@@ -894,12 +894,18 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 See `docs/milestones/0004-tap-test-port.md`. Parallelizable with
 M0002/M0003; lands regression coverage as those features ship.
 
-- [ ] `internal/testutil/cluster` package equivalent of
+- [x] `internal/testutil/cluster` package equivalent of
       `PostgreSQL::Test::Cluster`. Init/start/stop/restart with
       smart/fast/immediate modes; query via `psql` + Go libpq
       client; capture/inspect logs; programmatic edits to
       `postgresql.conf` and `pg_hba.conf`. Background-psql sessions.
       Multi-cluster API (impl deferred).
+      (achieved 2026-04-29: added `internal/testutil/cluster`
+      wrapper around `goopg` CLI with `Init`, `Start`, `Stop`,
+      `Restart`, `Reload`, `Status`, foreground/background psql
+      helpers, `Query` via `database/sql` + `lib/pq`, config-file
+      append helpers, and log wait helpers. Added package tests for
+      init/config edits plus lifecycle/query integration.)
 - [x] `internal/testutil/util` package equivalent of
       `PostgreSQL::Test::Utils`. Tempdir/file helpers, command runner
       with timeout + capture, log scanning helpers.
