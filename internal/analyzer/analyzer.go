@@ -1,9 +1,7 @@
 // Package analyzer performs semantic validation on parsed SQL trees.
 //
-// v0 keeps this intentionally small: name resolution for single-table
-// DML/SELECT and lightweight expression type checks. Features the planner
-// cannot execute yet are rejected here with SQLSTATE 0A000 so they fail
-// explicitly instead of being silently ignored.
+// v0 keeps this intentionally small: name resolution plus lightweight
+// expression type checks across DML/SELECT statements.
 package analyzer
 
 import (
@@ -33,6 +31,10 @@ func analyzeError(pos int, code, msg string) *AnalyzeError {
 }
 
 type scope struct {
+	rels []scopeRel
+}
+
+type scopeRel struct {
 	table *catalog.Table
 	alias string
 }
@@ -60,24 +62,14 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 	if s.SetOp != nil {
 		return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
 	}
-	if len(s.GroupBy) > 0 || s.Having != nil {
-		return analyzeError(s.Pos(), "0A000", "GROUP BY / HAVING are not supported in v0 planner")
-	}
-	if hasJoinClauses(s.FromExprs) {
-		return analyzeError(s.Pos(), "0A000", "JOIN is not supported in v0 planner")
-	}
-	if len(s.From) > 1 {
-		return analyzeError(s.Pos(), "0A000", "multi-table FROM is not supported in v0 planner")
-	}
 
-	var ctx *scope
-	if len(s.From) == 1 {
-		rv := s.From[0]
-		tbl, err := lookupTable(cat, rv)
+	ctx := &scope{}
+	if len(s.From) > 0 {
+		rels, err := buildSelectScope(s, cat)
 		if err != nil {
 			return err
 		}
-		ctx = &scope{table: tbl, alias: rv.Alias}
+		ctx.rels = rels
 	}
 
 	if err := analyzeTargets(s.Targets, ctx); err != nil {
@@ -85,6 +77,20 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 	}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
+	}
+	for _, g := range s.GroupBy {
+		if _, err := analyzeExpr(g, ctx); err != nil {
+			return err
+		}
+	}
+	if s.Having != nil {
+		typ, err := analyzeExpr(s.Having, ctx)
+		if err != nil {
+			return err
+		}
+		if !isBooleanLike(typ) {
+			return analyzeError(s.Having.Pos(), "42804", "HAVING condition must be type boolean")
+		}
 	}
 	for _, sb := range s.OrderBy {
 		if _, err := analyzeExpr(sb.Expr, ctx); err != nil {
@@ -153,7 +159,7 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 	if len(s.Returning) > 0 {
 		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
 	}
-	ctx := &scope{table: tbl, alias: s.Target.Alias}
+	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
 	}
@@ -181,7 +187,7 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 	if len(s.Returning) > 0 {
 		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
 	}
-	ctx := &scope{table: tbl, alias: s.Target.Alias}
+	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}}
 	return analyzeWhere(s.Where, ctx)
 }
 
@@ -215,14 +221,23 @@ func analyzeTargets(targets []parser.ResTarget, ctx *scope) error {
 }
 
 func analyzeStar(star *parser.StarExpr, ctx *scope) error {
-	if ctx == nil || ctx.table == nil {
+	if ctx == nil || len(ctx.rels) == 0 {
 		return analyzeError(star.Pos(), "42601", "SELECT * with no FROM clause")
 	}
-	if star.Schema != "" && !strings.EqualFold(star.Schema, ctx.table.Schema) {
+	if star.Table == "" && star.Schema == "" {
+		return nil
+	}
+	matches := 0
+	for _, rel := range ctx.rels {
+		if scopeRelMatches(rel, star.Table, star.Schema) {
+			matches++
+		}
+	}
+	if matches == 0 {
 		return analyzeError(star.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", star.Table))
 	}
-	if star.Table != "" && !matchesRangeVarRef(star.Table, ctx.table, ctx.alias) {
-		return analyzeError(star.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", star.Table))
+	if matches > 1 {
+		return analyzeError(star.Pos(), "42702", fmt.Sprintf("table reference %q is ambiguous", star.Table))
 	}
 	return nil
 }
@@ -341,20 +356,61 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 }
 
 func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error) {
-	if ctx == nil || ctx.table == nil {
+	if ctx == nil || len(ctx.rels) == 0 {
 		return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 	}
-	if x.Schema != "" && !strings.EqualFold(x.Schema, ctx.table.Schema) {
-		return catalog.Type{}, analyzeError(x.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", x.Table))
+	if x.Table != "" || x.Schema != "" {
+		matches := make([]scopeRel, 0, 1)
+		for _, rel := range ctx.rels {
+			if scopeRelMatches(rel, x.Table, x.Schema) {
+				matches = append(matches, rel)
+			}
+		}
+		if len(matches) == 0 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", x.Table))
+		}
+		if len(matches) > 1 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42702", fmt.Sprintf("table reference %q is ambiguous", x.Table))
+		}
+		col, ok := lookupColumn(matches[0].table, x.Column)
+		if !ok {
+			return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+		}
+		return col.Type, nil
 	}
-	if x.Table != "" && !matchesRangeVarRef(x.Table, ctx.table, ctx.alias) {
-		return catalog.Type{}, analyzeError(x.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", x.Table))
+
+	var found *catalog.Type
+	for _, rel := range ctx.rels {
+		col, ok := lookupColumn(rel.table, x.Column)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return catalog.Type{}, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+		}
+		t := col.Type
+		found = &t
 	}
-	col, ok := lookupColumn(ctx.table, x.Column)
-	if !ok {
+	if found == nil {
 		return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 	}
-	return col.Type, nil
+	return *found, nil
+}
+
+func scopeRelMatches(rel scopeRel, table, schema string) bool {
+	if schema != "" && !strings.EqualFold(schema, rel.table.Schema) {
+		return false
+	}
+	if table == "" {
+		return schema != ""
+	}
+	if strings.EqualFold(table, rel.table.Name) {
+		return true
+	}
+	if rel.alias != "" && strings.EqualFold(table, rel.alias) {
+		return true
+	}
+	return false
 }
 
 func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
@@ -363,6 +419,36 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 		return nil, analyzeError(rv.Pos(), "42P01", fmt.Sprintf("relation %q does not exist", rv.Name))
 	}
 	return tbl, nil
+}
+
+func buildSelectScope(s *parser.SelectStmt, cat catalog.Catalog) ([]scopeRel, error) {
+	if len(s.FromExprs) == 0 {
+		rels := make([]scopeRel, 0, len(s.From))
+		for _, rv := range s.From {
+			tbl, err := lookupTable(cat, rv)
+			if err != nil {
+				return nil, err
+			}
+			rels = append(rels, scopeRel{table: tbl, alias: rv.Alias})
+		}
+		return rels, nil
+	}
+	rels := make([]scopeRel, 0, len(s.From))
+	for _, item := range s.FromExprs {
+		tbl, err := lookupTable(cat, item.Base)
+		if err != nil {
+			return nil, err
+		}
+		rels = append(rels, scopeRel{table: tbl, alias: item.Base.Alias})
+		for _, j := range item.Joins {
+			rt, err := lookupTable(cat, j.Right)
+			if err != nil {
+				return nil, err
+			}
+			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias})
+		}
+	}
+	return rels, nil
 }
 
 func lookupColumn(tbl *catalog.Table, name string) (*catalog.Column, bool) {

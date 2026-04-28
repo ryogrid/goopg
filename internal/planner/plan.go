@@ -146,6 +146,57 @@ type IndexScan struct {
 func (n *IndexScan) Pos() int       { return n.pos }
 func (n *IndexScan) Output() Schema { return n.schema }
 
+// JoinType is the physical join shape emitted by the planner.
+type JoinType int
+
+const (
+	JoinTypeInner JoinType = iota
+	JoinTypeLeft
+	JoinTypeRight
+	JoinTypeFull
+	JoinTypeCross
+)
+
+// Join combines two child relations with an optional predicate.
+// Predicate is nil for CROSS JOIN and NATURAL/USING joins with no
+// shared columns.
+type Join struct {
+	pos       int
+	Type      JoinType
+	Left      Node
+	Right     Node
+	Predicate Expr
+	schema    Schema
+}
+
+func (n *Join) Pos() int       { return n.pos }
+func (n *Join) Output() Schema { return n.schema }
+
+// AggregateCall is one aggregate function invocation in an Aggregate node.
+type AggregateCall struct {
+	pos      int
+	Name     string
+	Arg      Expr // nil for count(*)
+	Star     bool
+	Distinct bool
+	Type     catalog.Type
+}
+
+func (a AggregateCall) Pos() int { return a.pos }
+
+// Aggregate groups rows by GroupExprs and computes Aggs.
+// Output columns are [group exprs..., aggregate calls...].
+type Aggregate struct {
+	pos        int
+	Child      Node
+	GroupExprs []Expr
+	Aggs       []AggregateCall
+	schema     Schema
+}
+
+func (n *Aggregate) Pos() int       { return n.pos }
+func (n *Aggregate) Output() Schema { return n.schema }
+
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
 	pos       int

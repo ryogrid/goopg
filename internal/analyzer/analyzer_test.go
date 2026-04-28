@@ -69,12 +69,23 @@ func TestAnalyzeRejectUnsupportedSelectFeatures(t *testing.T) {
 	cases := []string{
 		"SELECT DISTINCT aid FROM pgbench_accounts",
 		"SELECT 1 UNION SELECT 2",
-		"SELECT aid FROM pgbench_accounts GROUP BY aid",
-		"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid",
 	}
 	for _, sql := range cases {
 		expectAnalyzeCode(t, cat, sql, "0A000")
 	}
+}
+
+func TestAnalyzeSelectJoinAndGroupBy(t *testing.T) {
+	cat := analyzerCatalog(t)
+	sql := "SELECT a.aid, sum(h.delta) FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid GROUP BY a.aid HAVING sum(h.delta) > 0 ORDER BY a.aid"
+	if err := Analyze(parseOne(t, sql), cat); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAnalyzeAmbiguousColumnError(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat, "SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702")
 }
 
 func TestAnalyzeTypeErrors(t *testing.T) {

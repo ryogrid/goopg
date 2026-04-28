@@ -240,8 +240,9 @@ unchecked item unless a dependency forces a different order.
       single-column btree index exists for an equality predicate;
       executor opens the btree and probes by encoded int4 key
       (`const` and `$N` forms, including commuted `const = col`).
-- [ ] Planner: multi-table FROM, joins, GROUP BY/HAVING, aggregates
-      (extends the single-relation v0 once the executor side is in).
+- [x] Planner: multi-table FROM, joins, GROUP BY/HAVING, aggregates
+      (planner now emits Join/Aggregate trees; executor-side operators
+      are still tracked under the executor milestone).
 - [ ] Executor with the operators the planner emits.
   - [x] Volcano Open/Next/Close iterator scaffold (`internal/executor`):
         Datum union with KindNull/Bool/Int/String/Bytes/Time, expression

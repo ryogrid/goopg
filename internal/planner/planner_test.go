@@ -106,6 +106,77 @@ func TestPlanSelectResolvesTableAlias(t *testing.T) {
 	}
 }
 
+func TestPlanSelectJoin(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	node, err := Plan(parseOne(t, "SELECT a.aid, h.delta FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid"), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj, ok := node.(*Project)
+	if !ok {
+		t.Fatalf("root=%T want *Project", node)
+	}
+	j, ok := proj.Child.(*Join)
+	if !ok {
+		t.Fatalf("child=%T want *Join", proj.Child)
+	}
+	if j.Type != JoinTypeInner {
+		t.Fatalf("join type=%v want inner", j.Type)
+	}
+	if j.Predicate == nil {
+		t.Fatal("join predicate should not be nil")
+	}
+	if len(j.Output()) != 9 {
+		t.Fatalf("join output=%d want 9", len(j.Output()))
+	}
+}
+
+func TestPlanSelectGroupByHaving(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	sql := "SELECT a.aid, sum(h.delta) FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid GROUP BY a.aid HAVING sum(h.delta) > 0"
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj, ok := node.(*Project)
+	if !ok {
+		t.Fatalf("root=%T want *Project", node)
+	}
+	having, ok := proj.Child.(*Filter)
+	if !ok {
+		t.Fatalf("project child=%T want *Filter", proj.Child)
+	}
+	agg, ok := having.Child.(*Aggregate)
+	if !ok {
+		t.Fatalf("having child=%T want *Aggregate", having.Child)
+	}
+	if len(agg.GroupExprs) != 1 {
+		t.Fatalf("group exprs=%d want 1", len(agg.GroupExprs))
+	}
+	if len(agg.Aggs) != 1 || agg.Aggs[0].Name != "sum" {
+		t.Fatalf("aggs=%+v", agg.Aggs)
+	}
+}
+
+func TestPlanSelectCommaFromUsesCrossJoin(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	node, err := Plan(parseOne(t, "SELECT * FROM pgbench_accounts a, pgbench_history h"), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj := node.(*Project)
+	j, ok := proj.Child.(*Join)
+	if !ok {
+		t.Fatalf("child=%T want *Join", proj.Child)
+	}
+	if j.Type != JoinTypeCross {
+		t.Fatalf("join type=%v want cross", j.Type)
+	}
+	if len(proj.Targets) != 9 {
+		t.Fatalf("targets=%d want 9", len(proj.Targets))
+	}
+}
+
 func TestPlanPgbenchSelectUsesIndexScanRule(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
@@ -266,10 +337,10 @@ func TestPlanResolutionErrors(t *testing.T) {
 		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},       // undefined_column
 		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
 		{"INSERT INTO pgbench_history VALUES (1, 2, 3)", "42601"},        // arity mismatch
-		{"SELECT aid FROM pgbench_accounts GROUP BY aid", "0A000"},       // grouping unsupported
 		{"SELECT 1 UNION SELECT 2", "0A000"},                             // set op unsupported
-		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "0A000"},
 		{"INSERT INTO pgbench_history (tid) VALUES (1) RETURNING tid", "0A000"},
+		{"SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702"},
+		{"SELECT aid FROM pgbench_accounts HAVING aid > 0", "42803"},
 	}
 	for _, c := range cases {
 		_, err := Plan(parseOne(t, c.sql), cat)

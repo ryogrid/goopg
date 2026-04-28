@@ -99,6 +99,8 @@ ordinal without re-resolving names.
 | -------------- | ------------------- | ------------------- | ---------------------------- |
 | `SeqScan`      | (heap relation)     | all heap columns    | full table scan              |
 | `IndexScan`    | (relation + index)  | all heap columns    | v0: only for `col = const`   |
+| `Join`         | left + right child  | concatenated schema | INNER/LEFT/RIGHT/FULL/CROSS  |
+| `Aggregate`    | child               | groups + aggs       | GROUP BY / HAVING input      |
 | `Filter`       | child               | child's output      | applies a predicate          |
 | `Project`      | child               | targetlist columns  | computes target expressions  |
 | `Sort`         | child               | child's output      | ORDER BY                     |
@@ -119,16 +121,17 @@ errors can reference the original SQL position.
 For each statement shape:
 
 1. **SELECT**:
-   - Resolve `From[0]` to a `*catalog.Table` (single-table only in v0).
-   - Build a `SeqScan` over it (IndexScan promotion is rule-based —
-     activated when `Where` is `col = const`/`col = $N` and `col`
-     has a B-tree index of the right type).
-   - Wrap `Filter` if `Where != nil`.
-   - Wrap `Sort` if `OrderBy != nil`.
-   - Wrap `Limit` if `Limit != nil` or `Offset != nil`.
-   - Wrap `Project` if the target list isn't `*` or doesn't already
-     project the full row — the executor's protocol-write path needs
-     a fixed output schema.
+   - Resolve each FROM item to `SeqScan` and fold explicit JOIN clauses
+     into a left-deep `Join` tree. Comma-separated FROM items become
+     `CROSS JOIN` nodes.
+   - For single-table shapes, apply IndexScan promotion when `Where` is
+     `col = const`/`col = $N` and `col` has a compatible B-tree index.
+   - Wrap `Filter` for `WHERE`.
+   - If GROUP BY or aggregate calls are present, insert `Aggregate`
+     (`GroupExprs` + deduplicated aggregate call list), then `Filter`
+     for HAVING.
+   - Wrap `Sort` and `Limit` as needed.
+   - Finish with `Project` to materialize the target list schema.
 2. **INSERT**: build a `Values` from the literal rows; emit `Insert`
    with the resolved target table and column ordinals.
 3. **UPDATE**: `SeqScan` the target → `Filter(Where)` → `Update` with
@@ -144,10 +147,10 @@ For each statement shape:
 
 Name resolution is done in one bottom-up pass:
 
-- `parser.ColumnRef` → `(tableIndex, colOrdinal)` against the
-  `FromList` of the enclosing SELECT/UPDATE/DELETE.
+- `parser.ColumnRef` → `(inputOrdinal)` against the full joined input
+  schema of the enclosing SELECT/UPDATE/DELETE.
 - `parser.StarExpr` → expanded into one `ColumnRef` per column of the
-  source relation.
+  visible source relation(s).
 - `parser.ParamRef` → kept as-is; the executor binds parameter values
   at `Execute` time.
 
@@ -157,10 +160,12 @@ generated SQLSTATE table (e.g. `42P01` `undefined_table`,
 
 ### What v0 does NOT cover
 
-- Cost-based path selection / join ordering. Pgbench is single-table.
+- Cost-based path selection / join ordering.
 - Subqueries, CTEs, set operations.
-- GROUP BY / HAVING / aggregates over multiple rows.
-- Index selection beyond the simple `col = const` rule.
+- DISTINCT.
+- Rich aggregate-function coverage and expression rewrites beyond the
+  current pgbench-oriented subset.
+- Index selection beyond the simple single-table `col = const` rule.
 - View resolution; views require catalog support that lands later.
 - Prepared-statement plan caching. Each Bind currently re-plans.
 
