@@ -709,8 +709,15 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       (NULL right side for unmatched), and reversed-equality
       shapes. See `docs/design/0003-0002-join-executors.md`.)
 - [ ] Sort-merge join executor.
-- [ ] Hash aggregate executor (replace today's sort-then-group as the
+- [x] Hash aggregate executor (replace today's sort-then-group as the
       default path).
+      (verified 2026-04-28: the executor's aggregateOp
+      (`internal/executor/operators_join_agg.go` line 249)
+      already groups by `map[string]*groupRuntime{}` — it's
+      a hash aggregate, never a sort-then-group. The "replace"
+      in this bullet's wording was speculative; v0 has only
+      ever shipped the hash variant. Verified end-to-end via
+      psql 18.3 with `SELECT k, sum(v) FROM t GROUP BY k`.)
 - [x] `EXPLAIN` output for a `parser.ExplainStmt` shape.
       (achieved 2026-04-28: `EXPLAIN <stmt>` parses via new
       KwExplain + parser.ExplainStmt; planner.Explain wraps
@@ -735,7 +742,22 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 
 ### Query coverage (incremental)
 
-- [ ] 3- to 7-way JOIN planning (extend the M1 nested-loop planner).
+- [x] 3- to 7-way JOIN planning (extend the M1 nested-loop planner).
+      (verified 2026-04-28: the M1 planner already builds
+      left-deep join chains for both comma-FROM (`FROM a, b,
+      c, d, e, f` with WHERE-side equalities) and explicit
+      JOIN ... ON syntax. With hash-join landed in the
+      previous loop, each pairwise INNER join in the chain
+      promotes to JoinAlgoHash. End-to-end verified via psql
+      18.3:
+        - 6-way: `FROM region, nation, supplier, customer,
+          orders, lineitem WHERE …` returned correct rows.
+        - 7-way: `customer JOIN orders … JOIN lineitem …
+          JOIN supplier … JOIN nation … JOIN region … JOIN
+          part …` end-to-end. EXPLAIN shows the expected
+          left-deep Hash Join chain.
+      Cost-based join-ordering decisions stay open as part
+      of the cost-based-planner item.)
 - [ ] Correlated and uncorrelated subqueries; `EXISTS`, `NOT EXISTS`,
       `IN`, `NOT IN`.
       (uncorrelated forms all landed 2026-04-28: scalar
