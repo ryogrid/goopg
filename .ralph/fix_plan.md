@@ -249,9 +249,16 @@ unchecked item unless a dependency forces a different order.
         Run helper. SELECT 1, parameterised expressions, LIMIT/OFFSET,
         ORDER BY, division-by-zero (22012), and current_timestamp work
         end-to-end without storage.
-  - [ ] Heap-touching operators: SeqScan, Insert, Update, Delete (need
-        an MVCC-aware scan + write-through-buffer-pool + xmin/xmax
-        tagging).
+  - [x] Heap-touching operators: SeqScan + Insert. Row codec
+        (`internal/executor/codec.go`) marshals Datum rows ↔ heap-tuple
+        bytes for v0's typed columns (int4/int8/bool/timestamp/text);
+        Context grows Pool/Catalog/TxnMgr/Tx/Snap fields; SeqScan walks
+        the buffer pool with mvcc.TupleVisible filtering; Insert
+        extends via PinNew when the last block is full. End-to-end
+        round-trip + relation-extension tests pass.
+  - [ ] Heap-touching operators: Update + Delete. Update overwrites
+        with old-image xmax-tagged + new-image xmin-tagged; Delete
+        marks visible rows with xmax = current xid.
   - [ ] DDL operator path: CREATE TABLE / DROP TABLE / TRUNCATE /
         CREATE INDEX wired through the catalog + smgr.
   - [ ] Transaction operator: BEGIN/COMMIT/ROLLBACK plumbed to

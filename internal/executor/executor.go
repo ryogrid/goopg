@@ -38,6 +38,14 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return newSortOp(p, child), nil
+	case *planner.SeqScan:
+		return newSeqScanOp(p), nil
+	case *planner.Insert:
+		child, err := Build(p.Source)
+		if err != nil {
+			return nil, err
+		}
+		return newInsertOp(p, child), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: fmt.Sprintf("unsupported plan node %T", plan)}
 }

@@ -1,6 +1,12 @@
 package executor
 
-import "time"
+import (
+	"time"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/storage"
+)
 
 // Context carries per-statement runtime state into every operator's
 // Open / Next call. It is constructed by the wire-protocol path at
@@ -16,6 +22,15 @@ type Context struct {
 	// means unlimited. The extended-query protocol's Execute message
 	// passes through here.
 	MaxRows int
+
+	// Storage handles. Heap-touching operators (SeqScan/Insert/
+	// Update/Delete) require all four to be set; pure-compute
+	// statements (SELECT 1, …) don't.
+	Pool    *storage.Pool
+	Catalog catalog.Catalog
+	TxnMgr  *mvcc.Manager
+	Tx      mvcc.Transaction
+	Snap    mvcc.Snapshot
 }
 
 // NewContext builds a Context with sensible defaults: a fresh
