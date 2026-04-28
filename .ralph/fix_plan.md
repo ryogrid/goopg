@@ -138,12 +138,18 @@ unchecked item unless a dependency forces a different order.
 - [x] Design docs: `0005-buffer-manager.md`, `0006-storage-format.md`.
 - [ ] Heap and tuple format with xmin/xmax visibility metadata.
 - [ ] Snapshot manager with `READ COMMITTED` and `REPEATABLE READ` semantics.
-- [ ] WAL writer with `fdatasync` on commit; checkpointer goroutine.
+- [x] WAL writer with `fdatasync` on commit.
+      `internal/wal` now provides segmented WAL files under `pg_wal/`,
+      append/flush worker serialization, record framing with CRC, and
+      `FlushUpTo` durability semantics. `internal/storage.Pool`
+      integrates WAL-before-data ordering by flushing WAL up to
+      page `pd_lsn` before dirty-page writeback.
+- [ ] Checkpointer goroutine.
 - [ ] Crash recovery (replay WAL up to the last consistent checkpoint).
 - [ ] B-tree index access method.
 - [ ] `VACUUM` and `ANALYZE` minimal implementations.
-- [ ] Design docs: `0007-mvcc-and-snapshots.md`,
-      `0008-wal-and-recovery.md`, `0009-btree.md`.
+- [ ] Design docs: `0007-mvcc-and-snapshots.md`, `0009-btree.md`.
+- [x] Design doc: `0008-wal-and-recovery.md`.
 
 ## Milestone 6 — SQL surface for pgbench
 
