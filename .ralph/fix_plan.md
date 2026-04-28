@@ -163,9 +163,14 @@ unchecked item unless a dependency forces a different order.
       `internal/wal/recovery.go` adds page-image replay and checkpoint
       marker handling (`RecordKindCheckpoint`), replaying records up to
       the latest consistent checkpoint boundary.
-- [ ] B-tree index access method.
+- [x] B-tree index access method. `internal/access/btree` provides a
+      single-column int4 B-tree on top of the buffer pool: 24-byte page
+      header + ItemId array + tuple region + 16-byte BTPageOpaque,
+      metapage at block 0, recursive leaf+internal splits with new-root
+      lift, byte-order-preserving `EncodeInt4`, forward range scan via
+      right-sibling pointers, single-mutex concurrency.
 - [ ] `VACUUM` and `ANALYZE` minimal implementations.
-- [ ] Design doc: `0009-btree.md`.
+- [x] Design doc: `0009-btree.md`.
 - [x] Design doc: `0007-mvcc-and-snapshots.md`.
 - [x] Design doc: `0008-wal-and-recovery.md`.
 

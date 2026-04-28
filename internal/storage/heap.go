@@ -242,6 +242,81 @@ func PageGetHeapTuple(p Page, slot uint16) (HeapTuple, error) {
 	return ParseHeapTuple(raw)
 }
 
+// PageAddItemRaw appends an arbitrary blob as a new item on the page,
+// returning its 1-based slot number. This is the access-method-neutral
+// counterpart of PageAddHeapTuple — index AMs (e.g. btree) carry their
+// own per-AM payload formats and need a way to drop a pre-encoded item
+// in without going through the heap-specific tuple parser.
+//
+// The caller is responsible for the contents; `raw` must be small
+// enough that the line pointer's 15-bit length field can express it.
+//
+// Item bodies are tracked by pd_upper / pd_special exactly as for heap
+// tuples, so a page may freely mix heap and index-shaped items as long
+// as the access method consuming them knows what to expect — in
+// practice, each relation file holds one or the other.
+//
+// pd_special bounds the tuple region: the new item is placed at
+// pd_upper - len(raw); if that would land below pd_special's start the
+// page is treated as full.
+func PageAddItemRaw(p Page, raw []byte) (uint16, error) {
+	h, err := Header(p)
+	if err != nil {
+		return 0, err
+	}
+	if len(raw) > 0x7FFF {
+		return 0, fmt.Errorf("item too large for line pointer len=%d", len(raw))
+	}
+	lower := int(h.Lower())
+	upper := int(h.Upper())
+	needed := itemIDSize + len(raw)
+	if upper-lower < needed {
+		return 0, ErrNoSpaceInPage
+	}
+	newUpper := upper - len(raw)
+	copy(p[newUpper:upper], raw)
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	item := ItemID{Offset: uint16(newUpper), Flags: ItemIDNormal, Length: uint16(len(raw))}
+	if err := writeItemID(p, count, item); err != nil {
+		return 0, err
+	}
+	h.SetLower(uint16(lower + itemIDSize))
+	h.SetUpper(uint16(newUpper))
+	return uint16(count + 1), nil
+}
+
+// PageGetItemRaw returns the raw item bytes at the 1-based slot. The
+// returned slice is a copy.
+func PageGetItemRaw(p Page, slot uint16) ([]byte, error) {
+	if slot == 0 {
+		return nil, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return nil, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return nil, err
+	}
+	if item.Flags != ItemIDNormal {
+		return nil, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	ln := int(item.Length)
+	if off < 0 || ln < 0 || off+ln > len(p) {
+		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+	}
+	return append([]byte(nil), p[off:off+ln]...), nil
+}
+
 func readItemID(p Page, idx int) (ItemID, error) {
 	off := SizeOfPageHeaderData + idx*itemIDSize
 	if off < 0 || off+itemIDSize > len(p) {
