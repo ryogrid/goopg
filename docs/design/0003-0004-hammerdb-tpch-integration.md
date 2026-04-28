@@ -161,16 +161,27 @@ in v0; we record the flag for forward compatibility).
   v0's cast is already a no-op for analyzer typing; the path
   works but doesn't enforce.
 
-### Q1–Q22 plan-time coverage
+### Q1–Q22 plan-time and build-time coverage
 
-All 22 HammerDB TPC-H query templates parse and plan against the
-v0 catalog (verified by `internal/planner.TestPlanTPCHQueriesPlannable`).
-The test fixture seeds the eight HammerDB-shaped tables and asks
-`planner.Plan` to produce a node tree for each query with parameters
-substituted from `sub_query()`'s default range. Planning succeeding
-is necessary but not sufficient — execution-time gaps (missing
-built-in functions, NUMERIC arithmetic shapes, etc.) surface only
-when the executor evaluates expressions against real rows.
+All 22 HammerDB TPC-H query templates parse, plan, AND build into
+operator trees against the v0 stack. Two complementary tests pin
+this contract:
+
+- `internal/planner.TestPlanTPCHQueriesPlannable`: every query
+  produces a `planner.Node` tree against the eight-table
+  HammerDB-shaped catalog.
+- `internal/executor.TestBuildTPCHQueries`: every planned tree
+  passes through `executor.Build` and yields an `Operator` —
+  guards the planner→executor handoff against unsupported plan
+  nodes.
+
+Both tests share `internal/testutil/tpch`, which exposes the
+catalog (`tpch.Catalog`) and the parameter-substituted Q1..Q22
+SQL templates (`tpch.Queries`) so they don't drift. Planning +
+building succeeding is necessary but not sufficient — execution-
+time gaps (missing built-in functions, type-coercion shapes,
+empty-input edge cases) surface only when the executor evaluates
+expressions against real rows.
 
 Built-in functions added this loop to unblock execution:
 

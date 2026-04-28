@@ -1203,21 +1203,25 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
 - [ ] All 22 queries (Q1–Q22) execute end-to-end and produce
       result sets byte-identical (or otherwise verified-equivalent)
       to upstream PG on the same data.
-      (plan-time coverage achieved 2026-04-29: every query parses
-      and plans against the v0 planner — pinned by
-      `internal/planner.TestPlanTPCHQueriesPlannable`, which seeds the
-      eight HammerDB-shaped tables and asks `planner.Plan` to produce a
-      node tree for each Q1..Q22 SQL with parameters substituted from
-      HammerDB's `sub_query()` default range. Two missing built-in
-      functions surfaced and were added to unblock the execution path:
-      `substr(text, int [, int])` / `substring` for Q22's country-code
-      prefix extraction (1-based indexing, NULL propagation,
+      (plan-time + build-time coverage achieved 2026-04-29: every
+      query parses, plans, and builds against the v0 stack — pinned
+      by two complementary tests. Plan-time:
+      `internal/planner.TestPlanTPCHQueriesPlannable` seeds the eight
+      HammerDB-shaped tables and asks `planner.Plan` to produce a
+      node tree for each Q1..Q22 SQL. Build-time:
+      `internal/executor.TestBuildTPCHQueries` chases the planned
+      tree through `executor.Build` so every query also constructs
+      a complete operator tree — guards the planner→executor
+      handoff against unsupported plan nodes. Both tests share the
+      shared `internal/testutil/tpch` fixture (catalog + queries)
+      to avoid drift. Two missing built-in functions surfaced
+      earlier in the loop and were added: `substr(text, int [, int])`
+      / `substring` for Q22 (1-based indexing, NULL propagation,
       negative-length 22011 error per upstream) and
-      `to_date(text, fmt)` for Q15's view-defining
-      `WHERE l_shipdate >= to_date(...)` pattern (reuses
-      `pgFormatToGoLayout`, truncates to midnight UTC). Unit tests pin
-      both contracts. Full execution-time verification with real data
-      remains pending HammerDB harness availability — see milestone
+      `to_date(text, fmt)` for Q15 (reuses `pgFormatToGoLayout`,
+      truncates to midnight UTC). Unit tests pin both contracts.
+      Full execution-time verification with real data remains
+      pending HammerDB harness availability — see milestone
       `0003-tpch-workload.md` DoD #2 and #3.)
 - [ ] HammerDB Power Test at SF1 completes without errors.
 
