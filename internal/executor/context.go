@@ -46,6 +46,14 @@ type Context struct {
 	// — that's the v0 behaviour for a server started without a WAL
 	// writer.
 	Checkpointer Checkpointer
+
+	// OuterRows is the lexical-scope row stack used by correlated
+	// subqueries. evalSubquery / evalInExpr / evalExistsExpr push
+	// the current outer row before opening the inner plan and
+	// pop on close. evalOuterColumnRef reads
+	// `OuterRows[len(OuterRows)-Level]` — Level 1 is the
+	// innermost outer scope.
+	OuterRows []Row
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

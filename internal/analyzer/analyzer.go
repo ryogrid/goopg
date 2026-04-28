@@ -32,11 +32,71 @@ func analyzeError(pos int, code, msg string) *AnalyzeError {
 
 type scope struct {
 	rels []scopeRel
+	// parent is the lexical-scope parent for correlated
+	// subqueries — set when analyzing a subquery's inner
+	// SELECT so column refs that don't resolve locally walk
+	// up. nil for the top-level SELECT.
+	parent *scope
+	// cat is the catalog. Threaded via the scope so the
+	// SubqueryExpr / ExistsExpr / InExpr handlers can recurse
+	// into analyzeSelectWithParent without re-piping cat as a
+	// separate parameter through every helper.
+	cat catalog.Catalog
 }
 
 type scopeRel struct {
 	table *catalog.Table
 	alias string
+}
+
+// outerScope is the goroutine-thread-unsafe lexical-scope
+// channel set by the planner before invoking Analyze on a
+// subquery's inner SELECT. Mirrors planner.planParent. nil
+// for top-level statements.
+var outerScope *scope
+
+// OuterRelation describes one FROM-clause range variable in
+// an outer scope. The planner constructs these from its
+// resolveContext bindings before recursively planning a
+// subquery.
+type OuterRelation struct {
+	Table *catalog.Table
+	Alias string
+}
+
+// OuterScope is an opaque handle to a lexical-scope parent
+// chain the planner threads into the analyzer for correlated
+// subquery analysis. Constructed via NewOuterScope; consumed
+// via SetOuterScope.
+type OuterScope struct{ inner *scope }
+
+// NewOuterScope builds an OuterScope from a flat list of
+// FROM-clause relations and an enclosing scope (or nil for
+// the outermost level). The cat is captured so the analyzer
+// can recurse into nested subqueries from this level.
+func NewOuterScope(cat catalog.Catalog, rels []OuterRelation, parent *OuterScope) *OuterScope {
+	rs := make([]scopeRel, len(rels))
+	for i, r := range rels {
+		rs[i] = scopeRel{table: r.Table, alias: r.Alias}
+	}
+	s := &scope{rels: rs, cat: cat}
+	if parent != nil {
+		s.parent = parent.inner
+	}
+	return &OuterScope{inner: s}
+}
+
+// SetOuterScope wires the lexical-scope parent for the next
+// Analyze call. Returns a restorer; defer it to guarantee
+// cleanup. Mirrors planner.planParent's design.
+func SetOuterScope(parent *OuterScope) func() {
+	prev := outerScope
+	if parent != nil {
+		outerScope = parent.inner
+	} else {
+		outerScope = nil
+	}
+	return func() { outerScope = prev }
 }
 
 // Analyze validates one parsed statement semantically.
@@ -56,6 +116,14 @@ func Analyze(stmt parser.Stmt, cat catalog.Catalog) error {
 }
 
 func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
+	return analyzeSelectWithParent(s, cat, outerScope)
+}
+
+// analyzeSelectWithParent analyzes a SELECT with the supplied
+// scope as lexical-scope parent. Used by SubqueryExpr /
+// InExpr / ExistsExpr handlers when recursing into inner
+// SELECTs so column refs can resolve against the outer scope.
+func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
 	if s.Distinct {
 		return analyzeError(s.Pos(), "0A000", "DISTINCT is not supported in v0 planner")
 	}
@@ -63,7 +131,7 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 		return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
 	}
 
-	ctx := &scope{}
+	ctx := &scope{parent: parent, cat: cat}
 	if len(s.From) > 0 {
 		rels, err := buildSelectScope(s, cat)
 		if err != nil {
@@ -267,11 +335,17 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 	case *parser.CaseExpr:
 		return analyzeCaseExpr(x, ctx)
 	case *parser.SubqueryExpr:
-		// v0 doesn't recursively analyze the inner SELECT here —
-		// the planner runs Plan() on it, which already invokes
-		// its own analyzer pass. The expression's resulting type
-		// is "unknown"; isAssignable's unknown-coercion rule
-		// keeps the comparison sites happy.
+		// Recursively analyze the inner SELECT with the current
+		// scope as lexical parent so correlated column refs
+		// (`o.col` from outer scope) resolve through the
+		// scope-chain walker. Result is `unknown` — real
+		// type-inference for scalar subqueries waits on the
+		// type system. cat is required.
+		if ctx != nil && ctx.cat != nil {
+			if err := analyzeSelectWithParent(x.Inner, ctx.cat, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.InExpr:
 		// Operand and list/subquery are checked at planner / runtime
@@ -287,10 +361,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				return catalog.Type{}, err
 			}
 		}
+		if x.Subquery != nil && ctx != nil && ctx.cat != nil {
+			if err := analyzeSelectWithParent(x.Subquery, ctx.cat, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
 		return catalog.Type{Name: "bool"}, nil
 	case *parser.ExistsExpr:
-		// Subquery analysis happens during planning. EXISTS is
-		// boolean by definition.
+		if x.Subquery != nil && ctx != nil && ctx.cat != nil {
+			if err := analyzeSelectWithParent(x.Subquery, ctx.cat, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
 		return catalog.Type{Name: "bool"}, nil
 	case *parser.NullConst:
 		return catalog.Type{Name: "unknown"}, nil
@@ -424,8 +506,33 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 }
 
 func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error) {
-	if ctx == nil || len(ctx.rels) == 0 {
+	if ctx == nil {
 		return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+	}
+	// Walk lexical scopes — local first, then parent chain
+	// for correlated subqueries.
+	for cur := ctx; cur != nil; cur = cur.parent {
+		ty, ok, err := resolveColumnRefTypeAt(x, cur)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		if ok {
+			return ty, nil
+		}
+	}
+	if x.Table != "" {
+		return catalog.Type{}, analyzeError(x.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", x.Table))
+	}
+	return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+}
+
+// resolveColumnRefTypeAt tries to resolve x at a single scope
+// level. Returns (type, true, nil) on hit, (_, false, nil) on
+// miss (caller walks up), or an error for in-scope ambiguity /
+// missing-column-on-matched-relation.
+func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool, error) {
+	if len(ctx.rels) == 0 {
+		return catalog.Type{}, false, nil
 	}
 	if x.Table != "" || x.Schema != "" {
 		matches := make([]scopeRel, 0, 1)
@@ -435,16 +542,16 @@ func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error)
 			}
 		}
 		if len(matches) == 0 {
-			return catalog.Type{}, analyzeError(x.Pos(), "42P01", fmt.Sprintf("missing FROM-clause entry for table %q", x.Table))
+			return catalog.Type{}, false, nil
 		}
 		if len(matches) > 1 {
-			return catalog.Type{}, analyzeError(x.Pos(), "42702", fmt.Sprintf("table reference %q is ambiguous", x.Table))
+			return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("table reference %q is ambiguous", x.Table))
 		}
 		col, ok := lookupColumn(matches[0].table, x.Column)
 		if !ok {
-			return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+			return catalog.Type{}, false, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 		}
-		return col.Type, nil
+		return col.Type, true, nil
 	}
 
 	var found *catalog.Type
@@ -454,15 +561,15 @@ func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error)
 			continue
 		}
 		if found != nil {
-			return catalog.Type{}, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+			return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
 		}
 		t := col.Type
 		found = &t
 	}
 	if found == nil {
-		return catalog.Type{}, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+		return catalog.Type{}, false, nil
 	}
-	return *found, nil
+	return *found, true, nil
 }
 
 func scopeRelMatches(rel scopeRel, table, schema string) bool {

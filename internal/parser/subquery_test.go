@@ -47,6 +47,17 @@ func TestParseExistsExpr(t *testing.T) {
 	}
 }
 
+// TestParseCorrelatedExists pins TPC-H Q4 shape: `EXISTS
+// (SELECT 1 FROM t WHERE t.col = outer.col …)`. The
+// correlated reference is an unresolved ColumnRef at parse
+// time — analyzer/planner walks it up the scope chain.
+func TestParseCorrelatedExists(t *testing.T) {
+	_, err := Parse("SELECT o_orderkey FROM orders o WHERE EXISTS (SELECT 1 FROM lineitem WHERE l_orderkey = o.o_orderkey)")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestParseSubqueryExpr pins the TPC-H Q15 shape:
 // `WHERE x = (SELECT max(y) FROM t)` parses as a SubqueryExpr
 // wrapping the inner SelectStmt verbatim.

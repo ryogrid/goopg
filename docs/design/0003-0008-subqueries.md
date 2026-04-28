@@ -184,17 +184,59 @@ End-to-end verified via psql 18.3:
   rows when inner non-empty, none when empty.
 - `WHERE NOT EXISTS (...)` → inverted.
 
+### Correlated subqueries (parameter pull-up)
+
+TPC-H Q4 / Q21 / Q22 use the shape `EXISTS (SELECT 1 FROM
+inner WHERE inner.col = outer.col …)`. Without parameter
+pull-up the inner SELECT can't reference outer-scope
+columns. v0 implements it via a lexical-scope chain on both
+the analyzer and planner sides, plus an outer-row stack on
+the executor's Context.
+
+- `analyzer.scope.parent`: each scope carries its lexical
+  parent. `resolveColumnRefType` walks the chain: local first,
+  then up. Found at parent level returns the column's type
+  (no special node — analyzer just type-checks).
+- `analyzer.OuterScope` (exported) wraps the internal scope
+  for planner-side construction. `analyzer.SetOuterScope`
+  stashes the chain in a package-level channel for the
+  recursive `Analyze()` call to pick up. Mirrors planner.planParent.
+- `planner.resolveContext.parent`: same pattern. New
+  `resolveColumnRefAt` checks each level; on a parent-level
+  hit, emits a `planner.OuterColumnRef{Level, Index}`
+  (1-based level — matches upstream's `Var.varlevelsup`).
+- `planner.planSelectWithParent`: the entry point for
+  subquery planning. Sets `planParent` (so planSelect's ctx
+  inherits via `ctx.parent`) AND constructs the analyzer's
+  `OuterScope` chain via `buildAnalyzerOuterScope`, calls
+  `analyzer.SetOuterScope`, then `Plan()`. Both restorers
+  are deferred.
+- `executor.Context.OuterRows`: a `[]Row` stack. Push /
+  pop per evaluation in `evalSubquery` / `evalExistsExpr`
+  / `collectInValues`. `evalOuterColumnRef` reads
+  `OuterRows[len(OuterRows)-Level]` — Level 1 is the
+  innermost outer scope.
+
+End-to-end verified via psql 18.3:
+- TPC-H Q4 shape `EXISTS (SELECT 1 FROM lineitem WHERE
+  l_orderkey = o.o_orderkey AND l_status = 'F')` correctly
+  filters by per-row sub-results.
+- NOT EXISTS variant flips the predicate.
+- Correlated scalar subquery `(SELECT count(*) FROM
+  lineitem WHERE l_orderkey = o.o_orderkey)` returns the
+  right per-row count.
+
 ## Out of scope (deferred to subsequent loops)
 
-- Correlated subqueries: outer-row column references inside
-  the inner SELECT need parameter pull-up + per-row
-  re-evaluation. TPC-H Q4/Q21/Q22 use these; until the
-  pull-up rewrite lands, those queries fail at planning
-  with `column does not exist`.
 - Initplan caching: evaluate uncorrelated subqueries once
   per query plan and reuse the result Datum. Performance
   win, no correctness change. Applies equally to
   SubqueryExpr / InExpr / ExistsExpr.
+- Subquery decorrelation: rewriting correlated subqueries
+  as semi-joins for asymptotic-better execution. v0's
+  per-outer-row re-evaluation is correct but quadratic for
+  large outers. TPC-H queries at SF1 will be slow but
+  produce the right answer.
 - ANY / SOME / ALL (subquery / value-list quantified
   comparisons). Distinct from IN.
 - `LATERAL` joins (related grammar; not used by TPC-H).

@@ -29,14 +29,27 @@ func (e *ExecError) Error() string {
 // any ColumnRef resolution is an internal error.
 func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	switch x := e.(type) {
+	case *planner.OuterColumnRef:
+		// Look up the row from the lexical-scope stack pushed
+		// by evalSubquery/evalInExpr/evalExistsExpr before the
+		// inner plan runs. Level 1 is the immediate parent.
+		idx := len(ctx.OuterRows) - x.Level
+		if idx < 0 || idx >= len(ctx.OuterRows) {
+			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/level=%d out of range (depth=%d)", x.Name, x.Level, len(ctx.OuterRows))}
+		}
+		row := ctx.OuterRows[idx]
+		if x.Index < 0 || x.Index >= len(row) {
+			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(row))}
+		}
+		return row[x.Index], nil
 	case *planner.CaseExpr:
 		return evalCaseExpr(x, row, ctx)
 	case *planner.SubqueryExpr:
-		return evalSubquery(x, ctx)
+		return evalSubquery(x, row, ctx)
 	case *planner.InExpr:
 		return evalInExpr(x, row, ctx)
 	case *planner.ExistsExpr:
-		return evalExistsExpr(x, ctx)
+		return evalExistsExpr(x, row, ctx)
 	case *planner.TypedStringLit:
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
@@ -427,6 +440,10 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 // exactly one column. Otherwise evaluates the value list.
 func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) {
 	if x.Plan != nil {
+		// Push the outer row so correlated refs inside the
+		// IN-subquery resolve against it. Pop on return.
+		ctx.OuterRows = append(ctx.OuterRows, row)
+		defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 		op, err := Build(x.Plan)
 		if err != nil {
 			return nil, err
@@ -467,7 +484,16 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 // the inner plan, asks for one row, returns the bool. Works
 // regardless of column count — EXISTS only cares whether at
 // least one row exists.
-func evalExistsExpr(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
+func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error) {
+	// Push the outer row so correlated column refs in the inner
+	// plan can resolve against it. Pop on return regardless of
+	// outcome.
+	ctx.OuterRows = append(ctx.OuterRows, row)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	return existsImpl(x, ctx)
+}
+
+func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err
@@ -495,7 +521,13 @@ func evalExistsExpr(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 // v0 is always uncorrelated — the inner plan never sees the
 // outer row. Correlated subqueries (parameter pull-up) are
 // deferred; see docs/design/0003-0008-subqueries.md.
-func evalSubquery(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
+func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
+	ctx.OuterRows = append(ctx.OuterRows, row)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	return subqueryImpl(x, ctx)
+}
+
+func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err

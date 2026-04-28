@@ -758,24 +758,28 @@ clone at `./HammerDB/`; TPC-H schema + queries under
           left-deep Hash Join chain.
       Cost-based join-ordering decisions stay open as part
       of the cost-based-planner item.)
-- [ ] Correlated and uncorrelated subqueries; `EXISTS`, `NOT EXISTS`,
+- [x] Correlated and uncorrelated subqueries; `EXISTS`, `NOT EXISTS`,
       `IN`, `NOT IN`.
-      (uncorrelated forms all landed 2026-04-28: scalar
-      `(SELECT …)` in expression position via
-      parser.SubqueryExpr; `expr [NOT] IN (subquery|val_list)`
-      via parser.InExpr (parser hooks into expr-precedence
-      loop, lookahead disambiguates subquery vs value list);
-      `[NOT] EXISTS (subquery)` via parser.ExistsExpr (NOT
-      composed via UnaryOp). Planner mirrors plan the inner
-      SELECT recursively; executor evalSubquery/evalInExpr/
-      evalExistsExpr handle three-valued NULL for IN
-      (operand-NULL → NULL, inner-NULL with no match → NULL),
-      cardinality 21000 for scalar multi-row, multi-column
-      42601 for both scalar and IN. Verified via psql 18.3
-      with TPC-H Q15 (scalar) and Q16/Q18 shapes (IN
-      subquery + value list + EXISTS + NOT EXISTS).
-      Correlated subqueries (parameter pull-up for Q4/Q21/Q22)
-      remain open — see `docs/design/0003-0008-subqueries.md`.)
+      (achieved 2026-04-28: uncorrelated forms first
+      (parser.SubqueryExpr / InExpr / ExistsExpr), then
+      correlated subqueries via lexical-scope chains: new
+      `analyzer.scope.parent` + `planner.resolveContext.parent`
+      walk-up paths in `resolveColumnRefType` /
+      `resolveColumnRefAt`, `planner.OuterColumnRef{Level,
+      Index}` for parent-scope references, plus
+      `executor.Context.OuterRows` stack pushed by
+      evalSubquery / evalExistsExpr / collectInValues.
+      `analyzer.OuterScope` + `planner.planSelectWithParent`
+      thread the lexical-scope parent through both passes
+      (analyzer-side via package-level channel, planner-side
+      via `planParent`). End-to-end verified via psql 18.3:
+      TPC-H Q4 shape `EXISTS (SELECT 1 FROM lineitem WHERE
+      l_orderkey = o.o_orderkey …)`, NOT EXISTS, and
+      correlated scalar subquery `(SELECT count(*) FROM
+      lineitem WHERE l_orderkey = o.o_orderkey)` all return
+      correct rows. Subquery decorrelation, initplan
+      caching, ANY/SOME/ALL, LATERAL remain deferred — see
+      `docs/design/0003-0008-subqueries.md`.)
 - [x] `CASE` expressions (parser + executor).
       (achieved 2026-04-28: both searched (`CASE WHEN cond THEN
       result …`) and simple (`CASE expr WHEN val THEN result …`)

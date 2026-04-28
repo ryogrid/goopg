@@ -187,6 +187,23 @@ type ColumnRef struct {
 func (e *ColumnRef) Pos() int { return e.pos }
 func (*ColumnRef) exprNode()  {}
 
+// OuterColumnRef refers to a column in an enclosing query's
+// row, set by the executor's outer-row stack before opening a
+// correlated subquery. Level is 1-based (1 = immediate parent
+// scope) — matches upstream's Var.varlevelsup. Only emitted
+// by the planner when a ColumnRef in a subquery resolves up
+// the parent chain instead of locally.
+type OuterColumnRef struct {
+	pos   int
+	Level int
+	Index int
+	Name  string
+	Type  catalog.Type
+}
+
+func (e *OuterColumnRef) Pos() int { return e.pos }
+func (*OuterColumnRef) exprNode()  {}
+
 // ParamRef passes through a bind-parameter placeholder. The executor
 // supplies values at execute time.
 type ParamRef struct {

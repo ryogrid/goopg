@@ -113,6 +113,12 @@ type resolveContext struct {
 	// the top-level planSelect; nil for utility contexts that
 	// don't need catalog access.
 	cat catalog.Catalog
+	// parent is set when this resolveContext is for a subquery —
+	// used by resolveColumnRef to walk up the lexical scope when
+	// a column doesn't resolve locally. Implements upstream's
+	// Var.varlevelsup by counting how many parent links to walk.
+	// nil for the top-level SELECT.
+	parent *resolveContext
 }
 
 type rangeBinding struct {
@@ -226,8 +232,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// this SELECT — subquery planning recurses into Plan(inner,
 	// cat) by reading ctx.cat. Set unconditionally so the
 	// FROM-less and FROM-bearing branches converge.
+	//
+	// planParent (set by planSelectWithParent) wires the
+	// lexical-scope parent for correlated subqueries — the
+	// inner SELECT's top-level ctx points up to the outer
+	// SELECT so resolveColumnRef can walk up.
 	if ctx != nil {
 		ctx.cat = cat
+		ctx.parent = planParent
 	}
 
 	if s.Where != nil {
@@ -815,11 +827,11 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.IntervalLit:
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
-		return planSubqueryExpr(x, agg.input.cat)
+		return planSubqueryExpr(x, agg.input)
 	case *parser.InExpr:
 		return planInExpr(x, agg.input)
 	case *parser.ExistsExpr:
-		return planExistsExpr(x, agg.input.cat)
+		return planExistsExpr(x, agg.input)
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
 		if err != nil {
@@ -1372,17 +1384,15 @@ func exprType(e Expr) catalog.Type {
 
 // planSubqueryExpr plans the SELECT inside a parser
 // SubqueryExpr against the supplied catalog and wraps the
-// resulting Node in a planner.SubqueryExpr. The catalog is
-// threaded down through resolveContext.cat so subqueries
-// inside expressions don't need to receive it as a separate
-// argument at every call site. A nil catalog (utility-only
-// resolveContext) is a configuration error: subqueries
-// shouldn't be reachable through SHOW/SET/RESET.
-func planSubqueryExpr(x *parser.SubqueryExpr, cat catalog.Catalog) (Expr, error) {
-	if cat == nil {
+// resulting Node in a planner.SubqueryExpr. The outer
+// resolveContext is passed in as the inner SELECT's parent
+// so column references in the subquery can resolve up the
+// lexical scope (correlated subqueries).
+func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, error) {
+	if parent == nil || parent.cat == nil {
 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
 	}
-	inner, err := Plan(x.Inner, cat)
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent)
 	if err != nil {
 		return nil, err
 	}
@@ -1390,8 +1400,9 @@ func planSubqueryExpr(x *parser.SubqueryExpr, cat catalog.Catalog) (Expr, error)
 }
 
 // planInExpr resolves the operand and either plans the inner
-// subquery or recursively resolves the value list, depending
-// on which the parser produced.
+// subquery (passing the outer ctx as parent for correlated
+// references) or recursively resolves the value list,
+// depending on which the parser produced.
 func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	op, err := resolveExpr(x.Operand, ctx)
 	if err != nil {
@@ -1399,10 +1410,10 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	}
 	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated}
 	if x.Subquery != nil {
-		if ctx.cat == nil {
+		if ctx == nil || ctx.cat == nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
 		}
-		inner, err := Plan(x.Subquery, ctx.cat)
+		inner, err := planSelectWithParent(x.Subquery, ctx.cat, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1421,17 +1432,74 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 }
 
 // planExistsExpr plans the inner subquery and wraps in an
-// ExistsExpr. v0 supports only the uncorrelated form.
-func planExistsExpr(x *parser.ExistsExpr, cat catalog.Catalog) (Expr, error) {
-	if cat == nil {
+// ExistsExpr. The outer ctx becomes the inner SELECT's
+// parent for column-reference walk-up.
+func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) {
+	if parent == nil || parent.cat == nil {
 		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "EXISTS not supported in this context"}
 	}
-	inner, err := Plan(x.Subquery, cat)
+	inner, err := planSelectWithParent(x.Subquery, parent.cat, parent)
 	if err != nil {
 		return nil, err
 	}
 	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner}, nil
 }
+
+// planSelectWithParent plans an inner SELECT with the supplied
+// resolveContext as the lexical-scope parent. Used by
+// SubqueryExpr / InExpr / ExistsExpr to enable correlated
+// references. The resulting plan tree may contain
+// OuterColumnRef nodes that the executor resolves against its
+// outer-row stack at runtime.
+//
+// Two parent channels are wired: planParent (planner-side, so
+// resolveColumnRef can walk up the resolveContext chain) and
+// the analyzer's outer-scope channel (so the recursive
+// Analyze pass that Plan() invokes also sees the outer
+// scope). Both are restored on return.
+func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext) (Node, error) {
+	prevParent := planParent
+	planParent = parent
+	defer func() { planParent = prevParent }()
+
+	// Build the analyzer-side OuterScope chain mirroring the
+	// resolveContext chain.
+	if scope := buildAnalyzerOuterScope(parent); scope != nil {
+		restore := analyzer.SetOuterScope(scope)
+		defer restore()
+	}
+	return Plan(stmt, cat)
+}
+
+// buildAnalyzerOuterScope walks a resolveContext chain and
+// produces the analyzer's parallel OuterScope chain so the
+// recursive Analyze call sees the same outer FROM-clause
+// relations the planner sees. The inner-most scope is
+// returned; analyzer.SetOuterScope is the consumer.
+func buildAnalyzerOuterScope(ctx *resolveContext) *analyzer.OuterScope {
+	if ctx == nil || ctx.cat == nil {
+		return nil
+	}
+	parent := buildAnalyzerOuterScope(ctx.parent)
+	rels := make([]analyzer.OuterRelation, 0, len(ctx.bindings))
+	for _, b := range ctx.bindings {
+		rels = append(rels, analyzer.OuterRelation{Table: b.table, Alias: b.alias})
+	}
+	return analyzer.NewOuterScope(ctx.cat, rels, parent)
+}
+
+// planParent is the goroutine-thread-unsafe "current outer
+// resolveContext" used by planSelect to seed its top-level
+// resolveContext's parent field. This is a v0 simplification
+// — Plan() / planSelect / planFromClause take cat as a
+// parameter, and re-threading a parent argument through every
+// helper would be more invasive than the package-level
+// channel. Each public Plan() call is sequential at the
+// boundary, so the outer goroutine is the only writer.
+//
+// Future cleanup: add explicit parent params to Plan() / the
+// internal helpers.
+var planParent *resolveContext
 
 // resolveCaseExpr translates a parser CaseExpr into a planner
 // CaseExpr, recursively resolving each Operand / When / Then /
@@ -1481,11 +1549,11 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.IntervalLit:
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
-		return planSubqueryExpr(x, ctx.cat)
+		return planSubqueryExpr(x, ctx)
 	case *parser.InExpr:
 		return planInExpr(x, ctx)
 	case *parser.ExistsExpr:
-		return planExistsExpr(x, ctx.cat)
+		return planExistsExpr(x, ctx)
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, ctx)
 		if err != nil {
@@ -1542,8 +1610,33 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 }
 
 func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
+	// Walk the lexical scope chain. level=0 is the local
+	// resolveContext; level=N is N parents up — matches
+	// upstream's Var.varlevelsup. Found-but-ambiguous in the
+	// local scope is an error; ambiguity at a parent level
+	// shadows the further parents (no error). Found at parent
+	// level produces an OuterColumnRef.
+	level := 0
+	for cur := ctx; cur != nil; cur = cur.parent {
+		ref, ok, err := resolveColumnRefAt(x, cur, level)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return ref, nil
+		}
+		level++
+	}
+	return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+}
+
+// resolveColumnRefAt tries to resolve x against a single
+// resolveContext level. Returns (nil, false, nil) on miss so
+// the caller walks up; (expr, true, nil) on hit; or an error
+// for in-scope ambiguity / missing-FROM diagnostics.
+func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Expr, bool, error) {
 	if len(ctx.bindings) == 0 {
-		return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+		return nil, false, nil
 	}
 
 	if x.Table != "" || x.Schema != "" {
@@ -1554,22 +1647,30 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 			}
 		}
 		if len(matches) == 0 {
-			return nil, &PlanError{Pos: x.Pos(), Code: "42P01", Message: fmt.Sprintf("missing FROM-clause entry for table %q", x.Table)}
+			// Not in this level — caller walks up.
+			return nil, false, nil
 		}
 		if len(matches) > 1 {
-			return nil, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", x.Table)}
+			return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", x.Table)}
 		}
 		b := matches[0]
 		for i, c := range b.table.Columns {
 			if strings.EqualFold(c.Name, x.Column) {
 				idx := b.offset + i
-				return &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type}, nil
+				if level == 0 {
+					return &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type}, true, nil
+				}
+				return &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type}, true, nil
 			}
 		}
-		return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+		// The qualifier matched a binding at this level but the
+		// column didn't — that's a hard error (no point walking
+		// up; an outer-scope `t.c` for a different `t` would be
+		// caught by the qualifier mismatch instead).
+		return nil, false, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
 	}
 
-	var found *ColumnRef
+	var found Expr
 	for _, b := range ctx.bindings {
 		for i, c := range b.table.Columns {
 			if !strings.EqualFold(c.Name, x.Column) {
@@ -1577,15 +1678,19 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 			}
 			idx := b.offset + i
 			if found != nil {
-				return nil, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
+				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
 			}
-			found = &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type}
+			if level == 0 {
+				found = &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type}
+			} else {
+				found = &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type}
+			}
 		}
 	}
 	if found != nil {
-		return found, nil
+		return found, true, nil
 	}
-	return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+	return nil, false, nil
 }
 
 func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
