@@ -217,16 +217,20 @@ func CompareKeys(a, b []byte) int {
 //     synchronise through per-page Slot.RLock() latches and use
 //     Lehman-Yao right-link recovery to recover from concurrent
 //     splits.
-//   - Inserts hold bt.mu so only one writer mutates the tree at a
-//     time. Per-page Slot.Lock() guards each mutation site so
-//     readers can run alongside the writer; writer-vs-writer
-//     concurrency lands in Landing 3 along with split WAL records.
+//   - Inserts take one of two paths:
+//   - fast path: non-splitting leaf inserts run under the target
+//     page's Slot.Lock only, so writers on different pages proceed
+//     in parallel.
+//   - split path: page splits (and their parent/root/meta updates)
+//     are serialised through splitMu to keep tree-structure changes
+//     atomic while Landing 3's full writer-coupling protocol is
+//     still staged.
 type BTree struct {
 	pool     *storage.Pool
 	rel      storage.RelFileNode
 	logSplit LogSplitFunc
 
-	mu sync.Mutex
+	splitMu sync.Mutex
 }
 
 // LogSplitFunc emits the atomic page-split WAL record described in
@@ -291,8 +295,6 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 // CreateWithOptions is the wired-up Create variant.
 func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
 	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
-	bt.mu.Lock()
-	defer bt.mu.Unlock()
 
 	// Block 0: metapage.
 	metaSlot, metaBlk, err := pool.PinNew(rel)
@@ -453,7 +455,7 @@ func (bt *BTree) markDirtyWithPageRecord(slot *storage.Slot, blk storage.BlockNu
 }
 
 // updateRootMeta rewrites the metapage root pointer + level. Caller
-// must hold bt.mu (writers serialise tree-wide).
+// must hold bt.splitMu (structural writer serialisation).
 func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	slot, err := bt.pinW(MetaBlock)
 	if err != nil {
@@ -568,18 +570,62 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 // Insert places (key, ptr) into the leaf where it belongs, splitting
 // pages on the way up if needed.
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
-	bt.mu.Lock()
-	defer bt.mu.Unlock()
+	it := item{
+		keyLen: uint16(len(key)),
+		ptr:    ptr,
+		key:    append([]byte(nil), key...),
+	}
+
+	// Fast path: no split required. Writers touching different leaves
+	// only contend on those page latches, not on a tree-wide mutex.
+	if err := bt.tryInsertNoSplit(it); err == nil {
+		return nil
+	} else if !errors.Is(err, errNeedsSplit) {
+		return err
+	}
+
+	// Split path: serialise structure changes (split propagation,
+	// root lift, metapage rewrite), then retry from a fresh descent.
+	bt.splitMu.Lock()
+	defer bt.splitMu.Unlock()
 
 	leafBlk, path, err := bt.descendToLeaf(key)
 	if err != nil {
 		return err
 	}
-	return bt.insertIntoBlock(leafBlk, path, item{
-		keyLen: uint16(len(key)),
-		ptr:    ptr,
-		key:    append([]byte(nil), key...),
-	})
+	return bt.insertIntoBlock(leafBlk, path, it)
+}
+
+var errNeedsSplit = errors.New("btree: insert needs split")
+
+func (bt *BTree) tryInsertNoSplit(it item) error {
+	leafBlk, _, err := bt.descendToLeaf(it.key)
+	if err != nil {
+		return err
+	}
+	slot, err := bt.pinW(leafBlk)
+	if err != nil {
+		return err
+	}
+	defer bt.unpinW(slot)
+
+	op := readOpaque(slot.Page())
+	if keyExceedsHighKey(op, it.key) {
+		return errNeedsSplit
+	}
+	if !pageHasSpaceFor(slot.Page(), it) {
+		return errNeedsSplit
+	}
+
+	insertItemSorted(slot.Page(), it)
+	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
+		itemBytes := it.marshal()
+		return bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+			return logIns(bt.rel, leafBlk, itemBytes)
+		})
+	}
+	bt.pool.MarkDirty(slot)
+	return nil
 }
 
 // insertIntoBlock inserts `it` into the page at blk. If the page

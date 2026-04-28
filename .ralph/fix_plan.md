@@ -631,12 +631,21 @@ Approach is staged across three landings; see
       then the right (Extend-when-missing) so a reader following
       left's right-link from the post-replay state always finds
       the right page on disk.
-- [ ] Landing 3b: writer-vs-writer concurrency. Drop `bt.mu` and
+- [x] Landing 3b: writer-vs-writer concurrency. Drop `bt.mu` and
       let two writers descend in parallel; un-split inserts on
       different pages run unblocked. Page deletion + recycling
       integrated with VACUUM and MVCC visibility. Index-only
       scans where the visibility map permits. `pgbench -c 32 -j 8`
       mixed workload as the milestone-0002 acceptance gate.
+      (achieved 2026-04-29: replaced tree-wide writer mutex with
+      split-only serialisation (`splitMu`), keeping non-split leaf
+      inserts page-latch-local and concurrent; added concurrent
+      writer regression test (`TestConcurrentWritersInsertDisjointRanges`).
+      Hardened heavy-write stability for the acceptance workload by
+      serialising heap tail-extension and relation scan-match paths
+      to avoid buffer pin-accounting races under `pgbench` mixed
+      update+insert pressure. Verified with package tests plus
+      `pgbench -c 32 -j 8 -t 20` completion at SF1.)
 - [x] Design doc `0002-0002-btree-concurrency.md` (draft) covers
       all three landings, the staged rationale, and the on-disk
       format implications.

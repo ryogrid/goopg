@@ -386,6 +386,23 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	tag := BufferTag{Rel: rel, Block: blk}
 
 	p.poolMu.Lock()
+	if idx, ok := p.byTag[tag]; ok {
+		// Another goroutine already loaded/published this freshly
+		// extended block while we were outside poolMu. Reuse that
+		// slot and release ours back to the free pool.
+		existing := p.slots[idx]
+		existing.pinCount++
+		if existing.usageCount < maxUsageCount {
+			existing.usageCount++
+		}
+		s.tag = BufferTag{}
+		s.valid = false
+		s.dirty = false
+		s.pinCount = 0
+		s.usageCount = 0
+		p.poolMu.Unlock()
+		return existing, blk, nil
+	}
 	s.tag = tag
 	s.valid = true
 	s.dirty = true // Extend wrote it but the in-memory page was just initialised; flag dirty so any subsequent mutation flushes
@@ -429,30 +446,46 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	delete(p.byTag, s.tag)
 	s.valid = false
 	s.dirty = false
-	// Provisionally bind the new tag so concurrent Pin of the same
-	// tag finds the slot rather than picking another victim. We mark
-	// it not-valid until the disk read completes.
-	s.tag = tag
+	// Reserve this slot while I/O runs outside poolMu.
+	s.tag = BufferTag{}
 	s.pinCount = 1
 	s.usageCount = 1
-	p.byTag[tag] = slotIdx
 	p.poolMu.Unlock()
 
 	s.contentMu.Lock()
 	err = p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
 	s.contentMu.Unlock()
 	if err != nil {
-		// Roll back the tentative binding.
 		p.poolMu.Lock()
-		delete(p.byTag, tag)
 		s.tag = BufferTag{}
 		s.pinCount = 0
+		s.usageCount = 0
 		s.valid = false
+		s.dirty = false
 		p.poolMu.Unlock()
 		return nil, err
 	}
 	p.poolMu.Lock()
+	if idx, ok := p.byTag[tag]; ok {
+		// Another goroutine published this tag while we were doing I/O.
+		// Use that slot and release ours.
+		existing := p.slots[idx]
+		existing.pinCount++
+		if existing.usageCount < maxUsageCount {
+			existing.usageCount++
+		}
+		s.tag = BufferTag{}
+		s.pinCount = 0
+		s.usageCount = 0
+		s.valid = false
+		s.dirty = false
+		p.poolMu.Unlock()
+		return existing, nil
+	}
+	s.tag = tag
 	s.valid = true
+	s.dirty = false
+	p.byTag[tag] = slotIdx
 	p.poolMu.Unlock()
 	return s, nil
 }

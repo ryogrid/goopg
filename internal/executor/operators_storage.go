@@ -2,12 +2,30 @@ package executor
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+var heapExtendLocks sync.Map // map[storage.RelFileNode]*sync.Mutex
+var scanMatchLocks sync.Map  // map[storage.RelFileNode]*sync.Mutex
+
+func lockHeapExtend(rel storage.RelFileNode) func() {
+	v, _ := heapExtendLocks.LoadOrStore(rel, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+func lockScanMatch(rel storage.RelFileNode) func() {
+	v, _ := scanMatchLocks.LoadOrStore(rel, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
 
 // seqScanOp walks every block of a heap relation, yielding visible
 // tuples decoded into the planner's column ordering. Visibility is
@@ -394,6 +412,9 @@ func (o *deleteOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column
 }
 
 func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
+	unlock := lockScanMatch(rel)
+	defer unlock()
+
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
@@ -486,17 +507,10 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 	}
 
 	logHeap := ctx.Pool.LogHeapInsert()
-
-	// Try the last existing block first.
-	nBlocks, err := ctx.Pool.NBlocks(rel)
-	if err != nil {
-		return err
-	}
-	if nBlocks > 0 {
-		blk := nBlocks - 1
+	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
-			return err
+			return false, err
 		}
 		// Hold the page's content lock across the
 		// IsNew/InitPage/PageAddHeapTuple read-modify-write window
@@ -510,23 +524,61 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			if err := storage.InitPage(slot.Page()); err != nil {
 				slot.Unlock()
 				ctx.Pool.Unpin(slot)
-				return err
+				return false, err
 			}
 		}
 		if lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
 			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
-			return derr
+			return true, derr
 		} else if !errors.Is(err, storage.ErrNoSpaceInPage) {
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
-			return err
+			return false, err
 		}
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
+		return false, nil
 	}
-	// Extend.
+
+	// Try the last existing block first.
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if nBlocks > 0 {
+		appended, err := tryAppendToBlock(nBlocks - 1)
+		if err != nil {
+			return err
+		}
+		if appended {
+			return nil
+		}
+	}
+
+	// Extend. Serialise relation extension so concurrent writers don't
+	// race on PinNew and corrupt pin accounting for the freshly-grown
+	// tail block under heavy insert workloads.
+	unlock := lockHeapExtend(rel)
+	defer unlock()
+
+	// Re-check after taking the extension lock; another writer may
+	// already have extended and/or inserted into the new tail block.
+	nBlocks, err = ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if nBlocks > 0 {
+		appended, err := tryAppendToBlock(nBlocks - 1)
+		if err != nil {
+			return err
+		}
+		if appended {
+			return nil
+		}
+	}
+
 	slot, blk, err := ctx.Pool.PinNew(rel)
 	if err != nil {
 		return err

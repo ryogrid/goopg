@@ -308,6 +308,57 @@ func TestConcurrentInsertSearch(t *testing.T) {
 	}
 }
 
+// TestConcurrentWritersInsertDisjointRanges covers Landing 3b's core
+// promise: writers should no longer serialize behind a tree-wide mutex.
+// Two writers insert disjoint key ranges concurrently while splits are
+// possible; every key must be searchable after completion.
+func TestConcurrentWritersInsertDisjointRanges(t *testing.T) {
+	bt, _, cleanup := newTestTree(t)
+	defer cleanup()
+
+	const perWriter = 700
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+
+	writer := func(base int32) {
+		defer wg.Done()
+		for i := 0; i < perWriter; i++ {
+			k := base + int32(i)
+			ptr := storage.ItemPointer{Block: storage.BlockNumber(k + 1), Offset: 1}
+			if err := bt.Insert(EncodeInt4(k), ptr); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}
+
+	wg.Add(2)
+	go writer(0)
+	go writer(100_000)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent writer insert: %v", err)
+		}
+	}
+
+	for i := 0; i < perWriter; i++ {
+		for _, k := range []int32{int32(i), 100_000 + int32(i)} {
+			ptr, ok, err := bt.Search(EncodeInt4(k))
+			if err != nil {
+				t.Fatalf("Search(%d): %v", k, err)
+			}
+			if !ok {
+				t.Fatalf("Search(%d): not found", k)
+			}
+			if ptr.Block != storage.BlockNumber(k+1) {
+				t.Fatalf("Search(%d): block=%d want=%d", k, ptr.Block, k+1)
+			}
+		}
+	}
+}
+
 // TestReopen ensures a freshly-Open'd handle observes the same metapage
 // state — i.e. the on-disk format is internally consistent.
 func TestReopen(t *testing.T) {
