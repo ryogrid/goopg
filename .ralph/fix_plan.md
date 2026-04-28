@@ -505,9 +505,12 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       server_version) as queryable virtual tables.
 - [ ] Crash-recovery test: `SIGKILL` mid-workload, restart, verify
       committed transactions survive and in-flight ones don't.
-- [ ] Design doc `NNNN-checkpointing.md` covering all of the above
-      (only the items in this milestone — recovery is in M1's WAL
-      doc).
+- [x] Design doc `m0002-0001-checkpointing.md` covering all of the
+      above (FPI-on-first-dirty, max_wal_size volume trigger,
+      spread/paced writeback, GUC surface, SQL CHECKPOINT, structural
+      seams). Recovery itself was already covered in M1's
+      `root-0008-wal-and-recovery.md`; this doc cross-references it
+      and only describes the producer-side machinery.
 
 ### Concurrent B-tree (Lehman-Yao + PG modifications)
 
