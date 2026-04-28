@@ -124,16 +124,26 @@ unchecked item unless a dependency forces a different order.
 
 ## Milestone 5 — Storage, MVCC, WAL
 
-- [ ] Buffer manager with O_DIRECT-aligned page buffers.
+- [x] Buffer manager with O_DIRECT-aligned page buffers.
+      `internal/storage` ships an mmap-backed page-aligned arena
+      carved into BlockSize=8192 slots, a smgr (Manager) that opens
+      per-relation files with optional `O_DIRECT|O_DSYNC` and exposes
+      `ReadBlock`/`WriteBlock`/`Extend`/`NBlocks`/`Sync` at block
+      offsets, and a clock-sweep `Pool` with `Pin`/`PinNew`/`Unpin`/
+      `MarkDirty`/`FlushAll`. PageHeaderData layout matches upstream
+      byte-for-byte (`InitPage` writes pd_lower=24, pd_upper=8192,
+      pd_pagesize_version=0x2004). Tests pin the header layout, smgr
+      round-trip, dirty-eviction-flushes-back, and the
+      `ErrNoBuffer`/recovery path.
+- [x] Design docs: `0005-buffer-manager.md`, `0006-storage-format.md`.
 - [ ] Heap and tuple format with xmin/xmax visibility metadata.
 - [ ] Snapshot manager with `READ COMMITTED` and `REPEATABLE READ` semantics.
 - [ ] WAL writer with `fdatasync` on commit; checkpointer goroutine.
 - [ ] Crash recovery (replay WAL up to the last consistent checkpoint).
 - [ ] B-tree index access method.
 - [ ] `VACUUM` and `ANALYZE` minimal implementations.
-- [ ] Design docs: `0005-buffer-manager.md`, `0006-storage-format.md`,
-      `0007-mvcc-and-snapshots.md`, `0008-wal-and-recovery.md`,
-      `0009-btree.md`.
+- [ ] Design docs: `0007-mvcc-and-snapshots.md`,
+      `0008-wal-and-recovery.md`, `0009-btree.md`.
 
 ## Milestone 6 — SQL surface for pgbench
 
