@@ -64,6 +64,12 @@ const (
 	KwTrue        Keyword = "true"
 	KwFalse       Keyword = "false"
 	KwIs          Keyword = "is"
+	KwInsert      Keyword = "insert"
+	KwInto        Keyword = "into"
+	KwValues      Keyword = "values"
+	KwUpdate      Keyword = "update"
+	KwDelete      Keyword = "delete"
+	KwReturning   Keyword = "returning"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -106,6 +112,12 @@ var keywords = map[string]Keyword{
 	"true":        KwTrue,
 	"false":       KwFalse,
 	"is":          KwIs,
+	"insert":      KwInsert,
+	"into":        KwInto,
+	"values":      KwValues,
+	"update":      KwUpdate,
+	"delete":      KwDelete,
+	"returning":   KwReturning,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

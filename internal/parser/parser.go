@@ -142,6 +142,12 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseReset()
 	case KwSelect:
 		return p.parseSelect()
+	case KwInsert:
+		return p.parseInsert()
+	case KwUpdate:
+		return p.parseUpdate()
+	case KwDelete:
+		return p.parseDelete()
 	}
 	return nil, p.errAtCur("unsupported statement")
 }

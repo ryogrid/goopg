@@ -149,3 +149,56 @@ type SelectStmt struct {
 
 func (s *SelectStmt) Pos() int  { return s.pos }
 func (s *SelectStmt) stmtNode() {}
+
+// InsertStmt — `INSERT INTO target [(col, …)] VALUES (val, …) [, …]
+//
+//	[RETURNING target_list]`. v0 supports literal VALUES rows only;
+//
+// `INSERT … SELECT` and ON CONFLICT clauses are deferred.
+type InsertStmt struct {
+	pos       int
+	Target    RangeVar
+	Columns   []string // empty when no column list — INSERT defaults to declared order
+	Rows      [][]Expr // each row is a parenthesised tuple
+	Returning []ResTarget
+}
+
+func (s *InsertStmt) Pos() int  { return s.pos }
+func (s *InsertStmt) stmtNode() {}
+
+// UpdateAssign is one `column = expr` pair in an UPDATE SET clause.
+type UpdateAssign struct {
+	pos    int
+	Column string
+	Expr   Expr
+}
+
+func (a UpdateAssign) Pos() int { return a.pos }
+
+// UpdateStmt — `UPDATE target SET col = expr [, …] [WHERE expr]
+//
+//	[RETURNING target_list]`. FROM-clause joins in UPDATE are
+//
+// deferred.
+type UpdateStmt struct {
+	pos       int
+	Target    RangeVar
+	Set       []UpdateAssign
+	Where     Expr // nil when absent
+	Returning []ResTarget
+}
+
+func (s *UpdateStmt) Pos() int  { return s.pos }
+func (s *UpdateStmt) stmtNode() {}
+
+// DeleteStmt — `DELETE FROM target [WHERE expr] [RETURNING target_list]`.
+// USING-clause joins in DELETE are deferred.
+type DeleteStmt struct {
+	pos       int
+	Target    RangeVar
+	Where     Expr // nil when absent
+	Returning []ResTarget
+}
+
+func (s *DeleteStmt) Pos() int  { return s.pos }
+func (s *DeleteStmt) stmtNode() {}

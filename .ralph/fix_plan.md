@@ -205,7 +205,12 @@ unchecked item unless a dependency forces a different order.
         GROUP BY, HAVING, and set operations are still deferred.
   - [ ] Statement parsers: JOIN clauses, GROUP BY, HAVING, set operations
         for the SELECT shapes pgbench reports queries need.
-  - [ ] Statement parsers: `INSERT`, `UPDATE`, `DELETE`.
+  - [x] Statement parsers: `INSERT INTO t [(col, …)] VALUES (val, …) [, …]
+        [RETURNING target_list]`, `UPDATE t SET col = expr [, …]
+        [WHERE expr] [RETURNING target_list]`, `DELETE FROM t
+        [WHERE expr] [RETURNING target_list]`. Pgbench's INSERT into
+        pgbench_history and the abalance UPDATE/SELECT pair parse
+        end-to-end.
   - [ ] Statement parsers: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`,
         `DROP INDEX`, `TRUNCATE`.
   - [ ] Analyzer pass (name resolution, type checking) once the catalog
