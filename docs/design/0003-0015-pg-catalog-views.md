@@ -91,6 +91,39 @@ SELECT relname FROM pg_class WHERE relname = 'region';
 -- region                       (regression check — pg_class still works)
 ```
 
+### `pg_catalog.pg_database` / `pg_roles` / `pg_tables`
+
+HammerDB's bootstrap also probes `pg_database`, `pg_roles`, and
+`pg_tables` before issuing CREATE DATABASE / CREATE USER and
+during checkschema. v0 adds the three views with the same
+virtual-row pattern:
+
+- `pg_database` — single seeded row `(postgres, 10, 6)`. v0
+  doesn't track multiple databases (single dbOid), so any
+  query for a non-`postgres` name filters to zero rows and
+  HammerDB takes the CREATE DATABASE branch which the
+  dispatch.go no-op compatibility tag absorbs.
+- `pg_roles` — single seeded row `(postgres, t, t)` for the
+  same reason. CREATE USER + GRANT + ALTER USER all flow
+  through dispatch.go's compat tags (ALTER USER added in this
+  loop alongside the views).
+- `pg_tables` — walks user (non-virtual) tables in
+  deterministic key order, emitting
+  `(schemaname, tablename, tableowner)`. checkschema's
+  `SELECT EXISTS (SELECT FROM pg_tables WHERE …)` shape
+  needs targetless SELECT, so the parser was extended to
+  accept an empty target list when followed by FROM
+  (matches upstream PG).
+
+### Targetless SELECT
+
+Upstream PG accepts `SELECT FROM tbl` (no target list — emits
+one zero-column row per source row). HammerDB writes
+`SELECT EXISTS (SELECT FROM pg_tables WHERE …)` with this
+shape. The parser's `parseSelect` now skips
+`parseTargetList` when the next token is `FROM`, leaving
+`Targets` empty so EXISTS can short-circuit on row presence.
+
 ## Out of scope (deferred)
 
 - A configurable `search_path` GUC. v0 hardwires the
@@ -99,5 +132,8 @@ SELECT relname FROM pg_class WHERE relname = 'region';
   strings; upstream pg_indexes would synthesise
   `CREATE INDEX ... ON ... USING btree (...)` from
   `pg_index.indkey`, which v0 doesn't track.
+- Real multi-database / multi-role tracking through the
+  catalog. v0 seeds one row each for `pg_database` and
+  `pg_roles`.
 - Other pg_catalog views HammerDB doesn't probe yet
   (`pg_namespace`, `pg_attribute`, `pg_index`).

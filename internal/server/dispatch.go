@@ -98,6 +98,8 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "CREATE DATABASE", true
 	case strings.HasPrefix(norm, "alter database "):
 		return "ALTER DATABASE", true
+	case strings.HasPrefix(norm, "alter user "), strings.HasPrefix(norm, "alter role "):
+		return "ALTER ROLE", true
 	case strings.HasPrefix(norm, "drop database "):
 		return "DROP DATABASE", true
 	case strings.HasPrefix(norm, "drop user "), strings.HasPrefix(norm, "drop role "):

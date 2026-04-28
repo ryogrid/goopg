@@ -281,6 +281,93 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_indexes"] = pgIndexes
+
+	// pg_database — HammerDB probes
+	// `SELECT 1 FROM pg_database WHERE datname = '<db>'` to
+	// decide whether to issue CREATE DATABASE. v0 doesn't track
+	// multiple databases (single dbOid), so the seeded row is
+	// the conventional `postgres` superuser DB. A query for any
+	// other name filters to zero rows → HammerDB takes the
+	// CREATE-DATABASE branch which the dispatch.go no-op
+	// compatibility tag absorbs.
+	pgDatabase := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_database",
+		Columns: []Column{
+			{Name: "datname", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 2},
+		},
+		OID:     1262, // upstream's DatabaseRelationId
+		Virtual: true,
+	}
+	pgDatabase.VirtualRows = func() [][]string {
+		return [][]string{{"postgres", "10", "6"}}
+	}
+	c.tables["pg_catalog.pg_database"] = pgDatabase
+
+	// pg_roles — HammerDB probes
+	// `SELECT 1 FROM pg_roles WHERE rolname = '<user>'` before
+	// CREATE USER. v0's auth layer doesn't expose role state
+	// through the catalog, so the seeded row is the conventional
+	// `postgres` superuser. Other names filter to zero, and
+	// the dispatch.go CREATE USER no-op handles the follow-up.
+	pgRoles := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_roles",
+		Columns: []Column{
+			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 2},
+		},
+		OID:     1260, // upstream's AuthIdRelationId
+		Virtual: true,
+	}
+	pgRoles.VirtualRows = func() [][]string {
+		return [][]string{{"postgres", "t", "t"}}
+	}
+	c.tables["pg_catalog.pg_roles"] = pgRoles
+
+	// pg_tables — HammerDB probes
+	// `SELECT 1 FROM pg_tables WHERE schemaname = 'public'` to
+	// decide whether the target DB is empty before
+	// CreateTables and `SELECT EXISTS (... WHERE tablename =
+	// '<t>')` during checkschema. Walks user (non-virtual)
+	// tables in deterministic key order.
+	pgTables := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_tables",
+		Columns: []Column{
+			{Name: "schemaname", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "tablename", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "tableowner", Type: Type{Name: "text"}, Ordinal: 2},
+		},
+		OID:     1259101, // synthetic — upstream's pg_tables is a view, no fixed OID
+		Virtual: true,
+	}
+	pgTables.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		keys := make([]string, 0, len(c.tables))
+		for k := range c.tables {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var out [][]string
+		for _, k := range keys {
+			t := c.tables[k]
+			if t.Virtual {
+				continue
+			}
+			schema := t.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			out = append(out, []string{schema, t.Name, "postgres"})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_tables"] = pgTables
 }
 
 // RegisterVirtualTable installs a virtual table built by an

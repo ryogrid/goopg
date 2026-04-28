@@ -968,6 +968,30 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] `pg_catalog.pg_database`, `pg_roles`, `pg_tables` views +
+      targetless `SELECT FROM tbl` for HammerDB bootstrap +
+      checkschema.
+      (achieved 2026-04-29: HammerDB's bootstrap probes
+      `SELECT 1 FROM pg_roles WHERE rolname = '<u>'`,
+      `SELECT 1 FROM pg_database WHERE datname = '<db>'`,
+      `SELECT 1 FROM pg_tables WHERE schemaname = 'public'`,
+      and `SELECT EXISTS (SELECT FROM pg_tables WHERE
+      schemaname='public' AND tablename='<t>')`. Without
+      these the buildschema flow couldn't even start. Now:
+      pg_database and pg_roles are seeded with a single
+      conventional `postgres` row each (other names filter
+      to zero rows so HammerDB's CREATE branches run via
+      the dispatch.go no-op tags); pg_tables walks user
+      (non-virtual) tables in deterministic key order with
+      `(schemaname, tablename, tableowner)`. ALTER USER /
+      ALTER ROLE join the existing CREATE USER /
+      CREATE DATABASE / GRANT no-op compatibility tags.
+      Parser extended to accept targetless `SELECT FROM tbl`
+      (matches upstream; required for the EXISTS shape).
+      Verified via psql 18.3 against all four HammerDB probe
+      shapes. `TestPgCatalogBootstrapViews` pins lookup +
+      VirtualRows shape. See
+      `docs/design/0003-0015-pg-catalog-views.md`.)
 - [x] `pg_catalog.pg_indexes` virtual view for HammerDB checkschema.
       (achieved 2026-04-29: HammerDB's checkschema step probes
       `SELECT tablename, indexname FROM pg_indexes WHERE

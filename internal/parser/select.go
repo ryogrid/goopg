@@ -27,11 +27,19 @@ func (p *parser) parseSelect() (Stmt, error) {
 	if p.acceptKeyword(KwDistinct) {
 		s.Distinct = true
 	}
-	tgts, err := p.parseTargetList()
-	if err != nil {
-		return nil, err
+	// Empty target list: `SELECT FROM <table>` is valid in
+	// upstream PG (returns one zero-column row per source row);
+	// HammerDB writes
+	// `SELECT EXISTS (SELECT FROM pg_tables WHERE …)` with this
+	// shape. Skip the target-list parse when the next token is
+	// FROM and synthesize an empty Targets slice.
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) {
+		tgts, err := p.parseTargetList()
+		if err != nil {
+			return nil, err
+		}
+		s.Targets = tgts
 	}
-	s.Targets = tgts
 
 	if p.acceptKeyword(KwFrom) {
 		fromExprs, from, err := p.parseFromList()

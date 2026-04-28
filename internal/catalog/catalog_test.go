@@ -131,6 +131,39 @@ func TestCatalogAddColumn(t *testing.T) {
 	}
 }
 
+// TestPgCatalogBootstrapViews pins the pg_database / pg_roles /
+// pg_tables virtual views HammerDB queries during bootstrap +
+// checkschema. Each is exposed under pg_catalog and resolves
+// unqualified via the search_path fallback.
+func TestPgCatalogBootstrapViews(t *testing.T) {
+	c := NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "items"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"pg_database", "pg_roles", "pg_tables"} {
+		v, ok := c.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("LookupTable(%s) failed — search_path fallback not honored", name)
+		}
+		if !v.Virtual || v.VirtualRows == nil {
+			t.Fatalf("%s is not a virtual view", name)
+		}
+		rows := v.VirtualRows()
+		if len(rows) == 0 {
+			t.Errorf("%s: empty rows", name)
+		}
+	}
+
+	tables, _ := c.LookupTable(parser.ObjectName{Name: "pg_tables"})
+	got := tables.VirtualRows()
+	if len(got) != 1 || got[0][1] != "items" {
+		t.Errorf("pg_tables rows=%v want one (public, items, postgres)", got)
+	}
+}
+
 // TestPgIndexesView pins the pg_catalog.pg_indexes virtual
 // view that HammerDB's checkschema queries. Each index on a
 // non-virtual table should produce one row with
