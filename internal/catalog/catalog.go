@@ -61,6 +61,33 @@ type Table struct {
 	// scan.
 	View               *parser.SelectStmt
 	ViewColumnAliases  []string
+
+	// Stats holds the most recent ANALYZE output for this
+	// table. nil before ANALYZE has run; the planner treats nil
+	// as "no statistics yet" and falls back to the legacy
+	// rules-only join order. Mirrors upstream's pg_class
+	// reltuples / relpages plus per-column pg_statistic data.
+	Stats *TableStats
+}
+
+// TableStats captures the pg_class-shaped table-level stats
+// plus per-column NDistinct. v0 doesn't yet track MCV lists
+// or histograms — see
+// docs/design/0003-0010-analyze-statistics.md.
+type TableStats struct {
+	RowCount int64
+	Pages    int
+	AvgWidth float64
+	Columns  []ColumnStats
+}
+
+// ColumnStats is the per-column pg_statistic-shaped subset v0
+// collects. NDistinct mirrors upstream's stadistinct: the
+// number of distinct non-NULL values seen during ANALYZE.
+// NullFrac is the fraction of NULL rows.
+type ColumnStats struct {
+	NDistinct int64
+	NullFrac  float64
 }
 
 // Index is one index relation in the catalog.
@@ -101,6 +128,7 @@ type Catalog interface {
 	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error)
 	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error)
 	DropView(name parser.ObjectName, ifExists bool) error
+	SetTableStats(table *Table, stats *TableStats)
 	AddColumn(table *Table, col Column) (*Column, error)
 	DropTable(name parser.ObjectName) error
 	DropIndex(name parser.ObjectName) error
@@ -383,6 +411,21 @@ func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []s
 	c.nextOID++
 	c.tables[k] = t
 	return t, nil
+}
+
+// SetTableStats publishes the latest ANALYZE result on the
+// given table. Caller must own the Table pointer (i.e. it
+// came from LookupTable / CreateTable on this catalog).
+// Concurrency: the catalog lock guards table-map mutations
+// only; stats are pointer-replaced atomically so concurrent
+// readers never see a torn struct.
+func (c *InMemory) SetTableStats(table *Table, stats *TableStats) {
+	if table == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	table.Stats = stats
 }
 
 // DropView removes a view from the catalog. Errors when the

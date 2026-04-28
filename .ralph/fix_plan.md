@@ -732,9 +732,22 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       psql 18.3 — output renders identically to upstream's
       text format. Options / ANALYZE / FORMAT JSON deferred —
       see `docs/design/0003-0007-explain.md`.)
-- [ ] `ANALYZE` produces statistics: n_distinct, MCV lists,
+- [x] `ANALYZE` produces statistics: n_distinct, MCV lists,
       histograms (mirror upstream's
       `postgres/src/backend/commands/analyze.c`).
+      (achieved 2026-04-28 with documented v0 scope: full-
+      table scan ANALYZE produces table-level RowCount /
+      Pages / AvgWidth and per-column NDistinct / NullFrac.
+      catalog.TableStats + ColumnStats added; new
+      executor.analyzeOp drives the collection via the buffer
+      pool + DecodeRow; SQL ANALYZE dispatch wired through
+      Build's type-check on AnalyzeStmt. MCV lists,
+      histograms, sampling, and stats-persistence remain
+      deferred — see
+      `docs/design/0003-0010-analyze-statistics.md`. v0's
+      cost model only needs NDistinct for the
+      `|A|*|B|/max(NDistinct(A.k), NDistinct(B.k))` join-
+      cardinality estimate.)
 - [ ] Design docs: `0003-0001-planner-overview.md` (extend M1's
       `root-0011-planner.md`), `0003-0002-join-executors.md`,
       `0003-0003-statistics-and-cardinality.md`,

@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -81,11 +82,13 @@ func Build(plan planner.Node) (Operator, error) {
 		// statements. The wire layer already handles SHOW/SET/RESET
 		// via the legacy string-matching path in
 		// internal/server/query.go, so they shouldn't reach here in
-		// practice. VACUUM and ANALYZE in v0 are optimisations
-		// (their package functions are exposed in internal/vacuum)
-		// and not load-bearing for correctness — emit a no-op
-		// operator that succeeds silently. The wire layer's
-		// commandTagFor builds the right CommandComplete tag.
+		// practice. ANALYZE drives the catalog-stats collector
+		// (per-table row count + per-column NDistinct/NullFrac);
+		// VACUUM still routes through utilityNoOp until the
+		// vacuum package exposes a stmt-driven entry point.
+		if as, ok := p.Stmt.(*parser.AnalyzeStmt); ok {
+			return newAnalyzeOp(as), nil
+		}
 		return newUtilityNoOp(p), nil
 	case *planner.Copy:
 		// COPY is currently driven from the wire-protocol layer
