@@ -214,3 +214,5 @@ The initial milestone is considered complete when **all** of the following hold 
 8. `docs/design/` contains an indexed set of design documents covering every major subsystem implemented to reach this milestone.
 
 Subsequent milestones (broader SQL coverage, replication, SSI, performance work, etc.) are out of scope for this requirements document and will be defined in follow-up requirements as they become relevant.
+
+See docs/milestones/README.md for follow-up milestones.

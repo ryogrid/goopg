@@ -1,6 +1,7 @@
 package initdb
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,12 @@ import (
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// CatalogSnapshotFile is the relative path inside the data
+// directory where the catalog snapshot lives. The file is JSON for
+// v0 — see internal/catalog/persist.go and
+// docs/design/0017-data-directory.md.
+const CatalogSnapshotFile = "global/pg_catalog.json"
 
 // Runtime is the bundle of long-lived handles a running goopg
 // server needs to drive table-touching statements: a storage
@@ -79,13 +86,83 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: bufpool: %w", err)
 	}
 
+	cat := catalog.NewInMemory()
+	if err := loadCatalogSnapshot(abs, cat); err != nil {
+		_ = pool.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+
 	return &Runtime{
 		StorageMgr: mgr,
 		Pool:       pool,
 		TxnMgr:     mvcc.NewManager(),
-		Catalog:    catalog.NewInMemory(),
+		Catalog:    cat,
 		DataDir:    abs,
 	}, nil
+}
+
+// loadCatalogSnapshot reads <dir>/global/pg_catalog.json (if
+// present) into cat. A missing file is fine — that's the
+// fresh-from-init case. Anything else (read error, JSON parse
+// error, Restore error) propagates: the operator is better off
+// seeing a startup failure than running with a half-loaded
+// schema.
+func loadCatalogSnapshot(dir string, cat *catalog.InMemory) error {
+	path := filepath.Join(dir, CatalogSnapshotFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("goopg: read catalog snapshot %q: %w", path, err)
+	}
+	var snap catalog.Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("goopg: parse catalog snapshot %q: %w", path, err)
+	}
+	if err := cat.Restore(snap); err != nil {
+		return fmt.Errorf("goopg: restore catalog snapshot %q: %w", path, err)
+	}
+	return nil
+}
+
+// SaveCatalog writes the in-memory catalog to disk so a subsequent
+// Open recovers the same schema. Callers (typically the goopg
+// start shutdown path) should call this before Close. Returns nil
+// when r is nil or the catalog isn't an *InMemory (i.e. someone
+// supplied a custom catalog implementation in tests).
+//
+// The write is atomic: data lands in <path>.tmp first, then
+// rename(2) makes it visible. A crash between the temp file and
+// the rename leaves the previous snapshot intact.
+func (r *Runtime) SaveCatalog() error {
+	if r == nil || r.Catalog == nil {
+		return nil
+	}
+	cat, ok := r.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	snap := cat.Snapshot()
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("goopg: marshal catalog snapshot: %w", err)
+	}
+	data = append(data, '\n')
+	path := filepath.Join(r.DataDir, CatalogSnapshotFile)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("goopg: mkdir for catalog snapshot: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("goopg: write catalog snapshot tempfile: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("goopg: rename catalog snapshot: %w", err)
+	}
+	return nil
 }
 
 // Close releases the runtime's storage handles. Safe to call

@@ -6,7 +6,7 @@
 
 ## Context
 
-Milestone 0001 brought up a server that runs `pgbench`. The checkpointing and B-tree implementations there are deliberate placeholders: a checkpoint goroutine on a fixed interval (per `REQUIREMENTS.md` §5.3) and a B-tree sufficient for pgbench's index needs. Both are correctness-first, performance-second. This milestone replaces them with PG-compatible, production-grade implementations.
+Milestone 0001 brought up a server that runs `pgbench`. The checkpointing and B-tree implementations there are deliberate placeholders: a checkpoint goroutine on a fixed interval (per `GOAL_AND_REQUIREMENTS.md` §5.3) and a B-tree sufficient for pgbench's index needs. Both are correctness-first, performance-second. This milestone replaces them with PG-compatible, production-grade implementations.
 
 ## In Scope
 
@@ -16,7 +16,7 @@ Implement PG-compatible checkpoint mechanics:
 
 - GUCs: `checkpoint_timeout` (default 5min), `checkpoint_completion_target` (default 0.9), `max_wal_size`, `min_wal_size`, `full_page_writes` (default on). Names, units, and defaults must match upstream per `REQUIREMENTS.md` §6.2.
 - Spread/smoothed checkpoint writes over the configured fraction of the next checkpoint cycle, rather than one synchronous burst.
-- Triggers: timeout, WAL volume crossing `max_wal_size`, explicit `CHECKPOINT` SQL command, and the dedicated CLI subcommand introduced under `REQUIREMENTS.md` §3.3 if checkpoint-on-demand is exposed there.
+- Triggers: timeout, WAL volume crossing `max_wal_size`, explicit `CHECKPOINT` SQL command, and the dedicated CLI subcommand introduced under `GOAL_AND_REQUIREMENTS.md` §3.3 if checkpoint-on-demand is exposed there.
 - Full-page-image WAL records for the first modification of a page after each checkpoint when `full_page_writes` is on.
 - Statistics surfaced through `pg_stat_bgwriter` / `pg_stat_checkpointer` (whichever upstream version goopg is targeting; see the `server_version` decision recorded under M1).
 

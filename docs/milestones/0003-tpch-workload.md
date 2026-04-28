@@ -8,7 +8,7 @@
 
 Milestone 0001 targeted `pgbench`, a TPC-B–like OLTP workload that exercises concurrent point reads/writes against a small handful of tables. TPC-H is fundamentally different: 22 analytical queries against a star schema, stressing joins, subqueries, aggregates, and the cost-based planner. Passing TPC-H is the right next checkpoint because it forces the executor and planner to grow up before any further OLTP performance work.
 
-HammerDB is the chosen driver: it speaks the libpq-compatible PostgreSQL protocol, requires no license, and is widely used. Its TPC-H implementation does not depend on stored procedures, which keeps it within `REQUIREMENTS.md`'s non-goals (stored procedures are explicitly out of scope). The agent must verify this assumption when porting and record any HammerDB-specific deviations in a design doc.
+HammerDB is the chosen driver: it speaks the libpq-compatible PostgreSQL protocol, requires no license, and is widely used. Its TPC-H implementation does not depend on stored procedures, which keeps it within `GOAL_AND_REQUIREMENTS.md`'s non-goals (stored procedures are explicitly out of scope). The agent must verify this assumption when porting and record any HammerDB-specific deviations in a design doc.
 
 ## In Scope
 
@@ -50,6 +50,9 @@ The 22 TPC-H queries collectively require:
 - `NNNN-join-executors.md`
 - `NNNN-statistics-and-cardinality.md`
 - `NNNN-hammerdb-tpch-integration.md` (records anything HammerDB-specific that goopg has to accommodate, including the verification that no stored procedures are in HammerDB's TPC-H path)
+
+## Reference
+- HammerDB's source code is cloned under `./HammerDB/` for reference. The TPC-H schema build script is at `HammerDB/tpch/postgres/ddl.sql` and the 22 queries are at `HammerDB/tpch/postgres/queries/`.
 
 ## Definition of Done
 

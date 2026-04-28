@@ -142,7 +142,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
 		}
-		defer func() { _ = rt.Close() }()
+		defer func() {
+			// Persist the catalog before tearing down the pool.
+			// If saving fails we surface a warning but still
+			// close so file handles aren't leaked.
+			if err := rt.SaveCatalog(); err != nil {
+				logger.Warn("save catalog snapshot failed", "err", err)
+			}
+			_ = rt.Close()
+		}()
 		cfg.Catalog = rt.Catalog
 		cfg.Pool = rt.Pool
 		cfg.TxnMgr = rt.TxnMgr

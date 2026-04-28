@@ -335,14 +335,16 @@ unchecked item unless a dependency forces a different order.
       on-disk catalog work.
 - [ ] `goopg start|stop|restart|reload|status` operate the running server.
       (`goopg start -D <dir>` now opens a storage Manager + Pool +
-      MVCC + in-memory Catalog from a data directory previously
-      laid out by `goopg init` and passes them into Server.Config,
-      so the binary serves the same parser→planner→executor path
-      the test harness exercises. Catalog persistence is still
-      deferred — schema declared via SQL during a session vanishes
-      when the process exits, but heap data files do persist via
-      the storage manager. stop/restart/reload/status remain
-      stubbed.)
+      MVCC + Catalog from a data directory previously laid out by
+      `goopg init` and passes them into Server.Config. The catalog
+      now persists too: `internal/catalog.Snapshot/Restore`
+      serialises the in-memory schema to JSON; `initdb.Open`
+      replays `<DataDir>/global/pg_catalog.json` if present;
+      `Runtime.SaveCatalog` writes it via tempfile+rename so a
+      crash mid-save can't corrupt the prior snapshot; goopg start
+      saves on shutdown. Tables, columns, indexes (including
+      primary-key flag + method), and `nextOID` round-trip across
+      restarts. stop/restart/reload/status remain stubbed.)
 - [ ] `pgbench -i` succeeds against goopg.
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
