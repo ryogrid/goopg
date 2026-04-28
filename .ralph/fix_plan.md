@@ -46,12 +46,17 @@ unchecked item unless a dependency forces a different order.
 
 ## Milestone 2 — Simple query protocol and a fixed response
 
-- [ ] Implement the simple `Query` message path returning a hand-rolled
+- [x] Implement the simple `Query` message path returning a hand-rolled
       `RowDescription` + `DataRow` + `CommandComplete` + `ReadyForQuery`
-      sequence for `SELECT 1`.
-- [ ] Implement `ErrorResponse` for unrecognized statements with realistic
+      sequence for `SELECT 1`. (See `internal/server/query.go`.)
+- [x] Implement `ErrorResponse` for unrecognized statements with realistic
       `SQLSTATE` codes sourced from `postgres/src/backend/utils/errcodes.txt`.
-- [ ] Add `pgx`/`psql` integration tests that exercise the path.
+      `internal/sqlstate` is generated from the upstream file by
+      `cmd/gen-sqlstate`; existing magic strings replaced with typed codes.
+- [ ] Add `pgx`/`psql` integration tests that exercise the path. Deferred:
+      the Ralph workspace doesn't have `psql` installed, and pulling pgx in
+      pre-emptively burns deps before we have a story for integration-test
+      gating. Re-open once a libpq client is available locally.
 
 ## Milestone 3 — Authentication
 

@@ -42,19 +42,24 @@ const MaxRegularMessageLength = 1 << 20
 // Backend message type bytes. Mirrors PqMsg_* in
 // postgres/src/include/libpq/protocol.h.
 const (
-	MsgAuthentication  byte = 'R'
-	MsgParameterStatus byte = 'S'
-	MsgBackendKeyData  byte = 'K'
-	MsgReadyForQuery   byte = 'Z'
-	MsgErrorResponse   byte = 'E'
-	MsgNoticeResponse  byte = 'N'
+	MsgAuthentication     byte = 'R'
+	MsgParameterStatus    byte = 'S'
+	MsgBackendKeyData     byte = 'K'
+	MsgReadyForQuery      byte = 'Z'
+	MsgErrorResponse      byte = 'E'
+	MsgNoticeResponse     byte = 'N'
+	MsgRowDescription     byte = 'T'
+	MsgDataRow            byte = 'D'
+	MsgCommandComplete    byte = 'C'
+	MsgEmptyQueryResponse byte = 'I'
 )
 
-// Frontend message type bytes recognised by the v0 server. v0 only needs
-// Terminate ('X') to close cleanly; every other frontend message becomes
-// an "unsupported" error response. Milestone 2 will widen this set.
+// Frontend message type bytes recognised by the simple-query path. The full
+// set is in postgres/src/include/libpq/protocol.h; goopg widens the set as
+// milestones land.
 const (
 	MsgTerminate byte = 'X'
+	MsgQuery     byte = 'Q'
 )
 
 // AuthenticationOk subcode (postgres/src/include/libpq/protocol.h).

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/protocol"
+	"github.com/goopg/goopg/internal/sqlstate"
 )
 
 // Config controls a single Server instance.
@@ -255,13 +256,13 @@ func (s *Server) handleStartup(r *protocol.FrameReader, w *protocol.FrameWriter)
 		}
 		if version != protocol.ProtocolVersion3_0 {
 			major, minor := version>>16, version&0xFFFF
-			s.writeFatal(w, "0A000",
+			s.writeFatal(w, sqlstate.FeatureNotSupported,
 				fmt.Sprintf("unsupported frontend protocol %d.%d: server supports 3.0", major, minor))
 			return nil, fmt.Errorf("unsupported protocol %d.%d", major, minor)
 		}
 		params, err := protocol.ParseStartupParameters(payload)
 		if err != nil {
-			s.writeFatal(w, "08P01", "invalid startup packet")
+			s.writeFatal(w, sqlstate.ProtocolViolation, "invalid startup packet")
 			return nil, err
 		}
 		return params, nil
@@ -316,14 +317,14 @@ func (s *Server) parameterStatusBlock(params map[string]string) [][2]string {
 	}
 }
 
-// runPostStartupLoop handles every frame after ReadyForQuery. v0 only knows
-// how to honour Terminate; everything else gets an "unsupported" error then
-// another ReadyForQuery, matching what real PostgreSQL does for an unknown
-// statement: emit the error and stay open until the client disconnects.
+// runPostStartupLoop handles every frame after ReadyForQuery. v0 routes
+// simple Query messages into handleQuery; Terminate closes the connection
+// cleanly; anything else is an "unsupported" ErrorResponse followed by
+// another ReadyForQuery so the client can keep going.
 func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, logger *slog.Logger) {
 	for {
 		if ctx.Err() != nil {
-			s.writeFatal(w, "57P01", "terminating connection due to administrator command")
+			s.writeFatal(w, sqlstate.AdminShutdown, "terminating connection due to administrator command")
 			return
 		}
 		f, err := r.ReadFrame()
@@ -333,22 +334,28 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 			}
 			return
 		}
-		if f.Type == protocol.MsgTerminate {
+		switch f.Type {
+		case protocol.MsgTerminate:
 			return
-		}
-		// Anything else: not yet supported.
-		err = w.WriteErrorResponse([]protocol.ErrorField{
-			{Code: protocol.FieldSeverity, Value: "ERROR"},
-			{Code: protocol.FieldSeverityNonLocal, Value: "ERROR"},
-			{Code: protocol.FieldSQLState, Value: "0A000"},
-			{Code: protocol.FieldMessage, Value: fmt.Sprintf("message type %q not yet supported", f.Type)},
-			{Code: protocol.FieldRoutine, Value: "server.runPostStartupLoop"},
-		})
-		if err != nil {
-			return
-		}
-		if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
-			return
+		case protocol.MsgQuery:
+			if err := s.handleQuery(w, f.Payload); err != nil {
+				logger.Debug("handleQuery write error", "err", err)
+				return
+			}
+		default:
+			err = w.WriteErrorResponse([]protocol.ErrorField{
+				{Code: protocol.FieldSeverity, Value: "ERROR"},
+				{Code: protocol.FieldSeverityNonLocal, Value: "ERROR"},
+				{Code: protocol.FieldSQLState, Value: string(sqlstate.FeatureNotSupported)},
+				{Code: protocol.FieldMessage, Value: fmt.Sprintf("message type %q not yet supported", f.Type)},
+				{Code: protocol.FieldRoutine, Value: "server.runPostStartupLoop"},
+			})
+			if err != nil {
+				return
+			}
+			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+				return
+			}
 		}
 		if err := w.Flush(); err != nil {
 			return
@@ -359,11 +366,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 // writeFatal sends a single FATAL ErrorResponse and flushes. Errors are
 // silently swallowed: by the time we're emitting FATAL, the connection is
 // already going away.
-func (s *Server) writeFatal(w *protocol.FrameWriter, sqlstate, msg string) {
+func (s *Server) writeFatal(w *protocol.FrameWriter, code sqlstate.Code, msg string) {
 	_ = w.WriteErrorResponse([]protocol.ErrorField{
 		{Code: protocol.FieldSeverity, Value: "FATAL"},
 		{Code: protocol.FieldSeverityNonLocal, Value: "FATAL"},
-		{Code: protocol.FieldSQLState, Value: sqlstate},
+		{Code: protocol.FieldSQLState, Value: string(code)},
 		{Code: protocol.FieldMessage, Value: msg},
 	})
 	_ = w.Flush()
