@@ -161,11 +161,54 @@ default policy described above is constructed by
 `auth.DefaultPolicy()`. Tests can construct a fixed policy directly
 without going through the file parser.
 
+### Password and MD5 (addendum, 2026-04-28)
+
+`password` (cleartext) and `md5` are now implemented in
+`internal/auth/exchange.go`. The wire shape:
+
+| Method     | Server sends                                | Client replies                | Verification                                                                  |
+| ---------- | ------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------------- |
+| `password` | `R` / int32(3)                              | `p` / `<password>\0`          | `subtle.ConstantTimeCompare` against the stored credential.                   |
+| `md5`      | `R` / int32(5) / 4-byte salt                | `p` / `md5<32 hex chars>\0`   | Reproduce `"md5"+md5_hex(rolpassword_md5_tail+salt)` and constant-time match. |
+
+The 4-byte cancel-key style random salt is freshly generated per
+connection from `crypto/rand`, matching upstream's
+`postgres/src/backend/libpq/auth.c:CheckMD5Auth`.
+
+`internal/auth.UserStore` is the lookup interface goopg uses to find
+the stored credential. v0 ships `MapUserStore` — a concurrency-safe
+`map[string]Credential` for development and tests; a real catalog-backed
+implementation lands when `pg_authid` does (milestone 6+).
+
+A `Credential` carries one of two formats:
+
+- **Plaintext.** Compared verbatim for the cleartext exchange; for the
+  md5 exchange we shadow the password ad-hoc to derive the expected
+  response. Mostly useful for tests and quick-start setups.
+- **MD5-shadowed**, exactly upstream's `pg_authid.rolpassword` form:
+  `"md5" + md5_hex(password + username)`. Built by
+  `auth.NewMD5Credential(user, password)` from a cleartext password,
+  or `auth.ParseMD5Stored("md5...")` from a value already in that form.
+
+Both `password` and `md5` accept both credential formats. The reverse
+isn't true: a `scram-sha-256` rolpassword (when that lands) won't
+satisfy md5 auth — same constraint as upstream, see
+`postgres/src/backend/libpq/crypt.c:md5_crypt_verify` line 213.
+
+Failure messages follow upstream's "auth failed for user \"X\""
+template *regardless* of whether the user exists or the password was
+wrong — distinguishing them at the network edge is a leak. The
+log entry on the server side does carry the difference, since the
+log is the operator's tool, not the attacker's.
+
+The server's `Config` grows a `UserStore auth.UserStore` field. nil is
+acceptable for trust-only deployments; password/md5 with a nil store
+report `ErrMethodUnsupported` rather than panicking.
+
 ### What this doc does NOT cover
 
-- The actual `password` / `md5` / `scram-sha-256` exchanges. Each
-  gets its own follow-up doc (or, more likely, an addendum to this
-  one) when implemented.
+- The `scram-sha-256` exchange (RFC 7677, RFC 5802). Lands in a
+  follow-up loop with its own addendum here.
 - TLS / `hostssl` enforcement. v0 always answers `'N'` to SSLRequest;
   rules with `hostssl` are matched but never produce a passing
   outcome until TLS lands.

@@ -54,6 +54,13 @@ type Config struct {
 	// nil means auth.DefaultPolicy() — loopback-only trust. See
 	// docs/design/0003-authentication.md.
 	Policy auth.Policy
+
+	// UserStore answers password/md5/scram credential lookups during
+	// the auth exchange. nil means "no users configured", which makes
+	// every method other than trust/reject fail with
+	// ErrMethodUnsupported. The default policy is trust-only, so a nil
+	// UserStore is fine for the common loopback-development setup.
+	UserStore auth.UserStore
 }
 
 func (c *Config) defaults() {
@@ -231,7 +238,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	app := params["application_name"]
 	logger = logger.With("user", user, "application_name", app)
 
-	if !s.checkAuth(raw, w, params, logger) {
+	if !s.checkAuth(raw, r, w, params, logger) {
 		return
 	}
 	logger.Info("connection established")
@@ -244,10 +251,12 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	s.runPostStartupLoop(connCtx, r, w, logger)
 }
 
-// checkAuth runs the configured Policy and writes the appropriate
-// AuthenticationOk / FATAL ErrorResponse. It returns true iff the
-// connection should proceed to the parameter-status block.
-func (s *Server) checkAuth(raw net.Conn, w *protocol.FrameWriter, params map[string]string, logger *slog.Logger) bool {
+// checkAuth runs the configured Policy and the corresponding wire
+// exchange (Trust → AuthenticationOk; Password / MD5 → AuthRequest +
+// PasswordMessage round-trip; Reject / unsupported method → FATAL
+// ErrorResponse). It returns true iff the connection should proceed to
+// the parameter-status block.
+func (s *Server) checkAuth(raw net.Conn, r *protocol.FrameReader, w *protocol.FrameWriter, params map[string]string, logger *slog.Logger) bool {
 	req := auth.Request{
 		ConnType: connTypeFor(raw),
 		Remote:   remoteIP(raw),
@@ -260,22 +269,27 @@ func (s *Server) checkAuth(raw net.Conn, w *protocol.FrameWriter, params map[str
 		req.Database = req.User
 	}
 	decision := s.cfg.Policy.Match(req)
-	switch err := auth.Authenticate(decision); {
+	err := auth.Exchange(decision, r, w, s.cfg.UserStore, req.User)
+	switch {
 	case err == nil:
-		if err := w.WriteAuthenticationOk(); err != nil {
-			logger.Info("AuthenticationOk write failed", "err", err)
-			return false
-		}
 		return true
-	case isAuthRejected(err):
-		logger.Info("connection rejected by policy",
+	case isAuthRejected(err) || isInvalidPassword(err) || isUserUnknown(err):
+		logger.Info("connection rejected",
 			"err", err,
 			"method", decision.Method.String(),
 		)
 		s.writeFatal(w, sqlstate.InvalidAuthorizationSpecification, err.Error())
 		return false
+	case isAuthExchangeFailure(err) || errors.Is(err, auth.ErrUnexpectedFrame):
+		// Wire-level failure or client misbehaved during the exchange.
+		// The connection is already in a bad state — log and close
+		// without trying to emit FATAL, matching how upstream's
+		// auth.c quits on EOF during a password packet read.
+		logger.Info("auth exchange failed", "err", err)
+		return false
 	default:
-		logger.Info("auth method not implemented",
+		// ErrMethodUnsupported and any future errors land here.
+		logger.Info("auth method not supported",
 			"err", err,
 			"method", decision.Method.String(),
 		)
@@ -286,13 +300,23 @@ func (s *Server) checkAuth(raw net.Conn, w *protocol.FrameWriter, params map[str
 
 func isAuthRejected(err error) bool {
 	var rej auth.ErrRejected
-	return errorsAs(err, &rej)
+	return errors.As(err, &rej)
 }
 
-// errorsAs is a tiny wrapper to avoid importing "errors" twice in this
-// file; the real errors.As is fine but go vet on a fresh tree pinned us
-// to a wrapper for clarity. Leaving as a one-liner.
-func errorsAs(err error, target any) bool { return errors.As(err, target) }
+func isInvalidPassword(err error) bool {
+	var bad auth.ErrInvalidPassword
+	return errors.As(err, &bad)
+}
+
+func isUserUnknown(err error) bool {
+	var unk auth.ErrUserUnknown
+	return errors.As(err, &unk)
+}
+
+func isAuthExchangeFailure(err error) bool {
+	var x auth.ErrAuthExchange
+	return errors.As(err, &x)
+}
 
 // connTypeFor reports the auth.ConnType implied by the listener that
 // accepted raw. v0 only listens on TCP; ConnLocal arrives once we add a

@@ -4,12 +4,29 @@ import (
 	"encoding/binary"
 )
 
-// WriteAuthenticationOk emits 'R' / int32(0) — the "no further authentication
-// required" message. v0 always answers AuthenticationOk after parsing the
-// startup packet; real auth lives in milestone 3.
+// WriteAuthenticationOk emits 'R' / int32(0) — "no further authentication
+// required".
 func (fw *FrameWriter) WriteAuthenticationOk() error {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], AuthenticationOK)
+	return fw.WriteFrame(MsgAuthentication, buf[:])
+}
+
+// WriteAuthenticationCleartextPassword emits 'R' / int32(3). The client
+// answers with a PasswordMessage carrying the cleartext password.
+func (fw *FrameWriter) WriteAuthenticationCleartextPassword() error {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], AuthenticationCleartextPasswd)
+	return fw.WriteFrame(MsgAuthentication, buf[:])
+}
+
+// WriteAuthenticationMD5Password emits 'R' / int32(5) / 4-byte salt. The
+// client answers with a PasswordMessage of the form
+// "md5" + md5_hex(md5_hex(password+username) + salt).
+func (fw *FrameWriter) WriteAuthenticationMD5Password(salt [4]byte) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint32(buf[0:4], AuthenticationMD5Passwd)
+	copy(buf[4:8], salt[:])
 	return fw.WriteFrame(MsgAuthentication, buf[:])
 }
 

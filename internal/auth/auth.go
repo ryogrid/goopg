@@ -283,24 +283,6 @@ func addressMatches(r *Rule, ip net.IP) bool {
 	return r.Network.Contains(ip)
 }
 
-// Authenticate runs the authentication exchange for a Decision. v0 only
-// implements MethodTrust and the two reject methods; other methods cause
-// it to return an error so handleStartup can emit a FATAL ErrorResponse.
-//
-// The caller is responsible for actually writing AuthenticationOk / the
-// FATAL ErrorResponse on the wire — Authenticate just decides whether
-// the handshake should proceed and returns a typed reason if not.
-func Authenticate(d Decision) error {
-	switch d.Method {
-	case MethodTrust:
-		return nil
-	case MethodReject, MethodImplicitReject:
-		return ErrRejected{Decision: d}
-	default:
-		return ErrMethodUnsupported{Method: d.Method}
-	}
-}
-
 // ErrRejected is returned when the matched rule is `reject` or no rule
 // matched (implicit reject).
 type ErrRejected struct {

@@ -146,27 +146,16 @@ func TestImplicitReject(t *testing.T) {
 	}
 }
 
-func TestAuthenticate(t *testing.T) {
-	if err := Authenticate(Decision{Method: MethodTrust}); err != nil {
-		t.Errorf("trust returned %v, want nil", err)
+// Categorical error-type smoke tests. Exchange (which actually drives
+// the wire protocol) is exercised end-to-end in internal/server tests.
+func TestRejectErrorTypes(t *testing.T) {
+	rej := ErrRejected{Decision: Decision{Rule: &Rule{SourceFile: "x", SourceLine: 7}}}
+	if rej.Error() == "" {
+		t.Error("ErrRejected.Error() empty")
 	}
-
-	rejErr := Authenticate(Decision{Method: MethodReject, Rule: &Rule{SourceFile: "x", SourceLine: 7}})
-	var rej ErrRejected
-	if !errors.As(rejErr, &rej) {
-		t.Fatalf("reject returned %T (%v), want ErrRejected", rejErr, rejErr)
-	}
-
-	if err := Authenticate(Decision{Method: MethodImplicitReject}); err == nil {
-		t.Error("implicit reject returned nil error")
-	} else if !errors.As(err, &rej) {
-		t.Errorf("implicit reject returned %T, want ErrRejected", err)
-	}
-
-	unsErr := Authenticate(Decision{Method: MethodSCRAMSHA256})
-	var uns ErrMethodUnsupported
-	if !errors.As(unsErr, &uns) {
-		t.Fatalf("scram returned %T (%v), want ErrMethodUnsupported", unsErr, unsErr)
+	uns := ErrMethodUnsupported{Method: MethodSCRAMSHA256}
+	if uns.Error() == "" {
+		t.Error("ErrMethodUnsupported.Error() empty")
 	}
 }
 

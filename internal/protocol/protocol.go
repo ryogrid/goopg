@@ -54,16 +54,26 @@ const (
 	MsgEmptyQueryResponse byte = 'I'
 )
 
-// Frontend message type bytes recognised by the simple-query path. The full
-// set is in postgres/src/include/libpq/protocol.h; goopg widens the set as
-// milestones land.
+// Frontend message type bytes recognised so far. The full set is in
+// postgres/src/include/libpq/protocol.h; goopg widens the set as milestones
+// land.
 const (
-	MsgTerminate byte = 'X'
-	MsgQuery     byte = 'Q'
+	MsgTerminate       byte = 'X'
+	MsgQuery           byte = 'Q'
+	MsgPasswordMessage byte = 'p'
 )
 
-// AuthenticationOk subcode (postgres/src/include/libpq/protocol.h).
-const AuthenticationOK uint32 = 0
+// AuthenticationRequest subcodes (postgres/src/include/libpq/protocol.h:74).
+const (
+	AuthenticationOK              uint32 = 0
+	AuthenticationCleartextPasswd uint32 = 3
+	AuthenticationMD5Passwd       uint32 = 5
+	AuthenticationGSS             uint32 = 7
+	AuthenticationGSSCont         uint32 = 8
+	AuthenticationSASL            uint32 = 10
+	AuthenticationSASLCont        uint32 = 11
+	AuthenticationSASLFinal       uint32 = 12
+)
 
 // TransactionStatus byte sent in ReadyForQuery.
 type TransactionStatus byte

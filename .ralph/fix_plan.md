@@ -69,7 +69,15 @@ unchecked item unless a dependency forces a different order.
       decision; default policy trusts loopback. `goopg start --hba`
       points at a real file. `reject` and implicit-reject emit FATAL
       ErrorResponse with SQLSTATE 28000.
-- [ ] Implement `password` (cleartext) and `md5` auth.
+- [x] Implement `password` (cleartext) and `md5` auth.
+      `internal/auth.UserStore`/`Credential` carry plaintext and
+      pg_authid-style `md5HEX` formats. `auth.Exchange` drives the
+      AuthRequest+PasswordMessage round-trip for both methods. Salt is
+      4 bytes from `crypto/rand`; comparisons are constant-time.
+      Unknown-user and wrong-password paths report identical FATAL
+      ErrorResponse (SQLSTATE 28000) so the wire can't distinguish.
+      Server `Config.UserStore` is the seam; nil is acceptable for
+      trust-only deployments.
 - [ ] Implement `scram-sha-256` auth (preferred default).
 - [x] Design doc `0003-authentication.md`.
 
