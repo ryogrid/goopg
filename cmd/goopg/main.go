@@ -203,6 +203,14 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				rt.Checkpointer.SetInterval(time.Duration(secs) * time.Second)
 			}
 		}
+		// max_wal_size is stored in MB (matching upstream).
+		// Convert to a byte threshold for the checkpointer's
+		// volume-driven trigger.
+		if v, ok := registry.Get("max_wal_size"); ok {
+			if mb, err := strconv.Atoi(v.Display()); err == nil && mb > 0 {
+				rt.Checkpointer.SetMaxWALBytes(uint64(mb) * 1024 * 1024)
+			}
+		}
 	}
 
 	// Run the periodic checkpointer alongside the server. SIGTERM /

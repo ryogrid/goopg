@@ -45,6 +45,90 @@ func (f *fakeFlusher) Calls() int {
 	return f.calls
 }
 
+// TestCheckpointerVolumeTrigger pins the max_wal_size path.
+// We arm a small MaxWALBytes threshold, append enough records
+// through the writer to cross it, and expect a checkpoint
+// before Interval elapses. Interval is set to an hour so any
+// success here came from the volume trigger, not the timer.
+func TestCheckpointerVolumeTrigger(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	flusher := &fakeFlusher{flushSignalChan: make(chan struct{}, 16)}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{
+		Interval:            time.Hour,
+		MaxWALBytes:         128, // very small threshold
+		VolumeCheckInterval: 5 * time.Millisecond,
+		Logger:              slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = cp.Run(ctx)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	// Force the writer past the threshold.
+	for i := 0; i < 10; i++ {
+		if _, _, err := w.Append([]byte("aaaaaaaaaaaaaaaa")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Poll LastCheckpointLSN; the volume-triggered checkpoint
+	// fires once the ticker tick observes WrittenLSN >= 128 and
+	// finishes its Flush+Append+FlushUpTo dance.
+	deadline := time.Now().Add(2 * time.Second)
+	for cp.LastCheckpointLSN() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("volume trigger did not fire within 2s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if flusher.Calls() == 0 {
+		t.Error("flusher.FlushAll was never called")
+	}
+}
+
+// TestCheckpointerVolumeTriggerThreshold pins the boundary on
+// volumeTriggerFires: at threshold-1 it must not fire; at
+// threshold it must.
+func TestCheckpointerVolumeTriggerThreshold(t *testing.T) {
+	cp := &Checkpointer{cfg: CheckpointerConfig{MaxWALBytes: 100}}
+
+	// No checkpoint yet, written < threshold -> no fire.
+	if cp.volumeTriggerFires(stubReporter{lsn: 99}) {
+		t.Error("fired at written=99, threshold=100, lastCkpt=0")
+	}
+	// No checkpoint yet, written == threshold -> fire.
+	if !cp.volumeTriggerFires(stubReporter{lsn: 100}) {
+		t.Error("did not fire at written=100, threshold=100, lastCkpt=0")
+	}
+
+	// After a checkpoint at lsn=200, gap < threshold -> no fire.
+	cp.lastCheckpointLSN.Store(200)
+	if cp.volumeTriggerFires(stubReporter{lsn: 250}) {
+		t.Error("fired at gap=50, threshold=100")
+	}
+	// gap == threshold -> fire.
+	if !cp.volumeTriggerFires(stubReporter{lsn: 300}) {
+		t.Error("did not fire at gap=100, threshold=100")
+	}
+}
+
+type stubReporter struct{ lsn uint64 }
+
+func (s stubReporter) WrittenLSN() uint64 { return s.lsn }
+
 // TestCheckpointerSetInterval pins the GUC-driven cadence
 // override. Construction defaults Interval to 10s; SetInterval
 // must update the field so a subsequent Run uses it. We don't

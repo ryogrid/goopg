@@ -464,8 +464,14 @@ full Definition of Done. Decomposed into agent-sized chunks below.
 - [ ] Spread/smoothed checkpoint writes over
       `checkpoint_completion_target * checkpoint_timeout`, rather than
       one synchronous burst (today's behaviour).
-- [ ] Trigger checkpoints when the WAL volume crosses `max_wal_size`,
-      not just on the timer.
+- [x] Trigger checkpoints when the WAL volume crosses `max_wal_size`,
+      not just on the timer. `wal.Writer` exposes `WrittenLSN()`
+      (atomic mirror of writeLSN); `wal.Checkpointer` polls it on a
+      1-second cadence and fires `checkpointOnce` whenever the gap
+      since the last checkpoint marker reaches `MaxWALBytes`.
+      `goopg start` reads `max_wal_size` (in MB) from the registry
+      and calls `Checkpointer.SetMaxWALBytes` before launching the
+      Run goroutine.
 - [ ] Implement full-page-image WAL records for the first
       modification of a page after each checkpoint when
       `full_page_writes` is on.

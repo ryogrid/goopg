@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 )
 
 const (
@@ -62,6 +63,12 @@ type result struct {
 type Writer struct {
 	ops  chan op
 	done chan struct{}
+
+	// writeLSNAtomic mirrors state.writeLSN so external observers
+	// (notably the checkpointer's max_wal_size trigger) can read
+	// the current write position without serialising through the
+	// op channel.
+	writeLSNAtomic atomic.Uint64
 }
 
 type state struct {
@@ -70,6 +77,11 @@ type state struct {
 	writePos   int64
 	writeLSN   uint64
 	flushedLSN uint64
+
+	// writeLSNMirror, when non-nil, gets the current writeLSN
+	// stored after each successful append. The Writer reads it
+	// without locking.
+	writeLSNMirror *atomic.Uint64
 
 	files map[uint64]*os.File
 	dirty map[uint64]bool
@@ -91,8 +103,17 @@ func NewWriter(cfg Config) (*Writer, error) {
 		ops:  make(chan op),
 		done: make(chan struct{}),
 	}
+	w.writeLSNAtomic.Store(uint64(st.writePos))
+	st.writeLSNMirror = &w.writeLSNAtomic
 	go st.loop(w.ops, w.done)
 	return w, nil
+}
+
+// WrittenLSN returns the LSN of the last byte the writer has
+// appended (durable or not). Cheap and lock-free; suitable for
+// the checkpointer's max_wal_size trigger.
+func (w *Writer) WrittenLSN() uint64 {
+	return w.writeLSNAtomic.Load()
 }
 
 // Append writes one record and returns its [startLSN, endLSN].
@@ -240,6 +261,9 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	s.writePos += int64(len(record))
 	end := uint64(s.writePos)
 	s.writeLSN = end
+	if s.writeLSNMirror != nil {
+		s.writeLSNMirror.Store(end)
+	}
 	return start, end, nil
 }
 
