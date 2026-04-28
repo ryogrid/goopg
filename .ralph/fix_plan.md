@@ -305,13 +305,23 @@ unchecked item unless a dependency forces a different order.
       ordinals, query-form plans the inner SELECT, plan-time option
       validator with SQLSTATE 42P01/42703/42701/42601/0A000).
       Executor now has a COPY TEXT codec
-      (`internal/executor/copy_text.go`) that round-trips Datum rows
-      through upstream's tab-separated/`\N`-NULL form, including the
-      \b/\f/\n/\r/\t/\v/\\/\xHH/\NNN escape table; pgbench-shaped
-      rows (3×int4 + text filler) round-trip exactly. The server
-      replacement of the string-matching COPY dispatch and the
-      executor-side bidirectional driver still need to land; binary
-      mode also pending.)
+      (`internal/executor/copy_text.go`) plus the bidirectional
+      drivers (`internal/executor/copy.go`):
+      `RunCopyTo(ctx, plan, emit)` opens a SeqScan (table-form) or
+      the planner-attached Query subtree (query-form), projects via
+      ColumnIndex when needed, and pushes one COPY TEXT line per
+      visible row through the emit callback;
+      `NewCopyFromExecutor(ctx, plan)` exposes a PushLine-based
+      receive loop that decodes each line, scatters the listed
+      columns into the table's full column slice (unlisted columns
+      land as NULL), and writes via the heap-tuple path; bad
+      field-count surfaces as SQLSTATE 22P04. file/PROGRAM endpoints
+      reject as 0A000. Round-trip CopyFrom→CopyTo verified
+      end-to-end against an in-memory catalog. The server
+      replacement of internal/server/copy.go's string-matching
+      dispatch and the Server.Config plumbing
+      (Catalog/Pool/TxnMgr) are the remaining pieces; binary mode
+      also pending.)
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.
