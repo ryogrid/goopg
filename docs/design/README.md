@@ -20,5 +20,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | #    | Title                                         | Status   | Summary                                                                     |
 | ---- | --------------------------------------------- | -------- | --------------------------------------------------------------------------- |
 | 0001 | [Architecture Overview](0001-architecture-overview.md) | accepted | Single-process Go architecture, upstream-reference policy, reported `server_version`. |
+| 0002 | [Wire Protocol (v0)](0002-wire-protocol.md) | accepted | Frame reader/writer, startup-packet parsing, ParameterStatus/BackendKeyData/ReadyForQuery emission, graceful shutdown. |
 
 Append new rows in numeric order. Do not reorder.

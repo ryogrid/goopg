@@ -47,13 +47,13 @@ func TestVersionPrintsAndExitsZero(t *testing.T) {
 	}
 }
 
-// TestSubcommandStubsAreReachable confirms every advertised subcommand
+// TestSubcommandStubsAreReachable confirms every still-stubbed subcommand
 // dispatches without panicking. Stubs return exit code 1 ("not yet
-// implemented"); only `version` returns 0.
+// implemented"); only `version` returns 0. `start` is excluded from this
+// matrix because it now actually starts a server (see internal/server tests).
 func TestSubcommandStubsAreReachable(t *testing.T) {
 	cases := map[string]int{
 		"init":    1,
-		"start":   1,
 		"stop":    1,
 		"restart": 1,
 		"reload":  1,

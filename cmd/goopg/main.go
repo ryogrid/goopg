@@ -7,10 +7,16 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/goopg/goopg/internal/server"
 )
 
 const usage = `goopg — a Go reimplementation of PostgreSQL.
@@ -90,9 +96,32 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 
 func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	fs.String("D", "", "data directory")
-	fs.String("config", "", "path to postgresql.conf (default: $D/postgresql.conf)")
-	return notImplemented("start", fs, args, stderr)
+	fs.SetOutput(stderr)
+	fs.String("D", "", "data directory (unused in v0; reserved for milestone 7)")
+	fs.String("config", "", "path to postgresql.conf (unused in v0)")
+	addr := fs.String("listen", "127.0.0.1:5432", "TCP listen address (host:port)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// SIGINT and SIGTERM both translate into the same internal shutdown
+	// path (see docs/design/0001-architecture-overview.md §3). Other
+	// operator-driven shutdowns will arrive over the control socket via
+	// `goopg stop` once milestone 7 builds it.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	srv := server.New(server.Config{
+		Address: *addr,
+		Logger:  logger,
+	})
+	if err := srv.Run(ctx); err != nil {
+		fmt.Fprintf(stderr, "goopg start: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 func runStop(args []string, stdout, stderr io.Writer) int {
