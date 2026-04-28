@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
@@ -47,6 +48,12 @@ type Config struct {
 	// HandshakeTimeout caps how long a client may take to complete the
 	// startup handshake. Defaults to 30s.
 	HandshakeTimeout time.Duration
+
+	// Policy decides whether to admit a connection based on the
+	// (conn-type, remote, database, user) tuple from the StartupMessage.
+	// nil means auth.DefaultPolicy() — loopback-only trust. See
+	// docs/design/0003-authentication.md.
+	Policy auth.Policy
 }
 
 func (c *Config) defaults() {
@@ -64,6 +71,9 @@ func (c *Config) defaults() {
 	}
 	if c.HandshakeTimeout == 0 {
 		c.HandshakeTimeout = 30 * time.Second
+	}
+	if c.Policy == nil {
+		c.Policy = auth.DefaultPolicy()
 	}
 }
 
@@ -220,6 +230,10 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	user := params["user"]
 	app := params["application_name"]
 	logger = logger.With("user", user, "application_name", app)
+
+	if !s.checkAuth(raw, w, params, logger) {
+		return
+	}
 	logger.Info("connection established")
 
 	if err := s.sendStartupReply(w, params, pid); err != nil {
@@ -228,6 +242,75 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 
 	s.runPostStartupLoop(connCtx, r, w, logger)
+}
+
+// checkAuth runs the configured Policy and writes the appropriate
+// AuthenticationOk / FATAL ErrorResponse. It returns true iff the
+// connection should proceed to the parameter-status block.
+func (s *Server) checkAuth(raw net.Conn, w *protocol.FrameWriter, params map[string]string, logger *slog.Logger) bool {
+	req := auth.Request{
+		ConnType: connTypeFor(raw),
+		Remote:   remoteIP(raw),
+		Database: params["database"],
+		User:     params["user"],
+	}
+	if req.Database == "" {
+		// PostgreSQL convention: when no database is provided in the
+		// StartupMessage, the user name is used as the database name.
+		req.Database = req.User
+	}
+	decision := s.cfg.Policy.Match(req)
+	switch err := auth.Authenticate(decision); {
+	case err == nil:
+		if err := w.WriteAuthenticationOk(); err != nil {
+			logger.Info("AuthenticationOk write failed", "err", err)
+			return false
+		}
+		return true
+	case isAuthRejected(err):
+		logger.Info("connection rejected by policy",
+			"err", err,
+			"method", decision.Method.String(),
+		)
+		s.writeFatal(w, sqlstate.InvalidAuthorizationSpecification, err.Error())
+		return false
+	default:
+		logger.Info("auth method not implemented",
+			"err", err,
+			"method", decision.Method.String(),
+		)
+		s.writeFatal(w, sqlstate.FeatureNotSupported, err.Error())
+		return false
+	}
+}
+
+func isAuthRejected(err error) bool {
+	var rej auth.ErrRejected
+	return errorsAs(err, &rej)
+}
+
+// errorsAs is a tiny wrapper to avoid importing "errors" twice in this
+// file; the real errors.As is fine but go vet on a fresh tree pinned us
+// to a wrapper for clarity. Leaving as a one-liner.
+func errorsAs(err error, target any) bool { return errors.As(err, target) }
+
+// connTypeFor reports the auth.ConnType implied by the listener that
+// accepted raw. v0 only listens on TCP; ConnLocal arrives once we add a
+// Unix-socket listener (deferred). TLS tagging (ConnHostSSL) lands when
+// TLS does.
+func connTypeFor(raw net.Conn) auth.ConnType {
+	if _, ok := raw.LocalAddr().(*net.UnixAddr); ok {
+		return auth.ConnLocal
+	}
+	return auth.ConnHost
+}
+
+// remoteIP returns the client's IP, or nil for connections without one.
+func remoteIP(raw net.Conn) net.IP {
+	if tcp, ok := raw.RemoteAddr().(*net.TCPAddr); ok {
+		return tcp.IP
+	}
+	return nil
 }
 
 // handleStartup reads startup packets, transparently rejecting SSL/GSS
@@ -270,12 +353,10 @@ func (s *Server) handleStartup(r *protocol.FrameReader, w *protocol.FrameWriter)
 	return nil, errors.New("too many SSL/GSS negotiation attempts")
 }
 
-// sendStartupReply emits AuthenticationOk + ParameterStatus block +
-// BackendKeyData + ReadyForQuery.
+// sendStartupReply emits the post-auth portion of the startup sequence:
+// the ParameterStatus block, BackendKeyData, and ReadyForQuery.
+// AuthenticationOk has already been written by checkAuth at this point.
 func (s *Server) sendStartupReply(w *protocol.FrameWriter, params map[string]string, pid uint32) error {
-	if err := w.WriteAuthenticationOk(); err != nil {
-		return err
-	}
 	for _, kv := range s.parameterStatusBlock(params) {
 		if err := w.WriteParameterStatus(kv[0], kv[1]); err != nil {
 			return err

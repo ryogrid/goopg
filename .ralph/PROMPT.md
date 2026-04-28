@@ -300,3 +300,6 @@ Remember: Quality over speed. Build it right the first time. Know when you're do
 - use GNU GLOBAL (global command) for searching codebase of postgres
   - index files is already generated, so searches should be fast
   - current directory is set to the root of the postgres codebase, so you can search for any symbol or file
+
+## VESION CONTROL RULES
+- add and commit working changes with descriptive messages when you complete a task and push to origin

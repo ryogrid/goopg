@@ -60,11 +60,18 @@ unchecked item unless a dependency forces a different order.
 
 ## Milestone 3 — Authentication
 
-- [ ] Implement `trust` auth (the simplest case) end-to-end with a
-      `pg_hba.conf`-style file parser.
+- [x] Implement `trust` auth (the simplest case) end-to-end with a
+      `pg_hba.conf`-style file parser. `internal/auth` provides Method
+      and ConnType enums covering every upstream method, a tokenizer +
+      parser with include / include_if_exists / include_dir support,
+      and a first-match matcher with explicit/implicit reject. Server
+      replaces the unconditional AuthenticationOk with a policy-driven
+      decision; default policy trusts loopback. `goopg start --hba`
+      points at a real file. `reject` and implicit-reject emit FATAL
+      ErrorResponse with SQLSTATE 28000.
 - [ ] Implement `password` (cleartext) and `md5` auth.
 - [ ] Implement `scram-sha-256` auth (preferred default).
-- [ ] Design doc `0003-authentication.md`.
+- [x] Design doc `0003-authentication.md`.
 
 ## Milestone 4 — Configuration and GUC system
 
