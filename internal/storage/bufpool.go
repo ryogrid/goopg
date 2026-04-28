@@ -49,6 +49,7 @@ type Pool struct {
 	mgr   *Manager
 	arena *arena
 	slots []*Slot
+	wal   WALFlusher
 
 	// poolMu guards byTag, slots[*].tag/valid/dirty, slots[*].pinCount,
 	// slots[*].usageCount, and clockHand. It does NOT guard the page
@@ -61,6 +62,16 @@ type Pool struct {
 // PoolConfig controls Pool sizing.
 type PoolConfig struct {
 	Slots int
+
+	// WAL, when non-nil, is asked to flush up to the page's pd_lsn
+	// before any dirty page is written to data files.
+	WAL WALFlusher
+}
+
+// WALFlusher is the minimal WAL contract the buffer pool needs to
+// enforce write-ahead ordering.
+type WALFlusher interface {
+	FlushUpTo(lsn uint64) error
 }
 
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by an
@@ -79,6 +90,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		arena: a,
 		slots: make([]*Slot, cfg.Slots),
 		byTag: make(map[BufferTag]int, cfg.Slots),
+		wal:   cfg.WAL,
 	}
 	for i := range p.slots {
 		p.slots[i] = &Slot{page: a.slot(i)}
@@ -111,7 +123,7 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		oldTag := s.tag
 		s.contentMu.Lock()
 		p.poolMu.Unlock()
-		err := p.mgr.WriteBlock(oldTag.Rel, oldTag.Block, s.page)
+		err := p.flushSlot(oldTag, s.page)
 		s.contentMu.Unlock()
 		if err != nil {
 			return nil, InvalidBlockNumber, fmt.Errorf("flush victim: %w", err)
@@ -169,7 +181,7 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		oldTag := s.tag
 		s.contentMu.Lock()
 		p.poolMu.Unlock()
-		err := p.mgr.WriteBlock(oldTag.Rel, oldTag.Block, s.page)
+		err := p.flushSlot(oldTag, s.page)
 		s.contentMu.Unlock()
 		if err != nil {
 			return nil, fmt.Errorf("flush victim: %w", err)
@@ -225,6 +237,17 @@ func (p *Pool) MarkDirty(s *Slot) {
 	s.dirty = true
 }
 
+// MarkDirtyWithLSN records a page LSN and marks the slot dirty.
+// Callers should use this when a page mutation is backed by WAL.
+func (p *Pool) MarkDirtyWithLSN(s *Slot, lsn LSN) {
+	s.contentMu.Lock()
+	MustHeader(s.page).SetLSN(lsn)
+	s.contentMu.Unlock()
+	p.poolMu.Lock()
+	s.dirty = true
+	p.poolMu.Unlock()
+}
+
 // FlushAll writes every dirty slot through smgr and clears the dirty
 // bit. Used by the checkpointer (when it lands).
 func (p *Pool) FlushAll() error {
@@ -246,7 +269,7 @@ func (p *Pool) FlushAll() error {
 	for _, t := range todo {
 		s := p.slots[t.idx]
 		s.contentMu.RLock()
-		err := p.mgr.WriteBlock(t.tag.Rel, t.tag.Block, s.page)
+		err := p.flushSlot(t.tag, s.page)
 		s.contentMu.RUnlock()
 		if err != nil {
 			return err
@@ -258,6 +281,21 @@ func (p *Pool) FlushAll() error {
 			s.dirty = false
 		}
 		p.poolMu.Unlock()
+	}
+	return nil
+}
+
+func (p *Pool) flushSlot(tag BufferTag, page Page) error {
+	if p.wal != nil {
+		lsn := MustHeader(page).LSN()
+		if lsn != 0 {
+			if err := p.wal.FlushUpTo(uint64(lsn)); err != nil {
+				return fmt.Errorf("flush wal up to %d: %w", lsn, err)
+			}
+		}
+	}
+	if err := p.mgr.WriteBlock(tag.Rel, tag.Block, page); err != nil {
+		return err
 	}
 	return nil
 }

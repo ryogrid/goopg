@@ -4,8 +4,22 @@ import (
 	"bytes"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+type recordingWAL struct {
+	calls []uint64
+	err   error
+}
+
+func (w *recordingWAL) FlushUpTo(lsn uint64) error {
+	w.calls = append(w.calls, lsn)
+	if w.err != nil {
+		return w.err
+	}
+	return nil
+}
 
 // TestInitPagePinsHeaderLayout verifies a freshly-initialised page has
 // the byte-for-byte layout from docs/design/0006-storage-format.md.
@@ -282,5 +296,80 @@ func TestPoolFlushAllClearsDirty(t *testing.T) {
 	}
 	if got[200] != 0x99 {
 		t.Errorf("smgr read byte[200] = %#x, want 0x99", got[200])
+	}
+}
+
+func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	wal := &recordingWAL{}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 1, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 500, Fork: MainFork}
+
+	s0, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s0.Page()[300] = 0x7A
+	pool.MarkDirtyWithLSN(s0, LSN(42))
+	pool.Unpin(s0)
+
+	// A second PinNew with a one-slot pool forces eviction+flush.
+	s1, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s1)
+
+	if len(wal.calls) == 0 {
+		t.Fatalf("expected at least one WAL flush request")
+	}
+	if wal.calls[0] != 42 {
+		t.Fatalf("first WAL flush LSN = %d, want 42", wal.calls[0])
+	}
+
+	got := make(Page, BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	if got[300] != 0x7A {
+		t.Fatalf("persisted byte = %#x, want 0x7A", got[300])
+	}
+}
+
+func TestPoolEvictionReturnsWALFlushError(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	wal := &recordingWAL{err: errors.New("simulated wal failure")}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 1, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 501, Fork: MainFork}
+
+	s0, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.MarkDirtyWithLSN(s0, LSN(77))
+	pool.Unpin(s0)
+
+	_, _, err = pool.PinNew(rel)
+	if err == nil {
+		t.Fatalf("expected flush-victim error")
+	}
+	if !strings.Contains(err.Error(), "flush wal") {
+		t.Fatalf("error = %v, want WAL flush context", err)
 	}
 }
