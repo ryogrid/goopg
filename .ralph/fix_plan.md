@@ -900,9 +900,14 @@ M0002/M0003; lands regression coverage as those features ship.
       client; capture/inspect logs; programmatic edits to
       `postgresql.conf` and `pg_hba.conf`. Background-psql sessions.
       Multi-cluster API (impl deferred).
-- [ ] `internal/testutil/util` package equivalent of
+- [x] `internal/testutil/util` package equivalent of
       `PostgreSQL::Test::Utils`. Tempdir/file helpers, command runner
       with timeout + capture, log scanning helpers.
+      (achieved 2026-04-29: added `internal/testutil/util` with
+      `MkdirTemp`, `WriteTextFile`, `RunCommand` (stdout/stderr
+      capture, non-zero exit code capture, timeout detection),
+      `FileContains`, and `WaitForFileContains`; package tests cover
+      exit-code capture, timeout behavior, file/log scanning.)
 - [ ] `docs/test-port/upstream-tap-coverage.md` — classify every
       upstream TAP test under `postgres/src/test/recovery/t/`,
       `postgres/src/bin/*/t/`, etc. as `port`/`skip`/`defer` with a
