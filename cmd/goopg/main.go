@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,9 +16,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/server"
 )
@@ -154,6 +157,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.Catalog = rt.Catalog
 		cfg.Pool = rt.Pool
 		cfg.TxnMgr = rt.TxnMgr
+		cfg.DataDir = rt.DataDir
 		logger.Info("opened data directory", "path", rt.DataDir)
 	}
 	if *confPath != "" {
@@ -190,28 +194,137 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 func runStop(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
-	fs.String("D", "", "data directory of the server to stop")
-	fs.String("mode", "fast", "shutdown mode: smart|fast|immediate")
-	return notImplemented("stop", fs, args, stderr)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("D", "", "data directory of the server to stop (required)")
+	mode := fs.String("mode", "fast", "shutdown mode: smart|fast|immediate (v0 treats all three as graceful)")
+	timeoutSec := fs.Int("t", 30, "seconds to wait for shutdown to complete")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dataDir == "" {
+		fmt.Fprintln(stderr, "goopg stop: -D <data-directory> is required")
+		return 2
+	}
+	pf, err := control.ParsePIDFile(*dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stderr, "goopg stop: server not running (no postmaster.pid)")
+			return 1
+		}
+		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
+		return 1
+	}
+	// v0 collapses smart/fast/immediate onto the same graceful
+	// path; the flag is preserved so future loops can split them.
+	_ = *mode
+	reply, err := control.Send(pf.SocketPath, "STOP", time.Duration(*timeoutSec)*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
+		return 1
+	}
+	if reply != "OK" {
+		fmt.Fprintf(stderr, "goopg stop: unexpected reply %q\n", reply)
+		return 1
+	}
+	// Wait for the process to actually exit so a follow-up
+	// `goopg start` doesn't race with the previous incarnation.
+	deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
+	for time.Now().Before(deadline) {
+		if !control.ProcessAlive(pf.PID) {
+			fmt.Fprintln(stdout, "goopg stop: server stopped")
+			return 0
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	fmt.Fprintf(stderr, "goopg stop: server did not exit within %ds\n", *timeoutSec)
+	return 1
 }
 
 func runRestart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
-	fs.String("D", "", "data directory")
-	fs.String("mode", "fast", "shutdown mode for the stop phase")
-	return notImplemented("restart", fs, args, stderr)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	// Restarting a foreground-supervised server is the supervisor's
+	// job (systemd, container runtime); v0's `goopg restart` is
+	// effectively the same as `goopg stop`. Documenting this here
+	// rather than removing the subcommand keeps the CLI shape
+	// matching pg_ctl for muscle memory.
+	fmt.Fprintln(stderr, "goopg restart: not yet implemented; use 'goopg stop -D ...' then 'goopg start -D ...' (v0 runs in the foreground; the operator's supervisor restarts the process)")
+	return 1
 }
 
 func runReload(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("reload", flag.ContinueOnError)
-	fs.String("D", "", "data directory of the server to reload")
-	return notImplemented("reload", fs, args, stderr)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("D", "", "data directory of the server to reload (required)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dataDir == "" {
+		fmt.Fprintln(stderr, "goopg reload: -D <data-directory> is required")
+		return 2
+	}
+	pf, err := control.ParsePIDFile(*dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stderr, "goopg reload: server not running (no postmaster.pid)")
+			return 1
+		}
+		fmt.Fprintf(stderr, "goopg reload: %v\n", err)
+		return 1
+	}
+	reply, err := control.Send(pf.SocketPath, "RELOAD", 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "goopg reload: %v\n", err)
+		return 1
+	}
+	if reply != "OK" {
+		fmt.Fprintf(stderr, "goopg reload: unexpected reply %q\n", reply)
+		return 1
+	}
+	fmt.Fprintln(stdout, "goopg reload: configuration reload signalled (v0 no-op)")
+	return 0
 }
 
 func runStatus(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
-	fs.String("D", "", "data directory of the server to inspect")
-	return notImplemented("status", fs, args, stderr)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("D", "", "data directory of the server to inspect (required)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dataDir == "" {
+		fmt.Fprintln(stderr, "goopg status: -D <data-directory> is required")
+		return 2
+	}
+	pf, err := control.ParsePIDFile(*dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stdout, "goopg status: not running")
+			// Match pg_ctl status's "exit 3 = not running" semantics
+			// so shell scripts can branch on the exit code.
+			return 3
+		}
+		fmt.Fprintf(stderr, "goopg status: %v\n", err)
+		return 1
+	}
+	if !control.ProcessAlive(pf.PID) {
+		fmt.Fprintf(stdout, "goopg status: not running (stale postmaster.pid for pid %d)\n", pf.PID)
+		return 3
+	}
+	// Best-effort liveness ping over the control socket. A failure
+	// here means the process is up but unresponsive — distinguish
+	// from "stopped" so operators can act differently.
+	if reply, err := control.Send(pf.SocketPath, "PING", 2*time.Second); err == nil && reply == "OK" {
+		fmt.Fprintf(stdout, "goopg status: running (pid %d, listen %s, started %s)\n",
+			pf.PID, pf.ListenAddr, pf.StartedAt.Format(time.RFC3339))
+		return 0
+	}
+	fmt.Fprintf(stdout, "goopg status: process %d alive but control socket %s not responding\n",
+		pf.PID, pf.SocketPath)
+	return 4
 }
 
 // version is the human-readable build tag for the goopg binary. The reported

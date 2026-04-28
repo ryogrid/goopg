@@ -49,18 +49,22 @@ func TestVersionPrintsAndExitsZero(t *testing.T) {
 	}
 }
 
-// TestSubcommandStubsAreReachable confirms every still-stubbed subcommand
-// dispatches without panicking. Stubs return exit code 1 ("not yet
-// implemented"); `version` returns 0. `start` is excluded because it
-// runs a real server (see internal/server tests); `init` is excluded
-// because it now writes a real data directory and is covered by
-// TestInitCommandLaysOutDataDir.
+// TestSubcommandStubsAreReachable confirms every subcommand
+// dispatches without panicking. The exit codes here are what
+// each subcommand returns when invoked with NO arguments:
+//   - stop/reload/status all require -D; missing flag is exit 2.
+//   - restart is still a stub returning exit 1.
+//   - version always returns 0.
+//
+// `start` is excluded because it runs a real server (see
+// internal/server tests); `init` is excluded because it now writes
+// a real data directory and is covered by TestInitCommandLaysOutDataDir.
 func TestSubcommandStubsAreReachable(t *testing.T) {
 	cases := map[string]int{
-		"stop":    1,
+		"stop":    2,
 		"restart": 1,
-		"reload":  1,
-		"status":  1,
+		"reload":  2,
+		"status":  2,
 		"version": 0,
 	}
 	for cmd, want := range cases {

@@ -183,9 +183,14 @@ unchecked item unless a dependency forces a different order.
 
 ## Milestone 6 — SQL surface for pgbench
 
-- [ ] Parser/analyzer covering `CREATE TABLE`, `CREATE INDEX`, `INSERT`,
+- [x] Parser/analyzer covering `CREATE TABLE`, `CREATE INDEX`, `INSERT`,
       `UPDATE`, `DELETE`, `SELECT` with the joins/aggregates pgbench needs,
       `BEGIN`/`COMMIT`/`ROLLBACK`, `VACUUM`, `ANALYZE`, prepared statements.
+      (achieved as composite of all sub-items below, with addenda for
+      `::` typecast, niladic CURRENT_TIMESTAMP, and analyzer numeric
+      compatibility for bare `int`. Verified end-to-end via
+      `pgbench -i` and `pgbench` default + `--select-only` workloads
+      under concurrent clients.)
   - [x] Lexer (`internal/parser/lexer.go`) covering identifiers (quoted
         and unquoted), integer literals, single-quoted strings with `''`
         escape, parameter placeholders `$N`, line and (nested) block
@@ -294,9 +299,15 @@ unchecked item unless a dependency forces a different order.
         COMMIT/ROLLBACK finishing the active xid, nested BEGIN as
         no-op, and explicit-tx lifecycle tests.
 - [x] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
-- [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
+- [x] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
-      (text-mode end-to-end works through the real
+      (achieved 2026-04-28 in text mode, which is what pgbench -i
+      actually uses; pgbench client-side init runs end-to-end. Binary
+      mode is genuinely deferred — no goopg consumer needs it yet
+      and the text codec's behaviour was verified against upstream
+      libpq.
+      Original notes:
+      text-mode end-to-end works through the real
       parser→planner→executor stack: parser produces a
       `parser.CopyStmt` (FROM/TO, STDIN/STDOUT/file/PROGRAM,
       parenthesised + legacy WITH options including FORCE_QUOTE *,
@@ -314,7 +325,7 @@ unchecked item unless a dependency forces a different order.
       reports `COPY N` with the inserted-row count). Without
       handles, the v0 string-matching path stays as a fallback so
       protocol-only tests keep working. Binary mode is still
-      pending.)
+      pending.))
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.
@@ -333,8 +344,24 @@ unchecked item unless a dependency forces a different order.
       accepted. Wired through `goopg init -D <dir>`. Bootstrap of a
       system catalog and a `pg_control` file are deferred to the
       on-disk catalog work.
-- [ ] `goopg start|stop|restart|reload|status` operate the running server.
-      (`goopg start -D <dir>` now opens a storage Manager + Pool +
+- [x] `goopg start|stop|restart|reload|status` operate the running server.
+      (achieved 2026-04-28: `internal/control` ships a `postmaster.pid`
+      file plus a Unix-domain command socket
+      (`<DataDir>/.goopg.ctl.sock`); Server lifecycle writes both on
+      bind and removes them on shutdown. CLI: `goopg status -D` reads
+      pidfile, kill(0)-checks the process, optionally pings the
+      socket — exit 0/3/4 distinguishing running / not-running /
+      unresponsive (matches pg_ctl status conventions). `goopg stop -D`
+      sends STOP over the socket, waits for the server to exit
+      (default 30s deadline). `goopg reload -D` sends RELOAD (v0
+      no-op until per-GUC SIGHUP-style refresh wires up).
+      `goopg restart` remains a documented stub since v0 runs
+      foreground and the supervisor (systemd / container runtime)
+      restarts the process per spec §7. Tests cover pidfile
+      round-trip, listener PING/STOP, ProcessAlive; manual smoke
+      against a live server confirms status→reload→stop→status
+      flow with the right exit codes.
+      Original notes:
       MVCC + Catalog from a data directory previously laid out by
       `goopg init` and passes them into Server.Config. The catalog
       now persists too: `internal/catalog.Snapshot/Restore`

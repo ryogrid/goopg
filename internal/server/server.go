@@ -21,9 +21,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"os"
+	"path/filepath"
+
 	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -80,6 +84,12 @@ type Config struct {
 	Catalog catalog.Catalog
 	Pool    *storage.Pool
 	TxnMgr  *mvcc.Manager
+
+	// DataDir, when set, controls where the server writes its
+	// `postmaster.pid` file and binds its operator-facing control
+	// socket. Empty disables both — useful for in-process tests
+	// that don't want a sticky pidfile in /tmp.
+	DataDir string
 }
 
 // hasStorage reports whether all three storage handles are configured.
@@ -131,6 +141,11 @@ type Server struct {
 	connWG    sync.WaitGroup
 	nextPID   atomic.Uint32
 	closeOnce sync.Once
+
+	// controlListener is the operator-facing command socket; nil
+	// when DataDir is unset (in-process tests).
+	controlListener *control.Listener
+	controlPath     string
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
@@ -169,25 +184,89 @@ func (s *Server) Run(ctx context.Context) error {
 	close(s.ready)
 	s.cfg.Logger.Info("goopg listener bound", "address", ln.Addr().String())
 
+	// Operator control plane: pidfile + Unix-domain command socket.
+	// Optional — disabled when DataDir is empty (e.g. tests).
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	if s.cfg.DataDir != "" {
+		if err := s.startControlPlane(runCtx, runCancel, ln); err != nil {
+			return err
+		}
+		defer s.stopControlPlane()
+	}
+
 	// One goroutine watches ctx.Done() and closes the listener so Accept
 	// unblocks. We also stamp accept deadlines in the loop as a backstop
 	// for platforms where Close doesn't unblock pending Accept (e.g. some
 	// kernels/golang versions historically had quirks here).
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		s.closeOnce.Do(func() { _ = ln.Close() })
 	}()
 
-	acceptErr := s.acceptLoop(ctx, ln)
+	acceptErr := s.acceptLoop(runCtx, ln)
 
 	// Wait for in-flight connections to drain.
 	s.connWG.Wait()
 
 	s.cfg.Logger.Info("goopg listener stopped")
-	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+	if errors.Is(runCtx.Err(), context.Canceled) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return nil
 	}
 	return acceptErr
+}
+
+// startControlPlane writes the pidfile and binds the Unix-domain
+// command socket. STOP cancels runCancel so the accept loop drains.
+// RELOAD is a v0 no-op — the GUC system can already absorb a new
+// postgresql.conf via SET, but a true restart-the-listener reload
+// is deferred.
+func (s *Server) startControlPlane(runCtx context.Context, runCancel context.CancelFunc, ln net.Listener) error {
+	dir := s.cfg.DataDir
+	socketPath := filepath.Join(dir, control.SocketName)
+	clog := control.PIDFile{
+		PID:        os.Getpid(),
+		DataDir:    dir,
+		StartedAt:  time.Now(),
+		ListenAddr: ln.Addr().String(),
+		SocketPath: socketPath,
+	}
+	if err := control.WritePIDFile(dir, clog); err != nil {
+		return fmt.Errorf("write pidfile: %w", err)
+	}
+	cl, err := control.NewListener(socketPath)
+	if err != nil {
+		_ = control.RemovePIDFile(dir)
+		return fmt.Errorf("control listener: %w", err)
+	}
+	cl.OnStop = func() error {
+		s.cfg.Logger.Info("control: stop requested")
+		runCancel()
+		return nil
+	}
+	cl.OnReload = func() error {
+		s.cfg.Logger.Info("control: reload requested (v0 no-op)")
+		return nil
+	}
+	s.controlListener = cl
+	s.controlPath = socketPath
+	go func() {
+		if err := cl.Serve(); err != nil {
+			s.cfg.Logger.Debug("control listener serve returned", "err", err)
+		}
+	}()
+	_ = runCtx // referenced for future cancellation hooks
+	return nil
+}
+
+func (s *Server) stopControlPlane() {
+	if s.controlListener != nil {
+		_ = s.controlListener.Close()
+		s.controlListener = nil
+	}
+	if s.cfg.DataDir != "" {
+		_ = control.RemovePIDFile(s.cfg.DataDir)
+	}
 }
 
 func (s *Server) acceptLoop(ctx context.Context, ln net.Listener) error {
