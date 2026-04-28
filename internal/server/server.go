@@ -22,9 +22,12 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // Config controls a single Server instance.
@@ -67,6 +70,21 @@ type Config struct {
 	// config.BuildDefaultRegistry() — the seeded set of variables we
 	// already advertise. See docs/design/0004-configuration-and-guc.md.
 	Registry *config.Registry
+
+	// Catalog / Pool / TxnMgr are the storage handles the executor
+	// needs for table-form COPY (and, in future loops, every other
+	// table-touching statement). All three must be non-nil to enable
+	// the parser→planner→executor path; if any is nil, the wire
+	// layer falls back to the v0 string-matching COPY shape so
+	// existing deployments without storage configured keep working.
+	Catalog catalog.Catalog
+	Pool    *storage.Pool
+	TxnMgr  *mvcc.Manager
+}
+
+// hasStorage reports whether all three storage handles are configured.
+func (c *Config) hasStorage() bool {
+	return c.Catalog != nil && c.Pool != nil && c.TxnMgr != nil
 }
 
 func (c *Config) defaults() {

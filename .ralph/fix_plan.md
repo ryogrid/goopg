@@ -296,32 +296,25 @@ unchecked item unless a dependency forces a different order.
 - [x] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
-      (partial: simple-query COPY wire loop now handles a minimal
-      `COPY (SELECT 1) TO STDOUT` path and COPY FROM STDIN data mode;
-      parser produces a `parser.CopyStmt` (FROM/TO, STDIN/STDOUT/
-      file/PROGRAM, parenthesised + legacy WITH options including
-      FORCE_QUOTE *, FORCE_NOT_NULL/(cols)); planner now resolves
-      `parser.CopyStmt` to `planner.Copy` (catalog table + column
-      ordinals, query-form plans the inner SELECT, plan-time option
-      validator with SQLSTATE 42P01/42703/42701/42601/0A000).
-      Executor now has a COPY TEXT codec
-      (`internal/executor/copy_text.go`) plus the bidirectional
-      drivers (`internal/executor/copy.go`):
-      `RunCopyTo(ctx, plan, emit)` opens a SeqScan (table-form) or
-      the planner-attached Query subtree (query-form), projects via
-      ColumnIndex when needed, and pushes one COPY TEXT line per
-      visible row through the emit callback;
-      `NewCopyFromExecutor(ctx, plan)` exposes a PushLine-based
-      receive loop that decodes each line, scatters the listed
-      columns into the table's full column slice (unlisted columns
-      land as NULL), and writes via the heap-tuple path; bad
-      field-count surfaces as SQLSTATE 22P04. file/PROGRAM endpoints
-      reject as 0A000. Round-trip CopyFrom→CopyTo verified
-      end-to-end against an in-memory catalog. The server
-      replacement of internal/server/copy.go's string-matching
-      dispatch and the Server.Config plumbing
-      (Catalog/Pool/TxnMgr) are the remaining pieces; binary mode
-      also pending.)
+      (text-mode end-to-end works through the real
+      parser→planner→executor stack: parser produces a
+      `parser.CopyStmt` (FROM/TO, STDIN/STDOUT/file/PROGRAM,
+      parenthesised + legacy WITH options including FORCE_QUOTE *,
+      FORCE_NOT_NULL/(cols)); planner resolves it to `planner.Copy`
+      (catalog table + column ordinals, query-form plans the inner
+      SELECT, plan-time option validator with SQLSTATE
+      42P01/42703/42701/42601/0A000); executor has a COPY TEXT codec
+      and the `RunCopyTo` / `CopyFromExecutor` bidirectional
+      drivers. The wire layer (`internal/server/copy.go`) now
+      dispatches via parser+planner+executor when Server.Config has
+      Catalog/Pool/TxnMgr handles configured (begins a per-COPY
+      ReadCommitted transaction; CopyOut streams `EncodeCopyTextRow`
+      output through `WriteCopyData`; CopyIn buffers CopyData
+      payloads, splits on `\n`, calls `PushLine` for each row, and
+      reports `COPY N` with the inserted-row count). Without
+      handles, the v0 string-matching path stays as a fallback so
+      protocol-only tests keep working. Binary mode is still
+      pending.)
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.
