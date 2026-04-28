@@ -154,6 +154,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseDrop()
 	case KwTruncate:
 		return p.parseTruncate()
+	case KwAlter:
+		return p.parseAlter()
 	}
 	return nil, p.errAtCur("unsupported statement")
 }

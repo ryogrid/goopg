@@ -323,6 +323,100 @@ func (p *parser) parseDropTail() (bool, []ObjectName, DropBehavior, error) {
 	return ifExists, names, behavior, nil
 }
 
+// parseAlter: ALTER TABLE [IF EXISTS] name action [, action …].
+//
+// Action grammar (v0):
+//
+//	ADD [CONSTRAINT name] PRIMARY KEY ( col [, …] )
+//	ADD [COLUMN] column_def
+//
+// Pgbench emits `alter table pgbench_branches add primary key (bid)`
+// to install primary keys after CREATE TABLE; that's the load-bearing
+// shape this function unblocks.
+func (p *parser) parseAlter() (Stmt, error) {
+	t, err := p.expectKeyword(KwAlter)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(KwTable); err != nil {
+		return nil, err
+	}
+	stmt := &AlterTableStmt{pos: t.Pos}
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	first, err := p.parseAlterTableAction()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Actions = append(stmt.Actions, first)
+	for p.acceptSymbol(",") {
+		next, err := p.parseAlterTableAction()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Actions = append(stmt.Actions, next)
+	}
+	return stmt, nil
+}
+
+func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
+	if !p.acceptKeyword(KwAdd) {
+		return AlterTableAction{}, p.errAtCur("expected ADD")
+	}
+	pos := p.cur().Pos
+	act := AlterTableAction{pos: pos}
+	// Optional CONSTRAINT name.
+	if p.acceptKeyword(KwConstraint) {
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		act.ConstraintName = identText(nameTok)
+	}
+	switch {
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
+		p.advance()
+		if _, err := p.expectKeyword(KwKey); err != nil {
+			return AlterTableAction{}, err
+		}
+		if !p.acceptSymbol("(") {
+			return AlterTableAction{}, p.errAtCur("expected '(' after PRIMARY KEY")
+		}
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		if !p.acceptSymbol(")") {
+			return AlterTableAction{}, p.errAtCur("expected ')'")
+		}
+		act.Kind = AlterTableAddPrimaryKey
+		act.Columns = cols
+		return act, nil
+	default:
+		// ADD [COLUMN] column_def — bare ident or COLUMN keyword.
+		if act.ConstraintName != "" {
+			return AlterTableAction{}, p.errAtCur("expected PRIMARY KEY after CONSTRAINT name")
+		}
+		_ = p.acceptKeyword(KwColumn)
+		col, err := p.parseColumnDef()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		act.Kind = AlterTableAddColumn
+		act.Column = col
+		return act, nil
+	}
+}
+
 // parseTruncate: TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT].
 func (p *parser) parseTruncate() (Stmt, error) {
 	t, err := p.expectKeyword(KwTruncate)

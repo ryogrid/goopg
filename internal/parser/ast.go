@@ -309,3 +309,42 @@ type TruncateStmt struct {
 
 func (s *TruncateStmt) Pos() int  { return s.pos }
 func (s *TruncateStmt) stmtNode() {}
+
+// AlterTableActionKind discriminates the per-clause action of an
+// ALTER TABLE statement.
+type AlterTableActionKind int
+
+const (
+	AlterTableAddPrimaryKey AlterTableActionKind = iota
+	AlterTableAddColumn
+)
+
+// AlterTableAction is one clause inside ALTER TABLE. v0 covers the
+// ADD [CONSTRAINT name] PRIMARY KEY (cols) shape pgbench emits and
+// the simpler ADD [COLUMN] coldef form.
+type AlterTableAction struct {
+	pos            int
+	Kind           AlterTableActionKind
+	ConstraintName string    // optional, ADD CONSTRAINT name PRIMARY KEY …
+	Columns        []string  // populated for AddPrimaryKey
+	Column         ColumnDef // populated for AddColumn
+}
+
+func (a AlterTableAction) Pos() int { return a.pos }
+
+// AlterTableStmt — `ALTER TABLE [IF EXISTS] name action [, action …]`.
+// pgbench emits:
+//
+//	alter table pgbench_branches add primary key (bid)
+//
+// so v0 supports comma-separated ADD actions; DROP/ALTER COLUMN and
+// other variants are deferred.
+type AlterTableStmt struct {
+	pos      int
+	IfExists bool
+	Name     ObjectName
+	Actions  []AlterTableAction
+}
+
+func (s *AlterTableStmt) Pos() int  { return s.pos }
+func (s *AlterTableStmt) stmtNode() {}

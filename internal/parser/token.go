@@ -87,6 +87,11 @@ const (
 	KwKey         Keyword = "key"
 	KwCascade     Keyword = "cascade"
 	KwRestrict    Keyword = "restrict"
+	KwAlter       Keyword = "alter"
+	KwAdd         Keyword = "add"
+	KwConstraint  Keyword = "constraint"
+	KwColumn      Keyword = "column"
+	KwForeign     Keyword = "foreign"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -152,6 +157,11 @@ var keywords = map[string]Keyword{
 	"key":         KwKey,
 	"cascade":     KwCascade,
 	"restrict":    KwRestrict,
+	"alter":       KwAlter,
+	"add":         KwAdd,
+	"constraint":  KwConstraint,
+	"column":      KwColumn,
+	"foreign":     KwForeign,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

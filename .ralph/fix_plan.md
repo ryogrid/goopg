@@ -220,8 +220,11 @@ unchecked item unless a dependency forces a different order.
         `numeric(10,2)`), inline `NOT NULL`/`PRIMARY KEY`, and
         table-level `PRIMARY KEY (a, b)` round-trip; pgbench -i's four
         CREATE TABLE strings parse as expected.
-  - [ ] Statement parser: `ALTER TABLE … ADD PRIMARY KEY (col)` (pgbench
-        adds primary keys via ALTER, not via CREATE INDEX).
+  - [x] Statement parser: `ALTER TABLE [IF EXISTS] name action [, …]`
+        with `ADD [CONSTRAINT name] PRIMARY KEY (cols)` and
+        `ADD [COLUMN] coldef` actions. Pgbench's three primary-key
+        ALTER strings parse end-to-end — pgbench -i's full DDL surface
+        is now covered.
   - [ ] Analyzer pass (name resolution, type checking) once the catalog
         exists.
 - [ ] Planner sufficient for pgbench's workload.
