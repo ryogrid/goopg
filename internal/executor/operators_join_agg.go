@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/planner"
@@ -11,9 +12,9 @@ import (
 // in Open and emits joined rows from an in-memory result slice.
 //
 // The executor always builds a joinOp; the per-row inner loop
-// dispatches on plan.Algo, picking the hash-join code path for
-// JoinAlgoHash (INNER + LEFT) and falling back to the
-// quadratic nested-loop scan otherwise. Wrapping both algos in
+// dispatches on plan.Algo, picking hash-join for JoinAlgoHash,
+// merge-join for JoinAlgoMerge, and nested-loop otherwise.
+// Wrapping all algos in
 // one operator keeps schema/Open/Close/Next unified — algo
 // selection is just a buffering strategy choice.
 type joinOp struct {
@@ -66,6 +67,9 @@ func (o *joinOp) Open(ctx *Context) error {
 
 	if o.plan.Algo == planner.JoinAlgoHash {
 		return o.runHashJoin(leftRows, rightRows, leftWidth, rightWidth)
+	}
+	if o.plan.Algo == planner.JoinAlgoMerge {
+		return o.runMergeJoin(leftRows, rightRows, leftWidth, rightWidth)
 	}
 	return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
 }
@@ -165,6 +169,152 @@ func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth in
 		}
 	}
 	return nil
+}
+
+type mergeKeyedRow struct {
+	row    Row
+	key    Datum
+	hasKey bool
+}
+
+// runMergeJoin sorts both sides on their join keys and merges the
+// two ordered streams. NULL keys never match (same as hash join).
+// Supports INNER / LEFT / RIGHT / FULL outer semantics.
+func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
+	nullLeft := nullRow(leftWidth)
+	nullRight := nullRow(rightWidth)
+
+	leftKeyed, leftNull, err := o.buildMergeSide(leftRows, true, leftWidth, rightWidth)
+	if err != nil {
+		return err
+	}
+	rightKeyed, rightNull, err := o.buildMergeSide(rightRows, false, leftWidth, rightWidth)
+	if err != nil {
+		return err
+	}
+
+	i, j := 0, 0
+	for i < len(leftKeyed) && j < len(rightKeyed) {
+		cmp, err := compareDatum(leftKeyed[i].key, rightKeyed[j].key, o.plan.Pos())
+		if err != nil {
+			return err
+		}
+		switch {
+		case cmp < 0:
+			if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
+				o.rows = append(o.rows, concatRows(leftKeyed[i].row, nullRight))
+			}
+			i++
+		case cmp > 0:
+			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
+				o.rows = append(o.rows, concatRows(nullLeft, rightKeyed[j].row))
+			}
+			j++
+		default:
+			li := i
+			for i < len(leftKeyed) {
+				eq, err := compareDatum(leftKeyed[li].key, leftKeyed[i].key, o.plan.Pos())
+				if err != nil {
+					return err
+				}
+				if eq != 0 {
+					break
+				}
+				i++
+			}
+			rj := j
+			for j < len(rightKeyed) {
+				eq, err := compareDatum(rightKeyed[rj].key, rightKeyed[j].key, o.plan.Pos())
+				if err != nil {
+					return err
+				}
+				if eq != 0 {
+					break
+				}
+				j++
+			}
+			for a := li; a < i; a++ {
+				for b := rj; b < j; b++ {
+					o.rows = append(o.rows, concatRows(leftKeyed[a].row, rightKeyed[b].row))
+				}
+			}
+		}
+	}
+
+	for ; i < len(leftKeyed); i++ {
+		if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
+			o.rows = append(o.rows, concatRows(leftKeyed[i].row, nullRight))
+		}
+	}
+	for ; j < len(rightKeyed); j++ {
+		if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
+			o.rows = append(o.rows, concatRows(nullLeft, rightKeyed[j].row))
+		}
+	}
+
+	if o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull {
+		for _, l := range leftNull {
+			o.rows = append(o.rows, concatRows(l, nullRight))
+		}
+	}
+	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
+		for _, r := range rightNull {
+			o.rows = append(o.rows, concatRows(nullLeft, r))
+		}
+	}
+
+	return nil
+}
+
+func (o *joinOp) buildMergeSide(rows []Row, isLeft bool, leftWidth, rightWidth int) ([]mergeKeyedRow, []Row, error) {
+	var paddedLeft, paddedRight Row
+	if isLeft {
+		paddedRight = nullRow(rightWidth)
+	} else {
+		paddedLeft = nullRow(leftWidth)
+	}
+	keyExpr := o.plan.RightKey
+	if isLeft {
+		keyExpr = o.plan.LeftKey
+	}
+	if keyExpr == nil {
+		return nil, nil, fmt.Errorf("merge join key is nil")
+	}
+
+	keyed := make([]mergeKeyedRow, 0, len(rows))
+	nullKey := make([]Row, 0)
+	for _, row := range rows {
+		var evalRow Row
+		if isLeft {
+			evalRow = concatRows(row, paddedRight)
+		} else {
+			evalRow = concatRows(paddedLeft, row)
+		}
+		v, err := evalExpr(keyExpr, evalRow, o.ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		if v.IsNull() {
+			nullKey = append(nullKey, row)
+			continue
+		}
+		keyed = append(keyed, mergeKeyedRow{row: row, key: v, hasKey: true})
+	}
+
+	var sortErr error
+	sort.SliceStable(keyed, func(i, j int) bool {
+		cmp, err := compareDatum(keyed[i].key, keyed[j].key, o.plan.Pos())
+		if err != nil {
+			sortErr = err
+			return false
+		}
+		return cmp < 0
+	})
+	if sortErr != nil {
+		return nil, nil, sortErr
+	}
+
+	return keyed, nullKey, nil
 }
 
 // evalHashKey evaluates one side of the hash-join key against a

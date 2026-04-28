@@ -433,18 +433,20 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 			Predicate: pred,
 			schema:    mergedSchema,
 		}
-		// Pick hash join when the predicate decomposes into a single
-		// equality whose two operands reference disjoint sides.
-		// INNER and LEFT are supported by the v0 hash executor;
-		// RIGHT/FULL/CROSS stay on the nested-loop fallback because
-		// they need outer-row bookkeeping that's a follow-up loop's
-		// task.
-		if jn.Type == JoinTypeInner || jn.Type == JoinTypeLeft {
-			leftWidth := len(leftCtx.schema)
-			if lk, rk, ok := splitEqualityForHash(pred, leftWidth); ok {
+		// Pick a specialised equality join algorithm when the
+		// predicate decomposes into disjoint-side keys:
+		//   - INNER / LEFT: hash join
+		//   - RIGHT / FULL: merge join
+		// CROSS and non-equality predicates stay on nested-loop.
+		leftWidth := len(leftCtx.schema)
+		if lk, rk, ok := splitEqualityForHash(pred, leftWidth); ok {
+			jn.LeftKey = lk
+			jn.RightKey = rk
+			switch jn.Type {
+			case JoinTypeInner, JoinTypeLeft:
 				jn.Algo = JoinAlgoHash
-				jn.LeftKey = lk
-				jn.RightKey = rk
+			case JoinTypeRight, JoinTypeFull:
+				jn.Algo = JoinAlgoMerge
 			}
 		}
 		leftNode = jn

@@ -729,7 +729,15 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       match. Verified end-to-end via psql 18.3 with INNER, LEFT
       (NULL right side for unmatched), and reversed-equality
       shapes. See `docs/design/0003-0002-join-executors.md`.)
-- [ ] Sort-merge join executor.
+- [x] Sort-merge join executor.
+      (achieved 2026-04-29: planner adds `JoinAlgoMerge` and now
+      promotes disjoint-equality RIGHT/FULL joins to merge join
+      (INNER/LEFT still use hash join); executor `joinOp` gained
+      `runMergeJoin` (sort both sides by join key Datum, merge
+      equal-key runs with duplicate-preserving expansion, NULL keys
+      never match but are emitted for outer semantics). EXPLAIN now
+      renders `Merge Join (...)` labels; planner/executor tests cover
+      selection and INNER/LEFT/RIGHT/FULL result parity.)
 - [x] Hash aggregate executor (replace today's sort-then-group as the
       default path).
       (verified 2026-04-28: the executor's aggregateOp

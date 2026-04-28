@@ -86,10 +86,11 @@ func tableRows(tbl *catalog.Table) int64 {
 }
 
 // estimateJoin uses the upstream-aligned formula
-// `|L| * |R| / max(NDistinct(L.k), NDistinct(R.k))` for hash
-// joins with disjoint-equality predicates. Falls back to the
-// generic equality selectivity when either NDistinct is
-// unavailable. CROSS join is the cartesian product.
+// `|L| * |R| / max(NDistinct(L.k), NDistinct(R.k))` for
+// specialised equality joins (hash / merge) with disjoint-side
+// keys. Falls back to the generic equality selectivity when
+// either NDistinct is unavailable. CROSS join is the cartesian
+// product.
 func estimateJoin(j *Join) int64 {
 	l := EstimateRows(j.Left)
 	r := EstimateRows(j.Right)
@@ -99,7 +100,7 @@ func estimateJoin(j *Join) int64 {
 	if j.Type == JoinTypeCross {
 		return l * r
 	}
-	if j.Algo == JoinAlgoHash {
+	if j.Algo == JoinAlgoHash || j.Algo == JoinAlgoMerge {
 		nd := keyNDistinct(j.LeftKey, j.Left)
 		if rnd := keyNDistinct(j.RightKey, j.Right); rnd > nd {
 			nd = rnd

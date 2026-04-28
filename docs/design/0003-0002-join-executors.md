@@ -18,9 +18,9 @@ the largest (LINEITEM) has ~6 million. A query like Q3
 hashes + probes under hash-join.
 
 Hash join is the foundational join algorithm goopg needs before
-attempting Q1–Q22. This loop adds it as the planner's preferred
-algorithm whenever the predicate decomposes into a single
-disjoint-side equality.
+attempting Q1–Q22. Follow-up loops added sort-merge join so
+RIGHT/FULL outer equality joins can avoid the quadratic nested
+loop fallback while preserving outer-row semantics.
 
 ## Upstream reference
 
@@ -33,19 +33,22 @@ disjoint-side equality.
 
 ## Decisions
 
-### One operator, two algorithms
+### One operator, three algorithms
 
 `joinOp` (in `internal/executor/operators_join_agg.go`) keeps a
 single Open/Next/Close shape. Open dispatches:
 
 ```go
 if o.plan.Algo == planner.JoinAlgoHash {
-    return o.runHashJoin(...)
+  return o.runHashJoin(...)
+}
+if o.plan.Algo == planner.JoinAlgoMerge {
+  return o.runMergeJoin(...)
 }
 return o.runNestedLoop(...)
 ```
 
-This matches the M1 buffering semantics — both algos drain
+This matches the M1 buffering semantics — all algos drain
 their inputs into in-memory slices in Open and emit from a
 materialised result slice in Next. Streaming hash-probe (which
 upstream uses to avoid buffering the outer side) is deferred —
@@ -78,12 +81,23 @@ What stays on nested-loop:
   yet split conjunctions into multi-column hash keys.
 - Inequalities, range predicates, subqueries.
 - CROSS join (no predicate) and any join with a NULL predicate.
-- RIGHT and FULL outer joins. The hash op tracks unmatched
-  outer-side rows naturally for LEFT (the probe loop's
-  `matched` flag), but unmatched right rows under FULL would
-  need a second pass over the hash buckets — a bookkeeping
-  extension deferred until the planner emits FULL joins from
-  TPC-H queries.
+
+RIGHT/FULL equality joins now take the merge path. The planner
+keeps hash join for INNER/LEFT and chooses merge join for
+RIGHT/FULL when `splitEqualityForHash` succeeds.
+
+### Merge join for RIGHT/FULL equality joins
+
+`runMergeJoin` computes key Datums for both sides (`LeftKey`,
+`RightKey`), sorts each side with `compareDatum`, then merges the
+two streams. Equal-key runs are expanded as a Cartesian product
+(so duplicates on either side preserve SQL join multiplicity).
+NULL keys never match and are emitted only as unmatched rows for
+outer-join shapes.
+
+This gives O((N+M) log (N+M)) behaviour for RIGHT/FULL equi-joins
+instead of nested-loop's O(N*M), without changing planner surface
+area (same Join node, different `Algo`).
 
 ### Build vs. probe side
 
@@ -133,9 +147,9 @@ which stay on nested-loop.
 ## Out of scope (deferred to subsequent loops)
 
 - Sort-merge join (the third upstream algorithm). For TPC-H
-  the difference between hash and sort-merge is mostly about
-  ordering — hash join is sufficient until cost-based
-  planning needs to choose between them.
+  for INNER/LEFT joins. v0 currently reserves merge join for
+  RIGHT/FULL equality shapes; cost-based selection between hash
+  and merge for INNER/LEFT is deferred.
 - Multi-column equality keys (`a.x = b.x AND a.y = b.y` →
   composite hash key).
 - Cost-based build-side selection (smaller-input → build).

@@ -209,33 +209,47 @@ func TestExecJoinVariants(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		plan := &planner.Join{
-			Type:      tc.jt,
-			Left:      makeSide(1, 2),
-			Right:     makeSide(1, 3),
-			Predicate: pred,
-		}
-		op, err := Build(plan)
-		if err != nil {
-			t.Fatalf("Build(%s): %v", tc.name, err)
-		}
-		rows, err := Run(op, NewContext())
-		if err != nil {
-			t.Fatalf("Run(%s): %v", tc.name, err)
-		}
-		if len(rows) != len(tc.want) {
-			t.Fatalf("%s rows=%d want %d", tc.name, len(rows), len(tc.want))
-		}
-		for i := range tc.want {
-			if len(rows[i]) != len(tc.want[i]) {
-				t.Fatalf("%s row[%d] len=%d want %d", tc.name, i, len(rows[i]), len(tc.want[i]))
+		for _, algo := range []planner.JoinAlgo{planner.JoinAlgoNestedLoop, planner.JoinAlgoMerge} {
+			name := tc.name
+			plan := &planner.Join{
+				Type:      tc.jt,
+				Algo:      algo,
+				Left:      makeSide(1, 2),
+				Right:     makeSide(1, 3),
+				Predicate: pred,
+				LeftKey: &planner.ColumnRef{
+					Index: 0,
+					Name:  "l",
+					Type:  catalog.Type{Name: "int4"},
+				},
+				RightKey: &planner.ColumnRef{
+					Index: 1,
+					Name:  "r",
+					Type:  catalog.Type{Name: "int4"},
+				},
 			}
-			for j := range tc.want[i] {
-				if rows[i][j].Kind != tc.want[i][j].Kind {
-					t.Fatalf("%s row[%d][%d] kind=%d want %d", tc.name, i, j, rows[i][j].Kind, tc.want[i][j].Kind)
+			op, err := Build(plan)
+			if err != nil {
+				t.Fatalf("Build(%s/%v): %v", name, algo, err)
+			}
+			rows, err := Run(op, NewContext())
+			if err != nil {
+				t.Fatalf("Run(%s/%v): %v", name, algo, err)
+			}
+			if len(rows) != len(tc.want) {
+				t.Fatalf("%s/%v rows=%d want %d", name, algo, len(rows), len(tc.want))
+			}
+			for i := range tc.want {
+				if len(rows[i]) != len(tc.want[i]) {
+					t.Fatalf("%s/%v row[%d] len=%d want %d", name, algo, i, len(rows[i]), len(tc.want[i]))
 				}
-				if rows[i][j].Kind == KindInt && rows[i][j].Int != tc.want[i][j].Int {
-					t.Fatalf("%s row[%d][%d] int=%d want %d", tc.name, i, j, rows[i][j].Int, tc.want[i][j].Int)
+				for j := range tc.want[i] {
+					if rows[i][j].Kind != tc.want[i][j].Kind {
+						t.Fatalf("%s/%v row[%d][%d] kind=%d want %d", name, algo, i, j, rows[i][j].Kind, tc.want[i][j].Kind)
+					}
+					if rows[i][j].Kind == KindInt && rows[i][j].Int != tc.want[i][j].Int {
+						t.Fatalf("%s/%v row[%d][%d] int=%d want %d", name, algo, i, j, rows[i][j].Int, tc.want[i][j].Int)
+					}
 				}
 			}
 		}

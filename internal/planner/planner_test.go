@@ -148,6 +148,9 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON h.aid = a.aid", true},
 		// LEFT join also takes the hash path.
 		{"SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid", true},
+		// RIGHT/FULL use merge join, not hash.
+		{"SELECT a.aid FROM pgbench_accounts a RIGHT JOIN pgbench_history h ON a.aid = h.aid", false},
+		{"SELECT a.aid FROM pgbench_accounts a FULL JOIN pgbench_history h ON a.aid = h.aid", false},
 		// Inequality predicate → nested-loop fallback.
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid < h.aid", false},
 		// CROSS join (no predicate) → nested-loop.
@@ -175,6 +178,39 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 		}
 		if tc.wantHash && (j.LeftKey == nil || j.RightKey == nil) {
 			t.Errorf("%q: hash algo but LeftKey/RightKey nil", tc.sql)
+		}
+	}
+}
+
+func TestPlanJoinPicksMergeAlgoForRightFullEquality(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	cases := []struct {
+		sql string
+	}{
+		{"SELECT a.aid FROM pgbench_accounts a RIGHT JOIN pgbench_history h ON a.aid = h.aid"},
+		{"SELECT a.aid FROM pgbench_accounts a FULL JOIN pgbench_history h ON h.aid = a.aid"},
+	}
+	for _, tc := range cases {
+		node, err := Plan(parseOne(t, tc.sql), cat)
+		if err != nil {
+			t.Errorf("Plan(%q): %v", tc.sql, err)
+			continue
+		}
+		proj, ok := node.(*Project)
+		if !ok {
+			t.Errorf("%q: root=%T want *Project", tc.sql, node)
+			continue
+		}
+		j, ok := proj.Child.(*Join)
+		if !ok {
+			t.Errorf("%q: child=%T want *Join", tc.sql, proj.Child)
+			continue
+		}
+		if j.Algo != JoinAlgoMerge {
+			t.Errorf("%q: Algo=%v want JoinAlgoMerge", tc.sql, j.Algo)
+		}
+		if j.LeftKey == nil || j.RightKey == nil {
+			t.Errorf("%q: merge algo but LeftKey/RightKey nil", tc.sql)
 		}
 	}
 }
