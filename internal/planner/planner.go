@@ -80,7 +80,37 @@ func tableSchema(t *catalog.Table) Schema {
 	return out
 }
 
+func hasJoinClauses(items []parser.FromExpr) bool {
+	for _, item := range items {
+		if len(item.Joins) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	if s.SetOp != nil {
+		return nil, &PlanError{
+			Pos:     s.SetOp.Pos(),
+			Code:    "0A000",
+			Message: "set operations are not supported in v0 planner",
+		}
+	}
+	if len(s.GroupBy) > 0 || s.Having != nil {
+		return nil, &PlanError{
+			Pos:     s.Pos(),
+			Code:    "0A000",
+			Message: "GROUP BY / HAVING are not supported in v0 planner",
+		}
+	}
+	if hasJoinClauses(s.FromExprs) {
+		return nil, &PlanError{
+			Pos:     s.Pos(),
+			Code:    "0A000",
+			Message: "JOIN is not supported in v0 planner",
+		}
+	}
 	if len(s.From) == 0 {
 		// Constant SELECT — `SELECT 1`. The target list resolves
 		// against the empty schema.

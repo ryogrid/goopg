@@ -243,6 +243,9 @@ func TestPlanResolutionErrors(t *testing.T) {
 		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},       // undefined_column
 		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
 		{"INSERT INTO pgbench_history VALUES (1, 2, 3)", "42601"},        // arity mismatch
+		{"SELECT aid FROM pgbench_accounts GROUP BY aid", "0A000"},       // grouping unsupported
+		{"SELECT 1 UNION SELECT 2", "0A000"},                             // set op unsupported
+		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "0A000"},
 	}
 	for _, c := range cases {
 		_, err := Plan(parseOne(t, c.sql), cat)

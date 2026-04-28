@@ -121,6 +121,58 @@ type RangeVar struct {
 
 func (r RangeVar) Pos() int { return r.pos }
 
+// JoinType classifies one JOIN variant.
+type JoinType int
+
+const (
+	JoinInner JoinType = iota
+	JoinLeft
+	JoinRight
+	JoinFull
+	JoinCross
+)
+
+// JoinExpr is one JOIN clause attached to a FROM base item.
+type JoinExpr struct {
+	pos     int
+	Type    JoinType
+	Natural bool
+	Right   RangeVar
+	On      Expr
+	Using   []string
+}
+
+func (j JoinExpr) Pos() int { return j.pos }
+
+// FromExpr is one FROM item plus its trailing JOIN chain.
+type FromExpr struct {
+	pos   int
+	Base  RangeVar
+	Joins []JoinExpr
+}
+
+func (f FromExpr) Pos() int { return f.pos }
+
+// SetOpType classifies SQL set operations.
+type SetOpType int
+
+const (
+	SetOpUnion SetOpType = iota
+	SetOpIntersect
+	SetOpExcept
+)
+
+// SetOpClause is one trailing UNION/INTERSECT/EXCEPT branch.
+// Chains are represented by SetOp on the right-hand SelectStmt.
+type SetOpClause struct {
+	pos   int
+	Type  SetOpType
+	All   bool
+	Right *SelectStmt
+}
+
+func (s SetOpClause) Pos() int { return s.pos }
+
 // SortBy is one entry in an ORDER BY list.
 type SortBy struct {
 	pos  int
@@ -132,19 +184,26 @@ func (s SortBy) Pos() int { return s.pos }
 
 // SelectStmt — `SELECT [DISTINCT] target_list
 //
-//	[FROM from_item [, …]] [WHERE expr] [ORDER BY sort_list]
-//	[LIMIT n] [OFFSET n]`. JOINs, GROUP BY, HAVING, and set ops are
-//
-// deferred — see fix_plan.
+//	[FROM from_item [, …]] [WHERE expr]
+//	[GROUP BY expr [, …]] [HAVING expr]
+//	[ORDER BY sort_list] [LIMIT n] [OFFSET n]
+//	[{UNION|INTERSECT|EXCEPT} [ALL|DISTINCT] SELECT ...].
 type SelectStmt struct {
 	pos      int
 	Distinct bool
 	Targets  []ResTarget
+	// From keeps a flattened range-var list for v0 planner
+	// compatibility.
 	From     []RangeVar
+	// FromExprs preserves explicit JOIN structure.
+	FromExprs []FromExpr
 	Where    Expr // nil when absent
+	GroupBy  []Expr
+	Having   Expr
 	OrderBy  []SortBy
 	Limit    Expr // nil when absent; integer expression in v0
 	Offset   Expr // nil when absent
+	SetOp    *SetOpClause
 }
 
 func (s *SelectStmt) Pos() int  { return s.pos }

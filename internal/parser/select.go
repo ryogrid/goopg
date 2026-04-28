@@ -11,12 +11,12 @@ import (
 //	SELECT [DISTINCT] target_list
 //	  [FROM from_item [, from_item …]]
 //	  [WHERE expr]
+//	  [GROUP BY expr [, expr …]] [HAVING expr]
 //	  [ORDER BY sort_list]
 //	  [LIMIT expr] [OFFSET expr]
+//	  [{UNION|INTERSECT|EXCEPT} [ALL|DISTINCT] SELECT ...]
 //
-// JOINs, GROUP BY, HAVING, and set operations (UNION/INTERSECT) are
-// deferred to subsequent loops alongside the planner work that needs
-// them.
+// Planner support for JOIN/group/set semantics lands separately.
 func (p *parser) parseSelect() (Stmt, error) {
 	t, err := p.expectKeyword(KwSelect)
 	if err != nil {
@@ -33,10 +33,11 @@ func (p *parser) parseSelect() (Stmt, error) {
 	s.Targets = tgts
 
 	if p.acceptKeyword(KwFrom) {
-		from, err := p.parseFromList()
+		fromExprs, from, err := p.parseFromList()
 		if err != nil {
 			return nil, err
 		}
+		s.FromExprs = fromExprs
 		s.From = from
 	}
 	if p.acceptKeyword(KwWhere) {
@@ -45,6 +46,23 @@ func (p *parser) parseSelect() (Stmt, error) {
 			return nil, err
 		}
 		s.Where = w
+	}
+	if p.acceptKeyword(KwGroup) {
+		if _, err := p.expectKeyword(KwBy); err != nil {
+			return nil, err
+		}
+		list, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		s.GroupBy = list
+	}
+	if p.acceptKeyword(KwHaving) {
+		h, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		s.Having = h
 	}
 	if p.acceptKeyword(KwOrder) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
@@ -70,7 +88,63 @@ func (p *parser) parseSelect() (Stmt, error) {
 		}
 		s.Offset = e
 	}
+	if setOp, ok, err := p.parseSetOpClause(); err != nil {
+		return nil, err
+	} else if ok {
+		s.SetOp = setOp
+	}
 	return s, nil
+}
+
+func (p *parser) parseExprList() ([]Expr, error) {
+	var out []Expr
+	first, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, first)
+	for p.acceptSymbol(",") {
+		next, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, next)
+	}
+	return out, nil
+}
+
+func (p *parser) parseSetOpClause() (*SetOpClause, bool, error) {
+	t := p.cur()
+	if t.Kind != TokenKeyword {
+		return nil, false, nil
+	}
+	clause := &SetOpClause{pos: t.Pos}
+	switch t.Keyword {
+	case KwUnion:
+		clause.Type = SetOpUnion
+	case KwIntersect:
+		clause.Type = SetOpIntersect
+	case KwExcept:
+		clause.Type = SetOpExcept
+	default:
+		return nil, false, nil
+	}
+	p.advance()
+	if p.acceptKeyword(KwAll) {
+		clause.All = true
+	} else {
+		_ = p.acceptKeyword(KwDistinct)
+	}
+	rhsStmt, err := p.parseSelect()
+	if err != nil {
+		return nil, false, err
+	}
+	rhs, ok := rhsStmt.(*SelectStmt)
+	if !ok {
+		return nil, false, p.errAtCur("expected SELECT after set operation")
+	}
+	clause.Right = rhs
+	return clause, true, nil
 }
 
 func (p *parser) parseTargetList() ([]ResTarget, error) {
@@ -117,21 +191,128 @@ func (p *parser) parseTargetEntry() (ResTarget, error) {
 	return rt, nil
 }
 
-func (p *parser) parseFromList() ([]RangeVar, error) {
-	var out []RangeVar
-	first, err := p.parseRangeVar()
+func (p *parser) parseFromList() ([]FromExpr, []RangeVar, error) {
+	var out []FromExpr
+	var flat []RangeVar
+	first, firstFlat, err := p.parseFromItem()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out = append(out, first)
+	flat = append(flat, firstFlat...)
 	for p.acceptSymbol(",") {
-		next, err := p.parseRangeVar()
+		next, nextFlat, err := p.parseFromItem()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		out = append(out, next)
+		flat = append(flat, nextFlat...)
 	}
-	return out, nil
+	return out, flat, nil
+}
+
+func (p *parser) parseFromItem() (FromExpr, []RangeVar, error) {
+	base, err := p.parseRangeVar()
+	if err != nil {
+		return FromExpr{}, nil, err
+	}
+	item := FromExpr{pos: base.Pos(), Base: base}
+	flat := []RangeVar{base}
+	for {
+		join, ok, err := p.parseJoinClause()
+		if err != nil {
+			return FromExpr{}, nil, err
+		}
+		if !ok {
+			break
+		}
+		item.Joins = append(item.Joins, join)
+		flat = append(flat, join.Right)
+	}
+	return item, flat, nil
+}
+
+func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
+	t := p.cur()
+	natural := p.acceptKeyword(KwNatural)
+	jt := JoinInner
+
+	switch {
+	case p.acceptKeyword(KwJoin):
+		jt = JoinInner
+	case p.acceptKeyword(KwInner):
+		jt = JoinInner
+		if _, err := p.expectKeyword(KwJoin); err != nil {
+			return JoinExpr{}, false, err
+		}
+	case p.acceptKeyword(KwLeft):
+		jt = JoinLeft
+		_ = p.acceptKeyword(KwOuter)
+		if _, err := p.expectKeyword(KwJoin); err != nil {
+			return JoinExpr{}, false, err
+		}
+	case p.acceptKeyword(KwRight):
+		jt = JoinRight
+		_ = p.acceptKeyword(KwOuter)
+		if _, err := p.expectKeyword(KwJoin); err != nil {
+			return JoinExpr{}, false, err
+		}
+	case p.acceptKeyword(KwFull):
+		jt = JoinFull
+		_ = p.acceptKeyword(KwOuter)
+		if _, err := p.expectKeyword(KwJoin); err != nil {
+			return JoinExpr{}, false, err
+		}
+	case p.acceptKeyword(KwCross):
+		jt = JoinCross
+		if _, err := p.expectKeyword(KwJoin); err != nil {
+			return JoinExpr{}, false, err
+		}
+	default:
+		if natural {
+			return JoinExpr{}, false, p.errAtCur("expected JOIN after NATURAL")
+		}
+		_ = t
+		return JoinExpr{}, false, nil
+	}
+
+	right, err := p.parseRangeVar()
+	if err != nil {
+		return JoinExpr{}, false, err
+	}
+	join := JoinExpr{pos: t.Pos, Type: jt, Natural: natural, Right: right}
+	if join.Type == JoinCross {
+		if natural {
+			return JoinExpr{}, false, &SyntaxError{Pos: t.Pos, Message: "NATURAL CROSS JOIN is not supported"}
+		}
+		return join, true, nil
+	}
+	if natural {
+		return join, true, nil
+	}
+	if p.acceptKeyword(KwOn) {
+		onExpr, err := p.parseExpr()
+		if err != nil {
+			return JoinExpr{}, false, err
+		}
+		join.On = onExpr
+		return join, true, nil
+	}
+	if p.acceptKeyword(KwUsing) {
+		if !p.acceptSymbol("(") {
+			return JoinExpr{}, false, p.errAtCur("expected '('")
+		}
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return JoinExpr{}, false, err
+		}
+		if !p.acceptSymbol(")") {
+			return JoinExpr{}, false, p.errAtCur("expected ')'")
+		}
+		join.Using = cols
+		return join, true, nil
+	}
+	return JoinExpr{}, false, p.errAtCur("expected ON or USING in JOIN")
 }
 
 func (p *parser) parseRangeVar() (RangeVar, error) {
@@ -168,7 +349,9 @@ func isAliasStart(t Token) bool {
 		return false
 	}
 	switch t.Keyword {
-	case KwWhere, KwOrder, KwLimit, KwOffset, KwFrom, KwBy:
+	case KwWhere, KwGroup, KwHaving, KwOrder, KwLimit, KwOffset, KwFrom, KwBy,
+		KwJoin, KwInner, KwLeft, KwRight, KwFull, KwCross, KwNatural,
+		KwUnion, KwIntersect, KwExcept:
 		return false
 	}
 	// Conservative: don't treat keywords as aliases unless we know

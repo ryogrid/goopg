@@ -201,9 +201,8 @@ unchecked item unless a dependency forces a different order.
         precedences.
   - [x] Statement parsers: `SELECT` target list (with `*`, qualified
         `t.*`, `AS` alias), comma-separated `FROM` with optional alias,
-        `WHERE`, `ORDER BY` with ASC/DESC, `LIMIT`/`OFFSET`. JOINs,
-        GROUP BY, HAVING, and set operations are still deferred.
-  - [ ] Statement parsers: JOIN clauses, GROUP BY, HAVING, set operations
+        `WHERE`, `ORDER BY` with ASC/DESC, `LIMIT`/`OFFSET`.
+  - [x] Statement parsers: JOIN clauses, GROUP BY, HAVING, set operations
         for the SELECT shapes pgbench reports queries need.
   - [x] Statement parsers: `INSERT INTO t [(col, …)] VALUES (val, …) [, …]
         [RETURNING target_list]`, `UPDATE t SET col = expr [, …]

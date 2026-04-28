@@ -25,6 +25,9 @@ func TestParseSelectConstant(t *testing.T) {
 	if s.From != nil || s.Where != nil {
 		t.Errorf("expected no FROM/WHERE, got %+v / %+v", s.From, s.Where)
 	}
+	if s.FromExprs != nil {
+		t.Errorf("expected no FROM exprs, got %+v", s.FromExprs)
+	}
 }
 
 // TestParseSelectPgbenchSelectOnly: the canonical query the
@@ -114,6 +117,82 @@ func TestParseSelectOrderLimitOffset(t *testing.T) {
 	}
 }
 
+func TestParseSelectJoins(t *testing.T) {
+	in := "SELECT a.id FROM t1 a INNER JOIN t2 b ON a.id = b.id LEFT JOIN t3 c USING (id) CROSS JOIN t4 d"
+	stmts, err := Parse(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if len(s.FromExprs) != 1 {
+		t.Fatalf("fromExprs=%d", len(s.FromExprs))
+	}
+	if len(s.From) != 4 {
+		t.Fatalf("from(flat)=%d", len(s.From))
+	}
+	joins := s.FromExprs[0].Joins
+	if len(joins) != 3 {
+		t.Fatalf("joins=%d", len(joins))
+	}
+	if joins[0].Type != JoinInner || joins[0].On == nil {
+		t.Errorf("joins[0]=%+v", joins[0])
+	}
+	if joins[1].Type != JoinLeft || len(joins[1].Using) != 1 || joins[1].Using[0] != "id" {
+		t.Errorf("joins[1]=%+v", joins[1])
+	}
+	if joins[2].Type != JoinCross || joins[2].On != nil || len(joins[2].Using) != 0 {
+		t.Errorf("joins[2]=%+v", joins[2])
+	}
+}
+
+func TestParseSelectGroupByHaving(t *testing.T) {
+	stmts, err := Parse("SELECT a, sum(b) FROM t GROUP BY a HAVING sum(b) > 10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if len(s.GroupBy) != 1 {
+		t.Fatalf("groupBy=%d", len(s.GroupBy))
+	}
+	if c, ok := s.GroupBy[0].(*ColumnRef); !ok || c.Column != "a" {
+		t.Errorf("groupBy[0]=%+v", s.GroupBy[0])
+	}
+	h, ok := s.Having.(*BinaryOp)
+	if !ok || h.Op != ">" {
+		t.Fatalf("having=%+v", s.Having)
+	}
+}
+
+func TestParseSelectSetOps(t *testing.T) {
+	stmts, err := Parse("SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if s.SetOp == nil || s.SetOp.Type != SetOpUnion || !s.SetOp.All {
+		t.Fatalf("setop=%+v", s.SetOp)
+	}
+	rhs := s.SetOp.Right
+	if rhs == nil || rhs.SetOp == nil || rhs.SetOp.Type != SetOpIntersect || rhs.SetOp.All {
+		t.Fatalf("rhs setop=%+v", rhs)
+	}
+}
+
+func TestParseSelectNaturalJoin(t *testing.T) {
+	stmts, err := Parse("SELECT * FROM a NATURAL JOIN b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if len(s.FromExprs) != 1 || len(s.FromExprs[0].Joins) != 1 {
+		t.Fatalf("fromExprs=%+v", s.FromExprs)
+	}
+	j := s.FromExprs[0].Joins[0]
+	if !j.Natural || j.Type != JoinInner || j.On != nil || len(j.Using) != 0 {
+		t.Errorf("join=%+v", j)
+	}
+}
+
 // TestParseSelectFunctionCall: count(*) and sum(distinct x) shapes.
 func TestParseSelectFunctionCall(t *testing.T) {
 	stmts, err := Parse("SELECT count(*), sum(DISTINCT x) FROM t")
@@ -139,6 +218,10 @@ func TestParseSelectSyntaxErrors(t *testing.T) {
 		"SELECT 1 FROM",     // no table after FROM
 		"SELECT 1 WHERE",    // no expression after WHERE
 		"SELECT 1 ORDER BY", // no expression after ORDER BY
+		"SELECT 1 FROM t JOIN u",
+		"SELECT 1 FROM t NATURAL",
+		"SELECT 1 GROUP",
+		"SELECT 1 UNION",
 	}
 	for _, in := range cases {
 		_, err := Parse(in)

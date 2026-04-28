@@ -53,10 +53,23 @@ const (
 	KwAs          Keyword = "as"
 	KwOrder       Keyword = "order"
 	KwBy          Keyword = "by"
+	KwGroup       Keyword = "group"
+	KwHaving      Keyword = "having"
 	KwAsc         Keyword = "asc"
 	KwDesc        Keyword = "desc"
 	KwLimit       Keyword = "limit"
 	KwOffset      Keyword = "offset"
+	KwJoin        Keyword = "join"
+	KwInner       Keyword = "inner"
+	KwLeft        Keyword = "left"
+	KwRight       Keyword = "right"
+	KwFull        Keyword = "full"
+	KwCross       Keyword = "cross"
+	KwNatural     Keyword = "natural"
+	KwOuter       Keyword = "outer"
+	KwUnion       Keyword = "union"
+	KwIntersect   Keyword = "intersect"
+	KwExcept      Keyword = "except"
 	KwAnd         Keyword = "and"
 	KwOr          Keyword = "or"
 	KwNot         Keyword = "not"
@@ -123,10 +136,23 @@ var keywords = map[string]Keyword{
 	"as":          KwAs,
 	"order":       KwOrder,
 	"by":          KwBy,
+	"group":       KwGroup,
+	"having":      KwHaving,
 	"asc":         KwAsc,
 	"desc":        KwDesc,
 	"limit":       KwLimit,
 	"offset":      KwOffset,
+	"join":        KwJoin,
+	"inner":       KwInner,
+	"left":        KwLeft,
+	"right":       KwRight,
+	"full":        KwFull,
+	"cross":       KwCross,
+	"natural":     KwNatural,
+	"outer":       KwOuter,
+	"union":       KwUnion,
+	"intersect":   KwIntersect,
+	"except":      KwExcept,
 	"and":         KwAnd,
 	"or":          KwOr,
 	"not":         KwNot,
