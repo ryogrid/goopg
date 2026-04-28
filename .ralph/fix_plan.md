@@ -498,8 +498,12 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       FPI by using that variant. `goopg start` honours the
       `full_page_writes` GUC by calling
       `Pool.SetFullPageWrites` at boot.
-- [ ] Add `goopg ctl checkpoint` CLI subcommand routed through the
-      control socket. Same semantics as the SQL verb.
+- [x] Add `goopg ctl checkpoint` CLI subcommand routed through the
+      control socket. Same semantics as the SQL verb. Wired as
+      `goopg checkpoint -D <dir> [-t seconds]`; the server-side
+      handler drops the listener read deadline before invoking
+      `Checkpointer.CheckpointNow()` so a long flush won't trip
+      the default 5s timeout. CLI default is 300s.
 - [ ] Surface `pg_stat_bgwriter` / `pg_stat_checkpointer` (whichever
       view shipped in PG 18; pick what matches the reported
       server_version) as queryable virtual tables.
@@ -556,7 +560,18 @@ full Definition of Done. Decomposed into agent-sized chunks below.
         and is idempotent via `pd_lsn`. pgbench `-t 30`
         default-mixed workload (~120 UPDATEs + ~30 INSERTs +
         SELECTs) WAL stays flat at ~21 MB.
-  - [ ] Migrate VACUUM page-prune mutations.
+  - [x] Migrate VACUUM page-prune mutations.
+        New `RecordKindHeapVacuum` (kind=7); format
+        `kind | rel(9) | blk(4) | count(2) | slots[count](2 each)`,
+        16 + 2*count bytes. `storage.CollectDeadHeapSlots` and
+        `storage.VacuumHeapPageBySlots` factor the prune kernel so
+        live VACUUM and replay both apply the same slot list.
+        VACUUM now takes the per-page content latch around the
+        scan + repack + pd_lsn stamp (concurrency-safety win),
+        emits the slot list via `Pool.MarkDirtyChangeRecord`, and
+        falls back to `MarkDirty` when no `LogHeapVacuum` hook is
+        wired (test pools). Replay re-runs `VacuumHeapPageBySlots`
+        with the recorded slots; idempotent via pd_lsn.
   - [ ] Once all paths are migrated, flip `maybeEmitFPI` back to
         the strict once-per-epoch policy globally.
 

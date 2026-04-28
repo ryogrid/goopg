@@ -84,6 +84,100 @@ func TestReplayHeapDeleteIdempotent(t *testing.T) {
 	}
 }
 
+// TestEncodeDecodeHeapVacuumRoundTrip pins the on-the-wire shape
+// of the heap-vacuum record so a future format edit can't silently
+// rearrange fields.
+func TestEncodeDecodeHeapVacuumRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 60, RelOid: 61, Fork: storage.MainFork}
+	slots := []uint16{1, 3, 5, 7}
+	enc := EncodeHeapVacuum(rel, 21, slots)
+	if enc[0] != RecordKindHeapVacuum {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindHeapVacuum)
+	}
+	gotRel, gotBlk, gotSlots, err := DecodeHeapVacuum(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRel != rel || gotBlk != 21 {
+		t.Errorf("decoded rel/blk = %v %d", gotRel, gotBlk)
+	}
+	if len(gotSlots) != len(slots) {
+		t.Fatalf("decoded slots len = %d, want %d", len(gotSlots), len(slots))
+	}
+	for i, s := range slots {
+		if gotSlots[i] != s {
+			t.Errorf("decoded slots[%d] = %d, want %d", i, gotSlots[i], s)
+		}
+	}
+}
+
+// TestReplayHeapVacuumIdempotent walks one HeapVacuum record
+// through replay against a page seeded with three live tuples.
+// One slot is reclaimed; the prune is observed after replay and
+// a second replay is a no-op via pd_lsn.
+func TestReplayHeapVacuumIdempotent(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 906, Fork: storage.MainFork}
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"alpha", "beta", "gamma"} {
+		tup := storage.NewHeapTuple(7, storage.InvalidTransactionID, []byte(body))
+		if _, err := storage.PageAddHeapTuple(page, tup); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := EncodeHeapVacuum(rel, 0, []uint16{2})
+	stats, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Applied != 1 {
+		t.Fatalf("first replay Applied=%d want 1", stats.Applied)
+	}
+
+	// Second replay must be a no-op via pd_lsn.
+	if _, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	}); err != nil {
+		t.Fatalf("second replay returned err=%v (expected silent skip)", err)
+	}
+
+	// Slot 2 should be LP_UNUSED; 1 and 3 still readable.
+	got := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.PageGetHeapTuple(got, 2); err == nil {
+		t.Errorf("slot 2 still readable after vacuum replay; want LP_UNUSED")
+	}
+	t1, err := storage.PageGetHeapTuple(got, 1)
+	if err != nil {
+		t.Fatalf("slot 1: %v", err)
+	}
+	if string(t1.Data) != "alpha" {
+		t.Errorf("slot 1 body = %q want alpha", t1.Data)
+	}
+	t3, err := storage.PageGetHeapTuple(got, 3)
+	if err != nil {
+		t.Fatalf("slot 3: %v", err)
+	}
+	if string(t3.Data) != "gamma" {
+		t.Errorf("slot 3 body = %q want gamma", t3.Data)
+	}
+}
+
 // TestEncodeDecodeBtreeInsertRoundTrip pins the on-the-wire
 // shape of the new redo record so future format edits can't
 // silently rearrange fields.

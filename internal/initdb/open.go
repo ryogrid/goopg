@@ -165,6 +165,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Logical heap-vacuum (page prune) change record.
+	logHeapVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, deadSlots []uint16) (storage.LSN, error) {
+		payload := wal.EncodeHeapVacuum(rel, blk, deadSlots)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
@@ -173,6 +183,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapInsert:  logHeapInsert,
 		LogBtreeInsert: logBtreeInsert,
 		LogHeapDelete:  logHeapDelete,
+		LogHeapVacuum:  logHeapVacuum,
 		FullPageWrites: true,
 	})
 	if err != nil {

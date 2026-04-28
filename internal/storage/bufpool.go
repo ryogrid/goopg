@@ -92,6 +92,10 @@ type Pool struct {
 	// logHeapDelete emits a logical heap-delete (xmax stamp)
 	// WAL record. Used by the executor's UPDATE / DELETE paths.
 	logHeapDelete LogHeapDeleteFunc
+	// logHeapVacuum emits a logical heap-vacuum (page prune) WAL
+	// record. Used by VACUUM to capture the dead-slot list rather
+	// than a full-page image on each pruned page.
+	logHeapVacuum LogHeapVacuumFunc
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -153,6 +157,12 @@ type PoolConfig struct {
 	// xmax-stamp paths can emit a logical change record.
 	LogHeapDelete LogHeapDeleteFunc
 
+	// LogHeapVacuum, when non-nil, is exposed via
+	// Pool.LogHeapVacuum so the VACUUM path can emit a
+	// dead-slot-list change record instead of a full FPI on
+	// each pruned page.
+	LogHeapVacuum LogHeapVacuumFunc
+
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -190,6 +200,13 @@ type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN
 // epoch. See docs/design/0002-0003-redo-records.md.
 type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID) (LSN, error)
 
+// LogHeapVacuumFunc emits one logical heap-vacuum (page prune)
+// redo record carrying the 1-based LP_NORMAL slot numbers being
+// reclaimed. Replay calls VacuumHeapPageBySlots with the same
+// list, so the prune is bit-exact whether it's the original
+// write or recovery. See docs/design/0002-0003-redo-records.md.
+type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
+
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by an
 // mmap'd arena. Returns an error if slots <= 0 or the arena alloc
 // fails.
@@ -216,6 +233,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapInsert:  cfg.LogHeapInsert,
 		logBtreeInsert: cfg.LogBtreeInsert,
 		logHeapDelete:  cfg.LogHeapDelete,
+		logHeapVacuum:  cfg.LogHeapVacuum,
 		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
@@ -244,6 +262,11 @@ func (p *Pool) LogBtreeInsert() LogBtreeInsertFunc { return p.logBtreeInsert }
 // hook, or nil if none was wired. Callers fall back to per-page
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapDelete() LogHeapDeleteFunc { return p.logHeapDelete }
+
+// LogHeapVacuum returns the configured heap-vacuum change-record
+// hook, or nil if none was wired. Callers fall back to per-page
+// FPI via MarkDirty when nil.
+func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 // Mirrors upstream's full_page_writes SIGHUP-context GUC.

@@ -46,19 +46,30 @@ corresponding mutation site:
   `btree.insertIntoBlock` non-split path. pgbench-i WAL:
   ~801 MB → ~21 MB. `btree.ApplyInsertRecord` is the public
   replay helper that `wal/recovery.go` calls.
-- **0002-0003c** (this landing): `RecordKindHeapDelete` (fixed
+- **0002-0003c**: `RecordKindHeapDelete` (fixed
   20-byte record: rel + blk + lineSlot + xmax). Migrated both
   `updateOp` (xmax stamp on the old image) and `deleteOp`
   (xmax stamp on the visible match) via a new
   `markHeapDeleteDirty` helper. `pgbench -t 30` default-mixed
   workload now keeps WAL flat at ~21 MB.
+- **0002-0003d** (this landing): `RecordKindHeapVacuum`
+  (`kind | rel(9) | blk(4) | count(2) | slots[count](2 each)`,
+  16 + 2*count bytes). VACUUM now collects the dead-slot list
+  via the new `storage.CollectDeadHeapSlots`, applies the prune
+  via `storage.VacuumHeapPageBySlots`, and emits the slot list
+  through `Pool.MarkDirtyChangeRecord` so a pruned page only
+  spends an FPI on the first prune-per-epoch. Replay re-runs
+  `VacuumHeapPageBySlots` against the existing page bytes for a
+  bit-exact prune; idempotent via pd_lsn. The per-page content
+  latch (`Slot.Lock`) is now taken around the dead-set scan +
+  repack + LSN stamp so concurrent inserters can't tear the
+  prune.
 
-Remaining paths still emit FPI-every-dirty: vacuum page prune,
-btree metapage updates, btree internal-node insert, btree
-clearRootFlag. Each gets its own record kind in subsequent
-loops; once all paths are migrated, `Pool.MarkDirty` flips back
-to once-per-epoch FPI globally and the per-method selector
-dissolves.
+Remaining paths still emit FPI-every-dirty: btree metapage
+updates, btree internal-node insert, btree clearRootFlag. Each
+gets its own record kind in subsequent loops; once all paths are
+migrated, `Pool.MarkDirty` flips back to once-per-epoch FPI
+globally and the per-method selector dissolves.
 
 ### Record format
 
@@ -133,10 +144,7 @@ re-emitted produces the same bytes.
 
 ## Out of scope (deferred to subsequent loops)
 
-- Heap UPDATE / DELETE redo (`RecordKindHeapDelete`,
-  `RecordKindHeapUpdate`).
-- B-tree non-split insert redo.
-- VACUUM prune redo.
+- B-tree metapage / internal-node / clearRootFlag redo.
 - Catalog-page (`pg_class` etc.) change records — v0's catalog
   is JSON-on-disk so it's not a buffer-pool path.
 

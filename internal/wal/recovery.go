@@ -47,6 +47,16 @@ const (
 	// Format: "kind | rel(9) | blk(4) | lineSlot(2) | xmax(4)"
 	// = 20 bytes, fixed. Replay is idempotent via pd_lsn.
 	RecordKindHeapDelete byte = 6
+	// RecordKindHeapVacuum is a logical change record for one
+	// heap page-prune. VACUUM emits one per pruned page,
+	// carrying the 1-based LP_NORMAL slot numbers it reclaimed
+	// to LP_UNUSED. Replay calls
+	// storage.VacuumHeapPageBySlots with the same list, so
+	// the post-replay page is bit-exact with the original
+	// post-prune image. Format:
+	// "kind | rel(9) | blk(4) | count(2) | slots[count](2 each)"
+	// = 16 + 2*count bytes. Replay is idempotent via pd_lsn.
+	RecordKindHeapVacuum byte = 7
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
@@ -61,6 +71,9 @@ const (
 	// heapDeleteSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1)
 	// + Block(4) + LineSlot(2) + Xmax(4) = 20.
 	heapDeleteSize = 20
+	// heapVacuumHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + Block(4) + Count(2) = 16.
+	heapVacuumHeaderSize = 16
 )
 
 // ReplayStats summarizes one replay run.
@@ -161,6 +174,54 @@ func DecodeHeapDelete(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
 	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
 	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
+	return
+}
+
+// EncodeHeapVacuum encodes one logical heap-vacuum (page prune)
+// redo record. `deadSlots` carries the 1-based LP_NORMAL slot
+// numbers to reclaim, in any order — replay treats the list as
+// a set.
+func EncodeHeapVacuum(rel storage.RelFileNode, blk storage.BlockNumber, deadSlots []uint16) []byte {
+	out := make([]byte, heapVacuumHeaderSize+2*len(deadSlots))
+	out[0] = RecordKindHeapVacuum
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], uint16(len(deadSlots)))
+	for i, s := range deadSlots {
+		binary.LittleEndian.PutUint16(out[heapVacuumHeaderSize+2*i:heapVacuumHeaderSize+2*i+2], s)
+	}
+	return out
+}
+
+// DecodeHeapVacuum returns the rel + block + dead-slot list
+// carried by a HeapVacuum record payload.
+func DecodeHeapVacuum(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, deadSlots []uint16, err error) {
+	if len(payload) < heapVacuumHeaderSize {
+		err = fmt.Errorf("wal: invalid heap-vacuum payload len %d (want >= %d)", len(payload), heapVacuumHeaderSize)
+		return
+	}
+	if payload[0] != RecordKindHeapVacuum {
+		err = fmt.Errorf("wal: record kind %d is not heap-vacuum", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	count := int(binary.LittleEndian.Uint16(payload[14:16]))
+	want := heapVacuumHeaderSize + 2*count
+	if len(payload) != want {
+		err = fmt.Errorf("wal: heap-vacuum payload len %d does not match count=%d (want %d)", len(payload), count, want)
+		return
+	}
+	deadSlots = make([]uint16, count)
+	for i := 0; i < count; i++ {
+		deadSlots[i] = binary.LittleEndian.Uint16(payload[heapVacuumHeaderSize+2*i : heapVacuumHeaderSize+2*i+2])
+	}
 	return
 }
 
@@ -309,6 +370,11 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
 			}
 			stats.Applied++
+		case RecordKindHeapVacuum:
+			if err := replayHeapVacuum(mgr, r); err != nil {
+				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
+			}
+			stats.Applied++
 		case RecordKindCheckpoint:
 			// Marker only; no page write.
 			continue
@@ -350,6 +416,37 @@ func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64
 		return ReplayStats{}, err
 	}
 	return ReplayRecords(mgr, records)
+}
+
+// replayHeapVacuum applies one logical heap-vacuum prune record.
+// The page must already exist; idempotent via pd_lsn.
+func replayHeapVacuum(mgr *storage.Manager, r Record) error {
+	rel, blk, deadSlots, err := DecodeHeapVacuum(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-vacuum replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-vacuum replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if _, err := storage.VacuumHeapPageBySlots(page, deadSlots); err != nil {
+		return fmt.Errorf("wal: heap-vacuum apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
 }
 
 // replayHeapDelete applies one logical xmax-stamp record. The

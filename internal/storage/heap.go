@@ -312,6 +312,67 @@ type HeapPageVacuumStats struct {
 // On any structural error (corrupt header, invalid line pointer) the
 // page is left untouched and the error is returned.
 func VacuumHeapPage(p Page, isDead func(HeapTupleHeader) bool) (HeapPageVacuumStats, error) {
+	deadSlots, err := CollectDeadHeapSlots(p, isDead)
+	if err != nil {
+		return HeapPageVacuumStats{}, err
+	}
+	return VacuumHeapPageBySlots(p, deadSlots)
+}
+
+// CollectDeadHeapSlots walks p and returns the 1-based slot numbers
+// whose LP_NORMAL tuple satisfies isDead. The page itself is not
+// modified. The returned slot list is in ascending order, matching
+// the order VacuumHeapPageBySlots needs for deterministic replay.
+//
+// VACUUM uses this to compute the dead set once at original-mutation
+// time, then both prune the page (via VacuumHeapPageBySlots) and
+// emit a logical redo record carrying that slot list. Replay applies
+// the same slot list against the existing page bytes, so the prune
+// is bit-exact whether it's the original write or recovery.
+func CollectDeadHeapSlots(p Page, isDead func(HeapTupleHeader) bool) ([]uint16, error) {
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	var dead []uint16
+	for idx := 0; idx < count; idx++ {
+		item, err := readItemID(p, idx)
+		if err != nil {
+			return nil, err
+		}
+		if item.Flags != ItemIDNormal {
+			continue
+		}
+		off := int(item.Offset)
+		ln := int(item.Length)
+		if off < 0 || ln < 0 || off+ln > len(p) {
+			return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, idx+1, off, ln)
+		}
+		t, err := ParseHeapTuple(p[off : off+ln])
+		if err != nil {
+			return nil, err
+		}
+		if isDead(t.Header) {
+			dead = append(dead, uint16(idx+1))
+		}
+	}
+	return dead, nil
+}
+
+// VacuumHeapPageBySlots applies a vacuum prune to p with an explicit
+// list of 1-based LP_NORMAL slot numbers to reclaim. It is the
+// deterministic kernel shared by:
+//
+//   - the live VACUUM path, which collects the slot list via
+//     CollectDeadHeapSlots, applies it here, and emits the same
+//     slot list as a redo record; and
+//   - WAL replay, which decodes the slot list from the redo record
+//     and applies it here.
+//
+// deadSlots must be ascending and reference only LP_NORMAL slots;
+// any out-of-range or non-LP_NORMAL entry returns an error and the
+// page is left untouched.
+func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, error) {
 	h, err := Header(p)
 	if err != nil {
 		return HeapPageVacuumStats{}, err
@@ -319,6 +380,13 @@ func VacuumHeapPage(p Page, isDead func(HeapTupleHeader) bool) (HeapPageVacuumSt
 	count, err := PageLinePointerCount(p)
 	if err != nil {
 		return HeapPageVacuumStats{}, err
+	}
+	deadSet := make(map[int]struct{}, len(deadSlots))
+	for _, s := range deadSlots {
+		if s == 0 || int(s) > count {
+			return HeapPageVacuumStats{}, fmt.Errorf("%w: dead slot %d out of range (count=%d)", ErrInvalidSlot, s, count)
+		}
+		deadSet[int(s)-1] = struct{}{}
 	}
 	type live struct {
 		idx  int
@@ -339,11 +407,7 @@ func VacuumHeapPage(p Page, isDead func(HeapTupleHeader) bool) (HeapPageVacuumSt
 		if off < 0 || ln < 0 || off+ln > len(p) {
 			return HeapPageVacuumStats{}, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, idx+1, off, ln)
 		}
-		t, err := ParseHeapTuple(p[off : off+ln])
-		if err != nil {
-			return HeapPageVacuumStats{}, err
-		}
-		if isDead(t.Header) {
+		if _, isDead := deadSet[idx]; isDead {
 			if err := writeItemID(p, idx, ItemID{Flags: ItemIDUnused}); err != nil {
 				return HeapPageVacuumStats{}, err
 			}

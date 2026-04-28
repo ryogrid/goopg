@@ -28,6 +28,14 @@ type Stats struct {
 // tuples are still pinned and re-flushed only if any tuple was
 // reclaimed; otherwise they're left untouched.
 //
+// When the buffer pool has a `LogHeapVacuum` hook wired (the normal
+// runtime case), each pruned page emits a logical heap-vacuum redo
+// record carrying the reclaimed slot list — replay then re-runs
+// `VacuumHeapPageBySlots` against the existing page bytes for a
+// bit-exact prune. When the hook is absent (test pools), Vacuum
+// falls back to MarkDirty so the FPI-on-every-dirty path keeps the
+// change durable.
+//
 // VACUUM does not touch indexes — see Reindex for the bridge until
 // B-tree page deletion lands.
 func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Stats, error) {
@@ -43,6 +51,7 @@ func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Sta
 		}
 		return h.Xmax < horizon
 	}
+	logVac := pool.LogHeapVacuum()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -56,14 +65,37 @@ func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Sta
 			stats.Pages++
 			continue
 		}
-		ps, err := storage.VacuumHeapPage(page, isDead)
+		// Take the per-page content lock so concurrent readers /
+		// writers can't tear the dead-set scan + repack + pd_lsn
+		// stamp under MarkDirtyChangeRecord.
+		slot.Lock()
+		deadSlots, err := storage.CollectDeadHeapSlots(page, isDead)
 		if err != nil {
+			slot.Unlock()
+			pool.Unpin(slot)
+			return stats, err
+		}
+		ps, err := storage.VacuumHeapPageBySlots(page, deadSlots)
+		if err != nil {
+			slot.Unlock()
 			pool.Unpin(slot)
 			return stats, err
 		}
 		if ps.Dead > 0 {
-			pool.MarkDirty(slot)
+			if logVac != nil {
+				err = pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+					return logVac(rel, blk, deadSlots)
+				})
+				if err != nil {
+					slot.Unlock()
+					pool.Unpin(slot)
+					return stats, err
+				}
+			} else {
+				pool.MarkDirty(slot)
+			}
 		}
+		slot.Unlock()
 		pool.Unpin(slot)
 		stats.Pages++
 		stats.Live += ps.Live
