@@ -182,6 +182,92 @@ func TestPlanJoinPicksHashAlgo(t *testing.T) {
 	}
 }
 
+// TestPlanJoinHashBuildSidePicksSmaller pins the planner's
+// build-side selection: when EstimateRows says the LEFT input is
+// smaller, the planner sets BuildLeft=true so the executor builds
+// the hash on the smaller relation. Build-side selection is
+// INNER-only — LEFT joins keep the right-as-build default because
+// the executor's outer-row emission walks the left side as the
+// probe stream.
+func TestPlanJoinHashBuildSidePicksSmaller(t *testing.T) {
+	smallStats := &catalog.TableStats{
+		RowCount: 100,
+		Columns:  []catalog.ColumnStats{{NDistinct: 100}, {}, {}, {}},
+	}
+	bigStats := &catalog.TableStats{
+		RowCount: 10000,
+		Columns:  []catalog.ColumnStats{{}, {}, {NDistinct: 100}, {}, {}},
+	}
+
+	cases := []struct {
+		name          string
+		accountsStats *catalog.TableStats
+		historyStats  *catalog.TableStats
+		sql           string
+		wantBuildLeft bool
+	}{
+		{
+			name:          "small left, big right -> build=left",
+			accountsStats: smallStats,
+			historyStats:  bigStats,
+			sql:           "SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid",
+			wantBuildLeft: true,
+		},
+		{
+			name:          "big left, small right -> build=right (default)",
+			accountsStats: bigStats,
+			historyStats:  smallStats,
+			sql:           "SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid",
+			wantBuildLeft: false,
+		},
+		{
+			name:          "no stats -> build=right (default)",
+			sql:           "SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid",
+			wantBuildLeft: false,
+		},
+		{
+			name:          "LEFT JOIN never flips build side, even when left is smaller",
+			accountsStats: smallStats,
+			historyStats:  bigStats,
+			sql:           "SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid",
+			wantBuildLeft: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cat := pgbenchCatalog(t)
+			if tc.accountsStats != nil {
+				if tbl, ok := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"}); ok {
+					cat.SetTableStats(tbl, tc.accountsStats)
+				}
+			}
+			if tc.historyStats != nil {
+				if tbl, ok := cat.LookupTable(parser.ObjectName{Name: "pgbench_history"}); ok {
+					cat.SetTableStats(tbl, tc.historyStats)
+				}
+			}
+			node, err := Plan(parseOne(t, tc.sql), cat)
+			if err != nil {
+				t.Fatalf("Plan: %v", err)
+			}
+			proj, ok := node.(*Project)
+			if !ok {
+				t.Fatalf("root=%T want *Project", node)
+			}
+			j, ok := proj.Child.(*Join)
+			if !ok {
+				t.Fatalf("child=%T want *Join", proj.Child)
+			}
+			if j.Algo != JoinAlgoHash {
+				t.Fatalf("Algo=%v want JoinAlgoHash", j.Algo)
+			}
+			if j.BuildLeft != tc.wantBuildLeft {
+				t.Errorf("BuildLeft=%v want %v", j.BuildLeft, tc.wantBuildLeft)
+			}
+		})
+	}
+}
+
 func TestPlanJoinPicksMergeAlgoForRightFullEquality(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	cases := []struct {

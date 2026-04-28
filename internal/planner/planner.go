@@ -448,6 +448,18 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 			case JoinTypeRight, JoinTypeFull:
 				jn.Algo = JoinAlgoMerge
 			}
+			// Build-side selection: for INNER hash joins, build on
+			// whichever side the cardinality estimator reports as
+			// smaller. LEFT joins keep the right-as-build default
+			// because the executor's outer-row emission walks the
+			// left (preserved) side as the probe stream.
+			if jn.Algo == JoinAlgoHash && jn.Type == JoinTypeInner {
+				lRows := EstimateRows(jn.Left)
+				rRows := EstimateRows(jn.Right)
+				if lRows > 0 && rRows > 0 && lRows < rRows {
+					jn.BuildLeft = true
+				}
+			}
 		}
 		leftNode = jn
 		leftCtx = mergedCtx

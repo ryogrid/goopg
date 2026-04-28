@@ -112,13 +112,21 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 	return nil
 }
 
-// runHashJoin builds an in-memory map keyed by RightKey over
-// the right input, then probes from the left. INNER and LEFT
-// only — the planner enables the hash algo only for these
-// types. Build cost: O(M) hashes + O(M) memory; probe cost:
-// O(N) hashes + O(matches) emits. NULL keys never match
-// (matches upstream's NULL-aware equi-join semantics).
+// runHashJoin builds an in-memory map on one input and probes from
+// the other. By default the right input is the build side (matches
+// the historical convention); when the planner sets BuildLeft=true
+// — which it does for INNER joins where EstimateRows says the left
+// side is smaller — we hash the left input instead. The output row
+// order remains canonical [leftCols, rightCols] regardless of which
+// side built the hash table. INNER and LEFT only — the planner
+// enables the hash algo only for these types and only sets
+// BuildLeft for INNER. Build cost: O(M) hashes + O(M) memory;
+// probe cost: O(N) hashes + O(matches) emits. NULL keys never
+// match (matches upstream's NULL-aware equi-join semantics).
 func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
+	if o.plan.BuildLeft {
+		return o.runHashJoinBuildLeft(leftRows, rightRows, leftWidth, rightWidth)
+	}
 	nullRight := nullRow(rightWidth)
 
 	// Build phase: hash right input on RightKey. The right key
@@ -166,6 +174,43 @@ func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth in
 		}
 		if !matched && o.plan.Type == planner.JoinTypeLeft {
 			o.rows = append(o.rows, concatRows(l, nullRight))
+		}
+	}
+	return nil
+}
+
+// runHashJoinBuildLeft mirrors runHashJoin with the build/probe
+// sides swapped: the LEFT input becomes the hash table and the
+// RIGHT input drives the probe. The output is still in the
+// canonical [leftCols, rightCols] order so downstream operators
+// see no difference. INNER only — the planner does not enable
+// BuildLeft for LEFT JOIN (the left side is the outer/preserved
+// side and must drive the loop to emit unmatched rows).
+func (o *joinOp) runHashJoinBuildLeft(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
+	leftHash := make(map[string][]Row, len(leftRows))
+	rightZero := nullRow(rightWidth)
+	for _, l := range leftRows {
+		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, rightZero))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		leftHash[key] = append(leftHash[key], l)
+	}
+
+	leftPad := nullRow(leftWidth)
+	for _, r := range rightRows {
+		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(leftPad, r))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		for _, l := range leftHash[key] {
+			o.rows = append(o.rows, concatRows(l, r))
 		}
 	}
 	return nil

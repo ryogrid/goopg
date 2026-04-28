@@ -101,13 +101,30 @@ area (same Join node, different `Algo`).
 
 ### Build vs. probe side
 
-The right input is the build side. The plan structure is
-"left ⋈ right" with predicates resolved against the left||right
-schema concat; hashing on the right means a single map keyed
-by the right input's join column. Upstream picks the smaller
-side as build for cache efficiency; v0 always builds on the
-right because the planner has no row-count estimates yet
-(stats milestone is a follow-up).
+The right input is the default build side. The plan structure
+is "left ⋈ right" with predicates resolved against the
+left||right schema concat; hashing on the right means a single
+map keyed by the right input's join column.
+
+For INNER joins the planner now consults `EstimateRows` (see
+`docs/design/0003-0003-statistics-and-cardinality.md`) and sets
+`Join.BuildLeft = true` when the LEFT input is the smaller side.
+The executor's `runHashJoinBuildLeft` then hashes the LEFT input
+and probes from the RIGHT, but emits rows in the same canonical
+[leftCols, rightCols] order so downstream operators see no
+schema change. EXPLAIN surfaces the choice as
+`Hash Join (INNER, build=left)` when the swap fires.
+
+LEFT JOIN keeps the right-as-build default unconditionally: its
+outer-row preservation walks the LEFT side as the probe stream,
+so we can't flip the build side without re-deriving the
+unmatched-row emission logic. RIGHT/FULL never reach the hash
+algorithm — they take merge join — so build-side selection is
+strictly an INNER-hash optimisation.
+
+Build-side selection is gated on having stats: when both sides'
+estimates are 0 (no ANALYZE has run on either table) the planner
+keeps `BuildLeft = false`, matching the prior behaviour.
 
 ### Hash key encoding: datumKey reuse
 
@@ -142,7 +159,10 @@ SELECT c_name FROM customer JOIN orders ON o_custkey = c_custkey;
 ```
 
 `TestPlanJoinPicksHashAlgo` pins which predicates promote and
-which stay on nested-loop.
+which stay on nested-loop. `TestPlanJoinHashBuildSidePicksSmaller`
+pins the build-side selection: smaller-LEFT → BuildLeft=true,
+bigger-LEFT → BuildLeft=false (default), no-stats → default,
+LEFT JOIN → default regardless of side sizes.
 
 ## Out of scope (deferred to subsequent loops)
 
@@ -153,7 +173,10 @@ which stay on nested-loop.
 - Multi-column equality keys (`a.x = b.x AND a.y = b.y` →
   composite hash key).
 - Cost-based build-side selection (smaller-input → build).
-  Waits on the statistics milestone.
+  Implemented for INNER hash joins as of 2026-04-29 (see "Build
+  vs. probe side" above). LEFT JOIN still pins right-as-build
+  for outer-row semantics; INNER + bidirectional outer hash
+  with build-side selection is a future loop.
 - RIGHT / FULL outer hash join.
 - Streaming probe (the upstream "outer side iterates while
   hash table builds incrementally" pattern). v0 buffers both

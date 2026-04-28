@@ -788,13 +788,17 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       Join uses upstream's `|L|*|R|/max(NDistinct)`;
       Aggregate uses NDistinct on single-column GROUP BY.
       Surfaced via EXPLAIN's `(rows=N)` suffix; suppressed
-      for unanalysed tables. Estimates are now consumed
-      visually but NOT yet by planner decision-making —
-      hash-join build-side selection, join-order reordering,
-      and algorithm-vs-algorithm choice still use the
-      rules-based logic. Closing this bullet needs the
-      reorderer + a real cost model. See
-      `docs/design/0003-0003-statistics-and-cardinality.md`.)
+      for unanalysed tables. Hash-join build-side selection
+      now consumes the estimates 2026-04-29: INNER joins flip
+      to `BuildLeft = true` when EstimateRows says the left
+      side is smaller. EXPLAIN annotates the swap as
+      `Hash Join (INNER, build=left)`. LEFT JOIN keeps
+      right-as-build for outer-row semantics. Still TODO for
+      this bullet: join-order reordering and
+      algorithm-vs-algorithm choice (hash vs merge vs nested
+      for INNER). See
+      `docs/design/0003-0003-statistics-and-cardinality.md`
+      and `docs/design/0003-0002-join-executors.md`.)
 - [x] Hash join executor (`internal/executor/operators_hashjoin.go`).
       (achieved 2026-04-28: implemented in
       `internal/executor/operators_join_agg.go` (extending the

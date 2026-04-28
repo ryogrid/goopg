@@ -300,10 +300,16 @@ const (
 //
 // When Algo == JoinAlgoHash or JoinAlgoMerge, LeftKey and
 // RightKey carry the equality operands (`LeftKey = RightKey` is
-// exactly Predicate). Hash join builds a hash table on the right
-// input keyed by RightKey and probes from the left. Merge join
-// sorts both sides on their keys and merges the two ordered
-// streams, preserving RIGHT/FULL outer-row semantics.
+// exactly Predicate). Hash join builds a hash table on one input
+// and probes from the other. The default build side is the right
+// input (matches the executor's historical convention); the
+// planner sets BuildLeft=true when EstimateRows says the left
+// side is smaller — building on the smaller relation cuts both
+// memory and hash-table population time. BuildLeft is INNER-only
+// because LEFT JOIN's outer-row preservation depends on which
+// side drives the probe loop. Merge join sorts both sides on
+// their keys and merges the two ordered streams, preserving
+// RIGHT/FULL outer-row semantics.
 type Join struct {
 	pos       int
 	Type      JoinType
@@ -313,6 +319,7 @@ type Join struct {
 	Predicate Expr
 	LeftKey   Expr // populated when Algo == JoinAlgoHash
 	RightKey  Expr
+	BuildLeft bool // hash join: build on left input instead of right
 	schema    Schema
 }
 

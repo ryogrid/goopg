@@ -99,6 +99,9 @@ func describePlan(n planner.Node) string {
 		if p.Algo == planner.JoinAlgoMerge {
 			algo = "Merge Join"
 		}
+		if p.Algo == planner.JoinAlgoHash && p.BuildLeft {
+			return fmt.Sprintf("%s (%s, build=left)", algo, joinTypeName(p.Type))
+		}
 		return fmt.Sprintf("%s (%s)", algo, joinTypeName(p.Type))
 	case *planner.Aggregate:
 		if len(p.GroupExprs) == 0 {
