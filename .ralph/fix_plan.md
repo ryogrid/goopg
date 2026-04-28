@@ -968,6 +968,26 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] HammerDB workload-runner GUC compatibility: register
+      stub `max_parallel_workers_per_gather`,
+      `client_min_messages`, `statement_timeout`, `work_mem`,
+      `random_page_cost`, `effective_cache_size`,
+      `search_path` so the seven SET statements HammerDB
+      issues before running queries succeed.
+      (achieved 2026-04-29: surfaced by smoke-running the
+      seven SET statements HammerDB / psql / pgbench
+      typically issue against goopg — all seven failed with
+      `unrecognized configuration parameter`. Now registered
+      as ContextUserset GUCs in BuildDefaultRegistry with
+      upstream-aligned names, units (UnitMs/UnitKB/etc.),
+      ranges, and defaults. v0 doesn't actually honour any
+      of these semantically — the planner/executor still
+      ignore the values — but the SET commands succeed and
+      `SHOW <name>` returns sensible canonical values.
+      Verified via psql 18.3 against all seven SET shapes,
+      including unit-converted forms (`SET work_mem='64MB'`
+      → `SHOW work_mem` returns 65536). Design doc
+      root-0004 updated to list the new entries.)
 - [x] `pg_catalog.pg_database`, `pg_roles`, `pg_tables` views +
       targetless `SELECT FROM tbl` for HammerDB bootstrap +
       checkschema.

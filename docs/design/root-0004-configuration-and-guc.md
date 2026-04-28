@@ -134,7 +134,20 @@ itself; concurrent access happens through per-connection
    `is_superuser`, `session_authorization`, `in_hot_standby`,
    `default_transaction_read_only`, `application_name`,
    `default_transaction_isolation`, `listen_addresses`, `port`,
-   `max_connections`, `scram_iterations`).
+   `max_connections`, `scram_iterations`, `shared_buffers`,
+   `checkpoint_timeout`, `checkpoint_completion_target`,
+   `max_wal_size`, `min_wal_size`, `full_page_writes`), plus seven
+   compatibility GUCs HammerDB / psql / pgbench issue with `SET`
+   before running their workloads:
+   `max_parallel_workers_per_gather`, `client_min_messages`,
+   `statement_timeout`, `work_mem`, `random_page_cost`,
+   `effective_cache_size`, and `search_path`. v0 doesn't honour
+   any of these compatibility GUCs semantically — the planner
+   and executor ignore the values — but registering them as
+   `ContextUserset` lets the SET succeed instead of failing
+   with `unrecognized configuration parameter`. Names, units,
+   ranges, and defaults mirror upstream's
+   `postgres/src/backend/utils/misc/guc_tables.c` entries.
 2. If a postgresql.conf path was supplied, `ApplyConfigFile(path)`
    walks the parsed entries and calls `Set(name, value,
    SourceConfigFile)` on each. Unknown names emit a warning and are

@@ -168,5 +168,56 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// Compatibility GUCs HammerDB / psql / pgbench issue with
+	// SET before running their workloads. v0 doesn't honour any
+	// of these semantically — the planner / executor ignores
+	// the values — but registering them as ContextUserset lets
+	// `SET <name> = <value>` succeed instead of failing with
+	// `unrecognized configuration parameter`. Names, units,
+	// ranges, and defaults mirror upstream's
+	// postgres/src/backend/utils/misc/guc_tables.c entries
+	// where applicable.
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_parallel_workers_per_gather", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: 1024,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "client_min_messages", Type: TypeEnum, BootVal: "notice",
+		EnumOptions: []string{"debug5", "debug4", "debug3", "debug2", "debug1", "log", "notice", "warning", "error"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "statement_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "4MB",
+		MinVal: 64, MaxVal: 1 << 40,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "random_page_cost", Type: TypeReal, BootVal: "4.0",
+		MinVal: 0, MaxVal: 1e9,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "effective_cache_size", Type: TypeInt, Unit: UnitKB, BootVal: "4GB",
+		MinVal: 1, MaxVal: 1 << 40,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "search_path", Type: TypeString, BootVal: `"$user", public`,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
 	return r
 }
