@@ -30,5 +30,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | 0008 | [WAL Writer and Recovery Seam (v0)](0008-wal-and-recovery.md) | accepted | Segmented WAL writer, FlushUpTo durability contract, and WAL-before-data integration seam for buffer flushes. |
 | 0015 | [Simple Query Path (v0) and SQLSTATE Strategy](0015-simple-query-and-sqlstate.md) | accepted | Interim `SELECT 1` shim, RowDescription/DataRow/CommandComplete encoders, generated `internal/sqlstate`. |
 | 0016 | [VACUUM and ANALYZE (v0)](0016-vacuum-and-analyze.md) | accepted | Heap page-level prune driven by the MVCC oldest-xmin horizon, full-scan ANALYZE, REINDEX bridge for B-tree cleanup. |
+| 0010 | [SQL Parser and AST (v0)](0010-parser.md) | accepted | Hand-written lexer + recursive-descent parser for the pgbench SQL subset; AST node types mirror upstream parsenodes.h names. |
 
 Append new rows in numeric order. Do not reorder.

@@ -1,0 +1,83 @@
+// Package parser implements goopg's SQL lexer, parser, and AST.
+//
+// Scope and growth path are documented in docs/design/0010-parser.md.
+// v0 covers the pgbench surface area with a hand-written
+// recursive-descent parser; statements are added incrementally.
+package parser
+
+// TokenKind classifies a lexer token.
+type TokenKind int
+
+const (
+	TokenEOF TokenKind = iota
+	TokenIdent
+	TokenQuotedIdent
+	TokenIntLit
+	TokenStringLit
+	TokenParam // $N
+	TokenSymbol
+	TokenOperator
+	TokenKeyword
+)
+
+// Keyword carves out the subset of identifiers the parser treats as
+// keywords. v0 only enumerates the ones the phase-1 statements need;
+// each new statement family adds its own. Mirrors upstream's
+// kwlist.h subset.
+type Keyword string
+
+const (
+	KwBegin       Keyword = "begin"
+	KwCommit      Keyword = "commit"
+	KwRollback    Keyword = "rollback"
+	KwAbort       Keyword = "abort" // alias for ROLLBACK in upstream
+	KwEnd         Keyword = "end"   // alias for COMMIT in upstream
+	KwTransaction Keyword = "transaction"
+	KwWork        Keyword = "work"
+	KwVacuum      Keyword = "vacuum"
+	KwAnalyze     Keyword = "analyze"
+	KwAnalyse     Keyword = "analyse" // British spelling, accepted upstream
+	KwVerbose     Keyword = "verbose"
+	KwShow        Keyword = "show"
+	KwSet         Keyword = "set"
+	KwLocal       Keyword = "local"
+	KwSession     Keyword = "session"
+	KwTo          Keyword = "to"
+	KwReset       Keyword = "reset"
+	KwAll         Keyword = "all"
+	KwDefault     Keyword = "default"
+)
+
+// keywords lists every keyword v0 recognises. Lookup is via the
+// lower-cased identifier text.
+var keywords = map[string]Keyword{
+	"begin":       KwBegin,
+	"commit":      KwCommit,
+	"rollback":    KwRollback,
+	"abort":       KwAbort,
+	"end":         KwEnd,
+	"transaction": KwTransaction,
+	"work":        KwWork,
+	"vacuum":      KwVacuum,
+	"analyze":     KwAnalyze,
+	"analyse":     KwAnalyse,
+	"verbose":     KwVerbose,
+	"show":        KwShow,
+	"set":         KwSet,
+	"local":       KwLocal,
+	"session":     KwSession,
+	"to":          KwTo,
+	"reset":       KwReset,
+	"all":         KwAll,
+	"default":     KwDefault,
+}
+
+// Token is one lexer output. Value is the source bytes (lower-cased
+// for keywords/idents, raw payload for literals). Pos is the byte
+// offset in the original input.
+type Token struct {
+	Kind    TokenKind
+	Keyword Keyword // populated when Kind == TokenKeyword
+	Value   string
+	Pos     int
+}

@@ -186,12 +186,30 @@ unchecked item unless a dependency forces a different order.
 - [ ] Parser/analyzer covering `CREATE TABLE`, `CREATE INDEX`, `INSERT`,
       `UPDATE`, `DELETE`, `SELECT` with the joins/aggregates pgbench needs,
       `BEGIN`/`COMMIT`/`ROLLBACK`, `VACUUM`, `ANALYZE`, prepared statements.
+  - [x] Lexer (`internal/parser/lexer.go`) covering identifiers (quoted
+        and unquoted), integer literals, single-quoted strings with `''`
+        escape, parameter placeholders `$N`, line and (nested) block
+        comments, multi-character operators.
+  - [x] Statement parsers: `BEGIN`/`COMMIT`/`ROLLBACK` (and `END`/`ABORT`
+        aliases), `VACUUM` (with VERBOSE/ANALYZE/target list), `ANALYZE`,
+        `SHOW`/`SET`/`RESET`. Carving the GUC verbs out of
+        `internal/server/query.go` is deferred until the executor lands.
+  - [ ] Statement parsers: `SELECT` with FROM/WHERE/ORDER BY/LIMIT, joins,
+        aggregates pgbench needs.
+  - [ ] Statement parsers: `INSERT`, `UPDATE`, `DELETE`.
+  - [ ] Statement parsers: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`,
+        `DROP INDEX`, `TRUNCATE`.
+  - [ ] Expression tree (`ColumnRef`, integer/string consts, `BinaryOp`,
+        `FuncCall`, `ParamRef`) with operator-precedence climbing.
+  - [ ] Analyzer pass (name resolution, type checking) once the catalog
+        exists.
 - [ ] Planner sufficient for pgbench's workload.
 - [ ] Executor with the operators the planner emits.
 - [ ] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
-- [ ] Design docs: `0010-parser.md`, `0011-planner.md`, `0012-executor.md`,
+- [x] Design doc: `0010-parser.md`.
+- [ ] Design docs: `0011-planner.md`, `0012-executor.md`,
       `0013-extended-query-protocol.md`, `0014-copy.md`.
 
 ## Milestone 7 — pgbench end-to-end and admin tooling
