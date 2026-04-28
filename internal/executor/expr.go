@@ -28,6 +28,8 @@ func (e *ExecError) Error() string {
 // any ColumnRef resolution is an internal error.
 func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	switch x := e.(type) {
+	case *planner.CaseExpr:
+		return evalCaseExpr(x, row, ctx)
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
 	case *planner.NumericConst:
@@ -236,6 +238,73 @@ func evalOr(a, b Datum) Datum {
 		return NullDatum
 	}
 	return Datum{Kind: KindBool, Bool: a.Bool || b.Bool}
+}
+
+// evalCaseExpr evaluates the SQL CASE expression. Two forms:
+//
+//	-- searched: each WHEN is a boolean predicate
+//	-- simple:   each WHEN is `Operand = When`
+//
+// First match wins; ELSE is the fallback. Per upstream, NULL
+// WHEN evaluates as "not matched" — never NULL-true.
+func evalCaseExpr(x *planner.CaseExpr, row Row, ctx *Context) (Datum, error) {
+	var operand Datum
+	hasOperand := x.Operand != nil
+	if hasOperand {
+		v, err := evalExpr(x.Operand, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		operand = v
+	}
+	for _, w := range x.Whens {
+		whenVal, err := evalExpr(w.When, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		var matched bool
+		if hasOperand {
+			eq, err := compareEq(operand, whenVal)
+			if err != nil {
+				return Datum{}, err
+			}
+			matched = eq.Kind == KindBool && eq.Bool
+		} else {
+			matched = whenVal.Kind == KindBool && whenVal.Bool
+		}
+		if matched {
+			return evalExpr(w.Then, row, ctx)
+		}
+	}
+	if x.Else != nil {
+		return evalExpr(x.Else, row, ctx)
+	}
+	return NullDatum, nil
+}
+
+// compareEq computes `a = b` returning a KindBool datum
+// (KindNull if either side is NULL). Helper for the simple-form
+// CASE; reuses upstream-shaped equality semantics across the
+// types v0 understands.
+func compareEq(a, b Datum) (Datum, error) {
+	if a.IsNull() || b.IsNull() {
+		return NullDatum, nil
+	}
+	switch {
+	case a.Kind == KindInt && b.Kind == KindInt:
+		return Datum{Kind: KindBool, Bool: a.Int == b.Int}, nil
+	case a.Kind == KindBool && b.Kind == KindBool:
+		return Datum{Kind: KindBool, Bool: a.Bool == b.Bool}, nil
+	case a.Kind == KindString && b.Kind == KindString:
+		return Datum{Kind: KindBool, Bool: a.String == b.String}, nil
+	case a.Kind == KindTime && b.Kind == KindTime:
+		return Datum{Kind: KindBool, Bool: a.Time.Equal(b.Time)}, nil
+	case a.Kind == KindInt && b.Kind == KindString:
+		return Datum{Kind: KindBool, Bool: fmt.Sprintf("%d", a.Int) == b.String}, nil
+	case a.Kind == KindString && b.Kind == KindInt:
+		return Datum{Kind: KindBool, Bool: a.String == fmt.Sprintf("%d", b.Int)}, nil
+	}
+	return Datum{Kind: KindBool, Bool: false}, nil
 }
 
 // evalFuncCall resolves a function name against the in-tree registry.

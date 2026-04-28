@@ -712,7 +712,19 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 - [ ] 3- to 7-way JOIN planning (extend the M1 nested-loop planner).
 - [ ] Correlated and uncorrelated subqueries; `EXISTS`, `NOT EXISTS`,
       `IN`, `NOT IN`.
-- [ ] `CASE` expressions (parser + executor).
+- [x] `CASE` expressions (parser + executor).
+      (achieved 2026-04-28: both searched (`CASE WHEN cond THEN
+      result …`) and simple (`CASE expr WHEN val THEN result …`)
+      forms parse, analyze, plan, and execute end-to-end. New
+      `parser.CaseExpr` (Operand, Whens[], Else), planner mirror
+      via `resolveCaseExpr`, analyzer's `analyzeCaseExpr` unifies
+      branch types same-or-compatible-else-unknown, executor's
+      `evalCaseExpr` walks Whens in order with `compareEq` for
+      simple-form equality (handles int/string mixes for
+      NUMERIC-as-text columns). Verified end-to-end via psql 18.3:
+      searched form, simple form, and ELSE-omitted → NULL fallback
+      all return correct rows. Required for TPC-H Q1/Q12/Q14. See
+      `docs/design/0003-0005-case-expressions.md`.)
 - [ ] Date and interval arithmetic, `EXTRACT(... FROM ts)`.
 - [ ] `FETCH FIRST n ROWS ONLY` as a `LIMIT` synonym.
 - [ ] Views (CREATE VIEW / DROP VIEW) where HammerDB uses them.

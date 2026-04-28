@@ -65,6 +65,27 @@ type NumericConst struct {
 func (e *NumericConst) Pos() int { return e.pos }
 func (*NumericConst) exprNode()  {}
 
+// CaseWhen mirrors parser.CaseWhen with planner-resolved
+// expressions in place of parser-AST nodes.
+type CaseWhen struct {
+	When Expr
+	Then Expr
+}
+
+// CaseExpr is the planner mirror of parser.CaseExpr. The simple
+// form sets Operand and the executor evaluates each When as
+// `Operand = When`; the searched form has Operand=nil and treats
+// each When as a boolean predicate.
+type CaseExpr struct {
+	pos     int
+	Operand Expr // nil for searched form
+	Whens   []CaseWhen
+	Else    Expr // nil if absent
+}
+
+func (e *CaseExpr) Pos() int { return e.pos }
+func (*CaseExpr) exprNode()  {}
+
 // NullConst — SQL NULL.
 type NullConst struct{ pos int }
 

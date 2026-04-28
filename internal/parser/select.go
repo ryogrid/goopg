@@ -622,12 +622,69 @@ func (p *parser) parsePrimary() (Expr, error) {
 		case KwFalse:
 			p.advance()
 			return &BooleanConst{pos: t.Pos, Value: false}, nil
+		case KwCase:
+			return p.parseCaseExpr()
 		}
 	}
 	if t.Kind == TokenIdent || t.Kind == TokenQuotedIdent {
 		return p.parseColumnOrCall()
 	}
 	return nil, p.errAtCur("expected expression")
+}
+
+// parseCaseExpr parses both forms of CASE:
+//
+//	CASE WHEN cond THEN result [WHEN …] [ELSE result] END   -- searched
+//	CASE expr WHEN val THEN result [WHEN …] [ELSE result] END -- simple
+//
+// Distinguishes by what follows `CASE`: a `WHEN` keyword starts
+// the searched form; anything else is parsed as the simple-form
+// operand. At least one `WHEN` clause is required (mirrors
+// upstream); the `ELSE` clause is optional.
+func (p *parser) parseCaseExpr() (Expr, error) {
+	caseTok, err := p.expectKeyword(KwCase)
+	if err != nil {
+		return nil, err
+	}
+	out := &CaseExpr{pos: caseTok.Pos}
+	// Simple form: `CASE expr WHEN val THEN result …`. The
+	// searched form goes straight into WHEN.
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhen) {
+		operand, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		out.Operand = operand
+	}
+	for p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhen {
+		p.advance() // WHEN
+		when, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwThen); err != nil {
+			return nil, err
+		}
+		then, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		out.Whens = append(out.Whens, CaseWhen{When: when, Then: then})
+	}
+	if len(out.Whens) == 0 {
+		return nil, p.errAtCur("CASE requires at least one WHEN clause")
+	}
+	if p.acceptKeyword(KwElse) {
+		els, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		out.Else = els
+	}
+	if _, err := p.expectKeyword(KwEnd); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // parseColumnOrCall handles `name`, `name.name`, `name.name.name`,

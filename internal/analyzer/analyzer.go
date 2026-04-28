@@ -250,6 +250,8 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: "numeric"}, nil
 	case *parser.StringConst:
 		return catalog.Type{Name: "text"}, nil
+	case *parser.CaseExpr:
+		return analyzeCaseExpr(x, ctx)
 	case *parser.NullConst:
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.BooleanConst:
@@ -579,6 +581,81 @@ func isComparable(left, right catalog.Type) bool {
 		return true
 	}
 	if isBooleanTypeName(left.Name) && isBooleanTypeName(right.Name) {
+		return true
+	}
+	return false
+}
+
+// analyzeCaseExpr type-checks a CASE expression and returns the
+// type of the value it produces. v0 unifies WHEN/ELSE result
+// types loosely: if all branches resolve to the same type, that's
+// the result; otherwise we fall back to `unknown` (which makes
+// it assignable to any column). Real type unification (numeric
+// promotion, text/varchar coalescing) waits on the type system.
+func analyzeCaseExpr(x *parser.CaseExpr, ctx *scope) (catalog.Type, error) {
+	// Operand of the simple form just needs to be a valid
+	// expression; type-checking the comparison is deferred until
+	// the type system can do real coercions.
+	if x.Operand != nil {
+		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+	}
+	var resultType catalog.Type
+	for _, w := range x.Whens {
+		if x.Operand == nil {
+			// Searched form: WHEN must be boolean-like.
+			whenType, err := analyzeExpr(w.When, ctx)
+			if err != nil {
+				return catalog.Type{}, err
+			}
+			if !isBooleanLike(whenType) {
+				return catalog.Type{}, analyzeError(w.When.Pos(), "42804", "CASE WHEN clause must be boolean")
+			}
+		} else {
+			if _, err := analyzeExpr(w.When, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		thenType, err := analyzeExpr(w.Then, ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		if resultType.Name == "" {
+			resultType = thenType
+		} else if !sameOrCompatible(resultType, thenType) {
+			resultType = catalog.Type{Name: "unknown"}
+		}
+	}
+	if x.Else != nil {
+		elseType, err := analyzeExpr(x.Else, ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		if resultType.Name == "" {
+			resultType = elseType
+		} else if !sameOrCompatible(resultType, elseType) {
+			resultType = catalog.Type{Name: "unknown"}
+		}
+	}
+	return resultType, nil
+}
+
+// sameOrCompatible reports whether two CASE branch types should
+// be merged into the same result type without falling back to
+// unknown. Mirrors `isComparable` but limited to types CASE
+// branches commonly mix (int8 + numeric, text + varchar, etc.).
+func sameOrCompatible(a, b catalog.Type) bool {
+	if isUnknownType(a) || isUnknownType(b) {
+		return true
+	}
+	if strings.EqualFold(a.Name, b.Name) {
+		return true
+	}
+	if isNumericTypeName(a.Name) && isNumericTypeName(b.Name) {
+		return true
+	}
+	if isStringTypeName(a.Name) && isStringTypeName(b.Name) {
 		return true
 	}
 	return false

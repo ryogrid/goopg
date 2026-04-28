@@ -38,6 +38,36 @@ type NumericConst struct {
 func (e *NumericConst) Pos() int { return e.pos }
 func (*NumericConst) exprNode()  {}
 
+// CaseWhen is one (WHEN cond THEN result) clause inside a CASE
+// expression.
+type CaseWhen struct {
+	When Expr
+	Then Expr
+}
+
+// CaseExpr is the SQL CASE expression. Two forms upstream
+// supports:
+//
+//	-- searched form
+//	CASE WHEN cond THEN result [WHEN cond THEN result …]
+//	     [ELSE result] END
+//	-- simple form
+//	CASE operand WHEN val THEN result [WHEN val THEN result …]
+//	     [ELSE result] END
+//
+// The searched form has a nil Operand. The simple form sets
+// Operand and evaluates each `When` as `Operand = When` per
+// upstream.
+type CaseExpr struct {
+	pos     int
+	Operand Expr // nil for the searched form
+	Whens   []CaseWhen
+	Else    Expr // nil if ELSE omitted
+}
+
+func (e *CaseExpr) Pos() int { return e.pos }
+func (*CaseExpr) exprNode()  {}
+
 // NullConst is the SQL NULL literal.
 type NullConst struct{ pos int }
 

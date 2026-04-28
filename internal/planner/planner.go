@@ -643,6 +643,8 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return &BooleanConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.ParamRef:
 		return &ParamRef{pos: x.Pos(), Number: x.Number}, nil
+	case *parser.CaseExpr:
+		return resolveCaseExpr(x, agg.input)
 	case *parser.ColumnRef:
 		resolved, err := resolveColumnRef(x, agg.input)
 		if err != nil {
@@ -1179,6 +1181,39 @@ func exprType(e Expr) catalog.Type {
 	return catalog.Type{Name: "unknown"}
 }
 
+// resolveCaseExpr translates a parser CaseExpr into a planner
+// CaseExpr, recursively resolving each Operand / When / Then /
+// Else expression in `ctx`.
+func resolveCaseExpr(x *parser.CaseExpr, ctx *resolveContext) (Expr, error) {
+	out := &CaseExpr{pos: x.Pos()}
+	if x.Operand != nil {
+		operand, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out.Operand = operand
+	}
+	for _, w := range x.Whens {
+		when, err := resolveExpr(w.When, ctx)
+		if err != nil {
+			return nil, err
+		}
+		then, err := resolveExpr(w.Then, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out.Whens = append(out.Whens, CaseWhen{When: when, Then: then})
+	}
+	if x.Else != nil {
+		els, err := resolveExpr(x.Else, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out.Else = els
+	}
+	return out, nil
+}
+
 // resolveExpr walks a parser.Expr and replaces ColumnRef nodes with
 // indexed planner ColumnRefs. Other node types are translated 1:1.
 func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
@@ -1195,6 +1230,8 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return &BooleanConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.ParamRef:
 		return &ParamRef{pos: x.Pos(), Number: x.Number}, nil
+	case *parser.CaseExpr:
+		return resolveCaseExpr(x, ctx)
 	case *parser.ColumnRef:
 		return resolveColumnRef(x, ctx)
 	case *parser.BinaryOp:

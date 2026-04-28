@@ -115,6 +115,10 @@ const (
 	KwDeferrable  Keyword = "deferrable"
 	KwCopy        Keyword = "copy"
 	KwCheckpoint  Keyword = "checkpoint"
+	KwCase        Keyword = "case"
+	KwWhen        Keyword = "when"
+	KwThen        Keyword = "then"
+	KwElse        Keyword = "else"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -200,6 +204,10 @@ var keywords = map[string]Keyword{
 	"foreign":     KwForeign,
 	"references":  KwReferences,
 	"deferrable":  KwDeferrable,
+	"case":        KwCase,
+	"when":        KwWhen,
+	"then":        KwThen,
+	"else":        KwElse,
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
 }
