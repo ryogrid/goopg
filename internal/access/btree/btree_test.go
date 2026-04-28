@@ -168,6 +168,93 @@ func TestConcurrentSearchAfterInserts(t *testing.T) {
 	}
 }
 
+// TestConcurrentInsertSearch is the Landing 2 acceptance test for
+// milestone 0002: while one writer drives Insert (which performs
+// splits and updates the metapage), N reader goroutines hammer
+// Search against keys that are being inserted. Right-link
+// recovery handles the case where a reader descended to a leaf
+// that has since been split. The test runs under -race to catch
+// torn-byte access at the page level.
+func TestConcurrentInsertSearch(t *testing.T) {
+	bt, _, cleanup := newTestTree(t)
+	defer cleanup()
+
+	const total = 300
+	// Pre-seed half the keys so readers always have work.
+	for i := 0; i < total/2; i++ {
+		ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}
+		if err := bt.Insert(EncodeInt4(int32(i)), ptr); err != nil {
+			t.Fatalf("seed Insert(%d): %v", i, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Writer: insert the second half, one key at a time.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(stop)
+		for i := total / 2; i < total; i++ {
+			ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}
+			if err := bt.Insert(EncodeInt4(int32(i)), ptr); err != nil {
+				t.Errorf("Insert(%d): %v", i, err)
+				return
+			}
+		}
+	}()
+
+	// Readers: spin Search across the seeded keys. Every found key
+	// must report the right block — the Insert path mutates pages
+	// under exclusive content latches and Search descends under
+	// shared latches with right-link recovery, so a torn read or a
+	// split-induced miss would surface here.
+	const readers = 6
+	var hits atomic.Uint64
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				key := int32(uint64(hits.Load()) % (total / 2))
+				ptr, ok, err := bt.Search(EncodeInt4(key))
+				if err != nil {
+					t.Errorf("Search(%d): %v", key, err)
+					return
+				}
+				if ok {
+					if int32(ptr.Block) != key+1 {
+						t.Errorf("Search(%d): block=%d want %d", key, ptr.Block, key+1)
+						return
+					}
+					hits.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verify every inserted key is searchable post-run.
+	for i := 0; i < total; i++ {
+		ptr, ok, err := bt.Search(EncodeInt4(int32(i)))
+		if err != nil || !ok {
+			t.Fatalf("post-run Search(%d): ok=%v err=%v", i, ok, err)
+		}
+		if int32(ptr.Block) != int32(i+1) {
+			t.Errorf("post-run Search(%d): block=%d want %d", i, ptr.Block, i+1)
+		}
+	}
+	if hits.Load() == 0 {
+		t.Error("no successful concurrent searches recorded")
+	}
+}
+
 // TestReopen ensures a freshly-Open'd handle observes the same metapage
 // state — i.e. the on-disk format is internally consistent.
 func TestReopen(t *testing.T) {

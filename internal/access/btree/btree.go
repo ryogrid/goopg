@@ -17,17 +17,29 @@ import (
 )
 
 // SizeOfBTPageOpaque is the on-disk size of the per-page B-tree opaque
-// area, mirroring upstream's BTPageOpaqueData layout.
-const SizeOfBTPageOpaque = 16
+// area. v2 grew it from 16 to 24 bytes to carry a fixed-width
+// HighKey + a BTHasHighKey flag bit (Landing 2 of milestone 0002 —
+// see docs/design/0002-0002-btree-concurrency.md). Layout, in
+// little-endian:
+//
+//	offset 0  Prev      (4 bytes)
+//	offset 4  Next      (4 bytes)
+//	offset 8  Level     (4 bytes)
+//	offset 12 Flags     (2 bytes)
+//	offset 14 _padding  (2 bytes)
+//	offset 16 HighKey   (4 bytes; valid only when BTHasHighKey is set)
+//	offset 20 _reserved (4 bytes)
+const SizeOfBTPageOpaque = 24
 
 // btSpecialOffset is where the opaque area starts on every B-tree page.
 const btSpecialOffset = storage.BlockSize - SizeOfBTPageOpaque
 
 // PageFlag values for btpo_flags.
 const (
-	BTLeaf    uint16 = 0x0001
-	BTRoot    uint16 = 0x0002
-	BTDeleted uint16 = 0x0004
+	BTLeaf       uint16 = 0x0001
+	BTRoot       uint16 = 0x0002
+	BTDeleted    uint16 = 0x0004
+	BTHasHighKey uint16 = 0x0008
 )
 
 // MetaBlock is always block 0 — the metapage. RootStart is the first
@@ -38,7 +50,7 @@ const (
 	rootStart storage.BlockNumber = 1
 
 	btreeMagic   uint32 = 0x053162
-	btreeVersion uint32 = 1
+	btreeVersion uint32 = 2 // bumped by Landing 2 (24-byte opaque with HighKey)
 )
 
 // BTreeMeta is the v0 metapage payload.
@@ -52,12 +64,14 @@ type BTreeMeta struct {
 }
 
 // BTPageOpaque is the typed view over the special area at the end of
-// each B-tree page.
+// each B-tree page. HighKey is meaningful only when BTHasHighKey is
+// set in Flags; for v0 it stores a 4-byte EncodeInt4-form key.
 type BTPageOpaque struct {
-	Prev  storage.BlockNumber
-	Next  storage.BlockNumber
-	Level uint32
-	Flags uint16
+	Prev    storage.BlockNumber
+	Next    storage.BlockNumber
+	Level   uint32
+	Flags   uint16
+	HighKey [4]byte
 }
 
 // IsLeaf reports whether the page carries leaf items.
@@ -66,15 +80,22 @@ func (o BTPageOpaque) IsLeaf() bool { return o.Flags&BTLeaf != 0 }
 // IsRoot reports whether the page is the current root.
 func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
 
+// HasHighKey reports whether this page advertises a high-key
+// boundary. Pages without a high key are rightmost on their level
+// (or freshly created) and cover all remaining keys.
+func (o BTPageOpaque) HasHighKey() bool { return o.Flags&BTHasHighKey != 0 }
+
 // readOpaque returns the parsed opaque from page bytes.
 func readOpaque(p storage.Page) BTPageOpaque {
 	off := btSpecialOffset
-	return BTPageOpaque{
+	o := BTPageOpaque{
 		Prev:  storage.BlockNumber(binary.LittleEndian.Uint32(p[off : off+4])),
 		Next:  storage.BlockNumber(binary.LittleEndian.Uint32(p[off+4 : off+8])),
 		Level: binary.LittleEndian.Uint32(p[off+8 : off+12]),
 		Flags: binary.LittleEndian.Uint16(p[off+12 : off+14]),
 	}
+	copy(o.HighKey[:], p[off+16:off+20])
+	return o
 }
 
 // writeOpaque persists the opaque into page bytes.
@@ -85,6 +106,18 @@ func writeOpaque(p storage.Page, o BTPageOpaque) {
 	binary.LittleEndian.PutUint32(p[off+8:off+12], o.Level)
 	binary.LittleEndian.PutUint16(p[off+12:off+14], o.Flags)
 	binary.LittleEndian.PutUint16(p[off+14:off+16], 0)
+	copy(p[off+16:off+20], o.HighKey[:])
+	binary.LittleEndian.PutUint32(p[off+20:off+24], 0)
+}
+
+// keyExceedsHighKey reports whether `key` is strictly greater than
+// `op.HighKey` — i.e., the search has overshot this page and must
+// follow op.Next under right-link recovery.
+func keyExceedsHighKey(op BTPageOpaque, key []byte) bool {
+	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
+		return false
+	}
+	return CompareKeys(key, op.HighKey[:]) > 0
 }
 
 // initPage prepares a freshly extended block as a B-tree page with the
@@ -177,17 +210,22 @@ func CompareKeys(a, b []byte) int {
 
 // BTree is the access-method handle for one index relation.
 //
-// Concurrency (Landing 1 of milestone 0002 — see
-// docs/design/0002-0002-btree-concurrency.md): mu is an RWMutex
-// so multiple Search/RangeScan callers run in parallel. Inserts,
-// splits, and metapage updates all serialise through Lock(). A
-// follow-up loop replaces this tree-wide RWMutex with per-page
-// latches and Lehman-Yao right-link descent.
+// Concurrency (Landing 2 of milestone 0002 — see
+// docs/design/0002-0002-btree-concurrency.md):
+//
+//   - Readers (Search, RangeScan) take no tree-wide lock; they
+//     synchronise through per-page Slot.RLock() latches and use
+//     Lehman-Yao right-link recovery to recover from concurrent
+//     splits.
+//   - Inserts hold bt.mu so only one writer mutates the tree at a
+//     time. Per-page Slot.Lock() guards each mutation site so
+//     readers can run alongside the writer; writer-vs-writer
+//     concurrency lands in Landing 3 along with split WAL records.
 type BTree struct {
 	pool *storage.Pool
 	rel  storage.RelFileNode
 
-	mu sync.RWMutex
+	mu sync.Mutex
 }
 
 // Open returns a handle to an existing B-tree on rel. Validates the
@@ -234,6 +272,7 @@ func Create(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 	}
 
 	// Initialise the root page as a leaf.
+	rootSlot.Lock()
 	initPage(rootSlot.Page(), BTPageOpaque{
 		Prev:  storage.InvalidBlockNumber,
 		Next:  storage.InvalidBlockNumber,
@@ -241,8 +280,10 @@ func Create(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 		Flags: BTLeaf | BTRoot,
 	})
 	pool.MarkDirty(rootSlot)
+	rootSlot.Unlock()
 
 	// Initialise the metapage.
+	metaSlot.Lock()
 	storage.InitPage(metaSlot.Page())
 	writeMeta(metaSlot.Page(), BTreeMeta{
 		Magic:     btreeMagic,
@@ -253,6 +294,7 @@ func Create(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 		FastLevel: 0,
 	})
 	pool.MarkDirty(metaSlot)
+	metaSlot.Unlock()
 
 	pool.Unpin(rootSlot)
 	pool.Unpin(metaSlot)
@@ -265,16 +307,52 @@ var (
 	ErrNotABTree = errors.New("btree: not a B-tree relation")
 )
 
-// readMeta loads the metapage. Caller must already hold bt.mu if
-// concurrency matters; readers tolerate stale snapshots since meta
-// updates are serialised.
+// readMeta loads the metapage under a shared content latch so the
+// read sees a torn-byte-free snapshot.
 func (bt *BTree) readMeta() (BTreeMeta, error) {
 	slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: MetaBlock})
 	if err != nil {
 		return BTreeMeta{}, err
 	}
-	defer bt.pool.Unpin(slot)
-	return parseMeta(slot.Page()), nil
+	slot.RLock()
+	m := parseMeta(slot.Page())
+	slot.RUnlock()
+	bt.pool.Unpin(slot)
+	return m, nil
+}
+
+// pinR pins a buffer and acquires its shared content latch. Callers
+// release it with unpinR. Used on every read of internal/leaf pages
+// during descent and scans.
+func (bt *BTree) pinR(blk storage.BlockNumber) (*storage.Slot, error) {
+	s, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+	if err != nil {
+		return nil, err
+	}
+	s.RLock()
+	return s, nil
+}
+
+func (bt *BTree) unpinR(s *storage.Slot) {
+	s.RUnlock()
+	bt.pool.Unpin(s)
+}
+
+// pinW pins a buffer and acquires its exclusive content latch.
+// Used at every mutation site so concurrent readers (which take
+// the shared latch) see a coherent page image.
+func (bt *BTree) pinW(blk storage.BlockNumber) (*storage.Slot, error) {
+	s, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+	if err != nil {
+		return nil, err
+	}
+	s.Lock()
+	return s, nil
+}
+
+func (bt *BTree) unpinW(s *storage.Slot) {
+	s.Unlock()
+	bt.pool.Unpin(s)
 }
 
 func parseMeta(p storage.Page) BTreeMeta {
@@ -303,10 +381,10 @@ func writeMeta(p storage.Page, m BTreeMeta) {
 	h.SetLower(uint16(off + 24))
 }
 
-// updateRootMeta rewrites the metapage root pointer + level under the
-// big mutex.
+// updateRootMeta rewrites the metapage root pointer + level. Caller
+// must hold bt.mu (writers serialise tree-wide).
 func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
-	slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: MetaBlock})
+	slot, err := bt.pinW(MetaBlock)
 	if err != nil {
 		return err
 	}
@@ -317,7 +395,7 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	m.FastLevel = level
 	writeMeta(slot.Page(), m)
 	bt.pool.MarkDirty(slot)
-	bt.pool.Unpin(slot)
+	bt.unpinW(slot)
 	return nil
 }
 
@@ -363,9 +441,15 @@ func findChildBlock(items []item, key []byte) storage.BlockNumber {
 }
 
 // descendToLeaf walks from the current root to the leaf containing
-// `key`. Returns the leaf block number; pinning is the caller's
-// responsibility. The returned slice is the descent path (root..leaf,
-// excluding leaf) — callers performing splits walk it in reverse.
+// `key`. Each page is read under a shared content latch, and the
+// classic Lehman-Yao right-link recovery handles the case where a
+// concurrent writer split the page after we picked it: if the
+// search key exceeds the page's high key, we follow op.Next and
+// retry on the right sibling.
+//
+// The returned `path` is the chain of internal pages walked
+// (root..parent-of-leaf), used by writers to propagate separator
+// items up after a split. Readers ignore it.
 func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []storage.BlockNumber, err error) {
 	meta, err := bt.readMeta()
 	if err != nil {
@@ -373,17 +457,29 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 	}
 	cur := meta.Root
 	for {
-		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: cur})
+		slot, err := bt.pinR(cur)
 		if err != nil {
 			return 0, nil, err
 		}
 		op := readOpaque(slot.Page())
+
+		// Right-link recovery: a concurrent split may have moved
+		// our target keys to the right sibling. Follow op.Next
+		// until we land on a page that covers the search key.
+		if keyExceedsHighKey(op, key) {
+			next := op.Next
+			bt.unpinR(slot)
+			cur = next
+			continue
+		}
+
 		if op.IsLeaf() {
-			bt.pool.Unpin(slot)
+			bt.unpinR(slot)
 			return cur, path, nil
 		}
+
 		items, err := pageItems(slot.Page())
-		bt.pool.Unpin(slot)
+		bt.unpinR(slot)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -412,11 +508,19 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	})
 }
 
-// insertIntoBlock inserts `it` into the page at blk. If the page lacks
-// space, splits it; the resulting separator item is recursively
-// inserted into the parent (or a new root is created).
+// insertIntoBlock inserts `it` into the page at blk. If the page
+// lacks space, splits it; the resulting separator item is
+// recursively inserted into the parent (or a new root is
+// created).
+//
+// All page mutations happen under the per-page exclusive content
+// latch so concurrent readers (Search/RangeScan) see either the
+// pre-split or post-split state, never an in-between snapshot.
+// The split sequence stamps a high key on the left page BEFORE
+// dropping its latch — readers that descended to it under shared
+// latch will follow the new right-link to find the moved keys.
 func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNumber, it item) error {
-	slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+	slot, err := bt.pinW(blk)
 	if err != nil {
 		return err
 	}
@@ -424,29 +528,40 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	if pageHasSpaceFor(slot.Page(), it) {
 		insertItemSorted(slot.Page(), it)
 		bt.pool.MarkDirty(slot)
-		bt.pool.Unpin(slot)
+		bt.unpinW(slot)
 		return nil
 	}
 
-	// Split. We pin a freshly extended right page, redistribute items,
-	// then propagate the right page's smallest key up.
+	// Split. Pin a freshly-extended right page exclusively,
+	// redistribute items, stamp the high key, then drop both
+	// latches before walking up.
 	op := readOpaque(slot.Page())
 	rightSlot, rightBlk, err := bt.pool.PinNew(bt.rel)
 	if err != nil {
-		bt.pool.Unpin(slot)
+		bt.unpinW(slot)
 		return err
 	}
-	initPage(rightSlot.Page(), BTPageOpaque{
-		Prev:  blk,
-		Next:  op.Next,
-		Level: op.Level,
-		Flags: op.Flags & ^BTRoot, // right sibling is never the root (root stays the original blk during a split, until we lift)
-	})
+	rightSlot.Lock()
+
+	// The right sibling inherits the original page's high key
+	// (or has none, if this was the rightmost page on its level).
+	rightOpaque := BTPageOpaque{
+		Prev:    blk,
+		Next:    op.Next,
+		Level:   op.Level,
+		Flags:   op.Flags & ^BTRoot, // right sibling is never the root (root stays the original blk during a split, until we lift)
+		HighKey: op.HighKey,
+	}
+	if !op.HasHighKey() {
+		rightOpaque.Flags &^= BTHasHighKey
+	}
+	initPage(rightSlot.Page(), rightOpaque)
 
 	allItems, err := pageItems(slot.Page())
 	if err != nil {
-		bt.pool.Unpin(slot)
+		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
+		bt.unpinW(slot)
 		return err
 	}
 	allItems = appendSorted(allItems, it)
@@ -464,20 +579,23 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		insertItemSorted(rightSlot.Page(), x)
 	}
 
-	// Fix sibling pointer of the page that used to be op.Next.
-	if op.Next != storage.InvalidBlockNumber {
-		nbrSlot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: op.Next})
-		if err == nil {
-			no := readOpaque(nbrSlot.Page())
-			no.Prev = rightBlk
-			writeOpaque(nbrSlot.Page(), no)
-			bt.pool.MarkDirty(nbrSlot)
-			bt.pool.Unpin(nbrSlot)
-		}
-	}
-
-	// Update left's opaque to point right.
+	// Stamp the new high key onto the left page: left now covers
+	// keys ≤ HighKey, the rest live on rightBlk via the
+	// right-link. This is the Lehman-Yao invariant readers rely on.
 	op.Next = rightBlk
+	op.Flags |= BTHasHighKey
+	if len(rightItems[0].key) == len(op.HighKey) {
+		copy(op.HighKey[:], rightItems[0].key)
+	} else {
+		// Variable-length keys aren't supported in v0; the only
+		// format we encode is 4-byte int4 — guard the invariant
+		// rather than silently truncate.
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		bt.unpinW(slot)
+		return fmt.Errorf("btree: split key length %d does not fit fixed HighKey width %d",
+			len(rightItems[0].key), len(op.HighKey))
+	}
 	writeOpaque(slot.Page(), op)
 
 	bt.pool.MarkDirty(slot)
@@ -490,14 +608,14 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		key:    append([]byte(nil), rightItems[0].key...),
 	}
 
-	bt.pool.Unpin(slot)
+	rightSlot.Unlock()
 	bt.pool.Unpin(rightSlot)
+	bt.unpinW(slot)
 
 	// If we just split the root, lift a new root.
 	if op.IsRoot() {
-		// Strip BT_ROOT off the now-non-root left page.
-		err := bt.clearRootFlag(blk)
-		if err != nil {
+		// Strip BTRoot off the now-non-root left page.
+		if err := bt.clearRootFlag(blk); err != nil {
 			return err
 		}
 		return bt.createNewRoot(blk, rightBlk, sepItem.key, op.Level+1)
@@ -510,7 +628,7 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 }
 
 func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
-	slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+	slot, err := bt.pinW(blk)
 	if err != nil {
 		return err
 	}
@@ -518,7 +636,7 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 	op.Flags &^= BTRoot
 	writeOpaque(slot.Page(), op)
 	bt.pool.MarkDirty(slot)
-	bt.pool.Unpin(slot)
+	bt.unpinW(slot)
 	return nil
 }
 
@@ -527,6 +645,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	if err != nil {
 		return err
 	}
+	rootSlot.Lock()
 	initPage(rootSlot.Page(), BTPageOpaque{
 		Prev:  storage.InvalidBlockNumber,
 		Next:  storage.InvalidBlockNumber,
@@ -546,6 +665,7 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 		key:    append([]byte(nil), rightKey...),
 	})
 	bt.pool.MarkDirty(rootSlot)
+	rootSlot.Unlock()
 	bt.pool.Unpin(rootSlot)
 
 	return bt.updateRootMeta(rootBlk, level)
@@ -608,62 +728,78 @@ func resetPageItems(p storage.Page) {
 
 // Search returns the heap pointer associated with key, if any.
 //
-// Search holds a shared (RLock) latch on the tree for the duration
-// of the descent + leaf scan, so concurrent Searches parallelise
-// while Inserts continue to serialise. Page bytes are protected
-// against torn reads by the buffer-pool's per-slot RLock taken
-// transiently inside pageItems via Pin/Unpin.
+// Search takes no tree-wide lock — concurrent Searches and the
+// single in-flight Insert run truly in parallel except where they
+// touch the same page (and there only transiently, under the
+// buffer pool's per-slot content latch). Right-link recovery at
+// the leaf catches the case where a split moved our key to the
+// right sibling between descent and lookup.
 func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
-	bt.mu.RLock()
-	defer bt.mu.RUnlock()
-
 	leafBlk, _, err := bt.descendToLeaf(key)
 	if err != nil {
 		return storage.ItemPointer{}, false, err
 	}
-	slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: leafBlk})
-	if err != nil {
-		return storage.ItemPointer{}, false, err
+	cur := leafBlk
+	for {
+		slot, err := bt.pinR(cur)
+		if err != nil {
+			return storage.ItemPointer{}, false, err
+		}
+		op := readOpaque(slot.Page())
+		if keyExceedsHighKey(op, key) {
+			next := op.Next
+			bt.unpinR(slot)
+			cur = next
+			continue
+		}
+		items, err := pageItems(slot.Page())
+		bt.unpinR(slot)
+		if err != nil {
+			return storage.ItemPointer{}, false, err
+		}
+		idx := sort.Search(len(items), func(i int) bool {
+			return CompareKeys(items[i].key, key) >= 0
+		})
+		if idx >= len(items) || CompareKeys(items[idx].key, key) != 0 {
+			return storage.ItemPointer{}, false, nil
+		}
+		return items[idx].ptr, true, nil
 	}
-	defer bt.pool.Unpin(slot)
-	items, err := pageItems(slot.Page())
-	if err != nil {
-		return storage.ItemPointer{}, false, err
-	}
-	idx := sort.Search(len(items), func(i int) bool {
-		return CompareKeys(items[i].key, key) >= 0
-	})
-	if idx >= len(items) || CompareKeys(items[idx].key, key) != 0 {
-		return storage.ItemPointer{}, false, nil
-	}
-	return items[idx].ptr, true, nil
 }
 
 // RangeScan invokes fn for every (key, ptr) pair where lo ≤ key ≤ hi.
 // fn returning false stops the scan; the returned error from fn aborts
 // with that error.
 //
-// Like Search, RangeScan holds an RLock so concurrent scans
-// parallelise. fn is invoked while no buffer-pool latches are
-// held (the page is unpinned between the read of items and the
-// callback) so callers may issue further btree operations from
-// within fn without deadlocking.
+// RangeScan takes no tree-wide lock; each page is read under the
+// buffer pool's per-slot shared content latch. The first leaf is
+// reached via descendToLeaf (which already handles right-link
+// recovery); subsequent leaves are walked rightward via op.Next.
+// fn is invoked while no latches are held so callers may issue
+// further btree operations without deadlocking.
 func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
-	bt.mu.RLock()
-	defer bt.mu.RUnlock()
-
 	cur, _, err := bt.descendToLeaf(lo)
 	if err != nil {
 		return err
 	}
 	for cur != storage.InvalidBlockNumber {
-		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: cur})
+		slot, err := bt.pinR(cur)
 		if err != nil {
 			return err
 		}
-		items, err := pageItems(slot.Page())
 		op := readOpaque(slot.Page())
-		bt.pool.Unpin(slot)
+		// Recovery on the first iteration: descendToLeaf may
+		// have returned a leaf that has since been split. Skip
+		// rightward until we land on a page whose key range
+		// covers `lo` (or we run out of pages).
+		if keyExceedsHighKey(op, lo) {
+			next := op.Next
+			bt.unpinR(slot)
+			cur = next
+			continue
+		}
+		items, err := pageItems(slot.Page())
+		bt.unpinR(slot)
 		if err != nil {
 			return err
 		}

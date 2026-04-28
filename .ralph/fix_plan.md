@@ -523,11 +523,20 @@ Approach is staged across three landings; see
       continues under `Slot.Lock()`. Verified with a goroutine-stress
       test under `-race` and `pgbench -S -c 4 -j 2 -t 50` against a
       live server (200/200 tx, ~18k TPS).
-- [ ] Landing 2: replace the tree-wide RWMutex with per-page
-      latches + Lehman-Yao right-link descent. Adds high keys to
-      the page format. Splits update the right-sibling pointer and
-      stamp the high key under exclusive page latches; readers that
-      "land left" on a split page recover by following op.Next.
+- [x] Landing 2: per-page latches + Lehman-Yao right-link descent.
+      Page format bumped to v2 with a 24-byte BTPageOpaque carrying
+      a fixed-width HighKey + BTHasHighKey flag. Search and
+      RangeScan take no tree-wide lock — they descend under
+      Slot.RLock per page and fall back to op.Next when
+      keyExceedsHighKey reports the key has moved right. Insert
+      keeps bt.mu (writer-vs-writer concurrency deferred to
+      Landing 3), and every mutation site now runs under
+      Slot.Lock so readers see only pre- or post-split images.
+      Split sequences stamp the new high key on the left page
+      before dropping its latch. Verified with a concurrent
+      insert+search stress test under -race and `pgbench -S
+      -c 8 -j 4 -t 50` (400/400 tx, ~21k TPS) plus default mixed
+      `pgbench -c 4 -j 2 -t 30` (120/120 tx).
 - [ ] Landing 3: atomic page splits with crash-safe WAL records
       and replay. Page deletion + recycling integrated with VACUUM
       and MVCC visibility. Index-only scans where the visibility

@@ -41,6 +41,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | root-0014 | [COPY FROM/TO (v0)](root-0014-copy.md) | accepted | COPY wire-mode state machine, text/binary framing seam, and integration points with executor insert/scan paths. |
 | root-0017 | [Data Directory and Server Bootstrap (v0)](root-0017-data-directory.md) | accepted | `goopg init` directory layout (PG_VERSION, base/global/pg_wal/pg_xact, sample conf files); `initdb.Open` runtime bundle; deferred items (on-disk catalog, pg_control). |
 | 0002-0001 | [Checkpointing (M0002)](0002-0001-checkpointing.md) | accepted | Production-grade checkpointer: GUCs (`checkpoint_timeout`, `checkpoint_completion_target`, `max_wal_size`, `min_wal_size`, `full_page_writes`), max_wal_size volume trigger, spread/paced writeback, full-page-image WAL records on first dirty per epoch, SQL `CHECKPOINT` verb. |
-| 0002-0002 | [Concurrent B-tree (M0002)](0002-0002-btree-concurrency.md) | draft | Three-landing plan to remove the global B-tree mutex: Landing 1 RWMutex (read parallelism, this loop), Landing 2 per-page latches + Lehman-Yao right-link descent, Landing 3 atomic split WAL + page deletion. |
+| 0002-0002 | [Concurrent B-tree (M0002)](0002-0002-btree-concurrency.md) | accepted (L1+L2) | Three-landing plan to remove the global B-tree mutex: Landing 1 RWMutex (read parallelism), Landing 2 per-page latches + Lehman-Yao right-link descent (high keys in BTPageOpaque, format v2), Landing 3 atomic split WAL + page deletion (planned). |
 
 Append new rows in numeric order. Do not reorder.

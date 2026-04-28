@@ -2,7 +2,7 @@
 
 | Field      | Value                                                  |
 | ---------- | ------------------------------------------------------ |
-| Status     | draft                                                  |
+| Status     | accepted (Landings 1 + 2); Landing 3 still planned     |
 | Date       | 2026-04-28                                             |
 | Milestone  | 0002 — Production-Grade Checkpointing & Concurrent B-tree |
 | Refines    | [root-0009-btree.md](root-0009-btree.md)               |
@@ -62,39 +62,59 @@ This is the **minimum viable change** that makes the read side
 correct under concurrency without changing the on-disk format or
 the page-mutation invariants.
 
-### Landing 2 — Per-page latches with right-link descent (next M0002 loop)
+### Landing 2 — High keys, right-link descent, per-page latches (this loop)
 
-Replace the tree-wide `RWMutex` with per-page latches. Use the
-buffer pool's existing `Slot.RLock()/Lock()` directly.
+Concrete scope:
 
-Lehman-Yao baseline:
+1. **Page format.** Grow `BTPageOpaque` from 16 to 24 bytes to add a
+   fixed-width `HighKey` field (4 bytes for v0's int4 keys) and a
+   `BTHasHighKey` flag bit. `btSpecialOffset` moves accordingly. The
+   format version bumps to 2; old on-disk indexes are unreadable.
+   Tests create fresh indexes; `pgbench -i` recreates them.
+2. **High key semantics.** A page with `BTHasHighKey` set claims to
+   cover keys ≤ `HighKey`. Pages without the flag (rightmost
+   pages, including a freshly-created root that hasn't split) cover
+   all remaining keys. After a split, the left page's HighKey is
+   set to the smallest key of the right page; the right page
+   inherits whatever HighKey the original page carried (or stays
+   without one if original was rightmost).
+3. **Right-link recovery.** Both descent and leaf scan check, at
+   each page, whether `key > HighKey && Next != Invalid`. If so,
+   they jump to `Next` and re-test. This is the core Lehman-Yao
+   safety net that makes "drop the parent latch before taking the
+   child latch" correct.
+4. **Per-page latches.** Reads use `Slot.RLock()`; mutations use
+   `Slot.Lock()`. A reader's descent does NOT crab-couple — it
+   takes one shared latch at a time and relies on right-link
+   recovery to fix mid-flight splits. Writers take the leaf's
+   exclusive latch only when ready to mutate it; ancestor latches
+   are dropped well before that.
+5. **Single writer per tree.** `BTree.mu sync.Mutex` is retained
+   to serialise inserts. Concurrent readers no longer take
+   `bt.mu` at all — their only synchronisation is per-page
+   `Slot.RLock`. This produces the read-vs-write parallelism that
+   was missing under Landing 1's `RWMutex`. Landing 3 will replace
+   `bt.mu` with proper write-side concurrency once split WAL
+   records are in.
 
-1. **Descent (read or write).** Pin the metapage, read root, drop
-   metapage. Pin root with shared latch. Walk down the level: at
-   each internal page take a *shared* latch, find the child, drop
-   the latch, take the child's latch. Hold at most one page's
-   latch at a time.
-2. **Right-link recovery.** If the search key is greater than the
-   page's high key (the maximum key the page covers), follow
-   `op.Next` and re-test. This is what makes "drop the parent
-   before latching the child" safe: a concurrent split that moved
-   keys to the right sibling is recoverable by following the
-   right-link.
-3. **Split.** Perform the split under exclusive latches on the
-   left page and the freshly-extended right page. Update the
-   right-sibling pointer of the *previous* op.Next under exclusive
-   latch. Stamp the high key into the left page. Then drop the
-   leaf-level latches and walk up to insert the separator into
-   the parent — this is now a separate critical section, and a
-   reader descending through the parent during the gap will hit
-   the right-link recovery path.
+Why keep `bt.mu` at this stage? Two concurrent writers would need
+to coordinate on per-page exclusive latches across split sequences
+that span multiple pages (left, right, parent). That coordination
+is correct under Lehman-Yao but adds new failure modes (write
+amplification on retry, sibling-pointer maintenance under
+concurrent splits) that pair naturally with crash-safe split WAL
+records — which is Landing 3 territory. Keeping `bt.mu` for this
+landing isolates the change set to "readers no longer block on
+writers" without buying the rest of the multi-writer story.
 
-The B-tree page format already has Prev/Next pointers in
-`BTPageOpaque` (see [root-0009-btree.md](root-0009-btree.md)). We
-need to add **high keys**: the rightmost item on each non-rightmost
-page is reserved as the "this page covers keys ≤ this value"
-sentinel. Upstream uses the same convention
-(`P_HIKEY = 1`, line-pointer slot 1 holds the high key).
+What this buys:
+
+- Multiple readers truly parallel — no tree-wide latch.
+- Readers run concurrently with writers — they only block
+  transiently on the per-page `Slot.Lock` a writer holds during
+  its mutation.
+- Writers still single-thread per tree, so split correctness is
+  preserved by the existing top-down logic.
 
 ### Landing 3 — Atomic splits with WAL + page-deletion (later)
 
