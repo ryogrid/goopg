@@ -427,15 +427,23 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 // maybeEmitFPI runs the FPI side-effect of MarkDirty when the
 // epoch flag is unset and the pool has FPI wiring. Caller must
 // hold Slot.contentMu exclusive so the page bytes are stable.
+//
+// v0 emits an FPI on EVERY MarkDirty rather than once per epoch
+// because the WAL has no logical change records yet (no
+// heap_insert / btree_insert deltas). Without that, the
+// first-dirty FPI captures only the snapshot at the moment of
+// first mutation; subsequent in-memory mutations on the same
+// page would be silently dropped on crash recovery. The
+// fpiSinceCheckpoint flag is still tracked because the
+// checkpointer uses it for per-epoch bookkeeping, but it no
+// longer gates emission. WAL volume cost is high but bounded by
+// the dirty-page rate; landing logical change records is a
+// post-M0002 task.
 func (p *Pool) maybeEmitFPI(s *Slot) {
 	if p.logFPI == nil || !p.fullPageWrites.Load() {
 		return
 	}
 	p.poolMu.Lock()
-	if s.fpiSinceCheckpoint {
-		p.poolMu.Unlock()
-		return
-	}
 	tag := s.tag
 	p.poolMu.Unlock()
 

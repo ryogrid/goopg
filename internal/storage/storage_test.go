@@ -344,23 +344,23 @@ func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	}
 }
 
-// TestPoolFPIEmittedOncePerEpoch pins the milestone-0002 contract:
-// MarkDirty must emit exactly one full-page-image WAL record per
-// page per checkpoint epoch, and ResetCheckpointEpoch must arm a
-// fresh emission for the next mutation.
-func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
+// TestPoolFPIEmittedEveryMarkDirty pins the v0 redo contract:
+// every MarkDirty emits a full-page-image WAL record. v0 has no
+// logical change records (no heap_insert / btree_insert deltas)
+// so a single FPI per page per epoch would lose subsequent
+// mutations on crash recovery — see
+// docs/design/0002-0001-checkpointing.md "first dirty per epoch"
+// note and the M0002 crash-recovery test in
+// internal/initdb/recovery_test.go.
+func TestPoolFPIEmittedEveryMarkDirty(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
 
-	type fpi struct {
-		rel RelFileNode
-		blk BlockNumber
-	}
-	var emitted []fpi
-	logFPI := func(rel RelFileNode, blk BlockNumber, _ Page) (LSN, error) {
-		emitted = append(emitted, fpi{rel, blk})
-		return LSN(100 + len(emitted)), nil
+	var emitted int
+	logFPI := func(_ RelFileNode, _ BlockNumber, _ Page) (LSN, error) {
+		emitted++
+		return LSN(100 + emitted), nil
 	}
 	pool, err := NewPool(mgr, PoolConfig{
 		Slots:          2,
@@ -377,36 +377,32 @@ func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Lock()
-	s.Page()[200] = 1
-	pool.MarkDirty(s)
-	s.Unlock()
-
-	// Second mutation in the same epoch must NOT emit another FPI.
-	s.Lock()
-	s.Page()[201] = 2
-	pool.MarkDirty(s)
-	s.Unlock()
+	for i, b := range []byte{1, 2, 3} {
+		s.Lock()
+		s.Page()[200+i] = b
+		pool.MarkDirty(s)
+		s.Unlock()
+	}
 	pool.Unpin(s)
 
-	if len(emitted) != 1 {
-		t.Fatalf("emitted=%d FPI(s) in one epoch, want 1", len(emitted))
+	if emitted != 3 {
+		t.Fatalf("emitted=%d FPIs across 3 mutations, want 3 (every MarkDirty must emit)", emitted)
 	}
 
+	// ResetCheckpointEpoch is still tracked per-slot for the
+	// checkpointer's bookkeeping, but no longer gates emission.
 	pool.ResetCheckpointEpoch()
-
 	s, err = pool.Pin(BufferTag{Rel: rel, Block: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.Lock()
-	s.Page()[202] = 3
+	s.Page()[210] = 9
 	pool.MarkDirty(s)
 	s.Unlock()
 	pool.Unpin(s)
-
-	if len(emitted) != 2 {
-		t.Fatalf("emitted=%d after epoch reset, want 2", len(emitted))
+	if emitted != 4 {
+		t.Errorf("emitted=%d after epoch reset + one mutation, want 4", emitted)
 	}
 }
 

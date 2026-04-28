@@ -2,7 +2,9 @@ package wal
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -165,6 +167,28 @@ func ReplayFromDir(dataDir string, segmentSize int64) (ReplayStats, error) {
 	}
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
 	defer func() { _ = mgr.Close() }()
+	return ReplayRecords(mgr, records)
+}
+
+// ReplayFromDirWithMgr replays the WAL segments under walDir into
+// the supplied Manager. Used by initdb.Open at startup so the
+// runtime's single Manager handles both the replay phase and
+// subsequent normal I/O. A missing or empty walDir is treated as
+// "nothing to replay" (a freshly initdb'd cluster). segmentSize
+// of 0 means use the default DefaultSegmentSize.
+func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64) (ReplayStats, error) {
+	if segmentSize == 0 {
+		segmentSize = DefaultSegmentSize
+	}
+	records, err := ReadAll(walDir, segmentSize)
+	if err != nil {
+		// Missing pg_wal on a fresh data dir is fine — no records
+		// to replay.
+		if errors.Is(err, fs.ErrNotExist) {
+			return ReplayStats{}, nil
+		}
+		return ReplayStats{}, err
+	}
 	return ReplayRecords(mgr, records)
 }
 

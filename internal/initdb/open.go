@@ -84,6 +84,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		AlignedIO: opts.AlignedIO,
 	})
 
+	// Crash recovery: replay any WAL records past the last
+	// checkpoint into the data files BEFORE the buffer pool comes
+	// online, so the pool always observes a consistent on-disk
+	// state. Replay is idempotent — a clean shutdown leaves no
+	// records past the last checkpoint, so this is a no-op for
+	// normal restarts. See M0002 "Crash-recovery test" in
+	// .ralph/fix_plan.md.
+	if _, err := wal.ReplayFromDirWithMgr(mgr, filepath.Join(abs, "pg_wal"), 0); err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: wal replay: %w", err)
+	}
+
 	walWriter, err := wal.NewWriter(wal.Config{
 		WALDir: filepath.Join(abs, "pg_wal"),
 	})

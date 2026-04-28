@@ -176,6 +176,21 @@ final write.
 
 ### 5. Full-page-image emission lives in `MarkDirty`
 
+**Update (Landing 3a follow-up):** v0 emits an FPI on **every**
+`MarkDirty`, not just first-dirty-per-epoch. The original
+once-per-epoch design assumed companion logical change records
+(`heap_insert`, `btree_insert`, ...) capture the deltas between
+checkpoints; v0 has no such records yet, so first-dirty-only FPI
+silently drops every subsequent mutation on a page across crash
+recovery — the M0002 crash-recovery test in
+`internal/initdb/recovery_test.go` failed exactly that way before
+we relaxed the gating. The `fpiSinceCheckpoint` flag is still
+tracked per slot (checkpointer's epoch bookkeeping) but no
+longer gates emission. WAL volume rose substantially —
+`pgbench -i -s 1` grew from ~10 MB to ~1.6 GB. Logical change
+records (which would restore the once-per-epoch optimisation)
+are deferred to a post-M0002 milestone.
+
 The torn-write window is between "mutator updates page in the buffer"
 and "checkpointer/eviction writes the page to disk." Upstream protects
 against it by emitting a full-page image (FPI) WAL record on the

@@ -503,8 +503,24 @@ full Definition of Done. Decomposed into agent-sized chunks below.
 - [ ] Surface `pg_stat_bgwriter` / `pg_stat_checkpointer` (whichever
       view shipped in PG 18; pick what matches the reported
       server_version) as queryable virtual tables.
-- [ ] Crash-recovery test: `SIGKILL` mid-workload, restart, verify
-      committed transactions survive and in-flight ones don't.
+- [x] Crash-recovery test: simulated SIGKILL mid-workload, restart,
+      verify committed mutations survive WAL replay.
+      `internal/initdb/recovery_test.go` builds a populated B-tree,
+      flushes WAL durable, then closes the WAL writer + Manager
+      WITHOUT calling `Pool.Close` (which would `FlushAll`) — every
+      dirty in-memory page is dropped, mirroring SIGKILL before
+      bgwriter / checkpointer flushes. `initdb.Open` now invokes
+      `wal.ReplayFromDirWithMgr` against the data dir BEFORE
+      constructing the new buffer pool, so replay reconstructs
+      the post-mutation state into the data files. Surfaced and
+      fixed a v0 redo-log gap in the same loop: FPI was previously
+      emitted only on first-dirty-per-epoch, which silently dropped
+      every subsequent mutation on the same page on replay; v0 now
+      emits an FPI on every `MarkDirty`. WAL volume cost is high
+      (`pgbench -i -s 1` grew from ~10 MB to ~1.6 GB) but
+      correctness is the M0002 priority — logical change records
+      that would restore the optimisation are deferred to a
+      post-M0002 milestone.
 - [x] Design doc `0002-0001-checkpointing.md` covering all of the
       above (FPI-on-first-dirty, max_wal_size volume trigger,
       spread/paced writeback, GUC surface, SQL CHECKPOINT, structural
