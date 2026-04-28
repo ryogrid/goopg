@@ -246,6 +246,8 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 	switch x := e.(type) {
 	case *parser.IntegerConst:
 		return catalog.Type{Name: "int8"}, nil
+	case *parser.NumericConst:
+		return catalog.Type{Name: "numeric"}, nil
 	case *parser.StringConst:
 		return catalog.Type{Name: "text"}, nil
 	case *parser.NullConst:

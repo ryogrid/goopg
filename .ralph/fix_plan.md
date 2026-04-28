@@ -642,9 +642,27 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 
 ### Schema and loader
 
-- [ ] Make `HammerDB/tpch/postgres/ddl.sql` run end-to-end against
+- [x] Make `HammerDB/tpch/postgres/ddl.sql` run end-to-end against
       goopg. Identify and add any missing column types, default
       expressions, or constraint forms.
+      (achieved 2026-04-28: all eight HammerDB TPC-H CREATE TABLEs
+      from `HammerDB/src/postgresql/pgolap.tcl` complete via psql
+      18.3 against `goopg start -D <dir>`. Two gaps surfaced and
+      fixed in this loop: (a) NUMERIC codec — encoded integer
+      datums now round-trip as varlen text via the new
+      `numeric`/`decimal` case in `internal/executor/codec.go`,
+      using the same frame as varchar/char; (b) decimal +
+      scientific-notation literals — lexer extended to emit
+      `TokenNumericLit` for `123.45` and `1.5e-3`, parser AST
+      gained `parser.NumericConst{Value string}`, plumbed
+      through analyzer (`numeric` type), planner
+      (`planner.NumericConst`), and executor evaluator
+      (`KindString` datum so the NUMERIC codec stores the
+      literal verbatim). End-to-end smoke: round-trip INSERTs
+      with `901.01` and `1.5e3` SELECT back byte-identically.
+      Real arithmetic on NUMERIC and `numeric(p,s)` enforcement
+      remain deferred to the type-system milestone — see
+      `docs/design/0003-0004-hammerdb-tpch-integration.md`.)
 - [ ] HammerDB's COPY-based loader at SF1 succeeds.
 - [ ] Foreign-key parsing accepted (enforcement may be a no-op for
       v0; record the decision in a design doc).

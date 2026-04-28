@@ -586,6 +586,9 @@ func (p *parser) parsePrimary() (Expr, error) {
 			return nil, &SyntaxError{Pos: t.Pos, Message: "invalid integer literal: " + t.Value}
 		}
 		return &IntegerConst{pos: t.Pos, Value: v}, nil
+	case TokenNumericLit:
+		p.advance()
+		return &NumericConst{pos: t.Pos, Value: t.Value}, nil
 	case TokenStringLit:
 		p.advance()
 		return &StringConst{pos: t.Pos, Value: t.Value}, nil

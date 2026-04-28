@@ -25,6 +25,19 @@ type StringConst struct {
 func (e *StringConst) Pos() int { return e.pos }
 func (*StringConst) exprNode()  {}
 
+// NumericConst carries the verbatim text of a decimal / scientific
+// literal so we don't lose precision before the executor's NUMERIC
+// codec encodes it as varlen text. v0 doesn't compute on NUMERIC —
+// the value flows through analyzer/planner unchanged. Real
+// arithmetic waits on the type system milestone.
+type NumericConst struct {
+	pos   int
+	Value string
+}
+
+func (e *NumericConst) Pos() int { return e.pos }
+func (*NumericConst) exprNode()  {}
+
 // NullConst is the SQL NULL literal.
 type NullConst struct{ pos int }
 

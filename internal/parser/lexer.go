@@ -157,6 +157,41 @@ func (l *lexer) next() (Token, error) {
 		for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
 			l.pos++
 		}
+		// Optional fractional part. We commit to a decimal literal
+		// only when we see digit(s) after the dot; a trailing `.`
+		// followed by an identifier is upstream's qualified-name
+		// form and stays an integer.
+		isNumeric := false
+		if l.pos < len(l.src) && l.src[l.pos] == '.' && l.pos+1 < len(l.src) && isDigit(l.src[l.pos+1]) {
+			l.pos++ // consume '.'
+			for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+				l.pos++
+			}
+			isNumeric = true
+		}
+		// Optional exponent: e[+-]?digits
+		if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
+			save := l.pos
+			l.pos++
+			if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
+				l.pos++
+			}
+			expStart := l.pos
+			for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+				l.pos++
+			}
+			if l.pos == expStart {
+				// Not a real exponent — back off so a token like
+				// `1e` followed by something else doesn't get
+				// silently consumed.
+				l.pos = save
+			} else {
+				isNumeric = true
+			}
+		}
+		if isNumeric {
+			return Token{Kind: TokenNumericLit, Value: l.src[start:l.pos], Pos: start}, nil
+		}
 		return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
 
 	case c == '$':

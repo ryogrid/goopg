@@ -633,6 +633,8 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	switch x := e.(type) {
 	case *parser.IntegerConst:
 		return &IntegerConst{pos: x.Pos(), Value: x.Value}, nil
+	case *parser.NumericConst:
+		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
 		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.NullConst:
@@ -867,6 +869,8 @@ func parserExprKey(e parser.Expr) string {
 	switch x := e.(type) {
 	case *parser.IntegerConst:
 		return fmt.Sprintf("i:%d", x.Value)
+	case *parser.NumericConst:
+		return "n:" + x.Value
 	case *parser.StringConst:
 		return "s:" + x.Value
 	case *parser.NullConst:
@@ -1181,6 +1185,8 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	switch x := e.(type) {
 	case *parser.IntegerConst:
 		return &IntegerConst{pos: x.Pos(), Value: x.Value}, nil
+	case *parser.NumericConst:
+		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
 		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.NullConst:

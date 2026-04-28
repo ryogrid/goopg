@@ -13,6 +13,12 @@ const (
 	TokenIdent
 	TokenQuotedIdent
 	TokenIntLit
+	// TokenNumericLit covers decimal and scientific-notation literals
+	// (`1.5`, `1e10`, `0.5e-3`). v0 stores the literal verbatim — the
+	// parser emits a NumericConst that the executor encodes as a
+	// varlen text payload for NUMERIC columns. Real arithmetic on
+	// NUMERIC waits on the type system.
+	TokenNumericLit
 	TokenStringLit
 	TokenParam // $N
 	TokenSymbol

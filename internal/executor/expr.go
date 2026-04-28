@@ -29,6 +29,12 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	switch x := e.(type) {
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
+	case *planner.NumericConst:
+		// v0 surfaces the literal as a string Datum so the
+		// codec stores it verbatim in the varlen text frame
+		// shared with VARCHAR/CHAR. Real numeric arithmetic
+		// waits on the type system.
+		return Datum{Kind: KindString, String: x.Value}, nil
 	case *planner.StringConst:
 		return Datum{Kind: KindString, String: x.Value}, nil
 	case *planner.NullConst:

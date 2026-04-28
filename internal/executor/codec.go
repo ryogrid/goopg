@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -105,6 +106,26 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [8]byte
 		binary.BigEndian.PutUint64(buf[:], uint64(d.Time.UnixNano()))
 		return buf[:], nil
+	case "numeric", "decimal":
+		// v0 stores NUMERIC values as their decimal-string
+		// representation in the same varlen text frame as
+		// varchar/char. Real precision-tracking arithmetic
+		// requires the type system milestone-7 will land;
+		// until then this lossless string round-trip is what
+		// HammerDB / TPC-H need to load and unload data
+		// without spurious encode failures. Integer datums
+		// (e.g. `INSERT INTO t (numeric_col) VALUES (1)`)
+		// flow through `strconv.FormatInt` so the round-trip
+		// preserves the literal.
+		switch d.Kind {
+		case KindInt:
+			return encodeVarlen([]byte(strconv.FormatInt(d.Int, 10))), nil
+		case KindString:
+			return encodeVarlen([]byte(d.String)), nil
+		case KindBytes:
+			return encodeVarlen(d.Bytes), nil
+		}
+		return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 	default:
 		// Variable-length text-like fallback.
 		var s string
@@ -154,6 +175,19 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		}
 		ns := int64(binary.BigEndian.Uint64(data[:8]))
 		return Datum{Kind: KindTime, Time: time.Unix(0, ns).UTC()}, 8, nil
+	case "numeric", "decimal":
+		// Stored as varlen text (see encodeValue). Surface as
+		// KindString so the wire layer formats it verbatim;
+		// callers that want comparison arithmetic must coerce
+		// in the planner.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated numeric")
+		}
+		n := int(binary.BigEndian.Uint32(data[:4]))
+		if 4+n > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated numeric body")
+		}
+		return Datum{Kind: KindString, String: string(data[4 : 4+n])}, 4 + n, nil
 	default:
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated varlen header")

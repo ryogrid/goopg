@@ -53,6 +53,18 @@ type StringConst struct {
 func (e *StringConst) Pos() int { return e.pos }
 func (*StringConst) exprNode()  {}
 
+// NumericConst carries a verbatim NUMERIC / decimal literal (e.g.
+// `123.45`, `1e-5`). v0 treats the value as opaque text — the
+// executor's NUMERIC codec stores it byte-for-byte. Real
+// arithmetic on NUMERIC waits on the type system.
+type NumericConst struct {
+	pos   int
+	Value string
+}
+
+func (e *NumericConst) Pos() int { return e.pos }
+func (*NumericConst) exprNode()  {}
+
 // NullConst — SQL NULL.
 type NullConst struct{ pos int }
 
