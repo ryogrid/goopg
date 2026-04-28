@@ -962,6 +962,18 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] `LIKE` / `NOT LIKE` pattern matching for TPC-H text filters.
+      (achieved 2026-04-29: `expr [NOT] LIKE pattern` parses at
+      comparison precedence (postfix-style alongside `[NOT] IN`),
+      analyzer requires text-on-text → bool, executor's
+      `matchSQLLike` is a byte-level recursive matcher honouring
+      `%` (any run), `_` (single byte), and `\` escape. Verified
+      end-to-end via psql 18.3 against TPC-H Q14 shape
+      (`p_name LIKE 'PROMO%'`), Q9 shape (`%green%`), suffix
+      anchor (`%COPPER`), `_` exact-one, and explicit-escape
+      `'PROMO%' LIKE 'PROMO\%'`. ILIKE, ESCAPE clause, and
+      planner-side prefix-anchor index extraction are deferred —
+      see `docs/design/0003-0011-like-pattern-matching.md`.)
 - [x] Views (CREATE VIEW / DROP VIEW) where HammerDB uses them.
       (achieved 2026-04-28: `CREATE [OR REPLACE] VIEW name
       [(col_list)] AS SELECT …` and `DROP VIEW [IF EXISTS]`

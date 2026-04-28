@@ -171,8 +171,69 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 			return Datum{}, err
 		}
 		return Datum{Kind: KindBool, Bool: cmpResult(op, cmp)}, nil
+	case "LIKE", "NOT LIKE":
+		if left.Kind != KindString || right.Kind != KindString {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands", op)}
+		}
+		matched := matchSQLLike(left.String, right.String)
+		if op == "NOT LIKE" {
+			matched = !matched
+		}
+		return Datum{Kind: KindBool, Bool: matched}, nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
+}
+
+// matchSQLLike implements SQL LIKE pattern semantics: '%' matches
+// any (possibly empty) sequence, '_' matches exactly one character,
+// every other byte matches itself. v0 does not honour an ESCAPE
+// clause — escapes are upstream's default backslash where the next
+// character is taken literally. The implementation is the standard
+// recursive-descent matcher (no regex translation, so embedded
+// special chars in the input never interact with regex syntax).
+func matchSQLLike(s, pat string) bool {
+	si, pi := 0, 0
+	starS, starP := -1, -1
+	for si < len(s) {
+		if pi < len(pat) {
+			c := pat[pi]
+			switch c {
+			case '\\':
+				// Escape: next pattern byte matches literally.
+				if pi+1 < len(pat) && pat[pi+1] == s[si] {
+					pi += 2
+					si++
+					continue
+				}
+			case '%':
+				starP = pi
+				starS = si
+				pi++
+				continue
+			case '_':
+				pi++
+				si++
+				continue
+			default:
+				if c == s[si] {
+					pi++
+					si++
+					continue
+				}
+			}
+		}
+		if starP >= 0 {
+			pi = starP + 1
+			starS++
+			si = starS
+			continue
+		}
+		return false
+	}
+	for pi < len(pat) && pat[pi] == '%' {
+		pi++
+	}
+	return pi == len(pat)
 }
 
 // addTimeInterval applies an interval to a time value. When

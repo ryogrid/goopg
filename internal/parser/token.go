@@ -123,6 +123,7 @@ const (
 	KwIn          Keyword = "in"
 	KwView        Keyword = "view"
 	KwReplace     Keyword = "replace"
+	KwLike        Keyword = "like"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -218,6 +219,7 @@ var keywords = map[string]Keyword{
 	"replace":     KwReplace,
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
+	"like":        KwLike,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

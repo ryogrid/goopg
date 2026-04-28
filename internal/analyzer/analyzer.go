@@ -460,6 +460,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator || requires string operands")
 			}
 			return catalog.Type{Name: "text"}, nil
+		case "LIKE", "NOT LIKE":
+			// Both operands must be string-like (text/varchar/char/
+			// bpchar/unknown). Pattern can be a literal or column.
+			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires string operands", x.Op))
+			}
+			return catalog.Type{Name: "bool"}, nil
 		default:
 			return catalog.Type{Name: "unknown"}, nil
 		}

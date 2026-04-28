@@ -502,6 +502,33 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				left = inExpr
 				continue
 			}
+			// `expr [NOT] LIKE pattern` mirrors the IN handling. The
+			// pattern is a comparison-precedence operand so a bare
+			// string literal binds correctly without parens; nesting
+			// LIKE inside arithmetic expressions still works because
+			// we ascend at precCompare+1 for the rhs.
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwLike {
+				pos := t.Pos
+				p.advance()
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				left = &BinaryOp{pos: pos, Op: "LIKE", Left: left, Right: rhs}
+				continue
+			}
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwLike {
+				pos := t.Pos
+				p.advance() // NOT
+				p.advance() // LIKE
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				left = &BinaryOp{pos: pos, Op: "NOT LIKE", Left: left, Right: rhs}
+				continue
+			}
 		}
 		op, prec, ok := p.peekBinaryOp()
 		if !ok || prec < min {
