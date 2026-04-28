@@ -202,3 +202,110 @@ type DeleteStmt struct {
 
 func (s *DeleteStmt) Pos() int  { return s.pos }
 func (s *DeleteStmt) stmtNode() {}
+
+// ColumnType is the textual type spec on a column or function arg.
+// Args are the optional parameter list — `char(22)` carries [22],
+// `numeric(10,2)` carries [10, 2]. Schema-qualified type names
+// (e.g. `pg_catalog.int4`) populate Schema.
+type ColumnType struct {
+	pos    int
+	Schema string
+	Name   string
+	Args   []int64
+}
+
+func (c ColumnType) Pos() int { return c.pos }
+
+// ColumnDef is one column declaration in CREATE TABLE.
+type ColumnDef struct {
+	pos     int
+	Name    string
+	Type    ColumnType
+	NotNull bool
+	Primary bool // inline `PRIMARY KEY` constraint
+}
+
+func (c ColumnDef) Pos() int { return c.pos }
+
+// CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
+//
+//	(column_def [, …]) [WITH (option = value [, …])]`. Foreign keys,
+//
+// CHECK constraints, partitioning, and inheritance are deferred.
+type CreateTableStmt struct {
+	pos         int
+	IfNotExists bool
+	Unlogged    bool
+	Name        ObjectName
+	Columns     []ColumnDef
+	// PrimaryKey holds the column names from a table-level
+	// `PRIMARY KEY (a, b)` clause. Inline-on-column primary keys live
+	// on ColumnDef.Primary instead.
+	PrimaryKey []string
+	// With carries the option list from `WITH (k = v, …)`. We keep it
+	// as a string→string map; the analyzer interprets known options
+	// (fillfactor, autovacuum_*, …) and rejects the rest.
+	With map[string]string
+}
+
+func (s *CreateTableStmt) Pos() int  { return s.pos }
+func (s *CreateTableStmt) stmtNode() {}
+
+// CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
+//
+//	ON table [USING method] (col [, …])`. Index-only-on-expression,
+//
+// WHERE predicates, INCLUDE columns, and storage parameters are
+// deferred.
+type CreateIndexStmt struct {
+	pos         int
+	IfNotExists bool
+	Unique      bool
+	Name        string // empty for "auto-named" indexes (CREATE INDEX ON t (c))
+	Table       ObjectName
+	Method      string // empty defaults to "btree" downstream
+	Columns     []string
+}
+
+func (s *CreateIndexStmt) Pos() int  { return s.pos }
+func (s *CreateIndexStmt) stmtNode() {}
+
+// DropBehavior is the trailing CASCADE/RESTRICT on DROP statements.
+type DropBehavior int
+
+const (
+	DropDefault DropBehavior = iota // RESTRICT (the default)
+	DropCascade
+)
+
+// DropTableStmt — `DROP TABLE [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+type DropTableStmt struct {
+	pos      int
+	IfExists bool
+	Names    []ObjectName
+	Behavior DropBehavior
+}
+
+func (s *DropTableStmt) Pos() int  { return s.pos }
+func (s *DropTableStmt) stmtNode() {}
+
+// DropIndexStmt — `DROP INDEX [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+type DropIndexStmt struct {
+	pos      int
+	IfExists bool
+	Names    []ObjectName
+	Behavior DropBehavior
+}
+
+func (s *DropIndexStmt) Pos() int  { return s.pos }
+func (s *DropIndexStmt) stmtNode() {}
+
+// TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
+type TruncateStmt struct {
+	pos      int
+	Names    []ObjectName
+	Behavior DropBehavior
+}
+
+func (s *TruncateStmt) Pos() int  { return s.pos }
+func (s *TruncateStmt) stmtNode() {}

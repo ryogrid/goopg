@@ -70,6 +70,23 @@ const (
 	KwUpdate      Keyword = "update"
 	KwDelete      Keyword = "delete"
 	KwReturning   Keyword = "returning"
+	KwCreate      Keyword = "create"
+	KwTable       Keyword = "table"
+	KwIndex       Keyword = "index"
+	KwUnique      Keyword = "unique"
+	KwOn          Keyword = "on"
+	KwUsing       Keyword = "using"
+	KwUnlogged    Keyword = "unlogged"
+	KwDrop        Keyword = "drop"
+	KwIf          Keyword = "if"
+	KwExists      Keyword = "exists"
+	KwTruncate    Keyword = "truncate"
+	KwWith        Keyword = "with"
+	KwTablespace  Keyword = "tablespace"
+	KwPrimary     Keyword = "primary"
+	KwKey         Keyword = "key"
+	KwCascade     Keyword = "cascade"
+	KwRestrict    Keyword = "restrict"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -118,6 +135,23 @@ var keywords = map[string]Keyword{
 	"update":      KwUpdate,
 	"delete":      KwDelete,
 	"returning":   KwReturning,
+	"create":      KwCreate,
+	"table":       KwTable,
+	"index":       KwIndex,
+	"unique":      KwUnique,
+	"on":          KwOn,
+	"using":       KwUsing,
+	"unlogged":    KwUnlogged,
+	"drop":        KwDrop,
+	"if":          KwIf,
+	"exists":      KwExists,
+	"truncate":    KwTruncate,
+	"with":        KwWith,
+	"tablespace":  KwTablespace,
+	"primary":     KwPrimary,
+	"key":         KwKey,
+	"cascade":     KwCascade,
+	"restrict":    KwRestrict,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

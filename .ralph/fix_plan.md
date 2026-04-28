@@ -211,8 +211,17 @@ unchecked item unless a dependency forces a different order.
         [WHERE expr] [RETURNING target_list]`. Pgbench's INSERT into
         pgbench_history and the abalance UPDATE/SELECT pair parse
         end-to-end.
-  - [ ] Statement parsers: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`,
-        `DROP INDEX`, `TRUNCATE`.
+  - [x] Statement parsers: `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
+        (column_def [, …]) [WITH (k=v, …)] [TABLESPACE x]`,
+        `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table
+        [USING method] (col [, …])`, `DROP {TABLE|INDEX} [IF EXISTS]
+        name [, …] [CASCADE|RESTRICT]`, `TRUNCATE [TABLE] name [, …]
+        [CASCADE|RESTRICT]`. Type modifiers (`char(22)`,
+        `numeric(10,2)`), inline `NOT NULL`/`PRIMARY KEY`, and
+        table-level `PRIMARY KEY (a, b)` round-trip; pgbench -i's four
+        CREATE TABLE strings parse as expected.
+  - [ ] Statement parser: `ALTER TABLE … ADD PRIMARY KEY (col)` (pgbench
+        adds primary keys via ALTER, not via CREATE INDEX).
   - [ ] Analyzer pass (name resolution, type checking) once the catalog
         exists.
 - [ ] Planner sufficient for pgbench's workload.
