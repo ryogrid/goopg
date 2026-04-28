@@ -157,6 +157,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.Catalog = rt.Catalog
 		cfg.Pool = rt.Pool
 		cfg.TxnMgr = rt.TxnMgr
+		cfg.Checkpointer = rt.Checkpointer
 		cfg.DataDir = rt.DataDir
 		logger.Info("opened data directory", "path", rt.DataDir)
 	}
@@ -185,8 +186,28 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 
 	srv := server.New(cfg)
-	if err := srv.Run(ctx); err != nil {
-		fmt.Fprintf(stderr, "goopg start: %v\n", err)
+
+	// Run the periodic checkpointer alongside the server. SIGTERM /
+	// SIGINT cancel `ctx` directly; a control-socket STOP makes
+	// srv.Run return without cancelling ctx, so we drive the
+	// checkpointer off a child context and cancel it on the way out
+	// to avoid a stuck shutdown.
+	cpCtx, cpCancel := context.WithCancel(ctx)
+	cpDone := make(chan struct{})
+	if rt != nil && rt.Checkpointer != nil {
+		go func() {
+			defer close(cpDone)
+			_ = rt.Checkpointer.Run(cpCtx)
+		}()
+	} else {
+		close(cpDone)
+	}
+
+	runErr := srv.Run(ctx)
+	cpCancel()
+	<-cpDone
+	if runErr != nil {
+		fmt.Fprintf(stderr, "goopg start: %v\n", runErr)
 		return 1
 	}
 	return 0

@@ -28,6 +28,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -84,6 +85,13 @@ type Config struct {
 	Catalog catalog.Catalog
 	Pool    *storage.Pool
 	TxnMgr  *mvcc.Manager
+
+	// Checkpointer, when set, is invoked by the SQL `CHECKPOINT`
+	// verb. Production wiring points at *wal.Checkpointer; tests can
+	// inject a fake. nil makes CHECKPOINT fail with
+	// feature_not_supported, matching the v0 in-process default
+	// where the server runs without a WAL writer.
+	Checkpointer executor.Checkpointer
 
 	// DataDir, when set, controls where the server writes its
 	// `postmaster.pid` file and binds its operator-facing control

@@ -39,6 +39,20 @@ type Context struct {
 	// tests can leave it nil when the operator under test doesn't
 	// need it.
 	Session Session
+
+	// Checkpointer, when set, is invoked by the Checkpoint operator
+	// to drive a synchronous checkpoint (see milestone 0002). nil
+	// means the SQL CHECKPOINT verb fails with feature_not_supported
+	// — that's the v0 behaviour for a server started without a WAL
+	// writer.
+	Checkpointer Checkpointer
+}
+
+// Checkpointer is the contract the SQL `CHECKPOINT` verb uses to
+// drive a synchronous checkpoint. The wire layer fills it from
+// server.Config; production servers use a *wal.Checkpointer.
+type Checkpointer interface {
+	CheckpointNow() error
 }
 
 // NewContext builds a Context with sensible defaults: a fresh

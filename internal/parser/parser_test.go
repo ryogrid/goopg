@@ -101,6 +101,19 @@ func TestParseAnalyze(t *testing.T) {
 	}
 }
 
+// TestParseCheckpoint locks the bare CHECKPOINT verb. Upstream
+// only accepts CHECKPOINT (no parenthesised options) — see
+// postgres/src/backend/parser/gram.y CheckPointStmt rule.
+func TestParseCheckpoint(t *testing.T) {
+	stmts, err := Parse("CHECKPOINT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stmts[0].(*CheckpointStmt); !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+}
+
 // TestParseShowSetReset locks down the GUC verbs the parser carves out
 // from the simple-query path.
 func TestParseShowSetReset(t *testing.T) {

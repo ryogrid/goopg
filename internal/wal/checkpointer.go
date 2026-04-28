@@ -75,6 +75,15 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 	}
 }
 
+// CheckpointNow performs a synchronous checkpoint and returns when
+// the marker is durable on disk. The SQL `CHECKPOINT` verb and the
+// `goopg ctl` checkpoint subcommand both call this; the periodic
+// Run loop also routes through it. Concurrent calls are serialized
+// through the underlying WAL writer.
+func (c *Checkpointer) CheckpointNow() error {
+	return c.checkpointOnce()
+}
+
 func (c *Checkpointer) checkpointOnce() error {
 	if err := c.flusher.FlushAll(); err != nil {
 		return fmt.Errorf("flush dirty pages: %w", err)

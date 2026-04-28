@@ -330,6 +330,14 @@ type Utility struct {
 func (n *Utility) Pos() int       { return n.pos }
 func (n *Utility) Output() Schema { return nil }
 
+// Checkpoint — `CHECKPOINT`. Distinct from Utility because it has
+// real side-effects (synchronous flush + WAL marker), wired through
+// executor.Context.Checkpointer.
+type Checkpoint struct{ pos int }
+
+func (n *Checkpoint) Pos() int       { return n.pos }
+func (n *Checkpoint) Output() Schema { return nil }
+
 // CopyDirection records whether the COPY moves data into or out of
 // the table. Mirrors parser.CopyDirection so the executor doesn't
 // need to import the parser package directly.

@@ -68,6 +68,9 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
 
+	case *parser.CheckpointStmt:
+		return &Checkpoint{pos: s.Pos()}, nil
+
 	case *parser.CopyStmt:
 		return planCopy(s, cat)
 	}

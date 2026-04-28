@@ -60,6 +60,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sql str
 	ctx.TxnMgr = s.cfg.TxnMgr
 	ctx.Tx = tx
 	ctx.Snap = snap
+	ctx.Checkpointer = s.cfg.Checkpointer
 
 	for _, stmt := range stmts {
 		// Refresh snapshot per statement for ReadCommitted parity.
@@ -184,6 +185,9 @@ func commandTagFor(node planner.Node, op executor.Operator, rowCount int64) stri
 		return transactionTag(n.Verb)
 	case *planner.Utility:
 		return utilityTag(n.Stmt)
+	case *planner.Checkpoint:
+		_ = n
+		return "CHECKPOINT"
 	}
 	// Read-shaped: SELECT N. Catches Project/Sort/Limit/Filter/Aggregate/
 	// Join/SeqScan/IndexScan/Values root nodes.

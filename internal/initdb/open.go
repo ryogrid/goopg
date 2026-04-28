@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // CatalogSnapshotFile is the relative path inside the data
@@ -26,11 +27,13 @@ const CatalogSnapshotFile = "global/pg_catalog.json"
 // production entry point that constructs the four together against
 // a real data directory.
 type Runtime struct {
-	StorageMgr *storage.Manager
-	Pool       *storage.Pool
-	TxnMgr     *mvcc.Manager
-	Catalog    catalog.Catalog
-	DataDir    string
+	StorageMgr   *storage.Manager
+	Pool         *storage.Pool
+	TxnMgr       *mvcc.Manager
+	Catalog      catalog.Catalog
+	WAL          *wal.Writer
+	Checkpointer *wal.Checkpointer
+	DataDir      string
 }
 
 // OpenOptions controls Open.
@@ -80,8 +83,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DataDir:   abs,
 		AlignedIO: opts.AlignedIO,
 	})
-	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: slots})
+
+	walWriter, err := wal.NewWriter(wal.Config{
+		WALDir: filepath.Join(abs, "pg_wal"),
+	})
 	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: wal: %w", err)
+	}
+
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{
+		Slots: slots,
+		WAL:   walWriter,
+	})
+	if err != nil {
+		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: bufpool: %w", err)
 	}
@@ -90,16 +106,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	txnMgr := mvcc.NewManager()
 	if err := loadCatalogSnapshot(abs, cat, txnMgr); err != nil {
 		_ = pool.Close()
+		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, err
 	}
 
+	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{})
+
 	return &Runtime{
-		StorageMgr: mgr,
-		Pool:       pool,
-		TxnMgr:     txnMgr,
-		Catalog:    cat,
-		DataDir:    abs,
+		StorageMgr:   mgr,
+		Pool:         pool,
+		TxnMgr:       txnMgr,
+		Catalog:      cat,
+		WAL:          walWriter,
+		Checkpointer: cp,
+		DataDir:      abs,
 	}, nil
 }
 
@@ -188,6 +209,12 @@ func (r *Runtime) Close() error {
 			firstErr = err
 		}
 		r.Pool = nil
+	}
+	if r.WAL != nil {
+		if err := r.WAL.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.WAL = nil
 	}
 	if r.StorageMgr != nil {
 		if err := r.StorageMgr.Close(); err != nil && firstErr == nil {

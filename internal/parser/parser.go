@@ -158,8 +158,16 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseAlter()
 	case KwCopy:
 		return p.parseCopy()
+	case KwCheckpoint:
+		return p.parseCheckpoint()
 	}
 	return nil, p.errAtCur("unsupported statement")
+}
+
+// parseCheckpoint: CHECKPOINT
+func (p *parser) parseCheckpoint() (Stmt, error) {
+	t := p.advance()
+	return &CheckpointStmt{pos: t.Pos}, nil
 }
 
 // parseBegin: BEGIN [WORK | TRANSACTION]

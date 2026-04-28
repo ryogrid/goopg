@@ -1,0 +1,38 @@
+package executor
+
+import (
+	"github.com/goopg/goopg/internal/planner"
+)
+
+// checkpointOp drives the SQL `CHECKPOINT` verb. It calls
+// Context.Checkpointer.CheckpointNow synchronously on Open and
+// returns a no-row stream so the wire layer emits just the
+// CommandComplete tag.
+type checkpointOp struct{ plan *planner.Checkpoint }
+
+func newCheckpointOp(p *planner.Checkpoint) *checkpointOp {
+	return &checkpointOp{plan: p}
+}
+
+func (o *checkpointOp) Schema() planner.Schema { return nil }
+
+func (o *checkpointOp) Open(ctx *Context) error {
+	if ctx == nil || ctx.Checkpointer == nil {
+		return &ExecError{
+			Code:    "0A000", // feature_not_supported
+			Pos:     o.plan.Pos(),
+			Message: "CHECKPOINT requires a server started with a WAL writer; the v0 in-process server has none",
+		}
+	}
+	if err := ctx.Checkpointer.CheckpointNow(); err != nil {
+		return &ExecError{
+			Code:    "XX000", // internal_error
+			Pos:     o.plan.Pos(),
+			Message: "CHECKPOINT failed: " + err.Error(),
+		}
+	}
+	return nil
+}
+
+func (o *checkpointOp) Next() (Row, error) { return nil, EOF }
+func (o *checkpointOp) Close() error       { return nil }

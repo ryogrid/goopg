@@ -69,6 +69,14 @@ type AnalyzeStmt struct {
 func (s *AnalyzeStmt) Pos() int  { return s.pos }
 func (s *AnalyzeStmt) stmtNode() {}
 
+// CheckpointStmt — `CHECKPOINT`. Triggers a synchronous checkpoint
+// (see milestone 0002 §Checkpointing). The bare verb is the only
+// form upstream accepts as well.
+type CheckpointStmt struct{ pos int }
+
+func (s *CheckpointStmt) Pos() int  { return s.pos }
+func (s *CheckpointStmt) stmtNode() {}
+
 // ShowStmt — `SHOW name | SHOW ALL`.
 type ShowStmt struct {
 	pos  int

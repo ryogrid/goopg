@@ -72,6 +72,7 @@ func (s *Server) executeExtendedQueryViaExecutor(query string, params []boundPar
 	ctx.Tx = tx
 	ctx.Snap = snap
 	ctx.Params = datums
+	ctx.Checkpointer = s.cfg.Checkpointer
 
 	op, err := executor.Build(node)
 	if err != nil {

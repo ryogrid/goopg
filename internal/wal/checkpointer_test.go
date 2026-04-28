@@ -45,6 +45,35 @@ func (f *fakeFlusher) Calls() int {
 	return f.calls
 }
 
+// TestCheckpointerCheckpointNowSynchronous covers the operator-
+// driven path used by the SQL `CHECKPOINT` verb: a single call
+// flushes dirty pages, appends a marker, and advances
+// LastCheckpointLSN before returning.
+func TestCheckpointerCheckpointNowSynchronous(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	flusher := &fakeFlusher{flushSignalChan: make(chan struct{}, 4)}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{
+		Interval: time.Hour, // never ticks during the test
+		Logger:   slog.New(slog.NewTextHandler(nilDiscardWriter{}, nil)),
+	})
+
+	if err := cp.CheckpointNow(); err != nil {
+		t.Fatalf("CheckpointNow: %v", err)
+	}
+	if got := cp.LastCheckpointLSN(); got == 0 {
+		t.Fatal("LastCheckpointLSN unchanged after CheckpointNow")
+	}
+	if flusher.Calls() != 1 {
+		t.Fatalf("flusher.Calls=%d want 1", flusher.Calls())
+	}
+}
+
 func TestCheckpointerWritesCheckpointMarkers(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
 	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 512})

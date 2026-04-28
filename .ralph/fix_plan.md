@@ -426,6 +426,137 @@ unchecked item unless a dependency forces a different order.
       region update — was the root cause of the
       "invalid t_hoff=0 len=44" corruption seen with -c 4 -j 2.)
 
+## Milestone 0002 — Production-grade checkpointing & concurrent B-tree
+
+See `docs/milestones/0002-durability-and-concurrent-storage.md` for the
+full Definition of Done. Decomposed into agent-sized chunks below.
+
+### Checkpointing
+
+- [x] Wire `wal.Writer` and `wal.Checkpointer` into `initdb.Runtime` so
+      every started server has a real WAL stream and a periodic
+      checkpointer goroutine. (achieved 2026-04-28: `Runtime.WAL` and
+      `Runtime.Checkpointer` are constructed in `initdb.Open` against
+      `<DataDir>/pg_wal`, threaded through `server.Config.Checkpointer`,
+      and the periodic loop runs alongside `srv.Run` under a child
+      context that cancels on the way out so a control-socket STOP
+      doesn't hang the shutdown.)
+- [x] Implement the `CHECKPOINT` SQL verb end-to-end. Parser carves
+      `KwCheckpoint` + `CheckpointStmt`; planner emits `Checkpoint`
+      plan node; executor's `checkpointOp` invokes
+      `Context.Checkpointer.CheckpointNow`; wire layer's
+      `commandTagFor` returns "CHECKPOINT". Smoke-tested with
+      upstream psql 18.3 against `goopg start -D <dir>`.
+- [ ] Add the M0002 GUCs with upstream defaults: `checkpoint_timeout`
+      (5min), `checkpoint_completion_target` (0.9), `max_wal_size`,
+      `min_wal_size`, `full_page_writes` (on). Names, units, and
+      defaults must match upstream per `GOAL_AND_REQUIREMENTS.md`
+      §6.2.
+- [ ] Honour `checkpoint_timeout` in `wal.Checkpointer.Run` (replace
+      the hard-coded 10s default with the GUC value).
+- [ ] Spread/smoothed checkpoint writes over
+      `checkpoint_completion_target * checkpoint_timeout`, rather than
+      one synchronous burst (today's behaviour).
+- [ ] Trigger checkpoints when the WAL volume crosses `max_wal_size`,
+      not just on the timer.
+- [ ] Implement full-page-image WAL records for the first
+      modification of a page after each checkpoint when
+      `full_page_writes` is on.
+- [ ] Add `goopg ctl checkpoint` CLI subcommand routed through the
+      control socket. Same semantics as the SQL verb.
+- [ ] Surface `pg_stat_bgwriter` / `pg_stat_checkpointer` (whichever
+      view shipped in PG 18; pick what matches the reported
+      server_version) as queryable virtual tables.
+- [ ] Crash-recovery test: `SIGKILL` mid-workload, restart, verify
+      committed transactions survive and in-flight ones don't.
+- [ ] Design doc `NNNN-checkpointing.md` covering all of the above
+      (only the items in this milestone — recovery is in M1's WAL
+      doc).
+
+### Concurrent B-tree (Lehman-Yao + PG modifications)
+
+- [ ] Replace global tree mutex with per-page `sync.RWMutex` latches
+      coupled with the buffer pool's existing per-slot locks.
+- [ ] Add right-sibling pointers and high keys so descents don't hold
+      parent locks (Lehman-Yao baseline).
+- [ ] Atomic page splits with crash-safe WAL records and replay.
+- [ ] Concurrent inserts, point lookups, and forward range scans
+      without the global tree lock; verified by `pgbench -c 32 -j 8`.
+- [ ] Index-only scans where the visibility map permits.
+- [ ] Vacuum integration: B-tree page deletion and recycling
+      consistent with MVCC visibility.
+- [ ] Design doc `NNNN-btree-concurrency.md`.
+
+## Milestone 0003 — HammerDB TPC-H workload
+
+See `docs/milestones/0003-tpch-workload.md` for full DoD. HammerDB
+clone at `./HammerDB/`; TPC-H schema + queries under
+`HammerDB/tpch/postgres/`.
+
+### Schema and loader
+
+- [ ] Make `HammerDB/tpch/postgres/ddl.sql` run end-to-end against
+      goopg. Identify and add any missing column types, default
+      expressions, or constraint forms.
+- [ ] HammerDB's COPY-based loader at SF1 succeeds.
+- [ ] Foreign-key parsing accepted (enforcement may be a no-op for
+      v0; record the decision in a design doc).
+
+### Planner depth
+
+- [ ] Cost-based planner with cardinality estimates good enough that
+      no TPC-H query degenerates to a Cartesian product.
+- [ ] Hash join executor (`internal/executor/operators_hashjoin.go`).
+- [ ] Sort-merge join executor.
+- [ ] Hash aggregate executor (replace today's sort-then-group as the
+      default path).
+- [ ] `EXPLAIN` output for a `parser.ExplainStmt` shape.
+- [ ] `ANALYZE` produces statistics: n_distinct, MCV lists,
+      histograms (mirror upstream's
+      `postgres/src/backend/commands/analyze.c`).
+- [ ] Design docs: `NNNN-planner-overview.md` (extend M1's
+      0011-planner.md), `NNNN-join-executors.md`,
+      `NNNN-statistics-and-cardinality.md`,
+      `NNNN-hammerdb-tpch-integration.md`.
+
+### Query coverage (incremental)
+
+- [ ] 3- to 7-way JOIN planning (extend the M1 nested-loop planner).
+- [ ] Correlated and uncorrelated subqueries; `EXISTS`, `NOT EXISTS`,
+      `IN`, `NOT IN`.
+- [ ] `CASE` expressions (parser + executor).
+- [ ] Date and interval arithmetic, `EXTRACT(... FROM ts)`.
+- [ ] `FETCH FIRST n ROWS ONLY` as a `LIMIT` synonym.
+- [ ] Views (CREATE VIEW / DROP VIEW) where HammerDB uses them.
+- [ ] All 22 queries (Q1–Q22) execute end-to-end and produce
+      result sets byte-identical (or otherwise verified-equivalent)
+      to upstream PG on the same data.
+- [ ] HammerDB Power Test at SF1 completes without errors.
+
+## Milestone 0004 — TAP test port & Go utility library
+
+See `docs/milestones/0004-tap-test-port.md`. Parallelizable with
+M0002/M0003; lands regression coverage as those features ship.
+
+- [ ] `internal/testutil/cluster` package equivalent of
+      `PostgreSQL::Test::Cluster`. Init/start/stop/restart with
+      smart/fast/immediate modes; query via `psql` + Go libpq
+      client; capture/inspect logs; programmatic edits to
+      `postgresql.conf` and `pg_hba.conf`. Background-psql sessions.
+      Multi-cluster API (impl deferred).
+- [ ] `internal/testutil/util` package equivalent of
+      `PostgreSQL::Test::Utils`. Tempdir/file helpers, command runner
+      with timeout + capture, log scanning helpers.
+- [ ] `docs/test-port/upstream-tap-coverage.md` — classify every
+      upstream TAP test under `postgres/src/test/recovery/t/`,
+      `postgres/src/bin/*/t/`, etc. as `port`/`skip`/`defer` with a
+      one-line rationale. Reproducible from a tool committed
+      alongside it.
+- [ ] Port at least 80% of `port` rows. Each ported test references
+      its upstream source path in a header comment.
+- [ ] Design docs: `NNNN-go-test-utility-library.md`,
+      `NNNN-tap-test-port-strategy.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
