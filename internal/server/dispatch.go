@@ -219,6 +219,10 @@ func ddlTag(stmt parser.Stmt) string {
 		return "DROP TABLE"
 	case *parser.DropIndexStmt:
 		return "DROP INDEX"
+	case *parser.CreateViewStmt:
+		return "CREATE VIEW"
+	case *parser.DropViewStmt:
+		return "DROP VIEW"
 	case *parser.TruncateStmt:
 		return "TRUNCATE TABLE"
 	case *parser.AlterTableStmt:

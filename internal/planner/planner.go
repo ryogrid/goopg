@@ -54,6 +54,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 
 	case *parser.CreateTableStmt, *parser.DropTableStmt,
 		*parser.CreateIndexStmt, *parser.DropIndexStmt,
+		*parser.CreateViewStmt, *parser.DropViewStmt,
 		*parser.TruncateStmt, *parser.AlterTableStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
@@ -190,20 +191,30 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	} else if isSimpleSingle {
 		rv := s.From[0]
-		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
-		if !ok {
-			return nil, &PlanError{
-				Pos:     rv.Pos(),
-				Code:    "42P01",
-				Message: fmt.Sprintf("relation %q does not exist", rv.Name),
+		// Delegate the simple-single-table case to
+		// planScanRangeVar so view substitution / virtual-rows
+		// dispatch live in one place.
+		nrv, b, err := planScanRangeVar(rv, cat)
+		if err != nil {
+			return nil, err
+		}
+		node = nrv
+		schema := tableSchema(b.table)
+		// View substitution may have rewritten the schema to
+		// merge the view's column names with the inner plan's
+		// types — preserve it.
+		if b.table.View != nil {
+			schema = make(Schema, len(b.table.Columns))
+			innerOut := node.Output()
+			for i, c := range b.table.Columns {
+				ty := c.Type
+				if i < len(innerOut) {
+					ty = innerOut[i].Type
+				}
+				schema[i] = SchemaColumn{Name: c.Name, Type: ty}
 			}
 		}
-		ctx = singleBindingContext(tbl, rv.Alias)
-		if tbl.Virtual {
-			node = buildVirtualValues(s.Pos(), tbl, ctx.schema)
-		} else {
-			node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
-		}
+		ctx = newResolveContext([]rangeBinding{b}, schema)
 	} else {
 		var err error
 		node, ctx, err = planFromClause(s, cat)
@@ -441,6 +452,37 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 	}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0}
 	ctx := newResolveContext([]rangeBinding{b}, tableSchema(tbl))
+	// View: plan the stored inner SELECT and substitute its
+	// node. The outer ctx's schema (built from the view's
+	// catalog Table) takes precedence for downstream name
+	// resolution — the inner SELECT's target-list names are
+	// only relevant when the view didn't supply an explicit
+	// alias list. Column count must match what the view
+	// declared; v0 reports a planner error otherwise.
+	if tbl.View != nil {
+		inner, err := Plan(tbl.View, cat)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		innerSchema := inner.Output()
+		if len(innerSchema) != len(tbl.Columns) {
+			return nil, rangeBinding{}, &PlanError{
+				Pos:     rv.Pos(),
+				Code:    "42P10",
+				Message: fmt.Sprintf("view %q has %d columns but its body produces %d", tbl.QualifiedName(), len(tbl.Columns), len(innerSchema)),
+			}
+		}
+		// Rebuild the outer ctx schema using the view's column
+		// names but the inner plan's column types — types
+		// flow from the planned inner so downstream
+		// comparisons see the right type tag.
+		schema := make(Schema, len(tbl.Columns))
+		for i, c := range tbl.Columns {
+			schema[i] = SchemaColumn{Name: c.Name, Type: innerSchema[i].Type}
+		}
+		ctx.schema = schema
+		return inner, b, nil
+	}
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
 	}

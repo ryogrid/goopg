@@ -48,6 +48,19 @@ type Table struct {
 	// without us bootstrapping a full system catalog.
 	Virtual     bool
 	VirtualRows func() [][]string
+
+	// View, when non-nil, marks this table as a SQL view. The
+	// stored value is the parser AST of the view's defining
+	// SELECT; planScanRangeVar substitutes the planned inner
+	// node for any reference to this name. ViewColumnAliases is
+	// the optional explicit column-name list from
+	// `CREATE VIEW name (col_list) AS …`. Required for
+	// HammerDB TPC-H Q15. v0 doesn't enforce read-only —
+	// INSERT/UPDATE/DELETE against a view will surface as a
+	// planner error because the substituted plan isn't a heap
+	// scan.
+	View               *parser.SelectStmt
+	ViewColumnAliases  []string
 }
 
 // Index is one index relation in the catalog.
@@ -86,6 +99,8 @@ type Catalog interface {
 	LookupIndex(name parser.ObjectName) (*Index, bool)
 	CreateTable(name parser.ObjectName, cols []Column) (*Table, error)
 	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error)
+	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error)
+	DropView(name parser.ObjectName, ifExists bool) error
 	AddColumn(table *Table, col Column) (*Column, error)
 	DropTable(name parser.ObjectName) error
 	DropIndex(name parser.ObjectName) error
@@ -332,6 +347,64 @@ func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
 
 // DropTable removes a table from the catalog. Returns an error when
 // the name doesn't resolve.
+// CreateView installs a view in the catalog. The view is
+// registered as a Virtual Table whose `View` field carries the
+// parser SELECT for later expansion at planning time. cols
+// derive from the explicit alias list when present, otherwise
+// from the inner SELECT's target list (caller's
+// responsibility — passes already-typed []Column). orReplace
+// drops an existing same-name view first; CREATE VIEW (without
+// REPLACE) over an existing object is an error per upstream.
+func (c *InMemory) CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(name)
+	if existing, ok := c.tables[k]; ok {
+		if !orReplace {
+			return nil, fmt.Errorf("relation %q already exists", k)
+		}
+		if existing.View == nil {
+			return nil, fmt.Errorf("%q is not a view", k)
+		}
+		delete(c.tables, k)
+	}
+	for i := range cols {
+		cols[i].Ordinal = i
+	}
+	t := &Table{
+		Schema:            name.Schema,
+		Name:              name.Name,
+		Columns:           append([]Column(nil), cols...),
+		OID:               c.nextOID,
+		Virtual:           true,
+		View:              query,
+		ViewColumnAliases: append([]string(nil), aliases...),
+	}
+	c.nextOID++
+	c.tables[k] = t
+	return t, nil
+}
+
+// DropView removes a view from the catalog. Errors when the
+// name resolves to a non-view relation; respects ifExists.
+func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(name)
+	t, ok := c.tables[k]
+	if !ok {
+		if ifExists {
+			return nil
+		}
+		return fmt.Errorf("view %q does not exist", k)
+	}
+	if t.View == nil {
+		return fmt.Errorf("%q is not a view", k)
+	}
+	delete(c.tables, k)
+	return nil
+}
+
 func (c *InMemory) DropTable(name parser.ObjectName) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

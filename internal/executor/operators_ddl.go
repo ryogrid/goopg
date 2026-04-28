@@ -44,10 +44,14 @@ func (o *ddlOp) Next() (Row, error) {
 		return nil, o.execCreateTable(s)
 	case *parser.CreateIndexStmt:
 		return nil, o.execCreateIndex(s)
+	case *parser.CreateViewStmt:
+		return nil, o.execCreateView(s)
 	case *parser.DropTableStmt:
 		return nil, o.execDropTable(s)
 	case *parser.DropIndexStmt:
 		return nil, o.execDropIndex(s)
+	case *parser.DropViewStmt:
+		return nil, o.execDropView(s)
 	case *parser.TruncateStmt:
 		return nil, o.execTruncate(s)
 	case *parser.AlterTableStmt:
@@ -73,6 +77,75 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	if _, err := o.ctx.Catalog.CreateTable(s.Name, cols); err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// execCreateView registers a view in the catalog. Column
+// types default to `unknown` because v0 doesn't run the
+// type-inference pass against the inner SELECT during DDL —
+// the planner re-runs Plan() on the stored SELECT at every
+// reference, and unknown's coercion rules let the planner-
+// produced types flow into outer comparisons. The optional
+// alias-list is preserved on the catalog Table so reference
+// sites can rename columns.
+func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
+	if s.Query == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE VIEW requires a SELECT body"}
+	}
+	if !s.OrReplace {
+		if existing, ok := o.ctx.Catalog.LookupTable(s.Name); ok && existing.View == nil {
+			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
+		}
+	}
+	// Compute the column count + names. Aliases override the
+	// SELECT's target-list names; otherwise derive from the
+	// target shape — bare ColumnRef → its name, FuncCall →
+	// the function name (matches upstream's "sum" / "count"
+	// convention).
+	cols := make([]catalog.Column, 0, len(s.Query.Targets))
+	for i, tgt := range s.Query.Targets {
+		name := ""
+		if i < len(s.Columns) {
+			name = s.Columns[i]
+		} else if tgt.Alias != "" {
+			name = tgt.Alias
+		} else {
+			name = deriveTargetName(tgt.Expr)
+		}
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
+		}
+		cols = append(cols, catalog.Column{Name: name, Type: catalog.Type{Name: "unknown"}})
+	}
+	if _, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace); err != nil {
+		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// deriveTargetName picks the implicit column name for a SELECT
+// target — matches upstream's behaviour: bare ColumnRef →
+// its column name, FuncCall → function name. Anything else
+// returns "" and the caller falls back to a `?column?N`
+// placeholder.
+func deriveTargetName(e parser.Expr) string {
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		return x.Column
+	case *parser.FuncCall:
+		return x.Name.Name
+	}
+	return ""
+}
+
+// execDropView removes a view from the catalog. No relation
+// file is involved — views are virtual.
+func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
+	for _, name := range s.Names {
+		if err := o.ctx.Catalog.DropView(name, s.IfExists); err != nil {
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+		}
 	}
 	return nil
 }

@@ -381,6 +381,35 @@ type DropIndexStmt struct {
 func (s *DropIndexStmt) Pos() int  { return s.pos }
 func (s *DropIndexStmt) stmtNode() {}
 
+// CreateViewStmt — `CREATE [OR REPLACE] VIEW name [(col_list)] AS
+// <select>`. v0 stores the parsed inner SELECT in the catalog;
+// LookupTable returns the view as a Table whose VirtualRows
+// hook materialises the SELECT at query time. Required for
+// HammerDB TPC-H Q15 (`create or replace view
+// revenue$<position> (supplier_no, total_revenue) as select
+// …`).
+type CreateViewStmt struct {
+	pos       int
+	OrReplace bool
+	Name      ObjectName
+	Columns   []string // optional explicit column-name list
+	Query     *SelectStmt
+}
+
+func (s *CreateViewStmt) Pos() int  { return s.pos }
+func (s *CreateViewStmt) stmtNode() {}
+
+// DropViewStmt — `DROP VIEW [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+type DropViewStmt struct {
+	pos      int
+	IfExists bool
+	Names    []ObjectName
+	Behavior DropBehavior
+}
+
+func (s *DropViewStmt) Pos() int  { return s.pos }
+func (s *DropViewStmt) stmtNode() {}
+
 // TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
 type TruncateStmt struct {
 	pos      int

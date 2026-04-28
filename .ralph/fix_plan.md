@@ -796,7 +796,23 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
-- [ ] Views (CREATE VIEW / DROP VIEW) where HammerDB uses them.
+- [x] Views (CREATE VIEW / DROP VIEW) where HammerDB uses them.
+      (achieved 2026-04-28: `CREATE [OR REPLACE] VIEW name
+      [(col_list)] AS SELECT …` and `DROP VIEW [IF EXISTS]`
+      both parse and plan/execute end-to-end. New
+      parser.CreateViewStmt + DropViewStmt; catalog stores
+      the view's parser AST + optional column-alias list;
+      planner.planScanRangeVar substitutes the planned inner
+      SELECT at every reference (column types flow from the
+      inner plan's Output(); names from aliases or target-
+      list inference via deriveTargetName). planSelect's
+      simple-single-table fast path now also delegates to
+      planScanRangeVar so view substitution lives in one
+      place. Verified end-to-end via psql 18.3 with the
+      HammerDB Q15 shape — view + scalar subquery against
+      the view work together. DML on views and catalog
+      persistence remain deferred — see
+      `docs/design/0003-0009-views.md`.)
 - [ ] All 22 queries (Q1–Q22) execute end-to-end and produce
       result sets byte-identical (or otherwise verified-equivalent)
       to upstream PG on the same data.

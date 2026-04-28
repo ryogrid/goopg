@@ -9,14 +9,36 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return nil, err
 	}
 	unlogged := p.acceptKeyword(KwUnlogged)
+	// `OR REPLACE` is recognised here so that `CREATE OR REPLACE VIEW`
+	// dispatches into parseCreateViewTail with the flag set. Other
+	// CREATE-something forms reject OR REPLACE.
+	orReplace := false
+	if p.acceptKeyword(KwOr) {
+		if _, err := p.expectKeyword(KwReplace); err != nil {
+			return nil, err
+		}
+		orReplace = true
+	}
 	switch {
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable:
+		if orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "OR REPLACE is not valid for CREATE TABLE"}
+		}
 		p.advance()
 		return p.parseCreateTableTail(t.Pos, unlogged)
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwView:
+		if unlogged {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE VIEW"}
+		}
+		p.advance()
+		return p.parseCreateViewTail(t.Pos, orReplace)
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 		// CREATE UNIQUE INDEX …
 		if unlogged {
 			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE INDEX"}
+		}
+		if orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "OR REPLACE is not valid for CREATE INDEX"}
 		}
 		p.advance()
 		if _, err := p.expectKeyword(KwIndex); err != nil {
@@ -27,10 +49,51 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if unlogged {
 			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE INDEX"}
 		}
+		if orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "OR REPLACE is not valid for CREATE INDEX"}
+		}
 		p.advance()
 		return p.parseCreateIndexTail(t.Pos, false)
 	}
-	return nil, p.errAtCur("expected TABLE or INDEX after CREATE")
+	return nil, p.errAtCur("expected TABLE, INDEX, or VIEW after CREATE")
+}
+
+// parseCreateViewTail picks up after CREATE [OR REPLACE] VIEW.
+// Grammar: `name [(col_list)] AS <select>`.
+func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
+	stmt := &CreateViewStmt{pos: pos, OrReplace: orReplace}
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	// Optional explicit column list.
+	if p.acceptSymbol("(") {
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after view column list")
+		}
+		stmt.Columns = cols
+	}
+	if _, err := p.expectKeyword(KwAs); err != nil {
+		return nil, err
+	}
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect) {
+		return nil, p.errAtCur("expected SELECT after AS")
+	}
+	inner, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := inner.(*SelectStmt)
+	if !ok {
+		return nil, &SyntaxError{Pos: pos, Message: "view body did not produce SELECT"}
+	}
+	stmt.Query = sel
+	return stmt, nil
 }
 
 // parseCreateTableTail picks up after CREATE [UNLOGGED] TABLE.
@@ -295,8 +358,15 @@ func (p *parser) parseDrop() (Stmt, error) {
 			return nil, err
 		}
 		return &DropIndexStmt{pos: t.Pos, IfExists: ifExists, Names: names, Behavior: behavior}, nil
+	case KwView:
+		p.advance()
+		ifExists, names, behavior, err := p.parseDropTail()
+		if err != nil {
+			return nil, err
+		}
+		return &DropViewStmt{pos: t.Pos, IfExists: ifExists, Names: names, Behavior: behavior}, nil
 	}
-	return nil, p.errAtCur("expected TABLE or INDEX after DROP")
+	return nil, p.errAtCur("expected TABLE, INDEX, or VIEW after DROP")
 }
 
 // parseDropTail picks up after DROP TABLE / DROP INDEX, parsing

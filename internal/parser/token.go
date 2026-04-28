@@ -121,6 +121,8 @@ const (
 	KwElse        Keyword = "else"
 	KwExplain     Keyword = "explain"
 	KwIn          Keyword = "in"
+	KwView        Keyword = "view"
+	KwReplace     Keyword = "replace"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -212,6 +214,8 @@ var keywords = map[string]Keyword{
 	"else":        KwElse,
 	"explain":     KwExplain,
 	"in":          KwIn,
+	"view":        KwView,
+	"replace":     KwReplace,
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
 }
