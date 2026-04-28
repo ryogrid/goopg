@@ -117,6 +117,25 @@ func (p *parser) acceptSymbol(sym string) bool {
 	return false
 }
 
+// acceptIdentKeyword consumes a TokenIdent matching any of the
+// given (case-insensitive) names. Used for SQL words upstream
+// treats as unreserved keywords — `FETCH`, `FIRST`, `NEXT`,
+// `ROW`, `ROWS`, `ONLY`. Returns false (without advancing)
+// when the current token doesn't match.
+func (p *parser) acceptIdentKeyword(names ...string) bool {
+	t := p.cur()
+	if t.Kind != TokenIdent {
+		return false
+	}
+	for _, n := range names {
+		if strings.EqualFold(t.Value, n) {
+			p.advance()
+			return true
+		}
+	}
+	return false
+}
+
 // parseStatement dispatches on the leading keyword.
 func (p *parser) parseStatement() (Stmt, error) {
 	t := p.cur()

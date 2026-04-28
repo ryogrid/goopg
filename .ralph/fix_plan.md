@@ -740,7 +740,20 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       all return correct rows. Fractional-second EXTRACT and
       timestamp-timestamp interval remain deferred — see
       `docs/design/0003-0006-date-interval-arithmetic.md`.)
-- [ ] `FETCH FIRST n ROWS ONLY` as a `LIMIT` synonym.
+- [x] `FETCH FIRST n ROWS ONLY` as a `LIMIT` synonym.
+      (achieved 2026-04-28: parseSelect accepts the SQL-standard
+      `FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY` clause as an
+      alternative to LIMIT — count is optional (defaults to 1),
+      both FIRST/NEXT and ROW/ROWS spellings work, and combining
+      LIMIT with FETCH FIRST is a syntax error. Also accepts the
+      `OFFSET n {ROW | ROWS}` SQL-standard trailer (no-op). New
+      `acceptIdentKeyword` helper for the unreserved-keyword
+      idents (FETCH/FIRST/NEXT/ROW/ROWS/ONLY); `isAliasStart`
+      now rejects bare-ident "fetch" so `FROM t FETCH …` parses
+      correctly. Verified end-to-end via psql 18.3 with all
+      five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
+      shape and OFFSET … FETCH NEXT. Required for several
+      TPC-H queries.)
 - [ ] Views (CREATE VIEW / DROP VIEW) where HammerDB uses them.
 - [ ] All 22 queries (Q1–Q22) execute end-to-end and produce
       result sets byte-identical (or otherwise verified-equivalent)

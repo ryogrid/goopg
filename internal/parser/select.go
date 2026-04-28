@@ -88,6 +88,40 @@ func (p *parser) parseSelect() (Stmt, error) {
 			return nil, err
 		}
 		s.Offset = e
+		// Optional `{ROW | ROWS}` trailer per SQL standard.
+		// Both are no-ops for v0 — OFFSET applies the same way.
+		p.acceptIdentKeyword("row", "rows")
+	}
+	// SQL-standard `FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY`
+	// is accepted as a synonym for `LIMIT n`. Upstream allows it
+	// after both LIMIT and OFFSET; v0 treats it as an alternative
+	// to LIMIT — combining FETCH and LIMIT in the same SELECT is
+	// an error.
+	if p.acceptIdentKeyword("fetch") {
+		if !p.acceptIdentKeyword("first", "next") {
+			return nil, p.errAtCur("expected FIRST or NEXT after FETCH")
+		}
+		// Count is optional — `FETCH FIRST ROW ONLY` defaults to 1.
+		var count Expr
+		if !(p.cur().Kind == TokenIdent && (strings.EqualFold(p.cur().Value, "row") || strings.EqualFold(p.cur().Value, "rows"))) {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			count = e
+		} else {
+			count = &IntegerConst{pos: p.cur().Pos, Value: 1}
+		}
+		if !p.acceptIdentKeyword("row", "rows") {
+			return nil, p.errAtCur("expected ROW or ROWS after FETCH count")
+		}
+		if !p.acceptIdentKeyword("only") {
+			return nil, p.errAtCur("expected ONLY after FETCH … ROW(S) (WITH TIES is not supported in v0)")
+		}
+		if s.Limit != nil {
+			return nil, p.errAtCur("LIMIT and FETCH FIRST cannot both be specified")
+		}
+		s.Limit = count
 	}
 	if setOp, ok, err := p.parseSetOpClause(); err != nil {
 		return nil, err
@@ -341,9 +375,18 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 
 // isAliasStart returns true when the current token can plausibly begin
 // a relation alias following a from-item without an AS keyword. It
-// excludes any keyword that would start the next clause.
+// excludes any keyword that would start the next clause, and the
+// SQL-standard unreserved idents that double as clause introducers
+// (`FETCH` for `FETCH FIRST n ROWS ONLY`).
 func isAliasStart(t Token) bool {
-	if t.Kind == TokenIdent || t.Kind == TokenQuotedIdent {
+	if t.Kind == TokenIdent {
+		switch strings.ToLower(t.Value) {
+		case "fetch":
+			return false
+		}
+		return true
+	}
+	if t.Kind == TokenQuotedIdent {
 		return true
 	}
 	if t.Kind != TokenKeyword {
