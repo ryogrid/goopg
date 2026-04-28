@@ -694,6 +694,20 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 
 - [ ] Cost-based planner with cardinality estimates good enough that
       no TPC-H query degenerates to a Cartesian product.
+      (cardinality-estimation infrastructure landed
+      2026-04-28: `planner.EstimateRows(n)` flows row counts
+      bottom-up — SeqScan reads `Stats.RowCount`; Filter /
+      Limit / Sort / Project propagate child estimates; Hash
+      Join uses upstream's `|L|*|R|/max(NDistinct)`;
+      Aggregate uses NDistinct on single-column GROUP BY.
+      Surfaced via EXPLAIN's `(rows=N)` suffix; suppressed
+      for unanalysed tables. Estimates are now consumed
+      visually but NOT yet by planner decision-making —
+      hash-join build-side selection, join-order reordering,
+      and algorithm-vs-algorithm choice still use the
+      rules-based logic. Closing this bullet needs the
+      reorderer + a real cost model. See
+      `docs/design/0003-0003-statistics-and-cardinality.md`.)
 - [x] Hash join executor (`internal/executor/operators_hashjoin.go`).
       (achieved 2026-04-28: implemented in
       `internal/executor/operators_join_agg.go` (extending the

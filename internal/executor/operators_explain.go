@@ -57,7 +57,16 @@ func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row) {
 	if depth > 0 {
 		prefix = indent + "->  "
 	}
-	*rows = append(*rows, Row{Datum{Kind: KindString, String: prefix + describePlan(n)}})
+	label := prefix + describePlan(n)
+	// Append `(rows=N)` when the planner has a non-zero
+	// estimate. Zero means "no statistics yet" — leave it out
+	// rather than printing a misleading `(rows=0)` for tables
+	// that haven't been ANALYZE'd. Matches upstream's
+	// "EXPLAIN doesn't show costs without ANALYZE" behaviour.
+	if est := planner.EstimateRows(n); est > 0 {
+		label += fmt.Sprintf(" (rows=%d)", est)
+	}
+	*rows = append(*rows, Row{Datum{Kind: KindString, String: label}})
 
 	for _, c := range planChildren(n) {
 		walkPlan(b, c, depth+1, rows)
