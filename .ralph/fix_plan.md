@@ -505,7 +505,7 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       server_version) as queryable virtual tables.
 - [ ] Crash-recovery test: `SIGKILL` mid-workload, restart, verify
       committed transactions survive and in-flight ones don't.
-- [x] Design doc `m0002-0001-checkpointing.md` covering all of the
+- [x] Design doc `0002-0001-checkpointing.md` covering all of the
       above (FPI-on-first-dirty, max_wal_size volume trigger,
       spread/paced writeback, GUC surface, SQL CHECKPOINT, structural
       seams). Recovery itself was already covered in M1's
@@ -514,17 +514,28 @@ full Definition of Done. Decomposed into agent-sized chunks below.
 
 ### Concurrent B-tree (Lehman-Yao + PG modifications)
 
-- [ ] Replace global tree mutex with per-page `sync.RWMutex` latches
-      coupled with the buffer pool's existing per-slot locks.
-- [ ] Add right-sibling pointers and high keys so descents don't hold
-      parent locks (Lehman-Yao baseline).
-- [ ] Atomic page splits with crash-safe WAL records and replay.
-- [ ] Concurrent inserts, point lookups, and forward range scans
-      without the global tree lock; verified by `pgbench -c 32 -j 8`.
-- [ ] Index-only scans where the visibility map permits.
-- [ ] Vacuum integration: B-tree page deletion and recycling
-      consistent with MVCC visibility.
-- [ ] Design doc `NNNN-btree-concurrency.md`.
+Approach is staged across three landings; see
+`docs/design/0002-0002-btree-concurrency.md`.
+
+- [x] Landing 1: replace `BTree.mu` `sync.Mutex` with `sync.RWMutex`
+      so multiple Search/RangeScan calls parallelise. Inserts and
+      splits still serialise through Lock(). Per-page mutation
+      continues under `Slot.Lock()`. Verified with a goroutine-stress
+      test under `-race` and `pgbench -S -c 4 -j 2 -t 50` against a
+      live server (200/200 tx, ~18k TPS).
+- [ ] Landing 2: replace the tree-wide RWMutex with per-page
+      latches + Lehman-Yao right-link descent. Adds high keys to
+      the page format. Splits update the right-sibling pointer and
+      stamp the high key under exclusive page latches; readers that
+      "land left" on a split page recover by following op.Next.
+- [ ] Landing 3: atomic page splits with crash-safe WAL records
+      and replay. Page deletion + recycling integrated with VACUUM
+      and MVCC visibility. Index-only scans where the visibility
+      map permits. `pgbench -c 32 -j 8` mixed workload as the
+      milestone-0002 acceptance gate.
+- [x] Design doc `0002-0002-btree-concurrency.md` (draft) covers
+      all three landings, the staged rationale, and the on-disk
+      format implications.
 
 ## Milestone 0003 — HammerDB TPC-H workload
 

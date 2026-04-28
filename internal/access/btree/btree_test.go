@@ -1,6 +1,8 @@
 package btree
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -119,6 +121,50 @@ func TestRangeScan(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("got[%d] = %d, want %d", i, got[i], want[i])
 		}
+	}
+}
+
+// TestConcurrentSearchAfterInserts pins Landing 1 of milestone 0002:
+// after a tree is populated, many goroutines can call Search in
+// parallel without serialising through the global lock. The test
+// doesn't measure throughput — go test -race is the real
+// signal — but it does verify correctness under concurrency.
+func TestConcurrentSearchAfterInserts(t *testing.T) {
+	bt, _, cleanup := newTestTree(t)
+	defer cleanup()
+
+	const N = 200
+	for i := 0; i < N; i++ {
+		ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}
+		if err := bt.Insert(EncodeInt4(int32(i)), ptr); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+
+	const goroutines = 8
+	const lookupsPer = 500
+	var found atomic.Uint64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < lookupsPer; i++ {
+				key := int32(i % N)
+				_, ok, err := bt.Search(EncodeInt4(key))
+				if err != nil {
+					t.Errorf("Search(%d): %v", key, err)
+					return
+				}
+				if ok {
+					found.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if found.Load() != goroutines*lookupsPer {
+		t.Errorf("found %d/%d concurrent search hits", found.Load(), goroutines*lookupsPer)
 	}
 }
 

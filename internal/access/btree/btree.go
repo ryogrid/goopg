@@ -176,11 +176,18 @@ func CompareKeys(a, b []byte) int {
 }
 
 // BTree is the access-method handle for one index relation.
+//
+// Concurrency (Landing 1 of milestone 0002 — see
+// docs/design/0002-0002-btree-concurrency.md): mu is an RWMutex
+// so multiple Search/RangeScan callers run in parallel. Inserts,
+// splits, and metapage updates all serialise through Lock(). A
+// follow-up loop replaces this tree-wide RWMutex with per-page
+// latches and Lehman-Yao right-link descent.
 type BTree struct {
 	pool *storage.Pool
 	rel  storage.RelFileNode
 
-	mu sync.Mutex
+	mu sync.RWMutex
 }
 
 // Open returns a handle to an existing B-tree on rel. Validates the
@@ -600,9 +607,15 @@ func resetPageItems(p storage.Page) {
 }
 
 // Search returns the heap pointer associated with key, if any.
+//
+// Search holds a shared (RLock) latch on the tree for the duration
+// of the descent + leaf scan, so concurrent Searches parallelise
+// while Inserts continue to serialise. Page bytes are protected
+// against torn reads by the buffer-pool's per-slot RLock taken
+// transiently inside pageItems via Pin/Unpin.
 func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
-	bt.mu.Lock()
-	defer bt.mu.Unlock()
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
 
 	leafBlk, _, err := bt.descendToLeaf(key)
 	if err != nil {
@@ -629,9 +642,15 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 // RangeScan invokes fn for every (key, ptr) pair where lo ≤ key ≤ hi.
 // fn returning false stops the scan; the returned error from fn aborts
 // with that error.
+//
+// Like Search, RangeScan holds an RLock so concurrent scans
+// parallelise. fn is invoked while no buffer-pool latches are
+// held (the page is unpinned between the read of items and the
+// callback) so callers may issue further btree operations from
+// within fn without deadlocking.
 func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
-	bt.mu.Lock()
-	defer bt.mu.Unlock()
+	bt.mu.RLock()
+	defer bt.mu.RUnlock()
 
 	cur, _, err := bt.descendToLeaf(lo)
 	if err != nil {

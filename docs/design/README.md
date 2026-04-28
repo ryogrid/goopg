@@ -6,8 +6,10 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 ## Conventions
 
-- Filenames use the form `MMMM-NNNN-short-slug.md`, where `MMMM` is milestone identifier, `NNNN` is a zero-padded
-  sequence number assigned at creation time and never reused.
+- Filenames use the form `root-NNNN-short-slug.md`, where `NNNN` is a
+  zero-padded global sequence number assigned at creation time and never reused.
+- Reserve a concrete filename before implementation work starts; do not
+  leave `NNNN-*` placeholders in active plans.
 - Each doc opens with a short metadata block: status, date, supersedes.
 - Status values: `draft`, `accepted`, `superseded`, `historical`.
 - When a new doc supersedes an older one, mark the older doc
@@ -36,6 +38,7 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | root-0013 | [Extended Query Protocol (v0)](root-0013-extended-query-protocol.md) | accepted | Parse/Bind/Describe/Execute/Sync state machine, per-connection statement+portal caches, and SQLSTATE/error choreography. |
 | root-0014 | [COPY FROM/TO (v0)](root-0014-copy.md) | accepted | COPY wire-mode state machine, text/binary framing seam, and integration points with executor insert/scan paths. |
 | root-0017 | [Data Directory and Server Bootstrap (v0)](root-0017-data-directory.md) | accepted | `goopg init` directory layout (PG_VERSION, base/global/pg_wal/pg_xact, sample conf files); `initdb.Open` runtime bundle; deferred items (on-disk catalog, pg_control). |
-| m0002-0001 | [Checkpointing (M0002)](m0002-0001-checkpointing.md) | accepted | Production-grade checkpointer: GUCs (`checkpoint_timeout`, `checkpoint_completion_target`, `max_wal_size`, `min_wal_size`, `full_page_writes`), max_wal_size volume trigger, spread/paced writeback, full-page-image WAL records on first dirty per epoch, SQL `CHECKPOINT` verb. |
+| 0002-0001 | [Checkpointing (M0002)](0002-0001-checkpointing.md) | accepted | Production-grade checkpointer: GUCs (`checkpoint_timeout`, `checkpoint_completion_target`, `max_wal_size`, `min_wal_size`, `full_page_writes`), max_wal_size volume trigger, spread/paced writeback, full-page-image WAL records on first dirty per epoch, SQL `CHECKPOINT` verb. |
+| 0002-0002 | [Concurrent B-tree (M0002)](0002-0002-btree-concurrency.md) | draft | Three-landing plan to remove the global B-tree mutex: Landing 1 RWMutex (read parallelism, this loop), Landing 2 per-page latches + Lehman-Yao right-link descent, Landing 3 atomic split WAL + page deletion. |
 
 Append new rows in numeric order. Do not reorder.
