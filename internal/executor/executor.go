@@ -40,6 +40,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return newSortOp(p, child), nil
 	case *planner.SeqScan:
 		return newSeqScanOp(p), nil
+	case *planner.IndexScan:
+		return newIndexScanOp(p), nil
 	case *planner.Insert:
 		child, err := Build(p.Source)
 		if err != nil {

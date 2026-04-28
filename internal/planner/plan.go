@@ -133,6 +133,19 @@ type SeqScan struct {
 func (n *SeqScan) Pos() int       { return n.pos }
 func (n *SeqScan) Output() Schema { return n.schema }
 
+// IndexScan probes a single-column B-tree index with an equality key.
+// v0 supports only `col = const` / `col = $N` shapes.
+type IndexScan struct {
+	pos    int
+	Table  *catalog.Table
+	Index  *catalog.Index
+	Key    Expr
+	schema Schema
+}
+
+func (n *IndexScan) Pos() int       { return n.pos }
+func (n *IndexScan) Output() Schema { return n.schema }
+
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
 	pos       int

@@ -83,6 +83,48 @@ func TestPlanPgbenchSelect(t *testing.T) {
 	}
 }
 
+func TestPlanPgbenchSelectUsesIndexScanRule(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_aid_idx"}, tbl, []string{"aid"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		sql      string
+		wantExpr string
+	}{
+		{sql: "SELECT abalance FROM pgbench_accounts WHERE aid = $1", wantExpr: "param"},
+		{sql: "SELECT abalance FROM pgbench_accounts WHERE 1 = aid", wantExpr: "int"},
+	}
+	for _, tc := range tests {
+		node, err := Plan(parseOne(t, tc.sql), cat)
+		if err != nil {
+			t.Fatalf("Plan(%q): %v", tc.sql, err)
+		}
+		proj, ok := node.(*Project)
+		if !ok {
+			t.Fatalf("Plan(%q) root=%T want *Project", tc.sql, node)
+		}
+		idx, ok := proj.Child.(*IndexScan)
+		if !ok {
+			t.Fatalf("Plan(%q) child=%T want *IndexScan", tc.sql, proj.Child)
+		}
+		if idx.Index.Name != "pgbench_accounts_aid_idx" {
+			t.Fatalf("index=%q want pgbench_accounts_aid_idx", idx.Index.Name)
+		}
+		switch tc.wantExpr {
+		case "param":
+			if _, ok := idx.Key.(*ParamRef); !ok {
+				t.Fatalf("key expr=%T want *ParamRef", idx.Key)
+			}
+		case "int":
+			if _, ok := idx.Key.(*IntegerConst); !ok {
+				t.Fatalf("key expr=%T want *IntegerConst", idx.Key)
+			}
+		}
+	}
+}
+
 // TestPlanSelectStarExpansion verifies SELECT * expands to the full
 // column list and the Project's output schema reflects the table.
 func TestPlanSelectStarExpansion(t *testing.T) {

@@ -236,8 +236,11 @@ unchecked item unless a dependency forces a different order.
       errors (42P01, 42703, 42601, 0A000). pgbench's three load-bearing
       DML queries plus SELECT *, BEGIN, DROP TABLE, and VACUUM ANALYZE
       all plan end-to-end.
-- [ ] Planner: index-scan rule (`col = const` / `col = $N` against a
-      btree-indexed column).
+- [x] Planner: index-scan rule (`col = const` / `col = $N` against a
+      btree-indexed column). Planner now emits `IndexScan` when a
+      single-column btree index exists for an equality predicate;
+      executor opens the btree and probes by encoded int4 key
+      (`const` and `$N` forms, including commuted `const = col`).
 - [ ] Planner: multi-table FROM, joins, GROUP BY/HAVING, aggregates
       (extends the single-relation v0 once the executor side is in).
 - [ ] Executor with the operators the planner emits.

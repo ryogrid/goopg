@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -116,11 +117,17 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	scan := &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	var node Node = scan
 	if s.Where != nil {
-		pred, err := resolveExpr(s.Where, ctx)
-		if err != nil {
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
 			return nil, err
+		} else if ok {
+			node = idxNode
+		} else {
+			pred, err := resolveExpr(s.Where, ctx)
+			if err != nil {
+				return nil, err
+			}
+			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 		}
-		node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 	}
 	if len(s.OrderBy) > 0 {
 		keys := make([]SortKey, 0, len(s.OrderBy))
@@ -156,6 +163,74 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		return nil, err
 	}
 	return &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}, nil
+}
+
+func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	b, ok := where.(*parser.BinaryOp)
+	if !ok || b.Op != "=" {
+		return nil, false, nil
+	}
+	leftCol, lIsCol := b.Left.(*parser.ColumnRef)
+	rightCol, rIsCol := b.Right.(*parser.ColumnRef)
+	if lIsCol == rIsCol {
+		return nil, false, nil
+	}
+
+	var colRef *parser.ColumnRef
+	var keyExpr parser.Expr
+	if lIsCol {
+		colRef = leftCol
+		keyExpr = b.Right
+	} else {
+		colRef = rightCol
+		keyExpr = b.Left
+	}
+
+	resolvedCol, err := resolveColumnRef(colRef, ctx)
+	if err != nil {
+		return nil, false, nil
+	}
+	col, ok := resolvedCol.(*ColumnRef)
+	if !ok {
+		return nil, false, nil
+	}
+
+	resolvedKey, err := resolveExpr(keyExpr, ctx)
+	if err != nil {
+		return nil, false, nil
+	}
+	switch resolvedKey.(type) {
+	case *IntegerConst, *ParamRef:
+	default:
+		return nil, false, nil
+	}
+
+	idx := findBTreeIndexForColumn(cat, ctx.table, col.Name)
+	if idx == nil {
+		return nil, false, nil
+	}
+	return &IndexScan{
+		pos:    where.Pos(),
+		Table:  ctx.table,
+		Index:  idx,
+		Key:    resolvedKey,
+		schema: ctx.schema,
+	}, true, nil
+}
+
+func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string) *catalog.Index {
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if strings.ToLower(idx.Method) != "btree" {
+			continue
+		}
+		if len(idx.Columns) != 1 {
+			continue
+		}
+		if idx.Columns[0] == col {
+			return idx
+		}
+	}
+	return nil
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
