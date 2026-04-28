@@ -815,20 +815,30 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		if next.Kind != TokenStringLit {
 			return nil, false
 		}
+		// Form 1: `interval '<N>' <unit>` — three tokens with the
+		// unit as a trailing identifier. v0's original shape.
 		unitTok := p.peek(2)
-		if unitTok.Kind != TokenIdent {
-			return nil, false
+		if unitTok.Kind == TokenIdent {
+			unit := strings.ToLower(identText(unitTok))
+			switch unit {
+			case "day", "days", "month", "months", "year", "years":
+				canonical := strings.TrimSuffix(unit, "s")
+				p.advance() // INTERVAL
+				strTok := p.advance()
+				p.advance() // unit
+				return &IntervalLit{pos: t.Pos, Value: strTok.Value, Unit: canonical}, true
+			}
 		}
-		unit := strings.ToLower(identText(unitTok))
-		switch unit {
-		case "day", "days", "month", "months", "year", "years":
-			// Normalise plural→singular so the executor
-			// only sees three unit values.
-			canonical := strings.TrimSuffix(unit, "s")
+		// Form 2: `interval '<N> <unit>'` — two tokens with the
+		// unit embedded in the string literal. HammerDB's TPC-H
+		// query templates use this form (e.g.
+		// `interval '90 day'`, `interval '1 year'`,
+		// `interval '3 month'`). Parse the string body so
+		// downstream IntervalLit handling stays unchanged.
+		if v, u, ok := splitEmbeddedInterval(next.Value); ok {
 			p.advance() // INTERVAL
-			strTok := p.advance()
-			p.advance() // unit
-			return &IntervalLit{pos: t.Pos, Value: strTok.Value, Unit: canonical}, true
+			p.advance() // string literal
+			return &IntervalLit{pos: t.Pos, Value: v, Unit: u}, true
 		}
 	}
 	return nil, false
@@ -861,6 +871,35 @@ func (p *parser) parseExistsExpr(negated bool) (Expr, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "EXISTS subquery did not produce SELECT"}
 	}
 	return &ExistsExpr{pos: pos, Negated: negated, Subquery: sel}, nil
+}
+
+// splitEmbeddedInterval parses a SQL interval literal body where
+// the magnitude and unit share a single string literal:
+//
+//	"90 day"    → ("90", "day", true)
+//	"1 year"    → ("1", "year", true)
+//	"3 months"  → ("3", "month", true)
+//	"-1 day"    → ("-1", "day", true)
+//
+// HammerDB's TPC-H query templates use this form (Q1's
+// `interval ':1 day'` after parameter substitution becomes
+// `interval '90 day'`; Q5/Q6 use `interval '1 year'`; Q4 uses
+// `interval '3 month'`). Whitespace tolerance and the
+// plural-to-singular normalisation match the trailing-unit form
+// so downstream IntervalLit handling stays uniform. Returns
+// false for any string that doesn't decompose cleanly so the
+// caller can fall back to non-typed-literal parsing.
+func splitEmbeddedInterval(body string) (string, string, bool) {
+	parts := strings.Fields(strings.TrimSpace(body))
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	num, unit := parts[0], strings.ToLower(parts[1])
+	switch unit {
+	case "day", "days", "month", "months", "year", "years":
+		return num, strings.TrimSuffix(unit, "s"), true
+	}
+	return "", "", false
 }
 
 // parseInTail consumes the right side of `expr [NOT] IN (...)`

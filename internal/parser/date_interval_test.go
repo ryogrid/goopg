@@ -54,6 +54,41 @@ func TestDateMinusIntervalParses(t *testing.T) {
 	}
 }
 
+// TestParseIntervalEmbeddedUnit pins the SQL-standard form
+// `interval '<N> <unit>'` where the magnitude and unit share a
+// single string literal. HammerDB's TPC-H templates emit this
+// shape: Q1's `interval ':1 day'` becomes `interval '90 day'`
+// after parameter substitution; Q5/Q6 use `interval '1 year'`;
+// Q4 uses `interval '3 month'`. The IntervalLit produced is
+// indistinguishable from the trailing-unit form so downstream
+// passes don't need to learn about the embedded variant.
+func TestParseIntervalEmbeddedUnit(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantVal  string
+		wantUnit string
+	}{
+		{"SELECT interval '90 day' FROM t", "90", "day"},
+		{"SELECT interval '90 days' FROM t", "90", "day"},
+		{"SELECT interval '3 month' FROM t", "3", "month"},
+		{"SELECT interval '3 months' FROM t", "3", "month"},
+		{"SELECT interval '1 year' FROM t", "1", "year"},
+		{"SELECT interval '1 years' FROM t", "1", "year"},
+		{"SELECT interval '-1 day' FROM t", "-1", "day"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("Parse(%q): %v", tc.sql, err)
+			continue
+		}
+		iv := stmts[0].(*SelectStmt).Targets[0].Expr.(*IntervalLit)
+		if iv.Value != tc.wantVal || iv.Unit != tc.wantUnit {
+			t.Errorf("%q: got (val=%q, unit=%q), want (val=%q, unit=%q)", tc.sql, iv.Value, iv.Unit, tc.wantVal, tc.wantUnit)
+		}
+	}
+}
+
 // TestParseExtractExpr pins the TPC-H Q7/Q8/Q9 shape:
 // `EXTRACT(year FROM o_orderdate)` parses to ExtractExpr
 // with the lower-cased field name.

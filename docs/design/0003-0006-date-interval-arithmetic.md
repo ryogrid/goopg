@@ -59,15 +59,27 @@ type names that double as literal-prefix sugar).
 
 ### Interval literal: integer + single unit
 
-`interval 'N' unit` is the only interval form we accept in v0.
+`interval 'N' unit` (Form 1, trailing-unit) and
+`interval '<N> <unit>'` (Form 2, embedded-unit) both produce
+the same AST node. HammerDB's TPC-H query templates emit Form 2
+— Q1's `interval ':1 day'` becomes `interval '90 day'` after
+parameter substitution; Q4 uses `interval '3 month'`; Q5/Q6/Q12
+use `interval '1 year'` — so v0 has to accept both shapes for
+the upstream queries to parse without source rewrites. The
+parser tries Form 1 first (peek-2 ident); on miss it splits the
+string-literal body via `splitEmbeddedInterval` and falls back
+to Form 2.
+
 Recognised units are day(s), month(s), year(s); plurals
 normalise to singular. Sub-day units (hour/minute/second),
-multi-field intervals (`'1 day 5 hours'`), and negative
-literals are deferred. v0 covers what HammerDB's TPC-H actually
-uses.
+multi-field intervals (`'1 day 5 hours'`), and the SQL-standard
+`INTERVAL [+|-] '<N>' YEAR TO MONTH`-style qualifiers are
+deferred. v0 covers what HammerDB's TPC-H actually uses.
 
 `parser.IntervalLit{Value, Unit}` carries the parsed parts
 verbatim; the executor parses `Value` to int32 at evaluation.
+Negative magnitudes parse fine — `splitEmbeddedInterval`
+preserves the leading `-` so `interval '-1 day'` round-trips.
 
 ### Datum: KindInterval with months + days fields
 

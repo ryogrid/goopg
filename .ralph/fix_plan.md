@@ -945,8 +945,14 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       int8. Verified end-to-end via psql 18.3: TPC-H Q1's
       date-arithmetic filter, Q4/Q5/Q6's range shape, and
       Q7's `WHERE extract(year FROM o_orderdate) = 1995`
-      all return correct rows. Fractional-second EXTRACT and
-      timestamp-timestamp interval remain deferred — see
+      all return correct rows. Embedded-unit interval form
+      (`interval '90 day'`, `interval '1 year'`,
+      `interval '3 month'`) added 2026-04-29 since HammerDB's
+      TPC-H templates emit that shape after parameter
+      substitution; both Form 1 (`interval '90' day`) and Form 2
+      (`interval '90 day'`) now produce identical IntervalLit
+      AST. Fractional-second EXTRACT and timestamp-timestamp
+      interval remain deferred — see
       `docs/design/0003-0006-date-interval-arithmetic.md`.)
 - [x] `FETCH FIRST n ROWS ONLY` as a `LIMIT` synonym.
       (achieved 2026-04-28: parseSelect accepts the SQL-standard
