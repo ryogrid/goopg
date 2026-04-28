@@ -777,10 +777,13 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       cost model only needs NDistinct for the
       `|A|*|B|/max(NDistinct(A.k), NDistinct(B.k))` join-
       cardinality estimate.)
-- [ ] Design docs: `0003-0001-planner-overview.md` (extend M1's
+- [x] Design docs: `0003-0001-planner-overview.md` (extend M1's
       `root-0011-planner.md`), `0003-0002-join-executors.md`,
       `0003-0003-statistics-and-cardinality.md`,
       `0003-0004-hammerdb-tpch-integration.md`.
+      (achieved 2026-04-29: added `0003-0001` as the M0003 planner
+      entry point; refreshed `0003-0002` for merge-join landing and
+      updated the design index summaries.)
 
 ### Query coverage (incremental)
 
