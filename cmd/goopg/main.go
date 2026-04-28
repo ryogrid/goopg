@@ -140,10 +140,30 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		Address: *addr,
 		Logger:  logger,
 	}
+
+	// Build the GUC registry up front so server-context settings
+	// (shared_buffers, etc.) are available before Open allocates the
+	// buffer pool. Without a config file this is just the seeded
+	// defaults; with one we apply the file's entries on top.
+	registry := config.BuildDefaultRegistry()
+	if *confPath != "" {
+		entries, err := config.ParseConfigFile(*confPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+		if err := registry.ApplyConfigEntries(entries); err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+		cfg.Registry = registry
+		logger.Info("loaded postgresql.conf", "path", *confPath, "entries", len(entries))
+	}
 	var rt *initdb.Runtime
 	if *dataDir != "" {
+		poolSlots := poolSlotsFromGUC(registry)
 		var err error
-		rt, err = initdb.Open(initdb.OpenOptions{DataDir: *dataDir})
+		rt, err = initdb.Open(initdb.OpenOptions{DataDir: *dataDir, PoolSlots: poolSlots})
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
@@ -162,21 +182,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.TxnMgr = rt.TxnMgr
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.DataDir = rt.DataDir
-		logger.Info("opened data directory", "path", rt.DataDir)
-	}
-	if *confPath != "" {
-		entries, err := config.ParseConfigFile(*confPath)
-		if err != nil {
-			fmt.Fprintf(stderr, "goopg start: %v\n", err)
-			return 1
-		}
-		registry := config.BuildDefaultRegistry()
-		if err := registry.ApplyConfigEntries(entries); err != nil {
-			fmt.Fprintf(stderr, "goopg start: %v\n", err)
-			return 1
-		}
-		cfg.Registry = registry
-		logger.Info("loaded postgresql.conf", "path", *confPath, "entries", len(entries))
+		logger.Info("opened data directory", "path", rt.DataDir, "shared_buffers_slots", poolSlots)
 	}
 	if *hbaPath != "" {
 		policy, err := auth.ParseHBAFile(*hbaPath)
@@ -247,6 +253,31 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// poolSlotsFromGUC reads the shared_buffers GUC (canonical KB) and
+// converts it to a buffer-pool slot count. shared_buffers/8 because
+// each slot is BlockSize=8 KB. Returns 0 (which Open treats as "use
+// default") if the GUC isn't present, isn't parseable, or yields a
+// non-positive count — the registry guarantees a value at boot, so
+// the fallback is purely defensive.
+func poolSlotsFromGUC(registry *config.Registry) int {
+	if registry == nil {
+		return 0
+	}
+	v, ok := registry.Get("shared_buffers")
+	if !ok {
+		return 0
+	}
+	kb, err := strconv.Atoi(v.Display())
+	if err != nil || kb <= 0 {
+		return 0
+	}
+	slots := kb / 8
+	if slots <= 0 {
+		return 0
+	}
+	return slots
 }
 
 func runStop(args []string, stdout, stderr io.Writer) int {

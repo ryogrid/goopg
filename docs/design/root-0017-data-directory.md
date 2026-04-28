@@ -100,15 +100,21 @@ disk and the four runtime handles a goopg server needs. It:
    The version match is intentionally strict so a binary upgrade
    can't silently corrupt a stale directory.
 3. Constructs `storage.Manager` rooted at the data directory,
-   `storage.Pool` of `PoolSlots` buffers (default 1024), an
-   `mvcc.Manager`, and an empty `catalog.NewInMemory()`.
+   `storage.Pool` of `PoolSlots` buffers (default 16384, i.e. 128
+   MB at BlockSize=8 KB — matching upstream PostgreSQL's
+   `shared_buffers` boot default), an `mvcc.Manager`, and an empty
+   `catalog.NewInMemory()`.
 4. Returns a `Runtime` bundle whose `Close()` releases pool +
    smgr in order and is idempotent.
 
 `cmd/goopg start -D <dir>` calls `initdb.Open` and forwards the
-four handles into `Server.Config.{Catalog,Pool,TxnMgr}`. With
-those set, the wire layer routes COPY (and, in future loops, every
-other table-touching statement) through parser→planner→executor.
+four handles into `Server.Config.{Catalog,Pool,TxnMgr}`. The CLI
+also derives `OpenOptions.PoolSlots` from the `shared_buffers` GUC
+(parsed from `postgresql.conf` if `--config` is supplied, otherwise
+the seeded default of 128 MB) so operators can size the buffer
+pool the same way they size upstream's. With those handles set,
+the wire layer routes COPY (and, in future loops, every other
+table-touching statement) through parser→planner→executor.
 Without `-D`, the server still runs in the protocol-only fallback
 mode — useful for the pure-protocol smoke tests and for the early
 authentication/configuration loops that don't need storage.

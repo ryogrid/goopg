@@ -117,6 +117,20 @@ func BuildDefaultRegistry() *Registry {
 		Scope: ScopeSession,
 	}))
 
+	// shared_buffers sizes the buffer pool. Upstream's default is 128
+	// MB; goopg matches that so cmd/goopg start with no postgresql.conf
+	// behaves like upstream initdb does. The native unit is KB (matches
+	// postgres/src/backend/utils/misc/guc_tables.c GUC_UNIT_KB), so the
+	// canonical value is the KB count and Display() returns it as a
+	// bare integer. cmd/goopg derives PoolSlots from this at server
+	// start: slots = sharedBuffersKB / (BlockSize/1024) = KB / 8.
+	r.MustRegister(NewVariable(Variable{
+		Name: "shared_buffers", Type: TypeInt, Unit: UnitKB, BootVal: "128MB",
+		MinVal: 128, MaxVal: 1 << 40,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// WAL & checkpointer GUCs (milestone 0002). Names, units, ranges,
 	// and defaults mirror upstream's
 	// postgres/src/backend/utils/misc/guc_tables.c entries.

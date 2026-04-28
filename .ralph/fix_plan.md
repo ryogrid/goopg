@@ -702,17 +702,21 @@ clone at `./HammerDB/`; TPC-H schema + queries under
             `0ca733a`.
       - M0003 loader verification at SF1 is partially complete: Docker
             HammerDB `buildschema` now reaches the data-load phase.
-      - Current observed blocker during SF1 load:
-            `ERROR: no available buffer (all pinned)`.
-      - Local WIP exists (not committed yet) for loader stabilisation:
-            - `internal/server/dispatch.go`: compatibility no-op command tags
-                  for role/database DDL used by HammerDB bootstrap SQL.
-            - `internal/storage/bufpool.go`: clock-sweep victim-search bound
-                  widened to avoid false `ErrNoBuffer` under high usage counts.
-            - `internal/storage/storage_test.go`: regression test
-                  `TestPoolEvictHighUsageDoesNotSpuriouslyExhaust`.
-      - Keep the above WIP changes unstaged until SF1 `buildschema`
-            passes end-to-end.
+      - Loader-stabilisation WIP from the prior loop is now committed in
+            `f20a891` (`server/storage: harden HammerDB path and bufpool
+            eviction`): role/database/grant DDL no-op command tags +
+            clock-sweep bound widened to N*(maxUsageCount+1) +
+            `TestPoolEvictHighUsageDoesNotSpuriouslyExhaust`.
+      - Buffer-pool sizing now flows from the `shared_buffers` GUC
+            (this loop): `BuildDefaultRegistry` registers
+            `shared_buffers` with the upstream-aligned 128 MB default,
+            `cmd/goopg start` parses the postgresql.conf entry first
+            and feeds `OpenOptions.PoolSlots = sharedBuffersKB / 8`
+            into `initdb.Open`. The `initdb.Open` default also moved
+            from 1024 to 16384 slots so a no-config run matches
+            upstream. SF1 buildschema retry should now use
+            `shared_buffers = 256MB` or higher in the conf file rather
+            than relying on the old 8 MB default.
 
 - Docker HammerDB verification procedure (SF1):
 

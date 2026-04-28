@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/config"
 )
 
 // TestNoArgsPrintsUsage guards the contract from
@@ -104,5 +106,43 @@ func TestInitCommandRequiresD(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "-D") {
 		t.Errorf("stderr=%q want a -D diagnostic", stderr.String())
+	}
+}
+
+// TestPoolSlotsFromGUC pins the postgresql.conf -> shared_buffers ->
+// PoolSlots wiring so a future loop can't silently drop the override.
+// Default 128MB matches upstream PostgreSQL boot. 32 MB / 8 KB per
+// page = 4096 slots; the conversion is exercised end-to-end via the
+// canonical KB display form.
+func TestPoolSlotsFromGUC(t *testing.T) {
+	cases := []struct {
+		name string
+		set  string // value to Set; empty means leave at boot default
+		want int
+	}{
+		{name: "boot default 128MB", want: 16384},
+		{name: "32MB override", set: "32MB", want: 4096},
+		{name: "256MB override", set: "256MB", want: 32768},
+		{name: "8MB override", set: "8MB", want: 1024},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := config.BuildDefaultRegistry()
+			if c.set != "" {
+				if err := r.Set("shared_buffers", c.set, config.SourceConfigFile); err != nil {
+					t.Fatalf("Set shared_buffers=%q: %v", c.set, err)
+				}
+			}
+			got := poolSlotsFromGUC(r)
+			if got != c.want {
+				t.Errorf("poolSlotsFromGUC = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestPoolSlotsFromGUC_NilRegistry(t *testing.T) {
+	if got := poolSlotsFromGUC(nil); got != 0 {
+		t.Errorf("nil registry: got %d, want 0 (Open uses default)", got)
 	}
 }

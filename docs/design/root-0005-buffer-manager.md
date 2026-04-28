@@ -99,8 +99,12 @@ size in blocks.
 
 ### Buffer manager
 
-The pool is a slice of `slot`s, sized at construction (`shared_buffers`
-GUC arrives later; v0 takes a `Slots int` config knob).
+The pool is a slice of `slot`s, sized at construction. The size
+flows from the `shared_buffers` GUC: `cmd/goopg start` reads the
+canonical KB value out of the registry (default 128 MB, matching
+upstream) and passes `slots = KB / 8` into `initdb.OpenOptions.
+PoolSlots`. Tests that build a pool directly still pass an
+explicit `Slots int`.
 
 ```go
 type slot struct {

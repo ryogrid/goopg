@@ -44,8 +44,11 @@ type OpenOptions struct {
 	DataDir string
 
 	// PoolSlots is the number of buffer pool slots to allocate.
-	// Defaults to 1024 when zero, matching upstream's boot-time
-	// shared_buffers floor.
+	// Defaults to 16384 when zero (128 MB at BlockSize=8 KB), which
+	// matches upstream PostgreSQL's `shared_buffers` boot default.
+	// cmd/goopg start derives this from the shared_buffers GUC so
+	// postgresql.conf overrides flow through; tests pass an explicit
+	// small value.
 	PoolSlots int
 
 	// AlignedIO forwards through to storage.ManagerConfig.AlignedIO.
@@ -76,7 +79,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	slots := opts.PoolSlots
 	if slots <= 0 {
-		slots = 1024
+		slots = 16384
 	}
 
 	mgr := storage.NewManager(storage.ManagerConfig{
