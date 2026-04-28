@@ -1,0 +1,166 @@
+package executor
+
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
+)
+
+func runTransactionStmt(t *testing.T, ctx *Context, sql string) error {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", sql, err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Parse(%q): got %d statements", sql, len(stmts))
+	}
+	plan, err := planner.Plan(stmts[0], catalog.NewInMemory())
+	if err != nil {
+		t.Fatalf("Plan(%q): %v", sql, err)
+	}
+	op, err := Build(plan)
+	if err != nil {
+		t.Fatalf("Build(%q): %v", sql, err)
+	}
+	_, err = Run(op, ctx)
+	return err
+}
+
+func TestTransactionBeginCommitLifecycle(t *testing.T) {
+	ctx := NewContext()
+	ctx.TxnMgr = mvcc.NewManager()
+	sess := NewBasicSession()
+	ctx.Session = sess
+
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if !sess.InExplicitTransaction() {
+		t.Fatal("session should be in explicit transaction after BEGIN")
+	}
+	if ctx.TxnMgr.ActiveCount() != 1 {
+		t.Fatalf("active count=%d want=1", ctx.TxnMgr.ActiveCount())
+	}
+	tx, snap, ok := sess.CurrentTransaction()
+	if !ok {
+		t.Fatal("CurrentTransaction should be set after BEGIN")
+	}
+	if tx.XID == 0 {
+		t.Fatal("xid must be allocated")
+	}
+	if !snap.HasInProgress(tx.XID) {
+		t.Fatalf("snapshot should include current xid=%d", tx.XID)
+	}
+	if ctx.Tx.XID != tx.XID {
+		t.Fatalf("ctx.Tx=%d want=%d", ctx.Tx.XID, tx.XID)
+	}
+
+	if err := runTransactionStmt(t, ctx, "COMMIT"); err != nil {
+		t.Fatalf("COMMIT: %v", err)
+	}
+	if sess.InExplicitTransaction() {
+		t.Fatal("session should exit explicit transaction after COMMIT")
+	}
+	if ctx.TxnMgr.ActiveCount() != 0 {
+		t.Fatalf("active count=%d want=0", ctx.TxnMgr.ActiveCount())
+	}
+	if ctx.Tx.XID != 0 {
+		t.Fatalf("ctx.Tx should be cleared, got xid=%d", ctx.Tx.XID)
+	}
+
+	// COMMIT outside a transaction is a no-op.
+	if err := runTransactionStmt(t, ctx, "COMMIT"); err != nil {
+		t.Fatalf("COMMIT outside tx: %v", err)
+	}
+}
+
+func TestTransactionRollbackLifecycle(t *testing.T) {
+	ctx := NewContext()
+	ctx.TxnMgr = mvcc.NewManager()
+	ctx.Session = NewBasicSession()
+
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if err := runTransactionStmt(t, ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK: %v", err)
+	}
+	if ctx.TxnMgr.ActiveCount() != 0 {
+		t.Fatalf("active count=%d want=0", ctx.TxnMgr.ActiveCount())
+	}
+	if ctx.Session.InExplicitTransaction() {
+		t.Fatal("session should not remain in explicit tx after ROLLBACK")
+	}
+
+	// ROLLBACK outside a transaction is a no-op.
+	if err := runTransactionStmt(t, ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK outside tx: %v", err)
+	}
+}
+
+func TestTransactionBeginInsideTransactionIsNoOp(t *testing.T) {
+	ctx := NewContext()
+	ctx.TxnMgr = mvcc.NewManager()
+	sess := NewBasicSession()
+	ctx.Session = sess
+
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN 1: %v", err)
+	}
+	tx1, _, ok := sess.CurrentTransaction()
+	if !ok {
+		t.Fatal("expected active transaction after first BEGIN")
+	}
+
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN 2: %v", err)
+	}
+	tx2, _, ok := sess.CurrentTransaction()
+	if !ok {
+		t.Fatal("expected active transaction after second BEGIN")
+	}
+	if tx1.XID != tx2.XID {
+		t.Fatalf("nested BEGIN should keep xid, got %d then %d", tx1.XID, tx2.XID)
+	}
+	if ctx.TxnMgr.ActiveCount() != 1 {
+		t.Fatalf("active count=%d want=1", ctx.TxnMgr.ActiveCount())
+	}
+}
+
+func TestTransactionBeginUsesSessionIsolation(t *testing.T) {
+	ctx := NewContext()
+	ctx.TxnMgr = mvcc.NewManager()
+	sess := NewBasicSession()
+	if err := sess.SetIsolationLevel(mvcc.IsolationRepeatableRead); err != nil {
+		t.Fatal(err)
+	}
+	ctx.Session = sess
+
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	tx, _, ok := sess.CurrentTransaction()
+	if !ok {
+		t.Fatal("expected active transaction after BEGIN")
+	}
+	if tx.Isolation != mvcc.IsolationRepeatableRead {
+		t.Fatalf("tx isolation=%v want=%v", tx.Isolation, mvcc.IsolationRepeatableRead)
+	}
+}
+
+func TestTransactionRequiresContextHooks(t *testing.T) {
+	ctx := NewContext()
+	ctx.TxnMgr = mvcc.NewManager()
+	err := runTransactionStmt(t, ctx, "BEGIN")
+	if err == nil {
+		t.Fatal("expected BEGIN to fail without Session")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "XX000" {
+		t.Fatalf("err=%v want ExecError XX000", err)
+	}
+}

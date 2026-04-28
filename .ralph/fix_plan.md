@@ -275,8 +275,12 @@ unchecked item unless a dependency forces a different order.
   - [ ] DDL operator path: CREATE INDEX / DROP INDEX / ALTER TABLE
         wired through the B-tree + catalog (deferred — needs catalog
         index metadata first).
-  - [ ] Transaction operator: BEGIN/COMMIT/ROLLBACK plumbed to
-        `mvcc.Manager` and per-session state.
+  - [x] Transaction operator: BEGIN/COMMIT/ROLLBACK plumbed to
+        `mvcc.Manager` and per-session state. `internal/executor`
+        now has `transactionOp` + `Session` abstraction
+        (`BasicSession`), with BEGIN allocating xid/snapshot,
+        COMMIT/ROLLBACK finishing the active xid, nested BEGIN as
+        no-op, and explicit-tx lifecycle tests.
 - [ ] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.

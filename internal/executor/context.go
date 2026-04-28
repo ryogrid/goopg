@@ -31,6 +31,14 @@ type Context struct {
 	TxnMgr  *mvcc.Manager
 	Tx      mvcc.Transaction
 	Snap    mvcc.Snapshot
+
+	// Session, if set, is consulted by the Transaction operator to
+	// drive BEGIN/COMMIT/ROLLBACK. It also tracks whether the current
+	// statement is running inside an explicit transaction block. The
+	// wire-protocol path provides a per-connection implementation;
+	// tests can leave it nil when the operator under test doesn't
+	// need it.
+	Session Session
 }
 
 // NewContext builds a Context with sensible defaults: a fresh
