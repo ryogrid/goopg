@@ -17,6 +17,7 @@ import (
 	"syscall"
 
 	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/server"
 )
 
@@ -99,7 +100,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.String("D", "", "data directory (unused in v0; reserved for milestone 7)")
-	fs.String("config", "", "path to postgresql.conf (unused in v0)")
+	confPath := fs.String("config", "", "path to postgresql.conf (default: built-in defaults)")
 	addr := fs.String("listen", "127.0.0.1:5432", "TCP listen address (host:port)")
 	hbaPath := fs.String("hba", "", "path to pg_hba.conf (default: built-in loopback-trust policy)")
 	if err := fs.Parse(args); err != nil {
@@ -118,6 +119,20 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	cfg := server.Config{
 		Address: *addr,
 		Logger:  logger,
+	}
+	if *confPath != "" {
+		entries, err := config.ParseConfigFile(*confPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+		registry := config.BuildDefaultRegistry()
+		if err := registry.ApplyConfigEntries(entries); err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+		cfg.Registry = registry
+		logger.Info("loaded postgresql.conf", "path", *confPath, "entries", len(entries))
 	}
 	if *hbaPath != "" {
 		policy, err := auth.ParseHBAFile(*hbaPath)

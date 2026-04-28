@@ -303,3 +303,6 @@ Remember: Quality over speed. Build it right the first time. Know when you're do
 
 ## VESION CONTROL RULES
 - add and commit working changes with descriptive messages when you complete a task and push to origin
+
+## PostgreSQL Compatibility testing
+- Use `psql` and `pgbench` under `./postgres/local_install/{bin, lib}` to test compatibility with upstream PostgreSQL 18.3. Appropriate environment variables (e.g. `PATH`, `PGPORT`, `PGUSER`) should be set to connect to the goopg server instance.

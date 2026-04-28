@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
@@ -61,6 +62,11 @@ type Config struct {
 	// ErrMethodUnsupported. The default policy is trust-only, so a nil
 	// UserStore is fine for the common loopback-development setup.
 	UserStore auth.UserStore
+
+	// Registry is the GUC registry. nil means
+	// config.BuildDefaultRegistry() — the seeded set of variables we
+	// already advertise. See docs/design/0004-configuration-and-guc.md.
+	Registry *config.Registry
 }
 
 func (c *Config) defaults() {
@@ -81,6 +87,9 @@ func (c *Config) defaults() {
 	}
 	if c.Policy == nil {
 		c.Policy = auth.DefaultPolicy()
+	}
+	if c.Registry == nil {
+		c.Registry = config.BuildDefaultRegistry()
 	}
 }
 
@@ -243,12 +252,35 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 	logger.Info("connection established")
 
-	if err := s.sendStartupReply(w, params, pid); err != nil {
+	sess := config.NewSessionRegistry(s.cfg.Registry)
+	// Echo StartupMessage values for variables clients commonly send.
+	// Failures are not fatal — clients send a wide variety of values
+	// and we want to keep the connection going.
+	if app != "" {
+		_ = sess.Set("application_name", app, false)
+	}
+	if user != "" {
+		// session_authorization is FlagReport; use a layer-write so the
+		// effective value matches.
+		_ = sess.Set("session_authorization", user, false)
+	}
+
+	// Now wire the per-session ParameterStatus emitter so subsequent
+	// SET application_name = 'X' (etc.) auto-emits.
+	sess.SetReportableHook(func(name, value string) {
+		if err := w.WriteParameterStatus(name, value); err != nil {
+			logger.Debug("ParameterStatus write failed", "name", name, "err", err)
+			return
+		}
+		_ = w.Flush()
+	})
+
+	if err := s.sendStartupReply(w, sess, pid); err != nil {
 		logger.Info("startup reply failed", "err", err)
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, r, w, logger)
+	s.runPostStartupLoop(connCtx, r, w, sess, logger)
 }
 
 // checkAuth runs the configured Policy and the corresponding wire
@@ -378,11 +410,12 @@ func (s *Server) handleStartup(r *protocol.FrameReader, w *protocol.FrameWriter)
 }
 
 // sendStartupReply emits the post-auth portion of the startup sequence:
-// the ParameterStatus block, BackendKeyData, and ReadyForQuery.
-// AuthenticationOk has already been written by checkAuth at this point.
-func (s *Server) sendStartupReply(w *protocol.FrameWriter, params map[string]string, pid uint32) error {
-	for _, kv := range s.parameterStatusBlock(params) {
-		if err := w.WriteParameterStatus(kv[0], kv[1]); err != nil {
+// the ParameterStatus block (driven by the GUC registry), BackendKeyData,
+// and ReadyForQuery. AuthenticationOk has already been written by
+// checkAuth at this point.
+func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionRegistry, pid uint32) error {
+	for _, kv := range sess.ReportableVariables() {
+		if err := w.WriteParameterStatus(kv.Name, kv.Value); err != nil {
 			return err
 		}
 	}
@@ -399,34 +432,11 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, params map[string]str
 	return w.Flush()
 }
 
-// parameterStatusBlock returns the v0 ParameterStatus list. The order is
-// deliberate: clients see `server_version` first (the most-gated value) and
-// then conventional encodings, matching the order PostgreSQL itself uses.
-func (s *Server) parameterStatusBlock(params map[string]string) [][2]string {
-	user := params["user"]
-	app := params["application_name"]
-	return [][2]string{
-		{"server_version", s.cfg.ServerVersion},
-		{"server_encoding", "UTF8"},
-		{"client_encoding", "UTF8"},
-		{"application_name", app},
-		{"is_superuser", "off"},
-		{"session_authorization", user},
-		{"DateStyle", "ISO, MDY"},
-		{"IntervalStyle", "postgres"},
-		{"TimeZone", "UTC"},
-		{"integer_datetimes", "on"},
-		{"standard_conforming_strings", "on"},
-		{"in_hot_standby", "off"},
-		{"default_transaction_read_only", "off"},
-	}
-}
-
 // runPostStartupLoop handles every frame after ReadyForQuery. v0 routes
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, logger *slog.Logger) {
+func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger) {
 	for {
 		if ctx.Err() != nil {
 			s.writeFatal(w, sqlstate.AdminShutdown, "terminating connection due to administrator command")
@@ -443,7 +453,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 		case protocol.MsgTerminate:
 			return
 		case protocol.MsgQuery:
-			if err := s.handleQuery(w, f.Payload); err != nil {
+			if err := s.handleQuery(w, sess, f.Payload); err != nil {
 				logger.Debug("handleQuery write error", "err", err)
 				return
 			}

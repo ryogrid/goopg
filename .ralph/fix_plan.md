@@ -96,12 +96,25 @@ unchecked item unless a dependency forces a different order.
 
 ## Milestone 4 — Configuration and GUC system
 
-- [ ] Implement `postgresql.conf` parser (key=value, comments, includes).
-- [ ] Implement the GUC registry: name, type, unit, range, default, source,
-      scope (server/database/role/session/transaction).
-- [ ] Wire `SHOW`, `SET`, `SET LOCAL`, `pg_settings`, `current_setting()`,
-      `set_config()` into the executor stub.
-- [ ] Design doc `0004-configuration-and-guc.md`.
+- [x] Implement `postgresql.conf` parser (key=value, comments, includes).
+      `internal/config` parses single/double-quoted values (with `''`
+      escapes), bareword multi-token sequences (`DateStyle = ISO, MDY`),
+      and the include / include_if_exists / include_dir directives with
+      cycle detection.
+- [x] Implement the GUC registry: name, type, unit, range, default, source,
+      scope (server/database/role/session/transaction). Variable carries
+      Type / Unit / Context / Source / Scope / VarFlag; Registry seeds
+      the variables the server already advertises;
+      ApplyConfigEntries bypasses Context gating for file-driven sets.
+      Unit conversions cover both bytes (B/KB/MB/GB/TB) and time
+      (us/ms/s/min/h/d) families.
+- [x] Wire `SHOW`, `SET`, `SET LOCAL`, `RESET`, `RESET ALL` into the
+      simple-query path. SessionRegistry layers transaction → session
+      → global. FlagReport variables emit ParameterStatus on change.
+      `pg_settings` / `current_setting()` / `set_config()` are deferred
+      with the catalog work in milestone 5; `SHOW ALL` covers the
+      inspection use case until then.
+- [x] Design doc `0004-configuration-and-guc.md`.
 
 ## Milestone 5 — Storage, MVCC, WAL
 

@@ -5,25 +5,30 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
 
-// oidInt4 is pg_type.oid for int4. Pinned to upstream's pg_type.dat entry
-// (postgres/src/include/catalog/pg_type.dat: int4 oid => 23).
-const oidInt4 = 23
+// oidInt4 / oidText are pg_type.oids pinned to upstream's pg_type.dat
+// entries (postgres/src/include/catalog/pg_type.dat).
+const (
+	oidInt4 = 23
+	oidText = 25
+)
 
-// handleQuery implements the simple Query path for v0. The real parser
-// arrives in milestone 6; until then we recognise exactly two shapes:
+// handleQuery implements the simple Query path. v0 recognises:
 //
-//   - SELECT 1                    → single int4 column "?column?", value "1"
-//   - <empty / whitespace only>   → EmptyQueryResponse
+//   - SELECT 1                       → single int4 column, value "1"
+//   - SHOW name | SHOW ALL           → registry inspection
+//   - SET name = value | SET LOCAL …
+//   - RESET name | RESET ALL
+//   - <empty / whitespace only>      → EmptyQueryResponse
 //
-// Anything else returns a SyntaxError ErrorResponse, mirroring how upstream
-// behaves when the parser rejects a statement. Either way we finish with
-// ReadyForQuery('I') so the client can send the next message.
-func (s *Server) handleQuery(w *protocol.FrameWriter, payload []byte) error {
-	// payload is "<query string>\0" per protocol.h:Query message format.
+// Everything else still returns a feature-not-supported ErrorResponse.
+// Each statement is terminated with ReadyForQuery('I') so the client
+// can keep going.
+func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) error {
 	q, err := extractCString(payload)
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -37,16 +42,141 @@ func (s *Server) handleQuery(w *protocol.FrameWriter, payload []byte) error {
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	}
 
-	// Strip a single trailing semicolon for the v0 matcher.
 	matchable := strings.TrimRight(trimmed, ";")
 	matchable = strings.TrimSpace(matchable)
+
 	if strings.EqualFold(matchable, "SELECT 1") {
 		return s.respondSelectOne(w)
 	}
 
+	upper := strings.ToUpper(matchable)
+	switch {
+	case strings.HasPrefix(upper, "SHOW "):
+		return s.handleShow(w, sess, strings.TrimSpace(matchable[len("SHOW "):]))
+	case upper == "SHOW ALL":
+		return s.handleShowAll(w, sess)
+	case strings.HasPrefix(upper, "SET LOCAL "):
+		return s.handleSet(w, sess, matchable[len("SET LOCAL "):], true)
+	case strings.HasPrefix(upper, "SET "):
+		return s.handleSet(w, sess, matchable[len("SET "):], false)
+	case strings.HasPrefix(upper, "RESET ALL"):
+		sess.ResetAll()
+		if err := w.WriteCommandComplete("RESET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	case strings.HasPrefix(upper, "RESET "):
+		name := strings.TrimSpace(matchable[len("RESET "):])
+		if err := sess.Reset(name); err != nil {
+			return s.writeQueryError(w, sqlstate.UndefinedObject, err.Error())
+		}
+		if err := w.WriteCommandComplete("RESET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	}
+
 	return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 		fmt.Sprintf("query not supported by goopg v0: %q "+
-			"(only \"SELECT 1\" is recognised until the parser lands)", trimmed))
+			"(only SELECT 1 / SHOW / SET / RESET are recognised until the parser lands)", trimmed))
+}
+
+// handleShow returns the value of one variable as a single text column
+// named after the variable. Matches upstream's SHOW behaviour.
+func (s *Server) handleShow(w *protocol.FrameWriter, sess *config.SessionRegistry, name string) error {
+	name = strings.Trim(name, " \"'")
+	v, eff, ok := sess.Get(name)
+	if !ok {
+		return s.writeQueryError(w, sqlstate.UndefinedObject,
+			fmt.Sprintf("unrecognized configuration parameter %q", name))
+	}
+	if err := w.WriteRowDescription([]protocol.FieldDescription{{
+		Name: v.Name, TableOID: 0, ColumnAttNum: 0,
+		TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0,
+	}}); err != nil {
+		return err
+	}
+	if err := w.WriteDataRow([][]byte{[]byte(eff)}); err != nil {
+		return err
+	}
+	if err := w.WriteCommandComplete("SHOW"); err != nil {
+		return err
+	}
+	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+}
+
+// handleShowAll returns every variable as (name, setting). Upstream also
+// emits a description column; we include name + setting only and leave
+// description for milestone 5 (catalog) work.
+func (s *Server) handleShowAll(w *protocol.FrameWriter, sess *config.SessionRegistry) error {
+	if err := w.WriteRowDescription([]protocol.FieldDescription{
+		{Name: "name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+		{Name: "setting", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+	}); err != nil {
+		return err
+	}
+	rows := sess.All()
+	for _, kv := range rows {
+		if err := w.WriteDataRow([][]byte{[]byte(kv.Name), []byte(kv.Value)}); err != nil {
+			return err
+		}
+	}
+	if err := w.WriteCommandComplete("SHOW"); err != nil {
+		return err
+	}
+	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+}
+
+// handleSet applies a SET / SET LOCAL statement. Body is the text after
+// the keyword: "name = value", "name TO value", or "name value".
+func (s *Server) handleSet(w *protocol.FrameWriter, sess *config.SessionRegistry, body string, isLocal bool) error {
+	name, value, ok := splitSet(body)
+	if !ok {
+		return s.writeQueryError(w, sqlstate.SyntaxError,
+			fmt.Sprintf("could not parse SET statement: %q", body))
+	}
+	if err := sess.Set(name, value, isLocal); err != nil {
+		return s.writeQueryError(w, sqlstate.InvalidParameterValue, err.Error())
+	}
+	if err := w.WriteCommandComplete("SET"); err != nil {
+		return err
+	}
+	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+}
+
+// splitSet splits "name = value", "name TO value", or "name value" into
+// (name, value). Quoted values strip the surrounding quotes; "DEFAULT"
+// returns the boot value.
+func splitSet(body string) (string, string, bool) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", "", false
+	}
+	// Find the first whitespace or '=' after the name.
+	end := 0
+	for end < len(body) && body[end] != ' ' && body[end] != '\t' && body[end] != '=' {
+		end++
+	}
+	if end == 0 {
+		return "", "", false
+	}
+	name := body[:end]
+	rest := strings.TrimSpace(body[end:])
+	rest = strings.TrimPrefix(rest, "=")
+	rest = strings.TrimSpace(rest)
+	if strings.HasPrefix(strings.ToUpper(rest), "TO ") {
+		rest = strings.TrimSpace(rest[3:])
+	}
+	if rest == "" {
+		return "", "", false
+	}
+	// Strip outer single quotes (and double them out per SQL spec).
+	if strings.HasPrefix(rest, "'") && strings.HasSuffix(rest, "'") && len(rest) >= 2 {
+		inner := rest[1 : len(rest)-1]
+		inner = strings.ReplaceAll(inner, "''", "'")
+		return name, inner, true
+	}
+	return name, rest, true
 }
 
 func (s *Server) respondSelectOne(w *protocol.FrameWriter) error {
