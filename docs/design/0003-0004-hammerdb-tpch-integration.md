@@ -155,14 +155,32 @@ in v0; we record the flag for forward compatibility).
 
 ### What's deliberately deferred
 
-- Real NUMERIC arithmetic (`a + b * c`). v0's expression
-  evaluator never sees a NumericConst inside a binary op
-  during HammerDB's load phase; queries Q1–Q22 will need it.
 - `numeric(p, s)` precision / scale enforcement. The parser
   records the modifier list, but the codec ignores it.
 - Cast operator support for NUMERIC (`x::numeric(10,2)`).
   v0's cast is already a no-op for analyzer typing; the path
   works but doesn't enforce.
+
+### Q1–Q22 plan-time coverage
+
+All 22 HammerDB TPC-H query templates parse and plan against the
+v0 catalog (verified by `internal/planner.TestPlanTPCHQueriesPlannable`).
+The test fixture seeds the eight HammerDB-shaped tables and asks
+`planner.Plan` to produce a node tree for each query with parameters
+substituted from `sub_query()`'s default range. Planning succeeding
+is necessary but not sufficient — execution-time gaps (missing
+built-in functions, NUMERIC arithmetic shapes, etc.) surface only
+when the executor evaluates expressions against real rows.
+
+Built-in functions added this loop to unblock execution:
+
+- `substr(text, int [, int])` (alias `substring`) for Q22's
+  country-code prefix extraction. 1-based indexing, NULL
+  propagation, negative-length error matches upstream.
+- `to_date(text, fmt)` for Q15's view-defining
+  `WHERE l_shipdate >= to_date('1996-01-01', 'YYYY-MM-DD')`
+  pattern. Reuses `pgFormatToGoLayout` and truncates to
+  midnight UTC.
 
 ## Verification
 

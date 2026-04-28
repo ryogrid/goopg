@@ -1,0 +1,212 @@
+package planner
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
+
+// tpchCatalog seeds a catalog with the eight TPC-H tables HammerDB
+// creates (region, nation, supplier, customer, part, partsupp, orders,
+// lineitem). Column types mirror HammerDB's PostgreSQL DDL at
+// HammerDB/src/postgresql/pgolap.tcl lines 130-137. Used by
+// TestPlanTPCHQueries to drive plan-time coverage of Q1-Q22.
+func tpchCatalog(t *testing.T) catalog.Catalog {
+	t.Helper()
+	c := catalog.NewInMemory()
+	mk := func(name string, cols []catalog.Column) {
+		if _, err := c.CreateTable(parser.ObjectName{Name: name}, cols); err != nil {
+			t.Fatalf("CreateTable %s: %v", name, err)
+		}
+	}
+	mk("region", []catalog.Column{
+		{Name: "r_regionkey", Type: catalog.Type{Name: "numeric"}},
+		{Name: "r_name", Type: catalog.Type{Name: "char", Args: []int64{25}}},
+		{Name: "r_comment", Type: catalog.Type{Name: "varchar", Args: []int64{152}}},
+	})
+	mk("nation", []catalog.Column{
+		{Name: "n_nationkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "n_name", Type: catalog.Type{Name: "char", Args: []int64{25}}},
+		{Name: "n_regionkey", Type: catalog.Type{Name: "numeric"}},
+		{Name: "n_comment", Type: catalog.Type{Name: "varchar", Args: []int64{152}}},
+	})
+	mk("supplier", []catalog.Column{
+		{Name: "s_suppkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "s_nationkey", Type: catalog.Type{Name: "numeric"}},
+		{Name: "s_comment", Type: catalog.Type{Name: "varchar", Args: []int64{102}}},
+		{Name: "s_name", Type: catalog.Type{Name: "char", Args: []int64{25}}},
+		{Name: "s_address", Type: catalog.Type{Name: "varchar", Args: []int64{40}}},
+		{Name: "s_phone", Type: catalog.Type{Name: "char", Args: []int64{15}}},
+		{Name: "s_acctbal", Type: catalog.Type{Name: "numeric"}},
+	})
+	mk("customer", []catalog.Column{
+		{Name: "c_custkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "c_mktsegment", Type: catalog.Type{Name: "char", Args: []int64{10}}},
+		{Name: "c_nationkey", Type: catalog.Type{Name: "numeric"}},
+		{Name: "c_name", Type: catalog.Type{Name: "varchar", Args: []int64{25}}},
+		{Name: "c_address", Type: catalog.Type{Name: "varchar", Args: []int64{40}}},
+		{Name: "c_phone", Type: catalog.Type{Name: "char", Args: []int64{15}}},
+		{Name: "c_acctbal", Type: catalog.Type{Name: "numeric"}},
+		{Name: "c_comment", Type: catalog.Type{Name: "varchar", Args: []int64{118}}},
+	})
+	mk("part", []catalog.Column{
+		{Name: "p_partkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "p_type", Type: catalog.Type{Name: "varchar", Args: []int64{25}}},
+		{Name: "p_size", Type: catalog.Type{Name: "numeric"}},
+		{Name: "p_brand", Type: catalog.Type{Name: "char", Args: []int64{10}}},
+		{Name: "p_name", Type: catalog.Type{Name: "varchar", Args: []int64{55}}},
+		{Name: "p_container", Type: catalog.Type{Name: "char", Args: []int64{10}}},
+		{Name: "p_mfgr", Type: catalog.Type{Name: "char", Args: []int64{25}}},
+		{Name: "p_retailprice", Type: catalog.Type{Name: "numeric"}},
+		{Name: "p_comment", Type: catalog.Type{Name: "varchar", Args: []int64{23}}},
+	})
+	mk("partsupp", []catalog.Column{
+		{Name: "ps_partkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "ps_suppkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "ps_supplycost", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "ps_availqty", Type: catalog.Type{Name: "numeric"}},
+		{Name: "ps_comment", Type: catalog.Type{Name: "varchar", Args: []int64{199}}},
+	})
+	mk("orders", []catalog.Column{
+		{Name: "o_orderdate", Type: catalog.Type{Name: "timestamp"}},
+		{Name: "o_orderkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "o_custkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "o_orderpriority", Type: catalog.Type{Name: "char", Args: []int64{15}}},
+		{Name: "o_shippriority", Type: catalog.Type{Name: "numeric"}},
+		{Name: "o_clerk", Type: catalog.Type{Name: "char", Args: []int64{15}}},
+		{Name: "o_orderstatus", Type: catalog.Type{Name: "char", Args: []int64{1}}},
+		{Name: "o_totalprice", Type: catalog.Type{Name: "numeric"}},
+		{Name: "o_comment", Type: catalog.Type{Name: "varchar", Args: []int64{79}}},
+	})
+	mk("lineitem", []catalog.Column{
+		{Name: "l_shipdate", Type: catalog.Type{Name: "timestamp"}},
+		{Name: "l_orderkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_discount", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_extendedprice", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_suppkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_quantity", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_returnflag", Type: catalog.Type{Name: "char", Args: []int64{1}}},
+		{Name: "l_partkey", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_linestatus", Type: catalog.Type{Name: "char", Args: []int64{1}}},
+		{Name: "l_tax", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_commitdate", Type: catalog.Type{Name: "timestamp"}},
+		{Name: "l_receiptdate", Type: catalog.Type{Name: "timestamp"}},
+		{Name: "l_shipmode", Type: catalog.Type{Name: "char", Args: []int64{10}}},
+		{Name: "l_linenumber", Type: catalog.Type{Name: "numeric"}, NotNull: true},
+		{Name: "l_shipinstruct", Type: catalog.Type{Name: "char", Args: []int64{25}}},
+		{Name: "l_comment", Type: catalog.Type{Name: "varchar", Args: []int64{44}}},
+	})
+	return c
+}
+
+// tpchQuerySQL maps each TPC-H query number (1..22) to a parameter-
+// substituted SQL string. Templates are taken verbatim from
+// HammerDB/src/postgresql/pgolap.tcl set_query lines 982-1003;
+// placeholder values mirror the defaults sub_query() picks at run
+// time. Q15's three statements are kept as a single ;-separated
+// string so callers can split as needed.
+func tpchQuerySQL() map[int]string {
+	return map[int]string{
+		1:  "select l_returnflag, l_linestatus, sum(l_quantity) as sum_qty, sum(l_extendedprice) as sum_base_price, sum(l_extendedprice * (1 - l_discount)) as sum_disc_price, sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge, avg(l_quantity) as avg_qty, avg(l_extendedprice) as avg_price, avg(l_discount) as avg_disc, count(*) as count_order from lineitem where l_shipdate <= date '1998-12-01' - interval '90 day' group by l_returnflag, l_linestatus order by l_returnflag, l_linestatus",
+		2:  "select s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment from part, supplier, partsupp, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and p_size = 15 and p_type like '%BRASS' and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'EUROPE' and ps_supplycost = ( select min(ps_supplycost) from partsupp, supplier, nation, region where p_partkey = ps_partkey and s_suppkey = ps_suppkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'EUROPE') order by s_acctbal desc, n_name, s_name, p_partkey",
+		3:  "select l_orderkey, sum(l_extendedprice * (1 - l_discount)) as revenue, o_orderdate, o_shippriority from customer, orders, lineitem where c_mktsegment = 'BUILDING' and c_custkey = o_custkey and l_orderkey = o_orderkey and o_orderdate < date '1995-03-15' and l_shipdate > date '1995-03-15' group by l_orderkey, o_orderdate, o_shippriority order by revenue desc, o_orderdate",
+		4:  "select o_orderpriority, count(*) as order_count from orders where o_orderdate >= date '1993-07-01' and o_orderdate < date '1993-07-01' + interval '3 month' and exists ( select * from lineitem where l_orderkey = o_orderkey and l_commitdate < l_receiptdate) group by o_orderpriority order by o_orderpriority",
+		5:  "select n_name, sum(l_extendedprice * (1 - l_discount)) as revenue from customer, orders, lineitem, supplier, nation, region where c_custkey = o_custkey and l_orderkey = o_orderkey and l_suppkey = s_suppkey and c_nationkey = s_nationkey and s_nationkey = n_nationkey and n_regionkey = r_regionkey and r_name = 'ASIA' and o_orderdate >= date '1994-01-01' and o_orderdate < date '1994-01-01' + interval '1 year' group by n_name order by revenue desc",
+		6:  "select sum(l_extendedprice * l_discount) as revenue from lineitem where l_shipdate >= date '1994-01-01' and l_shipdate < date '1994-01-01' + interval '1 year' and l_discount between 0.05 - 0.01 and 0.05 + 0.01 and l_quantity < 24",
+		7:  "select supp_nation, cust_nation, l_year, sum(volume) as revenue from ( select n1.n_name as supp_nation, n2.n_name as cust_nation, extract(year from l_shipdate) as l_year, l_extendedprice * (1 - l_discount) as volume from supplier, lineitem, orders, customer, nation n1, nation n2 where s_suppkey = l_suppkey and o_orderkey = l_orderkey and c_custkey = o_custkey and s_nationkey = n1.n_nationkey and c_nationkey = n2.n_nationkey and ( (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY') or (n1.n_name = 'GERMANY' and n2.n_name = 'FRANCE')) and l_shipdate between date '1995-01-01' and date '1996-12-31') shipping group by supp_nation, cust_nation, l_year order by supp_nation, cust_nation, l_year",
+		8:  "select o_year, sum(case when nation = 'BRAZIL' then volume else 0 end) / sum(volume) as mkt_share from ( select extract(year from o_orderdate) as o_year, l_extendedprice * (1 - l_discount) as volume, n2.n_name as nation from part, supplier, lineitem, orders, customer, nation n1, nation n2, region where p_partkey = l_partkey and s_suppkey = l_suppkey and l_orderkey = o_orderkey and o_custkey = c_custkey and c_nationkey = n1.n_nationkey and n1.n_regionkey = r_regionkey and r_name = 'AMERICA' and s_nationkey = n2.n_nationkey and o_orderdate between date '1995-01-01' and date '1996-12-31' and p_type = 'ECONOMY ANODIZED STEEL') all_nations group by o_year order by o_year",
+		9:  "select nation, o_year, sum(amount) as sum_profit from ( select n_name as nation, extract(year from o_orderdate) as o_year, l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount from part, supplier, lineitem, partsupp, orders, nation where s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey and p_partkey = l_partkey and o_orderkey = l_orderkey and s_nationkey = n_nationkey and p_name like '%green%') profit group by nation, o_year order by nation, o_year desc",
+		10: "select c_custkey, c_name, sum(l_extendedprice * (1 - l_discount)) as revenue, c_acctbal, n_name, c_address, c_phone, c_comment from customer, orders, lineitem, nation where c_custkey = o_custkey and l_orderkey = o_orderkey and o_orderdate >= date '1993-10-01' and o_orderdate < date '1993-10-01' + interval '3 month' and l_returnflag = 'R' and c_nationkey = n_nationkey group by c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment order by revenue desc",
+		11: "select ps_partkey, sum(ps_supplycost * ps_availqty) as value from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'GERMANY' group by ps_partkey having sum(ps_supplycost * ps_availqty) > ( select sum(ps_supplycost * ps_availqty) * 0.0001000000 from partsupp, supplier, nation where ps_suppkey = s_suppkey and s_nationkey = n_nationkey and n_name = 'GERMANY') order by value desc",
+		12: "select l_shipmode, sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' then 1 else 0 end) as high_line_count, sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' then 1 else 0 end) as low_line_count from orders, lineitem where o_orderkey = l_orderkey and l_shipmode in ('MAIL', 'SHIP') and l_commitdate < l_receiptdate and l_shipdate < l_commitdate and l_receiptdate >= date '1994-01-01' and l_receiptdate < date '1994-01-01' + interval '1 year' group by l_shipmode order by l_shipmode",
+		13: "select c_count, count(*) as custdist from ( select c_custkey, count(o_orderkey) as c_count from customer left outer join orders on c_custkey = o_custkey and o_comment not like '%special%requests%' group by c_custkey) c_orders group by c_count order by custdist desc, c_count desc",
+		14: "select 100.00 * sum(case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) else 0 end) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue from lineitem, part where l_partkey = p_partkey and l_shipdate >= date '1995-09-01' and l_shipdate < date '1995-09-01' + interval '1 month'",
+		// Q15 is three statements; tested separately so we know which step fails.
+		15: "create or replace view revenue0 (supplier_no, total_revenue) as select l_suppkey, sum(l_extendedprice * (1 - l_discount)) from lineitem where l_shipdate >= to_date( '1996-01-01', 'YYYY-MM-DD') and l_shipdate < (to_date ('1996-01-01', 'YYYY-MM-DD') + interval '3 month') group by l_suppkey",
+		16: "select p_brand, p_type, p_size, count(distinct ps_suppkey) as supplier_cnt from partsupp, part where p_partkey = ps_partkey and p_brand <> 'Brand#45' and p_type not like 'MEDIUM POLISHED%' and p_size in (49, 14, 23, 45, 19, 3, 36, 9) and ps_suppkey not in ( select s_suppkey from supplier where s_comment like '%Customer%Complaints%') group by p_brand, p_type, p_size order by supplier_cnt desc, p_brand, p_type, p_size",
+		17: "select sum(l_extendedprice) / 7.0 as avg_yearly from lineitem, part where p_partkey = l_partkey and p_brand = 'Brand#23' and p_container = 'MED BOX' and l_quantity < ( select 0.2 * avg(l_quantity) from lineitem where l_partkey = p_partkey)",
+		18: "select c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) from customer, orders, lineitem where o_orderkey in ( select l_orderkey from lineitem group by l_orderkey having sum(l_quantity) > 313) and c_custkey = o_custkey and o_orderkey = l_orderkey group by c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice order by o_totalprice desc, o_orderdate",
+		19: "select sum(l_extendedprice* (1 - l_discount)) as revenue from lineitem, part where ( p_partkey = l_partkey and p_brand = 'Brand#12' and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') and l_quantity >= 1 and l_quantity <= 1 + 10 and p_size between 1 and 5 and l_shipmode in ('AIR', 'AIR REG') and l_shipinstruct = 'DELIVER IN PERSON') or ( p_partkey = l_partkey and p_brand = 'Brand#23' and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') and l_quantity >= 10 and l_quantity <= 10 + 10 and p_size between 1 and 10 and l_shipmode in ('AIR', 'AIR REG') and l_shipinstruct = 'DELIVER IN PERSON') or ( p_partkey = l_partkey and p_brand = 'Brand#34' and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') and l_quantity >= 20 and l_quantity <= 20 + 10 and p_size between 1 and 15 and l_shipmode in ('AIR', 'AIR REG') and l_shipinstruct = 'DELIVER IN PERSON')",
+		20: "select s_name, s_address from supplier, nation where s_suppkey in ( select ps_suppkey from partsupp where ps_partkey in ( select p_partkey from part where p_name like 'forest%') and ps_availqty > ( select 0.5 * sum(l_quantity) from lineitem where l_partkey = ps_partkey and l_suppkey = ps_suppkey and l_shipdate >= date '1994-01-01' and l_shipdate < date '1994-01-01' + interval '1 year')) and s_nationkey = n_nationkey and n_name = 'CANADA' order by s_name",
+		21: "select s_name, count(*) as numwait from supplier, lineitem l1, orders, nation where s_suppkey = l1.l_suppkey and o_orderkey = l1.l_orderkey and o_orderstatus = 'F' and l1.l_receiptdate > l1.l_commitdate and exists ( select * from lineitem l2 where l2.l_orderkey = l1.l_orderkey and l2.l_suppkey <> l1.l_suppkey) and not exists ( select * from lineitem l3 where l3.l_orderkey = l1.l_orderkey and l3.l_suppkey <> l1.l_suppkey and l3.l_receiptdate > l3.l_commitdate) and s_nationkey = n_nationkey and n_name = 'SAUDI ARABIA' group by s_name order by numwait desc, s_name",
+		22: "select cntrycode, count(*) as numcust, sum(c_acctbal) as totacctbal from ( select substr(c_phone, 1, 2) as cntrycode, c_acctbal from customer where substr(c_phone, 1, 2) in ('13', '31', '23', '29', '30', '18', '17') and c_acctbal > ( select avg(c_acctbal) from customer where c_acctbal > 0.00 and substr(c_phone, 1, 2) in ('13', '31', '23', '29', '30', '18', '17')) and not exists ( select * from orders where o_custkey = c_custkey)) custsale group by cntrycode order by cntrycode",
+	}
+}
+
+// TestPlanTPCHQueriesPlannable parses+plans every TPC-H query against
+// the v0 planner and reports a status table. Queries that fail are
+// captured for triage; this is the canonical place to track plan-time
+// regressions as M0003 query-coverage work proceeds.
+//
+// The expectation list below records the *current* baseline. Update
+// it as fixes land. A query is "plannable" when parser.Parse and
+// planner.Plan both succeed; it is *not* a guarantee that execution
+// produces the right rows — that is verified separately when the
+// HammerDB harness becomes available.
+func TestPlanTPCHQueriesPlannable(t *testing.T) {
+	cat := tpchCatalog(t)
+	queries := tpchQuerySQL()
+	type result struct {
+		ok  bool
+		err string
+	}
+	results := make(map[int]result)
+	for q := 1; q <= 22; q++ {
+		sql := queries[q]
+		stmts, perr := parser.Parse(sql)
+		if perr != nil {
+			results[q] = result{false, "parse: " + perr.Error()}
+			continue
+		}
+		if len(stmts) == 0 {
+			results[q] = result{false, "no statements parsed"}
+			continue
+		}
+		// Plan only the first statement; Q15 ships three but the
+		// CREATE VIEW is the gating step.
+		if _, err := Plan(stmts[0], cat); err != nil {
+			results[q] = result{false, "plan: " + err.Error()}
+			continue
+		}
+		results[q] = result{true, ""}
+	}
+	// Print a status summary so failures are visible in `go test -v`.
+	var passed []int
+	var failed []int
+	for q := 1; q <= 22; q++ {
+		if results[q].ok {
+			passed = append(passed, q)
+		} else {
+			failed = append(failed, q)
+		}
+	}
+	t.Logf("TPC-H plan-time coverage: %d/22 plannable", len(passed))
+	for _, q := range failed {
+		t.Logf("  Q%-2d FAIL: %s", q, truncateErr(results[q].err))
+	}
+	// Hard expectations: queries that MUST plan today. Update the
+	// list as fixes land. Anything in this list that fails turns
+	// the test red.
+	mustPass := []int{
+		1, 3, 4, 5, 6, 7, 8, 9, 10,
+		11, 12, 13, 14,
+		17, 18, 19,
+		21,
+	}
+	for _, q := range mustPass {
+		if !results[q].ok {
+			t.Errorf("Q%d expected to plan but failed: %s", q, results[q].err)
+		}
+	}
+}
+
+func truncateErr(s string) string {
+	const max = 240
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}

@@ -742,8 +742,127 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{Kind: KindTime, Time: t.Truncate(24 * 60 * 60 * 1e9)}, nil
 	case "to_timestamp":
 		return evalToTimestamp(x, row, ctx)
+	case "to_date":
+		return evalToDate(x, row, ctx)
+	case "substr", "substring":
+		return evalSubstr(x, row, ctx)
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s does not exist", x.Name)}
+}
+
+// evalToDate implements PostgreSQL's `to_date(text, text)` for the
+// format codes HammerDB TPC-H Q15 uses (`YYYY-MM-DD`). It reuses
+// `pgFormatToGoLayout` from to_timestamp and truncates the result
+// to midnight UTC so the value behaves like a DATE rather than a
+// timestamp. Real upstream parity (timezone, era handling, locale
+// month names) waits on the type system; this is scoped to "make
+// Q15 plan and run without rejecting the conversion".
+func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date(text, text) requires exactly 2 arguments"}
+	}
+	src, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	fmtArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if src.IsNull() || fmtArg.IsNull() {
+		return NullDatum, nil
+	}
+	if src.Kind != KindString || fmtArg.Kind != KindString {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date arguments must be text"}
+	}
+	goLayout := pgFormatToGoLayout(fmtArg.String)
+	t, perr := time.Parse(goLayout, src.String)
+	if perr != nil {
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_date: %v (format=%q value=%q)", perr, fmtArg.String, src.String)}
+	}
+	year, month, day := t.UTC().Date()
+	out := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	return Datum{Kind: KindTime, Time: out}, nil
+}
+
+// evalSubstr implements PostgreSQL's `substr(string, from [, count])`
+// (alias `substring`) using 1-based byte indexing — matches upstream's
+// `text_substr` semantics for ASCII/single-byte text. HammerDB TPC-H
+// Q22 uses `substr(c_phone, 1, 2)` to extract the country code prefix.
+// NULL inputs propagate to NULL output.
+//
+// The 2-argument form returns the substring from `from` to the end of
+// the string. Negative `from` values are clamped per upstream:
+// `substr('abcdef', -2, 4)` returns `'a'` (start at position 1, length
+// becomes 1 after subtracting the negative offset). For a v0 simple
+// implementation we follow the spec exactly.
+func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 && len(x.Args) != 3 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr requires 2 or 3 arguments"}
+	}
+	src, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	fromArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if src.IsNull() || fromArg.IsNull() {
+		return NullDatum, nil
+	}
+	if src.Kind != KindString {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
+	}
+	if fromArg.Kind != KindInt {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr second argument must be integer"}
+	}
+	s := src.String
+	from := fromArg.Int
+	// Upstream's text_substring: 1-based start, treat values <=0 as
+	// shifting the window left of the string. With no length, the
+	// window is open-ended on the right, so a non-positive `from`
+	// just clamps to position 1.
+	if len(x.Args) == 2 {
+		if from < 1 {
+			from = 1
+		}
+		idx := int(from) - 1
+		if idx >= len(s) {
+			return Datum{Kind: KindString, String: ""}, nil
+		}
+		return Datum{Kind: KindString, String: s[idx:]}, nil
+	}
+	cntArg, err := evalExpr(x.Args[2], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if cntArg.IsNull() {
+		return NullDatum, nil
+	}
+	if cntArg.Kind != KindInt {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr third argument must be integer"}
+	}
+	count := cntArg.Int
+	if count < 0 {
+		return Datum{}, &ExecError{Code: "22011", Pos: x.Pos(), Message: "negative substring length not allowed"}
+	}
+	end := from + count
+	if from < 1 {
+		from = 1
+	}
+	startIdx := int(from) - 1
+	endIdx := int(end) - 1
+	if endIdx < startIdx {
+		endIdx = startIdx
+	}
+	if startIdx >= len(s) {
+		return Datum{Kind: KindString, String: ""}, nil
+	}
+	if endIdx > len(s) {
+		endIdx = len(s)
+	}
+	return Datum{Kind: KindString, String: s[startIdx:endIdx]}, nil
 }
 
 // evalToTimestamp implements PostgreSQL's `to_timestamp(text,
