@@ -227,13 +227,26 @@ unchecked item unless a dependency forces a different order.
         is now covered.
   - [ ] Analyzer pass (name resolution, type checking) once the catalog
         exists.
-- [ ] Planner sufficient for pgbench's workload.
+- [x] Planner sufficient for pgbench's workload. `internal/catalog`
+      provides the in-memory schema (Table/Column/OID, with a
+      Catalog interface the planner takes by value); `internal/planner`
+      maps each parser.Stmt shape to a plan-node tree
+      (SeqScan/Filter/Project/Sort/Limit/Values/Insert/Update/Delete/
+      DDL/Transaction/Utility) and resolves names with SQLSTATE-aligned
+      errors (42P01, 42703, 42601, 0A000). pgbench's three load-bearing
+      DML queries plus SELECT *, BEGIN, DROP TABLE, and VACUUM ANALYZE
+      all plan end-to-end.
+- [ ] Planner: index-scan rule (`col = const` / `col = $N` against a
+      btree-indexed column).
+- [ ] Planner: multi-table FROM, joins, GROUP BY/HAVING, aggregates
+      (extends the single-relation v0 once the executor side is in).
 - [ ] Executor with the operators the planner emits.
 - [ ] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
 - [x] Design doc: `0010-parser.md`.
-- [ ] Design docs: `0011-planner.md`, `0012-executor.md`,
+- [x] Design doc: `0011-planner.md`.
+- [ ] Design docs: `0012-executor.md`,
       `0013-extended-query-protocol.md`, `0014-copy.md`.
 
 ## Milestone 7 — pgbench end-to-end and admin tooling
