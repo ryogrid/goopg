@@ -299,7 +299,7 @@ unchecked item unless a dependency forces a different order.
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.
-- [ ] Design docs: `0013-extended-query-protocol.md`, `0014-copy.md`.
+- [x] Design docs: `0013-extended-query-protocol.md`, `0014-copy.md`.
 
 ## Milestone 7 — pgbench end-to-end and admin tooling
 

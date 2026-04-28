@@ -33,5 +33,7 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | 0010 | [SQL Parser and AST (v0)](0010-parser.md) | accepted | Hand-written lexer + recursive-descent parser for the pgbench SQL subset; AST node types mirror upstream parsenodes.h names. |
 | 0011 | [Planner and Catalog Seam (v0)](0011-planner.md) | accepted | In-memory catalog interface, logical plan nodes, rule-based single-pass planner mapping each pgbench statement shape to a fixed template. |
 | 0012 | [Executor (v0)](0012-executor.md) | accepted | Volcano-style Open/Next/Close iterators, expression evaluator, Datum union, Values/Project/Filter/Limit/Sort + heap operators. |
+| 0013 | [Extended Query Protocol (v0)](0013-extended-query-protocol.md) | accepted | Parse/Bind/Describe/Execute/Sync state machine, per-connection statement+portal caches, and SQLSTATE/error choreography. |
+| 0014 | [COPY FROM/TO (v0)](0014-copy.md) | accepted | COPY wire-mode state machine, text/binary framing seam, and integration points with executor insert/scan paths. |
 
 Append new rows in numeric order. Do not reorder.
