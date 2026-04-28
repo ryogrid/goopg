@@ -241,9 +241,9 @@ unchecked item unless a dependency forces a different order.
       executor opens the btree and probes by encoded int4 key
       (`const` and `$N` forms, including commuted `const = col`).
 - [x] Planner: multi-table FROM, joins, GROUP BY/HAVING, aggregates
-      (planner now emits Join/Aggregate trees; executor-side operators
-      are still tracked under the executor milestone).
-- [ ] Executor with the operators the planner emits.
+      (planner emits Join/Aggregate trees including INNER/LEFT/RIGHT/
+      FULL/CROSS joins and grouped aggregates).
+- [x] Executor with the operators the planner emits.
   - [x] Volcano Open/Next/Close iterator scaffold (`internal/executor`):
         Datum union with KindNull/Bool/Int/String/Bytes/Time, expression
         evaluator (arithmetic/comparison/`||`/Kleene AND/OR/NOT, ParamRef
@@ -252,6 +252,11 @@ unchecked item unless a dependency forces a different order.
         Run helper. SELECT 1, parameterised expressions, LIMIT/OFFSET,
         ORDER BY, division-by-zero (22012), and current_timestamp work
         end-to-end without storage.
+  - [x] Planner-parity operators: Join + Aggregate. Executor now builds
+        and runs nested-loop joins (INNER/LEFT/RIGHT/FULL/CROSS with
+        NULL-extension semantics) and grouped aggregates
+        (COUNT/SUM/AVG/MIN/MAX, DISTINCT support, HAVING via Filter
+        over Aggregate).
   - [x] Heap-touching operators: SeqScan + Insert. Row codec
         (`internal/executor/codec.go`) marshals Datum rows ↔ heap-tuple
         bytes for v0's typed columns (int4/int8/bool/timestamp/text);

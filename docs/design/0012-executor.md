@@ -29,7 +29,9 @@ internal/executor/
     datum.go             // Datum union, null tracking, type tags
     expr.go              // expression evaluator (planner.Expr -> Datum)
     operator.go          // Operator interface (Open/Next/Close)
-    operators.go         // Values, Project, Filter, Limit, Sort, …
+  operators.go         // Values, Project, Filter, Limit, Sort
+  operators_index.go   // IndexScan
+  operators_join_agg.go// Join + Aggregate
     operators_storage.go // SeqScan / Insert / Update / Delete
                          //   (separated so tests can run without storage)
     executor.go          // Build(plan) + Run helpers
@@ -88,16 +90,18 @@ in-tree registry (`current_timestamp`, `now`, `nextval` later, …).
 | `Filter`    | Discards child rows where the predicate isn't TRUE.              |
 | `Limit`     | Consumes `Offset` rows, then yields up to `Limit` rows.          |
 | `Sort`      | Fully buffers the child, then sorts under multi-key ordering.    |
+| `Join`      | Nested-loop join with ON/USING/NATURAL predicates.               |
+| `Aggregate` | In-memory grouping for GROUP BY + aggregate call list.            |
 | `SeqScan`   | Heap-scan (block 0..N-1, slot 1..count, MVCC visibility).        |
+| `IndexScan` | B-tree equality probe on encoded int4 keys.                      |
 | `Insert`    | Reads child rows, marshals into HeapTuple, calls heap insert.    |
 | `Update`    | Re-reads visible row, computes new image, deletes old + inserts. |
 | `Delete`    | Marks visible rows dead under the current xact's xid.            |
 
 Out of scope for v0:
 
-- `IndexScan` — the planner doesn't promote yet; punt until the
-  index-scan rule lands.
-- Hash join / merge join / aggregates — pgbench doesn't issue them.
+- Hash join / merge join and cost-based join selection.
+- Spill-to-disk for large Sort/Aggregate workloads.
 - Parallel execution — single-threaded per-statement.
 - Cursors / `FETCH` semantics — extended-query holds plans, but
   doesn't yet stream results across messages.

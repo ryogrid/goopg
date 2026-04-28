@@ -38,6 +38,22 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return newSortOp(p, child), nil
+	case *planner.Join:
+		left, err := Build(p.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := Build(p.Right)
+		if err != nil {
+			return nil, err
+		}
+		return newJoinOp(p, left, right), nil
+	case *planner.Aggregate:
+		child, err := Build(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return newAggregateOp(p, child), nil
 	case *planner.SeqScan:
 		return newSeqScanOp(p), nil
 	case *planner.IndexScan:

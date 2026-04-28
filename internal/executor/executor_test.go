@@ -151,6 +151,163 @@ func TestExecSort(t *testing.T) {
 	}
 }
 
+func TestExecJoinVariants(t *testing.T) {
+	makeSide := func(vals ...int64) *planner.Values {
+		rows := make([][]planner.Expr, 0, len(vals))
+		for _, v := range vals {
+			rows = append(rows, []planner.Expr{&planner.IntegerConst{Value: v}})
+		}
+		return &planner.Values{Rows: rows}
+	}
+	pred := &planner.BinaryOp{
+		Op: "=",
+		Left: &planner.ColumnRef{
+			Index: 0,
+			Name:  "l",
+			Type:  catalog.Type{Name: "int4"},
+		},
+		Right: &planner.ColumnRef{
+			Index: 1,
+			Name:  "r",
+			Type:  catalog.Type{Name: "int4"},
+		},
+	}
+	tests := []struct {
+		name string
+		jt   planner.JoinType
+		want []Row
+	}{
+		{
+			name: "inner",
+			jt:   planner.JoinTypeInner,
+			want: []Row{{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}}},
+		},
+		{
+			name: "left",
+			jt:   planner.JoinTypeLeft,
+			want: []Row{
+				{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}},
+				{{Kind: KindInt, Int: 2}, NullDatum},
+			},
+		},
+		{
+			name: "right",
+			jt:   planner.JoinTypeRight,
+			want: []Row{
+				{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}},
+				{NullDatum, {Kind: KindInt, Int: 3}},
+			},
+		},
+		{
+			name: "full",
+			jt:   planner.JoinTypeFull,
+			want: []Row{
+				{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 1}},
+				{{Kind: KindInt, Int: 2}, NullDatum},
+				{NullDatum, {Kind: KindInt, Int: 3}},
+			},
+		},
+	}
+	for _, tc := range tests {
+		plan := &planner.Join{
+			Type:      tc.jt,
+			Left:      makeSide(1, 2),
+			Right:     makeSide(1, 3),
+			Predicate: pred,
+		}
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatalf("Build(%s): %v", tc.name, err)
+		}
+		rows, err := Run(op, NewContext())
+		if err != nil {
+			t.Fatalf("Run(%s): %v", tc.name, err)
+		}
+		if len(rows) != len(tc.want) {
+			t.Fatalf("%s rows=%d want %d", tc.name, len(rows), len(tc.want))
+		}
+		for i := range tc.want {
+			if len(rows[i]) != len(tc.want[i]) {
+				t.Fatalf("%s row[%d] len=%d want %d", tc.name, i, len(rows[i]), len(tc.want[i]))
+			}
+			for j := range tc.want[i] {
+				if rows[i][j].Kind != tc.want[i][j].Kind {
+					t.Fatalf("%s row[%d][%d] kind=%d want %d", tc.name, i, j, rows[i][j].Kind, tc.want[i][j].Kind)
+				}
+				if rows[i][j].Kind == KindInt && rows[i][j].Int != tc.want[i][j].Int {
+					t.Fatalf("%s row[%d][%d] int=%d want %d", tc.name, i, j, rows[i][j].Int, tc.want[i][j].Int)
+				}
+			}
+		}
+	}
+}
+
+func TestExecAggregateGroupBy(t *testing.T) {
+	child := &planner.Values{Rows: [][]planner.Expr{
+		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 10}},
+		{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}},
+		{&planner.IntegerConst{Value: 2}, &planner.IntegerConst{Value: 5}},
+	}}
+	plan := &planner.Aggregate{
+		Child: child,
+		GroupExprs: []planner.Expr{
+			&planner.ColumnRef{Index: 0, Name: "k", Type: catalog.Type{Name: "int4"}},
+		},
+		Aggs: []planner.AggregateCall{
+			{Name: "sum", Arg: &planner.ColumnRef{Index: 1, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
+			{Name: "count", Star: true, Type: catalog.Type{Name: "int8"}},
+		},
+	}
+	op, err := Build(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := Run(op, NewContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+	got := map[int64]Row{}
+	for _, r := range rows {
+		got[r[0].Int] = r
+	}
+	if got[1][1].Int != 30 || got[1][2].Int != 2 {
+		t.Fatalf("group 1 row=%+v", got[1])
+	}
+	if got[2][1].Int != 5 || got[2][2].Int != 1 {
+		t.Fatalf("group 2 row=%+v", got[2])
+	}
+}
+
+func TestExecAggregateGlobalEmptyInput(t *testing.T) {
+	plan := &planner.Aggregate{
+		Child: &planner.Values{Rows: nil},
+		Aggs: []planner.AggregateCall{
+			{Name: "count", Star: true, Type: catalog.Type{Name: "int8"}},
+			{Name: "sum", Arg: &planner.ColumnRef{Index: 0, Name: "v", Type: catalog.Type{Name: "int4"}}, Type: catalog.Type{Name: "int8"}},
+		},
+	}
+	op, err := Build(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := Run(op, NewContext())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	if rows[0][0].Kind != KindInt || rows[0][0].Int != 0 {
+		t.Fatalf("count=%+v want 0", rows[0][0])
+	}
+	if !rows[0][1].IsNull() {
+		t.Fatalf("sum=%+v want NULL", rows[0][1])
+	}
+}
+
 // TestExecBooleanThreeValuedLogic pins NULL handling on AND/OR per
 // SQL Kleene semantics: NULL AND FALSE -> FALSE, NULL OR TRUE -> TRUE,
 // NULL AND TRUE -> NULL.
