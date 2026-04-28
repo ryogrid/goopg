@@ -297,9 +297,11 @@ unchecked item unless a dependency forces a different order.
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
       (partial: simple-query COPY wire loop now handles a minimal
-      `COPY (SELECT 1) TO STDOUT` path and COPY FROM STDIN data mode,
-      but parser/planner/executor-backed table COPY and binary mode are
-      still pending.)
+      `COPY (SELECT 1) TO STDOUT` path and COPY FROM STDIN data mode;
+      parser now produces a `parser.CopyStmt` (FROM/TO, STDIN/STDOUT/
+      file/PROGRAM, parenthesised + legacy WITH options including
+      FORCE_QUOTE *, FORCE_NOT_NULL/(cols)). Planner/executor wiring
+      and binary mode are still pending.)
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.

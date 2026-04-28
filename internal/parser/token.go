@@ -105,6 +105,7 @@ const (
 	KwConstraint  Keyword = "constraint"
 	KwColumn      Keyword = "column"
 	KwForeign     Keyword = "foreign"
+	KwCopy        Keyword = "copy"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -188,6 +189,7 @@ var keywords = map[string]Keyword{
 	"constraint":  KwConstraint,
 	"column":      KwColumn,
 	"foreign":     KwForeign,
+	"copy":        KwCopy,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

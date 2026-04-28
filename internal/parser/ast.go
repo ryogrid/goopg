@@ -407,3 +407,64 @@ type AlterTableStmt struct {
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }
 func (s *AlterTableStmt) stmtNode() {}
+
+// CopyDirection records whether a COPY moves data into the table
+// (FROM) or out of it (TO).
+type CopyDirection int
+
+const (
+	CopyFrom CopyDirection = iota
+	CopyTo
+)
+
+// CopyEndpoint discriminates the file/program/standard-stream sink or
+// source for a COPY. v0 implements stdin/stdout end-to-end and parses
+// the others so the analyzer can reject them with a stable SQLSTATE.
+type CopyEndpoint int
+
+const (
+	CopyEndpointStdin CopyEndpoint = iota
+	CopyEndpointStdout
+	CopyEndpointFile    // 'path/to/file'
+	CopyEndpointProgram // PROGRAM 'cmd'
+)
+
+// CopyOption is one entry in the WITH (...) option list. Name is
+// lower-cased; Value carries the textual value (string literal stripped
+// of surrounding quotes, numeric/identifier values verbatim). Bool
+// records HEADER's optional explicit value; when the option appears
+// without arguments (e.g. `HEADER`, `FREEZE`), Bool is true and Value
+// is empty. Star/Cols carry FORCE_QUOTE/FORCE_NOT_NULL/FORCE_NULL
+// payloads.
+type CopyOption struct {
+	pos   int
+	Name  string
+	Value string
+	Bool  bool
+	Star  bool
+	Cols  []string
+}
+
+func (o CopyOption) Pos() int { return o.pos }
+
+// CopyStmt — `COPY (table [(cols)] | (query)) {FROM|TO}
+//
+//	{ 'file' | PROGRAM 'cmd' | STDIN | STDOUT } [WITH] [(option, …)]`.
+//
+// Exactly one of Table/Query is set; Columns is empty for query-form
+// COPY TO. Filename is populated when Endpoint == CopyEndpointFile or
+// CopyEndpointProgram. Options carries the WITH list verbatim — the
+// analyzer interprets known names and rejects the rest.
+type CopyStmt struct {
+	pos       int
+	Direction CopyDirection
+	Table     ObjectName  // empty when Query is set
+	Columns   []string    // empty when no column list
+	Query     *SelectStmt // populated for COPY (query) TO …
+	Endpoint  CopyEndpoint
+	Filename  string // filename or program command, when applicable
+	Options   []CopyOption
+}
+
+func (s *CopyStmt) Pos() int  { return s.pos }
+func (s *CopyStmt) stmtNode() {}
