@@ -1216,6 +1216,30 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
 - [ ] All 22 queries (Q1–Q22) execute end-to-end and produce
       result sets byte-identical (or otherwise verified-equivalent)
       to upstream PG on the same data.
+      (parity test infrastructure achieved 2026-04-29: new
+      `internal/testutil/tpch.TestTPCHResultParity` runs each
+      Q1..Q22 against goopg AND upstream PostgreSQL 18.3 on
+      the SAME synthetic dataset and diffs rows. Adds a minimal
+      upstream-PG lifecycle wrapper
+      (`internal/testutil/tpch/upstreampg_test.go`: initdb /
+      pg_ctl start / libpq query / pg_ctl stop). Fail-closed
+      only on goopg-errors-while-upstream-OK regressions;
+      row-content divergences logged as a triage list. Current
+      matrix at synthetic dataset: identical=11, divergent=11,
+      goopg-errored=0, upstream-errored=0. Divergences group
+      into three clusters that can be tackled independently:
+      (1) NUMERIC precision in division (Q1, Q14) — Q1 returns
+      11.666666 vs upstream 11.6666666666666667; v0's
+      `numericDiv` hardcodes scale 6, real fix waits on
+      arbitrary-precision NUMERIC; (2) Row-count divergences
+      from join / GROUP BY semantics (Q3, Q5, Q7, Q8, Q9,
+      Q10, Q13) — goopg consistently returns more rows than
+      upstream, suggests GROUP BY de-dup or join filter gap;
+      (3) NOT IN / HAVING scalar subquery semantics (Q11, Q16)
+      — likely 3VL on NULL or scalar materialisation drift.
+      See `docs/design/0003-0017-result-parity-testing.md`
+      for the full triage workstream. SF1 parity still gated
+      on Docker / WSL2 reachability.)
       (plan-time + build-time + executor-time coverage achieved
       2026-04-29: every query parses, plans, builds, AND executes
       end-to-end against synthetic data — pinned by three
