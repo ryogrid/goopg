@@ -738,17 +738,22 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 - [ ] 3- to 7-way JOIN planning (extend the M1 nested-loop planner).
 - [ ] Correlated and uncorrelated subqueries; `EXISTS`, `NOT EXISTS`,
       `IN`, `NOT IN`.
-      (uncorrelated scalar landed 2026-04-28: `(SELECT …)` in
-      expression position parses as parser.SubqueryExpr,
-      planner.SubqueryExpr wraps the planned inner Node
-      (catalog threaded through resolveContext.cat), executor's
-      evalSubquery builds-opens-drains-closes per evaluation,
-      returns NULL on empty, the single cell on one row, 21000
-      cardinality_violation on multi-row, and 42601 on
-      multi-column. Verified via psql 18.3 with TPC-H Q15 shape
-      `WHERE val = (SELECT max(val) FROM t)`. IN / NOT IN /
-      EXISTS / correlated remain open — see
-      `docs/design/0003-0008-subqueries.md`.)
+      (uncorrelated forms all landed 2026-04-28: scalar
+      `(SELECT …)` in expression position via
+      parser.SubqueryExpr; `expr [NOT] IN (subquery|val_list)`
+      via parser.InExpr (parser hooks into expr-precedence
+      loop, lookahead disambiguates subquery vs value list);
+      `[NOT] EXISTS (subquery)` via parser.ExistsExpr (NOT
+      composed via UnaryOp). Planner mirrors plan the inner
+      SELECT recursively; executor evalSubquery/evalInExpr/
+      evalExistsExpr handle three-valued NULL for IN
+      (operand-NULL → NULL, inner-NULL with no match → NULL),
+      cardinality 21000 for scalar multi-row, multi-column
+      42601 for both scalar and IN. Verified via psql 18.3
+      with TPC-H Q15 (scalar) and Q16/Q18 shapes (IN
+      subquery + value list + EXISTS + NOT EXISTS).
+      Correlated subqueries (parameter pull-up for Q4/Q21/Q22)
+      remain open — see `docs/design/0003-0008-subqueries.md`.)
 - [x] `CASE` expressions (parser + executor).
       (achieved 2026-04-28: both searched (`CASE WHEN cond THEN
       result …`) and simple (`CASE expr WHEN val THEN result …`)

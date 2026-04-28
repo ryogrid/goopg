@@ -774,6 +774,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, agg.input.cat)
+	case *parser.InExpr:
+		return planInExpr(x, agg.input)
+	case *parser.ExistsExpr:
+		return planExistsExpr(x, agg.input.cat)
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
 		if err != nil {
@@ -1343,6 +1347,50 @@ func planSubqueryExpr(x *parser.SubqueryExpr, cat catalog.Catalog) (Expr, error)
 	return &SubqueryExpr{pos: x.Pos(), Plan: inner}, nil
 }
 
+// planInExpr resolves the operand and either plans the inner
+// subquery or recursively resolves the value list, depending
+// on which the parser produced.
+func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
+	op, err := resolveExpr(x.Operand, ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated}
+	if x.Subquery != nil {
+		if ctx.cat == nil {
+			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
+		}
+		inner, err := Plan(x.Subquery, ctx.cat)
+		if err != nil {
+			return nil, err
+		}
+		out.Plan = inner
+	} else {
+		out.List = make([]Expr, len(x.List))
+		for i, e := range x.List {
+			r, err := resolveExpr(e, ctx)
+			if err != nil {
+				return nil, err
+			}
+			out.List[i] = r
+		}
+	}
+	return out, nil
+}
+
+// planExistsExpr plans the inner subquery and wraps in an
+// ExistsExpr. v0 supports only the uncorrelated form.
+func planExistsExpr(x *parser.ExistsExpr, cat catalog.Catalog) (Expr, error) {
+	if cat == nil {
+		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "EXISTS not supported in this context"}
+	}
+	inner, err := Plan(x.Subquery, cat)
+	if err != nil {
+		return nil, err
+	}
+	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner}, nil
+}
+
 // resolveCaseExpr translates a parser CaseExpr into a planner
 // CaseExpr, recursively resolving each Operand / When / Then /
 // Else expression in `ctx`.
@@ -1392,6 +1440,10 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, ctx.cat)
+	case *parser.InExpr:
+		return planInExpr(x, ctx)
+	case *parser.ExistsExpr:
+		return planExistsExpr(x, ctx.cat)
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, ctx)
 		if err != nil {

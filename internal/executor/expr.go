@@ -33,6 +33,10 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		return evalCaseExpr(x, row, ctx)
 	case *planner.SubqueryExpr:
 		return evalSubquery(x, ctx)
+	case *planner.InExpr:
+		return evalInExpr(x, row, ctx)
+	case *planner.ExistsExpr:
+		return evalExistsExpr(x, ctx)
 	case *planner.TypedStringLit:
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
@@ -369,6 +373,116 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}
 	return d, nil
+}
+
+// evalInExpr evaluates `expr [NOT] IN (subquery | val_list)`.
+// The inner set is materialised once per evaluation (no
+// caching across rows in v0); for IN (subquery), the executor
+// drains the inner plan and collects the first column per
+// row. For IN (list), the list is evaluated against the
+// outer row.
+//
+// Three-valued logic:
+//   - operand NULL → result NULL.
+//   - any inner NULL when outer doesn't match a non-NULL
+//     value → NULL.
+//   - inner empty → false (NOT IN: true).
+//
+// Multi-column subqueries raise 42601.
+func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
+	operand, err := evalExpr(x.Operand, row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if operand.IsNull() {
+		return NullDatum, nil
+	}
+
+	values, err := collectInValues(x, row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	sawNull := false
+	for _, v := range values {
+		if v.IsNull() {
+			sawNull = true
+			continue
+		}
+		eq, err := compareEq(operand, v)
+		if err != nil {
+			return Datum{}, err
+		}
+		if eq.Kind == KindBool && eq.Bool {
+			return Datum{Kind: KindBool, Bool: !x.Negated}, nil
+		}
+	}
+	if sawNull {
+		return NullDatum, nil
+	}
+	return Datum{Kind: KindBool, Bool: x.Negated}, nil
+}
+
+// collectInValues returns the inner set for `IN (...)`. When
+// the source is a subquery, drains it; the subquery must have
+// exactly one column. Otherwise evaluates the value list.
+func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) {
+	if x.Plan != nil {
+		op, err := Build(x.Plan)
+		if err != nil {
+			return nil, err
+		}
+		if err := op.Open(ctx); err != nil {
+			_ = op.Close()
+			return nil, err
+		}
+		defer func() { _ = op.Close() }()
+		var out []Datum
+		for {
+			r, err := op.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			if len(r) != 1 {
+				return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("subquery used as IN argument returned %d columns, expected 1", len(r))}
+			}
+			out = append(out, r[0])
+		}
+		return out, nil
+	}
+	out := make([]Datum, len(x.List))
+	for i, e := range x.List {
+		v, err := evalExpr(e, row, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+
+// evalExistsExpr evaluates `[NOT] EXISTS (subquery)`. Opens
+// the inner plan, asks for one row, returns the bool. Works
+// regardless of column count — EXISTS only cares whether at
+// least one row exists.
+func evalExistsExpr(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
+	op, err := Build(x.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = op.Close() }()
+	_, err = op.Next()
+	hasRow := err == nil
+	if err != nil && err != EOF {
+		return Datum{}, err
+	}
+	return Datum{Kind: KindBool, Bool: hasRow != x.Negated}, nil
 }
 
 // evalSubquery runs the inner plan inside a SubqueryExpr and

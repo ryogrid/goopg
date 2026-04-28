@@ -87,6 +87,39 @@ type IntervalLit struct {
 func (e *IntervalLit) Pos() int { return e.pos }
 func (*IntervalLit) exprNode()  {}
 
+// InExpr is `expr [NOT] IN (subquery | value_list)`. The
+// executor handles the uncorrelated case: drain the inner
+// subquery (or evaluate the value-list expressions) into a
+// set once per outer Open and probe per outer row.
+//
+// Either Subquery or List is non-nil but not both. NULL values
+// in the inner set follow upstream's three-valued semantics:
+// `x IN (a, NULL)` returns NULL when x doesn't match a.
+type InExpr struct {
+	pos      int
+	Operand  Expr
+	Negated  bool         // NOT IN
+	Subquery *SelectStmt  // populated for IN (subquery)
+	List     []Expr       // populated for IN (val_list)
+}
+
+func (e *InExpr) Pos() int { return e.pos }
+func (*InExpr) exprNode()  {}
+
+// ExistsExpr is `EXISTS (subquery)` and its NOT variant. The
+// executor opens the inner plan, asks for the first row, and
+// returns true (or false for NOT EXISTS) iff at least one row
+// is produced. The body of the subquery is otherwise ignored
+// — output columns are discarded; upstream-aligned semantics.
+type ExistsExpr struct {
+	pos      int
+	Negated  bool        // NOT EXISTS
+	Subquery *SelectStmt
+}
+
+func (e *ExistsExpr) Pos() int { return e.pos }
+func (*ExistsExpr) exprNode()  {}
+
 // SubqueryExpr is the v0 scalar-subquery expression: a
 // parenthesised SELECT used in expression position. The
 // executor evaluates it once per Open and binds the single

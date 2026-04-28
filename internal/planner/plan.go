@@ -99,6 +99,33 @@ type ExtractExpr struct {
 func (e *ExtractExpr) Pos() int { return e.pos }
 func (*ExtractExpr) exprNode()  {}
 
+// InExpr mirrors parser.InExpr after subquery / value-list
+// resolution. Either Plan or List is non-nil. v0 supports the
+// uncorrelated form only — the executor evaluates the inner
+// once, builds a set, then probes per outer row.
+type InExpr struct {
+	pos     int
+	Operand Expr
+	Negated bool
+	Plan    Node // populated when the source is a subquery
+	List    []Expr
+}
+
+func (e *InExpr) Pos() int { return e.pos }
+func (*InExpr) exprNode()  {}
+
+// ExistsExpr mirrors parser.ExistsExpr. The executor opens the
+// inner plan, asks for one row, and reports the bool. NOT
+// EXISTS is the same path with the result negated.
+type ExistsExpr struct {
+	pos     int
+	Negated bool
+	Plan    Node
+}
+
+func (e *ExistsExpr) Pos() int { return e.pos }
+func (*ExistsExpr) exprNode()  {}
+
 // SubqueryExpr mirrors parser.SubqueryExpr after the inner
 // SELECT has been planned. The executor opens / drains /
 // closes Plan once at evaluation time and returns the single

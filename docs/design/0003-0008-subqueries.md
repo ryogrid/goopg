@@ -133,18 +133,70 @@ SELECT id FROM t WHERE val = (SELECT val FROM t);
 
 `TestParseSubqueryExpr` pins the AST shape.
 
+### IN / NOT IN / EXISTS / NOT EXISTS (uncorrelated)
+
+Adds three more AST shapes alongside SubqueryExpr, all
+following the same uncorrelated-only contract:
+
+- `parser.InExpr{Operand, Negated, Subquery, List}` — either
+  Subquery or List is non-nil. The parser detects the right
+  side: a leading `SELECT` keyword inside the parens is
+  treated as a subquery; otherwise a comma-separated value
+  list. The grammar hooks in at comparison precedence inside
+  `parseExprPrec` so `expr IN (...)` and `expr NOT IN (...)`
+  parse without back-tracking. NOT IN is a two-keyword
+  lookahead (`KwNot` followed by `KwIn`).
+- `parser.ExistsExpr{Negated, Subquery}` — leading EXISTS
+  keyword in primary expression position. NOT EXISTS parses
+  as `UnaryOp{NOT, ExistsExpr{Negated:false}}`; the executor's
+  bool-NOT inverts the result. (Setting Negated at parse
+  time would also work; the UnaryOp shape is simpler and
+  reuses existing NOT semantics.)
+
+Planner (`planInExpr` / `planExistsExpr`):
+- IN with a subquery plans the inner SELECT recursively
+  through `Plan(s.Subquery, ctx.cat)` and stores the result
+  on `Plan`.
+- IN with a value list resolves each list element through
+  `resolveExpr` so column refs in the list resolve
+  correctly.
+- EXISTS unconditionally plans the inner SELECT.
+
+Executor:
+- `evalInExpr` materialises the inner set per evaluation
+  (no caching across rows). Three-valued logic:
+  - Operand NULL → NULL.
+  - Inner contains a NULL and outer doesn't match a non-NULL
+    value → NULL.
+  - Inner empty → false (NOT IN: true).
+  - Match found → true (NOT IN: false).
+  Multi-column subqueries surface 42601.
+- `evalExistsExpr` opens the inner plan, asks for one row,
+  returns `hasRow != Negated`. Output columns are ignored —
+  `SELECT 1` is the canonical body but anything else works.
+
+End-to-end verified via psql 18.3:
+- `WHERE p_partkey IN (SELECT ps_partkey FROM partsupp)` →
+  matching rows.
+- `WHERE p_partkey NOT IN (...)` → non-matching rows.
+- `WHERE p_partkey IN (1, 4)` → value-list form.
+- `WHERE EXISTS (SELECT 1 FROM partsupp WHERE …)` → all
+  rows when inner non-empty, none when empty.
+- `WHERE NOT EXISTS (...)` → inverted.
+
 ## Out of scope (deferred to subsequent loops)
 
-- `IN (subquery)`, `NOT IN`, `EXISTS (subquery)`. Distinct
-  AST nodes (`SubLink` in upstream); the executor side is
-  qualitatively different — `IN` checks set membership,
-  `EXISTS` short-circuits on first row.
 - Correlated subqueries: outer-row column references inside
   the inner SELECT need parameter pull-up + per-row
-  re-evaluation.
+  re-evaluation. TPC-H Q4/Q21/Q22 use these; until the
+  pull-up rewrite lands, those queries fail at planning
+  with `column does not exist`.
 - Initplan caching: evaluate uncorrelated subqueries once
   per query plan and reuse the result Datum. Performance
-  win, no correctness change.
+  win, no correctness change. Applies equally to
+  SubqueryExpr / InExpr / ExistsExpr.
+- ANY / SOME / ALL (subquery / value-list quantified
+  comparisons). Distinct from IN.
 - `LATERAL` joins (related grammar; not used by TPC-H).
 
 ## Cross-references

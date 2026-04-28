@@ -475,6 +475,34 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			left = cast
 			continue
 		}
+		// `expr [NOT] IN (...)` is a postfix-style construct at
+		// comparison precedence. Check for it before the standard
+		// binary-op match so the IN keyword doesn't get parsed as
+		// an unrelated identifier.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwIn {
+				pos := t.Pos
+				p.advance()
+				inExpr, err := p.parseInTail(left, pos, false)
+				if err != nil {
+					return nil, err
+				}
+				left = inExpr
+				continue
+			}
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwIn {
+				pos := t.Pos
+				p.advance() // NOT
+				p.advance() // IN
+				inExpr, err := p.parseInTail(left, pos, true)
+				if err != nil {
+					return nil, err
+				}
+				left = inExpr
+				continue
+			}
+		}
 		op, prec, ok := p.peekBinaryOp()
 		if !ok || prec < min {
 			return left, nil
@@ -687,6 +715,8 @@ func (p *parser) parsePrimary() (Expr, error) {
 			return &BooleanConst{pos: t.Pos, Value: false}, nil
 		case KwCase:
 			return p.parseCaseExpr()
+		case KwExists:
+			return p.parseExistsExpr(false)
 		}
 	}
 	if t.Kind == TokenIdent || t.Kind == TokenQuotedIdent {
@@ -745,6 +775,76 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		}
 	}
 	return nil, false
+}
+
+// parseExistsExpr parses `EXISTS (subquery)`. The leading
+// EXISTS keyword is the current token on entry. v0 supports
+// only the parenthesised-SELECT form; row-constructor /
+// scalar-expression `EXISTS (expr)` forms are not standard SQL
+// anyway. NOT is handled by the caller's NOT-prefix branch
+// (parses as `UnaryOp{NOT, ExistsExpr}`).
+func (p *parser) parseExistsExpr(negated bool) (Expr, error) {
+	pos := p.cur().Pos
+	p.advance() // EXISTS
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after EXISTS")
+	}
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect) {
+		return nil, p.errAtCur("EXISTS requires a parenthesised SELECT")
+	}
+	inner, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close EXISTS subquery")
+	}
+	sel, ok := inner.(*SelectStmt)
+	if !ok {
+		return nil, &SyntaxError{Pos: pos, Message: "EXISTS subquery did not produce SELECT"}
+	}
+	return &ExistsExpr{pos: pos, Negated: negated, Subquery: sel}, nil
+}
+
+// parseInTail consumes the right side of `expr [NOT] IN (...)`
+// after the IN keyword. The parenthesised body is either a
+// parenthesised SELECT (uncorrelated subquery) or a value list
+// — disambiguated by whether the first inner token is SELECT.
+func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after IN")
+	}
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+		inner, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close IN subquery")
+		}
+		sel, ok := inner.(*SelectStmt)
+		if !ok {
+			return nil, &SyntaxError{Pos: pos, Message: "IN subquery did not produce SELECT"}
+		}
+		return &InExpr{pos: pos, Operand: left, Negated: negated, Subquery: sel}, nil
+	}
+	// Value list. At least one expression required.
+	first, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	list := []Expr{first}
+	for p.acceptSymbol(",") {
+		next, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, next)
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close IN list")
+	}
+	return &InExpr{pos: pos, Operand: left, Negated: negated, List: list}, nil
 }
 
 // parseCaseExpr parses both forms of CASE:

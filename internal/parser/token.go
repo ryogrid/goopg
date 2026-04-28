@@ -120,6 +120,7 @@ const (
 	KwThen        Keyword = "then"
 	KwElse        Keyword = "else"
 	KwExplain     Keyword = "explain"
+	KwIn          Keyword = "in"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -210,6 +211,7 @@ var keywords = map[string]Keyword{
 	"then":        KwThen,
 	"else":        KwElse,
 	"explain":     KwExplain,
+	"in":          KwIn,
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
 }

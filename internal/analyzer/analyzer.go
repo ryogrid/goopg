@@ -273,6 +273,25 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		// is "unknown"; isAssignable's unknown-coercion rule
 		// keeps the comparison sites happy.
 		return catalog.Type{Name: "unknown"}, nil
+	case *parser.InExpr:
+		// Operand and list/subquery are checked at planner / runtime
+		// rather than here — IN's type-coercion rules are
+		// upstream's "anyelement = anyelement" generic. v0 just
+		// validates each side's expression sub-tree resolves and
+		// reports bool.
+		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		for _, e := range x.List {
+			if _, err := analyzeExpr(e, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "bool"}, nil
+	case *parser.ExistsExpr:
+		// Subquery analysis happens during planning. EXISTS is
+		// boolean by definition.
+		return catalog.Type{Name: "bool"}, nil
 	case *parser.NullConst:
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.BooleanConst:
