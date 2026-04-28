@@ -52,7 +52,11 @@ func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
-			return nil, fmt.Errorf("DecodeRow: truncated at column %s", c.Name)
+			// ALTER TABLE ADD COLUMN appends new logical columns without
+			// rewriting old heap tuples; missing trailing values read as
+			// NULL.
+			row[i] = NullDatum
+			continue
 		}
 		flag := data[off]
 		off++

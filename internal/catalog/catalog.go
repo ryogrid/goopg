@@ -8,6 +8,7 @@ package catalog
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -40,6 +41,18 @@ type Table struct {
 	OID     uint32
 }
 
+// Index is one index relation in the catalog.
+type Index struct {
+	Schema  string
+	Name    string
+	Table   *Table
+	Columns []string
+	Unique  bool
+	Method  string
+	Primary bool
+	OID     uint32
+}
+
 // QualifiedName renders the table's name in the canonical
 // `schema.name` form when schema-qualified, otherwise just `name`.
 func (t *Table) QualifiedName() string {
@@ -49,13 +62,28 @@ func (t *Table) QualifiedName() string {
 	return t.Schema + "." + t.Name
 }
 
+// QualifiedName renders the index name in canonical form.
+func (i *Index) QualifiedName() string {
+	if i.Schema == "" {
+		return i.Name
+	}
+	return i.Schema + "." + i.Name
+}
+
 // Catalog is the lookup interface the planner uses.
 type Catalog interface {
 	LookupTable(name parser.ObjectName) (*Table, bool)
 	LookupColumn(table *Table, name string) (*Column, bool)
+	LookupIndex(name parser.ObjectName) (*Index, bool)
 	CreateTable(name parser.ObjectName, cols []Column) (*Table, error)
+	CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error)
+	AddColumn(table *Table, col Column) (*Column, error)
 	DropTable(name parser.ObjectName) error
+	DropIndex(name parser.ObjectName) error
+	IndexesOnTable(table *Table) []*Index
+	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
+	IndexRelFileNode(index *Index) storage.RelFileNode
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -66,6 +94,8 @@ type Catalog interface {
 type InMemory struct {
 	mu      sync.RWMutex
 	tables  map[string]*Table
+	indexes map[string]*Index
+	byTable map[uint32]map[string]*Index
 	nextOID uint32
 	dbOid   uint32
 }
@@ -84,6 +114,8 @@ const DefaultDBOid uint32 = 1
 func NewInMemory() *InMemory {
 	return &InMemory{
 		tables:  make(map[string]*Table),
+		indexes: make(map[string]*Index),
+		byTable: make(map[uint32]map[string]*Index),
 		nextOID: FirstUserOID,
 		dbOid:   DefaultDBOid,
 	}
@@ -121,6 +153,15 @@ func (c *InMemory) LookupColumn(table *Table, name string) (*Column, bool) {
 	return nil, false
 }
 
+// LookupIndex returns the index with the given name, or false when
+// unresolved.
+func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	idx, ok := c.indexes[key(name)]
+	return idx, ok
+}
+
 // CreateTable installs a new table in the catalog. Returns an error
 // when a table with the same name already exists.
 func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, error) {
@@ -144,17 +185,128 @@ func (c *InMemory) CreateTable(name parser.ObjectName, cols []Column) (*Table, e
 	return t, nil
 }
 
+// CreateIndex installs a new index in the catalog. Returns an error
+// when an index with the same name already exists.
+func (c *InMemory) CreateIndex(name parser.ObjectName, table *Table, cols []string, unique bool, method string, primary bool) (*Index, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if table == nil {
+		return nil, fmt.Errorf("table is nil")
+	}
+	k := key(name)
+	if _, exists := c.indexes[k]; exists {
+		return nil, fmt.Errorf("relation %q already exists", k)
+	}
+	idx := &Index{
+		Schema:  name.Schema,
+		Name:    name.Name,
+		Table:   table,
+		Columns: append([]string(nil), cols...),
+		Unique:  unique,
+		Method:  strings.ToLower(method),
+		Primary: primary,
+		OID:     c.nextOID,
+	}
+	c.nextOID++
+	c.indexes[k] = idx
+	if c.byTable[table.OID] == nil {
+		c.byTable[table.OID] = map[string]*Index{}
+	}
+	c.byTable[table.OID][k] = idx
+	return idx, nil
+}
+
+// AddColumn appends one column to an existing table definition.
+func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if table == nil {
+		return nil, fmt.Errorf("table is nil")
+	}
+	k := key(parser.ObjectName{Schema: table.Schema, Name: table.Name})
+	t, ok := c.tables[k]
+	if !ok {
+		return nil, fmt.Errorf("relation %q does not exist", table.QualifiedName())
+	}
+	for i := range t.Columns {
+		if strings.EqualFold(t.Columns[i].Name, col.Name) {
+			return nil, fmt.Errorf("column %q already exists", col.Name)
+		}
+	}
+	col.Ordinal = len(t.Columns)
+	t.Columns = append(t.Columns, col)
+	return &t.Columns[len(t.Columns)-1], nil
+}
+
 // DropTable removes a table from the catalog. Returns an error when
 // the name doesn't resolve.
 func (c *InMemory) DropTable(name parser.ObjectName) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	k := key(name)
-	if _, exists := c.tables[k]; !exists {
+	tbl, exists := c.tables[k]
+	if !exists {
 		return fmt.Errorf("relation %q does not exist", k)
+	}
+	if idxs, ok := c.byTable[tbl.OID]; ok {
+		for idxKey := range idxs {
+			delete(c.indexes, idxKey)
+		}
+		delete(c.byTable, tbl.OID)
 	}
 	delete(c.tables, k)
 	return nil
+}
+
+// DropIndex removes an index from the catalog.
+func (c *InMemory) DropIndex(name parser.ObjectName) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(name)
+	idx, ok := c.indexes[k]
+	if !ok {
+		return fmt.Errorf("index %q does not exist", k)
+	}
+	delete(c.indexes, k)
+	if idxs, ok := c.byTable[idx.Table.OID]; ok {
+		delete(idxs, k)
+		if len(idxs) == 0 {
+			delete(c.byTable, idx.Table.OID)
+		}
+	}
+	return nil
+}
+
+// IndexesOnTable returns indexes whose base relation is table.
+func (c *InMemory) IndexesOnTable(table *Table) []*Index {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if table == nil {
+		return nil
+	}
+	idxs := c.byTable[table.OID]
+	out := make([]*Index, 0, len(idxs))
+	for _, idx := range idxs {
+		out = append(out, idx)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].QualifiedName() < out[j].QualifiedName() })
+	return out
+}
+
+// HasPrimaryKey reports whether table has a primary-key index.
+func (c *InMemory) HasPrimaryKey(table *Table) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if table == nil {
+		return false
+	}
+	idxs := c.byTable[table.OID]
+	for _, idx := range idxs {
+		if idx.Primary {
+			return true
+		}
+	}
+	return false
 }
 
 // RelFileNode returns the storage manager identity for a table.
@@ -162,4 +314,11 @@ func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return storage.RelFileNode{DBOid: c.dbOid, RelOid: table.OID, Fork: storage.MainFork}
+}
+
+// IndexRelFileNode returns the storage manager identity for an index.
+func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return storage.RelFileNode{DBOid: c.dbOid, RelOid: index.OID, Fork: storage.MainFork}
 }

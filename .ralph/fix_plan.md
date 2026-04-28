@@ -272,9 +272,13 @@ unchecked item unless a dependency forces a different order.
         undefined_table on DROP without IF EXISTS. End-to-end tests
         run CREATE/DROP/TRUNCATE through the parser→planner→executor
         stack.
-  - [ ] DDL operator path: CREATE INDEX / DROP INDEX / ALTER TABLE
-        wired through the B-tree + catalog (deferred — needs catalog
-        index metadata first).
+  - [x] DDL operator path: CREATE INDEX / DROP INDEX / ALTER TABLE
+        wired through the B-tree + catalog. `internal/catalog` now
+        tracks index metadata; executor DDL handles CREATE INDEX
+        (single-column int4 btree build/backfill), DROP INDEX,
+        ALTER TABLE ADD COLUMN, and ALTER TABLE ADD PRIMARY KEY
+        (unique btree). TRUNCATE now resets dependent index files as
+        well.
   - [x] Transaction operator: BEGIN/COMMIT/ROLLBACK plumbed to
         `mvcc.Manager` and per-session state. `internal/executor`
         now has `transactionOp` + `Session` abstraction

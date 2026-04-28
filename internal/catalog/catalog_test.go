@@ -60,3 +60,73 @@ func TestCatalogDuplicateAndMissing(t *testing.T) {
 		t.Error("DropTable of missing should fail")
 	}
 }
+
+func TestCatalogIndexLifecycle(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "items"}, []Column{{Name: "id", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := c.CreateIndex(parser.ObjectName{Name: "items_id_idx"}, tbl, []string{"id"}, false, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx.OID <= tbl.OID {
+		t.Fatalf("index oid=%d should be greater than table oid=%d", idx.OID, tbl.OID)
+	}
+	if _, ok := c.LookupIndex(parser.ObjectName{Name: "items_id_idx"}); !ok {
+		t.Fatal("LookupIndex failed")
+	}
+	idxs := c.IndexesOnTable(tbl)
+	if len(idxs) != 1 || idxs[0].Name != "items_id_idx" {
+		t.Fatalf("IndexesOnTable=%+v", idxs)
+	}
+	rfn := c.IndexRelFileNode(idx)
+	if rfn.RelOid != idx.OID || rfn.DBOid != DefaultDBOid {
+		t.Fatalf("IndexRelFileNode=%+v", rfn)
+	}
+	if err := c.DropIndex(parser.ObjectName{Name: "items_id_idx"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.LookupIndex(parser.ObjectName{Name: "items_id_idx"}); ok {
+		t.Fatal("index should be gone after DropIndex")
+	}
+}
+
+func TestCatalogDropTableAlsoDropsIndexes(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []Column{{Name: "id", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "t_pkey"}, tbl, []string{"id"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	if !c.HasPrimaryKey(tbl) {
+		t.Fatal("expected HasPrimaryKey to be true")
+	}
+	if err := c.DropTable(parser.ObjectName{Name: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.LookupIndex(parser.ObjectName{Name: "t_pkey"}); ok {
+		t.Fatal("index metadata should be removed when table is dropped")
+	}
+}
+
+func TestCatalogAddColumn(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "items"}, []Column{{Name: "id", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	col, err := c.AddColumn(tbl, Column{Name: "label", Type: Type{Name: "text"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if col.Ordinal != 1 {
+		t.Fatalf("new column ordinal=%d want=1", col.Ordinal)
+	}
+	if _, err := c.AddColumn(tbl, Column{Name: "LABEL", Type: Type{Name: "text"}}); err == nil {
+		t.Fatal("duplicate AddColumn should fail")
+	}
+}

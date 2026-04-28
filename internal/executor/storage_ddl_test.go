@@ -1,10 +1,11 @@
 package executor
 
 import (
-	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -165,6 +166,157 @@ func TestDDLTruncateClearsRelation(t *testing.T) {
 	}
 }
 
+func TestDDLCreateIndexBuildsSearchableBTree(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	if err := runDDL(t, ctx, "CREATE INDEX idx_items_id ON items (id)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_items_id"})
+	if !ok {
+		t.Fatal("index not in catalog after CREATE INDEX")
+	}
+	rel := ctx.Catalog.IndexRelFileNode(idx)
+	tree, err := btree.Open(ctx.Pool, rel)
+	if err != nil {
+		t.Fatalf("btree.Open: %v", err)
+	}
+	for _, k := range []int32{1, 2, 3} {
+		if _, found, err := tree.Search(btree.EncodeInt4(k)); err != nil || !found {
+			t.Fatalf("index search key=%d found=%v err=%v", k, found, err)
+		}
+	}
+}
+
+func TestDDLDropIndexRemovesCatalogAndFile(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX idx_items_id ON items (id)"); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_items_id"})
+	idxRel := ctx.Catalog.IndexRelFileNode(idx)
+
+	if err := runDDL(t, ctx, "DROP INDEX idx_items_id"); err != nil {
+		t.Fatalf("DROP INDEX: %v", err)
+	}
+	if _, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "idx_items_id"}); ok {
+		t.Fatal("index still in catalog after DROP INDEX")
+	}
+	n, err := ctx.Pool.NBlocks(idxRel)
+	if err != nil {
+		t.Fatalf("NBlocks on dropped index rel: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("dropped index rel has %d blocks, want 0", n)
+	}
+}
+
+func TestDDLAlterTableAddColumnKeepsExistingRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	if err := writeHeapRow(ctx, ctx.Catalog.RelFileNode(tbl), tbl.Columns, Row{{Kind: KindInt, Int: 7}}); err != nil {
+		t.Fatalf("writeHeapRow: %v", err)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE items ADD COLUMN label text"); err != nil {
+		t.Fatalf("ALTER TABLE ADD COLUMN: %v", err)
+	}
+	tbl, _ = ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	if len(tbl.Columns) != 2 || tbl.Columns[1].Name != "label" {
+		t.Fatalf("columns after ADD COLUMN: %+v", tbl.Columns)
+	}
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	if rows[0][0].Int != 7 {
+		t.Fatalf("id=%d want=7", rows[0][0].Int)
+	}
+	if !rows[0][1].IsNull() {
+		t.Fatalf("new column should read NULL for old rows, got %+v", rows[0][1])
+	}
+}
+
+func TestDDLAlterTableAddPrimaryKeyCreatesUniqueIndex(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	if err := runDDL(t, ctx, "ALTER TABLE items ADD PRIMARY KEY (id)"); err != nil {
+		t.Fatalf("ALTER TABLE ... ADD PRIMARY KEY: %v", err)
+	}
+	idx, ok := ctx.Catalog.LookupIndex(parser.ObjectName{Name: "items_pkey"})
+	if !ok {
+		t.Fatal("expected items_pkey index in catalog")
+	}
+	if !idx.Unique || !idx.Primary {
+		t.Fatalf("index flags: unique=%v primary=%v", idx.Unique, idx.Primary)
+	}
+	tree, err := btree.Open(ctx.Pool, ctx.Catalog.IndexRelFileNode(idx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := tree.Search(btree.EncodeInt4(2)); err != nil || !found {
+		t.Fatalf("primary-key index search found=%v err=%v", found, err)
+	}
+}
+
+func TestDDLAlterTableAddPrimaryKeyRejectsDuplicates(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE dup (id int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "dup"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	err := runDDL(t, ctx, "ALTER TABLE dup ADD PRIMARY KEY (id)")
+	if err == nil {
+		t.Fatal("expected unique-violation on duplicate id values")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "23505" {
+		t.Fatalf("err=%v want ExecError 23505", err)
+	}
+}
+
 // newDDLFixture is a sibling of newStorageFixture that does NOT
 // pre-create a table — DDL tests do that themselves through the
 // executor.
@@ -177,16 +329,25 @@ func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 		t.Fatalf("NewPool: %v", err)
 	}
 	cat := catalog.NewInMemory()
+	mgrMVCC := mvcc.NewManager()
+	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := mgrMVCC.SnapshotFor(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := NewContext()
 	ctx.Pool = pool
 	ctx.Catalog = cat
+	ctx.TxnMgr = mgrMVCC
+	ctx.Tx = tx
+	ctx.Snap = snap
 	cleanup := func() {
+		_ = mgrMVCC.Rollback(tx)
 		_ = pool.Close()
 		_ = mgr.Close()
-	}
-	// Sanity: confirm the data dir is in scope.
-	if !strings.HasPrefix(dir, t.TempDir()[:len(dir)-len(t.Name())]) && false {
-		t.Log("dir", dir)
 	}
 	return ctx, cat, cleanup
 }
