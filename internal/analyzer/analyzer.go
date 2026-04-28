@@ -250,6 +250,10 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: "numeric"}, nil
 	case *parser.StringConst:
 		return catalog.Type{Name: "text"}, nil
+	case *parser.TypedStringLit:
+		return catalog.Type{Name: x.Type}, nil
+	case *parser.IntervalLit:
+		return catalog.Type{Name: "interval"}, nil
 	case *parser.CaseExpr:
 		return analyzeCaseExpr(x, ctx)
 	case *parser.NullConst:
@@ -314,6 +318,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return catalog.Type{Name: "bool"}, nil
 		case "+", "-", "*", "/", "%":
+			// timestamp/date ± interval → timestamp. TPC-H Q1
+			// (`l_shipdate <= date '...' - interval '90' day`)
+			// hits this; v0 returns the result as `timestamp`
+			// since date is internally a timestamp.
+			if (x.Op == "+" || x.Op == "-") &&
+				isTimestampLike(leftTyp) && strings.EqualFold(rightTyp.Name, "interval") {
+				return catalog.Type{Name: "timestamp"}, nil
+			}
+			if x.Op == "+" &&
+				strings.EqualFold(leftTyp.Name, "interval") && isTimestampLike(rightTyp) {
+				return catalog.Type{Name: "timestamp"}, nil
+			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
@@ -552,6 +568,24 @@ func isNumericLike(t catalog.Type) bool {
 	return isNumericTypeName(t.Name)
 }
 
+// isTimestampLike reports whether a type is one of the v0
+// timestamp / date kinds. They share an internal representation
+// (KindTime), so timestamp ± interval and date ± interval go
+// through the same evaluator path.
+func isTimestampLike(t catalog.Type) bool {
+	if isUnknownType(t) {
+		return true
+	}
+	switch strings.ToLower(t.Name) {
+	case "timestamp", "timestamptz", "date":
+		return true
+	}
+	return false
+}
+
+// isComparableTime allows timestamp/date columns to be compared
+// against each other and against unknown literals. Used by the
+// CASE branch unifier.
 func isStringTypeName(name string) bool {
 	switch strings.ToLower(name) {
 	case "text", "varchar", "character varying", "char", "bpchar", "name":
@@ -581,6 +615,9 @@ func isComparable(left, right catalog.Type) bool {
 		return true
 	}
 	if isBooleanTypeName(left.Name) && isBooleanTypeName(right.Name) {
+		return true
+	}
+	if isTimestampLike(left) && isTimestampLike(right) {
 		return true
 	}
 	return false

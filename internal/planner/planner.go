@@ -637,6 +637,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
 		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
+	case *parser.TypedStringLit:
+		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
+	case *parser.IntervalLit:
+		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.NullConst:
 		return &NullConst{pos: x.Pos()}, nil
 	case *parser.BooleanConst:
@@ -1224,6 +1228,10 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return &NumericConst{pos: x.Pos(), Value: x.Value}, nil
 	case *parser.StringConst:
 		return &StringConst{pos: x.Pos(), Value: x.Value}, nil
+	case *parser.TypedStringLit:
+		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
+	case *parser.IntervalLit:
+		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.NullConst:
 		return &NullConst{pos: x.Pos()}, nil
 	case *parser.BooleanConst:

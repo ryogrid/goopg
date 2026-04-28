@@ -38,6 +38,37 @@ type NumericConst struct {
 func (e *NumericConst) Pos() int { return e.pos }
 func (*NumericConst) exprNode()  {}
 
+// TypedStringLit represents the SQL-standard typed-string-literal
+// syntax — `<type> 'value'`. The two we care about for TPC-H:
+// `date '1998-12-01'` and `timestamp '1998-12-01 00:00:00'`. The
+// parser emits this when it sees an unquoted ident matching a
+// recognised type-name (date / timestamp / timestamptz)
+// immediately followed by a TokenStringLit. The executor parses
+// `Value` per `Type` at evaluation time.
+type TypedStringLit struct {
+	pos   int
+	Type  string // lower-cased type name: "date", "timestamp", "timestamptz"
+	Value string
+}
+
+func (e *TypedStringLit) Pos() int { return e.pos }
+func (*TypedStringLit) exprNode()  {}
+
+// IntervalLit represents the SQL-standard `interval 'N' unit`
+// shape used heavily by TPC-H (Q1: `interval '90' day`, Q4:
+// `interval '3' month`, Q5/6/12/14: `interval '1' year`, etc.).
+// v0 supports the integer-count + single-unit form only (day,
+// month, year and their plurals); upstream's full ISO 8601 and
+// multi-field forms wait on the type system.
+type IntervalLit struct {
+	pos   int
+	Value string // verbatim numeric body of the literal (e.g. "90")
+	Unit  string // lower-cased unit: "day"/"month"/"year"
+}
+
+func (e *IntervalLit) Pos() int { return e.pos }
+func (*IntervalLit) exprNode()  {}
+
 // CaseWhen is one (WHEN cond THEN result) clause inside a CASE
 // expression.
 type CaseWhen struct {

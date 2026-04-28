@@ -65,6 +65,29 @@ type NumericConst struct {
 func (e *NumericConst) Pos() int { return e.pos }
 func (*NumericConst) exprNode()  {}
 
+// TypedStringLit mirrors parser.TypedStringLit. The executor
+// parses `Value` per `Type` at evaluation time so callers can
+// compare against catalog-typed columns without an explicit
+// cast operator.
+type TypedStringLit struct {
+	pos   int
+	Type  string
+	Value string
+}
+
+func (e *TypedStringLit) Pos() int { return e.pos }
+func (*TypedStringLit) exprNode()  {}
+
+// IntervalLit mirrors parser.IntervalLit.
+type IntervalLit struct {
+	pos   int
+	Value string
+	Unit  string
+}
+
+func (e *IntervalLit) Pos() int { return e.pos }
+func (*IntervalLit) exprNode()  {}
+
 // CaseWhen mirrors parser.CaseWhen with planner-resolved
 // expressions in place of parser-AST nodes.
 type CaseWhen struct {

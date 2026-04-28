@@ -726,6 +726,20 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       all return correct rows. Required for TPC-H Q1/Q12/Q14. See
       `docs/design/0003-0005-case-expressions.md`.)
 - [ ] Date and interval arithmetic, `EXTRACT(... FROM ts)`.
+      (date/interval landed 2026-04-28 — EXTRACT still pending.
+      `date 'YYYY-MM-DD'` and `timestamp 'YYYY-MM-DD HH:MM:SS'`
+      typed-string literals parse via parser.TypedStringLit;
+      `interval 'N' unit` (units day/month/year + plurals)
+      via parser.IntervalLit. New Datum.KindInterval with
+      months+days fields. Binary +/- between time and interval
+      uses Go's time.AddDate so month overflow matches
+      upstream's calendar-arithmetic semantics. Verified
+      end-to-end via psql 18.3: TPC-H Q1's
+      `l_shipdate <= date '1998-12-01' - interval '90' day`
+      and Q4/Q5/Q6's range-with-+interval shape both filter
+      correctly. EXTRACT(field FROM ts) is its own grammar
+      and stays open. See
+      `docs/design/0003-0006-date-interval-arithmetic.md`.)
 - [ ] `FETCH FIRST n ROWS ONLY` as a `LIMIT` synonym.
 - [ ] Views (CREATE VIEW / DROP VIEW) where HammerDB uses them.
 - [ ] All 22 queries (Q1–Q22) execute end-to-end and produce

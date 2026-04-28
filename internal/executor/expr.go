@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,10 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	switch x := e.(type) {
 	case *planner.CaseExpr:
 		return evalCaseExpr(x, row, ctx)
+	case *planner.TypedStringLit:
+		return evalTypedStringLit(x)
+	case *planner.IntervalLit:
+		return evalIntervalLit(x)
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
 	case *planner.NumericConst:
@@ -115,7 +120,21 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		return NullDatum, nil
 	}
 	switch op {
-	case "+", "-", "*", "/", "%":
+	case "+", "-":
+		// timestamp/date ± interval and interval + timestamp/date
+		// route through the time-arithmetic path before falling
+		// back to integer arithmetic. v0 doesn't support
+		// interval - timestamp (upstream rejects it too) or
+		// timestamp - timestamp (returns interval upstream;
+		// scope-deferred until the type system).
+		if left.Kind == KindTime && right.Kind == KindInterval {
+			return addTimeInterval(left, right, op == "-"), nil
+		}
+		if op == "+" && left.Kind == KindInterval && right.Kind == KindTime {
+			return addTimeInterval(right, left, false), nil
+		}
+		fallthrough
+	case "*", "/", "%":
 		if left.Kind != KindInt || right.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
 		}
@@ -133,6 +152,21 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		return Datum{Kind: KindBool, Bool: cmpResult(op, cmp)}, nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
+}
+
+// addTimeInterval applies an interval to a time value. When
+// `subtract` is true the interval is negated first. Months are
+// applied via time.AddDate (which carries year/month overflow
+// the way upstream PG does for `timestamp + interval '1 month'`);
+// days are added via the same call.
+func addTimeInterval(t, iv Datum, subtract bool) Datum {
+	months := int(iv.IntervalMonths)
+	days := int(iv.IntervalDays)
+	if subtract {
+		months = -months
+		days = -days
+	}
+	return Datum{Kind: KindTime, Time: t.Time.AddDate(0, months, days)}
 }
 
 func arithmetic(op string, a, b int64, pos int) (Datum, error) {
@@ -238,6 +272,54 @@ func evalOr(a, b Datum) Datum {
 		return NullDatum
 	}
 	return Datum{Kind: KindBool, Bool: a.Bool || b.Bool}
+}
+
+// evalTypedStringLit parses the body of a `<type> 'value'`
+// literal at evaluation time. v0 supports date / timestamp /
+// timestamptz; the parsed time is normalised to UTC.
+func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
+	switch x.Type {
+	case "date":
+		t, err := time.Parse("2006-01-02", x.Value)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
+		}
+		return Datum{Kind: KindTime, Time: t.UTC()}, nil
+	case "timestamp", "timestamptz":
+		// Try a few common upstream layouts in order. The
+		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
+		// use; `2006-01-02T15:04:05Z` is RFC3339 fallback.
+		layouts := []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05", "2006-01-02"}
+		for _, layout := range layouts {
+			if t, err := time.Parse(layout, x.Value); err == nil {
+				return Datum{Kind: KindTime, Time: t.UTC()}, nil
+			}
+		}
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
+	}
+	return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("typed-string literal with type %q is not supported", x.Type)}
+}
+
+// evalIntervalLit parses the integer body of an `interval 'N' unit`
+// literal. The parser already normalised plurals so Unit is one
+// of day / month / year.
+func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
+	n, err := strconv.ParseInt(x.Value, 10, 32)
+	if err != nil {
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
+	}
+	d := Datum{Kind: KindInterval}
+	switch x.Unit {
+	case "day":
+		d.IntervalDays = int32(n)
+	case "month":
+		d.IntervalMonths = int32(n)
+	case "year":
+		d.IntervalMonths = int32(n) * 12
+	default:
+		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
+	}
+	return d, nil
 }
 
 // evalCaseExpr evaluates the SQL CASE expression. Two forms:

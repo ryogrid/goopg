@@ -2,6 +2,7 @@ package parser
 
 import (
 	"strconv"
+	"strings"
 )
 
 // parseSelect parses a SELECT statement.
@@ -627,9 +628,61 @@ func (p *parser) parsePrimary() (Expr, error) {
 		}
 	}
 	if t.Kind == TokenIdent || t.Kind == TokenQuotedIdent {
+		// Typed-literal sugar: `date '...'`, `timestamp '...'`,
+		// `timestamptz '...'`, `interval 'N' unit`. Recognised
+		// only when the type name is unquoted and immediately
+		// followed by a TokenStringLit. Anything else falls
+		// through to the normal column / function-call parse.
+		if t.Kind == TokenIdent {
+			if lit, ok := p.tryTypedLiteral(); ok {
+				return lit, nil
+			}
+		}
 		return p.parseColumnOrCall()
 	}
 	return nil, p.errAtCur("expected expression")
+}
+
+// tryTypedLiteral peeks at the current ident and the token after
+// it; if the pair matches `<typename> '...'`, it consumes both
+// (and the trailing unit ident for INTERVAL) and returns the
+// typed literal. Otherwise it leaves the parser position
+// unchanged and returns ok=false so the caller can fall back to
+// the normal column/function-call parse.
+func (p *parser) tryTypedLiteral() (Expr, bool) {
+	t := p.cur()
+	name := strings.ToLower(identText(t))
+	switch name {
+	case "date", "timestamp", "timestamptz":
+		next := p.peek(1)
+		if next.Kind != TokenStringLit {
+			return nil, false
+		}
+		p.advance() // consume type ident
+		strTok := p.advance()
+		return &TypedStringLit{pos: t.Pos, Type: name, Value: strTok.Value}, true
+	case "interval":
+		next := p.peek(1)
+		if next.Kind != TokenStringLit {
+			return nil, false
+		}
+		unitTok := p.peek(2)
+		if unitTok.Kind != TokenIdent {
+			return nil, false
+		}
+		unit := strings.ToLower(identText(unitTok))
+		switch unit {
+		case "day", "days", "month", "months", "year", "years":
+			// Normalise plural→singular so the executor
+			// only sees three unit values.
+			canonical := strings.TrimSuffix(unit, "s")
+			p.advance() // INTERVAL
+			strTok := p.advance()
+			p.advance() // unit
+			return &IntervalLit{pos: t.Pos, Value: strTok.Value, Unit: canonical}, true
+		}
+	}
+	return nil, false
 }
 
 // parseCaseExpr parses both forms of CASE:
