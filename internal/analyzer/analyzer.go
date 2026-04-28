@@ -258,6 +258,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return resolveColumnRefType(x, ctx)
 	case *parser.StarExpr:
 		return catalog.Type{}, analyzeError(x.Pos(), "42601", "'*' is not allowed here")
+	case *parser.CastExpr:
+		// v0 treats `expr::type` as a no-op for type-checking. We
+		// recurse into the operand so analysis errors inside it
+		// surface, but report `unknown` for the cast result so
+		// downstream comparison-compatibility checks pass without
+		// us implementing a real type lattice. This is good enough
+		// for shapes like `oid=$1::pg_catalog.regclass` where the
+		// declared target type isn't a goopg-tracked type at all.
+		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "unknown"}, nil
 	case *parser.UnaryOp:
 		opTyp, err := analyzeExpr(x.Operand, ctx)
 		if err != nil {

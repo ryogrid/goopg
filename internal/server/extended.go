@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
@@ -242,7 +244,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 		if err := w.WriteParameterDescription(oids); err != nil {
 			return nil, err
 		}
-		fields := describeExtendedQuery(stmt.Query)
+		fields := s.describeExtendedQuery(stmt.Query)
 		if len(fields) == 0 {
 			if err := w.WriteNoData(); err != nil {
 				return nil, err
@@ -262,7 +264,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 				Routine: "server.handleDescribeFrame",
 			}, nil
 		}
-		fields := describeExtendedQuery(portal.Statement.Query)
+		fields := s.describeExtendedQuery(portal.Statement.Query)
 		if len(fields) == 0 {
 			if err := w.WriteNoData(); err != nil {
 				return nil, err
@@ -500,7 +502,7 @@ func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string
 	}
 }
 
-func describeExtendedQuery(query string) []protocol.FieldDescription {
+func (s *Server) describeExtendedQuery(query string) []protocol.FieldDescription {
 	_, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return nil
@@ -536,7 +538,48 @@ func describeExtendedQuery(query string) []protocol.FieldDescription {
 		}
 		return []protocol.FieldDescription{{Name: name, TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0}}
 	}
+	if s.cfg.hasStorage() {
+		// Plan the statement to learn its output schema. Errors here
+		// are non-fatal — we just fall back to NoData and let the
+		// follow-up Execute surface a real error.
+		if fields, ok := s.describeViaPlanner(query); ok {
+			return fields
+		}
+	}
 	return nil
+}
+
+// describeViaPlanner parses+plans the query and converts the
+// planner's output schema into a wire-protocol RowDescription. The
+// caller dispatches based on whether the result is non-empty: an
+// empty schema (write-only statement, transaction verb, etc.) is
+// signalled to the wire layer as NoData. Errors return ok=false; the
+// real error will surface during Execute.
+func (s *Server) describeViaPlanner(query string) ([]protocol.FieldDescription, bool) {
+	stmts, err := parser.Parse(query)
+	if err != nil || len(stmts) != 1 {
+		return nil, false
+	}
+	node, err := planner.Plan(stmts[0], s.cfg.Catalog)
+	if err != nil {
+		return nil, false
+	}
+	schema := node.Output()
+	if len(schema) == 0 {
+		// Write-only / DDL / transaction — no rows.
+		return nil, true
+	}
+	fields := make([]protocol.FieldDescription, len(schema))
+	for i, sc := range schema {
+		fields[i] = protocol.FieldDescription{
+			Name:         sc.Name,
+			TypeOID:      typeOIDFor(sc.Type.Name),
+			TypeSize:     -1,
+			TypeModifier: -1,
+			Format:       0,
+		}
+	}
+	return fields, true
 }
 
 func normalizeSimpleQuery(query string) (trimmed string, matchable string, upper string, empty bool) {

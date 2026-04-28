@@ -39,6 +39,15 @@ type Table struct {
 	Name    string
 	Columns []Column
 	OID     uint32
+
+	// Virtual marks tables that don't live on the heap. The planner
+	// short-circuits SeqScan into a materialised Values node by
+	// calling VirtualRows() at plan time. v0 uses this for the
+	// minimal pg_catalog views (pg_class, etc.) so external tools
+	// like pgbench that probe for table metadata get a useful answer
+	// without us bootstrapping a full system catalog.
+	Virtual     bool
+	VirtualRows func() [][]string
 }
 
 // Index is one index relation in the catalog.
@@ -110,15 +119,65 @@ const FirstUserOID uint32 = 16384
 // catalog entry lives in this database.
 const DefaultDBOid uint32 = 1
 
-// NewInMemory returns an empty catalog.
+// NewInMemory returns a catalog seeded with the v0 pg_catalog
+// virtual views.
 func NewInMemory() *InMemory {
-	return &InMemory{
+	c := &InMemory{
 		tables:  make(map[string]*Table),
 		indexes: make(map[string]*Index),
 		byTable: make(map[uint32]map[string]*Index),
 		nextOID: FirstUserOID,
 		dbOid:   DefaultDBOid,
 	}
+	c.registerSystemTables()
+	return c
+}
+
+// registerSystemTables installs the minimal pg_catalog v0 needs:
+// pg_class with one row per user table. The OID column is text-typed
+// because regclass casts are no-ops in v0 — pgbench's
+// `oid=$1::pg_catalog.regclass` ends up comparing the bound text
+// parameter (the table name) against pg_class.oid, so storing the
+// relname there makes the equality match.
+func (c *InMemory) registerSystemTables() {
+	pgClass := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_class",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "relname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "relkind", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "relnamespace", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID:     1259, // upstream's RelationRelationId
+		Virtual: true,
+	}
+	pgClass.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		keys := make([]string, 0, len(c.tables))
+		for k := range c.tables {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		out := make([][]string, 0, len(c.tables))
+		for _, k := range keys {
+			t := c.tables[k]
+			if t.Virtual {
+				// Don't list ourselves in our own view — keeps the
+				// regclass probe shape predictable for pgbench.
+				continue
+			}
+			out = append(out, []string{
+				t.Name,
+				t.Name,
+				"r",
+				"pg_catalog",
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_class"] = pgClass
 }
 
 // key builds the map key for a parser.ObjectName. Matching follows

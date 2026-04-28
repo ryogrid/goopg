@@ -183,7 +183,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			}
 		}
 		ctx = singleBindingContext(tbl, rv.Alias)
-		node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
+		if tbl.Virtual {
+			node = buildVirtualValues(s.Pos(), tbl, ctx.schema)
+		} else {
+			node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
+		}
 	} else {
 		var err error
 		node, ctx, err = planFromClause(s, cat)
@@ -399,7 +403,35 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 	}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0}
 	ctx := newResolveContext([]rangeBinding{b}, tableSchema(tbl))
+	if tbl.Virtual {
+		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
+	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, schema: ctx.schema}, b, nil
+}
+
+// buildVirtualValues materialises a virtual table's current rows as
+// a Values plan node. The catalog provides the rows as text; we wrap
+// each cell in a planner.StringConst so downstream Filter/Project
+// nodes can apply WHERE/SELECT predicates exactly as they do over a
+// SeqScan.
+func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
+	var rows [][]Expr
+	if tbl.VirtualRows != nil {
+		raw := tbl.VirtualRows()
+		rows = make([][]Expr, len(raw))
+		for i, r := range raw {
+			cells := make([]Expr, len(tbl.Columns))
+			for j := range tbl.Columns {
+				if j < len(r) {
+					cells[j] = &StringConst{pos: pos, Value: r[j]}
+				} else {
+					cells[j] = &NullConst{pos: pos}
+				}
+			}
+			rows[i] = cells
+		}
+	}
+	return &Values{pos: pos, Rows: rows, schema: schema}
 }
 
 func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resolveContext) (Expr, error) {

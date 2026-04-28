@@ -55,6 +55,12 @@ func (c *InMemory) Snapshot() Snapshot {
 	defer c.mu.RUnlock()
 	s := Snapshot{NextOID: c.nextOID}
 	for _, t := range c.tables {
+		if t.Virtual {
+			// Virtual catalog views are re-registered on every
+			// startup; persisting them would just churn the JSON
+			// snapshot without preserving anything useful.
+			continue
+		}
 		s.Tables = append(s.Tables, TableEntry{
 			OID:     t.OID,
 			Schema:  t.Schema,
@@ -140,5 +146,8 @@ func (c *InMemory) Restore(s Snapshot) error {
 		}
 		c.byTable[t.OID][k] = idx
 	}
+	// Re-install the pg_catalog virtual views: they're not part of
+	// the persisted snapshot but must be present on every startup.
+	c.registerSystemTables()
 	return nil
 }

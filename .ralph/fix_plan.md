@@ -358,16 +358,21 @@ unchecked item unless a dependency forces a different order.
       KindInt; everything else becomes KindString) and flow
       through Context.Params for ParamRef resolution. pgbench -i
       now gets past DROP/CREATE preamble, the pre-COPY BEGIN,
-      and the bind-parameter handshake. The `::` typecast also
-      parses now: the lexer recognises `::`, the parser produces a
-      `parser.CastExpr` with the type stored as a (possibly
-      schema-qualified) ObjectName, and the planner unwraps it as
-      a no-op (the executor doesn't yet enforce typing). Next
-      blocker: `pg_catalog.pg_class` doesn't exist — the SELECT
-      fails with 42P01 (`relation "pg_class" does not exist`).
-      Adding a minimal pg_catalog (pg_class + pg_attribute +
-      pg_namespace, populated from the in-memory catalog) is the
-      next sub-step.)
+      and the bind-parameter handshake. The `::` typecast parses
+      end-to-end (analyzer treats the cast as `unknown` so
+      comparisons stay compatible). pg_catalog gets a v0
+      foothold: catalog.Table grows a `Virtual` flag and a
+      `VirtualRows` provider; `pg_catalog.pg_class` is
+      pre-registered with one row per user table (oid stores the
+      relname so regclass casts compare equal); the planner emits
+      a materialised Values node for virtual tables; Snapshot/
+      Restore skip them. Extended-query Describe(P) now plans the
+      query and emits a real RowDescription instead of NoData. Next
+      blocker: pgbench's first COPY (`copy pgbench_branches from
+      stdin with (freeze on)`) fails with `row has 1 fields,
+      expected 3` — the wire-layer line splitter or the
+      CopyFromExecutor field count is wrong on pgbench-generated
+      data; needs investigation.)
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
 
