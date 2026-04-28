@@ -438,6 +438,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // another ReadyForQuery so the client can keep going.
 func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger) {
 	extended := newExtendedState()
+	var copyIn *copyInState
 	for {
 		if ctx.Err() != nil {
 			s.writeFatal(w, sqlstate.AdminShutdown, "terminating connection due to administrator command")
@@ -450,6 +451,22 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 			}
 			return
 		}
+		if copyIn != nil {
+			if f.Type == protocol.MsgTerminate {
+				return
+			}
+			done, err := s.handleCopyInFrame(w, copyIn, f)
+			if err != nil {
+				return
+			}
+			if done {
+				copyIn = nil
+			}
+			if err := w.Flush(); err != nil {
+				return
+			}
+			continue
+		}
 		if extended.syncRequired && f.Type != protocol.MsgSync && f.Type != protocol.MsgTerminate {
 			continue
 		}
@@ -457,10 +474,12 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 		case protocol.MsgTerminate:
 			return
 		case protocol.MsgQuery:
-			if err := s.handleQuery(w, sess, f.Payload); err != nil {
-				logger.Debug("handleQuery write error", "err", err)
+			nextCopyIn, err := s.handleQueryOrCopy(w, sess, f.Payload)
+			if err != nil {
+				logger.Debug("handleQueryOrCopy write error", "err", err)
 				return
 			}
+			copyIn = nextCopyIn
 		case protocol.MsgParse:
 			em := s.handleParseFrame(extended, f.Payload)
 			if em != nil {

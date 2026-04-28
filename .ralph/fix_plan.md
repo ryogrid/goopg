@@ -296,6 +296,10 @@ unchecked item unless a dependency forces a different order.
 - [x] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
+      (partial: simple-query COPY wire loop now handles a minimal
+      `COPY (SELECT 1) TO STDOUT` path and COPY FROM STDIN data mode,
+      but parser/planner/executor-backed table COPY and binary mode are
+      still pending.)
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.

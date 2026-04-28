@@ -138,6 +138,40 @@ func (fw *FrameWriter) WriteNoData() error {
 	return fw.WriteFrame(MsgNoData, nil)
 }
 
+// WriteCopyInResponse emits 'G' / int8 overall-format / int16 ncolumns /
+// int16 format[*]. overall-format is 0=text or 1=binary.
+func (fw *FrameWriter) WriteCopyInResponse(overallFormat byte, columnFormats []uint16) error {
+	payload := make([]byte, 0, 1+2+2*len(columnFormats))
+	payload = append(payload, overallFormat)
+	payload = appendUint16(payload, uint16(len(columnFormats)))
+	for _, f := range columnFormats {
+		payload = appendUint16(payload, f)
+	}
+	return fw.WriteFrame(MsgCopyInResponse, payload)
+}
+
+// WriteCopyOutResponse emits 'H' with the same payload layout as
+// CopyInResponse.
+func (fw *FrameWriter) WriteCopyOutResponse(overallFormat byte, columnFormats []uint16) error {
+	payload := make([]byte, 0, 1+2+2*len(columnFormats))
+	payload = append(payload, overallFormat)
+	payload = appendUint16(payload, uint16(len(columnFormats)))
+	for _, f := range columnFormats {
+		payload = appendUint16(payload, f)
+	}
+	return fw.WriteFrame(MsgCopyOutResponse, payload)
+}
+
+// WriteCopyData emits one COPY data chunk ('d').
+func (fw *FrameWriter) WriteCopyData(data []byte) error {
+	return fw.WriteFrame(MsgCopyData, data)
+}
+
+// WriteCopyDone emits backend CopyDone ('c').
+func (fw *FrameWriter) WriteCopyDone() error {
+	return fw.WriteFrame(MsgCopyDone, nil)
+}
+
 // ErrorField is one (code, value) pair inside an ErrorResponse or
 // NoticeResponse body. See docs/design/0002-wire-protocol.md for the list
 // of codes the v0 server emits.
