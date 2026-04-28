@@ -23,9 +23,9 @@ const (
 // CANCEL_REQUEST_CODE / NEGOTIATE_SSL_CODE / NEGOTIATE_GSS_CODE constants in
 // postgres/src/include/libpq/pqcomm.h.
 const (
-	CancelRequestCode     uint32 = 1234<<16 | 5678
-	NegotiateSSLCode      uint32 = 1234<<16 | 5679
-	NegotiateGSSCode      uint32 = 1234<<16 | 5680
+	CancelRequestCode uint32 = 1234<<16 | 5678
+	NegotiateSSLCode  uint32 = 1234<<16 | 5679
+	NegotiateGSSCode  uint32 = 1234<<16 | 5680
 )
 
 // MaxStartupPacketLength caps the size of a startup packet. Matches
@@ -50,13 +50,11 @@ const (
 	MsgNoticeResponse  byte = 'N'
 )
 
-// Frontend message type bytes recognised by the v0 server. The full set is
-// listed in protocol.h; v0 only needs Terminate ('X') to close cleanly,
-// everything else becomes an "unsupported" error response.
+// Frontend message type bytes recognised by the v0 server. v0 only needs
+// Terminate ('X') to close cleanly; every other frontend message becomes
+// an "unsupported" error response. Milestone 2 will widen this set.
 const (
 	MsgTerminate byte = 'X'
-	MsgQuery     byte = 'Q'
-	MsgSync      byte = 'S' // shares value with ParameterStatus; context disambiguates
 )
 
 // AuthenticationOk subcode (postgres/src/include/libpq/protocol.h).
@@ -66,7 +64,7 @@ const AuthenticationOK uint32 = 0
 type TransactionStatus byte
 
 const (
-	TxStatusIdle               TransactionStatus = 'I'
-	TxStatusInTransaction      TransactionStatus = 'T'
+	TxStatusIdle                TransactionStatus = 'I'
+	TxStatusInTransaction       TransactionStatus = 'T'
 	TxStatusInFailedTransaction TransactionStatus = 'E'
 )

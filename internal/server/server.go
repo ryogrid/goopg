@@ -69,10 +69,11 @@ func (c *Config) defaults() {
 // Server is the goopg TCP listener.
 //
 // Lifecycle:
-//   srv, err := server.New(cfg)
-//   go func() { _ = srv.Run(ctx) }()
-//   ...
-//   cancel(); srv.Wait() // or rely on Run to return
+//
+//	srv, err := server.New(cfg)
+//	go func() { _ = srv.Run(ctx) }()
+//	...
+//	cancel(); srv.Wait() // or rely on Run to return
 //
 // Once Run returns, the Server cannot be restarted.
 type Server struct {
