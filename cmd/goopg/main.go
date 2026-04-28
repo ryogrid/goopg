@@ -1,0 +1,137 @@
+// Package main is the goopg command-line entrypoint. It plays the combined
+// role that PostgreSQL splits across initdb, postmaster, and pg_ctl: data
+// directory initialization, server lifecycle, and the operator-facing
+// commands that PostgreSQL drives via signals.
+//
+// See .ralph/specs/GOAL_AND_REQUIREMENTS.md §3.3 and §7.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"os"
+)
+
+const usage = `goopg — a Go reimplementation of PostgreSQL.
+
+Usage:
+  goopg <command> [arguments]
+
+Commands:
+  init       Initialize a data directory.
+  start      Run the server in the foreground.
+  stop       Request a graceful shutdown of a running server.
+  restart    Stop the server and start it again.
+  reload     Reload configuration without restarting.
+  status     Report whether a server is running and its high-level state.
+  version    Print the goopg version and exit.
+
+Use "goopg <command> -h" for command-specific flags.
+`
+
+type subcommand struct {
+	name string
+	run  func(args []string, stdout, stderr io.Writer) int
+}
+
+var subcommands = []subcommand{
+	{"init", runInit},
+	{"start", runStart},
+	{"stop", runStop},
+	{"restart", runRestart},
+	{"reload", runReload},
+	{"status", runStatus},
+	{"version", runVersion},
+}
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprint(stdout, usage)
+		return 0
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		fmt.Fprint(stdout, usage)
+		return 0
+	}
+	for _, c := range subcommands {
+		if c.name == args[0] {
+			return c.run(args[1:], stdout, stderr)
+		}
+	}
+	fmt.Fprintf(stderr, "goopg: unknown command %q\n\n", args[0])
+	fmt.Fprint(stderr, usage)
+	return 2
+}
+
+// notImplemented is the temporary handler for subcommands whose
+// implementation is still pending. Each subcommand defines its own flag
+// set up front so that "-h" already gives operators a stable surface to
+// script against, and so that future loops only need to fill in the body.
+func notImplemented(name string, fs *flag.FlagSet, args []string, stderr io.Writer) int {
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	fmt.Fprintf(stderr, "goopg %s: not yet implemented\n", name)
+	return 1
+}
+
+func runInit(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	fs.String("D", "", "data directory to initialize (required)")
+	return notImplemented("init", fs, args, stderr)
+}
+
+func runStart(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("start", flag.ContinueOnError)
+	fs.String("D", "", "data directory")
+	fs.String("config", "", "path to postgresql.conf (default: $D/postgresql.conf)")
+	return notImplemented("start", fs, args, stderr)
+}
+
+func runStop(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	fs.String("D", "", "data directory of the server to stop")
+	fs.String("mode", "fast", "shutdown mode: smart|fast|immediate")
+	return notImplemented("stop", fs, args, stderr)
+}
+
+func runRestart(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
+	fs.String("D", "", "data directory")
+	fs.String("mode", "fast", "shutdown mode for the stop phase")
+	return notImplemented("restart", fs, args, stderr)
+}
+
+func runReload(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("reload", flag.ContinueOnError)
+	fs.String("D", "", "data directory of the server to reload")
+	return notImplemented("reload", fs, args, stderr)
+}
+
+func runStatus(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.String("D", "", "data directory of the server to inspect")
+	return notImplemented("status", fs, args, stderr)
+}
+
+// version is the human-readable build tag for the goopg binary. The reported
+// PostgreSQL-compatibility wire version is a separate concern and lives in
+// the protocol layer (see docs/design/0001-architecture-overview.md).
+const version = "0.0.0-dev"
+
+func runVersion(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	fmt.Fprintf(stdout, "goopg %s\n", version)
+	return 0
+}

@@ -9,6 +9,8 @@
 .ralph/.response_analysis
 .ralph/.circuit_breaker_state
 .ralph/.circuit_breaker_history
+.ralph/.loop_start_sha
+.ralph/.token_count
 
 # Ralph logs and generated docs
 .ralph/logs/*
@@ -27,15 +29,25 @@ Thumbs.db
 *.tmp
 .temp/
 
-# Node modules (if using Node.js projects)
-node_modules/
+# Go build artifacts
+/bin/
+/dist/
+/goopg            # stray binary `go build ./...` drops at repo root
+*.test
+*.out
+coverage.txt
+coverage.html
 
-# Python cache (if using Python projects)
-__pycache__/
-*.pyc
+# Read-only upstream PostgreSQL reference clone — not part of goopg's codebase.
+# See .ralph/specs/GOAL_AND_REQUIREMENTS.md §2.
+/postgres/
 
-# Rust build (if using Rust projects)
-target/
+# Local dev data directories
+/tmp-data/
+/var/
+
+# IDE / editor
+.gopls/
 
 # IDE files
 .vscode/

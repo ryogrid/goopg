@@ -1,158 +1,120 @@
-# Agent Build Instructions
+# Agent Build Instructions — goopg
 
-## Project Setup
-```bash
-# Install dependencies (example for Node.js project)
-npm install
+`goopg` is a from-scratch Go reimplementation of PostgreSQL. The project
+target platform is x86_64 Linux only. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md`
+for the authoritative goals; pick work from `.ralph/fix_plan.md`.
 
-# Or for Python project
-pip install -r requirements.txt
+## Toolchain
 
-# Or for Rust project  
-cargo build
+- Go (≥ 1.22, whatever is on PATH).
+- Standard libc and a Linux kernel that supports `O_DIRECT` on the filesystem
+  used for the data directory (ext4 / xfs).
+- No CGo unless a specific syscall is unreachable from `golang.org/x/sys/unix`.
+  Justify any introduction in a design doc.
+
+## Repository layout
+
+```
+.
+├── cmd/goopg/         # Top-level CLI entrypoint (replaces postmaster + pg_ctl + initdb)
+├── internal/          # All non-public packages live here
+│   ├── server/        # Listener, connection lifecycle, shutdown orchestration
+│   ├── protocol/      # PostgreSQL wire protocol (v3) framing and messages
+│   ├── config/        # postgresql.conf, pg_hba.conf, GUC registry
+│   ├── storage/       # Buffer manager, page format, file I/O (O_DIRECT)
+│   ├── wal/           # Write-ahead log writer and recovery
+│   ├── mvcc/          # Snapshot manager, visibility, transaction IDs
+│   ├── catalog/       # System catalogs and pg_* views
+│   ├── parser/        # SQL parser/analyzer
+│   ├── planner/       # Query planner
+│   ├── executor/      # Query executor and physical operators
+│   ├── access/        # Access methods (heap, btree)
+│   └── auth/          # trust / password / md5 / scram-sha-256
+├── docs/design/       # Design documents (0001, 0002, …) — see §9 of the spec
+├── postgres/          # READ-ONLY upstream PostgreSQL source — reference only
+├── .ralph/            # Ralph autonomous-loop control files (DO NOT MODIFY)
+└── go.mod
 ```
 
-## Running Tests
+Subdirectories under `internal/` are created on demand as their corresponding
+milestones are tackled. Do not create empty stubs ahead of time.
+
+## Build
+
 ```bash
-# Node.js
-npm test
-
-# Python
-pytest
-
-# Rust
-cargo test
+go build ./...                       # whole module
+go build -o bin/goopg ./cmd/goopg    # produce the binary explicitly
 ```
 
-## Build Commands
+## Test
+
 ```bash
-# Production build
-npm run build
-# or
-cargo build --release
+go test ./...                                   # full suite
+go test -run <Pattern> ./internal/<pkg>         # focused
+go test -race ./...                             # race detector — preferred when
+                                                # touching concurrency code
+go test -cover ./...                            # coverage summary
 ```
 
-## Development Server
+Integration tests that need a real `psql`/`pgbench` belong under
+`internal/<subsystem>/...` next to the code they exercise, gated by a build
+tag (`//go:build integration`) so the default `go test ./...` stays fast.
+
+## Lint and format
+
 ```bash
-# Start development server
-npm run dev
-# or
-cargo run
+gofmt -l .          # must produce empty output
+go vet ./...
 ```
+
+## Reference oracle: `./postgres/`
+
+A read-only clone of the upstream PostgreSQL source tree lives at `./postgres/`.
+It is the source of truth for wire format, on-disk format, GUC defaults, error
+codes, system catalog shape, and SQL semantics. GNU GLOBAL tags are
+pre-generated under `./postgres/`, so:
+
+```bash
+# from inside ./postgres
+global -x SymbolName            # locate definitions
+global -rx SymbolName           # locate references
+global -f path/to/file.c        # list symbols defined in a file
+```
+
+When porting any concept, cite the upstream file path (e.g.
+`postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
+and/or code comment. Never modify, vendor, or import code from `./postgres/`.
+
+## LSP
+
+`gopls` is the recommended LSP for navigating `goopg`'s own code. Use it for
+"go to definition", references, and rename refactors.
+
+## Runtime expectations
+
+- The server binary must run in the foreground; daemonization is not a goal.
+- Operator-facing actions PostgreSQL drives via signals are implemented as
+  `goopg ctl <subcommand>` (see §3.3 of the spec). The minimal set the
+  process accepts directly is `SIGINT` and `SIGTERM`, which are translated
+  internally to the same path as `goopg stop`.
+
+## Loop discipline (for Ralph)
+
+- One item per loop. Pick the topmost unchecked task in
+  `.ralph/fix_plan.md` unless a dependency forces another order.
+- Search before assuming something is missing. Prefer reading the spec and
+  the upstream source over guessing.
+- Land a design doc alongside or just before any non-trivial subsystem. This
+  is a hard requirement, not optional documentation.
+- Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
+  loop's effort. Implementation > documentation > tests when prioritising.
+- Update `.ralph/fix_plan.md` at the end of every loop: tick boxes, add
+  newly-discovered follow-ups, and note any tasks that turned out to be
+  larger than expected.
 
 ## Key Learnings
-- Update this section when you learn new build optimizations
-- Document any gotchas or special setup requirements
-- Keep track of the fastest test/build cycle
 
-## Feature Development Quality Standards
-
-**CRITICAL**: All new features MUST meet the following mandatory requirements before being considered complete.
-
-### Testing Requirements
-
-- **Minimum Coverage**: 85% code coverage ratio required for all new code
-- **Test Pass Rate**: 100% - all tests must pass, no exceptions
-- **Test Types Required**:
-  - Unit tests for all business logic and services
-  - Integration tests for API endpoints or main functionality
-  - End-to-end tests for critical user workflows
-- **Coverage Validation**: Run coverage reports before marking features complete:
-  ```bash
-  # Examples by language/framework
-  npm run test:coverage
-  pytest --cov=src tests/ --cov-report=term-missing
-  cargo tarpaulin --out Html
-  ```
-- **Test Quality**: Tests must validate behavior, not just achieve coverage metrics
-- **Test Documentation**: Complex test scenarios must include comments explaining the test strategy
-
-### Git Workflow Requirements
-
-Before moving to the next feature, ALL changes must be:
-
-1. **Committed with Clear Messages**:
-   ```bash
-   git add .
-   git commit -m "feat(module): descriptive message following conventional commits"
-   ```
-   - Use conventional commit format: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, etc.
-   - Include scope when applicable: `feat(api):`, `fix(ui):`, `test(auth):`
-   - Write descriptive messages that explain WHAT changed and WHY
-
-2. **Pushed to Remote Repository**:
-   ```bash
-   git push origin <branch-name>
-   ```
-   - Never leave completed features uncommitted
-   - Push regularly to maintain backup and enable collaboration
-   - Ensure CI/CD pipelines pass before considering feature complete
-
-3. **Branch Hygiene**:
-   - Work on feature branches, never directly on `main`
-   - Branch naming convention: `feature/<feature-name>`, `fix/<issue-name>`, `docs/<doc-update>`
-   - Create pull requests for all significant changes
-
-4. **Ralph Integration**:
-   - Update .ralph/fix_plan.md with new tasks before starting work
-   - Mark items complete in .ralph/fix_plan.md upon completion
-   - Update .ralph/PROMPT.md if development patterns change
-   - Test features work within Ralph's autonomous loop
-
-### Documentation Requirements
-
-**ALL implementation documentation MUST remain synchronized with the codebase**:
-
-1. **Code Documentation**:
-   - Language-appropriate documentation (JSDoc, docstrings, etc.)
-   - Update inline comments when implementation changes
-   - Remove outdated comments immediately
-
-2. **Implementation Documentation**:
-   - Update relevant sections in this AGENT.md file
-   - Keep build and test commands current
-   - Update configuration examples when defaults change
-   - Document breaking changes prominently
-
-3. **README Updates**:
-   - Keep feature lists current
-   - Update setup instructions when dependencies change
-   - Maintain accurate command examples
-   - Update version compatibility information
-
-4. **AGENT.md Maintenance**:
-   - Add new build patterns to relevant sections
-   - Update "Key Learnings" with new insights
-   - Keep command examples accurate and tested
-   - Document new testing patterns or quality gates
-
-### Feature Completion Checklist
-
-Before marking ANY feature as complete, verify:
-
-- [ ] All tests pass with appropriate framework command
-- [ ] Code coverage meets 85% minimum threshold
-- [ ] Coverage report reviewed for meaningful test quality
-- [ ] Code formatted according to project standards
-- [ ] Type checking passes (if applicable)
-- [ ] All changes committed with conventional commit messages
-- [ ] All commits pushed to remote repository
-- [ ] .ralph/fix_plan.md task marked as complete
-- [ ] Implementation documentation updated
-- [ ] Inline code comments updated or added
-- [ ] .ralph/AGENT.md updated (if new patterns introduced)
-- [ ] Breaking changes documented
-- [ ] Features tested within Ralph loop (if applicable)
-- [ ] CI/CD pipeline passes
-
-### Rationale
-
-These standards ensure:
-- **Quality**: High test coverage and pass rates prevent regressions
-- **Traceability**: Git commits and .ralph/fix_plan.md provide clear history of changes
-- **Maintainability**: Current documentation reduces onboarding time and prevents knowledge loss
-- **Collaboration**: Pushed changes enable team visibility and code review
-- **Reliability**: Consistent quality gates maintain production stability
-- **Automation**: Ralph integration ensures continuous development practices
-
-**Enforcement**: AI agents should automatically apply these standards to all feature development tasks without requiring explicit instruction for each task.
+- Go module path is `github.com/goopg/goopg` (placeholder; rename if a real
+  origin is chosen later).
+- Reported `server_version` is tracked in design doc `0001-architecture-overview.md`
+  so client gating (`pgx`, JDBC, `psql`) behaves predictably.
