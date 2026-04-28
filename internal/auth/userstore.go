@@ -41,6 +41,14 @@ const (
 	// pg_authid.rolpassword shape that the `md5` auth method consumes
 	// directly without ever seeing the original password.
 	PasswordMD5
+
+	// PasswordSCRAMSHA256 stores the upstream
+	//   SCRAM-SHA-256$<iter>:<salt-b64>$<StoredKey-b64>:<ServerKey-b64>
+	// rolpassword form. The cleartext password is unrecoverable from
+	// this format; it satisfies the `scram-sha-256` auth method
+	// directly, and the `password` (cleartext) method by recomputing
+	// the StoredKey and comparing.
+	PasswordSCRAMSHA256
 )
 
 // Credential is one entry in the user store. Use NewPlaintextCredential or
@@ -80,16 +88,23 @@ func ParseMD5Stored(secret string) (Credential, error) {
 }
 
 // VerifyCleartext checks an incoming cleartext password against the stored
-// credential. Both stored formats are supported: a plaintext credential
-// is compared byte-for-byte (constant-time), and an md5 credential is
-// reproduced by re-shadowing the supplied password+username and
-// comparing.
+// credential. Plaintext credentials are compared byte-for-byte
+// (constant-time); md5 credentials are reproduced by re-shadowing the
+// supplied password+username; SCRAM credentials are validated by re-running
+// the SCRAM key derivation and comparing StoredKey, matching upstream's
+// scram_verify_plain_password.
 func (c Credential) VerifyCleartext(user, given string) bool {
 	switch c.Type {
 	case PasswordPlaintext:
 		return subtle.ConstantTimeCompare([]byte(c.Secret), []byte(given)) == 1
 	case PasswordMD5:
 		return subtle.ConstantTimeCompare([]byte(c.Secret), []byte(md5Shadow(given, user))) == 1
+	case PasswordSCRAMSHA256:
+		secret, err := ParseSCRAMSecret(c.Secret)
+		if err != nil {
+			return false
+		}
+		return secret.VerifySCRAMSecretFromPassword(given)
 	default:
 		return false
 	}

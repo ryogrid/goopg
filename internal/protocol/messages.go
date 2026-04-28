@@ -30,6 +30,51 @@ func (fw *FrameWriter) WriteAuthenticationMD5Password(salt [4]byte) error {
 	return fw.WriteFrame(MsgAuthentication, buf[:])
 }
 
+// WriteAuthenticationSASL emits 'R' / int32(10) / [mechanism\0]+ / \0 —
+// the list of SASL mechanisms the server is willing to negotiate. The
+// client picks one and replies with a SASLInitialResponse. See
+// postgres/src/backend/libpq/auth.c:CheckSASLAuth.
+func (fw *FrameWriter) WriteAuthenticationSASL(mechanisms []string) error {
+	size := 4 + 1
+	for _, m := range mechanisms {
+		size += len(m) + 1
+	}
+	payload := make([]byte, 0, size)
+	payload = append(payload,
+		byte(AuthenticationSASL>>24), byte(AuthenticationSASL>>16),
+		byte(AuthenticationSASL>>8), byte(AuthenticationSASL))
+	for _, m := range mechanisms {
+		payload = append(payload, m...)
+		payload = append(payload, 0)
+	}
+	payload = append(payload, 0)
+	return fw.WriteFrame(MsgAuthentication, payload)
+}
+
+// WriteAuthenticationSASLContinue emits 'R' / int32(11) / SASL-data.
+// The body is mechanism-specific (for SCRAM-SHA-256, the
+// server-first-message).
+func (fw *FrameWriter) WriteAuthenticationSASLContinue(data []byte) error {
+	payload := make([]byte, 0, 4+len(data))
+	payload = append(payload,
+		byte(AuthenticationSASLCont>>24), byte(AuthenticationSASLCont>>16),
+		byte(AuthenticationSASLCont>>8), byte(AuthenticationSASLCont))
+	payload = append(payload, data...)
+	return fw.WriteFrame(MsgAuthentication, payload)
+}
+
+// WriteAuthenticationSASLFinal emits 'R' / int32(12) / SASL-data. The
+// body is mechanism-specific (for SCRAM-SHA-256, the
+// server-final-message containing the ServerSignature `v=...`).
+func (fw *FrameWriter) WriteAuthenticationSASLFinal(data []byte) error {
+	payload := make([]byte, 0, 4+len(data))
+	payload = append(payload,
+		byte(AuthenticationSASLFinal>>24), byte(AuthenticationSASLFinal>>16),
+		byte(AuthenticationSASLFinal>>8), byte(AuthenticationSASLFinal))
+	payload = append(payload, data...)
+	return fw.WriteFrame(MsgAuthentication, payload)
+}
+
 // WriteParameterStatus emits 'S' / key\0value\0.
 //
 // Both key and value must be valid PostgreSQL identifiers / values, i.e.

@@ -205,10 +205,84 @@ The server's `Config` grows a `UserStore auth.UserStore` field. nil is
 acceptable for trust-only deployments; password/md5 with a nil store
 report `ErrMethodUnsupported` rather than panicking.
 
+### SCRAM-SHA-256 (addendum, 2026-04-28)
+
+`scram-sha-256` is now implemented in `internal/auth/scram.go` per
+RFC 5802 + RFC 7677, mirroring upstream's
+`postgres/src/backend/libpq/auth-scram.c`. Wire shape is the standard
+SASL framing layered on the `'R'`/`'p'` envelopes:
+
+| Direction | Frame                                | Body                                                                  |
+| --------- | ------------------------------------ | --------------------------------------------------------------------- |
+| s → c     | `R` AuthenticationSASL (10)          | `"SCRAM-SHA-256\0" + "\0"` (one mechanism advertised, list-terminator). |
+| c → s     | `p` SASLInitialResponse              | `<mech>\0 int32 dataLen <client-first-message>`                       |
+| s → c     | `R` AuthenticationSASLContinue (11)  | `r=<combined-nonce>,s=<base64-salt>,i=<iter>`                         |
+| c → s     | `p` SASLResponse                     | `<client-final-message>` (`c=,r=,p=`)                                 |
+| s → c     | `R` AuthenticationSASLFinal (12)     | `v=<base64-ServerSignature>`                                          |
+| s → c     | `R` AuthenticationOk (0)             | empty                                                                 |
+
+#### Mechanism scope
+
+v0 advertises only `SCRAM-SHA-256` (no `-PLUS`). Channel binding stays
+out of scope until TLS lands; a client requesting `gs2-cbind-flag = "p=..."`
+is rejected at the parser. `"n"` and `"y"` flags are accepted, and the
+`c=` attribute on the client-final-message is checked against
+`base64("n,,")` / `base64("y,,")` exactly.
+
+SASLprep (RFC 4013) is **not** applied to the password before key
+derivation in v0. Upstream applies it via `pg_saslprep` and falls back
+to the raw bytes on prohibited characters; that fallback dominates for
+ASCII passwords (the common case). Adding the full SASLprep is queued
+for a follow-up loop — the seam is `scramBuildSecret`, where the
+password could be normalised before being passed to PBKDF2.
+
+#### Credential format
+
+`PasswordSCRAMSHA256` is the third format in the `Credential` enum. The
+secret string is exactly upstream's pg_authid.rolpassword shape:
+
+```
+SCRAM-SHA-256$<iterations>:<base64 salt>$<base64 StoredKey>:<base64 ServerKey>
+```
+
+`auth.NewSCRAMSecret(password)` derives a fresh secret with
+goopg/upstream defaults (16-byte salt, 4096 iterations, SHA-256 KDF).
+`auth.ParseSCRAMSecret(secret)` is the inverse — and the only way to
+ingest a secret produced by a real PostgreSQL deployment.
+
+A SCRAM credential can satisfy `password` (cleartext) auth too: we
+recompute StoredKey from the supplied password and constant-time
+compare, exactly as upstream's `scram_verify_plain_password` does.
+
+`PasswordMD5` cannot satisfy SCRAM (no plaintext available), and a
+SCRAM credential cannot satisfy `md5` for the same reason — both
+constraints match upstream's behaviour and are documented at the
+verifier call sites.
+
+#### Doomed exchanges and timing parity
+
+When the user is unknown (or the credential is the wrong format),
+`SCRAMServer` runs the full exchange against a fabricated mock secret
+derived from a per-connection random salt. The proof check then fails,
+and we report `ErrInvalidPassword` so the caller emits the same
+SQLSTATE 28000 ErrorResponse it would for a wrong password. This
+mirrors `auth-scram.c:442` ("we calculate the client proof even in a
+mock authentication ... to thwart timing attacks to determine if a role
+with the given name exists or not").
+
+#### What's still deferred
+
+- SASLprep (RFC 4013) password normalisation.
+- Channel binding (`SCRAM-SHA-256-PLUS`, `tls-server-end-point`). Lands
+  with TLS.
+- Mechanism negotiation when the client offers more than one. We
+  advertise one mechanism, so this isn't load-bearing yet.
+- `scram_iterations` GUC — today the default 4096 is hard-coded.
+  Becomes a GUC once the GUC registry exists (milestone 4).
+
 ### What this doc does NOT cover
 
-- The `scram-sha-256` exchange (RFC 7677, RFC 5802). Lands in a
-  follow-up loop with its own addendum here.
+- TLS itself, including `hostssl` enforcement and channel binding.
 - TLS / `hostssl` enforcement. v0 always answers `'N'` to SSLRequest;
   rules with `hostssl` are matched but never produce a passing
   outcome until TLS lands.

@@ -78,7 +78,20 @@ unchecked item unless a dependency forces a different order.
       ErrorResponse (SQLSTATE 28000) so the wire can't distinguish.
       Server `Config.UserStore` is the seam; nil is acceptable for
       trust-only deployments.
-- [ ] Implement `scram-sha-256` auth (preferred default).
+- [x] Implement `scram-sha-256` auth (preferred default).
+      `internal/auth/scram.go` implements RFC 5802 + 7677. PBKDF2-HMAC-
+      SHA-256 pinned to RFC 7914 known-answer; SaltedPassword /
+      ClientKey / StoredKey / ServerKey derivation matches
+      postgres/src/common/scram-common.c. SASL framing
+      (AuthenticationSASL / SASLContinue / SASLFinal) lives in
+      internal/protocol; SASLInitialResponse and SASLResponse parsing
+      lives in auth.Exchange. PasswordSCRAMSHA256 credential format
+      mirrors upstream's `SCRAM-SHA-256$<iter>:<salt>$<sk>:<svk>`
+      rolpassword. Doomed exchanges (unknown user, wrong-format
+      credential) run to completion against a mock secret for timing
+      parity, then fail with ErrInvalidPassword. SASLprep and channel
+      binding are deferred — documented as next-loop work in
+      0003-authentication.md.
 - [x] Design doc `0003-authentication.md`.
 
 ## Milestone 4 — Configuration and GUC system
