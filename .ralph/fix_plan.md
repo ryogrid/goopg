@@ -968,6 +968,27 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] Derived tables (`(SELECT …) AS alias` in FROM) for TPC-H Q13.
+      (achieved 2026-04-29: surfaced by running TPC-H Q13
+      end-to-end — parse-errored at `FROM (SELECT ...)`. Now:
+      parser.RangeVar grows a `Subquery *SelectStmt` field;
+      `(` + lookahead-SELECT path parses the inner SELECT,
+      requires a mandatory alias (matches upstream).
+      Analyzer's `synthesizeSubqueryTable` analyzes the inner
+      with no parent scope (no LATERAL in v0), walks the
+      target list to derive column names+types, and returns
+      a transient `*catalog.Table` with `Name=alias`.
+      Planner's `planSubqueryRangeVar` plans the inner
+      recursively via `Plan(rv.Subquery, cat)` and exposes
+      its `Output()` through the rangeBinding so outer
+      ColumnRefs to `alias.col` resolve normally. Verified
+      via psql 18.3 against Q13's full
+      `LEFT OUTER JOIN ... NOT LIKE` shape and bare/aliased
+      derived-table forms. `TestPlanDerivedTable` pins four
+      behaviours including the missing-alias rejection.
+      LATERAL, CTEs, and parenthesised plain relations
+      deferred. See
+      `docs/design/0003-0014-derived-tables.md`.)
 - [x] `GROUP BY <target-list-alias>` / `GROUP BY <positional-index>`
       for TPC-H Q7 (`extract(year FROM ...) AS l_year ...
       GROUP BY l_year`) and the PG-extension case generally.

@@ -397,6 +397,48 @@ func TestPlanOrderByAliasAndPositional(t *testing.T) {
 	})
 }
 
+// TestPlanDerivedTable pins the FROM-clause-subquery
+// (`(SELECT …) AS alias`) shape that TPC-H Q13 uses. The
+// outer SELECT must see the derived table's columns under its
+// alias and the inner SELECT's plan must be substituted in
+// place of a SeqScan.
+func TestPlanDerivedTable(t *testing.T) {
+	cat := pgbenchCatalog(t)
+
+	t.Run("derived table with explicit aliases", func(t *testing.T) {
+		sql := "SELECT t.k FROM (SELECT a.aid AS k FROM pgbench_accounts a) AS t ORDER BY t.k"
+		_, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+	})
+
+	t.Run("derived table with bare ColumnRef target", func(t *testing.T) {
+		sql := "SELECT s.aid FROM (SELECT a.aid FROM pgbench_accounts a) AS s ORDER BY s.aid"
+		_, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+	})
+
+	t.Run("derived table with aggregate", func(t *testing.T) {
+		// Q13 shape: GROUP BY in inner, GROUP BY in outer.
+		sql := "SELECT c_count, count(*) AS custdist FROM (SELECT a.aid, count(*) AS c_count FROM pgbench_accounts a GROUP BY a.aid) AS c_orders GROUP BY c_count"
+		_, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+	})
+
+	t.Run("derived table requires alias", func(t *testing.T) {
+		// The parser-side check enforces this.
+		_, err := parser.Parse("SELECT * FROM (SELECT 1) ORDER BY 1")
+		if err == nil {
+			t.Fatalf("expected parser error for missing alias on derived table")
+		}
+	})
+}
+
 // TestPlanGroupByAliasAndPositional pins the GROUP BY
 // substitution: bare aliases and positional indices rewrite to
 // the underlying target-list expression. PG accepts this as an

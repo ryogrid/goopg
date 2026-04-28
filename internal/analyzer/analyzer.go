@@ -634,11 +634,76 @@ func scopeRelMatches(rel scopeRel, table, schema string) bool {
 }
 
 func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
+	if rv.Subquery != nil {
+		return synthesizeSubqueryTable(cat, rv)
+	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !ok {
 		return nil, analyzeError(rv.Pos(), "42P01", fmt.Sprintf("relation %q does not exist", rv.Name))
 	}
 	return tbl, nil
+}
+
+// synthesizeSubqueryTable analyzes a derived table — the
+// `(SELECT …) AS alias` form parsed into rv.Subquery — and
+// builds an in-memory *catalog.Table whose columns mirror the
+// inner SELECT's target list. The table is alias-named so name
+// resolution in the outer query treats `alias.col` correctly,
+// and lives only for the duration of analysis (never registered
+// in the catalog).
+//
+// Column naming follows upstream's `transformTargetEntry`
+// fallback chain: explicit `AS alias` first, then derived names
+// (bare ColumnRef → column name; FuncCall → function name);
+// otherwise `?column?N`. Types come from analyzeExpr against an
+// inner scope built from the subquery's own FROM clause.
+//
+// v0 does not support LATERAL so the subquery is analyzed
+// without a parent scope; correlated derived tables are
+// deferred. See docs/design/0003-0014-derived-tables.md.
+func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
+	if err := analyzeSelectWithParent(rv.Subquery, cat, nil); err != nil {
+		return nil, err
+	}
+	innerCtx := &scope{cat: cat}
+	if len(rv.Subquery.From) > 0 || len(rv.Subquery.FromExprs) > 0 {
+		rels, err := buildSelectScope(rv.Subquery, cat)
+		if err != nil {
+			return nil, err
+		}
+		innerCtx.rels = rels
+	}
+	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
+	for i, tgt := range rv.Subquery.Targets {
+		name := tgt.Alias
+		if name == "" {
+			name = deriveAnalyzerTargetName(tgt.Expr)
+		}
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
+		}
+		typ, err := analyzeExpr(tgt.Expr, innerCtx)
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, catalog.Column{Name: name, Type: typ})
+	}
+	return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
+}
+
+// deriveAnalyzerTargetName mirrors executor.deriveTargetName for
+// the analyzer's synthetic-table flow. Bare ColumnRef returns
+// its column name; FuncCall returns its lower-cased function
+// name; everything else returns the empty string and the
+// caller falls back to `?column?N`.
+func deriveAnalyzerTargetName(e parser.Expr) string {
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		return x.Column
+	case *parser.FuncCall:
+		return strings.ToLower(x.Name.Name)
+	}
+	return ""
 }
 
 func buildSelectScope(s *parser.SelectStmt, cat catalog.Catalog) ([]scopeRel, error) {

@@ -133,12 +133,16 @@ type ResTarget struct {
 func (r ResTarget) Pos() int { return r.pos }
 
 // RangeVar is a relation reference appearing in a FROM clause:
-// `[schema.]table [AS alias]`.
+// `[schema.]table [AS alias]`. Subquery is non-nil when the
+// FROM item is a derived table — `(SELECT …) AS alias`. In that
+// case Name is empty and the parsed inner SELECT lives in
+// Subquery; the alias is required (matches upstream).
 type RangeVar struct {
-	pos    int
-	Schema string
-	Name   string
-	Alias  string // empty when no AS clause
+	pos      int
+	Schema   string
+	Name     string
+	Alias    string // empty when no AS clause
+	Subquery *SelectStmt
 }
 
 func (r RangeVar) Pos() int { return r.pos }

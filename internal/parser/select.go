@@ -351,6 +351,42 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 }
 
 func (p *parser) parseRangeVar() (RangeVar, error) {
+	// Derived table: `(SELECT …) AS alias`. The alias is mandatory
+	// in upstream PG; we mirror that. The two-token lookahead
+	// (`(` + SELECT) is necessary to disambiguate from
+	// `( table_name )` which v0 doesn't currently support but
+	// upstream does.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwSelect {
+		pos := p.cur().Pos
+		p.advance() // (
+		inner, err := p.parseSelect()
+		if err != nil {
+			return RangeVar{}, err
+		}
+		if !p.acceptSymbol(")") {
+			return RangeVar{}, p.errAtCur("expected ')' after subquery in FROM")
+		}
+		sel, ok := inner.(*SelectStmt)
+		if !ok {
+			return RangeVar{}, &SyntaxError{Pos: pos, Message: "subquery in FROM did not produce SELECT"}
+		}
+		rv := RangeVar{pos: pos, Subquery: sel}
+		if p.acceptKeyword(KwAs) {
+			t, err := p.parseIdent()
+			if err != nil {
+				return RangeVar{}, err
+			}
+			rv.Alias = identText(t)
+		} else if isAliasStart(p.cur()) {
+			t := p.advance()
+			rv.Alias = identText(t)
+		}
+		if rv.Alias == "" {
+			return RangeVar{}, &SyntaxError{Pos: pos, Message: "subquery in FROM must have an alias"}
+		}
+		return rv, nil
+	}
 	obj, err := p.parseObjectName()
 	if err != nil {
 		return RangeVar{}, err

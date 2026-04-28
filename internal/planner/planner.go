@@ -484,6 +484,9 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 }
 
 func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBinding, error) {
+	if rv.Subquery != nil {
+		return planSubqueryRangeVar(rv, cat)
+	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !ok {
 		return nil, rangeBinding{}, &PlanError{
@@ -554,6 +557,54 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 		}
 	}
 	return &Values{pos: pos, Rows: rows, schema: schema}
+}
+
+// planSubqueryRangeVar plans a `(SELECT …) AS alias` derived
+// table. The inner SELECT is planned with the same catalog so
+// nested derived tables / view refs / subqueries work; the
+// resulting plan node's Output() schema becomes the binding's
+// columns. Names come from the subquery's target-list aliases
+// or v0's deriveTargetName fallback (mirrors the analyzer's
+// synthesizeSubqueryTable). The synthetic *catalog.Table is
+// never registered in the catalog — it lives only to satisfy
+// the rangeBinding contract that downstream column resolution
+// uses.
+func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBinding, error) {
+	inner, err := Plan(rv.Subquery, cat)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	innerSchema := inner.Output()
+	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
+	schema := make(Schema, 0, len(rv.Subquery.Targets))
+	for i, tgt := range rv.Subquery.Targets {
+		name := tgt.Alias
+		if name == "" {
+			name = deriveSubqueryTargetName(tgt.Expr)
+		}
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
+		}
+		var typ catalog.Type
+		if i < len(innerSchema) {
+			typ = innerSchema[i].Type
+		}
+		cols = append(cols, catalog.Column{Name: name, Type: typ})
+		schema = append(schema, SchemaColumn{Name: name, Type: typ})
+	}
+	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
+	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0}
+	return inner, b, nil
+}
+
+func deriveSubqueryTargetName(e parser.Expr) string {
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		return x.Column
+	case *parser.FuncCall:
+		return strings.ToLower(x.Name.Name)
+	}
+	return ""
 }
 
 func planJoinPredicate(join parser.JoinExpr, leftCtx, rightCtx, mergedCtx *resolveContext) (Expr, error) {
