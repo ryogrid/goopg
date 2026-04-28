@@ -18,3 +18,7 @@ The project focuses on three validation themes:
 
 This repository is research-oriented and intentionally iterative. It is meant
 for experimentation, measurement, and learning, rather than production use.
+
+For oracle-based verification, this repository includes the upstream PostgreSQL
+repository as a submodule under postgres/. The current reference codebase is
+pinned to REL_18_3.
