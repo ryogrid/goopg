@@ -415,10 +415,24 @@ func (p *Pool) maybeEmitFPI(s *Slot) {
 }
 
 // FlushAll writes every dirty slot through smgr and clears the dirty
-// bit. Used by the checkpointer (when it lands).
+// bit. Equivalent to FlushAllPaced with a no-op pacer; convenient
+// for callers that don't want to spread the work over time
+// (CheckpointNow, Pool.Close).
 func (p *Pool) FlushAll() error {
-	// Snapshot the dirty set under the pool mutex, then flush each
-	// slot under its own contentMu so we don't block lookups.
+	return p.FlushAllPaced(nil)
+}
+
+// FlushAllPaced writes every dirty slot through smgr and invokes
+// `pacer(progress)` after each flush, where progress is the
+// fraction of work already completed in [0, 1]. The pacer can
+// sleep to spread the I/O over a target wall-clock window — this
+// is the path the spread checkpoint writes (milestone 0002) take.
+// A nil pacer behaves like FlushAll.
+//
+// The dirty set is snapshotted at entry; pages dirtied after the
+// snapshot are not flushed in this pass and stay dirty for the
+// next checkpoint.
+func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
 	p.poolMu.Lock()
 	type pending struct {
 		idx int
@@ -432,7 +446,8 @@ func (p *Pool) FlushAll() error {
 	}
 	p.poolMu.Unlock()
 
-	for _, t := range todo {
+	total := len(todo)
+	for i, t := range todo {
 		s := p.slots[t.idx]
 		s.contentMu.RLock()
 		err := p.flushSlot(t.tag, s.page)
@@ -447,6 +462,12 @@ func (p *Pool) FlushAll() error {
 			s.dirty = false
 		}
 		p.poolMu.Unlock()
+		if pacer != nil && total > 0 {
+			progress := float64(i+1) / float64(total)
+			if err := pacer(progress); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

@@ -45,6 +45,115 @@ func (f *fakeFlusher) Calls() int {
 	return f.calls
 }
 
+// TestCheckpointerSpreadPacing pins the milestone-0002
+// spread-checkpoint contract: when CompletionTarget is set and a
+// timer-driven checkpoint runs, the pacer is invoked once per
+// flushed buffer with monotonically increasing progress in
+// (0, 1]. The IMMEDIATE-speed paths (CheckpointNow and
+// volume-triggered) skip the pacer.
+func TestCheckpointerSpreadPacing(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	pf := &pacedFakeFlusher{dirty: 4}
+	cp := NewCheckpointer(pf, w, CheckpointerConfig{
+		Interval:         100 * time.Millisecond,
+		CompletionTarget: 0.5,
+	})
+
+	if err := cp.runCheckpoint(context.Background(), true); err != nil {
+		t.Fatalf("runCheckpoint(spread): %v", err)
+	}
+	if len(pf.progresses) != 4 {
+		t.Fatalf("pacer called %d times, want 4", len(pf.progresses))
+	}
+	prev := 0.0
+	for i, p := range pf.progresses {
+		if p <= prev {
+			t.Errorf("progress[%d]=%v not strictly greater than prev=%v", i, p, prev)
+		}
+		prev = p
+	}
+	if pf.progresses[len(pf.progresses)-1] != 1.0 {
+		t.Errorf("final progress = %v, want 1.0", pf.progresses[len(pf.progresses)-1])
+	}
+
+	// Now run an IMMEDIATE-speed checkpoint and expect no pacing.
+	pf2 := &pacedFakeFlusher{dirty: 3}
+	cp2 := NewCheckpointer(pf2, w, CheckpointerConfig{
+		Interval:         100 * time.Millisecond,
+		CompletionTarget: 0.5,
+	})
+	if err := cp2.CheckpointNow(); err != nil {
+		t.Fatal(err)
+	}
+	if len(pf2.progresses) != 0 {
+		t.Errorf("CheckpointNow paced %d times, want 0 (IMMEDIATE)", len(pf2.progresses))
+	}
+	if !pf2.flushAllCalled {
+		t.Error("CheckpointNow did not call FlushAll fallback")
+	}
+}
+
+// TestCheckpointerSpreadHonoursDeadlines verifies that the pacer
+// inserts wall-clock delay so total flush time approaches
+// Interval*CompletionTarget.
+func TestCheckpointerSpreadHonoursDeadlines(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// 4 buffers, target 50ms — pacer should aim for 12.5ms
+	// per buffer; total runtime should be at least 30ms
+	// (allowing for the last-buffer no-delay).
+	pf := &pacedFakeFlusher{dirty: 4}
+	cp := NewCheckpointer(pf, w, CheckpointerConfig{
+		Interval:         100 * time.Millisecond,
+		CompletionTarget: 0.5,
+	})
+	start := time.Now()
+	if err := cp.runCheckpoint(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 30*time.Millisecond {
+		t.Errorf("spread checkpoint completed in %v; expected >= 30ms", elapsed)
+	}
+	// Don't bound from above tightly — CI machines vary.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("spread checkpoint took %v; expected < 500ms", elapsed)
+	}
+}
+
+type pacedFakeFlusher struct {
+	dirty          int
+	progresses     []float64
+	flushAllCalled bool
+}
+
+func (p *pacedFakeFlusher) FlushAll() error {
+	p.flushAllCalled = true
+	return nil
+}
+
+func (p *pacedFakeFlusher) FlushAllPaced(pacer func(progress float64) error) error {
+	for i := 0; i < p.dirty; i++ {
+		progress := float64(i+1) / float64(p.dirty)
+		if err := pacer(progress); err != nil {
+			return err
+		}
+		p.progresses = append(p.progresses, progress)
+	}
+	return nil
+}
+
 // TestCheckpointerVolumeTrigger pins the max_wal_size path.
 // We arm a small MaxWALBytes threshold, append enough records
 // through the writer to cross it, and expect a checkpoint

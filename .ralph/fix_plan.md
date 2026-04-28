@@ -461,9 +461,18 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       default instead of the development-time 10s. SetInterval is
       a no-op for non-positive durations so a missing/typo'd GUC
       keeps the construction default.
-- [ ] Spread/smoothed checkpoint writes over
+- [x] Spread/smoothed checkpoint writes over
       `checkpoint_completion_target * checkpoint_timeout`, rather than
-      one synchronous burst (today's behaviour).
+      one synchronous burst. `storage.Pool.FlushAllPaced` walks a
+      snapshot of the dirty set and invokes a per-buffer pacer
+      callback after each write. The checkpointer builds a deadline-
+      driven pacer (`start + Interval * CompletionTarget * progress`)
+      for timer-driven runs only; volume-triggered checkpoints and
+      the SQL `CHECKPOINT` verb both run at IMMEDIATE speed
+      (`FlushAll` fallback) since they're backpressure / operator
+      requests, not cadence work. `goopg start` reads
+      `checkpoint_completion_target` from the registry and calls
+      `Checkpointer.SetCompletionTarget`.
 - [x] Trigger checkpoints when the WAL volume crosses `max_wal_size`,
       not just on the timer. `wal.Writer` exposes `WrittenLSN()`
       (atomic mirror of writeLSN); `wal.Checkpointer` polls it on a

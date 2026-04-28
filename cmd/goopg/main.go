@@ -211,6 +211,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				rt.Checkpointer.SetMaxWALBytes(uint64(mb) * 1024 * 1024)
 			}
 		}
+		if v, ok := registry.Get("checkpoint_completion_target"); ok {
+			if f, err := strconv.ParseFloat(v.Display(), 64); err == nil {
+				rt.Checkpointer.SetCompletionTarget(f)
+			}
+		}
 		if v, ok := registry.Get("full_page_writes"); ok && rt.Pool != nil {
 			rt.Pool.SetFullPageWrites(v.Display() == "on")
 		}

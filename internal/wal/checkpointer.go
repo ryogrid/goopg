@@ -13,6 +13,15 @@ type DirtyPageFlusher interface {
 	FlushAll() error
 }
 
+// pacedFlusher is implemented by *storage.Pool so the
+// checkpointer can spread dirty-page writeback over a target
+// wall-clock window (mirrors upstream's
+// checkpoint_completion_target). Optional — flushers that don't
+// satisfy it fall back to FlushAll, matching v0 behaviour.
+type pacedFlusher interface {
+	FlushAllPaced(pacer func(progress float64) error) error
+}
+
 // epochResetter is implemented by *storage.Pool so the
 // checkpointer can clear the per-page "FPI emitted this epoch"
 // flag after a successful checkpoint. Optional — checkpointers
@@ -50,7 +59,14 @@ type CheckpointerConfig struct {
 	// WrittenLSN to evaluate the volume trigger between timer
 	// ticks. Defaults to 1s when MaxWALBytes is set.
 	VolumeCheckInterval time.Duration
-	Logger              *slog.Logger
+	// CompletionTarget is the fraction of Interval over which
+	// timer-driven checkpoints spread their dirty-page writeback
+	// (mirrors upstream's checkpoint_completion_target). 0
+	// disables spreading; values are clamped to [0, 1]. Volume-
+	// triggered and SQL-triggered (CheckpointNow) checkpoints
+	// always run at IMMEDIATE speed and ignore this knob.
+	CompletionTarget float64
+	Logger           *slog.Logger
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -112,6 +128,19 @@ func (c *Checkpointer) SetMaxWALBytes(b uint64) {
 	}
 }
 
+// SetCompletionTarget updates the spread fraction (0 disables
+// spreading, 1 spreads across the full Interval). Out-of-range
+// values are clamped.
+func (c *Checkpointer) SetCompletionTarget(t float64) {
+	if t < 0 {
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	c.cfg.CompletionTarget = t
+}
+
 // Run starts the periodic checkpoint loop and returns when ctx is canceled.
 func (c *Checkpointer) Run(ctx context.Context) error {
 	ticker := time.NewTicker(c.cfg.Interval)
@@ -134,14 +163,17 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := c.checkpointOnce(); err != nil {
+			if err := c.runCheckpoint(ctx, true); err != nil {
 				c.cfg.Logger.Warn("checkpoint failed", "err", err)
 			}
 		case <-volumeC:
 			if !c.volumeTriggerFires(vr) {
 				continue
 			}
-			if err := c.checkpointOnce(); err != nil {
+			// Volume-triggered checkpoints run at IMMEDIATE
+			// speed: max_wal_size is a backpressure signal,
+			// not a cadence knob.
+			if err := c.runCheckpoint(ctx, false); err != nil {
 				c.cfg.Logger.Warn("volume-triggered checkpoint failed", "err", err)
 			}
 		}
@@ -165,17 +197,26 @@ func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
 	return written > last && (written-last) >= c.cfg.MaxWALBytes
 }
 
-// CheckpointNow performs a synchronous checkpoint and returns when
-// the marker is durable on disk. The SQL `CHECKPOINT` verb and the
-// `goopg ctl` checkpoint subcommand both call this; the periodic
-// Run loop also routes through it. Concurrent calls are serialized
-// through the underlying WAL writer.
+// CheckpointNow performs a synchronous, IMMEDIATE-speed
+// checkpoint and returns when the marker is durable on disk.
+// The SQL `CHECKPOINT` verb and the `goopg ctl` checkpoint
+// subcommand both call this. Spread/throttling is bypassed;
+// the caller asked for fast.
 func (c *Checkpointer) CheckpointNow() error {
-	return c.checkpointOnce()
+	return c.runCheckpoint(context.Background(), false)
 }
 
-func (c *Checkpointer) checkpointOnce() error {
-	if err := c.flusher.FlushAll(); err != nil {
+// runCheckpoint executes one checkpoint cycle. When `spread` is
+// true and CompletionTarget > 0, dirty-page writeback is paced so
+// it finishes near `start + Interval * CompletionTarget`. The WAL
+// marker is appended after writeback completes and is always
+// flushed synchronously — pacing only governs the dirty-page
+// drain.
+func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
+	start := time.Now()
+	pacer := c.buildPacer(ctx, spread, start)
+
+	if err := c.flushDirty(pacer); err != nil {
 		return fmt.Errorf("flush dirty pages: %w", err)
 	}
 	_, endLSN, err := c.wal.Append(EncodeCheckpoint())
@@ -193,4 +234,43 @@ func (c *Checkpointer) checkpointOnce() error {
 		er.ResetCheckpointEpoch()
 	}
 	return nil
+}
+
+// flushDirty drains the buffer pool's dirty set, using the paced
+// API when both the flusher and pacer are available.
+func (c *Checkpointer) flushDirty(pacer func(progress float64) error) error {
+	if pf, ok := c.flusher.(pacedFlusher); ok && pacer != nil {
+		return pf.FlushAllPaced(pacer)
+	}
+	return c.flusher.FlushAll()
+}
+
+// buildPacer returns a per-buffer delay function that aims to
+// finish writeback at start + Interval*CompletionTarget. Returns
+// nil when spreading is disabled or the inputs are degenerate;
+// flushDirty then takes the IMMEDIATE-speed FlushAll path.
+func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.Time) func(float64) error {
+	if !spread || c.cfg.CompletionTarget <= 0 || c.cfg.Interval <= 0 {
+		return nil
+	}
+	target := time.Duration(float64(c.cfg.Interval) * c.cfg.CompletionTarget)
+	if target <= 0 {
+		return nil
+	}
+	return func(progress float64) error {
+		if progress >= 1.0 {
+			return nil
+		}
+		deadline := start.Add(time.Duration(float64(target) * progress))
+		wait := time.Until(deadline)
+		if wait <= 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+			return nil
+		}
+	}
 }
