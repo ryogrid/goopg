@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -31,12 +32,24 @@ func (e *PlanError) Error() string {
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
+		if err := analyzer.Analyze(s, cat); err != nil {
+			return nil, toPlanError(err)
+		}
 		return planSelect(s, cat)
 	case *parser.InsertStmt:
+		if err := analyzer.Analyze(s, cat); err != nil {
+			return nil, toPlanError(err)
+		}
 		return planInsert(s, cat)
 	case *parser.UpdateStmt:
+		if err := analyzer.Analyze(s, cat); err != nil {
+			return nil, toPlanError(err)
+		}
 		return planUpdate(s, cat)
 	case *parser.DeleteStmt:
+		if err := analyzer.Analyze(s, cat); err != nil {
+			return nil, toPlanError(err)
+		}
 		return planDelete(s, cat)
 
 	case *parser.CreateTableStmt, *parser.DropTableStmt,
@@ -62,6 +75,13 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	}
 }
 
+func toPlanError(err error) error {
+	if ae, ok := err.(*analyzer.AnalyzeError); ok {
+		return &PlanError{Pos: ae.Pos, Code: ae.Code, Message: ae.Message}
+	}
+	return err
+}
+
 // resolveContext holds the per-statement name-resolution scope.
 //
 // v0 only supports single-relation FROM clauses, so this is just one
@@ -69,6 +89,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 // a per-RangeVar list.
 type resolveContext struct {
 	table  *catalog.Table
+	alias  string
 	schema Schema // schema produced by the input scan
 }
 
@@ -143,7 +164,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			Message: fmt.Sprintf("relation %q does not exist", rv.Name),
 		}
 	}
-	ctx := &resolveContext{table: tbl, schema: tableSchema(tbl)}
+	ctx := &resolveContext{table: tbl, alias: rv.Alias, schema: tableSchema(tbl)}
 	scan := &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	var node Node = scan
 	if s.Where != nil {
@@ -335,7 +356,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
-	ctx := &resolveContext{table: tbl, schema: tableSchema(tbl)}
+	ctx := &resolveContext{table: tbl, alias: s.Target.Alias, schema: tableSchema(tbl)}
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
 		pred, err := resolveExpr(s.Where, ctx)
@@ -364,7 +385,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
-	ctx := &resolveContext{table: tbl, schema: tableSchema(tbl)}
+	ctx := &resolveContext{table: tbl, alias: s.Target.Alias, schema: tableSchema(tbl)}
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
 		pred, err := resolveExpr(s.Where, ctx)
@@ -479,8 +500,10 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 	if ctx.table == nil {
 		return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
 	}
-	if x.Table != "" && x.Table != ctx.table.Name {
-		return nil, &PlanError{Pos: x.Pos(), Code: "42P01", Message: fmt.Sprintf("missing FROM-clause entry for table %q", x.Table)}
+	if x.Table != "" {
+		if !strings.EqualFold(x.Table, ctx.table.Name) && (ctx.alias == "" || !strings.EqualFold(x.Table, ctx.alias)) {
+			return nil, &PlanError{Pos: x.Pos(), Code: "42P01", Message: fmt.Sprintf("missing FROM-clause entry for table %q", x.Table)}
+		}
 	}
 	for i, c := range ctx.table.Columns {
 		if c.Name == x.Column {

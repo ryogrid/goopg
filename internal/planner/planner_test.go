@@ -83,6 +83,29 @@ func TestPlanPgbenchSelect(t *testing.T) {
 	}
 }
 
+func TestPlanSelectResolvesTableAlias(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	node, err := Plan(parseOne(t, "SELECT a.abalance FROM pgbench_accounts a WHERE a.aid = $1"), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proj, ok := node.(*Project)
+	if !ok {
+		t.Fatalf("root=%T want *Project", node)
+	}
+	filt, ok := proj.Child.(*Filter)
+	if !ok {
+		t.Fatalf("child=%T want *Filter", proj.Child)
+	}
+	pred, ok := filt.Predicate.(*BinaryOp)
+	if !ok || pred.Op != "=" {
+		t.Fatalf("predicate=%+v", filt.Predicate)
+	}
+	if _, ok := pred.Left.(*ColumnRef); !ok {
+		t.Fatalf("predicate.Left=%T want *ColumnRef", pred.Left)
+	}
+}
+
 func TestPlanPgbenchSelectUsesIndexScanRule(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
@@ -246,6 +269,7 @@ func TestPlanResolutionErrors(t *testing.T) {
 		{"SELECT aid FROM pgbench_accounts GROUP BY aid", "0A000"},       // grouping unsupported
 		{"SELECT 1 UNION SELECT 2", "0A000"},                             // set op unsupported
 		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "0A000"},
+		{"INSERT INTO pgbench_history (tid) VALUES (1) RETURNING tid", "0A000"},
 	}
 	for _, c := range cases {
 		_, err := Plan(parseOne(t, c.sql), cat)

@@ -224,7 +224,7 @@ unchecked item unless a dependency forces a different order.
         `ADD [COLUMN] coldef` actions. Pgbench's three primary-key
         ALTER strings parse end-to-end — pgbench -i's full DDL surface
         is now covered.
-  - [ ] Analyzer pass (name resolution, type checking) once the catalog
+  - [x] Analyzer pass (name resolution, type checking) once the catalog
         exists.
 - [x] Planner sufficient for pgbench's workload. `internal/catalog`
       provides the in-memory schema (Table/Column/OID, with a

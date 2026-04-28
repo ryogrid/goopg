@@ -194,16 +194,16 @@ type SelectStmt struct {
 	Targets  []ResTarget
 	// From keeps a flattened range-var list for v0 planner
 	// compatibility.
-	From     []RangeVar
+	From []RangeVar
 	// FromExprs preserves explicit JOIN structure.
 	FromExprs []FromExpr
-	Where    Expr // nil when absent
-	GroupBy  []Expr
-	Having   Expr
-	OrderBy  []SortBy
-	Limit    Expr // nil when absent; integer expression in v0
-	Offset   Expr // nil when absent
-	SetOp    *SetOpClause
+	Where     Expr // nil when absent
+	GroupBy   []Expr
+	Having    Expr
+	OrderBy   []SortBy
+	Limit     Expr // nil when absent; integer expression in v0
+	Offset    Expr // nil when absent
+	SetOp     *SetOpClause
 }
 
 func (s *SelectStmt) Pos() int  { return s.pos }
