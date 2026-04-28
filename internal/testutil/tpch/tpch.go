@@ -44,6 +44,57 @@ type TableDef struct {
 // slice on every call.
 func Tables() []TableDef { return tableDefs() }
 
+// DDL returns the eight CREATE TABLE statements that match HammerDB's
+// pgolap.tcl declarations (lines 130-137). Order is the same as
+// `Tables()`. A v0 caller can issue these against a live `goopg`
+// cluster via psql or libpq to populate the catalog before running
+// queries against `Queries()`.
+func DDL() []string {
+	return []string{
+		`CREATE TABLE region (r_regionkey NUMERIC, r_name CHAR(25), r_comment VARCHAR(152))`,
+		`CREATE TABLE nation (n_nationkey NUMERIC NOT NULL, n_name CHAR(25), n_regionkey NUMERIC, n_comment VARCHAR(152))`,
+		`CREATE TABLE supplier (s_suppkey NUMERIC NOT NULL, s_nationkey NUMERIC, s_comment VARCHAR(102), s_name CHAR(25), s_address VARCHAR(40), s_phone CHAR(15), s_acctbal NUMERIC)`,
+		`CREATE TABLE customer (c_custkey NUMERIC NOT NULL, c_mktsegment CHAR(10), c_nationkey NUMERIC, c_name VARCHAR(25), c_address VARCHAR(40), c_phone CHAR(15), c_acctbal NUMERIC, c_comment VARCHAR(118))`,
+		`CREATE TABLE part (p_partkey NUMERIC NOT NULL, p_type VARCHAR(25), p_size NUMERIC, p_brand CHAR(10), p_name VARCHAR(55), p_container CHAR(10), p_mfgr CHAR(25), p_retailprice NUMERIC, p_comment VARCHAR(23))`,
+		`CREATE TABLE partsupp (ps_partkey NUMERIC NOT NULL, ps_suppkey NUMERIC NOT NULL, ps_supplycost NUMERIC NOT NULL, ps_availqty NUMERIC, ps_comment VARCHAR(199))`,
+		`CREATE TABLE orders (o_orderdate TIMESTAMP, o_orderkey NUMERIC NOT NULL, o_custkey NUMERIC NOT NULL, o_orderpriority CHAR(15), o_shippriority NUMERIC, o_clerk CHAR(15), o_orderstatus CHAR(1), o_totalprice NUMERIC, o_comment VARCHAR(79))`,
+		`CREATE TABLE lineitem (l_shipdate TIMESTAMP, l_orderkey NUMERIC NOT NULL, l_discount NUMERIC NOT NULL, l_extendedprice NUMERIC NOT NULL, l_suppkey NUMERIC NOT NULL, l_quantity NUMERIC NOT NULL, l_returnflag CHAR(1), l_partkey NUMERIC NOT NULL, l_linestatus CHAR(1), l_tax NUMERIC NOT NULL, l_commitdate TIMESTAMP, l_receiptdate TIMESTAMP, l_shipmode CHAR(10), l_linenumber NUMERIC NOT NULL, l_shipinstruct CHAR(25), l_comment VARCHAR(44))`,
+	}
+}
+
+// SampleInserts returns a tiny synthetic dataset that's referentially
+// consistent enough for Q1..Q22 to *execute* without error. It does
+// not aim to match upstream PG result sets — many queries will return
+// zero rows because the synthetic data falls outside their date /
+// brand / nation filters. The harness's job is to surface
+// executor-time crashes, not result-set divergence; that comes with
+// the HammerDB SF1 path.
+//
+// Counts: 5 regions, 5 nations, 5 suppliers, 5 customers, 5 parts,
+// 10 partsupp rows, 8 orders, 16 lineitems. All amounts use string
+// literals so the NUMERIC text codec accepts them, and all dates fall
+// inside `1994-01-01..1998-12-31` so most TPC-H date filters match.
+func SampleInserts() []string {
+	return []string{
+		// region: r_regionkey, r_name, r_comment
+		`INSERT INTO region VALUES (0, 'AFRICA', 'a'), (1, 'AMERICA', 'b'), (2, 'ASIA', 'c'), (3, 'EUROPE', 'd'), (4, 'MIDDLE EAST', 'e')`,
+		// nation: n_nationkey, n_name, n_regionkey, n_comment
+		`INSERT INTO nation VALUES (0, 'ALGERIA', 0, 'a'), (1, 'BRAZIL', 1, 'b'), (2, 'CHINA', 2, 'c'), (3, 'FRANCE', 3, 'd'), (4, 'GERMANY', 3, 'e')`,
+		// supplier: s_suppkey, s_nationkey, s_comment, s_name, s_address, s_phone, s_acctbal
+		`INSERT INTO supplier VALUES (1, 3, 'sc', 's1', 'sa', '555-0001', '100.00'), (2, 4, 'sc', 's2', 'sa', '555-0002', '200.00'), (3, 1, 'sc', 's3', 'sa', '555-0003', '300.00'), (4, 0, 'sc', 's4', 'sa', '555-0004', '400.00'), (5, 2, 'sc', 's5', 'sa', '555-0005', '500.00')`,
+		// customer: c_custkey, c_mktsegment, c_nationkey, c_name, c_address, c_phone, c_acctbal, c_comment
+		`INSERT INTO customer VALUES (1, 'BUILDING', 3, 'c1', 'a', '13-1', '100.00', 'cm'), (2, 'AUTOMOBILE', 1, 'c2', 'a', '31-1', '200.00', 'cm'), (3, 'BUILDING', 4, 'c3', 'a', '23-1', '300.00', 'cm'), (4, 'MACHINERY', 2, 'c4', 'a', '29-1', '400.00', 'cm'), (5, 'HOUSEHOLD', 0, 'c5', 'a', '30-1', '500.00', 'cm')`,
+		// part: p_partkey, p_type, p_size, p_brand, p_name, p_container, p_mfgr, p_retailprice, p_comment
+		`INSERT INTO part VALUES (1, 'PROMO BURNISHED COPPER', 15, 'Brand#12', 'green forest', 'SM CASE', 'm1', '1000.00', 'pc'), (2, 'STANDARD ANODIZED BRASS', 14, 'Brand#23', 'forest spring', 'MED BAG', 'm2', '2000.00', 'pc'), (3, 'ECONOMY ANODIZED STEEL', 23, 'Brand#34', 'spring summer', 'LG CASE', 'm3', '3000.00', 'pc'), (4, 'PROMO PLATED TIN', 49, 'Brand#45', 'summer forest', 'SM BOX', 'm4', '4000.00', 'pc'), (5, 'LARGE BRUSHED BRASS', 9, 'Brand#11', 'forest green', 'MED PKG', 'm5', '5000.00', 'pc')`,
+		// partsupp: ps_partkey, ps_suppkey, ps_supplycost, ps_availqty, ps_comment
+		`INSERT INTO partsupp VALUES (1, 1, '10.00', 100, 'p'), (1, 2, '11.00', 200, 'p'), (2, 2, '12.00', 300, 'p'), (2, 3, '13.00', 400, 'p'), (3, 3, '14.00', 500, 'p'), (3, 4, '15.00', 600, 'p'), (4, 4, '16.00', 700, 'p'), (4, 5, '17.00', 800, 'p'), (5, 5, '18.00', 900, 'p'), (5, 1, '19.00', 1000, 'p')`,
+		// orders: o_orderdate, o_orderkey, o_custkey, o_orderpriority, o_shippriority, o_clerk, o_orderstatus, o_totalprice, o_comment
+		`INSERT INTO orders VALUES (timestamp '1995-03-10 00:00:00', 1, 1, '1-URGENT', 0, 'Clerk#1', 'O', '1000.00', 'oc'), (timestamp '1995-03-20 00:00:00', 2, 2, '2-HIGH', 0, 'Clerk#2', 'F', '2000.00', 'oc'), (timestamp '1993-08-01 00:00:00', 3, 3, '3-MEDIUM', 0, 'Clerk#3', 'F', '3000.00', 'oc'), (timestamp '1994-01-15 00:00:00', 4, 4, '4-NOT SPECIFIED', 0, 'Clerk#4', 'O', '4000.00', 'oc'), (timestamp '1996-01-15 00:00:00', 5, 5, '5-LOW', 0, 'Clerk#5', 'F', '5000.00', 'oc'), (timestamp '1995-09-15 00:00:00', 6, 1, '1-URGENT', 0, 'Clerk#6', 'F', '6000.00', 'oc'), (timestamp '1993-10-15 00:00:00', 7, 2, '2-HIGH', 0, 'Clerk#7', 'F', '7000.00', 'oc'), (timestamp '1994-07-01 00:00:00', 8, 3, '3-MEDIUM', 0, 'Clerk#8', 'O', '8000.00', 'oc')`,
+		// lineitem: l_shipdate, l_orderkey, l_discount, l_extendedprice, l_suppkey, l_quantity, l_returnflag, l_partkey, l_linestatus, l_tax, l_commitdate, l_receiptdate, l_shipmode, l_linenumber, l_shipinstruct, l_comment
+		`INSERT INTO lineitem VALUES (timestamp '1995-04-15 00:00:00', 1, '0.05', '1500.00', 1, 10, 'N', 1, 'O', '0.08', timestamp '1995-03-15 00:00:00', timestamp '1995-04-25 00:00:00', 'AIR', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1995-04-20 00:00:00', 1, '0.06', '2500.00', 2, 20, 'N', 2, 'O', '0.07', timestamp '1995-04-01 00:00:00', timestamp '1995-05-01 00:00:00', 'MAIL', 2, 'DELIVER IN PERSON', 'lc'), (timestamp '1995-05-01 00:00:00', 2, '0.04', '3500.00', 3, 30, 'R', 3, 'F', '0.06', timestamp '1995-04-15 00:00:00', timestamp '1995-05-15 00:00:00', 'SHIP', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1993-09-01 00:00:00', 3, '0.03', '4500.00', 4, 5, 'R', 4, 'F', '0.05', timestamp '1993-08-15 00:00:00', timestamp '1993-09-15 00:00:00', 'AIR', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1994-02-01 00:00:00', 4, '0.05', '5500.00', 5, 15, 'A', 5, 'F', '0.07', timestamp '1994-01-25 00:00:00', timestamp '1994-02-15 00:00:00', 'AIR REG', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1996-02-01 00:00:00', 5, '0.07', '6500.00', 1, 25, 'N', 1, 'O', '0.09', timestamp '1996-01-25 00:00:00', timestamp '1996-02-15 00:00:00', 'AIR', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1995-10-01 00:00:00', 6, '0.05', '7500.00', 2, 12, 'R', 2, 'F', '0.06', timestamp '1995-09-25 00:00:00', timestamp '1995-10-10 00:00:00', 'MAIL', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1993-11-01 00:00:00', 7, '0.04', '8500.00', 3, 8, 'R', 3, 'F', '0.05', timestamp '1993-10-25 00:00:00', timestamp '1993-11-10 00:00:00', 'SHIP', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1994-08-01 00:00:00', 8, '0.06', '9500.00', 4, 18, 'N', 4, 'O', '0.07', timestamp '1994-07-25 00:00:00', timestamp '1994-08-10 00:00:00', 'AIR', 1, 'DELIVER IN PERSON', 'lc'), (timestamp '1995-04-25 00:00:00', 1, '0.02', '1100.00', 3, 7, 'N', 3, 'O', '0.04', timestamp '1995-04-15 00:00:00', timestamp '1995-05-05 00:00:00', 'AIR', 3, 'DELIVER IN PERSON', 'lc'), (timestamp '1996-02-15 00:00:00', 5, '0.05', '6700.00', 2, 22, 'A', 2, 'O', '0.07', timestamp '1996-02-01 00:00:00', timestamp '1996-02-25 00:00:00', 'AIR REG', 2, 'DELIVER IN PERSON', 'lc'), (timestamp '1995-09-25 00:00:00', 6, '0.04', '7800.00', 4, 14, 'A', 4, 'F', '0.05', timestamp '1995-09-15 00:00:00', timestamp '1995-10-05 00:00:00', 'AIR', 2, 'DELIVER IN PERSON', 'lc'), (timestamp '1993-10-25 00:00:00', 7, '0.03', '8200.00', 5, 6, 'A', 5, 'F', '0.04', timestamp '1993-10-15 00:00:00', timestamp '1993-11-01 00:00:00', 'SHIP', 2, 'DELIVER IN PERSON', 'lc'), (timestamp '1994-07-25 00:00:00', 8, '0.05', '9300.00', 1, 19, 'N', 1, 'O', '0.06', timestamp '1994-07-15 00:00:00', timestamp '1994-08-01 00:00:00', 'AIR', 2, 'DELIVER IN PERSON', 'lc'), (timestamp '1995-04-01 00:00:00', 2, '0.03', '3200.00', 4, 11, 'A', 4, 'O', '0.05', timestamp '1995-03-20 00:00:00', timestamp '1995-04-10 00:00:00', 'AIR REG', 3, 'DELIVER IN PERSON', 'lc'), (timestamp '1995-09-30 00:00:00', 6, '0.02', '7100.00', 5, 9, 'N', 5, 'O', '0.04', timestamp '1995-09-20 00:00:00', timestamp '1995-10-08 00:00:00', 'AIR', 3, 'DELIVER IN PERSON', 'lc')`,
+	}
+}
+
 // Queries returns Q1..Q22 SQL strings keyed by query number.
 // Q15 is the first of three statements (CREATE OR REPLACE VIEW);
 // the SELECT and DROP VIEW pieces are exercised separately because

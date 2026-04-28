@@ -1492,10 +1492,94 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 // only knows what ColumnRef carries; everything else gets the
 // "unknown" tag the executor coerces at runtime.
 func exprType(e Expr) catalog.Type {
-	if cr, ok := e.(*ColumnRef); ok {
-		return cr.Type
+	switch x := e.(type) {
+	case *ColumnRef:
+		return x.Type
+	case *NumericConst:
+		return catalog.Type{Name: "numeric"}
+	case *IntegerConst:
+		return catalog.Type{Name: "int8"}
+	case *StringConst:
+		return catalog.Type{Name: "text"}
+	case *BooleanConst:
+		return catalog.Type{Name: "bool"}
+	case *NullConst:
+		return catalog.Type{Name: "unknown"}
+	case *BinaryOp:
+		// Arithmetic on numeric promotes to numeric. Comparison /
+		// boolean ops return bool. String concat returns text. The
+		// rule mirrors the executor's actual behaviour so the wire
+		// layer advertises a TypeOID consistent with the formatted
+		// cell text — without this, sum(numeric * numeric) lands as
+		// int8 and libpq's Go driver fails ParseInt on `20667.0000`.
+		switch strings.ToUpper(x.Op) {
+		case "+", "-", "*", "/", "%":
+			lt := exprType(x.Left)
+			rt := exprType(x.Right)
+			if isNumericTypeName(lt.Name) || isNumericTypeName(rt.Name) {
+				return catalog.Type{Name: "numeric"}
+			}
+			if (lt.Name == "int8" || lt.Name == "int4") && (rt.Name == "int8" || rt.Name == "int4") {
+				return catalog.Type{Name: "int8"}
+			}
+			return catalog.Type{Name: "unknown"}
+		case "||":
+			return catalog.Type{Name: "text"}
+		case "AND", "OR", "=", "<>", "!=", "<", "<=", ">", ">=", "LIKE", "NOT LIKE":
+			return catalog.Type{Name: "bool"}
+		}
+		return catalog.Type{Name: "unknown"}
+	case *UnaryOp:
+		if strings.ToUpper(x.Op) == "NOT" {
+			return catalog.Type{Name: "bool"}
+		}
+		return exprType(x.Operand)
+	case *CaseExpr:
+		// All Whens unify to a single result type during analysis;
+		// take the first branch's type as the representative.
+		if len(x.Whens) > 0 {
+			t := exprType(x.Whens[0].Then)
+			if t.Name != "unknown" && t.Name != "" {
+				return t
+			}
+		}
+		if x.Else != nil {
+			return exprType(x.Else)
+		}
+		return catalog.Type{Name: "unknown"}
+	case *ExtractExpr:
+		return catalog.Type{Name: "int8"}
+	case *FuncCall:
+		// Aggregates carry their own Type field (set by
+		// buildAggregateCall) on the AggregateCall path, but free
+		// FuncCalls reach here with no type carried. Match the
+		// known-typed builtins; everything else stays unknown.
+		switch strings.ToLower(x.Name) {
+		case "count":
+			return catalog.Type{Name: "int8"}
+		case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
+			return catalog.Type{Name: "timestamp"}
+		case "current_date", "to_date":
+			return catalog.Type{Name: "date"}
+		case "to_timestamp":
+			return catalog.Type{Name: "timestamp"}
+		case "substr", "substring":
+			return catalog.Type{Name: "text"}
+		}
+		return catalog.Type{Name: "unknown"}
 	}
 	return catalog.Type{Name: "unknown"}
+}
+
+// isNumericTypeName reports whether name refers to a numeric type
+// (NUMERIC / DECIMAL family). Used by exprType to promote arithmetic
+// to numeric whenever any operand is numeric.
+func isNumericTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal":
+		return true
+	}
+	return false
 }
 
 // planSubqueryExpr plans the SELECT inside a parser

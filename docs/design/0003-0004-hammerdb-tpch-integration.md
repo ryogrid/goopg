@@ -161,11 +161,11 @@ in v0; we record the flag for forward compatibility).
   v0's cast is already a no-op for analyzer typing; the path
   works but doesn't enforce.
 
-### Q1–Q22 plan-time and build-time coverage
+### Q1–Q22 plan-time, build-time, AND executor-time coverage
 
-All 22 HammerDB TPC-H query templates parse, plan, AND build into
-operator trees against the v0 stack. Two complementary tests pin
-this contract:
+All 22 HammerDB TPC-H query templates parse, plan, build into
+operator trees, AND execute end-to-end against synthetic data
+on the v0 stack. Three complementary tests pin this contract:
 
 - `internal/planner.TestPlanTPCHQueriesPlannable`: every query
   produces a `planner.Node` tree against the eight-table
@@ -174,14 +174,45 @@ this contract:
   passes through `executor.Build` and yields an `Operator` —
   guards the planner→executor handoff against unsupported plan
   nodes.
+- `internal/testutil/tpch.TestRunTPCHQueriesAgainstSyntheticData`:
+  spins up a real goopg cluster, applies the eight DDL strings,
+  loads a tiny synthetic dataset (5-15 rows per table), and runs
+  each Q1..Q22 against the live server. Fail-closed: any executor
+  error fails the test. Result-set parity vs upstream PG is NOT
+  asserted here (synthetic data is too small) — that comes with
+  the HammerDB SF1 path.
 
-Both tests share `internal/testutil/tpch`, which exposes the
-catalog (`tpch.Catalog`) and the parameter-substituted Q1..Q22
-SQL templates (`tpch.Queries`) so they don't drift. Planning +
-building succeeding is necessary but not sufficient — execution-
-time gaps (missing built-in functions, type-coercion shapes,
-empty-input edge cases) surface only when the executor evaluates
-expressions against real rows.
+All three tests share the `internal/testutil/tpch` package, which
+exposes:
+- `tpch.Catalog()` — in-memory catalog seeded with the 8 tables.
+- `tpch.DDL()` — eight CREATE TABLE strings.
+- `tpch.SampleInserts()` — referentially-consistent INSERTs.
+- `tpch.Queries()` — Q1..Q22 with parameters substituted.
+
+#### exprType type-inference fix
+
+The first run of `TestRunTPCHQueriesAgainstSyntheticData` surfaced
+a wire-format bug: 8 of 22 queries failed with libpq's Go driver
+raising `strconv.ParseInt: parsing "20667.0000": invalid syntax`
+on the result of `sum(l_extendedprice * (1 - l_discount))` and
+similar aggregate-of-arithmetic shapes. Root cause:
+`planner.exprType` only handled `*ColumnRef`, returning `unknown`
+for arithmetic expressions. `buildAggregateCall` for `sum` then
+fell back to `int8` for the output type, the wire layer
+advertised `TypeOID = 20` (int8 OID), and the client's text-mode
+int8 scanner choked on the formatted decimal string.
+
+Fix: expand `exprType` to walk `BinaryOp` / `UnaryOp` / `CaseExpr`
+/ `ExtractExpr` / `FuncCall` / typed constants, mirroring the
+executor's actual datum-kind behaviour:
+- arithmetic with any numeric operand → `numeric`
+- arithmetic on int8/int4 only → `int8`
+- comparison / boolean / LIKE → `bool`
+- `||` → `text`
+- `extract(...)` → `int8`
+- `count` → `int8`, `to_date` / `to_timestamp` → date / timestamp
+- `substr` / `substring` → `text`
+- `CASE` takes the first When branch's type as representative.
 
 Built-in functions added this loop to unblock execution:
 
