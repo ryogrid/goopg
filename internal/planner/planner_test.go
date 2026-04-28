@@ -131,6 +131,54 @@ func TestPlanSelectJoin(t *testing.T) {
 	}
 }
 
+// TestPlanJoinPicksHashAlgo pins the planner's hash-join
+// promotion: a single equality predicate with disjoint-side
+// ColumnRefs flips the Join algorithm to JoinAlgoHash and
+// populates LeftKey/RightKey. Predicates that don't decompose
+// stay on JoinAlgoNestedLoop.
+func TestPlanJoinPicksHashAlgo(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	cases := []struct {
+		sql      string
+		wantHash bool
+	}{
+		// Equality on disjoint sides → hash.
+		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", true},
+		// Reversed equality flipped at plan time → still hash.
+		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON h.aid = a.aid", true},
+		// LEFT join also takes the hash path.
+		{"SELECT a.aid FROM pgbench_accounts a LEFT JOIN pgbench_history h ON a.aid = h.aid", true},
+		// Inequality predicate → nested-loop fallback.
+		{"SELECT a.aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid < h.aid", false},
+		// CROSS join (no predicate) → nested-loop.
+		{"SELECT a.aid FROM pgbench_accounts a CROSS JOIN pgbench_history h", false},
+	}
+	for _, tc := range cases {
+		node, err := Plan(parseOne(t, tc.sql), cat)
+		if err != nil {
+			t.Errorf("Plan(%q): %v", tc.sql, err)
+			continue
+		}
+		proj, ok := node.(*Project)
+		if !ok {
+			t.Errorf("%q: root=%T want *Project", tc.sql, node)
+			continue
+		}
+		j, ok := proj.Child.(*Join)
+		if !ok {
+			t.Errorf("%q: child=%T want *Join", tc.sql, proj.Child)
+			continue
+		}
+		gotHash := j.Algo == JoinAlgoHash
+		if gotHash != tc.wantHash {
+			t.Errorf("%q: Algo=%v want JoinAlgoHash=%v", tc.sql, j.Algo, tc.wantHash)
+		}
+		if tc.wantHash && (j.LeftKey == nil || j.RightKey == nil) {
+			t.Errorf("%q: hash algo but LeftKey/RightKey nil", tc.sql)
+		}
+	}
+}
+
 func TestPlanSelectGroupByHaving(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	sql := "SELECT a.aid, sum(h.delta) FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid GROUP BY a.aid HAVING sum(h.delta) > 0"

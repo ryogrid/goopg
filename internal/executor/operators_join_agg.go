@@ -9,6 +9,13 @@ import (
 
 // joinOp is a nested-loop implementation that buffers both children
 // in Open and emits joined rows from an in-memory result slice.
+//
+// The executor always builds a joinOp; the per-row inner loop
+// dispatches on plan.Algo, picking the hash-join code path for
+// JoinAlgoHash (INNER + LEFT) and falling back to the
+// quadratic nested-loop scan otherwise. Wrapping both algos in
+// one operator keeps schema/Open/Close/Next unified — algo
+// selection is just a buffering strategy choice.
 type joinOp struct {
 	plan   *planner.Join
 	left   Operator
@@ -56,6 +63,16 @@ func (o *joinOp) Open(ctx *Context) error {
 	if rightWidth == 0 && len(rightRows) > 0 {
 		rightWidth = len(rightRows[0])
 	}
+
+	if o.plan.Algo == planner.JoinAlgoHash {
+		return o.runHashJoin(leftRows, rightRows, leftWidth, rightWidth)
+	}
+	return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+}
+
+// runNestedLoop is the universal fallback. O(N*M) over the two
+// drained sides; supports INNER / LEFT / RIGHT / FULL / CROSS.
+func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
 	nullLeft := nullRow(leftWidth)
 	nullRight := nullRow(rightWidth)
 
@@ -89,6 +106,79 @@ func (o *joinOp) Open(ctx *Context) error {
 		}
 	}
 	return nil
+}
+
+// runHashJoin builds an in-memory map keyed by RightKey over
+// the right input, then probes from the left. INNER and LEFT
+// only — the planner enables the hash algo only for these
+// types. Build cost: O(M) hashes + O(M) memory; probe cost:
+// O(N) hashes + O(matches) emits. NULL keys never match
+// (matches upstream's NULL-aware equi-join semantics).
+func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
+	nullRight := nullRow(rightWidth)
+
+	// Build phase: hash right input on RightKey. The right key
+	// is evaluated against a left||right concat where the left
+	// half is null padding — RightKey only references right-
+	// side columns by planner construction.
+	rightHash := make(map[string][]Row, len(rightRows))
+	leftPad := nullRow(leftWidth)
+	for _, r := range rightRows {
+		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(leftPad, r))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			// NULL key — never matches anyone in upstream's
+			// equi-join semantics, so don't add to the hash.
+			// LEFT join doesn't care; the right side is the
+			// inner side.
+			continue
+		}
+		rightHash[key] = append(rightHash[key], r)
+	}
+
+	// Probe phase.
+	rightZero := nullRow(rightWidth)
+	for _, l := range leftRows {
+		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, rightZero))
+		if err != nil {
+			return err
+		}
+		matches := rightHash[key]
+		if !ok {
+			matches = nil
+		}
+		matched := false
+		for _, r := range matches {
+			joined := concatRows(l, r)
+			// The hash equality already guarantees the join
+			// key matches; for predicates that ARE just the
+			// equality this is enough. v0 always splits the
+			// full predicate into LeftKey/RightKey at plan
+			// time so re-checking is unnecessary.
+			matched = true
+			o.rows = append(o.rows, joined)
+		}
+		if !matched && o.plan.Type == planner.JoinTypeLeft {
+			o.rows = append(o.rows, concatRows(l, nullRight))
+		}
+	}
+	return nil
+}
+
+// evalHashKey evaluates one side of the hash-join key against a
+// padded row and returns its canonical key string. The boolean
+// is false when the key evaluated to NULL (never matches).
+func (o *joinOp) evalHashKey(keyExpr planner.Expr, row Row) (string, bool, error) {
+	v, err := evalExpr(keyExpr, row, o.ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if v.IsNull() {
+		return "", false, nil
+	}
+	return datumKey(v), true, nil
 }
 
 func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {

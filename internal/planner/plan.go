@@ -224,15 +224,38 @@ const (
 	JoinTypeCross
 )
 
+// JoinAlgo is the physical algorithm the executor uses for a Join.
+// v0 has two: nested-loop (the universal fallback) and hash join
+// (used when the predicate decomposes into equality keys with one
+// side referencing only the left input and the other only the
+// right).
+type JoinAlgo int
+
+const (
+	JoinAlgoNestedLoop JoinAlgo = iota
+	JoinAlgoHash
+)
+
 // Join combines two child relations with an optional predicate.
 // Predicate is nil for CROSS JOIN and NATURAL/USING joins with no
 // shared columns.
+//
+// When Algo == JoinAlgoHash, LeftKey and RightKey carry the
+// equality operands (`LeftKey = RightKey` is exactly Predicate).
+// The executor builds a hash table on the right input keyed by
+// RightKey and probes from the left. v0's planner only enables
+// the hash algo for INNER and LEFT joins; RIGHT/FULL stay on
+// nested-loop until the executor's outer-row tracking is
+// extended.
 type Join struct {
 	pos       int
 	Type      JoinType
+	Algo      JoinAlgo
 	Left      Node
 	Right     Node
 	Predicate Expr
+	LeftKey   Expr // populated when Algo == JoinAlgoHash
+	RightKey  Expr
 	schema    Schema
 }
 

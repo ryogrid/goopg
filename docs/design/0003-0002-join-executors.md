@@ -1,0 +1,162 @@
+# Join Executors (Milestone 0003)
+
+| Field      | Value                                                  |
+| ---------- | ------------------------------------------------------ |
+| Status     | draft                                                  |
+| Date       | 2026-04-28                                             |
+| Milestone  | 0003 — HammerDB TPC-H Workload                         |
+| Refines    | [root-0011-planner.md](root-0011-planner.md), [root-0012-executor.md](root-0012-executor.md) |
+| Supersedes | —                                                      |
+
+## Problem
+
+The M1 planner emits one join algorithm — nested-loop. For TPC-H
+at SF1, the smallest tables (NATION, REGION) have 25 and 5 rows;
+the largest (LINEITEM) has ~6 million. A query like Q3
+(customer ⋈ orders ⋈ lineitem) over those scales would do
+~6 trillion comparisons under nested-loop, vs. ~6 million
+hashes + probes under hash-join.
+
+Hash join is the foundational join algorithm goopg needs before
+attempting Q1–Q22. This loop adds it as the planner's preferred
+algorithm whenever the predicate decomposes into a single
+disjoint-side equality.
+
+## Upstream reference
+
+- `postgres/src/backend/optimizer/path/joinpath.c` —
+  `match_unsorted_outer`, `hash_inner_and_outer`.
+- `postgres/src/backend/executor/nodeHashjoin.c` —
+  `ExecHashJoin` state machine.
+- `postgres/src/backend/utils/hash/dynahash.c` — chained
+  hash table; v0 uses Go's built-in map.
+
+## Decisions
+
+### One operator, two algorithms
+
+`joinOp` (in `internal/executor/operators_join_agg.go`) keeps a
+single Open/Next/Close shape. Open dispatches:
+
+```go
+if o.plan.Algo == planner.JoinAlgoHash {
+    return o.runHashJoin(...)
+}
+return o.runNestedLoop(...)
+```
+
+This matches the M1 buffering semantics — both algos drain
+their inputs into in-memory slices in Open and emit from a
+materialised result slice in Next. Streaming hash-probe (which
+upstream uses to avoid buffering the outer side) is deferred —
+the v0 buffer-everything strategy is consistent with the
+nested-loop op and keeps the algorithm switch local.
+
+### Planner-side detection: single equality, disjoint sides
+
+`splitEqualityForHash(pred, leftWidth)` inspects the join
+predicate. The hash algorithm is enabled only when:
+
+1. The top-level predicate is a `BinaryOp` with `Op == "="`.
+2. One side references columns whose `Index < leftWidth`
+   (the left input only); the other side references columns
+   whose `Index >= leftWidth` (the right input only).
+3. Constants and other side-free leaves are allowed on either
+   side.
+
+`exprSide(e, leftWidth)` is the side-classifier: `sideUnknown`
+for pure constants, `sideLeft` / `sideRight` for ColumnRefs,
+recursing through BinaryOp / UnaryOp / FuncCall / CaseExpr /
+ExtractExpr; `sideMixed` short-circuits the promotion.
+
+When the equality is `right.col = left.col`, the planner flips
+the operands so `LeftKey` always references the left input and
+`RightKey` the right. This keeps the executor one-direction.
+
+What stays on nested-loop:
+- AND-of-equalities (`a.x = b.x AND a.y = b.y`). v0 doesn't
+  yet split conjunctions into multi-column hash keys.
+- Inequalities, range predicates, subqueries.
+- CROSS join (no predicate) and any join with a NULL predicate.
+- RIGHT and FULL outer joins. The hash op tracks unmatched
+  outer-side rows naturally for LEFT (the probe loop's
+  `matched` flag), but unmatched right rows under FULL would
+  need a second pass over the hash buckets — a bookkeeping
+  extension deferred until the planner emits FULL joins from
+  TPC-H queries.
+
+### Build vs. probe side
+
+The right input is the build side. The plan structure is
+"left ⋈ right" with predicates resolved against the left||right
+schema concat; hashing on the right means a single map keyed
+by the right input's join column. Upstream picks the smaller
+side as build for cache efficiency; v0 always builds on the
+right because the planner has no row-count estimates yet
+(stats milestone is a follow-up).
+
+### Hash key encoding: datumKey reuse
+
+`evalHashKey` evaluates the key expression against a padded
+row (left||null on the build side, left||null on the probe
+side, since RightKey/LeftKey reference only their respective
+half) and hands the resulting Datum to `datumKey`, which is
+the same canonical-string form `aggregateOp` uses for
+GROUP BY keys. NULL keys never match — both sides skip the
+hash insert/probe, which mirrors upstream's NULL-aware
+equi-join semantics.
+
+## Verification
+
+End-to-end against `goopg start -D <dir>` with upstream psql
+18.3:
+
+```
+CREATE TABLE customer (c_custkey INT, c_name TEXT);
+CREATE TABLE orders (o_orderkey INT, o_custkey INT, o_totalprice INT);
+INSERT INTO customer VALUES (1,'alice'),(2,'bob'),(3,'carol'),(4,'dave');
+INSERT INTO orders VALUES (10,1,100),(11,1,50),(12,2,200),(13,4,300);
+
+SELECT c_name, o_orderkey FROM customer JOIN orders ON c_custkey = o_custkey;
+-- alice/10, alice/11, bob/12, dave/13   (4 rows, hash algo)
+
+SELECT c_name, o_orderkey FROM customer LEFT JOIN orders ON c_custkey = o_custkey;
+-- carol gets a NULL right side.        (5 rows, hash algo)
+
+SELECT c_name FROM customer JOIN orders ON o_custkey = c_custkey;
+-- Right-then-left equality flipped at plan time. (4 rows, hash algo)
+```
+
+`TestPlanJoinPicksHashAlgo` pins which predicates promote and
+which stay on nested-loop.
+
+## Out of scope (deferred to subsequent loops)
+
+- Sort-merge join (the third upstream algorithm). For TPC-H
+  the difference between hash and sort-merge is mostly about
+  ordering — hash join is sufficient until cost-based
+  planning needs to choose between them.
+- Multi-column equality keys (`a.x = b.x AND a.y = b.y` →
+  composite hash key).
+- Cost-based build-side selection (smaller-input → build).
+  Waits on the statistics milestone.
+- RIGHT / FULL outer hash join.
+- Streaming probe (the upstream "outer side iterates while
+  hash table builds incrementally" pattern). v0 buffers both
+  sides for simplicity; the lower memory ceiling for huge
+  outers comes with the same bookkeeping streaming probe
+  needs.
+- Hash aggregate as a planner-level rule (the executor's
+  aggregate operator already groups by datumKey, so the
+  algorithmic side is done; only the planner's OPERATOR
+  selection — Aggregate-on-Hash vs. Aggregate-on-Sort — is
+  what's missing).
+
+## Cross-references
+
+- TPC-H Q3 / Q5 / Q9 query bodies: HammerDB upstream
+  `tpc-h/queries-93-orig.sql`.
+- Existing nested-loop fallback:
+  [root-0012-executor.md](root-0012-executor.md).
+- M1 join planning:
+  [root-0011-planner.md](root-0011-planner.md).

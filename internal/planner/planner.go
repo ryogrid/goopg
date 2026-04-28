@@ -382,7 +382,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 		if err != nil {
 			return nil, nil, err
 		}
-		leftNode = &Join{
+		jn := &Join{
 			pos:       j.Pos(),
 			Type:      mapJoinType(j.Type),
 			Left:      leftNode,
@@ -390,6 +390,21 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 			Predicate: pred,
 			schema:    mergedSchema,
 		}
+		// Pick hash join when the predicate decomposes into a single
+		// equality whose two operands reference disjoint sides.
+		// INNER and LEFT are supported by the v0 hash executor;
+		// RIGHT/FULL/CROSS stay on the nested-loop fallback because
+		// they need outer-row bookkeeping that's a follow-up loop's
+		// task.
+		if jn.Type == JoinTypeInner || jn.Type == JoinTypeLeft {
+			leftWidth := len(leftCtx.schema)
+			if lk, rk, ok := splitEqualityForHash(pred, leftWidth); ok {
+				jn.Algo = JoinAlgoHash
+				jn.LeftKey = lk
+				jn.RightKey = rk
+			}
+		}
+		leftNode = jn
 		leftCtx = mergedCtx
 	}
 	return leftNode, leftCtx.bindings, nil
@@ -498,6 +513,102 @@ func naturalJoinColumns(leftCtx, rightCtx *resolveContext) []string {
 		}
 	}
 	return out
+}
+
+// splitEqualityForHash inspects a join predicate and reports
+// whether it's a single equality whose two sides reference
+// disjoint join inputs (one only the left, the other only the
+// right). leftWidth is the column count of the left input; any
+// ColumnRef with Index < leftWidth is "left-side", >= leftWidth
+// is "right-side".
+//
+// Returns (leftKey, rightKey, true) when the equality can be
+// turned into hash keys. The returned keys are oriented so
+// `leftKey` references the left input only and `rightKey` the
+// right; a `right.col = left.col` predicate is silently flipped
+// at this layer so the executor can stay one-direction.
+//
+// AND-of-equalities, OR, range predicates, and equalities whose
+// operands span both sides all fall back to (nil, nil, false)
+// — the planner keeps the nested-loop algorithm for those.
+func splitEqualityForHash(pred Expr, leftWidth int) (Expr, Expr, bool) {
+	bin, ok := pred.(*BinaryOp)
+	if !ok || bin.Op != "=" {
+		return nil, nil, false
+	}
+	lSide := exprSide(bin.Left, leftWidth)
+	rSide := exprSide(bin.Right, leftWidth)
+	switch {
+	case lSide == sideLeft && rSide == sideRight:
+		return bin.Left, bin.Right, true
+	case lSide == sideRight && rSide == sideLeft:
+		return bin.Right, bin.Left, true
+	}
+	return nil, nil, false
+}
+
+type joinSide int
+
+const (
+	sideUnknown joinSide = iota
+	sideLeft
+	sideRight
+	sideMixed
+)
+
+// exprSide classifies which join input(s) e references. Pure
+// constants resolve as sideUnknown and combine with anything;
+// references to the left input are sideLeft, to the right are
+// sideRight; if both appear the result is sideMixed.
+func exprSide(e Expr, leftWidth int) joinSide {
+	switch x := e.(type) {
+	case *ColumnRef:
+		if x.Index < leftWidth {
+			return sideLeft
+		}
+		return sideRight
+	case *IntegerConst, *NumericConst, *StringConst, *NullConst, *BooleanConst, *ParamRef, *TypedStringLit, *IntervalLit:
+		return sideUnknown
+	case *BinaryOp:
+		return mergeSides(exprSide(x.Left, leftWidth), exprSide(x.Right, leftWidth))
+	case *UnaryOp:
+		return exprSide(x.Operand, leftWidth)
+	case *FuncCall:
+		side := sideUnknown
+		for _, a := range x.Args {
+			side = mergeSides(side, exprSide(a, leftWidth))
+		}
+		return side
+	case *CaseExpr:
+		side := sideUnknown
+		if x.Operand != nil {
+			side = mergeSides(side, exprSide(x.Operand, leftWidth))
+		}
+		for _, w := range x.Whens {
+			side = mergeSides(side, exprSide(w.When, leftWidth))
+			side = mergeSides(side, exprSide(w.Then, leftWidth))
+		}
+		if x.Else != nil {
+			side = mergeSides(side, exprSide(x.Else, leftWidth))
+		}
+		return side
+	case *ExtractExpr:
+		return exprSide(x.Source, leftWidth)
+	}
+	return sideMixed
+}
+
+func mergeSides(a, b joinSide) joinSide {
+	if a == sideUnknown {
+		return b
+	}
+	if b == sideUnknown {
+		return a
+	}
+	if a == b {
+		return a
+	}
+	return sideMixed
 }
 
 func mapJoinType(t parser.JoinType) JoinType {

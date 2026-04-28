@@ -694,7 +694,20 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 
 - [ ] Cost-based planner with cardinality estimates good enough that
       no TPC-H query degenerates to a Cartesian product.
-- [ ] Hash join executor (`internal/executor/operators_hashjoin.go`).
+- [x] Hash join executor (`internal/executor/operators_hashjoin.go`).
+      (achieved 2026-04-28: implemented in
+      `internal/executor/operators_join_agg.go` (extending the
+      existing joinOp rather than a new file). Planner detects
+      disjoint-side equality predicates via splitEqualityForHash
+      + exprSide and sets `Join.Algo = JoinAlgoHash` with
+      LeftKey/RightKey populated; `right.col = left.col` is
+      flipped at plan time so the executor stays one-direction.
+      INNER + LEFT joins covered (RIGHT/FULL/CROSS keep the
+      nested-loop fallback). Build phase: hash right input on
+      RightKey; probe phase: lookup LeftKey, NULL keys never
+      match. Verified end-to-end via psql 18.3 with INNER, LEFT
+      (NULL right side for unmatched), and reversed-equality
+      shapes. See `docs/design/0003-0002-join-executors.md`.)
 - [ ] Sort-merge join executor.
 - [ ] Hash aggregate executor (replace today's sort-then-group as the
       default path).
