@@ -263,8 +263,18 @@ unchecked item unless a dependency forces a different order.
         Both extract their predicate from a child Filter(SeqScan) or
         bare SeqScan; v0 doesn't yet handle JOIN/USING. Pgbench-shaped
         UPDATE-then-SELECT and DELETE-by-id round-trip end-to-end.
-  - [ ] DDL operator path: CREATE TABLE / DROP TABLE / TRUNCATE /
-        CREATE INDEX wired through the catalog + smgr.
+  - [x] DDL operator path: CREATE TABLE / DROP TABLE / TRUNCATE wired
+        through the catalog + smgr. New smgr methods DropRelation
+        (close + unlink the file) and TruncateRelation (file size to
+        0); Pool.InvalidateRel evicts unpinned slots before the file
+        change so subsequent reads see the new state. SQLSTATE
+        alignment: 42P07 duplicate_table on CREATE, 42P01
+        undefined_table on DROP without IF EXISTS. End-to-end tests
+        run CREATE/DROP/TRUNCATE through the parser→planner→executor
+        stack.
+  - [ ] DDL operator path: CREATE INDEX / DROP INDEX / ALTER TABLE
+        wired through the B-tree + catalog (deferred — needs catalog
+        index metadata first).
   - [ ] Transaction operator: BEGIN/COMMIT/ROLLBACK plumbed to
         `mvcc.Manager` and per-session state.
 - [ ] Extended query protocol (Parse/Bind/Describe/Execute/Sync).

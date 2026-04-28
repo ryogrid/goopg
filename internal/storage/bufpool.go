@@ -108,6 +108,33 @@ func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 	return p.mgr.NBlocks(rel)
 }
 
+// Manager exposes the underlying storage manager so DDL operators can
+// drop or truncate relation files. Pinning still flows through Pool.
+func (p *Pool) Manager() *Manager { return p.mgr }
+
+// InvalidateRel evicts every slot currently bound to a buffer of rel.
+// DROP TABLE / TRUNCATE TABLE call this after committing the
+// catalog-level change so a subsequent Pin returns a fresh page
+// rather than a stale cached one. Pinned slots are skipped — v0
+// requires DDL to run without concurrent pinning of the dropped
+// relation, matching upstream's AccessExclusiveLock requirement.
+func (p *Pool) InvalidateRel(rel RelFileNode) {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	for tag, idx := range p.byTag {
+		if tag.Rel != rel {
+			continue
+		}
+		s := p.slots[idx]
+		if s.pinCount > 0 {
+			continue
+		}
+		s.valid = false
+		s.dirty = false
+		delete(p.byTag, tag)
+	}
+}
+
 // ErrNoBuffer is returned when every slot is pinned and the clock
 // sweep can't find a victim.
 var ErrNoBuffer = errors.New("no available buffer (all pinned)")

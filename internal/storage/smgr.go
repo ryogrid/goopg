@@ -124,6 +124,35 @@ func (m *Manager) Sync(rel RelFileNode) error {
 	return f.sync()
 }
 
+// DropRelation closes the open file (if any) and removes it from
+// disk. The executor's DROP TABLE path calls this after the catalog
+// entry is gone; the buffer pool's InvalidateRel must run beforehand
+// to flush any pinned slots.
+func (m *Manager) DropRelation(rel RelFileNode) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if f, ok := m.files[rel]; ok {
+		_ = f.f.Close()
+		delete(m.files, rel)
+	}
+	path := m.relPath(rel)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove %s: %w", path, err)
+	}
+	return nil
+}
+
+// TruncateRelation truncates rel's backing file to zero blocks. The
+// caller is responsible for invalidating buffer-pool slots that hold
+// pages of rel before calling this.
+func (m *Manager) TruncateRelation(rel RelFileNode) error {
+	f, err := m.relFile(rel)
+	if err != nil {
+		return err
+	}
+	return f.truncateToZero()
+}
+
 func (m *Manager) relFile(rel RelFileNode) (*relFile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -246,6 +275,16 @@ func (r *relFile) sync() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.f.Sync()
+}
+
+func (r *relFile) truncateToZero() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.f.Truncate(0); err != nil {
+		return fmt.Errorf("truncate %s: %w", r.path, err)
+	}
+	r.nblocks = 0
+	return nil
 }
 
 func (r *relFile) close() error {

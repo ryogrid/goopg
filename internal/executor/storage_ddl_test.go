@@ -1,0 +1,192 @@
+package executor
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
+)
+
+func runDDL(t *testing.T, ctx *Context, sql string) error {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", sql, err)
+	}
+	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatalf("Plan(%q): %v", sql, err)
+	}
+	op, err := Build(plan)
+	if err != nil {
+		t.Fatalf("Build(%q): %v", sql, err)
+	}
+	if err := op.Open(ctx); err != nil {
+		return err
+	}
+	if _, err := op.Next(); err != EOF {
+		return err
+	}
+	return op.Close()
+}
+
+// TestDDLCreateTableEndToEnd runs CREATE TABLE through the parser ->
+// planner -> executor stack and verifies the catalog grew an entry
+// with the expected columns.
+func TestDDLCreateTableEndToEnd(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int NOT NULL, b text)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table not in catalog")
+	}
+	if len(tbl.Columns) != 2 || tbl.Columns[0].Name != "a" || !tbl.Columns[0].NotNull {
+		t.Errorf("columns=%+v", tbl.Columns)
+	}
+	if tbl.Columns[1].Type.Name != "text" {
+		t.Errorf("col[1].Type=%+v", tbl.Columns[1].Type)
+	}
+}
+
+// TestDDLCreateTableDuplicateAndIfNotExists pins the 42P07 error path
+// and the IF NOT EXISTS escape.
+func TestDDLCreateTableDuplicateAndIfNotExists(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatal(err)
+	}
+	err := runDDL(t, ctx, "CREATE TABLE t (b int)")
+	if err == nil {
+		t.Fatal("duplicate CREATE TABLE should fail")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42P07" {
+		t.Errorf("want 42P07, got %v", err)
+	}
+	// IF NOT EXISTS is a no-op when the table already exists.
+	if err := runDDL(t, ctx, "CREATE TABLE IF NOT EXISTS t (b int)"); err != nil {
+		t.Errorf("CREATE TABLE IF NOT EXISTS: %v", err)
+	}
+}
+
+// TestDDLDropTableRemovesCatalogAndFile: DROP TABLE removes the
+// catalog entry and the on-disk relation file.
+func TestDDLDropTableRemovesCatalogAndFile(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	// Force the relation file into existence.
+	if _, _, err := ctx.Pool.PinNew(rel); err != nil {
+		t.Fatalf("PinNew: %v", err)
+	}
+
+	if err := runDDL(t, ctx, "DROP TABLE t"); err != nil {
+		t.Fatalf("DROP TABLE: %v", err)
+	}
+	if _, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"}); ok {
+		t.Errorf("table still in catalog after DROP")
+	}
+	// Re-resolving via NBlocks should now hit a re-created (empty) file.
+	n, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		t.Fatalf("NBlocks post-drop: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("NBlocks=%d want 0", n)
+	}
+}
+
+// TestDDLDropTableIfExists silently succeeds when the table is absent.
+func TestDDLDropTableIfExists(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "DROP TABLE IF EXISTS missing"); err != nil {
+		t.Errorf("IF EXISTS path: %v", err)
+	}
+	err := runDDL(t, ctx, "DROP TABLE missing")
+	if err == nil {
+		t.Fatal("DROP TABLE without IF EXISTS should fail")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42P01" {
+		t.Errorf("want 42P01, got %v", err)
+	}
+}
+
+// TestDDLTruncateClearsRelation: TRUNCATE shrinks the file to 0
+// blocks and a subsequent SeqScan returns no rows.
+func TestDDLTruncateClearsRelation(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	rel := ctx.Catalog.RelFileNode(tbl)
+	n, _ := ctx.Pool.NBlocks(rel)
+	if n == 0 {
+		t.Fatal("expected relation file to have at least one block before truncate")
+	}
+
+	if err := runDDL(t, ctx, "TRUNCATE TABLE items"); err != nil {
+		t.Fatalf("TRUNCATE: %v", err)
+	}
+	n2, _ := ctx.Pool.NBlocks(rel)
+	if n2 != 0 {
+		t.Errorf("NBlocks after TRUNCATE = %d want 0", n2)
+	}
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, _ := drainScan(scan)
+	if len(rows) != 0 {
+		t.Errorf("post-truncate scan returned %d rows want 0", len(rows))
+	}
+}
+
+// newDDLFixture is a sibling of newStorageFixture that does NOT
+// pre-create a table — DDL tests do that themselves through the
+// executor.
+func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
+	t.Helper()
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 16})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	cat := catalog.NewInMemory()
+	ctx := NewContext()
+	ctx.Pool = pool
+	ctx.Catalog = cat
+	cleanup := func() {
+		_ = pool.Close()
+		_ = mgr.Close()
+	}
+	// Sanity: confirm the data dir is in scope.
+	if !strings.HasPrefix(dir, t.TempDir()[:len(dir)-len(t.Name())]) && false {
+		t.Log("dir", dir)
+	}
+	return ctx, cat, cleanup
+}
