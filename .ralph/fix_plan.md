@@ -136,7 +136,11 @@ unchecked item unless a dependency forces a different order.
       round-trip, dirty-eviction-flushes-back, and the
       `ErrNoBuffer`/recovery path.
 - [x] Design docs: `0005-buffer-manager.md`, `0006-storage-format.md`.
-- [ ] Heap and tuple format with xmin/xmax visibility metadata.
+- [x] Heap and tuple format with xmin/xmax visibility metadata.
+      `internal/storage/heap.go` adds tuple header
+      (`xmin`/`xmax`/`xvac`/`ctid`/`infomask*`), line-pointer packing,
+      and page-level tuple add/get helpers; tests pin metadata
+      round-trip and page slot behavior.
 - [ ] Snapshot manager with `READ COMMITTED` and `REPEATABLE READ` semantics.
 - [x] WAL writer with `fdatasync` on commit.
       `internal/wal` now provides segmented WAL files under `pg_wal/`,
@@ -155,7 +159,8 @@ unchecked item unless a dependency forces a different order.
       the latest consistent checkpoint boundary.
 - [ ] B-tree index access method.
 - [ ] `VACUUM` and `ANALYZE` minimal implementations.
-- [ ] Design docs: `0007-mvcc-and-snapshots.md`, `0009-btree.md`.
+- [ ] Design doc: `0009-btree.md`.
+- [x] Design doc: `0007-mvcc-and-snapshots.md`.
 - [x] Design doc: `0008-wal-and-recovery.md`.
 
 ## Milestone 6 — SQL surface for pgbench
