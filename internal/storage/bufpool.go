@@ -3,7 +3,9 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 )
 
 // Slot is one buffer-pool entry holding one Page. Callers receive
@@ -31,6 +33,13 @@ type Slot struct {
 
 	// usageCount is the clock-sweep "second chance" counter.
 	usageCount uint8
+
+	// fpiSinceCheckpoint records whether a full-page-image WAL
+	// record has already been emitted for this page in the current
+	// checkpoint epoch. Mutated only with the pool mutex held.
+	// The checkpointer clears it across all slots after a
+	// successful checkpoint via Pool.ResetCheckpointEpoch.
+	fpiSinceCheckpoint bool
 
 	// contentMu guards the Page bytes for read/write. The pool mutex
 	// is dropped before we acquire this so I/O doesn't block lookups.
@@ -63,10 +72,22 @@ type Pool struct {
 	arena *arena
 	slots []*Slot
 	wal   WALFlusher
+	// logFPI emits a full-page-image WAL record and returns the
+	// record's end LSN. nil disables FPI emission. Set via
+	// PoolConfig.LogPageImage.
+	logFPI func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
+	// fullPageWrites gates FPI emission. The wire/admin layer can
+	// flip it at runtime to mirror upstream's full_page_writes
+	// SIGHUP-context GUC.
+	fullPageWrites atomic.Bool
+	// logger is used to surface non-fatal FPI emission failures
+	// without changing MarkDirty's signature.
+	logger *slog.Logger
 
 	// poolMu guards byTag, slots[*].tag/valid/dirty, slots[*].pinCount,
-	// slots[*].usageCount, and clockHand. It does NOT guard the page
-	// bytes — those are guarded by Slot.contentMu.
+	// slots[*].usageCount, slots[*].fpiSinceCheckpoint, and clockHand.
+	// It does NOT guard the page bytes — those are guarded by
+	// Slot.contentMu.
 	poolMu    sync.Mutex
 	byTag     map[BufferTag]int
 	clockHand int
@@ -79,6 +100,23 @@ type PoolConfig struct {
 	// WAL, when non-nil, is asked to flush up to the page's pd_lsn
 	// before any dirty page is written to data files.
 	WAL WALFlusher
+
+	// LogPageImage, when non-nil, is invoked by MarkDirty on the
+	// first mutation of each page after every checkpoint to emit
+	// a full-page-image WAL record. The returned LSN is stamped
+	// into the page header so the existing flush-before-write
+	// ordering covers it. Failures are logged but not propagated
+	// to the mutation site (matches upstream's PANIC stance only
+	// in spirit; v0 logs and continues — see milestone 0002).
+	LogPageImage func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
+
+	// FullPageWrites mirrors upstream's full_page_writes GUC. When
+	// false, no FPI is emitted regardless of LogPageImage.
+	FullPageWrites bool
+
+	// Logger receives FPI emission failures. nil means
+	// slog.Default().
+	Logger *slog.Logger
 }
 
 // WALFlusher is the minimal WAL contract the buffer pool needs to
@@ -98,17 +136,42 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Pool{
-		mgr:   mgr,
-		arena: a,
-		slots: make([]*Slot, cfg.Slots),
-		byTag: make(map[BufferTag]int, cfg.Slots),
-		wal:   cfg.WAL,
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
+	p := &Pool{
+		mgr:    mgr,
+		arena:  a,
+		slots:  make([]*Slot, cfg.Slots),
+		byTag:  make(map[BufferTag]int, cfg.Slots),
+		wal:    cfg.WAL,
+		logFPI: cfg.LogPageImage,
+		logger: logger,
+	}
+	p.fullPageWrites.Store(cfg.FullPageWrites)
 	for i := range p.slots {
 		p.slots[i] = &Slot{page: a.slot(i)}
 	}
 	return p, nil
+}
+
+// SetFullPageWrites toggles full-page-image emission at runtime.
+// Mirrors upstream's full_page_writes SIGHUP-context GUC.
+func (p *Pool) SetFullPageWrites(on bool) { p.fullPageWrites.Store(on) }
+
+// FullPageWrites reports the current setting.
+func (p *Pool) FullPageWrites() bool { return p.fullPageWrites.Load() }
+
+// ResetCheckpointEpoch clears the per-slot "FPI emitted" flag.
+// The checkpointer calls this after a successful checkpoint so
+// the next mutation of each page emits a fresh full-page image.
+func (p *Pool) ResetCheckpointEpoch() {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	for _, s := range p.slots {
+		s.fpiSinceCheckpoint = false
+	}
 }
 
 // Close flushes every dirty slot through smgr and releases the
@@ -287,21 +350,67 @@ func (p *Pool) Unpin(s *Slot) {
 }
 
 // MarkDirty flags the slot as having been mutated. Caller must hold
-// a pin.
+// a pin and (for write paths) the slot's exclusive content lock so
+// a full-page-image snapshot taken below sees a stable image.
+//
+// When full_page_writes is on and this is the first mutation since
+// the last checkpoint, an FPI record is emitted via the configured
+// LogPageImage callback and the resulting LSN is stamped into the
+// page header so the existing flush-before-write ordering
+// (`flushSlot` -> `wal.FlushUpTo(pd_lsn)`) covers it.
 func (p *Pool) MarkDirty(s *Slot) {
+	p.maybeEmitFPI(s)
 	p.poolMu.Lock()
-	defer p.poolMu.Unlock()
 	s.dirty = true
+	p.poolMu.Unlock()
 }
 
-// MarkDirtyWithLSN records a page LSN and marks the slot dirty.
-// Callers should use this when a page mutation is backed by WAL.
+// MarkDirtyWithLSN records an explicit page LSN and marks the slot
+// dirty. Used when the caller has already issued a WAL record and
+// wants the buffer pool to track its LSN for the flush ordering.
+// FPI emission is skipped — the caller's record is the durability
+// anchor.
 func (p *Pool) MarkDirtyWithLSN(s *Slot, lsn LSN) {
 	s.contentMu.Lock()
 	MustHeader(s.page).SetLSN(lsn)
 	s.contentMu.Unlock()
 	p.poolMu.Lock()
 	s.dirty = true
+	// Stamping our own LSN supersedes any prior FPI for this
+	// epoch — the WAL record at this LSN is what redo will pick up.
+	s.fpiSinceCheckpoint = true
+	p.poolMu.Unlock()
+}
+
+// maybeEmitFPI runs the FPI side-effect of MarkDirty when the
+// epoch flag is unset and the pool has FPI wiring. Caller must
+// hold Slot.contentMu exclusive so the page bytes are stable.
+func (p *Pool) maybeEmitFPI(s *Slot) {
+	if p.logFPI == nil || !p.fullPageWrites.Load() {
+		return
+	}
+	p.poolMu.Lock()
+	if s.fpiSinceCheckpoint {
+		p.poolMu.Unlock()
+		return
+	}
+	tag := s.tag
+	p.poolMu.Unlock()
+
+	pageCopy := make(Page, BlockSize)
+	copy(pageCopy, s.page)
+	lsn, err := p.logFPI(tag.Rel, tag.Block, pageCopy)
+	if err != nil {
+		// Best-effort in v0: log and continue. Upstream PANICs
+		// here; surfacing that requires changing MarkDirty's
+		// signature, which is a follow-up loop's task.
+		p.logger.Warn("full-page-image WAL emit failed",
+			"rel", tag.Rel, "block", tag.Block, "err", err)
+		return
+	}
+	MustHeader(s.page).SetLSN(lsn)
+	p.poolMu.Lock()
+	s.fpiSinceCheckpoint = true
 	p.poolMu.Unlock()
 }
 

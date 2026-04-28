@@ -92,9 +92,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: wal: %w", err)
 	}
 
+	// Bridge the buffer pool's FPI hook to the WAL writer.
+	// storage cannot import wal (wal imports storage), so we
+	// adapt via a closure here.
+	logFPI := func(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) (storage.LSN, error) {
+		payload, err := wal.EncodePageImage(rel, blk, page)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
-		Slots: slots,
-		WAL:   walWriter,
+		Slots:          slots,
+		WAL:            walWriter,
+		LogPageImage:   logFPI,
+		FullPageWrites: true,
 	})
 	if err != nil {
 		_ = walWriter.Close()

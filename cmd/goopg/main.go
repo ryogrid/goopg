@@ -211,6 +211,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				rt.Checkpointer.SetMaxWALBytes(uint64(mb) * 1024 * 1024)
 			}
 		}
+		if v, ok := registry.Get("full_page_writes"); ok && rt.Pool != nil {
+			rt.Pool.SetFullPageWrites(v.Display() == "on")
+		}
 	}
 
 	// Run the periodic checkpointer alongside the server. SIGTERM /

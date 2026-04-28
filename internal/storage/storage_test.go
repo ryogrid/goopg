@@ -344,6 +344,110 @@ func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	}
 }
 
+// TestPoolFPIEmittedOncePerEpoch pins the milestone-0002 contract:
+// MarkDirty must emit exactly one full-page-image WAL record per
+// page per checkpoint epoch, and ResetCheckpointEpoch must arm a
+// fresh emission for the next mutation.
+func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	type fpi struct {
+		rel RelFileNode
+		blk BlockNumber
+	}
+	var emitted []fpi
+	logFPI := func(rel RelFileNode, blk BlockNumber, _ Page) (LSN, error) {
+		emitted = append(emitted, fpi{rel, blk})
+		return LSN(100 + len(emitted)), nil
+	}
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots:          2,
+		LogPageImage:   logFPI,
+		FullPageWrites: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 600, Fork: MainFork}
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Lock()
+	s.Page()[200] = 1
+	pool.MarkDirty(s)
+	s.Unlock()
+
+	// Second mutation in the same epoch must NOT emit another FPI.
+	s.Lock()
+	s.Page()[201] = 2
+	pool.MarkDirty(s)
+	s.Unlock()
+	pool.Unpin(s)
+
+	if len(emitted) != 1 {
+		t.Fatalf("emitted=%d FPI(s) in one epoch, want 1", len(emitted))
+	}
+
+	pool.ResetCheckpointEpoch()
+
+	s, err = pool.Pin(BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Lock()
+	s.Page()[202] = 3
+	pool.MarkDirty(s)
+	s.Unlock()
+	pool.Unpin(s)
+
+	if len(emitted) != 2 {
+		t.Fatalf("emitted=%d after epoch reset, want 2", len(emitted))
+	}
+}
+
+// TestPoolFPISkippedWhenDisabled verifies that flipping
+// full_page_writes off via SetFullPageWrites suppresses FPI
+// emission even though the callback is wired.
+func TestPoolFPISkippedWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	calls := 0
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots: 1,
+		LogPageImage: func(_ RelFileNode, _ BlockNumber, _ Page) (LSN, error) {
+			calls++
+			return 1, nil
+		},
+		FullPageWrites: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 601, Fork: MainFork}
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Lock()
+	s.Page()[300] = 9
+	pool.MarkDirty(s)
+	s.Unlock()
+	pool.Unpin(s)
+
+	if calls != 0 {
+		t.Fatalf("FPI callback called %d times when full_page_writes=off", calls)
+	}
+}
+
 func TestPoolEvictionReturnsWALFlushError(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})

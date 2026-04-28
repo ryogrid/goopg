@@ -13,6 +13,15 @@ type DirtyPageFlusher interface {
 	FlushAll() error
 }
 
+// epochResetter is implemented by *storage.Pool so the
+// checkpointer can clear the per-page "FPI emitted this epoch"
+// flag after a successful checkpoint. Optional — checkpointers
+// constructed in tests with a flusher that doesn't satisfy this
+// interface keep working.
+type epochResetter interface {
+	ResetCheckpointEpoch()
+}
+
 type checkpointWAL interface {
 	Append(payload []byte) (uint64, uint64, error)
 	FlushUpTo(lsn uint64) error
@@ -177,5 +186,11 @@ func (c *Checkpointer) checkpointOnce() error {
 		return fmt.Errorf("flush checkpoint marker up to lsn %d: %w", endLSN, err)
 	}
 	c.lastCheckpointLSN.Store(endLSN)
+	// Open a new full-page-image epoch: the next mutation of each
+	// page must emit a fresh FPI so crash recovery from this
+	// checkpoint can replay it on a torn page.
+	if er, ok := c.flusher.(epochResetter); ok {
+		er.ResetCheckpointEpoch()
+	}
 	return nil
 }

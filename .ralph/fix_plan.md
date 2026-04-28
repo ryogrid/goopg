@@ -472,9 +472,23 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       `goopg start` reads `max_wal_size` (in MB) from the registry
       and calls `Checkpointer.SetMaxWALBytes` before launching the
       Run goroutine.
-- [ ] Implement full-page-image WAL records for the first
+- [x] Implement full-page-image WAL records for the first
       modification of a page after each checkpoint when
-      `full_page_writes` is on.
+      `full_page_writes` is on. The buffer pool's `MarkDirty`
+      now emits a `wal.EncodePageImage` record via a
+      `LogPageImage` callback the first time each page is
+      mutated since the last checkpoint, stamps the FPI's end
+      LSN into the page header (so the existing
+      flush-before-write ordering covers it), and tracks the
+      epoch via `Slot.fpiSinceCheckpoint`. The checkpointer
+      calls `Pool.ResetCheckpointEpoch` after a successful
+      checkpoint so the next mutation per page emits a fresh
+      FPI. `MarkDirtyWithLSN` keeps its existing semantics —
+      callers that already issued a WAL record (e.g. a future
+      heap_insert XLogInsert path) opt out of the redundant
+      FPI by using that variant. `goopg start` honours the
+      `full_page_writes` GUC by calling
+      `Pool.SetFullPageWrites` at boot.
 - [ ] Add `goopg ctl checkpoint` CLI subcommand routed through the
       control socket. Same semantics as the SQL verb.
 - [ ] Surface `pg_stat_bgwriter` / `pg_stat_checkpointer` (whichever
