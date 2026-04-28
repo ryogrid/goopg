@@ -322,8 +322,17 @@ unchecked item unless a dependency forces a different order.
 
 ## Milestone 7 — pgbench end-to-end and admin tooling
 
-- [ ] `goopg init` creates a data directory layout (`base/`, `global/`,
-      `pg_wal/`, `pg_xact/`, etc.).
+- [x] `goopg init` creates a data directory layout (`base/`, `global/`,
+      `pg_wal/`, `pg_xact/`, etc.). `internal/initdb` writes the
+      load-bearing subdirs at mode 0700, a `base/<DefaultDBOid>`
+      subdir for the default database, plus PG_VERSION (matching the
+      reported `server_version` major) and sample `postgresql.conf`
+      / `pg_hba.conf` files (loopback-trust, reject everything else
+      — same defaults `goopg start` ships with). Refuses to clobber
+      a non-empty target directory; an existing-but-empty target is
+      accepted. Wired through `goopg init -D <dir>`. Bootstrap of a
+      system catalog and a `pg_control` file are deferred to the
+      on-disk catalog work.
 - [ ] `goopg start|stop|restart|reload|status` operate the running server.
 - [ ] `pgbench -i` succeeds against goopg.
 - [ ] `pgbench` default and `--select-only` scripts run to completion under

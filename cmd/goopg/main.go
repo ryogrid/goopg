@@ -18,6 +18,7 @@ import (
 
 	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/server"
 )
 
@@ -92,8 +93,21 @@ func notImplemented(name string, fs *flag.FlagSet, args []string, stderr io.Writ
 
 func runInit(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	fs.String("D", "", "data directory to initialize (required)")
-	return notImplemented("init", fs, args, stderr)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("D", "", "data directory to initialize (required)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dataDir == "" {
+		fmt.Fprintln(stderr, "goopg init: -D <data-directory> is required")
+		return 2
+	}
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir}); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "goopg init: created data directory at %s\n", *dataDir)
+	return 0
 }
 
 func runStart(args []string, stdout, stderr io.Writer) int {
