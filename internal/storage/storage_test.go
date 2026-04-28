@@ -344,15 +344,11 @@ func TestPoolEvictionFlushesWALBeforeData(t *testing.T) {
 	}
 }
 
-// TestPoolFPIEmittedEveryMarkDirty pins the v0 redo contract:
-// every MarkDirty emits a full-page-image WAL record. v0 has no
-// logical change records (no heap_insert / btree_insert deltas)
-// so a single FPI per page per epoch would lose subsequent
-// mutations on crash recovery — see
-// docs/design/0002-0001-checkpointing.md "first dirty per epoch"
-// note and the M0002 crash-recovery test in
-// internal/initdb/recovery_test.go.
-func TestPoolFPIEmittedEveryMarkDirty(t *testing.T) {
+// TestPoolFPIEmittedOncePerEpoch pins the restored FPI contract:
+// MarkDirty emits at most one full-page-image per slot per
+// checkpoint epoch. ResetCheckpointEpoch re-arms emission for the
+// next mutation.
+func TestPoolFPIEmittedOncePerEpoch(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
 	defer mgr.Close()
@@ -385,12 +381,11 @@ func TestPoolFPIEmittedEveryMarkDirty(t *testing.T) {
 	}
 	pool.Unpin(s)
 
-	if emitted != 3 {
-		t.Fatalf("emitted=%d FPIs across 3 mutations, want 3 (every MarkDirty must emit)", emitted)
+	if emitted != 1 {
+		t.Fatalf("emitted=%d FPIs across 3 mutations in one epoch, want 1", emitted)
 	}
 
-	// ResetCheckpointEpoch is still tracked per-slot for the
-	// checkpointer's bookkeeping, but no longer gates emission.
+	// ResetCheckpointEpoch re-arms the first-dirty emission.
 	pool.ResetCheckpointEpoch()
 	s, err = pool.Pin(BufferTag{Rel: rel, Block: 0})
 	if err != nil {
@@ -401,8 +396,8 @@ func TestPoolFPIEmittedEveryMarkDirty(t *testing.T) {
 	pool.MarkDirty(s)
 	s.Unlock()
 	pool.Unpin(s)
-	if emitted != 4 {
-		t.Errorf("emitted=%d after epoch reset + one mutation, want 4", emitted)
+	if emitted != 2 {
+		t.Errorf("emitted=%d after epoch reset + one mutation, want 2", emitted)
 	}
 }
 

@@ -223,13 +223,13 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logger = slog.Default()
 	}
 	p := &Pool{
-		mgr:           mgr,
-		arena:         a,
-		slots:         make([]*Slot, cfg.Slots),
-		byTag:         make(map[BufferTag]int, cfg.Slots),
-		wal:           cfg.WAL,
-		logFPI:        cfg.LogPageImage,
-		logBtreeSplit: cfg.LogBtreeSplit,
+		mgr:            mgr,
+		arena:          a,
+		slots:          make([]*Slot, cfg.Slots),
+		byTag:          make(map[BufferTag]int, cfg.Slots),
+		wal:            cfg.WAL,
+		logFPI:         cfg.LogPageImage,
+		logBtreeSplit:  cfg.LogBtreeSplit,
 		logHeapInsert:  cfg.LogHeapInsert,
 		logBtreeInsert: cfg.LogBtreeInsert,
 		logHeapDelete:  cfg.LogHeapDelete,
@@ -247,6 +247,12 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 // or nil if none was wired. Callers (the B-tree access method)
 // are expected to fall back to per-page FPI when nil.
 func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
+
+// LogPageImage returns the configured full-page-image hook,
+// or nil if none was wired.
+func (p *Pool) LogPageImage() func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error) {
+	return p.logFPI
+}
 
 // LogHeapInsert returns the configured heap-insert change-record
 // hook, or nil if none was wired. Callers fall back to per-page
@@ -521,8 +527,10 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 // while keeping the once-per-epoch FPI optimisation alive for
 // migrated paths. Caller must hold s.contentMu exclusive.
 //
-// Paths that haven't been migrated to logical records keep
-// using MarkDirty (which emits FPI on every dirty for safety).
+// Paths that haven't been migrated to logical records can still
+// use MarkDirty for one-off page initialisation writes; hot
+// paths that may dirty the same page repeatedly in one checkpoint
+// epoch should use this API so subsequent mutations are logged.
 // See docs/design/0002-0003-redo-records.md.
 func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error {
 	p.poolMu.Lock()
@@ -569,26 +577,18 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 	return nil
 }
 
-// maybeEmitFPI runs the FPI side-effect of MarkDirty when the
-// epoch flag is unset and the pool has FPI wiring. Caller must
-// hold Slot.contentMu exclusive so the page bytes are stable.
-//
-// v0 emits an FPI on EVERY MarkDirty rather than once per epoch
-// because the WAL has no logical change records yet (no
-// heap_insert / btree_insert deltas). Without that, the
-// first-dirty FPI captures only the snapshot at the moment of
-// first mutation; subsequent in-memory mutations on the same
-// page would be silently dropped on crash recovery. The
-// fpiSinceCheckpoint flag is still tracked because the
-// checkpointer uses it for per-epoch bookkeeping, but it no
-// longer gates emission. WAL volume cost is high but bounded by
-// the dirty-page rate; landing logical change records is a
-// post-M0002 task.
+// maybeEmitFPI runs the FPI side-effect of MarkDirty for the
+// first mutation in each checkpoint epoch. Caller must hold
+// Slot.contentMu exclusive so the page bytes are stable.
 func (p *Pool) maybeEmitFPI(s *Slot) {
 	if p.logFPI == nil || !p.fullPageWrites.Load() {
 		return
 	}
 	p.poolMu.Lock()
+	if s.fpiSinceCheckpoint {
+		p.poolMu.Unlock()
+		return
+	}
 	tag := s.tag
 	p.poolMu.Unlock()
 

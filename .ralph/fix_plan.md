@@ -541,7 +541,7 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       seams). Recovery itself was already covered in M1's
       `root-0008-wal-and-recovery.md`; this doc cross-references it
       and only describes the producer-side machinery.
-- [ ] Logical change records to recover the FPI-volume regression
+- [x] Logical change records to recover the FPI-volume regression
       (started in `docs/design/0002-0003-redo-records.md`):
   - [x] `RecordKindHeapInsert` (kind=4) + encode/decode/replay
         with pd_lsn idempotency.
@@ -582,8 +582,15 @@ full Definition of Done. Decomposed into agent-sized chunks below.
         falls back to `MarkDirty` when no `LogHeapVacuum` hook is
         wired (test pools). Replay re-runs `VacuumHeapPageBySlots`
         with the recorded slots; idempotent via pd_lsn.
-  - [ ] Once all paths are migrated, flip `maybeEmitFPI` back to
+  - [x] Once all paths are migrated, flip `maybeEmitFPI` back to
         the strict once-per-epoch policy globally.
+        (achieved 2026-04-29: `storage.Pool.MarkDirty` now emits
+        at most one FPI per slot per checkpoint epoch by gating on
+        `fpiSinceCheckpoint`; B-tree metadata/root-maintenance paths
+        (`CreateWithOptions`, `updateRootMeta`, `clearRootFlag`,
+        `createNewRoot`) now go through
+        `markDirtyWithPageRecord` -> `MarkDirtyChangeRecord`, using
+        page-image WAL records for subsequent same-epoch updates.)
 
 ### Concurrent B-tree (Lehman-Yao + PG modifications)
 

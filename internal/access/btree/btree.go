@@ -222,8 +222,8 @@ func CompareKeys(a, b []byte) int {
 //     readers can run alongside the writer; writer-vs-writer
 //     concurrency lands in Landing 3 along with split WAL records.
 type BTree struct {
-	pool    *storage.Pool
-	rel     storage.RelFileNode
+	pool     *storage.Pool
+	rel      storage.RelFileNode
 	logSplit LogSplitFunc
 
 	mu sync.Mutex
@@ -324,7 +324,12 @@ func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options
 		Level: 0,
 		Flags: BTLeaf | BTRoot,
 	})
-	pool.MarkDirty(rootSlot)
+	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
+		rootSlot.Unlock()
+		pool.Unpin(rootSlot)
+		pool.Unpin(metaSlot)
+		return nil, err
+	}
 	rootSlot.Unlock()
 
 	// Initialise the metapage.
@@ -338,7 +343,12 @@ func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options
 		FastRoot:  rootBlk,
 		FastLevel: 0,
 	})
-	pool.MarkDirty(metaSlot)
+	if err := bt.markDirtyWithPageRecord(metaSlot, MetaBlock); err != nil {
+		metaSlot.Unlock()
+		pool.Unpin(rootSlot)
+		pool.Unpin(metaSlot)
+		return nil, err
+	}
 	metaSlot.Unlock()
 
 	pool.Unpin(rootSlot)
@@ -426,6 +436,22 @@ func writeMeta(p storage.Page, m BTreeMeta) {
 	h.SetLower(uint16(off + 24))
 }
 
+// markDirtyWithPageRecord routes metadata-page mutations through
+// MarkDirtyChangeRecord when a page-image WAL hook is available.
+// This keeps metapage/root-flag/root-create updates crash-safe once
+// MarkDirty returns to once-per-checkpoint FPI behaviour.
+func (bt *BTree) markDirtyWithPageRecord(slot *storage.Slot, blk storage.BlockNumber) error {
+	if logPage := bt.pool.LogPageImage(); logPage != nil {
+		return bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+			pageCopy := make(storage.Page, storage.BlockSize)
+			copy(pageCopy, slot.Page())
+			return logPage(bt.rel, blk, pageCopy)
+		})
+	}
+	bt.pool.MarkDirty(slot)
+	return nil
+}
+
 // updateRootMeta rewrites the metapage root pointer + level. Caller
 // must hold bt.mu (writers serialise tree-wide).
 func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
@@ -439,8 +465,11 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	m.FastRoot = root
 	m.FastLevel = level
 	writeMeta(slot.Page(), m)
-	bt.pool.MarkDirty(slot)
+	err = bt.markDirtyWithPageRecord(slot, MetaBlock)
 	bt.unpinW(slot)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -716,8 +745,11 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 	op := readOpaque(slot.Page())
 	op.Flags &^= BTRoot
 	writeOpaque(slot.Page(), op)
-	bt.pool.MarkDirty(slot)
+	err = bt.markDirtyWithPageRecord(slot, blk)
 	bt.unpinW(slot)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -769,7 +801,11 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
 		key:    append([]byte(nil), rightKey...),
 	})
-	bt.pool.MarkDirty(rootSlot)
+	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
+		rootSlot.Unlock()
+		bt.pool.Unpin(rootSlot)
+		return err
+	}
 	rootSlot.Unlock()
 	bt.pool.Unpin(rootSlot)
 

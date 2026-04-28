@@ -65,11 +65,14 @@ corresponding mutation site:
   repack + LSN stamp so concurrent inserters can't tear the
   prune.
 
-Remaining paths still emit FPI-every-dirty: btree metapage
-updates, btree internal-node insert, btree clearRootFlag. Each
-gets its own record kind in subsequent loops; once all paths are
-migrated, `Pool.MarkDirty` flips back to once-per-epoch FPI
-globally and the per-method selector dissolves.
+Follow-up landing (2026-04-29): B-tree metadata/root-maintenance
+paths (`CreateWithOptions`, `updateRootMeta`, `clearRootFlag`,
+`createNewRoot`) now route through
+`markDirtyWithPageRecord` -> `Pool.MarkDirtyChangeRecord`.
+Subsequent same-epoch mutations on those pages emit a page-image
+record via the pool's `LogPageImage` hook; first dirty keeps the
+baseline FPI behaviour. With those paths migrated, `Pool.MarkDirty`
+is restored to strict once-per-epoch FPI globally.
 
 ### Record format
 
@@ -144,12 +147,10 @@ re-emitted produces the same bytes.
 
 ## Out of scope (deferred to subsequent loops)
 
-- B-tree metapage / internal-node / clearRootFlag redo.
+- Compact logical record kinds for B-tree metadata/root-maintenance
+  paths (they currently use page-image change records).
 - Catalog-page (`pg_class` etc.) change records — v0's catalog
   is JSON-on-disk so it's not a buffer-pool path.
-
-After all of those land, `MarkDirty` itself can flip back to
-once-per-epoch FPI globally and the per-method selector dissolves.
 
 ## Test strategy
 
