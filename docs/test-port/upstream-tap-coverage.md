@@ -9,6 +9,8 @@ Scope in this file:
 
 Total tests: **136** (port=10, skip=66, defer=60)
 
+Port implementation status (goopg): 10/10 port rows have corresponding Go tests in `internal/testport/tap_port_test.go`.
+
 | Path | Status | Rationale |
 | ---- | ------ | --------- |
 | `postgres/src/bin/initdb/t/001_initdb.pl` | port | Maps to goopg server lifecycle and SQL protocol behavior; candidate for direct Go test porting. |

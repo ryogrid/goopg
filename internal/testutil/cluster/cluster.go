@@ -35,6 +35,7 @@ type Options struct {
 	ListenAddr   string
 	GoopgCommand []string // default: ["go", "run", "./cmd/goopg"]
 	PSQLPath     string   // default: "psql"
+	PGbenchPath  string   // default: "pgbench"
 	User         string   // default: "postgres"
 	Database     string   // default: "postgres"
 	StartupWait  time.Duration
@@ -50,6 +51,7 @@ type Cluster struct {
 	listenAddr   string
 	goopgCommand []string
 	psqlPath     string
+	pgbenchPath  string
 	user         string
 	database     string
 	startupWait  time.Duration
@@ -93,6 +95,10 @@ func New(name string, opts Options) (*Cluster, error) {
 	if strings.TrimSpace(psql) == "" {
 		psql = "psql"
 	}
+	pgbench := opts.PGbenchPath
+	if strings.TrimSpace(pgbench) == "" {
+		pgbench = "pgbench"
+	}
 	user := opts.User
 	if strings.TrimSpace(user) == "" {
 		user = "postgres"
@@ -116,6 +122,7 @@ func New(name string, opts Options) (*Cluster, error) {
 		listenAddr:   listen,
 		goopgCommand: goopg,
 		psqlPath:     psql,
+		pgbenchPath:  pgbench,
 		user:         user,
 		database:     db,
 		startupWait:  startup,
@@ -226,14 +233,55 @@ func (c *Cluster) Reload() error {
 	return nil
 }
 
+// Checkpoint runs `goopg checkpoint -D <dir>`.
+func (c *Cluster) Checkpoint() error {
+	res, err := c.runGoopg("checkpoint", "-D", c.dataDir)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("checkpoint failed: %s", strings.TrimSpace(res.Stderr))
+	}
+	return nil
+}
+
 // Status runs `goopg status -D <dir>` and returns (exitCode, combinedOutput).
 func (c *Cluster) Status() (int, string, error) {
 	res, err := c.runGoopg("status", "-D", c.dataDir)
 	if err != nil {
 		return 1, "", err
 	}
-	msg := strings.TrimSpace(strings.TrimSpace(res.Stdout + "\n" + res.Stderr))
-	return res.ExitCode, msg, nil
+	code := res.ExitCode
+	stderr := strings.TrimSpace(res.Stderr)
+	if code == 1 {
+		if mapped, ok := parseGoRunWrappedExitStatus(stderr); ok {
+			code = mapped
+			stderr = stripGoRunWrappedExitStatus(stderr)
+		}
+	}
+	msg := strings.TrimSpace(strings.TrimSpace(res.Stdout + "\n" + stderr))
+	return code, msg, nil
+}
+
+// WaitForStatus polls status until exit code matches want.
+func (c *Cluster) WaitForStatus(want int, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		code, msg, err := c.Status()
+		if err == nil && code == want {
+			return nil
+		}
+		_ = msg
+		time.Sleep(50 * time.Millisecond)
+	}
+	code, msg, err := c.Status()
+	if err != nil {
+		return fmt.Errorf("wait for status=%d: %w", want, err)
+	}
+	return fmt.Errorf("wait for status=%d: got status=%d (%s)", want, code, msg)
 }
 
 // PSQL runs a foreground psql command against this cluster.
@@ -250,6 +298,23 @@ func (c *Cluster) PSQL(args ...string) (util.CommandResult, error) {
 		Dir:     c.repoRoot,
 		Env:     []string{"PGPASSWORD="},
 		Timeout: 30 * time.Second,
+	})
+}
+
+// PGbench runs a foreground pgbench command against this cluster.
+func (c *Cluster) PGbench(args ...string) (util.CommandResult, error) {
+	host, port, err := splitHostPort(c.listenAddr)
+	if err != nil {
+		return util.CommandResult{}, err
+	}
+	base := []string{"-h", host, "-p", port, "-U", c.user, c.database}
+	base = append(base, args...)
+	return util.RunCommand(util.CommandSpec{
+		Name:    c.pgbenchPath,
+		Args:    base,
+		Dir:     c.repoRoot,
+		Env:     []string{"PGPASSWORD="},
+		Timeout: 120 * time.Second,
 	})
 }
 
@@ -348,6 +413,11 @@ func (c *Cluster) WaitForLogContains(needle string, timeout time.Duration) error
 	return util.WaitForFileContains(c.logPath, needle, timeout)
 }
 
+// TruncateLog emulates pg_ctl logrotate for a single-file log target.
+func (c *Cluster) TruncateLog() error {
+	return os.WriteFile(c.logPath, nil, 0o644)
+}
+
 func (c *Cluster) runGoopg(args ...string) (util.CommandResult, error) {
 	cmdArgs := append(append([]string{}, c.goopgCommand[1:]...), args...)
 	return util.RunCommand(util.CommandSpec{
@@ -394,4 +464,25 @@ func appendLine(path, line string) error {
 	}
 	_, err = f.WriteString(line)
 	return err
+}
+
+func parseGoRunWrappedExitStatus(stderr string) (int, bool) {
+	line := strings.TrimSpace(stderr)
+	if !strings.HasPrefix(line, "exit status ") {
+		return 0, false
+	}
+	v := strings.TrimSpace(strings.TrimPrefix(line, "exit status "))
+	code, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, false
+	}
+	return code, true
+}
+
+func stripGoRunWrappedExitStatus(stderr string) string {
+	line := strings.TrimSpace(stderr)
+	if strings.HasPrefix(line, "exit status ") {
+		return ""
+	}
+	return stderr
 }

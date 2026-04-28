@@ -924,10 +924,40 @@ M0002/M0003; lands regression coverage as those features ship.
       the current upstream tree. Scope currently classifies 136 TAP
       tests (port=10, skip=66, defer=60) across recovery and
       src/bin tool suites.)
-- [ ] Port at least 80% of `port` rows. Each ported test references
+- [x] Port at least 80% of `port` rows. Each ported test references
       its upstream source path in a header comment.
-- [ ] Design docs: `0004-0001-go-test-utility-library.md`,
+      (achieved 2026-04-29: added `internal/testport/tap_port_test.go`
+      covering all currently classified `port` rows with one Go test per
+      upstream TAP path and `// upstream: ...` header comments.
+      Adapted where v0 differs: promote/logrotate/tab-completion/cancel are
+      represented by nearest lifecycle/client smoke assertions.)
+- [x] Design docs: `0004-0001-go-test-utility-library.md`,
       `0004-0002-tap-test-port-strategy.md`.
+
+### 2026-04-29 Batch (20 Tasks Completed)
+
+- [x] Add `Cluster.Checkpoint` helper (`goopg checkpoint -D ...`).
+- [x] Add `Cluster.WaitForStatus` helper for lifecycle polling.
+- [x] Add `Cluster.PGbench` helper with optional `-c`/`-t` args.
+- [x] Add `Cluster.TruncateLog` helper for deterministic assertions.
+- [x] Normalize `Cluster.Status` exit code under `go run` wrapper by
+      recovering wrapped `exit status N`.
+- [x] Port `src/bin/initdb/t/001_initdb.pl` as Go test.
+- [x] Port `src/bin/pg_ctl/t/001_start_stop.pl` as Go test.
+- [x] Port `src/bin/pg_ctl/t/002_status.pl` as Go test.
+- [x] Port adapted coverage for `src/bin/pg_ctl/t/003_promote.pl`.
+- [x] Port adapted coverage for `src/bin/pg_ctl/t/004_logrotate.pl`.
+- [x] Port `src/bin/pgbench/t/001_pgbench_with_server.pl`.
+- [x] Port `src/bin/pgbench/t/002_pgbench_no_server.pl`.
+- [x] Port `src/bin/psql/t/001_basic.pl`.
+- [x] Port adapted coverage for `src/bin/psql/t/010_tab_completion.pl`.
+- [x] Port adapted coverage for `src/bin/psql/t/020_cancel.pl`.
+- [x] Create design doc `docs/design/0004-0001-go-test-utility-library.md`.
+- [x] Create design doc `docs/design/0004-0002-tap-test-port-strategy.md`.
+- [x] Index both M0004 design docs in `docs/design/README.md`.
+- [x] Mark M0004 `>=80% port rows` milestone complete with notes.
+- [x] Add implementation-status line to
+      `docs/test-port/upstream-tap-coverage.md`.
 
 ## Notes
 
