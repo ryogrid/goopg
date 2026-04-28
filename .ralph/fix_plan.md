@@ -304,9 +304,14 @@ unchecked item unless a dependency forces a different order.
       `parser.CopyStmt` to `planner.Copy` (catalog table + column
       ordinals, query-form plans the inner SELECT, plan-time option
       validator with SQLSTATE 42P01/42703/42701/42601/0A000).
-      Executor copy operator and the server replacement of the
-      string-matching dispatch are still pending; binary mode also
-      pending.)
+      Executor now has a COPY TEXT codec
+      (`internal/executor/copy_text.go`) that round-trips Datum rows
+      through upstream's tab-separated/`\N`-NULL form, including the
+      \b/\f/\n/\r/\t/\v/\\/\xHH/\NNN escape table; pgbench-shaped
+      rows (3×int4 + text filler) round-trip exactly. The server
+      replacement of the string-matching COPY dispatch and the
+      executor-side bidirectional driver still need to land; binary
+      mode also pending.)
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.
