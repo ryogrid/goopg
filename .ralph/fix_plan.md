@@ -145,7 +145,10 @@ unchecked item unless a dependency forces a different order.
       integrates WAL-before-data ordering by flushing WAL up to
       page `pd_lsn` before dirty-page writeback.
 - [ ] Checkpointer goroutine.
-- [ ] Crash recovery (replay WAL up to the last consistent checkpoint).
+- [x] Crash recovery (replay WAL up to the last consistent checkpoint).
+      `internal/wal/recovery.go` adds page-image replay and checkpoint
+      marker handling (`RecordKindCheckpoint`), replaying records up to
+      the latest consistent checkpoint boundary.
 - [ ] B-tree index access method.
 - [ ] `VACUUM` and `ANALYZE` minimal implementations.
 - [ ] Design docs: `0007-mvcc-and-snapshots.md`, `0009-btree.md`.

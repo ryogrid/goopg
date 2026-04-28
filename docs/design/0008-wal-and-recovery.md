@@ -35,9 +35,9 @@ Land a **library-first WAL layer** and wire it into buffer flush paths:
 4. Buffer manager integration so every dirty page write asks WAL to
    flush up to that page's `pd_lsn` first.
 
-Do not land full crash replay in this loop. Recovery implementation is
-the next loop's item; this document defines the seam and invariants it
-relies on.
+Initial loop scope focused on writer + WAL-before-data ordering; a
+follow-up loop now adds minimal crash replay that applies WAL records
+up to the last checkpoint marker.
 
 ### WAL stream model
 
@@ -114,6 +114,18 @@ This loop keeps the existing `FlushAll()`-driven checkpoint seam:
 
 Adding the actual scheduler goroutine is a thin follow-up once server
 lifecycle wiring (`goopg start -D`) is ready.
+
+### Recovery model (minimal)
+
+Recovery reads WAL records and replays only records up to the most
+recent checkpoint marker (`RecordKindCheckpoint`). If no checkpoint
+exists, recovery replays all records.
+
+- `RecordKindPageImage`: full-page image redo record.
+- `RecordKindCheckpoint`: consistency boundary marker.
+
+This gives a conservative crash-recovery behavior that avoids applying
+tail records beyond the last known consistent point.
 
 ## Alternatives considered
 

@@ -11,14 +11,22 @@ import (
 const (
 	// RecordKindPageImage is a full-page image redo record.
 	RecordKindPageImage byte = 1
+	// RecordKindCheckpoint marks a consistent recovery boundary.
+	RecordKindCheckpoint byte = 2
 
 	pageImageHeaderSize = 14
 )
 
 // ReplayStats summarizes one replay run.
 type ReplayStats struct {
-	Records int
-	Applied int
+	Records       int
+	Applied       int
+	CheckpointLSN uint64
+}
+
+// EncodeCheckpoint encodes a checkpoint marker record payload.
+func EncodeCheckpoint() []byte {
+	return []byte{RecordKindCheckpoint}
 }
 
 // EncodePageImage encodes one full-page image record payload.
@@ -60,7 +68,10 @@ func DecodePageImage(payload []byte) (storage.RelFileNode, storage.BlockNumber, 
 // ReplayRecords replays decoded WAL records into storage.
 func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) {
 	stats := ReplayStats{Records: len(records)}
-	for i, r := range records {
+	replayUntil, checkpointLSN := replayLimit(records)
+	stats.CheckpointLSN = checkpointLSN
+
+	for i, r := range records[:replayUntil] {
 		if len(r.Payload) == 0 {
 			return stats, fmt.Errorf("wal: replay record %d has empty payload", i)
 		}
@@ -70,6 +81,9 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
 			}
 			stats.Applied++
+		case RecordKindCheckpoint:
+			// Marker only; no page write.
+			continue
 		default:
 			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: unsupported kind %d", i, r.StartLSN, r.EndLSN, r.Payload[0])
 		}
@@ -112,4 +126,22 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 	default:
 		return fmt.Errorf("wal: replay gap block=%d nblocks=%d", blk, nblocks)
 	}
+}
+
+func replayLimit(records []Record) (int, uint64) {
+	lastCheckpointIdx := -1
+	var checkpointLSN uint64
+	for i, r := range records {
+		if len(r.Payload) == 0 {
+			continue
+		}
+		if r.Payload[0] == RecordKindCheckpoint {
+			lastCheckpointIdx = i
+			checkpointLSN = r.EndLSN
+		}
+	}
+	if lastCheckpointIdx == -1 {
+		return len(records), 0
+	}
+	return lastCheckpointIdx + 1, checkpointLSN
 }
