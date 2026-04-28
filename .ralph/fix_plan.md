@@ -821,7 +821,7 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
 
 ### Planner depth
 
-- [ ] Cost-based planner with cardinality estimates good enough that
+- [x] Cost-based planner with cardinality estimates good enough that
       no TPC-H query degenerates to a Cartesian product.
       (cardinality-estimation infrastructure landed
       2026-04-28: `planner.EstimateRows(n)` flows row counts
@@ -844,10 +844,23 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       hash-join-with-build-side-selection. The canonical
       TPC-H shape `SELECT FROM r, n, s WHERE r.rk = n.rk
       AND s.nk = n.nk` now plans as chained Hash Joins
-      instead of `Filter(Cross(Cross(...)))`. Still TODO for
-      this bullet: cost-driven join-order reordering and
-      algorithm-vs-algorithm choice (hash vs merge vs nested
-      for INNER). See
+      instead of `Filter(Cross(Cross(...)))`. Cost-driven
+      join-order reordering landed 2026-04-29:
+      `internal/planner/joinorder.go` adds a parser-level
+      pre-pass that permutes the comma-FROM list so small-
+      cardinality tables join first when ANALYZE has supplied
+      row counts. Greedy nearest-neighbour by cardinality with
+      equality-edge preference (bare-column refs resolved via a
+      column→relation owner map). Operating at parser-AST level
+      avoids any ColumnRef.Index remapping downstream. Skips
+      when stats are missing, when an explicit JOIN clause is
+      present, or when the result equals source order. TPC-H
+      Q5's `customer, orders, lineitem, supplier, nation,
+      region` now reorders to `region, nation, supplier,
+      lineitem, orders, customer`. Algorithm-vs-algorithm
+      choice (hash vs merge vs nested for INNER) is still
+      open as a future refinement. See
+      `docs/design/0003-0016-join-order-reordering.md`,
       `docs/design/0003-0003-statistics-and-cardinality.md`,
       `docs/design/0003-0002-join-executors.md`, and the
       "Predicate Pushdown for Comma-FROM" section in

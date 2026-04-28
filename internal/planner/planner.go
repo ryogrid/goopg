@@ -222,8 +222,22 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		ctx = newResolveContext([]rangeBinding{b}, schema)
 	} else {
+		// Cost-based join-order reordering: when every comma-FROM
+		// table has ANALYZE statistics, permute the FROM list so
+		// small-cardinality relations join first. Operates on a
+		// SelectStmt copy so we don't mutate the caller's parser
+		// AST. Falls through to source order when stats are
+		// missing or the FROM list isn't a pure comma chain.
+		// See docs/design/0003-0016-join-order-reordering.md.
+		stmt := s
+		if reFE, reFR, rewrote := reorderCommaFromByCardinality(s, cat); rewrote {
+			c := *s
+			c.FromExprs = reFE
+			c.From = reFR
+			stmt = &c
+		}
 		var err error
-		node, ctx, err = planFromClause(s, cat)
+		node, ctx, err = planFromClause(stmt, cat)
 		if err != nil {
 			return nil, err
 		}
