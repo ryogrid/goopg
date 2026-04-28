@@ -256,9 +256,13 @@ unchecked item unless a dependency forces a different order.
         the buffer pool with mvcc.TupleVisible filtering; Insert
         extends via PinNew when the last block is full. End-to-end
         round-trip + relation-extension tests pass.
-  - [ ] Heap-touching operators: Update + Delete. Update overwrites
-        with old-image xmax-tagged + new-image xmin-tagged; Delete
-        marks visible rows with xmax = current xid.
+  - [x] Heap-touching operators: Update + Delete. Update follows the
+        upstream "delete + insert" pattern — stamp xmax on the old
+        tuple via storage.PageSetHeapTupleXmax, then writeHeapRow the
+        new image with xmin = current xid. Delete just stamps xmax.
+        Both extract their predicate from a child Filter(SeqScan) or
+        bare SeqScan; v0 doesn't yet handle JOIN/USING. Pgbench-shaped
+        UPDATE-then-SELECT and DELETE-by-id round-trip end-to-end.
   - [ ] DDL operator path: CREATE TABLE / DROP TABLE / TRUNCATE /
         CREATE INDEX wired through the catalog + smgr.
   - [ ] Transaction operator: BEGIN/COMMIT/ROLLBACK plumbed to

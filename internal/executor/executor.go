@@ -46,6 +46,10 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return newInsertOp(p, child), nil
+	case *planner.Update:
+		return newUpdateOp(p)
+	case *planner.Delete:
+		return newDeleteOp(p)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: fmt.Sprintf("unsupported plan node %T", plan)}
 }

@@ -378,6 +378,40 @@ func VacuumHeapPage(p Page, isDead func(HeapTupleHeader) bool) (HeapPageVacuumSt
 	return stats, nil
 }
 
+// PageSetHeapTupleXmax overwrites the xmax field of the heap tuple
+// at the given 1-based slot. This is the executor's MVCC delete /
+// update-old-image path: marking xmax doesn't move the tuple bytes,
+// so existing index pointers and concurrent readers stay valid.
+//
+// Returns ErrUnsupportedItem if the slot isn't LP_NORMAL, ErrInvalidSlot
+// for out-of-range slot numbers.
+func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+8 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	return nil
+}
+
 // PageGetItemRaw returns the raw item bytes at the 1-based slot. The
 // returned slice is a copy.
 func PageGetItemRaw(p Page, slot uint16) ([]byte, error) {
