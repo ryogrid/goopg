@@ -254,6 +254,16 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: x.Type}, nil
 	case *parser.IntervalLit:
 		return catalog.Type{Name: "interval"}, nil
+	case *parser.ExtractExpr:
+		// EXTRACT(field FROM ts) returns numeric upstream
+		// (NUMERIC for fractional seconds, integer otherwise).
+		// v0 returns int8 — covers year/month/day/etc.; the
+		// fractional-second fields (second/millisecond) are
+		// listed as deferred in the design doc.
+		if _, err := analyzeExpr(x.Source, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "int8"}, nil
 	case *parser.CaseExpr:
 		return analyzeCaseExpr(x, ctx)
 	case *parser.NullConst:

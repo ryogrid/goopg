@@ -54,6 +54,24 @@ type TypedStringLit struct {
 func (e *TypedStringLit) Pos() int { return e.pos }
 func (*TypedStringLit) exprNode()  {}
 
+// ExtractExpr is the SQL-standard `EXTRACT(field FROM source)`
+// where `field` is an unquoted identifier naming a calendar
+// component (year, month, day, hour, minute, second, dow, doy,
+// epoch, …). v0 implements the subset TPC-H needs (year, month,
+// day) plus the obvious neighbours; sub-second fields wait on
+// the type system. Stored separately from `FuncCall` because
+// upstream's grammar is `EXTRACT(extract_arg FROM expr)` —
+// the field is a keyword-position identifier, not a value
+// expression.
+type ExtractExpr struct {
+	pos    int
+	Field  string // lower-cased: "year"/"month"/"day"/...
+	Source Expr
+}
+
+func (e *ExtractExpr) Pos() int { return e.pos }
+func (*ExtractExpr) exprNode()  {}
+
 // IntervalLit represents the SQL-standard `interval 'N' unit`
 // shape used heavily by TPC-H (Q1: `interval '90' day`, Q4:
 // `interval '3' month`, Q5/6/12/14: `interval '1' year`, etc.).

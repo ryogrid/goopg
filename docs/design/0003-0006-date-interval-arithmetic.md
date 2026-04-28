@@ -127,10 +127,46 @@ SELECT date '1995-01-01' + interval '1' year AS one_year_later;
 
 All three return the expected rows.
 
+### EXTRACT(field FROM source)
+
+`EXTRACT` has its own grammar — `EXTRACT(field FROM expr)` —
+because the field name is in keyword position rather than a
+value expression. The parser detects the leading `extract(`
+inside `parseColumnOrCall` and dispatches to
+`parseExtractExpr`, which consumes `(`, the field ident, the
+`FROM` keyword, the source expression, and `)`. The result
+is a `parser.ExtractExpr{Field, Source}` AST node.
+
+Supported fields (executor `evalExtract`):
+
+| Field    | Result                          |
+| -------- | ------------------------------- |
+| year     | calendar year                   |
+| month    | 1-12                            |
+| day      | 1-31                            |
+| hour     | 0-23                            |
+| minute   | 0-59                            |
+| second   | 0-59 (sub-second deferred)      |
+| dow      | 0=Sun … 6=Sat (matches upstream) |
+| doy      | 1-366                           |
+| epoch    | Unix seconds                    |
+| quarter  | 1-4 (computed from month)       |
+
+All fields return `int8`; fractional seconds wait on the type
+system. EXTRACT(microsecond FROM …) and EXTRACT(timezone FROM
+…) are deferred.
+
+End-to-end with TPC-H Q7's filter shape:
+
+```
+SELECT o_orderdate FROM orders
+  WHERE EXTRACT(year FROM o_orderdate) = 1995;
+-- correctly returns only the 1995-* rows
+```
+
 ## Out of scope (deferred to subsequent loops)
 
-- `EXTRACT(field FROM ts)` (Q7/Q8/Q9). A separate function
-  with its own grammar.
+- Fractional-second EXTRACT (microsecond, millisecond).
 - `timestamp - timestamp → interval`.
 - Sub-day intervals and multi-field literals.
 - `BETWEEN x AND y` (sugar over `>= AND <=`; not strictly

@@ -740,6 +740,33 @@ func (p *parser) parseCaseExpr() (Expr, error) {
 	return out, nil
 }
 
+// parseExtractExpr parses the EXTRACT special-grammar: the
+// leading `EXTRACT` ident has already been consumed; this
+// helper is called when the parser is positioned on the `(`.
+// Grammar: `( ident FROM expr )` where `ident` is the lower-
+// case calendar component (year, month, day, …).
+func (p *parser) parseExtractExpr(pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after EXTRACT")
+	}
+	fieldTok, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	field := strings.ToLower(identText(fieldTok))
+	if _, err := p.expectKeyword(KwFrom); err != nil {
+		return nil, err
+	}
+	source, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close EXTRACT")
+	}
+	return &ExtractExpr{pos: pos, Field: field, Source: source}, nil
+}
+
 // parseColumnOrCall handles `name`, `name.name`, `name.name.name`,
 // `name(args)`, `name.name(args)`, `name.*`, `name.name.*`. The
 // distinction between a function call and a column reference is the
@@ -774,6 +801,13 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 	}
 	// Function call?
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		// EXTRACT has its own grammar: EXTRACT(field FROM expr).
+		// Field is a positional identifier, not a value expr,
+		// so the regular comma-arg parser would mishandle it.
+		// Match case-insensitively on the bare ident form.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "extract") {
+			return p.parseExtractExpr(startPos)
+		}
 		var name ObjectName
 		switch len(parts) {
 		case 1:

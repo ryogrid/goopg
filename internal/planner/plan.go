@@ -88,6 +88,17 @@ type IntervalLit struct {
 func (e *IntervalLit) Pos() int { return e.pos }
 func (*IntervalLit) exprNode()  {}
 
+// ExtractExpr mirrors parser.ExtractExpr. Field is the
+// lower-cased calendar component the executor switches on.
+type ExtractExpr struct {
+	pos    int
+	Field  string
+	Source Expr
+}
+
+func (e *ExtractExpr) Pos() int { return e.pos }
+func (*ExtractExpr) exprNode()  {}
+
 // CaseWhen mirrors parser.CaseWhen with planner-resolved
 // expressions in place of parser-AST nodes.
 type CaseWhen struct {

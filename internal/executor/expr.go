@@ -35,6 +35,8 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
 		return evalIntervalLit(x)
+	case *planner.ExtractExpr:
+		return evalExtract(x, row, ctx)
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
 	case *planner.NumericConst:
@@ -298,6 +300,51 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
 	}
 	return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("typed-string literal with type %q is not supported", x.Type)}
+}
+
+// evalExtract implements `EXTRACT(field FROM source)` for the
+// timestamp-component fields TPC-H Q7/Q8/Q9 use (year), plus
+// the obvious neighbours (month, day, hour, minute, dow, doy,
+// epoch). Returns int8; fractional-second fields wait on the
+// type system.
+func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
+	src, err := evalExpr(x.Source, row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if src.IsNull() {
+		return NullDatum, nil
+	}
+	if src.Kind != KindTime {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT(%s FROM …) requires timestamp/date input", x.Field)}
+	}
+	t := src.Time.UTC()
+	var n int64
+	switch x.Field {
+	case "year":
+		n = int64(t.Year())
+	case "month":
+		n = int64(t.Month())
+	case "day":
+		n = int64(t.Day())
+	case "hour":
+		n = int64(t.Hour())
+	case "minute":
+		n = int64(t.Minute())
+	case "second":
+		n = int64(t.Second())
+	case "dow":
+		n = int64(t.Weekday()) // Sunday=0, matches upstream
+	case "doy":
+		n = int64(t.YearDay())
+	case "epoch":
+		n = t.Unix()
+	case "quarter":
+		n = int64((int(t.Month())-1)/3 + 1)
+	default:
+		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT field %q is not supported in v0", x.Field)}
+	}
+	return Datum{Kind: KindInt, Int: n}, nil
 }
 
 // evalIntervalLit parses the integer body of an `interval 'N' unit`

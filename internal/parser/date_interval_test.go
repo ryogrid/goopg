@@ -53,3 +53,20 @@ func TestDateMinusIntervalParses(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestParseExtractExpr pins the TPC-H Q7/Q8/Q9 shape:
+// `EXTRACT(year FROM o_orderdate)` parses to ExtractExpr
+// with the lower-cased field name.
+func TestParseExtractExpr(t *testing.T) {
+	stmts, err := Parse("SELECT EXTRACT(YEAR FROM o_orderdate) FROM orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt := stmts[0].(*SelectStmt).Targets[0].Expr.(*ExtractExpr)
+	if tgt.Field != "year" {
+		t.Errorf("Field=%q want year", tgt.Field)
+	}
+	if _, ok := tgt.Source.(*ColumnRef); !ok {
+		t.Errorf("Source=%T want *ColumnRef", tgt.Source)
+	}
+}
