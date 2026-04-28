@@ -333,6 +333,70 @@ func TestPlanCommaFromPushesEqualityIntoJoin(t *testing.T) {
 	})
 }
 
+// TestPlanOrderByAliasAndPositional pins the ORDER BY
+// substitution: bare aliases and positional indices rewrite to
+// the underlying target-list expression so TPC-H Q3/Q5/Q9/Q10/Q21
+// (ORDER BY <agg-alias> DESC) plan and execute end-to-end.
+// Qualified column refs (`t.col`) are NOT substituted even if
+// the bare name happens to collide with a target alias.
+func TestPlanOrderByAliasAndPositional(t *testing.T) {
+	cat := pgbenchCatalog(t)
+
+	t.Run("alias resolves to target expression", func(t *testing.T) {
+		sql := "SELECT a.aid + 10 AS xx FROM pgbench_accounts a ORDER BY xx DESC"
+		node, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		// Project -> Sort -> SeqScan
+		proj, ok := node.(*Project)
+		if !ok {
+			t.Fatalf("root=%T want *Project", node)
+		}
+		sort, ok := proj.Child.(*Sort)
+		if !ok {
+			t.Fatalf("Project.Child=%T want *Sort", proj.Child)
+		}
+		if len(sort.Keys) != 1 {
+			t.Fatalf("Sort.Keys=%d want 1", len(sort.Keys))
+		}
+		// The substituted expression is `aid + 10` — not the
+		// undefined alias name.
+		if _, ok := sort.Keys[0].Expr.(*BinaryOp); !ok {
+			t.Errorf("Sort.Keys[0].Expr=%T want *BinaryOp (a.aid + 10)", sort.Keys[0].Expr)
+		}
+	})
+
+	t.Run("positional index resolves to target", func(t *testing.T) {
+		sql := "SELECT a.aid, a.bid FROM pgbench_accounts a ORDER BY 2"
+		node, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		proj := node.(*Project)
+		sort := proj.Child.(*Sort)
+		// The substituted expression is the second target's
+		// resolved column ref (a.bid, index 1).
+		cr, ok := sort.Keys[0].Expr.(*ColumnRef)
+		if !ok {
+			t.Fatalf("Sort.Keys[0].Expr=%T want *ColumnRef", sort.Keys[0].Expr)
+		}
+		if cr.Index != 1 {
+			t.Errorf("Index=%d want 1 (a.bid)", cr.Index)
+		}
+	})
+
+	t.Run("non-alias bare ident still resolves via FROM", func(t *testing.T) {
+		// `aid` isn't a target alias here — should resolve to
+		// a.aid via the regular column-ref path.
+		sql := "SELECT a.aid + 10 FROM pgbench_accounts a ORDER BY aid"
+		_, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v (should resolve aid via FROM)", err)
+		}
+	})
+}
+
 func TestPlanJoinPicksMergeAlgoForRightFullEquality(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	cases := []struct {

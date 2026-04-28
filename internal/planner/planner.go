@@ -293,12 +293,21 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if len(s.OrderBy) > 0 {
 		keys := make([]SortKey, 0, len(s.OrderBy))
 		for _, sb := range s.OrderBy {
+			// SQL allows ORDER BY to reference target-list aliases
+			// (`SELECT sum(x) AS revenue ... ORDER BY revenue`)
+			// and positional indices (`ORDER BY 1, 2`). Resolve
+			// those substitutions BEFORE feeding the expression
+			// into the column-resolver so the post-aggregate path
+			// can see the same parser.Expr that built the
+			// aggregate stage's target. TPC-H Q3, Q5, Q9, Q10,
+			// Q21 all use ORDER BY <alias> shapes.
+			expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
 			var e Expr
 			var err error
 			if agg == nil {
-				e, err = resolveExpr(sb.Expr, ctx)
+				e, err = resolveExpr(expr, ctx)
 			} else {
-				e, err = resolveExprAfterAggregate(sb.Expr, agg)
+				e, err = resolveExprAfterAggregate(expr, agg)
 			}
 			if err != nil {
 				return nil, err
@@ -623,6 +632,35 @@ func naturalJoinColumns(leftCtx, rightCtx *resolveContext) []string {
 // right; a `right.col = left.col` predicate is silently flipped
 // at this layer so the executor can stay one-direction.
 //
+// resolveOrderBySubstitution rewrites an ORDER BY expression to
+// the underlying target-list expression when the user wrote a
+// bare alias or a positional index. Returns `expr` unchanged
+// when neither rewrite applies. This mirrors upstream's
+// `transformSortClause` lookup order: positional, then alias,
+// then full expression resolution. Qualified column references
+// (`t.col`) are NOT substituted — those refer to FROM-clause
+// columns even if a target shares the bare name. TPC-H Q3, Q5,
+// Q9, Q10, Q21 use the alias form (`ORDER BY revenue DESC`).
+func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) parser.Expr {
+	// Positional: `ORDER BY 1` → targets[0].Expr.
+	if ic, ok := expr.(*parser.IntegerConst); ok {
+		idx := int(ic.Value) - 1
+		if idx >= 0 && idx < len(targets) {
+			return targets[idx].Expr
+		}
+		return expr
+	}
+	// Alias: bare ColumnRef whose Column matches a target's Alias.
+	if cr, ok := expr.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
+		for _, tgt := range targets {
+			if tgt.Alias != "" && strings.EqualFold(tgt.Alias, cr.Column) {
+				return tgt.Expr
+			}
+		}
+	}
+	return expr
+}
+
 // AND-of-equalities, OR, range predicates, and equalities whose
 // operands span both sides all fall back to (nil, nil, false)
 // — the planner keeps the nested-loop algorithm for those.

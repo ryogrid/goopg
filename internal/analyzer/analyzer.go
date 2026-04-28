@@ -12,6 +12,31 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// orderBySubstitution rewrites an ORDER BY expression to the
+// underlying target-list expression when the user wrote a bare
+// alias (`ORDER BY revenue`) or a positional index (`ORDER BY 1`).
+// Returns expr unchanged when neither rewrite applies. Mirrors
+// the planner's resolveOrderBySubstitution so analyzer and
+// planner stay in lockstep on what counts as a valid ORDER BY
+// reference.
+func orderBySubstitution(expr parser.Expr, targets []parser.ResTarget) parser.Expr {
+	if ic, ok := expr.(*parser.IntegerConst); ok {
+		idx := int(ic.Value) - 1
+		if idx >= 0 && idx < len(targets) {
+			return targets[idx].Expr
+		}
+		return expr
+	}
+	if cr, ok := expr.(*parser.ColumnRef); ok && cr.Schema == "" && cr.Table == "" {
+		for _, tgt := range targets {
+			if tgt.Alias != "" && strings.EqualFold(tgt.Alias, cr.Column) {
+				return tgt.Expr
+			}
+		}
+	}
+	return expr
+}
+
 // AnalyzeError is a structured analyzer failure with SQLSTATE-style code.
 type AnalyzeError struct {
 	Pos     int
@@ -161,7 +186,13 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		}
 	}
 	for _, sb := range s.OrderBy {
-		if _, err := analyzeExpr(sb.Expr, ctx); err != nil {
+		// SQL ORDER BY may reference target-list aliases or
+		// positional indices. Substitute the underlying target
+		// expression before type-checking so a bare alias like
+		// `ORDER BY revenue DESC` (Q3) doesn't trip the
+		// undefined-column check.
+		expr := orderBySubstitution(sb.Expr, s.Targets)
+		if _, err := analyzeExpr(expr, ctx); err != nil {
 			return err
 		}
 	}

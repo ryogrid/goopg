@@ -968,6 +968,23 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] `ORDER BY <target-list-alias>` / `ORDER BY <positional-index>`
+      for TPC-H Q3 / Q5 / Q9 / Q10 / Q21 result ordering.
+      (achieved 2026-04-29: surfaced by running TPC-H Q3
+      end-to-end against goopg —
+      `ORDER BY revenue DESC, o_orderdate` errored with
+      `column "revenue" does not exist`. Both analyzer and
+      planner now substitute the underlying target expression
+      before resolving columns: bare ColumnRef whose Column
+      matches a target's Alias becomes that target's parser
+      expression; IntegerConst N becomes targets[N-1].Expr.
+      Qualified `t.col` refs are NOT substituted even when the
+      bare name collides with a target alias (matches upstream's
+      transformSortClause precedence). Verified via psql 18.3
+      against TPC-H Q3 (`ORDER BY revenue DESC`),
+      `ORDER BY <position>`, and a non-alias bare ident
+      resolving via FROM. `TestPlanOrderByAliasAndPositional`
+      pins the three behaviours.)
 - [x] `BETWEEN` / `NOT BETWEEN` for TPC-H Q6 / Q14 / Q19 ranges.
       (achieved 2026-04-29: parser desugars
       `expr [NOT] BETWEEN low AND high` at parse time to

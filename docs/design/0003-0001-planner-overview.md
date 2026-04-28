@@ -71,6 +71,28 @@ For INNER hash joins, `EstimateRows` drives build-side selection: the smaller
 side becomes the build (`Join.BuildLeft = true` when the left input has the
 smaller estimate). See [0003-0002-join-executors.md](0003-0002-join-executors.md).
 
+## ORDER BY Alias and Positional Substitution
+
+ORDER BY can reference target-list aliases (`ORDER BY revenue DESC`,
+emitted by TPC-H Q3/Q5/Q9/Q10/Q21) and positional indices
+(`ORDER BY 1, 2`). Both analyzer and planner run the same
+`orderBySubstitution` / `resolveOrderBySubstitution` helper before
+column resolution:
+
+- Bare `ColumnRef` (no schema/table qualifier) whose column name
+  case-insensitively matches a target's `Alias` becomes that
+  target's parser expression.
+- `IntegerConst N` becomes `targets[N-1].Expr`.
+- Anything else passes through unchanged — qualified `t.col`
+  refs always resolve via FROM, never via target aliases (matches
+  upstream's `transformSortClause` precedence).
+
+Doing this in both the analyzer and the planner keeps them in
+lockstep on what counts as a valid ORDER BY reference; without
+the analyzer-side substitution, the analyzer's
+`undefined column` check would reject the alias before the
+planner ever saw it.
+
 ## Predicate Pushdown for Comma-FROM
 
 `planFromRangeVars` builds a left-deep CROSS-join chain when the user writes
