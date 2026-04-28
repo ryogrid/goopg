@@ -101,6 +101,13 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 // Close releases the arena. It does not close the storage manager.
 func (p *Pool) Close() error { return p.arena.close() }
 
+// NBlocks reports the number of blocks currently in rel. Pass-through
+// to the underlying smgr; callers (e.g. vacuum) need this to drive a
+// full-relation walk.
+func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
+	return p.mgr.NBlocks(rel)
+}
+
 // ErrNoBuffer is returned when every slot is pinned and the clock
 // sweep can't find a victim.
 var ErrNoBuffer = errors.New("no available buffer (all pinned)")

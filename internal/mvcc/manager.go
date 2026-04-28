@@ -110,6 +110,22 @@ func (m *Manager) ActiveCount() int {
 	return len(m.active)
 }
 
+// OldestXmin is the lowest xid still potentially observable by any
+// in-progress or future snapshot. Returns nextXID when no transaction
+// is active. VACUUM uses this as the horizon below which xmax-tagged
+// tuples can be reclaimed.
+func (m *Manager) OldestXmin() storage.TransactionID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	xmin := m.nextXID
+	for xid := range m.active {
+		if xid < xmin {
+			xmin = xid
+		}
+	}
+	return xmin
+}
+
 func (m *Manager) finish(tx Transaction) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

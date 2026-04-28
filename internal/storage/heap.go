@@ -288,6 +288,96 @@ func PageAddItemRaw(p Page, raw []byte) (uint16, error) {
 	return uint16(count + 1), nil
 }
 
+// HeapPageVacuumStats reports the outcome of a single-page vacuum.
+type HeapPageVacuumStats struct {
+	Dead int // line pointers transitioned LP_NORMAL -> LP_UNUSED
+	Live int // tuples that survived this pass
+}
+
+// VacuumHeapPage prunes dead tuples in-place.
+//
+// For every LP_NORMAL line pointer the predicate `isDead` is invoked
+// with the tuple header. Dead slots are marked LP_UNUSED (length and
+// offset zeroed); live tuples are repacked against pd_special so the
+// in-page free-space window is contiguous again. Slot numbers are
+// preserved — external pointers (B-tree leaf items, future ctids) into
+// reclaimed slots simply observe LP_UNUSED on the next probe and treat
+// the entry as absent.
+//
+// The line-pointer array itself is NOT truncated; future inserts can
+// reuse LP_UNUSED slots, and stable slot numbering is the invariant
+// that lets the index AM keep working without an in-band invalidation
+// channel.
+//
+// On any structural error (corrupt header, invalid line pointer) the
+// page is left untouched and the error is returned.
+func VacuumHeapPage(p Page, isDead func(HeapTupleHeader) bool) (HeapPageVacuumStats, error) {
+	h, err := Header(p)
+	if err != nil {
+		return HeapPageVacuumStats{}, err
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return HeapPageVacuumStats{}, err
+	}
+	type live struct {
+		idx  int
+		body []byte
+	}
+	var survivors []live
+	stats := HeapPageVacuumStats{}
+	for idx := 0; idx < count; idx++ {
+		item, err := readItemID(p, idx)
+		if err != nil {
+			return HeapPageVacuumStats{}, err
+		}
+		if item.Flags != ItemIDNormal {
+			continue
+		}
+		off := int(item.Offset)
+		ln := int(item.Length)
+		if off < 0 || ln < 0 || off+ln > len(p) {
+			return HeapPageVacuumStats{}, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, idx+1, off, ln)
+		}
+		t, err := ParseHeapTuple(p[off : off+ln])
+		if err != nil {
+			return HeapPageVacuumStats{}, err
+		}
+		if isDead(t.Header) {
+			if err := writeItemID(p, idx, ItemID{Flags: ItemIDUnused}); err != nil {
+				return HeapPageVacuumStats{}, err
+			}
+			stats.Dead++
+			continue
+		}
+		survivors = append(survivors, live{idx: idx, body: append([]byte(nil), p[off:off+ln]...)})
+	}
+	stats.Live = len(survivors)
+
+	// Repack: zero the tuple region and rewrite live bodies down from
+	// pd_special, updating each surviving line pointer's offset.
+	special := int(h.Special())
+	lineEnd := SizeOfPageHeaderData + count*itemIDSize
+	for i := lineEnd; i < special; i++ {
+		p[i] = 0
+	}
+	upper := special
+	for _, e := range survivors {
+		upper -= len(e.body)
+		copy(p[upper:upper+len(e.body)], e.body)
+		item, err := readItemID(p, e.idx)
+		if err != nil {
+			return HeapPageVacuumStats{}, err
+		}
+		item.Offset = uint16(upper)
+		if err := writeItemID(p, e.idx, item); err != nil {
+			return HeapPageVacuumStats{}, err
+		}
+	}
+	h.SetUpper(uint16(upper))
+	return stats, nil
+}
+
 // PageGetItemRaw returns the raw item bytes at the 1-based slot. The
 // returned slice is a copy.
 func PageGetItemRaw(p Page, slot uint16) ([]byte, error) {

@@ -169,8 +169,15 @@ unchecked item unless a dependency forces a different order.
       metapage at block 0, recursive leaf+internal splits with new-root
       lift, byte-order-preserving `EncodeInt4`, forward range scan via
       right-sibling pointers, single-mutex concurrency.
-- [ ] `VACUUM` and `ANALYZE` minimal implementations.
+- [x] `VACUUM` and `ANALYZE` minimal implementations. `internal/vacuum`
+      drives a heap page-prune across every block using
+      `mvcc.Manager.OldestXmin()` as the horizon, marking dead tuples
+      LP_UNUSED and repacking survivors against pd_special; ANALYZE
+      walks the heap and returns row count + average tuple width over
+      visible rows. SQL surface (`VACUUM`/`ANALYZE` statements) waits on
+      milestone 6's parser; the package functions are the seam.
 - [x] Design doc: `0009-btree.md`.
+- [x] Design doc: `0016-vacuum-and-analyze.md`.
 - [x] Design doc: `0007-mvcc-and-snapshots.md`.
 - [x] Design doc: `0008-wal-and-recovery.md`.
 
