@@ -695,6 +695,48 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       HammerDB SF1 load against the live server is a separate
       harness task that's a workstream of its own.)
 
+#### 2026-04-29 SF1 attempt: Docker `--network host` reachability blocker
+
+Attempted Docker HammerDB SF1 buildschema against goopg this loop
+on 0.0.0.0:55440 with `shared_buffers = 256MB`. Outcome:
+
+- goopg startup and initdb succeed; listener bound at `[::]:55440`
+  (ss confirms IPv6 wildcard; `bindv6only=0`).
+- Host psql via `127.0.0.1:55440` connects and runs `SELECT 1`
+  cleanly.
+- HammerDB Docker container's first connection (Vuser 1, the
+  Monitor Thread) errors out with libpq's
+  `could not connect to server: Connection refused`. The goopg
+  server log shows zero connection attempts during the run —
+  TCP is being refused before reaching us.
+- Docker `--network host` is supposed to share the host's
+  network namespace, but on WSL2 this falls back to bridge
+  semantics. The container's `127.0.0.1` is its own loopback,
+  not the host's, so the listener on the host's `[::]:55440`
+  is unreachable. (The handover script assumes this works
+  because it does on bare-metal Linux.)
+
+This is a test-infrastructure constraint, not a goopg bug.
+Workarounds for future loops:
+
+- **Bare-metal Linux**: rerun the handover script as-is; Docker
+  `--network host` works.
+- **WSL2**: bind goopg on the host's WSL interface IP (find via
+  `ip addr show eth0` in the WSL distro), and connect HammerDB
+  to that IP rather than `127.0.0.1`. Or skip Docker — install
+  HammerDB natively in WSL.
+- **Mac / Windows Docker Desktop**: use `host.docker.internal`
+  in `pg_host` rather than `127.0.0.1`.
+
+All goopg-side compatibility for HammerDB has landed across
+the recent loops (`pg_indexes`, `pg_database`, `pg_roles`,
+`pg_tables`, targetless `SELECT FROM`, NUMERIC, LIKE, BETWEEN,
+derived tables, ORDER BY/GROUP BY alias, embedded interval,
+predicate pushdown, hash-join build-side selection,
+shared_buffers GUC, ALTER USER no-op, and 24+ stub GUCs).
+A successful `buildschema` on the right environment is now an
+infrastructure run, not a code change.
+
 #### 2026-04-29 Handover: status + Docker HammerDB verification
 
 - Current status:
