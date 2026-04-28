@@ -646,6 +646,25 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case TokenSymbol:
 		if t.Value == "(" {
 			p.advance()
+			// `( SELECT … )` is a subquery expression. v0
+			// supports only the scalar form (one column, at
+			// most one row at evaluation time); IN / EXISTS
+			// have their own grammars and are deferred to a
+			// follow-up loop.
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+				inner, err := p.parseSelect()
+				if err != nil {
+					return nil, err
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')' to close subquery")
+				}
+				sel, ok := inner.(*SelectStmt)
+				if !ok {
+					return nil, &SyntaxError{Pos: t.Pos, Message: "subquery did not produce SELECT"}
+				}
+				return &SubqueryExpr{pos: t.Pos, Inner: sel}, nil
+			}
 			inner, err := p.parseExpr()
 			if err != nil {
 				return nil, err

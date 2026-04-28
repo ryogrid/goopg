@@ -31,6 +31,8 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	switch x := e.(type) {
 	case *planner.CaseExpr:
 		return evalCaseExpr(x, row, ctx)
+	case *planner.SubqueryExpr:
+		return evalSubquery(x, ctx)
 	case *planner.TypedStringLit:
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
@@ -367,6 +369,47 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}
 	return d, nil
+}
+
+// evalSubquery runs the inner plan inside a SubqueryExpr and
+// returns its single cell. Multi-row results raise SQLSTATE
+// 21000 (cardinality_violation); zero rows return NULL (per
+// upstream's scalar-subquery semantics). Multi-column subqueries
+// raise 42601 because v0's caller types the SubqueryExpr as a
+// single value.
+//
+// v0 is always uncorrelated — the inner plan never sees the
+// outer row. Correlated subqueries (parameter pull-up) are
+// deferred; see docs/design/0003-0008-subqueries.md.
+func evalSubquery(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
+	op, err := Build(x.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = op.Close() }()
+	row, err := op.Next()
+	if err == EOF {
+		return NullDatum, nil
+	}
+	if err != nil {
+		return Datum{}, err
+	}
+	if len(row) != 1 {
+		return Datum{}, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("scalar subquery returned %d columns, expected 1", len(row))}
+	}
+	val := row[0]
+	// Drain to ensure the subquery returned at most one row.
+	if _, err := op.Next(); err != EOF {
+		if err == nil {
+			return Datum{}, &ExecError{Code: "21000", Pos: x.Pos(), Message: "more than one row returned by a subquery used as an expression"}
+		}
+		return Datum{}, err
+	}
+	return val, nil
 }
 
 // evalCaseExpr evaluates the SQL CASE expression. Two forms:

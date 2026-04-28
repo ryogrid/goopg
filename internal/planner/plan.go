@@ -99,6 +99,19 @@ type ExtractExpr struct {
 func (e *ExtractExpr) Pos() int { return e.pos }
 func (*ExtractExpr) exprNode()  {}
 
+// SubqueryExpr mirrors parser.SubqueryExpr after the inner
+// SELECT has been planned. The executor opens / drains /
+// closes Plan once at evaluation time and returns the single
+// cell as the expression's value. Multi-row / multi-column
+// subqueries trigger a runtime error.
+type SubqueryExpr struct {
+	pos  int
+	Plan Node
+}
+
+func (e *SubqueryExpr) Pos() int { return e.pos }
+func (*SubqueryExpr) exprNode()  {}
+
 // CaseWhen mirrors parser.CaseWhen with planner-resolved
 // expressions in place of parser-AST nodes.
 type CaseWhen struct {

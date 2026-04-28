@@ -87,6 +87,23 @@ type IntervalLit struct {
 func (e *IntervalLit) Pos() int { return e.pos }
 func (*IntervalLit) exprNode()  {}
 
+// SubqueryExpr is the v0 scalar-subquery expression: a
+// parenthesised SELECT used in expression position. The
+// executor evaluates it once per Open and binds the single
+// returned cell as the expression's value. Multi-row /
+// multi-column subqueries surface as runtime 21000 errors.
+//
+// IN (subquery), EXISTS (subquery), and correlated subqueries
+// are deliberately deferred to a follow-up loop — they need
+// distinct planner/executor paths from the scalar form.
+type SubqueryExpr struct {
+	pos   int
+	Inner *SelectStmt
+}
+
+func (e *SubqueryExpr) Pos() int { return e.pos }
+func (*SubqueryExpr) exprNode()  {}
+
 // CaseWhen is one (WHEN cond THEN result) clause inside a CASE
 // expression.
 type CaseWhen struct {

@@ -106,6 +106,12 @@ type resolveContext struct {
 	schema Schema // schema produced by the input scan
 	// bindings keeps every FROM-clause relation in output-column order.
 	bindings []rangeBinding
+	// cat threads the catalog through so subexpression rewrites
+	// (currently subquery planning) can recurse into Plan() without
+	// every helper taking it as a separate argument. Populated by
+	// the top-level planSelect; nil for utility contexts that
+	// don't need catalog access.
+	cat catalog.Catalog
 }
 
 type rangeBinding struct {
@@ -204,6 +210,13 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	// Make the catalog reachable from every resolveExpr call in
+	// this SELECT — subquery planning recurses into Plan(inner,
+	// cat) by reading ctx.cat. Set unconditionally so the
+	// FROM-less and FROM-bearing branches converge.
+	if ctx != nil {
+		ctx.cat = cat
 	}
 
 	if s.Where != nil {
@@ -759,6 +772,8 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
+	case *parser.SubqueryExpr:
+		return planSubqueryExpr(x, agg.input.cat)
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
 		if err != nil {
@@ -1309,6 +1324,25 @@ func exprType(e Expr) catalog.Type {
 	return catalog.Type{Name: "unknown"}
 }
 
+// planSubqueryExpr plans the SELECT inside a parser
+// SubqueryExpr against the supplied catalog and wraps the
+// resulting Node in a planner.SubqueryExpr. The catalog is
+// threaded down through resolveContext.cat so subqueries
+// inside expressions don't need to receive it as a separate
+// argument at every call site. A nil catalog (utility-only
+// resolveContext) is a configuration error: subqueries
+// shouldn't be reachable through SHOW/SET/RESET.
+func planSubqueryExpr(x *parser.SubqueryExpr, cat catalog.Catalog) (Expr, error) {
+	if cat == nil {
+		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
+	}
+	inner, err := Plan(x.Inner, cat)
+	if err != nil {
+		return nil, err
+	}
+	return &SubqueryExpr{pos: x.Pos(), Plan: inner}, nil
+}
+
 // resolveCaseExpr translates a parser CaseExpr into a planner
 // CaseExpr, recursively resolving each Operand / When / Then /
 // Else expression in `ctx`.
@@ -1356,6 +1390,8 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return &TypedStringLit{pos: x.Pos(), Type: x.Type, Value: x.Value}, nil
 	case *parser.IntervalLit:
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
+	case *parser.SubqueryExpr:
+		return planSubqueryExpr(x, ctx.cat)
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, ctx)
 		if err != nil {

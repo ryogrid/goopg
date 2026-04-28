@@ -266,6 +266,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: "int8"}, nil
 	case *parser.CaseExpr:
 		return analyzeCaseExpr(x, ctx)
+	case *parser.SubqueryExpr:
+		// v0 doesn't recursively analyze the inner SELECT here —
+		// the planner runs Plan() on it, which already invokes
+		// its own analyzer pass. The expression's resulting type
+		// is "unknown"; isAssignable's unknown-coercion rule
+		// keeps the comparison sites happy.
+		return catalog.Type{Name: "unknown"}, nil
 	case *parser.NullConst:
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.BooleanConst:
