@@ -914,11 +914,16 @@ M0002/M0003; lands regression coverage as those features ship.
       capture, non-zero exit code capture, timeout detection),
       `FileContains`, and `WaitForFileContains`; package tests cover
       exit-code capture, timeout behavior, file/log scanning.)
-- [ ] `docs/test-port/upstream-tap-coverage.md` — classify every
+- [x] `docs/test-port/upstream-tap-coverage.md` — classify every
       upstream TAP test under `postgres/src/test/recovery/t/`,
       `postgres/src/bin/*/t/`, etc. as `port`/`skip`/`defer` with a
       one-line rationale. Reproducible from a tool committed
       alongside it.
+      (achieved 2026-04-29: added generator `cmd/gen-tap-coverage`
+      and generated `docs/test-port/upstream-tap-coverage.md` from
+      the current upstream tree. Scope currently classifies 136 TAP
+      tests (port=10, skip=66, defer=60) across recovery and
+      src/bin tool suites.)
 - [ ] Port at least 80% of `port` rows. Each ported test references
       its upstream source path in a header comment.
 - [ ] Design docs: `0004-0001-go-test-utility-library.md`,
