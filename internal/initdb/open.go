@@ -134,11 +134,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Logical heap-insert change record (M0002 redo-records —
+	// see docs/design/0002-0003-redo-records.md).
+	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) (storage.LSN, error) {
+		payload := wal.EncodeHeapInsert(rel, blk, lineSlot, tuple)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
 		LogPageImage:   logFPI,
 		LogBtreeSplit:  logBtreeSplit,
+		LogHeapInsert:  logHeapInsert,
 		FullPageWrites: true,
 	})
 	if err != nil {

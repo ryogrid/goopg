@@ -7,6 +7,90 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// TestReplayHeapInsertIdempotent pins the M0002 redo-records
+// landing: a HeapInsert record applies on top of an existing
+// page, and a second replay of the same record is a no-op via
+// the pd_lsn idempotency guard. Without that guard, replay
+// would either error (duplicate slot) or duplicate the tuple.
+func TestReplayHeapInsertIdempotent(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 904, Fork: storage.MainFork}
+
+	// Block 0 already exists with InitPage'd content.
+	zero := mustPageWithByte(t, 0)
+	if err := storage.InitPage(zero); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, zero); err != nil {
+		t.Fatal(err)
+	}
+
+	tup := storage.NewHeapTuple(7, storage.InvalidTransactionID, []byte("hello"))
+	tupBytes, err := tup.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := EncodeHeapInsert(rel, 0, 1, tupBytes)
+	stats, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Applied != 1 {
+		t.Fatalf("first replay Applied=%d want 1", stats.Applied)
+	}
+
+	// Second replay of the same record must be a no-op via the
+	// pd_lsn idempotency guard.
+	_, err = ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	})
+	if err != nil {
+		t.Fatalf("second replay returned err=%v (expected silent skip)", err)
+	}
+
+	// Verify the page actually has the tuple at slot 1.
+	got := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := storage.PageGetItemRaw(got, 1)
+	if err != nil {
+		t.Fatalf("PageGetItemRaw(1): %v", err)
+	}
+	parsed, err := storage.ParseHeapTuple(raw)
+	if err != nil {
+		t.Fatalf("ParseHeapTuple: %v", err)
+	}
+	if string(parsed.Data) != "hello" {
+		t.Errorf("tuple body = %q want %q", parsed.Data, "hello")
+	}
+}
+
+// TestEncodeDecodeHeapInsertRoundTrip pins the on-the-wire shape.
+func TestEncodeDecodeHeapInsertRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 11, RelOid: 12, Fork: storage.MainFork}
+	enc := EncodeHeapInsert(rel, 7, 3, []byte("payload"))
+	if enc[0] != RecordKindHeapInsert {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindHeapInsert)
+	}
+	gotRel, gotBlk, gotSlot, gotTuple, err := DecodeHeapInsert(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRel != rel || gotBlk != 7 || gotSlot != 3 {
+		t.Errorf("decoded rel/blk/slot = %v %d %d", gotRel, gotBlk, gotSlot)
+	}
+	if string(gotTuple) != "payload" {
+		t.Errorf("decoded tuple = %q want \"payload\"", string(gotTuple))
+	}
+}
+
 // TestReplayBtreeSplitAtomic pins Landing 3a of M0002: a single
 // BtreeSplit record carries both pages, and replay applies the
 // right page even when it does not yet exist on disk (the split's

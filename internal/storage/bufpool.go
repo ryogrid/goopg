@@ -80,6 +80,11 @@ type Pool struct {
 	// covering both halves of a split. Pulled out via
 	// LogBtreeSplit() for the btree access method.
 	logBtreeSplit LogBtreeSplitFunc
+	// logHeapInsert emits a logical heap-insert WAL record.
+	// Pulled out via LogHeapInsert() for the executor's
+	// writeHeapRow path. nil disables the optimisation —
+	// MarkDirtyChangeRecord falls back to FPI emission.
+	logHeapInsert LogHeapInsertFunc
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -125,6 +130,12 @@ type PoolConfig struct {
 	// hook and the btree falls back to per-page FPI on splits.
 	LogBtreeSplit LogBtreeSplitFunc
 
+	// LogHeapInsert, when non-nil, is exposed via
+	// Pool.LogHeapInsert so the executor's heap-insert path can
+	// emit a logical change record instead of a full FPI on
+	// every dirty (see docs/design/0002-0003-redo-records.md).
+	LogHeapInsert LogHeapInsertFunc
+
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -142,6 +153,13 @@ type WALFlusher interface {
 // like internal/access/btree can consume it without an import
 // cycle through internal/wal.
 type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page) (LSN, error)
+
+// LogHeapInsertFunc emits one logical heap-insert redo record and
+// returns its end LSN. Used by the executor's writeHeapRow path
+// (and exposed via Pool.LogHeapInsert) to bypass full-page-image
+// emission on subsequent dirties of the same page in an epoch.
+// See docs/design/0002-0003-redo-records.md.
+type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte) (LSN, error)
 
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by an
 // mmap'd arena. Returns an error if slots <= 0 or the arena alloc
@@ -166,6 +184,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		wal:           cfg.WAL,
 		logFPI:        cfg.LogPageImage,
 		logBtreeSplit: cfg.LogBtreeSplit,
+		logHeapInsert: cfg.LogHeapInsert,
 		logger:        logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
@@ -179,6 +198,11 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 // or nil if none was wired. Callers (the B-tree access method)
 // are expected to fall back to per-page FPI when nil.
 func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
+
+// LogHeapInsert returns the configured heap-insert change-record
+// hook, or nil if none was wired. Callers fall back to per-page
+// FPI via MarkDirty when nil.
+func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 // Mirrors upstream's full_page_writes SIGHUP-context GUC.
@@ -422,6 +446,63 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 	// epoch — the WAL record at this LSN is what redo will pick up.
 	s.fpiSinceCheckpoint = true
 	p.poolMu.Unlock()
+}
+
+// MarkDirtyChangeRecord is the change-record-aware variant of
+// MarkDirty. The first dirty in each checkpoint epoch emits an
+// FPI as the baseline (and ignores `emitter`); subsequent dirties
+// in the same epoch invoke `emitter` to append the caller's
+// logical change record and stamp its end LSN onto pd_lsn. This
+// gives upstream's "FPI then change records" replay invariant
+// while keeping the once-per-epoch FPI optimisation alive for
+// migrated paths. Caller must hold s.contentMu exclusive.
+//
+// Paths that haven't been migrated to logical records keep
+// using MarkDirty (which emits FPI on every dirty for safety).
+// See docs/design/0002-0003-redo-records.md.
+func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error {
+	p.poolMu.Lock()
+	needFPI := !s.fpiSinceCheckpoint
+	tag := s.tag
+	p.poolMu.Unlock()
+
+	if needFPI {
+		// Baseline: emit the post-mutation page image.
+		if p.logFPI != nil && p.fullPageWrites.Load() {
+			pageCopy := make(Page, BlockSize)
+			copy(pageCopy, s.page)
+			lsn, err := p.logFPI(tag.Rel, tag.Block, pageCopy)
+			if err != nil {
+				return err
+			}
+			MustHeader(s.page).SetLSN(lsn)
+		} else if emitter != nil {
+			// No FPI hook (or full_page_writes off): fall back
+			// to the logical record so the change is at least
+			// captured in WAL.
+			lsn, err := emitter()
+			if err != nil {
+				return err
+			}
+			MustHeader(s.page).SetLSN(lsn)
+		}
+	} else {
+		// Already FPI'd this epoch — emit logical record only.
+		if emitter == nil {
+			return fmt.Errorf("MarkDirtyChangeRecord: emitter required after first dirty")
+		}
+		lsn, err := emitter()
+		if err != nil {
+			return err
+		}
+		MustHeader(s.page).SetLSN(lsn)
+	}
+
+	p.poolMu.Lock()
+	s.dirty = true
+	s.fpiSinceCheckpoint = true
+	p.poolMu.Unlock()
+	return nil
 }
 
 // maybeEmitFPI runs the FPI side-effect of MarkDirty when the

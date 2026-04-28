@@ -527,6 +527,27 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       seams). Recovery itself was already covered in M1's
       `root-0008-wal-and-recovery.md`; this doc cross-references it
       and only describes the producer-side machinery.
+- [ ] Logical change records to recover the FPI-volume regression
+      (started in `docs/design/0002-0003-redo-records.md`):
+  - [x] `RecordKindHeapInsert` (kind=4) + encode/decode/replay
+        with pd_lsn idempotency.
+  - [x] `Pool.MarkDirtyChangeRecord(slot, emitter)` — emits FPI
+        baseline on first-dirty-per-epoch, calls emitter on
+        subsequent dirties. Restores the once-per-epoch FPI
+        optimisation for migrated paths only.
+  - [x] Migrated `writeHeapRow` (heap INSERT path). pgbench -i WAL
+        dropped from ~1.6 GB → ~800 MB; pgbench -i runtime from
+        ~18s → ~13s. The remaining FPI volume comes from
+        non-migrated paths.
+  - [ ] Migrate `btree.insertIntoBlock` non-split path (use a new
+        `RecordKindBtreeInsert`). Largest remaining contributor
+        to pgbench-i WAL — primary-key build dominates the
+        runtime.
+  - [ ] Migrate heap UPDATE / DELETE xmax-stamp paths
+        (`PageSetHeapTupleXmax` callers in operators_storage.go).
+  - [ ] Migrate VACUUM page-prune mutations.
+  - [ ] Once all paths are migrated, flip `maybeEmitFPI` back to
+        the strict once-per-epoch policy globally.
 
 ### Concurrent B-tree (Lehman-Yao + PG modifications)
 

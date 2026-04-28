@@ -23,11 +23,21 @@ const (
 	// the bare smgr.Extend zero/init image. See
 	// docs/design/0002-0002-btree-concurrency.md Landing 3a.
 	RecordKindBtreeSplit byte = 3
+	// RecordKindHeapInsert is a logical change record for one
+	// heap insert. The full record is "kind | rel(9) | blk(4) |
+	// lineSlot(2) | tuple-bytes". Replay reads the existing page
+	// (or InitPage if missing) and re-applies the insert at the
+	// recorded slot, keyed off pd_lsn idempotency. See
+	// docs/design/0002-0003-redo-records.md.
+	RecordKindHeapInsert byte = 4
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
 	// Fork(1) + LeftBlk(4) + RightBlk(4) = 18.
 	btreeSplitHeaderSize = 18
+	// heapInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + Block(4) + LineSlot(2) = 16.
+	heapInsertHeaderSize = 16
 )
 
 // ReplayStats summarizes one replay run.
@@ -55,6 +65,45 @@ func EncodePageImage(rel storage.RelFileNode, blk storage.BlockNumber, page stor
 	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
 	copy(out[pageImageHeaderSize:], page)
 	return out, nil
+}
+
+// EncodeHeapInsert encodes one logical heap-insert redo record.
+// `lineSlot` is the 1-based line-pointer slot returned by
+// PageAddHeapTuple at original mutation time; replay restores the
+// same line-pointer assignment by inserting at that slot.
+func EncodeHeapInsert(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) []byte {
+	out := make([]byte, heapInsertHeaderSize+len(tuple))
+	out[0] = RecordKindHeapInsert
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], lineSlot)
+	copy(out[heapInsertHeaderSize:], tuple)
+	return out
+}
+
+// DecodeHeapInsert returns the rel + block + lineSlot + tuple
+// bytes carried by a HeapInsert record payload.
+func DecodeHeapInsert(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte, err error) {
+	if len(payload) < heapInsertHeaderSize {
+		err = fmt.Errorf("wal: invalid heap-insert payload len %d (want >= %d)", len(payload), heapInsertHeaderSize)
+		return
+	}
+	if payload[0] != RecordKindHeapInsert {
+		err = fmt.Errorf("wal: record kind %d is not heap-insert", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
+	tuple = make([]byte, len(payload)-heapInsertHeaderSize)
+	copy(tuple, payload[heapInsertHeaderSize:])
+	return
 }
 
 // EncodeBtreeSplit encodes one atomic B-tree split record. Both
@@ -149,6 +198,11 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
 			}
 			stats.Applied++
+		case RecordKindHeapInsert:
+			if err := replayHeapInsert(mgr, r); err != nil {
+				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
+			}
+			stats.Applied++
 		case RecordKindCheckpoint:
 			// Marker only; no page write.
 			continue
@@ -190,6 +244,73 @@ func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64
 		return ReplayStats{}, err
 	}
 	return ReplayRecords(mgr, records)
+}
+
+// replayHeapInsert applies one logical heap-insert record to the
+// data file. Idempotent via pd_lsn: if the page already carries an
+// LSN >= record.endLSN, the change is already persisted and the
+// apply is skipped. Otherwise, decode, InitPage if the page is
+// missing, PageAddHeapTuple at the recorded slot, set pd_lsn,
+// write back.
+func replayHeapInsert(mgr *storage.Manager, r Record) error {
+	rel, blk, lineSlot, tuple, err := DecodeHeapInsert(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	switch {
+	case blk < nblocks:
+		if err := mgr.ReadBlock(rel, blk, page); err != nil {
+			return err
+		}
+		if !storage.IsNew(page) {
+			if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+				return nil // already applied
+			}
+		} else {
+			if err := storage.InitPage(page); err != nil {
+				return err
+			}
+		}
+	case blk == nblocks:
+		// Page doesn't exist yet — Extend with an InitPage'd
+		// blank, then we'll add the tuple.
+		if err := storage.InitPage(page); err != nil {
+			return err
+		}
+		got, err := mgr.Extend(rel, page)
+		if err != nil {
+			return err
+		}
+		if got != blk {
+			return fmt.Errorf("wal: heap-insert extend returned block %d, want %d", got, blk)
+		}
+	default:
+		return fmt.Errorf("wal: heap-insert replay gap block=%d nblocks=%d", blk, nblocks)
+	}
+
+	// Place the tuple at the recorded slot.
+	tup, err := storage.ParseHeapTuple(tuple)
+	if err != nil {
+		return fmt.Errorf("wal: heap-insert decode tuple: %w", err)
+	}
+	got, err := storage.PageAddHeapTuple(page, tup)
+	if err != nil {
+		return fmt.Errorf("wal: heap-insert apply: %w", err)
+	}
+	if got != lineSlot {
+		// Slot mismatch is a sign of replay drift — earlier records
+		// produced a different layout than original. v0 doesn't
+		// support out-of-order slot assignment, so this is a hard
+		// error rather than a silent fix-up.
+		return fmt.Errorf("wal: heap-insert replay slot drift: got %d, want %d (block %d)", got, lineSlot, blk)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
 }
 
 // replayBtreeSplit applies the left then right page images carried

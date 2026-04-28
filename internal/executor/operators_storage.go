@@ -462,12 +462,24 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 
 // writeHeapRow encodes the row and appends it to the relation. v0
 // always writes to the last block, extending if no tuple fits there.
+//
+// Persistence: when the buffer pool has a heap-insert change-record
+// hook configured (initdb.Open wires this), we use
+// `Pool.MarkDirtyChangeRecord` so subsequent inserts on the same
+// page in a checkpoint epoch emit a small logical record instead
+// of a full FPI. See docs/design/0002-0003-redo-records.md.
 func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
 	body, err := EncodeRow(cols, row)
 	if err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	tuple := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	tupleBytes, err := tuple.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	logHeap := ctx.Pool.LogHeapInsert()
 
 	// Try the last existing block first.
 	nBlocks, err := ctx.Pool.NBlocks(rel)
@@ -495,11 +507,11 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				return err
 			}
 		}
-		if _, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
-			ctx.Pool.MarkDirty(slot)
+		if lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
+			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
-			return nil
+			return derr
 		} else if !errors.Is(err, storage.ErrNoSpaceInPage) {
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
@@ -509,18 +521,40 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 		ctx.Pool.Unpin(slot)
 	}
 	// Extend.
-	slot, _, err := ctx.Pool.PinNew(rel)
+	slot, blk, err := ctx.Pool.PinNew(rel)
 	if err != nil {
 		return err
 	}
 	slot.Lock()
-	if _, err := storage.PageAddHeapTuple(slot.Page(), tuple); err != nil {
+	lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple)
+	if err != nil {
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
 		return err
 	}
-	ctx.Pool.MarkDirty(slot)
+	derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
-	return nil
+	return derr
+}
+
+// markHeapInsertDirty centralises the choice between
+// MarkDirtyChangeRecord (when a heap-insert WAL hook is wired)
+// and the conservative fallback MarkDirty (when none is). The
+// caller must hold slot.Lock; the change-record path also reads
+// the page bytes inline, which is safe under exclusive content
+// latch.
+func markHeapInsertDirty(
+	pool *storage.Pool, slot *storage.Slot,
+	logHeap storage.LogHeapInsertFunc,
+	rel storage.RelFileNode, blk storage.BlockNumber,
+	lineSlot uint16, tupleBytes []byte,
+) error {
+	if logHeap == nil {
+		pool.MarkDirty(slot)
+		return nil
+	}
+	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+		return logHeap(rel, blk, lineSlot, tupleBytes)
+	})
 }
