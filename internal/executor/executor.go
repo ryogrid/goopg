@@ -72,6 +72,17 @@ func Build(plan planner.Node) (Operator, error) {
 		return newDDLOp(p), nil
 	case *planner.Transaction:
 		return newTransactionOp(p), nil
+	case *planner.Utility:
+		// VACUUM / ANALYZE / SHOW / SET / RESET are utility
+		// statements. The wire layer already handles SHOW/SET/RESET
+		// via the legacy string-matching path in
+		// internal/server/query.go, so they shouldn't reach here in
+		// practice. VACUUM and ANALYZE in v0 are optimisations
+		// (their package functions are exposed in internal/vacuum)
+		// and not load-bearing for correctness — emit a no-op
+		// operator that succeeds silently. The wire layer's
+		// commandTagFor builds the right CommandComplete tag.
+		return newUtilityNoOp(p), nil
 	case *planner.Copy:
 		// COPY is currently driven from the wire-protocol layer
 		// (see internal/server/copy.go). The planner produces a
@@ -84,6 +95,20 @@ func Build(plan planner.Node) (Operator, error) {
 	}
 	return nil, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: fmt.Sprintf("unsupported plan node %T", plan)}
 }
+
+// utilityNoOp is the executor counterpart to planner.Utility. v0
+// uses it for VACUUM/ANALYZE statements that the wire layer
+// recognises but doesn't yet have a real implementation for at the
+// executor level — running them is a no-op so pgbench's `vacuum
+// analyze pgbench_branches` (and similar) succeed cleanly.
+type utilityNoOp struct{ plan *planner.Utility }
+
+func newUtilityNoOp(p *planner.Utility) *utilityNoOp { return &utilityNoOp{plan: p} }
+
+func (o *utilityNoOp) Schema() planner.Schema  { return nil }
+func (o *utilityNoOp) Open(*Context) error     { return nil }
+func (o *utilityNoOp) Next() (Row, error)      { return nil, EOF }
+func (o *utilityNoOp) Close() error            { return nil }
 
 // Run is a convenience that opens an operator, drains it into a slice
 // of rows, then closes. Production paths use Open/Next/Close

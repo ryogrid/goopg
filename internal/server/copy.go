@@ -365,15 +365,34 @@ func (st *copyInState) consumeExecCopyData(chunk []byte) error {
 			return nil
 		}
 		line := st.lineBuf[:idx]
-		// PushLine allocates internally for the row; we can hand the
-		// shared slice straight in.
+		// libpq's PQputline / PQputCopyData callers (notably
+		// pgbench) terminate the data stream with a `\.` line
+		// before issuing CopyDone. Upstream's text-mode COPY treats
+		// it as an end-of-data marker and drops it; protocol v3
+		// uses CopyDone for the actual signal but the literal `\.`
+		// frame still arrives. Match upstream's behaviour and
+		// silently skip it.
+		if isCopyTextEOD(line) {
+			st.lineBuf = st.lineBuf[idx+1:]
+			continue
+		}
 		if err := st.fromExec.PushLine(line); err != nil {
-			// Drop the buffer to avoid double-processing.
 			st.lineBuf = st.lineBuf[:0]
 			return err
 		}
 		st.lineBuf = st.lineBuf[idx+1:]
 	}
+}
+
+// isCopyTextEOD reports whether a single decoded COPY-text line is
+// the deprecated `\.` end-of-data marker. The line passed in has
+// already had its trailing `\n` stripped; we also tolerate `\r`
+// before the `\.` for CRLF clients.
+func isCopyTextEOD(line []byte) bool {
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	return len(line) == 2 && line[0] == '\\' && line[1] == '.'
 }
 
 func (st *copyInState) consumeTextCopyData(chunk []byte) {

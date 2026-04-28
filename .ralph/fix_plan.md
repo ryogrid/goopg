@@ -345,8 +345,16 @@ unchecked item unless a dependency forces a different order.
       saves on shutdown. Tables, columns, indexes (including
       primary-key flag + method), and `nextOID` round-trip across
       restarts. stop/restart/reload/status remain stubbed.)
-- [ ] `pgbench -i` succeeds against goopg.
-      (in progress: when started with `goopg start -D <dir>`,
+- [x] `pgbench -i` succeeds against goopg.
+      (achieved 2026-04-28: `goopg init -D /tmp/d && goopg start
+      -D /tmp/d` followed by upstream pgbench 18.3 `-i -s 1`
+      completes the full init flow — drop tables, create tables,
+      client-side generate of 100k rows via COPY FROM STDIN with
+      freeze, vacuum, alter table add primary key — in ~7 s with
+      no errors. Took fixes for: CopyIn line splitter ignoring
+      libpq's `\.` end-of-data marker, and an executor noop for
+      planner.Utility (VACUUM/ANALYZE) statements.
+      Original notes:
       the simple-query path now routes every statement through
       parser→planner→executor — DDL (CREATE/DROP/ALTER/TRUNCATE/
       INDEX), DML (INSERT/UPDATE/DELETE), VACUUM/ANALYZE, and
@@ -372,7 +380,7 @@ unchecked item unless a dependency forces a different order.
       stdin with (freeze on)`) fails with `row has 1 fields,
       expected 3` — the wire-layer line splitter or the
       CopyFromExecutor field count is wrong on pgbench-generated
-      data; needs investigation.)
+      data; needs investigation.))
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
 
