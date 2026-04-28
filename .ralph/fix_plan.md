@@ -141,7 +141,13 @@ unchecked item unless a dependency forces a different order.
       (`xmin`/`xmax`/`xvac`/`ctid`/`infomask*`), line-pointer packing,
       and page-level tuple add/get helpers; tests pin metadata
       round-trip and page slot behavior.
-- [ ] Snapshot manager with `READ COMMITTED` and `REPEATABLE READ` semantics.
+- [x] Snapshot manager with `READ COMMITTED` and `REPEATABLE READ` semantics.
+      `internal/mvcc` now tracks active xids and provides
+      statement-snapshot acquisition (`SnapshotFor`) with per-statement
+      refresh for READ COMMITTED and first-snapshot pinning for
+      REPEATABLE READ. `TupleVisible` evaluates
+      `storage.HeapTupleHeader` against `(xmin,xmax,in-progress[])`
+      horizons and current xid.
 - [x] WAL writer with `fdatasync` on commit.
       `internal/wal` now provides segmented WAL files under `pg_wal/`,
       append/flush worker serialization, record framing with CRC, and

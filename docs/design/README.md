@@ -25,7 +25,7 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | 0004 | [Configuration and GUC](0004-configuration-and-guc.md) | accepted | postgresql.conf parser, GUC registry, SessionRegistry layering, SHOW/SET/RESET in the simple-query path. |
 | 0005 | [Buffer Manager and Storage Manager (v0)](0005-buffer-manager.md) | accepted | mmap'd page arena, smgr per-relation file with O_DIRECT, clock-sweep buffer pool, Pin/Unpin/MarkDirty. |
 | 0006 | [On-Disk Page and Tuple Format (v0)](0006-storage-format.md) | accepted | PageHeaderData layout, ItemId encoding, RelFileNode triple, tuple-header field set. |
-| 0007 | [MVCC Tuple Header and Snapshot Direction (v0)](0007-mvcc-and-snapshots.md) | accepted | Heap tuple header with xmin/xmax metadata, line-pointer packing, and snapshot-manager direction. |
+| 0007 | [MVCC Tuple Header and Snapshot Manager (v0)](0007-mvcc-and-snapshots.md) | accepted | Heap tuple header with xmin/xmax metadata plus a snapshot manager for READ COMMITTED / REPEATABLE READ visibility. |
 | 0008 | [WAL Writer and Recovery Seam (v0)](0008-wal-and-recovery.md) | accepted | Segmented WAL writer, FlushUpTo durability contract, and WAL-before-data integration seam for buffer flushes. |
 | 0015 | [Simple Query Path (v0) and SQLSTATE Strategy](0015-simple-query-and-sqlstate.md) | accepted | Interim `SELECT 1` shim, RowDescription/DataRow/CommandComplete encoders, generated `internal/sqlstate`. |
 
