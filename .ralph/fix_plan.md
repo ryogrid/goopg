@@ -144,7 +144,11 @@ unchecked item unless a dependency forces a different order.
       `FlushUpTo` durability semantics. `internal/storage.Pool`
       integrates WAL-before-data ordering by flushing WAL up to
       page `pd_lsn` before dirty-page writeback.
-- [ ] Checkpointer goroutine.
+- [x] Checkpointer goroutine.
+      `internal/wal/checkpointer.go` runs periodic checkpoints by
+      flushing dirty pages (`FlushAll`), appending a checkpoint marker,
+      and syncing WAL to the checkpoint LSN. Failed flushes skip marker
+      emission for that tick and are retried on the next interval.
 - [x] Crash recovery (replay WAL up to the last consistent checkpoint).
       `internal/wal/recovery.go` adds page-image replay and checkpoint
       marker handling (`RecordKindCheckpoint`), replaying records up to

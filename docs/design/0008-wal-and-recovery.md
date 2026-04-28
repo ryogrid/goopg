@@ -105,15 +105,17 @@ the pool does:
 
 If WAL flush fails, data flush is aborted and the error propagates.
 
-### Checkpointer seam
+### Checkpointer goroutine (minimal)
 
-This loop keeps the existing `FlushAll()`-driven checkpoint seam:
+`internal/wal` now includes a minimal checkpointer worker:
 
-- future checkpointer goroutine calls `Pool.FlushAll()` periodically
-- WAL-before-data ordering is already enforced inside `FlushAll()`
+- tick on configurable interval
+- call `Pool.FlushAll()` through a `DirtyPageFlusher` interface
+- append a `RecordKindCheckpoint` marker on successful flush
+- call `FlushUpTo(checkpointLSN)` so the marker is durable
 
-Adding the actual scheduler goroutine is a thin follow-up once server
-lifecycle wiring (`goopg start -D`) is ready.
+If page flush fails, no checkpoint marker is written for that tick; the
+worker logs and retries on the next interval.
 
 ### Recovery model (minimal)
 
@@ -142,5 +144,5 @@ tail records beyond the last known consistent point.
 
 - Dirty-page writeback now enforces WAL-before-data.
 - WAL durability can be tested independently from SQL transaction logic.
-- Crash replay work can proceed in the next loop on top of a stable WAL
-  append/flush/read foundation.
+- Crash replay is available with checkpoint-bounded semantics and can be
+  extended by later loops with richer record types.
