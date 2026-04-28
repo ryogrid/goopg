@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -239,7 +240,8 @@ func evalOr(a, b Datum) Datum {
 
 // evalFuncCall resolves a function name against the in-tree registry.
 // v0 is small: current_timestamp / now / current_date are the only
-// no-arg time functions pgbench needs.
+// no-arg time functions pgbench needs; HammerDB TPC-H also uses
+// to_timestamp(text, fmt) to load TIMESTAMP columns.
 func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	name := strings.ToLower(x.Name)
 	switch name {
@@ -248,6 +250,81 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_date":
 		t := ctx.Now
 		return Datum{Kind: KindTime, Time: t.Truncate(24 * 60 * 60 * 1e9)}, nil
+	case "to_timestamp":
+		return evalToTimestamp(x, row, ctx)
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s does not exist", x.Name)}
+}
+
+// evalToTimestamp implements PostgreSQL's `to_timestamp(text,
+// text)` for the format specifiers HammerDB's TPC-H loader uses
+// (`YYYY`, `Mon`, `MM`, `DD`, plus optional time-of-day pieces).
+// Real upstream parity (timezone handling, locale-aware month
+// names, fractional seconds) waits on the type system; this is
+// deliberately scoped to "make the loader work without rejecting
+// rows".
+func evalToTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp(text, text) requires exactly 2 arguments"}
+	}
+	src, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	fmtArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if src.IsNull() || fmtArg.IsNull() {
+		return NullDatum, nil
+	}
+	if src.Kind != KindString || fmtArg.Kind != KindString {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp arguments must be text"}
+	}
+	goLayout := pgFormatToGoLayout(fmtArg.String)
+	t, perr := time.Parse(goLayout, src.String)
+	if perr != nil {
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_timestamp: %v (format=%q value=%q)", perr, fmtArg.String, src.String)}
+	}
+	return Datum{Kind: KindTime, Time: t.UTC()}, nil
+}
+
+// pgFormatToGoLayout translates a v0 subset of upstream PG's
+// to_timestamp() format codes into a Go time-package layout.
+// Codes are matched longest-first inside a left-to-right scan;
+// any character that isn't a recognised code passes through as a
+// literal separator. Unknown codes are kept verbatim — Go's
+// time.Parse will error if they don't match the input.
+func pgFormatToGoLayout(s string) string {
+	codes := []struct {
+		from, to string
+	}{
+		{"YYYY", "2006"},
+		{"YY", "06"},
+		{"MON", "Jan"},
+		{"Mon", "Jan"},
+		{"MM", "01"},
+		{"DD", "02"},
+		{"HH24", "15"},
+		{"HH", "03"},
+		{"MI", "04"},
+		{"SS", "05"},
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		matched := false
+		for _, c := range codes {
+			if i+len(c.from) <= len(s) && s[i:i+len(c.from)] == c.from {
+				b.WriteString(c.to)
+				i += len(c.from)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			b.WriteByte(s[i])
+			i++
+		}
+	}
+	return b.String()
 }

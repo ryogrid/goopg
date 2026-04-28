@@ -89,6 +89,36 @@ types it as `numeric`, the planner mirrors the node as
 `KindString` datum so it lands in the same NUMERIC codec path
 as integer literals.
 
+### HammerDB-shape multi-row INSERTs
+
+HammerDB's TPC-H loader (`HammerDB/src/postgresql/pgolap.tcl`)
+issues multi-row `INSERT INTO t (cols) VALUES (v1), (v2), …`
+with **every value passed as a single-quoted string**, including
+into NUMERIC columns:
+
+```
+INSERT INTO REGION (R_REGIONKEY, R_NAME, R_COMMENT)
+  VALUES ('0','AFRICA','lar deposits');
+```
+
+Upstream PostgreSQL accepts this because bare string literals
+parse as type `unknown` and are inferred at the assignment site.
+goopg types them as `text`, so the analyzer's `isAssignable`
+gained a narrow exception: `text → numeric` / `text → decimal` is
+allowed because the v0 NUMERIC codec stores string datums
+verbatim. `text → int4 / int8` stays a 42804 error — the integer
+codec can't accept text bodies, and existing analyzer regression
+tests pin this contract.
+
+For TIMESTAMP columns HammerDB calls `to_timestamp(text,
+fmt_text)` rather than passing a bare date string. v0 implements
+the function in `internal/executor/expr.go` with a tiny format
+translator (`pgFormatToGoLayout`) covering the codes the loader
+uses (`YYYY`, `Mon`, `MM`, `DD`, plus `HH24`/`MI`/`SS` for
+completeness). The translator is intentionally
+substring-rewrite, not a real DateStyle parser; locale-aware
+month names and timezone-aware parsing wait on the type system.
+
 ### What's deliberately deferred
 
 - Real NUMERIC arithmetic (`a + b * c`). v0's expression
@@ -120,10 +150,12 @@ and `pg_catalog.pg_class` lists the eight tables.
 
 ## Out of scope (deferred to subsequent loops)
 
-- HammerDB's COPY-based bulk loader at SF1. The DDL works,
-  but the COPY producer side hasn't been driven against
-  TPC-H column shapes yet; the next loop will exercise the
-  text-COPY path with NUMERIC-heavy rows.
+- HammerDB's full SF1 load against goopg. The shapes
+  (multi-row INSERT, string-literal NUMERIC, `to_timestamp`)
+  all work end-to-end; running the actual loader requires a
+  HammerDB-side TCL harness that's a workstream of its own.
+- Real NUMERIC arithmetic / `numeric(p,s)` enforcement.
+- Locale-aware / timezone-aware to_timestamp.
 - Foreign-key parsing (HammerDB's `ALTER TABLE … ADD
   FOREIGN KEY`). Currently rejected with SQLSTATE 0A000.
 - Cost-based planner work (Q1–Q22 join orderings). See

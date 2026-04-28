@@ -664,6 +664,20 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       remain deferred to the type-system milestone — see
       `docs/design/0003-0004-hammerdb-tpch-integration.md`.)
 - [ ] HammerDB's COPY-based loader at SF1 succeeds.
+      (loader-shape unblocked 2026-04-28: HammerDB's TPC-H loader
+      doesn't actually use COPY — it issues multi-row INSERTs
+      with every value passed as a single-quoted string. Two
+      gaps closed in this loop: (a) analyzer's `isAssignable`
+      now accepts `text → numeric/decimal` (narrow — int4/int8
+      still reject); (b) executor implements
+      `to_timestamp(text, fmt)` via a tiny `pgFormatToGoLayout`
+      translator covering the codes HammerDB uses
+      (`YYYY`/`Mon`/`MM`/`DD` + `HH24`/`MI`/`SS`). Verified
+      end-to-end via psql 18.3: REGION, SUPPLIER, and ORDERS
+      multi-row INSERTs (with `to_timestamp('1995-Jan-15',
+      'YYYY-Mon-DD')`) all round-trip. Running the actual
+      HammerDB SF1 load against the live server is a separate
+      harness task that's a workstream of its own.)
 - [ ] Foreign-key parsing accepted (enforcement may be a no-op for
       v0; record the decision in a design doc).
 

@@ -600,5 +600,36 @@ func isAssignable(src, dst catalog.Type) bool {
 	if isBooleanTypeName(src.Name) && isBooleanTypeName(dst.Name) {
 		return true
 	}
+	// HammerDB and other tools (DBI / TCL pg_exec) pass every
+	// VALUES literal as a single-quoted string, including for
+	// NUMERIC columns: `INSERT INTO t (n) VALUES ('123')`.
+	// Upstream PG accepts this because bare string literals are
+	// typed `unknown` until inferred at the assignment site;
+	// goopg types them as `text` and instead recovers
+	// compatibility here. The executor's NUMERIC codec already
+	// stores string datums verbatim (see
+	// docs/design/0003-0004-hammerdb-tpch-integration.md), so
+	// the round-trip is lossless.
+	//
+	// Scope is intentionally narrow: only NUMERIC / DECIMAL
+	// columns. string→int4/int8 stays an error because the
+	// integer codec can't accept text — the existing analyzer
+	// test pinning `INSERT INTO pgbench_accounts (aid) VALUES
+	// ('x')` as 42804 still passes.
+	if isStringTypeName(src.Name) && isExactNumericTextTarget(dst.Name) {
+		return true
+	}
+	return false
+}
+
+// isExactNumericTextTarget reports whether dst is a column type
+// whose v0 codec accepts string datums (NUMERIC / DECIMAL). Used
+// by isAssignable to permit the HammerDB-shape INSERT pattern
+// without weakening the assignment check for integer columns.
+func isExactNumericTextTarget(name string) bool {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal":
+		return true
+	}
 	return false
 }
