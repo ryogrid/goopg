@@ -539,10 +539,13 @@ full Definition of Done. Decomposed into agent-sized chunks below.
         dropped from ~1.6 GB → ~800 MB; pgbench -i runtime from
         ~18s → ~13s. The remaining FPI volume comes from
         non-migrated paths.
-  - [ ] Migrate `btree.insertIntoBlock` non-split path (use a new
-        `RecordKindBtreeInsert`). Largest remaining contributor
-        to pgbench-i WAL — primary-key build dominates the
-        runtime.
+  - [x] Migrate `btree.insertIntoBlock` non-split path. New
+        `RecordKindBtreeInsert` (kind=5); `btree.ApplyInsertRecord`
+        is the public replay helper called by
+        `wal.replayBtreeInsert`. pgbench-i WAL collapsed from
+        ~801 MB → ~21 MB; runtime from ~13s → ~9.25s.
+        `wal/recovery.go` now imports `internal/access/btree` for
+        the apply helper (one-direction dep, no cycle).
   - [ ] Migrate heap UPDATE / DELETE xmax-stamp paths
         (`PageSetHeapTupleXmax` callers in operators_storage.go).
   - [ ] Migrate VACUUM page-prune mutations.

@@ -7,6 +7,28 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// TestEncodeDecodeBtreeInsertRoundTrip pins the on-the-wire
+// shape of the new redo record so future format edits can't
+// silently rearrange fields.
+func TestEncodeDecodeBtreeInsertRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 33, RelOid: 44, Fork: storage.MainFork}
+	itemBytes := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
+	enc := EncodeBtreeInsert(rel, 9, itemBytes)
+	if enc[0] != RecordKindBtreeInsert {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindBtreeInsert)
+	}
+	gotRel, gotBlk, gotItem, err := DecodeBtreeInsert(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRel != rel || gotBlk != 9 {
+		t.Errorf("decoded rel/blk = %v %d", gotRel, gotBlk)
+	}
+	if string(gotItem) != string(itemBytes) {
+		t.Errorf("decoded item = %x want %x", gotItem, itemBytes)
+	}
+}
+
 // TestReplayHeapInsertIdempotent pins the M0002 redo-records
 // landing: a HeapInsert record applies on top of an existing
 // page, and a second replay of the same record is a no-op via

@@ -85,6 +85,10 @@ type Pool struct {
 	// writeHeapRow path. nil disables the optimisation —
 	// MarkDirtyChangeRecord falls back to FPI emission.
 	logHeapInsert LogHeapInsertFunc
+	// logBtreeInsert emits a logical B-tree non-split insert
+	// WAL record. Pulled out via LogBtreeInsert() for the btree
+	// access method. nil disables the optimisation.
+	logBtreeInsert LogBtreeInsertFunc
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -136,6 +140,11 @@ type PoolConfig struct {
 	// every dirty (see docs/design/0002-0003-redo-records.md).
 	LogHeapInsert LogHeapInsertFunc
 
+	// LogBtreeInsert, when non-nil, is exposed via
+	// Pool.LogBtreeInsert so the B-tree access method's
+	// non-split insert path can emit a logical change record.
+	LogBtreeInsert LogBtreeInsertFunc
+
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -161,6 +170,12 @@ type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, left
 // See docs/design/0002-0003-redo-records.md.
 type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte) (LSN, error)
 
+// LogBtreeInsertFunc emits one logical B-tree non-split insert
+// redo record. The `item` payload is the raw bytes the caller
+// stored on the page — for v0's btree, internal/access/btree's
+// item.marshal output. See docs/design/0002-0003-redo-records.md.
+type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN, error)
+
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by an
 // mmap'd arena. Returns an error if slots <= 0 or the arena alloc
 // fails.
@@ -184,8 +199,9 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		wal:           cfg.WAL,
 		logFPI:        cfg.LogPageImage,
 		logBtreeSplit: cfg.LogBtreeSplit,
-		logHeapInsert: cfg.LogHeapInsert,
-		logger:        logger,
+		logHeapInsert:  cfg.LogHeapInsert,
+		logBtreeInsert: cfg.LogBtreeInsert,
+		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
 	for i := range p.slots {
@@ -203,6 +219,11 @@ func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
 // hook, or nil if none was wired. Callers fall back to per-page
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
+
+// LogBtreeInsert returns the configured btree non-split insert
+// change-record hook, or nil if none was wired. Callers fall
+// back to per-page FPI via MarkDirty when nil.
+func (p *Pool) LogBtreeInsert() LogBtreeInsertFunc { return p.logBtreeInsert }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 // Mirrors upstream's full_page_writes SIGHUP-context GUC.

@@ -145,12 +145,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Logical btree non-split insert change record.
+	logBtreeInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, item []byte) (storage.LSN, error) {
+		payload := wal.EncodeBtreeInsert(rel, blk, item)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
 		LogPageImage:   logFPI,
 		LogBtreeSplit:  logBtreeSplit,
 		LogHeapInsert:  logHeapInsert,
+		LogBtreeInsert: logBtreeInsert,
 		FullPageWrites: true,
 	})
 	if err != nil {

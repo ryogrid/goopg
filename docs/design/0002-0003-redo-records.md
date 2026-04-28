@@ -35,16 +35,23 @@ optimisation without losing replay correctness.
 
 ## Decisions
 
-### Taxonomy: start with the hot path
+### Taxonomy: migrate hot paths incrementally
 
-Rather than introduce every redo record at once, this landing
-defines and wires up exactly one — `RecordKindHeapInsert` — and
-migrates one mutation site (`internal/executor/operators_storage.go`
-`writeHeapRow`). That is `pgbench -i`'s dominant workload (100 k
-client-side INSERTs at scale 1) so it captures the bulk of the
-WAL-volume regression. Other paths (heap UPDATE/DELETE xmax stamps,
-btree non-split insert, vacuum prune) keep emitting FPI on every
-MarkDirty in this loop; subsequent loops migrate them.
+Each landing defines one or two record kinds and migrates the
+corresponding mutation site:
+
+- **0002-0003a** (loop landing this doc): `RecordKindHeapInsert` +
+  `writeHeapRow`. pgbench-i WAL: ~1.6 GB → ~801 MB.
+- **0002-0003b** (next loop): `RecordKindBtreeInsert` +
+  `btree.insertIntoBlock` non-split path. pgbench-i WAL:
+  ~801 MB → ~21 MB. `btree.ApplyInsertRecord` is the public
+  replay helper that `wal/recovery.go` calls.
+
+Remaining paths still emit FPI-every-dirty: heap UPDATE/DELETE
+xmax stamps, vacuum page prune, btree metapage updates. Each
+will get its own record kind in subsequent loops; once all paths
+are migrated, `Pool.MarkDirty` flips back to once-per-epoch FPI
+globally and the per-method selector dissolves.
 
 ### Record format
 

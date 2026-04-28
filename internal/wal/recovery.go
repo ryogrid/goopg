@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path/filepath"
 
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -30,6 +31,15 @@ const (
 	// recorded slot, keyed off pd_lsn idempotency. See
 	// docs/design/0002-0003-redo-records.md.
 	RecordKindHeapInsert byte = 4
+	// RecordKindBtreeInsert is a logical change record for one
+	// B-tree non-split insert. Format:
+	// "kind | rel(9) | blk(4) | item-bytes". The item bytes are
+	// the same shape internal/access/btree's `item.marshal`
+	// produces (keyLen + ptr.block + ptr.offset + key). Replay
+	// is idempotent via pd_lsn and applies the item to the
+	// existing page in sorted order. See
+	// docs/design/0002-0003-redo-records.md.
+	RecordKindBtreeInsert byte = 5
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
@@ -38,6 +48,9 @@ const (
 	// heapInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
 	// Fork(1) + Block(4) + LineSlot(2) = 16.
 	heapInsertHeaderSize = 16
+	// btreeInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + Block(4) = 14.
+	btreeInsertHeaderSize = 14
 )
 
 // ReplayStats summarizes one replay run.
@@ -103,6 +116,44 @@ func DecodeHeapInsert(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
 	tuple = make([]byte, len(payload)-heapInsertHeaderSize)
 	copy(tuple, payload[heapInsertHeaderSize:])
+	return
+}
+
+// EncodeBtreeInsert encodes one logical B-tree non-split insert
+// redo record. The opaque `item` payload is whatever bytes the
+// caller stored on the page (in v0,
+// internal/access/btree.item.marshal output: keyLen + ptr.block
+// + ptr.offset + key).
+func EncodeBtreeInsert(rel storage.RelFileNode, blk storage.BlockNumber, item []byte) []byte {
+	out := make([]byte, btreeInsertHeaderSize+len(item))
+	out[0] = RecordKindBtreeInsert
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	copy(out[btreeInsertHeaderSize:], item)
+	return out
+}
+
+// DecodeBtreeInsert returns the rel + block + raw item bytes
+// carried by a BtreeInsert record payload.
+func DecodeBtreeInsert(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, item []byte, err error) {
+	if len(payload) < btreeInsertHeaderSize {
+		err = fmt.Errorf("wal: invalid btree-insert payload len %d (want >= %d)", len(payload), btreeInsertHeaderSize)
+		return
+	}
+	if payload[0] != RecordKindBtreeInsert {
+		err = fmt.Errorf("wal: record kind %d is not btree-insert", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	item = make([]byte, len(payload)-btreeInsertHeaderSize)
+	copy(item, payload[btreeInsertHeaderSize:])
 	return
 }
 
@@ -203,6 +254,11 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
 			}
 			stats.Applied++
+		case RecordKindBtreeInsert:
+			if err := replayBtreeInsert(mgr, r); err != nil {
+				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
+			}
+			stats.Applied++
 		case RecordKindCheckpoint:
 			// Marker only; no page write.
 			continue
@@ -244,6 +300,41 @@ func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64
 		return ReplayStats{}, err
 	}
 	return ReplayRecords(mgr, records)
+}
+
+// replayBtreeInsert applies one logical B-tree non-split insert
+// to the data file. Idempotent via pd_lsn: skipped if the page
+// already advertises an LSN >= record.endLSN. The page must
+// already exist; bt-insert is never the first record for a page
+// (a split or initial Create produced the page first), so a
+// missing block is a hard error.
+func replayBtreeInsert(mgr *storage.Manager, r Record) error {
+	rel, blk, item, err := DecodeBtreeInsert(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: btree-insert replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: btree-insert replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if err := btree.ApplyInsertRecord(page, item); err != nil {
+		return fmt.Errorf("wal: btree-insert apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
 }
 
 // replayHeapInsert applies one logical heap-insert record to the

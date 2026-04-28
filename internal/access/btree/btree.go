@@ -572,9 +572,24 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 
 	if pageHasSpaceFor(slot.Page(), it) {
 		insertItemSorted(slot.Page(), it)
-		bt.pool.MarkDirty(slot)
+		// Logical-record path (M0002 redo-records): if the pool
+		// has a btree-insert hook configured, emit a small
+		// change record on subsequent dirties of this page in
+		// the same checkpoint epoch instead of a full FPI. The
+		// first dirty in an epoch still emits the FPI baseline.
+		// Falls back to plain MarkDirty when the hook isn't
+		// wired (test helpers, pre-runtime callers).
+		var derr error
+		if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
+			itemBytes := it.marshal()
+			derr = bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+				return logIns(bt.rel, blk, itemBytes)
+			})
+		} else {
+			bt.pool.MarkDirty(slot)
+		}
 		bt.unpinW(slot)
-		return nil
+		return derr
 	}
 
 	// Split. Pin a freshly-extended right page exclusively,
@@ -703,6 +718,30 @@ func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
 	writeOpaque(slot.Page(), op)
 	bt.pool.MarkDirty(slot)
 	bt.unpinW(slot)
+	return nil
+}
+
+// ApplyInsertRecord re-runs one B-tree non-split insert against
+// the given page bytes during WAL replay (see
+// docs/design/0002-0003-redo-records.md). The raw item is the
+// same payload the writer emitted (item.marshal output: keyLen +
+// ptr.block + ptr.offset + key). The page must already be a
+// valid initialised B-tree page; replay never creates a fresh
+// btree page from a logical insert (a split record handles that
+// case).
+//
+// Idempotency is the caller's responsibility: WAL recovery
+// compares page pd_lsn against the record's end-LSN before
+// invoking this. The function is "apply unconditionally".
+func ApplyInsertRecord(page storage.Page, raw []byte) error {
+	it, err := parseItem(raw)
+	if err != nil {
+		return err
+	}
+	if !pageHasSpaceFor(page, it) {
+		return fmt.Errorf("btree: replay of insert: page has no space for keyLen=%d", it.keyLen)
+	}
+	insertItemSorted(page, it)
 	return nil
 }
 
