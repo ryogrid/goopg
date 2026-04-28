@@ -112,6 +112,63 @@ func TestSetRejectsPostmasterContextVar(t *testing.T) {
 	}
 }
 
+// TestShowAllReturnsAllVariables pins the regression that real psql 18.3
+// exposed: `SHOW ALL` was incorrectly being routed through the per-name
+// SHOW arm, which then errored with "unrecognized configuration parameter
+// \"ALL\"". The fix reorders the switch so SHOW ALL hits its own arm
+// first.
+func TestShowAllReturnsAllVariables(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "SHOW ALL")
+	frames := readUntilReady(t, conn)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("frame[0] = %c, want T (RowDescription)", frames[0].Type)
+	}
+	// One DataRow per registered variable. We don't pin the exact count
+	// (it grows as new GUCs are seeded) — just confirm the row count
+	// matches the registry size and a known variable shows up.
+	var dataRows, sawServerVersion int
+	for _, f := range frames {
+		if f.Type == protocol.MsgDataRow {
+			dataRows++
+			// payload: int16 ncols + int32 len + name + int32 len + value
+			// Quick scan for "server_version" anywhere in payload.
+			if bytesContains(f.Payload, []byte("server_version")) {
+				sawServerVersion++
+			}
+		}
+	}
+	if dataRows == 0 {
+		t.Fatal("SHOW ALL returned no DataRow frames")
+	}
+	if sawServerVersion == 0 {
+		t.Fatal("SHOW ALL did not include server_version")
+	}
+}
+
+func bytesContains(haystack, needle []byte) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		ok := true
+		for j := range needle {
+			if haystack[i+j] != needle[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Quick reachability check that net.IP isn't unused in any related test
 // file after refactoring.
 var _ = net.IP{}

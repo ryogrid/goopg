@@ -51,15 +51,19 @@ func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegist
 
 	upper := strings.ToUpper(matchable)
 	switch {
-	case strings.HasPrefix(upper, "SHOW "):
-		return s.handleShow(w, sess, strings.TrimSpace(matchable[len("SHOW "):]))
 	case upper == "SHOW ALL":
 		return s.handleShowAll(w, sess)
+	case strings.HasPrefix(upper, "SHOW "):
+		name := strings.TrimSpace(matchable[len("SHOW "):])
+		if strings.EqualFold(name, "ALL") {
+			return s.handleShowAll(w, sess)
+		}
+		return s.handleShow(w, sess, name)
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		return s.handleSet(w, sess, matchable[len("SET LOCAL "):], true)
 	case strings.HasPrefix(upper, "SET "):
 		return s.handleSet(w, sess, matchable[len("SET "):], false)
-	case strings.HasPrefix(upper, "RESET ALL"):
+	case upper == "RESET ALL":
 		sess.ResetAll()
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err

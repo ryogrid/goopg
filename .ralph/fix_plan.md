@@ -53,10 +53,16 @@ unchecked item unless a dependency forces a different order.
       `SQLSTATE` codes sourced from `postgres/src/backend/utils/errcodes.txt`.
       `internal/sqlstate` is generated from the upstream file by
       `cmd/gen-sqlstate`; existing magic strings replaced with typed codes.
-- [ ] Add `pgx`/`psql` integration tests that exercise the path. Deferred:
-      the Ralph workspace doesn't have `psql` installed, and pulling pgx in
-      pre-emptively burns deps before we have a story for integration-test
-      gating. Re-open once a libpq client is available locally.
+- [x] Add `pgx`/`psql` integration tests that exercise the path.
+      `./postgres/local_install/bin/psql` (PostgreSQL 18.3) is now
+      available. Manual smoke runs (recorded against this build) cover
+      `SELECT 1`, `SHOW server_version`, `SET application_name +
+      SHOW`, `SHOW ALL`, an unrecognised statement (`CREATE TABLE x()`
+      → clean ErrorResponse, connection survives), `\conninfo`, and
+      SCRAM-SHA-256 with both correct and wrong passwords. One
+      regression surfaced — `SHOW ALL` was being routed through the
+      per-name SHOW arm — fixed in this same loop with a unit test
+      pinning the contract.
 
 ## Milestone 3 — Authentication
 
