@@ -968,6 +968,22 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] Common JDBC / driver / planner-toggle GUC stubs:
+      `transaction_isolation` (FlagReport), `enable_*` planner
+      toggles (11 of them), `lock_timeout`,
+      `idle_in_transaction_session_timeout`, `log_statement`,
+      `log_min_duration_statement`,
+      `default_statistics_target`.
+      (achieved 2026-04-29: surfaced by smoke-running common
+      JDBC-issued SETs and planner-test-fixture toggles
+      against goopg — all failed with
+      `unrecognized configuration parameter`. Now registered
+      as Userset/Suset GUCs with upstream-aligned types and
+      defaults; SET / SHOW round-trip correctly including
+      unit-converted forms (`SET idle_in_transaction_session_
+      timeout = '60s'` → 60000 ms). v0's planner still
+      ignores the toggles, but the SET path succeeds.
+      Design doc root-0004 updated to list the new entries.)
 - [x] HammerDB workload-runner GUC compatibility: register
       stub `max_parallel_workers_per_gather`,
       `client_min_messages`, `statement_timeout`, `work_mem`,

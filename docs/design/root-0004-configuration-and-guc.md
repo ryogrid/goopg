@@ -137,15 +137,24 @@ itself; concurrent access happens through per-connection
    `max_connections`, `scram_iterations`, `shared_buffers`,
    `checkpoint_timeout`, `checkpoint_completion_target`,
    `max_wal_size`, `min_wal_size`, `full_page_writes`), plus seven
-   compatibility GUCs HammerDB / psql / pgbench issue with `SET`
-   before running their workloads:
+   compatibility GUCs that JDBC / pgAdmin / DBeaver / HammerDB /
+   psql / pgbench issue with `SET` before running their
+   workloads:
    `max_parallel_workers_per_gather`, `client_min_messages`,
    `statement_timeout`, `work_mem`, `random_page_cost`,
-   `effective_cache_size`, and `search_path`. v0 doesn't honour
-   any of these compatibility GUCs semantically — the planner
-   and executor ignore the values — but registering them as
-   `ContextUserset` lets the SET succeed instead of failing
-   with `unrecognized configuration parameter`. Names, units,
+   `effective_cache_size`, `search_path`, `transaction_isolation`,
+   `lock_timeout`, `idle_in_transaction_session_timeout`,
+   `log_statement`, `log_min_duration_statement`,
+   `default_statistics_target`, plus the eleven planner toggles
+   `enable_seqscan` / `enable_indexscan` / `enable_indexonlyscan` /
+   `enable_bitmapscan` / `enable_hashjoin` / `enable_mergejoin` /
+   `enable_nestloop` / `enable_sort` / `enable_hashagg` /
+   `enable_material` / `enable_partition_pruning`. v0 doesn't
+   honour any of these compatibility GUCs semantically — the
+   planner / executor ignore the values — but registering them
+   as `ContextUserset` (or `ContextSuset` for log_*) lets the
+   SET succeed instead of failing with
+   `unrecognized configuration parameter`. Names, units,
    ranges, and defaults mirror upstream's
    `postgres/src/backend/utils/misc/guc_tables.c` entries.
 2. If a postgresql.conf path was supplied, `ApplyConfigFile(path)`

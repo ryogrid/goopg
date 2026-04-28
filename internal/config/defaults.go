@@ -219,5 +219,73 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 
+	// transaction_isolation is what JDBC's getTransactionIsolation()
+	// reports back; stays read-only with FlagReport so SHOW works
+	// without a separate `SET` path.
+	r.MustRegister(NewVariable(Variable{
+		Name: "transaction_isolation", Type: TypeEnum, BootVal: "read committed",
+		EnumOptions: []string{"read uncommitted", "read committed", "repeatable read", "serializable"},
+		Context:     ContextUserset, Flags: FlagReport,
+		Scope: ScopeSession | ScopeTransaction,
+	}))
+
+	// Planner toggle GUCs. Upstream uses them for testing (`SET
+	// enable_seqscan = off` to force an index plan). v0's planner
+	// ignores them — the rule-based decisions still apply — but
+	// the SET succeeds so test scripts don't trip.
+	for _, name := range []string{
+		"enable_seqscan", "enable_indexscan", "enable_indexonlyscan",
+		"enable_bitmapscan", "enable_hashjoin", "enable_mergejoin",
+		"enable_nestloop", "enable_sort", "enable_hashagg",
+		"enable_material", "enable_partition_pruning",
+	} {
+		r.MustRegister(NewVariable(Variable{
+			Name: name, Type: TypeBool, BootVal: "on",
+			Context: ContextUserset,
+			Scope:   ScopeSession | ScopeTransaction,
+		}))
+	}
+
+	// Time-bounded session GUCs commonly issued by JDBC / pgbouncer.
+	r.MustRegister(NewVariable(Variable{
+		Name: "lock_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "idle_in_transaction_session_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
+	// Logging GUCs. Stubs so `SET log_statement = 'all'` and
+	// related psql / connection-pool wrappers don't trip.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_statement", Type: TypeEnum, BootVal: "none",
+		EnumOptions: []string{"none", "ddl", "mod", "all"},
+		Context:     ContextSuset,
+		Scope:       ScopeSession,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_min_duration_statement", Type: TypeInt, Unit: UnitMs, BootVal: "-1",
+		MinVal: -1, MaxVal: 2147483647,
+		Context: ContextSuset,
+		Scope:   ScopeSession,
+	}))
+
+	// default_statistics_target is read by ANALYZE clients to
+	// gauge sample sizes; pgAdmin / DBeaver inspect it on
+	// connection. v0's ANALYZE doesn't honour it (full-table
+	// scan), but registering avoids the "unrecognized parameter"
+	// failure on those tools.
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_statistics_target", Type: TypeInt, BootVal: "100",
+		MinVal: 1, MaxVal: 10000,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
 	return r
 }
