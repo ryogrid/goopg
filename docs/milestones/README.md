@@ -39,3 +39,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0002 | Production-grade checkpointing & concurrent B-tree     | planned  | `0002-durability-and-concurrent-storage.md`       |
 | 0003 | HammerDB TPC-H workload coverage                       | planned  | `0003-tpch-workload.md`                           |
 | 0004 | TAP test port & Go utility library                     | planned  | `0004-tap-test-port.md`                           |
+| 0005 | Streaming replication support                          | planned  | `0005-streaming-replication-support.md`           |
