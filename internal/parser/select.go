@@ -529,6 +529,36 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				left = &BinaryOp{pos: pos, Op: "NOT LIKE", Left: left, Right: rhs}
 				continue
 			}
+			// `expr [NOT] BETWEEN low AND high` desugars to
+			//   `expr >= low AND expr <= high`
+			// (or wrapped in NOT for the inverse). The low and high
+			// operands parse at precAnd+1 so the AND that ends the
+			// construct doesn't get gobbled as a boolean conjunction
+			// on the rhs of `low`. NOT BETWEEN's outer wrap is a
+			// UnaryOp{NOT} so three-valued logic flows through
+			// the existing evalAnd / evalNot Kleene paths.
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwBetween {
+				pos := t.Pos
+				p.advance()
+				expanded, err := p.parseBetweenTail(left, pos, false)
+				if err != nil {
+					return nil, err
+				}
+				left = expanded
+				continue
+			}
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwBetween {
+				pos := t.Pos
+				p.advance() // NOT
+				p.advance() // BETWEEN
+				expanded, err := p.parseBetweenTail(left, pos, true)
+				if err != nil {
+					return nil, err
+				}
+				left = expanded
+				continue
+			}
 		}
 		op, prec, ok := p.peekBinaryOp()
 		if !ok || prec < min {
@@ -872,6 +902,49 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 		return nil, p.errAtCur("expected ')' to close IN list")
 	}
 	return &InExpr{pos: pos, Operand: left, Negated: negated, List: list}, nil
+}
+
+// parseBetweenTail consumes `low AND high` after `[NOT] BETWEEN`
+// has been advanced and rewrites the construct as an AST tree of
+// existing comparison + boolean operators. We do this at parse
+// time so downstream passes (analyzer, planner, executor) don't
+// need to learn about BETWEEN; the comparison/boolean nodes are
+// already there.
+//
+// `expr BETWEEN low AND high` becomes
+//
+//	(expr >= low) AND (expr <= high)
+//
+// `expr NOT BETWEEN low AND high` becomes
+//
+//	NOT ((expr >= low) AND (expr <= high))
+//
+// so SQL three-valued logic flows through the same Kleene
+// evaluator as `expr >= low AND expr <= high`. The `low` and
+// `high` operands parse at `precAnd + 1` so the trailing `AND`
+// terminates `low` instead of being consumed as a boolean
+// conjunction inside it (e.g. `BETWEEN a AND b AND c` parses as
+// `BETWEEN a AND b` followed by a top-level AND with c, matching
+// upstream).
+func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error) {
+	low, err := p.parseExprPrec(precAnd + 1)
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptKeyword(KwAnd) {
+		return nil, p.errAtCur("expected AND after BETWEEN low operand")
+	}
+	high, err := p.parseExprPrec(precAnd + 1)
+	if err != nil {
+		return nil, err
+	}
+	ge := &BinaryOp{pos: pos, Op: ">=", Left: left, Right: low}
+	le := &BinaryOp{pos: pos, Op: "<=", Left: left, Right: high}
+	combined := Expr(&BinaryOp{pos: pos, Op: "AND", Left: ge, Right: le})
+	if negated {
+		combined = &UnaryOp{pos: pos, Op: "NOT", Operand: combined}
+	}
+	return combined, nil
 }
 
 // parseCaseExpr parses both forms of CASE:

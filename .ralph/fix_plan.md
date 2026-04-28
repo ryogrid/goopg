@@ -962,6 +962,20 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] `BETWEEN` / `NOT BETWEEN` for TPC-H Q6 / Q14 / Q19 ranges.
+      (achieved 2026-04-29: parser desugars
+      `expr [NOT] BETWEEN low AND high` at parse time to
+      `(expr >= low) AND (expr <= high)` (NOT-wrapped for the
+      negated form), so analyzer/planner/executor inherit
+      everything from existing comparison + boolean paths.
+      Precedence handling pins `BETWEEN ... AND high AND y`
+      to parse as `(BETWEEN-tree) AND y`. Date codec also
+      extended in this loop — `date`-typed columns share the
+      8-byte nanos-since-epoch frame with timestamps so
+      `WHERE l_shipdate BETWEEN date '...' AND date '...'`
+      works end-to-end. Verified via psql 18.3 across INT,
+      NUMERIC, and date BETWEEN/NOT BETWEEN. See
+      `docs/design/0003-0013-between-operator.md`.)
 - [x] NUMERIC arithmetic for TPC-H aggregates with arithmetic.
       (achieved 2026-04-29: new KindNumeric carrier
       (`int64 mantissa, int8 scale`) replaces the prior

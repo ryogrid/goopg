@@ -99,7 +99,15 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
-	case "timestamp", "timestamptz":
+	case "timestamp", "timestamptz", "date":
+		// DATE shares the timestamp on-disk shape: an 8-byte
+		// big-endian nanos-since-epoch. The midnight-UTC
+		// coercion happens at literal-parse time (date '...' →
+		// KindTime at midnight), so a column-level distinction
+		// from timestamp isn't needed for arithmetic and
+		// comparison. Wire-format formatting back to the
+		// `YYYY-MM-DD` shape would belong in a dedicated KindDate
+		// carrier, deferred to the type-system milestone.
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
@@ -169,9 +177,9 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated bool")
 		}
 		return Datum{Kind: KindBool, Bool: data[0] != 0}, 1, nil
-	case "timestamp", "timestamptz":
+	case "timestamp", "timestamptz", "date":
 		if len(data) < 8 {
-			return Datum{}, 0, fmt.Errorf("truncated timestamp")
+			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
 		}
 		ns := int64(binary.BigEndian.Uint64(data[:8]))
 		return Datum{Kind: KindTime, Time: time.Unix(0, ns).UTC()}, 8, nil
