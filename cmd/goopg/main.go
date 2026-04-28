@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -186,6 +187,23 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 
 	srv := server.New(cfg)
+
+	// Honour the checkpoint_timeout GUC (milestone 0002). Default of
+	// 300s matches upstream; the prior hard-coded 10s was a
+	// development convenience. A future reload path will reapply
+	// this when the GUC changes — today the registry value is
+	// frozen at startup.
+	if rt != nil && rt.Checkpointer != nil {
+		registry := cfg.Registry
+		if registry == nil {
+			registry = config.BuildDefaultRegistry()
+		}
+		if v, ok := registry.Get("checkpoint_timeout"); ok {
+			if secs, err := strconv.Atoi(v.Display()); err == nil && secs > 0 {
+				rt.Checkpointer.SetInterval(time.Duration(secs) * time.Second)
+			}
+		}
+	}
 
 	// Run the periodic checkpointer alongside the server. SIGTERM /
 	// SIGINT cancel `ctx` directly; a control-socket STOP makes

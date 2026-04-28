@@ -58,6 +58,18 @@ func (c *Checkpointer) LastCheckpointLSN() uint64 {
 	return c.lastCheckpointLSN.Load()
 }
 
+// SetInterval updates the periodic checkpoint cadence. Call before
+// Run starts; once Run is in flight the ticker is already armed
+// against the original interval and a change here only affects a
+// subsequent Run invocation. The control-socket reload path will
+// hook into this once it observes the GUC registry.
+func (c *Checkpointer) SetInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.cfg.Interval = d
+}
+
 // Run starts the periodic checkpoint loop and returns when ctx is canceled.
 func (c *Checkpointer) Run(ctx context.Context) error {
 	ticker := time.NewTicker(c.cfg.Interval)

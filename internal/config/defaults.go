@@ -117,5 +117,42 @@ func BuildDefaultRegistry() *Registry {
 		Scope: ScopeSession,
 	}))
 
+	// WAL & checkpointer GUCs (milestone 0002). Names, units, ranges,
+	// and defaults mirror upstream's
+	// postgres/src/backend/utils/misc/guc_tables.c entries.
+	// PGC_SIGHUP -> ContextSigHup so a goopg reload (control-socket
+	// RELOAD) will be able to pick them up once the reload path
+	// observes the registry; today the reload is a no-op but the
+	// gating is in place.
+	r.MustRegister(NewVariable(Variable{
+		Name: "checkpoint_timeout", Type: TypeInt, Unit: UnitS, BootVal: "300",
+		MinVal: 30, MaxVal: 86400,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "checkpoint_completion_target", Type: TypeReal, BootVal: "0.9",
+		MinVal: 0.0, MaxVal: 1.0,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_wal_size", Type: TypeInt, Unit: UnitMB, BootVal: "1024",
+		MinVal: 2, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "min_wal_size", Type: TypeInt, Unit: UnitMB, BootVal: "80",
+		MinVal: 2, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "full_page_writes", Type: TypeBool, BootVal: "on",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+
 	return r
 }

@@ -154,3 +154,50 @@ func TestReportableVariablesSeedPlausibleSet(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckpointGUCDefaults pins the M0002 GUCs added to the
+// default registry. Names, units, ranges, and defaults must match
+// upstream's postgres/src/backend/utils/misc/guc_tables.c.
+func TestCheckpointGUCDefaults(t *testing.T) {
+	r := BuildDefaultRegistry()
+
+	cases := []struct {
+		name    string
+		bootVal string
+	}{
+		{"checkpoint_timeout", "300"},
+		{"checkpoint_completion_target", "0.9"},
+		{"max_wal_size", "1024"},
+		{"min_wal_size", "80"},
+		{"full_page_writes", "on"},
+	}
+	for _, c := range cases {
+		v, ok := r.Get(c.name)
+		if !ok {
+			t.Errorf("%s: not registered", c.name)
+			continue
+		}
+		if v.BootVal != c.bootVal {
+			t.Errorf("%s: BootVal=%q want %q", c.name, v.BootVal, c.bootVal)
+		}
+		if v.Display() != c.bootVal {
+			t.Errorf("%s: Display=%q want %q", c.name, v.Display(), c.bootVal)
+		}
+	}
+
+	// Range gates: max_wal_size must reject < 2 (upstream MIN of 2 MB).
+	if err := r.Set("max_wal_size", "1MB", SourceConfigFile); err == nil {
+		t.Error("expected max_wal_size=1MB to be rejected (< 2 MB)")
+	}
+	// checkpoint_completion_target must reject > 1.0.
+	if err := r.Set("checkpoint_completion_target", "1.5", SourceConfigFile); err == nil {
+		t.Error("expected checkpoint_completion_target=1.5 to be rejected (> 1.0)")
+	}
+	// checkpoint_timeout accepts a unit suffix and converts to seconds.
+	if err := r.Set("checkpoint_timeout", "5min", SourceConfigFile); err != nil {
+		t.Fatalf("checkpoint_timeout=5min: %v", err)
+	}
+	if v, _ := r.Get("checkpoint_timeout"); v.Display() != "300" {
+		t.Errorf("checkpoint_timeout after 5min set: Display=%q want 300", v.Display())
+	}
+}

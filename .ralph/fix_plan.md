@@ -447,13 +447,20 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       `Context.Checkpointer.CheckpointNow`; wire layer's
       `commandTagFor` returns "CHECKPOINT". Smoke-tested with
       upstream psql 18.3 against `goopg start -D <dir>`.
-- [ ] Add the M0002 GUCs with upstream defaults: `checkpoint_timeout`
-      (5min), `checkpoint_completion_target` (0.9), `max_wal_size`,
-      `min_wal_size`, `full_page_writes` (on). Names, units, and
-      defaults must match upstream per `GOAL_AND_REQUIREMENTS.md`
-      §6.2.
-- [ ] Honour `checkpoint_timeout` in `wal.Checkpointer.Run` (replace
-      the hard-coded 10s default with the GUC value).
+- [x] Add the M0002 GUCs with upstream defaults: `checkpoint_timeout`
+      (5min), `checkpoint_completion_target` (0.9), `max_wal_size`
+      (1024 MB), `min_wal_size` (80 MB), `full_page_writes` (on).
+      All five mirror upstream's
+      `postgres/src/backend/utils/misc/guc_tables.c` entries —
+      names, units, ranges, contexts (PGC_SIGHUP), and defaults.
+      `SHOW checkpoint_timeout` etc. work end-to-end.
+- [x] Honour `checkpoint_timeout` in `wal.Checkpointer.Run`. `goopg
+      start` reads the GUC value from the registry and calls
+      `Checkpointer.SetInterval` before launching the periodic
+      goroutine, so the cadence now matches upstream's 5-min
+      default instead of the development-time 10s. SetInterval is
+      a no-op for non-positive durations so a missing/typo'd GUC
+      keeps the construction default.
 - [ ] Spread/smoothed checkpoint writes over
       `checkpoint_completion_target * checkpoint_timeout`, rather than
       one synchronous burst (today's behaviour).

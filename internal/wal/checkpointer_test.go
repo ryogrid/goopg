@@ -45,6 +45,34 @@ func (f *fakeFlusher) Calls() int {
 	return f.calls
 }
 
+// TestCheckpointerSetInterval pins the GUC-driven cadence
+// override. Construction defaults Interval to 10s; SetInterval
+// must update the field so a subsequent Run uses it. We don't
+// drive Run here — the periodic-fire path is exercised by
+// TestCheckpointerWritesCheckpointMarkers.
+func TestCheckpointerSetInterval(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	flusher := &fakeFlusher{flushSignalChan: make(chan struct{}, 1)}
+	cp := NewCheckpointer(flusher, w, CheckpointerConfig{})
+	if cp.cfg.Interval != 10*time.Second {
+		t.Fatalf("default Interval=%v want 10s", cp.cfg.Interval)
+	}
+	cp.SetInterval(5 * time.Minute)
+	if cp.cfg.Interval != 5*time.Minute {
+		t.Fatalf("after SetInterval(5m): Interval=%v", cp.cfg.Interval)
+	}
+	// Non-positive values are ignored (defensive).
+	cp.SetInterval(0)
+	if cp.cfg.Interval != 5*time.Minute {
+		t.Fatalf("SetInterval(0) clobbered the existing value")
+	}
+}
+
 // TestCheckpointerCheckpointNowSynchronous covers the operator-
 // driven path used by the SQL `CHECKPOINT` verb: a single call
 // flushes dirty pages, appends a marker, and advances
