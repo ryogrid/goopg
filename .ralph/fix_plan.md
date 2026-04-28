@@ -346,6 +346,22 @@ unchecked item unless a dependency forces a different order.
       primary-key flag + method), and `nextOID` round-trip across
       restarts. stop/restart/reload/status remain stubbed.)
 - [ ] `pgbench -i` succeeds against goopg.
+      (in progress: when started with `goopg start -D <dir>`,
+      the simple-query path now routes every statement through
+      parser→planner→executor — DDL (CREATE/DROP/ALTER/TRUNCATE/
+      INDEX), DML (INSERT/UPDATE/DELETE), VACUUM/ANALYZE, and
+      Transaction verbs all emit upstream-shaped CommandComplete
+      tags ("DROP TABLE", "INSERT 0 N", etc.). pgbench -i now
+      gets past the DROP/CREATE table preamble and the
+      pre-COPY BEGIN; next blockers: (a) extended-query bind
+      parameters for table-touching statements aren't routed
+      through the executor — pgbench probes `SELECT relkind FROM
+      pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass`
+      via Parse/Bind/Execute, hitting "bind parameters in
+      Execute are not supported yet"; (b) pg_catalog system
+      tables (pg_class, pg_attribute, etc.) aren't implemented,
+      so even if the bind parameters worked, the SELECT would
+      return 42P01.)
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
 

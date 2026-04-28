@@ -122,9 +122,12 @@ type insertOp struct {
 	plan         *planner.Insert
 	ctx          *Context
 	child        Operator
-	RowsAffected int64
+	rowsAffected int64
 	done         bool
 }
+
+// RowsAffected satisfies executor.RowCounter.
+func (o *insertOp) RowsAffected() int64 { return o.rowsAffected }
 
 func newInsertOp(p *planner.Insert, child Operator) *insertOp {
 	return &insertOp{plan: p, child: child}
@@ -171,7 +174,7 @@ func (o *insertOp) Next() (Row, error) {
 		if err := writeHeapRow(o.ctx, rel, cols, row); err != nil {
 			return nil, err
 		}
-		o.RowsAffected++
+		o.rowsAffected++
 	}
 	return nil, EOF
 }
@@ -203,9 +206,12 @@ type updateOp struct {
 	scan         *planner.SeqScan
 	pred         planner.Expr
 	ctx          *Context
-	RowsAffected int64
+	rowsAffected int64
 	done         bool
 }
+
+// RowsAffected satisfies executor.RowCounter.
+func (o *updateOp) RowsAffected() int64 { return o.rowsAffected }
 
 func newUpdateOp(p *planner.Update) (*updateOp, error) {
 	scan, pred, err := extractScanAndPredicate(p.Child)
@@ -281,7 +287,7 @@ func (o *updateOp) Next() (Row, error) {
 		if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
 			return nil, err
 		}
-		o.RowsAffected++
+		o.rowsAffected++
 	}
 	return nil, EOF
 }
@@ -293,9 +299,12 @@ type deleteOp struct {
 	scan         *planner.SeqScan
 	pred         planner.Expr
 	ctx          *Context
-	RowsAffected int64
+	rowsAffected int64
 	done         bool
 }
+
+// RowsAffected satisfies executor.RowCounter.
+func (o *deleteOp) RowsAffected() int64 { return o.rowsAffected }
 
 func newDeleteOp(p *planner.Delete) (*deleteOp, error) {
 	scan, pred, err := extractScanAndPredicate(p.Child)
@@ -348,7 +357,7 @@ func (o *deleteOp) Next() (Row, error) {
 		}
 		o.ctx.Pool.MarkDirty(s)
 		o.ctx.Pool.Unpin(s)
-		o.RowsAffected++
+		o.rowsAffected++
 	}
 	return nil, EOF
 }

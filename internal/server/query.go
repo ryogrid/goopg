@@ -80,9 +80,13 @@ func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegist
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	}
 
+	if s.cfg.hasStorage() {
+		return s.dispatchSimpleQueryViaExecutor(w, trimmed)
+	}
+
 	return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 		fmt.Sprintf("query not supported by goopg v0: %q "+
-			"(only SELECT 1 / SHOW / SET / RESET are recognised until the parser lands)", trimmed))
+			"(only SELECT 1 / SHOW / SET / RESET are recognised until storage is wired via -D)", trimmed))
 }
 
 // handleShow returns the value of one variable as a single text column

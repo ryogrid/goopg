@@ -27,3 +27,11 @@ type Operator interface {
 	Close() error
 	Schema() planner.Schema
 }
+
+// RowCounter is implemented by DML operators that report a
+// post-execution affected-row count (Insert, Update, Delete). The
+// wire-protocol path uses this to build the canonical
+// `INSERT 0 N`/`UPDATE N`/`DELETE N` CommandComplete tag.
+type RowCounter interface {
+	RowsAffected() int64
+}

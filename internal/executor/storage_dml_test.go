@@ -69,8 +69,8 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 	if _, err := op.Next(); err != EOF {
 		t.Fatalf("Update.Next: %v", err)
 	}
-	if uo := op.(*updateOp); uo.RowsAffected != 1 {
-		t.Errorf("RowsAffected=%d want 1", uo.RowsAffected)
+	if uo := op.(*updateOp); uo.RowsAffected() != 1 {
+		t.Errorf("RowsAffected=%d want 1", uo.RowsAffected())
 	}
 	_ = op.Close()
 
@@ -128,8 +128,8 @@ func TestDeleteStampsXmax(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = op.Next()
-	if d := op.(*deleteOp); d.RowsAffected != 1 {
-		t.Errorf("RowsAffected=%d want 1", d.RowsAffected)
+	if d := op.(*deleteOp); d.RowsAffected() != 1 {
+		t.Errorf("RowsAffected=%d want 1", d.RowsAffected())
 	}
 	_ = op.Close()
 
@@ -165,8 +165,8 @@ func TestDeleteAllRowsWithoutPredicate(t *testing.T) {
 	op, _ := Build(del)
 	_ = op.Open(ctx)
 	_, _ = op.Next()
-	if d := op.(*deleteOp); d.RowsAffected != 3 {
-		t.Errorf("RowsAffected=%d want 3", d.RowsAffected)
+	if d := op.(*deleteOp); d.RowsAffected() != 3 {
+		t.Errorf("RowsAffected=%d want 3", d.RowsAffected())
 	}
 	_ = op.Close()
 

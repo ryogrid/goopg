@@ -83,8 +83,8 @@ func TestInsertThenSeqScanRoundTrip(t *testing.T) {
 	if _, err := op.Next(); err != EOF {
 		t.Fatalf("Insert.Next: %v", err)
 	}
-	if io := op.(*insertOp); io.RowsAffected != 3 {
-		t.Errorf("RowsAffected=%d want 3", io.RowsAffected)
+	if io := op.(*insertOp); io.RowsAffected() != 3 {
+		t.Errorf("RowsAffected=%d want 3", io.RowsAffected())
 	}
 	if err := op.Close(); err != nil {
 		t.Fatal(err)
