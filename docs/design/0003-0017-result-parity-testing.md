@@ -52,10 +52,10 @@ the must-match list will grow.
 
 ## Current parity matrix (synthetic 75-row dataset)
 
-After the 2026-04-29 NUMERIC-hash-key fix
-(`canonicalNumericKey` in
-`internal/executor/operators_join_agg.go`), 18/22 queries match
-identically. The 4 remaining divergences cluster cleanly:
+After two NUMERIC-handling fixes (the 2026-04-29
+`canonicalNumericKey` in `datumKey` and the follow-up
+`compareEq` NUMERIC-aware arm), 19/22 queries match identically.
+The 3 remaining divergences are all pure NUMERIC-precision deltas:
 
 | Q   | Status      | Notes                                                                          |
 | --- | ----------- | ------------------------------------------------------------------------------ |
@@ -65,13 +65,26 @@ identically. The 4 remaining divergences cluster cleanly:
 | Q9..Q13 | IDENTICAL | (Q9 multi-row, Q11 HAVING-scalar-subquery, Q13 LEFT JOIN)                    |
 | Q14 | DIVERGENT   | NUMERIC precision: 51.834417 vs 51.8344178319257926                            |
 | Q15 | IDENTICAL   |                                                                                 |
-| Q16 | DIVERGENT   | Row counts: goopg=0, upstream=3 — `NOT IN (subquery)` semantics               |
+| Q16 | IDENTICAL   | (closed by compareEq NUMERIC arm — was failing `p_size in (49, 14, ...)` against NUMERIC column) |
 | Q17..Q22 | IDENTICAL |                                                                                |
 
-**Summary**: identical=18, divergent=4, goopg-errored=0,
-upstream-errored=0. Three of the four divergences are pure NUMERIC
-precision deltas (gated on arbitrary-precision NUMERIC, deferred
-per design 0003-0012). Q16 is the only remaining structural gap.
+**Summary**: identical=19, divergent=3, goopg-errored=0,
+upstream-errored=0. All three remaining divergences are pure
+NUMERIC precision deltas (gated on arbitrary-precision NUMERIC,
+deferred per design 0003-0012). No remaining structural gaps on
+the synthetic dataset.
+
+### What the compareEq NUMERIC fix corrected
+
+`compareEq` (used by `IN (val_list)` and the simple form of
+`CASE`) had no NUMERIC arm, so any equality check between a
+NUMERIC column and an integer literal returned false. Q16's
+`p_size in (49, 14, 23, 45, 19, 3, 36, 9)` against the
+`p_size NUMERIC` column always evaluated to false, dropping every
+row before the join. Fix: route NUMERIC and NUMERIC↔INT
+cross-kind comparisons through the existing
+`compareDatum` (which already handles scale-aware numericCmp);
+incompatible kinds fall through to false rather than erroring.
 
 ### What the NUMERIC-hash-key fix corrected
 
@@ -93,8 +106,8 @@ KindInt or scale-0 KindNumeric).
 
 ## Triage workstream
 
-After the NUMERIC-hash-key fix, the remaining divergences cluster
-into:
+After the two NUMERIC-handling fixes, the only remaining
+divergences are precision deltas:
 
 ### NUMERIC precision (Q1, Q8, Q14)
 
@@ -106,23 +119,21 @@ fixed scale that better matches HammerDB-shaped ratios. v0
 deliberately deferred this in
 `docs/design/0003-0012-numeric-arithmetic.md`.
 
-### NOT IN (subquery) semantics (Q16)
-
-Q16 uses `NOT IN (subquery)`. Goopg returns 0 rows where upstream
-returns 3. Likely cause: three-valued logic on NULL in the inner
-subquery's result set, or a `NOT IN` rewrite that filters too
-aggressively. Small, contained — open as the next divergence to
-close.
-
 ### Closed in 2026-04-29
 
 The previous "row-count divergences from join / GROUP BY semantics"
-cluster (Q3, Q5, Q7, Q9, Q10, Q11, Q13 — formerly 7 queries) was
-all one bug: NUMERIC datums weren't hashed correctly so any
-hash-join with NUMERIC keys degenerated to cross product. Single
-~30-line fix in `datumKey` + `canonicalNumericKey`. The
-HAVING-scalar-subquery shape in Q11 was a downstream symptom, not
-a separate gap.
+cluster (Q3, Q5, Q7, Q9, Q10, Q11, Q13 — 7 queries) was all one
+bug: NUMERIC datums weren't hashed correctly so any hash-join with
+NUMERIC keys degenerated to cross product. Single ~30-line fix in
+`datumKey` + `canonicalNumericKey`.
+
+The Q16 NOT-IN divergence wasn't actually NOT-IN semantics — the
+inner subquery returned 0 rows, so `NOT IN` should have evaluated
+to true on every row. The real failure was `compareEq` rejecting
+all `p_size in (49, 14, ...)` matches because the IN-list
+literals (KindInt) couldn't compare against the NUMERIC column.
+Fix: make `compareEq` route NUMERIC and cross-kind comparisons
+through `compareDatum` instead of dropping through to "false".
 
 ## Out of scope
 

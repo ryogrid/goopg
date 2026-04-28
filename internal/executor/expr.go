@@ -711,6 +711,22 @@ func compareEq(a, b Datum) (Datum, error) {
 	if a.IsNull() || b.IsNull() {
 		return NullDatum, nil
 	}
+	// NUMERIC arms: route NUMERIC and NUMERIC↔INT cross-kind
+	// comparisons through compareDatum so they use scale-aware
+	// equality. Without this, `IN (49, 14, ...)` against a
+	// NUMERIC column (TPC-H Q16's `p_size in (...)` shape) always
+	// returns false because the int literals don't match
+	// KindNumeric values directly.
+	if a.Kind == KindNumeric || b.Kind == KindNumeric {
+		// compareDatum errors only on truly incompatible kinds;
+		// for IN-list semantics we want false on those, so swallow
+		// the error and report not-equal.
+		cmp, err := compareDatum(a, b, 0)
+		if err != nil {
+			return Datum{Kind: KindBool, Bool: false}, nil
+		}
+		return Datum{Kind: KindBool, Bool: cmp == 0}, nil
+	}
 	switch {
 	case a.Kind == KindInt && b.Kind == KindInt:
 		return Datum{Kind: KindBool, Bool: a.Int == b.Int}, nil

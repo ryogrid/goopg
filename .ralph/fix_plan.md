@@ -1244,13 +1244,19 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       cross-kind hashes match. Closed 7 row-count divergences
       (Q3, Q5, Q7, Q9, Q10, Q11, Q13) in one ~30-line fix.
 
-      Remaining 4 divergences:
-      (1) NUMERIC precision in division (Q1, Q8, Q14) — gated
-          on arbitrary-precision NUMERIC, deferred per design
-          0003-0012;
-      (2) NOT IN (subquery) semantics (Q16) — goopg returns 0
-          rows where upstream returns 3; likely 3VL-on-NULL
-          handling. Open as the next divergence to close.
+      Remaining 3 divergences (all pure NUMERIC precision deltas
+      gated on arbitrary-precision NUMERIC, deferred per design
+      0003-0012): Q1, Q8, Q14. No structural gaps remain on the
+      synthetic dataset.
+
+      Q16 (formerly NOT-IN divergence) closed in the same loop
+      with a second NUMERIC-handling fix: `compareEq` (used by
+      `IN (val_list)` and the simple form of `CASE`) had no
+      NUMERIC arm so `p_size in (49, 14, ...)` against NUMERIC
+      `p_size` always evaluated false. Fix routes NUMERIC and
+      cross-kind comparisons through the existing
+      `compareDatum` helper, which already does scale-aware
+      `numericCmp`.
 
       See `docs/design/0003-0017-result-parity-testing.md`
       for the full triage workstream. SF1 parity still gated
