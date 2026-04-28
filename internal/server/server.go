@@ -256,6 +256,14 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 		s.cfg.Logger.Info("control: reload requested (v0 no-op)")
 		return nil
 	}
+	cl.OnCheckpoint = func() error {
+		if s.cfg.Checkpointer == nil {
+			s.cfg.Logger.Info("control: checkpoint requested but no checkpointer configured")
+			return errors.New("checkpoint not configured (server has no WAL writer)")
+		}
+		s.cfg.Logger.Info("control: checkpoint requested")
+		return s.cfg.Checkpointer.CheckpointNow()
+	}
 	s.controlListener = cl
 	s.controlPath = socketPath
 	go func() {

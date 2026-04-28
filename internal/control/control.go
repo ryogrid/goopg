@@ -160,6 +160,12 @@ type Listener struct {
 	// OnReload is invoked when a client sends RELOAD. Should be
 	// fast; v0's only consumer is a no-op.
 	OnReload func() error
+	// OnCheckpoint is invoked when a client sends CHECKPOINT.
+	// Same semantics as the SQL `CHECKPOINT` verb — runs a
+	// synchronous IMMEDIATE checkpoint and only replies once
+	// the marker is durable. Slow by design; the client-side
+	// timeout in `goopg ctl checkpoint` is generous.
+	OnCheckpoint func() error
 }
 
 // NewListener binds a control-plane Unix domain socket at path.
@@ -248,6 +254,21 @@ func (l *Listener) handleConn(conn net.Conn) {
 				fmt.Fprintf(conn, "ERR %s\n", err.Error())
 				return
 			}
+		}
+		_, _ = conn.Write([]byte("OK\n"))
+	case "CHECKPOINT":
+		// Drop the read deadline — a checkpoint can take
+		// arbitrarily long if there are many dirty pages and
+		// the spread completion target is high. The CLI side
+		// handles its own client timeout.
+		_ = conn.SetReadDeadline(time.Time{})
+		if l.OnCheckpoint == nil {
+			fmt.Fprintf(conn, "ERR checkpoint not configured\n")
+			return
+		}
+		if err := l.OnCheckpoint(); err != nil {
+			fmt.Fprintf(conn, "ERR %s\n", err.Error())
+			return
 		}
 		_, _ = conn.Write([]byte("OK\n"))
 	default:

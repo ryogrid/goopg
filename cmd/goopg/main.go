@@ -37,6 +37,7 @@ Commands:
   stop       Request a graceful shutdown of a running server.
   restart    Stop the server and start it again.
   reload     Reload configuration without restarting.
+  checkpoint Trigger a synchronous IMMEDIATE-speed checkpoint.
   status     Report whether a server is running and its high-level state.
   version    Print the goopg version and exit.
 
@@ -54,6 +55,7 @@ var subcommands = []subcommand{
 	{"stop", runStop},
 	{"restart", runRestart},
 	{"reload", runReload},
+	{"checkpoint", runCheckpoint},
 	{"status", runStatus},
 	{"version", runVersion},
 }
@@ -340,6 +342,46 @@ func runReload(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(stdout, "goopg reload: configuration reload signalled (v0 no-op)")
+	return 0
+}
+
+// runCheckpoint sends a CHECKPOINT request over the control
+// socket. Same semantics as the SQL `CHECKPOINT` verb — a
+// synchronous IMMEDIATE-speed checkpoint that returns once the
+// marker is durable. The default 5-min timeout matches the upper
+// end of typical bgwriter cycles; operators can extend it for
+// big buffer pools.
+func runCheckpoint(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("checkpoint", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("D", "", "data directory of the server to checkpoint (required)")
+	timeoutSec := fs.Int("t", 300, "seconds to wait for the checkpoint to complete")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dataDir == "" {
+		fmt.Fprintln(stderr, "goopg checkpoint: -D <data-directory> is required")
+		return 2
+	}
+	pf, err := control.ParsePIDFile(*dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stderr, "goopg checkpoint: server not running (no postmaster.pid)")
+			return 1
+		}
+		fmt.Fprintf(stderr, "goopg checkpoint: %v\n", err)
+		return 1
+	}
+	reply, err := control.Send(pf.SocketPath, "CHECKPOINT", time.Duration(*timeoutSec)*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "goopg checkpoint: %v\n", err)
+		return 1
+	}
+	if reply != "OK" {
+		fmt.Fprintf(stderr, "goopg checkpoint: %s\n", reply)
+		return 1
+	}
+	fmt.Fprintln(stdout, "goopg checkpoint: complete")
 	return 0
 }
 
