@@ -268,6 +268,71 @@ func TestPlanJoinHashBuildSidePicksSmaller(t *testing.T) {
 	}
 }
 
+// TestPlanCommaFromPushesEqualityIntoJoin pins the predicate-
+// pushdown pass: comma-FROM with WHERE-side equalities should
+// produce real INNER hash joins instead of CROSS+Filter.
+func TestPlanCommaFromPushesEqualityIntoJoin(t *testing.T) {
+	cat := pgbenchCatalog(t)
+
+	// Two-table case: SELECT FROM a, h WHERE a.aid = h.aid.
+	// Expected: Project -> Join(INNER, hash) over a and h with
+	// no surrounding Filter (the only conjunct moved into the
+	// Join). The build-side stays at the default (right) because
+	// neither table has stats.
+	t.Run("two-table eq pushed into join", func(t *testing.T) {
+		sql := "SELECT a.aid FROM pgbench_accounts a, pgbench_history h WHERE a.aid = h.aid"
+		node, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		proj, ok := node.(*Project)
+		if !ok {
+			t.Fatalf("root=%T want *Project", node)
+		}
+		j, ok := proj.Child.(*Join)
+		if !ok {
+			t.Fatalf("Project.Child=%T want *Join (no Filter wrapper)", proj.Child)
+		}
+		if j.Type != JoinTypeInner {
+			t.Errorf("Join.Type=%v want JoinTypeInner", j.Type)
+		}
+		if j.Algo != JoinAlgoHash {
+			t.Errorf("Join.Algo=%v want JoinAlgoHash", j.Algo)
+		}
+		if j.LeftKey == nil || j.RightKey == nil {
+			t.Errorf("LeftKey/RightKey unset after pushdown")
+		}
+		if j.Predicate == nil {
+			t.Errorf("Join.Predicate nil after pushdown")
+		}
+	})
+
+	// Mixed case: an eq-conjunct should land on the Join while a
+	// single-table filter stays on top.
+	t.Run("non-pushable conjunct stays on Filter", func(t *testing.T) {
+		sql := "SELECT a.aid FROM pgbench_accounts a, pgbench_history h WHERE a.aid = h.aid AND a.bid = 5"
+		node, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+		proj, ok := node.(*Project)
+		if !ok {
+			t.Fatalf("root=%T want *Project", node)
+		}
+		f, ok := proj.Child.(*Filter)
+		if !ok {
+			t.Fatalf("Project.Child=%T want *Filter (a.bid=5 stays here)", proj.Child)
+		}
+		j, ok := f.Child.(*Join)
+		if !ok {
+			t.Fatalf("Filter.Child=%T want *Join", f.Child)
+		}
+		if j.Type != JoinTypeInner || j.Algo != JoinAlgoHash {
+			t.Errorf("Join Type=%v Algo=%v want INNER+Hash", j.Type, j.Algo)
+		}
+	})
+}
+
 func TestPlanJoinPicksMergeAlgoForRightFullEquality(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	cases := []struct {

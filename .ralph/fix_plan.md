@@ -793,12 +793,23 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       to `BuildLeft = true` when EstimateRows says the left
       side is smaller. EXPLAIN annotates the swap as
       `Hash Join (INNER, build=left)`. LEFT JOIN keeps
-      right-as-build for outer-row semantics. Still TODO for
-      this bullet: join-order reordering and
+      right-as-build for outer-row semantics.
+      Predicate-pushdown for comma-FROM lands the same loop:
+      `pushPredicatesIntoCrossJoins` walks the WHERE
+      conjunction and rehomes each disjoint-side equality
+      onto the deepest qualifying Join, flipping
+      `JoinTypeCross → JoinTypeInner` and promoting to
+      hash-join-with-build-side-selection. The canonical
+      TPC-H shape `SELECT FROM r, n, s WHERE r.rk = n.rk
+      AND s.nk = n.nk` now plans as chained Hash Joins
+      instead of `Filter(Cross(Cross(...)))`. Still TODO for
+      this bullet: cost-driven join-order reordering and
       algorithm-vs-algorithm choice (hash vs merge vs nested
       for INNER). See
-      `docs/design/0003-0003-statistics-and-cardinality.md`
-      and `docs/design/0003-0002-join-executors.md`.)
+      `docs/design/0003-0003-statistics-and-cardinality.md`,
+      `docs/design/0003-0002-join-executors.md`, and the
+      "Predicate Pushdown for Comma-FROM" section in
+      `docs/design/0003-0001-planner-overview.md`.)
 - [x] Hash join executor (`internal/executor/operators_hashjoin.go`).
       (achieved 2026-04-28: implemented in
       `internal/executor/operators_join_agg.go` (extending the

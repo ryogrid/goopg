@@ -261,6 +261,13 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			// Comma-FROM produces a left-deep CROSS-join chain.
+			// Push WHERE-side equalities into the deepest Join
+			// whose schema spans both sides so the planner can
+			// pick hash join instead of running a Cartesian
+			// product through Filter. See
+			// internal/planner/pushdown.go.
+			node = pushPredicatesIntoCrossJoins(node)
 		}
 	}
 

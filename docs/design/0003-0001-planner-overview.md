@@ -67,6 +67,33 @@ left-key/right-key equality:
   expressions): planner keeps `JoinAlgoNestedLoop` fallback.
 
 Planner stores `LeftKey`/`RightKey` on `planner.Join` for hash/merge paths.
+For INNER hash joins, `EstimateRows` drives build-side selection: the smaller
+side becomes the build (`Join.BuildLeft = true` when the left input has the
+smaller estimate). See [0003-0002-join-executors.md](0003-0002-join-executors.md).
+
+## Predicate Pushdown for Comma-FROM
+
+`planFromRangeVars` builds a left-deep CROSS-join chain when the user writes
+comma-FROM (`SELECT FROM r, n, s WHERE ...`). The naive output is
+`Filter(Cross(Cross(r, n), s))` — Cartesian for any non-trivial scale. After
+the WHERE filter is built, `pushPredicatesIntoCrossJoins` (in
+`internal/planner/pushdown.go`) walks the conjunction and rehomes each
+disjoint-side equality onto the deepest Join whose schema contains both
+sides:
+
+- The Join's type flips from `JoinTypeCross` to `JoinTypeInner`.
+- `splitEqualityForHash` runs on the conjunct; on success the Join is promoted
+  to `JoinAlgoHash` with `LeftKey`/`RightKey` populated and the build-side
+  selection rule fires.
+- Conjuncts that don't span exactly two sides (single-table filters,
+  out-of-scope refs, OuterColumnRef from correlated subqueries) stay on the
+  outer Filter.
+
+This mirrors the upstream planner's implicit "pull WHERE quals into the
+qualifying join" step (`postgres/src/backend/optimizer/plan/initsplan.c`,
+`distribute_qual_to_rels`) at a single, post-FROM rewrite granularity.
+Multi-Join AND-of-equalities now collapse to chained hash joins instead of
+`Filter(Cross(Cross...))`.
 
 ## Cardinality Estimation Surface
 
