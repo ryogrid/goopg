@@ -968,6 +968,24 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] `pg_catalog.pg_indexes` virtual view for HammerDB checkschema.
+      (achieved 2026-04-29: HammerDB's checkschema step probes
+      `SELECT tablename, indexname FROM pg_indexes WHERE
+      tablename = '<t>'` to verify each TPC-H table has at
+      least one index after CreateIndexes runs; without
+      pg_indexes it raised `no indices` and aborted before the
+      workload could start. Now: `pg_catalog.pg_indexes` is a
+      virtual view (one row per index on each user table) with
+      `(schemaname, tablename, indexname, tablespace, indexdef)`
+      columns; tablespace and indexdef are empty strings (v0
+      doesn't track them). LookupTable falls back to pg_catalog
+      when an unqualified lookup misses so `pg_indexes` resolves
+      without a schema prefix (mirrors upstream's implicit
+      search_path entry). Verified via psql 18.3 against the
+      HammerDB checkschema query shape; pg_class still resolves
+      unqualified. `TestPgIndexesView` pins the lookup +
+      VirtualRows shape. See
+      `docs/design/0003-0015-pg-catalog-views.md`.)
 - [x] Derived tables (`(SELECT …) AS alias` in FROM) for TPC-H Q13.
       (achieved 2026-04-29: surfaced by running TPC-H Q13
       end-to-end — parse-errored at `FROM (SELECT ...)`. Now:

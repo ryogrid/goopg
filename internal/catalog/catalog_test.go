@@ -130,3 +130,39 @@ func TestCatalogAddColumn(t *testing.T) {
 		t.Fatal("duplicate AddColumn should fail")
 	}
 }
+
+// TestPgIndexesView pins the pg_catalog.pg_indexes virtual
+// view that HammerDB's checkschema queries. Each index on a
+// non-virtual table should produce one row with
+// (schemaname, tablename, indexname, ...). Unqualified lookup
+// resolves via the implicit pg_catalog search_path.
+func TestPgIndexesView(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "items"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+		{Name: "label", Type: Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "items_id_idx"}, tbl, []string{"id"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	view, ok := c.LookupTable(parser.ObjectName{Name: "pg_indexes"})
+	if !ok {
+		t.Fatal("LookupTable(pg_indexes) failed — search_path fallback to pg_catalog not honored")
+	}
+	if !view.Virtual || view.VirtualRows == nil {
+		t.Fatalf("pg_indexes is not a virtual view: virtual=%v rows=nil(%t)", view.Virtual, view.VirtualRows == nil)
+	}
+	rows := view.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	if got, want := rows[0][1], "items"; got != want {
+		t.Errorf("tablename=%q want %q", got, want)
+	}
+	if got, want := rows[0][2], "items_id_idx"; got != want {
+		t.Errorf("indexname=%q want %q", got, want)
+	}
+}

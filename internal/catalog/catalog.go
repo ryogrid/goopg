@@ -221,6 +221,66 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_class"] = pgClass
+
+	// pg_indexes view. HammerDB's checkschema step queries
+	// `select tablename, indexname from pg_indexes where
+	// tablename = '$table'` to verify each TPC-H table has at
+	// least one index after CreateIndexes runs. Mirrors the
+	// upstream view's first three columns; tablespace and
+	// indexdef are populated as empty / placeholder strings
+	// since v0 doesn't track them.
+	pgIndexes := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_indexes",
+		Columns: []Column{
+			{Name: "schemaname", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "tablename", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "indexname", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "tablespace", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "indexdef", Type: Type{Name: "text"}, Ordinal: 4},
+		},
+		OID:     2604, // upstream's pg_indexes OID
+		Virtual: true,
+	}
+	pgIndexes.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		// Sort for deterministic output across calls.
+		tableKeys := make([]string, 0, len(c.tables))
+		for k, t := range c.tables {
+			if t.Virtual {
+				continue
+			}
+			tableKeys = append(tableKeys, k)
+		}
+		sort.Strings(tableKeys)
+		var out [][]string
+		for _, tk := range tableKeys {
+			t := c.tables[tk]
+			idxs := c.byTable[t.OID]
+			idxKeys := make([]string, 0, len(idxs))
+			for ik := range idxs {
+				idxKeys = append(idxKeys, ik)
+			}
+			sort.Strings(idxKeys)
+			for _, ik := range idxKeys {
+				idx := idxs[ik]
+				schema := idx.Schema
+				if schema == "" {
+					schema = "public"
+				}
+				out = append(out, []string{
+					schema,
+					t.Name,
+					idx.Name,
+					"", // tablespace
+					"",
+				})
+			}
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_indexes"] = pgIndexes
 }
 
 // RegisterVirtualTable installs a virtual table built by an
@@ -268,12 +328,23 @@ func key(name parser.ObjectName) string {
 }
 
 // LookupTable returns the table with the given name, or false when
-// the name doesn't resolve.
+// the name doesn't resolve. Unqualified lookups fall back to the
+// `pg_catalog` schema so HammerDB's `SELECT FROM pg_indexes ...`
+// and `SELECT FROM pg_class ...` shapes resolve without an
+// explicit schema qualifier — mirrors upstream's implicit
+// `pg_catalog` entry on the search_path.
 func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	t, ok := c.tables[key(name)]
-	return t, ok
+	if t, ok := c.tables[key(name)]; ok {
+		return t, true
+	}
+	if name.Schema == "" {
+		if t, ok := c.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
+			return t, true
+		}
+	}
+	return nil, false
 }
 
 // LookupColumn returns the column with the given name on a resolved
