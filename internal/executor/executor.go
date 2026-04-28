@@ -74,6 +74,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return newTransactionOp(p), nil
 	case *planner.Checkpoint:
 		return newCheckpointOp(p), nil
+	case *planner.Explain:
+		return newExplainOp(p), nil
 	case *planner.Utility:
 		// VACUUM / ANALYZE / SHOW / SET / RESET are utility
 		// statements. The wire layer already handles SHOW/SET/RESET

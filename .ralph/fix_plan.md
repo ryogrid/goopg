@@ -711,7 +711,20 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 - [ ] Sort-merge join executor.
 - [ ] Hash aggregate executor (replace today's sort-then-group as the
       default path).
-- [ ] `EXPLAIN` output for a `parser.ExplainStmt` shape.
+- [x] `EXPLAIN` output for a `parser.ExplainStmt` shape.
+      (achieved 2026-04-28: `EXPLAIN <stmt>` parses via new
+      KwExplain + parser.ExplainStmt; planner.Explain wraps
+      the planned inner Node; executor's explainOp pre-order
+      walks the tree and emits one row per node as a single-
+      column "QUERY PLAN" text result. Hash-join vs nested-
+      loop algorithm visible in the label
+      (`Hash Join (INNER)` vs `Nested Loop (INNER)`); SeqScan/
+      IndexScan show their relation, Aggregate distinguishes
+      ungrouped from GroupAggregate. Wire layer reports
+      CommandComplete tag "EXPLAIN". Verified end-to-end via
+      psql 18.3 — output renders identically to upstream's
+      text format. Options / ANALYZE / FORMAT JSON deferred —
+      see `docs/design/0003-0007-explain.md`.)
 - [ ] `ANALYZE` produces statistics: n_distinct, MCV lists,
       histograms (mirror upstream's
       `postgres/src/backend/commands/analyze.c`).

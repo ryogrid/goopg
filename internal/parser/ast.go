@@ -69,6 +69,20 @@ type AnalyzeStmt struct {
 func (s *AnalyzeStmt) Pos() int  { return s.pos }
 func (s *AnalyzeStmt) stmtNode() {}
 
+// ExplainStmt — `EXPLAIN <stmt>`. v0 ignores the optional
+// upstream option list (`( ANALYZE, VERBOSE, COSTS, … )`) —
+// adding parsing for those is one of the deferred items in
+// docs/design/0003-0007-explain.md. The result of executing an
+// ExplainStmt is a single-column QUERY PLAN text result-set
+// rendering the inner statement's plan tree.
+type ExplainStmt struct {
+	pos   int
+	Inner Stmt
+}
+
+func (s *ExplainStmt) Pos() int  { return s.pos }
+func (s *ExplainStmt) stmtNode() {}
+
 // CheckpointStmt — `CHECKPOINT`. Triggers a synchronous checkpoint
 // (see milestone 0002 §Checkpointing). The bare verb is the only
 // form upstream accepts as well.

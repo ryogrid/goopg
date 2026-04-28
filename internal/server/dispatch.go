@@ -188,6 +188,9 @@ func commandTagFor(node planner.Node, op executor.Operator, rowCount int64) stri
 	case *planner.Checkpoint:
 		_ = n
 		return "CHECKPOINT"
+	case *planner.Explain:
+		_ = n
+		return "EXPLAIN"
 	}
 	// Read-shaped: SELECT N. Catches Project/Sort/Limit/Filter/Aggregate/
 	// Join/SeqScan/IndexScan/Values root nodes.

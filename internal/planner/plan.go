@@ -428,6 +428,19 @@ type Checkpoint struct{ pos int }
 func (n *Checkpoint) Pos() int       { return n.pos }
 func (n *Checkpoint) Output() Schema { return nil }
 
+// Explain — `EXPLAIN <stmt>`. Wraps the planned inner node so
+// the executor can render it as a single-column QUERY PLAN
+// text result-set without re-running planning.
+type Explain struct {
+	pos   int
+	Child Node
+}
+
+func (n *Explain) Pos() int { return n.pos }
+func (n *Explain) Output() Schema {
+	return Schema{SchemaColumn{Name: "QUERY PLAN", Type: catalog.Type{Name: "text"}}}
+}
+
 // CopyDirection records whether the COPY moves data into or out of
 // the table. Mirrors parser.CopyDirection so the executor doesn't
 // need to import the parser package directly.

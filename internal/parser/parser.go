@@ -179,8 +179,24 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseCopy()
 	case KwCheckpoint:
 		return p.parseCheckpoint()
+	case KwExplain:
+		return p.parseExplain()
 	}
 	return nil, p.errAtCur("unsupported statement")
+}
+
+// parseExplain: `EXPLAIN <stmt>`. v0 doesn't yet accept the
+// optional `( option [, …] )` list upstream uses for ANALYZE
+// / VERBOSE / FORMAT — the bare form is what every TPC-H
+// shape needs. Skipping a leading parenthesised list is left
+// to a follow-up loop.
+func (p *parser) parseExplain() (Stmt, error) {
+	t := p.advance() // EXPLAIN
+	inner, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	return &ExplainStmt{pos: t.Pos, Inner: inner}, nil
 }
 
 // parseCheckpoint: CHECKPOINT

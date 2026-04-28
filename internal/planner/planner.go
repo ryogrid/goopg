@@ -71,6 +71,13 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	case *parser.CheckpointStmt:
 		return &Checkpoint{pos: s.Pos()}, nil
 
+	case *parser.ExplainStmt:
+		inner, err := Plan(s.Inner, cat)
+		if err != nil {
+			return nil, err
+		}
+		return &Explain{pos: s.Pos(), Child: inner}, nil
+
 	case *parser.CopyStmt:
 		return planCopy(s, cat)
 	}
