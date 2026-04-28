@@ -13,8 +13,19 @@ const (
 	RecordKindPageImage byte = 1
 	// RecordKindCheckpoint marks a consistent recovery boundary.
 	RecordKindCheckpoint byte = 2
+	// RecordKindBtreeSplit captures a B-tree page split atomically:
+	// the post-split image of the left page plus the freshly
+	// populated right page in one record. Replay applies both,
+	// guaranteeing crash recovery never lands in the torn state
+	// where left advertises a right-link to a page that's still
+	// the bare smgr.Extend zero/init image. See
+	// docs/design/0002-0002-btree-concurrency.md Landing 3a.
+	RecordKindBtreeSplit byte = 3
 
 	pageImageHeaderSize = 14
+	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + LeftBlk(4) + RightBlk(4) = 18.
+	btreeSplitHeaderSize = 18
 )
 
 // ReplayStats summarizes one replay run.
@@ -42,6 +53,56 @@ func EncodePageImage(rel storage.RelFileNode, blk storage.BlockNumber, page stor
 	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
 	copy(out[pageImageHeaderSize:], page)
 	return out, nil
+}
+
+// EncodeBtreeSplit encodes one atomic B-tree split record. Both
+// pages must be exactly storage.BlockSize bytes; the record
+// embeds them in left-then-right order so replay applies the new
+// right page before any reader could follow left's right-link to
+// it.
+func EncodeBtreeSplit(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) ([]byte, error) {
+	if len(leftPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-split left page is %d bytes, want %d", len(leftPage), storage.BlockSize)
+	}
+	if len(rightPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-split right page is %d bytes, want %d", len(rightPage), storage.BlockSize)
+	}
+	out := make([]byte, btreeSplitHeaderSize+2*storage.BlockSize)
+	out[0] = RecordKindBtreeSplit
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(leftBlk))
+	binary.LittleEndian.PutUint32(out[14:18], uint32(rightBlk))
+	copy(out[btreeSplitHeaderSize:btreeSplitHeaderSize+storage.BlockSize], leftPage)
+	copy(out[btreeSplitHeaderSize+storage.BlockSize:], rightPage)
+	return out, nil
+}
+
+// DecodeBtreeSplit returns the rel + (left,right) blocks + page
+// images carried by a BtreeSplit record payload.
+func DecodeBtreeSplit(payload []byte) (rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, err error) {
+	want := btreeSplitHeaderSize + 2*storage.BlockSize
+	if len(payload) != want {
+		err = fmt.Errorf("wal: invalid btree-split payload len %d (want %d)", len(payload), want)
+		return
+	}
+	if payload[0] != RecordKindBtreeSplit {
+		err = fmt.Errorf("wal: record kind %d is not btree-split", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	leftBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	rightBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[14:18]))
+	leftPage = make(storage.Page, storage.BlockSize)
+	copy(leftPage, payload[btreeSplitHeaderSize:btreeSplitHeaderSize+storage.BlockSize])
+	rightPage = make(storage.Page, storage.BlockSize)
+	copy(rightPage, payload[btreeSplitHeaderSize+storage.BlockSize:])
+	return
 }
 
 // DecodePageImage decodes a full-page image record payload.
@@ -81,6 +142,11 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
 			}
 			stats.Applied++
+		case RecordKindBtreeSplit:
+			if err := replayBtreeSplit(mgr, r.Payload); err != nil {
+				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
+			}
+			stats.Applied++
 		case RecordKindCheckpoint:
 			// Marker only; no page write.
 			continue
@@ -102,11 +168,33 @@ func ReplayFromDir(dataDir string, segmentSize int64) (ReplayStats, error) {
 	return ReplayRecords(mgr, records)
 }
 
-func replayPageImage(mgr *storage.Manager, payload []byte) error {
-	rel, blk, page, err := DecodePageImage(payload)
+// replayBtreeSplit applies the left then right page images carried
+// by an atomic split record. The right page is applied via Extend
+// when the relation is one block short of containing it (the
+// freshly-allocated case at original record time) and via
+// WriteBlock when the file is already long enough (replay re-run
+// or the right page somehow already on disk). Apply order is
+// left → right so a reader following left's right-link from the
+// post-replay state always finds a real right page on disk.
+func replayBtreeSplit(mgr *storage.Manager, payload []byte) error {
+	rel, leftBlk, rightBlk, leftPage, rightPage, err := DecodeBtreeSplit(payload)
 	if err != nil {
 		return err
 	}
+	if err := writeBlockOrExtend(mgr, rel, leftBlk, leftPage); err != nil {
+		return fmt.Errorf("apply left block %d: %w", leftBlk, err)
+	}
+	if err := writeBlockOrExtend(mgr, rel, rightBlk, rightPage); err != nil {
+		return fmt.Errorf("apply right block %d: %w", rightBlk, err)
+	}
+	return nil
+}
+
+// writeBlockOrExtend installs `page` at the given block number,
+// extending the relation if the block is exactly one past the end.
+// It is the shared kernel for replayPageImage and the per-side
+// apply in replayBtreeSplit.
+func writeBlockOrExtend(mgr *storage.Manager, rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) error {
 	nblocks, err := mgr.NBlocks(rel)
 	if err != nil {
 		return err
@@ -126,6 +214,14 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 	default:
 		return fmt.Errorf("wal: replay gap block=%d nblocks=%d", blk, nblocks)
 	}
+}
+
+func replayPageImage(mgr *storage.Manager, payload []byte) error {
+	rel, blk, page, err := DecodePageImage(payload)
+	if err != nil {
+		return err
+	}
+	return writeBlockOrExtend(mgr, rel, blk, page)
 }
 
 func replayLimit(records []Record) (int, uint64) {

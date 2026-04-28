@@ -222,16 +222,44 @@ func CompareKeys(a, b []byte) int {
 //     readers can run alongside the writer; writer-vs-writer
 //     concurrency lands in Landing 3 along with split WAL records.
 type BTree struct {
-	pool *storage.Pool
-	rel  storage.RelFileNode
+	pool    *storage.Pool
+	rel     storage.RelFileNode
+	logSplit LogSplitFunc
 
 	mu sync.Mutex
 }
 
+// LogSplitFunc emits the atomic page-split WAL record described in
+// docs/design/0002-0002-btree-concurrency.md Landing 3a and
+// returns the record's end LSN. nil means "no WAL writer wired";
+// the btree falls back to the per-page FPI emitted by
+// Pool.MarkDirty, which is correct under the limited
+// crash-consistency contract (split atomicity is best-effort
+// without this hook).
+type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error)
+
+// Options carries optional dependencies for Open/Create. The zero
+// value works for tests and callers that don't need WAL-backed
+// split atomicity.
+type Options struct {
+	// LogSplit, when non-nil, is invoked on every page split to
+	// emit one atomic BtreeSplit WAL record covering both pages.
+	LogSplit LogSplitFunc
+}
+
 // Open returns a handle to an existing B-tree on rel. Validates the
 // metapage; returns ErrNotABTree if the magic doesn't match.
+//
+// The split-WAL hook (Landing 3a) is pulled from
+// `pool.LogBtreeSplit()`. Callers that need to override (tests,
+// future independent WAL streams) can use OpenWithOptions.
 func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel}
+	return OpenWithOptions(pool, rel, Options{LogSplit: adaptPoolLogSplit(pool)})
+}
+
+// OpenWithOptions is the wired-up Open variant.
+func OpenWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
 	meta, err := bt.readMeta()
 	if err != nil {
 		return nil, err
@@ -245,7 +273,24 @@ func Open(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
 // Create initializes a new B-tree on rel. The relation must be empty.
 // Allocates the metapage and the initial leaf-as-root page.
 func Create(pool *storage.Pool, rel storage.RelFileNode) (*BTree, error) {
-	bt := &BTree{pool: pool, rel: rel}
+	return CreateWithOptions(pool, rel, Options{LogSplit: adaptPoolLogSplit(pool)})
+}
+
+// adaptPoolLogSplit returns the pool's split-WAL hook in btree's
+// LogSplitFunc shape, or nil when no hook is wired (tests etc.).
+func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
+	hook := pool.LogBtreeSplit()
+	if hook == nil {
+		return nil
+	}
+	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error) {
+		return hook(rel, leftBlk, rightBlk, leftPage, rightPage)
+	}
+}
+
+// CreateWithOptions is the wired-up Create variant.
+func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
+	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
 
@@ -598,8 +643,29 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 	writeOpaque(slot.Page(), op)
 
-	bt.pool.MarkDirty(slot)
-	bt.pool.MarkDirty(rightSlot)
+	// Atomic split WAL record (Landing 3a). When a writer is
+	// available, emit ONE record covering both pages and stamp
+	// the resulting LSN onto both page headers; this guarantees
+	// crash recovery never observes the half-split state where
+	// left's right-link points at a right block whose disk image
+	// is the bare smgr.Extend init page. When no writer is wired
+	// (test helpers, pre-runtime callers), fall back to the
+	// per-page FPI path via MarkDirty — losing split atomicity
+	// but keeping the in-memory tree correct.
+	if bt.logSplit != nil {
+		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page())
+		if lerr != nil {
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			bt.unpinW(slot)
+			return fmt.Errorf("btree: log split: %w", lerr)
+		}
+		bt.pool.MarkDirtyWithLSNLocked(slot, lsn)
+		bt.pool.MarkDirtyWithLSNLocked(rightSlot, lsn)
+	} else {
+		bt.pool.MarkDirty(slot)
+		bt.pool.MarkDirty(rightSlot)
+	}
 
 	// The separator key going up is the smallest key in the right page.
 	sepItem := item{

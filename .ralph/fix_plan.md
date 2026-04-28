@@ -537,11 +537,26 @@ Approach is staged across three landings; see
       insert+search stress test under -race and `pgbench -S
       -c 8 -j 4 -t 50` (400/400 tx, ~21k TPS) plus default mixed
       `pgbench -c 4 -j 2 -t 30` (120/120 tx).
-- [ ] Landing 3: atomic page splits with crash-safe WAL records
-      and replay. Page deletion + recycling integrated with VACUUM
-      and MVCC visibility. Index-only scans where the visibility
-      map permits. `pgbench -c 32 -j 8` mixed workload as the
-      milestone-0002 acceptance gate.
+- [x] Landing 3a: atomic split WAL records. New `RecordKindBtreeSplit`
+      (kind=3) carries `rel + leftBlk + rightBlk + leftPage +
+      rightPage` in one ~16 KB record. Emitted from
+      `insertIntoBlock`'s split path via a `LogSplit` closure
+      plumbed through `storage.PoolConfig.LogBtreeSplit` →
+      `Pool.LogBtreeSplit()` → `btree.BTree.logSplit`. Both pages
+      get `pd_lsn = endLSN` of this record via the new
+      `Pool.MarkDirtyWithLSNLocked` (the existing
+      `MarkDirtyWithLSN` was unsafe under exclusive content latch
+      hold — would self-deadlock). Replay
+      (`internal/wal/recovery.go`) applies the left page first,
+      then the right (Extend-when-missing) so a reader following
+      left's right-link from the post-replay state always finds
+      the right page on disk.
+- [ ] Landing 3b: writer-vs-writer concurrency. Drop `bt.mu` and
+      let two writers descend in parallel; un-split inserts on
+      different pages run unblocked. Page deletion + recycling
+      integrated with VACUUM and MVCC visibility. Index-only
+      scans where the visibility map permits. `pgbench -c 32 -j 8`
+      mixed workload as the milestone-0002 acceptance gate.
 - [x] Design doc `0002-0002-btree-concurrency.md` (draft) covers
       all three landings, the staged rationale, and the on-disk
       format implications.

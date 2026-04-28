@@ -107,10 +107,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Atomic B-tree split record (Landing 3a of M0002 — see
+	// docs/design/0002-0002-btree-concurrency.md). Same import-cycle
+	// dodge as logFPI.
+	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error) {
+		payload, err := wal.EncodeBtreeSplit(rel, leftBlk, rightBlk, leftPage, rightPage)
+		if err != nil {
+			return 0, err
+		}
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
 		LogPageImage:   logFPI,
+		LogBtreeSplit:  logBtreeSplit,
 		FullPageWrites: true,
 	})
 	if err != nil {

@@ -168,6 +168,59 @@ func TestConcurrentSearchAfterInserts(t *testing.T) {
 	}
 }
 
+// TestSplitInvokesLogSplit pins Landing 3a of milestone 0002:
+// when an Insert causes a leaf split, the configured LogSplit
+// closure is invoked once per split with both page images, and
+// the returned LSN is stamped onto pd_lsn of both pages so the
+// buffer pool's flush-before-write ordering covers them.
+func TestSplitInvokesLogSplit(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 32})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer pool.Close()
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 9100, Fork: storage.MainFork}
+
+	type call struct {
+		left, right storage.BlockNumber
+	}
+	var calls []call
+	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error) {
+		if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
+			t.Errorf("page sizes = %d/%d, want %d", len(leftPage), len(rightPage), storage.BlockSize)
+		}
+		calls = append(calls, call{leftBlk, rightBlk})
+		return storage.LSN(1000 + len(calls)), nil
+	}
+
+	bt, err := CreateWithOptions(pool, rel, Options{LogSplit: logSplit})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Drive enough inserts to force at least one split. v0 leaves
+	// can hold roughly 500 fixed-width int4 entries before pd_lower
+	// catches pd_upper; 1000 is safely past the threshold.
+	for i := 0; i < 1000; i++ {
+		ptr := storage.ItemPointer{Block: storage.BlockNumber(i + 1), Offset: 1}
+		if err := bt.Insert(EncodeInt4(int32(i)), ptr); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+
+	if len(calls) == 0 {
+		t.Fatal("LogSplit was never invoked despite 1000 inserts forcing a split")
+	}
+	for _, c := range calls {
+		if c.left == c.right {
+			t.Errorf("split with leftBlk == rightBlk = %d", c.left)
+		}
+	}
+}
+
 // TestConcurrentInsertSearch is the Landing 2 acceptance test for
 // milestone 0002: while one writer drives Insert (which performs
 // splits and updates the metapage), N reader goroutines hammer

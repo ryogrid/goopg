@@ -2,7 +2,7 @@
 
 | Field      | Value                                                  |
 | ---------- | ------------------------------------------------------ |
-| Status     | accepted (Landings 1 + 2); Landing 3 still planned     |
+| Status     | accepted (L1+L2+L3a); Landing 3b still planned         |
 | Date       | 2026-04-28                                             |
 | Milestone  | 0002 — Production-Grade Checkpointing & Concurrent B-tree |
 | Refines    | [root-0009-btree.md](root-0009-btree.md)               |
@@ -116,13 +116,57 @@ What this buys:
 - Writers still single-thread per tree, so split correctness is
   preserved by the existing top-down logic.
 
-### Landing 3 — Atomic splits with WAL + page-deletion (later)
+### Landing 3a — Atomic split WAL records (this loop)
 
-- WAL records for splits and merges so crash recovery replays them
-  atomically. v0 already emits FPI-on-first-dirty (see
-  [0002-0001-checkpointing.md](0002-0001-checkpointing.md)),
-  which gives us *durability* for half-split states; this landing
-  adds *redo logic* so torn splits replay to a consistent state.
+The M0002 checkpointing landing emits FPI-on-first-dirty per page
+(see [0002-0001-checkpointing.md](0002-0001-checkpointing.md)).
+That covers single-page mutations but not multi-page atomic
+operations: a split mutates the left page AND extends a brand-new
+right page that has no prior on-disk image. With independent FPIs,
+nothing guarantees both records reach durability together.
+Concretely, the buffer pool can flush left's data file once
+FPI(left) is durable, even if FPI(right) hasn't been fsync'd yet —
+a crash between the two leaves a torn state where left advertises
+a high key + right-link to a right page whose disk image is the
+empty `InitPage` produced by smgr.Extend.
+
+Landing 3a introduces a single atomic record covering both pages:
+
+- New record kind `RecordKindBtreeSplit` (3).
+- Payload: `kind | rel(9 bytes) | leftBlk | rightBlk | leftPage | rightPage`.
+- Emitted from the writer's split sequence after both pages are
+  fully populated in memory; both pages get `pd_lsn = endLSN` of
+  this record via `Pool.MarkDirtyWithLSN`, which also sets
+  `fpiSinceCheckpoint` so the per-epoch FPI hook does not emit a
+  redundant record for either page.
+- Replay (`internal/wal/recovery.go`) decodes the record and
+  applies both page images via `WriteBlock`/`Extend`, in the
+  order left-then-right, so the right page exists on disk before
+  any reader following left's right-link gets there.
+- The record is sized at ~16 KB (two `BlockSize` images plus a
+  small header). Splits are infrequent under steady-state load
+  so the WAL volume cost is acceptable; the alternative is a
+  diff-style record, which is more code but minor savings for v0.
+
+The parent-pointer update that follows the leaf split is NOT
+included in the same record. If a crash interrupts between the
+leaf split and the parent update, replay leaves the leaf in its
+post-split state with no parent entry pointing to the right
+sibling — readers find the right keys via Lehman-Yao right-link
+recovery, so reads stay correct. A future maintenance pass (or
+an explicit "incomplete split" flag, à la upstream) finishes the
+parent insertion; that work is deferred.
+
+### Landing 3b — Multi-writer concurrency (later)
+
+- Drop `bt.mu` and let two writers descend in parallel. Splits
+  serialise per-page on `Slot.Lock`, but un-split inserts on
+  different pages run unblocked.
+- Concurrent inserts on adjacent leaves can race on sibling-
+  pointer maintenance; v0 sidesteps it by NOT updating the
+  Prev pointer of the old `op.Next` neighbour during split
+  (Prev is unused by reads — only forward `Next` is followed).
+  Landing 3a keeps that simplification.
 - Page deletion + recycling integrated with VACUUM and MVCC
   visibility (`internal/vacuum`).
 - Index-only scans where the visibility map permits.

@@ -7,6 +7,90 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// TestReplayBtreeSplitAtomic pins Landing 3a of M0002: a single
+// BtreeSplit record carries both pages, and replay applies the
+// right page even when it does not yet exist on disk (the split's
+// "Extend" half). Without this record the bare smgr.Extend image
+// would be the only thing on disk for the right block, leaving a
+// torn state where left's right-link points at an empty page.
+func TestReplayBtreeSplitAtomic(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 902, Fork: storage.MainFork}
+
+	// Establish block 0 (the metapage stand-in) so block 1 is the
+	// "left" we'll write a post-split image to. Then the split
+	// record extends block 2 as the right sibling.
+	zero := mustPageWithByte(t, 0)
+	if _, err := mgr.Extend(rel, zero); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, zero); err != nil { // block 1 reserved
+		t.Fatal(err)
+	}
+
+	leftAfter := mustPageWithByte(t, 0x44)
+	rightAfter := mustPageWithByte(t, 0x55)
+
+	rec, err := EncodeBtreeSplit(rel, 1, 2, leftAfter, rightAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Applied != 1 {
+		t.Fatalf("Applied=%d want 1", stats.Applied)
+	}
+
+	got1 := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 1, got1); err != nil {
+		t.Fatal(err)
+	}
+	if got1[100] != 0x44 {
+		t.Fatalf("left byte = %#x, want 0x44", got1[100])
+	}
+
+	got2 := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 2, got2); err != nil {
+		t.Fatal(err)
+	}
+	if got2[100] != 0x55 {
+		t.Fatalf("right byte = %#x, want 0x55 (right page must have been Extend'd by replay)", got2[100])
+	}
+}
+
+// TestEncodeDecodeBtreeSplitRoundTrip pins the on-the-wire shape
+// of the new record so a future-format change can't silently
+// rearrange fields and break replay against pre-existing WAL.
+func TestEncodeDecodeBtreeSplitRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 7, RelOid: 8, Fork: storage.MainFork}
+	left := mustPageWithByte(t, 0x10)
+	right := mustPageWithByte(t, 0x20)
+	enc, err := EncodeBtreeSplit(rel, 41, 42, left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enc[0] != RecordKindBtreeSplit {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindBtreeSplit)
+	}
+	gotRel, gotL, gotR, leftP, rightP, err := DecodeBtreeSplit(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRel != rel || gotL != 41 || gotR != 42 {
+		t.Errorf("decoded rel/blocks=%v %d %d", gotRel, gotL, gotR)
+	}
+	if leftP[100] != 0x10 || rightP[100] != 0x20 {
+		t.Errorf("decoded page bytes mismatched")
+	}
+}
+
 func TestReplayRecordsAppliesPageImages(t *testing.T) {
 	dataDir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})

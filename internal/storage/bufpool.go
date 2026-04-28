@@ -76,6 +76,10 @@ type Pool struct {
 	// record's end LSN. nil disables FPI emission. Set via
 	// PoolConfig.LogPageImage.
 	logFPI func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
+	// logBtreeSplit emits an atomic B-tree split WAL record
+	// covering both halves of a split. Pulled out via
+	// LogBtreeSplit() for the btree access method.
+	logBtreeSplit LogBtreeSplitFunc
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -114,6 +118,13 @@ type PoolConfig struct {
 	// false, no FPI is emitted regardless of LogPageImage.
 	FullPageWrites bool
 
+	// LogBtreeSplit, when non-nil, is exposed via Pool.LogBtreeSplit
+	// so the B-tree access method can emit an atomic split record
+	// (Landing 3a of milestone 0002 — see
+	// docs/design/0002-0002-btree-concurrency.md). nil disables the
+	// hook and the btree falls back to per-page FPI on splits.
+	LogBtreeSplit LogBtreeSplitFunc
+
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -124,6 +135,13 @@ type PoolConfig struct {
 type WALFlusher interface {
 	FlushUpTo(lsn uint64) error
 }
+
+// LogBtreeSplitFunc emits one atomic WAL record covering a B-tree
+// page split (left's post-image + right's full image) and returns
+// the record's end LSN. The signature lives in storage so packages
+// like internal/access/btree can consume it without an import
+// cycle through internal/wal.
+type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page) (LSN, error)
 
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by an
 // mmap'd arena. Returns an error if slots <= 0 or the arena alloc
@@ -141,13 +159,14 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logger = slog.Default()
 	}
 	p := &Pool{
-		mgr:    mgr,
-		arena:  a,
-		slots:  make([]*Slot, cfg.Slots),
-		byTag:  make(map[BufferTag]int, cfg.Slots),
-		wal:    cfg.WAL,
-		logFPI: cfg.LogPageImage,
-		logger: logger,
+		mgr:           mgr,
+		arena:         a,
+		slots:         make([]*Slot, cfg.Slots),
+		byTag:         make(map[BufferTag]int, cfg.Slots),
+		wal:           cfg.WAL,
+		logFPI:        cfg.LogPageImage,
+		logBtreeSplit: cfg.LogBtreeSplit,
+		logger:        logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
 	for i := range p.slots {
@@ -155,6 +174,11 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	}
 	return p, nil
 }
+
+// LogBtreeSplit returns the configured atomic split-record hook,
+// or nil if none was wired. Callers (the B-tree access method)
+// are expected to fall back to per-page FPI when nil.
+func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 // Mirrors upstream's full_page_writes SIGHUP-context GUC.
@@ -370,10 +394,28 @@ func (p *Pool) MarkDirty(s *Slot) {
 // wants the buffer pool to track its LSN for the flush ordering.
 // FPI emission is skipped — the caller's record is the durability
 // anchor.
+//
+// Callers that DON'T already hold s.contentMu (e.g. test code that
+// pins the slot but never explicitly latches it) should use this
+// entry point. Callers that ARE in the middle of an exclusive
+// content-latch hold (e.g. the B-tree split path) must use
+// MarkDirtyWithLSNLocked to avoid the obvious self-deadlock.
 func (p *Pool) MarkDirtyWithLSN(s *Slot, lsn LSN) {
 	s.contentMu.Lock()
 	MustHeader(s.page).SetLSN(lsn)
 	s.contentMu.Unlock()
+	p.markDirtyWithLSNCommon(s)
+}
+
+// MarkDirtyWithLSNLocked is the variant for callers that already
+// hold s.contentMu in exclusive mode. The page-header LSN write
+// happens without re-taking the latch.
+func (p *Pool) MarkDirtyWithLSNLocked(s *Slot, lsn LSN) {
+	MustHeader(s.page).SetLSN(lsn)
+	p.markDirtyWithLSNCommon(s)
+}
+
+func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 	p.poolMu.Lock()
 	s.dirty = true
 	// Stamping our own LSN supersedes any prior FPI for this
