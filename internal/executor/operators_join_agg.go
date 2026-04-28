@@ -421,9 +421,14 @@ type aggregateOp struct {
 type aggRuntime struct {
 	hasValue bool
 	value    Datum
-	sum      int64
-	count    int64
-	distinct map[string]struct{}
+	// sum tracks INT-only running sums; numericSum tracks the
+	// NUMERIC accumulator. Each aggregate-call uses exactly one
+	// of them based on the first non-NULL argument's kind. The
+	// two are not mixed within a single aggregate.
+	sum        int64
+	numericSum Datum
+	count      int64
+	distinct   map[string]struct{}
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -550,10 +555,21 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 		st.count++
 		st.hasValue = true
 	case "sum", "avg":
-		if arg.Kind != KindInt {
-			return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires integer argument in v0", name)}
+		switch arg.Kind {
+		case KindInt:
+			st.sum += arg.Int
+		case KindNumeric:
+			if !st.hasValue || st.numericSum.Kind != KindNumeric {
+				st.numericSum = Datum{Kind: KindNumeric, NumericMantissa: 0, NumericScale: arg.NumericScale}
+			}
+			s, err := numericAdd(st.numericSum, arg)
+			if err != nil {
+				return &ExecError{Code: "22003", Pos: call.Pos(), Message: err.Error()}
+			}
+			st.numericSum = s
+		default:
+			return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
 		}
-		st.sum += arg.Int
 		st.count++
 		st.hasValue = true
 	case "min":
@@ -596,10 +612,20 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if !st.hasValue {
 			return NullDatum
 		}
+		if st.numericSum.Kind == KindNumeric {
+			return st.numericSum
+		}
 		return Datum{Kind: KindInt, Int: st.sum}
 	case "avg":
 		if st.count == 0 {
 			return NullDatum
+		}
+		if st.numericSum.Kind == KindNumeric {
+			d, err := numericDiv(st.numericSum, numericFromInt(st.count), call.Pos())
+			if err != nil {
+				return NullDatum
+			}
+			return d
 		}
 		return Datum{Kind: KindInt, Int: st.sum / st.count}
 	case "min", "max":

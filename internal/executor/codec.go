@@ -107,17 +107,17 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		binary.BigEndian.PutUint64(buf[:], uint64(d.Time.UnixNano()))
 		return buf[:], nil
 	case "numeric", "decimal":
-		// v0 stores NUMERIC values as their decimal-string
-		// representation in the same varlen text frame as
-		// varchar/char. Real precision-tracking arithmetic
-		// requires the type system milestone-7 will land;
-		// until then this lossless string round-trip is what
-		// HammerDB / TPC-H need to load and unload data
-		// without spurious encode failures. Integer datums
-		// (e.g. `INSERT INTO t (numeric_col) VALUES (1)`)
-		// flow through `strconv.FormatInt` so the round-trip
-		// preserves the literal.
+		// NUMERIC values flow on the wire as decimal text in the
+		// same varlen frame VARCHAR uses. KindNumeric formats via
+		// formatNumeric so the stored bytes are stable across
+		// arithmetic chains. KindInt / KindString round-trip
+		// straight through (the analyzer accepts both as
+		// assignable to numeric, e.g. HammerDB's loader sends
+		// pre-formatted strings). See
+		// docs/design/0003-0012-numeric-arithmetic.md.
 		switch d.Kind {
+		case KindNumeric:
+			return encodeVarlen([]byte(formatNumeric(d.NumericMantissa, d.NumericScale))), nil
 		case KindInt:
 			return encodeVarlen([]byte(strconv.FormatInt(d.Int, 10))), nil
 		case KindString:
@@ -176,10 +176,11 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		ns := int64(binary.BigEndian.Uint64(data[:8]))
 		return Datum{Kind: KindTime, Time: time.Unix(0, ns).UTC()}, 8, nil
 	case "numeric", "decimal":
-		// Stored as varlen text (see encodeValue). Surface as
-		// KindString so the wire layer formats it verbatim;
-		// callers that want comparison arithmetic must coerce
-		// in the planner.
+		// Stored as varlen text. Parse into KindNumeric so
+		// arithmetic and comparison can run through the
+		// scale-aligning helpers without re-parsing on every
+		// row. Strings that aren't valid numerics surface as
+		// 22P02 — same SQLSTATE upstream reports.
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated numeric")
 		}
@@ -187,7 +188,12 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		if 4+n > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated numeric body")
 		}
-		return Datum{Kind: KindString, String: string(data[4 : 4+n])}, 4 + n, nil
+		text := string(data[4 : 4+n])
+		m, s, err := parseNumeric(text)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
+		}
+		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, 4 + n, nil
 	default:
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated varlen header")

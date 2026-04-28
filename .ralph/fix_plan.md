@@ -962,6 +962,22 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] NUMERIC arithmetic for TPC-H aggregates with arithmetic.
+      (achieved 2026-04-29: new KindNumeric carrier
+      (`int64 mantissa, int8 scale`) replaces the prior
+      KindString-only path. NumericConst literals,
+      codec decode, +/-/*/divide arithmetic with scale
+      alignment, NUMERIC↔INT comparison, and sum/avg
+      accumulators all wired through. Verified end-to-end
+      via psql 18.3 against TPC-H Q1's central shape:
+      `sum(l_extendedprice * (1 - l_discount))` correctly
+      computes 320.4500 / 1040.2000 across two groups, and
+      `avg(l_extendedprice)` returns 175.250000 / 525.125000.
+      Bounded by int64 (sufficient for SF1 magnitudes;
+      worst-case Q1 accumulator ~6.5e15 << int64 max).
+      Arbitrary-precision NUMERIC, `numeric(p,s)` typmod
+      enforcement, `%`/`^`, and the binary wire format are
+      deferred — see `docs/design/0003-0012-numeric-arithmetic.md`.)
 - [x] `LIKE` / `NOT LIKE` pattern matching for TPC-H text filters.
       (achieved 2026-04-29: `expr [NOT] LIKE pattern` parses at
       comparison precedence (postfix-style alongside `[NOT] IN`),

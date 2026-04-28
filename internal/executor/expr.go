@@ -59,11 +59,11 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
 	case *planner.NumericConst:
-		// v0 surfaces the literal as a string Datum so the
-		// codec stores it verbatim in the varlen text frame
-		// shared with VARCHAR/CHAR. Real numeric arithmetic
-		// waits on the type system.
-		return Datum{Kind: KindString, String: x.Value}, nil
+		m, s, err := parseNumeric(x.Value)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(), Message: err.Error()}
+		}
+		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
 	case *planner.StringConst:
 		return Datum{Kind: KindString, String: x.Value}, nil
 	case *planner.NullConst:
@@ -154,8 +154,34 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		if op == "+" && left.Kind == KindInterval && right.Kind == KindTime {
 			return addTimeInterval(right, left, false), nil
 		}
+		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
+		// the int side to KindNumeric{scale=0} and reuse the same
+		// scale-aligning helpers.
+		if left.Kind == KindNumeric || right.Kind == KindNumeric {
+			a, b, err := promoteToNumeric(left, right, op, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			if op == "+" {
+				return numericAdd(a, b)
+			}
+			return numericSub(a, b)
+		}
 		fallthrough
 	case "*", "/", "%":
+		if left.Kind == KindNumeric || right.Kind == KindNumeric {
+			a, b, err := promoteToNumeric(left, right, op, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			switch op {
+			case "*":
+				return numericMul(a, b)
+			case "/":
+				return numericDiv(a, b, pos)
+			}
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s not supported on numeric", op)}
+		}
 		if left.Kind != KindInt || right.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
 		}
@@ -277,6 +303,22 @@ func arithmetic(op string, a, b int64, pos int) (Datum, error) {
 // compareDatum returns -1/0/1 the same way upstream's btree
 // comparators do, scoped to the v0 type set.
 func compareDatum(a, b Datum, pos int) (int, error) {
+	// NUMERIC ↔ INT: promote int to numeric so the comparison is
+	// scale-aware. NUMERIC ↔ NUMERIC: align scales then compare
+	// mantissas. Identical kinds drop through to the per-kind
+	// switch below.
+	if a.Kind == KindNumeric || b.Kind == KindNumeric {
+		if a.Kind == KindInt {
+			a = numericFromInt(a.Int)
+		}
+		if b.Kind == KindInt {
+			b = numericFromInt(b.Int)
+		}
+		if a.Kind != KindNumeric || b.Kind != KindNumeric {
+			return 0, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("comparison across kinds %d vs %d", a.Kind, b.Kind)}
+		}
+		return numericCmp(a, b)
+	}
 	if a.Kind != b.Kind {
 		return 0, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("comparison across kinds %d vs %d", a.Kind, b.Kind)}
 	}

@@ -7,14 +7,15 @@ import (
 )
 
 // TestEncodeDecodeNumericRoundTrip pins the M0003 NUMERIC codec
-// behaviour: integer literals (e.g. `INSERT INTO t (n) VALUES (1)`)
-// flow through the encoder as their decimal-string form, and
-// SELECT * round-trips them as KindString. Without this case TPC-H
-// loaders fail with "integer datum cannot encode as numeric".
+// behaviour: integer / string / KindNumeric datums all encode as
+// decimal text in the varlen frame, and decode parses back into
+// KindNumeric so arithmetic and comparison can run through the
+// scale-aligning helpers without re-parsing on every row.
 func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 	cols := []catalog.Column{
 		{Name: "n", Type: catalog.Type{Name: "numeric"}},
 	}
+	// Integer datum (`INSERT INTO t (n) VALUES (42)`).
 	row := Row{{Kind: KindInt, Int: 42}}
 	bytes, err := EncodeRow(cols, row)
 	if err != nil {
@@ -24,11 +25,11 @@ func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].Kind != KindString || got[0].String != "42" {
-		t.Errorf("decoded=%+v; want KindString '42'", got[0])
+	if got[0].Kind != KindNumeric || got[0].NumericMantissa != 42 || got[0].NumericScale != 0 {
+		t.Errorf("decoded=%+v; want KindNumeric{42,0}", got[0])
 	}
 
-	// String values with decimals also round-trip verbatim.
+	// String values with decimals (e.g. HammerDB loader).
 	rowStr := Row{{Kind: KindString, String: "1234567890.12345"}}
 	bytes2, err := EncodeRow(cols, rowStr)
 	if err != nil {
@@ -38,7 +39,22 @@ func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got2[0].String != "1234567890.12345" {
-		t.Errorf("decoded=%q; want '1234567890.12345'", got2[0].String)
+	if got2[0].Format() != "1234567890.12345" {
+		t.Errorf("decoded=%q; want '1234567890.12345'", got2[0].Format())
+	}
+
+	// KindNumeric datums (output of NUMERIC arithmetic) format
+	// back to their canonical decimal-text form.
+	rowNum := Row{{Kind: KindNumeric, NumericMantissa: -12345, NumericScale: 3}}
+	bytes3, err := EncodeRow(cols, rowNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got3, err := DecodeRow(cols, bytes3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got3[0].Format() != "-12.345" {
+		t.Errorf("decoded=%q; want '-12.345'", got3[0].Format())
 	}
 }
