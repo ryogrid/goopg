@@ -1225,18 +1225,33 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       pg_ctl start / libpq query / pg_ctl stop). Fail-closed
       only on goopg-errors-while-upstream-OK regressions;
       row-content divergences logged as a triage list. Current
-      matrix at synthetic dataset: identical=11, divergent=11,
-      goopg-errored=0, upstream-errored=0. Divergences group
-      into three clusters that can be tackled independently:
-      (1) NUMERIC precision in division (Q1, Q14) — Q1 returns
-      11.666666 vs upstream 11.6666666666666667; v0's
-      `numericDiv` hardcodes scale 6, real fix waits on
-      arbitrary-precision NUMERIC; (2) Row-count divergences
-      from join / GROUP BY semantics (Q3, Q5, Q7, Q8, Q9,
-      Q10, Q13) — goopg consistently returns more rows than
-      upstream, suggests GROUP BY de-dup or join filter gap;
-      (3) NOT IN / HAVING scalar subquery semantics (Q11, Q16)
-      — likely 3VL on NULL or scalar materialisation drift.
+      matrix at synthetic dataset: identical=18, divergent=4,
+      goopg-errored=0, upstream-errored=0 (after the
+      NUMERIC-hash-key fix landed in the same loop).
+
+      The original 11-query divergent cluster collapsed when
+      one root cause was found and fixed: `datumKey` (used by
+      hash-join, count-distinct, and group-by hashing) had no
+      `KindNumeric` arm in its switch, so every NUMERIC value
+      fell through to a single fallback bucket — turning every
+      NUMERIC-keyed hash join into a cross product. Since
+      every TPC-H join key column is declared NUMERIC, the bug
+      affected every multi-table query. New helper
+      `canonicalNumericKey(mantissa, scale)` strips trailing-
+      zero pairs so two numerics that compare equal hash equal
+      (`1`, `1.0`, `1.00` all → `m:1:0`). KindInt now also
+      routes through canonicalNumericKey at scale 0 so
+      cross-kind hashes match. Closed 7 row-count divergences
+      (Q3, Q5, Q7, Q9, Q10, Q11, Q13) in one ~30-line fix.
+
+      Remaining 4 divergences:
+      (1) NUMERIC precision in division (Q1, Q8, Q14) — gated
+          on arbitrary-precision NUMERIC, deferred per design
+          0003-0012;
+      (2) NOT IN (subquery) semantics (Q16) — goopg returns 0
+          rows where upstream returns 3; likely 3VL-on-NULL
+          handling. Open as the next divergence to close.
+
       See `docs/design/0003-0017-result-parity-testing.md`
       for the full triage workstream. SF1 parity still gated
       on Docker / WSL2 reachability.)

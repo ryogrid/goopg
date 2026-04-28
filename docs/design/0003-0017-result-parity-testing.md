@@ -50,42 +50,53 @@ small enough that some result discrepancies are expected
 upstream uses scale 17). As individual divergences are closed
 the must-match list will grow.
 
-## Current parity matrix (synthetic 75-row dataset, 2026-04-29)
+## Current parity matrix (synthetic 75-row dataset)
+
+After the 2026-04-29 NUMERIC-hash-key fix
+(`canonicalNumericKey` in
+`internal/executor/operators_join_agg.go`), 18/22 queries match
+identically. The 4 remaining divergences cluster cleanly:
 
 | Q   | Status      | Notes                                                                          |
 | --- | ----------- | ------------------------------------------------------------------------------ |
 | Q1  | DIVERGENT   | NUMERIC precision: `avg(...)` returns 11.666666 vs upstream 11.6666666666666667 |
-| Q2  | IDENTICAL   | 0 rows on both                                                                  |
-| Q3  | DIVERGENT   | Row counts: goopg=5, upstream=1 — likely GROUP BY semantics gap               |
-| Q4  | IDENTICAL   | 1 row                                                                           |
-| Q5  | DIVERGENT   | Row counts: goopg=5, upstream=1 — likely same root cause as Q3                |
-| Q6  | IDENTICAL   | 1 row                                                                           |
-| Q7  | DIVERGENT   | Row counts: goopg=4, upstream=1                                                |
-| Q8  | DIVERGENT   | Row counts: goopg=2, upstream=1                                                |
-| Q9  | DIVERGENT   | Row counts: goopg=20, upstream=6                                              |
-| Q10 | DIVERGENT   | Row counts: goopg=25, upstream=1                                              |
-| Q11 | DIVERGENT   | Row counts: goopg=1, upstream=2 — HAVING/scalar subquery comparison           |
-| Q12 | IDENTICAL   | 0 rows                                                                          |
-| Q13 | DIVERGENT   | Row counts: goopg=1, upstream=2                                                |
-| Q14 | DIVERGENT   | NUMERIC precision: 40.000000 vs 51.8344178319257926                            |
-| Q15 | IDENTICAL   | 0 rows                                                                          |
-| Q16 | DIVERGENT   | Row counts: goopg=0, upstream=3 — likely `NOT IN (subquery)` semantics        |
-| Q17 | IDENTICAL   | 1 row                                                                           |
-| Q18 | IDENTICAL   | 0 rows                                                                          |
-| Q19 | IDENTICAL   | 1 row                                                                           |
-| Q20 | IDENTICAL   | 0 rows                                                                          |
-| Q21 | IDENTICAL   | 0 rows                                                                          |
-| Q22 | IDENTICAL   | 0 rows                                                                          |
+| Q2..Q7  | IDENTICAL | (Q2 and Q3 0/1 row baselines, Q4-Q7 fact aggregations)                       |
+| Q8  | DIVERGENT   | NUMERIC precision: 1.000000 vs 1.00000000000000000000                          |
+| Q9..Q13 | IDENTICAL | (Q9 multi-row, Q11 HAVING-scalar-subquery, Q13 LEFT JOIN)                    |
+| Q14 | DIVERGENT   | NUMERIC precision: 51.834417 vs 51.8344178319257926                            |
+| Q15 | IDENTICAL   |                                                                                 |
+| Q16 | DIVERGENT   | Row counts: goopg=0, upstream=3 — `NOT IN (subquery)` semantics               |
+| Q17..Q22 | IDENTICAL |                                                                                |
 
-**Summary**: identical=11, divergent=11, goopg-errored=0,
-upstream-errored=0.
+**Summary**: identical=18, divergent=4, goopg-errored=0,
+upstream-errored=0. Three of the four divergences are pure NUMERIC
+precision deltas (gated on arbitrary-precision NUMERIC, deferred
+per design 0003-0012). Q16 is the only remaining structural gap.
+
+### What the NUMERIC-hash-key fix corrected
+
+`datumKey` (used by hash-join, count-distinct, and group-by hashing)
+previously fell through to `"k:6"` for every `KindNumeric` value
+because the switch had no `KindNumeric` arm. Since every TPC-H join
+key column (c_custkey, o_custkey, l_orderkey, ps_partkey, etc.) is
+declared `NUMERIC`, every hash-join with a NUMERIC key degenerated
+to a cross product. Q3, Q5, Q7, Q8, Q9, Q10, Q11, Q13 all closed
+with this single fix.
+
+The new helper `canonicalNumericKey(mantissa, scale)` strips
+trailing-zero pairs (one digit + one scale step at a time) so two
+numerics that compare equal hash equal: `1` (m=1,s=0), `1.0`
+(m=10,s=1), and `1.00` (m=100,s=2) all canonicalise to `m:1:0`.
+KindInt now also routes through this helper at scale 0 so
+cross-kind hashes match (`aid = $1` works whether `$1` lands as
+KindInt or scale-0 KindNumeric).
 
 ## Triage workstream
 
-Divergences group into three clusters that can be tackled
-independently:
+After the NUMERIC-hash-key fix, the remaining divergences cluster
+into:
 
-### NUMERIC precision (Q1, Q14)
+### NUMERIC precision (Q1, Q8, Q14)
 
 Root cause: `numericDiv` in `internal/executor/numeric.go` uses
 `scale = max(scales, 6)` while upstream's NUMERIC division
@@ -95,39 +106,23 @@ fixed scale that better matches HammerDB-shaped ratios. v0
 deliberately deferred this in
 `docs/design/0003-0012-numeric-arithmetic.md`.
 
-### Row-count divergences from join / GROUP BY semantics (Q3, Q5, Q7, Q8, Q9, Q10, Q13)
+### NOT IN (subquery) semantics (Q16)
 
-These are the highest-impact divergences and the most likely to
-reveal real bugs. The pattern (goopg returning more rows than
-upstream) suggests one of:
+Q16 uses `NOT IN (subquery)`. Goopg returns 0 rows where upstream
+returns 3. Likely cause: three-valued logic on NULL in the inner
+subquery's result set, or a `NOT IN` rewrite that filters too
+aggressively. Small, contained — open as the next divergence to
+close.
 
-- GROUP BY de-duplication failing for some grouping-key shapes
-  (e.g., string-format keys vs typed-Datum keys);
-- Hash-join producing duplicate matches (e.g., hash bucket
-  match plus nested-loop match in the fallback path);
-- Predicate-pushdown losing a conjunct between the rewrite and
-  the resulting Filter node;
-- Cross-join residual still emitting all-pairs when an
-  expression couldn't be classified as disjoint-side.
+### Closed in 2026-04-29
 
-The systematic next step is to add an EXPLAIN-emitting variant
-of the parity test for the 7 row-count-divergent queries and
-compare the plan tree shapes.
-
-### NOT IN / HAVING subquery semantics (Q11, Q16)
-
-Two subquery shapes that may have edge cases v0 doesn't cover:
-- Q11's HAVING clause references a scalar subquery whose
-  return value is then compared via `>`. If goopg's scalar
-  subquery materialisation differs in scale or NULL handling,
-  the HAVING-true count diverges.
-- Q16 uses `NOT IN (subquery)`. If the subquery returns NULL,
-  upstream PG specs `NOT IN (NULL)` evaluates to NULL, which
-  filters out rows. Goopg's executor may not honour the
-  three-valued logic exactly.
-
-Each of these is a small, contained fix once the divergence is
-isolated.
+The previous "row-count divergences from join / GROUP BY semantics"
+cluster (Q3, Q5, Q7, Q9, Q10, Q11, Q13 — formerly 7 queries) was
+all one bug: NUMERIC datums weren't hashed correctly so any
+hash-join with NUMERIC keys degenerated to cross product. Single
+~30-line fix in `datumKey` + `canonicalNumericKey`. The
+HAVING-scalar-subquery shape in Q11 was a downstream symptom, not
+a separate gap.
 
 ## Out of scope
 

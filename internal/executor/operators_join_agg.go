@@ -691,13 +691,42 @@ func datumKey(d Datum) string {
 		}
 		return "b:f"
 	case KindInt:
-		return fmt.Sprintf("i:%d", d.Int)
+		// Cross-kind hash compatibility: integers and numerics
+		// must hash equal when they represent the same value, so
+		// `aid = $1` matches whether $1 lands as KindInt or as a
+		// scale-0 KindNumeric. Normalise both to the same shape.
+		return canonicalNumericKey(d.Int, 0)
+	case KindNumeric:
+		return canonicalNumericKey(d.NumericMantissa, int(d.NumericScale))
 	case KindString:
 		return "s:" + d.String
 	case KindBytes:
 		return "x:" + string(d.Bytes)
 	case KindTime:
 		return fmt.Sprintf("t:%d", d.Time.UnixNano())
+	case KindInterval:
+		return fmt.Sprintf("v:%d:%d", d.IntervalMonths, d.IntervalDays)
 	}
 	return fmt.Sprintf("k:%d", d.Kind)
+}
+
+// canonicalNumericKey produces a string identifier that's identical
+// for two numerics that compare equal. `1` (m=1,s=0), `1.0`
+// (m=10,s=1), and `1.00` (m=100,s=2) all canonicalise to the same
+// key. Trailing zero pairs (one digit + one scale step) are stripped
+// until either the scale reaches 0 or the trailing digit is non-zero.
+// Negative-scale results are flagged as `e<N>` so `100` (m=100,s=0)
+// and `100` (m=1,s=-2) — should the latter ever arise — both map
+// to the same canonical form. v0 never produces negative scales,
+// but the helper is kept robust.
+func canonicalNumericKey(mantissa int64, scale int) string {
+	// Special case: 0 at any scale collapses to a single value.
+	if mantissa == 0 {
+		return "m:0:0"
+	}
+	for scale > 0 && mantissa%10 == 0 {
+		mantissa /= 10
+		scale--
+	}
+	return fmt.Sprintf("m:%d:%d", mantissa, scale)
 }
