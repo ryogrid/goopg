@@ -259,6 +259,61 @@ func TestPoolPinAllExhaustsBuffers(t *testing.T) {
 	}
 }
 
+// TestPoolEvictHighUsageDoesNotSpuriouslyExhaust verifies that the
+// clock sweep keeps searching long enough to find a victim when every
+// unpinned slot has usageCount=maxUsageCount.
+func TestPoolEvictHighUsageDoesNotSpuriouslyExhaust(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 301, Fork: MainFork}
+
+	// Create 4 blocks directly in smgr so pinning block 3 requires
+	// evicting one of the cached blocks 0..2.
+	for i := 0; i < 4; i++ {
+		pg := make(Page, BlockSize)
+		if err := InitPage(pg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mgr.Extend(rel, pg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Fill the pool with blocks 0..2.
+	for blk := 0; blk < 3; blk++ {
+		s, err := pool.Pin(BufferTag{Rel: rel, Block: BlockNumber(blk)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool.Unpin(s)
+	}
+
+	// Re-pin enough times to saturate usageCount to maxUsageCount.
+	for i := 0; i < int(maxUsageCount); i++ {
+		for blk := 0; blk < 3; blk++ {
+			s, err := pool.Pin(BufferTag{Rel: rel, Block: BlockNumber(blk)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pool.Unpin(s)
+		}
+	}
+
+	// The next distinct pin should evict after enough decrements,
+	// not fail with ErrNoBuffer.
+	s, err := pool.Pin(BufferTag{Rel: rel, Block: 3})
+	if err != nil {
+		t.Fatalf("Pin(block=3) = %v, want success", err)
+	}
+	pool.Unpin(s)
+}
+
 // TestPoolFlushAllClearsDirty verifies FlushAll writes dirty pages and
 // clears their dirty bits.
 func TestPoolFlushAllClearsDirty(t *testing.T) {

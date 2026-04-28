@@ -29,6 +29,12 @@ import (
 func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sql string) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
+		if tag, ok := compatNoopCommandTag(sql); ok {
+			if err := w.WriteCommandComplete(tag); err != nil {
+				return err
+			}
+			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		}
 		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
 	}
 	if len(stmts) == 0 {
@@ -79,6 +85,35 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sql str
 	}
 	commit = true
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+}
+
+func compatNoopCommandTag(sql string) (string, bool) {
+	norm := normalizeCompatSQL(sql)
+	switch {
+	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
+		return "CREATE ROLE", true
+	case strings.HasPrefix(norm, "grant "):
+		return "GRANT", true
+	case strings.HasPrefix(norm, "create database "):
+		return "CREATE DATABASE", true
+	case strings.HasPrefix(norm, "alter database "):
+		return "ALTER DATABASE", true
+	case strings.HasPrefix(norm, "drop database "):
+		return "DROP DATABASE", true
+	case strings.HasPrefix(norm, "drop user "), strings.HasPrefix(norm, "drop role "):
+		return "DROP ROLE", true
+	case strings.HasPrefix(norm, "set constraints "):
+		return "SET CONSTRAINTS", true
+	}
+	return "", false
+}
+
+func normalizeCompatSQL(sql string) string {
+	s := strings.TrimSpace(sql)
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
 }
 
 // executeOneSimpleStmt plans and runs one statement, emitting the

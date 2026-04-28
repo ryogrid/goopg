@@ -722,15 +722,16 @@ const maxUsageCount = 5
 // evictLocked finds a victim slot. The pool mutex must be held.
 // Returns the slot index, or ErrNoBuffer if every slot is pinned.
 //
-// Algorithm: clock sweep. We do at most 2*N+M passes where M==maxUsageCount,
-// matching upstream's bound (each pass decrements usageCount by 1 and
-// after maxUsageCount+1 passes any unpinned slot has usageCount==0).
+// Algorithm: clock sweep. In the worst case every unpinned slot starts
+// at usageCount==maxUsageCount, so finding a victim can require one full
+// sweep per decrement plus one final sweep to observe a zero.
+// Bound probes at N*(maxUsageCount+1).
 func (p *Pool) evictLocked() (int, error) {
 	n := len(p.slots)
 	if n == 0 {
 		return 0, ErrNoBuffer
 	}
-	maxPasses := 2*n + int(maxUsageCount)
+	maxPasses := n * (int(maxUsageCount) + 1)
 	for i := 0; i < maxPasses; i++ {
 		idx := p.clockHand
 		p.clockHand = (p.clockHand + 1) % n
