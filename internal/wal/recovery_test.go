@@ -7,6 +7,83 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// TestEncodeDecodeHeapDeleteRoundTrip pins the on-the-wire shape
+// of the heap-delete record.
+func TestEncodeDecodeHeapDeleteRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 50, RelOid: 51, Fork: storage.MainFork}
+	enc := EncodeHeapDelete(rel, 13, 7, storage.TransactionID(99))
+	if enc[0] != RecordKindHeapDelete {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindHeapDelete)
+	}
+	gotRel, gotBlk, gotSlot, gotXmax, err := DecodeHeapDelete(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRel != rel || gotBlk != 13 || gotSlot != 7 || gotXmax != 99 {
+		t.Errorf("decoded rel/blk/slot/xmax=%v %d %d %d", gotRel, gotBlk, gotSlot, gotXmax)
+	}
+}
+
+// TestReplayHeapDeleteIdempotent walks one HeapDelete record
+// through replay against a page that already has a tuple at
+// slot 1, verifies xmax is stamped and a second replay is a
+// no-op via pd_lsn.
+func TestReplayHeapDeleteIdempotent(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 905, Fork: storage.MainFork}
+
+	// Seed block 0 with one tuple at slot 1.
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	tup := storage.NewHeapTuple(7, storage.InvalidTransactionID, []byte("alive"))
+	if _, err := storage.PageAddHeapTuple(page, tup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := EncodeHeapDelete(rel, 0, 1, storage.TransactionID(42))
+	stats, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Applied != 1 {
+		t.Fatalf("first replay Applied=%d want 1", stats.Applied)
+	}
+
+	// Second replay must be a no-op.
+	if _, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	}); err != nil {
+		t.Fatalf("second replay returned err=%v (expected silent skip)", err)
+	}
+
+	// Verify xmax actually stamped.
+	got := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := storage.PageGetItemRaw(got, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := storage.ParseHeapTuple(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Header.Xmax != 42 {
+		t.Errorf("xmax = %d want 42", parsed.Header.Xmax)
+	}
+}
+
 // TestEncodeDecodeBtreeInsertRoundTrip pins the on-the-wire
 // shape of the new redo record so future format edits can't
 // silently rearrange fields.

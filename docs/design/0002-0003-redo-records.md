@@ -42,16 +42,23 @@ corresponding mutation site:
 
 - **0002-0003a** (loop landing this doc): `RecordKindHeapInsert` +
   `writeHeapRow`. pgbench-i WAL: ~1.6 GB → ~801 MB.
-- **0002-0003b** (next loop): `RecordKindBtreeInsert` +
+- **0002-0003b**: `RecordKindBtreeInsert` +
   `btree.insertIntoBlock` non-split path. pgbench-i WAL:
   ~801 MB → ~21 MB. `btree.ApplyInsertRecord` is the public
   replay helper that `wal/recovery.go` calls.
+- **0002-0003c** (this landing): `RecordKindHeapDelete` (fixed
+  20-byte record: rel + blk + lineSlot + xmax). Migrated both
+  `updateOp` (xmax stamp on the old image) and `deleteOp`
+  (xmax stamp on the visible match) via a new
+  `markHeapDeleteDirty` helper. `pgbench -t 30` default-mixed
+  workload now keeps WAL flat at ~21 MB.
 
-Remaining paths still emit FPI-every-dirty: heap UPDATE/DELETE
-xmax stamps, vacuum page prune, btree metapage updates. Each
-will get its own record kind in subsequent loops; once all paths
-are migrated, `Pool.MarkDirty` flips back to once-per-epoch FPI
-globally and the per-method selector dissolves.
+Remaining paths still emit FPI-every-dirty: vacuum page prune,
+btree metapage updates, btree internal-node insert, btree
+clearRootFlag. Each gets its own record kind in subsequent
+loops; once all paths are migrated, `Pool.MarkDirty` flips back
+to once-per-epoch FPI globally and the per-method selector
+dissolves.
 
 ### Record format
 

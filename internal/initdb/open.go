@@ -155,6 +155,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Logical heap-delete (xmax stamp) change record.
+	logHeapDelete := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID) (storage.LSN, error) {
+		payload := wal.EncodeHeapDelete(rel, blk, lineSlot, xmax)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
@@ -162,6 +172,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeSplit:  logBtreeSplit,
 		LogHeapInsert:  logHeapInsert,
 		LogBtreeInsert: logBtreeInsert,
+		LogHeapDelete:  logHeapDelete,
 		FullPageWrites: true,
 	})
 	if err != nil {

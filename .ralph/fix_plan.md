@@ -546,8 +546,16 @@ full Definition of Done. Decomposed into agent-sized chunks below.
         ~801 MB → ~21 MB; runtime from ~13s → ~9.25s.
         `wal/recovery.go` now imports `internal/access/btree` for
         the apply helper (one-direction dep, no cycle).
-  - [ ] Migrate heap UPDATE / DELETE xmax-stamp paths
-        (`PageSetHeapTupleXmax` callers in operators_storage.go).
+  - [x] Migrate heap UPDATE / DELETE xmax-stamp paths.
+        New `RecordKindHeapDelete` (kind=6, fixed 20 bytes:
+        rel + blk + lineSlot + xmax). `markHeapDeleteDirty`
+        helper picks `MarkDirtyChangeRecord` when the pool's
+        `LogHeapDelete` hook is wired and falls back to
+        `MarkDirty` otherwise. Both `updateOp` and `deleteOp`
+        switched to it. Replay re-runs `PageSetHeapTupleXmax`
+        and is idempotent via `pd_lsn`. pgbench `-t 30`
+        default-mixed workload (~120 UPDATEs + ~30 INSERTs +
+        SELECTs) WAL stays flat at ~21 MB.
   - [ ] Migrate VACUUM page-prune mutations.
   - [ ] Once all paths are migrated, flip `maybeEmitFPI` back to
         the strict once-per-epoch policy globally.

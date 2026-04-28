@@ -89,6 +89,9 @@ type Pool struct {
 	// WAL record. Pulled out via LogBtreeInsert() for the btree
 	// access method. nil disables the optimisation.
 	logBtreeInsert LogBtreeInsertFunc
+	// logHeapDelete emits a logical heap-delete (xmax stamp)
+	// WAL record. Used by the executor's UPDATE / DELETE paths.
+	logHeapDelete LogHeapDeleteFunc
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -145,6 +148,11 @@ type PoolConfig struct {
 	// non-split insert path can emit a logical change record.
 	LogBtreeInsert LogBtreeInsertFunc
 
+	// LogHeapDelete, when non-nil, is exposed via
+	// Pool.LogHeapDelete so the executor's UPDATE / DELETE
+	// xmax-stamp paths can emit a logical change record.
+	LogHeapDelete LogHeapDeleteFunc
+
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -176,6 +184,12 @@ type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, t
 // item.marshal output. See docs/design/0002-0003-redo-records.md.
 type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN, error)
 
+// LogHeapDeleteFunc emits one logical heap-delete (xmax stamp)
+// redo record. Used by the executor's UPDATE / DELETE paths to
+// avoid an FPI on subsequent dirties of the same page in an
+// epoch. See docs/design/0002-0003-redo-records.md.
+type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID) (LSN, error)
+
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by an
 // mmap'd arena. Returns an error if slots <= 0 or the arena alloc
 // fails.
@@ -201,6 +215,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logBtreeSplit: cfg.LogBtreeSplit,
 		logHeapInsert:  cfg.LogHeapInsert,
 		logBtreeInsert: cfg.LogBtreeInsert,
+		logHeapDelete:  cfg.LogHeapDelete,
 		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
@@ -224,6 +239,11 @@ func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
 // change-record hook, or nil if none was wired. Callers fall
 // back to per-page FPI via MarkDirty when nil.
 func (p *Pool) LogBtreeInsert() LogBtreeInsertFunc { return p.logBtreeInsert }
+
+// LogHeapDelete returns the configured heap-delete change-record
+// hook, or nil if none was wired. Callers fall back to per-page
+// FPI via MarkDirty when nil.
+func (p *Pool) LogHeapDelete() LogHeapDeleteFunc { return p.logHeapDelete }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 // Mirrors upstream's full_page_writes SIGHUP-context GUC.

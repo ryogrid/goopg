@@ -291,9 +291,12 @@ func (o *updateOp) Next() (Row, error) {
 			o.ctx.Pool.Unpin(s)
 			return nil, err
 		}
-		o.ctx.Pool.MarkDirty(s)
+		derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
+		if derr != nil {
+			return nil, derr
+		}
 		if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
 			return nil, err
 		}
@@ -367,9 +370,12 @@ func (o *deleteOp) Next() (Row, error) {
 			o.ctx.Pool.Unpin(s)
 			return nil, err
 		}
-		o.ctx.Pool.MarkDirty(s)
+		derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, v.blk, v.slot, o.ctx.Tx.XID)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
+		if derr != nil {
+			return nil, derr
+		}
 		o.rowsAffected++
 	}
 	return nil, EOF
@@ -556,5 +562,25 @@ func markHeapInsertDirty(
 	}
 	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
 		return logHeap(rel, blk, lineSlot, tupleBytes)
+	})
+}
+
+// markHeapDeleteDirty mirrors markHeapInsertDirty for the xmax
+// stamp paths (UPDATE old image + DELETE). When the pool has a
+// LogHeapDelete hook configured, subsequent dirties of the same
+// page in an epoch emit a fixed-size 20-byte logical record
+// instead of a full FPI.
+func markHeapDeleteDirty(
+	pool *storage.Pool, slot *storage.Slot,
+	rel storage.RelFileNode, blk storage.BlockNumber,
+	lineSlot uint16, xmax storage.TransactionID,
+) error {
+	logDel := pool.LogHeapDelete()
+	if logDel == nil {
+		pool.MarkDirty(slot)
+		return nil
+	}
+	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+		return logDel(rel, blk, lineSlot, xmax)
 	})
 }

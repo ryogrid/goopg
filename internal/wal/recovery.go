@@ -40,6 +40,13 @@ const (
 	// existing page in sorted order. See
 	// docs/design/0002-0003-redo-records.md.
 	RecordKindBtreeInsert byte = 5
+	// RecordKindHeapDelete is a logical change record stamping
+	// xmax on an existing heap tuple. The MVCC update path
+	// emits one for the old image (followed by a HeapInsert for
+	// the new); the DELETE path emits one per visible match.
+	// Format: "kind | rel(9) | blk(4) | lineSlot(2) | xmax(4)"
+	// = 20 bytes, fixed. Replay is idempotent via pd_lsn.
+	RecordKindHeapDelete byte = 6
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
@@ -51,6 +58,9 @@ const (
 	// btreeInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
 	// Fork(1) + Block(4) = 14.
 	btreeInsertHeaderSize = 14
+	// heapDeleteSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1)
+	// + Block(4) + LineSlot(2) + Xmax(4) = 20.
+	heapDeleteSize = 20
 )
 
 // ReplayStats summarizes one replay run.
@@ -116,6 +126,41 @@ func DecodeHeapInsert(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
 	tuple = make([]byte, len(payload)-heapInsertHeaderSize)
 	copy(tuple, payload[heapInsertHeaderSize:])
+	return
+}
+
+// EncodeHeapDelete encodes one logical heap-delete (xmax stamp)
+// redo record.
+func EncodeHeapDelete(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID) []byte {
+	out := make([]byte, heapDeleteSize)
+	out[0] = RecordKindHeapDelete
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], lineSlot)
+	binary.LittleEndian.PutUint32(out[16:20], uint32(xmax))
+	return out
+}
+
+// DecodeHeapDelete decodes a HeapDelete record payload.
+func DecodeHeapDelete(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, err error) {
+	if len(payload) != heapDeleteSize {
+		err = fmt.Errorf("wal: invalid heap-delete payload len %d (want %d)", len(payload), heapDeleteSize)
+		return
+	}
+	if payload[0] != RecordKindHeapDelete {
+		err = fmt.Errorf("wal: record kind %d is not heap-delete", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
+	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
 	return
 }
 
@@ -259,6 +304,11 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
 			}
 			stats.Applied++
+		case RecordKindHeapDelete:
+			if err := replayHeapDelete(mgr, r); err != nil {
+				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
+			}
+			stats.Applied++
 		case RecordKindCheckpoint:
 			// Marker only; no page write.
 			continue
@@ -300,6 +350,38 @@ func ReplayFromDirWithMgr(mgr *storage.Manager, walDir string, segmentSize int64
 		return ReplayStats{}, err
 	}
 	return ReplayRecords(mgr, records)
+}
+
+// replayHeapDelete applies one logical xmax-stamp record. The
+// page must already exist (HeapInsert or an earlier mutation
+// produced it). Idempotent via pd_lsn.
+func replayHeapDelete(mgr *storage.Manager, r Record) error {
+	rel, blk, lineSlot, xmax, err := DecodeHeapDelete(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-delete replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-delete replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if err := storage.PageSetHeapTupleXmax(page, lineSlot, xmax); err != nil {
+		return fmt.Errorf("wal: heap-delete apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
 }
 
 // replayBtreeInsert applies one logical B-tree non-split insert
