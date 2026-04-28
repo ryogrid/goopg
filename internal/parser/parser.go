@@ -140,6 +140,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseSet()
 	case KwReset:
 		return p.parseReset()
+	case KwSelect:
+		return p.parseSelect()
 	}
 	return nil, p.errAtCur("unsupported statement")
 }

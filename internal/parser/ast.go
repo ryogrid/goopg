@@ -100,3 +100,52 @@ type ResetStmt struct {
 
 func (s *ResetStmt) Pos() int  { return s.pos }
 func (s *ResetStmt) stmtNode() {}
+
+// ResTarget is one entry in a SELECT target list: `expr [AS alias]`.
+type ResTarget struct {
+	pos   int
+	Alias string // empty when no AS clause
+	Expr  Expr
+}
+
+func (r ResTarget) Pos() int { return r.pos }
+
+// RangeVar is a relation reference appearing in a FROM clause:
+// `[schema.]table [AS alias]`.
+type RangeVar struct {
+	pos    int
+	Schema string
+	Name   string
+	Alias  string // empty when no AS clause
+}
+
+func (r RangeVar) Pos() int { return r.pos }
+
+// SortBy is one entry in an ORDER BY list.
+type SortBy struct {
+	pos  int
+	Expr Expr
+	Desc bool // true for DESC, false for ASC (the default)
+}
+
+func (s SortBy) Pos() int { return s.pos }
+
+// SelectStmt — `SELECT [DISTINCT] target_list
+//
+//	[FROM from_item [, …]] [WHERE expr] [ORDER BY sort_list]
+//	[LIMIT n] [OFFSET n]`. JOINs, GROUP BY, HAVING, and set ops are
+//
+// deferred — see fix_plan.
+type SelectStmt struct {
+	pos      int
+	Distinct bool
+	Targets  []ResTarget
+	From     []RangeVar
+	Where    Expr // nil when absent
+	OrderBy  []SortBy
+	Limit    Expr // nil when absent; integer expression in v0
+	Offset   Expr // nil when absent
+}
+
+func (s *SelectStmt) Pos() int  { return s.pos }
+func (s *SelectStmt) stmtNode() {}

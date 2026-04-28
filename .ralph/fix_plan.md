@@ -194,13 +194,20 @@ unchecked item unless a dependency forces a different order.
         aliases), `VACUUM` (with VERBOSE/ANALYZE/target list), `ANALYZE`,
         `SHOW`/`SET`/`RESET`. Carving the GUC verbs out of
         `internal/server/query.go` is deferred until the executor lands.
-  - [ ] Statement parsers: `SELECT` with FROM/WHERE/ORDER BY/LIMIT, joins,
-        aggregates pgbench needs.
+  - [x] Expression tree (`ColumnRef`, integer/string/null/bool consts,
+        `BinaryOp`, `UnaryOp`, `FuncCall`, `ParamRef`, `StarExpr`) with
+        operator-precedence climbing (Pratt). Recognises arithmetic,
+        comparison, boolean, and `||` operators with upstream-aligned
+        precedences.
+  - [x] Statement parsers: `SELECT` target list (with `*`, qualified
+        `t.*`, `AS` alias), comma-separated `FROM` with optional alias,
+        `WHERE`, `ORDER BY` with ASC/DESC, `LIMIT`/`OFFSET`. JOINs,
+        GROUP BY, HAVING, and set operations are still deferred.
+  - [ ] Statement parsers: JOIN clauses, GROUP BY, HAVING, set operations
+        for the SELECT shapes pgbench reports queries need.
   - [ ] Statement parsers: `INSERT`, `UPDATE`, `DELETE`.
   - [ ] Statement parsers: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`,
         `DROP INDEX`, `TRUNCATE`.
-  - [ ] Expression tree (`ColumnRef`, integer/string consts, `BinaryOp`,
-        `FuncCall`, `ParamRef`) with operator-precedence climbing.
   - [ ] Analyzer pass (name resolution, type checking) once the catalog
         exists.
 - [ ] Planner sufficient for pgbench's workload.

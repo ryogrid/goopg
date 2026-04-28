@@ -1,0 +1,453 @@
+package parser
+
+import (
+	"strconv"
+)
+
+// parseSelect parses a SELECT statement.
+//
+// Grammar (v0):
+//
+//	SELECT [DISTINCT] target_list
+//	  [FROM from_item [, from_item …]]
+//	  [WHERE expr]
+//	  [ORDER BY sort_list]
+//	  [LIMIT expr] [OFFSET expr]
+//
+// JOINs, GROUP BY, HAVING, and set operations (UNION/INTERSECT) are
+// deferred to subsequent loops alongside the planner work that needs
+// them.
+func (p *parser) parseSelect() (Stmt, error) {
+	t, err := p.expectKeyword(KwSelect)
+	if err != nil {
+		return nil, err
+	}
+	s := &SelectStmt{pos: t.Pos}
+	if p.acceptKeyword(KwDistinct) {
+		s.Distinct = true
+	}
+	tgts, err := p.parseTargetList()
+	if err != nil {
+		return nil, err
+	}
+	s.Targets = tgts
+
+	if p.acceptKeyword(KwFrom) {
+		from, err := p.parseFromList()
+		if err != nil {
+			return nil, err
+		}
+		s.From = from
+	}
+	if p.acceptKeyword(KwWhere) {
+		w, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		s.Where = w
+	}
+	if p.acceptKeyword(KwOrder) {
+		if _, err := p.expectKeyword(KwBy); err != nil {
+			return nil, err
+		}
+		ob, err := p.parseSortList()
+		if err != nil {
+			return nil, err
+		}
+		s.OrderBy = ob
+	}
+	if p.acceptKeyword(KwLimit) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		s.Limit = e
+	}
+	if p.acceptKeyword(KwOffset) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		s.Offset = e
+	}
+	return s, nil
+}
+
+func (p *parser) parseTargetList() ([]ResTarget, error) {
+	var out []ResTarget
+	first, err := p.parseTargetEntry()
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, first)
+	for p.acceptSymbol(",") {
+		next, err := p.parseTargetEntry()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, next)
+	}
+	return out, nil
+}
+
+func (p *parser) parseTargetEntry() (ResTarget, error) {
+	pos := p.cur().Pos
+	// Bare `*` target.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+		p.advance()
+		return ResTarget{pos: pos, Expr: &StarExpr{pos: pos}}, nil
+	}
+	expr, err := p.parseExpr()
+	if err != nil {
+		return ResTarget{}, err
+	}
+	rt := ResTarget{pos: pos, Expr: expr}
+	if p.acceptKeyword(KwAs) {
+		alias, err := p.parseIdent()
+		if err != nil {
+			return ResTarget{}, err
+		}
+		rt.Alias = identText(alias)
+		return rt, nil
+	}
+	// Implicit alias: a bare identifier or quoted ident immediately
+	// after the expression — but the v0 expression parser already
+	// consumes those into a ColumnRef, so we don't try to peel one
+	// off here. AS is the only path until the analyzer disambiguates.
+	return rt, nil
+}
+
+func (p *parser) parseFromList() ([]RangeVar, error) {
+	var out []RangeVar
+	first, err := p.parseRangeVar()
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, first)
+	for p.acceptSymbol(",") {
+		next, err := p.parseRangeVar()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, next)
+	}
+	return out, nil
+}
+
+func (p *parser) parseRangeVar() (RangeVar, error) {
+	obj, err := p.parseObjectName()
+	if err != nil {
+		return RangeVar{}, err
+	}
+	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
+	// Optional alias: AS ident, or bare ident for the "implicit alias"
+	// shorthand that pgbench uses (`pgbench_accounts a`).
+	if p.acceptKeyword(KwAs) {
+		t, err := p.parseIdent()
+		if err != nil {
+			return RangeVar{}, err
+		}
+		rv.Alias = identText(t)
+		return rv, nil
+	}
+	if isAliasStart(p.cur()) {
+		t := p.advance()
+		rv.Alias = identText(t)
+	}
+	return rv, nil
+}
+
+// isAliasStart returns true when the current token can plausibly begin
+// a relation alias following a from-item without an AS keyword. It
+// excludes any keyword that would start the next clause.
+func isAliasStart(t Token) bool {
+	if t.Kind == TokenIdent || t.Kind == TokenQuotedIdent {
+		return true
+	}
+	if t.Kind != TokenKeyword {
+		return false
+	}
+	switch t.Keyword {
+	case KwWhere, KwOrder, KwLimit, KwOffset, KwFrom, KwBy:
+		return false
+	}
+	// Conservative: don't treat keywords as aliases unless we know
+	// they're harmless. Upstream's "unreserved keyword" list is more
+	// permissive; we tighten it here and let the analyzer relax later.
+	return false
+}
+
+func (p *parser) parseSortList() ([]SortBy, error) {
+	var out []SortBy
+	first, err := p.parseSortItem()
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, first)
+	for p.acceptSymbol(",") {
+		next, err := p.parseSortItem()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, next)
+	}
+	return out, nil
+}
+
+func (p *parser) parseSortItem() (SortBy, error) {
+	pos := p.cur().Pos
+	e, err := p.parseExpr()
+	if err != nil {
+		return SortBy{}, err
+	}
+	sb := SortBy{pos: pos, Expr: e}
+	if p.acceptKeyword(KwDesc) {
+		sb.Desc = true
+	} else {
+		_ = p.acceptKeyword(KwAsc)
+	}
+	return sb, nil
+}
+
+// --- Expression parsing (Pratt / precedence climbing) ---------------
+
+// Precedence levels (higher binds tighter), aligned with upstream's
+// gram.y operator precedence.
+const (
+	precOr      = 1
+	precAnd     = 2
+	precNot     = 3
+	precIs      = 4
+	precCompare = 5 // = <> < > <= >=
+	precAddSub  = 6
+	precMulDiv  = 7
+	precConcat  = 8
+	precUnary   = 9
+)
+
+// parseExpr drives the precedence-climbing loop.
+func (p *parser) parseExpr() (Expr, error) {
+	return p.parseExprPrec(0)
+}
+
+func (p *parser) parseExprPrec(min int) (Expr, error) {
+	left, err := p.parseUnary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		op, prec, ok := p.peekBinaryOp()
+		if !ok || prec < min {
+			return left, nil
+		}
+		opTok := p.advance()
+		right, err := p.parseExprPrec(prec + 1)
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryOp{pos: opTok.Pos, Op: op, Left: left, Right: right}
+	}
+}
+
+// peekBinaryOp returns the operator text and precedence of the current
+// token if it can extend an expression as a left-associative binary
+// operator. Returns ok=false when the current token can't.
+func (p *parser) peekBinaryOp() (string, int, bool) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenOperator:
+		switch t.Value {
+		case "+", "-":
+			return t.Value, precAddSub, true
+		case "*", "/", "%":
+			return t.Value, precMulDiv, true
+		case "||":
+			return t.Value, precConcat, true
+		case "=", "<", ">", "<=", ">=", "<>", "!=":
+			return t.Value, precCompare, true
+		}
+	case TokenSymbol:
+		// '*' is also a symbol token (target-list wildcard) — but in
+		// expression context it's a multiplication operator.
+		if t.Value == "*" {
+			return "*", precMulDiv, true
+		}
+	case TokenKeyword:
+		switch t.Keyword {
+		case KwAnd:
+			return "AND", precAnd, true
+		case KwOr:
+			return "OR", precOr, true
+		}
+	}
+	return "", 0, false
+}
+
+// parseUnary handles prefix operators and falls through to parsePrimary.
+func (p *parser) parseUnary() (Expr, error) {
+	t := p.cur()
+	switch {
+	case t.Kind == TokenOperator && (t.Value == "-" || t.Value == "+"):
+		p.advance()
+		operand, err := p.parseExprPrec(precUnary)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryOp{pos: t.Pos, Op: t.Value, Operand: operand}, nil
+	case t.Kind == TokenKeyword && t.Keyword == KwNot:
+		p.advance()
+		operand, err := p.parseExprPrec(precNot)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryOp{pos: t.Pos, Op: "NOT", Operand: operand}, nil
+	}
+	return p.parsePrimary()
+}
+
+// parsePrimary handles the leaves: literals, parameters, identifier
+// references (possibly qualified, possibly function calls), and
+// parenthesised subexpressions.
+func (p *parser) parsePrimary() (Expr, error) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenIntLit:
+		p.advance()
+		v, err := strconv.ParseInt(t.Value, 10, 64)
+		if err != nil {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "invalid integer literal: " + t.Value}
+		}
+		return &IntegerConst{pos: t.Pos, Value: v}, nil
+	case TokenStringLit:
+		p.advance()
+		return &StringConst{pos: t.Pos, Value: t.Value}, nil
+	case TokenParam:
+		p.advance()
+		n, err := strconv.Atoi(t.Value)
+		if err != nil || n <= 0 {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "invalid parameter number: $" + t.Value}
+		}
+		return &ParamRef{pos: t.Pos, Number: n}, nil
+	case TokenSymbol:
+		if t.Value == "(" {
+			p.advance()
+			inner, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')'")
+			}
+			return inner, nil
+		}
+	case TokenKeyword:
+		switch t.Keyword {
+		case KwNull:
+			p.advance()
+			return &NullConst{pos: t.Pos}, nil
+		case KwTrue:
+			p.advance()
+			return &BooleanConst{pos: t.Pos, Value: true}, nil
+		case KwFalse:
+			p.advance()
+			return &BooleanConst{pos: t.Pos, Value: false}, nil
+		}
+	}
+	if t.Kind == TokenIdent || t.Kind == TokenQuotedIdent {
+		return p.parseColumnOrCall()
+	}
+	return nil, p.errAtCur("expected expression")
+}
+
+// parseColumnOrCall handles `name`, `name.name`, `name.name.name`,
+// `name(args)`, `name.name(args)`, `name.*`, `name.name.*`. The
+// distinction between a function call and a column reference is the
+// next token being '('.
+func (p *parser) parseColumnOrCall() (Expr, error) {
+	first := p.advance()
+	startPos := first.Pos
+	parts := []string{identText(first)}
+	starQualified := false
+	for p.acceptSymbol(".") {
+		t := p.cur()
+		if t.Kind == TokenSymbol && t.Value == "*" {
+			p.advance()
+			starQualified = true
+			break
+		}
+		ident, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, identText(ident))
+	}
+	if starQualified {
+		switch len(parts) {
+		case 1:
+			return &StarExpr{pos: startPos, Table: parts[0]}, nil
+		case 2:
+			return &StarExpr{pos: startPos, Schema: parts[0], Table: parts[1]}, nil
+		default:
+			return nil, &SyntaxError{Pos: startPos, Message: "too many name parts before .*"}
+		}
+	}
+	// Function call?
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		var name ObjectName
+		switch len(parts) {
+		case 1:
+			name = ObjectName{pos: startPos, Name: parts[0]}
+		case 2:
+			name = ObjectName{pos: startPos, Schema: parts[0], Name: parts[1]}
+		default:
+			return nil, &SyntaxError{Pos: startPos, Message: "function name has too many qualifying parts"}
+		}
+		return p.parseFuncCallTail(startPos, name)
+	}
+	// Column reference.
+	switch len(parts) {
+	case 1:
+		return &ColumnRef{pos: startPos, Column: parts[0]}, nil
+	case 2:
+		return &ColumnRef{pos: startPos, Table: parts[0], Column: parts[1]}, nil
+	case 3:
+		return &ColumnRef{pos: startPos, Schema: parts[0], Table: parts[1], Column: parts[2]}, nil
+	}
+	return nil, &SyntaxError{Pos: startPos, Message: "column reference has too many name parts"}
+}
+
+func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
+	// '(' already on the cursor.
+	p.advance()
+	fc := &FuncCall{pos: pos, Name: name}
+	// `f()`
+	if p.acceptSymbol(")") {
+		return fc, nil
+	}
+	// `f(*)` — count(*) etc.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+		p.advance()
+		fc.Star = true
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+		return fc, nil
+	}
+	if p.acceptKeyword(KwDistinct) {
+		fc.Distinct = true
+	}
+	for {
+		arg, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		fc.Args = append(fc.Args, arg)
+		if p.acceptSymbol(",") {
+			continue
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ',' or ')'")
+		}
+		return fc, nil
+	}
+}

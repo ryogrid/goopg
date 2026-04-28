@@ -46,6 +46,24 @@ const (
 	KwReset       Keyword = "reset"
 	KwAll         Keyword = "all"
 	KwDefault     Keyword = "default"
+	KwSelect      Keyword = "select"
+	KwDistinct    Keyword = "distinct"
+	KwFrom        Keyword = "from"
+	KwWhere       Keyword = "where"
+	KwAs          Keyword = "as"
+	KwOrder       Keyword = "order"
+	KwBy          Keyword = "by"
+	KwAsc         Keyword = "asc"
+	KwDesc        Keyword = "desc"
+	KwLimit       Keyword = "limit"
+	KwOffset      Keyword = "offset"
+	KwAnd         Keyword = "and"
+	KwOr          Keyword = "or"
+	KwNot         Keyword = "not"
+	KwNull        Keyword = "null"
+	KwTrue        Keyword = "true"
+	KwFalse       Keyword = "false"
+	KwIs          Keyword = "is"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -70,6 +88,24 @@ var keywords = map[string]Keyword{
 	"reset":       KwReset,
 	"all":         KwAll,
 	"default":     KwDefault,
+	"select":      KwSelect,
+	"distinct":    KwDistinct,
+	"from":        KwFrom,
+	"where":       KwWhere,
+	"as":          KwAs,
+	"order":       KwOrder,
+	"by":          KwBy,
+	"asc":         KwAsc,
+	"desc":        KwDesc,
+	"limit":       KwLimit,
+	"offset":      KwOffset,
+	"and":         KwAnd,
+	"or":          KwOr,
+	"not":         KwNot,
+	"null":        KwNull,
+	"true":        KwTrue,
+	"false":       KwFalse,
+	"is":          KwIs,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased
