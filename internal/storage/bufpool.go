@@ -98,8 +98,18 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	return p, nil
 }
 
-// Close releases the arena. It does not close the storage manager.
-func (p *Pool) Close() error { return p.arena.close() }
+// Close flushes every dirty slot through smgr and releases the
+// page-aligned arena. Dirty pages must reach disk before the
+// process exits or callers see data loss across restarts; the
+// storage manager itself is closed separately by the caller.
+func (p *Pool) Close() error {
+	flushErr := p.FlushAll()
+	closeErr := p.arena.close()
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
+}
 
 // NBlocks reports the number of blocks currently in rel. Pass-through
 // to the underlying smgr; callers (e.g. vacuum) need this to drive a

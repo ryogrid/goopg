@@ -87,7 +87,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	cat := catalog.NewInMemory()
-	if err := loadCatalogSnapshot(abs, cat); err != nil {
+	txnMgr := mvcc.NewManager()
+	if err := loadCatalogSnapshot(abs, cat, txnMgr); err != nil {
 		_ = pool.Close()
 		_ = mgr.Close()
 		return nil, err
@@ -96,7 +97,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	return &Runtime{
 		StorageMgr: mgr,
 		Pool:       pool,
-		TxnMgr:     mvcc.NewManager(),
+		TxnMgr:     txnMgr,
 		Catalog:    cat,
 		DataDir:    abs,
 	}, nil
@@ -108,7 +109,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 // error, Restore error) propagates: the operator is better off
 // seeing a startup failure than running with a half-loaded
 // schema.
-func loadCatalogSnapshot(dir string, cat *catalog.InMemory) error {
+func loadCatalogSnapshot(dir string, cat *catalog.InMemory, txnMgr *mvcc.Manager) error {
 	path := filepath.Join(dir, CatalogSnapshotFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -123,6 +124,13 @@ func loadCatalogSnapshot(dir string, cat *catalog.InMemory) error {
 	}
 	if err := cat.Restore(snap); err != nil {
 		return fmt.Errorf("goopg: restore catalog snapshot %q: %w", path, err)
+	}
+	if snap.NextXID != 0 {
+		// Advance the in-memory transaction counter past the saved
+		// horizon so heap tuples from previous sessions appear
+		// committed (xmin < snap.Xmin) to the new session's
+		// snapshots.
+		txnMgr.SetNextXID(storage.TransactionID(snap.NextXID))
 	}
 	return nil
 }
@@ -145,6 +153,9 @@ func (r *Runtime) SaveCatalog() error {
 		return nil
 	}
 	snap := cat.Snapshot()
+	if r.TxnMgr != nil {
+		snap.NextXID = uint32(r.TxnMgr.NextXID())
+	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return fmt.Errorf("goopg: marshal catalog snapshot: %w", err)

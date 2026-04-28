@@ -534,7 +534,8 @@ func isIntegerLike(t catalog.Type) bool {
 
 func isNumericTypeName(name string) bool {
 	switch strings.ToLower(name) {
-	case "int2", "int4", "int8", "integer", "smallint", "bigint", "numeric", "float4", "float8", "real", "double":
+	case "int", "int2", "int4", "int8", "integer", "smallint", "bigint", "numeric", "decimal",
+		"float4", "float8", "real", "double", "double precision":
 		return true
 	}
 	return false

@@ -383,6 +383,22 @@ unchecked item unless a dependency forces a different order.
       data; needs investigation.))
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
+      (partial: against `goopg start -D <dir>` after `pgbench -i -s 1`,
+      single-client `pgbench -t 5` (default TPC-B-like) runs 5/5
+      transactions at ~37 TPS; `pgbench -S -t 5` runs 5/5 at ~7100
+      TPS; concurrent `pgbench -S -c 4 -j 2 -t 20` runs 80/80 at
+      ~19k TPS. Took fixes for: analyzer.isNumericTypeName missing
+      "int" (so `aid int = $1::int8` failed type-checking);
+      Pool.Close not flushing dirty pages (data evaporated on
+      shutdown); mvcc.nextXID not persisting across restarts (so
+      reloaded heap tuples were treated as future/in-progress and
+      became invisible) — now stored in catalog snapshot's
+      next_xid field; CURRENT_TIMESTAMP / CURRENT_DATE / etc.
+      parsed as ColumnRef instead of niladic FuncCall.
+      Concurrent default workload (-c 4 -j 2 -t 5) hits a
+      heap-tuple corruption race ("invalid t_hoff=0 len=44") on
+      INSERT/UPDATE — next blocker, likely a buffer-pool or
+      page-add ordering bug.)
 
 ## Notes
 

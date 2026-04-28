@@ -20,9 +20,16 @@ import (
 // CatalogVersion bumps. See docs/design/0017-data-directory.md for
 // the migration gate.
 type Snapshot struct {
-	NextOID uint32        `json:"next_oid"`
-	Tables  []TableEntry  `json:"tables,omitempty"`
-	Indexes []IndexEntry  `json:"indexes,omitempty"`
+	NextOID uint32       `json:"next_oid"`
+	// NextXID is the mvcc.Manager.nextXID at save time. Restored on
+	// the next startup so persisted heap tuples (whose xmin/xmax
+	// come from previous sessions) are visible to the new session's
+	// snapshots — without this restore, every new session starts at
+	// xid=3 and treats the persisted xids as in-progress/future,
+	// hiding all the durable data.
+	NextXID uint32       `json:"next_xid,omitempty"`
+	Tables  []TableEntry `json:"tables,omitempty"`
+	Indexes []IndexEntry `json:"indexes,omitempty"`
 }
 
 // TableEntry mirrors Table for serialization.

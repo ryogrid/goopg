@@ -672,6 +672,15 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		}
 		return p.parseFuncCallTail(startPos, name)
 	}
+	// SQL standard "no-parens" niladic functions: when the bare
+	// identifier is one of these and isn't being treated as a
+	// function call (no following `(`), upstream parses it as a
+	// niladic FuncCall not a ColumnRef. pgbench's TPC-B emits
+	// `... VALUES (..., CURRENT_TIMESTAMP)` and relies on this
+	// shape.
+	if len(parts) == 1 && isNoParenFuncName(parts[0]) {
+		return &FuncCall{pos: startPos, Name: ObjectName{pos: startPos, Name: parts[0]}}, nil
+	}
 	// Column reference.
 	switch len(parts) {
 	case 1:
@@ -682,6 +691,22 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		return &ColumnRef{pos: startPos, Schema: parts[0], Table: parts[1], Column: parts[2]}, nil
 	}
 	return nil, &SyntaxError{Pos: startPos, Message: "column reference has too many name parts"}
+}
+
+// isNoParenFuncName reports whether name (already lower-cased by the
+// lexer) is one of the SQL standard niladic functions that don't
+// require parentheses on the call side. Mirrors upstream's
+// SystemFuncName classification — we cover the ones the executor
+// already knows how to evaluate.
+func isNoParenFuncName(name string) bool {
+	switch name {
+	case "current_timestamp", "current_date", "current_time",
+		"localtime", "localtimestamp",
+		"current_user", "session_user", "user",
+		"current_catalog", "current_schema":
+		return true
+	}
+	return false
 }
 
 func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {

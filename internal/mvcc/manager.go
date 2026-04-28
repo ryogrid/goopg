@@ -48,6 +48,29 @@ func NewManager() *Manager {
 	}
 }
 
+// SetNextXID advances nextXID forward without allocating it. Used on
+// startup to skip over xids already present in persisted heap tuples
+// from previous sessions, so the new session's snapshots see those
+// tuples as committed (xmin < snap.Xmin) instead of in-progress.
+//
+// The change is monotonic: a smaller value is ignored. Concurrent
+// callers are serialised with the regular Manager mutex.
+func (m *Manager) SetNextXID(x storage.TransactionID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if x > m.nextXID {
+		m.nextXID = x
+	}
+}
+
+// NextXID returns the value the next Begin will allocate. Used by
+// the bootstrap path to snapshot transaction state across restarts.
+func (m *Manager) NextXID() storage.TransactionID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextXID
+}
+
 // Begin allocates an xid and tracks the transaction as in-progress.
 func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
 	if iso != IsolationReadCommitted && iso != IsolationRepeatableRead {
