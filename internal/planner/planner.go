@@ -799,6 +799,12 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	outputSchema := make(Schema, 0, len(s.GroupBy)+len(s.Targets))
 
 	for _, g := range s.GroupBy {
+		// GROUP BY accepts target-list aliases and positional
+		// indices (PG extension; TPC-H Q7 leans on it). Run the
+		// same substitution as ORDER BY so the resolved
+		// expression — and the parserExprKey we record below —
+		// matches what the target list and ORDER BY look up.
+		g = resolveOrderBySubstitution(g, s.Targets)
 		if exprHasAggregate(g) {
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42803", Message: "aggregate functions are not allowed in GROUP BY"}
 		}

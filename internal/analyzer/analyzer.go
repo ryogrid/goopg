@@ -172,7 +172,14 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		return err
 	}
 	for _, g := range s.GroupBy {
-		if _, err := analyzeExpr(g, ctx); err != nil {
+		// GROUP BY (PG-extension) may reference target-list
+		// aliases and positional indices the same way ORDER BY
+		// does. TPC-H Q7 leans on this: `extract(year FROM
+		// l_shipdate) AS l_year ... GROUP BY l_year`. Run the
+		// substitution before type-checking so the alias doesn't
+		// trip the undefined-column check.
+		expr := orderBySubstitution(g, s.Targets)
+		if _, err := analyzeExpr(expr, ctx); err != nil {
 			return err
 		}
 	}

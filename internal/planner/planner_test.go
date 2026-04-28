@@ -397,6 +397,31 @@ func TestPlanOrderByAliasAndPositional(t *testing.T) {
 	})
 }
 
+// TestPlanGroupByAliasAndPositional pins the GROUP BY
+// substitution: bare aliases and positional indices rewrite to
+// the underlying target-list expression. PG accepts this as an
+// extension; TPC-H Q7 leans on it
+// (`extract(year FROM ...) AS l_year ... GROUP BY l_year`).
+func TestPlanGroupByAliasAndPositional(t *testing.T) {
+	cat := pgbenchCatalog(t)
+
+	t.Run("alias resolves to target expression", func(t *testing.T) {
+		sql := "SELECT a.aid + 10 AS xx, sum(a.bid) FROM pgbench_accounts a GROUP BY xx"
+		_, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+	})
+
+	t.Run("positional index resolves to target", func(t *testing.T) {
+		sql := "SELECT a.aid, sum(a.bid) FROM pgbench_accounts a GROUP BY 1"
+		_, err := Plan(parseOne(t, sql), cat)
+		if err != nil {
+			t.Fatalf("Plan: %v", err)
+		}
+	})
+}
+
 func TestPlanJoinPicksMergeAlgoForRightFullEquality(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	cases := []struct {

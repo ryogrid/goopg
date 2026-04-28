@@ -968,6 +968,21 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       five common forms — including TPC-H Q2/Q3/Q10/Q18/Q21
       shape and OFFSET … FETCH NEXT. Required for several
       TPC-H queries.)
+- [x] `GROUP BY <target-list-alias>` / `GROUP BY <positional-index>`
+      for TPC-H Q7 (`extract(year FROM ...) AS l_year ...
+      GROUP BY l_year`) and the PG-extension case generally.
+      (achieved 2026-04-29: surfaced by running TPC-H Q7
+      end-to-end; the same `orderBySubstitution` helper that
+      services ORDER BY now also runs against each GROUP BY
+      expression in both analyzer and planner. Bare ColumnRef
+      whose Column matches a target's Alias becomes that
+      target's parser expression; IntegerConst N becomes
+      targets[N-1].Expr; qualified `t.col` falls through to
+      FROM-clause resolution. Verified via psql 18.3 against
+      Q7-style `GROUP BY yr` over `extract(year FROM ...)`,
+      `GROUP BY 1`, and the parallel ORDER BY paths.
+      `TestPlanGroupByAliasAndPositional` pins the two
+      behaviours.)
 - [x] `ORDER BY <target-list-alias>` / `ORDER BY <positional-index>`
       for TPC-H Q3 / Q5 / Q9 / Q10 / Q21 result ordering.
       (achieved 2026-04-29: surfaced by running TPC-H Q3
