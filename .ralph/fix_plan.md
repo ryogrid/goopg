@@ -358,13 +358,16 @@ unchecked item unless a dependency forces a different order.
       KindInt; everything else becomes KindString) and flow
       through Context.Params for ParamRef resolution. pgbench -i
       now gets past DROP/CREATE preamble, the pre-COPY BEGIN,
-      and the bind-parameter handshake. Next blockers: (a) the
-      parser doesn't recognise `::` typecast — pgbench probes
-      `SELECT relkind FROM pg_catalog.pg_class WHERE
-      oid=$1::pg_catalog.regclass` and fails at byte 52 with
-      `unexpected character ':'`; (b) `pg_catalog` system tables
-      aren't implemented, so even with `::` parsed, the SELECT
-      would return 42P01.)
+      and the bind-parameter handshake. The `::` typecast also
+      parses now: the lexer recognises `::`, the parser produces a
+      `parser.CastExpr` with the type stored as a (possibly
+      schema-qualified) ObjectName, and the planner unwraps it as
+      a no-op (the executor doesn't yet enforce typing). Next
+      blocker: `pg_catalog.pg_class` doesn't exist — the SELECT
+      fails with 42P01 (`relation "pg_class" does not exist`).
+      Adding a minimal pg_catalog (pg_class + pg_attribute +
+      pg_namespace, populated from the in-memory catalog) is the
+      next sub-step.)
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
 

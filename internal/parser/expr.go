@@ -95,6 +95,23 @@ type UnaryOp struct {
 func (e *UnaryOp) Pos() int { return e.pos }
 func (*UnaryOp) exprNode()  {}
 
+// CastExpr is `Operand :: TypeName` (upstream's `expr::type` shorthand
+// for `CAST(expr AS type)`). v0 carries the type name through as a
+// schema-qualified ObjectName so future loops can resolve it; the
+// executor currently treats the cast as a no-op (the underlying
+// expression evaluates and the requested type is ignored), which is
+// good enough for pgbench's `oid=$1::pg_catalog.regclass` shape
+// since the executor doesn't yet enforce typing.
+type CastExpr struct {
+	pos     int
+	Operand Expr
+	Type    ObjectName
+	Typmods []int64 // optional `(N)` or `(N,M)` typmod arguments
+}
+
+func (e *CastExpr) Pos() int { return e.pos }
+func (*CastExpr) exprNode()  {}
+
 // FuncCall is `Name(args…)`. v0 covers the call shape only; argument
 // type checking and overload resolution are the analyzer's job.
 type FuncCall struct {

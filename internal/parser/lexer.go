@@ -174,6 +174,17 @@ func (l *lexer) next() (Token, error) {
 		l.pos++
 		return Token{Kind: TokenSymbol, Value: string(c), Pos: start}, nil
 
+	case c == ':':
+		// `::` is upstream's typecast operator; a bare `:` is not
+		// otherwise meaningful in goopg's SQL surface and surfaces
+		// here as a lex error so the wire layer can return SQLSTATE
+		// 42601.
+		if l.peekAt(1) == ':' {
+			l.pos += 2
+			return Token{Kind: TokenOperator, Value: "::", Pos: start}, nil
+		}
+		return Token{}, l.errf(start, "unexpected character %q", c)
+
 	case c == '<' || c == '>' || c == '=' || c == '!' || c == '+' || c == '-' || c == '/' || c == '%' || c == '|':
 		// Greedy multi-char operator match.
 		two := ""

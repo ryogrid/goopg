@@ -637,6 +637,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			return nil, err
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
+	case *parser.CastExpr:
+		// See resolveExpr: cast is a no-op in v0.
+		return resolveExprAfterAggregate(x.Operand, agg)
 	case *parser.FuncCall:
 		if isAggregateFunc(x) {
 			k := aggregateCallKey(x)
@@ -864,6 +867,8 @@ func parserExprKey(e parser.Expr) string {
 		return k.String()
 	case *parser.StarExpr:
 		return "star:" + strings.ToLower(x.Schema) + "." + strings.ToLower(x.Table)
+	case *parser.CastExpr:
+		return "cast:" + strings.ToLower(x.Type.String()) + ":(" + parserExprKey(x.Operand) + ")"
 	}
 	return fmt.Sprintf("expr:%T", e)
 }
@@ -1179,6 +1184,13 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
+	case *parser.CastExpr:
+		// v0 treats `expr::type` as a no-op — the executor doesn't yet
+		// enforce typing, and pgbench's `oid=$1::pg_catalog.regclass`
+		// shape just needs the operand expression to plan. The
+		// declared target type is preserved on the parser AST for
+		// future loops that wire up real type coercion.
+		return resolveExpr(x.Operand, ctx)
 	}
 	return nil, &PlanError{Pos: e.Pos(), Code: "0A000", Message: fmt.Sprintf("unsupported expression %T", e)}
 }

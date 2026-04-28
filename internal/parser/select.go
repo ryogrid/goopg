@@ -419,6 +419,18 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		return nil, err
 	}
 	for {
+		// `::` typecast binds tighter than every binary operator and
+		// is left-associative on the operand: `a::int + b::int` parses
+		// as `(a::int) + (b::int)`. Loop here (not in the binary-op
+		// switch) so it can chain like `expr::int8::text`.
+		if t := p.cur(); t.Kind == TokenOperator && t.Value == "::" {
+			cast, err := p.parseCastTail(left)
+			if err != nil {
+				return nil, err
+			}
+			left = cast
+			continue
+		}
 		op, prec, ok := p.peekBinaryOp()
 		if !ok || prec < min {
 			return left, nil
@@ -430,6 +442,79 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		}
 		left = &BinaryOp{pos: opTok.Pos, Op: op, Left: left, Right: right}
 	}
+}
+
+// parseCastTail consumes a single `:: typename [(typmods)]` after the
+// caller has already produced the operand expression. Returns the
+// CastExpr; the caller chains by re-checking for `::` after.
+func (p *parser) parseCastTail(operand Expr) (Expr, error) {
+	tok := p.advance() // consumes "::"
+	name, err := p.parseTypeNameAfterCast()
+	if err != nil {
+		return nil, err
+	}
+	var typmods []int64
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance()
+		for {
+			if p.cur().Kind != TokenIntLit {
+				return nil, p.errAtCur("expected integer typmod")
+			}
+			n, err := strconv.ParseInt(p.cur().Value, 10, 64)
+			if err != nil {
+				return nil, p.errAtCur("invalid typmod")
+			}
+			typmods = append(typmods, n)
+			p.advance()
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+				p.advance()
+				continue
+			}
+			break
+		}
+		if p.cur().Kind != TokenSymbol || p.cur().Value != ")" {
+			return nil, p.errAtCur("expected ')' to close typmod list")
+		}
+		p.advance()
+	}
+	return &CastExpr{pos: tok.Pos, Operand: operand, Type: name, Typmods: typmods}, nil
+}
+
+// parseTypeNameAfterCast accepts an unquoted dotted name as the cast
+// target. Reserved-word type aliases (int, varchar, char, timestamp
+// etc.) are not yet handled — the lexer maps the common ones to
+// keywords; this loop only needs the `pg_catalog.regclass` shape so
+// we accept any identifier-or-keyword token that reads as a type
+// name and store it in ObjectName{Schema, Name}.
+func (p *parser) parseTypeNameAfterCast() (ObjectName, error) {
+	first, err := p.consumeTypeIdent()
+	if err != nil {
+		return ObjectName{}, err
+	}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+		p.advance()
+		second, err := p.consumeTypeIdent()
+		if err != nil {
+			return ObjectName{}, err
+		}
+		return ObjectName{Schema: first, Name: second}, nil
+	}
+	return ObjectName{Name: first}, nil
+}
+
+func (p *parser) consumeTypeIdent() (string, error) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenIdent, TokenQuotedIdent:
+		p.advance()
+		return t.Value, nil
+	case TokenKeyword:
+		// Type-name aliases (int, integer, text, varchar, char, …) are
+		// keywords in our lexer; their text is lower-cased in t.Value.
+		p.advance()
+		return t.Value, nil
+	}
+	return "", p.errAtCur("expected type name")
 }
 
 // peekBinaryOp returns the operator text and precedence of the current
