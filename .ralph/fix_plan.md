@@ -678,8 +678,17 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       'YYYY-Mon-DD')`) all round-trip. Running the actual
       HammerDB SF1 load against the live server is a separate
       harness task that's a workstream of its own.)
-- [ ] Foreign-key parsing accepted (enforcement may be a no-op for
+- [x] Foreign-key parsing accepted (enforcement may be a no-op for
       v0; record the decision in a design doc).
+      (achieved 2026-04-28: parser recognises
+      `ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES
+      table [(cols)] [NOT DEFERRABLE | DEFERRABLE]` as a new
+      `AlterTableAddForeignKey` action; executor accepts the
+      kind and only validates that the referenced table
+      exists (42P01 otherwise). All eight HammerDB TPC-H FK
+      ALTER TABLEs from `pgolap.tcl` lines 529–536 run
+      cleanly via psql 18.3. Real enforcement is deferred —
+      see `docs/design/0003-0004-hammerdb-tpch-integration.md`.)
 
 ### Planner depth
 

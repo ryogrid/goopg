@@ -183,6 +183,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterTableAddPrimaryKey(tbl, act); err != nil {
 				return err
 			}
+		case parser.AlterTableAddForeignKey:
+			// v0 accepts the syntax for HammerDB TPC-H
+			// compatibility but does not enforce. The
+			// referenced table must exist (so typos and
+			// dropped relations still surface here); column-
+			// level validation is deferred. See
+			// docs/design/0003-0004-hammerdb-tpch-integration.md.
+			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
+				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
+			}
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}

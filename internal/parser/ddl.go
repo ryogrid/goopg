@@ -401,10 +401,64 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.Kind = AlterTableAddPrimaryKey
 		act.Columns = cols
 		return act, nil
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
+		// ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES
+		// table (cols) [NOT DEFERRABLE | DEFERRABLE]. v0
+		// records the shape but does not enforce — mirrors
+		// upstream's "syntax accepted, lookup deferred" stance
+		// for the duration of TPC-H load. See
+		// docs/design/0003-0004-hammerdb-tpch-integration.md.
+		p.advance()
+		if _, err := p.expectKeyword(KwKey); err != nil {
+			return AlterTableAction{}, err
+		}
+		if !p.acceptSymbol("(") {
+			return AlterTableAction{}, p.errAtCur("expected '(' after FOREIGN KEY")
+		}
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		if !p.acceptSymbol(")") {
+			return AlterTableAction{}, p.errAtCur("expected ')'")
+		}
+		if _, err := p.expectKeyword(KwReferences); err != nil {
+			return AlterTableAction{}, err
+		}
+		refTable, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		var refCols []string
+		if p.acceptSymbol("(") {
+			refCols, err = p.parseColumnNameList()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			if !p.acceptSymbol(")") {
+				return AlterTableAction{}, p.errAtCur("expected ')'")
+			}
+		}
+		// Optional [NOT] DEFERRABLE trailer.
+		deferrable := false
+		if p.acceptKeyword(KwNot) {
+			if _, err := p.expectKeyword(KwDeferrable); err != nil {
+				return AlterTableAction{}, err
+			}
+			deferrable = false
+		} else if p.acceptKeyword(KwDeferrable) {
+			deferrable = true
+		}
+		act.Kind = AlterTableAddForeignKey
+		act.Columns = cols
+		act.RefTable = refTable
+		act.RefColumns = refCols
+		act.Deferrable = deferrable
+		return act, nil
 	default:
 		// ADD [COLUMN] column_def — bare ident or COLUMN keyword.
 		if act.ConstraintName != "" {
-			return AlterTableAction{}, p.errAtCur("expected PRIMARY KEY after CONSTRAINT name")
+			return AlterTableAction{}, p.errAtCur("expected PRIMARY KEY or FOREIGN KEY after CONSTRAINT name")
 		}
 		_ = p.acceptKeyword(KwColumn)
 		col, err := p.parseColumnDef()

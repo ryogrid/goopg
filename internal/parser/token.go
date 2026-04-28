@@ -111,6 +111,8 @@ const (
 	KwConstraint  Keyword = "constraint"
 	KwColumn      Keyword = "column"
 	KwForeign     Keyword = "foreign"
+	KwReferences  Keyword = "references"
+	KwDeferrable  Keyword = "deferrable"
 	KwCopy        Keyword = "copy"
 	KwCheckpoint  Keyword = "checkpoint"
 )
@@ -196,6 +198,8 @@ var keywords = map[string]Keyword{
 	"constraint":  KwConstraint,
 	"column":      KwColumn,
 	"foreign":     KwForeign,
+	"references":  KwReferences,
+	"deferrable":  KwDeferrable,
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
 }

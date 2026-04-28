@@ -384,17 +384,31 @@ type AlterTableActionKind int
 const (
 	AlterTableAddPrimaryKey AlterTableActionKind = iota
 	AlterTableAddColumn
+	// AlterTableAddForeignKey is `ADD [CONSTRAINT name] FOREIGN
+	// KEY (cols) REFERENCES table (cols) [NOT DEFERRABLE |
+	// DEFERRABLE]`. v0 parses it for compatibility with HammerDB
+	// TPC-H's post-load FK pass; enforcement is a no-op until
+	// the constraint subsystem lands. See
+	// docs/design/0003-0004-hammerdb-tpch-integration.md.
+	AlterTableAddForeignKey
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
-// ADD [CONSTRAINT name] PRIMARY KEY (cols) shape pgbench emits and
-// the simpler ADD [COLUMN] coldef form.
+// ADD [CONSTRAINT name] PRIMARY KEY (cols) shape pgbench emits, the
+// simpler ADD [COLUMN] coldef form, and the ADD CONSTRAINT name
+// FOREIGN KEY (cols) REFERENCES table (cols) shape HammerDB TPC-H
+// uses for its post-load FK pass.
 type AlterTableAction struct {
 	pos            int
 	Kind           AlterTableActionKind
 	ConstraintName string    // optional, ADD CONSTRAINT name PRIMARY KEY …
-	Columns        []string  // populated for AddPrimaryKey
+	Columns        []string  // populated for AddPrimaryKey + AddForeignKey (local cols)
 	Column         ColumnDef // populated for AddColumn
+
+	// Foreign-key extras (only populated for AddForeignKey).
+	RefTable   ObjectName
+	RefColumns []string
+	Deferrable bool // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

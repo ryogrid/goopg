@@ -119,6 +119,40 @@ completeness). The translator is intentionally
 substring-rewrite, not a real DateStyle parser; locale-aware
 month names and timezone-aware parsing wait on the type system.
 
+### Foreign-key syntax accepted, enforcement no-op
+
+HammerDB's TPC-H workflow (`HammerDB/src/postgresql/pgolap.tcl`
+lines 529–536) issues eight ALTER TABLE statements after the
+data load:
+
+```
+ALTER TABLE LINEITEM ADD CONSTRAINT LINEITEM_PARTSUPP_FK
+  FOREIGN KEY (L_PARTKEY, L_SUPPKEY)
+  REFERENCES PARTSUPP(PS_PARTKEY, PS_SUPPKEY) NOT DEFERRABLE
+…
+ALTER TABLE LINEITEM ADD CONSTRAINT LINEITEM_ORDER_FK
+  FOREIGN KEY (L_ORDERKEY) REFERENCES ORDERS (O_ORDERKEY) DEFERRABLE
+```
+
+The parser accepts `ADD [CONSTRAINT name] FOREIGN KEY (cols)
+REFERENCES table [(cols)] [NOT DEFERRABLE | DEFERRABLE]` as a
+new `AlterTableAddForeignKey` action and stores the local +
+referenced column lists plus the deferrable flag on the action.
+
+The executor's `ddlOp` for ALTER TABLE accepts the kind and
+performs **no enforcement**: it only verifies that the
+referenced relation exists (so dropped tables and typos surface
+with SQLSTATE 42P01). Real cascade / lookup enforcement
+requires the constraint subsystem and is deferred until at
+least the type-system milestone — TPC-H queries don't need
+referential integrity to run, only the load to complete
+without errors.
+
+The decision matches upstream's "syntactically accepted, but
+behavior changes mid-milestone" stance for unimplemented
+features (e.g. NOT DEFERRABLE / DEFERRABLE both behave the same
+in v0; we record the flag for forward compatibility).
+
 ### What's deliberately deferred
 
 - Real NUMERIC arithmetic (`a + b * c`). v0's expression

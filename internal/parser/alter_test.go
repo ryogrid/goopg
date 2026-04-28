@@ -45,6 +45,67 @@ func TestParseAlterTableNamedConstraint(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddForeignKey pins HammerDB TPC-H's
+// post-load FK pass: `ALTER TABLE … ADD CONSTRAINT name FOREIGN
+// KEY (cols) REFERENCES other (cols) [NOT DEFERRABLE | DEFERRABLE]`.
+// v0 records the shape but does not enforce.
+func TestParseAlterTableAddForeignKey(t *testing.T) {
+	cases := []struct {
+		sql        string
+		localCols  []string
+		refTable   string
+		refCols    []string
+		deferrable bool
+	}{
+		{
+			"ALTER TABLE LINEITEM ADD CONSTRAINT LINEITEM_PARTSUPP_FK FOREIGN KEY (L_PARTKEY, L_SUPPKEY) REFERENCES PARTSUPP(PS_PARTKEY, PS_SUPPKEY) NOT DEFERRABLE",
+			[]string{"l_partkey", "l_suppkey"},
+			"partsupp",
+			[]string{"ps_partkey", "ps_suppkey"},
+			false,
+		},
+		{
+			"ALTER TABLE LINEITEM ADD CONSTRAINT LINEITEM_ORDER_FK FOREIGN KEY (L_ORDERKEY) REFERENCES ORDERS (O_ORDERKEY) DEFERRABLE",
+			[]string{"l_orderkey"},
+			"orders",
+			[]string{"o_orderkey"},
+			true,
+		},
+		{
+			// Trailer omitted entirely.
+			"ALTER TABLE x ADD FOREIGN KEY (a) REFERENCES y(b)",
+			[]string{"a"},
+			"y",
+			[]string{"b"},
+			false,
+		},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("Parse(%q): %v", tc.sql, err)
+			continue
+		}
+		at := stmts[0].(*AlterTableStmt)
+		act := at.Actions[0]
+		if act.Kind != AlterTableAddForeignKey {
+			t.Errorf("%q: kind=%v want AddForeignKey", tc.sql, act.Kind)
+		}
+		if act.RefTable.Name != tc.refTable {
+			t.Errorf("%q: refTable=%q want %q", tc.sql, act.RefTable.Name, tc.refTable)
+		}
+		if len(act.Columns) != len(tc.localCols) {
+			t.Errorf("%q: localCols=%+v want %+v", tc.sql, act.Columns, tc.localCols)
+		}
+		if len(act.RefColumns) != len(tc.refCols) {
+			t.Errorf("%q: refCols=%+v want %+v", tc.sql, act.RefColumns, tc.refCols)
+		}
+		if act.Deferrable != tc.deferrable {
+			t.Errorf("%q: deferrable=%v want %v", tc.sql, act.Deferrable, tc.deferrable)
+		}
+	}
+}
+
 // TestParseAlterTableAddColumn covers the simpler `ADD [COLUMN] coldef`
 // form so ALTER TABLE isn't a one-trick.
 func TestParseAlterTableAddColumn(t *testing.T) {
