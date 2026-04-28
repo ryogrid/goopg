@@ -48,7 +48,9 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		if err != nil {
 			return false, err
 		}
+		slot.RLock()
 		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
 		if err != nil {
 			return false, err

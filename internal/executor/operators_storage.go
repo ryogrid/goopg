@@ -69,6 +69,12 @@ func (o *seqScanOp) Next() (Row, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Hold the page's read lock for the lifetime of our
+			// iteration over its line pointers so writers
+			// (PageAddHeapTuple / PageSetHeapTupleXmax) can't tear
+			// the bytes we're decoding. RUnlock fires from
+			// releasePinned.
+			slot.RLock()
 			o.pinned = slot
 			page := slot.Page()
 			if storage.IsNew(page) {
@@ -110,6 +116,7 @@ func (o *seqScanOp) Next() (Row, error) {
 
 func (o *seqScanOp) releasePinned() {
 	if o.pinned != nil {
+		o.pinned.RUnlock()
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
 	}
@@ -278,11 +285,14 @@ func (o *updateOp) Next() (Row, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.Lock()
 		if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			return nil, err
 		}
 		o.ctx.Pool.MarkDirty(s)
+		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
 			return nil, err
@@ -351,11 +361,14 @@ func (o *deleteOp) Next() (Row, error) {
 		if err != nil {
 			return nil, err
 		}
+		s.Lock()
 		if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
+			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			return nil, err
 		}
 		o.ctx.Pool.MarkDirty(s)
+		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		o.rowsAffected++
 	}
@@ -384,13 +397,16 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 		if err != nil {
 			return err
 		}
+		s.RLock()
 		page := s.Page()
 		if storage.IsNew(page) {
+			s.RUnlock()
 			ctx.Pool.Unpin(s)
 			continue
 		}
 		count, err := storage.PageLinePointerCount(page)
 		if err != nil {
+			s.RUnlock()
 			ctx.Pool.Unpin(s)
 			return err
 		}
@@ -404,6 +420,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				if errors.Is(err, storage.ErrUnsupportedItem) {
 					continue
 				}
+				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return err
 			}
@@ -412,12 +429,14 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			}
 			row, err := DecodeRow(cols, tuple.Data)
 			if err != nil {
+				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return err
 			}
 			if pred != nil {
 				v, err := evalExpr(pred, row, ctx)
 				if err != nil {
+					s.RUnlock()
 					ctx.Pool.Unpin(s)
 					return err
 				}
@@ -430,6 +449,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				row  Row
 			}{slot: slot, row: row})
 		}
+		s.RUnlock()
 		ctx.Pool.Unpin(s)
 		for _, m := range matches {
 			if err := fn(blk, m.slot, m.row); err != nil {
@@ -460,20 +480,32 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 		if err != nil {
 			return err
 		}
+		// Hold the page's content lock across the
+		// IsNew/InitPage/PageAddHeapTuple read-modify-write window
+		// so concurrent writers serialise; without it, two writers
+		// to the same block compute the same upper offset, both
+		// memcpy their tuple over the same bytes, and the
+		// later-rewritten line pointer points at a half-overwritten
+		// payload — the "invalid t_hoff=0" symptom.
+		slot.Lock()
 		if storage.IsNew(slot.Page()) {
 			if err := storage.InitPage(slot.Page()); err != nil {
+				slot.Unlock()
 				ctx.Pool.Unpin(slot)
 				return err
 			}
 		}
 		if _, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
 			ctx.Pool.MarkDirty(slot)
+			slot.Unlock()
 			ctx.Pool.Unpin(slot)
 			return nil
 		} else if !errors.Is(err, storage.ErrNoSpaceInPage) {
+			slot.Unlock()
 			ctx.Pool.Unpin(slot)
 			return err
 		}
+		slot.Unlock()
 		ctx.Pool.Unpin(slot)
 	}
 	// Extend.
@@ -481,11 +513,14 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 	if err != nil {
 		return err
 	}
+	slot.Lock()
 	if _, err := storage.PageAddHeapTuple(slot.Page(), tuple); err != nil {
+		slot.Unlock()
 		ctx.Pool.Unpin(slot)
 		return err
 	}
 	ctx.Pool.MarkDirty(slot)
+	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	return nil
 }

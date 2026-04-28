@@ -381,24 +381,23 @@ unchecked item unless a dependency forces a different order.
       expected 3` — the wire-layer line splitter or the
       CopyFromExecutor field count is wrong on pgbench-generated
       data; needs investigation.))
-- [ ] `pgbench` default and `--select-only` scripts run to completion under
+- [x] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
-      (partial: against `goopg start -D <dir>` after `pgbench -i -s 1`,
-      single-client `pgbench -t 5` (default TPC-B-like) runs 5/5
-      transactions at ~37 TPS; `pgbench -S -t 5` runs 5/5 at ~7100
-      TPS; concurrent `pgbench -S -c 4 -j 2 -t 20` runs 80/80 at
-      ~19k TPS. Took fixes for: analyzer.isNumericTypeName missing
-      "int" (so `aid int = $1::int8` failed type-checking);
-      Pool.Close not flushing dirty pages (data evaporated on
-      shutdown); mvcc.nextXID not persisting across restarts (so
-      reloaded heap tuples were treated as future/in-progress and
-      became invisible) — now stored in catalog snapshot's
-      next_xid field; CURRENT_TIMESTAMP / CURRENT_DATE / etc.
-      parsed as ColumnRef instead of niladic FuncCall.
-      Concurrent default workload (-c 4 -j 2 -t 5) hits a
-      heap-tuple corruption race ("invalid t_hoff=0 len=44") on
-      INSERT/UPDATE — next blocker, likely a buffer-pool or
-      page-add ordering bug.)
+      (achieved 2026-04-28: against `goopg start -D <dir>` after
+      `pgbench -i -s 1`,
+      `pgbench -S -t 5` → 5/5 at ~7100 TPS;
+      `pgbench -t 5` (TPC-B-like, single client) → 5/5 at ~37 TPS;
+      `pgbench -S -c 4 -j 2 -t 20` → 80/80 at ~19k TPS;
+      `pgbench -c 4 -j 2 -t 50` (default) → 200/200 at ~65 TPS,
+      0 failed transactions. Took fixes for: analyzer recognising
+      bare `int` as numeric; Pool.Close flushing dirty pages;
+      mvcc.nextXID persistence in catalog snapshot;
+      CURRENT_TIMESTAMP parsed as niladic FuncCall; per-page
+      content lock (Slot.Lock/Unlock/RLock/RUnlock) around
+      PageAddHeapTuple / PageSetHeapTupleXmax / PageGetHeapTuple
+      so concurrent writers can't tear the line-pointer + upper-
+      region update — was the root cause of the
+      "invalid t_hoff=0 len=44" corruption seen with -c 4 -j 2.)
 
 ## Notes
 

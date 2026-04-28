@@ -44,6 +44,19 @@ func (s *Slot) Page() Page { return s.page }
 // Tag returns the (rel, fork, block) the slot currently holds.
 func (s *Slot) Tag() BufferTag { return s.tag }
 
+// Lock acquires the page's exclusive content lock. Callers that
+// mutate the page bytes (e.g. PageAddHeapTuple, PageSetHeapTupleXmax)
+// must hold this between the start of the modification and the
+// MarkDirty/Unlock sequence. Without it, two concurrent writers can
+// race on the same line-pointer / upper-region update and produce
+// corrupted tuples (upstream PostgreSQL holds a buffer content
+// lock for the same window — see postgres/src/backend/storage/buffer/
+// bufmgr.c LockBuffer(BUFFER_LOCK_EXCLUSIVE)).
+func (s *Slot) Lock()    { s.contentMu.Lock() }
+func (s *Slot) Unlock()  { s.contentMu.Unlock() }
+func (s *Slot) RLock()   { s.contentMu.RLock() }
+func (s *Slot) RUnlock() { s.contentMu.RUnlock() }
+
 // Pool is the buffer manager. It is goroutine-safe.
 type Pool struct {
 	mgr   *Manager
