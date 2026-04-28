@@ -30,7 +30,7 @@ for the authoritative goals; pick work from `.ralph/fix_plan.md`.
 │   ├── executor/      # Query executor and physical operators
 │   ├── access/        # Access methods (heap, btree)
 │   └── auth/          # trust / password / md5 / scram-sha-256
-├── docs/design/       # Design documents (0001, 0002, …) — see §9 of the spec
+├── docs/design/       # Design documents (<id>-NNNN-..., e.g. root-0001-... / 0002-0001-...) — see §9 of the spec
 ├── postgres/          # READ-ONLY upstream PostgreSQL source — reference only
 ├── .ralph/            # Ralph autonomous-loop control files (DO NOT MODIFY)
 └── go.mod
@@ -106,6 +106,12 @@ and/or code comment. Never modify, vendor, or import code from `./postgres/`.
   the upstream source over guessing.
 - Land a design doc alongside or just before any non-trivial subsystem. This
   is a hard requirement, not optional documentation.
+- For any non-trivial subsystem item, create/update the corresponding
+  `docs/design/<milestone-or-spec-id>-NNNN-*.md` file and update
+  `docs/design/README.md`
+  in the same loop and commit.
+- Do not keep bare `NNNN-*` placeholders in active tasks. Replace them with
+  concrete `<id>-NNNN-*` filenames before implementation begins.
 - Tests are valuable, but per `PROMPT.md` they should not exceed ~20% of a
   loop's effort. Implementation > documentation > tests when prioritising.
 - Update `.ralph/fix_plan.md` at the end of every loop: tick boxes, add
@@ -116,5 +122,5 @@ and/or code comment. Never modify, vendor, or import code from `./postgres/`.
 
 - Go module path is `github.com/goopg/goopg` (placeholder; rename if a real
   origin is chosen later).
-- Reported `server_version` is tracked in design doc `0001-architecture-overview.md`
+- Reported `server_version` is tracked in design doc `root-0001-architecture-overview.md`
   so client gating (`pgx`, JDBC, `psql`) behaves predictably.

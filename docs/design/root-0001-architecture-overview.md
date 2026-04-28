@@ -164,19 +164,19 @@ The following are explicitly out of scope here and will be addressed in
 their own design docs:
 
 - The exact wire-protocol parser implementation strategy (hand-rolled
-  scanner vs. generated). → `0002-wire-protocol.md`.
+  scanner vs. generated). → `root-0002-wire-protocol.md`.
 - Authentication mechanism choices and `pg_hba.conf` parsing.
-  → `0003-authentication.md`.
+  → `root-0003-authentication.md`.
 - GUC registry data structures and SET/RESET semantics.
-  → `0004-configuration-and-guc.md`.
+  → `root-0004-configuration-and-guc.md`.
 - The buffer manager replacement strategy and victim selection.
-  → `0005-buffer-manager.md`.
+  → `root-0005-buffer-manager.md`.
 - On-disk page format and tuple layout.
-  → `0006-storage-format.md`.
+  → `root-0006-storage-format.md`.
 - Snapshot manager, transaction IDs, freeze logic.
-  → `0007-mvcc-and-snapshots.md`.
+  → `root-0007-mvcc-and-snapshots.md`.
 - WAL records, segment lifecycle, recovery.
-  → `0008-wal-and-recovery.md`.
+  → `root-0008-wal-and-recovery.md`.
 
 ## Alternatives Considered
 

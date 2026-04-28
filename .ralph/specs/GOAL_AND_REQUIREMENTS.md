@@ -190,7 +190,13 @@ The agent is expected to **produce and maintain design documents incrementally**
 ### 9.2 Where to Put Them
 
 - Store design docs under `docs/design/` in the repository.
-- Use a clear naming scheme, e.g. `docs/design/NNNN-short-slug.md`, with `NNNN` a zero-padded sequence number assigned at creation time.
+- Use a clear naming scheme:
+  `docs/design/<milestone-or-spec-id>-NNNN-short-slug.md`.
+  `<milestone-or-spec-id>` is `root` for this requirements spec and a
+  milestone identifier such as `0002` for milestone-scoped docs.
+  `NNNN` is a zero-padded sequence number within that identifier.
+- Do not leave bare `NNNN-*` placeholders in active plans. Reserve a concrete
+  `<milestone-or-spec-id>-NNNN-*` filename before implementation starts.
 - Maintain an index (`docs/design/README.md`) listing every design doc with its status (`draft`, `accepted`, `superseded`, `historical`) and a one-line summary.
 
 ### 9.3 Treat Them as Permanent

@@ -46,10 +46,10 @@ The 22 TPC-H queries collectively require:
 
 ## Required Design Docs
 
-- `NNNN-planner-overview.md` (if not already produced under M1; otherwise extend the existing one)
-- `NNNN-join-executors.md`
-- `NNNN-statistics-and-cardinality.md`
-- `NNNN-hammerdb-tpch-integration.md` (records anything HammerDB-specific that goopg has to accommodate, including the verification that no stored procedures are in HammerDB's TPC-H path)
+- `0003-0001-planner-overview.md` (if not already produced under M1; otherwise extend the existing one)
+- `0003-0002-join-executors.md`
+- `0003-0003-statistics-and-cardinality.md`
+- `0003-0004-hammerdb-tpch-integration.md` (records anything HammerDB-specific that goopg has to accommodate, including the verification that no stored procedures are in HammerDB's TPC-H path)
 
 ## Reference
 - HammerDB's source code is cloned under `./HammerDB/` for reference. The TPC-H schema build script is at `HammerDB/tpch/postgres/ddl.sql` and the 22 queries are at `HammerDB/tpch/postgres/queries/`.

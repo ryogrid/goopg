@@ -6,7 +6,10 @@ This directory tracks scoped, sequential milestones for goopg. Each milestone ha
 - A set of design docs (under `../design/`) that must exist when the milestone is complete.
 - A concrete Definition of Done with verifiable criteria.
 
-Milestones are numbered with a 4-digit zero-padded prefix matching the design-doc convention used by `docs/design/`. Numbers are assigned at creation and never reused.
+Milestones are numbered with a 4-digit zero-padded prefix. Design-doc
+filenames use `<milestone-or-spec-id>-NNNN-short-slug.md`: `root` for the
+foundational requirements spec and the milestone ID (for example `0002`) for
+milestone-scoped docs. `NNNN` is the per-identifier sequence.
 
 The foundational requirements live in the top-level `REQUIREMENTS.md` at the repository root. That document plays the role of Milestone 0001 implicitly. New scope is captured in additional milestone documents in this directory.
 

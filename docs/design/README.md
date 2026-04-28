@@ -6,10 +6,12 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 ## Conventions
 
-- Filenames use the form `root-NNNN-short-slug.md`, where `NNNN` is a
-  zero-padded global sequence number assigned at creation time and never reused.
+- Filenames use the form `<milestone-or-spec-id>-NNNN-short-slug.md`.
+  `<milestone-or-spec-id>` is `root` for the foundational requirements spec
+  and a milestone identifier such as `0002` for milestone-scoped docs.
+  `NNNN` is a zero-padded sequence number within that identifier.
 - Reserve a concrete filename before implementation work starts; do not
-  leave `NNNN-*` placeholders in active plans.
+  leave bare `NNNN-*` placeholders in active plans.
 - Each doc opens with a short metadata block: status, date, supersedes.
 - Status values: `draft`, `accepted`, `superseded`, `historical`.
 - When a new doc supersedes an older one, mark the older doc

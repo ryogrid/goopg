@@ -65,8 +65,8 @@ Each ported test must reference its upstream source path in a header comment so 
 
 ## Required Design Docs
 
-- `NNNN-go-test-utility-library.md` — API design and rationale for `cluster` and `util` packages, including how they interact with goopg's CLI subcommands.
-- `NNNN-tap-test-port-strategy.md` — selection criteria, porting conventions, and the structure of `docs/test-port/upstream-tap-coverage.md`.
+- `0004-0001-go-test-utility-library.md` — API design and rationale for `cluster` and `util` packages, including how they interact with goopg's CLI subcommands.
+- `0004-0002-tap-test-port-strategy.md` — selection criteria, porting conventions, and the structure of `docs/test-port/upstream-tap-coverage.md`.
 
 ## Definition of Done
 

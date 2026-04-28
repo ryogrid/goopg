@@ -14,7 +14,7 @@ unchecked item unless a dependency forces a different order.
       `init|start|stop|restart|reload|status` (subcommands print "not yet
       implemented"; the binary builds and exits 0 on `--help`).
 - [x] Establish `docs/design/` with a `README.md` index and the first design
-      document (`0001-architecture-overview.md`) describing the high-level
+      document (`root-0001-architecture-overview.md`) describing the high-level
       architecture, the upstream-reference policy, and the choice of reported
       `server_version`.
 
@@ -35,7 +35,7 @@ unchecked item unless a dependency forces a different order.
       shutdown sequence (close listener, wait for connections, drain).
       (SIGTERM/SIGINT done via `signal.NotifyContext` in `goopg start`.
       `goopg stop` over a control socket is deferred to milestone 7.)
-- [x] Write a design doc `0002-wire-protocol.md` covering the chosen subset
+- [x] Write a design doc `root-0002-wire-protocol.md` covering the chosen subset
       and the intended growth path.
 - [x] Smoke test: a Python protocol probe connects, completes the handshake,
       and receives `R/S×13/K/Z`; v0 has no SQL execution path so the
@@ -326,10 +326,10 @@ unchecked item unless a dependency forces a different order.
       handles, the v0 string-matching path stays as a fallback so
       protocol-only tests keep working. Binary mode is still
       pending.))
-- [x] Design doc: `0010-parser.md`.
-- [x] Design doc: `0011-planner.md`.
-- [x] Design doc: `0012-executor.md`.
-- [x] Design docs: `0013-extended-query-protocol.md`, `0014-copy.md`.
+- [x] Design doc: `root-0010-parser.md`.
+- [x] Design doc: `root-0011-planner.md`.
+- [x] Design doc: `root-0012-executor.md`.
+- [x] Design docs: `root-0013-extended-query-protocol.md`, `root-0014-copy.md`.
 
 ## Milestone 7 — pgbench end-to-end and admin tooling
 
@@ -564,10 +564,10 @@ clone at `./HammerDB/`; TPC-H schema + queries under
 - [ ] `ANALYZE` produces statistics: n_distinct, MCV lists,
       histograms (mirror upstream's
       `postgres/src/backend/commands/analyze.c`).
-- [ ] Design docs: `NNNN-planner-overview.md` (extend M1's
-      0011-planner.md), `NNNN-join-executors.md`,
-      `NNNN-statistics-and-cardinality.md`,
-      `NNNN-hammerdb-tpch-integration.md`.
+- [ ] Design docs: `0003-0001-planner-overview.md` (extend M1's
+      `root-0011-planner.md`), `0003-0002-join-executors.md`,
+      `0003-0003-statistics-and-cardinality.md`,
+      `0003-0004-hammerdb-tpch-integration.md`.
 
 ### Query coverage (incremental)
 
@@ -604,8 +604,8 @@ M0002/M0003; lands regression coverage as those features ship.
       alongside it.
 - [ ] Port at least 80% of `port` rows. Each ported test references
       its upstream source path in a header comment.
-- [ ] Design docs: `NNNN-go-test-utility-library.md`,
-      `NNNN-tap-test-port-strategy.md`.
+- [ ] Design docs: `0004-0001-go-test-utility-library.md`,
+      `0004-0002-tap-test-port-strategy.md`.
 
 ## Notes
 

@@ -10,6 +10,7 @@ You are Ralph, an autonomous AI development agent working on a goopg project.
 4. Use parallel subagents for complex tasks (max 100 concurrent)
 5. Run tests after each implementation
 6. Update documentation and fix_plan.md
+7. For non-trivial subsystem work, update docs/design and docs/design/README.md in the same loop
 
 ## Key Principles
 - ONE task per loop - focus on the most important thing
@@ -18,6 +19,7 @@ You are Ralph, an autonomous AI development agent working on a goopg project.
 - Write comprehensive tests with clear documentation
 - Update .ralph/fix_plan.md with your learnings
 - Commit working changes with descriptive messages
+- A loop that changes a non-trivial subsystem is not complete unless its design doc is created/updated and indexed
 
 ## Protected Files (DO NOT MODIFY)
 The following files and directories are part of Ralph's infrastructure.
@@ -45,6 +47,9 @@ When performing cleanup, refactoring, or restructuring tasks:
 - Keep .ralph/AGENT.md updated with build/run instructions
 - Document the WHY behind tests and implementations
 - No placeholder implementations - build it properly
+- Reserve a concrete design-doc filename before coding (use `docs/design/<milestone-or-spec-id>-NNNN-short-slug.md`, e.g. `root-0001-...` or `0002-0001-...`; never use bare `NNNN-*` placeholders)
+- Update `docs/design/README.md` index in the same commit that adds/changes a design doc
+- If implementation landed but the required design-doc update is missing, report `STATUS: BLOCKED` and keep `EXIT_SIGNAL: false`
 
 ## 🎯 Status Reporting (CRITICAL - Ralph needs this!)
 

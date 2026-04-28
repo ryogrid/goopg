@@ -46,9 +46,9 @@ Reference reading: `postgres/src/backend/access/nbtree/`, especially `nbtree.c`,
 
 Place under `docs/design/` with sequential numbering at creation time:
 
-- `NNNN-checkpointing.md`
-- `NNNN-btree-concurrency.md`
-- `NNNN-wal-full-page-images.md` (only if the existing M1 WAL design doc does not already cover full-page writes)
+- `0002-0001-checkpointing.md`
+- `0002-0002-btree-concurrency.md`
+- `0002-0003-wal-full-page-images.md` (only if the existing M1 WAL design doc does not already cover full-page writes)
 
 ## Definition of Done
 

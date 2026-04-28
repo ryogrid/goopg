@@ -111,12 +111,12 @@ than reading magic strings out of test fixtures.
 
 ### Why not extend 0002?
 
-`docs/design/0002-wire-protocol.md` covers the listener and the
+`docs/design/root-0002-wire-protocol.md` covers the listener and the
 startup handshake; it explicitly defers the simple Query path to its
 own doc. The simple Query path is heavier (parser, planner, executor
 in real builds) so it gets its own design lineage starting here, and
-the proper coverage will arrive in `0010-parser.md` /
-`0011-planner.md` / `0012-executor.md` when those land. This doc
+the proper coverage will arrive in `root-0010-parser.md` /
+`root-0011-planner.md` / `root-0012-executor.md` when those land. This doc
 records the *interim* decisions so they can be cleanly retired.
 
 ## Alternatives Considered

@@ -137,7 +137,7 @@ this order:
 
 | Key                         | v0 value                               | Source                                         |
 | --------------------------- | -------------------------------------- | ---------------------------------------------- |
-| `server_version`            | `"18.3"`                               | docs/design/0001-architecture-overview.md §5   |
+| `server_version`            | `"18.3"`                               | docs/design/root-0001-architecture-overview.md §5   |
 | `server_encoding`           | `"UTF8"`                               | spec §4.2                                      |
 | `client_encoding`           | `"UTF8"`                               | spec §4.2                                      |
 | `application_name`          | echoed from `StartupMessage` (or `""`) | spec §4.2                                      |
