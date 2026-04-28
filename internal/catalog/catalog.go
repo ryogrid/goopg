@@ -180,6 +180,39 @@ func (c *InMemory) registerSystemTables() {
 	c.tables["pg_catalog.pg_class"] = pgClass
 }
 
+// RegisterVirtualTable installs a virtual table built by an
+// out-of-tree caller. Used by the runtime to wire stats views
+// (`pg_stat_checkpointer`, etc.) whose row data lives outside
+// the catalog. The supplied table must have Virtual=true and a
+// non-nil VirtualRows; otherwise an error is returned.
+//
+// Like the seeded `pg_catalog.pg_class`, virtual tables are NOT
+// part of the persisted catalog snapshot — the caller is
+// expected to re-register on every startup.
+func (c *InMemory) RegisterVirtualTable(t *Table) error {
+	if t == nil {
+		return fmt.Errorf("RegisterVirtualTable: nil table")
+	}
+	if !t.Virtual || t.VirtualRows == nil {
+		return fmt.Errorf("RegisterVirtualTable: %s is not a virtual table with a row provider", t.QualifiedName())
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
+	if _, exists := c.tables[k]; exists {
+		return fmt.Errorf("relation %q already exists", k)
+	}
+	if t.OID == 0 {
+		t.OID = c.nextOID
+		c.nextOID++
+	}
+	for i := range t.Columns {
+		t.Columns[i].Ordinal = i
+	}
+	c.tables[k] = t
+	return nil
+}
+
 // key builds the map key for a parser.ObjectName. Matching follows
 // upstream's lower-cased convention: unquoted identifiers were
 // already lower-cased by the lexer; quoted identifiers preserve

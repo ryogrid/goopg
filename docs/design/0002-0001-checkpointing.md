@@ -259,6 +259,36 @@ without a config knob.
 The same pattern applies to `wal.Writer.WrittenLSN` via the
 `volumeReporter` interface inside the checkpointer.
 
+### 7. Operator visibility: pg_stat_checkpointer
+
+Checkpointer counters surface as a virtual `pg_catalog.pg_stat_checkpointer`
+view so operators (and HammerDB / pgbench tooling) can observe
+cadence without attaching a debugger:
+
+| Column                | v0 source                             |
+| --------------------- | ------------------------------------- |
+| num_timed             | timer-driven `runCheckpoint(spread=true)` count |
+| num_requested         | SQL CHECKPOINT / CLI ctl / volume-triggered count |
+| restartpoints_*       | `0` (no replication in v0)            |
+| write_time            | cumulative ms inside `flushDirty`     |
+| sync_time             | `0` (we don't separate fsync)         |
+| total_time            | same as `write_time` for v0           |
+| buffers_written       | `0` (per-cycle counter not yet wired) |
+| slru_written          | `0` (no SLRU yet)                     |
+| stats_reset           | server-start timestamp                |
+
+`Checkpointer` carries four atomic counters
+(`numTimed`/`numRequested`/`writeTimeMs`/`statsResetAt`)
+incremented inside `runCheckpoint` after a successful flush +
+marker. `Stats()` returns a coherent snapshot. `initdb.Open`
+constructs the virtual table via the new
+`(*catalog.InMemory).RegisterVirtualTable` and wires the row
+provider to `cp.Stats()` so each `SELECT` against the view
+reads the live counters. Like `pg_class`, the view is NOT
+persisted — the runtime re-registers it on every startup, so
+the row provider's closure always references the current
+checkpointer.
+
 ## Recovery behavior
 
 Recovery (`internal/wal/recovery.go`) was not changed in this
@@ -275,12 +305,11 @@ TAP utility-library doc under M0004.
 - Recycling old WAL segments per `min_wal_size`. The writer
   currently keeps everything; a follow-up loop will add segment
   recycling once `min_wal_size` becomes load-bearing.
-- `pg_stat_bgwriter` / `pg_stat_checkpointer` virtual tables.
-  Listed in the M0002 fix-plan but pending the catalog work to
-  expose them through pg_class as queryable views.
-- The `goopg ctl checkpoint` CLI subcommand. The SQL verb already
-  exposes the trigger end-to-end; the CLI hook is a tiny wrapper on
-  the control socket.
+- `pg_stat_bgwriter` virtual table. goopg has no separate
+  bgwriter, so the upstream view (which excludes checkpoint
+  counters since PG 17) has no analogue here.
+- Per-checkpoint `buffers_written` counter on
+  `pg_stat_checkpointer`.
 - Surfacing `MarkDirty` FPI errors. See §5.
 
 ## Cross-references

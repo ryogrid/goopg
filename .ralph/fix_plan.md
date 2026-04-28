@@ -504,9 +504,19 @@ full Definition of Done. Decomposed into agent-sized chunks below.
       handler drops the listener read deadline before invoking
       `Checkpointer.CheckpointNow()` so a long flush won't trip
       the default 5s timeout. CLI default is 300s.
-- [ ] Surface `pg_stat_bgwriter` / `pg_stat_checkpointer` (whichever
+- [x] Surface `pg_stat_bgwriter` / `pg_stat_checkpointer` (whichever
       view shipped in PG 18; pick what matches the reported
       server_version) as queryable virtual tables.
+      `pg_stat_checkpointer` (the PG 18 view) is now wired:
+      `Checkpointer.Stats()` returns atomic-counter snapshots
+      (num_timed, num_requested, write_time_ms, last_checkpoint_lsn,
+      stats_reset), `runCheckpoint` increments them per cycle, and
+      `initdb.Open` registers a virtual table via the new
+      `(*catalog.InMemory).RegisterVirtualTable`. Column shape
+      matches PG 18 (restartpoints_*, sync_time, buffers_written,
+      slru_written report 0 — see design §7 for what's deferred).
+      `pg_stat_bgwriter` has no analogue in v0 (no separate
+      bgwriter; documented in the design doc's Out-of-scope).
 - [x] Crash-recovery test: simulated SIGKILL mid-workload, restart,
       verify committed mutations survive WAL replay.
       `internal/initdb/recovery_test.go` builds a populated B-tree,

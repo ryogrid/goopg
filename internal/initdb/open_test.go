@@ -31,6 +31,49 @@ func TestOpenAfterInitReturnsRuntime(t *testing.T) {
 	}
 }
 
+// TestOpenRegistersStatCheckpointerView: the runtime wires
+// pg_catalog.pg_stat_checkpointer as a virtual table backed by
+// the live Checkpointer counters. After one CheckpointNow, the
+// num_requested column should report "1".
+func TestOpenRegistersStatCheckpointerView(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+
+	tbl, ok := rt.Catalog.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_checkpointer"})
+	if !ok {
+		t.Fatal("pg_catalog.pg_stat_checkpointer not registered")
+	}
+	if !tbl.Virtual || tbl.VirtualRows == nil {
+		t.Fatal("pg_stat_checkpointer is not a virtual table with a row provider")
+	}
+
+	// Run one synchronous checkpoint and verify the row reflects it.
+	if err := rt.Checkpointer.CheckpointNow(); err != nil {
+		t.Fatal(err)
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("VirtualRows len=%d want 1", len(rows))
+	}
+	if got := rows[0][1]; got != "1" {
+		t.Errorf("num_requested=%q want \"1\"", got)
+	}
+	if got := rows[0][0]; got != "0" {
+		t.Errorf("num_timed=%q want \"0\" (no timer firings)", got)
+	}
+	// stats_reset should be a non-empty timestamp string.
+	if rows[0][10] == "" {
+		t.Errorf("stats_reset is empty")
+	}
+}
+
 // TestOpenRejectsUninitializedDir: pointing the server at a
 // directory that goopg init never touched should fail fast with
 // the diagnostic that names the missing PG_VERSION as the

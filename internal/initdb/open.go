@@ -203,6 +203,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{})
 
+	// Surface the M0002 checkpointer counters as the
+	// pg_stat_checkpointer virtual table so operators can observe
+	// timer-vs-requested cadence and write_time without attaching
+	// a debugger. Column shape mirrors PG 18.x's view; the
+	// upstream-aligned columns we don't track in v0 (restartpoints*,
+	// buffers_written, slru_written) report literal 0.
+	if err := registerStatCheckpointerView(cat, cp); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+
 	return &Runtime{
 		StorageMgr:   mgr,
 		Pool:         pool,
@@ -212,6 +225,47 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Checkpointer: cp,
 		DataDir:      abs,
 	}, nil
+}
+
+// registerStatCheckpointerView installs the
+// `pg_catalog.pg_stat_checkpointer` virtual table backed by
+// `Checkpointer.Stats`. Column ordering matches upstream PG 18.x.
+func registerStatCheckpointerView(cat *catalog.InMemory, cp *wal.Checkpointer) error {
+	tbl := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_stat_checkpointer",
+		Columns: []catalog.Column{
+			{Name: "num_timed", Type: catalog.Type{Name: "text"}},
+			{Name: "num_requested", Type: catalog.Type{Name: "text"}},
+			{Name: "restartpoints_timed", Type: catalog.Type{Name: "text"}},
+			{Name: "restartpoints_req", Type: catalog.Type{Name: "text"}},
+			{Name: "restartpoints_done", Type: catalog.Type{Name: "text"}},
+			{Name: "write_time", Type: catalog.Type{Name: "text"}},
+			{Name: "sync_time", Type: catalog.Type{Name: "text"}},
+			{Name: "total_time", Type: catalog.Type{Name: "text"}},
+			{Name: "buffers_written", Type: catalog.Type{Name: "text"}},
+			{Name: "slru_written", Type: catalog.Type{Name: "text"}},
+			{Name: "stats_reset", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	tbl.VirtualRows = func() [][]string {
+		s := cp.Stats()
+		return [][]string{{
+			fmt.Sprintf("%d", s.NumTimed),
+			fmt.Sprintf("%d", s.NumRequested),
+			"0", // restartpoints_timed (no replication in v0)
+			"0", // restartpoints_req
+			"0", // restartpoints_done
+			fmt.Sprintf("%d", s.WriteTimeMs),
+			"0", // sync_time (not separated from write_time in v0)
+			fmt.Sprintf("%d", s.WriteTimeMs),
+			"0", // buffers_written (per-checkpoint counter not yet wired)
+			"0", // slru_written
+			s.StatsResetAt.UTC().Format("2006-01-02 15:04:05.000-07"),
+		}}
+	}
+	return cat.RegisterVirtualTable(tbl)
 }
 
 // loadCatalogSnapshot reads <dir>/global/pg_catalog.json (if

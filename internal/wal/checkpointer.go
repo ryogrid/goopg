@@ -89,16 +89,52 @@ type Checkpointer struct {
 	cfg     CheckpointerConfig
 
 	lastCheckpointLSN atomic.Uint64
+
+	// Aggregate counters surfaced through pg_stat_checkpointer.
+	// Mirror the upstream PG 18 view's counter shape:
+	// num_timed     — timer-driven cycles
+	// num_requested — SQL CHECKPOINT, CLI ctl, max_wal_size volume
+	// write_time_ms — cumulative wall time inside flushDirty
+	// statsResetAt  — timestamp of the last counter reset
+	//                 (currently only set at construction)
+	numTimed     atomic.Uint64
+	numRequested atomic.Uint64
+	writeTimeMs  atomic.Uint64
+	statsResetAt atomic.Int64 // unix nanos
+}
+
+// Stats is the snapshot pg_stat_checkpointer renders into a row.
+type Stats struct {
+	NumTimed          uint64
+	NumRequested      uint64
+	WriteTimeMs       uint64
+	LastCheckpointLSN uint64
+	StatsResetAt      time.Time
+}
+
+// Stats returns a coherent counter snapshot. Atomic loads only —
+// the result is a point-in-time view, fine for the
+// pg_stat_checkpointer virtual table.
+func (c *Checkpointer) Stats() Stats {
+	return Stats{
+		NumTimed:          c.numTimed.Load(),
+		NumRequested:      c.numRequested.Load(),
+		WriteTimeMs:       c.writeTimeMs.Load(),
+		LastCheckpointLSN: c.lastCheckpointLSN.Load(),
+		StatsResetAt:      time.Unix(0, c.statsResetAt.Load()),
+	}
 }
 
 // NewCheckpointer constructs a checkpointer worker.
 func NewCheckpointer(flusher DirtyPageFlusher, wal checkpointWAL, cfg CheckpointerConfig) *Checkpointer {
 	cfg.withDefaults()
-	return &Checkpointer{
+	c := &Checkpointer{
 		flusher: flusher,
 		wal:     wal,
 		cfg:     cfg,
 	}
+	c.statsResetAt.Store(time.Now().UnixNano())
+	return c
 }
 
 // LastCheckpointLSN returns the most recent successful checkpoint marker LSN.
@@ -212,13 +248,21 @@ func (c *Checkpointer) CheckpointNow() error {
 // marker is appended after writeback completes and is always
 // flushed synchronously — pacing only governs the dirty-page
 // drain.
+//
+// `spread` also classifies the checkpoint for pg_stat_checkpointer:
+// timer-driven cycles set `spread=true` and bump num_timed; SQL
+// CHECKPOINT / CLI ctl / volume-triggered cycles set `spread=false`
+// and bump num_requested. write_time_ms accumulates the wall time
+// spent in flushDirty, matching upstream's checkpointer view.
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	start := time.Now()
 	pacer := c.buildPacer(ctx, spread, start)
 
+	flushStart := time.Now()
 	if err := c.flushDirty(pacer); err != nil {
 		return fmt.Errorf("flush dirty pages: %w", err)
 	}
+	c.writeTimeMs.Add(uint64(time.Since(flushStart).Milliseconds()))
 	_, endLSN, err := c.wal.Append(EncodeCheckpoint())
 	if err != nil {
 		return fmt.Errorf("append checkpoint marker: %w", err)
@@ -227,6 +271,11 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		return fmt.Errorf("flush checkpoint marker up to lsn %d: %w", endLSN, err)
 	}
 	c.lastCheckpointLSN.Store(endLSN)
+	if spread {
+		c.numTimed.Add(1)
+	} else {
+		c.numRequested.Add(1)
+	}
 	// Open a new full-page-image epoch: the next mutation of each
 	// page must emit a fresh FPI so crash recovery from this
 	// checkpoint can replay it on a torn page.
