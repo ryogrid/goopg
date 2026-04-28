@@ -302,14 +302,7 @@ func (s *Server) handleExecuteFrame(state *extendedState, payload []byte, w *pro
 	}
 
 	if portal.Result == nil {
-		if portal.Statement.ParamCount > 0 {
-			return &extendedMessageError{
-				Code:    sqlstate.FeatureNotSupported,
-				Message: "bind parameters in Execute are not supported yet",
-				Routine: "server.handleExecuteFrame",
-			}, nil
-		}
-		res, qerr := executeExtendedQuery(sess, portal.Statement.Query, portal.Params)
+		res, qerr := s.executeExtendedQuery(sess, portal.Statement.Query, portal.Params)
 		if qerr != nil {
 			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Routine: "server.handleExecuteFrame"}, nil
 		}
@@ -398,10 +391,7 @@ func (s *Server) handleCloseFrame(state *extendedState, payload []byte) *extende
 	}
 }
 
-func executeExtendedQuery(sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
-	if len(params) > 0 {
-		return nil, &extendedQueryError{Code: sqlstate.FeatureNotSupported, Message: "bind parameters are not supported yet"}
-	}
+func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
@@ -496,10 +486,17 @@ func executeExtendedQuery(sess *config.SessionRegistry, query string, params []b
 		return &extendedQueryResult{CommandTag: "RESET"}, nil
 	}
 
+	if s.cfg.hasStorage() {
+		return s.executeExtendedQueryViaExecutor(trimmed, params)
+	}
+
+	if len(params) > 0 {
+		return nil, &extendedQueryError{Code: sqlstate.FeatureNotSupported, Message: "bind parameters are not supported yet (storage not configured)"}
+	}
 	return nil, &extendedQueryError{
 		Code: sqlstate.FeatureNotSupported,
 		Message: fmt.Sprintf("query not supported by goopg v0: %q "+
-			"(only SELECT 1 / SHOW / SET / RESET are recognised until the parser lands)", trimmed),
+			"(only SELECT 1 / SHOW / SET / RESET are recognised until storage is wired via -D)", trimmed),
 	}
 }
 

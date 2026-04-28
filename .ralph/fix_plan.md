@@ -351,17 +351,20 @@ unchecked item unless a dependency forces a different order.
       parser→planner→executor — DDL (CREATE/DROP/ALTER/TRUNCATE/
       INDEX), DML (INSERT/UPDATE/DELETE), VACUUM/ANALYZE, and
       Transaction verbs all emit upstream-shaped CommandComplete
-      tags ("DROP TABLE", "INSERT 0 N", etc.). pgbench -i now
-      gets past the DROP/CREATE table preamble and the
-      pre-COPY BEGIN; next blockers: (a) extended-query bind
-      parameters for table-touching statements aren't routed
-      through the executor — pgbench probes `SELECT relkind FROM
-      pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass`
-      via Parse/Bind/Execute, hitting "bind parameters in
-      Execute are not supported yet"; (b) pg_catalog system
-      tables (pg_class, pg_attribute, etc.) aren't implemented,
-      so even if the bind parameters worked, the SELECT would
-      return 42P01.)
+      tags ("DROP TABLE", "INSERT 0 N", etc.). The extended-query
+      path (Parse/Bind/Describe/Execute) now also routes through
+      parser→planner→executor when storage is wired — bind
+      parameters become executor.Datum (text-format ints become
+      KindInt; everything else becomes KindString) and flow
+      through Context.Params for ParamRef resolution. pgbench -i
+      now gets past DROP/CREATE preamble, the pre-COPY BEGIN,
+      and the bind-parameter handshake. Next blockers: (a) the
+      parser doesn't recognise `::` typecast — pgbench probes
+      `SELECT relkind FROM pg_catalog.pg_class WHERE
+      oid=$1::pg_catalog.regclass` and fails at byte 52 with
+      `unexpected character ':'`; (b) `pg_catalog` system tables
+      aren't implemented, so even with `::` parsed, the SELECT
+      would return 42P01.)
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
 
