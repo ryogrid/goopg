@@ -298,10 +298,15 @@ unchecked item unless a dependency forces a different order.
       `pgbench -i`.
       (partial: simple-query COPY wire loop now handles a minimal
       `COPY (SELECT 1) TO STDOUT` path and COPY FROM STDIN data mode;
-      parser now produces a `parser.CopyStmt` (FROM/TO, STDIN/STDOUT/
+      parser produces a `parser.CopyStmt` (FROM/TO, STDIN/STDOUT/
       file/PROGRAM, parenthesised + legacy WITH options including
-      FORCE_QUOTE *, FORCE_NOT_NULL/(cols)). Planner/executor wiring
-      and binary mode are still pending.)
+      FORCE_QUOTE *, FORCE_NOT_NULL/(cols)); planner now resolves
+      `parser.CopyStmt` to `planner.Copy` (catalog table + column
+      ordinals, query-form plans the inner SELECT, plan-time option
+      validator with SQLSTATE 42P01/42703/42701/42601/0A000).
+      Executor copy operator and the server replacement of the
+      string-matching dispatch are still pending; binary mode also
+      pending.)
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
 - [x] Design doc: `0012-executor.md`.

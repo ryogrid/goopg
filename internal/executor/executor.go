@@ -72,6 +72,15 @@ func Build(plan planner.Node) (Operator, error) {
 		return newDDLOp(p), nil
 	case *planner.Transaction:
 		return newTransactionOp(p), nil
+	case *planner.Copy:
+		// COPY is currently driven from the wire-protocol layer
+		// (see internal/server/copy.go). The planner produces a
+		// Copy node so the layer can resolve table/columns through
+		// the catalog without re-parsing; once the executor copy
+		// operator lands the Build dispatch will return it. Until
+		// then, fall through with a stable feature-not-supported
+		// error rather than a generic "unsupported plan node".
+		return nil, &ExecError{Code: "0A000", Pos: p.Pos(), Message: "COPY is driven from the wire layer; planner.Copy has no executor path yet"}
 	}
 	return nil, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: fmt.Sprintf("unsupported plan node %T", plan)}
 }

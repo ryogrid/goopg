@@ -329,3 +329,48 @@ type Utility struct {
 
 func (n *Utility) Pos() int       { return n.pos }
 func (n *Utility) Output() Schema { return nil }
+
+// CopyDirection records whether the COPY moves data into or out of
+// the table. Mirrors parser.CopyDirection so the executor doesn't
+// need to import the parser package directly.
+type CopyDirection int
+
+const (
+	CopyFrom CopyDirection = iota
+	CopyTo
+)
+
+// CopyEndpoint discriminates the source/sink. v0 implements
+// stdin/stdout end-to-end and parses file/PROGRAM into stable
+// "feature_not_supported" errors at execute time.
+type CopyEndpoint int
+
+const (
+	CopyEndpointStdin CopyEndpoint = iota
+	CopyEndpointStdout
+	CopyEndpointFile
+	CopyEndpointProgram
+)
+
+// Copy — `COPY (table [(cols)] | (query)) {FROM|TO} {endpoint} [opts]`.
+//
+// Exactly one of Table/Query is set. ColumnIndex lists table column
+// ordinals for the table-form COPY; for query-form COPY TO it's nil
+// (the schema comes from Query.Output()). Options is a passthrough
+// of the parser option list — execute-time interpretation is
+// centralised in the executor so the wire layer doesn't have to
+// agree on a normalisation path.
+type Copy struct {
+	pos         int
+	Direction   CopyDirection
+	Table       *catalog.Table
+	ColumnIndex []int
+	Query       Node
+	Endpoint    CopyEndpoint
+	Filename    string
+	Options     []parser.CopyOption
+	schema      Schema
+}
+
+func (n *Copy) Pos() int       { return n.pos }
+func (n *Copy) Output() Schema { return n.schema }

@@ -67,6 +67,9 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
+
+	case *parser.CopyStmt:
+		return planCopy(s, cat)
 	}
 	return nil, &PlanError{
 		Pos:     stmt.Pos(),
