@@ -46,11 +46,17 @@ const (
 	MsgParameterStatus    byte = 'S'
 	MsgBackendKeyData     byte = 'K'
 	MsgReadyForQuery      byte = 'Z'
+	MsgParseComplete      byte = '1'
+	MsgBindComplete       byte = '2'
+	MsgCloseComplete      byte = '3'
 	MsgErrorResponse      byte = 'E'
 	MsgNoticeResponse     byte = 'N'
 	MsgRowDescription     byte = 'T'
+	MsgParameterDesc      byte = 't'
 	MsgDataRow            byte = 'D'
 	MsgCommandComplete    byte = 'C'
+	MsgPortalSuspended    byte = 's'
+	MsgNoData             byte = 'n'
 	MsgEmptyQueryResponse byte = 'I'
 )
 
@@ -61,6 +67,13 @@ const (
 	MsgTerminate       byte = 'X'
 	MsgQuery           byte = 'Q'
 	MsgPasswordMessage byte = 'p'
+	MsgParse           byte = 'P'
+	MsgBind            byte = 'B'
+	MsgDescribe        byte = 'D'
+	MsgExecute         byte = 'E'
+	MsgSync            byte = 'S'
+	MsgFlush           byte = 'H'
+	MsgClose           byte = 'C'
 )
 
 // AuthenticationRequest subcodes (postgres/src/include/libpq/protocol.h:74).

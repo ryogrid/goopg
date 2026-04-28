@@ -437,6 +437,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
 func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger) {
+	extended := newExtendedState()
 	for {
 		if ctx.Err() != nil {
 			s.writeFatal(w, sqlstate.AdminShutdown, "terminating connection due to administrator command")
@@ -449,6 +450,9 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 			}
 			return
 		}
+		if extended.syncRequired && f.Type != protocol.MsgSync && f.Type != protocol.MsgTerminate {
+			continue
+		}
 		switch f.Type {
 		case protocol.MsgTerminate:
 			return
@@ -457,6 +461,71 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 				logger.Debug("handleQuery write error", "err", err)
 				return
 			}
+		case protocol.MsgParse:
+			em := s.handleParseFrame(extended, f.Payload)
+			if em != nil {
+				if err := s.writeExtendedMessageError(w, em); err != nil {
+					return
+				}
+				extended.syncRequired = true
+				break
+			}
+			if err := w.WriteParseComplete(); err != nil {
+				return
+			}
+		case protocol.MsgBind:
+			em := s.handleBindFrame(extended, f.Payload)
+			if em != nil {
+				if err := s.writeExtendedMessageError(w, em); err != nil {
+					return
+				}
+				extended.syncRequired = true
+				break
+			}
+			if err := w.WriteBindComplete(); err != nil {
+				return
+			}
+		case protocol.MsgDescribe:
+			em, err := s.handleDescribeFrame(extended, f.Payload, w)
+			if err != nil {
+				return
+			}
+			if em != nil {
+				if err := s.writeExtendedMessageError(w, em); err != nil {
+					return
+				}
+				extended.syncRequired = true
+			}
+		case protocol.MsgExecute:
+			em, err := s.handleExecuteFrame(extended, f.Payload, w, sess)
+			if err != nil {
+				return
+			}
+			if em != nil {
+				if err := s.writeExtendedMessageError(w, em); err != nil {
+					return
+				}
+				extended.syncRequired = true
+			}
+		case protocol.MsgClose:
+			em := s.handleCloseFrame(extended, f.Payload)
+			if em != nil {
+				if err := s.writeExtendedMessageError(w, em); err != nil {
+					return
+				}
+				extended.syncRequired = true
+				break
+			}
+			if err := w.WriteCloseComplete(); err != nil {
+				return
+			}
+		case protocol.MsgSync:
+			extended.syncRequired = false
+			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+				return
+			}
+		case protocol.MsgFlush:
+			// Flush itself carries no payload and no response frame.
 		default:
 			err = w.WriteErrorResponse([]protocol.ErrorField{
 				{Code: protocol.FieldSeverity, Value: "ERROR"},

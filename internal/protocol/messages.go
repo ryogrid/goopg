@@ -103,6 +103,41 @@ func (fw *FrameWriter) WriteReadyForQuery(status TransactionStatus) error {
 	return fw.WriteFrame(MsgReadyForQuery, []byte{byte(status)})
 }
 
+// WriteParseComplete emits '1' with no payload.
+func (fw *FrameWriter) WriteParseComplete() error {
+	return fw.WriteFrame(MsgParseComplete, nil)
+}
+
+// WriteBindComplete emits '2' with no payload.
+func (fw *FrameWriter) WriteBindComplete() error {
+	return fw.WriteFrame(MsgBindComplete, nil)
+}
+
+// WriteCloseComplete emits '3' with no payload.
+func (fw *FrameWriter) WriteCloseComplete() error {
+	return fw.WriteFrame(MsgCloseComplete, nil)
+}
+
+// WritePortalSuspended emits 's' with no payload.
+func (fw *FrameWriter) WritePortalSuspended() error {
+	return fw.WriteFrame(MsgPortalSuspended, nil)
+}
+
+// WriteParameterDescription emits 't' / int16 count / int32 typeOID[*].
+func (fw *FrameWriter) WriteParameterDescription(typeOIDs []uint32) error {
+	payload := make([]byte, 0, 2+4*len(typeOIDs))
+	payload = appendUint16(payload, uint16(len(typeOIDs)))
+	for _, oid := range typeOIDs {
+		payload = appendUint32(payload, oid)
+	}
+	return fw.WriteFrame(MsgParameterDesc, payload)
+}
+
+// WriteNoData emits 'n' with no payload.
+func (fw *FrameWriter) WriteNoData() error {
+	return fw.WriteFrame(MsgNoData, nil)
+}
+
 // ErrorField is one (code, value) pair inside an ErrorResponse or
 // NoticeResponse body. See docs/design/0002-wire-protocol.md for the list
 // of codes the v0 server emits.

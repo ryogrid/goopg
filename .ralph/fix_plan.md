@@ -293,7 +293,7 @@ unchecked item unless a dependency forces a different order.
         (`BasicSession`), with BEGIN allocating xid/snapshot,
         COMMIT/ROLLBACK finishing the active xid, nested BEGIN as
         no-op, and explicit-tx lifecycle tests.
-- [ ] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
+- [x] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
 - [x] Design doc: `0010-parser.md`.
