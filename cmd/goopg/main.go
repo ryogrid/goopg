@@ -113,7 +113,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 func runStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.String("D", "", "data directory (unused in v0; reserved for milestone 7)")
+	dataDir := fs.String("D", "", "data directory (created via 'goopg init'; when empty, the server runs without storage handles and only the protocol-only paths are reachable)")
 	confPath := fs.String("config", "", "path to postgresql.conf (default: built-in defaults)")
 	addr := fs.String("listen", "127.0.0.1:5432", "TCP listen address (host:port)")
 	hbaPath := fs.String("hba", "", "path to pg_hba.conf (default: built-in loopback-trust policy)")
@@ -133,6 +133,20 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	cfg := server.Config{
 		Address: *addr,
 		Logger:  logger,
+	}
+	var rt *initdb.Runtime
+	if *dataDir != "" {
+		var err error
+		rt, err = initdb.Open(initdb.OpenOptions{DataDir: *dataDir})
+		if err != nil {
+			fmt.Fprintf(stderr, "goopg start: %v\n", err)
+			return 1
+		}
+		defer func() { _ = rt.Close() }()
+		cfg.Catalog = rt.Catalog
+		cfg.Pool = rt.Pool
+		cfg.TxnMgr = rt.TxnMgr
+		logger.Info("opened data directory", "path", rt.DataDir)
 	}
 	if *confPath != "" {
 		entries, err := config.ParseConfigFile(*confPath)

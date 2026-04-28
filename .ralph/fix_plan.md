@@ -334,6 +334,15 @@ unchecked item unless a dependency forces a different order.
       system catalog and a `pg_control` file are deferred to the
       on-disk catalog work.
 - [ ] `goopg start|stop|restart|reload|status` operate the running server.
+      (`goopg start -D <dir>` now opens a storage Manager + Pool +
+      MVCC + in-memory Catalog from a data directory previously
+      laid out by `goopg init` and passes them into Server.Config,
+      so the binary serves the same parser→planner→executor path
+      the test harness exercises. Catalog persistence is still
+      deferred — schema declared via SQL during a session vanishes
+      when the process exits, but heap data files do persist via
+      the storage manager. stop/restart/reload/status remain
+      stubbed.)
 - [ ] `pgbench -i` succeeds against goopg.
 - [ ] `pgbench` default and `--select-only` scripts run to completion under
       concurrent clients with MVCC-consistent results.
