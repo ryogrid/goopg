@@ -694,6 +694,73 @@ clone at `./HammerDB/`; TPC-H schema + queries under
       'YYYY-Mon-DD')`) all round-trip. Running the actual
       HammerDB SF1 load against the live server is a separate
       harness task that's a workstream of its own.)
+
+#### 2026-04-29 Handover: status + Docker HammerDB verification
+
+- Current status:
+      - M0002 Landing 3b acceptance is complete and pushed in commit
+            `0ca733a`.
+      - M0003 loader verification at SF1 is partially complete: Docker
+            HammerDB `buildschema` now reaches the data-load phase.
+      - Current observed blocker during SF1 load:
+            `ERROR: no available buffer (all pinned)`.
+      - Local WIP exists (not committed yet) for loader stabilisation:
+            - `internal/server/dispatch.go`: compatibility no-op command tags
+                  for role/database DDL used by HammerDB bootstrap SQL.
+            - `internal/storage/bufpool.go`: clock-sweep victim-search bound
+                  widened to avoid false `ErrNoBuffer` under high usage counts.
+            - `internal/storage/storage_test.go`: regression test
+                  `TestPoolEvictHighUsageDoesNotSpuriouslyExhaust`.
+      - Keep the above WIP changes unstaged until SF1 `buildschema`
+            passes end-to-end.
+
+- Docker HammerDB verification procedure (SF1):
+
+```bash
+cd /home/ryo/work/goopg/goopg
+
+# 1) Build goopg and create a fresh test cluster.
+go build -o /tmp/goopg-hdb-bin ./cmd/goopg
+rm -rf /tmp/goopg-hdb-live
+/tmp/goopg-hdb-bin init -D /tmp/goopg-hdb-live
+
+cat >/tmp/goopg_hba_hdb.conf <<'EOF'
+local all all trust
+host all all 127.0.0.1/32 trust
+host all all ::1/128 trust
+EOF
+
+# Pick a free port if 55439 is already in use.
+PORT=55440
+/tmp/goopg-hdb-bin start -D /tmp/goopg-hdb-live --listen 0.0.0.0:${PORT} --hba /tmp/goopg_hba_hdb.conf
+
+# 2) Run TPROC-H schema build in Docker HammerDB (SF1).
+cp HammerDB/scripts/tcl/postgres/tproch/pg_tproch_buildschema.tcl /tmp/pg_tproch_buildschema_sf1.tcl
+sed -i 's/diset connection pg_host localhost/diset connection pg_host 127.0.0.1/' /tmp/pg_tproch_buildschema_sf1.tcl
+sed -i "s/diset connection pg_port 5432/diset connection pg_port ${PORT}/" /tmp/pg_tproch_buildschema_sf1.tcl
+# Keep pg_scale_fact=1 for milestone acceptance.
+
+docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
+      tpcorg/hammerdb:postgres \
+      /home/HammerDB-4.12/hammerdbcli auto /tmp/pg_tproch_buildschema_sf1.tcl
+
+# 3) Run TPROC-H workload (Q1-Q22 / Power path) in Docker HammerDB.
+cp HammerDB/scripts/tcl/postgres/tproch/pg_tproch_run.tcl /tmp/pg_tproch_run_sf1.tcl
+sed -i 's/diset connection pg_host localhost/diset connection pg_host 127.0.0.1/' /tmp/pg_tproch_run_sf1.tcl
+sed -i "s/diset connection pg_port 5432/diset connection pg_port ${PORT}/" /tmp/pg_tproch_run_sf1.tcl
+
+docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
+      tpcorg/hammerdb:postgres \
+      /home/HammerDB-4.12/hammerdbcli auto /tmp/pg_tproch_run_sf1.tcl
+
+# 4) Shut down cluster.
+/tmp/goopg-hdb-bin stop -D /tmp/goopg-hdb-live -m fast
+```
+
+- Notes:
+      - SF1 is intentional: DoD for this milestone explicitly requires SF1.
+      - For triage-only runs, lower `pg_num_tpch_threads` first before
+            changing scale-factor assumptions.
 - [x] Foreign-key parsing accepted (enforcement may be a no-op for
       v0; record the decision in a design doc).
       (achieved 2026-04-28: parser recognises
