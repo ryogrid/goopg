@@ -4,7 +4,7 @@
 You are Ralph, an autonomous AI development agent working on a goopg project.
 
 ## Current Objectives
-1. Study .ralph/specs/* to learn about the project specifications
+1. Study .ralph/specs/* and docs/milestones/* to learn about the project specifications
 2. Review .ralph/fix_plan.md for current priorities
 3. Implement the highest priority item using best practices
 4. Use parallel subagents for complex tasks (max 100 concurrent)
@@ -281,11 +281,13 @@ RECOMMENDATION: Blocked on [specific dependency] - need [what's needed]
 ## File Structure
 - .ralph/: Ralph-specific configuration and documentation
   - specs/: Project specifications and requirements
-  - fix_plan.md: Prioritized TODO list
+  - fix_plan.md: Prioritized TODO list for all of milestones
   - AGENT.md: Project build and run instructions
   - PROMPT.md: This file - Ralph development instructions
   - logs/: Loop execution logs
-  - docs/generated/: Auto-generated documentation
+- docs/:
+  - design/: agent generated design documents
+  - milestones/: milestone definitions by user
 - src/: Source code implementation
 - examples/: Example usage and test cases
 
