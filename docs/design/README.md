@@ -32,5 +32,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | 0016 | [VACUUM and ANALYZE (v0)](0016-vacuum-and-analyze.md) | accepted | Heap page-level prune driven by the MVCC oldest-xmin horizon, full-scan ANALYZE, REINDEX bridge for B-tree cleanup. |
 | 0010 | [SQL Parser and AST (v0)](0010-parser.md) | accepted | Hand-written lexer + recursive-descent parser for the pgbench SQL subset; AST node types mirror upstream parsenodes.h names. |
 | 0011 | [Planner and Catalog Seam (v0)](0011-planner.md) | accepted | In-memory catalog interface, logical plan nodes, rule-based single-pass planner mapping each pgbench statement shape to a fixed template. |
+| 0012 | [Executor (v0)](0012-executor.md) | accepted | Volcano-style Open/Next/Close iterators, expression evaluator, Datum union, Values/Project/Filter/Limit/Sort + heap operators. |
 
 Append new rows in numeric order. Do not reorder.

@@ -241,13 +241,28 @@ unchecked item unless a dependency forces a different order.
 - [ ] Planner: multi-table FROM, joins, GROUP BY/HAVING, aggregates
       (extends the single-relation v0 once the executor side is in).
 - [ ] Executor with the operators the planner emits.
+  - [x] Volcano Open/Next/Close iterator scaffold (`internal/executor`):
+        Datum union with KindNull/Bool/Int/String/Bytes/Time, expression
+        evaluator (arithmetic/comparison/`||`/Kleene AND/OR/NOT, ParamRef
+        lookup, current_timestamp etc. via in-tree registry), Values /
+        Project / Filter / Limit / Sort operators, Build(plan) wiring,
+        Run helper. SELECT 1, parameterised expressions, LIMIT/OFFSET,
+        ORDER BY, division-by-zero (22012), and current_timestamp work
+        end-to-end without storage.
+  - [ ] Heap-touching operators: SeqScan, Insert, Update, Delete (need
+        an MVCC-aware scan + write-through-buffer-pool + xmin/xmax
+        tagging).
+  - [ ] DDL operator path: CREATE TABLE / DROP TABLE / TRUNCATE /
+        CREATE INDEX wired through the catalog + smgr.
+  - [ ] Transaction operator: BEGIN/COMMIT/ROLLBACK plumbed to
+        `mvcc.Manager` and per-session state.
 - [ ] Extended query protocol (Parse/Bind/Describe/Execute/Sync).
 - [ ] `COPY FROM STDIN` and `COPY TO STDOUT` (text and binary) sufficient for
       `pgbench -i`.
 - [x] Design doc: `0010-parser.md`.
 - [x] Design doc: `0011-planner.md`.
-- [ ] Design docs: `0012-executor.md`,
-      `0013-extended-query-protocol.md`, `0014-copy.md`.
+- [x] Design doc: `0012-executor.md`.
+- [ ] Design docs: `0013-extended-query-protocol.md`, `0014-copy.md`.
 
 ## Milestone 7 — pgbench end-to-end and admin tooling
 
