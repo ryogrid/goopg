@@ -96,6 +96,13 @@ type OpenOptions struct {
 	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
 	WALSenderMemoryBuffer int64
 
+	// WALBuffers sizes the in-memory WAL buffer that holds
+	// generated WAL records before they hit segment files. 0
+	// disables the buffer (legacy behaviour). Mirrors the
+	// `wal_buffers` GUC. See
+	// docs/design/0013-0001-wal-buffers-architecture.md.
+	WALBuffers int64
+
 	// AIO* control the AIO engine the storage manager (and
 	// future heap-scan / checkpointer / WAL-writer callers)
 	// will use. Maps to the upstream-aligned `io_method`,
@@ -175,6 +182,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Preallocate:        opts.WALInitZero,
 		DirectIO:           opts.WALDirectIO,
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
+		WALBuffers:         opts.WALBuffers,
 	}
 	if aioEngine != nil {
 		walCfg.AIO = walAIOEngineAdapter{eng: aioEngine}

@@ -1867,6 +1867,80 @@ the topmost unchecked item.
       (DROP/ALTER), catalog-level locks, `lock_timeout` GUC,
       and `pg_locks` view are separate follow-up scopes.)
 
+## Milestone 0013 — WAL buffers + eviction-safe durability
+
+See `docs/milestones/0013-wal-buffers-optimization-with-eviction-safe-wal-before-data-durability.md`
+for the full DoD. Decomposed into the three design-doc seams the
+milestone calls out (`0013-0001`, `0013-0002`, `0013-0003`); pick
+the topmost unchecked item.
+
+- [x] WAL buffers architecture: bounded in-memory WAL buffer
+      between `state.append` and segment files; overflow drain
+      preserves LSN order; FlushUpTo two-stage (drain then
+      dataSync); records ≥ wal_buffers bypass the buffer in one
+      shot. Design doc
+      `docs/design/0013-0001-wal-buffers-architecture.md`.
+      (landed 2026-04-29: new `wal_buffers` GUC (TypeInt,
+      BootVal 16 MiB, range `[0, 1 GiB]`, ContextPostmaster);
+      0 disables. New `internal/wal/wal_buffer.go` with
+      LSN-addressed ring (`base`/`head`/`tail`, byte-wise
+      wraparound, two-slice `readForDrain`). `state` grew
+      `walBuf *walBuffer` and `drainedLSN uint64` (last byte
+      written to a segment file; `flushedLSN ≤ drainedLSN ≤
+      writeLSN`; with walBuf nil, drainedLSN tracks writeLSN
+      exactly). `state.append` branches: (a) buffer disabled
+      OR record larger than walBuf.cap → bypass to writeAt
+      directly (advances drainedLSN); (b) buffered append
+      with overflow drain via `drainBufferBytes(need)` if
+      free space < record size; record then copied into
+      walBuf. `flushUpTo` adds Stage 1
+      `drainBufferUpTo(targetLSN)` before the existing Stage 2
+      dataSync — every byte ≤ targetLSN lands in segment
+      files and on the dirty list before the durability
+      barrier runs. `state.writeAt`'s existing dirty-flag
+      bookkeeping covers drained segments automatically (the
+      "sync debt" the milestone calls out). Walsender
+      MemRing (M0010-0002) keeps mirroring every Append
+      regardless of which path, so streaming-from-RAM is
+      unchanged. Plumbed cmd/goopg start →
+      `OpenOptions.WALBuffers` → `wal.Config.WALBuffers`.
+      Tests: TestWALBufferDisabledByDefault (legacy 0-cap
+      regression guard), TestWALBufferRetainsRecordsInRAM
+      (segment file size unchanged for 5 small Appends with
+      64 KiB cap), TestWALBufferOverflowDrainsToSegments
+      (256-byte cap + 8×50-byte payloads → segment grows),
+      TestFlushUpToDrainsBufferThenSyncs (Stage 1 drain then
+      Stage 2 ReadAll round-trip), TestWALBufferRecordLargerThan
+      BufferBypasses (256-byte record vs 64-byte cap), and
+      TestWALBufferReadAllRoundTrip table-test across three
+      cap values (0, 64 KiB, 256 B forced drains) — every
+      configuration round-trips byte-identical. Full
+      `go test ./...` green. Eviction-driven drain
+      verification + counter surface land in M0013-0002 and
+      M0013-0003.)
+
+- [ ] Overflow + eviction durability ordering (M0013-0002):
+      verify shared-buffer eviction and checkpoint-driven
+      data-flush paths force WAL drain + dataSync through the
+      page LSN before the data-page write proceeds. The Pool
+      eviction path already calls `Writer.FlushUpTo(pageLSN)`
+      which now has two-stage semantics, so the invariant is
+      *automatically* preserved — but a regression test that
+      pins it (set up a dirty buffered WAL record below page
+      LSN, evict, observe Stage 1 drain + Stage 2 dataSync
+      both ran before the heap write) is required by the
+      milestone. Same for the checkpoint flush path. Continues
+      `docs/design/0013-0002-overflow-and-eviction-durability-ordering.md`.
+
+- [ ] WAL buffers observability + rollout (M0013-0003):
+      counters for current `bytes_resident`, lifetime
+      `overflow_drains`, `forced_drains_for_eviction`,
+      `bytes_drained_by_flush`. New SQL surface piece
+      (`pg_stat_wal_buffers` view or extending
+      `pg_stat_wal_io`). Startup log line
+      `event=wal_buffers_attached capacity_bytes=N`. Continues
+      `docs/design/0013-0003-wal-buffers-observability-and-rollout.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

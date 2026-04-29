@@ -183,6 +183,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
 		walDirectIO := boolGUC(registry, "wal_direct_io", false)
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
+		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
 		aioMethod := stringGUC(registry, "io_method", "")
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
@@ -193,6 +194,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WALInitZero:           walInitZero,
 			WALDirectIO:           walDirectIO,
 			WALSenderMemoryBuffer: walSenderMemBuf,
+			WALBuffers:            walBuffers,
 			AIOMethod:             aioMethod,
 			AIOWorkers:            aioWorkers,
 			AIOMaxConcurrency:     aioMax,

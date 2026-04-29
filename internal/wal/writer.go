@@ -76,6 +76,14 @@ type Config struct {
 	// 2 is in flight.
 	DirectIO bool
 
+	// WALBuffers sizes (in bytes) the bounded in-memory WAL
+	// buffer Appends land in before they hit segment files.
+	// 0 disables the buffer (every Append flows straight
+	// through to writeAt — legacy / pre-M0013 behaviour).
+	// Mirrors upstream's wal_buffers GUC. See
+	// docs/design/0013-0001-wal-buffers-architecture.md.
+	WALBuffers int64
+
 	// SenderMemoryBuffer sizes (in bytes) the in-memory ring
 	// of recent WAL bytes used by the walsender hot-path.
 	// 0 disables the ring entirely; iterators always pread
@@ -219,6 +227,19 @@ type state struct {
 	writePos   int64
 	writeLSN   uint64
 	flushedLSN uint64
+
+	// drainedLSN is the last byte position that has been written
+	// to a segment file. With wal_buffers > 0, drainedLSN can lag
+	// writeLSN by up to walBuf.cap bytes — those bytes live only
+	// in walBuf until an overflow drain or flushUpTo Stage 1
+	// pushes them to disk. With walBuf nil, drainedLSN tracks
+	// writeLSN exactly. See M0013-0001.
+	drainedLSN uint64
+
+	// walBuf is the M0013-0001 in-memory WAL buffer. nil when
+	// Config.WALBuffers == 0 (legacy behaviour: every Append
+	// calls writeAt directly).
+	walBuf *walBuffer
 
 	// writeLSNMirror, when non-nil, gets the current writeLSN
 	// stored after each successful append. The Writer reads it
@@ -537,11 +558,12 @@ func loadState(cfg Config) (*state, error) {
 			return nil, err
 		}
 	}
-	return &state{
+	st := &state{
 		cfg:                    cfg,
 		writePos:               writePos,
 		writeLSN:               uint64(writePos),
 		flushedLSN:             uint64(writePos),
+		drainedLSN:             uint64(writePos),
 		files:                  make(map[uint64]*os.File),
 		dirty:                  make(map[uint64]bool),
 		aio:                    cfg.AIO,
@@ -550,7 +572,12 @@ func loadState(cfg Config) (*state, error) {
 		directIOActive:         cfg.DirectIO && fallback == "",
 		directIOBlockSize:      4096,
 		memRing:                NewMemRing(cfg.SenderMemoryBuffer),
-	}, nil
+		walBuf:                 newWALBuffer(cfg.WALBuffers),
+	}
+	if st.walBuf != nil {
+		st.walBuf.reset(writePos)
+	}
+	return st, nil
 }
 
 func detectWritePos(walDir string, segSize int64) (int64, error) {
@@ -679,15 +706,38 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	record := encodeRecord(payload)
 	start := uint64(s.writePos) + 1
 	writePos := s.writePos
-	if err := s.writeAt(writePos, record); err != nil {
-		return 0, 0, err
+
+	// Path A: WAL buffer disabled, OR record larger than the
+	// entire buffer. Bypass and write straight to disk —
+	// fragmenting a single record across multiple drains would
+	// complicate the contiguous-stream invariant for no benefit.
+	if s.walBuf == nil || !s.walBuf.canHold(len(record)) {
+		if err := s.writeAt(writePos, record); err != nil {
+			return 0, 0, err
+		}
+		s.memRing.Append(writePos, record)
+		s.writePos = writePos + int64(len(record))
+		end := uint64(s.writePos)
+		s.writeLSN = end
+		s.drainedLSN = end
+		if s.writeLSNMirror != nil {
+			s.writeLSNMirror.Store(end)
+		}
+		return start, end, nil
 	}
-	// Mirror the just-written bytes into the in-memory ring so
-	// walsender's iterator can stream from RAM. Append AFTER the
-	// disk write succeeds — a failed pwrite must not appear in
-	// the ring (the writer's loop will retry / surface the error
-	// and the byte position never advances). nil ring is the
-	// default config; Append is a no-op then.
+
+	// Path B: buffered append. If we'd overflow, drain the head
+	// of the buffer to segment files first to make room.
+	need := int64(len(record)) - s.walBuf.free()
+	if need > 0 {
+		if err := s.drainBufferBytes(need); err != nil {
+			return 0, 0, err
+		}
+	}
+	s.walBuf.append(record)
+	// Walsender's MemRing must see every record, regardless of
+	// whether it's in walBuf or already on a segment — keeps the
+	// streaming-from-RAM invariant unchanged from M0010-0002.
 	s.memRing.Append(writePos, record)
 	s.writePos = writePos + int64(len(record))
 	end := uint64(s.writePos)
@@ -696,6 +746,54 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		s.writeLSNMirror.Store(end)
 	}
 	return start, end, nil
+}
+
+// drainBufferBytes writes at least `n` bytes from walBuf's head to
+// segment files via state.writeAt, advances walBuf.head, and bumps
+// drainedLSN. Drained segments are added to s.dirty (already
+// happens inside writeAt via openSegment's dirty-flag bookkeeping)
+// so the next flushUpTo's dataSync includes them — the "sync debt"
+// the milestone calls out.
+//
+// The caller has already verified walBuf is non-nil and the record
+// being appended is ≤ walBuf.cap.
+func (s *state) drainBufferBytes(n int64) error {
+	if n <= 0 || s.walBuf == nil {
+		return nil
+	}
+	if n > s.walBuf.resident() {
+		n = s.walBuf.resident()
+	}
+	first, second := s.walBuf.readForDrain(n)
+	pos := int64(s.drainedLSN)
+	if len(first) > 0 {
+		if err := s.writeAt(pos, first); err != nil {
+			return err
+		}
+		pos += int64(len(first))
+	}
+	if len(second) > 0 {
+		if err := s.writeAt(pos, second); err != nil {
+			return err
+		}
+		pos += int64(len(second))
+	}
+	s.walBuf.advanceHead(n)
+	s.drainedLSN = uint64(pos)
+	return nil
+}
+
+// drainBufferUpTo drains every byte from walBuf.head through (but
+// not past) targetLSN. Used by flushUpTo's Stage 1 — every byte
+// ≤ targetLSN must land in segment files before the dataSync
+// barrier runs. No-op if walBuf is nil or already drained past
+// targetLSN.
+func (s *state) drainBufferUpTo(targetLSN uint64) error {
+	if s.walBuf == nil || targetLSN <= s.drainedLSN {
+		return nil
+	}
+	need := int64(targetLSN - s.drainedLSN)
+	return s.drainBufferBytes(need)
 }
 
 func (s *state) flushUpTo(lsn uint64) error {
@@ -707,6 +805,13 @@ func (s *state) flushUpTo(lsn uint64) error {
 	}
 	if lsn <= s.flushedLSN {
 		return nil
+	}
+
+	// Stage 1 (M0013-0001): drain walBuf bytes ≤ lsn to segment
+	// files so Stage 2's dataSync covers every byte the caller
+	// asked for. No-op when walBuf is nil or already drained.
+	if err := s.drainBufferUpTo(lsn); err != nil {
+		return err
 	}
 
 	targetSeg := segmentForLSN(lsn, s.cfg.SegmentSize)

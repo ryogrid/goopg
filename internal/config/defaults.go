@@ -209,6 +209,24 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// wal_buffers sizes (in bytes) the bounded in-memory WAL
+	// buffer that holds generated WAL records before they hit
+	// segment files. Default 16 MiB matches PostgreSQL's
+	// default. Records ≤ wal_buffers stay in RAM until either
+	// (a) Append would overflow the buffer (drain just enough
+	// to make room) or (b) FlushUpTo demands a byte ≤ the
+	// requested LSN be on disk and durable. 0 disables the
+	// buffer entirely (every Append calls writeAt directly —
+	// pre-M0013 behaviour). Records larger than wal_buffers
+	// bypass the buffer in one shot rather than fragment.
+	// See docs/design/0013-0001-wal-buffers-architecture.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_buffers", Type: TypeInt, BootVal: "16777216",
+		MinVal: 0, MaxVal: 1 << 30,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// io_method picks the AIO I/O method. `sync` runs every
 	// I/O on the calling goroutine (the safe default that
 	// matches v0's pre-AIO behaviour); `worker` uses a
