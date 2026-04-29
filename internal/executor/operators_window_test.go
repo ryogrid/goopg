@@ -7,7 +7,7 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 )
 
-func TestWindowOpSkeletonSortsAndAppendsPlaceholders(t *testing.T) {
+func TestWindowOpRowNumberByPartitionAndOrder(t *testing.T) {
 	plan := &planner.WindowAgg{
 		Child: &planner.Values{Rows: [][]planner.Expr{
 			{&planner.IntegerConst{Value: 1}, &planner.IntegerConst{Value: 20}},
@@ -36,6 +36,7 @@ func TestWindowOpSkeletonSortsAndAppendsPlaceholders(t *testing.T) {
 		t.Fatalf("rows=%d want 3", len(rows))
 	}
 	want := [][2]int64{{1, 10}, {1, 20}, {2, 5}}
+	wantRN := []int64{1, 2, 1}
 	for i, w := range want {
 		if rows[i][0].Kind != KindInt || rows[i][0].Int != w[0] {
 			t.Fatalf("row[%d][0]=%+v want int=%d", i, rows[i][0], w[0])
@@ -43,13 +44,13 @@ func TestWindowOpSkeletonSortsAndAppendsPlaceholders(t *testing.T) {
 		if rows[i][1].Kind != KindInt || rows[i][1].Int != w[1] {
 			t.Fatalf("row[%d][1]=%+v want int=%d", i, rows[i][1], w[1])
 		}
-		if len(rows[i]) != 3 || !rows[i][2].IsNull() {
-			t.Fatalf("row[%d]=%+v want third column NULL placeholder", i, rows[i])
+		if len(rows[i]) != 3 || rows[i][2].Kind != KindInt || rows[i][2].Int != wantRN[i] {
+			t.Fatalf("row[%d]=%+v want row_number=%d", i, rows[i], wantRN[i])
 		}
 	}
 }
 
-func TestWindowOpSkeletonKeepsOrderWithoutKeys(t *testing.T) {
+func TestWindowOpRankPlaceholderKeepsOrderWithoutKeys(t *testing.T) {
 	plan := &planner.WindowAgg{
 		Child: &planner.Values{Rows: [][]planner.Expr{
 			{&planner.IntegerConst{Value: 9}},

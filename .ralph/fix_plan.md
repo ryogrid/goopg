@@ -2813,7 +2813,7 @@ Substantial. Decompose when picked up.
             injection between aggregate/having and final ORDER BY).
       - [x] M0020-S05: executor WindowAgg operator skeleton (drain,
             partition key evaluation, order-key sort).
-      - [ ] M0020-S06: executor row_number() evaluation.
+      - [x] M0020-S06: executor row_number() evaluation.
       - [ ] M0020-S07: executor rank() evaluation with peer-group
             semantics.
       - [ ] M0020-S08: EXPLAIN label/tree integration for

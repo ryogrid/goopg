@@ -2,6 +2,7 @@ package executor
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -106,9 +107,67 @@ func (o *windowOp) Open(ctx *Context) error {
 			}
 			o.rows[i] = out
 		}
+		if err := o.evalWindowFuncs(); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+func (o *windowOp) evalWindowFuncs() error {
+	if len(o.plan.Funcs) == 0 {
+		return nil
+	}
+	base := 0
+	if len(o.rows) > 0 {
+		base = len(o.rows[0]) - len(o.plan.Funcs)
+	}
+	var (
+		prevPartition string
+		hasPrev       bool
+		rowNum        int64
+	)
+	for i := range o.rows {
+		partKey, err := o.partitionKey(o.rows[i])
+		if err != nil {
+			return err
+		}
+		if !hasPrev || partKey != prevPartition {
+			rowNum = 1
+			prevPartition = partKey
+			hasPrev = true
+		} else {
+			rowNum++
+		}
+		for j, fn := range o.plan.Funcs {
+			idx := base + j
+			switch strings.ToLower(fn.Name) {
+			case "row_number":
+				o.rows[i][idx] = Datum{Kind: KindInt, Int: rowNum}
+			case "rank":
+				// rank() lands in M0020-S07.
+			default:
+				return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
+			}
+		}
+	}
+	return nil
+}
+
+func (o *windowOp) partitionKey(row Row) (string, error) {
+	if len(o.plan.PartitionBy) == 0 {
+		return "__all__", nil
+	}
+	parts := make([]string, 0, len(o.plan.PartitionBy))
+	for _, pe := range o.plan.PartitionBy {
+		v, err := evalExpr(pe, row, o.ctx)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, datumKey(v))
+	}
+	return strings.Join(parts, "|"), nil
 }
 
 func compareSortDatums(a, b Datum, pos int, desc bool) (cmp int, decided bool, err error) {
