@@ -51,3 +51,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0014 | PostgreSQL-compatible WAL on-disk format                          | planned  | `0014-wal-compatibility-with-pg.md` |
 | 0015 | PL/pgSQL stored routines (function-first delivery)                | planned  | `0015-plpgsql-stored-routines-function-first.md` |
 | 0016 | WITH clause and CTE support                                       | planned  | `0016-with-clause-cte-support.md` |
+| 0017 | UPSERT support (INSERT ... ON CONFLICT DO UPDATE)                 | planned  | `0017-upsert-on-conflict-do-update.md` |
