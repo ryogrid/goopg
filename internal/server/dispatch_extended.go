@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -23,7 +24,7 @@ import (
 // are rejected at Bind time); we feed them through to
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
-func (s *Server) executeExtendedQueryViaExecutor(query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQueryViaExecutor(sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SyntaxError, Message: err.Error()}
@@ -73,6 +74,7 @@ func (s *Server) executeExtendedQueryViaExecutor(query string, params []boundPar
 	ctx.Snap = snap
 	ctx.Params = datums
 	ctx.Checkpointer = s.cfg.Checkpointer
+	ctx.StatsTarget = sessionStatsTarget(sess)
 
 	op, err := executor.Build(node)
 	if err != nil {

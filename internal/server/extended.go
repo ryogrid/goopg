@@ -489,7 +489,7 @@ func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string
 	}
 
 	if s.cfg.hasStorage() {
-		return s.executeExtendedQueryViaExecutor(trimmed, params)
+		return s.executeExtendedQueryViaExecutor(sess, trimmed, params)
 	}
 
 	if len(params) > 0 {

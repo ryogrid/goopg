@@ -1839,6 +1839,71 @@ under "Hooks into existing goopg code".
       lands in the same loop and documents the deferred
       pieces.)
 
+## Milestone 0006 — Planner-grade statistics
+
+See `docs/milestones/0006-planner-statistics.md` for the full DoD.
+Decomposed into the four design-doc seams the milestone calls out
+(`0006-0001` … `0006-0004`); pick the topmost unchecked item.
+
+### Statistics collection
+
+- [x] Sampling-based ANALYZE with MCV lists and equi-depth
+      histograms (design doc `0006-0001-sampling-and-mcv-histograms.md`).
+      (landed 2026-04-29: M0003's full distinct-set walk in
+      `internal/executor/operators_analyze.go` is replaced by a
+      reservoir sampler with `targrows = default_statistics_target
+      * 300` (upstream's `analyze.c`). Per-column MCV admission
+      uses the upstream margin rule (`freq >= 1.25 *
+      avg_freq(remaining)`) capped at `statsTarget`; equi-depth
+      histogram boundaries over the non-MCV portion live on
+      `catalog.ColumnStats.Histogram []string` for orderable
+      kinds (int / bool / string / time / numeric); MCV +
+      Frequency live on `catalog.ColumnStats.MCV []MCVEntry`.
+      The `default_statistics_target` GUC is threaded through
+      `executor.Context.StatsTarget` from the session registry on
+      both the simple-query (`internal/server/dispatch.go`) and
+      extended-query (`internal/server/dispatch_extended.go`)
+      paths via the new `sessionStatsTarget` helper.
+      `Context.AnalyzeRandSeed` makes the sampler reproducible
+      for tests. New tests in
+      `internal/executor/operators_analyze_test.go`:
+      `TestAnalyzeBuildsMCVForSkewedColumn` (800/150/50 split
+      across F/O/P → MCV[0]='F' freq ~0.8),
+      `TestAnalyzeBuildsHistogramForOrderedColumn` (1000-row
+      uniform 1..1000 → strictly ascending boundaries spanning
+      the range), `TestAnalyzeRespectsStatsTarget`
+      (`statsTarget=1` caps reservoir at 300, so NDistinct on
+      the 400-row table stays ≤300; `statsTarget=0` falls back
+      to the 30000-row sample size and recovers the exact
+      400). The pre-existing 7-row pin
+      `TestAnalyzeRelationPopulatesStats` continues to pass —
+      tables smaller than the sample size still collect every
+      tuple.)
+
+### Catalog persistence
+
+- [ ] Persist `TableStats` + per-column `ColumnStats` (including
+      MCV + histogram payloads) through the catalog snapshot
+      machinery so stats survive a clean stop / start. Old
+      snapshots without stats must still load and present
+      unanalysed relations. Design doc
+      `docs/design/0006-0002-stats-persistence.md`.
+
+### Planner consumption
+
+- [ ] `clauselist_selectivity`-shaped predicate decomposition in
+      `planner.EstimateRows` for the Filter case: equality vs MCV
+      lookup, range vs histogram-bucket interpolation, IN as sum
+      of per-value selectivities, AND/OR combination, fall back
+      to today's `1/3` only when stats are absent. Design doc
+      `docs/design/0006-0003-clauselist-selectivity.md`.
+- [ ] Cost-driven INNER-join algorithm selection: hash vs merge
+      vs nested-loop scored against estimated input sizes and
+      key NDistinct. Existing rule-based logic remains the
+      documented fallback when stats are absent. Stats-aware
+      EXPLAIN surfacing for verification. Design doc
+      `docs/design/0006-0004-join-algorithm-selection.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

@@ -81,7 +81,7 @@ func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegist
 	}
 
 	if s.cfg.hasStorage() {
-		return s.dispatchSimpleQueryViaExecutor(w, trimmed)
+		return s.dispatchSimpleQueryViaExecutor(w, sess, trimmed)
 	}
 
 	return s.writeQueryError(w, sqlstate.FeatureNotSupported,

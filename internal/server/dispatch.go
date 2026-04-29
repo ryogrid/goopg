@@ -2,8 +2,10 @@ package server
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -26,7 +28,7 @@ import (
 //
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
-func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sql string) error {
+func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		if tag, ok := compatNoopCommandTag(sql); ok {
@@ -67,6 +69,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sql str
 	ctx.Tx = tx
 	ctx.Snap = snap
 	ctx.Checkpointer = s.cfg.Checkpointer
+	ctx.StatsTarget = sessionStatsTarget(sess)
 
 	for _, stmt := range stmts {
 		// Refresh snapshot per statement for ReadCommitted parity.
@@ -85,6 +88,25 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sql str
 	}
 	commit = true
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+}
+
+// sessionStatsTarget reads the effective `default_statistics_target`
+// GUC from the per-connection session registry. Zero is returned
+// when sess is nil or the value can't be parsed; callers (the
+// executor's analyzeOp) treat zero as "use the upstream default".
+func sessionStatsTarget(sess *config.SessionRegistry) int {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("default_statistics_target")
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(eff))
+	if err != nil || n < 1 {
+		return 0
+	}
+	return n
 }
 
 func compatNoopCommandTag(sql string) (string, bool) {

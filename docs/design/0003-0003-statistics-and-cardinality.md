@@ -1,12 +1,13 @@
 # Statistics and Cardinality Estimation (Milestone 0003)
 
-| Field      | Value                                                  |
-| ---------- | ------------------------------------------------------ |
-| Status     | draft                                                  |
-| Date       | 2026-04-28                                             |
-| Milestone  | 0003 — HammerDB TPC-H Workload                         |
-| Refines    | [root-0011-planner.md](root-0011-planner.md), [0003-0010-analyze-statistics.md](0003-0010-analyze-statistics.md) |
-| Supersedes | —                                                      |
+| Field         | Value                                                  |
+| ------------- | ------------------------------------------------------ |
+| Status        | draft                                                  |
+| Date          | 2026-04-28                                             |
+| Milestone     | 0003 — HammerDB TPC-H Workload                         |
+| Refines       | [root-0011-planner.md](root-0011-planner.md), [0003-0010-analyze-statistics.md](0003-0010-analyze-statistics.md) |
+| Supersedes    | —                                                      |
+| Superseded by | [0006-0001-sampling-and-mcv-histograms.md](0006-0001-sampling-and-mcv-histograms.md) (statistics collection); planner consumption supersession tracked under `0006-0003` / `0006-0004` |
 
 ## Problem
 

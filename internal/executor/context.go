@@ -54,6 +54,20 @@ type Context struct {
 	// `OuterRows[len(OuterRows)-Level]` — Level 1 is the
 	// innermost outer scope.
 	OuterRows []Row
+
+	// StatsTarget is the effective `default_statistics_target`
+	// GUC value for the current statement. ANALYZE uses
+	// `targrows = StatsTarget * 300` for sample sizing, mirrors
+	// upstream's analyze.c. Zero means "use the upstream default
+	// of 100" — the wire path populates this from the session
+	// registry; tests leave it zero unless they care about
+	// sample-size behaviour.
+	StatsTarget int
+
+	// AnalyzeRandSeed, when non-zero, makes ANALYZE's reservoir
+	// sampler reproducible. Tests set it; production leaves it
+	// zero so the sampler reseeds from the wall clock.
+	AnalyzeRandSeed int64
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

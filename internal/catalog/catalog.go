@@ -71,9 +71,9 @@ type Table struct {
 }
 
 // TableStats captures the pg_class-shaped table-level stats
-// plus per-column NDistinct. v0 doesn't yet track MCV lists
-// or histograms — see
-// docs/design/0003-0010-analyze-statistics.md.
+// plus per-column NDistinct, MCV lists, and equi-depth
+// histograms. See
+// docs/design/0006-0001-sampling-and-mcv-histograms.md.
 type TableStats struct {
 	RowCount int64
 	Pages    int
@@ -85,9 +85,32 @@ type TableStats struct {
 // collects. NDistinct mirrors upstream's stadistinct: the
 // number of distinct non-NULL values seen during ANALYZE.
 // NullFrac is the fraction of NULL rows.
+//
+// MCV holds the most-common-values list (upstream's
+// STATISTIC_KIND_MCV slot), sorted by Frequency desc. Histogram
+// holds equi-depth bucket boundaries over the non-MCV portion
+// (upstream's STATISTIC_KIND_HISTOGRAM slot); len(Histogram) is
+// bucketCount+1 when populated, zero when the column type has
+// no total order or fewer than two non-MCV values were sampled.
+//
+// MCV.Value and Histogram entries are the canonical
+// `Datum.Format()` rendering of the stored value. See
+// docs/design/0006-0001-sampling-and-mcv-histograms.md for the
+// rationale (catalog must not depend on the executor's Datum
+// type) and the planner-side parsing contract.
 type ColumnStats struct {
 	NDistinct int64
 	NullFrac  float64
+	MCV       []MCVEntry
+	Histogram []string
+}
+
+// MCVEntry is one entry in a per-column MCV list. Frequency is
+// the sample frequency (0..1). Mirrors a single (stavalues,
+// stanumbers) pair in upstream's pg_statistic MCV slot.
+type MCVEntry struct {
+	Value     string
+	Frequency float64
 }
 
 // Index is one index relation in the catalog.

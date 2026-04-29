@@ -1,12 +1,13 @@
 # ANALYZE Statistics (Milestone 0003)
 
-| Field      | Value                                                  |
-| ---------- | ------------------------------------------------------ |
-| Status     | draft                                                  |
-| Date       | 2026-04-28                                             |
-| Milestone  | 0003 — HammerDB TPC-H Workload                         |
-| Refines    | [root-0011-planner.md](root-0011-planner.md), [root-0012-executor.md](root-0012-executor.md), [0016-vacuum-and-analyze.md](root-0016-vacuum-and-analyze.md) |
-| Supersedes | —                                                      |
+| Field         | Value                                                  |
+| ------------- | ------------------------------------------------------ |
+| Status        | draft                                                  |
+| Date          | 2026-04-28                                             |
+| Milestone     | 0003 — HammerDB TPC-H Workload                         |
+| Refines       | [root-0011-planner.md](root-0011-planner.md), [root-0012-executor.md](root-0012-executor.md), [0016-vacuum-and-analyze.md](root-0016-vacuum-and-analyze.md) |
+| Supersedes    | —                                                      |
+| Superseded by | [0006-0001-sampling-and-mcv-histograms.md](0006-0001-sampling-and-mcv-histograms.md) (sampling / MCV / histogram fields only; full-table-scan mechanics still apply) |
 
 ## Problem
 
@@ -124,16 +125,15 @@ behaviour: 7 rows seeded with 3 distinct labels yield
 
 ## Out of scope (deferred to subsequent loops)
 
-- Sampling. Upstream uses ANALYZE sampling targets;
-  full-table scan is the v0 baseline.
-- MCV (most-common-values) lists. Needed for skewed-data
-  selectivity.
-- Equi-width or equi-depth histograms. Needed for range
-  predicates.
+- Sampling, MCV lists, and equi-depth histograms — **landed in
+  M0006 / [0006-0001-sampling-and-mcv-histograms.md](0006-0001-sampling-and-mcv-histograms.md)**.
+  Reservoir sampler with `default_statistics_target * 300` sample
+  size, MCV admission via the upstream margin rule, equi-depth
+  histogram boundaries over the non-MCV portion. Stored on
+  `catalog.ColumnStats` as `MCV []MCVEntry` + `Histogram []string`.
 - Catalog-snapshot persistence: Stats live in memory. Across
-  server restart, ANALYZE has to run again. The catalog-
-  persistence machinery serialises Tables but not their
-  Stats yet.
+  server restart, ANALYZE has to run again. Tracked under
+  M0006 (`0006-0002`).
 - Cross-column / multivariate stats (CREATE STATISTICS
   upstream).
 - ANALYZE's own progress reporting / per-row sample noise.
