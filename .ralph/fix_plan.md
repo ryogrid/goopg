@@ -2124,6 +2124,86 @@ pick the topmost unchecked item.
       M0014-0004 step 2 alongside the joint M0014-0001/0002
       writer/reader switchover. Full `go test ./...` green.)
 
+## Milestone 0015 — PL/pgSQL stored routines (function-first delivery)
+
+See `docs/milestones/0015-plpgsql-stored-routines-function-first.md`
+for the full DoD. Substantial milestone — large surface area
+(parser + analyzer + plpgsql interpreter + catalog + executor).
+Decomposition + design docs land when this milestone is picked up.
+
+- [ ] Stage A: function-first delivery (CREATE OR REPLACE FUNCTION
+      ... LANGUAGE plpgsql, callable from SELECT). Decompose into
+      seam-sized slices when picked up.
+- [ ] Stage B: procedure follow-up (CREATE PROCEDURE, CALL,
+      out-parameter binding).
+
+## Milestone 0016 — WITH clause (CTE) support
+
+See `docs/milestones/0016-with-clause-cte-support.md` for the full
+DoD. Decomposed into the four design-doc seams the milestone calls
+out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
+
+- [x] WITH parser, AST, and statement dispatch
+      (M0016-0001 step 1). Design doc
+      `docs/design/0016-0001-with-parser-ast-and-name-resolution.md`.
+      (landed 2026-04-29: parser-only slice. New AST nodes
+      `CommonTableExpr` (Name + optional Columns alias list +
+      Query *SelectStmt) and `WithClause` (Recursive flag +
+      ordered CTEs slice). `SelectStmt` / `InsertStmt` /
+      `UpdateStmt` / `DeleteStmt` each grew an optional
+      `With *WithClause` field — nil for pre-M0016 callers,
+      so existing tests are byte-for-byte unchanged. New
+      `KwRecursive` keyword. New `internal/parser/with.go`
+      with `parseWithClause` (handles `WITH [RECURSIVE]
+      cte (, cte)*`) and four `parseSelectWithCTE` /
+      `parseInsertWithCTE` / `parseUpdateWithCTE` /
+      `parseDeleteWithCTE` thin wrappers that delegate to
+      the existing per-statement parsers and stamp the
+      pre-parsed WithClause onto the result. New `parseCTE`
+      handles the `name [(col, ...)] AS (SELECT ...)` shape;
+      Stage A restriction (`KwInsert/KwUpdate/KwDelete`
+      bodies) surfaces as a clean parse error pinned at the
+      inner-statement keyword position. `parseStatement`
+      gained a new `case KwWith → parseStatementWithCTE`
+      dispatch that peeks past the WithClause to route to
+      the right per-statement parser. Tests: 11 sub-tests
+      cover simple WITH, multiple CTEs (left-to-right
+      order), RECURSIVE keyword acceptance (planner-level
+      rejection is a separate slice), column-alias list,
+      data-modifying-body rejection (3 variants), With
+      flow-through to Insert/Update/Delete (3 sub-tests),
+      missing-AS rejection, empty-list rejection, and a
+      regression guard pinning that plain SELECT still
+      produces With=nil. Full `go test ./...` green.
+      Analyzer name resolution + planner / executor
+      integration land in M0016-0001 step 2 / M0016-0002.)
+
+- [ ] WITH analyzer: name resolution, scope rules,
+      shadowing handling (M0016-0001 step 2). Continues
+      `docs/design/0016-0001-with-parser-ast-and-name-resolution.md`.
+      Implement CTE scope (left-to-right visibility,
+      outer-query visibility, base-relation shadowing),
+      validate column-alias arity, plumb CTE references
+      through the analyzer's name-resolution code.
+
+- [ ] Non-recursive CTE planner + executor (M0016-0002).
+      Materialise CTE producers once; feed multiple
+      consumers; preserve statement-snapshot MVCC
+      consistency. Continues
+      `docs/design/0016-0002-nonrecursive-cte-planner-executor.md`.
+
+- [ ] Recursive CTE fixpoint execution (M0016-0003).
+      Anchor + iterative recursive member; cycle-safe
+      termination; reject unsupported recursive constructs
+      with stable SQLSTATE. Continues
+      `docs/design/0016-0003-recursive-cte-fixpoint-execution.md`.
+
+- [ ] CTE observability + compatibility tests
+      (M0016-0004). EXPLAIN labels for CTE producers;
+      runtime counters; representative PG-shaped CTE
+      regression suite. Continues
+      `docs/design/0016-0004-cte-observability-and-compat-tests.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

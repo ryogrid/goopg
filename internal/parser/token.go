@@ -135,6 +135,9 @@ const (
 	KwConnection   Keyword = "connection"
 	KwFor          Keyword = "for"
 	KwTables       Keyword = "tables"
+
+	// CTE / WITH clause (M0016).
+	KwRecursive Keyword = "recursive"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -208,6 +211,7 @@ var keywords = map[string]Keyword{
 	"exists":      KwExists,
 	"truncate":    KwTruncate,
 	"with":        KwWith,
+	"recursive":   KwRecursive,
 	"tablespace":  KwTablespace,
 	"primary":     KwPrimary,
 	"key":         KwKey,

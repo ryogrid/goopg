@@ -181,8 +181,39 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseCheckpoint()
 	case KwExplain:
 		return p.parseExplain()
+	case KwWith:
+		return p.parseStatementWithCTE()
 	}
 	return nil, p.errAtCur("unsupported statement")
+}
+
+// parseStatementWithCTE handles a `WITH cte ...` prefix: parses
+// the WithClause then dispatches on the next keyword to the
+// appropriate per-statement parser. The dispatched parser is
+// invoked through its `*WithCTE` overload which threads the
+// pre-parsed WithClause onto the resulting AST node.
+//
+// See docs/design/0016-0001-with-parser-ast-and-name-resolution.md.
+func (p *parser) parseStatementWithCTE() (Stmt, error) {
+	with, err := p.parseWithClause()
+	if err != nil {
+		return nil, err
+	}
+	t := p.cur()
+	if t.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected SELECT / INSERT / UPDATE / DELETE after WITH list")
+	}
+	switch t.Keyword {
+	case KwSelect:
+		return p.parseSelectWithCTE(with)
+	case KwInsert:
+		return p.parseInsertWithCTE(with)
+	case KwUpdate:
+		return p.parseUpdateWithCTE(with)
+	case KwDelete:
+		return p.parseDeleteWithCTE(with)
+	}
+	return nil, p.errAtCur("WITH clause must be followed by SELECT, INSERT, UPDATE, or DELETE")
 }
 
 // parseExplain: `EXPLAIN <stmt>`. v0 doesn't yet accept the

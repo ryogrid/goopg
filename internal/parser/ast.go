@@ -208,14 +208,48 @@ type SortBy struct {
 
 func (s SortBy) Pos() int { return s.pos }
 
-// SelectStmt — `SELECT [DISTINCT] target_list
+// CommonTableExpr is one `WITH cte_name [(col, ...)] AS (SELECT ...)`
+// entry. Stage A of M0016 restricts the body to a SelectStmt; the
+// parser rejects data-modifying CTE bodies (INSERT / UPDATE /
+// DELETE inside the parenthesised body) at parse time. See
+// docs/design/0016-0001-with-parser-ast-and-name-resolution.md.
+type CommonTableExpr struct {
+	pos     int
+	Name    string
+	Columns []string // optional column-alias list; nil when absent
+	Query   *SelectStmt
+}
+
+// Pos returns the position of the CTE's declaring identifier.
+func (c *CommonTableExpr) Pos() int { return c.pos }
+
+// WithClause is the optional `WITH [RECURSIVE] cte [, ...]` prefix
+// on SELECT / INSERT / UPDATE / DELETE. The parser accepts the
+// RECURSIVE keyword even though execution support lands in
+// 0016-0003 — clean syntax-level errors are the same regardless of
+// execution support.
+type WithClause struct {
+	pos       int
+	Recursive bool
+	CTEs      []*CommonTableExpr
+}
+
+// Pos returns the position of the WITH keyword.
+func (w *WithClause) Pos() int { return w.pos }
+
+// SelectStmt — `[WITH ...] SELECT [DISTINCT] target_list
 //
 //	[FROM from_item [, …]] [WHERE expr]
 //	[GROUP BY expr [, …]] [HAVING expr]
 //	[ORDER BY sort_list] [LIMIT n] [OFFSET n]
 //	[{UNION|INTERSECT|EXCEPT} [ALL|DISTINCT] SELECT ...].
+//
+// The optional `With` field (M0016-0001) is nil when no WITH
+// clause precedes the SELECT — pre-M0016 tests are byte-for-byte
+// unchanged.
 type SelectStmt struct {
 	pos      int
+	With     *WithClause
 	Distinct bool
 	Targets  []ResTarget
 	// From keeps a flattened range-var list for v0 planner
@@ -235,13 +269,16 @@ type SelectStmt struct {
 func (s *SelectStmt) Pos() int  { return s.pos }
 func (s *SelectStmt) stmtNode() {}
 
-// InsertStmt — `INSERT INTO target [(col, …)] VALUES (val, …) [, …]
+// InsertStmt — `[WITH ...] INSERT INTO target [(col, …)]
 //
-//	[RETURNING target_list]`. v0 supports literal VALUES rows only;
+//	VALUES (val, …) [, …] [RETURNING target_list]`. v0 supports
 //
-// `INSERT … SELECT` and ON CONFLICT clauses are deferred.
+// literal VALUES rows only; `INSERT … SELECT` and ON CONFLICT
+// clauses are deferred. The optional `With` field (M0016-0001) is
+// nil when no WITH clause precedes the INSERT.
 type InsertStmt struct {
 	pos       int
+	With      *WithClause
 	Target    RangeVar
 	Columns   []string // empty when no column list — INSERT defaults to declared order
 	Rows      [][]Expr // each row is a parenthesised tuple
@@ -260,13 +297,15 @@ type UpdateAssign struct {
 
 func (a UpdateAssign) Pos() int { return a.pos }
 
-// UpdateStmt — `UPDATE target SET col = expr [, …] [WHERE expr]
+// UpdateStmt — `[WITH ...] UPDATE target SET col = expr [, …]
 //
-//	[RETURNING target_list]`. FROM-clause joins in UPDATE are
+//	[WHERE expr] [RETURNING target_list]`. FROM-clause joins in
 //
-// deferred.
+// UPDATE are deferred. The optional `With` field (M0016-0001) is
+// nil when no WITH clause precedes the UPDATE.
 type UpdateStmt struct {
 	pos       int
+	With      *WithClause
 	Target    RangeVar
 	Set       []UpdateAssign
 	Where     Expr // nil when absent
@@ -276,10 +315,15 @@ type UpdateStmt struct {
 func (s *UpdateStmt) Pos() int  { return s.pos }
 func (s *UpdateStmt) stmtNode() {}
 
-// DeleteStmt — `DELETE FROM target [WHERE expr] [RETURNING target_list]`.
-// USING-clause joins in DELETE are deferred.
+// DeleteStmt — `[WITH ...] DELETE FROM target [WHERE expr]
+//
+//	[RETURNING target_list]`. USING-clause joins in DELETE are
+//
+// deferred. The optional `With` field (M0016-0001) is nil when no
+// WITH clause precedes the DELETE.
 type DeleteStmt struct {
 	pos       int
+	With      *WithClause
 	Target    RangeVar
 	Where     Expr // nil when absent
 	Returning []ResTarget
