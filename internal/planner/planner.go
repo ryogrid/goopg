@@ -137,6 +137,15 @@ type rangeBinding struct {
 	table  *catalog.Table
 	alias  string
 	offset int // first output-column index for this relation
+	// qualifiedOnly hides this binding from the unqualified
+	// column-resolution path AND restricts qualified matches to
+	// alias-only (never via the underlying table's catalog name).
+	// Used by ON CONFLICT DO UPDATE (M0017-0002) to wire the
+	// `excluded` pseudo-table — same `*catalog.Table` as the
+	// target — without making bare `col` ambiguous or letting
+	// `<target>.col` accidentally match the excluded side.
+	// Mirrors the analyzer's scopeRel.qualifiedOnly.
+	qualifiedOnly bool
 }
 
 func tableSchema(t *catalog.Table) Schema {
@@ -1376,19 +1385,6 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
-	if s.OnConflict != nil {
-		// M0017-0001 step 2 lands the parser surface and
-		// analyzer validation; planner conflict-arbiter
-		// selection lands in M0017-0002. Reject at the planner
-		// so an executable plan never silently drops the ON
-		// CONFLICT clause — analyzer-only validation is not a
-		// safe substitute for execution gating.
-		return nil, &PlanError{
-			Pos:     s.OnConflict.Pos(),
-			Code:    "0A000",
-			Message: "ON CONFLICT is not supported in v0 planner",
-		}
-	}
 	restore, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
@@ -1448,7 +1444,158 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		rows = append(rows, row)
 	}
 	values := &Values{pos: s.Pos(), Rows: rows, schema: insertValuesSchema(tbl, colIndex)}
-	return &Insert{pos: s.Pos(), Table: tbl, Source: values, ColumnIndex: colIndex}, nil
+	insert := &Insert{pos: s.Pos(), Table: tbl, Source: values, ColumnIndex: colIndex}
+	if s.OnConflict != nil {
+		oc, err := planOnConflict(s.OnConflict, tbl, s.Target.Alias, cat)
+		if err != nil {
+			return nil, err
+		}
+		insert.OnConflict = oc
+	}
+	return insert, nil
+}
+
+// planOnConflict resolves the parser-level ON CONFLICT clause into
+// the planner-side OnConflictPlan: arbiter-index selection from
+// the conflict target columns, plus expression resolution for the
+// DO UPDATE branch under a target+excluded scope. M0017-0002.
+func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias string, cat catalog.Catalog) (*OnConflictPlan, error) {
+	out := &OnConflictPlan{}
+
+	switch oc.Action {
+	case parser.OnConflictNothing:
+		out.Action = OnConflictActionNothing
+	case parser.OnConflictUpdate:
+		out.Action = OnConflictActionUpdate
+	default:
+		return nil, &PlanError{Pos: oc.Pos(), Code: "XX000", Message: fmt.Sprintf("unexpected ON CONFLICT action %d", oc.Action)}
+	}
+
+	// Constraint-name target — analyzer rejects this as Stage B,
+	// but defend against bypassed-analyzer paths so the planner
+	// stays self-contained.
+	if oc.Target != nil && oc.Target.Constraint != "" {
+		return nil, &PlanError{Pos: oc.Pos(), Code: "0A000", Message: "ON CONFLICT ON CONSTRAINT is not supported in v0 (Stage B)"}
+	}
+
+	// Arbiter-index selection. For the no-target form (DO NOTHING
+	// only — analyzer rejects DO UPDATE without a target),
+	// ArbiterIndex stays nil; the executor checks every unique
+	// index when the row hits.
+	if oc.Target != nil {
+		idx, ords, err := resolveArbiterIndex(oc.Target, tbl, cat)
+		if err != nil {
+			return nil, err
+		}
+		out.ArbiterIndex = idx
+		out.ArbiterColumns = ords
+	}
+
+	if out.Action != OnConflictActionUpdate {
+		return out, nil
+	}
+
+	// DO UPDATE expression resolution.
+	//
+	// Build a 2-binding scope: the target table at offset 0 (bare
+	// refs and `<target>.col` resolve here) and the same table
+	// re-bound as `excluded` at offset N with qualifiedOnly so
+	// `excluded.col` resolves only via the alias path. Schema is
+	// 2N wide — the executor will arrange a merged tuple at
+	// runtime.
+	primaryAlias := targetAlias
+	if primaryAlias == "" {
+		primaryAlias = tbl.Name
+	}
+	n := len(tbl.Columns)
+	bindings := []rangeBinding{
+		{table: tbl, alias: primaryAlias, offset: 0},
+		{table: tbl, alias: "excluded", offset: n, qualifiedOnly: true},
+	}
+	mergedSchema := make(Schema, 0, 2*n)
+	mergedSchema = append(mergedSchema, tableSchema(tbl)...)
+	mergedSchema = append(mergedSchema, tableSchema(tbl)...)
+	ctx := newResolveContext(bindings, mergedSchema)
+	ctx.cat = cat
+
+	out.UpdateSet = make([]Expr, n)
+	for _, a := range oc.UpdateSet {
+		col, ok := cat.LookupColumn(tbl, a.Column)
+		if !ok {
+			return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
+		}
+		expr, err := resolveExpr(a.Expr, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out.UpdateSet[col.Ordinal] = expr
+	}
+	if oc.UpdateWhere != nil {
+		pred, err := resolveExpr(oc.UpdateWhere, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out.UpdateWhere = pred
+	}
+	return out, nil
+}
+
+// resolveArbiterIndex matches the parsed conflict-target columns
+// against tbl's catalog indexes. A unique index whose column set
+// equals the target column set (case-insensitive, order-insensitive)
+// arbitrates the conflict. Mirrors upstream's "inference
+// specification" rule: the user's columns must canonically match
+// some unique constraint.
+//
+// Returns (idx, ordinals, nil) on a single match — ordinals are
+// `tbl.Columns` ordinals matching idx.Columns in catalog order so
+// the executor can extract the conflict key from a row tuple
+// without a name lookup. SQLSTATE 42P10 ("invalid_column_reference"
+// — upstream's "no unique or exclusion constraint matching the ON
+// CONFLICT specification") on no match.
+func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, cat catalog.Catalog) (*catalog.Index, []int, error) {
+	if len(target.Columns) == 0 {
+		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42601", Message: "ON CONFLICT target requires at least one column"}
+	}
+	wanted := make(map[string]struct{}, len(target.Columns))
+	for _, c := range target.Columns {
+		wanted[strings.ToLower(c)] = struct{}{}
+	}
+	if len(wanted) != len(target.Columns) {
+		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "ON CONFLICT target list contains duplicate columns"}
+	}
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if !idx.Unique {
+			continue
+		}
+		if len(idx.Columns) != len(target.Columns) {
+			continue
+		}
+		match := true
+		for _, ic := range idx.Columns {
+			if _, ok := wanted[strings.ToLower(ic)]; !ok {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		ords := make([]int, 0, len(idx.Columns))
+		for _, ic := range idx.Columns {
+			col, ok := cat.LookupColumn(tbl, ic)
+			if !ok {
+				// Catalog inconsistency — index references a
+				// column that isn't on the table. Surface
+				// loudly so we don't silently produce a
+				// wrong arbiter.
+				return nil, nil, &PlanError{Pos: target.Pos(), Code: "XX000", Message: fmt.Sprintf("index %q column %q not found on table %q", idx.Name, ic, tbl.Name)}
+			}
+			ords = append(ords, col.Ordinal)
+		}
+		return idx, ords, nil
+	}
+	return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: fmt.Sprintf("there is no unique or exclusion constraint matching the ON CONFLICT specification on relation %q", tbl.Name)}
 }
 
 func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
@@ -1942,6 +2089,17 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	if x.Table != "" || x.Schema != "" {
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
+			if b.qualifiedOnly {
+				// Pseudo-tables (e.g. ON CONFLICT's
+				// `excluded`) reach name resolution only
+				// via their alias. See the matching
+				// analyzer-side comment in analyzer.go.
+				if b.alias != "" && strings.EqualFold(x.Table, b.alias) &&
+					(x.Schema == "" || strings.EqualFold(x.Schema, b.table.Schema)) {
+					matches = append(matches, b)
+				}
+				continue
+			}
 			if bindingMatchesRelation(b, x.Table, x.Schema) {
 				matches = append(matches, b)
 			}
@@ -1972,6 +2130,9 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 
 	var found Expr
 	for _, b := range ctx.bindings {
+		if b.qualifiedOnly {
+			continue
+		}
 		for i, c := range b.table.Columns {
 			if !strings.EqualFold(c.Name, x.Column) {
 				continue

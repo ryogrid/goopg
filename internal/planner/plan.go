@@ -432,15 +432,76 @@ func (n *Values) Output() Schema { return n.schema }
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed
 // receive NULL (or their declared default once defaults are wired).
+//
+// OnConflict carries the resolved `ON CONFLICT …` action (M0017-0002).
+// nil for a plain INSERT — every existing test path keeps that
+// nil-default. Non-nil for the upstream-compatible UPSERT shape.
 type Insert struct {
 	pos         int
 	Table       *catalog.Table
 	Source      Node
 	ColumnIndex []int
+	OnConflict  *OnConflictPlan
 }
 
 func (n *Insert) Pos() int       { return n.pos }
 func (n *Insert) Output() Schema { return nil }
+
+// OnConflictAction enumerates the resolved conflict action — mirrors
+// the parser's parser.OnConflictAction enum, but the analyzer-only
+// `OnConflictNone` placeholder doesn't appear here because the
+// planner only produces nodes for actual clauses.
+type OnConflictAction int
+
+const (
+	// OnConflictActionNothing — `DO NOTHING`. The executor skips
+	// the row when any conflict on ArbiterIndex is detected (or
+	// any unique index, when ArbiterIndex == nil for the
+	// no-target form).
+	OnConflictActionNothing OnConflictAction = iota
+	// OnConflictActionUpdate — `DO UPDATE SET … [WHERE …]`. The
+	// executor reads the conflicting tuple, evaluates UpdateSet
+	// (and optional UpdateWhere) against a row exposing both the
+	// existing tuple (output indices 0..N-1) and the inserted
+	// tuple (output indices N..2N-1; addressed as `excluded.col`
+	// in user SQL), and writes the result back.
+	OnConflictActionUpdate
+)
+
+// OnConflictPlan is the resolved planner-side state for an
+// `INSERT … ON CONFLICT …` clause. Mirrors upstream's
+// OnConflictExpr (parsenodes.h) at the level of detail goopg's
+// executor needs.
+type OnConflictPlan struct {
+	Action OnConflictAction
+
+	// ArbiterIndex is the resolved unique/primary index that
+	// arbitrates conflict detection. Non-nil for any ON CONFLICT
+	// (cols) form; nil only for the bare `ON CONFLICT DO NOTHING`
+	// shape (no-target — executor must check every unique index).
+	ArbiterIndex *catalog.Index
+
+	// ArbiterColumns are the column ordinals on Table.Columns that
+	// match ArbiterIndex.Columns in catalog order. Same length as
+	// ArbiterIndex.Columns when ArbiterIndex != nil; nil otherwise.
+	// Useful at runtime so the executor can extract the conflict
+	// key from the inserted-row tuple without re-doing a name
+	// lookup.
+	ArbiterColumns []int
+
+	// UpdateSet is parallel to Table.Columns: nil means "leave the
+	// existing value alone", non-nil is an Expr to evaluate
+	// against the merged target+excluded row at conflict time.
+	// Only populated when Action == OnConflictActionUpdate.
+	UpdateSet []Expr
+
+	// UpdateWhere is the optional predicate from `DO UPDATE SET …
+	// WHERE …`. nil when absent. Evaluated against the same
+	// target+excluded row; rows whose predicate evaluates false
+	// are left unchanged (no DO NOTHING fallback — matches
+	// upstream's silent-skip rule).
+	UpdateWhere Expr
+}
 
 // Update — overwrites visible rows of Table with Set assignments.
 // Set is parallel to the table's columns: nil entries leave the

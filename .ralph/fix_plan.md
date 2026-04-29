@@ -2456,10 +2456,68 @@ concurrent-write semantics. Decompose when picked up.
       planner-side `TestPlanInsertOnConflictRejected`
       mirroring the `TestPlanWithRecursiveRejected`
       pattern. Full `go test ./...` green.)
-- [ ] UPSERT Stage A — planner + executor wiring
-      (M0017-0002 / M0017-0003). Reserves filenames
-      `docs/design/0017-0002-upsert-planner-and-arbiter-selection.md`
-      and `docs/design/0017-0003-upsert-executor-concurrency-and-locking.md`.
+- [x] UPSERT Stage A — **planner + arbiter selection**
+      (M0017-0002). Design doc
+      `docs/design/0017-0002-upsert-planner-and-arbiter-selection.md`.
+      (landed 2026-04-29: produces an executable plan node
+      from the parser/analyzer-validated AST. New
+      `OnConflictPlan` (Action / ArbiterIndex /
+      ArbiterColumns / UpdateSet / UpdateWhere) hangs off
+      `Insert.OnConflict` — nil-default keeps every
+      pre-M0017 INSERT byte-unchanged. New
+      `OnConflictAction` enum (Nothing / Update).
+      `resolveArbiterIndex(target, tbl, cat)` walks
+      `cat.IndexesOnTable(tbl)` looking for a unique index
+      whose column **set** (case-insensitive,
+      order-insensitive) equals the user-supplied target —
+      first match wins, catalog iteration order is stable
+      so the choice is deterministic; `(a,b)` matches
+      `(a,b)` and `(b,a)` indexes per upstream semantics.
+      Returns `42P10` "no unique or exclusion constraint
+      matching the ON CONFLICT specification" on no match.
+      `ArbiterColumns` is the per-target-column ordinal
+      list in `tbl.Columns` order matching
+      `ArbiterIndex.Columns` so the executor extracts the
+      conflict key without re-doing name lookup.
+      `rangeBinding` grew `qualifiedOnly bool` — same
+      dual-restriction as the analyzer's
+      `scopeRel.qualifiedOnly`: hidden from the unqualified
+      loop AND restricted to alias-only on the qualified
+      arm. Without it, registering `excluded` as a synthetic
+      binding pointing at the same `*catalog.Table` would
+      make every bare `col` ambiguous and let
+      `<target>.col` accidentally match excluded. DO UPDATE
+      planner builds a 2-binding scope (target at offset 0,
+      excluded at offset N qualifiedOnly), 2N-wide schema;
+      `UpdateSet` is parallel to `tbl.Columns` (nil = leave
+      alone). Resolved ColumnRefs carry Index values 0..N-1
+      (existing tuple) / N..2N-1 (inserted tuple) — the
+      executor will arrange the merged layout at runtime.
+      Executor `*planner.Insert` build-path rejects when
+      `p.OnConflict != nil` with "ON CONFLICT execution is
+      not supported in v0 (Stage A executor lands in
+      M0017-0003)" — two-step gate: planner produces full
+      plan so misuses surface specific catalog/arbiter
+      errors not a generic curtain; executor refuses to
+      silently drop the clause. Tests in
+      `internal/planner/with_test.go`:
+      TestPlanInsertOnConflictNoMatchingArbiter (42P10
+      without index), TestPlanInsertOnConflictWithUniqueIndex
+      (full plan-shape assertion against an installed
+      unique index — ArbiterIndex / ArbiterColumns / UpdateSet
+      slot mapping all checked),
+      TestPlanInsertOnConflictDoNothingNoTarget (no-target
+      form leaves ArbiterIndex nil for runtime). Full
+      `go test ./...` green.)
+- [ ] UPSERT Stage A — executor runtime
+      (M0017-0003). Reserves filename
+      `docs/design/0017-0003-upsert-executor-concurrency-and-locking.md`.
+      Implement runtime conflict detection (probe arbiter
+      index before heap insert), DO UPDATE apply path
+      (read existing tuple, build merged 2N-wide row,
+      evaluate UpdateSet/UpdateWhere, write back), DO
+      NOTHING short-circuit, locking semantics under
+      concurrent writers.
 - [ ] UPSERT Stage B: `ON CONFLICT ON CONSTRAINT name`,
       `excluded.col` references in DO UPDATE.
 

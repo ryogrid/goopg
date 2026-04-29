@@ -3,6 +3,8 @@ package planner
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestPlanWithSimpleCTE: WITH a AS (SELECT 1) SELECT * FROM a
@@ -124,26 +126,94 @@ func TestPlanWithoutCTEUnchanged(t *testing.T) {
 	}
 }
 
-// TestPlanInsertOnConflictRejected: ON CONFLICT analyzer
-// validation lands in M0017-0001 step 2; planner conflict-arbiter
-// selection lands in M0017-0002. Until then the planner refuses
-// to produce a plan for `INSERT … ON CONFLICT …` so an executable
-// plan never silently drops the clause. Mirrors the
-// TestPlanWithRecursiveRejected pattern (0A000 second-line gate).
-func TestPlanInsertOnConflictRejected(t *testing.T) {
+// TestPlanInsertOnConflictNoMatchingArbiter — without a unique
+// index covering the conflict-target columns, the planner can't
+// pick an arbiter and surfaces upstream's 42P10 ("no unique or
+// exclusion constraint matching the ON CONFLICT specification")
+// diagnostic. Pgbench's default schema has no index on aid, so
+// this stands as the no-match guard.
+func TestPlanInsertOnConflictNoMatchingArbiter(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	stmt := parseOne(t,
 		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) "+
 			"ON CONFLICT (aid) DO UPDATE SET abalance = excluded.abalance")
 	_, err := Plan(stmt, cat)
 	if err == nil {
-		t.Fatal("expected ON CONFLICT rejection, got nil")
+		t.Fatal("expected arbiter-resolution error, got nil")
 	}
 	pe, ok := err.(*PlanError)
 	if !ok {
 		t.Fatalf("err type=%T, want *PlanError", err)
 	}
-	if pe.Code != "0A000" {
-		t.Errorf("code=%s, want 0A000", pe.Code)
+	if pe.Code != "42P10" {
+		t.Errorf("code=%s, want 42P10", pe.Code)
+	}
+}
+
+// TestPlanInsertOnConflictWithUniqueIndex — once a unique index
+// covers the conflict-target column set, the planner produces a
+// fully-resolved Insert with OnConflict populated: arbiter index
+// reference, ordinals matching the index columns, and the SET
+// expressions resolved against the target+excluded scope.
+func TestPlanInsertOnConflictWithUniqueIndex(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_pkey"}, tbl, []string{"aid"}, true, "btree", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) "+
+			"ON CONFLICT (aid) DO UPDATE SET abalance = excluded.abalance")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins, ok := node.(*Insert)
+	if !ok {
+		t.Fatalf("node = %T, want *Insert", node)
+	}
+	if ins.OnConflict == nil {
+		t.Fatal("OnConflict nil")
+	}
+	if ins.OnConflict.Action != OnConflictActionUpdate {
+		t.Errorf("Action = %v", ins.OnConflict.Action)
+	}
+	if ins.OnConflict.ArbiterIndex != idx {
+		t.Errorf("ArbiterIndex = %v, want %v", ins.OnConflict.ArbiterIndex, idx)
+	}
+	if len(ins.OnConflict.ArbiterColumns) != 1 || ins.OnConflict.ArbiterColumns[0] != 0 {
+		t.Errorf("ArbiterColumns = %v, want [0]", ins.OnConflict.ArbiterColumns)
+	}
+	// abalance is column ordinal 2 on pgbench_accounts.
+	if ins.OnConflict.UpdateSet[2] == nil {
+		t.Errorf("UpdateSet[2] = nil, want non-nil")
+	}
+	if ins.OnConflict.UpdateWhere != nil {
+		t.Errorf("UpdateWhere = %+v, want nil", ins.OnConflict.UpdateWhere)
+	}
+}
+
+// TestPlanInsertOnConflictDoNothingNoTarget — the bare DO NOTHING
+// shape (no conflict target) plans without any unique-index
+// match: ArbiterIndex stays nil and the executor decides which
+// indexes to consult at runtime.
+func TestPlanInsertOnConflictDoNothingNoTarget(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) ON CONFLICT DO NOTHING")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	if ins.OnConflict == nil {
+		t.Fatal("OnConflict nil")
+	}
+	if ins.OnConflict.Action != OnConflictActionNothing {
+		t.Errorf("Action = %v, want OnConflictActionNothing", ins.OnConflict.Action)
+	}
+	if ins.OnConflict.ArbiterIndex != nil {
+		t.Errorf("ArbiterIndex = %+v, want nil for no-target form", ins.OnConflict.ArbiterIndex)
 	}
 }

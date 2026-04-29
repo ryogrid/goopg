@@ -76,6 +76,17 @@ func Build(plan planner.Node) (Operator, error) {
 	case *planner.IndexScan:
 		return maybeInstrument(p, newIndexScanOp(p)), nil
 	case *planner.Insert:
+		if p.OnConflict != nil {
+			// M0017-0002 lands the planner-side resolution
+			// (arbiter selection, target+excluded scope for
+			// SET expressions). Runtime detection +
+			// conflict-update apply land in M0017-0003. Reject
+			// at the executor so an `INSERT … ON CONFLICT …`
+			// statement never silently drops the clause when
+			// the planner produces a fully-formed OnConflict
+			// node before the runtime support is in place.
+			return nil, fmt.Errorf("ON CONFLICT execution is not supported in v0 (Stage A executor lands in M0017-0003)")
+		}
 		child, err := Build(p.Source)
 		if err != nil {
 			return nil, err
