@@ -2814,7 +2814,7 @@ Substantial. Decompose when picked up.
       - [x] M0020-S05: executor WindowAgg operator skeleton (drain,
             partition key evaluation, order-key sort).
       - [x] M0020-S06: executor row_number() evaluation.
-      - [ ] M0020-S07: executor rank() evaluation with peer-group
+      - [x] M0020-S07: executor rank() evaluation with peer-group
             semantics.
       - [ ] M0020-S08: EXPLAIN label/tree integration for
             WindowAgg.

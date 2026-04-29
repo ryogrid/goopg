@@ -127,6 +127,7 @@ func (o *windowOp) evalWindowFuncs() error {
 		prevPartition string
 		hasPrev       bool
 		rowNum        int64
+		rank          int64
 	)
 	for i := range o.rows {
 		partKey, err := o.partitionKey(o.rows[i])
@@ -135,10 +136,18 @@ func (o *windowOp) evalWindowFuncs() error {
 		}
 		if !hasPrev || partKey != prevPartition {
 			rowNum = 1
+			rank = 1
 			prevPartition = partKey
 			hasPrev = true
 		} else {
 			rowNum++
+			peer, err := o.samePeer(o.rows[i-1], o.rows[i])
+			if err != nil {
+				return err
+			}
+			if !peer {
+				rank = rowNum
+			}
 		}
 		for j, fn := range o.plan.Funcs {
 			idx := base + j
@@ -146,7 +155,7 @@ func (o *windowOp) evalWindowFuncs() error {
 			case "row_number":
 				o.rows[i][idx] = Datum{Kind: KindInt, Int: rowNum}
 			case "rank":
-				// rank() lands in M0020-S07.
+				o.rows[i][idx] = Datum{Kind: KindInt, Int: rank}
 			default:
 				return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
 			}
@@ -168,6 +177,36 @@ func (o *windowOp) partitionKey(row Row) (string, error) {
 		parts = append(parts, datumKey(v))
 	}
 	return strings.Join(parts, "|"), nil
+}
+
+func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
+	if len(o.plan.OrderBy) == 0 {
+		return true, nil
+	}
+	for _, ok := range o.plan.OrderBy {
+		a, err := evalExpr(ok.Expr, prev, o.ctx)
+		if err != nil {
+			return false, err
+		}
+		b, err := evalExpr(ok.Expr, cur, o.ctx)
+		if err != nil {
+			return false, err
+		}
+		if a.IsNull() || b.IsNull() {
+			if a.IsNull() && b.IsNull() {
+				continue
+			}
+			return false, nil
+		}
+		cmp, err := compareDatum(a, b, ok.Expr.Pos())
+		if err != nil {
+			return false, err
+		}
+		if cmp != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func compareSortDatums(a, b Datum, pos int, desc bool) (cmp int, decided bool, err error) {
