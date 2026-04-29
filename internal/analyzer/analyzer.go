@@ -738,6 +738,14 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{Name: "unknown"}, nil
 		}
 	case *parser.FuncCall:
+		// M0020-0001 step 1: parser accepts `func() OVER (...)`,
+		// but analyzer / planner / executor support hasn't
+		// landed yet. Reject loudly so a SELECT with a window
+		// function never silently degrades to a non-windowed
+		// scalar/aggregate evaluation.
+		if x.Over != nil {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "window functions are not supported in v0 analyzer")
+		}
 		for _, a := range x.Args {
 			if _, err := analyzeExpr(a, ctx); err != nil {
 				return catalog.Type{}, err

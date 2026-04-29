@@ -101,3 +101,16 @@ func TestAnalyzeDMLTypeAndReturningErrors(t *testing.T) {
 	expectAnalyzeCode(t, cat, "UPDATE pgbench_accounts SET aid = 'x'", "42804")
 	expectAnalyzeCode(t, cat, "DELETE FROM pgbench_accounts RETURNING aid", "0A000")
 }
+
+// TestAnalyzeWindowFunctionRejected — M0020 step 1 gate. The
+// parser accepts `OVER (...)` but the analyzer / planner /
+// executor support hasn't landed yet; a SELECT with a window
+// function must surface 0A000 so users see the precise
+// "not yet supported" diagnostic instead of a silent
+// non-windowed evaluation.
+func TestAnalyzeWindowFunctionRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT row_number() OVER () FROM pgbench_accounts",
+		"0A000")
+}

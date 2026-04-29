@@ -148,6 +148,14 @@ const (
 	KwDo       Keyword = "do"
 	KwNothing  Keyword = "nothing"
 
+	// Window functions (M0020): `func() OVER ( [PARTITION BY …]
+	// [ORDER BY …] )`. KwOrder / KwBy already exist; the new
+	// ones are OVER / PARTITION. Frame clauses (ROWS / RANGE /
+	// GROUPS) and named-window references are deferred to a
+	// later slice.
+	KwOver      Keyword = "over"
+	KwPartition Keyword = "partition"
+
 	// Pessimistic row locking (M0021): `SELECT ... FOR { UPDATE
 	// | SHARE } [ OF table [, ...] ] [ NOWAIT | SKIP LOCKED ]`.
 	// `KwFor`, `KwUpdate` already exist; the new ones are
@@ -270,6 +278,8 @@ var keywords = map[string]Keyword{
 	"nowait":       KwNowait,
 	"skip":         KwSkip,
 	"locked":       KwLocked,
+	"over":         KwOver,
+	"partition":    KwPartition,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

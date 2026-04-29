@@ -256,13 +256,35 @@ func (*CastExpr) exprNode()  {}
 
 // FuncCall is `Name(args…)`. v0 covers the call shape only; argument
 // type checking and overload resolution are the analyzer's job.
+//
+// The optional `Over *WindowDef` (M0020-0001) field is non-nil when
+// the call carried an `OVER (…)` tail — promoting it from a scalar
+// or aggregate to a window function. nil for plain calls so every
+// existing parser/planner test path stays byte-for-byte unchanged.
 type FuncCall struct {
 	pos      int
 	Name     ObjectName
 	Args     []Expr
 	Star     bool // count(*)-style star argument
 	Distinct bool // DISTINCT inside the arg list
+	Over     *WindowDef
 }
 
 func (e *FuncCall) Pos() int { return e.pos }
 func (*FuncCall) exprNode()  {}
+
+// WindowDef is the parsed `OVER ( [PARTITION BY exprs]
+// [ORDER BY sortlist] )` tail attached to a FuncCall (M0020 step
+// 1). Frame clauses (ROWS / RANGE / GROUPS), frame exclusion, and
+// named-window references (`OVER win_name`) are deferred to a
+// later slice — they're optional in upstream and ROW_NUMBER /
+// RANK / LAG / LEAD don't need explicit frames at the SQL surface
+// (the executor uses default frames).
+type WindowDef struct {
+	pos         int
+	PartitionBy []Expr
+	OrderBy     []SortBy
+}
+
+// Pos returns the position of the leading `OVER` keyword.
+func (w *WindowDef) Pos() int { return w.pos }

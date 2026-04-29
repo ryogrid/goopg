@@ -2761,7 +2761,46 @@ Decompose when picked up.
 See `docs/milestones/0020-window-functions-over-row-number-rank-lag-lead.md`.
 Substantial. Decompose when picked up.
 
-- [ ] Window-function parser + planner + executor.
+- [x] Window-function parser surface + AST
+      (M0020-0001 step 1). Design doc
+      `docs/design/0020-0001-window-parser-and-ast.md`.
+      (landed 2026-04-30: parser-only additive slice
+      mirroring the M0016/M0017/M0018/M0021 step-1
+      pattern. New keywords KwOver / KwPartition;
+      KwOrder/KwBy already exist. New `WindowDef` AST
+      (PartitionBy []Expr + OrderBy []SortBy reusing
+      existing SortBy shape so executor ordering logic
+      doesn't need new sort-key plumbing).
+      `FuncCall.Over *WindowDef` is nil for every
+      pre-M0020 call so existing tests stay
+      byte-unchanged. New `parseWindowDef` consumes
+      `OVER ( [PARTITION BY exprs] [ORDER BY
+      sortlist] )`; new `maybeWindowTail` is called by
+      `parseFuncCallTail` after `)` and returns FuncCall
+      unchanged when next token isn't OVER. Frame
+      clauses (ROWS / RANGE / GROUPS) parse but error
+      explicitly with "frame clauses are not supported
+      in v0" so users see deferred-feature diagnostic
+      instead of generic syntax error — Stage B promotes
+      them. Named windows + WINDOW definition clauses
+      also deferred. Analyzer gate: `analyzeExpr`'s
+      FuncCall arm rejects `x.Over != nil` with 0A000.
+      Tests: 7 parser scenarios in window_test.go (bare
+      OVER, PARTITION BY, ORDER BY DESC, both clauses,
+      count(*) OVER (), frame-clause reject, rollout
+      guardrail) + 1 analyzer test
+      TestAnalyzeWindowFunctionRejected. Full `go test
+      ./...` green. Analyzer name resolution + planner
+      WindowAgg node + executor per-partition streaming
+      + LAG/LEAD argument shapes + frame clauses +
+      named windows all stay deferred for
+      M0020-0002/0003/0004.)
+- [ ] Window-function — analyzer + planner + executor
+      wiring (M0020-0002 / M0020-0003 / M0020-0004).
+      Reserves filenames
+      `docs/design/0020-0002-window-analyzer-and-planner.md`,
+      `docs/design/0020-0003-window-executor.md`,
+      `docs/design/0020-0004-window-explain-and-tests.md`.
 
 ## Milestone 0021 — SELECT ... FOR UPDATE
 

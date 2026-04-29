@@ -1267,7 +1267,7 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 	fc := &FuncCall{pos: pos, Name: name}
 	// `f()`
 	if p.acceptSymbol(")") {
-		return fc, nil
+		return p.maybeWindowTail(fc)
 	}
 	// `f(*)` — count(*) etc.
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
@@ -1276,7 +1276,7 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		return fc, nil
+		return p.maybeWindowTail(fc)
 	}
 	if p.acceptKeyword(KwDistinct) {
 		fc.Distinct = true
@@ -1293,6 +1293,63 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ',' or ')'")
 		}
+		return p.maybeWindowTail(fc)
+	}
+}
+
+// maybeWindowTail consumes an optional `OVER (...)` window
+// clause after a function-call's closing `)`. Promotes the
+// FuncCall from a scalar/aggregate to a window function by
+// stamping fc.Over (M0020 step 1). When the next token isn't
+// the OVER keyword the call is returned unchanged so every
+// pre-M0020 caller stays byte-for-byte the same.
+func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOver) {
 		return fc, nil
 	}
+	wd, err := p.parseWindowDef()
+	if err != nil {
+		return nil, err
+	}
+	fc.Over = wd
+	return fc, nil
+}
+
+// parseWindowDef parses the `OVER ( [PARTITION BY exprs]
+// [ORDER BY sortlist] )` body. Frame clauses (ROWS / RANGE /
+// GROUPS) are deferred — `parseWindowDef` errors on any token
+// that isn't `)` after the optional ORDER BY.
+func (p *parser) parseWindowDef() (*WindowDef, error) {
+	t, err := p.expectKeyword(KwOver)
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after OVER")
+	}
+	wd := &WindowDef{pos: t.Pos}
+	if p.acceptKeyword(KwPartition) {
+		if _, err := p.expectKeyword(KwBy); err != nil {
+			return nil, err
+		}
+		exprs, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		wd.PartitionBy = exprs
+	}
+	if p.acceptKeyword(KwOrder) {
+		if _, err := p.expectKeyword(KwBy); err != nil {
+			return nil, err
+		}
+		sl, err := p.parseSortList()
+		if err != nil {
+			return nil, err
+		}
+		wd.OrderBy = sl
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' after window definition (frame clauses are not supported in v0)")
+	}
+	return wd, nil
 }
