@@ -2174,11 +2174,45 @@ item.
       builder skeleton stays deferred — needed before a real
       consumer can interpret tuple bytes against schema.)
 
-- [ ] Snapshot builder skeleton: slot-creation-time HISTORIC
+- [x] Snapshot builder skeleton: slot-creation-time HISTORIC
       snapshot for the logical decoder so plugins can
       interpret tuple bytes against the catalog state in
       effect at slot creation. Continues in
       `docs/design/0008-0001-logical-decoding-pipeline.md`.
+      (landed 2026-04-29: new
+      `catalog.InMemory.AllTables()` accessor returns deep
+      copies of every non-virtual user table in OID order.
+      `internal/wal/snapshot.go` introduces:
+        - `RelationDef{Schema, Name, OID, Columns}` and
+          `ColumnDef{Name, Type, NotNull, Ordinal}` — the
+          immutable per-relation snapshot.
+        - `CatalogSnapshot` — per-RelOid map; `Lookup(rel)`
+          resolves by RelOid (stable across renames); `Len()`
+          for observability.
+        - `BuildCatalogSnapshot(c)` — captures the current
+          catalog state. Mutations after capture cannot leak
+          through; the `Drop + recreate` test pin guarantees
+          this.
+        - Virtual catalog views skipped (they re-register on
+          startup).
+        - `SlotSnapshot{Catalog, MVCC}` bundles the two
+          frozen views a plugin needs at slot start.
+      `wal.SlotDecoder` grows a `Snapshot SlotSnapshot` field
+      and a `NewSlotDecoderWithSnapshot(...)` constructor; the
+      original `NewSlotDecoder` stays for tests that don't
+      need schema awareness. Plugins read
+      `decoder.Snapshot` once pgoutput (0008-0002) wires the
+      consumption path. Tests:
+      TestBuildCatalogSnapshotFreezesShape (mutation after
+      capture doesn't bleed through),
+      TestBuildCatalogSnapshotSkipsVirtualTables,
+      TestSnapshotLookupMissingRelation,
+      TestNewSlotDecoderWithSnapshotAttachesIt. Full upstream
+      `SnapBuild` state machine, schema-change replay across
+      slot lifetime, and the per-slot catalog-xmin retention
+      hook in vacuum / pruning remain deferred. With this
+      slice 0008-0001 has the foundation a real pgoutput
+      plugin (0008-0002) can build against.)
 
 - [ ] `pgoutput` output plugin: B / C / R / I / U / D message
       framing wire-compatible with upstream PG 18.x. Replica-

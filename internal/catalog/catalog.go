@@ -711,3 +711,25 @@ func (c *InMemory) IndexRelFileNode(index *Index) storage.RelFileNode {
 	defer c.mu.RUnlock()
 	return storage.RelFileNode{DBOid: c.dbOid, RelOid: index.OID, Fork: storage.MainFork}
 }
+
+// AllTables returns deep copies of every non-virtual user table
+// in the catalog, in OID order. Used by the M0008 logical-decoding
+// snapshot builder to freeze the schema as it stood at slot
+// creation time so plugins can interpret tuple bytes against a
+// stable shape. See
+// docs/design/0008-0001-logical-decoding-pipeline.md.
+func (c *InMemory) AllTables() []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Table, 0, len(c.tables))
+	for _, t := range c.tables {
+		if t.Virtual {
+			continue
+		}
+		cp := *t
+		cp.Columns = append([]Column(nil), t.Columns...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}

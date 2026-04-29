@@ -25,11 +25,27 @@ import (
 // SlotDecoder runs the WAL → reorder buffer → output plugin
 // pipeline for one logical slot. Construct one per slot, call
 // Run(ctx), Close on ctx cancellation.
+//
+// The HISTORIC snapshot bundle (Snapshot field) freezes the
+// catalog and MVCC view at slot-decoder construction time so
+// plugins can interpret tuple bytes against a stable schema
+// shape. Plugins reach the snapshot through whatever surface
+// the OutputPlugin implementer wires up — the SlotDecoder
+// keeps it as state but doesn't propagate it through the
+// `Begin` / `Change` / `Commit` interface today. pgoutput
+// (0008-0002) adds that wiring.
 type SlotDecoder struct {
 	slotName string
 	slots    *Slots
 	iter     *RecordIterator
 	decoder  *Decoder
+
+	// Snapshot is the slot-creation-time HISTORIC view a
+	// plugin uses to resolve relations and decide tuple
+	// visibility. Set by NewSlotDecoderWithSnapshot;
+	// NewSlotDecoder leaves it zero-valued so existing tests
+	// stay green.
+	Snapshot SlotSnapshot
 }
 
 // NewSlotDecoder wires a logical-slot consumer. `slotName` must
@@ -63,6 +79,25 @@ func NewSlotDecoder(slots *Slots, slotName string, w *Writer, walDir string, seg
 		iter:     it,
 		decoder:  NewDecoder(plugin),
 	}, nil
+}
+
+// NewSlotDecoderWithSnapshot is the M0008-aware constructor that
+// freezes a HISTORIC catalog + MVCC view at decoder-construction
+// time and stuffs it on the returned `SlotDecoder.Snapshot`. The
+// snapshot is what a real OutputPlugin (pgoutput in 0008-0002)
+// will consult to interpret tuple bytes against a stable schema
+// shape; passing the bundle in at construction means the
+// plugin's view of the catalog doesn't drift mid-stream.
+//
+// Mirrors NewSlotDecoder otherwise. See
+// docs/design/0008-0001-logical-decoding-pipeline.md.
+func NewSlotDecoderWithSnapshot(slots *Slots, slotName string, w *Writer, walDir string, segSize int64, plugin OutputPlugin, snap SlotSnapshot) (*SlotDecoder, error) {
+	d, err := NewSlotDecoder(slots, slotName, w, walDir, segSize, plugin)
+	if err != nil {
+		return nil, err
+	}
+	d.Snapshot = snap
+	return d, nil
 }
 
 // Close releases the iterator subscription. Safe to call multiple

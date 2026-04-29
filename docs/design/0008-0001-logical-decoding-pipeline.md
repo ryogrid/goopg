@@ -256,11 +256,43 @@ structures that the future WAL classifier will drive.
    One goroutine per active slot; the loop is sequential by
    design.
 
-   **Snapshot builder still deferred.** A real consumer needs
-   schema awareness to interpret tuple bytes; that's the next
-   M0008 / 0008-0001 follow-up. Until it lands, the loop works
-   end-to-end against synthetic record streams that ship the
-   raw tuple bytes through to the plugin.
+7. **Snapshot builder skeleton (`internal/wal/snapshot.go`).** Loop
+   6 closes the snapshot gap. v0's first slice is "snapshot built
+   at slot creation stays consistent for the slot's lifetime" —
+   schema changes during the slot's life are explicitly out of
+   scope and will surface as decoder errors when they bite.
+
+   - `CatalogSnapshot` is an immutable, per-`RelOid` map of
+     `RelationDef{Schema, Name, OID, Columns}`. Built via
+     `BuildCatalogSnapshot(c *catalog.InMemory)`, which calls a
+     new `catalog.InMemory.AllTables()` accessor that returns
+     deep copies in OID order. Mutations to the underlying
+     catalog after capture cannot leak through — the test suite
+     pins this with a drop-and-recreate after snapshotting.
+   - Virtual catalog views (`pg_catalog.*`) are skipped — they
+     re-register on every startup and aren't user-data.
+   - `Lookup(rel storage.RelFileNode) (*RelationDef, bool)` —
+     RelOid is the stable identifier across schema renames; v0's
+     RelFileNode triple is what the classifier already extracts.
+     `false` means the relation didn't exist when the slot
+     started; today the plugin should skip the change, once
+     schema-change handling lands this becomes a hard error.
+   - `SlotSnapshot{Catalog *CatalogSnapshot, MVCC mvcc.Snapshot}`
+     bundles the two frozen views a logical decoder needs at
+     slot start: schema plus xact visibility.
+   - `NewSlotDecoderWithSnapshot(...)` is the M0008-aware
+     constructor that attaches the bundle to the decoder; the
+     non-snapshot constructor remains for tests that don't care
+     about plugin schema awareness. Plugins consume
+     `SlotDecoder.Snapshot` once pgoutput (0008-0002) wires up
+     the read path.
+
+   The full upstream `SnapBuild` state machine
+   (initial → building → consistent transitions across multiple
+   running-xact snapshots, schema-change replay, etc.) stays
+   deferred — the v0 cut works for "create slot against a
+   quiescent primary, decode forward" which is the M0008 DoD's
+   first acceptance bar.
 
 ### Out of scope for this milestone
 
@@ -291,6 +323,19 @@ Slot foundation + view (loop 1):
   `catalog_xmin` keys) round-trip cleanly.
 - `internal/initdb/replication_views_test.go::TestPgReplicationSlotsViewRendersBothKinds`
   — view renders one row per slot with the upstream column shape.
+
+Snapshot builder skeleton (loop 6):
+
+- `internal/wal/snapshot_test.go::TestBuildCatalogSnapshotFreezesShape`
+  — capture, mutate the underlying catalog, confirm the frozen
+  view still resolves to the original shape via `Lookup`.
+- `…::TestBuildCatalogSnapshotSkipsVirtualTables` — `pg_catalog.*`
+  views aren't user-data; the snapshot omits them.
+- `…::TestSnapshotLookupMissingRelation` — Lookup of an unknown
+  RelOid returns `(nil, false)`.
+- `…::TestNewSlotDecoderWithSnapshotAttachesIt` — pin that
+  `NewSlotDecoderWithSnapshot` carries the SlotSnapshot through
+  to `SlotDecoder.Snapshot` for the future plugin to read.
 
 Per-slot decoder loop (loop 5):
 
