@@ -56,6 +56,14 @@ import (
 //     drained by FlushUpTo's Stage 1 (commit / eviction /
 //     checkpoint). The "natural" cost of WAL durability through
 //     the buffer; high values are healthy.
+//   - format_version (M0014-0004 step 2 finalisation): the active
+//     on-disk WAL format the writer is emitting — `legacy` for
+//     pre-M0014 8-byte length+CRC32-IEEE frames, `pgcompat` for
+//     the M0014 PG18-compatible format (XLogPageHeader +
+//     XLogRecord with CRC32C and MAXALIGN(8) record padding).
+//     Static for the writer's lifetime; satisfies M0014 DoD #9
+//     "Runtime observability exposes WAL format mode/version" at
+//     the SQL level.
 func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
@@ -73,6 +81,7 @@ func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 			{Name: "wal_buffers_bytes_resident", Type: catalog.Type{Name: "text"}},
 			{Name: "wal_buffers_overflow_drain_bytes", Type: catalog.Type{Name: "text"}},
 			{Name: "wal_buffers_flush_drain_bytes", Type: catalog.Type{Name: "text"}},
+			{Name: "format_version", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -106,6 +115,7 @@ func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 			fmt.Sprintf("%d", w.WALBuffersBytesResident()),
 			fmt.Sprintf("%d", w.WALBuffersOverflowDrainBytes()),
 			fmt.Sprintf("%d", w.WALBuffersFlushDrainBytes()),
+			w.Format().String(),
 		}}
 	}
 	return cat.RegisterVirtualTable(tbl)

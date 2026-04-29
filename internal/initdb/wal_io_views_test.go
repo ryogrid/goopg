@@ -137,3 +137,54 @@ func TestStatWALIOActiveWhenProbeOk(t *testing.T) {
 		t.Errorf("tail_rmw_writes=0 after small Append, want > 0 (3-byte payload definitely not block-aligned)")
 	}
 }
+
+// TestStatWALIOFormatVersionColumn pins the M0014-0004 step-2
+// finalisation: the trailing format_version column reports
+// `legacy` for the default writer and `pgcompat` when
+// PageHeaders=true. Static for the writer's lifetime — the
+// column position is at the end of the row so callers reading
+// older indexes don't shift.
+func TestStatWALIOFormatVersionColumn(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) {
+		w, err := wal.NewWriter(wal.Config{
+			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
+			SegmentSize: 4096,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		cat := catalog.NewInMemory()
+		if err := registerStatWALIOView(cat, w); err != nil {
+			t.Fatal(err)
+		}
+		tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_wal_io"})
+		row := tbl.VirtualRows()[0]
+		got := row[len(row)-1]
+		if got != "legacy" {
+			t.Errorf("format_version=%q, want legacy", got)
+		}
+	})
+	t.Run("pgcompat", func(t *testing.T) {
+		w, err := wal.NewWriter(wal.Config{
+			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
+			SegmentSize: 4096,
+			PageHeaders: true,
+			TimelineID:  1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		cat := catalog.NewInMemory()
+		if err := registerStatWALIOView(cat, w); err != nil {
+			t.Fatal(err)
+		}
+		tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_wal_io"})
+		row := tbl.VirtualRows()[0]
+		got := row[len(row)-1]
+		if got != "pgcompat" {
+			t.Errorf("format_version=%q, want pgcompat", got)
+		}
+	})
+}

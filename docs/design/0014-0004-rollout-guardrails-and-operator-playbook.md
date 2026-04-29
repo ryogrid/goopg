@@ -131,9 +131,14 @@ Tests: `format_mismatch_test.go` —
   compatibility" for pre-milestone clusters; pre-GA goopg simply
   requires a fresh data dir.
 - A standalone `pg_resetwal`-equivalent — separate scope.
-- SQL-level `pg_stat_wal_io.format_version` column wiring — the
+- ~~SQL-level `pg_stat_wal_io.format_version` column wiring — the
   Go-level `Writer.Format()` accessor lands now; surfacing it
-  through the existing pg_stat view is a follow-up cosmetic slice.
+  through the existing pg_stat view is a follow-up cosmetic slice.~~
+  Landed 2026-04-30: `pg_catalog.pg_stat_wal_io` grew a trailing
+  `format_version` column whose value is `w.Format().String()` (so
+  `legacy` or `pgcompat`). Trailing position keeps existing column
+  indexes stable. Test: `TestStatWALIOFormatVersionColumn` (two
+  sub-tests pinning both modes).
 - Migration tooling — M0014 says "out of scope: full pg_upgrade
   compatibility" for pre-milestone clusters; pre-GA goopg simply
   requires a fresh data dir.
