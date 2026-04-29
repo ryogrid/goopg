@@ -1510,10 +1510,72 @@ See `docs/milestones/0009-aio-subsystem.md`.
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 
-See `docs/milestones/0010-wal-direct-io-and-walsender-memory-handoff.md`.
+See `docs/milestones/0010-wal-direct-io-and-walsender-memory-handoff.md`
+for the full DoD. Decomposed into the three design-doc seams the
+milestone calls out (`0010-0001`, `0010-0002`, `0010-0003`); pick the
+topmost unchecked item.
 
-- [ ] (Decompose into agent-sized slices in a future loop;
-      depends on M0009 AIO subsystem.)
+- [ ] WAL direct-I/O write path (Linux, primary writer +
+      walreceiver). Open WAL segments with `O_DIRECT` when a
+      new `wal_direct_io` GUC (`ContextPostmaster`, default
+      `off`) is enabled; alignment-safe writes for body and
+      tail (`O_DIRECT` requires buffer/length/offset aligned
+      to the underlying block size — typically 4 KiB on
+      modern filesystems, but probe via `statx`/`BLKSSZGET`
+      rather than hard-coding). Tail writes that aren't
+      block-aligned use a read-modify-write of the trailing
+      page (legal because we own the segment exclusively) or
+      stage through a buffered fallback file descriptor that
+      `fdatasync`s into place — design doc must pick one and
+      explain the choice. Preserve M0007's commit-path
+      durability (commit succeeds only after the chosen sync
+      barrier returns) and M0007/M0007-0002's directory
+      `fsync` semantics. On filesystems / kernels where
+      `O_DIRECT` returns EINVAL at open, downgrade to
+      buffered with a `event=wal_direct_io_fallback` warn-
+      level log line. Same path lights up walreceiver's
+      WAL-persist write loop on the standby. Design doc
+      `docs/design/0010-0001-wal-direct-io-write-path.md`.
+
+- [ ] Walsender in-memory WAL handoff. Bounded ring of
+      recent WAL bytes maintained by the WAL writer (sized
+      via a new `wal_sender_memory_buffer` GUC, default e.g.
+      16 MiB). `walsender` reads from the ring when the
+      requested LSN is within the retention window, falls
+      back to on-disk segment reads (the existing path) for
+      historical ranges. Retention / eviction policy: drop
+      the oldest LSN bytes once the ring is full AND every
+      active sender's `sentLSN` has passed them; lagging
+      senders that fall outside the window cleanly switch to
+      disk reads without dropping the connection. Concurrent-
+      safe across multiple senders — RWMutex on the ring
+      head/tail metadata, lock-free byte read once the
+      sender has its (start, len) snapshot. Preserves M0005
+      ordering / framing: this is purely the byte-source
+      switch. Required because M0010-0001's `O_DIRECT` path
+      makes recent WAL no-longer-cheaply-available from the
+      page cache, so a sender trying to stream from disk
+      reads pays the full I/O cost. Design doc
+      `docs/design/0010-0002-walsender-in-memory-wal-handoff.md`.
+
+- [ ] WAL direct-I/O observability + operations. New
+      counters in `pg_stat_wal` (or a sibling
+      `pg_stat_wal_io`): `direct_writes`,
+      `direct_fallbacks`, `tail_rmw_writes`. New view /
+      counters for the in-memory handoff:
+      `pg_stat_replication.send_buffer_hits`,
+      `send_buffer_misses`, `send_buffer_bytes_resident`.
+      Startup log line: `event=wal_direct_io method=direct
+      block_size=4096 fallback_reason=...` (mirrors the
+      shape M0009's `event=aio_engine_attached` /
+      `event=aio_method_fallback` already established).
+      Operator-doc bullet under `docs/design/` covering
+      "when to enable" (write-heavy primary, page-cache
+      pressure visible in `vmstat si/so`) and "when not to"
+      (single-sender low-throughput setup where the buffered
+      path is fine, or filesystems that don't honour
+      `O_DIRECT`). Design doc
+      `docs/design/0010-0003-wal-direct-io-observability-and-operations.md`.
 
 ## Notes
 
