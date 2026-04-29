@@ -2809,7 +2809,7 @@ Substantial. Decompose when picked up.
             argument-shape diagnostics.
       - [x] M0020-S03: planner plan-node/types for WindowAgg and
             resolved window function descriptors.
-      - [ ] M0020-S04: planner pipeline wiring (WindowAgg
+      - [x] M0020-S04: planner pipeline wiring (WindowAgg
             injection between aggregate/having and final ORDER BY).
       - [ ] M0020-S05: executor WindowAgg operator skeleton (drain,
             partition key evaluation, order-key sort).

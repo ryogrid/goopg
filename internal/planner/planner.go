@@ -335,6 +335,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	var win *windowSurface
+	if needsWindowStage(s) {
+		var err error
+		node, ctx, win, err = buildWindowStage(s, node, ctx, agg)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if len(s.OrderBy) > 0 {
 		keys := make([]SortKey, 0, len(s.OrderBy))
 		for _, sb := range s.OrderBy {
@@ -349,7 +358,9 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
 			var e Expr
 			var err error
-			if agg == nil {
+			if win != nil {
+				e, err = resolveExprAfterWindow(expr, win)
+			} else if agg == nil {
 				e, err = resolveExpr(expr, ctx)
 			} else {
 				e, err = resolveExprAfterAggregate(expr, agg)
@@ -384,7 +395,9 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		targets []Expr
 		schema  Schema
 	)
-	if agg == nil {
+	if win != nil {
+		targets, schema, err = resolveTargetsAfterWindow(s.Targets, win)
+	} else if agg == nil {
 		targets, schema, err = resolveTargets(s.Targets, ctx)
 	} else {
 		targets, schema, err = resolveTargetsAfterAggregate(s.Targets, agg)
@@ -989,6 +1002,18 @@ type aggregateSurface struct {
 	aggregateByKey  map[string]aggregateBinding
 }
 
+type windowBinding struct {
+	index int
+	typ   catalog.Type
+}
+
+type windowSurface struct {
+	input       *resolveContext
+	agg         *aggregateSurface
+	output      *resolveContext
+	windowByKey map[string]windowBinding
+}
+
 func needsAggregateStage(s *parser.SelectStmt) bool {
 	if len(s.GroupBy) > 0 {
 		return true
@@ -1007,6 +1032,237 @@ func needsAggregateStage(s *parser.SelectStmt) bool {
 		}
 	}
 	return false
+}
+
+func needsWindowStage(s *parser.SelectStmt) bool {
+	for _, t := range s.Targets {
+		if parserExprHasWindowFunc(t.Expr) {
+			return true
+		}
+	}
+	for _, sb := range s.OrderBy {
+		expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
+		if parserExprHasWindowFunc(expr) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, agg *aggregateSurface) (Node, *resolveContext, *windowSurface, error) {
+	calls, err := collectWindowCalls(s)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(calls) == 0 {
+		return child, inputCtx, nil, nil
+	}
+
+	firstSpec := windowSpecKey(calls[0].Over)
+	for i := 1; i < len(calls); i++ {
+		if windowSpecKey(calls[i].Over) != firstSpec {
+			return nil, nil, nil, &PlanError{Pos: calls[i].Pos(), Code: "0A000", Message: "multiple window specifications are not supported in v0 planner"}
+		}
+	}
+
+	partition := make([]Expr, 0, len(calls[0].Over.PartitionBy))
+	for _, p := range calls[0].Over.PartitionBy {
+		r, err := resolveExprForWindowInput(p, inputCtx, agg)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		partition = append(partition, r)
+	}
+	order := make([]SortKey, 0, len(calls[0].Over.OrderBy))
+	for _, ob := range calls[0].Over.OrderBy {
+		r, err := resolveExprForWindowInput(ob.Expr, inputCtx, agg)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		order = append(order, SortKey{Expr: r, Desc: ob.Desc})
+	}
+
+	outputSchema := append(Schema(nil), inputCtx.schema...)
+	funcs := make([]WindowFunc, 0, len(calls))
+	byKey := make(map[string]windowBinding, len(calls))
+	for _, fc := range calls {
+		k := windowCallKey(fc)
+		if _, exists := byKey[k]; exists {
+			continue
+		}
+		wf, err := buildWindowFunc(fc)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		idx := len(outputSchema)
+		funcs = append(funcs, wf)
+		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: wf.Type})
+		byKey[k] = windowBinding{index: idx, typ: wf.Type}
+	}
+
+	windowNode := &WindowAgg{
+		pos:         s.Pos(),
+		Child:       child,
+		PartitionBy: partition,
+		OrderBy:     order,
+		Funcs:       funcs,
+		schema:      outputSchema,
+	}
+	outCtx := newResolveContext(nil, outputSchema)
+	surface := &windowSurface{input: inputCtx, agg: agg, output: outCtx, windowByKey: byKey}
+	return windowNode, outCtx, surface, nil
+}
+
+func collectWindowCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
+	seen := map[string]struct{}{}
+	out := make([]*parser.FuncCall, 0)
+	visit := func(e parser.Expr) error {
+		return walkExprForWindows(e, func(fc *parser.FuncCall) error {
+			if fc.Over == nil {
+				return nil
+			}
+			k := windowCallKey(fc)
+			if _, ok := seen[k]; ok {
+				return nil
+			}
+			seen[k] = struct{}{}
+			out = append(out, fc)
+			return nil
+		})
+	}
+	for _, t := range s.Targets {
+		if err := visit(t.Expr); err != nil {
+			return nil, err
+		}
+	}
+	for _, sb := range s.OrderBy {
+		expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
+		if err := visit(expr); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func buildWindowFunc(fc *parser.FuncCall) (WindowFunc, error) {
+	name := strings.ToLower(fc.Name.Name)
+	switch name {
+	case "row_number", "rank":
+		if fc.Star || fc.Distinct || len(fc.Args) != 0 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name)}
+		}
+	default:
+		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
+	}
+	return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}}, nil
+}
+
+func windowCallKey(fc *parser.FuncCall) string {
+	b := strings.Builder{}
+	b.WriteString(strings.ToLower(fc.Name.String()))
+	b.WriteString("|")
+	if fc.Star {
+		b.WriteString("*")
+	}
+	if fc.Distinct {
+		b.WriteString("distinct|")
+	}
+	for _, a := range fc.Args {
+		b.WriteString(parserExprKey(a))
+		b.WriteString("|")
+	}
+	b.WriteString("over:")
+	b.WriteString(windowSpecKey(fc.Over))
+	return b.String()
+}
+
+func windowSpecKey(w *parser.WindowDef) string {
+	if w == nil {
+		return ""
+	}
+	b := strings.Builder{}
+	b.WriteString("p:")
+	for _, p := range w.PartitionBy {
+		b.WriteString(parserExprKey(p))
+		b.WriteString("|")
+	}
+	b.WriteString("o:")
+	for _, o := range w.OrderBy {
+		b.WriteString(parserExprKey(o.Expr))
+		if o.Desc {
+			b.WriteString(":desc")
+		} else {
+			b.WriteString(":asc")
+		}
+		b.WriteString("|")
+	}
+	return b.String()
+}
+
+func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		if err := walkExprForWindows(x.Left, fn); err != nil {
+			return err
+		}
+		return walkExprForWindows(x.Right, fn)
+	case *parser.UnaryOp:
+		return walkExprForWindows(x.Operand, fn)
+	case *parser.CastExpr:
+		return walkExprForWindows(x.Operand, fn)
+	case *parser.ExtractExpr:
+		return walkExprForWindows(x.Source, fn)
+	case *parser.CaseExpr:
+		if x.Operand != nil {
+			if err := walkExprForWindows(x.Operand, fn); err != nil {
+				return err
+			}
+		}
+		for _, w := range x.Whens {
+			if err := walkExprForWindows(w.When, fn); err != nil {
+				return err
+			}
+			if err := walkExprForWindows(w.Then, fn); err != nil {
+				return err
+			}
+		}
+		if x.Else != nil {
+			return walkExprForWindows(x.Else, fn)
+		}
+		return nil
+	case *parser.InExpr:
+		if err := walkExprForWindows(x.Operand, fn); err != nil {
+			return err
+		}
+		for _, v := range x.List {
+			if err := walkExprForWindows(v, fn); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *parser.FuncCall:
+		if err := fn(x); err != nil {
+			return err
+		}
+		for _, a := range x.Args {
+			if err := walkExprForWindows(a, fn); err != nil {
+				return err
+			}
+		}
+		if x.Over != nil {
+			for _, p := range x.Over.PartitionBy {
+				if err := walkExprForWindows(p, fn); err != nil {
+					return err
+				}
+			}
+			for _, o := range x.Over.OrderBy {
+				if err := walkExprForWindows(o.Expr, fn); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext) (Node, *resolveContext, *aggregateSurface, Expr, error) {
@@ -1163,6 +1419,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		// See resolveExpr: cast is a no-op in v0.
 		return resolveExprAfterAggregate(x.Operand, agg)
 	case *parser.FuncCall:
+		if x.Over != nil {
+			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
+		}
 		if isAggregateFunc(x) {
 			k := aggregateCallKey(x)
 			b, ok := agg.aggregateByKey[k]
@@ -1194,6 +1453,133 @@ func resolveTargetsAfterAggregate(targets []parser.ResTarget, agg *aggregateSurf
 			return nil, nil, &PlanError{Pos: t.Pos(), Code: "0A000", Message: "SELECT * with GROUP BY/aggregate is not supported in v0 planner"}
 		}
 		e, err := resolveExprAfterAggregate(t.Expr, agg)
+		if err != nil {
+			return nil, nil, err
+		}
+		name, typ := targetMeta(e, t)
+		out = append(out, e)
+		schema = append(schema, SchemaColumn{Name: name, Type: typ})
+	}
+	return out, schema, nil
+}
+
+func resolveExprForWindowInput(e parser.Expr, inputCtx *resolveContext, agg *aggregateSurface) (Expr, error) {
+	if agg == nil {
+		return resolveExpr(e, inputCtx)
+	}
+	return resolveExprAfterAggregate(e, agg)
+}
+
+func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
+	if !parserExprHasWindowFunc(e) {
+		return resolveExprForWindowInput(e, win.input, win.agg)
+	}
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		l, err := resolveExprAfterWindow(x.Left, win)
+		if err != nil {
+			return nil, err
+		}
+		r, err := resolveExprAfterWindow(x.Right, win)
+		if err != nil {
+			return nil, err
+		}
+		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, nil
+	case *parser.UnaryOp:
+		op, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
+	case *parser.CastExpr:
+		return resolveExprAfterWindow(x.Operand, win)
+	case *parser.ExtractExpr:
+		src, err := resolveExprAfterWindow(x.Source, win)
+		if err != nil {
+			return nil, err
+		}
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src}, nil
+	case *parser.CaseExpr:
+		out := &CaseExpr{pos: x.Pos()}
+		if x.Operand != nil {
+			op, err := resolveExprAfterWindow(x.Operand, win)
+			if err != nil {
+				return nil, err
+			}
+			out.Operand = op
+		}
+		for _, w := range x.Whens {
+			when, err := resolveExprAfterWindow(w.When, win)
+			if err != nil {
+				return nil, err
+			}
+			then, err := resolveExprAfterWindow(w.Then, win)
+			if err != nil {
+				return nil, err
+			}
+			out.Whens = append(out.Whens, CaseWhen{When: when, Then: then})
+		}
+		if x.Else != nil {
+			els, err := resolveExprAfterWindow(x.Else, win)
+			if err != nil {
+				return nil, err
+			}
+			out.Else = els
+		}
+		return out, nil
+	case *parser.FuncCall:
+		if x.Over != nil {
+			k := windowCallKey(x)
+			b, ok := win.windowByKey[k]
+			if !ok {
+				return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window call could not be resolved"}
+			}
+			return &ColumnRef{pos: x.Pos(), Index: b.index, Name: win.output.schema[b.index].Name, Type: b.typ}, nil
+		}
+		args := make([]Expr, 0, len(x.Args))
+		for _, a := range x.Args {
+			pa, err := resolveExprAfterWindow(a, win)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, pa)
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
+	case *parser.InExpr:
+		op, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		list := make([]Expr, 0, len(x.List))
+		for _, item := range x.List {
+			r, err := resolveExprAfterWindow(item, win)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, r)
+		}
+		if x.Subquery != nil {
+			return planInExpr(x, win.input)
+		}
+		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, List: list}, nil
+	}
+	return resolveExprForWindowInput(e, win.input, win.agg)
+}
+
+func resolveTargetsAfterWindow(targets []parser.ResTarget, win *windowSurface) ([]Expr, Schema, error) {
+	out := make([]Expr, 0, len(targets))
+	schema := make(Schema, 0, len(targets))
+	for _, t := range targets {
+		if star, ok := t.Expr.(*parser.StarExpr); ok {
+			exprList, cols, err := expandStarTarget(star, win.input)
+			if err != nil {
+				return nil, nil, err
+			}
+			out = append(out, exprList...)
+			schema = append(schema, cols...)
+			continue
+		}
+		e, err := resolveExprAfterWindow(t.Expr, win)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1280,6 +1666,17 @@ func exprHasAggregate(e parser.Expr) bool {
 	found := false
 	_ = walkExpr(e, func(fc *parser.FuncCall) error {
 		if isAggregateFunc(fc) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+func parserExprHasWindowFunc(e parser.Expr) bool {
+	found := false
+	_ = walkExprForWindows(e, func(fc *parser.FuncCall) error {
+		if fc.Over != nil {
 			found = true
 		}
 		return nil
@@ -2163,6 +2560,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.FuncCall:
+		if x.Over != nil {
+			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
+		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {
 			pa, err := resolveExpr(a, ctx)
