@@ -382,6 +382,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// pg_stat_aio_targets: one row per Op.Target seen
+	// (relfile path or WAL segment path) with that target's
+	// accumulated I/O counters and latency. Backed by
+	// aio.Engine.PerTarget(). Zero rows when no engine is
+	// attached or no targets have accumulated.
+	if err := registerPgStatAIOTargetsView(cat, aioEngine); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 	// pg_replication_slots: one row per persistent replication slot
 	// (physical or logical). Backed by the *wal.Slots registry.
 	if err := registerReplicationSlotsView(cat, slotsReg); err != nil {

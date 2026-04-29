@@ -3367,6 +3367,41 @@ See `docs/milestones/0009-aio-subsystem.md`.
       observability is a future slice — needs a
       streaming-quantile estimator on the engine.)
 
+- [x] AIO observability — per-relation counter breakdown
+      (`pg_stat_aio_targets`). (landed 2026-04-29:
+      `aio.Engine` gained a `targets sync.Map[string,
+      *targetStats]` keyed by `Op.Target`; per-target
+      counters (`submitted`, `completed`, `errored`,
+      `latencySumMicros`, `latencyMaxMicros`, `bytes`)
+      are atomic so updates don't take a lock — only the
+      first I/O for a new target pays the LoadOrStore
+      allocation. Submit and finishHandle update the
+      target-keyed stats alongside the existing
+      per-direction counters. Empty `Op.Target` is
+      ignored (no "" entry pollutes the view). New
+      `Engine.PerTarget() []TargetStats` returns a
+      lex-sorted snapshot.
+      `internal/initdb/aio_views.go::registerPgStatAIOTargetsView`
+      installs `pg_catalog.pg_stat_aio_targets` with
+      columns `target`, `submitted`, `completed`,
+      `errored`, `bytes`, `avg_latency_us` (sum/count via
+      the existing `avgLatencyUS` helper, "0" when
+      count==0), `max_latency_us`. Wired into
+      `initdb.Open` next to `pg_aios`. Tests in aio:
+      TestEnginePerTargetTracking (3 ops across 2
+      targets → 2 rows in name order with right
+      submitted/completed/bytes per row),
+      TestEnginePerTargetEmptyTargetIgnored (empty
+      Target doesn't create a row). Tests in initdb:
+      TestPgStatAIOTargetsViewEmptyWithoutEngine (nil
+      engine → 0 rows), TestPgStatAIOTargetsViewRendersRows
+      (two targets across read+write produce two rows in
+      lex order with correct columns). Built and full
+      `go test ./...` green. With this slice an operator
+      can SELECT from pg_stat_aio_targets and see
+      exactly which relfile / WAL segment is dominating
+      I/O.)
+
 - [ ] (BLOCKED) AIO wait-event surface: register a
       "waiting on AIO completion" wait event so a query
       stalled on an AIO Wait shows up identifiably in the

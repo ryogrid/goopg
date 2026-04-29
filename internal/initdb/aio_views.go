@@ -90,6 +90,49 @@ func avgLatencyUS(sum, count uint64) string {
 	return fmt.Sprintf("%d", sum/count)
 }
 
+// registerPgStatAIOTargetsView installs
+// `pg_catalog.pg_stat_aio_targets` — one row per Op.Target
+// the engine has seen, with that target's accumulated I/O
+// counters and latency. Lets an operator triage "which
+// relfile is hot?" without per-handle tracing. Empty when no
+// engine is attached or no targets have accumulated.
+func registerPgStatAIOTargetsView(cat *catalog.InMemory, eng *aio.Engine) error {
+	tbl := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_stat_aio_targets",
+		Columns: []catalog.Column{
+			{Name: "target", Type: catalog.Type{Name: "text"}},
+			{Name: "submitted", Type: catalog.Type{Name: "text"}},
+			{Name: "completed", Type: catalog.Type{Name: "text"}},
+			{Name: "errored", Type: catalog.Type{Name: "text"}},
+			{Name: "bytes", Type: catalog.Type{Name: "text"}},
+			{Name: "avg_latency_us", Type: catalog.Type{Name: "text"}},
+			{Name: "max_latency_us", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	tbl.VirtualRows = func() [][]string {
+		if eng == nil {
+			return nil
+		}
+		snap := eng.PerTarget()
+		out := make([][]string, 0, len(snap))
+		for _, t := range snap {
+			out = append(out, []string{
+				t.Target,
+				fmt.Sprintf("%d", t.Submitted),
+				fmt.Sprintf("%d", t.Completed),
+				fmt.Sprintf("%d", t.Errored),
+				fmt.Sprintf("%d", t.Bytes),
+				avgLatencyUS(t.LatencySumMicros, t.Completed),
+				fmt.Sprintf("%d", t.LatencyMaxMicros),
+			})
+		}
+		return out
+	}
+	return cat.RegisterVirtualTable(tbl)
+}
+
 // registerPgAiosView installs `pg_catalog.pg_aios` backed by
 // aio.Engine.InFlight(). Zero rows when no engine is attached
 // or no Ops are outstanding. Mirrors the upstream `pg_aios`

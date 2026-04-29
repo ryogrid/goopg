@@ -210,6 +210,15 @@ type Engine struct {
 	writeLatencySumMicros atomic.Uint64
 	writeLatencyMaxMicros atomic.Uint64
 
+	// Per-target breakdown: maps Op.Target → *targetStats.
+	// Sync.Map fits this access pattern — most ops on existing
+	// keys take only an atomic Load; only the first I/O for a
+	// new target pays the LoadOrStore allocation. Counters
+	// inside *targetStats are atomic so bumps don't take a
+	// lock. Scales to thousands of distinct targets without
+	// contention.
+	targets sync.Map
+
 	// nextID hands out per-Submit identifiers. Monotonic.
 	nextID atomic.Uint64
 
@@ -243,6 +252,49 @@ type InFlightInfo struct {
 	Offset      int64
 	SubmittedAt time.Time
 	Target      string
+}
+
+// targetStats is the engine's per-Op.Target accumulator.
+// All counters are atomic so updates don't take a lock —
+// the only serialisation is the sync.Map's LoadOrStore on
+// first I/O for a new target.
+type targetStats struct {
+	submitted         atomic.Uint64
+	completed         atomic.Uint64
+	errored           atomic.Uint64
+	latencySumMicros  atomic.Uint64
+	latencyMaxMicros  atomic.Uint64
+	bytes             atomic.Uint64
+}
+
+// TargetStats is the public, copy-on-read view of one
+// target's accumulated counters. Mirrors the columns the
+// `pg_stat_aio_targets` view surfaces. Average latency =
+// LatencySumMicros / Completed (callers compute it; we
+// don't pre-compute to avoid the divide-by-zero edge).
+type TargetStats struct {
+	Target            string
+	Submitted         uint64
+	Completed         uint64
+	Errored           uint64
+	LatencySumMicros  uint64
+	LatencyMaxMicros  uint64
+	Bytes             uint64
+}
+
+// loadOrCreateTarget returns the *targetStats for `target`,
+// creating it on first encounter. Empty-string target
+// returns nil — we don't track an "unnamed" bucket since
+// most callers stamp Target.
+func (e *Engine) loadOrCreateTarget(target string) *targetStats {
+	if target == "" {
+		return nil
+	}
+	if v, ok := e.targets.Load(target); ok {
+		return v.(*targetStats)
+	}
+	v, _ := e.targets.LoadOrStore(target, &targetStats{})
+	return v.(*targetStats)
 }
 
 // EngineConfig parameterises NewEngine. Method names mirror
@@ -319,6 +371,9 @@ func (e *Engine) Submit(op Op) *Handle {
 	case DirWrite:
 		e.writeSubmitted.Add(1)
 	}
+	if ts := e.loadOrCreateTarget(op.Target); ts != nil {
+		ts.submitted.Add(1)
+	}
 	return e.method.Submit(&op)
 }
 
@@ -373,6 +428,19 @@ func (e *Engine) finishHandle(h *Handle, r Result) {
 		}
 		e.writeLatencySumMicros.Add(elapsedMicros)
 		advanceMax(&e.writeLatencyMaxMicros, elapsedMicros)
+	}
+	if ts := e.loadOrCreateTarget(h.op.Target); ts != nil {
+		ts.completed.Add(1)
+		if isErr {
+			ts.errored.Add(1)
+		}
+		ts.latencySumMicros.Add(elapsedMicros)
+		advanceMax(&ts.latencyMaxMicros, elapsedMicros)
+		// Bytes — count the underlying transfer size (the
+		// op's buffer length, regardless of short reads /
+		// writes; callers can subtract Errored*Length when
+		// they want the durable-transfer estimate).
+		ts.bytes.Add(uint64(len(h.op.Buffer)))
 	}
 	e.inFlight.Add(-1)
 	e.inflightMu.Lock()
@@ -433,6 +501,30 @@ type Stats struct {
 	ReadLatencyMaxMicros  uint64
 	WriteLatencySumMicros uint64
 	WriteLatencyMaxMicros uint64
+}
+
+// PerTarget returns a sorted snapshot of every target the
+// engine has seen at least one I/O for. Sort key is the
+// target string (lexicographic) so a repeated SELECT against
+// pg_stat_aio_targets returns identical row order. Empty
+// slice when no targets have accumulated.
+func (e *Engine) PerTarget() []TargetStats {
+	var out []TargetStats
+	e.targets.Range(func(k, v any) bool {
+		ts := v.(*targetStats)
+		out = append(out, TargetStats{
+			Target:            k.(string),
+			Submitted:         ts.submitted.Load(),
+			Completed:         ts.completed.Load(),
+			Errored:           ts.errored.Load(),
+			LatencySumMicros:  ts.latencySumMicros.Load(),
+			LatencyMaxMicros:  ts.latencyMaxMicros.Load(),
+			Bytes:             ts.bytes.Load(),
+		})
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Target < out[j].Target })
+	return out
 }
 
 // InFlight returns a sorted copy of every currently-outstanding

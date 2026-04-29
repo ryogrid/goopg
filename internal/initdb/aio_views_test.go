@@ -190,3 +190,59 @@ func (f *gatedViewFile) ReadAt(p []byte, off int64) (int, error) {
 func (f *gatedViewFile) WriteAt(p []byte, off int64) (int, error) {
 	return copy(f.buf[off:], p), nil
 }
+
+// TestPgStatAIOTargetsViewEmptyWithoutEngine: nil engine
+// produces 0 rows so SELECT * works on synchronous
+// deployments.
+func TestPgStatAIOTargetsViewEmptyWithoutEngine(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgStatAIOTargetsView(cat, nil); err != nil {
+		t.Fatal(err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_aio_targets"})
+	if !ok {
+		t.Fatal("pg_stat_aio_targets not registered")
+	}
+	if rows := tbl.VirtualRows(); len(rows) != 0 {
+		t.Errorf("rows=%d want 0", len(rows))
+	}
+}
+
+// TestPgStatAIOTargetsViewRendersRows: with two distinct
+// targets seen by the engine, the view returns two rows in
+// target-name order with correct counter columns.
+func TestPgStatAIOTargetsViewRendersRows(t *testing.T) {
+	eng, err := aio.NewEngine(aio.EngineConfig{Method: aio.MethodSync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	cat := catalog.NewInMemory()
+	if err := registerPgStatAIOTargetsView(cat, eng); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_aio_targets"})
+
+	f := &memViewFile{buf: make([]byte, 32)}
+	eng.Submit(aio.Op{File: f, Buffer: make([]byte, 4), Direction: aio.DirRead, Target: "alpha"}).Wait()
+	eng.Submit(aio.Op{File: f, Buffer: []byte("hi"), Direction: aio.DirWrite, Target: "beta"}).Wait()
+
+	rows := tbl.VirtualRows()
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+	// Column ordering: target, submitted, completed,
+	// errored, bytes, avg_latency_us, max_latency_us.
+	if rows[0][0] != "alpha" || rows[1][0] != "beta" {
+		t.Errorf("targets=%q,%q want alpha,beta", rows[0][0], rows[1][0])
+	}
+	if rows[0][1] != "1" || rows[0][2] != "1" {
+		t.Errorf("alpha submitted/completed=%q/%q want 1/1", rows[0][1], rows[0][2])
+	}
+	if rows[0][4] != "4" {
+		t.Errorf("alpha bytes=%q want 4", rows[0][4])
+	}
+	if rows[1][4] != "2" {
+		t.Errorf("beta bytes=%q want 2", rows[1][4])
+	}
+}

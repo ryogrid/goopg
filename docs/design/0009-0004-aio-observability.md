@@ -193,6 +193,32 @@ row. `in_flight` is the engine's aggregate (renders on the
 read row; the write row reports 0 — splitting InFlight by
 direction is a small future refactor).
 
+## Per-target / per-relation observability (landed)
+
+`aio.Engine` carries a `sync.Map[string, *targetStats]`
+keyed by `Op.Target`. Per-target counters (`submitted`,
+`completed`, `errored`, `latencySumMicros`, `latencyMaxMicros`,
+`bytes`) are atomic — only the first I/O for a new target
+pays the `LoadOrStore` allocation; subsequent ops do an
+atomic-load + atomic-add per counter. Empty `Op.Target` is
+ignored, so callers that don't stamp Target don't pollute
+the view with an empty bucket.
+
+`Engine.PerTarget() []TargetStats` returns a lex-sorted
+snapshot keyed by target name — stable order across repeated
+SELECTs.
+
+`registerPgStatAIOTargetsView` installs
+`pg_catalog.pg_stat_aio_targets` with one row per target.
+Columns: `target`, `submitted`, `completed`, `errored`,
+`bytes`, `avg_latency_us`, `max_latency_us`. Wired into
+`initdb.Open` next to `pg_aios`.
+
+With this layered on top of the existing per-direction
+totals in `pg_stat_aio`, an operator can ask "which side is
+hot?" (read vs write) and "which file is hot?" (per-target)
+without per-handle tracing.
+
 ## What this slice doesn't deliver
 
 - **AIO wait events.** "Waiting on AIO completion" hasn't

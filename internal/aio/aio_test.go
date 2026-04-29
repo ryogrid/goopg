@@ -447,3 +447,58 @@ func TestEngineStatsLatencyMaxMonotonic(t *testing.T) {
 		prevMax = cur
 	}
 }
+
+// TestEnginePerTargetTracking pins per-target counter
+// accumulation: Submits with distinct Target values
+// produce distinct rows in PerTarget(); each row's
+// counters reflect only its own ops.
+func TestEnginePerTargetTracking(t *testing.T) {
+	e, err := NewEngine(EngineConfig{Method: MethodSync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	f := newMemFile(64)
+
+	// 2 ops to "foo", 1 to "bar", 0 to anything else.
+	e.Submit(Op{File: f, Buffer: make([]byte, 4), Direction: DirRead, Target: "foo"}).Wait()
+	e.Submit(Op{File: f, Buffer: make([]byte, 4), Direction: DirRead, Target: "foo"}).Wait()
+	e.Submit(Op{File: f, Buffer: []byte("xy"), Direction: DirWrite, Target: "bar"}).Wait()
+
+	snap := e.PerTarget()
+	if len(snap) != 2 {
+		t.Fatalf("PerTarget=%d want 2 (foo + bar)", len(snap))
+	}
+	// Sort key is target name; "bar" < "foo" lexically.
+	if snap[0].Target != "bar" || snap[1].Target != "foo" {
+		t.Errorf("targets=%q,%q want bar,foo", snap[0].Target, snap[1].Target)
+	}
+	if snap[0].Submitted != 1 || snap[0].Completed != 1 {
+		t.Errorf("bar counters=%d/%d want 1/1", snap[0].Submitted, snap[0].Completed)
+	}
+	if snap[1].Submitted != 2 || snap[1].Completed != 2 {
+		t.Errorf("foo counters=%d/%d want 2/2", snap[1].Submitted, snap[1].Completed)
+	}
+	if snap[1].Bytes != 8 {
+		t.Errorf("foo bytes=%d want 8 (2 reads × 4 bytes)", snap[1].Bytes)
+	}
+	if snap[0].Bytes != 2 {
+		t.Errorf("bar bytes=%d want 2", snap[0].Bytes)
+	}
+}
+
+// TestEnginePerTargetEmptyTargetIgnored: empty Op.Target
+// means "no target identity" — those ops contribute to the
+// global counters but DON'T create a "" entry in PerTarget.
+func TestEnginePerTargetEmptyTargetIgnored(t *testing.T) {
+	e, err := NewEngine(EngineConfig{Method: MethodSync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	f := newMemFile(8)
+	e.Submit(Op{File: f, Buffer: []byte("ab"), Direction: DirWrite}).Wait()
+	if got := len(e.PerTarget()); got != 0 {
+		t.Errorf("PerTarget=%d want 0 (empty Target shouldn't create a row)", got)
+	}
+}
