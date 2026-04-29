@@ -342,6 +342,61 @@ after the snapshot LSN.
   LSN=0. The apply-worker integration that drives `s` → `r`
   on a streaming commit boundary is a separate slice.
 
+## Tablesync per-subscription manager
+
+`internal/server/tablesync_manager.go` ships
+`RunTableSyncManager(ctx, cfg)`, the per-subscription driver that
+walks `SubscriptionRels(subName)` and invokes `RunTableSync` on
+every row not yet at state `r`. The streaming `s → r` promotion
+is the apply-worker's job (see "Apply-worker tablesync
+integration" above), so the manager never touches state `r`
+rows.
+
+The manager doesn't dial or build heap-write targets itself —
+both are injected as callbacks so the manager is directly
+testable against in-memory frame buffers and stays composable
+with whatever production transport eventually layers on top:
+
+```
+ResolveRel(relOID) → (qualifiedName, ok)
+   // turns a tracked OID into the "schema.name" the publisher
+   // will see on its COPY <name> TO STDOUT query.
+
+OpenConn(ctx, relOID) → *ConnPair{Reader, Writer, Close}
+   // one fresh authenticated query connection per rel.
+   // The manager closes it before moving on.
+
+OpenWriter(ctx, relOID) → *WriterPair{Writer LineWriter, Close}
+   // one per-rel apply target. Typically wraps
+   // *executor.CopyFromExecutor once the substrate to translate
+   // pg_subscription_rel.srrelid into a local *catalog.Table is
+   // wired up. The manager closes it before moving on.
+```
+
+Each visited rel produces a `TableSyncResult{RelOID, Relname,
+InitialState, FinalState, Rows, Err}`. A per-rel error is
+captured on `Err` and the manager continues — mirroring
+upstream's behaviour where one stuck table doesn't block the
+rest. The function-level error is reserved for systemic
+missing-config cases.
+
+What this slice doesn't deliver:
+
+- Production wiring. The factory composition
+  (`LogicalReceiver` opens the per-rel query connection;
+  `executor.CopyFromExecutor` opens the per-rel writer;
+  manager results feed observability) is the next slice —
+  it composes cleanly once logical-replication observability
+  lands in `0008-0005-logical-replication-observability.md`.
+- Concurrency. v0 syncs rels sequentially. Upstream PG
+  spawns one tablesync worker per rel; that lands later
+  alongside multi-process worker support.
+- Subscription_rel seeding. The manager assumes the rows
+  have already been added (e.g. by a future
+  `CREATE SUBSCRIPTION` path that queries the publisher's
+  publication membership). Until then, callers add rows
+  explicitly.
+
 ## Tablesync state machine — catalog substrate
 
 Upstream tracks per-(subscription, relation) sync progress in

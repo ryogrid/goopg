@@ -2674,15 +2674,57 @@ item.
       crossing the sync boundary promotes them so streaming
       takes over without double-applying.)
 
-- [ ] Tablesync caller wiring: per-subscription manager
-      that on subscriber start dials the publisher, walks
-      `SubscriptionRels(subName)` looking for non-`r`
-      rows, opens a (second) connection per such rel,
-      invokes `RunTableSync` to drive `i → d → s`, and
-      then hands the streaming connection to the apply
-      worker (which already advances `s → r` on commit).
-      Mirrors upstream's per-table `LogicalRepSyncTableStart`
-      worker spawn.
+- [x] Tablesync caller wiring — per-subscription manager.
+      (landed 2026-04-29: `internal/server/tablesync_manager.go`
+      ships `RunTableSyncManager(ctx, cfg)` which walks
+      `SubscriptionRels(subName)`, skips rows already at
+      state `r`, and for every other row drives one
+      initial-COPY exchange via `RunTableSync`. The
+      manager is structured around three injected
+      callbacks so it stays free of TCP/dial logic and
+      remains directly testable with in-memory frame
+      buffers: `ResolveRel(relOID) → "schema.name"` (turns
+      a tracked OID into the qualified relname the
+      publisher will see on its `COPY <name> TO STDOUT`),
+      `OpenConn(ctx, relOID) → ConnPair{Reader, Writer,
+      Close}` (one fresh authenticated query connection
+      per rel; closer always called before moving on),
+      and `OpenWriter(ctx, relOID) → WriterPair{Writer
+      LineWriter, Close}` (one per-rel apply target;
+      typically wraps `*executor.CopyFromExecutor` once
+      the DDL substrate to translate
+      `pg_subscription_rel.srrelid` into a local
+      `*catalog.Table` lands). Per-rel errors land on
+      the returned `[]TableSyncResult` (one entry per
+      visited rel, with `RelOID`, `Relname`,
+      `InitialState`, `FinalState`, `Rows`, and `Err`);
+      the manager continues to the next rel rather than
+      aborting, mirroring upstream's behaviour where one
+      stuck table doesn't block the rest. Function-level
+      error is reserved for systemic missing-config
+      cases. Streaming `s → r` promotion is left to the
+      apply-worker (which already does the right thing
+      on commit-LSN crossover). Tests:
+      TestRunTableSyncManagerWalksUnsyncedRels (sub
+      with three rels at i/d/r; manager touches only
+      the first two and both reach s while the r row is
+      untouched, including no callback invocations for
+      it), TestRunTableSyncManagerOneFailureDoesNotAbortRest
+      (OpenConn fails for one rel; siblings still reach
+      s; failed rel keeps state i),
+      TestRunTableSyncManagerUnresolvedRelnameSkips
+      (ResolveRel ok=false aborts that rel before
+      OpenConn fires), TestRunTableSyncManagerNoUnsyncedRelsReturnsEmpty
+      (all-r subscription returns empty results and
+      never invokes any callback). Built and full
+      `go test ./...` green. Plumbing the production
+      composition (LogicalReceiver opens the per-rel
+      query conn, executor.CopyFromExecutor opens the
+      per-rel writer, and the manager's results feed
+      observability) is the next slice — once
+      logical-replication observability lands in
+      `0008-0005`, the manager hookup will compose
+      naturally with both.)
 
 - [ ] Logical-replication observability: `pg_stat_subscription`,
       logical-replication rows in `pg_stat_replication`, structured
