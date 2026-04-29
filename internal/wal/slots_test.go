@@ -2,6 +2,7 @@ package wal
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -140,4 +141,97 @@ func TestSlotsPersistence(t *testing.T) {
 	if got.Active {
 		t.Errorf("rehydrated primary.Active = true, want false")
 	}
+}
+
+// TestCreateLogicalSlot pins the M0008 / 0008-0001 contract: a
+// logical slot is created with the right Kind / Plugin / Database,
+// participates in MinRestartLSN, and round-trips through the
+// per-slot state file.
+func TestCreateLogicalSlot(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenSlots(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateLogical("logical1", "pgoutput", "appdb", 0x500); err != nil {
+		t.Fatalf("CreateLogical: %v", err)
+	}
+	got, err := s.Get("logical1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Kind != SlotLogical {
+		t.Errorf("Kind=%q want %q", got.Kind, SlotLogical)
+	}
+	if got.Plugin != "pgoutput" || got.Database != "appdb" {
+		t.Errorf("Plugin=%q Database=%q want (pgoutput, appdb)", got.Plugin, got.Database)
+	}
+	if got.RestartLSN != 0x500 || got.ConfirmedFlushLSN != 0x500 {
+		t.Errorf("LSNs=(%x,%x) want (0x500,0x500)", got.RestartLSN, got.ConfirmedFlushLSN)
+	}
+
+	// Mix a physical slot in; both contribute to MinRestartLSN.
+	if _, err := s.Create("phys1", SlotPhysical, 0x800); err != nil {
+		t.Fatal(err)
+	}
+	if min := s.MinRestartLSN(); min != 0x500 {
+		t.Errorf("MinRestartLSN=%x want 0x500 (logical pinning lower)", min)
+	}
+
+	// Reopen the registry — durable state must round-trip.
+	s2, err := OpenSlots(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := s2.Get("logical1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2.Kind != SlotLogical || got2.Plugin != "pgoutput" || got2.Database != "appdb" {
+		t.Errorf("reopened logical slot lost fields: %+v", got2)
+	}
+}
+
+// TestCreateLogicalRequiresPluginAndDatabase: empty plugin or
+// database must fail at Create time so an operator sees the
+// configuration error before any walsender attaches.
+func TestCreateLogicalRequiresPluginAndDatabase(t *testing.T) {
+	s, _ := OpenSlots(t.TempDir())
+	if _, err := s.CreateLogical("nopluging", "", "appdb", 0); !errors.Is(err, ErrSlotKindMismatch) {
+		t.Errorf("empty plugin err=%v want ErrSlotKindMismatch", err)
+	}
+	if _, err := s.CreateLogical("nodb", "pgoutput", "", 0); !errors.Is(err, ErrSlotKindMismatch) {
+		t.Errorf("empty database err=%v want ErrSlotKindMismatch", err)
+	}
+}
+
+// TestPhysicalSlotJSONUnchangedAcrossM0008 pins the wire-format
+// forward-compat: a physical slot's persisted state has no
+// `plugin`/`database`/`catalog_xmin` keys (omitempty), so a
+// pre-M0008 slot file round-trips through reopen without the new
+// fields appearing.
+func TestPhysicalSlotJSONUnchangedAcrossM0008(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := OpenSlots(dir)
+	if _, err := s.Create("phys1", SlotPhysical, 0x100); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "pg_replslot", "phys1", "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"plugin"`, `"database"`, `"catalog_xmin"`} {
+		if bytesContains(body, key) {
+			t.Errorf("physical slot JSON includes %s; expected omitempty", key)
+		}
+	}
+}
+
+func bytesContains(b []byte, s string) bool {
+	for i := 0; i+len(s) <= len(b); i++ {
+		if string(b[i:i+len(s)]) == s {
+			return true
+		}
+	}
+	return false
 }

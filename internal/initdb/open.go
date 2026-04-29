@@ -275,6 +275,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// pg_replication_slots: one row per persistent replication slot
+	// (physical or logical). Backed by the *wal.Slots registry.
+	if err := registerReplicationSlotsView(cat, slotsReg); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 
 	standby, err := IsStandby(abs)
 	if err != nil {

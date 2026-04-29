@@ -153,3 +153,80 @@ func TestFormatLSN(t *testing.T) {
 		}
 	}
 }
+
+// TestPgReplicationSlotsViewRendersBothKinds pins the M0008 /
+// 0008-0001 contract: the view emits one row per persistent slot
+// with the upstream-shaped column set. Logical-only fields
+// (plugin, database, catalog_xmin) are populated for logical
+// slots and empty for physical ones.
+func TestPgReplicationSlotsViewRendersBothKinds(t *testing.T) {
+	dir := t.TempDir()
+	slots, err := wal.OpenSlots(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := slots.Create("phys1", wal.SlotPhysical, 0x100); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := slots.CreateLogical("logical1", "pgoutput", "appdb", 0x500); err != nil {
+		t.Fatal(err)
+	}
+
+	cat := catalog.NewInMemory()
+	if err := registerReplicationSlotsView(cat, slots); err != nil {
+		t.Fatal(err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_replication_slots"})
+	if !ok {
+		t.Fatal("view not registered")
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d, want 2", len(rows))
+	}
+
+	// Column order pinned by the view definition: slot_name, plugin,
+	// slot_type, datoid, database, temporary, active, active_pid,
+	// xmin, catalog_xmin, restart_lsn, confirmed_flush_lsn,
+	// wal_status, safe_wal_size, two_phase.
+	byName := map[string][]string{}
+	for _, r := range rows {
+		byName[r[0]] = r
+	}
+	logical := byName["logical1"]
+	if logical == nil {
+		t.Fatal("logical1 row missing")
+	}
+	if logical[1] != "pgoutput" {
+		t.Errorf("logical plugin=%q want pgoutput", logical[1])
+	}
+	if logical[2] != "logical" {
+		t.Errorf("logical slot_type=%q want logical", logical[2])
+	}
+	if logical[4] != "appdb" {
+		t.Errorf("logical database=%q want appdb", logical[4])
+	}
+	if logical[10] != "0/500" {
+		t.Errorf("logical restart_lsn=%q want 0/500", logical[10])
+	}
+	if logical[12] != "reserved" {
+		t.Errorf("logical wal_status=%q want reserved", logical[12])
+	}
+
+	phys := byName["phys1"]
+	if phys == nil {
+		t.Fatal("phys1 row missing")
+	}
+	if phys[1] != "" {
+		t.Errorf("physical plugin=%q want empty", phys[1])
+	}
+	if phys[2] != "physical" {
+		t.Errorf("physical slot_type=%q want physical", phys[2])
+	}
+	if phys[4] != "" {
+		t.Errorf("physical database=%q want empty", phys[4])
+	}
+	if phys[9] != "" {
+		t.Errorf("physical catalog_xmin=%q want empty", phys[9])
+	}
+}

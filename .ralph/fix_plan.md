@@ -2025,6 +2025,71 @@ out (`0007-0001`, `0007-0002`); pick the topmost unchecked item.
       `wal_sync_method` GUC selector, and a segment-removal
       directory fsync are deferred.)
 
+## Milestone 0008 — Logical replication
+
+See `docs/milestones/0008-logical-replication-support.md` for the
+full DoD. Decomposed into the five design-doc seams the milestone
+calls out (`0008-0001` … `0008-0005`); pick the topmost unchecked
+item.
+
+- [x] Logical replication slot foundation + `pg_replication_slots`
+      view. Design doc
+      `docs/design/0008-0001-logical-decoding-pipeline.md`.
+      (landed 2026-04-29: `wal.SlotKind` grows `SlotLogical`;
+      `wal.Slot` grows `Plugin` / `Database` / `CatalogXmin` —
+      all JSON-tagged with `omitempty` so physical-slot state
+      files stay byte-identical and pre-M0008 files round-trip
+      cleanly with the new fields zero-valued. New typed
+      constructor `Slots.CreateLogical(name, plugin, database,
+      startLSN)`; `Slots.Create` accepts `SlotLogical` (the
+      pre-M0008 hard-reject is dropped). New
+      `pg_catalog.pg_replication_slots` virtual view in
+      `internal/initdb/replication_views.go` backed by the
+      `*wal.Slots` registry, registered in `initdb.Open` next to
+      `pg_stat_replication` / `pg_stat_wal_receiver`. Column
+      shape mirrors upstream PG 18.x; columns goopg doesn't
+      track yet (`temporary` / `xmin` / `safe_wal_size` /
+      `two_phase` / `active_pid`) emit empty / `f` / `0`. WAL
+      retention via `MinRestartLSN` picks up logical slots
+      automatically — `Slot` shape is shared, no retention
+      code change needed. New tests: `TestCreateLogicalSlot`,
+      `TestCreateLogicalRequiresPluginAndDatabase`,
+      `TestPhysicalSlotJSONUnchangedAcrossM0008`,
+      `TestPgReplicationSlotsViewRendersBothKinds`. Reorder
+      buffer, snapshot builder, decoder loop, and per-slot
+      catalog-xmin retention in vacuum/pruning are all
+      deferred to subsequent loops in this milestone.)
+
+- [ ] Reorder buffer + decoder loop + snapshot builder skeleton:
+      classify WAL records, group into per-xact queues keyed by
+      XID, drain on commit, drop on abort. Snapshot built at slot
+      creation stays consistent for the slot's lifetime (full
+      `SnapBuild` deferred). Continues in
+      `docs/design/0008-0001-logical-decoding-pipeline.md`.
+
+- [ ] `pgoutput` output plugin: B / C / R / I / U / D message
+      framing wire-compatible with upstream PG 18.x. Replica-
+      identity handling. Design doc
+      `docs/design/0008-0002-pgoutput-plugin.md`.
+
+- [ ] Publication / subscription DDL + system catalogs:
+      `CREATE PUBLICATION` / `ALTER PUBLICATION` / `DROP
+      PUBLICATION`, `CREATE SUBSCRIPTION` / etc., backed by
+      `pg_publication`, `pg_publication_rel`,
+      `pg_publication_tables`, `pg_subscription`,
+      `pg_subscription_rel`. Design doc
+      `docs/design/0008-0003-publication-subscription-ddl.md`.
+
+- [ ] Apply worker + initial table sync: subscriber-side worker
+      that connects to the publisher's logical slot, decodes the
+      `pgoutput` stream, and applies each change. Design doc
+      `docs/design/0008-0004-apply-worker-and-tablesync.md`.
+
+- [ ] Logical-replication observability: `pg_stat_subscription`,
+      logical-replication rows in `pg_stat_replication`, structured
+      replication-event logging. Design doc
+      `docs/design/0008-0005-logical-replication-observability.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

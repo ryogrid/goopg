@@ -27,12 +27,16 @@ import (
 	"sync"
 )
 
-// SlotKind narrows what a slot is for. v0 ships physical only;
-// logical-replication slots are deferred per the milestone.
+// SlotKind narrows what a slot is for. Physical slots support
+// streaming replication (M0005); logical slots support
+// logical-decoding-based replication (M0008). The shape is shared
+// to keep retention paths uniform — `MinRestartLSN` /
+// `InvalidateLagging` already work the same for both kinds.
 type SlotKind string
 
 const (
 	SlotPhysical SlotKind = "physical"
+	SlotLogical  SlotKind = "logical"
 )
 
 // Slot is the in-memory image of one replication slot.
@@ -52,6 +56,24 @@ type Slot struct {
 	// docs/design/0005-0001-streaming-replication-architecture.md
 	// (§ Replication slot retention semantics).
 	Invalidated bool `json:"invalidated"`
+
+	// Plugin names the output plugin a logical slot drives
+	// (e.g. "pgoutput"). Empty for physical slots. Maps to
+	// upstream's pg_replication_slots.plugin column. See
+	// docs/design/0008-0001-logical-decoding-pipeline.md.
+	Plugin string `json:"plugin,omitempty"`
+	// Database is the database name a logical slot is anchored
+	// in. Empty for physical slots (which span the whole cluster).
+	// Maps to upstream's pg_replication_slots.database.
+	Database string `json:"database,omitempty"`
+	// CatalogXmin is the oldest transaction id whose catalog row
+	// versions a logical slot may still need to reconstruct
+	// historic snapshots for. Zero for physical slots and for
+	// freshly created logical slots; populated by the decoder as
+	// it advances. Maps to upstream's
+	// pg_replication_slots.catalog_xmin.
+	CatalogXmin uint64 `json:"catalog_xmin,omitempty"`
+
 	// Active is in-memory only; the durable state file records
 	// the slot's existence, while Active reflects whether a
 	// walsender connection currently owns it.
@@ -116,9 +138,9 @@ func (s *Slots) Create(name string, kind SlotKind, startLSN uint64) (*Slot, erro
 	if !validSlotName(name) {
 		return nil, ErrSlotInvalidName
 	}
-	if kind != SlotPhysical {
-		return nil, fmt.Errorf("%w: only %q is supported in v0",
-			ErrSlotKindMismatch, SlotPhysical)
+	if kind != SlotPhysical && kind != SlotLogical {
+		return nil, fmt.Errorf("%w: kind %q not recognised",
+			ErrSlotKindMismatch, kind)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,6 +158,45 @@ func (s *Slots) Create(name string, kind SlotKind, startLSN uint64) (*Slot, erro
 	}
 	s.m[name] = slot
 	// Return a copy so callers can't mutate the stored entry.
+	out := *slot
+	return &out, nil
+}
+
+// CreateLogical persists a new logical-decoding slot anchored in the
+// named database and driven by the named output plugin. The slot
+// participates in WAL retention via `MinRestartLSN` exactly the same
+// way a physical slot does. Returns ErrSlotExists if a slot with
+// `name` already exists. See
+// docs/design/0008-0001-logical-decoding-pipeline.md.
+func (s *Slots) CreateLogical(name, plugin, database string, startLSN uint64) (*Slot, error) {
+	if !validSlotName(name) {
+		return nil, ErrSlotInvalidName
+	}
+	if plugin == "" {
+		return nil, fmt.Errorf("%w: plugin is required for logical slots",
+			ErrSlotKindMismatch)
+	}
+	if database == "" {
+		return nil, fmt.Errorf("%w: database is required for logical slots",
+			ErrSlotKindMismatch)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.m[name]; exists {
+		return nil, ErrSlotExists
+	}
+	slot := &Slot{
+		Name:              name,
+		Kind:              SlotLogical,
+		RestartLSN:        startLSN,
+		ConfirmedFlushLSN: startLSN,
+		Plugin:            plugin,
+		Database:          database,
+	}
+	if err := s.writeSlotLocked(slot); err != nil {
+		return nil, err
+	}
+	s.m[name] = slot
 	out := *slot
 	return &out, nil
 }
