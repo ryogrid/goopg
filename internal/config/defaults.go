@@ -180,6 +180,40 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// io_method picks the AIO I/O method. `sync` runs every
+	// I/O on the calling goroutine (the safe default that
+	// matches v0's pre-AIO behaviour); `worker` uses a
+	// goroutine pool. `io_uring` is reserved for a future loop
+	// — selecting it here returns ErrUnsupportedMethod when
+	// the engine is constructed. See
+	// docs/design/0009-0001-aio-core.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "io_method", Type: TypeEnum, BootVal: "worker",
+		EnumOptions: []string{"sync", "worker", "io_uring"},
+		Context:     ContextPostmaster,
+		Scope:       ScopeServer,
+	}))
+	// io_workers is the goroutine count for `io_method=worker`.
+	// Upstream's default is 3; we mirror it.
+	r.MustRegister(NewVariable(Variable{
+		Name: "io_workers", Type: TypeInt, BootVal: "3",
+		MinVal: 1, MaxVal: 1024,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	// io_max_concurrency caps in-flight AIO operations
+	// globally. 0 disables the cap (no backpressure). Upstream
+	// names this `io_max_concurrency` and lets the platform
+	// derive a default; we mirror upstream's "let the method
+	// decide" by passing 0 through to the engine, which sets
+	// 4×workers for the worker method.
+	r.MustRegister(NewVariable(Variable{
+		Name: "io_max_concurrency", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 1024,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// Compatibility GUCs HammerDB / psql / pgbench issue with
 	// SET before running their workloads. v0 doesn't honour any
 	// of these semantically — the planner / executor ignores

@@ -2862,6 +2862,107 @@ item.
       so the M0005 and M0008 event vocabularies share one
       grep target.)
 
+## Milestone 0009 — AIO subsystem (asynchronous I/O)
+
+See `docs/milestones/0009-aio-subsystem.md`.
+
+- [x] AIO core: `internal/aio/` package exposing the
+      submit/wait API plus the `worker` and `sync` methods.
+      Design doc `0009-0001-aio-core.md`. (landed
+      2026-04-29: `internal/aio/aio.go` ships the public
+      surface — `Direction` (read/write), `File` interface
+      (io.ReaderAt + io.WriterAt seam — production callers
+      pass `*os.File`; tests use an in-memory `memFile`),
+      `Op` (File/Buffer/Offset/Direction/optional
+      Callback), `Result` (N + Err), `Handle` (Wait blocks
+      until completion, idempotent), `Method` interface
+      (Submit/Close/Name), `Engine` (front door + atomic
+      counters + Stats snapshot), `EngineConfig`
+      (Method/Workers/MaxConcurrency), `NewEngine`
+      factory. Two methods delivered:
+      `internal/aio/method_sync.go` runs every I/O on the
+      calling goroutine with optional buffered-semaphore
+      backpressure when MaxConcurrency>0;
+      `internal/aio/method_worker.go` is a goroutine pool
+      that drains a bounded submission channel (channel
+      doubles as work queue + concurrency bound — one
+      allocation per Submit instead of two; default depth
+      `4×workers` when MaxConcurrency==0). Submission
+      blocks once the channel is full so a misbehaving
+      caller cannot allocate unbounded queue depth.
+      `MethodIOUring` is reserved — `NewEngine` returns
+      `ErrUnsupportedMethod` until the Linux-only
+      follow-up lands. Engine counters: Submitted /
+      Completed / Errored / InFlight. `io.EOF` does NOT
+      count as Errored (matches upstream's "EOF is
+      expected" semantics). GUCs registered in
+      `internal/config/defaults.go` (all
+      ContextPostmaster, mirroring upstream): `io_method`
+      enum sync/worker/io_uring (default `worker`),
+      `io_workers` (default 3 = upstream default, range
+      1..1024), `io_max_concurrency` (default 0 = "let
+      the method decide", range 0..1024). GUCs registered
+      but not yet consumed by any caller — that wiring is
+      the follow-up. Engine-closed Submits return a
+      Handle whose Wait yields the engine-closed error
+      rather than deadlocking. Tests in
+      `internal/aio/aio_test.go`:
+      TestEngineSyncReadWriteRoundTrip (foundational
+      write+read round-trip, counters bookkeeping),
+      TestEngineSyncCallback (optional Callback sees same
+      Result as Wait), TestEngineSyncWaitIdempotent
+      (double-Wait returns same Result no block),
+      TestEngineWorkerParallelExecution (100 concurrent
+      writes through 4 workers / cap=8 commit cleanly,
+      InFlight settles to 0),
+      TestEngineWorkerSubmitAfterCloseSurfacesError
+      (close-vs-submit race surfaces typed error rather
+      than deadlock), TestNewEngineRejectsIOUring +
+      TestNewEngineRejectsUnknown (ErrUnsupportedMethod),
+      TestEngineSyncReadEOF (EOF surfaces but doesn't
+      bump Errored). Built and full `go test ./...`
+      green.)
+
+- [ ] AIO `io_uring` method (Linux-only). Runtime probe
+      of `io_uring_setup(2)` availability, fall back to
+      `worker` when the probe fails. Selecting
+      `io_method = io_uring` on a Linux host where the
+      probe succeeds drives I/Os visible to
+      `strace -e io_uring_*`.
+
+- [ ] Read-stream API on top of the AIO core:
+      `internal/aio/read_stream.go` with the upstream
+      `read_stream.h`-shaped surface — caller hands a
+      "next block" callback and a desired lookahead depth;
+      the stream issues prefetch I/Os ahead of `Next()`
+      calls. Per-stream lookahead bound + global in-flight
+      cap so one query plan can't monopolise the pool.
+      Design doc `0009-0002-read-stream.md`.
+
+- [ ] AIO caller integrations: sequential heap scan and
+      bitmap heap scan use the read stream as their
+      page-fetch path; checkpointer dirty-page writeback
+      submits writes through the AIO core; WAL writer's
+      per-segment writeback path can submit writes
+      through the AIO core (commit-path durability
+      barrier `fdatasync` per M0007 remains synchronous).
+      Design doc `0009-0003-aio-checkpointer-and-wal.md`.
+
+- [ ] AIO observability: `pg_aios` virtual view (in-flight
+      I/Os: backend, target file, offset, length,
+      direction, state, elapsed time); AIO counters in
+      pg_stat_* surfaces; wait events for "waiting on AIO
+      completion"; startup log line indicating chosen
+      method, probe result, worker-pool size, in-flight
+      caps. Design doc `0009-0004-aio-observability.md`.
+
+## Milestone 0010 — WAL direct I/O & walsender memory handoff
+
+See `docs/milestones/0010-wal-direct-io-and-walsender-memory-handoff.md`.
+
+- [ ] (Decompose into agent-sized slices in a future loop;
+      depends on M0009 AIO subsystem.)
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
