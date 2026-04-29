@@ -1948,14 +1948,37 @@ the topmost unchecked item.
       that catches each. Counters / observability surface
       for forced-drain events land in M0013-0003.)
 
-- [ ] WAL buffers observability + rollout (M0013-0003):
-      counters for current `bytes_resident`, lifetime
-      `overflow_drains`, `forced_drains_for_eviction`,
-      `bytes_drained_by_flush`. New SQL surface piece
-      (`pg_stat_wal_buffers` view or extending
-      `pg_stat_wal_io`). Startup log line
-      `event=wal_buffers_attached capacity_bytes=N`. Continues
+- [x] WAL buffers observability + rollout (M0013-0003).
+      Design doc
       `docs/design/0013-0003-wal-buffers-observability-and-rollout.md`.
+      (landed 2026-04-29: new `walBufferCounters` struct
+      (mirrors directIOCounters — single alloc owned by
+      Writer, shared with state via pointer) carries two
+      `atomic.Uint64`s: `overflowDrainBytes` (sizing
+      indicator) and `flushDrainBytes` (durability cost).
+      `drainReason` enum classifies each `drainBufferBytes`
+      call site so attribution is explicit. Four new Writer
+      accessors: WALBuffersCapacity (static GUC),
+      WALBuffersBytesResident (live read via new
+      `opWALBufStat` writer-loop op so it serialises
+      against append/drain), WALBuffersOverflowDrainBytes,
+      WALBuffersFlushDrainBytes. `pg_catalog.pg_stat_wal_io`
+      extended with four columns at the end
+      (wal_buffers_capacity_bytes /
+      wal_buffers_bytes_resident /
+      wal_buffers_overflow_drain_bytes /
+      wal_buffers_flush_drain_bytes) — operator's
+      "one place to look" preserved. Startup log line in
+      `cmd/goopg start`: `event=wal_buffers_attached
+      capacity_bytes=N` when `wal_buffers>0`. New test
+      TestWALBufferCountersTrackDrains pins each counter
+      only moves on its trigger (8×50B / 256B cap →
+      OverflowDrainBytes; small append + FlushUpTo →
+      FlushDrainBytes). Existing pg_stat_wal_io view tests
+      keep passing — column-name based assertions, the
+      four-column extension is transparent. Full
+      `go test ./...` green. M0013 closes — every DoD item
+      maps to a landed slice.)
 
 ## Notes
 

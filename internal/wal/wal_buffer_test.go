@@ -207,6 +207,69 @@ func TestWALBufferRecordLargerThanBufferBypasses(t *testing.T) {
 	}
 }
 
+// TestWALBufferCountersTrackDrains pins the M0013-0003
+// observability surface. Two distinct triggers (overflow drain
+// from Append, Stage 1 drain from FlushUpTo) bump two distinct
+// counters so an operator can tell a sizing problem (high
+// overflow) from natural commit-driven cost (high flush). Also
+// pins WALBuffersCapacity / WALBuffersBytesResident accessors —
+// the SQL view's columns rely on them.
+func TestWALBufferCountersTrackDrains(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pg_wal")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const cap = 256
+	w, err := NewWriter(Config{
+		WALDir:      dir,
+		SegmentSize: 1 << 20,
+		WALBuffers:  cap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	// Capacity matches GUC, no drains yet.
+	if got := w.WALBuffersCapacity(); got != cap {
+		t.Errorf("WALBuffersCapacity = %d, want %d", got, cap)
+	}
+	if got := w.WALBuffersOverflowDrainBytes(); got != 0 {
+		t.Errorf("OverflowDrainBytes initially %d, want 0", got)
+	}
+	if got := w.WALBuffersFlushDrainBytes(); got != 0 {
+		t.Errorf("FlushDrainBytes initially %d, want 0", got)
+	}
+
+	// Force overflow drains: 8 × 50-byte payload exceeds 256-byte cap.
+	payload := bytes.Repeat([]byte{0xCC}, 50)
+	for i := 0; i < 8; i++ {
+		if _, _, err := w.Append(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := w.WALBuffersOverflowDrainBytes(); got == 0 {
+		t.Errorf("OverflowDrainBytes still 0 after overflow appends")
+	}
+	if got := w.WALBuffersFlushDrainBytes(); got != 0 {
+		t.Errorf("FlushDrainBytes = %d before any FlushUpTo, want 0", got)
+	}
+
+	// Force a Stage 1 flush drain: append something that fits,
+	// then FlushUpTo to push it out of the buffer.
+	_, end, err := w.Append([]byte("commit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeFlush := w.WALBuffersFlushDrainBytes()
+	if err := w.FlushUpTo(end); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.WALBuffersFlushDrainBytes(); got <= beforeFlush {
+		t.Errorf("FlushDrainBytes did not advance: before=%d after=%d", beforeFlush, got)
+	}
+}
+
 // TestWALBufferReadAllRoundTrip is the end-to-end correctness
 // check: a sequence of buffered appends round-trips through the
 // drain path on FlushUpTo, byte-identical to what the

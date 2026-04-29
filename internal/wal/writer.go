@@ -155,6 +155,11 @@ const (
 	opFlush
 	opRecycle
 	opClose
+	// opWALBufStat is a read-only op the M0013-0003 observability
+	// surface uses to snapshot walBuf cap + resident under the
+	// writer goroutine's serialisation (avoids racing append /
+	// drain). The snapshot lands in result.walBufStat.
+	opWALBufStat
 )
 
 type op struct {
@@ -164,11 +169,17 @@ type op struct {
 	resp    chan result
 }
 
+type walBufStatSnapshot struct {
+	cap      int64
+	resident int64
+}
+
 type result struct {
-	startLSN uint64
-	endLSN   uint64
-	removed  int
-	err      error
+	startLSN   uint64
+	endLSN     uint64
+	removed    int
+	walBufStat walBufStatSnapshot
+	err        error
 }
 
 // Writer serializes all WAL writes through one internal goroutine.
@@ -219,6 +230,10 @@ type Writer struct {
 	// reseated. Read by Writer.DirectIOWrites() /
 	// Writer.TailRMWWrites().
 	directIOCounters *directIOCounters
+
+	// walBufferCounters shares atomics with state for the
+	// M0013-0003 wal_buffers_* columns of pg_stat_wal_io.
+	walBufferCounters *walBufferCounters
 }
 
 type state struct {
@@ -311,6 +326,10 @@ type state struct {
 	// Pointer-shared with Writer so both ends see the same
 	// atomics. Read by the pg_stat_wal_io virtual view.
 	directIOCounters *directIOCounters
+
+	// walBufferCounters mirrors Writer.walBufferCounters via
+	// pointer — drainBufferBytes bumps these (M0013-0003).
+	walBufferCounters *walBufferCounters
 }
 
 // directIOCounters holds the atomic counters wal-direct-I/O
@@ -320,6 +339,28 @@ type directIOCounters struct {
 	directWrites  atomic.Uint64 // every writeAtDirectIO region
 	tailRMWWrites atomic.Uint64 // subset where the user range wasn't block-aligned
 }
+
+// walBufferCounters holds the atomic lifetime counters that
+// pg_stat_wal_io's M0013-0003 columns surface. The two drain
+// buckets are kept separate so an operator can tell a sizing
+// problem (high overflowDrainBytes) from natural commit /
+// eviction durability cost (high flushDrainBytes). Single
+// allocation owned by Writer; shared with state via pointer.
+type walBufferCounters struct {
+	overflowDrainBytes atomic.Uint64
+	flushDrainBytes    atomic.Uint64
+}
+
+// drainReason classifies which counter a drainBufferBytes call
+// should bump. Kept inside the package — callers funnel through
+// the two top-level helpers (drainBufferBytes /
+// drainBufferUpToForFlush) rather than naming the enum directly.
+type drainReason int
+
+const (
+	drainReasonOverflow drainReason = iota // append-path overflow
+	drainReasonFlush                       // flushUpTo Stage 1
+)
 
 // directIOScratchCap caps the per-call RMW scratch buffer at
 // 1 MiB. WAL writes are usually much smaller (one append =
@@ -343,6 +384,8 @@ func NewWriter(cfg Config) (*Writer, error) {
 
 	counters := &directIOCounters{}
 	st.directIOCounters = counters
+	bufCounters := &walBufferCounters{}
+	st.walBufferCounters = bufCounters
 	w := &Writer{
 		ops:                    make(chan op),
 		done:                   make(chan struct{}),
@@ -350,6 +393,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 		directIOFallbackReason: st.directIOFallbackReason,
 		memRing:                st.memRing,
 		directIOCounters:       counters,
+		walBufferCounters:      bufCounters,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
@@ -407,6 +451,53 @@ func (w *Writer) TailRMWWrites() uint64 {
 		return 0
 	}
 	return w.directIOCounters.tailRMWWrites.Load()
+}
+
+// WALBuffersCapacity returns the wal_buffers GUC value the writer
+// was configured with. 0 when the buffer is disabled. Static for
+// the writer's lifetime. Surfaced as
+// `wal_buffers_capacity_bytes` in pg_stat_wal_io (M0013-0003).
+func (w *Writer) WALBuffersCapacity() int64 {
+	resp := make(chan result, 1)
+	if err := w.send(op{kind: opWALBufStat, resp: resp}); err != nil {
+		return 0
+	}
+	return (<-resp).walBufStat.cap
+}
+
+// WALBuffersBytesResident returns the live byte count currently
+// held in the in-memory WAL buffer (i.e. not yet drained to a
+// segment file). Surfaced as `wal_buffers_bytes_resident` in
+// pg_stat_wal_io. Reads serialise on the writer goroutine to
+// avoid racing with append/drain.
+func (w *Writer) WALBuffersBytesResident() int64 {
+	resp := make(chan result, 1)
+	if err := w.send(op{kind: opWALBufStat, resp: resp}); err != nil {
+		return 0
+	}
+	return (<-resp).walBufStat.resident
+}
+
+// WALBuffersOverflowDrainBytes returns the lifetime total bytes
+// drained from the buffer because an Append would have overflowed
+// it. High values indicate wal_buffers is too small for the
+// workload's append rate. Atomic load — does not enqueue an op.
+func (w *Writer) WALBuffersOverflowDrainBytes() uint64 {
+	if w.walBufferCounters == nil {
+		return 0
+	}
+	return w.walBufferCounters.overflowDrainBytes.Load()
+}
+
+// WALBuffersFlushDrainBytes returns the lifetime total bytes
+// drained from the buffer by FlushUpTo's Stage 1 (commits,
+// eviction, checkpoint). High values are typical and healthy —
+// the buffer's natural cost of WAL durability. Atomic load.
+func (w *Writer) WALBuffersFlushDrainBytes() uint64 {
+	if w.walBufferCounters == nil {
+		return 0
+	}
+	return w.walBufferCounters.flushDrainBytes.Load()
 }
 
 // WrittenLSN returns the LSN of the last byte the writer has
@@ -696,6 +787,13 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 			err := s.close()
 			req.resp <- result{err: err}
 			return
+		case opWALBufStat:
+			snap := walBufStatSnapshot{}
+			if s.walBuf != nil {
+				snap.cap = s.walBuf.cap
+				snap.resident = s.walBuf.resident()
+			}
+			req.resp <- result{walBufStat: snap}
 		default:
 			req.resp <- result{err: fmt.Errorf("wal: unknown operation %d", req.kind)}
 		}
@@ -730,7 +828,7 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	// of the buffer to segment files first to make room.
 	need := int64(len(record)) - s.walBuf.free()
 	if need > 0 {
-		if err := s.drainBufferBytes(need); err != nil {
+		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -756,8 +854,9 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 // the milestone calls out.
 //
 // The caller has already verified walBuf is non-nil and the record
-// being appended is ≤ walBuf.cap.
-func (s *state) drainBufferBytes(n int64) error {
+// being appended is ≤ walBuf.cap. `reason` classifies the drain
+// for the M0013-0003 observability counters (overflow vs flush).
+func (s *state) drainBufferBytes(n int64, reason drainReason) error {
 	if n <= 0 || s.walBuf == nil {
 		return nil
 	}
@@ -780,6 +879,14 @@ func (s *state) drainBufferBytes(n int64) error {
 	}
 	s.walBuf.advanceHead(n)
 	s.drainedLSN = uint64(pos)
+	if c := s.walBufferCounters; c != nil {
+		switch reason {
+		case drainReasonOverflow:
+			c.overflowDrainBytes.Add(uint64(n))
+		case drainReasonFlush:
+			c.flushDrainBytes.Add(uint64(n))
+		}
+	}
 	return nil
 }
 
@@ -793,7 +900,7 @@ func (s *state) drainBufferUpTo(targetLSN uint64) error {
 		return nil
 	}
 	need := int64(targetLSN - s.drainedLSN)
-	return s.drainBufferBytes(need)
+	return s.drainBufferBytes(need, drainReasonFlush)
 }
 
 func (s *state) flushUpTo(lsn uint64) error {

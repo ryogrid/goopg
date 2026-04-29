@@ -261,6 +261,18 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				"event", "wal_sender_memory_buffer_attached",
 				"capacity_bytes", rt.WAL.MemRing().Cap())
 		}
+		// In-memory WAL buffer (M0013-0003): logged when
+		// wal_buffers > 0 so an operator can grep
+		// `event=wal_buffers_attached` to verify the rollout.
+		// Suppressed when the buffer is disabled — there's
+		// nothing to surface.
+		if rt.WAL != nil {
+			if cap := rt.WAL.WALBuffersCapacity(); cap > 0 {
+				logger.Info("wal buffers attached",
+					"event", "wal_buffers_attached",
+					"capacity_bytes", cap)
+			}
+		}
 		defer func() {
 			// Persist the catalog before tearing down the pool.
 			// If saving fails we surface a warning but still

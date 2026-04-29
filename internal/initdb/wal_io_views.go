@@ -45,6 +45,17 @@ import (
 //     RecordIterator.readBytesAt outcomes against the ring.
 //     hits / (hits + misses) is the cache hit-rate the
 //     operator should keep > 95% to make the ring worthwhile.
+//   - wal_buffers_capacity_bytes (M0013-0003): the wal_buffers
+//     GUC value. 0 when the buffer is disabled.
+//   - wal_buffers_bytes_resident (M0013-0003): live byte count
+//     in the in-memory WAL buffer. 0 when disabled.
+//   - wal_buffers_overflow_drain_bytes (M0013-0003): lifetime
+//     bytes drained because Append would have overflowed the
+//     buffer. High values indicate undersized wal_buffers.
+//   - wal_buffers_flush_drain_bytes (M0013-0003): lifetime bytes
+//     drained by FlushUpTo's Stage 1 (commit / eviction /
+//     checkpoint). The "natural" cost of WAL durability through
+//     the buffer; high values are healthy.
 func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
@@ -58,6 +69,10 @@ func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 			{Name: "send_buffer_bytes_resident", Type: catalog.Type{Name: "text"}},
 			{Name: "send_buffer_hits", Type: catalog.Type{Name: "text"}},
 			{Name: "send_buffer_misses", Type: catalog.Type{Name: "text"}},
+			{Name: "wal_buffers_capacity_bytes", Type: catalog.Type{Name: "text"}},
+			{Name: "wal_buffers_bytes_resident", Type: catalog.Type{Name: "text"}},
+			{Name: "wal_buffers_overflow_drain_bytes", Type: catalog.Type{Name: "text"}},
+			{Name: "wal_buffers_flush_drain_bytes", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -87,6 +102,10 @@ func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 			fmt.Sprintf("%d", resident),
 			fmt.Sprintf("%d", hits),
 			fmt.Sprintf("%d", misses),
+			fmt.Sprintf("%d", w.WALBuffersCapacity()),
+			fmt.Sprintf("%d", w.WALBuffersBytesResident()),
+			fmt.Sprintf("%d", w.WALBuffersOverflowDrainBytes()),
+			fmt.Sprintf("%d", w.WALBuffersFlushDrainBytes()),
 		}}
 	}
 	return cat.RegisterVirtualTable(tbl)
