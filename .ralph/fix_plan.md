@@ -1966,6 +1966,47 @@ Decomposed into the four design-doc seams the milestone calls out
       / `random_page_cost`, indexed-rescan nestloop pricing,
       and `enable_*` GUC consultation deferred.)
 
+## Milestone 0007 — WAL segment preallocation & fdatasync
+
+See `docs/milestones/0007-wal-segment-preallocation.md` for the full
+DoD. Decomposed into the two design-doc seams the milestone calls
+out (`0007-0001`, `0007-0002`); pick the topmost unchecked item.
+
+- [x] WAL segment preallocation: zero-fill new segments to
+      `SegmentSize` + fsync at creation; directory fsync; EOS
+      sentinel for the trailing zero-fill so recovery terminates
+      cleanly. Design doc
+      `docs/design/0007-0001-wal-segment-preallocation.md`.
+      (landed 2026-04-29: `wal.Config.Preallocate` flips on the
+      preallocator. `state.openSegment` zero-fills new files via
+      `preallocateSegment` (64-KiB-chunk WriteAt loop + fsync) and
+      fsyncs the WAL directory entry. The encoded zero header
+      (`len=0 && crc=0`) is now the EOS sentinel: `Writer.Append`
+      rejects empty payloads (`ErrEmptyPayload`); `ReadAll` /
+      `decodeRecord` callers honour `isZeroHeader` to stop on
+      first zero header. `detectWritePos`'s legacy
+      "size-of-last-segment" formula is replaced by
+      `scanLastSegmentEnd` which walks the last segment
+      record-by-record to find the actual write position —
+      handles both short legacy segments and full-size
+      preallocated tails. The new `wal_init_zero` GUC
+      (`ContextPostmaster`, default `on`) flows through
+      `cmd/goopg start` → `initdb.Open(OpenOptions{WALInitZero})`
+      → `wal.Config.Preallocate`. New tests:
+      `TestPreallocatedSegmentIsFullSize`,
+      `TestPreallocatedSegmentRecoversCleanly`,
+      `TestAppendRejectsEmptyPayload`. `fdatasync` switch
+      (0007-0002), `wal_recycle`, eager next-segment lookahead,
+      counters / observability, and pgbench latency measurement
+      deferred.)
+
+- [ ] `fdatasync` on the commit path: replace
+      `f.Sync()` in `flushUpTo` with platform-aware `fdatasync`
+      (Linux) / `fsync` fallback. Keep full `fsync` at segment
+      creation, post-creation directory flush, and segment
+      removal. Design doc
+      `docs/design/0007-0002-fdatasync-commit-path.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

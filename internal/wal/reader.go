@@ -29,6 +29,12 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 	var records []Record
 	off := 0
 	for off < len(stream) {
+		// The EOS sentinel (zero header) inside a preallocated
+		// segment's zero-fill tail terminates the record stream.
+		// See docs/design/0007-0001-wal-segment-preallocation.md.
+		if isZeroHeader(stream[off:]) {
+			break
+		}
 		payload, n, err := decodeRecord(stream[off:])
 		if err != nil {
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
@@ -60,6 +66,11 @@ func readStream(walDir string, segSize int64) ([]byte, error) {
 			return nil, fmt.Errorf("wal: segment %s too large: %d > %d", path, len(b), segSize)
 		}
 		stream = append(stream, b...)
+		// Legacy lazy-grown last segment: shorter than segSize, no
+		// next segment exists. Preallocated mode: every segment is
+		// full-size, and we keep reading until ENOENT. The EOS
+		// sentinel inside the byte stream terminates record
+		// iteration in ReadAll.
 		if int64(len(b)) < segSize {
 			break
 		}

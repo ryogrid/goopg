@@ -65,6 +65,13 @@ type OpenOptions struct {
 	// Production deployments want O_DIRECT|O_DSYNC; tests typically
 	// leave this false.
 	AlignedIO bool
+
+	// WALInitZero, when true, forwards to wal.Config.Preallocate
+	// so new WAL segments are zero-filled to SegmentSize at
+	// creation time. Mirrors upstream's `wal_init_zero` GUC.
+	// cmd/goopg start sets this from the GUC; tests typically
+	// leave it false.
+	WALInitZero bool
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -110,7 +117,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	walWriter, err := wal.NewWriter(wal.Config{
-		WALDir: filepath.Join(abs, "pg_wal"),
+		WALDir:      filepath.Join(abs, "pg_wal"),
+		Preallocate: opts.WALInitZero,
 	})
 	if err != nil {
 		_ = mgr.Close()

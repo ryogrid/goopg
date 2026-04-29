@@ -18,12 +18,26 @@ const (
 var (
 	ErrClosed        = errors.New("wal: writer closed")
 	ErrLSNNotWritten = errors.New("wal: requested LSN is beyond written WAL")
+	// ErrEmptyPayload guards the EOS sentinel: a zero
+	// (len=0, crc=0) header is reserved as "no record here yet"
+	// in preallocated segments. See
+	// docs/design/0007-0001-wal-segment-preallocation.md.
+	ErrEmptyPayload = errors.New("wal: empty payload not allowed")
 )
 
 // Config controls writer and reader behavior.
 type Config struct {
 	WALDir      string
 	SegmentSize int64
+
+	// Preallocate, when true, zero-fills new segment files to
+	// SegmentSize and fsyncs them at creation time so subsequent
+	// commit-path syncs don't pay for inode metadata updates and
+	// don't trigger filesystem allocations on the hot path.
+	// Mirrors upstream's `wal_init_zero` GUC. Default false keeps
+	// the legacy "grow lazily" behaviour for callers that haven't
+	// migrated. See docs/design/0007-0001-wal-segment-preallocation.md.
+	Preallocate bool
 }
 
 func (c *Config) withDefaults() {
@@ -173,7 +187,16 @@ func (w *Writer) notifyAppend() {
 }
 
 // Append writes one record and returns its [startLSN, endLSN].
+//
+// Empty payloads are rejected because the encoded zero header
+// (len=0, crc=0) is reserved as the EOS sentinel in preallocated
+// segments — see
+// docs/design/0007-0001-wal-segment-preallocation.md. No
+// production caller emits empty records.
 func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
+	if len(payload) == 0 {
+		return 0, 0, ErrEmptyPayload
+	}
 	resp := make(chan result, 1)
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
@@ -310,10 +333,52 @@ func detectWritePos(walDir string, segSize int64) (int64, error) {
 		if i < len(segNos)-1 && sz != segSize {
 			return 0, fmt.Errorf("wal: non-final segment %s has size %d, expected %d", formatSegmentName(expected), sz, segSize)
 		}
-		writePos += sz
+		if i < len(segNos)-1 {
+			writePos += sz
+			continue
+		}
+		// Last segment: scan for the first EOS sentinel (zero
+		// header) to find the actual end of records. Works for
+		// both legacy lazy-grown segments (writePos == sz, no
+		// trailing zeros) and preallocated full-size segments
+		// (writePos < sz, zero-fill tail).
+		usedBytes, scanErr := scanLastSegmentEnd(walDir, expected, sz)
+		if scanErr != nil {
+			return 0, scanErr
+		}
+		writePos += usedBytes
 	}
 
 	return writePos, nil
+}
+
+// scanLastSegmentEnd reads the last segment from disk and returns
+// the byte offset of the first EOS sentinel (a zero record header
+// — `len=0 && crc=0`). Used by detectWritePos to recover the true
+// write position from a preallocated full-size last segment, and
+// also serves the legacy short-segment case (where the segment
+// has no trailing zeros, and the scan returns the full size).
+func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64) (int64, error) {
+	path := filepath.Join(walDir, formatSegmentName(segNo))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, fmt.Errorf("wal: read %s: %w", path, err)
+	}
+	if int64(len(data)) > segSize {
+		return 0, fmt.Errorf("wal: segment %s too large: %d > %d", path, len(data), segSize)
+	}
+	off := 0
+	for off < len(data) {
+		if isZeroHeader(data[off:]) {
+			return int64(off), nil
+		}
+		_, n, err := decodeRecord(data[off:])
+		if err != nil {
+			return 0, fmt.Errorf("wal: scan %s at offset %d: %w", path, off, err)
+		}
+		off += n
+	}
+	return int64(off), nil
 }
 
 func (s *state) loop(ops <-chan op, done chan<- struct{}) {
@@ -487,12 +552,64 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 		return f, nil
 	}
 	path := filepath.Join(s.cfg.WALDir, formatSegmentName(segNo))
+
+	// Detect first-time creation so the preallocator only zero-fills
+	// new segments. Existing files (legacy lazy mode, or a re-open
+	// after server restart) are left alone — the EOS-sentinel rule
+	// in decodeRecord handles their trailing zeros if any.
+	wasNew := false
+	if s.cfg.Preallocate {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			wasNew = true
+		} else if err != nil {
+			return nil, fmt.Errorf("wal: stat %s: %w", path, err)
+		}
+	}
+
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open %s: %w", path, err)
 	}
+
+	if wasNew {
+		if err := preallocateSegment(f, s.cfg.SegmentSize); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		// Directory fsync makes the new dirent durable. Mirrors
+		// upstream's fsync_fname behaviour.
+		if dir, derr := os.Open(s.cfg.WALDir); derr == nil {
+			_ = dir.Sync()
+			_ = dir.Close()
+		}
+	}
+
 	s.files[segNo] = f
 	return f, nil
+}
+
+// preallocateSegment zero-fills f to size and fsyncs it. Mirrors
+// upstream's XLogFileInitInternal zero-write loop. The simple
+// loop is portable across filesystems; posix_fallocate is a
+// follow-up optimisation.
+func preallocateSegment(f *os.File, size int64) error {
+	const chunk = 1 << 16 // 64 KiB
+	zero := make([]byte, chunk)
+	written := int64(0)
+	for written < size {
+		n := int64(chunk)
+		if size-written < n {
+			n = size - written
+		}
+		if _, err := f.WriteAt(zero[:n], written); err != nil {
+			return fmt.Errorf("wal: preallocate %s: %w", f.Name(), err)
+		}
+		written += n
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("wal: preallocate fsync %s: %w", f.Name(), err)
+	}
+	return nil
 }
 
 func (s *state) close() error {

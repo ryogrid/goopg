@@ -2,6 +2,7 @@ package wal
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -141,5 +142,102 @@ func TestRecordCanSpanSegments(t *testing.T) {
 		if recs[0].Payload[i] != payload[i] {
 			t.Fatalf("payload[%d] = %d, want %d", i, recs[0].Payload[i], payload[i])
 		}
+	}
+}
+
+// TestPreallocatedSegmentIsFullSize pins the M0007 / 0007-0001
+// contract: with Preallocate=true, every newly created segment
+// file is exactly SegmentSize bytes from the moment it appears,
+// even after a single short append.
+func TestPreallocatedSegmentIsFullSize(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = int64(1024)
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, Preallocate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Append([]byte("short")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(walDir, formatSegmentName(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != segSize {
+		t.Errorf("segment 0 size=%d want %d (preallocated)", st.Size(), segSize)
+	}
+}
+
+// TestPreallocatedSegmentRecoversCleanly: write three records
+// into a preallocated segment, close, reopen with the same
+// config. Recovery's WrittenLSN matches the third record's end
+// and ReadAll returns exactly those three records — no spurious
+// empty records emitted from the zero-fill tail.
+func TestPreallocatedSegmentRecoversCleanly(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = int64(1024)
+	cfg := Config{WALDir: walDir, SegmentSize: segSize, Preallocate: true}
+
+	w, err := NewWriter(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastEnd uint64
+	for _, p := range []string{"alpha", "beta", "gamma"} {
+		_, end, err := w.Append([]byte(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lastEnd = end
+	}
+	if err := w.FlushUpTo(lastEnd); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := NewWriter(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if got := w2.WrittenLSN(); got != lastEnd {
+		t.Errorf("reopened WrittenLSN=%d want %d", got, lastEnd)
+	}
+
+	recs, err := ReadAll(walDir, segSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 3 {
+		t.Fatalf("ReadAll returned %d records want 3 (zero-fill tail leaked?)", len(recs))
+	}
+	for i, want := range []string{"alpha", "beta", "gamma"} {
+		if string(recs[i].Payload) != want {
+			t.Errorf("recs[%d]=%q want %q", i, recs[i].Payload, want)
+		}
+	}
+}
+
+// TestAppendRejectsEmptyPayload pins the new invariant: empty
+// records collide with the EOS sentinel, so the writer rejects
+// them outright. See
+// docs/design/0007-0001-wal-segment-preallocation.md.
+func TestAppendRejectsEmptyPayload(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, _, err := w.Append(nil); !errors.Is(err, ErrEmptyPayload) {
+		t.Errorf("Append(nil) err=%v want ErrEmptyPayload", err)
+	}
+	if _, _, err := w.Append([]byte{}); !errors.Is(err, ErrEmptyPayload) {
+		t.Errorf("Append([]byte{}) err=%v want ErrEmptyPayload", err)
 	}
 }

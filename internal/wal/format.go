@@ -9,7 +9,30 @@ import (
 
 const recordHeaderSize = 8
 
-var ErrCorruptRecord = errors.New("wal: corrupt record")
+var (
+	ErrCorruptRecord = errors.New("wal: corrupt record")
+	// ErrEOS signals that the decoder reached the end-of-stream
+	// sentinel (a zero record header) inside a preallocated
+	// segment's zero-fill tail. Callers stop reading on this. See
+	// docs/design/0007-0001-wal-segment-preallocation.md.
+	ErrEOS = errors.New("wal: end of stream")
+)
+
+// isZeroHeader reports whether the first recordHeaderSize bytes
+// of stream are all zero — the EOS sentinel. Stream shorter than
+// the header counts as the same condition (no further records can
+// fit anyway).
+func isZeroHeader(stream []byte) bool {
+	if len(stream) < recordHeaderSize {
+		return true
+	}
+	for i := 0; i < recordHeaderSize; i++ {
+		if stream[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
 
 func encodeRecord(payload []byte) []byte {
 	buf := make([]byte, recordHeaderSize+len(payload))

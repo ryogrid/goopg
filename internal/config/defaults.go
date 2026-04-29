@@ -168,6 +168,18 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// wal_init_zero controls whether new WAL segments are zero-
+	// filled at creation time so subsequent commit-path syncs
+	// don't pay for inode metadata updates and don't trigger
+	// filesystem allocations on the hot path. Default `on`
+	// matches upstream. See
+	// docs/design/0007-0001-wal-segment-preallocation.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_init_zero", Type: TypeBool, BootVal: "on",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// Compatibility GUCs HammerDB / psql / pgbench issue with
 	// SET before running their workloads. v0 doesn't honour any
 	// of these semantically — the planner / executor ignores

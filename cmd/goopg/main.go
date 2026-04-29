@@ -180,8 +180,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	var rt *initdb.Runtime
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
+		walInitZero := boolGUC(registry, "wal_init_zero", true)
 		var err error
-		rt, err = initdb.Open(initdb.OpenOptions{DataDir: *dataDir, PoolSlots: poolSlots})
+		rt, err = initdb.Open(initdb.OpenOptions{
+			DataDir:     *dataDir,
+			PoolSlots:   poolSlots,
+			WALInitZero: walInitZero,
+		})
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
@@ -496,6 +501,26 @@ func parsePrimaryConninfo(conninfo string) string {
 		return ""
 	}
 	return host + ":" + port
+}
+
+// boolGUC reads a boolean GUC by name, returning fallback when the
+// registry is nil, the variable isn't registered, or the value
+// can't be parsed.
+func boolGUC(registry *config.Registry, name string, fallback bool) bool {
+	if registry == nil {
+		return fallback
+	}
+	v, ok := registry.Get(name)
+	if !ok {
+		return fallback
+	}
+	switch strings.ToLower(strings.TrimSpace(v.Display())) {
+	case "on", "true", "yes", "1":
+		return true
+	case "off", "false", "no", "0":
+		return false
+	}
+	return fallback
 }
 
 // poolSlotsFromGUC reads the shared_buffers GUC (canonical KB) and
