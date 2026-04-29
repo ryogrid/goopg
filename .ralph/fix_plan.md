@@ -2233,6 +2233,39 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 3 — analyzer pass-through + planner DDL
+        pass-through + executor `execCreateFunction` /
+        `execDropFunction`. Design doc
+        `docs/design/0015-0003-create-function-executor-wiring.md`.
+        (landed 2026-04-30: end-to-end wiring slice. CATALOG
+        interface gains `Routines() *Routines` (small additive;
+        only `*InMemory` implements). ANALYZER drops the step-1
+        SQLSTATE 0A000 reject — DDL is pass-through just like
+        CREATE TABLE / CREATE VIEW. PLANNER switch adds
+        `*parser.CreateFunctionStmt` / `*parser.DropFunctionStmt`
+        to the existing `&DDL{Stmt: stmt}` arm. EXECUTOR
+        `ddlOp.Next` dispatch calls new `execCreateFunction` /
+        `execDropFunction`. `execCreateFunction` validates
+        LANGUAGE (plpgsql/sql allowlist; missing → SQLSTATE
+        42P13, unsupported → 42704), translates
+        `parser.FunctionArg` → `catalog.Routine`, calls
+        `Routines.Create(routine, s.OrReplace)`. Errors mapped
+        to upstream-canonical SQLSTATEs: ErrRoutineExists →
+        42723, ErrRoutineNotFound → 42883 (swallowed by IF
+        EXISTS), ErrRoutineAmbiguous → 42725. `execDropFunction`
+        chooses `Drop(name, argTypes)` vs `DropByName(name)`
+        based on whether `s.Args == nil`. 8 executor tests
+        cover register / duplicate / OR-REPLACE-preserves-OID /
+        unsupported-language / drop-by-signature /
+        drop-missing-no-IF-EXISTS / DROP-IF-EXISTS-swallow /
+        ambiguous-bare-name. `TestAnalyzeCreateFunctionPasses
+        Through` replaces the step-1 reject tests. Out of scope
+        (Stage A step 4+): PL/pgSQL parser + AST for routine
+        bodies, the interpreter / SPI bridge, function
+        invocation in expression contexts, persistence of
+        pg_proc rows, WAL replay support, multi-target DROP.
+        Full `go test ./...` green.)
+
   - [x] Stage A step 2 — pg_proc catalog registry + virtual
         view. Design doc
         `docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md`.

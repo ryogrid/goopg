@@ -159,6 +159,12 @@ type Catalog interface {
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
 	IndexRelFileNode(index *Index) storage.RelFileNode
+	// Routines returns the user-defined-routine registry. M0015
+	// Stage A step 3: the executor's CREATE FUNCTION / DROP
+	// FUNCTION operators call into this to mutate `pg_proc`-shaped
+	// state. Implementations may return a process-local registry
+	// (current InMemory behaviour) or a future on-disk-backed one.
+	Routines() *Routines
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.

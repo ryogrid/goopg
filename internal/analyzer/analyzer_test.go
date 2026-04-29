@@ -123,25 +123,20 @@ func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 		"0A000")
 }
 
-// TestAnalyzeCreateFunctionRejected pins the M0015 Stage A step 1
-// gate: the parser surface lands ahead of the PL/pgSQL interpreter,
-// so the analyzer rejects with SQLSTATE 0A000 ("feature not
-// supported"). Subsequent loops drop this case as the catalog +
-// runtime wiring lands.
-func TestAnalyzeCreateFunctionRejected(t *testing.T) {
+// TestAnalyzeCreateFunctionPassesThrough pins M0015 Stage A step 3:
+// the analyzer drops the step-1 SQLSTATE 0A000 rejection now that
+// the executor's CREATE FUNCTION operator lands the catalog row.
+// DDL flows straight through Plan to the executor; the analyzer
+// no longer needs to gatekeep these statements.
+func TestAnalyzeCreateFunctionPassesThrough(t *testing.T) {
 	cat := analyzerCatalog(t)
-	expectAnalyzeCode(t, cat,
-		"CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$",
-		"0A000")
-}
-
-// TestAnalyzeDropFunctionRejected: symmetric guard — DROP FUNCTION
-// also surfaces 0A000 until the catalog work lands.
-func TestAnalyzeDropFunctionRejected(t *testing.T) {
-	cat := analyzerCatalog(t)
-	expectAnalyzeCode(t, cat,
-		"DROP FUNCTION IF EXISTS f(int)",
-		"0A000")
+	if err := Analyze(parseOne(t,
+		"CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$"), cat); err != nil {
+		t.Errorf("Analyze CREATE FUNCTION = %v, want nil", err)
+	}
+	if err := Analyze(parseOne(t, "DROP FUNCTION IF EXISTS f(int)"), cat); err != nil {
+		t.Errorf("Analyze DROP FUNCTION = %v, want nil", err)
+	}
 }
 
 func TestAnalyzeWindowFunctionArgShapeRejected(t *testing.T) {

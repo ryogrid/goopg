@@ -64,6 +64,10 @@ func (o *ddlOp) Next() (Row, error) {
 		return nil, o.execCreateSubscription(s)
 	case *parser.DropSubscriptionStmt:
 		return nil, o.execDropSubscription(s)
+	case *parser.CreateFunctionStmt:
+		return nil, o.execCreateFunction(s)
+	case *parser.DropFunctionStmt:
+		return nil, o.execDropFunction(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -654,4 +658,89 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		}
 	}
 	return nil
+}
+
+// execCreateFunction registers a routine in the catalog's
+// Routines() registry (M0015 Stage A step 3). Body is stored
+// verbatim — the PL/pgSQL parser/interpreter that executes it
+// arrives in step 4+. Stage A pins LANGUAGE to plpgsql or sql;
+// other languages surface a typed diagnostic.
+func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE FUNCTION requires routine registry"}
+	}
+	lang := strings.ToLower(s.Language)
+	if lang == "" {
+		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
+	}
+	if lang != "plpgsql" && lang != "sql" {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage A: plpgsql, sql)", s.Language)}
+	}
+	argTypes := make([]catalog.Type, len(s.Args))
+	argNames := make([]string, len(s.Args))
+	for i, a := range s.Args {
+		argTypes[i] = catalog.Type{
+			Name: strings.ToLower(a.Type.Name),
+			Args: append([]int64(nil), a.Type.Args...),
+		}
+		argNames[i] = a.Name
+	}
+	r := &catalog.Routine{
+		Schema:   s.Name.Schema,
+		Name:     s.Name.Name,
+		ArgNames: argNames,
+		ArgTypes: argTypes,
+		ReturnType: catalog.Type{
+			Name: strings.ToLower(s.ReturnType.Name),
+			Args: append([]int64(nil), s.ReturnType.Args...),
+		},
+		Language: lang,
+		Body:     s.Body,
+	}
+	if _, err := rs.Create(r, s.OrReplace); err != nil {
+		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
+		if errors.Is(err, catalog.ErrRoutineExists) {
+			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
+		}
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// execDropFunction removes a routine from the registry. With an
+// argument list, drops the matching overload; without it, drops
+// the unique overload (and surfaces 42725 "ambiguous function"
+// if more than one exists).
+func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP FUNCTION requires routine registry"}
+	}
+	var err error
+	if s.Args == nil {
+		err = rs.DropByName(s.Name)
+	} else {
+		argTypes := make([]catalog.Type, len(s.Args))
+		for i, a := range s.Args {
+			argTypes[i] = catalog.Type{
+				Name: strings.ToLower(a.Type.Name),
+				Args: append([]int64(nil), a.Type.Args...),
+			}
+		}
+		err = rs.Drop(s.Name, argTypes)
+	}
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, catalog.ErrRoutineNotFound) {
+		if s.IfExists {
+			return nil
+		}
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: err.Error()}
+	}
+	if errors.Is(err, catalog.ErrRoutineAmbiguous) {
+		return &ExecError{Code: "42725", Pos: s.Pos(), Message: err.Error()}
+	}
+	return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 }

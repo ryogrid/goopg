@@ -152,18 +152,14 @@ func Analyze(stmt parser.Stmt, cat catalog.Catalog) error {
 		return analyzeUpdate(s, cat)
 	case *parser.DeleteStmt:
 		return analyzeDelete(s, cat)
-	case *parser.CreateFunctionStmt:
-		// M0015 Stage A step 1: parser surface lands ahead of the
-		// PL/pgSQL interpreter. Reject with SQLSTATE 0A000 so
-		// clients see "feature not supported in v0" instead of a
-		// silent accept. Subsequent loops drop this case as the
-		// catalog / executor wiring lands.
-		return analyzeError(s.Pos(), "0A000",
-			"CREATE FUNCTION is not supported in v0 analyzer")
-	case *parser.DropFunctionStmt:
-		return analyzeError(s.Pos(), "0A000",
-			"DROP FUNCTION is not supported in v0 analyzer")
 	default:
+		// DDL statements (CreateTableStmt, CreateFunctionStmt,
+		// DropFunctionStmt, etc.) flow straight through Plan to the
+		// DDL executor. Stage A step 3 dropped the
+		// CREATE/DROP FUNCTION rejection that step 1 added — the
+		// catalog Routines() registry now backs the executor's
+		// CREATE FUNCTION / DROP FUNCTION operators.
+		_ = s
 		return nil
 	}
 }
