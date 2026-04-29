@@ -358,6 +358,17 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 
 	user := params["user"]
 	app := params["application_name"]
+	// PostgreSQL streaming replication: the standby's libpq client
+	// passes `replication=true` (or `database`, `1`) in the
+	// StartupMessage parameter bag to request a replication-mode
+	// connection. We tag the per-conn ctx so runPostStartupLoop can
+	// route IDENTIFY_SYSTEM / START_REPLICATION etc. through the
+	// walsender path instead of the regular SQL dispatcher. See
+	// docs/design/0005-0001-streaming-replication-architecture.md.
+	isReplication := isReplicationStartupParam(params["replication"])
+	if isReplication {
+		logger = logger.With("replication", true)
+	}
 	logger = logger.With("user", user, "application_name", app)
 
 	if !s.checkAuth(raw, r, w, params, logger) {
@@ -394,6 +405,24 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 
 	s.runPostStartupLoop(connCtx, r, w, sess, logger)
+	_ = isReplication // reserved for the next loop's START_REPLICATION dispatch
+}
+
+// isReplicationStartupParam interprets the StartupMessage `replication`
+// parameter the way upstream PostgreSQL does: case-insensitive `true`
+// or `1` enables physical replication mode; `database` enables logical
+// replication (deferred in v0; treated as physical for now); empty /
+// `false` / `0` / unrecognised values mean "not a replication
+// connection". Mirrors postgres/src/backend/replication/walsender.c
+// (`got_STOPPING`, `EnableReplicationOriginCmd`).
+func isReplicationStartupParam(v string) bool {
+	switch v {
+	case "":
+		return false
+	case "0", "false", "FALSE", "False":
+		return false
+	}
+	return true
 }
 
 // checkAuth runs the configured Policy and the corresponding wire

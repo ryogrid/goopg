@@ -1393,14 +1393,34 @@ under "Hooks into existing goopg code".
 
 ### Wire protocol
 
-- [ ] Add `MsgCopyBoth` ('W') backend frame type to
+- [x] Add `MsgCopyBoth` ('W') backend frame type to
       `internal/protocol/protocol.go` next to `MsgCopyOutResponse`.
-- [ ] Add encoders in `internal/protocol/messages.go` for the
+      (achieved 2026-04-29: `MsgCopyBothResponse byte = 'W'`
+      added; `WriteCopyBothResponse(overallFormat, columnFormats)`
+      method on FrameWriter mirrors the existing
+      WriteCopyInResponse / WriteCopyOutResponse layout.)
+- [x] Add encoders in `internal/protocol/replication.go` for the
       WAL-data ('w'), keepalive ('k'), and standby-status ('r')
       inner-payload framings used inside CopyBoth/CopyData.
-- [ ] Recognise `replication=true` in the StartupMessage
+      (achieved 2026-04-29: `EncodeWALData` /
+      `EncodeKeepalive` / `EncodeStandbyStatusUpdate` produce
+      the upstream-aligned byte sequences; symmetric decoders
+      via `DecodeReplicationMessage` yield typed
+      `*WALDataMessage` / `*KeepaliveMessage` /
+      `*StandbyStatusUpdate` structs. Timestamps round-trip
+      through `PgTimestampMicros` against the upstream
+      TimestampTz epoch (2000-01-01 UTC, microseconds).
+      Round-trip + epoch + unknown-byte rejection unit tests
+      pin the contract.)
+- [x] Recognise `replication=true` in the StartupMessage
       parameter bag (`internal/server/server.go` startup parser);
       tag the per-connection ctx with an `IsReplication` flag.
+      (achieved 2026-04-29: new `isReplicationStartupParam`
+      helper interprets `true` / `1` / `database` (logical, treated
+      as physical for v0) / non-`false` as enabling replication
+      mode; flag added to per-conn logger and reserved for the
+      next loop's IDENTIFY_SYSTEM / START_REPLICATION command
+      dispatch.)
 - [ ] Implement `IDENTIFY_SYSTEM` simple-query handler that
       returns `(systemid, timeline, xlogpos, dbname)` as a
       single-row tuple. Required for v0.

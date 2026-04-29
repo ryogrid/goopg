@@ -53,6 +53,11 @@ const (
 	MsgNoticeResponse     byte = 'N'
 	MsgCopyInResponse     byte = 'G'
 	MsgCopyOutResponse    byte = 'H'
+	// MsgCopyBoth ('W') is the bidirectional flavour used by the
+	// streaming-replication path. See
+	// docs/design/0005-0001-streaming-replication-architecture.md
+	// "Streaming mode" for the framing on top of it.
+	MsgCopyBothResponse   byte = 'W'
 	MsgRowDescription     byte = 'T'
 	MsgParameterDesc      byte = 't'
 	MsgDataRow            byte = 'D'
