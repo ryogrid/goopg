@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/goopg/goopg/internal/aio"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
@@ -38,6 +39,7 @@ type Runtime struct {
 	WalReceivers   *wal.Receivers
 	WalSubscribers *wal.Subscribers
 	PubSub         *catalog.PubSub
+	AIO            *aio.Engine
 	DataDir        string
 
 	// Standby is true when `<DataDir>/standby.signal` was present
@@ -74,6 +76,16 @@ type OpenOptions struct {
 	// cmd/goopg start sets this from the GUC; tests typically
 	// leave it false.
 	WALInitZero bool
+
+	// AIO* control the AIO engine the storage manager (and
+	// future heap-scan / checkpointer / WAL-writer callers)
+	// will use. Maps to the upstream-aligned `io_method`,
+	// `io_workers`, and `io_max_concurrency` GUCs. When
+	// AIOMethod is empty, no engine is attached and the
+	// synchronous code paths run unchanged.
+	AIOMethod         string
+	AIOWorkers        int
+	AIOMaxConcurrency int
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -105,6 +117,27 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DataDir:   abs,
 		AlignedIO: opts.AlignedIO,
 	})
+
+	// AIO engine: optional. With opts.AIOMethod=="" no engine is
+	// constructed and storage Manager.PrefetchBlock falls back to
+	// synchronous reads. When set we adapt the engine through a
+	// thin shim so internal/storage doesn't have to import
+	// internal/aio (the aio package would otherwise need to know
+	// about storage.RelFileNode types).
+	var aioEngine *aio.Engine
+	if opts.AIOMethod != "" {
+		eng, err := aio.NewEngine(aio.EngineConfig{
+			Method:         opts.AIOMethod,
+			Workers:        opts.AIOWorkers,
+			MaxConcurrency: opts.AIOMaxConcurrency,
+		})
+		if err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: aio: %w", err)
+		}
+		aioEngine = eng
+		mgr.SetAIO(aioEngineAdapter{eng: eng})
+	}
 
 	// Crash recovery: replay any WAL records past the last
 	// checkpoint into the data files BEFORE the buffer pool comes
@@ -353,9 +386,61 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WalReceivers:   walReceivers,
 		WalSubscribers: walSubscribers,
 		PubSub:         pubsub,
+		AIO:            aioEngine,
 		DataDir:        abs,
 		Standby:        standby,
 	}, nil
+}
+
+// aioEngineAdapter bridges *aio.Engine to storage.AIOEngine.
+// Lives here because internal/storage cannot import internal/aio
+// (and shouldn't — keeping storage AIO-agnostic at the type level
+// lets tests substitute fake engines without dragging the whole
+// package graph along).
+type aioEngineAdapter struct {
+	eng *aio.Engine
+}
+
+// Submit fans the storage-shaped op out to the aio engine.
+// The returned aio.*Handle satisfies storage.AIOHandle by
+// adapting Wait through aioHandleAdapter.
+func (a aioEngineAdapter) Submit(op storage.AIOSubmitOp) storage.AIOHandle {
+	return aioHandleAdapter{
+		h: a.eng.Submit(aio.Op{
+			File:      aioFileAdapter{f: op.File},
+			Buffer:    op.Buffer,
+			Offset:    op.Offset,
+			Direction: aio.DirRead,
+		}),
+	}
+}
+
+// aioFileAdapter exposes a storage.AIOFile (ReadAt-only) to the
+// aio engine, which expects a full aio.File (ReadAt + WriteAt).
+// PrefetchBlock is read-only, so WriteAt is a panic in case the
+// engine's contract grows to call it for non-DirRead Ops — that
+// would be a bug, not graceful fallback.
+type aioFileAdapter struct {
+	f storage.AIOFile
+}
+
+func (a aioFileAdapter) ReadAt(p []byte, off int64) (int, error) {
+	return a.f.ReadAt(p, off)
+}
+
+func (a aioFileAdapter) WriteAt(_ []byte, _ int64) (int, error) {
+	panic("initdb: aioFileAdapter.WriteAt called on a read-only handle")
+}
+
+// aioHandleAdapter unwraps the aio.Result struct into the
+// (n, err) pair storage.AIOHandle exposes.
+type aioHandleAdapter struct {
+	h *aio.Handle
+}
+
+func (a aioHandleAdapter) Wait() (int, error) {
+	r := a.h.Wait()
+	return r.N, r.Err
 }
 
 // registerStatCheckpointerView installs the
@@ -496,6 +581,16 @@ func (r *Runtime) Close() error {
 			firstErr = err
 		}
 		r.StorageMgr = nil
+	}
+	if r.AIO != nil {
+		// Close after the storage manager so any AIO handles
+		// the manager held drain cleanly. The engine's own
+		// Close is idempotent and waits for worker goroutines
+		// to join before returning.
+		if err := r.AIO.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.AIO = nil
 	}
 	return firstErr
 }

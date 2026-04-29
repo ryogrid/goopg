@@ -2990,14 +2990,73 @@ See `docs/milestones/0009-aio-subsystem.md`.
       Design doc `docs/design/0009-0002-read-stream.md`
       added and indexed in `docs/design/README.md`.)
 
-- [ ] AIO caller integrations: sequential heap scan and
-      bitmap heap scan use the read stream as their
-      page-fetch path; checkpointer dirty-page writeback
-      submits writes through the AIO core; WAL writer's
-      per-segment writeback path can submit writes
-      through the AIO core (commit-path durability
-      barrier `fdatasync` per M0007 remains synchronous).
-      Design doc `0009-0003-aio-checkpointer-and-wal.md`.
+- [x] AIO engine lifecycle + storage integration
+      substrate. (landed 2026-04-29:
+      `internal/storage/smgr.go` ships
+      `storage.AIOEngine` (narrow `Submit(AIOSubmitOp)
+      AIOHandle` interface keeping internal/storage free
+      of an internal/aio import) plus
+      `storage.AIOSubmitOp{File AIOFile, Buffer, Offset}`
+      and `storage.AIOFile` (ReadAt-only — prefetch never
+      writes). `Manager.SetAIO(eng)` attaches the engine,
+      `Manager.PrefetchBlock(rel, blk, buf) (AIOHandle,
+      error)` submits via the engine when set and falls
+      back to a `preCompletedHandle{n, err}` (Wait never
+      blocks) when not — caller Submit/Wait path is
+      identical regardless. `relFile.ReadAt` makes
+      relfiles satisfy `AIOFile`; the per-relfile mutex is
+      shared between Pin/Read paths so PrefetchBlock
+      doesn't race the *os.File cursor. Out-of-range
+      blocks return a pre-completed handle whose Wait
+      surfaces ErrShortRead — matches ReadBlock. Engine
+      lifecycle wired via three new `OpenOptions` fields
+      (AIOMethod / AIOWorkers / AIOMaxConcurrency); when
+      set, `initdb.Open` calls `aio.NewEngine`, surfaces
+      it on `Runtime.AIO`, attaches it to the storage
+      manager, and closes it AFTER the storage manager in
+      `Runtime.Close()` so in-flight prefetches drain.
+      Engine adapter (`aioEngineAdapter` /
+      `aioFileAdapter` / `aioHandleAdapter`) lives in
+      initdb so internal/storage stays import-free of
+      internal/aio; the file adapter's WriteAt panics
+      because PrefetchBlock is read-only — any DirWrite
+      flowing through would be a contract violation, not
+      graceful fallback. `cmd/goopg start` reads
+      `io_method` / `io_workers` / `io_max_concurrency`
+      from the registry via two new helpers
+      (`stringGUC` / `intGUC`); `io_uring` is silently
+      downgraded to `worker` with a warn-level
+      `event=aio_method_fallback` log line until the
+      runtime probe lands. Tests in storage:
+      TestPrefetchBlockSyncFallback (no engine — pre-
+      completed handle returns read bytes),
+      TestPrefetchBlockUsesAttachedEngine (recording
+      engine sees the right offset, bytes round-trip),
+      TestPrefetchBlockOutOfRange (ErrShortRead surface).
+      Tests in initdb: TestOpenAttachesAIOEngineWhenMethodSet,
+      TestOpenLeavesAIONilWithoutMethod. Built and full
+      `go test ./...` green. Design doc
+      `docs/design/0009-0003-aio-storage-integration.md`
+      added and indexed; milestone-required
+      `0009-0003-aio-checkpointer-and-wal.md` and
+      `0009-0004-aio-observability.md` renumber to
+      `0009-0004` and `0009-0005` respectively when they
+      land — recorded in the new doc's "Numbering note"
+      section.)
+
+- [ ] AIO heap-scan / bitmap-heap-scan caller integration:
+      sequential heap scan and bitmap heap scan use the
+      read stream as their page-fetch path; `Pool.Prefetch(tag)`
+      hook invokes `Manager.PrefetchBlock` so cache-warming
+      becomes observable mid-scan.
+
+- [ ] AIO checkpointer + WAL writer caller integration:
+      checkpointer dirty-page writeback submits writes
+      through the AIO core; WAL writer's per-segment
+      writeback path can submit writes through the AIO
+      core (commit-path durability barrier `fdatasync` per
+      M0007 remains synchronous). Design doc
+      `0009-0004-aio-checkpointer-and-wal.md`.
 
 - [ ] AIO observability: `pg_aios` virtual view (in-flight
       I/Os: backend, target file, offset, length,
@@ -3005,7 +3064,7 @@ See `docs/milestones/0009-aio-subsystem.md`.
       pg_stat_* surfaces; wait events for "waiting on AIO
       completion"; startup log line indicating chosen
       method, probe result, worker-pool size, in-flight
-      caps. Design doc `0009-0004-aio-observability.md`.
+      caps. Design doc `0009-0005-aio-observability.md`.
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 

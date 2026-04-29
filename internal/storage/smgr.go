@@ -20,11 +20,47 @@ import (
 // satisfy the alignment requirement.
 //
 // The Manager is goroutine-safe.
+// AIOEngine is the optional AIO seam. When attached via
+// SetAIO, PrefetchBlock submits reads through it so callers
+// (read-stream-driven heap scans, ANALYZE sample reads,
+// vacuum's free-space-map walk) can pipeline I/O without
+// blocking the consumer. Defined here as a narrow interface
+// to avoid the storage→aio import (the engine would then
+// pull aio.File semantics into bufpool, which already
+// imports storage).
+type AIOEngine interface {
+	Submit(op AIOSubmitOp) AIOHandle
+}
+
+// AIOSubmitOp mirrors aio.Op's read-shaped subset: AIO writes
+// don't go through the storage Manager (the WAL writer and
+// the checkpointer own their own write paths). Keeping this
+// type local keeps storage independent of internal/aio.
+type AIOSubmitOp struct {
+	File   AIOFile
+	Buffer []byte
+	Offset int64
+}
+
+// AIOFile is the engine's view of the underlying *os.File.
+// Mirrors io.ReaderAt; storage's relFile satisfies it.
+type AIOFile interface {
+	ReadAt(p []byte, off int64) (int, error)
+}
+
+// AIOHandle is the engine's completion handle. Wait blocks
+// until the I/O lands.
+type AIOHandle interface {
+	Wait() (n int, err error)
+}
+
 type Manager struct {
 	cfg ManagerConfig
 
 	mu    sync.Mutex
 	files map[RelFileNode]*relFile
+
+	aio AIOEngine
 }
 
 // ManagerConfig controls how files are opened.
@@ -62,6 +98,69 @@ func (m *Manager) Close() error {
 	m.files = nil
 	return firstErr
 }
+
+// SetAIO attaches an AIO engine to the manager. PrefetchBlock
+// submits through it. nil clears any previously-set engine
+// (PrefetchBlock then falls back to a synchronous read).
+// Idempotent; safe to call before or after the first ReadBlock.
+func (m *Manager) SetAIO(eng AIOEngine) {
+	m.mu.Lock()
+	m.aio = eng
+	m.mu.Unlock()
+}
+
+// PrefetchBlock submits a read of block #blk into buf and
+// returns an AIOHandle the caller Waits on. With an engine
+// attached the read happens off the calling goroutine; without
+// one, the read runs synchronously and the returned handle's
+// Wait is already complete. buf must be exactly BlockSize
+// bytes.
+//
+// PrefetchBlock does NOT track buf-aliasing across the lifetime
+// of the handle: the caller MUST keep buf alive until Wait
+// returns. Mirrors the aio.Op contract.
+//
+// Out-of-range blocks return an already-complete handle whose
+// Wait surfaces ErrShortRead, matching ReadBlock's behaviour.
+func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (AIOHandle, error) {
+	if len(buf) != BlockSize {
+		return nil, fmt.Errorf("PrefetchBlock: buf is %d bytes, want %d", len(buf), BlockSize)
+	}
+	f, err := m.relFile(rel)
+	if err != nil {
+		return nil, err
+	}
+	if blk >= f.nblocks {
+		return preCompletedHandle{err: ErrShortRead}, nil
+	}
+	off := int64(blk) * BlockSize
+
+	m.mu.Lock()
+	eng := m.aio
+	m.mu.Unlock()
+	if eng == nil {
+		// Synchronous fallback: run the read inline and hand
+		// back a pre-completed handle. Keeps callers'
+		// Submit/Wait code path identical regardless of
+		// whether the engine is attached.
+		err := f.readBlock(blk, buf)
+		var n int
+		if err == nil {
+			n = BlockSize
+		}
+		return preCompletedHandle{n: n, err: err}, nil
+	}
+	return eng.Submit(AIOSubmitOp{File: f, Buffer: buf, Offset: off}), nil
+}
+
+// preCompletedHandle is the AIOHandle a synchronous-fallback
+// PrefetchBlock returns. Wait never blocks.
+type preCompletedHandle struct {
+	n   int
+	err error
+}
+
+func (h preCompletedHandle) Wait() (int, error) { return h.n, h.err }
 
 // ReadBlock reads block #blk of rel into buf. buf must be exactly
 // BlockSize bytes. Returns ErrShortRead if the file ends before the
@@ -213,6 +312,17 @@ type relFile struct {
 	f       *os.File
 	path    string
 	nblocks BlockNumber
+}
+
+// ReadAt is the engine-facing offset-shaped read. The relFile
+// itself satisfies storage.AIOFile this way so the engine can
+// submit reads against it without smgr exposing *os.File.
+// Mirrors os.File.ReadAt's contract: short reads at end-of-
+// file surface io.EOF.
+func (r *relFile) ReadAt(p []byte, off int64) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.f.ReadAt(p, off)
 }
 
 func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {

@@ -181,11 +181,26 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
+		aioMethod := stringGUC(registry, "io_method", "")
+		// io_uring isn't implemented yet; fall back to worker
+		// silently rather than fail server start. When the
+		// io_uring method lands, this guard moves into the
+		// engine's runtime probe.
+		if aioMethod == "io_uring" {
+			logger.Warn("io_method=io_uring requested but not yet implemented; falling back to worker",
+				"event", "aio_method_fallback")
+			aioMethod = "worker"
+		}
+		aioWorkers := intGUC(registry, "io_workers", 0)
+		aioMax := intGUC(registry, "io_max_concurrency", 0)
 		var err error
 		rt, err = initdb.Open(initdb.OpenOptions{
-			DataDir:     *dataDir,
-			PoolSlots:   poolSlots,
-			WALInitZero: walInitZero,
+			DataDir:           *dataDir,
+			PoolSlots:         poolSlots,
+			WALInitZero:       walInitZero,
+			AIOMethod:         aioMethod,
+			AIOWorkers:        aioWorkers,
+			AIOMaxConcurrency: aioMax,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
@@ -522,6 +537,41 @@ func boolGUC(registry *config.Registry, name string, fallback bool) bool {
 		return false
 	}
 	return fallback
+}
+
+// stringGUC reads a string-shaped GUC by name, returning fallback
+// when the registry is nil, the variable isn't registered, or its
+// Display value is empty.
+func stringGUC(registry *config.Registry, name string, fallback string) string {
+	if registry == nil {
+		return fallback
+	}
+	v, ok := registry.Get(name)
+	if !ok {
+		return fallback
+	}
+	if d := strings.TrimSpace(v.Display()); d != "" {
+		return d
+	}
+	return fallback
+}
+
+// intGUC reads an int-shaped GUC by name, returning fallback when
+// the registry is nil, the variable isn't registered, or its
+// Display value isn't a valid integer.
+func intGUC(registry *config.Registry, name string, fallback int) int {
+	if registry == nil {
+		return fallback
+	}
+	v, ok := registry.Get(name)
+	if !ok {
+		return fallback
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v.Display()))
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 // poolSlotsFromGUC reads the shared_buffers GUC (canonical KB) and

@@ -308,3 +308,48 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 		t.Errorf("WAL stream missing XactAbort for xid=%d", tx2.XID)
 	}
 }
+
+// TestOpenAttachesAIOEngineWhenMethodSet pins the engine
+// lifecycle wiring: passing AIOMethod constructs an aio.Engine,
+// surfaces it on Runtime.AIO, and Close tears it down. Empty
+// AIOMethod leaves Runtime.AIO nil so the synchronous code
+// paths are unchanged.
+func TestOpenAttachesAIOEngineWhenMethodSet(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Open(OpenOptions{
+		DataDir:    dir,
+		PoolSlots:  4,
+		AIOMethod:  "sync",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	if rt.AIO == nil {
+		t.Fatal("Runtime.AIO is nil despite AIOMethod=sync")
+	}
+	if got := rt.AIO.Method(); got != "sync" {
+		t.Errorf("engine method=%q want sync", got)
+	}
+}
+
+// TestOpenLeavesAIONilWithoutMethod: with no AIOMethod, no
+// engine is constructed and the existing synchronous storage
+// paths run unchanged.
+func TestOpenLeavesAIONilWithoutMethod(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	if rt.AIO != nil {
+		t.Errorf("Runtime.AIO=%v want nil (no AIOMethod)", rt.AIO.Method())
+	}
+}

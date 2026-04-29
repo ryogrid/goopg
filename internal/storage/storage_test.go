@@ -523,3 +523,127 @@ func TestPoolEvictionReturnsWALFlushError(t *testing.T) {
 		t.Fatalf("error = %v, want WAL flush context", err)
 	}
 }
+
+// recordingAIOEngine is a fake AIOEngine that captures every
+// Submit so a test can assert the storage Manager actually
+// flowed reads through the engine when one is attached.
+type recordingAIOEngine struct {
+	submits []AIOSubmitOp
+}
+
+func (r *recordingAIOEngine) Submit(op AIOSubmitOp) AIOHandle {
+	r.submits = append(r.submits, op)
+	n, err := op.File.ReadAt(op.Buffer, op.Offset)
+	return recordingAIOHandle{n: n, err: err}
+}
+
+type recordingAIOHandle struct {
+	n   int
+	err error
+}
+
+func (h recordingAIOHandle) Wait() (int, error) { return h.n, h.err }
+
+// TestPrefetchBlockSyncFallback pins the no-engine path: with
+// no AIO engine attached, PrefetchBlock returns a pre-completed
+// handle whose Wait yields the just-read bytes synchronously.
+// This is the substrate's "preserve existing behaviour" guard.
+func TestPrefetchBlockSyncFallback(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17000, Fork: MainFork}
+
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	page[64] = 0xAA
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(Page, BlockSize)
+	h, err := mgr.PrefetchBlock(rel, 0, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, werr := h.Wait()
+	if werr != nil {
+		t.Fatalf("Wait err=%v", werr)
+	}
+	if n != BlockSize {
+		t.Errorf("Wait n=%d want %d", n, BlockSize)
+	}
+	if got[64] != 0xAA {
+		t.Errorf("byte 64 = %#x want 0xAA", got[64])
+	}
+}
+
+// TestPrefetchBlockUsesAttachedEngine pins the engine path:
+// once SetAIO is called, every PrefetchBlock submits through
+// the engine. Asserts the engine sees the right offset and
+// the read still round-trips bytes.
+func TestPrefetchBlockUsesAttachedEngine(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17001, Fork: MainFork}
+
+	// Two pages so PrefetchBlock(blk=1) lands at offset BlockSize.
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	page[100] = 0xCD
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+	page[100] = 0xEF
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := &recordingAIOEngine{}
+	mgr.SetAIO(eng)
+
+	got := make(Page, BlockSize)
+	h, err := mgr.PrefetchBlock(rel, 1, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, werr := h.Wait()
+	if werr != nil || n != BlockSize {
+		t.Fatalf("Wait n=%d err=%v", n, werr)
+	}
+	if got[100] != 0xEF {
+		t.Errorf("byte 100 = %#x want 0xEF", got[100])
+	}
+	if len(eng.submits) != 1 {
+		t.Fatalf("engine saw %d submits, want 1", len(eng.submits))
+	}
+	if off := eng.submits[0].Offset; off != BlockSize {
+		t.Errorf("submit offset=%d want %d", off, BlockSize)
+	}
+}
+
+// TestPrefetchBlockOutOfRange: a prefetch past EOF returns an
+// already-complete handle whose Wait surfaces ErrShortRead —
+// matches ReadBlock's behaviour.
+func TestPrefetchBlockOutOfRange(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17002, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := mgr.PrefetchBlock(rel, 5, make(Page, BlockSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := h.Wait(); !errors.Is(werr, ErrShortRead) {
+		t.Errorf("Wait err=%v want ErrShortRead", werr)
+	}
+}
