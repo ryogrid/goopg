@@ -457,6 +457,54 @@ func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
 	}
 }
 
+// TestApplyWorkerStatHandleAdvancesOnCommit pins the
+// pg_stat_subscription wiring: every ApplyMessage stamps the
+// Subscriber's last_msg_*_time via MarkMessage; every commit
+// advances received_lsn to the commit LSN. Confirms the
+// observability seam reflects the apply loop's actual progress.
+func TestApplyWorkerStatHandleAdvancesOnCommit(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	rel := pubCat.RelFileNode(pubTbl)
+
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+
+	subs := wal.NewSubscribers()
+	statHandle := subs.Register(wal.SubscriberState{
+		SubID:      99,
+		SubName:    "sub_stat",
+		WorkerType: wal.SubscriberWorkerLeader,
+		PID:        7777,
+	})
+	defer subs.Unregister(statHandle)
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	w.SetStatHandle(statHandle)
+	defer w.SafeRollback()
+
+	stream := pgoutputBIRC(t, snap, rel, 1, "obs", 0xC0FFEE)
+	driveStream(t, w, stream)
+
+	got := subs.Snapshot()[0]
+	if got.ReceivedLSN != 0xC0FFEE {
+		t.Errorf("received_lsn=%x want 0xC0FFEE (commit LSN must flow into stat handle)", got.ReceivedLSN)
+	}
+	// MarkMessage stamps last_msg_*_time on every frame; a
+	// post-Begin/post-Commit timestamp must be after the
+	// pre-Apply zero default.
+	if got.LastMsgReceiptTime.IsZero() {
+		t.Errorf("LastMsgReceiptTime is zero; ApplyMessage should have stamped it via MarkMessage")
+	}
+	// The B/C messages carry an EndLSN of 0xC0FFEE; that should
+	// have flowed into latest_end_lsn.
+	if got.LatestEndLSN != 0xC0FFEE {
+		t.Errorf("latest_end_lsn=%x want 0xC0FFEE", got.LatestEndLSN)
+	}
+}
+
 // TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS:
 // when a commit's LSN is below a subscription_rel's recorded
 // end-LSN, the rel stays at 's' (still waiting for the apply

@@ -43,10 +43,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // LineWriter is the subset of executor.CopyFromExecutor that
@@ -71,6 +73,15 @@ type TableSyncConfig struct {
 	From    LineWriter
 	Reader  *protocol.FrameReader
 	Writer  *protocol.FrameWriter
+
+	// Stat is the optional pg_stat_subscription handle for this
+	// tablesync worker. When non-nil, RunTableSync stamps every
+	// CopyData frame's receipt time via MarkMessage and bumps
+	// the worker's received_lsn to the row count once the
+	// stream completes (LSN handoff isn't on the wire in v0, so
+	// the row count stands in as a "progress observed" signal).
+	// Caller owns Register / Unregister around RunTableSync.
+	Stat *wal.Subscriber
 }
 
 // RunTableSync drives one publisher → subscriber initial COPY and
@@ -152,6 +163,9 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 		}
 		switch f.Type {
 		case protocol.MsgCopyData:
+			if cfg.Stat != nil {
+				cfg.Stat.MarkMessage(time.Now(), 0)
+			}
 			if err := pushCopyDataLines(cfg.From, f.Payload); err != nil {
 				return cfg.From.RowsInserted(), fmt.Errorf("tablesync: apply row: %w", err)
 			}

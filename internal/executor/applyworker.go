@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -70,6 +71,14 @@ type ApplyWorker struct {
 	// path that existing tests depend on.
 	pubsub  *catalog.PubSub
 	subName string
+
+	// stat is the pg_stat_subscription handle for this worker.
+	// When non-nil, every ApplyMessage records the receipt
+	// timestamp + the message's reported end LSN, and every
+	// commit advances the worker's received_lsn to the commit
+	// LSN. Nil disables observability — the legacy path used by
+	// existing tests.
+	stat *wal.Subscriber
 }
 
 // applyRel pairs a remote Relation message with its resolved
@@ -103,6 +112,16 @@ func (w *ApplyWorker) SetSubscriptionContext(ps *catalog.PubSub, subName string)
 	w.subName = subName
 }
 
+// SetStatHandle attaches a pg_stat_subscription handle to this
+// worker. When set, every ApplyMessage records receipt
+// timestamp + reported end LSN via MarkMessage, and every
+// commit advances received_lsn via AdvanceReceivedLSN. Nil
+// disables observability. Caller owns the handle's lifecycle
+// (Register before, Unregister after the apply loop). Idempotent.
+func (w *ApplyWorker) SetStatHandle(sub *wal.Subscriber) {
+	w.stat = sub
+}
+
 // ApplyMessage handles one decoded pgoutput event. The second
 // return value is non-zero only for `C` (commit) messages — it
 // carries the remote commit LSN so the caller can advance the
@@ -111,6 +130,12 @@ func (w *ApplyWorker) SetSubscriptionContext(ps *catalog.PubSub, subName string)
 func (w *ApplyWorker) ApplyMessage(m *wal.DecodedMessage) (uint64, error) {
 	if m == nil {
 		return 0, errors.New("applyworker: nil message")
+	}
+	if w.stat != nil {
+		// Record this frame's arrival timestamp. EndLSN comes from
+		// the publisher's reported end-of-WAL on B/C messages
+		// (zero on R/I/D, which leaves latest_end_lsn untouched).
+		w.stat.MarkMessage(time.Now(), m.EndLSN)
 	}
 	switch m.Kind {
 	case 'B':
@@ -229,6 +254,9 @@ func (w *ApplyWorker) applyCommit(m *wal.DecodedMessage) error {
 	// commit-only sequences when every change was filtered.
 	// Falls through to the tablesync promotion check below.)
 	w.promoteSyncedRels(m.CommitLSN)
+	if w.stat != nil {
+		w.stat.AdvanceReceivedLSN(m.CommitLSN)
+	}
 	return nil
 }
 

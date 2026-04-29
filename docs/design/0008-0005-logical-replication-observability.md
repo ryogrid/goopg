@@ -132,15 +132,48 @@ slice below has a public seam to register against.
   state; `latest_end_*` stay blank until marked; rows vanish on
   Unregister.
 
+## Apply-worker / tablesync hookup
+
+The apply-worker side and the tablesync transport both have
+opt-in seams that flow into the registry:
+
+```
+// internal/executor/applyworker.go
+func (w *ApplyWorker) SetStatHandle(sub *wal.Subscriber)
+   // ApplyMessage → MarkMessage(time.Now(), m.EndLSN)
+   // applyCommit → AdvanceReceivedLSN(m.CommitLSN)
+
+// internal/server/tablesync.go
+type TableSyncConfig struct { ...; Stat *wal.Subscriber }
+   // CopyData frame → MarkMessage(time.Now(), 0)
+
+// internal/server/tablesync_manager.go
+type TableSyncManagerConfig struct { ...
+    OpenStat func(ctx, relOID) (*StatPair, error)
+}
+   // Per visited rel: Register → run sync → Close (always).
+```
+
+Caller owns lifecycle: `Register` before the apply loop / sync
+exchange, `Unregister` after. The manager guarantees `Close` on
+the `StatPair` even when the per-rel sync fails so the registry
+never accrues stale tablesync rows. Nil handles disable
+observability — the legacy path used by existing tests.
+
+For the leader apply loop, `MarkMessage`'s `endLSN` argument
+is wired to the decoded message's `EndLSN`. v0 pgoutput sets
+`EndLSN` on `B` (begin) and `C` (commit) messages and zero on
+`R`/`I`/`D`, so `latest_end_lsn` lands once per transaction
+boundary and `last_msg_*_time` lands on every frame.
+
+For tablesync workers, the simple-COPY transport doesn't carry
+a per-frame LSN, so `MarkMessage`'s `endLSN` is zero — the
+freshness signal is purely the timestamp pair, which is enough
+for an operator monitoring "is this tablesync worker still
+making progress?".
+
 ## What this slice doesn't deliver
 
-- **Apply-worker / tablesync-manager hookup.** `ApplyWorker`
-  and `RunTableSyncManager` don't yet `Register` into the
-  registry. The plumbing is straightforward (call `Register`
-  on entry, `defer Unregister`, `AdvanceReceivedLSN` after
-  every applyCommit, `MarkMessage` after every received frame)
-  but is split into the next slice so the observability
-  surface lands as one reviewable change.
 - **Structured replication-event logging.** A `wal.ReplicationLogger`
   interface with hooks for slot-create/drop, walsender
   start/stop, walreceiver start/stop, applyCommit,

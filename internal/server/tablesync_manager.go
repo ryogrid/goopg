@@ -34,6 +34,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // ConnPair bundles the framed I/O for one publisher connection
@@ -52,6 +53,15 @@ type ConnPair struct {
 type WriterPair struct {
 	Writer LineWriter
 	Close  func() error
+}
+
+// StatPair bundles a per-rel pg_stat_subscription handle plus a
+// closer. The manager calls Close (typically `subs.Unregister`)
+// after each rel's RunTableSync completes — even on error — so
+// the registry never accrues stale tablesync rows.
+type StatPair struct {
+	Stat  *wal.Subscriber
+	Close func() error
 }
 
 // TableSyncManagerConfig parameterises one manager run.
@@ -81,6 +91,16 @@ type TableSyncManagerConfig struct {
 	// table identified by relOID. The manager guarantees Close
 	// is called before moving on.
 	OpenWriter func(ctx context.Context, relOID uint32) (*WriterPair, error)
+
+	// OpenStat is the optional pg_stat_subscription factory.
+	// When set, the manager calls it once per visited rel to
+	// register a tablesync worker into the *wal.Subscribers
+	// registry; the returned handle flows into RunTableSync's
+	// Stat field so the per-frame MarkMessage updates land. The
+	// manager always calls Close on the returned StatPair (even
+	// when sync errors) so the registry never accrues stale
+	// rows. Nil disables observability — useful for tests.
+	OpenStat func(ctx context.Context, relOID uint32) (*StatPair, error)
 }
 
 // TableSyncResult records what happened for one (subscription,
@@ -169,6 +189,23 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		}
 	}()
 
+	var statHandle *wal.Subscriber
+	if cfg.OpenStat != nil {
+		stat, err := cfg.OpenStat(ctx, relOID)
+		if err != nil {
+			res.Err = fmt.Errorf("tablesync_manager: open stat for rel %d (%s): %w", relOID, relname, err)
+			return res
+		}
+		if stat != nil {
+			statHandle = stat.Stat
+			defer func() {
+				if stat.Close != nil {
+					_ = stat.Close()
+				}
+			}()
+		}
+	}
+
 	rows, err := RunTableSync(TableSyncConfig{
 		PubSub:  cfg.PubSub,
 		SubName: cfg.SubName,
@@ -177,6 +214,7 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		From:    writer.Writer,
 		Reader:  conn.Reader,
 		Writer:  conn.Writer,
+		Stat:    statHandle,
 	})
 	res.Rows = rows
 	if err != nil {

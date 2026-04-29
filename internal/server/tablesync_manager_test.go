@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // fakePublisherConn returns a ConnPair backed by an in-memory
@@ -236,6 +237,146 @@ func TestRunTableSyncManagerUnresolvedRelnameSkips(t *testing.T) {
 	got, _ := ps.LookupSubscriptionRel("sub1", 42)
 	if got.State != catalog.SubRelStateInit {
 		t.Errorf("state=%q want i (no advance on resolve failure)", got.State)
+	}
+}
+
+// TestRunTableSyncManagerRegistersStatHandle: when OpenStat is
+// supplied, each visited rel gets a *wal.Subscriber registered
+// (visible in subs.Snapshot during sync, absent after). The
+// CopyData frames flowing through RunTableSync stamp the
+// per-rel last_msg_receipt_time so an operator selecting
+// pg_stat_subscription mid-sync sees freshness.
+func TestRunTableSyncManagerRegistersStatHandle(t *testing.T) {
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("sub1", 16400); err != nil {
+		t.Fatal(err)
+	}
+
+	subs := wal.NewSubscribers()
+	// Capture the snapshot mid-sync via a probe inside the
+	// LineWriter — at PushLine time the registry must show one
+	// active tablesync row.
+	var midSnapshot []wal.SubscriberState
+	probe := &probingLineWriter{onPush: func() { midSnapshot = subs.Snapshot() }}
+
+	results, err := RunTableSyncManager(context.Background(), TableSyncManagerConfig{
+		PubSub:     ps,
+		SubName:    "sub1",
+		ResolveRel: func(_ uint32) (string, bool) { return "public.t", true },
+		OpenConn: func(_ context.Context, _ uint32) (*ConnPair, error) {
+			return fakePublisherConn(t, []string{"1\trow"}), nil
+		},
+		OpenWriter: func(_ context.Context, _ uint32) (*WriterPair, error) {
+			return &WriterPair{Writer: probe, Close: func() error { return nil }}, nil
+		},
+		OpenStat: func(_ context.Context, relOID uint32) (*StatPair, error) {
+			h := subs.Register(wal.SubscriberState{
+				SubID:      42,
+				SubName:    "sub1",
+				WorkerType: wal.SubscriberWorkerTablesync,
+				PID:        9000,
+				LeaderPID:  1000,
+				RelOID:     relOID,
+			})
+			return &StatPair{Stat: h, Close: func() error { subs.Unregister(h); return nil }}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("RunTableSyncManager: %v", err)
+	}
+	if len(results) != 1 || results[0].Err != nil {
+		t.Fatalf("results=%+v want 1 success", results)
+	}
+	if len(midSnapshot) != 1 {
+		t.Fatalf("mid-sync registry len=%d want 1 tablesync row", len(midSnapshot))
+	}
+	if midSnapshot[0].RelOID != 16400 {
+		t.Errorf("mid-sync rel=%d want 16400", midSnapshot[0].RelOID)
+	}
+	if midSnapshot[0].WorkerType != wal.SubscriberWorkerTablesync {
+		t.Errorf("mid-sync worker_type=%q want tablesync", midSnapshot[0].WorkerType)
+	}
+	// MarkMessage in RunTableSync should have stamped
+	// last_msg_receipt_time during the CopyData frame.
+	if midSnapshot[0].LastMsgReceiptTime.IsZero() {
+		t.Errorf("mid-sync LastMsgReceiptTime is zero; CopyData frames should stamp it")
+	}
+	// After the manager closes the StatPair, the entry must
+	// vanish so the registry never accrues stale tablesync rows.
+	if got := subs.Snapshot(); len(got) != 0 {
+		t.Errorf("post-sync registry=%+v want empty (manager must Close StatPair)", got)
+	}
+}
+
+// probingLineWriter wraps recordingLineWriter with a callback
+// that fires at PushLine entry — used by tests that need to
+// observe registry/state in mid-sync, not just before/after.
+type probingLineWriter struct {
+	rec    recordingLineWriter
+	onPush func()
+}
+
+func (p *probingLineWriter) PushLine(line []byte) error {
+	if p.onPush != nil {
+		p.onPush()
+	}
+	return p.rec.PushLine(line)
+}
+
+func (p *probingLineWriter) RowsInserted() int64 { return p.rec.RowsInserted() }
+
+// TestRunTableSyncManagerStatClosedOnFailure: when the per-rel
+// sync fails, the StatPair's Close still runs so the registry
+// doesn't accrue zombie rows.
+func TestRunTableSyncManagerStatClosedOnFailure(t *testing.T) {
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("sub1", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	subs := wal.NewSubscribers()
+	results, err := RunTableSyncManager(context.Background(), TableSyncManagerConfig{
+		PubSub:     ps,
+		SubName:    "sub1",
+		ResolveRel: func(_ uint32) (string, bool) { return "t", true },
+		OpenConn: func(_ context.Context, _ uint32) (*ConnPair, error) {
+			// Force RunTableSync to fail by returning an
+			// out-of-shape publisher response (RowDescription
+			// before CopyOutResponse — TableSync rejects this).
+			var pubOut bytes.Buffer
+			w := protocol.NewFrameWriter(&pubOut)
+			w.WriteRowDescription(nil)
+			w.Flush()
+			return &ConnPair{
+				Reader: protocol.NewFrameReader(bytes.NewReader(pubOut.Bytes())),
+				Writer: protocol.NewFrameWriter(&bytes.Buffer{}),
+				Close:  func() error { return nil },
+			}, nil
+		},
+		OpenWriter: func(_ context.Context, _ uint32) (*WriterPair, error) {
+			return fakeWriterPair(&recordingLineWriter{}), nil
+		},
+		OpenStat: func(_ context.Context, relOID uint32) (*StatPair, error) {
+			h := subs.Register(wal.SubscriberState{
+				SubName: "sub1", WorkerType: wal.SubscriberWorkerTablesync, RelOID: relOID,
+			})
+			return &StatPair{Stat: h, Close: func() error { subs.Unregister(h); return nil }}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("manager err=%v", err)
+	}
+	if len(results) != 1 || results[0].Err == nil {
+		t.Fatalf("results=%+v want one failed entry", results)
+	}
+	if got := subs.Snapshot(); len(got) != 0 {
+		t.Errorf("registry=%+v want empty after failed sync (StatPair.Close must still run)", got)
 	}
 }
 

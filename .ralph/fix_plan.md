@@ -2777,14 +2777,44 @@ item.
       the existing publisher-side walsender registry — no
       additional work needed there.)
 
-- [ ] Logical-replication observability — apply-worker /
-      tablesync-manager hookup. ApplyWorker and
-      RunTableSyncManager don't yet `Register` into the
-      `Subscribers` registry. Plumbing: `Register` on entry,
-      `defer Unregister`, `AdvanceReceivedLSN` after each
-      applyCommit, `MarkMessage` after each received frame.
-      Mirrors the existing walsender wiring on the publisher
-      side.
+- [x] Logical-replication observability — apply-worker /
+      tablesync-manager hookup. (landed 2026-04-29:
+      `executor.ApplyWorker` gained `SetStatHandle(*wal.Subscriber)`;
+      when set, `ApplyMessage` calls `MarkMessage(time.Now(),
+      m.EndLSN)` on every frame (so `last_msg_send_time` /
+      `last_msg_receipt_time` / `latest_end_lsn` /
+      `latest_end_time` move forward in lock-step with the
+      publisher's stream) and `applyCommit` calls
+      `AdvanceReceivedLSN(m.CommitLSN)` so `received_lsn`
+      reflects the highest committed LSN. Caller owns the
+      `Register`/`Unregister` lifecycle. `server.TableSyncConfig`
+      gained an optional `Stat *wal.Subscriber`; when set,
+      `RunTableSync` calls `MarkMessage(time.Now(), 0)` on
+      every CopyData frame so an operator selecting
+      pg_stat_subscription mid-sync sees freshness. The
+      manager (`RunTableSyncManager`) gained an optional
+      `OpenStat(ctx, relOID) → *StatPair{Stat, Close}`
+      callback that lets the caller register a tablesync
+      worker per visited rel; the manager always invokes
+      `Close` (typically `subs.Unregister`) — including on
+      failure — so the registry never accrues stale rows.
+      Plumbing is opt-in (nil disables observability),
+      preserving the legacy "apply everything, no
+      visibility" path that existing tests rely on. Tests:
+      TestApplyWorkerStatHandleAdvancesOnCommit (commit
+      LSN flows into received_lsn; B/C EndLSN flows into
+      latest_end_lsn; LastMsgReceiptTime non-zero after
+      first ApplyMessage), TestRunTableSyncManagerRegistersStatHandle
+      (mid-sync probe sees a tablesync worker registered
+      with the right relOID/worker_type and a stamped
+      LastMsgReceiptTime; post-sync registry is empty),
+      TestRunTableSyncManagerStatClosedOnFailure (StatPair
+      .Close runs even when the per-rel sync errors).
+      Built and full `go test ./...` green. With this
+      slice the observability surface is now real: a live
+      apply leader + a live tablesync worker register
+      themselves and `pg_stat_subscription` reflects their
+      progress in real time.)
 
 - [ ] Structured replication-event logging:
       `wal.ReplicationLogger` interface with hooks for
