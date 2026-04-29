@@ -22,3 +22,89 @@ for experimentation, measurement, and learning, rather than production use.
 For oracle-based verification, this repository includes the upstream PostgreSQL
 repository as a submodule under postgres/. The current reference codebase is
 pinned to REL_18_3.
+
+## Quickstart
+
+The lifecycle below — build, init, start, connect with psql, stop, drop —
+is driven from the top-level `Makefile`. Run `make help` for the full list
+of targets and overridable variables.
+
+### Prerequisites
+
+- Go (matching `go.mod`'s toolchain).
+- A locally built upstream PostgreSQL client toolchain at
+  `postgres/local_install/`. The Makefile expects:
+  - `postgres/local_install/bin/` — `psql`, `pg_ctl`, etc.
+  - `postgres/local_install/lib/` — the matching shared libraries
+    (`libpq.so*`, ICU, …).
+
+  If you have not built it yet, build the `postgres/` submodule with
+  `--prefix=$(pwd)/postgres/local_install` and `make install` so those
+  paths are populated. The Makefile only needs the client tools and
+  their shared libraries; the upstream `postgres` server binary is not
+  used at runtime.
+
+### Environment for the in-tree PostgreSQL client tools
+
+`psql` and the rest of the client tools under `postgres/local_install/bin`
+load shared libraries from `postgres/local_install/lib`, which is **not**
+on the system loader path. Every Makefile target that invokes a client
+tool prepends both directories itself; if you run any of the steps
+manually, prepend them explicitly:
+
+```bash
+export PATH="$PWD/postgres/local_install/bin:$PATH"
+export LD_LIBRARY_PATH="$PWD/postgres/local_install/lib:${LD_LIBRARY_PATH:-}"
+# macOS users: also set DYLD_LIBRARY_PATH to the same value as LD_LIBRARY_PATH.
+```
+
+`make print-env` prints the exact lines this Makefile uses.
+
+### One-shot lifecycle via make
+
+```bash
+make build          # → ./bin/goopg
+make init           # → tmp/goopg-data/ (override with DATA_DIR=...)
+make start          # background server on 127.0.0.1:5432; log: tmp/goopg.log
+make psql           # connect with the in-tree psql
+make stop           # graceful shutdown
+make clean-data     # remove the data directory
+# optionally: make clean   # also removes ./bin/goopg
+```
+
+Common overrides:
+
+```bash
+make start LISTEN=0.0.0.0:55432 DATA_DIR=/tmp/my-cluster
+make psql  LISTEN=0.0.0.0:55432 DATA_DIR=/tmp/my-cluster PSQL_DBNAME=postgres
+```
+
+### Equivalent raw commands
+
+For the record, the same flow without the Makefile:
+
+```bash
+# 1. Build.
+go build -o ./bin/goopg ./cmd/goopg
+
+# 2. Initialize the data directory.
+./bin/goopg init -D ./tmp/goopg-data
+
+# 3. Start the server. `goopg start` runs in the foreground; either run
+#    it in a dedicated terminal or background it as the Makefile does.
+./bin/goopg start -D ./tmp/goopg-data --listen 127.0.0.1:5432
+
+# 4. In another terminal, with the in-tree client toolchain on PATH and
+#    LD_LIBRARY_PATH (see "Environment" above), connect:
+psql -h 127.0.0.1 -p 5432 -U postgres -d postgres
+
+# 5. Stop the server gracefully (from any terminal where the Makefile
+#    environment or the binary's path is reachable):
+./bin/goopg stop -D ./tmp/goopg-data
+
+# 6. Drop the cluster.
+rm -rf ./tmp/goopg-data
+```
+
+`goopg start` exits when it receives `SIGINT` / `SIGTERM` or when
+`goopg stop -D <datadir>` requests a shutdown over the control socket.
