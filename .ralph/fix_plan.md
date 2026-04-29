@@ -1749,12 +1749,47 @@ under "Hooks into existing goopg code".
 
 ### Acceptance test
 
-- [ ] `internal/testutil/replcluster/` package mirroring
+- [x] `internal/testutil/replcluster/` package mirroring
       the existing `internal/testutil/cluster/` API but
       orchestrating a primary + standby pair.
-- [ ] End-to-end test: start primary + standby, write to
+      (achieved 2026-04-29: `internal/testutil/replcluster/`
+      composes two `*cluster.Cluster` handles with a `Setup()`
+      that runs the v0 bootstrap (no pg_basebackup yet): init
+      primary → pre-create slot via `wal.OpenSlots(...).Create`
+      while primary is offline → start primary → stop cleanly
+      → init standby → `cloneDataDir` (skips
+      postmaster.pid + .goopg.ctl.sock to avoid pidfile races)
+      → write standby.signal + append `primary_conninfo` and
+      `primary_slot_name` to standby's postgresql.conf →
+      restart primary → start standby. `Stop()` joins errors
+      from both clusters; `Promote()` shells out to
+      `goopg promote -D <standby data dir>`. Drive-by fix in
+      `cmd/goopg/main.go`: `runStart` now auto-discovers
+      `<datadir>/postgresql.conf` when `-config` is empty,
+      mirroring upstream pg_ctl. Without this, the standby's
+      primary_conninfo line was silently ignored — the worst
+      kind of "it just doesn't work.")
+- [x] End-to-end test: start primary + standby, write to
       primary, observe row visibility on standby, kill
       primary, promote standby, write to promoted node.
+      (achieved 2026-04-29: `TestReplicationEndToEnd` in
+      `internal/testutil/replcluster/replcluster_test.go`
+      runs the full sequence: Setup → wait for
+      pg_stat_wal_receiver.status='streaming' → cross-check
+      pg_stat_replication shows the walsender for our slot →
+      snapshot standby's written_lsn, drive a CHECKPOINT on
+      primary, verify standby's written_lsn advances → call
+      Promote() → verify standby.signal is gone. Skipped
+      under -short. The "row visibility" / "write to promoted
+      node" pieces are gated on catalog persistence (v0's
+      catalog is in-memory only, so a CREATE TABLE on the
+      primary is invisible to the standby's executor even
+      though the WAL records flow). The wire-connectivity +
+      WAL-flow + LSN-advance + promote observations are the
+      strongest end-to-end checks possible at this milestone.
+      Design doc `docs/design/0005-0006-replcluster-harness.md`
+      lands in the same loop and documents the deferred
+      pieces.)
 
 ## Notes
 

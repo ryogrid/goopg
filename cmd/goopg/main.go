@@ -134,6 +134,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// Auto-discover postgresql.conf inside the data directory when the
+	// operator didn't pass an explicit -config. Mirrors upstream
+	// pg_ctl, which always reads `<datadir>/postgresql.conf`. Without
+	// this default, a postgresql.conf entry the operator wrote (e.g.
+	// `primary_conninfo` for a standby) is silently ignored — which
+	// is the worst kind of "it just doesn't work."
+	if *confPath == "" && *dataDir != "" {
+		candidate := filepath.Join(*dataDir, "postgresql.conf")
+		if _, err := os.Stat(candidate); err == nil {
+			*confPath = candidate
+		}
+	}
+
 	// SIGINT and SIGTERM both translate into the same internal shutdown
 	// path (see docs/design/0001-architecture-overview.md §3). Other
 	// operator-driven shutdowns will arrive over the control socket via
