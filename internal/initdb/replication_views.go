@@ -152,6 +152,67 @@ func registerStatWalReceiverView(cat *catalog.InMemory, receivers *wal.Receivers
 	return cat.RegisterVirtualTable(tbl)
 }
 
+// registerStatSubscriptionView installs `pg_catalog.pg_stat_subscription`
+// backed by the process-wide *wal.Subscribers registry. Column
+// shape mirrors upstream PG 18.x. Worker rows are emitted in
+// (subname, worker_type, relid, pid) order — the same stable
+// ordering Senders / Receivers use — so an operator's repeated
+// SELECT against a quiet subscription returns identical bytes.
+//
+// See docs/design/0008-0005-logical-replication-observability.md.
+func registerStatSubscriptionView(cat *catalog.InMemory, subs *wal.Subscribers) error {
+	tbl := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_stat_subscription",
+		Columns: []catalog.Column{
+			{Name: "subid", Type: catalog.Type{Name: "text"}},
+			{Name: "subname", Type: catalog.Type{Name: "text"}},
+			{Name: "worker_type", Type: catalog.Type{Name: "text"}},
+			{Name: "pid", Type: catalog.Type{Name: "text"}},
+			{Name: "leader_pid", Type: catalog.Type{Name: "text"}},
+			{Name: "relid", Type: catalog.Type{Name: "text"}},
+			{Name: "received_lsn", Type: catalog.Type{Name: "text"}},
+			{Name: "last_msg_send_time", Type: catalog.Type{Name: "text"}},
+			{Name: "last_msg_receipt_time", Type: catalog.Type{Name: "text"}},
+			{Name: "latest_end_lsn", Type: catalog.Type{Name: "text"}},
+			{Name: "latest_end_time", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	tbl.VirtualRows = func() [][]string {
+		if subs == nil {
+			return nil
+		}
+		snap := subs.Snapshot()
+		out := make([][]string, 0, len(snap))
+		for _, s := range snap {
+			leaderPID := ""
+			if s.LeaderPID != 0 {
+				leaderPID = fmt.Sprintf("%d", s.LeaderPID)
+			}
+			relID := ""
+			if s.RelOID != 0 {
+				relID = fmt.Sprintf("%d", s.RelOID)
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", s.SubID),
+				s.SubName,
+				string(s.WorkerType),
+				fmt.Sprintf("%d", s.PID),
+				leaderPID,
+				relID,
+				formatLSN(s.ReceivedLSN),
+				formatTime(s.LastMsgSendTime),
+				formatTime(s.LastMsgReceiptTime),
+				formatLSN(s.LatestEndLSN),
+				formatTime(s.LatestEndTime),
+			})
+		}
+		return out
+	}
+	return cat.RegisterVirtualTable(tbl)
+}
+
 // registerReplicationSlotsView installs `pg_catalog.pg_replication_slots`
 // backed by the process-wide *wal.Slots registry. Renders both
 // physical and logical slots with the upstream PG 18.x column shape;

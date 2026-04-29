@@ -309,3 +309,96 @@ func TestPgSubscriptionViewRendersRows(t *testing.T) {
 		t.Errorf("subpublications=%q want {p1}", row[12])
 	}
 }
+
+// TestStatSubscriptionRendersRegisteredSubscribers confirms the
+// pg_stat_subscription view observes the live Subscribers registry:
+// a leader row + a tablesync row appear with the right columns
+// (subid/subname/worker_type/pid/leader_pid/relid/received_lsn/
+// last_msg_send/last_msg_receipt/latest_end_lsn/latest_end_time)
+// and disappear on Unregister.
+func TestStatSubscriptionRendersRegisteredSubscribers(t *testing.T) {
+	cat := catalog.NewInMemory()
+	subs := wal.NewSubscribers()
+	if err := registerStatSubscriptionView(cat, subs); err != nil {
+		t.Fatal(err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_subscription"})
+	if !ok {
+		t.Fatal("pg_stat_subscription not registered")
+	}
+	if got := tbl.VirtualRows(); len(got) != 0 {
+		t.Fatalf("empty registry must yield 0 rows, got %d", len(got))
+	}
+
+	leader := subs.Register(wal.SubscriberState{
+		SubID:      42,
+		SubName:    "sub_test",
+		WorkerType: wal.SubscriberWorkerLeader,
+		PID:        1001,
+	})
+	leader.AdvanceReceivedLSN(0x100)
+	tablesync := subs.Register(wal.SubscriberState{
+		SubID:      42,
+		SubName:    "sub_test",
+		WorkerType: wal.SubscriberWorkerTablesync,
+		PID:        1002,
+		LeaderPID:  1001,
+		RelOID:     16400,
+	})
+
+	rows := tbl.VirtualRows()
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+	// Sort key is (subname, worker_type, relid, pid). Both rows
+	// share subname; "leader" < "tablesync" lexically, so leader
+	// comes first.
+	leaderRow := rows[0]
+	tsRow := rows[1]
+
+	if leaderRow[1] != "sub_test" {
+		t.Errorf("leader subname=%q want sub_test", leaderRow[1])
+	}
+	if leaderRow[2] != "leader" {
+		t.Errorf("leader worker_type=%q want leader", leaderRow[2])
+	}
+	if leaderRow[3] != "1001" {
+		t.Errorf("leader pid=%q want 1001", leaderRow[3])
+	}
+	if leaderRow[4] != "" {
+		t.Errorf("leader leader_pid=%q want empty", leaderRow[4])
+	}
+	if leaderRow[5] != "" {
+		t.Errorf("leader relid=%q want empty", leaderRow[5])
+	}
+	if leaderRow[6] != "0/100" {
+		t.Errorf("leader received_lsn=%q want 0/100", leaderRow[6])
+	}
+	// latest_end_lsn / latest_end_time stay zero/blank until a
+	// MarkMessage with non-zero endLSN fires.
+	if leaderRow[9] != "0/0" {
+		t.Errorf("leader latest_end_lsn=%q want 0/0", leaderRow[9])
+	}
+	if leaderRow[10] != "" {
+		t.Errorf("leader latest_end_time=%q want empty (never marked)", leaderRow[10])
+	}
+
+	if tsRow[2] != "tablesync" {
+		t.Errorf("tablesync worker_type=%q want tablesync", tsRow[2])
+	}
+	if tsRow[3] != "1002" {
+		t.Errorf("tablesync pid=%q want 1002", tsRow[3])
+	}
+	if tsRow[4] != "1001" {
+		t.Errorf("tablesync leader_pid=%q want 1001", tsRow[4])
+	}
+	if tsRow[5] != "16400" {
+		t.Errorf("tablesync relid=%q want 16400", tsRow[5])
+	}
+
+	subs.Unregister(leader)
+	subs.Unregister(tablesync)
+	if rows := tbl.VirtualRows(); len(rows) != 0 {
+		t.Errorf("after unregister: rows=%d want 0", len(rows))
+	}
+}

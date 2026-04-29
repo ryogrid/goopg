@@ -34,10 +34,11 @@ type Runtime struct {
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
-	WalSenders   *wal.Senders
-	WalReceivers *wal.Receivers
-	PubSub       *catalog.PubSub
-	DataDir      string
+	WalSenders     *wal.Senders
+	WalReceivers   *wal.Receivers
+	WalSubscribers *wal.Subscribers
+	PubSub         *catalog.PubSub
+	DataDir        string
 
 	// Standby is true when `<DataDir>/standby.signal` was present
 	// at Open time. cmd/goopg start uses this to decide whether to
@@ -264,6 +265,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// virtual views below render whichever entries are live.
 	walSenders := wal.NewSenders()
 	walReceivers := wal.NewReceivers()
+	walSubscribers := wal.NewSubscribers()
 
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{})
 
@@ -291,6 +293,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_stat_wal_receiver: zero or one row depending on whether the
 	// standby's walreceiver is currently registered.
 	if err := registerStatWalReceiverView(cat, walReceivers); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	// pg_stat_subscription: one row per active subscriber worker
+	// (leader apply + per-rel tablesync). Backed by the Subscribers
+	// registry — apply / tablesync goroutines register on entry and
+	// unregister on exit. See
+	// docs/design/0008-0005-logical-replication-observability.md.
+	if err := registerStatSubscriptionView(cat, walSubscribers); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -336,11 +349,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WAL:          walWriter,
 		Checkpointer: cp,
 		Slots:        slotsReg,
-		WalSenders:   walSenders,
-		WalReceivers: walReceivers,
-		PubSub:       pubsub,
-		DataDir:      abs,
-		Standby:      standby,
+		WalSenders:     walSenders,
+		WalReceivers:   walReceivers,
+		WalSubscribers: walSubscribers,
+		PubSub:         pubsub,
+		DataDir:        abs,
+		Standby:        standby,
 	}, nil
 }
 

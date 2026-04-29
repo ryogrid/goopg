@@ -2726,10 +2726,73 @@ item.
       `0008-0005`, the manager hookup will compose
       naturally with both.)
 
-- [ ] Logical-replication observability: `pg_stat_subscription`,
-      logical-replication rows in `pg_stat_replication`, structured
-      replication-event logging. Design doc
-      `docs/design/0008-0005-logical-replication-observability.md`.
+- [x] Logical-replication observability — `pg_stat_subscription`
+      substrate. (landed 2026-04-29:
+      `internal/wal/subscriber_mon.go` ships the in-process
+      `Subscribers` registry mirroring the publisher-side
+      `Senders`/`Receivers` pattern. `SubscriberWorkerType`
+      enum covers `leader` (one per active subscription) and
+      `tablesync` (one per non-`r` rel); `parallel` reserved
+      for a future loop. Each `Subscriber` carries identity
+      (subID/subname/workerType/pid/leaderPID/relOID, set
+      once at Register) plus atomic-backed LSN counters
+      (`receivedLSN`, `latestEndLSN`) and timestamp pairs
+      (`lastMsgSendTime`, `lastMsgReceiptTime`,
+      `latestEndTime`) so the high-frequency advance path is
+      lock-free per entry. `AdvanceReceivedLSN(lsn)` and
+      `MarkMessage(now, endLSN)` are monotonic-clamped via
+      `advanceLSN` — stale frames cannot rewind progress.
+      `Snapshot()` returns rows sorted by
+      `(subname, worker_type, relid, pid)` so a repeated
+      SELECT against a quiet subscription returns identical
+      bytes. `LatestEndTime` stays at Go's zero (rendered
+      blank) until the first `MarkMessage` with a non-zero
+      endLSN — the snapshot path explicitly guards against
+      the `time.Unix(0,0)` epoch sentinel that would
+      otherwise pollute the view with a 1970 timestamp.
+      `internal/initdb/replication_views.go::registerStatSubscriptionView`
+      installs `pg_catalog.pg_stat_subscription` with the
+      upstream PG 18.x columns (`subid`, `subname`,
+      `worker_type`, `pid`, `leader_pid`, `relid`,
+      `received_lsn`, `last_msg_send_time`,
+      `last_msg_receipt_time`, `latest_end_lsn`,
+      `latest_end_time`); `leader_pid`/`relid` blank on
+      leader rows, `latest_end_time` blank until first
+      MarkMessage. Wired into `initdb.Open` next to the
+      existing replication views; `Runtime.WalSubscribers`
+      exposes the registry to apply/tablesync workers.
+      Tests: TestSubscribersRegisterUnregisterRoundTrip,
+      TestSubscriberWorkerTypeDefaults,
+      TestSubscriberLSNMonotonic,
+      TestSubscribersSnapshotSorted,
+      TestSubscriberMarkMessageUpdatesTimestamps (registry
+      contract); TestStatSubscriptionRendersRegisteredSubscribers
+      (view rendering for a leader + tablesync pair, blank-
+      column rules, sort order, post-Unregister vanish).
+      Design doc
+      `docs/design/0008-0005-logical-replication-observability.md`
+      added and indexed in `docs/design/README.md`. Built
+      and full `go test ./...` green. Logical-replication
+      rows on `pg_stat_replication` are already covered by
+      the existing publisher-side walsender registry — no
+      additional work needed there.)
+
+- [ ] Logical-replication observability — apply-worker /
+      tablesync-manager hookup. ApplyWorker and
+      RunTableSyncManager don't yet `Register` into the
+      `Subscribers` registry. Plumbing: `Register` on entry,
+      `defer Unregister`, `AdvanceReceivedLSN` after each
+      applyCommit, `MarkMessage` after each received frame.
+      Mirrors the existing walsender wiring on the publisher
+      side.
+
+- [ ] Structured replication-event logging:
+      `wal.ReplicationLogger` interface with hooks for
+      slot-create/drop, walsender start/stop, walreceiver
+      start/stop, applyCommit, tablesync-state-transition
+      events. Until this lands, ad-hoc log.Printf lines in
+      the live workers remain the sole structured-log
+      source.
 
 ## Notes
 
