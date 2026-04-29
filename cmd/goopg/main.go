@@ -206,6 +206,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
 		}
+		// AIO engine startup line: surfaces the chosen method,
+		// the worker count, and the in-flight cap so an operator
+		// triaging an I/O-bound workload can verify the live
+		// configuration without grepping through GUCs. Mirrors
+		// the upstream "AIO method = ..." log line shape from
+		// PostgreSQL 18.
+		if rt.AIO != nil {
+			logger.Info("aio engine attached",
+				"event", "aio_engine_attached",
+				"method", rt.AIO.Method(),
+				"workers", aioWorkers,
+				"max_concurrency", aioMax)
+		}
 		defer func() {
 			// Persist the catalog before tearing down the pool.
 			// If saving fails we surface a warning but still

@@ -3095,13 +3095,47 @@ See `docs/milestones/0009-aio-subsystem.md`.
       M0007 remains synchronous). Design doc
       `0009-0004-aio-checkpointer-and-wal.md`.
 
-- [ ] AIO observability: `pg_aios` virtual view (in-flight
-      I/Os: backend, target file, offset, length,
-      direction, state, elapsed time); AIO counters in
-      pg_stat_* surfaces; wait events for "waiting on AIO
-      completion"; startup log line indicating chosen
-      method, probe result, worker-pool size, in-flight
-      caps. Design doc `0009-0005-aio-observability.md`.
+- [x] AIO observability — aggregate counters + startup
+      log line (first slice). (landed 2026-04-29:
+      `internal/initdb/aio_views.go::registerStatAIOView`
+      installs `pg_catalog.pg_stat_aio` backed by
+      `*aio.Engine.Stats()`. Columns: `method`
+      (sync/worker) + monotonic counters `submitted` /
+      `completed` / `errored` / `in_flight`. Single-row
+      when an engine is attached, zero-row when none is —
+      SELECT works on synchronous deployments without a
+      missing-table error. EOF is excluded from `errored`
+      per the engine's "EOF is expected" semantics
+      (matches Engine.completionBookkeeping's EOF guard).
+      Wired into `initdb.Open` next to the existing
+      replication / pubsub views; the registration site
+      handles a nil engine gracefully so the view can be
+      registered unconditionally. `cmd/goopg start` emits
+      a structured `event=aio_engine_attached
+      method=worker workers=N max_concurrency=N` slog
+      line right after Open returns when `rt.AIO != nil`,
+      mirroring upstream's "AIO method = ..." startup-log
+      shape. The existing `event=aio_method_fallback`
+      warn-level line covers the io_uring-requested-but-
+      unavailable case. Tests in initdb:
+      TestStatAIOViewEmptyWithoutEngine (nil engine → 0
+      rows; view still SELECTable),
+      TestStatAIOViewReflectsEngineCounters (sync method
+      + zero counters pre-Submit; one Submit+Wait bumps
+      submitted/completed to 1; in_flight back to 0).
+      Built and full `go test ./...` green. Design doc
+      `docs/design/0009-0004-aio-observability.md` added
+      and indexed in `docs/design/README.md`.)
+
+- [ ] AIO observability — per-I/O `pg_aios` view + wait
+      events (follow-up slice). `pg_aios` (one row per
+      outstanding I/O: PID, target file, offset, length,
+      direction, state, elapsed time) and the
+      "waiting on AIO completion" wait event surface both
+      need per-handle tracking on the engine — a sync.Map
+      of in-flight handles + submit-time bookkeeping. Once
+      that lands, the rest of the upstream-shaped
+      observability composes naturally.
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 

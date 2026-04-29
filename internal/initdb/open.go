@@ -349,6 +349,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// pg_stat_aio: one row per AIO engine (v0 has at most one).
+	// Backed by aio.Engine.Stats(). Emits zero rows when no
+	// engine is attached so a SELECT against the view doesn't
+	// surface as a missing-table error. See
+	// docs/design/0009-0004-aio-observability.md.
+	if err := registerStatAIOView(cat, aioEngine); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 	// pg_replication_slots: one row per persistent replication slot
 	// (physical or logical). Backed by the *wal.Slots registry.
 	if err := registerReplicationSlotsView(cat, slotsReg); err != nil {
