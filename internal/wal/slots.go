@@ -41,6 +41,17 @@ type Slot struct {
 	Kind              SlotKind `json:"kind"`
 	RestartLSN        uint64   `json:"restart_lsn"`
 	ConfirmedFlushLSN uint64   `json:"confirmed_flush_lsn"`
+	// Invalidated, when true, marks the slot as no longer usable
+	// because the WAL it was holding back was removed (the
+	// standby's lag exceeded `max_slot_wal_keep_size`). An
+	// invalidated slot persists so operators can `pg_drop_replication_slot`
+	// it explicitly, but the retention path stops honouring its
+	// RestartLSN and a reconnecting walsender will refuse to start
+	// streaming. Mirrors upstream's "invalidated" state in
+	// postgres/src/backend/replication/slot.c. See
+	// docs/design/0005-0001-streaming-replication-architecture.md
+	// (§ Replication slot retention semantics).
+	Invalidated bool `json:"invalidated"`
 	// Active is in-memory only; the durable state file records
 	// the slot's existence, while Active reflects whether a
 	// walsender connection currently owns it.
@@ -221,23 +232,80 @@ func (s *Slots) SetActive(name string, active bool) error {
 	return nil
 }
 
-// MinRestartLSN returns the smallest RestartLSN across all slots, or
-// 0 if there are no slots. The WAL retention path consults this
-// before recycling segments. Returning 0 (no slots) is the unbounded
-// case — retention is then governed only by checkpoint policy and
-// `max_wal_size`.
+// MinRestartLSN returns the smallest RestartLSN across all slots that
+// are still usable for WAL retention. Invalidated slots are skipped:
+// the operator already accepted the lag-based eviction, so their
+// stale RestartLSN must not pin WAL anymore. Returns 0 when no slots
+// (or no live slots) exist — the WAL retention path then degenerates
+// to "checkpoint horizon only", which is the v0 unbounded-by-slots
+// case.
 func (s *Slots) MinRestartLSN() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var min uint64
 	first := true
 	for _, slot := range s.m {
+		if slot.Invalidated {
+			continue
+		}
 		if first || slot.RestartLSN < min {
 			min = slot.RestartLSN
 			first = false
 		}
 	}
 	return min
+}
+
+// InvalidateLagging marks every non-invalidated slot whose lag
+// (currentLSN - RestartLSN) exceeds maxKeepBytes as invalidated, and
+// returns the names of the slots that were just invalidated. Callers
+// (the slot-aware retention hook on the checkpointer) drive this
+// before computing the keep horizon so a single laggy standby can't
+// pin WAL forever.
+//
+// maxKeepBytes <= 0 disables the bound — no slot is ever invalidated.
+// This matches upstream's `max_slot_wal_keep_size = -1` default
+// (unlimited retention).
+//
+// currentLSN is typically the writer's WrittenLSN at checkpoint time;
+// it must be ≥ every slot's RestartLSN for the lag computation to be
+// meaningful (slots that somehow advanced past it are treated as
+// zero-lag and left alone).
+//
+// Active slots are still invalidated — upstream behaves the same way:
+// the next standby-status reply from the laggy walsender will fail
+// because the slot's RestartLSN is now considered stale, and the
+// operator must rebuild the standby from a fresh base backup. v0
+// inherits that semantics.
+func (s *Slots) InvalidateLagging(currentLSN uint64, maxKeepBytes int64) ([]string, error) {
+	if maxKeepBytes <= 0 || currentLSN == 0 {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var invalidated []string
+	for _, slot := range s.m {
+		if slot.Invalidated {
+			continue
+		}
+		if slot.RestartLSN >= currentLSN {
+			continue
+		}
+		if currentLSN-slot.RestartLSN <= uint64(maxKeepBytes) {
+			continue
+		}
+		slot.Invalidated = true
+		if err := s.writeSlotLocked(slot); err != nil {
+			// Roll back the in-memory flip so a transient I/O
+			// failure doesn't strand the slot in a "logically
+			// invalidated, durably alive" inconsistent state.
+			slot.Invalidated = false
+			return invalidated, err
+		}
+		invalidated = append(invalidated, slot.Name)
+	}
+	sort.Strings(invalidated)
+	return invalidated, nil
 }
 
 // validSlotName mirrors upstream's check in

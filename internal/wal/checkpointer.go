@@ -88,6 +88,13 @@ type Checkpointer struct {
 	wal     checkpointWAL
 	cfg     CheckpointerConfig
 
+	// retainer, when non-nil, runs after each successful
+	// checkpoint marker is durable. The slot-aware production
+	// implementation lives in retention.go; tests can wire a
+	// fake. nil disables WAL pruning entirely (the v0 default —
+	// caller opts in by passing SetRetainer).
+	retainer Retainer
+
 	lastCheckpointLSN atomic.Uint64
 
 	// Aggregate counters surfaced through pg_stat_checkpointer.
@@ -162,6 +169,14 @@ func (c *Checkpointer) SetMaxWALBytes(b uint64) {
 	if b > 0 && c.cfg.VolumeCheckInterval <= 0 {
 		c.cfg.VolumeCheckInterval = time.Second
 	}
+}
+
+// SetRetainer installs the post-marker WAL pruning hook. nil
+// disables pruning (the v0 default). Production wiring passes a
+// *SlotAwareRetainer that consults the replication-slot registry.
+// Call before Run starts.
+func (c *Checkpointer) SetRetainer(r Retainer) {
+	c.retainer = r
 }
 
 // SetCompletionTarget updates the spread fraction (0 disables
@@ -281,6 +296,17 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	// checkpoint can replay it on a torn page.
 	if er, ok := c.flusher.(epochResetter); ok {
 		er.ResetCheckpointEpoch()
+	}
+	// Slot-aware WAL retention: prune segments that are no longer
+	// needed by either crash recovery (everything below this
+	// checkpoint LSN is now redo-redundant) or any live
+	// replication slot. A retainer error is logged but does not
+	// fail the checkpoint — the marker is already durable, and
+	// retention is best-effort.
+	if c.retainer != nil {
+		if err := c.retainer.Retain(endLSN); err != nil {
+			c.cfg.Logger.Warn("wal retention failed", "err", err)
+		}
 	}
 	return nil
 }

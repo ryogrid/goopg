@@ -1518,9 +1518,37 @@ under "Hooks into existing goopg code".
       (achieved 2026-04-29: full registry with persistence,
       validation, advance helpers, retention-aware
       `MinRestartLSN`. See entry above.)
-- [ ] Slot-aware WAL retention: M0002's segment-recycling
+- [x] Slot-aware WAL retention: M0002's segment-recycling
       path consults `min(slot.RestartLSN ∀ active)` before
       unlinking, bounded by `max_slot_wal_keep_size`.
+      (achieved 2026-04-29: M0002 had no recycling path before
+      this loop — `pg_wal/` grew unbounded. Built the recycling
+      kernel from scratch as `Writer.RemoveOldSegments(keepLSN)`,
+      a new `opRecycle` op on the writer's serialised loop that
+      drops cached fds, deletes obsolete segments, and preserves
+      the segment containing keepLSN. Slot-side: `Slot.Invalidated`
+      bool persisted in the slot's JSON state file +
+      `Slots.InvalidateLagging(currentLSN, maxKeepBytes)` flips
+      slots whose lag exceeds the cap (strict `>`, matching
+      upstream KeepLogSeg). `MinRestartLSN` skips invalidated
+      slots. New `internal/wal/retention.go` SlotAwareRetainer
+      glues it together: invalidate → compute
+      `min(checkpointLSN, min(RestartLSN ∀ live slots))` → unlink.
+      Wired into `Checkpointer.runCheckpoint` via
+      `SetRetainer`/`Retainer` interface; failures log but don't
+      fail the checkpoint. `initdb.Open` now opens `Slots` so
+      it lives on `Runtime`; `cmd/goopg start` reads
+      `max_slot_wal_keep_size` (MB; -1 sentinel) from the
+      registry and constructs the retainer, plus threads
+      `rt.Slots`/`rt.WAL` into `server.Config` so replication
+      slots actually work in the production binary (drive-by
+      fix). 8 unit tests pin the contract: keep-segment
+      preservation, zero-LSN no-op, fd cleanup, lag eviction
+      with persistence, boundary semantics, disabled-cap
+      sentinel, end-to-end retainer with live slot, end-to-end
+      retainer with invalidation. Design doc
+      `docs/design/0005-0004-slot-aware-wal-retention.md` lands
+      in the same loop.)
 
 ### Standby side
 

@@ -184,6 +184,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.Pool = rt.Pool
 		cfg.TxnMgr = rt.TxnMgr
 		cfg.Checkpointer = rt.Checkpointer
+		cfg.Slots = rt.Slots
+		cfg.WAL = rt.WAL
+		cfg.WALDirPath = filepath.Join(rt.DataDir, "pg_wal")
 		cfg.DataDir = rt.DataDir
 		logger.Info("opened data directory", "path", rt.DataDir, "shared_buffers_slots", poolSlots)
 	}
@@ -229,6 +232,31 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		if v, ok := registry.Get("full_page_writes"); ok && rt.Pool != nil {
 			rt.Pool.SetFullPageWrites(v.Display() == "on")
+		}
+
+		// Slot-aware WAL retention. Wired here (rather than inside
+		// initdb.Open) because the GUC values that govern its
+		// behaviour — `max_slot_wal_keep_size` — only finish loading
+		// once the postgresql.conf entries have been applied to the
+		// registry. The retainer's own logger is the per-process
+		// slog so retention events show up next to the rest of the
+		// startup chatter.
+		if rt.WAL != nil {
+			retainer := &wal.SlotAwareRetainer{
+				Writer: rt.WAL,
+				Slots:  rt.Slots,
+				Logger: logger,
+			}
+			if v, ok := registry.Get("max_slot_wal_keep_size"); ok {
+				// Stored in MB (matching upstream guc_tables.c). -1
+				// is the unlimited sentinel.
+				if mb, err := strconv.Atoi(v.Display()); err == nil {
+					if mb > 0 {
+						retainer.MaxSlotKeepBytes = int64(mb) * 1024 * 1024
+					}
+				}
+			}
+			rt.Checkpointer.SetRetainer(retainer)
 		}
 	}
 

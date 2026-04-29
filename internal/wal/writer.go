@@ -40,6 +40,7 @@ type opKind int
 const (
 	opAppend opKind = iota
 	opFlush
+	opRecycle
 	opClose
 )
 
@@ -53,6 +54,7 @@ type op struct {
 type result struct {
 	startLSN uint64
 	endLSN   uint64
+	removed  int
 	err      error
 }
 
@@ -194,6 +196,33 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	return (<-resp).err
 }
 
+// RemoveOldSegments unlinks any WAL segment file whose contents end
+// strictly before the segment that contains keepLSN. The segment
+// containing keepLSN — and every segment after it — is preserved, so
+// the caller can pass `min(checkpointLSN, min(slot.RestartLSN))` and
+// be sure no record needed for crash recovery or for an attached
+// standby is removed.
+//
+// keepLSN == 0 is a no-op (no records have been written yet).
+//
+// The op runs on the writer's serialised loop so it cannot race with
+// an in-flight Append or Flush. Open file handles for removed segments
+// are closed before the unlink and dropped from the writer's cache so
+// subsequent writes never re-touch a deleted file.
+//
+// Returns the number of segment files that were removed.
+func (w *Writer) RemoveOldSegments(keepLSN uint64) (int, error) {
+	if keepLSN == 0 {
+		return 0, nil
+	}
+	resp := make(chan result, 1)
+	if err := w.send(op{kind: opRecycle, lsn: keepLSN, resp: resp}); err != nil {
+		return 0, err
+	}
+	r := <-resp
+	return r.removed, r.err
+}
+
 // Close flushes dirty segments, closes files, and stops the worker.
 func (w *Writer) Close() error {
 	resp := make(chan result, 1)
@@ -299,6 +328,9 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 			}
 		case opFlush:
 			req.resp <- result{err: s.flushUpTo(req.lsn)}
+		case opRecycle:
+			n, err := s.removeOldSegments(req.lsn)
+			req.resp <- result{removed: n, err: err}
 		case opClose:
 			err := s.close()
 			req.resp <- result{err: err}
@@ -357,6 +389,67 @@ func (s *state) flushUpTo(lsn uint64) error {
 
 	s.flushedLSN = lsn
 	return nil
+}
+
+// removeOldSegments unlinks every segment whose final byte sits
+// strictly before the segment containing keepLSN. Runs on the loop
+// goroutine so it serialises with append/flush and won't race with
+// openSegment.
+//
+// Behaviour notes:
+//   - The segment that contains keepLSN is preserved (the standby /
+//     recovery still needs to read records inside it).
+//   - Open file handles for removed segments are closed and dropped
+//     from s.files so a subsequent writeAt that somehow targets a
+//     stale segment number reopens fresh (it shouldn't — keepLSN
+//     guarantees we only delete fully-superseded segments — but the
+//     defensive close keeps the invariant explicit).
+//   - dirty flags for removed segments are dropped: the bytes were
+//     superseded, no fdatasync owes them anymore.
+//   - Missing files are silently skipped so a partially-cleaned
+//     directory (e.g. a manual rm during testing) doesn't wedge the
+//     loop.
+func (s *state) removeOldSegments(keepLSN uint64) (int, error) {
+	if keepLSN == 0 {
+		return 0, nil
+	}
+	keepSeg := segmentForLSN(keepLSN, s.cfg.SegmentSize)
+	if keepSeg == 0 {
+		return 0, nil
+	}
+
+	entries, err := os.ReadDir(s.cfg.WALDir)
+	if err != nil {
+		return 0, fmt.Errorf("wal: list %s: %w", s.cfg.WALDir, err)
+	}
+
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		segNo, ok := parseSegmentName(e.Name())
+		if !ok {
+			continue
+		}
+		if segNo >= keepSeg {
+			continue
+		}
+		if f, open := s.files[segNo]; open {
+			_ = f.Close()
+			delete(s.files, segNo)
+		}
+		delete(s.dirty, segNo)
+		path := filepath.Join(s.cfg.WALDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return removed, fmt.Errorf("wal: remove %s: %w", path, err)
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 func (s *state) writeAt(pos int64, buf []byte) error {

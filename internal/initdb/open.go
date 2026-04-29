@@ -33,6 +33,7 @@ type Runtime struct {
 	Catalog      catalog.Catalog
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
+	Slots        *wal.Slots
 	DataDir      string
 
 	// Standby is true when `<DataDir>/standby.signal` was present
@@ -211,6 +212,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
+	// Replication-slot registry. The retention path on the
+	// checkpointer (wired below in cmd/goopg start once the GUC
+	// values are known) consults this to decide which WAL
+	// segments are still pinned by a live standby. Opening the
+	// registry here also makes slots available to the
+	// CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT wire
+	// handlers without an extra OpenSlots call from main.
+	slotsReg, err := wal.OpenSlots(abs)
+	if err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: replication slots: %w", err)
+	}
+
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{})
 
 	// Surface the M0002 checkpointer counters as the
@@ -239,6 +255,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Catalog:      cat,
 		WAL:          walWriter,
 		Checkpointer: cp,
+		Slots:        slotsReg,
 		DataDir:      abs,
 		Standby:      standby,
 	}, nil
