@@ -287,5 +287,76 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 
+	// Streaming-replication GUCs (milestone 0005). Names, units,
+	// ranges, and defaults mirror upstream's
+	// postgres/src/backend/utils/misc/guc_tables.c entries.
+
+	// Primary-side: how many concurrent replication connections /
+	// slots / how long the walsender waits for client status
+	// updates before giving up. v0 honours these by configuration
+	// but doesn't yet enforce hard limits — the slot store is
+	// unbounded, walsender count is unbounded.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_level", Type: TypeEnum, BootVal: "replica",
+		EnumOptions: []string{"minimal", "replica", "logical"},
+		Context:     ContextPostmaster,
+		Scope:       ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_wal_senders", Type: TypeInt, BootVal: "10",
+		MinVal: 0, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_replication_slots", Type: TypeInt, BootVal: "10",
+		MinVal: 0, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
+		MinVal: 0, MaxVal: 1<<30,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_slot_wal_keep_size", Type: TypeInt, Unit: UnitMB, BootVal: "-1",
+		MinVal: -1, MaxVal: 2147483647,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+
+	// Standby-side: the consumer-side configuration. cmd/goopg
+	// start reads these when `<DataDir>/standby.signal` is
+	// present, dialing the named primary and acquiring the named
+	// slot before the walreceiver Run loop begins.
+	r.MustRegister(NewVariable(Variable{
+		Name: "primary_conninfo", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "primary_slot_name", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_receiver_status_interval", Type: TypeInt, Unit: UnitS, BootVal: "10",
+		MinVal: 0, MaxVal: 2147483,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "recovery_target_timeline", Type: TypeString, BootVal: "latest",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "hot_standby", Type: TypeBool, BootVal: "on",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	return r
 }

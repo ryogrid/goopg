@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -245,14 +246,149 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		close(cpDone)
 	}
 
+	// Standby mode: when `<DataDir>/standby.signal` was present at
+	// Open time, dial the configured `primary_conninfo` and spawn a
+	// walreceiver in the background. The receiver streams WAL into
+	// the local writer; `<DataDir>/pg_wal` ends up byte-identical
+	// to the primary's. Application of the streamed records into
+	// data files happens via the existing crash-recovery path on
+	// next startup; live-replay is the next M0005 slice.
+	wrCtx, wrCancel := context.WithCancel(ctx)
+	wrDone := make(chan struct{})
+	if rt != nil && rt.Standby {
+		startWalreceiver(wrCtx, wrDone, rt, registry, logger)
+	} else {
+		close(wrDone)
+	}
+
 	runErr := srv.Run(ctx)
 	cpCancel()
+	wrCancel()
 	<-cpDone
+	<-wrDone
 	if runErr != nil {
 		fmt.Fprintf(stderr, "goopg start: %v\n", runErr)
 		return 1
 	}
 	return 0
+}
+
+// startWalreceiver dials the primary identified by `primary_conninfo`
+// and runs a `WalReceiver` in a goroutine, reconnecting with
+// exponential backoff on transient failures. Returns once the
+// goroutine is launched; the supplied `done` channel closes when
+// the goroutine exits (after the parent context is cancelled).
+//
+// `primary_conninfo` is parsed as a libpq-style key=value bag; v0
+// honours `host` + `port` (anything else is ignored). Empty conninfo
+// is logged and the function returns without spawning — useful for
+// integration tests that exercise the standby-mode boot path
+// without an actual primary.
+func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *config.Registry, logger *slog.Logger) {
+	conninfo := ""
+	slotName := ""
+	statusInterval := 10 * time.Second
+	if registry != nil {
+		if v, ok := registry.Get("primary_conninfo"); ok {
+			conninfo = v.Display()
+		}
+		if v, ok := registry.Get("primary_slot_name"); ok {
+			slotName = v.Display()
+		}
+		if v, ok := registry.Get("wal_receiver_status_interval"); ok {
+			if secs, err := strconv.Atoi(v.Display()); err == nil && secs > 0 {
+				statusInterval = time.Duration(secs) * time.Second
+			}
+		}
+	}
+	addr := parsePrimaryConninfo(conninfo)
+	if addr == "" {
+		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
+		close(done)
+		return
+	}
+	logger.Info("standby mode: starting walreceiver",
+		"primary", addr, "slot", slotName, "status_interval", statusInterval)
+	go func() {
+		defer close(done)
+		const baseBackoff = 500 * time.Millisecond
+		const maxBackoff = 30 * time.Second
+		backoff := baseBackoff
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			rec, err := server.DialWalReceiver(ctx, server.WalReceiverConfig{
+				PrimaryAddr:    addr,
+				User:           "postgres",
+				SlotName:       slotName,
+				StartLSN:       rt.WAL.WrittenLSN(),
+				WAL:            rt.WAL,
+				StatusInterval: statusInterval,
+				DialTimeout:    10 * time.Second,
+			})
+			if err != nil {
+				logger.Warn("walreceiver dial failed; will retry",
+					"primary", addr, "err", err, "backoff", backoff)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			backoff = baseBackoff
+			runErr := rec.Run(ctx)
+			_ = rec.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			if runErr != nil {
+				logger.Warn("walreceiver run ended with error; reconnecting",
+					"err", runErr)
+			} else {
+				logger.Info("walreceiver run ended; reconnecting")
+			}
+		}
+	}()
+}
+
+// parsePrimaryConninfo extracts the host:port from a libpq-style
+// `key=value [key=value ...]` conninfo string. Defaults port to 5432
+// when host is given without one. Returns "" when no host is
+// provided. v0 honours only host + port; user / password / sslmode
+// follow in later loops.
+func parsePrimaryConninfo(conninfo string) string {
+	conninfo = strings.TrimSpace(conninfo)
+	if conninfo == "" {
+		return ""
+	}
+	host := ""
+	port := "5432"
+	for _, tok := range strings.Fields(conninfo) {
+		eq := strings.IndexByte(tok, '=')
+		if eq < 0 {
+			continue
+		}
+		k := strings.ToLower(tok[:eq])
+		v := tok[eq+1:]
+		switch k {
+		case "host":
+			host = v
+		case "port":
+			port = v
+		}
+	}
+	if host == "" {
+		return ""
+	}
+	return host + ":" + port
 }
 
 // poolSlotsFromGUC reads the shared_buffers GUC (canonical KB) and

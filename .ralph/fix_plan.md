@@ -1518,9 +1518,27 @@ under "Hooks into existing goopg code".
 
 ### Standby side
 
-- [ ] `<DataDir>/standby.signal` detection in `goopg start`
+- [x] `<DataDir>/standby.signal` detection in `goopg start`
       and `internal/initdb/Open`. When present, enter
       standby mode.
+      (achieved 2026-04-29: new `internal/initdb/standby.go`
+      exposes `StandbySignalFile = "standby.signal"`,
+      `IsStandby(dataDir) (bool, error)`, and the trigger-file
+      helpers `CreateStandbySignal` / `RemoveStandbySignal`
+      (the latter is idempotent for the future promotion path).
+      `Runtime` gains a `Standby bool` flag set at Open time.
+      `cmd/goopg start` reads `primary_conninfo` /
+      `primary_slot_name` / `wal_receiver_status_interval`
+      from the GUC layer when `Runtime.Standby` is true and
+      auto-spawns a `WalReceiver` in a background goroutine
+      with exponential reconnect backoff (500ms→30s cap). The
+      receiver's StartLSN seeds from the local WAL writer's
+      WrittenLSN so reconnects resume from the durable
+      tail. Empty conninfo logs a warning and skips the spawn
+      so test fixtures can exercise standby-mode boot without
+      a primary. Three unit tests pin the helper contract:
+      absent-returns-false, empty-data-dir, Create→IsStandby→
+      Remove round-trip including idempotent double-Remove.)
 - [x] `internal/server/walreceiver.go` (new): libpq-style
       client connection to `primary_conninfo`, sends
       `IDENTIFY_SYSTEM` then `START_REPLICATION SLOT <name>
@@ -1557,14 +1575,25 @@ under "Hooks into existing goopg code".
 
 ### Configuration surface
 
-- [ ] Register primary-side replication GUCs:
+- [x] Register primary-side replication GUCs:
       `wal_level` (default `replica`), `max_wal_senders` (10),
       `max_replication_slots` (10), `wal_sender_timeout` (60s),
       `max_slot_wal_keep_size` (-1).
-- [ ] Register standby-side GUCs: `primary_conninfo`,
+      (achieved 2026-04-29: registered in
+      `internal/config/defaults.go`. Names, units, ranges,
+      and defaults mirror upstream's `guc_tables.c`. v0
+      doesn't yet hard-enforce limits — slot store is
+      unbounded, walsender count is unbounded — but
+      `SHOW`/`SET` round-trip correctly.)
+- [x] Register standby-side GUCs: `primary_conninfo`,
       `primary_slot_name`, `wal_receiver_status_interval`
       (10s), `recovery_target_timeline` (`latest`),
       `hot_standby` (`on`).
+      (achieved 2026-04-29: registered in
+      `internal/config/defaults.go`. `cmd/goopg start` reads
+      these when `<DataDir>/standby.signal` is present and
+      uses `primary_conninfo` (libpq host/port subset) to
+      dial the primary.)
 
 ### Promotion
 

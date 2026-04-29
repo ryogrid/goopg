@@ -34,6 +34,13 @@ type Runtime struct {
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	DataDir      string
+
+	// Standby is true when `<DataDir>/standby.signal` was present
+	// at Open time. cmd/goopg start uses this to decide whether to
+	// dial the configured `primary_conninfo` and spawn a
+	// `WalReceiver` instead of accepting client writes directly.
+	// See docs/design/0005-0001-streaming-replication-architecture.md.
+	Standby bool
 }
 
 // OpenOptions controls Open.
@@ -219,6 +226,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
+	standby, err := IsStandby(abs)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: standby signal: %w", err)
+	}
+
 	return &Runtime{
 		StorageMgr:   mgr,
 		Pool:         pool,
@@ -227,6 +240,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WAL:          walWriter,
 		Checkpointer: cp,
 		DataDir:      abs,
+		Standby:      standby,
 	}, nil
 }
 
