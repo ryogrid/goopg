@@ -44,3 +44,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0007 | WAL segment preallocation & `fdatasync`-based commit path        | planned  | `0007-wal-segment-preallocation.md`               |
 | 0008 | Logical replication support                                      | planned  | `0008-logical-replication-support.md`             |
 | 0009 | AIO subsystem (asynchronous I/O)                                 | planned  | `0009-aio-subsystem.md`                           |
+| 0010 | WAL direct I/O writes & in-memory walsender handoff             | planned  | `0010-wal-direct-io-and-walsender-memory-handoff.md` |
