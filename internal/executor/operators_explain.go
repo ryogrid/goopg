@@ -363,6 +363,11 @@ func describePlan(n planner.Node) string {
 			return fmt.Sprintf("CTE Scan on %s %s", p.Name, p.Alias)
 		}
 		return fmt.Sprintf("CTE Scan on %s", p.Name)
+	case *planner.LockRows:
+		// Mirrors upstream's "LockRows" label; per-relation
+		// detail is too verbose for the single-line label and
+		// is left to a future VERBOSE-only extension.
+		return "LockRows"
 	}
 	return fmt.Sprintf("%T", n)
 }
@@ -405,6 +410,8 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.Insert:
 		return []planner.Node{p.Source}
 	case *planner.CTEScan:
+		return []planner.Node{p.Child}
+	case *planner.LockRows:
 		return []planner.Node{p.Child}
 	}
 	return nil

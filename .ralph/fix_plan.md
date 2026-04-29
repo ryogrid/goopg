@@ -2834,12 +2834,47 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       Locking inside subqueries/CTEs also deferred.
       Planner row-lock metadata + executor lands in
       M0021-0002 / M0021-0003 / M0021-0004.)
-- [ ] SELECT … FOR UPDATE — planner + executor
-      wiring (M0021-0002 / M0021-0003 / M0021-0004).
-      Reserves filenames
-      `docs/design/0021-0002-row-lock-planner-executor-integration.md`,
-      `docs/design/0021-0003-wait-policy-nowait-skip-locked.md`,
-      `docs/design/0021-0004-deadlock-observability-and-test-matrix.md`.
+- [x] SELECT … FOR UPDATE — **planner row-lock metadata
+      + LockRows plan node** (M0021-0002). Design doc
+      `docs/design/0021-0002-row-lock-planner-executor-integration.md`.
+      (landed 2026-04-30: produces an executable plan
+      node carrying the resolved per-relation locking
+      intent. New `LockRows` wrapper at the top of the
+      plan tree, Output() returns the child schema
+      unchanged. New types: `LockStrength`
+      (ForUpdate=iota+1 / ForShare), `LockWaitPolicy`
+      (Block / NoWait / SkipLocked), `LockedRel`. Pre-
+      M0021 SELECTs never produce LockRows so existing
+      tests stay byte-unchanged. `planSelect` wraps the
+      trailing Project with LockRows when `s.Locking !=
+      nil`. `resolveLockedRels(s, ctx)` walks each parsed
+      clause: empty Targets → one LockedRel per binding;
+      non-empty → one per name via `findBindingByName`
+      with alias-shadows-table semantics. Multiple
+      clauses targeting the same rel produce duplicate
+      LockedRels — the Stage A executor will fold them.
+      `executor.Build` rejects `*planner.LockRows` with
+      "row-level locking execution is not supported in
+      v0" — two-step gate from M0017-0002→0003: planner
+      produces full plan so EXPLAIN works, Build refuses
+      to silently drop locking intent. EXPLAIN
+      integration: `describePlan` returns "LockRows",
+      `planChildren` returns child for tree recursion.
+      Tests in `internal/planner/locking_test.go`: 6
+      scenarios — TestPlanSelectForUpdateWrapsLockRows
+      (full shape), TestPlanSelectForUpdateOfAlias
+      (alias-only), TestPlanSelectForUpdateNoTargetLocks
+      AllRels (bare FOR UPDATE locks every FROM rel),
+      TestPlanSelectForUpdateNoWaitPropagates (enum
+      conversion), TestPlanSelectForShareStrength,
+      TestPlanSelectWithoutLockingNoWrapper (rollout
+      guardrail). Full `go test ./...` green. Stage A
+      executor (acquire row-locks before yielding) +
+      NOWAIT/SKIP LOCKED runtime + deadlock observability
+      all deferred to M0021-0003 / M0021-0004.)
+- [ ] SELECT … FOR UPDATE — Stage A executor (acquire
+      row-locks via lockmgr) + NOWAIT/SKIP LOCKED runtime
+      + deadlock observability (M0021-0003 / M0021-0004).
 - [ ] Tuple-level pessimistic locking on top of M0012 lock
       manager.
 

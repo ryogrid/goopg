@@ -187,19 +187,6 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 }
 
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
-	if len(s.Locking) > 0 {
-		// M0021-0001 step 1 (parser surface only) — planner /
-		// executor support for row-level locking lands in
-		// M0021-0002 / M0021-0003. Reject loudly so an
-		// unmigrated runtime never silently drops the FOR
-		// UPDATE intent. See
-		// docs/design/0021-0001-for-update-parser-analysis-and-ast.md.
-		return nil, &PlanError{
-			Pos:     s.Locking[0].Pos(),
-			Code:    "0A000",
-			Message: "row-level locking clauses are not supported in v0 planner",
-		}
-	}
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
@@ -405,7 +392,97 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}, nil
+	out := Node(&Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema})
+	if len(s.Locking) > 0 {
+		// M0021-0002 — wrap the SELECT plan in a LockRows
+		// node carrying the resolved per-relation locking
+		// intent. The executor (Stage A executor lands in
+		// M0021-0003) consumes Locks to acquire row-level
+		// pessimistic locks before returning rows. Until
+		// then the executor refuses to Build a *LockRows so
+		// runtime never silently drops the locking intent.
+		locks, lerr := resolveLockedRels(s, ctx)
+		if lerr != nil {
+			return nil, lerr
+		}
+		out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks}
+	}
+	return out, nil
+}
+
+// resolveLockedRels walks the parsed locking clauses and
+// produces one LockedRel per (clause, FROM-clause range
+// variable) pair in the effective target set. When a clause
+// supplies an OF list, only those names produce LockedRels;
+// otherwise every range variable in the FROM clause is locked
+// per upstream's bare-FOR-UPDATE-locks-everything semantics.
+//
+// Mirrors upstream's expand_targetlist_to_locks step inside
+// preprocess_rowmarks. The analyzer (M0021-0001 step 2) has
+// already verified the OF target names resolve, so this
+// helper's lookup paths are second-line defence.
+func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, error) {
+	if ctx == nil {
+		return nil, &PlanError{Pos: s.Pos(), Code: "0A000", Message: "FOR UPDATE/SHARE requires a FROM clause"}
+	}
+	var out []LockedRel
+	for _, lc := range s.Locking {
+		strength := lockStrengthFromParser(lc.Strength)
+		policy := lockWaitPolicyFromParser(lc.WaitPolicy)
+		if len(lc.Targets) == 0 {
+			for _, b := range ctx.bindings {
+				out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy})
+			}
+			continue
+		}
+		for _, name := range lc.Targets {
+			b, ok := findBindingByName(ctx.bindings, name)
+			if !ok {
+				return nil, &PlanError{Pos: lc.Pos(), Code: "42P01",
+					Message: fmt.Sprintf("relation %q in FOR UPDATE/SHARE clause not found in FROM clause", name)}
+			}
+			out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy})
+		}
+	}
+	return out, nil
+}
+
+func lockStrengthFromParser(s parser.LockStrength) LockStrength {
+	switch s {
+	case parser.LockStrengthForUpdate:
+		return LockStrengthForUpdate
+	case parser.LockStrengthForShare:
+		return LockStrengthForShare
+	}
+	return LockStrengthForUpdate
+}
+
+func lockWaitPolicyFromParser(p parser.LockWaitPolicy) LockWaitPolicy {
+	switch p {
+	case parser.LockWaitNoWait:
+		return LockWaitNoWait
+	case parser.LockWaitSkipLocked:
+		return LockWaitSkipLocked
+	}
+	return LockWaitBlock
+}
+
+func findBindingByName(bindings []rangeBinding, name string) (rangeBinding, bool) {
+	for _, b := range bindings {
+		if b.qualifiedOnly {
+			continue
+		}
+		if b.alias != "" {
+			if strings.EqualFold(name, b.alias) {
+				return b, true
+			}
+			continue
+		}
+		if strings.EqualFold(name, b.table.Name) {
+			return b, true
+		}
+	}
+	return rangeBinding{}, false
 }
 
 func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveContext, error) {

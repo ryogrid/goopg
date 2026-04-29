@@ -447,6 +447,66 @@ type Insert struct {
 func (n *Insert) Pos() int       { return n.pos }
 func (n *Insert) Output() Schema { return nil }
 
+// LockStrength enumerates the row-locking strength a SELECT
+// requested via FOR UPDATE / FOR SHARE. Mirrors upstream's
+// LockClauseStrength enum (parsenodes.h). The zero value is
+// reserved for "no lock" — Stage A only emits the two upstream-
+// canonical strengths goopg's parser accepts (M0021-0001).
+type LockStrength int
+
+const (
+	// LockStrengthForUpdate — `FOR UPDATE`. Write-intent row
+	// lock. Mirrors upstream's LCS_FORUPDATE.
+	LockStrengthForUpdate LockStrength = iota + 1
+	// LockStrengthForShare — `FOR SHARE`. Read-intent row lock.
+	// Mirrors upstream's LCS_FORSHARE.
+	LockStrengthForShare
+)
+
+// LockWaitPolicy enumerates how a row-locking clause should
+// behave when a target row is already locked by another
+// transaction. Stage A executor only honors LockWaitBlock;
+// LockWaitNoWait / LockWaitSkipLocked stay deferred to
+// M0021-0003 but are carried through the plan node so the
+// executor can branch on them once support lands.
+type LockWaitPolicy int
+
+const (
+	LockWaitBlock      LockWaitPolicy = iota // wait for contention
+	LockWaitNoWait                           // NOWAIT — fail with 55P03
+	LockWaitSkipLocked                       // SKIP LOCKED — drop row
+)
+
+// LockedRel is the per-relation locking intent the planner
+// resolved from a SELECT's `FOR UPDATE / FOR SHARE [OF …]`
+// tail. One LockedRel per FROM-clause range variable in the
+// effective target set; multiple clauses may produce duplicate
+// entries today (Stage A executor will merge under a
+// strongest-wins rule when it lands).
+type LockedRel struct {
+	Table      *catalog.Table
+	Alias      string // FROM-clause alias for diagnostics; empty when bare table
+	Strength   LockStrength
+	WaitPolicy LockWaitPolicy
+}
+
+// LockRows is the upstream-shape wrapper that adds row-lock
+// acquisition over its child SELECT plan. Mirrors upstream's
+// LockRows operator (createplan.c). The planner emits one
+// LockRows at the top of the plan tree when the SELECT carries
+// any locking clause; pre-M0021 SELECTs never see this node.
+//
+// Output schema is the child's schema unchanged — locking is a
+// side effect on storage, not a row-shape transformation.
+type LockRows struct {
+	pos   int
+	Child Node
+	Locks []LockedRel
+}
+
+func (n *LockRows) Pos() int       { return n.pos }
+func (n *LockRows) Output() Schema { return n.Child.Output() }
+
 // OnConflictAction enumerates the resolved conflict action — mirrors
 // the parser's parser.OnConflictAction enum, but the analyzer-only
 // `OnConflictNone` placeholder doesn't appear here because the
