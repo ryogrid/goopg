@@ -1735,17 +1735,34 @@ unchecked item.
       planner enablement and HammerDB end-to-end validation
       are M0011-0003.)
 
-- [ ] HammerDB TPC-H NUMERIC index validation: reproduce the
-      `bench/tpch/run_all.sh` failure-class
-      ("ERROR: btree v0 only supports int4 keys, got
-      \"numeric\"") in a Go integration test that creates a
-      table with a `NUMERIC` column and runs `CREATE INDEX` /
-      `CREATE UNIQUE INDEX` /  `ADD PRIMARY KEY` against it
-      using realistic TPC-H column types (l_orderkey,
-      l_extendedprice, etc.). Confirm the index-build stage
-      reaches completion and basic equality lookups return
-      correct rows. Continues
+- [x] HammerDB TPC-H NUMERIC index validation (M0011-0003).
+      Design doc
       `docs/design/0011-0003-hammerdb-tpch-numeric-index-validation.md`.
+      (landed 2026-04-29: two pieces. (1) Planner —
+      `planIndexScanFromWhere` accepts `*NumericConst` on the
+      rhs of `col = const` so equality queries on NUMERIC
+      columns emit `IndexScan` rather than `SeqScan +
+      Filter`. (2) Integration test
+      `internal/executor/tpch_numeric_index_test.go` brings
+      up the eight TPC-H tables via `tpch.DDL()` +
+      `tpch.SampleInserts()` and runs the 13 single-column
+      NUMERIC CREATE INDEX statements mirroring HammerDB's
+      `pgolap.tcl` lines 511-544 (region_pk … idx_lineitem_
+      orderkey_fkidx). All 13 land cleanly. Sanity probe:
+      `btree.Search(EncodeNumericKey(k, 0))` round-trips on
+      `orders_pk`. End-to-end probe:
+      `SELECT o_orderkey FROM orders WHERE o_orderkey = 4`
+      now plans to IndexScan (verified via
+      `planContainsIndexScan` walking past Project/Filter
+      wrappers) and returns exactly one row.
+      `TestTPCHCompositeIndexStillRejected` pins the v0
+      single-column boundary — the four HammerDB composite
+      indexes still surface `0A000 only single-column btree
+      indexes are supported`. Full `go test ./...` green.
+      M0011 closes — `bench/tpch/run_all.sh` reaches the
+      "CREATING TPCH INDEXES" stage without the int4-only
+      restriction; full HammerDB completion needs composite
+      indexes which are separate scope.)
 
 ## Milestone 0012 — Lock manager + deadlock detection
 

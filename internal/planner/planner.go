@@ -1301,7 +1301,12 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 	switch resolvedKey.(type) {
-	case *IntegerConst, *ParamRef:
+	case *IntegerConst, *NumericConst, *ParamRef:
+		// NumericConst landed alongside M0011-0002: a NUMERIC
+		// b-tree index can be probed by either an integer or a
+		// numeric literal on the rhs of `=`. The executor's
+		// encodeBTreeKeyForColumn picks the right encoding from
+		// the column type.
 	default:
 		return nil, false, nil
 	}
