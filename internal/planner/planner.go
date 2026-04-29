@@ -174,6 +174,16 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 }
 
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	// Pre-plan WITH-list CTEs so FROM-clause references can
+	// substitute them in. Restorer pops the CTE scope back to
+	// the caller's view when this Plan call returns. nil-WITH
+	// returns a no-op restorer.
+	restore, err := preplanWithClause(s.With, cat)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
+
 	if s.SetOp != nil {
 		return nil, &PlanError{
 			Pos:     s.SetOp.Pos(),
@@ -360,7 +370,6 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	var (
 		targets []Expr
 		schema  Schema
-		err     error
 	)
 	if agg == nil {
 		targets, schema, err = resolveTargets(s.Targets, ctx)
@@ -517,6 +526,21 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBinding, error) {
 	if rv.Subquery != nil {
 		return planSubqueryRangeVar(rv, cat)
+	}
+	// CTE substitution (M0016-0002): an unschemed name takes the
+	// CTE before falling through to the catalog. CTE names are
+	// unschemed in upstream so `pg_catalog.foo` always hits the
+	// catalog. Multiple consumers each get a fresh plan reference
+	// (Stage A inlining); materialise-once is M0016-0004.
+	if rv.Schema == "" {
+		if ce := lookupPlannedCTE(rv.Name); ce != nil {
+			alias := rv.Alias
+			if alias == "" {
+				alias = ce.name
+			}
+			b := rangeBinding{table: ce.table, alias: alias, offset: 0}
+			return ce.body, b, nil
+		}
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !ok {
@@ -1340,6 +1364,11 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+	restore, err := preplanWithClause(s.With, cat)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
 	if !ok {
 		return nil, &PlanError{
@@ -1407,6 +1436,11 @@ func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
 }
 
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
+	restore, err := preplanWithClause(s.With, cat)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
@@ -1436,6 +1470,11 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
+	restore, err := preplanWithClause(s.With, cat)
+	if err != nil {
+		return nil, err
+	}
+	defer restore()
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}

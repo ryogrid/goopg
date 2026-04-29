@@ -1,0 +1,133 @@
+package planner
+
+// Non-recursive CTE planning (M0016-0002). Builds on the parser
+// AST + analyzer scope rules from M0016-0001.
+//
+// Strategy: inline-substitute per consumer. Each FROM-clause
+// reference to a CTE name returns a freshly-cloned plan of that
+// CTE's body. Multiple consumers in the same statement each get
+// their own copy of the plan tree — correctness-first; the
+// "materialise once, feed many" optimisation lands later under
+// M0016-0004.
+//
+// See docs/design/0016-0002-nonrecursive-cte-planner-executor.md.
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
+
+// plannedCTE is the planner-side record for one CTE: its planned
+// body Node, the synthetic *catalog.Table that downstream
+// rangeBinding code needs, and the body's output Schema (with
+// alias-renamed column names if the CTE's `(col, ...)` list was
+// specified).
+type plannedCTE struct {
+	name   string
+	body   Node
+	schema Schema
+	table  *catalog.Table
+}
+
+// planCTEs is the goroutine-thread-unsafe "current WITH-list"
+// scope visible to nested Plan calls. Mirrors the existing
+// `planParent` pattern. nil when no WITH clause is in scope.
+//
+// A CTE body's recursive Plan call inherits planCTEs from its
+// surrounding statement so a sibling CTE can reference an earlier
+// declaration (left-to-right visibility). When a nested statement
+// (subquery, CTE body) declares its own WITH, savePlanCTEs makes
+// the existing entries available too — name shadowing then mirrors
+// PostgreSQL.
+var planCTEs map[string]*plannedCTE
+
+// preplanWithClause planens every CTE in `with` (left-to-right,
+// each visible to subsequent siblings) and stamps the resulting
+// plannedCTE entries into the package-local planCTEs map. The
+// caller MUST defer the returned restorer to release the scope
+// once the WITH-prefixed statement has finished planning.
+//
+// Returns nil restorer when with is nil so the caller can defer
+// unconditionally with `defer restore()` and a no-op stub.
+func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), error) {
+	if with == nil {
+		return func() {}, nil
+	}
+	if with.Recursive {
+		// Second line of defence — the analyzer already rejects.
+		return nil, &PlanError{
+			Pos:     with.Pos(),
+			Code:    "0A000",
+			Message: "WITH RECURSIVE is not supported in v0 (Stage A)",
+		}
+	}
+	prev := planCTEs
+	cur := make(map[string]*plannedCTE, len(with.CTEs))
+	// Outer-scope CTEs stay visible — a nested WITH inherits but
+	// its own names shadow on conflict. Mirrors PG.
+	for k, v := range prev {
+		cur[k] = v
+	}
+	planCTEs = cur
+	restore := func() { planCTEs = prev }
+
+	for _, cte := range with.CTEs {
+		// Bypass Plan() entry's Analyze pass: the outer statement's
+		// Plan call already analyzed the whole tree (including this
+		// CTE body — analyzer.analyzeWith recurses into each CTE
+		// query under the right scope). A second analyzer pass at
+		// recursive-Plan time would re-validate WITHOUT the
+		// parent's CTE scope and erroneously reject sibling
+		// references like `WITH a AS (SELECT 1), b AS (SELECT *
+		// FROM a) ...`. Calling planSelect directly skips Analyze
+		// while still seeing the in-progress planCTEs map so an
+		// earlier sibling is visible to a later one.
+		body, err := planSelect(cte.Query, cat)
+		if err != nil {
+			restore()
+			return nil, err
+		}
+		schema := body.Output()
+		if len(cte.Columns) > 0 {
+			if len(cte.Columns) != len(schema) {
+				restore()
+				return nil, &PlanError{
+					Pos:     cte.Pos(),
+					Code:    "42P10",
+					Message: fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(schema)),
+				}
+			}
+			renamed := make(Schema, len(schema))
+			for i, c := range schema {
+				renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+			}
+			schema = renamed
+		}
+		cols := make([]catalog.Column, len(schema))
+		for i, c := range schema {
+			cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
+		}
+		entry := &plannedCTE{
+			name:   cte.Name,
+			body:   body,
+			schema: schema,
+			table:  &catalog.Table{Name: cte.Name, Columns: cols},
+		}
+		cur[strings.ToLower(cte.Name)] = entry
+	}
+	return restore, nil
+}
+
+// lookupPlannedCTE consults planCTEs for an unschemed name. CTE
+// names are unschemed in upstream so a `pg_catalog.foo` reference
+// always falls through to the catalog. Returns nil when no CTE
+// matches.
+func lookupPlannedCTE(name string) *plannedCTE {
+	if planCTEs == nil || name == "" {
+		return nil
+	}
+	return planCTEs[strings.ToLower(name)]
+}

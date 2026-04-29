@@ -2225,11 +2225,48 @@ out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
       Full `go test ./...` green. Planner / executor for
       non-recursive CTEs lands in M0016-0002.)
 
-- [ ] Non-recursive CTE planner + executor (M0016-0002).
-      Materialise CTE producers once; feed multiple
-      consumers; preserve statement-snapshot MVCC
-      consistency. Continues
+- [x] Non-recursive CTE planner + executor (M0016-0002).
+      Design doc
       `docs/design/0016-0002-nonrecursive-cte-planner-executor.md`.
+      (landed 2026-04-29: Stage A inline-substitution
+      strategy — each FROM-clause reference to a CTE name
+      returns a freshly-cloned plan of that CTE's body. New
+      `internal/planner/with.go` with `plannedCTE` record
+      (name + planned Node + Schema + synthetic
+      *catalog.Table), package-local `planCTEs map` (mirrors
+      the existing `planParent` save/restore pattern), and
+      `preplanWithClause(with, cat)` which walks each CTE
+      left-to-right with prior siblings visible to later ones
+      via the in-progress map. Returns a restorer the caller
+      defers. CTE body planning bypasses Plan()'s analyzer
+      pass and calls planSelect directly — the outer Plan()
+      Analyze already validated the whole tree under the
+      analyzer's CTE scope, and a second analyzer pass would
+      re-validate without the parent CTE scope and
+      erroneously reject sibling references. Column-alias
+      list arity validation matches the analyzer's check
+      (42P10). RECURSIVE rejected at planner level too
+      (0A000) as second line of defence. `planScanRangeVar`
+      gained a CTE-substitution path before catalog lookup,
+      gated on `rv.Schema == ""` (CTE names are unschemed).
+      Wired into all four entry points: `planSelect` /
+      `planInsert` / `planUpdate` / `planDelete` each gained
+      the preplanWithClause + defer restore stanza. Tests:
+      8 planner-side (TestPlanWithSimpleCTE, TestPlanWithCTE
+      ReadingTable (with table column type flow-through),
+      TestPlanWithCTEMultipleConsumers (cross-product —
+      pins inlining), TestPlanWithCTEReferencingPriorSibling
+      (left-to-right scope), TestPlanWithRecursiveRejected,
+      TestPlanWithCTEShadowsBaseRelation,
+      TestPlanWithColumnAliasArityMismatch (42P10),
+      TestPlanWithoutCTEUnchanged regression guard) + 2
+      executor end-to-end (TestExecuteWithSimpleCTE,
+      TestExecuteWithCTEMultipleConsumers — confirm the
+      executor needs zero CTE infrastructure since Stage A
+      inlining produces a vanilla plan tree). Full
+      `go test ./...` green. Materialise-once optimisation
+      and EXPLAIN labels for CTE producers land in
+      M0016-0004.)
 
 - [ ] Recursive CTE fixpoint execution (M0016-0003).
       Anchor + iterative recursive member; cycle-safe
