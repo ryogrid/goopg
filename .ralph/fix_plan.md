@@ -2128,10 +2128,32 @@ item.
       synthetic record streams in tests but sees no markers in
       live workloads until the executor wires them in.)
 
-- [ ] Wire-layer emission of `EncodeXactCommit` / `EncodeXactAbort`
-      at executor transaction boundaries, plus a long-lived
-      classifier loop that consumes a `RecordIterator` over a
-      logical slot and drives a real `OutputPlugin`. Continues in
+- [x] Wire-layer emission of `EncodeXactCommit` /
+      `EncodeXactAbort` at executor transaction boundaries.
+      Continues in
+      `docs/design/0008-0001-logical-decoding-pipeline.md`.
+      (landed 2026-04-29: `mvcc.Manager` grew `XactMarker`
+      enum (`XactCommit`/`XactAbort`) and
+      `SetXactMarkerLogger(fn func(xid, kind) error)`. Both
+      `Commit` and `Rollback` invoke the logger under the
+      manager lock before the active-set delete; a logger
+      error surfaces back through Commit/Rollback so a
+      WAL-append failure stops the txn from finishing and the
+      caller can retry. `initdb.Open` installs a hook that
+      `walWriter.Append`s `EncodeXactCommit(xid)` /
+      `EncodeXactAbort(xid)` — single seam covers every server
+      path (simple-query, extended-query, COPY) without
+      per-call-site changes. Tests:
+      TestXactMarkerLoggerCalledOnCommit/OnRollback,
+      TestXactMarkerLoggerErrorAbortsCommit (mvcc),
+      TestOpenWiresXactMarkerHook (end-to-end via
+      `wal.ReadAll`). The classifier from loop 3 now sees
+      real markers in live workloads.)
+
+- [ ] Long-lived classifier loop: spin a goroutine per logical
+      slot that consumes a `RecordIterator` and drives a real
+      `OutputPlugin`. Snapshot builder skeleton (slot-creation-
+      time HISTORIC snapshot). Continues in
       `docs/design/0008-0001-logical-decoding-pipeline.md`.
 
 - [ ] `pgoutput` output plugin: B / C / R / I / U / D message

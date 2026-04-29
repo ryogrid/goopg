@@ -34,9 +34,10 @@ type txState struct {
 // Manager tracks active transactions and creates statement snapshots.
 // It is safe for concurrent use.
 type Manager struct {
-	mu      sync.Mutex
-	nextXID storage.TransactionID
-	active  map[storage.TransactionID]*txState
+	mu         sync.Mutex
+	nextXID    storage.TransactionID
+	active     map[storage.TransactionID]*txState
+	xactMarker func(storage.TransactionID, XactMarker) error
 }
 
 // NewManager returns a fresh manager whose first assigned xid is 3,
@@ -117,13 +118,21 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 }
 
 // Commit marks tx committed and removes it from the active set.
+// The XactMarkerLogger hook (when installed) is invoked under the
+// manager's lock with kind=XactCommit before the active-set
+// removal so a hook failure surfaces as a Commit error and the
+// transaction stays in-progress for the caller to retry.
 func (m *Manager) Commit(tx Transaction) error {
-	return m.finish(tx)
+	return m.finish(tx, XactCommit)
 }
 
 // Rollback marks tx aborted and removes it from the active set.
+// The XactMarkerLogger hook is invoked the same way as Commit
+// but with kind=XactAbort. A hook failure on rollback also keeps
+// the transaction in-progress; the caller is expected to retry
+// or escalate.
 func (m *Manager) Rollback(tx Transaction) error {
-	return m.finish(tx)
+	return m.finish(tx, XactAbort)
 }
 
 // ActiveCount returns the number of in-progress transactions.
@@ -149,7 +158,7 @@ func (m *Manager) OldestXmin() storage.TransactionID {
 	return xmin
 }
 
-func (m *Manager) finish(tx Transaction) error {
+func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	state, ok := m.active[tx.XID]
@@ -159,8 +168,51 @@ func (m *Manager) finish(tx Transaction) error {
 	if state.isolation != tx.Isolation {
 		return fmt.Errorf("mvcc: transaction isolation mismatch xid=%d", tx.XID)
 	}
+	if m.xactMarker != nil {
+		if err := m.xactMarker(tx.XID, kind); err != nil {
+			return fmt.Errorf("mvcc: xact-marker hook (xid=%d, kind=%v): %w", tx.XID, kind, err)
+		}
+	}
 	delete(m.active, tx.XID)
 	return nil
+}
+
+// XactMarker discriminates the two transaction-end markers fed to
+// the M0008 logical decoder via SetXactMarkerLogger. Mirrors the
+// upstream xact-end records.
+type XactMarker int
+
+const (
+	// XactCommit is the kind passed to the hook from Commit.
+	XactCommit XactMarker = iota
+	// XactAbort is the kind passed to the hook from Rollback.
+	XactAbort
+)
+
+func (k XactMarker) String() string {
+	switch k {
+	case XactCommit:
+		return "commit"
+	case XactAbort:
+		return "abort"
+	}
+	return "unknown"
+}
+
+// SetXactMarkerLogger installs a callback the manager invokes on
+// every Commit / Rollback before removing the xact from the
+// active set. The hook is the seam the M0008 logical decoder
+// uses to learn about transaction boundaries — production wires
+// it to wal.Writer.Append(EncodeXactCommit/Abort(xid)) so the
+// classifier sees commit/abort markers in the WAL stream. See
+// docs/design/0008-0001-logical-decoding-pipeline.md.
+//
+// Pass nil to clear a previously installed hook. Tests that care
+// only about MVCC mechanics typically leave it unset.
+func (m *Manager) SetXactMarkerLogger(fn func(storage.TransactionID, XactMarker) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.xactMarker = fn
 }
 
 func (m *Manager) captureSnapshotLocked() Snapshot {

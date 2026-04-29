@@ -7,7 +7,9 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // TestOpenAfterInitReturnsRuntime: the typical operator flow —
@@ -228,5 +230,81 @@ func TestRuntimeCloseIsIdempotent(t *testing.T) {
 	}
 	if err := rt.Close(); err != nil {
 		t.Fatalf("second close: %v", err)
+	}
+}
+
+// TestOpenWiresXactMarkerHook is the end-to-end pin for the
+// M0008 wire-layer emission: after a Begin/Commit through the
+// runtime's TxnMgr, the WAL stream contains an XactCommit
+// record whose xid matches the committed txn. Without this
+// hook, the M0008 classifier loop on a logical slot would
+// never see commit/abort markers and could not bound
+// transactions in the reorder buffer.
+func TestOpenWiresXactMarkerHook(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.TxnMgr.Commit(tx); err != nil {
+		t.Fatal(err)
+	}
+	tx2, _ := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err := rt.TxnMgr.Rollback(tx2); err != nil {
+		t.Fatal(err)
+	}
+	// Flush the WAL writer so ReadAll observes the markers,
+	// then close the runtime so segment files are visible to
+	// the reader.
+	if err := rt.WAL.FlushUpTo(rt.WAL.WrittenLSN()); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, err := wal.ReadAll(filepath.Join(dir, "pg_wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawCommit, sawAbort bool
+	for _, r := range recs {
+		if len(r.Payload) == 0 {
+			continue
+		}
+		switch r.Payload[0] {
+		case wal.RecordKindXactCommit:
+			xid, err := wal.DecodeXactMarker(r.Payload)
+			if err != nil {
+				t.Errorf("decode commit: %v", err)
+				continue
+			}
+			if xid == tx.XID {
+				sawCommit = true
+			}
+		case wal.RecordKindXactAbort:
+			xid, err := wal.DecodeXactMarker(r.Payload)
+			if err != nil {
+				t.Errorf("decode abort: %v", err)
+				continue
+			}
+			if xid == tx2.XID {
+				sawAbort = true
+			}
+		}
+	}
+	if !sawCommit {
+		t.Errorf("WAL stream missing XactCommit for xid=%d", tx.XID)
+	}
+	if !sawAbort {
+		t.Errorf("WAL stream missing XactAbort for xid=%d", tx2.XID)
 	}
 }

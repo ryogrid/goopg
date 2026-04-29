@@ -4,6 +4,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/goopg/goopg/internal/storage"
 )
 
 func TestParseIsolationLevel(t *testing.T) {
@@ -119,5 +121,74 @@ func TestFinishUnknownTransaction(t *testing.T) {
 	}
 	if err := m.Commit(tx); !errors.Is(err, ErrUnknownTransaction) {
 		t.Fatalf("err=%v want ErrUnknownTransaction", err)
+	}
+}
+
+// TestXactMarkerLoggerCalledOnCommit pins the M0008 hook
+// contract: a successful Commit invokes the logger with
+// kind=XactCommit and the xact's xid before removing it from the
+// active set. The hook is the seam the wire layer uses to emit
+// EncodeXactCommit records into the WAL stream.
+func TestXactMarkerLoggerCalledOnCommit(t *testing.T) {
+	m := NewManager()
+	type call struct {
+		xid  storage.TransactionID
+		kind XactMarker
+	}
+	var calls []call
+	m.SetXactMarkerLogger(func(xid storage.TransactionID, kind XactMarker) error {
+		calls = append(calls, call{xid, kind})
+		return nil
+	})
+	tx, err := m.Begin(IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Commit(tx); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls=%v want one entry", calls)
+	}
+	if calls[0].xid != tx.XID || calls[0].kind != XactCommit {
+		t.Errorf("call=%+v want {xid=%d, XactCommit}", calls[0], tx.XID)
+	}
+}
+
+// TestXactMarkerLoggerCalledOnRollback: same hook contract but
+// for Rollback → kind=XactAbort.
+func TestXactMarkerLoggerCalledOnRollback(t *testing.T) {
+	m := NewManager()
+	var got XactMarker
+	m.SetXactMarkerLogger(func(xid storage.TransactionID, kind XactMarker) error {
+		got = kind
+		return nil
+	})
+	tx, _ := m.Begin(IsolationReadCommitted)
+	if err := m.Rollback(tx); err != nil {
+		t.Fatal(err)
+	}
+	if got != XactAbort {
+		t.Errorf("kind=%v want XactAbort", got)
+	}
+}
+
+// TestXactMarkerLoggerErrorAbortsCommit: when the hook fails
+// (e.g. WAL append errors out), Commit must surface the error
+// and the txn must remain in-progress so the caller can retry
+// or escalate.
+func TestXactMarkerLoggerErrorAbortsCommit(t *testing.T) {
+	m := NewManager()
+	wantErr := errors.New("wal: out of disk")
+	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker) error {
+		return wantErr
+	})
+	tx, _ := m.Begin(IsolationReadCommitted)
+	if err := m.Commit(tx); err == nil || !errors.Is(err, wantErr) {
+		t.Errorf("Commit err=%v want %v", err, wantErr)
+	}
+	// Txn must still be in-progress (not removed from active set).
+	if got := m.ActiveCount(); got != 1 {
+		t.Errorf("ActiveCount=%d want 1 (commit failed, tx still in-progress)", got)
 	}
 }

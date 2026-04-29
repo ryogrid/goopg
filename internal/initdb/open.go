@@ -215,6 +215,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	cat := catalog.NewInMemory()
 	txnMgr := mvcc.NewManager()
+	// Wire the M0008 logical-decoding xact-marker hook: every
+	// successful Commit / Rollback against this manager appends
+	// an EncodeXactCommit / EncodeXactAbort record to the WAL
+	// stream so the M0008 classifier can drive its reorder
+	// buffer. Errors propagate back through Commit / Rollback so
+	// a WAL-append failure stops the txn from finishing. See
+	// docs/design/0008-0001-logical-decoding-pipeline.md.
+	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
+		var payload []byte
+		switch kind {
+		case mvcc.XactCommit:
+			payload = wal.EncodeXactCommit(xid)
+		case mvcc.XactAbort:
+			payload = wal.EncodeXactAbort(xid)
+		default:
+			return fmt.Errorf("goopg: unknown xact marker %v", kind)
+		}
+		_, _, err := walWriter.Append(payload)
+		return err
+	})
 	if err := loadCatalogSnapshot(abs, cat, txnMgr); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()

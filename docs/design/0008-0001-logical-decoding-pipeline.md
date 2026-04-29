@@ -213,12 +213,23 @@ structures that the future WAL classifier will drive.
    xmin and HeapDelete already carries xmax. That keeps the wire
    format backwards-compatible with persisted WAL streams.
 
-   What still needs to happen: the executor / wire layer must
-   emit `EncodeXactCommit(xid)` at COMMIT and `EncodeXactAbort
-   (xid)` at ROLLBACK boundaries. Until that lands, the
-   classifier works against synthetic record streams in tests but
-   sees no commit/abort markers in real workloads. That's tracked
-   as the next M0008 loop.
+   Loop 4 closed the wire-layer emission: `mvcc.Manager` grew
+   `SetXactMarkerLogger(fn func(xid, kind) error)` and `Commit`/
+   `Rollback` invoke it under the manager's lock before removing
+   the txn from the active set. A logger error propagates back
+   through `Commit`/`Rollback` so a WAL-append failure stops the
+   txn from finishing — the caller can retry or escalate.
+   `initdb.Open` installs a hook that calls
+   `walWriter.Append(EncodeXactCommit/Abort(xid))`, so every
+   server path that flows through `mvcc.Manager.Commit/Rollback`
+   (simple-query, extended-query, COPY) automatically emits
+   markers without needing per-call-site code changes.
+
+   The end-to-end pin lives in
+   `internal/initdb/open_test.go::TestOpenWiresXactMarkerHook`:
+   begin/commit + begin/rollback through the runtime's TxnMgr,
+   then `wal.ReadAll` against the data directory finds both
+   markers with matching xids.
 
 5. **Output plugin contract.** Already shipped by this loop as
    `wal.OutputPlugin`. v0's first implementation is `pgoutput`
@@ -253,6 +264,18 @@ Slot foundation + view (loop 1):
   `catalog_xmin` keys) round-trip cleanly.
 - `internal/initdb/replication_views_test.go::TestPgReplicationSlotsViewRendersBothKinds`
   — view renders one row per slot with the upstream column shape.
+
+Wire-layer xact-marker emission (loop 4):
+
+- `internal/mvcc/manager_test.go::TestXactMarkerLoggerCalledOnCommit`
+  / `…OnRollback` — successful Commit/Rollback invokes the logger
+  with the right xid and kind.
+- `…::TestXactMarkerLoggerErrorAbortsCommit` — a logger error
+  surfaces as a Commit error and the txn stays in-progress.
+- `internal/initdb/open_test.go::TestOpenWiresXactMarkerHook` —
+  end-to-end: a real Begin/Commit through `Runtime.TxnMgr` lands
+  an `XactCommit` record in the WAL stream readable via
+  `wal.ReadAll`.
 
 WAL classifier (loop 3):
 
