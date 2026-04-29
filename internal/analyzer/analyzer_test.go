@@ -102,15 +102,46 @@ func TestAnalyzeDMLTypeAndReturningErrors(t *testing.T) {
 	expectAnalyzeCode(t, cat, "DELETE FROM pgbench_accounts RETURNING aid", "0A000")
 }
 
-// TestAnalyzeWindowFunctionRejected — M0020 step 1 gate. The
-// parser accepts `OVER (...)` but the analyzer / planner /
-// executor support hasn't landed yet; a SELECT with a window
-// function must surface 0A000 so users see the precise
-// "not yet supported" diagnostic instead of a silent
-// non-windowed evaluation.
-func TestAnalyzeWindowFunctionRejected(t *testing.T) {
+func TestAnalyzeWindowFunctionAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT row_number() OVER () FROM pgbench_accounts",
+		"SELECT rank() OVER (PARTITION BY bid ORDER BY aid) FROM pgbench_accounts",
+		"SELECT aid FROM pgbench_accounts ORDER BY row_number() OVER (ORDER BY aid)",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
 	expectAnalyzeCode(t, cat,
-		"SELECT row_number() OVER () FROM pgbench_accounts",
+		"SELECT count(*) OVER () FROM pgbench_accounts",
+		"0A000")
+}
+
+func TestAnalyzeWindowFunctionArgShapeRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT row_number(1) OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT rank(DISTINCT aid) OVER () FROM pgbench_accounts",
+		"42601")
+}
+
+func TestAnalyzeWindowFunctionPlacementRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT aid FROM pgbench_accounts WHERE row_number() OVER () > 0",
+		"0A000")
+	expectAnalyzeCode(t, cat,
+		"SELECT aid FROM pgbench_accounts GROUP BY row_number() OVER ()",
+		"0A000")
+	expectAnalyzeCode(t, cat,
+		"SELECT aid FROM pgbench_accounts HAVING row_number() OVER () > 0",
 		"0A000")
 }

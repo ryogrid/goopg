@@ -2804,7 +2804,7 @@ Substantial. Decompose when picked up.
       - [x] M0020-S01: add design doc
             `docs/design/0020-0002-window-analyzer-and-planner.md`
             and index `docs/design/README.md`.
-      - [ ] M0020-S02: analyzer allows window funcs (Stage A:
+      - [x] M0020-S02: analyzer allows window funcs (Stage A:
             row_number/rank) with deterministic placement and
             argument-shape diagnostics.
       - [ ] M0020-S03: planner plan-node/types for WindowAgg and

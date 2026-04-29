@@ -195,6 +195,9 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 	if err := analyzeTargets(s.Targets, ctx); err != nil {
 		return err
 	}
+	if s.Where != nil && exprHasWindowFunc(s.Where) {
+		return analyzeError(s.Where.Pos(), "0A000", "window functions are not allowed in WHERE")
+	}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
 	}
@@ -206,11 +209,17 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		// substitution before type-checking so the alias doesn't
 		// trip the undefined-column check.
 		expr := orderBySubstitution(g, s.Targets)
+		if exprHasWindowFunc(expr) {
+			return analyzeError(expr.Pos(), "0A000", "window functions are not allowed in GROUP BY")
+		}
 		if _, err := analyzeExpr(expr, ctx); err != nil {
 			return err
 		}
 	}
 	if s.Having != nil {
+		if exprHasWindowFunc(s.Having) {
+			return analyzeError(s.Having.Pos(), "0A000", "window functions are not allowed in HAVING")
+		}
 		typ, err := analyzeExpr(s.Having, ctx)
 		if err != nil {
 			return err
@@ -555,6 +564,54 @@ func analyzeTargets(targets []parser.ResTarget, ctx *scope) error {
 	return nil
 }
 
+func exprHasWindowFunc(e parser.Expr) bool {
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		return exprHasWindowFunc(x.Left) || exprHasWindowFunc(x.Right)
+	case *parser.UnaryOp:
+		return exprHasWindowFunc(x.Operand)
+	case *parser.CastExpr:
+		return exprHasWindowFunc(x.Operand)
+	case *parser.ExtractExpr:
+		return exprHasWindowFunc(x.Source)
+	case *parser.CaseExpr:
+		if x.Operand != nil && exprHasWindowFunc(x.Operand) {
+			return true
+		}
+		for _, w := range x.Whens {
+			if exprHasWindowFunc(w.When) || exprHasWindowFunc(w.Then) {
+				return true
+			}
+		}
+		if x.Else != nil && exprHasWindowFunc(x.Else) {
+			return true
+		}
+		return false
+	case *parser.InExpr:
+		if exprHasWindowFunc(x.Operand) {
+			return true
+		}
+		for _, v := range x.List {
+			if exprHasWindowFunc(v) {
+				return true
+			}
+		}
+		return false
+	case *parser.FuncCall:
+		if x.Over != nil {
+			return true
+		}
+		for _, a := range x.Args {
+			if exprHasWindowFunc(a) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
 func analyzeStar(star *parser.StarExpr, ctx *scope) error {
 	if ctx == nil || len(ctx.rels) == 0 {
 		return analyzeError(star.Pos(), "42601", "SELECT * with no FROM clause")
@@ -738,13 +795,8 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{Name: "unknown"}, nil
 		}
 	case *parser.FuncCall:
-		// M0020-0001 step 1: parser accepts `func() OVER (...)`,
-		// but analyzer / planner / executor support hasn't
-		// landed yet. Reject loudly so a SELECT with a window
-		// function never silently degrades to a non-windowed
-		// scalar/aggregate evaluation.
 		if x.Over != nil {
-			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "window functions are not supported in v0 analyzer")
+			return analyzeWindowFuncCall(x, ctx)
 		}
 		for _, a := range x.Args {
 			if _, err := analyzeExpr(a, ctx); err != nil {
@@ -785,6 +837,35 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
+}
+
+func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error) {
+	name := strings.ToLower(x.Name.Name)
+	switch name {
+	case "row_number", "rank":
+		if x.Star || x.Distinct || len(x.Args) != 0 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name))
+		}
+	default:
+		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
+	}
+	for _, pe := range x.Over.PartitionBy {
+		if exprHasWindowFunc(pe) {
+			return catalog.Type{}, analyzeError(pe.Pos(), "0A000", "nested window functions are not supported")
+		}
+		if _, err := analyzeExpr(pe, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+	}
+	for _, ob := range x.Over.OrderBy {
+		if exprHasWindowFunc(ob.Expr) {
+			return catalog.Type{}, analyzeError(ob.Expr.Pos(), "0A000", "nested window functions are not supported")
+		}
+		if _, err := analyzeExpr(ob.Expr, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+	}
+	return catalog.Type{Name: "int8"}, nil
 }
 
 func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error) {
