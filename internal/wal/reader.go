@@ -16,6 +16,13 @@ type Record struct {
 
 // ReadAll decodes every record found under walDir across ordered
 // segments. It is intended for recovery and unit tests.
+//
+// Auto-detects the on-disk format via DetectWALFormat: page-emitted
+// segments (M0014-0001 step 2 / WALFormatPGCompat) are walked with
+// page-header skipping; legacy bare-record streams use the
+// pre-M0014 zero-record-header EOS sentinel. The caller does not
+// need to know which format is in use — the same call site handles
+// both during the M0014 rollout window.
 func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 	if segmentSize <= 0 {
 		segmentSize = DefaultSegmentSize
@@ -24,6 +31,21 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 	stream, err := readStream(walDir, segmentSize)
 	if err != nil {
 		return nil, err
+	}
+	if len(stream) == 0 {
+		return nil, nil
+	}
+
+	// Format auto-detection: a successful classification picks
+	// the matching reader path. Classification errors (e.g.
+	// segment shorter than a page header — short tests use
+	// 32-byte segments) silently fall back to the legacy
+	// flat-record-stream walk. The legacy path's per-record
+	// CRC validates correctness; misclassification of a real
+	// page-emitted segment as legacy would surface as a CRC
+	// mismatch on the very first record.
+	if format, derr := DetectWALFormat(walDir); derr == nil && format == WALFormatPGCompat {
+		return readAllPageAware(stream, segmentSize)
 	}
 
 	var records []Record
@@ -45,6 +67,67 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 		off += n
 	}
 
+	return records, nil
+}
+
+// readAllPageAware walks a page-emitted WAL stream (M0014-0001 step 2):
+// at every page boundary skip the page header (or stop on an
+// all-zero header — preallocated tail), then decode records that
+// may straddle page boundaries. Record-byte LSNs include the page
+// header bytes between record fragments, mirroring upstream's
+// LSN-as-byte-offset semantics.
+func readAllPageAware(stream []byte, segSize int64) ([]Record, error) {
+	var records []Record
+	off := 0
+	for off < len(stream) {
+		pos := int64(off)
+		if pos%XLOGBlockSize == 0 {
+			hsize := pageHeaderSizeAt(pos, segSize)
+			if off+hsize > len(stream) {
+				break
+			}
+			if isZeroBytes(stream[off : off+hsize]) {
+				break
+			}
+			off += hsize
+			continue
+		}
+		// Mid-page record. The first 8 bytes are the v0
+		// length+CRC frame; if all zero, EOS.
+		if off+recordHeaderSize > len(stream) {
+			break
+		}
+		if isZeroHeader(stream[off:]) {
+			break
+		}
+		// Peek at length to compute total record size, then
+		// extract the contiguous record bytes (skipping any
+		// page header that sits between fragments).
+		header, _ := extractRecordBytes(stream[off:], pos, segSize, recordHeaderSize)
+		if len(header) < recordHeaderSize {
+			break
+		}
+		payloadLen := int(header[0]) | int(header[1])<<8 | int(header[2])<<16 | int(header[3])<<24
+		if payloadLen < 0 {
+			return nil, fmt.Errorf("wal: decode at offset %d: negative payload length %d", off, payloadLen)
+		}
+		total := recordHeaderSize + payloadLen
+		fullBytes, consumed := extractRecordBytes(stream[off:], pos, segSize, total)
+		if len(fullBytes) < total {
+			break
+		}
+		payload, n, err := decodeRecord(fullBytes)
+		if err != nil {
+			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
+		}
+		if n != total {
+			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, n, total)
+		}
+		start := uint64(off) + 1
+		end := uint64(off) + uint64(consumed)
+		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: payload})
+		off += consumed
+	}
 	return records, nil
 }
 

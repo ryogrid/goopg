@@ -30,12 +30,19 @@ import (
 // buffer is reused, so callers must not retain the slice past the
 // next `Next` call without copying.
 type RecordIterator struct {
-	writer    *Writer
-	walDir    string
-	segSize   int64
-	wake      chan struct{}
-	pos       int64 // 0-based byte offset corresponding to the LSN cursor
-	closed    bool
+	writer  *Writer
+	walDir  string
+	segSize int64
+	wake    chan struct{}
+	pos     int64 // 0-based byte offset corresponding to the LSN cursor
+	closed  bool
+	// pageHeaders mirrors Writer.PageHeadersEnabled() at iterator
+	// construction time. When true, the cursor walks page-header
+	// bytes transparently: at every page boundary the iterator
+	// skips a 24- or 40-byte XLogPageHeader, and record-byte reads
+	// can span page boundaries (the next page's header sits between
+	// fragments). See M0014-0001 step 2.
+	pageHeaders bool
 }
 
 // NewRecordIterator constructs a streaming iterator anchored at
@@ -59,11 +66,12 @@ func NewRecordIterator(w *Writer, walDir string, segSize int64, startLSN uint64)
 	wake := make(chan struct{}, 1)
 	w.Subscribe(wake)
 	return &RecordIterator{
-		writer:  w,
-		walDir:  walDir,
-		segSize: segSize,
-		wake:    wake,
-		pos:     pos,
+		writer:      w,
+		walDir:      walDir,
+		segSize:     segSize,
+		wake:        wake,
+		pos:         pos,
+		pageHeaders: w.PageHeadersEnabled(),
 	}, nil
 }
 
@@ -88,6 +96,21 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 	}
 	for {
 		written := it.writer.WrittenLSN()
+		// In page-headers mode, advance the cursor past any
+		// page header that sits at the current boundary. The
+		// header bytes are part of the WAL stream byte count
+		// (so writePos covers them) but carry no record data —
+		// transparent skip on the read side mirrors the
+		// transparent insertion on the writer side.
+		if it.pageHeaders {
+			for it.pos < int64(written) && it.pos%XLOGBlockSize == 0 {
+				hsize := int64(pageHeaderSizeAt(it.pos, it.segSize))
+				if it.pos+hsize > int64(written) {
+					break
+				}
+				it.pos += hsize
+			}
+		}
 		// `written` is the LSN of the last byte appended; the next
 		// record's start byte is at offset `written` (0-based) =
 		// LSN `written + 1`. So if our cursor (0-based pos) equals
@@ -119,20 +142,24 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 // count. Header / payload that span segments are pasted together by
 // reading the trailing bytes of one segment and the leading bytes
 // of the next.
+//
+// In page-headers mode, reads transparently span page boundaries:
+// the iterator extracts only record bytes (skipping XLogPageHeader
+// bytes) and the returned advance count includes those header
+// bytes so the cursor lands on the start of the next page's
+// content. `pos` must point at a record byte (not a page header)
+// — Next() advances past leading headers before calling here.
 func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
-	header, err := it.readBytesAt(pos, recordHeaderSize)
+	header, _, err := it.readRecordBytesAt(pos, recordHeaderSize)
 	if err != nil {
 		return Record{}, 0, err
 	}
-	// We need the full record bytes for decodeRecord (which
-	// validates CRC). Compute the length from the header to avoid
-	// reading more than one record.
 	payloadLen := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16 | uint32(header[3])<<24)
 	if payloadLen < 0 {
 		return Record{}, 0, fmt.Errorf("%w: negative payload length %d", ErrCorruptRecord, payloadLen)
 	}
 	total := recordHeaderSize + payloadLen
-	body, err := it.readBytesAt(pos, total)
+	body, advance, err := it.readRecordBytesAt(pos, total)
 	if err != nil {
 		return Record{}, 0, err
 	}
@@ -144,8 +171,46 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		return Record{}, 0, fmt.Errorf("wal: iterator size mismatch: %d vs %d", n, total)
 	}
 	startLSN := uint64(pos) + 1
-	endLSN := uint64(pos) + uint64(total)
-	return Record{StartLSN: startLSN, EndLSN: endLSN, Payload: payload}, total, nil
+	endLSN := uint64(pos) + uint64(advance)
+	return Record{StartLSN: startLSN, EndLSN: endLSN, Payload: payload}, advance, nil
+}
+
+// readRecordBytesAt reads `n` logical record bytes starting at
+// stream byte offset `pos`. In legacy mode this is identical to
+// readBytesAt; in page-headers mode the read transparently steps
+// over any 24- or 40-byte XLogPageHeader that sits between record
+// bytes, returning the number of physical stream bytes consumed
+// (record bytes + skipped page-header bytes) as `advance`.
+func (it *RecordIterator) readRecordBytesAt(pos int64, n int) ([]byte, int, error) {
+	if !it.pageHeaders {
+		out, err := it.readBytesAt(pos, n)
+		if err != nil {
+			return nil, 0, err
+		}
+		return out, n, nil
+	}
+	out := make([]byte, 0, n)
+	advance := 0
+	for len(out) < n {
+		cur := pos + int64(advance)
+		if cur%XLOGBlockSize == 0 {
+			hsize := pageHeaderSizeAt(cur, it.segSize)
+			advance += hsize
+			continue
+		}
+		space := XLOGBlockSize - int(cur%XLOGBlockSize)
+		want := n - len(out)
+		if want > space {
+			want = space
+		}
+		buf, err := it.readBytesAt(cur, want)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, buf...)
+		advance += want
+	}
+	return out, advance, nil
 }
 
 // readBytesAt fetches `n` bytes starting at byte offset `pos` in the

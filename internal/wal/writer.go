@@ -94,6 +94,31 @@ type Config struct {
 	// GUC. Default 0 keeps the legacy disk-only path. See
 	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
 	SenderMemoryBuffer int64
+
+	// PageHeaders flips the writer's append path onto the
+	// PG-compatible XLOG page layout (M0014-0001 step 2): every
+	// 8 KiB page boundary gets a 24-byte short page header, every
+	// segment boundary gets a 40-byte long page header, and records
+	// crossing a page boundary stamp XLP_FIRST_IS_CONTRECORD +
+	// xlp_rem_len on the next page. Default false keeps the legacy
+	// flat-record-stream layout so the rest of M0014 (record-frame
+	// switchover, recovery validation) can land incrementally
+	// without forcing every existing test or data dir through the
+	// new layout. See
+	// docs/design/0014-0001-xlog-page-and-segment-layout-compat.md.
+	PageHeaders bool
+
+	// SystemID is the cluster's pg_control system identifier,
+	// stamped into every long-form page header's xlp_sysid for
+	// pg_waldump cross-check. Caller (cmd/goopg start) plumbs the
+	// pg_control value through. Only consulted when PageHeaders=true.
+	SystemID uint64
+
+	// TimelineID is the cluster's current timeline, stamped into
+	// every page header's xlp_tli. Defaults to 1 when zero — the
+	// initial timeline a fresh cluster starts on. Only consulted
+	// when PageHeaders=true.
+	TimelineID uint32
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -145,6 +170,9 @@ func (c *Config) withDefaults() {
 	}
 	if c.SegmentSize <= 0 {
 		c.SegmentSize = DefaultSegmentSize
+	}
+	if c.PageHeaders && c.TimelineID == 0 {
+		c.TimelineID = 1
 	}
 }
 
@@ -234,6 +262,16 @@ type Writer struct {
 	// walBufferCounters shares atomics with state for the
 	// M0013-0003 wal_buffers_* columns of pg_stat_wal_io.
 	walBufferCounters *walBufferCounters
+
+	// pageHeaders mirrors Config.PageHeaders so RecordIterator
+	// (and any other reader holding a *Writer reference) can
+	// decide whether to skip page-header bytes when streaming
+	// records. Static for the Writer's lifetime.
+	pageHeaders bool
+	// segmentSize mirrors Config.SegmentSize so iterators can
+	// distinguish a long-form (segment-boundary) page header
+	// from a short-form one without having to thread cfg in.
+	segmentSize int64
 }
 
 type state struct {
@@ -330,6 +368,14 @@ type state struct {
 	// walBufferCounters mirrors Writer.walBufferCounters via
 	// pointer — drainBufferBytes bumps these (M0013-0003).
 	walBufferCounters *walBufferCounters
+
+	// pageHeaders, when true, makes state.append interleave
+	// PG-compatible page headers into the on-disk byte stream.
+	// Mirrors Config.PageHeaders. See M0014-0001 step 2 in
+	// docs/design/0014-0001-xlog-page-and-segment-layout-compat.md.
+	pageHeaders bool
+	sysID       uint64
+	tli         uint32
 }
 
 // directIOCounters holds the atomic counters wal-direct-I/O
@@ -394,6 +440,8 @@ func NewWriter(cfg Config) (*Writer, error) {
 		memRing:                st.memRing,
 		directIOCounters:       counters,
 		walBufferCounters:      bufCounters,
+		pageHeaders:            cfg.PageHeaders,
+		segmentSize:            cfg.SegmentSize,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
@@ -421,6 +469,14 @@ func (w *Writer) DirectIOFallbackReason() string {
 func (w *Writer) DirectIORequested() bool {
 	return w.directIORequested
 }
+
+// PageHeadersEnabled reports whether the writer is emitting
+// PG-compatible XLOG page headers (M0014-0001 step 2). Returns the
+// Config.PageHeaders value the writer was constructed with — static
+// for the lifetime of the Writer. RecordIterator consults this so
+// it knows whether the on-disk segments contain interleaved page
+// headers it must skip.
+func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
 
 // MemRing returns the in-memory WAL ring. nil when
 // `wal_sender_memory_buffer = 0` (or absent). RecordIterator
@@ -628,7 +684,7 @@ func (w *Writer) send(req op) error {
 }
 
 func loadState(cfg Config) (*state, error) {
-	writePos, err := detectWritePos(cfg.WALDir, cfg.SegmentSize)
+	writePos, err := detectWritePos(cfg.WALDir, cfg.SegmentSize, cfg.PageHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -664,6 +720,9 @@ func loadState(cfg Config) (*state, error) {
 		directIOBlockSize:      4096,
 		memRing:                NewMemRing(cfg.SenderMemoryBuffer),
 		walBuf:                 newWALBuffer(cfg.WALBuffers),
+		pageHeaders:            cfg.PageHeaders,
+		sysID:                  cfg.SystemID,
+		tli:                    cfg.TimelineID,
 	}
 	if st.walBuf != nil {
 		st.walBuf.reset(writePos)
@@ -671,7 +730,7 @@ func loadState(cfg Config) (*state, error) {
 	return st, nil
 }
 
-func detectWritePos(walDir string, segSize int64) (int64, error) {
+func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, error) {
 	entries, err := os.ReadDir(walDir)
 	if err != nil {
 		return 0, fmt.Errorf("wal: list %s: %w", walDir, err)
@@ -729,7 +788,7 @@ func detectWritePos(walDir string, segSize int64) (int64, error) {
 		// both legacy lazy-grown segments (writePos == sz, no
 		// trailing zeros) and preallocated full-size segments
 		// (writePos < sz, zero-fill tail).
-		usedBytes, scanErr := scanLastSegmentEnd(walDir, expected, sz)
+		usedBytes, scanErr := scanLastSegmentEnd(walDir, expected, sz, segSize, pageHeaders)
 		if scanErr != nil {
 			return 0, scanErr
 		}
@@ -740,12 +799,18 @@ func detectWritePos(walDir string, segSize int64) (int64, error) {
 }
 
 // scanLastSegmentEnd reads the last segment from disk and returns
-// the byte offset of the first EOS sentinel (a zero record header
-// — `len=0 && crc=0`). Used by detectWritePos to recover the true
-// write position from a preallocated full-size last segment, and
-// also serves the legacy short-segment case (where the segment
-// has no trailing zeros, and the scan returns the full size).
-func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64) (int64, error) {
+// the byte offset of the first EOS sentinel — a zero record header
+// in legacy mode, an all-zero page header at a page boundary in
+// page-headers mode (M0014-0001 step 2). Used by detectWritePos to
+// recover the true write position from a preallocated full-size
+// last segment; also serves the legacy short-segment case (where
+// the scan returns the full size because no trailing zeros exist).
+//
+// `cfgSegSize` is the configured WAL segment size (controls the
+// long-vs-short page header size at segment boundaries).
+// `pageHeaders=true` walks the file's interleaved page headers and
+// record bytes; `false` keeps the legacy flat record-stream walk.
+func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize int64, pageHeaders bool) (int64, error) {
 	path := filepath.Join(walDir, formatSegmentName(segNo))
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -754,16 +819,76 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64) (int64, erro
 	if int64(len(data)) > segSize {
 		return 0, fmt.Errorf("wal: segment %s too large: %d > %d", path, len(data), segSize)
 	}
+	if !pageHeaders {
+		off := 0
+		for off < len(data) {
+			if isZeroHeader(data[off:]) {
+				return int64(off), nil
+			}
+			_, n, err := decodeRecord(data[off:])
+			if err != nil {
+				return 0, fmt.Errorf("wal: scan %s at offset %d: %w", path, off, err)
+			}
+			off += n
+		}
+		return int64(off), nil
+	}
+
+	// Page-aware walk: at every page boundary skip the page
+	// header (or stop on an all-zero header — the preallocated
+	// tail). Inside a page, decode records that may continue
+	// onto the next page (the next page's header sits between
+	// the head and tail of those bytes).
+	streamBase := int64(segNo) * cfgSegSize
 	off := 0
 	for off < len(data) {
+		pos := streamBase + int64(off)
+		if pos%XLOGBlockSize == 0 {
+			hsize := pageHeaderSizeAt(pos, cfgSegSize)
+			if off+hsize > len(data) {
+				return int64(off), nil
+			}
+			if isZeroBytes(data[off : off+hsize]) {
+				return int64(off), nil
+			}
+			off += hsize
+			continue
+		}
+		// Mid-page record. The first 8 bytes are the legacy
+		// length+CRC frame; if all zero, we hit the in-page
+		// EOS sentinel.
+		if off+recordHeaderSize > len(data) {
+			return int64(off), nil
+		}
 		if isZeroHeader(data[off:]) {
 			return int64(off), nil
 		}
-		_, n, err := decodeRecord(data[off:])
-		if err != nil {
+		// Read the encoded record bytes (record header +
+		// payload) — they may straddle a page boundary, with
+		// the next page's header sitting between fragments.
+		// extractRecordBytes copies record bytes only; we
+		// then call decodeRecord on the contiguous record
+		// stream to validate length/CRC.
+		recordBytes, _ := extractRecordBytes(data[off:], pos, cfgSegSize, recordHeaderSize)
+		if len(recordBytes) < recordHeaderSize {
+			return int64(off), nil
+		}
+		// Now we know the full record size; re-extract.
+		payloadLen := int(recordBytes[0]) | int(recordBytes[1])<<8 | int(recordBytes[2])<<16 | int(recordBytes[3])<<24
+		if payloadLen < 0 {
+			return 0, fmt.Errorf("wal: scan %s at offset %d: negative payload length %d", path, off, payloadLen)
+		}
+		total := recordHeaderSize + payloadLen
+		fullBytes, consumed := extractRecordBytes(data[off:], pos, cfgSegSize, total)
+		if len(fullBytes) < total {
+			// Truncated tail — treat as EOS so we don't
+			// consume a partially-written record.
+			return int64(off), nil
+		}
+		if _, n, err := decodeRecord(fullBytes); err != nil || n != total {
 			return 0, fmt.Errorf("wal: scan %s at offset %d: %w", path, off, err)
 		}
-		off += n
+		off += consumed
 	}
 	return int64(off), nil
 }
@@ -802,19 +927,29 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 
 func (s *state) append(payload []byte) (uint64, uint64, error) {
 	record := encodeRecord(payload)
-	start := uint64(s.writePos) + 1
 	writePos := s.writePos
+	// In page-headers mode (M0014-0001 step 2), interleave page
+	// headers into the on-disk byte stream. `stream` is what we
+	// write to disk; `leading` is the byte count of any page
+	// header inserted at the front of `stream` (so startLSN
+	// lands on the first record byte, after the header).
+	stream := record
+	leading := 0
+	if s.pageHeaders {
+		stream, leading = emitWithPageHeaders(record, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
+	}
+	start := uint64(writePos) + uint64(leading) + 1
 
 	// Path A: WAL buffer disabled, OR record larger than the
 	// entire buffer. Bypass and write straight to disk —
 	// fragmenting a single record across multiple drains would
 	// complicate the contiguous-stream invariant for no benefit.
-	if s.walBuf == nil || !s.walBuf.canHold(len(record)) {
-		if err := s.writeAt(writePos, record); err != nil {
+	if s.walBuf == nil || !s.walBuf.canHold(len(stream)) {
+		if err := s.writeAt(writePos, stream); err != nil {
 			return 0, 0, err
 		}
-		s.memRing.Append(writePos, record)
-		s.writePos = writePos + int64(len(record))
+		s.memRing.Append(writePos, stream)
+		s.writePos = writePos + int64(len(stream))
 		end := uint64(s.writePos)
 		s.writeLSN = end
 		s.drainedLSN = end
@@ -826,18 +961,18 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 
 	// Path B: buffered append. If we'd overflow, drain the head
 	// of the buffer to segment files first to make room.
-	need := int64(len(record)) - s.walBuf.free()
+	need := int64(len(stream)) - s.walBuf.free()
 	if need > 0 {
 		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
 			return 0, 0, err
 		}
 	}
-	s.walBuf.append(record)
+	s.walBuf.append(stream)
 	// Walsender's MemRing must see every record, regardless of
 	// whether it's in walBuf or already on a segment — keeps the
 	// streaming-from-RAM invariant unchanged from M0010-0002.
-	s.memRing.Append(writePos, record)
-	s.writePos = writePos + int64(len(record))
+	s.memRing.Append(writePos, stream)
+	s.writePos = writePos + int64(len(stream))
 	end := uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {

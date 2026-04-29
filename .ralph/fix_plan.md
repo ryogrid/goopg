@@ -2027,15 +2027,64 @@ pick the topmost unchecked item.
       step 2 without churning unrelated code first. Full
       `go test ./...` green.)
 
-- [ ] XLOG page emission in writer + page-aware reader
-      (M0014-0001 step 2). Wire the new helpers into the writer's
-      append path: every segment starts with a 40-byte long
-      page header; subsequent pages get a 24-byte short
-      header; records crossing a page boundary set
-      XLP_FIRST_IS_CONTRECORD on the next page and update
-      `xlp_rem_len`. Update RecordIterator + ReadAll to skip
-      page headers when streaming records. Continues
+- [x] XLOG page emission in writer + page-aware reader
+      (M0014-0001 step 2). Continues
       `docs/design/0014-0001-xlog-page-and-segment-layout-compat.md`.
+      (landed 2026-04-29: gated by new `Config.PageHeaders`
+      (+ `SystemID` / `TimelineID`) flag — default `false`
+      keeps every legacy data dir / test byte-unchanged.
+      `state.append` calls `emitWithPageHeaders(record,
+      writePos, segSize, sysID, tli)` which interleaves a
+      40-byte `XLogLongPageHeader` at every segment boundary
+      (stamps `xlp_sysid` / `xlp_seg_size` / `xlp_xlog_blcksz`)
+      and a 24-byte short header at every other 8 KiB page
+      boundary. Records crossing a page boundary stamp
+      `XLP_FIRST_IS_CONTRECORD` and `xlp_rem_len =
+      bytes_remaining_of_record` on the next page; multi-page
+      records re-decrement page-by-page. `state.writePos` and
+      `Writer.WrittenLSN()` advance over the combined stream
+      length, preserving upstream's invariant **LSN = byte
+      offset in the on-disk WAL stream**. `Append` returns
+      `startLSN = writePos + leading_header_bytes + 1` so the
+      LSN lands on the first record byte. Reader side:
+      `RecordIterator.Next` skips any header at the cursor
+      before checking write-tail; `readRecordBytesAt` is the
+      new helper that mirrors the writer's interleave —
+      returns record bytes and the physical advance count
+      (record bytes + skipped header bytes). `ReadAll`
+      auto-detects format via `DetectWALFormat(walDir)` and
+      dispatches to `readAllPageAware`; classification errors
+      silently fall back to the legacy walk so the existing
+      tiny-segment tests still work. `scanLastSegmentEnd`
+      (writer startup) consults `cfg.PageHeaders` directly;
+      EOS becomes two-flavoured — all-zero page header at a
+      page boundary OR all-zero record header mid-page
+      (preserves the M0007 / 0007-0001 preallocated-tail
+      contract). MemRing capture / walBuf path / writeAt
+      layering all consume `stream` instead of the bare
+      record so direct-I/O alignment, AIO submission, and
+      walsender RAM streaming see the same physical bytes
+      the segment carries. New tests in
+      `internal/wal/xlog_emit_test.go`:
+      TestPageEmissionLongHeaderAtSegmentStart,
+      TestPageEmissionShortHeaderAtPageBoundary (exact
+      `xlp_rem_len = record_size - (XLOGBlockSize -
+      SizeOfXLogLongPHD)` arithmetic),
+      TestPageEmissionRecordCrossesPage (Append/ReadAll LSN
+      cross-check), TestPageEmissionRecordCrossesSegment
+      (segment-spanning record → long header on next segment
+      with both XLPLongHeader and XLPFirstIsContRecord set),
+      TestPageEmissionIteratorRoundTrip,
+      TestPageEmissionRecoversCleanly (close + reopen with
+      Preallocate=true), TestPageEmissionLegacyDefaultUnchanged
+      (rollout invariant: byte-identical output when
+      PageHeaders=false). Full `go test ./...` green. The
+      XLogRecord-header switchover (M0014-0002 step 2) and
+      pg_waldump validation (M0014-0003) remain deferred —
+      `PageHeaders=true` today produces upstream-shaped pages
+      with goopg's legacy 8-byte length+CRC32-IEEE record
+      frames inside; pg_waldump won't accept those until the
+      record-frame switchover lands.)
 
 - [x] XLogRecord header + rmgr — **types and helpers**
       (M0014-0002 step 1). Design doc
