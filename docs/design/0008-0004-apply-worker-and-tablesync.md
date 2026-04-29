@@ -208,6 +208,88 @@ encoder:
 - `TestPgoutputDecoderRoundTrip`: pure decoder unit test —
   encode B/C/R/I/D, decode each message, confirm round-trip.
 
+## Tablesync initial-COPY transport
+
+`internal/server/tablesync.go` carries the wire-shape driver for
+the per-relation initial sync. The function
+
+```
+func RunTableSync(cfg TableSyncConfig) (int64, error)
+```
+
+drives one full publisher → subscriber `COPY <rel> TO STDOUT`
+exchange and walks `pg_subscription_rel.srsubstate` through
+`i` → `d` → `s`. The caller owns the connection and the local
+write surface; the function only cares about a framed pair plus
+a small interface:
+
+```
+type LineWriter interface {
+    PushLine(line []byte) error
+    RowsInserted() int64
+}
+```
+
+That interface is precisely the subset of
+`executor.CopyFromExecutor` we need. Defining it server-side
+keeps the dependency direction one-way (server imports executor
+for nothing here, only the interface) and lets tests substitute a
+recording fake.
+
+### Exchange
+
+```
+subscriber → publisher:  Query("COPY <rel> TO STDOUT")
+publisher  → subscriber: CopyOutResponse('H')
+                         CopyData('d') × N            -- one or more
+                                                        '\n'-terminated
+                                                        COPY-TEXT lines
+                                                        per frame
+                         CopyDone('c')
+                         CommandComplete('C')
+                         ReadyForQuery('Z')
+```
+
+`CopyOutResponse` is the trigger for `i` → `d`. The advance is
+idempotent: if a previous attempt left the row at `d`, the
+validity map's `d → d` self-loop accepts it. `CopyDone` is the
+trigger for `d` → `s`. We do not advance to `r` here — that's
+the apply-worker's job once it sees a streaming commit at-or-
+after the snapshot LSN.
+
+### Error handling
+
+- `ErrorResponse` mid-exchange: the 'M' (message) and 'C'
+  (sqlstate) fields are unwrapped and returned wrapped. The row
+  is left at whatever state it reached so the next loop can
+  retry from there.
+- An out-of-shape frame (e.g. `RowDescription` where
+  `CopyOutResponse` was expected) returns a typed error
+  identifying the surprise type.
+- A `PushLine` failure stops the stream immediately (we don't
+  drain remaining `CopyData` frames before returning) — the
+  underlying transport is expected to be torn down anyway.
+- `EOF` after `CopyDone` but before `CommandComplete` is
+  tolerated: some publishers close the connection right after
+  `CopyDone` is sent. The data is already locally durable, and
+  the row is at `s`.
+
+### What this slice doesn't deliver
+
+- Connection setup. The caller has already dialed and
+  authenticated the publisher; `RunTableSync` only drives the
+  framed exchange. The per-subscription manager that walks
+  `SubscriptionRels(subName)` for non-`r` rows and dials a
+  publisher connection per relation is a follow-up loop.
+- Row buffering across `CopyData` frames. v0 goopg's
+  `runCopyTo` always emits exactly one COPY-TEXT line per
+  frame; we tolerate multi-row frames (split on `'\n'`) but a
+  row split *across* frames is a wire error today.
+- Snapshot-LSN handoff. The simple-COPY path doesn't surface
+  the publisher slot's snapshot LSN, so we advance to `s` with
+  LSN=0. The apply-worker integration that drives `s` → `r`
+  on a streaming commit boundary is a separate slice.
+
 ## Tablesync state machine — catalog substrate
 
 Upstream tracks per-(subscription, relation) sync progress in

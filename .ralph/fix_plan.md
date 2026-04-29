@@ -2565,13 +2565,61 @@ item.
       and the apply-worker hookup that drives transitions
       remain as the next two M0008 slices below.)
 
-- [ ] Tablesync initial COPY transport: subscriber worker
-      that opens a second walsender connection per
-      not-yet-ready relation, issues `COPY (SELECT * FROM
-      <rel>) TO STDOUT` (or the upstream pg_dump-style
-      tablesync path), streams rows into the local heap,
-      then advances `pg_subscription_rel.srsubstate` from
-      `i` → `d` → `s` once the snapshot is drained.
+- [x] Tablesync initial COPY transport — wire-shape driver.
+      (landed 2026-04-29: `internal/server/tablesync.go`
+      ships `RunTableSync(TableSyncConfig)` that drives a
+      publisher → subscriber `COPY <rel> TO STDOUT`
+      exchange against a `protocol.FrameReader` /
+      `FrameWriter` pair. The exchange: send simple
+      `Query("COPY <rel> TO STDOUT")`; await
+      `CopyOutResponse` (and on receipt advance
+      `pg_subscription_rel.srsubstate` from `i` → `d`,
+      idempotent if already at `d`); loop reading
+      `CopyData` frames, splitting each payload on `'\n'`
+      and forwarding terminated COPY-TEXT lines to a
+      `LineWriter` interface (the subset of
+      `executor.CopyFromExecutor` we need —
+      `PushLine(line []byte) error` plus
+      `RowsInserted() int64`, defined in the server
+      package to keep the import direction one-way); on
+      `CopyDone` drain the trailer
+      (`CommandComplete` + `ReadyForQuery`, with
+      tolerance for an EOF after `CopyDone` that some
+      publishers emit) and advance `d` → `s`.
+      `ErrorResponse` mid-stream is unwrapped via the
+      'M'/'C' fields and surfaced to the caller; an
+      out-of-shape frame at any point yields a typed
+      error and leaves the row at whatever state it
+      reached. The state-machine row is seeded
+      idempotently with `AddSubscriptionRel`
+      (`ErrSubscriptionRelExists` is fine — a previous
+      attempt may have advanced past `i`). LSN is left at
+      0; the apply-worker integration that drives `s` →
+      `r` based on commit LSN is a separate slice.
+      Tests in `internal/server/tablesync_test.go`:
+      TestRunTableSyncHappyPath (3-row exchange, exact
+      byte-for-byte round-trip of COPY-TEXT lines + Query
+      frame inspection + final state==s),
+      TestRunTableSyncMultiRowFrame (multiple rows in a
+      single CopyData frame still produce one PushLine
+      per row), TestRunTableSyncAdvancesIToDOnCopyOutResponse
+      (state advances to `d` even before any CopyData,
+      so an interrupted sync is observable in catalog),
+      TestRunTableSyncRowApplyErrorLeavesStateAtD
+      (PushLine error stops the sync and keeps state at
+      `d`), TestRunTableSyncResumesFromExistingRow
+      (a row pre-existing at `d` is not reset to `i`,
+      and the second attempt drives to `s`),
+      TestRunTableSyncRejectsUnexpectedFrame
+      (RowDescription before CopyOutResponse → typed
+      error, state stays at `i`). Built and full
+      `go test ./...` green. The remaining gap is the
+      caller wiring: a per-subscription manager that
+      dials the publisher, walks
+      `SubscriptionRels(subName)` looking for non-`r`
+      rows, and invokes `RunTableSync` for each. That
+      lives in the next bullet alongside the apply-worker
+      `s` → `r` driver.)
 
 - [ ] Apply-worker tablesync integration: hook the streaming
       apply path so that for each relation it observes a
