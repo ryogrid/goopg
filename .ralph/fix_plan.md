@@ -2395,10 +2395,54 @@ item.
       transport, slot-start handshake, and tablesync state
       machine remain the next M0008 work.)
 
-- [ ] TCP transport for the pgoutput stream + slot-start
-      handshake: subscriber-side dial, START_REPLICATION SLOT
-      ... LOGICAL command, libpq CopyData unwrap, advance the
-      slot's confirmed_flush_lsn after each ApplyMessage commit.
+- [x] TCP transport for the pgoutput stream + slot-start
+      handshake (continues 0008-0004).
+      (landed 2026-04-29:
+      `internal/server/logicalreceiver.go::LogicalReceiver`
+      mirrors WalReceiver's structure but feeds each `'w'`
+      CopyData payload through `wal.DecodeMessage` →
+      `*executor.ApplyWorker.ApplyMessage`. Config:
+      `LogicalReceiverConfig{PrimaryAddr, User, SlotName,
+      Publications, StartLSN, ProtoVersion=1, Apply,
+      StatusInterval, DialTimeout}`.
+      `DialLogicalReceiver(ctx, cfg)` performs TCP dial + v3
+      startup with `replication=database` + `START_REPLICATION
+      SLOT name LOGICAL <lsn> ("proto_version" '1',
+      "publication_names" 'p1,p2')` issued via
+      `buildStartLogicalReplicationCommand`.
+      `Run(ctx)` spins a frame-reader goroutine and dispatches
+      via `handleFrame` → `handleCopyData` →
+      `wal.DecodeMessage` → `Apply.ApplyMessage`; on every
+      commit, the receiver caches the commit LSN as
+      `applyLSN` so subsequent standby-status frames advance
+      the publisher's `confirmed_flush_lsn`. `sendStatus`
+      emits `'r'` standby-status CopyData on every
+      StatusInterval tick (default 10s) and on
+      reply-requested keepalives. Apply errors trigger
+      `Apply.SafeRollback()` so the in-progress xact never
+      leaks. Tests:
+      TestBuildStartLogicalReplicationCommandShape pins the
+      exact wire-level SQL string (including the option
+      block); TestBuildStartLogicalReplicationCommandNoPublications
+      pins that empty Publications drops the
+      `publication_names` option entirely (matches libpq's
+      "all visible publications" fallback);
+      TestLogicalReceiverHandleCopyDataAppliesPgoutputAndAdvancesLSN
+      drives `handleCopyData` directly with B → R → I → C
+      pgoutput bytes wrapped in `'w'` CopyData payloads and
+      confirms the receiver's `ApplyLSN()` advances to the
+      commit LSN. Real publisher-side wiring (the walsender
+      recognising logical slots and emitting pgoutput bytes
+      through `'w'` frames in place of WAL bytes) is the next
+      M0008 piece.)
+
+- [ ] Publisher-side walsender support for logical slots:
+      when `START_REPLICATION SLOT name LOGICAL ...` is
+      received, run a `wal.SlotDecoder` driving a
+      `wal.PgOutput` writer that wraps each emitted message
+      in a `'w'` CopyData payload and ships it to the
+      subscriber. Wire `confirmed_flush_lsn` advances from
+      the standby-status frames the subscriber sends back.
 
 - [ ] Tablesync state machine + initial table sync: subscriber
       worker that COPYs each new table's current contents
