@@ -2797,10 +2797,32 @@ Substantial. Decompose when picked up.
       M0020-0002/0003/0004.)
 - [ ] Window-function — analyzer + planner + executor
       wiring (M0020-0002 / M0020-0003 / M0020-0004).
-      Reserves filenames
       `docs/design/0020-0002-window-analyzer-and-planner.md`,
       `docs/design/0020-0003-window-executor.md`,
       `docs/design/0020-0004-window-explain-and-tests.md`.
+      Decomposed execution checklist:
+      - [x] M0020-S01: add design doc
+            `docs/design/0020-0002-window-analyzer-and-planner.md`
+            and index `docs/design/README.md`.
+      - [ ] M0020-S02: analyzer allows window funcs (Stage A:
+            row_number/rank) with deterministic placement and
+            argument-shape diagnostics.
+      - [ ] M0020-S03: planner plan-node/types for WindowAgg and
+            resolved window function descriptors.
+      - [ ] M0020-S04: planner pipeline wiring (WindowAgg
+            injection between aggregate/having and final ORDER BY).
+      - [ ] M0020-S05: executor WindowAgg operator skeleton (drain,
+            partition key evaluation, order-key sort).
+      - [ ] M0020-S06: executor row_number() evaluation.
+      - [ ] M0020-S07: executor rank() evaluation with peer-group
+            semantics.
+      - [ ] M0020-S08: EXPLAIN label/tree integration for
+            WindowAgg.
+      - [ ] M0020-S09: regression tests (analyzer/planner/executor
+            for Stage A semantics).
+      - [ ] M0020-S10: finalize design docs
+            `0020-0003-window-executor.md` and
+            `0020-0004-window-explain-and-tests.md` + README index.
 
 ## Milestone 0021 — SELECT ... FOR UPDATE
 
