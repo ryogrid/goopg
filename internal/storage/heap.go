@@ -33,6 +33,48 @@ const (
 	InvalidTransactionID TransactionID = 0
 )
 
+// HeapTupleHeader infomask flag bits. Values mirror upstream's
+// `postgres/src/include/access/htup_details.h` so future
+// pg_waldump compat / on-disk format work doesn't have to
+// translate. v0 only consumes the lock-related bits today
+// (M0021 follow-up — tuple-level pessimistic locking step 1):
+//
+//   - HeapXmaxInvalid: xmax is not a delete (set when xmax is
+//     known invalid; complement of HeapXmaxCommitted).
+//   - HeapXmaxCommitted: xmax committed (cached hint).
+//   - HeapXmaxLockOnly: xmax represents a row lock, not a
+//     delete. The MVCC visibility helper recognises this bit
+//     and treats a lock-only xmax as "no deleter" — readers
+//     still see the tuple as live.
+//   - HeapXmaxKeyShrLock / HeapXmaxExclLock: row-lock strength
+//     bits (KEY SHARE / EXCLUSIVE). FOR UPDATE uses ExclLock;
+//     FOR SHARE will use the SHR composite (KeyShrLock |
+//     ExclLock) when MultiXact-aware multi-holder support
+//     lands. v0 only emits ExclLock.
+const (
+	HeapXmaxInvalid    uint16 = 0x0800
+	HeapXmaxCommitted  uint16 = 0x0400
+	HeapXmaxLockOnly   uint16 = 0x0080
+	HeapXmaxKeyShrLock uint16 = 0x0010
+	HeapXmaxExclLock   uint16 = 0x0040
+	// HeapXmaxShrLock is the composite "FOR SHARE" lock — both
+	// the KEY SHARE bit and the EXCLUSIVE bit set. Mirrors
+	// upstream's HEAP_XMAX_SHR_LOCK macro.
+	HeapXmaxShrLock = HeapXmaxKeyShrLock | HeapXmaxExclLock
+
+	// HeapXmaxLockMask covers every row-lock-strength bit;
+	// `(infomask & HeapXmaxLockMask) != 0` is the
+	// "this is a row-lock holding xmax" predicate.
+	HeapXmaxLockMask = HeapXmaxKeyShrLock | HeapXmaxExclLock
+)
+
+// IsHeapTupleLockOnly reports whether `infomask` indicates the
+// tuple's xmax represents a row lock (not a delete). Mirrors
+// upstream's HEAP_XMAX_IS_LOCKED_ONLY macro.
+func IsHeapTupleLockOnly(infomask uint16) bool {
+	return infomask&HeapXmaxLockOnly != 0
+}
+
 // ItemPointer identifies a tuple location (block, line-pointer slot).
 type ItemPointer struct {
 	Block  BlockNumber
@@ -473,6 +515,71 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
 	}
 	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	return nil
+}
+
+// PageSetHeapTupleLockOnly stamps xmax + sets the
+// HEAP_XMAX_LOCK_ONLY and lock-strength infomask bits on the heap
+// tuple at the given 1-based slot. Companion to PageSetHeapTupleXmax
+// for the row-lock path: lock-only xmax doesn't make the tuple
+// invisible — `mvcc.TupleVisible` recognises the bit and lets
+// readers through. Used by the SELECT FOR UPDATE / FOR SHARE
+// runtime to record per-row lock holders without deleting the
+// tuple.
+//
+// `lockStrength` selects which lock-mode bit gets set in infomask:
+//
+//   - HeapXmaxExclLock for FOR UPDATE (write-intent lock).
+//   - HeapXmaxShrLock  for FOR SHARE (read-intent lock).
+//   - HeapXmaxKeyShrLock for FOR KEY SHARE (out of v0 scope but
+//     accepted at the encoding layer for forward-compat).
+//
+// Existing infomask bits OTHER than the lock-strength group are
+// preserved; lock-strength bits in HeapXmaxLockMask are cleared
+// before OR-ing the new mode in so a re-stamp from a stronger
+// lock to a weaker (or vice versa) doesn't accumulate stale
+// bits.
+//
+// Returns ErrUnsupportedItem if the slot isn't LP_NORMAL,
+// ErrInvalidSlot for out-of-range slot numbers,
+// ErrCorruptTuple for tuples whose Hoff is too small to hold
+// the infomask bytes.
+func PageSetHeapTupleLockOnly(p Page, slot uint16, xmax TransactionID, lockStrength uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	if lockStrength&HeapXmaxLockMask == 0 {
+		return fmt.Errorf("PageSetHeapTupleLockOnly: lockStrength %#x has no lock-mode bit set", lockStrength)
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	// Need bytes 0..21 of the header (Xmax at 4..8, Infomask at
+	// 20..22 — note the on-disk order Infomask2 then Infomask
+	// per ParseHeapTuple / MarshalBinary).
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockMask
+	infomask &^= HeapXmaxInvalid // xmax is now a real (lock-only) value
+	infomask |= HeapXmaxLockOnly
+	infomask |= lockStrength & HeapXmaxLockMask
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
 }
 

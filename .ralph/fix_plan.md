@@ -2950,8 +2950,48 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       RowExclusiveLock doesn't block the test's blocker
       (a latent ordering bug surfaced when adding the new
       NOWAIT contention test). Full `go test ./...` green.)
-- [ ] Tuple-level pessimistic locking on top of M0012 lock
-      manager.
+- [x] Tuple-level pessimistic locking on top of M0012 lock
+      manager — **step 1: storage primitives + MVCC
+      visibility hook**. Design doc
+      `docs/design/0021-0005-tuple-level-locking-storage-and-mvcc.md`.
+      (landed 2026-04-30: foundation slice that unlocks
+      per-row blocking + SKIP LOCKED. New infomask
+      constants in `internal/storage/heap.go` (HeapXmax*
+      bits matching upstream htup_details.h byte-for-byte).
+      New predicate `IsHeapTupleLockOnly(infomask)`. New
+      `PageSetHeapTupleLockOnly(p, slot, xmax,
+      lockStrength)` companion to the existing xmax-delete
+      stamper: clears stale lock-strength bits + HeapXmax
+      Invalid before OR-ing the new bits in; rejects zero
+      lockStrength (would yield "lock-only unknown mode"
+      corruption). Layout note: Infomask sits at on-disk
+      bytes 20..21 (Infomask2 18..19, Hoff 22) — order is
+      swapped relative to the struct field order;
+      PageSetHeapTupleLockOnly writes 20..21 to match
+      MarshalBinary / ParseHeapTuple. `mvcc.TupleVisible`
+      learns the lock-only branch — when xmax has
+      HeapXmaxLockOnly set the tuple stays visible
+      regardless of holder progress (committed / aborted /
+      in-progress) including the self-lock case
+      (Xmin=Xmax=cur + LOCK_ONLY) which previously was
+      treated as deleted-by-current-xact. Tests: 4 storage
+      tests + 2 mvcc tests covering normal usage,
+      stale-strength clearing, API misuse guards, and the
+      regression that plain committed deletes remain
+      invisible. Full `go test ./...` green. Pure
+      additive — no production callers yet. Executor
+      wiring (lockRowsOp stamping + INSERT/UPDATE/DELETE
+      detecting lock-only xmax) + xl_heap_lock WAL
+      records + MultiXact infrastructure all deferred.)
+- [ ] Tuple-level pessimistic locking — step 2: executor
+      wiring (lockRowsOp stamps lock-only xmax per row;
+      INSERT/UPDATE/DELETE detect lock-only xmax from
+      another live xact and block / fail-NOWAIT / skip
+      for SKIP LOCKED).
+- [ ] Tuple-level pessimistic locking — step 3: row-lock
+      WAL record (xl_heap_lock) + crash-recovery replay.
+- [ ] Tuple-level pessimistic locking — step 4:
+      MultiXact-aware multi-holder support for FOR SHARE.
 
 ## Notes
 
