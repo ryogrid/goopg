@@ -351,6 +351,33 @@ type Aggregate struct {
 func (n *Aggregate) Pos() int       { return n.pos }
 func (n *Aggregate) Output() Schema { return n.schema }
 
+// WindowFunc is one supported window-function invocation in a
+// WindowAgg node. Stage A supports row_number/rank only; both
+// return int8.
+type WindowFunc struct {
+	pos  int
+	Name string
+	Type catalog.Type
+}
+
+func (w WindowFunc) Pos() int { return w.pos }
+
+// WindowAgg evaluates window functions over the child rows.
+// Output columns are [child output..., window func outputs...].
+// Stage A uses one shared PARTITION BY / ORDER BY spec for all
+// funcs in the node.
+type WindowAgg struct {
+	pos         int
+	Child       Node
+	PartitionBy []Expr
+	OrderBy     []SortKey
+	Funcs       []WindowFunc
+	schema      Schema
+}
+
+func (n *WindowAgg) Pos() int       { return n.pos }
+func (n *WindowAgg) Output() Schema { return n.schema }
+
 // Filter — applies a predicate to its child's rows.
 type Filter struct {
 	pos       int

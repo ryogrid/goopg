@@ -2807,7 +2807,7 @@ Substantial. Decompose when picked up.
       - [x] M0020-S02: analyzer allows window funcs (Stage A:
             row_number/rank) with deterministic placement and
             argument-shape diagnostics.
-      - [ ] M0020-S03: planner plan-node/types for WindowAgg and
+      - [x] M0020-S03: planner plan-node/types for WindowAgg and
             resolved window function descriptors.
       - [ ] M0020-S04: planner pipeline wiring (WindowAgg
             injection between aggregate/having and final ORDER BY).

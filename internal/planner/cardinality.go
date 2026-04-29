@@ -62,6 +62,8 @@ func EstimateRows(n Node) int64 {
 		return EstimateRows(x.Child)
 	case *Project:
 		return EstimateRows(x.Child)
+	case *WindowAgg:
+		return EstimateRows(x.Child)
 	case *Join:
 		return estimateJoin(x)
 	case *Aggregate:
