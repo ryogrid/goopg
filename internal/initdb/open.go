@@ -253,6 +253,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// the engine's worker pool rather than no-oping.
 	if aioEngine != nil {
 		pool.SetPrefetchEnabled(true)
+		// Batch dirty-page flushes so the checkpointer's
+		// FlushAllPaced pipelines writes through the engine.
+		// Default batch = 8 (small enough that a checkpoint
+		// pacing tick still fires reasonably often, large
+		// enough to keep `io_workers=3` busy under load). A
+		// future GUC can expose this; for now it's wired off
+		// the engine attachment.
+		pool.SetAsyncFlushBatchSize(8)
 	}
 
 	cat := catalog.NewInMemory()

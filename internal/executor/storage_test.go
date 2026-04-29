@@ -235,7 +235,14 @@ type recordingExecAIOEngine struct {
 
 func (r *recordingExecAIOEngine) Submit(op storage.AIOSubmitOp) storage.AIOHandle {
 	r.submits++
-	n, err := op.File.ReadAt(op.Buffer, op.Offset)
+	var n int
+	var err error
+	switch op.Direction {
+	case storage.AIODirWrite:
+		n, err = op.File.WriteAt(op.Buffer, op.Offset)
+	default:
+		n, err = op.File.ReadAt(op.Buffer, op.Offset)
+	}
 	return execAIOHandle{n: n, err: err}
 }
 

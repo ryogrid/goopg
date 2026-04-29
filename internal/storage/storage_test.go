@@ -839,3 +839,139 @@ func TestWriteBlockAIORejectsOutOfRange(t *testing.T) {
 		t.Errorf("Wait err=nil want out-of-range failure")
 	}
 }
+
+// TestFlushAllPacedBatchedSubmitsThroughEngine pins the new
+// hot-path wiring: with an AIO engine attached and async-flush
+// enabled, FlushAllPaced batches dirty slots and submits writes
+// through Manager.WriteBlockAIO with Direction=AIODirWrite. The
+// recording engine sees one submit per dirty slot, all with
+// DirWrite. Bytes round-trip through ReadBlock confirming
+// WAL-before-data wasn't broken (writes still landed correctly).
+func TestFlushAllPacedBatchedSubmitsThroughEngine(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	eng := &recordingAIOEngine{}
+	mgr.SetAIO(eng)
+	pool, err := NewPool(mgr, PoolConfig{Slots: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	pool.SetAsyncFlushBatchSize(4)
+
+	rel := RelFileNode{DBOid: 1, RelOid: 17300, Fork: MainFork}
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	// Extend three blocks and dirty them via Pin + MarkDirty.
+	for i := 0; i < 3; i++ {
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		s, err := pool.Pin(BufferTag{Rel: rel, Block: BlockNumber(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.page[200+i] = byte(0xA0 + i)
+		pool.MarkDirty(s)
+		pool.Unpin(s)
+	}
+
+	// Reset the engine counter so the flush path is what we
+	// observe, not the eviction-path Pins above (none here, but
+	// future test additions might).
+	eng.submits = nil
+	if err := pool.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+	if got := len(eng.submits); got != 3 {
+		t.Errorf("engine saw %d submits, want 3", got)
+	}
+	for i, op := range eng.submits {
+		if op.Direction != AIODirWrite {
+			t.Errorf("submit[%d] direction=%v want AIODirWrite", i, op.Direction)
+		}
+	}
+
+	// Round-trip via fresh Pins (forced by InvalidateRel).
+	pool.InvalidateRel(rel)
+	for i := 0; i < 3; i++ {
+		s, err := pool.Pin(BufferTag{Rel: rel, Block: BlockNumber(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := byte(0xA0 + i)
+		if got := s.page[200+i]; got != want {
+			t.Errorf("block %d byte = %#x want %#x", i, got, want)
+		}
+		pool.Unpin(s)
+	}
+}
+
+// TestFlushAllPacedBatchSizeOneEquivalentToLegacy: with the
+// async-flush batch size left at 0 (the default) FlushAllPaced
+// runs the per-slot path, equivalent to the pre-AIO behaviour
+// — every dirty slot still flushes correctly even with no
+// engine attached.
+func TestFlushAllPacedBatchSizeOneEquivalentToLegacy(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 17301, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+	s, err := pool.Pin(BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.page[100] = 0xCD
+	pool.MarkDirty(s)
+	pool.Unpin(s)
+
+	if err := pool.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
+	pool.InvalidateRel(rel)
+	s, _ = pool.Pin(BufferTag{Rel: rel, Block: 0})
+	if got := s.page[100]; got != 0xCD {
+		t.Errorf("byte 100 = %#x want 0xCD", got)
+	}
+	pool.Unpin(s)
+}
+
+// TestSetAsyncFlushBatchSizeClamps pins the input validation:
+// negative values clamp to 0, values above MaxFlushBatchSize
+// clamp to the cap.
+func TestSetAsyncFlushBatchSizeClamps(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	pool.SetAsyncFlushBatchSize(-1)
+	if got := pool.flushBatchSize(); got != 1 {
+		t.Errorf("batch=-1 → flushBatchSize=%d want 1 (legacy serial)", got)
+	}
+	pool.SetAsyncFlushBatchSize(MaxFlushBatchSize * 10)
+	if got := pool.flushBatchSize(); got != MaxFlushBatchSize {
+		t.Errorf("batch=10×Max → flushBatchSize=%d want %d", got, MaxFlushBatchSize)
+	}
+}

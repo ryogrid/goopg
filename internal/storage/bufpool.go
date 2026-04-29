@@ -113,6 +113,15 @@ type Pool struct {
 	// run async.
 	prefetchEnabled atomic.Bool
 
+	// asyncFlushBatchSize controls FlushAllPaced's batching.
+	// 0 / 1 reduces to the legacy per-slot serial loop. >1
+	// batches the WAL flush + the AIO write submissions
+	// across that many dirty slots so the engine's worker
+	// pool pipelines the writes. The lifecycle owner sets
+	// this after attaching an AIO engine; values are clamped
+	// in flushBatchSize.
+	asyncFlushBatchSize atomic.Int32
+
 	// poolMu guards byTag, slots[*].tag/valid/dirty, slots[*].pinCount,
 	// slots[*].usageCount, slots[*].fpiSinceCheckpoint, and clockHand.
 	// It does NOT guard the page bytes — those are guarded by
@@ -332,6 +341,41 @@ func (p *Pool) Manager() *Manager { return p.mgr }
 // background goroutine rather than blocking the caller with
 // an inline pread.
 func (p *Pool) SetPrefetchEnabled(on bool) { p.prefetchEnabled.Store(on) }
+
+// SetAsyncFlushBatchSize controls how many dirty slots
+// FlushAllPaced batches per WAL-flush + AIO-submit + Wait
+// cycle. 0 or 1 means the legacy per-slot serial loop. Larger
+// values pipeline writes through the AIO worker pool — the
+// caller (initdb.Open) sets this after attaching an AIO
+// engine. Values >MaxFlushBatchSize are clamped.
+func (p *Pool) SetAsyncFlushBatchSize(n int) {
+	if n > MaxFlushBatchSize {
+		n = MaxFlushBatchSize
+	}
+	if n < 0 {
+		n = 0
+	}
+	p.asyncFlushBatchSize.Store(int32(n))
+}
+
+// MaxFlushBatchSize caps the per-batch dirty-slot count so a
+// pathologically large config can't allocate unbounded handle
+// arrays or hold too many contentMu read locks at once.
+// Independent of the engine's global MaxConcurrency cap (which
+// still applies on top via Engine.Submit's queue-fullness
+// backpressure).
+const MaxFlushBatchSize = 256
+
+// flushBatchSize returns the effective batch size for
+// FlushAllPaced. Treats 0 as 1 (serial), so callers that
+// haven't opted in see the legacy behaviour.
+func (p *Pool) flushBatchSize() int {
+	n := int(p.asyncFlushBatchSize.Load())
+	if n < 1 {
+		return 1
+	}
+	return n
+}
 
 // Prefetch is a hint that the caller is about to Pin tag. When
 // prefetching is enabled and tag isn't already cached, the page
@@ -696,7 +740,7 @@ func (p *Pool) FlushAll() error {
 }
 
 // FlushAllPaced writes every dirty slot through smgr and invokes
-// `pacer(progress)` after each flush, where progress is the
+// `pacer(progress)` after each batch, where progress is the
 // fraction of work already completed in [0, 1]. The pacer can
 // sleep to spread the I/O over a target wall-clock window — this
 // is the path the spread checkpoint writes (milestone 0002) take.
@@ -705,6 +749,15 @@ func (p *Pool) FlushAll() error {
 // The dirty set is snapshotted at entry; pages dirtied after the
 // snapshot are not flushed in this pass and stay dirty for the
 // next checkpoint.
+//
+// When SetAsyncFlushBatchSize is >1 and an AIO engine is
+// attached to the storage Manager, dirty slots are flushed in
+// batches: one combined wal.FlushUpTo for the batch's max
+// pd_lsn, then parallel AIO writes via Manager.WriteBlockAIO,
+// then waits on every handle. The contentMu RLock is held for
+// the full batch so writers can't tear the bytes the engine is
+// pwrite-ing. With batch=1 the loop is bit-identical to the
+// legacy per-slot serial flush.
 func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
 	p.poolMu.Lock()
 	type pending struct {
@@ -720,28 +773,113 @@ func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
 	p.poolMu.Unlock()
 
 	total := len(todo)
-	for i, t := range todo {
-		s := p.slots[t.idx]
-		s.contentMu.RLock()
-		err := p.flushSlot(t.tag, s.page)
-		s.contentMu.RUnlock()
-		if err != nil {
+	if total == 0 {
+		return nil
+	}
+	batchSize := p.flushBatchSize()
+	for start := 0; start < total; start += batchSize {
+		end := start + batchSize
+		if end > total {
+			end = total
+		}
+		// Per-batch flush: WAL barrier first, then AIO writes.
+		// Build a parallel slice of slots so the helper doesn't
+		// need to re-resolve idx → *Slot.
+		batchSlots := make([]*Slot, 0, end-start)
+		batchTags := make([]BufferTag, 0, end-start)
+		for _, t := range todo[start:end] {
+			batchSlots = append(batchSlots, p.slots[t.idx])
+			batchTags = append(batchTags, t.tag)
+		}
+		if err := p.flushBatch(batchSlots, batchTags); err != nil {
 			return err
 		}
-		p.poolMu.Lock()
-		// Only clear dirty if the tag hasn't been reassigned and
-		// nothing else has marked it dirty since the flush started.
-		if s.tag == t.tag {
-			s.dirty = false
-		}
-		p.poolMu.Unlock()
-		if pacer != nil && total > 0 {
-			progress := float64(i+1) / float64(total)
+		if pacer != nil {
+			progress := float64(end) / float64(total)
 			if err := pacer(progress); err != nil {
 				return err
 			}
 		}
 	}
+	return nil
+}
+
+// flushBatch flushes a batch of dirty slots: takes contentMu
+// read-locks across the batch, runs one combined WAL flush at
+// the batch's max pd_lsn, submits all AIO writes in parallel
+// via Manager.WriteBlockAIO, waits on every handle, then
+// clears dirty bits for slots whose tag still matches.
+//
+// At batch size 1 this reduces to the legacy per-slot serial
+// flush (one RLock, one WAL FlushUpTo, one Submit+Wait).
+func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
+	// Phase 1: lock + compute max LSN.
+	for _, s := range slots {
+		s.contentMu.RLock()
+	}
+	defer func() {
+		for _, s := range slots {
+			s.contentMu.RUnlock()
+		}
+	}()
+
+	var maxLSN LSN
+	for _, s := range slots {
+		if lsn := MustHeader(s.page).LSN(); lsn > maxLSN {
+			maxLSN = lsn
+		}
+	}
+
+	// Phase 2: single WAL flush for the batch. WAL-before-data
+	// is preserved: every page in the batch has pd_lsn ≤ maxLSN,
+	// and the durability barrier covers all of them.
+	if p.wal != nil && maxLSN != 0 {
+		if err := p.wal.FlushUpTo(uint64(maxLSN)); err != nil {
+			return fmt.Errorf("flush wal up to %d: %w", maxLSN, err)
+		}
+	}
+
+	// Phase 3: submit every data write through the AIO engine.
+	// With no engine attached, WriteBlockAIO returns a
+	// pre-completed handle synchronously — the loop below then
+	// runs writes serially, matching the legacy behaviour.
+	handles := make([]AIOHandle, len(slots))
+	for i, s := range slots {
+		h, err := p.mgr.WriteBlockAIO(tags[i].Rel, tags[i].Block, s.page)
+		if err != nil {
+			// Wait on whatever has already been submitted so
+			// the engine's InFlight counter doesn't leak.
+			for j := 0; j < i; j++ {
+				_, _ = handles[j].Wait()
+			}
+			return err
+		}
+		handles[i] = h
+	}
+
+	// Phase 4: wait for every write to land. Surface the first
+	// error, but always drain the rest so the engine's
+	// bookkeeping stays coherent.
+	var firstErr error
+	for _, h := range handles {
+		if _, err := h.Wait(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+
+	// Phase 5: clear dirty bits where the tag still matches.
+	// Only clear dirty if the tag hasn't been reassigned and
+	// nothing else has marked it dirty since the flush started.
+	p.poolMu.Lock()
+	for i, s := range slots {
+		if s.tag == tags[i] {
+			s.dirty = false
+		}
+	}
+	p.poolMu.Unlock()
 	return nil
 }
 

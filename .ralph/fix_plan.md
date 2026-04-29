@@ -3122,16 +3122,59 @@ See `docs/milestones/0009-aio-subsystem.md`.
       `docs/design/0009-0005-aio-checkpointer-and-wal.md`
       added and indexed in `docs/design/README.md`.)
 
-- [ ] AIO checkpointer + WAL writer caller integration —
-      hot-path wiring. `Pool.FlushAllPaced` shaped to
-      batch-submit writes through `Manager.WriteBlockAIO`
-      with the WAL-before-data barrier preserved (per-slot
-      WAL flush stays serial; data writes pipeline);
-      `wal.state.writeAt` shaped to flow per-segment
-      writeback through the engine while the commit-path
-      `fdatasync` barrier remains synchronous. Substrate
-      is in place via the previous slice; this is the
-      hot-path wiring + perf-validation work.
+- [x] AIO checkpointer caller integration — Pool.FlushAllPaced
+      hot-path wiring. (landed 2026-04-29:
+      `internal/storage/bufpool.go` reshaped FlushAllPaced
+      from a per-slot serial loop into a batched WAL-flush
+      + parallel AIO-submit + Wait loop. New
+      `Pool.SetAsyncFlushBatchSize(n)` + `MaxFlushBatchSize`
+      cap (256). flushBatchSize() returns max(1, configured)
+      so callers that don't opt in see the legacy serial
+      loop unchanged. The new batched path: phase 1 takes
+      contentMu RLocks across the batch (writers can't tear
+      pwrite-d bytes); phase 2 runs ONE wal.FlushUpTo
+      against the batch's max pd_lsn (preserves WAL-before-
+      data — every page in the batch has pd_lsn ≤ maxLSN);
+      phase 3 submits every data write through
+      Manager.WriteBlockAIO collecting handles; phase 4
+      Waits on every handle (drains all even on first
+      error so engine InFlight stays coherent); phase 5
+      clears dirty bits where tag still matches. With no
+      engine attached, WriteBlockAIO returns a pre-
+      completed handle synchronously so the loop runs
+      writes serially — bit-equivalent to legacy. Pacing
+      semantics widened: pacer fires per-batch instead of
+      per-slot (the M0002 smoothed-checkpoint contract is
+      preserved at batch=1 = serial; at batch>1 the same
+      'fraction completed' value is computed across the
+      batch). `initdb.Open` calls
+      `pool.SetAsyncFlushBatchSize(8)` after attaching the
+      engine (small enough to keep checkpoint pacing
+      ticks reasonable, large enough to keep io_workers=3
+      busy under load — a future GUC can expose this).
+      flushSlot is unchanged for the eviction-path
+      callers (Pin / PinNew evict-and-flush) — those keep
+      their per-slot serial behaviour. Tests in storage:
+      TestFlushAllPacedBatchedSubmitsThroughEngine
+      (3 dirty slots + recording engine + batch=4 → 3
+      submits all DirWrite; bytes round-trip after
+      Invalidate+Pin),
+      TestFlushAllPacedBatchSizeOneEquivalentToLegacy
+      (default batch=0 → serial path still flushes a
+      dirty slot correctly with no engine),
+      TestSetAsyncFlushBatchSizeClamps (-1 → 1, 10×Max →
+      Max). The exec recording-engine fake was updated to
+      dispatch on Direction (DirWrite → File.WriteAt) so
+      TestSeqScanFiresPrefetchesAcrossBlocks's flush
+      step still round-trips bytes. Built and full
+      `go test ./...` green.)
+
+- [ ] AIO WAL writer caller integration — wal.state.writeAt
+      shaped to flow per-segment writeback through the
+      engine while the commit-path `fdatasync` barrier
+      remains synchronous. Substrate (Manager.WriteBlockAIO
+      + AIOSubmitOp.Direction) already in place; this is
+      the WAL-side hot-path wiring + perf-validation work.
 
 - [x] AIO observability — aggregate counters + startup
       log line (first slice). (landed 2026-04-29:

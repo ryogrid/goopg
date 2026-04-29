@@ -78,37 +78,56 @@ if op.Direction == storage.AIODirWrite {
 file (it previously panicked, since `PrefetchBlock` was
 read-only).
 
-## Caller integrations (deferred to follow-up slice)
+## Checkpointer dirty-page writeback (landed)
 
-This slice intentionally stops at the substrate. The
-checkpointer and WAL writer call sites that should layer on
-`Manager.WriteBlockAIO` are listed below; their landing is
-the next slice.
+`storage.Pool.FlushAllPaced` is now a batched WAL-flush +
+parallel AIO-submit + Wait loop:
 
-### Checkpointer dirty-page writeback
+1. **Snapshot** the dirty set under `poolMu`.
+2. For each batch of up to `flushBatchSize()` slots
+   (configured via `Pool.SetAsyncFlushBatchSize`,
+   clamped to `[0, MaxFlushBatchSize=256]`; 0/1 reduces to
+   the legacy per-slot serial loop):
+   - **Phase 1** — RLock all `slot.contentMu` in the batch.
+     Held for the entire batch so writers can't tear the
+     bytes the engine pwrites concurrently.
+   - **Phase 2** — Compute `maxLSN = max(pd_lsn)` across
+     the batch and run ONE `wal.FlushUpTo(maxLSN)`.
+     WAL-before-data is preserved: every page in the
+     batch has `pd_lsn ≤ maxLSN`, so a single durability
+     barrier covers them all.
+   - **Phase 3** — Submit every data write through
+     `Manager.WriteBlockAIO`, collecting `AIOHandle`
+     values. With no engine attached, each Submit returns
+     a pre-completed handle synchronously and the loop
+     runs writes serially.
+   - **Phase 4** — Wait on every handle. Drain all (even
+     on first error) so the engine's `InFlight` counter
+     stays coherent; surface the first error.
+   - **Phase 5** — Clear dirty bits under `poolMu`, only
+     when the slot's tag hasn't been reassigned since
+     phase 1.
+3. After each batch, fire `pacer(progress)` with the
+   batch's cumulative completion fraction.
 
-`storage.Pool.FlushAllPaced` walks the dirty set serially,
-calling `flushSlot` (which does the WAL flush + the data
-write). To pipeline writes through AIO, the caller would
-shape the loop as:
+Pacing semantics widen from per-slot to per-batch. The
+M0002 smoothed-checkpoint contract ("pacing semantics
+must not change observably for operators who do not opt
+into AIO") holds at batch size 1 — the loop is
+bit-equivalent to the previous per-slot serial flush.
 
-1. Snapshot the dirty set.
-2. For each slot, run the WAL flush serially (must precede
-   data writes per WAL-before-data — the durability barrier
-   is order-significant and stays synchronous).
-3. Submit all data writes through `Manager.WriteBlockAIO`,
-   collecting handles.
-4. Wait on each handle in order; clear the dirty bit only
-   when the write lands AND the slot's tag hasn't been
-   reassigned in the interim.
-5. Pacing semantics: `pacer(progress)` fires after each
-   batch's Wait set lands rather than per-slot. M0002's
-   smoothed-checkpoint contract ("pacing semantics must not
-   change observably for operators who do not opt into AIO")
-   holds because the engine-less path keeps the per-slot
-   loop verbatim.
+`initdb.Open` calls `pool.SetAsyncFlushBatchSize(8)`
+after attaching an AIO engine. A future GUC will expose
+the value; for now the choice is wired off engine
+attachment.
 
-### WAL writer per-segment writeback
+`flushSlot` is unchanged for the eviction-path callers
+(`Pin` / `PinNew` evict-and-flush) — those keep their
+per-slot serial behaviour because eviction is on the
+single-slot critical path, not a batchable
+sweep.
+
+### WAL writer per-segment writeback (deferred to follow-up)
 
 `internal/wal/writer.go::state.writeAt` performs `f.WriteAt`
 on the underlying segment file for every WAL append. The
@@ -122,6 +141,12 @@ segment that has been preallocated and `fsync`-ed once is a
 valid AIO write target; a segment that has not yet been
 preallocated is not. The writer must not race AIO submission
 against preallocation.
+
+The substrate is in place via `Manager.WriteBlockAIO` and
+`AIOSubmitOp.Direction`; the per-segment writeback path is
+the same `WriteAt` shape the heap path uses. The WAL
+writer's hot path doesn't yet flow through the engine —
+that's the next slice.
 
 ## Verification
 
@@ -150,25 +175,46 @@ TestPoolPrefetchEnabledFiresThroughEngine,
 TestSeqScanFiresPrefetchesAcrossBlocks) still pass because
 `AIODirRead` is the zero value.
 
-### Caller integration (next slice)
+### Caller integration (Pool.FlushAllPaced — landed)
 
-Will pin: a flush-all under load with the engine attached
-shows the engine's `submitted` and `completed` counters
-advancing in lock-step with dirty-slot count, the `InFlight`
-counter peaks at most `min(io_max_concurrency, dirty_slots)`,
-and a crash-recovery test still passes.
+`internal/storage/storage_test.go`:
+
+- **TestFlushAllPacedBatchedSubmitsThroughEngine** — 3
+  dirty slots + recording engine + batch=4 → 3 submits
+  all `Direction=AIODirWrite`; bytes round-trip after
+  Invalidate+Pin to confirm WAL-before-data wasn't
+  broken (writes still landed correctly).
+- **TestFlushAllPacedBatchSizeOneEquivalentToLegacy** —
+  default batch=0 → serial path still flushes a dirty
+  slot correctly with no engine attached. Pre-AIO
+  behaviour preserved.
+- **TestSetAsyncFlushBatchSizeClamps** — input
+  validation: -1 → 1 (legacy serial), 10×Max →
+  `MaxFlushBatchSize`.
+
+The exec-package recording-engine fake
+(`recordingExecAIOEngine`) was extended in the same slice
+to dispatch on `Direction` so
+`TestSeqScanFiresPrefetchesAcrossBlocks`'s
+flush-then-Invalidate setup keeps round-tripping bytes.
 
 ## What this slice doesn't deliver
 
-- **Pool.FlushAllPaced AIO wiring.** The substrate is in
-  place but no checkpointer call site uses
-  `WriteBlockAIO` yet. Follow-up.
-- **WAL writer integration.** Same — substrate is shared,
-  the per-segment writeback path is the same `WriteAt`
-  shape, but the writer's hot path doesn't yet flow
-  through the engine.
+- **WAL writer integration.** The substrate is shared, the
+  per-segment writeback path is the same `WriteAt` shape,
+  but the writer's hot path doesn't yet flow through the
+  engine. Follow-up.
 - **Async fsync / fdatasync.** Out of scope. Durability
   barriers stay synchronous and serialising.
+- **Eviction-path AIO writes.** `Pool.flushSlot` (called
+  from `Pin` / `PinNew` evict-and-flush) keeps its
+  per-slot serial behaviour. The eviction is on the
+  single-slot critical path, not a batchable sweep, so
+  there's no parallelism to harvest.
+- **GUC for batch size.** `SetAsyncFlushBatchSize` is
+  hard-wired to 8 in `initdb.Open` when an engine
+  attaches; a future GUC (e.g.
+  `checkpoint_io_concurrency`) can expose the knob.
 - **Replication WAL receiving / sending paths.** Out of
   scope per the M0009 milestone definition.
 
