@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // TestParseStartReplicationArgsLogical pins the publisher-side
@@ -125,5 +127,130 @@ func TestWalsenderPgoutputAdapterWrapsAsCopyData(t *testing.T) {
 	}
 	if string(m2.WALBytes) != "second" {
 		t.Errorf("frame[1] body=%q", m2.WALBytes)
+	}
+}
+
+// TestPublicationFilterAllowsByTable: a publication that names
+// "items" admits every change for items (subject to publish
+// flags) and rejects every change for other tables.
+func TestPublicationFilterAllowsByTable(t *testing.T) {
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreatePublication("p", []string{"public.items"}, catalog.DefaultPublicationOptions()); err != nil {
+		t.Fatal(err)
+	}
+	f := buildPublicationFilter(ps, []string{"p"})
+
+	items := &wal.RelationDef{Schema: "public", Name: "items"}
+	events := &wal.RelationDef{Schema: "public", Name: "events"}
+
+	if !f.Allows(items, wal.ChangeInsert) {
+		t.Errorf("items insert allowed=false want true")
+	}
+	if !f.Allows(items, wal.ChangeDelete) {
+		t.Errorf("items delete allowed=false want true")
+	}
+	if f.Allows(events, wal.ChangeInsert) {
+		t.Errorf("events insert allowed=true want false (not in publication)")
+	}
+}
+
+// TestPublicationFilterAllTables: FOR ALL TABLES admits every
+// relation regardless of the per-table list.
+func TestPublicationFilterAllTables(t *testing.T) {
+	ps := catalog.NewPubSub()
+	opts := catalog.DefaultPublicationOptions()
+	opts.AllTables = true
+	if _, err := ps.CreatePublication("pall", nil, opts); err != nil {
+		t.Fatal(err)
+	}
+	f := buildPublicationFilter(ps, []string{"pall"})
+
+	if !f.Allows(&wal.RelationDef{Name: "anything"}, wal.ChangeInsert) {
+		t.Errorf("FOR ALL TABLES rejects an arbitrary relation")
+	}
+}
+
+// TestPublicationFilterRespectsPublishFlags: a publication with
+// publish=insert,delete (no update) admits inserts and deletes
+// but not updates for its tables.
+func TestPublicationFilterRespectsPublishFlags(t *testing.T) {
+	ps := catalog.NewPubSub()
+	opts := catalog.DefaultPublicationOptions()
+	opts.PublishUpdate = false
+	if _, err := ps.CreatePublication("p", []string{"public.items"}, opts); err != nil {
+		t.Fatal(err)
+	}
+	f := buildPublicationFilter(ps, []string{"p"})
+
+	items := &wal.RelationDef{Schema: "public", Name: "items"}
+	if !f.Allows(items, wal.ChangeInsert) {
+		t.Errorf("insert blocked")
+	}
+	if f.Allows(items, wal.ChangeUpdate) {
+		t.Errorf("update allowed despite publish=insert,delete")
+	}
+	if !f.Allows(items, wal.ChangeDelete) {
+		t.Errorf("delete blocked")
+	}
+}
+
+// TestPublicationFilterUnionAcrossPublications: when the slot
+// names two publications, the relation is allowed if any
+// publication grants the action. Mirrors upstream's
+// "any publication grants the change" rule.
+func TestPublicationFilterUnionAcrossPublications(t *testing.T) {
+	ps := catalog.NewPubSub()
+	insertOnly := catalog.DefaultPublicationOptions()
+	insertOnly.PublishUpdate = false
+	insertOnly.PublishDelete = false
+	deleteOnly := catalog.DefaultPublicationOptions()
+	deleteOnly.PublishInsert = false
+	deleteOnly.PublishUpdate = false
+	if _, err := ps.CreatePublication("p_ins", []string{"public.items"}, insertOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.CreatePublication("p_del", []string{"public.items"}, deleteOnly); err != nil {
+		t.Fatal(err)
+	}
+
+	f := buildPublicationFilter(ps, []string{"p_ins", "p_del"})
+	items := &wal.RelationDef{Schema: "public", Name: "items"}
+	if !f.Allows(items, wal.ChangeInsert) {
+		t.Errorf("insert blocked despite p_ins covering it")
+	}
+	if !f.Allows(items, wal.ChangeDelete) {
+		t.Errorf("delete blocked despite p_del covering it")
+	}
+	if f.Allows(items, wal.ChangeUpdate) {
+		t.Errorf("update allowed despite neither publication granting it")
+	}
+}
+
+// TestPublicationFilterUnknownPublicationSkipped: a non-existent
+// publication name is silently skipped — the slot still works
+// against any publications that do exist.
+func TestPublicationFilterUnknownPublicationSkipped(t *testing.T) {
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreatePublication("real", []string{"public.items"}, catalog.DefaultPublicationOptions()); err != nil {
+		t.Fatal(err)
+	}
+	f := buildPublicationFilter(ps, []string{"missing", "real"})
+	items := &wal.RelationDef{Schema: "public", Name: "items"}
+	if !f.Allows(items, wal.ChangeInsert) {
+		t.Errorf("insert blocked despite real publication being among the list")
+	}
+}
+
+// TestSplitPublicationNamesTrimsAndDropsEmpty.
+func TestSplitPublicationNamesTrimsAndDropsEmpty(t *testing.T) {
+	got := splitPublicationNames(" p1 , p2,, p3 ,")
+	want := []string{"p1", "p2", "p3"}
+	if len(got) != len(want) {
+		t.Fatalf("len=%d want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got[%d]=%q want %q", i, got[i], want[i])
+		}
 	}
 }

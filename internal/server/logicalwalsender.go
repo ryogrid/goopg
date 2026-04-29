@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +66,16 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 		nextLSN: args.StartLSN + 1,
 	}
 	plugin := wal.NewPgOutput(snap, adapter)
+
+	// Apply the publication-membership filter from the slot's
+	// requested publication_names option (parsed by
+	// parseStartReplicationArgs). Empty list / missing PubSub
+	// registry leaves the filter nil — emit every change in the
+	// snapshot, matching the v0 pre-filter behaviour. See
+	// docs/design/0008-0003-publication-subscription-ddl.md.
+	if pubNames := splitPublicationNames(args.Options["publication_names"]); len(pubNames) > 0 && s.cfg.PubSub != nil {
+		plugin.SetFilter(buildPublicationFilter(s.cfg.PubSub, pubNames))
+	}
 
 	dec, err := wal.NewSlotDecoderWithSnapshot(s.cfg.Slots, args.SlotName, s.cfg.WAL, walDir, segSize, plugin, wal.SlotSnapshot{Catalog: snap})
 	if err != nil {
@@ -154,3 +165,122 @@ func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 
 // guard the unused-import warning in some build configurations.
 var _ = storage.MainFork
+
+// publicationFilter implements wal.RelationFilter by checking
+// each (relation, change kind) pair against the union of the
+// slot's subscribed publications. A relation passes if at least
+// one of its subscribed publications either covers ALL TABLES
+// or names the relation explicitly *and* the corresponding
+// publish-flag for the change kind is set.
+//
+// Mirrors upstream's per-publication membership rules from
+// postgres/src/backend/replication/pgoutput/pgoutput.c
+// `relation_is_publishable`.
+type publicationFilter struct {
+	allTablesAllowed allowFlags
+	byTable          map[string]allowFlags
+}
+
+// allowFlags is the bitset of publish-* flags that have been
+// observed across the union of subscribed publications. Any one
+// publication granting an action is enough.
+type allowFlags struct {
+	insert, update, delete bool
+}
+
+func (f allowFlags) allowsKind(k wal.ChangeKind) bool {
+	switch k {
+	case wal.ChangeInsert:
+		return f.insert
+	case wal.ChangeUpdate:
+		return f.update
+	case wal.ChangeDelete:
+		return f.delete
+	}
+	return false
+}
+
+func (f *publicationFilter) Allows(rel *wal.RelationDef, kind wal.ChangeKind) bool {
+	if rel == nil {
+		return false
+	}
+	if f.allTablesAllowed.allowsKind(kind) {
+		return true
+	}
+	qname := relQualifiedName(rel)
+	if flags, ok := f.byTable[qname]; ok && flags.allowsKind(kind) {
+		return true
+	}
+	return false
+}
+
+// buildPublicationFilter materialises the membership rules from
+// the named publications. Unknown publication names are silently
+// skipped — upstream rejects them at CREATE SUBSCRIPTION time
+// rather than at slot start; v0 follows the lenient path so
+// startup doesn't fail when a publication has been dropped.
+func buildPublicationFilter(ps *catalog.PubSub, names []string) *publicationFilter {
+	out := &publicationFilter{
+		byTable: map[string]allowFlags{},
+	}
+	for _, name := range names {
+		pub, ok := ps.LookupPublication(name)
+		if !ok {
+			continue
+		}
+		flags := allowFlags{
+			insert: pub.PublishInsert,
+			update: pub.PublishUpdate,
+			delete: pub.PublishDelete,
+		}
+		if pub.AllTables {
+			out.allTablesAllowed = unionFlags(out.allTablesAllowed, flags)
+			continue
+		}
+		for _, qname := range pub.Tables {
+			out.byTable[qname] = unionFlags(out.byTable[qname], flags)
+		}
+	}
+	return out
+}
+
+// unionFlags ORs the publish-flag bitsets — a relation gets the
+// most-permissive treatment across every publication that
+// covers it. Mirrors upstream's "any publication grants the
+// action" rule.
+func unionFlags(a, b allowFlags) allowFlags {
+	return allowFlags{
+		insert: a.insert || b.insert,
+		update: a.update || b.update,
+		delete: a.delete || b.delete,
+	}
+}
+
+// relQualifiedName renders a wal.RelationDef the same way
+// catalog.PubSub stores publication-table names ("schema.name")
+// so the lookup is byte-equal.
+func relQualifiedName(rel *wal.RelationDef) string {
+	if rel.Schema == "" {
+		return rel.Name
+	}
+	return rel.Schema + "." + rel.Name
+}
+
+// splitPublicationNames parses the `publication_names` option
+// value libpq sends as 'p1,p2,p3' into a clean slice of names.
+// Empty / whitespace entries are dropped; surrounding spaces
+// trimmed.
+func splitPublicationNames(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}

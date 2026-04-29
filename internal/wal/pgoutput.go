@@ -52,6 +52,17 @@ const (
 	pgoColText = 't'
 )
 
+// RelationFilter decides whether a given (relation, change kind)
+// pair should be emitted to the wire. Used by PgOutput to apply
+// the publication-membership rules a real subscriber expects:
+// `CREATE PUBLICATION p FOR TABLE t1, t2` means changes to t1 /
+// t2 land on the wire and changes to other tables don't, with
+// the publish=insert,update,delete flags filtering at the
+// change-kind level. nil filter = pass everything.
+type RelationFilter interface {
+	Allows(rel *RelationDef, kind ChangeKind) bool
+}
+
 // PgOutput emits logical-replication messages to an io.Writer in
 // upstream pgoutput's wire format. One PgOutput per active
 // logical slot; not goroutine-safe (the `SlotDecoder` loop is
@@ -66,6 +77,14 @@ type PgOutput struct {
 	// message; subsequent changes skip it. Mirrors upstream's
 	// `relsynced` set.
 	emittedRel map[uint32]struct{}
+
+	// filter, when non-nil, gates every Change emission against
+	// publication-membership rules. SetFilter installs it; nil
+	// (the default) means "ship every change for every relation
+	// in the snapshot" — useful for tests and for the
+	// catalog-only initial scaffolding before publications
+	// existed.
+	filter RelationFilter
 }
 
 // NewPgOutput constructs a plugin that writes pgoutput messages
@@ -79,6 +98,14 @@ func NewPgOutput(snap *CatalogSnapshot, w io.Writer) *PgOutput {
 		w:          w,
 		emittedRel: map[uint32]struct{}{},
 	}
+}
+
+// SetFilter installs a publication-membership filter. Call once
+// at construction time — the SlotDecoder loop is sequential, so
+// changing the filter mid-stream isn't supported. Pass nil to
+// clear an existing filter.
+func (p *PgOutput) SetFilter(f RelationFilter) {
+	p.filter = f
 }
 
 // Begin emits the per-xact `B` prologue. final_lsn = commitLSN
@@ -122,6 +149,13 @@ func (p *PgOutput) Change(c Change) error {
 		// Future loop: surface this as an error once schema
 		// changes are honoured. For now skip silently — the
 		// classifier already filtered everything actionable.
+		return nil
+	}
+	if p.filter != nil && !p.filter.Allows(rel, c.Kind) {
+		// Out of the slot's publication set (or excluded by
+		// publish=... flags). No `R` is emitted either —
+		// subscribers never need a relation descriptor for
+		// changes they'll never receive.
 		return nil
 	}
 	if _, ok := p.emittedRel[rel.OID]; !ok {

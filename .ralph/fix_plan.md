@@ -2490,11 +2490,45 @@ item.
       doesn't restrict the wire). Hooking the publication-
       filter into the pgoutput writer is a small follow-up.)
 
-- [ ] Publication-membership filter on the publisher's
-      logical walsender: only emit changes for relations
-      named by the slot's subscribed publications. Today
-      every change for every relation in the catalog
-      snapshot is shipped.
+- [x] Publication-membership filter on the publisher's
+      logical walsender (continues 0008-0003 / 0008-0004).
+      (landed 2026-04-29: `wal.RelationFilter` interface
+      and `PgOutput.SetFilter` gate every Change emission
+      against publication membership *and* per-kind
+      publish-flag rules. Filter-rejected changes emit
+      nothing — neither `R` nor `I`/`D`. Server-side
+      `publicationFilter` (in `logicalwalsender.go`) is
+      built from the slot's `publication_names` option:
+      iterates the subscribed publications, ORs publish-
+      flag bitsets across every publication that covers a
+      relation, and keeps a fast-path for FOR ALL TABLES
+      publications. Unknown publication names are silently
+      skipped (lenient v0 behavior; upstream rejects them
+      at CREATE SUBSCRIPTION time). `relQualifiedName`
+      renders rels as "schema.name" so the lookup is
+      byte-equal with what `catalog.PubSub.Tables` stores.
+      `splitPublicationNames` parses libpq's
+      'p1,p2,p3' option value with whitespace trimming +
+      empty-entry drops. `runLogicalWalsender` installs
+      the filter via `SetFilter` when both the option list
+      is non-empty and the runtime has a PubSub registry;
+      missing either path leaves the filter nil so the
+      old "ship everything" behaviour is preserved.
+      Tests: TestPgOutputFilterSuppressesEmission and
+      TestPgOutputFilterPerKind in the wal package pin the
+      filter contract on PgOutput;
+      TestPublicationFilterAllowsByTable,
+      TestPublicationFilterAllTables,
+      TestPublicationFilterRespectsPublishFlags,
+      TestPublicationFilterUnionAcrossPublications,
+      TestPublicationFilterUnknownPublicationSkipped,
+      TestSplitPublicationNamesTrimsAndDropsEmpty in the
+      server package pin the publication-derivation rules
+      and the `publication_names` parser. With this slice
+      a subscriber's `CREATE SUBSCRIPTION s CONNECTION ...
+      PUBLICATION p` actually only receives changes from
+      `p`'s tables — the wire matches what publication
+      DDL configured.)
 
 - [ ] Tablesync state machine + initial table sync: subscriber
       worker that COPYs each new table's current contents

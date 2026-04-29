@@ -262,3 +262,78 @@ func TestPgOutputSkipsUnknownRelation(t *testing.T) {
 		t.Errorf("unknown rel produced output: %x", buf.Bytes())
 	}
 }
+
+// alwaysFalseFilter rejects every change. Used to pin
+// PgOutput.Change's filter contract.
+type alwaysFalseFilter struct{}
+
+func (alwaysFalseFilter) Allows(_ *RelationDef, _ ChangeKind) bool { return false }
+
+// onlyInsertFilter admits inserts on every relation, rejects
+// other change kinds.
+type onlyInsertFilter struct{}
+
+func (onlyInsertFilter) Allows(_ *RelationDef, k ChangeKind) bool {
+	return k == ChangeInsert
+}
+
+// TestPgOutputFilterSuppressesEmission pins the M0008 /
+// 0008-0003 publication-membership contract: when SetFilter
+// rejects a change, PgOutput emits nothing — neither the `R`
+// nor the `I`/`D` payload. Subscribers never see a relation
+// descriptor for changes they'll never receive.
+func TestPgOutputFilterSuppressesEmission(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	po.SetFilter(alwaysFalseFilter{})
+
+	body := encodeBodyV0([]any{1}, []string{"int4"})
+	tuple := wrapAsHeapTuple(t, body)
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("filter-rejected change produced %d bytes; want 0", buf.Len())
+	}
+}
+
+// TestPgOutputFilterPerKind: a filter that admits only inserts
+// passes inserts through (with their preceding R) and drops
+// deletes silently — and the dropped delete must not pre-emit
+// a stray R for its relation either.
+func TestPgOutputFilterPerKind(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	po.SetFilter(onlyInsertFilter{})
+
+	// Delete first — should be silently dropped.
+	if err := po.Change(Change{Kind: ChangeDelete, Rel: rel}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("filter-rejected delete emitted %d bytes; want 0", buf.Len())
+	}
+
+	// Then an insert — should emit R + I.
+	body := encodeBodyV0([]any{1}, []string{"int4"})
+	tuple := wrapAsHeapTuple(t, body)
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Bytes()[0] != 'R' {
+		t.Errorf("first byte after allowed insert=%q want R", buf.Bytes()[0])
+	}
+	if !bytes.Contains(buf.Bytes(), []byte{'I'}) {
+		t.Errorf("missing I after allowed insert: %x", buf.Bytes())
+	}
+}
