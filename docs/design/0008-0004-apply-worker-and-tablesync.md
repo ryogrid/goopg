@@ -182,10 +182,11 @@ adjusting state and restarting the worker.
   output. Real slot-start handshake (`START_REPLICATION SLOT name
   LOGICAL ...`) and the message-framing-from-CopyData unwrap follow
   in the next loop.
-- Initial table sync (the `i` / `d` / `s` / `r` state machine).
-- `pg_subscription_rel` row-level updates from the apply worker —
-  the view emits zero rows from 0008-0003 and stays that way until
-  tablesync lands.
+- Initial COPY transport for tablesync — the catalog state
+  machine for `pg_subscription_rel.srsubstate` (`i` / `d` /
+  `s` / `r`) landed in a separate slice (see "Tablesync state
+  machine — catalog substrate" below), but no worker yet
+  walks a relation through those transitions.
 - UPDATE message support — encoder doesn't emit `U` yet.
 - DELETE row resolution — emit-time pre-image is missing; first
   slice no-ops on `D`.
@@ -206,6 +207,66 @@ encoder:
   the caller can advance `confirmed_flush_lsn`.
 - `TestPgoutputDecoderRoundTrip`: pure decoder unit test —
   encode B/C/R/I/D, decode each message, confirm round-trip.
+
+## Tablesync state machine — catalog substrate
+
+Upstream tracks per-(subscription, relation) sync progress in
+`pg_subscription_rel.srsubstate`. The column is a single
+character that walks monotonically from `i` (init) through
+`d` (data copying) and `s` (sync done — caught up to a known
+LSN) to `r` (ready — fully integrated into the streaming
+apply). A reversal would imply rewinding a synced table back
+to copy mode, which would silently re-apply rows; the catalog
+must reject it.
+
+`internal/catalog/pubsub.go` carries the state machine. Each
+row is a `SubscriptionRel { SubID, RelOID, State, LSN }`,
+indexed by subscription name + relation OID:
+
+```
+subRels map[string]map[uint32]*SubscriptionRel
+```
+
+Constants `SubRelStateInit="i"`, `SubRelStateDataCopy="d"`,
+`SubRelStateSyncDone="s"`, `SubRelStateReady="r"` are the
+only legal values; an unknown character returns
+`ErrInvalidSubRelState`. The validity table
+
+```
+i → {i, d, s}     // i→s shortcut covers tables empty at slot start
+d → {d, s}
+s → {s, r}
+r → {r}
+```
+
+is enforced by `AdvanceSubscriptionRel(subName, relOID,
+newState, newLSN)`; an illegal jump (e.g. `i → r`) or a
+reversal (`r → d`) returns `ErrInvalidSubRelStateTransition`.
+LSN updates use `max(old, new)` so a stale path that supplies
+a smaller LSN cannot rewind sync progress.
+
+`AddSubscriptionRel` seeds a fresh row at state `i` and
+returns `ErrSubscriptionRelExists` on duplicates;
+`DropSubscription` clears the entire `subRels[name]` bucket
+so a re-CREATE under the same name doesn't inherit stale
+state. Read accessors: `LookupSubscriptionRel(subName,
+relOID)`, `SubscriptionRels(subName)` (per-subscription
+slice), and `AllSubscriptionRels()` (cross-subscription
+slice — used by the catalog view).
+
+`internal/initdb/replication_views.go` wires the
+`pg_subscription_rel` virtual view to render rows from
+`AllSubscriptionRels()`: `srsubid` and `srrelid` come from
+the row, `srsubstate` is the state character verbatim, and
+`srsublsn` is `formatLSN(LSN)` (or empty when LSN is zero).
+The view is no longer "always zero rows" — once a worker
+drives the state machine, `\d+ pg_subscription_rel` will
+reflect tablesync progress.
+
+What the substrate doesn't deliver: the actual COPY
+transport that reads each table's snapshot, and the
+apply-worker hook that calls `AdvanceSubscriptionRel`
+during streaming. Both land in the next two M0008 slices.
 
 ## Cross-references
 

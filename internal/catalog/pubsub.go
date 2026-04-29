@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -35,6 +36,43 @@ type Subscription struct {
 	SlotName     string
 }
 
+// SubscriptionRel is one tablesync row: a (subscription, relation)
+// pair plus its current sync state. Mirrors upstream
+// pg_subscription_rel's `srsubid` / `srrelid` / `srsubstate` /
+// `srsublsn` columns. State values follow upstream's letter codes:
+//
+//	'i' — initial (waiting for sync to start)
+//	'd' — data is being copied
+//	's' — synchronized (sync done, catching up to streaming)
+//	'r' — ready (joined the streaming apply path)
+//
+// Mirrors upstream's `SUBREL_STATE_*` constants in
+// postgres/src/include/catalog/pg_subscription_rel.h. See
+// docs/design/0008-0004-apply-worker-and-tablesync.md.
+type SubscriptionRel struct {
+	SubID  uint32
+	RelOID uint32
+	State  string
+	LSN    uint64
+}
+
+// Tablesync state letters matching upstream's
+// `SUBREL_STATE_INIT` / `_DATASYNC` / `_SYNCDONE` / `_READY`.
+const (
+	SubRelStateInit     = "i"
+	SubRelStateDataCopy = "d"
+	SubRelStateSyncDone = "s"
+	SubRelStateReady    = "r"
+)
+
+// Tablesync errors surfaced by the state-machine API.
+var (
+	ErrSubscriptionRelExists       = errors.New("subscription_rel already exists")
+	ErrSubscriptionRelNotFound     = errors.New("subscription_rel does not exist")
+	ErrInvalidSubRelState          = errors.New("invalid subscription_rel state")
+	ErrInvalidSubRelStateTransition = errors.New("invalid subscription_rel state transition")
+)
+
 // Errors surfaced by PubSub mutators.
 var (
 	ErrPublicationExists    = errors.New("publication already exists")
@@ -51,6 +89,12 @@ type PubSub struct {
 	mu            sync.RWMutex
 	publications  map[string]*Publication
 	subscriptions map[string]*Subscription
+	// subRels is the tablesync state-machine store. Keyed by
+	// subscription name → RelOID → SubscriptionRel. The
+	// per-subscription map keeps lookups + iteration cheap and
+	// matches the way pg_subscription_rel is queried in
+	// practice (always filtered by srsubid).
+	subRels map[string]map[uint32]*SubscriptionRel
 	// nextOID is local to the registry. PubSub OIDs share the
 	// same numeric space upstream uses (anything ≥ FirstUserOID),
 	// but they don't collide with user-table OIDs because the
@@ -65,6 +109,7 @@ func NewPubSub() *PubSub {
 	return &PubSub{
 		publications:  map[string]*Publication{},
 		subscriptions: map[string]*Subscription{},
+		subRels:       map[string]map[uint32]*SubscriptionRel{},
 		nextOID:       FirstUserOID,
 	}
 }
@@ -194,7 +239,9 @@ func (p *PubSub) CreateSubscription(name, conninfo string, publications []string
 }
 
 // DropSubscription removes a subscription. Returns
-// ErrSubscriptionNotFound when name is unknown.
+// ErrSubscriptionNotFound when name is unknown. Tablesync rows
+// for the subscription are dropped at the same time so a
+// re-CREATE under the same name doesn't inherit stale state.
 func (p *PubSub) DropSubscription(name string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -202,6 +249,7 @@ func (p *PubSub) DropSubscription(name string) error {
 		return ErrSubscriptionNotFound
 	}
 	delete(p.subscriptions, name)
+	delete(p.subRels, name)
 	return nil
 }
 
@@ -234,6 +282,182 @@ func (p *PubSub) Subscriptions() []*Subscription {
 		sub := *p.subscriptions[n]
 		sub.Publications = append([]string(nil), p.subscriptions[n].Publications...)
 		out = append(out, &sub)
+	}
+	return out
+}
+
+// validSubRelStates is the set of legal state letters for
+// SubscriptionRel.State. Anything outside this set surfaces as
+// ErrInvalidSubRelState.
+var validSubRelStates = map[string]struct{}{
+	SubRelStateInit:     {},
+	SubRelStateDataCopy: {},
+	SubRelStateSyncDone: {},
+	SubRelStateReady:    {},
+}
+
+// validSubRelTransitions encodes the upstream-shape state
+// machine: i → d → s → r. Each step is monotonic; "going
+// backwards" is rejected at the API boundary so the apply
+// worker can't accidentally rewind a synced table.
+//
+//	i → d   (initial → data-copy starting)
+//	d → s   (data copy finished, catching up to streaming)
+//	s → r   (caught up; ready to join streaming apply)
+//	any state → same state is allowed as a no-op LSN bump.
+//
+// Tablesync sometimes also lets `i → s` happen when the table
+// was already empty at slot start — upstream optimises away
+// the data-copy phase. v0 honours that shortcut too.
+var validSubRelTransitions = map[string]map[string]struct{}{
+	SubRelStateInit: {
+		SubRelStateInit:     {},
+		SubRelStateDataCopy: {},
+		SubRelStateSyncDone: {},
+	},
+	SubRelStateDataCopy: {
+		SubRelStateDataCopy: {},
+		SubRelStateSyncDone: {},
+	},
+	SubRelStateSyncDone: {
+		SubRelStateSyncDone: {},
+		SubRelStateReady:    {},
+	},
+	SubRelStateReady: {
+		SubRelStateReady: {},
+	},
+}
+
+// AddSubscriptionRel registers a new tablesync row for
+// (subName, relOID) in the SubRelStateInit state. Returns
+// ErrSubscriptionNotFound when the subscription doesn't exist
+// and ErrSubscriptionRelExists when the rel is already tracked.
+// See docs/design/0008-0004-apply-worker-and-tablesync.md.
+func (p *PubSub) AddSubscriptionRel(subName string, relOID uint32) (*SubscriptionRel, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sub, ok := p.subscriptions[subName]
+	if !ok {
+		return nil, ErrSubscriptionNotFound
+	}
+	if rels, ok := p.subRels[subName]; ok {
+		if _, dup := rels[relOID]; dup {
+			return nil, ErrSubscriptionRelExists
+		}
+	} else {
+		p.subRels[subName] = map[uint32]*SubscriptionRel{}
+	}
+	rel := &SubscriptionRel{
+		SubID:  sub.OID,
+		RelOID: relOID,
+		State:  SubRelStateInit,
+	}
+	p.subRels[subName][relOID] = rel
+	out := *rel
+	return &out, nil
+}
+
+// AdvanceSubscriptionRel transitions one tablesync row to a new
+// state, optionally bumping its LSN. The state must be one of
+// `i`/`d`/`s`/`r`, and the transition must be legal under
+// validSubRelTransitions. Mirrors upstream's
+// `UpdateSubscriptionRelState`. Returns the freshly-updated row
+// (deep-copied) so the caller can observe both new fields without
+// re-Lookup.
+func (p *PubSub) AdvanceSubscriptionRel(subName string, relOID uint32, newState string, newLSN uint64) (*SubscriptionRel, error) {
+	if _, ok := validSubRelStates[newState]; !ok {
+		return nil, ErrInvalidSubRelState
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rels, ok := p.subRels[subName]
+	if !ok {
+		return nil, ErrSubscriptionRelNotFound
+	}
+	rel, ok := rels[relOID]
+	if !ok {
+		return nil, ErrSubscriptionRelNotFound
+	}
+	allowed, ok := validSubRelTransitions[rel.State]
+	if !ok {
+		return nil, ErrInvalidSubRelStateTransition
+	}
+	if _, ok := allowed[newState]; !ok {
+		return nil, fmt.Errorf("%w: %s → %s", ErrInvalidSubRelStateTransition, rel.State, newState)
+	}
+	rel.State = newState
+	if newLSN > rel.LSN {
+		rel.LSN = newLSN
+	}
+	out := *rel
+	return &out, nil
+}
+
+// LookupSubscriptionRel returns a deep copy of one tablesync
+// row, or nil/false when the (subName, relOID) pair isn't
+// tracked.
+func (p *PubSub) LookupSubscriptionRel(subName string, relOID uint32) (*SubscriptionRel, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	rels, ok := p.subRels[subName]
+	if !ok {
+		return nil, false
+	}
+	rel, ok := rels[relOID]
+	if !ok {
+		return nil, false
+	}
+	out := *rel
+	return &out, true
+}
+
+// SubscriptionRels returns every tablesync row for `subName` in
+// RelOID order. Each entry is a deep copy. Empty slice when the
+// subscription has no tablesync rows yet (or when it doesn't
+// exist).
+func (p *PubSub) SubscriptionRels(subName string) []*SubscriptionRel {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	rels, ok := p.subRels[subName]
+	if !ok {
+		return nil
+	}
+	oids := make([]uint32, 0, len(rels))
+	for o := range rels {
+		oids = append(oids, o)
+	}
+	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+	out := make([]*SubscriptionRel, 0, len(oids))
+	for _, o := range oids {
+		cp := *rels[o]
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// AllSubscriptionRels returns every (subName, rel) pair across
+// every subscription, ordered by (subName, RelOID). Used by the
+// pg_subscription_rel virtual view.
+func (p *PubSub) AllSubscriptionRels() []*SubscriptionRel {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	subNames := make([]string, 0, len(p.subRels))
+	for n := range p.subRels {
+		subNames = append(subNames, n)
+	}
+	sort.Strings(subNames)
+	var out []*SubscriptionRel
+	for _, n := range subNames {
+		rels := p.subRels[n]
+		oids := make([]uint32, 0, len(rels))
+		for o := range rels {
+			oids = append(oids, o)
+		}
+		sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+		for _, o := range oids {
+			cp := *rels[o]
+			out = append(out, &cp)
+		}
 	}
 	return out
 }

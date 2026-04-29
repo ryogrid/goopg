@@ -125,3 +125,137 @@ func TestPubSubDuplicateSubscriptionName(t *testing.T) {
 		t.Errorf("err=%v want ErrSubscriptionExists", err)
 	}
 }
+
+// TestSubscriptionRelStateMachineHappyPath pins the canonical
+// upstream tablesync flow: i → d → s → r. Each AdvanceSubscriptionRel
+// returns the freshly-updated row with state + LSN bumped.
+func TestSubscriptionRelStateMachineHappyPath(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "x", []string{"p"}, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("s1", 16400); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ps.LookupSubscriptionRel("s1", 16400)
+	if !ok || got.State != SubRelStateInit {
+		t.Errorf("initial state=%+v want %q", got, SubRelStateInit)
+	}
+
+	// i → d
+	if _, err := ps.AdvanceSubscriptionRel("s1", 16400, SubRelStateDataCopy, 0); err != nil {
+		t.Fatal(err)
+	}
+	// d → s with an LSN
+	if r, err := ps.AdvanceSubscriptionRel("s1", 16400, SubRelStateSyncDone, 0xCAFE); err != nil {
+		t.Fatal(err)
+	} else if r.State != SubRelStateSyncDone || r.LSN != 0xCAFE {
+		t.Errorf("after sync done: %+v", r)
+	}
+	// s → r
+	if r, err := ps.AdvanceSubscriptionRel("s1", 16400, SubRelStateReady, 0xDEAD); err != nil {
+		t.Fatal(err)
+	} else if r.State != SubRelStateReady || r.LSN != 0xDEAD {
+		t.Errorf("after ready: %+v", r)
+	}
+}
+
+// TestSubscriptionRelStateMachineRejectsBackwards: every
+// reversal (e.g. r → s) and every illegal jump (e.g. i → r)
+// surfaces ErrInvalidSubRelStateTransition. Mirrors upstream's
+// monotonic state-machine guarantee.
+func TestSubscriptionRelStateMachineRejectsBackwards(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("s1", 1); err != nil {
+		t.Fatal(err)
+	}
+	// i → r (illegal jump)
+	if _, err := ps.AdvanceSubscriptionRel("s1", 1, SubRelStateReady, 0); !errors.Is(err, ErrInvalidSubRelStateTransition) {
+		t.Errorf("i → r err=%v want ErrInvalidSubRelStateTransition", err)
+	}
+	// Walk forward to r, then try to go back.
+	for _, st := range []string{SubRelStateDataCopy, SubRelStateSyncDone, SubRelStateReady} {
+		if _, err := ps.AdvanceSubscriptionRel("s1", 1, st, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// r → d (reversal)
+	if _, err := ps.AdvanceSubscriptionRel("s1", 1, SubRelStateDataCopy, 0); !errors.Is(err, ErrInvalidSubRelStateTransition) {
+		t.Errorf("r → d err=%v want ErrInvalidSubRelStateTransition", err)
+	}
+}
+
+// TestSubscriptionRelInitToSyncDoneShortcut: upstream allows
+// `i → s` when the table was already empty at slot start so
+// the data-copy phase is skipped. v0 honours that shortcut.
+func TestSubscriptionRelInitToSyncDoneShortcut(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("s1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AdvanceSubscriptionRel("s1", 1, SubRelStateSyncDone, 0xBEEF); err != nil {
+		t.Errorf("i → s shortcut rejected: %v", err)
+	}
+}
+
+// TestSubscriptionRelLSNMonotonic: LSN never goes backwards
+// even when a caller passes a smaller value.
+func TestSubscriptionRelLSNMonotonic(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("s1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AdvanceSubscriptionRel("s1", 1, SubRelStateDataCopy, 0xCAFE); err != nil {
+		t.Fatal(err)
+	}
+	r, err := ps.AdvanceSubscriptionRel("s1", 1, SubRelStateDataCopy, 0x1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.LSN != 0xCAFE {
+		t.Errorf("LSN=%x want 0xCAFE (rewind rejected)", r.LSN)
+	}
+}
+
+// TestSubscriptionRelDropSubscriptionClearsRels: dropping a
+// subscription drops all its tablesync rows so a re-CREATE
+// under the same name doesn't inherit stale state.
+func TestSubscriptionRelDropSubscriptionClearsRels(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("s1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ps.DropSubscription("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if rels := ps.SubscriptionRels("s1"); len(rels) != 0 {
+		t.Errorf("after drop, rels=%v want empty", rels)
+	}
+}
+
+// TestAddSubscriptionRelDuplicate pins the uniqueness contract
+// for (subName, relOID).
+func TestAddSubscriptionRelDuplicate(t *testing.T) {
+	ps := NewPubSub()
+	if _, err := ps.CreateSubscription("s1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("s1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("s1", 1); !errors.Is(err, ErrSubscriptionRelExists) {
+		t.Errorf("err=%v want ErrSubscriptionRelExists", err)
+	}
+}

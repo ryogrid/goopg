@@ -2530,10 +2530,57 @@ item.
       `p`'s tables — the wire matches what publication
       DDL configured.)
 
-- [ ] Tablesync state machine + initial table sync: subscriber
-      worker that COPYs each new table's current contents
-      before joining streaming apply; `pg_subscription_rel`
-      state column transitions through i / d / s / r.
+- [x] Tablesync state machine — catalog substrate
+      (`pg_subscription_rel.srsubstate`). (landed 2026-04-29:
+      `catalog.PubSub` gained a `SubscriptionRel { SubID,
+      RelOID, State, LSN }` row type with state constants
+      `SubRelStateInit="i"`, `SubRelStateDataCopy="d"`,
+      `SubRelStateSyncDone="s"`, `SubRelStateReady="r"` and
+      a monotonic-only validity map: `i→{i,d,s}` (the i→s
+      shortcut covers tables that were empty at slot start),
+      `d→{d,s}`, `s→{s,r}`, `r→{r}` — every reversal and
+      every illegal jump returns
+      `ErrInvalidSubRelStateTransition`. `AddSubscriptionRel`
+      seeds (subName, relOID) at state `i`;
+      `AdvanceSubscriptionRel` validates the transition and
+      `max()`-merges LSN so concurrent paths cannot rewind
+      sync progress. `DropSubscription` clears
+      `subRels[name]` so a re-CREATE under the same name
+      doesn't inherit stale rows. Accessors:
+      `LookupSubscriptionRel`,
+      `SubscriptionRels(subName)`, `AllSubscriptionRels()`.
+      `internal/initdb/replication_views.go` wires the
+      `pg_subscription_rel` virtual view to render rows
+      from `AllSubscriptionRels()` (`srsublsn` formatted
+      via `formatLSN`, blank when LSN==0). Tests:
+      TestSubscriptionRelStateMachineHappyPath (i→d→s→r
+      with LSN bumps), TestSubscriptionRelStateMachineRejectsBackwards
+      (i→r illegal jump and r→d reversal both rejected),
+      TestSubscriptionRelInitToSyncDoneShortcut,
+      TestSubscriptionRelLSNMonotonic (smaller LSN ignored),
+      TestSubscriptionRelDropSubscriptionClearsRels,
+      TestAddSubscriptionRelDuplicate. Built and full
+      `go test ./...` green. The catalog/SQL surface for
+      tablesync is now ready; the actual TCP-driven COPY
+      and the apply-worker hookup that drives transitions
+      remain as the next two M0008 slices below.)
+
+- [ ] Tablesync initial COPY transport: subscriber worker
+      that opens a second walsender connection per
+      not-yet-ready relation, issues `COPY (SELECT * FROM
+      <rel>) TO STDOUT` (or the upstream pg_dump-style
+      tablesync path), streams rows into the local heap,
+      then advances `pg_subscription_rel.srsubstate` from
+      `i` → `d` → `s` once the snapshot is drained.
+
+- [ ] Apply-worker tablesync integration: hook the streaming
+      apply path so that for each relation it observes a
+      change for, it consults `pg_subscription_rel` and
+      either (a) buffers/skips changes until the table
+      reaches state `r`, or (b) advances `s` → `r` on the
+      first commit at-or-after the tablesync end-LSN.
+      Mirrors upstream's `process_syncing_tables` loop in
+      `worker.c`.
 
 - [ ] Logical-replication observability: `pg_stat_subscription`,
       logical-replication rows in `pg_stat_replication`, structured

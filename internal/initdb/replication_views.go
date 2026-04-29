@@ -397,9 +397,24 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 		Virtual: true,
 	}
 	pgSubRel.VirtualRows = func() [][]string {
-		// Tablesync state is driven by the apply worker (0008-0004);
-		// until that lands the view emits zero rows.
-		return nil
+		if ps == nil {
+			return nil
+		}
+		all := ps.AllSubscriptionRels()
+		out := make([][]string, 0, len(all))
+		for _, sr := range all {
+			lsn := ""
+			if sr.LSN != 0 {
+				lsn = formatLSN(sr.LSN)
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", sr.SubID),
+				fmt.Sprintf("%d", sr.RelOID),
+				sr.State,
+				lsn,
+			})
+		}
+		return out
 	}
 	return cat.RegisterVirtualTable(pgSubRel)
 }
