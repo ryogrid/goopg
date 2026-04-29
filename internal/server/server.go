@@ -94,6 +94,15 @@ type Config struct {
 	// where the server runs without a WAL writer.
 	Checkpointer executor.Checkpointer
 
+	// Promote, when set, is invoked by the control-plane PROMOTE
+	// command. The handler drains pending WAL replay, removes
+	// `<DataDir>/standby.signal`, and switches the runtime out of
+	// standby mode. Wired by `cmd/goopg start` only when the data
+	// directory had standby.signal at boot. nil makes PROMOTE
+	// reply with "promote not configured" — protecting an
+	// already-primary process from a stray `goopg promote`.
+	Promote func() error
+
 	// Slots, when set, exposes the replication-slot registry to
 	// the wire-layer replication-command handler (IDENTIFY_SYSTEM,
 	// CREATE_REPLICATION_SLOT, DROP_REPLICATION_SLOT). nil disables
@@ -295,6 +304,12 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 		}
 		s.cfg.Logger.Info("control: checkpoint requested")
 		return s.cfg.Checkpointer.CheckpointNow()
+	}
+	if s.cfg.Promote != nil {
+		cl.OnPromote = func() error {
+			s.cfg.Logger.Info("control: promote requested")
+			return s.cfg.Promote()
+		}
 	}
 	s.controlListener = cl
 	s.controlPath = socketPath

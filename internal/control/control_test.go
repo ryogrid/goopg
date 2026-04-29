@@ -96,6 +96,78 @@ func TestListenerStopAndPing(t *testing.T) {
 	}
 }
 
+// TestPromoteDispatch confirms the PROMOTE command routes to the
+// OnPromote callback and the reply only flows after the handler
+// returns. We seed the handler with a 50ms sleep — if the listener
+// replied before the callback finished, the test would race and
+// occasionally observe stopped == 0 below.
+func TestPromoteDispatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), SocketName)
+	ln, err := NewListener(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var promoted int32
+	ln.OnPromote = func() error {
+		time.Sleep(50 * time.Millisecond)
+		atomic.StoreInt32(&promoted, 1)
+		return nil
+	}
+	go ln.Serve()
+	reply, err := Send(path, "PROMOTE", 5*time.Second)
+	if err != nil {
+		t.Fatalf("PROMOTE: %v", err)
+	}
+	if reply != "OK" {
+		t.Errorf("PROMOTE reply=%q want OK", reply)
+	}
+	if atomic.LoadInt32(&promoted) != 1 {
+		t.Error("OnPromote did not run before reply")
+	}
+}
+
+// TestPromoteUnconfigured pins the "I'm a primary, not a standby"
+// guard: a server with no OnPromote set must reject PROMOTE rather
+// than no-op silently.
+func TestPromoteUnconfigured(t *testing.T) {
+	path := filepath.Join(t.TempDir(), SocketName)
+	ln, err := NewListener(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go ln.Serve()
+	reply, err := Send(path, "PROMOTE", time.Second)
+	if err != nil {
+		t.Fatalf("PROMOTE: %v", err)
+	}
+	if reply != "ERR promote not configured" {
+		t.Errorf("PROMOTE reply=%q want ERR promote not configured", reply)
+	}
+}
+
+// TestPromoteHandlerError surfaces handler-side failures verbatim so
+// the operator sees what went wrong (drain timeout, signal-removal
+// failure, etc.) without having to scrape server logs.
+func TestPromoteHandlerError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), SocketName)
+	ln, err := NewListener(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	ln.OnPromote = func() error { return errors.New("drain timed out") }
+	go ln.Serve()
+	reply, err := Send(path, "PROMOTE", time.Second)
+	if err != nil {
+		t.Fatalf("PROMOTE: %v", err)
+	}
+	if reply != "ERR drain timed out" {
+		t.Errorf("PROMOTE reply=%q want ERR drain timed out", reply)
+	}
+}
+
 // TestProcessAliveSelf sanity-checks ProcessAlive: this process is
 // always alive, pid 0 is not.
 func TestProcessAliveSelf(t *testing.T) {

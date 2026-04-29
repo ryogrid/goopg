@@ -41,6 +41,7 @@ Commands:
   restart    Stop the server and start it again.
   reload     Reload configuration without restarting.
   checkpoint Trigger a synchronous IMMEDIATE-speed checkpoint.
+  promote    Promote a running standby to primary.
   status     Report whether a server is running and its high-level state.
   version    Print the goopg version and exit.
 
@@ -59,6 +60,7 @@ var subcommands = []subcommand{
 	{"restart", runRestart},
 	{"reload", runReload},
 	{"checkpoint", runCheckpoint},
+	{"promote", runPromote},
 	{"status", runStatus},
 	{"version", runVersion},
 }
@@ -200,8 +202,6 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		logger.Info("loaded pg_hba.conf", "path", *hbaPath, "rules", len(policy.Rules))
 	}
 
-	srv := server.New(cfg)
-
 	// Honour the checkpoint_timeout GUC (milestone 0002). Default of
 	// 300s matches upstream; the prior hard-coded 10s was a
 	// development convenience. A future reload path will reapply
@@ -286,23 +286,24 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// idempotent via `pd_lsn`, so on restart the iterator can safely
 	// re-read the durable tail without bookkeeping a separate
 	// apply cursor.
-	wrCtx, wrCancel := context.WithCancel(ctx)
-	wrDone := make(chan struct{})
-	replayDone := make(chan struct{})
+	//
+	// The standbyController exposes a Promote method for the
+	// control-plane PROMOTE command. It must be wired into
+	// server.Config BEFORE srv.Run begins so the very first PROMOTE
+	// after startup has a handler.
+	var sc *standbyController
 	if rt != nil && rt.Standby {
-		startWalreceiver(wrCtx, wrDone, rt, registry, logger)
-		startStandbyReplayer(wrCtx, replayDone, rt, logger)
-	} else {
-		close(wrDone)
-		close(replayDone)
+		sc = startStandby(ctx, rt, registry, logger)
+		cfg.Promote = boundPromoteToServer(sc)
 	}
 
+	srv := server.New(cfg)
 	runErr := srv.Run(ctx)
 	cpCancel()
-	wrCancel()
+	if sc != nil {
+		sc.Close()
+	}
 	<-cpDone
-	<-wrDone
-	<-replayDone
 	if runErr != nil {
 		fmt.Fprintf(stderr, "goopg start: %v\n", runErr)
 		return 1
@@ -327,18 +328,18 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 // would compound the corruption. The goroutine also exits when the
 // supplied context is cancelled (clean shutdown) or the writer
 // closes (process tear-down).
-func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) {
+func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) *wal.StreamReplayer {
+	baseLSN := rt.WAL.WrittenLSN()
+	walDir := filepath.Join(rt.DataDir, "pg_wal")
+	sr := wal.NewStreamReplayer(rt.StorageMgr, baseLSN)
 	go func() {
 		defer close(done)
-		baseLSN := rt.WAL.WrittenLSN()
-		walDir := filepath.Join(rt.DataDir, "pg_wal")
 		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, baseLSN)
 		if err != nil {
 			logger.Error("standby replay: iterator init failed", "err", err)
 			return
 		}
 		defer func() { _ = iter.Close() }()
-		sr := wal.NewStreamReplayer(rt.StorageMgr, baseLSN)
 		logger.Info("standby mode: starting continuous WAL replay",
 			"start_lsn", baseLSN)
 		if err := sr.Run(ctx, iter); err != nil {
@@ -348,6 +349,7 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 		logger.Info("standby replay: stopped",
 			"apply_lsn", sr.ApplyLSN())
 	}()
+	return sr
 }
 
 // startWalreceiver dials the primary identified by `primary_conninfo`
@@ -626,6 +628,47 @@ func runCheckpoint(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintln(stdout, "goopg checkpoint: complete")
+	return 0
+}
+
+// runPromote sends a PROMOTE request over the control socket and
+// blocks until the server confirms the standby has been drained,
+// `standby.signal` removed, and the runtime flipped to primary
+// mode. Default 5-min timeout matches `runCheckpoint`'s — promotion
+// is bounded by `drainTimeout` (5s server-side), but the operator
+// may have a deeper queue of WAL still in flight from the primary,
+// so a generous client-side timeout is the safe default.
+func runPromote(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("promote", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("D", "", "data directory of the standby to promote (required)")
+	timeoutSec := fs.Int("t", 300, "seconds to wait for the promotion to complete")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *dataDir == "" {
+		fmt.Fprintln(stderr, "goopg promote: -D <data-directory> is required")
+		return 2
+	}
+	pf, err := control.ParsePIDFile(*dataDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stderr, "goopg promote: server not running (no postmaster.pid)")
+			return 1
+		}
+		fmt.Fprintf(stderr, "goopg promote: %v\n", err)
+		return 1
+	}
+	reply, err := control.Send(pf.SocketPath, "PROMOTE", time.Duration(*timeoutSec)*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "goopg promote: %v\n", err)
+		return 1
+	}
+	if reply != "OK" {
+		fmt.Fprintf(stderr, "goopg promote: %s\n", reply)
+		return 1
+	}
+	fmt.Fprintln(stdout, "goopg promote: complete")
 	return 0
 }
 

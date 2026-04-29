@@ -1650,12 +1650,50 @@ under "Hooks into existing goopg code".
 
 ### Promotion
 
-- [ ] Add `OnPromote` callback in `internal/control/control.go`
+- [x] Add `OnPromote` callback in `internal/control/control.go`
       and a `PROMOTE` command handler in
       `startControlPlane`.
-- [ ] `goopg promote -D <dir>` CLI subcommand that sends
+      (achieved 2026-04-29: `OnPromote func() error` field on
+      `Listener` next to OnStop/OnReload/OnCheckpoint; new `case
+      "PROMOTE"` in handleConn drops the read deadline (drain
+      can take seconds), routes through the callback, replies
+      `OK` only after the handler returns, and emits
+      `ERR promote not configured` when the callback is nil so a
+      stray promote against a primary fails loudly. `Promote
+      func() error` seam on `server.Config` is wired into
+      `startControlPlane` so cmd/goopg can install whatever
+      drain policy it likes without server.go owning the
+      receiver/replayer goroutines. Three control-package unit
+      tests pin the contract: dispatch (handler runs before
+      reply), unconfigured (right error string), and
+      handler-error propagation.)
+- [x] `goopg promote -D <dir>` CLI subcommand that sends
       `PROMOTE` over the control socket. Drains pending WAL,
       removes `standby.signal`, switches to primary mode.
+      (achieved 2026-04-29: new `runPromote` subcommand mirrors
+      `runCheckpoint`'s shape — reads `<DataDir>/postmaster.pid`,
+      sends PROMOTE over the control socket with a generous
+      300s default timeout (`-t` overrides), surfaces server-
+      side `ERR ...` lines verbatim. New
+      `cmd/goopg/standby.go` introduces a `standbyController`
+      that owns the receiver+replayer goroutines and exposes
+      `Promote(ctx)`: cancels receiver, waits, snapshots
+      `WrittenLSN` as the drain target, polls `ApplyLSN` every
+      10ms with a 5s ceiling, cancels replayer, removes
+      `standby.signal`, flips `Runtime.Standby`. Guarded by
+      `sync.Once` + `atomic.Bool` so concurrent PROMOTEs can't
+      half-promote the runtime. `cmd/goopg start` builds the
+      controller only when the data dir had `standby.signal` at
+      Open time and threads `boundPromoteToServer(sc)` into
+      `cfg.Promote`. `startStandbyReplayer` now returns its
+      `*wal.StreamReplayer` so the controller can poll
+      ApplyLSN. Two cmd/goopg unit tests pin the drain
+      contract: idle-standby remove-signal happy path
+      (idempotent on re-call) and pending-replay drain (Append
+      a record post-startStandby, Promote must wait for it to
+      apply). Design doc
+      `docs/design/0005-0005-promotion.md` lands in the same
+      loop.)
 
 ### Observability
 

@@ -166,6 +166,19 @@ type Listener struct {
 	// the marker is durable. Slow by design; the client-side
 	// timeout in `goopg ctl checkpoint` is generous.
 	OnCheckpoint func() error
+	// OnPromote is invoked when a client sends PROMOTE. The
+	// handler is responsible for draining pending WAL replay,
+	// removing `<DataDir>/standby.signal`, and switching the
+	// runtime out of standby mode. Reply is delivered only after
+	// the handler returns, so `goopg promote` blocks until the
+	// promotion is durable. Slow by design — the read deadline
+	// is dropped just like CHECKPOINT.
+	//
+	// nil means the server can't be promoted (the v0 default for
+	// non-standby starts). The PROMOTE command then errors with
+	// "promote not configured" so `goopg promote` against a
+	// primary can't accidentally hang or no-op silently.
+	OnPromote func() error
 }
 
 // NewListener binds a control-plane Unix domain socket at path.
@@ -267,6 +280,20 @@ func (l *Listener) handleConn(conn net.Conn) {
 			return
 		}
 		if err := l.OnCheckpoint(); err != nil {
+			fmt.Fprintf(conn, "ERR %s\n", err.Error())
+			return
+		}
+		_, _ = conn.Write([]byte("OK\n"))
+	case "PROMOTE":
+		// Same deadline-dropping rationale as CHECKPOINT —
+		// promotion has to drain in-flight WAL replay, which
+		// can take seconds on a busy standby.
+		_ = conn.SetReadDeadline(time.Time{})
+		if l.OnPromote == nil {
+			fmt.Fprintf(conn, "ERR promote not configured\n")
+			return
+		}
+		if err := l.OnPromote(); err != nil {
 			fmt.Fprintf(conn, "ERR %s\n", err.Error())
 			return
 		}
