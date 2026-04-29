@@ -2095,12 +2095,43 @@ item.
       so the decoder can be driven from a `RecordIterator`. The
       snapshot builder is also deferred.)
 
-- [ ] WAL classifier hookup: introduce `RecordKindXactCommit` /
-      `RecordKindXactAbort` records, plumb per-record xid through
-      the existing logical change records (`HeapInsert`,
-      `HeapDelete`, `HeapVacuum`, `BtreeInsert`), and wire a
-      classifier loop that drives `Decoder.Apply*` from a
-      `RecordIterator`. Continues in
+- [x] WAL classifier hookup: introduce `RecordKindXactCommit` /
+      `RecordKindXactAbort` records and a `Classify(decoder,
+      record)` function that drives `Decoder.Apply*` from any
+      record stream. Continues in
+      `docs/design/0008-0001-logical-decoding-pipeline.md`.
+      (landed 2026-04-29: New WAL record kinds
+      `RecordKindXactCommit` (8) and `RecordKindXactAbort` (9)
+      with 5-byte `kind|xid` payloads. `EncodeXactCommit`,
+      `EncodeXactAbort`, `DecodeXactMarker` round-trip the xid.
+      `ApplyRecord` treats both kinds as physical-recovery
+      no-ops — they exist purely so the M0008 logical decoder
+      can drive its reorder buffer; the existing per-record
+      idempotency in HeapInsert/Delete/Vacuum/Btree records
+      already brings storage to a consistent state.
+      `internal/wal/classifier.go::Classify(d, r)` walks one
+      decoded `Record` and dispatches into the `*Decoder`:
+      HeapInsert routes by xmin parsed from the encoded tuple
+      header (offset 0..3); HeapDelete routes by the xmax
+      already in the record payload — no wire-format change to
+      the existing logical change records. XactCommit/XactAbort
+      route to the corresponding Decoder method; vacuum/btree/
+      page-image/checkpoint records are silently skipped. Tests:
+      TestClassifyHeapInsertRoutesByXmin,
+      TestClassifyHeapDeleteRoutesByXmax,
+      TestClassifyAbortDropsXact,
+      TestClassifyIsolatesConcurrentXacts,
+      TestClassifySkipsNonTxRecords,
+      TestEncodeDecodeXactMarker. Wire-layer emission of
+      EncodeXactCommit/EncodeXactAbort at executor txn
+      boundaries remains deferred — the classifier works against
+      synthetic record streams in tests but sees no markers in
+      live workloads until the executor wires them in.)
+
+- [ ] Wire-layer emission of `EncodeXactCommit` / `EncodeXactAbort`
+      at executor transaction boundaries, plus a long-lived
+      classifier loop that consumes a `RecordIterator` over a
+      logical slot and drives a real `OutputPlugin`. Continues in
       `docs/design/0008-0001-logical-decoding-pipeline.md`.
 
 - [ ] `pgoutput` output plugin: B / C / R / I / U / D message

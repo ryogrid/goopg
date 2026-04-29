@@ -57,6 +57,22 @@ const (
 	// "kind | rel(9) | blk(4) | count(2) | slots[count](2 each)"
 	// = 16 + 2*count bytes. Replay is idempotent via pd_lsn.
 	RecordKindHeapVacuum byte = 7
+	// RecordKindXactCommit marks the boundary that releases a
+	// transaction's queued changes from the M0008 reorder buffer
+	// to the output plugin. Carries the xid so the logical
+	// decoder can route it. Crash-recovery is a no-op for this
+	// kind — the per-record idempotency in the data records is
+	// sufficient to bring storage back to a consistent state;
+	// the commit/abort markers exist purely so the logical
+	// decoder can make commit/abort decisions. Format:
+	// "kind(1) | xid(4)" = 5 bytes. See
+	// docs/design/0008-0001-logical-decoding-pipeline.md.
+	RecordKindXactCommit byte = 8
+	// RecordKindXactAbort marks the boundary that drops a
+	// transaction's queued changes from the M0008 reorder buffer
+	// without emission. Same format / recovery semantics as
+	// RecordKindXactCommit.
+	RecordKindXactAbort byte = 9
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
@@ -74,7 +90,42 @@ const (
 	// heapVacuumHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
 	// Fork(1) + Block(4) + Count(2) = 16.
 	heapVacuumHeaderSize = 16
+	// xactRecordSize: kind(1) + xid(4) = 5. Shared by
+	// RecordKindXactCommit and RecordKindXactAbort.
+	xactRecordSize = 5
 )
+
+// EncodeXactCommit encodes a logical-decoding commit marker for
+// xid. Crash recovery skips this kind; only the M0008 logical
+// decoder consumes it. See
+// docs/design/0008-0001-logical-decoding-pipeline.md.
+func EncodeXactCommit(xid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindXactCommit
+	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
+	return out
+}
+
+// EncodeXactAbort encodes a logical-decoding abort marker.
+func EncodeXactAbort(xid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindXactAbort
+	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
+	return out
+}
+
+// DecodeXactMarker returns the xid carried by a commit or abort
+// marker payload. The caller already knows the kind from the
+// payload's first byte; this helper just unpacks the xid.
+func DecodeXactMarker(payload []byte) (storage.TransactionID, error) {
+	if len(payload) != xactRecordSize {
+		return 0, fmt.Errorf("wal: invalid xact-marker payload len %d (want %d)", len(payload), xactRecordSize)
+	}
+	if payload[0] != RecordKindXactCommit && payload[0] != RecordKindXactAbort {
+		return 0, fmt.Errorf("wal: record kind %d is not an xact marker", payload[0])
+	}
+	return storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5])), nil
+}
 
 // ReplayStats summarizes one replay run.
 type ReplayStats struct {
@@ -402,6 +453,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		}
 		return true, nil
 	case RecordKindCheckpoint:
+		return false, nil
+	case RecordKindXactCommit, RecordKindXactAbort:
+		// Logical-decoding markers — physical recovery is a
+		// no-op. The per-record idempotency in the data records
+		// already brings storage to a consistent state; the
+		// markers exist purely so the M0008 logical decoder can
+		// drive its reorder buffer. See
+		// docs/design/0008-0001-logical-decoding-pipeline.md.
 		return false, nil
 	default:
 		return false, fmt.Errorf("unsupported kind %d", r.Payload[0])

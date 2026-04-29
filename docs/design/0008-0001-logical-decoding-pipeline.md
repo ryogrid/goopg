@@ -189,19 +189,36 @@ structures that the future WAL classifier will drive.
    machine is the long-term target. Deferred to the next M0008
    loop.
 
-4. **WAL classifier — explicitly deferred.** v0's existing WAL
-   record kinds (`HeapInsert`, `HeapDelete`, `HeapVacuum`,
-   `BtreeInsert`, `BtreeSplit`, `PageImage`, `Checkpoint`) carry
-   no commit/abort markers and no per-record xid. To drive the
-   reorder buffer from the live WAL stream we need:
-   - `RecordKindXactCommit` / `RecordKindXactAbort` records
-     emitted at xact end by the wire layer.
-   - Per-record xid plumbing (the heap tuple body already carries
-     xmin; the abort/commit markers need to carry xid).
+4. **WAL classifier (`internal/wal/classifier.go`).** Walks decoded
+   `Record`s and dispatches them into a `*Decoder` by xid. Loop 3
+   delivered:
 
-   These records are a wire-format change — the next M0008 loop
-   adds them and wires the classifier to drive `Decoder` from a
-   `RecordIterator`.
+   - New WAL record kinds `RecordKindXactCommit` (8) and
+     `RecordKindXactAbort` (9), 5-byte payloads (`kind | xid`).
+     `EncodeXactCommit` / `EncodeXactAbort` / `DecodeXactMarker`
+     are the encoders. `ApplyRecord` treats both as physical-
+     recovery no-ops — they exist purely so the M0008 logical
+     decoder can drive its reorder buffer.
+   - `Classify(decoder, record)` extracts the xact id per kind:
+     - `HeapInsert`: xmin parsed from the encoded heap-tuple
+       header (offset 0..3, mirrors `storage.HeapTuple.MarshalBinary`).
+     - `HeapDelete`: the encoded `xmax` field — already in the
+       record, no wire-format change.
+     - `XactCommit` / `XactAbort`: xid in the payload.
+     - All other kinds (vacuum, btree-*, page-image, checkpoint)
+       are silently skipped — not user-data transactional events.
+
+   Per-record xid plumbing on the existing logical change records
+   was avoided because the on-disk tuple body already carries
+   xmin and HeapDelete already carries xmax. That keeps the wire
+   format backwards-compatible with persisted WAL streams.
+
+   What still needs to happen: the executor / wire layer must
+   emit `EncodeXactCommit(xid)` at COMMIT and `EncodeXactAbort
+   (xid)` at ROLLBACK boundaries. Until that lands, the
+   classifier works against synthetic record streams in tests but
+   sees no commit/abort markers in real workloads. That's tracked
+   as the next M0008 loop.
 
 5. **Output plugin contract.** Already shipped by this loop as
    `wal.OutputPlugin`. v0's first implementation is `pgoutput`
@@ -236,6 +253,21 @@ Slot foundation + view (loop 1):
   `catalog_xmin` keys) round-trip cleanly.
 - `internal/initdb/replication_views_test.go::TestPgReplicationSlotsViewRendersBothKinds`
   — view renders one row per slot with the upstream column shape.
+
+WAL classifier (loop 3):
+
+- `internal/wal/classifier_test.go::TestClassifyHeapInsertRoutesByXmin`
+  — xmin from the heap-tuple body drives the xid dispatch.
+- `…::TestClassifyHeapDeleteRoutesByXmax` — xmax from the record
+  payload drives the xid dispatch.
+- `…::TestClassifyAbortDropsXact` — `XactAbort` marker drops the
+  xact's queued changes; the plugin never sees them.
+- `…::TestClassifyIsolatesConcurrentXacts` — interleaved xids stay
+  isolated through the classifier and through the buffer.
+- `…::TestClassifySkipsNonTxRecords` — vacuum, btree, page-image,
+  checkpoint records are silently skipped.
+- `…::TestEncodeDecodeXactMarker` — round-trip for the new marker
+  records.
 
 Reorder buffer + decoder orchestration (loop 2):
 
