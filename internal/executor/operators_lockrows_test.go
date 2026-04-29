@@ -223,6 +223,136 @@ func TestLockRowsStampsTupleLockOnlyXmax(t *testing.T) {
 	}
 }
 
+// TestUpdateBlocksOnForeignTupleLock — the headline tuple-level
+// step 2b property: a SELECT FOR UPDATE in session 1 stamps a
+// tuple lock; a UPDATE in session 2 hitting the same row blocks
+// in the lockmgr until session 1's xact ends. We verify by
+// running the UPDATE in a goroutine, asserting it registers as a
+// waiter on the tuple-level tag, then releasing session 1's
+// holdings (LockMgr.ReleaseAll) and confirming the goroutine
+// completes.
+//
+// The fixture seeds rows under a separately-committed xact (so
+// sessions 1 and 2 see them as live), then begins independent
+// xacts for each session. Without that separation, session 2's
+// snapshot would treat the still-running seed xact as
+// in-progress and the tuple would be invisible — the conflict
+// detection would never fire because no row would be reached.
+func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	// Seed under the fixture xact and commit so future xacts see
+	// the rows. Replace ctx.Tx/Snap with fresh post-commit ones —
+	// the rest of this test never reuses the seed xact.
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+
+	// Session 1: SELECT FOR UPDATE — stamps tuple lock on every
+	// returned row.
+	s1tx, err := ctx.TxnMgr.Begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1snap, err := ctx.TxnMgr.SnapshotFor(s1tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1 := makeCtx(lm, 1)
+	s1.Pool = ctx.Pool
+	s1.Catalog = ctx.Catalog
+	s1.TxnMgr = ctx.TxnMgr
+	s1.Tx = s1tx
+	s1.Snap = s1snap
+	if _, err := runForUpdate(t, s1, "SELECT id FROM items WHERE id = 1 FOR UPDATE"); err != nil {
+		t.Fatalf("session-1 FOR UPDATE: %v", err)
+	}
+
+	// Session 2: UPDATE the same row.
+	s2tx, err := ctx.TxnMgr.Begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2snap, err := ctx.TxnMgr.SnapshotFor(s2tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := makeCtx(lm, 2)
+	s2.Pool = ctx.Pool
+	s2.Catalog = ctx.Catalog
+	s2.TxnMgr = ctx.TxnMgr
+	s2.Tx = s2tx
+	s2.Snap = s2snap
+	defer ctx.TxnMgr.Rollback(s2tx)
+
+	done := make(chan error, 1)
+	go func() {
+		stmts, err := parser.Parse("UPDATE items SET label = 'updated' WHERE id = 1")
+		if err != nil {
+			done <- err
+			return
+		}
+		node, err := planner.Plan(stmts[0], s2.Catalog)
+		if err != nil {
+			done <- err
+			return
+		}
+		op, err := Build(node)
+		if err != nil {
+			done <- err
+			return
+		}
+		if err := op.Open(s2); err != nil {
+			done <- err
+			return
+		}
+		_, err = op.Next()
+		_ = op.Close()
+		if err != nil && err != EOF {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	rel := ctx.Catalog.RelFileNode(tbl)
+	deadline := time.Now().Add(2 * time.Second)
+	registered := false
+	for time.Now().Before(deadline) {
+		// seedItems inserts 3 rows on block 0. id=1 is the first
+		// row, slot 1 — encoded as Block=1, Offset=2 by
+		// tupleLockTag's +1 shift.
+		w := lm.Waiters(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
+		if len(w) > 0 {
+			registered = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !registered {
+		lm.ReleaseAll(1)
+		<-done
+		t.Fatal("session 2 did not register as a tuple-tag waiter within 2s")
+	}
+
+	// Release session 1's transaction-scoped locks; session 2
+	// should now wake and complete.
+	lm.ReleaseAll(1)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("UPDATE after release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session 2 did not unblock after release")
+	}
+}
+
 // TestLockRowsRejectsSkipLocked — SKIP LOCKED stays deferred
 // pending tuple-level pessimistic locking (relation-coarse
 // locks have no per-row "skip" semantic). Pins the explicit

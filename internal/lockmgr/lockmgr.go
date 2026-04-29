@@ -140,6 +140,18 @@ func ConflictsWith(m Mode, held Mask) bool {
 type LockTag struct {
 	DB  uint32
 	Rel uint32
+	// Block + Offset extend a relation lock tag down to a specific
+	// heap tuple (M0021 tuple-level locking step 2b). Both zero
+	// → relation-level lock (the historic default; every existing
+	// caller continues to work because Go's struct-literal
+	// zero-initialises unset fields). Both non-zero → tuple-level
+	// lock; the (DB, Rel) tag and the (DB, Rel, Block, Offset)
+	// tag are independent map keys, so a relation-level holder
+	// doesn't accidentally block tuple-level acquirers and
+	// vice-versa. Mirrors upstream's separation between
+	// `LOCKTAG_RELATION` and `LOCKTAG_TUPLE`.
+	Block  uint32
+	Offset uint32
 }
 
 // BackendID identifies a session/transaction holding or waiting for

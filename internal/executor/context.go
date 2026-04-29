@@ -121,6 +121,68 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
+// acquireTupleLock acquires a tuple-level lock on the given
+// (rel, ItemPointer) tag (M0021 tuple-level locking step 2b).
+// Used by SELECT FOR UPDATE to record per-row holders, and by
+// UPDATE / DELETE to block on a foreign lock holder. Lock-tag
+// granularity reuses lockmgr.LockTag with Block/Offset set —
+// the (DB, Rel) relation tag and the (DB, Rel, Block, Offset)
+// tuple tag are independent map keys, so relation-level
+// locking and tuple-level locking don't accidentally block
+// each other. Same SQLSTATE mappings as acquireRelLock.
+func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPointer, mode lockmgr.Mode) error {
+	if c.LockMgr == nil {
+		return nil
+	}
+	tag := tupleLockTag(rel, ptr)
+	err := c.LockMgr.Acquire(context.Background(), c.BackendID, tag, mode)
+	if err == nil {
+		return nil
+	}
+	if err == lockmgr.ErrDeadlockDetected {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// tryAcquireTupleLock is the NOWAIT variant — surfaces
+// SQLSTATE 55P03 immediately on contention. Used by SELECT FOR
+// UPDATE NOWAIT and by UPDATE / DELETE on a tuple another xact
+// holds when the operator wants fail-fast semantics.
+func (c *Context) tryAcquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPointer, mode lockmgr.Mode) error {
+	if c.LockMgr == nil {
+		return nil
+	}
+	tag := tupleLockTag(rel, ptr)
+	err := c.LockMgr.TryAcquire(c.BackendID, tag, mode)
+	if err == nil {
+		return nil
+	}
+	if err == lockmgr.ErrLockNotAvailable {
+		return &ExecError{Code: "55P03", Message: "could not obtain lock on row"}
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// tupleLockTag synthesises a tuple-level LockTag from a
+// (rel, ItemPointer). The encoding (block in Block, line slot in
+// Offset) is private to the executor; lockmgr only uses the tag
+// as an opaque comparable key. The tuple tag and the matching
+// relation tag (Block=0, Offset=0) are independent so
+// AccessShareLock / RowExclusiveLock at the relation never
+// blocks tuple-level acquirers.
+func tupleLockTag(rel storage.RelFileNode, ptr storage.ItemPointer) lockmgr.LockTag {
+	return lockmgr.LockTag{
+		DB:     rel.DBOid,
+		Rel:    rel.RelOid,
+		Block:  uint32(ptr.Block) + 1, // shift so Block=0 isn't an alias for "relation tag"
+		Offset: uint32(ptr.Offset) + 1,
+	}
+}
+
 // tryAcquireRelLock is the NOWAIT variant of acquireRelLock —
 // returns SQLSTATE 55P03 immediately when the lock isn't
 // instantly grantable. Used by `SELECT … FOR UPDATE NOWAIT`.

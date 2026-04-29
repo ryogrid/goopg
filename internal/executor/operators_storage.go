@@ -489,6 +489,24 @@ func (o *deleteOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column
 	return scanMatching(o.ctx, rel, cols, o.pred, fn)
 }
 
+// foreignLockOnly reports whether `h` indicates the tuple is
+// currently row-locked by another live transaction (M0021
+// tuple-level locking step 2b). The xmax field carries the
+// locker's xid; the HeapXmaxLockOnly infomask bit distinguishes
+// a lock from a real delete. We wait on the lockmgr's
+// transaction-scoped tuple tag — when the locker commits /
+// aborts, ReleaseAll drops the tuple-tag holder and the waiting
+// UPDATE / DELETE wakes up.
+func foreignLockOnly(h storage.HeapTupleHeader, currentXID storage.TransactionID) bool {
+	if h.Xmax == storage.InvalidTransactionID {
+		return false
+	}
+	if h.Xmax == currentXID {
+		return false
+	}
+	return storage.IsHeapTupleLockOnly(h.Infomask)
+}
+
 func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
 	unlock := lockScanMatch(rel)
 	defer unlock()
@@ -516,8 +534,9 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			return err
 		}
 		var matches []struct {
-			slot uint16
-			row  Row
+			slot     uint16
+			row      Row
+			lockedBy storage.TransactionID
 		}
 		for slot := uint16(1); slot <= uint16(count); slot++ {
 			tuple, err := storage.PageGetHeapTuple(page, slot)
@@ -550,19 +569,45 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				}
 			}
 			matches = append(matches, struct {
-				slot uint16
-				row  Row
-			}{slot: slot, row: row})
+				slot     uint16
+				row      Row
+				lockedBy storage.TransactionID
+			}{slot: slot, row: row, lockedBy: lockedByForeign(tuple.Header, ctx.Tx.XID)})
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 		for _, m := range matches {
+			// M0021 step 2b: if the tuple is row-locked by
+			// another live xact (HEAP_XMAX_LOCK_ONLY +
+			// xmax != ours), block on the locker's tuple-tag
+			// in the lockmgr. ReleaseAll on the locker's
+			// commit/abort wakes us up; we then proceed
+			// with the UPDATE / DELETE atomic stamp.
+			if m.lockedBy != storage.InvalidTransactionID {
+				ptr := storage.ItemPointer{Block: blk, Offset: m.slot}
+				if err := ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
+					return err
+				}
+			}
 			if err := fn(blk, m.slot, m.row); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// lockedByForeign returns the locking xid when `h` indicates the
+// tuple is row-locked by another live xact (HEAP_XMAX_LOCK_ONLY
+// + xmax != currentXID); InvalidTransactionID otherwise.
+// Capturing this at scan time and using the captured value at
+// the per-row dispatch loop avoids re-reading the page after
+// we've released its RLock.
+func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID) storage.TransactionID {
+	if foreignLockOnly(h, currentXID) {
+		return h.Xmax
+	}
+	return storage.InvalidTransactionID
 }
 
 // writeHeapRow encodes the row and appends it to the relation. v0

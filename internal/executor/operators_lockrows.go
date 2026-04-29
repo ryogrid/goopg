@@ -248,7 +248,20 @@ func (o *lockRowsOp) drainAndStamp() error {
 // pool's hook isn't configured — preserves crash safety via
 // FPI emission), and unpins. Mirrors writeHeapRow's
 // markHeapInsertDirty pattern.
+//
+// Also acquires a tuple-level ExclusiveLock via the lockmgr's
+// (DB, Rel, Block+1, Offset+1) tag (M0021 step 2b). This is what
+// makes concurrent UPDATE / DELETE / FOR UPDATE on the same row
+// actually block: they call acquireTupleLock with the same tag
+// and wait until our xact commits / aborts (transaction-scoped
+// release via LockMgr.ReleaseAll).
 func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer) error {
+	// Acquire the tuple-level lock first so a concurrent UPDATE
+	// that races with us can't slip through between the xmax
+	// stamp and the lock registration.
+	if err := o.ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
+		return err
+	}
 	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 	if err != nil {
 		return err

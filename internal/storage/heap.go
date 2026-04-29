@@ -489,6 +489,15 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 // update-old-image path: marking xmax doesn't move the tuple bytes,
 // so existing index pointers and concurrent readers stay valid.
 //
+// Lock-only bookkeeping carry-over: if the tuple was previously
+// row-locked by a SELECT FOR UPDATE (HeapXmaxLockOnly + a
+// lock-strength bit set in infomask), a DELETE / UPDATE that
+// supersedes the lock must clear those bits before re-stamping
+// xmax. Otherwise mvcc.TupleVisible's lock-only short-circuit
+// would mistake our delete-stamp xmax for a still-locked tuple
+// and erroneously keep the tuple visible. Mirrors upstream's
+// HEAP_LOCK_MASK clearing inside heap_delete / heap_update.
+//
 // Returns ErrUnsupportedItem if the slot isn't LP_NORMAL, ErrInvalidSlot
 // for out-of-range slot numbers.
 func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
@@ -511,10 +520,17 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
 	}
 	off := int(item.Offset)
-	if off+8 > len(p) {
+	if off+22 > len(p) {
 		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
 	}
 	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	// Clear lock-only metadata so future readers treat this xmax
+	// as a real delete, not a lingering row-lock from a
+	// since-superseded SELECT FOR UPDATE. No-op when no bits
+	// were set (the pre-M0021 case).
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
 }
 

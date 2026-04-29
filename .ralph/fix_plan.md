@@ -3013,9 +3013,43 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       green. INSERT/UPDATE/DELETE conflict detection +
       IndexScan currentTID + MultiXact + streaming
       refactor all stay deferred.)
-- [ ] Tuple-level pessimistic locking — step 2b:
-      INSERT/UPDATE/DELETE detect foreign lock-only xmax
-      and block / fail-NOWAIT / skip-for-SKIP-LOCKED.
+- [x] Tuple-level pessimistic locking — step 2b:
+      UPDATE/DELETE block on foreign lock-only xmax via
+      lockmgr tuple tags. Design doc
+      `docs/design/0021-0008-tuple-locking-blocking-enforcement.md`.
+      (landed 2026-04-30: closes the gap between steps
+      1/2a/3 — data was on the page, nobody enforced it.
+      lockmgr.LockTag grew Block + Offset (defaults zero
+      = historic relation tag; both non-zero = tuple tag,
+      independent map keys). New `tupleLockTag(rel,
+      ItemPointer)` shifts +1 to disambiguate tuple-at-
+      (0,0) from the relation tag. New executor helpers
+      `acquireTupleLock` / `tryAcquireTupleLock` mirror
+      the relation-lock SQLSTATE mappings.
+      lockRowsOp.stampLock now acquires ExclusiveLock on
+      the tuple tag before the xmax stamp.
+      `scanMatching` captures `lockedBy` per match at
+      scan time and the dispatch loop interposes
+      acquireTupleLock when set, blocking until the
+      locker's ReleaseAll. PageSetHeapTupleXmax extended
+      to clear HeapXmaxLockOnly + HeapXmaxLockMask on
+      stamp — without that, the locker's metadata would
+      leak into our deleter's xmax bytes and
+      mvcc.TupleVisible would mistake it for still-
+      locked. New multi-session
+      TestUpdateBlocksOnForeignTupleLock verifies the
+      block/release cycle end-to-end. Full `go test
+      ./...` green; race-mode targeted runs across
+      executor/lockmgr/storage/wal/initdb/mvcc all green.
+      IndexScan blocking + tuple-level NOWAIT/SKIP
+      LOCKED + MultiXact + streaming-stamping refactor +
+      pg_locks introspection + lock-strength merge all
+      deferred.)
+- [ ] Tuple-level pessimistic locking — step 2c:
+      IndexScan currentTID twin + lockRowsOp / scanMatching
+      traversal into indexScanOp so SELECT FOR UPDATE
+      via index scans + UPDATE WHERE indexed-col blocking
+      both work.
 - [x] Tuple-level pessimistic locking — step 3: row-lock
       WAL record + crash-recovery replay. Design doc
       `docs/design/0021-0006-tuple-locking-heap-lock-wal.md`.
