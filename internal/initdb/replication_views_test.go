@@ -230,3 +230,82 @@ func TestPgReplicationSlotsViewRendersBothKinds(t *testing.T) {
 		t.Errorf("physical catalog_xmin=%q want empty", phys[9])
 	}
 }
+
+// TestPgPublicationViewRendersRows pins the M0008 / 0008-0003
+// contract: a publication registered through the *catalog.PubSub
+// shows up in pg_catalog.pg_publication with the upstream-shaped
+// columns.
+func TestPgPublicationViewRendersRows(t *testing.T) {
+	cat := catalog.NewInMemory()
+	ps := catalog.NewPubSub()
+	if err := registerPublicationViews(cat, ps); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.CreatePublication("p1", []string{"public.items"}, catalog.DefaultPublicationOptions()); err != nil {
+		t.Fatal(err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_publication"})
+	if !ok {
+		t.Fatal("pg_publication view not registered")
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	row := rows[0]
+	// Column order pinned by the view definition: oid, pubname,
+	// pubowner, puballtables, pubinsert, pubupdate, pubdelete,
+	// pubtruncate, pubviaroot.
+	if row[1] != "p1" {
+		t.Errorf("pubname=%q want p1", row[1])
+	}
+	if row[3] != "f" {
+		t.Errorf("puballtables=%q want f", row[3])
+	}
+	if row[4] != "t" || row[5] != "t" || row[6] != "t" {
+		t.Errorf("publish flags=%v want t/t/t", row[4:7])
+	}
+	if row[7] != "f" {
+		t.Errorf("pubtruncate=%q want f (M0008-out-of-scope)", row[7])
+	}
+}
+
+// TestPgSubscriptionViewRendersRows pins the same shape contract
+// for pg_subscription. Conninfo and SlotName must round-trip.
+func TestPgSubscriptionViewRendersRows(t *testing.T) {
+	cat := catalog.NewInMemory()
+	ps := catalog.NewPubSub()
+	if err := registerSubscriptionViews(cat, ps); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.CreateSubscription("s1", "host=remote dbname=app", []string{"p1"}, "", true); err != nil {
+		t.Fatal(err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_subscription"})
+	if !ok {
+		t.Fatal("pg_subscription view not registered")
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	row := rows[0]
+	// oid, subdbid, subname, subowner, subenabled, subbinary,
+	// substream, subtwophasestate, subdisableonerr, subconninfo,
+	// subslotname, subsynccommit, subpublications.
+	if row[2] != "s1" {
+		t.Errorf("subname=%q want s1", row[2])
+	}
+	if row[4] != "t" {
+		t.Errorf("subenabled=%q want t", row[4])
+	}
+	if row[9] != "host=remote dbname=app" {
+		t.Errorf("subconninfo=%q", row[9])
+	}
+	if row[10] != "s1" {
+		t.Errorf("subslotname=%q want s1 (default to name)", row[10])
+	}
+	if row[12] != "{p1}" {
+		t.Errorf("subpublications=%q want {p1}", row[12])
+	}
+}

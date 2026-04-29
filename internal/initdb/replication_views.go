@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -209,6 +210,243 @@ func registerReplicationSlotsView(cat *catalog.InMemory, slots *wal.Slots) error
 		return out
 	}
 	return cat.RegisterVirtualTable(tbl)
+}
+
+// registerPublicationViews installs `pg_catalog.pg_publication`,
+// `pg_catalog.pg_publication_rel`, and `pg_catalog.pg_publication_tables`
+// backed by the *catalog.PubSub registry. Column shapes mirror
+// upstream PG 18.x. Columns goopg doesn't yet track
+// (`pubowner`, `pubviaroot`, `prqual`, `prattrs`) emit empty
+// strings / `f`. See
+// docs/design/0008-0003-publication-subscription-ddl.md.
+func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
+	pgPub := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_publication",
+		Columns: []catalog.Column{
+			{Name: "oid", Type: catalog.Type{Name: "text"}},
+			{Name: "pubname", Type: catalog.Type{Name: "text"}},
+			{Name: "pubowner", Type: catalog.Type{Name: "text"}},
+			{Name: "puballtables", Type: catalog.Type{Name: "text"}},
+			{Name: "pubinsert", Type: catalog.Type{Name: "text"}},
+			{Name: "pubupdate", Type: catalog.Type{Name: "text"}},
+			{Name: "pubdelete", Type: catalog.Type{Name: "text"}},
+			{Name: "pubtruncate", Type: catalog.Type{Name: "text"}},
+			{Name: "pubviaroot", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	pgPub.VirtualRows = func() [][]string {
+		if ps == nil {
+			return nil
+		}
+		out := make([][]string, 0)
+		for _, pub := range ps.Publications() {
+			out = append(out, []string{
+				fmt.Sprintf("%d", pub.OID),
+				pub.Name,
+				"",                            // pubowner: roles aren't OID-stable yet
+				boolText(pub.AllTables),
+				boolText(pub.PublishInsert),
+				boolText(pub.PublishUpdate),
+				boolText(pub.PublishDelete),
+				"f",                            // pubtruncate: M0008-out-of-scope
+				"f",                            // pubviaroot: out of scope
+			})
+		}
+		return out
+	}
+	if err := cat.RegisterVirtualTable(pgPub); err != nil {
+		return err
+	}
+
+	pgPubRel := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_publication_rel",
+		Columns: []catalog.Column{
+			{Name: "oid", Type: catalog.Type{Name: "text"}},
+			{Name: "prpubid", Type: catalog.Type{Name: "text"}},
+			{Name: "prrelid", Type: catalog.Type{Name: "text"}},
+			{Name: "prqual", Type: catalog.Type{Name: "text"}},
+			{Name: "prattrs", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	pgPubRel.VirtualRows = func() [][]string {
+		if ps == nil {
+			return nil
+		}
+		out := make([][]string, 0)
+		for _, pub := range ps.Publications() {
+			if pub.AllTables {
+				continue
+			}
+			for _, qname := range pub.Tables {
+				relOID := lookupRelOID(cat, qname)
+				out = append(out, []string{
+					"",                         // oid of the pg_publication_rel row itself
+					fmt.Sprintf("%d", pub.OID),
+					relOID,
+					"",                         // prqual: row filter — out of scope
+					"",                         // prattrs: column list — out of scope
+				})
+			}
+		}
+		return out
+	}
+	if err := cat.RegisterVirtualTable(pgPubRel); err != nil {
+		return err
+	}
+
+	pgPubTables := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_publication_tables",
+		Columns: []catalog.Column{
+			{Name: "pubname", Type: catalog.Type{Name: "text"}},
+			{Name: "schemaname", Type: catalog.Type{Name: "text"}},
+			{Name: "tablename", Type: catalog.Type{Name: "text"}},
+			{Name: "attnames", Type: catalog.Type{Name: "text"}},
+			{Name: "rowfilter", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	pgPubTables.VirtualRows = func() [][]string {
+		if ps == nil {
+			return nil
+		}
+		out := make([][]string, 0)
+		for _, pub := range ps.Publications() {
+			if pub.AllTables {
+				for _, t := range cat.AllTables() {
+					out = append(out, pubTableRow(pub.Name, t.Schema, t.Name))
+				}
+				continue
+			}
+			for _, qname := range pub.Tables {
+				schema, name := splitQualifiedName(qname)
+				out = append(out, pubTableRow(pub.Name, schema, name))
+			}
+		}
+		return out
+	}
+	return cat.RegisterVirtualTable(pgPubTables)
+}
+
+// registerSubscriptionViews installs `pg_catalog.pg_subscription`
+// and `pg_catalog.pg_subscription_rel` backed by *catalog.PubSub.
+// `pg_subscription_rel` emits zero rows in this loop — tablesync
+// state lives in the apply worker (0008-0004).
+func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
+	pgSub := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_subscription",
+		Columns: []catalog.Column{
+			{Name: "oid", Type: catalog.Type{Name: "text"}},
+			{Name: "subdbid", Type: catalog.Type{Name: "text"}},
+			{Name: "subname", Type: catalog.Type{Name: "text"}},
+			{Name: "subowner", Type: catalog.Type{Name: "text"}},
+			{Name: "subenabled", Type: catalog.Type{Name: "text"}},
+			{Name: "subbinary", Type: catalog.Type{Name: "text"}},
+			{Name: "substream", Type: catalog.Type{Name: "text"}},
+			{Name: "subtwophasestate", Type: catalog.Type{Name: "text"}},
+			{Name: "subdisableonerr", Type: catalog.Type{Name: "text"}},
+			{Name: "subconninfo", Type: catalog.Type{Name: "text"}},
+			{Name: "subslotname", Type: catalog.Type{Name: "text"}},
+			{Name: "subsynccommit", Type: catalog.Type{Name: "text"}},
+			{Name: "subpublications", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	pgSub.VirtualRows = func() [][]string {
+		if ps == nil {
+			return nil
+		}
+		out := make([][]string, 0)
+		for _, sub := range ps.Subscriptions() {
+			out = append(out, []string{
+				fmt.Sprintf("%d", sub.OID),
+				"",                                // subdbid
+				sub.Name,
+				"",                                // subowner
+				boolText(sub.Enabled),
+				"f",                               // subbinary
+				"f",                               // substream
+				"d",                               // subtwophasestate disabled
+				"f",                               // subdisableonerr
+				sub.Conninfo,
+				sub.SlotName,
+				"local",                           // subsynccommit
+				formatStringList(sub.Publications),
+			})
+		}
+		return out
+	}
+	if err := cat.RegisterVirtualTable(pgSub); err != nil {
+		return err
+	}
+
+	pgSubRel := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_subscription_rel",
+		Columns: []catalog.Column{
+			{Name: "srsubid", Type: catalog.Type{Name: "text"}},
+			{Name: "srrelid", Type: catalog.Type{Name: "text"}},
+			{Name: "srsubstate", Type: catalog.Type{Name: "text"}},
+			{Name: "srsublsn", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	pgSubRel.VirtualRows = func() [][]string {
+		// Tablesync state is driven by the apply worker (0008-0004);
+		// until that lands the view emits zero rows.
+		return nil
+	}
+	return cat.RegisterVirtualTable(pgSubRel)
+}
+
+// lookupRelOID resolves a qualified table name ("schema.name" or
+// just "name") to its OID via the catalog's LookupTable. Empty
+// when the table isn't registered — keeps `pg_publication_rel`
+// well-formed even for stale publication entries.
+func lookupRelOID(cat *catalog.InMemory, qname string) string {
+	schema, name := splitQualifiedName(qname)
+	t, ok := cat.LookupTable(parser.ObjectName{Schema: schema, Name: name})
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%d", t.OID)
+}
+
+// splitQualifiedName splits "schema.name" into ("schema", "name");
+// a single bare name returns ("", name).
+func splitQualifiedName(qname string) (string, string) {
+	for i := 0; i < len(qname); i++ {
+		if qname[i] == '.' {
+			return qname[:i], qname[i+1:]
+		}
+	}
+	return "", qname
+}
+
+func pubTableRow(pubname, schema, table string) []string {
+	if schema == "" {
+		schema = "public"
+	}
+	return []string{pubname, schema, table, "", ""}
+}
+
+func formatStringList(xs []string) string {
+	if len(xs) == 0 {
+		return "{}"
+	}
+	out := "{"
+	for i, x := range xs {
+		if i > 0 {
+			out += ","
+		}
+		out += x
+	}
+	return out + "}"
 }
 
 // slotWalStatus mirrors upstream's pg_replication_slots.wal_status:

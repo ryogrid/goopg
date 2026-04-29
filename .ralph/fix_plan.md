@@ -2250,13 +2250,48 @@ item.
       emit upstream-compatible bytes; the next M0008 work is
       0008-0003 (publication / subscription DDL + catalog).
 
-- [ ] Publication / subscription DDL + system catalogs:
-      `CREATE PUBLICATION` / `ALTER PUBLICATION` / `DROP
-      PUBLICATION`, `CREATE SUBSCRIPTION` / etc., backed by
+- [x] Publication / subscription catalog substrate + the five
+      system views (first slice of 0008-0003). Design doc
+      `docs/design/0008-0003-publication-subscription-ddl.md`.
+      (landed 2026-04-29: `internal/catalog/pubsub.go::PubSub`
+      in-memory registry with `Publication{Name, OID,
+      AllTables, PublishInsert/Update/Delete, Tables}` and
+      `Subscription{Name, OID, Conninfo, Publications,
+      Enabled, SlotName}`. `Create*`/`Drop*`/`Lookup*`/
+      `Publications()`/`Subscriptions()` accessors return deep
+      copies; insertion order preserved via name-sorted
+      iteration. SlotName defaults to subscription name when
+      empty (matches upstream). `Runtime.PubSub` field plumbed
+      through `initdb.Open`. Five virtual views registered:
       `pg_publication`, `pg_publication_rel`,
       `pg_publication_tables`, `pg_subscription`,
-      `pg_subscription_rel`. Design doc
-      `docs/design/0008-0003-publication-subscription-ddl.md`.
+      `pg_subscription_rel`. Column shapes mirror upstream PG
+      18.x; columns goopg doesn't track yet (`pubowner`,
+      `pubviaroot`, `subbinary`, `substream`,
+      `subtwophasestate`, `prqual`, `prattrs`) emit empty / `f`
+      / `{}`; `pg_subscription_rel` emits zero rows (tablesync
+      state lives in apply worker). Tests:
+      TestPubSubCreatePublicationByTable,
+      TestPubSubCreatePublicationAllTables,
+      TestPubSubDuplicatePublicationName,
+      TestPubSubDropPublication,
+      TestPubSubCreateSubscription,
+      TestPubSubDuplicateSubscriptionName,
+      TestPgPublicationViewRendersRows,
+      TestPgSubscriptionViewRendersRows. The catalog substrate
+      is now in place; an operator's `\dRp` against goopg
+      returns a clean (empty) row set. Parser surface,
+      executor wiring, slot provisioning, and persistence land
+      in subsequent loops.)
+
+- [ ] Publication / subscription parser surface +
+      executor / catalog wiring: `CREATE PUBLICATION name
+      [FOR ALL TABLES | FOR TABLE t1, t2] [WITH (publish =
+      'insert,update,delete')]`, `DROP PUBLICATION [IF EXISTS]
+      name`, `CREATE SUBSCRIPTION name CONNECTION '...'
+      PUBLICATION p [WITH (slot_name=…, enabled=…)]`, `DROP
+      SUBSCRIPTION [IF EXISTS] name`. AST + dispatcher path
+      + a small Plan node that calls `Runtime.PubSub.*`.
 
 - [ ] Apply worker + initial table sync: subscriber-side worker
       that connects to the publisher's logical slot, decodes the

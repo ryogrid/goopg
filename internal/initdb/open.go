@@ -36,6 +36,7 @@ type Runtime struct {
 	Slots        *wal.Slots
 	WalSenders   *wal.Senders
 	WalReceivers *wal.Receivers
+	PubSub       *catalog.PubSub
 	DataDir      string
 
 	// Standby is true when `<DataDir>/standby.signal` was present
@@ -303,6 +304,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// Publication / subscription registry + their five virtual
+	// catalog views (pg_publication, pg_publication_rel,
+	// pg_publication_tables, pg_subscription, pg_subscription_rel).
+	// See docs/design/0008-0003-publication-subscription-ddl.md.
+	pubsub := catalog.NewPubSub()
+	if err := registerPublicationViews(cat, pubsub); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	if err := registerSubscriptionViews(cat, pubsub); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 
 	standby, err := IsStandby(abs)
 	if err != nil {
@@ -320,6 +338,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Slots:        slotsReg,
 		WalSenders:   walSenders,
 		WalReceivers: walReceivers,
+		PubSub:       pubsub,
 		DataDir:      abs,
 		Standby:      standby,
 	}, nil
