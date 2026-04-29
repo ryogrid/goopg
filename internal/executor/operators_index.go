@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -30,6 +31,14 @@ func (o *indexScanOp) Open(ctx *Context) error {
 	o.rows = nil
 	o.idx = 0
 
+	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
+	if err := ctx.acquireRelLock(heapRel, lockmgr.AccessShareLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
+
 	key, ok, err := o.lookupKey()
 	if err != nil {
 		return err
@@ -42,7 +51,6 @@ func (o *indexScanOp) Open(ctx *Context) error {
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
-	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
 	err = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {

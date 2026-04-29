@@ -7,6 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -52,10 +53,20 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
+	// Each Query message gets a fresh BackendID for the lock
+	// manager; the youngest-backend victim policy from M0012-0002
+	// relies on monotonic IDs.
+	backendID := lockmgr.BackendID(s.nextBackendID.Add(1))
 	commit := false
 	defer func() {
 		if !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
+		}
+		// Always drop locks at txn end so a leftover holder
+		// can't outlive the connection. ReleaseAll is a no-op
+		// when LockMgr is nil.
+		if s.cfg.LockMgr != nil {
+			s.cfg.LockMgr.ReleaseAll(backendID)
 		}
 	}()
 	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
@@ -71,6 +82,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	ctx.Checkpointer = s.cfg.Checkpointer
 	ctx.StatsTarget = sessionStatsTarget(sess)
 	ctx.PubSub = s.cfg.PubSub
+	ctx.LockMgr = s.cfg.LockMgr
+	ctx.BackendID = backendID
 
 	for _, stmt := range stmts {
 		// Refresh snapshot per statement for ReadCommitted parity.

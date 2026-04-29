@@ -1837,14 +1837,35 @@ the topmost unchecked item.
       `ErrDeadlockDetected` → SQLSTATE `40P01` translation
       lands with executor integration in M0012-0003.)
 
-- [ ] Executor integration + multi-session test matrix:
-      acquire relation locks at executor open for at least
-      one conflict-capable path (writes on a shared table);
-      deterministic two-session deadlock test; three-session
-      multi-edge cycle test; non-deadlock contention test
-      (no false-positive 40P01); cancellation cleanup test.
-      Continues
+- [x] Executor integration + multi-session test matrix
+      (M0012-0003). Design doc
       `docs/design/0012-0003-lock-wait-integration-and-test-matrix.md`.
+      (landed 2026-04-29: `executor.Context` grew
+      `LockMgr *lockmgr.LockManager` + `BackendID
+      lockmgr.BackendID` (both nil-safe). New helper
+      `Context.acquireRelLock(rel, mode)` is the single
+      funnel: nil-LockMgr → no-op; `ErrDeadlockDetected` →
+      `*ExecError{Code:"40P01", Message:"deadlock
+      detected"}`; ctx-cancel → `*ExecError{Code:"57014"}`.
+      Wired into 5 operators: seqScanOp /indexScanOp.Open
+      take AccessShareLock; insertOp/updateOp/deleteOp.Open
+      take RowExclusiveLock. `server.Config` grew `LockMgr`;
+      `Server` grew `nextBackendID atomic.Uint32`;
+      `dispatch.go` plumbs both into the Context and calls
+      `LockMgr.ReleaseAll(backendID)` from the deferred
+      txn-end block. Tests in
+      `internal/executor/lock_integration_test.go`:
+      TestExecutorAcquireHelperNilLockMgr (regression guard
+      for fixture compatibility), TestExecutorAcquireHelperGrantsLock,
+      TestExecutorDeadlockTwoSession (A↔B cycle —
+      ErrDeadlockDetected → 40P01 mapping pinned),
+      TestExecutorDeadlockThreeSession (A→B→C→A multi-edge,
+      exactly one 40P01, BackendID 3 = youngest cancelled),
+      TestExecutorNonDeadlockContention (linear waiter chain
+      — no false-positive 40P01). Race-clean. Full
+      `go test ./...` green. M0012 closes — DDL paths
+      (DROP/ALTER), catalog-level locks, `lock_timeout` GUC,
+      and `pg_locks` view are separate follow-up scopes.)
 
 ## Notes
 

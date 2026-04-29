@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"context"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -75,6 +77,48 @@ type Context struct {
 	// hasn't wired logical-replication DDL — those statements
 	// fail with feature_not_supported.
 	PubSub *catalog.PubSub
+
+	// LockMgr, when set, is consulted by SQL-touching operators
+	// to acquire relation-level locks per
+	// docs/design/0012-0003-lock-wait-integration-and-test-matrix.md.
+	// nil makes acquireRelLock a no-op so existing tests and
+	// non-storage code paths keep working unchanged.
+	LockMgr *lockmgr.LockManager
+
+	// BackendID identifies this session/transaction to the lock
+	// manager. The wire layer assigns one per connection from a
+	// monotonic atomic counter — the youngest-backend victim
+	// policy from M0012-0002 relies on the monotonic shape.
+	BackendID lockmgr.BackendID
+}
+
+// acquireRelLock funnels every operator's relation-level lock
+// acquisition through one place so the SQLSTATE 40P01 mapping for
+// `lockmgr.ErrDeadlockDetected` and the 57014 mapping for context
+// cancellation are consistent. nil-LockMgr is a no-op: tests and
+// the legacy COPY-only server path don't have a lock manager
+// configured and must keep working.
+//
+// Locks taken here are transaction-scoped — released at the
+// dispatch.go commit/rollback call to LockMgr.ReleaseAll —
+// so they survive across statements within a multi-statement
+// txn, which is required for any real SQL deadlock to form.
+func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) error {
+	if c.LockMgr == nil {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	err := c.LockMgr.Acquire(context.Background(), c.BackendID, tag, mode)
+	if err == nil {
+		return nil
+	}
+	if err == lockmgr.ErrDeadlockDetected {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

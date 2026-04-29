@@ -29,6 +29,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -86,6 +87,15 @@ type Config struct {
 	Catalog catalog.Catalog
 	Pool    *storage.Pool
 	TxnMgr  *mvcc.Manager
+
+	// LockMgr, when set, is plumbed into every executor.Context
+	// the dispatch path constructs. Operators consult it for
+	// relation-level lock acquisition; deadlock detection is
+	// handled inside lockmgr (M0012-0002). nil disables locking
+	// entirely so existing test setups that don't configure a
+	// lock manager keep working unchanged. See
+	// docs/design/0012-0003-lock-wait-integration-and-test-matrix.md.
+	LockMgr *lockmgr.LockManager
 
 	// PubSub is the M0008 logical-replication publication /
 	// subscription registry. CREATE PUBLICATION / CREATE
@@ -204,6 +214,7 @@ type Server struct {
 
 	connWG    sync.WaitGroup
 	nextPID   atomic.Uint32
+	nextBackendID atomic.Uint32
 	closeOnce sync.Once
 
 	// controlListener is the operator-facing command socket; nil

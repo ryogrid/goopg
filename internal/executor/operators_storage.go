@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -68,6 +69,12 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	}
 	o.ctx = ctx
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
+	if err := ctx.acquireRelLock(rel, lockmgr.AccessShareLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	n, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
@@ -199,6 +206,13 @@ func (o *insertOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Insert requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	rel := ctx.Catalog.RelFileNode(o.plan.Table)
+	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	return o.child.Open(ctx)
 }
 
@@ -287,6 +301,13 @@ func (o *updateOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Update requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	rel := ctx.Catalog.RelFileNode(o.plan.Table)
+	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	return nil
 }
 
@@ -386,6 +407,13 @@ func (o *deleteOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Delete requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	rel := ctx.Catalog.RelFileNode(o.plan.Table)
+	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	return nil
 }
 
