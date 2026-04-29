@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"sync/atomic"
 )
 
@@ -69,6 +70,16 @@ type Writer struct {
 	// the current write position without serialising through the
 	// op channel.
 	writeLSNAtomic atomic.Uint64
+
+	// subscribers receive a non-blocking wake-up after every
+	// successful Append. Used by RecordIterator (and walsender
+	// goroutines) to block until more WAL is available instead of
+	// polling WrittenLSN. Subscribers maintain their own buffer
+	// channel; Writer drops the wake-up if the channel is full —
+	// the iterator will catch up on the next event or by a manual
+	// re-poll.
+	subMu       sync.Mutex
+	subscribers map[chan<- struct{}]struct{}
 }
 
 type state struct {
@@ -82,6 +93,11 @@ type state struct {
 	// stored after each successful append. The Writer reads it
 	// without locking.
 	writeLSNMirror *atomic.Uint64
+
+	// onAppend, when non-nil, is invoked after every successful
+	// append to wake subscribers (RecordIterators, walsender
+	// goroutines). Non-blocking by contract.
+	onAppend func()
 
 	files map[uint64]*os.File
 	dirty map[uint64]bool
@@ -105,6 +121,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
+	st.onAppend = w.notifyAppend
 	go st.loop(w.ops, w.done)
 	return w, nil
 }
@@ -114,6 +131,43 @@ func NewWriter(cfg Config) (*Writer, error) {
 // the checkpointer's max_wal_size trigger.
 func (w *Writer) WrittenLSN() uint64 {
 	return w.writeLSNAtomic.Load()
+}
+
+// Subscribe registers ch to receive a non-blocking wake-up after
+// every successful Append. Caller is expected to use a buffered
+// channel of capacity ≥ 1 — the Writer drops the wake-up if the
+// channel is full, since "WAL has advanced" is an idempotent signal
+// (subscribers re-poll WrittenLSN, the actual advance is observable
+// regardless of how many wake-ups were collapsed).
+func (w *Writer) Subscribe(ch chan<- struct{}) {
+	w.subMu.Lock()
+	if w.subscribers == nil {
+		w.subscribers = map[chan<- struct{}]struct{}{}
+	}
+	w.subscribers[ch] = struct{}{}
+	w.subMu.Unlock()
+}
+
+// Unsubscribe removes ch from the wake-up set. Safe to call even if
+// ch was never subscribed.
+func (w *Writer) Unsubscribe(ch chan<- struct{}) {
+	w.subMu.Lock()
+	delete(w.subscribers, ch)
+	w.subMu.Unlock()
+}
+
+// notifyAppend wakes every active subscriber. Called by the writer
+// goroutine after a successful append. Non-blocking sends so a stuck
+// subscriber can't back-pressure the WAL writer.
+func (w *Writer) notifyAppend() {
+	w.subMu.Lock()
+	for ch := range w.subscribers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	w.subMu.Unlock()
 }
 
 // Append writes one record and returns its [startLSN, endLSN].
@@ -240,6 +294,9 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 		case opAppend:
 			start, end, err := s.append(req.payload)
 			req.resp <- result{startLSN: start, endLSN: end, err: err}
+			if err == nil && s.onAppend != nil {
+				s.onAppend()
+			}
 		case opFlush:
 			req.resp <- result{err: s.flushUpTo(req.lsn)}
 		case opClose:

@@ -20,8 +20,12 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -35,7 +39,7 @@ import (
 // take it. Errors are write errors on the wire (the connection is
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
-func (s *Server) handleReplicationCommand(w *protocol.FrameWriter, payload []byte) (bool, error) {
+func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, payload []byte) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -49,6 +53,8 @@ func (s *Server) handleReplicationCommand(w *protocol.FrameWriter, payload []byt
 		return true, s.replyCreateReplicationSlot(w, trimmed[len("CREATE_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "DROP_REPLICATION_SLOT "):
 		return true, s.replyDropReplicationSlot(w, trimmed[len("DROP_REPLICATION_SLOT "):])
+	case strings.HasPrefix(upper, "START_REPLICATION"):
+		return true, s.replyStartReplication(ctx, r, w, trimmed)
 	}
 	return false, nil
 }
@@ -175,6 +181,268 @@ func (s *Server) replyDropReplicationSlot(w *protocol.FrameWriter, args string) 
 		return err
 	}
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+}
+
+// replyStartReplication validates the START_REPLICATION command,
+// flips the connection into CopyBoth streaming mode, and runs the
+// walsender loop until the WAL writer is gone, the context is
+// cancelled, or the client closes its side. Argument shape:
+//
+//	START_REPLICATION [SLOT name] PHYSICAL <X/X> [TIMELINE n]
+//
+// v0 supports physical only; the TIMELINE clause is accepted but a
+// non-1 value is rejected with feature_not_supported (single-timeline
+// operation is the documented v0 scope, see 0005-0001).
+//
+// `SLOT name`: when present, the named slot is acquired (made active)
+// and ConfirmedFlushLSN is advanced as standby status updates
+// arrive. When absent the walsender streams without slot-backed WAL
+// retention — fine for one-shot test traffic, dangerous in
+// production. Upstream behaves identically.
+func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, raw string) error {
+	if s.cfg.WAL == nil {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			"START_REPLICATION requires a configured WAL writer")
+	}
+	args, err := parseStartReplicationArgs(raw)
+	if err != nil {
+		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+	}
+	if args.Timeline != 0 && args.Timeline != 1 {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			fmt.Sprintf("START_REPLICATION TIMELINE %d not supported (v0 is single-timeline)", args.Timeline))
+	}
+	if args.SlotName != "" {
+		if s.cfg.Slots == nil {
+			return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+				"replication slots are not configured on this server")
+		}
+		if err := s.cfg.Slots.SetActive(args.SlotName, true); err != nil {
+			return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
+		}
+		defer func() { _ = s.cfg.Slots.SetActive(args.SlotName, false) }()
+	}
+
+	// Hand the connection over to CopyBoth streaming mode.
+	if err := w.WriteCopyBothResponse(0, nil); err != nil {
+		return err
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	walDir := s.cfg.WALDirPath
+	if walDir == "" {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			"START_REPLICATION requires Config.WALDirPath to be set")
+	}
+	segSize := s.cfg.WALSegmentSize
+	if segSize <= 0 {
+		segSize = wal.DefaultSegmentSize
+	}
+
+	it, err := wal.NewRecordIterator(s.cfg.WAL, walDir, segSize, args.StartLSN)
+	if err != nil {
+		// The CopyBoth stream is already open; report the failure
+		// and end the conversation rather than rolling back.
+		return s.writeStreamingError(w, sqlstate.InternalError, err.Error())
+	}
+	defer it.Close()
+
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+
+	// Receive-side goroutine: consume CopyData / CopyDone frames from
+	// the standby and apply standby-status updates to the slot. The
+	// goroutine ends naturally when the connection closes (ReadFrame
+	// returns an error) or the streaming context is cancelled.
+	receiveDone := make(chan struct{})
+	go func() {
+		defer close(receiveDone)
+		for {
+			f, err := r.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch f.Type {
+			case protocol.MsgCopyData:
+				_ = s.handleStandbyCopyData(args.SlotName, f.Payload)
+			case protocol.MsgCopyDone:
+				streamCancel()
+				return
+			case protocol.MsgTerminate:
+				streamCancel()
+				return
+			default:
+				// Unknown frame mid-stream — drop it; libpq's
+				// walreceiver doesn't send anything else.
+			}
+		}
+	}()
+
+	// Send-side loop: forward each WAL record as a 'w' WAL-data frame,
+	// emit periodic keepalives so the standby can advance its
+	// progress reporting even when the primary is idle.
+	const keepaliveInterval = 10 * time.Second
+	keepaliveTimer := time.NewTimer(keepaliveInterval)
+	defer keepaliveTimer.Stop()
+
+	recCh := make(chan wal.Record, 1)
+	recErrCh := make(chan error, 1)
+	go func() {
+		for {
+			rec, err := it.Next(streamCtx)
+			if err != nil {
+				recErrCh <- err
+				return
+			}
+			select {
+			case recCh <- rec:
+			case <-streamCtx.Done():
+				recErrCh <- streamCtx.Err()
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-streamCtx.Done():
+			<-receiveDone
+			return nil
+		case <-receiveDone:
+			return nil
+		case rec := <-recCh:
+			frame := protocol.EncodeWALData(rec.StartLSN, rec.EndLSN, time.Now().UTC(), rec.Payload)
+			if err := w.WriteCopyData(frame); err != nil {
+				streamCancel()
+				return err
+			}
+			if err := w.Flush(); err != nil {
+				streamCancel()
+				return err
+			}
+			// Reset the keepalive timer — fresh WAL implies the
+			// standby has just heard from us.
+			if !keepaliveTimer.Stop() {
+				select {
+				case <-keepaliveTimer.C:
+				default:
+				}
+			}
+			keepaliveTimer.Reset(keepaliveInterval)
+		case <-keepaliveTimer.C:
+			frame := protocol.EncodeKeepalive(s.cfg.WAL.WrittenLSN(), time.Now().UTC(), false)
+			if err := w.WriteCopyData(frame); err != nil {
+				streamCancel()
+				return err
+			}
+			if err := w.Flush(); err != nil {
+				streamCancel()
+				return err
+			}
+			keepaliveTimer.Reset(keepaliveInterval)
+		case err := <-recErrCh:
+			if errors.Is(err, context.Canceled) || errors.Is(err, wal.ErrClosed) {
+				<-receiveDone
+				return nil
+			}
+			streamCancel()
+			<-receiveDone
+			return s.writeStreamingError(w, sqlstate.InternalError, err.Error())
+		}
+	}
+}
+
+// handleStandbyCopyData decodes a client-side CopyData payload and
+// applies the relevant slot advance. Errors are swallowed (logged at
+// debug elsewhere) — a malformed status frame should not kill the
+// stream.
+func (s *Server) handleStandbyCopyData(slotName string, payload []byte) error {
+	parsed, kind, err := protocol.DecodeReplicationMessage(payload)
+	if err != nil {
+		return err
+	}
+	if kind == protocol.ReplMsgStandbyStatus {
+		st := parsed.(*protocol.StandbyStatusUpdate)
+		if slotName != "" && s.cfg.Slots != nil {
+			_ = s.cfg.Slots.AdvanceConfirmedFlushLSN(slotName, st.FlushLSN)
+		}
+	}
+	return nil
+}
+
+// writeStreamingError emits an ErrorResponse on a CopyBoth-mode
+// connection. Upstream's walsender does the same: error mid-stream
+// goes via a regular error frame, and the standby treats it as a
+// terminal disconnect.
+func (s *Server) writeStreamingError(w *protocol.FrameWriter, code sqlstate.Code, msg string) error {
+	return s.writeQueryError(w, code, msg)
+}
+
+// startReplicationArgs is the parsed form of the SQL command body.
+type startReplicationArgs struct {
+	SlotName string
+	StartLSN uint64
+	Timeline int
+}
+
+// parseStartReplicationArgs handles the two-shape grammar:
+//
+//	START_REPLICATION [SLOT name] PHYSICAL X/X [TIMELINE n]
+//
+// Tokens are case-insensitive for keywords. The LSN is upstream's
+// `X/X` hex pair.
+func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
+	tokens := strings.Fields(raw)
+	if len(tokens) == 0 || !strings.EqualFold(tokens[0], "START_REPLICATION") {
+		return startReplicationArgs{}, errors.New("START_REPLICATION: unexpected verb")
+	}
+	tokens = tokens[1:]
+	var out startReplicationArgs
+	if len(tokens) >= 2 && strings.EqualFold(tokens[0], "SLOT") {
+		out.SlotName = unquoteIdent(tokens[1])
+		tokens = tokens[2:]
+	}
+	if len(tokens) == 0 || !strings.EqualFold(tokens[0], "PHYSICAL") {
+		return startReplicationArgs{}, errors.New("START_REPLICATION: only PHYSICAL is supported in v0")
+	}
+	tokens = tokens[1:]
+	if len(tokens) == 0 {
+		return startReplicationArgs{}, errors.New("START_REPLICATION: missing start LSN")
+	}
+	lsn, err := parseLSN(tokens[0])
+	if err != nil {
+		return startReplicationArgs{}, err
+	}
+	out.StartLSN = lsn
+	tokens = tokens[1:]
+	if len(tokens) >= 2 && strings.EqualFold(tokens[0], "TIMELINE") {
+		tl, err := strconv.Atoi(tokens[1])
+		if err != nil {
+			return startReplicationArgs{}, fmt.Errorf("START_REPLICATION: invalid TIMELINE %q", tokens[1])
+		}
+		out.Timeline = tl
+	}
+	return out, nil
+}
+
+// parseLSN parses upstream's `X/X` hex notation back into a uint64.
+// Empty / "0/0" → 0 (start of WAL).
+func parseLSN(s string) (uint64, error) {
+	parts := strings.SplitN(s, "/", 2)
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid LSN %q (want X/X)", s)
+	}
+	hi, err := strconv.ParseUint(parts[0], 16, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid LSN %q: %w", s, err)
+	}
+	lo, err := strconv.ParseUint(parts[1], 16, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid LSN %q: %w", s, err)
+	}
+	return (hi << 32) | lo, nil
 }
 
 // formatLSN renders an LSN in upstream's `X/X` notation. PostgreSQL's

@@ -109,6 +109,16 @@ type Config struct {
 	// value).
 	WAL *wal.Writer
 
+	// WALDirPath is the on-disk directory the WAL writer is using
+	// (typically `<DataDir>/pg_wal`). Required for the walsender
+	// path so RecordIterator can open segments. Empty disables the
+	// walsender — START_REPLICATION returns feature_not_supported.
+	WALDirPath string
+
+	// WALSegmentSize matches the SegmentSize the WAL writer was
+	// constructed with. Zero falls back to wal.DefaultSegmentSize.
+	WALSegmentSize int64
+
 	// SystemID is the cluster's pg_control identifier reported by
 	// IDENTIFY_SYSTEM. Empty makes IDENTIFY_SYSTEM emit a fixed
 	// placeholder. Production wiring derives this from
@@ -645,7 +655,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 			// falls back to the normal handler so utility commands
 			// like SHOW still work for diagnostics.
 			if isReplication {
-				handled, err := s.handleReplicationCommand(w, f.Payload)
+				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload)
 				if err != nil {
 					logger.Debug("replication command write error", "err", err)
 					return

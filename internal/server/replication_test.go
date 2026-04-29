@@ -18,8 +18,23 @@ import (
 // dispatch only needs the slot store + (optionally) a WAL writer.
 func startReplicationTestServer(t *testing.T) (string, *wal.Slots, func()) {
 	t.Helper()
+	addr, slots, _, stop := startReplicationTestServerFull(t)
+	return addr, slots, stop
+}
+
+// startReplicationTestServerFull is the variant used by tests that
+// need the WAL writer too (e.g., START_REPLICATION). Returns the
+// listen address, the slot registry, the live writer, and a stop
+// func.
+func startReplicationTestServerFull(t *testing.T) (string, *wal.Slots, *wal.Writer, func()) {
+	t.Helper()
 	dataDir := t.TempDir()
 	slots, err := wal.OpenSlots(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walDir := dataDir + "/pg_wal"
+	walWriter, err := wal.NewWriter(wal.Config{WALDir: walDir, SegmentSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,6 +44,9 @@ func startReplicationTestServer(t *testing.T) (string, *wal.Slots, func()) {
 		AcceptDeadline:   25 * time.Millisecond,
 		HandshakeTimeout: 2 * time.Second,
 		Slots:            slots,
+		WAL:              walWriter,
+		WALDirPath:       walDir,
+		WALSegmentSize:   4096,
 		SystemID:         "7300000000000000001",
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -43,8 +61,9 @@ func startReplicationTestServer(t *testing.T) (string, *wal.Slots, func()) {
 		case <-time.After(2 * time.Second):
 			t.Error("Server.Run did not return within 2s of cancel")
 		}
+		_ = walWriter.Close()
 	}
-	return addr, slots, stop
+	return addr, slots, walWriter, stop
 }
 
 // dialReplication completes the startup handshake with replication=true
@@ -261,6 +280,96 @@ func hasCommandTag(payload []byte, want string) bool {
 		return false
 	}
 	return payload[len(want)] == 0 || payload[len(want)] == ' '
+}
+
+// TestReplicationStartReplicationStreamsRecord exercises the full
+// walsender path: a client connects in replication mode, creates a
+// slot, issues START_REPLICATION, and reads a CopyBoth + WAL-data
+// frame after the primary appends a WAL record. Pins the wire shape
+// of the streamed payload (decode via DecodeReplicationMessage).
+func TestReplicationStartReplicationStreamsRecord(t *testing.T) {
+	addr, _, walWriter, stop := startReplicationTestServerFull(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT primary PHYSICAL`)
+	_ = readUntilReadyForQuery(t, r)
+
+	sendQuery(t, w, `START_REPLICATION SLOT primary PHYSICAL 0/0`)
+
+	// First backend frame is CopyBothResponse.
+	f, err := r.ReadFrame()
+	if err != nil {
+		t.Fatalf("read CopyBothResponse: %v", err)
+	}
+	if f.Type != protocol.MsgCopyBothResponse {
+		t.Fatalf("first frame = %c, want W (CopyBothResponse)", f.Type)
+	}
+
+	// Append a WAL record from the primary side.
+	want := []byte("hello replication world")
+	if _, _, err := walWriter.Append(want); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Read CopyData frames until we see the WAL-data payload our
+	// record produced. Keepalives may come first if the timer
+	// races us.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("timeout waiting for streamed WAL record")
+		default:
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("read CopyData: %v", err)
+		}
+		if f.Type != protocol.MsgCopyData {
+			continue
+		}
+		parsed, kind, err := protocol.DecodeReplicationMessage(f.Payload)
+		if err != nil {
+			t.Fatalf("decode replication message: %v", err)
+		}
+		if kind != protocol.ReplMsgWALData {
+			continue
+		}
+		m := parsed.(*protocol.WALDataMessage)
+		if string(m.WALBytes) != string(want) {
+			t.Fatalf("WAL-data payload = %q, want %q", m.WALBytes, want)
+		}
+		// StartLSN / EndLSN must match what the writer reported.
+		if m.StartLSN == 0 || m.EndLSN <= m.StartLSN {
+			t.Errorf("LSN range = (%d, %d), want non-trivial", m.StartLSN, m.EndLSN)
+		}
+		return
+	}
+}
+
+// TestReplicationStartReplicationRejectsLogical: the v0 spec covers
+// PHYSICAL only. LOGICAL or unsupported keywords yield a SyntaxError
+// or feature-not-supported, and the connection survives.
+func TestReplicationStartReplicationRejectsLogical(t *testing.T) {
+	addr, _, _, stop := startReplicationTestServerFull(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `START_REPLICATION LOGICAL 0/0`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgErrorResponse {
+		t.Fatalf("LOGICAL first frame = %c, want E (ErrorResponse)", frames[0].Type)
+	}
+	// IDENTIFY_SYSTEM still works after the rejection.
+	sendQuery(t, w, "IDENTIFY_SYSTEM")
+	frames = readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Errorf("post-error IDENTIFY_SYSTEM = %c, want T", frames[0].Type)
+	}
 }
 
 func replicationFrameTypes(frames []protocol.Frame) string {

@@ -1214,6 +1214,8 @@ docker run --rm --network host -e TMP=/tmp -v /tmp:/tmp -v "$PWD:/work" \
       persistence remain deferred — see
       `docs/design/0003-0009-views.md`.)
 - [ ] All 22 queries (Q1–Q22) execute end-to-end and produce
+　　-　you can use scripts for vanilla PostgreSQL at bench/tpch dirctory as a reference, but you need to make necessary adjustments to run the test against goopg (e.g. connection parameters, any SQL syntax differences, etc.)
+
       result sets byte-identical (or otherwise verified-equivalent)
       to upstream PG on the same data.
       (parity test infrastructure achieved 2026-04-29: new
@@ -1445,27 +1447,61 @@ under "Hooks into existing goopg code".
       tuple `(slot_name, consistent_point, snapshot_name,
       output_plugin)`. Six unit tests pin the registry; three
       wire-shape integration tests pin the dispatch.)
-- [ ] Implement `START_REPLICATION [SLOT slot_name] PHYSICAL
+- [x] Implement `START_REPLICATION [SLOT slot_name] PHYSICAL
       <lsn> [TIMELINE n]` — flips the connection to streaming
       mode, replies with `MsgCopyBoth`, and hands off to the
       walsender goroutine.
+      (achieved 2026-04-29: parser accepts the upstream grammar,
+      acquires the named slot via `Slots.SetActive(true)`,
+      replies with `WriteCopyBothResponse`, then runs a walsender
+      with three concurrent legs: a producer goroutine that pumps
+      records from `wal.RecordIterator(startLSN)` into a buffered
+      channel; a receiver goroutine that decodes inbound CopyData
+      frames (standby status updates) and advances the slot's
+      `ConfirmedFlushLSN`; the main loop encodes each WAL record
+      via `EncodeWALData` + `WriteCopyData` and emits keepalives
+      every 10s when idle. Single-timeline only (TIMELINE != 1
+      rejects with feature_not_supported); LOGICAL rejected.
+      End-to-end test exercises the full path: client connects in
+      replication mode, creates a slot, issues START_REPLICATION,
+      primary appends a WAL record via the writer, client decodes
+      the `MsgCopyData` 'w' frame and verifies payload + LSN
+      range.)
 
 ### WAL streaming machinery
 
-- [ ] Add `internal/wal/reader.go` streaming
+- [x] Add `internal/wal/iterator.go` streaming
       `RecordIterator(startLSN)` that yields records
       one-at-a-time; blocks (waits on a channel) when caught
       up to `WrittenLSN()`.
-- [ ] Add a flush-event subscription channel on
+      (achieved 2026-04-29: NewRecordIterator takes a Writer +
+      walDir + segSize + startLSN. Next(ctx) returns one Record
+      at a time, transparently spans segment boundaries, blocks
+      on the writer's flush-event subscription when caught up,
+      cleanly returns ctx.Err() / ErrClosed on cancel /
+      writer-closed. Four unit tests pin the contract: read all
+      existing, block-then-wake on Append, context cancel
+      promptness, mid-stream startLSN skip.)
+- [x] Add a flush-event subscription channel on
       `internal/wal/writer.go` so subscribers (walsender
       goroutines) wake on flush instead of polling
       `WrittenLSN()`.
-- [ ] Walsender goroutine
+      (achieved 2026-04-29: Writer.Subscribe(ch) /
+      Unsubscribe(ch); the writer goroutine calls notifyAppend
+      after every successful append. Non-blocking send so a stuck
+      subscriber can't back-pressure the WAL writer; subscribers
+      use buffered channels of capacity ≥ 1 and re-poll WrittenLSN
+      on each wake-up since "WAL has advanced" is idempotent.)
+- [x] Walsender goroutine
       (`internal/server/replication.go` new file): subscribe to
       the WAL flush stream, encode each record into a
       WAL-data CopyData frame, periodically emit keepalives,
       consume standby status updates, and update the
       backing slot's `confirmed_flush_lsn`.
+      (achieved 2026-04-29: integrated into the
+      `replyStartReplication` handler — see entry above. The
+      walsender's three-leg design (producer / receiver /
+      main loop) is in `internal/server/replication.go`.)
 
 ### Replication slots
 
