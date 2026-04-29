@@ -55,3 +55,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0018 | EXPLAIN / EXPLAIN ANALYZE support                                 | planned  | `0018-explain-and-explain-analyze.md` |
 | 0019 | Autovacuum support                                                 | planned  | `0019-autovacuum-support.md` |
 | 0020 | Window function support (OVER, ROW_NUMBER, RANK, LAG/LEAD)       | planned  | `0020-window-functions-over-row-number-rank-lag-lead.md` |
+| 0021 | Pessimistic row locking support (SELECT ... FOR UPDATE)          | planned  | `0021-pessimistic-lock-select-for-update.md` |
