@@ -2037,15 +2037,48 @@ pick the topmost unchecked item.
       page headers when streaming records. Continues
       `docs/design/0014-0001-xlog-page-and-segment-layout-compat.md`.
 
-- [ ] XLogRecord header + rmgr mapping (M0014-0002). Replace
-      the v0 `length+CRC32-IEEE` 8-byte frame with
-      `XLogRecord`-compatible header (`xl_tot_len`, `xl_xid`,
-      `xl_prev`, `xl_info`, `xl_rmid`, `xl_crc`) using
-      upstream's CRC32C algorithm. Map goopg's existing
-      record kinds (heap insert/delete/vacuum, btree
-      insert/split, page-image, checkpoint) to upstream's
-      RmgrId vocabulary. Continues
+- [x] XLogRecord header + rmgr — **types and helpers**
+      (M0014-0002 step 1). Design doc
       `docs/design/0014-0002-xlogrecord-header-and-rmgr-mapping.md`.
+      (landed 2026-04-29: pure additive — no production-path
+      changes yet, mirroring the M0014-0001-step-1 pattern.
+      New `internal/wal/xlog_record.go` defines
+      `XLogRecord` (24 bytes; mirrors upstream's
+      `xl_tot_len/xl_xid/xl_prev/xl_info/xl_rmid/_pad/xl_crc`
+      layout byte-for-byte), `Rmgr` enum with values matching
+      upstream's `RM_*_ID` (RmgrXLog=0, RmgrXact=1,
+      RmgrStorage=2, RmgrHeap2=9, RmgrHeap=10, RmgrBtree=11
+      — only the IDs goopg's current record kinds map to)
+      plus MaxKnownRmgr boundary, flag-bit constants
+      (XLRInfoMask / XLRRmgrInfoMask / XLRSpecialRelUpdate /
+      XLRCheckConsistency). New `XLogCRC32C(data)` uses Go's
+      `crc32.MakeTable(crc32.Castagnoli)` (singleton) for
+      upstream-compatible CRC32C. `EncodeXLogRecordHeader`
+      validates TotLen == header+payload, rejects undefined
+      framework bits, zeros the 2-byte padding (upstream
+      invariant), zeros the CRC field while computing the
+      running CRC across (header || payload), then writes the
+      stored CRC back. `DecodeXLogRecordHeader` returns the
+      typed sentinel `ErrInvalidRecordHeader` on non-zero
+      padding, unknown rmid (> MaxKnownRmgr), or undefined
+      framework bits. Separate `VerifyXLogRecordCRC(headerBytes,
+      payload, want)` for recovery-time checking — caller
+      doesn't have to zero the CRC field, the helper does that
+      in a scratch copy. Tests: TestXLogCRC32CIsCastagnoli (the
+      canonical "123456789" → 0xE3069283 vector — any drift to
+      crc32.IEEE breaks pg_waldump compat), TestXLogRecordHeader
+      RoundTrip, TestVerifyXLogRecordCRCDetectsTamper (1-bit
+      payload flip → ErrCorruptRecord), TestEncodeRejectsTotLen
+      Mismatch, TestEncodeRejectsUndefinedFrameworkBits,
+      TestDecodeRejectsNonZeroPadding,
+      TestDecodeRejectsUnknownRmgr, TestDecodeTruncatedSrc,
+      TestEncodeCRCMatchesDirectComputation. Goopg→upstream
+      record-kind mapping table is in the design doc; the
+      actual writer/reader switchover for both M0014-0001
+      step 2 and M0014-0002 will land together in a later loop
+      so a half-migrated segment file (new pages + legacy
+      records, or vice versa) is impossible. Full
+      `go test ./...` green.)
 
 - [ ] Recovery + streaming + compat validation (M0014-0003).
       Update WAL replay paths to decode the new format;
