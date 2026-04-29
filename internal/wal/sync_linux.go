@@ -1,0 +1,20 @@
+//go:build linux
+
+package wal
+
+import (
+	"os"
+
+	"golang.org/x/sys/unix"
+)
+
+// dataSync persists the file's data blocks via fdatasync(2) on
+// Linux. Unlike fsync(2) it does not flush inode metadata
+// (mtime, size, …) — which is exactly what we want now that
+// preallocated WAL segments have a fixed inode size between
+// commits. Mirrors upstream's `pg_fdatasync` from
+// postgres/src/backend/storage/file/fd.c. See
+// docs/design/0007-0002-fdatasync-commit-path.md.
+func dataSync(f *os.File) error {
+	return unix.Fdatasync(int(f.Fd()))
+}

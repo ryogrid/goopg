@@ -2000,12 +2000,30 @@ out (`0007-0001`, `0007-0002`); pick the topmost unchecked item.
       counters / observability, and pgbench latency measurement
       deferred.)
 
-- [ ] `fdatasync` on the commit path: replace
+- [x] `fdatasync` on the commit path: replace
       `f.Sync()` in `flushUpTo` with platform-aware `fdatasync`
       (Linux) / `fsync` fallback. Keep full `fsync` at segment
       creation, post-creation directory flush, and segment
       removal. Design doc
       `docs/design/0007-0002-fdatasync-commit-path.md`.
+      (landed 2026-04-29: Build-tagged `dataSync(f *os.File)
+      error` helper. `internal/wal/sync_linux.go` calls
+      `unix.Fdatasync(int(f.Fd()))` from `golang.org/x/sys/unix`
+      (already a transitive dep), mirroring upstream's
+      `pg_fdatasync` from
+      postgres/src/backend/storage/file/fd.c.
+      `internal/wal/sync_other.go` falls back to `f.Sync()` on
+      every non-Linux platform — preserves the durability
+      contract at the cost of paying for inode metadata
+      updates `fdatasync` would have skipped. `flushUpTo` now
+      calls `dataSync(f)` per dirty segment instead of
+      `f.Sync()`. Full `fsync` is preserved in
+      `preallocateSegment` and the directory-fsync after
+      segment creation — both need durable metadata. The
+      `wal: fdatasync %s` error prefix in the loop is now
+      accurate. The pgbench latency measurement, the
+      `wal_sync_method` GUC selector, and a segment-removal
+      directory fsync are deferred.)
 
 ## Notes
 

@@ -446,7 +446,11 @@ func (s *state) flushUpTo(lsn uint64) error {
 		if err != nil {
 			return err
 		}
-		if err := f.Sync(); err != nil {
+		// fdatasync on Linux (skips inode metadata that hasn't
+		// changed thanks to preallocation), full fsync fallback
+		// elsewhere. See
+		// docs/design/0007-0002-fdatasync-commit-path.md.
+		if err := dataSync(f); err != nil {
 			return fmt.Errorf("wal: fdatasync %s: %w", f.Name(), err)
 		}
 		delete(s.dirty, seg)
