@@ -32,12 +32,17 @@ type Snapshot struct {
 	Indexes []IndexEntry `json:"indexes,omitempty"`
 }
 
-// TableEntry mirrors Table for serialization.
+// TableEntry mirrors Table for serialization. Stats is omitted
+// when the table has never been ANALYZEd; snapshots saved before
+// M0006 / 0006-0002 also have no `stats` key, so they round-trip
+// cleanly into Stats==nil and are restored as unanalysed
+// relations. See docs/design/0006-0002-stats-persistence.md.
 type TableEntry struct {
-	OID     uint32   `json:"oid"`
-	Schema  string   `json:"schema,omitempty"`
-	Name    string   `json:"name"`
-	Columns []Column `json:"columns"`
+	OID     uint32      `json:"oid"`
+	Schema  string      `json:"schema,omitempty"`
+	Name    string      `json:"name"`
+	Columns []Column    `json:"columns"`
+	Stats   *TableStats `json:"stats,omitempty"`
 }
 
 // IndexEntry mirrors Index for serialization. TableOID points at
@@ -73,6 +78,7 @@ func (c *InMemory) Snapshot() Snapshot {
 			Schema:  t.Schema,
 			Name:    t.Name,
 			Columns: append([]Column(nil), t.Columns...),
+			Stats:   cloneTableStats(t.Stats),
 		})
 	}
 	for _, idx := range c.indexes {
@@ -119,6 +125,7 @@ func (c *InMemory) Restore(s Snapshot) error {
 			Name:    te.Name,
 			Columns: cols,
 			OID:     te.OID,
+			Stats:   cloneTableStats(te.Stats),
 		}
 		k := key(parser.ObjectName{Schema: te.Schema, Name: te.Name})
 		if _, dup := c.tables[k]; dup {
@@ -157,4 +164,38 @@ func (c *InMemory) Restore(s Snapshot) error {
 	// the persisted snapshot but must be present on every startup.
 	c.registerSystemTables()
 	return nil
+}
+
+// cloneTableStats deep-copies a TableStats so the snapshot copy
+// (and the post-Restore in-memory table) own their own MCV /
+// histogram slices rather than aliasing the source. nil maps to
+// nil — the "unanalysed table" sentinel survives the round trip.
+func cloneTableStats(s *TableStats) *TableStats {
+	if s == nil {
+		return nil
+	}
+	out := &TableStats{
+		RowCount: s.RowCount,
+		Pages:    s.Pages,
+		AvgWidth: s.AvgWidth,
+	}
+	if len(s.Columns) > 0 {
+		out.Columns = make([]ColumnStats, len(s.Columns))
+		for i, col := range s.Columns {
+			cc := ColumnStats{
+				NDistinct: col.NDistinct,
+				NullFrac:  col.NullFrac,
+			}
+			if len(col.MCV) > 0 {
+				cc.MCV = make([]MCVEntry, len(col.MCV))
+				copy(cc.MCV, col.MCV)
+			}
+			if len(col.Histogram) > 0 {
+				cc.Histogram = make([]string, len(col.Histogram))
+				copy(cc.Histogram, col.Histogram)
+			}
+			out.Columns[i] = cc
+		}
+	}
+	return out
 }

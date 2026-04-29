@@ -75,10 +75,10 @@ type Table struct {
 // histograms. See
 // docs/design/0006-0001-sampling-and-mcv-histograms.md.
 type TableStats struct {
-	RowCount int64
-	Pages    int
-	AvgWidth float64
-	Columns  []ColumnStats
+	RowCount int64         `json:"row_count,omitempty"`
+	Pages    int           `json:"pages,omitempty"`
+	AvgWidth float64       `json:"avg_width,omitempty"`
+	Columns  []ColumnStats `json:"columns,omitempty"`
 }
 
 // ColumnStats is the per-column pg_statistic-shaped subset v0
@@ -99,18 +99,18 @@ type TableStats struct {
 // rationale (catalog must not depend on the executor's Datum
 // type) and the planner-side parsing contract.
 type ColumnStats struct {
-	NDistinct int64
-	NullFrac  float64
-	MCV       []MCVEntry
-	Histogram []string
+	NDistinct int64      `json:"ndistinct,omitempty"`
+	NullFrac  float64    `json:"null_frac,omitempty"`
+	MCV       []MCVEntry `json:"mcv,omitempty"`
+	Histogram []string   `json:"histogram,omitempty"`
 }
 
 // MCVEntry is one entry in a per-column MCV list. Frequency is
 // the sample frequency (0..1). Mirrors a single (stavalues,
 // stanumbers) pair in upstream's pg_statistic MCV slot.
 type MCVEntry struct {
-	Value     string
-	Frequency float64
+	Value     string  `json:"value"`
+	Frequency float64 `json:"frequency"`
 }
 
 // Index is one index relation in the catalog.

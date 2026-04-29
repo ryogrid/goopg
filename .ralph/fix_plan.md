@@ -1882,12 +1882,31 @@ Decomposed into the four design-doc seams the milestone calls out
 
 ### Catalog persistence
 
-- [ ] Persist `TableStats` + per-column `ColumnStats` (including
+- [x] Persist `TableStats` + per-column `ColumnStats` (including
       MCV + histogram payloads) through the catalog snapshot
       machinery so stats survive a clean stop / start. Old
       snapshots without stats must still load and present
       unanalysed relations. Design doc
       `docs/design/0006-0002-stats-persistence.md`.
+      (landed 2026-04-29: `catalog.TableEntry` grew
+      `Stats *TableStats` (JSON-tagged with `omitempty`).
+      `TableStats` / `ColumnStats` / `MCVEntry` got JSON tags
+      (`row_count` / `pages` / `avg_width` / `columns` /
+      `ndistinct` / `null_frac` / `mcv` / `histogram` / `value` /
+      `frequency`) so the on-disk shape is frozen against future
+      Go-side renames. `Snapshot()` deep-copies via
+      `cloneTableStats` (so the snapshot copy owns its MCV /
+      histogram slices); `Restore()` re-installs `Table.Stats`
+      with the same deep-copy. `<DataDir>/global/pg_catalog.json`
+      now grows the new field on the next clean stop / start —
+      no production wiring change. Forward-compat verified by
+      `TestRestoreAcceptsLegacySnapshotWithoutStats` (a literal
+      pre-M0006 JSON snapshot without `stats` keys round-trips
+      cleanly into `Table.Stats==nil`). End-to-end MCV /
+      histogram round-trip pinned by
+      `TestSnapshotPreservesTableStats`. JSON shape pinned by
+      `TestSnapshotOmitsStatsWhenNil` (no `stats` key on
+      unanalysed tables).)
 
 ### Planner consumption
 

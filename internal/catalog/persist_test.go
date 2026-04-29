@@ -1,7 +1,9 @@
 package catalog
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -95,6 +97,126 @@ func TestRestoreRejectsDanglingIndex(t *testing.T) {
 	dst := NewInMemory()
 	if err := dst.Restore(snap); err == nil {
 		t.Fatal("expected error for dangling index")
+	}
+}
+
+// TestSnapshotPreservesTableStats pins the M0006 / 0006-0002
+// contract: a populated TableStats with MCV + histogram payloads
+// survives Snapshot → JSON-encode → JSON-decode → Restore deep-
+// equal. Without this, ANALYZE has to re-run after every clean
+// stop / start.
+func TestSnapshotPreservesTableStats(t *testing.T) {
+	src := NewInMemory()
+	tbl, err := src.CreateTable(parser.ObjectName{Name: "items"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}, NotNull: true},
+		{Name: "label", Type: Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStats := &TableStats{
+		RowCount: 1000,
+		Pages:    7,
+		AvgWidth: 24.5,
+		Columns: []ColumnStats{
+			{NDistinct: 1000, NullFrac: 0.0},
+			{
+				NDistinct: 3,
+				NullFrac:  0.01,
+				MCV: []MCVEntry{
+					{Value: "F", Frequency: 0.8},
+					{Value: "O", Frequency: 0.15},
+				},
+				Histogram: []string{"P", "Q", "R"},
+			},
+		},
+	}
+	src.SetTableStats(tbl, wantStats)
+
+	// Round-trip via JSON to exercise the actual on-disk path,
+	// not just the in-memory deep-copy.
+	raw, err := json.Marshal(src.Snapshot())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Snapshot
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	dst := NewInMemory()
+	if err := dst.Restore(decoded); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := dst.LookupTable(parser.ObjectName{Name: "items"})
+	if !ok {
+		t.Fatal("items lost across round-trip")
+	}
+	if got.Stats == nil {
+		t.Fatal("Stats lost across round-trip")
+	}
+	if !reflect.DeepEqual(got.Stats, wantStats) {
+		t.Errorf("Stats=%+v want %+v", got.Stats, wantStats)
+	}
+
+	// Independent ownership: mutating the source after Snapshot
+	// must not show up on the restored copy.
+	wantStats.Columns[1].MCV[0].Value = "MUTATED"
+	if got.Stats.Columns[1].MCV[0].Value != "F" {
+		t.Errorf("restored MCV aliased source: got %q", got.Stats.Columns[1].MCV[0].Value)
+	}
+}
+
+// TestSnapshotOmitsStatsWhenNil pins the forward-compat
+// contract: a table with no Stats serialises without a `stats`
+// key. Old snapshots saved before M0006 / 0006-0002 also have no
+// such key, so the JSON shape stays interchangeable.
+func TestSnapshotOmitsStatsWhenNil(t *testing.T) {
+	src := NewInMemory()
+	if _, err := src.CreateTable(parser.ObjectName{Name: "items"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(src.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"stats"`) {
+		t.Errorf("snapshot for unanalysed table included `stats` key:\n%s", raw)
+	}
+}
+
+// TestRestoreAcceptsLegacySnapshotWithoutStats: a JSON snapshot
+// from before M0006 (no `stats` field on tables) must round-trip
+// cleanly into Stats==nil and be queryable as an unanalysed
+// relation.
+func TestRestoreAcceptsLegacySnapshotWithoutStats(t *testing.T) {
+	legacy := []byte(`{
+        "next_oid": 16385,
+        "tables": [
+            {
+                "oid": 16384,
+                "name": "items",
+                "columns": [
+                    {"name": "id", "type": {"name": "int4"}, "ordinal": 0}
+                ]
+            }
+        ]
+    }`)
+	var snap Snapshot
+	if err := json.Unmarshal(legacy, &snap); err != nil {
+		t.Fatalf("unmarshal legacy snapshot: %v", err)
+	}
+	dst := NewInMemory()
+	if err := dst.Restore(snap); err != nil {
+		t.Fatalf("restore legacy snapshot: %v", err)
+	}
+	got, ok := dst.LookupTable(parser.ObjectName{Name: "items"})
+	if !ok {
+		t.Fatal("items lost from legacy snapshot")
+	}
+	if got.Stats != nil {
+		t.Errorf("Stats=%+v want nil for unanalysed legacy table", got.Stats)
 	}
 }
 
