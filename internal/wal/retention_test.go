@@ -1,13 +1,57 @@
 package wal
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 )
+
+// logCapture buffers slog records as JSON so tests can introspect
+// emitted events. Use logger() to feed a SlotAwareRetainer; use
+// entries() to iterate the resulting structured records.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func newLogCapture() *logCapture { return &logCapture{} }
+
+func (c *logCapture) logger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(&syncBuffer{c: c}, nil))
+}
+
+func (c *logCapture) entries() []map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := []map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(c.buf.Bytes()))
+	for dec.More() {
+		var m map[string]any
+		if err := dec.Decode(&m); err != nil {
+			break
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+type syncBuffer struct{ c *logCapture }
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	return s.c.buf.Write(p)
+}
+
+var _ context.Context // keep import live for future test additions
 
 // TestRemoveOldSegmentsKeepsContainingSegment confirms the writer
 // preserves the segment that contains the keep-LSN itself: a
@@ -267,6 +311,62 @@ func TestSlotAwareRetainerPrunesBelowSlotHorizon(t *testing.T) {
 	}
 	if !equalStringSlices(got, want) {
 		t.Fatalf("segments after retain = %v, want %v", got, want)
+	}
+}
+
+// TestSlotAwareRetainerEmitsLagWarning pins the warning behaviour:
+// a slot whose lag has crossed LagWarnFraction of MaxSlotKeepBytes
+// (but hasn't yet exceeded the cap) gets an event=slot_lag_warning
+// log so the operator can act before invalidation.
+func TestSlotAwareRetainerEmitsLagWarning(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for i := 0; i < 4; i++ {
+		if _, _, err := w.Append(make([]byte, 24)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	slots, err := OpenSlots(filepath.Dir(walDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Slot anchored at LSN 1; current write position is ~128.
+	// MaxSlotKeepBytes=200 → cap not exceeded, but
+	// LagWarnFraction*200 = 100, so lag > 100 should warn.
+	if _, err := slots.Create("warn_me", SlotPhysical, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := newLogCapture()
+	r := &SlotAwareRetainer{
+		Writer:           w,
+		Slots:            slots,
+		MaxSlotKeepBytes: 200,
+		Logger:           logs.logger(),
+	}
+	if err := r.Retain(uint64(3*32 + 1)); err != nil {
+		t.Fatal(err)
+	}
+	// Slot must NOT be invalidated (lag 127 < cap 200).
+	got, _ := slots.Get("warn_me")
+	if got.Invalidated {
+		t.Fatal("slot invalidated; want lag-warning only")
+	}
+	// We expect at least one log line carrying event=slot_lag_warning
+	// for this slot.
+	found := false
+	for _, e := range logs.entries() {
+		if e["event"] == EventSlotLagWarning && e["slot"] == "warn_me" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected slot_lag_warning log; got %v", logs.entries())
 	}
 }
 

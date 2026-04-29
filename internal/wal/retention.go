@@ -87,12 +87,32 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 	currentLSN := r.Writer.WrittenLSN()
 	var invalidated []string
 	if r.Slots != nil && r.MaxSlotKeepBytes > 0 {
+		// Pre-eviction warning sweep: any slot whose lag has
+		// crossed LagWarnFraction of the cap gets an INFO log so
+		// the operator can react (raise the cap, fix the standby)
+		// before the next checkpoint flips the slot to
+		// invalidated. Done before the actual invalidation pass
+		// so the warning fires on the same checkpoint where the
+		// slot has crossed the threshold but not yet the cap.
+		r.warnLaggingSlots(currentLSN)
+
 		var err error
 		invalidated, err = r.Slots.InvalidateLagging(currentLSN, r.MaxSlotKeepBytes)
 		if err != nil {
-			r.logger().Warn("wal retention: slot invalidation failed", "err", err)
+			r.logger().Warn("wal retention: slot invalidation failed",
+				"event", EventSlotInvalidated, "err", err)
 			// Fall through — we still want to unlink whatever
 			// the unchanged slot horizon allows.
+		}
+		// Per-slot WARN for each freshly-invalidated slot so an
+		// alert can wake somebody up. The summary log below
+		// still names the full list, but a per-slot WARN-level
+		// event is what dashboards typically gate alarms on.
+		for _, name := range invalidated {
+			r.logger().Warn("replication slot invalidated by retention",
+				"event", EventSlotInvalidated, "slot", name,
+				"max_slot_wal_keep_bytes", r.MaxSlotKeepBytes,
+				"current_lsn", currentLSN)
 		}
 	}
 
@@ -116,6 +136,7 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 
 	if removed > 0 || len(invalidated) > 0 {
 		r.logger().Info("wal retention: pruned",
+			"event", EventWALSegmentsRecycled,
 			"checkpoint_lsn", checkpointLSN,
 			"keep_lsn", keepLSN,
 			"segments_removed", removed,
@@ -123,6 +144,45 @@ func (r *SlotAwareRetainer) Retain(checkpointLSN uint64) error {
 		)
 	}
 	return nil
+}
+
+// warnLaggingSlots emits an INFO event for any slot whose lag has
+// crossed LagWarnFraction of MaxSlotKeepBytes but hasn't yet
+// exceeded the cap. Acts as a heads-up so the operator can raise
+// the cap or unblock the standby before the slot is invalidated.
+// Caller must guarantee r.Slots != nil and r.MaxSlotKeepBytes > 0.
+func (r *SlotAwareRetainer) warnLaggingSlots(currentLSN uint64) {
+	if r.Slots == nil || r.MaxSlotKeepBytes <= 0 {
+		return
+	}
+	warnThreshold := uint64(float64(r.MaxSlotKeepBytes) * LagWarnFraction)
+	if warnThreshold == 0 {
+		return
+	}
+	for _, slot := range r.Slots.List() {
+		if slot.Invalidated {
+			continue
+		}
+		if slot.RestartLSN >= currentLSN {
+			continue
+		}
+		lag := currentLSN - slot.RestartLSN
+		if lag <= warnThreshold {
+			continue
+		}
+		if lag > uint64(r.MaxSlotKeepBytes) {
+			// About to be invalidated below; the WARN log fires
+			// from the post-invalidation loop instead so we
+			// don't double-log the same slot.
+			continue
+		}
+		r.logger().Info("replication slot lag approaching cap",
+			"event", EventSlotLagWarning,
+			"slot", slot.Name,
+			"lag_bytes", lag,
+			"max_slot_wal_keep_bytes", r.MaxSlotKeepBytes,
+			"warn_fraction", LagWarnFraction)
+	}
 }
 
 func (r *SlotAwareRetainer) logger() *slog.Logger {

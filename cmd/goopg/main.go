@@ -357,10 +357,13 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 		logger.Info("standby mode: starting continuous WAL replay",
 			"start_lsn", baseLSN)
 		if err := sr.Run(ctx, iter); err != nil {
-			logger.Error("standby replay: stopped on error", "err", err)
+			logger.Error("standby replay: stopped on error",
+				"event", wal.EventStandbyReplayError,
+				"apply_lsn", sr.ApplyLSN(), "err", err)
 			return
 		}
 		logger.Info("standby replay: stopped",
+			"event", wal.EventStandbyReplayStopped,
 			"apply_lsn", sr.ApplyLSN())
 	}()
 	return sr
@@ -424,6 +427,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",
+					"event", wal.EventWalreceiverDialFailed,
 					"primary", addr, "err", err, "backoff", backoff)
 				select {
 				case <-ctx.Done():
@@ -439,16 +443,24 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 				continue
 			}
 			backoff = baseBackoff
+			logger.Info("walreceiver connected",
+				"event", wal.EventWalreceiverConnected,
+				"primary", addr, "slot", slotName,
+				"start_lsn", rt.WAL.WrittenLSN())
 			runErr := rec.Run(ctx)
+			lastApplied := rec.ApplyLSN()
 			_ = rec.Close()
 			if ctx.Err() != nil {
 				return
 			}
 			if runErr != nil {
-				logger.Warn("walreceiver run ended with error; reconnecting",
-					"err", runErr)
+				logger.Warn("walreceiver disconnect; will reconnect",
+					"event", wal.EventWalreceiverDisconnect,
+					"primary", addr, "apply_lsn", lastApplied, "err", runErr)
 			} else {
-				logger.Info("walreceiver run ended; reconnecting")
+				logger.Info("walreceiver disconnect (clean); will reconnect",
+					"event", wal.EventWalreceiverDisconnect,
+					"primary", addr, "apply_lsn", lastApplied)
 			}
 		}
 	}()

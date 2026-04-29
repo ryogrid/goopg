@@ -251,7 +251,11 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 
 	// Register this walsender into the process-wide observability
 	// registry so the pg_stat_replication virtual view can render
-	// a live row. Unregister on exit (whether clean or error).
+	// a live row. Unregister on exit (whether clean or error). The
+	// disconnect log fires on every exit path (clean stream end,
+	// keepalive write failure, ctx cancel) so an operator scraping
+	// for replication churn has a single event name to gate alerts
+	// on (`event=walsender_disconnect`).
 	var senderHandle *wal.Sender
 	if s.cfg.WalSenders != nil {
 		senderHandle = s.cfg.WalSenders.Register(wal.SenderState{
@@ -261,6 +265,17 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		})
 		defer s.cfg.WalSenders.Unregister(senderHandle)
 	}
+	defer func() {
+		if s.cfg.Logger == nil {
+			return
+		}
+		s.cfg.Logger.Info("walsender disconnect",
+			"event", wal.EventWalsenderDisconnect,
+			"slot", args.SlotName,
+			"start_lsn", args.StartLSN,
+			"primary_written_lsn", s.cfg.WAL.WrittenLSN(),
+		)
+	}()
 
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()

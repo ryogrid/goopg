@@ -1631,8 +1631,19 @@ under "Hooks into existing goopg code".
       cooperative shutdown on context cancel. Design doc
       `docs/design/0005-0002-standby-recovery-and-replay.md`
       lands in the same loop.)
-- [ ] Reconnect loop with backoff when `primary_conninfo`
+- [x] Reconnect loop with backoff when `primary_conninfo`
       drops; resume from the last durable apply LSN.
+      (achieved 2026-04-29: already in place via the
+      `startWalreceiver` goroutine in `cmd/goopg/main.go`.
+      Exponential backoff base=500ms cap=30s; resets to base
+      after a successful connect. Resume LSN = `rt.WAL.WrittenLSN()`,
+      which is the in-memory write head during a single process
+      lifetime (restart-safe because `loadState` reseeds it from
+      the on-disk segment sizes — both written and flushed). The
+      loop checks `ctx.Err()` after Run returns to distinguish
+      clean-shutdown from disconnect. Auditing this loop, all
+      properties hold; no code change needed beyond the
+      structured-event logging in 0005-0007.)
 
 ### Configuration surface
 
@@ -1744,8 +1755,34 @@ under "Hooks into existing goopg code".
       node default); one row when streaming. Two registry
       unit tests + one view test cover single-row semantics,
       progress advance, and column shape.)
-- [ ] Replication-related logging hooks for disconnect /
+- [x] Replication-related logging hooks for disconnect /
       replay-pause / retention-pressure events.
+      (achieved 2026-04-29: new `internal/wal/repllog.go`
+      defines a canonical `event=<name>` vocabulary so dashboards
+      can build alert rules against stable field values instead
+      of grepping free-form messages. Nine events:
+      `walreceiver_dial_failed` (WARN), `walreceiver_connected`
+      (INFO), `walreceiver_disconnect` (INFO/WARN),
+      `standby_replay_error` (ERROR), `standby_replay_stopped`
+      (INFO), `walsender_disconnect` (INFO),
+      `slot_lag_warning` (INFO),
+      `slot_invalidated` (WARN), `wal_segments_recycled` (INFO).
+      Producers: `cmd/goopg/main.go` for receiver/replayer
+      events; `internal/server/replication.go` for walsender
+      disconnect (deferred so it fires on every exit path);
+      `SlotAwareRetainer` for slot/segment events. Plus a new
+      pre-eviction `warnLaggingSlots` sweep on
+      `SlotAwareRetainer.Retain` that emits
+      `slot_lag_warning` when a slot's lag crosses
+      `LagWarnFraction` (50%) of `max_slot_wal_keep_size`,
+      giving the operator time to react before forced
+      invalidation. New unit test
+      `TestSlotAwareRetainerEmitsLagWarning` pins the
+      threshold + event-field contract via a JSON-decoding
+      logCapture helper. Design doc
+      `docs/design/0005-0007-replication-event-logging.md`
+      lands in the same loop with the full event taxonomy +
+      severity routing guidance.)
 
 ### Acceptance test
 
