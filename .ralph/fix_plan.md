@@ -2233,6 +2233,39 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 4a — PL/pgSQL body parser + AST (Block +
+        RETURN). Design doc
+        `docs/design/0015-0004-plpgsql-body-parser-and-ast.md`.
+        (landed 2026-04-30: parser-only slice. New
+        `internal/plpgsql` package parses routine-body bytes
+        captured by step 1's dollar-quote lexer into AST nodes.
+        Reuses goopg's main SQL lexer via `parser.Lex` so
+        identifiers / literals / dollar-quotes / parameter refs
+        all tokenise identically. New `KwReturn` keyword
+        (`KwBegin`/`KwEnd` already there). New public
+        `parser.ParseExpr(input string) (Expr, error)` so
+        RETURN's expression bytes can be fed back through the
+        SQL expression parser — the resulting `parser.Expr` is
+        the same shape a SELECT target list would produce,
+        letting the existing analyzer / planner / executor
+        stay reusable when the interpreter (step 5) arrives.
+        AST: `Block{Statements []Stmt}` + `ReturnStmt{Expr
+        parser.Expr}`; closed `Stmt` interface via unexported
+        `plpgsqlStmtNode()` marker. Grammar: `body ::= 'BEGIN'
+        stmt_list 'END' [';']`, `stmt ::= 'RETURN' sql_expr
+        ';'`. Typed `plpgsql.SyntaxError{Pos, Message}`; lexer
+        errors wrap into the same envelope (errors.As
+        round-trip). Specific Stage-A diagnostics for missing
+        BEGIN / END, unsupported statement (says "Stage A 4a
+        accepts RETURN only"), bare RETURN without value, bad
+        expression (pinned at expression start). 11 tests in
+        `parser_test.go`. Out of scope (Stage A 4 follow-ups):
+        DECLARE + assignment (4b), IF/ELSIF/ELSE (4c),
+        LOOP/WHILE/FOR/EXIT/CONTINUE (4d), PERFORM (4e),
+        SELECT INTO (4f), embedded INSERT/UPDATE/DELETE/SELECT
+        (4g), exception blocks (Stage B), RETURN NEXT/QUERY
+        (Stage B). Full `go test ./...` green.)
+
   - [x] Stage A step 3 — analyzer pass-through + planner DDL
         pass-through + executor `execCreateFunction` /
         `execDropFunction`. Design doc

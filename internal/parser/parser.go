@@ -20,6 +20,30 @@ func (e *SyntaxError) Error() string {
 // Parse splits input on statement boundaries and returns one Stmt per
 // non-empty statement. A trailing semicolon is allowed; an empty input
 // returns an empty slice and no error.
+// ParseExpr parses a single SQL expression and returns its AST.
+// Used by the PL/pgSQL body parser (M0015 Stage A step 4) to
+// translate RETURN / assignment / IF-condition expressions into
+// the same AST nodes a SELECT target list would produce — keeps
+// the type-checker / planner / executor reusable for routine
+// bodies. Trailing tokens after the expression surface a syntax
+// error so a caller passing `1 + 2; garbage` gets a clean
+// diagnostic.
+func ParseExpr(input string) (Expr, error) {
+	toks, err := Lex(input)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{tokens: toks}
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().Kind != TokenEOF {
+		return nil, p.errAtCur("unexpected trailing tokens after expression")
+	}
+	return expr, nil
+}
+
 func Parse(input string) ([]Stmt, error) {
 	toks, err := Lex(input)
 	if err != nil {

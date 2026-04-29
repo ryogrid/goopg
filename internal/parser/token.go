@@ -181,6 +181,14 @@ const (
 	KwFunction Keyword = "function"
 	KwReturns  Keyword = "returns"
 	KwLanguage Keyword = "language"
+
+	// PL/pgSQL body keywords (M0015 Stage A step 4). The PL/pgSQL
+	// parser lives in `internal/plpgsql/` but reuses goopg's main
+	// SQL lexer for tokenisation, so the keywords belong here.
+	// Step 4a covers BEGIN / END (already declared above) and
+	// RETURN; DECLARE / IF / LOOP / WHILE / FOR / EXIT / CONTINUE /
+	// PERFORM stay deferred to subsequent slices.
+	KwReturn Keyword = "return"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -297,6 +305,7 @@ var keywords = map[string]Keyword{
 	"function":     KwFunction,
 	"returns":      KwReturns,
 	"language":     KwLanguage,
+	"return":       KwReturn,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased
