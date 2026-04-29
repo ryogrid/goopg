@@ -48,4 +48,6 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0011 | B-tree NUMERIC key support                                       | planned  | `0011-btree-numeric-key-support.md`               |
 | 0012 | Lock manager foundation & PostgreSQL-style deadlock detection   | planned  | `0012-lock-manager-and-deadlock-detection.md`     |
 | 0013 | WAL buffers optimization with eviction-safe WAL-before-data durability | planned  | `0013-wal-buffers-optimization-with-eviction-safe-wal-before-data-durability.md` |
-| 0014 | PostgreSQL-compatible WAL on-disk format                          | planned  | `0014-postgresql-compatible-wal-on-disk-format.md` |
+| 0014 | PostgreSQL-compatible WAL on-disk format                          | planned  | `0014-wal-compatibility-with-pg.md` |
+| 0015 | PL/pgSQL stored routines (function-first delivery)                | planned  | `0015-plpgsql-stored-routines-function-first.md` |
+| 0016 | WITH clause and CTE support                                       | planned  | `0016-with-clause-cte-support.md` |
