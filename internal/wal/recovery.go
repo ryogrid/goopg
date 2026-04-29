@@ -341,48 +341,71 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 	stats.CheckpointLSN = checkpointLSN
 
 	for i, r := range records[:replayUntil] {
-		if len(r.Payload) == 0 {
-			return stats, fmt.Errorf("wal: replay record %d has empty payload", i)
+		applied, err := ApplyRecord(mgr, r)
+		if err != nil {
+			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
 		}
-		switch r.Payload[0] {
-		case RecordKindPageImage:
-			if err := replayPageImage(mgr, r.Payload); err != nil {
-				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
-			}
+		if applied {
 			stats.Applied++
-		case RecordKindBtreeSplit:
-			if err := replayBtreeSplit(mgr, r.Payload); err != nil {
-				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
-			}
-			stats.Applied++
-		case RecordKindHeapInsert:
-			if err := replayHeapInsert(mgr, r); err != nil {
-				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
-			}
-			stats.Applied++
-		case RecordKindBtreeInsert:
-			if err := replayBtreeInsert(mgr, r); err != nil {
-				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
-			}
-			stats.Applied++
-		case RecordKindHeapDelete:
-			if err := replayHeapDelete(mgr, r); err != nil {
-				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
-			}
-			stats.Applied++
-		case RecordKindHeapVacuum:
-			if err := replayHeapVacuum(mgr, r); err != nil {
-				return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
-			}
-			stats.Applied++
-		case RecordKindCheckpoint:
-			// Marker only; no page write.
-			continue
-		default:
-			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: unsupported kind %d", i, r.StartLSN, r.EndLSN, r.Payload[0])
 		}
 	}
 	return stats, nil
+}
+
+// ApplyRecord applies a single decoded WAL record to storage. It is
+// the per-record kernel shared by `ReplayRecords` (crash recovery
+// from a slice already trimmed to the last checkpoint) and
+// `StreamReplayer` (continuous standby replay driven by a streaming
+// `RecordIterator`). Returns `applied=true` when a real page mutation
+// happened, `applied=false` for marker-only records (Checkpoint).
+//
+// All physical and logical applies are individually idempotent via
+// `pd_lsn`: re-applying a record that was already persisted is a
+// no-op, which means the stream replayer can resume from any point
+// the local WAL writer's `WrittenLSN` advertises without bookkeeping
+// a separate "apply cursor" — a record that finished on disk but
+// crashed before the storage write is re-attempted on restart, and
+// one that finished both is silently skipped.
+func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
+	if len(r.Payload) == 0 {
+		return false, errors.New("wal: empty record payload")
+	}
+	switch r.Payload[0] {
+	case RecordKindPageImage:
+		if err := replayPageImage(mgr, r.Payload); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindBtreeSplit:
+		if err := replayBtreeSplit(mgr, r.Payload); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindHeapInsert:
+		if err := replayHeapInsert(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindBtreeInsert:
+		if err := replayBtreeInsert(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindHeapDelete:
+		if err := replayHeapDelete(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindHeapVacuum:
+		if err := replayHeapVacuum(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindCheckpoint:
+		return false, nil
+	default:
+		return false, fmt.Errorf("unsupported kind %d", r.Payload[0])
+	}
 }
 
 // ReplayFromDir reads records from <dataDir>/pg_wal and replays them.

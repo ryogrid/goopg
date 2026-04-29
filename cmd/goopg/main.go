@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/server"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 const usage = `goopg — a Go reimplementation of PostgreSQL.
@@ -248,17 +250,23 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	// Standby mode: when `<DataDir>/standby.signal` was present at
 	// Open time, dial the configured `primary_conninfo` and spawn a
-	// walreceiver in the background. The receiver streams WAL into
-	// the local writer; `<DataDir>/pg_wal` ends up byte-identical
-	// to the primary's. Application of the streamed records into
-	// data files happens via the existing crash-recovery path on
-	// next startup; live-replay is the next M0005 slice.
+	// walreceiver + continuous-replay pair in the background. The
+	// receiver streams WAL into the local writer (`<DataDir>/pg_wal`
+	// ends up byte-identical to the primary's) and a streaming
+	// `wal.StreamReplayer` consumes from a `RecordIterator` to apply
+	// each record into data files as soon as it lands. Apply is
+	// idempotent via `pd_lsn`, so on restart the iterator can safely
+	// re-read the durable tail without bookkeeping a separate
+	// apply cursor.
 	wrCtx, wrCancel := context.WithCancel(ctx)
 	wrDone := make(chan struct{})
+	replayDone := make(chan struct{})
 	if rt != nil && rt.Standby {
 		startWalreceiver(wrCtx, wrDone, rt, registry, logger)
+		startStandbyReplayer(wrCtx, replayDone, rt, logger)
 	} else {
 		close(wrDone)
+		close(replayDone)
 	}
 
 	runErr := srv.Run(ctx)
@@ -266,11 +274,52 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	wrCancel()
 	<-cpDone
 	<-wrDone
+	<-replayDone
 	if runErr != nil {
 		fmt.Fprintf(stderr, "goopg start: %v\n", runErr)
 		return 1
 	}
 	return 0
+}
+
+// startStandbyReplayer launches the continuous-replay goroutine that
+// drains the local WAL writer into the storage manager. The standby
+// runs both this and `startWalreceiver` together: the receiver
+// produces WAL records (Append'ing into `rt.WAL`), and the replayer
+// consumes from a streaming `wal.RecordIterator` and applies each
+// record via `wal.ApplyRecord`. Apply is idempotent via `pd_lsn`, so
+// the iterator anchors at the writer's current `WrittenLSN` (which
+// equals the durable tail right after `initdb.Open`'s crash-recovery
+// pass) and any record already on disk + applied is silently
+// skipped.
+//
+// On a per-record apply error the goroutine logs and exits — a
+// divergence between primary WAL and standby data files is
+// unrecoverable without a fresh base backup, and continuing to apply
+// would compound the corruption. The goroutine also exits when the
+// supplied context is cancelled (clean shutdown) or the writer
+// closes (process tear-down).
+func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) {
+	go func() {
+		defer close(done)
+		baseLSN := rt.WAL.WrittenLSN()
+		walDir := filepath.Join(rt.DataDir, "pg_wal")
+		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, baseLSN)
+		if err != nil {
+			logger.Error("standby replay: iterator init failed", "err", err)
+			return
+		}
+		defer func() { _ = iter.Close() }()
+		sr := wal.NewStreamReplayer(rt.StorageMgr, baseLSN)
+		logger.Info("standby mode: starting continuous WAL replay",
+			"start_lsn", baseLSN)
+		if err := sr.Run(ctx, iter); err != nil {
+			logger.Error("standby replay: stopped on error", "err", err)
+			return
+		}
+		logger.Info("standby replay: stopped",
+			"apply_lsn", sr.ApplyLSN())
+	}()
 }
 
 // startWalreceiver dials the primary identified by `primary_conninfo`

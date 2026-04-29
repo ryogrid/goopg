@@ -1383,10 +1383,16 @@ under "Hooks into existing goopg code".
       state-transition diagram, replication-slot retention,
       GUC surface, promotion path, hook list for follow-up
       implementation loops).
-- [ ] Design doc `0005-0002-standby-recovery-and-replay.md`
+- [x] Design doc `0005-0002-standby-recovery-and-replay.md`
       covering streaming WAL reader iterator, incremental
       `ReplayRecords` invocation, restart semantics across
       stop/start, and consistency model under reconnect.
+      (achieved 2026-04-29: `docs/design/0005-0002-...` lands
+      alongside the continuous-replay implementation. Documents
+      the `ApplyRecord` per-record kernel, the `StreamReplayer`
+      driver, the no-separate-apply-cursor restart contract
+      (relies on `pd_lsn` idempotency), the failure model, and
+      the wire-up into `cmd/goopg start`'s standby boot.)
 - [ ] Design doc `0005-0003-replication-observability.md`
       covering `pg_stat_replication` / `pg_stat_wal_receiver`
       virtual views, replication-lag computation, and the
@@ -1566,10 +1572,29 @@ under "Hooks into existing goopg code".
       appear byte-identical in the standby's pg_wal segments
       with matching ApplyLSN. Driving the recovery loop on top
       of the appended WAL is the next slice's job.)
-- [ ] Continuous-replay extension to
+- [x] Continuous-replay extension to
       `internal/wal/recovery.go ReplayRecords` so single
       records arriving from a stream apply incrementally.
       Idempotency is already in place via `pd_lsn`.
+      (achieved 2026-04-29: `ReplayRecords`'s per-record switch
+      lifted into a new `wal.ApplyRecord(mgr, r) (applied bool,
+      err error)` kernel; `ReplayRecords` now delegates per
+      record. New `internal/wal/stream_replayer.go` adds a
+      `StreamReplayer` driver that pulls records from a
+      `RecordIterator` (which blocks on the writer's
+      flush-event subscription at the tail) and applies each
+      via `ApplyRecord`. `ApplyLSN` is exposed for future
+      observability hookup. `cmd/goopg start`'s standby boot
+      path now spawns the replayer alongside the existing
+      walreceiver goroutine; the iterator anchors at the
+      writer's `WrittenLSN` after `initdb.Open`'s crash-recovery
+      pass, so restart-resume needs no separate apply cursor —
+      `pd_lsn` idempotency covers any overlap. Three unit tests
+      pin the contract: happy-path apply of three heap-inserts,
+      idempotent re-apply over a stream that already landed,
+      cooperative shutdown on context cancel. Design doc
+      `docs/design/0005-0002-standby-recovery-and-replay.md`
+      lands in the same loop.)
 - [ ] Reconnect loop with backoff when `primary_conninfo`
       drops; resume from the last durable apply LSN.
 
