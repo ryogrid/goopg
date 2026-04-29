@@ -180,6 +180,20 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// wal_direct_io requests Linux O_DIRECT writes for WAL
+	// segments so newly-written WAL bytes don't pollute the OS
+	// page cache. Default `off` keeps the legacy buffered path.
+	// On filesystems / kernels that don't honour O_DIRECT
+	// (tmpfs, overlayfs, every non-Linux GOOS) the writer
+	// transparently falls back to buffered writes and logs
+	// `event=wal_direct_io_fallback` at startup. See
+	// docs/design/0010-0001-wal-direct-io-write-path.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_direct_io", Type: TypeBool, BootVal: "off",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// io_method picks the AIO I/O method. `sync` runs every
 	// I/O on the calling goroutine (the safe default that
 	// matches v0's pre-AIO behaviour); `worker` uses a

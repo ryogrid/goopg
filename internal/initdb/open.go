@@ -77,6 +77,18 @@ type OpenOptions struct {
 	// leave it false.
 	WALInitZero bool
 
+	// WALDirectIO, when true, forwards to wal.Config.DirectIO
+	// so WAL writes go through the O_DIRECT path on Linux
+	// filesystems that honour it (ext4, XFS). Mirrors
+	// upstream's `wal_direct_io` GUC. cmd/goopg start sets
+	// this from the GUC; on filesystems where O_DIRECT is
+	// unsupported (tmpfs, overlayfs) the writer transparently
+	// falls back to buffered writes — Runtime.WAL exposes the
+	// fallback reason via DirectIOFallbackReason() so the
+	// startup logger can surface it. See
+	// docs/design/0010-0001-wal-direct-io-write-path.md.
+	WALDirectIO bool
+
 	// AIO* control the AIO engine the storage manager (and
 	// future heap-scan / checkpointer / WAL-writer callers)
 	// will use. Maps to the upstream-aligned `io_method`,
@@ -154,6 +166,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	walCfg := wal.Config{
 		WALDir:      filepath.Join(abs, "pg_wal"),
 		Preallocate: opts.WALInitZero,
+		DirectIO:    opts.WALDirectIO,
 	}
 	if aioEngine != nil {
 		walCfg.AIO = walAIOEngineAdapter{eng: aioEngine}

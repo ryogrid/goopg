@@ -181,6 +181,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
+		walDirectIO := boolGUC(registry, "wal_direct_io", false)
 		aioMethod := stringGUC(registry, "io_method", "")
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
@@ -189,6 +190,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			DataDir:           *dataDir,
 			PoolSlots:         poolSlots,
 			WALInitZero:       walInitZero,
+			WALDirectIO:       walDirectIO,
 			AIOMethod:         aioMethod,
 			AIOWorkers:        aioWorkers,
 			AIOMaxConcurrency: aioMax,
@@ -222,6 +224,28 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				"method", rt.AIO.Method(),
 				"workers", aioWorkers,
 				"max_concurrency", aioMax)
+		}
+		// WAL direct-I/O startup line: surfaces whether the
+		// operator's `wal_direct_io=on` request actually took
+		// effect or fell back to buffered. Three cases:
+		//   - requested=false           → no log line (silent default)
+		//   - requested=true, ok=true   → event=wal_direct_io_active
+		//   - requested=true, ok=false  → event=wal_direct_io_fallback
+		// Mirrors the M0009 `event=aio_engine_attached` /
+		// `event=aio_method_fallback` shape so operators grep one
+		// vocabulary across both subsystems. See
+		// docs/design/0010-0001-wal-direct-io-write-path.md.
+		if rt.WAL != nil && rt.WAL.DirectIORequested() {
+			if reason := rt.WAL.DirectIOFallbackReason(); reason != "" {
+				logger.Warn("wal direct io fallback",
+					"event", "wal_direct_io_fallback",
+					"requested", true,
+					"reason", reason)
+			} else {
+				logger.Info("wal direct io active",
+					"event", "wal_direct_io_active",
+					"requested", true)
+			}
 		}
 		defer func() {
 			// Persist the catalog before tearing down the pool.

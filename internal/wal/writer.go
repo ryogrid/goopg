@@ -49,6 +49,31 @@ type Config struct {
 	// interface to avoid the wal → aio import (the engine pulls
 	// in a heavier dependency graph that wal can't take on).
 	AIO AIOEngine
+
+	// DirectIO requests Linux O_DIRECT writes for WAL segment
+	// pwrite/pwritev calls so newly-written WAL bytes don't
+	// pollute the OS page cache (mitigates the cache-pressure
+	// pathology M0010 documents on write-heavy primaries).
+	// Mirrors upstream's `wal_direct_io` GUC. The writer
+	// probes the WALDir filesystem for O_DIRECT support at
+	// construction time; on filesystems / kernels that don't
+	// honour the flag (tmpfs, overlayfs, FUSE, every
+	// non-Linux GOOS) it transparently downgrades to buffered
+	// writes and surfaces the reason via
+	// `Writer.DirectIOFallbackReason()`. Default false keeps
+	// the legacy buffered behaviour. See
+	// docs/design/0010-0001-wal-direct-io-write-path.md.
+	//
+	// Phase 1 (M0010-0001a, landed): the probe + fallback
+	// reporting + plumbing surface this field flips. The
+	// segment-open flag flip + per-write alignment path
+	// (RMW for partial trailing blocks) lands in M0010-0001b.
+	// Setting DirectIO=true today is a no-op at the syscall
+	// layer beyond the probe; the GUC value flows through the
+	// startup log so an operator can verify the rollout
+	// without surprising correctness regressions while Phase
+	// 2 is in flight.
+	DirectIO bool
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -150,6 +175,16 @@ type Writer struct {
 	// re-poll.
 	subMu       sync.Mutex
 	subscribers map[chan<- struct{}]struct{}
+
+	// directIORequested mirrors Config.DirectIO; cached on the
+	// Writer so cmd/goopg start can read it without reaching
+	// into state. directIOFallbackReason captures the probe
+	// outcome — empty when (a) DirectIO=false, or (b)
+	// DirectIO=true and the probe succeeded; non-empty when
+	// the probe rejected O_DIRECT. See
+	// docs/design/0010-0001-wal-direct-io-write-path.md.
+	directIORequested      bool
+	directIOFallbackReason string
 }
 
 type state struct {
@@ -176,6 +211,20 @@ type state struct {
 	// writes through the engine. nil → direct f.WriteAt path
 	// (legacy / no-engine deployments).
 	aio AIOEngine
+
+	// directIORequested mirrors Config.DirectIO. Phase 2
+	// (M0010-0001b) consults this when opening segments to
+	// decide whether to OR in O_DIRECT.
+	directIORequested bool
+
+	// directIOFallbackReason is non-empty when Config.DirectIO
+	// was true but the filesystem probe rejected O_DIRECT
+	// (tmpfs / overlayfs / non-Linux). The cmd/goopg start
+	// logger surfaces it as `event=wal_direct_io_fallback` so
+	// an operator can grep for the misconfiguration. Empty
+	// when (a) DirectIO=false, or (b) DirectIO=true and the
+	// probe succeeded.
+	directIOFallbackReason string
 }
 
 // NewWriter creates a segmented WAL writer rooted at cfg.WALDir.
@@ -191,14 +240,36 @@ func NewWriter(cfg Config) (*Writer, error) {
 	}
 
 	w := &Writer{
-		ops:  make(chan op),
-		done: make(chan struct{}),
+		ops:                    make(chan op),
+		done:                   make(chan struct{}),
+		directIORequested:      st.directIORequested,
+		directIOFallbackReason: st.directIOFallbackReason,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
 	st.onAppend = w.notifyAppend
 	go st.loop(w.ops, w.done)
 	return w, nil
+}
+
+// DirectIOFallbackReason reports the human-readable reason the
+// O_DIRECT probe rejected `wal_direct_io=on`, or the empty string
+// when (a) the operator did not request direct I/O, or (b) the
+// probe succeeded. cmd/goopg start consults this and emits
+// `event=wal_direct_io_fallback` at startup when it's non-empty.
+// Returned value is stable for the lifetime of the Writer (the
+// probe only runs once at construction).
+func (w *Writer) DirectIOFallbackReason() string {
+	return w.directIOFallbackReason
+}
+
+// DirectIORequested reports whether the operator asked for direct
+// I/O via `wal_direct_io=on`. Independent of whether the probe
+// succeeded — combine with DirectIOFallbackReason to determine the
+// effective mode (requested && !fallback → direct I/O active in
+// Phase 2; otherwise buffered).
+func (w *Writer) DirectIORequested() bool {
+	return w.directIORequested
 }
 
 // WrittenLSN returns the LSN of the last byte the writer has
@@ -333,14 +404,33 @@ func loadState(cfg Config) (*state, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Direct-I/O probe: only runs when the operator actually
+	// requested it via `wal_direct_io=on`. Probe cost is one
+	// open + close + unlink; cheap enough to do unconditionally
+	// at startup. Failure modes:
+	//   - empty reason  → probe succeeded; Phase 2 may flip
+	//     O_DIRECT on segment opens.
+	//   - non-empty     → fallback to buffered writes; the
+	//     startup logger surfaces the reason.
+	//   - error return  → unexpected failure (permission denied,
+	//     mkdir race); fail fast so misconfiguration is loud.
+	var fallback string
+	if cfg.DirectIO {
+		fallback, err = probeDirectIO(cfg.WALDir)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &state{
-		cfg:        cfg,
-		writePos:   writePos,
-		writeLSN:   uint64(writePos),
-		flushedLSN: uint64(writePos),
-		files:      make(map[uint64]*os.File),
-		dirty:      make(map[uint64]bool),
-		aio:        cfg.AIO,
+		cfg:                    cfg,
+		writePos:               writePos,
+		writeLSN:               uint64(writePos),
+		flushedLSN:             uint64(writePos),
+		files:                  make(map[uint64]*os.File),
+		dirty:                  make(map[uint64]bool),
+		aio:                    cfg.AIO,
+		directIORequested:      cfg.DirectIO,
+		directIOFallbackReason: fallback,
 	}, nil
 }
 

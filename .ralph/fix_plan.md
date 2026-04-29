@@ -1515,27 +1515,59 @@ for the full DoD. Decomposed into the three design-doc seams the
 milestone calls out (`0010-0001`, `0010-0002`, `0010-0003`); pick the
 topmost unchecked item.
 
-- [ ] WAL direct-I/O write path (Linux, primary writer +
-      walreceiver). Open WAL segments with `O_DIRECT` when a
-      new `wal_direct_io` GUC (`ContextPostmaster`, default
-      `off`) is enabled; alignment-safe writes for body and
-      tail (`O_DIRECT` requires buffer/length/offset aligned
-      to the underlying block size — typically 4 KiB on
-      modern filesystems, but probe via `statx`/`BLKSSZGET`
-      rather than hard-coding). Tail writes that aren't
-      block-aligned use a read-modify-write of the trailing
-      page (legal because we own the segment exclusively) or
-      stage through a buffered fallback file descriptor that
-      `fdatasync`s into place — design doc must pick one and
-      explain the choice. Preserve M0007's commit-path
-      durability (commit succeeds only after the chosen sync
-      barrier returns) and M0007/M0007-0002's directory
-      `fsync` semantics. On filesystems / kernels where
-      `O_DIRECT` returns EINVAL at open, downgrade to
-      buffered with a `event=wal_direct_io_fallback` warn-
-      level log line. Same path lights up walreceiver's
-      WAL-persist write loop on the standby. Design doc
-      `docs/design/0010-0001-wal-direct-io-write-path.md`.
+- [x] WAL direct-I/O write path — Phase 1 (GUC, probe,
+      plumbing, fallback observability). New `wal_direct_io`
+      GUC (TypeBool, default `off`, ContextPostmaster).
+      `wal.Config.DirectIO` field; `loadState` runs
+      `probeDirectIO(walDir)` once at construction when
+      DirectIO=true. Probe opens `<walDir>/.wal_direct_io_probe`
+      with `O_RDWR|O_CREAT|O_DIRECT`, observes EINVAL /
+      EOPNOTSUPP and returns a human-readable fallback
+      reason (or empty on success). Linux-only
+      `internal/wal/direct_io_linux.go`; non-Linux stub in
+      `internal/wal/direct_io_other.go` always falls back
+      (mirrors the M0009 io_uring stub). Phase 1 does NOT
+      flip O_DIRECT on segment opens — that's Phase 2. The
+      probe outcome is plumbed end-to-end:
+      `Writer.DirectIORequested()` /
+      `Writer.DirectIOFallbackReason()`, `cmd/goopg start`
+      reads the GUC into `OpenOptions.WALDirectIO` and emits
+      `event=wal_direct_io_active` (probe ok) or
+      `event=wal_direct_io_fallback reason=...` (probe
+      rejected) — mirrors the M0009 `event=aio_*` shape so
+      operators grep one vocabulary across both subsystems.
+      Tests: TestDirectIODisabledByDefault (probe skipped
+      when GUC off), TestDirectIOEnabledProbesFilesystem
+      (probe runs + outcome plumbed correctly per GOOS),
+      TestDirectIOFallbackReasonStable (idempotent reads).
+      Design doc
+      `docs/design/0010-0001-wal-direct-io-write-path.md`
+      indexed; spans both phases with Phase 2 explicitly
+      marked deferred. (landed 2026-04-29.)
+
+- [ ] WAL direct-I/O write path — Phase 2 (M0010-0001b):
+      flip O_DIRECT on segment opens, alignment-safe per-
+      write read-modify-write for partial trailing blocks,
+      aligned scratch via `unix.Mmap(MAP_PRIVATE|
+      MAP_ANONYMOUS)` (mirrors `internal/storage/arena.go`),
+      block-size detection via `unix.Statx(STATX_DIOALIGN)`
+      with 4 KiB fallback for kernels < 6.1, AIO submit-path
+      alignment (engine-side scratch copy so heap/index
+      O_DIRECT writes don't pay a redundant copy). Phase 2
+      gates on `state.directIORequested &&
+      state.directIOFallbackReason == ""`. Walreceiver's
+      WAL-persist path inherits via the shared writer fd
+      (`wal.Writer.Append` → `state.writeAt` → the same
+      O_DIRECT-aware code path). Tests must cover round-trip
+      on ext4 with the probe honoured, probe-failure path
+      identical to Phase 1 buffered behaviour, RMW
+      correctness for arbitrary chunk lengths / offsets,
+      crash-restart with `wal_init_zero=on` (the M0007-0001
+      EOS sentinel rule must still terminate recovery
+      cleanly when the trailing block is RMW'd back
+      unchanged). Same design doc
+      `docs/design/0010-0001-wal-direct-io-write-path.md`
+      (Phase 2 section already drafted in the doc).
 
 - [ ] Walsender in-memory WAL handoff. Bounded ring of
       recent WAL bytes maintained by the WAL writer (sized
