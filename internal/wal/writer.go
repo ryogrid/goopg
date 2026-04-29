@@ -38,7 +38,57 @@ type Config struct {
 	// the legacy "grow lazily" behaviour for callers that haven't
 	// migrated. See docs/design/0007-0001-wal-segment-preallocation.md.
 	Preallocate bool
+
+	// AIO is the optional AIO engine seam. When set,
+	// state.writeAt submits per-segment writes through it so
+	// pg_stat_aio / pg_aios show WAL writes alongside heap
+	// writes. nil falls back to direct f.WriteAt — preserving
+	// pre-AIO behaviour. The commit-path durability barrier
+	// (`flushUpTo` → `dataSync`) remains a synchronous
+	// fdatasync regardless of this field. Defined as a narrow
+	// interface to avoid the wal → aio import (the engine pulls
+	// in a heavier dependency graph that wal can't take on).
+	AIO AIOEngine
 }
+
+// AIOEngine is the wal-side seam onto an AIO engine. Mirrors
+// storage.AIOEngine; the adapter in initdb.Open wraps the same
+// underlying *aio.Engine so reads, heap writes, and WAL writes
+// all flow through one pool.
+type AIOEngine interface {
+	Submit(op AIOSubmitOp) AIOHandle
+}
+
+// AIOSubmitOp is the wal-side op shape — read/write directional
+// against an AIOFile + offset. Buffer is the source for writes
+// (and the destination for reads, though wal currently only
+// submits writes).
+type AIOSubmitOp struct {
+	File      AIOFile
+	Buffer    []byte
+	Offset    int64
+	Direction AIODirection
+}
+
+// AIOFile mirrors storage.AIOFile: a pread/pwrite-shaped
+// handle. The wal writer passes its underlying *os.File through.
+type AIOFile interface {
+	ReadAt(p []byte, off int64) (int, error)
+	WriteAt(p []byte, off int64) (int, error)
+}
+
+// AIOHandle mirrors storage.AIOHandle.
+type AIOHandle interface {
+	Wait() (n int, err error)
+}
+
+// AIODirection mirrors aio.Direction without taking the import.
+type AIODirection int
+
+const (
+	AIODirRead AIODirection = iota
+	AIODirWrite
+)
 
 func (c *Config) withDefaults() {
 	if c.WALDir == "" {
@@ -117,6 +167,11 @@ type state struct {
 
 	files map[uint64]*os.File
 	dirty map[uint64]bool
+
+	// aio mirrors Config.AIO so writeAt can submit per-segment
+	// writes through the engine. nil → direct f.WriteAt path
+	// (legacy / no-engine deployments).
+	aio AIOEngine
 }
 
 // NewWriter creates a segmented WAL writer rooted at cfg.WALDir.
@@ -281,6 +336,7 @@ func loadState(cfg Config) (*state, error) {
 		flushedLSN: uint64(writePos),
 		files:      make(map[uint64]*os.File),
 		dirty:      make(map[uint64]bool),
+		aio:        cfg.AIO,
 	}, nil
 }
 
@@ -536,7 +592,27 @@ func (s *state) writeAt(pos int64, buf []byte) error {
 			return err
 		}
 
-		n, err := f.WriteAt(buf[:chunk], segOff)
+		// Per-segment write. With an AIO engine attached the
+		// pwrite goes through Engine.Submit + Wait — observable
+		// in pg_aios / pg_stat_aio alongside heap writes. With
+		// no engine attached, fall back to the direct
+		// f.WriteAt path (pre-AIO behaviour). Either way, the
+		// wal writer's loop is single-threaded so the Wait is
+		// inline; deferring Wait across multiple appends
+		// requires restructuring the writer loop and is a
+		// future slice.
+		var n int
+		if s.aio != nil {
+			h := s.aio.Submit(AIOSubmitOp{
+				File:      f,
+				Buffer:    buf[:chunk],
+				Offset:    segOff,
+				Direction: AIODirWrite,
+			})
+			n, err = h.Wait()
+		} else {
+			n, err = f.WriteAt(buf[:chunk], segOff)
+		}
 		if err != nil {
 			return fmt.Errorf("wal: write %s at %d: %w", f.Name(), segOff, err)
 		}

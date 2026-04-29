@@ -127,26 +127,52 @@ per-slot serial behaviour because eviction is on the
 single-slot critical path, not a batchable
 sweep.
 
-### WAL writer per-segment writeback (deferred to follow-up)
+### WAL writer per-segment writeback (landed)
 
-`internal/wal/writer.go::state.writeAt` performs `f.WriteAt`
-on the underlying segment file for every WAL append. The
-commit-path durability barrier (`fdatasync` on Linux per
-M0007) remains a synchronous, serialising syscall — AIO is
-strictly for the *writeback bandwidth*, not for moving the
-durability barrier.
+`internal/wal/writer.go` exposes a `Config.AIO` seam plus
+narrow `wal.AIOEngine` / `AIOSubmitOp` / `AIOFile` /
+`AIOHandle` / `AIODirection` interfaces (parallel to the
+storage-side shapes so `internal/wal` stays free of an
+`internal/aio` import).
 
-The interaction with M0007 preallocation is explicit: a
-segment that has been preallocated and `fsync`-ed once is a
-valid AIO write target; a segment that has not yet been
-preallocated is not. The writer must not race AIO submission
-against preallocation.
+`state.aio` mirrors `Config.AIO`. `state.writeAt`:
 
-The substrate is in place via `Manager.WriteBlockAIO` and
-`AIOSubmitOp.Direction`; the per-segment writeback path is
-the same `WriteAt` shape the heap path uses. The WAL
-writer's hot path doesn't yet flow through the engine —
-that's the next slice.
+- **Engine attached** — wraps the segment chunk in
+  `AIOSubmitOp{File: f, Buffer: chunk, Offset: segOff,
+  Direction: AIODirWrite}`, calls `engine.Submit`, and
+  Waits inline. WAL writes appear in `pg_aios` /
+  `pg_stat_aio` alongside heap writes — reads, heap writes,
+  and WAL writes all flow through one engine.
+- **No engine** — falls back to direct `f.WriteAt` (legacy
+  / pre-AIO behaviour).
+
+The commit-path durability barrier is unchanged: the WAL
+writer's loop is single-threaded, every `Submit` Waits
+inline before returning, and by the time `flushUpTo` calls
+`dataSync`/fdatasync every byte ≤ the requested LSN has
+already been pwrite'd. Order-significant fdatasync remains
+synchronous and serialising.
+
+The interaction with M0007 preallocation is unchanged from
+the legacy path: `openSegment` does the
+preallocate-zero-fill + fsync before `state.writeAt` ever
+sees the segment, so AIO submission can never race
+preallocation.
+
+`initdb.Open` builds a `walAIOEngineAdapter` (parallel to
+the storage `aioEngineAdapter` — same shape, separate type
+so each package keeps its own narrow interface) and threads
+it through `wal.Config.AIO` when an engine is attached.
+
+What's deferred: **perf-pipelining.** The WAL writer's
+loop is single-threaded so inline Wait gives no
+parallelism — Append `n+1` still waits on Append `n`'s
+pwrite. Restructuring the loop to defer Wait across
+multiple Appends (so commit `n+1` doesn't pay for commit
+`n`'s pwrite latency) is a follow-up that requires
+changing the loop's serialisation model. The observability
++ symmetry win is in place; the perf win waits on the
+loop redesign.
 
 ## Verification
 
@@ -200,10 +226,10 @@ flush-then-Invalidate setup keeps round-tripping bytes.
 
 ## What this slice doesn't deliver
 
-- **WAL writer integration.** The substrate is shared, the
-  per-segment writeback path is the same `WriteAt` shape,
-  but the writer's hot path doesn't yet flow through the
-  engine. Follow-up.
+- **WAL writer perf-pipelining.** The writer flows
+  through the engine but Waits inline (single-threaded
+  loop). Real pipelining requires loop redesign — see the
+  WAL writer section above.
 - **Async fsync / fdatasync.** Out of scope. Durability
   barriers stay synchronous and serialising.
 - **Eviction-path AIO writes.** `Pool.flushSlot` (called

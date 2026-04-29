@@ -3169,12 +3169,44 @@ See `docs/milestones/0009-aio-subsystem.md`.
       step still round-trips bytes. Built and full
       `go test ./...` green.)
 
-- [ ] AIO WAL writer caller integration — wal.state.writeAt
+- [x] AIO WAL writer caller integration — wal.state.writeAt
       shaped to flow per-segment writeback through the
-      engine while the commit-path `fdatasync` barrier
-      remains synchronous. Substrate (Manager.WriteBlockAIO
-      + AIOSubmitOp.Direction) already in place; this is
-      the WAL-side hot-path wiring + perf-validation work.
+      engine. (landed 2026-04-29: `wal.Config.AIO` adds an
+      optional engine seam; matching `wal.AIOEngine` /
+      `AIOSubmitOp` / `AIOFile` / `AIOHandle` /
+      `AIODirection` interfaces mirror the storage-side
+      shapes so internal/wal stays import-free of
+      internal/aio. `state.aio` mirrors `Config.AIO`;
+      `state.writeAt` Submit→Wait through the engine when
+      set, falls back to direct `f.WriteAt` when nil.
+      Commit-path durability barrier is unchanged: every
+      Submit Waits inline (single-threaded writer loop),
+      so by the time `flushUpTo` calls `dataSync`/fdatasync
+      every byte ≤ the requested LSN has already been
+      pwrite'd. WAL writes now appear in `pg_aios` /
+      `pg_stat_aio` alongside heap writes — engine, reads,
+      heap writes, and WAL writes all flow through one
+      pool. `initdb.Open` builds a `walAIOEngineAdapter`
+      (parallel to the storage adapter, keeping each
+      package free of internal/aio) and threads it through
+      `wal.Config.AIO` when an engine is attached. Tests:
+      TestWriterAppendNoAIOPreservesLegacyPath (no engine
+      → bytes land on disk via direct `f.WriteAt`),
+      TestWriterAppendAIOFlowsThroughEngine (engine
+      attached → every writeAt-chunk flows through Submit
+      with Direction=AIODirWrite; bytes still round-trip
+      via the segment file). Built and full
+      `go test ./...` green.
+
+      What's deferred: real perf benefit. The WAL writer's
+      single-threaded loop means inline Wait gives no
+      pipelining — Append n still blocks on Append n's
+      pwrite. Restructuring the writer to defer Wait
+      across multiple Appends (so commit n+1 doesn't wait
+      on commit n's pwrite) is a follow-up that requires
+      changing the loop's serialisation model. The
+      observability + symmetry win is meaningful; the
+      perf win waits on the loop redesign.)
 
 - [x] AIO observability — aggregate counters + startup
       log line (first slice). (landed 2026-04-29:

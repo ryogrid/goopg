@@ -151,10 +151,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}
 
-	walWriter, err := wal.NewWriter(wal.Config{
+	walCfg := wal.Config{
 		WALDir:      filepath.Join(abs, "pg_wal"),
 		Preallocate: opts.WALInitZero,
-	})
+	}
+	if aioEngine != nil {
+		walCfg.AIO = walAIOEngineAdapter{eng: aioEngine}
+	}
+	walWriter, err := wal.NewWriter(walCfg)
 	if err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: wal: %w", err)
@@ -479,6 +483,51 @@ type aioHandleAdapter struct {
 }
 
 func (a aioHandleAdapter) Wait() (int, error) {
+	r := a.h.Wait()
+	return r.N, r.Err
+}
+
+// walAIOEngineAdapter bridges *aio.Engine to wal.AIOEngine.
+// Same shape as aioEngineAdapter (storage-side) — kept as a
+// separate type so the `internal/wal` package can stay free of
+// the `internal/aio` import. Both adapters delegate to the same
+// underlying *aio.Engine so reads, heap writes, and WAL writes
+// flow through one pool.
+type walAIOEngineAdapter struct {
+	eng *aio.Engine
+}
+
+func (a walAIOEngineAdapter) Submit(op wal.AIOSubmitOp) wal.AIOHandle {
+	dir := aio.DirRead
+	if op.Direction == wal.AIODirWrite {
+		dir = aio.DirWrite
+	}
+	return walAIOHandleAdapter{
+		h: a.eng.Submit(aio.Op{
+			File:      walAIOFileAdapter{f: op.File},
+			Buffer:    op.Buffer,
+			Offset:    op.Offset,
+			Direction: dir,
+		}),
+	}
+}
+
+type walAIOFileAdapter struct {
+	f wal.AIOFile
+}
+
+func (a walAIOFileAdapter) ReadAt(p []byte, off int64) (int, error) {
+	return a.f.ReadAt(p, off)
+}
+func (a walAIOFileAdapter) WriteAt(p []byte, off int64) (int, error) {
+	return a.f.WriteAt(p, off)
+}
+
+type walAIOHandleAdapter struct {
+	h *aio.Handle
+}
+
+func (a walAIOHandleAdapter) Wait() (int, error) {
 	r := a.h.Wait()
 	return r.N, r.Err
 }
