@@ -1626,24 +1626,44 @@ topmost unchecked item.
       `pg_stat_replication.send_buffer_*` counter surface
       remains follow-up under M0010-0003.)
 
-- [ ] WAL direct-I/O observability + operations. New
-      counters in `pg_stat_wal` (or a sibling
-      `pg_stat_wal_io`): `direct_writes`,
-      `direct_fallbacks`, `tail_rmw_writes`. New view /
-      counters for the in-memory handoff:
-      `pg_stat_replication.send_buffer_hits`,
-      `send_buffer_misses`, `send_buffer_bytes_resident`.
-      Startup log line: `event=wal_direct_io method=direct
-      block_size=4096 fallback_reason=...` (mirrors the
-      shape M0009's `event=aio_engine_attached` /
-      `event=aio_method_fallback` already established).
-      Operator-doc bullet under `docs/design/` covering
-      "when to enable" (write-heavy primary, page-cache
-      pressure visible in `vmstat si/so`) and "when not to"
-      (single-sender low-throughput setup where the buffered
-      path is fine, or filesystems that don't honour
-      `O_DIRECT`). Design doc
-      `docs/design/0010-0003-wal-direct-io-observability-and-operations.md`.
+- [x] WAL direct-I/O observability + operations. (landed
+      2026-04-29: new `pg_catalog.pg_stat_wal_io` virtual
+      view (`internal/initdb/wal_io_views.go`): one row per
+      attached WAL writer, eight columns —
+      `direct_io_active` (t/f when DirectIO requested AND
+      probe succeeded), `direct_io_fallback_reason`,
+      `direct_writes` (lifetime `writeAtDirectIO` regions
+      via O_DIRECT pwrite), `tail_rmw_writes` (subset where
+      the user range wasn't block-aligned),
+      `send_buffer_capacity_bytes`,
+      `send_buffer_bytes_resident`, `send_buffer_hits`,
+      `send_buffer_misses`. Counter wiring: new
+      `directIOCounters` struct (atomic `directWrites` /
+      `tailRMWWrites`) shared between Writer and state via
+      pointer; `state.writeAtDirectIO` bumps both per-
+      region (RMW counter only when `userStart!=regionStart
+      || userEnd!=regionEnd`). New `Writer.DirectIOWrites()`
+      / `Writer.TailRMWWrites()` accessors. New
+      `MemRing.BytesResident()` for the resident column.
+      `pg_stat_replication` extended with the same trio
+      (cluster-wide values on every per-sender row) so
+      operators see ring health alongside per-sender lag in
+      one query — `registerStatReplicationView` gains a
+      `*wal.Writer` parameter, plumbed through `Open`. The
+      M0009-0006 / M0010-0001 startup log lines already
+      established the `event=...` vocabulary; this slice
+      adds the SQL surface that mirrors them. Tests:
+      TestStatWALIOEmptyWithoutWriter (nil writer → 0 rows
+      — pins the "view exists, just empty" contract),
+      TestStatWALIORendersWriterCounters (capacity matches
+      GUC; bytes_resident moves with appends; column shape
+      stable), TestStatWALIOActiveWhenProbeOk (probe ok →
+      active=t; 3-byte Append bumps direct_writes AND
+      tail_rmw_writes; `t.Skip` on probe fallback). Built
+      and full `go test ./...` green. Operator playbook
+      ("when to enable", "when not to", "how to size the
+      ring") in the design doc
+      `docs/design/0010-0003-wal-direct-io-observability-and-operations.md`.)
 
 ## Notes
 

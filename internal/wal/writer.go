@@ -205,6 +205,12 @@ type Writer struct {
 	// Config.SenderMemoryBuffer == 0. See
 	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
 	memRing *MemRing
+
+	// directIOCounters shares atomics with state for the
+	// pg_stat_wal_io view. Allocated once at construction; never
+	// reseated. Read by Writer.DirectIOWrites() /
+	// Writer.TailRMWWrites().
+	directIOCounters *directIOCounters
 }
 
 type state struct {
@@ -276,6 +282,22 @@ type state struct {
 	// Config.SenderMemoryBuffer == 0; iterators always go to
 	// disk in that case.
 	memRing *MemRing
+
+	// directIOCounters mirrors the Writer.directIOCounters
+	// pointer so the writeAtDirectIO hot path can bump the
+	// observability counters without indirecting through
+	// Writer (state is the layer that owns the actual writes).
+	// Pointer-shared with Writer so both ends see the same
+	// atomics. Read by the pg_stat_wal_io virtual view.
+	directIOCounters *directIOCounters
+}
+
+// directIOCounters holds the atomic counters wal-direct-I/O
+// accumulates for the pg_stat_wal_io view. Single allocation
+// shared between Writer and state.
+type directIOCounters struct {
+	directWrites  atomic.Uint64 // every writeAtDirectIO region
+	tailRMWWrites atomic.Uint64 // subset where the user range wasn't block-aligned
 }
 
 // directIOScratchCap caps the per-call RMW scratch buffer at
@@ -298,12 +320,15 @@ func NewWriter(cfg Config) (*Writer, error) {
 		return nil, err
 	}
 
+	counters := &directIOCounters{}
+	st.directIOCounters = counters
 	w := &Writer{
 		ops:                    make(chan op),
 		done:                   make(chan struct{}),
 		directIORequested:      st.directIORequested,
 		directIOFallbackReason: st.directIOFallbackReason,
 		memRing:                st.memRing,
+		directIOCounters:       counters,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
@@ -339,6 +364,29 @@ func (w *Writer) DirectIORequested() bool {
 // returned pointer is stable for the writer's lifetime; callers
 // must not mutate the ring's internal state.
 func (w *Writer) MemRing() *MemRing { return w.memRing }
+
+// DirectIOWrites returns the lifetime count of writeAtDirectIO
+// regions written successfully — observable via the
+// pg_stat_wal_io view's `direct_writes` column. Always 0 when
+// `wal_direct_io=off` or the probe fell back. Atomic load.
+func (w *Writer) DirectIOWrites() uint64 {
+	if w.directIOCounters == nil {
+		return 0
+	}
+	return w.directIOCounters.directWrites.Load()
+}
+
+// TailRMWWrites returns the subset of DirectIOWrites where the
+// user range wasn't already block-aligned and the writer paid
+// for a real read-modify-write (head pad and/or tail pad).
+// Operators watch this to gauge alignment-induced overhead;
+// when it equals DirectIOWrites every direct-I/O write is RMW.
+func (w *Writer) TailRMWWrites() uint64 {
+	if w.directIOCounters == nil {
+		return 0
+	}
+	return w.directIOCounters.tailRMWWrites.Load()
+}
 
 // WrittenLSN returns the LSN of the last byte the writer has
 // appended (durable or not). Cheap and lock-free; suitable for
@@ -902,6 +950,18 @@ func (s *state) writeAtDirectIO(f *os.File, segOff int64, buf []byte) (int, erro
 		if wn != regionLen {
 			return written, fmt.Errorf("wal: DIO RMW short write to %s: %d of %d",
 				f.Name(), wn, regionLen)
+		}
+
+		// M0010-0003 observability: bump direct-write counter
+		// always; bump RMW counter only when the user range
+		// wasn't already block-aligned (head pad OR tail pad
+		// non-empty), which is when we paid for the read+overlay
+		// dance rather than a clean aligned write.
+		if c := s.directIOCounters; c != nil {
+			c.directWrites.Add(1)
+			if userStart != regionStart || userEnd != regionEnd {
+				c.tailRMWWrites.Add(1)
+			}
 		}
 
 		written = int(userEnd - segOff)

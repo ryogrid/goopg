@@ -15,7 +15,7 @@ import (
 func TestStatReplicationRendersRegisteredSenders(t *testing.T) {
 	cat := catalog.NewInMemory()
 	senders := wal.NewSenders()
-	if err := registerStatReplicationView(cat, senders); err != nil {
+	if err := registerStatReplicationView(cat, senders, nil); err != nil {
 		t.Fatal(err)
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_replication"})

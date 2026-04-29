@@ -23,8 +23,15 @@ import (
 )
 
 // registerStatReplicationView installs `pg_catalog.pg_stat_replication`
-// backed by the process-wide *wal.Senders registry.
-func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders) error {
+// backed by the process-wide *wal.Senders registry. The optional
+// writer pointer surfaces M0010-0002's in-memory ring counters
+// (`send_buffer_hits` / `send_buffer_misses` /
+// `send_buffer_bytes_resident`) — these are cluster-wide rather
+// than per-sender, so every row reports the same value. The
+// counters live alongside the per-sender LSN fields here so an
+// operator's `\watch pg_stat_replication` shows ring health in
+// the same query.
+func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, writer *wal.Writer) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_replication",
@@ -50,6 +57,14 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders) er
 			{Name: "sync_state", Type: catalog.Type{Name: "text"}},
 			{Name: "reply_time", Type: catalog.Type{Name: "text"}},
 			{Name: "slot_name", Type: catalog.Type{Name: "text"}},
+			// M0010-0002 / M0010-0003: cluster-wide ring counters.
+			// Per-sender breakdown isn't useful — every sender
+			// reads from the same ring — so the same values
+			// appear on every row for consistency with the
+			// upstream-aligned per-row shape.
+			{Name: "send_buffer_hits", Type: catalog.Type{Name: "text"}},
+			{Name: "send_buffer_misses", Type: catalog.Type{Name: "text"}},
+			{Name: "send_buffer_bytes_resident", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -57,31 +72,46 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders) er
 		if senders == nil {
 			return nil
 		}
+		var hits, misses uint64
+		var resident int64
+		if writer != nil {
+			if ring := writer.MemRing(); ring != nil {
+				hits = ring.Hits()
+				misses = ring.Misses()
+				resident = ring.BytesResident()
+			}
+		}
+		hitsStr := fmt.Sprintf("%d", hits)
+		missesStr := fmt.Sprintf("%d", misses)
+		residentStr := fmt.Sprintf("%d", resident)
 		snap := senders.Snapshot()
 		out := make([][]string, 0, len(snap))
 		for _, s := range snap {
 			out = append(out, []string{
 				fmt.Sprintf("%d", s.PID),
-				"",                 // usesysid: roles aren't oid-stable in v0
-				"",                 // usename
-				s.ApplicationName,  // application_name
-				s.ClientAddr,       // client_addr
-				"",                 // client_hostname
-				"",                 // client_port (carried inside ClientAddr in v0)
+				"",                // usesysid: roles aren't oid-stable in v0
+				"",                // usename
+				s.ApplicationName, // application_name
+				s.ClientAddr,      // client_addr
+				"",                // client_hostname
+				"",                // client_port (carried inside ClientAddr in v0)
 				formatTime(s.BackendStart),
-				"",                 // backend_xmin: hot-standby feedback not wired in v0
-				s.State,            // state
+				"",      // backend_xmin: hot-standby feedback not wired in v0
+				s.State, // state
 				formatLSN(s.SentLSN),
 				formatLSN(s.WriteLSN),
 				formatLSN(s.FlushLSN),
 				formatLSN(s.ReplayLSN),
-				"00:00:00",         // write_lag: lag intervals not wired in v0
-				"00:00:00",         // flush_lag
-				"00:00:00",         // replay_lag
-				"0",                // sync_priority: no synchronous replication in v0
-				"async",            // sync_state: hard-coded to async in v0
-				"",                 // reply_time: not tracked per-message in v0
-				s.SlotName,         // slot_name
+				"00:00:00", // write_lag: lag intervals not wired in v0
+				"00:00:00", // flush_lag
+				"00:00:00", // replay_lag
+				"0",        // sync_priority: no synchronous replication in v0
+				"async",    // sync_state: hard-coded to async in v0
+				"",         // reply_time: not tracked per-message in v0
+				s.SlotName, // slot_name
+				hitsStr,
+				missesStr,
+				residentStr,
 			})
 		}
 		return out

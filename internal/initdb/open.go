@@ -357,7 +357,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_stat_replication: one row per active walsender. Backed by
 	// the in-process Senders registry — walsender goroutines
 	// register themselves on entry and unregister on exit.
-	if err := registerStatReplicationView(cat, walSenders); err != nil {
+	if err := registerStatReplicationView(cat, walSenders, walWriter); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -417,6 +417,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_replication_slots: one row per persistent replication slot
 	// (physical or logical). Backed by the *wal.Slots registry.
 	if err := registerReplicationSlotsView(cat, slotsReg); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	// pg_stat_wal_io: M0010-0003 observability surface. One row
+	// when a WAL writer is attached; surfaces direct-I/O write
+	// counters and walsender in-memory ring metrics. See
+	// docs/design/0010-0003-wal-direct-io-observability-and-operations.md.
+	if err := registerStatWALIOView(cat, walWriter); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()

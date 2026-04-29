@@ -180,6 +180,20 @@ func (r *MemRing) Range() (head, tail int64) {
 	return r.head, r.tail
 }
 
+// BytesResident returns tail-head — the number of WAL bytes
+// currently in the ring (always ≤ Cap). Surfaced by the
+// pg_stat_wal_io view's `send_buffer_bytes_resident` column.
+// Snapshot under RLock so it's coherent against an in-flight
+// Append.
+func (r *MemRing) BytesResident() int64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.tail - r.head
+}
+
 // Hits returns the lifetime hit counter. M0010-0003's
 // `pg_stat_replication.send_buffer_hits` reads this.
 func (r *MemRing) Hits() uint64 {
