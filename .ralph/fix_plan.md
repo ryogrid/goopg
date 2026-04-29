@@ -2060,11 +2060,47 @@ item.
       catalog-xmin retention in vacuum/pruning are all
       deferred to subsequent loops in this milestone.)
 
-- [ ] Reorder buffer + decoder loop + snapshot builder skeleton:
-      classify WAL records, group into per-xact queues keyed by
-      XID, drain on commit, drop on abort. Snapshot built at slot
-      creation stays consistent for the slot's lifetime (full
-      `SnapBuild` deferred). Continues in
+- [x] Reorder buffer + decoder orchestration skeleton: per-xact
+      queueing, commit-time drain, abort-drop, plus the
+      `OutputPlugin` interface that pgoutput will implement.
+      Continues in
+      `docs/design/0008-0001-logical-decoding-pipeline.md`.
+      (landed 2026-04-29: `internal/wal/reorder.go` —
+      `ReorderBuffer{Append, Commit, Abort, Active,
+      OldestBeginLSN}` keyed by `storage.TransactionID`,
+      single-decoder / non-goroutine-safe by design (the decoder
+      loop is sequential; wrap in a mutex if it ever moves to a
+      goroutine pool). `Change{Kind, LSN, Rel, Block, LineSlot,
+      OldTuple, NewTuple}` covers Insert/Update/Delete; xid==0
+      Append is rejected to avoid conflating distinct xacts.
+      `internal/wal/decoder.go` — `OutputPlugin` interface
+      (`Begin(xid, commitLSN)` / `Change(c)` / `Commit(xid,
+      commitLSN)`) plus `Decoder.ApplyChange/ApplyCommit/
+      ApplyAbort`; `ApplyCommit` drives the plugin in
+      `Begin → Change* → Commit` order, unknown xids are no-ops
+      (handles catalog-only filter-everything xacts), and
+      `ErrNoPlugin` flags a commit-with-changes against a
+      decoder configured with no plugin. New tests pin the
+      contract: TestReorderBufferCommitDrainsInOrder,
+      TestReorderBufferAbortDropsChanges,
+      TestReorderBufferIsolatesXacts,
+      TestReorderBufferOldestBeginLSN,
+      TestReorderBufferRejectsInvalidXID,
+      TestDecoderApplyCommitDrivesPlugin,
+      TestDecoderAbortSkipsPlugin,
+      TestDecoderUnknownCommitIsNoop,
+      TestDecoderRequiresPlugin. WAL classifier remains
+      deferred — needs new `RecordKindXactCommit` /
+      `RecordKindXactAbort` markers + per-record xid plumbing
+      so the decoder can be driven from a `RecordIterator`. The
+      snapshot builder is also deferred.)
+
+- [ ] WAL classifier hookup: introduce `RecordKindXactCommit` /
+      `RecordKindXactAbort` records, plumb per-record xid through
+      the existing logical change records (`HeapInsert`,
+      `HeapDelete`, `HeapVacuum`, `BtreeInsert`), and wire a
+      classifier loop that drives `Decoder.Apply*` from a
+      `RecordIterator`. Continues in
       `docs/design/0008-0001-logical-decoding-pipeline.md`.
 
 - [ ] `pgoutput` output plugin: B / C / R / I / U / D message

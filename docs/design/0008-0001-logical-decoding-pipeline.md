@@ -143,37 +143,69 @@ schemas can change while a slot is active; it's tracked under
 field is persisted now so the surface is in place when the vacuum
 hook lands.
 
-### Pipeline architecture (future loops)
+### Pipeline architecture
 
-The remaining pipeline pieces below land in subsequent loops:
+The first M0008 / 0008-0001 loop landed the slot foundation + view
+described above. This second loop lands the reorder-buffer and
+decoder-orchestration layer in `internal/wal/reorder.go` and
+`internal/wal/decoder.go` — pure, sequential, in-process data
+structures that the future WAL classifier will drive.
 
-1. **Reorder buffer.** A per-transaction in-memory accumulator keyed
-   by `XID`. Each WAL record decoded into a change event is appended
-   to its xact's queue; commit fires the queue at the output plugin
-   in commit order; abort drops it.
+1. **Reorder buffer (`internal/wal/reorder.go`).** Per-transaction
+   in-memory accumulator keyed by `storage.TransactionID`.
+   - `Append(xid, Change)` queues `Change` under `xid` (first
+     append records the begin LSN).
+   - `Commit(xid)` returns the queued changes in append order and
+     drops the entry; the caller drives the output plugin with
+     the returned slice.
+   - `Abort(xid)` drops the entry without producing output.
+   - `Active() / OldestBeginLSN()` for observability and the
+     publisher's catalog-xmin tracker.
 
-2. **Snapshot builder.** Tracks committed transactions and produces
+   Single-process, single-decoder for v0 — no goroutine safety
+   because the decoder loop is sequential. xid==0 (the
+   `InvalidTransactionID` sentinel) is rejected at Append time.
+
+2. **Decoder orchestrator (`internal/wal/decoder.go`).** Sits
+   between the reorder buffer and the output plugin. Defines:
+   - `OutputPlugin` interface — `Begin(xid, commitLSN)` /
+     `Change(c Change)` / `Commit(xid, commitLSN)`. pgoutput will
+     be the first implementation (0008-0002).
+   - `Decoder.ApplyChange(xid, c)`, `ApplyCommit(xid, commitLSN)`,
+     `ApplyAbort(xid)` — the data-flow contract that the future
+     WAL classifier calls into.
+   - `ApplyCommit` drains the buffer through `Begin → Change* →
+     Commit` in append order. Unknown xids are no-ops (catalog-
+     only xacts that the classifier filtered every change for).
+     `ErrNoPlugin` when no plugin was provided and a commit-with-
+     changes happens.
+
+3. **Snapshot builder.** Tracks committed transactions and produces
    a `HISTORIC` snapshot for the decoder. The simplest correct v0
    shape is "snapshot built at slot creation time stays consistent
-   for the slot's lifetime" — schema changes during the slot's life
-   are out of scope for the first usable cut and explicitly
+   for the slot's lifetime" — schema changes during the slot's
+   life are out of scope for the first usable cut and explicitly
    surface as decoder errors. Upstream's full `SnapBuild` state
-   machine is the long-term target.
+   machine is the long-term target. Deferred to the next M0008
+   loop.
 
-3. **Decoder loop.** Reads WAL through a `RecordIterator` (already in
-   place from M0005), classifies each record (heap-insert /
-   heap-delete / heap-vacuum / btree-* / checkpoint / xact-commit /
-   xact-abort), routes data records into the reorder buffer keyed by
-   xact, and on a commit record drains the buffer through the output
-   plugin.
+4. **WAL classifier — explicitly deferred.** v0's existing WAL
+   record kinds (`HeapInsert`, `HeapDelete`, `HeapVacuum`,
+   `BtreeInsert`, `BtreeSplit`, `PageImage`, `Checkpoint`) carry
+   no commit/abort markers and no per-record xid. To drive the
+   reorder buffer from the live WAL stream we need:
+   - `RecordKindXactCommit` / `RecordKindXactAbort` records
+     emitted at xact end by the wire layer.
+   - Per-record xid plumbing (the heap tuple body already carries
+     xmin; the abort/commit markers need to carry xid).
 
-4. **Output plugin contract.** A small interface (`OutputPlugin`)
-   that the decoder calls per change event and per commit. v0 ships
-   one implementation: `pgoutput` (0008-0002).
+   These records are a wire-format change — the next M0008 loop
+   adds them and wires the classifier to drive `Decoder` from a
+   `RecordIterator`.
 
-These sub-pieces are explicitly **not** delivered in this loop —
-they're documented here so the slot/view foundation has the right
-shape from the start.
+5. **Output plugin contract.** Already shipped by this loop as
+   `wal.OutputPlugin`. v0's first implementation is `pgoutput`
+   (0008-0002).
 
 ### Out of scope for this milestone
 
@@ -194,21 +226,41 @@ duplicated here for design-doc completeness.)
 
 ## Verification
 
-This loop's slice (slot foundation + view) is verified by:
+Slot foundation + view (loop 1):
 
-- `internal/wal/slots_test.go` — `TestCreateLogicalSlot` pins that a
-  logical slot is created with the right `Kind` / `Plugin` /
-  `Database` / `CatalogXmin` and that `MinRestartLSN` includes it.
-- `internal/wal/slots_test.go` — `TestPhysicalSlotJSONUnchangedAcrossM0008`
-  pins the wire-format forward-compat: a physical slot persisted before
-  M0008 (no `plugin` / `database` / `catalog_xmin` keys) round-trips
-  cleanly into `Plugin == "" && Database == "" && CatalogXmin == 0`.
-- `internal/initdb/replication_views_test.go` —
-  `TestPgReplicationSlotsViewRendersBothKinds` pins that the view
-  renders one row per slot with the upstream-shaped column set.
+- `internal/wal/slots_test.go::TestCreateLogicalSlot` — logical slot
+  is created with the right `Kind` / `Plugin` / `Database` /
+  `CatalogXmin` and `MinRestartLSN` includes it.
+- `internal/wal/slots_test.go::TestPhysicalSlotJSONUnchangedAcrossM0008`
+  — pre-M0008 physical-slot files (no `plugin`/`database`/
+  `catalog_xmin` keys) round-trip cleanly.
+- `internal/initdb/replication_views_test.go::TestPgReplicationSlotsViewRendersBothKinds`
+  — view renders one row per slot with the upstream column shape.
 
-End-to-end pipeline verification (decoder, reorder buffer, apply) is
-covered by the M0008 DoD tests added in subsequent loops.
+Reorder buffer + decoder orchestration (loop 2):
+
+- `internal/wal/reorder_test.go::TestReorderBufferCommitDrainsInOrder`
+  — append-order is preserved through commit.
+- `…::TestReorderBufferAbortDropsChanges` — aborted xact's queued
+  changes never resurface.
+- `…::TestReorderBufferIsolatesXacts` — concurrent xact queues are
+  independent; committing one doesn't affect the other.
+- `…::TestReorderBufferOldestBeginLSN` — tracks the smallest
+  in-flight begin LSN for the catalog-xmin contract.
+- `…::TestReorderBufferRejectsInvalidXID` — `xid==0` defensive guard.
+- `…::TestDecoderApplyCommitDrivesPlugin` — pins the
+  `Begin → Change* → Commit` ordering through the plugin interface.
+- `…::TestDecoderAbortSkipsPlugin` — aborted xacts don't reach the
+  plugin.
+- `…::TestDecoderUnknownCommitIsNoop` — a commit on an unseen xid
+  is a no-op (handles catalog-only xacts where every change was
+  filtered).
+- `…::TestDecoderRequiresPlugin` — `ErrNoPlugin` when no plugin is
+  configured and a commit-with-changes arrives.
+
+End-to-end pipeline verification (WAL classifier, snapshot builder,
+pgoutput, apply worker) is covered by tests added in subsequent
+M0008 loops.
 
 ## Cross-references
 
