@@ -1771,11 +1771,41 @@ for the full DoD. Decomposed into the three design-doc seams the
 milestone calls out (`0012-0001`, `0012-0002`, `0012-0003`); pick
 the topmost unchecked item.
 
-- [ ] Lock manager v0 surface: relation-level lock tags +
-      mode-based compatibility matrix, `LockAcquire(tag, mode,
-      backendID)` / `LockRelease`, holder/waiter tracking
-      shaped for deadlock detection. Continues
+- [x] Lock manager v0 surface (M0012-0001). Design doc
       `docs/design/0012-0001-lock-manager-architecture.md`.
+      (landed 2026-04-29: new `internal/lockmgr` package with
+      eight upstream lock modes (`AccessShareLock` …
+      `AccessExclusiveLock`, numeric values matching
+      `lockdefs.h`), `conflictTab[1..8]` ported verbatim from
+      `postgres/src/backend/storage/lmgr/lock.c LockConflicts[]`,
+      relation-level `LockTag{DB, Rel}`, per-tag `lockState`
+      with `holders map[BackendID]Mask` + FIFO `waiters
+      []*Waiter` + cached `granted` Mask, lazy-alloc + GC
+      empties. `Acquire(ctx, b, t, m)` grants immediately
+      iff no conflict against `grantedExcept(b)` AND no
+      waiters queued (second check enforces strict
+      head-of-line FIFO); else parks on a buffered signal
+      chan; cancellation splices waiter under `lm.mu` and
+      handles the Release-promoted-during-cancel race.
+      `Release` runs FIFO wake-pass head-first.
+      `ReleaseAll(b)` is the txn-end hook. Single coarse
+      `sync.Mutex` (per-tag striping deferred). Self-conflict
+      impossible — `grantedExcept(b)` excludes requester's
+      own holdings. `ConflictsWith(m, held)` exported for
+      M0012-0002. Tests:
+      TestLockConflictMatrixMatchesUpstream (exhaustive 8-mode
+      cross-check), TestLockManagerNoConflictGrantsImmediately,
+      TestLockManagerCompatibleModesCoexist,
+      TestLockManagerConflictBlocksAndWakesOnRelease,
+      TestLockManagerSelfDoesNotConflict,
+      TestLockManagerIdempotentAcquire,
+      TestLockManagerWaiterCancellationCleansUp,
+      TestLockManagerReleaseAllWakesEveryone,
+      TestLockManagerFIFOFairness,
+      TestLockManagerGCEmptiesState. Race-clean
+      (`go test -race`). Full `go test ./...` green.
+      Deadlock detection (M0012-0002) and executor
+      integration (M0012-0003) build on this surface.)
 
 - [ ] Wait-for graph + deadlock detection: build wait-for
       edges from current waiter/holder state when a wait
