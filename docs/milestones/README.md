@@ -53,3 +53,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0016 | WITH clause and CTE support                                       | planned  | `0016-with-clause-cte-support.md` |
 | 0017 | UPSERT support (INSERT ... ON CONFLICT DO UPDATE)                 | planned  | `0017-upsert-on-conflict-do-update.md` |
 | 0018 | EXPLAIN / EXPLAIN ANALYZE support                                 | planned  | `0018-explain-and-explain-analyze.md` |
+| 0019 | Autovacuum support                                                 | planned  | `0019-autovacuum-support.md` |
