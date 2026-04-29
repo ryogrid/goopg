@@ -42,6 +42,15 @@ coverage.html
 # See .ralph/specs/GOAL_AND_REQUIREMENTS.md §2.
 /postgres/
 
+# HammerDB benchmark binaries / source — fetched on demand, not part of goopg.
+/HammerDB-5.0/
+/HammerDB-5.0-Prod-Lin-UBU22.tar.gz
+/HammerDB/
+
+# Ephemeral state created by bench/tpch scripts (PGDATA, sockets, HammerDB tmp).
+/bench/tpch/runtime/
+/bench/tpch/logs/
+
 # Local dev data directories
 /tmp-data/
 /var/
