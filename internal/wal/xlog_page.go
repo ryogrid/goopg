@@ -31,7 +31,7 @@ const XLOGBlockSize = 8192
 // Cross-reference: `XLOG_PAGE_MAGIC` in
 // postgres/src/include/access/xlog_internal.h for the relevant
 // release.
-const XLOGPageMagic uint16 = 0xD119
+const XLOGPageMagic uint16 = 0xD118
 
 // xlp_info flag bits (mirror postgres/src/include/access/xlog_internal.h).
 const (

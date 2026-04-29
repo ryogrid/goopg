@@ -521,6 +521,75 @@ func TestReplayFromDirEndToEnd(t *testing.T) {
 	}
 }
 
+func TestReplayFromDirEndToEndPageHeaders(t *testing.T) {
+	dataDir := t.TempDir()
+	walDir := filepath.Join(dataDir, "pg_wal")
+
+	w, err := NewWriter(Config{
+		WALDir:      walDir,
+		SegmentSize: 16 * 1024,
+		PageHeaders: true,
+		SystemID:    0x1111222233334444,
+		TimelineID:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 902, Fork: storage.MainFork}
+	pBefore := mustPageWithByte(t, 0x66)
+	pAfter := mustPageWithByte(t, 0x99)
+
+	beforePayload, err := EncodePageImage(rel, 0, pBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterPayload, err := EncodePageImage(rel, 0, pAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, end1, err := w.Append(beforePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, end2, err := w.Append(EncodeCheckpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, end3, err := w.Append(afterPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(end3); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if end2 <= end1 {
+		t.Fatalf("checkpoint end lsn ordering invalid: end1=%d end2=%d", end1, end2)
+	}
+
+	stats, err := ReplayFromDir(dataDir, 16*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Records != 3 || stats.Applied != 1 || stats.CheckpointLSN != end2 {
+		t.Fatalf("unexpected stats: %+v (want records=3 applied=1 checkpoint=%d)", stats, end2)
+	}
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+	got := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	if got[100] != 0x66 {
+		t.Fatalf("replayed byte = %#x, want 0x66", got[100])
+	}
+}
+
 func mustPageWithByte(t *testing.T, v byte) storage.Page {
 	t.Helper()
 	p := make(storage.Page, storage.BlockSize)

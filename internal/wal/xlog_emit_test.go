@@ -148,10 +148,10 @@ func TestPageEmissionShortHeaderAtPageBoundary(t *testing.T) {
 		t.Fatalf("unexpected XLPLongHeader on mid-segment page")
 	}
 	// Bytes consumed on page 0 = XLOGBlockSize - SizeOfXLogLongPHD;
-	// the record itself is recordHeaderSize + len(payload) bytes,
-	// so RemLen = (recordHeaderSize+len(payload)) - bytesOnPage0.
+	// the record itself is XLogRecord header + main-data chunk
+	// header + payload bytes.
 	bytesOnPage0 := XLOGBlockSize - SizeOfXLogLongPHD
-	want := uint32((recordHeaderSize + len(payload)) - bytesOnPage0)
+	want := uint32(xlogRecordWireSize(len(payload)) - bytesOnPage0)
 	if short.RemLen != want {
 		t.Fatalf("RemLen = %d, want %d", short.RemLen, want)
 	}
@@ -383,6 +383,65 @@ func TestPageEmissionRecoversCleanly(t *testing.T) {
 	for i, p := range want {
 		if !bytes.Equal(recs[i].Payload, p) {
 			t.Fatalf("rec[%d] payload mismatch", i)
+		}
+	}
+}
+
+// TestPageEmissionXLogPrevChain pins xl_prev linkage for the
+// PG-compatible record framing: every record stores the previous
+// record's start LSN (or 0 for the first record).
+func TestPageEmissionXLogPrevChain(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{
+		WALDir:      walDir,
+		SegmentSize: pickPageSegSize,
+		PageHeaders: true,
+		TimelineID:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payloads := [][]byte{
+		[]byte("p0"),
+		makePagePayload(3000),
+		[]byte("p2"),
+	}
+	starts := make([]uint64, 0, len(payloads))
+	for _, p := range payloads {
+		start, _, err := w.Append(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		starts = append(starts, start)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := readStream(walDir, pickPageSegSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, start := range starts {
+		off := int64(start - 1)
+		header, _ := extractRecordBytes(stream[off:], off, pickPageSegSize, xlogRecordHeaderSize)
+		if len(header) < xlogRecordHeaderSize {
+			t.Fatalf("record %d header truncated at off=%d", i, off)
+		}
+		h, err := DecodeXLogRecordHeader(header)
+		if err != nil {
+			t.Fatalf("record %d header decode: %v", i, err)
+		}
+		wantPrev := uint64(0)
+		if i > 0 {
+			// xl_prev is the upstream 0-based RecPtr of the
+			// previous record's start. goopg's `start` LSN is
+			// 1-based, so subtract 1.
+			wantPrev = starts[i-1] - 1
+		}
+		if h.Prev != wantPrev {
+			t.Fatalf("record %d xl_prev=%d want %d", i, h.Prev, wantPrev)
 		}
 	}
 }

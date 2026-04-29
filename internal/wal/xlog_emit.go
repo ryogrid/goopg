@@ -59,7 +59,7 @@ func pageHeaderSizeAt(pos int64, segSize int64) int {
 // output for the v0 record framing, or future XLogRecord bytes once
 // M0014-0002 wires the upstream record header in). The helper is
 // agnostic to the record's internal shape.
-func emitWithPageHeaders(record []byte, startPos int64, segSize int64, sysID uint64, tli uint32) (out []byte, leading int) {
+func emitWithPageHeaders(record []byte, realRecLen int, startPos int64, segSize int64, sysID uint64, tli uint32) (out []byte, leading int) {
 	out = make([]byte, 0, len(record)+SizeOfXLogShortPHD)
 	pos := startPos
 
@@ -92,7 +92,13 @@ func emitWithPageHeaders(record []byte, startPos int64, segSize int64, sysID uin
 		// page boundary, emit the contrecord page header for the
 		// next page.
 		if consumed < len(record) && pos%XLOGBlockSize == 0 {
-			remaining := uint32(len(record) - consumed)
+			// xlp_rem_len upstream-semantic: bytes-still-to-go
+			// of the *actual* record (xl_tot_len), not the
+			// MAXALIGN trailing pad.
+			remaining := uint32(0)
+			if consumed < realRecLen {
+				remaining = uint32(realRecLen - consumed)
+			}
 			hdr := buildPageHeader(pos, segSize, sysID, tli, true, remaining)
 			out = append(out, hdr...)
 			pos += int64(len(hdr))

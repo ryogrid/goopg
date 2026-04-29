@@ -50,9 +50,9 @@ const (
 type Rmgr uint8
 
 const (
-	RmgrXLog    Rmgr = 0  // RM_XLOG_ID — checkpoints, EOL markers, switch
-	RmgrXact    Rmgr = 1  // RM_XACT_ID — commit / abort
-	RmgrStorage Rmgr = 2  // RM_SMGR_ID — relation create / truncate
+	RmgrXLog    Rmgr = 0 // RM_XLOG_ID — checkpoints, EOL markers, switch
+	RmgrXact    Rmgr = 1 // RM_XACT_ID — commit / abort
+	RmgrStorage Rmgr = 2 // RM_SMGR_ID — relation create / truncate
 	// 3..8 reserved (CLOG, Database, Tablespace, MultiXact, RelMap, Standby).
 	RmgrHeap2 Rmgr = 9  // RM_HEAP2_ID — heap multi-insert / vacuum
 	RmgrHeap  Rmgr = 10 // RM_HEAP_ID  — heap insert / delete / update
@@ -81,8 +81,8 @@ var ErrInvalidRecordHeader = errors.New("wal: invalid record header")
 //	offset 16  Info    (1 byte)  xl_info
 //	offset 17  Rmid    (1 byte)  xl_rmid
 //	offset 18  _pad    (2 bytes) MUST be zero
-//	offset 20  CRC     (4 bytes) xl_crc — CRC32C over (header || payload)
-//	                              with the CRC bytes treated as zero.
+//	offset 20  CRC     (4 bytes) xl_crc — CRC32C over (header bytes
+//	                              before xl_crc || payload).
 type XLogRecord struct {
 	TotLen uint32 // xl_tot_len — total bytes including the 24-byte header
 	XID    uint32 // xl_xid     — TransactionId is uint32 in upstream
@@ -98,19 +98,14 @@ type XLogRecord struct {
 var xlogCRC32CTable = crc32.MakeTable(crc32.Castagnoli)
 
 // XLogCRC32C returns the upstream-compatible CRC32C checksum over
-// `data` using the Castagnoli polynomial 0x1EDC6F41. The caller
-// is responsible for assembling the full byte slice (header ||
-// payload) with the xl_crc field zeroed before passing it in —
-// matches upstream's COMP_CRC32C behaviour where the running CRC
-// is computed across the record with the CRC field reset.
+// `data` using the Castagnoli polynomial 0x1EDC6F41.
 func XLogCRC32C(data []byte) uint32 {
 	return crc32.Checksum(data, xlogCRC32CTable)
 }
 
 // EncodeXLogRecordHeader writes a 24-byte XLogRecord header to
-// dst[:SizeOfXLogRecord], computing xl_crc over (header || payload)
-// with the xl_crc field bytes (offsets 20..23) treated as zero —
-// matches upstream's CRC convention.
+// dst[:SizeOfXLogRecord], computing xl_crc over (header bytes
+// before xl_crc || payload) — matches upstream's CRC convention.
 //
 // Caller invariants:
 //   - dst is large enough (SizeOfXLogRecord bytes minimum).
@@ -145,15 +140,18 @@ func EncodeXLogRecordHeader(dst []byte, h XLogRecord, payload []byte) error {
 	// zero them. Tests pin this.
 	dst[18] = 0
 	dst[19] = 0
-	// xl_crc is computed over the full record with these bytes
-	// zero. We zero them, build the running CRC across both the
-	// header and the payload, then write the result back.
+	// xl_crc is computed over (payload || header bytes 0..19) — the
+	// upstream order matches XLogInsertRecord/XLogRecordAssemble in
+	// postgres/src/backend/access/transam/xlog.c (line ~5170) and
+	// xloginsert.c (line ~903): "rdata, then backup blocks, then
+	// record header". We zero xl_crc bytes before stamping the
+	// finished value back.
 	dst[20] = 0
 	dst[21] = 0
 	dst[22] = 0
 	dst[23] = 0
-	crc := crc32.Update(0, xlogCRC32CTable, dst[:SizeOfXLogRecord])
-	crc = crc32.Update(crc, xlogCRC32CTable, payload)
+	crc := crc32.Update(0, xlogCRC32CTable, payload)
+	crc = crc32.Update(crc, xlogCRC32CTable, dst[:20])
 	binary.LittleEndian.PutUint32(dst[20:24], crc)
 	return nil
 }
@@ -198,8 +196,8 @@ func DecodeXLogRecordHeader(src []byte) (XLogRecord, error) {
 	return h, nil
 }
 
-// VerifyXLogRecordCRC reconstructs the running CRC over (header ||
-// payload) with the xl_crc field zeroed and compares it against
+// VerifyXLogRecordCRC reconstructs the running CRC over (header
+// bytes before xl_crc || payload) and compares it against
 // h.CRC. Used by the recovery / iterator path after a successful
 // header decode + payload read. Returns nil on match,
 // ErrCorruptRecord on mismatch.
@@ -217,8 +215,9 @@ func VerifyXLogRecordCRC(headerBytes, payload []byte, want uint32) error {
 	scratch[21] = 0
 	scratch[22] = 0
 	scratch[23] = 0
-	crc := crc32.Update(0, xlogCRC32CTable, scratch[:])
-	crc = crc32.Update(crc, xlogCRC32CTable, payload)
+	// CRC order matches upstream: payload first, then header[:20].
+	crc := crc32.Update(0, xlogCRC32CTable, payload)
+	crc = crc32.Update(crc, xlogCRC32CTable, scratch[:20])
 	if crc != want {
 		return fmt.Errorf("%w: xl_crc=0x%08x computed=0x%08x", ErrCorruptRecord, want, crc)
 	}

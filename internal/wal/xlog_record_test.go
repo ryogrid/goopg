@@ -174,8 +174,9 @@ func TestEncodeCRCMatchesDirectComputation(t *testing.T) {
 	}
 	stored := DecodeOnly(t, buf).CRC
 
-	// Independent computation: zero the CRC field, run Castagnoli
-	// over (header || payload).
+	// Independent computation: run Castagnoli over (payload ||
+	// header bytes 0..19) — the upstream XLogInsertRecord order
+	// from postgres/src/backend/access/transam/xlog.c (~line 5170).
 	var scratch [SizeOfXLogRecord]byte
 	copy(scratch[:], buf)
 	scratch[20] = 0
@@ -183,8 +184,8 @@ func TestEncodeCRCMatchesDirectComputation(t *testing.T) {
 	scratch[22] = 0
 	scratch[23] = 0
 	tab := crc32.MakeTable(crc32.Castagnoli)
-	want := crc32.Update(0, tab, scratch[:])
-	want = crc32.Update(want, tab, payload)
+	want := crc32.Update(0, tab, payload)
+	want = crc32.Update(want, tab, scratch[:20])
 	if stored != want {
 		t.Errorf("stored CRC=0x%08X, independent computation=0x%08X", stored, want)
 	}

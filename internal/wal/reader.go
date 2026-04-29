@@ -18,8 +18,8 @@ type Record struct {
 // segments. It is intended for recovery and unit tests.
 //
 // Auto-detects the on-disk format via DetectWALFormat: page-emitted
-// segments (M0014-0001 step 2 / WALFormatPGCompat) are walked with
-// page-header skipping; legacy bare-record streams use the
+// segments (WALFormatPGCompat) are walked with page-header skipping
+// plus XLogRecord decode; legacy bare-record streams use the
 // pre-M0014 zero-record-header EOS sentinel. The caller does not
 // need to know which format is in use — the same call site handles
 // both during the M0014 rollout window.
@@ -70,7 +70,7 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 	return records, nil
 }
 
-// readAllPageAware walks a page-emitted WAL stream (M0014-0001 step 2):
+// readAllPageAware walks a page-emitted WAL stream (M0014-0003):
 // at every page boundary skip the page header (or stop on an
 // all-zero header — preallocated tail), then decode records that
 // may straddle page boundaries. Record-byte LSNs include the page
@@ -92,36 +92,37 @@ func readAllPageAware(stream []byte, segSize int64) ([]Record, error) {
 			off += hsize
 			continue
 		}
-		// Mid-page record. The first 8 bytes are the v0
-		// length+CRC frame; if all zero, EOS.
-		if off+recordHeaderSize > len(stream) {
+		// Mid-page record. The first 24 bytes are the XLogRecord
+		// header; if all zero, EOS.
+		if off+xlogRecordHeaderSize > len(stream) {
 			break
 		}
-		if isZeroHeader(stream[off:]) {
+		header, _ := extractRecordBytes(stream[off:], pos, segSize, xlogRecordHeaderSize)
+		if len(header) < xlogRecordHeaderSize {
 			break
 		}
-		// Peek at length to compute total record size, then
-		// extract the contiguous record bytes (skipping any
-		// page header that sits between fragments).
-		header, _ := extractRecordBytes(stream[off:], pos, segSize, recordHeaderSize)
-		if len(header) < recordHeaderSize {
+		if isZeroXLogRecordHeader(header) {
 			break
 		}
-		payloadLen := int(header[0]) | int(header[1])<<8 | int(header[2])<<16 | int(header[3])<<24
-		if payloadLen < 0 {
-			return nil, fmt.Errorf("wal: decode at offset %d: negative payload length %d", off, payloadLen)
-		}
-		total := recordHeaderSize + payloadLen
-		fullBytes, consumed := extractRecordBytes(stream[off:], pos, segSize, total)
-		if len(fullBytes) < total {
-			break
-		}
-		payload, n, err := decodeRecord(fullBytes)
+		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
 		}
-		if n != total {
-			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, n, total)
+		total := int(h.TotLen)
+		if total < xlogRecordHeaderSize {
+			return nil, fmt.Errorf("wal: decode at offset %d: bad xlog total length %d", off, total)
+		}
+		paddedTotal := maxAlignXLog(total)
+		fullBytes, consumed := extractRecordBytes(stream[off:], pos, segSize, paddedTotal)
+		if len(fullBytes) < total {
+			break
+		}
+		payload, n, err := decodeRecordXLog(fullBytes)
+		if err != nil {
+			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
+		}
+		if n != len(fullBytes) {
+			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, n, len(fullBytes))
 		}
 		start := uint64(off) + 1
 		end := uint64(off) + uint64(consumed)

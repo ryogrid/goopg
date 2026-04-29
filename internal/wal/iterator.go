@@ -19,8 +19,11 @@ import (
 )
 
 // RecordIterator walks the WAL stream forward from a starting LSN.
-// Records align to upstream's per-record framing (8-byte header +
-// payload). When the iterator catches up to the writer's WrittenLSN
+// Record framing depends on writer mode:
+//   - legacy mode: 8-byte len+CRC frame + payload
+//   - page-header mode: 24-byte XLogRecord + wrapped main-data chunk
+//
+// When the iterator catches up to the writer's WrittenLSN
 // it blocks on `Next` until either:
 //   - the writer advances (via the subscription wake-up channel), or
 //   - the supplied context is cancelled, or
@@ -136,12 +139,12 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 	}
 }
 
-// readOneAt opens the segment containing pos, reads the 8-byte
-// header (possibly split across the segment boundary), then reads
-// the body, decodes, and returns the Record + its on-wire byte
-// count. Header / payload that span segments are pasted together by
-// reading the trailing bytes of one segment and the leading bytes
-// of the next.
+// readOneAt opens the segment containing pos, reads one record
+// header (legacy 8-byte frame or PG-compatible 24-byte XLogRecord
+// header), then reads and decodes the full body and returns the
+// Record + its on-wire byte count. Header / payload that span
+// segments are pasted together by reading the trailing bytes of one
+// segment and the leading bytes of the next.
 //
 // In page-headers mode, reads transparently span page boundaries:
 // the iterator extracts only record bytes (skipping XLogPageHeader
@@ -150,6 +153,38 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 // content. `pos` must point at a record byte (not a page header)
 // — Next() advances past leading headers before calling here.
 func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
+	if it.pageHeaders {
+		headerBytes, _, err := it.readRecordBytesAt(pos, xlogRecordHeaderSize)
+		if err != nil {
+			return Record{}, 0, err
+		}
+		h, err := DecodeXLogRecordHeader(headerBytes)
+		if err != nil {
+			return Record{}, 0, err
+		}
+		total := int(h.TotLen)
+		if total < xlogRecordHeaderSize {
+			return Record{}, 0, fmt.Errorf("%w: bad xlog total length %d", ErrCorruptRecord, total)
+		}
+		// Read MAXALIGN(total) physical bytes to also pick up the
+		// trailing zero pad — the upstream record alignment.
+		paddedTotal := maxAlignXLog(total)
+		body, advance, err := it.readRecordBytesAt(pos, paddedTotal)
+		if err != nil {
+			return Record{}, 0, err
+		}
+		payload, n, err := decodeRecordXLog(body)
+		if err != nil {
+			return Record{}, 0, err
+		}
+		if n != len(body) {
+			return Record{}, 0, fmt.Errorf("wal: iterator xlog size mismatch: %d vs %d", n, len(body))
+		}
+		startLSN := uint64(pos) + 1
+		endLSN := uint64(pos) + uint64(advance)
+		return Record{StartLSN: startLSN, EndLSN: endLSN, Payload: payload}, advance, nil
+	}
+
 	header, _, err := it.readRecordBytesAt(pos, recordHeaderSize)
 	if err != nil {
 		return Record{}, 0, err
