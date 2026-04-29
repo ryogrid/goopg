@@ -148,6 +148,28 @@ that don't set it. Closes the upstream-shape gap:
 `\watch pg_aios` now lets an operator see exactly which
 relfile or WAL segment a stalled I/O targets.
 
+## Per-direction latency observability (landed)
+
+`aio.Engine` carries four per-direction latency counters
+(`read{Latency,Latency}Sum/MaxMicros` and the write twin).
+`finishHandle` computes `time.Since(h.submittedAt).Microseconds()`
+once per completion and:
+
+- `Add()`s to `*LatencySumMicros` (cumulative — average
+  per-direction latency = `SumMicros / Completed`).
+- CAS-monotonic-clamps `*LatencyMaxMicros` via a new
+  `advanceMax(*atomic.Uint64, uint64)` helper that
+  retries on lost CAS until the stored max is ≥ the new
+  sample.
+
+Stats surface both flavours; `pg_stat_aio` renders
+`avg_latency_us` (helper `avgLatencyUS` returns "0" on
+zero-completion to avoid NaN) and `max_latency_us`
+alongside the existing per-direction counters. With this
+slice, an operator triaging tail-latency regressions sees
+per-direction worst-sample + average without needing to
+attach a profiler.
+
 ## Per-direction counter breakdown (landed)
 
 `aio.Engine` carries six per-direction atomic counters
@@ -181,9 +203,12 @@ direction is a small future refactor).
 - **Per-relation breakdown.** A future view could split
   `submitted` etc. by relfile, but the engine doesn't
   track per-target counters today (only per-direction).
-- **Histograms / latency percentiles.** Out of scope; the
-  observability surface here is for "is it running," not for
-  performance regression triage.
+- **Latency percentile histograms (p50 / p95 / p99).**
+  Average and max are landed per-direction on the engine
+  and rendered in `pg_stat_aio.avg_latency_us` /
+  `max_latency_us`; full quantile estimation needs a
+  streaming-quantile sketch (e.g. t-digest) on the engine
+  hot path. Future slice.
 
 ## Cross-references
 

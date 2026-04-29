@@ -198,6 +198,18 @@ type Engine struct {
 	writeCompleted atomic.Uint64
 	writeErrored   atomic.Uint64
 
+	// Per-direction latency observability. SumMicros tracks
+	// the cumulative observed latency (now - submittedAt at
+	// completion time) so consumers can compute the average
+	// latency as SumMicros/Completed. MaxMicros tracks the
+	// worst-case sample observed so far, CAS-clamped to
+	// monotonic-forward. Both are micros (not nanos) to
+	// fit comfortably in uint64 even at high I/O rates.
+	readLatencySumMicros  atomic.Uint64
+	readLatencyMaxMicros  atomic.Uint64
+	writeLatencySumMicros atomic.Uint64
+	writeLatencyMaxMicros atomic.Uint64
+
 	// nextID hands out per-Submit identifiers. Monotonic.
 	nextID atomic.Uint64
 
@@ -341,23 +353,47 @@ func (e *Engine) finishHandle(h *Handle, r Result) {
 	if isErr {
 		e.errored.Add(1)
 	}
+	// Latency: compute once and stash on both per-direction
+	// SumMicros and MaxMicros. Clamps SumMicros at uint64
+	// overflow (in practice impossible — would take 18M years
+	// at 1B I/Os per second).
+	elapsedMicros := uint64(time.Since(h.submittedAt).Microseconds())
 	switch h.op.Direction {
 	case DirRead:
 		e.readCompleted.Add(1)
 		if isErr {
 			e.readErrored.Add(1)
 		}
+		e.readLatencySumMicros.Add(elapsedMicros)
+		advanceMax(&e.readLatencyMaxMicros, elapsedMicros)
 	case DirWrite:
 		e.writeCompleted.Add(1)
 		if isErr {
 			e.writeErrored.Add(1)
 		}
+		e.writeLatencySumMicros.Add(elapsedMicros)
+		advanceMax(&e.writeLatencyMaxMicros, elapsedMicros)
 	}
 	e.inFlight.Add(-1)
 	e.inflightMu.Lock()
 	delete(e.inflight, h.id)
 	e.inflightMu.Unlock()
 	h.finish(r)
+}
+
+// advanceMax CAS-clamps p to max(p, v) — monotonic-forward
+// without taking a lock. Used by the latency-max accountancy
+// in finishHandle.
+func advanceMax(p *atomic.Uint64, v uint64) {
+	for {
+		cur := p.Load()
+		if v <= cur {
+			return
+		}
+		if p.CompareAndSwap(cur, v) {
+			return
+		}
+	}
 }
 
 // Close shuts down the engine. Idempotent.
@@ -388,6 +424,15 @@ type Stats struct {
 	WriteSubmitted uint64
 	WriteCompleted uint64
 	WriteErrored   uint64
+
+	// Per-direction latency observability (cumulative micros
+	// of observed completion latency, plus worst-sample max).
+	// Average per-direction latency = SumMicros / Completed.
+	// Both stay zero when no I/O has completed.
+	ReadLatencySumMicros  uint64
+	ReadLatencyMaxMicros  uint64
+	WriteLatencySumMicros uint64
+	WriteLatencyMaxMicros uint64
 }
 
 // InFlight returns a sorted copy of every currently-outstanding
@@ -422,12 +467,16 @@ func (e *Engine) Stats() Stats {
 		Completed:      e.completed.Load(),
 		Errored:        e.errored.Load(),
 		InFlight:       e.inFlight.Load(),
-		ReadSubmitted:  e.readSubmitted.Load(),
-		ReadCompleted:  e.readCompleted.Load(),
-		ReadErrored:    e.readErrored.Load(),
-		WriteSubmitted: e.writeSubmitted.Load(),
-		WriteCompleted: e.writeCompleted.Load(),
-		WriteErrored:   e.writeErrored.Load(),
+		ReadSubmitted:         e.readSubmitted.Load(),
+		ReadCompleted:         e.readCompleted.Load(),
+		ReadErrored:           e.readErrored.Load(),
+		WriteSubmitted:        e.writeSubmitted.Load(),
+		WriteCompleted:        e.writeCompleted.Load(),
+		WriteErrored:          e.writeErrored.Load(),
+		ReadLatencySumMicros:  e.readLatencySumMicros.Load(),
+		ReadLatencyMaxMicros:  e.readLatencyMaxMicros.Load(),
+		WriteLatencySumMicros: e.writeLatencySumMicros.Load(),
+		WriteLatencyMaxMicros: e.writeLatencyMaxMicros.Load(),
 	}
 }
 

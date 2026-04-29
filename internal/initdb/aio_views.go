@@ -38,6 +38,8 @@ func registerStatAIOView(cat *catalog.InMemory, eng *aio.Engine) error {
 			{Name: "completed", Type: catalog.Type{Name: "text"}},
 			{Name: "errored", Type: catalog.Type{Name: "text"}},
 			{Name: "in_flight", Type: catalog.Type{Name: "text"}},
+			{Name: "avg_latency_us", Type: catalog.Type{Name: "text"}},
+			{Name: "max_latency_us", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -61,6 +63,8 @@ func registerStatAIOView(cat *catalog.InMemory, eng *aio.Engine) error {
 				fmt.Sprintf("%d", s.ReadCompleted),
 				fmt.Sprintf("%d", s.ReadErrored),
 				fmt.Sprintf("%d", s.InFlight),
+				avgLatencyUS(s.ReadLatencySumMicros, s.ReadCompleted),
+				fmt.Sprintf("%d", s.ReadLatencyMaxMicros),
 			},
 			{
 				s.Method, "write",
@@ -68,10 +72,22 @@ func registerStatAIOView(cat *catalog.InMemory, eng *aio.Engine) error {
 				fmt.Sprintf("%d", s.WriteCompleted),
 				fmt.Sprintf("%d", s.WriteErrored),
 				"0",
+				avgLatencyUS(s.WriteLatencySumMicros, s.WriteCompleted),
+				fmt.Sprintf("%d", s.WriteLatencyMaxMicros),
 			},
 		}
 	}
 	return cat.RegisterVirtualTable(tbl)
+}
+
+// avgLatencyUS renders sum/count as an integer-microsecond
+// average. Returns "0" when count is zero — preserves the
+// "no I/O completed yet" sentinel without surfacing NaN.
+func avgLatencyUS(sum, count uint64) string {
+	if count == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("%d", sum/count)
 }
 
 // registerPgAiosView installs `pg_catalog.pg_aios` backed by

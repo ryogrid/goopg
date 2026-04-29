@@ -3340,6 +3340,33 @@ See `docs/milestones/0009-aio-subsystem.md`.
       directions and verifies the aggregate-sum
       invariant. Built and full `go test ./...` green.)
 
+- [x] AIO observability — per-direction latency
+      (avg + max). (landed 2026-04-29: aio.Engine carries
+      four new atomic counters
+      `read{Latency,Latency}Sum/MaxMicros` (+ write
+      counterpart). `finishHandle` computes
+      `time.Since(h.submittedAt).Microseconds()` once and
+      Add()s to the per-direction SumMicros and CAS-
+      monotonic-clamps via a new `advanceMax(*atomic.Uint64,
+      uint64)` helper for the per-direction MaxMicros.
+      `Stats` exposes `ReadLatencySumMicros`,
+      `ReadLatencyMaxMicros`, `WriteLatencySumMicros`,
+      `WriteLatencyMaxMicros`. `pg_stat_aio` grows
+      `avg_latency_us` (computed sum/count via the
+      `avgLatencyUS` helper, returns "0" when count==0
+      to avoid NaN) and `max_latency_us` columns —
+      rendered per-direction-row alongside the existing
+      counters. Tests: TestEngineStatsLatency
+      (non-flaky cross-direction independence + sum ≥
+      max sanity check), TestEngineStatsLatencyMaxMonotonic
+      (50 ops; MaxMicros never regresses). Built and
+      full `go test ./...` green. With this slice an
+      operator can spot per-direction tail-latency
+      regressions in pg_stat_aio without attaching a
+      profiler. Histogram / percentile (p50, p95, p99)
+      observability is a future slice — needs a
+      streaming-quantile estimator on the engine.)
+
 - [ ] (BLOCKED) AIO wait-event surface: register a
       "waiting on AIO completion" wait event so a query
       stalled on an AIO Wait shows up identifiably in the

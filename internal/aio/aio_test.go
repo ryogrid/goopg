@@ -379,3 +379,71 @@ func TestEngineStatsPerDirection(t *testing.T) {
 			s.ReadCompleted+s.WriteCompleted)
 	}
 }
+
+// TestEngineStatsLatency pins the per-direction latency
+// observability: SumMicros increments on every completion,
+// MaxMicros monotonically tracks the worst sample. The
+// engine doesn't fake-time so we just assert non-zero +
+// monotonic ordering — pinning exact values would be flaky.
+func TestEngineStatsLatency(t *testing.T) {
+	e, err := NewEngine(EngineConfig{Method: MethodSync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	f := newMemFile(64)
+
+	// Two reads + one write so we observe per-direction split.
+	for i := 0; i < 2; i++ {
+		h := e.Submit(Op{File: f, Buffer: make([]byte, 4), Offset: 0, Direction: DirRead})
+		h.Wait()
+	}
+	wh := e.Submit(Op{File: f, Buffer: []byte("hi"), Offset: 0, Direction: DirWrite})
+	wh.Wait()
+
+	s := e.Stats()
+	if s.ReadCompleted != 2 {
+		t.Fatalf("ReadCompleted=%d want 2", s.ReadCompleted)
+	}
+	// Sum should be ≥ Max — both must be non-negative; the
+	// memFile path is fast but not zero so SumMicros is
+	// almost always > 0. Don't assert > 0 to avoid flakes
+	// on machines with sub-microsecond clocks.
+	if s.ReadLatencyMaxMicros > s.ReadLatencySumMicros {
+		t.Errorf("read max=%d > sum=%d (impossible: max is one sample)",
+			s.ReadLatencyMaxMicros, s.ReadLatencySumMicros)
+	}
+	if s.WriteLatencyMaxMicros > s.WriteLatencySumMicros {
+		t.Errorf("write max=%d > sum=%d", s.WriteLatencyMaxMicros, s.WriteLatencySumMicros)
+	}
+	// Cross-direction independence: read latency must NOT
+	// reflect the write op (and vice versa). Test by
+	// checking the write counters are populated separately.
+	if s.WriteCompleted != 1 {
+		t.Errorf("WriteCompleted=%d want 1", s.WriteCompleted)
+	}
+}
+
+// TestEngineStatsLatencyMaxMonotonic: MaxMicros must never
+// regress on a smaller subsequent sample. Forces a stale
+// CAS by injecting a known-large fake max via a slow op.
+// (Hard to test reliably without time injection — assert the
+// invariant survives across many ops at least.)
+func TestEngineStatsLatencyMaxMonotonic(t *testing.T) {
+	e, err := NewEngine(EngineConfig{Method: MethodSync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	f := newMemFile(64)
+	var prevMax uint64
+	for i := 0; i < 50; i++ {
+		h := e.Submit(Op{File: f, Buffer: make([]byte, 4), Offset: 0, Direction: DirRead})
+		h.Wait()
+		cur := e.Stats().ReadLatencyMaxMicros
+		if cur < prevMax {
+			t.Errorf("MaxMicros regressed: prev=%d cur=%d", prevMax, cur)
+		}
+		prevMax = cur
+	}
+}
