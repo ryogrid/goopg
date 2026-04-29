@@ -2359,11 +2359,40 @@ calls out.
       for ANALYZE, and JSON snapshot regression strategy
       land in 0018-0002 / 0018-0003 / 0018-0004.)
 
-- [ ] Static plan rendering (M0018-0002): VERBOSE output
-      (relation-qualified columns, per-key sort orderings),
-      FORMAT JSON renderer, deterministic node-attribute
-      shapes for regression. Continues
+- [x] Static plan rendering — Stage A (M0018-0002).
+      Design doc
       `docs/design/0018-0002-static-plan-rendering-and-output-contract.md`.
+      (landed 2026-04-29: parser AST options now flow into
+      EXPLAIN output. `planner.Explain` grew an `Options
+      parser.ExplainOptions` field; the Plan dispatcher
+      copies `s.Options` from `parser.ExplainStmt` and
+      rejects ANALYZE BEFORE planning the inner statement
+      with SQLSTATE 0A000 and a "Stage B" message — pre-plan
+      check ensures `EXPLAIN ANALYZE INSERT ...` doesn't
+      trigger side effects of planning a write path that
+      won't execute. `explainOp.Open` branches on
+      `Options.Format`: ExplainFormatText runs the existing
+      indented walker (byte-for-byte unchanged for the
+      bare-EXPLAIN form); ExplainFormatJSON renders the plan
+      tree as a JSON object via new `planToJSON` (Node Type
+      + Plan Rows + optional Output array + recursive Plans
+      array, wrapped in a single-element array matching
+      upstream's `[ {root} ]` shape). VERBOSE adds an
+      `Output: (col, ...)` line under each node in TEXT
+      mode and an `Output` array key in JSON mode (matches
+      upstream's "Output is part of VERBOSE" behaviour).
+      Other static options (COSTS / TIMING / SUMMARY /
+      BUFFERS / SETTINGS) are parsed-but-no-op until Stage B
+      / M0018-0004 — agreed Stage A contract per the
+      milestone doc. Tests:
+      TestExplainTextFormatUnchanged regression guard,
+      TestExplainFormatJSONProducesValidJSON,
+      TestExplainFormatJSONOmitsOutputWithoutVerbose,
+      TestExplainFormatJSONHonoursVerbose,
+      TestExplainVerboseAddsOutputLine (text mode),
+      TestExplainAnalyzeRejected (keyword form),
+      TestExplainParenAnalyzeAlsoRejected (parens form too).
+      Full `go test ./...` green.)
 
 - [ ] EXPLAIN ANALYZE instrumentation (M0018-0003): per-node
       timing wrapper, rows/loops counters, TIMING OFF

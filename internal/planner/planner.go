@@ -81,11 +81,23 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &Checkpoint{pos: s.Pos()}, nil
 
 	case *parser.ExplainStmt:
+		// Reject ANALYZE before planning the inner statement so
+		// `EXPLAIN ANALYZE INSERT ...` doesn't accidentally
+		// trigger side effects of planning a write path that
+		// won't execute. Stage B (M0018-0003) flips this to
+		// the runtime-instrumentation path.
+		if s.Options.Analyze {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "0A000",
+				Message: "EXPLAIN ANALYZE is not supported in v0 (Stage B — see docs/milestones/0018-explain-and-explain-analyze.md)",
+			}
+		}
 		inner, err := Plan(s.Inner, cat)
 		if err != nil {
 			return nil, err
 		}
-		return &Explain{pos: s.Pos(), Child: inner}, nil
+		return &Explain{pos: s.Pos(), Options: s.Options, Child: inner}, nil
 
 	case *parser.CopyStmt:
 		return planCopy(s, cat)

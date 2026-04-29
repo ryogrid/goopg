@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -29,9 +31,23 @@ func (o *explainOp) Schema() planner.Schema {
 }
 
 func (o *explainOp) Open(_ *Context) error {
-	var b strings.Builder
 	o.rows = nil
-	walkPlan(&b, o.plan.Child, 0, &o.rows)
+	if o.plan.Options.Format == parser.ExplainFormatJSON {
+		// FORMAT JSON: emit one row whose cell is the JSON-
+		// encoded plan tree. The wrapping single-element array
+		// matches upstream's `[ {root} ]` shape so future
+		// extensions (multiple top-level entries) don't require
+		// a schema change.
+		root := planToJSON(o.plan.Child, o.plan.Options)
+		out, err := json.MarshalIndent([]any{root}, "", "  ")
+		if err != nil {
+			return fmt.Errorf("explain: marshal JSON: %w", err)
+		}
+		o.rows = []Row{{Datum{Kind: KindString, String: string(out)}}}
+		return nil
+	}
+	var b strings.Builder
+	walkPlan(&b, o.plan.Child, 0, &o.rows, o.plan.Options)
 	return nil
 }
 
@@ -51,7 +67,11 @@ func (o *explainOp) Close() error { return nil }
 // KindString datum already formatted as "<indent>->  <node
 // label>" — upstream's render shape — except the root which
 // has no leading "->".
-func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row) {
+//
+// When opts.Verbose is set, an extra `Output: (col, ...)` line
+// is emitted under each node listing its schema columns —
+// mirrors upstream's `EXPLAIN VERBOSE` output (M0018-0002).
+func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
 	indent := strings.Repeat("  ", depth)
 	prefix := indent
 	if depth > 0 {
@@ -68,9 +88,60 @@ func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row) {
 	}
 	*rows = append(*rows, Row{Datum{Kind: KindString, String: label}})
 
-	for _, c := range planChildren(n) {
-		walkPlan(b, c, depth+1, rows)
+	if opts.Verbose {
+		if cols := schemaColumnNames(n); len(cols) > 0 {
+			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
+			*rows = append(*rows, Row{Datum{Kind: KindString, String: outline}})
+		}
 	}
+
+	for _, c := range planChildren(n) {
+		walkPlan(b, c, depth+1, rows, opts)
+	}
+}
+
+// schemaColumnNames returns the names of n's output columns,
+// or nil when the node doesn't expose a schema (Insert/Update/
+// Delete operators run for side effects and have empty Output).
+func schemaColumnNames(n planner.Node) []string {
+	out := n.Output()
+	if len(out) == 0 {
+		return nil
+	}
+	names := make([]string, len(out))
+	for i, c := range out {
+		names[i] = c.Name
+	}
+	return names
+}
+
+// planToJSON renders n as the upstream-style JSON object an
+// `EXPLAIN (FORMAT JSON)` row carries. Recursive — children land
+// in a `Plans` array. The Output column-name array is emitted
+// only when opts.Verbose is set (matches upstream's behaviour
+// where columns are part of VERBOSE output, not the default
+// JSON shape).
+func planToJSON(n planner.Node, opts parser.ExplainOptions) map[string]any {
+	obj := map[string]any{
+		"Node Type": describePlan(n),
+	}
+	if est := planner.EstimateRows(n); est > 0 {
+		obj["Plan Rows"] = est
+	}
+	if opts.Verbose {
+		if cols := schemaColumnNames(n); len(cols) > 0 {
+			obj["Output"] = cols
+		}
+	}
+	children := planChildren(n)
+	if len(children) > 0 {
+		plans := make([]map[string]any, 0, len(children))
+		for _, c := range children {
+			plans = append(plans, planToJSON(c, opts))
+		}
+		obj["Plans"] = plans
+	}
+	return obj
 }
 
 // describePlan renders the v0 single-line label for a plan node.

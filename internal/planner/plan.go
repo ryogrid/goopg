@@ -515,10 +515,15 @@ func (n *Checkpoint) Output() Schema { return nil }
 
 // Explain — `EXPLAIN <stmt>`. Wraps the planned inner node so
 // the executor can render it as a single-column QUERY PLAN
-// text result-set without re-running planning.
+// text result-set without re-running planning. The Options
+// field carries the parsed EXPLAIN flags (M0018-0001) — the
+// executor consults Format / Verbose to switch between TEXT /
+// JSON / verbose-mode rendering. Zero-value Options preserves
+// the pre-M0018 bare-EXPLAIN behaviour.
 type Explain struct {
-	pos   int
-	Child Node
+	pos     int
+	Options parser.ExplainOptions
+	Child   Node
 }
 
 func (n *Explain) Pos() int { return n.pos }
