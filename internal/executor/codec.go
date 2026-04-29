@@ -135,7 +135,10 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 	default:
-		// Variable-length text-like fallback.
+		// Variable-length text-like fallback. NUMERIC datums emit
+		// the canonical decimal text via formatNumeric so a column
+		// with an unrecognised type name still receives a usable
+		// representation (mirrors the dedicated numeric arm above).
 		var s string
 		switch d.Kind {
 		case KindString:
@@ -144,6 +147,8 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			return encodeVarlen(d.Bytes), nil
 		case KindInt:
 			return nil, fmt.Errorf("integer datum cannot encode as %s", t.Name)
+		case KindNumeric:
+			s = formatNumeric(d.NumericMantissa, d.NumericScale)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 		}
