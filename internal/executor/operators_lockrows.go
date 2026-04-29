@@ -263,17 +263,23 @@ func (o *lockRowsOp) drainAndStamp() error {
 // FPI emission), and unpins. Mirrors writeHeapRow's
 // markHeapInsertDirty pattern.
 //
-// Also acquires a tuple-level ExclusiveLock via the lockmgr's
-// (DB, Rel, Block+1, Offset+1) tag (M0021 step 2b). This is what
-// makes concurrent UPDATE / DELETE / FOR UPDATE on the same row
-// actually block: they call acquireTupleLock with the same tag
-// and wait until our xact commits / aborts (transaction-scoped
-// release via LockMgr.ReleaseAll).
+// Also acquires a tuple-level lock via the lockmgr's
+// (DB, Rel, Block+1, Offset+1) tag (M0021 step 2b). The mode
+// depends on the lock strength (M0021 step 4): FOR UPDATE
+// takes ExclusiveLock (single writer / blocks all other
+// holders); FOR SHARE takes RowShareLock (compatible with
+// other RowShareLock holders so multiple FOR SHARE sessions
+// proceed concurrently, conflicts with ExclusiveLock so a
+// UPDATE / DELETE / FOR UPDATE waits until all FOR SHARE
+// holders release). The lockmgr's existing conflict matrix
+// already implements the upstream multi-holder semantics
+// without MultiXact infrastructure — transaction-scoped
+// ReleaseAll on commit/abort cleans every holder up.
 func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer) error {
 	// Acquire the tuple-level lock first so a concurrent UPDATE
 	// that races with us can't slip through between the xmax
 	// stamp and the lock registration.
-	if err := o.ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
+	if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
 		return err
 	}
 	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
@@ -290,6 +296,22 @@ func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
 	return derr
+}
+
+// tupleLockMode picks the lockmgr Mode used for the tuple-tag
+// acquire based on the SELECT FOR clause's strength (M0021 step
+// 4). FOR SHARE → RowShareLock so multiple shared holders
+// coexist on the same tuple tag; FOR UPDATE → ExclusiveLock so
+// a single writer blocks every other holder. Mirrors upstream's
+// `tuple_lock_extended` mode mapping at the lockmgr level
+// without needing MultiXact infrastructure for v0 — the
+// lockmgr's existing conflict matrix already supplies the
+// multi-holder semantics.
+func (o *lockRowsOp) tupleLockMode() lockmgr.Mode {
+	if o.lockStrength == storage.HeapXmaxShrLock || o.lockStrength == storage.HeapXmaxKeyShrLock {
+		return lockmgr.RowShareLock
+	}
+	return lockmgr.ExclusiveLock
 }
 
 // markHeapLockDirty centralises the choice between

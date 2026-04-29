@@ -3136,8 +3136,41 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       ./...` green. Producer wiring (lockRowsOp emitting
       HeapLock through ctx.Pool.LogHeapLock parallel to
       LogHeapInsert / LogHeapDelete) is the next slice.)
-- [ ] Tuple-level pessimistic locking — step 4:
-      MultiXact-aware multi-holder support for FOR SHARE.
+- [x] Tuple-level pessimistic locking — step 4:
+      multi-holder FOR SHARE via lockmgr modes (no
+      MultiXact infrastructure needed). Design doc
+      `docs/design/0021-0011-tuple-locking-for-share-multi-holder.md`.
+      (landed 2026-04-30: fixes the hidden bug where two
+      concurrent SELECT FOR SHARE on the same row
+      serialised. New `lockRowsOp.tupleLockMode()` picks
+      RowShareLock for HeapXmaxShrLock/KeyShrLock,
+      ExclusiveLock for HeapXmaxExclLock. The lockmgr's
+      existing conflict matrix gives upstream's
+      multi-holder semantics for free: RowShareLock
+      compatible with self, conflicts with ExclusiveLock.
+      Mapping: FOR UPDATE → Excl, FOR SHARE → RowShare,
+      UPDATE/DELETE foreign-lock branch → Excl.
+      Transaction-scoped ReleaseAll cleans up. On-page
+      xmax bookkeeping limitation noted: second holder
+      overwrites first's xmax bytes, harmless because
+      visibility short-circuits on LOCK_ONLY without
+      consulting xmax value, lockmgr tracks holders by
+      backend ID independently, WAL records each
+      emission separately. Persistent MultiXact
+      identifier in xmax (for accurate post-crash
+      holder-set reconstruction) is the deferred MultiXact
+      slice. Test:
+      TestForShareCompatibleMultipleHolders runs two
+      sessions concurrently taking FOR SHARE (verifies
+      both appear in Holders[tag]), then a third session
+      UPDATE blocks waiting for both and unblocks only
+      after BOTH release — pins multi-holder + UPDATE-
+      conflicts-with-shared semantics. Full `go test
+      ./...` green; race-mode targeted runs across
+      executor + lockmgr green. Lock-strength promotion
+      + persistent MultiXact + tuple-level NOWAIT/SKIP
+      LOCKED + streaming + pg_locks introspection all
+      stay deferred.)
 
 ## Notes
 

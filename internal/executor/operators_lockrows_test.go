@@ -524,6 +524,138 @@ func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
 	}
 }
 
+// TestForShareCompatibleMultipleHolders — M0021 step 4:
+// multiple SELECT FOR SHARE sessions on the same row should
+// coexist without blocking, and a subsequent UPDATE / FOR
+// UPDATE should wait for all of them to release. Achieves
+// PostgreSQL FOR SHARE multi-holder semantics via lockmgr
+// modes (RowShareLock vs ExclusiveLock) without needing
+// MultiXact infrastructure: RowShareLock is compatible with
+// itself and conflicts with ExclusiveLock per the lockmgr's
+// conflict matrix.
+func TestForShareCompatibleMultipleHolders(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+
+	// Two sessions concurrently take FOR SHARE on the same row.
+	s1tx, _ := ctx.TxnMgr.Begin(0)
+	s1snap, _ := ctx.TxnMgr.SnapshotFor(s1tx)
+	s1 := makeCtx(lm, 1)
+	s1.Pool = ctx.Pool
+	s1.Catalog = ctx.Catalog
+	s1.TxnMgr = ctx.TxnMgr
+	s1.Tx = s1tx
+	s1.Snap = s1snap
+
+	s2tx, _ := ctx.TxnMgr.Begin(0)
+	s2snap, _ := ctx.TxnMgr.SnapshotFor(s2tx)
+	s2 := makeCtx(lm, 2)
+	s2.Pool = ctx.Pool
+	s2.Catalog = ctx.Catalog
+	s2.TxnMgr = ctx.TxnMgr
+	s2.Tx = s2tx
+	s2.Snap = s2snap
+
+	if _, err := runForUpdate(t, s1, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-1 FOR SHARE: %v", err)
+	}
+	// Second FOR SHARE must succeed without blocking — pin
+	// against the multi-holder property by running it
+	// synchronously and asserting it returns promptly. If the
+	// first FOR SHARE's lock blocked the second, the test would
+	// hang.
+	if _, err := runForUpdate(t, s2, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-2 FOR SHARE (must be compatible): %v", err)
+	}
+
+	// Both sessions hold the tuple tag; verify the tag has 2
+	// holders (RowShareLock from each backend).
+	rel := ctx.Catalog.RelFileNode(tbl)
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2}
+	holders := lm.Holders(tag)
+	if len(holders) != 2 {
+		t.Fatalf("Holders=%d, want 2 (both FOR SHARE sessions)", len(holders))
+	}
+
+	// A third session attempting UPDATE on the same row must
+	// block until BOTH FOR SHARE holders release.
+	s3tx, _ := ctx.TxnMgr.Begin(0)
+	s3snap, _ := ctx.TxnMgr.SnapshotFor(s3tx)
+	s3 := makeCtx(lm, 3)
+	s3.Pool = ctx.Pool
+	s3.Catalog = ctx.Catalog
+	s3.TxnMgr = ctx.TxnMgr
+	s3.Tx = s3tx
+	s3.Snap = s3snap
+	defer ctx.TxnMgr.Rollback(s3tx)
+
+	done := make(chan error, 1)
+	go func() {
+		stmts, _ := parser.Parse("UPDATE items SET label = 'updated' WHERE id = 1")
+		node, err := planner.Plan(stmts[0], s3.Catalog)
+		if err != nil {
+			done <- err
+			return
+		}
+		op, _ := Build(node)
+		if err := op.Open(s3); err != nil {
+			done <- err
+			return
+		}
+		_, err = op.Next()
+		_ = op.Close()
+		if err != nil && err != EOF {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	// Wait briefly for session 3 to register as a waiter.
+	deadline := time.Now().Add(2 * time.Second)
+	registered := false
+	for time.Now().Before(deadline) {
+		if len(lm.Waiters(tag)) >= 1 {
+			registered = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !registered {
+		lm.ReleaseAll(1)
+		lm.ReleaseAll(2)
+		<-done
+		t.Fatal("session 3 UPDATE did not register as waiter")
+	}
+
+	// Release session 1; session 3 must still be blocked
+	// (session 2 still holds RowShareLock).
+	lm.ReleaseAll(1)
+	select {
+	case err := <-done:
+		t.Fatalf("session 3 unblocked too early — session 2 still holds: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// expected — still blocked
+	}
+	// Release session 2; session 3 should now wake.
+	lm.ReleaseAll(2)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("session 3 UPDATE: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session 3 did not unblock after both holders released")
+	}
+}
+
 // TestLockRowsRejectsSkipLocked — SKIP LOCKED stays deferred
 // pending tuple-level pessimistic locking (relation-coarse
 // locks have no per-row "skip" semantic). Pins the explicit
