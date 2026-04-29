@@ -208,6 +208,58 @@ encoder:
 - `TestPgoutputDecoderRoundTrip`: pure decoder unit test —
   encode B/C/R/I/D, decode each message, confirm round-trip.
 
+## Apply-worker tablesync integration
+
+`executor.ApplyWorker` cooperates with the tablesync state
+machine through an optional per-subscription context:
+
+```
+func (w *ApplyWorker) SetSubscriptionContext(ps *catalog.PubSub, subName string)
+```
+
+When both arguments are non-zero, two new behaviours layer on
+top of the existing B/R/I/D/C dispatch:
+
+### Per-change gate (`applyInsert`)
+
+Before forwarding an INSERT to `writeHeapRow`, the worker looks
+up `pg_subscription_rel` for `(subName, localRelOID)`. If a row
+exists and its `srsubstate` is anything other than `r`, the
+INSERT is skipped silently — the tablesync worker is
+responsible for seeding that data through the COPY path, and
+applying it again here would double-write. A relation with no
+tracked row applies normally (the legacy "apply everything"
+path), which keeps tests that don't model tablesync working
+unchanged.
+
+The gate keys off the local relation's OID resolved through
+`cat.RelFileNode(local).RelOid`, the same identifier the
+tablesync transport used to seed the row in
+`AddSubscriptionRel`.
+
+### Per-commit promotion (`applyCommit` → `promoteSyncedRels`)
+
+After every committed apply transaction (and even after a
+commit-only message that closed no local xact), the worker
+walks `SubscriptionRels(subName)` and, for every row at state
+`s` whose recorded sync-end LSN is ≤ the commit LSN,
+advances it to `r` via `AdvanceSubscriptionRel`. Subsequent
+changes for that rel will then pass the per-change gate.
+
+v0's tablesync transport records LSN=0 (the simple-COPY path
+doesn't surface a per-snapshot LSN), so the first commit
+observed promotes the rel — conservative but correct: the COPY
+happens on the same publisher slot timeline as the streaming
+apply, and there is no parallel writer to race with. When a
+real LSN handoff lands, the same comparison continues to work
+because `0 ≤ commitLSN` is the same condition as
+`recorded ≤ commitLSN` for `recorded == 0`.
+
+This mirrors upstream worker.c's
+`process_syncing_tables_for_apply` (the per-commit promotion
+sweep) and `should_apply_changes_for_rel` (the per-change
+gate).
+
 ## Tablesync initial-COPY transport
 
 `internal/server/tablesync.go` carries the wire-shape driver for

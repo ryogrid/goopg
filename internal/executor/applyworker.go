@@ -59,6 +59,17 @@ type ApplyWorker struct {
 	// xact are an apply error.
 	currentTx mvcc.Transaction
 	inXact    bool
+
+	// Tablesync gating. When pubsub and subName are both set,
+	// applyInsert skips changes for relations that aren't at
+	// state 'r' yet (tablesync still in progress), and
+	// applyCommit promotes 's' → 'r' for relations whose
+	// recorded sync-end LSN has been crossed by this commit.
+	// Mirrors upstream worker.c's process_syncing_tables_for_apply.
+	// Both nil/empty preserves the legacy "apply everything"
+	// path that existing tests depend on.
+	pubsub  *catalog.PubSub
+	subName string
 }
 
 // applyRel pairs a remote Relation message with its resolved
@@ -78,6 +89,18 @@ func NewApplyWorker(cat catalog.Catalog, pool *storage.Pool, txnMgr *mvcc.Manage
 		txnMgr:    txnMgr,
 		relations: map[uint32]*applyRel{},
 	}
+}
+
+// SetSubscriptionContext binds the worker to a subscription's
+// tablesync state in the supplied PubSub registry. With both
+// arguments non-zero, the apply path consults
+// pg_subscription_rel before applying each change and updates it
+// after each commit; passing nil/"" disables gating (the legacy
+// path used by tests that don't model tablesync). Idempotent;
+// safe to call before the first message arrives.
+func (w *ApplyWorker) SetSubscriptionContext(ps *catalog.PubSub, subName string) {
+	w.pubsub = ps
+	w.subName = subName
 }
 
 // ApplyMessage handles one decoded pgoutput event. The second
@@ -146,6 +169,23 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 		return fmt.Errorf("applyworker: INSERT for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
 	}
+	// Tablesync gate: while the relation is still at state 'i'
+	// or 'd' (initial COPY in progress) or 's' (snapshot drained
+	// but apply hasn't crossed the sync-end LSN), the row is
+	// either already coming through tablesync or we'd be
+	// double-applying it. Skip silently — the row will reach
+	// the local table via the tablesync worker. State 'r'
+	// (ready) is the only state where streaming applies.
+	if w.pubsub != nil && w.subName != "" {
+		// Resolve the local rel's OID from the catalog so the
+		// gate keys off the same identifier the tablesync
+		// transport used to seed the row.
+		localOID := w.cat.RelFileNode(r.local).RelOid
+		if sr, tracked := w.pubsub.LookupSubscriptionRel(w.subName, localOID); tracked &&
+			sr.State != catalog.SubRelStateReady {
+			return nil
+		}
+	}
 	row, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode insert tuple for %q: %w", r.local.Name, err)
@@ -178,18 +218,45 @@ func (w *ApplyWorker) applyDelete(_ *wal.DecodedMessage) error {
 }
 
 func (w *ApplyWorker) applyCommit(m *wal.DecodedMessage) error {
-	if !w.inXact {
-		// Idle commit (no Begin observed) — v0 pgoutput emits
-		// commit-only sequences only when every change was
-		// filtered. Tolerate as a no-op.
-		return nil
+	if w.inXact {
+		if err := w.txnMgr.Commit(w.currentTx); err != nil {
+			return fmt.Errorf("applyworker: commit (commit_lsn=%d): %w", m.CommitLSN, err)
+		}
+		w.inXact = false
+		w.currentTx = mvcc.Transaction{}
 	}
-	if err := w.txnMgr.Commit(w.currentTx); err != nil {
-		return fmt.Errorf("applyworker: commit (commit_lsn=%d): %w", m.CommitLSN, err)
-	}
-	w.inXact = false
-	w.currentTx = mvcc.Transaction{}
+	// (Idle commit with no Begin observed — v0 pgoutput can emit
+	// commit-only sequences when every change was filtered.
+	// Falls through to the tablesync promotion check below.)
+	w.promoteSyncedRels(m.CommitLSN)
 	return nil
+}
+
+// promoteSyncedRels advances every subscription_rel in state 's'
+// whose recorded sync-end LSN has been crossed by this commit
+// to state 'r'. Mirrors the apply-worker side of upstream
+// worker.c's process_syncing_tables_for_apply: once the apply
+// stream has replayed past the snapshot LSN that tablesync
+// captured, it is safe to merge the relation into the streaming
+// path without double-applying. v0's tablesync transport records
+// LSN=0 (no per-snapshot handoff yet), so the first observed
+// commit promotes any 's' rel — conservative but correct given
+// the COPY happens on the same publisher/slot timeline as the
+// streaming apply.
+func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
+	if w.pubsub == nil || w.subName == "" {
+		return
+	}
+	for _, sr := range w.pubsub.SubscriptionRels(w.subName) {
+		if sr.State != catalog.SubRelStateSyncDone {
+			continue
+		}
+		if commitLSN < sr.LSN {
+			continue
+		}
+		_, _ = w.pubsub.AdvanceSubscriptionRel(w.subName, sr.RelOID,
+			catalog.SubRelStateReady, commitLSN)
+	}
 }
 
 // decodePgoutputTupleAsRow parses each pgoutput text-format

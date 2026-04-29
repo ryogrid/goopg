@@ -247,3 +247,259 @@ func pgoutputMessageLength(buf []byte) (int, error) {
 	}
 	return 0, nil
 }
+
+// pgoutputBIRC builds the B → R → I → C byte stream for one
+// (relfile, [datums]) pair, mirroring what the publisher emits
+// over CopyData. Returned bytes are framed back-to-back; the
+// caller chunks them with pgoutputMessageLength. Reused by
+// the tablesync gating tests below.
+func pgoutputBIRC(t *testing.T, snap *wal.CatalogSnapshot, rel storage.RelFileNode,
+	id int, label string, commitLSN uint64) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	po := wal.NewPgOutput(snap, &buf)
+	if err := po.Begin(42, commitLSN); err != nil {
+		t.Fatal(err)
+	}
+	body := encodeBodyV0([]any{id, label}, []string{"int4", "text"})
+	tuple := wrapAsHeapTuple(t, body)
+	if err := po.Change(wal.Change{
+		Kind:     wal.ChangeInsert,
+		Rel:      rel,
+		NewTuple: tuple,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := po.Commit(42, commitLSN); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// driveStream chunks the encoder output and feeds each message
+// through the apply worker. Returns the last commit LSN observed.
+// Test helper.
+func driveStream(t *testing.T, w *ApplyWorker, stream []byte) uint64 {
+	t.Helper()
+	consumed := 0
+	var commitLSN uint64
+	for consumed < len(stream) {
+		end, err := pgoutputMessageLength(stream[consumed:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := wal.DecodeMessage(stream[consumed : consumed+end])
+		if err != nil {
+			t.Fatal(err)
+		}
+		lsn, err := w.ApplyMessage(m)
+		if err != nil {
+			t.Fatalf("ApplyMessage(kind=%q): %v", m.Kind, err)
+		}
+		if lsn != 0 {
+			commitLSN = lsn
+		}
+		consumed += end
+	}
+	return commitLSN
+}
+
+// TestApplyWorkerSkipsChangesForRelInTablesync pins the gating
+// rule: when a subscription_rel is at state 'd' (still copying),
+// the apply worker drops INSERT events for that rel rather than
+// double-applying — the tablesync worker is responsible for
+// getting that data into the table. Mirrors the upstream
+// `should_apply_changes_for_rel` early-out.
+func TestApplyWorkerSkipsChangesForRelInTablesync(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	rel := pubCat.RelFileNode(pubTbl)
+
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	subRel := subCat.RelFileNode(subTbl)
+
+	// Wire the apply worker to a subscription whose 'items'
+	// row is at state 'd' (data copy in progress).
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub1", "x", []string{"p"}, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("sub1", subRel.RelOid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AdvanceSubscriptionRel("sub1", subRel.RelOid,
+		catalog.SubRelStateDataCopy, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	w.SetSubscriptionContext(ps, "sub1")
+	defer w.SafeRollback()
+
+	stream := pgoutputBIRC(t, snap, rel, 99, "skipped", 0xFEED)
+	if lsn := driveStream(t, w, stream); lsn != 0xFEED {
+		t.Errorf("commit LSN=%x want 0xFEED", lsn)
+	}
+
+	// SeqScan should see zero rows — the INSERT was filtered.
+	tx, _ := subCtx.TxnMgr.Begin(0)
+	defer subCtx.TxnMgr.Rollback(tx)
+	snap2, _ := subCtx.TxnMgr.SnapshotFor(tx)
+	scanCtx := NewContext()
+	scanCtx.Pool = subCtx.Pool
+	scanCtx.Catalog = subCat
+	scanCtx.TxnMgr = subCtx.TxnMgr
+	scanCtx.Tx = tx
+	scanCtx.Snap = snap2
+	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("subscriber scan returned %d rows; gating should have dropped the INSERT", len(rows))
+	}
+
+	// Rel state must still be 'd' — the apply worker's promotion
+	// logic only advances 's' rows, never resets the table.
+	got, _ := ps.LookupSubscriptionRel("sub1", subRel.RelOid)
+	if got.State != catalog.SubRelStateDataCopy {
+		t.Errorf("state=%q want d (gating should not advance state)", got.State)
+	}
+}
+
+// TestApplyWorkerPromotesSyncDoneToReadyOnCommit pins the
+// `s` → `r` advance: when a rel is at state 's' with a recorded
+// sync-end LSN, the first commit at-or-after that LSN promotes
+// it to 'r' so subsequent INSERTs apply directly. This mirrors
+// upstream worker.c's process_syncing_tables_for_apply.
+func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	rel := pubCat.RelFileNode(pubTbl)
+
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	subRel := subCat.RelFileNode(subTbl)
+
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub1", "x", []string{"p"}, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("sub1", subRel.RelOid); err != nil {
+		t.Fatal(err)
+	}
+	// Walk i → d → s with a recorded end-LSN of 0xCAFE; the
+	// commit below at 0xFEED is past it so promotion fires.
+	if _, err := ps.AdvanceSubscriptionRel("sub1", subRel.RelOid,
+		catalog.SubRelStateDataCopy, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AdvanceSubscriptionRel("sub1", subRel.RelOid,
+		catalog.SubRelStateSyncDone, 0xCAFE); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	w.SetSubscriptionContext(ps, "sub1")
+	defer w.SafeRollback()
+
+	// First commit at 0xFEED — past the sync-end LSN. The INSERT
+	// itself is gated (state is still 's' when it arrives), but
+	// the commit promotes 's' → 'r'.
+	stream := pgoutputBIRC(t, snap, rel, 1, "first", 0xFEED)
+	driveStream(t, w, stream)
+	got, _ := ps.LookupSubscriptionRel("sub1", subRel.RelOid)
+	if got.State != catalog.SubRelStateReady {
+		t.Errorf("after first commit: state=%q want r", got.State)
+	}
+
+	// A second B/R/I/C now applies directly because the rel is
+	// 'r'. Use a fresh worker so no relation cache leaks state
+	// between phases (the existing one would still work).
+	w2 := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	w2.SetSubscriptionContext(ps, "sub1")
+	defer w2.SafeRollback()
+	stream2 := pgoutputBIRC(t, snap, rel, 2, "second", 0xFFFF)
+	driveStream(t, w2, stream2)
+
+	tx, _ := subCtx.TxnMgr.Begin(0)
+	defer subCtx.TxnMgr.Rollback(tx)
+	snap2, _ := subCtx.TxnMgr.SnapshotFor(tx)
+	scanCtx := NewContext()
+	scanCtx.Pool = subCtx.Pool
+	scanCtx.Catalog = subCat
+	scanCtx.TxnMgr = subCtx.TxnMgr
+	scanCtx.Tx = tx
+	scanCtx.Snap = snap2
+	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0][0].Int != 2 {
+		t.Errorf("scan rows=%v want one row with id=2", rows)
+	}
+}
+
+// TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS:
+// when a commit's LSN is below a subscription_rel's recorded
+// end-LSN, the rel stays at 's' (still waiting for the apply
+// stream to catch up).
+func TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	rel := pubCat.RelFileNode(pubTbl)
+
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	subRel := subCat.RelFileNode(subTbl)
+
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub1", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("sub1", subRel.RelOid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AdvanceSubscriptionRel("sub1", subRel.RelOid,
+		catalog.SubRelStateDataCopy, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Sync end LSN is 0xFFFFFFFF; commit below is at 0x100. The
+	// commit must NOT promote.
+	if _, err := ps.AdvanceSubscriptionRel("sub1", subRel.RelOid,
+		catalog.SubRelStateSyncDone, 0xFFFFFFFF); err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	w.SetSubscriptionContext(ps, "sub1")
+	defer w.SafeRollback()
+
+	stream := pgoutputBIRC(t, snap, rel, 1, "x", 0x100)
+	driveStream(t, w, stream)
+	got, _ := ps.LookupSubscriptionRel("sub1", subRel.RelOid)
+	if got.State != catalog.SubRelStateSyncDone {
+		t.Errorf("state=%q want s (commit below sync-end LSN must not promote)", got.State)
+	}
+	_ = subTbl // silence unused if scan removed
+}

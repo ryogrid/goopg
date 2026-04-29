@@ -2621,14 +2621,68 @@ item.
       lives in the next bullet alongside the apply-worker
       `s` → `r` driver.)
 
-- [ ] Apply-worker tablesync integration: hook the streaming
-      apply path so that for each relation it observes a
-      change for, it consults `pg_subscription_rel` and
-      either (a) buffers/skips changes until the table
-      reaches state `r`, or (b) advances `s` → `r` on the
-      first commit at-or-after the tablesync end-LSN.
-      Mirrors upstream's `process_syncing_tables` loop in
-      `worker.c`.
+- [x] Apply-worker tablesync integration. (landed
+      2026-04-29: `executor.ApplyWorker` gained an optional
+      tablesync context (`SetSubscriptionContext(ps,
+      subName)`) and two new behaviours on top of the
+      existing B/R/I/D/C dispatch. (1) Per-change gating in
+      `applyInsert`: when the worker has a subscription
+      context and the rel's `pg_subscription_rel.srsubstate`
+      is anything other than `r`, the INSERT is skipped
+      silently — the tablesync worker is responsible for
+      seeding that data via the COPY path, and applying it
+      again here would double-write. The local OID is
+      resolved through `cat.RelFileNode(local).RelOid` so
+      the gate keys off the same identifier the tablesync
+      transport used. A rel with no `subRels` row is
+      treated as ungated (apply normally) so existing
+      tests that don't model tablesync keep passing. (2)
+      Per-commit promotion in `applyCommit` (renamed loop
+      now also runs after a commit-only sequence with no
+      open xact): `promoteSyncedRels` walks
+      `SubscriptionRels(subName)` and, for every row at
+      state `s` whose recorded sync-end LSN ≤ the just-
+      observed commit LSN, advances it to `r` via
+      `AdvanceSubscriptionRel`. v0's tablesync transport
+      records LSN=0 (no per-snapshot handoff yet), so the
+      first commit observed promotes the rel — conservative
+      but correct given COPY happens on the same publisher
+      timeline as the streaming apply. Mirrors upstream
+      worker.c's `process_syncing_tables_for_apply` and
+      `should_apply_changes_for_rel`. Tests in
+      `internal/executor/applyworker_test.go`:
+      TestApplyWorkerSkipsChangesForRelInTablesync (rel at
+      `d` causes INSERT to be dropped; SeqScan sees zero
+      rows; state stays at `d`),
+      TestApplyWorkerPromotesSyncDoneToReadyOnCommit (rel
+      at `s` with LSN=0xCAFE; commit at 0xFEED promotes to
+      `r`; a subsequent INSERT then applies because the
+      rel is `r`),
+      TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS
+      (rel at `s` with LSN=0xFFFFFFFF; commit at 0x100
+      doesn't promote — apply hasn't crossed the sync
+      boundary yet). Existing tests
+      (TestApplyWorkerInsertsRowFromPgoutputStream,
+      TestApplyWorkerCommitOutsideXactIsNoop,
+      TestApplyWorkerInsertWithoutRelationFails) still
+      green via the no-context default. Helpers
+      `pgoutputBIRC` and `driveStream` factor the encoder
+      and chunker boilerplate so the new tests stay
+      readable. Built and full `go test ./...` green. With
+      this slice the apply path correctly cooperates with
+      tablesync: rels in copy phase are filtered, and
+      crossing the sync boundary promotes them so streaming
+      takes over without double-applying.)
+
+- [ ] Tablesync caller wiring: per-subscription manager
+      that on subscriber start dials the publisher, walks
+      `SubscriptionRels(subName)` looking for non-`r`
+      rows, opens a (second) connection per such rel,
+      invokes `RunTableSync` to drive `i → d → s`, and
+      then hands the streaming connection to the apply
+      worker (which already advances `s → r` on commit).
+      Mirrors upstream's per-table `LogicalRepSyncTableStart`
+      worker spawn.
 
 - [ ] Logical-replication observability: `pg_stat_subscription`,
       logical-replication rows in `pg_stat_replication`, structured
