@@ -975,3 +975,64 @@ func TestSetAsyncFlushBatchSizeClamps(t *testing.T) {
 		t.Errorf("batch=10×Max → flushBatchSize=%d want %d", got, MaxFlushBatchSize)
 	}
 }
+
+// TestPrefetchBlockPopulatesTarget pins that PrefetchBlock
+// stamps the AIOSubmitOp.Target field with the relfile's
+// path so pg_aios.target_desc can render it.
+func TestPrefetchBlockPopulatesTarget(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17400, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := &recordingAIOEngine{}
+	mgr.SetAIO(eng)
+	got := make(Page, BlockSize)
+	h, err := mgr.PrefetchBlock(rel, 0, got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := h.Wait(); werr != nil {
+		t.Fatal(werr)
+	}
+	if len(eng.submits) != 1 {
+		t.Fatalf("submits=%d want 1", len(eng.submits))
+	}
+	want := filepath.Join(dir, "base", "1", "17400")
+	if got := eng.submits[0].Target; got != want {
+		t.Errorf("Target=%q want %q", got, want)
+	}
+}
+
+// TestWriteBlockAIOPopulatesTarget: the write path also stamps
+// Target with the relfile path.
+func TestWriteBlockAIOPopulatesTarget(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17401, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := &recordingAIOEngine{}
+	mgr.SetAIO(eng)
+	h, err := mgr.WriteBlockAIO(rel, 0, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := h.Wait(); werr != nil {
+		t.Fatal(werr)
+	}
+	want := filepath.Join(dir, "base", "1", "17401")
+	if got := eng.submits[0].Target; got != want {
+		t.Errorf("Target=%q want %q", got, want)
+	}
+}

@@ -133,6 +133,21 @@ Some upstream fields (`target`, `target_desc`, `raw_result`)
 are not yet tracked and would need plumbing the relfile
 identity through the AIO seam — deferred.
 
+## `pg_aios.target_desc` (landed)
+
+`aio.Op` carries a free-form `Target string` field; the
+engine threads it through `inFlightEntry` and surfaces it on
+`InFlightInfo`. `storage.AIOSubmitOp` and `wal.AIOSubmitOp`
+both gained matching fields, and the initdb adapters
+propagate them through. The storage `Manager.PrefetchBlock`
+/ `Manager.WriteBlockAIO` paths stamp `relFile.path` on every
+submit; `wal.state.writeAt` stamps `f.Name()` (the segment
+file path). `pg_aios` grew a `target_desc` column rendering
+that string verbatim. Empty strings render blank for callers
+that don't set it. Closes the upstream-shape gap:
+`\watch pg_aios` now lets an operator see exactly which
+relfile or WAL segment a stalled I/O targets.
+
 ## What this slice doesn't deliver
 
 - **AIO wait events.** "Waiting on AIO completion" hasn't
@@ -147,10 +162,6 @@ identity through the AIO seam — deferred.
 - **Histograms / latency percentiles.** Out of scope; the
   observability surface here is for "is it running," not for
   performance regression triage.
-- **`pg_aios.target_desc`.** The relfile identity isn't
-  threaded through `aio.Op` — the engine sees an `aio.File`
-  interface, not a tagged identity. Adding a `Target string`
-  field on `Op` is a cheap follow-up.
 
 ## Cross-references
 

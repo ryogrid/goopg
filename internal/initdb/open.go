@@ -457,6 +457,7 @@ func (a aioEngineAdapter) Submit(op storage.AIOSubmitOp) storage.AIOHandle {
 			Buffer:    op.Buffer,
 			Offset:    op.Offset,
 			Direction: dir,
+			Target:    op.Target,
 		}),
 	}
 }
@@ -508,6 +509,7 @@ func (a walAIOEngineAdapter) Submit(op wal.AIOSubmitOp) wal.AIOHandle {
 			Buffer:    op.Buffer,
 			Offset:    op.Offset,
 			Direction: dir,
+			Target:    op.Target,
 		}),
 	}
 }

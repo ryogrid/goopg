@@ -73,6 +73,7 @@ func registerPgAiosView(cat *catalog.InMemory, eng *aio.Engine) error {
 			{Name: "length", Type: catalog.Type{Name: "text"}},
 			{Name: "submitted_at", Type: catalog.Type{Name: "text"}},
 			{Name: "elapsed_us", Type: catalog.Type{Name: "text"}},
+			{Name: "target_desc", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -91,6 +92,7 @@ func registerPgAiosView(cat *catalog.InMemory, eng *aio.Engine) error {
 				fmt.Sprintf("%d", e.Length),
 				e.SubmittedAt.UTC().Format(time.RFC3339Nano),
 				fmt.Sprintf("%d", now.Sub(e.SubmittedAt).Microseconds()),
+				e.Target,
 			})
 		}
 		return out

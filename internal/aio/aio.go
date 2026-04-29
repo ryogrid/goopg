@@ -91,6 +91,14 @@ type Op struct {
 	Offset    int64
 	Direction Direction
 
+	// Target is a free-form descriptor identifying what this
+	// I/O is reading from / writing to (typically the relfile
+	// path for storage Ops or the segment path for WAL Ops).
+	// Surfaced through `pg_aios.target_desc`. Empty when the
+	// caller doesn't supply one — the view renders blank in
+	// that case. Mirrors upstream's `pgaio_target_desc`.
+	Target string
+
 	// Callback, if non-nil, fires on the engine's completion
 	// goroutine after the I/O lands. Mirrors upstream's
 	// `pgaio_io_register_callbacks`. Nil is fine — Wait
@@ -199,6 +207,7 @@ type inFlightEntry struct {
 	direction   Direction
 	length      int
 	offset      int64
+	target      string
 }
 
 // InFlightInfo is the public, copy-on-read view of one
@@ -210,6 +219,7 @@ type InFlightInfo struct {
 	Length      int
 	Offset      int64
 	SubmittedAt time.Time
+	Target      string
 }
 
 // EngineConfig parameterises NewEngine. Method names mirror
@@ -298,6 +308,7 @@ func (e *Engine) registerInFlight(h *Handle, op *Op) {
 		direction:   op.Direction,
 		length:      len(op.Buffer),
 		offset:      op.Offset,
+		target:      op.Target,
 	}
 	e.inflightMu.Lock()
 	e.inflight[id] = entry
@@ -352,6 +363,7 @@ func (e *Engine) InFlight() []InFlightInfo {
 			Length:      en.length,
 			Offset:      en.offset,
 			SubmittedAt: en.submittedAt,
+			Target:      en.target,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })

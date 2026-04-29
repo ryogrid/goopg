@@ -68,6 +68,10 @@ type AIOSubmitOp struct {
 	Buffer    []byte
 	Offset    int64
 	Direction AIODirection
+	// Target is a free-form descriptor (typically the WAL
+	// segment path) the engine surfaces through
+	// pg_aios.target_desc. Empty leaves the column blank.
+	Target string
 }
 
 // AIOFile mirrors storage.AIOFile: a pread/pwrite-shaped
@@ -608,6 +612,7 @@ func (s *state) writeAt(pos int64, buf []byte) error {
 				Buffer:    buf[:chunk],
 				Offset:    segOff,
 				Direction: AIODirWrite,
+				Target:    f.Name(),
 			})
 			n, err = h.Wait()
 		} else {

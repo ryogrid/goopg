@@ -3287,6 +3287,30 @@ See `docs/milestones/0009-aio-subsystem.md`.
       follow-up slices — all unblocked now that per-
       handle tracking is in place.)
 
+- [x] AIO `pg_aios.target_desc` — file-path identity on
+      every outstanding I/O. (landed 2026-04-29: `aio.Op`
+      gained a free-form `Target string` field; the
+      engine's `inFlightEntry` and the public
+      `InFlightInfo` surface it. `storage.AIOSubmitOp`
+      and `wal.AIOSubmitOp` both gained matching `Target`
+      fields and the initdb adapters propagate them.
+      `Manager.PrefetchBlock` and `Manager.WriteBlockAIO`
+      stamp `f.path` on every submit; `wal.state.writeAt`
+      stamps `f.Name()` on every WAL segment write. The
+      `pg_aios` view grew a `target_desc` column rendering
+      that string. Empty strings render blank — preserves
+      the "no target" case for callers that don't set it.
+      Tests: TestEngineInFlightTarget (engine snapshot
+      surfaces caller-supplied Target),
+      TestPrefetchBlockPopulatesTarget (storage read path
+      stamps the relfile path),
+      TestWriteBlockAIOPopulatesTarget (storage write
+      path stamps the relfile path). Built and full
+      `go test ./...` green. With this slice, every row
+      in pg_aios is human-attributable to a specific WAL
+      segment or relation file rather than just a numeric
+      offset.)
+
 - [ ] (BLOCKED) AIO wait-event surface: register a
       "waiting on AIO completion" wait event so a query
       stalled on an AIO Wait shows up identifiably in the

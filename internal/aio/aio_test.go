@@ -313,3 +313,36 @@ func (g *gateFileWith) WriteAt(p []byte, off int64) (int, error) {
 	return g.inner.WriteAt(p, off)
 }
 func (g *gateFileWith) releaseAll() { close(g.gate) }
+
+// TestEngineInFlightTarget pins the new Target field: callers
+// stamp Op.Target; the engine's InFlight() snapshot surfaces
+// it on each entry so pg_aios.target_desc can render the
+// human-readable identifier for an outstanding I/O.
+func TestEngineInFlightTarget(t *testing.T) {
+	e, err := NewEngine(EngineConfig{
+		Method: MethodWorker, Workers: 1, MaxConcurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	g := newGateFileWith(64)
+	h := e.Submit(Op{
+		File: g, Buffer: make([]byte, 8),
+		Offset: 0, Direction: DirRead,
+		Target: "base/1/16385",
+	})
+	deadline := 1000
+	for len(e.InFlight()) < 1 && deadline > 0 {
+		deadline--
+	}
+	snap := e.InFlight()
+	if len(snap) != 1 {
+		t.Fatalf("inflight len=%d want 1", len(snap))
+	}
+	if snap[0].Target != "base/1/16385" {
+		t.Errorf("Target=%q want base/1/16385", snap[0].Target)
+	}
+	g.releaseAll()
+	h.Wait()
+}

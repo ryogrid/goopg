@@ -44,6 +44,10 @@ type AIOSubmitOp struct {
 	// semantics so callers that don't set it explicitly
 	// continue to issue reads.
 	Direction AIODirection
+	// Target is a free-form descriptor (typically the relfile
+	// path) the engine surfaces through pg_aios.target_desc.
+	// Empty leaves the column blank.
+	Target string
 }
 
 // AIODirection mirrors aio.Direction without taking the import.
@@ -166,7 +170,12 @@ func (m *Manager) PrefetchBlock(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		}
 		return preCompletedHandle{n: n, err: err}, nil
 	}
-	return eng.Submit(AIOSubmitOp{File: f, Buffer: buf, Offset: off}), nil
+	return eng.Submit(AIOSubmitOp{
+		File:   f,
+		Buffer: buf,
+		Offset: off,
+		Target: f.path,
+	}), nil
 }
 
 // preCompletedHandle is the AIOHandle a synchronous-fallback
@@ -221,6 +230,7 @@ func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (A
 		Buffer:    buf,
 		Offset:    off,
 		Direction: AIODirWrite,
+		Target:    f.path,
 	}), nil
 }
 
