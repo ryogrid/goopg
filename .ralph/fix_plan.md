@@ -2767,6 +2767,47 @@ Substantial. Decompose when picked up.
 
 See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
 
+- [x] SELECT … FOR UPDATE parser surface + AST
+      (M0021-0001 step 1). Design doc
+      `docs/design/0021-0001-for-update-parser-analysis-and-ast.md`.
+      (landed 2026-04-30: parser-only additive slice
+      mirroring M0016-0001 / M0017-0001 / M0018-0001
+      step-1 pattern. `SelectStmt.Locking
+      []*LockingClause` — empty-default keeps existing
+      tests byte-unchanged. New AST: `LockStrength`
+      enum (`LockStrengthForUpdate=iota+1`,
+      `LockStrengthForShare`; zero reserved),
+      `LockWaitPolicy` enum (Block / NoWait /
+      SkipLocked), `LockingClause` (Strength + Targets
+      + WaitPolicy). New keywords: KwShare / KwOf /
+      KwNowait / KwSkip / KwLocked. `parseLockingClause`
+      called in a for-loop after LIMIT/OFFSET/FETCH so
+      multiple clauses collect in source order
+      (upstream allows e.g. `FOR UPDATE OF a NOWAIT
+      FOR SHARE OF b`). OF list captured as raw
+      identifiers; alias/table-name resolution is the
+      analyzer's job. SKIP requires LOCKED. Stage A
+      only accepts UPDATE and SHARE — NO KEY UPDATE /
+      KEY SHARE deferred (would need NO+KEY composite
+      tokens). `planSelect` second-line gate rejects
+      `len(s.Locking) > 0` with 0A000 — two-step gate:
+      parse the surface so diagnostics surface specific
+      feature names, refuse to silently drop locking
+      intent at runtime. Tests in locking_test.go: 10
+      scenarios — all six accepted shapes (bare FOR
+      UPDATE / FOR SHARE / OF list / NOWAIT / SKIP
+      LOCKED / multi-clause / AFTER LIMIT) plus 2
+      diagnostic guards (FOR READ, bare SKIP) plus 1
+      rollout guardrail (TestParseSelectWithoutLocking
+      Unchanged). Full `go test ./...` green. Analyzer
+      validation + planner row-lock metadata +
+      executor row-lock acquisition + NOWAIT/SKIP
+      LOCKED runtime + deadlock + observability all
+      deferred to M0021-0001 step 2 / M0021-0002 /
+      M0021-0003 / M0021-0004.)
+- [ ] SELECT … FOR UPDATE — analyzer + planner +
+      executor wiring (M0021-0001 step 2 / M0021-0002 /
+      M0021-0003 / M0021-0004).
 - [ ] Tuple-level pessimistic locking on top of M0012 lock
       manager.
 

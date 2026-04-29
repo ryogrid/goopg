@@ -292,6 +292,60 @@ func (w *WithClause) Pos() int { return w.pos }
 // The optional `With` field (M0016-0001) is nil when no WITH
 // clause precedes the SELECT — pre-M0016 tests are byte-for-byte
 // unchanged.
+// LockStrength enumerates the row-locking strength a `FOR …` clause
+// requests. v0 supports the two upstream strengths most commonly
+// emitted by ORMs: `FOR UPDATE` (write intent) and `FOR SHARE`
+// (read intent). `FOR NO KEY UPDATE` / `FOR KEY SHARE` are
+// upstream extensions out of scope for M0021 — adding them is a
+// future loop on top of the same AST shape.
+type LockStrength int
+
+const (
+	// LockStrengthForUpdate — `FOR UPDATE`. Write-intent row
+	// lock; mirrors upstream's LCS_FORUPDATE.
+	LockStrengthForUpdate LockStrength = iota + 1
+	// LockStrengthForShare — `FOR SHARE`. Read-intent row lock;
+	// mirrors upstream's LCS_FORSHARE.
+	LockStrengthForShare
+)
+
+// LockWaitPolicy enumerates the wait modifier on a row-locking
+// clause. Block (the default) waits until the lock is released or
+// a deadlock is detected; NoWait fails immediately on contention;
+// SkipLocked silently omits contended rows from the result.
+type LockWaitPolicy int
+
+const (
+	// LockWaitBlock is the default — wait for contended row locks.
+	LockWaitBlock LockWaitPolicy = iota
+	// LockWaitNoWait — `NOWAIT`. Fail with SQLSTATE 55P03 on
+	// contention. Mirrors upstream's LockWaitError.
+	LockWaitNoWait
+	// LockWaitSkipLocked — `SKIP LOCKED`. Silently drop contended
+	// rows. Mirrors upstream's LockWaitSkip.
+	LockWaitSkipLocked
+)
+
+// LockingClause holds one parsed `FOR { UPDATE | SHARE } [ OF
+// table_name [, …] ] [ NOWAIT | SKIP LOCKED ]` tail. PostgreSQL
+// allows multiple locking clauses per SELECT (each with its own OF
+// list and wait policy) so we store them as an ordered slice on
+// SelectStmt.
+//
+// Targets is empty when no `OF` list was supplied — the lock
+// applies to every range variable in the FROM clause; otherwise
+// each name must resolve to a FROM-clause alias / table at
+// analyze time.
+type LockingClause struct {
+	pos        int
+	Strength   LockStrength
+	Targets    []string
+	WaitPolicy LockWaitPolicy
+}
+
+// Pos returns the position of the leading `FOR` keyword.
+func (c *LockingClause) Pos() int { return c.pos }
+
 type SelectStmt struct {
 	pos      int
 	With     *WithClause
@@ -309,6 +363,11 @@ type SelectStmt struct {
 	Limit     Expr // nil when absent; integer expression in v0
 	Offset    Expr // nil when absent
 	SetOp     *SetOpClause
+	// Locking holds parsed `FOR UPDATE / FOR SHARE [OF …]
+	// [NOWAIT | SKIP LOCKED]` clauses (M0021-0001). Empty for
+	// every pre-M0021 SELECT — preserves byte-for-byte
+	// invariance across the existing parser/planner test suite.
+	Locking []*LockingClause
 }
 
 func (s *SelectStmt) Pos() int  { return s.pos }

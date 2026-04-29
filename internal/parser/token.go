@@ -147,6 +147,18 @@ const (
 	KwConflict Keyword = "conflict"
 	KwDo       Keyword = "do"
 	KwNothing  Keyword = "nothing"
+
+	// Pessimistic row locking (M0021): `SELECT ... FOR { UPDATE
+	// | SHARE } [ OF table [, ...] ] [ NOWAIT | SKIP LOCKED ]`.
+	// `KwFor`, `KwUpdate` already exist; the new ones are
+	// SHARE / OF / NOWAIT / SKIP / LOCKED. `FOR NO KEY UPDATE`
+	// and `FOR KEY SHARE` are out of scope for v0 (need NO + KEY
+	// composite keywords plus an extended LockStrength enum).
+	KwShare  Keyword = "share"
+	KwOf     Keyword = "of"
+	KwNowait Keyword = "nowait"
+	KwSkip   Keyword = "skip"
+	KwLocked Keyword = "locked"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -253,6 +265,11 @@ var keywords = map[string]Keyword{
 	"conflict":     KwConflict,
 	"do":           KwDo,
 	"nothing":      KwNothing,
+	"share":        KwShare,
+	"of":           KwOf,
+	"nowait":       KwNowait,
+	"skip":         KwSkip,
+	"locked":       KwLocked,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

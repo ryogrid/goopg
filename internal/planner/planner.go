@@ -187,6 +187,19 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 }
 
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	if len(s.Locking) > 0 {
+		// M0021-0001 step 1 (parser surface only) — planner /
+		// executor support for row-level locking lands in
+		// M0021-0002 / M0021-0003. Reject loudly so an
+		// unmigrated runtime never silently drops the FOR
+		// UPDATE intent. See
+		// docs/design/0021-0001-for-update-parser-analysis-and-ast.md.
+		return nil, &PlanError{
+			Pos:     s.Locking[0].Pos(),
+			Code:    "0A000",
+			Message: "row-level locking clauses are not supported in v0 planner",
+		}
+	}
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH

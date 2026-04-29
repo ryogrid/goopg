@@ -136,7 +136,67 @@ func (p *parser) parseSelect() (Stmt, error) {
 	} else if ok {
 		s.SetOp = setOp
 	}
+	// Trailing locking clause(s) — `FOR UPDATE / FOR SHARE [OF
+	// …] [NOWAIT | SKIP LOCKED]`. M0021-0001 step 1 (parser
+	// only). Multiple clauses with different OF lists / wait
+	// policies are allowed per upstream.
+	for p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFor {
+		lc, err := p.parseLockingClause()
+		if err != nil {
+			return nil, err
+		}
+		s.Locking = append(s.Locking, lc)
+	}
 	return s, nil
+}
+
+// parseLockingClause parses one `FOR { UPDATE | SHARE } [ OF
+// table_name [, …] ] [ NOWAIT | SKIP LOCKED ]` tail. The leading
+// FOR keyword is the current token on entry. Stage A scope:
+//
+//   - LockStrength: UPDATE | SHARE. NO KEY UPDATE / KEY SHARE are
+//     out of scope for v0 (would need NO + KEY composite forms).
+//   - WaitPolicy: NOWAIT and SKIP LOCKED parse but the analyzer +
+//     executor decide which strengths actually take effect (Stage
+//     B promotes the wait modifiers).
+func (p *parser) parseLockingClause() (*LockingClause, error) {
+	t, err := p.expectKeyword(KwFor)
+	if err != nil {
+		return nil, err
+	}
+	lc := &LockingClause{pos: t.Pos}
+	switch {
+	case p.acceptKeyword(KwUpdate):
+		lc.Strength = LockStrengthForUpdate
+	case p.acceptKeyword(KwShare):
+		lc.Strength = LockStrengthForShare
+	default:
+		return nil, p.errAtCur("expected UPDATE or SHARE after FOR")
+	}
+	if p.acceptKeyword(KwOf) {
+		first, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		lc.Targets = []string{identText(first)}
+		for p.acceptSymbol(",") {
+			next, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			lc.Targets = append(lc.Targets, identText(next))
+		}
+	}
+	switch {
+	case p.acceptKeyword(KwNowait):
+		lc.WaitPolicy = LockWaitNoWait
+	case p.acceptKeyword(KwSkip):
+		if _, err := p.expectKeyword(KwLocked); err != nil {
+			return nil, err
+		}
+		lc.WaitPolicy = LockWaitSkipLocked
+	}
+	return lc, nil
 }
 
 func (p *parser) parseExprList() ([]Expr, error) {
