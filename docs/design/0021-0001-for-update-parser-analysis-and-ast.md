@@ -1,6 +1,6 @@
 # 0021-0001 — SELECT … FOR UPDATE Parser, AST, and Analysis
 
-**Status:** accepted (step 1 — parser + AST only)
+**Status:** accepted (steps 1–2: parser + AST + analyzer)
 **Milestone:** [0021 — Pessimistic Row Locking](../milestones/0021-pessimistic-lock-select-for-update.md)
 **Spans seam:** SQL parser surface, SelectStmt AST shape,
 analyzer / planner / executor hook points (deferred).
@@ -155,11 +155,69 @@ promotes the planner to row-lock metadata + executor wiring.
 
 Full `go test ./...` green.
 
+## Step 2 — analyzer wiring (landed 2026-04-30)
+
+`analyzeLockingClauses(s, ctx)` runs at the tail of
+`analyzeSelectWithParent` when `len(s.Locking) > 0`. Mirrors
+upstream's `transformLockingClause` / `preprocess_rowmarks`
+rejection set:
+
+- **Must have FROM**: locking is meaningless without rows from a
+  relation. `SELECT 1 FOR UPDATE` errors with SQLSTATE `0A000`
+  ("FOR UPDATE/SHARE is not allowed in this context").
+- **No GROUP BY / HAVING**: aggregation produces grouped rows
+  that don't map back to individual storage tuples. Errors with
+  SQLSTATE `0A000`.
+- **`OF` target resolution**: each name in the locking clause's
+  Targets list must match a FROM-clause range variable — by
+  alias when one is set, otherwise by table name (matches
+  upstream's alias-shadows-table rule for column references).
+  Mismatch surfaces SQLSTATE `42P01` (the canonical
+  "relation not in FROM" diagnostic).
+
+`lockingTargetMatches(name, rels)` is a small helper that walks
+the analyzer's `scopeRel` slice, skipping `qualifiedOnly` rels
+(none present in the SELECT scope today; future-proofing for
+cases where the merged-row trick from M0017 might leak into
+SELECT analysis).
+
+Wait-policy modifiers (NOWAIT, SKIP LOCKED) are accepted by the
+analyzer for AST stability across stages — the planner /
+executor narrow the supported runtime subset later.
+
+### Tests
+
+`internal/analyzer/locking_test.go`:
+
+- `TestAnalyzeForUpdateBasic` — happy-path FROM + FOR UPDATE.
+- `TestAnalyzeForUpdateOfAlias` — `OF a` resolves through alias.
+- `TestAnalyzeForUpdateOfTableNameWithoutAlias` — bare table name
+  works when no alias is set.
+- `TestAnalyzeForUpdateRequiresFromClause` — `0A000`.
+- `TestAnalyzeForUpdateRejectsGroupBy` — `0A000`.
+- `TestAnalyzeForUpdateRejectsHaving` — `0A000`.
+- `TestAnalyzeForUpdateUnknownTarget` — `42P01`.
+- `TestAnalyzeForUpdateRejectsTableNameWhenAliased` — `42P01`
+  (alias-shadows-table guarantee).
+- `TestAnalyzeForShareAccepted` — read-intent variant.
+- `TestAnalyzeForUpdateMultiClauseAccepted` — multi-clause shape
+  validates each clause's targets independently against the
+  same FROM list.
+
+Full `go test ./...` green.
+
 ## Out of scope
 
-- Analyzer validation (alias / table-name resolution against the
-  FROM list, locking-clause placement in unsupported query
-  shapes) — M0021-0001 step 2.
+- Aggregate-functions-in-target detection (a SELECT like
+  `SELECT count(*) FROM t FOR UPDATE` should also error per
+  upstream, but the analyzer doesn't currently expose a "this
+  target list contains aggregates" predicate; deferred to the
+  planner slice when WindowFunc / aggregate node detection
+  lands cleanly).
+- Locking inside subqueries / CTEs — upstream forbids this, the
+  analyzer recurses into subquery analysis but doesn't yet plumb
+  the "outer locking context" needed to detect inner-query
+  conflicts.
 - Planner row-lock metadata + plan-node propagation —
   M0021-0002.
 - Executor row-lock acquisition + blocking semantics —

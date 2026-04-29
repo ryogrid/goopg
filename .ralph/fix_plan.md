@@ -2805,9 +2805,41 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       LOCKED runtime + deadlock + observability all
       deferred to M0021-0001 step 2 / M0021-0002 /
       M0021-0003 / M0021-0004.)
-- [ ] SELECT … FOR UPDATE — analyzer + planner +
-      executor wiring (M0021-0001 step 2 / M0021-0002 /
-      M0021-0003 / M0021-0004).
+- [x] SELECT … FOR UPDATE — **analyzer wiring**
+      (M0021-0001 step 2). Continues
+      `docs/design/0021-0001-for-update-parser-analysis-and-ast.md`.
+      (landed 2026-04-30: `analyzeLockingClauses(s, ctx)`
+      runs at the tail of `analyzeSelectWithParent` when
+      `len(s.Locking) > 0`. Mirrors upstream's
+      `transformLockingClause` / `preprocess_rowmarks`
+      rejection set: (1) **must have FROM** — `SELECT 1
+      FOR UPDATE` → 0A000 "FOR UPDATE/SHARE is not
+      allowed in this context"; (2) **no GROUP BY /
+      HAVING** — aggregation produces grouped rows that
+      don't map back to individual storage tuples, both
+      → 0A000; (3) **OF target resolution** — each name
+      must match a FROM-clause range variable by alias
+      (when set) or by bare table name, mismatch → 42P01
+      "relation not in FROM". `lockingTargetMatches`
+      uses the alias-shadows-table rule (when `rel.alias
+      != ""` we ONLY check alias — matches upstream
+      column-reference rules). Wait-policy modifiers
+      (NOWAIT, SKIP LOCKED) accepted at analyze time for
+      AST stability across stages. Tests in
+      `locking_test.go`: 10 scenarios covering every
+      accept/reject combination including the
+      multi-clause shape. Full `go test ./...` green.
+      Aggregate-functions-in-target detection deferred —
+      analyzer doesn't expose that predicate cleanly yet.
+      Locking inside subqueries/CTEs also deferred.
+      Planner row-lock metadata + executor lands in
+      M0021-0002 / M0021-0003 / M0021-0004.)
+- [ ] SELECT … FOR UPDATE — planner + executor
+      wiring (M0021-0002 / M0021-0003 / M0021-0004).
+      Reserves filenames
+      `docs/design/0021-0002-row-lock-planner-executor-integration.md`,
+      `docs/design/0021-0003-wait-policy-nowait-skip-locked.md`,
+      `docs/design/0021-0004-deadlock-observability-and-test-matrix.md`.
 - [ ] Tuple-level pessimistic locking on top of M0012 lock
       manager.
 

@@ -248,7 +248,76 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 			return analyzeError(s.Offset.Pos(), "42804", "OFFSET must be an integer expression")
 		}
 	}
+	if len(s.Locking) > 0 {
+		if err := analyzeLockingClauses(s, ctx); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// analyzeLockingClauses validates the parsed FOR UPDATE / FOR
+// SHARE tail (M0021-0001 step 2). Mirrors upstream's
+// transformLockingClause / preprocess_rowmarks rejection set:
+//
+//   - Locking is meaningless without a FROM clause — SQLSTATE
+//     0A000 ("FOR UPDATE/SHARE is not allowed in this context").
+//   - Locking conflicts with aggregation: GROUP BY and HAVING
+//     produce grouped rows that don't map back to individual
+//     storage tuples. Reject with 0A000.
+//   - Each `OF target_name` must resolve to a FROM-clause range
+//     variable (alias if present, otherwise table name).
+//     Mismatched names surface 42P01 (the canonical
+//     "table not found" diagnostic).
+//
+// Wait-policy modifiers (NOWAIT, SKIP LOCKED) are accepted by
+// the analyzer for AST stability across stages — the planner /
+// executor narrow the supported runtime subset later.
+func analyzeLockingClauses(s *parser.SelectStmt, ctx *scope) error {
+	first := s.Locking[0]
+	if len(s.From) == 0 {
+		return analyzeError(first.Pos(), "0A000",
+			"FOR UPDATE/SHARE is not allowed in this context")
+	}
+	if len(s.GroupBy) > 0 {
+		return analyzeError(first.Pos(), "0A000",
+			"FOR UPDATE/SHARE is not allowed with GROUP BY clause")
+	}
+	if s.Having != nil {
+		return analyzeError(first.Pos(), "0A000",
+			"FOR UPDATE/SHARE is not allowed with HAVING clause")
+	}
+	for _, lc := range s.Locking {
+		for _, name := range lc.Targets {
+			if !lockingTargetMatches(name, ctx.rels) {
+				return analyzeError(lc.Pos(), "42P01",
+					fmt.Sprintf("relation %q in FOR UPDATE/SHARE clause not found in FROM clause", name))
+			}
+		}
+	}
+	return nil
+}
+
+// lockingTargetMatches reports whether name matches one of the
+// FROM-clause relations: by alias when set, otherwise by table
+// name. Case-insensitive — matches scopeRelMatches's identifier
+// comparison.
+func lockingTargetMatches(name string, rels []scopeRel) bool {
+	for _, rel := range rels {
+		if rel.qualifiedOnly {
+			continue
+		}
+		if rel.alias != "" {
+			if strings.EqualFold(name, rel.alias) {
+				return true
+			}
+			continue
+		}
+		if strings.EqualFold(name, rel.table.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
