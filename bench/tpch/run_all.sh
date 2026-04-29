@@ -12,7 +12,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=env.sh
-source "${SCRIPT_DIR}/env.sh"
+source "${SCRIPT_DIR}/env_goopg.sh"
 
 keep_running=0
 for arg in "$@"; do
@@ -31,8 +31,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"${SCRIPT_DIR}/setup_pg.sh" --reset
-"${SCRIPT_DIR}/build_schema.sh"
-"${SCRIPT_DIR}/run_power_test.sh"
+"${SCRIPT_DIR}/setup_goopg.sh" --reset
+"${SCRIPT_DIR}/build_schema_goopg.sh"
+"${SCRIPT_DIR}/run_power_test_goopg.sh"
 
 echo "TPC-H benchmark finished."
