@@ -1,6 +1,10 @@
 package analyzer
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // TestAnalyzeOnConflictDoNothingNoTarget pins the simplest accepted
 // UPSERT shape — no target, no SET — through the analyzer. No
@@ -63,14 +67,59 @@ func TestAnalyzeOnConflictDoUpdateWithWhere(t *testing.T) {
 	}
 }
 
-// TestAnalyzeOnConflictRejectsConstraintTarget pins the Stage B
-// gate: `ON CONSTRAINT name` parses but the analyzer rejects with
-// SQLSTATE 0A000 so tooling can branch on a stable diagnostic.
-func TestAnalyzeOnConflictRejectsConstraintTarget(t *testing.T) {
+// TestAnalyzeOnConflictRejectsUnknownConstraint — `ON CONSTRAINT
+// name` is now supported (M0017 Stage B), but unknown / mismatched
+// constraint names surface 42704 ("constraint does not exist") so
+// tooling can branch on the canonical upstream diagnostic.
+func TestAnalyzeOnConflictRejectsUnknownConstraint(t *testing.T) {
 	cat := analyzerCatalog(t)
 	expectAnalyzeCode(t, cat,
-		"INSERT INTO pgbench_accounts (aid) VALUES (1) ON CONFLICT ON CONSTRAINT pk DO NOTHING",
-		"0A000")
+		"INSERT INTO pgbench_accounts (aid) VALUES (1) ON CONFLICT ON CONSTRAINT no_such_pk DO NOTHING",
+		"42704")
+}
+
+// TestAnalyzeOnConflictAcceptsConstraintTarget — Stage B happy
+// path. Analyzer must accept `ON CONSTRAINT name` once the
+// constraint exists as a unique index on the target table.
+func TestAnalyzeOnConflictAcceptsConstraintTarget(t *testing.T) {
+	cat := analyzerCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_pk"}, tbl, []string{"aid"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	sql := `INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0)
+		ON CONFLICT ON CONSTRAINT pgbench_accounts_pk DO UPDATE SET abalance = excluded.abalance`
+	if err := Analyze(parseOne(t, sql), cat); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+}
+
+// TestAnalyzeOnConflictRejectsNonUniqueConstraint — pinning
+// upstream's "is not a unique constraint" rule (42P10): a regular
+// non-unique index can't arbitrate conflicts.
+func TestAnalyzeOnConflictRejectsNonUniqueConstraint(t *testing.T) {
+	cat := analyzerCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_idx"}, tbl, []string{"aid"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	expectAnalyzeCode(t, cat,
+		"INSERT INTO pgbench_accounts (aid) VALUES (1) ON CONFLICT ON CONSTRAINT pgbench_accounts_idx DO NOTHING",
+		"42P10")
+}
+
+// TestAnalyzeOnConflictRejectsConstraintOnDifferentTable — the
+// named constraint must live on the INSERT target table; otherwise
+// 42704 (canonical "doesn't belong" diagnostic).
+func TestAnalyzeOnConflictRejectsConstraintOnDifferentTable(t *testing.T) {
+	cat := analyzerCatalog(t)
+	other, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_history"})
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_history_pk"}, other, []string{"tid"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	expectAnalyzeCode(t, cat,
+		"INSERT INTO pgbench_accounts (aid) VALUES (1) ON CONFLICT ON CONSTRAINT pgbench_history_pk DO NOTHING",
+		"42704")
 }
 
 // TestAnalyzeOnConflictRejectsUpdateWithoutTarget pins upstream's

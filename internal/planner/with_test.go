@@ -194,6 +194,33 @@ func TestPlanInsertOnConflictWithUniqueIndex(t *testing.T) {
 	}
 }
 
+// TestPlanInsertOnConflictByConstraintName — Stage B path: the
+// arbiter is resolved by a named constraint instead of column
+// inference. Pins (1) the planner accepts the constraint-name
+// shape and (2) ArbiterIndex points at the named index.
+func TestPlanInsertOnConflictByConstraintName(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_pkey"}, tbl, []string{"aid"}, true, "btree", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) "+
+			"ON CONFLICT ON CONSTRAINT pgbench_accounts_pkey DO UPDATE SET abalance = excluded.abalance")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	if ins.OnConflict == nil || ins.OnConflict.ArbiterIndex != idx {
+		t.Fatalf("ArbiterIndex = %+v, want %+v", ins.OnConflict.ArbiterIndex, idx)
+	}
+	if len(ins.OnConflict.ArbiterColumns) != 1 || ins.OnConflict.ArbiterColumns[0] != 0 {
+		t.Errorf("ArbiterColumns = %v, want [0]", ins.OnConflict.ArbiterColumns)
+	}
+}
+
 // TestPlanInsertOnConflictDoNothingNoTarget — the bare DO NOTHING
 // shape (no conflict target) plans without any unique-index
 // match: ArbiterIndex stays nil and the executor decides which

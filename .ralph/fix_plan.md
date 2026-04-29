@@ -2571,8 +2571,37 @@ concurrent-write semantics. Decompose when picked up.
       UPSERTs both writers may believe they're winning
       the race until the next CREATE INDEX rebuild
       surfaces the duplicate.)
-- [ ] UPSERT Stage B: `ON CONFLICT ON CONSTRAINT name`,
-      `excluded.col` references in DO UPDATE.
+- [x] UPSERT Stage B: `ON CONFLICT ON CONSTRAINT name`.
+      Continues
+      `docs/design/0017-0001-on-conflict-parser-ast-and-analysis.md`.
+      (`excluded.col` references already landed in Stage A.)
+      (landed 2026-04-30: promotes the constraint-name target
+      from the Stage A 0A000 reject to a fully-supported path.
+      Analyzer's `analyzeOnConflict` constraint branch:
+      `cat.LookupIndex(parser.ObjectName{Name:
+      target.Constraint})` then 42704 ("constraint X for
+      table Y does not exist") / 42704 ("does not belong to")
+      / 42P10 ("is not a unique constraint") — mirrors
+      upstream's three diagnostics from
+      `transformOnConflictClause`. Planner's
+      `resolveArbiterIndex` gains a constraint-name branch
+      ahead of the column-set inference loop, returns the
+      named index + tbl ordinals matching `idx.Columns` so
+      the executor's existing `ArbiterColumns` handling
+      works without change. Executor needs **zero new code**
+      — upsertOp consumes ArbiterIndex/ArbiterColumns
+      regardless of how the planner resolved them. Tests:
+      3 new analyzer tests (TestAnalyzeOnConflictAccepts
+      ConstraintTarget, TestAnalyzeOnConflictRejectsNonUnique
+      Constraint, TestAnalyzeOnConflictRejectsConstraintOn
+      DifferentTable; the old Stage A reject test
+      TestAnalyzeOnConflictRejectsConstraintTarget is
+      replaced with TestAnalyzeOnConflictRejectsUnknown
+      Constraint asserting 42704), 1 planner
+      TestPlanInsertOnConflictByConstraintName (pins
+      ArbiterIndex pointer + ArbiterColumns), 1 executor
+      end-to-end TestUpsertConflictByConstraintName. Full
+      `go test ./...` green.)
 
 ## Milestone 0018 — EXPLAIN / EXPLAIN ANALYZE
 

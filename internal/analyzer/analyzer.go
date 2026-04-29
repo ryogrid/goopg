@@ -316,14 +316,6 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 // The pseudo-table is registered as `qualifiedOnly` so bare column
 // references continue to resolve unambiguously to the target side.
 func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat catalog.Catalog, targetAlias string) error {
-	// Stage B reject — constraint-name target form. The parser
-	// already accepts the shape so the AST is stable; the analyzer
-	// is the gate.
-	if oc.Target != nil && oc.Target.Constraint != "" {
-		return analyzeError(oc.Pos(), "0A000",
-			"ON CONFLICT ON CONSTRAINT is not supported in v0 (Stage B)")
-	}
-
 	// `ON CONFLICT DO UPDATE …` requires a conflict target. Mirrors
 	// upstream's "ON CONFLICT DO UPDATE requires inference
 	// specification or constraint name" diagnostic (42601 there).
@@ -332,18 +324,41 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
 	}
 
-	// Validate the conflict-target column list (when present).
-	// Each named column must exist on the target table; the
-	// planner picks the actual unique-arbiter index in M0017-0002.
+	// Validate the conflict target shape:
+	//   - column-list form: each named column must exist on the
+	//     target table; the planner picks the unique-arbiter index
+	//     in M0017-0002.
+	//   - constraint-name form (M0017 Stage B): the named constraint
+	//     must exist, must be a unique index, and must belong to
+	//     the target table. Mirrors upstream's
+	//     "constraint X for table Y does not exist" / "is not a
+	//     unique constraint" diagnostics.
 	if oc.Target != nil {
-		if len(oc.Target.Columns) == 0 {
-			return analyzeError(oc.Target.Pos(), "42601",
-				"ON CONFLICT target requires at least one column")
-		}
-		for _, col := range oc.Target.Columns {
-			if _, ok := lookupColumn(tbl, col); !ok {
-				return analyzeError(oc.Target.Pos(), "42703",
-					fmt.Sprintf("column %q of relation %q does not exist", col, tbl.Name))
+		switch {
+		case oc.Target.Constraint != "":
+			idx, ok := cat.LookupIndex(parser.ObjectName{Name: oc.Target.Constraint})
+			if !ok {
+				return analyzeError(oc.Target.Pos(), "42704",
+					fmt.Sprintf("constraint %q for table %q does not exist", oc.Target.Constraint, tbl.Name))
+			}
+			if idx.Table != tbl {
+				return analyzeError(oc.Target.Pos(), "42704",
+					fmt.Sprintf("constraint %q does not belong to table %q", oc.Target.Constraint, tbl.Name))
+			}
+			if !idx.Unique {
+				return analyzeError(oc.Target.Pos(), "42P10",
+					fmt.Sprintf("constraint %q is not a unique constraint", oc.Target.Constraint))
+			}
+		default:
+			if len(oc.Target.Columns) == 0 {
+				return analyzeError(oc.Target.Pos(), "42601",
+					"ON CONFLICT target requires at least one column")
+			}
+			for _, col := range oc.Target.Columns {
+				if _, ok := lookupColumn(tbl, col); !ok {
+					return analyzeError(oc.Target.Pos(), "42703",
+						fmt.Sprintf("column %q of relation %q does not exist", col, tbl.Name))
+				}
 			}
 		}
 	}

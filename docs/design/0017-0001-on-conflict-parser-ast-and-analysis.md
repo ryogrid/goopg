@@ -1,6 +1,6 @@
 # 0017-0001 — ON CONFLICT Parser, AST, and Analysis
 
-**Status:** accepted (steps 1–2: parser + AST + analyzer)
+**Status:** accepted (steps 1–2 + Stage B constraint-name target)
 **Milestone:** [0017 — UPSERT Support](../milestones/0017-upsert-on-conflict-do-update.md)
 **Spans seam:** SQL parser surface, INSERT AST shape, analyzer hook
 points (deferred).
@@ -290,6 +290,61 @@ arbiter selection + plan-node generation.
 `internal/planner/with_test.go`:
 
 - `TestPlanInsertOnConflictRejected` — second-line `0A000` gate.
+
+Full `go test ./...` green.
+
+## Stage B — constraint-name target (landed 2026-04-30)
+
+Stage B promotes the `ON CONFLICT ON CONSTRAINT name` target form
+from Stage A's hard-reject (`0A000`) to a fully-supported path.
+The parser already accepted the shape from step 1 — only the
+analyzer + planner gates change.
+
+### Analyzer
+
+The Stage B reject in `analyzeOnConflict` is replaced with catalog
+validation. For `Target.Constraint != ""`:
+
+```go
+idx, ok := cat.LookupIndex(parser.ObjectName{Name: target.Constraint})
+if !ok       { → 42704 "constraint X for table Y does not exist" }
+if idx.Table != tbl { → 42704 "constraint X does not belong to Y" }
+if !idx.Unique     { → 42P10 "constraint X is not a unique constraint" }
+```
+
+Mirrors upstream's three diagnostics (parsenodes.h /
+parse_clause.c `transformOnConflictClause`):
+- 42704 (`undefined_object`) — unknown constraint name.
+- 42704 — wrong table.
+- 42P10 (`invalid_column_reference`) — non-unique index used as
+  arbiter.
+
+### Planner
+
+`resolveArbiterIndex` gains a constraint-name branch executed
+ahead of the column-set inference loop. Returns the named index
+plus column ordinals matching `idx.Columns` so the executor's
+existing `ArbiterColumns` handling works without change. The
+analyzer-side rejects are mirrored as second-line `PlanError`
+checks for paths that bypass the analyzer.
+
+### Executor
+
+No new code path — the upsertOp consumes `ArbiterIndex` /
+`ArbiterColumns` regardless of how the planner resolved them.
+The same conflict-detect-and-apply machinery handles both
+target forms.
+
+### Tests
+
+- analyzer: `TestAnalyzeOnConflictAcceptsConstraintTarget`,
+  `TestAnalyzeOnConflictRejectsUnknownConstraint` (replaces the
+  old Stage B reject test), `TestAnalyzeOnConflictRejectsNonUniqueConstraint`,
+  `TestAnalyzeOnConflictRejectsConstraintOnDifferentTable`.
+- planner: `TestPlanInsertOnConflictByConstraintName` — pins
+  ArbiterIndex pointer and ArbiterColumns ordinals.
+- executor: `TestUpsertConflictByConstraintName` — full
+  end-to-end UPSERT against the constraint-name target form.
 
 Full `go test ./...` green.
 

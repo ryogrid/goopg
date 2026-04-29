@@ -208,6 +208,30 @@ func TestUpsertDoUpdateWithWhereSkipsRow(t *testing.T) {
 	}
 }
 
+// TestUpsertConflictByConstraintName — Stage B end-to-end. The
+// arbiter is resolved through `ON CONFLICT ON CONSTRAINT
+// items_pkey` instead of column inference; behaviour matches the
+// column-inference path (existing row updated, RowsAffected=1).
+func TestUpsertConflictByConstraintName(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := upsertSeed(t, ctx)
+
+	rc := runUpsertSQL(t, ctx,
+		"INSERT INTO items (id, label) VALUES (2, 'beta-replaced') "+
+			"ON CONFLICT ON CONSTRAINT items_pkey DO UPDATE SET label = excluded.label")
+	if rc != 1 {
+		t.Errorf("RowsAffected = %d, want 1", rc)
+	}
+	got := scanItems(t, ctx, tbl)
+	if got[2] != "beta-replaced" {
+		t.Errorf("constraint-name conflict not applied: got[2]=%q want beta-replaced", got[2])
+	}
+}
+
 // TestUpsertConflictKeyModificationRejected — Stage A scope guard:
 // a SET expression that targets the conflict-key column is
 // rejected at upsertOp.Open with 0A000. Without this, the

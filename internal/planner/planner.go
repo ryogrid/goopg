@@ -1471,13 +1471,6 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		return nil, &PlanError{Pos: oc.Pos(), Code: "XX000", Message: fmt.Sprintf("unexpected ON CONFLICT action %d", oc.Action)}
 	}
 
-	// Constraint-name target — analyzer rejects this as Stage B,
-	// but defend against bypassed-analyzer paths so the planner
-	// stays self-contained.
-	if oc.Target != nil && oc.Target.Constraint != "" {
-		return nil, &PlanError{Pos: oc.Pos(), Code: "0A000", Message: "ON CONFLICT ON CONSTRAINT is not supported in v0 (Stage B)"}
-	}
-
 	// Arbiter-index selection. For the no-target form (DO NOTHING
 	// only — analyzer rejects DO UPDATE without a target),
 	// ArbiterIndex stays nil; the executor checks every unique
@@ -1554,6 +1547,31 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 // — upstream's "no unique or exclusion constraint matching the ON
 // CONFLICT specification") on no match.
 func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, cat catalog.Catalog) (*catalog.Index, []int, error) {
+	// Constraint-name target form (M0017 Stage B). The named index
+	// must exist, must be a unique index, and must belong to the
+	// target table. The analyzer already enforces these but the
+	// planner stays self-contained for paths that bypass it.
+	if target.Constraint != "" {
+		idx, ok := cat.LookupIndex(parser.ObjectName{Name: target.Constraint})
+		if !ok {
+			return nil, nil, &PlanError{Pos: target.Pos(), Code: "42704", Message: fmt.Sprintf("constraint %q for table %q does not exist", target.Constraint, tbl.Name)}
+		}
+		if idx.Table != tbl {
+			return nil, nil, &PlanError{Pos: target.Pos(), Code: "42704", Message: fmt.Sprintf("constraint %q does not belong to table %q", target.Constraint, tbl.Name)}
+		}
+		if !idx.Unique {
+			return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: fmt.Sprintf("constraint %q is not a unique constraint", target.Constraint)}
+		}
+		ords := make([]int, 0, len(idx.Columns))
+		for _, ic := range idx.Columns {
+			col, ok := cat.LookupColumn(tbl, ic)
+			if !ok {
+				return nil, nil, &PlanError{Pos: target.Pos(), Code: "XX000", Message: fmt.Sprintf("index %q column %q not found on table %q", idx.Name, ic, tbl.Name)}
+			}
+			ords = append(ords, col.Ordinal)
+		}
+		return idx, ords, nil
+	}
 	if len(target.Columns) == 0 {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42601", Message: "ON CONFLICT target requires at least one column"}
 	}
