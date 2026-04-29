@@ -1393,11 +1393,19 @@ under "Hooks into existing goopg code".
       driver, the no-separate-apply-cursor restart contract
       (relies on `pd_lsn` idempotency), the failure model, and
       the wire-up into `cmd/goopg start`'s standby boot.)
-- [ ] Design doc `0005-0003-replication-observability.md`
+- [x] Design doc `0005-0003-replication-observability.md`
       covering `pg_stat_replication` / `pg_stat_wal_receiver`
       virtual views, replication-lag computation, and the
       operational logging surface for disconnect /
       replay-pause / retention-pressure events.
+      (achieved 2026-04-29: doc lands alongside the
+      virtual-view implementation. Documents the in-process
+      Senders + Receivers registries, the monotonic-CAS LSN
+      advance contract, the (slot,pid)-sorted Snapshot order,
+      both views' upstream-aligned column shapes, and the
+      explicit out-of-scope list (lag intervals,
+      `backend_xmin`, `client_addr` plumbing,
+      `pg_replication_slots`).)
 
 ### Wire protocol
 
@@ -1697,10 +1705,45 @@ under "Hooks into existing goopg code".
 
 ### Observability
 
-- [ ] `pg_stat_replication` virtual view (sender side):
+- [x] `pg_stat_replication` virtual view (sender side):
       one row per active walsender with state / lag fields.
-- [ ] `pg_stat_wal_receiver` virtual view (receiver side):
+      (achieved 2026-04-29: new `internal/wal/replmon.go`
+      provides the process-wide `Senders` registry with
+      `Register`/`Unregister`/`Snapshot` and per-handle
+      `SetSentLSN` + `ApplyStandbyStatus` (monotonic CAS,
+      stale-reply-resistant). Walsender goroutine in
+      `internal/server/replication.go` registers on entry,
+      defer-unregisters on exit, advances sent_lsn after each
+      WriteCopyData and the standby-reported LSNs from each
+      status reply (write/flush/replay). View registered in
+      `internal/initdb/replication_views.go` with 21 columns
+      mirroring upstream PG 18.x; LSN columns render via
+      `formatLSN` in `XXXXXXXX/XXXXXXXX` hex form, timestamps
+      via `formatTime`. Lag intervals (`write_lag` etc.)
+      emit `00:00:00` placeholders (deferred), `client_addr`
+      currently empty (FrameReader doesn't surface RemoteAddr;
+      one-line follow-up). Sorted `(slot_name, pid)` so
+      `\watch pg_stat_replication` returns stable order. Six
+      registry unit tests + one end-to-end view test pin
+      shape, monotonicity, register/unregister, sort order,
+      and concurrent register safety.)
+- [x] `pg_stat_wal_receiver` virtual view (receiver side):
       single-row view of the active walreceiver if any.
+      (achieved 2026-04-29: same `replmon.go` provides the
+      single-slot `Receivers` registry. Reconnect-safe via
+      "unregister no-ops when the supplied handle isn't
+      current" semantics. `WalReceiverConfig` grows
+      `Receivers` + `Conninfo` fields; `DialWalReceiver`
+      registers on handshake completion, `Close` unregisters,
+      `handleCopyData` publishes `SetReceivedLSN(end)` +
+      `MarkMessageReceived(now)` on each WAL-data /
+      keepalive frame. View registered with 15 columns
+      mirroring upstream PG 18.x; single-timeline operation
+      means `receive_start_tli`/`received_tli` hard-code to
+      `1`. Empty when no receiver is registered (the primary-
+      node default); one row when streaming. Two registry
+      unit tests + one view test cover single-row semantics,
+      progress advance, and column shape.)
 - [ ] Replication-related logging hooks for disconnect /
       replay-pause / retention-pressure events.
 

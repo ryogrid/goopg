@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -64,6 +65,19 @@ type WalReceiverConfig struct {
 	// DialTimeout caps how long Connect blocks on the TCP dial +
 	// startup handshake. Zero falls back to 10s.
 	DialTimeout time.Duration
+
+	// Receivers, when set, is the process-wide observability
+	// registry the receiver registers itself into so
+	// pg_stat_wal_receiver renders a row. nil makes registration a
+	// no-op (suitable for unit tests that don't care about
+	// observability).
+	Receivers *wal.Receivers
+
+	// Conninfo is the original conninfo string the start-up code
+	// parsed before constructing PrimaryAddr. Stored verbatim in
+	// pg_stat_wal_receiver.conninfo so operators can see what was
+	// configured. Empty falls back to PrimaryAddr.
+	Conninfo string
 }
 
 // WalReceiver is the standby-side replication client. Construct via
@@ -83,6 +97,12 @@ type WalReceiver struct {
 	// writer's own WrittenLSN(), but we cache for a tiny perf win
 	// and to make the test surface predictable.
 	applyLSN uint64
+
+	// monHandle is the observability registry handle this receiver
+	// publishes progress through. nil when cfg.Receivers was unset
+	// (in which case all the SetReceivedLSN / MarkMessageReceived
+	// calls become no-ops via the nil-check helpers below).
+	monHandle *wal.Receiver
 }
 
 // DialWalReceiver opens the TCP connection, performs the v3 startup
@@ -129,6 +149,21 @@ func DialWalReceiver(ctx context.Context, cfg WalReceiverConfig) (*WalReceiver, 
 		return nil, err
 	}
 	rec.applyLSN = cfg.StartLSN
+	if cfg.Receivers != nil {
+		conninfo := cfg.Conninfo
+		if conninfo == "" {
+			conninfo = cfg.PrimaryAddr
+		}
+		rec.monHandle = cfg.Receivers.Register(wal.ReceiverState{
+			Status:          "streaming",
+			PID:             uint32(os.Getpid()),
+			ReceiveStartLSN: cfg.StartLSN,
+			ReceivedLSN:     cfg.StartLSN,
+			SenderHost:      cfg.PrimaryAddr,
+			SlotName:        cfg.SlotName,
+			Conninfo:        conninfo,
+		})
+	}
 	return rec, nil
 }
 
@@ -276,6 +311,7 @@ func (r *WalReceiver) handleCopyData(payload []byte) error {
 				r.applyLSN = m.EndLSN
 			}
 			r.mu.Unlock()
+			r.publishProgress(m.EndLSN)
 			return nil
 		}
 		_, end, err := r.cfg.WAL.Append(m.WALBytes)
@@ -287,13 +323,29 @@ func (r *WalReceiver) handleCopyData(payload []byte) error {
 			r.applyLSN = end
 		}
 		r.mu.Unlock()
+		r.publishProgress(end)
 	case protocol.ReplMsgKeepalive:
 		ka := parsed.(*protocol.KeepaliveMessage)
+		r.publishProgress(0)
 		if ka.ReplyRequested {
 			return r.sendStatus()
 		}
 	}
 	return nil
+}
+
+// publishProgress pushes the latest received LSN + a "message just
+// arrived" timestamp into the observability registry. Both updates
+// are no-ops when monHandle is nil. lsn==0 means "no LSN to report"
+// (e.g. a keepalive with no advance) and only the timestamp moves.
+func (r *WalReceiver) publishProgress(lsn uint64) {
+	if r.monHandle == nil {
+		return
+	}
+	if lsn != 0 {
+		r.monHandle.SetReceivedLSN(lsn)
+	}
+	r.monHandle.MarkMessageReceived(time.Now())
 }
 
 // sendStatus emits an 'r' standby-status CopyData payload reporting
@@ -330,6 +382,9 @@ func (r *WalReceiver) Close() error {
 	}
 	r.closed = true
 	r.mu.Unlock()
+	if r.cfg.Receivers != nil && r.monHandle != nil {
+		r.cfg.Receivers.Unregister(r.monHandle)
+	}
 	return r.conn.Close()
 }
 

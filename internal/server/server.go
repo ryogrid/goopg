@@ -112,6 +112,11 @@ type Config struct {
 	// docs/design/0005-0001-streaming-replication-architecture.md.
 	Slots *wal.Slots
 
+	// WalSenders, when set, lets each walsender goroutine register
+	// itself so the pg_stat_replication virtual view can render a
+	// live row per active sender. nil makes registration a no-op.
+	WalSenders *wal.Senders
+
 	// WAL exposes the WAL writer's WrittenLSN() so IDENTIFY_SYSTEM
 	// can report a current xlogpos. nil → IDENTIFY_SYSTEM reports
 	// xlogpos=0/0 (acceptable for tests that don't care about the

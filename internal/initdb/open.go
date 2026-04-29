@@ -34,6 +34,8 @@ type Runtime struct {
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
+	WalSenders   *wal.Senders
+	WalReceivers *wal.Receivers
 	DataDir      string
 
 	// Standby is true when `<DataDir>/standby.signal` was present
@@ -227,6 +229,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: replication slots: %w", err)
 	}
 
+	// Replication monitoring registries. Senders are registered by
+	// each walsender goroutine on entry; the (single) Receivers
+	// entry is registered by the standby's walreceiver. The two
+	// virtual views below render whichever entries are live.
+	walSenders := wal.NewSenders()
+	walReceivers := wal.NewReceivers()
+
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{})
 
 	// Surface the M0002 checkpointer counters as the
@@ -236,6 +245,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// upstream-aligned columns we don't track in v0 (restartpoints*,
 	// buffers_written, slru_written) report literal 0.
 	if err := registerStatCheckpointerView(cat, cp); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	// pg_stat_replication: one row per active walsender. Backed by
+	// the in-process Senders registry — walsender goroutines
+	// register themselves on entry and unregister on exit.
+	if err := registerStatReplicationView(cat, walSenders); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+	// pg_stat_wal_receiver: zero or one row depending on whether the
+	// standby's walreceiver is currently registered.
+	if err := registerStatWalReceiverView(cat, walReceivers); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -256,6 +282,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WAL:          walWriter,
 		Checkpointer: cp,
 		Slots:        slotsReg,
+		WalSenders:   walSenders,
+		WalReceivers: walReceivers,
 		DataDir:      abs,
 		Standby:      standby,
 	}, nil

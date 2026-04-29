@@ -187,6 +187,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.TxnMgr = rt.TxnMgr
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
+		cfg.WalSenders = rt.WalSenders
 		cfg.WAL = rt.WAL
 		cfg.WALDirPath = filepath.Join(rt.DataDir, "pg_wal")
 		cfg.DataDir = rt.DataDir
@@ -405,6 +406,8 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 				WAL:            rt.WAL,
 				StatusInterval: statusInterval,
 				DialTimeout:    10 * time.Second,
+				Receivers:      rt.WalReceivers,
+				Conninfo:       conninfo,
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",

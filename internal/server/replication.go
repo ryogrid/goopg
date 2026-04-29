@@ -249,6 +249,19 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	}
 	defer it.Close()
 
+	// Register this walsender into the process-wide observability
+	// registry so the pg_stat_replication virtual view can render
+	// a live row. Unregister on exit (whether clean or error).
+	var senderHandle *wal.Sender
+	if s.cfg.WalSenders != nil {
+		senderHandle = s.cfg.WalSenders.Register(wal.SenderState{
+			SlotName:   args.SlotName,
+			ClientAddr: walsenderClientAddr(r),
+			SentLSN:    args.StartLSN,
+		})
+		defer s.cfg.WalSenders.Unregister(senderHandle)
+	}
+
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 
@@ -266,7 +279,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 			}
 			switch f.Type {
 			case protocol.MsgCopyData:
-				_ = s.handleStandbyCopyData(args.SlotName, f.Payload)
+				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle)
 			case protocol.MsgCopyDone:
 				streamCancel()
 				return
@@ -322,6 +335,9 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 				streamCancel()
 				return err
 			}
+			if senderHandle != nil {
+				senderHandle.SetSentLSN(rec.EndLSN)
+			}
 			// Reset the keepalive timer — fresh WAL implies the
 			// standby has just heard from us.
 			if !keepaliveTimer.Stop() {
@@ -357,8 +373,10 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 // handleStandbyCopyData decodes a client-side CopyData payload and
 // applies the relevant slot advance. Errors are swallowed (logged at
 // debug elsewhere) — a malformed status frame should not kill the
-// stream.
-func (s *Server) handleStandbyCopyData(slotName string, payload []byte) error {
+// stream. When a senderHandle is supplied the standby-reported LSNs
+// are also pushed into the observability registry so
+// pg_stat_replication renders write_lsn / flush_lsn / replay_lsn.
+func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHandle *wal.Sender) error {
 	parsed, kind, err := protocol.DecodeReplicationMessage(payload)
 	if err != nil {
 		return err
@@ -368,8 +386,21 @@ func (s *Server) handleStandbyCopyData(slotName string, payload []byte) error {
 		if slotName != "" && s.cfg.Slots != nil {
 			_ = s.cfg.Slots.AdvanceConfirmedFlushLSN(slotName, st.FlushLSN)
 		}
+		if senderHandle != nil {
+			senderHandle.ApplyStandbyStatus(st.WriteLSN, st.FlushLSN, st.ApplyLSN)
+		}
 	}
 	return nil
+}
+
+// walsenderClientAddr returns a best-effort `host:port` string for
+// the standby connection backing this walsender. The frame reader
+// doesn't expose its underlying net.Conn, so v0 reports "" and the
+// pg_stat_replication.client_addr column ends up blank. A future
+// loop can plumb the connection's RemoteAddr through Server.handleConn
+// to fill this in.
+func walsenderClientAddr(_ *protocol.FrameReader) string {
+	return ""
 }
 
 // writeStreamingError emits an ErrorResponse on a CopyBoth-mode
