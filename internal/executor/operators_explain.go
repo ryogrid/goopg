@@ -109,6 +109,16 @@ func describePlan(n planner.Node) string {
 		}
 		return fmt.Sprintf("GroupAggregate (%d keys, %d aggregates)", len(p.GroupExprs), len(p.Aggs))
 	case *planner.SeqScan:
+		// `(stats)` flags scans whose Table.Stats has been
+		// populated by ANALYZE — the planner's cost-driven
+		// decisions (Filter selectivity from MCV / histogram,
+		// INNER-join algorithm choice) are only active for
+		// these. M0006 / 0006-0004 surfaces this so an operator
+		// inspecting EXPLAIN can verify which scans feed the
+		// cost model.
+		if p.Table != nil && p.Table.Stats != nil {
+			return fmt.Sprintf("Seq Scan on %s (stats)", p.Table.QualifiedName())
+		}
 		return fmt.Sprintf("Seq Scan on %s", p.Table.QualifiedName())
 	case *planner.IndexScan:
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())

@@ -1938,12 +1938,33 @@ Decomposed into the four design-doc seams the milestone calls out
       MCV-hit equality, non-MCV-fallback equality, histogram
       range, AND product, OR inclusion-exclusion, IN sum, and
       no-stats fallback.)
-- [ ] Cost-driven INNER-join algorithm selection: hash vs merge
+- [x] Cost-driven INNER-join algorithm selection: hash vs merge
       vs nested-loop scored against estimated input sizes and
       key NDistinct. Existing rule-based logic remains the
       documented fallback when stats are absent. Stats-aware
       EXPLAIN surfacing for verification. Design doc
       `docs/design/0006-0004-join-algorithm-selection.md`.
+      (landed 2026-04-29: `internal/planner/joincost.go` adds
+      `chooseInnerJoinAlgo(L, R) (JoinAlgo, bool)` scoring under
+      unit-row costs — hash (`build + probe`), merge
+      (`L·log2(L) + R·log2(R) + L+R`), nested-loop (`L*R`) —
+      and returns the cheapest. Wired into both INNER call
+      sites: `planner.go` (JOIN ... ON path) and `pushdown.go`
+      (comma-FROM CROSS-promotion). RIGHT/FULL keep merge
+      (semantics-driven), LEFT keeps hash (executor outer-row
+      preservation), CROSS / non-equality keep nested-loop.
+      When either side returns `EstimateRows == 0` the cost
+      selector declines (returns `ok=false`) and the M0003
+      rule-based hash default holds — the documented fallback.
+      Stats-aware EXPLAIN: `Seq Scan on <t>` now appends
+      `(stats)` when `Table.Stats != nil`. Existing planner
+      tests stay green because they seed catalogs without
+      ANALYZE so they exercise the fallback path. New tests in
+      `joincost_test.go` pin the contract: fallback when stats
+      missing, hash for balanced 10k/10k, nested-loop for tiny
+      1/1, hash beats merge at modest 100/100. `seq_page_cost`
+      / `random_page_cost`, indexed-rescan nestloop pricing,
+      and `enable_*` GUC consultation deferred.)
 
 ## Notes
 

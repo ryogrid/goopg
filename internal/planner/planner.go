@@ -465,8 +465,10 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 		}
 		// Pick a specialised equality join algorithm when the
 		// predicate decomposes into disjoint-side keys:
-		//   - INNER / LEFT: hash join
-		//   - RIGHT / FULL: merge join
+		//   - INNER / LEFT: hash join (M0003 rule); cost-driven
+		//     override for INNER when stats are present (M0006).
+		//   - RIGHT / FULL: merge join (semantics-driven; stays
+		//     rules-based regardless of stats).
 		// CROSS and non-equality predicates stay on nested-loop.
 		leftWidth := len(leftCtx.schema)
 		if lk, rk, ok := splitEqualityForHash(pred, leftWidth); ok {
@@ -478,15 +480,22 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 			case JoinTypeRight, JoinTypeFull:
 				jn.Algo = JoinAlgoMerge
 			}
-			// Build-side selection: for INNER hash joins, build on
-			// whichever side the cardinality estimator reports as
-			// smaller. LEFT joins keep the right-as-build default
-			// because the executor's outer-row emission walks the
-			// left (preserved) side as the probe stream.
-			if jn.Algo == JoinAlgoHash && jn.Type == JoinTypeInner {
+			// INNER joins: let the cost model pick when both sides
+			// have row estimates. Hash stays the M0003 fallback
+			// when either side is unanalysed.
+			if jn.Type == JoinTypeInner {
 				lRows := EstimateRows(jn.Left)
 				rRows := EstimateRows(jn.Right)
-				if lRows > 0 && rRows > 0 && lRows < rRows {
+				if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
+					jn.Algo = algo
+				}
+				// Build-side selection: when the cost-driven (or
+				// rule-driven) algorithm landed on hash, build on
+				// the smaller side. LEFT joins keep the right-as-
+				// build default because the executor's outer-row
+				// emission walks the left (preserved) side as the
+				// probe stream.
+				if jn.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
 					jn.BuildLeft = true
 				}
 			}

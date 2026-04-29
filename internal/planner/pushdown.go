@@ -81,7 +81,13 @@ func pushOneConjunct(node Node, c Expr) bool {
 		j.Algo = JoinAlgoHash
 		lRows := EstimateRows(j.Left)
 		rRows := EstimateRows(j.Right)
-		if lRows > 0 && rRows > 0 && lRows < rRows {
+		// Cost-driven INNER algorithm pick when stats are
+		// present; rule-based hash is the fallback (see
+		// docs/design/0006-0004-join-algorithm-selection.md).
+		if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
+			j.Algo = algo
+		}
+		if j.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
 			j.BuildLeft = true
 		}
 	}
