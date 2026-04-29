@@ -71,6 +71,12 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newAggregateOp(p, child)), nil
+	case *planner.WindowAgg:
+		child, err := Build(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newWindowOp(p, child)), nil
 	case *planner.SeqScan:
 		return maybeInstrument(p, newSeqScanOp(p)), nil
 	case *planner.IndexScan:

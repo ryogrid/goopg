@@ -2811,7 +2811,7 @@ Substantial. Decompose when picked up.
             resolved window function descriptors.
       - [x] M0020-S04: planner pipeline wiring (WindowAgg
             injection between aggregate/having and final ORDER BY).
-      - [ ] M0020-S05: executor WindowAgg operator skeleton (drain,
+      - [x] M0020-S05: executor WindowAgg operator skeleton (drain,
             partition key evaluation, order-key sort).
       - [ ] M0020-S06: executor row_number() evaluation.
       - [ ] M0020-S07: executor rank() evaluation with peer-group
