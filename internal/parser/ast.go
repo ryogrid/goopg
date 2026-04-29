@@ -316,19 +316,74 @@ func (s *SelectStmt) stmtNode() {}
 
 // InsertStmt — `[WITH ...] INSERT INTO target [(col, …)]
 //
-//	VALUES (val, …) [, …] [RETURNING target_list]`. v0 supports
+//	VALUES (val, …) [, …] [ON CONFLICT …] [RETURNING target_list]`.
 //
-// literal VALUES rows only; `INSERT … SELECT` and ON CONFLICT
-// clauses are deferred. The optional `With` field (M0016-0001) is
-// nil when no WITH clause precedes the INSERT.
+// v0 supports literal VALUES rows only; `INSERT … SELECT` is
+// deferred. The optional `With` field (M0016-0001) is nil when no
+// WITH clause precedes the INSERT. The optional `OnConflict` field
+// (M0017-0001) is nil when no ON CONFLICT clause is present —
+// existing INSERT call sites are byte-for-byte unchanged.
 type InsertStmt struct {
-	pos       int
-	With      *WithClause
-	Target    RangeVar
-	Columns   []string // empty when no column list — INSERT defaults to declared order
-	Rows      [][]Expr // each row is a parenthesised tuple
-	Returning []ResTarget
+	pos        int
+	With       *WithClause
+	Target     RangeVar
+	Columns    []string // empty when no column list — INSERT defaults to declared order
+	Rows       [][]Expr // each row is a parenthesised tuple
+	OnConflict *OnConflictClause
+	Returning  []ResTarget
 }
+
+// OnConflictAction enumerates the action the conflict resolver runs
+// when an inserted row collides with an existing one. Mirrors
+// upstream's `OnConflictAction` enum (parsenodes.h).
+type OnConflictAction int
+
+const (
+	// OnConflictNone is the zero value reserved for "no ON
+	// CONFLICT clause" — InsertStmt.OnConflict==nil — so a stray
+	// zero-value OnConflictClause never gets misread as a valid
+	// action.
+	OnConflictNone OnConflictAction = iota
+	// OnConflictNothing — `ON CONFLICT … DO NOTHING`. Skips
+	// conflicting rows silently.
+	OnConflictNothing
+	// OnConflictUpdate — `ON CONFLICT … DO UPDATE SET … [WHERE …]`.
+	// Re-applies the SET assignments to the existing row.
+	OnConflictUpdate
+)
+
+// OnConflictTarget is the conflict-arbiter spec: which unique
+// constraint or set of columns participates in conflict detection.
+// Exactly one of (Columns, Constraint) is populated for the two
+// upstream forms; both nil/empty means the no-target shape
+// `ON CONFLICT DO NOTHING`. The constraint-name form lands as Stage
+// B in M0017; the parser already accepts it so the AST shape is
+// stable across stages.
+type OnConflictTarget struct {
+	pos        int
+	Columns    []string // populated for `ON CONFLICT (col [, col, …])`
+	Constraint string   // populated for `ON CONFLICT ON CONSTRAINT name`
+}
+
+// Pos returns the position of the leading token of the target
+// (the `(` for the column-list form or `ON` for the constraint-name
+// form).
+func (t OnConflictTarget) Pos() int { return t.pos }
+
+// OnConflictClause holds the parsed `ON CONFLICT …` tail of an
+// INSERT statement. Target is nil for the no-target `ON CONFLICT
+// DO NOTHING` form. UpdateSet / UpdateWhere are populated only when
+// Action == OnConflictUpdate.
+type OnConflictClause struct {
+	pos         int
+	Target      *OnConflictTarget
+	Action      OnConflictAction
+	UpdateSet   []UpdateAssign // populated when Action == OnConflictUpdate
+	UpdateWhere Expr           // optional; nil when no WHERE follows the SET list
+}
+
+// Pos returns the position of the leading `ON` token.
+func (c *OnConflictClause) Pos() int { return c.pos }
 
 func (s *InsertStmt) Pos() int  { return s.pos }
 func (s *InsertStmt) stmtNode() {}

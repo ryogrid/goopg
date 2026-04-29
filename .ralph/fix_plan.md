@@ -2368,9 +2368,58 @@ See `docs/milestones/0017-upsert-on-conflict-do-update.md` for the
 full DoD. Substantial milestone — parser + planner + executor +
 concurrent-write semantics. Decompose when picked up.
 
-- [ ] UPSERT Stage A: parser + analyzer + planner + executor for
-      `INSERT ... ON CONFLICT (cols) DO UPDATE SET ...`. Decompose
-      into seam-sized slices when picked up.
+- [x] UPSERT Stage A — **parser surface and AST**
+      (M0017-0001 step 1). Design doc
+      `docs/design/0017-0001-on-conflict-parser-ast-and-analysis.md`.
+      (landed 2026-04-29: parser-only additive slice mirroring
+      M0016-0001 / M0018-0001 step-1 pattern. `InsertStmt`
+      grew an optional `OnConflict *OnConflictClause` —
+      nil-default keeps existing INSERT call sites byte-for-byte
+      unchanged. New AST: `OnConflictAction` enum (None /
+      Nothing / Update; None is the zero-value sentinel for
+      "no clause"), `OnConflictTarget` (Columns + Constraint
+      — exactly one populated; both empty for the no-target
+      shape), `OnConflictClause` (Target + Action + UpdateSet
+      + UpdateWhere). New keywords: `KwConflict` / `KwDo` /
+      `KwNothing`. `excluded` stays an unreserved identifier
+      so `excluded.col` parses as a normal
+      `*ColumnRef{Table:"excluded"}` — promoting it would
+      shadow legitimate column refs named `excluded` in
+      pre-UPSERT clusters; matches upstream's de-facto rule.
+      New `parseOnConflict()` in dml.go handles the next-token
+      disambiguation (`(` → column list, `ON` keyword →
+      constraint name, otherwise no target) and the action
+      keyword set (`NOTHING` / `UPDATE` after `DO`). Parser
+      accepts every upstream shape including the constraint-name
+      target the milestone defers to Stage B — keeps the AST
+      shape stable so Stage B promotion doesn't change
+      parser-error semantics. Tests (10 in
+      on_conflict_test.go): TestParseInsertOnConflictNoTargetDoNothing,
+      TestParseInsertOnConflictColumnTargetDoNothing,
+      TestParseInsertOnConflictDoUpdate (pins `excluded.b`
+      AST shape so analyzer slice has stable input),
+      TestParseInsertOnConflictDoUpdateWithWhere,
+      TestParseInsertOnConflictConstraintTarget,
+      TestParseInsertOnConflictWithReturning (composes after
+      ON CONFLICT in upstream-mandated order),
+      TestParseInsertOnConflictCTE (M0016 + M0017 surface
+      combine without parser interaction),
+      TestParseInsertOnConflictRejectsBadAction (DO REPLACE /
+      DO INSERT → parse error),
+      TestParseInsertOnConflictRejectsMissingDo,
+      TestParseInsertWithoutOnConflictUnchanged (rollout
+      guardrail — no spurious empty clauses for unmigrated
+      callers). Full `go test ./...` green. Analyzer name
+      resolution + `excluded` pseudo-table scope, planner
+      conflict-arbiter selection, executor concurrency /
+      locking integration, observability counters all land
+      in subsequent slices (M0017-0001 step 2 / M0017-0002 /
+      M0017-0003 / M0017-0004).)
+- [ ] UPSERT Stage A — analyzer + planner + executor wiring
+      (M0017-0001 step 2 / M0017-0002 / M0017-0003).
+      Continues `docs/design/0017-0001-on-conflict-parser-ast-and-analysis.md`
+      and reserves filenames `0017-0002-upsert-planner-and-arbiter-selection.md`
+      and `0017-0003-upsert-executor-concurrency-and-locking.md`.
 - [ ] UPSERT Stage B: `ON CONFLICT ON CONSTRAINT name`,
       `excluded.col` references in DO UPDATE.
 

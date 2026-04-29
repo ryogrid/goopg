@@ -1,14 +1,16 @@
 package parser
 
 // parseInsert: INSERT INTO target [(col, …)] VALUES (val, …) [, …]
-// [RETURNING target_list].
+// [ON CONFLICT …] [RETURNING target_list].
 //
 // pgbench emits:
 //
 //	INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
 //
 // so v0 supports the column list and one or more parenthesised value
-// tuples. INSERT … SELECT and ON CONFLICT are deferred.
+// tuples. INSERT … SELECT is deferred. The optional ON CONFLICT
+// tail (M0017-0001 step 1) parses every upstream shape — the
+// analyzer/planner narrow the supported subset by stage.
 func (p *parser) parseInsert() (Stmt, error) {
 	t, err := p.expectKeyword(KwInsert)
 	if err != nil {
@@ -40,6 +42,13 @@ func (p *parser) parseInsert() (Stmt, error) {
 		return nil, err
 	}
 	stmt.Rows = rows
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
+		oc, err := p.parseOnConflict()
+		if err != nil {
+			return nil, err
+		}
+		stmt.OnConflict = oc
+	}
 	if p.acceptKeyword(KwReturning) {
 		ret, err := p.parseTargetList()
 		if err != nil {
@@ -48,6 +57,96 @@ func (p *parser) parseInsert() (Stmt, error) {
 		stmt.Returning = ret
 	}
 	return stmt, nil
+}
+
+// parseOnConflict parses the upstream `ON CONFLICT …` tail. The
+// caller has already verified the next token is `ON`.
+//
+// Grammar:
+//
+//	ON CONFLICT [conflict_target] conflict_action
+//	conflict_target := '(' col_name [, col_name …] ')'
+//	                 | ON CONSTRAINT constraint_name
+//	conflict_action := DO NOTHING
+//	                 | DO UPDATE SET assign_list [WHERE expr]
+//
+// The constraint-name form parses but is rejected at analyze time
+// in M0017 Stage A — Stage B promotes it. Likewise `excluded.col`
+// references in DO UPDATE are normal qualified column refs at the
+// parser level; the analyzer resolves the special pseudo-table
+// scope.
+func (p *parser) parseOnConflict() (*OnConflictClause, error) {
+	t, err := p.expectKeyword(KwOn)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(KwConflict); err != nil {
+		return nil, err
+	}
+	clause := &OnConflictClause{pos: t.Pos}
+
+	// Optional conflict target. The two forms are disambiguated
+	// by the next token: `(` → column list, `ON` → constraint
+	// name. Anything else means no target — the next token must
+	// be `DO`.
+	switch {
+	case p.acceptSymbol("("):
+		tgtPos := p.cur().Pos
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+		clause.Target = &OnConflictTarget{pos: tgtPos, Columns: cols}
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn:
+		tgtPos := p.cur().Pos
+		p.advance()
+		if _, err := p.expectKeyword(KwConstraint); err != nil {
+			return nil, err
+		}
+		name, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		clause.Target = &OnConflictTarget{pos: tgtPos, Constraint: identText(name)}
+	}
+
+	// Action: `DO NOTHING` | `DO UPDATE SET …`.
+	if _, err := p.expectKeyword(KwDo); err != nil {
+		return nil, err
+	}
+	cur := p.cur()
+	if cur.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected NOTHING or UPDATE")
+	}
+	switch cur.Keyword {
+	case KwNothing:
+		p.advance()
+		clause.Action = OnConflictNothing
+	case KwUpdate:
+		p.advance()
+		if _, err := p.expectKeyword(KwSet); err != nil {
+			return nil, err
+		}
+		assigns, err := p.parseAssignList()
+		if err != nil {
+			return nil, err
+		}
+		clause.Action = OnConflictUpdate
+		clause.UpdateSet = assigns
+		if p.acceptKeyword(KwWhere) {
+			w, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			clause.UpdateWhere = w
+		}
+	default:
+		return nil, p.errAtCur("expected NOTHING or UPDATE")
+	}
+	return clause, nil
 }
 
 func (p *parser) parseColumnNameList() ([]string, error) {

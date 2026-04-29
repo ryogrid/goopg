@@ -1,0 +1,195 @@
+# 0017-0001 — ON CONFLICT Parser, AST, and Analysis
+
+**Status:** accepted (step 1 — parser + AST only)
+**Milestone:** [0017 — UPSERT Support](../milestones/0017-upsert-on-conflict-do-update.md)
+**Spans seam:** SQL parser surface, INSERT AST shape, analyzer hook
+points (deferred).
+**Cross-links:**
+[root-0010](root-0010-parser.md) (parser scaffolding),
+[0016-0001](0016-0001-with-parser-ast-and-name-resolution.md) (the
+WITH-clause precedent for parser-only step-1 slices),
+[0018-0001](0018-0001-explain-parser-options-and-ast.md) (the EXPLAIN
+parser-only precedent).
+
+## Context
+
+goopg's parser supports `INSERT INTO target [(cols)] VALUES (rows)
+[RETURNING …]` but does not yet recognise `ON CONFLICT …`. Modern
+ORMs (sqlx, Diesel, SQLAlchemy 2.0, ActiveRecord) emit upserts as
+their default idempotent-write path; lacking parser support means
+every such query fails at the lex/parse layer with a generic
+syntax error rather than the targeted SQLSTATE feature-gating that
+later analyzer/planner stages can produce.
+
+This slice introduces the upstream-compatible **parser surface and
+AST nodes** without yet wiring the analyzer / planner / executor
+— mirroring the M0016-0001 (WITH clause) and M0018-0001 (EXPLAIN
+options) step-1 pattern. Establishing the AST shape in one
+well-tested commit lets subsequent stages (analyzer name
+resolution → planner conflict-arbiter selection → executor
+concurrency path) land incrementally with each step having a
+known landing point in the AST.
+
+## Target upstream major
+
+PostgreSQL 18.x. Mirrors `postgres/src/backend/parser/gram.y` and
+`postgres/src/include/nodes/parsenodes.h`'s `OnConflictClause`
+shape.
+
+## Grammar
+
+The parser accepts every upstream `INSERT … ON CONFLICT …` shape
+this milestone targets, including the constraint-name target form
+that Stage A would otherwise reject:
+
+```
+insert_stmt        ::= [WITH …] INSERT INTO target [(cols)]
+                       VALUES (vals) [, …]
+                       [on_conflict_clause]
+                       [RETURNING target_list]
+
+on_conflict_clause ::= ON CONFLICT [conflict_target] conflict_action
+
+conflict_target    ::= '(' col_name [, col_name …] ')'
+                     | ON CONSTRAINT constraint_name
+
+conflict_action    ::= DO NOTHING
+                     | DO UPDATE SET assign_list [WHERE expr]
+```
+
+Three target forms × two action types = six valid combinations;
+all six parse cleanly. Stage A in M0017 narrows the supported
+analyzer subset to `(cols) DO UPDATE SET …`; Stage B promotes
+the constraint-name target and `excluded.col` references in
+`SET` / `WHERE`.
+
+`excluded.col` is not a parser-level concern — it surfaces as a
+normal `*ColumnRef{Table: "excluded", Column: <name>}` because
+`excluded` is intentionally **not** a keyword. Upstream uses the
+same convention: `excluded` is a special pseudo-table that the
+analyzer's name resolver injects into the conflict-resolution
+scope. Promoting it to a keyword would shadow legitimate column
+references named `excluded` in pre-UPSERT clusters.
+
+## AST shape
+
+```go
+// InsertStmt grew an OnConflict field. Pre-M0017 callers see nil.
+type InsertStmt struct {
+    pos        int
+    With       *WithClause
+    Target     RangeVar
+    Columns    []string
+    Rows       [][]Expr
+    OnConflict *OnConflictClause   // nil when no ON CONFLICT
+    Returning  []ResTarget
+}
+
+type OnConflictAction int
+
+const (
+    OnConflictNone    OnConflictAction = iota // zero value reserved
+    OnConflictNothing                         // DO NOTHING
+    OnConflictUpdate                          // DO UPDATE SET …
+)
+
+type OnConflictTarget struct {
+    pos        int
+    Columns    []string // populated for `(col [, col …])` form
+    Constraint string   // populated for `ON CONSTRAINT name` form
+}
+
+type OnConflictClause struct {
+    pos         int
+    Target      *OnConflictTarget // nil for the no-target shape
+    Action      OnConflictAction
+    UpdateSet   []UpdateAssign    // populated when Action == OnConflictUpdate
+    UpdateWhere Expr              // optional; nil when no WHERE follows SET
+}
+```
+
+Three nil/empty discriminators encode the parser-accepted forms:
+
+| Form                                          | Target           | Action            | UpdateSet | UpdateWhere |
+| --------------------------------------------- | ---------------- | ----------------- | --------- | ----------- |
+| `ON CONFLICT DO NOTHING`                      | nil              | OnConflictNothing | nil       | nil         |
+| `ON CONFLICT (cols) DO NOTHING`               | {Columns}        | OnConflictNothing | nil       | nil         |
+| `ON CONFLICT ON CONSTRAINT name DO NOTHING`   | {Constraint}     | OnConflictNothing | nil       | nil         |
+| `ON CONFLICT (cols) DO UPDATE SET …`          | {Columns}        | OnConflictUpdate  | [...]     | nil         |
+| `ON CONFLICT (cols) DO UPDATE SET … WHERE …`  | {Columns}        | OnConflictUpdate  | [...]     | non-nil     |
+| `ON CONFLICT ON CONSTRAINT name DO UPDATE …`  | {Constraint}     | OnConflictUpdate  | [...]     | nil/non-nil |
+
+`OnConflictNone` is the zero value of `OnConflictAction`, reserved
+for "no clause". Combined with `InsertStmt.OnConflict==nil`, this
+guards against a stray zero-value `OnConflictClause` accidentally
+being treated as a valid action — defensive, since Go's zero-value
+semantics make accidental misconstruction easy.
+
+## New keywords
+
+```go
+KwConflict Keyword = "conflict"
+KwDo       Keyword = "do"
+KwNothing  Keyword = "nothing"
+```
+
+`UPDATE`, `SET`, `WHERE`, `ON`, and `CONSTRAINT` are already
+keywords from earlier milestones — no new entries needed.
+`excluded` stays an unreserved identifier (see Grammar above).
+
+## Disambiguation
+
+The optional conflict target is disambiguated by the next token
+after `CONFLICT`:
+
+- `(` → column-list form: parse `parseColumnNameList()` then expect `)`.
+- `ON` (keyword) → constraint-name form: consume `ON`, expect `CONSTRAINT`, parse identifier.
+- Anything else → no target; the next token must be `DO`.
+
+This is the upstream gram.y rule order — note that `ON CONFLICT ON
+CONSTRAINT` is the canonical two-`ON` shape PostgreSQL accepts.
+
+## Tests
+
+`internal/parser/on_conflict_test.go`:
+
+- `TestParseInsertOnConflictNoTargetDoNothing` — pins the no-target
+  branch (`Target` stays nil, `Action == OnConflictNothing`).
+- `TestParseInsertOnConflictColumnTargetDoNothing` — column-list
+  target combined with DO NOTHING.
+- `TestParseInsertOnConflictDoUpdate` — full Stage A surface:
+  column-list target + DO UPDATE SET with multiple assignments,
+  including an `excluded.col` reference. Pins that the reference
+  parses as a `*ColumnRef{Table:"excluded", Column:"b"}` so the
+  analyzer slice has a stable input.
+- `TestParseInsertOnConflictDoUpdateWithWhere` — pins the optional
+  `UpdateWhere` field.
+- `TestParseInsertOnConflictConstraintTarget` — `ON CONFLICT ON
+  CONSTRAINT name` shape. Stage B-only at the analyzer level, but
+  the parser already accepts it so the AST shape is stable across
+  stages.
+- `TestParseInsertOnConflictWithReturning` — composes ON CONFLICT
+  with RETURNING in the upstream-mandated order.
+- `TestParseInsertOnConflictCTE` — composes the WITH wrapper with
+  ON CONFLICT (M0016 + M0017 surface combine without parser
+  interaction).
+- `TestParseInsertOnConflictRejectsBadAction` — diagnostic guard:
+  `DO REPLACE` / `DO INSERT` etc. error at parse time.
+- `TestParseInsertOnConflictRejectsMissingDo` — bare `(a) NOTHING`
+  (without `DO`) errors.
+- `TestParseInsertWithoutOnConflictUnchanged` — rollout guardrail:
+  an INSERT without ON CONFLICT must continue to produce a nil
+  `OnConflict` field — no spurious empty clauses for callers that
+  haven't migrated.
+
+## Out of scope
+
+- Analyzer name resolution + conflict-target validation against
+  table metadata + the `excluded` pseudo-table scope — M0017-0001
+  step 2 (this same doc, follow-up).
+- Planner conflict-arbiter selection — M0017-0002.
+- Executor concurrency / locking integration — M0017-0003.
+- Observability counters — M0017-0004.
+- `INSERT … SELECT` (orthogonal — pre-existing limitation).
+- MERGE statement support (out of M0017 entirely; see
+  `milestones/0017-upsert-on-conflict-do-update.md` Out of Scope).

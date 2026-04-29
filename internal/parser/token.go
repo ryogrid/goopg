@@ -138,6 +138,15 @@ const (
 
 	// CTE / WITH clause (M0016).
 	KwRecursive Keyword = "recursive"
+
+	// UPSERT (M0017): `INSERT … ON CONFLICT … DO {NOTHING |
+	// UPDATE SET …}`. `excluded` is intentionally NOT a keyword
+	// — upstream treats it as a pseudo-table identifier resolved
+	// at analyze time, so leaving it as a normal ident keeps
+	// existing column-named-`excluded` queries unbroken.
+	KwConflict Keyword = "conflict"
+	KwDo       Keyword = "do"
+	KwNothing  Keyword = "nothing"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -241,6 +250,9 @@ var keywords = map[string]Keyword{
 	"connection":   KwConnection,
 	"for":          KwFor,
 	"tables":       KwTables,
+	"conflict":     KwConflict,
+	"do":           KwDo,
+	"nothing":      KwNothing,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased
