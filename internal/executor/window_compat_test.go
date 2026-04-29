@@ -1,0 +1,137 @@
+package executor
+
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+)
+
+func TestCompatWindowRowNumberPartitionOrder(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 7}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM t ORDER BY grp, val, rn")
+	want := []struct{ grp, val, rn int64 }{
+		{grp: 1, val: 10, rn: 1},
+		{grp: 1, val: 10, rn: 2},
+		{grp: 1, val: 20, rn: 3},
+		{grp: 2, val: 5, rn: 1},
+		{grp: 2, val: 7, rn: 2},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][0].Kind != KindInt || rows[i][0].Int != w.grp {
+			t.Fatalf("row[%d] grp=%+v want %d", i, rows[i][0], w.grp)
+		}
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w.val {
+			t.Fatalf("row[%d] val=%+v want %d", i, rows[i][1], w.val)
+		}
+		if rows[i][2].Kind != KindInt || rows[i][2].Int != w.rn {
+			t.Fatalf("row[%d] rn=%+v want %d", i, rows[i][2], w.rn)
+		}
+	}
+}
+
+func TestCompatWindowRankPeerGroups(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) AS rk FROM t ORDER BY grp, val, rk")
+	want := []struct{ grp, val, rk int64 }{
+		{grp: 1, val: 10, rk: 1},
+		{grp: 1, val: 10, rk: 1},
+		{grp: 1, val: 20, rk: 3},
+		{grp: 2, val: 5, rk: 1},
+		{grp: 2, val: 5, rk: 1},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][0].Kind != KindInt || rows[i][0].Int != w.grp {
+			t.Fatalf("row[%d] grp=%+v want %d", i, rows[i][0], w.grp)
+		}
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w.val {
+			t.Fatalf("row[%d] val=%+v want %d", i, rows[i][1], w.val)
+		}
+		if rows[i][2].Kind != KindInt || rows[i][2].Int != w.rk {
+			t.Fatalf("row[%d] rk=%+v want %d", i, rows[i][2], w.rk)
+		}
+	}
+}
+
+func TestCompatWindowRankNullPeersAsc(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 10}},
+		{NullDatum},
+		{NullDatum},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, rank() OVER (ORDER BY val) AS rk FROM t ORDER BY rk, val")
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d want 3", len(rows))
+	}
+	if !rows[0][0].IsNull() || rows[0][1].Kind != KindInt || rows[0][1].Int != 1 {
+		t.Fatalf("row0=%+v want NULL rank=1", rows[0])
+	}
+	if !rows[1][0].IsNull() || rows[1][1].Kind != KindInt || rows[1][1].Int != 1 {
+		t.Fatalf("row1=%+v want NULL rank=1", rows[1])
+	}
+	if rows[2][0].Kind != KindInt || rows[2][0].Int != 10 || rows[2][1].Kind != KindInt || rows[2][1].Int != 3 {
+		t.Fatalf("row2=%+v want 10 rank=3", rows[2])
+	}
+}

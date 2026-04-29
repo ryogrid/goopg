@@ -2818,7 +2818,7 @@ Substantial. Decompose when picked up.
             semantics.
       - [x] M0020-S08: EXPLAIN label/tree integration for
             WindowAgg.
-      - [ ] M0020-S09: regression tests (analyzer/planner/executor
+      - [x] M0020-S09: regression tests (analyzer/planner/executor
             for Stage A semantics).
       - [ ] M0020-S10: finalize design docs
             `0020-0003-window-executor.md` and
