@@ -1376,6 +1376,19 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
+	if s.OnConflict != nil {
+		// M0017-0001 step 2 lands the parser surface and
+		// analyzer validation; planner conflict-arbiter
+		// selection lands in M0017-0002. Reject at the planner
+		// so an executable plan never silently drops the ON
+		// CONFLICT clause — analyzer-only validation is not a
+		// safe substitute for execution gating.
+		return nil, &PlanError{
+			Pos:     s.OnConflict.Pos(),
+			Code:    "0A000",
+			Message: "ON CONFLICT is not supported in v0 planner",
+		}
+	}
 	restore, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err

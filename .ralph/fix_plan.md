@@ -2415,11 +2415,51 @@ concurrent-write semantics. Decompose when picked up.
       locking integration, observability counters all land
       in subsequent slices (M0017-0001 step 2 / M0017-0002 /
       M0017-0003 / M0017-0004).)
-- [ ] UPSERT Stage A — analyzer + planner + executor wiring
-      (M0017-0001 step 2 / M0017-0002 / M0017-0003).
-      Continues `docs/design/0017-0001-on-conflict-parser-ast-and-analysis.md`
-      and reserves filenames `0017-0002-upsert-planner-and-arbiter-selection.md`
-      and `0017-0003-upsert-executor-concurrency-and-locking.md`.
+- [x] UPSERT Stage A — **analyzer wiring**
+      (M0017-0001 step 2). Continues
+      `docs/design/0017-0001-on-conflict-parser-ast-and-analysis.md`.
+      (landed 2026-04-29: `scopeRel` grew a `qualifiedOnly
+      bool` field — hides the rel from the unqualified column-
+      resolution loop AND restricts qualified-arm matches to
+      alias-only (never via the underlying table's catalog
+      name). Without that dual-restriction, registering
+      `excluded` as a synthetic rel pointing at the same
+      `*catalog.Table` would (a) make every bare `col`
+      ambiguous between target and excluded, and (b) make
+      `<target>.col` ambiguous because both rels share
+      `rel.table.Name`. New `analyzeOnConflict(oc, tbl, cat,
+      targetAlias)` called from `analyzeInsert` validates:
+      (1) Stage B reject for `ON CONSTRAINT name` — `0A000`;
+      (2) `DO UPDATE` requires a target — `42601` mirroring
+      upstream's "requires inference specification or
+      constraint name"; (3) conflict-target columns exist
+      on target table — `42703` (planner picks the unique-
+      arbiter index in M0017-0002); (4) DO UPDATE scope
+      builds two rels — target (bare + qualified-by-alias
+      resolve here) and `excluded` qualifiedOnly (reachable
+      only via `excluded.col`); (5) SET assignment column
+      existence (`42703`) + RHS type (`42804`) mirroring
+      `analyzeUpdate`; (6) optional WHERE analyzed under
+      the same scope, must be boolean (`42804`). `planInsert`
+      second-line gate rejects any `InsertStmt` carrying a
+      non-nil `OnConflict` with `0A000` so an executable
+      plan never silently drops the clause when a caller
+      bypasses the analyzer. Tests: 11 analyzer-side in
+      `internal/analyzer/on_conflict_test.go` covers all
+      six accepted shapes (DO NOTHING no-target, DO NOTHING
+      with target, DO UPDATE basic, DO UPDATE mixed bare +
+      excluded refs, DO UPDATE WHERE qualified by target
+      name + excluded, all six rejected diagnostics
+      including 0A000 constraint, 42601 update-without-
+      target, 42703 unknown target/SET/excluded column,
+      42804 type mismatch and non-boolean WHERE) + 1
+      planner-side `TestPlanInsertOnConflictRejected`
+      mirroring the `TestPlanWithRecursiveRejected`
+      pattern. Full `go test ./...` green.)
+- [ ] UPSERT Stage A — planner + executor wiring
+      (M0017-0002 / M0017-0003). Reserves filenames
+      `docs/design/0017-0002-upsert-planner-and-arbiter-selection.md`
+      and `docs/design/0017-0003-upsert-executor-concurrency-and-locking.md`.
 - [ ] UPSERT Stage B: `ON CONFLICT ON CONSTRAINT name`,
       `excluded.col` references in DO UPDATE.
 

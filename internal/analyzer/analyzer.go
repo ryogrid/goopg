@@ -81,6 +81,14 @@ type scope struct {
 type scopeRel struct {
 	table *catalog.Table
 	alias string
+	// qualifiedOnly hides this rel from the unqualified
+	// column-resolution path. Used by ON CONFLICT DO UPDATE
+	// (M0017-0001 step 2) to wire `excluded` into the scope as a
+	// pseudo-table without creating a bare-`col` ambiguity with
+	// the target table — `excluded.col` resolves only via the
+	// fully-qualified path. Mirrors upstream's name-resolution
+	// rule for the EXCLUDED pseudo-relation.
+	qualifiedOnly bool
 }
 
 // outerScope is the goroutine-thread-unsafe lexical-scope
@@ -282,6 +290,103 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 			if !isAssignable(typ, targetCols[i].Type) {
 				return analyzeError(e.Pos(), "42804", fmt.Sprintf("column %q has type %q but expression has type %q", targetCols[i].Name, targetCols[i].Type.Name, typ.Name))
 			}
+		}
+	}
+	if s.OnConflict != nil {
+		if err := analyzeOnConflict(s.OnConflict, tbl, cat, s.Target.Alias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// analyzeOnConflict validates an `ON CONFLICT …` clause against the
+// INSERT target's catalog metadata (M0017-0001 step 2). The shapes
+// the parser accepts but Stage A doesn't yet support — `ON
+// CONSTRAINT name` and `ON CONFLICT DO UPDATE` without a target —
+// are rejected here with deterministic SQLSTATE codes so callers
+// see the same diagnostic regardless of when feature gating moves
+// (Stage B, planner step, etc.).
+//
+// For `DO UPDATE SET …`, expressions on the RHS of each assignment
+// (and the optional `WHERE` predicate) are analyzed against a scope
+// that includes both the target table (resolvable bare or by its
+// table name / alias) and the `excluded` pseudo-table — the
+// inserted-row "view" upstream exposes via the EXCLUDED keyword.
+// The pseudo-table is registered as `qualifiedOnly` so bare column
+// references continue to resolve unambiguously to the target side.
+func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat catalog.Catalog, targetAlias string) error {
+	// Stage B reject — constraint-name target form. The parser
+	// already accepts the shape so the AST is stable; the analyzer
+	// is the gate.
+	if oc.Target != nil && oc.Target.Constraint != "" {
+		return analyzeError(oc.Pos(), "0A000",
+			"ON CONFLICT ON CONSTRAINT is not supported in v0 (Stage B)")
+	}
+
+	// `ON CONFLICT DO UPDATE …` requires a conflict target. Mirrors
+	// upstream's "ON CONFLICT DO UPDATE requires inference
+	// specification or constraint name" diagnostic (42601 there).
+	if oc.Action == parser.OnConflictUpdate && oc.Target == nil {
+		return analyzeError(oc.Pos(), "42601",
+			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
+	}
+
+	// Validate the conflict-target column list (when present).
+	// Each named column must exist on the target table; the
+	// planner picks the actual unique-arbiter index in M0017-0002.
+	if oc.Target != nil {
+		if len(oc.Target.Columns) == 0 {
+			return analyzeError(oc.Target.Pos(), "42601",
+				"ON CONFLICT target requires at least one column")
+		}
+		for _, col := range oc.Target.Columns {
+			if _, ok := lookupColumn(tbl, col); !ok {
+				return analyzeError(oc.Target.Pos(), "42703",
+					fmt.Sprintf("column %q of relation %q does not exist", col, tbl.Name))
+			}
+		}
+	}
+
+	if oc.Action != parser.OnConflictUpdate {
+		return nil
+	}
+
+	// Build the DO UPDATE scope:
+	//   - target table — primary, bare refs resolve here. Carries
+	//     the user-provided alias (if any) so `t.col` works for
+	//     `INSERT INTO foo AS t … DO UPDATE SET … = t.col`.
+	//   - excluded — pseudo-table with the same column shape;
+	//     qualifiedOnly so bare refs don't become ambiguous.
+	primaryAlias := targetAlias
+	if primaryAlias == "" {
+		primaryAlias = tbl.Name
+	}
+	ctx := &scope{
+		cat: cat,
+		rels: []scopeRel{
+			{table: tbl, alias: primaryAlias},
+			{table: tbl, alias: "excluded", qualifiedOnly: true},
+		},
+	}
+	for _, assign := range oc.UpdateSet {
+		col, ok := lookupColumn(tbl, assign.Column)
+		if !ok {
+			return analyzeError(assign.Pos(), "42703",
+				fmt.Sprintf("column %q of relation %q does not exist", assign.Column, tbl.Name))
+		}
+		typ, err := analyzeExpr(assign.Expr, ctx)
+		if err != nil {
+			return err
+		}
+		if !isAssignable(typ, col.Type) {
+			return analyzeError(assign.Expr.Pos(), "42804",
+				fmt.Sprintf("column %q has type %q but expression has type %q", col.Name, col.Type.Name, typ.Name))
+		}
+	}
+	if oc.UpdateWhere != nil {
+		if err := analyzeWhere(oc.UpdateWhere, ctx); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -622,6 +727,22 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 	if x.Table != "" || x.Schema != "" {
 		matches := make([]scopeRel, 0, 1)
 		for _, rel := range ctx.rels {
+			if rel.qualifiedOnly {
+				// Pseudo-tables (e.g. ON CONFLICT's
+				// `excluded`) reach name resolution
+				// only via their alias — never via the
+				// underlying table's catalog name —
+				// because the alias is the user-facing
+				// identity. Otherwise a target table
+				// named `t` plus an `excluded` rel
+				// pointing at the same `*catalog.Table`
+				// would make `t.col` ambiguous.
+				if rel.alias != "" && strings.EqualFold(x.Table, rel.alias) &&
+					(x.Schema == "" || strings.EqualFold(x.Schema, rel.table.Schema)) {
+					matches = append(matches, rel)
+				}
+				continue
+			}
 			if scopeRelMatches(rel, x.Table, x.Schema) {
 				matches = append(matches, rel)
 			}
@@ -641,6 +762,9 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 
 	var found *catalog.Type
 	for _, rel := range ctx.rels {
+		if rel.qualifiedOnly {
+			continue
+		}
 		col, ok := lookupColumn(rel.table, x.Column)
 		if !ok {
 			continue

@@ -123,3 +123,27 @@ func TestPlanWithoutCTEUnchanged(t *testing.T) {
 		t.Errorf("plain SELECT: %v", err)
 	}
 }
+
+// TestPlanInsertOnConflictRejected: ON CONFLICT analyzer
+// validation lands in M0017-0001 step 2; planner conflict-arbiter
+// selection lands in M0017-0002. Until then the planner refuses
+// to produce a plan for `INSERT … ON CONFLICT …` so an executable
+// plan never silently drops the clause. Mirrors the
+// TestPlanWithRecursiveRejected pattern (0A000 second-line gate).
+func TestPlanInsertOnConflictRejected(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) "+
+			"ON CONFLICT (aid) DO UPDATE SET abalance = excluded.abalance")
+	_, err := Plan(stmt, cat)
+	if err == nil {
+		t.Fatal("expected ON CONFLICT rejection, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("err type=%T, want *PlanError", err)
+	}
+	if pe.Code != "0A000" {
+		t.Errorf("code=%s, want 0A000", pe.Code)
+	}
+}
