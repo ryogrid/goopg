@@ -223,3 +223,111 @@ func drainScan(op Operator) ([]Row, error) {
 		out = append(out, row)
 	}
 }
+
+// recordingExecAIOEngine counts every Submit so a test can
+// assert that seqScan's prefetch loop fires through Pool.Prefetch
+// → Manager.PrefetchBlock → engine.Submit. Same shape as the
+// recording engine in internal/storage/storage_test.go but
+// duplicated here because Go test packages can't share helpers.
+type recordingExecAIOEngine struct {
+	submits int
+}
+
+func (r *recordingExecAIOEngine) Submit(op storage.AIOSubmitOp) storage.AIOHandle {
+	r.submits++
+	n, err := op.File.ReadAt(op.Buffer, op.Offset)
+	return execAIOHandle{n: n, err: err}
+}
+
+type execAIOHandle struct {
+	n   int
+	err error
+}
+
+func (h execAIOHandle) Wait() (int, error) { return h.n, h.err }
+
+// TestSeqScanFiresPrefetchesAcrossBlocks pins the M0009 caller
+// integration: with prefetching enabled, seqScan walks
+// `seqScanLookahead` blocks ahead of curBlock via Pool.Prefetch.
+// Constructs a fixture with a recording AIO engine, inserts
+// enough rows to span 5+ blocks, runs a SeqScan to completion,
+// and asserts the engine saw at least one Submit (and at most
+// nBlocks Submits — we never overshoot the relation).
+func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	// Attach a recording AIO engine to the fixture's Manager
+	// and opt the Pool into prefetching.
+	eng := &recordingExecAIOEngine{}
+	ctx.Pool.Manager().SetAIO(eng)
+	ctx.Pool.SetPrefetchEnabled(true)
+
+	// Stuff enough rows in to span several blocks.
+	const N = 600
+	rows := make([][]planner.Expr, N)
+	for i := range rows {
+		rows[i] = []planner.Expr{
+			&planner.IntegerConst{Value: int64(i)},
+			&planner.StringConst{Value: "row"},
+		}
+	}
+	in := &planner.Insert{
+		Table:       tbl,
+		Source:      &planner.Values{Rows: rows},
+		ColumnIndex: []int{0, 1},
+	}
+	op, _ := Build(in)
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+
+	rel := cat.RelFileNode(tbl)
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nBlocks < 2 {
+		t.Fatalf("test setup wrote only %d blocks; need ≥2 to exercise prefetch", nBlocks)
+	}
+
+	// Insert populated the buffer pool with every page. Flush
+	// to disk THEN drop them so the SeqScan's Pool.Prefetch
+	// hits the not-cached path (Pool.Prefetch silently no-ops
+	// on cached tags). InvalidateRel without a prior FlushAll
+	// would discard dirty pages, costing the inserted data.
+	if err := ctx.Pool.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
+	ctx.Pool.InvalidateRel(rel)
+	// Reset the counter so we observe only the SeqScan's
+	// prefetches, not any Pin-driven background reads from the
+	// insert path.
+	eng.submits = 0
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	scanned, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = scan.Close()
+	if len(scanned) != N {
+		t.Errorf("scanned %d rows, want %d", len(scanned), N)
+	}
+	// SeqScan should have fired at least one prefetch (the
+	// initial lookahead window) and at most nBlocks — the
+	// refill loop never overshoots NBlocks.
+	if eng.submits == 0 {
+		t.Errorf("seqScan fired 0 prefetches; expected at least 1")
+	}
+	if eng.submits > int(nBlocks) {
+		t.Errorf("seqScan fired %d prefetches, exceeds NBlocks=%d", eng.submits, nBlocks)
+	}
+}

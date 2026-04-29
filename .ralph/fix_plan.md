@@ -3044,11 +3044,48 @@ See `docs/milestones/0009-aio-subsystem.md`.
       land — recorded in the new doc's "Numbering note"
       section.)
 
-- [ ] AIO heap-scan / bitmap-heap-scan caller integration:
-      sequential heap scan and bitmap heap scan use the
-      read stream as their page-fetch path; `Pool.Prefetch(tag)`
-      hook invokes `Manager.PrefetchBlock` so cache-warming
-      becomes observable mid-scan.
+- [x] AIO heap-scan caller integration. (landed
+      2026-04-29: `storage.Pool` gained
+      `SetPrefetchEnabled(bool)` and `Prefetch(tag)`. With
+      prefetching enabled, Prefetch checks the byTag map
+      under poolMu and — on a miss — calls
+      `Manager.PrefetchBlock` with a throwaway buffer; the
+      AIO handle is dropped on the floor (the engine's
+      worker goroutine completes the read in the
+      background, the buffer warms the kernel page cache
+      via the pread syscall, and the buffer is then GC'd).
+      Default-off so synchronous deployments don't pay for
+      an inline pread we'd repeat on the subsequent Pin.
+      `initdb.Open` flips it on after attaching an AIO
+      engine. Errors swallowed — a failed prefetch must
+      not impact correctness; the subsequent Pin will
+      surface any real I/O error. `executor.seqScanOp`
+      gained a `prefetchedThru` cursor and a
+      `refillPrefetchWindow` helper that keeps
+      `seqScanLookahead = 4` blocks ahead of curBlock
+      prefetched via Pool.Prefetch. The window is primed
+      on Open and topped up after every block advance, so
+      the next-but-N block is being read by the AIO engine
+      while the consumer decodes the current page. With
+      Pool.Prefetch disabled the loop is cheap (atomic
+      load + early return) so existing tests that don't
+      model AIO are unaffected. Tests in storage:
+      TestPoolPrefetchDisabledIsNoOp (default-off — no
+      submits even with engine attached),
+      TestPoolPrefetchEnabledFiresThroughEngine (one
+      Submit per non-cached Prefetch; cached-tag Prefetch
+      is a no-op). Tests in executor:
+      TestSeqScanFiresPrefetchesAcrossBlocks (recording
+      engine attached + Pool.SetPrefetchEnabled(true);
+      insert 600 rows spanning multiple blocks; flush +
+      InvalidateRel so the SeqScan's Prefetch hits the
+      not-cached path; assert engine.submits ∈ [1,
+      nBlocks] after a full scan that returns all 600
+      rows). Built and full `go test ./...` green. The
+      bitmap-heap-scan, ANALYZE-sample, and direct read-
+      stream-driven seqScan paths remain follow-up
+      slices; the substrate they all sit on is now in
+      place.)
 
 - [ ] AIO checkpointer + WAL writer caller integration:
       checkpointer dirty-page writeback submits writes

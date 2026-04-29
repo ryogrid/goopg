@@ -104,6 +104,15 @@ type Pool struct {
 	// without changing MarkDirty's signature.
 	logger *slog.Logger
 
+	// prefetchEnabled gates Pool.Prefetch. When false (the
+	// default), Prefetch is a fast no-op so the synchronous
+	// fallback path doesn't pay for an inline pread we'd have
+	// to repeat on the subsequent Pin. The lifecycle owner
+	// (initdb.Open) flips it on after attaching an AIO engine
+	// to the storage Manager, since only then does Prefetch
+	// run async.
+	prefetchEnabled atomic.Bool
+
 	// poolMu guards byTag, slots[*].tag/valid/dirty, slots[*].pinCount,
 	// slots[*].usageCount, slots[*].fpiSinceCheckpoint, and clockHand.
 	// It does NOT guard the page bytes — those are guarded by
@@ -315,6 +324,42 @@ func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // Manager exposes the underlying storage manager so DDL operators can
 // drop or truncate relation files. Pinning still flows through Pool.
 func (p *Pool) Manager() *Manager { return p.mgr }
+
+// SetPrefetchEnabled toggles Pool.Prefetch's behaviour. When
+// false, Prefetch is a no-op. Idempotent. The wiring layer
+// (initdb.Open) sets this true once an AIO engine is attached
+// to the storage Manager — only then does Prefetch run on a
+// background goroutine rather than blocking the caller with
+// an inline pread.
+func (p *Pool) SetPrefetchEnabled(on bool) { p.prefetchEnabled.Store(on) }
+
+// Prefetch is a hint that the caller is about to Pin tag. When
+// prefetching is enabled and tag isn't already cached, the page
+// is read on the AIO engine's background workers so the
+// kernel page cache is warm by the time Pin's synchronous read
+// runs. Buffer-pool slot allocation still happens at Pin time;
+// Prefetch only warms the kernel side.
+//
+// Drops the AIO handle on the floor — the engine's worker
+// goroutine completes the read in the background; the throwaway
+// buffer warms the page cache and is then GC'd.
+//
+// Errors are intentionally swallowed: a failed prefetch must
+// not impact correctness. The subsequent Pin will surface any
+// real I/O error.
+func (p *Pool) Prefetch(tag BufferTag) {
+	if !p.prefetchEnabled.Load() {
+		return
+	}
+	p.poolMu.Lock()
+	_, cached := p.byTag[tag]
+	p.poolMu.Unlock()
+	if cached {
+		return
+	}
+	buf := make([]byte, BlockSize)
+	_, _ = p.mgr.PrefetchBlock(tag.Rel, tag.Block, buf)
+}
 
 // InvalidateRel evicts every slot currently bound to a buffer of rel.
 // DROP TABLE / TRUNCATE TABLE call this after committing the

@@ -647,3 +647,80 @@ func TestPrefetchBlockOutOfRange(t *testing.T) {
 		t.Errorf("Wait err=%v want ErrShortRead", werr)
 	}
 }
+
+// TestPoolPrefetchDisabledIsNoOp pins the default-off behaviour:
+// SetPrefetchEnabled is false at construction so seqScan-style
+// callers that fire Prefetch don't trigger any I/O on
+// AIO-engine-less deployments.
+func TestPoolPrefetchDisabledIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	eng := &recordingAIOEngine{}
+	mgr.SetAIO(eng)
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 17100, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	pool.Prefetch(BufferTag{Rel: rel, Block: 0})
+	if got := len(eng.submits); got != 0 {
+		t.Errorf("disabled Prefetch fired %d submits, want 0", got)
+	}
+}
+
+// TestPoolPrefetchEnabledFiresThroughEngine pins the enabled
+// path: with prefetching on and an engine attached, every
+// non-cached Prefetch call submits one read through the engine.
+// A subsequent Prefetch for an already-cached tag is a no-op.
+func TestPoolPrefetchEnabledFiresThroughEngine(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	eng := &recordingAIOEngine{}
+	mgr.SetAIO(eng)
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	pool.SetPrefetchEnabled(true)
+
+	rel := RelFileNode{DBOid: 1, RelOid: 17101, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	pool.Prefetch(BufferTag{Rel: rel, Block: 0})
+	pool.Prefetch(BufferTag{Rel: rel, Block: 1})
+	if got := len(eng.submits); got != 2 {
+		t.Errorf("Prefetch fired %d submits, want 2", got)
+	}
+
+	// Pin block 0 so it lands in the pool, then Prefetch it
+	// again — the cached-tag check should suppress the submit.
+	s, err := pool.Pin(BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s)
+	pool.Prefetch(BufferTag{Rel: rel, Block: 0})
+	if got := len(eng.submits); got != 2 {
+		t.Errorf("Prefetch on cached tag fired extra submit; submits=%d want 2", got)
+	}
+}

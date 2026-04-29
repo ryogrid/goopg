@@ -247,6 +247,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: bufpool: %w", err)
 	}
+	// With an AIO engine attached, opt the Pool into prefetching
+	// so heap-scan / future bitmap-scan / ANALYZE callers issuing
+	// `Pool.Prefetch(tag)` hints actually warm the page cache via
+	// the engine's worker pool rather than no-oping.
+	if aioEngine != nil {
+		pool.SetPrefetchEnabled(true)
+	}
 
 	cat := catalog.NewInMemory()
 	txnMgr := mvcc.NewManager()

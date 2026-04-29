@@ -41,7 +41,20 @@ type seqScanOp struct {
 	curSlot  uint16
 	slotMax  int
 	pinned   *storage.Slot
+
+	// prefetchedThru is the highest block (exclusive) we've
+	// already issued a Pool.Prefetch hint for. SeqScan walks
+	// blocks strictly forward, so the prefetcher just needs to
+	// keep `seqScanLookahead` blocks ahead of curBlock.
+	prefetchedThru storage.BlockNumber
 }
+
+// seqScanLookahead is the number of blocks ahead of the current
+// scan position seqScanOp keeps prefetched. Mirrors upstream's
+// `effective_io_concurrency` default scope and is enough to
+// pipeline a single sequential scan against typical SSD
+// latencies. A future loop turns this into a tunable GUC.
+const seqScanLookahead storage.BlockNumber = 4
 
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	return &seqScanOp{plan: p, cols: p.Table.Columns}
@@ -63,7 +76,24 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curBlock = 0
 	o.curSlot = 0
 	o.slotMax = 0
+	o.prefetchedThru = 0
+	o.refillPrefetchWindow(rel)
 	return nil
+}
+
+// refillPrefetchWindow keeps `seqScanLookahead` blocks ahead of
+// curBlock prefetched via Pool.Prefetch. With prefetching
+// disabled (no AIO engine attached) Pool.Prefetch is a no-op,
+// so this loop is cheap.
+func (o *seqScanOp) refillPrefetchWindow(rel storage.RelFileNode) {
+	target := o.curBlock + seqScanLookahead
+	if target > o.nBlocks {
+		target = o.nBlocks
+	}
+	for o.prefetchedThru < target {
+		o.ctx.Pool.Prefetch(storage.BufferTag{Rel: rel, Block: o.prefetchedThru})
+		o.prefetchedThru++
+	}
 }
 
 func (o *seqScanOp) Close() error {
@@ -129,6 +159,10 @@ func (o *seqScanOp) Next() (Row, error) {
 		}
 		o.releasePinned()
 		o.curBlock++
+		// As the scan walks forward, top up the prefetch window
+		// so the next-but-one block is being read by the AIO
+		// engine while we decode the current page.
+		o.refillPrefetchWindow(rel)
 	}
 }
 

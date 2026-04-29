@@ -145,17 +145,78 @@ until the io_uring method's runtime probe lands.
     leaves `Runtime.AIO` nil so the existing synchronous
     storage paths are unchanged.
 
+## Heap-scan caller integration
+
+Layered on top of the storage substrate above:
+
+### `Pool.Prefetch(tag)` + `SetPrefetchEnabled(bool)`
+
+```go
+func (p *Pool) SetPrefetchEnabled(on bool)
+func (p *Pool) Prefetch(tag BufferTag)
+```
+
+`SetPrefetchEnabled` toggles `Prefetch`'s behaviour. Default
+off, so synchronous deployments don't pay for an inline pread
+we'd then repeat on the subsequent `Pin`. `initdb.Open` flips
+it on after attaching an AIO engine to the storage Manager.
+
+`Prefetch` checks the `byTag` map under `poolMu`. On a hit,
+it's a no-op (the page is already cached, no syscall needed).
+On a miss, it calls `Manager.PrefetchBlock` with a throwaway
+buffer; the returned AIO handle is dropped on the floor — the
+engine's worker goroutine completes the read in the
+background, the buffer warms the kernel page cache via the
+underlying `pread` syscall, and the buffer is then GC'd.
+
+Errors are intentionally swallowed: a failed prefetch must
+not impact correctness. The subsequent `Pin` will surface any
+real I/O error.
+
+### `seqScanOp.refillPrefetchWindow`
+
+`executor.seqScanOp` keeps a `prefetchedThru` cursor and calls
+`refillPrefetchWindow(rel)` on `Open` and after every block
+advance:
+
+```go
+const seqScanLookahead storage.BlockNumber = 4
+
+func (o *seqScanOp) refillPrefetchWindow(rel storage.RelFileNode) {
+    target := o.curBlock + seqScanLookahead
+    if target > o.nBlocks { target = o.nBlocks }
+    for o.prefetchedThru < target {
+        o.ctx.Pool.Prefetch(BufferTag{Rel: rel, Block: o.prefetchedThru})
+        o.prefetchedThru++
+    }
+}
+```
+
+The window targets `curBlock + seqScanLookahead`, capped at
+`nBlocks` so the refill loop never overshoots. With
+`Pool.Prefetch` disabled the loop is essentially free (atomic
+load + early return) — existing tests that don't model AIO
+are unaffected.
+
+`seqScanLookahead` is a fixed `4` for now. A future loop turns
+it into a tunable GUC (mirroring upstream's
+`effective_io_concurrency`).
+
 ## What this slice doesn't deliver
 
-- **Heap-scan / bitmap-heap-scan integration.** No executor
-  call site uses `Manager.PrefetchBlock` yet. The next slice
-  layers a `aio.ReadStream` driven by a `storage.Manager`-aware
-  `NextBlockFunc` onto the seqscan operator.
-- **`Pool.Prefetch(tag)`.** The buffer pool doesn't yet have
-  a prefetch hook that invokes `Manager.PrefetchBlock`. That
-  lands alongside the heap-scan integration so the pool
-  already has consumers when the cache-warming behaviour
-  becomes observable.
+- **Bitmap-heap-scan integration.** Bitmap scans walk a
+  pre-collected block list (from a bitmap-OR of index
+  scans); same `Pool.Prefetch` shape applies, but the
+  caller hasn't been wired up yet.
+- **ANALYZE-sample integration.** Reservoir sampling in the
+  ANALYZE path reads N random pages; an `aio.ReadStream`-
+  driven version would prefetch them. Hooks reserved.
+- **Direct `aio.ReadStream` integration.** seqScan still
+  goes through `Pool.Pin` for the actual page read; the
+  read-stream's `Next() → []byte` shape would let scans
+  bypass the buffer pool for one-shot reads. Out of scope
+  this slice; the cache-warming Prefetch path delivers the
+  measurable win without changing pin/unpin semantics.
 - **Checkpointer / WAL writer write paths** through AIO. Out
   of scope for this read-side substrate; lands in the
   follow-up `0009-0004-aio-checkpointer-and-wal.md`.
