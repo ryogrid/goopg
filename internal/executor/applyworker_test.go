@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"encoding/binary"
+	"log/slog"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -454,6 +455,72 @@ func TestApplyWorkerPromotesSyncDoneToReadyOnCommit(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0][0].Int != 2 {
 		t.Errorf("scan rows=%v want one row with id=2", rows)
+	}
+}
+
+// TestApplyWorkerLogsCommitAndPromotion pins the structured-log
+// contract: a commit produces an `event=apply_commit` line with
+// the commit LSN; promoting an `s` rel to `r` produces an
+// `event=tablesync_state_change` line with `from=s to=r`. Both
+// land via the configured slog.Logger so dashboards can alert on
+// either keyword.
+func TestApplyWorkerLogsCommitAndPromotion(t *testing.T) {
+	_, pubCat, pubCleanup := newStorageFixture(t)
+	defer pubCleanup()
+	pubTbl, _ := pubCat.LookupTable(parser.ObjectName{Name: "items"})
+	snap := wal.BuildCatalogSnapshot(pubCat.(*catalog.InMemory))
+	rel := pubCat.RelFileNode(pubTbl)
+
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	subRel := subCat.RelFileNode(subTbl)
+
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub_log", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ps.AddSubscriptionRel("sub_log", subRel.RelOid); err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range []string{
+		catalog.SubRelStateDataCopy,
+		catalog.SubRelStateSyncDone,
+	} {
+		if _, err := ps.AdvanceSubscriptionRel("sub_log", subRel.RelOid, st, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	w.SetSubscriptionContext(ps, "sub_log")
+	w.SetLogger(logger)
+	defer w.SafeRollback()
+
+	stream := pgoutputBIRC(t, snap, rel, 1, "row", 0xC0FFEE)
+	driveStream(t, w, stream)
+
+	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte{'\n'})
+	var sawCommit, sawPromotion bool
+	for _, line := range lines {
+		if bytes.Contains(line, []byte(`"event":"apply_commit"`)) &&
+			bytes.Contains(line, []byte(`"lsn":12648430`)) {
+			sawCommit = true
+		}
+		if bytes.Contains(line, []byte(`"event":"tablesync_state_change"`)) &&
+			bytes.Contains(line, []byte(`"from":"s"`)) &&
+			bytes.Contains(line, []byte(`"to":"r"`)) {
+			sawPromotion = true
+		}
+	}
+	if !sawCommit {
+		t.Errorf("missing apply_commit log line; saw: %s", buf.String())
+	}
+	if !sawPromotion {
+		t.Errorf("missing tablesync_state_change s→r log line; saw: %s", buf.String())
 	}
 }
 

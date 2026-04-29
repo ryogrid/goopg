@@ -2816,13 +2816,51 @@ item.
       themselves and `pg_stat_subscription` reflects their
       progress in real time.)
 
-- [ ] Structured replication-event logging:
-      `wal.ReplicationLogger` interface with hooks for
-      slot-create/drop, walsender start/stop, walreceiver
-      start/stop, applyCommit, tablesync-state-transition
-      events. Until this lands, ad-hoc log.Printf lines in
-      the live workers remain the sole structured-log
-      source.
+- [x] Structured replication-event logging. (landed
+      2026-04-29: extends the existing `slog` +
+      `internal/wal/repllog.go` event-constant pattern from
+      M0005 rather than adding a parallel
+      `wal.ReplicationLogger` interface — the M0005
+      walreceiver / retention paths already use
+      `*slog.Logger` with `"event", wal.EventXxx` plus
+      structured key/value pairs, and dashboards alert on
+      that vocabulary; the logical-replication slice
+      reuses it. New event constants in `repllog.go`:
+      `EventApplyCommit`, `EventApplyError`,
+      `EventTablesyncStarted`, `EventTablesyncCompleted`,
+      `EventTablesyncStateChange`. `executor.ApplyWorker`
+      gained `SetLogger(*slog.Logger)`; `applyCommit`
+      emits `event=apply_commit` with sub/xid/lsn; the
+      per-message error path emits `event=apply_error`
+      with sub/kind/rel_oid/lsn/err; `promoteSyncedRels`
+      emits `event=tablesync_state_change` with
+      from=s/to=r/lsn on each successful promotion.
+      `server.TableSyncConfig.Logger` and
+      `server.TableSyncManagerConfig.Logger` plumb the
+      same logger through the tablesync transport;
+      `RunTableSync` emits `tablesync_started` at entry,
+      `tablesync_state_change` at every actual `i→d` and
+      `d→s` transition (the i→d line is suppressed when
+      the previous state was already `d` — re-entry on a
+      partial sync), and `tablesync_completed` with the
+      row count at exit. nil logger falls back to
+      `slog.Default()` everywhere so existing tests don't
+      need to opt in. Tests:
+      TestApplyWorkerLogsCommitAndPromotion (B/R/I/C
+      through an apply worker with a tablesync rel at `s`
+      produces both `apply_commit` with `lsn:12648430`
+      and `tablesync_state_change` from=s to=r);
+      TestRunTableSyncLogsLifecycle (happy-path sync of
+      two rows produces tablesync_started, both
+      state-change lines, and `tablesync_completed` with
+      `rows:2`). Design doc
+      `docs/design/0008-0006-structured-replication-event-logging.md`
+      added and indexed in `docs/design/README.md`. Built
+      and full `go test ./...` green. The first draft
+      introduced a parallel `wal.ReplicationLogger`
+      interface; rejected for the slog/repllog.go pattern
+      so the M0005 and M0008 event vocabularies share one
+      grep target.)
 
 ## Notes
 

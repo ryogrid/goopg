@@ -31,6 +31,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
@@ -91,6 +92,12 @@ type TableSyncManagerConfig struct {
 	// table identified by relOID. The manager guarantees Close
 	// is called before moving on.
 	OpenWriter func(ctx context.Context, relOID uint32) (*WriterPair, error)
+
+	// Logger receives structured replication-event lines and is
+	// forwarded into every per-rel RunTableSync invocation. nil
+	// falls back to slog.Default(). See repllog.go for the event
+	// vocabulary.
+	Logger *slog.Logger
 
 	// OpenStat is the optional pg_stat_subscription factory.
 	// When set, the manager calls it once per visited rel to
@@ -215,6 +222,7 @@ func syncOneRel(ctx context.Context, cfg TableSyncManagerConfig, relOID uint32, 
 		Reader:  conn.Reader,
 		Writer:  conn.Writer,
 		Stat:    statHandle,
+		Logger:  cfg.Logger,
 	})
 	res.Rows = rows
 	if err != nil {

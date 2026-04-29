@@ -31,6 +31,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -79,6 +80,12 @@ type ApplyWorker struct {
 	// LSN. Nil disables observability — the legacy path used by
 	// existing tests.
 	stat *wal.Subscriber
+
+	// logger receives structured replication-event lines (apply
+	// commits, apply errors, tablesync state promotions). nil
+	// falls back to slog.Default(); tests pass a discard logger
+	// to silence output. See repllog.go for the event vocabulary.
+	logger *slog.Logger
 }
 
 // applyRel pairs a remote Relation message with its resolved
@@ -122,6 +129,22 @@ func (w *ApplyWorker) SetStatHandle(sub *wal.Subscriber) {
 	w.stat = sub
 }
 
+// SetLogger attaches a structured replication-event logger.
+// nil falls back to slog.Default(). Idempotent.
+func (w *ApplyWorker) SetLogger(l *slog.Logger) {
+	w.logger = l
+}
+
+// log returns the configured logger or slog.Default() when
+// none was set. Centralised so call sites don't repeat the
+// nil-check.
+func (w *ApplyWorker) log() *slog.Logger {
+	if w.logger != nil {
+		return w.logger
+	}
+	return slog.Default()
+}
+
 // ApplyMessage handles one decoded pgoutput event. The second
 // return value is non-zero only for `C` (commit) messages — it
 // carries the remote commit LSN so the caller can advance the
@@ -137,19 +160,32 @@ func (w *ApplyWorker) ApplyMessage(m *wal.DecodedMessage) (uint64, error) {
 		// (zero on R/I/D, which leaves latest_end_lsn untouched).
 		w.stat.MarkMessage(time.Now(), m.EndLSN)
 	}
+	var (
+		commitLSN uint64
+		err       error
+	)
 	switch m.Kind {
 	case 'B':
-		return 0, w.applyBegin(m)
+		err = w.applyBegin(m)
 	case 'R':
-		return 0, w.applyRelation(m)
+		err = w.applyRelation(m)
 	case 'I':
-		return 0, w.applyInsert(m)
+		err = w.applyInsert(m)
 	case 'D':
-		return 0, w.applyDelete(m)
+		err = w.applyDelete(m)
 	case 'C':
-		return m.CommitLSN, w.applyCommit(m)
+		commitLSN = m.CommitLSN
+		err = w.applyCommit(m)
+	default:
+		err = fmt.Errorf("applyworker: unsupported pgoutput kind %q", m.Kind)
 	}
-	return 0, fmt.Errorf("applyworker: unsupported pgoutput kind %q", m.Kind)
+	if err != nil {
+		w.log().Error("logical apply: per-message failure",
+			"event", wal.EventApplyError,
+			"sub", w.subName, "kind", string(m.Kind),
+			"rel_oid", m.RelOID, "lsn", m.EndLSN, "err", err)
+	}
+	return commitLSN, err
 }
 
 func (w *ApplyWorker) applyBegin(m *wal.DecodedMessage) error {
@@ -257,6 +293,9 @@ func (w *ApplyWorker) applyCommit(m *wal.DecodedMessage) error {
 	if w.stat != nil {
 		w.stat.AdvanceReceivedLSN(m.CommitLSN)
 	}
+	w.log().Info("logical apply: commit",
+		"event", wal.EventApplyCommit,
+		"sub", w.subName, "xid", m.XID, "lsn", m.CommitLSN)
 	return nil
 }
 
@@ -282,8 +321,15 @@ func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
 		if commitLSN < sr.LSN {
 			continue
 		}
-		_, _ = w.pubsub.AdvanceSubscriptionRel(w.subName, sr.RelOID,
-			catalog.SubRelStateReady, commitLSN)
+		if _, err := w.pubsub.AdvanceSubscriptionRel(w.subName, sr.RelOID,
+			catalog.SubRelStateReady, commitLSN); err == nil {
+			w.log().Info("logical apply: tablesync rel promoted",
+				"event", wal.EventTablesyncStateChange,
+				"sub", w.subName, "rel_oid", sr.RelOID,
+				"from", catalog.SubRelStateSyncDone,
+				"to", catalog.SubRelStateReady,
+				"lsn", commitLSN)
+		}
 	}
 }
 

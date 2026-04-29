@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -82,6 +83,12 @@ type TableSyncConfig struct {
 	// the row count stands in as a "progress observed" signal).
 	// Caller owns Register / Unregister around RunTableSync.
 	Stat *wal.Subscriber
+
+	// Logger receives structured replication-event lines
+	// (started, state-change, completed). nil falls back to
+	// slog.Default(). See internal/wal/repllog.go for the
+	// event vocabulary.
+	Logger *slog.Logger
 }
 
 // RunTableSync drives one publisher → subscriber initial COPY and
@@ -103,6 +110,11 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 		return 0, errors.New("tablesync: Relname is empty")
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	// Idempotent seed: if the (sub, rel) row already exists, leave
 	// its state alone — a previous attempt may have advanced it to
 	// 'd' before crashing. ErrSubscriptionRelExists is fine.
@@ -110,6 +122,10 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 		!errors.Is(err, catalog.ErrSubscriptionRelExists) {
 		return 0, fmt.Errorf("tablesync: seed subscription_rel: %w", err)
 	}
+
+	logger.Info("logical tablesync: started",
+		"event", wal.EventTablesyncStarted,
+		"sub", cfg.SubName, "rel_oid", cfg.RelOID, "rel", cfg.Relname)
 
 	// Send the simple-query COPY. Quoting policy: the caller is
 	// expected to pass a qualified, already-safe identifier (the
@@ -149,9 +165,16 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 	// Move i → d now that the publisher has agreed to stream.
 	// This transition is allowed and a no-op if we're already at d
 	// (the validity map has d → d).
+	prev, _ := cfg.PubSub.LookupSubscriptionRel(cfg.SubName, cfg.RelOID)
 	if _, err := cfg.PubSub.AdvanceSubscriptionRel(cfg.SubName, cfg.RelOID,
 		catalog.SubRelStateDataCopy, 0); err != nil {
 		return 0, fmt.Errorf("tablesync: advance to d: %w", err)
+	}
+	if prev != nil && prev.State != catalog.SubRelStateDataCopy {
+		logger.Info("logical tablesync: state change",
+			"event", wal.EventTablesyncStateChange,
+			"sub", cfg.SubName, "rel_oid", cfg.RelOID,
+			"from", prev.State, "to", catalog.SubRelStateDataCopy)
 	}
 
 	// Phase 2: stream rows until CopyDone. Each CopyData payload
@@ -183,7 +206,17 @@ func RunTableSync(cfg TableSyncConfig) (int64, error) {
 				catalog.SubRelStateSyncDone, 0); err != nil {
 				return cfg.From.RowsInserted(), fmt.Errorf("tablesync: advance to s: %w", err)
 			}
-			return cfg.From.RowsInserted(), nil
+			logger.Info("logical tablesync: state change",
+				"event", wal.EventTablesyncStateChange,
+				"sub", cfg.SubName, "rel_oid", cfg.RelOID,
+				"from", catalog.SubRelStateDataCopy,
+				"to", catalog.SubRelStateSyncDone)
+			rows := cfg.From.RowsInserted()
+			logger.Info("logical tablesync: completed",
+				"event", wal.EventTablesyncCompleted,
+				"sub", cfg.SubName, "rel_oid", cfg.RelOID,
+				"rel", cfg.Relname, "rows", rows)
+			return rows, nil
 		case protocol.MsgErrorResponse:
 			return cfg.From.RowsInserted(),
 				errFromErrorResponse(f.Payload, "tablesync (publisher errored mid-COPY)")

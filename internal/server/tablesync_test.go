@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -307,5 +308,54 @@ func TestRunTableSyncRejectsUnexpectedFrame(t *testing.T) {
 	got, _ := ps.LookupSubscriptionRel("sub1", 13)
 	if got.State != catalog.SubRelStateInit {
 		t.Errorf("state=%q want i (no advance on shape violation)", got.State)
+	}
+}
+
+// TestRunTableSyncLogsLifecycle pins the structured-log
+// contract: a happy-path RunTableSync emits started, the
+// state-change line for d→s, and completed with the row count.
+// (i→d state-change only logs when the prior state was actually
+// 'i'; here the row is fresh so we expect both transitions.)
+func TestRunTableSyncLogsLifecycle(t *testing.T) {
+	ps := catalog.NewPubSub()
+	if _, err := ps.CreateSubscription("sub_log", "x", nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	pubBytes := pubRespond(t, []string{"1\ta", "2\tb"})
+	from := &recordingLineWriter{}
+	var subOut bytes.Buffer
+	rows, err := RunTableSync(TableSyncConfig{
+		PubSub:  ps,
+		SubName: "sub_log",
+		RelOID:  16400,
+		Relname: "public.t",
+		From:    from,
+		Reader:  protocol.NewFrameReader(bytes.NewReader(pubBytes)),
+		Writer:  protocol.NewFrameWriter(&subOut),
+		Logger:  logger,
+	})
+	if err != nil || rows != 2 {
+		t.Fatalf("rows=%d err=%v want (2, nil)", rows, err)
+	}
+
+	want := []string{
+		`"event":"tablesync_started"`,
+		`"event":"tablesync_state_change"`,
+		`"from":"i"`,
+		`"to":"d"`,
+		`"from":"d"`,
+		`"to":"s"`,
+		`"event":"tablesync_completed"`,
+		`"rows":2`,
+	}
+	out := buf.String()
+	for _, w := range want {
+		if !strings.Contains(out, w) {
+			t.Errorf("log missing fragment %q; full output:\n%s", w, out)
+		}
 	}
 }
