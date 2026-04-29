@@ -42,8 +42,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Direction is the read-vs-write flavour of an Op.
@@ -114,8 +116,14 @@ type Handle struct {
 	mu   sync.Mutex
 	res  Result
 
-	// engine back-reference is currently unused but reserved
-	// for cancellation in a follow-up loop.
+	// id is the engine-assigned monotonic identifier. Used by
+	// the in-flight tracking map (and the future pg_aios view)
+	// to key off a stable, lookup-friendly value.
+	id uint64
+	// submittedAt records when Submit registered the handle.
+	// Powers the elapsed-time column in pg_aios.
+	submittedAt time.Time
+
 	engine *Engine
 }
 
@@ -165,11 +173,43 @@ type Method interface {
 // counter) so the future observability slice has counters to
 // surface without touching every method.
 type Engine struct {
-	method     Method
-	inFlight   atomic.Int64
-	submitted  atomic.Uint64
-	completed  atomic.Uint64
-	errored    atomic.Uint64
+	method    Method
+	inFlight  atomic.Int64
+	submitted atomic.Uint64
+	completed atomic.Uint64
+	errored   atomic.Uint64
+
+	// nextID hands out per-Submit identifiers. Monotonic.
+	nextID atomic.Uint64
+
+	// inflightMu guards the inflight map. Acquired only on
+	// Submit (insert) and on completion (delete) — never on
+	// the I/O hot path, which uses atomic counters above.
+	inflightMu sync.RWMutex
+	inflight   map[uint64]inFlightEntry
+}
+
+// inFlightEntry is the per-Op record the engine keeps while a
+// handle is outstanding. Compact (no pointers to Op or Buffer
+// — those would pin large allocations longer than necessary)
+// and copy-cheap so InFlight snapshots stay fast.
+type inFlightEntry struct {
+	id          uint64
+	submittedAt time.Time
+	direction   Direction
+	length      int
+	offset      int64
+}
+
+// InFlightInfo is the public, copy-on-read view of one
+// outstanding Op. Mirrors the columns the future `pg_aios`
+// view will surface.
+type InFlightInfo struct {
+	ID          uint64
+	Direction   Direction
+	Length      int
+	Offset      int64
+	SubmittedAt time.Time
 }
 
 // EngineConfig parameterises NewEngine. Method names mirror
@@ -219,7 +259,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if cfg.Method == "" {
 		cfg.Method = MethodSync
 	}
-	e := &Engine{}
+	e := &Engine{inflight: map[uint64]inFlightEntry{}}
 	switch cfg.Method {
 	case MethodSync:
 		e.method = newMethodSync(e, cfg.MaxConcurrency)
@@ -243,6 +283,42 @@ func (e *Engine) Submit(op Op) *Handle {
 	return e.method.Submit(&op)
 }
 
+// registerInFlight inserts a freshly-built Handle into the
+// inflight map. Called by Methods after building the Handle and
+// before kicking off the actual I/O so a Snapshot taken
+// concurrently always sees the entry. Returns the id assigned
+// so the Method can stamp it on the Handle.
+func (e *Engine) registerInFlight(h *Handle, op *Op) {
+	id := e.nextID.Add(1)
+	h.id = id
+	h.submittedAt = time.Now()
+	entry := inFlightEntry{
+		id:          id,
+		submittedAt: h.submittedAt,
+		direction:   op.Direction,
+		length:      len(op.Buffer),
+		offset:      op.Offset,
+	}
+	e.inflightMu.Lock()
+	e.inflight[id] = entry
+	e.inflightMu.Unlock()
+}
+
+// finishHandle is the shared completion path: bookkeeping +
+// in-flight removal + Handle.finish. Methods call this once
+// per Op so the counters / inflight map stay coherent.
+func (e *Engine) finishHandle(h *Handle, r Result) {
+	e.completed.Add(1)
+	if r.Err != nil && !errors.Is(r.Err, io.EOF) {
+		e.errored.Add(1)
+	}
+	e.inFlight.Add(-1)
+	e.inflightMu.Lock()
+	delete(e.inflight, h.id)
+	e.inflightMu.Unlock()
+	h.finish(r)
+}
+
 // Close shuts down the engine. Idempotent.
 func (e *Engine) Close() error { return e.method.Close() }
 
@@ -258,6 +334,28 @@ type Stats struct {
 	Completed uint64
 	Errored   uint64
 	InFlight  int64
+}
+
+// InFlight returns a sorted copy of every currently-outstanding
+// Op's metadata. Sort key is the Op's ID (monotonic by
+// submission order) so the future pg_aios view returns rows in
+// a stable, oldest-first order. Empty slice when no Ops are
+// in flight.
+func (e *Engine) InFlight() []InFlightInfo {
+	e.inflightMu.RLock()
+	defer e.inflightMu.RUnlock()
+	out := make([]InFlightInfo, 0, len(e.inflight))
+	for _, en := range e.inflight {
+		out = append(out, InFlightInfo{
+			ID:          en.id,
+			Direction:   en.direction,
+			Length:      en.length,
+			Offset:      en.offset,
+			SubmittedAt: en.submittedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // Stats returns a coherent counter snapshot. Used by the
@@ -287,13 +385,3 @@ func runOp(op *Op) Result {
 	return Result{Err: fmt.Errorf("aio: unknown direction %d", op.Direction)}
 }
 
-// completionBookkeeping is the shared "I/O finished" path.
-// Methods call this after runOp so the engine's counters stay
-// in sync regardless of which method ran.
-func (e *Engine) completionBookkeeping(r Result) {
-	e.completed.Add(1)
-	if r.Err != nil && !errors.Is(r.Err, io.EOF) {
-		e.errored.Add(1)
-	}
-	e.inFlight.Add(-1)
-}

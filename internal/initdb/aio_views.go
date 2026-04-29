@@ -1,16 +1,14 @@
-// AIO observability virtual view: `pg_stat_aio` exposes the
-// AIO engine's aggregate counters. v0 ships the aggregate
-// flavour first because it covers the typical operator
-// question — "is AIO running, and is it making progress?" —
-// without needing per-handle bookkeeping. The per-I/O `pg_aios`
-// view (one row per outstanding I/O) lands in a follow-up
-// alongside per-handle tracking on the engine.
+// AIO observability virtual views.
 //
-// Column shape mirrors what an operator would expect from
-// pg_stat_* views: a method label plus monotonic counter
-// columns. There is one row per engine — v0 has one engine
-// per server, so the view is either zero rows (no engine
-// attached) or one row.
+// `pg_stat_aio` exposes the AIO engine's aggregate counters
+// (one row per engine; v0 has at most one). Useful for
+// "is AIO running, and is it making progress?" triage.
+//
+// `pg_aios` exposes one row per currently-outstanding I/O —
+// the same shape upstream's `pg_aios()` set-returning function
+// has. Backed by `aio.Engine.InFlight()`, which is populated
+// by per-handle tracking on Submit and cleared on completion.
+// Useful for "what is this query stuck on?" triage.
 //
 // See docs/design/0009-0004-aio-observability.md.
 
@@ -18,6 +16,7 @@ package initdb
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/goopg/goopg/internal/aio"
 	"github.com/goopg/goopg/internal/catalog"
@@ -52,6 +51,49 @@ func registerStatAIOView(cat *catalog.InMemory, eng *aio.Engine) error {
 			fmt.Sprintf("%d", s.Errored),
 			fmt.Sprintf("%d", s.InFlight),
 		}}
+	}
+	return cat.RegisterVirtualTable(tbl)
+}
+
+// registerPgAiosView installs `pg_catalog.pg_aios` backed by
+// aio.Engine.InFlight(). Zero rows when no engine is attached
+// or no Ops are outstanding. Mirrors the upstream `pg_aios`
+// column shape closely enough that an operator's `\watch
+// pg_aios` muscle memory transfers — though some upstream
+// fields (target, target_desc, raw_result) are not yet tracked
+// and render as blank text.
+func registerPgAiosView(cat *catalog.InMemory, eng *aio.Engine) error {
+	tbl := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_aios",
+		Columns: []catalog.Column{
+			{Name: "io_id", Type: catalog.Type{Name: "text"}},
+			{Name: "operation", Type: catalog.Type{Name: "text"}},
+			{Name: "off", Type: catalog.Type{Name: "text"}},
+			{Name: "length", Type: catalog.Type{Name: "text"}},
+			{Name: "submitted_at", Type: catalog.Type{Name: "text"}},
+			{Name: "elapsed_us", Type: catalog.Type{Name: "text"}},
+		},
+		Virtual: true,
+	}
+	tbl.VirtualRows = func() [][]string {
+		if eng == nil {
+			return nil
+		}
+		now := time.Now()
+		snap := eng.InFlight()
+		out := make([][]string, 0, len(snap))
+		for _, e := range snap {
+			out = append(out, []string{
+				fmt.Sprintf("%d", e.ID),
+				e.Direction.String(),
+				fmt.Sprintf("%d", e.Offset),
+				fmt.Sprintf("%d", e.Length),
+				e.SubmittedAt.UTC().Format(time.RFC3339Nano),
+				fmt.Sprintf("%d", now.Sub(e.SubmittedAt).Microseconds()),
+			})
+		}
+		return out
 	}
 	return cat.RegisterVirtualTable(tbl)
 }

@@ -72,20 +72,74 @@ the negative case.
   Waiting on it bumps `submitted` and `completed` to 1; the
   `in_flight` column is 0 after Wait.
 
+## Per-I/O view (`pg_aios`)
+
+Layered on top of per-handle engine tracking that landed in
+the same slice:
+
+```go
+// internal/aio/aio.go
+func (e *Engine) InFlight() []InFlightInfo
+type InFlightInfo struct {
+    ID          uint64
+    Direction   Direction
+    Length      int
+    Offset      int64
+    SubmittedAt time.Time
+}
+```
+
+Each `Submit` calls `engine.registerInFlight(h, op)` which:
+
+1. Bumps `Engine.nextID` (an `atomic.Uint64`) and stamps the
+   ID + `submittedAt` on the Handle.
+2. Builds an `inFlightEntry { id, submittedAt, direction,
+   length, offset }` (compact; no pointers to Op or Buffer
+   so large allocations aren't pinned longer than needed).
+3. Inserts into `Engine.inflight` under the
+   `Engine.inflightMu sync.RWMutex`.
+
+Each completion calls `engine.finishHandle(h, r)`, which
+combines the previous `completionBookkeeping(r)` work
+(`completed.Add(1)` + `errored` accounting + `inFlight.Add(-1)`)
+with `delete(e.inflight, h.id)` and the final `h.finish(r)` —
+one call site, coherent counters + inflight map.
+
+The mutex is only acquired on `Submit` / completion — never
+on the I/O hot path, which stays on atomic counters. For a
+sustained workload of hundreds of in-flight I/Os the
+contention is negligible compared to the per-I/O syscall.
+
+`Engine.InFlight()` returns a sorted copy (sort key: ID,
+monotonic by submission order) so consumers see rows in
+stable oldest-first order. Empty slice when no Ops are in
+flight.
+
+`registerPgAiosView` installs
+`pg_catalog.pg_aios` backed by `Engine.InFlight()`:
+
+| Column | Source |
+|---|---|
+| `io_id` | InFlightInfo.ID |
+| `operation` | `Direction.String()` (read/write) |
+| `off` | InFlightInfo.Offset |
+| `length` | InFlightInfo.Length |
+| `submitted_at` | RFC3339Nano UTC |
+| `elapsed_us` | `time.Since(SubmittedAt).Microseconds()` |
+
+Mirrors upstream's `pg_aios()` set-returning function shape
+closely enough that `\watch pg_aios` muscle memory transfers.
+Some upstream fields (`target`, `target_desc`, `raw_result`)
+are not yet tracked and would need plumbing the relfile
+identity through the AIO seam — deferred.
+
 ## What this slice doesn't deliver
 
-- **Per-I/O `pg_aios` view.** One row per outstanding I/O
-  (PID, target file, offset, length, direction, state,
-  elapsed time). Requires per-handle tracking on the engine
-  (a sync.Map of in-flight handles plus submit-time
-  bookkeeping). Lands in a follow-up alongside the wait-event
-  surface — once the engine grows per-handle visibility, the
-  rest of the upstream-shaped observability composes
-  naturally.
-- **Wait events** — "waiting on AIO completion" hasn't been
-  registered with the existing wait-event surface (the
-  pg_stat_activity-shaped one used for lock waits in M0002).
-  Same blocker as `pg_aios`: needs the per-handle map.
+- **AIO wait events.** "Waiting on AIO completion" hasn't
+  been registered with the existing wait-event surface
+  (the pg_stat_activity-shaped one used for lock waits in
+  M0002). Now unblocked — composes with the existing
+  wait-event registry once a follow-up wires it.
 - **Per-relation / per-direction counter breakdown.** A
   future view could split `submitted` etc. by `Direction`
   (read/write) and by relfile, but the engine doesn't track
@@ -93,6 +147,10 @@ the negative case.
 - **Histograms / latency percentiles.** Out of scope; the
   observability surface here is for "is it running," not for
   performance regression triage.
+- **`pg_aios.target_desc`.** The relfile identity isn't
+  threaded through `aio.Op` — the engine sees an `aio.File`
+  interface, not a tagged identity. Adding a `Target string`
+  field on `Op` is a cheap follow-up.
 
 ## Cross-references
 

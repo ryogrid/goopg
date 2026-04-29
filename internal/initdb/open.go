@@ -360,6 +360,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// pg_aios: one row per currently-outstanding AIO operation.
+	// Backed by aio.Engine.InFlight() (per-handle tracking).
+	// Zero rows when no engine is attached or no Ops are
+	// in flight.
+	if err := registerPgAiosView(cat, aioEngine); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 	// pg_replication_slots: one row per persistent replication slot
 	// (physical or logical). Backed by the *wal.Slots registry.
 	if err := registerReplicationSlotsView(cat, slotsReg); err != nil {

@@ -3127,15 +3127,59 @@ See `docs/milestones/0009-aio-subsystem.md`.
       `docs/design/0009-0004-aio-observability.md` added
       and indexed in `docs/design/README.md`.)
 
-- [ ] AIO observability — per-I/O `pg_aios` view + wait
-      events (follow-up slice). `pg_aios` (one row per
-      outstanding I/O: PID, target file, offset, length,
-      direction, state, elapsed time) and the
-      "waiting on AIO completion" wait event surface both
-      need per-handle tracking on the engine — a sync.Map
-      of in-flight handles + submit-time bookkeeping. Once
-      that lands, the rest of the upstream-shaped
-      observability composes naturally.
+- [x] AIO observability — per-I/O `pg_aios` view +
+      per-handle tracking. (landed 2026-04-29:
+      `internal/aio/aio.go` gained per-handle tracking on
+      the engine. `Engine.nextID` (atomic.Uint64) hands
+      out monotonic per-Submit identifiers; `Engine.inflight`
+      is a `map[uint64]inFlightEntry` guarded by an
+      `inflightMu sync.RWMutex` (acquired only on Submit
+      / completion — never on the I/O hot path, which
+      stays on atomic counters). `Handle` gained `id` and
+      `submittedAt` fields. New `Engine.registerInFlight(h,
+      op)` is called by both methods after building the
+      Handle and before kicking off the actual I/O so a
+      Snapshot taken concurrently always sees the entry.
+      `Engine.finishHandle(h, r)` replaces the old
+      `completionBookkeeping(r)` — counters + inflight-map
+      removal + Handle.finish in one call. Both methods
+      (sync, worker) wired through. New
+      `Engine.InFlight() []InFlightInfo` returns a sorted
+      copy (sort key: ID, monotonic by submission order)
+      so consumers see rows in stable oldest-first order.
+      `internal/initdb/aio_views.go::registerPgAiosView`
+      installs `pg_catalog.pg_aios` backed by
+      `Engine.InFlight()`. Columns: `io_id`, `operation`
+      (read/write via Direction.String), `off`, `length`,
+      `submitted_at` (RFC3339Nano UTC), `elapsed_us`
+      (now − submittedAt in microseconds). Zero rows when
+      no engine is attached or no Ops are outstanding.
+      Wired into `initdb.Open` next to `pg_stat_aio`.
+      Tests in aio: TestEngineInFlightSnapshot (a new
+      `gateFileWith` blocks every ReadAt so the test
+      observes two outstanding Ops via `Engine.InFlight()`
+      mid-flight; asserts ID monotonicity, direction,
+      offset, length; post-Wait the inflight map is
+      empty). Tests in initdb:
+      TestPgAiosViewEmptyWithoutEngine (nil engine → 0
+      rows; SELECT works on synchronous deployments),
+      TestPgAiosViewReflectsInFlightHandles (gated worker
+      method blocks two reads; view returns two rows with
+      the right operation / offset / length columns;
+      post-Wait the view returns 0 rows). Built and full
+      `go test ./...` green. Wait events ("waiting on
+      AIO completion" surfaced through pg_stat_activity-
+      shaped surface), per-direction / per-relation
+      counter breakdowns, and latency histograms remain
+      follow-up slices — all unblocked now that per-
+      handle tracking is in place.)
+
+- [ ] AIO wait-event surface: register a "waiting on AIO
+      completion" wait event so a query stalled on an AIO
+      Wait shows up identifiably in the
+      pg_stat_activity-shaped surface from prior milestones.
+      Composes with the existing wait-event registry from
+      M0002.
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 

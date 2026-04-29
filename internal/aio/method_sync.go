@@ -46,15 +46,17 @@ func (m *methodSync) Submit(op *Op) *Handle {
 		select {
 		case m.slots <- struct{}{}:
 		case <-m.closed:
+			// Lost the race against Close: finish synchronously
+			// without registering in-flight.
 			h.finish(Result{Err: errEngineClosed})
 			return h
 		}
 		defer func() { <-m.slots }()
 	}
 	m.engine.inFlight.Add(1)
+	m.engine.registerInFlight(h, op)
 	r := runOp(op)
-	m.engine.completionBookkeeping(r)
-	h.finish(r)
+	m.engine.finishHandle(h, r)
 	return h
 }
 

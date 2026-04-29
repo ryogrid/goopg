@@ -48,17 +48,16 @@ func (m *methodWorker) Name() string { return MethodWorker }
 func (m *methodWorker) Submit(op *Op) *Handle {
 	h := &Handle{op: *op, done: make(chan struct{}), engine: m.engine}
 	m.engine.inFlight.Add(1)
+	m.engine.registerInFlight(h, op)
 	select {
 	case m.queue <- h:
 		return h
 	case <-m.closed:
 		// Lose the race against Close — finish synchronously
 		// with an engine-closed error so the caller never
-		// blocks forever in Wait.
-		m.engine.inFlight.Add(-1)
-		m.engine.errored.Add(1)
-		m.engine.completed.Add(1)
-		h.finish(Result{Err: errEngineClosed})
+		// blocks forever in Wait. finishHandle takes care of
+		// the inflight-map cleanup + counters.
+		m.engine.finishHandle(h, Result{Err: errEngineClosed})
 		return h
 	}
 }
@@ -69,8 +68,7 @@ func (m *methodWorker) run() {
 	defer m.wg.Done()
 	for h := range m.queue {
 		r := runOp(&h.op)
-		m.engine.completionBookkeeping(r)
-		h.finish(r)
+		m.engine.finishHandle(h, r)
 	}
 }
 

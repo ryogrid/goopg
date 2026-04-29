@@ -235,3 +235,81 @@ func TestEngineSyncReadEOF(t *testing.T) {
 		t.Errorf("EOF should not count as Errored")
 	}
 }
+
+// TestEngineInFlightSnapshot pins the per-handle tracking
+// contract: a Submit registers an inflight entry visible to
+// InFlight() until the I/O lands; once Wait returns the entry
+// is gone. Uses the worker method + a gateFile so the test can
+// observe the inflight set mid-flight.
+func TestEngineInFlightSnapshot(t *testing.T) {
+	e, err := NewEngine(EngineConfig{
+		Method: MethodWorker, Workers: 2, MaxConcurrency: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if got := len(e.InFlight()); got != 0 {
+		t.Errorf("pre-Submit InFlight=%d want 0", got)
+	}
+
+	// gateFile blocks every ReadAt until released; lets us
+	// observe two outstanding Ops simultaneously.
+	g := newGateFileWith(64)
+	h1 := e.Submit(Op{File: g, Buffer: make([]byte, 8), Offset: 0, Direction: DirRead})
+	h2 := e.Submit(Op{File: g, Buffer: make([]byte, 8), Offset: 16, Direction: DirRead})
+
+	// Wait until both registrations land. Submit is sync wrt
+	// the registration (registerInFlight runs before queueing)
+	// but the worker hasn't necessarily started yet.
+	deadline := 100
+	for len(e.InFlight()) < 2 && deadline > 0 {
+		deadline--
+	}
+	snap := e.InFlight()
+	if len(snap) != 2 {
+		t.Fatalf("inflight len=%d want 2", len(snap))
+	}
+	// Sort key is ID — h1's id < h2's id since Submit is
+	// monotonic.
+	if snap[0].Direction != DirRead || snap[0].Length != 8 {
+		t.Errorf("snap[0]=%+v", snap[0])
+	}
+	if snap[0].Offset != 0 || snap[1].Offset != 16 {
+		t.Errorf("offsets=%d,%d want 0,16", snap[0].Offset, snap[1].Offset)
+	}
+	if snap[0].ID >= snap[1].ID {
+		t.Errorf("ID order: %d >= %d, want strictly less", snap[0].ID, snap[1].ID)
+	}
+
+	g.releaseAll()
+	h1.Wait()
+	h2.Wait()
+	if got := len(e.InFlight()); got != 0 {
+		t.Errorf("post-Wait InFlight=%d want 0", got)
+	}
+}
+
+// gateFileWith is a per-test in-memory File that blocks ReadAt
+// until releaseAll() is called. Modeled after the test in
+// read_stream_test.go but lives here to avoid cross-file dep.
+type gateFileWith struct {
+	inner *memFile
+	gate  chan struct{}
+}
+
+func newGateFileWith(size int) *gateFileWith {
+	return &gateFileWith{
+		inner: newMemFile(size),
+		gate:  make(chan struct{}),
+	}
+}
+
+func (g *gateFileWith) ReadAt(p []byte, off int64) (int, error) {
+	<-g.gate
+	return g.inner.ReadAt(p, off)
+}
+func (g *gateFileWith) WriteAt(p []byte, off int64) (int, error) {
+	return g.inner.WriteAt(p, off)
+}
+func (g *gateFileWith) releaseAll() { close(g.gate) }
