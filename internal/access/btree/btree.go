@@ -7,10 +7,13 @@
 package btree
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"sync"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -188,24 +191,85 @@ func DecodeInt4(b []byte) (int32, error) {
 	return int32(binary.BigEndian.Uint32(b) ^ 0x80000000), nil
 }
 
-// CompareKeys is bytewise comparison; matches numeric order for
-// EncodeInt4 by construction.
+// EncodeNumericKey encodes a NUMERIC value (mantissa * 10^(-scale)) into
+// a sortable byte string such that bytewise comparison matches numeric
+// order. The encoding is scale-invariant: numerically equal inputs
+// (e.g. (10,1) and (100,2), both representing 1.0) produce identical
+// bytes — required for UNIQUE/PRIMARY KEY equality on NUMERIC.
+//
+// Layout, semantics, and worked examples are documented in
+// docs/design/0011-0001-btree-numeric-key-ordering.md. Briefly:
+//
+//	zero          -> [0x01]
+//	non-zero      -> sign(1) || biased exp(4 BE) || digits || terminator(1)
+//	positive sign -> 0x02; exp = E + 0x80000000;       digits = '0'+d;       term = 0x00
+//	negative sign -> 0x00; exp = 0x7FFFFFFF - E;       digits = '0'+(9-d);   term = 0xFF
+//
+// Where d_1.d_2…d_n × 10^E is the value's scientific normalisation
+// after stripping trailing zeros from the mantissa.
+//
+// Decoding is intentionally not provided: the B-tree never inverts the
+// encoding; index probes always re-encode from the live datum.
+func EncodeNumericKey(mantissa int64, scale int8) []byte {
+	if mantissa == 0 {
+		return []byte{0x01}
+	}
+	negative := mantissa < 0
+	var um uint64
+	if mantissa == math.MinInt64 {
+		um = 1 << 63
+	} else if negative {
+		um = uint64(-mantissa)
+	} else {
+		um = uint64(mantissa)
+	}
+	// Strip trailing zeros so numerically-equal values normalise to
+	// the same digit string.
+	s := int32(scale)
+	for um%10 == 0 {
+		um /= 10
+		s--
+	}
+	digits := strconv.FormatUint(um, 10)
+	ndig := int32(len(digits))
+	E := ndig - 1 - s
+
+	out := make([]byte, 0, 6+int(ndig))
+	var b [4]byte
+	if negative {
+		out = append(out, 0x00)
+		// Inverted bias so a larger E (more negative value) sorts smaller.
+		binary.BigEndian.PutUint32(b[:], uint32(int32(0x7FFFFFFF)-E))
+		out = append(out, b[:]...)
+		for i := 0; i < int(ndig); i++ {
+			d := digits[i] - '0'
+			out = append(out, '0'+(9-d))
+		}
+		out = append(out, 0xFF) // greater than any digit byte; longer sorts first
+	} else {
+		out = append(out, 0x02)
+		// Standard bias so a larger E sorts larger.
+		binary.BigEndian.PutUint32(b[:], uint32(E)+0x80000000)
+		out = append(out, b[:]...)
+		for i := 0; i < int(ndig); i++ {
+			out = append(out, digits[i])
+		}
+		out = append(out, 0x00) // less than any digit byte; shorter sorts first
+	}
+	return out
+}
+
+// CompareKeys is straight bytewise lexicographic comparison.
+//
+// For int4 keys (all 4 bytes) this matches numeric order by
+// construction of EncodeInt4. For NUMERIC keys (variable length)
+// it matches numeric order via the sign + biased-exponent + digits
+// + terminator layout produced by EncodeNumericKey — see
+// docs/design/0011-0001-btree-numeric-key-ordering.md for why
+// straight lex compare (not length-first) is the right contract
+// for variable-length keys.
 func CompareKeys(a, b []byte) int {
-	switch {
-	case len(a) < len(b):
-		return -1
-	case len(a) > len(b):
-		return 1
-	}
-	for i := range a {
-		if a[i] < b[i] {
-			return -1
-		}
-		if a[i] > b[i] {
-			return 1
-		}
-	}
-	return 0
+	return bytes.Compare(a, b)
 }
 
 // BTree is the access-method handle for one index relation.

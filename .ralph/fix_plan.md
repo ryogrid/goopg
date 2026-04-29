@@ -1665,6 +1665,105 @@ topmost unchecked item.
       ring") in the design doc
       `docs/design/0010-0003-wal-direct-io-observability-and-operations.md`.)
 
+## Milestone 0011 — B-tree NUMERIC key support
+
+See `docs/milestones/0011-btree-numeric-key-support.md` for the full
+DoD. Decomposed into the three design-doc seams the milestone calls
+out (`0011-0001`, `0011-0002`, `0011-0003`); pick the topmost
+unchecked item.
+
+- [x] B-tree NUMERIC key ordering: byte encoding + comparator
+      contract for variable-length numeric keys. Design doc
+      `docs/design/0011-0001-btree-numeric-key-ordering.md`.
+      (landed 2026-04-29: new
+      `internal/access/btree.EncodeNumericKey(mantissa int64,
+      scale int8) []byte` produces a scale-invariant sortable byte
+      string. Layout: `sign(1) || biased exp(4 BE) || normalized
+      digits || terminator(1)`. Sign byte (`0x00` neg, `0x01`
+      zero, `0x02` pos) settles cross-sign cases; exponent is
+      biased big-endian (inverted for negatives so bigger E sorts
+      smaller); digits have trailing zeros stripped and are
+      emitted as ASCII (inverted `'0'+(9-d)` for negatives);
+      terminator is `0x00` for positives / `0xFF` for negatives
+      so prefix-equal-but-shorter sorts on the correct side.
+      Zero is the single-byte sentinel `[0x01]`. Numerically-
+      equal `(m, s)` pairs (e.g. `(10,1)` and `(100,2)`, both
+      `1.0`) produce identical bytes — required for
+      UNIQUE/PRIMARY KEY equality. `CompareKeys` simplified to
+      straight `bytes.Compare` (length-first comparison was
+      wrong for variable-length keys; int4 keys are all 4 bytes
+      so behaviour unchanged for the existing path). Encoding
+      bound ≤ 25 bytes. Tests:
+      TestEncodeNumericKeyZeroIsSingleByte,
+      TestEncodeNumericKeyScaleInvariance,
+      TestEncodeNumericKeySignOrder,
+      TestEncodeNumericKeyMonotone (23-element sorted slice
+      assertion), TestEncodeNumericKeySamePrefixDifferentLengths,
+      TestEncodeNumericKeyMinInt64. Built and full `go test
+      ./...` green. The DDL acceptance, build/uniqueness path,
+      and variable-length `BTPageOpaque.HighKey` adjustment land
+      in M0011-0002.)
+
+- [ ] B-tree NUMERIC build + UNIQUE/PRIMARY KEY: lift the
+      `btree v0 only supports int4 keys` DDL rejection in
+      `createSingleColumnBTreeIndex`, extend
+      `backfillSingleColumnBTree` to extract NUMERIC mantissas
+      and call `btree.EncodeNumericKey` (replacing the int32
+      seen-set with a byte-slice keyed dedup so `(10,1)` and
+      `(100,2)` collapse), wire the same encoding into
+      `indexScanOp.lookupKey`, and grow `BTPageOpaque.HighKey`
+      from a fixed 4-byte field to a variable-length blob (or a
+      length+blob pair) so splits emit correct boundary keys
+      for >4-byte numeric keys. Tests must cover: int4 path
+      unchanged (regression guard); UNIQUE rejects `1.0` /
+      `1.00` duplicates; index scan finds rows by NUMERIC key
+      with mismatched literal scales; restart correctness over
+      a NUMERIC index (open-then-search round-trip after
+      writer cycle). Continues
+      `docs/design/0011-0002-btree-numeric-build-and-uniqueness.md`.
+
+- [ ] HammerDB TPC-H NUMERIC index validation: reproduce the
+      `bench/tpch/run_all.sh` failure-class
+      ("ERROR: btree v0 only supports int4 keys, got
+      \"numeric\"") in a Go integration test that creates a
+      table with a `NUMERIC` column and runs `CREATE INDEX` /
+      `CREATE UNIQUE INDEX` /  `ADD PRIMARY KEY` against it
+      using realistic TPC-H column types (l_orderkey,
+      l_extendedprice, etc.). Confirm the index-build stage
+      reaches completion and basic equality lookups return
+      correct rows. Continues
+      `docs/design/0011-0003-hammerdb-tpch-numeric-index-validation.md`.
+
+## Milestone 0012 — Lock manager + deadlock detection
+
+See `docs/milestones/0012-lock-manager-and-deadlock-detection.md`
+for the full DoD. Decomposed into the three design-doc seams the
+milestone calls out (`0012-0001`, `0012-0002`, `0012-0003`); pick
+the topmost unchecked item.
+
+- [ ] Lock manager v0 surface: relation-level lock tags +
+      mode-based compatibility matrix, `LockAcquire(tag, mode,
+      backendID)` / `LockRelease`, holder/waiter tracking
+      shaped for deadlock detection. Continues
+      `docs/design/0012-0001-lock-manager-architecture.md`.
+
+- [ ] Wait-for graph + deadlock detection: build wait-for
+      edges from current waiter/holder state when a wait
+      exceeds the deadlock-check trigger; cycle-detection via
+      DFS; victim selection (younger backend in v0); SQLSTATE
+      `40P01` cancellation path; clean lock/waiter cleanup
+      after victim aborts. Continues
+      `docs/design/0012-0002-deadlock-detection-algorithm.md`.
+
+- [ ] Executor integration + multi-session test matrix:
+      acquire relation locks at executor open for at least
+      one conflict-capable path (writes on a shared table);
+      deterministic two-session deadlock test; three-session
+      multi-edge cycle test; non-deadlock contention test
+      (no false-positive 40P01); cancellation cleanup test.
+      Continues
+      `docs/design/0012-0003-lock-wait-integration-and-test-matrix.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
