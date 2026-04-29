@@ -1,0 +1,264 @@
+package wal
+
+import (
+	"bytes"
+	"encoding/binary"
+	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
+)
+
+// snapshotForRel builds a one-table CatalogSnapshot for tests.
+func snapshotForRel(t *testing.T, name string, cols []catalog.Column) (*CatalogSnapshot, storage.RelFileNode) {
+	t.Helper()
+	c := catalog.NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: name}, cols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return BuildCatalogSnapshot(c), c.RelFileNode(tbl)
+}
+
+// encodeBodyV0 mirrors the executor codec's null-flag-then-value
+// frame so tests can construct on-disk bytes the plugin will
+// decode. Kept self-contained to avoid pulling in the executor
+// package.
+func encodeBodyV0(values []any, types []string) []byte {
+	var out []byte
+	for i, v := range values {
+		if v == nil {
+			out = append(out, 1)
+			continue
+		}
+		out = append(out, 0)
+		switch t := types[i]; t {
+		case "int4":
+			var tmp [4]byte
+			binary.BigEndian.PutUint32(tmp[:], uint32(int32(v.(int))))
+			out = append(out, tmp[:]...)
+		case "int8":
+			var tmp [8]byte
+			binary.BigEndian.PutUint64(tmp[:], uint64(v.(int64)))
+			out = append(out, tmp[:]...)
+		case "text":
+			s := v.(string)
+			var ln [4]byte
+			binary.BigEndian.PutUint32(ln[:], uint32(len(s)))
+			out = append(out, ln[:]...)
+			out = append(out, []byte(s)...)
+		}
+	}
+	return out
+}
+
+func wrapAsHeapTuple(t *testing.T, body []byte) []byte {
+	t.Helper()
+	tup, err := storage.NewHeapTuple(42, 0, body).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tup
+}
+
+// TestPgOutputBeginEmitsCanonicalShape pins the M0008 / 0008-0002
+// `B` message wire shape: kind(1) | final_lsn(8) | commit_time(8)
+// | xid(4) = 21 bytes.
+func TestPgOutputBeginEmitsCanonicalShape(t *testing.T) {
+	var buf bytes.Buffer
+	po := NewPgOutput(&CatalogSnapshot{}, &buf)
+	if err := po.Begin(42, 0x0123456789ABCDEF); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.Bytes()
+	if len(out) != 21 {
+		t.Fatalf("len=%d want 21", len(out))
+	}
+	if out[0] != 'B' {
+		t.Errorf("kind=%q want B", out[0])
+	}
+	if got := binary.BigEndian.Uint64(out[1:9]); got != 0x0123456789ABCDEF {
+		t.Errorf("final_lsn=%x want 0x0123456789ABCDEF", got)
+	}
+	if got := binary.BigEndian.Uint32(out[17:21]); got != 42 {
+		t.Errorf("xid=%d want 42", got)
+	}
+}
+
+// TestPgOutputCommitEmitsCanonicalShape pins the `C` message
+// wire shape: kind(1) | flags(1)=0 | commit_lsn(8) | end_lsn(8)
+// | commit_time(8) = 26 bytes.
+func TestPgOutputCommitEmitsCanonicalShape(t *testing.T) {
+	var buf bytes.Buffer
+	po := NewPgOutput(&CatalogSnapshot{}, &buf)
+	if err := po.Commit(99, 0xCAFE); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.Bytes()
+	if len(out) != 26 {
+		t.Fatalf("len=%d want 26", len(out))
+	}
+	if out[0] != 'C' || out[1] != 0 {
+		t.Errorf("header=% x want C 00", out[:2])
+	}
+	if got := binary.BigEndian.Uint64(out[2:10]); got != 0xCAFE {
+		t.Errorf("commit_lsn=%x want 0xCAFE", got)
+	}
+	if got := binary.BigEndian.Uint64(out[10:18]); got != 0xCAFE {
+		t.Errorf("end_lsn=%x want 0xCAFE", got)
+	}
+}
+
+// TestPgOutputInsertEmitsRelationOnceThenInsert: the first
+// Change touching a relation emits `R` then `I`; the second
+// Change against the same relation emits only `I`. Mirrors
+// upstream's relsynced behaviour.
+func TestPgOutputInsertEmitsRelationOnceThenInsert(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "label", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	body := encodeBodyV0([]any{1, "alpha"}, []string{"int4", "text"})
+	tuple := wrapAsHeapTuple(t, body)
+
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.Bytes()
+	if out[0] != 'R' {
+		t.Fatalf("first byte=%q want R (relation emitted before insert)", out[0])
+	}
+	// Locate the I message after the R; not byte-precise (rel
+	// payload length varies) but the kind sequence is the
+	// invariant we want to pin.
+	if !bytes.Contains(out, []byte{'I'}) {
+		t.Errorf("missing I message after R: %x", out)
+	}
+
+	buf.Reset()
+	body2 := encodeBodyV0([]any{2, "beta"}, []string{"int4", "text"})
+	tup2 := wrapAsHeapTuple(t, body2)
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tup2}); err != nil {
+		t.Fatal(err)
+	}
+	out2 := buf.Bytes()
+	if out2[0] != 'I' {
+		t.Errorf("second-change first byte=%q want I (R already emitted)", out2[0])
+	}
+	if bytes.Contains(out2, []byte{'R'}) {
+		t.Errorf("second change re-emitted R: %x", out2)
+	}
+}
+
+// TestPgOutputInsertEncodesIntAndText pins the tuple body
+// decoding: an int4=1 + text="alpha" row produces an `I` whose
+// tuple body has nliveatts=2, two `t`-status columns with the
+// canonical text bytes "1" and "alpha".
+func TestPgOutputInsertEncodesIntAndText(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "label", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	body := encodeBodyV0([]any{42, "alpha"}, []string{"int4", "text"})
+	tuple := wrapAsHeapTuple(t, body)
+	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Skip the `R` message and find the `I`. The first byte is
+	// 'R'; scan forward to the first 'I'.
+	idx := bytes.IndexByte(buf.Bytes(), 'I')
+	if idx < 0 {
+		t.Fatal("no I message in output")
+	}
+	insert := buf.Bytes()[idx:]
+	// I framing: kind(1) | rel_oid(4) | 'N' | nliveatts(2) | …
+	if insert[5] != 'N' {
+		t.Errorf("insert action byte=%q want N", insert[5])
+	}
+	nliveatts := binary.BigEndian.Uint16(insert[6:8])
+	if nliveatts != 2 {
+		t.Fatalf("nliveatts=%d want 2", nliveatts)
+	}
+	// First column: 't' | len(4) | "1"
+	off := 8
+	if insert[off] != 't' {
+		t.Errorf("col[0].status=%q want t", insert[off])
+	}
+	col0len := binary.BigEndian.Uint32(insert[off+1 : off+5])
+	col0val := string(insert[off+5 : off+5+int(col0len)])
+	if col0val != "42" {
+		t.Errorf("col[0] value=%q want 42", col0val)
+	}
+	off += 5 + int(col0len)
+	// Second column: 't' | len(4) | "alpha"
+	if insert[off] != 't' {
+		t.Errorf("col[1].status=%q want t", insert[off])
+	}
+	col1len := binary.BigEndian.Uint32(insert[off+1 : off+5])
+	col1val := string(insert[off+5 : off+5+int(col1len)])
+	if col1val != "alpha" {
+		t.Errorf("col[1] value=%q want alpha", col1val)
+	}
+}
+
+// TestPgOutputDeleteEmitsKMarker pins the `D` message: kind(1)
+// | rel_oid(4) | 'K' | nliveatts(2)=0. v0's HeapDelete record
+// carries no pre-image; the wire shape stays well-formed via a
+// 0-attribute tuple body. The apply worker resolves the row by
+// (rel, block, slot) lookup.
+func TestPgOutputDeleteEmitsKMarker(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	if err := po.Change(Change{Kind: ChangeDelete, Rel: rel}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.Bytes()
+	idx := bytes.IndexByte(out, 'D')
+	if idx < 0 {
+		t.Fatal("no D message in output")
+	}
+	d := out[idx:]
+	if len(d) < 8 {
+		t.Fatalf("D message too short: %d bytes", len(d))
+	}
+	if d[5] != 'K' {
+		t.Errorf("delete action byte=%q want K", d[5])
+	}
+	nliveatts := binary.BigEndian.Uint16(d[6:8])
+	if nliveatts != 0 {
+		t.Errorf("delete nliveatts=%d want 0 (no pre-image in v0)", nliveatts)
+	}
+}
+
+// TestPgOutputSkipsUnknownRelation: a Change against a relation
+// not in the snapshot is silently dropped. Mirrors v0's
+// "snapshot-time relations only" contract from
+// docs/design/0008-0001-logical-decoding-pipeline.md.
+func TestPgOutputSkipsUnknownRelation(t *testing.T) {
+	var buf bytes.Buffer
+	po := NewPgOutput(&CatalogSnapshot{}, &buf)
+	if err := po.Change(Change{
+		Kind: ChangeInsert,
+		Rel:  storage.RelFileNode{DBOid: 1, RelOid: 99999},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("unknown rel produced output: %x", buf.Bytes())
+	}
+}

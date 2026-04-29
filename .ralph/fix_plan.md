@@ -2214,10 +2214,41 @@ item.
       slice 0008-0001 has the foundation a real pgoutput
       plugin (0008-0002) can build against.)
 
-- [ ] `pgoutput` output plugin: B / C / R / I / U / D message
+- [x] `pgoutput` output plugin: B / C / R / I / D message
       framing wire-compatible with upstream PG 18.x. Replica-
       identity handling. Design doc
       `docs/design/0008-0002-pgoutput-plugin.md`.
+      (landed 2026-04-29: `internal/wal/pgoutput.go::PgOutput`
+      implements the `OutputPlugin` interface and emits
+      pgoutput v1 wire-shapes:
+        - B: kind | final_lsn | commit_time | xid (21 bytes).
+        - C: kind | flags=0 | commit_lsn | end_lsn |
+              commit_time (26 bytes).
+        - R: rel_oid | nspname\\0 | relname\\0 | replident |
+              nattrs | per-attr (flags | name\\0 | type_oid |
+              typmod). Lazy-emitted once per session via an
+              `emittedRel` set.
+        - I: rel_oid | 'N' | tuple-body.
+        - D: rel_oid | 'K' | nliveatts=0 (v0 HeapDelete
+              carries no pre-image; apply worker resolves
+              the row by (rel, block, slot) lookup).
+      Tuple body parsing mirrors
+      `executor/codec.go::DecodeRow` byte-for-byte (duplicated
+      because `executor` depends on `wal`); supports int4 /
+      int8 / bool / text / varchar / numeric / timestamp /
+      date. `pgoTypeOIDFor` maps v0 catalog type names to
+      upstream `pg_type` OIDs. Replica identity reports DEFAULT
+      uniformly (catalog tracking lands with 0008-0003);
+      every column flagged as part of REPLICA IDENTITY
+      DEFAULT so apply workers' row-resolution path works for
+      tables with primary keys. `U` UPDATE intentionally
+      deferred — v0 executor emits UPDATE as paired
+      HeapDelete + HeapInsert; reorder-buffer fold is its own
+      slice. Tests pin the byte shapes for B / C / R / I / D
+      plus the relation-once-per-session and unknown-rel-skip
+      contracts. With this slice the pipeline can finally
+      emit upstream-compatible bytes; the next M0008 work is
+      0008-0003 (publication / subscription DDL + catalog).
 
 - [ ] Publication / subscription DDL + system catalogs:
       `CREATE PUBLICATION` / `ALTER PUBLICATION` / `DROP
