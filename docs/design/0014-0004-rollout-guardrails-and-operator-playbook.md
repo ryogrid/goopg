@@ -1,6 +1,6 @@
 # 0014-0004 — Rollout Guardrails and Operator Playbook
 
-**Status:** accepted (step 1)
+**Status:** accepted (steps 1-2)
 **Milestone:** [0014 — PostgreSQL-Compatible WAL On-Disk Format](../milestones/0014-wal-compatibility-with-pg.md)
 **Spans seam:** legacy-format detection, format-mode reporting, operator
 diagnostics.
@@ -88,13 +88,52 @@ will follow:
 - Mismatch always fails — silently mixing formats would corrupt the
   segment files.
 
-## Out of scope (step 1)
+## Step 2 (landed 2026-04-30): caller wiring + observability
 
-- Caller wiring (the actual fail-fast at startup) — step 2.
-- The runtime observability surface (DoD #9: "Runtime observability
-  exposes WAL format mode/version") — extends `pg_stat_wal_io` with
-  a `format_version` column once writer/reader integration is far
-  enough along to have a meaningful value.
+`loadState` now calls `DetectWALFormat(cfg.WALDir)` immediately
+before `detectWritePos`. Decision matrix:
+
+| detected     | cfg.PageHeaders | result                          |
+|--------------|------------------|---------------------------------|
+| Unknown      | any              | proceed (no signal — fresh dir) |
+| Legacy       | false            | proceed (matching format)       |
+| Legacy       | true             | `ErrWALFormatMismatch`          |
+| PGCompat     | true             | proceed (matching format)       |
+| PGCompat     | false            | `ErrWALFormatMismatch`          |
+
+`Unknown` covers the empty-data-dir bootstrap path *and* the
+"segment file is shorter than 40 bytes so the detector can't read
+its quorum" case. The latter is rare in production (segments are
+preallocated to 16 MiB) but common in unit tests with tiny segments
+— treating it as no-mismatch keeps the gate cheap and lets the
+existing `detectWritePos` record-level scan catch any deeper
+incompatibility (record decode errors will surface a more specific
+diagnostic).
+
+A tiny additive `Writer.Format() WALFormatVersion` accessor
+satisfies M0014 DoD #9 ("WAL format mode/version exposed at
+runtime"): callers can ask the live writer which format it's
+emitting. Returns `WALFormatPGCompat` when `cfg.PageHeaders=true`,
+`WALFormatLegacy` otherwise. Static for the writer's lifetime.
+
+Tests: `format_mismatch_test.go` —
+`TestNewWriterRejectsLegacyDirInPGCompatMode`,
+`TestNewWriterRejectsPGCompatDirInLegacyMode`,
+`TestNewWriterAcceptsFreshDirInBothModes`,
+`TestNewWriterAcceptsMatchingFormat`,
+`TestWriterFormatExposesActiveMode`,
+`TestNewWriterIgnoresNonSegmentFiles`. Full
+`go test ./...` green.
+
+## Out of scope (steps 1-2)
+
+- Migration tooling — M0014 says "out of scope: full pg_upgrade
+  compatibility" for pre-milestone clusters; pre-GA goopg simply
+  requires a fresh data dir.
+- A standalone `pg_resetwal`-equivalent — separate scope.
+- SQL-level `pg_stat_wal_io.format_version` column wiring — the
+  Go-level `Writer.Format()` accessor lands now; surfacing it
+  through the existing pg_stat view is a follow-up cosmetic slice.
 - Migration tooling — M0014 says "out of scope: full pg_upgrade
   compatibility" for pre-milestone clusters; pre-GA goopg simply
   requires a fresh data dir.

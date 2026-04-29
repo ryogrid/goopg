@@ -24,6 +24,15 @@ var (
 	// in preallocated segments. See
 	// docs/design/0007-0001-wal-segment-preallocation.md.
 	ErrEmptyPayload = errors.New("wal: empty payload not allowed")
+	// ErrWALFormatMismatch is returned by NewWriter when the
+	// existing WAL directory's on-disk format conflicts with the
+	// writer's configured `PageHeaders` mode (M0014-0004 step 2):
+	// e.g. the data dir holds legacy frames but the operator
+	// requested pg-compat output, or vice versa. Mixing the two
+	// formats inside one WAL stream would corrupt recovery, so the
+	// writer refuses to open. Operators must either match the
+	// config to the existing format or migrate the data dir.
+	ErrWALFormatMismatch = errors.New("wal: configured format does not match existing data dir")
 )
 
 // Config controls writer and reader behavior.
@@ -483,6 +492,18 @@ func (w *Writer) DirectIORequested() bool {
 // headers it must skip.
 func (w *Writer) PageHeadersEnabled() bool { return w.pageHeaders }
 
+// Format returns the active on-disk WAL format the writer is
+// emitting. Mirrors the Config.PageHeaders flag the writer was
+// constructed with — static for the lifetime of the Writer.
+// Surfaced for runtime observability (M0014 DoD #9 — WAL format
+// mode/version exposed at runtime).
+func (w *Writer) Format() WALFormatVersion {
+	if w.pageHeaders {
+		return WALFormatPGCompat
+	}
+	return WALFormatLegacy
+}
+
 // MemRing returns the in-memory WAL ring. nil when
 // `wal_sender_memory_buffer = 0` (or absent). RecordIterator
 // consults this on every read to decide between RAM and disk;
@@ -689,6 +710,21 @@ func (w *Writer) send(req op) error {
 }
 
 func loadState(cfg Config) (*state, error) {
+	// M0014-0004 step 2: fail fast if the existing data dir holds
+	// WAL in a format the configured writer cannot append to.
+	// Detection is read-only and skips CRC validation. Unknown
+	// (empty / fresh / unclassifiable) is treated as "no mismatch
+	// signal" — both modes can claim the dir, and detectWritePos's
+	// later record-level scan will catch any deeper incompatibility.
+	detected, _ := DetectWALFormat(cfg.WALDir)
+	if detected == WALFormatLegacy && cfg.PageHeaders {
+		return nil, fmt.Errorf("%w: data dir contains %s WAL but PageHeaders=true requests pgcompat output",
+			ErrWALFormatMismatch, detected)
+	}
+	if detected == WALFormatPGCompat && !cfg.PageHeaders {
+		return nil, fmt.Errorf("%w: data dir contains %s WAL but PageHeaders=false requests legacy output",
+			ErrWALFormatMismatch, detected)
+	}
 	writePos, prevRecPtr, err := detectWritePos(cfg.WALDir, cfg.SegmentSize, cfg.PageHeaders)
 	if err != nil {
 		return nil, err

@@ -2129,11 +2129,25 @@ pick the topmost unchecked item.
       records, or vice versa) is impossible. Full
       `go test ./...` green.)
 
-- [ ] Recovery + streaming + compat validation (M0014-0003).
-      Update WAL replay paths to decode the new format;
-      verify pg_waldump can parse goopg's emitted WAL on
-      representative workloads. Continues
+- [x] Recovery + streaming + compat validation (M0014-0003).
+      Design doc
       `docs/design/0014-0003-recovery-streaming-and-compat-validation.md`.
+      (landed 2026-04-30: page-header mode now emits
+      XLogRecord-framed records (`xl_prev` + CRC32C) with a
+      valid PostgreSQL main-data chunk wrapper around goopg's
+      existing payload bytes (`XLR_BLOCK_ID_DATA_SHORT`/
+      `_LONG`). Legacy mode (`PageHeaders=false`) remains
+      byte-identical. Reader/iterator/recovery startup scan
+      paths now decode/verify XLogRecord frames and unwrap back
+      to the existing `RecordKind*` payloads, preserving
+      replay/logical-decoder semantics. Writer startup scan now
+      returns both write-end and last-record start so `xl_prev`
+      chains survive restart. Added coverage:
+      `format_xlog_test.go`,
+      `TestPageEmissionXLogPrevChain`,
+      `TestReplayFromDirEndToEndPageHeaders`, and
+      `TestPGWaldumpParsesEmittedWAL` (skips only when
+      pg_waldump is unavailable).)
 
 - [x] Rollout guardrails — **legacy-format detection helper**
       (M0014-0004 step 1). Design doc
@@ -2172,6 +2186,41 @@ pick the topmost unchecked item.
       (loadState fail-fast on format mismatch) lands in
       M0014-0004 step 2 alongside the joint M0014-0001/0002
       writer/reader switchover. Full `go test ./...` green.)
+
+- [x] Rollout guardrails — **loadState fail-fast on format
+      mismatch + Writer.Format() observability** (M0014-0004 step
+      2). Design doc
+      `docs/design/0014-0004-rollout-guardrails-and-operator-playbook.md`.
+      (landed 2026-04-30: `loadState` now calls
+      `DetectWALFormat(cfg.WALDir)` immediately before
+      `detectWritePos` and surfaces the new typed sentinel
+      `ErrWALFormatMismatch` when (detected=Legacy ∧
+      cfg.PageHeaders=true) or (detected=PGCompat ∧
+      cfg.PageHeaders=false). Unknown / unclassifiable detection
+      results are treated as no signal — both modes can claim
+      empty dirs, fresh dirs, dirs holding only non-segment
+      files, and tiny test segments (< 40 B) where the detector
+      can't read its quorum. Production segments are preallocated
+      to 16 MiB so this fallback rarely fires there; test
+      segments commonly do, and the writer's existing
+      record-level scan in `detectWritePos` catches deeper
+      incompatibilities (record decode error → specific
+      diagnostic). Step 2 also adds the static accessor
+      `Writer.Format() WALFormatVersion` (returns
+      `WALFormatPGCompat` when `cfg.PageHeaders=true`,
+      `WALFormatLegacy` otherwise) — satisfies M0014 DoD #9
+      "Runtime observability exposes WAL format mode/version" at
+      the Go API level. Wiring that accessor into the SQL-level
+      `pg_stat_wal_io.format_version` column is a cosmetic
+      follow-up. Tests added in `format_mismatch_test.go`:
+      TestNewWriterRejectsLegacyDirInPGCompatMode,
+      TestNewWriterRejectsPGCompatDirInLegacyMode,
+      TestNewWriterAcceptsFreshDirInBothModes,
+      TestNewWriterAcceptsMatchingFormat (legacy_legacy +
+      pgcompat_pgcompat reopen),
+      TestWriterFormatExposesActiveMode,
+      TestNewWriterIgnoresNonSegmentFiles. Full
+      `go test ./...` green.)
 
 ## Milestone 0015 — PL/pgSQL stored routines (function-first delivery)
 
