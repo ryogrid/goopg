@@ -2795,11 +2795,21 @@ Substantial. Decompose when picked up.
       + LAG/LEAD argument shapes + frame clauses +
       named windows all stay deferred for
       M0020-0002/0003/0004.)
-- [ ] Window-function — analyzer + planner + executor
+- [x] Window-function — analyzer + planner + executor
       wiring (M0020-0002 / M0020-0003 / M0020-0004).
       `docs/design/0020-0002-window-analyzer-and-planner.md`,
       `docs/design/0020-0003-window-executor.md`,
       `docs/design/0020-0004-window-explain-and-tests.md`.
+      (landed 2026-04-30: Stage A support for row_number/rank
+      now runs end-to-end: analyzer allows supported window calls
+      and rejects invalid placement/shape; planner injects
+      WindowAgg and rewrites target/ORDER BY refs; executor
+      evaluates row_number and rank with partition/order + peer
+      semantics; EXPLAIN TEXT/JSON renders WindowAgg; regression
+      matrix added across analyzer/planner/executor plus
+      compatibility tests for ties and NULL order keys. Stage B
+      lag/lead + frame clauses + multiple window specs remain
+      deferred follow-up.)
       Decomposed execution checklist:
       - [x] M0020-S01: add design doc
             `docs/design/0020-0002-window-analyzer-and-planner.md`
@@ -2820,7 +2830,7 @@ Substantial. Decompose when picked up.
             WindowAgg.
       - [x] M0020-S09: regression tests (analyzer/planner/executor
             for Stage A semantics).
-      - [ ] M0020-S10: finalize design docs
+      - [x] M0020-S10: finalize design docs
             `0020-0003-window-executor.md` and
             `0020-0004-window-explain-and-tests.md` + README index.
 
