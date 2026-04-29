@@ -1807,13 +1807,35 @@ the topmost unchecked item.
       Deadlock detection (M0012-0002) and executor
       integration (M0012-0003) build on this surface.)
 
-- [ ] Wait-for graph + deadlock detection: build wait-for
-      edges from current waiter/holder state when a wait
-      exceeds the deadlock-check trigger; cycle-detection via
-      DFS; victim selection (younger backend in v0); SQLSTATE
-      `40P01` cancellation path; clean lock/waiter cleanup
-      after victim aborts. Continues
+- [x] Wait-for graph + deadlock detection (M0012-0002).
+      Design doc
       `docs/design/0012-0002-deadlock-detection-algorithm.md`.
+      (landed 2026-04-29: new
+      `internal/lockmgr/deadlock.go` with `runDeadlockCheck`
+      (timer target), `CheckDeadlocksNow` (synchronous test
+      hook), `findCycle` (iterative 3-colour DFS over
+      waiter→conflicting-holder edges), and
+      `cancelVictimLocked` (splice + signal). Victim policy:
+      youngest backend in the cycle (max `BackendID`).
+      Cancellation contract: `Waiter` grew a `victim chan
+      struct{}`; the cancelled `Acquire` selects on
+      signal/victim/ctx.Done and returns
+      `ErrDeadlockDetected` on victim, then calls
+      `ReleaseAll` to free other holdings. Scheduling: every
+      parked Acquire arms a `time.AfterFunc(
+      deadlockTimeout, runDeadlockCheck)`; default 1s,
+      `SetDeadlockTimeout` for tests; concurrent fires
+      serialise on `lm.mu`. Tests:
+      TestDeadlockDetectsTwoSessionCycle,
+      TestDeadlockYoungestBackendIsVictim,
+      TestDeadlockDetectsThreeSessionCycle (A→B→C→A multi-
+      edge),
+      TestDeadlockNoCycleNoCancel (false-positive guard),
+      TestDeadlockTimerSchedulesCheck (real AfterFunc path,
+      no synchronous trigger), TestDeadlockSurvivorMakesProgress.
+      Race-clean. Full `go test ./...` green.
+      `ErrDeadlockDetected` → SQLSTATE `40P01` translation
+      lands with executor integration in M0012-0003.)
 
 - [ ] Executor integration + multi-session test matrix:
       acquire relation locks at executor open for at least

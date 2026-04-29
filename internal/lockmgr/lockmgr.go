@@ -15,9 +15,22 @@ package lockmgr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
+
+// ErrDeadlockDetected is returned by Acquire when the deadlock
+// detector picked the calling backend as the cycle victim. Higher
+// layers translate this to SQLSTATE 40P01 (deadlock_detected). See
+// docs/design/0012-0002-deadlock-detection-algorithm.md.
+var ErrDeadlockDetected = errors.New("lockmgr: deadlock detected")
+
+// DefaultDeadlockTimeout matches upstream's `deadlock_timeout` GUC
+// default (1s). The detector fires once a parked Acquire has been
+// blocked at least this long.
+const DefaultDeadlockTimeout = time.Second
 
 // Mode is one of upstream's eight lock modes. The numeric values
 // match upstream's lockdefs.h so log lines and future SQL views can
@@ -136,10 +149,18 @@ type BackendID uint32
 
 // Waiter is one queued lock request. Stored by *Waiter so cancel
 // can splice it out of the slice by pointer identity.
+//
+// `signal` fires when the wake-pass promotes this waiter to a
+// holder. `victim` fires when the deadlock detector selects this
+// waiter as the cycle victim — distinct from `signal` so the
+// Acquire goroutine can return ErrDeadlockDetected instead of
+// silently succeeding.
 type Waiter struct {
 	Backend BackendID
 	Mode    Mode
+	tag     LockTag
 	signal  chan struct{}
+	victim  chan struct{}
 }
 
 // lockState is the per-tag holder + waiter view. Allocated lazily on
@@ -176,13 +197,28 @@ func (s *lockState) grantedExcept(b BackendID) Mask {
 
 // LockManager is the lock table. Use New to construct.
 type LockManager struct {
-	mu     sync.Mutex
-	states map[LockTag]*lockState
+	mu              sync.Mutex
+	states          map[LockTag]*lockState
+	deadlockTimeout time.Duration
 }
 
-// New returns an empty lock manager.
+// New returns an empty lock manager with the default deadlock
+// timeout (DefaultDeadlockTimeout).
 func New() *LockManager {
-	return &LockManager{states: make(map[LockTag]*lockState)}
+	return &LockManager{
+		states:          make(map[LockTag]*lockState),
+		deadlockTimeout: DefaultDeadlockTimeout,
+	}
+}
+
+// SetDeadlockTimeout tunes how long Acquire waits before
+// scheduling a deadlock check. Tests use a small value so cycles
+// are detected without a real-time-second pause; production uses
+// the default.
+func (lm *LockManager) SetDeadlockTimeout(d time.Duration) {
+	lm.mu.Lock()
+	lm.deadlockTimeout = d
+	lm.mu.Unlock()
 }
 
 // Acquire attempts to take mode `m` on tag `t` for backend `b`.
@@ -223,14 +259,37 @@ func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		return nil
 	}
 	// Conflict: enqueue and block.
-	w := &Waiter{Backend: b, Mode: m, signal: make(chan struct{}, 1)}
+	w := &Waiter{
+		Backend: b,
+		Mode:    m,
+		tag:     t,
+		signal:  make(chan struct{}, 1),
+		victim:  make(chan struct{}, 1),
+	}
 	st.waiters = append(st.waiters, w)
+	timeout := lm.deadlockTimeout
 	lm.mu.Unlock()
+
+	// Schedule a deadlock check after the configured timeout.
+	// Idempotent and cheap; concurrent fires serialise on lm.mu.
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.AfterFunc(timeout, lm.runDeadlockCheck)
+		defer timer.Stop()
+	}
 
 	select {
 	case <-w.signal:
 		// Promoted to holder by Release's wake-pass.
 		return nil
+	case <-w.victim:
+		// Selected by the deadlock detector. The detector has
+		// already spliced us out of the queue and dropped any
+		// holder bit it might have momentarily set. Release any
+		// other holdings this backend has so survivors can make
+		// progress without waiting for an explicit ReleaseAll.
+		lm.ReleaseAll(b)
+		return ErrDeadlockDetected
 	case <-ctx.Done():
 		// Splice ourselves out of the queue if we're still there;
 		// a racing wake-pass may have already promoted us.
