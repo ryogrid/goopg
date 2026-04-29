@@ -1980,6 +1980,86 @@ the topmost unchecked item.
       `go test ./...` green. M0013 closes — every DoD item
       maps to a landed slice.)
 
+## Milestone 0014 — PostgreSQL-compatible WAL on-disk format
+
+See `docs/milestones/0014-wal-compatibility-with-pg.md` for the
+full DoD. Decomposed into the four design-doc seams the milestone
+calls out (`0014-0001`, `0014-0002`, `0014-0003`, `0014-0004`);
+pick the topmost unchecked item.
+
+- [x] XLOG page and segment layout — **types and helpers**
+      (M0014-0001 step 1). Design doc
+      `docs/design/0014-0001-xlog-page-and-segment-layout-compat.md`.
+      (landed 2026-04-29: pure additive — no production-path
+      changes yet. New `internal/wal/xlog_page.go` defines
+      upstream-compatible page-header types and helpers
+      targeting PG18: `XLogPageHeader` (24 bytes, mirrors
+      `XLogPageHeaderData`), `XLogLongPageHeader` (40 bytes,
+      mirrors `XLogLongPageHeaderData` with the
+      sysid/seg_size/xlog_blcksz cross-check), constants
+      `XLOGBlockSize=8192`, `XLOGPageMagic=0xD119`,
+      `SizeOfXLogShortPHD=24`, `SizeOfXLogLongPHD=40`, all
+      flag bits (`XLPFirstIsContRecord`, `XLPLongHeader`,
+      `XLPBkpRemovable`, `XLPFirstIsOverwriteContRecord`,
+      `XLPAllFlags`). Encode/decode helpers serialise to/from
+      little-endian (host byte order on x86_64/aarch64 Linux,
+      matches upstream's de-facto LE assumption — cross-arch
+      transfer out of scope). `EncodeXLogPageHeader` rejects
+      undefined flag bits (XLPAllFlags contract);
+      `DecodeXLogPageHeader` returns the typed sentinel
+      `ErrInvalidPageHeader` on magic mismatch so the
+      M0014-0004 legacy-format detector has a clean branch.
+      `EncodeXLogLongPageHeader` auto-sets the long bit;
+      `DecodeXLogLongPageHeader` enforces it. Filename
+      helpers `XLogFileName(tli, segno, segSize)` and
+      `ParseXLogFileName(name, segSize)` produce/consume the
+      upstream `<TLI:08X><Log:08X><Seg:08X>` form via strict
+      `strconv.ParseUint` (rejects partial parses). Tests:
+      TestXLogFileNameRoundTrip (5 representative TLI/segno
+      cases including log-boundary 255→256), TestParseXLogFile
+      NameRejectsGarbage, TestXLogPageHeaderRoundTrip,
+      TestXLogLongPageHeaderRoundTrip, TestDecodeXLogPageHeader
+      RejectsBadMagic (typed sentinel), TestEncodeXLogPageHeader
+      RejectsUndefinedFlags (XLPAllFlags contract), TestDecode
+      XLogLongPageHeaderRequiresLongBit. Coexists with the
+      legacy `formatSegmentName` / `parseSegmentName` so the
+      writer/reader switchover lands atomically in M0014-0001
+      step 2 without churning unrelated code first. Full
+      `go test ./...` green.)
+
+- [ ] XLOG page emission in writer + page-aware reader
+      (M0014-0001 step 2). Wire the new helpers into the writer's
+      append path: every segment starts with a 40-byte long
+      page header; subsequent pages get a 24-byte short
+      header; records crossing a page boundary set
+      XLP_FIRST_IS_CONTRECORD on the next page and update
+      `xlp_rem_len`. Update RecordIterator + ReadAll to skip
+      page headers when streaming records. Continues
+      `docs/design/0014-0001-xlog-page-and-segment-layout-compat.md`.
+
+- [ ] XLogRecord header + rmgr mapping (M0014-0002). Replace
+      the v0 `length+CRC32-IEEE` 8-byte frame with
+      `XLogRecord`-compatible header (`xl_tot_len`, `xl_xid`,
+      `xl_prev`, `xl_info`, `xl_rmid`, `xl_crc`) using
+      upstream's CRC32C algorithm. Map goopg's existing
+      record kinds (heap insert/delete/vacuum, btree
+      insert/split, page-image, checkpoint) to upstream's
+      RmgrId vocabulary. Continues
+      `docs/design/0014-0002-xlogrecord-header-and-rmgr-mapping.md`.
+
+- [ ] Recovery + streaming + compat validation (M0014-0003).
+      Update WAL replay paths to decode the new format;
+      verify pg_waldump can parse goopg's emitted WAL on
+      representative workloads. Continues
+      `docs/design/0014-0003-recovery-streaming-and-compat-validation.md`.
+
+- [ ] Rollout guardrails + operator playbook (M0014-0004).
+      Legacy-format detection (use `ErrInvalidPageHeader` as
+      the branching point) with actionable diagnostics;
+      operator-facing rollout notes; runtime observability
+      surfacing the WAL format mode/version. Continues
+      `docs/design/0014-0004-rollout-guardrails-and-operator-playbook.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
