@@ -54,6 +54,9 @@ go test -run <Pattern> ./internal/<pkg>         # focused
 go test -race ./...                             # race detector — preferred when
                                                 # touching concurrency code
 go test -cover ./...                            # coverage summary
+
+# Ralph loop state consistency guard (run before final status block)
+make ralph-state-guard
 ```
 
 Integration tests that need a real `psql`/`pgbench` belong under

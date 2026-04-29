@@ -32,7 +32,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair
+.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -48,6 +48,7 @@ help:
 	@echo "  make print-env       Print the PATH/LD_LIBRARY_PATH this Makefile uses."
 	@echo "  make ralph-state-check  Validate .ralph/status.json and .ralph/progress.json consistency."
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
+	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
 	@echo
 	@echo "Variables (override with 'make VAR=value'):"
 	@echo "  DATA_DIR=$(DATA_DIR)"
@@ -124,3 +125,13 @@ ralph-state-check:
 
 ralph-state-repair:
 	go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json -fix
+
+ralph-state-guard:
+	@set -e; \
+	if go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json; then \
+		echo "ralph-state-guard: already consistent"; \
+	else \
+		echo "ralph-state-guard: inconsistency detected, attempting safe repair"; \
+		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json -fix; \
+		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json; \
+	fi
