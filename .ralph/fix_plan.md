@@ -2872,9 +2872,51 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       executor (acquire row-locks before yielding) +
       NOWAIT/SKIP LOCKED runtime + deadlock observability
       all deferred to M0021-0003 / M0021-0004.)
-- [ ] SELECT … FOR UPDATE — Stage A executor (acquire
-      row-locks via lockmgr) + NOWAIT/SKIP LOCKED runtime
-      + deadlock observability (M0021-0003 / M0021-0004).
+- [x] SELECT … FOR UPDATE — **Stage A executor**
+      (relation-level RowShareLock; M0021-0003).
+      Design doc
+      `docs/design/0021-0003-wait-policy-nowait-skip-locked.md`.
+      (landed 2026-04-30: new `lockRowsOp` in
+      `internal/executor/operators_lockrows.go`. Open()
+      acquires `RowShareLock` on each LockedRel.Table via
+      `Context.acquireRelLock` — mirrors upstream where
+      both FOR UPDATE and FOR SHARE take RowShareLock at
+      the relation level. Next()/Close() pass through.
+      Locks are transaction-scoped, released by
+      `LockMgr.ReleaseAll(backendID)` in
+      `internal/server/dispatch.go` at commit/rollback.
+      Stage A correctness property: RowShareLock
+      conflicts with ExclusiveLock / AccessExclusiveLock
+      (DROP TABLE / ALTER TABLE / VACUUM FULL) so schema
+      changes can't yank the table out from under a
+      running SELECT FOR UPDATE. Compatible with
+      RowExclusiveLock so concurrent UPDATEs/DELETEs
+      proceed unblocked at the relation level —
+      tuple-level row-blocking is the separate deferred
+      "Tuple-level pessimistic locking on top of M0012
+      lock manager" item. Open pre-pass acquires every
+      lock first then opens the child (matches upstream's
+      ExecLockRows placement). Stage A scope guard:
+      lockRowsOp.Open rejects non-Block WaitPolicies
+      with 0A000. Deadlock detection from M0012 just
+      works — `ErrDeadlockDetected` flows through
+      acquireRelLock to surface as 40P01. Tests in
+      `operators_lockrows_test.go`: 4 scenarios —
+      TestLockRowsAcquiresRowShareLock (end-to-end
+      FOR UPDATE; lm.Holders[backend] has RowShareLock
+      bit), TestLockRowsForShareAlsoUsesRowShareLock,
+      TestLockRowsRejectsNoWait (0A000),
+      TestLockRowsBlocksOnExclusiveLock (multi-session:
+      blocker holds ExclusiveLock, FOR UPDATE registers
+      as waiter, blocker releases, SELECT completes —
+      pins lockmgr conflict-matrix integration via the
+      operator). Full `go test ./...` green. NOWAIT/SKIP
+      LOCKED runtime + observability counters + tuple-
+      level pessimistic locking deferred.)
+- [ ] SELECT … FOR UPDATE — NOWAIT / SKIP LOCKED
+      runtime + observability counters (M0021-0003
+      follow-up / M0021-0004). Reserves filename
+      `docs/design/0021-0004-deadlock-observability-and-test-matrix.md`.
 - [ ] Tuple-level pessimistic locking on top of M0012 lock
       manager.
 

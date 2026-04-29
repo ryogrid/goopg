@@ -76,14 +76,11 @@ func Build(plan planner.Node) (Operator, error) {
 	case *planner.IndexScan:
 		return maybeInstrument(p, newIndexScanOp(p)), nil
 	case *planner.LockRows:
-		// M0021-0002 lands the planner-side row-lock metadata.
-		// Stage A executor (acquire row locks before yielding
-		// rows) lands in M0021-0003. Reject at the executor so
-		// an unmigrated runtime never silently drops the FOR
-		// UPDATE intent — the planner produces a fully-formed
-		// LockRows node so EXPLAIN works, but execution waits
-		// for runtime support.
-		return nil, fmt.Errorf("row-level locking execution is not supported in v0 (Stage A executor lands in M0021-0003)")
+		child, err := Build(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newLockRowsOp(p, child)), nil
 	case *planner.Insert:
 		child, err := Build(p.Source)
 		if err != nil {
