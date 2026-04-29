@@ -73,6 +73,16 @@ const (
 	// without emission. Same format / recovery semantics as
 	// RecordKindXactCommit.
 	RecordKindXactAbort byte = 9
+	// RecordKindHeapLock is the row-lock redo record (M0021
+	// tuple-level locking step 3). Stamps an xmax + the
+	// HEAP_XMAX_LOCK_ONLY infomask bit + a lock-strength bit on
+	// an existing heap tuple. Mirrors upstream's xl_heap_lock
+	// record. The record is idempotent via pd_lsn — re-applying
+	// after a crash is a no-op when the page already advertises
+	// an LSN >= record.endLSN. Format:
+	// "kind(1) | rel(9) | blk(4) | lineSlot(2) | xmax(4) |
+	//  lockStrength(2)" = 22 bytes.
+	RecordKindHeapLock byte = 10
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
@@ -93,6 +103,9 @@ const (
 	// xactRecordSize: kind(1) + xid(4) = 5. Shared by
 	// RecordKindXactCommit and RecordKindXactAbort.
 	xactRecordSize = 5
+	// heapLockSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1)
+	// + Block(4) + LineSlot(2) + Xmax(4) + LockStrength(2) = 22.
+	heapLockSize = 22
 )
 
 // EncodeXactCommit encodes a logical-decoding commit marker for
@@ -225,6 +238,47 @@ func DecodeHeapDelete(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
 	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
 	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
+	return
+}
+
+// EncodeHeapLock encodes one row-lock redo record (M0021
+// tuple-level locking step 3). `xmax` is the locking xact's xid;
+// `lockStrength` carries the HeapXmax* lock-mode bits to OR into
+// the tuple's infomask alongside HEAP_XMAX_LOCK_ONLY. Mirrors
+// upstream's xl_heap_lock at the level of detail goopg's replay
+// path needs; XID-tracking and MultiXact handling are deferred.
+func EncodeHeapLock(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16) []byte {
+	out := make([]byte, heapLockSize)
+	out[0] = RecordKindHeapLock
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], lineSlot)
+	binary.LittleEndian.PutUint32(out[16:20], uint32(xmax))
+	binary.LittleEndian.PutUint16(out[20:22], lockStrength)
+	return out
+}
+
+// DecodeHeapLock decodes a HeapLock record payload.
+func DecodeHeapLock(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16, err error) {
+	if len(payload) != heapLockSize {
+		err = fmt.Errorf("wal: invalid heap-lock payload len %d (want %d)", len(payload), heapLockSize)
+		return
+	}
+	if payload[0] != RecordKindHeapLock {
+		err = fmt.Errorf("wal: record kind %d is not heap-lock", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
+	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
+	lockStrength = binary.LittleEndian.Uint16(payload[20:22])
 	return
 }
 
@@ -447,6 +501,11 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	case RecordKindHeapLock:
+		if err := replayHeapLock(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
 	case RecordKindHeapVacuum:
 		if err := replayHeapVacuum(mgr, r); err != nil {
 			return false, err
@@ -526,6 +585,39 @@ func replayHeapVacuum(mgr *storage.Manager, r Record) error {
 	}
 	if _, err := storage.VacuumHeapPageBySlots(page, deadSlots); err != nil {
 		return fmt.Errorf("wal: heap-vacuum apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
+}
+
+// replayHeapLock applies one row-lock redo record. The page must
+// already exist (a HeapInsert or earlier mutation produced it).
+// Idempotent via pd_lsn — re-applying a record after a crash is a
+// no-op when the page already advertises an LSN >= record.endLSN.
+func replayHeapLock(mgr *storage.Manager, r Record) error {
+	rel, blk, lineSlot, xmax, lockStrength, err := DecodeHeapLock(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-lock replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-lock replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if err := storage.PageSetHeapTupleLockOnly(page, lineSlot, xmax, lockStrength); err != nil {
+		return fmt.Errorf("wal: heap-lock apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(rel, blk, page)

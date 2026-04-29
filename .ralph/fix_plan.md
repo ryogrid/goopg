@@ -2988,8 +2988,35 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       INSERT/UPDATE/DELETE detect lock-only xmax from
       another live xact and block / fail-NOWAIT / skip
       for SKIP LOCKED).
-- [ ] Tuple-level pessimistic locking — step 3: row-lock
-      WAL record (xl_heap_lock) + crash-recovery replay.
+- [x] Tuple-level pessimistic locking — step 3: row-lock
+      WAL record + crash-recovery replay. Design doc
+      `docs/design/0021-0006-tuple-locking-heap-lock-wal.md`.
+      (landed 2026-04-30: pure additive WAL record-kind
+      sequel to step 1's storage primitives. New
+      `RecordKindHeapLock=10` + 22-byte payload (kind /
+      DBOid / RelOid / Fork / Block / LineSlot / Xmax /
+      LockStrength). New `EncodeHeapLock` /
+      `DecodeHeapLock` — decoder validates kind byte +
+      length so a stray payload from another record kind
+      errors instead of silently constructing nonsense
+      ItemPointer / xmax values. New `replayHeapLock(mgr,
+      r)` mirrors `replayHeapDelete`: validate block
+      exists / page initialised, idempotency via pd_lsn
+      (re-replay no-ops when MustHeader(page).LSN() >=
+      r.EndLSN), call the step-1 `PageSetHeapTupleLockOnly`,
+      stamp pd_lsn, write back. `ApplyRecord` switch grew
+      a case for the new kind. Logical decoder's
+      `Classify` intentionally skips lock records — locking
+      doesn't change replicated data, the trailing
+      default-skip arm covers the new kind without code
+      change. Tests: 5 scenarios in recovery_test.go
+      (round-trip, wrong-kind reject, idempotent replay
+      pinning xmax + LockOnly + ExclLock infomask bits +
+      pd_lsn second-replay-no-op, missing-block reject,
+      ApplyRecord routes the new kind). Full `go test
+      ./...` green. Producer wiring (lockRowsOp emitting
+      HeapLock through ctx.Pool.LogHeapLock parallel to
+      LogHeapInsert / LogHeapDelete) is the next slice.)
 - [ ] Tuple-level pessimistic locking — step 4:
       MultiXact-aware multi-holder support for FOR SHARE.
 

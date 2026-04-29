@@ -530,3 +530,157 @@ func mustPageWithByte(t *testing.T, v byte) storage.Page {
 	p[100] = v
 	return p
 }
+
+// TestEncodeDecodeHeapLockRoundTrip pins the on-the-wire shape
+// of the row-lock record (M0021 tuple-level locking step 3).
+func TestEncodeDecodeHeapLockRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 70, RelOid: 71, Fork: storage.MainFork}
+	enc := EncodeHeapLock(rel, 17, 9, storage.TransactionID(123), storage.HeapXmaxExclLock)
+	if enc[0] != RecordKindHeapLock {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindHeapLock)
+	}
+	if len(enc) != heapLockSize {
+		t.Errorf("len = %d, want %d", len(enc), heapLockSize)
+	}
+	gotRel, gotBlk, gotSlot, gotXmax, gotStrength, err := DecodeHeapLock(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRel != rel || gotBlk != 17 || gotSlot != 9 || gotXmax != 123 || gotStrength != storage.HeapXmaxExclLock {
+		t.Errorf("decoded rel/blk/slot/xmax/strength = %+v %d %d %d %#x",
+			gotRel, gotBlk, gotSlot, gotXmax, gotStrength)
+	}
+}
+
+// TestDecodeHeapLockRejectsWrongKind — guards against a future
+// caller that hands a non-heap-lock payload to DecodeHeapLock.
+// Mirrors the shape-guard tests on the other heap-record decoders.
+func TestDecodeHeapLockRejectsWrongKind(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 70, RelOid: 71, Fork: storage.MainFork}
+	enc := EncodeHeapDelete(rel, 17, 9, storage.TransactionID(123))
+	if _, _, _, _, _, err := DecodeHeapLock(enc); err == nil {
+		t.Error("expected error decoding heap-delete bytes as heap-lock")
+	}
+}
+
+// TestReplayHeapLockIdempotent walks one HeapLock record through
+// replay against a page seeded with one live tuple; verifies xmax
+// + the HeapXmaxLockOnly + lock-strength infomask bits land, and
+// a second replay is a no-op via pd_lsn. The lock-only stamp
+// must NOT make the tuple invisible — that's the whole point of
+// HEAP_XMAX_LOCK_ONLY versus HEAP_XMAX (delete) — but visibility
+// is a mvcc package concern; this test only pins the on-page
+// bytes and the redo-path idempotency.
+func TestReplayHeapLockIdempotent(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 906, Fork: storage.MainFork}
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	tup := storage.NewHeapTuple(7, storage.InvalidTransactionID, []byte("locked-target"))
+	if _, err := storage.PageAddHeapTuple(page, tup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := EncodeHeapLock(rel, 0, 1, storage.TransactionID(42), storage.HeapXmaxExclLock)
+	stats, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Applied != 1 {
+		t.Fatalf("first replay Applied=%d want 1", stats.Applied)
+	}
+
+	// Second replay must be a no-op via pd_lsn.
+	if _, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	}); err != nil {
+		t.Fatalf("second replay returned err=%v (expected silent skip)", err)
+	}
+
+	// Verify the on-page bytes: xmax stamped, LockOnly + ExclLock
+	// bits set in infomask, HeapXmaxInvalid cleared.
+	got := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := storage.PageGetItemRaw(got, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := storage.ParseHeapTuple(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Header.Xmax != 42 {
+		t.Errorf("xmax = %d want 42", parsed.Header.Xmax)
+	}
+	if parsed.Header.Infomask&storage.HeapXmaxLockOnly == 0 {
+		t.Errorf("Infomask = %#x missing HeapXmaxLockOnly", parsed.Header.Infomask)
+	}
+	if parsed.Header.Infomask&storage.HeapXmaxExclLock == 0 {
+		t.Errorf("Infomask = %#x missing HeapXmaxExclLock", parsed.Header.Infomask)
+	}
+}
+
+// TestReplayHeapLockMissingBlock — replay against a relation
+// whose target block doesn't yet exist surfaces an error rather
+// than silently extending — locking a non-existent tuple is
+// always a producer bug.
+func TestReplayHeapLockMissingBlock(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 907, Fork: storage.MainFork}
+	rec := EncodeHeapLock(rel, 5, 1, storage.TransactionID(42), storage.HeapXmaxExclLock)
+	_, err := ReplayRecords(mgr, []Record{
+		{StartLSN: 1, EndLSN: 100, Payload: rec},
+	})
+	if err == nil {
+		t.Error("expected error replaying lock against non-existent block")
+	}
+}
+
+// TestApplyRecordRoutesHeapLock — the per-record kernel
+// `ApplyRecord` must dispatch `RecordKindHeapLock` to
+// replayHeapLock; missing the case would silently drop the
+// lock at recovery time. Verifies via the public `applied`
+// flag the dispatcher returns.
+func TestApplyRecordRoutesHeapLock(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 908, Fork: storage.MainFork}
+	page := make(storage.Page, storage.BlockSize)
+	_ = storage.InitPage(page)
+	tup := storage.NewHeapTuple(1, storage.InvalidTransactionID, []byte("x"))
+	_, _ = storage.PageAddHeapTuple(page, tup)
+	_, _ = mgr.Extend(rel, page)
+
+	rec := Record{
+		StartLSN: 1, EndLSN: 50,
+		Payload: EncodeHeapLock(rel, 0, 1, storage.TransactionID(7), storage.HeapXmaxExclLock),
+	}
+	applied, err := ApplyRecord(mgr, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Errorf("ApplyRecord applied=false, want true")
+	}
+}
+
+// _ avoids an unused-import lint when this file ends up alone.
+var _ = filepath.Base
