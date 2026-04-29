@@ -50,16 +50,16 @@ type lockRowsOp struct {
 	ctx   *Context
 	child Operator
 
-	// scan is the underlying seqScanOp resolved at Open time —
-	// found by walking the child chain past Project / Filter
-	// wrappers. Each row that bubbles up through child.Next()
-	// can be traced back to (block, slot) via scan.currentTID.
-	// nil when the child tree has no seqScanOp leaf (e.g. an
-	// IndexScan, which Stage A doesn't yet support per-row
-	// stamping for); in that case Next() falls through to
-	// pass-through behaviour and only the relation-level lock
-	// from Open applies.
-	scan *seqScanOp
+	// scan is the underlying TID-providing leaf operator
+	// resolved at Open time — found by walking the child chain
+	// past Project / Filter wrappers. Each row that bubbles up
+	// through child.Next() can be traced back to (block, slot)
+	// via scan.currentTID. nil when the child tree has no
+	// supported leaf (e.g. Values); in that case Next() falls
+	// through to pass-through and only the relation-level lock
+	// from Open applies. Both seqScanOp (M0021 step 2a) and
+	// indexScanOp (M0021 step 2c) implement currentTIDProvider.
+	scan currentTIDProvider
 	// lockStrength is the HeapXmax* infomask bit corresponding
 	// to the locks slice (FOR UPDATE → ExclLock, FOR SHARE →
 	// ShrLock). Resolved once at Open. Multiple LockedRels
@@ -99,14 +99,28 @@ func newLockRowsOp(p *planner.LockRows, child Operator) *lockRowsOp {
 	return &lockRowsOp{plan: p, child: child}
 }
 
-// findSeqScan walks the child operator chain past Project /
-// Filter wrappers to surface the underlying *seqScanOp. Returns
-// nil when the leaf isn't a seqScanOp (e.g. IndexScan, Values).
-// Used by lockRowsOp.Open to wire the per-row currentTID hook.
-func findSeqScan(op Operator) *seqScanOp {
+// currentTIDProvider is the interface a scan leaf implements to
+// expose the (rel, ItemPointer) of its most recently emitted
+// row. Implemented by *seqScanOp (M0021 step 2a) and
+// *indexScanOp (M0021 step 2c). lockRowsOp resolves this at
+// Open via findScanLeaf and queries it after each child.Next
+// to stamp per-row lock-only xmax.
+type currentTIDProvider interface {
+	currentTID() (storage.RelFileNode, storage.ItemPointer, bool)
+}
+
+// findScanLeaf walks the child operator chain past Project /
+// Filter wrappers to surface a TID-providing leaf operator
+// (seqScanOp / indexScanOp). Returns nil when the leaf is
+// neither (e.g. Values, CTEScan); lockRowsOp falls through to
+// pass-through Next in that case with only relation-level
+// lock applied.
+func findScanLeaf(op Operator) currentTIDProvider {
 	for {
 		switch v := op.(type) {
 		case *seqScanOp:
+			return v
+		case *indexScanOp:
 			return v
 		case *projectOp:
 			op = v.child
@@ -180,7 +194,7 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
-	o.scan = findSeqScan(o.child)
+	o.scan = findScanLeaf(o.child)
 	return nil
 }
 

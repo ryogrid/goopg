@@ -3045,11 +3045,36 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       LOCKED + MultiXact + streaming-stamping refactor +
       pg_locks introspection + lock-strength merge all
       deferred.)
-- [ ] Tuple-level pessimistic locking — step 2c:
-      IndexScan currentTID twin + lockRowsOp / scanMatching
-      traversal into indexScanOp so SELECT FOR UPDATE
-      via index scans + UPDATE WHERE indexed-col blocking
-      both work.
+- [x] Tuple-level pessimistic locking — step 2c:
+      IndexScan currentTID + lockRowsOp scan-leaf
+      traversal. Design doc
+      `docs/design/0021-0009-tuple-locking-indexscan-leaf.md`.
+      (landed 2026-04-30: closes the seqScan-only
+      restriction from step 2a. indexScanOp grew a parallel
+      `tids []storage.ItemPointer` slice populated in the
+      btree.RangeScan callback alongside `rows`; new
+      `currentTID()` returns the just-emitted row's TID via
+      `o.tids[o.idx-1]`. New `currentTIDProvider` interface
+      unifies seqScanOp / indexScanOp; `findSeqScan` replaced
+      with `findScanLeaf` that returns either leaf type;
+      lockRowsOp.scan field type changed accordingly.
+      Two-pass drain-then-stamp flow untouched. New
+      TestLockRowsStampsLockOnlyXmaxIndexScan creates a
+      unique index, runs SELECT id WHERE id=N FOR UPDATE
+      (planner picks IndexScan), verifies exactly one
+      tuple has xmax + HeapXmaxLockOnly stamped. Full
+      `go test ./...` green; race-mode targeted executor
+      runs green. UPDATE/DELETE-via-IndexScan stays out
+      of scope — extractScanAndPredicate requires
+      Filter(SeqScan) and an index-driven UPDATE plan
+      would error before the lock-detection logic runs.
+      Tuple-level NOWAIT/SKIP LOCKED + MultiXact +
+      streaming stamping all remain deferred.)
+- [ ] Tuple-level pessimistic locking — step 2d:
+      UPDATE/DELETE via IndexScan path (extend
+      extractScanAndPredicate to accept Filter(IndexScan)
+      and IndexScan; thread per-tuple foreign-lock
+      detection through the index-driven update path).
 - [x] Tuple-level pessimistic locking — step 3: row-lock
       WAL record + crash-recovery replay. Design doc
       `docs/design/0021-0006-tuple-locking-heap-lock-wal.md`.

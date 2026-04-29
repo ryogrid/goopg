@@ -353,6 +353,71 @@ func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
 	}
 }
 
+// TestLockRowsStampsLockOnlyXmaxIndexScan — M0021 step 2c
+// counterpart to TestLockRowsStampsTupleLockOnlyXmax. With a
+// unique index on items.id, the planner picks IndexScan for
+// `WHERE id = N`; lockRowsOp must traverse past Project →
+// IndexScan via findScanLeaf and stamp lock-only xmax on the
+// row IndexScan emits. Pins the per-row stamping property
+// regardless of whether the executor reached the row via
+// SeqScan or IndexScan.
+func TestLockRowsStampsLockOnlyXmaxIndexScan(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := runDDL(t, ctx, "CREATE UNIQUE INDEX items_pkey_idxscan ON items (id)"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx.LockMgr = lockmgr.New()
+	ctx.BackendID = 1
+
+	rows, err := runForUpdate(t, ctx, "SELECT id FROM items WHERE id = 2 FOR UPDATE")
+	if err != nil {
+		t.Fatalf("runForUpdate: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("FOR UPDATE returned %d rows, want 1 (id=2)", len(rows))
+	}
+
+	rel := ctx.Catalog.RelFileNode(tbl)
+	pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Pool.Unpin(pinned)
+	pinned.RLock()
+	defer pinned.RUnlock()
+	page := pinned.Page()
+	count, _ := storage.PageLinePointerCount(page)
+	stampedCount := 0
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(page, slot)
+		if err != nil {
+			continue
+		}
+		parsed, err := storage.ParseHeapTuple(raw)
+		if err != nil {
+			continue
+		}
+		if parsed.Header.Xmax != ctx.Tx.XID {
+			continue
+		}
+		if parsed.Header.Infomask&storage.HeapXmaxLockOnly == 0 {
+			t.Errorf("slot %d: xmax stamped but HeapXmaxLockOnly not set (Infomask=%#x)", slot, parsed.Header.Infomask)
+			continue
+		}
+		stampedCount++
+	}
+	if stampedCount != 1 {
+		t.Errorf("stamped %d tuples, want 1 (only id=2 should be locked via index probe)", stampedCount)
+	}
+}
+
 // TestLockRowsRejectsSkipLocked — SKIP LOCKED stays deferred
 // pending tuple-level pessimistic locking (relation-coarse
 // locks have no per-row "skip" semantic). Pins the explicit

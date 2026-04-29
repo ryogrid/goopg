@@ -14,6 +14,12 @@ type indexScanOp struct {
 	plan *planner.IndexScan
 	ctx  *Context
 	rows []Row
+	// tids parallels rows: tids[i] is the heap (block, slot) the
+	// i-th matched row was decoded from. Captured during the
+	// btree.RangeScan callback so SELECT FOR UPDATE / FOR SHARE
+	// (M0021 step 2c) can stamp per-row lock-only xmax via
+	// lockRowsOp.currentTID after Next emits the row.
+	tids []storage.ItemPointer
 	idx  int
 }
 
@@ -29,6 +35,7 @@ func (o *indexScanOp) Open(ctx *Context) error {
 	}
 	o.ctx = ctx
 	o.rows = nil
+	o.tids = nil
 	o.idx = 0
 
 	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
@@ -71,6 +78,7 @@ func (o *indexScanOp) Open(ctx *Context) error {
 			return false, err
 		}
 		o.rows = append(o.rows, row)
+		o.tids = append(o.tids, ptr)
 		return true, nil
 	})
 	if err != nil {
@@ -90,7 +98,22 @@ func (o *indexScanOp) Next() (Row, error) {
 
 func (o *indexScanOp) Close() error {
 	o.rows = nil
+	o.tids = nil
 	return nil
+}
+
+// currentTID returns the (rel, ItemPointer) of the most recently
+// emitted row, or ok=false before the first Next() call / past
+// EOF. Mirrors seqScanOp.currentTID for the index-scan path so
+// lockRowsOp can stamp per-row lock-only xmax (M0021 step 2c).
+// idx points one past the last-returned row (Next increments
+// post-fetch), so the just-returned row's TID is at idx-1.
+func (o *indexScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
+	if o.idx == 0 || o.idx > len(o.tids) {
+		return storage.RelFileNode{}, storage.ItemPointer{}, false
+	}
+	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
+	return rel, o.tids[o.idx-1], true
 }
 
 func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
