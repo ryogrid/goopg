@@ -26,9 +26,11 @@ func TestStatAIOViewEmptyWithoutEngine(t *testing.T) {
 }
 
 // TestStatAIOViewReflectsEngineCounters: with an engine
-// attached, the view returns one row whose columns reflect
-// the engine's live counters. Submitting one read bumps
-// submitted/completed; the method column matches the engine.
+// attached, the view returns two rows (one per direction)
+// reflecting the engine's per-direction counters. Submitting
+// one read bumps the read row; the write row's counters stay
+// at zero. Column ordering: method, operation, submitted,
+// completed, errored, in_flight.
 func TestStatAIOViewReflectsEngineCounters(t *testing.T) {
 	eng, err := aio.NewEngine(aio.EngineConfig{Method: aio.MethodSync})
 	if err != nil {
@@ -41,16 +43,24 @@ func TestStatAIOViewReflectsEngineCounters(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_aio"})
 
-	// Pre-Submit snapshot: zero counters.
+	// Pre-Submit snapshot: zero counters across both rows.
 	rows := tbl.VirtualRows()
-	if len(rows) != 1 {
-		t.Fatalf("rows=%d want 1", len(rows))
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2 (read + write)", len(rows))
 	}
-	if got := rows[0][0]; got != "sync" {
-		t.Errorf("method=%q want sync", got)
+	for i, r := range rows {
+		if r[0] != "sync" {
+			t.Errorf("row %d method=%q want sync", i, r[0])
+		}
 	}
-	if rows[0][1] != "0" || rows[0][2] != "0" {
-		t.Errorf("pre-submit counters submitted=%q completed=%q want 0/0", rows[0][1], rows[0][2])
+	if rows[0][1] != "read" || rows[1][1] != "write" {
+		t.Errorf("operations=%q,%q want read,write", rows[0][1], rows[1][1])
+	}
+	for _, r := range rows {
+		if r[2] != "0" || r[3] != "0" {
+			t.Errorf("pre-submit counters %s submitted=%q completed=%q want 0/0",
+				r[1], r[2], r[3])
+		}
 	}
 
 	// Submit one read against an in-memory file.
@@ -63,14 +73,17 @@ func TestStatAIOViewReflectsEngineCounters(t *testing.T) {
 		t.Fatal(r.Err)
 	}
 	rows = tbl.VirtualRows()
-	if rows[0][1] != "1" {
-		t.Errorf("post-submit submitted=%q want 1", rows[0][1])
+	// Read row should reflect the submit; write row stays zero.
+	if rows[0][2] != "1" || rows[0][3] != "1" {
+		t.Errorf("post-submit read submitted=%q completed=%q want 1/1",
+			rows[0][2], rows[0][3])
 	}
-	if rows[0][2] != "1" {
-		t.Errorf("post-submit completed=%q want 1", rows[0][2])
+	if rows[1][2] != "0" || rows[1][3] != "0" {
+		t.Errorf("post-submit write counters %q/%q should still be 0",
+			rows[1][2], rows[1][3])
 	}
-	if rows[0][4] != "0" {
-		t.Errorf("post-submit in_flight=%q want 0", rows[0][4])
+	if rows[0][5] != "0" {
+		t.Errorf("post-submit in_flight=%q want 0", rows[0][5])
 	}
 }
 

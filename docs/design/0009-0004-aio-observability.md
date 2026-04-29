@@ -148,6 +148,29 @@ that don't set it. Closes the upstream-shape gap:
 `\watch pg_aios` now lets an operator see exactly which
 relfile or WAL segment a stalled I/O targets.
 
+## Per-direction counter breakdown (landed)
+
+`aio.Engine` carries six per-direction atomic counters
+(`readSubmitted` / `readCompleted` / `readErrored` and the
+`write*` triple). `Submit` bumps the read or write Submitted
+at submission time based on `op.Direction`; `finishHandle`
+bumps the matching Completed (and Errored, for non-EOF
+errors) at completion time. The aggregate
+`submitted` / `completed` / `errored` counters still reflect
+the sum — invariant pinned by test.
+
+`Stats` exposes both flavors so consumers can read whichever
+they prefer without recomputing.
+
+`pg_stat_aio` reshaped to a two-row-per-engine view —
+one row per direction with an `operation` column ("read" /
+"write") and the per-direction `submitted` / `completed` /
+`errored` / `in_flight` counts. Mirrors upstream's
+`pg_stat_io` row shape, where each I/O kind gets its own
+row. `in_flight` is the engine's aggregate (renders on the
+read row; the write row reports 0 — splitting InFlight by
+direction is a small future refactor).
+
 ## What this slice doesn't deliver
 
 - **AIO wait events.** "Waiting on AIO completion" hasn't
@@ -155,10 +178,9 @@ relfile or WAL segment a stalled I/O targets.
   (the pg_stat_activity-shaped one used for lock waits in
   M0002). Now unblocked — composes with the existing
   wait-event registry once a follow-up wires it.
-- **Per-relation / per-direction counter breakdown.** A
-  future view could split `submitted` etc. by `Direction`
-  (read/write) and by relfile, but the engine doesn't track
-  those today.
+- **Per-relation breakdown.** A future view could split
+  `submitted` etc. by relfile, but the engine doesn't
+  track per-target counters today (only per-direction).
 - **Histograms / latency percentiles.** Out of scope; the
   observability surface here is for "is it running," not for
   performance regression triage.

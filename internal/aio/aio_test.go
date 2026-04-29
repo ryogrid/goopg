@@ -346,3 +346,36 @@ func TestEngineInFlightTarget(t *testing.T) {
 	g.releaseAll()
 	h.Wait()
 }
+
+// TestEngineStatsPerDirection pins the per-direction breakdown:
+// a write submit + a read submit each bump only their own
+// counters; the aggregate Submitted/Completed equals the sum.
+func TestEngineStatsPerDirection(t *testing.T) {
+	e, err := NewEngine(EngineConfig{Method: MethodSync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	f := newMemFile(64)
+
+	wh := e.Submit(Op{File: f, Buffer: []byte("write"), Offset: 0, Direction: DirWrite})
+	wh.Wait()
+	rh := e.Submit(Op{File: f, Buffer: make([]byte, 5), Offset: 0, Direction: DirRead})
+	rh.Wait()
+
+	s := e.Stats()
+	if s.ReadSubmitted != 1 || s.ReadCompleted != 1 {
+		t.Errorf("read counters=%d/%d want 1/1", s.ReadSubmitted, s.ReadCompleted)
+	}
+	if s.WriteSubmitted != 1 || s.WriteCompleted != 1 {
+		t.Errorf("write counters=%d/%d want 1/1", s.WriteSubmitted, s.WriteCompleted)
+	}
+	if s.Submitted != s.ReadSubmitted+s.WriteSubmitted {
+		t.Errorf("aggregate Submitted=%d != read+write=%d", s.Submitted,
+			s.ReadSubmitted+s.WriteSubmitted)
+	}
+	if s.Completed != s.ReadCompleted+s.WriteCompleted {
+		t.Errorf("aggregate Completed=%d != read+write=%d", s.Completed,
+			s.ReadCompleted+s.WriteCompleted)
+	}
+}

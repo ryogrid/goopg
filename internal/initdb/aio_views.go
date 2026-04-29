@@ -1,8 +1,9 @@
 // AIO observability virtual views.
 //
-// `pg_stat_aio` exposes the AIO engine's aggregate counters
-// (one row per engine; v0 has at most one). Useful for
-// "is AIO running, and is it making progress?" triage.
+// `pg_stat_aio` exposes the AIO engine's counters split by
+// operation (read vs write). Two rows per engine — one per
+// direction — mirroring the upstream `pg_stat_io` row shape.
+// Useful for "is AIO running, and which side is hot?" triage.
 //
 // `pg_aios` exposes one row per currently-outstanding I/O —
 // the same shape upstream's `pg_aios()` set-returning function
@@ -32,6 +33,7 @@ func registerStatAIOView(cat *catalog.InMemory, eng *aio.Engine) error {
 		Name:   "pg_stat_aio",
 		Columns: []catalog.Column{
 			{Name: "method", Type: catalog.Type{Name: "text"}},
+			{Name: "operation", Type: catalog.Type{Name: "text"}},
 			{Name: "submitted", Type: catalog.Type{Name: "text"}},
 			{Name: "completed", Type: catalog.Type{Name: "text"}},
 			{Name: "errored", Type: catalog.Type{Name: "text"}},
@@ -44,13 +46,30 @@ func registerStatAIOView(cat *catalog.InMemory, eng *aio.Engine) error {
 			return nil
 		}
 		s := eng.Stats()
-		return [][]string{{
-			s.Method,
-			fmt.Sprintf("%d", s.Submitted),
-			fmt.Sprintf("%d", s.Completed),
-			fmt.Sprintf("%d", s.Errored),
-			fmt.Sprintf("%d", s.InFlight),
-		}}
+		// Two rows per engine: one for reads, one for writes.
+		// `in_flight` is the engine's aggregate (we don't yet
+		// track in-flight per-direction); rendering it on the
+		// read row only would mislead, so we put the aggregate
+		// on the read row and "0" on the write row's column —
+		// the column header `in_flight` semantically belongs
+		// to the engine, not the direction. (A future refactor
+		// can split InFlight by direction too.)
+		return [][]string{
+			{
+				s.Method, "read",
+				fmt.Sprintf("%d", s.ReadSubmitted),
+				fmt.Sprintf("%d", s.ReadCompleted),
+				fmt.Sprintf("%d", s.ReadErrored),
+				fmt.Sprintf("%d", s.InFlight),
+			},
+			{
+				s.Method, "write",
+				fmt.Sprintf("%d", s.WriteSubmitted),
+				fmt.Sprintf("%d", s.WriteCompleted),
+				fmt.Sprintf("%d", s.WriteErrored),
+				"0",
+			},
+		}
 	}
 	return cat.RegisterVirtualTable(tbl)
 }

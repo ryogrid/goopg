@@ -187,6 +187,17 @@ type Engine struct {
 	completed atomic.Uint64
 	errored   atomic.Uint64
 
+	// Per-direction breakdown of the same counters above.
+	// `submitted` / `completed` / `errored` are the totals;
+	// these are the read / write split. Mirrors upstream's
+	// pg_stat_io row shape, which splits by operation.
+	readSubmitted  atomic.Uint64
+	readCompleted  atomic.Uint64
+	readErrored    atomic.Uint64
+	writeSubmitted atomic.Uint64
+	writeCompleted atomic.Uint64
+	writeErrored   atomic.Uint64
+
 	// nextID hands out per-Submit identifiers. Monotonic.
 	nextID atomic.Uint64
 
@@ -290,6 +301,12 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 // Submit hands an Op to the underlying method. See Method.Submit.
 func (e *Engine) Submit(op Op) *Handle {
 	e.submitted.Add(1)
+	switch op.Direction {
+	case DirRead:
+		e.readSubmitted.Add(1)
+	case DirWrite:
+		e.writeSubmitted.Add(1)
+	}
 	return e.method.Submit(&op)
 }
 
@@ -320,8 +337,21 @@ func (e *Engine) registerInFlight(h *Handle, op *Op) {
 // per Op so the counters / inflight map stay coherent.
 func (e *Engine) finishHandle(h *Handle, r Result) {
 	e.completed.Add(1)
-	if r.Err != nil && !errors.Is(r.Err, io.EOF) {
+	isErr := r.Err != nil && !errors.Is(r.Err, io.EOF)
+	if isErr {
 		e.errored.Add(1)
+	}
+	switch h.op.Direction {
+	case DirRead:
+		e.readCompleted.Add(1)
+		if isErr {
+			e.readErrored.Add(1)
+		}
+	case DirWrite:
+		e.writeCompleted.Add(1)
+		if isErr {
+			e.writeErrored.Add(1)
+		}
 	}
 	e.inFlight.Add(-1)
 	e.inflightMu.Lock()
@@ -339,12 +369,25 @@ func (e *Engine) Method() string { return e.method.Name() }
 
 // Stats is a point-in-time snapshot of engine counters. Read-
 // only; mutating fields here does not affect the engine.
+//
+// The aggregate counters (Submitted/Completed/Errored) sum the
+// per-direction counters; both are exposed so a future surface
+// can render either flavor without recomputing.
 type Stats struct {
 	Method    string
 	Submitted uint64
 	Completed uint64
 	Errored   uint64
 	InFlight  int64
+
+	// Per-direction breakdown. Sum of Read* and Write*
+	// matches the aggregate counter above.
+	ReadSubmitted  uint64
+	ReadCompleted  uint64
+	ReadErrored    uint64
+	WriteSubmitted uint64
+	WriteCompleted uint64
+	WriteErrored   uint64
 }
 
 // InFlight returns a sorted copy of every currently-outstanding
@@ -374,11 +417,17 @@ func (e *Engine) InFlight() []InFlightInfo {
 // future `pg_aios`-summary surface and tests.
 func (e *Engine) Stats() Stats {
 	return Stats{
-		Method:    e.method.Name(),
-		Submitted: e.submitted.Load(),
-		Completed: e.completed.Load(),
-		Errored:   e.errored.Load(),
-		InFlight:  e.inFlight.Load(),
+		Method:         e.method.Name(),
+		Submitted:      e.submitted.Load(),
+		Completed:      e.completed.Load(),
+		Errored:        e.errored.Load(),
+		InFlight:       e.inFlight.Load(),
+		ReadSubmitted:  e.readSubmitted.Load(),
+		ReadCompleted:  e.readCompleted.Load(),
+		ReadErrored:    e.readErrored.Load(),
+		WriteSubmitted: e.writeSubmitted.Load(),
+		WriteCompleted: e.writeCompleted.Load(),
+		WriteErrored:   e.writeErrored.Load(),
 	}
 }
 

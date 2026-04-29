@@ -3311,6 +3311,35 @@ See `docs/milestones/0009-aio-subsystem.md`.
       segment or relation file rather than just a numeric
       offset.)
 
+- [x] AIO observability — per-direction counter breakdown.
+      (landed 2026-04-29: `aio.Engine` gained six new
+      atomic counters splitting submitted / completed /
+      errored by `Direction` (read vs write). `Submit`
+      bumps the right `read*` or `write*` Submitted at
+      submission time; `finishHandle` bumps the
+      Completed and (for non-EOF errors) Errored
+      counterparts at completion time. The aggregate
+      `submitted/completed/errored` counters still
+      reflect the sum so existing consumers are unchanged.
+      `Stats` gained `ReadSubmitted`, `ReadCompleted`,
+      `ReadErrored`, `WriteSubmitted`, `WriteCompleted`,
+      `WriteErrored` fields — sum invariant
+      (Submitted == ReadSubmitted + WriteSubmitted) is
+      pinned by test. `pg_stat_aio` reshaped to a
+      two-row-per-engine view: one row per direction
+      (`operation` column = "read" / "write") with the
+      per-direction submitted / completed / errored
+      counts. Mirrors upstream's `pg_stat_io` row shape.
+      `in_flight` is the engine's aggregate (renders on
+      the read row; the write row reports 0 — splitting
+      InFlight by direction is a future refactor).
+      Updated TestStatAIOViewReflectsEngineCounters to
+      pin the new shape (2 rows, post-Submit only the
+      read row's counters move). New
+      TestEngineStatsPerDirection exercises both
+      directions and verifies the aggregate-sum
+      invariant. Built and full `go test ./...` green.)
+
 - [ ] (BLOCKED) AIO wait-event surface: register a
       "waiting on AIO completion" wait event so a query
       stalled on an AIO Wait shows up identifiably in the
