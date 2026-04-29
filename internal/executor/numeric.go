@@ -2,8 +2,15 @@ package executor
 
 import (
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
+)
+
+var (
+	bigNumericTen      = big.NewInt(10)
+	bigNumericMinInt64 = big.NewInt(-9223372036854775808)
+	bigNumericMaxInt64 = big.NewInt(9223372036854775807)
 )
 
 // parseNumeric parses a SQL NUMERIC literal — `123`, `123.45`,
@@ -196,16 +203,21 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 	}
 	// Compute mantissaA * 10^(target + scaleB - scaleA) / mantissaB
 	// so the quotient has `target` fractional digits.
+	//
+	// Use big.Int for the intermediate scale-up: for TPC-H Q14 the
+	// aggregate numerator can be large enough that multiplying by 10^6
+	// overflows int64 even though the final quotient still fits int64.
 	shift := target + int(b.NumericScale) - int(a.NumericScale)
-	am := a.NumericMantissa
-	for i := 0; i < shift; i++ {
-		if am > maxInt64Div10 || am < -maxInt64Div10 {
-			return Datum{}, fmt.Errorf("numeric overflow in divide")
-		}
-		am *= 10
+	am := big.NewInt(a.NumericMantissa)
+	if shift > 0 {
+		scale := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(shift)), nil)
+		am.Mul(am, scale)
 	}
-	q := am / b.NumericMantissa
-	return Datum{Kind: KindNumeric, NumericMantissa: q, NumericScale: int8(target)}, nil
+	q := new(big.Int).Quo(am, big.NewInt(b.NumericMantissa))
+	if q.Cmp(bigNumericMinInt64) < 0 || q.Cmp(bigNumericMaxInt64) > 0 {
+		return Datum{}, fmt.Errorf("numeric overflow in divide")
+	}
+	return Datum{Kind: KindNumeric, NumericMantissa: q.Int64(), NumericScale: int8(target)}, nil
 }
 
 // numericCmp compares two numeric values, returning -1/0/+1.
