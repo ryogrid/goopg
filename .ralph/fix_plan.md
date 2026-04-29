@@ -2351,9 +2351,59 @@ item.
       TestPgoutputDecoderRoundTripDelete (empty K body),
       TestPgoutputDecoderRejectsTruncated. With this slice
       the encoder/decoder symmetry is complete and the apply
-      worker has its byte-stream reader. Next M0008 loop:
-      ApplyWorker.Run skeleton + per-event apply, then TCP
-      transport + tablesync state machine.)
+      worker has its byte-stream reader.)
+
+- [x] ApplyWorker per-event apply path (continues 0008-0004).
+      (landed 2026-04-29: `internal/executor/applyworker.go`
+      delivers `ApplyWorker{cat, pool, txnMgr, relations,
+      currentTx, inXact}` plus `ApplyMessage(m
+      *wal.DecodedMessage) (uint64, error)`:
+        - B opens a local txn via
+          `txnMgr.Begin(ReadCommitted)`; a stray B inside an
+          open xact triggers a defensive rollback before
+          opening the new one.
+        - R caches the remote `DecodedRelation` keyed by
+          remote OID and resolves the local
+          `*catalog.Table` via `LookupTable({Schema, Name})`.
+        - I parses each pgoutput text-format column to a
+          Datum (int4 / int8 / bool through
+          `parsePgoutputText`; everything else falls back to
+          KindString) and writes the row through the same
+          `writeHeapRow` helper INSERT uses — so apply lands
+          in the same heap-tuple frame and triggers the same
+          WAL change records.
+        - D no-ops in v0: pgoutput emits an empty K body so
+          the row to stamp xmax on isn't identifiable.
+          Tracked as a wire-format extension follow-up.
+        - C commits the local txn and returns the remote
+          commit_lsn so the caller can advance
+          confirmed_flush_lsn. A C with no preceding B is
+          tolerated as a no-op (catalog-only
+          filter-everything xact).
+      `SafeRollback()` is the deferrable cleanup that
+      prevents open-xid leaks when the streaming driver
+      bails. Tests:
+      TestApplyWorkerInsertsRowFromPgoutputStream pins the
+      end-to-end encoder→decoder→apply path: a publisher's
+      `B → R → I → C` for a 2-column int4+text row results
+      in the subscriber's local `items` table containing
+      exactly one row with id=7, label="alpha" (verified via
+      SeqScan). TestApplyWorkerCommitOutsideXactIsNoop and
+      TestApplyWorkerInsertWithoutRelationFails pin the
+      protocol guards. With this slice the apply path works
+      end-to-end against in-process byte streams; TCP
+      transport, slot-start handshake, and tablesync state
+      machine remain the next M0008 work.)
+
+- [ ] TCP transport for the pgoutput stream + slot-start
+      handshake: subscriber-side dial, START_REPLICATION SLOT
+      ... LOGICAL command, libpq CopyData unwrap, advance the
+      slot's confirmed_flush_lsn after each ApplyMessage commit.
+
+- [ ] Tablesync state machine + initial table sync: subscriber
+      worker that COPYs each new table's current contents
+      before joining streaming apply; `pg_subscription_rel`
+      state column transitions through i / d / s / r.
 
 - [ ] Logical-replication observability: `pg_stat_subscription`,
       logical-replication rows in `pg_stat_replication`, structured
