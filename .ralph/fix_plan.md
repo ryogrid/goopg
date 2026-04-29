@@ -2436,13 +2436,65 @@ item.
       through `'w'` frames in place of WAL bytes) is the next
       M0008 piece.)
 
-- [ ] Publisher-side walsender support for logical slots:
-      when `START_REPLICATION SLOT name LOGICAL ...` is
-      received, run a `wal.SlotDecoder` driving a
-      `wal.PgOutput` writer that wraps each emitted message
-      in a `'w'` CopyData payload and ships it to the
-      subscriber. Wire `confirmed_flush_lsn` advances from
-      the standby-status frames the subscriber sends back.
+- [x] Publisher-side walsender support for logical slots
+      (continues 0008-0004).
+      (landed 2026-04-29:
+      `internal/server/replication.go::parseStartReplicationArgs`
+      grew Mode + Options fields and now handles
+      `START_REPLICATION SLOT name LOGICAL X/X ("key" 'value'
+      [, ...])`. Mode={PHYSICAL,LOGICAL}; LOGICAL requires SLOT.
+      Option-block parser splits libpq's quoted-pair syntax
+      respecting single-quote-quoted commas via
+      `splitStartReplicationOptionList`. Empty Options and
+      missing keyword still default to PHYSICAL so existing
+      callers don't break. `replyStartReplication` dispatches
+      LOGICAL into the new
+      `internal/server/logicalwalsender.go::runLogicalWalsender`,
+      which:
+        - Snapshots the catalog at session start via
+          `wal.BuildCatalogSnapshot` so pgoutput resolves
+          relations against a stable shape.
+        - Wraps the FrameWriter in
+          `walsenderPgoutputAdapter`, an `io.Writer` that
+          turns each pgoutput message (one Write call per
+          Begin/Commit/Change) into one `'w'` CopyData
+          frame with monotonic startLSN / endLSN — exactly
+          the shape the subscriber's LogicalReceiver
+          consumes.
+        - Builds a `wal.PgOutput` against the snapshot +
+          adapter, then drives it through
+          `wal.NewSlotDecoderWithSnapshot` so the slot's
+          `ConfirmedFlushLSN` advances on every commit.
+        - Spawns a receive-side goroutine that consumes
+          standby-status CopyData frames from the standby
+          (mirrors the PHYSICAL path) so the subscriber's
+          ack also drives retention.
+        - Cleanly returns on ctx cancel / CopyDone /
+          Terminate / wal.ErrClosed; other errors flow
+          through `writeStreamingError`.
+      New tests:
+      TestParseStartReplicationArgsLogical (full
+      command + option block round-trip);
+      TestParseStartReplicationArgsLogicalRequiresSlot
+      (LOGICAL without SLOT rejected);
+      TestParseStartReplicationArgsPhysicalStillWorks
+      (existing PHYSICAL grammar still parses);
+      TestWalsenderPgoutputAdapterWrapsAsCopyData (each
+      Write becomes one `'w'` CopyData frame with monotonic
+      LSNs that round-trip through DecodeReplicationMessage).
+      With this slice the publisher and subscriber both speak
+      the LOGICAL wire shape end-to-end. The remaining gap is
+      that the publisher-side walsender's pgoutput stream
+      currently emits whatever the slot decoder sees — there's
+      no publication-membership filter yet (FOR TABLE t1, t2
+      doesn't restrict the wire). Hooking the publication-
+      filter into the pgoutput writer is a small follow-up.)
+
+- [ ] Publication-membership filter on the publisher's
+      logical walsender: only emit changes for relations
+      named by the slot's subscribed publications. Today
+      every change for every relation in the catalog
+      snapshot is shipped.
 
 - [ ] Tablesync state machine + initial table sync: subscriber
       worker that COPYs each new table's current contents

@@ -231,6 +231,14 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		return err
 	}
 
+	// LOGICAL mode runs a separate path that drives the M0008
+	// pipeline (`wal.SlotDecoder` + `wal.PgOutput`) and ships
+	// pgoutput messages through `'w'` CopyData frames. See
+	// docs/design/0008-0004-apply-worker-and-tablesync.md.
+	if args.Mode == "LOGICAL" {
+		return s.runLogicalWalsender(ctx, r, w, args)
+	}
+
 	walDir := s.cfg.WALDirPath
 	if walDir == "" {
 		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
@@ -431,15 +439,42 @@ type startReplicationArgs struct {
 	SlotName string
 	StartLSN uint64
 	Timeline int
+	// Mode is "PHYSICAL" or "LOGICAL". Empty defaults to
+	// "PHYSICAL" — older clients omit the keyword and assume
+	// physical mode.
+	Mode string
+	// Options carries the parsed `(key 'value' [, ...])` block
+	// after the LSN in LOGICAL mode. Keys are lower-cased.
+	// pgoutput consumes `proto_version` and `publication_names`.
+	Options map[string]string
 }
 
-// parseStartReplicationArgs handles the two-shape grammar:
+// parseStartReplicationArgs handles upstream's grammar:
 //
 //	START_REPLICATION [SLOT name] PHYSICAL X/X [TIMELINE n]
+//	START_REPLICATION SLOT name LOGICAL X/X [( "key" 'value' [, ...] )]
 //
-// Tokens are case-insensitive for keywords. The LSN is upstream's
-// `X/X` hex pair.
+// Tokens are case-insensitive for keywords. LSNs are upstream's
+// `X/X` hex pair. The LOGICAL option block follows libpq's
+// quoted-pair shape verbatim.
 func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
+	// Strip a trailing semicolon if present (libpq sends none,
+	// but psql copy/paste adds one).
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimRight(raw, ";")
+
+	// Split off the optional `(...)` option block first so the
+	// keyword/LSN fields-scan stays simple.
+	var optionsRaw string
+	if i := strings.Index(raw, "("); i >= 0 {
+		j := strings.LastIndex(raw, ")")
+		if j <= i {
+			return startReplicationArgs{}, errors.New("START_REPLICATION: unmatched '(' in options")
+		}
+		optionsRaw = raw[i+1 : j]
+		raw = strings.TrimSpace(raw[:i])
+	}
+
 	tokens := strings.Fields(raw)
 	if len(tokens) == 0 || !strings.EqualFold(tokens[0], "START_REPLICATION") {
 		return startReplicationArgs{}, errors.New("START_REPLICATION: unexpected verb")
@@ -450,8 +485,19 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 		out.SlotName = unquoteIdent(tokens[1])
 		tokens = tokens[2:]
 	}
-	if len(tokens) == 0 || !strings.EqualFold(tokens[0], "PHYSICAL") {
-		return startReplicationArgs{}, errors.New("START_REPLICATION: only PHYSICAL is supported in v0")
+	if len(tokens) == 0 {
+		return startReplicationArgs{}, errors.New("START_REPLICATION: missing PHYSICAL/LOGICAL keyword")
+	}
+	switch {
+	case strings.EqualFold(tokens[0], "PHYSICAL"):
+		out.Mode = "PHYSICAL"
+	case strings.EqualFold(tokens[0], "LOGICAL"):
+		out.Mode = "LOGICAL"
+		if out.SlotName == "" {
+			return startReplicationArgs{}, errors.New("START_REPLICATION LOGICAL requires SLOT name")
+		}
+	default:
+		return startReplicationArgs{}, fmt.Errorf("START_REPLICATION: unknown mode %q", tokens[0])
 	}
 	tokens = tokens[1:]
 	if len(tokens) == 0 {
@@ -470,7 +516,62 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 		}
 		out.Timeline = tl
 	}
+	if optionsRaw != "" {
+		opts, err := parseStartReplicationOptions(optionsRaw)
+		if err != nil {
+			return startReplicationArgs{}, err
+		}
+		out.Options = opts
+	}
 	return out, nil
+}
+
+// parseStartReplicationOptions parses libpq's pgoutput-style
+// option block: `"key" 'value' [, "key" 'value' ...]`. Keys
+// are lower-cased; values are unquoted single-quoted strings.
+func parseStartReplicationOptions(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	parts := splitStartReplicationOptionList(raw)
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// "key" 'value' — find the value as the part after the
+		// last whitespace, since key may be quoted with embedded
+		// underscores.
+		spaceIdx := strings.LastIndexAny(p, " \t")
+		if spaceIdx <= 0 {
+			return nil, fmt.Errorf("START_REPLICATION: malformed option %q", p)
+		}
+		key := strings.TrimSpace(p[:spaceIdx])
+		val := strings.TrimSpace(p[spaceIdx+1:])
+		key = strings.Trim(key, "\"")
+		val = strings.Trim(val, "'")
+		out[strings.ToLower(key)] = val
+	}
+	return out, nil
+}
+
+// splitStartReplicationOptionList splits on commas that are not
+// inside single-quoted strings.
+func splitStartReplicationOptionList(raw string) []string {
+	var out []string
+	inQuote := false
+	start := 0
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '\'':
+			inQuote = !inQuote
+		case ',':
+			if !inQuote {
+				out = append(out, raw[start:i])
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, raw[start:])
+	return out
 }
 
 // parseLSN parses upstream's `X/X` hex notation back into a uint64.
