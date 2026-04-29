@@ -69,15 +69,46 @@ type AnalyzeStmt struct {
 func (s *AnalyzeStmt) Pos() int  { return s.pos }
 func (s *AnalyzeStmt) stmtNode() {}
 
-// ExplainStmt — `EXPLAIN <stmt>`. v0 ignores the optional
-// upstream option list (`( ANALYZE, VERBOSE, COSTS, … )`) —
-// adding parsing for those is one of the deferred items in
-// docs/design/0003-0007-explain.md. The result of executing an
-// ExplainStmt is a single-column QUERY PLAN text result-set
-// rendering the inner statement's plan tree.
+// ExplainFormat selects the rendering format for ExplainStmt
+// output. M0018-0001 introduces the AST shape; the renderer
+// honours TEXT today and JSON in 0018-0002 / 0018-0004.
+type ExplainFormat int
+
+const (
+	ExplainFormatText ExplainFormat = iota
+	ExplainFormatJSON
+)
+
+// ExplainOptions carries the parsed EXPLAIN options (M0018-0001).
+// All flags default to their PG-zero-value form so a bare
+// `EXPLAIN <stmt>` (no keyword form, no parenthesised list)
+// produces an ExplainOptions struct that's byte-for-byte
+// equivalent to the pre-M0018 zero-value behaviour.
+type ExplainOptions struct {
+	Analyze  bool
+	Verbose  bool
+	Costs    bool
+	Buffers  bool
+	Settings bool
+	Timing   bool
+	Summary  bool
+	Format   ExplainFormat
+}
+
+// ExplainStmt — `EXPLAIN [ANALYZE] [VERBOSE] <stmt>` or
+// `EXPLAIN (option [VALUE], ...) <stmt>`. Both surface forms
+// produce the same AST shape. The Options field carries the
+// parsed flags; v0 renderer (`internal/executor/operators_explain.go`)
+// consumes Format today and the rest land alongside their
+// renderer / instrumentation slices.
+//
+// Pre-M0018 `EXPLAIN <stmt>` callers see Options == zero-value
+// (no flags, Format=Text) which is byte-for-byte the
+// pre-existing behaviour.
 type ExplainStmt struct {
-	pos   int
-	Inner Stmt
+	pos     int
+	Options ExplainOptions
+	Inner   Stmt
 }
 
 func (s *ExplainStmt) Pos() int  { return s.pos }

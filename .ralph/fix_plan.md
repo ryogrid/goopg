@@ -2313,6 +2313,90 @@ out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
       makes per-CTE counters less informative than per-
       statement counters.)
 
+## Milestone 0017 — UPSERT (INSERT ... ON CONFLICT DO UPDATE)
+
+See `docs/milestones/0017-upsert-on-conflict-do-update.md` for the
+full DoD. Substantial milestone — parser + planner + executor +
+concurrent-write semantics. Decompose when picked up.
+
+- [ ] UPSERT Stage A: parser + analyzer + planner + executor for
+      `INSERT ... ON CONFLICT (cols) DO UPDATE SET ...`. Decompose
+      into seam-sized slices when picked up.
+- [ ] UPSERT Stage B: `ON CONFLICT ON CONSTRAINT name`,
+      `excluded.col` references in DO UPDATE.
+
+## Milestone 0018 — EXPLAIN / EXPLAIN ANALYZE
+
+See `docs/milestones/0018-explain-and-explain-analyze.md` for the
+full DoD. Decomposed into the four design-doc seams the milestone
+calls out.
+
+- [x] EXPLAIN parser options + AST (M0018-0001 step 1). Design
+      doc `docs/design/0018-0001-explain-parser-options-and-ast.md`.
+      (landed 2026-04-29: parser-only additive slice mirroring
+      the recent step-1 pattern. New `ExplainOptions` struct
+      (Analyze / Verbose / Costs / Buffers / Settings / Timing
+      / Summary bools + Format enum). New `ExplainFormat` enum
+      (Text / JSON). `ExplainStmt` grew an `Options` field —
+      zero value preserves byte-for-byte invariance for the
+      pre-M0018 bare-EXPLAIN form. New `parseExplainOptionList`
+      handles `EXPLAIN (option [VALUE], ...) <stmt>`; the
+      keyword form `EXPLAIN [ANALYZE] [VERBOSE]` continues to
+      work in either order. Per-option dispatch validates the
+      name set; FORMAT TEXT|JSON is recognised, all other
+      options take an optional bool with `defGetBoolean`-style
+      forms (ON/OFF/TRUE/FALSE/1/0). Unknown options error
+      with byte-position diagnostics; FORMAT XML/YAML rejects
+      with "unsupported FORMAT". Tests: 13 parser tests
+      cover bare-form regression guard, both keyword forms in
+      either order, parenthesised default-true behaviour, all
+      bool flags via the parenthesised form, FORMAT JSON +
+      TEXT, unknown-option rejection, empty-list rejection,
+      bad-FORMAT rejection, all six bool value forms
+      (ON/OFF/TRUE/FALSE/1/0), and a mixed-options test.
+      Full `go test ./...` green. Static plan rendering
+      (FORMAT JSON output, VERBOSE), runtime instrumentation
+      for ANALYZE, and JSON snapshot regression strategy
+      land in 0018-0002 / 0018-0003 / 0018-0004.)
+
+- [ ] Static plan rendering (M0018-0002): VERBOSE output
+      (relation-qualified columns, per-key sort orderings),
+      FORMAT JSON renderer, deterministic node-attribute
+      shapes for regression. Continues
+      `docs/design/0018-0002-static-plan-rendering-and-output-contract.md`.
+
+- [ ] EXPLAIN ANALYZE instrumentation (M0018-0003): per-node
+      timing wrapper, rows/loops counters, TIMING OFF
+      suppression, summary block. Continues
+      `docs/design/0018-0003-explain-analyze-instrumentation.md`.
+
+- [ ] EXPLAIN JSON snapshot strategy (M0018-0004): stable
+      schema, regression-test fixture format, BUFFERS counter
+      surface integration. Continues
+      `docs/design/0018-0004-json-format-and-regression-strategy.md`.
+
+## Milestone 0019 — Autovacuum
+
+See `docs/milestones/0019-autovacuum-support.md`. Substantial.
+Decompose when picked up.
+
+- [ ] Autovacuum launcher + worker architecture; trigger
+      policy; observability.
+
+## Milestone 0020 — Window functions
+
+See `docs/milestones/0020-window-functions-over-row-number-rank-lag-lead.md`.
+Substantial. Decompose when picked up.
+
+- [ ] Window-function parser + planner + executor.
+
+## Milestone 0021 — SELECT ... FOR UPDATE
+
+See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
+
+- [ ] Tuple-level pessimistic locking on top of M0012 lock
+      manager.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

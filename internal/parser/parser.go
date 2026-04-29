@@ -216,18 +216,199 @@ func (p *parser) parseStatementWithCTE() (Stmt, error) {
 	return nil, p.errAtCur("WITH clause must be followed by SELECT, INSERT, UPDATE, or DELETE")
 }
 
-// parseExplain: `EXPLAIN <stmt>`. v0 doesn't yet accept the
-// optional `( option [, …] )` list upstream uses for ANALYZE
-// / VERBOSE / FORMAT — the bare form is what every TPC-H
-// shape needs. Skipping a leading parenthesised list is left
-// to a follow-up loop.
+// parseExplain handles the three EXPLAIN surface forms upstream
+// supports:
+//
+//	EXPLAIN <stmt>
+//	EXPLAIN [ANALYZE] [VERBOSE] <stmt>
+//	EXPLAIN ( option [VALUE] [, ...] ) <stmt>
+//
+// The keyword form is parsed first when the token after EXPLAIN
+// matches ANALYZE/VERBOSE; the parenthesised form takes over when
+// the next token is `(`. Any other token routes straight to the
+// inner statement (preserving bare-EXPLAIN for byte-for-byte
+// pre-M0018 compatibility).
+//
+// See docs/design/0018-0001-explain-parser-options-and-ast.md.
 func (p *parser) parseExplain() (Stmt, error) {
 	t := p.advance() // EXPLAIN
+	var opts ExplainOptions
+
+	// Parenthesised option list (`EXPLAIN (option [, ...]) <stmt>`).
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		if err := p.parseExplainOptionList(&opts); err != nil {
+			return nil, err
+		}
+	} else {
+		// Keyword form: ANALYZE and VERBOSE may appear in either
+		// order, matching upstream's `opt_analyze`/`opt_verbose`.
+		for {
+			if p.acceptKeyword(KwAnalyze) {
+				opts.Analyze = true
+				continue
+			}
+			if p.acceptKeyword(KwVerbose) {
+				opts.Verbose = true
+				continue
+			}
+			break
+		}
+	}
+
 	inner, err := p.parseStatement()
 	if err != nil {
 		return nil, err
 	}
-	return &ExplainStmt{pos: t.Pos, Inner: inner}, nil
+	return &ExplainStmt{pos: t.Pos, Options: opts, Inner: inner}, nil
+}
+
+// parseExplainOptionList parses the parenthesised option list:
+//
+//	"(" name [VALUE] ("," name [VALUE])* ")"
+//
+// On entry the cursor sits on the opening `(`. On success the
+// cursor sits past the closing `)`. Errors carry the precise
+// byte position where the offending token sits.
+func (p *parser) parseExplainOptionList(opts *ExplainOptions) error {
+	if !p.acceptSymbol("(") {
+		return p.errAtCur("expected '(' after EXPLAIN")
+	}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+		// Empty list — `EXPLAIN () SELECT ...` is a syntax error
+		// in upstream too.
+		return &SyntaxError{Pos: p.cur().Pos, Message: "EXPLAIN option list is empty"}
+	}
+	for {
+		if err := p.parseExplainOneOption(opts); err != nil {
+			return err
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return p.errAtCur("expected ')' to close EXPLAIN option list")
+	}
+	return nil
+}
+
+// parseExplainOneOption parses one option entry. The name is
+// matched case-insensitively against the supported set; FORMAT
+// takes a TEXT|JSON value, all others take an optional bool.
+func (p *parser) parseExplainOneOption(opts *ExplainOptions) error {
+	tok := p.cur()
+	if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+		return p.errAtCur("expected EXPLAIN option name")
+	}
+	name := strings.ToLower(tok.Value)
+	if tok.Kind == TokenKeyword {
+		// Keyword tokens carry the lowercased form in tok.Value
+		// already; this branch lets ANALYZE / VERBOSE be used
+		// inside the parenthesised list too (upstream allows it).
+	}
+	pos := tok.Pos
+	p.advance()
+
+	if name == "format" {
+		// FORMAT requires a value: TEXT or JSON.
+		valTok := p.cur()
+		if valTok.Kind != TokenIdent && valTok.Kind != TokenKeyword && valTok.Kind != TokenStringLit && valTok.Kind != TokenQuotedIdent {
+			return &SyntaxError{Pos: valTok.Pos, Message: "FORMAT requires a value (TEXT or JSON)"}
+		}
+		v := strings.ToLower(valTok.Value)
+		p.advance()
+		switch v {
+		case "text":
+			opts.Format = ExplainFormatText
+		case "json":
+			opts.Format = ExplainFormatJSON
+		default:
+			return &SyntaxError{Pos: valTok.Pos, Message: fmt.Sprintf("unsupported FORMAT %q (TEXT or JSON only)", valTok.Value)}
+		}
+		return nil
+	}
+
+	// All other options are bool. Read the optional value.
+	val := true
+	if v, present, err := p.tryReadBoolOptionValue(); err != nil {
+		return err
+	} else if present {
+		val = v
+	}
+
+	switch name {
+	case "analyze":
+		opts.Analyze = val
+	case "verbose":
+		opts.Verbose = val
+	case "costs":
+		opts.Costs = val
+	case "buffers":
+		opts.Buffers = val
+	case "settings":
+		opts.Settings = val
+	case "timing":
+		opts.Timing = val
+	case "summary":
+		opts.Summary = val
+	default:
+		return &SyntaxError{Pos: pos, Message: fmt.Sprintf("unknown EXPLAIN option %q", tok.Value)}
+	}
+	return nil
+}
+
+// tryReadBoolOptionValue reads an optional bool value following an
+// EXPLAIN option name. Returns (val, true, nil) when a value was
+// consumed, (false, false, nil) when the next token isn't a bool
+// value (caller's responsibility to default to true), and a
+// non-nil error when the next token looks like a value but isn't
+// a recognised bool form.
+func (p *parser) tryReadBoolOptionValue() (val bool, present bool, err error) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenKeyword:
+		if t.Keyword == KwTrue {
+			p.advance()
+			return true, true, nil
+		}
+		if t.Keyword == KwFalse {
+			p.advance()
+			return false, true, nil
+		}
+		// `on` is a keyword in the lexer (KwOn — used by ON
+		// DELETE etc.). For EXPLAIN's bool-option-value position
+		// it stands in as `true` to match upstream's
+		// defGetBoolean. `off` is just an identifier (no
+		// collision with any keyword) and is handled in the
+		// TokenIdent branch below.
+		if t.Keyword == KwOn {
+			p.advance()
+			return true, true, nil
+		}
+		return false, false, nil
+	case TokenIdent:
+		switch strings.ToLower(t.Value) {
+		case "on":
+			p.advance()
+			return true, true, nil
+		case "off":
+			p.advance()
+			return false, true, nil
+		}
+		return false, false, nil
+	case TokenIntLit:
+		// Upstream accepts 1/0 as ON/OFF.
+		switch t.Value {
+		case "0":
+			p.advance()
+			return false, true, nil
+		case "1":
+			p.advance()
+			return true, true, nil
+		}
+		return false, false, nil
+	}
+	return false, false, nil
 }
 
 // parseCheckpoint: CHECKPOINT
