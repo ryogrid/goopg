@@ -47,3 +47,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0010 | WAL direct I/O writes & in-memory walsender handoff             | planned  | `0010-wal-direct-io-and-walsender-memory-handoff.md` |
 | 0011 | B-tree NUMERIC key support                                       | planned  | `0011-btree-numeric-key-support.md`               |
 | 0012 | Lock manager foundation & PostgreSQL-style deadlock detection   | planned  | `0012-lock-manager-and-deadlock-detection.md`     |
+| 0013 | WAL buffers optimization with eviction-safe WAL-before-data durability | planned  | `0013-wal-buffers-optimization-with-eviction-safe-wal-before-data-durability.md` |
