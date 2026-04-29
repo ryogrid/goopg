@@ -2233,6 +2233,38 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 2 — pg_proc catalog registry + virtual
+        view. Design doc
+        `docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md`.
+        (landed 2026-04-30: catalog-only slice. New
+        `internal/catalog/routines.go` with `Routine` struct
+        (OID, Schema, Name, ArgNames, ArgTypes, ReturnType,
+        Language, Body) and the RWMutex-guarded `Routines`
+        registry: `Create(orReplace)`, `Drop`, `DropByName`,
+        `Lookup`, `LookupByName`, `List`. Signature key
+        lower-cased `(arg1_type,...)`; OID space starts at
+        `FirstRoutineOID = 1<<17` so routine OIDs never collide
+        with the table-OID space. `CREATE OR REPLACE` preserves
+        the existing OID matching upstream's contract. Schema
+        defaulting to `public` mirrors upstream's
+        search_path[0]. Typed errors `ErrRoutineExists` /
+        `ErrRoutineNotFound` / `ErrRoutineAmbiguous` so the
+        future analyzer branches cleanly to SQLSTATE 42723 /
+        42883 / 42725. `*InMemory` grows a `routines` field
+        plus the `(*InMemory).Routines() *Routines` accessor.
+        New `internal/initdb/pg_proc_view.go` registers
+        `pg_catalog.pg_proc` virtual view backed by
+        `cat.Routines().List()` — columns mirror upstream's
+        `\df` shape (oid, proname, pronamespace, prolang,
+        prorettype, proargtypes comma-joined, prosrc). Wired
+        into `Open` after `pg_stat_wal_io`. 8 registry tests
+        + 3 view tests. Out of scope (Stage A step 3+):
+        analyzer wiring (still rejects 0A000), executor
+        CreateFunction / DropFunction operators, persistence
+        of pg_proc rows across restart, PL/pgSQL body parser,
+        interpreter, function-invocation resolver, numerical
+        type-OID columns. Full `go test ./...` green.)
+
   - [x] Stage A step 1 — parser + AST surface for CREATE/DROP
         FUNCTION + lexer dollar-quote support + analyzer reject.
         Design doc

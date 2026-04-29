@@ -173,6 +173,11 @@ type InMemory struct {
 	byTable map[uint32]map[string]*Index
 	nextOID uint32
 	dbOid   uint32
+	// routines holds user-defined routines (M0015 Stage A step 2).
+	// Separate registry — not part of the table/index map space —
+	// so existing CRUD on those types stays untouched. Accessed
+	// via `(*InMemory).Routines()`.
+	routines *Routines
 }
 
 // FirstUserOID is the first OID handed out for user-created tables.
@@ -189,15 +194,22 @@ const DefaultDBOid uint32 = 1
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:  make(map[string]*Table),
-		indexes: make(map[string]*Index),
-		byTable: make(map[uint32]map[string]*Index),
-		nextOID: FirstUserOID,
-		dbOid:   DefaultDBOid,
+		tables:   make(map[string]*Table),
+		indexes:  make(map[string]*Index),
+		byTable:  make(map[uint32]map[string]*Index),
+		nextOID:  FirstUserOID,
+		dbOid:    DefaultDBOid,
+		routines: NewRoutines(),
 	}
 	c.registerSystemTables()
 	return c
 }
+
+// Routines returns the user-defined routine registry. Stage A
+// step 2: catalog-side bookkeeping for CREATE FUNCTION / DROP
+// FUNCTION; the analyzer / executor wiring lands in subsequent
+// slices. Pointer is stable for the catalog's lifetime.
+func (c *InMemory) Routines() *Routines { return c.routines }
 
 // registerSystemTables installs the minimal pg_catalog v0 needs:
 // pg_class with one row per user table. The OID column is text-typed

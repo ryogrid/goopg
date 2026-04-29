@@ -452,6 +452,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// pg_proc: M0015 Stage A step 2 — user-defined routine
+	// introspection. Empty until CREATE FUNCTION execution lands
+	// in a later slice; registering here makes the view present
+	// from the first session so `\df` doesn't surface a
+	// missing-table error in the meantime.
+	if err := registerPgProcView(cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 	// Publication / subscription registry + their five virtual
 	// catalog views (pg_publication, pg_publication_rel,
 	// pg_publication_tables, pg_subscription, pg_subscription_rel).
