@@ -2178,13 +2178,52 @@ out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
       Analyzer name resolution + planner / executor
       integration land in M0016-0001 step 2 / M0016-0002.)
 
-- [ ] WITH analyzer: name resolution, scope rules,
-      shadowing handling (M0016-0001 step 2). Continues
+- [x] WITH analyzer: name resolution, scope rules,
+      shadowing handling (M0016-0001 step 2). Design doc
       `docs/design/0016-0001-with-parser-ast-and-name-resolution.md`.
-      Implement CTE scope (left-to-right visibility,
-      outer-query visibility, base-relation shadowing),
-      validate column-alias arity, plumb CTE references
-      through the analyzer's name-resolution code.
+      (landed 2026-04-29: `scope` grew a `ctes
+      map[string]*catalog.Table` field — populated by new
+      `analyzeWith(with, ctx)` which walks each CTE in
+      declaration order, recursively analyzes its inner
+      SELECT under ctx (so a later CTE can reference an
+      earlier sibling — left-to-right visibility), builds a
+      synthetic catalog.Table mirroring
+      `synthesizeSubqueryTable`'s naming chain, applies the
+      optional `(col, ...)` alias list with arity validation
+      (42P10 on mismatch), rejects duplicate CTE names within
+      one WITH list (42710), and rejects WITH RECURSIVE
+      (0A000 — Stage A only). New `resolveTable(ctx, rv)`
+      helper walks the scope chain head-first looking for a
+      matching CTE name (so an inner WITH shadows an outer
+      one) before falling through to the catalog. Schema-
+      qualified names bypass CTE lookup. New
+      `buildSelectScopeIn(s, ctx)` is the scope-aware variant
+      used inside CTE bodies. `analyzeSelectWithParent` calls
+      `analyzeWith` early then routes FROM-clause resolution
+      through `buildSelectScopeIn` so CTE references resolve.
+      `analyzeInsert` / `analyzeUpdate` / `analyzeDelete`
+      each gained an early `analyzeWith` call so type errors
+      inside CTE bodies surface even though Stage A's
+      planner / executor doesn't yet consume the CTEs. The
+      analyzer Insert keeps using `lookupTable` for its
+      target relation (CTE shadowing of `INSERT INTO t`
+      target is intentionally NOT supported; matches PG
+      behaviour). Tests:
+      TestAnalyzeWithCTEResolvesInFROM,
+      TestAnalyzeWithCTELeftToRightVisibility,
+      TestAnalyzeWithCTERejectsForwardReference (pins the
+      right-to-left scope rule), TestAnalyzeWithRecursive
+      Rejected (0A000), TestAnalyzeWithDuplicateCTEName
+      (42710), TestAnalyzeWithColumnAliasArityMismatch
+      (42P10), TestAnalyzeWithColumnAliasesRenameColumns
+      (alias list overrides inner names; original names no
+      longer resolve), TestAnalyzeWithCTEShadowsBaseRelation
+      (CTE name shadows the catalog table; columns the CTE
+      doesn't expose return 42703), TestAnalyzeWithoutCTE
+      Unchanged (regression guard for byte-for-byte
+      invariance), TestAnalyzeWithCTEErrorsBubbleUp.
+      Full `go test ./...` green. Planner / executor for
+      non-recursive CTEs lands in M0016-0002.)
 
 - [ ] Non-recursive CTE planner + executor (M0016-0002).
       Materialise CTE producers once; feed multiple

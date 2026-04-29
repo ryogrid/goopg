@@ -1,6 +1,6 @@
 # 0016-0001 — WITH Parser, AST, and Name Resolution (Step 1: Parser & AST)
 
-**Status:** accepted (parser/AST step)
+**Status:** accepted (parser/AST step + analyzer step)
 **Milestone:** [0016 — WITH Clause (CTE) Support](../milestones/0016-with-clause-cte-support.md)
 **Spans seam:** parser AST nodes, grammar entry-point, byte-position
 diagnostics for malformed CTE syntax.
@@ -105,10 +105,54 @@ func (p *parser) parseSelectWithCTE(with *WithClause) (Stmt, error)
 - Trailing CTE separator (`WITH foo AS (SELECT 1), SELECT ...`) → `"expected CTE name after ,"` at the SELECT keyword.
 - `WITH RECURSIVE` is accepted at the parser level — analyzer rejects unsupported recursive shapes in Stage B prep work; for Stage A, the `Recursive` flag flows through but reading it at planner / executor time produces the SQLSTATE 0A000 error pinned by the milestone's gate-B fail-fast contract.
 
-## Out of scope (this step)
+## Step 2 — Analyzer name resolution
 
-- Analyzer name resolution (CTE scope rules, alias arity validation,
-  shadowing diagnostics) — 0016-0001 step 2.
+Lands alongside step 1 with the following extensions:
+
+### `scope.ctes`
+
+The analyzer's `scope` struct grows a `ctes map[string]*catalog.Table`
+field. Each CTE definition in a `WITH` clause is analyzed bottom-up:
+
+1. The CTE's `Query` is recursively analyzed under the surrounding
+   scope (so a later CTE in the same WITH list can reference an
+   earlier one — left-to-right visibility).
+2. A synthetic `*catalog.Table` is built from the inner SELECT's
+   target list, mirroring `synthesizeSubqueryTable`'s naming
+   conventions (explicit alias → derived name → `?column?N`).
+3. If the CTE declared a column-alias list (`WITH a(x, y) AS (...)`),
+   the alias arity must match the inner SELECT's target count and
+   the synthetic table's column names use the aliases instead of
+   the inner derivations.
+4. The synthetic table is registered in `scope.ctes[name]`. Duplicate
+   names within the same WITH list error with SQLSTATE `42710`
+   (`duplicate_alias`).
+
+### Scope-aware table resolution
+
+`lookupTable(cat, rv)` becomes `resolveTable(rv, ctx)` for FROM-
+clause references: walks the scope chain checking `ctes` first,
+falls through to the catalog. Target relations
+(`INSERT INTO`, `UPDATE`, `DELETE FROM`) keep using the catalog-
+only `lookupTable` — `INSERT INTO cte_name` would be a Stage A
+out-of-scope construct, and silently allowing it would be wrong.
+
+### RECURSIVE rejection (Stage A)
+
+`analyzeWith` rejects `WithClause.Recursive == true` with SQLSTATE
+`0A000` ("WITH RECURSIVE is not supported in v0 (Stage A)") so the
+parser-accepted RECURSIVE flag fails fast at the analyzer. Stage B
+flips this to actual recursive analysis.
+
+### Wiring
+
+`analyzeSelect` / `analyzeInsert` / `analyzeUpdate` / `analyzeDelete`
+each check for `s.With != nil`, build a CTE-bearing scope via
+`analyzeWith`, and pass it down. Pre-M0016 statements (With==nil)
+take the existing path byte-for-byte unchanged.
+
+## Out of scope
+
 - Planner / executor for non-recursive CTEs — 0016-0002.
 - Recursive execution semantics — 0016-0003.
 - Observability hooks in EXPLAIN — 0016-0004.

@@ -67,6 +67,15 @@ type scope struct {
 	// into analyzeSelectWithParent without re-piping cat as a
 	// separate parameter through every helper.
 	cat catalog.Catalog
+	// ctes maps CTE name → synthetic *catalog.Table built from
+	// the inner SELECT's target list. Populated by analyzeWith
+	// when a statement carries a WITH clause; consulted by
+	// resolveTable before falling through to the catalog. The
+	// scope chain is walked head-first so an inner WITH shadows
+	// an outer-scope CTE of the same name (mirrors PostgreSQL).
+	// nil for pre-M0016 callers — every existing test path goes
+	// straight through to lookupTable. See M0016-0001.
+	ctes map[string]*catalog.Table
 }
 
 type scopeRel struct {
@@ -157,8 +166,18 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 	}
 
 	ctx := &scope{parent: parent, cat: cat}
+	// CTE definitions are visible to the SELECT body's FROM
+	// clause and to subsequent CTEs in the same WITH list. Build
+	// the CTE map first so resolveTable can find them when
+	// buildSelectScope walks the From list. See
+	// docs/design/0016-0001-with-parser-ast-and-name-resolution.md.
+	if s.With != nil {
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	if len(s.From) > 0 {
-		rels, err := buildSelectScope(s, cat)
+		rels, err := buildSelectScopeIn(s, ctx)
 		if err != nil {
 			return err
 		}
@@ -225,6 +244,17 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 }
 
 func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
+	if s.With != nil {
+		// Stage A: validate the CTE definitions (so type errors
+		// inside the CTE bodies surface even though the INSERT
+		// VALUES path doesn't yet consume them). The planner /
+		// executor integration for WITH-prefixed INSERTs lands in
+		// 0016-0002.
+		ctx := &scope{cat: cat}
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	tbl, err := lookupTable(cat, s.Target)
 	if err != nil {
 		return err
@@ -265,7 +295,12 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 	if len(s.Returning) > 0 {
 		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
 	}
-	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}}
+	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	if s.With != nil {
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
 	}
@@ -293,7 +328,12 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 	if len(s.Returning) > 0 {
 		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
 	}
-	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}}
+	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	if s.With != nil {
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	return analyzeWhere(s.Where, ctx)
 }
 
@@ -642,6 +682,150 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 		return nil, analyzeError(rv.Pos(), "42P01", fmt.Sprintf("relation %q does not exist", rv.Name))
 	}
 	return tbl, nil
+}
+
+// resolveTable is the scope-aware variant of lookupTable used by
+// FROM-clause resolution. It walks the scope chain head-first
+// looking for a matching CTE name (so an inner WITH shadows an
+// outer one), and only falls through to the catalog when no CTE
+// matches. Schema-qualified names (`pg_catalog.foo`) bypass CTE
+// resolution since CTE names are unschemed in upstream.
+//
+// Used only by buildSelectScope. Target-relation paths (INSERT INTO
+// / UPDATE / DELETE FROM) keep using lookupTable directly so that
+// `INSERT INTO cte_name VALUES ...` continues to error on the
+// non-existent base relation rather than mistakenly aliasing the
+// CTE — Stage A scope explicitly forbids data-modifying CTE chains.
+func resolveTable(ctx *scope, rv parser.RangeVar) (*catalog.Table, error) {
+	if rv.Subquery == nil && rv.Schema == "" && rv.Name != "" {
+		for s := ctx; s != nil; s = s.parent {
+			if s.ctes == nil {
+				continue
+			}
+			if tbl, ok := s.ctes[strings.ToLower(rv.Name)]; ok {
+				// CTE found — clone with the alias from the FROM
+				// reference (or fall back to the CTE name) so the
+				// scopeRel carries the right alias for column
+				// qualification (`alias.col` lookups).
+				cp := *tbl
+				if rv.Alias == "" {
+					cp.Name = tbl.Name
+				}
+				return &cp, nil
+			}
+		}
+	}
+	return lookupTable(ctx.cat, rv)
+}
+
+// analyzeWith populates ctx.ctes from a WITH clause. Each CTE's
+// inner SELECT is recursively analyzed under ctx so a later CTE
+// in the same list can reference an earlier one (left-to-right
+// visibility, matching PostgreSQL). The synthetic *catalog.Table
+// for each CTE mirrors synthesizeSubqueryTable's column-naming
+// chain — explicit alias → derived name → `?column?N` — overridden
+// by the optional `(col, ...)` alias list when present.
+//
+// Stage A restrictions enforced here:
+//   - WITH RECURSIVE → SQLSTATE 0A000 (parser accepts the keyword,
+//     analyzer rejects until 0016-0003 lands).
+//   - Duplicate CTE name within the same WITH list → 42710.
+//   - Column-alias arity mismatch → 42P10 (invalid_column_reference).
+func analyzeWith(with *parser.WithClause, ctx *scope) error {
+	if with == nil {
+		return nil
+	}
+	if with.Recursive {
+		return analyzeError(with.Pos(), "0A000", "WITH RECURSIVE is not supported in v0 (Stage A)")
+	}
+	if ctx.ctes == nil {
+		ctx.ctes = make(map[string]*catalog.Table, len(with.CTEs))
+	}
+	for _, cte := range with.CTEs {
+		nameKey := strings.ToLower(cte.Name)
+		if _, exists := ctx.ctes[nameKey]; exists {
+			return analyzeError(cte.Pos(), "42710", fmt.Sprintf("duplicate CTE name %q", cte.Name))
+		}
+		// Recurse into the CTE's inner SELECT under the current
+		// scope so an earlier CTE in the same WITH list is
+		// visible to a later one. The inner SELECT can also have
+		// its own nested WITH (left-recursive call into
+		// analyzeSelectWithParent which calls analyzeWith again).
+		if err := analyzeSelectWithParent(cte.Query, ctx.cat, ctx); err != nil {
+			return err
+		}
+		// Build the synthetic catalog.Table mirroring
+		// synthesizeSubqueryTable.
+		innerCtx := &scope{cat: ctx.cat, parent: ctx}
+		if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
+			rels, err := buildSelectScopeIn(cte.Query, innerCtx)
+			if err != nil {
+				return err
+			}
+			innerCtx.rels = rels
+		}
+		innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
+		for i, tgt := range cte.Query.Targets {
+			name := tgt.Alias
+			if name == "" {
+				name = deriveAnalyzerTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", i+1)
+			}
+			typ, err := analyzeExpr(tgt.Expr, innerCtx)
+			if err != nil {
+				return err
+			}
+			innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
+		}
+		// Apply column-alias list if specified. Arity must match.
+		if len(cte.Columns) > 0 {
+			if len(cte.Columns) != len(innerCols) {
+				return analyzeError(cte.Pos(), "42P10",
+					fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
+			}
+			for i, alias := range cte.Columns {
+				innerCols[i].Name = alias
+			}
+		}
+		ctx.ctes[nameKey] = &catalog.Table{Name: cte.Name, Columns: innerCols}
+	}
+	return nil
+}
+
+// buildSelectScopeIn is the scope-aware variant of buildSelectScope
+// — used by analyzeWith when validating an inner CTE body's column
+// types. Resolves FROM-clause range-vars through the supplied
+// scope (so a CTE body can reference an earlier sibling CTE).
+func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
+	if len(s.FromExprs) == 0 {
+		rels := make([]scopeRel, 0, len(s.From))
+		for _, rv := range s.From {
+			tbl, err := resolveTable(ctx, rv)
+			if err != nil {
+				return nil, err
+			}
+			rels = append(rels, scopeRel{table: tbl, alias: rv.Alias})
+		}
+		return rels, nil
+	}
+	rels := make([]scopeRel, 0, len(s.From))
+	for _, item := range s.FromExprs {
+		tbl, err := resolveTable(ctx, item.Base)
+		if err != nil {
+			return nil, err
+		}
+		rels = append(rels, scopeRel{table: tbl, alias: item.Base.Alias})
+		for _, j := range item.Joins {
+			rt, err := resolveTable(ctx, j.Right)
+			if err != nil {
+				return nil, err
+			}
+			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias})
+		}
+	}
+	return rels, nil
 }
 
 // synthesizeSubqueryTable analyzes a derived table — the
