@@ -531,7 +531,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 	// CTE before falling through to the catalog. CTE names are
 	// unschemed in upstream so `pg_catalog.foo` always hits the
 	// catalog. Multiple consumers each get a fresh plan reference
-	// (Stage A inlining); materialise-once is M0016-0004.
+	// (Stage A inlining). The body is wrapped in a CTEScan so
+	// EXPLAIN can label the inlined subtree (M0016-0004).
 	if rv.Schema == "" {
 		if ce := lookupPlannedCTE(rv.Name); ce != nil {
 			alias := rv.Alias
@@ -539,7 +540,14 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 				alias = ce.name
 			}
 			b := rangeBinding{table: ce.table, alias: alias, offset: 0}
-			return ce.body, b, nil
+			scan := &CTEScan{
+				pos:    rv.Pos(),
+				Name:   ce.name,
+				Alias:  alias,
+				Child:  ce.body,
+				schema: ce.schema,
+			}
+			return scan, b, nil
 		}
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})

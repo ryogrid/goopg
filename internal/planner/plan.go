@@ -372,6 +372,27 @@ type Project struct {
 func (n *Project) Pos() int       { return n.pos }
 func (n *Project) Output() Schema { return n.schema }
 
+// CTEScan wraps a cloned CTE body so EXPLAIN can label the
+// inlined subtree with the CTE's name and alias. Stage A
+// inlining clones the body per consumer (M0016-0002); this node
+// sits between the consumer's FROM-clause reference and the
+// cloned plan, carrying enough metadata for operator-level
+// triage. The executor's Build switch unwraps it to Child — no
+// new operator type is needed; the wrap is purely a labeling
+// artifact.
+//
+// See docs/design/0016-0004-cte-observability-and-compat-tests.md.
+type CTEScan struct {
+	pos    int
+	Name   string // CTE name from the WITH list
+	Alias  string // alias used at this consumer site (defaults to Name)
+	Child  Node
+	schema Schema
+}
+
+func (n *CTEScan) Pos() int       { return n.pos }
+func (n *CTEScan) Output() Schema { return n.schema }
+
 // Sort — orders the child's rows by the given keys.
 type SortKey struct {
 	Expr Expr

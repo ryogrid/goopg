@@ -140,6 +140,15 @@ func describePlan(n planner.Node) string {
 		return fmt.Sprintf("Copy %s", p.Table.QualifiedName())
 	case *planner.Explain:
 		return "Explain"
+	case *planner.CTEScan:
+		// Mirrors upstream's "CTE Scan on <name>" label; the
+		// alias is rendered separately when distinct so output
+		// like `WITH a AS (SELECT 1) SELECT * FROM a x` shows
+		// `CTE Scan on a x`.
+		if p.Alias != "" && p.Alias != p.Name {
+			return fmt.Sprintf("CTE Scan on %s %s", p.Name, p.Alias)
+		}
+		return fmt.Sprintf("CTE Scan on %s", p.Name)
 	}
 	return fmt.Sprintf("%T", n)
 }
@@ -181,6 +190,8 @@ func planChildren(n planner.Node) []planner.Node {
 		return []planner.Node{p.Left, p.Right}
 	case *planner.Insert:
 		return []planner.Node{p.Source}
+	case *planner.CTEScan:
+		return []planner.Node{p.Child}
 	}
 	return nil
 }

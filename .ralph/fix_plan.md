@@ -2268,17 +2268,50 @@ out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
       and EXPLAIN labels for CTE producers land in
       M0016-0004.)
 
-- [ ] Recursive CTE fixpoint execution (M0016-0003).
-      Anchor + iterative recursive member; cycle-safe
-      termination; reject unsupported recursive constructs
-      with stable SQLSTATE. Continues
+- [ ] (BLOCKED) Recursive CTE fixpoint execution
+      (M0016-0003). Hard prereq: `UNION ALL` planner +
+      executor support, which goopg's planner currently
+      rejects with `0A000 set operations are not supported`.
+      Recursive CTEs are inherently `WITH RECURSIVE r AS
+      (anchor UNION [ALL] recursive_member) SELECT ...`
+      shaped, so this slice can't ship without UNION ALL
+      first. Once UNION ALL lands, this slice does the
+      anchor/recursive-member detection, planner-side
+      fixpoint scan node, executor iteration, cycle-safe
+      termination, and unsupported-recursive-shape
+      rejection. Continues
       `docs/design/0016-0003-recursive-cte-fixpoint-execution.md`.
 
-- [ ] CTE observability + compatibility tests
-      (M0016-0004). EXPLAIN labels for CTE producers;
-      runtime counters; representative PG-shaped CTE
-      regression suite. Continues
+- [x] CTE observability + compatibility tests
+      (M0016-0004). Design doc
       `docs/design/0016-0004-cte-observability-and-compat-tests.md`.
+      (landed 2026-04-29: closes the Stage A picture.
+      New `planner.CTEScan` plan node wraps each cloned
+      CTE body at `planScanRangeVar`'s substitution site so
+      EXPLAIN can label the inlined subtree (Name + Alias).
+      Pure labeling artifact — `executor.Build` unwraps to
+      Child, so Stage A's "zero new executor infrastructure"
+      property is preserved. EXPLAIN's `describePlan` switch
+      gained a CTEScan arm rendering "CTE Scan on <name>"
+      (or "CTE Scan on <name> <alias>" when distinct);
+      `planChildren` recurses into Child so the inlined body
+      still appears below the label. Tests:
+      TestExplainCTEScanLabelsCTEByName (`WITH a AS (SELECT
+      1) SELECT * FROM a` produces "CTE Scan on a" in the
+      EXPLAIN output), TestExplainCTEScanShowsAlias
+      (FROM-alias rendering),
+      TestExplainCTEScanRecursesIntoChild. Plus three
+      end-to-end PG-shaped compat tests in
+      with_compat_test.go: TestCompatCTEFilterThenAggregate
+      (filter via CTE + count(*)),
+      TestCompatCTEMultiConsumerCrossProduct (single-row
+      CTE × itself = 1 row), TestCompatCTEChainedSiblings
+      (left-to-right `a → b` reference end-to-end). Full
+      `go test ./...` green. Materialise-once optimisation
+      and runtime CTE counters in pg_stat_* views remain
+      out of scope per design doc — the inlining model
+      makes per-CTE counters less informative than per-
+      statement counters.)
 
 ## Notes
 
