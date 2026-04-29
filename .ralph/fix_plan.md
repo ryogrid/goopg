@@ -2150,10 +2150,34 @@ item.
       `wal.ReadAll`). The classifier from loop 3 now sees
       real markers in live workloads.)
 
-- [ ] Long-lived classifier loop: spin a goroutine per logical
+- [x] Long-lived classifier loop: a goroutine per logical
       slot that consumes a `RecordIterator` and drives a real
-      `OutputPlugin`. Snapshot builder skeleton (slot-creation-
-      time HISTORIC snapshot). Continues in
+      `OutputPlugin`, advancing the slot's `ConfirmedFlushLSN`
+      on each commit. Continues in
+      `docs/design/0008-0001-logical-decoding-pipeline.md`.
+      (landed 2026-04-29: `internal/wal/slot_decoder.go`
+      defines `SlotDecoder.Run(ctx)` — owns a
+      `*RecordIterator` anchored at the slot's `RestartLSN`
+      and a `*Decoder` driving the `OutputPlugin`; loops
+      `iter.Next` → `Classify(decoder, rec)` until ctx is
+      cancelled or the writer closes. On every record whose
+      kind is `RecordKindXactCommit`, the slot's
+      `ConfirmedFlushLSN` advances to `rec.EndLSN` so a
+      restart resumes from the correct anchor without
+      replaying acked transactions. Construction rejects
+      non-logical slots. Tests:
+      TestSlotDecoderRunDrivesPluginThroughCommit (end-to-end
+      with a live writer, async loop, `xid=42`
+      insert/insert/commit observed by a thread-safe capture
+      plugin, `ConfirmedFlushLSN` advances to commit EndLSN),
+      TestSlotDecoderRejectsPhysicalSlot. The snapshot
+      builder skeleton stays deferred — needed before a real
+      consumer can interpret tuple bytes against schema.)
+
+- [ ] Snapshot builder skeleton: slot-creation-time HISTORIC
+      snapshot for the logical decoder so plugins can
+      interpret tuple bytes against the catalog state in
+      effect at slot creation. Continues in
       `docs/design/0008-0001-logical-decoding-pipeline.md`.
 
 - [ ] `pgoutput` output plugin: B / C / R / I / U / D message

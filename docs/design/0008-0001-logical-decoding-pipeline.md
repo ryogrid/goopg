@@ -235,6 +235,33 @@ structures that the future WAL classifier will drive.
    `wal.OutputPlugin`. v0's first implementation is `pgoutput`
    (0008-0002).
 
+6. **Per-slot decoder loop (`internal/wal/slot_decoder.go`).** Loop
+   5 ties everything together. `SlotDecoder` is the long-lived
+   consumer for one logical replication slot:
+
+   - `NewSlotDecoder(slots, name, writer, walDir, segSize, plugin)`
+     wires a `*RecordIterator` anchored at the slot's
+     `RestartLSN` and a `*Decoder` driving `plugin`. Construction
+     fails fast on a non-logical slot.
+   - `Run(ctx)` loops `iter.Next` → `Classify(decoder, rec)`.
+     On a successful commit (record kind `XactCommit`), the
+     slot's `ConfirmedFlushLSN` is advanced to the commit
+     record's `EndLSN` — the on-disk anchor that lets a restart
+     resume from the right LSN without replaying acked
+     transactions.
+   - `Close()` releases the iterator subscription. `ctx.Cancelled`
+     and the writer-closed sentinel return cleanly so a graceful
+     shutdown is distinguishable from a crash.
+
+   One goroutine per active slot; the loop is sequential by
+   design.
+
+   **Snapshot builder still deferred.** A real consumer needs
+   schema awareness to interpret tuple bytes; that's the next
+   M0008 / 0008-0001 follow-up. Until it lands, the loop works
+   end-to-end against synthetic record streams that ship the
+   raw tuple bytes through to the plugin.
+
 ### Out of scope for this milestone
 
 (Mirrors the M0008 milestone "Out of scope" section verbatim;
@@ -264,6 +291,17 @@ Slot foundation + view (loop 1):
   `catalog_xmin` keys) round-trip cleanly.
 - `internal/initdb/replication_views_test.go::TestPgReplicationSlotsViewRendersBothKinds`
   — view renders one row per slot with the upstream column shape.
+
+Per-slot decoder loop (loop 5):
+
+- `internal/wal/slot_decoder_test.go::TestSlotDecoderRunDrivesPluginThroughCommit`
+  — end-to-end: a logical slot decoder consuming a live writer
+  drives the plugin in `Begin → Change → Change → Commit` order
+  for an `xid=42` insert/insert/commit sequence and advances the
+  slot's `ConfirmedFlushLSN` to the commit record's `EndLSN`.
+- `…::TestSlotDecoderRejectsPhysicalSlot` — construction-time
+  type check rejects physical slots (they feed the streaming-
+  replication path, not pgoutput).
 
 Wire-layer xact-marker emission (loop 4):
 
