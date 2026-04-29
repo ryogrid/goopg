@@ -196,6 +196,40 @@ func (l *lexer) next() (Token, error) {
 
 	case c == '$':
 		l.pos++
+		// Dollar-quoted string literal (M0015): `$$body$$` or
+		// `$tag$body$tag$`. Used by PL/pgSQL function bodies and
+		// any payload where embedded single-quotes would be
+		// awkward. The tag may be empty or a SQL identifier
+		// (letter/underscore followed by letter/digit/underscore).
+		// Closer must match the opening tag exactly.
+		if l.pos < len(l.src) && (l.src[l.pos] == '$' || isIdentStart(l.src[l.pos])) {
+			tagStart := l.pos
+			// Tag chars follow upstream's rule: an unquoted
+			// identifier *without* `$` (PG manual: "the tag ...
+			// cannot contain a dollar sign"). Empty tag (`$$`)
+			// falls out of the loop after consuming zero bytes.
+			for l.pos < len(l.src) && isDollarTagCont(l.src[l.pos]) {
+				l.pos++
+			}
+			if l.pos < len(l.src) && l.src[l.pos] == '$' {
+				tag := l.src[tagStart:l.pos]
+				l.pos++ // consume closing `$` of opener
+				bodyStart := l.pos
+				closer := "$" + tag + "$"
+				for l.pos+len(closer) <= len(l.src) {
+					if l.src[l.pos] == '$' && l.src[l.pos:l.pos+len(closer)] == closer {
+						body := l.src[bodyStart:l.pos]
+						l.pos += len(closer)
+						return Token{Kind: TokenStringLit, Value: body, Pos: start}, nil
+					}
+					l.pos++
+				}
+				return Token{}, l.errf(start, "unterminated dollar-quoted string (looking for %q)", closer)
+			}
+			// Not a dollar-quote opener — rewind so the
+			// positional-parameter path can re-scan from `$`.
+			l.pos = tagStart
+		}
 		dStart := l.pos
 		for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
 			l.pos++
@@ -250,3 +284,12 @@ func isIdentCont(c byte) bool {
 }
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// isDollarTagCont is the dollar-quote tag character class:
+// identifier chars except `$`. The `$` exclusion mirrors upstream's
+// PostgreSQL rule (per the manual: "the tag ... cannot contain a
+// dollar sign") — it's what lets the lexer detect the end of the
+// opening tag at the first subsequent `$`.
+func isDollarTagCont(c byte) bool {
+	return isIdentStart(c) || isDigit(c)
+}

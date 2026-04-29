@@ -152,6 +152,17 @@ func Analyze(stmt parser.Stmt, cat catalog.Catalog) error {
 		return analyzeUpdate(s, cat)
 	case *parser.DeleteStmt:
 		return analyzeDelete(s, cat)
+	case *parser.CreateFunctionStmt:
+		// M0015 Stage A step 1: parser surface lands ahead of the
+		// PL/pgSQL interpreter. Reject with SQLSTATE 0A000 so
+		// clients see "feature not supported in v0" instead of a
+		// silent accept. Subsequent loops drop this case as the
+		// catalog / executor wiring lands.
+		return analyzeError(s.Pos(), "0A000",
+			"CREATE FUNCTION is not supported in v0 analyzer")
+	case *parser.DropFunctionStmt:
+		return analyzeError(s.Pos(), "0A000",
+			"DROP FUNCTION is not supported in v0 analyzer")
 	default:
 		return nil
 	}

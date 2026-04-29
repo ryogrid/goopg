@@ -167,6 +167,20 @@ const (
 	KwNowait Keyword = "nowait"
 	KwSkip   Keyword = "skip"
 	KwLocked Keyword = "locked"
+
+	// Stored routines, Stage A — function-first delivery (M0015).
+	// Stage A grammar:
+	//   CREATE [OR REPLACE] FUNCTION name([arg_decl, ...])
+	//     RETURNS rettype
+	//     [LANGUAGE lang]*
+	//     AS $$body$$
+	//   DROP FUNCTION [IF EXISTS] name [(arg_decl, ...)]
+	//
+	// CALL / PROCEDURE / OUT / INOUT / VARIADIC arrive in
+	// Stage B — those keywords stay deferred.
+	KwFunction Keyword = "function"
+	KwReturns  Keyword = "returns"
+	KwLanguage Keyword = "language"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -280,6 +294,9 @@ var keywords = map[string]Keyword{
 	"locked":       KwLocked,
 	"over":         KwOver,
 	"partition":    KwPartition,
+	"function":     KwFunction,
+	"returns":      KwReturns,
+	"language":     KwLanguage,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

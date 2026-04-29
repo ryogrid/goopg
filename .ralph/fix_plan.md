@@ -2232,6 +2232,44 @@ Decomposition + design docs land when this milestone is picked up.
 - [ ] Stage A: function-first delivery (CREATE OR REPLACE FUNCTION
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
+
+  - [x] Stage A step 1 — parser + AST surface for CREATE/DROP
+        FUNCTION + lexer dollar-quote support + analyzer reject.
+        Design doc
+        `docs/design/0015-0001-create-function-parser-and-ast.md`.
+        (landed 2026-04-30: parser-only slice mirroring the
+        M0016/M0017/M0018/M0020/M0021 step-1 precedents. Lexer
+        gains dollar-quoted string support — `$$body$$` and
+        `$tag$body$tag$` — by extending the existing `$` case
+        (which previously only handled positional parameters
+        `$1..$N`); new `isDollarTagCont` predicate mirrors PG's
+        "tag cannot contain a dollar sign" rule and the rewind
+        path keeps `$1` / `revenue$0`-style identifiers
+        byte-identical to pre-M0015 behaviour. Three new
+        keywords — `KwFunction`, `KwReturns`, `KwLanguage`;
+        Stage B keywords (`Procedure`, `Call`, `Out`, `Inout`,
+        `Variadic`, `Declare`) stay deferred. New AST nodes
+        `CreateFunctionStmt`, `DropFunctionStmt`, `FunctionArg`,
+        and the `FuncArgMode` enum stub with only `FuncArgIn`
+        populated. `Args=nil` (no parens) distinguishes from
+        `Args=[]FunctionArg{}` (explicit empty list) so a future
+        overload resolver can tell "drop by name" apart from
+        "drop the zero-arg overload". `parseCreate`/`parseDrop`
+        gain `KwFunction` dispatch; `OUT`/`INOUT`/`VARIADIC`
+        modes surface a Stage-A-only diagnostic; `LANGUAGE` and
+        `AS` parse in either order (upstream-flex); function
+        body must be dollar-quoted (single-quoted bodies are
+        upstream-legal but rejected here so a future relaxation
+        is intentional). Analyzer gates `CreateFunctionStmt`
+        and `DropFunctionStmt` with SQLSTATE 0A000 "...is not
+        supported in v0 analyzer". 12 parser tests
+        (`function_test.go`) + 2 analyzer tests pin the surface
+        + lexer regression. Out of scope (Stage A steps 2-5):
+        pg_proc catalog wiring, PL/pgSQL parser+AST for routine
+        bodies, PL/pgSQL interpreter + SPI bridge, function
+        invocation in expression contexts. Full
+        `go test ./...` green.)
+
 - [ ] Stage B: procedure follow-up (CREATE PROCEDURE, CALL,
       out-parameter binding).
 

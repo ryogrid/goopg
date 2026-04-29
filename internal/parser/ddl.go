@@ -66,8 +66,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		p.advance()
 		return p.parseCreateSubscriptionTail(t.Pos)
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFunction:
+		if unlogged {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE FUNCTION"}
+		}
+		p.advance()
+		return p.parseCreateFunctionTail(t.Pos, orReplace)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, or SUBSCRIPTION after CREATE")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, or FUNCTION after CREATE")
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
@@ -510,8 +516,11 @@ func (p *parser) parseDrop() (Stmt, error) {
 			return nil, err
 		}
 		return &DropSubscriptionStmt{pos: t.Pos, IfExists: ifExists, Name: name}, nil
+	case KwFunction:
+		p.advance()
+		return p.parseDropFunctionTail(t.Pos)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, or SUBSCRIPTION after DROP")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, or FUNCTION after DROP")
 }
 
 // parseDropPubSubTail picks up after DROP PUBLICATION / DROP

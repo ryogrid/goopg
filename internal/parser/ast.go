@@ -789,3 +789,80 @@ type CopyStmt struct {
 
 func (s *CopyStmt) Pos() int  { return s.pos }
 func (s *CopyStmt) stmtNode() {}
+
+// FuncArgMode classifies a routine parameter direction. Stage A only
+// recognises IN (the default); OUT / INOUT / VARIADIC arrive in Stage
+// B. Surface them at the parser level only when ready so unsupported
+// modes return clean syntax errors instead of being silently lost.
+type FuncArgMode int
+
+const (
+	// FuncArgIn is the default — input parameter. The Stage A
+	// surface accepts the explicit `IN` keyword too (no behavioural
+	// difference) so handwritten functions migrated from upstream
+	// don't trip on it.
+	FuncArgIn FuncArgMode = iota
+)
+
+// FunctionArg is one entry in a function's argument list. Name is
+// optional (PostgreSQL allows positional-only args); Type is the
+// declared SQL type; Default carries the parsed default expression
+// when one was given (`arg INT DEFAULT 0`).
+//
+// Stage A pins `Mode` to `FuncArgIn` for every accepted argument —
+// OUT / INOUT / VARIADIC remain Stage B. The field exists on the
+// struct now so step 2's analyzer/runtime work doesn't have to
+// retrofit the AST shape.
+type FunctionArg struct {
+	pos     int
+	Name    string // empty for positional-only args
+	Mode    FuncArgMode
+	Type    ColumnType
+	Default Expr // nil when no DEFAULT was given
+}
+
+func (a FunctionArg) Pos() int { return a.pos }
+
+// CreateFunctionStmt — `CREATE [OR REPLACE] FUNCTION name([args])
+// RETURNS rettype [LANGUAGE lang] AS $$body$$`. Stage A scope
+// (M0015): function-first delivery — parser surface only, body
+// stored as the raw source string captured between the dollar-quote
+// delimiters. Analyzer / planner / executor wiring lands in
+// subsequent loops; the analyzer rejects this statement now with a
+// clean SQLSTATE 0A000.
+//
+// Language defaults to "sql" upstream; goopg requires it explicit
+// for now so future PL/* additions are unambiguous. Stage A accepts
+// `plpgsql` (case-insensitive) and `sql`; the analyzer is the gate
+// that decides which languages run.
+//
+// See docs/design/0015-0001-create-function-parser-and-ast.md.
+type CreateFunctionStmt struct {
+	pos       int
+	OrReplace bool
+	Name      ObjectName
+	Args      []FunctionArg
+	ReturnType ColumnType
+	Language  string // lower-cased, e.g. "plpgsql"
+	Body      string // raw source between the dollar-quote delimiters
+}
+
+func (s *CreateFunctionStmt) Pos() int  { return s.pos }
+func (s *CreateFunctionStmt) stmtNode() {}
+
+// DropFunctionStmt — `DROP FUNCTION [IF EXISTS] name [(arg_decl,
+// …)] [CASCADE|RESTRICT]`. Multi-target DROP (comma-separated
+// names) is upstream syntax but rare in practice and out of Stage A
+// scope; supporting one name keeps the slice small. The optional
+// argument list is stored verbatim so a later loop can implement
+// overload-resolution drop semantics without re-parsing.
+type DropFunctionStmt struct {
+	pos      int
+	IfExists bool
+	Name     ObjectName
+	Args     []FunctionArg // nil when no parenthesised arg list was given
+	Behavior DropBehavior
+}
+
+func (s *DropFunctionStmt) Pos() int  { return s.pos }
+func (s *DropFunctionStmt) stmtNode() {}
