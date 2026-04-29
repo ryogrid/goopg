@@ -2930,14 +2930,65 @@ See `docs/milestones/0009-aio-subsystem.md`.
       probe succeeds drives I/Os visible to
       `strace -e io_uring_*`.
 
-- [ ] Read-stream API on top of the AIO core:
-      `internal/aio/read_stream.go` with the upstream
-      `read_stream.h`-shaped surface — caller hands a
-      "next block" callback and a desired lookahead depth;
-      the stream issues prefetch I/Os ahead of `Next()`
-      calls. Per-stream lookahead bound + global in-flight
-      cap so one query plan can't monopolise the pool.
-      Design doc `0009-0002-read-stream.md`.
+- [x] Read-stream API on top of the AIO core. (landed
+      2026-04-29: `internal/aio/read_stream.go` ships the
+      predictive-prefetch surface. Public types:
+      `NextBlockFunc func() int64` (returns next byte
+      offset or the `EndOfStream = -1` sentinel),
+      `ReadStreamConfig { Engine, File, BlockSize,
+      NextBlock, Lookahead }`, `ReadStream` with `Next()`
+      and `Close()`. `NewReadStream` validates the config
+      (non-nil Engine / File / NextBlock + positive
+      BlockSize → typed errors), clamps Lookahead to
+      `[1, MaxReadStreamLookahead=256]` so a pathological
+      caller can't allocate unbounded buffer memory (zero
+      falls back to `DefaultReadStreamLookahead=4`), and
+      primes the prefetch window via up to Lookahead
+      `Engine.Submit` calls. Every `Next` blocks on the
+      head prefetch's Wait, returns the block's bytes
+      (truncated to the underlying ReadAt's reported byte
+      count, slice aliases the stream's internal buffer
+      and is valid until the next Next/Close call), and
+      refills the window. `io.EOF` is the trailing
+      sentinel returned exactly once after NextBlock has
+      signalled `EndOfStream` AND the queue has drained.
+      `Close` waits for in-flight prefetches to land
+      rather than abandoning them so the engine's
+      `InFlight` counter stays honest (cancellation will
+      arrive post-`io_uring`; until then drain is the
+      only correct exit). Operates on `File`+offsets
+      rather than buffer-manager `Buffer` handles —
+      mirrors upstream `read_stream.h`'s shape but keeps
+      the abstraction reusable for non-heap-scan
+      prefetchers (ANALYZE sample reads, vacuum's free-
+      space-map walk). Two backpressure layers stack: the
+      per-stream Lookahead window AND the engine's global
+      `io_max_concurrency` cap (Submit blocks naturally
+      when hit, so the stream's window can shrink under
+      contention without violating the cap). Deferred:
+      contiguous-merge ("io_combine_limit"), sequential
+      ramp-up, `Reset()` for restartable scans. Tests in
+      `internal/aio/read_stream_test.go`:
+      TestReadStreamSequentialRoundTrip (4-block stream
+      at Lookahead=2 round-trips bytes in callback order
+      + trailing EOF + Submitted=4),
+      TestReadStreamLookaheadCapsConcurrentSubmits (a
+      `gateFile` that blocks every ReadAt until released
+      lets the test sample the engine's `InFlight`
+      counter mid-stream; asserts it never exceeds
+      Lookahead),
+      TestReadStreamHonoursDefaultLookahead (zero falls
+      back to 4), TestReadStreamClampsHugeLookahead
+      (10×Max → MaxReadStreamLookahead),
+      TestReadStreamRejectsInvalidConfig (each of nil
+      Engine / File / NextBlock + zero BlockSize → typed
+      error), TestReadStreamSurfacesPerBlockError (empty
+      file + non-zero offset → io.EOF on the per-block
+      result, mirroring io.ReaderAt's contract),
+      TestReadStreamCloseDrainsInFlight (post-Close
+      InFlight=0). Built and full `go test ./...` green.
+      Design doc `docs/design/0009-0002-read-stream.md`
+      added and indexed in `docs/design/README.md`.)
 
 - [ ] AIO caller integrations: sequential heap scan and
       bitmap heap scan use the read stream as their
