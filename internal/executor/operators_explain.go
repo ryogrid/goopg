@@ -41,15 +41,20 @@ func (o *explainOp) Open(ctx *Context) error {
 	if opts.Analyze {
 		// M0018-0003: build the inner plan with instrumentation,
 		// drain it to completion so timers fire, then render.
-		// TIMING and SUMMARY are always on under ANALYZE in this
-		// slice — explicit `TIMING OFF` / `SUMMARY OFF` support
-		// is a follow-up. The Options.Timing / Options.Summary
-		// flags are parsed but not yet consulted (the AST shape
-		// is stable; the renderer just enables them
-		// unconditionally for now).
-		timing := true
-		summary := true
+		// M0018-0004: TIMING and SUMMARY default to ON under
+		// ANALYZE matching upstream; explicit OFF wins. The
+		// `Set` companion struct distinguishes "user said off"
+		// (Set.Timing && !opts.Timing) from "user said nothing"
+		// (!Set.Timing).
+		timing := !opts.Set.Timing || opts.Timing
+		summary := !opts.Set.Summary || opts.Summary
 
+		// Top-level Planning / Execution wallclock is independent
+		// of per-node TIMING — measure it unconditionally under
+		// ANALYZE so SUMMARY=true with TIMING=false still has a
+		// number to report. Per-node time= bracket is suppressed
+		// when nodeStats.timing is false (the wrapper skips
+		// time.Now() at row granularity).
 		planStart := time.Now()
 		var inner Operator
 		var err error
@@ -59,9 +64,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		if timing {
-			planNs = time.Since(planStart).Nanoseconds()
-		}
+		planNs = time.Since(planStart).Nanoseconds()
 
 		execStart := time.Now()
 		if err := inner.Open(ctx); err != nil {
@@ -80,17 +83,13 @@ func (o *explainOp) Open(ctx *Context) error {
 		if err := inner.Close(); err != nil {
 			return err
 		}
-		if timing {
-			execNs = time.Since(execStart).Nanoseconds()
-		}
+		execNs = time.Since(execStart).Nanoseconds()
 
 		if opts.Format == parser.ExplainFormatJSON {
 			root := planToJSONWithStats(o.plan.Child, opts, stats)
 			if summary {
-				if timing {
-					root["Planning Time"] = nsToMs(planNs)
-					root["Execution Time"] = nsToMs(execNs)
-				}
+				root["Planning Time"] = nsToMs(planNs)
+				root["Execution Time"] = nsToMs(execNs)
 			}
 			out, err := json.MarshalIndent([]any{root}, "", "  ")
 			if err != nil {
@@ -101,7 +100,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		}
 		var b strings.Builder
 		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats)
-		if summary && timing {
+		if summary {
 			o.rows = append(o.rows,
 				Row{Datum{Kind: KindString, String: fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs))}},
 				Row{Datum{Kind: KindString, String: fmt.Sprintf("Execution Time: %.3f ms", nsToMs(execNs))}},
@@ -211,8 +210,12 @@ func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row,
 		label += fmt.Sprintf(" (rows=%d)", est)
 	}
 	if s, ok := stats[n]; ok && s != nil {
-		label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%d loops=%d)",
-			nsToMs(s.startupNs), nsToMs(s.totalNs), s.rowsOut, s.loops)
+		if s.timing {
+			label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%d loops=%d)",
+				nsToMs(s.startupNs), nsToMs(s.totalNs), s.rowsOut, s.loops)
+		} else {
+			label += fmt.Sprintf(" (actual rows=%d loops=%d)", s.rowsOut, s.loops)
+		}
 	}
 	*rows = append(*rows, Row{Datum{Kind: KindString, String: label}})
 

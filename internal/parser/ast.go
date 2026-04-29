@@ -84,6 +84,12 @@ const (
 // `EXPLAIN <stmt>` (no keyword form, no parenthesised list)
 // produces an ExplainOptions struct that's byte-for-byte
 // equivalent to the pre-M0018 zero-value behaviour.
+//
+// `Set` (M0018-0004) tracks which options the user wrote
+// explicitly. The executor consults it under ANALYZE to
+// distinguish "user said off" (Set.Timing=true && Timing=false)
+// from "user said nothing" (Set.Timing=false) — the latter
+// defaults to ON matching upstream's default-true semantics.
 type ExplainOptions struct {
 	Analyze  bool
 	Verbose  bool
@@ -93,6 +99,14 @@ type ExplainOptions struct {
 	Timing   bool
 	Summary  bool
 	Format   ExplainFormat
+	Set      ExplainOptionsSet
+}
+
+// ExplainOptionsSet records which ExplainOptions fields the user
+// wrote explicitly. Allows the executor to distinguish a user-set
+// false from an unset zero-value bool.
+type ExplainOptionsSet struct {
+	Analyze, Verbose, Costs, Buffers, Settings, Timing, Summary, Format bool
 }
 
 // ExplainStmt — `EXPLAIN [ANALYZE] [VERBOSE] <stmt>` or

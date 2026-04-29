@@ -245,10 +245,12 @@ func (p *parser) parseExplain() (Stmt, error) {
 		for {
 			if p.acceptKeyword(KwAnalyze) {
 				opts.Analyze = true
+				opts.Set.Analyze = true
 				continue
 			}
 			if p.acceptKeyword(KwVerbose) {
 				opts.Verbose = true
+				opts.Set.Verbose = true
 				continue
 			}
 			break
@@ -325,6 +327,7 @@ func (p *parser) parseExplainOneOption(opts *ExplainOptions) error {
 		default:
 			return &SyntaxError{Pos: valTok.Pos, Message: fmt.Sprintf("unsupported FORMAT %q (TEXT or JSON only)", valTok.Value)}
 		}
+		opts.Set.Format = true
 		return nil
 	}
 
@@ -339,18 +342,25 @@ func (p *parser) parseExplainOneOption(opts *ExplainOptions) error {
 	switch name {
 	case "analyze":
 		opts.Analyze = val
+		opts.Set.Analyze = true
 	case "verbose":
 		opts.Verbose = val
+		opts.Set.Verbose = true
 	case "costs":
 		opts.Costs = val
+		opts.Set.Costs = true
 	case "buffers":
 		opts.Buffers = val
+		opts.Set.Buffers = true
 	case "settings":
 		opts.Settings = val
+		opts.Set.Settings = true
 	case "timing":
 		opts.Timing = val
+		opts.Set.Timing = true
 	case "summary":
 		opts.Summary = val
+		opts.Set.Summary = true
 	default:
 		return &SyntaxError{Pos: pos, Message: fmt.Sprintf("unknown EXPLAIN option %q", tok.Value)}
 	}

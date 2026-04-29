@@ -2433,10 +2433,42 @@ calls out.
       BUFFERS / SETTINGS counter rendering and the JSON
       snapshot regression strategy land in M0018-0004.)
 
-- [ ] EXPLAIN JSON snapshot strategy (M0018-0004): stable
-      schema, regression-test fixture format, BUFFERS counter
-      surface integration. Continues
+- [x] TIMING/SUMMARY OFF wiring + JSON snapshot strategy
+      (M0018-0004). Design doc
       `docs/design/0018-0004-json-format-and-regression-strategy.md`.
+      (landed 2026-04-29: parser AST grew an
+      `ExplainOptionsSet` companion struct tracking which
+      EXPLAIN options the user wrote explicitly. The parser
+      flips `Set.<Option>` for every keyword-form ANALYZE /
+      VERBOSE and every parenthesised-form name. Executor
+      ANALYZE path computes effective TIMING/SUMMARY via
+      `effective = !Set.Option || opts.Option` — defaults
+      ON under ANALYZE, explicit OFF wins. nodeStats.timing
+      flows from this; the wrapper skips per-row
+      `time.Now()` snapshots when timing is false; the
+      walkPlanAnalyze TEXT renderer emits `(actual rows=N
+      loops=N)` without the `time=X..Y` bracket; planToJSON
+      WithStats omits `Actual Total Time` / `Actual Startup
+      Time` keys. SUMMARY=false suppresses the
+      `Planning Time:` / `Execution Time:` footer rows in
+      TEXT and root-level keys in JSON. Top-level wallclock
+      is now measured unconditionally under ANALYZE so
+      SUMMARY-without-TIMING still has a number to report.
+      Tests:
+      TestExplainAnalyzeTimingOffSuppressesTimeBracket,
+      TestExplainAnalyzeTimingOnByDefault (regression guard
+      for the default-true semantics),
+      TestExplainAnalyzeSummaryOffSuppressesFooter,
+      TestExplainAnalyzeTimingOffJSONOmitsTimeKeys (Actual
+      Rows / Loops still present; Total / Startup Time
+      gone), TestExplainAnalyzeSummaryOffJSONOmitsTimingKeys,
+      TestExplainJSONShapeStable (structural snapshot for
+      non-ANALYZE: required Node Type present; all gated
+      keys absent — pins the contract for future BUFFERS /
+      SETTINGS additions). Full `go test ./...` green.
+      M0018 closes — BUFFERS / SETTINGS counter rendering
+      is queued as a Pool-level instrumentation follow-up,
+      not a M0018-internal slice.)
 
 ## Milestone 0019 — Autovacuum
 
