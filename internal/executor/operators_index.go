@@ -93,13 +93,17 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 	if v.IsNull() {
 		return nil, false, nil
 	}
-	if v.Kind != KindInt {
-		return nil, false, &ExecError{Code: "42804", Pos: o.plan.Key.Pos(), Message: "index lookup key must be integer"}
+	// Look up the indexed column on the underlying table so the
+	// probe encoding matches what backfill stored. The index is
+	// always single-column in v0 (createSingleColumnBTreeIndex
+	// enforces this).
+	col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	if !ok {
+		return nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name)}
 	}
-	const minInt32 = -1 << 31
-	const maxInt32 = 1<<31 - 1
-	if v.Int < minInt32 || v.Int > maxInt32 {
-		return nil, false, &ExecError{Code: "22003", Pos: o.plan.Key.Pos(), Message: fmt.Sprintf("integer %d out of int4 range", v.Int)}
+	key, encErr := encodeBTreeKeyForColumn(v, col, o.plan.Key.Pos())
+	if encErr != nil {
+		return nil, false, encErr
 	}
-	return btree.EncodeInt4(int32(v.Int)), true, nil
+	return key, true, nil
 }

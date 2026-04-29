@@ -20,19 +20,25 @@ import (
 )
 
 // SizeOfBTPageOpaque is the on-disk size of the per-page B-tree opaque
-// area. v2 grew it from 16 to 24 bytes to carry a fixed-width
-// HighKey + a BTHasHighKey flag bit (Landing 2 of milestone 0002 —
-// see docs/design/0002-0002-btree-concurrency.md). Layout, in
-// little-endian:
+// area. v3 grew it from 24 to 48 bytes to carry a variable-length
+// HighKey (M0011-0002 — see
+// docs/design/0011-0002-btree-numeric-build-and-uniqueness.md), which
+// is required for NUMERIC keys whose encoded form exceeds the
+// previous 4-byte field. Layout, in little-endian:
 //
-//	offset 0  Prev      (4 bytes)
-//	offset 4  Next      (4 bytes)
-//	offset 8  Level     (4 bytes)
-//	offset 12 Flags     (2 bytes)
-//	offset 14 _padding  (2 bytes)
-//	offset 16 HighKey   (4 bytes; valid only when BTHasHighKey is set)
-//	offset 20 _reserved (4 bytes)
-const SizeOfBTPageOpaque = 24
+//	offset 0  Prev        (4 bytes)
+//	offset 4  Next        (4 bytes)
+//	offset 8  Level       (4 bytes)
+//	offset 12 Flags       (2 bytes)
+//	offset 14 HighKeyLen  (2 bytes)
+//	offset 16 HighKey     (32 bytes; bytes 0..HighKeyLen valid)
+const SizeOfBTPageOpaque = 48
+
+// MaxHighKeyLen bounds the on-disk HighKey field. Covers the int4
+// encoding (4 bytes) and the NUMERIC encoding (≤25 bytes per
+// 0011-0001) with headroom. Wider key encodings would require
+// another opaque-format bump.
+const MaxHighKeyLen = 32
 
 // btSpecialOffset is where the opaque area starts on every B-tree page.
 const btSpecialOffset = storage.BlockSize - SizeOfBTPageOpaque
@@ -53,7 +59,7 @@ const (
 	rootStart storage.BlockNumber = 1
 
 	btreeMagic   uint32 = 0x053162
-	btreeVersion uint32 = 2 // bumped by Landing 2 (24-byte opaque with HighKey)
+	btreeVersion uint32 = 3 // bumped by M0011-0002 (variable-length HighKey, 48-byte opaque)
 )
 
 // BTreeMeta is the v0 metapage payload.
@@ -68,13 +74,15 @@ type BTreeMeta struct {
 
 // BTPageOpaque is the typed view over the special area at the end of
 // each B-tree page. HighKey is meaningful only when BTHasHighKey is
-// set in Flags; for v0 it stores a 4-byte EncodeInt4-form key.
+// set in Flags; from v3 onwards it carries a variable-length key
+// bounded by MaxHighKeyLen so NUMERIC and other variable-width
+// encodings fit (M0011-0002).
 type BTPageOpaque struct {
 	Prev    storage.BlockNumber
 	Next    storage.BlockNumber
 	Level   uint32
 	Flags   uint16
-	HighKey [4]byte
+	HighKey []byte
 }
 
 // IsLeaf reports whether the page carries leaf items.
@@ -97,20 +105,36 @@ func readOpaque(p storage.Page) BTPageOpaque {
 		Level: binary.LittleEndian.Uint32(p[off+8 : off+12]),
 		Flags: binary.LittleEndian.Uint16(p[off+12 : off+14]),
 	}
-	copy(o.HighKey[:], p[off+16:off+20])
+	hkLen := int(binary.LittleEndian.Uint16(p[off+14 : off+16]))
+	if hkLen > MaxHighKeyLen {
+		hkLen = MaxHighKeyLen // defensive: truncate corrupt length to bounded slice
+	}
+	if hkLen > 0 {
+		o.HighKey = append([]byte(nil), p[off+16:off+16+hkLen]...)
+	}
 	return o
 }
 
-// writeOpaque persists the opaque into page bytes.
+// writeOpaque persists the opaque into page bytes. Panics if HighKey
+// exceeds MaxHighKeyLen — by construction (int4=4, NUMERIC≤25) this
+// can only fire for a future encoding that grew past the format
+// budget.
 func writeOpaque(p storage.Page, o BTPageOpaque) {
+	if len(o.HighKey) > MaxHighKeyLen {
+		panic(fmt.Sprintf("btree: HighKey length %d exceeds MaxHighKeyLen %d", len(o.HighKey), MaxHighKeyLen))
+	}
 	off := btSpecialOffset
 	binary.LittleEndian.PutUint32(p[off:off+4], uint32(o.Prev))
 	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(o.Next))
 	binary.LittleEndian.PutUint32(p[off+8:off+12], o.Level)
 	binary.LittleEndian.PutUint16(p[off+12:off+14], o.Flags)
-	binary.LittleEndian.PutUint16(p[off+14:off+16], 0)
-	copy(p[off+16:off+20], o.HighKey[:])
-	binary.LittleEndian.PutUint32(p[off+20:off+24], 0)
+	binary.LittleEndian.PutUint16(p[off+14:off+16], uint16(len(o.HighKey)))
+	// Zero the HighKey region first so leftover bytes from a longer
+	// previous HighKey don't survive a shorter rewrite.
+	for i := 0; i < MaxHighKeyLen; i++ {
+		p[off+16+i] = 0
+	}
+	copy(p[off+16:off+16+len(o.HighKey)], o.HighKey)
 }
 
 // keyExceedsHighKey reports whether `key` is strictly greater than
@@ -120,7 +144,7 @@ func keyExceedsHighKey(op BTPageOpaque, key []byte) bool {
 	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
 		return false
 	}
-	return CompareKeys(key, op.HighKey[:]) > 0
+	return CompareKeys(key, op.HighKey) > 0
 }
 
 // initPage prepares a freshly extended block as a B-tree page with the
@@ -783,18 +807,15 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// right-link. This is the Lehman-Yao invariant readers rely on.
 	op.Next = rightBlk
 	op.Flags |= BTHasHighKey
-	if len(rightItems[0].key) == len(op.HighKey) {
-		copy(op.HighKey[:], rightItems[0].key)
-	} else {
-		// Variable-length keys aren't supported in v0; the only
-		// format we encode is 4-byte int4 — guard the invariant
-		// rather than silently truncate.
+	sepKey := rightItems[0].key
+	if len(sepKey) > MaxHighKeyLen {
 		rightSlot.Unlock()
 		bt.pool.Unpin(rightSlot)
 		bt.unpinW(slot)
-		return fmt.Errorf("btree: split key length %d does not fit fixed HighKey width %d",
-			len(rightItems[0].key), len(op.HighKey))
+		return fmt.Errorf("btree: separator key length %d exceeds MaxHighKeyLen %d",
+			len(sepKey), MaxHighKeyLen)
 	}
+	op.HighKey = append([]byte(nil), sepKey...)
 	writeOpaque(slot.Page(), op)
 
 	// Atomic split WAL record (Landing 3a). When a writer is

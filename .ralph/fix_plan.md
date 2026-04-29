@@ -1704,23 +1704,36 @@ unchecked item.
       and variable-length `BTPageOpaque.HighKey` adjustment land
       in M0011-0002.)
 
-- [ ] B-tree NUMERIC build + UNIQUE/PRIMARY KEY: lift the
-      `btree v0 only supports int4 keys` DDL rejection in
-      `createSingleColumnBTreeIndex`, extend
-      `backfillSingleColumnBTree` to extract NUMERIC mantissas
-      and call `btree.EncodeNumericKey` (replacing the int32
-      seen-set with a byte-slice keyed dedup so `(10,1)` and
-      `(100,2)` collapse), wire the same encoding into
-      `indexScanOp.lookupKey`, and grow `BTPageOpaque.HighKey`
-      from a fixed 4-byte field to a variable-length blob (or a
-      length+blob pair) so splits emit correct boundary keys
-      for >4-byte numeric keys. Tests must cover: int4 path
-      unchanged (regression guard); UNIQUE rejects `1.0` /
-      `1.00` duplicates; index scan finds rows by NUMERIC key
-      with mismatched literal scales; restart correctness over
-      a NUMERIC index (open-then-search round-trip after
-      writer cycle). Continues
+- [x] B-tree NUMERIC build + UNIQUE/PRIMARY KEY (M0011-0002).
+      Design doc
       `docs/design/0011-0002-btree-numeric-build-and-uniqueness.md`.
+      (landed 2026-04-29: `BTPageOpaque.HighKey` becomes
+      `[]byte` in memory and a 32-byte variable slot
+      (`MaxHighKeyLen=32`) on disk with a 2-byte length prefix
+      at offset 14 replacing the old `_padding`; opaque grows
+      24→48 bytes; `btreeVersion` bumps 2→3 (pre-GA, older
+      btrees error with `ErrNotABTree`). Split path's
+      length-equality guard replaced by a `MaxHighKeyLen`
+      upper bound. `createSingleColumnBTreeIndex` accepts
+      `numeric` / `decimal` via new `isSupportedBTreeKeyType`
+      predicate. `backfillSingleColumnBTree` switches dedup
+      from `map[int32]struct{}` to `map[string]struct{}`
+      keyed on the encoded bytes so `(10,1)` and `(100,2)`
+      collapse for UNIQUE. New shared helper
+      `encodeBTreeKeyForColumn(v, col, pos)` — int4 path
+      unchanged, numeric path uses `EncodeNumericKey`
+      (`KindInt` promoted to scale=0). `indexScanOp.lookupKey`
+      calls the same helper so probe and stored keys match
+      bit-for-bit. Tests:
+      TestDDLCreateNumericBTreeIndexAcceptsType,
+      TestDDLNumericUniqueIndexCollapsesScales (1.0 / 1.00 →
+      23505), TestDDLNumericIndexSplitWithVariableLengthHighKey
+      (600-row mantissa/scale-varying insert forces leaf
+      split with non-uniform key lengths),
+      TestDDLInt4IndexUnchangedRegressionGuard. Full
+      `go test ./...` green. NumericConst-driven IndexScan
+      planner enablement and HammerDB end-to-end validation
+      are M0011-0003.)
 
 - [ ] HammerDB TPC-H NUMERIC index validation: reproduce the
       `bench/tpch/run_all.sh` failure-class

@@ -460,8 +460,8 @@ func (o *ddlOp) createSingleColumnBTreeIndex(pos int, idxName parser.ObjectName,
 	if !ok {
 		return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", columns[0], tbl.Name)}
 	}
-	if !isInt4Type(col.Type.Name) {
-		return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 keys, got %q", col.Type.Name)}
+	if !isSupportedBTreeKeyType(col.Type.Name) {
+		return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
 	}
 	idx, err := o.ctx.Catalog.CreateIndex(idxName, tbl, columns, unique, "btree", primary)
 	if err != nil {
@@ -492,9 +492,12 @@ func (o *ddlOp) backfillSingleColumnBTree(tree *btree.BTree, tbl *catalog.Table,
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	seen := map[int32]struct{}{}
-	const minInt32 = -1 << 31
-	const maxInt32 = 1<<31 - 1
+	// Dedup map keyed on the encoded byte form. For int4 this is
+	// trivially a 4-byte string; for NUMERIC it's the canonical
+	// EncodeNumericKey output, so (10,1) and (100,2) collapse —
+	// satisfies UNIQUE on numerically-equal values regardless of
+	// textual scale.
+	seen := map[string]struct{}{}
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -531,23 +534,19 @@ func (o *ddlOp) backfillSingleColumnBTree(tree *btree.BTree, tbl *catalog.Table,
 			if v.IsNull() {
 				continue
 			}
-			if v.Kind != KindInt {
+			key, encErr := encodeBTreeKeyForColumn(v, col, pos)
+			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
-				return &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not integer at runtime", col.Name)}
+				return encErr
 			}
-			if v.Int < minInt32 || v.Int > maxInt32 {
-				o.ctx.Pool.Unpin(slot)
-				return &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("value %d out of int4 range for index key", v.Int)}
-			}
-			k := int32(v.Int)
 			if unique {
-				if _, exists := seen[k]; exists {
+				if _, exists := seen[string(key)]; exists {
 					o.ctx.Pool.Unpin(slot)
 					return &ExecError{Code: "23505", Pos: pos, Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
 				}
-				seen[k] = struct{}{}
+				seen[string(key)] = struct{}{}
 			}
-			if err := tree.Insert(btree.EncodeInt4(k), storage.ItemPointer{Block: blk, Offset: i}); err != nil {
+			if err := tree.Insert(key, storage.ItemPointer{Block: blk, Offset: i}); err != nil {
 				o.ctx.Pool.Unpin(slot)
 				return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 			}
@@ -555,6 +554,41 @@ func (o *ddlOp) backfillSingleColumnBTree(tree *btree.BTree, tbl *catalog.Table,
 		o.ctx.Pool.Unpin(slot)
 	}
 	return nil
+}
+
+// encodeBTreeKeyForColumn turns a runtime Datum into the byte-form
+// key that the B-tree stores. Shared between backfill and index-scan
+// lookup so the encoding is symmetric — a probe key built from the
+// query literal lands on the same bytes the backfill produced for the
+// stored row.
+//
+// int4 path: KindInt range-checked into int32 then EncodeInt4.
+// numeric path: KindInt promoted to (int, scale=0); KindNumeric
+// passes (mantissa, scale) straight through. Anything else surfaces
+// 42804 — the analyzer should have caught it but the runtime guard
+// makes the failure mode crisp.
+func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+	switch {
+	case isInt4Type(col.Type.Name):
+		const minInt32 = -1 << 31
+		const maxInt32 = 1<<31 - 1
+		if v.Kind != KindInt {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not integer at runtime", col.Name)}
+		}
+		if v.Int < minInt32 || v.Int > maxInt32 {
+			return nil, &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("value %d out of int4 range for index key", v.Int)}
+		}
+		return btree.EncodeInt4(int32(v.Int)), nil
+	case isNumericType(col.Type.Name):
+		switch v.Kind {
+		case KindNumeric:
+			return btree.EncodeNumericKey(v.NumericMantissa, v.NumericScale), nil
+		case KindInt:
+			return btree.EncodeNumericKey(v.Int, 0), nil
+		}
+		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
+	}
+	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
 
 func (o *ddlOp) autoIndexName(tbl *catalog.Table, columns []string, suffix string) string {
@@ -575,6 +609,22 @@ func isInt4Type(name string) bool {
 	default:
 		return false
 	}
+}
+
+func isNumericType(name string) bool {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal":
+		return true
+	default:
+		return false
+	}
+}
+
+// isSupportedBTreeKeyType lists the column types accepted by
+// createSingleColumnBTreeIndex. int4 is the original v0 path; numeric
+// landed in M0011-0002 to unblock HammerDB TPC-H index builds.
+func isSupportedBTreeKeyType(name string) bool {
+	return isInt4Type(name) || isNumericType(name)
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
