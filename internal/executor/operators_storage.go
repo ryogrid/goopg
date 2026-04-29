@@ -558,14 +558,26 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 // page in a checkpoint epoch emit a small logical record instead
 // of a full FPI. See docs/design/0002-0003-redo-records.md.
 func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
+	_, err := writeHeapRowReturning(ctx, rel, cols, row)
+	return err
+}
+
+// writeHeapRowReturning is writeHeapRow's variant that surfaces the
+// (block, slot) of the freshly-inserted tuple so callers that need
+// to maintain secondary structures (UPSERT's arbiter index) can
+// stitch the new ItemPointer into them. The non-returning variant
+// is preserved for INSERT / UPDATE callers that don't need the
+// location.
+func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
+	var ptr storage.ItemPointer
 	body, err := EncodeRow(cols, row)
 	if err != nil {
-		return &ExecError{Code: "XX000", Message: err.Error()}
+		return ptr, &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	tuple := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
-		return err
+		return ptr, err
 	}
 
 	logHeap := ctx.Pool.LogHeapInsert()
@@ -593,6 +605,9 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
+			if derr == nil {
+				ptr = storage.ItemPointer{Block: blk, Offset: lineSlot}
+			}
 			return true, derr
 		} else if !errors.Is(err, storage.ErrNoSpaceInPage) {
 			slot.Unlock()
@@ -607,15 +622,15 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 	// Try the last existing block first.
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
-		return err
+		return ptr, err
 	}
 	if nBlocks > 0 {
 		appended, err := tryAppendToBlock(nBlocks - 1)
 		if err != nil {
-			return err
+			return ptr, err
 		}
 		if appended {
-			return nil
+			return ptr, nil
 		}
 	}
 
@@ -629,33 +644,36 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 	// already have extended and/or inserted into the new tail block.
 	nBlocks, err = ctx.Pool.NBlocks(rel)
 	if err != nil {
-		return err
+		return ptr, err
 	}
 	if nBlocks > 0 {
 		appended, err := tryAppendToBlock(nBlocks - 1)
 		if err != nil {
-			return err
+			return ptr, err
 		}
 		if appended {
-			return nil
+			return ptr, nil
 		}
 	}
 
 	slot, blk, err := ctx.Pool.PinNew(rel)
 	if err != nil {
-		return err
+		return ptr, err
 	}
 	slot.Lock()
 	lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple)
 	if err != nil {
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
-		return err
+		return ptr, err
 	}
 	derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
-	return derr
+	if derr == nil {
+		ptr = storage.ItemPointer{Block: blk, Offset: lineSlot}
+	}
+	return ptr, derr
 }
 
 // markHeapInsertDirty centralises the choice between

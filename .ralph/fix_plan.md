@@ -2509,15 +2509,68 @@ concurrent-write semantics. Decompose when picked up.
       TestPlanInsertOnConflictDoNothingNoTarget (no-target
       form leaves ArbiterIndex nil for runtime). Full
       `go test ./...` green.)
-- [ ] UPSERT Stage A — executor runtime
-      (M0017-0003). Reserves filename
+- [x] UPSERT Stage A — **executor runtime**
+      (M0017-0003). Design doc
       `docs/design/0017-0003-upsert-executor-concurrency-and-locking.md`.
-      Implement runtime conflict detection (probe arbiter
-      index before heap insert), DO UPDATE apply path
-      (read existing tuple, build merged 2N-wide row,
-      evaluate UpdateSet/UpdateWhere, write back), DO
-      NOTHING short-circuit, locking semantics under
-      concurrent writers.
+      (landed 2026-04-29: new `upsertOp` in
+      `internal/executor/operators_upsert.go` runs the
+      planner-resolved state. Per row: encode conflict
+      key from `OnConflict.ArbiterColumns`, probe via
+      `btree.RangeScan(key, key, callback)` and skip
+      invisible tuples via `mvcc.TupleVisible` (essential
+      because UPSERT inserts duplicate index entries —
+      historical dead versions are still reachable). On
+      no-conflict: `writeHeapRowReturning` + arbiter
+      `tree.Insert(key, newPtr)` so subsequent rows in
+      the same statement see the new entry. On conflict
+      + DO NOTHING: skip silently (RowsAffected does NOT
+      bump — matches upstream). On conflict + DO UPDATE:
+      build merged 2N-wide row (existing 0..N-1 || inserted
+      N..2N-1 — planner ColumnRef Index values already
+      address this layout), evaluate UpdateWhere (non-true
+      → silent skip per upstream — no DO NOTHING fallback),
+      evaluate each non-nil UpdateSet[i] (nil slots inherit
+      existing[i]), stamp xmax on conflicting tuple via
+      `PageSetHeapTupleXmax` + `markHeapDeleteDirty`,
+      writeHeapRowReturning the updated tuple,
+      maintainArbiter inserts new (key, newPtr); old (key,
+      oldPtr) entry stays in place since btree.Insert
+      allows duplicates and future probe's visibility
+      filter rejects the dead one. Refactor:
+      `writeHeapRow` split into void wrapper +
+      `writeHeapRowReturning` that surfaces the new
+      tuple's `(block, slot)`; existing INSERT/UPDATE
+      callers unchanged. Stage A scope guard at
+      `upsertOp.Open`: UpdateSet targeting a conflict-key
+      column ordinal rejects with `0A000` — without it
+      the arbiter entry for the original key would point
+      at a tuple whose actual key bytes differ; future
+      probes would land on the wrong row. Multi-column
+      arbiters surface `0A000` at runtime (v0 btree only
+      has single-column key encoding). Tests in
+      `operators_upsert_test.go`: 6 end-to-end scenarios
+      through parser→analyzer→planner→executor —
+      TestUpsertNoConflictInsertsRow (new key path),
+      TestUpsertConflictDoUpdate (replace existing label),
+      TestUpsertConflictDoNothing (RowsAffected=0),
+      TestUpsertDoUpdateMixingExistingAndExcluded
+      (`SET label = label || '/' || excluded.label`
+      exercises merged-row layout — bare `label` from
+      existing[1], `excluded.label` from inserted[N+1]),
+      TestUpsertDoUpdateWithWhereSkipsRow (predicate
+      false → silent skip), TestUpsertConflictKeyModificationRejected
+      (`0A000` Stage A guard). Test fixture seeds rows
+      THEN creates the unique index so backfill picks
+      up the seeded tuples — required because v0 doesn't
+      maintain non-arbiter indexes on plain INSERT
+      (pre-existing limitation; the arbiter is the only
+      index UPSERT itself maintains). Full `go test ./...`
+      green. Concurrency hardening (speculative insert +
+      cleanup on conflict, MVCC-correct under contention)
+      deferred to a follow-on slice; under concurrent
+      UPSERTs both writers may believe they're winning
+      the race until the next CREATE INDEX rebuild
+      surfaces the duplicate.)
 - [ ] UPSERT Stage B: `ON CONFLICT ON CONSTRAINT name`,
       `excluded.col` references in DO UPDATE.
 
