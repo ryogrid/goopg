@@ -3,6 +3,7 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -212,9 +213,7 @@ type state struct {
 	// (legacy / no-engine deployments).
 	aio AIOEngine
 
-	// directIORequested mirrors Config.DirectIO. Phase 2
-	// (M0010-0001b) consults this when opening segments to
-	// decide whether to OR in O_DIRECT.
+	// directIORequested mirrors Config.DirectIO.
 	directIORequested bool
 
 	// directIOFallbackReason is non-empty when Config.DirectIO
@@ -225,7 +224,40 @@ type state struct {
 	// when (a) DirectIO=false, or (b) DirectIO=true and the
 	// probe succeeded.
 	directIOFallbackReason string
+
+	// directIOActive is true when the operator requested direct
+	// I/O AND the probe succeeded — the only state in which
+	// `state.openSegment` flips O_DIRECT on the segment fd and
+	// `state.writeAt` routes through `writeAtDirectIO`'s aligned
+	// RMW path. Snapshot of (`directIORequested && fallback==""`)
+	// captured at writer construction.
+	directIOActive bool
+
+	// directIOBlockSize is the alignment / minimum-write
+	// granularity O_DIRECT enforces on this filesystem. ext4 and
+	// XFS use 4 KiB by default; the value is hard-coded here
+	// because every modern Linux DIO-capable FS satisfies a
+	// 4 KiB boundary. STATX_DIOALIGN-driven detection is a
+	// future optimisation — wrong-but-larger alignment never
+	// causes EINVAL, only wastes a few extra RMW bytes.
+	directIOBlockSize int64
+
+	// directIOScratch is a page-aligned mmap'd buffer used by
+	// writeAtDirectIO's RMW (read aligned region → overlay user
+	// bytes → write aligned region back). Lazy-allocated on
+	// first directIO write, freed at close. Sized at
+	// directIOScratchCap so a typical record write needs one
+	// pread + one pwrite (no scratch-loop iterations).
+	directIOScratch []byte
 }
+
+// directIOScratchCap caps the per-call RMW scratch buffer at
+// 1 MiB. WAL writes are usually much smaller (one append =
+// header + payload ≤ a few KiB); the 1 MiB ceiling keeps the
+// mmap'd region small while still handling outsized batches in
+// one pread/pwrite. writeAtDirectIO loops when the requested
+// region exceeds the scratch.
+const directIOScratchCap = 1 << 20
 
 // NewWriter creates a segmented WAL writer rooted at cfg.WALDir.
 func NewWriter(cfg Config) (*Writer, error) {
@@ -431,6 +463,8 @@ func loadState(cfg Config) (*state, error) {
 		aio:                    cfg.AIO,
 		directIORequested:      cfg.DirectIO,
 		directIOFallbackReason: fallback,
+		directIOActive:         cfg.DirectIO && fallback == "",
+		directIOBlockSize:      4096,
 	}, nil
 }
 
@@ -686,17 +720,27 @@ func (s *state) writeAt(pos int64, buf []byte) error {
 			return err
 		}
 
-		// Per-segment write. With an AIO engine attached the
-		// pwrite goes through Engine.Submit + Wait — observable
-		// in pg_aios / pg_stat_aio alongside heap writes. With
-		// no engine attached, fall back to the direct
-		// f.WriteAt path (pre-AIO behaviour). Either way, the
-		// wal writer's loop is single-threaded so the Wait is
-		// inline; deferring Wait across multiple appends
+		// Per-segment write. Three dispatch paths:
+		//   1. directIOActive: writeAtDirectIO does an aligned
+		//      RMW (read aligned region → overlay → write back).
+		//      Bypasses the AIO engine — its Submit path holds
+		//      onto the user's buffer pointer, which isn't
+		//      page-aligned. AIO+DirectIO interaction is a
+		//      perf-only follow-up; correctness already lands
+		//      via the synchronous RMW.
+		//   2. AIO engine attached (no DirectIO): pwrite goes
+		//      through Engine.Submit + Wait — observable in
+		//      pg_aios / pg_stat_aio alongside heap writes.
+		//   3. Neither: legacy direct f.WriteAt path.
+		// The wal writer's loop is single-threaded so every
+		// Wait / RMW is inline; deferring across appends
 		// requires restructuring the writer loop and is a
 		// future slice.
 		var n int
-		if s.aio != nil {
+		switch {
+		case s.directIOActive:
+			n, err = s.writeAtDirectIO(f, segOff, buf[:chunk])
+		case s.aio != nil:
 			h := s.aio.Submit(AIOSubmitOp{
 				File:      f,
 				Buffer:    buf[:chunk],
@@ -705,7 +749,7 @@ func (s *state) writeAt(pos int64, buf []byte) error {
 				Target:    f.Name(),
 			})
 			n, err = h.Wait()
-		} else {
+		default:
 			n, err = f.WriteAt(buf[:chunk], segOff)
 		}
 		if err != nil {
@@ -720,6 +764,104 @@ func (s *state) writeAt(pos int64, buf []byte) error {
 		buf = buf[chunk:]
 	}
 	return nil
+}
+
+// writeAtDirectIO writes buf to f at offset segOff under O_DIRECT
+// alignment rules: the (offset, length, buffer) triple passed to
+// pwrite must each be a multiple of directIOBlockSize. We satisfy
+// this with a per-write read-modify-write through a page-aligned
+// mmap'd scratch buffer:
+//
+//  1. Compute the aligned region [alignDown(segOff),
+//     alignUp(segOff+len(buf))) covering the destination.
+//  2. pread the existing region into scratch. Past-EOF bytes
+//     (legacy lazy-grow case without `wal_init_zero=on`) are
+//     padded with zeros — preserves the bytes-written-so-far
+//     invariant. With `wal_init_zero=on` (M0007-0001) the segment
+//     body is fully allocated and the pread always returns full.
+//  3. Overlay buf onto scratch[segOff-regionStart:].
+//  4. pwrite the full region back. O_DIRECT honours this because
+//     scratch is page-aligned (mmap MAP_PRIVATE|MAP_ANONYMOUS),
+//     regionStart is block-aligned by construction, and regionLen
+//     is a multiple of directIOBlockSize.
+//
+// When the requested region exceeds directIOScratchCap, the loop
+// processes one scratch-sized aligned slice at a time. Returns the
+// number of user bytes written (always len(buf) on success) and
+// the first error encountered.
+//
+// Trade-off: per-call RMW pays for two block-aligned syscalls per
+// write. A future Phase 2.b slice will introduce write-buffering
+// (accumulate user bytes in scratch until block-aligned, drain at
+// flushUpTo) which amortises the read cost — see Phase 2 sketch in
+// docs/design/0010-0001-wal-direct-io-write-path.md.
+func (s *state) writeAtDirectIO(f *os.File, segOff int64, buf []byte) (int, error) {
+	if s.directIOScratch == nil {
+		scratch, err := allocAlignedScratch(directIOScratchCap)
+		if err != nil {
+			return 0, fmt.Errorf("wal: alloc DIO scratch: %w", err)
+		}
+		s.directIOScratch = scratch
+	}
+
+	bs := s.directIOBlockSize
+	alignDown := func(x int64) int64 { return x &^ (bs - 1) }
+	alignUp := func(x int64) int64 { return alignDown(x + bs - 1) }
+
+	written := 0
+	for written < len(buf) {
+		userStart := segOff + int64(written)
+		userEndAll := segOff + int64(len(buf))
+
+		regionStart := alignDown(userStart)
+		// Cap the region at directIOScratchCap. Then snap
+		// the cap back down to a block boundary so pwrite
+		// length stays aligned.
+		userEnd := userEndAll
+		if userEnd-regionStart > int64(directIOScratchCap) {
+			userEnd = regionStart + int64(directIOScratchCap)
+			userEnd = alignDown(userEnd)
+			if userEnd <= userStart {
+				return written, fmt.Errorf(
+					"wal: DIO scratch %d too small for block size %d",
+					directIOScratchCap, bs)
+			}
+		}
+		regionEnd := alignUp(userEnd)
+		regionLen := int(regionEnd - regionStart)
+		scratch := s.directIOScratch[:regionLen]
+
+		// Read the aligned region. Short reads (past-EOF) are
+		// expected for legacy lazy-grow segments; zero-fill the
+		// tail. With wal_init_zero=on the segment is preallocated
+		// to SegmentSize so this branch is rarely taken — but it's
+		// the correct behaviour for both modes.
+		n, err := f.ReadAt(scratch, regionStart)
+		if err != nil && err != io.EOF {
+			return written, fmt.Errorf("wal: DIO RMW read %s at %d: %w",
+				f.Name(), regionStart, err)
+		}
+		for i := n; i < regionLen; i++ {
+			scratch[i] = 0
+		}
+
+		// Overlay the user bytes.
+		copy(scratch[userStart-regionStart:], buf[written:int(userEnd-segOff)])
+
+		// Write the aligned region back.
+		wn, werr := f.WriteAt(scratch, regionStart)
+		if werr != nil {
+			return written, fmt.Errorf("wal: DIO RMW write %s at %d: %w",
+				f.Name(), regionStart, werr)
+		}
+		if wn != regionLen {
+			return written, fmt.Errorf("wal: DIO RMW short write to %s: %d of %d",
+				f.Name(), wn, regionLen)
+		}
+
+		written = int(userEnd - segOff)
+	}
+	return written, nil
 }
 
 func (s *state) openSegment(segNo uint64) (*os.File, error) {
@@ -756,6 +898,21 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 		if dir, derr := os.Open(s.cfg.WALDir); derr == nil {
 			_ = dir.Sync()
 			_ = dir.Close()
+		}
+	}
+
+	// Phase 2 of M0010-0001: flip O_DIRECT on the live fd AFTER
+	// preallocation finishes. Preallocation's 64-KiB heap-buffer
+	// zero-fill writes can't satisfy O_DIRECT alignment (the
+	// `make([]byte, chunk)` slice isn't page-aligned), so we
+	// open buffered, lay the body down, then fcntl(F_SETFL) the
+	// flag in. Subsequent pread/pwrite go through writeAtDirectIO's
+	// RMW path which uses the per-state aligned scratch buffer.
+	// See docs/design/0010-0001-wal-direct-io-write-path.md.
+	if s.directIOActive {
+		if err := enableDirectIO(f); err != nil {
+			_ = f.Close()
+			return nil, err
 		}
 	}
 
@@ -801,5 +958,11 @@ func (s *state) close() error {
 	}
 	s.files = nil
 	s.dirty = nil
+	if s.directIOScratch != nil {
+		if err := freeAlignedScratch(s.directIOScratch); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.directIOScratch = nil
+	}
 	return firstErr
 }

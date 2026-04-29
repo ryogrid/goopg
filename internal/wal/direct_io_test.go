@@ -90,3 +90,117 @@ func TestDirectIOFallbackReasonStable(t *testing.T) {
 		}
 	}
 }
+
+// TestDirectIORoundTripWithPreallocation pins the Phase 2
+// behaviour: with DirectIO=on AND wal_init_zero=on (the supported
+// production combination — preallocation guarantees the segment
+// body is fully laid down so RMW reads always succeed), records
+// round-trip through the kernel via the per-write RMW path.
+// Skips when the probe rejected O_DIRECT (the test host's tmpdir
+// isn't on a DIO-capable FS) — same idiom as the M0009 io_uring
+// tests. SegmentSize is chosen as 4 KiB (one block) to exercise
+// the regular writeAtDirectIO loop without crossing segments.
+func TestDirectIORoundTripWithPreallocation(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{
+		WALDir:      walDir,
+		SegmentSize: 4096,
+		DirectIO:    true,
+		Preallocate: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason := w.DirectIOFallbackReason(); reason != "" {
+		t.Skipf("O_DIRECT unsupported on this host: %s", reason)
+	}
+
+	payloads := [][]byte{
+		[]byte("alpha"),
+		[]byte("bravo charlie"),
+		[]byte("delta echo foxtrot golf"),
+	}
+	var lastEnd uint64
+	for _, p := range payloads {
+		_, end, err := w.Append(p)
+		if err != nil {
+			t.Fatalf("Append %q: %v", p, err)
+		}
+		lastEnd = end
+	}
+	if err := w.FlushUpTo(lastEnd); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, err := ReadAll(walDir, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != len(payloads) {
+		t.Fatalf("record count = %d, want %d", len(recs), len(payloads))
+	}
+	for i, p := range payloads {
+		if got := string(recs[i].Payload); got != string(p) {
+			t.Errorf("record[%d] = %q, want %q", i, got, p)
+		}
+	}
+}
+
+// TestDirectIORecordSpanningBlocks: a single payload large enough
+// to straddle multiple 4 KiB blocks exercises writeAtDirectIO's
+// region-len math when the user bytes don't align to block
+// boundaries. SegmentSize is one MiB so the record fits in a
+// single segment but crosses ~3 block boundaries. Skips on probe
+// fallback like the round-trip test.
+func TestDirectIORecordSpanningBlocks(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{
+		WALDir:      walDir,
+		SegmentSize: 1 << 20,
+		DirectIO:    true,
+		Preallocate: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason := w.DirectIOFallbackReason(); reason != "" {
+		t.Skipf("O_DIRECT unsupported on this host: %s", reason)
+	}
+
+	// Build a payload that lands at offset ~1.5 KiB (after the
+	// 12-byte record header) and stretches past the third block
+	// boundary so the RMW touches blocks 0..3.
+	payload := make([]byte, 12000) // ~3 blocks
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	_, end, err := w.Append(payload)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.FlushUpTo(end); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recs, err := ReadAll(walDir, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("record count = %d, want 1", len(recs))
+	}
+	if len(recs[0].Payload) != len(payload) {
+		t.Fatalf("payload length = %d, want %d", len(recs[0].Payload), len(payload))
+	}
+	for i := range payload {
+		if recs[0].Payload[i] != payload[i] {
+			t.Fatalf("payload[%d] = %d, want %d", i, recs[0].Payload[i], payload[i])
+		}
+	}
+}

@@ -42,8 +42,9 @@ the actual O_DIRECT segment open + alignment-safe writes.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 1 | GUC, FS probe, fallback reporting, startup log line. `wal_direct_io=on` is plumbed end-to-end but does NOT yet flip `O_DIRECT` on segment opens — buffered writes regardless. | landed (this loop) |
-| 2 | OR `O_DIRECT` into `openSegment`'s flags when probe ok. Per-write read-modify-write for partial trailing blocks. Aligned scratch buffer allocation via `unix.Mmap`. Walreceiver inherits via the shared writer fd. | next slice (M0010-0001b in fix_plan) |
+| 1 | GUC, FS probe, fallback reporting, startup log line. | landed |
+| 2 | `enableDirectIO(f)` toggles O_DIRECT on segment fds (post-preallocation, via fcntl `F_SETFL`). Per-write RMW alignment in `state.writeAtDirectIO`. Aligned scratch via `unix.Mmap(MAP_PRIVATE\|MAP_ANONYMOUS)`. Walreceiver inherits via the shared writer fd. | landed |
+| 2.b | Write-buffering fast path: accumulate user bytes in scratch until block-aligned, drain at flushUpTo. Amortises the per-write RMW pread cost. | deferred (perf-only optimisation) |
 
 The split is not arbitrary: Phase 2 requires non-trivial changes to
 `state.writeAt` (alignment-safe per-chunk RMW, scratch buffer
@@ -52,17 +53,17 @@ first lets operators verify their filesystem honours O_DIRECT
 (probe outcome surfaces in startup logs) before Phase 2 changes
 the syscall shape.
 
-## Phase 1 file map
+## File map (Phases 1 + 2)
 
 | File | Role |
 | --- | --- |
-| `internal/wal/direct_io_linux.go` | `probeDirectIO(walDir)` — opens a sentinel file with `O_RDWR\|O_CREAT\|O_DIRECT`, observes EINVAL / EOPNOTSUPP, removes the sentinel. Returns the human-readable fallback reason or empty on success. |
-| `internal/wal/direct_io_other.go` | Non-Linux stub returning a fixed fallback reason. Mirrors the M0009 io_uring stub shape (`internal/aio/method_iouring_other.go`). |
-| `internal/wal/writer.go` | New `Config.DirectIO bool`, new `state.directIORequested` / `state.directIOFallbackReason`, `loadState` runs the probe when `DirectIO=true`, new `Writer.DirectIORequested()` / `Writer.DirectIOFallbackReason()` accessors. |
+| `internal/wal/direct_io_linux.go` | `probeDirectIO(walDir)` — opens a sentinel file with `O_RDWR\|O_CREAT\|O_DIRECT`, observes EINVAL / EOPNOTSUPP, removes the sentinel. `enableDirectIO(f)` — fcntl `F_SETFL` to flip `O_DIRECT` on a live fd post-preallocation. `allocAlignedScratch(size)` / `freeAlignedScratch(b)` — page-aligned RMW buffer via `unix.Mmap(MAP_PRIVATE\|MAP_ANONYMOUS)`. |
+| `internal/wal/direct_io_other.go` | Non-Linux stub: probe always falls back; `enableDirectIO` returns an error (never reached because `directIOActive` is always false on non-Linux); scratch helpers are unsupported. |
+| `internal/wal/writer.go` | New `Config.DirectIO bool`. `state` grows `directIORequested`, `directIOFallbackReason`, `directIOActive`, `directIOBlockSize`, `directIOScratch`. `loadState` runs the probe + sets `directIOActive`. `openSegment` calls `enableDirectIO` after preallocation when active. `state.writeAt` dispatches to new `state.writeAtDirectIO` (RMW: pread aligned region → overlay user bytes → pwrite aligned region back, looping if region exceeds `directIOScratchCap` = 1 MiB). `state.close` munmaps the scratch. New `Writer.DirectIORequested()` / `Writer.DirectIOFallbackReason()` accessors. |
 | `internal/config/defaults.go` | Registers the `wal_direct_io` GUC (`TypeBool`, default `off`, `ContextPostmaster`, `ScopeServer`). |
 | `internal/initdb/open.go` | `OpenOptions.WALDirectIO` plumbs to `wal.Config.DirectIO`. |
 | `cmd/goopg/main.go` | Reads the GUC into `OpenOptions.WALDirectIO`; emits `event=wal_direct_io_active` on probe success or `event=wal_direct_io_fallback` on failure. |
-| `internal/wal/direct_io_test.go` | `TestDirectIODisabledByDefault` (no probe runs when GUC off), `TestDirectIOEnabledProbesFilesystem` (probe runs, outcome plumbed correctly per GOOS), `TestDirectIOFallbackReasonStable` (idempotent reads). |
+| `internal/wal/direct_io_test.go` | `TestDirectIODisabledByDefault`, `TestDirectIOEnabledProbesFilesystem`, `TestDirectIOFallbackReasonStable` (Phase 1); `TestDirectIORoundTripWithPreallocation` (records round-trip via the RMW path), `TestDirectIORecordSpanningBlocks` (12 KiB payload across ~3 block boundaries) (Phase 2). Phase 2 tests `t.Skip` on probe fallback. |
 
 ## The probe
 
@@ -116,50 +117,70 @@ are the public read-side. `cmd/goopg start` is the only caller in
 Phase 1; future consumers (a `pg_stat_wal_io` view, an
 `event=...` counter export) will read the same accessors.
 
-## Phase 2 sketch (sibling slice — not landed in this loop)
+## Phase 2 details (landed)
 
-Phase 2 (`M0010-0001b` in `.ralph/fix_plan.md`) adds:
+1. **O_DIRECT segment open** (`state.openSegment`): the standard
+   `os.OpenFile(O_RDWR|O_CREATE)` happens first. When the segment
+   is new and preallocation is on, `preallocateSegment` lays the
+   16 MiB body down via 64-KiB chunked pwrites — these can't
+   satisfy O_DIRECT alignment because `make([]byte, 64KiB)`
+   isn't page-aligned. After preallocation completes (and the
+   directory fsync) we call `enableDirectIO(f)` which uses
+   `fcntl(F_SETFL, flags | unix.O_DIRECT)` to flip the flag on
+   the live fd. From this point on every read / write through
+   `f` must be block-aligned. The same fd serves the wal writer
+   AND the walreceiver path (walreceiver delegates to
+   `wal.Writer.Append`), so walreceiver inherits the alignment
+   contract for free.
+2. **Per-write alignment** (`state.writeAtDirectIO`): three steps
+   per region.
+   1. Compute the aligned region `[alignDown(segOff),
+      alignUp(segOff+len(user bytes)))`. Capped at
+      `directIOScratchCap = 1 MiB` per iteration; outsized writes
+      loop through the scratch.
+   2. `pread` the existing aligned region into the per-state
+      scratch. Past-EOF bytes (legacy lazy-grow without
+      `wal_init_zero=on`) are zero-padded — the bytes-written-
+      so-far invariant is preserved because no caller reads past
+      `state.writeLSN` before flushUpTo blesses it.
+   3. Overlay user bytes onto `scratch[userStart-regionStart:]`,
+      `pwrite` the full aligned region back. O_DIRECT honours
+      this because (offset, length, buffer) are all block-aligned
+      by construction (regionStart = alignDown, regionEnd =
+      alignUp, scratch is `unix.Mmap`'d so 4 KiB-aligned).
+3. **Aligned scratch lifecycle**: lazy-allocated on the first
+   `writeAtDirectIO` call (cost paid only on direct-I/O writers,
+   not buffered ones), freed in `state.close`. Backed by
+   `unix.Mmap(MAP_PRIVATE|MAP_ANONYMOUS)` — same pattern as
+   `internal/storage/arena.go`'s buffer pool slab. Capacity 1
+   MiB sized to handle a typical commit-batch in one syscall pair
+   while keeping memory overhead bounded.
+4. **AIO + DirectIO interaction**: when `state.directIOActive`
+   AND `state.aio != nil`, `writeAt` bypasses the AIO engine
+   and uses the synchronous RMW path. Reason: `aio.Op.Buffer`
+   holds the user's slice pointer, which isn't page-aligned, so
+   AIO Submit would need its own aligned-copy substrate. That's
+   a perf-only follow-up (heap/index O_DIRECT writes already
+   pay this cost via the page-aligned arena slot path); WAL
+   correctness lands via the synchronous RMW first.
+5. **Block-size**: hard-coded at 4 KiB for now
+   (`state.directIOBlockSize`). Every modern Linux DIO-capable
+   filesystem (ext4, XFS) satisfies this boundary. A
+   `STATX_DIOALIGN`-based probe (kernel ≥ 6.1) is a future
+   tightening — wrong-but-larger-than-actual alignment never
+   causes EINVAL, just wastes a few extra RMW bytes.
 
-1. **`O_DIRECT` segment open**: when `state.directIORequested &&
-   state.directIOFallbackReason == ""`, `openSegment` ORs in
-   `unix.O_DIRECT`. The same fd serves both writer and
-   walreceiver paths (walreceiver writes through
-   `wal.Writer.Append`).
-2. **Per-write alignment**: `writeAt` routes through a new
-   `writeAtDirectIO(f, segOff, buf, blockSize)`:
-   - Compute the aligned region `[alignDown(segOff),
-     alignUp(segOff+len(buf)))`.
-   - Allocate aligned scratch via `unix.Mmap(MAP_PRIVATE|
-     MAP_ANONYMOUS)` — same trick as
-     `internal/storage/arena.go`.
-   - `pread` the existing region into scratch. Past-EOF bytes
-     (legacy lazy-grow case without `wal_init_zero=on`) are
-     padded with zeros.
-   - Overlay `buf` onto `scratch[segOff-regionStart:]`.
-   - `pwrite` the full region back. O_DIRECT honours this
-     because (offset, length, buffer) are all block-aligned.
-3. **Block-size detection**: probe via `unix.Statx` with
-   `STATX_DIOALIGN` (kernel ≥ 6.1) or fall back to 4 KiB. The
-   block size is stored on `state` and passed to
-   `writeAtDirectIO`.
-4. **AIO submit path**: when `Config.AIO != nil` and `DirectIO`
-   is active, `state.writeAt` still routes through the engine —
-   but the buffer must be aligned. Either the engine's worker
-   method copies into a scratch arena before pwrite, or the
-   writer pre-aligns at the wal layer. Phase 2 design picks the
-   former (engine-side) so heap/index O_DIRECT writes (which
-   already use page-aligned arena slots) don't pay for a
-   redundant copy.
-5. **Walreceiver coverage**: walreceiver's WAL-persist path
-   delegates to `wal.Writer.Append` — it inherits Phase 2's
-   alignment automatically, no separate code path.
-
-Phase 2 tests must cover (a) round-trip on ext4 with the probe
-honoured, (b) probe-failure path identical to Phase 1 buffered
-behaviour, (c) RMW correctness for arbitrary chunk lengths /
-offsets, (d) crash-restart with `wal_init_zero=on` (the EOS
-sentinel rule from M0007-0001 must still terminate recovery
-cleanly when the trailing block is RMW'd back unchanged).
+Phase 2 tests cover (a) round-trip with the probe honoured (`Test
+DirectIORoundTripWithPreallocation` — three appends + flush +
+ReadAll), (b) RMW correctness across multiple block boundaries
+(`TestDirectIORecordSpanningBlocks` — 12 KiB payload spanning ~3
+block boundaries; the test asserts every byte round-trips). The
+probe-failure path is the same buffered code Phase 1 already
+exercised. Crash-restart correctness rides on the existing
+`TestPreallocatedSegmentRecoversCleanly` test in `wal_test.go`:
+the byte stream written under O_DIRECT is identical to the
+buffered stream (the RMW writes the exact same bytes), so the
+EOS-sentinel decoder sees no difference.
 
 ## Cross-references
 

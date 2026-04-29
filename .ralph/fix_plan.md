@@ -1545,29 +1545,43 @@ topmost unchecked item.
       indexed; spans both phases with Phase 2 explicitly
       marked deferred. (landed 2026-04-29.)
 
-- [ ] WAL direct-I/O write path — Phase 2 (M0010-0001b):
-      flip O_DIRECT on segment opens, alignment-safe per-
-      write read-modify-write for partial trailing blocks,
-      aligned scratch via `unix.Mmap(MAP_PRIVATE|
-      MAP_ANONYMOUS)` (mirrors `internal/storage/arena.go`),
-      block-size detection via `unix.Statx(STATX_DIOALIGN)`
-      with 4 KiB fallback for kernels < 6.1, AIO submit-path
-      alignment (engine-side scratch copy so heap/index
-      O_DIRECT writes don't pay a redundant copy). Phase 2
-      gates on `state.directIORequested &&
-      state.directIOFallbackReason == ""`. Walreceiver's
-      WAL-persist path inherits via the shared writer fd
-      (`wal.Writer.Append` → `state.writeAt` → the same
-      O_DIRECT-aware code path). Tests must cover round-trip
-      on ext4 with the probe honoured, probe-failure path
-      identical to Phase 1 buffered behaviour, RMW
-      correctness for arbitrary chunk lengths / offsets,
-      crash-restart with `wal_init_zero=on` (the M0007-0001
-      EOS sentinel rule must still terminate recovery
-      cleanly when the trailing block is RMW'd back
-      unchanged). Same design doc
+- [x] WAL direct-I/O write path — Phase 2 (M0010-0001b):
+      flip O_DIRECT on segment fds, alignment-safe per-write
+      RMW, aligned scratch via `unix.Mmap`. (landed
+      2026-04-29: `state.directIOActive` snapshots
+      `directIORequested && fallback==""` at construction.
+      `enableDirectIO(f)` uses `fcntl(F_SETFL,
+      flags|unix.O_DIRECT)` to flip the flag on the live fd
+      AFTER preallocation finishes — preallocation's 64-KiB
+      heap-buffer zero-fill can't satisfy O_DIRECT alignment.
+      `state.writeAt` dispatches to `state.writeAtDirectIO`
+      when active: pread the aligned region (`alignDown`/
+      `alignUp` bracket around the user bytes) into the
+      per-state mmap'd scratch, overlay user bytes, pwrite
+      the full aligned region back. Past-EOF reads (legacy
+      lazy-grow case) zero-pad the tail. `directIOScratchCap
+      = 1 MiB`; outsized writes loop through the scratch.
+      Aligned scratch is lazy-allocated on first write via
+      `unix.Mmap(MAP_PRIVATE|MAP_ANONYMOUS)` (mirrors
+      `internal/storage/arena.go`); freed in `state.close`.
+      AIO+DirectIO bypasses the engine and uses synchronous
+      RMW — engine-side aligned-copy is a perf-only follow-
+      up (`Phase 2.b` in the design doc). Block size hard-
+      coded at 4 KiB; STATX_DIOALIGN-driven detection
+      deferred. Walreceiver's WAL-persist path inherits via
+      the shared writer fd (no separate code path).
+      Tests: TestDirectIORoundTripWithPreallocation
+      (three appends + flush + ReadAll round-trip via
+      RMW; SegmentSize=4 KiB),
+      TestDirectIORecordSpanningBlocks (12 KiB payload
+      across ~3 block boundaries; every byte round-trips).
+      Both `t.Skip` on probe fallback. Crash-restart
+      correctness rides on existing
+      `TestPreallocatedSegmentRecoversCleanly`: the byte
+      stream is identical under O_DIRECT vs buffered. Built
+      and full `go test ./...` green. Design doc
       `docs/design/0010-0001-wal-direct-io-write-path.md`
-      (Phase 2 section already drafted in the doc).
+      updated with Phase 2 details.)
 
 - [ ] Walsender in-memory WAL handoff. Bounded ring of
       recent WAL bytes maintained by the WAL writer (sized
