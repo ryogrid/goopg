@@ -1919,18 +1919,34 @@ the topmost unchecked item.
       verification + counter surface land in M0013-0002 and
       M0013-0003.)
 
-- [ ] Overflow + eviction durability ordering (M0013-0002):
-      verify shared-buffer eviction and checkpoint-driven
-      data-flush paths force WAL drain + dataSync through the
-      page LSN before the data-page write proceeds. The Pool
-      eviction path already calls `Writer.FlushUpTo(pageLSN)`
-      which now has two-stage semantics, so the invariant is
-      *automatically* preserved — but a regression test that
-      pins it (set up a dirty buffered WAL record below page
-      LSN, evict, observe Stage 1 drain + Stage 2 dataSync
-      both ran before the heap write) is required by the
-      milestone. Same for the checkpoint flush path. Continues
+- [x] Overflow + eviction durability ordering (M0013-0002).
+      Design doc
       `docs/design/0013-0002-overflow-and-eviction-durability-ordering.md`.
+      (landed 2026-04-29: pure additive testing — no
+      production code changes. The M0013-0001 two-stage
+      `FlushUpTo` is already invoked by the existing flush
+      sites (`Pool.flushSlot` line 886; `Pool.flushDirtyBatch`
+      line 836) before `mgr.WriteBlock` fires, so the
+      WAL-before-data invariant is preserved by construction.
+      New `internal/storage/wal_buffer_eviction_test.go`
+      (external `package storage_test` so it can import
+      `wal` without cycle). Two tests pin the invariant:
+      TestEvictionDrainsBufferedWALBeforeWritingPage (real
+      `*wal.Writer` with WALBuffers=64 KiB, Append small
+      record → segment 0 bytes confirmed in walBuf →
+      MarkDirtyWithLSN(endLSN) → force eviction via second
+      PinNew on one-slot pool → assert heap byte persisted
+      AND segment bytes > 0 AND ReadAll returns the
+      payload). TestFlushAllPacedDrainsBufferedWAL exercises
+      the checkpointer-driven batched path
+      (`Pool.FlushAllPaced` → `flushDirtyBatch` →
+      `FlushUpTo(maxLSN)`) with 3 pages, 3 distinct
+      buffered LSNs — every payload durable, every heap
+      byte on disk. Failure-mode catalogue in the design
+      doc maps Stage 1 skipped / Stage 2 skipped / wrong
+      ordering / stale maxLSN to the specific assertion
+      that catches each. Counters / observability surface
+      for forced-drain events land in M0013-0003.)
 
 - [ ] WAL buffers observability + rollout (M0013-0003):
       counters for current `bytes_resident`, lifetime
