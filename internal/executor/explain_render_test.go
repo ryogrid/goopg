@@ -147,6 +147,63 @@ func TestExplainVerboseAddsOutputLine(t *testing.T) {
 	}
 }
 
+func TestExplainIncludesWindowAggNodeText(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := runExplainRows(t, ctx, "EXPLAIN SELECT row_number() OVER (ORDER BY id) FROM t")
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "WindowAgg") {
+		t.Errorf("EXPLAIN TEXT missing WindowAgg node:\n%s", joined)
+	}
+}
+
+func TestExplainIncludesWindowAggNodeJSON(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (FORMAT JSON) SELECT row_number() OVER (ORDER BY id) FROM t")
+	if len(lines) != 1 {
+		t.Fatalf("FORMAT JSON produced %d rows, want 1", len(lines))
+	}
+	var top []map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &top); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, lines[0])
+	}
+	if len(top) != 1 {
+		t.Fatalf("root array has %d entries, want 1", len(top))
+	}
+	if !jsonPlanHasNodeType(top[0], "WindowAgg") {
+		t.Fatalf("EXPLAIN JSON missing WindowAgg node: %+v", top[0])
+	}
+}
+
+func jsonPlanHasNodeType(node map[string]any, needle string) bool {
+	if nodeType, ok := node["Node Type"].(string); ok && strings.HasPrefix(nodeType, needle) {
+		return true
+	}
+	children, ok := node["Plans"].([]any)
+	if !ok {
+		return false
+	}
+	for _, child := range children {
+		cm, ok := child.(map[string]any)
+		if !ok {
+			continue
+		}
+		if jsonPlanHasNodeType(cm, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 // (Stage A's ANALYZE-rejection tests were replaced by the
 // instrumentation tests below when M0018-0003 lifted the gate.
 // `EXPLAIN ANALYZE` now executes the inner statement and reports

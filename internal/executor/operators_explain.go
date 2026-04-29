@@ -322,6 +322,8 @@ func describePlan(n planner.Node) string {
 			return fmt.Sprintf("Aggregate (%d aggregates)", len(p.Aggs))
 		}
 		return fmt.Sprintf("GroupAggregate (%d keys, %d aggregates)", len(p.GroupExprs), len(p.Aggs))
+	case *planner.WindowAgg:
+		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *planner.SeqScan:
 		// `(stats)` flags scans whose Table.Stats has been
 		// populated by ANALYZE — the planner's cost-driven
@@ -404,6 +406,8 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.Limit:
 		return []planner.Node{p.Child}
 	case *planner.Aggregate:
+		return []planner.Node{p.Child}
+	case *planner.WindowAgg:
 		return []planner.Node{p.Child}
 	case *planner.Join:
 		return []planner.Node{p.Left, p.Right}

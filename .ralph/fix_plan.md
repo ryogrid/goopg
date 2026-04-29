@@ -2816,7 +2816,7 @@ Substantial. Decompose when picked up.
       - [x] M0020-S06: executor row_number() evaluation.
       - [x] M0020-S07: executor rank() evaluation with peer-group
             semantics.
-      - [ ] M0020-S08: EXPLAIN label/tree integration for
+      - [x] M0020-S08: EXPLAIN label/tree integration for
             WindowAgg.
       - [ ] M0020-S09: regression tests (analyzer/planner/executor
             for Stage A semantics).
