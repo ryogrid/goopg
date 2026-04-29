@@ -182,18 +182,20 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
 		walDirectIO := boolGUC(registry, "wal_direct_io", false)
+		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		aioMethod := stringGUC(registry, "io_method", "")
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
 		var err error
 		rt, err = initdb.Open(initdb.OpenOptions{
-			DataDir:           *dataDir,
-			PoolSlots:         poolSlots,
-			WALInitZero:       walInitZero,
-			WALDirectIO:       walDirectIO,
-			AIOMethod:         aioMethod,
-			AIOWorkers:        aioWorkers,
-			AIOMaxConcurrency: aioMax,
+			DataDir:               *dataDir,
+			PoolSlots:             poolSlots,
+			WALInitZero:           walInitZero,
+			WALDirectIO:           walDirectIO,
+			WALSenderMemoryBuffer: walSenderMemBuf,
+			AIOMethod:             aioMethod,
+			AIOWorkers:            aioWorkers,
+			AIOMaxConcurrency:     aioMax,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
@@ -246,6 +248,16 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 					"event", "wal_direct_io_active",
 					"requested", true)
 			}
+		}
+		// Walsender in-memory WAL handoff (M0010-0002): when
+		// the ring is configured, log its capacity at startup
+		// so an operator can verify the rollout — particularly
+		// important when wal_direct_io=on, since the ring is
+		// the page-cache replacement for sender-path reads.
+		if rt.WAL != nil && rt.WAL.MemRing() != nil {
+			logger.Info("wal sender memory buffer attached",
+				"event", "wal_sender_memory_buffer_attached",
+				"capacity_bytes", rt.WAL.MemRing().Cap())
 		}
 		defer func() {
 			// Persist the catalog before tearing down the pool.

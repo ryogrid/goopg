@@ -75,6 +75,17 @@ type Config struct {
 	// without surprising correctness regressions while Phase
 	// 2 is in flight.
 	DirectIO bool
+
+	// SenderMemoryBuffer sizes (in bytes) the in-memory ring
+	// of recent WAL bytes used by the walsender hot-path.
+	// 0 disables the ring entirely; iterators always pread
+	// from disk. >0 allocates a fixed-size byte ring that
+	// captures every successful state.writeAt — RecordIterator
+	// consults the ring before reaching for a segment file.
+	// Mirrors the M0010 milestone's `wal_sender_memory_buffer`
+	// GUC. Default 0 keeps the legacy disk-only path. See
+	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
+	SenderMemoryBuffer int64
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -186,6 +197,14 @@ type Writer struct {
 	// docs/design/0010-0001-wal-direct-io-write-path.md.
 	directIORequested      bool
 	directIOFallbackReason string
+
+	// memRing is shared with state.memRing (one allocation,
+	// two pointers). Exposed via MemRing() so the iterator
+	// and observability code can read it without serialising
+	// through the writer's loop. nil when
+	// Config.SenderMemoryBuffer == 0. See
+	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
+	memRing *MemRing
 }
 
 type state struct {
@@ -249,6 +268,14 @@ type state struct {
 	// directIOScratchCap so a typical record write needs one
 	// pread + one pwrite (no scratch-loop iterations).
 	directIOScratch []byte
+
+	// memRing mirrors recently-written WAL bytes in RAM so
+	// walsender's RecordIterator can stream without paying for
+	// disk reads (especially important when wal_direct_io=on
+	// keeps WAL out of the OS page cache). nil when
+	// Config.SenderMemoryBuffer == 0; iterators always go to
+	// disk in that case.
+	memRing *MemRing
 }
 
 // directIOScratchCap caps the per-call RMW scratch buffer at
@@ -276,6 +303,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 		done:                   make(chan struct{}),
 		directIORequested:      st.directIORequested,
 		directIOFallbackReason: st.directIOFallbackReason,
+		memRing:                st.memRing,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
@@ -303,6 +331,14 @@ func (w *Writer) DirectIOFallbackReason() string {
 func (w *Writer) DirectIORequested() bool {
 	return w.directIORequested
 }
+
+// MemRing returns the in-memory WAL ring. nil when
+// `wal_sender_memory_buffer = 0` (or absent). RecordIterator
+// consults this on every read to decide between RAM and disk;
+// observability code reads its Hits()/Misses() counters. The
+// returned pointer is stable for the writer's lifetime; callers
+// must not mutate the ring's internal state.
+func (w *Writer) MemRing() *MemRing { return w.memRing }
 
 // WrittenLSN returns the LSN of the last byte the writer has
 // appended (durable or not). Cheap and lock-free; suitable for
@@ -465,6 +501,7 @@ func loadState(cfg Config) (*state, error) {
 		directIOFallbackReason: fallback,
 		directIOActive:         cfg.DirectIO && fallback == "",
 		directIOBlockSize:      4096,
+		memRing:                NewMemRing(cfg.SenderMemoryBuffer),
 	}, nil
 }
 
@@ -593,10 +630,18 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 func (s *state) append(payload []byte) (uint64, uint64, error) {
 	record := encodeRecord(payload)
 	start := uint64(s.writePos) + 1
-	if err := s.writeAt(s.writePos, record); err != nil {
+	writePos := s.writePos
+	if err := s.writeAt(writePos, record); err != nil {
 		return 0, 0, err
 	}
-	s.writePos += int64(len(record))
+	// Mirror the just-written bytes into the in-memory ring so
+	// walsender's iterator can stream from RAM. Append AFTER the
+	// disk write succeeds — a failed pwrite must not appear in
+	// the ring (the writer's loop will retry / surface the error
+	// and the byte position never advances). nil ring is the
+	// default config; Append is a no-op then.
+	s.memRing.Append(writePos, record)
+	s.writePos = writePos + int64(len(record))
 	end := uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {

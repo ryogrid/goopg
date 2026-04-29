@@ -194,6 +194,21 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// wal_sender_memory_buffer sizes (in bytes) the in-memory
+	// ring of recent WAL bytes used by walsender's
+	// RecordIterator. 0 disables the ring; >0 mirrors every
+	// successful WAL write so senders can stream without
+	// disk reads (especially valuable when wal_direct_io=on
+	// keeps recent WAL out of the OS page cache). Default
+	// 16 MiB matches the M0010 milestone default. See
+	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_sender_memory_buffer", Type: TypeInt, BootVal: "16777216",
+		MinVal: 0, MaxVal: 1 << 30,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// io_method picks the AIO I/O method. `sync` runs every
 	// I/O on the calling goroutine (the safe default that
 	// matches v0's pre-AIO behaviour); `worker` uses a

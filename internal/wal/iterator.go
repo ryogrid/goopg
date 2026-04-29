@@ -151,8 +151,22 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 // readBytesAt fetches `n` bytes starting at byte offset `pos` in the
 // WAL stream, transparently spanning segment boundaries. Returns a
 // fresh buffer the caller may retain.
+//
+// Hot path: when the writer has a non-nil in-memory ring AND the
+// requested range is fully resident, the bytes come straight from
+// RAM — no syscall. M0010-0002 introduced this path so walsenders
+// don't depend on OS page cache residency, especially with
+// `wal_direct_io=on` keeping recent WAL out of the cache. On a
+// miss (range not resident, or no ring) we fall through to the
+// per-segment pread loop. Hit/miss counters live on the ring and
+// surface via the writer's observability accessors.
 func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
 	out := make([]byte, n)
+	if ring := it.writer.MemRing(); ring != nil {
+		if got, ok := ring.ReadAt(pos, out); ok && got == n {
+			return out, nil
+		}
+	}
 	read := 0
 	for read < n {
 		segNo := uint64((pos + int64(read)) / it.segSize)

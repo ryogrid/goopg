@@ -89,6 +89,13 @@ type OpenOptions struct {
 	// docs/design/0010-0001-wal-direct-io-write-path.md.
 	WALDirectIO bool
 
+	// WALSenderMemoryBuffer sizes the in-memory WAL byte ring
+	// the walsender RecordIterator consults before falling
+	// back to disk reads. 0 disables the ring. Mirrors the
+	// `wal_sender_memory_buffer` GUC. See
+	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
+	WALSenderMemoryBuffer int64
+
 	// AIO* control the AIO engine the storage manager (and
 	// future heap-scan / checkpointer / WAL-writer callers)
 	// will use. Maps to the upstream-aligned `io_method`,
@@ -164,9 +171,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	walCfg := wal.Config{
-		WALDir:      filepath.Join(abs, "pg_wal"),
-		Preallocate: opts.WALInitZero,
-		DirectIO:    opts.WALDirectIO,
+		WALDir:             filepath.Join(abs, "pg_wal"),
+		Preallocate:        opts.WALInitZero,
+		DirectIO:           opts.WALDirectIO,
+		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
 	}
 	if aioEngine != nil {
 		walCfg.AIO = walAIOEngineAdapter{eng: aioEngine}

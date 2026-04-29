@@ -1583,26 +1583,48 @@ topmost unchecked item.
       `docs/design/0010-0001-wal-direct-io-write-path.md`
       updated with Phase 2 details.)
 
-- [ ] Walsender in-memory WAL handoff. Bounded ring of
-      recent WAL bytes maintained by the WAL writer (sized
-      via a new `wal_sender_memory_buffer` GUC, default e.g.
-      16 MiB). `walsender` reads from the ring when the
-      requested LSN is within the retention window, falls
-      back to on-disk segment reads (the existing path) for
-      historical ranges. Retention / eviction policy: drop
-      the oldest LSN bytes once the ring is full AND every
-      active sender's `sentLSN` has passed them; lagging
-      senders that fall outside the window cleanly switch to
-      disk reads without dropping the connection. Concurrent-
-      safe across multiple senders — RWMutex on the ring
-      head/tail metadata, lock-free byte read once the
-      sender has its (start, len) snapshot. Preserves M0005
-      ordering / framing: this is purely the byte-source
-      switch. Required because M0010-0001's `O_DIRECT` path
-      makes recent WAL no-longer-cheaply-available from the
-      page cache, so a sender trying to stream from disk
-      reads pays the full I/O cost. Design doc
-      `docs/design/0010-0002-walsender-in-memory-wal-handoff.md`.
+- [x] Walsender in-memory WAL handoff. (landed 2026-04-29:
+      new `wal.MemRing` (`internal/wal/mem_ring.go`):
+      fixed-size byte ring keyed by 0-based LSN-byte
+      position. `wal_sender_memory_buffer` GUC (TypeInt,
+      default 16 MiB, range `[0, 1 GiB]`, ContextPostmaster);
+      0 disables. `state.append` calls
+      `s.memRing.Append(writePos, record)` AFTER
+      `state.writeAt` succeeds — a failed pwrite must not
+      appear in the ring. `RecordIterator.readBytesAt`
+      consults `it.writer.MemRing().ReadAt(pos, out)` first;
+      on hit returns from RAM (no syscall), on miss falls
+      through to the legacy per-segment pread loop. Single
+      `sync.RWMutex`: writers Lock during memcpy + head/tail
+      advance, readers RLock during their own memcpy so a
+      concurrent eviction can't free bytes mid-read.
+      `hits` / `misses` are atomic counters bumped per
+      `ReadAt`. Eviction is FIFO: when `tail - head > cap`,
+      head advances to `tail - cap`. Partial-overlap reads
+      return `(0, false)` so the caller fetches the whole
+      range from disk in one go (no two-source stitching).
+      Reset path handles post-recovery first-Append at
+      non-zero `writePos`; oversized Appends keep only the
+      trailing `cap` bytes. `cmd/goopg start` logs
+      `event=wal_sender_memory_buffer_attached
+      capacity_bytes=N` at startup when configured. Tests:
+      TestMemRingNilSafe, TestMemRingRoundTripWithinCap,
+      TestMemRingEvictsOldBytesOnOverflow,
+      TestMemRingPartialOverlapMisses, TestMemRingWraps,
+      TestMemRingWriteLargerThanCap,
+      TestMemRingConcurrentReads (4 readers vs 100 writes —
+      pins the lock-during-memcpy invariant);
+      TestIteratorReadsFromMemRing (ring on + segment file
+      deleted post-Append → iterator still streams, proving
+      RAM source; Hits()>0),
+      TestIteratorFallsBackToDiskWithoutRing (ring off +
+      segment intact → pread succeeds, legacy path
+      unchanged). Built and full `go test ./...` green.
+      Design doc
+      `docs/design/0010-0002-walsender-in-memory-wal-handoff.md`
+      indexed. Walsender's
+      `pg_stat_replication.send_buffer_*` counter surface
+      remains follow-up under M0010-0003.)
 
 - [ ] WAL direct-I/O observability + operations. New
       counters in `pg_stat_wal` (or a sibling
