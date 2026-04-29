@@ -41,3 +41,6 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0004 | TAP test port & Go utility library                     | planned  | `0004-tap-test-port.md`                           |
 | 0005 | Streaming replication support                          | planned  | `0005-streaming-replication-support.md`           |
 | 0006 | Planner-grade statistics (MCV, histograms, cost-based join algo) | planned  | `0006-planner-statistics.md`                      |
+| 0007 | WAL segment preallocation & `fdatasync`-based commit path        | planned  | `0007-wal-segment-preallocation.md`               |
+| 0008 | Logical replication support                                      | planned  | `0008-logical-replication-support.md`             |
+| 0009 | AIO subsystem (asynchronous I/O)                                 | planned  | `0009-aio-subsystem.md`                           |
