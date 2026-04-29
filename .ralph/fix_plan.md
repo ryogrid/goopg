@@ -3087,13 +3087,51 @@ See `docs/milestones/0009-aio-subsystem.md`.
       slices; the substrate they all sit on is now in
       place.)
 
-- [ ] AIO checkpointer + WAL writer caller integration:
-      checkpointer dirty-page writeback submits writes
-      through the AIO core; WAL writer's per-segment
-      writeback path can submit writes through the AIO
-      core (commit-path durability barrier `fdatasync` per
-      M0007 remains synchronous). Design doc
-      `0009-0004-aio-checkpointer-and-wal.md`.
+- [x] AIO checkpointer + WAL writer caller integration —
+      write-side substrate. (landed 2026-04-29:
+      `storage.AIOSubmitOp` gained a `Direction` field
+      (`AIODirRead` / `AIODirWrite`; the AIODirRead zero
+      value preserves the prefetch-only semantics so
+      existing callers see the same behaviour). `AIOFile`
+      now requires both `ReadAt` and `WriteAt`; the
+      `relFile` type satisfies both via mutex-guarded
+      forwards to `*os.File`. New
+      `Manager.WriteBlockAIO(rel, blk, buf) (AIOHandle,
+      error)` submits a write through the engine with
+      `Direction=AIODirWrite`, falls back to a
+      synchronous `writeBlock` + `preCompletedHandle`
+      when no engine is attached, and rejects
+      out-of-range blocks via Wait — mirrors WriteBlock's
+      "extend through Extend, not the write path"
+      contract. The `aioEngineAdapter.Submit` in initdb
+      now honours `op.Direction` (DirRead/DirWrite);
+      `aioFileAdapter.WriteAt` actually forwards to the
+      storage file (it previously panicked when
+      PrefetchBlock was read-only). The recording engine
+      fake in storage tests was extended to dispatch on
+      Direction. Tests:
+      TestWriteBlockAIOSyncFallback (no engine — bytes
+      round-trip via WriteBlock fallback),
+      TestWriteBlockAIOUsesAttachedEngine (recording
+      engine sees one submit with Direction=AIODirWrite;
+      bytes round-trip via the WriteAt path),
+      TestWriteBlockAIORejectsOutOfRange (past-nblocks →
+      descriptive Wait error). Read-side regression-
+      checked unchanged. Built and full `go test ./...`
+      green. Design doc
+      `docs/design/0009-0005-aio-checkpointer-and-wal.md`
+      added and indexed in `docs/design/README.md`.)
+
+- [ ] AIO checkpointer + WAL writer caller integration —
+      hot-path wiring. `Pool.FlushAllPaced` shaped to
+      batch-submit writes through `Manager.WriteBlockAIO`
+      with the WAL-before-data barrier preserved (per-slot
+      WAL flush stays serial; data writes pipeline);
+      `wal.state.writeAt` shaped to flow per-segment
+      writeback through the engine while the commit-path
+      `fdatasync` barrier remains synchronous. Substrate
+      is in place via the previous slice; this is the
+      hot-path wiring + perf-validation work.
 
 - [x] AIO observability — aggregate counters + startup
       log line (first slice). (landed 2026-04-29:
@@ -3174,12 +3212,18 @@ See `docs/milestones/0009-aio-subsystem.md`.
       follow-up slices — all unblocked now that per-
       handle tracking is in place.)
 
-- [ ] AIO wait-event surface: register a "waiting on AIO
-      completion" wait event so a query stalled on an AIO
-      Wait shows up identifiably in the
-      pg_stat_activity-shaped surface from prior milestones.
-      Composes with the existing wait-event registry from
-      M0002.
+- [ ] (BLOCKED) AIO wait-event surface: register a
+      "waiting on AIO completion" wait event so a query
+      stalled on an AIO Wait shows up identifiably in the
+      pg_stat_activity-shaped surface. The fix_plan
+      previously claimed this composes with "the existing
+      wait-event registry from M0002", but no such
+      registry was actually built — `pg_stat_activity` and
+      the wait-event vocabulary aren't implemented yet in
+      goopg. Building that surface is itself a meaningful
+      milestone-scoped slice (probably its own
+      pg-stat-activity / wait-event milestone). This AIO
+      hookup remains queued behind it.
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 

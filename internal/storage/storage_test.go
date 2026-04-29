@@ -533,7 +533,14 @@ type recordingAIOEngine struct {
 
 func (r *recordingAIOEngine) Submit(op AIOSubmitOp) AIOHandle {
 	r.submits = append(r.submits, op)
-	n, err := op.File.ReadAt(op.Buffer, op.Offset)
+	var n int
+	var err error
+	switch op.Direction {
+	case AIODirWrite:
+		n, err = op.File.WriteAt(op.Buffer, op.Offset)
+	default:
+		n, err = op.File.ReadAt(op.Buffer, op.Offset)
+	}
 	return recordingAIOHandle{n: n, err: err}
 }
 
@@ -722,5 +729,113 @@ func TestPoolPrefetchEnabledFiresThroughEngine(t *testing.T) {
 	pool.Prefetch(BufferTag{Rel: rel, Block: 0})
 	if got := len(eng.submits); got != 2 {
 		t.Errorf("Prefetch on cached tag fired extra submit; submits=%d want 2", got)
+	}
+}
+
+// TestWriteBlockAIOSyncFallback: with no engine attached the
+// WriteBlockAIO path runs the write inline and returns a
+// pre-completed handle whose Wait yields BlockSize / nil. The
+// bytes round-trip through ReadBlock — confirming the
+// fallback path is identical to WriteBlock semantically.
+func TestWriteBlockAIOSyncFallback(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17200, Fork: MainFork}
+
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	page[256] = 0x42
+	h, err := mgr.WriteBlockAIO(rel, 0, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, werr := h.Wait()
+	if werr != nil || n != BlockSize {
+		t.Fatalf("Wait n=%d err=%v want %d/nil", n, werr, BlockSize)
+	}
+
+	got := make(Page, BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	if got[256] != 0x42 {
+		t.Errorf("byte 256 = %#x want 0x42", got[256])
+	}
+}
+
+// TestWriteBlockAIOUsesAttachedEngine: with an engine attached,
+// WriteBlockAIO submits through it with Direction=Write so the
+// engine sees the right shape. The recording engine echoes the
+// op as a sync write; bytes round-trip through ReadBlock.
+func TestWriteBlockAIOUsesAttachedEngine(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17201, Fork: MainFork}
+
+	page := make(Page, BlockSize)
+	if err := InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := &recordingAIOEngine{}
+	mgr.SetAIO(eng)
+
+	page[300] = 0xAB
+	h, err := mgr.WriteBlockAIO(rel, 0, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, werr := h.Wait()
+	if werr != nil || n != BlockSize {
+		t.Fatalf("Wait n=%d err=%v", n, werr)
+	}
+	if len(eng.submits) != 1 {
+		t.Fatalf("engine saw %d submits, want 1", len(eng.submits))
+	}
+	if eng.submits[0].Direction != AIODirWrite {
+		t.Errorf("Direction=%v want AIODirWrite", eng.submits[0].Direction)
+	}
+
+	got := make(Page, BlockSize)
+	if err := mgr.ReadBlock(rel, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	if got[300] != 0xAB {
+		t.Errorf("byte 300 = %#x want 0xAB", got[300])
+	}
+}
+
+// TestWriteBlockAIORejectsOutOfRange: writing past nblocks
+// returns a pre-completed handle whose Wait surfaces a
+// descriptive error. Mirrors WriteBlock's behaviour (Extend is
+// the only path that grows a relation; AIO doesn't extend).
+func TestWriteBlockAIORejectsOutOfRange(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 17202, Fork: MainFork}
+	page := make(Page, BlockSize)
+	_ = InitPage(page)
+	if _, err := mgr.Extend(rel, page); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := mgr.WriteBlockAIO(rel, 5, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := h.Wait(); werr == nil {
+		t.Errorf("Wait err=nil want out-of-range failure")
 	}
 }

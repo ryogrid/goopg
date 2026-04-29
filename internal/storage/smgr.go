@@ -32,20 +32,36 @@ type AIOEngine interface {
 	Submit(op AIOSubmitOp) AIOHandle
 }
 
-// AIOSubmitOp mirrors aio.Op's read-shaped subset: AIO writes
-// don't go through the storage Manager (the WAL writer and
-// the checkpointer own their own write paths). Keeping this
-// type local keeps storage independent of internal/aio.
+// AIOSubmitOp mirrors aio.Op's submit shape. Direction picks
+// pread vs pwrite on the underlying File. Keeping this type
+// local keeps storage independent of internal/aio.
 type AIOSubmitOp struct {
 	File   AIOFile
 	Buffer []byte
 	Offset int64
+	// Direction controls read vs write. The zero value
+	// (AIODirRead) preserves the original prefetch-only
+	// semantics so callers that don't set it explicitly
+	// continue to issue reads.
+	Direction AIODirection
 }
 
+// AIODirection mirrors aio.Direction without taking the import.
+// AIODirRead is the zero value so callers that don't care about
+// writes get the same behaviour as before this field existed.
+type AIODirection int
+
+const (
+	AIODirRead AIODirection = iota
+	AIODirWrite
+)
+
 // AIOFile is the engine's view of the underlying *os.File.
-// Mirrors io.ReaderAt; storage's relFile satisfies it.
+// Implementations expose both pread and pwrite so the engine
+// can dispatch on Direction; the storage relfile satisfies it.
 type AIOFile interface {
 	ReadAt(p []byte, off int64) (int, error)
+	WriteAt(p []byte, off int64) (int, error)
 }
 
 // AIOHandle is the engine's completion handle. Wait blocks
@@ -161,6 +177,52 @@ type preCompletedHandle struct {
 }
 
 func (h preCompletedHandle) Wait() (int, error) { return h.n, h.err }
+
+// WriteBlockAIO submits a write of buf as block #blk of rel
+// through the AIO engine when one is attached, otherwise falls
+// back to a synchronous WriteBlock and returns a pre-completed
+// handle. buf must be exactly BlockSize bytes; the block must
+// already exist (use Extend to grow the relation). The caller
+// MUST keep buf alive until Wait returns.
+//
+// This is the primary write seam future checkpointer / WAL
+// writer caller integrations layer on. Engine-attached
+// deployments pipeline writes via the AIO worker pool;
+// engine-less ones see the same blocking-pwrite behaviour
+// they had before.
+func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (AIOHandle, error) {
+	if len(buf) != BlockSize {
+		return nil, fmt.Errorf("WriteBlockAIO: buf is %d bytes, want %d", len(buf), BlockSize)
+	}
+	f, err := m.relFile(rel)
+	if err != nil {
+		return nil, err
+	}
+	if blk >= f.nblocks {
+		return preCompletedHandle{
+			err: fmt.Errorf("WriteBlockAIO %s blk %d: out of range (nblocks=%d)", f.path, blk, f.nblocks),
+		}, nil
+	}
+	off := int64(blk) * BlockSize
+
+	m.mu.Lock()
+	eng := m.aio
+	m.mu.Unlock()
+	if eng == nil {
+		err := f.writeBlock(blk, buf)
+		var n int
+		if err == nil {
+			n = BlockSize
+		}
+		return preCompletedHandle{n: n, err: err}, nil
+	}
+	return eng.Submit(AIOSubmitOp{
+		File:      f,
+		Buffer:    buf,
+		Offset:    off,
+		Direction: AIODirWrite,
+	}), nil
+}
 
 // ReadBlock reads block #blk of rel into buf. buf must be exactly
 // BlockSize bytes. Returns ErrShortRead if the file ends before the
@@ -323,6 +385,18 @@ func (r *relFile) ReadAt(p []byte, off int64) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.f.ReadAt(p, off)
+}
+
+// WriteAt is the engine-facing offset-shaped write. Mirrors
+// os.File.WriteAt's contract; pairs with ReadAt so a single
+// relFile satisfies storage.AIOFile end-to-end. Bounds /
+// nblocks tracking still happens in writeBlock — callers
+// reaching directly through the engine path (Manager.WriteBlockAIO)
+// validate against nblocks before submitting.
+func (r *relFile) WriteAt(p []byte, off int64) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.f.WriteAt(p, off)
 }
 
 func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {

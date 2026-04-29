@@ -431,23 +431,27 @@ type aioEngineAdapter struct {
 
 // Submit fans the storage-shaped op out to the aio engine.
 // The returned aio.*Handle satisfies storage.AIOHandle by
-// adapting Wait through aioHandleAdapter.
+// adapting Wait through aioHandleAdapter. Direction is
+// forwarded so writes (Manager.WriteBlockAIO) flow through
+// the same submission path as reads (Manager.PrefetchBlock).
 func (a aioEngineAdapter) Submit(op storage.AIOSubmitOp) storage.AIOHandle {
+	dir := aio.DirRead
+	if op.Direction == storage.AIODirWrite {
+		dir = aio.DirWrite
+	}
 	return aioHandleAdapter{
 		h: a.eng.Submit(aio.Op{
 			File:      aioFileAdapter{f: op.File},
 			Buffer:    op.Buffer,
 			Offset:    op.Offset,
-			Direction: aio.DirRead,
+			Direction: dir,
 		}),
 	}
 }
 
-// aioFileAdapter exposes a storage.AIOFile (ReadAt-only) to the
-// aio engine, which expects a full aio.File (ReadAt + WriteAt).
-// PrefetchBlock is read-only, so WriteAt is a panic in case the
-// engine's contract grows to call it for non-DirRead Ops — that
-// would be a bug, not graceful fallback.
+// aioFileAdapter exposes a storage.AIOFile to the aio engine,
+// which expects a full aio.File. Both ReadAt (for PrefetchBlock)
+// and WriteAt (for WriteBlockAIO) flow through.
 type aioFileAdapter struct {
 	f storage.AIOFile
 }
@@ -456,8 +460,8 @@ func (a aioFileAdapter) ReadAt(p []byte, off int64) (int, error) {
 	return a.f.ReadAt(p, off)
 }
 
-func (a aioFileAdapter) WriteAt(_ []byte, _ int64) (int, error) {
-	panic("initdb: aioFileAdapter.WriteAt called on a read-only handle")
+func (a aioFileAdapter) WriteAt(p []byte, off int64) (int, error) {
+	return a.f.WriteAt(p, off)
 }
 
 // aioHandleAdapter unwraps the aio.Result struct into the
