@@ -1521,11 +1521,33 @@ under "Hooks into existing goopg code".
 - [ ] `<DataDir>/standby.signal` detection in `goopg start`
       and `internal/initdb/Open`. When present, enter
       standby mode.
-- [ ] `internal/server/walreceiver.go` (new): libpq-style
+- [x] `internal/server/walreceiver.go` (new): libpq-style
       client connection to `primary_conninfo`, sends
       `IDENTIFY_SYSTEM` then `START_REPLICATION SLOT <name>
       PHYSICAL <last_apply_lsn>`, reads the CopyBoth stream,
       writes records to local WAL, drives the recovery loop.
+      (achieved 2026-04-29: `WalReceiver` speaks v3 directly via
+      the existing `internal/protocol` FrameReader/Writer — no
+      libpq dependency. `DialWalReceiver` performs the TCP dial,
+      v3 startup handshake with `replication=true`,
+      `START_REPLICATION SLOT name PHYSICAL X/X`, and confirms
+      the `MsgCopyBothResponse` handoff. `Run(ctx)` decodes
+      incoming `'w'` WAL-data CopyData frames via
+      `DecodeReplicationMessage`, unwraps the WALBytes, and
+      `Append`s them to the local writer; framing identity is
+      preserved because the walsender forwards record payloads
+      and the standby's writer re-encodes with the same
+      `len|crc|payload` layout. Periodic standby-status updates
+      ('r') flow back every `StatusInterval` (default 10s). New
+      `protocol.FrameWriter.WriteStartupMessage` and
+      `WriteQuery` helpers support client-side use of the
+      protocol package. End-to-end test
+      `TestWalReceiverStreamsRecordsToLocalWAL` boots a primary
+      with the WAL writer + slot, dials a standby walreceiver,
+      pushes three records on the primary, and verifies they
+      appear byte-identical in the standby's pg_wal segments
+      with matching ApplyLSN. Driving the recovery loop on top
+      of the appended WAL is the next slice's job.)
 - [ ] Continuous-replay extension to
       `internal/wal/recovery.go ReplayRecords` so single
       records arriving from a stream apply incrementally.

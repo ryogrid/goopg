@@ -1,0 +1,381 @@
+// Standby-side walreceiver: connects to a primary, opens a
+// replication-mode session, issues START_REPLICATION, and persists
+// each received WAL record into the local WAL writer.
+//
+// The walreceiver is the standby's mirror of the primary's walsender.
+// It speaks the same v3 wire protocol via internal/protocol's
+// FrameReader/Writer — no third-party libpq dependency. WAL records
+// arriving as `'w'` CopyData payloads are unwrapped and re-Append'd
+// into the local writer; framing identity is preserved because the
+// walsender forwards record payloads (not their on-wire frames) and
+// our local writer re-encodes with the same `len|crc|payload`
+// layout.
+//
+// Status updates on the back-channel: every
+// `wal_receiver_status_interval` (default 10s, mirroring upstream)
+// the receiver emits an `'r'` standby-status CopyData with its
+// current ApplyLSN. The primary uses these to advance the
+// corresponding slot's `confirmed_flush_lsn`.
+//
+// See docs/design/0005-0001-streaming-replication-architecture.md.
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/goopg/goopg/internal/protocol"
+	"github.com/goopg/goopg/internal/wal"
+)
+
+// WalReceiverConfig parameterises a single walreceiver session.
+type WalReceiverConfig struct {
+	// PrimaryAddr is `host:port` of the upstream primary's listener.
+	PrimaryAddr string
+
+	// User identifies the role on the primary. Replication
+	// connections still authenticate; v0 ships trust by default
+	// so any non-empty user works.
+	User string
+
+	// SlotName, when non-empty, names the physical replication
+	// slot to acquire on the primary. The slot must already
+	// exist (a future loop adds CREATE_REPLICATION_SLOT-on-startup
+	// for the convenience case).
+	SlotName string
+
+	// StartLSN is the starting position for the stream. 0 means
+	// "from the beginning" (matches upstream's `0/0` shorthand).
+	StartLSN uint64
+
+	// WAL is the local WAL writer where received records land.
+	WAL *wal.Writer
+
+	// StatusInterval throttles standby-status updates. Zero falls
+	// back to 10s, matching upstream's default
+	// `wal_receiver_status_interval`.
+	StatusInterval time.Duration
+
+	// DialTimeout caps how long Connect blocks on the TCP dial +
+	// startup handshake. Zero falls back to 10s.
+	DialTimeout time.Duration
+}
+
+// WalReceiver is the standby-side replication client. Construct via
+// `DialWalReceiver` (which performs the TCP dial + startup
+// handshake), then call `Run(ctx)` to drain WAL until the context is
+// cancelled or the connection breaks.
+type WalReceiver struct {
+	cfg    WalReceiverConfig
+	conn   net.Conn
+	r      *protocol.FrameReader
+	w      *protocol.FrameWriter
+	mu     sync.Mutex
+	closed bool
+
+	// applyLSN tracks the last record successfully Append'd to the
+	// local writer. Re-read by the status-update goroutine via the
+	// writer's own WrittenLSN(), but we cache for a tiny perf win
+	// and to make the test surface predictable.
+	applyLSN uint64
+}
+
+// DialWalReceiver opens the TCP connection, performs the v3 startup
+// handshake with `replication=true`, optionally consumes the auth /
+// parameter status / ReadyForQuery handshake, then issues
+// `START_REPLICATION` and confirms the `CopyBothResponse`. The
+// returned receiver is ready for `Run`.
+func DialWalReceiver(ctx context.Context, cfg WalReceiverConfig) (*WalReceiver, error) {
+	if cfg.PrimaryAddr == "" {
+		return nil, errors.New("walreceiver: PrimaryAddr is required")
+	}
+	if cfg.WAL == nil {
+		return nil, errors.New("walreceiver: WAL is required")
+	}
+	if cfg.User == "" {
+		cfg.User = "postgres"
+	}
+	if cfg.StatusInterval <= 0 {
+		cfg.StatusInterval = 10 * time.Second
+	}
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 10 * time.Second
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, cfg.DialTimeout)
+	defer cancel()
+	d := net.Dialer{}
+	conn, err := d.DialContext(dialCtx, "tcp", cfg.PrimaryAddr)
+	if err != nil {
+		return nil, fmt.Errorf("walreceiver: dial %s: %w", cfg.PrimaryAddr, err)
+	}
+	rec := &WalReceiver{
+		cfg:  cfg,
+		conn: conn,
+		r:    protocol.NewFrameReader(conn),
+		w:    protocol.NewFrameWriter(conn),
+	}
+	if err := rec.handshake(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := rec.startStreaming(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	rec.applyLSN = cfg.StartLSN
+	return rec, nil
+}
+
+// handshake performs the v3 startup with replication=true and drains
+// frames until ReadyForQuery. The primary's side is the existing
+// goopg server; trust auth means we just see AuthenticationOk +
+// ParameterStatus block + BackendKeyData + ReadyForQuery.
+func (r *WalReceiver) handshake() error {
+	params := map[string]string{
+		"user":        r.cfg.User,
+		"replication": "true",
+	}
+	if err := r.w.WriteStartupMessage(params); err != nil {
+		return fmt.Errorf("walreceiver: write startup: %w", err)
+	}
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return fmt.Errorf("walreceiver: handshake read: %w", err)
+		}
+		switch f.Type {
+		case protocol.MsgErrorResponse:
+			return fmt.Errorf("walreceiver: server rejected startup: %s",
+				summariseErrorResponse(f.Payload))
+		case protocol.MsgReadyForQuery:
+			return nil
+		}
+	}
+}
+
+// startStreaming sends START_REPLICATION and waits for the CopyBoth
+// handoff. Any ErrorResponse mid-handshake is reported to the caller
+// for human triage.
+func (r *WalReceiver) startStreaming() error {
+	cmd := buildStartReplicationCommand(r.cfg.SlotName, r.cfg.StartLSN)
+	if err := r.w.WriteQuery(cmd); err != nil {
+		return fmt.Errorf("walreceiver: write START_REPLICATION: %w", err)
+	}
+	if err := r.w.Flush(); err != nil {
+		return fmt.Errorf("walreceiver: flush START_REPLICATION: %w", err)
+	}
+	for {
+		f, err := r.r.ReadFrame()
+		if err != nil {
+			return fmt.Errorf("walreceiver: start-stream read: %w", err)
+		}
+		switch f.Type {
+		case protocol.MsgCopyBothResponse:
+			return nil
+		case protocol.MsgErrorResponse:
+			return fmt.Errorf("walreceiver: START_REPLICATION rejected: %s",
+				summariseErrorResponse(f.Payload))
+		}
+		// Other frames pre-CopyBoth (NoticeResponse, etc.) are
+		// ignored.
+	}
+}
+
+// Run drains WAL records from the connection until ctx is cancelled
+// or the link breaks. Each WAL-data frame is unwrapped and Append'd
+// to the local writer; periodic standby-status updates flow back to
+// the primary every `StatusInterval`. Returns the first error it
+// can't recover from; nil when ctx is cancelled cleanly.
+func (r *WalReceiver) Run(ctx context.Context) error {
+	statusTicker := time.NewTicker(r.cfg.StatusInterval)
+	defer statusTicker.Stop()
+
+	frames := make(chan protocol.Frame, 4)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(frames)
+		for {
+			f, err := r.r.ReadFrame()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			// FrameReader's payload buffer is reused; copy.
+			payload := make([]byte, len(f.Payload))
+			copy(payload, f.Payload)
+			select {
+			case frames <- protocol.Frame{Type: f.Type, Payload: payload}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			_ = r.Close()
+			return nil
+		case err := <-errCh:
+			_ = r.Close()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		case f, ok := <-frames:
+			if !ok {
+				return nil
+			}
+			if err := r.handleFrame(f); err != nil {
+				_ = r.Close()
+				return err
+			}
+		case <-statusTicker.C:
+			if err := r.sendStatus(); err != nil {
+				_ = r.Close()
+				return err
+			}
+		}
+	}
+}
+
+// handleFrame dispatches one server frame. WAL-data is appended into
+// the local writer; keepalives with replyRequested=true trigger an
+// immediate status update; CopyDone closes the stream.
+func (r *WalReceiver) handleFrame(f protocol.Frame) error {
+	switch f.Type {
+	case protocol.MsgCopyData:
+		return r.handleCopyData(f.Payload)
+	case protocol.MsgCopyDone:
+		return io.EOF // caller treats EOF as clean stream end
+	case protocol.MsgErrorResponse:
+		return fmt.Errorf("walreceiver: server error mid-stream: %s",
+			summariseErrorResponse(f.Payload))
+	}
+	return nil // unknown frame: ignore (forward-compatibility)
+}
+
+func (r *WalReceiver) handleCopyData(payload []byte) error {
+	parsed, kind, err := protocol.DecodeReplicationMessage(payload)
+	if err != nil {
+		return fmt.Errorf("walreceiver: decode replication message: %w", err)
+	}
+	switch kind {
+	case protocol.ReplMsgWALData:
+		m := parsed.(*protocol.WALDataMessage)
+		if len(m.WALBytes) == 0 {
+			// Empty advance: just track endLSN.
+			r.mu.Lock()
+			if m.EndLSN > r.applyLSN {
+				r.applyLSN = m.EndLSN
+			}
+			r.mu.Unlock()
+			return nil
+		}
+		_, end, err := r.cfg.WAL.Append(m.WALBytes)
+		if err != nil {
+			return fmt.Errorf("walreceiver: append local WAL: %w", err)
+		}
+		r.mu.Lock()
+		if end > r.applyLSN {
+			r.applyLSN = end
+		}
+		r.mu.Unlock()
+	case protocol.ReplMsgKeepalive:
+		ka := parsed.(*protocol.KeepaliveMessage)
+		if ka.ReplyRequested {
+			return r.sendStatus()
+		}
+	}
+	return nil
+}
+
+// sendStatus emits an 'r' standby-status CopyData payload reporting
+// the current apply LSN. WriteLSN / FlushLSN / ApplyLSN are all set
+// to applyLSN — v0's standby has no separate write/flush staging.
+func (r *WalReceiver) sendStatus() error {
+	r.mu.Lock()
+	apply := r.applyLSN
+	r.mu.Unlock()
+	frame := protocol.EncodeStandbyStatusUpdate(apply, apply, apply, time.Now().UTC(), false)
+	if err := r.w.WriteCopyData(frame); err != nil {
+		return err
+	}
+	return r.w.Flush()
+}
+
+// ApplyLSN returns the last LSN successfully appended to the local
+// WAL. Useful for tests that need to observe the receiver's
+// progress.
+func (r *WalReceiver) ApplyLSN() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.applyLSN
+}
+
+// Close terminates the underlying connection. Safe to call multiple
+// times; subsequent Run invocations on the same receiver will
+// short-circuit.
+func (r *WalReceiver) Close() error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	r.mu.Unlock()
+	return r.conn.Close()
+}
+
+// buildStartReplicationCommand renders the wire-level command
+// string. Mirrors upstream's libpq walreceiver shape so a goopg
+// primary or upstream PostgreSQL primary parse it identically.
+func buildStartReplicationCommand(slotName string, startLSN uint64) string {
+	if slotName != "" {
+		return fmt.Sprintf("START_REPLICATION SLOT %s PHYSICAL %s",
+			slotName, formatLSN(startLSN))
+	}
+	return fmt.Sprintf("START_REPLICATION PHYSICAL %s", formatLSN(startLSN))
+}
+
+// summariseErrorResponse extracts a human-readable summary from an
+// ErrorResponse payload (sequence of (field-byte, NUL-terminated
+// string) pairs ending with a terminating zero byte). Used only
+// for error messages — full structured access lives in the wire
+// dispatcher.
+func summariseErrorResponse(payload []byte) string {
+	var msg, code string
+	i := 0
+	for i < len(payload) {
+		field := payload[i]
+		i++
+		if field == 0 {
+			break
+		}
+		end := i
+		for end < len(payload) && payload[end] != 0 {
+			end++
+		}
+		val := string(payload[i:end])
+		i = end + 1
+		switch field {
+		case 'M':
+			msg = val
+		case 'C':
+			code = val
+		}
+	}
+	if code != "" && msg != "" {
+		return fmt.Sprintf("%s: %s", code, msg)
+	}
+	if msg != "" {
+		return msg
+	}
+	return "(empty error)"
+}

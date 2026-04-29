@@ -4,6 +4,42 @@ import (
 	"encoding/binary"
 )
 
+// WriteStartupMessage emits the v3 protocol startup packet. Unlike
+// regular messages this has no leading type byte:
+//
+//	int32 totalLen | int32 protocolVersion | (key NUL value NUL)* | NUL
+//
+// Used by client-side code (e.g., the standby walreceiver) that needs
+// to drive a connection through the same handshake the test helper
+// `writeStartupPacket` performs.
+func (fw *FrameWriter) WriteStartupMessage(params map[string]string) error {
+	body := make([]byte, 4)
+	binary.BigEndian.PutUint32(body, ProtocolVersion3_0)
+	for k, v := range params {
+		body = append(body, k...)
+		body = append(body, 0)
+		body = append(body, v...)
+		body = append(body, 0)
+	}
+	body = append(body, 0)
+	pkt := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(pkt[:4], uint32(4+len(body)))
+	copy(pkt[4:], body)
+	if _, err := fw.w.Write(pkt); err != nil {
+		return err
+	}
+	return fw.Flush()
+}
+
+// WriteQuery emits a simple-query 'Q' frame. The trailing NUL the
+// protocol requires is appended automatically.
+func (fw *FrameWriter) WriteQuery(sql string) error {
+	body := make([]byte, 0, len(sql)+1)
+	body = append(body, sql...)
+	body = append(body, 0)
+	return fw.WriteFrame(MsgQuery, body)
+}
+
 // WriteAuthenticationOk emits 'R' / int32(0) — "no further authentication
 // required".
 func (fw *FrameWriter) WriteAuthenticationOk() error {
