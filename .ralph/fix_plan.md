@@ -2320,10 +2320,40 @@ item.
       'insert,delete')` and the change is visible via the
       five virtual catalog views from the prior loop.)
 
-- [ ] Apply worker + initial table sync: subscriber-side worker
-      that connects to the publisher's logical slot, decodes the
-      `pgoutput` stream, and applies each change. Design doc
+- [x] Apply worker + initial table sync — first slice
+      (pgoutput decoder + design doc). Subscriber-side worker
+      scaffolding, TCP transport, tablesync state machine,
+      DELETE/UPDATE row resolution still deferred. Design doc
       `docs/design/0008-0004-apply-worker-and-tablesync.md`.
+      (landed 2026-04-29: `internal/wal/pgoutput_decoder.go`
+      delivers `DecodeMessage(payload) (*DecodedMessage,
+      error)` — the inverse of 0008-0002's encoder. Output
+      types: `DecodedMessage{Kind, XID, CommitLSN, EndLSN,
+      CommitTime, Relation, RelOID, NewTuple, OldTuple}`,
+      `DecodedRelation{OID, Schema, Name, Replident,
+      Columns}`, `DecodedAttr{Flags, Name, TypeOID, TypeMod}`,
+      `DecodedColumn{Status, Bytes}`. Reader cursor enforces
+      big-endian framing and surfaces `ErrTruncatedMessage` on
+      short payloads. Per-kind parsers cover `B` (21 bytes:
+      kind | final_lsn | commit_time | xid), `C` (26 bytes:
+      kind | flags=0 | commit_lsn | end_lsn | commit_time),
+      `R` (rel_oid | nspname\\0 | relname\\0 | replident |
+      natts | per-attr fields), `I` (`'N'` action + tuple
+      body), `D` (`'K'`/`'O'` action + tuple body). Tuple
+      bodies handle `'n'` (NULL), `'t'` (text with
+      length-prefix), and `'u'` (unchanged TOAST) status
+      bytes. Tests:
+      TestPgoutputDecoderRoundTripBegin,
+      TestPgoutputDecoderRoundTripCommit,
+      TestPgoutputDecoderRoundTripRelationAndInsert (pins
+      end-to-end encoder→decoder for a 2-column int4+text
+      table; tuple body decodes to `[t:"42", t:"alpha"]`),
+      TestPgoutputDecoderRoundTripDelete (empty K body),
+      TestPgoutputDecoderRejectsTruncated. With this slice
+      the encoder/decoder symmetry is complete and the apply
+      worker has its byte-stream reader. Next M0008 loop:
+      ApplyWorker.Run skeleton + per-event apply, then TCP
+      transport + tablesync state machine.)
 
 - [ ] Logical-replication observability: `pg_stat_subscription`,
       logical-replication rows in `pg_stat_replication`, structured
