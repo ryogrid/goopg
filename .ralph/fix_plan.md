@@ -1365,6 +1365,135 @@ M0002/M0003; lands regression coverage as those features ship.
 - [x] Add implementation-status line to
       `docs/test-port/upstream-tap-coverage.md`.
 
+## Milestone 0005 — Streaming replication
+
+See `docs/milestones/0005-streaming-replication-support.md` for
+the full DoD. Decomposed into agent-sized chunks below; the
+implementation seam list lives in
+`docs/design/0005-0001-streaming-replication-architecture.md`
+under "Hooks into existing goopg code".
+
+### Architecture and design
+
+- [x] Design doc `0005-0001-streaming-replication-architecture.md`
+      (process model, wire-protocol surface,
+      MsgCopyBoth/WAL-data/keepalive/standby-status framing,
+      state-transition diagram, replication-slot retention,
+      GUC surface, promotion path, hook list for follow-up
+      implementation loops).
+- [ ] Design doc `0005-0002-standby-recovery-and-replay.md`
+      covering streaming WAL reader iterator, incremental
+      `ReplayRecords` invocation, restart semantics across
+      stop/start, and consistency model under reconnect.
+- [ ] Design doc `0005-0003-replication-observability.md`
+      covering `pg_stat_replication` / `pg_stat_wal_receiver`
+      virtual views, replication-lag computation, and the
+      operational logging surface for disconnect /
+      replay-pause / retention-pressure events.
+
+### Wire protocol
+
+- [ ] Add `MsgCopyBoth` ('W') backend frame type to
+      `internal/protocol/protocol.go` next to `MsgCopyOutResponse`.
+- [ ] Add encoders in `internal/protocol/messages.go` for the
+      WAL-data ('w'), keepalive ('k'), and standby-status ('r')
+      inner-payload framings used inside CopyBoth/CopyData.
+- [ ] Recognise `replication=true` in the StartupMessage
+      parameter bag (`internal/server/server.go` startup parser);
+      tag the per-connection ctx with an `IsReplication` flag.
+- [ ] Implement `IDENTIFY_SYSTEM` simple-query handler that
+      returns `(systemid, timeline, xlogpos, dbname)` as a
+      single-row tuple. Required for v0.
+- [ ] Implement `CREATE_REPLICATION_SLOT slot_name PHYSICAL`
+      and `DROP_REPLICATION_SLOT` handlers. Persist via the
+      new `internal/wal/slots.go` API.
+- [ ] Implement `START_REPLICATION [SLOT slot_name] PHYSICAL
+      <lsn> [TIMELINE n]` — flips the connection to streaming
+      mode, replies with `MsgCopyBoth`, and hands off to the
+      walsender goroutine.
+
+### WAL streaming machinery
+
+- [ ] Add `internal/wal/reader.go` streaming
+      `RecordIterator(startLSN)` that yields records
+      one-at-a-time; blocks (waits on a channel) when caught
+      up to `WrittenLSN()`.
+- [ ] Add a flush-event subscription channel on
+      `internal/wal/writer.go` so subscribers (walsender
+      goroutines) wake on flush instead of polling
+      `WrittenLSN()`.
+- [ ] Walsender goroutine
+      (`internal/server/replication.go` new file): subscribe to
+      the WAL flush stream, encode each record into a
+      WAL-data CopyData frame, periodically emit keepalives,
+      consume standby status updates, and update the
+      backing slot's `confirmed_flush_lsn`.
+
+### Replication slots
+
+- [ ] `internal/wal/slots.go` (new): `Slot{Name, RestartLSN,
+      ConfirmedFlushLSN, Active}` + load/save under
+      `<DataDir>/pg_replslot/<slot>/state` (mirrors upstream
+      `slotdata.c`).
+- [ ] Slot-aware WAL retention: M0002's segment-recycling
+      path consults `min(slot.RestartLSN ∀ active)` before
+      unlinking, bounded by `max_slot_wal_keep_size`.
+
+### Standby side
+
+- [ ] `<DataDir>/standby.signal` detection in `goopg start`
+      and `internal/initdb/Open`. When present, enter
+      standby mode.
+- [ ] `internal/server/walreceiver.go` (new): libpq-style
+      client connection to `primary_conninfo`, sends
+      `IDENTIFY_SYSTEM` then `START_REPLICATION SLOT <name>
+      PHYSICAL <last_apply_lsn>`, reads the CopyBoth stream,
+      writes records to local WAL, drives the recovery loop.
+- [ ] Continuous-replay extension to
+      `internal/wal/recovery.go ReplayRecords` so single
+      records arriving from a stream apply incrementally.
+      Idempotency is already in place via `pd_lsn`.
+- [ ] Reconnect loop with backoff when `primary_conninfo`
+      drops; resume from the last durable apply LSN.
+
+### Configuration surface
+
+- [ ] Register primary-side replication GUCs:
+      `wal_level` (default `replica`), `max_wal_senders` (10),
+      `max_replication_slots` (10), `wal_sender_timeout` (60s),
+      `max_slot_wal_keep_size` (-1).
+- [ ] Register standby-side GUCs: `primary_conninfo`,
+      `primary_slot_name`, `wal_receiver_status_interval`
+      (10s), `recovery_target_timeline` (`latest`),
+      `hot_standby` (`on`).
+
+### Promotion
+
+- [ ] Add `OnPromote` callback in `internal/control/control.go`
+      and a `PROMOTE` command handler in
+      `startControlPlane`.
+- [ ] `goopg promote -D <dir>` CLI subcommand that sends
+      `PROMOTE` over the control socket. Drains pending WAL,
+      removes `standby.signal`, switches to primary mode.
+
+### Observability
+
+- [ ] `pg_stat_replication` virtual view (sender side):
+      one row per active walsender with state / lag fields.
+- [ ] `pg_stat_wal_receiver` virtual view (receiver side):
+      single-row view of the active walreceiver if any.
+- [ ] Replication-related logging hooks for disconnect /
+      replay-pause / retention-pressure events.
+
+### Acceptance test
+
+- [ ] `internal/testutil/replcluster/` package mirroring
+      the existing `internal/testutil/cluster/` API but
+      orchestrating a primary + standby pair.
+- [ ] End-to-end test: start primary + standby, write to
+      primary, observe row visibility on standby, kill
+      primary, promote standby, write to promoted node.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
