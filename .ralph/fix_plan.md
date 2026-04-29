@@ -2086,12 +2086,43 @@ pick the topmost unchecked item.
       representative workloads. Continues
       `docs/design/0014-0003-recovery-streaming-and-compat-validation.md`.
 
-- [ ] Rollout guardrails + operator playbook (M0014-0004).
-      Legacy-format detection (use `ErrInvalidPageHeader` as
-      the branching point) with actionable diagnostics;
-      operator-facing rollout notes; runtime observability
-      surfacing the WAL format mode/version. Continues
+- [x] Rollout guardrails — **legacy-format detection helper**
+      (M0014-0004 step 1). Design doc
       `docs/design/0014-0004-rollout-guardrails-and-operator-playbook.md`.
+      (landed 2026-04-29: pure additive read-only utility.
+      New `internal/wal/format_detect.go` with
+      `WALFormatVersion` enum (Unknown / Legacy / PGCompat,
+      `String()` for log lines) and
+      `DetectWALFormat(walDir) (WALFormatVersion, error)`.
+      Inspects the lowest-numbered segment file (parsed
+      via either `parseSegmentName` legacy or
+      `ParseXLogFileName` pg-compat — both return ok=false
+      for `.gitignore`-shaped non-segment files), reads
+      first 40 bytes, tries `DecodeXLogLongPageHeader` then
+      `DecodeXLogPageHeader`. Magic match → PGCompat;
+      `errors.Is(err, ErrInvalidPageHeader)` → Legacy
+      (legacy frames start with a `[len:uint32][crc:uint32-IEEE]`
+      pair so they can never collide with `XLOGPageMagic=0xD119`
+      at offset 0..1 — uint32 length values up to ~16 MB stay
+      well below the high-byte-set magic). Empty / nonexistent
+      dirs → (Unknown, nil) — fresh-data-dir bootstrap doesn't
+      have to special-case. Truncation < 24 bytes → typed
+      error. CRC validation intentionally skipped — too
+      expensive at startup and the writer's per-record check
+      catches real corruption later. Tests:
+      TestDetectWALFormatNonexistentDir,
+      TestDetectWALFormatEmptyDir,
+      TestDetectWALFormatIgnoresGarbageFiles (3 user files,
+      none parses as segment),
+      TestDetectWALFormatLegacy (synthesised legacy
+      length+CRC32-IEEE frame at offset 0),
+      TestDetectWALFormatPGCompat (`EncodeXLogLongPageHeader`
+      → file → DetectWALFormat round-trip),
+      TestDetectWALFormatTruncatedSegment,
+      TestDetectWALFormatVersionString. Caller wiring
+      (loadState fail-fast on format mismatch) lands in
+      M0014-0004 step 2 alongside the joint M0014-0001/0002
+      writer/reader switchover. Full `go test ./...` green.)
 
 ## Notes
 
