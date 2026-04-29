@@ -1,0 +1,402 @@
+// Predicate selectivity for the Filter case of EstimateRows.
+//
+// `clauseSelectivity` decomposes a Filter's predicate the same way
+// upstream's `clauselist_selectivity` (postgres/src/backend/utils/
+// adt/selfuncs.c) does, and returns a value in [0, 1] that scales
+// the child estimate. AND multiplies, OR uses inclusion-exclusion,
+// equality probes the MCV list with a non-MCV fallback, and range
+// predicates interpolate the equi-depth histogram.
+//
+// When stats aren't available — table never ANALYZEd, predicate
+// shape unrecognised, ColumnRef on neither side — we fall back to
+// `defaultGenericSelectivity` (1/3). That keeps the M0003
+// rules-only behaviour as the documented fallback.
+//
+// See docs/design/0006-0003-clauselist-selectivity.md.
+package planner
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/goopg/goopg/internal/catalog"
+)
+
+// clauseSelectivity returns the fraction of `child`'s rows expected
+// to pass `expr`. Always in [0, 1].
+func clauseSelectivity(expr Expr, child Node) float64 {
+	if expr == nil {
+		return 1.0
+	}
+	switch e := expr.(type) {
+	case *BinaryOp:
+		switch e.Op {
+		case "AND":
+			// Independence assumption — upstream's default.
+			return clauseSelectivity(e.Left, child) * clauseSelectivity(e.Right, child)
+		case "OR":
+			a := clauseSelectivity(e.Left, child)
+			b := clauseSelectivity(e.Right, child)
+			return a + b - a*b
+		case "=":
+			return eqOpSelectivity(e.Left, e.Right, child)
+		case "<>", "!=":
+			eq := eqOpSelectivity(e.Left, e.Right, child)
+			return 1 - eq
+		case "<", "<=", ">", ">=":
+			return rangeOpSelectivity(e.Op, e.Left, e.Right, child)
+		}
+	case *UnaryOp:
+		if strings.EqualFold(e.Op, "NOT") {
+			return 1 - clauseSelectivity(e.Operand, child)
+		}
+	case *InExpr:
+		// Only the value-list form matches the column-IN-(consts)
+		// shape selfuncs handles. The subquery form is handled by
+		// the join / subplan estimator.
+		if e.Plan != nil || len(e.List) == 0 {
+			return defaultGenericSelectivity
+		}
+		cr, ok := e.Operand.(*ColumnRef)
+		if !ok {
+			return defaultGenericSelectivity
+		}
+		stats := columnStatsForChild(cr.Index, child)
+		var sel float64
+		for _, v := range e.List {
+			sel += eqSelectivityForColumn(stats, v)
+		}
+		if sel > 1.0 {
+			sel = 1.0
+		}
+		if e.Negated {
+			return 1 - sel
+		}
+		return sel
+	case *BooleanConst:
+		if e.Value {
+			return 1.0
+		}
+		return 0.0
+	}
+	return defaultGenericSelectivity
+}
+
+// eqOpSelectivity handles `col = const` (or the swapped `const =
+// col`). Returns the MCV frequency on a hit, the non-MCV fallback,
+// or — when stats are missing — the upstream `1/200` constant.
+func eqOpSelectivity(left, right Expr, child Node) float64 {
+	col, val, ok := normalizeColumnConst(left, right)
+	if !ok {
+		return defaultEqSelectivity
+	}
+	stats := columnStatsForChild(col.Index, child)
+	return eqSelectivityForColumn(stats, val)
+}
+
+func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
+	literal, ok := formatExprConstant(val)
+	if !ok {
+		return defaultEqSelectivity
+	}
+	if stats == nil {
+		return defaultEqSelectivity
+	}
+	for _, mcv := range stats.MCV {
+		if mcv.Value == literal {
+			return mcv.Frequency
+		}
+	}
+	// Non-MCV bucket: split the leftover mass across the
+	// non-MCV distinct values.
+	mcvMass := 0.0
+	for _, mcv := range stats.MCV {
+		mcvMass += mcv.Frequency
+	}
+	remainingDistinct := stats.NDistinct - int64(len(stats.MCV))
+	if remainingDistinct <= 0 {
+		// MCV covers every distinct value — the constant isn't
+		// among them. Selectivity is the residual mass /
+		// nullFrac-adjusted; conservatively report the upstream
+		// default fallback.
+		return defaultEqSelectivity
+	}
+	mass := 1.0 - mcvMass - stats.NullFrac
+	if mass <= 0 {
+		return defaultEqSelectivity
+	}
+	return mass / float64(remainingDistinct)
+}
+
+// rangeOpSelectivity handles `col <op> const` for `< <= > >=`.
+// Returns the histogram-bucket interpolation, scaled to the
+// non-MCV mass, plus contributions from MCV values that satisfy
+// the predicate.
+func rangeOpSelectivity(op string, left, right Expr, child Node) float64 {
+	col, val, swapped, ok := normalizeColumnConstRange(left, right)
+	if !ok {
+		return defaultIneqSelectivity
+	}
+	if swapped {
+		op = swapInequalityOp(op)
+	}
+	stats := columnStatsForChild(col.Index, child)
+	if stats == nil || len(stats.Histogram) < 2 {
+		return defaultIneqSelectivity
+	}
+	literal, ok := formatExprConstant(val)
+	if !ok {
+		return defaultIneqSelectivity
+	}
+
+	// Histogram covers the non-MCV mass.
+	mcvMass := 0.0
+	mcvHits := 0.0
+	for _, mcv := range stats.MCV {
+		mcvMass += mcv.Frequency
+		if histCmp(mcv.Value, literal, col.Type.Name) >= 0 {
+			// Need to know if this MCV value satisfies op.
+			c := histCmp(mcv.Value, literal, col.Type.Name)
+			if rangeOpMatches(op, c) {
+				mcvHits += mcv.Frequency
+			}
+		} else {
+			c := -1
+			if rangeOpMatches(op, c) {
+				mcvHits += mcv.Frequency
+			}
+		}
+	}
+	nonMCVMass := 1.0 - mcvMass - stats.NullFrac
+	if nonMCVMass < 0 {
+		nonMCVMass = 0
+	}
+	histSel := histogramOpSelectivity(op, stats.Histogram, literal, col.Type.Name)
+	sel := mcvHits + histSel*nonMCVMass
+	if sel < 0 {
+		return 0
+	}
+	if sel > 1 {
+		return 1
+	}
+	return sel
+}
+
+// histogramOpSelectivity returns the fraction of the histogram's
+// mass (treated as 1.0 across the boundaries) that satisfies op
+// for the given literal. Boundaries are sorted ascending.
+func histogramOpSelectivity(op string, bounds []string, literal, typeName string) float64 {
+	k := len(bounds) - 1 // bucket count
+	if k < 1 {
+		return defaultIneqSelectivity
+	}
+	// Find the first boundary >= literal.
+	idx := -1
+	for i, b := range bounds {
+		if histCmp(b, literal, typeName) >= 0 {
+			idx = i
+			break
+		}
+	}
+	switch op {
+	case "<", "<=":
+		if idx <= 0 {
+			// literal <= bounds[0]: nothing to the left.
+			if idx == 0 && op == "<=" && histCmp(bounds[0], literal, typeName) == 0 {
+				// literal == low boundary; <= keeps a sliver of
+				// the first bucket. Approximate as 1/k.
+				return 1.0 / float64(k)
+			}
+			return 0.0
+		}
+		if idx == -1 {
+			// literal greater than every boundary.
+			return 1.0
+		}
+		whole := float64(idx-1) / float64(k)
+		frac := bucketFraction(bounds[idx-1], bounds[idx], literal, typeName)
+		return whole + frac/float64(k)
+	case ">", ">=":
+		// Symmetric: 1 - sel(<) for >=, 1 - sel(<=) for >.
+		flip := "<="
+		if op == ">=" {
+			flip = "<"
+		}
+		return 1.0 - histogramOpSelectivity(flip, bounds, literal, typeName)
+	}
+	return defaultIneqSelectivity
+}
+
+// bucketFraction returns the fraction of a single histogram
+// bucket [lo, hi] that lies below `lit`. Always in [0, 1].
+func bucketFraction(lo, hi, lit, typeName string) float64 {
+	loN, loOK := numericValue(lo, typeName)
+	hiN, hiOK := numericValue(hi, typeName)
+	litN, litOK := numericValue(lit, typeName)
+	if !loOK || !hiOK || !litOK || hiN <= loN {
+		// Non-numeric or zero-width bucket: best-effort half.
+		return 0.5
+	}
+	if litN <= loN {
+		return 0
+	}
+	if litN >= hiN {
+		return 1
+	}
+	return (litN - loN) / (hiN - loN)
+}
+
+// rangeOpMatches reports whether `cmp(a,b) <op> 0` holds for the
+// given op. cmp is -1/0/1 in the usual sense.
+func rangeOpMatches(op string, cmp int) bool {
+	switch op {
+	case "<":
+		return cmp < 0
+	case "<=":
+		return cmp <= 0
+	case ">":
+		return cmp > 0
+	case ">=":
+		return cmp >= 0
+	}
+	return false
+}
+
+// histCmp compares two histogram-bound-formatted strings under
+// the per-type total order. Integer / numeric / time go through
+// numericValue; strings fall back to byte-wise compare.
+func histCmp(a, b, typeName string) int {
+	if an, ok := numericValue(a, typeName); ok {
+		if bn, ok := numericValue(b, typeName); ok {
+			switch {
+			case an < bn:
+				return -1
+			case an > bn:
+				return 1
+			}
+			return 0
+		}
+	}
+	return strings.Compare(a, b)
+}
+
+// numericValue parses a histogram-bound or literal string back to
+// a float64 for numeric / integer / numeric-typed columns. Reports
+// (value, true) when the type is numeric and parsing succeeds;
+// otherwise (0, false). String / bool columns cannot use this
+// path and fall back to byte-wise compare in histCmp.
+func numericValue(s, typeName string) (float64, bool) {
+	switch strings.ToLower(typeName) {
+	case "int", "int2", "int4", "int8", "smallint", "integer", "bigint", "numeric", "decimal", "float", "real", "double precision":
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, false
+		}
+		return v, true
+	}
+	return 0, false
+}
+
+// normalizeColumnConst recognises `col op const` and `const op col`
+// for equality. Returns the column ref and the constant side; ok
+// is false when the predicate isn't shaped that way.
+func normalizeColumnConst(l, r Expr) (*ColumnRef, Expr, bool) {
+	if cr, ok := l.(*ColumnRef); ok && isConstExpr(r) {
+		return cr, r, true
+	}
+	if cr, ok := r.(*ColumnRef); ok && isConstExpr(l) {
+		return cr, l, true
+	}
+	return nil, nil, false
+}
+
+// normalizeColumnConstRange is the same shape recogniser as
+// normalizeColumnConst, but it also reports whether the column
+// was on the right (so callers can flip the operator).
+func normalizeColumnConstRange(l, r Expr) (*ColumnRef, Expr, bool, bool) {
+	if cr, ok := l.(*ColumnRef); ok && isConstExpr(r) {
+		return cr, r, false, true
+	}
+	if cr, ok := r.(*ColumnRef); ok && isConstExpr(l) {
+		return cr, l, true, true
+	}
+	return nil, nil, false, false
+}
+
+func swapInequalityOp(op string) string {
+	switch op {
+	case "<":
+		return ">"
+	case "<=":
+		return ">="
+	case ">":
+		return "<"
+	case ">=":
+		return "<="
+	}
+	return op
+}
+
+// isConstExpr reports whether e is a literal the planner can
+// render through formatExprConstant for MCV / histogram lookup.
+// ParamRef is intentionally excluded — bind values aren't known
+// at plan time.
+func isConstExpr(e Expr) bool {
+	switch e.(type) {
+	case *IntegerConst, *StringConst, *NumericConst, *BooleanConst, *TypedStringLit:
+		return true
+	}
+	return false
+}
+
+// formatExprConstant renders a constant expression to the same
+// canonical string ANALYZE used when stamping MCV.Value /
+// Histogram entries. The match is byte-equal — no smart numeric
+// canonicalisation is needed because both sides go through the
+// executor's Datum.Format and the planner's formatter mirrors it.
+func formatExprConstant(e Expr) (string, bool) {
+	switch x := e.(type) {
+	case *IntegerConst:
+		return strconv.FormatInt(x.Value, 10), true
+	case *StringConst:
+		return x.Value, true
+	case *NumericConst:
+		return x.Value, true
+	case *BooleanConst:
+		if x.Value {
+			return "t", true
+		}
+		return "f", true
+	case *TypedStringLit:
+		// Date / timestamp literals share the value byte-for-byte
+		// with what ANALYZE stamps via Datum.Format for those
+		// kinds — both render through Go's time formatting.
+		return x.Value, true
+	}
+	return "", false
+}
+
+// columnStatsForChild walks the child plan tree to find a
+// SeqScan whose Table.Stats describes the column at logical
+// index `idx` (matches the executor's Output indexing). Returns
+// nil when the column doesn't trace back to a base relation
+// with stats — that's the unanalysed-table fallback.
+func columnStatsForChild(idx int, child Node) *catalog.ColumnStats {
+	switch x := child.(type) {
+	case *SeqScan:
+		if x.Table == nil || x.Table.Stats == nil {
+			return nil
+		}
+		if idx < 0 || idx >= len(x.Table.Stats.Columns) {
+			return nil
+		}
+		return &x.Table.Stats.Columns[idx]
+	case *Filter:
+		return columnStatsForChild(idx, x.Child)
+	case *Sort:
+		return columnStatsForChild(idx, x.Child)
+	case *Project:
+		return columnStatsForChild(idx, x.Child)
+	}
+	return nil
+}

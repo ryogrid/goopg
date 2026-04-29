@@ -1910,12 +1910,34 @@ Decomposed into the four design-doc seams the milestone calls out
 
 ### Planner consumption
 
-- [ ] `clauselist_selectivity`-shaped predicate decomposition in
+- [x] `clauselist_selectivity`-shaped predicate decomposition in
       `planner.EstimateRows` for the Filter case: equality vs MCV
       lookup, range vs histogram-bucket interpolation, IN as sum
       of per-value selectivities, AND/OR combination, fall back
       to today's `1/3` only when stats are absent. Design doc
       `docs/design/0006-0003-clauselist-selectivity.md`.
+      (landed 2026-04-29: `internal/planner/selectivity.go`
+      introduces `clauseSelectivity(expr, child) float64`, hooked
+      into `cardinality.go`'s `*Filter` case in place of the
+      M0003 flat `1/3` constant. Equality on a ColumnRef probes
+      the column's MCV list (byte-equal against
+      `formatExprConstant`); misses fall back to non-MCV mass /
+      non-MCV NDistinct, then `defaultEqSelectivity` = 1/200.
+      Range predicates `< <= > >=` interpolate the equi-depth
+      histogram via `bucketFraction`, scoped to non-MCV mass and
+      added to MCV-hit contributions. AND uses the independence
+      assumption product, OR uses inclusion-exclusion, NOT
+      inverts, `IN (vals)` sums per-value selectivities capped
+      at 1.0. Two-column predicates (`a.x = b.y` outside JOIN),
+      LIKE, IS NULL, ParamRef constants and unrecognised shapes
+      all fall through to `defaultGenericSelectivity` — the M0003
+      behaviour stays as the documented fallback. New helper
+      `columnStatsForChild` walks SeqScan / Filter / Sort /
+      Project chains to find the per-column stats. Tests in
+      `selectivity_test.go` pin the seven-shape contract:
+      MCV-hit equality, non-MCV-fallback equality, histogram
+      range, AND product, OR inclusion-exclusion, IN sum, and
+      no-stats fallback.)
 - [ ] Cost-driven INNER-join algorithm selection: hash vs merge
       vs nested-loop scored against estimated input sizes and
       key NDistinct. Existing rule-based logic remains the

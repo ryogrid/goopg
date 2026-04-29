@@ -49,7 +49,7 @@ func EstimateRows(n Node) int64 {
 		if child <= 0 {
 			return 0
 		}
-		return scaleByFloat(child, defaultGenericSelectivity)
+		return scaleByFloat(child, clauseSelectivity(x.Predicate, x.Child))
 	case *Limit:
 		child := EstimateRows(x.Child)
 		if lim, ok := constInt(x.Limit); ok {
