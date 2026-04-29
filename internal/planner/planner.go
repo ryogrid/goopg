@@ -1726,13 +1726,24 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
 	ctx := singleBindingContext(tbl, s.Target.Alias)
+	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
-		pred, err := resolveExpr(s.Where, ctx)
-		if err != nil {
+		// M0021-0009 step 2d: try the index-driven probe first
+		// for `WHERE indexed_col = key` shapes. Mirrors planSelect's
+		// `if idxNode, ok, err := planIndexScanFromWhere(...)` arm.
+		// Falls through to Filter(SeqScan) on no index match.
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
 			return nil, err
+		} else if ok {
+			node = idxNode
+		} else {
+			pred, err := resolveExpr(s.Where, ctx)
+			if err != nil {
+				return nil, err
+			}
+			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 		}
-		node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 	}
 	set := make([]Expr, len(tbl.Columns))
 	for _, a := range s.Set {
@@ -1760,13 +1771,23 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
 	ctx := singleBindingContext(tbl, s.Target.Alias)
+	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
-		pred, err := resolveExpr(s.Where, ctx)
-		if err != nil {
+		// M0021-0009 step 2d: index-driven probe for
+		// `WHERE indexed_col = key` shapes; falls through to
+		// Filter(SeqScan).
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
 			return nil, err
+		} else if ok {
+			node = idxNode
+		} else {
+			pred, err := resolveExpr(s.Where, ctx)
+			if err != nil {
+				return nil, err
+			}
+			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 		}
-		node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 	}
 	return &Delete{pos: s.Pos(), Table: tbl, Child: node}, nil
 }

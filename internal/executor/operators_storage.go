@@ -269,21 +269,70 @@ func (o *insertOp) Next() (Row, error) {
 }
 
 // extractScanAndPredicate walks an Update/Delete child plan and pulls
-// out the underlying SeqScan plus an optional predicate. v0 only
-// emits Filter(SeqScan) or bare SeqScan, so anything else is a
-// planner bug we surface explicitly.
+// out the underlying scan target relation plus an optional predicate
+// the runtime should apply per row. The runtime's scanMatching is
+// inherently sequential — it walks every block of the relation —
+// so an IndexScan plan is treated as "SeqScan with a synthesised
+// `<indexed_col> = key` equality predicate". This is correct (the
+// predicate filters the same tuples the index would have probed)
+// but does not exploit the index for fast access; that
+// optimisation is a follow-up. Filter(IndexScan) combines the
+// outer Filter's predicate with the synthesised key predicate
+// via AND.
+//
+// Surfaces an explicit XX000 for plan shapes the executor doesn't
+// recognise — pre-existing planner-bug guard.
 func extractScanAndPredicate(child planner.Node) (*planner.SeqScan, planner.Expr, error) {
 	switch c := child.(type) {
 	case *planner.SeqScan:
 		return c, nil, nil
+	case *planner.IndexScan:
+		scan := &planner.SeqScan{Table: c.Table}
+		return scan, indexScanPredicate(c), nil
 	case *planner.Filter:
-		scan, ok := c.Child.(*planner.SeqScan)
-		if !ok {
-			return nil, nil, &ExecError{Code: "XX000", Pos: c.Pos(), Message: "Update/Delete: Filter child is not SeqScan"}
+		switch inner := c.Child.(type) {
+		case *planner.SeqScan:
+			return inner, c.Predicate, nil
+		case *planner.IndexScan:
+			scan := &planner.SeqScan{Table: inner.Table}
+			combined := &planner.BinaryOp{
+				Op:    "AND",
+				Left:  c.Predicate,
+				Right: indexScanPredicate(inner),
+			}
+			return scan, combined, nil
 		}
-		return scan, c.Predicate, nil
+		return nil, nil, &ExecError{Code: "XX000", Pos: c.Pos(), Message: "Update/Delete: Filter child is not SeqScan or IndexScan"}
 	}
 	return nil, nil, &ExecError{Code: "XX000", Pos: child.Pos(), Message: "Update/Delete: unsupported child plan"}
+}
+
+// indexScanPredicate synthesises a `<indexed_col> = key` equality
+// predicate from a planner.IndexScan node so the runtime's
+// scanMatching loop (which always seq-scans) filters correctly
+// against the index's key target. The IndexScan's resolved
+// `Key` expression carries the rhs; the lhs reconstructs as a
+// ColumnRef pointing at the indexed column's table-output
+// ordinal. v0 indexes are single-column so Index.Columns[0] is
+// the relevant name; resolving against the IndexScan's parent
+// schema gives the correct output index for ColumnRef.
+func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
+	col := ix.Index.Columns[0]
+	out := ix.Output()
+	for i, sc := range out {
+		if sc.Name == col {
+			return &planner.BinaryOp{
+				Op:    "=",
+				Left:  &planner.ColumnRef{Index: i, Name: col, Type: sc.Type},
+				Right: ix.Key,
+			}
+		}
+	}
+	// Catalog inconsistency — index references a column that
+	// isn't on the table's output schema. Conservative: drop
+	// the predicate (over-match into the seq-scan body); the
+	// planner-side resolver should have caught this.
+	return nil
 }
 
 // updateOp scans the target relation and rewrites visible matching

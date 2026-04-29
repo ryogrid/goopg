@@ -418,6 +418,112 @@ func TestLockRowsStampsLockOnlyXmaxIndexScan(t *testing.T) {
 	}
 }
 
+// TestUpdateViaIndexScanBlocksOnForeignTupleLock — M0021 step 2d
+// integration. With a unique index on items.id, planUpdate picks
+// the IndexScan path for `UPDATE … WHERE id = N`. The runtime
+// still goes through scanMatching (which seq-scans the heap)
+// but the per-tuple foreign-lock detection from step 2b must
+// continue to fire — the IndexScan promotion shouldn't bypass
+// the blocking. Verifies by holding a SELECT FOR UPDATE in
+// session 1 and asserting that session 2's UPDATE registers as
+// a tuple-tag waiter when the planner picks IndexScan.
+func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := runDDL(t, ctx, "CREATE UNIQUE INDEX items_pk_2d_block ON items (id)"); err != nil {
+		t.Fatal(err)
+	}
+	// Commit the seed so subsequent xacts see the rows.
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+
+	s1tx, _ := ctx.TxnMgr.Begin(0)
+	s1snap, _ := ctx.TxnMgr.SnapshotFor(s1tx)
+	s1 := makeCtx(lm, 1)
+	s1.Pool = ctx.Pool
+	s1.Catalog = ctx.Catalog
+	s1.TxnMgr = ctx.TxnMgr
+	s1.Tx = s1tx
+	s1.Snap = s1snap
+	if _, err := runForUpdate(t, s1, "SELECT id FROM items WHERE id = 1 FOR UPDATE"); err != nil {
+		t.Fatalf("session-1 FOR UPDATE: %v", err)
+	}
+
+	s2tx, _ := ctx.TxnMgr.Begin(0)
+	s2snap, _ := ctx.TxnMgr.SnapshotFor(s2tx)
+	s2 := makeCtx(lm, 2)
+	s2.Pool = ctx.Pool
+	s2.Catalog = ctx.Catalog
+	s2.TxnMgr = ctx.TxnMgr
+	s2.Tx = s2tx
+	s2.Snap = s2snap
+	defer ctx.TxnMgr.Rollback(s2tx)
+
+	done := make(chan error, 1)
+	go func() {
+		stmts, err := parser.Parse("UPDATE items SET label = 'idx-updated' WHERE id = 1")
+		if err != nil {
+			done <- err
+			return
+		}
+		node, err := planner.Plan(stmts[0], s2.Catalog)
+		if err != nil {
+			done <- err
+			return
+		}
+		op, err := Build(node)
+		if err != nil {
+			done <- err
+			return
+		}
+		if err := op.Open(s2); err != nil {
+			done <- err
+			return
+		}
+		_, err = op.Next()
+		_ = op.Close()
+		if err != nil && err != EOF {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	rel := ctx.Catalog.RelFileNode(tbl)
+	deadline := time.Now().Add(2 * time.Second)
+	registered := false
+	for time.Now().Before(deadline) {
+		w := lm.Waiters(lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid, Block: 1, Offset: 2})
+		if len(w) > 0 {
+			registered = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !registered {
+		lm.ReleaseAll(1)
+		<-done
+		t.Fatal("session 2 did not register as a tuple-tag waiter via the IndexScan-driven UPDATE path")
+	}
+	lm.ReleaseAll(1)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("UPDATE after release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session 2 did not unblock after release")
+	}
+}
+
 // TestLockRowsRejectsSkipLocked — SKIP LOCKED stays deferred
 // pending tuple-level pessimistic locking (relation-coarse
 // locks have no per-row "skip" semantic). Pins the explicit

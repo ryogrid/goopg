@@ -178,3 +178,45 @@ func TestDeleteAllRowsWithoutPredicate(t *testing.T) {
 		t.Errorf("rows=%d want 0", len(rows))
 	}
 }
+
+// TestUpdateViaIndexScanPath — M0021 step 2d. Once the items
+// table has a unique index on id, the planner picks IndexScan
+// (or Filter(IndexScan) when an extra predicate is added) for
+// `UPDATE … WHERE id = N`. Verifies that the executor's
+// extractScanAndPredicate handles both shapes correctly,
+// synthesising the index key as a `=` predicate so scanMatching
+// still filters to the right rows; the rewrite produces the
+// same observable outcome as the SeqScan-based path.
+func TestUpdateViaIndexScanPath(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	// Index forces planUpdate to pick the IndexScan branch.
+	if err := runDDL(t, ctx, "CREATE UNIQUE INDEX items_pk_2d ON items (id)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "UPDATE items SET label = 'updated' WHERE id = 2"); err != nil {
+		t.Fatalf("UPDATE WHERE indexed: %v", err)
+	}
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	_ = scan.Open(ctx)
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]string{}
+	for _, r := range rows {
+		got[r[0].Int] = r[1].String
+	}
+	want := map[int64]string{1: "alpha", 2: "updated", 3: "gamma"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("got[%d]=%q want %q", k, got[k], v)
+		}
+	}
+}

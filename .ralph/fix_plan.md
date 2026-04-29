@@ -3070,11 +3070,43 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       would error before the lock-detection logic runs.
       Tuple-level NOWAIT/SKIP LOCKED + MultiXact +
       streaming stamping all remain deferred.)
-- [ ] Tuple-level pessimistic locking — step 2d:
-      UPDATE/DELETE via IndexScan path (extend
-      extractScanAndPredicate to accept Filter(IndexScan)
-      and IndexScan; thread per-tuple foreign-lock
-      detection through the index-driven update path).
+- [x] Tuple-level pessimistic locking — step 2d:
+      UPDATE/DELETE via IndexScan path. Design doc
+      `docs/design/0021-0010-tuple-locking-index-update-path.md`.
+      (landed 2026-04-30: planUpdate/planDelete mirror
+      planSelect's planIndexScanFromWhere arm — when
+      `WHERE indexed_col = key` shape matches, the planner
+      picks IndexScan; otherwise falls through to
+      Filter(SeqScan). `ctx.cat = cat` set on the
+      singleBindingContext so subquery resolution inside
+      the index key works. extractScanAndPredicate
+      extended to accept *planner.IndexScan and
+      *planner.Filter wrapping IndexScan; new
+      indexScanPredicate(ix) synthesises a
+      `<indexed_col> = key` equality predicate (lhs is a
+      fresh ColumnRef on the indexed column's output
+      ordinal; rhs is the IndexScan's already-resolved
+      Key). Filter(IndexScan) ANDs the outer predicate
+      with the synthesised key predicate. scanMatching
+      is still sequential — treating IndexScan as
+      "SeqScan with synthesised key predicate" is correct
+      but doesn't exploit the index for fast access;
+      that optimisation is a separate follow-up.
+      Crucially, scanMatching's per-tuple foreign-lock
+      detection from step 2b continues to fire: every
+      tuple the seq-scan visits (including those passing
+      the synthesised `=` predicate) goes through
+      lockedByForeign + acquireTupleLock. Tests:
+      TestUpdateViaIndexScanPath (rewrite produces same
+      observable outcome) +
+      TestUpdateViaIndexScanBlocksOnForeignTupleLock
+      (multi-session blocking still fires when UPDATE
+      picks IndexScan). Full `go test ./...` green;
+      race-mode targeted executor + planner runs green.
+      Index-driven UPDATE/DELETE optimisation +
+      tuple-level NOWAIT/SKIP LOCKED through
+      UPDATE/DELETE + MultiXact + streaming stamping
+      all remain deferred.)
 - [x] Tuple-level pessimistic locking — step 3: row-lock
       WAL record + crash-recovery replay. Design doc
       `docs/design/0021-0006-tuple-locking-heap-lock-wal.md`.
