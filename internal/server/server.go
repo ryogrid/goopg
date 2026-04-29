@@ -33,6 +33,7 @@ import (
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // Config controls a single Server instance.
@@ -92,6 +93,27 @@ type Config struct {
 	// feature_not_supported, matching the v0 in-process default
 	// where the server runs without a WAL writer.
 	Checkpointer executor.Checkpointer
+
+	// Slots, when set, exposes the replication-slot registry to
+	// the wire-layer replication-command handler (IDENTIFY_SYSTEM,
+	// CREATE_REPLICATION_SLOT, DROP_REPLICATION_SLOT). nil disables
+	// replication entirely — replication-mode connections still
+	// authenticate but every replication command returns
+	// feature_not_supported. See
+	// docs/design/0005-0001-streaming-replication-architecture.md.
+	Slots *wal.Slots
+
+	// WAL exposes the WAL writer's WrittenLSN() so IDENTIFY_SYSTEM
+	// can report a current xlogpos. nil → IDENTIFY_SYSTEM reports
+	// xlogpos=0/0 (acceptable for tests that don't care about the
+	// value).
+	WAL *wal.Writer
+
+	// SystemID is the cluster's pg_control identifier reported by
+	// IDENTIFY_SYSTEM. Empty makes IDENTIFY_SYSTEM emit a fixed
+	// placeholder. Production wiring derives this from
+	// `<DataDir>/global/pg_control` once that file exists.
+	SystemID string
 
 	// DataDir, when set, controls where the server writes its
 	// `postmaster.pid` file and binds its operator-facing control
@@ -404,8 +426,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, r, w, sess, logger)
-	_ = isReplication // reserved for the next loop's START_REPLICATION dispatch
+	s.runPostStartupLoop(connCtx, r, w, sess, logger, isReplication)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -578,7 +599,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger) {
+func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
 	extended := newExtendedState()
 	var copyIn *copyInState
 	for {
@@ -616,6 +637,23 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 		case protocol.MsgTerminate:
 			return
 		case protocol.MsgQuery:
+			// Replication-mode connections route MsgQuery through the
+			// replication-command dispatcher instead of the regular
+			// SQL path. The dispatcher recognises IDENTIFY_SYSTEM /
+			// CREATE_REPLICATION_SLOT / DROP_REPLICATION_SLOT and the
+			// (deferred) START_REPLICATION verbs; everything else
+			// falls back to the normal handler so utility commands
+			// like SHOW still work for diagnostics.
+			if isReplication {
+				handled, err := s.handleReplicationCommand(w, f.Payload)
+				if err != nil {
+					logger.Debug("replication command write error", "err", err)
+					return
+				}
+				if handled {
+					break
+				}
+			}
 			nextCopyIn, err := s.handleQueryOrCopy(w, sess, f.Payload)
 			if err != nil {
 				logger.Debug("handleQueryOrCopy write error", "err", err)

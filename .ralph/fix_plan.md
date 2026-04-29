@@ -1421,12 +1421,30 @@ under "Hooks into existing goopg code".
       mode; flag added to per-conn logger and reserved for the
       next loop's IDENTIFY_SYSTEM / START_REPLICATION command
       dispatch.)
-- [ ] Implement `IDENTIFY_SYSTEM` simple-query handler that
+- [x] Implement `IDENTIFY_SYSTEM` simple-query handler that
       returns `(systemid, timeline, xlogpos, dbname)` as a
       single-row tuple. Required for v0.
-- [ ] Implement `CREATE_REPLICATION_SLOT slot_name PHYSICAL`
+      (achieved 2026-04-29: `internal/server/replication.go`
+      `replyIdentifySystem` emits the upstream-aligned 4-column
+      reply with systemid (from `Config.SystemID`), timeline=1,
+      xlogpos formatted as `X/X` hex from `Config.WAL.WrittenLSN()`
+      when wired, and NULL dbname for physical replication.
+      Wire-shape integration test pins the contract.)
+- [x] Implement `CREATE_REPLICATION_SLOT slot_name PHYSICAL`
       and `DROP_REPLICATION_SLOT` handlers. Persist via the
       new `internal/wal/slots.go` API.
+      (achieved 2026-04-29: `internal/wal/slots.go` provides a
+      thread-safe `Slots` registry rooted at
+      `<DataDir>/pg_replslot/<slot>/state` (JSON, written via
+      tempfile+rename for crash safety). Supports Create / Drop
+      / Get / List / AdvanceConfirmedFlushLSN / SetActive /
+      MinRestartLSN. Slot-name validation matches upstream's
+      [a-z0-9_]{1,63}. Active slots can't be dropped (returns
+      ErrSlotInUse). `internal/server/replication.go` exposes
+      both verbs over the wire with the upstream-shaped response
+      tuple `(slot_name, consistent_point, snapshot_name,
+      output_plugin)`. Six unit tests pin the registry; three
+      wire-shape integration tests pin the dispatch.)
 - [ ] Implement `START_REPLICATION [SLOT slot_name] PHYSICAL
       <lsn> [TIMELINE n]` — flips the connection to streaming
       mode, replies with `MsgCopyBoth`, and hands off to the
@@ -1451,10 +1469,13 @@ under "Hooks into existing goopg code".
 
 ### Replication slots
 
-- [ ] `internal/wal/slots.go` (new): `Slot{Name, RestartLSN,
+- [x] `internal/wal/slots.go` (new): `Slot{Name, RestartLSN,
       ConfirmedFlushLSN, Active}` + load/save under
       `<DataDir>/pg_replslot/<slot>/state` (mirrors upstream
       `slotdata.c`).
+      (achieved 2026-04-29: full registry with persistence,
+      validation, advance helpers, retention-aware
+      `MinRestartLSN`. See entry above.)
 - [ ] Slot-aware WAL retention: M0002's segment-recycling
       path consults `min(slot.RestartLSN ∀ active)` before
       unlinking, bounded by `max_slot_wal_keep_size`.
