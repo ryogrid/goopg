@@ -2,8 +2,10 @@ package executor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -30,15 +32,91 @@ func (o *explainOp) Schema() planner.Schema {
 	return o.plan.Output()
 }
 
-func (o *explainOp) Open(_ *Context) error {
+func (o *explainOp) Open(ctx *Context) error {
 	o.rows = nil
-	if o.plan.Options.Format == parser.ExplainFormatJSON {
+	opts := o.plan.Options
+	var stats nodeStatsTable
+	var planNs, execNs int64
+
+	if opts.Analyze {
+		// M0018-0003: build the inner plan with instrumentation,
+		// drain it to completion so timers fire, then render.
+		// TIMING and SUMMARY are always on under ANALYZE in this
+		// slice — explicit `TIMING OFF` / `SUMMARY OFF` support
+		// is a follow-up. The Options.Timing / Options.Summary
+		// flags are parsed but not yet consulted (the AST shape
+		// is stable; the renderer just enables them
+		// unconditionally for now).
+		timing := true
+		summary := true
+
+		planStart := time.Now()
+		var inner Operator
+		var err error
+		inner, stats, err = withInstrumentation(timing, func() (Operator, error) {
+			return Build(o.plan.Child)
+		})
+		if err != nil {
+			return err
+		}
+		if timing {
+			planNs = time.Since(planStart).Nanoseconds()
+		}
+
+		execStart := time.Now()
+		if err := inner.Open(ctx); err != nil {
+			return err
+		}
+		for {
+			_, err := inner.Next()
+			if errors.Is(err, EOF) {
+				break
+			}
+			if err != nil {
+				_ = inner.Close()
+				return err
+			}
+		}
+		if err := inner.Close(); err != nil {
+			return err
+		}
+		if timing {
+			execNs = time.Since(execStart).Nanoseconds()
+		}
+
+		if opts.Format == parser.ExplainFormatJSON {
+			root := planToJSONWithStats(o.plan.Child, opts, stats)
+			if summary {
+				if timing {
+					root["Planning Time"] = nsToMs(planNs)
+					root["Execution Time"] = nsToMs(execNs)
+				}
+			}
+			out, err := json.MarshalIndent([]any{root}, "", "  ")
+			if err != nil {
+				return fmt.Errorf("explain: marshal JSON: %w", err)
+			}
+			o.rows = []Row{{Datum{Kind: KindString, String: string(out)}}}
+			return nil
+		}
+		var b strings.Builder
+		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats)
+		if summary && timing {
+			o.rows = append(o.rows,
+				Row{Datum{Kind: KindString, String: fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs))}},
+				Row{Datum{Kind: KindString, String: fmt.Sprintf("Execution Time: %.3f ms", nsToMs(execNs))}},
+			)
+		}
+		return nil
+	}
+
+	if opts.Format == parser.ExplainFormatJSON {
 		// FORMAT JSON: emit one row whose cell is the JSON-
 		// encoded plan tree. The wrapping single-element array
 		// matches upstream's `[ {root} ]` shape so future
 		// extensions (multiple top-level entries) don't require
 		// a schema change.
-		root := planToJSON(o.plan.Child, o.plan.Options)
+		root := planToJSON(o.plan.Child, opts)
 		out, err := json.MarshalIndent([]any{root}, "", "  ")
 		if err != nil {
 			return fmt.Errorf("explain: marshal JSON: %w", err)
@@ -47,9 +125,11 @@ func (o *explainOp) Open(_ *Context) error {
 		return nil
 	}
 	var b strings.Builder
-	walkPlan(&b, o.plan.Child, 0, &o.rows, o.plan.Options)
+	walkPlan(&b, o.plan.Child, 0, &o.rows, opts)
 	return nil
 }
+
+func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 
 func (o *explainOp) Next() (Row, error) {
 	if o.idx >= len(o.rows) {
@@ -113,6 +193,66 @@ func schemaColumnNames(n planner.Node) []string {
 		names[i] = c.Name
 	}
 	return names
+}
+
+// walkPlanAnalyze is the ANALYZE variant of walkPlan: same
+// indented TEXT output, but each node line gains an
+// `(actual time=startup..total rows=R loops=L)` suffix pulled
+// from the instrumentation table. Loops > 0 means the operator
+// ran at least once. Total time is in milliseconds.
+func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable) {
+	indent := strings.Repeat("  ", depth)
+	prefix := indent
+	if depth > 0 {
+		prefix = indent + "->  "
+	}
+	label := prefix + describePlan(n)
+	if est := planner.EstimateRows(n); est > 0 {
+		label += fmt.Sprintf(" (rows=%d)", est)
+	}
+	if s, ok := stats[n]; ok && s != nil {
+		label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%d loops=%d)",
+			nsToMs(s.startupNs), nsToMs(s.totalNs), s.rowsOut, s.loops)
+	}
+	*rows = append(*rows, Row{Datum{Kind: KindString, String: label}})
+
+	if opts.Verbose {
+		if cols := schemaColumnNames(n); len(cols) > 0 {
+			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
+			*rows = append(*rows, Row{Datum{Kind: KindString, String: outline}})
+		}
+	}
+
+	for _, c := range planChildren(n) {
+		walkPlanAnalyze(b, c, depth+1, rows, opts, stats)
+	}
+}
+
+// planToJSONWithStats is the ANALYZE variant of planToJSON: each
+// node object grows Actual Rows / Actual Loops / Actual Startup
+// Time / Actual Total Time fields keyed by the instrumented
+// node's identity. Mirrors upstream's JSON ANALYZE shape.
+func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeStatsTable) map[string]any {
+	obj := planToJSON(n, opts)
+	if s, ok := stats[n]; ok && s != nil {
+		obj["Actual Rows"] = s.rowsOut
+		obj["Actual Loops"] = s.loops
+		if s.timing {
+			obj["Actual Startup Time"] = nsToMs(s.startupNs)
+			obj["Actual Total Time"] = nsToMs(s.totalNs)
+		}
+	}
+	// Re-render Plans recursively with stats, replacing the
+	// stats-free children that planToJSON installed.
+	children := planChildren(n)
+	if len(children) > 0 {
+		plans := make([]map[string]any, 0, len(children))
+		for _, c := range children {
+			plans = append(plans, planToJSONWithStats(c, opts, stats))
+		}
+		obj["Plans"] = plans
+	}
+	return obj
 }
 
 // planToJSON renders n as the upstream-style JSON object an

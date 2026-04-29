@@ -11,41 +11,50 @@ import (
 // Open. Storage-touching operators (SeqScan/Insert/Update/Delete)
 // are wired in operators_storage.go alongside the heap-write
 // machinery; this file handles the pure-compute operators.
+//
+// When the package-local instrumentScope is non-nil (set by
+// withInstrumentation around an EXPLAIN ANALYZE Open), each
+// returned operator is wrapped in an instrumentedOp via
+// maybeInstrument so the EXPLAIN renderer can read per-node
+// rows/loops/timing counters. nil-scope (the default) returns
+// raw operators byte-for-byte unchanged.
 func Build(plan planner.Node) (Operator, error) {
 	switch p := plan.(type) {
 	case *planner.Values:
-		return newValuesOp(p), nil
+		return maybeInstrument(p, newValuesOp(p)), nil
 	case *planner.CTEScan:
 		// CTEScan is a labeling wrap from M0016-0004 — Stage A
 		// inlines the CTE body under the wrap, so executing it
 		// is just executing the child. The wrap exists so EXPLAIN
 		// can surface the CTE name; runtime semantics are
-		// identical to the child.
+		// identical to the child. The recursive Build wraps the
+		// child, so the CTEScan layer doesn't need its own
+		// instrumented row.
 		return Build(p.Child)
 	case *planner.Project:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
-		return newProjectOp(p, child), nil
+		return maybeInstrument(p, newProjectOp(p, child)), nil
 	case *planner.Filter:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
-		return newFilterOp(p, child), nil
+		return maybeInstrument(p, newFilterOp(p, child)), nil
 	case *planner.Limit:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
-		return newLimitOp(p, child), nil
+		return maybeInstrument(p, newLimitOp(p, child)), nil
 	case *planner.Sort:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
-		return newSortOp(p, child), nil
+		return maybeInstrument(p, newSortOp(p, child)), nil
 	case *planner.Join:
 		left, err := Build(p.Left)
 		if err != nil {
@@ -55,27 +64,35 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		return newJoinOp(p, left, right), nil
+		return maybeInstrument(p, newJoinOp(p, left, right)), nil
 	case *planner.Aggregate:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
-		return newAggregateOp(p, child), nil
+		return maybeInstrument(p, newAggregateOp(p, child)), nil
 	case *planner.SeqScan:
-		return newSeqScanOp(p), nil
+		return maybeInstrument(p, newSeqScanOp(p)), nil
 	case *planner.IndexScan:
-		return newIndexScanOp(p), nil
+		return maybeInstrument(p, newIndexScanOp(p)), nil
 	case *planner.Insert:
 		child, err := Build(p.Source)
 		if err != nil {
 			return nil, err
 		}
-		return newInsertOp(p, child), nil
+		return maybeInstrument(p, newInsertOp(p, child)), nil
 	case *planner.Update:
-		return newUpdateOp(p)
+		op, err := newUpdateOp(p)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, op), nil
 	case *planner.Delete:
-		return newDeleteOp(p)
+		op, err := newDeleteOp(p)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, op), nil
 	case *planner.DDL:
 		return newDDLOp(p), nil
 	case *planner.Transaction:

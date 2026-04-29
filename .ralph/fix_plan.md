@@ -2394,10 +2394,44 @@ calls out.
       TestExplainParenAnalyzeAlsoRejected (parens form too).
       Full `go test ./...` green.)
 
-- [ ] EXPLAIN ANALYZE instrumentation (M0018-0003): per-node
-      timing wrapper, rows/loops counters, TIMING OFF
-      suppression, summary block. Continues
+- [x] EXPLAIN ANALYZE instrumentation (M0018-0003).
+      Design doc
       `docs/design/0018-0003-explain-analyze-instrumentation.md`.
+      (landed 2026-04-29: M0018-0002 Stage A's ANALYZE
+      0A000 rejection lifted. New
+      `internal/executor/instrument.go`: `nodeStats` struct
+      tracks per-Node `rowsOut` / `loops` / `startupNs` /
+      `totalNs`; `instrumentedOp` wraps each Operator
+      delegating Schema/RowsAffected with sidecar counters.
+      Package-local `instrumentScope` + `withInstrumentation`
+      mirror the existing planParent / outerScope pattern.
+      `Build` switch arms each gained a `maybeInstrument(p,
+      op)` wrap before return — recursive Build naturally
+      wraps every node in the tree. nil-scope (the default)
+      returns raw operators byte-for-byte unchanged so every
+      pre-M0018-0003 path is invariant. Planner: dropped the
+      Stage A ANALYZE rejection so the AST flows through to
+      the executor. Executor: `explainOp.Open` branches on
+      `Options.Analyze` — true builds with instrumentation,
+      drains the inner plan to completion (Open / Next loop
+      / Close so timers fire), then renders. TEXT output
+      gains `(actual time=X..Y rows=R loops=L)` per node
+      and a `Planning Time: N ms` / `Execution Time: N ms`
+      footer. JSON output gains Actual Rows / Actual Loops /
+      Actual Total Time / Actual Startup Time per node and
+      Planning Time / Execution Time on the root. TIMING
+      and SUMMARY are always-on under ANALYZE in this slice;
+      explicit `TIMING OFF` / `SUMMARY OFF` is a follow-up.
+      Tests: TestExplainAnalyzeRunsInnerAndReportsActualRows
+      (5-row table → "rows=5 loops=1"),
+      TestExplainAnalyzeIncludesPlanningExecutionTime,
+      TestExplainAnalyzeJSONIncludesActualFields (all 6
+      keys present + Actual Rows accurate), TestExplain
+      AnalyzeOnSelectOneRowsAccurate. Stage A's
+      ANALYZE-rejection tests deleted (the gate they pinned
+      no longer exists). Full `go test ./...` green.
+      BUFFERS / SETTINGS counter rendering and the JSON
+      snapshot regression strategy land in M0018-0004.)
 
 - [ ] EXPLAIN JSON snapshot strategy (M0018-0004): stable
       schema, regression-test fixture format, BUFFERS counter

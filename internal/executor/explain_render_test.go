@@ -147,50 +147,7 @@ func TestExplainVerboseAddsOutputLine(t *testing.T) {
 	}
 }
 
-// TestExplainAnalyzeRejected pins the Stage A contract:
-// ANALYZE is parsed but rejected by the planner with SQLSTATE
-// 0A000 BEFORE the inner statement is planned. Without the
-// pre-plan rejection, `EXPLAIN ANALYZE INSERT ...` could
-// trigger side effects of planning a write path that won't
-// execute.
-func TestExplainAnalyzeRejected(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
-	defer cleanup()
-
-	stmts, err := parser.Parse("EXPLAIN ANALYZE SELECT 1")
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	_, err = planner.Plan(stmts[0], ctx.Catalog)
-	if err == nil {
-		t.Fatal("Plan returned nil for EXPLAIN ANALYZE; want 0A000 rejection")
-	}
-	pe, ok := err.(*planner.PlanError)
-	if !ok {
-		t.Fatalf("err type=%T, want *planner.PlanError", err)
-	}
-	if pe.Code != "0A000" {
-		t.Errorf("code=%s, want 0A000", pe.Code)
-	}
-	if !strings.Contains(pe.Message, "Stage B") {
-		t.Errorf("message missing 'Stage B' note: %q", pe.Message)
-	}
-}
-
-// TestExplainParenAnalyzeAlsoRejected: the parenthesised form
-// must hit the same rejection. Pre-plan check fires regardless
-// of which surface form set Analyze=true.
-func TestExplainParenAnalyzeAlsoRejected(t *testing.T) {
-	ctx, _, cleanup := newDDLFixture(t)
-	defer cleanup()
-
-	stmts, _ := parser.Parse("EXPLAIN (ANALYZE) SELECT 1")
-	_, err := planner.Plan(stmts[0], ctx.Catalog)
-	if err == nil {
-		t.Fatal("Plan returned nil; want 0A000")
-	}
-	pe, _ := err.(*planner.PlanError)
-	if pe == nil || pe.Code != "0A000" {
-		t.Errorf("got %v, want PlanError 0A000", err)
-	}
-}
+// (Stage A's ANALYZE-rejection tests were replaced by the
+// instrumentation tests below when M0018-0003 lifted the gate.
+// `EXPLAIN ANALYZE` now executes the inner statement and reports
+// per-node actual-rows / loops / timing.)
