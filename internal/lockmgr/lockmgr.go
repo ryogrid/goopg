@@ -233,6 +233,44 @@ func (lm *LockManager) SetDeadlockTimeout(d time.Duration) {
 // Acquire is idempotent over (b, t, m): asking for a mode you
 // already hold is a no-op and returns nil immediately. Higher-level
 // reference-counting is the caller's job.
+
+// ErrLockNotAvailable is the typed sentinel TryAcquire returns when
+// the requested mode would have to block. Callers translate it into
+// SQLSTATE 55P03 ("could not obtain lock on row in relation X").
+var ErrLockNotAvailable = errors.New("lockmgr: could not obtain lock immediately")
+
+// TryAcquire is the non-blocking variant of Acquire used by SELECT
+// FOR UPDATE NOWAIT (M0021-0003 follow-up). On grant it returns
+// nil; on contention (or any queued waiter ahead) it returns
+// ErrLockNotAvailable instead of waiting. The fast path is
+// otherwise byte-identical to Acquire's first branch — same
+// idempotency, same FIFO fairness rule (don't grant past queued
+// waiters even when there's no current holder conflict). Locks
+// granted via TryAcquire are tracked in the same state and
+// released identically by Release / ReleaseAll.
+func (lm *LockManager) TryAcquire(b BackendID, t LockTag, m Mode) error {
+	if m <= NoLock || m > maxMode {
+		return fmt.Errorf("lockmgr: invalid mode %d", int(m))
+	}
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	st := lm.states[t]
+	if st == nil {
+		st = &lockState{holders: make(map[BackendID]Mask)}
+		lm.states[t] = st
+	}
+	// Already hold this mode? No-op (mirrors Acquire).
+	if st.holders[b]&bit(m) != 0 {
+		return nil
+	}
+	if len(st.waiters) == 0 && !ConflictsWith(m, st.grantedExcept(b)) {
+		st.holders[b] |= bit(m)
+		st.granted |= bit(m)
+		return nil
+	}
+	return ErrLockNotAvailable
+}
+
 func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mode) error {
 	if m <= NoLock || m > maxMode {
 		return fmt.Errorf("lockmgr: invalid mode %d", int(m))

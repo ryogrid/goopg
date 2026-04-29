@@ -103,12 +103,10 @@ func TestLockRowsForShareAlsoUsesRowShareLock(t *testing.T) {
 	}
 }
 
-// TestLockRowsRejectsNoWait — Stage A scope guard: NOWAIT and
-// SKIP LOCKED parse and analyze, but the executor refuses to
-// silently downgrade to default-blocking. Returns SQLSTATE 0A000
-// pointing at the locking clause so users see the specific
-// "Stage A executor follow-up" message.
-func TestLockRowsRejectsNoWait(t *testing.T) {
+// TestLockRowsNoWaitSucceedsUncontended — NOWAIT is supported
+// (M0021-0003 follow-up): when the relation lock is immediately
+// grantable, NOWAIT acquires it and proceeds normally.
+func TestLockRowsNoWaitSucceedsUncontended(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
 	ctx.LockMgr = lockmgr.New()
@@ -117,16 +115,70 @@ func TestLockRowsRejectsNoWait(t *testing.T) {
 	seedItems(t, ctx, tbl)
 
 	_ = catalog.Catalog(cat)
-	if _, err := runForUpdate(t, ctx, "SELECT id FROM items FOR UPDATE NOWAIT"); err == nil {
-		t.Fatal("expected NOWAIT rejection, got nil")
-	} else {
-		ee, ok := err.(*ExecError)
-		if !ok {
-			t.Fatalf("err = %T, want *ExecError", err)
-		}
-		if ee.Code != "0A000" {
-			t.Errorf("code = %q, want 0A000", ee.Code)
-		}
+	if _, err := runForUpdate(t, ctx, "SELECT id FROM items FOR UPDATE NOWAIT"); err != nil {
+		t.Fatalf("uncontended NOWAIT: %v", err)
+	}
+}
+
+// TestLockRowsNoWaitFailsOnContention — when another backend
+// holds a conflicting lock, NOWAIT surfaces SQLSTATE 55P03
+// instead of waiting. Pins the canonical upstream diagnostic
+// for "could not obtain lock immediately".
+func TestLockRowsNoWaitFailsOnContention(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	// Seed BEFORE wiring the lockmgr — keeps the seed INSERT
+	// from leaving a RowExclusiveLock held on backend 0 that
+	// would block our blocker's ExclusiveLock acquisition.
+	seedItems(t, ctx, tbl)
+
+	lm := lockmgr.New()
+	rel := ctx.Catalog.RelFileNode(tbl)
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if err := lm.Acquire(context.Background(), 1, tag, lockmgr.ExclusiveLock); err != nil {
+		t.Fatalf("blocker Acquire: %v", err)
+	}
+	defer lm.Release(1, tag, lockmgr.ExclusiveLock)
+
+	ctx.LockMgr = lm
+	ctx.BackendID = 2
+	_, err := runForUpdate(t, ctx, "SELECT id FROM items FOR UPDATE NOWAIT")
+	if err == nil {
+		t.Fatal("expected 55P03 on contended NOWAIT, got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("err = %T, want *ExecError", err)
+	}
+	if ee.Code != "55P03" {
+		t.Errorf("code = %q, want 55P03", ee.Code)
+	}
+}
+
+// TestLockRowsRejectsSkipLocked — SKIP LOCKED stays deferred
+// pending tuple-level pessimistic locking (relation-coarse
+// locks have no per-row "skip" semantic). Pins the explicit
+// 0A000 reject so the diagnostic message stays stable.
+func TestLockRowsRejectsSkipLocked(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.LockMgr = lockmgr.New()
+	ctx.BackendID = 1
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	_ = catalog.Catalog(cat)
+	_, err := runForUpdate(t, ctx, "SELECT id FROM items FOR UPDATE SKIP LOCKED")
+	if err == nil {
+		t.Fatal("expected SKIP LOCKED rejection, got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("err = %T, want *ExecError", err)
+	}
+	if ee.Code != "0A000" {
+		t.Errorf("code = %q, want 0A000", ee.Code)
 	}
 }
 
@@ -139,9 +191,13 @@ func TestLockRowsRejectsNoWait(t *testing.T) {
 func TestLockRowsBlocksOnExclusiveLock(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
-	lm := lockmgr.New()
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	// Seed BEFORE wiring the lockmgr so the seed insert doesn't
+	// leave a RowExclusiveLock that conflicts with backend 1's
+	// ExclusiveLock acquisition below.
 	seedItems(t, ctx, tbl)
+
+	lm := lockmgr.New()
 	ctx.LockMgr = lm
 	ctx.BackendID = 2
 

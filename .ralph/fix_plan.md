@@ -2913,10 +2913,43 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       operator). Full `go test ./...` green. NOWAIT/SKIP
       LOCKED runtime + observability counters + tuple-
       level pessimistic locking deferred.)
-- [ ] SELECT … FOR UPDATE — NOWAIT / SKIP LOCKED
-      runtime + observability counters (M0021-0003
-      follow-up / M0021-0004). Reserves filename
+- [x] SELECT … FOR UPDATE — **NOWAIT runtime**
+      (M0021-0004; SKIP LOCKED + observability deferred
+      to the tuple-level locking follow-up). Design doc
       `docs/design/0021-0004-deadlock-observability-and-test-matrix.md`.
+      (landed 2026-04-30: new `lockmgr.TryAcquire(b, t,
+      m)` non-blocking acquire + typed sentinel
+      `ErrLockNotAvailable` — byte-identical to Acquire's
+      synchronous fast path (idempotent re-grant + FIFO-
+      fair grant when no waiters and no conflict) but
+      returns the sentinel instead of queueing on
+      contention. Locks granted via TryAcquire tracked /
+      released identically. New `Context.tryAcquireRelLock`
+      mirrors `acquireRelLock` for the non-blocking variant;
+      maps ErrLockNotAvailable → SQLSTATE `55P03` (upstream's
+      canonical "could not obtain lock" code; message says
+      "relation" because goopg's locking is relation-coarse).
+      `lockRowsOp.Open` dispatches by WaitPolicy: Block →
+      acquireRelLock (unchanged), NoWait → tryAcquireRelLock,
+      SkipLocked → `0A000` with a specific "tuple-level
+      pessimistic locking is the deferred follow-up" message
+      (relation-coarse SKIP LOCKED would either produce
+      surprising empty results or be a no-op). Observability
+      counters (lock_wait_count / lock_wait_time / pg_locks
+      introspection) also deferred — every lock wait on
+      SELECT FOR UPDATE today is a single relation-level
+      wait. Tests in operators_lockrows_test.go: 3 new
+      scenarios — TestLockRowsNoWaitSucceedsUncontended
+      (replaces the previous Stage-A NOWAIT-rejected test),
+      TestLockRowsNoWaitFailsOnContention (multi-backend
+      ExclusiveLock blocker → 55P03 without waiting),
+      TestLockRowsRejectsSkipLocked (0A000 stable
+      diagnostic). Pre-existing
+      TestLockRowsBlocksOnExclusiveLock updated to seed
+      BEFORE wiring the lockmgr so the seed-insert's
+      RowExclusiveLock doesn't block the test's blocker
+      (a latent ordering bug surfaced when adding the new
+      NOWAIT contention test). Full `go test ./...` green.)
 - [ ] Tuple-level pessimistic locking on top of M0012 lock
       manager.
 

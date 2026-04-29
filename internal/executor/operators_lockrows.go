@@ -60,15 +60,40 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	for i := range o.plan.Locks {
 		lk := &o.plan.Locks[i]
-		if lk.WaitPolicy != planner.LockWaitBlock {
+		rel := ctx.Catalog.RelFileNode(lk.Table)
+		var err error
+		switch lk.WaitPolicy {
+		case planner.LockWaitBlock:
+			err = ctx.acquireRelLock(rel, lockmgr.RowShareLock)
+		case planner.LockWaitNoWait:
+			// NOWAIT: try once and bail with 55P03 if the
+			// relation lock isn't immediately grantable.
+			// Mirrors upstream's "could not obtain lock on
+			// row" diagnostic at the relation-coarse layer
+			// goopg has today.
+			err = ctx.tryAcquireRelLock(rel, lockmgr.RowShareLock)
+		case planner.LockWaitSkipLocked:
+			// SKIP LOCKED needs tuple-level lock probing to
+			// silently drop contended rows from the result.
+			// goopg's row-locking is relation-coarse — there
+			// are no individual rows to skip, only the whole
+			// relation. Reject here so users see the specific
+			// "tuple-level pessimistic locking is the
+			// follow-up" message rather than silently producing
+			// an empty result on contention.
 			return &ExecError{
 				Code:    "0A000",
 				Pos:     o.plan.Pos(),
-				Message: "NOWAIT / SKIP LOCKED are not supported in v0 (Stage A executor; lands in M0021-0003 follow-up)",
+				Message: "SKIP LOCKED requires tuple-level pessimistic locking (deferred follow-up to M0021)",
+			}
+		default:
+			return &ExecError{
+				Code:    "XX000",
+				Pos:     o.plan.Pos(),
+				Message: "unexpected wait policy",
 			}
 		}
-		rel := ctx.Catalog.RelFileNode(lk.Table)
-		if err := ctx.acquireRelLock(rel, lockmgr.RowShareLock); err != nil {
+		if err != nil {
 			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 				ee.Pos = o.plan.Pos()
 			}

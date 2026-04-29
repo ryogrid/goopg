@@ -121,6 +121,28 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
+// tryAcquireRelLock is the NOWAIT variant of acquireRelLock —
+// returns SQLSTATE 55P03 immediately when the lock isn't
+// instantly grantable. Used by `SELECT … FOR UPDATE NOWAIT`.
+// Mirrors upstream's "could not obtain lock on row in relation"
+// diagnostic; goopg's row-locking is relation-coarse for now so
+// the message says "relation" instead of "row" but the SQLSTATE
+// is the canonical one tooling greps for.
+func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) error {
+	if c.LockMgr == nil {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	err := c.LockMgr.TryAcquire(c.BackendID, tag, mode)
+	if err == nil {
+		return nil
+	}
+	if err == lockmgr.ErrLockNotAvailable {
+		return &ExecError{Code: "55P03", Message: "could not obtain lock on relation"}
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to
 // drive a synchronous checkpoint. The wire layer fills it from
 // server.Config; production servers use a *wal.Checkpointer.
