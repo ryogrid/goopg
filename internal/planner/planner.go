@@ -58,6 +58,14 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.TruncateStmt, *parser.AlterTableStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
+	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
+		*parser.CreateSubscriptionStmt, *parser.DropSubscriptionStmt:
+		// M0008 logical-replication DDL flows through DDL too;
+		// the executor's DDL operator handles them by mutating
+		// the runtime's *catalog.PubSub registry. See
+		// docs/design/0008-0003-publication-subscription-ddl.md.
+		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
+
 	case *parser.BeginStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxBegin}, nil
 	case *parser.CommitStmt:

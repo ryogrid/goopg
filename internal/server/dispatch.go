@@ -70,6 +70,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	ctx.Snap = snap
 	ctx.Checkpointer = s.cfg.Checkpointer
 	ctx.StatsTarget = sessionStatsTarget(sess)
+	ctx.PubSub = s.cfg.PubSub
 
 	for _, stmt := range stmts {
 		// Refresh snapshot per statement for ReadCommitted parity.

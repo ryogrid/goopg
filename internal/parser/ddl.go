@@ -54,8 +54,139 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		p.advance()
 		return p.parseCreateIndexTail(t.Pos, false)
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPublication:
+		if unlogged || orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED / OR REPLACE not valid for CREATE PUBLICATION"}
+		}
+		p.advance()
+		return p.parseCreatePublicationTail(t.Pos)
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSubscription:
+		if unlogged || orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED / OR REPLACE not valid for CREATE SUBSCRIPTION"}
+		}
+		p.advance()
+		return p.parseCreateSubscriptionTail(t.Pos)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, or VIEW after CREATE")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, or SUBSCRIPTION after CREATE")
+}
+
+// parseCreatePublicationTail picks up after CREATE PUBLICATION.
+// Grammar: `name [FOR ALL TABLES | FOR TABLE t1 [, t2 ...]]
+//           [WITH (option = value [, ...])]`.
+// See docs/design/0008-0003-publication-subscription-ddl.md.
+func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
+	stmt := &CreatePublicationStmt{pos: pos}
+	if p.cur().Kind != TokenIdent {
+		return nil, p.errAtCur("expected publication name after CREATE PUBLICATION")
+	}
+	stmt.Name = p.cur().Value
+	p.advance()
+	if p.acceptKeyword(KwFor) {
+		if p.acceptKeyword(KwAll) {
+			if !p.acceptKeyword(KwTables) {
+				return nil, p.errAtCur("expected TABLES after FOR ALL")
+			}
+			stmt.AllTables = true
+		} else if p.acceptKeyword(KwTable) {
+			tables, err := p.parseObjectList()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Tables = tables
+		} else {
+			return nil, p.errAtCur("expected ALL TABLES or TABLE after FOR")
+		}
+	}
+	if p.acceptKeyword(KwWith) {
+		opts, err := p.parsePubSubWithList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.With = opts
+	}
+	return stmt, nil
+}
+
+// parseCreateSubscriptionTail picks up after CREATE SUBSCRIPTION.
+// Grammar: `name CONNECTION 'conninfo' PUBLICATION p [, p2 ...]
+//           [WITH (option = value [, ...])]`.
+func (p *parser) parseCreateSubscriptionTail(pos int) (Stmt, error) {
+	stmt := &CreateSubscriptionStmt{pos: pos}
+	if p.cur().Kind != TokenIdent {
+		return nil, p.errAtCur("expected subscription name after CREATE SUBSCRIPTION")
+	}
+	stmt.Name = p.cur().Value
+	p.advance()
+	if _, err := p.expectKeyword(KwConnection); err != nil {
+		return nil, err
+	}
+	if p.cur().Kind != TokenStringLit {
+		return nil, p.errAtCur("expected string literal after CONNECTION")
+	}
+	stmt.Conninfo = p.cur().Value
+	p.advance()
+	if _, err := p.expectKeyword(KwPublication); err != nil {
+		return nil, err
+	}
+	if p.cur().Kind != TokenIdent {
+		return nil, p.errAtCur("expected publication name after PUBLICATION")
+	}
+	stmt.Publications = append(stmt.Publications, p.cur().Value)
+	p.advance()
+	for p.acceptSymbol(",") {
+		if p.cur().Kind != TokenIdent {
+			return nil, p.errAtCur("expected publication name after ','")
+		}
+		stmt.Publications = append(stmt.Publications, p.cur().Value)
+		p.advance()
+	}
+	if p.acceptKeyword(KwWith) {
+		opts, err := p.parsePubSubWithList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.With = opts
+	}
+	return stmt, nil
+}
+
+// parsePubSubWithList parses `(key = value [, key = value …])`. Values
+// may be string literals, identifiers, or boolean keywords.
+func (p *parser) parsePubSubWithList() (map[string]string, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after WITH")
+	}
+	out := map[string]string{}
+	for {
+		if p.cur().Kind != TokenIdent && p.cur().Kind != TokenKeyword {
+			return nil, p.errAtCur("expected option name in WITH list")
+		}
+		key := p.cur().Value
+		p.advance()
+		if cur := p.cur(); !(cur.Kind == TokenOperator && cur.Value == "=") {
+			return nil, p.errAtCur("expected '=' after option name")
+		}
+		p.advance()
+		var value string
+		switch p.cur().Kind {
+		case TokenStringLit, TokenIdent, TokenIntLit:
+			value = p.cur().Value
+			p.advance()
+		case TokenKeyword:
+			value = string(p.cur().Keyword)
+			p.advance()
+		default:
+			return nil, p.errAtCur("expected option value")
+		}
+		out[key] = value
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close WITH list")
+	}
+	return out, nil
 }
 
 // parseCreateViewTail picks up after CREATE [OR REPLACE] VIEW.
@@ -365,8 +496,41 @@ func (p *parser) parseDrop() (Stmt, error) {
 			return nil, err
 		}
 		return &DropViewStmt{pos: t.Pos, IfExists: ifExists, Names: names, Behavior: behavior}, nil
+	case KwPublication:
+		p.advance()
+		ifExists, name, err := p.parseDropPubSubTail("publication")
+		if err != nil {
+			return nil, err
+		}
+		return &DropPublicationStmt{pos: t.Pos, IfExists: ifExists, Name: name}, nil
+	case KwSubscription:
+		p.advance()
+		ifExists, name, err := p.parseDropPubSubTail("subscription")
+		if err != nil {
+			return nil, err
+		}
+		return &DropSubscriptionStmt{pos: t.Pos, IfExists: ifExists, Name: name}, nil
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, or VIEW after DROP")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, or SUBSCRIPTION after DROP")
+}
+
+// parseDropPubSubTail picks up after DROP PUBLICATION / DROP
+// SUBSCRIPTION, parsing `[IF EXISTS] name`. Single-name form
+// only — multi-target DROP for these isn't supported in v0.
+func (p *parser) parseDropPubSubTail(kind string) (bool, string, error) {
+	ifExists := false
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return false, "", err
+		}
+		ifExists = true
+	}
+	if p.cur().Kind != TokenIdent {
+		return false, "", p.errAtCur("expected " + kind + " name")
+	}
+	name := p.cur().Value
+	p.advance()
+	return ifExists, name, nil
 }
 
 // parseDropTail picks up after DROP TABLE / DROP INDEX, parsing

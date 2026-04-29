@@ -87,6 +87,16 @@ type Config struct {
 	Pool    *storage.Pool
 	TxnMgr  *mvcc.Manager
 
+	// PubSub is the M0008 logical-replication publication /
+	// subscription registry. CREATE PUBLICATION / CREATE
+	// SUBSCRIPTION etc. mutate it through the executor; the
+	// pg_publication / pg_subscription / pg_publication_rel /
+	// pg_publication_tables / pg_subscription_rel virtual
+	// catalog views render its current state. nil disables the
+	// SQL surface (DDL falls through to feature_not_supported).
+	// See docs/design/0008-0003-publication-subscription-ddl.md.
+	PubSub *catalog.PubSub
+
 	// Checkpointer, when set, is invoked by the SQL `CHECKPOINT`
 	// verb. Production wiring points at *wal.Checkpointer; tests can
 	// inject a fake. nil makes CHECKPOINT fail with

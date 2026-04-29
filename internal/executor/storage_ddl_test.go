@@ -351,3 +351,72 @@ func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 	}
 	return ctx, cat, cleanup
 }
+
+// TestDDLCreatePublicationEndToEnd pins the M0008 / 0008-0003 SQL
+// surface: `CREATE PUBLICATION p FOR TABLE t` parses, plans,
+// and executes against a Context whose PubSub registry is wired,
+// landing a row visible via Lookup.
+func TestDDLCreatePublicationEndToEnd(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	// Fixture pre-registers "items"; the DDL just references it.
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items WITH (publish = 'insert,delete')"); err != nil {
+		t.Fatal(err)
+	}
+	pub, ok := ctx.PubSub.LookupPublication("p")
+	if !ok {
+		t.Fatal("publication p not registered")
+	}
+	if pub.AllTables {
+		t.Errorf("AllTables=true want false")
+	}
+	if len(pub.Tables) != 1 || pub.Tables[0] != "items" {
+		t.Errorf("Tables=%v want [items]", pub.Tables)
+	}
+	if !pub.PublishInsert || pub.PublishUpdate || !pub.PublishDelete {
+		t.Errorf("publish flags=%+v want insert+delete only", pub)
+	}
+}
+
+// TestDDLCreateSubscriptionEndToEnd: a SUBSCRIPTION lands in the
+// registry via the SQL path with conninfo, publication list, and
+// slot_name carried from the WITH option.
+func TestDDLCreateSubscriptionEndToEnd(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	sql := "CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1, p2 WITH (slot_name = mysub, enabled = false)"
+	if err := runDDL(t, ctx, sql); err != nil {
+		t.Fatal(err)
+	}
+	sub, ok := ctx.PubSub.LookupSubscription("s")
+	if !ok {
+		t.Fatal("subscription s not registered")
+	}
+	if sub.Conninfo != "host=remote dbname=app" {
+		t.Errorf("Conninfo=%q", sub.Conninfo)
+	}
+	if len(sub.Publications) != 2 || sub.Publications[0] != "p1" || sub.Publications[1] != "p2" {
+		t.Errorf("Publications=%v", sub.Publications)
+	}
+	if sub.SlotName != "mysub" {
+		t.Errorf("SlotName=%q want mysub", sub.SlotName)
+	}
+	if sub.Enabled {
+		t.Errorf("Enabled=true want false")
+	}
+}
+
+// TestDDLDropPublicationIfExists: DROP IF EXISTS is a no-op when
+// the publication doesn't exist.
+func TestDDLDropPublicationIfExists(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+	if err := runDDL(t, ctx, "DROP PUBLICATION IF EXISTS missing"); err != nil {
+		t.Errorf("DROP PUBLICATION IF EXISTS missing returned %v want nil", err)
+	}
+}

@@ -2284,14 +2284,41 @@ item.
       executor wiring, slot provisioning, and persistence land
       in subsequent loops.)
 
-- [ ] Publication / subscription parser surface +
-      executor / catalog wiring: `CREATE PUBLICATION name
-      [FOR ALL TABLES | FOR TABLE t1, t2] [WITH (publish =
-      'insert,update,delete')]`, `DROP PUBLICATION [IF EXISTS]
-      name`, `CREATE SUBSCRIPTION name CONNECTION '...'
-      PUBLICATION p [WITH (slot_name=…, enabled=…)]`, `DROP
-      SUBSCRIPTION [IF EXISTS] name`. AST + dispatcher path
-      + a small Plan node that calls `Runtime.PubSub.*`.
+- [x] Publication / subscription parser surface +
+      executor / catalog wiring (continues 0008-0003).
+      (landed 2026-04-29: New keywords `publication`,
+      `subscription`, `connection`, `for`, `tables` (option
+      names `publish` / `enabled` / `slot_name` stay plain
+      identifiers so they don't collide with column
+      references like `pg_stat_replication.slot_name`). New
+      AST nodes `CreatePublicationStmt`, `DropPublicationStmt`,
+      `CreateSubscriptionStmt`, `DropSubscriptionStmt`. Parser
+      dispatch via `parseCreate` / `parseDrop`; new
+      `parseCreatePublicationTail`, `parseCreateSubscriptionTail`,
+      `parseDropPubSubTail`, and a shared
+      `parsePubSubWithList` for `WITH (k = v, ...)` (handles
+      string lits, idents, ints, keywords as values; uses the
+      `TokenOperator '='` shape since `=` is an operator).
+      Planner routes the four new stmts into `*planner.DDL`.
+      Executor `ddlOp` grows `execCreatePublication` /
+      `execDropPublication` / `execCreateSubscription` /
+      `execDropSubscription` that call into
+      `Context.PubSub.Create*`/`Drop*`. `executor.Context.PubSub`
+      added; threaded from `server.Config.PubSub` (which
+      `cmd/goopg start` populates from `Runtime.PubSub`) via
+      `dispatch.go` and `dispatch_extended.go`. Tests:
+      TestParseCreatePublicationForTable,
+      TestParseCreatePublicationForAllTables,
+      TestParseCreatePublicationWithPublishOption,
+      TestParseDropPublicationIfExists,
+      TestParseCreateSubscription, TestParseDropSubscription
+      (parser); TestDDLCreatePublicationEndToEnd,
+      TestDDLCreateSubscriptionEndToEnd,
+      TestDDLDropPublicationIfExists (executor end-to-end).
+      With this slice an operator can run
+      `CREATE PUBLICATION p FOR TABLE items WITH (publish =
+      'insert,delete')` and the change is visible via the
+      five virtual catalog views from the prior loop.)
 
 - [ ] Apply worker + initial table sync: subscriber-side worker
       that connects to the publisher's logical slot, decodes the

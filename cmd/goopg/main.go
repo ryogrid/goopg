@@ -207,6 +207,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.Slots = rt.Slots
 		cfg.WalSenders = rt.WalSenders
 		cfg.WAL = rt.WAL
+		cfg.PubSub = rt.PubSub
 		cfg.WALDirPath = filepath.Join(rt.DataDir, "pg_wal")
 		cfg.DataDir = rt.DataDir
 		logger.Info("opened data directory", "path", rt.DataDir, "shared_buffers_slots", poolSlots)

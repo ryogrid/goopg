@@ -125,6 +125,16 @@ const (
 	KwReplace     Keyword = "replace"
 	KwLike        Keyword = "like"
 	KwBetween     Keyword = "between"
+	// M0008 logical-replication DDL keywords. See
+	// docs/design/0008-0003-publication-subscription-ddl.md.
+	// Option names (publish / enabled / slot_name) intentionally
+	// stay as plain identifiers so they don't collide with column
+	// references like `pg_stat_replication.slot_name`.
+	KwPublication  Keyword = "publication"
+	KwSubscription Keyword = "subscription"
+	KwConnection   Keyword = "connection"
+	KwFor          Keyword = "for"
+	KwTables       Keyword = "tables"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -220,8 +230,13 @@ var keywords = map[string]Keyword{
 	"replace":     KwReplace,
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
-	"like":        KwLike,
-	"between":     KwBetween,
+	"like":         KwLike,
+	"between":      KwBetween,
+	"publication":  KwPublication,
+	"subscription": KwSubscription,
+	"connection":   KwConnection,
+	"for":          KwFor,
+	"tables":       KwTables,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

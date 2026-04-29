@@ -68,6 +68,13 @@ type Context struct {
 	// sampler reproducible. Tests set it; production leaves it
 	// zero so the sampler reseeds from the wall clock.
 	AnalyzeRandSeed int64
+
+	// PubSub is the M0008 publication / subscription registry.
+	// CREATE PUBLICATION / DROP PUBLICATION / CREATE SUBSCRIPTION
+	// / DROP SUBSCRIPTION mutate it. nil means the runtime
+	// hasn't wired logical-replication DDL — those statements
+	// fail with feature_not_supported.
+	PubSub *catalog.PubSub
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

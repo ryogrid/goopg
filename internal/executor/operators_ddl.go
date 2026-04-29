@@ -56,8 +56,146 @@ func (o *ddlOp) Next() (Row, error) {
 		return nil, o.execTruncate(s)
 	case *parser.AlterTableStmt:
 		return nil, o.execAlterTable(s)
+	case *parser.CreatePublicationStmt:
+		return nil, o.execCreatePublication(s)
+	case *parser.DropPublicationStmt:
+		return nil, o.execDropPublication(s)
+	case *parser.CreateSubscriptionStmt:
+		return nil, o.execCreateSubscription(s)
+	case *parser.DropSubscriptionStmt:
+		return nil, o.execDropSubscription(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
+}
+
+// execCreatePublication / execDropPublication / execCreateSubscription
+// / execDropSubscription drive the *catalog.PubSub registry attached
+// via Context.PubSub. The five virtual catalog views
+// (pg_publication, pg_publication_rel, pg_publication_tables,
+// pg_subscription, pg_subscription_rel) read the same registry, so
+// the SQL surface and the views stay coherent. See
+// docs/design/0008-0003-publication-subscription-ddl.md.
+func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE PUBLICATION requires PubSub registry in Context"}
+	}
+	opts := catalog.DefaultPublicationOptions()
+	opts.AllTables = s.AllTables
+	if pub, ok := s.With["publish"]; ok {
+		opts.PublishInsert = false
+		opts.PublishUpdate = false
+		opts.PublishDelete = false
+		for _, kind := range splitCommaList(pub) {
+			switch kind {
+			case "insert":
+				opts.PublishInsert = true
+			case "update":
+				opts.PublishUpdate = true
+			case "delete":
+				opts.PublishDelete = true
+			case "truncate":
+				// Out of scope: silently accept.
+			default:
+				return &ExecError{Code: "22023", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized publish action %q", kind)}
+			}
+		}
+	}
+	tables := make([]string, 0, len(s.Tables))
+	for _, t := range s.Tables {
+		tables = append(tables, qualifiedTableName(t))
+	}
+	if _, err := o.ctx.PubSub.CreatePublication(s.Name, tables, opts); err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP PUBLICATION requires PubSub registry in Context"}
+	}
+	if err := o.ctx.PubSub.DropPublication(s.Name); err != nil {
+		if s.IfExists {
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	enabled := true
+	if v, ok := s.With["enabled"]; ok {
+		enabled = v == "true" || v == "on" || v == "yes" || v == "1"
+	}
+	slotName := s.With["slot_name"]
+	if _, err := o.ctx.PubSub.CreateSubscription(s.Name, s.Conninfo, s.Publications, slotName, enabled); err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "DROP SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	if err := o.ctx.PubSub.DropSubscription(s.Name); err != nil {
+		if s.IfExists {
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// qualifiedTableName renders an ObjectName as "schema.name" or
+// just "name" when the schema is empty. Mirrors the format
+// catalog.PubSub stores.
+func qualifiedTableName(o parser.ObjectName) string {
+	if o.Schema == "" {
+		return o.Name
+	}
+	return o.Schema + "." + o.Name
+}
+
+// splitCommaList trims whitespace + lowercases each comma-separated
+// value in s. Used by the publish=... option parser.
+func splitCommaList(s string) []string {
+	var out []string
+	start := 0
+	add := func(end int) {
+		raw := s[start:end]
+		// trim ASCII spaces.
+		i, j := 0, len(raw)
+		for i < j && (raw[i] == ' ' || raw[i] == '\t') {
+			i++
+		}
+		for j > i && (raw[j-1] == ' ' || raw[j-1] == '\t') {
+			j--
+		}
+		if i < j {
+			lower := make([]byte, j-i)
+			for k := i; k < j; k++ {
+				c := raw[k]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				lower[k-i] = c
+			}
+			out = append(out, string(lower))
+		}
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			add(i)
+			start = i + 1
+		}
+	}
+	add(len(s))
+	return out
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {

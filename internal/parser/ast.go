@@ -414,6 +414,55 @@ type DropViewStmt struct {
 func (s *DropViewStmt) Pos() int  { return s.pos }
 func (s *DropViewStmt) stmtNode() {}
 
+// CreatePublicationStmt — `CREATE PUBLICATION name [FOR ALL TABLES |
+// FOR TABLE t1 [, t2 ...]] [WITH (k = v, ...)]`. v0 honours
+// `publish = 'insert,update,delete'`; truncate / row filters /
+// column lists are out of scope. See
+// docs/design/0008-0003-publication-subscription-ddl.md.
+type CreatePublicationStmt struct {
+	pos       int
+	Name      string
+	AllTables bool
+	Tables    []ObjectName
+	With      map[string]string
+}
+
+func (s *CreatePublicationStmt) Pos() int  { return s.pos }
+func (s *CreatePublicationStmt) stmtNode() {}
+
+// DropPublicationStmt — `DROP PUBLICATION [IF EXISTS] name`.
+type DropPublicationStmt struct {
+	pos      int
+	IfExists bool
+	Name     string
+}
+
+func (s *DropPublicationStmt) Pos() int  { return s.pos }
+func (s *DropPublicationStmt) stmtNode() {}
+
+// CreateSubscriptionStmt — `CREATE SUBSCRIPTION name CONNECTION 'conninfo'
+// PUBLICATION pub [, pub2 ...] [WITH (slot_name = ..., enabled = ...)]`.
+type CreateSubscriptionStmt struct {
+	pos          int
+	Name         string
+	Conninfo     string
+	Publications []string
+	With         map[string]string
+}
+
+func (s *CreateSubscriptionStmt) Pos() int  { return s.pos }
+func (s *CreateSubscriptionStmt) stmtNode() {}
+
+// DropSubscriptionStmt — `DROP SUBSCRIPTION [IF EXISTS] name`.
+type DropSubscriptionStmt struct {
+	pos      int
+	IfExists bool
+	Name     string
+}
+
+func (s *DropSubscriptionStmt) Pos() int  { return s.pos }
+func (s *DropSubscriptionStmt) stmtNode() {}
+
 // TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
 type TruncateStmt struct {
 	pos      int
