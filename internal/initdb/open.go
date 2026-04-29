@@ -264,6 +264,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Row-lock (lock-only xmax + lock-strength) change record.
+	// M0021 tuple-level locking step 2 producer hook.
+	logHeapLock := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16) (storage.LSN, error) {
+		payload := wal.EncodeHeapLock(rel, blk, lineSlot, xmax, lockStrength)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
@@ -273,6 +284,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeInsert: logBtreeInsert,
 		LogHeapDelete:  logHeapDelete,
 		LogHeapVacuum:  logHeapVacuum,
+		LogHeapLock:    logHeapLock,
 		FullPageWrites: true,
 	})
 	if err != nil {

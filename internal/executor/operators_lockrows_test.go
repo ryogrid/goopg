@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // runForUpdate plans + executes a SELECT … FOR UPDATE statement
@@ -153,6 +154,72 @@ func TestLockRowsNoWaitFailsOnContention(t *testing.T) {
 	}
 	if ee.Code != "55P03" {
 		t.Errorf("code = %q, want 55P03", ee.Code)
+	}
+}
+
+// TestLockRowsStampsTupleLockOnlyXmax — the headline tuple-
+// level locking step 2 contract. SELECT FOR UPDATE pulls each
+// scanned row through lockRowsOp's two-pass drain-then-stamp
+// path; after EOF, the underlying heap tuple carries
+// xmax = our xid + HeapXmaxLockOnly + HeapXmaxExclLock infomask
+// bits. Mirrors the on-page state upstream's heap_lock_tuple
+// produces.
+func TestLockRowsStampsTupleLockOnlyXmax(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.LockMgr = lockmgr.New()
+	ctx.BackendID = 1
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	rows, err := runForUpdate(t, ctx, "SELECT id FROM items FOR UPDATE")
+	if err != nil {
+		t.Fatalf("runForUpdate: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("FOR UPDATE returned no rows; expected 3 from seedItems")
+	}
+	// Page state: every visible row was stamped with xmax == cur
+	// + HeapXmaxLockOnly + HeapXmaxExclLock. Read block 0 back
+	// and verify each line pointer's tuple infomask.
+	rel := ctx.Catalog.RelFileNode(tbl)
+	pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Pool.Unpin(pinned)
+	pinned.RLock()
+	defer pinned.RUnlock()
+	page := pinned.Page()
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stampedCount := 0
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(page, slot)
+		if err != nil {
+			continue
+		}
+		parsed, err := storage.ParseHeapTuple(raw)
+		if err != nil {
+			continue
+		}
+		if parsed.Header.Xmax != ctx.Tx.XID {
+			continue
+		}
+		if parsed.Header.Infomask&storage.HeapXmaxLockOnly == 0 {
+			t.Errorf("slot %d: xmax stamped but HeapXmaxLockOnly not set (Infomask=%#x)", slot, parsed.Header.Infomask)
+			continue
+		}
+		if parsed.Header.Infomask&storage.HeapXmaxExclLock == 0 {
+			t.Errorf("slot %d: HeapXmaxExclLock not set (Infomask=%#x)", slot, parsed.Header.Infomask)
+			continue
+		}
+		stampedCount++
+	}
+	if stampedCount != len(rows) {
+		t.Errorf("stamped %d tuples, want %d (FOR UPDATE returned that many)", stampedCount, len(rows))
 	}
 }
 

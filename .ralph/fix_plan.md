@@ -2983,11 +2983,39 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       wiring (lockRowsOp stamping + INSERT/UPDATE/DELETE
       detecting lock-only xmax) + xl_heap_lock WAL
       records + MultiXact infrastructure all deferred.)
-- [ ] Tuple-level pessimistic locking — step 2: executor
-      wiring (lockRowsOp stamps lock-only xmax per row;
-      INSERT/UPDATE/DELETE detect lock-only xmax from
-      another live xact and block / fail-NOWAIT / skip
-      for SKIP LOCKED).
+- [x] Tuple-level pessimistic locking — step 2a: producer
+      wiring (lockRowsOp stamps lock-only xmax per scanned
+      row + emits xl_heap_lock WAL via Pool.LogHeapLock).
+      Design doc
+      `docs/design/0021-0007-tuple-locking-producer-wiring.md`.
+      (landed 2026-04-30: producer side of tuple-level
+      locking. New `LogHeapLockFunc` + `Pool.LogHeapLock()`
+      accessor + `PoolConfig.LogHeapLock` mirroring existing
+      LogHeapInsert/Delete pattern; initdb.Open wires the
+      closure. New `seqScanOp.currentTID()` exposes
+      (rel, ItemPointer) of the most recently emitted row.
+      `findSeqScan(op)` walks past Project/Filter
+      wrappers; nil leaf falls through to pass-through.
+      `lockRowsOp` switched to two-pass drain-then-stamp
+      because seqScanOp holds page RLock across Next()
+      calls — write-Lock for stamping would deadlock
+      against the reader. First Next() drains child
+      capturing (rel, ptr, row) per row inline, then
+      after EOF (page RLocks released) runs the stamp
+      pass: pin, Lock, PageSetHeapTupleLockOnly,
+      MarkDirtyChangeRecord(LogHeapLock), unlock, unpin.
+      Subsequent Next() yields from buffer. Memory cost =
+      result set size (SELECT FOR UPDATE typically small).
+      Lock-strength selection from `Locks[0].Strength` →
+      ExclLock / ShrLock. New test
+      TestLockRowsStampsTupleLockOnlyXmax verifies
+      end-to-end on-page state. Full `go test ./...`
+      green. INSERT/UPDATE/DELETE conflict detection +
+      IndexScan currentTID + MultiXact + streaming
+      refactor all stay deferred.)
+- [ ] Tuple-level pessimistic locking — step 2b:
+      INSERT/UPDATE/DELETE detect foreign lock-only xmax
+      and block / fail-NOWAIT / skip-for-SKIP-LOCKED.
 - [x] Tuple-level pessimistic locking — step 3: row-lock
       WAL record + crash-recovery replay. Design doc
       `docs/design/0021-0006-tuple-locking-heap-lock-wal.md`.

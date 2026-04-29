@@ -173,6 +173,22 @@ func (o *seqScanOp) Next() (Row, error) {
 	}
 }
 
+// currentTID returns the (rel, ItemPointer) of the most recently
+// returned row, or ok=false when no row has been returned yet on
+// this scan / page (or the scan has advanced past its last row).
+// Used by lockRowsOp (M0021 tuple-level locking step 2) to stamp
+// per-row lock-only xmax on the heap tuple after the scan
+// surfaces it. Caller must invoke between Next-returns-row and
+// the next Next call (the scan may release the page pin on the
+// next Next, but the (block, slot) pair stays valid until then).
+func (o *seqScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
+	if o.pinned == nil || o.curSlot == 0 {
+		return storage.RelFileNode{}, storage.ItemPointer{}, false
+	}
+	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
+	return rel, storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}, true
+}
+
 func (o *seqScanOp) releasePinned() {
 	if o.pinned != nil {
 		o.pinned.RUnlock()

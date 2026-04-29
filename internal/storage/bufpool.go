@@ -92,6 +92,12 @@ type Pool struct {
 	// logHeapDelete emits a logical heap-delete (xmax stamp)
 	// WAL record. Used by the executor's UPDATE / DELETE paths.
 	logHeapDelete LogHeapDeleteFunc
+	// logHeapLock emits a logical heap-lock (lock-only xmax +
+	// lock-strength) WAL record. Used by the SELECT FOR
+	// UPDATE / FOR SHARE executor (M0021 tuple-level locking
+	// step 2). nil disables the optimisation —
+	// MarkDirtyChangeRecord falls back to FPI emission.
+	logHeapLock LogHeapLockFunc
 	// logHeapVacuum emits a logical heap-vacuum (page prune) WAL
 	// record. Used by VACUUM to capture the dead-slot list rather
 	// than a full-page image on each pruned page.
@@ -175,6 +181,12 @@ type PoolConfig struct {
 	// xmax-stamp paths can emit a logical change record.
 	LogHeapDelete LogHeapDeleteFunc
 
+	// LogHeapLock, when non-nil, is exposed via
+	// Pool.LogHeapLock so the SELECT FOR UPDATE / FOR SHARE
+	// executor can emit a row-lock change record (M0021
+	// tuple-level locking step 2 — producer wiring).
+	LogHeapLock LogHeapLockFunc
+
 	// LogHeapVacuum, when non-nil, is exposed via
 	// Pool.LogHeapVacuum so the VACUUM path can emit a
 	// dead-slot-list change record instead of a full FPI on
@@ -218,6 +230,14 @@ type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN
 // epoch. See docs/design/0002-0003-redo-records.md.
 type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID) (LSN, error)
 
+// LogHeapLockFunc emits one row-lock WAL record (M0021 tuple-
+// level locking step 3) and returns the record's end LSN. Used
+// by the SELECT FOR UPDATE / FOR SHARE executor to capture
+// the lock-only xmax + lock-strength infomask change in WAL
+// so crash recovery can re-stamp the affected tuple. Mirrors
+// upstream's xl_heap_lock emission point inside heap_lock_tuple.
+type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, lockStrength uint16) (LSN, error)
+
 // LogHeapVacuumFunc emits one logical heap-vacuum (page prune)
 // redo record carrying the 1-based LP_NORMAL slot numbers being
 // reclaimed. Replay calls VacuumHeapPageBySlots with the same
@@ -251,6 +271,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapInsert:  cfg.LogHeapInsert,
 		logBtreeInsert: cfg.LogBtreeInsert,
 		logHeapDelete:  cfg.LogHeapDelete,
+		logHeapLock:    cfg.LogHeapLock,
 		logHeapVacuum:  cfg.LogHeapVacuum,
 		logger:         logger,
 	}
@@ -286,6 +307,12 @@ func (p *Pool) LogBtreeInsert() LogBtreeInsertFunc { return p.logBtreeInsert }
 // hook, or nil if none was wired. Callers fall back to per-page
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapDelete() LogHeapDeleteFunc { return p.logHeapDelete }
+
+// LogHeapLock returns the configured row-lock change-record
+// emitter (M0021 tuple-level locking step 2). nil disables the
+// optimisation; the executor falls back to MarkDirty + FPI
+// emission for crash safety.
+func (p *Pool) LogHeapLock() LogHeapLockFunc { return p.logHeapLock }
 
 // LogHeapVacuum returns the configured heap-vacuum change-record
 // hook, or nil if none was wired. Callers fall back to per-page
