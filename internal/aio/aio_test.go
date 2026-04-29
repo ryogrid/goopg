@@ -200,12 +200,33 @@ func TestEngineWorkerSubmitAfterCloseSurfacesError(t *testing.T) {
 	}
 }
 
-// TestNewEngineRejectsIOUring: until the io_uring method lands,
-// selecting it must surface ErrUnsupportedMethod cleanly.
-func TestNewEngineRejectsIOUring(t *testing.T) {
-	_, err := NewEngine(EngineConfig{Method: MethodIOUring})
-	if !errors.Is(err, ErrUnsupportedMethod) {
-		t.Errorf("err=%v want ErrUnsupportedMethod", err)
+// TestNewEngineIOUringConstructs: io_uring is selectable on
+// every platform — Linux hosts with kernel support get the
+// real method, every other build path silently falls back to
+// worker. Either way, NewEngine returns a usable engine; the
+// caller doesn't see ErrUnsupportedMethod.
+func TestNewEngineIOUringConstructs(t *testing.T) {
+	e, err := NewEngine(EngineConfig{Method: MethodIOUring})
+	if err != nil {
+		t.Fatalf("NewEngine(io_uring)=%v, want nil (probe-fail must fall back, not error)", err)
+	}
+	defer e.Close()
+	switch e.Method() {
+	case MethodIOUring:
+		req, _ := e.FallbackFrom()
+		if req != "" {
+			t.Errorf("Method=%q but FallbackFrom reports requested=%q", e.Method(), req)
+		}
+	case MethodWorker:
+		req, reason := e.FallbackFrom()
+		if req != MethodIOUring {
+			t.Errorf("FallbackFrom requested=%q want %q", req, MethodIOUring)
+		}
+		if reason == "" {
+			t.Error("FallbackFrom reason is empty after fallback")
+		}
+	default:
+		t.Errorf("unexpected method after io_uring request: %q", e.Method())
 	}
 }
 

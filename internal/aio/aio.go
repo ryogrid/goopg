@@ -227,6 +227,15 @@ type Engine struct {
 	// the I/O hot path, which uses atomic counters above.
 	inflightMu sync.RWMutex
 	inflight   map[uint64]inFlightEntry
+
+	// requestedMethod records the io_method the caller asked
+	// for, even when the engine fell back to a different
+	// method (typically io_uring → worker on a kernel that
+	// doesn't support io_uring). fallbackReason carries the
+	// probe error so an operator log line can explain why.
+	// Both empty unless a fallback occurred.
+	requestedMethod string
+	fallbackReason  string
 }
 
 // inFlightEntry is the per-Op record the engine keeps while a
@@ -355,11 +364,40 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		}
 		e.method = newMethodWorker(e, workers, cfg.MaxConcurrency)
 	case MethodIOUring:
-		return nil, fmt.Errorf("%w: %q", ErrUnsupportedMethod, cfg.Method)
+		// Probe + (silent) fallback. Mirrors upstream: if the
+		// kernel can't honour io_uring (ENOSYS, EPERM under
+		// sysctl io_uring_disabled, EINVAL on too-old hosts),
+		// we degrade to the worker method rather than fail
+		// server start. The caller can detect the fallback via
+		// FallbackFrom() and log it.
+		m, err := newMethodIOUring(e, cfg.MaxConcurrency)
+		if err != nil {
+			if !errors.Is(err, errProbeFailed) {
+				return nil, err
+			}
+			workers := cfg.Workers
+			if workers <= 0 {
+				workers = defaultWorkerCount
+			}
+			e.method = newMethodWorker(e, workers, cfg.MaxConcurrency)
+			e.requestedMethod = MethodIOUring
+			e.fallbackReason = err.Error()
+		} else {
+			e.method = m
+		}
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedMethod, cfg.Method)
 	}
 	return e, nil
+}
+
+// FallbackFrom reports whether the engine fell back from a
+// caller-requested method to a different one (typically
+// io_uring → worker on a host where io_uring is unavailable).
+// Returns ("", "") when the engine is running the requested
+// method as-is.
+func (e *Engine) FallbackFrom() (requested, reason string) {
+	return e.requestedMethod, e.fallbackReason
 }
 
 // Submit hands an Op to the underlying method. See Method.Submit.

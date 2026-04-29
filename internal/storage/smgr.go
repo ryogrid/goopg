@@ -409,6 +409,14 @@ func (r *relFile) WriteAt(p []byte, off int64) (int, error) {
 	return r.f.WriteAt(p, off)
 }
 
+// Fd exposes the underlying *os.File's kernel descriptor so an
+// AIO method that talks to the kernel directly (notably
+// io_uring) can submit ops by fd. The mutex above is the
+// userspace serialiser that keeps Extend/Close coherent — the
+// fd itself is stable across pread/pwrite. Returns the same
+// uintptr for the lifetime of the relFile.
+func (r *relFile) Fd() uintptr { return r.f.Fd() }
+
 func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

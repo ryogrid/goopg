@@ -182,15 +182,6 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
 		aioMethod := stringGUC(registry, "io_method", "")
-		// io_uring isn't implemented yet; fall back to worker
-		// silently rather than fail server start. When the
-		// io_uring method lands, this guard moves into the
-		// engine's runtime probe.
-		if aioMethod == "io_uring" {
-			logger.Warn("io_method=io_uring requested but not yet implemented; falling back to worker",
-				"event", "aio_method_fallback")
-			aioMethod = "worker"
-		}
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
 		var err error
@@ -213,6 +204,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// the upstream "AIO method = ..." log line shape from
 		// PostgreSQL 18.
 		if rt.AIO != nil {
+			// Probe-failure fallback line: io_uring on a kernel
+			// that can't honour it (sysctl-disabled, ENOSYS,
+			// EPERM under containerised seccomp) drops down to
+			// worker silently inside aio.NewEngine. Surface it
+			// here so an operator triaging a "but I asked for
+			// io_uring" question can grep `event=aio_method_fallback`.
+			if req, reason := rt.AIO.FallbackFrom(); req != "" {
+				logger.Warn("aio method fallback",
+					"event", "aio_method_fallback",
+					"requested", req,
+					"actual", rt.AIO.Method(),
+					"reason", reason)
+			}
 			logger.Info("aio engine attached",
 				"event", "aio_engine_attached",
 				"method", rt.AIO.Method(),

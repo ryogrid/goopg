@@ -488,6 +488,19 @@ func (a aioFileAdapter) WriteAt(p []byte, off int64) (int, error) {
 	return a.f.WriteAt(p, off)
 }
 
+// Fd forwards the underlying file's descriptor when the wrapped
+// storage.AIOFile exposes one. The io_uring method type-asserts
+// for this interface; without it the io_uring path falls back
+// to inline pread/pwrite (correct, but no kernel acceleration).
+// Returns ^uintptr(0) when the underlying file doesn't surface
+// a real fd (e.g. an in-memory test file).
+func (a aioFileAdapter) Fd() uintptr {
+	if fr, ok := a.f.(interface{ Fd() uintptr }); ok {
+		return fr.Fd()
+	}
+	return ^uintptr(0)
+}
+
 // aioHandleAdapter unwraps the aio.Result struct into the
 // (n, err) pair storage.AIOHandle exposes.
 type aioHandleAdapter struct {
@@ -534,6 +547,17 @@ func (a walAIOFileAdapter) ReadAt(p []byte, off int64) (int, error) {
 }
 func (a walAIOFileAdapter) WriteAt(p []byte, off int64) (int, error) {
 	return a.f.WriteAt(p, off)
+}
+
+// Fd forwards the underlying WAL segment's descriptor — same
+// shape as aioFileAdapter.Fd(). io_uring's submit path uses
+// this so WAL writes flow through io_uring on Linux instead
+// of falling back to inline pwrite.
+func (a walAIOFileAdapter) Fd() uintptr {
+	if fr, ok := a.f.(interface{ Fd() uintptr }); ok {
+		return fr.Fd()
+	}
+	return ^uintptr(0)
 }
 
 type walAIOHandleAdapter struct {
