@@ -1495,18 +1495,12 @@ See `docs/milestones/0009-aio-subsystem.md`.
       exactly which relfile / WAL segment is dominating
       I/O.)
 
-- [ ] (BLOCKED) AIO wait-event surface: register a
+- [ ] AIO wait-event surface: register a
       "waiting on AIO completion" wait event so a query
       stalled on an AIO Wait shows up identifiably in the
-      pg_stat_activity-shaped surface. The fix_plan
-      previously claimed this composes with "the existing
-      wait-event registry from M0002", but no such
-      registry was actually built — `pg_stat_activity` and
-      the wait-event vocabulary aren't implemented yet in
-      goopg. Building that surface is itself a meaningful
-      milestone-scoped slice (probably its own
-      pg-stat-activity / wait-event milestone). This AIO
-      hookup remains queued behind it.
+      pg_stat_activity-shaped surface. The pg_stat_activity
+      infrastructure now exists (M0022 Stage A landed
+      2026-04-30), so this task is UNBLOCKED.
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 
