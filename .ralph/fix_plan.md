@@ -2427,9 +2427,8 @@ Decomposition + design docs land when this milestone is picked up.
         invocation in expression contexts. Full
         `go test ./...` green.)
 
-- [ ] Stage B: procedure follow-up (CREATE PROCEDURE, CALL,
-      out-parameter binding). Steps 1-4 landed; out-parameter
-      binding (INOUT/OUT return from CALL) remains.
+- [x] Stage B: procedure follow-up (CREATE PROCEDURE, CALL,
+      out-parameter binding). All 5 steps landed.
 
   - [x] Stage B step 1 — parser + AST + keyword registration.
         (landed 2026-04-30: `KwProcedure` / `KwCall` / `KwOut` /
@@ -2470,6 +2469,19 @@ Decomposition + design docs land when this milestone is picked up.
         IF EXISTS, arg-based overload resolution, and
         CASCADE/RESTRICT. 3 new parser tests. Full
         `go test ./...` green.)
+
+  - [x] Stage B step 5 — out-parameter binding (FuncArgOut/
+        FuncArgInout/FuncArgVariadic modes). (landed 2026-04-30:
+        Mode constants added to parser AST. `parseProcedureArg`
+        accepts OUT/INOUT/VARIADIC in CREATE PROCEDURE.
+        `parseFunctionArg` refactored into shared
+        `parseArgNameAndType`. `ArgModes []string` added to
+        `catalog.Routine` — populated by `execCreateProcedure`.
+        `callOp.Open` resolves the procedure at Open time so
+        `Schema()` can report OUT/INOUT output columns. `callOp.Next`
+        gives OUT params NULL input, executes the body, and returns
+        OUT/INOUT parameter values as a single-row result set.
+        Full `go test ./...` green.)
 
 ## Milestone 0016 — WITH clause (CTE) support
 
