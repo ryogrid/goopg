@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 
 	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/autovacuum"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
@@ -127,6 +128,10 @@ type Config struct {
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
 	AutovacuumLauncher *autovacuum.Launcher
+
+	// Activity is the backend-activity registry for
+	// pg_catalog.pg_stat_activity. nil disables tracking.
+	Activity *activity.Registry
 
 	// Slots, when set, exposes the replication-slot registry to
 	// the wire-layer replication-command handler (IDENTIFY_SYSTEM,
@@ -465,6 +470,34 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 	logger.Info("connection established")
 
+	// Register backend in the pg_stat_activity registry.
+	pidStr := activity.PID(pid)
+	if reg := s.cfg.Activity; reg != nil {
+		clientAddr := raw.RemoteAddr().String()
+		clientPort := ""
+		if taddr, ok := raw.RemoteAddr().(*net.TCPAddr); ok {
+			clientAddr = taddr.IP.String()
+			clientPort = fmt.Sprintf("%d", taddr.Port)
+		}
+		reg.Register(&activity.Backend{
+			PID:             pidStr,
+			DatName:         params["database"],
+			UserName:        user,
+			ApplicationName: app,
+			ClientAddr:      clientAddr,
+			ClientPort:      clientPort,
+			BackendStart:    time.Now().UTC().Format(time.RFC3339Nano),
+			State:           "active",
+			BackendType:     "client_backend",
+		})
+	}
+	reg := s.cfg.Activity
+	defer func() {
+		if reg != nil {
+			reg.Unregister(pidStr)
+		}
+	}()
+
 	sess := config.NewSessionRegistry(s.cfg.Registry)
 	// Echo StartupMessage values for variables clients commonly send.
 	// Failures are not fatal — clients send a wide variety of values
@@ -487,6 +520,10 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		}
 		_ = w.Flush()
 	})
+
+	// Store the backend PID in the session so dispatch paths can
+	// update pg_stat_activity state.
+	_ = sess.Set("goopg.backend_pid", pidStr, false)
 
 	if err := s.sendStartupReply(w, sess, pid); err != nil {
 		logger.Info("startup reply failed", "err", err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -77,6 +78,13 @@ type Context struct {
 	// hasn't wired logical-replication DDL — those statements
 	// fail with feature_not_supported.
 	PubSub *catalog.PubSub
+
+	// Activity is the M0022 backend-activity registry for
+	// pg_catalog.pg_stat_activity. nil disables tracking.
+	Activity *activity.Registry
+
+	// ActivityPID identifies this backend in the activity registry.
+	ActivityPID string
 
 	// LockMgr, when set, is consulted by SQL-touching operators
 	// to acquire relation-level locks per

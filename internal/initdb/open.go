@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/aio"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -41,6 +42,11 @@ type Runtime struct {
 	PubSub         *catalog.PubSub
 	AIO            *aio.Engine
 	DataDir        string
+
+	// Activity is the backend-activity registry backing
+	// pg_catalog.pg_stat_activity (M0022 Stage A). nil when
+	// not configured.
+	Activity *activity.Registry
 
 	// Standby is true when `<DataDir>/standby.signal` was present
 	// at Open time. cmd/goopg start uses this to decide whether to
@@ -481,6 +487,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
+	// pg_stat_activity: M0022 Stage A. Backend-activity registry
+	// tracking connection lifecycle, current query, and state.
+	// One row per active backend. Backed by *activity.Registry.
+	act := activity.NewRegistry()
+	if err := registerPgStatActivityView(cat, act); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+
 	standby, err := IsStandby(abs)
 	if err != nil {
 		_ = mgr.Close()
@@ -500,6 +517,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WalSubscribers: walSubscribers,
 		PubSub:         pubsub,
 		AIO:            aioEngine,
+		Activity:       act,
 		DataDir:        abs,
 		Standby:        standby,
 	}, nil

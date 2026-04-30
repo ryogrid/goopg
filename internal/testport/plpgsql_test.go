@@ -290,3 +290,30 @@ func TestPort_PLpgSQLViaPsql(t *testing.T) {
 		t.Fatalf("CALL double_it(21) via psql = %q, want 42", res.Stdout)
 	}
 }
+
+// TestPort_PgStatActivity verifies the pg_catalog.pg_stat_activity
+// view is queryable and returns at least one row (the current session).
+func TestPort_PgStatActivity(t *testing.T) {
+	c := newCluster(t, "pg_stat_activity")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	rows := runSQL(t, c, "SELECT pid, state, backend_type, application_name FROM pg_catalog.pg_stat_activity")
+	if len(rows) == 0 {
+		t.Fatal("pg_stat_activity returned zero rows, expected at least one")
+	}
+	// Verify the first row has a non-empty PID and valid state.
+	row := rows[0]
+	if len(row) < 4 {
+		t.Fatalf("row has %d columns, want at least 4", len(row))
+	}
+	if row[0] == "" {
+		t.Error("pid is empty")
+	}
+	if row[1] == "" {
+		t.Error("state is empty")
+	}
+	if row[2] != "client_backend" {
+		t.Errorf("backend_type = %q, want client_backend", row[2])
+	}
+}

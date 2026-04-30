@@ -3547,6 +3547,25 @@ See `docs/milestones/0021-pessimistic-lock-select-for-update.md`.
       LOCKED + streaming + pg_locks introspection all
       stay deferred.)
 
+## Milestone 0022 — pg_stat_activity support
+
+See `docs/milestones/0022-pg-stat-activity-support.md`.
+Decompose when picked up.
+
+- [x] Stage A: pg_stat_activity catalog/view shape, backend
+      lifecycle/state tracking, and query/transaction timing
+      fields. (landed 2026-04-30: design doc
+      `docs/design/0022-0001-pg-stat-activity-catalog-and-column-contract.md`.
+      `internal/activity` package with `Registry` + `Backend` types.
+      Virtual `pg_catalog.pg_stat_activity` view with 21 columns
+      (21 upstream-compatible columns, wait_event fields NULL in
+      Stage A). Backend lifecycle wired into `serveConn` (register
+      on accept, unregister on close). Query state tracking in
+      `dispatchSimpleQueryViaExecutor` (active → idle transitions).
+      Wired through `initdb.Runtime.Activity` → `server.Config.Activity`.
+      Integration test verifies view is queryable. Full `go test
+      ./...` green.)
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

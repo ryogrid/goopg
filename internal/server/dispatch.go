@@ -85,6 +85,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	ctx.LockMgr = s.cfg.LockMgr
 	ctx.BackendID = backendID
 
+	// Update pg_stat_activity before dispatching.
+	if reg := s.cfg.Activity; reg != nil {
+		if _, pid, _ := sess.Get("goopg.backend_pid"); pid != "" {
+			// Truncate query to 1 KB for activity tracking.
+			q := sql
+			if len(q) > 1024 {
+				q = q[:1024]
+			}
+			reg.UpdateState(pid, "active", q)
+		}
+	}
+
 	for _, stmt := range stmts {
 		// Refresh snapshot per statement for ReadCommitted parity.
 		snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
@@ -95,6 +107,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 
 		if err := s.executeOneSimpleStmt(w, ctx, stmt); err != nil {
 			return err
+		}
+	}
+	// Update pg_stat_activity to idle after successful execution.
+	if reg := s.cfg.Activity; reg != nil {
+		if _, pid, _ := sess.Get("goopg.backend_pid"); pid != "" {
+			reg.UpdateState(pid, "idle", "")
 		}
 	}
 	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
