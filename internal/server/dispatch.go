@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
@@ -89,14 +88,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {
 		if _, pid, _ := sess.Get("goopg.backend_pid"); pid != "" {
-			// Truncate query to 1 KB for activity tracking.
 			q := sql
 			if len(q) > 1024 {
 				q = q[:1024]
 			}
 			reg.UpdateState(pid, "active", q)
-			// Register goroutine for AIO wait-event hooks.
-			activity.RegisterCurrentGoroutine(reg, pid)
 		}
 	}
 
@@ -118,7 +114,6 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 			reg.UpdateState(pid, "idle", "")
 		}
 	}
-	activity.ClearCurrentGoroutine()
 	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}

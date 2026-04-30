@@ -9,38 +9,87 @@ import (
 	"time"
 )
 
-// Wait event type constants (upstream-compatible naming).
+// Wait event type constants (PG_WAIT_*  —  upstream-compatible).
 const (
 	WaitTypeIO       = "IO"
 	WaitTypeLock     = "Lock"
 	WaitTypeClient   = "Client"
 	WaitTypeTimeout  = "Timeout"
 	WaitTypeActivity = "Activity"
+	WaitTypeIPC      = "IPC"
+	WaitTypeLWLock   = "LWLock"
+	WaitTypeBufferPin = "BufferPin"
 )
 
-// Wait event name constants (goopg-defined, PostgreSQL-compatible where possible).
+// Wait event name constants  (pgstat_get_wait_* display names  —
+// upstream-compatible where a semantic equivalent exists in goopg).
+
+// IO-type events  (PG_WAIT_IO).
 const (
-	// IO-type events
-	WaitAIO           = "AIO"
-	WaitDataFileRead  = "DataFileRead"
-	WaitDataFileWrite = "DataFileWrite"
-	WaitWALWrite      = "WALWrite"
-	WaitWALRead       = "WALRead"
+	WaitAIO              = "AIO"
+	WaitDataFileRead     = "DataFileRead"
+	WaitDataFileWrite    = "DataFileWrite"
+	WaitDataFileExtend   = "DataFileExtend"
+	WaitDataFileSync     = "DataFileSync"
+	WaitDataFileFlush    = "DataFileFlush"
+	WaitDataFilePrefetch = "DataFilePrefetch"
+	WaitWALRead          = "WALRead"
+	WaitWALWrite         = "WALWrite"
+	WaitWALSync          = "WALSync"
+	WaitWALInitWrite     = "WalInitWrite"
+	WaitWALInitSync      = "WalInitSync"
+	WaitControlFileRead  = "ControlFileRead"
+	WaitControlFileWrite = "ControlFileWrite"
+	WaitControlFileSync  = "ControlFileSync"
+	WaitBuffileRead      = "BuffileRead"
+	WaitBuffileWrite     = "BuffileWrite"
+)
 
-	// Lock-type events
-	WaitRelationLock  = "relation"
-	WaitTupleLock     = "tuple"
+// Lock-type events  (PG_WAIT_LOCK).
+const (
+	WaitRelationLock    = "relation"
+	WaitTupleLock       = "tuple"
+	WaitTransactionID   = "transactionid"
+	WaitPageLock        = "page"
+	WaitExtendLock      = "extend"
+	WaitAdvisoryLock    = "advisory"
+	WaitVirtualXID      = "virtualxid"
+	WaitObjectLock      = "object"
+	WaitUserLock        = "userlock"
+	WaitSpecToken       = "spectoken"
+)
 
-	// Client-type events
-	WaitClientRead    = "ClientRead"
-	WaitClientWrite   = "ClientWrite"
+// Client-type events  (PG_WAIT_CLIENT).
+const (
+	WaitClientRead   = "ClientRead"
+	WaitClientWrite  = "ClientWrite"
+)
 
-	// Timeout-type events
-	WaitCheckpoint    = "Checkpoint"
-	WaitAutoVacuum    = "AutoVacuum"
+// IPC-type events  (PG_WAIT_IPC).
+const (
+	WaitSyncRep           = "SyncRep"
+	WaitCheckpointDone    = "CheckpointDone"
+	WaitCheckpointStart   = "CheckpointStart"
+	WaitBufferIO          = "BufferIo"
+	WaitBackendTermination = "BackendTermination"
+)
 
-	// Activity-type events
-	WaitAutoVacuumMain = "AutoVacuumMain"
+// Activity-type events  (PG_WAIT_ACTIVITY).
+const (
+	WaitCheckpointerMain      = "CheckpointerMain"
+	WaitWalWriterMain         = "WalWriterMain"
+	WaitWalSenderMain         = "WalSenderMain"
+	WaitAutoVacuumMain        = "AutovacuumMain"
+	WaitLogicalApplyMain      = "LogicalApplyMain"
+	WaitLogicalLauncherMain   = "LogicalLauncherMain"
+	WaitBgwriterHibernate     = "BgwriterHibernate"
+)
+
+// Timeout-type events  (PG_WAIT_TIMEOUT).
+const (
+	WaitPgSleep              = "PgSleep"
+	WaitCheckpointWriteDelay = "CheckpointWriteDelay"
+	WaitVacuumDelay          = "VacuumDelay"
 )
 
 // Backend represents one server backend/connection for pg_stat_activity.

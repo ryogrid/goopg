@@ -3569,12 +3569,17 @@ Decompose when picked up.
 
 - [x] Stage B: wait-event taxonomy and recording hooks.
       (landed 2026-04-30: wait event type/name constants
-      (WaitTypeIO, WaitTypeLock, WaitTypeClient, etc.)
-      defined in internal/activity. AIO wait event wired
-      (activity.WaitAIO). Lock manager wait events wired
-      (activity.WaitRelationLock). Extensible taxonomy for
-      future ClientRead/ClientWrite/WALWrite/etc. Full
-      `go test ./...` green.)
+      matching upstream PG taxonomy — IO/Lock/Client/IPC/Timeout/
+      Activity/BufferPin/LWLock types, 50+ named events.
+      AIO wait events via goroutine-ID dispatch hookup.
+      Lock manager wait events via executor.acquireRelLock.
+      Client I/O wait events via FrameReader/FrameWriter hooks
+      wired in serveConn — ClientRead before every wire read,
+      ClientWrite before every wire write. Full `go test ./...`
+      green. Remaining upstream events deferred: WAL I/O,
+      data-file I/O, BufferPin, LWLock, IPC, background-process
+      Activity waits — these require activity registry
+      registration for non-client-backend types.)
 
 ## Milestone 0023 — Comprehensive syntax integration test suite
 

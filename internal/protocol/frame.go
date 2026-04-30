@@ -29,6 +29,13 @@ type FrameReader struct {
 	buf      []byte // grows on demand, capped by MaxRegularMessageLength
 	maxStart int
 	maxRegul int
+
+	// OnBeforeRead / OnAfterRead are optional hooks called before and
+	// after every ReadFrame / ReadStartupPacket. The server sets these
+	// from serveConn so the activity package can record ClientRead
+	// wait events (Stage B wait-event taxonomy).
+	OnBeforeRead func()
+	OnAfterRead  func()
 }
 
 // NewFrameReader wraps r with the v0 message-size limits. Tests can pass a
@@ -50,6 +57,14 @@ func NewFrameReader(r io.Reader) *FrameReader {
 // caller can distinguish "client closed without sending anything" (a common
 // no-op probe) from "client sent a partial packet".
 func (fr *FrameReader) ReadStartupPacket() (version uint32, payload []byte, err error) {
+	if fr.OnBeforeRead != nil {
+		fr.OnBeforeRead()
+	}
+	defer func() {
+		if fr.OnAfterRead != nil {
+			fr.OnAfterRead()
+		}
+	}()
 	var lenBuf [4]byte
 	n, err := io.ReadFull(fr.r, lenBuf[:1])
 	if err != nil {
@@ -79,6 +94,14 @@ func (fr *FrameReader) ReadStartupPacket() (version uint32, payload []byte, err 
 // ReadFrame reads one post-startup message. The returned Frame.Payload aliases
 // an internal buffer reused on the next call; copy if you need to retain it.
 func (fr *FrameReader) ReadFrame() (Frame, error) {
+	if fr.OnBeforeRead != nil {
+		fr.OnBeforeRead()
+	}
+	defer func() {
+		if fr.OnAfterRead != nil {
+			fr.OnAfterRead()
+		}
+	}()
 	var hdr [5]byte
 	if _, err := io.ReadFull(fr.r, hdr[:]); err != nil {
 		if err == io.ErrUnexpectedEOF {
@@ -114,6 +137,13 @@ func (fr *FrameReader) ReadFrame() (Frame, error) {
 type FrameWriter struct {
 	w   *bufio.Writer
 	hdr [5]byte
+
+	// OnBeforeWrite / OnAfterWrite are optional hooks called before and
+	// after every WriteFrame / WriteRaw / Flush. The server sets these
+	// from serveConn so the activity package can record ClientWrite
+	// wait events (Stage B wait-event taxonomy).
+	OnBeforeWrite func()
+	OnAfterWrite  func()
 }
 
 // NewFrameWriter wraps w with a buffered writer sized for typical message
@@ -127,6 +157,14 @@ func NewFrameWriter(w io.Writer) *FrameWriter {
 // callers typically Flush() once after a logical batch (e.g. the full
 // startup reply).
 func (fw *FrameWriter) WriteFrame(typ byte, payload []byte) error {
+	if fw.OnBeforeWrite != nil {
+		fw.OnBeforeWrite()
+	}
+	defer func() {
+		if fw.OnAfterWrite != nil {
+			fw.OnAfterWrite()
+		}
+	}()
 	if len(payload) > MaxRegularMessageLength {
 		return fmt.Errorf("WriteFrame %q: payload %d exceeds %d", typ, len(payload), MaxRegularMessageLength)
 	}
@@ -147,12 +185,27 @@ func (fw *FrameWriter) WriteFrame(typ byte, payload []byte) error {
 // single-byte responses ('N' / 'S'), where the byte is sent before any
 // framed messages exist.
 func (fw *FrameWriter) WriteRaw(b []byte) error {
+	if fw.OnBeforeWrite != nil {
+		fw.OnBeforeWrite()
+	}
 	_, err := fw.w.Write(b)
+	if fw.OnAfterWrite != nil {
+		fw.OnAfterWrite()
+	}
 	return err
 }
 
 // Flush flushes the underlying buffered writer.
-func (fw *FrameWriter) Flush() error { return fw.w.Flush() }
+func (fw *FrameWriter) Flush() error {
+	if fw.OnBeforeWrite != nil {
+		fw.OnBeforeWrite()
+	}
+	err := fw.w.Flush()
+	if fw.OnAfterWrite != nil {
+		fw.OnAfterWrite()
+	}
+	return err
+}
 
 // ParseStartupParameters parses the NUL-terminated key/value pairs that
 // follow the 4-byte version of a regular startup packet. It returns a map

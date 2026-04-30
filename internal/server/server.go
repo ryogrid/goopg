@@ -472,7 +472,8 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 
 	// Register backend in the pg_stat_activity registry.
 	pidStr := activity.PID(pid)
-	if reg := s.cfg.Activity; reg != nil {
+	reg := s.cfg.Activity
+	if reg != nil {
 		clientAddr := raw.RemoteAddr().String()
 		clientPort := ""
 		if taddr, ok := raw.RemoteAddr().(*net.TCPAddr); ok {
@@ -490,13 +491,39 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			State:           "active",
 			BackendType:     "client_backend",
 		})
+		// Register this goroutine so AIO / lock / client-I/O wait-event
+		// hooks can find the correct backend via activity.LookupGoroutine.
+		activity.RegisterCurrentGoroutine(reg, pidStr)
 	}
-	reg := s.cfg.Activity
 	defer func() {
 		if reg != nil {
+			activity.ClearCurrentGoroutine()
 			reg.Unregister(pidStr)
 		}
 	}()
+
+	// Wire client-I/O wait-event hooks on the frame reader/writer.
+	// These fire before and every blocking read/write on the wire.
+	r.OnBeforeRead = func() {
+		if rReg, rPid := activity.LookupGoroutine(); rReg != nil {
+			rReg.WaitEventStart(rPid, activity.WaitTypeClient, activity.WaitClientRead)
+		}
+	}
+	r.OnAfterRead = func() {
+		if rReg, rPid := activity.LookupGoroutine(); rReg != nil {
+			rReg.WaitEventEnd(rPid)
+		}
+	}
+	w.OnBeforeWrite = func() {
+		if wReg, wPid := activity.LookupGoroutine(); wReg != nil {
+			wReg.WaitEventStart(wPid, activity.WaitTypeClient, activity.WaitClientWrite)
+		}
+	}
+	w.OnAfterWrite = func() {
+		if wReg, wPid := activity.LookupGoroutine(); wReg != nil {
+			wReg.WaitEventEnd(wPid)
+		}
+	}
 
 	sess := config.NewSessionRegistry(s.cfg.Registry)
 	// Echo StartupMessage values for variables clients commonly send.
