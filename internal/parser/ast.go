@@ -802,6 +802,14 @@ const (
 	// difference) so handwritten functions migrated from upstream
 	// don't trip on it.
 	FuncArgIn FuncArgMode = iota
+	// FuncArgOut is an output parameter — set by the procedure body,
+	// returned to the caller. Stage B (procedure follow-up).
+	FuncArgOut
+	// FuncArgInout is a bidirectional parameter — caller passes a
+	// value that the procedure can modify and return. Stage B.
+	FuncArgInout
+	// FuncArgVariadic marks the last parameter as variadic. Stage B.
+	FuncArgVariadic
 )
 
 // FunctionArg is one entry in a function's argument list. Name is

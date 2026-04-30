@@ -153,20 +153,83 @@ func (p *parser) parseFunctionArgList() ([]FunctionArg, error) {
 	}
 }
 
-// parseFunctionArg parses a single argument: `[name] [IN] type
-// [DEFAULT expr]`. Stage A pins Mode=FuncArgIn; OUT / INOUT /
-// VARIADIC surface a clean parse error so handwritten functions
-// using those modes get a specific diagnostic instead of a generic
-// "expected type".
+// parseProcedureArgList parses an optional `( arg [, ...] )` list
+// for CREATE PROCEDURE, using parseProcedureArg which accepts
+// OUT/INOUT/VARIADIC modes.
+func (p *parser) parseProcedureArgList() ([]FunctionArg, error) {
+	if !p.acceptSymbol("(") {
+		return nil, nil
+	}
+	if p.acceptSymbol(")") {
+		return []FunctionArg{}, nil
+	}
+	args := make([]FunctionArg, 0, 2)
+	for {
+		arg, err := p.parseProcedureArg()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+		if p.acceptSymbol(",") {
+			continue
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ',' or ')' in procedure arg list")
+		}
+		return args, nil
+	}
+}
+
 func (p *parser) parseFunctionArg() (FunctionArg, error) {
 	pos := p.cur().Pos
 	arg := FunctionArg{pos: pos, Mode: FuncArgIn}
 
-	// Reject Stage B keywords explicitly. KwOut / KwInout / KwVariadic
-	// are now registered keywords; check both keyword and ident forms.
+	// Reject Stage B mode keywords for functions (but not procedures).
+	if err := p.rejectStageBModes(pos); err != nil {
+		return FunctionArg{}, err
+	}
+
+	// Optional `IN` mode keyword.
+	if p.acceptKeyword(KwIn) {
+		arg.Mode = FuncArgIn
+	}
+
+	return p.parseArgNameAndType(pos, arg)
+}
+
+// parseProcedureArg parses a single procedure argument: `[name] [IN|OUT|INOUT] type
+// [DEFAULT expr]`. Stage B allows OUT, INOUT, and VARIADIC modes.
+func (p *parser) parseProcedureArg() (FunctionArg, error) {
+	pos := p.cur().Pos
+	arg := FunctionArg{pos: pos, Mode: FuncArgIn}
+
+	// Accept IN / OUT / INOUT / VARIADIC mode keywords.
+	if p.cur().Kind == TokenKeyword {
+		switch p.cur().Keyword {
+		case KwIn:
+			p.advance()
+			arg.Mode = FuncArgIn
+		case KwOut:
+			p.advance()
+			arg.Mode = FuncArgOut
+		case KwInout:
+			p.advance()
+			arg.Mode = FuncArgInout
+		case KwVariadic:
+			p.advance()
+			arg.Mode = FuncArgVariadic
+		}
+	}
+
+	return p.parseArgNameAndType(pos, arg)
+}
+
+// rejectStageBModes returns an error if the current token is an
+// OUT / INOUT / VARIADIC keyword, which are not valid in CREATE FUNCTION.
+func (p *parser) rejectStageBModes(pos int) error {
 	if p.cur().Kind == TokenIdent {
 		if isReservedFutureMode(p.cur().Value) {
-			return FunctionArg{}, p.errAtCur(fmt.Sprintf(
+			return p.errAtCur(fmt.Sprintf(
 				"function argument mode %q is not supported in v0 (Stage A: IN only)",
 				p.cur().Value))
 		}
@@ -174,19 +237,17 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 	if p.cur().Kind == TokenKeyword {
 		switch p.cur().Keyword {
 		case KwOut, KwInout, KwVariadic:
-			return FunctionArg{}, p.errAtCur(fmt.Sprintf(
+			return p.errAtCur(fmt.Sprintf(
 				"function argument mode %q is not supported in v0 (Stage A: IN only)",
 				p.cur().Value))
 		}
 	}
+	return nil
+}
 
-	// Optional `IN` mode keyword. Stage A treats IN as a no-op;
-	// kept here so handwritten functions migrated from upstream
-	// (which often spell `IN` explicitly) parse cleanly.
-	if p.acceptKeyword(KwIn) {
-		arg.Mode = FuncArgIn
-	}
-
+// parseArgNameAndType handles the common `[name] type [DEFAULT expr]` portion
+// shared by parseFunctionArg and parseProcedureArg.
+func (p *parser) parseArgNameAndType(pos int, arg FunctionArg) (FunctionArg, error) {
 	// Distinguish `arg_name TYPE` from `TYPE` (positional only):
 	// Look at the next two non-comma tokens. If we see
 	// `ident <type-start>` where <type-start> is another ident or
@@ -292,7 +353,7 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 	if err != nil {
 		return nil, err
 	}
-	args, err := p.parseFunctionArgList()
+	args, err := p.parseProcedureArgList()
 	if err != nil {
 		return nil, err
 	}

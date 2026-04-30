@@ -729,18 +729,32 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	}
 	argTypes := make([]catalog.Type, len(s.Args))
 	argNames := make([]string, len(s.Args))
+	argModes := make([]string, len(s.Args))
 	for i, a := range s.Args {
 		argTypes[i] = catalog.Type{
 			Name: strings.ToLower(a.Type.Name),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
+		switch a.Mode {
+		case parser.FuncArgIn:
+			argModes[i] = "i"
+		case parser.FuncArgOut:
+			argModes[i] = "o"
+		case parser.FuncArgInout:
+			argModes[i] = "b"
+		case parser.FuncArgVariadic:
+			argModes[i] = "v"
+		default:
+			argModes[i] = "i"
+		}
 	}
 	r := &catalog.Routine{
 		Schema:   s.Name.Schema,
 		Name:     s.Name.Name,
 		ArgNames: argNames,
 		ArgTypes: argTypes,
+		ArgModes: argModes,
 		Language: lang,
 		Body:     s.Body,
 	}

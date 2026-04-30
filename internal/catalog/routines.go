@@ -36,6 +36,7 @@ type Routine struct {
 	Name       string
 	ArgNames   []string // parallel to ArgTypes; empty string for positional-only args
 	ArgTypes   []Type
+	ArgModes   []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
 	ReturnType Type
 	Language   string // lower-cased
 	Body       string // raw routine source between the dollar-quote delimiters

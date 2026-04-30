@@ -99,11 +99,11 @@ func TestExecCallProcedureNotFound(t *testing.T) {
 	}
 	ctx := NewContext()
 	ctx.Catalog = cat
-	if err := op.Open(ctx); err != nil {
-		t.Fatalf("Open: %v", err)
+	err = op.Open(ctx)
+	if err == nil {
+		op.Close()
+		t.Fatal("expected error from Open, got nil")
 	}
-	defer op.Close()
-	_, err = op.Next()
 	ee, ok := err.(*ExecError)
 	if !ok || ee.Code != "42883" {
 		t.Fatalf("got err=%v, want ExecError SQLSTATE 42883", err)
