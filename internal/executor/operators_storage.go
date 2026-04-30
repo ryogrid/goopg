@@ -2,8 +2,10 @@ package executor
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -274,17 +276,20 @@ func (o *insertOp) Next() (Row, error) {
 //
 // Surfaces an explicit XX000 for plan shapes the executor doesn't
 // recognise — pre-existing planner-bug guard.
-func extractScanAndPredicate(child planner.Node) (*planner.SeqScan, planner.Expr, error) {
+func extractScan(child planner.Node) (seq *planner.SeqScan, pred planner.Expr, idx *planner.IndexScan, err error) {
 	switch c := child.(type) {
 	case *planner.SeqScan:
-		return c, nil, nil
+		return c, nil, nil, nil
 	case *planner.IndexScan:
+		// Convert to SeqScan+predicate for the fallback path,
+		// but also return the IndexScan so the caller can use
+		// the B-tree directly.
 		scan := &planner.SeqScan{Table: c.Table}
-		return scan, indexScanPredicate(c), nil
+		return scan, indexScanPredicate(c), c, nil
 	case *planner.Filter:
 		switch inner := c.Child.(type) {
 		case *planner.SeqScan:
-			return inner, c.Predicate, nil
+			return inner, c.Predicate, nil, nil
 		case *planner.IndexScan:
 			scan := &planner.SeqScan{Table: inner.Table}
 			combined := &planner.BinaryOp{
@@ -292,11 +297,11 @@ func extractScanAndPredicate(child planner.Node) (*planner.SeqScan, planner.Expr
 				Left:  c.Predicate,
 				Right: indexScanPredicate(inner),
 			}
-			return scan, combined, nil
+			return scan, combined, inner, nil
 		}
-		return nil, nil, &ExecError{Code: "XX000", Pos: c.Pos(), Message: "Update/Delete: Filter child is not SeqScan or IndexScan"}
+		return nil, nil, nil, &ExecError{Code: "XX000", Pos: c.Pos(), Message: "Update/Delete: Filter child is not SeqScan or IndexScan"}
 	}
-	return nil, nil, &ExecError{Code: "XX000", Pos: child.Pos(), Message: "Update/Delete: unsupported child plan"}
+	return nil, nil, nil, &ExecError{Code: "XX000", Pos: child.Pos(), Message: "Update/Delete: unsupported child plan"}
 }
 
 // indexScanPredicate synthesises a `<indexed_col> = key` equality
@@ -338,17 +343,23 @@ type updateOp struct {
 	ctx          *Context
 	rowsAffected int64
 	done         bool
+
+	// idxScan, when non-nil, is the IndexScan from the child plan.
+	// updateOp uses the B-tree to find matching tuples (O(log n))
+	// instead of the full SeqScan path (O(n)). Set by newUpdateOp
+	// when the planner produced an IndexScan.
+	idxScan *planner.IndexScan
 }
 
 // RowsAffected satisfies executor.RowCounter.
 func (o *updateOp) RowsAffected() int64 { return o.rowsAffected }
 
 func newUpdateOp(p *planner.Update) (*updateOp, error) {
-	scan, pred, err := extractScanAndPredicate(p.Child)
+	scan, pred, idxScan, err := extractScan(p.Child)
 	if err != nil {
 		return nil, err
 	}
-	return &updateOp{plan: p, scan: scan, pred: pred}, nil
+	return &updateOp{plan: p, scan: scan, pred: pred, idxScan: idxScan}, nil
 }
 
 func (o *updateOp) Schema() planner.Schema { return nil }
@@ -370,6 +381,133 @@ func (o *updateOp) Open(ctx *Context) error {
 
 func (o *updateOp) Close() error { return nil }
 
+// updateViaIndex uses the B-tree to find the tuple to update (O(log n))
+// instead of scanning all pages. Falls back to the path in Next() when
+// no IndexScan is available.
+func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column) (Row, error) {
+	ix := o.idxScan
+	idxRel := o.ctx.Catalog.IndexRelFileNode(ix.Index)
+	tree, err := btree.Open(o.ctx.Pool, idxRel)
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: ix.Pos(), Message: err.Error()}
+	}
+
+	// Evaluate the index key — same logic as indexScanOp.lookupKey.
+	v, err := evalExpr(ix.Key, nil, o.ctx)
+	if err != nil {
+		return nil, err
+	}
+	if v.IsNull() {
+		return nil, nil
+	}
+	col, ok := o.ctx.Catalog.LookupColumn(ix.Table, ix.Index.Columns[0])
+	if !ok {
+		return nil, &ExecError{Code: "XX000", Pos: ix.Pos(),
+			Message: fmt.Sprintf("indexed column %q not found on table %q", ix.Index.Columns[0], ix.Table.Name)}
+	}
+	keyBytes, encErr := encodeBTreeKeyForColumn(v, col, ix.Key.Pos())
+	if encErr != nil {
+		return nil, encErr
+	}
+
+	// Scan the B-tree for matching entries.
+	type pendingUpdate struct {
+		blk    storage.BlockNumber
+		slot   uint16
+		newRow Row
+	}
+	var pending []pendingUpdate
+	heapRel := rel
+
+	err = tree.RangeScan(keyBytes, keyBytes, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
+		if err != nil {
+			return false, err
+		}
+		slot.RLock()
+		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		slot.RUnlock()
+		o.ctx.Pool.Unpin(slot)
+		if err != nil {
+			return false, err
+		}
+		if !mvcc.TupleVisible(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID) {
+			return true, nil
+		}
+		// Check for foreign tuple lock (M0021 step 2b).
+		if foreignLockOnly(tuple.Header, o.ctx.Tx.XID) {
+			ptr := storage.ItemPointer{Block: ptr.Block, Offset: ptr.Offset}
+			if err := o.ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
+				return false, err
+			}
+			// Re-read after lock released.
+			slot2, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
+			if err != nil {
+				return false, err
+			}
+			slot2.RLock()
+			tuple, err = storage.PageGetHeapTuple(slot2.Page(), ptr.Offset)
+			slot2.RUnlock()
+			o.ctx.Pool.Unpin(slot2)
+			if err != nil {
+				return false, err
+			}
+		}
+		row, err := DecodeRow(cols, tuple.Data)
+		if err != nil {
+			return false, err
+		}
+
+		// Build new row from SET expressions.
+		newRow := make(Row, len(cols))
+		for i := range cols {
+			if o.plan.Set[i] == nil {
+				newRow[i] = row[i]
+				continue
+			}
+			v, err := evalExpr(o.plan.Set[i], row, o.ctx)
+			if err != nil {
+				return false, err
+			}
+			newRow[i] = v
+		}
+		pending = append(pending, pendingUpdate{
+			blk:    ptr.Block,
+			slot:   ptr.Offset,
+			newRow: newRow,
+		})
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Modification phase: stamp xmax and write new tuple.
+	for _, pu := range pending {
+		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+		if err != nil {
+			return nil, err
+		}
+		s.Lock()
+		if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+			s.Unlock()
+			o.ctx.Pool.Unpin(s)
+			return nil, err
+		}
+		derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
+		s.Unlock()
+		o.ctx.Pool.Unpin(s)
+		if derr != nil {
+			return nil, derr
+		}
+		if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
+			return nil, err
+		}
+		o.rowsAffected++
+	}
+	return nil, EOF
+}
+
 func (o *updateOp) Next() (Row, error) {
 	if o.done {
 		return nil, EOF
@@ -378,6 +516,13 @@ func (o *updateOp) Next() (Row, error) {
 	tbl := o.plan.Table
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
+
+	// Use IndexScan (B-tree) when available — O(log n) instead of O(n).
+	if o.idxScan != nil {
+		return o.updateViaIndex(rel, cols)
+	}
+
+	// Fallback: full SeqScan path.
 
 	// Two passes: first collect (block, slot, newRow) tuples to
 	// rewrite, then issue the writes. Doing the writes in-line during
@@ -444,17 +589,18 @@ type deleteOp struct {
 	ctx          *Context
 	rowsAffected int64
 	done         bool
+	idxScan      *planner.IndexScan
 }
 
 // RowsAffected satisfies executor.RowCounter.
 func (o *deleteOp) RowsAffected() int64 { return o.rowsAffected }
 
 func newDeleteOp(p *planner.Delete) (*deleteOp, error) {
-	scan, pred, err := extractScanAndPredicate(p.Child)
+	scan, pred, idxScan, err := extractScan(p.Child)
 	if err != nil {
 		return nil, err
 	}
-	return &deleteOp{plan: p, scan: scan, pred: pred}, nil
+	return &deleteOp{plan: p, scan: scan, pred: pred, idxScan: idxScan}, nil
 }
 
 func (o *deleteOp) Schema() planner.Schema { return nil }
