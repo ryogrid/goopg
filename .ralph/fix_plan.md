@@ -3567,6 +3567,22 @@ Decompose when picked up.
 - [ ] Stage B: wait-event taxonomy and recording hooks.
       (not yet started)
 
+## Milestone 0023 — Comprehensive syntax integration test suite
+
+See `docs/milestones/0023-comprehensive-syntax-integration-test-suite.md`.
+
+- [x] DDL statement tests (CREATE/DROP TABLE, INDEX, VIEW, ALTER, TRUNCATE)
+- [x] SELECT / expression tests (JOIN, GROUP BY, subqueries, CASE, ORDER BY, LIMIT, WHERE)
+- [x] Error code / SQLSTATE verification tests
+- [ ] DML statement tests (INSERT, UPDATE, DELETE)
+- [ ] Recursive CTE edge-case tests
+- [ ] EXPLAIN / EXPLAIN ANALYZE tests
+- [ ] UPSERT tests
+- [ ] Window function tests
+- [ ] Row locking tests (FOR UPDATE/SHARE)
+- [ ] Transaction tests
+- [ ] pg_catalog virtual view tests
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

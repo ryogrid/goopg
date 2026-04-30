@@ -13,6 +13,18 @@ import (
 	"github.com/goopg/goopg/internal/testutil/util"
 )
 
+// contextWithTimeout creates a context with a 10-second timeout for query use.
+func contextWithTimeout(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	return context.WithTimeout(context.Background(), 10*time.Second)
+}
+
+// libDir returns the path to the in-tree PostgreSQL library directory.
+func libDir(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(repoRoot(t), "postgres", "local_install", "lib")
+}
+
 // runSQL is a helper that runs SQL via the Go-native Query method
 // and fatals on non-nil error returns.
 func runSQL(t *testing.T, c *cluster.Cluster, sql string) [][]string {
