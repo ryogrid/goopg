@@ -303,3 +303,26 @@ func TestUDFForReverse(t *testing.T) {
 		t.Errorf("res = %+v, want 30", res)
 	}
 }
+
+func TestUDFPerform(t *testing.T) {
+	cat := catalog.NewInMemory()
+	cat.Routines().Create(&catalog.Routine{
+		Name:       "test_perform",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "plpgsql",
+		Body: `BEGIN
+			PERFORM 1 + 1;
+			RETURN 1;
+		END`,
+	}, false)
+
+	ctx := NewContext()
+	ctx.Catalog = cat
+	ctx.Now = time.Now()
+
+	expr := &planner.FuncCall{Name: "test_perform"}
+	_, err := evalExpr(expr, nil, ctx)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+}

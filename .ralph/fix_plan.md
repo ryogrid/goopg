@@ -2233,6 +2233,12 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 4e — PERFORM.
+        (landed 2026-04-30: parser + interpreter slice. `PERFORM
+        expr;` evaluates the expression and discards the result,
+        useful for side-effecting function calls. 1 new executor
+        test `TestUDFPerform`. Full `go test ./...` green.)
+
   - [x] Stage A step 4d — LOOP/WHILE/FOR/EXIT/CONTINUE.
         (landed 2026-04-30: parser + interpreter slice for all
         Stage A control-flow structures. `internal/plpgsql` now

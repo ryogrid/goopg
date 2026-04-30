@@ -358,6 +358,13 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.PerformStmt:
+		_, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.ExitStmt:
 		if s.Cond != nil {
 			cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)

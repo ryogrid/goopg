@@ -152,6 +152,16 @@ type ContinueStmt struct {
 func (c *ContinueStmt) Pos() int         { return c.pos }
 func (c *ContinueStmt) plpgsqlStmtNode() {}
 
+// PerformStmt is `PERFORM expression;`. Stage A only supports
+// scalar expressions.
+type PerformStmt struct {
+	pos  int
+	Expr parser.Expr
+}
+
+func (p *PerformStmt) Pos() int         { return p.pos }
+func (p *PerformStmt) plpgsqlStmtNode() {}
+
 // ReturnStmt is `RETURN expr;`. Stage A only emits scalar return
 // values; SETOF / TABLE / RETURN NEXT / RETURN QUERY arrive in
 // Stage B.

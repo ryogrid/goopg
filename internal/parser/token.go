@@ -198,6 +198,7 @@ const (
 	KwWhile    Keyword = "while"
 	KwContinue Keyword = "continue"
 	KwReverse  Keyword = "reverse"
+	KwPerform  Keyword = "perform"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -324,6 +325,7 @@ var keywords = map[string]Keyword{
 	"while":        KwWhile,
 	"continue":     KwContinue,
 	"reverse":      KwReverse,
+	"perform":      KwPerform,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

@@ -178,6 +178,8 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseWhile()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwFor:
 		return p.parseFor()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwPerform:
+		return p.parsePerform()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExit:
 		return p.parseExit()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:
@@ -300,6 +302,22 @@ func (p *bodyParser) parseFor() (*ForStmt, error) {
 		Step:    step,
 		Body:    body,
 	}, nil
+}
+
+// parsePerform parses `PERFORM expr ;`.
+func (p *bodyParser) parsePerform() (*PerformStmt, error) {
+	perfTok, err := p.expectKeyword(parser.KwPerform)
+	if err != nil {
+		return nil, err
+	}
+	expr, err := p.scanExprToSemicolon("PERFORM expression")
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate PERFORM statement")
+	}
+	return &PerformStmt{pos: perfTok.Pos, Expr: expr}, nil
 }
 
 // parseExit parses `EXIT [ WHEN cond ] ;`.
