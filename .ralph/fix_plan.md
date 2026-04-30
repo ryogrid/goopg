@@ -3578,10 +3578,10 @@ See `docs/milestones/0023-comprehensive-syntax-integration-test-suite.md`.
 - [x] EXPLAIN / EXPLAIN ANALYZE tests
 - [x] Transaction tests
 - [x] pg_catalog virtual view tests
+- [x] UPSERT tests
+- [x] Window function tests
+- [x] Row locking tests (FOR UPDATE/SHARE)
 - [ ] Recursive CTE edge-case tests
-- [ ] UPSERT tests
-- [ ] Window function tests
-- [ ] Row locking tests (FOR UPDATE/SHARE)
 
 ## Notes
 
