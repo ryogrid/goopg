@@ -59,3 +59,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0022 | PostgreSQL-compatible `pg_stat_activity` support                 | planned  | `0022-pg-stat-activity-support.md` |
 | 0023 | Comprehensive syntax integration test suite                      | planned  | `0023-comprehensive-syntax-integration-test-suite.md` |
 | 0024 | Wait-event recording architecture: non-client-backend & cross-goroutine paths | planned  | `0024-wait-event-recording-architecture.md` |
+| 0025 | OLTP performance analysis & bottleneck identification                      | planned  | `0025-oltp-performance-analysis.md` |
