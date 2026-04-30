@@ -12,17 +12,9 @@ import (
 )
 
 var heapExtendLocks sync.Map // map[storage.RelFileNode]*sync.Mutex
-var scanMatchLocks sync.Map  // map[storage.RelFileNode]*sync.Mutex
 
 func lockHeapExtend(rel storage.RelFileNode) func() {
 	v, _ := heapExtendLocks.LoadOrStore(rel, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
-}
-
-func lockScanMatch(rel storage.RelFileNode) func() {
-	v, _ := scanMatchLocks.LoadOrStore(rel, &sync.Mutex{})
 	mu := v.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
@@ -557,9 +549,6 @@ func foreignLockOnly(h storage.HeapTupleHeader, currentXID storage.TransactionID
 }
 
 func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
-	unlock := lockScanMatch(rel)
-	defer unlock()
-
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
