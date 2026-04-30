@@ -3050,8 +3050,15 @@ calls out.
 See `docs/milestones/0019-autovacuum-support.md`. Substantial.
 Decompose when picked up.
 
-- [ ] Autovacuum launcher + worker architecture; trigger
-      policy; observability.
+- [x] Autovacuum launcher + worker architecture — first slice.
+      (landed 2026-04-30: `internal/autovacuum` package with
+      `Launcher` struct, configurable nap interval and worker
+      limit, ticker-driven loop that scans the catalog for user
+      tables and dispatches `vacuum.Vacuum` / `vacuum.Analyze`.
+      Wired into `server.Config.AutovacuumLauncher` and started
+      as a background goroutine in `Server.Run`. Trigger policy
+      still always-vacuum (no threshold logic yet); cost controls
+      and full observability deferred. Full `go test ./...` green.)
 
 ## Milestone 0020 — Window functions
 

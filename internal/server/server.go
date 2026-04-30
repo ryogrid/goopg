@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 
 	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/autovacuum"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
@@ -122,6 +123,10 @@ type Config struct {
 	// reply with "promote not configured" — protecting an
 	// already-primary process from a stray `goopg promote`.
 	Promote func() error
+
+	// AutovacuumLauncher, when set, is started as a background
+	// goroutine during Run. nil disables autovacuum.
+	AutovacuumLauncher *autovacuum.Launcher
 
 	// Slots, when set, exposes the replication-slot registry to
 	// the wire-layer replication-command handler (IDENTIFY_SYSTEM,
@@ -278,6 +283,17 @@ func (s *Server) Run(ctx context.Context) error {
 		<-runCtx.Done()
 		s.closeOnce.Do(func() { _ = ln.Close() })
 	}()
+
+	// Start the autovacuum launcher if configured.
+	if s.cfg.AutovacuumLauncher != nil {
+		s.cfg.AutovacuumLauncher.SetLogger(s.cfg.Logger)
+		go func() {
+			if err := s.cfg.AutovacuumLauncher.Run(runCtx); err != nil &&
+				!errors.Is(err, context.Canceled) {
+				s.cfg.Logger.Error("autovacuum launcher error", "err", err)
+			}
+		}()
+	}
 
 	acceptErr := s.acceptLoop(runCtx, ln)
 
