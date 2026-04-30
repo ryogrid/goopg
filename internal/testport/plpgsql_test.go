@@ -371,3 +371,18 @@ func TestPort_UnionAll(t *testing.T) {
 		t.Fatalf("stdout=%q, want \"1\\n2\\n3\"", res.Stdout)
 	}
 }
+
+// TestPort_RecursiveCTE verifies a basic recursive CTE works.
+func TestPort_RecursiveCTE(t *testing.T) {
+	c := newCluster(t, "recursive_cte")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	rows := runSQL(t, c, "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r ORDER BY n")
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3: %v", len(rows), rows)
+	}
+	if rows[0][0] != "1" || rows[1][0] != "2" || rows[2][0] != "3" {
+		t.Fatalf("rows = %v, want [[1] [2] [3]]", rows)
+	}
+}

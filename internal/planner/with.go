@@ -174,11 +174,17 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 		}
 	}
 
+	// Save and clear SetOp so planSelect for the anchor does NOT
+	// enter the UNION ALL handler (which would try to plan the
+	// recursive member before the WorkTableScan is registered).
 	savedEntry, hadEntry := planCTEs[key]
 	if hadEntry {
 		delete(planCTEs, key)
 	}
+	savedSetOp := cte.Query.SetOp
+	cte.Query.SetOp = nil
 	anchor, err := planSelect(cte.Query, cat)
+	cte.Query.SetOp = savedSetOp
 	if err != nil {
 		if hadEntry {
 			planCTEs[key] = savedEntry

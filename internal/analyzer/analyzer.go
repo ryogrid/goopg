@@ -1047,18 +1047,77 @@ func resolveTable(ctx *scope, rv parser.RangeVar) (*catalog.Table, error) {
 // by the optional `(col, ...)` alias list when present.
 //
 // Stage A restrictions enforced here:
-//   - WITH RECURSIVE → SQLSTATE 0A000 (parser accepts the keyword,
-//     analyzer rejects until 0016-0003 lands).
+//   - WITH RECURSIVE → analyzed with the CTE self-reference allowed
+//     (planner enforces UNION ALL requirement).
 //   - Duplicate CTE name within the same WITH list → 42710.
 //   - Column-alias arity mismatch → 42P10 (invalid_column_reference).
+
+// analyzeRecursiveCTE analyzes a WITH RECURSIVE CTE body. It analyzes
+// the anchor (left side of UNION ALL) first to determine the output
+// columns, registers the CTE in the scope, then analyzes the recursive
+// member (right side) with the CTE self-reference visible.
+func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
+	body := cte.Query
+	if body.SetOp == nil || body.SetOp.Type != parser.SetOpUnion || !body.SetOp.All {
+		return analyzeError(cte.Pos(), "0A000", "WITH RECURSIVE requires UNION ALL")
+	}
+
+	// Analyze the anchor (left side) without the CTE in scope.
+	saved := body.SetOp
+	body.SetOp = nil
+	if err := analyzeSelectWithParent(body, ctx.cat, ctx); err != nil {
+		body.SetOp = saved
+		return err
+	}
+	body.SetOp = saved
+
+	// Build columns from the anchor's target list.
+	innerCtx := &scope{cat: ctx.cat, parent: ctx}
+	var rels []scopeRel
+	if len(body.From) > 0 || len(body.FromExprs) > 0 {
+		var err error
+		rels, err = buildSelectScopeIn(body, innerCtx)
+		if err != nil {
+			return err
+		}
+		innerCtx.rels = rels
+	}
+	cols := make([]catalog.Column, 0, len(body.Targets))
+	for i, tgt := range body.Targets {
+		name := tgt.Alias
+		if name == "" {
+			name = deriveAnalyzerTargetName(tgt.Expr)
+		}
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
+		}
+		typ, err := analyzeExpr(tgt.Expr, innerCtx)
+		if err != nil {
+			return err
+		}
+		cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: i})
+	}
+	colAliases := make([]string, len(cols))
+	for i, c := range cols {
+		colAliases[i] = c.Name
+	}
+	ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{
+		Name:       cte.Name,
+		Columns:    cols,
+		Virtual:    true,
+		ViewColumnAliases: colAliases,
+	}
+
+	// Analyze the recursive member (right side) with the CTE visible.
+	if err := analyzeSelectWithParent(body.SetOp.Right, ctx.cat, ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
 func analyzeWith(with *parser.WithClause, ctx *scope) error {
 	if with == nil {
 		return nil
-	}
-	if with.Recursive {
-		// WITH RECURSIVE: allow the CTE body to reference the
-		// CTE name itself. The planner handles the actual
-		// fixpoint iteration.
 	}
 	if ctx.ctes == nil {
 		ctx.ctes = make(map[string]*catalog.Table, len(with.CTEs))
@@ -1068,6 +1127,17 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 		if _, exists := ctx.ctes[nameKey]; exists {
 			return analyzeError(cte.Pos(), "42710", fmt.Sprintf("duplicate CTE name %q", cte.Name))
 		}
+
+		if with.Recursive {
+			// For WITH RECURSIVE, the CTE body must be UNION ALL.
+			// Register the CTE name before analyzing so the
+			// recursive member's self-reference resolves.
+			if err := analyzeRecursiveCTE(cte, ctx); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Recurse into the CTE's inner SELECT under the current
 		// scope so an earlier CTE in the same WITH list is
 		// visible to a later one. The inner SELECT can also have

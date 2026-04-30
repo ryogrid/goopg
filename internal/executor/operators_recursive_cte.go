@@ -66,9 +66,8 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 	}
 
 	// Phase 2: iterate the fixpoint.
-	iterLimit := 1000
 	for o.outIdx >= len(o.output) {
-		if len(o.working) == 0 || iterLimit <= 0 {
+		if len(o.working) == 0 {
 			o.done = true
 			return nil, EOF
 		}
@@ -98,8 +97,10 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 
 		o.working = iterRows
 		o.output = append(o.output, iterRows...)
-		o.outIdx = 0
-		iterLimit--
+		if len(iterRows) == 0 {
+			o.done = true
+			return nil, EOF
+		}
 	}
 
 	row := o.output[o.outIdx]
