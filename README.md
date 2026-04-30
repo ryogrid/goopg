@@ -39,8 +39,8 @@ of targets and overridable variables.
     (`libpq.so*`, ICU, …).
 
   If you have not built it yet, build the `postgres/` submodule with
-  `--prefix=$(pwd)/postgres/local_install` and `make install` so those
-  paths are populated. The Makefile only needs the client tools and
+  `--prefix=$(pwd)/local_install` and `make install` in `postgres/` directory.
+  The Makefile only needs the client tools and
   their shared libraries; the upstream `postgres` server binary is not
   used at runtime.
 
