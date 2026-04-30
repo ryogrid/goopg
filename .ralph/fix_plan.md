@@ -3632,3 +3632,34 @@ and `docs/design/0027-0001-hot-path-micro-optimisations.md`.
 - [x] CRC-32 cache for WAL encodeRecord (avoids recomputation for repeated payloads)
 - [x] B-tree direct binary search (findChildBlockDirect — avoids decoding all items per page). TPC-B +10%.
 - [ ] Remaining TPC-B gap vs simple-update (1122 vs 1514 TPS). Deeper analysis deferred.
+
+## Milestone 0028 — PostgreSQL implementation reference docs
+
+See `docs/milestones/0028-postgres-implementation-reference.md`.
+
+Documents under `docs/reference/` explaining how each goopg component
+works and how PostgreSQL implements equivalent logic.
+
+- [ ] REF-001: AIO Subsystem
+- [ ] REF-002: B-Tree Index
+- [ ] REF-003: Buffer Pool
+- [ ] REF-004: Checkpointer
+- [ ] REF-005: CTE / WITH Clause
+- [ ] REF-006: EXPLAIN / ANALYZE
+- [ ] REF-007: Heap Storage & MVCC
+- [ ] REF-008: Lock Manager
+- [ ] REF-009: Logical Replication
+- [ ] REF-010: Parser & AST
+- [ ] REF-011: Planner & Optimiser
+- [ ] REF-012: PL/pgSQL Runtime
+- [ ] REF-013: Tuple Format & Codec
+- [ ] REF-014: UPSERT (ON CONFLICT)
+- [ ] REF-015: WAL Format & I/O
+- [ ] REF-016: WAL Buffer & Eviction
+- [ ] REF-017: WAL Redo / Crash Recovery
+- [ ] REF-018: Window Functions
+- [ ] REF-019: pg_stat_activity & Wait Events
+- [ ] REF-020: Row Locking (FOR UPDATE)
+- [ ] REF-021: Protocol & Wire Format
+- [ ] REF-022: Session & Transaction Management
+- [ ] REF-023: Autovacuum

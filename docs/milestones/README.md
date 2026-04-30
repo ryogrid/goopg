@@ -62,3 +62,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0025 | OLTP performance analysis & bottleneck identification                      | accepted | `0025-oltp-performance-analysis.md` |
 | 0026 | Concurrent WAL append & flush architecture                                  | accepted | `0026-concurrent-wal-append.md` |
 | 0027 | Low-risk performance optimisations (readability-preserving)                  | planned  | `0027-readability-preserving-optimisations.md` |
+| 0028 | goopg implementation reference: PostgreSQL logic documentation               | planned  | `0028-postgres-implementation-reference.md` |
