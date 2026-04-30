@@ -416,7 +416,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot   uint16
 		newRow Row
 	}
-	var pending []pendingUpdate
+	pending := make([]pendingUpdate, 0, 1) // pre-alloc for common 1-row match
 	heapRel := rel
 
 	err = tree.RangeScan(keyBytes, keyBytes, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
@@ -535,7 +535,7 @@ func (o *updateOp) Next() (Row, error) {
 		slot   uint16
 		newRow Row
 	}
-	var pending []pendingUpdate
+	pending := make([]pendingUpdate, 0, 1) // pre-alloc for common 1-row match
 
 	if err := o.scanForMatches(rel, cols, func(blk storage.BlockNumber, slot uint16, row Row) error {
 		newRow := make(Row, len(cols))
@@ -717,11 +717,15 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			ctx.Pool.Unpin(s)
 			return err
 		}
-		var matches []struct {
+		matches := make([]struct {
 			slot     uint16
 			row      Row
 			lockedBy storage.TransactionID
-		}
+		}, 0, 1)
+		// Reusable row buffer — DecodeRowInto fills it without
+		// allocating (M0027-0001).  Copy into matches only for
+		// tuples that pass the predicate.
+		scanRow := make(Row, len(cols))
 		for slot := uint16(1); slot <= uint16(count); slot++ {
 			tuple, err := storage.PageGetHeapTuple(page, slot)
 			if err != nil {
@@ -735,14 +739,13 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			if !mvcc.TupleVisible(tuple.Header, ctx.Snap, ctx.Tx.XID) {
 				continue
 			}
-			row, err := DecodeRow(cols, tuple.Data)
-			if err != nil {
+			if err := DecodeRowInto(scanRow, cols, tuple.Data); err != nil {
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return err
 			}
 			if pred != nil {
-				v, err := evalExpr(pred, row, ctx)
+				v, err := evalExpr(pred, scanRow, ctx)
 				if err != nil {
 					s.RUnlock()
 					ctx.Pool.Unpin(s)
@@ -752,11 +755,14 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 					continue
 				}
 			}
+			// Matching tuple — copy the row (scanRow is reused).
+			matchedRow := make(Row, len(cols))
+			copy(matchedRow, scanRow)
 			matches = append(matches, struct {
 				slot     uint16
 				row      Row
 				lockedBy storage.TransactionID
-			}{slot: slot, row: row, lockedBy: lockedByForeign(tuple.Header, ctx.Tx.XID)})
+			}{slot: slot, row: matchedRow, lockedBy: lockedByForeign(tuple.Header, ctx.Tx.XID)})
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)

@@ -50,29 +50,36 @@ func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
 // DecodeRow inverts EncodeRow.
 func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 	row := make(Row, len(cols))
+	if err := DecodeRowInto(row, cols, data); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// DecodeRowInto fills an existing Row slice from encoded tuple data.
+// Avoids the allocation that DecodeRow would make. The caller must
+// ensure len(dst) == len(cols). M0027-0001.
+func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
-			// ALTER TABLE ADD COLUMN appends new logical columns without
-			// rewriting old heap tuples; missing trailing values read as
-			// NULL.
-			row[i] = NullDatum
+			dst[i] = NullDatum
 			continue
 		}
 		flag := data[off]
 		off++
 		if flag == 1 {
-			row[i] = NullDatum
+			dst[i] = NullDatum
 			continue
 		}
 		v, n, err := decodeValue(c.Type, data[off:])
 		if err != nil {
-			return nil, fmt.Errorf("DecodeRow: %s: %w", c.Name, err)
+			return fmt.Errorf("DecodeRow: %s: %w", c.Name, err)
 		}
-		row[i] = v
+		dst[i] = v
 		off += n
 	}
-	return row, nil
+	return nil
 }
 
 func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
