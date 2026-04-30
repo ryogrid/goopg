@@ -2610,13 +2610,9 @@ out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
       and EXPLAIN labels for CTE producers land in
       M0016-0004.)
 
-- [ ] (BLOCKED) Recursive CTE fixpoint execution
-      (M0016-0003). Hard prereq: `UNION ALL` planner +
-      executor support — now landed (2026-04-30: design doc
-      `docs/design/0016-0003-union-all-planner-and-executor.md`,
-      analyzer accepts UNION ALL, `planner.SetOp` node,
-      `executor.setOp` operator. Full `go test ./...` green).
-      Once UNION ALL shipped, this slice does the
+- [ ] Recursive CTE fixpoint execution
+      (M0016-0003). Hard prereq `UNION ALL` now landed
+      (2026-04-30). This slice does the
       anchor/recursive-member detection, planner-side
       fixpoint scan node, executor iteration, cycle-safe
       termination, and unsupported-recursive-shape
