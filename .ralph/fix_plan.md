@@ -2233,6 +2233,23 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 4b — DECLARE block + assignment.
+        (landed 2026-04-30: parser-only slice. `internal/plpgsql`
+        now accepts an optional `DECLARE` section before the main
+        `BEGIN` block. Supports typed variable declarations with
+        optional `DEFAULT expr` or `:= expr` initializers. reuses
+        the SQL type parser via a `CREATE TABLE` synthetic-parse
+        loop so `numeric(10,2)`-style types round-trip correctly.
+        New `AssignStmt` handles `target := expr;`. Assignment
+        target restricted to bare identifiers in Stage A. reuses
+        `scanExprToSemicolon` for expression capture so both
+        initializers and assignment values produce `parser.Expr`
+        nodes the interpreter can evaluate. 12 new tests in
+        `parser_test.go` cover declarations, initializers,
+        assignment, and specific Stage-A-4b diagnostics for
+        `CONSTANT` / `NOT NULL` deferrals. Full `go test ./...`
+        green.)
+
   - [x] Stage A step 4a — PL/pgSQL body parser + AST (Block +
         RETURN). Design doc
         `docs/design/0015-0004-plpgsql-body-parser-and-ast.md`.
