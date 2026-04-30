@@ -63,3 +63,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0026 | Concurrent WAL append & flush architecture                                  | accepted | `0026-concurrent-wal-append.md` |
 | 0027 | Low-risk performance optimisations (readability-preserving)                  | planned  | `0027-readability-preserving-optimisations.md` |
 | 0028 | goopg implementation reference: PostgreSQL logic documentation               | planned  | `0028-postgres-implementation-reference.md` |
+| 0029 | HammerDB TPC-H end-to-end run on goopg                                      | planned  | `0029-hammerdb-tpch-run.md` |
