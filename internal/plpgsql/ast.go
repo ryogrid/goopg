@@ -28,16 +28,55 @@ type Stmt interface {
 	plpgsqlStmtNode()
 }
 
-// Block is `BEGIN <statements> END` — the top-level shape of every
-// PL/pgSQL routine body Stage A 4a accepts. Future slices add the
-// optional `DECLARE` prefix and label / loop forms.
+// Block is the upstream PL/pgSQL block:
+//
+//	[ DECLARE <declarations> ]
+//	BEGIN
+//	    <statements>
+//	END [ ';' ]
+//
+// Stage A 4a accepted the BEGIN/END skeleton with RETURN as the only
+// statement; 4b adds the optional DECLARE prefix and assignment so
+// trivial functions with locals (`x := 1; RETURN x;`) parse. Label
+// and EXCEPTION-block forms remain Stage A 4d+ scope.
 type Block struct {
-	pos        int
-	Statements []Stmt
+	pos          int
+	Declarations []*Declaration
+	Statements   []Stmt
 }
 
-func (b *Block) Pos() int          { return b.pos }
+func (b *Block) Pos() int         { return b.pos }
 func (b *Block) plpgsqlStmtNode() {}
+
+// Declaration is one entry in a `DECLARE` section:
+//
+//	varname [CONSTANT] type [NOT NULL] [DEFAULT expr | := expr] ';'
+//
+// Stage A 4b drops CONSTANT and NOT NULL — both surface a clean
+// "Stage A 4b" diagnostic so handwritten PL/pgSQL using them gets
+// a specific message instead of a generic syntax error. The future
+// 4c slice extends `Declaration` with the missing fields rather
+// than reshape the struct.
+type Declaration struct {
+	pos     int
+	Name    string
+	Type    parser.ColumnType
+	Default parser.Expr // nil when no DEFAULT / := initializer
+}
+
+func (d *Declaration) Pos() int { return d.pos }
+
+// AssignStmt is `target := value;`. Stage A 4b accepts simple
+// variable targets only; future slices extend this for record-
+// field and array-element assignment.
+type AssignStmt struct {
+	pos    int
+	Target string
+	Value  parser.Expr
+}
+
+func (a *AssignStmt) Pos() int         { return a.pos }
+func (a *AssignStmt) plpgsqlStmtNode() {}
 
 // ReturnStmt is `RETURN expr;`. Stage A only emits scalar return
 // values; SETOF / TABLE / RETURN NEXT / RETURN QUERY arrive in

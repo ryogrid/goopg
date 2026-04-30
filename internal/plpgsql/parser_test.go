@@ -116,18 +116,18 @@ func TestParseRequiresEnd(t *testing.T) {
 	}
 }
 
-// TestParseRejectsUnsupportedStatement guards Stage A 4a's scope:
-// statements other than RETURN surface a specific
-// "Stage A 4a accepts RETURN only" diagnostic — clearer than a
-// generic syntax error so callers know the feature is recognised
-// but not yet implemented.
+// TestParseRejectsUnsupportedStatement guards Stage A 4b's scope:
+// PERFORM is an identifier-led statement that doesn't have `:=`
+// after the leading identifier, so the assignment parser surfaces
+// a Stage-A-4b diagnostic naming RETURN and assignment as the
+// only supported shapes.
 func TestParseRejectsUnsupportedStatement(t *testing.T) {
 	_, err := Parse("BEGIN PERFORM foo(); END")
 	if err == nil {
 		t.Fatal("expected SyntaxError for PERFORM")
 	}
-	if !strings.Contains(err.Error(), "Stage A 4a") {
-		t.Errorf("err = %v, want a Stage-A-4a diagnostic", err)
+	if !strings.Contains(err.Error(), "Stage A 4b") {
+		t.Errorf("err = %v, want a Stage-A-4b diagnostic", err)
 	}
 }
 
@@ -158,6 +158,162 @@ func TestParseReturnExpressionError(t *testing.T) {
 	}
 	if se.Pos == 0 {
 		t.Errorf("Pos = 0, want offset of expression start")
+	}
+}
+
+// TestParseDeclareSection: Stage A 4b accepts a DECLARE prefix
+// with one-or-more typed variable declarations.
+func TestParseDeclareSection(t *testing.T) {
+	src := `DECLARE
+		x int;
+		y text;
+	BEGIN
+		RETURN 1;
+	END`
+	blk, err := Parse(src)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(blk.Declarations) != 2 {
+		t.Fatalf("Declarations len = %d, want 2", len(blk.Declarations))
+	}
+	if blk.Declarations[0].Name != "x" || blk.Declarations[0].Type.Name != "int" {
+		t.Errorf("decl[0] = %+v, want x int", blk.Declarations[0])
+	}
+	if blk.Declarations[1].Name != "y" || blk.Declarations[1].Type.Name != "text" {
+		t.Errorf("decl[1] = %+v, want y text", blk.Declarations[1])
+	}
+}
+
+// TestParseDeclareWithDefaults pins both initializer forms —
+// `DEFAULT expr` and `:= expr` — landing on the same Default
+// field.
+func TestParseDeclareWithDefaults(t *testing.T) {
+	src := `DECLARE
+		a int := 5;
+		b int DEFAULT 10;
+	BEGIN
+	END`
+	blk, err := Parse(src)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if blk.Declarations[0].Default == nil {
+		t.Errorf("decl[0].Default = nil, want non-nil for `:= 5`")
+	}
+	if blk.Declarations[1].Default == nil {
+		t.Errorf("decl[1].Default = nil, want non-nil for `DEFAULT 10`")
+	}
+}
+
+// TestParseDeclareTypeWithArgs pins that `numeric(10, 2)`-style
+// type args round-trip into the catalog ColumnType — drives the
+// type-arg list path through the SQL parser.
+func TestParseDeclareTypeWithArgs(t *testing.T) {
+	src := `DECLARE
+		amt numeric(10, 2);
+	BEGIN
+	END`
+	blk, err := Parse(src)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	d := blk.Declarations[0]
+	if d.Type.Name != "numeric" {
+		t.Errorf("Type.Name = %q, want numeric", d.Type.Name)
+	}
+	if len(d.Type.Args) != 2 || d.Type.Args[0] != 10 || d.Type.Args[1] != 2 {
+		t.Errorf("Type.Args = %v, want [10 2]", d.Type.Args)
+	}
+}
+
+// TestParseDeclareRejectsConstant pins the Stage A 4b deferral —
+// CONSTANT declarations surface a specific diagnostic instead of
+// a generic syntax error.
+func TestParseDeclareRejectsConstant(t *testing.T) {
+	_, err := Parse("DECLARE x CONSTANT int := 1; BEGIN END")
+	if err == nil {
+		t.Fatal("expected SyntaxError for CONSTANT")
+	}
+	if !strings.Contains(err.Error(), "Stage A 4b") {
+		t.Errorf("err = %v, want Stage-A-4b diagnostic", err)
+	}
+}
+
+// TestParseDeclareRejectsNotNull: NOT NULL deferred to a later
+// slice; surface a specific diagnostic.
+func TestParseDeclareRejectsNotNull(t *testing.T) {
+	_, err := Parse("DECLARE x int NOT NULL; BEGIN END")
+	if err == nil {
+		t.Fatal("expected SyntaxError for NOT NULL")
+	}
+	if !strings.Contains(err.Error(), "Stage A 4b") {
+		t.Errorf("err = %v, want Stage-A-4b diagnostic", err)
+	}
+}
+
+// TestParseAssignment pins the assignment shape in a body
+// statement: the target name lands on AssignStmt.Target and the
+// expression hits the SQL expression AST.
+func TestParseAssignment(t *testing.T) {
+	src := `BEGIN
+		x := 1 + 2;
+		RETURN x;
+	END`
+	blk, err := Parse(src)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(blk.Statements) != 2 {
+		t.Fatalf("Statements len = %d, want 2", len(blk.Statements))
+	}
+	a, ok := blk.Statements[0].(*AssignStmt)
+	if !ok {
+		t.Fatalf("Statements[0] = %T, want *AssignStmt", blk.Statements[0])
+	}
+	if a.Target != "x" {
+		t.Errorf("Target = %q, want x", a.Target)
+	}
+	if _, ok := a.Value.(*parser.BinaryOp); !ok {
+		t.Errorf("Value = %T, want *parser.BinaryOp", a.Value)
+	}
+}
+
+// TestParseDeclareRequiresBegin: DECLARE section followed by EOF
+// rather than BEGIN surfaces a specific diagnostic.
+func TestParseDeclareRequiresBegin(t *testing.T) {
+	_, err := Parse("DECLARE x int;")
+	if err == nil {
+		t.Fatal("expected SyntaxError")
+	}
+	if !strings.Contains(err.Error(), "BEGIN") {
+		t.Errorf("err = %v, want a BEGIN diagnostic", err)
+	}
+}
+
+// TestParseDeclareEmpty: bare `DECLARE BEGIN END` is upstream-
+// legal; we accept it so future label-prefix parsing doesn't have
+// to undo a special-case lookahead.
+func TestParseDeclareEmpty(t *testing.T) {
+	blk, err := Parse("DECLARE BEGIN END")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(blk.Declarations) != 0 {
+		t.Errorf("Declarations len = %d, want 0", len(blk.Declarations))
+	}
+}
+
+// TestParseAssignWithoutColonEqError: bare-identifier statement
+// without `:=` surfaces the Stage-A-4b diagnostic naming the two
+// supported shapes.
+func TestParseAssignWithoutColonEqError(t *testing.T) {
+	_, err := Parse("BEGIN foo bar; END")
+	if err == nil {
+		t.Fatal("expected SyntaxError")
+	}
+	if !strings.Contains(err.Error(), ":=") {
+		t.Errorf("err = %v, want a `:=` diagnostic", err)
 	}
 }
 

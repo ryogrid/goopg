@@ -151,10 +151,10 @@ type utilityNoOp struct{ plan *planner.Utility }
 
 func newUtilityNoOp(p *planner.Utility) *utilityNoOp { return &utilityNoOp{plan: p} }
 
-func (o *utilityNoOp) Schema() planner.Schema  { return nil }
-func (o *utilityNoOp) Open(*Context) error     { return nil }
-func (o *utilityNoOp) Next() (Row, error)      { return nil, EOF }
-func (o *utilityNoOp) Close() error            { return nil }
+func (o *utilityNoOp) Schema() planner.Schema { return nil }
+func (o *utilityNoOp) Open(*Context) error    { return nil }
+func (o *utilityNoOp) Next() (Row, error)     { return nil, EOF }
+func (o *utilityNoOp) Close() error           { return nil }
 
 // Run is a convenience that opens an operator, drains it into a slice
 // of rows, then closes. Production paths use Open/Next/Close

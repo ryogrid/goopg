@@ -188,7 +188,8 @@ const (
 	// Step 4a covers BEGIN / END (already declared above) and
 	// RETURN; DECLARE / IF / LOOP / WHILE / FOR / EXIT / CONTINUE /
 	// PERFORM stay deferred to subsequent slices.
-	KwReturn Keyword = "return"
+	KwReturn  Keyword = "return"
+	KwDeclare Keyword = "declare"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -306,6 +307,7 @@ var keywords = map[string]Keyword{
 	"returns":      KwReturns,
 	"language":     KwLanguage,
 	"return":       KwReturn,
+	"declare":      KwDeclare,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

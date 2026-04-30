@@ -247,10 +247,17 @@ func (l *lexer) next() (Token, error) {
 		// `::` is upstream's typecast operator; a bare `:` is not
 		// otherwise meaningful in goopg's SQL surface and surfaces
 		// here as a lex error so the wire layer can return SQLSTATE
-		// 42601.
+		// 42601. `:=` is the PL/pgSQL assignment operator
+		// (M0015 Stage A step 4b) — recognised by the shared lexer
+		// because PL/pgSQL bodies tokenise through the same `Lex`
+		// entry point as SQL.
 		if l.peekAt(1) == ':' {
 			l.pos += 2
 			return Token{Kind: TokenOperator, Value: "::", Pos: start}, nil
+		}
+		if l.peekAt(1) == '=' {
+			l.pos += 2
+			return Token{Kind: TokenOperator, Value: ":=", Pos: start}, nil
 		}
 		return Token{}, l.errf(start, "unexpected character %q", c)
 

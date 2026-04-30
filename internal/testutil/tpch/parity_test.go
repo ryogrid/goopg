@@ -31,11 +31,10 @@ import (
 //   - both servers' row counts
 //   - first cell that differs, when both succeed
 //
-// The test is *informational* by default — it logs the parity
-// matrix but doesn't fail on differences (numeric-format and
-// trailing-space conventions diverge in known ways). A separate
-// short list of "must match" queries can be promoted later as
-// individual divergences are closed.
+// The test is fail-closed on unexpected divergences. We keep a
+// tiny explicit allowlist for the known synthetic-dataset numeric
+// precision deltas (Q1/Q8/Q14) and fail on every other mismatch,
+// as well as on any newly diverging query.
 func TestTPCHResultParity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping parity test in short mode")
@@ -172,6 +171,14 @@ func TestTPCHResultParity(t *testing.T) {
 	t.Logf("PARITY SUMMARY: identical=%d divergent=%d goopg-errored=%d upstream-errored=%d both-errored=%d",
 		b.identical, b.divergent, b.goopgErrored, b.upstreamErrored, b.bothErrored)
 
+	// Known divergences on the synthetic dataset. These are tracked
+	// by query number so newly introduced semantic drift fails closed.
+	knownDivergences := map[int]string{
+		1:  "numeric precision delta",
+		8:  "numeric precision delta",
+		14: "numeric precision delta",
+	}
+
 	// Hard expectation: every query that errored on goopg but
 	// succeeded on upstream is a real regression goopg must close.
 	for q := 1; q <= 22; q++ {
@@ -179,6 +186,25 @@ func TestTPCHResultParity(t *testing.T) {
 		if !m.gp.ok && m.up.ok {
 			t.Errorf("Q%d goopg errored while upstream succeeded (%d rows): %s",
 				q, len(m.up.rows), m.gp.err)
+		}
+
+		if m.gp.ok && m.up.ok {
+			ri, ci := firstDiff(m.gp.rows, m.up.rows)
+			hasDiff := ri != -1 || ci != -1
+			_, allowlisted := knownDivergences[q]
+			switch {
+			case hasDiff && !allowlisted:
+				if ci == -2 {
+					t.Errorf("Q%d unexpected parity divergence: row counts differ goopg=%d upstream=%d",
+						q, len(m.gp.rows), len(m.up.rows))
+				} else {
+					t.Errorf("Q%d unexpected parity divergence at row=%d col=%d: goopg=%q upstream=%q",
+						q, ri, ci, m.gp.rows[ri][ci], m.up.rows[ri][ci])
+				}
+			case !hasDiff && allowlisted:
+				t.Errorf("Q%d now matches upstream; remove stale known-divergence entry (%s)",
+					q, knownDivergences[q])
+			}
 		}
 	}
 }
