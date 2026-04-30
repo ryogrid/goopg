@@ -1,103 +1,104 @@
 # REF-002: B-Tree Index
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-The B-Tree index provides ordered key→ItemPointer lookups for
-primary keys, unique indexes, and non-unique indexes. goopg's
-implementation is a Lehman-Yao B-link-tree with high-key-based
-right-link recovery, matching the PostgreSQL approach.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+PostgreSQL's B-tree implementation in `nbtree` extends the basic
+Lehman-Yao B-link-tree with several critical features not present
+in goopg.
 
-**Package:** `internal/access/btree/`
+### Page Deletion (`_bt_pagedel`)
 
-### Key Types
+When a page becomes empty (all items moved to the right sibling
+during splits, or deleted by VACUUM), PostgreSQL removes it from
+the tree by:
 
-- `BTree` — one per index relation. Holds a reference to the storage
-  `Pool` for page I/O.
-- `BTreeMeta` — the metapage (root block number, level count,
-  fast-root for single-page optimisation).
-- `item` — an on-page entry containing `key []byte` and
-  `ptr ItemPointer` (block + slot in the heap).
-- `BTreeOpaque` — per-page header (level, isLeaf, high key,
-  right-sibling link).
+1. **Lock** the page, its left sibling, and its parent.
+2. **Unlink** the page by updating the left sibling's `op.next`
+   pointer to skip the deleted page.
+3. **Recycle** the page (add to the free space map for reuse).
 
-### Data Flow (Search)
+This prevents the tree from growing monotonically. goopg does not
+implement page deletion, so the tree grows without bound as
+INSERTs and UPDATEs occur.
 
-```
-BTree.Search(key)
-  ├─ readMeta() — get root block
-  └─ descendToLeaf(key)
-       ├─ pinR(root), readOpaque, findChildBlock → next block
-       ├─ repeat until leaf
-       └─ linear scan of leaf items for matching key
-```
+### Dedup (PostgreSQL 13+)
 
-### Page Structure
+When multiple index entries have identical keys, PostgreSQL can
+store them as a single "dedup" entry with multiple ItemPointers.
+This reduces index size and fan-out. goopg always stores one
+entry per tuple.
 
-Each B-tree page:
-```
-[PageHeader][BTreeOpaque][item_1][item_2]...[item_N][free space]
-```
+### Fast Root Optimisation
 
-Items are stored in sorted order. The opaque header contains the
-level, leaf flag, high key (rightmost key of the left-sibling
-after a split), and next-block pointer for right-link recovery.
+When the entire tree fits on a single page, PostgreSQL keeps it
+as a "root-only" tree with no internal pages. The `BTreeMeta`'s
+`fastroot` / `fastlevel` fields support this. goopg has the
+metapage fields (`FastRoot`, `FastLevel`) but always traverses
+through the normal root path.
 
-### Splits
+### Incomplete Split Recovery
 
-When `insertIntoBlock` finds no space on the leaf, it:
-1. Pins a freshly-extended block as the right sibling.
-2. Redistributes items (half stay, half go right).
-3. Stamps high keys and sets `op.Next` links.
-4. Walks up the parent path to insert a separator key.
+If a crash occurs during a page split, the B-tree might be in an
+inconsistent state with the left page's high key still referencing
+the right page but the parent not yet updated. PostgreSQL detects
+this during search by following right-link chains (`op.next`).
+goopg has the same right-link recovery logic in `descendToLeaf`.
 
-The global `splitMu` serialises concurrent splits on the same
-tree. Non-split inserts on different leaves run without the lock.
+### Sort Build (`_bt_spool` + `_bt_leafbuild`)
 
-### Insert (non-split)
+PostgreSQL builds indexes by:
+1. **Sort** all tuples into key order using a dedicated sort
+   operation (`_bt_spool`).
+2. **Bulk-load** the sorted tuples into leaf pages, creating
+   internal pages bottom-up (`_bt_leafbuild`).
 
-```
-BTree.Insert(key, ptr)
-  ├─ tryInsertNoSplit → descendToLeaf, pinW(leaf),
-  │    insertItemSorted, MarkDirty (or MarkDirtyChangeRecord)
-  └─ on overflow → splitMu, retry via insertIntoBlock
-```
+This is O(N log N) with sequential I/O, far faster than the
+row-by-row insertion that goopg uses, which is O(N log N) with
+random I/O. For a 1M-row table, this is the difference between
+seconds and minutes.
 
-## PostgreSQL Implementation
+### GiST and SP-GiST
 
-PostgreSQL's B-tree (`nbtree`) is a Lehman-Yao B-link-tree with
-several additional features:
+PostgreSQL also implements GiST (Generalised Search Tree) and
+SP-GiST (Space-Partitioned GiST) for geometric, full-text, and
+other non-default data types. goopg only supports B-tree.
 
-- **Dedicated sort for index build** — `_bt_spool` + `_bt_leafbuild`
-  (sort then bulk-load) instead of row-by-row insertion.
-- **Page deletion** — pages are not just split but also merged
-  when they become empty (`_bt_pagedel`).
-- **Dedup** — PostgreSQL 13+ optionally deduplicates duplicate keys.
-- **Incomplete splits** — if a split crashes partway, the
-  right-link chain allows recovery.
-- **Fast root optimisation** — if the entire tree fits on one page,
-  PostgreSQL keeps it as a "root-only" tree with no internal pages.
-  goopg has a `FastRoot`/`FastLevel` but does not currently
-  exploit it for single-page trees.
+## goopg Improvement Analysis
 
-### Key Differences
+### P0: Bulk-Load for Index Creation
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Insert order | Any order | Bulk-load for initial build |
-| Page deletion | None (VACUUM may reclaim later) | `_bt_pagedel` on empty pages |
-| Split serialisation | `splitMu` mutex | Lock coupling with right-link recovery |
-| High key semantics | Copied from original page | Strictly less than right page's minimum |
-| Key encoding | Binary `encodeProbeKey` | `_bt_compare` with type-specific callbacks |
+Replace the row-by-row `Insert` loop in index creation with a
+sort-then-bulk-load approach:
 
-## Potential Optimisations or Corrections
+1. Collect all (key, ItemPointer) pairs into a slice.
+2. Sort by key using `sort.Slice`.
+3. Build leaf pages sequentially (fill each page, chain via
+   `op.next`).
+4. Build internal pages bottom-up from the leaf level.
 
-- **Bulk-load on initial index creation** would dramatically speed
-  up `pgbench -i` (currently 30+s for scale-3 primary keys).
-- **Page deletion** would let DROP/VACUUM reclaim space.
-- **Lock-free split** (lock coupling) would remove `splitMu`
-  contention under heavy concurrent INSERT workloads.
+**Impact on pgbench -i:** The "primary keys" phase (31s at
+scale=3) would drop to < 2s. This is the single largest
+optimisation for data loading.
+
+### P1: Page Deletion
+
+Implement `deletePage(blk)` that:
+1. Locks the page, its left sibling, and the parent (via `splitMu`).
+2. Updates the left sibling's `op.next`.
+3. Marks the page as free for reuse.
+
+**Impact:** Prevents unbounded index growth under heavy
+UPDATE/DELETE workloads.
+
+### P2: Dedup
+
+When inserting a duplicate key, instead of creating a new `item`,
+append the ItemPointer to the existing item's list.
+
+**Impact:** Reduces index size for non-unique indexes with many
+duplicate keys.
 
 ## References
 
@@ -106,3 +107,5 @@ several additional features:
 - PG insert: `postgres/src/backend/access/nbtree/nbtinsert.c`
 - PG search: `postgres/src/backend/access/nbtree/nbtsearch.c`
 - PG sort/build: `postgres/src/backend/access/nbtree/nbtsort.c`
+- PG page deletion: `postgres/src/backend/access/nbtree/nbtdel.c`
+- PG dedup: `postgres/src/backend/access/nbtree/nbtdedup.c`

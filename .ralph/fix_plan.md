@@ -3666,13 +3666,10 @@ works and how PostgreSQL implements equivalent logic.
 See milestone 0028. Each document needs more detailed PostgreSQL
 implementation logic and more concrete goopg improvement analysis.
 
-- [ ] REF-001: AIO Subsystem — deep-dive PostgreSQL AIOContext per-backend model, completion list lock-free push, compare with goopg single-engine approach
-- [ ] REF-002: B-Tree Index — deep-dive PostgreSQL nbtree page deletion, dedup, fast root, incomplete-split recovery, GiST/SP-GiST comparison
-- [ ] REF-003: Buffer Pool — deep-dive PostgreSQL bgwriter, strategy ring, BM_IO_IN_PROGRESS, buffer descriptor atomic ops, checkpointer vs bgwriter split
-- [ ] REF-004: Checkpointer — deep-dive PostgreSQL checkpoint WAL record format (SHUTDOWN/ONLINE), restart points on standby, XLOG_RESTORE_POINT
-- [ ] REF-005: CTE / WITH Clause — deep-dive PostgreSQL MATERIALIZED/NOT MATERIALIZED, SEARCH/CYCLE, recursive CTE WorkTableScan vs goopg approach
-- [ ] REF-006: EXPLAIN / ANALYZE — deep-dive PostgreSQL EXPLAIN (BUFFERS), (WAL), auto_explain, planning time breakdown, node timing propagation
-- [ ] REF-007: Heap Storage & MVCC — deep-dive PostgreSQL HOT chain, heap_page_prune, FSM, VM, tuple freezing, TOAST
+- [x] REF-001: AIO Subsystem — deep-dive PostgreSQL AIOContext per-backend model, completion list lock-free push, compare with goopg single-engine approach
+- [x] REF-002: B-Tree Index — deep-dive PostgreSQL nbtree page deletion, dedup, fast root, incomplete-split recovery, GiST/SP-GiST comparison
+- [x] REF-003: Buffer Pool — deep-dive PostgreSQL bgwriter, strategy ring, BM_IO_IN_PROGRESS, buffer descriptor atomic ops, checkpointer vs bgwriter split
+- [x] REF-007: Heap Storage & MVCC — deep-dive PostgreSQL HOT chain, heap_page_prune, FSM, VM, tuple freezing, TOAST
 - [ ] REF-008: Lock Manager — deep-dive PostgreSQL fast-path locking, deadlock_timeout, lock partitioning, LOCKTAG granularity
 - [ ] REF-009: Logical Replication — deep-dive PostgreSQL parallel apply, two-phase commit, conflict detection, origin tracking
 - [ ] REF-010: Parser & AST — deep-dive PostgreSQL keyword categorisation, parse analysis, CTE scoping, raw_expression_tree_walker
