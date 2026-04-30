@@ -318,6 +318,26 @@ func TestPort_PgStatActivity(t *testing.T) {
 	}
 }
 
+// TestPort_PgStatActivityWaitEventsNull verifies Stage A columns
+// wait_event_type and wait_event are NULL.
+func TestPort_PgStatActivityWaitEventsNull(t *testing.T) {
+	c := newCluster(t, "pg_stat_activity_we")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	rows := runSQL(t, c, "SELECT wait_event_type, wait_event FROM pg_catalog.pg_stat_activity LIMIT 1")
+	if len(rows) == 0 {
+		t.Fatal("pg_stat_activity returned zero rows")
+	}
+	// In Stage A, both wait_event columns are NULL (empty string).
+	if rows[0][0] != "" {
+		t.Errorf("wait_event_type = %q, want empty (NULL)", rows[0][0])
+	}
+	if rows[0][1] != "" {
+		t.Errorf("wait_event = %q, want empty (NULL)", rows[0][1])
+	}
+}
+
 // TestPort_UnionAll verifies UNION ALL works end-to-end.
 func TestPort_UnionAll(t *testing.T) {
 	c := newCluster(t, "union_all")
