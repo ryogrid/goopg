@@ -187,6 +187,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	// DDL/Transaction) have empty schemas and emit only the command
 	// tag.
 	schema := node.Output()
+	// CALL plans have a dynamic schema that depends on the procedure's
+	// OUT params; the operator reports it after Open.
+	if schema == nil {
+		schema = op.Schema()
+	}
 	if len(schema) > 0 {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
@@ -264,6 +269,9 @@ func commandTagFor(node planner.Node, op executor.Operator, rowCount int64) stri
 	case *planner.Explain:
 		_ = n
 		return "EXPLAIN"
+	case *planner.Call:
+		_ = n
+		return "CALL"
 	}
 	// Read-shaped: SELECT N. Catches Project/Sort/Limit/Filter/Aggregate/
 	// Join/SeqScan/IndexScan/Values root nodes.

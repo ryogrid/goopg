@@ -74,10 +74,23 @@ func (o *callOp) Open(ctx *Context) error {
 		args[i] = d
 	}
 
-	// Match by argument count.
+	// Match by number of IN arguments. OUT/INOUT params are excluded
+	// from the arg count comparison since CALL doesn't require values
+	// for them.
+	inArgCount := len(st.Args)
 	matches := make([]*catalog.Routine, 0, 1)
 	for _, c := range routines {
-		if len(c.ArgTypes) == len(args) {
+		inCount := 0
+		for _, mode := range c.ArgModes {
+			if mode == "" || mode == "i" || mode == "b" {
+				inCount++
+			}
+		}
+		// If no ArgModes, all args are IN (backward compat).
+		if c.ArgModes == nil {
+			inCount = len(c.ArgTypes)
+		}
+		if inCount == inArgCount {
 			matches = append(matches, c)
 		}
 	}
@@ -118,35 +131,58 @@ func (o *callOp) Next() (Row, error) {
 	if o.ctx != nil {
 		*child = *o.ctx
 	}
-	child.Params = make([]Datum, len(o.args))
+	child.Params = make([]Datum, len(r.ArgTypes))
 	frame := newPLpgSQLFrame()
 
-	for i, arg := range o.args {
-		declared := catalog.Type{Name: "unknown"}
-		if i < len(r.ArgTypes) {
-			declared = normalizeCatalogType(r.ArgTypes[i])
-		}
+	argIdx := 0
+	for i := 0; i < len(r.ArgTypes); i++ {
+		declared := normalizeCatalogType(r.ArgTypes[i])
 		mode := "i"
 		if i < len(r.ArgModes) {
 			mode = r.ArgModes[i]
 		}
-		// OUT params get NULL input; INOUT and IN get the caller's value.
-		if mode == "o" {
+
+		switch mode {
+		case "o":
+			// OUT param: no caller value, default to NULL.
 			child.Params[i] = NullDatum
 			if i < len(r.ArgNames) && r.ArgNames[i] != "" {
 				_ = frame.add(r.ArgNames[i], declared, NullDatum)
 			}
-			continue
-		}
-		coerced, err := coerceDatumToType(arg, declared, o.plan.Stmt.Pos(), fmt.Sprintf("argument %d", i+1))
-		if err != nil {
-			return nil, err
-		}
-		child.Params[i] = coerced
-		if i < len(r.ArgNames) {
-			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
-				return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(), Message: err.Error()}
+		case "b":
+			// INOUT param: caller provides a value.
+			if argIdx >= len(o.args) {
+				return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(),
+					Message: "not enough arguments for procedure"}
 			}
+			coerced, err := coerceDatumToType(o.args[argIdx], declared, o.plan.Stmt.Pos(), fmt.Sprintf("argument %d", argIdx+1))
+			if err != nil {
+				return nil, err
+			}
+			child.Params[i] = coerced
+			if i < len(r.ArgNames) {
+				if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
+					return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(), Message: err.Error()}
+				}
+			}
+			argIdx++
+		default:
+			// IN param: caller provides a value.
+			if argIdx >= len(o.args) {
+				return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(),
+					Message: "not enough arguments for procedure"}
+			}
+			coerced, err := coerceDatumToType(o.args[argIdx], declared, o.plan.Stmt.Pos(), fmt.Sprintf("argument %d", argIdx+1))
+			if err != nil {
+				return nil, err
+			}
+			child.Params[i] = coerced
+			if i < len(r.ArgNames) {
+				if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
+					return nil, &ExecError{Code: "42P13", Pos: o.plan.Stmt.Pos(), Message: err.Error()}
+				}
+			}
+			argIdx++
 		}
 	}
 
