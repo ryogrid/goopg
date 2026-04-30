@@ -137,10 +137,11 @@ Their backend entries must also be registered in the activity registry
 | `DataFileWrite`           | ✅ Done   | `storage/smgr.go` WriteBlock (hook)     |
 | `DataFileExtend`          | ✅ Done   | `storage/smgr.go` Extend (hook)         |
 | `DataFileSync`            | ✅ Done   | `storage/smgr.go` Sync (hook)           |
-| `WALRead/Write/Sync`      | ⬜ Pending| `wal/writer.go` ops path                |
-| `BufferPin`               | ⬜ Pending| `storage/bufpool.go` Pin wait           |
-| `CheckpointerMain`        | ✅ Done   | `cmd/goopg/main.go` goroutine wrapper   |
-| `WalWriterMain`           | ⬜ Pending| `wal/writer.go` loop                    |
+| `WALRead/Write`           | ⬜ Pending| `wal/writer.go` state-loop goroutine |
+| `WALSync`                 | ✅ Done   | `wal/writer.go` FlushUpTo (hook)     |
+| `BufferPin`               | ⬜ Pending| `storage/bufpool.go` Pin wait        |
+| `CheckpointerMain`        | ✅ Done   | `cmd/goopg/main.go` goroutine wrapper|
+| `WalWriterMain`           | ⬜ Pending| `wal/writer.go` state-loop goroutine |
 | `BuffileRead/Write`       | ⬜ Pending| temporary file I/O in executor           |
 | `WalSenderMain`           | ⬜ Pending| replication walsender                    |
 

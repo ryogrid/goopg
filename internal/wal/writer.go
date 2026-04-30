@@ -280,6 +280,13 @@ type Writer struct {
 	// distinguish a long-form (segment-boundary) page header
 	// from a short-form one without having to thread cfg in.
 	segmentSize int64
+
+	// OnWALWrite and OnWALSync are optional hooks called before
+	// blocking WAL write / fdatasync operations.  The caller
+	// (initdb.Open) sets them via activity.LookupGoroutine so
+	// pg_stat_activity can report WALWrite / WALSync wait events.
+	OnWALWrite func()
+	OnWALSync  func()
 }
 
 type state struct {
@@ -651,6 +658,9 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 func (w *Writer) FlushUpTo(lsn uint64) error {
 	if lsn == 0 {
 		return nil
+	}
+	if w.OnWALSync != nil {
+		w.OnWALSync()
 	}
 	resp := make(chan result, 1)
 	if err := w.send(op{kind: opFlush, lsn: lsn, resp: resp}); err != nil {

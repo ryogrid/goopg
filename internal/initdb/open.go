@@ -539,6 +539,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
+	// Wire WAL I/O wait-event hooks.
+	if walWriter != nil {
+		walWriter.OnWALSync = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitWALSync)
+			}
+		}
+	}
+
 	standby, err := IsStandby(abs)
 	if err != nil {
 		_ = mgr.Close()

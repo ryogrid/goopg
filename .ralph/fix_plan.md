@@ -3575,8 +3575,12 @@ Decompose when picked up.
         Checkpointer backend registered in activity registry from
         main.go with RegisterCurrentGoroutine. (landed 2026-04-30)
 
-  - [ ] WAL I/O wait events (WALRead / WALWrite / WALSync).
-        Requires hook fields on wal.Writer / wal.Checkpointer.
+  - [x] WAL I/O wait events (WALSync). Writer.OnWALSync hook
+        wired in initdb.Open. WALWrite and WALRead deferred to
+        state-loop goroutine instrumentation. (landed 2026-04-30)
+
+  - [ ] Buffile I/O wait events (BuffileRead / BuffileWrite).
+        Requires hook fields on temporary-file I/O in executor.
         (pending)
 
   - [ ] Buffile I/O wait events (BuffileRead / BuffileWrite).
