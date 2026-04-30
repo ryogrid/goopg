@@ -3580,7 +3580,7 @@ E2E scenario tests remain:
 - [x] Logical streaming replication TAP test — SKIPPED: requires DDL WAL records
 - [x] Read Committed isolation TAP test — done: per-statement txn sees committed data
 - [x] PL/pgSQL E2E scenario test — done: procedure calling function, nested calls
-- [x] pgbench workload TAP test — SKIPPED: LD_LIBRARY_PATH not configurable via cluster.PGbench()
+- [x] pgbench workload TAP test — done: init + select-only via pgbench CLI
 - [x] DDL+DML mixed scenario test — done: CREATE → INSERT → ALTER → SELECT → DROP
 - [x] Concurrent-session test — done: two sessions, concurrent SELECT + UPDATE
 - [ ] WAL redo / crash-recovery TAP test (basic smoke test of WAL replay)
