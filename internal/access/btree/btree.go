@@ -604,6 +604,51 @@ func findChildBlock(items []item, key []byte) storage.BlockNumber {
 	return items[idx-1].ptr.Block
 }
 
+// findChildBlockDirect binary-searches an internal B-tree page for the
+// child block to descend into for `key`, without decoding all items
+// first.  Replaces the pageItems + findChildBlock pair (which allocated
+// a slice of all items on every descent).  M0027-0001.
+func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("btree: empty internal page")
+	}
+	// Binary search across line pointers.
+	n := count
+	idx := sort.Search(n, func(i int) bool {
+		raw, err := storage.PageGetItemRaw(p, uint16(i+1))
+		if err != nil {
+			return true // will surface at the final error check
+		}
+		it, err := parseItem(raw)
+		if err != nil {
+			return true
+		}
+		return CompareKeys(it.key, key) > 0
+	})
+	// sort.Search returns [0, n]; idx==n means all items ≤ key.
+	if idx >= n {
+		idx = n - 1
+	} else if idx > 0 {
+		// idx is the first item with key > search_key;
+		// child is the preceding item (last one ≤ key).
+		idx--
+	}
+	// idx==0 stays 0: first child.
+	raw, err := storage.PageGetItemRaw(p, uint16(idx+1))
+	if err != nil {
+		return 0, err
+	}
+	it, err := parseItem(raw)
+	if err != nil {
+		return 0, err
+	}
+	return it.ptr.Block, nil
+}
+
 // descendToLeaf walks from the current root to the leaf containing
 // `key`. Each page is read under a shared content latch, and the
 // classic Lehman-Yao right-link recovery handles the case where a
@@ -642,16 +687,15 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 			return cur, path, nil
 		}
 
-		items, err := pageItems(slot.Page())
+		// Binary-search the internal page directly, without decoding
+		// all items (avoids allocation & linear decode — M0027-0001).
+		child, err := findChildBlockDirect(slot.Page(), key)
 		bt.unpinR(slot)
 		if err != nil {
 			return 0, nil, err
 		}
-		if len(items) == 0 {
-			return 0, nil, fmt.Errorf("btree: empty internal page %d", cur)
-		}
 		path = append(path, cur)
-		cur = findChildBlock(items, key)
+		cur = child
 	}
 }
 
