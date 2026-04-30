@@ -1,6 +1,6 @@
 # Milestone 0025 — OLTP Performance Analysis & Bottleneck Identification
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** Milestone 0003 (HammerDB TPC-H workload), Milestone 0022 (pg_stat_activity + wait events), Milestone 0023 (syntax test suite for correctness verification).
 **Drives:** Evidence-based optimisation roadmap for goopg's short-transaction (OLTP) processing path — primarily the `pgbench -c 1 -t 100` (default, TPC-B-like) workload.
 
