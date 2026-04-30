@@ -2428,7 +2428,8 @@ Decomposition + design docs land when this milestone is picked up.
         `go test ./...` green.)
 
 - [ ] Stage B: procedure follow-up (CREATE PROCEDURE, CALL,
-      out-parameter binding).
+      out-parameter binding). Steps 1-4 landed; out-parameter
+      binding (INOUT/OUT return from CALL) remains.
 
   - [x] Stage B step 1 — parser + AST + keyword registration.
         (landed 2026-04-30: `KwProcedure` / `KwCall` / `KwOut` /
@@ -2460,6 +2461,15 @@ Decomposition + design docs land when this milestone is picked up.
         catalog registration, duplicate rejection (42723),
         unsupported language (42704), and end-to-end CALL
         execution. Full `go test ./...` green.)
+
+  - [x] Stage B step 4 — DROP PROCEDURE parser + planner +
+        executor. (landed 2026-04-30: `DropProcedureStmt` AST
+        node, `parseDropProcedureTail` parser (mirrors
+        `parseDropFunctionTail`), planner DDL pass-through,
+        and `execDropProcedure` executor handler. Supports
+        IF EXISTS, arg-based overload resolution, and
+        CASCADE/RESTRICT. 3 new parser tests. Full
+        `go test ./...` green.)
 
 ## Milestone 0016 — WITH clause (CTE) support
 
