@@ -138,6 +138,8 @@ func Build(plan planner.Node) (Operator, error) {
 		// then, fall through with a stable feature-not-supported
 		// error rather than a generic "unsupported plan node".
 		return nil, &ExecError{Code: "0A000", Pos: p.Pos(), Message: "COPY is driven from the wire layer; planner.Copy has no executor path yet"}
+	case *planner.Call:
+		return newCallOp(p), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: fmt.Sprintf("unsupported plan node %T", plan)}
 }

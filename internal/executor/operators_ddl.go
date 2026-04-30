@@ -68,6 +68,8 @@ func (o *ddlOp) Next() (Row, error) {
 		return nil, o.execCreateFunction(s)
 	case *parser.DropFunctionStmt:
 		return nil, o.execDropFunction(s)
+	case *parser.CreateProcedureStmt:
+		return nil, o.execCreateProcedure(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -700,6 +702,47 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
+		if errors.Is(err, catalog.ErrRoutineExists) {
+			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
+		}
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// execCreateProcedure registers a procedure in the catalog's
+// Routines() registry (M0015 Stage B). Mirror of execCreateFunction
+// but without RETURNS — procedures use OUT/INOUT params instead.
+func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
+	}
+	lang := strings.ToLower(s.Language)
+	if lang == "" {
+		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
+	}
+	if lang != "plpgsql" && lang != "sql" {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
+	}
+	argTypes := make([]catalog.Type, len(s.Args))
+	argNames := make([]string, len(s.Args))
+	for i, a := range s.Args {
+		argTypes[i] = catalog.Type{
+			Name: strings.ToLower(a.Type.Name),
+			Args: append([]int64(nil), a.Type.Args...),
+		}
+		argNames[i] = a.Name
+	}
+	r := &catalog.Routine{
+		Schema:   s.Name.Schema,
+		Name:     s.Name.Name,
+		ArgNames: argNames,
+		ArgTypes: argTypes,
+		Language: lang,
+		Body:     s.Body,
+	}
+	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
 		}

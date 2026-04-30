@@ -661,6 +661,16 @@ type Checkpoint struct{ pos int }
 func (n *Checkpoint) Pos() int       { return n.pos }
 func (n *Checkpoint) Output() Schema { return nil }
 
+// Call — `CALL proc(...)`. Holds the parsed call statement so the
+// executor can resolve and execute the procedure.
+type Call struct {
+	pos  int
+	Stmt *parser.CallStmt
+}
+
+func (n *Call) Pos() int       { return n.pos }
+func (n *Call) Output() Schema { return nil }
+
 // Explain — `EXPLAIN <stmt>`. Wraps the planned inner node so
 // the executor can render it as a single-column QUERY PLAN
 // text result-set without re-running planning. The Options

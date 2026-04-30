@@ -56,7 +56,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateIndexStmt, *parser.DropIndexStmt,
 		*parser.CreateViewStmt, *parser.DropViewStmt,
 		*parser.TruncateStmt, *parser.AlterTableStmt,
-		*parser.CreateFunctionStmt, *parser.DropFunctionStmt:
+		*parser.CreateFunctionStmt, *parser.DropFunctionStmt,
+		*parser.CreateProcedureStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
@@ -94,6 +95,9 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 
 	case *parser.CopyStmt:
 		return planCopy(s, cat)
+
+	case *parser.CallStmt:
+		return &Call{pos: s.Pos(), Stmt: s}, nil
 	}
 	return nil, &PlanError{
 		Pos:     stmt.Pos(),

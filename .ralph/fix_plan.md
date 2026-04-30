@@ -2229,9 +2229,10 @@ for the full DoD. Substantial milestone — large surface area
 (parser + analyzer + plpgsql interpreter + catalog + executor).
 Decomposition + design docs land when this milestone is picked up.
 
-- [ ] Stage A: function-first delivery (CREATE OR REPLACE FUNCTION
+- [x] Stage A: function-first delivery (CREATE OR REPLACE FUNCTION
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
+      (landed 2026-04-30: all 6 steps done.)
 
   - [x] Stage A step 6 — function invocation in expression contexts.
         (landed 2026-04-30: runtime wiring. `evalFuncCall` now
@@ -2428,6 +2429,24 @@ Decomposition + design docs land when this milestone is picked up.
 
 - [ ] Stage B: procedure follow-up (CREATE PROCEDURE, CALL,
       out-parameter binding).
+
+  - [x] Stage B step 1 — parser + AST + keyword registration.
+        (landed 2026-04-30: `KwProcedure` / `KwCall` / `KwOut` /
+        `KwInout` / `KwVariadic` keywords registered.
+        `CreateProcedureStmt` and `CallStmt` AST nodes added.
+        `parseCreateProcedureTail` / `parseCallStatement` in
+        function.go. 7 new parser tests. Full `go test ./...`
+        green.)
+
+  - [x] Stage B step 2 — planner + executor DDL pass-through for
+        CREATE PROCEDURE. (landed 2026-04-30:
+        `*parser.CreateProcedureStmt` routed through planner DDL
+        pass-through; `execCreateProcedure` in executor DDL handler
+        mirrors `execCreateFunction` but without RETURN clause.
+        `planner.Call` node for `CALL` statements wired through
+        planner; `callOp` executor returns a clear Stage-B-not-
+        implemented diagnostic for CALL. Full `go test ./...`
+        green.)
 
 ## Milestone 0016 — WITH clause (CTE) support
 
