@@ -133,16 +133,16 @@ Their backend entries must also be registered in the activity registry
 | `ClientWrite`             | ✅ Done   | `protocol/frame.go` hooks          |
 | `AIO`                     | ✅ Done   | `aio/aio.go` Handle.Wait           |
 | `relation` (lock)         | ✅ Done   | `executor/context.go` acquireRelLock |
-| `DataFileRead`            | ⬜ Pending| `storage/smgr.go` ReadBlock        |
-| `DataFileWrite`           | ⬜ Pending| `storage/smgr.go` WriteBlock       |
-| `DataFileExtend`          | ⬜ Pending| `storage/smgr.go` Extend           |
-| `DataFileSync`            | ⬜ Pending| `storage/smgr.go` Sync             |
-| `WALRead/Write/Sync`      | ⬜ Pending| `wal/writer.go` ops path           |
-| `BufferPin`               | ⬜ Pending| `storage/bufpool.go` Pin wait      |
-| `CheckpointerMain`        | ⬜ Pending| `wal/checkpointer.go` Run          |
-| `WalWriterMain`           | ⬜ Pending| `wal/writer.go` loop               |
-| `BuffileRead/Write`       | ⬜ Pending| temporary file I/O in executor     |
-| `WalSenderMain`           | ⬜ Pending| replication walsender              |
+| `DataFileRead`            | ✅ Done   | `storage/smgr.go` ReadBlock (hook)      |
+| `DataFileWrite`           | ✅ Done   | `storage/smgr.go` WriteBlock (hook)     |
+| `DataFileExtend`          | ✅ Done   | `storage/smgr.go` Extend (hook)         |
+| `DataFileSync`            | ✅ Done   | `storage/smgr.go` Sync (hook)           |
+| `WALRead/Write/Sync`      | ⬜ Pending| `wal/writer.go` ops path                |
+| `BufferPin`               | ⬜ Pending| `storage/bufpool.go` Pin wait           |
+| `CheckpointerMain`        | ✅ Done   | `cmd/goopg/main.go` goroutine wrapper   |
+| `WalWriterMain`           | ⬜ Pending| `wal/writer.go` loop                    |
+| `BuffileRead/Write`       | ⬜ Pending| temporary file I/O in executor           |
+| `WalSenderMain`           | ⬜ Pending| replication walsender                    |
 
 ## Reference
 

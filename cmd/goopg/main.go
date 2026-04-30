@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
@@ -373,6 +374,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if rt != nil && rt.Checkpointer != nil {
 		go func() {
 			defer close(cpDone)
+			// Register the checkpointer backend in the activity registry
+			// so its wait events (CheckpointerMain) are visible.
+			if act := rt.Activity; act != nil {
+				cpPID := "cp-0"
+				act.Register(&activity.Backend{
+					PID:         cpPID,
+					BackendType: "checkpointer",
+					State:       "active",
+					BackendStart: time.Now().UTC().Format(time.RFC3339Nano),
+				})
+				activity.RegisterCurrentGoroutine(act, cpPID)
+				defer activity.ClearCurrentGoroutine()
+			}
 			_ = rt.Checkpointer.Run(cpCtx)
 		}()
 	} else {
