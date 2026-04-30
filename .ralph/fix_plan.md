@@ -3571,10 +3571,19 @@ Decompose when picked up.
 
 See `docs/milestones/0023-comprehensive-syntax-integration-test-suite.md`.
 
-All items completed. 35 tests across 8 files covering DDL, DML,
-SELECT, JOIN, GROUP BY, subqueries, CASE, UPSERT, window functions,
-row locking, EXPLAIN, transactions, pg_catalog views, PL/pgSQL,
-recursive CTEs, and error code verification. Full `go test ./...` green.
+35 syntax tests landed (DDL / DML / SELECT / JOIN / GROUP BY /
+subqueries / CASE / UPSERT / window / row locking / EXPLAIN /
+transactions / pg_catalog / PL/pgSQL / recursive CTE / error codes).
+E2E scenario tests remain:
+
+- [ ] Physical streaming replication TAP test (primary ↔ standby)
+- [ ] Logical streaming replication TAP test (slot, publication, subscription, apply)
+- [ ] Read Committed isolation TAP test (concurrent txns, dirty-read prevention)
+- [ ] PL/pgSQL E2E scenario test (procedure calling function, nested calls)
+- [ ] pgbench workload TAP test (init + simple + complex via pgbench CLI)
+- [ ] DDL+DML mixed scenario test (CREATE → INSERT → ALTER → SELECT → DROP chain)
+- [ ] Concurrent-session test (two sessions, SELECT + UPDATE isolation)
+- [ ] WAL redo / crash-recovery TAP test (basic smoke test of WAL replay)
 
 ## Notes
 

@@ -1,6 +1,6 @@
 # Milestone 0023 - Comprehensive Syntax Integration Test Suite
 
-**Status:** accepted
+**Status:** planned
 **Depends on:** All preceding milestones (M0007-M0022) — every syntax feature shipped by those milestones must have at least one end-to-end test in this suite.
 **Drives:** Go-portable TAP-style integration tests that exercise every implemented SQL statement family through both the Go-native wire protocol (`database/sql` via lib/pq) and the `psql` CLI. This suite is the goopg equivalent of PostgreSQL's `src/bin/psql/t/` and `src/test/regress/` TAP tests.
 
@@ -98,13 +98,30 @@ When `psql` is available on the system PATH or at the in-tree path (`postgres/lo
 
 All tests must work WITHOUT `psql`. The Go-native `Cluster.Query` path is the primary test mechanism. psql cross-checks are gated by `psqlPath(t)` and skipped when psql is not found.
 
+### E2E Scenario Tests
+
+Beyond per-statement syntax coverage, the suite must exercise
+end-to-end (E2E) scenarios that span multiple statements and
+involve the full goopg stack (parser → analyzer → planner →
+executor → wire protocol → client):
+
+| Scenario | Description | Tools |
+|----------|-------------|-------|
+| Physical streaming replication | Primary + standby pair via `replcluster`. INSERT on primary, verify visibility on standby after streaming | `replcluster`, `Query`, `PSQL` |
+| Logical streaming replication | Create publication + slot + subscription, INSERT on primary, verify apply on standby | `replcluster`, `Query` |
+| Read Committed isolation | Two concurrent sessions: begin txn on session A, INSERT on session B, verify session A does NOT see uncommitted row (dirty-read prevention) | Two `Cluster` connections, `Query` |
+| PL/pgSQL nested scenario | Procedure calls function, function calls another function, all in one CALL | `Query` |
+| pgbench workload | Run `pgbench -i` (init), then `pgbench -S -t 10` (select-only), `pgbench -N -t 10` (simple update), verify all succeed | `PGbench` |
+| DDL+DML mixed chain | CREATE TABLE → INSERT → ALTER TABLE ADD COLUMN → UPDATE → SELECT → DROP TABLE, all in sequence | `Query` |
+| Concurrent session isolation | Two sessions SELECT + UPDATE same row: verifies one blocks, the other commits, blocked session sees updated value | Two `Cluster` connections |
+| WAL redo / crash recovery | Basic smoke test: insert data, simulate WAL replay by reading WAL records | `Query` + catalog check |
+
 ## Out of Scope
 
 - Full SQL-parser-level negative testing (syntax error coverage).
 - Performance/benchmark tests (those belong in `internal/testutil/tpch/`).
 - Cross-version compatibility with upstream PostgreSQL.
 - Randomized or fuzz testing.
-- Distributed/concurrent test scenarios beyond basic row-locking.
 
 ## Required Design Docs
 
