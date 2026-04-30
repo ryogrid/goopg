@@ -1498,9 +1498,11 @@ See `docs/milestones/0009-aio-subsystem.md`.
 - [ ] AIO wait-event surface: register a
       "waiting on AIO completion" wait event so a query
       stalled on an AIO Wait shows up identifiably in the
-      pg_stat_activity-shaped surface. The pg_stat_activity
-      infrastructure now exists (M0022 Stage A landed
-      2026-04-30), so this task is UNBLOCKED.
+      pg_stat_activity-shaped surface. Infrastructure landed
+      (OnWaitStart/OnWaitEnd hooks on aio.Engine, SetWaitEvent
+      on aio.Handle). Remaining: wire hooks from executor
+      (or storage.Pool) so each backend's activity registry
+      entry is updated around Handle.Wait().
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 
