@@ -763,7 +763,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "substr", "substring":
 		return evalSubstr(x, row, ctx)
 	}
-	return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %s does not exist", x.Name)}
+	return evalStoredRoutineFuncCall(x, row, ctx)
 }
 
 // evalToDate implements PostgreSQL's `to_date(text, text)` for the
