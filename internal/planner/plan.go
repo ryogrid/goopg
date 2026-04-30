@@ -733,3 +733,16 @@ type Copy struct {
 
 func (n *Copy) Pos() int       { return n.pos }
 func (n *Copy) Output() Schema { return n.schema }
+
+// SetOp represents a UNION [ALL] set operation. v0 supports UNION ALL
+// only; UNION DISTINCT, INTERSECT, and EXCEPT are rejected by the
+// analyzer.
+type SetOp struct {
+	pos   int
+	Left  Node
+	Right Node
+	All   bool
+}
+
+func (n *SetOp) Pos() int       { return n.pos }
+func (n *SetOp) Output() Schema { return n.Left.Output() }

@@ -2612,12 +2612,11 @@ out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
 
 - [ ] (BLOCKED) Recursive CTE fixpoint execution
       (M0016-0003). Hard prereq: `UNION ALL` planner +
-      executor support, which goopg's planner currently
-      rejects with `0A000 set operations are not supported`.
-      Recursive CTEs are inherently `WITH RECURSIVE r AS
-      (anchor UNION [ALL] recursive_member) SELECT ...`
-      shaped, so this slice can't ship without UNION ALL
-      first. Once UNION ALL lands, this slice does the
+      executor support — now landed (2026-04-30: design doc
+      `docs/design/0016-0003-union-all-planner-and-executor.md`,
+      analyzer accepts UNION ALL, `planner.SetOp` node,
+      `executor.setOp` operator. Full `go test ./...` green).
+      Once UNION ALL shipped, this slice does the
       anchor/recursive-member detection, planner-side
       fixpoint scan node, executor iteration, cycle-safe
       termination, and unsupported-recursive-shape

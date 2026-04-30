@@ -317,3 +317,37 @@ func TestPort_PgStatActivity(t *testing.T) {
 		t.Errorf("backend_type = %q, want client_backend", row[2])
 	}
 }
+
+// TestPort_UnionAll verifies UNION ALL works end-to-end.
+func TestPort_UnionAll(t *testing.T) {
+	c := newCluster(t, "union_all")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// Use psql for this test to avoid any wire-protocol path issues.
+	psql := psqlPath(t)
+	if psql == "" {
+		t.Skip("psql not installed")
+	}
+
+	// Build the query args.
+	host, port, _ := strings.Cut(c.ListenAddr(), ":")
+	libDir := filepath.Join(repoRoot(t), "postgres", "local_install", "lib")
+	psqlArgs := []string{"-h", host, "-p", port, "-U", "postgres", "-d", "postgres",
+		"-Atqc", "SELECT 1 AS x UNION ALL SELECT 2 AS x UNION ALL SELECT 3 AS x"}
+
+	res, err := util.RunCommand(util.CommandSpec{
+		Name: psql,
+		Args: psqlArgs,
+		Env:  []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + libDir},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	if strings.TrimSpace(res.Stdout) != "1\n2\n3" {
+		t.Fatalf("stdout=%q, want \"1\\n2\\n3\"", res.Stdout)
+	}
+}

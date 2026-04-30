@@ -96,6 +96,17 @@ func Build(plan planner.Node) (Operator, error) {
 			return maybeInstrument(p, newUpsertOp(p, child)), nil
 		}
 		return maybeInstrument(p, newInsertOp(p, child)), nil
+	case *planner.SetOp:
+		left, err := Build(p.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := Build(p.Right)
+		if err != nil {
+			left.Close()
+			return nil, err
+		}
+		return maybeInstrument(p, newSetOp(p, left, right)), nil
 	case *planner.Update:
 		op, err := newUpdateOp(p)
 		if err != nil {

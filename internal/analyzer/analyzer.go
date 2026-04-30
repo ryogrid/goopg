@@ -177,7 +177,23 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		return analyzeError(s.Pos(), "0A000", "DISTINCT is not supported in v0 planner")
 	}
 	if s.SetOp != nil {
-		return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
+		if s.SetOp.Type != parser.SetOpUnion || !s.SetOp.All {
+			return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
+		}
+		// UNION ALL: analyze right side first (innermost first),
+		// then analyze left side with SetOp temporarily cleared
+		// to avoid infinite recursion.
+		if err := analyzeSelectWithParent(s.SetOp.Right, cat, parent); err != nil {
+			return err
+		}
+		saved := s.SetOp
+		s.SetOp = nil
+		err := analyzeSelectWithParent(s, cat, parent)
+		s.SetOp = saved
+		if err != nil {
+			return err
+		}
+		return nil
 	}
 
 	ctx := &scope{parent: parent, cat: cat}

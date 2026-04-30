@@ -203,11 +203,27 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	defer restore()
 
 	if s.SetOp != nil {
-		return nil, &PlanError{
-			Pos:     s.SetOp.Pos(),
-			Code:    "0A000",
-			Message: "set operations are not supported in v0 planner",
+		if !s.SetOp.All || s.SetOp.Type != parser.SetOpUnion {
+			return nil, &PlanError{
+				Pos:     s.SetOp.Pos(),
+				Code:    "0A000",
+				Message: "set operations are not supported in v0 planner",
+			}
 		}
+		// UNION ALL: plan right side first, then left side with
+		// SetOp temporarily cleared to avoid infinite recursion.
+		right, err := planSelect(s.SetOp.Right, cat)
+		if err != nil {
+			return nil, err
+		}
+		saved := s.SetOp
+		s.SetOp = nil
+		left, err := planSelect(s, cat)
+		s.SetOp = saved
+		if err != nil {
+			return nil, err
+		}
+		return &SetOp{pos: s.Pos(), Left: left, Right: right, All: true}, nil
 	}
 	if s.Distinct {
 		return nil, &PlanError{
