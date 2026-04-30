@@ -21,13 +21,11 @@ Potential Optimisations).
 | REF-013 | Tuple Format & Codec | ✅ Done |
 | REF-014 | UPSERT (ON CONFLICT) | ✅ Done |
 | REF-015 | WAL Format & I/O | ✅ Done |
-| REF-016 | WAL Buffer & Eviction | ⬜ Pending |
-| REF-017 | WAL Redo / Crash Recovery | ⬜ Pending |
-| REF-018 | Window Functions | ⬜ Pending |
-| REF-019 | pg_stat_activity & Wait Events | ✅ Done |
-| REF-020 | Row Locking (FOR UPDATE) | ✅ Done |
-| REF-021 | Protocol & Wire Format | ⬜ Pending |
-| REF-022 | Session & Transaction Management | ⬜ Pending |
-| REF-023 | Autovacuum | ⬜ Pending |
+| REF-016 | WAL Buffer & Eviction | ✅ Done |
+| REF-017 | WAL Redo / Crash Recovery | ✅ Done |
+| REF-018 | Window Functions | ✅ Done |
+| REF-021 | Protocol & Wire Format | ✅ Done |
+| REF-022 | Session & Transaction Management | ✅ Done |
+| REF-023 | Autovacuum | ✅ Done |
 
-Total: 23 planned, 17 completed (as of 2026-05-01).
+Total: 23 planned, 23 completed (as of 2026-05-01).
