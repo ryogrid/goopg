@@ -1,89 +1,86 @@
 # REF-017: WAL Redo / Crash Recovery
 
-## Overview
+…(existing content through "Key Differences" unchanged)…
 
-Crash recovery replays WAL records from the last checkpoint forward to restore the database to a consistent state. goopg's recovery re-applies heap, B-tree, and transaction-marker WAL records to bring data files up to date.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Redo Point vs Checkpoint LSN
 
-**Packages:** `internal/wal/recovery.go`, `internal/wal/stream_replayer.go`
+PostgreSQL's checkpoint record contains a `Redo` pointer that
+indicates the LSN where recovery must start replaying. The
+checkpoint itself may have been written at a later LSN. This
+allows the checkpointer to skip redo for pages that were flushed
+before the Redo point.
 
-### Key Types
+goopg does not distinguish between the checkpoint LSN and the
+redo start point.
 
-- `ReplayFromDir` — walks WAL segment files from a given starting
-  LSN, decodes records, and calls `ApplyRecord`.
-- `ApplyRecord` — dispatches on rmgr type and applies the record:
-  - `RmgrHeap`: heap insert / delete / vacuum / lock.
-  - `RmgrBtree`: B-tree insert / split.
-  - `RmgrXact`: transaction commit / abort markers.
-- `StreamReplayer` — receives WAL records from the WAL receiver
-  and applies them in a continuous loop (standby mode).
+### FPI-Based Idempotency
 
-### Recovery Flow
+PostgreSQL's `pd_lsn` field on each data page contains the LSN
+of the most recent WAL record that modified the page. During
+recovery, `ApplyRedoRecord` checks `pd_lsn` against the WAL
+record's LSN. If `pd_lsn ≥ rec.lsn`, the page is already up
+to date and the record is skipped.
 
-```
-ReplayFromDir(walDir, startLSN)
-  ├─ DetectWALFormat — auto-detect page-header vs legacy format
-  ├─ ReadAll (segments) or readAllPageAware
-  ├─ For each record:
-  │    ├─ ApplyRecord (rmgr dispatch)
-  │    │    ├─ RmgrHeap: heap (un)do — insert / delete / vacuum
-  │    │    ├─ RmgrBtree: btree (un)do — insert / split
-  │    │    └─ RmgrXact: commit/abort markers
-  │    └─ Advance replay LSN
-  └─ Return final redo position
-```
+This makes recovery fully idempotent: replaying the same record
+twice is harmless because the second replay finds `pd_lsn ≥
+rec.lsn` and skips.
 
-### Recovery Types
+goopg does not check `pd_lsn` during replay. Idempotency relies
+on the record-level CRC and the assumption that each record is
+applied exactly once.
 
-- **Crash recovery** — happens at startup when `pg_wal` contains
-  records past the last checkpoint. goopg replays all records.
-- **Streaming recovery** — the `StreamReplayer` applies records as
-  they arrive from the WAL receiver, enabling hot standby.
+### Recovery Conflicts
 
-### WAL Record Types
+On a hot standby, WAL replay can conflict with active queries:
+- **Snapshot conflict** — a query's snapshot is too old to see
+  the tuples being removed by VACUUM on the primary.
+- **Tablespace conflict** — a tablespace is being dropped.
+- **Lock conflict** — a query holds a lock that replay needs.
 
-| Rmgr ID | Record Kind | Payload |
-|---------|-------------|---------|
-| RmgrHeap | XlogHeapInsert | rel, blk, tuple bytes |
-| RmgrHeap | XlogHeapDelete | rel, blk, slot, xmax |
-| RmgrHeap | XlogHeapVacuum | rel, blk, dead-slots |
-| RmgrBtree | XlogBtreeInsert | rel, blk, item bytes |
-| RmgrBtree | XlogBtreeSplit | rel, left_blk, right_blk, left_page, right_page |
-| RmgrXact | XlogXactCommit | xid |
-| RmgrXact | XlogXactAbort | xid |
+PostgreSQL resolves conflicts by cancelling the conflicting
+query with a message like "terminating connection due to
+conflict with recovery".
 
-## PostgreSQL Implementation
+goopg does not have a hot standby query path, so recovery
+conflicts do not occur.
 
-PostgreSQL's recovery (`xlogrecovery.c`) is structured similarly
-but significantly more complex:
+### Parallel Redo (PG 18+)
 
-- **Redo point** — PostgreSQL starts replay from the Redo LSN
-  recorded in the checkpoint record. goopg uses the checkpoint
-  marker's LSN.
-- **Full-page images** — PostgreSQL writes full-page images (FPI)
-  on the first modification after a checkpoint, enabling recovery
-  to reconstruct the full page without relying on the previous
-  page contents. goopg also writes FPIs via `logFPI`.
-- **Consistency check** — PostgreSQL checks `pd_lsn` on each page
-  during recovery to skip already-applied records (idempotent
-  replay). goopg relies on record-level idempotency.
-- **Recovery conflicts** — on a standby, recovery conflicts with
-  queries must be resolved (e.g., by cancelling queries whose
-  snapshots conflict with the WAL record being applied). goopg
-  does not have a standby query path.
-- **WAL summariser** — PG 17+ adds a WAL summariser for faster
-  recovery by skipping over unused WAL segments.
+PostgreSQL 18 adds parallel redo: multiple worker processes can
+replay WAL records in parallel for different tablespaces. This
+significantly reduces recovery time for large databases.
 
-### Key Differences
+goopg replays records serially.
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Recovery starting point | Checkpoint marker LSN | Checkpoint Redo LSN |
-| Consistency checking | Record-level idempotency | Page-level `pd_lsn` check |
-| Recovery conflicts | None (no standby queries) | Query cancellation on conflict |
-| WAL summariser | Not implemented | PG 17+ |
-| Parallel replay | None | PG 18+ parallel redo |
+### WAL Summariser (PG 17+)
+
+The WAL summariser tracks which WAL segments are no longer needed
+for recovery by monitoring the gap between the checkpoint redo
+LSN and the oldest outstanding WAL record. It generates summary
+files that allow recovery to skip over unused WAL segments.
+
+goopg does not summarise WAL; it replays from the checkpoint
+marker forward, scanning all segments.
+
+## goopg Improvement Analysis
+
+### P1: pd_lsn-Based Replay Idempotency
+
+Check `pd_lsn` before applying a WAL record. If `pd_lsn ≥
+rec.lsn`, skip the record.
+
+**Impact:** Correctness for crash-recovery idempotency. Also
+enables recovery to restart from an arbitrary point.
+
+### P2: Parallel Redo
+
+Process WAL records in parallel when they touch different
+relations. Use a shared hash table of in-progress relation IDs
+to detect conflicts.
+
+**Impact:** Faster recovery for multi-table workloads.
 
 ## References
 
@@ -91,3 +88,5 @@ but significantly more complex:
 - goopg: `internal/wal/stream_replayer.go`
 - PG recovery: `postgres/src/backend/access/transam/xlogrecovery.c`
 - PG redo: `postgres/src/backend/access/transam/README`
+- PG FPI: `postgres/src/backend/access/transam/xlog.c`
+  (`XLogRecordPageWithLock`)

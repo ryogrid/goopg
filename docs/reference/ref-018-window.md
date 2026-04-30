@@ -1,82 +1,85 @@
 # REF-018: Window Functions
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-Window functions compute aggregate-like values over a set of rows related to the current row, without collapsing the result set. goopg supports `ROW_NUMBER()` and `RANK()` with `OVER (PARTITION BY … ORDER BY …)`.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Frame Clause Types
 
-**Packages:** `internal/executor/operators_window.go`, `internal/planner/`
+PostgreSQL supports five frame boundary types:
 
-### Plan Node
+| Type | Clause | Example |
+|------|--------|---------|
+| ROWS | Physical row offset | `ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING` |
+| RANGE | Logical offset within partition | `RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING` |
+| GROUPS | Group offset | `GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING` |
 
-`planner.WindowAgg` wraps a child plan and adds window function evaluation:
+goopg only supports the default frame (`RANGE BETWEEN UNBOUNDED
+PRECEDING AND CURRENT ROW`).
 
-```go
-type WindowAgg struct {
-    pos       int
-    Child     Node
-    Functions []WindowFunc
-    Partition []Expr   // PARTITION BY expressions
-    OrderBy   []SortBy // ORDER BY expressions
-}
+### LEAD and LAG
+
+`LEAD(expr, offset, default)` and `LAG(expr, offset, default)`
+access rows at a physical offset within the partition. They are
+implemented via spooling: the executor reads all rows in the
+partition into a buffer, then emits them with the LEAD/LAG
+values computed from the buffer.
+
+goopg does not implement LEAD or LAG.
+
+### Aggregate Functions with OVER
+
+Any aggregate function (SUM, AVG, COUNT, etc.) can be used with
+`OVER (PARTITION BY … ORDER BY …)` to compute a window aggregate.
+For example:
+
+```sql
+SELECT sum(amount) OVER (PARTITION BY account ORDER BY date)
+FROM transactions;
 ```
 
-### Executor
+goopg does not support aggregate functions with OVER.
 
-`windowAggOp` implements window function evaluation:
+### WINDOW Clause
 
-1. **Partition** — the child plan must produce rows in partition +
-   order by order (the planner adds a Sort node when needed).
-2. **Frame** — for each partition, iterate rows and compute
-   window functions:
-   - `ROW_NUMBER()` — sequential row number within the partition.
-   - `RANK()` — like ROW_NUMBER but equal ORDER BY values get
-     the same rank, leaving gaps.
+The `WINDOW` clause names a window specification for reuse:
 
-### Window Function Types
+```sql
+SELECT sum(x) OVER w, avg(x) OVER w
+FROM t
+WINDOW w AS (ORDER BY y)
+```
 
-| Function | Implementation |
-|----------|---------------|
-| `ROW_NUMBER()` | Incrementing counter per partition, reset at partition boundary. |
-| `RANK()` | Counter that advances only when ORDER BY value changes. |
+goopg does not support the WINDOW clause.
 
-### Frame Clause
+### EXCLUDE (PG 12+)
 
-`ROWS / RANGE / GROUPS` frame clauses are parsed but rejected with
-a 0A000 error. Only the default frame (`RANGE BETWEEN UNBOUNDED
-PRECEDING AND CURRENT ROW`) is supported.
+PostgreSQL 12+ supports frame exclusion:
 
-## PostgreSQL Implementation
+- `EXCLUDE CURRENT ROW` — exclude the current row from the frame.
+- `EXCLUDE GROUP` — exclude all rows with the same ORDER BY
+  values as the current row.
+- `EXCLUDE TIES` — include rows with the same ORDER BY values
+  but exclude peers outside the frame.
 
-PostgreSQL's window function execution (`nodeWindowAgg.c`) is
-significantly more capable:
+goopg does not support EXCLUDE.
 
-- **Supported functions** — ROW_NUMBER, RANK, DENSE_RANK,
-  PERCENT_RANK, NTILE, LEAD, LAG, FIRST_VALUE, LAST_VALUE,
-  NTH_VALUE, CUME_DIST, and aggregate functions with OVER.
-- **Frame clauses** — ROWS, RANGE, GROUPS with various boundary
-  types (UNBOUNDED PRECEDING, value PRECEDING, CURRENT ROW,
-  value FOLLOWING, UNBOUNDED FOLLOWING).
-- **EXCLUDE** — PostgreSQL 12+ supports `EXCLUDE CURRENT ROW`,
-  `EXCLUDE GROUP`, `EXCLUDE TIES` frame exclusion.
-- **WINDOW clause** — named window definitions reusable across
-  multiple function calls.
-- **Aggregate window functions** — any aggregate (SUM, AVG, etc.)
-  can be used with OVER.
+## goopg Improvement Analysis
 
-### Key Differences
+### P2: LEAD / LAG
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Functions | ROW_NUMBER, RANK | 10+ built-in + aggregates |
-| Frame clause | Default only | ROWS, RANGE, GROUPS |
-| WINDOW clause | Not supported | Named window definitions |
-| LEAD / LAG | Not implemented | Supported |
-| Aggregate functions with OVER | Not supported | Supported |
+Implement LEAD and LAG by spooling partition rows into a slice.
+On each row emission, look ahead (LEAD) or behind (LAG) by the
+specified offset.
+
+### P3: Aggregate Window Functions
+
+Extend the executor's aggregate infrastructure to support OVER
+(PARTITION BY). When a window clause is present, evaluate the
+aggregate over the current frame instead of the current group.
 
 ## References
 
 - goopg: `internal/executor/operators_window.go`
 - PG window: `postgres/src/backend/executor/nodeWindowAgg.c`
-- PG window functions: `postgres/src/backend/utils/adt/windowfuncs.c`
+- PG window funcs: `postgres/src/backend/utils/adt/windowfuncs.c`

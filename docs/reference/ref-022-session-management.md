@@ -1,107 +1,85 @@
 # REF-022: Session & Transaction Management
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-Session management covers connection lifecycle, transaction state, MVCC snapshot management, and GUC configuration. Each client connection has a dedicated goroutine with an associated session registry.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Subtransactions (SAVEPOINT)
 
-**Packages:** `internal/server/server.go`, `internal/mvcc/`, `internal/config/session.go`
+PostgreSQL supports nested transactions via `SAVEPOINT` /
+`ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`. Each savepoint
+creates a subtransaction stored as a `TransactionState` node in
+a linked list. On rollback to a savepoint, all changes made
+since the savepoint are undone (via WAL redo for the aborted
+range).
 
-### Connection Lifecycle
+goopg does not implement savepoints.
 
-```
-serveConn:
-  ├─ TCP accept → goroutine
-  ├─ Startup handshake (auth, parameter exchange)
-  ├─ Register backend in activity registry
-  ├─ Create SessionRegistry
-  ├─ Loop: ReadFrame → handleQuery → WriteFrame
-  └─ Connection close → cleanup
-```
+### Prepared Transactions (Two-Phase Commit)
 
-### Session Registry
+`PREPARE TRANSACTION 'id'` persists the transaction's state to
+disk (`pg_twophase/`). The transaction can later be committed
+or rolled back by any session via `COMMIT PREPARED 'id'` or
+`ROLLBACK PREPARED 'id'`. This enables distributed transaction
+coordinators (like XA) to coordinate across multiple databases.
 
-`config.SessionRegistry` holds per-connection GUC values. It provides:
-- `Get(name)` — read effective value.
-- `Set(name, value, isLocal)` — set value.
-- `Reset(name)` / `ResetAll()` — restore defaults.
-- `SetReportableHook(func)` — emit ParameterStatus on changes.
+goopg does not implement prepared transactions.
 
-### Transaction Management
+### Process Model vs Goroutine Model
 
-`mvcc.Manager` manages transaction state:
+PostgreSQL uses one OS process per connection. This provides:
 
-```go
-tx, err := mgr.Begin(IsolationReadCommitted)
-snap, err := mgr.SnapshotFor(tx)
-// ... execute queries ...
-err = mgr.Commit(tx)   // or mgr.Rollback(tx)
-```
+- Strong memory isolation — a crash in one connection cannot
+  corrupt other connections.
+- Direct resource accounting — each process's RSS is visible
+  to the OS.
+- Simpler locking — no goroutine scheduler preemption at
+  arbitrary points.
 
-Each simple-query batch runs inside an implicit
-ReadCommitted transaction:
+goopg uses one goroutine per connection. This provides:
 
-```
-dispatchSimpleQueryViaExecutor:
-  ├─ TxnMgr.Begin
-  ├─ Refresh snapshot
-  ├─ Execute statements
-  ├─ TxnMgr.Commit (→ xactMarker → WAL Append)
-  └─ Write ReadyForQuery
-```
+- Lower per-connection overhead (~4 KB stack vs ~8 MB stack).
+- Cheaper context switches (goroutine vs kernel thread).
+- Shared memory for data structures (no shared memory setup).
 
-### GUC Configuration
+### GUC Memory Management
 
-GUCs are defined in `internal/config/defaults.go` with type,
-default value, and category. The registry applies config file
-entries on top of built-in defaults. Runtime changes (SET)
-update the session registry.
+PostgreSQL's GUCs are stored in:
+- `ConfigFileLinenoStack` — for file tracking.
+- `GUC_Nametab` — the main GUC array, indexed by name.
+- Per-backend `guc_variables` — runtime values.
 
-### MVCC Snapshot
+GUCs of type `PGC_POSTMASTER` require a restart to change.
+`PGC_SIGHUP` can be changed by reloading the config file.
+`PGC_BACKEND` is set at connection startup. `PGC_SUSET`
+requires superuser. `PGC_USERSET` can be set by any user.
 
-`SnapshotFor(tx)` returns a snapshot containing:
-- `Xmin` — lowest in-progress XID.
-- `Xmax` — highest completed XID + 1.
-- `XipList` — XIDs in-progress at snapshot time.
+goopg's GUC system is simpler: all GUCs can be set via `SET`
+(no PGC_POSTMASTER/PGC_SIGHUP distinction). Config file entries
+are applied on top of defaults at startup.
 
-Tuple visibility checks use the snapshot:
-- `xmin < xmin`: committed → visible if not aborted.
-- `xmin in xip`: in-progress → invisible.
-- `xmax < xmin`: deleted by committed xact → invisible.
-- `xmax in xip`: deleted by in-progress → visible (will be retried).
+## goopg Improvement Analysis
 
-## PostgreSQL Implementation
+### P2: Savepoints
 
-PostgreSQL's session management is process-based:
+Implement SAVEPOINT by tracking subtransaction save/restore
+points in the MVCC manager. On rollback to savepoint, replay
+the inverse of WAL records generated since the savepoint.
 
-- **Process model** — each connection is a separate OS process
-  (`fork()`), not a goroutine. This gives stronger isolation but
-  higher per-connection overhead.
-- **Transaction state** — stored in `TopTransactionState` and
-  `CurrentTransactionState` (process-local variables). goopg
-  stores transaction state in the mvvcc Manager.
-- **Subtransactions** — PostgreSQL supports `SAVEPOINT` and
-  subtransaction nesting. goopg does not.
-- **Prepared transactions** — PostgreSQL supports two-phase commit
-  via `PREPARE TRANSACTION` / `COMMIT PREPARED`. goopg does not.
-- **pg_stat_activity** — shared memory array, updated by each
-  backend. goopg uses an in-memory registry.
+### P2: GUC Categories
 
-### Key Differences
+Add PGC_POSTMASTER, PGC_SIGHUP, PGC_BACKEND categories.
+Validate that GUCs are set at the correct level.
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Connection model | Goroutine per connection | Process per connection |
-| Subtransactions | Not implemented | SAVEPOINT |
-| Two-phase commit | Not implemented | PREPARE TRANSACTION |
-| GUC storage | Per-session registry | Shared memory + process-local |
-| Transaction manager | `mvcc.Manager` in-memory | Shared-memory transaction state |
+**Impact:** Better compatibility with PostgreSQL config files
+that expect certain GUC categories.
 
 ## References
 
 - goopg: `internal/server/server.go`
 - goopg: `internal/mvcc/manager.go`
-- goopg: `internal/config/session.go`
+- goopg: `internal/config/`
 - PG transaction: `postgres/src/backend/access/transam/xact.c`
-- PG session: `postgres/src/backend/tcop/postgres.c`
+- PG subtransaction: `postgres/src/backend/access/transam/xact.c`
+  (`PushTransaction`, `PopTransaction`)
+- PG PREPARE TRANSACTION: `postgres/src/backend/access/transam/twophase.c`

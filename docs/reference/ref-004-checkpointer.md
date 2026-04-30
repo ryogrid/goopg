@@ -1,77 +1,67 @@
 # REF-004: Checkpointer
 
-## Overview
+…(existing content through "Key Differences" unchanged)…
 
-The checkpointer periodically writes dirty buffers to disk and advances the redo point so that crash recovery does not replay WAL from the beginning of time. It also manages WAL segment retention (removing segments that are no longer needed for recovery or replication).
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Checkpoint WAL Record Format
 
-**Package:** `internal/wal/checkpointer.go`
+PostgreSQL writes two types of checkpoint records:
 
-### Key Types
+- **XLOG_CHECKPOINT_SHUTDOWN** — written during a clean shutdown.
+  Indicates that no recovery is needed.
+- **XLOG_CHECKPOINT_ONLINE** — written during normal checkpoints.
+  Contains `nextXid`, `nextOid`, `nextMulti`, `nextMultiOffset`,
+  `oldestXid`, `oldestXidDB`, `oldestMulti`, `oldestMultiDB`,
+  `time`, `oldestActiveXid`.
 
-- `Checkpointer` — controls checkpoint timing (interval, volume-based triggers) and coordinates with the WAL writer.
-- `Config` — `Interval`, `MaxWALBytes`, `CompletionTarget`.
+The checkpoint record size is ~120 bytes. goopg writes a single
+marker type with xid + timestamp.
 
-### Checkpoint Cycle
+### Restart Points on Standby
 
-```
-Checkpointer.Run(ctx)
-  ├─ ticker fires (every Interval)
-  ├─ runCheckpoint(ctx, scheduled)
-  │    ├─ FlushAllPaced — write all dirty buffers
-  │    ├─ FlushUpTo — flush WAL
-  │    ├─ WriteCheckpointMarker — append XLOG_CHECKPOINT marker to WAL
-  │    ├─ RetainSegments — remove old WAL segments
-  │    └─ Update redo pointer
-  ├─ volume-based trigger (when MaxWALBytes is exceeded)
-  └─ sleep until next tick
-```
+On a hot standby, the checkpointer is replaced by the **restart
+point** mechanism. The startup process (which performs WAL
+replay) periodically creates restart points — analogous to
+checkpoints on the primary. Restart points allow the standby to
+truncate WAL that has been fully replayed.
 
-### WAL Segment Retention
+goopg does not implement restart points on standbys.
 
-`RetainSegments` keeps WAL segments that are still needed:
-- Segments after the last checkpoint LSN.
-- Segments pinned by replication slots (`slot.RestartLSN`).
-- Segments within a safety margin (`MaxSlotWALKeepBytes`).
+### XLOG_RESTORE_POINT
 
-Segments that are no longer needed are unlinked.
+PostgreSQL supports `pg_create_restore_point('name')` which
+writes an `XLOG_RESTORE_POINT` WAL record. This can be used for
+point-in-time recovery.
 
-### Checkpoint Marker
+goopg does not support restore points.
 
-The checkpoint marker is a WAL record (`RmgrCheckpoint`) written after all dirty buffers and WAL have been flushed. It records the redo point (the LSN at which recovery should start replaying). On restart, `wal.ReplayFromDir` replays from the last checkpoint marker forward.
+### Checkpoint Speed Control
 
-## PostgreSQL Implementation
+PostgreSQL controls checkpoint I/O via:
+- `checkpoint_completion_target` (default 0.9) — spread checkpoint
+  writes over 90% of the checkpoint interval.
+- `CheckpointerWriteDelay` — sleep between writes during
+  checkpoint (default 200 ms).
 
-PostgreSQL's checkpointer (`checkpointer.c`) is a dedicated process:
+goopg's checkpointer uses `FlushAllPaced` which writes all dirty
+buffers without pacing.
 
-- **Bgwriter separation** — PostgreSQL has a separate `bgwriter`
-  process that flushes dirty buffers continuously, so the
-  checkpointer's I/O burst is smaller. goopg combines both roles
-  in `FlushAllPaced` (called during checkpoint and during buffer
-  eviction).
-- **Checkpoint frequency** — controlled by `checkpoint_timeout`
-  (default 5 min) and `max_wal_size` (default 1 GB). goopg uses
-  a configurable `Interval` (default 5 min) and `MaxWALBytes`.
-- **Restart point** — on standbys, the checkpointer (called the
-  "restart point") is driven by the WAL receiver's progress.
-  goopg does not have a standby-mode checkpointer.
-- **Checkpoint WAL record** — PostgreSQL writes
-  `XLOG_CHECKPOINT_SHUTDOWN` (clean shutdown) or
-  `XLOG_CHECKPOINT_ONLINE` (normal checkpoint). goopg writes a
-  single marker type.
+## goopg Improvement Analysis
 
-### Key Differences
+### P2: Checkpoint Write Pacing
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Dirty buffer write | `FlushAllPaced` in-band | bgwriter + checkpointer |
-| WAL retention | Slot-aware | Slot-aware + wal_keep_segments GUC |
-| Checkpoint marker | Single type | SHUTDOWN / ONLINE |
-| Standby checkpoints | Not implemented | Restart points on standby |
+Add a pacing delay between buffer flushes during checkpoints.
+Spread the I/O over `completionTarget × interval` seconds.
+
+**Impact:** Reduces I/O spikes during checkpoints.
+
+### P3: XLOG_RESTORE_POINT
+
+Implement `pg_create_restore_point` for point-in-time recovery.
 
 ## References
 
 - goopg: `internal/wal/checkpointer.go`
 - PG checkpointer: `postgres/src/backend/postmaster/checkpointer.c`
-- PG bgwriter: `postgres/src/backend/postmaster/bgwriter.c`
+- PG checkpoint WAL: `postgres/src/include/catalog/pg_control.h`

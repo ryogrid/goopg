@@ -1,110 +1,113 @@
 # REF-023: Autovacuum
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-Autovacuum automatically runs VACUUM and ANALYZE on tables based on configurable trigger thresholds. It prevents table bloat and keeps planner statistics up to date without manual intervention.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Cost-Based Delay
 
-**Package:** `internal/autovacuum/`
+PostgreSQL throttles autovacuum I/O via a cost-based delay
+system:
 
-### Key Types
+1. Each vacuum operation has a **cost** (per page read = 1,
+   per page dirtied = 20, per page written during FPI = 10).
+2. When the accumulated cost exceeds
+   `autovacuum_vacuum_cost_limit` (default 200), vacuum sleeps
+   for `autovacuum_vacuum_cost_delay` (default 2 ms).
+3. The sleep is distributed across the vacuum operation (every
+   few pages).
 
-- `Launcher` — periodic ticker that evaluates each table and
-  dispatches vacuum/analyze workers.
-- `vacuum.Vacuum` — scans all heap pages, reclaims dead tuples,
-  and updates visibility.
-- `vacuum.Analyze` — scans a sample of heap pages to estimate
-  row count and per-column null fraction.
+This prevents autovacuum from saturating the disk and impacting
+concurrent queries.
 
-### Launcher Lifecycle
+goopg does not implement cost-based delay. Vacuum runs at full
+speed, which can cause I/O spikes.
+
+### Anti-Wraparound Autovacuum
+
+PostgreSQL tracks `relfrozenxid` per table — the oldest XID
+that has not been frozen. When `age(relfrozenxid)` exceeds
+`autovacuum_freeze_max_age` (default 200 million), a compulsory
+anti-wraparound vacuum is triggered, even if autovacuum is
+disabled for the table.
+
+The anti-wraparound vacuum freezes all tuples older than the
+freeze horizon, allowing the XID space to be reused.
+
+goopg does not freeze tuples or track `relfrozenxid`.
+
+### Per-Table Storage Parameters
+
+PostgreSQL allows per-table configuration of autovacuum via
+storage parameters:
+
+```sql
+ALTER TABLE t SET (autovacuum_enabled = false);
+ALTER TABLE t SET (autovacuum_vacuum_threshold = 1000);
+ALTER TABLE t SET (autovacuum_vacuum_scale_factor = 0.1);
+```
+
+Parameters override the global GUC defaults for that table.
+goopg does not support per-table autovacuum parameters.
+
+### Worker Process Pool
+
+PostgreSQL's autovacuum launcher (`autovacuum.c`) spawns
+dedicated worker processes (`autovacuum worker`). Each worker
+is a separate OS process that:
+
+1. Is assigned the next table to vacuum/analyze.
+2. Opens its own database connection.
+3. Performs the vacuum/analyze.
+4. Exits when done.
+
+The launcher limits the number of concurrent workers via
+`autovacuum_max_workers` (default 3).
+
+goopg's autovacuum runs in the launcher's goroutine directly
+(serial, no worker pool).
+
+### Dead-Tuple Tracking
+
+PostgreSQL tracks the number of dead tuples per table via the
+statistics collector (`pg_stat_user_tables.n_dead_tup`). This
+counter is incremented on UPDATE/DELETE and reset on VACUUM.
+The autovacuum trigger formula uses `n_dead_tup` directly:
 
 ```
-Launcher.Run(ctx)
-  ├─ ticker fires every NapInterval (default 60s)
-  ├─ Load all user tables from catalog
-  ├─ For each table:
-  │    ├─ If lastVacuumAge > MinVacuumAge → VACUUM
-  │    └─ If lastAnalyzeAge > MinAnalyzeAge → ANALYZE
-  └─ Sleep until next tick
+vacuum threshold = autovacuum_vacuum_threshold +
+                   autovacuum_vacuum_scale_factor × reltuples
 ```
 
-### Trigger Policy
+goopg does not track dead tuple counts. The launcher uses
+time-based scheduling.
 
-goopg's autovacuum uses time-based throttling:
-- `MinVacuumAge` (default 5 min) — minimum time between vacuums.
-- `MinAnalyzeAge` (default 5 min) — minimum time between analyzes.
-- Tables with `Stats == nil || RowCount == 0` are skipped.
+## goopg Improvement Analysis
 
-PostgreSQL uses threshold + scale-factor triggers:
-- `autovacuum_vacuum_threshold` (default 50 tuples).
-- `autovacuum_vacuum_scale_factor` (default 0.2 = 20% of rows).
-- `autovacuum_analyze_threshold` (default 50 tuples).
-- `autovacuum_analyze_scale_factor` (default 0.1 = 10% of rows).
+### P1: Dead-Tuple Tracking
 
-### Vacuum
+Add a dead-tuple counter to `catalog.TableStats`. Increment on
+UPDATE/DELETE. Reset on VACUUM. Use the PG trigger formula
+instead of time-based scheduling.
 
-`vacuum.Vacuum` iterates every block of the relation:
+**Impact:** Autovacuum responds to actual table churn, not
+wall-clock time.
 
-1. For each block:
-   - Pin the buffer page.
-   - Collect dead heap slots (tuples with `xmax < OldestXmin`).
-   - Reclaim dead slots via `VacuumHeapPageBySlots`.
-   - Mark dirty + WAL-log the vacuum.
-2. Return `Stats` (pages visited, live tuples, dead tuples).
+### P2: Cost-Based Delay
 
-### Analyze
+Add a cost counter in `vacuum.Vacuum`. Accumulate costs per
+page operation. When the cost limit is exceeded, sleep for the
+delay duration.
 
-`vacuum.Analyze` walks every block and counts visible tuples:
+**Impact:** Prevents autovacuum from saturating disk I/O.
 
-1. Begin a ReadCommitted transaction.
-2. For each block:
-   - Pin the page.
-   - Count visible tuples (filtered by the snapshot).
-   - Compute average tuple width.
-3. Store `TableStats` (row count, pages, avg width) via
-   `catalog.SetTableStats`.
+### P2: Anti-Wraparound
 
-## PostgreSQL Implementation
+Track `relfrozenxid` per table. When the freeze age exceeds
+`autovacuum_freeze_max_age` (or a goopg-specific threshold),
+trigger a compulsory vacuum that freezes tuples.
 
-PostgreSQL's autovacuum (`autovacuum.c`) is significantly more
-sophisticated:
-
-- **Launcher process** — a dedicated `autovacuum launcher` process
-  wakes periodically (default 1 min) and evaluates all databases.
-- **Worker process** — the launcher spawns a `autovacuum worker`
-  per table. Workers run with a dedicated transaction, cost-delay
-  throttling, and anti-wraparound priority.
-- **Cost-based delay** — `autovacuum_vacuum_cost_limit` (default
-  200) and `autovacuum_vacuum_cost_delay` (default 2 ms) throttle
-  I/O during vacuum to avoid saturating the disk.
-- **Anti-wraparound** — when `age(relfrozenxid)` exceeds
-  `autovacuum_freeze_max_age` (default 200 million), a
-  compulsory anti-wraparound vacuum runs even if autovacuum is
-  disabled for the table.
-- **Per-table overrides** — each table can override global
-  autovacuum settings via storage parameters (`autovacuum_enabled`,
-  `autovacuum_vacuum_threshold`, etc.).
-
-### Key Differences
-
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Trigger formula | Time-based (MinAge) | Threshold + scale factor |
-| Worker spawning | Same goroutine (serial) | Separate worker process per table |
-| Cost-based delay | Not implemented | `vacuum_cost_limit` / `vacuum_cost_delay` |
-| Anti-wraparound | Not implemented | compulsory freeze vacuum |
-| Per-table overrides | Not implemented | Storage parameters |
-| Statistics update | After each analyze | After each analyze |
-| Logging | Simple INFO lines | Detailed `pg_stat_progress_vacuum` |
-
-## Potential Optimisations or Corrections
-
-- **Dead-tuple-based triggers** (threshold + scale factor) would
-  make autovacuum responsive to actual table churn rather than
-  wall-clock time.
-- **Cost-based delay** would prevent vacuum from saturating disk
-  I/O on large tables.
+**Impact:** Prevents XID wraparound on long-running deployments.
 
 ## References
 
@@ -112,3 +115,7 @@ sophisticated:
 - goopg: `internal/vacuum/vacuum.go`
 - PG autovacuum: `postgres/src/backend/postmaster/autovacuum.c`
 - PG vacuum: `postgres/src/backend/commands/vacuum.c`
+- PG cost delay: `postgres/src/backend/commands/vacuum.c`
+  (`vacuum_delay_point`)
+- PG freeze: `postgres/src/backend/access/heap/heapam.c`
+  (`FreezeTuple`, `lazy_scan_heap`)

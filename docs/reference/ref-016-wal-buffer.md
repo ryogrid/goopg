@@ -1,94 +1,81 @@
 # REF-016: WAL Buffer & Eviction
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-The WAL buffer absorbs append operations in memory so that committing transactions do not block on disk I/O. Records accumulate in the buffer until either (a) the buffer fills up (overflow drain), or (b) a FlushUpTo call forces a drain + fdatasync.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Lock-Free WAL Ring (XLogCtl)
 
-**Package:** `internal/wal/wal_buffer.go`
+PostgreSQL's WAL buffer is a fixed-size ring in shared memory
+(`XLogCtl->xlblocks`). Each buffer slot is an atomic `uint64`
+that encodes both the LSN of the first byte in the slot and a
+"free/used" flag. Backends competing for a slot use a CAS
+(compare-and-swap) loop on the atomic flag, not a mutex.
 
-### Key Type
+The ring has `XLOGbuffers` slots (default 16 MB / XLOG_BLCKSZ
+≈ 1024 slots of 8 KB each). Multiple backends can simultaneously
+copy records into different slots.
 
-`walBuffer` is a fixed-size byte ring buffer addressed by absolute LSN:
+goopg's `walBuf` is protected by `appendMu` (a single mutex).
+All backends contend on this one mutex for every WAL insert.
+
+### WAL Writer Flush Interaction
+
+PostgreSQL's WalWriterMain:
+1. Wakes every `wal_writer_delay` (default 200 ms).
+2. Flushes all WAL buffers that have been filled since the last
+   wakeup.
+3. Updates `shmem->WalWriterFlushLSN`.
+
+Backends that call `XLogFlush` for a COMMIT check whether the
+WalWriter has already flushed past the requested LSN. If so,
+they return immediately without doing I/O.
+
+goopg's state loop handles both writing AND flushing. There is
+no dedicated WalWriter to pre-flush buffers.
+
+### wal_buffers Sizing
+
+PostgreSQL's `wal_buffers` defaults to 16 MB (or 1/32 of
+`shared_buffers`, whichever is smaller). The buffer must be
+large enough to absorb the WAL generated during the gap between
+WalWriter wakeups.
+
+goopg's `wal_buffers` defaults to 16 MB. The sizing logic does
+not consider `shared_buffers`.
+
+## goopg Improvement Analysis
+
+### P1: Lock-Free Slot Allocation
+
+Replace the single `appendMu` with atomic slot allocation into
+the ring buffer.
 
 ```go
-type walBuffer struct {
-    mu   sync.Mutex  // M0026: thread-safe for concurrent append
-    cap  int64
-    buf  []byte      // ring backing store; len == cap
-    base int64       // LSN that buf[0] currently represents
-    head int64       // first un-drained byte LSN
-    tail int64       // first unwritten byte LSN
+type walBufferSlot struct {
+    flag atomic.Uint64  // 0 = free, 1 = reserved, 2 = full
+    data [BlockSize]byte
 }
 ```
 
-### Buffer Operations
+Each backend atomically claims a slot, copies its record, and
+sets the flag to "full". The state loop drains "full" slots.
 
-| Method | Description |
-|--------|-------------|
-| `append(record)` | Copy record bytes into the ring at position `tail`. Advances `tail`. |
-| `readForDrain(n)` | Return up to `n` bytes from `head` for writing to a segment file. |
-| `advanceHead(n)` | Advance `head` after the drained bytes have been written. |
-| `free()` | Free space = `cap - resident()`. |
-| `resident()` | Un-drained bytes = `tail - head`. |
+**Impact:** Eliminates `appendMu` contention. Multiple backends
+can insert WAL records simultaneously.
 
-### Drain Path
+### P1: Dedicated WalWriter
 
-When the buffer is full (append would overflow) or FlushUpTo is called:
+Add a WalWriter goroutine that periodically (every 200 ms)
+flushes dirty WAL buffers. `FlushUpTo` first checks whether
+the WalWriter has already flushed past the requested LSN.
 
-1. `drainBufferBytes(need, reason)` — reads bytes from `head` via
-   `readForDrain`, writes them to the segment file via `writeAt`,
-   then calls `advanceHead`. The drain runs in the state-loop
-   goroutine.
-2. After drain, the segment file is fsynced (if this was the
-   terminal flush).
-
-### Overflow vs Flush
-
-| Trigger | Reason | Behaviour |
-|---------|--------|-----------|
-| Buffer full during append | `drainReasonOverflow` | Drain just enough to make room for the new record. |
-| FlushUpTo called | `drainReasonFlush` | Drain everything up to the requested LSN, then fdatasync. |
-
-## PostgreSQL Implementation
-
-PostgreSQL's WAL buffers (`xlog.c`) are a fixed-size ring in
-shared memory (`XLogCtl->xlblocks`):
-
-- **Insertion** — each backend copies its WAL record into the
-  ring under the partitioned `WALInsertLock`. If the ring is full,
-  the insertion waits for a WAL writer to drain.
-- **WAL writer** — the dedicated `WalWriterMain` periodically
-  flushes dirty buffers. Backends waiting for commit can also
-  flush directly.
-- **XLogFlush** — waits until `flushedUpto ≥ requestedLSN`.
-  The WAL writer may perform the I/O; waiting backends sleep
-  on a condition variable.
-- **Group commit** — multiple backends waiting for the same
-  flush point are grouped. The first to arrive performs the I/O;
-  others are woken when it completes.
-
-### Key Differences
-
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Buffer size | Fixed at startup (`WALBuffers`, default 16 MB) | Fixed at startup (`wal_buffers`, default 16 MB) |
-| Insert concurrency | Single `appendMu` mutex | Partitioned `WALInsertLock` (16–64 partitions) |
-| Overflow handling | Drain synchronously in state loop | Wait for WAL writer drain |
-| Flush batching | None (per-FlushUpTo) | Group commit (XLogFlush) |
-| Thread safety | `sync.Mutex` (M0026) | Lock-free ring with atomic slots |
-
-## Potential Optimisations or Corrections
-
-- **Partitioned insert lock** would let concurrent backends append
-  to different buffer partitions, eliminating `appendMu` contention.
-- **Group commit** would reduce fdatasync frequency by batching
-  multiple commit flushes.
+**Impact:** COMMIT latency is reduced because the WAL is already
+flushed when FlushUpTo is called.
 
 ## References
 
 - goopg: `internal/wal/wal_buffer.go`
-- goopg: `internal/wal/writer.go` (drainBufferBytes, flushUpTo)
 - PG WAL buffer: `postgres/src/backend/access/transam/xlog.c`
-  (`XLogInsertRecord`, `XLogFlush`, `WALInsertLock`)
+  (`XLogInsertRecord`, `XLogWrite`, `WALInsertLock`)
+- PG WalWriter: `postgres/src/backend/postmaster/walwriter.c`

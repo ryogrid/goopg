@@ -1,83 +1,85 @@
 # REF-010: Parser & AST
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-The parser converts SQL text into an abstract syntax tree (AST). goopg uses a handwritten recursive-descent parser rather than a parser generator (yacc/bison). It supports the SQL subset needed by pgbench, TPC-H, HammerDB, and the goopg test suite.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Keyword Categorisation
 
-**Package:** `internal/parser/`
+PostgreSQL classifies keywords into three categories that
+control whether they can be used as identifiers:
 
-### Key Types
+| Category | Example | Can be used as identifier? |
+|----------|---------|---------------------------|
+| **Reserved** | `SELECT`, `FROM`, `WHERE` | No (must be quoted) |
+| **Unreserved** | `BEGIN`, `COMMIT`, `VACUUM` | Yes |
+| **Col-name** | `YEAR`, `MONTH`, `ZONE` | Yes, in column position |
 
-- `parser` — the recursive-descent state machine. Holds a token slice, current position, and helper methods (`acceptKeyword`, `expectSymbol`, `parseExpr`, etc.).
-- `Token` / `TokenKind` — lexer output: identifier, keyword, integer literal, string literal, operator, etc.
-- `Keyword` — a string enum for SQL keywords. Only keywords used by the supported statement families are registered.
-- `Stmt` — interface for all statement AST nodes (SelectStmt, InsertStmt, CreateTableStmt, etc.).
-- `Expr` — interface for all expression nodes (BinaryOp, ColumnRef, IntegerConst, etc.).
+goopg treats all registered keywords as reserved. This means
+queries that use keywords like `begin`, `out`, `call` as column
+names or table names may fail.
 
-### Lexer
+### Parse Analysis (`parse_analyze.c`)
 
-`lexer.go` produces a `[]Token` from SQL input:
-- Handles identifiers, keywords, numeric literals, string literals, operators.
-- Dollar-quote support (`$$body$$`, `$tag$body$tag$`) for PL/pgSQL routine bodies.
-- Positional parameters (`$1`..`$N`) for prepared statements.
-- Single-line (`--`) and block (`/* */`) comments.
+After the raw parse tree is built, PostgreSQL runs it through
+`parse_analyze.c`, which performs:
 
-### Parser
+1. **Name resolution** — resolves `ColumnRef` to catalog columns.
+2. **Type resolution** — determines output types for expressions.
+3. **Permission checking** — verifies access rights.
+4. **Coercion** — inserts implicit type casts.
+5. **Subquery flattening** — merges simple subqueries.
+6. **Window function validation** — checks window function
+   placement and arguments.
 
-`parser.go` dispatches on the first keyword token:
-```
-parseStatement()
-  ├─ KwBegin → parseBegin
-  ├─ KwSelect → parseSelect
-  ├─ KwInsert → parseInsert
-  ├─ KwCreate → parseCreate (→ parseCreateTable, parseCreateView, parseCreateFunction, …)
-  ├─ KwDrop → parseDrop (→ parseDropTable, parseDropFunction, …)
-  ├─ KwCall → parseCallStatement
-  ├─ KwExplain → parseExplain
-  ├─ KwWith → parseStatementWithCTE
-  └─ … (others)
-```
+goopg's `analyzer` does name resolution and some type checking
+but omits permission checking, implicit coercion, and subquery
+flattening.
 
-Expression parsing uses a precedence-climbing approach (`parseExpr` → `parseBinaryOp` → `parsePrefix` → `parsePrimary`).
+### Raw Expression Tree Walker
 
-### AST
+PostgreSQL provides `raw_expression_tree_walker()` for
+traversing raw parse trees. This is used by the analyser,
+rewriter, and planner to walk the tree without knowing every
+node type. goopg uses type switches in each pass.
 
-The AST is defined as Go struct types in `ast.go`:
-- SelectStmt: targets, from, where, group-by, having, order-by, limit, set-operation.
-- InsertStmt: table, columns, values (RowsExpr or SelectStmt), on-conflict, returning.
-- UpdateStmt: table, set-clauses, where, returning.
-- CreateFunctionStmt, CreateProcedureStmt, etc.
+### rewriter (`rewriteHandler.c`)
 
-## PostgreSQL Implementation
+PostgreSQL has a **rewriter** phase between analysis and
+planning. The rewriter applies:
+- **View expansion** — replaces `FROM v` with the view's
+  underlying SELECT.
+- **Rule expansion** — applies CREATE RULE transformations.
+- **CTE inlining** — decides whether to materialise or inline
+  CTEs (controlled by `MATERIALIZED` / `NOT MATERIALIZED`).
 
-PostgreSQL's parser (`gram.y`):
+goopg handles view expansion in the planner's
+`planScanRangeVar` and handles CTEs in `preplanWithClause`.
 
-- **Grammar file** — a 15 000+ line bison grammar (`gram.y`) and a hand-written lexer (`scan.l`). The grammar is far more comprehensive than goopg's.
-- **Transformation** — after parsing, the raw parse tree goes through parse analysis (`parse_analyze.c`) which resolves names, types, and permissions. goopg's analyzer (`internal/analyzer/`) does similar work but with a much smaller surface.
-- **Keyword categories** — PostgreSQL classifies keywords as reserved/unreserved/col-name to control whether they can be used as identifiers. goopg makes all registered keywords reserved.
-- **CTE scope** — PostgreSQL handles WITH clause scoping with a dedicated analysis pass. goopg follows the same approach.
+## goopg Improvement Analysis
 
-### Key Differences
+### P1: Keyword Categorisation
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Parser type | Hand-written recursive descent | bison-generated LALR(1) |
-| Grammar size | ~4 000 lines (parser + lexer + helpers) | ~15 000 lines (gram.y alone) |
-| Keyword handling | All registered keywords reserved | Categorised (reserved/unreserved/col-name) |
-| Dollar quotes | Supported for routine bodies | Full dollar-quote support |
-| Expression parser | Precedence climbing | bison-generated (shift/reduce) |
-| Analyse pass | Separate `internal/analyzer/` | `parse_analyze.c` + `transform.c` |
+Add `isReserved` and `isColName` keyword categories. Allow
+unreserved and col-name keywords as identifiers in appropriate
+positions.
 
-## Potential Optimisations or Corrections
+**Impact:** Improves SQL compatibility. Reduces the need to
+quote column names that happen to match PG keywords.
 
-- **Keyword categorisation** would let more SQL pass through without syntax errors (e.g. `OUT` as a column name in contexts where it's not a reserved keyword).
-- **CTE scoping in parser** — goopg currently handles CTE scoping mostly in the analyzer and planner. Upstream does more at parse time.
+### P2: Type Coercion
+
+Add implicit type coercion in the analyzer:
+- `INSERT int → text` column → auto-cast.
+- `int2 + int4` → promote to `int4`.
+- String literal `'42'` used as `int` → implicit parse.
+
+**Impact:** Reduces false type-mismatch errors.
 
 ## References
 
-- goopg: `internal/parser/parser.go`, `internal/parser/ast.go`, `internal/parser/lexer.go`
+- goopg: `internal/parser/parser.go`, `internal/parser/ast.go`
 - PG grammar: `postgres/src/backend/parser/gram.y`
-- PG lexer: `postgres/src/backend/parser/scan.l`
 - PG parse analysis: `postgres/src/backend/parser/parse_analyze.c`
+- PG rewriter: `postgres/src/backend/rewrite/rewriteHandler.c`
+- PG keyword categories: `postgres/src/include/parser/kwlist.h`

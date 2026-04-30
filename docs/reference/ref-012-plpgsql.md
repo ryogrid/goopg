@@ -1,88 +1,119 @@
 # REF-012: PL/pgSQL Runtime
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-The PL/pgSQL runtime interprets stored functions and procedures written in PostgreSQL's PL/pgSQL language. goopg supports the most common control-flow constructs (IF, LOOP, WHILE, FOR, assignment, RETURN, PERFORM) and can call user-defined functions from SQL expressions.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### Bytecode Compilation
 
-**Packages:** `internal/plpgsql/` (parser), `internal/executor/plpgsql_runtime.go` (interpreter)
+PostgreSQL compiles PL/pgSQL source into a `PLpgSQL_function`
+containing a flat array of `PLpgSQL_stmt` instruction nodes.
+Control-flow structures (IF, LOOP, WHILE) are compiled into
+instructions with resolved branch targets (like a simple VM).
+This is done once, on the first call to the function.
 
-### Parser (`internal/plpgsql/`)
+Key benefits of bytecode compilation:
+- No per-call parsing overhead.
+- Branch targets are resolved at compile time.
+- Expression ASTs are cached as prepared statements.
+- Function arguments and local variables are accessed by slot
+  index, not by name lookup.
 
-Parses PL/pgSQL routine bodies into an AST:
+goopg interprets the PL/pgSQL AST directly on every execution.
+Parsing the body happens on every call. Variable lookups use
+a name-to-index map (linear scan for shadowed variables).
 
+### Expression Caching
+
+Each SQL expression in a PL/pgSQL function (`RETURN x + 1`,
+`IF x > 0`, etc.) is compiled to a `plpgsql_expr` that caches
+the analysed/planned state. The first time the expression is
+evaluated, it goes through parse → analyse → plan. Subsequent
+evaluations reuse the cached plan.
+
+goopg's `lowerPLpgSQLExpr` converts the expression AST on every
+evaluation. There is no caching.
+
+### SPI (Server Programming Interface)
+
+PL/pgSQL executes SQL statements through the SPI interface:
+- `SPI_execute(query, read_only)` — runs a query and returns
+  the result set.
+- `SPI_fetchrow` — retrieves one row from the result set.
+- `SPI_modifytuple` — creates a modified copy of a tuple.
+
+SPI provides full plan caching and handles transactions.
+goopg's PL/pgSQL calls `evalExpr` directly, bypassing any
+plan-caching layer.
+
+### Exception Blocks
+
+PL/pgSQL supports `BEGIN … EXCEPTION WHEN … THEN … END` blocks.
+When an exception occurs inside a block, the handler rolls back
+the subtransaction and executes the exception handler code.
+
+PostgreSQL implements this via subtransactions (`Savepoint` /
+`ReleaseSavepoint`). Each `BEGIN ... EXCEPTION` block creates
+a subtransaction.
+
+goopg does not support exception blocks.
+
+### Cursor Support
+
+PL/pgSQL can open, fetch from, and close cursors:
+
+```plpgsql
+DECLARE c CURSOR FOR SELECT * FROM t;
+FETCH NEXT FROM c;
+CLOSE c;
 ```
-body       ::= DECLARE … BEGIN … END
-statement  ::= RETURN expr
-             | IF cond THEN … ELSIF … ELSE … END IF
-             | LOOP … END LOOP
-             | WHILE cond LOOP … END LOOP
-             | FOR var IN [REVERSE] lower..upper [BY step] LOOP … END LOOP
-             | EXIT [WHEN cond]
-             | CONTINUE [WHEN cond]
-             | PERFORM expr
-             | assignment (target := expr)
-```
 
-### Interpreter (`plpgsql_runtime.go`)
+goopg does not implement cursor support in PL/pgSQL.
 
-Key types and functions:
+### RETURN NEXT / RETURN QUERY
 
-- `plpgsqlFrame` — local variable frame (mutable row). Names are case-insensitive. Shadowing is supported for loop variables.
-- `executePLpgSQLRoutine` — entry point for function calls. Parses the body, builds the frame from arguments and declarations, executes the statement list, and returns a Datum.
-- `executePLpgSQLStmt` — dispatches on statement type:
-  - `ReturnStmt`: evaluate expr, return via `controlFlow(flowReturn)`.
-  - `IfStmt`: evaluate condition, execute matching branch.
-  - `LoopStmt`: infinite loop with EXIT check.
-  - `WhileLoop`: condition + body loop.
-  - `ForLoop`: integer range iteration.
-  - `AssignStmt`: evaluate target expression, assign to frame variable.
-  - `PerformStmt`: evaluate and discard.
-- `lowerPLpgSQLExpr` — converts `parser.Expr` to `planner.Expr` for evaluation by `evalExpr`.
+PL/pgSQL `RETURN NEXT` appends a row to the function's result
+set without terminating. `RETURN QUERY` runs a SELECT and
+appends its result rows. These are used for set-returning
+functions.
 
-### Expression Context
+goopg does not support `RETURN NEXT` or `RETURN QUERY`.
 
-PL/pgSQL expressions can reference frame variables (via `lookup`) and SQL expressions. The `evalPLpgSQLExpr` function wraps `lowerPLpgSQLExpr` + `evalExpr` so that variable references resolve to the frame's current row.
+## goopg Improvement Analysis
 
-### SP Integration
+### P1: Expression Caching
 
-Procedures (no return value) are invoked via `callOp.Next()` which:
-1. Evaluates CALL arguments.
-2. Looks up the procedure in the routine registry.
-3. Executes `execPLpgSQLProcedure` (same as function execution but without the RETURN check).
+Cache the result of `lowerPLpgSQLExpr` for each expression
+within a routine body. On the first call, store the lowered
+`planner.Expr` in a side table. On subsequent calls, reuse it.
 
-## PostgreSQL Implementation
+**Impact:** Eliminates repeated parse/analyse/plan of the same
+expressions. Estimated 2–5× speedup for routines with loops.
 
-PostgreSQL's PL/pgSQL (`pl_exec.c`) is a bytecode-compiled interpreter:
+### P1: Bytecode Compilation (Minimal)
 
-- **Compilation** — on first call, the source text is compiled into
-  a `PLpgSQL_function` containing a `Datum` array of compiled
-  instructions (PLpgSQL_stmt_*). goopg interprets the AST directly
-  without a compilation step.
-- **Expression caching** — SQL expressions within PL/pgSQL are
-  cached as prepared statements after the first evaluation.
-  goopg's `lowerPLpgSQLExpr` converts the AST each time.
-- **SPI** — PostgreSQL's Server Programming Interface (SPI)
-  provides cursor-based access to SQL queries from within PL/pgSQL.
-  goopg does not have SPI; expressions are evaluated via the
-  normal `evalExpr` path.
-- **Exception blocks** — PostgreSQL supports `BEGIN … EXCEPTION
-  … END` for error handling. goopg does not.
+Instead of full bytecode, compile the AST into a `[]stmt` slice
+with resolved variable slots and branch targets once, then
+execute the compiled form on each call.
 
-### Key Differences
+**Impact:** No repeated parsing. No repeated name-to-slot
+resolution.
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Compilation | AST interpretation | Bytecode compilation |
-| Expression caching | None (re-lower on each call) | Cached as prepared statement |
-| SPI | Not implemented | Full SPI interface |
-| Exception handling | Not implemented | BEGIN … EXCEPTION … END |
-| SQL-language routines | Stub (0A000) | Full support |
+### P2: SPI Skeleton
+
+Add a minimal SPI that can plan and execute SQL statements,
+returning a row interface. Use it in PL/pgSQL expression
+evaluation to enable plan caching.
+
+### P3: Exception Blocks
+
+Implement subtransactions in the MVCC layer. Add exception-block
+parsing and execution to the PL/pgSQL runtime.
 
 ## References
 
 - goopg: `internal/plpgsql/` (parser)
 - goopg: `internal/executor/plpgsql_runtime.go`
-- PG PL/pgSQL: `postgres/src/pl/plpgsql/src/pl_exec.c`
+- PG PL/pgSQL executor: `postgres/src/pl/plpgsql/src/pl_exec.c`
 - PG PL/pgSQL grammar: `postgres/src/pl/plpgsql/src/pl_gram.y`
+- PG PL/pgSQL compilation: `postgres/src/pl/plpgsql/src/pl_comp.c`

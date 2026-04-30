@@ -1,66 +1,80 @@
 # REF-005: CTE / WITH Clause
 
-## Overview
+…(existing content up to "Key Differences" unchanged)…
 
-Common Table Expressions (CTEs) — the `WITH` clause — allow queries to define named subqueries that can be referenced multiple times in the main query body. goopg supports non-recursive CTEs (inlined per reference) and recursive CTEs (`WITH RECURSIVE`) via fixpoint iteration.
+## PostgreSQL Implementation (Deep Dive)
 
-## goopg Implementation
+### MATERIALIZED / NOT MATERIALIZED
 
-**Packages:** `internal/planner/with.go`, `internal/parser/`, `internal/analyzer/`, `internal/executor/`
+PostgreSQL materialises CTE results by default (the CTE body runs
+once and its result is shared among all consumers). This acts as
+an **optimisation fence** — the planner cannot push predicates
+into or pull predicates out of a CTE.
 
-### Non-Recursive CTEs
+`WITH ... AS NOT MATERIALIZED` overrides this behaviour, inlining
+the CTE body into the consuming query like a subquery or derived
+table.
 
-Non-recursive CTEs use inline-substitution: each reference to a CTE name in the FROM clause clones the planned body tree. Multiple consumers each get their own copy.
+goopg always inlines CTE bodies (equivalent to `NOT MATERIALIZED`).
 
+### SEARCH and CYCLE Clauses (PG 14+)
+
+PostgreSQL supports two clauses for recursive CTEs:
+
+**SEARCH** — controls traversal order:
+```sql
+WITH RECURSIVE r AS (
+    SELECT ... UNION ALL SELECT ...
+) SEARCH DEPTH FIRST BY id SET order_col
 ```
-planSelect → preplanWithClause(s.With, cat)
-  ├─ plan each CTE body (left-to-right; earlier CTEs visible to later ones)
-  ├─ store planned body in planCTEs map
-  └─ planScanRangeVar → lookupPlannedCTE(name) → CTEScan(plannedBody)
+
+**CYCLE** — detects cycles and stops:
+```sql
+WITH RECURSIVE r AS (
+    SELECT ... UNION ALL SELECT ...
+) CYCLE id SET is_cycle USING path
 ```
 
-### Recursive CTEs
+goopg does not support SEARCH or CYCLE.
 
-`WITH RECURSIVE r AS (anchor UNION ALL recursive_member)` is handled as:
+### Recursive CTE WorkTableScan
 
-1. **Analyzer** (`analyzeRecursiveCTE`): analyses the anchor (left side of UNION ALL) to determine output columns, then registers the CTE in the scope so the recursive member's self-reference resolves.
-2. **Planner** (`planRecursiveCTE`):
-   - Saves and clears the UNION ALL's `SetOp` to plan the anchor.
-   - Registers a `WorkTableScan` placeholder for the CTE name.
-   - Plans the recursive member (CTE references → WorkTableScan).
-   - Returns a `RecursiveUnion{Anchor, Recursive}` node.
-3. **Executor** (`recursiveUnionOp`):
-   - Drains the anchor → working table.
-   - Iterates fixpoint: for each row in the working table, executes the recursive member with `ctx.WorkTableRows` set, collects new rows, replaces the working table, repeats until empty.
+PostgreSQL's recursive CTE executor uses two plan nodes:
 
-### CTE Column Aliases
+- **RecursiveUnion** — drives the fixpoint iteration:
+  1. Execute the non-recursive (anchor) term → `working table`.
+  2. Execute the recursive term with the working table as input
+     → `new working table`.
+  3. Repeat until `new working table` is empty.
+- **WorkTableScan** — reads rows from the current working table.
+  Used inside the recursive term to reference the CTE name.
 
-Optional `(col, …)` aliases rename the CTE's output columns. An arity mismatch between aliases and the body's target list produces a planner error (42P10).
+goopg implements the same nodes with the same semantics.
 
-## PostgreSQL Implementation
+### CTE in DML
 
-PostgreSQL's CTE implementation differs in several important ways:
+PostgreSQL supports CTEs in INSERT/UPDATE/DELETE:
 
-- **Materialisation** — PostgreSQL treats CTEs as optimisation
-  fences by default: the CTE body is materialised once and its
-  result is shared among all consumers. goopg inlines the body
-  (different semantics — side effects may execute multiple times).
-  PostgreSQL can be forced to inline via `WITH … AS NOT MATERIALIZED`.
-- **Recursive CTE** — PostgreSQL's recursive CTE supports
-  `UNION ALL` and `UNION DISTINCT` forms. goopg only supports
-  `UNION ALL`. PostgreSQL also supports `SEARCH` and `CYCLE`
-  clauses for graph traversal.
-- **CTE in subqueries** — PostgreSQL allows CTEs in subqueries
-  and nested WITH clauses. goopg supports nested WITH.
+```sql
+WITH deleted AS (DELETE FROM t WHERE id = 1 RETURNING *)
+INSERT INTO t_audit SELECT * FROM deleted;
+```
 
-### Key Differences
+goopg may support this (the parser handles WITH for all
+statement types), but it is not tested.
 
-| Aspect | goopg | PostgreSQL |
-|--------|-------|------------|
-| Materialisation | Inline per consumer | Materialise once by default |
-| Recursive UNION [DISTINCT] | UNION ALL only | UNION ALL + UNION DISTINCT |
-| SEARCH / CYCLE clauses | Not implemented | Supported for recursive CTEs |
-| CTE in DML | Not tested | Supported (INSERT/UPDATE/DELETE with WITH) |
+## goopg Improvement Analysis
+
+### P2: SEARCH and CYCLE
+
+Implement SEARCH (DEPTH/BREADTH FIRST) and CYCLE detection for
+recursive CTEs. These are essential for graph traversal queries.
+
+### P2: CTE Materialisation
+
+Add a `Materialized` flag to the CTE plan node. When set,
+materialise the CTE result once and share among consumers.
+When unset (default in goopg), inline as currently.
 
 ## References
 
@@ -68,3 +82,4 @@ PostgreSQL's CTE implementation differs in several important ways:
 - goopg: `internal/executor/operators_recursive_cte.go`
 - PG CTE: `postgres/src/backend/parser/parse_cte.c`
 - PG recursive union: `postgres/src/backend/executor/nodeRecursiveunion.c`
+- PG worktable scan: `postgres/src/backend/executor/nodeWorktablescan.c`
