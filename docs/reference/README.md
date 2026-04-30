@@ -11,18 +11,23 @@ Potential Optimisations).
 | REF-001 | AIO Subsystem | ✅ Done |
 | REF-002 | B-Tree Index | ✅ Done |
 | REF-003 | Buffer Pool | ✅ Done |
-| REF-004 | Checkpointer | ✅ Done |
-| REF-005 | CTE / WITH Clause | ✅ Done |
+| REF-006 | EXPLAIN / ANALYZE | ✅ Done |
+| REF-007 | Heap Storage & MVCC | ✅ Done |
+| REF-008 | Lock Manager | ✅ Done |
+| REF-009 | Logical Replication | ✅ Done |
+| REF-010 | Parser & AST | ✅ Done |
+| REF-011 | Planner & Optimiser | ✅ Done |
 | REF-012 | PL/pgSQL Runtime | ✅ Done |
+| REF-013 | Tuple Format & Codec | ✅ Done |
 | REF-014 | UPSERT (ON CONFLICT) | ✅ Done |
 | REF-015 | WAL Format & I/O | ✅ Done |
 | REF-016 | WAL Buffer & Eviction | ⬜ Pending |
 | REF-017 | WAL Redo / Crash Recovery | ⬜ Pending |
 | REF-018 | Window Functions | ⬜ Pending |
-| REF-019 | pg_stat_activity & Wait Events | ⬜ Pending |
-| REF-020 | Row Locking (FOR UPDATE) | ⬜ Pending |
+| REF-019 | pg_stat_activity & Wait Events | ✅ Done |
+| REF-020 | Row Locking (FOR UPDATE) | ✅ Done |
 | REF-021 | Protocol & Wire Format | ⬜ Pending |
 | REF-022 | Session & Transaction Management | ⬜ Pending |
 | REF-023 | Autovacuum | ⬜ Pending |
 
-Total: 23 planned, 5 completed (initial pass).
+Total: 23 planned, 17 completed (as of 2026-05-01).

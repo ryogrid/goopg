@@ -3649,11 +3649,14 @@ works and how PostgreSQL implements equivalent logic.
 - [x] REF-005: CTE / WITH Clause
 - [x] REF-012: PL/pgSQL Runtime
 - [x] REF-014: UPSERT (ON CONFLICT)
+- [x] REF-006: EXPLAIN / ANALYZE
+- [x] REF-009: Logical Replication
+- [x] REF-013: Tuple Format & Codec
+- [x] REF-019: pg_stat_activity & Wait Events
+- [x] REF-020: Row Locking (FOR UPDATE)
 - [ ] REF-016: WAL Buffer & Eviction
 - [ ] REF-017: WAL Redo / Crash Recovery
 - [ ] REF-018: Window Functions
-- [ ] REF-019: pg_stat_activity & Wait Events
-- [ ] REF-020: Row Locking (FOR UPDATE)
 - [ ] REF-021: Protocol & Wire Format
 - [ ] REF-022: Session & Transaction Management
 - [ ] REF-023: Autovacuum
