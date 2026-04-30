@@ -26,8 +26,17 @@ type Launcher struct {
 	// NapInterval is the time between launcher wakeups.
 	NapInterval time.Duration
 
+	// MinVacuumAge is the minimum time between vacuums of the same table.
+	MinVacuumAge time.Duration
+
+	// MinAnalyzeAge is the minimum time between analyzes of the same table.
+	MinAnalyzeAge time.Duration
+
 	// WorkerLimit caps the number of concurrent vacuum/analyze workers.
 	WorkerLimit int
+
+	lastVacuum  map[string]time.Time   // key: qualified table name
+	lastAnalyze map[string]time.Time
 
 	logger *slog.Logger
 }
@@ -35,11 +44,15 @@ type Launcher struct {
 // NewLauncher creates a Launcher with the given dependencies.
 func NewLauncher(pool *storage.Pool, txnMgr *mvcc.Manager, cat catalog.Catalog) *Launcher {
 	return &Launcher{
-		Pool:        pool,
-		TxnMgr:      txnMgr,
-		Cat:         cat,
-		NapInterval: 60 * time.Second,
-		WorkerLimit: 1,
+		Pool:          pool,
+		TxnMgr:        txnMgr,
+		Cat:           cat,
+		NapInterval:   60 * time.Second,
+		MinVacuumAge:  5 * time.Minute,
+		MinAnalyzeAge: 5 * time.Minute,
+		WorkerLimit:   1,
+		lastVacuum:    make(map[string]time.Time),
+		lastAnalyze:   make(map[string]time.Time),
 	}
 }
 
@@ -75,13 +88,12 @@ func (l *Launcher) Run(ctx context.Context) error {
 func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 	log.Debug("autovacuum launcher tick")
 
-	// Get all user tables.
 	tables := l.loadTables()
 	if len(tables) == 0 {
 		return
 	}
 
-	// For each table, check if it needs vacuum or analyze.
+	now := time.Now()
 	for _, tbl := range tables {
 		select {
 		case <-ctx.Done():
@@ -89,31 +101,39 @@ func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 		default:
 		}
 
+		key := tbl.Schema + "." + tbl.Name
 		rel := l.Cat.RelFileNode(tbl)
-		if l.needsVacuum(tbl) {
-			log.Info("autovacuum: running vacuum", "table", tbl.Name)
-			stats, err := vacuum.Vacuum(l.Pool, l.TxnMgr, rel)
-			if err != nil {
-				log.Error("autovacuum: vacuum failed", "table", tbl.Name, "error", err)
-			} else {
-				log.Info("autovacuum: vacuum done", "table", tbl.Name,
-					"pages", stats.Pages, "dead", stats.Dead, "live", stats.Live)
+
+		if last, ok := l.lastVacuum[key]; !ok || now.Sub(last) >= l.MinVacuumAge {
+			if l.needsVacuum(tbl) {
+				log.Info("autovacuum: running vacuum", "table", key)
+				stats, err := vacuum.Vacuum(l.Pool, l.TxnMgr, rel)
+				if err != nil {
+					log.Error("autovacuum: vacuum failed", "table", key, "error", err)
+				} else {
+					l.lastVacuum[key] = now
+					log.Info("autovacuum: vacuum done", "table", key,
+						"pages", stats.Pages, "dead", stats.Dead, "live", stats.Live)
+				}
 			}
 		}
-		if l.needsAnalyze(tbl) {
-			log.Info("autovacuum: running analyze", "table", tbl.Name)
-			stats, err := vacuum.Analyze(l.Pool, l.TxnMgr, rel)
-			if err != nil {
-				log.Error("autovacuum: analyze failed", "table", tbl.Name, "error", err)
-			} else {
-				log.Info("autovacuum: analyze done", "table", tbl.Name,
-					"rows", stats.Rows)
+
+		if last, ok := l.lastAnalyze[key]; !ok || now.Sub(last) >= l.MinAnalyzeAge {
+			if l.needsAnalyze(tbl) {
+				log.Info("autovacuum: running analyze", "table", key)
+				stats, err := vacuum.Analyze(l.Pool, l.TxnMgr, rel)
+				if err != nil {
+					log.Error("autovacuum: analyze failed", "table", key, "error", err)
+				} else {
+					l.lastAnalyze[key] = now
+					log.Info("autovacuum: analyze done", "table", key,
+						"rows", stats.Rows)
+				}
 			}
 		}
 	}
 }
 
-// loadTables returns all non-virtual user tables from the catalog.
 func (l *Launcher) loadTables() []*catalog.Table {
 	if c, ok := l.Cat.(*catalog.InMemory); ok {
 		return c.AllTables()
@@ -121,14 +141,19 @@ func (l *Launcher) loadTables() []*catalog.Table {
 	return nil
 }
 
-// needsVacuum returns true if the table's dead-tuple estimate exceeds
-// the v0 threshold. For now, always vacuums every nap interval.
+// needsVacuum returns true if the table should be vacuumed.
+// v0 uses a simple heuristic: vacuum if the table has any
+// stats (has been analyzed) and RowCount > 0; otherwise skip
+// (no data yet or never analyzed).
 func (l *Launcher) needsVacuum(tbl *catalog.Table) bool {
-	return true
+	if tbl.Stats == nil {
+		return true
+	}
+	return tbl.Stats.RowCount > 0
 }
 
-// needsAnalyze returns true if the table's stats are stale. For now,
-// always analyzes every nap interval.
+// needsAnalyze returns true if the table should be analyzed.
 func (l *Launcher) needsAnalyze(tbl *catalog.Table) bool {
 	return true
 }
+

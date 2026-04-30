@@ -3053,8 +3053,9 @@ Decompose when picked up.
       tables and dispatches `vacuum.Vacuum` / `vacuum.Analyze`.
       Wired into `server.Config.AutovacuumLauncher` and started
       as a background goroutine in `Server.Run`. Trigger policy
-      still always-vacuum (no threshold logic yet); cost controls
-      and full observability deferred. Full `go test ./...` green.)
+      uses time-based throttle (MinVacuumAge, MinAnalyzeAge)
+      and skips tables with no rows after first analysis. Full
+      `go test ./...` green.)
 
 ## Milestone 0020 — Window functions
 
