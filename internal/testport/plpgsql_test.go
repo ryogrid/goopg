@@ -2,12 +2,15 @@ package testport
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/goopg/goopg/internal/testutil/cluster"
+	"github.com/goopg/goopg/internal/testutil/util"
 )
 
 // runSQL is a helper that runs SQL via the Go-native Query method
@@ -175,59 +178,115 @@ func TestPort_PLpgSQLDuplicateAndMissingProcedure(t *testing.T) {
 	runSQL(t, c, "DROP PROCEDURE IF EXISTS nonexistent()")
 }
 
-// TestPort_PLpgSQLViaPsql is the psql-based counterpart that
-// exercises stored procedures through the psql CLI. Skipped
-// when psql is not on PATH.
-func TestPort_PLpgSQLViaPsql(t *testing.T) {
-	if _, err := exec.LookPath("psql"); err != nil {
-		t.Skip("psql not installed")
+// psqlPath returns the in-tree PostgreSQL psql path when available,
+// or falls back to checking the system PATH. Returns empty string if
+// no psql is found anywhere.
+func psqlPath(t *testing.T) string {
+	t.Helper()
+	// Try the in-tree local_install first (see Makefile PG_BIN_DIR).
+	root := repoRoot(t)
+	local := filepath.Join(root, "postgres", "local_install", "bin", "psql")
+	if s, err := os.Stat(local); err == nil && s.Mode().IsRegular() {
+		return local
 	}
-	c := newCluster(t, "plpgsql_psql")
-	mustInitStart(t, c)
-	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	// Fall back to PATH lookup.
+	p, err := exec.LookPath("psql")
+	if err != nil {
+		return ""
+	}
+	return p
+}
 
-	// Create, call, drop via psql.
-	res, err := c.PSQL("-Atqc", "CREATE PROCEDURE greet(name text) LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$")
+// psqlCluster creates a cluster configured to use the in-tree psql.
+func psqlCluster(t *testing.T, name string) *cluster.Cluster {
+	t.Helper()
+	psql := psqlPath(t)
+	c, err := cluster.New(name, cluster.Options{
+		RepoRoot:      repoRoot(t),
+		DataDir:       filepath.Join(t.TempDir(), "data"),
+		StartupWait:   20 * time.Second,
+		ShutdownWait:  20 * time.Second,
+		PSQLPath:      psql,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return c
+}
+
+// runPSQL runs psql against the cluster with the given args, setting
+// LD_LIBRARY_PATH so the in-tree libpq is found.
+func runPSQL(t *testing.T, c *cluster.Cluster, args ...string) util.CommandResult {
+	t.Helper()
+	root := repoRoot(t)
+	libDir := filepath.Join(root, "postgres", "local_install", "lib")
+	addr := c.ListenAddr()
+	host, port, _ := strings.Cut(addr, ":")
+	psqlPath := filepath.Join(root, "postgres", "local_install", "bin", "psql")
+	psqlArgs := append([]string{"-h", host, "-p", port, "-U", "postgres", "-d", "postgres"}, args...)
+	res, err := util.RunCommand(util.CommandSpec{
+		Name: psqlPath,
+		Args: psqlArgs,
+		Env:  []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + libDir},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// TestPort_PLpgSQLViaPsql exercises stored procedures through the
+// psql CLI. Skipped when psql is not found.
+func TestPort_PLpgSQLViaPsql(t *testing.T) {
+	psql := psqlPath(t)
+	if psql == "" {
+		t.Skip("psql not installed")
+	}
+	c := psqlCluster(t, "plpgsql_psql")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// CREATE PROCEDURE and CALL via psql.
+	res := runPSQL(t, c, "-Atqc", "CREATE PROCEDURE greet(name text) LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$")
 	if res.ExitCode != 0 {
 		t.Fatalf("CREATE PROCEDURE via psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
 
-	res, err = c.PSQL("-Atqc", "CALL greet('world')")
-	if err != nil {
-		t.Fatal(err)
-	}
+	res = runPSQL(t, c, "-Atqc", "CALL greet('world')")
 	if res.ExitCode != 0 {
 		t.Fatalf("CALL via psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
 
-	res, err = c.PSQL("-Atqc", "DROP PROCEDURE greet(text)")
-	if err != nil {
-		t.Fatal(err)
-	}
+	res = runPSQL(t, c, "-Atqc", "DROP PROCEDURE greet(text)")
 	if res.ExitCode != 0 {
 		t.Fatalf("DROP PROCEDURE via psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
 
-	// Also test a function via psql.
-	res, err = c.PSQL("-Atqc", "CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN x + 1; END $$")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Function via psql.
+	res = runPSQL(t, c, "-Atqc", "CREATE FUNCTION add_one(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN x + 1; END $$")
 	if res.ExitCode != 0 {
 		t.Fatalf("CREATE FUNCTION via psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
 
-	res, err = c.PSQL("-Atqc", "SELECT add_one(41)")
-	if err != nil {
-		t.Fatal(err)
-	}
+	res = runPSQL(t, c, "-Atqc", "SELECT add_one(41)")
 	if res.ExitCode != 0 {
 		t.Fatalf("SELECT via psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
 	if strings.TrimSpace(res.Stdout) != "42" {
 		t.Fatalf("add_one(41) via psql = %q, want 42", res.Stdout)
+	}
+
+	// OUT params via psql.
+	res = runPSQL(t, c, "-Atqc", "CREATE PROCEDURE double_it(IN x int, OUT result int) LANGUAGE plpgsql AS $$ BEGIN result := x * 2; END $$")
+	if res.ExitCode != 0 {
+		t.Fatalf("CREATE PROCEDURE (OUT) via psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+
+	res = runPSQL(t, c, "-Atqc", "CALL double_it(21)")
+	if res.ExitCode != 0 {
+		t.Fatalf("CALL OUT via psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	if strings.TrimSpace(res.Stdout) != "42" {
+		t.Fatalf("CALL double_it(21) via psql = %q, want 42", res.Stdout)
 	}
 }
