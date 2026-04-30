@@ -269,9 +269,12 @@ type Writer struct {
 	// two pointers). Exposed via MemRing() so the iterator
 	// and observability code can read it without serialising
 	// through the writer's loop. nil when
-	// Config.SenderMemoryBuffer == 0. See
-	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
 	memRing *MemRing
+
+	// stateRef is a reference to the state struct, needed by
+	// Writer.Append to call encodeAndBuffer directly (M0026
+	// concurrent append path).
+	stateRef *state
 
 	// directIOCounters shares atomics with state for the
 	// pg_stat_wal_io view. Allocated once at construction; never
@@ -358,6 +361,11 @@ type state struct {
 	// RMW path. Snapshot of (`directIORequested && fallback==""`)
 	// captured at writer construction.
 	directIOActive bool
+
+	// appendMu serialises access to walBuf / memRing / writePos /
+	// writeLSN / drainedLSN so that Writer.Append (M0026 concurrent
+	// append) and the state loop's drain path do not race.
+	appendMu sync.Mutex
 
 	// directIOBlockSize is the alignment / minimum-write
 	// granularity O_DIRECT enforces on this filesystem. ext4 and
@@ -481,6 +489,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 		directIORequested:      st.directIORequested,
 		directIOFallbackReason: st.directIOFallbackReason,
 		memRing:                st.memRing,
+		stateRef:               st,
 		directIOCounters:       counters,
 		walBufferCounters:      bufCounters,
 		pageHeaders:            cfg.PageHeaders,
@@ -660,6 +669,13 @@ func (w *Writer) notifyAppend() {
 
 // Append writes one record and returns its [startLSN, endLSN].
 //
+// M0026: when a WAL buffer is configured, the calling goroutine
+// encodes and buffers the record directly under state.appendMu,
+// bypassing the state-loop goroutine.  This eliminates the
+// serial round-trip in the common case (buffer not full).
+// When the buffer overflows (uncommon), the call falls back to
+// the state-loop path (legacy behaviour).
+//
 // Empty payloads are rejected because the encoded zero header
 // (len=0, crc=0) is reserved as the EOS sentinel in preallocated
 // segments — see
@@ -669,6 +685,18 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 	if len(payload) == 0 {
 		return 0, 0, ErrEmptyPayload
 	}
+
+	// Fast path: WAL buffer available — encode and buffer under
+	// appendMu, sending an opAppend to the state loop only when
+	// the buffer overflows.
+	if st := w.stateRef; st != nil && st.walBuf != nil {
+		if start, end, ok, err := st.tryAppend(payload); ok {
+			return start, end, err
+		}
+	}
+
+	// Slow path: no WAL buffer, or buffer overflow — fall back
+	// to the state-loop goroutine (legacy serialised path).
 	resp := make(chan result, 1)
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
@@ -1045,6 +1073,7 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		stream, leading = emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
 	}
 	start := uint64(writePos) + uint64(leading) + 1
+	var end uint64
 
 	// Path A: WAL buffer disabled, OR record larger than the
 	// entire buffer. Bypass and write straight to disk —
@@ -1054,24 +1083,29 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		if err := s.writeAt(writePos, stream); err != nil {
 			return 0, 0, err
 		}
+		// I/O done; now update LSN under appendMu so
+		// concurrent tryAppend callers see consistent state.
+		s.appendMu.Lock()
 		s.memRing.Append(writePos, stream)
 		s.writePos = writePos + int64(len(stream))
-		end := uint64(s.writePos)
+		end = uint64(s.writePos)
 		s.writeLSN = end
 		s.drainedLSN = end
 		if s.writeLSNMirror != nil {
 			s.writeLSNMirror.Store(end)
 		}
 		if s.pageHeaders {
-			// Convert goopg's 1-based start LSN to upstream's
-			// 0-based RecPtr for xl_prev linkage.
 			s.prevRecPtr = start - 1
 		}
+		s.appendMu.Unlock()
 		return start, end, nil
 	}
 
-	// Path B: buffered append. If we'd overflow, drain the head
-	// of the buffer to segment files first to make room.
+	// Path B: buffered append. Serialise buffer access and LSN
+	// update under appendMu so we don't race with tryAppend.
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
 	need := int64(len(stream)) - s.walBuf.free()
 	if need > 0 {
 		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
@@ -1084,7 +1118,7 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	// streaming-from-RAM invariant unchanged from M0010-0002.
 	s.memRing.Append(writePos, stream)
 	s.writePos = writePos + int64(len(stream))
-	end := uint64(s.writePos)
+	end = uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {
 		s.writeLSNMirror.Store(end)
@@ -1093,6 +1127,62 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		s.prevRecPtr = start
 	}
 	return start, end, nil
+}
+
+// tryAppend attempts a fast-path append directly on the calling
+// goroutine.  Returns ok=true when the record was buffered without
+// I/O; returns ok=false when the caller must fall back to the
+// state-loop path (buffer overflow or other condition requiring
+// disk write).  M0026: this eliminates the state-loop round-trip
+// for the common case (buffer not full).
+func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error) {
+	record := encodeRecord(payload)
+	realRecLen := len(record)
+	if s.pageHeaders {
+		record, realRecLen, err = encodeRecordXLog(payload, s.prevRecPtr)
+		if err != nil {
+			return 0, 0, false, err
+		}
+	}
+
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
+	writePos := s.writePos
+	stream := record
+	leading := 0
+	if s.pageHeaders {
+		stream, leading = emitWithPageHeaders(record, realRecLen,
+			writePos, s.cfg.SegmentSize, s.sysID, s.tli)
+	}
+	start = uint64(writePos) + uint64(leading) + 1
+
+	// Path A: record larger than the buffer — can't handle without I/O.
+	if !s.walBuf.canHold(len(stream)) {
+		return 0, 0, false, nil
+	}
+
+	// Path B: buffered append.  If we'd overflow, fall back to the
+	// state loop (which will drain first).
+	if int64(len(stream)) > s.walBuf.free() {
+		return 0, 0, false, nil
+	}
+
+	s.walBuf.append(stream)
+	s.memRing.Append(writePos, stream)
+	s.writePos = writePos + int64(len(stream))
+	end = uint64(s.writePos)
+	s.writeLSN = end
+	if s.writeLSNMirror != nil {
+		s.writeLSNMirror.Store(end)
+	}
+	if s.pageHeaders {
+		s.prevRecPtr = start
+	}
+	if s.onAppend != nil {
+		s.onAppend()
+	}
+	return start, end, true, nil
 }
 
 // drainBufferBytes writes at least `n` bytes from walBuf's head to

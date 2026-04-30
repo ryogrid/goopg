@@ -3621,3 +3621,68 @@ E2E scenario tests:
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
+
+## Milestone 0027 — Low-risk performance optimisations
+
+See `docs/milestones/0027-readability-preserving-optimisations.md`
+and `docs/design/0027-0001-hot-path-micro-optimisations.md`.
+
+- [x] DecodeRowInto — reuse row buffer in scanMatching (avoids 300K allocations per SeqScan)
+- [x] Pre-allocate pending/matches slices (common case: 1-row match)
+- [x] CRC-32 cache for WAL encodeRecord (avoids recomputation for repeated payloads)
+- [x] B-tree direct binary search (findChildBlockDirect — avoids decoding all items per page). TPC-B +10%.
+- [ ] Remaining TPC-B gap vs simple-update (1122 vs 1514 TPS). Deeper analysis deferred.
+
+## Milestone 0028 — PostgreSQL implementation reference docs
+
+See `docs/milestones/0028-postgres-implementation-reference.md`.
+
+Documents under `docs/reference/` explaining how each goopg component
+works and how PostgreSQL implements equivalent logic.
+
+- [x] REF-001: AIO Subsystem
+- [x] REF-002: B-Tree Index
+- [x] REF-003: Buffer Pool
+- [x] REF-008: Lock Manager
+- [x] REF-015: WAL Format & I/O
+- [x] REF-004: Checkpointer
+- [x] REF-005: CTE / WITH Clause
+- [x] REF-012: PL/pgSQL Runtime
+- [x] REF-014: UPSERT (ON CONFLICT)
+- [x] REF-006: EXPLAIN / ANALYZE
+- [x] REF-009: Logical Replication
+- [x] REF-013: Tuple Format & Codec
+- [x] REF-019: pg_stat_activity & Wait Events
+- [x] REF-020: Row Locking (FOR UPDATE)
+- [x] REF-016: WAL Buffer & Eviction
+- [x] REF-017: WAL Redo / Crash Recovery
+- [x] REF-018: Window Functions
+- [x] REF-021: Protocol & Wire Format
+- [x] REF-022: Session & Transaction Management
+- [x] REF-023: Autovacuum
+
+## Milestone 0028b — Deepen PostgreSQL reference docs
+
+See milestone 0028. Each document needs more detailed PostgreSQL
+implementation logic and more concrete goopg improvement analysis.
+
+- [x] REF-001: AIO Subsystem — deep-dive PostgreSQL AIOContext per-backend model, completion list lock-free push, compare with goopg single-engine approach
+- [x] REF-002: B-Tree Index — deep-dive PostgreSQL nbtree page deletion, dedup, fast root, incomplete-split recovery, GiST/SP-GiST comparison
+- [x] REF-003: Buffer Pool — deep-dive PostgreSQL bgwriter, strategy ring, BM_IO_IN_PROGRESS, buffer descriptor atomic ops, checkpointer vs bgwriter split
+- [x] REF-007: Heap Storage & MVCC — deep-dive PostgreSQL HOT chain, heap_page_prune, FSM, VM, tuple freezing, TOAST
+- [ ] REF-008: Lock Manager — deep-dive PostgreSQL fast-path locking, deadlock_timeout, lock partitioning, LOCKTAG granularity
+- [ ] REF-009: Logical Replication — deep-dive PostgreSQL parallel apply, two-phase commit, conflict detection, origin tracking
+- [ ] REF-010: Parser & AST — deep-dive PostgreSQL keyword categorisation, parse analysis, CTE scoping, raw_expression_tree_walker
+- [ ] REF-011: Planner & Optimiser — deep-dive PostgreSQL path generation, GEQO, parallel plan creation, expression optimisation, SubqueryScan
+- [ ] REF-012: PL/pgSQL Runtime — deep-dive PostgreSQL bytecode compilation, SPI, expression caching, exception blocks, cursor support
+- [ ] REF-013: Tuple Format & Codec — deep-dive PostgreSQL null bitmap encoding, t_infomask2 flags, Datum pass-by-value/reference, expanded objects
+- [ ] REF-014: UPSERT (ON CONFLICT) — deep-dive PostgreSQL concurrent UPSERT retry loop, exclusion constraints, partial indexes, speculative insertion
+- [ ] REF-015: WAL Format & I/O — deep-dive PostgreSQL WALInsertLock partitioning, group commit, CRC-32C hardware acceleration, wal_level differences
+- [ ] REF-016: WAL Buffer & Eviction — deep-dive PostgreSQL lock-free WAL ring, XLogCtl->xlblocks, WAL writer flush interaction, wal_buffers sizing
+- [ ] REF-017: WAL Redo / Crash Recovery — deep-dive PostgreSQL FPI-based idempotency, recovery conflicts, parallel redo, WAL summariser
+- [ ] REF-018: Window Functions — deep-dive PostgreSQL frame clause (ROWS/RANGE/GROUPS/EXCLUDE), LEAD/LAG spool, Aggregate with OVER, WINDOW clause
+- [ ] REF-019: pg_stat_activity & Wait Events — deep-dive PostgreSQL pgstat shared memory, wait event encoding (uint32 class+id), dynamic event registration
+- [ ] REF-020: Row Locking (FOR UPDATE) — deep-dive PostgreSQL MultiXact for multi-holder share locks, lock strength (4 levels), NOWAIT error code 55P03
+- [ ] REF-021: Protocol & Wire Format — deep-dive PostgreSQL extended query (Parse/Bind/Execute), cancellation, SCRAM, GSS, COPY binary format
+- [ ] REF-022: Session & Transaction Management — deep-dive PostgreSQL subtransactions, prepared transactions, process model vs goroutine model, GUC memory management
+- [ ] REF-023: Autovacuum — deep-dive PostgreSQL cost-based delay, anti-wraparound, per-table storage parameters, worker process pool, dead-tuple tracking

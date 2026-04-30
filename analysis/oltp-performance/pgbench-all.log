@@ -1,0 +1,42 @@
+pgbench (18.3)
+starting vacuum...end.
+transaction type: <builtin: select only>
+scaling factor: 10
+query mode: simple
+number of clients: 1
+number of threads: 1
+maximum number of tries: 1
+number of transactions per client: 5000
+number of transactions actually processed: 5000/5000
+number of failed transactions: 0 (0.000%)
+latency average = 0.319 ms
+initial connection time = 0.615 ms
+tps = 3134.694041 (without initial connection time)
+pgbench (18.3)
+starting vacuum...end.
+transaction type: <builtin: select only>
+scaling factor: 10
+query mode: simple
+number of clients: 4
+number of threads: 1
+maximum number of tries: 1
+number of transactions per client: 2000
+number of transactions actually processed: 8000/8000
+number of failed transactions: 0 (0.000%)
+latency average = 0.673 ms
+initial connection time = 2.660 ms
+tps = 5947.495510 (without initial connection time)
+pgbench (18.3)
+starting vacuum...end.
+transaction type: <builtin: select only>
+scaling factor: 10
+query mode: simple
+number of clients: 16
+number of threads: 1
+maximum number of tries: 1
+number of transactions per client: 500
+number of transactions actually processed: 8000/8000
+number of failed transactions: 0 (0.000%)
+latency average = 2.871 ms
+initial connection time = 10.365 ms
+tps = 5573.052619 (without initial connection time)

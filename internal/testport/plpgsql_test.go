@@ -310,9 +310,10 @@ func TestPort_PgStatActivity(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	rows := runSQL(t, c, "SELECT pid, state, backend_type, application_name FROM pg_catalog.pg_stat_activity")
+	rows := runSQL(t, c, "SELECT pid, state, backend_type, application_name FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client_backend'")
 	if len(rows) == 0 {
-		t.Fatal("pg_stat_activity returned zero rows, expected at least one")
+		// If no client_backend rows (e.g. hidden by walwriter etc.), check any row.
+		rows = runSQL(t, c, "SELECT pid, state, backend_type, application_name FROM pg_catalog.pg_stat_activity LIMIT 1")
 	}
 	// Verify the first row has a non-empty PID and valid state.
 	row := rows[0]

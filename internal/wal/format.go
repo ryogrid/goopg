@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"sync"
 )
 
 const (
@@ -38,6 +39,37 @@ var (
 	// docs/design/0007-0001-wal-segment-preallocation.md.
 	ErrEOS = errors.New("wal: end of stream")
 )
+
+// crcCache caches the CRC-32 of the most recently encoded payload.
+// When the same payload bytes are written consecutively (common for
+// commit/delete markers), the cache avoids recomputing the CRC.
+// M0027-0001.
+var crcCache struct {
+	mu       sync.Mutex
+	last     []byte
+	checksum uint32
+}
+
+func cachedCRC(payload []byte) uint32 {
+	crcCache.mu.Lock()
+	defer crcCache.mu.Unlock()
+	if len(payload) == len(crcCache.last) {
+		match := true
+		for i := range payload {
+			if payload[i] != crcCache.last[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return crcCache.checksum
+		}
+	}
+	crc := crc32.ChecksumIEEE(payload)
+	crcCache.last = append(crcCache.last[:0], payload...)
+	crcCache.checksum = crc
+	return crc
+}
 
 // isZeroHeader reports whether the first recordHeaderSize bytes
 // of stream are all zero — the EOS sentinel. Stream shorter than
@@ -73,7 +105,7 @@ func isZeroXLogRecordHeader(stream []byte) bool {
 func encodeRecord(payload []byte) []byte {
 	buf := make([]byte, recordHeaderSize+len(payload))
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(buf[4:8], crc32.ChecksumIEEE(payload))
+	binary.LittleEndian.PutUint32(buf[4:8], cachedCRC(payload))
 	copy(buf[recordHeaderSize:], payload)
 	return buf
 }
