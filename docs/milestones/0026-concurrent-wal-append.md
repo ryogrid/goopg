@@ -1,6 +1,6 @@
 # Milestone 0026 — Concurrent WAL Append & Flush Architecture
 
-**Status:** planned
+**Status:** in-progress
 **Depends on:** Milestone 0013 (WAL buffer infrastructure), Milestone 0025 (OLTP performance analysis, which identified the WAL serialisation bottleneck).
 **Drives:** Remove the single-goroutine WAL serialisation bottleneck so that write-heavy OLTP workloads (pgbench default / simple update) can approach read-only throughput.
 
