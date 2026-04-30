@@ -163,10 +163,17 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 	arg := FunctionArg{pos: pos, Mode: FuncArgIn}
 
 	// Reject Stage B keywords explicitly. KwOut / KwInout / KwVariadic
-	// don't exist yet, so we can only catch them when they're
-	// surfaced as identifiers. That's what isReservedFutureMode does.
+	// are now registered keywords; check both keyword and ident forms.
 	if p.cur().Kind == TokenIdent {
 		if isReservedFutureMode(p.cur().Value) {
+			return FunctionArg{}, p.errAtCur(fmt.Sprintf(
+				"function argument mode %q is not supported in v0 (Stage A: IN only)",
+				p.cur().Value))
+		}
+	}
+	if p.cur().Kind == TokenKeyword {
+		switch p.cur().Keyword {
+		case KwOut, KwInout, KwVariadic:
 			return FunctionArg{}, p.errAtCur(fmt.Sprintf(
 				"function argument mode %q is not supported in v0 (Stage A: IN only)",
 				p.cur().Value))
@@ -272,6 +279,97 @@ func (p *parser) parseDropFunctionTail(pos int) (Stmt, error) {
 		stmt.Behavior = DropCascade
 	case p.acceptKeyword(KwRestrict):
 		stmt.Behavior = DropDefault
+	}
+	return stmt, nil
+}
+
+// parseCreateProcedureTail picks up after CREATE [OR REPLACE]
+// PROCEDURE and returns a populated CreateProcedureStmt. Caller has
+// already consumed the leading CREATE [OR REPLACE] PROCEDURE tokens.
+// Stage B (procedure follow-up) of M0015.
+func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error) {
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	args, err := p.parseFunctionArgList()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &CreateProcedureStmt{
+		pos:       pos,
+		OrReplace: orReplace,
+		Name:      name,
+		Args:      args,
+	}
+	// LANGUAGE / AS clauses in either order (mirrors CREATE FUNCTION)
+	sawLanguage := false
+	sawAs := false
+	for {
+		switch {
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLanguage:
+			if sawLanguage {
+				return nil, p.errAtCur("duplicate LANGUAGE clause")
+			}
+			p.advance()
+			lang, err := p.parseLanguageName()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Language = lang
+			sawLanguage = true
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs:
+			if sawAs {
+				return nil, p.errAtCur("duplicate AS clause")
+			}
+			p.advance()
+			body, err := p.parseFunctionBody()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Body = body
+			sawAs = true
+		default:
+			if !sawAs {
+				return nil, p.errAtCur("expected AS $$body$$ for CREATE PROCEDURE")
+			}
+			return stmt, nil
+		}
+	}
+}
+
+// parseCallStatement parses `CALL proc_name([expr [, ...]])`.
+// Stage B (procedure follow-up) of M0015.
+func (p *parser) parseCallStatement(pos int) (Stmt, error) {
+	// CALL keyword already consumed
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &CallStmt{
+		pos:  pos,
+		Name: name,
+	}
+	// Optional argument list
+	if p.acceptSymbol("(") {
+		args := make([]Expr, 0, 2)
+		if !p.acceptSymbol(")") {
+			for {
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, expr)
+				if p.acceptSymbol(",") {
+					continue
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ',' or ')' in CALL argument list")
+				}
+				break
+			}
+		}
+		stmt.Args = args
 	}
 	return stmt, nil
 }

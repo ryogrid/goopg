@@ -866,3 +866,30 @@ type DropFunctionStmt struct {
 
 func (s *DropFunctionStmt) Pos() int  { return s.pos }
 func (s *DropFunctionStmt) stmtNode() {}
+
+// CreateProcedureStmt is the AST for `CREATE [OR REPLACE] PROCEDURE ...`.
+// Stage B (procedure follow-up) of M0015.
+type CreateProcedureStmt struct {
+	pos       int
+	OrReplace bool
+	Name      ObjectName
+	Args      []FunctionArg
+	// Procedure doesn't have RETURN type; use FunctionArgMode for OUT/INOUT parameters
+	Language string // lower-cased, e.g. "plpgsql"
+	Body     string // raw source between the dollar-quote delimiters
+}
+
+func (s *CreateProcedureStmt) Pos() int  { return s.pos }
+func (s *CreateProcedureStmt) stmtNode() {}
+
+// CallStmt is the AST for `CALL procedure_name([arg [, ...]])`.
+// Stage B (procedure follow-up) of M0015.
+type CallStmt struct {
+	pos  int
+	Name ObjectName
+	Args []Expr // expressions for IN arguments
+	// OUT/INOUT parameter result handling deferred
+}
+
+func (s *CallStmt) Pos() int  { return s.pos }
+func (s *CallStmt) stmtNode() {}

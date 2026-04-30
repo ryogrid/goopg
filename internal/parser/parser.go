@@ -207,6 +207,9 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseExplain()
 	case KwWith:
 		return p.parseStatementWithCTE()
+	case KwCall:
+		p.advance()
+		return p.parseCallStatement(t.Pos)
 	}
 	return nil, p.errAtCur("unsupported statement")
 }

@@ -199,6 +199,14 @@ const (
 	KwContinue Keyword = "continue"
 	KwReverse  Keyword = "reverse"
 	KwPerform  Keyword = "perform"
+
+	// Stage B (procedure follow-up) keywords for M0015.
+	// These enable CREATE PROCEDURE and CALL statements.
+	KwProcedure Keyword = "procedure"
+	KwCall      Keyword = "call"
+	KwOut       Keyword = "out"
+	KwInout     Keyword = "inout"
+	KwVariadic  Keyword = "variadic"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -326,6 +334,11 @@ var keywords = map[string]Keyword{
 	"continue":     KwContinue,
 	"reverse":      KwReverse,
 	"perform":      KwPerform,
+	"procedure":    KwProcedure,
+	"call":         KwCall,
+	"out":          KwOut,
+	"inout":        KwInout,
+	"variadic":     KwVariadic,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

@@ -256,3 +256,124 @@ func TestPositionalParameterStillParses(t *testing.T) {
 		t.Fatalf("got %d stmts", len(stmts))
 	}
 }
+
+// TestParseCreateProcedureMinimal pins the basic CREATE PROCEDURE form.
+// Stage B (procedure follow-up) of M0015.
+func TestParseCreateProcedureMinimal(t *testing.T) {
+	src := `CREATE PROCEDURE proc() LANGUAGE plpgsql AS $$ BEGIN END $$`
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("got %d statements, want 1", len(stmts))
+	}
+	cp, ok := stmts[0].(*CreateProcedureStmt)
+	if !ok {
+		t.Fatalf("got %T, want *CreateProcedureStmt", stmts[0])
+	}
+	if cp.OrReplace {
+		t.Errorf("OrReplace = true, want false")
+	}
+	if cp.Name.Name != "proc" {
+		t.Errorf("Name.Name = %q, want proc", cp.Name.Name)
+	}
+	if len(cp.Args) != 0 {
+		t.Errorf("Args len = %d, want 0", len(cp.Args))
+	}
+	if cp.Language != "plpgsql" {
+		t.Errorf("Language = %q, want plpgsql", cp.Language)
+	}
+	if !strings.Contains(cp.Body, "BEGIN END") {
+		t.Errorf("Body = %q, missing BEGIN END", cp.Body)
+	}
+}
+
+// TestParseCreateProcedureOrReplace pins OR REPLACE flag.
+func TestParseCreateProcedureOrReplace(t *testing.T) {
+	src := `CREATE OR REPLACE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$`
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("got %d statements, want 1", len(stmts))
+	}
+	cp := stmts[0].(*CreateProcedureStmt)
+	if !cp.OrReplace {
+		t.Errorf("OrReplace = false, want true")
+	}
+}
+
+// TestParseCreateProcedureArgs pins argument parsing.
+func TestParseCreateProcedureArgs(t *testing.T) {
+	src := `CREATE PROCEDURE p(a int, b text) LANGUAGE plpgsql AS $$ BEGIN END $$`
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cp := stmts[0].(*CreateProcedureStmt)
+	if len(cp.Args) != 2 {
+		t.Fatalf("Args len = %d, want 2", len(cp.Args))
+	}
+	if cp.Args[0].Name != "a" || cp.Args[0].Type.Name != "int" {
+		t.Errorf("first arg = %v", cp.Args[0])
+	}
+	if cp.Args[1].Name != "b" || cp.Args[1].Type.Name != "text" {
+		t.Errorf("second arg = %v", cp.Args[1])
+	}
+}
+
+// TestParseCreateProcedureNoLanguage leaves Language empty when omitted.
+func TestParseCreateProcedureNoLanguage(t *testing.T) {
+	src := `CREATE PROCEDURE p() AS $$ SELECT 1 $$`
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cp := stmts[0].(*CreateProcedureStmt)
+	if cp.Language != "" {
+		t.Errorf("Language = %q, want empty when omitted", cp.Language)
+	}
+}
+
+// TestParseCallStatement pins CALL with and without arguments.
+func TestParseCallStatement(t *testing.T) {
+	tests := []struct {
+		src  string
+		want string
+		args int
+	}{
+		{"CALL foo", "foo", 0},
+		{"CALL foo()", "foo", 0},
+		{"CALL foo(1)", "foo", 1},
+		{"CALL foo(1 + 2, 'text')", "foo", 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.src, func(t *testing.T) {
+			stmts, err := Parse(tt.src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			call := stmts[0].(*CallStmt)
+			if call.Name.Name != tt.want {
+				t.Errorf("Name.Name = %q, want %s", call.Name.Name, tt.want)
+			}
+			if len(call.Args) != tt.args {
+				t.Errorf("Args len = %d, want %d", len(call.Args), tt.args)
+			}
+		})
+	}
+}
+
+// TestParseCallRejectsTrailingSemicolon ensures CALL ends cleanly.
+func TestParseCallRejectsTrailingSemicolon(t *testing.T) {
+	src := "CALL foo();"
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("got %d statements", len(stmts))
+	}
+}

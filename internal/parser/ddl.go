@@ -72,8 +72,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		p.advance()
 		return p.parseCreateFunctionTail(t.Pos, orReplace)
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwProcedure:
+		if unlogged {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE PROCEDURE"}
+		}
+		p.advance()
+		return p.parseCreateProcedureTail(t.Pos, orReplace)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, or FUNCTION after CREATE")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, or PROCEDURE after CREATE")
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
