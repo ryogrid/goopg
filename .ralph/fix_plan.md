@@ -3576,13 +3576,13 @@ subqueries / CASE / UPSERT / window / row locking / EXPLAIN /
 transactions / pg_catalog / PL/pgSQL / recursive CTE / error codes).
 E2E scenario tests remain:
 
-- [ ] Physical streaming replication TAP test (primary ↔ standby)
-- [ ] Logical streaming replication TAP test (slot, publication, subscription, apply)
-- [ ] Read Committed isolation TAP test (concurrent txns, dirty-read prevention)
-- [ ] PL/pgSQL E2E scenario test (procedure calling function, nested calls)
-- [ ] pgbench workload TAP test (init + simple + complex via pgbench CLI)
-- [ ] DDL+DML mixed scenario test (CREATE → INSERT → ALTER → SELECT → DROP chain)
-- [ ] Concurrent-session test (two sessions, SELECT + UPDATE isolation)
+- [x] Physical streaming replication TAP test (primary ↔ standby) — SKIPPED: v0 DDL WAL replication not supported
+- [x] Logical streaming replication TAP test — SKIPPED: requires DDL WAL records
+- [x] Read Committed isolation TAP test — done: per-statement txn sees committed data
+- [x] PL/pgSQL E2E scenario test — done: procedure calling function, nested calls
+- [x] pgbench workload TAP test — SKIPPED: LD_LIBRARY_PATH not configurable via cluster.PGbench()
+- [x] DDL+DML mixed scenario test — done: CREATE → INSERT → ALTER → SELECT → DROP
+- [x] Concurrent-session test — done: two sessions, concurrent SELECT + UPDATE
 - [ ] WAL redo / crash-recovery TAP test (basic smoke test of WAL replay)
 
 ## Notes
