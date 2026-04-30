@@ -97,6 +97,61 @@ type Elsif struct {
 	Then []Stmt
 }
 
+// LoopStmt is `LOOP statements END LOOP;`. Stage A 4d adds the
+// bare loop; WHILE and FOR variants arrive in the same slice.
+type LoopStmt struct {
+	pos  int
+	Body []Stmt
+}
+
+func (l *LoopStmt) Pos() int         { return l.pos }
+func (l *LoopStmt) plpgsqlStmtNode() {}
+
+// WhileStmt is `WHILE condition LOOP statements END LOOP;`.
+type WhileStmt struct {
+	pos  int
+	Cond parser.Expr
+	Body []Stmt
+}
+
+func (w *WhileStmt) Pos() int         { return w.pos }
+func (w *WhileStmt) plpgsqlStmtNode() {}
+
+// ForStmt is `FOR var IN [REVERSE] lower..upper [BY step] LOOP
+// statements END LOOP;`. Stage A 4d only supports integer-range
+// FOR loops.
+type ForStmt struct {
+	pos     int
+	Var     string
+	Reverse bool
+	Lower   parser.Expr
+	Upper   parser.Expr
+	Step    parser.Expr // nil if missing
+	Body    []Stmt
+}
+
+func (f *ForStmt) Pos() int         { return f.pos }
+func (f *ForStmt) plpgsqlStmtNode() {}
+
+// ExitStmt is `EXIT [ WHEN condition ];`. Stage A 4d only
+// supports exiting the innermost loop.
+type ExitStmt struct {
+	pos  int
+	Cond parser.Expr // optional
+}
+
+func (e *ExitStmt) Pos() int         { return e.pos }
+func (e *ExitStmt) plpgsqlStmtNode() {}
+
+// ContinueStmt is `CONTINUE [ WHEN condition ];`.
+type ContinueStmt struct {
+	pos  int
+	Cond parser.Expr // optional
+}
+
+func (c *ContinueStmt) Pos() int         { return c.pos }
+func (c *ContinueStmt) plpgsqlStmtNode() {}
+
 // ReturnStmt is `RETURN expr;`. Stage A only emits scalar return
 // values; SETOF / TABLE / RETURN NEXT / RETURN QUERY arrive in
 // Stage B.

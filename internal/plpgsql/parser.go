@@ -172,6 +172,16 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseReturn()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwIf:
 		return p.parseIf()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwLoop:
+		return p.parseLoop()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwWhile:
+		return p.parseWhile()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwFor:
+		return p.parseFor()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExit:
+		return p.parseExit()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:
+		return p.parseContinue()
 	case t.Kind == parser.TokenIdent:
 		// Stage A 4b: bare identifier at statement start is the
 		// assignment shape `target := value;`. Other identifier-
@@ -181,7 +191,155 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		// isn't there.
 		return p.parseAssign()
 	}
-	return nil, p.errAtCur("unsupported PL/pgSQL statement (Stage A 4c accepts RETURN, assignment, and IF only)")
+	return nil, p.errAtCur("unsupported PL/pgSQL statement (Stage A 4d accepts RETURN, assignment, IF, LOOP, and EXIT only)")
+}
+
+// parseLoop parses `LOOP stmts END LOOP ;`.
+func (p *bodyParser) parseLoop() (*LoopStmt, error) {
+	loopTok, err := p.expectKeyword(parser.KwLoop)
+	if err != nil {
+		return nil, err
+	}
+	body, err := p.parseStmtList(parser.KwEnd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwLoop); err != nil {
+		return nil, p.errAtCur("expected END LOOP to close LOOP statement")
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate LOOP statement")
+	}
+	return &LoopStmt{pos: loopTok.Pos, Body: body}, nil
+}
+
+// parseWhile parses `WHILE cond LOOP stmts END LOOP ;`.
+func (p *bodyParser) parseWhile() (*WhileStmt, error) {
+	whileTok, err := p.expectKeyword(parser.KwWhile)
+	if err != nil {
+		return nil, err
+	}
+	cond, err := p.scanExprToKeyword("WHILE condition", parser.KwLoop)
+	if err != nil {
+		return nil, err
+	}
+	p.advance() // LOOP
+	body, err := p.parseStmtList(parser.KwEnd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwLoop); err != nil {
+		return nil, p.errAtCur("expected END LOOP to close WHILE statement")
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate WHILE statement")
+	}
+	return &WhileStmt{pos: whileTok.Pos, Cond: cond, Body: body}, nil
+}
+
+// parseFor parses `FOR var IN [REVERSE] lower..upper [BY step] LOOP stmts END LOOP ;`.
+func (p *bodyParser) parseFor() (*ForStmt, error) {
+	forTok, err := p.expectKeyword(parser.KwFor)
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().Kind != parser.TokenIdent {
+		return nil, p.errAtCur("expected loop variable name")
+	}
+	varName := p.advance().Value
+	if _, err := p.expectKeyword(parser.KwIn); err != nil {
+		return nil, err
+	}
+	isReverse := p.acceptKeyword(parser.KwReverse)
+	lower, err := p.scanExprTo("lower bound", func(t parser.Token) bool {
+		return t.Kind == parser.TokenOperator && t.Value == ".."
+	})
+	if err != nil {
+		return nil, err
+	}
+	p.advance() // ..
+	upper, err := p.scanExprTo("upper bound", func(t parser.Token) bool {
+		return t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwLoop || t.Keyword == parser.KwBy)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var step parser.Expr
+	if p.acceptKeyword(parser.KwBy) {
+		step, err = p.scanExprToKeyword("BY step", parser.KwLoop)
+		if err != nil {
+			return nil, err
+		}
+	}
+	p.advance() // LOOP
+	body, err := p.parseStmtList(parser.KwEnd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwLoop); err != nil {
+		return nil, p.errAtCur("expected END LOOP to close FOR statement")
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate FOR statement")
+	}
+	return &ForStmt{
+		pos:     forTok.Pos,
+		Var:     varName,
+		Reverse: isReverse,
+		Lower:   lower,
+		Upper:   upper,
+		Step:    step,
+		Body:    body,
+	}, nil
+}
+
+// parseExit parses `EXIT [ WHEN cond ] ;`.
+func (p *bodyParser) parseExit() (*ExitStmt, error) {
+	exitTok, err := p.expectKeyword(parser.KwExit)
+	if err != nil {
+		return nil, err
+	}
+	e := &ExitStmt{pos: exitTok.Pos}
+	if p.acceptKeyword(parser.KwWhen) {
+		cond, err := p.scanExprToSemicolon("EXIT WHEN condition")
+		if err != nil {
+			return nil, err
+		}
+		e.Cond = cond
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate EXIT statement")
+	}
+	return e, nil
+}
+
+// parseContinue parses `CONTINUE [ WHEN cond ] ;`.
+func (p *bodyParser) parseContinue() (*ContinueStmt, error) {
+	contTok, err := p.expectKeyword(parser.KwContinue)
+	if err != nil {
+		return nil, err
+	}
+	c := &ContinueStmt{pos: contTok.Pos}
+	if p.acceptKeyword(parser.KwWhen) {
+		cond, err := p.scanExprToSemicolon("CONTINUE WHEN condition")
+		if err != nil {
+			return nil, err
+		}
+		c.Cond = cond
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate CONTINUE statement")
+	}
+	return c, nil
 }
 
 // parseIf parses `IF cond THEN stmts [ ELSIF cond THEN stmts ]* [ ELSE stmts ] END IF ;`.
@@ -240,16 +398,24 @@ func (p *bodyParser) parseIf() (*IfStmt, error) {
 // provided terminator keyword, slices the original source, and
 // feeds it through `parser.ParseExpr`.
 func (p *bodyParser) scanExprToKeyword(ctx string, term parser.Keyword) (parser.Expr, error) {
+	return p.scanExprTo(ctx, func(t parser.Token) bool {
+		return t.Kind == parser.TokenKeyword && t.Keyword == term
+	})
+}
+
+// scanExprTo scans tokens until the predicate matches, slices the
+// original source, and feeds it through `parser.ParseExpr`.
+func (p *bodyParser) scanExprTo(ctx string, stop func(parser.Token) bool) (parser.Expr, error) {
 	exprStart := p.cur().Pos
 	for p.cur().Kind != parser.TokenEOF {
-		if p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == term {
+		if stop(p.cur()) {
 			break
 		}
 		p.advance()
 	}
 	exprEnd := p.cur().Pos
-	if p.cur().Kind != parser.TokenKeyword || p.cur().Keyword != term {
-		return nil, p.errAtCur("expected %q to terminate %s", string(term), ctx)
+	if !stop(p.cur()) {
+		return nil, p.errAtCur("unexpected end of %s", ctx)
 	}
 	exprSrc := strings.TrimSpace(p.src[exprStart:exprEnd])
 	if exprSrc == "" {
@@ -420,15 +586,13 @@ func (p *bodyParser) scanExprToSemicolon(ctx string) (parser.Expr, error) {
 	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
 		return nil, p.errAt(exprStart, "%s requires a non-empty expression", ctx)
 	}
-	exprEnd := exprStart
 	for p.cur().Kind != parser.TokenEOF {
 		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
 			break
 		}
-		t := p.cur()
-		exprEnd = t.Pos + len(t.Value)
 		p.advance()
 	}
+	exprEnd := p.cur().Pos
 	if p.cur().Kind != parser.TokenSymbol || p.cur().Value != ";" {
 		return nil, p.errAtCur("expected ';' to terminate %s", ctx)
 	}

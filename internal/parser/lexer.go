@@ -240,6 +240,10 @@ func (l *lexer) next() (Token, error) {
 		return Token{Kind: TokenParam, Value: l.src[dStart:l.pos], Pos: start}, nil
 
 	case c == ',' || c == ';' || c == '(' || c == ')' || c == '.' || c == '*':
+		if c == '.' && l.peekAt(1) == '.' {
+			l.pos += 2
+			return Token{Kind: TokenOperator, Value: "..", Pos: start}, nil
+		}
 		l.pos++
 		return Token{Kind: TokenSymbol, Value: string(c), Pos: start}, nil
 

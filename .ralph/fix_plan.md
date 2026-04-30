@@ -2233,6 +2233,18 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 4d — LOOP/WHILE/FOR/EXIT/CONTINUE.
+        (landed 2026-04-30: parser + interpreter slice for all
+        Stage A control-flow structures. `internal/plpgsql` now
+        accepts `LOOP`, `WHILE condition LOOP`, `FOR var IN
+        [REVERSE] lower..upper [BY step] LOOP`, `EXIT [WHEN
+        condition]`, and `CONTINUE [WHEN condition]`. The
+        interpreter implements these with a `controlFlow` enum
+        for signal propagation. Integer `FOR` loops implicitly
+        declare their loop variable with shadowing/restoration
+        semantics matching upstream. 4 new executor tests
+        cover the full surface. Full `go test ./...` green.)
+
   - [x] Stage A step 4c — IF/ELSIF/ELSE statements.
         (landed 2026-04-30: parser-only slice. `internal/plpgsql`
         now supports `IF condition THEN stmts [ELSIF/ELSEIF

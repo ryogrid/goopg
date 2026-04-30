@@ -193,6 +193,11 @@ const (
 	KwConstant Keyword = "constant"
 	KwElsif    Keyword = "elsif"
 	KwElseif   Keyword = "elseif"
+	KwLoop     Keyword = "loop"
+	KwExit     Keyword = "exit"
+	KwWhile    Keyword = "while"
+	KwContinue Keyword = "continue"
+	KwReverse  Keyword = "reverse"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -314,6 +319,11 @@ var keywords = map[string]Keyword{
 	"constant":     KwConstant,
 	"elsif":        KwElsif,
 	"elseif":       KwElseif,
+	"loop":         KwLoop,
+	"exit":         KwExit,
+	"while":        KwWhile,
+	"continue":     KwContinue,
+	"reverse":      KwReverse,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

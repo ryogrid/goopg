@@ -166,37 +166,236 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 			return Datum{}, &ExecError{Code: "42P13", Pos: d.Pos(), Message: err.Error()}
 		}
 	}
-	for _, stmt := range block.Statements {
-		switch s := stmt.(type) {
-		case *plpgsql.AssignStmt:
-			idx, ok := frame.lookup(s.Target)
-			if !ok {
-				return Datum{}, &ExecError{Code: "42703", Pos: s.Pos(), Message: fmt.Sprintf("variable %q does not exist", s.Target)}
-			}
-			v, err := evalPLpgSQLExpr(s.Value, frame, child)
-			if err != nil {
-				return Datum{}, err
-			}
-			v, err = coerceDatumToType(v, frame.types[idx], s.Pos(), fmt.Sprintf("variable %q", s.Target))
-			if err != nil {
-				return Datum{}, err
-			}
-			frame.values[idx] = v
-		case *plpgsql.ReturnStmt:
-			v, err := evalPLpgSQLExpr(s.Expr, frame, child)
-			if err != nil {
-				return Datum{}, err
-			}
-			v, err = coerceDatumToType(v, r.ReturnType, s.Pos(), "RETURN")
-			if err != nil {
-				return Datum{}, err
-			}
-			return v, nil
-		default:
-			return Datum{}, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL statement %T", stmt)}
-		}
+	res, flow, err := executePLpgSQLStmtList(block.Statements, r, frame, child)
+	if err != nil {
+		return Datum{}, err
+	}
+	if flow == flowReturn {
+		return res, nil
 	}
 	return Datum{}, &ExecError{Code: "2F005", Pos: pos, Message: fmt.Sprintf("control reached end of function %s without RETURN", r.QualifiedName())}
+}
+
+type controlFlow int
+
+const (
+	flowNone controlFlow = iota
+	flowReturn
+	flowExit
+	flowContinue
+)
+
+func executePLpgSQLStmtList(stmts []plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFrame, ctx *Context) (Datum, controlFlow, error) {
+	for _, stmt := range stmts {
+		res, flow, err := executePLpgSQLStmt(stmt, r, frame, ctx)
+		if err != nil || flow != flowNone {
+			return res, flow, err
+		}
+	}
+	return Datum{}, flowNone, nil
+}
+
+func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFrame, ctx *Context) (Datum, controlFlow, error) {
+	switch s := stmt.(type) {
+	case *plpgsql.AssignStmt:
+		idx, ok := frame.lookup(s.Target)
+		if !ok {
+			return Datum{}, flowNone, &ExecError{Code: "42703", Pos: s.Pos(), Message: fmt.Sprintf("variable %q does not exist", s.Target)}
+		}
+		v, err := evalPLpgSQLExpr(s.Value, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		v, err = coerceDatumToType(v, frame.types[idx], s.Pos(), fmt.Sprintf("variable %q", s.Target))
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		frame.values[idx] = v
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.IfStmt:
+		cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		if !cond.IsNull() && cond.Kind == KindBool && cond.Bool {
+			return executePLpgSQLStmtList(s.Then, r, frame, ctx)
+		}
+		for _, elsif := range s.Elsifs {
+			cond, err := evalPLpgSQLExpr(elsif.Cond, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			if !cond.IsNull() && cond.Kind == KindBool && cond.Bool {
+				return executePLpgSQLStmtList(elsif.Then, r, frame, ctx)
+			}
+		}
+		if s.Else != nil {
+			return executePLpgSQLStmtList(s.Else, r, frame, ctx)
+		}
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.LoopStmt:
+		for {
+			res, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			if flow == flowReturn {
+				return res, flow, nil
+			}
+			if flow == flowExit {
+				return Datum{}, flowNone, nil
+			}
+			if flow == flowContinue {
+				continue
+			}
+		}
+
+	case *plpgsql.WhileStmt:
+		for {
+			cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			if cond.IsNull() || !cond.Bool {
+				return Datum{}, flowNone, nil
+			}
+			res, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			if flow == flowReturn {
+				return res, flow, nil
+			}
+			if flow == flowExit {
+				return Datum{}, flowNone, nil
+			}
+			if flow == flowContinue {
+				continue
+			}
+		}
+
+	case *plpgsql.ForStmt:
+		lower, err := evalPLpgSQLExpr(s.Lower, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		upper, err := evalPLpgSQLExpr(s.Upper, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		stepVal := int64(1)
+		if s.Step != nil {
+			sv, err := evalPLpgSQLExpr(s.Step, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			if sv.IsNull() || sv.Kind != KindInt {
+				return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(), Message: "FOR loop step must be an integer"}
+			}
+			stepVal = sv.Int
+		}
+		if lower.IsNull() || lower.Kind != KindInt || upper.IsNull() || upper.Kind != KindInt {
+			return Datum{}, flowNone, &ExecError{Code: "42804", Pos: s.Pos(), Message: "FOR loop bounds must be integers"}
+		}
+		l, u := lower.Int, upper.Int
+
+		// FOR loop variable shadowing: save previous state if any.
+		key := strings.ToLower(s.Var)
+		prevIdx, exists := frame.indexByName[key]
+		
+		// Always push a new slot for the loop variable.
+		idx := len(frame.values)
+		frame.indexByName[key] = idx
+		frame.types = append(frame.types, catalog.Type{Name: "integer"})
+		frame.values = append(frame.values, NullDatum)
+		defer func() {
+			// Restore frame state.
+			frame.values = frame.values[:idx]
+			frame.types = frame.types[:idx]
+			if exists {
+				frame.indexByName[key] = prevIdx
+			} else {
+				delete(frame.indexByName, key)
+			}
+		}()
+
+		if s.Reverse {
+			for i := l; i >= u; i -= stepVal {
+				frame.values[idx] = Datum{Kind: KindInt, Int: i}
+				res, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
+				if err != nil {
+					return Datum{}, flowNone, err
+				}
+				if flow == flowReturn {
+					return res, flow, nil
+				}
+				if flow == flowExit {
+					return Datum{}, flowNone, nil
+				}
+				if flow == flowContinue {
+					continue
+				}
+			}
+		} else {
+			for i := l; i <= u; i += stepVal {
+				frame.values[idx] = Datum{Kind: KindInt, Int: i}
+				res, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
+				if err != nil {
+					return Datum{}, flowNone, err
+				}
+				if flow == flowReturn {
+					return res, flow, nil
+				}
+				if flow == flowExit {
+					return Datum{}, flowNone, nil
+				}
+				if flow == flowContinue {
+					continue
+				}
+			}
+		}
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.ExitStmt:
+		if s.Cond != nil {
+			cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			if cond.IsNull() || !cond.Bool {
+				return Datum{}, flowNone, nil
+			}
+		}
+		return Datum{}, flowExit, nil
+
+	case *plpgsql.ContinueStmt:
+		if s.Cond != nil {
+			cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			if cond.IsNull() || !cond.Bool {
+				return Datum{}, flowNone, nil
+			}
+		}
+		return Datum{}, flowContinue, nil
+
+	case *plpgsql.ReturnStmt:
+		v, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		v, err = coerceDatumToType(v, r.ReturnType, s.Pos(), "RETURN")
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		return v, flowReturn, nil
+
+	default:
+		return Datum{}, flowNone, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL statement %T", stmt)}
+	}
 }
 
 func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, error) {
