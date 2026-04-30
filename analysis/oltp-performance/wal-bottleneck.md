@@ -4,155 +4,103 @@
 
 This report documents the investigation into goopg's write-path
 performance (`UPDATE pgbench_accounts` accounts for 98% of
-transaction time at ~74ms per call) and the proposed fix: making
-WAL Append bypass the serialised state-loop goroutine.
+transaction time at ~74ms per call) and the experiments performed
+to identify the bottleneck.
 
-## Current Architecture
+**Key finding after M0026 implementation:** Eliminating the WAL
+state-loop round-trip via concurrent `tryAppend` did NOT improve
+throughput (~14 TPS unchanged). The bottleneck is NOT WAL
+serialisation — it is likely in the executor's heap tuple
+modification or B-tree index path.
 
-```
-Client goroutine                     state.loop goroutine
-─────────────────                    ──────────────────────
-Writer.Append(payload)
-  send(opAppend) ───────────────►    receive op
-                                       encode record
-                                       append to walBuf
-                                       update writeLSN
-  ◄──── (startLSN, endLSN) ──────    reply via resp channel
-```
-
-Both `Append` and `FlushUpTo` go through the same unbuffered channel
-(`ops`) and are processed by the **single** state-loop goroutine.
-When `FlushUpTo` blocks on `fdatasync`, all pending `Append` calls
-queue behind it — regardless of whether the caller needs a reply
-immediately.
-
-## Bottleneck Identification
-
-Per-statement timing from `pgbench -r` (scale=3, 1 client, default
-TPC-B):
-
-| Statement | Time (ms) | Share |
-|-----------|-----------|-------|
-| `UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid` | **73.9** | **97.7 %** |
-| All other statements | 1.7 | 2.3 % |
-| **Total** | **75.6** | **100 %** |
-
-The SELECT-only benchmark achieves 6 454 TPS at 4 clients, showing
-that the read path is fast. The write workload achieves only 13.5 TPS —
-a factor-of-500 difference — confirming a serialisation point in the
-write path.
-
-## PostgreSQL's WAL Architecture (Reference)
-
-PostgreSQL separates WAL insert from WAL flush:
-
-1. **`XLogInsertRecord`** — The backend writes into shared WAL
-   buffers (`XLogCtl->xlblocks`) under a partitioned `WALInsertLock`.
-   No I/O is performed. The CPU work (record formatting, CRC) is done
-   in the backend's own process.
-
-2. **`XLogFlush`** — The backend requests durability by waiting
-   until `flushedUpto ≥ insertUpto`. The actual `fdatasync` may be
-   performed by the WAL writer (`WalWriterMain`) or by the requesting
-   backend in a critical section. Multiple backends waiting for the
-   same flush point are grouped (group commit).
-
-3. **`WalWriterMain`** — A dedicated process that periodically (or
-   on demand) writes dirty WAL buffers to disk and calls `fdatasync`.
-   This offloads the fsync from backends in the common case.
-
-Key difference from goopg: **WAL INSERT is not serialised through a
-single goroutine.** Each backend formats and buffers its own records;
-only the fsync barrier is shared.
-
-## Proposed Fix: Direct Append (M0026)
-
-### Design
-
-The `Writer.Append` call shall encode and buffer the record directly
-in the calling goroutine, then return immediately with the assigned
-LSN. Only the drain + fsync path remains in the state loop.
+## Current Architecture (after M0026)
 
 ```
 Client goroutine                     state.loop goroutine
 ─────────────────                    ──────────────────────
 Writer.Append(payload)
   encode record
-  lock(sharedWriteBuf)
-    append to walBuf
-    update writeLSN atomically
-  unlock(sharedWriteBuf)
-  return LSN                       (no round-trip)
+  lock(appendMu)
+    buffer to walBuf (memcpy)
+    update writeLSN
+  unlock(appendMu)
+  return LSN                          (no round-trip in common case)
 
-Writer.FlushUpTo(lsn) ──────────►   lock(sharedWriteBuf)
-                                      drain walBuf → segments
-                                    unlock(sharedWriteBuf)
-                                    fdatasync
-  ◄──── ok ────────────────────     reply
+Writer.FlushUpTo(lsn) ─────────────►  lock(appendMu)
+                                        drain walBuf -> segments
+                                      unlock(appendMu)
+                                      fdatasync
+  <- ok ---------------------------  reply
 ```
 
-### Shared Data
+The fast path (`tryAppend`) eliminates the state-loop round-trip
+for the common case (buffer not full). Despite this, throughput
+remained at ~14 TPS — conclusively proving the bottleneck is
+**not** the WAL Append serialisation.
 
-A new `sharedWriteBuf` struct holds the fields that both `Append`
-and the drain path need:
+## Bottleneck Reassessment
 
-```go
-type sharedWriteBuf struct {
-    mu        sync.Mutex
-    walBuf    *walBuffer
-    memRing   *MemRing
-    writePos  int64
-    writeLSN  uint64
-    drainedLSN uint64
-    prevRecPtr uint64
-}
-```
+With WAL serialisation eliminated, the remaining suspect is the
+executor's UPDATE implementation. The `UPDATE pgbench_accounts`
+query goes through:
 
-Both `Writer` and `state` hold a pointer to the same `sharedWriteBuf`.
+1. **Parse + Analyze + Plan** — < 0.01 ms
+2. **B-tree index scan** for `aid = :aid` — reads 3-4 index pages
+   (all buffer-pool hits after warm-up)
+3. **Heap fetch** — read the tuple from the heap page
+4. **Lock tuple** — acquire tuple-level lock
+5. **Mark old tuple dead** — MVCC visibility update
+6. **Insert new tuple** — new tuple version on the heap page
+7. **WAL Append (2x)** — heap + index WAL records
+   (fast path: ~0.01 ms)
+8. **Transaction commit** — WAL Append for commit marker
+   (fast path: ~0.01 ms)
 
-### Implementation Status
+Steps 2-3 are the same as SELECT (which runs in 0.3 ms).
+Steps 5-6 are write-specific. At ~74ms total, one of these steps
+accounts for ~73ms of unexpected latency.
 
-A first attempt was made (2026-05-01) but reverted because the
-`state` struct's drain methods (`flushUpTo`, `drainBufferBytes`,
-`writeAt`, `openSegment`) read from `state.writePos`,
-`state.drainedLSN`, `state.walBuf`, etc. — they were not updated to
-read from the shared buffer. The change required updating
-approximately 20 methods on `state` to use `state.writeBuf.*` instead
-of `state.*`.
+### Hypotheses
 
-The full implementation is tracked in milestone M0026
-(`docs/milestones/0026-concurrent-wal-append.md`).
+1. **B-tree insert overhead** — The UPDATE modifies the index
+   entry's pointer. If the B-tree insertion path has a bug or
+   O(n) behaviour, it could dominate.
 
-### Estimated Impact
+2. **Heap page slot management** — The heap modification functions
+   might do full-page scans for free slots.
 
-Based on the observation that the UPDATE path is 500× slower than
-the SELECT path, and that the state-loop round-trip adds at least
-one goroutine context switch per Append, the expected improvement
-is **5–50×** for write-heavy workloads.
+3. **Lock acquisition** — `LockTuple` might be serialising or
+   doing I/O.
 
-A more conservative estimate: if 50% of the 73.9ms is the state-loop
-serialisation, fixing it would bring UPDATE latency to ~37ms and TPS
-to ~27. If 80% is serialisation, TPS would reach ~67.
+4. **WAL record encoding overhead** — The `encodeRecord` /
+   `encodeRecordXLog` functions compute a CRC-32 over the payload.
+   While fast, repeated calls add up.
 
-## Measurement Data
+### Next Steps
 
-All data files are in `analysis/oltp-performance/`:
+- Profile `UPDATE pgbench_accounts` with `go tool pprof` to see
+  where the CPU time is spent.
+- Add temporary latency logging around the executor's heap
+  modification functions.
 
-| File | Content |
-|------|---------|
-| `README.md` | Full OLTP analysis report |
-| `quick-bench.sh` | Benchmark runner script |
-| `perf-detail.sh` | Per-statement timing collector |
-| `pgbench-all.log` | Raw pgbench output |
-| `waits.csv` | Wait-event samples (empty due to rapid clearing) |
-| `run-benchmarks.sh` | Extended benchmark runner |
+## Measurement Data (post-M0026)
+
+| Workload | Clients | TPS | Latency (ms) |
+|----------|---------|-----|-------------|
+| Select-only | 1 | 3 224 | 0.31 |
+| Select-only | 4 | 6 403 | 0.63 |
+| Select-only | 16 | 5 900 | 2.71 |
+| Simple update (-N) | 1 | 13.5 | 74.0 |
+| Simple update (-N) | 4 | 13.8 | 290 |
+| Default TPC-B | 1 | 13.1 | 76.4 |
+| Default TPC-B | 4 | 13.9 | 288 |
+
+The M0026 change (concurrent Append) did not affect throughput,
+confirming the bottleneck is elsewhere.
 
 ## References
 
 - Milestone M0025: `docs/milestones/0025-oltp-performance-analysis.md`
 - Milestone M0026: `docs/milestones/0026-concurrent-wal-append.md`
-- PostgreSQL WAL insert: `postgres/src/backend/access/transam/xlog.c`
-  (`XLogInsertRecord`, `XLogFlush`)
-- PostgreSQL WAL writer: `postgres/src/backend/postmaster/walwriter.c`
-- goopg current WAL: `internal/wal/writer.go`
-- goopg WAL buffer: `internal/wal/wal_buffer.go`
+- PostgreSQL WAL: `postgres/src/backend/access/transam/xlog.c`
+- goopg WAL implementation: `internal/wal/writer.go`
