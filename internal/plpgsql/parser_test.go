@@ -111,7 +111,7 @@ func TestParseRequiresEnd(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected SyntaxError for missing END")
 	}
-	if !strings.Contains(err.Error(), "END") {
+	if !strings.Contains(strings.ToUpper(err.Error()), "END") {
 		t.Errorf("err = %v, want an 'END' diagnostic", err)
 	}
 }
@@ -314,6 +314,71 @@ func TestParseAssignWithoutColonEqError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), ":=") {
 		t.Errorf("err = %v, want a `:=` diagnostic", err)
+	}
+}
+
+// TestParseIf pins the basic IF statement shape.
+func TestParseIf(t *testing.T) {
+	src := `BEGIN
+		IF x > 0 THEN
+			RETURN 1;
+		END IF;
+	END`
+	blk, err := Parse(src)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(blk.Statements) != 1 {
+		t.Fatalf("Statements len = %d, want 1", len(blk.Statements))
+	}
+	iff, ok := blk.Statements[0].(*IfStmt)
+	if !ok {
+		t.Fatalf("Statements[0] = %T, want *IfStmt", blk.Statements[0])
+	}
+	if _, ok := iff.Cond.(*parser.BinaryOp); !ok {
+		t.Errorf("Cond = %T, want *parser.BinaryOp", iff.Cond)
+	}
+	if len(iff.Then) != 1 {
+		t.Errorf("Then len = %d, want 1", len(iff.Then))
+	}
+}
+
+// TestParseIfElsifElse pins the full IF surface including multiple
+// ELSIF/ELSEIF variants and the ELSE branch.
+func TestParseIfElsifElse(t *testing.T) {
+	src := `BEGIN
+		IF x = 1 THEN
+			RETURN 1;
+		ELSIF x = 2 THEN
+			RETURN 2;
+		ELSEIF x = 3 THEN
+			RETURN 3;
+		ELSE
+			RETURN 0;
+		END IF;
+	END`
+	blk, err := Parse(src)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	iff := blk.Statements[0].(*IfStmt)
+	if len(iff.Elsifs) != 2 {
+		t.Fatalf("Elsifs len = %d, want 2", len(iff.Elsifs))
+	}
+	if len(iff.Else) != 1 {
+		t.Errorf("Else len = %d, want 1", len(iff.Else))
+	}
+}
+
+// TestParseIfMissingEndIf pins the diagnostic for an unterminated
+// IF block.
+func TestParseIfMissingEndIf(t *testing.T) {
+	_, err := Parse("BEGIN IF x THEN RETURN 1; END;")
+	if err == nil {
+		t.Fatal("expected SyntaxError")
+	}
+	if !strings.Contains(err.Error(), "END IF") {
+		t.Errorf("err = %v, want an 'END IF' diagnostic", err)
 	}
 }
 

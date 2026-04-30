@@ -2233,6 +2233,15 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 4c — IF/ELSIF/ELSE statements.
+        (landed 2026-04-30: parser-only slice. `internal/plpgsql`
+        now supports `IF condition THEN stmts [ELSIF/ELSEIF
+        condition THEN stmts]* [ELSE stmts] END IF;`. Condition
+        expressions reuse `parser.ParseExpr`. `Elsifs` slice
+        collects both `ELSIF` and `ELSEIF` variants (upstream-
+        flex). New `IfStmt` and `Elsif` AST nodes. 3 new tests
+        in `parser_test.go`. Full `go test ./...` green.)
+
   - [x] Stage A step 4b — DECLARE block + assignment.
         (landed 2026-04-30: parser-only slice. `internal/plpgsql`
         now accepts an optional `DECLARE` section before the main

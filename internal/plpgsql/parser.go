@@ -122,19 +122,11 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 		startPos = beginTok.Pos
 	}
 	block := &Block{pos: startPos, Declarations: decls}
-	for {
-		if p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwEnd {
-			break
-		}
-		if p.cur().Kind == parser.TokenEOF {
-			return nil, p.errAtCur("expected END to close PL/pgSQL block")
-		}
-		stmt, err := p.parseStmt()
-		if err != nil {
-			return nil, err
-		}
-		block.Statements = append(block.Statements, stmt)
+	stmts, err := p.parseStmtList(parser.KwEnd)
+	if err != nil {
+		return nil, err
 	}
+	block.Statements = stmts
 	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
 		return nil, err
 	}
@@ -147,11 +139,39 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 	return block, nil
 }
 
+// parseStmtList parses zero-or-more statements terminated by one
+// of the provided keywords. Does NOT consume the terminator.
+func (p *bodyParser) parseStmtList(terminators ...parser.Keyword) ([]Stmt, error) {
+	var stmts []Stmt
+Loop:
+	for {
+		t := p.cur()
+		if t.Kind == parser.TokenEOF {
+			return nil, p.errAtCur("unexpected EOF (expected one of %v)", terminators)
+		}
+		if t.Kind == parser.TokenKeyword {
+			for _, term := range terminators {
+				if t.Keyword == term {
+					break Loop
+				}
+			}
+		}
+		stmt, err := p.parseStmt()
+		if err != nil {
+			return nil, err
+		}
+		stmts = append(stmts, stmt)
+	}
+	return stmts, nil
+}
+
 func (p *bodyParser) parseStmt() (Stmt, error) {
 	t := p.cur()
 	switch {
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwReturn:
 		return p.parseReturn()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwIf:
+		return p.parseIf()
 	case t.Kind == parser.TokenIdent:
 		// Stage A 4b: bare identifier at statement start is the
 		// assignment shape `target := value;`. Other identifier-
@@ -161,7 +181,85 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		// isn't there.
 		return p.parseAssign()
 	}
-	return nil, p.errAtCur("unsupported PL/pgSQL statement (Stage A 4b accepts RETURN and assignment only)")
+	return nil, p.errAtCur("unsupported PL/pgSQL statement (Stage A 4c accepts RETURN, assignment, and IF only)")
+}
+
+// parseIf parses `IF cond THEN stmts [ ELSIF cond THEN stmts ]* [ ELSE stmts ] END IF ;`.
+func (p *bodyParser) parseIf() (*IfStmt, error) {
+	ifTok, err := p.expectKeyword(parser.KwIf)
+	if err != nil {
+		return nil, err
+	}
+	cond, err := p.scanExprToKeyword("IF condition", parser.KwThen)
+	if err != nil {
+		return nil, err
+	}
+	p.advance() // THEN
+	thenStmts, err := p.parseStmtList(parser.KwElsif, parser.KwElseif, parser.KwElse, parser.KwEnd)
+	if err != nil {
+		return nil, err
+	}
+	ifStmt := &IfStmt{pos: ifTok.Pos, Cond: cond, Then: thenStmts}
+	for {
+		t := p.cur()
+		if t.Kind != parser.TokenKeyword || (t.Keyword != parser.KwElsif && t.Keyword != parser.KwElseif) {
+			break
+		}
+		elsifPos := p.advance().Pos
+		elsifCond, err := p.scanExprToKeyword("ELSIF condition", parser.KwThen)
+		if err != nil {
+			return nil, err
+		}
+		p.advance() // THEN
+		elsifThen, err := p.parseStmtList(parser.KwElsif, parser.KwElseif, parser.KwElse, parser.KwEnd)
+		if err != nil {
+			return nil, err
+		}
+		ifStmt.Elsifs = append(ifStmt.Elsifs, &Elsif{pos: elsifPos, Cond: elsifCond, Then: elsifThen})
+	}
+	if p.acceptKeyword(parser.KwElse) {
+		elseStmts, err := p.parseStmtList(parser.KwEnd)
+		if err != nil {
+			return nil, err
+		}
+		ifStmt.Else = elseStmts
+	}
+	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+		return nil, p.errAtCur("expected END IF to close IF statement")
+	}
+	if _, err := p.expectKeyword(parser.KwIf); err != nil {
+		return nil, p.errAtCur("expected END IF (missing IF keyword)")
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate IF statement")
+	}
+	return ifStmt, nil
+}
+
+// scanExprToKeyword scans tokens up to (but not including) the
+// provided terminator keyword, slices the original source, and
+// feeds it through `parser.ParseExpr`.
+func (p *bodyParser) scanExprToKeyword(ctx string, term parser.Keyword) (parser.Expr, error) {
+	exprStart := p.cur().Pos
+	for p.cur().Kind != parser.TokenEOF {
+		if p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == term {
+			break
+		}
+		p.advance()
+	}
+	exprEnd := p.cur().Pos
+	if p.cur().Kind != parser.TokenKeyword || p.cur().Keyword != term {
+		return nil, p.errAtCur("expected %q to terminate %s", string(term), ctx)
+	}
+	exprSrc := strings.TrimSpace(p.src[exprStart:exprEnd])
+	if exprSrc == "" {
+		return nil, p.errAt(exprStart, "%s requires a non-empty expression", ctx)
+	}
+	expr, err := parser.ParseExpr(exprSrc)
+	if err != nil {
+		return nil, p.errAt(exprStart, "%s: %v", ctx, err)
+	}
+	return expr, nil
 }
 
 // parseDeclSection parses one-or-more declarations terminated by

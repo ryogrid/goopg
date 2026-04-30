@@ -191,6 +191,8 @@ const (
 	KwReturn   Keyword = "return"
 	KwDeclare  Keyword = "declare"
 	KwConstant Keyword = "constant"
+	KwElsif    Keyword = "elsif"
+	KwElseif   Keyword = "elseif"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -310,6 +312,8 @@ var keywords = map[string]Keyword{
 	"return":       KwReturn,
 	"declare":      KwDeclare,
 	"constant":     KwConstant,
+	"elsif":        KwElsif,
+	"elseif":       KwElseif,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

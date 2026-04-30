@@ -78,6 +78,25 @@ type AssignStmt struct {
 func (a *AssignStmt) Pos() int         { return a.pos }
 func (a *AssignStmt) plpgsqlStmtNode() {}
 
+// IfStmt is `IF condition THEN statements [ ELSIF condition THEN
+// statements ]* [ ELSE statements ] END IF;`.
+type IfStmt struct {
+	pos     int
+	Cond    parser.Expr
+	Then    []Stmt
+	Elsifs  []*Elsif
+	Else    []Stmt
+}
+
+func (i *IfStmt) Pos() int         { return i.pos }
+func (i *IfStmt) plpgsqlStmtNode() {}
+
+type Elsif struct {
+	pos  int
+	Cond parser.Expr
+	Then []Stmt
+}
+
 // ReturnStmt is `RETURN expr;`. Stage A only emits scalar return
 // values; SETOF / TABLE / RETURN NEXT / RETURN QUERY arrive in
 // Stage B.
