@@ -2233,6 +2233,20 @@ Decomposition + design docs land when this milestone is picked up.
       ... LANGUAGE plpgsql, callable from SELECT). Decompose into
       seam-sized slices when picked up.
 
+  - [x] Stage A step 6 — function invocation in expression contexts.
+        (landed 2026-04-30: runtime wiring. `evalFuncCall` now
+        falls back to `evalStoredRoutineFuncCall` for non-built-in
+        functions. This enables UDFs to be called from regular
+        SELECT queries, CASE expressions, and anywhere else SQL
+        expressions are used. scalar-only in Stage A.)
+
+  - [x] Stage A step 5 — interpreter / SPI bridge.
+        (landed 2026-04-30: core interpreter implementation in
+        `internal/executor/plpgsql_runtime.go`. supports
+        variable frames, expression evaluation via SQL-evaluator
+        reuse, and all control-flow structures landed in step 4.
+        SPI bridge for embedded SQL stays deferred to step 4g.)
+
   - [x] Stage A step 4e — PERFORM.
         (landed 2026-04-30: parser + interpreter slice. `PERFORM
         expr;` evaluates the expression and discards the result,
