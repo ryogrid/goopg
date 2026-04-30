@@ -4,8 +4,43 @@ package activity
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
+)
+
+// Wait event type constants (upstream-compatible naming).
+const (
+	WaitTypeIO       = "IO"
+	WaitTypeLock     = "Lock"
+	WaitTypeClient   = "Client"
+	WaitTypeTimeout  = "Timeout"
+	WaitTypeActivity = "Activity"
+)
+
+// Wait event name constants (goopg-defined, PostgreSQL-compatible where possible).
+const (
+	// IO-type events
+	WaitAIO           = "AIO"
+	WaitDataFileRead  = "DataFileRead"
+	WaitDataFileWrite = "DataFileWrite"
+	WaitWALWrite      = "WALWrite"
+	WaitWALRead       = "WALRead"
+
+	// Lock-type events
+	WaitRelationLock  = "relation"
+	WaitTupleLock     = "tuple"
+
+	// Client-type events
+	WaitClientRead    = "ClientRead"
+	WaitClientWrite   = "ClientWrite"
+
+	// Timeout-type events
+	WaitCheckpoint    = "Checkpoint"
+	WaitAutoVacuum    = "AutoVacuum"
+
+	// Activity-type events
+	WaitAutoVacuumMain = "AutoVacuumMain"
 )
 
 // Backend represents one server backend/connection for pg_stat_activity.
@@ -151,3 +186,70 @@ func (r *Registry) WaitEventEnd(pid string) {
 func PID(pid uint32) string {
 	return fmt.Sprintf("%d", pid)
 }
+
+// --- Goroutine-level backend registration --------------------------------
+//
+// The AIO wait-event hooks (Engine.OnWaitStart/OnWaitEnd) are called from
+// Handle.Wait, which runs inside a backend's goroutine but has no direct
+// reference to the activity registry or backend PID.  We bridge that gap
+// with a goroutine-ID → (registry, pid) map.
+//
+// The dispatch code calls RegisterCurrentGoroutine before executing a
+// query and ClearCurrentGoroutine after.  When Handle.Wait fires, the
+// hooks look up the calling goroutine's entry and call WaitEventStart /
+// WaitEventEnd on the correct backend.
+
+type goroutineEntry struct {
+	reg *Registry
+	pid string
+}
+
+var (
+	goroutineMu sync.RWMutex
+	goroutineMap = make(map[string]goroutineEntry) // goroutineID → entry
+)
+
+// RegisterCurrentGoroutine records the backend (registry, pid) for the
+// calling goroutine.  Must be called before any blocking I/O that might
+// trigger AIO wait-event hooks.
+func RegisterCurrentGoroutine(reg *Registry, pid string) {
+	id := goroutineID()
+	goroutineMu.Lock()
+	goroutineMap[id] = goroutineEntry{reg: reg, pid: pid}
+	goroutineMu.Unlock()
+}
+
+// ClearCurrentGoroutine removes the calling goroutine's entry.
+func ClearCurrentGoroutine() {
+	id := goroutineID()
+	goroutineMu.Lock()
+	delete(goroutineMap, id)
+	goroutineMu.Unlock()
+}
+
+// LookupGoroutine returns the registry and pid associated with the
+// calling goroutine, or nil if none.
+func LookupGoroutine() (*Registry, string) {
+	id := goroutineID()
+	goroutineMu.RLock()
+	entry, ok := goroutineMap[id]
+	goroutineMu.RUnlock()
+	if !ok {
+		return nil, ""
+	}
+	return entry.reg, entry.pid
+}
+
+func goroutineID() string {
+	buf := make([]byte, 64)
+	n := runtime.Stack(buf, false)
+	s := string(buf[:n])
+	// "goroutine N [running]:..." → extract "N"
+	for i := 0; i < n; i++ {
+		if s[i] == ' ' {
+			return s[9:i]
+		}
+	}
+	return "0"
+}
+

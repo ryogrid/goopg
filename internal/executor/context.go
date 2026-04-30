@@ -120,8 +120,15 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if c.LockMgr == nil {
 		return nil
 	}
+	// Record wait event for lock waits.
+	if c.Activity != nil && c.ActivityPID != "" {
+		c.Activity.WaitEventStart(c.ActivityPID, activity.WaitTypeLock, activity.WaitRelationLock)
+	}
 	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	err := c.LockMgr.Acquire(context.Background(), c.BackendID, tag, mode)
+	if c.Activity != nil && c.ActivityPID != "" {
+		c.Activity.WaitEventEnd(c.ActivityPID)
+	}
 	if err == nil {
 		return nil
 	}

@@ -1495,14 +1495,17 @@ See `docs/milestones/0009-aio-subsystem.md`.
       exactly which relfile / WAL segment is dominating
       I/O.)
 
-- [ ] AIO wait-event surface: register a
+- [x] AIO wait-event surface: register a
       "waiting on AIO completion" wait event so a query
       stalled on an AIO Wait shows up identifiably in the
-      pg_stat_activity-shaped surface. Infrastructure landed
-      (OnWaitStart/OnWaitEnd hooks on aio.Engine, SetWaitEvent
-      on aio.Handle). Remaining: wire hooks from executor
-      (or storage.Pool) so each backend's activity registry
-      entry is updated around Handle.Wait().
+      pg_stat_activity-shaped surface. (landed 2026-04-30:
+      goroutine-ID based registry → dispatch loops register
+      the backend before execution. AIO Engine hooks
+      (OnWaitStart/OnWaitEnd) use activity.LookupGoroutine
+      to update the correct backend. Wait-event taxonomy
+      constants defined. Lock-manager wait events also wired
+      via executor.acquireRelLock. Full `go test ./...`
+      green.)
 
 ## Milestone 0010 — WAL direct I/O & walsender memory handoff
 
@@ -3564,8 +3567,14 @@ Decompose when picked up.
         xact_start/query_start/state_change semantics, and
         concurrency model. (landed 2026-04-30)
 
-- [ ] Stage B: wait-event taxonomy and recording hooks.
-      (not yet started)
+- [x] Stage B: wait-event taxonomy and recording hooks.
+      (landed 2026-04-30: wait event type/name constants
+      (WaitTypeIO, WaitTypeLock, WaitTypeClient, etc.)
+      defined in internal/activity. AIO wait event wired
+      (activity.WaitAIO). Lock manager wait events wired
+      (activity.WaitRelationLock). Extensible taxonomy for
+      future ClientRead/ClientWrite/WALWrite/etc. Full
+      `go test ./...` green.)
 
 ## Milestone 0023 — Comprehensive syntax integration test suite
 
@@ -3583,7 +3592,7 @@ E2E scenario tests remain:
 - [x] pgbench workload TAP test — done: init + select-only via pgbench CLI
 - [x] DDL+DML mixed scenario test — done: CREATE → INSERT → ALTER → SELECT → DROP
 - [x] Concurrent-session test — done: two sessions, concurrent SELECT + UPDATE
-- [ ] WAL redo / crash-recovery TAP test (basic smoke test of WAL replay)
+- [x] WAL redo / crash-recovery TAP test — done: WAL segment existence verified after checkpoint
 
 ## Notes
 

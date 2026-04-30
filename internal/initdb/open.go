@@ -498,6 +498,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
+	// Wire AIO wait-event hooks so pg_stat_activity can report
+	// "AIO" wait events when backends block on I/O completion.
+	// The hooks use goroutine-ID lookup to find the correct backend
+	// (see activity.RegisterCurrentGoroutine).
+	if aioEngine != nil {
+		aioEngine.OnWaitStart = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitAIO)
+			}
+		}
+		aioEngine.OnWaitEnd = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventEnd(pid)
+			}
+		}
+	}
+
 	standby, err := IsStandby(abs)
 	if err != nil {
 		_ = mgr.Close()
