@@ -11,15 +11,10 @@ Potential Optimisations).
 | REF-001 | AIO Subsystem | ✅ Done |
 | REF-002 | B-Tree Index | ✅ Done |
 | REF-003 | Buffer Pool | ✅ Done |
-| REF-004 | Checkpointer | ⬜ Pending |
-| REF-005 | CTE / WITH Clause | ⬜ Pending |
-| REF-006 | EXPLAIN / ANALYZE | ⬜ Pending |
-| REF-007 | Heap Storage & MVCC | ✅ Done |
-| REF-010 | Parser & AST | ✅ Done |
-| REF-011 | Planner & Optimiser | ✅ Done |
-| REF-012 | PL/pgSQL Runtime | ⬜ Pending |
-| REF-013 | Tuple Format & Codec | ⬜ Pending |
-| REF-014 | UPSERT (ON CONFLICT) | ⬜ Pending |
+| REF-004 | Checkpointer | ✅ Done |
+| REF-005 | CTE / WITH Clause | ✅ Done |
+| REF-012 | PL/pgSQL Runtime | ✅ Done |
+| REF-014 | UPSERT (ON CONFLICT) | ✅ Done |
 | REF-015 | WAL Format & I/O | ✅ Done |
 | REF-016 | WAL Buffer & Eviction | ⬜ Pending |
 | REF-017 | WAL Redo / Crash Recovery | ⬜ Pending |

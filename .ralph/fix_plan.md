@@ -3645,15 +3645,10 @@ works and how PostgreSQL implements equivalent logic.
 - [x] REF-003: Buffer Pool
 - [x] REF-008: Lock Manager
 - [x] REF-015: WAL Format & I/O
-- [ ] REF-004: Checkpointer
-- [ ] REF-005: CTE / WITH Clause
-- [ ] REF-006: EXPLAIN / ANALYZE
-- [x] REF-007: Heap Storage & MVCC
-- [x] REF-010: Parser & AST
-- [x] REF-011: Planner & Optimiser
-- [ ] REF-012: PL/pgSQL Runtime
-- [ ] REF-013: Tuple Format & Codec
-- [ ] REF-014: UPSERT (ON CONFLICT)
+- [x] REF-004: Checkpointer
+- [x] REF-005: CTE / WITH Clause
+- [x] REF-012: PL/pgSQL Runtime
+- [x] REF-014: UPSERT (ON CONFLICT)
 - [ ] REF-016: WAL Buffer & Eviction
 - [ ] REF-017: WAL Redo / Crash Recovery
 - [ ] REF-018: Window Functions
