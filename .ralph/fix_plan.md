@@ -3574,14 +3574,14 @@ See `docs/milestones/0023-comprehensive-syntax-integration-test-suite.md`.
 - [x] DDL statement tests (CREATE/DROP TABLE, INDEX, VIEW, ALTER, TRUNCATE)
 - [x] SELECT / expression tests (JOIN, GROUP BY, subqueries, CASE, ORDER BY, LIMIT, WHERE)
 - [x] Error code / SQLSTATE verification tests
-- [ ] DML statement tests (INSERT, UPDATE, DELETE)
+- [x] DML statement tests (INSERT, UPDATE, DELETE)
+- [x] EXPLAIN / EXPLAIN ANALYZE tests
+- [x] Transaction tests
+- [x] pg_catalog virtual view tests
 - [ ] Recursive CTE edge-case tests
-- [ ] EXPLAIN / EXPLAIN ANALYZE tests
 - [ ] UPSERT tests
 - [ ] Window function tests
 - [ ] Row locking tests (FOR UPDATE/SHARE)
-- [ ] Transaction tests
-- [ ] pg_catalog virtual view tests
 
 ## Notes
 
