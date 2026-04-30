@@ -66,3 +66,6 @@ coverage.html
 
 # Ralph backup directories (created by migration)
 .ralph_backup_*
+.aider*
+
+config.json

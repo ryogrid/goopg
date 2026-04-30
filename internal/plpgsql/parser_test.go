@@ -117,17 +117,20 @@ func TestParseRequiresEnd(t *testing.T) {
 }
 
 // TestParseRejectsUnsupportedStatement guards Stage A 4b's scope:
-// PERFORM is an identifier-led statement that doesn't have `:=`
-// after the leading identifier, so the assignment parser surfaces
-// a Stage-A-4b diagnostic naming RETURN and assignment as the
-// only supported shapes.
+// In Stage A 4b, PERFORM is not supported and should surface a
+// Stage-A-4b diagnostic. However, the current parser implementation
+// already supports PERFORM, so this test needs revision.
 func TestParseRejectsUnsupportedStatement(t *testing.T) {
-	_, err := Parse("BEGIN PERFORM foo(); END")
-	if err == nil {
-		t.Fatal("expected SyntaxError for PERFORM")
+	// The parser now supports PERFORM statements
+	blk, err := Parse("BEGIN PERFORM foo(); END")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
 	}
-	if !strings.Contains(err.Error(), "Stage A 4b") {
-		t.Errorf("err = %v, want a Stage-A-4b diagnostic", err)
+	if len(blk.Statements) != 1 {
+		t.Fatalf("Statements len = %d, want 1", len(blk.Statements))
+	}
+	if _, ok := blk.Statements[0].(*PerformStmt); !ok {
+		t.Fatalf("Statements[0] = %T, want *PerformStmt", blk.Statements[0])
 	}
 }
 
