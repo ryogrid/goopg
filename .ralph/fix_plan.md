@@ -3640,21 +3640,21 @@ See `docs/milestones/0028-postgres-implementation-reference.md`.
 Documents under `docs/reference/` explaining how each goopg component
 works and how PostgreSQL implements equivalent logic.
 
-- [ ] REF-001: AIO Subsystem
-- [ ] REF-002: B-Tree Index
-- [ ] REF-003: Buffer Pool
+- [x] REF-001: AIO Subsystem
+- [x] REF-002: B-Tree Index
+- [x] REF-003: Buffer Pool
+- [x] REF-008: Lock Manager
+- [x] REF-015: WAL Format & I/O
 - [ ] REF-004: Checkpointer
 - [ ] REF-005: CTE / WITH Clause
 - [ ] REF-006: EXPLAIN / ANALYZE
 - [ ] REF-007: Heap Storage & MVCC
-- [ ] REF-008: Lock Manager
 - [ ] REF-009: Logical Replication
 - [ ] REF-010: Parser & AST
 - [ ] REF-011: Planner & Optimiser
 - [ ] REF-012: PL/pgSQL Runtime
 - [ ] REF-013: Tuple Format & Codec
 - [ ] REF-014: UPSERT (ON CONFLICT)
-- [ ] REF-015: WAL Format & I/O
 - [ ] REF-016: WAL Buffer & Eviction
 - [ ] REF-017: WAL Redo / Crash Recovery
 - [ ] REF-018: Window Functions
