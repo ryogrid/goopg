@@ -74,6 +74,8 @@ type AIOHandle interface {
 	Wait() (n int, err error)
 }
 
+// Manager provides synchronous file I/O for relation data files.
+// Each method blocks until the I/O completes.
 type Manager struct {
 	cfg ManagerConfig
 
@@ -81,6 +83,15 @@ type Manager struct {
 	files map[RelFileNode]*relFile
 
 	aio AIOEngine
+
+	// OnReadWait / OnWriteWait / OnExtendWait / OnSyncWait are optional
+	// hooks called before blocking I/O operations.  The server sets them
+	// from initdb.Open so the activity package can record DataFileRead /
+	// DataFileWrite / DataFileExtend / DataFileSync wait events.
+	OnReadWait   func()
+	OnWriteWait  func()
+	OnExtendWait func()
+	OnSyncWait   func()
 }
 
 // ManagerConfig controls how files are opened.
@@ -241,6 +252,9 @@ func (m *Manager) ReadBlock(rel RelFileNode, blk BlockNumber, buf []byte) error 
 	if len(buf) != BlockSize {
 		return fmt.Errorf("ReadBlock: buf is %d bytes, want %d", len(buf), BlockSize)
 	}
+	if m.OnReadWait != nil {
+		m.OnReadWait()
+	}
 	f, err := m.relFile(rel)
 	if err != nil {
 		return err
@@ -255,6 +269,9 @@ func (m *Manager) WriteBlock(rel RelFileNode, blk BlockNumber, buf []byte) error
 	if len(buf) != BlockSize {
 		return fmt.Errorf("WriteBlock: buf is %d bytes, want %d", len(buf), BlockSize)
 	}
+	if m.OnWriteWait != nil {
+		m.OnWriteWait()
+	}
 	f, err := m.relFile(rel)
 	if err != nil {
 		return err
@@ -267,6 +284,9 @@ func (m *Manager) WriteBlock(rel RelFileNode, blk BlockNumber, buf []byte) error
 func (m *Manager) Extend(rel RelFileNode, buf []byte) (BlockNumber, error) {
 	if len(buf) != BlockSize {
 		return InvalidBlockNumber, fmt.Errorf("Extend: buf is %d bytes, want %d", len(buf), BlockSize)
+	}
+	if m.OnExtendWait != nil {
+		m.OnExtendWait()
 	}
 	f, err := m.relFile(rel)
 	if err != nil {
@@ -288,6 +308,9 @@ func (m *Manager) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // checkpointer to make sure dirty buffers we already wrote are
 // durable before we advance the redo pointer.
 func (m *Manager) Sync(rel RelFileNode) error {
+	if m.OnSyncWait != nil {
+		m.OnSyncWait()
+	}
 	f, err := m.relFile(rel)
 	if err != nil {
 		return err

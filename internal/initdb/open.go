@@ -515,6 +515,30 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
+	// Wire data-file I/O wait-event hooks so pg_stat_activity records
+	// DataFileRead / DataFileWrite / DataFileExtend / DataFileSync
+	// when backends block on storage operations.
+	mgr.OnReadWait = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileRead)
+		}
+	}
+	mgr.OnWriteWait = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	mgr.OnExtendWait = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileExtend)
+		}
+	}
+	mgr.OnSyncWait = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileSync)
+		}
+	}
+
 	standby, err := IsStandby(abs)
 	if err != nil {
 		_ = mgr.Close()

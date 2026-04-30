@@ -3554,32 +3554,40 @@ Decompose when picked up.
       fields.
 
   - [x] Step 1: design doc 0022-0001 + virtual view + registry
-        + lifecycle wiring. (landed 2026-04-30: 21-column
-        `pg_catalog.pg_stat_activity` view backed by
-        `internal/activity.Registry`. Wired through
-        `initdb.Runtime.Activity` → `server.Config.Activity`.
-        Register on accept, state transitions in
-        `dispatchSimpleQueryViaExecutor`, unregister on close.
-        Integration test verifies queryability.)
+        + lifecycle wiring. (landed 2026-04-30)
 
   - [x] Step 2: design doc 0022-0002 (backend status lifecycle
-        and snapshot model) — formalising the state machine,
-        xact_start/query_start/state_change semantics, and
-        concurrency model. (landed 2026-04-30)
+        and snapshot model). (landed 2026-04-30)
 
 - [x] Stage B: wait-event taxonomy and recording hooks.
-      (landed 2026-04-30: wait event type/name constants
-      matching upstream PG taxonomy — IO/Lock/Client/IPC/Timeout/
-      Activity/BufferPin/LWLock types, 50+ named events.
-      AIO wait events via goroutine-ID dispatch hookup.
-      Lock manager wait events via executor.acquireRelLock.
-      Client I/O wait events via FrameReader/FrameWriter hooks
-      wired in serveConn — ClientRead before every wire read,
-      ClientWrite before every wire write. Full `go test ./...`
-      green. Remaining upstream events deferred: WAL I/O,
-      data-file I/O, BufferPin, LWLock, IPC, background-process
-      Activity waits — these require activity registry
-      registration for non-client-backend types.)
+
+  - [x] Core taxonomy + client I/O + lock + AIO waits.
+        (landed 2026-04-30: constants matching upstream,
+        FrameReader/FrameWriter hooks for ClientRead/Write,
+        acquireRelLock for relation-lock waits,
+        Handle.Wait for AIO waits. Full `go test ./...` green.)
+
+  - [ ] Data-file I/O wait events (DataFileRead / Write / Extend /
+        Sync). Manager hook fields wired in initdb.Open via
+        LookupGoroutine. (pending)
+
+  - [ ] Background-process wait events (CheckpointerMain,
+        WalWriterMain, etc.). Requires activity-registry
+        registration for non-client backend types and
+        RegisterCurrentGoroutine in their Run() methods.
+        (pending)
+
+  - [ ] WAL I/O wait events (WALRead / WALWrite / WALSync).
+        Requires hook fields on wal.Writer / wal.Checkpointer.
+        (pending)
+
+  - [ ] Buffile I/O wait events (BuffileRead / BuffileWrite).
+        Requires hook fields on temporary-file I/O in executor.
+        (pending)
+
+  - [ ] BufferPin wait event. Requires instrumentation in
+        storage.Pool.Pin when a buffer is not in the pool and
+        an I/O read is needed. (pending)
 
 ## Milestone 0023 — Comprehensive syntax integration test suite
 
