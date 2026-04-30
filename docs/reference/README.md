@@ -14,11 +14,9 @@ Potential Optimisations).
 | REF-004 | Checkpointer | ⬜ Pending |
 | REF-005 | CTE / WITH Clause | ⬜ Pending |
 | REF-006 | EXPLAIN / ANALYZE | ⬜ Pending |
-| REF-007 | Heap Storage & MVCC | ⬜ Pending |
-| REF-008 | Lock Manager | ✅ Done |
-| REF-009 | Logical Replication | ⬜ Pending |
-| REF-010 | Parser & AST | ⬜ Pending |
-| REF-011 | Planner & Optimiser | ⬜ Pending |
+| REF-007 | Heap Storage & MVCC | ✅ Done |
+| REF-010 | Parser & AST | ✅ Done |
+| REF-011 | Planner & Optimiser | ✅ Done |
 | REF-012 | PL/pgSQL Runtime | ⬜ Pending |
 | REF-013 | Tuple Format & Codec | ⬜ Pending |
 | REF-014 | UPSERT (ON CONFLICT) | ⬜ Pending |

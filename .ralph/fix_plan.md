@@ -3648,10 +3648,9 @@ works and how PostgreSQL implements equivalent logic.
 - [ ] REF-004: Checkpointer
 - [ ] REF-005: CTE / WITH Clause
 - [ ] REF-006: EXPLAIN / ANALYZE
-- [ ] REF-007: Heap Storage & MVCC
-- [ ] REF-009: Logical Replication
-- [ ] REF-010: Parser & AST
-- [ ] REF-011: Planner & Optimiser
+- [x] REF-007: Heap Storage & MVCC
+- [x] REF-010: Parser & AST
+- [x] REF-011: Planner & Optimiser
 - [ ] REF-012: PL/pgSQL Runtime
 - [ ] REF-013: Tuple Format & Codec
 - [ ] REF-014: UPSERT (ON CONFLICT)
