@@ -13,6 +13,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -134,6 +137,24 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Start pprof HTTP endpoint on 127.0.0.1:6060 for CPU/heap profiling.
+	// Available endpoints:
+	//   /debug/pprof/profile?seconds=30  — CPU profile (download with go tool pprof)
+	//   /debug/pprof/heap               — heap profile
+	//   /debug/pprof/goroutine          — goroutine dump
+	go func() {
+		pprofAddr := "127.0.0.1:6060"
+		ln, err := net.Listen("tcp", pprofAddr)
+		if err != nil {
+			logger.Debug("pprof listener not available", "addr", pprofAddr, "err", err)
+			return
+		}
+		logger.Info("pprof endpoint", "addr", pprofAddr)
+		if err := http.Serve(ln, nil); err != nil {
+			logger.Debug("pprof server stopped", "err", err)
+		}
+	}()
 
 	// Auto-discover postgresql.conf inside the data directory when the
 	// operator didn't pass an explicit -config. Mirrors upstream
