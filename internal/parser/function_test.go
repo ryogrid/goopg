@@ -377,3 +377,48 @@ func TestParseCallRejectsTrailingSemicolon(t *testing.T) {
 		t.Fatalf("got %d statements", len(stmts))
 	}
 }
+
+// TestParseDropProcedureMinimal pins DROP PROCEDURE with no args.
+func TestParseDropProcedureMinimal(t *testing.T) {
+	src := `DROP PROCEDURE p`
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	dp := stmts[0].(*DropProcedureStmt)
+	if dp.IfExists {
+		t.Errorf("IfExists = true, want false")
+	}
+	if dp.Name.Name != "p" {
+		t.Errorf("Name.Name = %q, want p", dp.Name.Name)
+	}
+	if dp.Args != nil {
+		t.Errorf("Args = %v, want nil", dp.Args)
+	}
+}
+
+// TestParseDropProcedureIfExists pins IF EXISTS.
+func TestParseDropProcedureIfExists(t *testing.T) {
+	src := `DROP PROCEDURE IF EXISTS p`
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	dp := stmts[0].(*DropProcedureStmt)
+	if !dp.IfExists {
+		t.Errorf("IfExists = false, want true")
+	}
+}
+
+// TestParseDropProcedureArgs pins DROP PROCEDURE with argument types.
+func TestParseDropProcedureArgs(t *testing.T) {
+	src := `DROP PROCEDURE p(int, text)`
+	stmts, err := Parse(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	dp := stmts[0].(*DropProcedureStmt)
+	if len(dp.Args) != 2 {
+		t.Fatalf("Args len = %d, want 2", len(dp.Args))
+	}
+}

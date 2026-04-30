@@ -70,6 +70,8 @@ func (o *ddlOp) Next() (Row, error) {
 		return nil, o.execDropFunction(s)
 	case *parser.CreateProcedureStmt:
 		return nil, o.execCreateProcedure(s)
+	case *parser.DropProcedureStmt:
+		return nil, o.execDropProcedure(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -749,6 +751,41 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 	}
 	return nil
+}
+
+// execDropProcedure removes a procedure from the routine registry
+// (mirrors execDropFunction).
+func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP PROCEDURE requires routine registry"}
+	}
+	var err error
+	if s.Args == nil {
+		err = rs.DropByName(s.Name)
+	} else {
+		argTypes := make([]catalog.Type, len(s.Args))
+		for i, a := range s.Args {
+			argTypes[i] = catalog.Type{
+				Name: strings.ToLower(a.Type.Name),
+				Args: append([]int64(nil), a.Type.Args...),
+			}
+		}
+		err = rs.Drop(s.Name, argTypes)
+	}
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, catalog.ErrRoutineNotFound) {
+		if s.IfExists {
+			return nil
+		}
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: err.Error()}
+	}
+	if errors.Is(err, catalog.ErrRoutineAmbiguous) {
+		return &ExecError{Code: "42725", Pos: s.Pos(), Message: err.Error()}
+	}
+	return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 }
 
 // execDropFunction removes a routine from the registry. With an

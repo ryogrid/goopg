@@ -893,3 +893,16 @@ type CallStmt struct {
 
 func (s *CallStmt) Pos() int  { return s.pos }
 func (s *CallStmt) stmtNode() {}
+
+// DropProcedureStmt is the AST for `DROP PROCEDURE [IF EXISTS] name [(arg, ...)]`.
+// Stage B (procedure follow-up) of M0015.
+type DropProcedureStmt struct {
+	pos      int
+	IfExists bool
+	Name     ObjectName
+	Args     []FunctionArg // nil when no parenthesised arg list was given
+	Behavior DropBehavior
+}
+
+func (s *DropProcedureStmt) Pos() int  { return s.pos }
+func (s *DropProcedureStmt) stmtNode() {}

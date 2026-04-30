@@ -525,8 +525,11 @@ func (p *parser) parseDrop() (Stmt, error) {
 	case KwFunction:
 		p.advance()
 		return p.parseDropFunctionTail(t.Pos)
+	case KwProcedure:
+		p.advance()
+		return p.parseDropProcedureTail(t.Pos)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, or FUNCTION after DROP")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, or PROCEDURE after DROP")
 }
 
 // parseDropPubSubTail picks up after DROP PUBLICATION / DROP

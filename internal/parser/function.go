@@ -373,3 +373,32 @@ func (p *parser) parseCallStatement(pos int) (Stmt, error) {
 	}
 	return stmt, nil
 }
+
+// parseDropProcedureTail picks up after DROP PROCEDURE and returns
+// a populated DropProcedureStmt (mirrors parseDropFunctionTail).
+func (p *parser) parseDropProcedureTail(pos int) (Stmt, error) {
+	stmt := &DropProcedureStmt{pos: pos}
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	args, err := p.parseFunctionArgList()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Args = args
+	switch {
+	case p.acceptKeyword(KwCascade):
+		stmt.Behavior = DropCascade
+	case p.acceptKeyword(KwRestrict):
+		stmt.Behavior = DropDefault
+	}
+	return stmt, nil
+}
