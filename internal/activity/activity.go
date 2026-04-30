@@ -23,6 +23,8 @@ type Backend struct {
 	QueryStart      string
 	StateChange     string
 	State           string
+	WaitEventType   string
+	WaitEvent       string
 	BackendXID      string
 	BackendXMin     string
 	Query           string
@@ -112,6 +114,37 @@ func (r *Registry) EndTransaction(pid string) {
 	b.StateChange = now
 	b.XactStart = ""
 	b.BackendXID = ""
+}
+
+// WaitEventStart records that the backend is waiting for an event of the
+// given type (e.g. "IO") and name (e.g. "AIO"). Sets wait_event_type,
+// wait_event, and state_change. Stage B of M0022.
+func (r *Registry) WaitEventStart(pid, waitType, waitName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, ok := r.backends[pid]
+	if !ok {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	b.WaitEventType = waitType
+	b.WaitEvent = waitName
+	b.StateChange = now
+}
+
+// WaitEventEnd clears the wait event for the backend, returning
+// wait_event_type and wait_event to empty string (SQL NULL).
+func (r *Registry) WaitEventEnd(pid string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, ok := r.backends[pid]
+	if !ok {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	b.WaitEventType = ""
+	b.WaitEvent = ""
+	b.StateChange = now
 }
 
 // PID returns a string representation of a uint32 PID suitable for the registry.

@@ -63,3 +63,31 @@ func TestBeginEndTransaction(t *testing.T) {
 		t.Error("xact_start should be empty after EndTransaction")
 	}
 }
+
+func TestWaitEventStartEnd(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&Backend{PID: "1", State: "active"})
+	r.WaitEventStart("1", "IO", "AIO")
+	snap := r.Snapshot()
+	if snap[0].WaitEventType != "IO" {
+		t.Errorf("wait_event_type = %q, want IO", snap[0].WaitEventType)
+	}
+	if snap[0].WaitEvent != "AIO" {
+		t.Errorf("wait_event = %q, want AIO", snap[0].WaitEvent)
+	}
+	r.WaitEventEnd("1")
+	snap = r.Snapshot()
+	if snap[0].WaitEventType != "" {
+		t.Errorf("wait_event_type = %q, want empty after end", snap[0].WaitEventType)
+	}
+	if snap[0].WaitEvent != "" {
+		t.Errorf("wait_event = %q, want empty after end", snap[0].WaitEvent)
+	}
+}
+
+func TestWaitEventNonExistent(t *testing.T) {
+	r := NewRegistry()
+	// Must not panic or error.
+	r.WaitEventStart("999", "IO", "test")
+	r.WaitEventEnd("999")
+}
