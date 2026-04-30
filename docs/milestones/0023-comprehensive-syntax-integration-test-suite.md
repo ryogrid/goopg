@@ -1,6 +1,6 @@
 # Milestone 0023 - Comprehensive Syntax Integration Test Suite
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** All preceding milestones (M0007-M0022) — every syntax feature shipped by those milestones must have at least one end-to-end test in this suite.
 **Drives:** Go-portable TAP-style integration tests that exercise every implemented SQL statement family through both the Go-native wire protocol (`database/sql` via lib/pq) and the `psql` CLI. This suite is the goopg equivalent of PostgreSQL's `src/bin/psql/t/` and `src/test/regress/` TAP tests.
 

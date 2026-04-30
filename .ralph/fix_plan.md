@@ -3571,17 +3571,10 @@ Decompose when picked up.
 
 See `docs/milestones/0023-comprehensive-syntax-integration-test-suite.md`.
 
-- [x] DDL statement tests (CREATE/DROP TABLE, INDEX, VIEW, ALTER, TRUNCATE)
-- [x] SELECT / expression tests (JOIN, GROUP BY, subqueries, CASE, ORDER BY, LIMIT, WHERE)
-- [x] Error code / SQLSTATE verification tests
-- [x] DML statement tests (INSERT, UPDATE, DELETE)
-- [x] EXPLAIN / EXPLAIN ANALYZE tests
-- [x] Transaction tests
-- [x] pg_catalog virtual view tests
-- [x] UPSERT tests
-- [x] Window function tests
-- [x] Row locking tests (FOR UPDATE/SHARE)
-- [ ] Recursive CTE edge-case tests
+All items completed. 35 tests across 8 files covering DDL, DML,
+SELECT, JOIN, GROUP BY, subqueries, CASE, UPSERT, window functions,
+row locking, EXPLAIN, transactions, pg_catalog views, PL/pgSQL,
+recursive CTEs, and error code verification. Full `go test ./...` green.
 
 ## Notes
 
