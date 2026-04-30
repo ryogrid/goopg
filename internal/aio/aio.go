@@ -132,16 +132,38 @@ type Handle struct {
 	// Powers the elapsed-time column in pg_aios.
 	submittedAt time.Time
 
+	// waitEventType and waitEventName are set via SetWaitEvent
+	// and used by the engine's OnWaitStart/OnWaitEnd hooks for
+	// pg_stat_activity wait-event reporting.
+	waitEventType string
+	waitEventName string
+
 	engine *Engine
 }
 
 // Wait blocks until the Op completes and returns its Result.
 // Idempotent.
 func (h *Handle) Wait() Result {
+	if h.engine != nil && h.engine.OnWaitStart != nil {
+		h.engine.OnWaitStart()
+	}
 	<-h.done
+	if h.engine != nil && h.engine.OnWaitEnd != nil {
+		h.engine.OnWaitEnd()
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.res
+}
+
+// SetWaitEvent configures the wait-event type and name that the
+// engine's OnWaitStart/OnWaitEnd hooks pass to the activity registry
+// when a backend blocks on this Handle's I/O completion. The values
+// are used by pg_stat_activity's wait_event_type / wait_event columns.
+// Must be called before Wait.
+func (h *Handle) SetWaitEvent(waitType, waitName string) {
+	h.waitEventType = waitType
+	h.waitEventName = waitName
 }
 
 // finish stores the result and unblocks any Wait. Internal —
@@ -230,12 +252,19 @@ type Engine struct {
 
 	// requestedMethod records the io_method the caller asked
 	// for, even when the engine fell back to a different
-	// method (typically io_uring → worker on a kernel that
-	// doesn't support io_uring). fallbackReason carries the
-	// probe error so an operator log line can explain why.
-	// Both empty unless a fallback occurred.
+	// method (io_uring → workers on ENOSYS). Surfaces in the
+	// startup log line and in pg_aios for operator triage.
 	requestedMethod string
 	fallbackReason  string
+
+	// OnWaitStart and OnWaitEnd are optional hooks called by
+	// Handle.Wait before blocking on I/O completion and after
+	// the I/O completes, respectively. The activity package
+	// sets these from initdb.Open so pg_stat_activity can
+	// report "AIO" wait events. Both are called from the
+	// goroutine that calls Handle.Wait and must not block.
+	OnWaitStart func()
+	OnWaitEnd   func()
 }
 
 // inFlightEntry is the per-Op record the engine keeps while a
