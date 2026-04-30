@@ -64,10 +64,9 @@ func TestPlanWithCTEReferencingPriorSibling(t *testing.T) {
 	}
 }
 
-// TestPlanWithRecursiveRejected: planner is the second line of
-// defence (analyzer is the first). If Plan ever runs without an
-// upstream Analyze call (some test paths do this), the planner
-// must still surface 0A000.
+// TestPlanWithRecursiveRejected: non-UNION-ALL recursive CTEs are
+// rejected by the planner. The analyzer passes WITH RECURSIVE
+// through, but the planner requires UNION ALL.
 func TestPlanWithRecursiveRejected(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	stmt := parseOne(t, "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r")

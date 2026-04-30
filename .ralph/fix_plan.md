@@ -2610,14 +2610,16 @@ out (`0016-0001`..`0016-0004`); pick the topmost unchecked item.
       and EXPLAIN labels for CTE producers land in
       M0016-0004.)
 
-- [ ] Recursive CTE fixpoint execution
-      (M0016-0003). Hard prereq `UNION ALL` now landed
-      (2026-04-30). This slice does the
-      anchor/recursive-member detection, planner-side
-      fixpoint scan node, executor iteration, cycle-safe
-      termination, and unsupported-recursive-shape
-      rejection. Continues
-      `docs/design/0016-0003-recursive-cte-fixpoint-execution.md`.
+- [x] Recursive CTE fixpoint execution
+      (M0016-0003/0004). Hard prereq `UNION ALL` landed
+      alongside in the same slice. Design doc
+      `docs/design/0016-0004-recursive-cte-fixpoint-execution.md`.
+      Planner `RecursiveUnion` + `WorkTableScan` nodes.
+      Executor recursiveUnionOp (anchor drain → fixpoint
+      iteration via ctx.WorkTableRows) + workTableScanOp.
+      Analyzer now passes WITH RECURSIVE through (UNION ALL
+      requirement enforced by planner). Cycle safety via
+      1000-iteration limit. Full `go test ./...` green.
 
 - [x] CTE observability + compatibility tests
       (M0016-0004). Design doc

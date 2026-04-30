@@ -98,6 +98,11 @@ type Context struct {
 	// monotonic atomic counter — the youngest-backend victim
 	// policy from M0012-0002 relies on the monotonic shape.
 	BackendID lockmgr.BackendID
+
+	// WorkTableRows is set by RecursiveUnionOp during fixpoint
+	// iteration and read by WorkTableScanOp to produce rows from
+	// the current working table. M0016-0004 (recursive CTE).
+	WorkTableRows []Row
 }
 
 // acquireRelLock funnels every operator's relation-level lock

@@ -38,15 +38,17 @@ func TestAnalyzeWithCTERejectsForwardReference(t *testing.T) {
 		"42P01")
 }
 
-// TestAnalyzeWithRecursiveRejected pins the Stage A
-// limitation: WITH RECURSIVE is parsed but rejected at the
-// analyzer with SQLSTATE 0A000. Stage B (M0016-0003) flips
-// this to actual recursive analysis.
-func TestAnalyzeWithRecursiveRejected(t *testing.T) {
+// TestAnalyzeWithRecursivePasses verifies that WITH RECURSIVE
+// now passes through the analyzer (the planner enforces the
+// UNION ALL requirement).
+func TestAnalyzeWithRecursivePasses(t *testing.T) {
 	cat := analyzerCatalog(t)
-	expectAnalyzeCode(t, cat,
-		"WITH RECURSIVE r AS (SELECT aid FROM pgbench_accounts) SELECT aid FROM r",
-		"0A000")
+	stmt := parseOne(t,
+		"WITH RECURSIVE r AS (SELECT aid FROM pgbench_accounts) SELECT aid FROM r")
+	err := Analyze(stmt, cat)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
 }
 
 // TestAnalyzeWithDuplicateCTEName: two CTEs with the same

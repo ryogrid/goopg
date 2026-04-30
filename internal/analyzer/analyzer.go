@@ -1056,7 +1056,9 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 		return nil
 	}
 	if with.Recursive {
-		return analyzeError(with.Pos(), "0A000", "WITH RECURSIVE is not supported in v0 (Stage A)")
+		// WITH RECURSIVE: allow the CTE body to reference the
+		// CTE name itself. The planner handles the actual
+		// fixpoint iteration.
 	}
 	if ctx.ctes == nil {
 		ctx.ctes = make(map[string]*catalog.Table, len(with.CTEs))

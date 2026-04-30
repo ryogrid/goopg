@@ -57,12 +57,51 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 		return func() {}, nil
 	}
 	if with.Recursive {
-		// Second line of defence — the analyzer already rejects.
-		return nil, &PlanError{
-			Pos:     with.Pos(),
-			Code:    "0A000",
-			Message: "WITH RECURSIVE is not supported in v0 (Stage A)",
+		// WITH RECURSIVE: each CTE body must be a UNION ALL.
+		// Second line of defence — the analyzer already rejects
+		// non-UNION-ALL forms.
+		prev := planCTEs
+		cur := make(map[string]*plannedCTE, len(with.CTEs))
+		for k, v := range prev {
+			cur[k] = v
 		}
+		planCTEs = cur
+		restore := func() { planCTEs = prev }
+
+		for _, cte := range with.CTEs {
+			body, err := planRecursiveCTE(cte, cat)
+			if err != nil {
+				restore()
+				return nil, err
+			}
+			schema := body.Output()
+			if len(cte.Columns) > 0 {
+				if len(cte.Columns) != len(schema) {
+					restore()
+					return nil, &PlanError{
+						Pos:     cte.Pos(),
+						Code:    "42P10",
+						Message: fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(schema)),
+					}
+				}
+				renamed := make(Schema, len(schema))
+				for i, c := range schema {
+					renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+				}
+				schema = renamed
+			}
+			cols := make([]catalog.Column, len(schema))
+			for i, c := range schema {
+				cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
+			}
+			cur[strings.ToLower(cte.Name)] = &plannedCTE{
+				name:   cte.Name,
+				body:   body,
+				schema: schema,
+				table:  &catalog.Table{Name: cte.Name, Columns: cols},
+			}
+		}
+		return restore, nil
 	}
 	prev := planCTEs
 	cur := make(map[string]*plannedCTE, len(with.CTEs))
@@ -119,6 +158,63 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 		cur[strings.ToLower(cte.Name)] = entry
 	}
 	return restore, nil
+}
+
+// planRecursiveCTE plans a WITH RECURSIVE CTE body as a RecursiveUnion.
+// The CTE must have a UNION ALL body; the left side is the anchor
+// and the right side is the recursive member.
+func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, error) {
+	key := strings.ToLower(cte.Name)
+
+	if cte.Query.SetOp == nil || !cte.Query.SetOp.All {
+		return nil, &PlanError{
+			Pos:     cte.Pos(),
+			Code:    "0A000",
+			Message: "WITH RECURSIVE requires UNION ALL",
+		}
+	}
+
+	savedEntry, hadEntry := planCTEs[key]
+	if hadEntry {
+		delete(planCTEs, key)
+	}
+	anchor, err := planSelect(cte.Query, cat)
+	if err != nil {
+		if hadEntry {
+			planCTEs[key] = savedEntry
+		}
+		return nil, err
+	}
+
+	anchorSchema := anchor.Output()
+	wts := &WorkTableScan{pos: cte.Pos(), schema: anchorSchema}
+	wtCols := make([]catalog.Column, len(anchorSchema))
+	for i, c := range anchorSchema {
+		wtCols[i] = catalog.Column{Name: c.Name, Type: c.Type}
+	}
+	planCTEs[key] = &plannedCTE{
+		name:   cte.Name,
+		body:   wts,
+		schema: anchorSchema,
+		table:  &catalog.Table{Name: cte.Name, Columns: wtCols},
+	}
+
+	rec, err := planSelect(cte.Query.SetOp.Right, cat)
+	if err != nil {
+		if hadEntry {
+			planCTEs[key] = savedEntry
+		} else {
+			delete(planCTEs, key)
+		}
+		return nil, err
+	}
+
+	return &RecursiveUnion{
+		pos:       cte.Pos(),
+		Anchor:    anchor,
+		Recursive: rec,
+		schema:    anchorSchema,
+	}, nil
 }
 
 // lookupPlannedCTE consults planCTEs for an unschemed name. CTE

@@ -746,3 +746,27 @@ type SetOp struct {
 
 func (n *SetOp) Pos() int       { return n.pos }
 func (n *SetOp) Output() Schema { return n.Left.Output() }
+
+// RecursiveUnion implements a WITH RECURSIVE fixpoint (M0016-0004).
+// Anchor is the non-recursive initial SELECT; Recursive is the
+// recursive member referencing the CTE name via WorkTableScans.
+type RecursiveUnion struct {
+	pos       int
+	Anchor    Node
+	Recursive Node
+	schema    Schema
+}
+
+func (n *RecursiveUnion) Pos() int       { return n.pos }
+func (n *RecursiveUnion) Output() Schema { return n.schema }
+
+// WorkTableScan reads rows from the RecursiveUnion's working table
+// during fixpoint iteration. Only valid inside a RecursiveUnion's
+// Recursive subtree.
+type WorkTableScan struct {
+	pos    int
+	schema Schema
+}
+
+func (n *WorkTableScan) Pos() int       { return n.pos }
+func (n *WorkTableScan) Output() Schema { return n.schema }

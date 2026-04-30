@@ -107,6 +107,19 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newSetOp(p, left, right)), nil
+	case *planner.RecursiveUnion:
+		anchor, err := Build(p.Anchor)
+		if err != nil {
+			return nil, err
+		}
+		recursive, err := Build(p.Recursive)
+		if err != nil {
+			anchor.Close()
+			return nil, err
+		}
+		return maybeInstrument(p, newRecursiveUnionOp(p, anchor, recursive)), nil
+	case *planner.WorkTableScan:
+		return maybeInstrument(p, newWorkTableScanOp(p)), nil
 	case *planner.Update:
 		op, err := newUpdateOp(p)
 		if err != nil {
