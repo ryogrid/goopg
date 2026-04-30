@@ -2448,6 +2448,19 @@ Decomposition + design docs land when this milestone is picked up.
         implemented diagnostic for CALL. Full `go test ./...`
         green.)
 
+  - [x] Stage B step 3 — CALL execution for PL/pgSQL procedures.
+        (landed 2026-04-30: `callOp.Next` now evaluates CALL
+        arguments using the PL/pgSQL expression evaluator via
+        `evalPLpgSQLExpr` / `lowerPLpgSQLExpr` and executes the
+        procedure body using `executePLpgSQLStmtList`. Procedure
+        body is parsed, arguments are bound to named variables,
+        declarations are initialized, and statements are run.
+        SQL-language procedures remain deferred with a clear
+        0A000 diagnostic. 4 new executor tests: create procedure
+        catalog registration, duplicate rejection (42723),
+        unsupported language (42704), and end-to-end CALL
+        execution. Full `go test ./...` green.)
+
 ## Milestone 0016 — WITH clause (CTE) support
 
 See `docs/milestones/0016-with-clause-cte-support.md` for the full
