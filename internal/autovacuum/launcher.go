@@ -35,6 +35,12 @@ type Launcher struct {
 	// WorkerLimit caps the number of concurrent vacuum/analyze workers.
 	WorkerLimit int
 
+	// OnRunStart / OnRunEnd are optional hooks called at the start
+	// and end of Run(), so the caller can register the autovacuum
+	// launcher goroutine in the activity registry.
+	OnRunStart func()
+	OnRunEnd   func()
+
 	lastVacuum  map[string]time.Time   // key: qualified table name
 	lastAnalyze map[string]time.Time
 
@@ -63,6 +69,12 @@ func (l *Launcher) SetLogger(logger *slog.Logger) {
 
 // Run starts the launcher loop. It blocks until ctx is cancelled.
 func (l *Launcher) Run(ctx context.Context) error {
+	if l.OnRunStart != nil {
+		l.OnRunStart()
+	}
+	if l.OnRunEnd != nil {
+		defer l.OnRunEnd()
+	}
 	log := l.logger
 	if log == nil {
 		log = slog.Default()

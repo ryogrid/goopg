@@ -92,6 +92,9 @@ const (
 	WaitVacuumDelay          = "VacuumDelay"
 )
 
+// BufferPin events.
+const WaitBufferPin = "BufferPin"
+
 // Backend represents one server backend/connection for pg_stat_activity.
 type Backend struct {
 	PID             string

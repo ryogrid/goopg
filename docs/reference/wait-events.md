@@ -133,17 +133,20 @@ Their backend entries must also be registered in the activity registry
 | `ClientWrite`             | ✅ Done   | `protocol/frame.go` hooks          |
 | `AIO`                     | ✅ Done   | `aio/aio.go` Handle.Wait           |
 | `relation` (lock)         | ✅ Done   | `executor/context.go` acquireRelLock |
-| `DataFileRead`            | ✅ Done   | `storage/smgr.go` ReadBlock (hook)      |
-| `DataFileWrite`           | ✅ Done   | `storage/smgr.go` WriteBlock (hook)     |
-| `DataFileExtend`          | ✅ Done   | `storage/smgr.go` Extend (hook)         |
-| `DataFileSync`            | ✅ Done   | `storage/smgr.go` Sync (hook)           |
-| `WALRead/Write`           | ⬜ Pending| `wal/writer.go` state-loop goroutine |
-| `WALSync`                 | ✅ Done   | `wal/writer.go` FlushUpTo (hook)     |
-| `BufferPin`               | ⬜ Pending| `storage/bufpool.go` Pin wait        |
-| `CheckpointerMain`        | ✅ Done   | `cmd/goopg/main.go` goroutine wrapper|
-| `WalWriterMain`           | ⬜ Pending| `wal/writer.go` state-loop goroutine |
-| `BuffileRead/Write`       | ⬜ Pending| temporary file I/O in executor           |
-| `WalSenderMain`           | ⬜ Pending| replication walsender                    |
+| `DataFileRead`            | ✅ Done   | `storage/smgr.go` ReadBlock (hook) |
+| `DataFileWrite`           | ✅ Done   | `storage/smgr.go` WriteBlock (hook)|
+| `DataFileExtend`          | ✅ Done   | `storage/smgr.go` Extend (hook)    |
+| `DataFileSync`            | ✅ Done   | `storage/smgr.go` Sync (hook)      |
+| `WALWrite`                | ✅ Done   | `wal/writer.go` writeAt (hook)     |
+| `WALSync`                 | ✅ Done   | `wal/writer.go` FlushUpTo (hook)   |
+| `BufferPin`               | ✅ Done   | `storage/bufpool.go` Pin (hook)    |
+| `CheckpointerMain`        | ✅ Done   | `cmd/goopg/main.go` goroutine      |
+| `WalWriterMain`           | ✅ Done   | `wal/writer.go` state loop (register) |
+| `AutovacuumMain`          | ✅ Done   | `internal/autovacuum` (hook fields)|
+| `BuffileRead/Write`       | ⬜ N/A    | No buffile I/O in v0 executor      |
+| `WALRead`                 | ⬜ Pending| wal segment reader path             |
+| `WalSenderMain`           | ⬜ Pending| replication walsender               |
+| `WalReceiverMain`         | ⬜ Pending| replication walreceiver             |
 
 ## Reference
 

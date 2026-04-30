@@ -3575,25 +3575,21 @@ Decompose when picked up.
         Checkpointer backend registered in activity registry from
         main.go with RegisterCurrentGoroutine. (landed 2026-04-30)
 
-  - [x] WAL I/O wait events (WALSync). Writer.OnWALSync hook
-        wired in initdb.Open. WALWrite and WALRead deferred to
-        state-loop goroutine instrumentation. (landed 2026-04-30)
+  - [x] WAL I/O wait events (WALSync, WALWrite). Writer.OnWALSync
+      wired in initdb.Open; state.onWALWrite fired before writeAt.
+      (landed 2026-04-30)
 
-  - [ ] Buffile I/O wait events (BuffileRead / BuffileWrite).
-        Requires hook fields on temporary-file I/O in executor.
-        (pending)
+- [x] BufferPin wait event. Pool.OnPinWait hook, fired before
+      Pin's disk read; wired in initdb.Open. (landed 2026-04-30)
 
-  - [ ] Buffile I/O wait events (BuffileRead / BuffileWrite).
-        Requires hook fields on temporary-file I/O in executor.
-        (pending)
+- [x] WalWriterMain: WAL writer state loop registered in activity
+      registry via OnLoopStart/OnLoopEnd hooks. (landed 2026-04-30)
 
-  - [ ] BufferPin wait event. Requires instrumentation in
-        storage.Pool.Pin when a buffer is not in the pool and
-        an I/O read is needed. (pending)
+- [x] AutovacuumMain: Launcher.OnRunStart/OnRunEnd hook fields
+      for goroutine registration. (landed 2026-04-30)
 
-  - [ ] WalWriterMain / WalSenderMain / AutovacuumMain activity
-        wait events. Requires goroutine registration in their
-        respective Run() methods. (pending)
+- [ ] Buffile I/O wait events (BuffileRead / BuffileWrite).
+      No buffile I/O in v0 executor — deferred. (pending)
 
 ## Milestone 0023 — Comprehensive syntax integration test suite
 
@@ -3602,7 +3598,7 @@ See `docs/milestones/0023-comprehensive-syntax-integration-test-suite.md`.
 35 syntax tests landed (DDL / DML / SELECT / JOIN / GROUP BY /
 subqueries / CASE / UPSERT / window / row locking / EXPLAIN /
 transactions / pg_catalog / PL/pgSQL / recursive CTE / error codes).
-E2E scenario tests remain:
+E2E scenario tests:
 
 - [x] Physical streaming replication TAP test (primary ↔ standby) — SKIPPED: v0 DDL WAL replication not supported
 - [x] Logical streaming replication TAP test — SKIPPED: requires DDL WAL records

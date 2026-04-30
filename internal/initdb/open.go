@@ -150,6 +150,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		AlignedIO: opts.AlignedIO,
 	})
 
+	// Activity registry (M0022): must be created early so WAL writer,
+	// AIO engine, and Manager hooks can register their goroutines via
+	// activity.RegisterCurrentGoroutine. The pg_stat_activity virtual
+	// view is registered later, after the catalog is fully set up.
+	act := activity.NewRegistry()
+
 	// AIO engine: optional. With opts.AIOMethod=="" no engine is
 	// constructed and storage Manager.PrefetchBlock falls back to
 	// synchronous reads. When set we adapt the engine through a
@@ -189,6 +195,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DirectIO:           opts.WALDirectIO,
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
 		WALBuffers:         opts.WALBuffers,
+		OnLoopStart: func() {
+			pid := "wal-writer-0"
+			act.Register(&activity.Backend{
+				PID:         pid,
+				BackendType: "walwriter",
+				State:       "active",
+			})
+			activity.RegisterCurrentGoroutine(act, pid)
+		},
+		OnLoopEnd: func() {
+			activity.ClearCurrentGoroutine()
+		},
+		OnWALWrite: func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitWALWrite)
+			}
+		},
 	}
 	if aioEngine != nil {
 		walCfg.AIO = walAIOEngineAdapter{eng: aioEngine}
@@ -297,6 +320,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: bufpool: %w", err)
+	}
+	// Wire BufferPin wait event hook.
+	pool.OnPinWait = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+		}
 	}
 	// With an AIO engine attached, opt the Pool into prefetching
 	// so heap-scan / future bitmap-scan / ANALYZE callers issuing
@@ -490,7 +519,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_stat_activity: M0022 Stage A. Backend-activity registry
 	// tracking connection lifecycle, current query, and state.
 	// One row per active backend. Backed by *activity.Registry.
-	act := activity.NewRegistry()
 	if err := registerPgStatActivityView(cat, act); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()

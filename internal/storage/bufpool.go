@@ -135,6 +135,14 @@ type Pool struct {
 	poolMu    sync.Mutex
 	byTag     map[BufferTag]int
 	clockHand int
+
+	// OnPinWait is an optional hook called when Pool.Pin cannot find
+	// the buffer in the pool and must wait for a disk read.  The hook
+	// fires before the I/O; the ReadBlock/WriteBlock hooks on Manager
+	// cover the actual I/O wait.  initdb.Open sets this via
+	// activity.LookupGoroutine so pg_stat_activity can report
+	// BufferPin wait events.
+	OnPinWait func()
 }
 
 // PoolConfig controls Pool sizing.
@@ -569,6 +577,9 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	p.poolMu.Unlock()
 
 	s.contentMu.Lock()
+	if p.OnPinWait != nil {
+		p.OnPinWait()
+	}
 	err = p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
 	s.contentMu.Unlock()
 	if err != nil {

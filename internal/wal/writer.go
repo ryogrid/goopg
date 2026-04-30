@@ -127,6 +127,18 @@ type Config struct {
 	// initial timeline a fresh cluster starts on. Only consulted
 	// when PageHeaders=true.
 	TimelineID uint32
+
+	// OnLoopStart / OnLoopEnd are optional hooks called at the
+	// beginning and end of the WAL state-loop goroutine, so the
+	// caller can register/deregister the WAL writer goroutine in
+	// the activity registry via RegisterCurrentGoroutine.
+	OnLoopStart func()
+	OnLoopEnd   func()
+
+	// OnWALWrite is an optional hook called before each WAL page
+	// write in the state loop.  Set by initdb.Open so the activity
+	// registry can report WALWrite wait events.
+	OnWALWrite func()
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -397,6 +409,16 @@ type state struct {
 	prevRecPtr uint64
 	sysID      uint64
 	tli        uint32
+
+	// onLoopStart / onLoopEnd are optional hooks called at the
+	// beginning and end of the state-loop goroutine, respectively.
+	// Set by NewWriter from the Writer's OnLoopStart / OnLoopEnd.
+	onLoopStart func()
+	onLoopEnd   func()
+
+	// onWALWrite is an optional hook called before each WAL page
+	// write in writeAt. Set by NewWriter from the Writer's OnWALWrite.
+	onWALWrite func()
 }
 
 // directIOCounters holds the atomic counters wal-direct-I/O
@@ -467,6 +489,9 @@ func NewWriter(cfg Config) (*Writer, error) {
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
 	st.onAppend = w.notifyAppend
+	st.onLoopStart = cfg.OnLoopStart
+	st.onLoopEnd = cfg.OnLoopEnd
+	st.onWALWrite = cfg.OnWALWrite
 	go st.loop(w.ops, w.done)
 	return w, nil
 }
@@ -961,6 +986,12 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 }
 
 func (s *state) loop(ops <-chan op, done chan<- struct{}) {
+	if s.onLoopStart != nil {
+		s.onLoopStart()
+	}
+	if s.onLoopEnd != nil {
+		defer s.onLoopEnd()
+	}
 	defer close(done)
 	for req := range ops {
 		switch req.kind {
@@ -1229,6 +1260,9 @@ func (s *state) removeOldSegments(keepLSN uint64) (int, error) {
 }
 
 func (s *state) writeAt(pos int64, buf []byte) error {
+	if s.onWALWrite != nil {
+		s.onWALWrite()
+	}
 	for len(buf) > 0 {
 		segNo := uint64(pos / s.cfg.SegmentSize)
 		segOff := pos % s.cfg.SegmentSize
