@@ -147,6 +147,7 @@ func (o *seqScanOp) Next() (Row, error) {
 				if errors.Is(err, storage.ErrUnsupportedItem) {
 					continue
 				}
+				o.releasePinned()
 				return nil, err
 			}
 			if !mvcc.TupleVisible(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID) {
@@ -154,6 +155,7 @@ func (o *seqScanOp) Next() (Row, error) {
 			}
 			row, err := DecodeRow(o.cols, tuple.Data)
 			if err != nil {
+				o.releasePinned()
 				return nil, err
 			}
 			return row, nil
