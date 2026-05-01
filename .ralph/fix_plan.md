@@ -1851,13 +1851,14 @@ several blocking issues that prevent a clean end-to-end run:
       - At least 10 of 22 queries return correct results
       Document results in `analysis/tpch-hammerdb-run-001.md`.
 
-- [ ] **Investigate composite index support**: HammerDB creates
-      4 composite indexes (`idx_orders_custkey`, `idx_lineitem_orderkey`,
-      `idx_partsupp_partkey`, `idx_partsupp_suppkey`). goopg currently
-      rejects them with `"0A000 only single-column btree indexes are
-      supported"`. These are needed for the power test to match
-      upstream's index shapes (though the queries work via seq scan
-      without them).
+- [x] **Investigate int8/BIGINT index support** (fixed 2026-05-01):
+      The four HammerDB "composite" indexes are actually single-column
+      indexes on BIGINT (int8) columns (`o_custkey`, `l_orderkey`,
+      `ps_partkey`, `ps_suppkey`). goopg previously only supported
+      int4 and numeric B-tree keys. Added `EncodeInt8`/`DecodeInt8`
+      to the btree package and `isInt8Type` to the executor's DDL
+      type-checking. Files: `internal/access/btree/btree.go`,
+      `internal/executor/operators_ddl.go`.
 
 ## Milestone 0012 — Lock manager + deadlock detection
 
