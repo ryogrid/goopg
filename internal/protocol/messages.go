@@ -136,8 +136,12 @@ func (fw *FrameWriter) WriteBackendKeyData(pid, secret uint32) error {
 
 // WriteReadyForQuery emits 'Z' / 1-byte transaction status.
 func (fw *FrameWriter) WriteReadyForQuery(status TransactionStatus) error {
-	return fw.WriteFrame(MsgReadyForQuery, []byte{byte(status)})
+	if err := fw.WriteFrame(MsgReadyForQuery, []byte{byte(status)}); err != nil {
+		return err
+	}
+	return fw.Flush()
 }
+
 
 // WriteParseComplete emits '1' with no payload.
 func (fw *FrameWriter) WriteParseComplete() error {
