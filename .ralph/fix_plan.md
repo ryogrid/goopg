@@ -230,6 +230,18 @@ See `analysis/tpch-hammerdb-run-001.md` for the full run report.
         The numeric-validation fix in e5c390d resolves the earlier
         "2-HIGH in l_extendedprice" corruption.
 
+- [ ] **Reach finishing of HammerDB power test including execution of queries** (blocked 2026-05-02):
+      Q14 completed (401s) in an earlier run. Full Q1-Q22 run is
+      blocked by a systematic data corruption: ORDERS column values
+      (o_orderpriority) appear in lineitem.l_extendedprice during
+      fresh SF=1 loads. The `copyTextToDatum` NUMERIC validation
+      (e5c390d) catches non-numeric values at COPY time via manual
+      `COPY` command, but the diagnostic does not fire during
+      HammerDB's load, suggesting a different code path. The
+      corruption persists across rebuilds. Root cause investigation
+      is ongoing — the runtime data loading path within HammerDB's
+      `buildschema` remains uncharacterised.
+
 ## Milestone 0029a — TPC-H Index Support
 
 - [x] **Composite btree index support** (fixed 2026-05-01):
@@ -284,4 +296,3 @@ Decomposed into the six design-doc seams the milestone calls out.
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
-- [x] Milestone 0029 — HammerDB TPC-H End-to-End Run.
