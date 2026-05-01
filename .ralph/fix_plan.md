@@ -1761,7 +1761,92 @@ unchecked item.
       M0011 closes — `bench/tpch/run_all.sh` reaches the
       "CREATING TPCH INDEXES" stage without the int4-only
       restriction; full HammerDB completion needs composite
-      indexes which are separate scope.)
+       indexes which are separate scope.)
+
+## Milestone 0029 — HammerDB TPC-H End-to-End Run
+
+See `docs/milestones/0029-hammerdb-tpch-run.md` for the full DoD.
+
+### Current Status (investigated 2026-05-01)
+
+A pprof-based memory investigation was conducted. The findings identified
+several blocking issues that prevent a clean end-to-end run:
+
+1. **Data loading succeeds with `shared_buffers=256MB` but fails with
+   1600MB** — the 1.6 GiB mmap'd arena causes memory pressure during
+   bulk-load (COPY path). Schema build crashes during LINEITEM loading
+   at 1600MB but completes cleanly at 256MB.
+2. **Index creation fails** — `"message type 0x5a arrived from server
+   while idle"` during HammerDB's "CREATING TPCH INDEXES" phase. This
+   is a wire-protocol desynchronisation bug (`0x5a` = `'Z'` =
+   ReadyForQuery arriving when the client doesn't expect it).
+3. **Data corruption after crash** — when the server OOMs during loading,
+   partial WAL + partially-written heap pages leave corrupted tuples
+   (e.g. `l_extendedprice` contains "3-MEDIUM" instead of a valid
+   DECIMAL). This prevents power-test queries from completing.
+   Clean shutdown after a successful load does NOT exhibit this issue.
+4. **pg_catalog type resolution** — some queries fail with `"DecodeRow:
+   l_extendedprice: decode numeric "3-MEDIUM""` even on clean data.
+   The root cause appears to be the executor decoding catalog metadata
+   rows through the table-column codec path, producing type mismatches.
+5. **`shared_buffers=1600MB` crash** — confirmed: at 1600MB the server
+   is killed during HammerDB data loading (likely OOM from arena +
+   COPY allocations). At 256MB the load succeeds.
+
+### Tasks
+
+- [ ] **Fix "message type 0x5a" protocol bug**: Investigate where
+      goopg sends an extra ReadyForQuery during CREATE INDEX / DDL
+      execution. Likely in `executeOneSimpleStmt` returning
+      CommandComplete followed by the caller's ReadyForQuery, but
+      the COPY/DATA phase of DDL expects a different message sequence.
+      Files: `internal/server/dispatch.go`, `internal/server/query.go`,
+      `internal/server/copy.go`.
+
+- [ ] **Fix shared_buffers OOM during COPY load**: Two options:
+      (a) Add a `COPY memory budget` that caps per-statement
+      allocations during bulk-load, or
+      (b) Document that `shared_buffers` must be ≤ 512MB for SF=1.
+      The arena itself is mmap'd (fixed-size), but the COPY path's
+      temporary allocations + arena residency together exceed
+      available memory. Consider using `GOMEMLIMIT` to cap Go heap
+      growth.
+
+- [ ] **Graceful WAL recovery after crash**: Ensure goopg can
+      recover from an unclean shutdown without leaving corrupted
+      tuples. Currently, if the server dies during a write,
+      startup recovery may encounter checksum-mismatch WAL records
+      and refuse to start (`wal: corrupt record: checksum mismatch`).
+      WAL segments must be cleaned or recovery must skip corrupt
+      trailing records.
+
+- [ ] **Fix pg_catalog type resolution for DECIMAL / NUMERIC**:
+      The `"DecodeRow: l_extendedprice: decode numeric"` error
+      indicates that catalog metadata is being decoded through the
+      table-column codec path. Investigate whether the executor's
+      SeqScan is reading `pg_type` or `pg_attribute` virtual tables
+      and incorrectly applying the caller's column schema.
+      Alternatively, the planner may not be pruning columns correctly
+      — all columns are decoded even when only a subset is needed.
+      Files: `internal/executor/operators_storage.go` (SeqScanOp),
+      `internal/planner/` (column projection).
+
+- [ ] **Run full end-to-end test after fixes**: Execute
+      `bench/tpch/run_all.sh` (or step-by-step) at SF=1 with
+      `shared_buffers=256MB` and verify:
+      - Schema build + data load completes
+      - Index creation completes
+      - Power test (Q1–Q22) runs without crash
+      - At least 10 of 22 queries return correct results
+      Document results in `analysis/tpch-hammerdb-run-001.md`.
+
+- [ ] **Investigate composite index support**: HammerDB creates
+      4 composite indexes (`idx_orders_custkey`, `idx_lineitem_orderkey`,
+      `idx_partsupp_partkey`, `idx_partsupp_suppkey`). goopg currently
+      rejects them with `"0A000 only single-column btree indexes are
+      supported"`. These are needed for the power test to match
+      upstream's index shapes (though the queries work via seq scan
+      without them).
 
 ## Milestone 0012 — Lock manager + deadlock detection
 
