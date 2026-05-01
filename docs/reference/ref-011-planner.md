@@ -1,6 +1,53 @@
 # REF-011: Planner & Optimiser
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+The planner converts an analysed AST into an executable plan tree. goopg's planner is optimiser-light: it applies heuristic transformations (join order, index selection) but does not perform cost-based optimisation with accurate cardinality estimates.
+
+## goopg Implementation
+
+**Package:** `internal/planner/`
+
+### Key Types
+
+- `Node` — interface for all plan nodes (SeqScan, IndexScan, Project, Filter, Join, Sort, Aggregate, …).
+- `Plan(stmt, cat)` — the entry point. Dispatches on statement type:
+  - `SelectStmt` → `planSelect` → builds the plan tree bottom-up.
+  - `InsertStmt` → `planInsert` → SeqScan of target (for RETURNING) + insert node.
+  - `DDL` statements → `&DDL{Stmt: stmt}` pass-through.
+- `Expr` — planner-side expression node (planner.Expr). Converted from `parser.Expr` during planning.
+
+### Planning a SELECT
+
+```
+planSelect:
+  1. preplanWithClause — handle WITH/CTE (inline each CTE body)
+  2. planScan — resolve FROM clause
+       - plain table → SeqScan
+       - with index equality predicate → IndexScan
+       - subquery → recursive planSelect
+       - CTE → CTEScan (label wrap over the CTE body)
+  3. planFilter — WHERE clause
+  4. planJoin — JOINs (nested loop or hash join)
+  5. planAggregate — GROUP BY / aggregate functions
+  6. planWindow — window functions
+  7. planProject — target list
+  8. planSetOp — UNION/INTERSECT/EXCEPT
+  9. planSort — ORDER BY
+  10. planLimit — LIMIT / OFFSET
+```
+
+### Index Selection
+
+`planScanRangeVar` checks whether the WHERE clause contains an equality predicate on an indexed column. If so, it produces an `IndexScan` instead of a `SeqScan`. The index key expression is attached to the IndexScan node.
+
+### Cardinality Estimation
+
+`cardinality.go` provides a simple heuristic:
+- SeqScan: `rows = table_stats.row_count` (or 10 000 if unknown).
+- IndexScan: `rows = table_stats.row_count / distinct_values`.
+- Join: `rows = left_rows * right_rows / max(distinct_values)`.
+These estimates are used only for join ordering (hash vs nested-loop).
 
 ## PostgreSQL Implementation (Deep Dive)
 

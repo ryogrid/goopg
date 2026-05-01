@@ -1,6 +1,56 @@
 # REF-008: Lock Manager
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+The lock manager provides relation-level and tuple-level locking
+with deadlock detection. It is used by DML statements (INSERT,
+UPDATE, DELETE, SELECT FOR UPDATE) to serialise concurrent access
+to tables and rows.
+
+## goopg Implementation
+
+**Package:** `internal/lockmgr/`
+
+### Key Types
+
+- `LockManager` — central coordinator. Holds per-tag lock queues
+  and a deadlock-detection graph.
+- `LockTag` — identifies the resource being locked:
+  `{DB, Rel, Block, Tuple}`.
+- `Mode` — lock strength: `AccessShareLock`, `RowShareLock`,
+  `RowExclusiveLock`, `ExclusiveLock`, etc.
+- `BackendID` — per-connection identifier (monotonic `uint32`).
+- `Waiter` — a backend blocked on a lock.
+
+### Lock Acquisition
+
+```
+LockManager.Acquire(ctx, backendID, tag, mode)
+  ├─ Lock lm.mu
+  ├─ Walk the tag's lock queue
+  │    └─ If no conflict: grant immediately, unlock, return
+  ├─ If conflict:
+  │    ├─ Register as waiter
+  │    ├─ Build wait-for edge in deadlock graph
+  │    ├─ Unlock lm.mu
+  │    └─ Block on a per-backend condition variable (cond.Wait)
+  └─ On wakeup: re-acquire lm.mu, check if lock granted
+```
+
+### Deadlock Detection
+
+`CheckDeadlocksNow()` runs a cycle-detection pass over the
+wait-for graph every time a new wait edge is added. If a cycle
+is found, the youngest-backend victim is cancelled with
+`ErrDeadlockDetected`. Upstream PostgreSQL probes the deadlock
+graph on a timer and only when a lock wait exceeds
+`deadlock_timeout`.
+
+### Lock Release
+
+`ReleaseAll(backendID)` removes all locks held by a backend and
+wakes any waiters that can now be granted. Called at transaction
+end.
 
 ## PostgreSQL Implementation (Deep Dive)
 

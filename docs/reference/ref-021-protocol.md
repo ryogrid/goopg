@@ -1,6 +1,91 @@
 # REF-021: Protocol & Wire Format
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+goopg implements the PostgreSQL wire protocol (version 3.0) for client-server communication. This covers the startup handshake, simple-query, extended-query, COPY, and replication protocols.
+
+## goopg Implementation
+
+**Package:** `internal/protocol/`
+
+### Message Flow
+
+```
+Client                          Server
+  │                               │
+  ├─ StartupMessage ─────────────►│
+  │                               ├─ AuthenticationOk
+  │                               ├─ ParameterStatus (×N)
+  │                               ├─ BackendKeyData
+  │                               └─ ReadyForQuery
+  │                               │
+  ├─ Query (SELECT 1) ───────────►│
+  │                               ├─ RowDescription
+  │                               ├─ DataRow (×N)
+  │                               ├─ CommandComplete
+  │                               └─ ReadyForQuery
+  │                               │
+  ├─ Query (INSERT …) ───────────►│
+  │                               └─ CommandComplete
+  │                               └─ ReadyForQuery
+```
+
+### Frame Format
+
+Each message (after startup) has:
+```
+┌─────────────────────────────────┐
+│ Type byte (1)                    │  e.g., 'Q' = Query, 'P' = Parse
+│ Length (4) big-endian           │  includes self + payload
+│ Payload (variable)              │
+└─────────────────────────────────┘
+```
+
+### Supported Message Types
+
+| Byte | Message | Support |
+|------|---------|---------|
+| `Q` | Simple Query | Full |
+| `P` | Parse (extended) | Stub (returns 0A000) |
+| `B` | Bind | Stub |
+| `E` | Execute | Stub |
+| `X` | Terminate | Full (connection close) |
+| `H` | Flush | Stub |
+| `S` | Sync | Stub |
+| `d` | CopyData | Full |
+| `c` | CopyDone | Full |
+| `f` | CopyFail | Full |
+
+### Startup Packet
+
+The startup packet contains protocol version and key-value parameters:
+- `user`, `database`, `application_name`, `replication`, etc.
+
+goopg supports:
+- PostgreSQL 3.0 protocol (version 196608 = 3.0).
+- SSLRequest (gated by `Policy`).
+- GSSENCERequest (rejected).
+
+### Reply Messages
+
+| Byte | Message | Used for |
+|------|---------|----------|
+| `R` | AuthenticationOk / AuthenticationMD5Password | Auth handshake |
+| `S` | ParameterStatus | Session settings |
+| `K` | BackendKeyData | Cancel key |
+| `Z` | ReadyForQuery | Transaction status |
+| `T` | RowDescription | Column metadata |
+| `D` | DataRow | Row data |
+| `C` | CommandComplete | Statement completion tag |
+| `E` | ErrorResponse | Error with SQLSTATE |
+| `N` | NoticeResponse | Warning / notice |
+| `1` | ParseComplete | Extended-query |
+| `2` | BindComplete | Extended-query |
+| `3` | CloseComplete | Extended-query |
+| `n` | NoData | Extended-query |
+| `s` | PortalSuspended | Extended-query |
+| `W` | CopyInResponse | COPY FROM |
+| `G` | CopyOutResponse | COPY TO |
 
 ## PostgreSQL Implementation (Deep Dive)
 

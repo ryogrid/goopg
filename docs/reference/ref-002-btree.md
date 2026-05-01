@@ -1,6 +1,68 @@
 # REF-002: B-Tree Index
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+The B-Tree index provides ordered key→ItemPointer lookups for
+primary keys, unique indexes, and non-unique indexes. goopg's
+implementation is a Lehman-Yao B-link-tree with high-key-based
+right-link recovery, matching the PostgreSQL approach.
+
+## goopg Implementation
+
+**Package:** `internal/access/btree/`
+
+### Key Types
+
+- `BTree` — one per index relation. Holds a reference to the storage
+  `Pool` for page I/O.
+- `BTreeMeta` — the metapage (root block number, level count,
+  fast-root for single-page optimisation).
+- `item` — an on-page entry containing `key []byte` and
+  `ptr ItemPointer` (block + slot in the heap).
+- `BTreeOpaque` — per-page header (level, isLeaf, high key,
+  right-sibling link).
+
+### Data Flow (Search)
+
+```
+BTree.Search(key)
+  ├─ readMeta() — get root block
+  └─ descendToLeaf(key)
+       ├─ pinR(root), readOpaque, findChildBlock → next block
+       ├─ repeat until leaf
+       └─ linear scan of leaf items for matching key
+```
+
+### Page Structure
+
+Each B-tree page:
+```
+[PageHeader][BTreeOpaque][item_1][item_2]...[item_N][free space]
+```
+
+Items are stored in sorted order. The opaque header contains the
+level, leaf flag, high key (rightmost key of the left-sibling
+after a split), and next-block pointer for right-link recovery.
+
+### Splits
+
+When `insertIntoBlock` finds no space on the leaf, it:
+1. Pins a freshly-extended block as the right sibling.
+2. Redistributes items (half stay, half go right).
+3. Stamps high keys and sets `op.Next` links.
+4. Walks up the parent path to insert a separator key.
+
+The global `splitMu` serialises concurrent splits on the same
+tree. Non-split inserts on different leaves run without the lock.
+
+### Insert (non-split)
+
+```
+BTree.Insert(key, ptr)
+  ├─ tryInsertNoSplit → descendToLeaf, pinW(leaf),
+  │    insertItemSorted, MarkDirty (or MarkDirtyChangeRecord)
+  └─ on overflow → splitMu, retry via insertIntoBlock
+```
 
 ## PostgreSQL Implementation (Deep Dive)
 

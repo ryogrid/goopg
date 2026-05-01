@@ -1,6 +1,49 @@
 # REF-009: Logical Replication
 
-…(existing content through "Key Differences" unchanged)…
+## Overview
+
+Logical replication streams changes (INSERT/UPDATE/DELETE) from a publisher to a subscriber. Unlike physical replication (which copies WAL blocks), logical replication decodes changes into row-level operations, enabling selective replication and cross-version compatibility.
+
+## goopg Implementation
+
+**Packages:** `internal/wal/pgoutput.go`, `internal/server/logicalwalsender.go`, `internal/wal/slot_decoder.go`
+
+### Architecture
+
+Logical replication in goopg follows PostgreSQL's architecture:
+
+1. **Publication** — defines a set of tables to replicate. Created via `CREATE PUBLICATION`.
+2. **Slot** — a replication slot tracks the subscriber's position in the WAL stream.
+3. **pgoutput plugin** — decodes WAL records into protocol messages (Begin, Insert, Update, Delete, Commit).
+4. **Subscription** — creates the apply worker on the subscriber side.
+5. **Apply worker** — receives decoded messages and applies them to the local tables.
+
+### pgoutput Plugin
+
+`internal/wal/pgoutput.go` implements the streaming protocol:
+
+- `Begin` — marks the start of a transaction.
+- `Relation` — describes a table schema (column names and types).
+- `Insert` — supplies the new row image.
+- `Update` — supplies old and new row images.
+- `Delete` — supplies the old row image (or key).
+- `Commit` — marks transaction end.
+
+The plugin is invoked via `slot_decoder.go`'s `Decode` loop, which
+walks WAL records and calls the plugin for each decoded record.
+
+### Apply Worker
+
+The apply worker (`internal/server/logicalreceiver.go`) connects to
+the publisher, streams changes via the pgoutput protocol, and
+applies them to the subscriber's tables.
+
+### Tablesync
+
+Initial table synchronisation copies the current snapshot of a
+table via COPY, then switches to streaming. Managed by the
+tablesync state machine (catalog-based `pg_subscription_rel`
+states: `i` → init, `d` → data sync, `s` → synced, `r` → ready).
 
 ## PostgreSQL Implementation (Deep Dive)
 

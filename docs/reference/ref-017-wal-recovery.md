@@ -1,6 +1,57 @@
 # REF-017: WAL Redo / Crash Recovery
 
-…(existing content through "Key Differences" unchanged)…
+## Overview
+
+Crash recovery replays WAL records from the last checkpoint forward to restore the database to a consistent state. goopg's recovery re-applies heap, B-tree, and transaction-marker WAL records to bring data files up to date.
+
+## goopg Implementation
+
+**Packages:** `internal/wal/recovery.go`, `internal/wal/stream_replayer.go`
+
+### Key Types
+
+- `ReplayFromDir` — walks WAL segment files from a given starting
+  LSN, decodes records, and calls `ApplyRecord`.
+- `ApplyRecord` — dispatches on rmgr type and applies the record:
+  - `RmgrHeap`: heap insert / delete / vacuum / lock.
+  - `RmgrBtree`: B-tree insert / split.
+  - `RmgrXact`: transaction commit / abort markers.
+- `StreamReplayer` — receives WAL records from the WAL receiver
+  and applies them in a continuous loop (standby mode).
+
+### Recovery Flow
+
+```
+ReplayFromDir(walDir, startLSN)
+  ├─ DetectWALFormat — auto-detect page-header vs legacy format
+  ├─ ReadAll (segments) or readAllPageAware
+  ├─ For each record:
+  │    ├─ ApplyRecord (rmgr dispatch)
+  │    │    ├─ RmgrHeap: heap (un)do — insert / delete / vacuum
+  │    │    ├─ RmgrBtree: btree (un)do — insert / split
+  │    │    └─ RmgrXact: commit/abort markers
+  │    └─ Advance replay LSN
+  └─ Return final redo position
+```
+
+### Recovery Types
+
+- **Crash recovery** — happens at startup when `pg_wal` contains
+  records past the last checkpoint. goopg replays all records.
+- **Streaming recovery** — the `StreamReplayer` applies records as
+  they arrive from the WAL receiver, enabling hot standby.
+
+### WAL Record Types
+
+| Rmgr ID | Record Kind | Payload |
+|---------|-------------|---------|
+| RmgrHeap | XlogHeapInsert | rel, blk, tuple bytes |
+| RmgrHeap | XlogHeapDelete | rel, blk, slot, xmax |
+| RmgrHeap | XlogHeapVacuum | rel, blk, dead-slots |
+| RmgrBtree | XlogBtreeInsert | rel, blk, item bytes |
+| RmgrBtree | XlogBtreeSplit | rel, left_blk, right_blk, left_page, right_page |
+| RmgrXact | XlogXactCommit | xid |
+| RmgrXact | XlogXactAbort | xid |
 
 ## PostgreSQL Implementation (Deep Dive)
 
