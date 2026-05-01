@@ -1,6 +1,41 @@
 # REF-005: CTE / WITH Clause
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+Common Table Expressions (CTEs) — the `WITH` clause — allow queries to define named subqueries that can be referenced multiple times in the main query body. goopg supports non-recursive CTEs (inlined per reference) and recursive CTEs (`WITH RECURSIVE`) via fixpoint iteration.
+
+## goopg Implementation
+
+**Packages:** `internal/planner/with.go`, `internal/parser/`, `internal/analyzer/`, `internal/executor/`
+
+### Non-Recursive CTEs
+
+Non-recursive CTEs use inline-substitution: each reference to a CTE name in the FROM clause clones the planned body tree. Multiple consumers each get their own copy.
+
+```
+planSelect → preplanWithClause(s.With, cat)
+  ├─ plan each CTE body (left-to-right; earlier CTEs visible to later ones)
+  ├─ store planned body in planCTEs map
+  └─ planScanRangeVar → lookupPlannedCTE(name) → CTEScan(plannedBody)
+```
+
+### Recursive CTEs
+
+`WITH RECURSIVE r AS (anchor UNION ALL recursive_member)` is handled as:
+
+1. **Analyzer** (`analyzeRecursiveCTE`): analyses the anchor (left side of UNION ALL) to determine output columns, then registers the CTE in the scope so the recursive member's self-reference resolves.
+2. **Planner** (`planRecursiveCTE`):
+   - Saves and clears the UNION ALL's `SetOp` to plan the anchor.
+   - Registers a `WorkTableScan` placeholder for the CTE name.
+   - Plans the recursive member (CTE references → WorkTableScan).
+   - Returns a `RecursiveUnion{Anchor, Recursive}` node.
+3. **Executor** (`recursiveUnionOp`):
+   - Drains the anchor → working table.
+   - Iterates fixpoint: for each row in the working table, executes the recursive member with `ctx.WorkTableRows` set, collects new rows, replaces the working table, repeats until empty.
+
+### CTE Column Aliases
+
+Optional `(col, …)` aliases rename the CTE's output columns. An arity mismatch between aliases and the body's target list produces a planner error (42P10).
 
 ## PostgreSQL Implementation (Deep Dive)
 

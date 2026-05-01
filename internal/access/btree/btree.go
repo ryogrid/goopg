@@ -215,6 +215,23 @@ func DecodeInt4(b []byte) (int32, error) {
 	return int32(binary.BigEndian.Uint32(b) ^ 0x80000000), nil
 }
 
+// EncodeInt8 encodes an int64 into a sortable byte representation.
+// Uses big-endian with the sign bit flipped so that negative values
+// sort before positive values, matching the same approach as EncodeInt4.
+func EncodeInt8(key int64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(key)^0x8000000000000000)
+	return b[:]
+}
+
+// DecodeInt8 inverts EncodeInt8.
+func DecodeInt8(b []byte) (int64, error) {
+	if len(b) != 8 {
+		return 0, fmt.Errorf("btree: int8 key must be 8 bytes, got %d", len(b))
+	}
+	return int64(binary.BigEndian.Uint64(b) ^ 0x8000000000000000), nil
+}
+
 // EncodeNumericKey encodes a NUMERIC value (mantissa * 10^(-scale)) into
 // a sortable byte string such that bytewise comparison matches numeric
 // order. The encoding is scale-invariant: numerically equal inputs

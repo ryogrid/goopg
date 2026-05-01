@@ -1,6 +1,72 @@
 # REF-007: Heap Storage & MVCC
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+The heap is the primary storage structure for table rows. Each row is stored as a `HeapTuple` on an 8 KiB page. MVCC (Multi-Version Concurrency Control) provides snapshot-based isolation: each transaction sees a consistent view of rows as of its snapshot time, without blocking readers.
+
+## goopg Implementation
+
+**Packages:** `internal/storage/heap.go`, `internal/mvcc/`
+
+### Key Types
+
+- `HeapTuple` — an in-memory tuple representation with a `Header` (xmin, xmax, infomask) and `Data` (column values).
+- `HeapTupleHeader` — `xmin` (creating XID), `xmax` (deleting/locking XID), `infomask` (tuple flags), `t_hoff` (header offset).
+- `Page` — 8 KiB byte array. Contains line-pointer array (slot → offset+length) and tuple data.
+- `Manager` (mvcc) — handles transaction begin/commit/rollback, snapshot creation, XID assignment.
+
+### Page Layout
+
+```
+┌──────────────────────────────────┐
+│ PageHeaderData (24 bytes)        │
+│  - pd_lsn, pd_checksum, flags    │
+│  - lower (start of line pointers) │
+│  - upper (start of free space)    │
+├──────────────────────────────────┤
+│ Line pointers (ItemIdData)        │
+│  slot 1: {offset, length, flags}  │
+│  slot 2: {offset, length, flags}  │
+│  ...                              │
+├──────────────────────────────────┤
+│ Free space                        │
+├──────────────────────────────────┤
+│ Tuple data                        │
+│  tuple 2: HeapTupleHeader + cols  │
+│  tuple 1: HeapTupleHeader + cols  │
+└──────────────────────────────────┘
+```
+
+### Tuple Visibility
+
+`mvcc.TupleVisible(header, snap, currentXID)` checks:
+1. `xmin` is committed in the snapshot → visible.
+2. `xmin` is our own transaction → visible (in-progress).
+3. `xmax` is InvalidTransactionID → visible (not deleted).
+4. `xmax` is committed → not visible (deleted by committed xact).
+5. `xmax` is our own → visible only if we aborted (will be rolled back).
+
+### Insert Path
+
+`writeHeapRowReturning`:
+1. Encode columns → binary tuple bytes.
+2. Marshal into `HeapTuple` (xmin = current XID, xmax = invalid).
+3. Pin the last block of the relation.
+4. Call `PageAddHeapTuple` (finds free space on the page).
+5. If no space, extend the relation (lock `heapExtendLocks`).
+6. Mark dirty + WAL-log the insert.
+
+### Update Path
+
+`updateOp.Next()`:
+1. Find matching tuple (via IndexScan or SeqScan).
+2. Stamp `xmax` on old tuple → `PageSetHeapTupleXmax`.
+3. Mark dirty + WAL-log the delete.
+4. `writeHeapRow` → insert new tuple version.
+
+### Lock Manager Integration (MVCC)
+
+The `HeapXmaxLockOnly` infomask bit distinguishes a row lock from a delete. Lock-only xmax values are checked in `foreignLockOnly` and cause the UPDATE/DELETE to block on `acquireTupleLock`.
 
 ## PostgreSQL Implementation (Deep Dive)
 

@@ -1,6 +1,54 @@
 # REF-010: Parser & AST
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+The parser converts SQL text into an abstract syntax tree (AST). goopg uses a handwritten recursive-descent parser rather than a parser generator (yacc/bison). It supports the SQL subset needed by pgbench, TPC-H, HammerDB, and the goopg test suite.
+
+## goopg Implementation
+
+**Package:** `internal/parser/`
+
+### Key Types
+
+- `parser` — the recursive-descent state machine. Holds a token slice, current position, and helper methods (`acceptKeyword`, `expectSymbol`, `parseExpr`, etc.).
+- `Token` / `TokenKind` — lexer output: identifier, keyword, integer literal, string literal, operator, etc.
+- `Keyword` — a string enum for SQL keywords. Only keywords used by the supported statement families are registered.
+- `Stmt` — interface for all statement AST nodes (SelectStmt, InsertStmt, CreateTableStmt, etc.).
+- `Expr` — interface for all expression nodes (BinaryOp, ColumnRef, IntegerConst, etc.).
+
+### Lexer
+
+`lexer.go` produces a `[]Token` from SQL input:
+- Handles identifiers, keywords, numeric literals, string literals, operators.
+- Dollar-quote support (`$$body$$`, `$tag$body$tag$`) for PL/pgSQL routine bodies.
+- Positional parameters (`$1`..`$N`) for prepared statements.
+- Single-line (`--`) and block (`/* */`) comments.
+
+### Parser
+
+`parser.go` dispatches on the first keyword token:
+```
+parseStatement()
+  ├─ KwBegin → parseBegin
+  ├─ KwSelect → parseSelect
+  ├─ KwInsert → parseInsert
+  ├─ KwCreate → parseCreate (→ parseCreateTable, parseCreateView, parseCreateFunction, …)
+  ├─ KwDrop → parseDrop (→ parseDropTable, parseDropFunction, …)
+  ├─ KwCall → parseCallStatement
+  ├─ KwExplain → parseExplain
+  ├─ KwWith → parseStatementWithCTE
+  └─ … (others)
+```
+
+Expression parsing uses a precedence-climbing approach (`parseExpr` → `parseBinaryOp` → `parsePrefix` → `parsePrimary`).
+
+### AST
+
+The AST is defined as Go struct types in `ast.go`:
+- SelectStmt: targets, from, where, group-by, having, order-by, limit, set-operation.
+- InsertStmt: table, columns, values (RowsExpr or SelectStmt), on-conflict, returning.
+- UpdateStmt: table, set-clauses, where, returning.
+- CreateFunctionStmt, CreateProcedureStmt, etc.
 
 ## PostgreSQL Implementation (Deep Dive)
 

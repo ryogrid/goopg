@@ -63,3 +63,10 @@ export PGDATABASE="postgres"
 
 export TMP="${RUNTIME_DIR}/tmp"
 mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
+
+# Cap Go heap growth to prevent OOM during bulk COPY loads.
+# The shared_buffers arena is mmap'd (fixed-size), but the COPY
+# path's temporary allocations + arena residency together exceed
+# available memory at the default 1600MB setting. 256MB shared_buffers
+# avoids the issue; GOMEMLIMIT is an additional safety net.
+export GOMEMLIMIT=512MiB

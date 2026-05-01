@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"time"
@@ -84,102 +85,108 @@ type copyField struct {
 // distinct from the literal two-byte string "\N", which would have
 // to be written `\\N` on the wire.
 func splitCopyTextFields(line []byte) ([]copyField, error) {
-	var (
-		out      []copyField
-		field    []byte
-		isNull   bool
-		anyChars bool // tracks "did we see any non-`\N` bytes in this field?"
-	)
-	flush := func() {
-		if isNull && !anyChars {
-			out = append(out, copyField{isNull: true})
-		} else {
-			cp := make([]byte, len(field))
-			copy(cp, field)
-			out = append(out, copyField{bytes: cp})
-		}
-		field = field[:0]
-		isNull = false
-		anyChars = false
-	}
-	i := 0
-	for i < len(line) {
-		b := line[i]
-		switch b {
-		case '\t':
-			flush()
-			i++
-		case '\\':
-			if i+1 >= len(line) {
-				return nil, fmt.Errorf("COPY: trailing backslash")
-			}
-			c := line[i+1]
-			i += 2
-			switch c {
-			case 'N':
-				if !anyChars && !isNull {
-					isNull = true
-					continue
-				}
-				// `\N` mid-string folds to literal "N" per upstream.
-				field = append(field, 'N')
-				anyChars = true
-			case 'b':
-				field = append(field, 0x08)
-				anyChars = true
-			case 'f':
-				field = append(field, 0x0c)
-				anyChars = true
-			case 'n':
-				field = append(field, '\n')
-				anyChars = true
-			case 'r':
-				field = append(field, '\r')
-				anyChars = true
-			case 't':
-				field = append(field, '\t')
-				anyChars = true
-			case 'v':
-				field = append(field, 0x0b)
-				anyChars = true
-			case '\\':
-				field = append(field, '\\')
-				anyChars = true
-			case 'x', 'X':
-				v, n := decodeHexEscape(line[i:])
-				if n == 0 {
-					field = append(field, c)
-				} else {
-					field = append(field, v)
-					i += n
-				}
-				anyChars = true
-			case '0', '1', '2', '3', '4', '5', '6', '7':
-				v := c - '0'
-				extra := 0
-				for extra < 2 && i+extra < len(line) {
-					nc := line[i+extra]
-					if nc < '0' || nc > '7' {
-						break
-					}
-					v = v<<3 | (nc - '0')
-					extra++
-				}
-				i += extra
-				field = append(field, v)
-				anyChars = true
-			default:
-				field = append(field, c)
-				anyChars = true
-			}
-		default:
-			field = append(field, b)
-			anyChars = true
-			i++
+	// Phase 1: split on unescaped tabs. Backslash escapes are NOT
+	// processed here — we first find tab boundaries, then unescape
+	// each field in phase 2. This prevents a trailing `\` in a
+	// field from consuming the tab separator as `\t`.
+	var rawFields [][]byte
+	start := 0
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\t' {
+			rawFields = append(rawFields, line[start:i])
+			start = i + 1
 		}
 	}
-	flush()
+	rawFields = append(rawFields, line[start:])
+
+	out := make([]copyField, 0, len(rawFields))
+	for _, raw := range rawFields {
+		cf, err := unescapeCopyTextField(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cf)
+	}
 	return out, nil
+}
+
+// unescapeCopyTextField processes escape sequences in one COPY TEXT
+// field (no tab separators). Returns the decoded field or an error.
+func unescapeCopyTextField(raw []byte) (copyField, error) {
+	// Fast path: no backslash means no escaping needed.
+	if bytes.IndexByte(raw, '\\') < 0 {
+		cp := make([]byte, len(raw))
+		copy(cp, raw)
+		return copyField{bytes: cp}, nil
+	}
+
+	var field []byte
+	isNull := false
+	i := 0
+	for i < len(raw) {
+		b := raw[i]
+		if b != '\\' {
+			field = append(field, b)
+			i++
+			continue
+		}
+		// Escape sequence
+		if i+1 >= len(raw) {
+			return copyField{}, fmt.Errorf("COPY: trailing backslash")
+		}
+		c := raw[i+1]
+		i += 2
+		switch c {
+		case 'N':
+			if len(field) == 0 && !isNull {
+				isNull = true
+			}
+			field = append(field, 'N')
+		case 'b':
+			field = append(field, 0x08)
+		case 'f':
+			field = append(field, 0x0c)
+		case 'n':
+			field = append(field, '\n')
+		case 'r':
+			field = append(field, '\r')
+		case 't':
+			field = append(field, '\t')
+		case 'v':
+			field = append(field, 0x0b)
+		case '\\':
+			field = append(field, '\\')
+		case 'x', 'X':
+			v, n := decodeHexEscape(raw[i:])
+			if n == 0 {
+				field = append(field, c)
+			} else {
+				field = append(field, v)
+				i += n
+			}
+		case '0', '1', '2', '3', '4', '5', '6', '7':
+			v := c - '0'
+			extra := 0
+			for extra < 2 && i+extra < len(raw) {
+				nc := raw[i+extra]
+				if nc < '0' || nc > '7' {
+					break
+				}
+				v = v<<3 | (nc - '0')
+				extra++
+			}
+			i += extra
+			field = append(field, v)
+		default:
+			field = append(field, c)
+		}
+	}
+	if isNull && len(field) == 1 && field[0] == 'N' {
+		return copyField{isNull: true}, nil
+	}
+	cp := make([]byte, len(field))
+	copy(cp, field)
+	return copyField{bytes: cp}, nil
 }
 
 func decodeHexEscape(rest []byte) (byte, int) {
@@ -287,12 +294,23 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		default:
 			return Datum{}, fmt.Errorf("invalid boolean %q", string(raw))
 		}
-	case "timestamp", "timestamptz":
+	case "timestamp", "timestamptz", "date":
 		ts, err := parseCopyTimestamp(string(raw))
 		if err != nil {
 			return Datum{}, err
 		}
 		return Datum{Kind: KindTime, Time: ts}, nil
+	case "numeric", "decimal":
+		text := string(raw)
+		// Validate the text is a valid numeric literal before
+		// storing.  This catches column-alignment bugs at COPY
+		// time instead of silently storing wrong-byte data that
+		// surfaces later as DecodeRow errors.
+		m, s, err := parseNumeric(text)
+		if err != nil {
+			return Datum{}, fmt.Errorf("invalid numeric %q: %w", text, err)
+		}
+		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
 	default:
 		// text / varchar / char / unknown — keep as String.
 		return Datum{Kind: KindString, String: string(raw)}, nil
@@ -304,6 +322,7 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 // without timezone.
 func parseCopyTimestamp(s string) (time.Time, error) {
 	layouts := []string{
+		"2006-01-02",
 		"2006-01-02 15:04:05.000000",
 		"2006-01-02 15:04:05",
 		"2006-01-02 15:04:05.000000-07",

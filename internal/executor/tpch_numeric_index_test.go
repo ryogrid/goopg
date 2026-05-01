@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -146,15 +145,11 @@ func planContainsIndexScan(n planner.Node) bool {
 	return false
 }
 
-// TestTPCHCompositeIndexStillRejected pins the v0 single-column
-// limit. The four HammerDB composite indexes
-// (PARTSUPP_PK, LINEITEM_PK, LINEITEM_PART_SUPP_FKIDX,
-// ORDER_CUSTOMER_FKIDX is single-column so excluded here) must
-// continue to surface 0A000 — failing would silently accept
-// half-implemented composite support. When composite indexes
-// land in a future milestone, this test inverts to assert
-// success.
-func TestTPCHCompositeIndexStillRejected(t *testing.T) {
+// TestTPCHCompositeIndexSucceeds verifies composite btree indexes
+// work end-to-end for the HammerDB TPC-H composite shapes
+// (partsupp: ps_partkey, ps_suppkey; lineitem: l_linenumber,
+// l_orderkey; lineitem: l_partkey, l_suppkey).
+func TestTPCHCompositeIndexSucceeds(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
@@ -168,17 +163,8 @@ func TestTPCHCompositeIndexStillRejected(t *testing.T) {
 		"CREATE INDEX lineitem_pk ON lineitem (l_linenumber, l_orderkey)",
 		"CREATE INDEX lineitem_part_supp_fkidx ON lineitem (l_partkey, l_suppkey)",
 	} {
-		err := runDDL(t, ctx, sql)
-		if err == nil {
-			t.Errorf("composite CREATE INDEX should be rejected: %s", sql)
-			continue
-		}
-		ee, ok := err.(*ExecError)
-		if !ok || ee.Code != "0A000" {
-			t.Errorf("want 0A000, got %v\nSQL: %s", err, sql)
-		}
-		if !strings.Contains(strings.ToLower(ee.Message), "single-column") {
-			t.Errorf("unexpected error message %q for %s", ee.Message, sql)
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Errorf("composite CREATE INDEX should succeed: %s: %v", sql, err)
 		}
 	}
 }

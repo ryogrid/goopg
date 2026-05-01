@@ -1,6 +1,59 @@
 # REF-019: pg_stat_activity & Wait Events
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+`pg_catalog.pg_stat_activity` exposes information about active server backends: their PID, current query, state, transaction timestamps, and wait events. goopg implements a virtual view backed by an in-memory registry, with wait events recorded at blocking-operation boundaries.
+
+## goopg Implementation
+
+**Package:** `internal/activity/`
+
+### Registry
+
+`activity.Registry` is a concurrency-safe (`sync.RWMutex`) map of
+backend PID → `Backend` struct. Each backend entry contains:
+
+```go
+type Backend struct {
+    PID, State, Query, QueryStart, XactStart, StateChange string
+    WaitEventType, WaitEvent                               string
+    BackendType, UserName, DatName                         string
+    ClientAddr, ClientPort                                  string
+    BackendStart, BackendXID, BackendXMin                   string
+}
+```
+
+### Backend Lifecycle
+
+1. **Connection accepted** (`serveConn`): backend registered with
+   state = "active", backend_type = "client_backend".
+2. **Query dispatched**: state → "active", query text updated.
+3. **Query completes**: state → "idle".
+4. **Connection closed**: backend unregistered.
+
+### Virtual View
+
+The view is registered in `initdb.Open` via `registerPgStatActivityView`.
+Its `VirtualRows` callback calls `Registry.Snapshot()` and formats
+each backend entry into a `[][]string` row.
+
+### Wait Event Recording
+
+Wait events are recorded at blocking-operation boundaries:
+
+| Wait Type | Wait Name | Hook Location |
+|-----------|-----------|---------------|
+| Client | ClientRead | `protocol.FrameReader` (before every read) |
+| Client | ClientWrite | `protocol.FrameWriter` (before every write) |
+| IO | AIO | `aio.Handle.Wait` (engine hooks) |
+| IO | DataFileRead/Write/Extend/Sync | `storage.Manager` hooks |
+| IO | WALSync | `wal.Writer.FlushUpTo` |
+| IO | WALWrite | `state.writeAt` |
+| Lock | relation | `executor.acquireRelLock` |
+| BufferPin | BufferPin | `storage.Pool.Pin` |
+
+The goroutine-ID lookup mechanism (`LookupGoroutine`) maps the
+calling goroutine to the correct (Registry, PID) pair.
 
 ## PostgreSQL Implementation (Deep Dive)
 

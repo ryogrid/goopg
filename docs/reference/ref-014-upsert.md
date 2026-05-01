@@ -1,6 +1,53 @@
 # REF-014: UPSERT (ON CONFLICT)
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+`INSERT … ON CONFLICT DO NOTHING / DO UPDATE SET …` (UPSERT) atomically inserts a row or updates an existing row if a conflict occurs on a unique index or exclusion constraint.
+
+## goopg Implementation
+
+**Package:** `internal/executor/operators_upsert.go`
+
+### Key Types
+
+- `upsertOp` — handles the DO UPDATE path.
+- `onConflictDoNothingOp` — handles the DO NOTHING path.
+
+### DO NOTHING Path
+
+```
+onConflictDoNothingOp.Next()
+  ├─ Insert the row via writeHeapRow.
+  ├─ If no unique-violation error → return (row inserted).
+  └─ If unique-violation error → swallow the error, return EOF.
+```
+
+### DO UPDATE Path
+
+```
+upsertOp.Next()
+  ├─ Insert the row via writeHeapRowReturning (returns ItemPointer).
+  ├─ If no conflict → update the index, return.
+  └─ If conflict (unique-violation error):
+       ├─ Resolve the arbiter index (ON CONFLICT (col)).
+       ├─ Re-read the conflicting tuple via the index.
+       ├─ Stamp xmax on the existing tuple.
+       ├─ writeHeapRowReturning for the new tuple.
+       ├─ Update the arbiter index pointer.
+       └─ If ON CONFLICT ON CONSTRAINT, validate constraint name.
+```
+
+### Planner Integration
+
+The planner produces:
+- `Insert` with `OnConflict` field containing the conflict target and action.
+- For `ON CONFLICT DO NOTHING`, the executor builds `onConflictDoNothingOp`.
+- For `ON CONFLICT DO UPDATE`, the executor builds `upsertOp`.
+
+### Limitations
+
+- `ON CONFLICT ON CONSTRAINT name` is partially supported (parsed and basic validation).
+- `EXCLUDED` row reference is supported via the `upsertOp`'s excluded-row tracking.
 
 ## PostgreSQL Implementation (Deep Dive)
 

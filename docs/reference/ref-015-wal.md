@@ -1,6 +1,80 @@
 # REF-015: WAL Format & I/O
 
-…(existing content up to "Key Differences" unchanged)…
+## Overview
+
+The WAL (Write-Ahead Log) subsystem provides ordered, crash-safe
+persistence for all data modifications. Each modification produces
+a WAL record that is written to in-memory buffers and eventually
+flushed to on-disk segment files. On recovery, un-flushed records
+are replayed to restore durability.
+
+## goopg Implementation
+
+**Package:** `internal/wal/`
+
+### Key Types
+
+- `Writer` — the public API for appending and flushing WAL records.
+  Holds a channel (`ops`) to the state-loop goroutine and a
+  `MemRing` for walsender in-memory streaming.
+- `state` — the run-loop goroutine that processes operations.
+  Owns `walBuf` (in-memory buffer), `writePos` / `writeLSN`,
+  segment file handles, and the AIO engine seam.
+- `Config` — controls WAL directory, segment size, preallocation,
+  direct I/O, sender memory buffer, WAL buffers, and hook fields
+  for wait events.
+
+### Record Format (Legacy, no page headers)
+
+```
+┌──────────────────────────────┐
+│ payload length (4 bytes, LE) │
+├──────────────────────────────┤
+│ CRC-32 of payload (4 bytes)  │
+├──────────────────────────────┤
+│ payload (variable)           │
+└──────────────────────────────┘
+```
+
+Total header overhead: 8 bytes per record.
+
+### Record Format (PG-compatible page headers, M0014)
+
+When `PageHeaders=true`, records are embedded in an XLOG page
+stream matching PostgreSQL's `pd_lsn` / `xlp_rem_len` layout.
+The page headers are emitted every `SegmentSize` bytes. This
+format is what `pg_waldump` expects.
+
+### Data Flow (Append)
+
+```
+Writer.Append(payload)
+  ├─ encodeRecord(payload) — prepend length + CRC
+  ├─ (M0026 fast path) tryAppend:
+  │    ├─ lock appendMu
+  │    ├─ append to walBuf (memcpy) and memRing
+  │    ├─ update writeLSN, unlock
+  │    └─ return (startLSN, endLSN)
+  └─ (fallback) send opAppend to state loop → state.append
+```
+
+### Data Flow (Flush)
+
+```
+Writer.FlushUpTo(lsn)
+  └─ send opFlush to state loop → state.flushUpTo(lsn)
+       ├─ drainBufferBytes (write walBuf → segment files)
+       ├─ dataSync (fdatasync)
+       └─ update flushedLSN
+```
+
+### Segment Management
+
+WAL segments are 16 MB by default (`DefaultSegmentSize`), named
+`000000000000000000000000` (24 hex digits: timeline + LSN). New
+segments are pre-allocated and zero-filled when `Preallocate=true`.
+Old segments are removed by the checkpointer's retention policy
+(slot-aware).
 
 ## PostgreSQL Implementation (Deep Dive)
 
