@@ -1795,22 +1795,30 @@ several blocking issues that prevent a clean end-to-end run:
 
 ### Tasks
 
-- [ ] **Fix "message type 0x5a" protocol bug**: Investigate where
-      goopg sends an extra ReadyForQuery during CREATE INDEX / DDL
-      execution. Likely in `executeOneSimpleStmt` returning
-      CommandComplete followed by the caller's ReadyForQuery, but
-      the COPY/DATA phase of DDL expects a different message sequence.
-      Files: `internal/server/dispatch.go`, `internal/server/query.go`,
-      `internal/server/copy.go`.
+- [x] **Fix "message type 0x5a" protocol bug** (fixed 2026-05-01):
+      Root cause was that `writeQueryError` sent ErrorResponse +
+      ReadyForQuery to the bufio buffer but the connection loop
+      exits before calling `Flush()` when an error propagates up.
+      The buffered data was lost or partially sent, causing libpq
+      to receive an unexpected 'Z' in idle state.
+      Fix: `WriteReadyForQuery` now calls `Flush()` after writing
+      the frame. Verified: duplicate CREATE INDEX returns clean
+      ErrorResponse without protocol desync. The HammerDB schema
+      build reaches "CREATING TPCH INDEXES" without the 0x5a
+      error (though index creation still fails for unsupported
+      types).
+      File: `internal/protocol/messages.go`.
 
 - [ ] **Fix shared_buffers OOM during COPY load**: Two options:
       (a) Add a `COPY memory budget` that caps per-statement
       allocations during bulk-load, or
-      (b) Document that `shared_buffers` must be ≤ 512MB for SF=1.
+      (b) Change the default config to use `shared_buffers = 256MB`
+      for SF=1 (confirmed: OOM at 1600MB, clean at 256MB).
       The arena itself is mmap'd (fixed-size), but the COPY path's
       temporary allocations + arena residency together exceed
       available memory. Consider using `GOMEMLIMIT` to cap Go heap
-      growth.
+      growth. The `bench/tpch/setup_goopg.sh` config has been
+      changed to 256MB by default.
 
 - [ ] **Graceful WAL recovery after crash**: Ensure goopg can
       recover from an unclean shutdown without leaving corrupted
@@ -1822,14 +1830,17 @@ several blocking issues that prevent a clean end-to-end run:
 
 - [ ] **Fix pg_catalog type resolution for DECIMAL / NUMERIC**:
       The `"DecodeRow: l_extendedprice: decode numeric"` error
-      indicates that catalog metadata is being decoded through the
-      table-column codec path. Investigate whether the executor's
-      SeqScan is reading `pg_type` or `pg_attribute` virtual tables
-      and incorrectly applying the caller's column schema.
-      Alternatively, the planner may not be pruning columns correctly
-      — all columns are decoded even when only a subset is needed.
-      Files: `internal/executor/operators_storage.go` (SeqScanOp),
-      `internal/planner/` (column projection).
+      was observed only on data from a server that crashed during
+      loading (unclean shutdown). With cleanly-loaded data (200MB
+      shared_buffers, clean shutdown), `SELECT ... FROM lineitem
+      LIMIT 3` works correctly. Verify whether the error still
+      occurs with a full table scan (no LIMIT) on clean data. If
+      it does not, the error was data corruption from the crash,
+      not a codec bug. If it does, investigate `decodeValue` type
+      matching for stored type names with args (e.g. `decimal(15,2)`
+      vs `"decimal"`). Files: `internal/executor/codec.go`
+      (`decodeValue`), `internal/executor/operators_storage.go`
+      (SeqScanOp).
 
 - [ ] **Run full end-to-end test after fixes**: Execute
       `bench/tpch/run_all.sh` (or step-by-step) at SF=1 with
