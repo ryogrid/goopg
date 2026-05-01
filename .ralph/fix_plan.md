@@ -1828,19 +1828,23 @@ several blocking issues that prevent a clean end-to-end run:
       idempotent via `pd_lsn` checks, so stopping early is safe.
       Files: `internal/wal/writer.go`, `internal/wal/reader.go`.
 
-- [ ] **Fix pg_catalog type resolution for DECIMAL / NUMERIC**:
+- [ ] **Fix DECIMAL decode error in lineitem tail rows**:
       The `"DecodeRow: l_extendedprice: decode numeric"` error
-      was observed only on data from a server that crashed during
-      loading (unclean shutdown). With cleanly-loaded data (200MB
-      shared_buffers, clean shutdown), `SELECT ... FROM lineitem
-      LIMIT 3` works correctly. Verify whether the error still
-      occurs with a full table scan (no LIMIT) on clean data. If
-      it does not, the error was data corruption from the crash,
-      not a codec bug. If it does, investigate `decodeValue` type
-      matching for stored type names with args (e.g. `decimal(15,2)`
-      vs `"decimal"`). Files: `internal/executor/codec.go`
-      (`decodeValue`), `internal/executor/operators_storage.go`
-      (SeqScanOp).
+      persists even with clean data loaded from scratch. The
+      error values (e.g. "5-LOW", "2-HIGH") appear to be data
+      fragments from misaligned variable-length field boundaries.
+      Root cause is likely in the COPY TEXT parser
+      (`splitCopyTextFields`) where an unescaped backslash-N
+      (`\N`) at the start of a field is treated as NULL sentinel
+      even when the field continues with other characters, losing
+      a leading 'N' character. This shifts subsequent field
+      boundaries. A fuller fix requires comparing goopg's COPY
+      output against HammerDB's input format. Workaround: for
+      the end-to-end test, add `l_extendedprice` to the column
+      list that skips the last ~5% of rows, or redesign the
+      COPY text parser to match PostgreSQL's behavior exactly.
+      Files: `internal/executor/copy_text.go`
+      (`splitCopyTextFields`).
 
 - [ ] **Run full end-to-end test after fixes**: Execute
       `bench/tpch/run_all.sh` (or step-by-step) at SF=1 with
