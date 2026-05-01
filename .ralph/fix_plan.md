@@ -1820,13 +1820,13 @@ several blocking issues that prevent a clean end-to-end run:
       growth. The `bench/tpch/setup_goopg.sh` config has been
       changed to 256MB by default.
 
-- [ ] **Graceful WAL recovery after crash**: Ensure goopg can
-      recover from an unclean shutdown without leaving corrupted
-      tuples. Currently, if the server dies during a write,
-      startup recovery may encounter checksum-mismatch WAL records
-      and refuse to start (`wal: corrupt record: checksum mismatch`).
-      WAL segments must be cleaned or recovery must skip corrupt
-      trailing records.
+- [x] **Graceful WAL recovery after crash** (fixed 2026-05-01):
+      `scanLastSegmentEnd`, `ReadAll`, and `readAllPageAware` now
+      treat decode errors in the last WAL segment as EOS instead of
+      hard errors. This handles OOM-kill scenarios where the last
+      segment has a corrupt trailing record. WAL application is
+      idempotent via `pd_lsn` checks, so stopping early is safe.
+      Files: `internal/wal/writer.go`, `internal/wal/reader.go`.
 
 - [ ] **Fix pg_catalog type resolution for DECIMAL / NUMERIC**:
       The `"DecodeRow: l_extendedprice: decode numeric"` error
