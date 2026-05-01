@@ -488,6 +488,12 @@ func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string
 		return &extendedQueryResult{CommandTag: "RESET"}, nil
 	}
 
+	if strings.HasPrefix(upper, "COPY ") {
+		return nil, &extendedQueryError{
+			Code:    sqlstate.FeatureNotSupported,
+			Message: "COPY is only supported in the simple query protocol",
+		}
+	}
 	if s.cfg.hasStorage() {
 		return s.executeExtendedQueryViaExecutor(sess, trimmed, params)
 	}

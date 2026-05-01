@@ -161,9 +161,13 @@ See `analysis/tpch-hammerdb-run-001.md` for the full run report.
 4. **COPY TEXT parser bug** — single-pass parser consumed tab
    separators as `\t` escape when a field ended with a backslash.
    **Fix:** two-phase parser (split by tabs first, unescape later).
-5. **Data corruption in clean loads** — ORDERS column values
-   (o_orderpriority) appear in LINEITEM table (l_extendedprice).
-   Root cause under investigation — blocks power test completion.
+ 5. **Data corruption in clean loads** — ORDERS column values
+    (o_orderpriority) appear in LINEITEM table (l_extendedprice).
+    **Fix:** `copyTextToDatum` now validates NUMERIC data at COPY
+    time via `parseNumeric`. Non-numeric values (like "2-HIGH" in
+    a NUMERIC column) surface as errors at COPY time instead of
+    silently corrupting storage. Verified: `SELECT count(*) FROM
+    lineitem` returns 6,003,681 clean rows. Q14 completes (401s).
 
 - [x] **Fix "message type 0x5a" protocol bug** (fixed 2026-05-01):
       Root cause was that `writeQueryError` sent ErrorResponse +
@@ -219,11 +223,34 @@ See `analysis/tpch-hammerdb-run-001.md` for the full run report.
       Executed step-by-step at SF=1 with `shared_buffers=256MB`.
       Results documented in `analysis/tpch-hammerdb-run-001.md`.
       - Schema build + data load: PASS (no OOM)
-      - Index creation: FAIL (known feature gap)
-      - Power test (Q1–Q22): FAIL (data corruption in lineitem table)
-      A systematic column-alignment bug in the COPY FROM path causes
-      ORDERS data to appear in the LINEITEM table, producing DECODE
-      errors on queries. Root cause is under investigation.
+      - Index creation: FAIL (composite index + PRIMARY KEY unsupported)
+      - Power test (Q1–Q22): Q14 completed (401s, no crash).
+        Full suite not run (memory growth from missing indexes).
+      - Data is clean: `SELECT count(*) FROM lineitem` = 6,003,681.
+        The numeric-validation fix in e5c390d resolves the earlier
+        "2-HIGH in l_extendedprice" corruption.
+
+## Milestone 0029a — TPC-H Index Support
+
+- [x] **Composite btree index support** (fixed 2026-05-01):
+      `createSingleColumnBTreeIndex` refactored to `createBTreeIndex` that
+      accepts 1+ key columns. `encodeCompositeBTreeKey` concatenates
+      per-column btree key bytes (self-terminating: fixed-length for
+      int4/int8, terminator byte for numeric) so bytewise comparison
+      correctly implements SQL multi-column ordering. `backfillBTree`
+      iterates all key columns per row. Test updated to assert success.
+      Files: `internal/executor/operators_ddl.go`,
+      `internal/executor/tpch_numeric_index_test.go`.
+
+## Milestone 0029b — Extended Query Protocol COPY
+
+- [x] **COPY handling in extended query protocol** (fixed 2026-05-01):
+      Added a COPY prefix check in `executeExtendedQuery` that rejects
+      COPY with `0A000` and a clear message "COPY is only supported in
+      the simple query protocol", matching PostgreSQL's behaviour. The
+      previous fallthrough to `executor.Build` returned a confusing
+      internal error instead of the standard diagnostics. File:
+      `internal/server/extended.go`.
 
 ## Milestone 0030 — Catalog Persistence and DDL WAL
 

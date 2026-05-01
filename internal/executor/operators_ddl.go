@@ -357,7 +357,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
-	return o.createSingleColumnBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.Unique, false)
+	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.Unique, false)
 }
 
 func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
@@ -457,19 +457,23 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	return o.createSingleColumnBTreeIndex(act.Pos(), idxName, tbl, act.Columns, true, true)
+	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, true, true)
 }
 
-func (o *ddlOp) createSingleColumnBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, unique bool, primary bool) error {
-	if len(columns) != 1 {
-		return &ExecError{Code: "0A000", Pos: pos, Message: "only single-column btree indexes are supported in v0"}
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, unique bool, primary bool) error {
+	if len(columns) == 0 {
+		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
 	}
-	col, ok := o.ctx.Catalog.LookupColumn(tbl, columns[0])
-	if !ok {
-		return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", columns[0], tbl.Name)}
-	}
-	if !isSupportedBTreeKeyType(col.Type.Name) {
-		return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+	cols := make([]*catalog.Column, len(columns))
+	for i, name := range columns {
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
+		if !ok {
+			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
+		}
+		if !isSupportedBTreeKeyType(col.Type.Name) {
+			return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+		}
+		cols[i] = col
 	}
 	idx, err := o.ctx.Catalog.CreateIndex(idxName, tbl, columns, unique, "btree", primary)
 	if err != nil {
@@ -485,7 +489,7 @@ func (o *ddlOp) createSingleColumnBTreeIndex(pos int, idxName parser.ObjectName,
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	if err := o.backfillSingleColumnBTree(tree, tbl, col, unique, idxName.String(), pos); err != nil {
+	if err := o.backfillBTree(tree, tbl, cols, unique, idxName.String(), pos); err != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
@@ -494,17 +498,12 @@ func (o *ddlOp) createSingleColumnBTreeIndex(pos int, idxName parser.ObjectName,
 	return nil
 }
 
-func (o *ddlOp) backfillSingleColumnBTree(tree *btree.BTree, tbl *catalog.Table, col *catalog.Column, unique bool, indexName string, pos int) error {
+func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	// Dedup map keyed on the encoded byte form. For int4 this is
-	// trivially a 4-byte string; for NUMERIC it's the canonical
-	// EncodeNumericKey output, so (10,1) and (100,2) collapse —
-	// satisfies UNIQUE on numerically-equal values regardless of
-	// textual scale.
 	seen := map[string]struct{}{}
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
@@ -538,11 +537,7 @@ func (o *ddlOp) backfillSingleColumnBTree(tree *btree.BTree, tbl *catalog.Table,
 				o.ctx.Pool.Unpin(slot)
 				return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 			}
-			v := row[col.Ordinal]
-			if v.IsNull() {
-				continue
-			}
-			key, encErr := encodeBTreeKeyForColumn(v, col, pos)
+			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return encErr
@@ -562,6 +557,28 @@ func (o *ddlOp) backfillSingleColumnBTree(tree *btree.BTree, tbl *catalog.Table,
 		o.ctx.Pool.Unpin(slot)
 	}
 	return nil
+}
+
+// encodeCompositeBTreeKey builds a composite btree key by concatenating
+// per-column encodings. Bytewise comparison of the result matches the
+// SQL multi-column ordering semantics (compare col1, if equal compare
+// col2, ...). Each column's encoding is self-terminating (fixed-length
+// for int4/int8, terminator byte for numeric), so concatenation is
+// unambiguous without a separator.
+func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) ([]byte, *ExecError) {
+	var out []byte
+	for _, col := range cols {
+		v := row[col.Ordinal]
+		if v.IsNull() {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is null and cannot be indexed", col.Name)}
+		}
+		k, err := encodeBTreeKeyForColumn(v, col, pos)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k...)
+	}
+	return out, nil
 }
 
 // encodeBTreeKeyForColumn turns a runtime Datum into the byte-form
