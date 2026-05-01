@@ -1828,23 +1828,18 @@ several blocking issues that prevent a clean end-to-end run:
       idempotent via `pd_lsn` checks, so stopping early is safe.
       Files: `internal/wal/writer.go`, `internal/wal/reader.go`.
 
-- [ ] **Fix DECIMAL decode error in lineitem tail rows**:
-      The `"DecodeRow: l_extendedprice: decode numeric"` error
-      persists even with clean data loaded from scratch. The
-      error values (e.g. "5-LOW", "2-HIGH") appear to be data
-      fragments from misaligned variable-length field boundaries.
-      Root cause is likely in the COPY TEXT parser
-      (`splitCopyTextFields`) where an unescaped backslash-N
-      (`\N`) at the start of a field is treated as NULL sentinel
-      even when the field continues with other characters, losing
-      a leading 'N' character. This shifts subsequent field
-      boundaries. A fuller fix requires comparing goopg's COPY
-      output against HammerDB's input format. Workaround: for
-      the end-to-end test, add `l_extendedprice` to the column
-      list that skips the last ~5% of rows, or redesign the
-      COPY text parser to match PostgreSQL's behavior exactly.
-      Files: `internal/executor/copy_text.go`
-      (`splitCopyTextFields`).
+- [x] **Fix DECIMAL decode error in lineitem tail rows** (fixed 2026-05-01):
+      Two root causes were identified and fixed:
+      (1) Two-phase COPY TEXT parser: `splitCopyTextFields` was redesigned
+      to split by tabs FIRST, then unescape each field separately.
+      The old single-pass parser consumed tab separators as `\t`
+      escape when a field ended with a backslash, merging adjacent
+      fields and shifting all column boundaries.
+      (2) `parseCopyTimestamp` only supported timestamp-with-time
+      layouts (e.g. "2006-01-02 15:04:05") but DATE columns in COPY
+      carry date-only values ("1993-07-07"). Added "2006-01-02" layout.
+      Files: `internal/executor/copy_text.go`.
+      Data is now verified clean after a full rebuild from scratch.
 
 - [ ] **Run full end-to-end test after fixes**: Execute
       `bench/tpch/run_all.sh` (or step-by-step) at SF=1 with
