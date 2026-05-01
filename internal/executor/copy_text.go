@@ -287,7 +287,7 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		default:
 			return Datum{}, fmt.Errorf("invalid boolean %q", string(raw))
 		}
-	case "timestamp", "timestamptz":
+	case "timestamp", "timestamptz", "date":
 		ts, err := parseCopyTimestamp(string(raw))
 		if err != nil {
 			return Datum{}, err
