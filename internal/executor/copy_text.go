@@ -304,6 +304,7 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 // without timezone.
 func parseCopyTimestamp(s string) (time.Time, error) {
 	layouts := []string{
+		"2006-01-02",
 		"2006-01-02 15:04:05.000000",
 		"2006-01-02 15:04:05",
 		"2006-01-02 15:04:05.000000-07",
