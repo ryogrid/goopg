@@ -571,6 +571,7 @@ func (o *ddlOp) backfillSingleColumnBTree(tree *btree.BTree, tbl *catalog.Table,
 // stored row.
 //
 // int4 path: KindInt range-checked into int32 then EncodeInt4.
+// int8 path: KindInt directly into EncodeInt8 (full int64 range).
 // numeric path: KindInt promoted to (int, scale=0); KindNumeric
 // passes (mantissa, scale) straight through. Anything else surfaces
 // 42804 — the analyzer should have caught it but the runtime guard
@@ -587,6 +588,11 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			return nil, &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("value %d out of int4 range for index key", v.Int)}
 		}
 		return btree.EncodeInt4(int32(v.Int)), nil
+	case isInt8Type(col.Type.Name):
+		if v.Kind != KindInt {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not integer at runtime", col.Name)}
+		}
+		return btree.EncodeInt8(v.Int), nil
 	case isNumericType(col.Type.Name):
 		switch v.Kind {
 		case KindNumeric:
@@ -619,6 +625,15 @@ func isInt4Type(name string) bool {
 	}
 }
 
+func isInt8Type(name string) bool {
+	switch strings.ToLower(name) {
+	case "int8", "bigint":
+		return true
+	default:
+		return false
+	}
+}
+
 func isNumericType(name string) bool {
 	switch strings.ToLower(name) {
 	case "numeric", "decimal":
@@ -629,10 +644,10 @@ func isNumericType(name string) bool {
 }
 
 // isSupportedBTreeKeyType lists the column types accepted by
-// createSingleColumnBTreeIndex. int4 is the original v0 path; numeric
-// landed in M0011-0002 to unblock HammerDB TPC-H index builds.
+// createSingleColumnBTreeIndex. int4 is the original v0 path; int8
+// and numeric landed for HammerDB TPC-H compatibility.
 func isSupportedBTreeKeyType(name string) bool {
-	return isInt4Type(name) || isNumericType(name)
+	return isInt4Type(name) || isInt8Type(name) || isNumericType(name)
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
