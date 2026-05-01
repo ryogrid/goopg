@@ -942,7 +942,9 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 			lastRecPtr = uint64(int64(segNo)*cfgSegSize+int64(off)) + 1
 			_, n, err := decodeRecord(data[off:])
 			if err != nil {
-				return 0, 0, fmt.Errorf("wal: scan %s at offset %d: %w", path, off, err)
+				// Corrupt record in the last segment —
+				// treat as EOS (unclean shutdown).
+				return int64(off), lastRecPtr, nil
 			}
 			off += n
 		}
@@ -984,11 +986,11 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 		}
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
-			return 0, 0, fmt.Errorf("wal: scan %s at offset %d: %w", path, off, err)
+			return int64(off), lastRecPtr, nil
 		}
 		total := int(h.TotLen)
 		if total < xlogRecordHeaderSize {
-			return 0, 0, fmt.Errorf("wal: scan %s at offset %d: bad xlog total length %d", path, off, total)
+			return int64(off), lastRecPtr, nil
 		}
 		// Request MAXALIGN-aligned bytes so we also pick up the
 		// trailing pad bytes (zero-filled by the encoder). The
@@ -1002,10 +1004,9 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 			return int64(off), lastRecPtr, nil
 		}
 		if _, n, err := decodeRecordXLog(fullBytes); err != nil || n != len(fullBytes) {
-			if err == nil {
-				err = fmt.Errorf("decoded %d bytes, expected %d", n, len(fullBytes))
-			}
-			return 0, 0, fmt.Errorf("wal: scan %s at offset %d: %w", path, off, err)
+			// Corrupt record in the last segment —
+			// treat as EOS (unclean shutdown).
+			return int64(off), lastRecPtr, nil
 		}
 		lastRecPtr = uint64(pos) + 1
 		off += consumed

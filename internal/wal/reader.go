@@ -59,6 +59,14 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 		}
 		payload, n, err := decodeRecord(stream[off:])
 		if err != nil {
+			// Corrupt record near the end of the stream (within
+			// one segment of EOF) is likely an unclean shutdown
+			// (OOM kill). Treat as EOS rather than failing
+			// startup. Early-segment corruption is extremely
+			// unlikely and treated as a hard error.
+			if int64(len(stream)-off) <= segmentSize {
+				break
+			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
 		}
 		start := uint64(off) + 1
@@ -106,10 +114,16 @@ func readAllPageAware(stream []byte, segSize int64) ([]Record, error) {
 		}
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
+			if int64(len(stream)-off) <= segSize {
+				break
+			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
 		}
 		total := int(h.TotLen)
 		if total < xlogRecordHeaderSize {
+			if int64(len(stream)-off) <= segSize {
+				break
+			}
 			return nil, fmt.Errorf("wal: decode at offset %d: bad xlog total length %d", off, total)
 		}
 		paddedTotal := maxAlignXLog(total)
@@ -119,9 +133,15 @@ func readAllPageAware(stream []byte, segSize int64) ([]Record, error) {
 		}
 		payload, n, err := decodeRecordXLog(fullBytes)
 		if err != nil {
+			if int64(len(stream)-off) <= segSize {
+				break
+			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
 		}
 		if n != len(fullBytes) {
+			if int64(len(stream)-off) <= segSize {
+				break
+			}
 			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, n, len(fullBytes))
 		}
 		start := uint64(off) + 1
