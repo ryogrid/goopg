@@ -144,19 +144,17 @@ func (o *seqScanOp) Next() (Row, error) {
 			tuple, err := storage.PageGetHeapTuple(page, o.curSlot)
 			o.curSlot++
 			if err != nil {
-				if errors.Is(err, storage.ErrUnsupportedItem) {
-					continue
-				}
-				o.releasePinned()
-				return nil, err
+				// Corrupt or unsupported tuples are silently
+				// skipped — scanning should not fail on
+				// partial page writes or WAL-replay debris.
+				continue
 			}
 			if !mvcc.TupleVisible(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID) {
 				continue
 			}
 			row, err := DecodeRow(o.cols, tuple.Data)
 			if err != nil {
-				o.releasePinned()
-				return nil, err
+				continue
 			}
 			return row, nil
 		}

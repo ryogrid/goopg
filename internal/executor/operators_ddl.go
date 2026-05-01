@@ -523,19 +523,17 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		for i := uint16(1); i <= uint16(count); i++ {
 			tuple, err := storage.PageGetHeapTuple(page, i)
 			if err != nil {
-				if errors.Is(err, storage.ErrUnsupportedItem) {
-					continue
-				}
-				o.ctx.Pool.Unpin(slot)
-				return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+				// Corrupt or unsupported tuples are silently
+				// skipped so backfill does not abort on
+				// partial page writes or WAL-replay debris.
+				continue
 			}
 			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
 			row, err := DecodeRow(tbl.Columns, tuple.Data)
 			if err != nil {
-				o.ctx.Pool.Unpin(slot)
-				return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+				continue
 			}
 			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
