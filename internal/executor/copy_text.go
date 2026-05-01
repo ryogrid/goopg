@@ -300,6 +300,17 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 			return Datum{}, err
 		}
 		return Datum{Kind: KindTime, Time: ts}, nil
+	case "numeric", "decimal":
+		text := string(raw)
+		// Validate the text is a valid numeric literal before
+		// storing.  This catches column-alignment bugs at COPY
+		// time instead of silently storing wrong-byte data that
+		// surfaces later as DecodeRow errors.
+		m, s, err := parseNumeric(text)
+		if err != nil {
+			return Datum{}, fmt.Errorf("invalid numeric %q: %w", text, err)
+		}
+		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
 	default:
 		// text / varchar / char / unknown — keep as String.
 		return Datum{Kind: KindString, String: string(raw)}, nil
