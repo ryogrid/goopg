@@ -1765,6 +1765,18 @@ unchecked item.
 
 ## Milestone 0029 — HammerDB TPC-H End-to-End Run
 
+### End-to-End Power Test
+
+After restoring the clean data cluster (`bench/tpch/data_sf1_complete.tar.gz`),
+run the HammerDB power test and fix any issues encountered.
+
+- [ ] **Run TPC-H power test (Q1-Q22)**: Execute the power test and
+      fix any query failures (syntax errors, planner issues, executor
+      crashes, type errors, etc.) until all 22 queries complete without
+      server crash. Document each fix below with a sub-task.
+      Data archive: `bench/tpch/data_sf1_complete.tar.gz` (SF=1).
+      Test script: `bench/tpch/run_power_test_goopg.sh`.
+
 See `docs/milestones/0029-hammerdb-tpch-run.md` for the full DoD.
 
 ### Current Status (investigated 2026-05-01)
