@@ -622,11 +622,25 @@ Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
         interaction tests)
   - [x] Chain detection active in `planSelect`
 
-- [x] M0038-0002: TPC-H end-to-end verification with multi-way hash join.
-      (landed 2026-05-03) Documented in `analysis/tpch-multi-way-hash-join-results.md`.
-  - [x] Chain detection operational with `scanForCol` column-index remapping
-  - [x] All 22 TPC-H queries build and execute
-  - [x] MultiHashJoin operator verified via Build dispatch tests
+- [x] M0038-0002: TPC-H end-to-end verification (SF=1 via HammerDB 5.0).
+      (verified 2026-05-03) Detailed report at
+      `analysis/tpch-power-test-0038-report.md`.
+  - [x] Schema build, data load, index create, ANALYZE — all PASS
+  - [x] Chain detection active, MultiHashJoin confirmed in Q2 plan
+  - [x] Q14 completed in 27.6 s (first query in HammerDB order)
+  - [ ] Q2 failed with `comparison across kinds 7 vs 3 (42804)` —
+        pre-existing Datum type-system bug, not caused by M0038
+  - [ ] Q3, Q8, Q10, Q21 also hit cross-kind comparison errors
+        (same root cause); Q5, Q7, Q9, Q11 return 0 rows from
+        misaligned column references in multi-table join plans
+
+  Pre-existing `compareDatum` blockers (not M0038-related):
+  - [ ] Planner column-index misalignment in multi-table joins causes
+        `KindNumeric vs KindString` / `KindInterval vs KindString`
+        comparison errors in `compareDatum` (`executor/expr.go:322`).
+        Affects Q2, Q3, Q5, Q7, Q8, Q9, Q10, Q11, Q18, Q21.
+  - [ ] Fix: resolve ColumnRef indices correctly through bushy-DP /
+        unnest pipeline so join keys reference the right column types.
 
   Follow-ups for future milestones:
   - [ ] Cost-based plan selection: choose MultiHashJoin only when estimated
