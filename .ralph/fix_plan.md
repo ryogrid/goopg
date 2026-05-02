@@ -502,6 +502,41 @@ connected subgraphs of the join graph. Eliminates the `CROSS(part, supplier) =
         to cut peak memory by ~50%.
   - [ ] Follow-up: Verify unnesting fires correctly on bushy plans.
 
+## Milestone 0035 — Streaming Hash Join & Bushy-Unnest Verification
+
+See `docs/milestones/0035-streaming-hash-join.md`.
+Eliminate probe-side `drainRows` in hash joins so only the build side is deep-copied.
+Verify that M0033's unnest pass correctly processes M0034's bushy plan trees.
+
+- [ ] M0035-0001: Streaming hash join executor. Design doc
+      `docs/design/0035-0001-streaming-hash-join.md`.
+
+  - [ ] Modify `joinOp.Open()` — for `JoinAlgoHash`, drain only the build side.
+        Probe side stays as a streaming `Operator`; `Next()` called in a loop.
+  - [ ] Implement `runHashJoinStream(probeOp, buildRows, ...)` — build hash table
+        from buildRows, stream probeOp.Next() through it.
+  - [ ] Implement `runHashJoinBuildLeftStream(buildRows, probeOp, ...)` — symmetric.
+  - [ ] LEFT JOIN: emit `concatRows(l, nullRight)` for unmatched probe rows.
+  - [ ] Nested-loop and merge joins unchanged (still need both sides buffered).
+  - [ ] Unit tests: TestStreamingHashJoinINNER, TestStreamingHashJoinLEFT,
+        TestStreamingHashJoinBuildLeft.
+  - [ ] Regression: 22/22 TPC-H queries build and execute.
+  - [ ] Memory test: Q2 on partial SF=1 data — compare peak RSS vs. 28 GB baseline.
+
+- [ ] M0035-0002: Bushy + unnest interaction verification.
+  - [ ] Unit test: `TestBushyPlanWithUnnest` — Q2 with ANALYZE stats, final plan
+        has zero `SubqueryExpr` AND zero `JoinTypeCross` nodes.
+  - [ ] Plan shape test: unnest result visible as `HashJoin` with `Aggregate` child
+        within the bushy join tree.
+  - [ ] If interaction fails, fix `unnestSubqueriesInPlan` to handle bushy trees
+        without a wrapping Filter.
+
+- [ ] M0035-0003: TPC-H end-to-end verification with streaming hash join.
+  - [ ] Run full TPC-H power test at shared_buffers=2048MB + GOMEMLIMIT=20GiB.
+  - [ ] Q2 completes within time/memory bounds.
+  - [ ] Peak RSS measured and compared against the 28 GB baseline.
+  - [ ] Document results in `analysis/tpch-streaming-hash-join-results.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

@@ -185,4 +185,8 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0034-0001 | [DP-Based Bushy Join Enumeration](0034-0001-bushy-join-planning.md) | draft | DPccp-style dynamic programming over connected subgraphs — enumerates bushy join trees, eliminates Cartesian products in Q2's 5-table join. |
 
+| 0035-0001 | [Streaming Hash Join Executor](0035-0001-streaming-hash-join.md) | draft | Modify hash join to drain only the build side; probe side streams one row at a time via Operator.Next(). Cuts peak memory by ~50% per join level. |
+
+| 0035-0001 | [Streaming Hash Join Executor](0035-0001-streaming-hash-join.md) | draft | Drain only build side of hash joins; probe streams via Operator.Next(). |
+
 Append new rows in numeric order. Do not reorder.
