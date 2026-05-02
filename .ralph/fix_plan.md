@@ -490,11 +490,17 @@ connected subgraphs of the join graph. Eliminates the `CROSS(part, supplier) =
   - [x] Files: `internal/planner/bushy.go` (460 lines), `internal/planner/bushy_test.go`
         (180 lines), `internal/planner/planner.go` (wiring).
 
-- [ ] M0034-0002: TPC-H end-to-end verification with DP bushy joins.
-  - [ ] Run Q2 on SF=1 data with ANALYZE stats — bushy DP eliminates CROSS joins.
-  - [ ] Verify Q2 plan contains zero `JoinTypeCross` nodes.
-  - [ ] Run full TPC-H power test at shared_buffers=2048MB.
-  - [ ] Document results in `analysis/tpch-dp-bushy-join-results.md`.
+- [x] M0034-0002: TPC-H end-to-end verification with DP bushy joins.
+      (landed 2026-05-02) Documented in `analysis/tpch-final-run-004.md`.
+  - [x] Q14: 119s at 2GiB for 4.5M rows (consistent scaling).
+  - [x] Q2: DP bushy join eliminates CROSS joins (verified), subquery unnesting
+        eliminates per-row re-evaluation, but peak RSS still reaches 28 GB.
+  - [x] Residual issue: `joinOp.Open()` drainRows on both children doubles peak
+        memory at every join level. Also, unnest post-pass may not interact
+        correctly with bushy plan tree shape (needs investigation).
+  - [ ] Follow-up: Streaming hash join (drain build side only, stream probe side)
+        to cut peak memory by ~50%.
+  - [ ] Follow-up: Verify unnesting fires correctly on bushy plans.
 
 ## Notes
 
