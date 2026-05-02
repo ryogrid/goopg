@@ -341,6 +341,56 @@ Analysis-only milestone. No implementation. Decomposed into two design-doc deliv
   - [x] lockRowsOp.Close(): nil o.pending.
   - [x] recursiveUnionOp.Close(): nil o.output, o.working, o.ctx; close o.recursive.
 
+## Milestone 0032 — shared_buffers Large-Value Crash Fix (madvise on Eviction)
+
+See `docs/milestones/0032-shared-buffers-madvise-eviction.md`.
+Core fix: call `madvise(MADV_DONTNEED)` on evicted buffer pool pages so physical
+memory is released back to the kernel, preventing the arena RSS from monotonically
+growing to the full `shared_buffers` size. Secondary: startup memory validation.
+
+- [ ] M0032-0001: madvise on buffer eviction — after flushSlot writes a dirty page
+      and before the slot is reassigned, advise the kernel to discard the physical
+      pages. Design doc
+      `docs/design/0032-0001-madvise-buffer-eviction.md`.
+
+  - [ ] Add `ArenaPageSize` constant (8 KiB, matches BlockSize).
+  - [ ] In `Pin` eviction path (after `delete(p.byTag, s.tag); s.valid = false`),
+        call `unix.Madvise(s.page, unix.MADV_DONTNEED)` on the evicted slot.
+  - [ ] In `PinNew` eviction path, same call after the slot is detached from its
+        old tag.
+  - [ ] In the `PinNew` duplicate-detection branch (line 522-527), madvise the
+        released slot before returning the existing one.
+  - [ ] Handle `unix.Madvise` errors: `ENOMEM` / `EINVAL` are non-fatal for the
+        buffer-pool correctness contract — log via `slog` and continue. Other
+        errnos (EAGAIN, EFAULT) surface as log warnings.
+  - [ ] Verify: `go test ./internal/storage/` passes. No correctness regression.
+  - [ ] Manual test: start goopg with `shared_buffers=2000M`, run TPC-H schema
+        build + data load, observe RSS via `/proc/<pid>/status VmRSS` — must NOT
+        reach 2.0 GB.
+
+- [ ] M0032-0002: Startup memory validation — read `/proc/meminfo`, compare
+      `shared_buffers` to available system memory, warn if excessive. Design doc
+      `docs/design/0032-0002-shared-buffers-startup-validation.md`.
+
+  - [ ] Add `readMemAvailable()` helper reading `/proc/meminfo` → `MemAvailable`
+        in bytes.
+  - [ ] In `poolSlotsFromGUC` or `initdb.Open`, after computing arena size: if
+        arena_size > 50% * MemAvailable, emit `slog.Warn("shared_buffers_large_warning",
+        "shared_buffers_mb", mb, "mem_available_mb", availMB)`.
+  - [ ] Warning is advisory only; server continues startup.
+  - [ ] Guard against `/proc/meminfo` read failure (e.g., non-Linux) — skip check
+        silently on error.
+  - [ ] Test: unit test for `readMemAvailable` parsing.
+
+- [ ] M0032-0003: TPC-H end-to-end verification at shared_buffers=2000M.
+  - [ ] Update `bench/tpch/setup_goopg.sh` to use `shared_buffers=2000M`.
+  - [ ] Run `bench/tpch/run_all.sh` — schema build + data load must complete.
+  - [ ] Run power test Q1–Q22 — queries must not OOM; duration should be
+        substantially shorter than the 256MB baseline.
+  - [ ] Document results in `analysis/tpch-shared-buffers-2000m-run.md`.
+  - [ ] If any query still OOMs at 2000M, investigate and either fix or document
+        the residual limitation.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
