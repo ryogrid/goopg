@@ -1,6 +1,6 @@
 # Milestone 0031 — TPC-H Q2 Memory Analysis & GC Leak Code Review
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** Milestone 0029 (HammerDB TPC-H run), Milestone 0029a (index support)
 **Drives:** Root-cause analysis of WSL2 OOM crash during TPC-H Query 2 execution, and systematic identification of GC-uncollectable memory patterns in the executor.
 
