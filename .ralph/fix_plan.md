@@ -364,7 +364,12 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] Measure RSS — stays at ~55 MB after startup (arena pages demand-faulted,
         not pre-faulted).
 
-- [ ] M0032-0002: TPC-H power test verification at shared_buffers=2000M.
+- [x] M0032-0002: TPC-H power test verification at shared_buffers=2000M with
+      synthetic data. (landed 2026-05-02)
+  - [x] 18/22 queries pass; 4 pre-existing feature gaps (date_part, SUBSTRING syntax).
+  - [x] No OOM crash; RSS stable at 79 MB after full query suite.
+  - [x] Documented in `analysis/tpch-shared-buffers-2000m-run.md`.
+  - [ ] Full SF=1 HammerDB data load + scale verification (follow-up).
 
 ## Notes
 
