@@ -1,6 +1,6 @@
 # Milestone 0034 — DP-Based Bushy Join Optimization (DPccp-Style)
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** Milestone 0033 (subquery unnesting confirmed; CROSS join identified as remaining bottleneck), Milestone 0006 (planner statistics for cardinality estimates)
 **Drives:** Eliminate the CROSS join explosion in Q2's outer 5-table comma-join by using a dynamic-programming-based join enumerator that explores bushy join trees — not just left-deep. This is a subset of the DPccp (Dynamic Programming connected complement pairs) algorithm adapted to goopg's v0 planner.
 

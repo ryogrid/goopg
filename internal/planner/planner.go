@@ -327,13 +327,27 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
-			// Comma-FROM produces a left-deep CROSS-join chain.
-			// Push WHERE-side equalities into the deepest Join
-			// whose schema spans both sides so the planner can
-			// pick hash join instead of running a Cartesian
-			// product through Filter. See
-			// internal/planner/pushdown.go.
-			node = pushPredicatesIntoCrossJoins(node)
+			// Attempt bushy-join DP when all tables have ANALYZE
+			// stats. This replaces the left-deep CROSS chain with
+			// a DPccp-style optimal bushy tree that eliminates
+			// Cartesian products. See internal/planner/bushy.go.
+			if f, ok := node.(*Filter); ok {
+				if newChild, newPred := tryBushyDP(f.Child, f.Predicate, ctx, cat); newPred == nil {
+					node = newChild // all conjuncts consumed → remove Filter
+				} else if newChild != f.Child {
+					f.Child = newChild
+					f.Predicate = newPred
+					node = pushPredicatesIntoCrossJoins(node)
+				} else {
+					// Comma-FROM produces a left-deep CROSS-join chain.
+					// Push WHERE-side equalities into the deepest Join
+					// whose schema spans both sides so the planner can
+					// pick hash join instead of running a Cartesian
+					// product through Filter. See
+					// internal/planner/pushdown.go.
+					node = pushPredicatesIntoCrossJoins(node)
+				}
+			}
 		}
 	}
 

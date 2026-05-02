@@ -1,6 +1,6 @@
 # 0034-0001 — DP-Based Bushy Join Enumeration (DPccp-Style)
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0034
 **Date:** 2026-05-02
 
