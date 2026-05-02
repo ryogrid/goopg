@@ -357,7 +357,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// GROUP BY aggregate + hash join. See internal/planner/unnest.go.
 	node = unnestSubqueriesInPlan(node)
 
-	// TODO M0038 chain detection disabled — see unnest.go comment.
+	// TODO M0038: enable multi-way chain detection when scope-boundary
+	// issue is fixed. Programmer note: rewriteMultiWayChain modifies the
+	// plan tree after unnest, which sometimes destroys the unnest
+	// HashJoin+Aggregate structure. Needs explicit guard to skip
+	// rewriting when the plan contains Aggregate children.
 	// node = rewriteMultiWayChain(node)
 
 	var agg *aggregateSurface

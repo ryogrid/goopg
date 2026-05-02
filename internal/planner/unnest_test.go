@@ -171,6 +171,13 @@ func findSubqueryInPlan(node Node) bool {
 		return findSubqueryInPlan(n.Child)
 	case *Sort:
 		return findSubqueryInPlan(n.Child)
+	case *MultiHashJoin:
+		for _, tbl := range n.Tables {
+			if findSubqueryInPlan(tbl) {
+				return true
+			}
+		}
+		return false
 	}
 	return false
 }
