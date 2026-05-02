@@ -589,23 +589,24 @@ func rewriteMultiWayChain(node Node) Node {
 		return nil
 	}
 	scans, keys, probeIdx := collectMultiHashTables(node)
-	if scans == nil {
-		// Not a valid chain — recurse into children.
-		switch n := node.(type) {
-		case *Join:
-			n.Left = rewriteMultiWayChain(n.Left)
-			n.Right = rewriteMultiWayChain(n.Right)
-		case *Filter:
-			n.Child = rewriteMultiWayChain(n.Child)
-		case *Project:
-			n.Child = rewriteMultiWayChain(n.Child)
-		case *Sort:
-			n.Child = rewriteMultiWayChain(n.Child)
-		case *Aggregate:
-			n.Child = rewriteMultiWayChain(n.Child)
+		if scans == nil {
+			// Not a valid chain — recurse into children.
+			// Only recurse into Join (binary ops) and thin wrappers
+			// (Filter, Project, Sort). Do NOT recurse into Aggregate:
+			// crossing a plan-phase boundary mixes table scopes.
+			switch n := node.(type) {
+			case *Join:
+				n.Left = rewriteMultiWayChain(n.Left)
+				n.Right = rewriteMultiWayChain(n.Right)
+			case *Filter:
+				n.Child = rewriteMultiWayChain(n.Child)
+			case *Project:
+				n.Child = rewriteMultiWayChain(n.Child)
+			case *Sort:
+				n.Child = rewriteMultiWayChain(n.Child)
+			}
+			return node
 		}
-		return node
-	}
 
 	// Build MultiHashJoin node.
 	mh := &MultiHashJoin{

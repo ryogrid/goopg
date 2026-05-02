@@ -68,4 +68,9 @@ coverage.html
 .ralph_backup_*
 .aider*
 
+# Python virtual environment
+venv/
+tmp/
+pprof-data/
+
 config.json

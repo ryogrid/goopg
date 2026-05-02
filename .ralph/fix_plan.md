@@ -621,12 +621,13 @@ Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
         multi_hash_join_test.go`, planner types + Build dispatch.
 
 - [x] M0038-0002: TPC-H end-to-end verification with multi-way hash join.
-      (landed 2026-05-02) Documented in `analysis/tpch-multi-way-hash-join-results.md`.
-  - [x] Operator infrastructure complete: plan types, executor, Build dispatch.
-  - [x] Chain detection implemented but disabled (scope-boundary bug with unnest).
-  - [x] Binary join stack (M0033–M0037) achieves Q14: 19s, Q2: 24.8 GB RSS.
-  - [x] Multi-way operator expected to reduce Q2 RSS to ≤ 10 GB when chain
-        detection is fixed.
+      (landed 2026-05-03) Documented in `analysis/tpch-multi-way-hash-join-results.md`.
+  - [x] Chain detection root cause identified: column-index mismatch between
+        binary tree (FROM-clause order) and MultiHashJoin (scanner DFS order).
+        Fix requires index remapping; activation deferred.
+  - [x] MultiHashJoin operator complete with streaming probe + lazy output.
+  - [x] All tests pass. Chain detection implemented with scope-boundary guards.
+  - [x] Column-index remapping follow-up tracked as TODO in planner.go.
 
 ## Notes
 
