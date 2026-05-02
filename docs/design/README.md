@@ -183,4 +183,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | 0032-0001 | [Buffer Pool Heap Arena Replacement](0032-0001-heap-arena-replacement.md) | draft | Replace mmap'd anonymous arena with Go heap `make([]byte)` allocation under GC control. |
 | 0033-0001 | [Planner-Level Subquery Unnesting](0033-0001-subquery-unnesting.md) | draft | Detect correlated scalar subqueries at plan time, rewrite as GROUP BY aggregate + hash join (eliminates per-row re-execution). |
 
+| 0034-0001 | [Bushy Join Tree Planning](0034-0001-bushy-join-planning.md) | draft | Join-graph construction from WHERE equijoins, connected-component grouping, greedy bushy tree assembly — replaces left-deep CROSS chain to eliminate Cartesian products. |
+
 Append new rows in numeric order. Do not reorder.

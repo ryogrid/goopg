@@ -459,6 +459,40 @@ Primary target: TPC-H Q2's `min(ps_supplycost)` subquery.
         is the CROSS join in the outer comma-join, which is independent of
         subquery execution strategy.
 
+## Milestone 0034 — Bushy Join Tree / Join-Graph Optimization
+
+See `docs/milestones/0034-bushy-join-optimization.md`.
+Replace the left-deep-only CROSS join chain with a join-graph-based bushy tree
+planner. Eliminates the `CROSS(part, supplier) = 2B rows` bottleneck in Q2.
+
+- [ ] M0034-0001: Join-graph bushy tree planner. Design doc
+      `docs/design/0034-0001-bushy-join-planning.md`.
+
+  - [ ] Add `joinGraph` / `joinEdge` types — undirected graph of tables + equijoins.
+  - [ ] Implement `buildJoinGraph()` — collect `=` edges from WHERE conjuncts
+        where ColumnRefs fall in different FROM tables.
+  - [ ] Implement `connectedComponents()` — DFS/union-find partitioning.
+  - [ ] Implement `buildBushyComponent()` — greedy per-component assembly:
+        start from smallest table, pick next table with edge to already-joined
+        set, prefer smallest estimated cardinality.
+  - [ ] Implement `buildBushyJoinTree()` — top-level: graph + component +
+        per-component assembly + CROSS-join components in size order.
+  - [ ] Wire into `planFromRangeVars` — gate on all tables having ANALYZE
+        stats. Busy path returns bushy plan + residual conjuncts; fallback
+        keeps existing left-deep logic.
+  - [ ] Unit tests: TestBushyQ2NoCrossJoins, TestBushyQ2AllHashJoins,
+        TestBushyPreservesResults, TestBushyTwoComponents,
+        TestBushyFallbackWithoutStats, TestBushyRegression22Queries.
+  - [ ] Integration: Q2 on 4M lineitem data completes in < 120s, RSS ≤ 20 GiB.
+  - [ ] Integration: Q5 (6-table join) plan contains no CROSS joins.
+
+- [ ] M0034-0002: TPC-H end-to-end verification with bushy joins.
+  - [ ] Run full TPC-H power test (22 queries) at shared_buffers=2048MB.
+  - [ ] Q2 completes with result within bounded time/memory.
+  - [ ] Compare Q2 results with PostgreSQL reference.
+  - [ ] No regressions in other queries.
+  - [ ] Document results in `analysis/tpch-bushy-join-results.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
