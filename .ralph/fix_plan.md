@@ -562,6 +562,35 @@ from ~1.8 GB to ~420 MB per join level (77% reduction).
         join children to build parent hash tables. Multi-way hash join or
         spill-to-disk needed to break this copy chain.
 
+## Milestone 0037 — Spill-to-Disk Hash Join (Grace Hash Join)
+
+See `docs/milestones/0037-hash-join-spill-to-disk.md`.
+When `drainRows` on a child join exceeds `work_mem`, spill rows to temporary
+disk files. Read them back one partition at a time. Breaks the per-level
+drainRows copy chain identified in M0036.
+
+- [ ] M0037-0001: Spill-to-disk hash join. Design doc
+      `docs/design/0037-0001-spill-to-disk-hash-join.md`.
+
+  - [ ] Implement `spillWriter` / `spillReader` — binary Datum codec, temp file I/O.
+  - [ ] Implement `drainRowsBounded(op, maxBytes)` — spill to disk when
+        accumulated rows exceed budget, return spill-backed Operator.
+  - [ ] Add `work_mem` GUC (TypeInt, UnitKB, BootVal 512MB, ContextUser).
+  - [ ] Thread `work_mem` through `executor.Context` from session registry.
+  - [ ] Integrate into `openLazyHashJoin`: use `drainRowsBounded` when build
+        side IS a child joinOp (not SeqScan).
+  - [ ] Unit tests: TestSpillRoundTrip, TestDrainRowsBoundedNoSpill,
+        TestDrainRowsBoundedSpill.
+  - [ ] Regression: 22/22 TPC-H queries build and execute.
+  - [ ] Grace hash join (Phase B): when hash table itself exceeds budget,
+        partition both sides into N spill files and join one partition at a time.
+
+- [ ] M0037-0002: TPC-H end-to-end verification with spill-to-disk.
+  - [ ] Run Q2 on partial SF=1 data with `work_mem=512MB` at shared_buffers=2048MB.
+  - [ ] Peak RSS ≤ 15 GB (vs 30 GB baseline from M0036).
+  - [ ] Q2 completes (not timing out).
+  - [ ] Document results in `analysis/tpch-spill-hash-join-results.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
