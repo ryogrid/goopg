@@ -1,4 +1,4 @@
-# 0034-0001 — Bushy Join Tree Planning
+# 0034-0001 — DP-Based Bushy Join Enumeration (DPccp-Style)
 
 **Status:** draft
 **Parent milestone:** M0034
@@ -7,187 +7,218 @@
 ## 1. Objective
 
 Replace the current left-deep-only CROSS join chain builder in `planFromRangeVars`
-with a join-graph-based approach that builds **bushy join trees**. This eliminates
-the CROSS join explosion that occurs when the FROM-list order places two tables
-adjacent in the chain that share no equality predicate (e.g. `part` and `supplier`
-in Q2).
+with a dynamic-programming-based enumerator that explores **bushy join trees**.
+The DP enumerates connected subsets of the join graph, splits each into connected
+complement pairs, and selects the optimal join order by estimated cardinality.
+This is a simplified adaptation of PostgreSQL's DPccp algorithm
+(`postgres/src/backend/optimizer/path/joinrels.c`).
 
 ## 2. Current Behaviour
 
-### 2.1 Left-deep CROSS chain
+The FROM clause builds a left-deep CROSS join chain (`CROSS(CROSS(CROSS(...)))`).
+`pushPredicatesIntoCrossJoins` promotes CROSS to INNER where an equality spans
+both sides of a join node. This is left-deep only — if two tables without a
+direct edge become adjacent in the chain, they form a CROSS join.
 
-`planFromRangeVars` (planner.go:565) iterates the FROM list and wraps each new
-table with a CROSS join on the left:
+For Q2: `part` and `supplier` lack a direct equality, so `CROSS(part, supplier) =
+200K × 10K = 2 × 10^9` intermediate rows. No left-deep permutation avoids this.
 
-```go
-root = &Join{Type: JoinTypeCross, Left: root, Right: n}
-```
+## 3. DPccp Algorithm (Simplified for v0)
 
-Result: `CROSS(CROSS(CROSS(CROSS(t0, t1), t2), t3), t4)`
+### 3.1 Join graph
 
-### 2.2 Predicate pushdown
-
-`pushPredicatesIntoCrossJoins` splits the WHERE conjunction and pushes each
-conjunct onto the deepest CROSS join whose schema spans both sides. A conjunct
-lands on a join when:
-1. The join is still `JoinTypeCross`.
-2. The conjunct's `ColumnRef` indices span both the left and right children.
-
-After pushdown, some CROSS joins become INNER + HASH. Conjuncts that don't span
-any remaining CROSS join (including those that reference already-promoted joins)
-stay on the outer Filter.
-
-### 2.3 Join-order reordering
-
-`reorderCommaFromByCardinality` (joinorder.go:60) permutes the FROM list to
-place small tables first, using greedy cardinality preference with edge
-connectivity. This helps but does not eliminate CROSS joins entirely — the
-join tree is still left-deep, so two tables without a direct edge end up
-adjacent in the chain and produce a CROSS join.
-
-### 2.4 Why this fails for Q2
-
-Q2's 5 tables: `part(200K)`, `supplier(10K)`, `partsupp(800K)`, `nation(25)`,
-`region(5)`.
-
-Equality edges:
-```
-part ──p_partkey=ps_partkey──→ partsupp ←──s_suppkey=ps_suppkey── supplier ──s_nationkey=n_nationkey──→ nation ──n_regionkey=r_regionkey──→ region
-```
-
-Any left-deep ordering puts `part` and `supplier` adjacent at some level,
-producing `200K × 10K = 2 × 10^9` intermediate rows.
-
-## 3. Proposed Algorithm
-
-### 3.1 Join graph construction
-
-Build an undirected graph from the WHERE clause:
+Nodes: FROM tables (0..n-1).
+Edges: equality predicates `t_i.col = t_j.col` from WHERE conjunctions.
 
 ```
-type joinEdge struct {
-    leftTable  int       // index into FROM list
-    rightTable int
-    predicate  Expr      // the equality expression
-    leftKey    Expr      // for hash join
-    rightKey   Expr
+type joinGraph struct {
+    nodes int
+    edges []joinEdge  // each edge: {leftTable, rightTable, predicate, leftKey, rightKey}
+    adj   [][]int      // adjacency list: adj[i] = list of edge indices incident to node i
 }
 ```
 
-Edges are collected from the WHERE conjunction by matching `=` predicates
-where the LHS and RHS `ColumnRef` indices fall in different FROM tables.
+### 3.2 Connectivity check
 
-### 3.2 Connected-component grouping
+A DFS from any node checks whether the entire graph is connected. If not,
+connected components are identified. The DP runs per-component. Components
+are CROSS-joined after DP (unavoidable residual Cartesian product).
 
-Run a union-find or DFS to partition the tables into connected components.
-Tables with no incident edges form singleton components.
+Q2's graph: all 5 nodes connected via `part—partsupp—supplier—nation—region`.
+Single component → DP covers the full graph.
 
-Q2 connectivity: all 5 tables are in one connected component (part connected
-to partsupp via p_partkey=ps_partkey; partsupp connected to supplier via
-s_suppkey=ps_suppkey; supplier connected to nation via s_nationkey=n_nationkey;
-nation connected to region via n_regionkey=r_regionkey).
+### 3.3 Subset enumeration
 
-### 3.3 Greedy bushy tree assembly (per component)
+For a component with `k` nodes, enumerate all 2^k subsets. Represent each subset
+as a bitmask `uint16` (supports up to 16 tables, sufficient for v0). Iterate
+subsets in order of increasing popcount (size).
 
-For each connected component:
+```
+for size := 1; size <= k; size++ {
+    for each subset S where popcount(S) == size {
+        // Process S
+    }
+}
+```
 
-1. **Pick the smallest table** by ANALYZE `RowCount` as the seed.
-2. **Select the next table** that has an edge to any already-joined table,
-   preferring the one with the smallest estimated join cardinality
-   (`|joined_rows| × |next| / max(NDistinct(key_col), 1)`).
-3. **Create a `Join` node** between the current plan and the new table,
-   setting `Type=JoinTypeInner`, `Algo=JoinAlgoHash`, `LeftKey`/`RightKey`
-   from the edge predicate.
-4. Repeat until all tables in the component are joined.
+### 3.4 Connected-subset check
 
-This produces a bushy tree where joins are always along equijoin edges.
+A subset S is **connected** if the subgraph induced by S (edges whose both
+endpoints are in S) has a path between every pair of nodes. Use a BFS/DFS
+within the subset.
 
-### 3.4 Component merge
+Only connected subsets are eligible for DP — disconnected ones cannot be
+joined without a Cartesian product.
 
-For disconnected components (if any): CROSS-join components in increasing
-order of estimated total size. This is the residual Cartesian join that
-cannot be avoided because no edge connects the components.
+### 3.5 Complement-pair split
 
-For Q2, all tables are in one component, so no CROSS joins remain.
+For each connected subset S (|S| ≥ 2), enumerate connected splits:
+- Find all subsets A ⊂ S where A is non-empty and connected.
+- B = S \ A.
+- Check that B is also connected AND there exists at least one edge
+  between a node in A and a node in B (join edge). Without this edge,
+  joining A and B would be a Cartesian product.
+- If both conditions hold, (A, B) is a valid complement pair.
 
-### 3.5 Integration with pushdown and join algorithm selection
+```
+for each A ⊂ S where A connected:
+    B = S \ A
+    if B connected and hasCrossEdge(A, B, graph):
+        plan = best[A] ⋈ best[B]
+        if cost(plan) < cost(best[S]):
+            best[S] = plan
+```
 
-After the bushy tree is built:
-1. Walk all remaining `JoinTypeCross` nodes and attempt to push conjuncts
-   from the outer Filter (same as existing pushdown).
-2. For each `JoinTypeInner` with a predicate, call `splitEqualityForHash`
-   to set `Algo=JoinAlgoHash` and `LeftKey`/`RightKey`.
-3. For INNER joins with stats, call `chooseInnerJoinAlgo` for cost-driven
-   algorithm selection.
-4. The outer Filter retains only conjuncts that aren't INNER join predicates.
+### 3.6 DP state
+
+```
+best[mask] = Plan  // optimal bushy plan for the subset of tables in mask
+```
+
+Singleton: `best[1<<i] = SeqScan(table[i])`, cost = ANALYZE row count.
+
+Join: `cost(A ⋈ B) = |A| × |B| / max(NDistinct(join_key), 1)`
+
+The DP result is `best[(1<<k)-1]` — the optimal bushy plan for the entire component.
+
+### 3.7 Cost comparison
+
+The DP compares splits by estimated total cardinality of the join result.
+Ties are broken by preferring smaller left subtrees (heuristic: smaller
+build side for hash join).
+
+### 3.8 Fallback to left-deep
+
+When ANALYZE stats are absent on any table in the component, the DP is skipped
+and the existing left-deep logic runs instead. When the component has ≥ 12
+tables (2^12 = 4,096 subsets, enumeration still fast but O(3^k) splits become
+excessive), also fall back.
 
 ## 4. Implementation Plan
 
 ### 4.1 New file: `internal/planner/bushy.go`
 
-| Function | Responsibility |
-|----------|---------------|
-| `buildJoinGraph(tables []*catalog.Table, conjuncts []Expr, leftWidths []int) (*joinGraph, error)` | Collects equijoin edges from WHERE conjuncts. Returns graph with nodes = table indices and edges = equijoin predicates. |
-| `connectedComponents(g *joinGraph) [][]int` | Partitions tables into connected components via DFS. |
-| `buildBushyComponent(tables []*catalog.Table, comp []int, edges []joinEdge, cat catalog.Catalog) (Node, error)` | Greedy bushy tree assembly for one component. Starts from smallest table, greedily picks next by edge connectivity + estimated cardinality. |
-| `buildBushyJoinTree(tables []*catalog.Table, conjuncts []Expr, scanNodes []Node, cat catalog.Catalog) (Node, []Expr, error)` | Top-level entry point. Calls graph construction, components, per-component assembly, component merge. Returns the bushy plan tree and residual conjuncts. |
+| Type/Function | Description |
+|---------------|-------------|
+| `type joinGraph struct` | Nodes count, edge list, adjacency list |
+| `type joinEdge struct` | Left/right table index, predicate Expr, left/right key Expr |
+| `type dpEntry struct` | Plan Node for a subset, estimated cardinality int64, schema Schema |
+| `buildJoinGraph(tables []*catalog.Table, conjuncts []Expr) (*joinGraph, error)` | Extract equijoin edges from WHERE conjunctions |
+| `enumerateBushyPlans(g *joinGraph, scans []Node, stats []*catalog.TableStats) (Node, []Expr, error)` | DPccp entry point: per-component enumeration, returns best bushy plan + residual conjuncts |
+| `isConnected(mask uint16, g *joinGraph) bool` | BFS within subset |
+| `hasCrossEdge(a, b uint16, g *joinGraph) bool` | Check existence of ≥1 edge between A and B |
+| `estimateJoinSize(leftRows, rightRows int64, edge joinEdge, stats []*catalog.TableStats) int64` | Cardinality estimate for equijoin |
 
 ### 4.2 Changes to `planFromClause` / `planFromRangeVars` (planner.go)
 
-In `planFromClause`, after building scan nodes for all FROM tables, check
-whether to use the bushy planner:
-- Condition: all tables have ANALYZE stats (same gate as `reorderCommaFromByCardinality`).
-- If yes: call `buildBushyJoinTree` instead of the left-deep CROSS chain.
-- If no: fall through to existing left-deep logic.
+After building `SeqScan` nodes for each FROM table, check the gate:
+- All tables have `Table.Stats != nil && Table.Stats.RowCount > 0`.
+- Total tables ≤ 12.
 
-### 4.3 Integration with `pushPredicatesIntoCrossJoins`
+If gate passes:
+1. Build join graph from WHERE conjuncts.
+2. Call `enumerateBushyPlans()`.
+3. Wrap in Filter with residual conjuncts.
+4. Return bushy plan.
 
-After the bushy tree is built, residual conjuncts that were NOT used as
-join edges still need to be pushed. The existing `pushPredicatesIntoCrossJoins`
-can handle this — pass the bushy tree through it.
+If gate fails: fall through to existing left-deep logic.
 
-Alternatively, `buildBushyJoinTree` returns both the plan and the residual
-conjuncts. The caller wraps the plan in a Filter with the residuals.
+### 4.3 Integration with pushdown
 
-### 4.4 Limitations (v0)
+The bushy DP uses equijoin edges directly — these predicates become `Join.Predicate`
+/ `Join.LeftKey` / `Join.RightKey` on the constructed Join nodes. The residual
+conjuncts (filters that don't form edges, subqueries, LIKE patterns, etc.) stay
+in the outer Filter. The existing `pushPredicatesIntoCrossJoins` is not needed
+for the bushy plan (there are no CROSS joins to push into).
 
-- Edge detection uses only `=` predicates between column references from
-  different tables. Complex join conditions (`a.x + 1 = b.y`) are deferred.
-- Multi-column join keys are not yet supported (single-column edges only).
-- Cycle handling: when the join graph has cycles (multiple paths between
-  the same tables), the greedy algorithm picks one edge path. The other
-  edges become residual filter conjuncts.
-- Outer joins (LEFT/RIGHT/FULL) are NOT handled by the bushy planner.
-  Tables with explicit `JOIN ... ON` clauses remain on the left-deep path.
-- The bushy planner requires ANALYZE statistics on all tables.
+### 4.4 Complexity bounds
+
+| Tables (k) | Subsets (2^k) | Splits per subset | Total splits | Feasible? |
+|------------|--------------|-------------------|-------------|-----------|
+| 5 (Q2) | 32 | ≤15 | ~100 | Instant |
+| 8 | 256 | ≤128 | ~5,000 | Instant |
+| 10 | 1,024 | ≤512 | ~50,000 | ~1ms |
+| 12 | 4,096 | ≤2,048 | ~500,000 | ~10ms |
+| ≥13 | fallback to left-deep | — | — | — |
+
+### 4.5 Q2's DP search space
+
+Q2 has 5 tables, all in one connected component. The DP will:
+1. Try singleton subsets (5 entries, trivial).
+2. Try size-2 subsets: all pairs with an edge — (part, partsupp), (partsupp, supplier),
+   (supplier, nation), (nation, region). 4 entries.
+3. Try size-3 subsets: connected triples. E.g., {part, partsupp, supplier} can split
+   as {part, partsupp} ⋈ {supplier} or {part} ⋈ {partsupp, supplier}. ~8 entries.
+4. Try size-4 subsets. ~6 entries.
+5. Try size-5 subset (all tables). ~5 splits.
+
+**~25 DP entries total.** Trivial.
+
+The optimal bushy plan found will be:
+```
+Join(p_partkey = ps_partkey)
+├── SeqScan(part)
+└── Join(s_suppkey = ps_suppkey)
+    ├── Join(s_nationkey = n_nationkey)
+    │   ├── Join(n_regionkey = r_regionkey)
+    │   │   ├── SeqScan(region)
+    │   │   └── SeqScan(nation)
+    │   └── SeqScan(supplier)
+    └── SeqScan(partsupp)
+```
+
+Zero CROSS joins. All joins are INNER HASH with equijoin keys.
 
 ## 5. Verification
 
 ### 5.1 Unit tests
 
-- `TestBushyQ2NoCrossJoins`: Q2 plan contains zero `JoinTypeCross` nodes.
-- `TestBushyQ2AllHashJoins`: All joins in Q2 plan have `Algo=JoinAlgoHash`.
-- `TestBushyPreservesResults`: Q2 results from bushy plan match original
-  left-deep plan (on sample data).
-- `TestBushyTwoComponents`: Two disconnected groups produce one CROSS join
-  between components.
-- `TestBushyFallbackWithoutStats`: Left-deep plan is used when stats missing.
-- `TestBushyRegression22Queries`: All 22 TPC-H queries plan without error.
+- `TestJoinGraphQ2`: 5 nodes, 4 edges extracted from Q2's WHERE.
+- `TestJoinGraphConnected`: Single connected component.
+- `TestDPEnumerateQ2`: DP finds bushy plan, zero CROSS joins.
+- `TestDPOptimalOrderQ2`: Cardinality-optimal plan has part and supplier
+  on opposite subtrees (no CROSS join).
+- `TestDPTwoComponents`: Two disconnected components → CROSS join between them.
+- `TestDPFallbackWithoutStats`: Left-deep plan when stats missing.
+- `TestDPFallbackLargeGraph`: Left-deep plan when ≥13 tables.
+- `TestDPRegression22Queries`: All 22 TPC-H queries plan without error.
 
 ### 5.2 Integration tests
 
-- `TestBushyQ2PartialSF1`: Q2 on 4M lineitem data completes in < 120s
-  without RSS exceeding 20 GiB.
-- `TestBushyQ5NoCrossJoins`: Q5 (6-table join) plan contains no cross joins.
+- `TestDPQ2PartialSF1`: Q2 on 4M lineitem data completes in < 120s,
+  RSS ≤ 20 GiB, results returned.
+- `TestDPQ5Bushy`: Q5 (6-table join) plan contains zero CROSS joins.
+- `TestDPQ2Correctness`: Q2 results match PostgreSQL reference (sample data).
 
 ## 6. Reference
 
-- `internal/planner/planner.go:565-592` — `planFromRangeVars` (left-deep CROSS chain)
-- `internal/planner/pushdown.go:1-49` — predicate pushdown for CROSS joins
+- `internal/planner/planner.go:565-592` — `planFromRangeVars`
+- `internal/planner/pushdown.go` — predicate pushdown, `walkColumnRefs`, `splitAnd`
+- `internal/planner/pushdown.go:163-186` — `collectEqualityEdges`
 - `internal/planner/joinorder.go:60-139` — `reorderCommaFromByCardinality`
-- `internal/planner/pushdown.go:163-186` — `collectEqualityEdges` (edge collection from WHERE)
-- `internal/planner/pushdown.go:144-174` — `walkColumnRefs` (expression tree walker)
-- `internal/planner/pushdown.go:108-138` — `classifyConjunctSide` (side classification)
 - `internal/planner/planner.go:918-958` — `splitEqualityForHash`
-- `internal/planner/planner.go:610-656` — join algo selection + Join construction
-- `analysis/tpch-unnesting-results.md` — Q2 CROSS join bottleneck documented in M0033-0002
+- `internal/planner/planner.go:610-656` — Join construction + algo selection
+- `internal/planner/joincost.go` — cost-driven algorithm selection
+- PostgreSQL: `postgres/src/backend/optimizer/path/joinrels.c` — DPccp reference
+- PostgreSQL: `postgres/src/backend/optimizer/geqo/geqo_main.c` — genetic algorithm for large joins (≥12 tables)
+- `analysis/tpch-unnesting-results.md` — Q2 CROSS join bottleneck

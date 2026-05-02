@@ -1,105 +1,71 @@
-# Milestone 0034 — Bushy Join Tree / Join-Graph Optimization
+# Milestone 0034 — DP-Based Bushy Join Optimization (DPccp-Style)
 
 **Status:** planned
 **Depends on:** Milestone 0033 (subquery unnesting confirmed; CROSS join identified as remaining bottleneck), Milestone 0006 (planner statistics for cardinality estimates)
-**Drives:** Eliminate the CROSS join explosion in Q2's outer 5-table comma-join by building bushy join trees instead of left-deep-only chains. This is the prerequisite for Q2 to execute at SF=1 without unbounded memory growth.
+**Drives:** Eliminate the CROSS join explosion in Q2's outer 5-table comma-join by using a dynamic-programming-based join enumerator that explores bushy join trees — not just left-deep. This is a subset of the DPccp (Dynamic Programming connected complement pairs) algorithm adapted to goopg's v0 planner.
 
 ## Context
 
-M0033-0002 proved that the planner unnesting correctly eliminates the correlated
-subquery bottleneck in Q2 — the subquery now runs once instead of per outer row.
-However, Q2 at SF=1 still exhausts memory (30 GB RSS) because the outer query's
-5-table comma-join contains a CROSS join that produces 2 billion intermediate rows.
+M0033-0002 proved that planner unnesting correctly eliminates the correlated subquery bottleneck in Q2. However, Q2 at SF=1 still exhausts memory because the outer query's 5-table comma-join contains a CROSS join producing 2 billion intermediate rows (documented in `analysis/tpch-unnesting-results.md`).
 
-### Why the CROSS join exists
+The CROSS join exists because the current planner builds only left-deep trees — no left-deep permutation of Q2's 5 tables can avoid placing `part` and `supplier` adjacent without a direct equality edge.
 
-The current planner (`planFromRangeVars` → left-deep CROSS chain →
-`pushPredicatesIntoCrossJoins`) can only promote a CROSS join to INNER when an
-equality spans the left and right children of a specific Join node in the
-left-deep chain. With Q2's table order:
+### Why DPccp
 
-```
-part ──p_partkey=ps_partkey──→ partsupp ←──s_suppkey=ps_suppkey── supplier
-                                                                    │
-                                                         s_nationkey=n_nationkey
-                                                                    │
-                                                                nation
-                                                                    │
-                                                         n_regionkey=r_regionkey
-                                                                    │
-                                                                region
-```
+PostgreSQL uses the DPccp algorithm (`postgres/src/backend/optimizer/path/joinrels.c`, `make_rels_by_clauseless_joins` etc.) for join enumeration. DPccp operates on the join graph:
+1. Decompose the graph into **connected subgraphs** (csg).
+2. For each csg, find its **connected complement pairs** (cmp) — pairs of subgraphs that together form the csg and have at least one join edge between them.
+3. Use dynamic programming: `best[S] = min over connected splits S = A ∪ B of (best[A] ⋈ best[B])`.
 
-Any left-deep ordering of these 5 tables necessarily places `part` and `supplier`
-adjacent in the join chain at some point — but there is no direct equality
-between them. The resulting CROSS join produces `|part| × |supplier| = 2 × 10^9`
-intermediate rows.
+This is a bushy-capable, optimal join-order algorithm for acyclic queries. For v0, we implement a simplified DP that:
+- Enumerates all subsets of tables joined by equijoin edges.
+- For each subset, splits into connected pairs and picks the optimal join.
+- Falls back to left-deep when stats are unavailable or the graph is disconnected.
 
-### How bushy join trees fix this
+### Why not left-deep DP (Selinger)
 
-A bushy join tree can group tables by their equijoin connectivity independently:
-
-```
-HashJoin(p_partkey = ps_partkey)
-├── SeqScan(part)
-└── HashJoin(s_suppkey = ps_suppkey)
-    ├── HashJoin(s_nationkey = n_nationkey)
-    │   ├── HashJoin(n_regionkey = r_regionkey)
-    │   │   ├── SeqScan(nation)
-    │   │   └── SeqScan(region)
-    │   └── SeqScan(supplier)
-    └── SeqScan(partsupp)
-```
-
-Every join is INNER with an equijoin key — no CROSS joins. The intermediate
-row counts are bounded by the actual join selectivities, not by Cartesian
-products.
+Selinger-style DP explores all left-deep permutations (O(n!)) but still cannot produce bushy trees. Q2's join graph requires a bushy tree to avoid Cartesian products — no left-deep ordering can do it. Selinger DP would find the "best left-deep plan" which is still CROSS(part, supplier) = 2 × 10^9 rows.
 
 ## Required Design Docs
 
-1. `docs/design/0034-0001-bushy-join-planning.md` — Join graph construction from WHERE
-   equijoins, connected-component grouping, greedy bushy tree assembly, integration
-   with predicate pushdown and join algorithm selection.
+1. `docs/design/0034-0001-dp-bushy-join-enumeration.md` — Join graph construction, subset enumeration, connected-complement-pair splitting, DP recurrence, integration with predicate pushdown and join algorithm selection.
 
 ## Definition of Done
 
-1. **Join graph construction**: `buildJoinGraph(fromTables, wherePredicate)` returns
-   an undirected graph where nodes are FROM tables and edges are equijoin predicates
-   (extracted from the WHERE clause). Edge weight = estimated join cardinality
-   (from ANALYZE stats, or just count of connected tables).
+1. **Join graph construction**: `buildJoinGraph(fromTables, whereConjuncts)` returns an undirected graph with one node per FROM table and one edge per equijoin predicate. Each edge carries its left/right key expressions.
 
-2. **Bushy tree assembly**: Starting from the smallest table (by ANALYZE row count),
-   greedily join the next table that shares an equijoin edge with any already-joined
-   table. This builds a single connected component. Repeat for disconnected components.
-   Finally, CROSS-join the components in order of increasing size.
+2. **DP enumeration**: `enumerateBushyPlans(graph, tableStats)` applies dynamic programming:
+   - Iterates over all subsets of the graph nodes (tables), ordered by increasing subset size.
+   - For each subset S, checks connectivity (if there is a path using only edges within S).
+   - For each connected subset S, iterates over splits `S = A ∪ B` where A and B are both connected AND there exists at least one edge crossing between A and B.
+   - `best[S] = argmin_{A,B} cost(best[A] ⋈ best[B])` where cost is estimated cardinality.
+   - Singleton subsets use `SeqScan` with ANALYZE row count.
+   - Disconnected subsets are skipped — they cannot form a bushy join.
 
-3. **Integration**: `planFromRangeVars` dispatches to the bushy planner when
-   all tables have ANALYZE statistics and there are ≥3 tables in the FROM clause
-   (the existing reorder pass already gates on these conditions).
+3. **Graph connectivity pre-check**: A DFS walk verifies the entire join graph is connected. If not, connected components are joined by CROSS (the unavoidable residual Cartesian product). The DP runs per-component.
 
-4. **Q2-specific verification**: The Q2 plan tree contains no CROSS joins. All joins
-   in the outer query's plan tree are `JoinAlgoHash` or `JoinAlgoMerge` with non-nil
-   `LeftKey`/`RightKey`.
+4. **Cost model**: `cost(plan) = EstimatedRows(plan)` — simple cardinality-based cost. Joins use upstream's formula `|A| × |B| / max(NDistinct(key), 1)`. No I/O cost or CPU cost in v0.
 
-5. **Regression test**: All 22 TPC-H queries remain plannable. Non-Q2 queries
-   are unaffected (the bushy planner falls back to left-deep when stats are absent).
+5. **DP search space bound**: For Q2's 5 tables: `2^5 = 32` subsets, at most ~50 splits. For 8 tables: 256 subsets, ~1,000 splits. For 10 tables: 1,024 subsets, ~5,000 splits — all trivially fast. The DP gracefully degrades to left-deep when the graph is large (≥12 tables) or stats are missing.
 
-6. **Q2 execution**: Q2 on partial SF=1 data (4M lineitem rows) completes without
-   RSS exceeding the 20 GiB GOMEMLIMIT, and results are returned.
+6. **Integration**: `planFromRangeVars` dispatches to the DP planner when all tables have ANALYZE statistics. Otherwise falls through to existing left-deep logic.
 
-7. **Performance**: Q2 execution time is bounded (completes within a few minutes
-   rather than timing out at 5+ minutes).
+7. **Q2 plan**: Contains zero `JoinTypeCross` nodes in the outer query. All joins are `JoinAlgoHash` with non-nil `LeftKey`/`RightKey`.
 
-8. **Design doc accepted**: `docs/design/0034-0001-bushy-join-planning.md` written
-   and indexed in `docs/design/README.md`.
+8. **Regression**: All 22 TPC-H queries remain plannable. Non-Q2 queries unaffected when stats are absent.
+
+9. **Q2 execution**: Q2 on partial SF=1 data (4M lineitem rows) completes with RSS ≤ 20 GiB GOMEMLIMIT and with result rows returned.
+
+10. **Design doc accepted**: `docs/design/0034-0001-dp-bushy-join-enumeration.md` written and indexed.
 
 ## Reference
 
-- `internal/planner/planner.go:528-592` — `planFromClause`, `planFromRangeVars` (left-deep CROSS chain builder)
-- `internal/planner/pushdown.go:29-49` — `pushPredicatesIntoCrossJoins` (CROSS → INNER promotion)
-- `internal/planner/pushdown.go:163-186` — `collectEqualityEdges` (edge collection from WHERE conjunctions)
-- `internal/planner/joinorder.go:60-139` — `reorderCommaFromByCardinality` (existing reorder pass)
-- `internal/planner/planner.go:610-656` — Join algorithm selection (hash/merge)
-- `internal/planner/planner.go:918-958` — `splitEqualityForHash` (disjoint-side equality decomposition)
-- `internal/planner/joincost.go` — cost-driven algorithm selection
-- `analysis/tpch-unnesting-results.md` — Q2 CROSS join bottleneck documentation
+- `internal/planner/planner.go:528-592` — `planFromClause`, `planFromRangeVars`
+- `internal/planner/pushdown.go:29-49` — `pushPredicatesIntoCrossJoins`
+- `internal/planner/pushdown.go:163-186` — `collectEqualityEdges`
+- `internal/planner/planner.go:610-656` — join algorithm selection
+- `internal/planner/planner.go:918-958` — `splitEqualityForHash`
+- `internal/planner/joincost.go` — `chooseInnerJoinAlgo`
+- `internal/planner/joinorder.go:60-139` — `reorderCommaFromByCardinality`
+- PostgreSQL reference: `postgres/src/backend/optimizer/path/joinrels.c` (DPccp implementation)
+- `analysis/tpch-unnesting-results.md` — Q2 CROSS join bottleneck
