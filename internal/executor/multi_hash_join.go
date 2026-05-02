@@ -40,7 +40,16 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	nTables := len(o.plan.Tables)
 	o.hashTbls = make([]map[string]Row, nTables)
-	o.nulls = make([]Row, nTables)
+	if o.nulls == nil || len(o.nulls) != nTables {
+		o.nulls = make([]Row, nTables)
+		for i := range o.nulls {
+			w := len(o.plan.Tables[i].Output())
+			if w == 0 {
+				w = len(o.children[i].Schema())
+			}
+			o.nulls[i] = nullRow(w)
+		}
+	}
 
 	// Determine which tables contribute join keys.
 	// Build edge map: for each MultiHashKey, record which tables
