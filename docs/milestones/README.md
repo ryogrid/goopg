@@ -72,4 +72,5 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0035 | Streaming hash join & bushy-unnest verification                          | accepted      | `0035-streaming-hash-join.md` |
 | 0036 | Hash join lazy materialization (on-demand output)                        | accepted       | `0036-hash-join-lazy-materialization.md` |
 | 0037 | Spill-to-disk hash join (Grace hash join)                                | accepted       | `0037-hash-join-spill-to-disk.md` |
+| 0038 | Multi-way hash join                                                     | planned        | `0038-multi-way-hash-join.md` |
 | 0035 | Streaming hash join & bushy-unnest correctness verification              | planned      | `0035-streaming-hash-join.md` |

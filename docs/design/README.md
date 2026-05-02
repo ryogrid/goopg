@@ -193,4 +193,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0037-0001 | [Spill-to-Disk Hash Join](0037-0001-spill-to-disk-hash-join.md) | draft | Grace hash join: when drainRows exceeds work_mem, spill intermediate rows to disk, process one partition at a time. Breaks the per-level copy chain in Q2's 4-level join. |
 
+| 0038-0001 | [Multi-Way Hash Join Operator](0038-0001-multi-way-hash-join.md) | draft | Replace chains of N binary hash joins with a single operator that builds N-1 hash tables and probes one fact table via chain-lookups. Eliminates intermediate result sets. |
+
 Append new rows in numeric order. Do not reorder.
