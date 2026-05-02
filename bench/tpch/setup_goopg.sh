@@ -45,15 +45,14 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
     echo "Running goopg init under ${PGDATA}"
     "${GOOPG_BIN}" init -D "${PGDATA}"
 
-    # postgresql.conf knobs sized for SF=1 on a developer laptop.
-    # `shared_buffers = 256MB` is the proven-stable value for
-    # SF=1 on ≤ 32 GB machines. Larger values were attempted
-    # (M0032-0004) but caused RSS exhaustion; see
-    # analysis/tpch-hammerdb-run-002.md.
+    # postgresql.conf knobs sized for SF=1 TPC-H.
+    # shared_buffers=2GiB: arena fits in Go heap under GC control
+    # (M0032-0001). Paired with GOMEMLIMIT=20GiB and explicit
+    # runtime.GC() after query/COPY completion (M0032-0006).
     {
         echo "listen_addresses = '127.0.0.1'"
         echo "port = ${PG_PORT}"
-        echo "shared_buffers = 256MB"
+        echo "shared_buffers = 2048MB"
         echo "checkpoint_timeout = 15min"
         echo "max_wal_size = 4GB"
     } >>"${PGDATA}/postgresql.conf"

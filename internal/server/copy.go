@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/goopg/goopg/internal/config"
@@ -287,6 +288,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); err != nil {
 				return true, err
 			}
+			runtime.GC()
 			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
 				return true, err
 			}

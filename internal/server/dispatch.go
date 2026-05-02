@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -118,6 +119,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
 	commit = true
+	runtime.GC()
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 

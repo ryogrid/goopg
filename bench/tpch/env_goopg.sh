@@ -69,4 +69,4 @@ mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
 # machines while still accommodating the shared_buffers arena (256 MB
 # default). Larger shared_buffers values (e.g. 2000 MB) need ≥ 64 GB
 # system RAM — see analysis/tpch-hammerdb-run-002.md.
-export GOMEMLIMIT=4GiB
+export GOMEMLIMIT=20GiB

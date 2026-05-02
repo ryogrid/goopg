@@ -404,6 +404,17 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [ ] Profile COPY performance bottlenecks.
   - [ ] Fix and re-test schema build at shared_buffers=2000M.
 
+- [x] M0032-0006: Add explicit `runtime.GC()` after query/COPY completion
+      and re-test at shared_buffers=2048MB, GOMEMLIMIT=20GiB.
+      Documented in `analysis/tpch-hammerdb-run-003.md`.
+  - [x] `runtime.GC()` in `internal/server/dispatch.go` after Commit.
+  - [x] `runtime.GC()` in `internal/server/copy.go` after CopyDone.
+  - [x] Post-load RSS: 694 MB (vs 4,350 MB without explicit GC — 6.3× reduction).
+  - [x] Q14: 17.64s at 2GiB (vs 401s at 256MB — 23× speedup).
+  - [x] Q2: RSS grew to 28 GB (correlated subquery per-row allocation).
+  - [ ] Follow-up: Q2 subquery caching/unnesting (M0031 follow-up).
+  - [ ] Follow-up: HammerDB COPY connection drops (M0032-0005).
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
