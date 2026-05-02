@@ -335,4 +335,7 @@ func markHeapLockDirty(
 	})
 }
 
-func (o *lockRowsOp) Close() error { return o.child.Close() }
+func (o *lockRowsOp) Close() error {
+	o.pending = nil
+	return o.child.Close()
+}

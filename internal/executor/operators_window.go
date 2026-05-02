@@ -244,5 +244,10 @@ func (o *windowOp) Next() (Row, error) {
 	return row, nil
 }
 
-func (o *windowOp) Close() error           { return o.child.Close() }
+func (o *windowOp) Close() error {
+	o.rows = nil
+	o.ctx = nil
+	o.idx = 0
+	return o.child.Close()
+}
 func (o *windowOp) Schema() planner.Schema { return o.schema }

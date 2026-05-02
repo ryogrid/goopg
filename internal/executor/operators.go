@@ -239,7 +239,12 @@ func (o *sortOp) Open(ctx *Context) error {
 }
 
 func (o *sortOp) Schema() planner.Schema { return o.child.Schema() }
-func (o *sortOp) Close() error           { return o.child.Close() }
+func (o *sortOp) Close() error {
+	o.rows = nil
+	o.idx = 0
+	o.ctx = nil
+	return o.child.Close()
+}
 
 func (o *sortOp) Next() (Row, error) {
 	if o.idx >= len(o.rows) {

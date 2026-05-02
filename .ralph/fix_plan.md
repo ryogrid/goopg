@@ -332,6 +332,15 @@ Analysis-only milestone. No implementation. Decomposed into two design-doc deliv
         and which don't.
   - [x] Prioritize fixes by estimated heap impact for Q2.
 
+- [x] M0031-0003: Apply GC leak fixes — nil buffers in Close() for joinOp, sortOp,
+      aggregateOp, windowOp, lockRowsOp, recursiveUnionOp. (landed 2026-05-02)
+  - [x] joinOp.Close(): nil o.rows, o.ctx; reset o.idx.
+  - [x] sortOp.Close(): nil o.rows, o.ctx; reset o.idx.
+  - [x] aggregateOp.Close(): nil o.rows, o.ctx; reset o.idx.
+  - [x] windowOp.Close(): nil o.rows, o.ctx; reset o.idx.
+  - [x] lockRowsOp.Close(): nil o.pending.
+  - [x] recursiveUnionOp.Close(): nil o.output, o.working, o.ctx; close o.recursive.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

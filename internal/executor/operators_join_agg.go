@@ -397,6 +397,9 @@ func (o *joinOp) Next() (Row, error) {
 }
 
 func (o *joinOp) Close() error {
+	o.rows = nil
+	o.ctx = nil
+	o.idx = 0
 	errL := o.left.Close()
 	errR := o.right.Close()
 	if errL != nil {
@@ -646,7 +649,12 @@ func (o *aggregateOp) Next() (Row, error) {
 	return row, nil
 }
 
-func (o *aggregateOp) Close() error { return o.child.Close() }
+func (o *aggregateOp) Close() error {
+	o.rows = nil
+	o.ctx = nil
+	o.idx = 0
+	return o.child.Close()
+}
 
 func (o *aggregateOp) Schema() planner.Schema { return o.schema }
 
