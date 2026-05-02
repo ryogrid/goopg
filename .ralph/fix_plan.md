@@ -293,6 +293,45 @@ Decomposed into the six design-doc seams the milestone calls out.
 - [ ] Transactional DDL foundation (M0030-0006).
       Design doc `docs/design/0030-0006-transactional-ddl.md`.
 
+## Milestone 0031 — TPC-H Q2 Memory Estimation & GC Leak Code Review
+
+See `docs/milestones/0031-tpch-q2-memory-analysis-and-gc-code-review.md`.
+Analysis-only milestone. No implementation. Decomposed into two design-doc deliverables.
+
+- [ ] M0031-0001: Q2 memory estimation — theoretical lower bound at SF=1, VUSER=1
+      assuming ideal GC. Per-operator peak allocation, invocation count, and
+      retained-after-Close analysis. Design doc
+      `docs/design/0031-0001-q2-memory-estimation.md`.
+
+  - [ ] Trace Q2 planner output to determine actual join tree and algorithm choices.
+  - [ ] Map each operator to its allocation profile (peak, per-invocation, retained).
+  - [ ] Count subquery invocations (outer row cardinality estimate).
+  - [ ] Compute total retained memory floor — compare against 512 MiB GOMEMLIMIT.
+  - [ ] Identify dominant contributors if the floor exceeds the limit.
+
+- [ ] M0031-0002: Executor GC leak code review — operator-by-operator audit for
+      memory that remains reachable (uncollectable by GC) after Close() or between
+      re-Open cycles. Design doc
+      `docs/design/0031-0002-executor-gc-leak-review.md`.
+
+  - [ ] Audit joinOp: o.rows not nilled on Close; hash table not nilled; drainRows
+        copies retained.
+  - [ ] Audit sortOp: o.rows retained after Close.
+  - [ ] Audit windowOp: o.rows retained after Close; per-comparison expression
+        re-evaluation.
+  - [ ] Audit aggregateOp: o.rows retained after Close; groups map not cleaned.
+  - [ ] Audit recursiveUnionOp: output/working monotonic growth, never cleared.
+  - [ ] Audit lockRowsOp: pending buffer retained after Close.
+  - [ ] Audit indexScanOp: compare against its good pattern (nils o.rows/tids).
+  - [ ] Audit seqScanOp and other storage operators.
+  - [ ] Audit evalSubquery/subqueryImpl: per-invocation Build/Open/Close cycle;
+        no caching; OuterRows stack growth under nesting.
+  - [ ] Audit evalGroupKey, runHashJoin, buildMergeSide: per-row/intermediate
+        allocation churn.
+  - [ ] Audit Close() patterns across all operators — which nill their buffers
+        and which don't.
+  - [ ] Prioritize fixes by estimated heap impact for Q2.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

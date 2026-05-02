@@ -65,3 +65,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0028 | goopg implementation reference: PostgreSQL logic documentation               | planned  | `0028-postgres-implementation-reference.md` |
 | 0029 | HammerDB TPC-H end-to-end run on goopg                                      | planned  | `0029-hammerdb-tpch-run.md` |
 | 0030 | Catalog persistence and DDL WAL                                             | planned  | `0030-catalog-persistence-and-ddl-wal.md` |
+| 0031 | TPC-H Q2 memory estimation & GC leak code review                           | planned  | `0031-tpch-q2-memory-analysis-and-gc-code-review.md` |
