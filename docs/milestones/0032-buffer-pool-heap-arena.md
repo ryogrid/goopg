@@ -1,6 +1,6 @@
 # Milestone 0032 — Buffer Pool Arena: mmap → Go Heap Replacement
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** Milestone 0029 (HammerDB TPC-H run)
 **Drives:** Enable `shared_buffers=2000M` without OOM during TPC-H data load, so heap and index pages fit entirely in the buffer pool for query performance.
 

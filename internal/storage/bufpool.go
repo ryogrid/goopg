@@ -253,8 +253,8 @@ type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xma
 // write or recovery. See docs/design/0002-0003-redo-records.md.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
-// NewPool allocates a Pool of cfg.Slots fixed buffers backed by an
-// mmap'd arena. Returns an error if slots <= 0 or the arena alloc
+// NewPool allocates a Pool of cfg.Slots fixed buffers backed by a
+// Go-heap arena. Returns an error if slots <= 0 or the arena alloc
 // fails.
 func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	if cfg.Slots <= 0 {
