@@ -118,49 +118,60 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 }
 
 // openLazyHashJoin builds a hash table from the build side and sets
-// up lazy output: joined rows are yielded on demand via Next().
-// TODO M0037: use drainRowsBounded with work_mem to spill to disk
-// when intermediate results exceed memory budget.
+// up lazy output. When ctx.WorkMem > 0, the build side uses
+// drainRowsBounded to spill to disk if row data exceeds the budget.
 func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
 	o.lazyLW = leftWidth
 	o.lazyRW = rightWidth
+	budget := ctx.WorkMem
+	if budget <= 0 {
+		budget = 512 * 1024 * 1024 // default 512 MiB
+	}
 	if o.plan.BuildLeft {
 		if err := o.left.Open(ctx); err != nil { return err }
-		buildRows, err := drainRows(o.left)
-		if err != nil { return err }
+		buildOp, err := drainRowsBounded(o.left, budget)
 		_ = o.left.Close()
-		if leftWidth == 0 && len(buildRows) > 0 {
-			leftWidth = len(buildRows[0]); o.lazyLW = leftWidth
-		}
-		nullRight := nullRow(rightWidth)
-		o.lazyHash = make(map[string][]Row, len(buildRows))
-		for _, l := range buildRows {
-			key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRight))
+		if err != nil { return err }
+		if err := buildOp.Open(ctx); err != nil { return err }
+		for {
+			l, err := buildOp.Next()
+			if err == EOF { break }
+			if err != nil { return err }
+			if leftWidth == 0 && len(l) > 0 {
+				leftWidth = len(l); o.lazyLW = leftWidth
+			}
+			key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRow(rightWidth)))
 			if err != nil { return err }
 			if !ok { continue }
+			if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
 			o.lazyHash[key] = append(o.lazyHash[key], l)
 		}
+		_ = buildOp.Close()
 		if err := o.right.Open(ctx); err != nil { return err }
 		o.lazyProbe = o.right
 		return nil
 	}
 	if err := o.right.Open(ctx); err != nil { return err }
-	buildRows, err := drainRows(o.right)
-	if err != nil { return err }
+	buildOp, err := drainRowsBounded(o.right, budget)
 	_ = o.right.Close()
-	if rightWidth == 0 && len(buildRows) > 0 {
-		rightWidth = len(buildRows[0]); o.lazyRW = rightWidth
-	}
-	nullLeft := nullRow(leftWidth)
-	o.lazyHash = make(map[string][]Row, len(buildRows))
-	for _, r := range buildRows {
-		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
+	if err != nil { return err }
+	if err := buildOp.Open(ctx); err != nil { return err }
+	for {
+		r, err := buildOp.Next()
+		if err == EOF { break }
+		if err != nil { return err }
+		if rightWidth == 0 && len(r) > 0 {
+			rightWidth = len(r); o.lazyRW = rightWidth
+		}
+		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullRow(leftWidth), r))
 		if err != nil { return err }
 		if !ok { continue }
+		if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
 		o.lazyHash[key] = append(o.lazyHash[key], r)
 	}
+	_ = buildOp.Close()
 	if err := o.left.Open(ctx); err != nil { return err }
 	o.lazyProbe = o.left
 	return nil
