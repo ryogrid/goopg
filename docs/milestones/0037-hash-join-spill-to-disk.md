@@ -1,6 +1,6 @@
 # Milestone 0037 — Spill-to-Disk Hash Join
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** M0036 (lazy hash join — confirmed parent drainRows re-materializes child output)
 **Drives:** Break the `drainRows` copy chain across join levels by writing intermediate results to disk when they exceed a memory budget, then reading them back one partition at a time.
 

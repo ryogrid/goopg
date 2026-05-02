@@ -119,6 +119,8 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 
 // openLazyHashJoin builds a hash table from the build side and sets
 // up lazy output: joined rows are yielded on demand via Next().
+// TODO M0037: use drainRowsBounded with work_mem to spill to disk
+// when intermediate results exceed memory budget.
 func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())

@@ -75,6 +75,7 @@ func (s *Server) executeExtendedQueryViaExecutor(sess *config.SessionRegistry, q
 	ctx.Params = datums
 	ctx.Checkpointer = s.cfg.Checkpointer
 	ctx.StatsTarget = sessionStatsTarget(sess)
+	ctx.WorkMem = sessionWorkMem(sess)
 	ctx.PubSub = s.cfg.PubSub
 
 	op, err := executor.Build(node)
