@@ -371,6 +371,17 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] Documented in `analysis/tpch-shared-buffers-2000m-run.md`.
   - [ ] Full SF=1 HammerDB data load + scale verification (follow-up).
 
+- [x] M0032-0003: Close TPC-H feature gaps — date_part() function + SUBSTRING
+      FROM/FOR syntax. (landed 2026-05-02)
+  - [x] `date_part(text, timestamp)` → returns int8, fields: year/month/day/hour/
+        minute/second/dow/doy/epoch/quarter. Shared logic with EXTRACT via
+        `extractTimestampField()`.
+  - [x] `SUBSTRING(str FROM start [FOR count])` → SQL-standard syntax, desugars
+        to comma-arg FuncCall. Both forms coexist.
+  - [x] Full `go test ./...` passes (parser, executor, planner green).
+  - [x] 22/22 TPC-H queries parse/plan/execute (100%). Verified on synthetic data.
+  - [x] Documented in `analysis/tpch-feature-gaps-closed.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

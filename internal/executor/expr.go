@@ -440,31 +440,72 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT(%s FROM …) requires timestamp/date input", x.Field)}
 	}
-	t := src.Time.UTC()
-	var n int64
-	switch x.Field {
+	n, err := extractTimestampField(x.Field, src.Time, x.Pos())
+	if err != nil {
+		return Datum{}, err
+	}
+	return Datum{Kind: KindInt, Int: n}, nil
+}
+
+// extractTimestampField returns the integer value of a named
+// calendar field from a UTC timestamp. Shared by evalExtract and
+// evalDatePart.
+func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
+	u := t.UTC()
+	switch field {
 	case "year":
-		n = int64(t.Year())
+		return int64(u.Year()), nil
 	case "month":
-		n = int64(t.Month())
+		return int64(u.Month()), nil
 	case "day":
-		n = int64(t.Day())
+		return int64(u.Day()), nil
 	case "hour":
-		n = int64(t.Hour())
+		return int64(u.Hour()), nil
 	case "minute":
-		n = int64(t.Minute())
+		return int64(u.Minute()), nil
 	case "second":
-		n = int64(t.Second())
+		return int64(u.Second()), nil
 	case "dow":
-		n = int64(t.Weekday()) // Sunday=0, matches upstream
+		return int64(u.Weekday()), nil // Sunday=0, matches upstream
 	case "doy":
-		n = int64(t.YearDay())
+		return int64(u.YearDay()), nil
 	case "epoch":
-		n = t.Unix()
+		return u.Unix(), nil
 	case "quarter":
-		n = int64((int(t.Month())-1)/3 + 1)
+		return int64((int(u.Month())-1)/3 + 1), nil
 	default:
-		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT field %q is not supported in v0", x.Field)}
+		return 0, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("date field %q is not supported in v0", field)}
+	}
+}
+
+// evalDatePart implements PostgreSQL's `date_part(text, timestamp)`
+// builtin. The first argument is a string literal naming the field
+// (e.g. 'year', 'month', 'quarter'). Semantics match
+// extractTimestampField, which is shared with EXTRACT.
+func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part(text, timestamp) requires exactly 2 arguments"}
+	}
+	fieldArg, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	src, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if fieldArg.IsNull() || src.IsNull() {
+		return NullDatum, nil
+	}
+	if fieldArg.Kind != KindString {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part first argument must be text"}
+	}
+	if src.Kind != KindTime {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part second argument must be timestamp/date"}
+	}
+	n, err := extractTimestampField(fieldArg.String, src.Time, x.Pos())
+	if err != nil {
+		return Datum{}, err
 	}
 	return Datum{Kind: KindInt, Int: n}, nil
 }
@@ -762,6 +803,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalToDate(x, row, ctx)
 	case "substr", "substring":
 		return evalSubstr(x, row, ctx)
+	case "date_part":
+		return evalDatePart(x, row, ctx)
 	}
 	return evalStoredRoutineFuncCall(x, row, ctx)
 }

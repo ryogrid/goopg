@@ -2359,6 +2359,8 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "timestamp"}
 		case "substr", "substring":
 			return catalog.Type{Name: "text"}
+		case "date_part":
+			return catalog.Type{Name: "int8"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}
