@@ -67,3 +67,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0030 | Catalog persistence and DDL WAL                                             | planned  | `0030-catalog-persistence-and-ddl-wal.md` |
 | 0031 | TPC-H Q2 memory estimation & GC leak code review                           | accepted  | `0031-tpch-q2-memory-analysis-and-gc-code-review.md` |
 | 0032 | Buffer pool arena: mmap → Go heap replacement                          | accepted   | `0032-buffer-pool-heap-arena.md` |
+| 0033 | Planner-level subquery unnesting                                         | planned    | `0033-subquery-unnesting.md` |

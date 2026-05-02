@@ -412,8 +412,44 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] Post-load RSS: 694 MB (vs 4,350 MB without explicit GC — 6.3× reduction).
   - [x] Q14: 17.64s at 2GiB (vs 401s at 256MB — 23× speedup).
   - [x] Q2: RSS grew to 28 GB (correlated subquery per-row allocation).
-  - [ ] Follow-up: Q2 subquery caching/unnesting (M0031 follow-up).
+  - [ ] Follow-up: Q2 subquery caching/unnesting (M0033).
   - [ ] Follow-up: HammerDB COPY connection drops (M0032-0005).
+
+## Milestone 0033 — Planner-Level Subquery Unnesting
+
+See `docs/milestones/0033-subquery-unnesting.md`.
+Detect correlated scalar subqueries at plan time and rewrite them as `GROUP BY`
+aggregate + hash join, so the subquery executes once instead of per outer row.
+Primary target: TPC-H Q2's `min(ps_supplycost)` subquery.
+
+- [ ] M0033-0001: Planner unnesting for correlated scalar subqueries. Design doc
+      `docs/design/0033-0001-subquery-unnesting.md`.
+
+  - [ ] Add `unnestParam` struct: `{OuterRef *OuterColumnRef, SubCol *ColumnRef}`.
+  - [ ] Implement `canUnnestSubquery()` — 5 detection checks (scalar subquery,
+        equijoin correlation, simple aggregate, no DISTINCT, single FROM scope).
+  - [ ] Implement `collectUnnestParams()` — walk inner WHERE for equijoin
+        `(OuterColumnRef = ColumnRef)` pairs.
+  - [ ] Implement `buildUnnestedSubquery()` — clone subquery plan, replace
+        OuterColumnRefs with subquery-side ColumnRefs, add GROUP BY.
+  - [ ] Implement `integrateUnnestedSubquery()` — insert HashJoin between
+        outer plan and unnested subquery, replace SubqueryExpr in outer filter.
+  - [ ] Wire into `planSubqueryExpr()` — call unnest pipeline; on success,
+        return rewritten expression tree instead of SubqueryExpr.
+  - [ ] Unit tests: `canUnnestSubquery` checks, Q2 unnest plan shape, rejection
+        cases (non-equijoin, multi-aggregate, HAVING, EXISTS, IN).
+  - [ ] Integration test: Q2 with sample data → plan contains HashJoin+Aggregate,
+        no SubqueryExpr. Execution returns correct result.
+  - [ ] Memory test: Q2 on partial SF=1 data (270K outer rows) → RSS bounded,
+        no OOM trend.
+  - [ ] EXPLAIN output: Verify unnest structure visible in plan tree.
+
+- [ ] M0033-0002: TPC-H end-to-end verification with unnesting.
+  - [ ] Run Q2 on SF=1 partial data — query completes without OOM.
+  - [ ] Compare Q2 results with PostgreSQL reference (correctness).
+  - [ ] Measure Q2 execution time at 2GiB shared_buffers.
+  - [ ] Run full TPC-H power test (22 queries) to verify no regressions.
+  - [ ] Document results in `analysis/tpch-unnesting-results.md`.
 
 ## Notes
 

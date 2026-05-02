@@ -181,5 +181,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | 0031-0001 | [TPC-H Q2 Memory Estimation at SF=1](0031-0001-q2-memory-estimation.md) | draft | Theoretical lower-bound memory footprint: plan trace, per-operator allocation, subquery re-execution, GC pacing under 512 MiB limit. |
 | 0031-0002 | [Executor GC Leak Code Review](0031-0002-executor-gc-leak-review.md) | draft | Operator-by-operator audit for GC-uncollectable retained memory after Close(); prioritised fix proposals. |
 | 0032-0001 | [Buffer Pool Heap Arena Replacement](0032-0001-heap-arena-replacement.md) | draft | Replace mmap'd anonymous arena with Go heap `make([]byte)` allocation under GC control. |
+| 0033-0001 | [Planner-Level Subquery Unnesting](0033-0001-subquery-unnesting.md) | draft | Detect correlated scalar subqueries at plan time, rewrite as GROUP BY aggregate + hash join (eliminates per-row re-execution). |
 
 Append new rows in numeric order. Do not reorder.
