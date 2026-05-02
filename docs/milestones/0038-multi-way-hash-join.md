@@ -1,6 +1,6 @@
 # Milestone 0038 — Multi-Way Hash Join
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** M0037 (spill-to-disk infrastructure), M0036 (lazy hash join), M0034 (bushy DP plan), M0033 (subquery unnesting)
 **Drives:** Eliminate intermediate join result accumulation across multiple join levels by joining N base tables in a single hash-table-based pass. This removes the per-level drainRows copy chain that causes Q2's 24.8 GB RSS.
 

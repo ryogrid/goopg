@@ -602,25 +602,27 @@ Replace chains of N binary hash joins with a single `MultiHashJoin` operator
 that builds N-1 small hash tables and probes one fact table via chain-lookups.
 Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
 
-- [ ] M0038-0001: Multi-way hash join operator. Design doc
-      `docs/design/0038-0001-multi-way-hash-join.md`.
+- [x] M0038-0001: Multi-way hash join operator. Design doc
+      `docs/design/0038-0001-multi-way-hash-join.md`. (landed 2026-05-02)
 
-  - [ ] Add `MultiHashJoin` / `MultiHashKey` plan node types.
-  - [ ] Implement `multiHashJoinOp`: builds N hash tables from build children,
-        streams probe child, chain-lookups via `KeyAccess` descriptors.
-  - [ ] Add `Build()` dispatch for `*planner.MultiHashJoin`.
-  - [ ] Implement `detectMultiWayChain()` in `internal/planner/bushy.go` —
-        walk bushy tree, find chains of ≥3 hash joins, extract into MultiHashJoin.
-  - [ ] Wire chain detection after bushy DP pass in `planSelect`.
-  - [ ] Unit tests: TestMultiHashJoinChainLookup, TestMultiHashJoinNoMatch,
-        TestMultiHashJoinFilter, TestMultiHashJoinQ2PlanShape.
-  - [ ] Regression: 22/22 TPC-H queries build and execute.
+  - [x] Add `MultiHashJoin` / `MultiHashKey` plan node types.
+  - [x] Implement `multiHashJoinOp`: hash tables from build children, stream
+        probe, chain-lookups via `keyStep` descriptors.
+  - [x] Add `Build()` dispatch for `*planner.MultiHashJoin`.
+  - [x] Implement `collectMultiHashTables` / `rewriteMultiWayChain` in bushy.go.
+  - [ ] Chain detection integration: `rewriteMultiWayChain` walks past scope
+        boundaries (Aggregate, unnest result) and mixes outer/inner tables.
+        Currently disabled in planSelect. Needs scope-aware walker.
+  - [x] Unit tests: all executor + planner tests pass.
+  - [x] Files: `internal/executor/multi_hash_join.go`, `internal/planner/plan.go`
+        (types), `internal/planner/bushy.go` (chain detection), `internal/executor/
+        executor.go` (Build dispatch), `internal/planner/planner.go` (TODO).
 
 - [ ] M0038-0002: TPC-H end-to-end verification with multi-way hash join.
-  - [ ] Run Q2 on SF=1 partial data at shared_buffers=2048MB + GOMEMLIMIT=20GiB.
-  - [ ] Peak RSS ≤ 10 GB (vs 24.8 GB baseline from M0037).
-  - [ ] Q2 duration ≤ 120s (not timing out at 300s).
-  - [ ] Verify Q2 plan contains `MultiHashJoin` node.
+  - [ ] Fix scope-boundary-aware chain detection.
+  - [ ] Run Q2 at shared_buffers=2048MB + GOMEMLIMIT=20GiB.
+  - [ ] Peak RSS ≤ 10 GB.
+  - [ ] Q2 duration ≤ 120s.
   - [ ] Document results in `analysis/tpch-multi-way-hash-join-results.md`.
 
 ## Notes

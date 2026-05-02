@@ -507,3 +507,119 @@ func markEdgesInMask(mask uint16, g *joinGraph, used []bool) {
 		}
 	}
 }
+
+// collectMultiHashTables walks a left-deep chain of hash joins and
+// collects the SeqScan leaf nodes. Returns the scan nodes in join
+// order and the join keys for each edge, or nil if the tree is not
+// a valid chain (≥3 tables, all JoinAlgoHash, all inner, chained).
+func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
+	var scans []Node
+	var keys []MultiHashKey
+
+	// Map from SeqScan node pointer to table index.
+	scanIdx := make(map[Node]int)
+
+	var walk func(n Node) bool
+	walk = func(n Node) bool {
+		if s, ok := n.(*SeqScan); ok {
+			idx := len(scans)
+			scans = append(scans, s)
+			scanIdx[n] = idx
+			return true
+		}
+		// Stop at scope boundaries: aggregate, sort, project,
+		// filter — these represent query phases, not join trees.
+		if _, ok := n.(*Aggregate); ok {
+			return false
+		}
+		if _, ok := n.(*Sort); ok {
+			return false
+		}
+		if _, ok := n.(*Project); ok {
+			return false
+		}
+		if _, ok := n.(*Filter); ok {
+			return false
+		}
+		j, ok := n.(*Join)
+		if !ok || j.Algo != JoinAlgoHash || j.Type != JoinTypeInner {
+			return false
+		}
+		if !walk(j.Left) || !walk(j.Right) {
+			return false
+		}
+		// Record the equijoin edge between left and right.
+		li := scanIdx[j.Left]
+		ri := scanIdx[j.Right]
+		if li < len(scans) && ri < len(scans) {
+			key := MultiHashKey{
+				LeftTable: li, LeftCol: 0,
+				RightTable: ri, RightCol: 0,
+			}
+			// Find correct column indices from the expression.
+			if lk, ok := j.LeftKey.(*ColumnRef); ok {
+				key.LeftCol = lk.Index
+			}
+			if rk, ok := j.RightKey.(*ColumnRef); ok {
+				key.RightCol = rk.Index
+			}
+			keys = append(keys, key)
+		}
+		return true
+	}
+	if !walk(node) || len(scans) < 3 {
+		return nil, nil, 0
+	}
+	// Determine probe table: the one with the largest row count.
+	probeIdx := 0
+	probeRows := int64(0)
+	for i, s := range scans {
+		if r := EstimateRows(s); r > probeRows {
+			probeRows = r
+			probeIdx = i
+		}
+	}
+	return scans, keys, probeIdx
+}
+
+// rewriteMultiWayChain walks the plan tree and replaces chains of
+// ≥3 hash-joined tables with MultiHashJoin nodes.
+func rewriteMultiWayChain(node Node) Node {
+	if node == nil {
+		return nil
+	}
+	scans, keys, probeIdx := collectMultiHashTables(node)
+	if scans == nil {
+		// Not a valid chain — recurse into children.
+		switch n := node.(type) {
+		case *Join:
+			n.Left = rewriteMultiWayChain(n.Left)
+			n.Right = rewriteMultiWayChain(n.Right)
+		case *Filter:
+			n.Child = rewriteMultiWayChain(n.Child)
+		case *Project:
+			n.Child = rewriteMultiWayChain(n.Child)
+		case *Sort:
+			n.Child = rewriteMultiWayChain(n.Child)
+		case *Aggregate:
+			n.Child = rewriteMultiWayChain(n.Child)
+		}
+		return node
+	}
+
+	// Build MultiHashJoin node.
+	mh := &MultiHashJoin{
+		pos:        node.Pos(),
+		Tables:     scans,
+		Keys:       keys,
+		ProbeTable: probeIdx,
+		Filters:    nil,
+	}
+	// Build output schema from all tables.
+	fullSchema := make(Schema, 0)
+	for _, s := range scans {
+		fullSchema = append(fullSchema, s.Output()...)
+	}
+	mh.schema = fullSchema
+	return mh
+}
