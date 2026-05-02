@@ -39,6 +39,9 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	if o.plan.Algo == planner.JoinAlgoHash {
+		return o.openStreamingHashJoin(ctx)
+	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -65,9 +68,6 @@ func (o *joinOp) Open(ctx *Context) error {
 		rightWidth = len(rightRows[0])
 	}
 
-	if o.plan.Algo == planner.JoinAlgoHash {
-		return o.runHashJoin(leftRows, rightRows, leftWidth, rightWidth)
-	}
 	if o.plan.Algo == planner.JoinAlgoMerge {
 		return o.runMergeJoin(leftRows, rightRows, leftWidth, rightWidth)
 	}
@@ -112,48 +112,75 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 	return nil
 }
 
-// runHashJoin builds an in-memory map on one input and probes from
-// the other. By default the right input is the build side (matches
-// the historical convention); when the planner sets BuildLeft=true
-// — which it does for INNER joins where EstimateRows says the left
-// side is smaller — we hash the left input instead. The output row
-// order remains canonical [leftCols, rightCols] regardless of which
-// side built the hash table. INNER and LEFT only — the planner
-// enables the hash algo only for these types and only sets
-// BuildLeft for INNER. Build cost: O(M) hashes + O(M) memory;
-// probe cost: O(N) hashes + O(matches) emits. NULL keys never
-// match (matches upstream's NULL-aware equi-join semantics).
-func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
+// openStreamingHashJoin opens a hash join where only the build
+// side is drained into memory. The probe side streams one row at
+// a time via Operator.Next(). This cuts peak memory by eliminating
+// the probe-side drainRows deep copy.
+func (o *joinOp) openStreamingHashJoin(ctx *Context) error {
+	leftWidth := len(o.left.Schema())
+	rightWidth := len(o.right.Schema())
 	if o.plan.BuildLeft {
-		return o.runHashJoinBuildLeft(leftRows, rightRows, leftWidth, rightWidth)
+		if err := o.left.Open(ctx); err != nil {
+			return err
+		}
+		buildRows, err := drainRows(o.left)
+		if err != nil {
+			return err
+		}
+		_ = o.left.Close()
+		if leftWidth == 0 && len(buildRows) > 0 {
+			leftWidth = len(buildRows[0])
+		}
+		if err := o.right.Open(ctx); err != nil {
+			return err
+		}
+		return o.runHashJoinBuildLeftStream(buildRows, leftWidth, rightWidth)
 	}
+	// Default: build right, probe left.
+	if err := o.right.Open(ctx); err != nil {
+		return err
+	}
+	buildRows, err := drainRows(o.right)
+	if err != nil {
+		return err
+	}
+	_ = o.right.Close()
+	if rightWidth == 0 && len(buildRows) > 0 {
+		rightWidth = len(buildRows[0])
+	}
+	if err := o.left.Open(ctx); err != nil {
+		return err
+	}
+	return o.runHashJoinStream(buildRows, leftWidth, rightWidth)
+}
+
+// runHashJoinStream builds a hash table from buildRows (right side)
+// and streams probe rows from o.left. INNER and LEFT only.
+func (o *joinOp) runHashJoinStream(buildRows []Row, leftWidth, rightWidth int) error {
+	nullLeft := nullRow(leftWidth)
 	nullRight := nullRow(rightWidth)
 
-	// Build phase: hash right input on RightKey. The right key
-	// is evaluated against a left||right concat where the left
-	// half is null padding — RightKey only references right-
-	// side columns by planner construction.
-	rightHash := make(map[string][]Row, len(rightRows))
-	leftPad := nullRow(leftWidth)
-	for _, r := range rightRows {
-		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(leftPad, r))
+	rightHash := make(map[string][]Row, len(buildRows))
+	for _, r := range buildRows {
+		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
 		if err != nil {
 			return err
 		}
 		if !ok {
-			// NULL key — never matches anyone in upstream's
-			// equi-join semantics, so don't add to the hash.
-			// LEFT join doesn't care; the right side is the
-			// inner side.
 			continue
 		}
 		rightHash[key] = append(rightHash[key], r)
 	}
 
-	// Probe phase.
-	rightZero := nullRow(rightWidth)
-	for _, l := range leftRows {
-		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, rightZero))
+	for {
+		l, err := o.left.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRight))
 		if err != nil {
 			return err
 		}
@@ -163,14 +190,8 @@ func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth in
 		}
 		matched := false
 		for _, r := range matches {
-			joined := concatRows(l, r)
-			// The hash equality already guarantees the join
-			// key matches; for predicates that ARE just the
-			// equality this is enough. v0 always splits the
-			// full predicate into LeftKey/RightKey at plan
-			// time so re-checking is unnecessary.
 			matched = true
-			o.rows = append(o.rows, joined)
+			o.rows = append(o.rows, concatRows(l, r))
 		}
 		if !matched && o.plan.Type == planner.JoinTypeLeft {
 			o.rows = append(o.rows, concatRows(l, nullRight))
@@ -179,18 +200,15 @@ func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth in
 	return nil
 }
 
-// runHashJoinBuildLeft mirrors runHashJoin with the build/probe
-// sides swapped: the LEFT input becomes the hash table and the
-// RIGHT input drives the probe. The output is still in the
-// canonical [leftCols, rightCols] order so downstream operators
-// see no difference. INNER only — the planner does not enable
-// BuildLeft for LEFT JOIN (the left side is the outer/preserved
-// side and must drive the loop to emit unmatched rows).
-func (o *joinOp) runHashJoinBuildLeft(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
-	leftHash := make(map[string][]Row, len(leftRows))
-	rightZero := nullRow(rightWidth)
-	for _, l := range leftRows {
-		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, rightZero))
+// runHashJoinBuildLeftStream is the BuildLeft=true streaming
+// variant: drains left as build side, streams right as probe.
+func (o *joinOp) runHashJoinBuildLeftStream(buildRows []Row, leftWidth, rightWidth int) error {
+	nullLeft := nullRow(leftWidth)
+	nullRight := nullRow(rightWidth)
+
+	leftHash := make(map[string][]Row, len(buildRows))
+	for _, l := range buildRows {
+		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRight))
 		if err != nil {
 			return err
 		}
@@ -200,9 +218,15 @@ func (o *joinOp) runHashJoinBuildLeft(leftRows, rightRows []Row, leftWidth, righ
 		leftHash[key] = append(leftHash[key], l)
 	}
 
-	leftPad := nullRow(leftWidth)
-	for _, r := range rightRows {
-		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(leftPad, r))
+	for {
+		r, err := o.right.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
 		if err != nil {
 			return err
 		}

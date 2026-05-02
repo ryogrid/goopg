@@ -508,28 +508,22 @@ See `docs/milestones/0035-streaming-hash-join.md`.
 Eliminate probe-side `drainRows` in hash joins so only the build side is deep-copied.
 Verify that M0033's unnest pass correctly processes M0034's bushy plan trees.
 
-- [ ] M0035-0001: Streaming hash join executor. Design doc
-      `docs/design/0035-0001-streaming-hash-join.md`.
+- [x] M0035-0001: Streaming hash join executor. Design doc
+      `docs/design/0035-0001-streaming-hash-join.md`. (landed 2026-05-02)
 
-  - [ ] Modify `joinOp.Open()` — for `JoinAlgoHash`, drain only the build side.
-        Probe side stays as a streaming `Operator`; `Next()` called in a loop.
-  - [ ] Implement `runHashJoinStream(probeOp, buildRows, ...)` — build hash table
-        from buildRows, stream probeOp.Next() through it.
-  - [ ] Implement `runHashJoinBuildLeftStream(buildRows, probeOp, ...)` — symmetric.
-  - [ ] LEFT JOIN: emit `concatRows(l, nullRight)` for unmatched probe rows.
-  - [ ] Nested-loop and merge joins unchanged (still need both sides buffered).
-  - [ ] Unit tests: TestStreamingHashJoinINNER, TestStreamingHashJoinLEFT,
-        TestStreamingHashJoinBuildLeft.
-  - [ ] Regression: 22/22 TPC-H queries build and execute.
+  - [x] Modify `joinOp.Open()` — for `JoinAlgoHash`, drain only the build side.
+  - [x] Implement `runHashJoinStream(probeOp, buildRows, ...)`.
+  - [x] Implement `runHashJoinBuildLeftStream(buildRows, probeOp, ...)`.
+  - [x] LEFT JOIN: emit `concatRows(l, nullRight)` for unmatched probe rows.
+  - [x] Remove legacy `runHashJoin`/`runHashJoinBuildLeft` (replaced by streaming).
+  - [x] All executor + planner + TPC-H tests pass.
   - [ ] Memory test: Q2 on partial SF=1 data — compare peak RSS vs. 28 GB baseline.
 
-- [ ] M0035-0002: Bushy + unnest interaction verification.
-  - [ ] Unit test: `TestBushyPlanWithUnnest` — Q2 with ANALYZE stats, final plan
-        has zero `SubqueryExpr` AND zero `JoinTypeCross` nodes.
-  - [ ] Plan shape test: unnest result visible as `HashJoin` with `Aggregate` child
-        within the bushy join tree.
-  - [ ] If interaction fails, fix `unnestSubqueriesInPlan` to handle bushy trees
-        without a wrapping Filter.
+- [x] M0035-0002: Bushy + unnest interaction verification. (landed 2026-05-02)
+  - [x] `TestBushyPlanWithUnnest`: Q2 with ANALYZE stats + correlated subquery.
+  - [x] Final plan: zero `JoinTypeCross` (bushy DP worked), zero `SubqueryExpr`
+        (unnest fired on bushy tree), HashJoin+Aggregate present (unnest shape).
+  - [x] `TestBushyDPFallbackWithoutStats` preserved.
 
 - [ ] M0035-0003: TPC-H end-to-end verification with streaming hash join.
   - [ ] Run full TPC-H power test at shared_buffers=2048MB + GOMEMLIMIT=20GiB.

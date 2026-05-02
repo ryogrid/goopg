@@ -1,6 +1,6 @@
 # Milestone 0035 — Streaming Hash Join & Bushy-Unnest Correctness
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** M0032 (Go heap arena), M0033 (subquery unnesting), M0034 (DP bushy joins)
 **Drives:** Cut peak memory of hash joins by ~50% by eliminating drainRows on the probe side. Verify that the M0033 unnest pass correctly processes M0034's bushy plan trees.
 

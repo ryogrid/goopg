@@ -1,6 +1,6 @@
 # 0035-0001 — Streaming Hash Join Executor
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0035
 **Date:** 2026-05-02
 
