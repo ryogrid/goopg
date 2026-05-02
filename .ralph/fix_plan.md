@@ -382,6 +382,28 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] 22/22 TPC-H queries parse/plan/execute (100%). Verified on synthetic data.
   - [x] Documented in `analysis/tpch-feature-gaps-closed.md`.
 
+- [x] M0032-0004: HammerDB SF=1 run at shared_buffers=2000M — attempted (landed
+      2026-05-02). Documented in `analysis/tpch-hammerdb-run-002.md`.
+  - [x] Schema build: REGION–PARTSUPP loaded OK; ORDERS/LINEITEM COPY connection
+        dropped at ~430K / ~1,037K rows (HammerDB client timeout). Partial data
+        (4.1M lineitem rows) loaded.
+  - [x] Queries Q1/Q6/Q14/Q15/Q19 executed on 4.1M-row data — no crash, results
+        returned (2–3 min each for full-scan queries).
+  - [x] Memory grew to 31 GB RSS (system RAM exhausted) during query execution.
+        Manually killed to prevent swap thrashing.
+  - [x] Root cause: arena residency (2 GB) + kernel page cache (1.5 GB) + query
+        working set (6+ GB for 4M-row SeqScan/sort/aggregate) + GOMEMLIMIT=40GiB
+        preventing GC scavenge → total RSS exceeded 32 GB system RAM.
+  - [ ] Follow-up: fix HammerDB COPY connection drops (M0032-0005).
+  - [ ] Follow-up: profile Go heap, add O_DIRECT, re-test on ≥ 64 GB machine.
+
+- [ ] M0032-0005: Fix HammerDB COPY connection timeout during ORDERS/LINEITEM
+      load at SF=1. Root cause TBD — likely libpq timeout or server-side COPY
+      path taking too long between DataRow messages.
+  - [ ] Reproduce with a standalone COPY FROM STDIN over 6M rows.
+  - [ ] Profile COPY performance bottlenecks.
+  - [ ] Fix and re-test schema build at shared_buffers=2000M.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

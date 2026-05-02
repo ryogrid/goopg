@@ -65,7 +65,8 @@ export TMP="${RUNTIME_DIR}/tmp"
 mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
 
 # The shared_buffers arena is a Go heap allocation under GC control.
-# GOMEMLIMIT=40G gives the runtime a soft target well above the arena
-# size (up to 2 GB) plus query working set, so GC only scavenges under
-# extreme pressure rather than during normal TPC-H query execution.
-export GOMEMLIMIT=40GiB
+# GOMEMLIMIT=4GiB keeps the Go heap footprint constrained on ≤ 32 GB
+# machines while still accommodating the shared_buffers arena (256 MB
+# default). Larger shared_buffers values (e.g. 2000 MB) need ≥ 64 GB
+# system RAM — see analysis/tpch-hammerdb-run-002.md.
+export GOMEMLIMIT=4GiB

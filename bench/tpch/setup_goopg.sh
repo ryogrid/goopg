@@ -46,8 +46,10 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
     "${GOOPG_BIN}" init -D "${PGDATA}"
 
     # postgresql.conf knobs sized for SF=1 on a developer laptop.
-    # `shared_buffers = 256MB` is the value the M0003 handover
-    # noted as the right SF1 default for goopg.
+    # `shared_buffers = 256MB` is the proven-stable value for
+    # SF=1 on ≤ 32 GB machines. Larger values were attempted
+    # (M0032-0004) but caused RSS exhaustion; see
+    # analysis/tpch-hammerdb-run-002.md.
     {
         echo "listen_addresses = '127.0.0.1'"
         echo "port = ${PG_PORT}"
