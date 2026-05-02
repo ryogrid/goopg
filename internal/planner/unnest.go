@@ -227,6 +227,13 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 				walkExprTree(e, visit)
 			}
 		}
+	case *MultiHashJoin:
+		for _, tbl := range n.Tables {
+			walkPlanExprs(tbl, visit)
+		}
+		for _, f := range n.Filters {
+			walkExprTree(f, visit)
+		}
 	}
 }
 
@@ -401,6 +408,28 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			c.Key = cloneExprReplacingOuter(n.Key, replace)
 		}
 		return &c, nil
+	case *MultiHashJoin:
+		c := *n
+		c.Tables = make([]Node, len(n.Tables))
+		for i, tbl := range n.Tables {
+			cloned, err := clonePlanReplacingOuter(tbl, replace)
+			if err != nil {
+				return nil, err
+			}
+			c.Tables[i] = cloned
+		}
+		c.Filters = nil
+		if n.Filters != nil {
+			c.Filters = make([]Expr, len(n.Filters))
+			for i, f := range n.Filters {
+				c.Filters[i] = cloneExprReplacingOuter(f, replace)
+			}
+		}
+		c.Keys = make([]MultiHashKey, len(n.Keys))
+		for i, k := range n.Keys {
+			c.Keys[i] = k
+		}
+		return &c, nil
 	case *Values:
 		c := *n
 		c.Rows = make([][]Expr, len(n.Rows))
@@ -483,25 +512,35 @@ func cloneExprLeaf(e Expr) Expr {
 	}
 	switch x := e.(type) {
 	case *IntegerConst:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *NumericConst:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *StringConst:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *NullConst:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *BooleanConst:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *ParamRef:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *TypedStringLit:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *IntervalLit:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *ColumnRef:
-		c := *x; return &c
+		c := *x
+		return &c
 	case *OuterColumnRef:
-		c := *x; return &c
+		c := *x
+		return &c
 	default:
 		return e
 	}
@@ -541,6 +580,12 @@ func findFilterContainingSubquery(node Node, target *SubqueryExpr) (*Filter, Exp
 		return findFilterContainingSubquery(n.Child, target)
 	case *Limit:
 		return findFilterContainingSubquery(n.Child, target)
+	case *MultiHashJoin:
+		for _, tbl := range n.Tables {
+			if f, c := findFilterContainingSubquery(tbl, target); f != nil {
+				return f, c
+			}
+		}
 	}
 	return nil, nil
 }

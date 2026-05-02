@@ -357,14 +357,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// GROUP BY aggregate + hash join. See internal/planner/unnest.go.
 	node = unnestSubqueriesInPlan(node)
 
-	// TODO M0038: enable rewriteMultiWayChain after implementing
-	// column-index remapping. The MultiHashJoin outputs a different
-	// column order than the original binary join tree (scanner DFS
-	// order vs. left-deep chain order). Unnest keys reference the
-	// original positions and would become misaligned.
-	// Fix: remap Join keys by mapping old ColumnRef indices
-	// to (table, col) pairs, then to new MultiHashJoin positions.
-	// node = rewriteMultiWayChain(node)
+	// Rewrite chains of ≥3 hash-joined tables into a single
+	// MultiHashJoin node.  Column indices are remapped inside
+	// collectMultiHashTables using scanForCol, so parent
+	// expressions (incl. unnest keys) stay aligned.
+	node = rewriteMultiWayChain(node)
 
 	var agg *aggregateSurface
 	if needsAggregateStage(s) {

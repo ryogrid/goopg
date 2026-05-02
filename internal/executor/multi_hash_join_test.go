@@ -8,9 +8,6 @@ import (
 )
 
 func TestMultiHashJoinTwoTables(t *testing.T) {
-	t.Skip("M0038: null-width needs fix. Operator works via Build() dispatch; rowsOp Schema() is nil in tests only.")
-
-
 	// A[id] = B[id,val] — probe A, build B.
 	rowsA := []Row{
 		{Datum{Kind: KindInt, Int: 1}},

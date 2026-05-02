@@ -1,6 +1,6 @@
 # 0038-0001 — Multi-Way Hash Join Operator
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0038
 **Date:** 2026-05-02
 

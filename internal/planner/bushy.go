@@ -8,11 +8,11 @@ import (
 
 // joinEdge is one equijoin predicate between two FROM tables.
 type joinEdge struct {
-	leftTable  int   // index into the FROM list
+	leftTable  int // index into the FROM list
 	rightTable int
-	predicate  Expr  // the BinaryOp("=") expression
-	leftKey    Expr  // left-hand side key expression
-	rightKey   Expr  // right-hand side key expression
+	predicate  Expr // the BinaryOp("=") expression
+	leftKey    Expr // left-hand side key expression
+	rightKey   Expr // right-hand side key expression
 }
 
 // joinGraph is an undirected graph where nodes are FROM tables and
@@ -21,10 +21,10 @@ type joinGraph struct {
 	nodes     int
 	tables    []*catalog.Table
 	edges     []joinEdge
-	scans     []Node      // SeqScan nodes, index = FROM position
-	scanWidth []int       // per-table output schema width
+	scans     []Node // SeqScan nodes, index = FROM position
+	scanWidth []int  // per-table output schema width
 	bindings  []rangeBinding
-	mask      uint16      // all-nodes mask for this component
+	mask      uint16 // all-nodes mask for this component
 }
 
 // tryBushyDP checks if the bushy join DP is applicable and runs it.
@@ -475,21 +475,22 @@ func remapKeyToSubset(key Expr, subset uint16, g *joinGraph) Expr {
 		cl := *col
 		offset := int32(0)
 		for i := 0; i < g.nodes; i++ {
-			if subset&(1<<i) == 0 {
-				continue
-			}
 			w := int32(g.scanWidth[i])
-			if cl.Index >= int(offset) && cl.Index < int(offset+w) {
-				// Found the table in this subset.
-				// Compute new index within subset.
-				newOff := int32(0)
-				for j := 0; j < i; j++ {
-					if subset&(1<<j) != 0 {
-						newOff += int32(g.scanWidth[j])
+			if subset&(1<<i) != 0 {
+				if cl.Index >= int(offset) && cl.Index < int(offset+w) {
+					// Found in this table.  Compute
+					// subset-local index by counting
+					// widths of preceding tables that
+					// are also in the subset.
+					newOff := int32(0)
+					for j := 0; j < i; j++ {
+						if subset&(1<<j) != 0 {
+							newOff += int32(g.scanWidth[j])
+						}
 					}
+					cl.Index = int(newOff + (int32(cl.Index) - offset))
+					return &cl
 				}
-				cl.Index = int(newOff + (int32(cl.Index) - offset))
-				return &cl
 			}
 			offset += w
 		}
@@ -514,17 +515,15 @@ func markEdgesInMask(mask uint16, g *joinGraph, used []bool) {
 // a valid chain (≥3 tables, all JoinAlgoHash, all inner, chained).
 func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 	var scans []Node
+	var scanWidths []int // number of columns in each scan's output
 	var keys []MultiHashKey
-
-	// Map from SeqScan node pointer to table index.
-	scanIdx := make(map[Node]int)
 
 	var walk func(n Node) bool
 	walk = func(n Node) bool {
 		if s, ok := n.(*SeqScan); ok {
-			idx := len(scans)
+			sz := len(s.Output())
+			scanWidths = append(scanWidths, sz)
 			scans = append(scans, s)
-			scanIdx[n] = idx
 			return true
 		}
 		// Stop at scope boundaries: aggregate, sort, project,
@@ -545,25 +544,42 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 		if !ok || j.Algo != JoinAlgoHash || j.Type != JoinTypeInner {
 			return false
 		}
-		if !walk(j.Left) || !walk(j.Right) {
+		leftStart := len(scans)
+		if !walk(j.Left) {
 			return false
 		}
-		// Record the equijoin edge between left and right.
-		li := scanIdx[j.Left]
-		ri := scanIdx[j.Right]
-		if li < len(scans) && ri < len(scans) {
-			key := MultiHashKey{
-				LeftTable: li, LeftCol: 0,
-				RightTable: ri, RightCol: 0,
-			}
-			// Find correct column indices from the expression.
-			if lk, ok := j.LeftKey.(*ColumnRef); ok {
-				key.LeftCol = lk.Index
-			}
-			if rk, ok := j.RightKey.(*ColumnRef); ok {
-				key.RightCol = rk.Index
-			}
-			keys = append(keys, key)
+		leftEnd := len(scans) // right subtree starts here
+		if !walk(j.Right) {
+			return false
+		}
+		rightEnd := len(scans)
+
+		// Determine which scan and column the left/right join keys
+		// reference.  LeftKey.ColumnRef.Index is relative to the
+		// left child's output schema.  RightKey.ColumnRef.Index
+		// was shifted by left child output width in
+		// buildJoinFromDP — we un-shift before searching the
+		// right subtree's scans.
+		li, lc := scanForCol(scanWidths, leftStart, leftEnd, j.LeftKey)
+
+		leftWidth := 0
+		for i := leftStart; i < leftEnd; i++ {
+			leftWidth += scanWidths[i]
+		}
+		rightKey := j.RightKey
+		if cr, ok := rightKey.(*ColumnRef); ok {
+			adjusted := *cr
+			adjusted.Index -= leftWidth
+			rightKey = &adjusted
+		}
+		ri, rc := scanForCol(scanWidths, leftEnd, rightEnd, rightKey)
+		if li >= 0 && ri >= 0 {
+			keys = append(keys, MultiHashKey{
+				LeftTable:  li,
+				LeftCol:    lc,
+				RightTable: ri,
+				RightCol:   rc,
+			})
 		}
 		return true
 	}
@@ -582,6 +598,24 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 	return scans, keys, probeIdx
 }
 
+// scanForCol maps a ColumnRef (whose index is relative to the
+// schema of scans[start..end)) back to the global scan index and
+// the per-scan column offset.
+func scanForCol(widths []int, start, end int, key Expr) (scanIdx int, colInScan int) {
+	cr, ok := key.(*ColumnRef)
+	if !ok {
+		return -1, 0
+	}
+	relOff := 0
+	for i := start; i < end; i++ {
+		if cr.Index >= relOff && cr.Index < relOff+widths[i] {
+			return i, cr.Index - relOff
+		}
+		relOff += widths[i]
+	}
+	return -1, 0
+}
+
 // rewriteMultiWayChain walks the plan tree and replaces chains of
 // ≥3 hash-joined tables with MultiHashJoin nodes.
 func rewriteMultiWayChain(node Node) Node {
@@ -589,24 +623,24 @@ func rewriteMultiWayChain(node Node) Node {
 		return nil
 	}
 	scans, keys, probeIdx := collectMultiHashTables(node)
-		if scans == nil {
-			// Not a valid chain — recurse into children.
-			// Only recurse into Join (binary ops) and thin wrappers
-			// (Filter, Project, Sort). Do NOT recurse into Aggregate:
-			// crossing a plan-phase boundary mixes table scopes.
-			switch n := node.(type) {
-			case *Join:
-				n.Left = rewriteMultiWayChain(n.Left)
-				n.Right = rewriteMultiWayChain(n.Right)
-			case *Filter:
-				n.Child = rewriteMultiWayChain(n.Child)
-			case *Project:
-				n.Child = rewriteMultiWayChain(n.Child)
-			case *Sort:
-				n.Child = rewriteMultiWayChain(n.Child)
-			}
-			return node
+	if scans == nil {
+		// Not a valid chain — recurse into children.
+		// Only recurse into Join (binary ops) and thin wrappers
+		// (Filter, Project, Sort). Do NOT recurse into Aggregate:
+		// crossing a plan-phase boundary mixes table scopes.
+		switch n := node.(type) {
+		case *Join:
+			n.Left = rewriteMultiWayChain(n.Left)
+			n.Right = rewriteMultiWayChain(n.Right)
+		case *Filter:
+			n.Child = rewriteMultiWayChain(n.Child)
+		case *Project:
+			n.Child = rewriteMultiWayChain(n.Child)
+		case *Sort:
+			n.Child = rewriteMultiWayChain(n.Child)
 		}
+		return node
+	}
 
 	// Build MultiHashJoin node.
 	mh := &MultiHashJoin{

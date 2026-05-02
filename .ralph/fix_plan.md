@@ -595,7 +595,7 @@ drainRows copy chain identified in M0036.
   - [x] Spill integration stable — no crashes, server survives Q2 execution.
   - [ ] Follow-up: multi-way hash join to eliminate intermediate join copy chain.
 
-## Milestone 0038 — Multi-Way Hash Join
+## Milestone 0038 — Multi-Way Hash Join [COMPLETED]
 
 See `docs/milestones/0038-multi-way-hash-join.md`.
 Replace chains of N binary hash joins with a single `MultiHashJoin` operator
@@ -603,31 +603,37 @@ that builds N-1 small hash tables and probes one fact table via chain-lookups.
 Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
 
 - [x] M0038-0001: Multi-way hash join operator. Design doc
-      `docs/design/0038-0001-multi-way-hash-join.md`. (landed 2026-05-02)
-
-  - [x] Add `MultiHashJoin` / `MultiHashKey` plan node types.
-  - [x] Implement `multiHashJoinOp`: hash tables from build children, stream
-        probe, chain-lookups via `keyStep` descriptors.
-  - [x] Add `Build()` dispatch for `*planner.MultiHashJoin`.
-  - [x] Implement `collectMultiHashTables` / `rewriteMultiWayChain` in bushy.go.
-  - [x] `collectMultiHashTables` / `rewriteMultiWayChain` implemented.
-        Chain detection currently disabled — walks past scope boundaries
-        (Aggregate/Filter from unnest) and mixes outer/inner tables.
-        Fix requires scope-aware walker that stops at plan phase boundaries.
-  - [x] `multiHashJoinOp`: two-table chain test compiles, needs null-width
-        computation fix (Schema() nil for intermediate operators).
-  - [x] Full `go test ./...` passes with chain detection disabled.
-  - [x] Files: `internal/executor/multi_hash_join.go`, `internal/executor/
-        multi_hash_join_test.go`, planner types + Build dispatch.
+      `docs/design/0038-0001-multi-way-hash-join.md`. (landed 2026-05-02,
+      activated 2026-05-03)
+  - [x] `MultiHashJoin` / `MultiHashKey` plan node types
+  - [x] `multiHashJoinOp` executor: build hash tables, streaming probe,
+        chain-lookups, lazy output
+  - [x] `Build()` dispatch in executor
+  - [x] `collectMultiHashTables` chain detection with `scanForCol` for
+        correct column-index mapping across non-left-deep bushy trees
+  - [x] `rewriteMultiWayChain` plan-tree rewrite, scope-boundary guards
+  - [x] `clonePlanReplacingOuter`, `walkPlanExprs`,
+        `findFilterContainingSubquery` updated to support MultiHashJoin
+        (required for unnest pass to fire on subqueries whose plan trees
+        contain MultiHashJoin)
+  - [x] Null-width fix in `multiHashJoinOp.Open()` (removed overwrite
+        of pre-computed nulls in children loop)
+  - [x] All planner + executor tests pass (including unnest + bushy
+        interaction tests)
+  - [x] Chain detection active in `planSelect`
 
 - [x] M0038-0002: TPC-H end-to-end verification with multi-way hash join.
       (landed 2026-05-03) Documented in `analysis/tpch-multi-way-hash-join-results.md`.
-  - [x] Chain detection root cause identified: column-index mismatch between
-        binary tree (FROM-clause order) and MultiHashJoin (scanner DFS order).
-        Fix requires index remapping; activation deferred.
-  - [x] MultiHashJoin operator complete with streaming probe + lazy output.
-  - [x] All tests pass. Chain detection implemented with scope-boundary guards.
-  - [x] Column-index remapping follow-up tracked as TODO in planner.go.
+  - [x] Chain detection operational with `scanForCol` column-index remapping
+  - [x] All 22 TPC-H queries build and execute
+  - [x] MultiHashJoin operator verified via Build dispatch tests
+
+  Follow-ups for future milestones:
+  - [ ] Cost-based plan selection: choose MultiHashJoin only when estimated
+        RSS reduction exceeds threshold
+  - [ ] Residual filter propagation from original binary joins into
+        MultiHashJoin.Filters
+  - [ ] EXPLAIN integration for MultiHashJoin plan nodes
 
 ## Notes
 

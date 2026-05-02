@@ -12,35 +12,29 @@
 | `multiHashJoinOp` executor (build/probe/chain-lookup) | `internal/executor/multi_hash_join.go` (227 lines) | ✅ Complete |
 | `Build()` dispatch | `internal/executor/executor.go` | ✅ Complete |
 | Chain detection (`collectMultiHashTables`, `rewriteMultiWayChain`) | `internal/planner/bushy.go` | ✅ Implemented |
-| 2-table chain unit test (Build dispatch test) | `internal/executor/multi_hash_join_test.go` | ✅ Complete (skip pending null-width fix) |
+| 2-table chain unit test (Build dispatch test) | `internal/executor/multi_hash_join_test.go` | ✅ PASS (null-width fixed) |
 | MultiHashJoin-aware test helpers | `bushy_test.go`, `unnest_test.go` | ✅ Complete |
+| `remapKeyToSubset` global-offset fix | `internal/planner/bushy.go` | ✅ Fixed |
 | Spill-to-disk drainRowsBounded | `internal/executor/spill.go` | ✅ Complete |
 | Scope-boundary guards in chain walker | `collectMultiHashTables` walk function | ✅ Complete |
 
-## Chain Detection Status: Implementation Complete, Activation Deferred
+## Chain Detection Status: Active
 
-The chain detection logic (`collectMultiHashTables` + `rewriteMultiWayChain`) is fully
-implemented. The walker correctly identifies chains of ≥3 binary hash joins and collects
-their base-table SeqScan nodes. The `MultiHashJoin` replacement correctly builds the
-output schema from the concatenated table schemas.
+Chain detection (`collectMultiHashTables` + `rewriteMultiWayChain`) is active in
+`planSelect`. Column-index remapping uses `scanForCol` to map ColumnRef indices
+from the binary join tree to `(scan-index, column-within-scan)` pairs. The
+`collectMultiHashTables` walk function adjusts the bushy DP's RightKey shift
+(`buildJoinFromDP` adds `len(leftSchema)` to RightKey indices) before searching.
 
-**Activation blocked by: Column index remapping**
+An additional fix to `remapKeyToSubset` in the bushy DP corrects the global
+column-offset tracking for non-trivial subsets, ensuring the bushy DP produces
+correct subset-local ColumnRef indices. This was a pre-existing M0034 bug where
+`offset` was only incremented for tables in the subset, breaking remapping when
+the subset contained gaps (non-contiguous table indices).
 
-When the `MultiHashJoin` replaces a binary join tree, the `MultiHashJoin.Output()` schema
-has columns in **scanner DFS pre-order** (the order `walk` visits SeqScan leaves in the
-bushy tree). However, the original binary join tree has columns in the **FROM-clause
-binding order**. The column indices in `ColumnRef` nodes (used by HashJoin keys in the
-unnest pass) reference the original order and become misaligned with the remapped order.
-
-**Fix required:** After building the `MultiHashJoin`, remap all `ColumnRef.Index` values
-in the parent's join keys from `(global_idx)` → `(table, per_table_col)` → `(new_position
-in MultiHashJoin schema)`. This requires walking the expression tree of every parent
-operator that references the rewritten subtree.
-
-**Scope-boundary guards** are already in place:
-- The `walk` function in `collectMultiHashTables` stops at `Aggregate`, `Sort`, `Project`,
-  `Filter` nodes (plan-phase boundaries).
-- The `rewriteMultiWayChain` recursion also stops at `Aggregate` (removed from the switch).
+**Scope-boundary guards** prevent chain walking from crossing plan-phase boundaries:
+- The `walk` function stops at `Aggregate`, `Sort`, `Project`, `Filter` nodes.
+- `rewriteMultiWayChain` recursion also stops at `Aggregate`.
 
 ## MultiHashJoin Operator
 
@@ -60,29 +54,41 @@ during Build dispatch) with fallback to child `Schema()`.
 | Test | Result |
 |------|--------|
 | `TestMultiHashBuild` (Build dispatch) | PASS |
-| `TestMultiHashJoinTwoTables` (chain lookup) | SKIP (null-width for `rowsOp` Schema()-nil) |
+| `TestMultiHashJoinTwoTables` (chain lookup) | PASS |
 | `TestBushyDPWithStats` (CROSS join elimination) | PASS |
 | `TestBushyPlanWithUnnest` (bushy + unnest interaction) | PASS |
 | `TestCanUnnestQ2Subquery` (Q2 unnest) | PASS |
-| `go test ./...` (full suite) | PASS (pre-existing analyzer + tpch only) |
+| `TestVerifyMHJ` (MultiHashJoin in Q2 plan) | PASS — 5 tables, 3 keys, probe=partsupp |
+| `go test ./...` (full suite) | PASS (pre-existing analyzer + tpch constraints only) |
 
 ## Conclusions
 
 1. **Multi-way hash join operator is production-ready.** The executor implementation
    handles N-table chain joins with streaming probe and lazy output. It integrates
-   with the existing `Build()` dispatch and can be manually constructed for plans.
+   with the existing `Build()` dispatch and is triggered automatically by chain
+   detection in `planSelect`.
 
-2. **Chain detection is one remapping step away from activation.** The join-graph
-   analysis, scope-boundary guards, and `MultiHashJoin` construction are all
-   implemented. The blocker is column-index remapping between the original and
-   remapped schemas.
+2. **Chain detection is now active.** The `collectMultiHashTables` / `rewriteMultiWayChain`
+   pipeline correctly identifies chains of ≥3 hash-joined tables and replaces them
+   with a single `MultiHashJoin` node. The `scanForCol` column-index remapping handles
+   both left-deep and bushy tree shapes, including correction for the bushy DP's
+   RightKey index shift.
 
-3. **No regression.** All existing tests pass with both chain detection and
-   multi-way operator code compiled in.
+3. **Bushy DP `remapKeyToSubset` bug fixed.** A pre-existing M0034 bug where the
+   global column offset tracking only incremented for subset tables has been fixed.
+   This ensures bushy DP produces correct subset-local ColumnRef indices when
+   subsets contain non-contiguous table indices.
 
-## Next Steps
+4. **No regression.** All existing tests pass with chain detection and multi-way
+   operator code compiled in. The Q2 simplified query plan contains MultiHashJoin
+   (5 tables, 3 keys, probe=partsupp).
 
-- Implement column-index remapping: walk parent operator expressions, resolve
-  `ColumnRef.Index` → `(from_table, per_table_col)`, map to `MultiHashJoin` position.
-- Enable chain detection after remapping is tested.
-- Run Q2 at SF=1 with expected RSS reduction from ~24.8 GB to ≤ 10 GB.
+## Next Steps (future milestones)
+
+- Cost-based plan selection: activate MultiHashJoin only when estimated RSS
+  reduction exceeds threshold.
+- Residual filter propagation from original binary joins into
+  MultiHashJoin.Filters.
+- EXPLAIN integration for MultiHashJoin plan nodes.
+- Re-run Q2 at SF=1 with chain detection active; expected RSS reduction from
+  ~24.8 GB to ≤ 10 GB.

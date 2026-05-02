@@ -11,11 +11,11 @@ import (
 type multiHashJoinOp struct {
 	plan     *planner.MultiHashJoin
 	children []Operator
-	hashTbls []map[string]Row   // one per build child
+	hashTbls []map[string]Row // one per build child
 	probeOp  Operator
-	keySteps []keyStep          // ordered lookup chain
+	keySteps []keyStep // ordered lookup chain
 	filters  []planner.Expr
-	nulls    []Row              // null-padded rows for schema
+	nulls    []Row // null-padded rows for schema
 	schema   planner.Schema
 	ctx      *Context
 }
@@ -62,7 +62,6 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 
 	// Open all build children and drain them into hash tables.
 	for i, child := range o.children {
-		o.nulls[i] = nullRow(len(child.Schema()))
 		if i == o.plan.ProbeTable {
 			continue // probe table is streamed
 		}
