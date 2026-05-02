@@ -337,6 +337,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	// Unnest correlated scalar subqueries after predicate pushdown
+	// has finalised the join tree. Subqueries that are unnestable
+	// (equijoin correlation, simple aggregate) are rewritten as
+	// GROUP BY aggregate + hash join. See internal/planner/unnest.go.
+	node = unnestSubqueriesInPlan(node)
+
 	var agg *aggregateSurface
 	if needsAggregateStage(s) {
 		var having Expr

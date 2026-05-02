@@ -1,6 +1,6 @@
 # 0033-0001 — Planner-Level Subquery Unnesting
 
-**Status:** draft  
+**Status:** accepted  
 **Parent milestone:** M0033  
 **Date:** 2026-05-02
 

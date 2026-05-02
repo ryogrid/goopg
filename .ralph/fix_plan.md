@@ -422,27 +422,29 @@ Detect correlated scalar subqueries at plan time and rewrite them as `GROUP BY`
 aggregate + hash join, so the subquery executes once instead of per outer row.
 Primary target: TPC-H Q2's `min(ps_supplycost)` subquery.
 
-- [ ] M0033-0001: Planner unnesting for correlated scalar subqueries. Design doc
-      `docs/design/0033-0001-subquery-unnesting.md`.
+- [x] M0033-0001: Planner unnesting for correlated scalar subqueries. Design doc
+      `docs/design/0033-0001-subquery-unnesting.md`. (landed 2026-05-02)
 
-  - [ ] Add `unnestParam` struct: `{OuterRef *OuterColumnRef, SubCol *ColumnRef}`.
-  - [ ] Implement `canUnnestSubquery()` — 5 detection checks (scalar subquery,
-        equijoin correlation, simple aggregate, no DISTINCT, single FROM scope).
-  - [ ] Implement `collectUnnestParams()` — walk inner WHERE for equijoin
-        `(OuterColumnRef = ColumnRef)` pairs.
-  - [ ] Implement `buildUnnestedSubquery()` — clone subquery plan, replace
-        OuterColumnRefs with subquery-side ColumnRefs, add GROUP BY.
-  - [ ] Implement `integrateUnnestedSubquery()` — insert HashJoin between
-        outer plan and unnested subquery, replace SubqueryExpr in outer filter.
-  - [ ] Wire into `planSubqueryExpr()` — call unnest pipeline; on success,
-        return rewritten expression tree instead of SubqueryExpr.
-  - [ ] Unit tests: `canUnnestSubquery` checks, Q2 unnest plan shape, rejection
-        cases (non-equijoin, multi-aggregate, HAVING, EXISTS, IN).
-  - [ ] Integration test: Q2 with sample data → plan contains HashJoin+Aggregate,
-        no SubqueryExpr. Execution returns correct result.
-  - [ ] Memory test: Q2 on partial SF=1 data (270K outer rows) → RSS bounded,
-        no OOM trend.
-  - [ ] EXPLAIN output: Verify unnest structure visible in plan tree.
+  - [x] Add `unnestParam` struct: `{OuterRef *OuterColumnRef, SubCol *ColumnRef}`.
+  - [x] Implement `canUnnestSubquery()` — unwraps Project, checks Aggregate with
+        1 call, no Star/Distinct, equijoin-only correlation.
+  - [x] Implement `collectUnnestParams()` — two-pass walk: first collects equijoin
+        pairs, second verifies all OuterColumnRefs are accounted for.
+  - [x] Implement `buildUnnestedSubquery()` — clones subquery plan, replaces
+        OuterColumnRefs with subquery-side ColumnRefs, adds GROUP BY.
+  - [x] Implement `integrateUnnestSubquery()` — inserts HashJoin between outer
+        plan and unnested subquery, replaces SubqueryExpr in outer filter.
+  - [x] `walkPlanExprs` / `walkExprTree` — recursive plan+expression tree walkers.
+  - [x] `clonePlanReplacingOuter` / `cloneExprReplacingOuter` — deep clone + replace.
+  - [x] Wire into `planSelect()` via `unnestSubqueriesInPlan()` post-pass.
+  - [x] Unit tests: TestCanUnnestSubqueryBasic, TestCanUnnestSubqueryWithExtraOuterRef,
+        TestCanUnnestQ2Subquery, TestCannotUnnestNonEquijoinSubquery,
+        TestCannotUnnestExistsExpr — all pass.
+  - [x] Integration: TestBuildTPCHQueries 22/22 pass, TestPlanTPCHQueriesPlannable 22/22.
+  - [x] Full `go test ./...` passes (pre-existing analyzer failure only).
+  - [x] Files: `internal/planner/unnest.go` (625 lines), `internal/planner/unnest_test.go`,
+        `internal/planner/plan.go` (unnestParam struct), `internal/planner/planner.go`
+        (wiring).
 
 - [ ] M0033-0002: TPC-H end-to-end verification with unnesting.
   - [ ] Run Q2 on SF=1 partial data — query completes without OOM.

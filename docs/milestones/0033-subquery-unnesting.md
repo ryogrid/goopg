@@ -1,6 +1,6 @@
 # Milestone 0033 — Planner-Level Subquery Unnesting
 
-**Status:** planned  
+**Status:** accepted  
 **Depends on:** Milestone 0031 (Q2 memory analysis identifies the bottleneck), Milestone 0003 (planner foundation and hash join)  
 **Drives:** Eliminate per-row subquery re-execution in Q2 and similar correlated scalar subqueries, making TPC-H Q2 executable at SF=1 without unbounded memory growth.
 

@@ -204,6 +204,14 @@ type OuterColumnRef struct {
 func (e *OuterColumnRef) Pos() int { return e.pos }
 func (*OuterColumnRef) exprNode()  {}
 
+// unnestParam records one correlation pair extracted from an
+// unnestable subquery: the outer-scope column reference and
+// the subquery-side column it is equijoined with.
+type unnestParam struct {
+	OuterRef *OuterColumnRef
+	SubCol   *ColumnRef
+}
+
 // ParamRef passes through a bind-parameter placeholder. The executor
 // supplies values at execute time.
 type ParamRef struct {
