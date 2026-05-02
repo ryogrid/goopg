@@ -533,6 +533,35 @@ Verify that M0033's unnest pass correctly processes M0034's bushy plan trees.
   - [x] Materializing Volcano model confirmed as the root cause: every operator
         stores full output in `o.rows`, compounding at each join level.
 
+## Milestone 0036 — Hash Join Lazy Materialization (On-Demand Output)
+
+See `docs/milestones/0036-hash-join-lazy-materialization.md`.
+Eliminate `o.rows` accumulation in hash joins — yield joined rows on demand
+via `Next()` instead of pre-computing all matches during `Open()`. Memory drops
+from ~1.8 GB to ~420 MB per join level (77% reduction).
+
+- [ ] M0036-0001: Lazy hash join output. Design doc
+      `docs/design/0036-0001-lazy-hash-join-materialization.md`.
+
+  - [ ] Add lazy-state fields to `joinOp`: `probeOp`, `hashTbl`, `lazyRow`,
+        `lazyMatches`, `lazyMatchIdx`, `lazyActive`, widths, `lazyBuildLeft`.
+  - [ ] `Open()`: build hash table, store probeOp, set `lazyActive = false`.
+        Do NOT populate `o.rows`.
+  - [ ] `Next()`: if `lazyActive`, continue serving matches from `lazyMatches`.
+        Else pull next probe row, look up hash table, emit concatRows.
+  - [ ] LEFT JOIN: unmatched probe rows emit `concatRows(l, nullRight)`.
+  - [ ] `BuildLeft` variant: symmetric — build left, probe right.
+  - [ ] Merge and nested-loop unchanged (still materialize in o.rows).
+  - [ ] Unit tests: TestLazyHashJoinINNER, TestLazyHashJoinLEFT,
+        TestLazyHashJoinBuildLeft, TestLazyHashJoinCorrectness (vs buffered).
+  - [ ] Integration: 22/22 TPC-H queries build and execute.
+
+- [ ] M0036-0002: Q2 end-to-end verification with lazy hash join.
+  - [ ] Run Q2 on partial SF=1 data at shared_buffers=2048MB + GOMEMLIMIT=20GiB.
+  - [ ] Peak RSS < 15 GB (vs 30 GB baseline from M0035-0003).
+  - [ ] Q2 completes within minutes (not timing out).
+  - [ ] Document results in `analysis/tpch-lazy-hash-join-results.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

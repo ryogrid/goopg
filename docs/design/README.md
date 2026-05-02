@@ -189,4 +189,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0035-0001 | [Streaming Hash Join Executor](0035-0001-streaming-hash-join.md) | draft | Drain only build side of hash joins; probe streams via Operator.Next(). |
 
+| 0036-0001 | [Lazy Hash Join Materialization](0036-0001-lazy-hash-join-materialization.md) | draft | Eliminate o.rows accumulation in hash joins — yield joined rows on demand via Next(). Memory drops from ~1.8 GB to ~420 MB per join. |
+
 Append new rows in numeric order. Do not reorder.
