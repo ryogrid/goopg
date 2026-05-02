@@ -8,15 +8,10 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 )
 
-// joinOp is a nested-loop implementation that buffers both children
-// in Open and emits joined rows from an in-memory result slice.
-//
-// The executor always builds a joinOp; the per-row inner loop
-// dispatches on plan.Algo, picking hash-join for JoinAlgoHash,
-// merge-join for JoinAlgoMerge, and nested-loop otherwise.
-// Wrapping all algos in
-// one operator keeps schema/Open/Close/Next unified — algo
-// selection is just a buffering strategy choice.
+// joinOp is a join operator that dispatches on plan.Algo.
+// Hash joins use lazy materialization (M0036): joined rows are
+// yielded on demand via Next() instead of pre-computed in o.rows.
+// Merge and nested-loop still materialize in o.rows.
 type joinOp struct {
 	plan   *planner.Join
 	left   Operator
@@ -26,6 +21,16 @@ type joinOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+
+	// M0036 lazy-output state (hash join only)
+	lazyHash    map[string][]Row // build-side hash table
+	lazyProbe   Operator         // probe side (streaming)
+	lazyRow     Row              // current probe row
+	lazyMatches []Row            // matches for current probe row (borrowed from lazyHash)
+	lazyMatchIdx int
+	lazyActive  bool // true between probeRow and last match
+	lazyLW      int  // left schema width
+	lazyRW      int  // right schema width
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -40,7 +45,7 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	if o.plan.Algo == planner.JoinAlgoHash {
-		return o.openStreamingHashJoin(ctx)
+		return o.openLazyHashJoin(ctx)
 	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
@@ -112,131 +117,50 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 	return nil
 }
 
-// openStreamingHashJoin opens a hash join where only the build
-// side is drained into memory. The probe side streams one row at
-// a time via Operator.Next(). This cuts peak memory by eliminating
-// the probe-side drainRows deep copy.
-func (o *joinOp) openStreamingHashJoin(ctx *Context) error {
+// openLazyHashJoin builds a hash table from the build side and sets
+// up lazy output: joined rows are yielded on demand via Next().
+func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
+	o.lazyLW = leftWidth
+	o.lazyRW = rightWidth
 	if o.plan.BuildLeft {
-		if err := o.left.Open(ctx); err != nil {
-			return err
-		}
+		if err := o.left.Open(ctx); err != nil { return err }
 		buildRows, err := drainRows(o.left)
-		if err != nil {
-			return err
-		}
+		if err != nil { return err }
 		_ = o.left.Close()
 		if leftWidth == 0 && len(buildRows) > 0 {
-			leftWidth = len(buildRows[0])
+			leftWidth = len(buildRows[0]); o.lazyLW = leftWidth
 		}
-		if err := o.right.Open(ctx); err != nil {
-			return err
+		nullRight := nullRow(rightWidth)
+		o.lazyHash = make(map[string][]Row, len(buildRows))
+		for _, l := range buildRows {
+			key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRight))
+			if err != nil { return err }
+			if !ok { continue }
+			o.lazyHash[key] = append(o.lazyHash[key], l)
 		}
-		return o.runHashJoinBuildLeftStream(buildRows, leftWidth, rightWidth)
+		if err := o.right.Open(ctx); err != nil { return err }
+		o.lazyProbe = o.right
+		return nil
 	}
-	// Default: build right, probe left.
-	if err := o.right.Open(ctx); err != nil {
-		return err
-	}
+	if err := o.right.Open(ctx); err != nil { return err }
 	buildRows, err := drainRows(o.right)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	_ = o.right.Close()
 	if rightWidth == 0 && len(buildRows) > 0 {
-		rightWidth = len(buildRows[0])
+		rightWidth = len(buildRows[0]); o.lazyRW = rightWidth
 	}
-	if err := o.left.Open(ctx); err != nil {
-		return err
-	}
-	return o.runHashJoinStream(buildRows, leftWidth, rightWidth)
-}
-
-// runHashJoinStream builds a hash table from buildRows (right side)
-// and streams probe rows from o.left. INNER and LEFT only.
-func (o *joinOp) runHashJoinStream(buildRows []Row, leftWidth, rightWidth int) error {
 	nullLeft := nullRow(leftWidth)
-	nullRight := nullRow(rightWidth)
-
-	rightHash := make(map[string][]Row, len(buildRows))
+	o.lazyHash = make(map[string][]Row, len(buildRows))
 	for _, r := range buildRows {
 		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		rightHash[key] = append(rightHash[key], r)
+		if err != nil { return err }
+		if !ok { continue }
+		o.lazyHash[key] = append(o.lazyHash[key], r)
 	}
-
-	for {
-		l, err := o.left.Next()
-		if err == EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRight))
-		if err != nil {
-			return err
-		}
-		matches := rightHash[key]
-		if !ok {
-			matches = nil
-		}
-		matched := false
-		for _, r := range matches {
-			matched = true
-			o.rows = append(o.rows, concatRows(l, r))
-		}
-		if !matched && o.plan.Type == planner.JoinTypeLeft {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-		}
-	}
-	return nil
-}
-
-// runHashJoinBuildLeftStream is the BuildLeft=true streaming
-// variant: drains left as build side, streams right as probe.
-func (o *joinOp) runHashJoinBuildLeftStream(buildRows []Row, leftWidth, rightWidth int) error {
-	nullLeft := nullRow(leftWidth)
-	nullRight := nullRow(rightWidth)
-
-	leftHash := make(map[string][]Row, len(buildRows))
-	for _, l := range buildRows {
-		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRight))
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		leftHash[key] = append(leftHash[key], l)
-	}
-
-	for {
-		r, err := o.right.Next()
-		if err == EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		for _, l := range leftHash[key] {
-			o.rows = append(o.rows, concatRows(l, r))
-		}
-	}
+	if err := o.left.Open(ctx); err != nil { return err }
+	o.lazyProbe = o.left
 	return nil
 }
 
@@ -412,6 +336,10 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 }
 
 func (o *joinOp) Next() (Row, error) {
+	// M0036 lazy output: yield joined rows on demand.
+	if o.lazyProbe != nil {
+		return o.nextLazy()
+	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -420,8 +348,70 @@ func (o *joinOp) Next() (Row, error) {
 	return row, nil
 }
 
+// nextLazy yields one joined row at a time for lazy hash joins.
+func (o *joinOp) nextLazy() (Row, error) {
+	nullLeft := nullRow(o.lazyLW)
+	nullRight := nullRow(o.lazyRW)
+	for {
+		// Continue serving matches from current probe row.
+		if o.lazyActive && o.lazyMatchIdx < len(o.lazyMatches) {
+			m := o.lazyMatches[o.lazyMatchIdx]
+			o.lazyMatchIdx++
+			if o.plan.BuildLeft {
+				return concatRows(m, o.lazyRow), nil
+			}
+			return concatRows(o.lazyRow, m), nil
+		}
+		o.lazyActive = false
+		// Pull next probe row.
+		r, err := o.lazyProbe.Next()
+		if err == EOF {
+			return nil, EOF
+		}
+		if err != nil {
+			return nil, err
+		}
+		o.lazyRow = r
+		var key string
+		var ok bool
+		if o.plan.BuildLeft {
+			// Build left: probe is right. Hash key from right row.
+			key, ok, err = o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
+		} else {
+			// Build right: probe is left. Hash key from left row.
+			key, ok, err = o.evalHashKey(o.plan.LeftKey, concatRows(r, nullRight))
+		}
+		if err != nil {
+			return nil, err
+		}
+		matches := o.lazyHash[key]
+		if !ok {
+			matches = nil
+		}
+		if len(matches) == 0 {
+			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
+				// LEFT JOIN: preserve unmatched left rows.
+				o.lazyRow = nil
+				return concatRows(r, nullRight), nil
+			}
+			// No matches, not LEFT — skip this probe row.
+			continue
+		}
+		o.lazyMatches = matches
+		o.lazyMatchIdx = 0
+		o.lazyActive = true
+		// Continue loop to yield first match.
+	}
+}
+
 func (o *joinOp) Close() error {
 	o.rows = nil
+	o.lazyHash = nil
+	o.lazyProbe = nil
+	o.lazyRow = nil
+	o.lazyMatches = nil
+	o.lazyMatchIdx = 0
+	o.lazyActive = false
 	o.ctx = nil
 	o.idx = 0
 	errL := o.left.Close()

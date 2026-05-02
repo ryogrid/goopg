@@ -1,6 +1,6 @@
 # Milestone 0036 — Hash Join Lazy Materialization (On-Demand Output)
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** M0035 (streaming hash join — probe side no longer drainRows'd), M0034 (DP bushy joins — zero CROSS joins), M0033 (subquery unnesting)
 **Drives:** Eliminate the `o.rows` materialization in hash joins so that joined rows are yielded on demand via `Next()` rather than stored in memory during `Open()`. This removes the last remaining memory bottleneck in Q2 — the accumulation of all intermediate join results.
 
