@@ -1059,7 +1059,13 @@ func resolveTable(ctx *scope, rv parser.RangeVar) (*catalog.Table, error) {
 func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	body := cte.Query
 	if body.SetOp == nil || body.SetOp.Type != parser.SetOpUnion || !body.SetOp.All {
-		return analyzeError(cte.Pos(), "0A000", "WITH RECURSIVE requires UNION ALL")
+		// No recursive self-join — just analyse the body as a
+		// regular CTE.  The planner enforces the UNION ALL
+		// requirement for true recursive CTEs.
+		if err := analyzeSelectWithParent(body, ctx.cat, ctx); err != nil {
+			return err
+		}
+		return registerAnalyzedCTE(cte, ctx)
 	}
 
 	// Analyze the anchor (left side) without the CTE in scope.
@@ -1102,9 +1108,9 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		colAliases[i] = c.Name
 	}
 	ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{
-		Name:       cte.Name,
-		Columns:    cols,
-		Virtual:    true,
+		Name:              cte.Name,
+		Columns:           cols,
+		Virtual:           true,
 		ViewColumnAliases: colAliases,
 	}
 
@@ -1146,43 +1152,47 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 		if err := analyzeSelectWithParent(cte.Query, ctx.cat, ctx); err != nil {
 			return err
 		}
-		// Build the synthetic catalog.Table mirroring
-		// synthesizeSubqueryTable.
-		innerCtx := &scope{cat: ctx.cat, parent: ctx}
-		if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
-			rels, err := buildSelectScopeIn(cte.Query, innerCtx)
-			if err != nil {
-				return err
-			}
-			innerCtx.rels = rels
+		if err := registerAnalyzedCTE(cte, ctx); err != nil {
+			return err
 		}
-		innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-		for i, tgt := range cte.Query.Targets {
-			name := tgt.Alias
-			if name == "" {
-				name = deriveAnalyzerTargetName(tgt.Expr)
-			}
-			if name == "" {
-				name = fmt.Sprintf("?column?%d", i+1)
-			}
-			typ, err := analyzeExpr(tgt.Expr, innerCtx)
-			if err != nil {
-				return err
-			}
-			innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
-		}
-		// Apply column-alias list if specified. Arity must match.
-		if len(cte.Columns) > 0 {
-			if len(cte.Columns) != len(innerCols) {
-				return analyzeError(cte.Pos(), "42P10",
-					fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
-			}
-			for i, alias := range cte.Columns {
-				innerCols[i].Name = alias
-			}
-		}
-		ctx.ctes[nameKey] = &catalog.Table{Name: cte.Name, Columns: innerCols}
 	}
+	return nil
+}
+
+func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
+	innerCtx := &scope{cat: ctx.cat, parent: ctx}
+	if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
+		rels, err := buildSelectScopeIn(cte.Query, innerCtx)
+		if err != nil {
+			return err
+		}
+		innerCtx.rels = rels
+	}
+	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
+	for i, tgt := range cte.Query.Targets {
+		name := tgt.Alias
+		if name == "" {
+			name = deriveAnalyzerTargetName(tgt.Expr)
+		}
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
+		}
+		typ, err := analyzeExpr(tgt.Expr, innerCtx)
+		if err != nil {
+			return err
+		}
+		innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
+	}
+	if len(cte.Columns) > 0 {
+		if len(cte.Columns) != len(innerCols) {
+			return analyzeError(cte.Pos(), "42P10",
+				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
+		}
+		for i, alias := range cte.Columns {
+			innerCols[i].Name = alias
+		}
+	}
+	ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{Name: cte.Name, Columns: innerCols}
 	return nil
 }
 

@@ -830,18 +830,15 @@ func canUnnestInExpr(in *InExpr) bool {
 	if params == nil || len(params) == 0 {
 		return false
 	}
-	// Reject nested subqueries inside the IN-subquery — only
-	// flat SELECT FROM WHERE shapes are unnestable.
-	var hasNested bool
+	// Reject nested IN subqueries inside the IN-subquery — those
+	// need their own unnest pass first.
+	var hasNestedIn bool
 	walkPlanExprs(plan, func(e Expr) {
-		if _, ok := e.(*SubqueryExpr); ok {
-			hasNested = true
-		}
 		if in2, ok := e.(*InExpr); ok && in2.Plan != nil {
-			hasNested = true
+			hasNestedIn = true
 		}
 	})
-	if hasNested {
+	if hasNestedIn {
 		return false
 	}
 	return true
@@ -872,6 +869,10 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Recursively unnest any scalar subqueries still inside the
+	// inner plan (e.g. Q20's lineitem aggregate inside the
+	// partsupp IN subquery).
+	innerPlan = unnestSubqueriesInPlan(innerPlan)
 
 	// Find the Filter that wraps the outer node.
 	filter, conjunct := findFilterContainingInExpr(outer, in)

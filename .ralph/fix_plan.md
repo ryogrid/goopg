@@ -749,13 +749,19 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
   - [x] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
 
   Follow-up (recursive scalar subquery unnest):
-  - [ ] Extend `unnestSubqueriesInPlan` to descend into IN-subquery
-        inner plans and unnest correlated scalar SubqueryExpr nodes
-        as aggregation hash‑joins.  This would rewrite Q20's
-        innermost `SELECT 0.5*SUM(...) FROM lineitem WHERE ...` into
-        a HashJoin partsupp ⋈ Aggregate(lineitem) — eliminating the
-        per‑row lineitem scan.
-  - [ ] Complete the HammerDB SF=1 power test with all 22 queries.
+  - [ ] M0040-0004: Recursive subquery unnest inside IN/SubqueryExpr
+        inner plans. Design doc at
+        `docs/design/0040-0002-recursive-subquery-unnest.md`.
+    - [ ] Extend `unnestSubqueriesInPlan` to swing into
+          `SubqueryExpr.Plan` and `InExpr.Plan` and recursively
+          unnest scalar `SubqueryExpr` nodes found there.
+    - [ ] The M0033 `canUnnestSubquery` / `unnestSubquery`
+          machinery (GROUP BY aggregate + hash join) already
+          handles the scalar pattern — only the walker entry
+          point needs extending.
+    - [ ] Verify: Q20's innermost `SELECT 0.5*SUM(...) FROM
+          lineitem WHERE ...` becomes HashJoin(partsupp ⋈
+          Aggregate(lineitem GROUP BY l_partkey, l_suppkey)).
 
 ## Notes
 
