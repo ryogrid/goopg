@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -87,7 +88,7 @@ func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 	}
 	// SampleInserts inserts orders 1..8 with NUMERIC o_orderkey.
 	for _, k := range []int64{1, 4, 8} {
-		if _, found, err := tree.Search(btree.EncodeNumericKey(k, 0)); err != nil || !found {
+		if _, found, err := tree.Search(btree.EncodeNumericKey(big.NewInt(k), 0)); err != nil || !found {
 			t.Errorf("orders_pk search o_orderkey=%d: found=%v err=%v", k, found, err)
 		}
 	}

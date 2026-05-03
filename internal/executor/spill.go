@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"time"
 
@@ -125,8 +126,21 @@ func encodeDatum(d Datum, buf []byte) []byte {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonths))
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDays))
 	case KindNumeric:
-		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.NumericMantissa))
-		buf = append(buf, byte(d.NumericScale))
+		// 2-byte int16 scale + length-prefixed signed-magnitude
+		// big.Int bytes (1 sign byte + magnitude). Per-query
+		// spill files have no on-disk back-compat constraint,
+		// so the wider layout is safe; fits-int64 values still
+		// pack into 2 + 4 + 1 + ≤8 bytes ≈ 15 bytes.
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(d.NumericScale))
+		mant := numericMant(d)
+		signByte := byte(0)
+		if mant.Sign() < 0 {
+			signByte = 1
+		}
+		mag := new(big.Int).Abs(mant).Bytes()
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(mag)))
+		buf = append(buf, signByte)
+		buf = append(buf, mag...)
 	}
 	return buf
 }
@@ -188,12 +202,24 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		days := int32(binary.LittleEndian.Uint32(data[pos+4:]))
 		return Datum{Kind: KindInterval, IntervalMonths: months, IntervalDays: days}, pos + 8, nil
 	case KindNumeric:
-		if pos+9 > len(data) {
+		if pos+6 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated numeric at %d", pos)
 		}
-		m := int64(binary.LittleEndian.Uint64(data[pos:]))
-		s := int8(data[pos+8])
-		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, pos + 9, nil
+		s := int16(binary.LittleEndian.Uint16(data[pos:]))
+		pos += 2
+		mlen := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
+		if pos+1+mlen > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated numeric body at %d (want %d)", pos, mlen)
+		}
+		signByte := data[pos]
+		pos++
+		mag := new(big.Int).SetBytes(data[pos : pos+mlen])
+		if signByte != 0 {
+			mag.Neg(mag)
+		}
+		pos += mlen
+		return newNumeric(mag, int(s)), pos, nil
 	default:
 		return Datum{}, 0, fmt.Errorf("unknown datum kind %d", kind)
 	}

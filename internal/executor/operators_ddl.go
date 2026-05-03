@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -611,9 +612,9 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 	case isNumericType(col.Type.Name):
 		switch v.Kind {
 		case KindNumeric:
-			return btree.EncodeNumericKey(v.NumericMantissa, v.NumericScale), nil
+			return btree.EncodeNumericKey(numericMant(v), v.NumericScale), nil
 		case KindInt:
-			return btree.EncodeNumericKey(v.Int, 0), nil
+			return btree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
 		}
 		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
 	}

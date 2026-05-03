@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -59,7 +60,7 @@ func TestDDLCreateNumericBTreeIndexAcceptsType(t *testing.T) {
 		m int64
 		s int8
 	}{{10, 1}, {25, 1}, {7, 0}} {
-		_, found, err := tree.Search(btree.EncodeNumericKey(k.m, k.s))
+		_, found, err := tree.Search(btree.EncodeNumericKey(big.NewInt(k.m), int16(k.s)))
 		if err != nil || !found {
 			t.Fatalf("Search(%d,%d): found=%v err=%v", k.m, k.s, found, err)
 		}
@@ -122,7 +123,7 @@ func TestDDLNumericIndexSplitWithVariableLengthHighKey(t *testing.T) {
 	for i := 0; i < nRows; i++ {
 		// Vary mantissa magnitude (1..nRows) and scale (i%4) so the
 		// encoded byte length varies across rows.
-		row := Row{{Kind: KindNumeric, NumericMantissa: int64(i + 1), NumericScale: int8(i % 4)}}
+		row := Row{{Kind: KindNumeric, NumericMantissa: int64(i + 1), NumericScale: int16(i % 4)}}
 		if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
 			t.Fatal(err)
 		}
@@ -139,7 +140,7 @@ func TestDDLNumericIndexSplitWithVariableLengthHighKey(t *testing.T) {
 	// Probe 50 spaced-out keys to exercise the descent path
 	// across multiple leaves post-split.
 	for i := 0; i < nRows; i += nRows / 50 {
-		key := btree.EncodeNumericKey(int64(i+1), int8(i%4))
+		key := btree.EncodeNumericKey(big.NewInt(int64(i+1)), int16(i%4))
 		if _, found, err := tree.Search(key); err != nil || !found {
 			t.Fatalf("Search row %d: found=%v err=%v", i, found, err)
 		}

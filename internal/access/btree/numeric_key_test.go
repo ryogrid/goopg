@@ -3,6 +3,7 @@ package btree
 import (
 	"bytes"
 	"math"
+	"math/big"
 	"sort"
 	"testing"
 )
@@ -13,7 +14,11 @@ import (
 type numCase struct {
 	name     string
 	mantissa int64
-	scale    int8
+	scale    int16
+}
+
+func encodeNumericInt64(m int64, s int16) []byte {
+	return EncodeNumericKey(big.NewInt(m), s)
 }
 
 // TestEncodeNumericKeyZeroIsSingleByte pins the zero sentinel.
@@ -21,13 +26,13 @@ type numCase struct {
 // the encoding is variable; zero gets its own short sentinel that
 // orders strictly between all negatives and all positives.
 func TestEncodeNumericKeyZeroIsSingleByte(t *testing.T) {
-	got := EncodeNumericKey(0, 0)
+	got := encodeNumericInt64(0, 0)
 	if len(got) != 1 || got[0] != 0x01 {
 		t.Fatalf("encode(0,0) = %x, want 01", got)
 	}
 	// Different (m=0, s=arbitrary) inputs must all hit the same
 	// sentinel — the carrier doesn't represent "negative zero".
-	if !bytes.Equal(EncodeNumericKey(0, 0), EncodeNumericKey(0, 100)) {
+	if !bytes.Equal(encodeNumericInt64(0, 0), encodeNumericInt64(0, 100)) {
 		t.Fatalf("zero sentinel must be scale-independent")
 	}
 }
@@ -47,9 +52,9 @@ func TestEncodeNumericKeyScaleInvariance(t *testing.T) {
 		{{"0.5", 5, 1}, {"0.50", 50, 2}},
 	}
 	for _, g := range groups {
-		base := EncodeNumericKey(g[0].mantissa, g[0].scale)
+		base := encodeNumericInt64(g[0].mantissa, g[0].scale)
 		for _, c := range g[1:] {
-			got := EncodeNumericKey(c.mantissa, c.scale)
+			got := encodeNumericInt64(c.mantissa, c.scale)
 			if !bytes.Equal(base, got) {
 				t.Errorf("%s vs %s: encodings diverge\n  %s -> %x\n  %s -> %x",
 					g[0].name, c.name, g[0].name, base, c.name, got)
@@ -62,17 +67,17 @@ func TestEncodeNumericKeyScaleInvariance(t *testing.T) {
 // negative encoding sorts before zero, which sorts before every
 // positive encoding. The single-byte sign prefix alone settles this.
 func TestEncodeNumericKeySignOrder(t *testing.T) {
-	zero := EncodeNumericKey(0, 0)
+	zero := encodeNumericInt64(0, 0)
 	negs := []numCase{{"-1", -1, 0}, {"-1.5", -15, 1}, {"-100", -100, 0}, {"min", math.MinInt64, 0}}
 	pos := []numCase{{"1", 1, 0}, {"0.001", 1, 3}, {"100", 100, 0}, {"max", math.MaxInt64, 0}}
 	for _, n := range negs {
-		b := EncodeNumericKey(n.mantissa, n.scale)
+		b := encodeNumericInt64(n.mantissa, n.scale)
 		if bytes.Compare(b, zero) >= 0 {
 			t.Errorf("encode(%s) >= encode(0): %x >= %x", n.name, b, zero)
 		}
 	}
 	for _, p := range pos {
-		b := EncodeNumericKey(p.mantissa, p.scale)
+		b := encodeNumericInt64(p.mantissa, p.scale)
 		if bytes.Compare(b, zero) <= 0 {
 			t.Errorf("encode(%s) <= encode(0): %x <= %x", p.name, b, zero)
 		}
@@ -116,8 +121,8 @@ func TestEncodeNumericKeyMonotone(t *testing.T) {
 	// under test.
 	sort.Slice(cases, func(i, j int) bool { return numericLess(cases[i], cases[j]) })
 	for i := 1; i < len(cases); i++ {
-		a := EncodeNumericKey(cases[i-1].mantissa, cases[i-1].scale)
-		b := EncodeNumericKey(cases[i].mantissa, cases[i].scale)
+		a := encodeNumericInt64(cases[i-1].mantissa, cases[i-1].scale)
+		b := encodeNumericInt64(cases[i].mantissa, cases[i].scale)
 		cmp := CompareKeys(a, b)
 		if cmp >= 0 {
 			t.Errorf("CompareKeys(%s, %s) = %d, want < 0\n  %s -> %x\n  %s -> %x",
@@ -140,8 +145,8 @@ func TestEncodeNumericKeySamePrefixDifferentLengths(t *testing.T) {
 		{numCase{"-1.5", -15, 1}, numCase{"-1", -1, 0}},      // -1.5 < -1
 	}
 	for _, p := range pairs {
-		ea := EncodeNumericKey(p.a.mantissa, p.a.scale)
-		eb := EncodeNumericKey(p.b.mantissa, p.b.scale)
+		ea := encodeNumericInt64(p.a.mantissa, p.a.scale)
+		eb := encodeNumericInt64(p.b.mantissa, p.b.scale)
 		if CompareKeys(ea, eb) >= 0 {
 			t.Errorf("encode(%s) < encode(%s) expected, got %x !< %x", p.a.name, p.b.name, ea, eb)
 		}
@@ -154,14 +159,14 @@ func TestEncodeNumericKeySamePrefixDifferentLengths(t *testing.T) {
 // case, |MinInt64| wraps and the encoding collides with positive
 // zero or worse.
 func TestEncodeNumericKeyMinInt64(t *testing.T) {
-	got := EncodeNumericKey(math.MinInt64, 0)
+	got := encodeNumericInt64(math.MinInt64, 0)
 	if len(got) == 0 || got[0] != 0x00 {
 		t.Fatalf("MinInt64 sign byte = %x, want 0x00 (negative)", got)
 	}
 	// Must compare strictly less than -1, less than -100, less than
 	// any in-range negative encountered.
 	for _, c := range []numCase{{"-1", -1, 0}, {"-100", -100, 0}, {"-1e18", -1_000_000_000_000_000_000, 0}} {
-		ref := EncodeNumericKey(c.mantissa, c.scale)
+		ref := encodeNumericInt64(c.mantissa, c.scale)
 		if CompareKeys(got, ref) >= 0 {
 			t.Errorf("MinInt64 encoding not less than %s: %x !< %x", c.name, got, ref)
 		}
@@ -176,7 +181,7 @@ func numericLess(a, b numCase) bool {
 	return am < bm
 }
 
-func alignForTest(am int64, as int8, bm int64, bs int8) (int64, int64, int8) {
+func alignForTest(am int64, as int16, bm int64, bs int16) (int64, int64, int16) {
 	common := as
 	if bs > common {
 		common = bs

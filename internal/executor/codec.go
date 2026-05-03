@@ -132,7 +132,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		// docs/design/0003-0012-numeric-arithmetic.md.
 		switch d.Kind {
 		case KindNumeric:
-			return encodeVarlen([]byte(formatNumeric(d.NumericMantissa, d.NumericScale))), nil
+			return encodeVarlen([]byte(numericText(d))), nil
 		case KindInt:
 			return encodeVarlen([]byte(strconv.FormatInt(d.Int, 10))), nil
 		case KindString:
@@ -155,7 +155,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		case KindInt:
 			return nil, fmt.Errorf("integer datum cannot encode as %s", t.Name)
 		case KindNumeric:
-			s = formatNumeric(d.NumericMantissa, d.NumericScale)
+			s = numericText(d)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 		}
@@ -213,7 +213,7 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		if err != nil {
 			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
 		}
-		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, 4 + n, nil
+		return newNumeric(m, int(s)), 4 + n, nil
 	default:
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated varlen header")

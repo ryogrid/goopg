@@ -11,9 +11,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"sort"
-	"strconv"
 	"sync"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -36,8 +35,13 @@ const SizeOfBTPageOpaque = 48
 
 // MaxHighKeyLen bounds the on-disk HighKey field. Covers the int4
 // encoding (4 bytes) and the NUMERIC encoding (≤25 bytes per
-// 0011-0001) with headroom. Wider key encodings would require
-// another opaque-format bump.
+// 0011-0001) with headroom. M0041-0004 widened EncodeNumericKey to
+// accept *big.Int mantissas, but the only B-tree NUMERIC keys in
+// practice are stored column values (TPC-H l_partkey, ps_partkey,
+// etc.) that fit in int64 and therefore in ≤25 bytes; the
+// arbitrary-precision lane only matters for runtime arithmetic
+// results that never enter an index. So MaxHighKeyLen stays 32 to
+// preserve on-disk page-format compatibility.
 const MaxHighKeyLen = 32
 
 // btSpecialOffset is where the opaque area starts on every B-tree page.
@@ -251,27 +255,38 @@ func DecodeInt8(b []byte) (int64, error) {
 //
 // Decoding is intentionally not provided: the B-tree never inverts the
 // encoding; index probes always re-encode from the live datum.
-func EncodeNumericKey(mantissa int64, scale int8) []byte {
-	if mantissa == 0 {
+//
+// M0041-0004 widens the mantissa parameter from int64 to *big.Int so
+// arbitrary-precision NUMERIC values (e.g. results of TPC-H Q8's
+// `1.00000000000000000000` produced by upstream-compatible division)
+// can be indexed without overflow. The on-page byte layout is
+// unchanged — sort order is preserved by the variable-length
+// digit-rebase trick, and any value that fits in int64 produces the
+// same bytes as before the widening.
+func EncodeNumericKey(mantissa *big.Int, scale int16) []byte {
+	if mantissa.Sign() == 0 {
 		return []byte{0x01}
 	}
-	negative := mantissa < 0
-	var um uint64
-	if mantissa == math.MinInt64 {
-		um = 1 << 63
-	} else if negative {
-		um = uint64(-mantissa)
-	} else {
-		um = uint64(mantissa)
-	}
+	negative := mantissa.Sign() < 0
+	abs := new(big.Int).Abs(mantissa)
 	// Strip trailing zeros so numerically-equal values normalise to
 	// the same digit string.
 	s := int32(scale)
-	for um%10 == 0 {
-		um /= 10
+	ten := big.NewInt(10)
+	zero := big.NewInt(0)
+	rem := new(big.Int)
+	for {
+		new(big.Int).QuoRem(abs, ten, rem)
+		if rem.Cmp(zero) != 0 {
+			break
+		}
+		abs.Quo(abs, ten)
 		s--
+		if abs.Sign() == 0 {
+			break
+		}
 	}
-	digits := strconv.FormatUint(um, 10)
+	digits := abs.Text(10)
 	ndig := int32(len(digits))
 	E := ndig - 1 - s
 

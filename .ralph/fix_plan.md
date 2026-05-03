@@ -746,9 +746,20 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
 ## Milestone 0041 — Close Remaining TPC‑H Result‑Parity Gaps [COMPLETE]
 
 See `docs/milestones/0041-close-parity-gaps.md`.
-Fixed all non‑precision DIVERGENT TPC‑H parity queries.
-**Final state: identical=19, divergent=3 (Q1+Q8+Q14 precision
-allowlisted), errored=0. `TestTPCHResultParity` PASSES.**
+Fixed all DIVERGENT TPC‑H parity queries — including the
+previously‑allowlisted numeric‑precision deltas (Q1, Q8, Q14).
+**Final state: identical=22, divergent=0, errored=0.
+`TestTPCHResultParity` PASSES with empty `knownDivergences`.**
+
+- M0041‑0004 (landed 2026‑05‑04): NUMERIC precision fix.
+  `numericDiv` rewritten to match upstream's `select_div_scale`
+  rule (NBASE=10000 weights, `rscale = max(16 − qweight*4, da, db,
+  0)` clamped to [0, 1000]) with half‑away‑from‑zero rounding;
+  `Datum` gains a `*big.Int` overflow lane (`NumericBig`) so
+  Q8's `mantissa = 10^20` round‑trips correctly; `NumericScale`
+  widened to `int16`; B‑tree `EncodeNumericKey` accepts `*big.Int`.
+  Heap on‑disk format unchanged (text varlen). See
+  `docs/design/0041-0004-numeric-precision-fix.md`.
 
 - [x] M0041-0001: Generalize ColumnRef remap to binary join trees.
       Design doc `docs/design/0041-0001-close-parity-gaps.md`.

@@ -63,7 +63,7 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(), Message: err.Error()}
 		}
-		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
+		return newNumeric(m, int(s)), nil
 	case *planner.StringConst:
 		return Datum{Kind: KindString, String: x.Value}, nil
 	case *planner.NullConst:
@@ -161,12 +161,12 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		// stored as strings before the type system enforces types).
 		if left.Kind == KindString {
 			if m, s, err := parseNumeric(left.String); err == nil {
-				left = Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}
+				left = newNumeric(m, int(s))
 			}
 		}
 		if right.Kind == KindString {
 			if m, s, err := parseNumeric(right.String); err == nil {
-				right = Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}
+				right = newNumeric(m, int(s))
 			}
 		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
@@ -345,7 +345,7 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 	case KindNumeric:
 		if m, sc, err := parseNumeric(s); err == nil {
-			return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: sc}
+			return newNumeric(m, int(sc))
 		}
 	case KindTime:
 		if t, err := parseCopyTimestamp(s); err == nil {

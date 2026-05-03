@@ -268,7 +268,7 @@ func datumToCopyText(t catalog.Type, d Datum) (string, error) {
 			}
 			return "f", nil
 		case KindNumeric:
-			return formatNumeric(d.NumericMantissa, d.NumericScale), nil
+			return numericText(d), nil
 		default:
 			return "", fmt.Errorf("kind %d cannot encode as %s in COPY TEXT", d.Kind, t.Name)
 		}
@@ -310,7 +310,7 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		if err != nil {
 			return Datum{}, fmt.Errorf("invalid numeric %q: %w", text, err)
 		}
-		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
+		return newNumeric(m, int(s)), nil
 	default:
 		// text / varchar / char / unknown — keep as String.
 		return Datum{Kind: KindString, String: string(raw)}, nil

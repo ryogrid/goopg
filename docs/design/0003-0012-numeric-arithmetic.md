@@ -45,7 +45,17 @@ The value is `mantissa * 10^-scale`. `123.45` is `(12345, 2)`,
 `-1500` is `(-1500, 0)`, `0.05` is `(5, 2)`. Sign lives in the
 mantissa; scale is non-negative.
 
-Why int64 and not big.Int / a homegrown digit array:
+> **Update (M0041-0004, 2026-05-04)**: this document predates the
+> NUMERIC precision fix. The "int64-only" model below is superseded
+> — `Datum` carries an optional `NumericBig *big.Int` overflow lane
+> for division results that don't fit int64 (TPC-H Q8 needs
+> mantissa = 10^20), and `numericDiv` matches upstream's
+> `select_div_scale` rule with half-away-from-zero rounding. The
+> per-row hot path still uses int64 when values fit, so the
+> "avoid big.Int allocation" trade-off below is preserved for
+> scans/joins. See `docs/design/0041-0004-numeric-precision-fix.md`.
+
+Why int64 (fast path) and not big.Int (always) / a homegrown digit array:
 
 - TPC-H SF1 magnitudes fit comfortably. Worst-case Q1 accumulator
   is `~6M rows × $999,999.99 × (1 - 0) × (1 + 0.08)` with two

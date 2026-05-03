@@ -13,27 +13,73 @@ var (
 	bigNumericMaxInt64 = big.NewInt(9223372036854775807)
 )
 
+// numericMinSigDigits mirrors upstream's NUMERIC_MIN_SIG_DIGITS
+// (postgres/src/include/utils/numeric.h:50). Division ensures the
+// result carries at least this many significant decimal digits,
+// which is enough for float8-equivalent precision and matches
+// upstream's TPC-H output byte-for-byte.
+const numericMinSigDigits = 16
+
+// numericMaxDisplayScale mirrors upstream's NUMERIC_MAX_DISPLAY_SCALE
+// (NUMERIC_MAX_PRECISION = 1000) — the upper bound on a result's
+// fractional-digit count.
+const numericMaxDisplayScale = 1000
+
+// numericMant returns d's mantissa as a *big.Int, regardless of
+// whether d is in the int64 fast-path lane (NumericBig == nil) or
+// the big-int overflow lane (NumericBig != nil). Always returns a
+// fresh *big.Int so callers can mutate without aliasing the Datum.
+func numericMant(d Datum) *big.Int {
+	if d.NumericBig != nil {
+		return new(big.Int).Set(d.NumericBig)
+	}
+	return big.NewInt(d.NumericMantissa)
+}
+
+// newNumeric constructs a KindNumeric Datum from a *big.Int
+// mantissa and an int (scale). When the mantissa fits in int64 the
+// result lands on the fast path (NumericMantissa); otherwise it
+// stays in the *big.Int lane (NumericBig). Scale ≤ 0 is rejected
+// only for negative values (the caller should already have clamped
+// to the upstream-compatible 0..1000 range); we tolerate scale=0
+// because that's the common case for integer-shaped NUMERICs.
+func newNumeric(b *big.Int, scale int) Datum {
+	if scale > numericMaxDisplayScale {
+		// Defensive: callers should have clamped already, but
+		// arithmetic at the int16 boundary is still well-defined
+		// — just clip rather than corrupt.
+		scale = numericMaxDisplayScale
+	}
+	if scale < 0 {
+		scale = 0
+	}
+	if b.Cmp(bigNumericMinInt64) >= 0 && b.Cmp(bigNumericMaxInt64) <= 0 {
+		return Datum{Kind: KindNumeric, NumericMantissa: b.Int64(), NumericScale: int16(scale)}
+	}
+	bb := new(big.Int).Set(b)
+	return Datum{Kind: KindNumeric, NumericBig: bb, NumericScale: int16(scale)}
+}
+
 // parseNumeric parses a SQL NUMERIC literal — `123`, `123.45`,
-// `-1.5`, `1.5e3`, `1.5e-2` — into mantissa+scale form. The
-// returned scale is non-negative; positive exponents shift digits
-// out of the fractional part (raising or lowering scale), negative
+// `-1.5`, `1.5e3`, `1.5e-2` — into a (mantissa *big.Int, scale)
+// pair. Scale is non-negative; positive exponents shift digits out
+// of the fractional part (raising or lowering scale), negative
 // exponents shift them in. Returns an error for malformed input.
 //
-// v0's NUMERIC carrier is int64-bounded; values whose magnitude
-// exceeds int64 surface as `numeric out of int64 range`. This
-// matches the deferred big-int support documented in
-// docs/design/0003-0012-numeric-arithmetic.md.
-func parseNumeric(text string) (int64, int8, error) {
+// Unlike the original int64-bounded parser, this one accepts
+// arbitrary precision — the carrier is *big.Int. The returned
+// mantissa fits in int64 for the common case (callers go via
+// newNumeric to land on the fast path).
+func parseNumeric(text string) (*big.Int, int16, error) {
 	s := strings.TrimSpace(text)
 	if s == "" {
-		return 0, 0, fmt.Errorf("empty numeric literal")
+		return nil, 0, fmt.Errorf("empty numeric literal")
 	}
 	neg := false
 	if s[0] == '+' || s[0] == '-' {
 		neg = s[0] == '-'
 		s = s[1:]
 	}
-	// Split off the exponent.
 	mantissaStr := s
 	exp := 0
 	if i := strings.IndexAny(s, "eE"); i >= 0 {
@@ -41,47 +87,40 @@ func parseNumeric(text string) (int64, int8, error) {
 		expStr := s[i+1:]
 		v, err := strconv.Atoi(expStr)
 		if err != nil {
-			return 0, 0, fmt.Errorf("invalid numeric exponent %q", expStr)
+			return nil, 0, fmt.Errorf("invalid numeric exponent %q", expStr)
 		}
 		exp = v
 	}
-	// Split mantissa into integer and fractional parts.
 	intPart, fracPart := mantissaStr, ""
 	if i := strings.IndexByte(mantissaStr, '.'); i >= 0 {
 		intPart = mantissaStr[:i]
 		fracPart = mantissaStr[i+1:]
 	}
 	if intPart == "" && fracPart == "" {
-		return 0, 0, fmt.Errorf("invalid numeric literal %q", text)
+		return nil, 0, fmt.Errorf("invalid numeric literal %q", text)
 	}
 	digits := intPart + fracPart
 	if digits == "" {
-		return 0, 0, fmt.Errorf("invalid numeric literal %q", text)
+		return nil, 0, fmt.Errorf("invalid numeric literal %q", text)
 	}
-	mantissa, err := strconv.ParseInt(digits, 10, 64)
-	if err != nil {
-		return 0, 0, fmt.Errorf("numeric out of int64 range: %q", text)
+	mantissa := new(big.Int)
+	if _, ok := mantissa.SetString(digits, 10); !ok {
+		return nil, 0, fmt.Errorf("invalid numeric literal %q", text)
 	}
 	if neg {
-		mantissa = -mantissa
+		mantissa.Neg(mantissa)
 	}
 	scale := len(fracPart) - exp
 	if scale < 0 {
-		// Pad mantissa with trailing zeros so scale >= 0.
-		for ; scale < 0; scale++ {
-			if mantissa > maxInt64Div10 || mantissa < -maxInt64Div10 {
-				return 0, 0, fmt.Errorf("numeric overflow scaling %q", text)
-			}
-			mantissa *= 10
-		}
+		shift := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(-scale)), nil)
+		mantissa.Mul(mantissa, shift)
+		scale = 0
 	}
-	if scale > 127 {
-		return 0, 0, fmt.Errorf("numeric scale %d exceeds int8", scale)
+	if scale > numericMaxDisplayScale {
+		return nil, 0, fmt.Errorf("numeric scale %d exceeds %d", scale, numericMaxDisplayScale)
 	}
-	return mantissa, int8(scale), nil
+	return mantissa, int16(scale), nil
 }
-
-const maxInt64Div10 = 922337203685477580 // (1<<63 - 1) / 10
 
 // numericFromInt promotes an int64 to KindNumeric form (scale=0).
 func numericFromInt(n int64) Datum {
@@ -113,128 +152,218 @@ func toNumeric(d Datum, op string, pos int) (Datum, error) {
 		return numericFromInt(d.Int), nil
 	case KindString:
 		if m, s, err := parseNumeric(d.String); err == nil {
-			return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
+			return newNumeric(m, int(s)), nil
 		}
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires numeric operands", op)}
 }
 
-// alignNumeric upscales whichever of the two has the smaller scale
-// so both have the larger scale. Returns the aligned mantissas and
-// the common scale; reports overflow as an error.
-func alignNumeric(am int64, as int8, bm int64, bs int8) (int64, int64, int8, error) {
+// alignNumericBig upscales whichever of the two operands has the
+// smaller scale so both reach a common scale. Returns the aligned
+// mantissas (as fresh *big.Int) and the common scale.
+func alignNumericBig(am *big.Int, as int16, bm *big.Int, bs int16) (*big.Int, *big.Int, int16) {
 	common := as
 	if bs > common {
 		common = bs
 	}
-	for as < common {
-		if am > maxInt64Div10 || am < -maxInt64Div10 {
-			return 0, 0, 0, fmt.Errorf("numeric overflow aligning scale")
-		}
-		am *= 10
-		as++
+	if as < common {
+		shift := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(common-as)), nil)
+		am = new(big.Int).Mul(am, shift)
 	}
-	for bs < common {
-		if bm > maxInt64Div10 || bm < -maxInt64Div10 {
-			return 0, 0, 0, fmt.Errorf("numeric overflow aligning scale")
-		}
-		bm *= 10
-		bs++
+	if bs < common {
+		shift := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(common-bs)), nil)
+		bm = new(big.Int).Mul(bm, shift)
 	}
-	return am, bm, common, nil
+	return am, bm, common
 }
 
 // numericAdd / numericSub / numericMul / numericDiv implement the
 // four arithmetic operators on KindNumeric values. NULL handling
 // is the caller's responsibility (evalBinary short-circuits before
-// reaching these).
+// reaching these). All operate on *big.Int internally, so int64
+// overflow is no longer a concern; the result lands on the int64
+// fast path automatically when it fits via newNumeric.
 func numericAdd(a, b Datum) (Datum, error) {
-	am, bm, scale, err := alignNumeric(a.NumericMantissa, a.NumericScale, b.NumericMantissa, b.NumericScale)
-	if err != nil {
-		return Datum{}, err
-	}
-	return Datum{Kind: KindNumeric, NumericMantissa: am + bm, NumericScale: scale}, nil
+	am, bm, scale := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	return newNumeric(new(big.Int).Add(am, bm), int(scale)), nil
 }
 
 func numericSub(a, b Datum) (Datum, error) {
-	am, bm, scale, err := alignNumeric(a.NumericMantissa, a.NumericScale, b.NumericMantissa, b.NumericScale)
-	if err != nil {
-		return Datum{}, err
-	}
-	return Datum{Kind: KindNumeric, NumericMantissa: am - bm, NumericScale: scale}, nil
+	am, bm, scale := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	return newNumeric(new(big.Int).Sub(am, bm), int(scale)), nil
 }
 
 func numericMul(a, b Datum) (Datum, error) {
 	scale := int(a.NumericScale) + int(b.NumericScale)
-	if scale > 127 {
-		return Datum{}, fmt.Errorf("numeric scale overflow in multiply")
+	if scale > numericMaxDisplayScale {
+		return Datum{}, fmt.Errorf("numeric scale %d exceeds %d in multiply", scale, numericMaxDisplayScale)
 	}
-	// int64 multiply: the product can overflow when both inputs
-	// are near max. Detect by computing in 128-bit space (just
-	// check magnitude before).
-	if !canMulInt64(a.NumericMantissa, b.NumericMantissa) {
-		return Datum{}, fmt.Errorf("numeric overflow in multiply")
-	}
-	return Datum{Kind: KindNumeric, NumericMantissa: a.NumericMantissa * b.NumericMantissa, NumericScale: int8(scale)}, nil
+	prod := new(big.Int).Mul(numericMant(a), numericMant(b))
+	return newNumeric(prod, scale), nil
 }
 
-func canMulInt64(a, b int64) bool {
-	if a == 0 || b == 0 {
-		return true
-	}
-	r := a * b
-	return r/b == a
-}
-
-// numericDiv produces an approximate quotient at a target scale
-// (caller-supplied). v0 picks max(scale_a, scale_b, 6) — matches
-// upstream's NUMERIC division for unscaled inputs and is enough
-// for TPC-H's `1 - l_discount` shape where both sides have small
-// scales. Division by zero raises 22012.
+// numericDiv computes a / b with PostgreSQL-compatible result
+// scale. Mirrors `select_div_scale` (postgres/src/backend/utils/adt/
+// numeric.c:10135-10195):
+//
+//	rscale = max(NUMERIC_MIN_SIG_DIGITS - qweight, dscale_a, dscale_b, 0)
+//	rscale = min(rscale, NUMERIC_MAX_DISPLAY_SCALE)
+//
+// where qweight = (weight_a - weight_b) - (firstdigit_a <=
+// firstdigit_b ? 1 : 0). With our DEC_DIGITS = 1 (decimal model),
+// upstream's `qweight*DEC_DIGITS` collapses to qweight.
+//
+// Quotient is rounded half-away-from-zero, matching upstream's
+// `div_var` with rounding=true. Division by zero raises 22012.
 func numericDiv(a, b Datum, pos int) (Datum, error) {
-	if b.NumericMantissa == 0 {
+	bm := numericMant(b)
+	if bm.Sign() == 0 {
 		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 	}
-	target := int(a.NumericScale)
-	if int(b.NumericScale) > target {
-		target = int(b.NumericScale)
+	am := numericMant(a)
+	da, db := int(a.NumericScale), int(b.NumericScale)
+	if am.Sign() == 0 {
+		// Zero numerator — short-circuit at max(da, db, 0).
+		zScale := da
+		if db > zScale {
+			zScale = db
+		}
+		if zScale < 0 {
+			zScale = 0
+		}
+		return newNumeric(new(big.Int).SetInt64(0), zScale), nil
 	}
-	if target < 6 {
-		target = 6
-	}
-	if target > 127 {
-		return Datum{}, fmt.Errorf("numeric scale overflow in divide")
-	}
-	// Compute mantissaA * 10^(target + scaleB - scaleA) / mantissaB
-	// so the quotient has `target` fractional digits.
-	//
-	// Use big.Int for the intermediate scale-up: for TPC-H Q14 the
-	// aggregate numerator can be large enough that multiplying by 10^6
-	// overflows int64 even though the final quotient still fits int64.
-	shift := target + int(b.NumericScale) - int(a.NumericScale)
-	am := big.NewInt(a.NumericMantissa)
+
+	rscale := numericDivScale(am, bm, da, db)
+
+	// shift = rscale + db - da; multiply numerator by 10^shift so
+	// integer division produces a quotient with `rscale` fractional
+	// digits.
+	shift := rscale + db - da
+	num := new(big.Int).Set(am)
 	if shift > 0 {
-		scale := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(shift)), nil)
-		am.Mul(am, scale)
+		scl := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(shift)), nil)
+		num.Mul(num, scl)
+	} else if shift < 0 {
+		scl := new(big.Int).Exp(bigNumericTen, big.NewInt(int64(-shift)), nil)
+		num.Quo(num, scl)
 	}
-	q := new(big.Int).Quo(am, big.NewInt(b.NumericMantissa))
-	if q.Cmp(bigNumericMinInt64) < 0 || q.Cmp(bigNumericMaxInt64) > 0 {
-		return Datum{}, fmt.Errorf("numeric overflow in divide")
+
+	q, rem := new(big.Int).QuoRem(num, bm, new(big.Int))
+	// Round half-away-from-zero. With Go's Quo/QuoRem semantics
+	// (truncated division), the sign of `rem` matches the sign of
+	// `num`. We compare 2*|rem| against |bm|.
+	twoAbsRem := new(big.Int).Abs(rem)
+	twoAbsRem.Lsh(twoAbsRem, 1)
+	absB := new(big.Int).Abs(bm)
+	if twoAbsRem.Cmp(absB) >= 0 {
+		// Increment magnitude by 1, preserving sign of q. When q
+		// is zero, the resulting sign comes from num*bm.
+		var bump *big.Int
+		if q.Sign() == 0 {
+			// q is zero — sign comes from the numerator times
+			// the denominator's sign.
+			if (num.Sign() < 0) != (bm.Sign() < 0) {
+				bump = big.NewInt(-1)
+			} else {
+				bump = big.NewInt(1)
+			}
+		} else if q.Sign() > 0 {
+			bump = big.NewInt(1)
+		} else {
+			bump = big.NewInt(-1)
+		}
+		q.Add(q, bump)
 	}
-	return Datum{Kind: KindNumeric, NumericMantissa: q.Int64(), NumericScale: int8(target)}, nil
+
+	return newNumeric(q, rscale), nil
+}
+
+// numericDivScale implements upstream's select_div_scale rule
+// (postgres/src/backend/utils/adt/numeric.c:10135-10195). Upstream
+// works in NBASE=10000 (DEC_DIGITS=4 decimal digits per NBASE
+// digit), so we mirror that conversion exactly: convert each
+// operand's decimal mantissa+dscale to its NBASE weight and first
+// NBASE digit, then apply the upstream formula
+//
+//	rscale = max(NUMERIC_MIN_SIG_DIGITS(16) - qweight*4, da, db, 0)
+//
+// where qweight = (weight1_NBASE - weight2_NBASE) - (firstdigit1_NBASE
+// <= firstdigit2_NBASE ? 1 : 0). Using NBASE=10000 (not our internal
+// decimal model with DEC_DIGITS=1) is necessary because the formula
+// counts NBASE-aligned significant chunks, not single decimal digits
+// — a 70/6 division (Q1's avg) has weight1_NBASE=weight2_NBASE=0 in
+// NBASE because both fit in one NBASE digit, giving rscale=16; in a
+// pure decimal model the weights differ by 1 and rscale would land
+// at 15.
+func numericDivScale(am, bm *big.Int, da, db int) int {
+	absA := new(big.Int).Abs(am).Text(10)
+	absB := new(big.Int).Abs(bm).Text(10)
+	w1, fd1 := nbaseWeightAndFirstDigit(absA, da)
+	w2, fd2 := nbaseWeightAndFirstDigit(absB, db)
+	qweight := w1 - w2
+	if fd1 <= fd2 {
+		qweight--
+	}
+	rscale := numericMinSigDigits - qweight*4
+	if da > rscale {
+		rscale = da
+	}
+	if db > rscale {
+		rscale = db
+	}
+	if rscale < 0 {
+		rscale = 0
+	}
+	if rscale > numericMaxDisplayScale {
+		rscale = numericMaxDisplayScale
+	}
+	return rscale
+}
+
+// nbaseWeightAndFirstDigit converts a value `|mantissa| * 10^-dscale`
+// (with mantissa given as the decimal digit string of its absolute
+// value) into upstream's NumericVar weight + first NBASE digit. NBASE
+// is 10000 — each NBASE digit packs 4 consecutive decimal digits.
+//
+// The MSB of the value sits at decimal position `nd - 1 - dscale`
+// (where nd = number of decimal digits). That MSB falls into NBASE
+// digit at position floor(MSBPos / 4). The first NBASE digit's value
+// is the 4-decimal-digit chunk aligned to that NBASE position,
+// padded on the right with zeros if the mantissa has fewer trailing
+// digits.
+func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int) {
+	if len(absStr) == 1 && absStr[0] == '0' {
+		return 0, 0
+	}
+	nd := len(absStr)
+	msbDecPos := nd - 1 - dscale
+	weight = msbDecPos / 4
+	if msbDecPos < 0 && msbDecPos%4 != 0 {
+		// Floor-div: Go's integer division rounds toward zero,
+		// but upstream's weight uses floor for negative exponents.
+		weight--
+	}
+	posInNBASE := msbDecPos - 4*weight // 0..3
+	firstdigit = 0
+	for i := 0; i <= posInNBASE; i++ {
+		d := byte(0)
+		if i < nd {
+			d = absStr[i] - '0'
+		}
+		firstdigit = firstdigit*10 + int(d)
+	}
+	return weight, firstdigit
 }
 
 // numericCmp compares two numeric values, returning -1/0/+1.
 // Aligning scales in advance avoids cross-scale precision loss.
 func numericCmp(a, b Datum) (int, error) {
-	am, bm, _, err := alignNumeric(a.NumericMantissa, a.NumericScale, b.NumericMantissa, b.NumericScale)
-	if err != nil {
-		return 0, err
-	}
-	switch {
-	case am < bm:
+	am, bm, _ := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	switch am.Cmp(bm) {
+	case -1:
 		return -1, nil
-	case am > bm:
+	case 1:
 		return 1, nil
 	}
 	return 0, nil

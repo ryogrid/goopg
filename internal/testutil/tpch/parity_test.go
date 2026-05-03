@@ -171,13 +171,13 @@ func TestTPCHResultParity(t *testing.T) {
 	t.Logf("PARITY SUMMARY: identical=%d divergent=%d goopg-errored=%d upstream-errored=%d both-errored=%d",
 		b.identical, b.divergent, b.goopgErrored, b.upstreamErrored, b.bothErrored)
 
-	// Known divergences on the synthetic dataset. These are tracked
-	// by query number so newly introduced semantic drift fails closed.
-	knownDivergences := map[int]string{
-		1:  "numeric precision delta",
-		8:  "numeric precision delta",
-		14: "numeric precision delta",
-	}
+	// Known divergences on the synthetic dataset. M0041-0004 closed
+	// the previous Q1/Q8/Q14 numeric-precision deltas by switching
+	// numericDiv to upstream's select_div_scale rule and adding a
+	// *big.Int overflow lane to the NUMERIC carrier — so the
+	// allowlist is now empty and the test fails closed on any
+	// re-introduced divergence.
+	knownDivergences := map[int]string{}
 
 	// Hard expectation: every query that errored on goopg but
 	// succeeded on upstream is a real regression goopg must close.

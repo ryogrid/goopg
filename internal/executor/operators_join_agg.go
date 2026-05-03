@@ -606,7 +606,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			st.sum += arg.Int
 		case KindNumeric:
 			if !st.hasValue || st.numericSum.Kind != KindNumeric {
-				st.numericSum = Datum{Kind: KindNumeric, NumericMantissa: 0, NumericScale: arg.NumericScale}
+				st.numericSum = Datum{Kind: KindNumeric, NumericScale: arg.NumericScale}
 			}
 			s, err := numericAdd(st.numericSum, arg)
 			if err != nil {

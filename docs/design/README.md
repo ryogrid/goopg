@@ -205,4 +205,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0041-0003 | [Q7 and Q9 Final Parity Fixes](0041-0003-q7-q9-final-fixes.md) | landed | Final batch closing the milestone. Disabled the broken OID‑based MHJ posMap, captured pushOneConjunct's residuals into `mh.Filters`, switched MHJ executor to multi‑row hash with `expandChain` Cartesian DFS, scope‑guarded pushdown via `allColumnRefNamesInScope`, applied `joinPredicateMatch` in lazy hash join, and made `predRebind` try both sides by Name. Parity 17→**19** — `TestTPCHResultParity` PASSES (only Q1/Q8/Q14 precision‑allowlisted divergences remain, errored=0). |
 
+| 0041-0004 | [NUMERIC Precision Fix (Q1, Q8, Q14)](0041-0004-numeric-precision-fix.md) | landed | Closes the last three TPC‑H precision divergences fundamentally. New `numericDiv` matches upstream's `select_div_scale` rule (NBASE=10000 weights + half‑away rounding); Datum gains a `*big.Int` overflow lane so Q8's `mantissa = 10^20` round‑trips. Allowlist emptied — `TestTPCHResultParity` runs at **identical=22, divergent=0, errored=0**. |
+
 Append new rows in numeric order. Do not reorder.

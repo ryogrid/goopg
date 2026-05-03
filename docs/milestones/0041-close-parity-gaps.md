@@ -1,8 +1,10 @@
 # Milestone 0041 — Close Remaining TPC‑H Result-Parity Gaps
 
-**Status:** completed (2026‑05‑04). Parity 14→**19** identical;
-divergent=3 (Q1+Q8+Q14 numeric precision, allowlisted in
-`TestTPCHResultParity`); errored=0. `TestTPCHResultParity` PASSES.
+**Status:** completed (2026‑05‑04). Parity 14→**22** identical;
+divergent=0; errored=0. `TestTPCHResultParity` PASSES with an
+empty `knownDivergences` allowlist — Q1/Q8/Q14 closed by M0041‑0004
+(matching upstream's NUMERIC division rule + `*big.Int` overflow
+lane).
 **Depends on:** M0039 (planner column-index alignment), M0038 (multi-way hash join), M0034 (bushy DP)
 **Drives:** Eliminate the remaining 8 DIVERGENT TPC‑H parity queries (currently 14 identical, 8 divergent, 0 errored). Target: all 22 queries IDENTICAL (precision‑only differences for Q1/Q14 accepted as known limit).
 
