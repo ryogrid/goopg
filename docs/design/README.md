@@ -199,6 +199,8 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0040-0001 | [Subquery Caching and IN‑Subquery Unnest](0040-0001-subquery-caching-and-unnest.md) | accepted | Two-part optimisation: (1) cache correlated subquery results per outer-key to eliminate per-row re-execution; (2) extend the unnest pass to rewrite `IN(subquery)` as hash semi-join. Targets TPC‑H Q20 ≤ 120 s. See `docs/milestones/0040-correlated-subquery-optimization.md`. |
 
-| 0041-0001 | [Close Remaining TPC-H Parity Gaps](0041-0001-close-parity-gaps.md) | draft | Analyse and fix the remaining 8 DIVERGENT TPC‑H queries (currently identical=14 divergent=8). Fix A: remap Filter/aggregate ColumnRefs after MHJ rewrite and aggregate rebuild. Fix B: fall back to left‑deep pushdown for non‑MHJ queries. See `docs/milestones/0041-close-parity-gaps.md`. |
+| 0041-0001 | [Close Remaining TPC-H Parity Gaps](0041-0001-close-parity-gaps.md) | in‑progress | Analyse and fix the remaining DIVERGENT TPC‑H queries. Bindings‑based posMap with `(table*, alias)` self‑join key + split agg‑expr / HAVING remap closes Q3 and Q11 (parity 14→15). Q5/Q7/Q9/Q10 still open — tracked in `0041-0002`. See `docs/milestones/0041-close-parity-gaps.md`. |
+
+| 0041-0002 | [Fix Remaining Divergent TPC-H Queries](0041-0002-fix-remaining-6-queries.md) | in‑progress | Continuation of `0041-0001`. After bindings‑posMap landed, parity is identical=15 divergent=7 (Q1/Q8/Q14 precision allowlisted; Q5/Q7/Q9/Q10 still need investigation per query plan shape). |
 
 Append new rows in numeric order. Do not reorder.

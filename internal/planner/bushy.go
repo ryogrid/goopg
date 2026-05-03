@@ -6,6 +6,15 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 )
 
+// scanKey uniquely identifies a scan by its catalog table pointer and
+// FROM‑clause alias.  For self‑joins (e.g. `nation n1, nation n2`)
+// the alias distinguishes the two instances; for ordinary tables the
+// alias is empty and the table pointer alone is sufficient.
+type scanKey struct {
+	table *catalog.Table
+	alias string
+}
+
 // joinEdge is one equijoin predicate between two FROM tables.
 type joinEdge struct {
 	leftTable  int // index into the FROM list
@@ -734,54 +743,98 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 	if node == nil {
 		return
 	}
+	// walkSubqueryPlans walks an expression tree and recursively
+	// calls remapPosMapAfterRewrite on any SubqueryExpr.Plan or
+	// InExpr.Plan found within. This handles subquery inner plans
+	// that need their own independent remap pass after the outer
+	// plan tree has been rewritten (e.g. MHJ or bushy DP).
+	var walkSubqueryPlans func(Expr)
+	walkSubqueryPlans = func(e Expr) {
+		if e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case *SubqueryExpr:
+			remapPosMapAfterRewrite(x.Plan, nil)
+		case *InExpr:
+			if x.Plan != nil {
+				remapPosMapAfterRewrite(x.Plan, nil)
+			}
+		case *BinaryOp:
+			walkSubqueryPlans(x.Left)
+			walkSubqueryPlans(x.Right)
+		case *UnaryOp:
+			walkSubqueryPlans(x.Operand)
+		case *FuncCall:
+			for _, a := range x.Args {
+				walkSubqueryPlans(a)
+			}
+		case *CaseExpr:
+			if x.Operand != nil {
+				walkSubqueryPlans(x.Operand)
+			}
+			for _, w := range x.Whens {
+				walkSubqueryPlans(w.When)
+				walkSubqueryPlans(w.Then)
+			}
+			if x.Else != nil {
+				walkSubqueryPlans(x.Else)
+			}
+		case *ExtractExpr:
+			walkSubqueryPlans(x.Source)
+		}
+	}
+	subRemap := func(exprs []Expr) {
+		for _, e := range exprs {
+			walkSubqueryPlans(e)
+		}
+	}
+
 	switch n := node.(type) {
 	case *MultiHashJoin:
 		return
 	case *Join:
 		remapPosMapAfterRewrite(n.Left, nil)
 		remapPosMapAfterRewrite(n.Right, nil)
+		subRemap([]Expr{n.Predicate, n.LeftKey, n.RightKey})
 		return
 	case *Filter:
 		remapPosMapAfterRewrite(n.Child, nil)
-		// Try MHJ posMap first, then binary-tree posMap.
+		// Only use MHJ posMap (OID‑based); binaryTreePosMapOf is
+		// disabled here because it assumes OID order == FROM order
+		// which is not always true — remapWithBindings handles that
+		// case using the actual FROM‑clause bindings.
 		pm := mhjPosMapOf(n.Child)
-		if pm == nil {
-			pm = binaryTreePosMapOf(n.Child)
-		}
 		if pm != nil {
 			remapByPosMap(&n.Predicate, pm)
 		}
+		subRemap([]Expr{n.Predicate})
 		return
 	case *Project:
 		remapPosMapAfterRewrite(n.Child, nil)
 		pm := mhjPosMapOf(n.Child)
-		if pm == nil {
-			pm = binaryTreePosMapOf(n.Child)
-		}
 		if pm != nil {
 			for i := range n.Targets {
 				remapByPosMap(&n.Targets[i], pm)
 			}
 		}
+		subRemap(n.Targets)
 		return
 	case *Sort:
 		remapPosMapAfterRewrite(n.Child, nil)
 		pm := mhjPosMapOf(n.Child)
-		if pm == nil {
-			pm = binaryTreePosMapOf(n.Child)
-		}
 		if pm != nil {
 			for i := range n.Keys {
 				remapByPosMap(&n.Keys[i].Expr, pm)
 			}
 		}
+		for i := range n.Keys {
+			subRemap([]Expr{n.Keys[i].Expr})
+		}
 		return
 	case *Aggregate:
 		remapPosMapAfterRewrite(n.Child, nil)
 		pm := mhjPosMapOf(n.Child)
-		if pm == nil {
-			pm = binaryTreePosMapOf(n.Child)
-		}
 		if pm != nil {
 			for i := range n.GroupExprs {
 				remapByPosMap(&n.GroupExprs[i], pm)
@@ -792,54 +845,13 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 				}
 			}
 		}
-		return
-	}
-	// After processing this node, walk its expressions to find
-	// subquery inner plans and recursively remap them.
-	subRemap := func(exprs []Expr) {
-		var visitor func(Expr)
-		visitor = func(e Expr) {
-			if e == nil {
-				return
-			}
-			switch x := e.(type) {
-			case *SubqueryExpr:
-				remapPosMapAfterRewrite(x.Plan, nil)
-			case *InExpr:
-				if x.Plan != nil {
-					remapPosMapAfterRewrite(x.Plan, nil)
-				}
-			case *BinaryOp:
-				visitor(x.Left)
-				visitor(x.Right)
-			case *UnaryOp:
-				visitor(x.Operand)
-			case *FuncCall:
-				for _, a := range x.Args {
-					visitor(a)
-				}
-			}
-		}
-		for _, e := range exprs {
-			visitor(e)
-		}
-	}
-	switch n := node.(type) {
-	case *Filter:
-		subRemap([]Expr{n.Predicate})
-	case *Project:
-		subRemap(n.Targets)
-	case *Sort:
-		for i := range n.Keys {
-			subRemap([]Expr{n.Keys[i].Expr})
-		}
-	case *Aggregate:
 		subRemap(n.GroupExprs)
 		for i := range n.Aggs {
 			if n.Aggs[i].Arg != nil {
 				subRemap([]Expr{n.Aggs[i].Arg})
 			}
 		}
+		return
 	}
 }
 
@@ -888,70 +900,59 @@ func remapExprRefsToMHJ(node Node) Node {
 	return remapColumnRefsAfterRewrite(node)
 }
 
-// remapWithBindings applies a second remap pass using FROM‑clause
-// bindings to correct any remaining OID‑vs‑FROM order mismatch
-// after the OID‑sorted MHJ schema has been built and the first
-// remap pass (OID‑based posMap) has run.
+// remapWithBindings applies a bindings‑based position remap to the
+// join‑tree portion of node (everything below any Aggregate).  It
+// maps FROM‑clause column offsets (as stored in bindings[i].offset)
+// to the actual scan offsets in the current plan output.  Self‑join
+// tables (e.g. `nation n1, nation n2`) are disambiguated via the
+// (table pointer, alias) scanKey.
 func remapWithBindings(node Node, bindings []rangeBinding) {
 	if node == nil || len(bindings) == 0 {
 		return
 	}
-	var scans []Node
-	var collect func(Node)
-	collect = func(n Node) {
-		if n == nil {
-			return
-		}
-		switch x := n.(type) {
-		case *SeqScan:
-			scans = append(scans, x)
-		case *Join:
-			collect(x.Left)
-			collect(x.Right)
-		case *MultiHashJoin:
-			for _, t := range x.Tables {
-				if s, ok := t.(*SeqScan); ok {
-					scans = append(scans, s)
-				}
-			}
-		case *Filter:
-			collect(x.Child)
-		case *Project:
-			collect(x.Child)
-		case *Sort:
-			collect(x.Child)
-		case *Aggregate:
-			collect(x.Child)
-		}
-	}
-	collect(node)
-	if len(scans) == 0 {
+	posMap := buildBindingsPosMap(node, bindings)
+	if posMap == nil {
 		return
 	}
+	applyJoinTreePosMap(node, posMap)
+}
 
-	scanOff := 0
-	scanMap := make(map[*catalog.Table]int)
-	for _, s := range scans {
-		scanMap[s.(*SeqScan).Table] = scanOff
-		scanOff += len(s.Output())
+// remapAggExprsWithBindings remaps the GroupExprs and Agg.Arg
+// expressions of the Aggregate node that is at or directly below node
+// (unwrapping at most one Filter wrapper for the HAVING clause).
+// The posMap is built from the Aggregate's child (the join tree), so
+// it maps FROM‑clause offsets to scan offsets without touching the
+// HAVING‑filter predicate, which already uses aggregate‑output
+// indices and must not be remapped.
+func remapAggExprsWithBindings(node Node, bindings []rangeBinding) {
+	if node == nil || len(bindings) == 0 {
+		return
 	}
-	posMap := func(oldIdx int) int {
-		for _, b := range bindings {
-			if b.table == nil {
-				continue
-			}
-			scanPos, ok := scanMap[b.table]
-			if !ok {
-				continue
-			}
-			w := len(b.table.Columns)
-			if oldIdx >= b.offset && oldIdx < b.offset+w {
-				return scanPos + (oldIdx - b.offset)
-			}
+	// Unwrap at most one HAVING Filter to find the Aggregate.
+	var aggNode *Aggregate
+	switch n := node.(type) {
+	case *Aggregate:
+		aggNode = n
+	case *Filter:
+		if ag, ok := n.Child.(*Aggregate); ok {
+			aggNode = ag
 		}
-		return oldIdx
 	}
-	remapPosMapAfterRewrite(node, posMap)
+	if aggNode == nil {
+		return
+	}
+	posMap := buildBindingsPosMap(aggNode.Child, bindings)
+	if posMap == nil {
+		return
+	}
+	for i := range aggNode.GroupExprs {
+		remapByPosMap(&aggNode.GroupExprs[i], posMap)
+	}
+	for i := range aggNode.Aggs {
+		if aggNode.Aggs[i].Arg != nil {
+			remapByPosMap(&aggNode.Aggs[i].Arg, posMap)
+		}
+	}
 }
 
 // mhjPosMapOf returns a position map (old FROM‑order → new MHJ
@@ -1007,6 +1008,20 @@ func remapByPosMap(e *Expr, posMap func(int) int) {
 		}
 	case *ExtractExpr:
 		remapByPosMap(&x.Source, posMap)
+	case *InExpr:
+		// Remap the probe operand; do NOT remap the inner Plan (already remapped).
+		remapByPosMap(&x.Operand, posMap)
+	case *CaseExpr:
+		if x.Operand != nil {
+			remapByPosMap(&x.Operand, posMap)
+		}
+		for i := range x.Whens {
+			remapByPosMap(&x.Whens[i].When, posMap)
+			remapByPosMap(&x.Whens[i].Then, posMap)
+		}
+		if x.Else != nil {
+			remapByPosMap(&x.Else, posMap)
+		}
 	}
 }
 
@@ -1062,5 +1077,122 @@ func buildMHJPosMap(mh *MultiHashJoin) func(int) int {
 			off2 += w
 		}
 		return oldIdx
+	}
+}
+
+// buildBindingsPosMap collects all SeqScan leaves from node (in DFS
+// order) and builds a position map from FROM‑clause offsets (as
+// recorded in bindings) to actual plan‑output offsets.  The map uses
+// (table pointer, alias) pairs so self‑joins like `nation n1, nation
+// n2` are disambiguated even when both have the same catalog OID.
+//
+// Returns nil when no scans can be found (e.g. the node is an opaque
+// derived‑table output whose inner scan nodes are already resolved).
+func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
+	type scanEntry struct {
+		key scanKey
+		off int
+	}
+	var entries []scanEntry
+	var off int
+	var collect func(Node)
+	collect = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *SeqScan:
+			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
+			off += len(x.Output())
+		case *IndexScan:
+			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: ""}, off: off})
+			off += len(x.Output())
+		case *MultiHashJoin:
+			for _, t := range x.Tables {
+				if s, ok := t.(*SeqScan); ok {
+					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
+					off += len(s.Output())
+				}
+			}
+		case *Join:
+			collect(x.Left)
+			collect(x.Right)
+		case *Filter:
+			collect(x.Child)
+		case *Project:
+			collect(x.Child)
+		case *Sort:
+			collect(x.Child)
+		case *Aggregate:
+			collect(x.Child)
+		}
+	}
+	collect(node)
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Build scanMap: only the FIRST occurrence of each (table,alias)
+	// is stored so that later duplicate aliases don't clobber it.
+	scanMap := make(map[scanKey]int, len(entries))
+	for _, e := range entries {
+		if _, exists := scanMap[e.key]; !exists {
+			scanMap[e.key] = e.off
+		}
+	}
+
+	return func(oldIdx int) int {
+		for i := range bindings {
+			b := &bindings[i]
+			if b.table == nil {
+				continue
+			}
+			w := len(b.table.Columns)
+			if oldIdx >= b.offset && oldIdx < b.offset+w {
+				k := scanKey{table: b.table, alias: b.alias}
+				if scanOff, ok := scanMap[k]; ok {
+					return scanOff + (oldIdx - b.offset)
+				}
+				return oldIdx
+			}
+		}
+		return oldIdx
+	}
+}
+
+// applyJoinTreePosMap walks the join‑tree portion of a plan (below
+// any Aggregate) and applies posMap to all ColumnRefs in Filter
+// predicates, Join predicates, Sort keys, and Project targets.
+// It stops at Aggregate nodes — those are handled separately by
+// remapAggExprsWithBindings so that post‑aggregate ColumnRefs (which
+// reference aggregate output columns, not scan columns) are never
+// inadvertently remapped.
+func applyJoinTreePosMap(node Node, posMap func(int) int) {
+	if node == nil {
+		return
+	}
+	switch n := node.(type) {
+	case *MultiHashJoin:
+		return // tables/keys already in output order
+	case *Join:
+		applyJoinTreePosMap(n.Left, posMap)
+		applyJoinTreePosMap(n.Right, posMap)
+		// Join.Predicate / LeftKey / RightKey were built with per‑
+		// subset indices by buildJoinFromDP — do NOT remap them.
+	case *Filter:
+		applyJoinTreePosMap(n.Child, posMap)
+		remapByPosMap(&n.Predicate, posMap)
+	case *Project:
+		applyJoinTreePosMap(n.Child, posMap)
+		for i := range n.Targets {
+			remapByPosMap(&n.Targets[i], posMap)
+		}
+	case *Sort:
+		applyJoinTreePosMap(n.Child, posMap)
+		for i := range n.Keys {
+			remapByPosMap(&n.Keys[i].Expr, posMap)
+		}
+	case *Aggregate:
+		return // stop — aggregate expressions are a different scope
 	}
 }

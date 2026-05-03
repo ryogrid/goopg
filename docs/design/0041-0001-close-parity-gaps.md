@@ -143,3 +143,23 @@ correctness.  Acceptable for M0041 scope.
 - `internal/planner/pushdown.go` — `pushPredicatesIntoCrossJoins`
 - `docs/milestones/0039-fix-planner-column-ref.md` — M0039 analysis
 - `analysis/tpch-power-test-0039-final.md` — power test results
+
+## 6. Outcome (2026‑05‑04)
+
+The Fix A / Fix B / Fix C plan landed across three branch commits
+(`a4ef440`, `b66698a`, `17474de`) and a final consolidation pass on
+2026‑05‑04 that introduced the bindings‑posMap with `(table*, alias)`
+self‑join disambiguation and split aggregate‑expression remap from
+HAVING‑predicate remap.
+
+Parity progression on the synthetic dataset:
+
+| Stage | identical | divergent | errored |
+|-------|----------:|----------:|--------:|
+| Pre‑M0041 (M0039) | 14 | 8 | 0 |
+| M0041 partial (this doc) | 15 | 7 | 0 |
+| Target | ≥ 19 | 3 (Q1+Q8+Q14) | 0 |
+
+Q3 and Q11 closed; Q5, Q7, Q9, Q10 still divergent. The remaining
+work is tracked in `0041-0002-fix-remaining-6-queries.md` (now scoped
+to those 4 queries).

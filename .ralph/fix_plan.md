@@ -758,28 +758,49 @@ Target: identical ≥ 20, divergent ≤ 2 (Q1 + Q14 numeric precision only).
         and ≥3‑table binary join trees both remapped.
         Parity: identical=14 (no regression).
 
-  - [ ] Fix B: Subquery plan traversal — `remapPosMapAfterRewrite`
-        must descend into `SubqueryExpr.Plan` / `InExpr.Plan`
-        inner plans (Q7, Q10, Q11).
+  - [x] Fix B: Subquery plan traversal — `remapPosMapAfterRewrite`
+        now hoists `walkSubqueryPlans` into a single recursive
+        closure and descends into `SubqueryExpr.Plan` /
+        `InExpr.Plan` from every node arm (Filter / Project / Sort
+        / Aggregate / Join). Walker also covers `CaseExpr` and
+        `ExtractExpr` arms. (landed 2026‑05‑04)
 
-  - [ ] Fix C: Non‑MHJ star‑shaped queries (Q5, Q8, Q9) — bushy DP
-        binary join trees may still have ColumnRef misalignment.
-        `binaryTreePosMapOf` infrastructure is in place but may not
-        cover all plan shapes.
+  - [x] Fix C (partial): bindings‑based posMap with self‑join
+        alias support. `SeqScan` gained an `Alias` field;
+        `buildBindingsPosMap` keys scans by `(table*, alias)` so
+        `nation n1, nation n2` self‑joins (Q7) are correctly
+        disambiguated. `applyJoinTreePosMap` walks Filter / Project /
+        Sort below any Aggregate; `remapAggExprsWithBindings` remaps
+        only GroupExprs / Agg.Arg (never the HAVING predicate, which
+        uses agg‑output indices). `remapByPosMap` extended to walk
+        `InExpr.Operand` and `CaseExpr` arms.
+        Parity: identical 14→**15** divergent 8→7 (Q3 and Q11 now
+        IDENTICAL; Q5, Q7, Q9, Q10 still divergent).
+        (landed 2026‑05‑04)
 
-- [ ] M0041-0002: Fix remaining 6 queries (subquery + star). Design doc
-      `docs/design/0041-0002-fix-remaining-6-queries.md`.
+- [ ] M0041-0002: Fix remaining 4 queries (Q5, Q7, Q9, Q10).
+      Design doc `docs/design/0041-0002-fix-remaining-6-queries.md`
+      (now scoped down to 4 queries).
 
-  - [ ] Subquery fix: add `SubqueryExpr.Plan` / `InExpr.Plan`
-        traversal to `remapPosMapAfterRewrite`.  Expected to fix
-        Q7, Q10, Q11 (queries with subqueries containing MHJ or
-        binary join trees).
+  - [ ] Q7 (`nation n1, nation n2` self‑join inside inline‑view
+        subquery): goopg returns 3 rows vs upstream 1. Self‑join
+        alias plumbing landed but the inline‑view subquery's outer
+        ColumnRefs may still reference stale positions.
 
-  - [ ] Star‑shape fix: investigate Q5/Q8/Q9 plan shapes and
-        determine why `binaryTreePosMapOf` doesn't help.
+  - [ ] Q5 (6‑table star, supplier degree=3): goopg returns 0 rows.
+        MHJ chain‑detection rejected (star‑graph guard); bindings
+        posMap should align binary‑tree ColumnRefs but the result
+        still empty — likely an additional plan shape not covered
+        by `applyJoinTreePosMap`'s walk.
 
-  - [ ] Verification: `TestTPCHResultParity` identical ≥ 18,
-        divergent ≤ 4 (Q1+Q14 precision), errored = 0.
+  - [ ] Q9 (6‑table star, lineitem at centre, multi‑column joins
+        on partsupp): goopg returns 0 rows vs upstream 6.
+
+  - [ ] Q10 (4‑table inline‑view‑less query): goopg returns 0 rows
+        vs upstream 1. Smallest plan; investigate first.
+
+  - [ ] Verification: `TestTPCHResultParity` identical ≥ 19,
+        divergent = 3 (Q1+Q8+Q14 precision allowlisted), errored = 0.
 
 ## Notes
 

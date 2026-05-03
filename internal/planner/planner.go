@@ -381,13 +381,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if having != nil {
 			node = &Filter{pos: s.Having.Pos(), Child: node, Predicate: having}
 		}
-		// The aggregate stage resolves ColumnRefs against ctx.bindings
-		// which use the pre‑rewrite (binary‑tree) column order.  Remap
-		// again after the aggregate is built so its GroupExprs / Sort
-		// keys / Project targets point to the correct MHJ positions.
-		node = remapExprRefsToMHJ(node)
+		// The aggregate stage resolves GroupExprs / Agg.Arg against
+		// ctx.bindings (FROM‑clause order).  Remap only those two
+		// fields — not the HAVING predicate, which uses aggregate‑
+		// output column indices and must not be touched.
 		if len(savedBindings) > 0 {
-			remapWithBindings(node, savedBindings)
+			remapAggExprsWithBindings(node, savedBindings)
 		}
 	} else if s.Having != nil {
 		return nil, &PlanError{
@@ -772,7 +771,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
 	}
-	return &SeqScan{pos: rv.Pos(), Table: tbl, schema: ctx.schema}, b, nil
+	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
 
 // buildVirtualValues materialises a virtual table's current rows as

@@ -1,6 +1,7 @@
 # Milestone 0041 — Close Remaining TPC‑H Result-Parity Gaps
 
-**Status:** planned
+**Status:** in‑progress (parity 14→15 identical as of 2026‑05‑04;
+Q5/Q7/Q9/Q10 still divergent, target ≥19 not yet met)
 **Depends on:** M0039 (planner column-index alignment), M0038 (multi-way hash join), M0034 (bushy DP)
 **Drives:** Eliminate the remaining 8 DIVERGENT TPC‑H parity queries (currently 14 identical, 8 divergent, 0 errored). Target: all 22 queries IDENTICAL (precision‑only differences for Q1/Q14 accepted as known limit).
 

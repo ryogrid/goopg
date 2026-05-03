@@ -259,6 +259,7 @@ func (*FuncCall) exprNode()  {}
 type SeqScan struct {
 	pos    int
 	Table  *catalog.Table
+	Alias  string // FROM-clause alias; empty when not specified
 	schema Schema
 }
 
