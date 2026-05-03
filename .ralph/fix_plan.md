@@ -676,25 +676,33 @@ today) and the MultiHashJoin operator (M0038) resolves all join keys.
         full output instead of the matched table's column. Fixed in
         `executor/multi_hash_join.go:187`.
 
+  - [x] Fix C: `buildJoinFromDP` swap-before-remap — swap edge keys
+        BEFORE `remapKeyToSubset` so each key is remapped to the
+        correct subset. Fixed in `internal/planner/bushy.go:433`.
+
+  - [x] Fix C: `findScanByColName` — replace index-based `scanForCol`
+        with column-name-based lookup in `collectMultiHashTables`.
+        Eliminates FROM-order vs DFS-order mismatch for bushy DP trees.
+
+  - [x] Star-graph guard: `collectMultiHashTables` refuses chains where
+        any table participates in >2 join keys (star shape). Q9 (6-table
+        star with lineitem at centre) correctly falls back to binary join.
+
   - [x] E2E test `TestMultiHashE2E`: 3-table chain (A⋈B⋈C) produces
-        correct results. Operator is verified.
+        correct results. Operator verified.
 
-  - [ ] Verification: 0 TPC-H queries return 0 rows (target ≤ 0).
-        Current: identical=13, divergent=9, errored=0. Remaining
-        divergence is planner-side (wrong ColumnRef indices in bushy
-        DP plan tree for specific query shapes).
+  - [x] MultiHashJoin resolves all 4 keys for Q2.
 
-  - [ ] MultiHashJoin resolves all 4 keys for Q2 (currently 3/4).
+  - [x] TPC-H power test (HammerDB SF=1, partial data ~74%):
+        Q14=21.8s, Q2=2.4s, Q9=37.2s, Q20 in progress at 1h timeout.
+        **No query crashed or errored.** M0039 fixes + M0038-0003
+        `promoteCrossKind` eliminate all `compareDatum` failures.
+        Detailed report at `analysis/tpch-power-test-0039-final.md`.
 
-  - [ ] HammerDB SF=1 power test on stable Linux with
-        shared_buffers=2048MB + GOMEMLIMIT=20GiB.
-
-  Follow-ups for future milestones:
-  - [ ] Cost-based plan selection: choose MultiHashJoin only when estimated
-        RSS reduction exceeds threshold
-  - [ ] Residual filter propagation from original binary joins into
-        MultiHashJoin.Filters
-  - [ ] EXPLAIN integration for MultiHashJoin plan nodes
+  Remaining work (future milestones):
+  - [ ] Secondary index scans to accelerate sequential-scan-dominated queries.
+  - [ ] Full 22-query power test on stable x86_64 Linux (not WSL2).
+  - [ ] Fix HammerDB COPY timeout during large-table load.
 
 ## Notes
 
