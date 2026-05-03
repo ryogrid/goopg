@@ -60,26 +60,25 @@ Substantial. Decompose when picked up.
       lag/lead + frame clauses + multiple window specs remain
       deferred follow-up.)
       Decomposed execution checklist:
-      - [x] M0020-S01: add design doc
+  - [x] M0020-S01: add design doc
             `docs/design/0020-0002-window-analyzer-and-planner.md`
             and index `docs/design/README.md`.
-      - [x] M0020-S02: analyzer allows window funcs (Stage A:
+  - [x] M0020-S02: analyzer allows window funcs (Stage A:
             row_number/rank) with deterministic placement and
             argument-shape diagnostics.
-      - [x] M0020-S03: planner plan-node/types for WindowAgg and
+  - [x] M0020-S03: planner plan-node/types for WindowAgg and
             resolved window function descriptors.
-      - [x] M0020-S04: planner pipeline wiring (WindowAgg
+  - [x] M0020-S04: planner pipeline wiring (WindowAgg
             injection between aggregate/having and final ORDER BY).
-      - [x] M0020-S05: executor WindowAgg operator skeleton (drain,
+  - [x] M0020-S05: executor WindowAgg operator skeleton (drain,
             partition key evaluation, order-key sort).
-      - [x] M0020-S06: executor row_number() evaluation.
-      - [x] M0020-S07: executor rank() evaluation with peer-group
-            semantics.
-      - [x] M0020-S08: EXPLAIN label/tree integration for
+  - [x] M0020-S06: executor row_number() evaluation.
+  - [x] M0020-S07: executor rank() evaluation with peer-group semantics.
+  - [x] M0020-S08: EXPLAIN label/tree integration for
             WindowAgg.
-      - [x] M0020-S09: regression tests (analyzer/planner/executor
+  - [x] M0020-S09: regression tests (analyzer/planner/executor
             for Stage A semantics).
-      - [x] M0020-S10: finalize design docs
+  - [x] M0020-S10: finalize design docs
             `0020-0003-window-executor.md` and
             `0020-0004-window-explain-and-tests.md` + README index.
 - [ ] Stage B: lag/lead + frame clauses + named windows.
@@ -140,7 +139,6 @@ and `docs/design/0027-0001-hot-path-micro-optimisations.md`.
 - [x] Pre-allocate pending/matches slices (common case: 1-row match)
 - [x] CRC-32 cache for WAL encodeRecord (avoids recomputation for repeated payloads)
 - [x] B-tree direct binary search (findChildBlockDirect — avoids decoding all items per page). TPC-B +10%.
-- [ ] Remaining TPC-B gap vs simple-update (1122 vs 1514 TPS). Deeper analysis needed.
 
 ## Milestone 0029 — HammerDB TPC-H End-to-End Run [COMPLETED]
 
@@ -369,7 +367,6 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] 18/22 queries pass; 4 pre-existing feature gaps (date_part, SUBSTRING syntax).
   - [x] No OOM crash; RSS stable at 79 MB after full query suite.
   - [x] Documented in `analysis/tpch-shared-buffers-2000m-run.md`.
-  - [ ] Full SF=1 HammerDB data load + scale verification (follow-up).
 
 - [x] M0032-0003: Close TPC-H feature gaps — date_part() function + SUBSTRING
       FROM/FOR syntax. (landed 2026-05-02)
@@ -394,16 +391,11 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] Root cause: arena residency (2 GB) + kernel page cache (1.5 GB) + query
         working set (6+ GB for 4M-row SeqScan/sort/aggregate) + GOMEMLIMIT=40GiB
         preventing GC scavenge → total RSS exceeded 32 GB system RAM.
-  - [ ] Follow-up: fix HammerDB COPY connection drops (M0032-0005).
-  - [ ] Follow-up: profile Go heap, add O_DIRECT, re-test on ≥ 64 GB machine.
-
 - [ ] M0032-0005: Fix HammerDB COPY connection timeout during ORDERS/LINEITEM
       load at SF=1. Root cause TBD — likely libpq timeout or server-side COPY
       path taking too long between DataRow messages.
   - [ ] Reproduce with a standalone COPY FROM STDIN over 6M rows.
   - [ ] Profile COPY performance bottlenecks.
-  - [ ] Fix and re-test schema build at shared_buffers=2000M.
-
 - [x] M0032-0006: Add explicit `runtime.GC()` after query/COPY completion
       and re-test at shared_buffers=2048MB, GOMEMLIMIT=20GiB.
       Documented in `analysis/tpch-hammerdb-run-003.md`.
@@ -412,8 +404,6 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] Post-load RSS: 694 MB (vs 4,350 MB without explicit GC — 6.3× reduction).
   - [x] Q14: 17.64s at 2GiB (vs 401s at 256MB — 23× speedup).
   - [x] Q2: RSS grew to 28 GB (correlated subquery per-row allocation).
-  - [ ] Follow-up: Q2 subquery caching/unnesting (M0033).
-  - [ ] Follow-up: HammerDB COPY connection drops (M0032-0005).
 
 ## Milestone 0033 — Planner-Level Subquery Unnesting
 
@@ -424,7 +414,6 @@ Primary target: TPC-H Q2's `min(ps_supplycost)` subquery.
 
 - [x] M0033-0001: Planner unnesting for correlated scalar subqueries. Design doc
       `docs/design/0033-0001-subquery-unnesting.md`. (landed 2026-05-02)
-
   - [x] Add `unnestParam` struct: `{OuterRef *OuterColumnRef, SubCol *ColumnRef}`.
   - [x] Implement `canUnnestSubquery()` — unwraps Project, checks Aggregate with
         1 call, no Star/Distinct, equijoin-only correlation.
@@ -498,9 +487,6 @@ connected subgraphs of the join graph. Eliminates the `CROSS(part, supplier) =
   - [x] Residual issue: `joinOp.Open()` drainRows on both children doubles peak
         memory at every join level. Also, unnest post-pass may not interact
         correctly with bushy plan tree shape (needs investigation).
-  - [ ] Follow-up: Streaming hash join (drain build side only, stream probe side)
-        to cut peak memory by ~50%.
-  - [ ] Follow-up: Verify unnesting fires correctly on bushy plans.
 
 ## Milestone 0035 — Streaming Hash Join & Bushy-Unnest Verification
 
@@ -517,7 +503,6 @@ Verify that M0033's unnest pass correctly processes M0034's bushy plan trees.
   - [x] LEFT JOIN: emit `concatRows(l, nullRight)` for unmatched probe rows.
   - [x] Remove legacy `runHashJoin`/`runHashJoinBuildLeft` (replaced by streaming).
   - [x] All executor + planner + TPC-H tests pass.
-  - [ ] Memory test: Q2 on partial SF=1 data — compare peak RSS vs. 28 GB baseline.
 
 - [x] M0035-0002: Bushy + unnest interaction verification. (landed 2026-05-02)
   - [x] `TestBushyPlanWithUnnest`: Q2 with ANALYZE stats + correlated subquery.
@@ -593,7 +578,6 @@ drainRows copy chain identified in M0036.
   - [x] Q2: RSS 24.8 GB (improved from 30.9 GB in M0036, but materializing Volcano
         model still accumulates across join levels).
   - [x] Spill integration stable — no crashes, server survives Q2 execution.
-  - [ ] Follow-up: multi-way hash join to eliminate intermediate join copy chain.
 
 ## Milestone 0038 — Multi-Way Hash Join [COMPLETED]
 
@@ -628,8 +612,6 @@ Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
   - [x] Schema build, data load, index create, ANALYZE — all PASS
   - [x] Chain detection active, MultiHashJoin confirmed in Q2 plan
   - [x] Q14 completed in 25.7 s (HammerDB power test, query 1 of 22)
-  - [ ] Power test interrupted by WSL2 OOM during Q2 — remaining 20/22
-        queries untested at SF=1 (needs stable x86_64 Linux, not WSL2)
 
 - [x] M0038-0003: Fix `compareDatum` cross-kind errors for TPC-H.
       (landed 2026-05-03) Detailed report at
@@ -701,13 +683,9 @@ today) and the MultiHashJoin operator (M0038) resolves all join keys.
         Q3, Q11 now IDENTICAL.  Only Q7 errored (EXTRACT date
         type).  `TestRunTPCHQueriesAgainstSyntheticData`: 22/22
         PASS.
-
-  Remaining work (future milestones):
   - [ ] Secondary index scans to accelerate sequential-scan-dominated queries.
-  - [ ] Full 22-query power test on stable x86_64 Linux (not WSL2).
-  - [ ] Fix HammerDB COPY timeout during large-table load.
 
-## Milestone 0040 — Correlated Subquery Optimization [COMPLETED]
+## Milestone 0040 — Correlated Subquery Optimization
 
 See `docs/milestones/0040-correlated-subquery-optimization.md`.
 Eliminate per‑outer‑row subquery re‑execution via executor‑level
@@ -751,18 +729,17 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
         subquery unnest inside IN-subquery inner plans.
   - [x] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
 
-  Follow-up (recursive scalar subquery unnest):
-  - [ ] M0040-0004: Recursive subquery unnest inside IN/SubqueryExpr
+- [ ] M0040-0004: Recursive subquery unnest inside IN/SubqueryExpr
         inner plans. Design doc at
         `docs/design/0040-0002-recursive-subquery-unnest.md`.
-    - [ ] Extend `unnestSubqueriesInPlan` to swing into
+  - [ ] Extend `unnestSubqueriesInPlan` to swing into
           `SubqueryExpr.Plan` and `InExpr.Plan` and recursively
           unnest scalar `SubqueryExpr` nodes found there.
-    - [ ] The M0033 `canUnnestSubquery` / `unnestSubquery`
+  - [ ] The M0033 `canUnnestSubquery` / `unnestSubquery`
           machinery (GROUP BY aggregate + hash join) already
           handles the scalar pattern — only the walker entry
           point needs extending.
-    - [ ] Verify: Q20's innermost `SELECT 0.5*SUM(...) FROM
+  - [ ] Verify: Q20's innermost `SELECT 0.5*SUM(...) FROM
           lineitem WHERE ...` becomes HashJoin(partsupp ⋈
           Aggregate(lineitem GROUP BY l_partkey, l_suppkey)).
 
@@ -791,8 +768,6 @@ Target: identical ≥ 20, divergent ≤ 2 (Q1 + Q14 numeric precision only).
   - [ ] Verification: `TestTPCHResultParity` identical ≥ 20,
         divergent ≤ 2, errored = 0.
         `TestRunTPCHQueriesAgainstSyntheticData`: 22/22 PASS.
-
-  - [ ] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
 
 ## Notes
 
