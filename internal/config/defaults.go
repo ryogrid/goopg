@@ -289,7 +289,7 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
-		Name: "work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "4MB",
+		Name: "work_mem", Type: TypeInt, Unit: UnitKB, BootVal: "512MB",
 		MinVal: 64, MaxVal: 1 << 40,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,

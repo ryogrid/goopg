@@ -103,6 +103,11 @@ type Context struct {
 	// iteration and read by WorkTableScanOp to produce rows from
 	// the current working table. M0016-0004 (recursive CTE).
 	WorkTableRows []Row
+
+	// WorkMem is the per-operator memory budget in bytes for
+	// spill-to-disk. Zero means unlimited (no spill). Defaults to
+	// 512 MiB when the GUC is active. See milestone 0037.
+	WorkMem int64
 }
 
 // acquireRelLock funnels every operator's relation-level lock

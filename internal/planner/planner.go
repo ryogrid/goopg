@@ -327,15 +327,41 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
-			// Comma-FROM produces a left-deep CROSS-join chain.
-			// Push WHERE-side equalities into the deepest Join
-			// whose schema spans both sides so the planner can
-			// pick hash join instead of running a Cartesian
-			// product through Filter. See
-			// internal/planner/pushdown.go.
-			node = pushPredicatesIntoCrossJoins(node)
+			// Attempt bushy-join DP when all tables have ANALYZE
+			// stats. This replaces the left-deep CROSS chain with
+			// a DPccp-style optimal bushy tree that eliminates
+			// Cartesian products. See internal/planner/bushy.go.
+			if f, ok := node.(*Filter); ok {
+				if newChild, newPred := tryBushyDP(f.Child, f.Predicate, ctx, cat); newPred == nil {
+					node = newChild // all conjuncts consumed → remove Filter
+				} else if newChild != f.Child {
+					f.Child = newChild
+					f.Predicate = newPred
+					node = pushPredicatesIntoCrossJoins(node)
+				} else {
+					// Comma-FROM produces a left-deep CROSS-join chain.
+					// Push WHERE-side equalities into the deepest Join
+					// whose schema spans both sides so the planner can
+					// pick hash join instead of running a Cartesian
+					// product through Filter. See
+					// internal/planner/pushdown.go.
+					node = pushPredicatesIntoCrossJoins(node)
+				}
+			}
 		}
 	}
+
+	// Unnest correlated scalar subqueries after predicate pushdown
+	// has finalised the join tree. Subqueries that are unnestable
+	// (equijoin correlation, simple aggregate) are rewritten as
+	// GROUP BY aggregate + hash join. See internal/planner/unnest.go.
+	node = unnestSubqueriesInPlan(node)
+
+	// Rewrite chains of ≥3 hash-joined tables into a single
+	// MultiHashJoin node.  Column indices are remapped inside
+	// collectMultiHashTables using scanForCol, so parent
+	// expressions (incl. unnest keys) stay aligned.
+	node = rewriteMultiWayChain(node)
 
 	var agg *aggregateSurface
 	if needsAggregateStage(s) {
@@ -2359,6 +2385,8 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "timestamp"}
 		case "substr", "substring":
 			return catalog.Type{Name: "text"}
+		case "date_part":
+			return catalog.Type{Name: "int8"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}

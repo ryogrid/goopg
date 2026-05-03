@@ -64,9 +64,9 @@ export PGDATABASE="postgres"
 export TMP="${RUNTIME_DIR}/tmp"
 mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
 
-# Cap Go heap growth to prevent OOM during bulk COPY loads.
-# The shared_buffers arena is mmap'd (fixed-size), but the COPY
-# path's temporary allocations + arena residency together exceed
-# available memory at the default 1600MB setting. 256MB shared_buffers
-# avoids the issue; GOMEMLIMIT is an additional safety net.
-export GOMEMLIMIT=512MiB
+# The shared_buffers arena is a Go heap allocation under GC control.
+# GOMEMLIMIT=4GiB keeps the Go heap footprint constrained on ≤ 32 GB
+# machines while still accommodating the shared_buffers arena (256 MB
+# default). Larger shared_buffers values (e.g. 2000 MB) need ≥ 64 GB
+# system RAM — see analysis/tpch-hammerdb-run-002.md.
+export GOMEMLIMIT=20GiB

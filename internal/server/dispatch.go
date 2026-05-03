@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -81,6 +82,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	ctx.Snap = snap
 	ctx.Checkpointer = s.cfg.Checkpointer
 	ctx.StatsTarget = sessionStatsTarget(sess)
+	ctx.WorkMem = sessionWorkMem(sess)
 	ctx.PubSub = s.cfg.PubSub
 	ctx.LockMgr = s.cfg.LockMgr
 	ctx.BackendID = backendID
@@ -118,6 +120,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
 	commit = true
+	runtime.GC()
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
@@ -138,6 +141,25 @@ func sessionStatsTarget(sess *config.SessionRegistry) int {
 		return 0
 	}
 	return n
+}
+
+// sessionWorkMem reads the effective `work_mem` GUC from the session
+// registry and returns it as bytes. Returns 0 (unlimited) when sess
+// is nil or the value can't be parsed.
+func sessionWorkMem(sess *config.SessionRegistry) int64 {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("work_mem")
+	if !ok {
+		return 0
+	}
+	kb, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || kb < 0 {
+		return 0
+	}
+	// work_mem is stored in KB; convert to bytes.
+	return kb * 1024
 }
 
 func compatNoopCommandTag(sql string) (string, bool) {

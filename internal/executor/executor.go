@@ -132,6 +132,16 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, op), nil
+	case *planner.MultiHashJoin:
+		children := make([]Operator, len(p.Tables))
+		for i, tbl := range p.Tables {
+			var err error
+			children[i], err = Build(tbl)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return maybeInstrument(p, newMultiHashJoinOp(p, children)), nil
 	case *planner.DDL:
 		return newDDLOp(p), nil
 	case *planner.Transaction:

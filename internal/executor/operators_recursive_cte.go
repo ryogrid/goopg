@@ -36,8 +36,14 @@ func (o *recursiveUnionOp) Open(ctx *Context) error {
 }
 
 func (o *recursiveUnionOp) Close() error {
+	o.output = nil
+	o.working = nil
+	o.ctx = nil
+	if o.recursive != nil {
+		_ = o.recursive.Close()
+	}
 	if o.anchor != nil {
-		o.anchor.Close()
+		return o.anchor.Close()
 	}
 	return nil
 }

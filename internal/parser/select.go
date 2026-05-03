@@ -1172,6 +1172,60 @@ func (p *parser) parseExtractExpr(pos int) (Expr, error) {
 	return &ExtractExpr{pos: pos, Field: field, Source: source}, nil
 }
 
+// parseSubstringFuncCall parses both SUBSTRING syntax forms:
+// (1) comma form: `SUBSTRING(str, start [, count])`
+// (2) SQL-standard form: `SUBSTRING(str FROM start [FOR count])`
+// The leading identifier has already been consumed and the parser
+// is positioned on `(`. Both forms are desugared into a regular
+// FuncCall with comma-separated arguments.
+func (p *parser) parseSubstringFuncCall(pos int, name string) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after SUBSTRING")
+	}
+	str, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	// Comma form: SUBSTRING(str, start [, count])
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+		args := []Expr{str}
+		for p.acceptSymbol(",") {
+			arg, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, arg)
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ',' or ')'")
+		}
+		return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
+	}
+
+	// SQL-standard form: SUBSTRING(str FROM start [FOR count])
+	if _, err := p.expectKeyword(KwFrom); err != nil {
+		return nil, err
+	}
+	start, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	args := []Expr{str, start}
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFor {
+		p.advance() // consume FOR
+		count, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, count)
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close SUBSTRING")
+	}
+	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: name}, Args: args}, nil
+}
+
 // parseColumnOrCall handles `name`, `name.name`, `name.name.name`,
 // `name(args)`, `name.name(args)`, `name.*`, `name.name.*`. The
 // distinction between a function call and a column reference is the
@@ -1212,6 +1266,9 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		// Match case-insensitively on the bare ident form.
 		if len(parts) == 1 && strings.EqualFold(parts[0], "extract") {
 			return p.parseExtractExpr(startPos)
+		}
+		if len(parts) == 1 && (strings.EqualFold(parts[0], "substring") || strings.EqualFold(parts[0], "substr")) {
+			return p.parseSubstringFuncCall(startPos, strings.ToLower(parts[0]))
 		}
 		var name ObjectName
 		switch len(parts) {

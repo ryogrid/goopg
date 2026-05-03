@@ -8,15 +8,10 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 )
 
-// joinOp is a nested-loop implementation that buffers both children
-// in Open and emits joined rows from an in-memory result slice.
-//
-// The executor always builds a joinOp; the per-row inner loop
-// dispatches on plan.Algo, picking hash-join for JoinAlgoHash,
-// merge-join for JoinAlgoMerge, and nested-loop otherwise.
-// Wrapping all algos in
-// one operator keeps schema/Open/Close/Next unified — algo
-// selection is just a buffering strategy choice.
+// joinOp is a join operator that dispatches on plan.Algo.
+// Hash joins use lazy materialization (M0036): joined rows are
+// yielded on demand via Next() instead of pre-computed in o.rows.
+// Merge and nested-loop still materialize in o.rows.
 type joinOp struct {
 	plan   *planner.Join
 	left   Operator
@@ -26,6 +21,16 @@ type joinOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+
+	// M0036 lazy-output state (hash join only)
+	lazyHash    map[string][]Row // build-side hash table
+	lazyProbe   Operator         // probe side (streaming)
+	lazyRow     Row              // current probe row
+	lazyMatches []Row            // matches for current probe row (borrowed from lazyHash)
+	lazyMatchIdx int
+	lazyActive  bool // true between probeRow and last match
+	lazyLW      int  // left schema width
+	lazyRW      int  // right schema width
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -39,6 +44,9 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	if o.plan.Algo == planner.JoinAlgoHash {
+		return o.openLazyHashJoin(ctx)
+	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -65,9 +73,6 @@ func (o *joinOp) Open(ctx *Context) error {
 		rightWidth = len(rightRows[0])
 	}
 
-	if o.plan.Algo == planner.JoinAlgoHash {
-		return o.runHashJoin(leftRows, rightRows, leftWidth, rightWidth)
-	}
 	if o.plan.Algo == planner.JoinAlgoMerge {
 		return o.runMergeJoin(leftRows, rightRows, leftWidth, rightWidth)
 	}
@@ -112,107 +117,63 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 	return nil
 }
 
-// runHashJoin builds an in-memory map on one input and probes from
-// the other. By default the right input is the build side (matches
-// the historical convention); when the planner sets BuildLeft=true
-// — which it does for INNER joins where EstimateRows says the left
-// side is smaller — we hash the left input instead. The output row
-// order remains canonical [leftCols, rightCols] regardless of which
-// side built the hash table. INNER and LEFT only — the planner
-// enables the hash algo only for these types and only sets
-// BuildLeft for INNER. Build cost: O(M) hashes + O(M) memory;
-// probe cost: O(N) hashes + O(matches) emits. NULL keys never
-// match (matches upstream's NULL-aware equi-join semantics).
-func (o *joinOp) runHashJoin(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
+// openLazyHashJoin builds a hash table from the build side and sets
+// up lazy output. When ctx.WorkMem > 0, the build side uses
+// drainRowsBounded to spill to disk if row data exceeds the budget.
+func (o *joinOp) openLazyHashJoin(ctx *Context) error {
+	leftWidth := len(o.left.Schema())
+	rightWidth := len(o.right.Schema())
+	o.lazyLW = leftWidth
+	o.lazyRW = rightWidth
+	budget := ctx.WorkMem
+	if budget <= 0 {
+		budget = 512 * 1024 * 1024 // default 512 MiB
+	}
 	if o.plan.BuildLeft {
-		return o.runHashJoinBuildLeft(leftRows, rightRows, leftWidth, rightWidth)
+		if err := o.left.Open(ctx); err != nil { return err }
+		buildOp, err := drainRowsBounded(o.left, budget)
+		_ = o.left.Close()
+		if err != nil { return err }
+		if err := buildOp.Open(ctx); err != nil { return err }
+		for {
+			l, err := buildOp.Next()
+			if err == EOF { break }
+			if err != nil { return err }
+			if leftWidth == 0 && len(l) > 0 {
+				leftWidth = len(l); o.lazyLW = leftWidth
+			}
+			key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRow(rightWidth)))
+			if err != nil { return err }
+			if !ok { continue }
+			if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
+			o.lazyHash[key] = append(o.lazyHash[key], l)
+		}
+		_ = buildOp.Close()
+		if err := o.right.Open(ctx); err != nil { return err }
+		o.lazyProbe = o.right
+		return nil
 	}
-	nullRight := nullRow(rightWidth)
-
-	// Build phase: hash right input on RightKey. The right key
-	// is evaluated against a left||right concat where the left
-	// half is null padding — RightKey only references right-
-	// side columns by planner construction.
-	rightHash := make(map[string][]Row, len(rightRows))
-	leftPad := nullRow(leftWidth)
-	for _, r := range rightRows {
-		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(leftPad, r))
-		if err != nil {
-			return err
+	if err := o.right.Open(ctx); err != nil { return err }
+	buildOp, err := drainRowsBounded(o.right, budget)
+	_ = o.right.Close()
+	if err != nil { return err }
+	if err := buildOp.Open(ctx); err != nil { return err }
+	for {
+		r, err := buildOp.Next()
+		if err == EOF { break }
+		if err != nil { return err }
+		if rightWidth == 0 && len(r) > 0 {
+			rightWidth = len(r); o.lazyRW = rightWidth
 		}
-		if !ok {
-			// NULL key — never matches anyone in upstream's
-			// equi-join semantics, so don't add to the hash.
-			// LEFT join doesn't care; the right side is the
-			// inner side.
-			continue
-		}
-		rightHash[key] = append(rightHash[key], r)
+		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullRow(leftWidth), r))
+		if err != nil { return err }
+		if !ok { continue }
+		if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
+		o.lazyHash[key] = append(o.lazyHash[key], r)
 	}
-
-	// Probe phase.
-	rightZero := nullRow(rightWidth)
-	for _, l := range leftRows {
-		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, rightZero))
-		if err != nil {
-			return err
-		}
-		matches := rightHash[key]
-		if !ok {
-			matches = nil
-		}
-		matched := false
-		for _, r := range matches {
-			joined := concatRows(l, r)
-			// The hash equality already guarantees the join
-			// key matches; for predicates that ARE just the
-			// equality this is enough. v0 always splits the
-			// full predicate into LeftKey/RightKey at plan
-			// time so re-checking is unnecessary.
-			matched = true
-			o.rows = append(o.rows, joined)
-		}
-		if !matched && o.plan.Type == planner.JoinTypeLeft {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-		}
-	}
-	return nil
-}
-
-// runHashJoinBuildLeft mirrors runHashJoin with the build/probe
-// sides swapped: the LEFT input becomes the hash table and the
-// RIGHT input drives the probe. The output is still in the
-// canonical [leftCols, rightCols] order so downstream operators
-// see no difference. INNER only — the planner does not enable
-// BuildLeft for LEFT JOIN (the left side is the outer/preserved
-// side and must drive the loop to emit unmatched rows).
-func (o *joinOp) runHashJoinBuildLeft(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
-	leftHash := make(map[string][]Row, len(leftRows))
-	rightZero := nullRow(rightWidth)
-	for _, l := range leftRows {
-		key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, rightZero))
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		leftHash[key] = append(leftHash[key], l)
-	}
-
-	leftPad := nullRow(leftWidth)
-	for _, r := range rightRows {
-		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(leftPad, r))
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		for _, l := range leftHash[key] {
-			o.rows = append(o.rows, concatRows(l, r))
-		}
-	}
+	_ = buildOp.Close()
+	if err := o.left.Open(ctx); err != nil { return err }
+	o.lazyProbe = o.left
 	return nil
 }
 
@@ -388,6 +349,10 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 }
 
 func (o *joinOp) Next() (Row, error) {
+	// M0036 lazy output: yield joined rows on demand.
+	if o.lazyProbe != nil {
+		return o.nextLazy()
+	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -396,7 +361,72 @@ func (o *joinOp) Next() (Row, error) {
 	return row, nil
 }
 
+// nextLazy yields one joined row at a time for lazy hash joins.
+func (o *joinOp) nextLazy() (Row, error) {
+	nullLeft := nullRow(o.lazyLW)
+	nullRight := nullRow(o.lazyRW)
+	for {
+		// Continue serving matches from current probe row.
+		if o.lazyActive && o.lazyMatchIdx < len(o.lazyMatches) {
+			m := o.lazyMatches[o.lazyMatchIdx]
+			o.lazyMatchIdx++
+			if o.plan.BuildLeft {
+				return concatRows(m, o.lazyRow), nil
+			}
+			return concatRows(o.lazyRow, m), nil
+		}
+		o.lazyActive = false
+		// Pull next probe row.
+		r, err := o.lazyProbe.Next()
+		if err == EOF {
+			return nil, EOF
+		}
+		if err != nil {
+			return nil, err
+		}
+		o.lazyRow = r
+		var key string
+		var ok bool
+		if o.plan.BuildLeft {
+			// Build left: probe is right. Hash key from right row.
+			key, ok, err = o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
+		} else {
+			// Build right: probe is left. Hash key from left row.
+			key, ok, err = o.evalHashKey(o.plan.LeftKey, concatRows(r, nullRight))
+		}
+		if err != nil {
+			return nil, err
+		}
+		matches := o.lazyHash[key]
+		if !ok {
+			matches = nil
+		}
+		if len(matches) == 0 {
+			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
+				// LEFT JOIN: preserve unmatched left rows.
+				o.lazyRow = nil
+				return concatRows(r, nullRight), nil
+			}
+			// No matches, not LEFT — skip this probe row.
+			continue
+		}
+		o.lazyMatches = matches
+		o.lazyMatchIdx = 0
+		o.lazyActive = true
+		// Continue loop to yield first match.
+	}
+}
+
 func (o *joinOp) Close() error {
+	o.rows = nil
+	o.lazyHash = nil
+	o.lazyProbe = nil
+	o.lazyRow = nil
+	o.lazyMatches = nil
+	o.lazyMatchIdx = 0
+	o.lazyActive = false
+	o.ctx = nil
+	o.idx = 0
 	errL := o.left.Close()
 	errR := o.right.Close()
 	if errL != nil {
@@ -646,7 +676,12 @@ func (o *aggregateOp) Next() (Row, error) {
 	return row, nil
 }
 
-func (o *aggregateOp) Close() error { return o.child.Close() }
+func (o *aggregateOp) Close() error {
+	o.rows = nil
+	o.ctx = nil
+	o.idx = 0
+	return o.child.Close()
+}
 
 func (o *aggregateOp) Schema() planner.Schema { return o.schema }
 

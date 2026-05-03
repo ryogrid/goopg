@@ -65,3 +65,12 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0028 | goopg implementation reference: PostgreSQL logic documentation               | planned  | `0028-postgres-implementation-reference.md` |
 | 0029 | HammerDB TPC-H end-to-end run on goopg                                      | planned  | `0029-hammerdb-tpch-run.md` |
 | 0030 | Catalog persistence and DDL WAL                                             | planned  | `0030-catalog-persistence-and-ddl-wal.md` |
+| 0031 | TPC-H Q2 memory estimation & GC leak code review                           | accepted  | `0031-tpch-q2-memory-analysis-and-gc-code-review.md` |
+| 0032 | Buffer pool arena: mmap → Go heap replacement                          | accepted   | `0032-buffer-pool-heap-arena.md` |
+| 0033 | Planner-level subquery unnesting                                         | accepted    | `0033-subquery-unnesting.md` |
+| 0034 | Bushy join tree / join-graph optimization                                | accepted     | `0034-bushy-join-optimization.md` |
+| 0035 | Streaming hash join & bushy-unnest verification                          | accepted      | `0035-streaming-hash-join.md` |
+| 0036 | Hash join lazy materialization (on-demand output)                        | accepted       | `0036-hash-join-lazy-materialization.md` |
+| 0037 | Spill-to-disk hash join (Grace hash join)                                | accepted       | `0037-hash-join-spill-to-disk.md` |
+| 0038 | Multi-way hash join                                                     | accepted        | `0038-multi-way-hash-join.md` |
+| 0039 | Fix planner column-index alignment (correct join results)               | planned         | `0039-fix-planner-column-ref.md` |
