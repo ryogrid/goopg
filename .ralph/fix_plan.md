@@ -766,6 +766,34 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
           lineitem WHERE ...` becomes HashJoin(partsupp ⋈
           Aggregate(lineitem GROUP BY l_partkey, l_suppkey)).
 
+## Milestone 0041 — Close Remaining TPC‑H Result‑Parity Gaps
+
+See `docs/milestones/0041-close-parity-gaps.md`.
+Fix the remaining 8 DIVERGENT TPC‑H parity queries (identical=14 today).
+Target: identical ≥ 20, divergent ≤ 2 (Q1 + Q14 numeric precision only).
+
+- [ ] M0041-0001: Close parity gaps. Design doc
+      `docs/design/0041-0001-close-parity-gaps.md`.
+
+  - [ ] Fix A: Re‑wire `remapExprRefsToMHJ` (with `remapByPosMap` and
+        OID‑based `buildMHJPosMap`) so Filter predicates and aggregate
+        expressions are remapped after `rewriteMultiWayChain` AND after
+        `buildAggregateStage`.
+
+  - [ ] Fix B: For MHJ queries with subqueries (Q7), ensure the remap
+        traverses into `SubqueryExpr.Plan` / `InExpr.Plan` inner plans.
+
+  - [ ] Fix C: For non‑MHJ queries (Q5, Q8, Q10), fall back to
+        `pushPredicatesIntoCrossJoins` (left‑deep, FROM‑order) when
+        the bushy DP produces a non‑left‑deep tree.  Left‑deep trees
+        have FROM‑order output schemas, avoiding column misalignment.
+
+  - [ ] Verification: `TestTPCHResultParity` identical ≥ 20,
+        divergent ≤ 2, errored = 0.
+        `TestRunTPCHQueriesAgainstSyntheticData`: 22/22 PASS.
+
+  - [ ] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
