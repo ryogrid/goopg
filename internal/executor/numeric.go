@@ -111,6 +111,10 @@ func toNumeric(d Datum, op string, pos int) (Datum, error) {
 		return d, nil
 	case KindInt:
 		return numericFromInt(d.Int), nil
+	case KindString:
+		if m, s, err := parseNumeric(d.String); err == nil {
+			return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
+		}
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires numeric operands", op)}
 }

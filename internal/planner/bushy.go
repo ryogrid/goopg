@@ -676,5 +676,128 @@ func rewriteMultiWayChain(node Node) Node {
 		fullSchema = append(fullSchema, s.Output()...)
 	}
 	mh.schema = fullSchema
+	// Remap parent ColumnRef indices: the MultiHashJoin output
+	// schema may be in a different order (DFS walk) than the
+	// original binary join tree (FROM-clause / DP join order).
+	// Walk the plan tree that contains this MHJ and remap any
+	// ColumnRefs that indexed into the old subtree so they
+	// point to the correct positions in the MHJ output.
 	return mh
+}
+
+// remapExprRefsToMHJ walks the plan tree and remaps ColumnRef
+// indices to match a MultiHashJoin's output schema when one is
+// encountered.  The remap applies to ALL ancestor expression-
+// bearing nodes (Filter, Project, Sort, Aggregate) whose
+// ColumnRefs may reference the MHJ output — not just the
+// immediate parent.
+func remapExprRefsToMHJ(node Node) Node {
+	if node == nil {
+		return nil
+	}
+	// Recurse first, collecting any MHJ schema we encounter.
+	var mhSchema Schema
+	switch n := node.(type) {
+	case *MultiHashJoin:
+		mhSchema = n.Output()
+	case *Filter:
+		n.Child = remapExprRefsToMHJ(n.Child)
+		mhSchema = mhjSchemaOf(n.Child)
+		if mhSchema != nil {
+			remapColumnRefs(&n.Predicate, mhSchema)
+		}
+		return n
+	case *Project:
+		n.Child = remapExprRefsToMHJ(n.Child)
+		mhSchema = mhjSchemaOf(n.Child)
+		if mhSchema != nil {
+			for i := range n.Targets {
+				remapColumnRefs(&n.Targets[i], mhSchema)
+			}
+		}
+		return n
+	case *Sort:
+		n.Child = remapExprRefsToMHJ(n.Child)
+		mhSchema = mhjSchemaOf(n.Child)
+		if mhSchema != nil {
+			for i := range n.Keys {
+				remapColumnRefs(&n.Keys[i].Expr, mhSchema)
+			}
+		}
+		return n
+	case *Aggregate:
+		n.Child = remapExprRefsToMHJ(n.Child)
+		mhSchema = mhjSchemaOf(n.Child)
+		if mhSchema != nil {
+			for i := range n.GroupExprs {
+				remapColumnRefs(&n.GroupExprs[i], mhSchema)
+			}
+			for i := range n.Aggs {
+				if n.Aggs[i].Arg != nil {
+					remapColumnRefs(&n.Aggs[i].Arg, mhSchema)
+				}
+			}
+		}
+		return n
+	case *Join:
+		n.Left = remapExprRefsToMHJ(n.Left)
+		n.Right = remapExprRefsToMHJ(n.Right)
+	}
+	return node
+}
+
+// mhjSchemaOf returns the output schema of the first MultiHashJoin
+// found by traversing through thin wrappers (Filter, Project) in
+// the subtree.
+func mhjSchemaOf(node Node) Schema {
+	for {
+		if node == nil {
+			return nil
+		}
+		if mh, ok := node.(*MultiHashJoin); ok {
+			return mh.Output()
+		}
+		switch n := node.(type) {
+		case *Filter:
+			node = n.Child
+		case *Project:
+			node = n.Child
+		case *Sort:
+			node = n.Child
+		case *Aggregate:
+			node = n.Child
+		default:
+			return nil
+		}
+	}
+}
+
+// remapColumnRefs walks an expression tree and updates any
+// ColumnRef.Index to match the column's position in the given
+// schema (identified by column name).  This corrects stale
+// indices after a plan-tree rewrite changes the output order.
+func remapColumnRefs(e *Expr, schema Schema) {
+	if e == nil || *e == nil {
+		return
+	}
+	switch x := (*e).(type) {
+	case *ColumnRef:
+		for i, col := range schema {
+			if col.Name == x.Name && x.Index != i {
+				cl := *x
+				cl.Index = i
+				*e = &cl
+				return
+			}
+		}
+	case *BinaryOp:
+		remapColumnRefs(&x.Left, schema)
+		remapColumnRefs(&x.Right, schema)
+	case *UnaryOp:
+		remapColumnRefs(&x.Operand, schema)
+	case *FuncCall:
+		for i := range x.Args {
+			remapColumnRefs(&x.Args[i], schema)
+		}
+	}
 }

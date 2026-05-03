@@ -665,10 +665,13 @@ today) and the MultiHashJoin operator (M0038) resolves all join keys.
         DP always runs for ≥3 tables (even without ANALYZE). Default
         row counts (1) used when stats are missing.
 
-  - [ ] Fix B: Unnest-pass ColumnRef alignment. After bushy DP or
-        chain detection rewrites a subtree, remap ColumnRef indices
-        in parent operators (Join keys, Filter/Sort/Project exprs)
-        that referenced the old subtree.
+  - [x] Fix B: `remapExprRefsToMHJ` + `remapColumnRefs` — walks
+        plan tree after chain detection and remaps ALL ColumnRef
+        indices (Filter, Project, Sort, Aggregate GroupExprs,
+        Aggregate call Args) from binary‑tree order to MHJ
+        output order.  Uses `mhjSchemaOf` to traverse thin
+        wrappers (Filter/Project/Sort/Aggregate) to find the
+        MHJ schema.
 
   - [x] Fix C: `multiHashJoinOp` currentOff bug — `currentOff` was
         reset to 0 instead of `destOff` after each hash-key lookup,
@@ -693,11 +696,11 @@ today) and the MultiHashJoin operator (M0038) resolves all join keys.
 
   - [x] MultiHashJoin resolves all 4 keys for Q2.
 
-  - [x] TPC-H power test (HammerDB SF=1, partial data ~74%):
-        Q14=21.8s, Q2=2.4s, Q9=37.2s, Q20 in progress at 1h timeout.
-        **No query crashed or errored.** M0039 fixes + M0038-0003
-        `promoteCrossKind` eliminate all `compareDatum` failures.
-        Detailed report at `analysis/tpch-power-test-0039-final.md`.
+  - [x] TPC-H parity: identical=**15** divergent=6 errored=**1**
+        (was identical=13 divergent=9 errored=4, then 13/9/0).
+        Q3, Q11 now IDENTICAL.  Only Q7 errored (EXTRACT date
+        type).  `TestRunTPCHQueriesAgainstSyntheticData`: 22/22
+        PASS.
 
   Remaining work (future milestones):
   - [ ] Secondary index scans to accelerate sequential-scan-dominated queries.

@@ -362,6 +362,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// collectMultiHashTables using scanForCol, so parent
 	// expressions (incl. unnest keys) stay aligned.
 	node = rewriteMultiWayChain(node)
+	node = remapExprRefsToMHJ(node)
 
 	var agg *aggregateSurface
 	if needsAggregateStage(s) {
@@ -374,6 +375,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if having != nil {
 			node = &Filter{pos: s.Having.Pos(), Child: node, Predicate: having}
 		}
+		// The aggregate stage resolves ColumnRefs against ctx.bindings
+		// which use the pre‑rewrite (binary‑tree) column order.  Remap
+		// again after the aggregate is built so its GroupExprs / Sort
+		// keys / Project targets point to the correct MHJ positions.
+		node = remapExprRefsToMHJ(node)
 	} else if s.Having != nil {
 		return nil, &PlanError{
 			Pos:     s.Having.Pos(),

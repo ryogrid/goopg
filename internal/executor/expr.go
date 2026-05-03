@@ -156,7 +156,19 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
 		// the int side to KindNumeric{scale=0} and reuse the same
-		// scale-aligning helpers.
+		// scale-aligning helpers.  Also try to parse string
+		// operands as numeric (columns loaded via INSERT may be
+		// stored as strings before the type system enforces types).
+		if left.Kind == KindString {
+			if m, s, err := parseNumeric(left.String); err == nil {
+				left = Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}
+			}
+		}
+		if right.Kind == KindString {
+			if m, s, err := parseNumeric(right.String); err == nil {
+				right = Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}
+			}
+		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
@@ -488,6 +500,15 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	}
 	if src.IsNull() {
 		return NullDatum, nil
+	}
+	if src.Kind != KindTime {
+		// Try to parse a string as timestamp (planner may assign
+		// string storage for date columns loaded via INSERT).
+		if src.Kind == KindString {
+			if t, err := parseCopyTimestamp(src.String); err == nil {
+				src = Datum{Kind: KindTime, Time: t}
+			}
+		}
 	}
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT(%s FROM …) requires timestamp/date input", x.Field)}
