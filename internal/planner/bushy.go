@@ -552,11 +552,16 @@ func markEdgesInMask(mask uint16, g *joinGraph, used []bool) {
 
 // collectMultiHashTables walks a left-deep chain of hash joins and
 // collects the SeqScan leaf nodes. Returns the scan nodes in join
-// order and the join keys for each edge, or nil if the tree is not
-// a valid chain (≥3 tables, all JoinAlgoHash, all inner, chained).
-func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
+// order, the join keys for each edge, the probe table index, and
+// any extra residual conjuncts that were ANDed onto Inner-Hash
+// joins by `pushOneConjunct` (which the original chain detection
+// silently dropped because it only inspected `j.LeftKey` /
+// `j.RightKey`). Returns (nil, nil, 0, nil) when the tree is not a
+// valid chain (≥3 tables, all JoinAlgoHash, all inner, chained).
+func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int, []Expr) {
 	var scans []Node
 	var keys []MultiHashKey
+	var extras []Expr
 
 	var walk func(n Node) bool
 	walk = func(n Node) bool {
@@ -591,6 +596,31 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 			return false
 		}
 		rightEnd := len(scans)
+		// Capture extras AND'd onto j.Predicate beyond the canonical
+		// `LeftKey = RightKey` equality, but ONLY when every
+		// ColumnRef in the extra references a column NAME present
+		// in some scan inside the MHJ's subset. pushOneConjunct's
+		// width-based side classification can mis-push a conjunct
+		// onto a Join whose subtree doesn't actually contain the
+		// referenced tables (e.g. TPC-H Q9 pushes
+		// `ps_partkey = l_partkey` onto a 4-table Inner Join that
+		// doesn't include partsupp because the global FROM index of
+		// ps_partkey happens to fall inside that Join's
+		// subset-FROM-order width range). Capturing such conjuncts
+		// into MHJ.Filters would attempt to evaluate them on the
+		// MHJ output row where the ps_partkey column doesn't exist,
+		// producing wrong results. The conjunct is left in the
+		// outer Filter where the bindings posMap will remap it to
+		// actual scan offsets and the post-join evaluation will
+		// see all tables.
+		for _, c := range splitAnd(j.Predicate) {
+			if isCanonicalKeyEquality(c, j.LeftKey, j.RightKey) {
+				continue
+			}
+			if extraInScans(c, scans) {
+				extras = append(extras, c)
+			}
+		}
 
 		// Determine which scan and column the left/right join keys
 		// reference.  We resolve by column name rather than by
@@ -612,7 +642,7 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 		return true
 	}
 	if !walk(node) || len(scans) < 3 {
-		return nil, nil, 0
+		return nil, nil, 0, nil
 	}
 
 	// Verify the keys form a simple chain: each table may appear
@@ -633,7 +663,7 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 		}
 	}
 	if !chainOK {
-		return nil, nil, 0
+		return nil, nil, 0, nil
 	}
 
 	// Determine probe table: the one with the largest row count.
@@ -645,7 +675,88 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 			probeIdx = i
 		}
 	}
-	return scans, keys, probeIdx
+	return scans, keys, probeIdx, extras
+}
+
+// isCanonicalKeyEquality reports whether c is the canonical
+// `LeftKey = RightKey` BinaryOp produced by buildJoinFromDP /
+// pushOneConjunct's CROSS→Inner promotion. Used to filter that
+// canonical equality out when capturing extras from a Join's
+// AND'd Predicate.
+func isCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
+	bin, ok := c.(*BinaryOp)
+	if !ok || bin.Op != "=" {
+		return false
+	}
+	return bin.Left == leftKey && bin.Right == rightKey
+}
+
+// extraInScans reports whether every ColumnRef in c references a
+// column name that appears in the output schema of at least one
+// scan in scans. Used to validate that an MHJ.Filters extra
+// belongs to the MHJ's subset before capturing it.
+func extraInScans(c Expr, scans []Node) bool {
+	allMatched := true
+	visitColumnRefsForTable(c, func(idx int) {})
+	visitColumnRefsByName(c, func(name string) {
+		found := false
+		for _, s := range scans {
+			ss, ok := s.(*SeqScan)
+			if !ok {
+				continue
+			}
+			for _, col := range ss.Output() {
+				if col.Name == name {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			allMatched = false
+		}
+	})
+	return allMatched
+}
+
+// visitColumnRefsByName invokes fn on each ColumnRef Name in e.
+func visitColumnRefsByName(e Expr, fn func(string)) {
+	if e == nil {
+		return
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		if x.Name != "" {
+			fn(x.Name)
+		}
+	case *BinaryOp:
+		visitColumnRefsByName(x.Left, fn)
+		visitColumnRefsByName(x.Right, fn)
+	case *UnaryOp:
+		visitColumnRefsByName(x.Operand, fn)
+	case *FuncCall:
+		for _, a := range x.Args {
+			visitColumnRefsByName(a, fn)
+		}
+	case *ExtractExpr:
+		visitColumnRefsByName(x.Source, fn)
+	case *CaseExpr:
+		if x.Operand != nil {
+			visitColumnRefsByName(x.Operand, fn)
+		}
+		for _, w := range x.Whens {
+			visitColumnRefsByName(w.When, fn)
+			visitColumnRefsByName(w.Then, fn)
+		}
+		if x.Else != nil {
+			visitColumnRefsByName(x.Else, fn)
+		}
+	case *InExpr:
+		visitColumnRefsByName(x.Operand, fn)
+	}
 }
 
 // findScanByColName resolves a join-key ColumnRef to a
@@ -679,7 +790,7 @@ func rewriteMultiWayChain(node Node) Node {
 	if node == nil {
 		return nil
 	}
-	scans, keys, probeIdx := collectMultiHashTables(node)
+	scans, keys, probeIdx, extras := collectMultiHashTables(node)
 	if scans == nil {
 		// Not a valid chain — recurse into children.
 		// Only recurse into Join (binary ops) and thin wrappers
@@ -705,7 +816,7 @@ func rewriteMultiWayChain(node Node) Node {
 		Tables:     scans,
 		Keys:       keys,
 		ProbeTable: probeIdx,
-		Filters:    nil,
+		Filters:    extras,
 	}
 	// Sort the tables (scans) by catalog OID so the output
 	// schema is in FROM-clause (table-creation) order, matching
@@ -1048,30 +1159,22 @@ func remapAggExprsWithBindings(node Node, bindings []rangeBinding) {
 	}
 }
 
-// mhjPosMapOf returns a position map (old FROM‑order → new MHJ
-// DFS‑order) if the subtree contains a MultiHashJoin, or nil.
-func mhjPosMapOf(node Node) func(int) int {
-	for {
-		if node == nil {
-			return nil
-		}
-		if mh, ok := node.(*MultiHashJoin); ok {
-			return buildMHJPosMap(mh)
-		}
-		switch n := node.(type) {
-		case *Filter:
-			node = n.Child
-		case *Project:
-			node = n.Child
-		case *Sort:
-			node = n.Child
-		case *Aggregate:
-			node = n.Child
-		default:
-			return nil
-		}
-	}
-}
+// mhjPosMapOf was a position map keyed by table OID, intended to
+// remap FROM‑order ColumnRef indices into the MHJ's OID‑sorted
+// output. The implementation was fundamentally broken: it assumed
+// FROM‑order == OID‑order (false whenever the FROM list isn't in
+// table‑creation order, which is most TPC‑H queries), and it
+// collapsed duplicate OIDs (self‑joins like TPC‑H Q7's
+// `nation n1, nation n2` where both scans share the nation OID).
+// The bindings‑based posMap (`buildBindingsPosMap`, used by
+// `remapWithBindings`) correctly handles both cases — it has access
+// to the actual FROM order via `rangeBinding.offset` and uses
+// `scanKey{table, alias}` to disambiguate self‑joins.
+//
+// Returning nil here makes the first remap pass a no‑op for all
+// node arms; the second (bindings) pass handles everything that
+// matters.
+func mhjPosMapOf(node Node) func(int) int { return nil }
 
 // remapColumnRefs walks an expression tree and updates any
 // ColumnRef.Index using a position map built from the
@@ -1266,7 +1369,19 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 	}
 	switch n := node.(type) {
 	case *MultiHashJoin:
-		return // tables/keys already in output order
+		// MHJ keys are stored in per-table column-index pairs and
+		// are independent of the output schema. Filters, however,
+		// are evaluated on the joined output row — their
+		// ColumnRefs come from `pushOneConjunct` ANDing residual
+		// conjuncts onto Inner-Hash joins, then collectMultiHash-
+		// Tables capturing those extras when those joins were
+		// absorbed into the MHJ. Those refs are in pre-rewrite
+		// (global FROM-order) coords; remap them to MHJ-output
+		// coords here.
+		for i := range n.Filters {
+			remapByPosMap(&n.Filters[i], posMap)
+		}
+		return
 	case *Join:
 		applyJoinTreePosMap(n.Left, posMap)
 		applyJoinTreePosMap(n.Right, posMap)
@@ -1357,25 +1472,39 @@ func reresolveJoinByName(j *Join) {
 			cr.Index = newIdx
 		}
 	}
-	// Note the ORIGINAL leftWidth before refreshing j.schema so we
-	// can classify each predicate ColumnRef by its pre-rewrite
-	// index. This matters for joins where the same column name
-	// appears on both sides (e.g. `a INNER JOIN b ON a.id = b.id`):
-	// looking up "id" in leftSchema first would silently rebind
-	// the right-side ColumnRef onto the left, producing a
-	// predicate of `a.id = a.id`.
+	// predRebind resolves a ColumnRef in the Predicate by NAME. It
+	// tries the side suggested by the original Index first (so
+	// `a INNER JOIN b ON a.id = b.id` keeps a.id on the left and
+	// b.id on the right when names collide), but falls back to the
+	// other side if the Name isn't found there. This covers
+	// pushOneConjunct's residuals: when a conjunct from a higher
+	// scope is ANDed onto a Join's Predicate, its ColumnRef indices
+	// may already have been remapped by an earlier pass — so the
+	// original-Index side classification can be wrong, and we need
+	// to retry the opposite side by Name.
 	predRebind := func(e Expr) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
 			return
 		}
-		if cr.Index < leftWidth {
+		tryLeftFirst := cr.Index < leftWidth
+		if tryLeftFirst {
 			if newIdx := findUnique(leftSchema, cr.Name, 0); newIdx >= 0 {
 				cr.Index = newIdx
+				return
+			}
+			if newIdx := findUnique(rightSchema, cr.Name, leftWidth); newIdx >= 0 {
+				cr.Index = newIdx
+				return
 			}
 		} else {
 			if newIdx := findUnique(rightSchema, cr.Name, leftWidth); newIdx >= 0 {
 				cr.Index = newIdx
+				return
+			}
+			if newIdx := findUnique(leftSchema, cr.Name, 0); newIdx >= 0 {
+				cr.Index = newIdx
+				return
 			}
 		}
 	}

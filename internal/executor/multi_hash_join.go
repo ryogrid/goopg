@@ -9,15 +9,27 @@ import (
 // Probe phase: stream the one "probe" table, chain-lookup through
 // hash tables, and emit joined rows lazily via Next().
 type multiHashJoinOp struct {
-	plan     *planner.MultiHashJoin
-	children []Operator
-	hashTbls []map[string]Row // one per build child
-	probeOp  Operator
-	keySteps []keyStep // ordered lookup chain
-	filters  []planner.Expr
-	nulls    []Row // null-padded rows for schema
-	schema   planner.Schema
-	ctx      *Context
+	plan       *planner.MultiHashJoin
+	children   []Operator
+	hashTbls   []map[string][]Row // one per build child; multi-value
+	probeOp    Operator
+	keySteps   []keyStep // ordered lookup chain
+	filters    []planner.Expr
+	nulls      []Row // null-padded rows for schema
+	tableOff   []int // precomputed offset of each table in output
+	schema     planner.Schema
+	ctx        *Context
+
+	// Materialised join output state. The chain may produce
+	// multiple rows per probe row when any build table has multi-
+	// row matches per key (e.g. TPC-H Q9 partsupp where two
+	// partsupps share each ps_suppkey). Open() drives the chain
+	// once and stores all output rows; Next() yields them one at
+	// a time. (Lazy expansion across multiple multi-match steps
+	// would require nested iterators — the synthetic dataset is
+	// small and this materialisation has negligible cost.)
+	rows []Row
+	idx  int
 }
 
 // keyStep describes one chain-lookup: take the value at the
@@ -45,8 +57,10 @@ func newMultiHashJoinOp(plan *planner.MultiHashJoin, children []Operator) *multi
 
 func (o *multiHashJoinOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	o.rows = nil
+	o.idx = 0
 	nTables := len(o.plan.Tables)
-	o.hashTbls = make([]map[string]Row, nTables)
+	o.hashTbls = make([]map[string][]Row, nTables)
 	if o.nulls == nil || len(o.nulls) != nTables || len(o.nulls[0]) == 0 {
 		o.nulls = make([]Row, nTables)
 		for i := range o.nulls {
@@ -151,97 +165,104 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 				}
 			}
 		}
-		ht := make(map[string]Row, len(rows))
+		ht := make(map[string][]Row, len(rows))
 		for _, r := range rows {
 			if keyCol >= 0 && keyCol < len(r) {
-				ht[datumKey(r[keyCol])] = r
+				ht[datumKey(r[keyCol])] = append(ht[datumKey(r[keyCol])], r)
 			}
 		}
 		o.hashTbls[i] = ht
 	}
 
-	// Open probe child for streaming.
+	// Open probe child and drive the entire join — produce the
+	// Cartesian expansion across multi-match chain steps up front.
 	o.probeOp = o.children[probe]
 	if err := o.probeOp.Open(ctx); err != nil {
 		return err
 	}
-
 	o.filters = o.plan.Filters
+
+	o.tableOff = make([]int, nTables)
+	acc := 0
+	for i := 0; i < nTables; i++ {
+		o.tableOff[i] = acc
+		acc += len(o.nulls[i])
+	}
+	for {
+		probeRow, err := o.probeOp.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		out := make(Row, 0, len(o.schema))
+		for i := 0; i < nTables; i++ {
+			out = append(out, o.nulls[i]...)
+		}
+		copy(out[o.tableOff[o.plan.ProbeTable]:], probeRow)
+		if err := o.expandChain(out, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// expandChain drives the chain of hash lookups depth-first, emitting
+// one output row per Cartesian combination of multi-row matches at
+// each step. Materialising all output rows up front avoids holding
+// per-step iterator state across Next() calls; the synthetic dataset
+// is small and TPC-H scales fit comfortably in memory.
+func (o *multiHashJoinOp) expandChain(out Row, stepIdx int) error {
+	if stepIdx >= len(o.keySteps) {
+		// Leaf: apply residual filters, emit if all pass.
+		for _, f := range o.filters {
+			v, err := evalExpr(f, out, o.ctx)
+			if err != nil {
+				return err
+			}
+			if v.IsNull() || !(v.Kind == KindBool && v.Bool) {
+				return nil
+			}
+		}
+		// Copy out (caller may overwrite slots in subsequent
+		// recursion levels for sibling matches).
+		row := make(Row, len(out))
+		copy(row, out)
+		o.rows = append(o.rows, row)
+		return nil
+	}
+	step := o.keySteps[stepIdx]
+	srcOff := o.tableOff[step.srcTable]
+	srcLen := len(o.nulls[step.srcTable])
+	if step.srcCol >= srcLen {
+		return nil // no source value
+	}
+	keyVal := out[srcOff+step.srcCol]
+	matches := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
+	if len(matches) == 0 {
+		return nil // INNER semantics: no matches → drop branch
+	}
+	dstOff := o.tableOff[step.hashTblIndex]
+	for _, m := range matches {
+		copy(out[dstOff:], m)
+		if err := o.expandChain(out, stepIdx+1); err != nil {
+			return err
+		}
+	}
+	// Restore null padding so sibling branches don't see leftover
+	// values from this match.
+	copy(out[dstOff:], o.nulls[step.hashTblIndex])
 	return nil
 }
 
 func (o *multiHashJoinOp) Next() (Row, error) {
-	for {
-		probeRow, err := o.probeOp.Next()
-		if err == EOF {
-			return nil, EOF
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		// Accumulate: start with probe table's columns plus null padding
-		// for all other tables.
-		out := make(Row, 0, len(o.schema))
-		// Fill with nulls, then overwrite the probe table's position.
-		nTables := len(o.plan.Tables)
-		for i := 0; i < nTables; i++ {
-			out = append(out, o.nulls[i]...)
-		}
-		// Precompute each table's offset in the accumulated output.
-		tableOff := make([]int, nTables)
-		acc := 0
-		for i := 0; i < nTables; i++ {
-			tableOff[i] = acc
-			acc += len(o.nulls[i])
-		}
-		// Copy probe row into position.
-		copy(out[tableOff[o.plan.ProbeTable]:], probeRow)
-
-		matched := true
-
-		// Chain lookup through hash tables. Each step takes the
-		// lookup key from out[srcTable_off + srcCol] — independent
-		// of step order — so the chain can branch from the probe
-		// to multiple subtrees.
-		for _, step := range o.keySteps {
-			srcOff := tableOff[step.srcTable]
-			srcLen := len(o.nulls[step.srcTable])
-			if step.srcCol >= srcLen {
-				matched = false
-				break
-			}
-			keyVal := out[srcOff+step.srcCol]
-			match, ok := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
-			if !ok {
-				matched = false
-				break
-			}
-			copy(out[tableOff[step.hashTblIndex]:], match)
-		}
-
-		if !matched {
-			continue // INNER semantics: skip unmatched probe rows
-		}
-
-		// Apply residual filters.
-		ok := true
-		for _, f := range o.filters {
-			v, err := evalExpr(f, out, o.ctx)
-			if err != nil {
-				return nil, err
-			}
-			if v.IsNull() || !(v.Kind == KindBool && v.Bool) {
-				ok = false
-				break
-			}
-		}
-		if !ok {
-			continue
-		}
-
-		return out, nil
+	if o.idx >= len(o.rows) {
+		return nil, EOF
 	}
+	row := o.rows[o.idx]
+	o.idx++
+	return row, nil
 }
 
 func (o *multiHashJoinOp) Close() error {

@@ -366,14 +366,30 @@ func (o *joinOp) nextLazy() (Row, error) {
 	nullLeft := nullRow(o.lazyLW)
 	nullRight := nullRow(o.lazyRW)
 	for {
-		// Continue serving matches from current probe row.
-		if o.lazyActive && o.lazyMatchIdx < len(o.lazyMatches) {
+		// Continue serving matches from current probe row. Apply
+		// the full join Predicate per emitted row — hash matching
+		// only checks LeftKey=RightKey, but the planner may have
+		// ANDed extra residual conjuncts onto the Predicate via
+		// pushOneConjunct (e.g. TPC-H Q9's `ps_partkey=l_partkey`
+		// pushed onto the part-join). Without the post-hash filter
+		// those extras are silently dropped and the join over-emits.
+		for o.lazyActive && o.lazyMatchIdx < len(o.lazyMatches) {
 			m := o.lazyMatches[o.lazyMatchIdx]
 			o.lazyMatchIdx++
+			var joined Row
 			if o.plan.BuildLeft {
-				return concatRows(m, o.lazyRow), nil
+				joined = concatRows(m, o.lazyRow)
+			} else {
+				joined = concatRows(o.lazyRow, m)
 			}
-			return concatRows(o.lazyRow, m), nil
+			ok, err := o.joinPredicateMatch(joined)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			return joined, nil
 		}
 		o.lazyActive = false
 		// Pull next probe row.
