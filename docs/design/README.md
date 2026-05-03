@@ -199,8 +199,8 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0040-0001 | [Subquery Caching and IN‑Subquery Unnest](0040-0001-subquery-caching-and-unnest.md) | accepted | Two-part optimisation: (1) cache correlated subquery results per outer-key to eliminate per-row re-execution; (2) extend the unnest pass to rewrite `IN(subquery)` as hash semi-join. Targets TPC‑H Q20 ≤ 120 s. See `docs/milestones/0040-correlated-subquery-optimization.md`. |
 
-| 0041-0001 | [Close Remaining TPC-H Parity Gaps](0041-0001-close-parity-gaps.md) | in‑progress | Analyse and fix the remaining DIVERGENT TPC‑H queries. Bindings‑based posMap with `(table*, alias)` self‑join key + split agg‑expr / HAVING remap closes Q3 and Q11 (parity 14→15). Q5/Q7/Q9/Q10 still open — tracked in `0041-0002`. See `docs/milestones/0041-close-parity-gaps.md`. |
+| 0041-0001 | [Close Remaining TPC-H Parity Gaps](0041-0001-close-parity-gaps.md) | in‑progress | Analyse and fix the remaining DIVERGENT TPC‑H queries. Bindings‑based posMap with `(table*, alias)` self‑join key + split agg‑expr / HAVING remap closed Q3 and Q11 (parity 14→15); follow‑up batch (executor + residual) closed Q5 and Q10 (15→17). Q7 (3 vs 1 rows) and Q9 (one numeric cell) still open — tracked in `0041-0002`. See `docs/milestones/0041-close-parity-gaps.md`. |
 
-| 0041-0002 | [Fix Remaining Divergent TPC-H Queries](0041-0002-fix-remaining-6-queries.md) | in‑progress | Continuation of `0041-0001`. After bindings‑posMap landed, parity is identical=15 divergent=7 (Q1/Q8/Q14 precision allowlisted; Q5/Q7/Q9/Q10 still need investigation per query plan shape). |
+| 0041-0002 | [Fix Remaining Divergent TPC-H Queries](0041-0002-fix-remaining-6-queries.md) | in‑progress | Continuation of `0041-0001`. MHJ executor (chain `visited` + branched build + per‑step `buildKeyCol`), bushy‑DP specific‑edge marking, inline‑view Project remap, and outer‑Join key re‑resolution by name closed Q5 and Q10 — parity 15→17 IDENTICAL. Q7 (alias‑name disambig) and Q9 (residual pushdown coord mismatch) still open. |
 
 Append new rows in numeric order. Do not reorder.

@@ -20,12 +20,19 @@ type multiHashJoinOp struct {
 	ctx      *Context
 }
 
-// keyStep describes one chain-lookup: use col from sourceRow as key
-// to look up hashTbl, then append matched row to output.
+// keyStep describes one chain-lookup: take the value at the
+// srcTable's srcCol from the accumulated output row and use it as
+// the lookup key into hashTbls[hashTblIndex] (whose hash is keyed on
+// buildKeyCol of the build table). Tracking srcTable explicitly
+// (rather than the previously-matched table) lets the chain branch
+// when a probe table connects to two or more tables — TPC-H Q5's
+// lineitem-supplier-…-region path and lineitem-orders-customer
+// path both need to fire from the same probe.
 type keyStep struct {
 	hashTblIndex int // which hashTbls[] to probe
-	srcCol       int // column in current accumulated row for lookup key
-	keyCol       int // column in hash table row that matches (for schema, unused)
+	srcTable     int // table index whose accumulated columns hold the lookup key
+	srcCol       int // column within srcTable used for the lookup
+	buildKeyCol  int // column in the build table that the hash is keyed on
 }
 
 func newMultiHashJoinOp(plan *planner.MultiHashJoin, children []Operator) *multiHashJoinOp {
@@ -51,16 +58,70 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 		}
 	}
 
-	// Determine which tables contribute join keys.
-	// Build edge map: for each MultiHashKey, record which tables
-	// provide the key for linking.
-	type edge struct{ srcTable, srcCol, dstTable int }
-	edges := make([]edge, len(o.plan.Keys))
-	for i, k := range o.plan.Keys {
-		edges[i] = edge{srcTable: k.RightTable, srcCol: k.RightCol, dstTable: k.LeftTable}
+	// Build the chain-lookup steps FIRST so each step records the
+	// exact (table, column) the hash table must be keyed on. Doing
+	// this before the build phase means the hash table is keyed on
+	// the column the chain actually probes.
+	//
+	// At each step, any already-visited table may serve as the
+	// "source" of a new key — not just the most recently added
+	// one. This branches the chain so that, e.g., TPC-H Q5's
+	// lineitem-as-probe can follow both lineitem→supplier→nation→
+	// region AND lineitem→orders→customer in one MHJ.
+	//
+	// `visited[i]` tracks tables already in the chain to prevent
+	// re-visiting and to terminate when no progress is possible.
+	o.keySteps = make([]keyStep, 0, len(o.plan.Keys))
+	probe := o.plan.ProbeTable
+	visited := make([]bool, nTables)
+	visited[probe] = true
+	for len(o.keySteps) < len(o.plan.Keys) {
+		found := false
+		for src := 0; src < nTables && !found; src++ {
+			if !visited[src] {
+				continue
+			}
+			for _, k := range o.plan.Keys {
+				if k.LeftTable != src && k.RightTable != src {
+					continue
+				}
+				buildTbl := k.LeftTable
+				srcCol := k.RightCol
+				buildKeyCol := k.LeftCol
+				if src == k.LeftTable {
+					buildTbl = k.RightTable
+					srcCol = k.LeftCol
+					buildKeyCol = k.RightCol
+				}
+				if buildTbl == probe || visited[buildTbl] {
+					continue
+				}
+				o.keySteps = append(o.keySteps, keyStep{
+					hashTblIndex: buildTbl,
+					srcTable:     src,
+					srcCol:       srcCol,
+					buildKeyCol:  buildKeyCol,
+				})
+				visited[buildTbl] = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			break
+		}
 	}
 
-	// Open all build children and drain them into hash tables.
+	// Open all build children and drain them into hash tables. Each
+	// table's hash key column is taken from the matching keyStep so
+	// the source-side lookup actually finds rows.
+	keyColByTable := make([]int, nTables)
+	for i := range keyColByTable {
+		keyColByTable[i] = -1
+	}
+	for _, st := range o.keySteps {
+		keyColByTable[st.hashTblIndex] = st.buildKeyCol
+	}
 	for i, child := range o.children {
 		if i == o.plan.ProbeTable {
 			continue // probe table is streamed
@@ -73,16 +134,21 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		// Find the key column for this table.
-		keyCol := -1
-		for _, k := range o.plan.Keys {
-			if k.LeftTable == i {
-				keyCol = k.LeftCol
-				break
-			}
-			if k.RightTable == i {
-				keyCol = k.RightCol
-				break
+		keyCol := keyColByTable[i]
+		if keyCol < 0 {
+			// Fallback: pick the first key mentioning this table
+			// (handles tables not reached by the chain — those
+			// rows stay in a nullable hash but contribute no
+			// matches).
+			for _, k := range o.plan.Keys {
+				if k.LeftTable == i {
+					keyCol = k.LeftCol
+					break
+				}
+				if k.RightTable == i {
+					keyCol = k.RightCol
+					break
+				}
 			}
 		}
 		ht := make(map[string]Row, len(rows))
@@ -92,39 +158,6 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 			}
 		}
 		o.hashTbls[i] = ht
-	}
-
-	// Build the chain-lookup steps.
-	// Walk the keys in order to determine the lookup chain.
-	o.keySteps = make([]keyStep, 0, len(o.plan.Keys))
-	probe := o.plan.ProbeTable
-	nextSrc := probe
-	// Find the key where probe table is involved.
-	for len(o.keySteps) < len(o.plan.Keys) {
-		found := false
-		for _, k := range o.plan.Keys {
-			if k.LeftTable == nextSrc || k.RightTable == nextSrc {
-				buildTbl := k.LeftTable
-				srcCol := k.RightCol
-				if nextSrc == k.LeftTable {
-					buildTbl = k.RightTable
-					srcCol = k.LeftCol
-				}
-				if buildTbl == probe || o.hashTbls[buildTbl] == nil {
-					continue // already processed or is probe
-				}
-				o.keySteps = append(o.keySteps, keyStep{
-					hashTblIndex: buildTbl,
-					srcCol:       srcCol,
-				})
-				nextSrc = buildTbl
-				found = true
-				break
-			}
-		}
-		if !found {
-			break
-		}
 	}
 
 	// Open probe child for streaming.
@@ -155,39 +188,36 @@ func (o *multiHashJoinOp) Next() (Row, error) {
 		for i := 0; i < nTables; i++ {
 			out = append(out, o.nulls[i]...)
 		}
-		// Copy probe row into position.
-		probeOff := 0
-		for i := 0; i < o.plan.ProbeTable; i++ {
-			probeOff += len(o.nulls[i])
+		// Precompute each table's offset in the accumulated output.
+		tableOff := make([]int, nTables)
+		acc := 0
+		for i := 0; i < nTables; i++ {
+			tableOff[i] = acc
+			acc += len(o.nulls[i])
 		}
-		copy(out[probeOff:], probeRow)
+		// Copy probe row into position.
+		copy(out[tableOff[o.plan.ProbeTable]:], probeRow)
 
 		matched := true
-		currentOff := probeOff
-		currentLen := len(probeRow)
 
-		// Chain lookup through hash tables.
+		// Chain lookup through hash tables. Each step takes the
+		// lookup key from out[srcTable_off + srcCol] — independent
+		// of step order — so the chain can branch from the probe
+		// to multiple subtrees.
 		for _, step := range o.keySteps {
-			if step.srcCol >= currentLen {
+			srcOff := tableOff[step.srcTable]
+			srcLen := len(o.nulls[step.srcTable])
+			if step.srcCol >= srcLen {
 				matched = false
 				break
 			}
-			keyVal := out[currentOff+step.srcCol]
+			keyVal := out[srcOff+step.srcCol]
 			match, ok := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
 			if !ok {
 				matched = false
 				break
 			}
-			// Copy matched row into output.
-			destOff := 0
-			for i := 0; i < step.hashTblIndex; i++ {
-				destOff += len(o.nulls[i])
-			}
-			copy(out[destOff:], match)
-			// Next step's srcCol is relative to the matched
-			// table's columns, not the whole output row.
-			currentOff = destOff
-			currentLen = len(match)
+			copy(out[tableOff[step.hashTblIndex]:], match)
 		}
 
 		if !matched {

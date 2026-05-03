@@ -157,9 +157,10 @@ Parity progression on the synthetic dataset:
 | Stage | identical | divergent | errored |
 |-------|----------:|----------:|--------:|
 | Pre‑M0041 (M0039) | 14 | 8 | 0 |
-| M0041 partial (this doc) | 15 | 7 | 0 |
+| M0041 partial (Fix A/B/C posMap) | 15 | 7 | 0 |
+| M0041 + executor & residual fixes | **17** | 5 | 0 |
 | Target | ≥ 19 | 3 (Q1+Q8+Q14) | 0 |
 
-Q3 and Q11 closed; Q5, Q7, Q9, Q10 still divergent. The remaining
-work is tracked in `0041-0002-fix-remaining-6-queries.md` (now scoped
-to those 4 queries).
+Q3, Q5, Q10, Q11 are now IDENTICAL. Q7 (3 vs 1 rows) and Q9
+(row=3 col=2 numeric mismatch) remain. See
+`0041-0002-fix-remaining-6-queries.md` §7 for the open items.

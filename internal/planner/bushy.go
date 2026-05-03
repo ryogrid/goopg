@@ -146,7 +146,7 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 // in e belong to, or -1 if columns span multiple tables.
 func tableForCol(e Expr, cumOffsets []int) int {
 	result := -1
-	walkColumnRefsForTable(e, func(colIdx int) {
+	visitColumnRefsForTable(e, func(colIdx int) {
 		for t := 0; t < len(cumOffsets)-1; t++ {
 			if colIdx >= cumOffsets[t] && colIdx < cumOffsets[t+1] {
 				if result == -1 {
@@ -165,10 +165,10 @@ func tableForCol(e Expr, cumOffsets []int) int {
 	return result
 }
 
-// walkColumnRefsForTable is a local helper that visits ColumnRef
-// nodes in an expression tree. Mirrors pushdown.go's walkColumnRefs
+// visitColumnRefsForTable is a local helper that visits ColumnRef
+// nodes in an expression tree. Mirrors pushdown.go's visitColumnRefs
 // but uses planner Expr instead of parser Expr.
-func walkColumnRefsForTable(e Expr, onIdx func(int)) {
+func visitColumnRefsForTable(e Expr, onIdx func(int)) {
 	if e == nil {
 		return
 	}
@@ -178,23 +178,23 @@ func walkColumnRefsForTable(e Expr, onIdx func(int)) {
 	case *OuterColumnRef, *SubqueryExpr, *InExpr, *ExistsExpr:
 		// outer refs and subqueries → out of scope
 	case *BinaryOp:
-		walkColumnRefsForTable(x.Left, onIdx)
-		walkColumnRefsForTable(x.Right, onIdx)
+		visitColumnRefsForTable(x.Left, onIdx)
+		visitColumnRefsForTable(x.Right, onIdx)
 	case *UnaryOp:
-		walkColumnRefsForTable(x.Operand, onIdx)
+		visitColumnRefsForTable(x.Operand, onIdx)
 	case *FuncCall:
 		for _, a := range x.Args {
-			walkColumnRefsForTable(a, onIdx)
+			visitColumnRefsForTable(a, onIdx)
 		}
 	case *CaseExpr:
-		walkColumnRefsForTable(x.Operand, onIdx)
+		visitColumnRefsForTable(x.Operand, onIdx)
 		for _, w := range x.Whens {
-			walkColumnRefsForTable(w.When, onIdx)
-			walkColumnRefsForTable(w.Then, onIdx)
+			visitColumnRefsForTable(w.When, onIdx)
+			visitColumnRefsForTable(w.Then, onIdx)
 		}
-		walkColumnRefsForTable(x.Else, onIdx)
+		visitColumnRefsForTable(x.Else, onIdx)
 	case *ExtractExpr:
-		walkColumnRefsForTable(x.Source, onIdx)
+		visitColumnRefsForTable(x.Source, onIdx)
 	}
 }
 
@@ -240,15 +240,23 @@ func hasCrossEdge(a, b uint16, g *joinGraph) bool {
 }
 
 func findEdgeBetween(a, b uint16, g *joinGraph) *joinEdge {
+	e, _ := findEdgeBetweenIdx(a, b, g)
+	return e
+}
+
+// findEdgeBetweenIdx is findEdgeBetween that also returns the edge's
+// index in g.edges, so callers can mark just that specific edge as
+// used (rather than all edges within a mask).
+func findEdgeBetweenIdx(a, b uint16, g *joinGraph) (*joinEdge, int) {
 	for i := range g.edges {
 		e := &g.edges[i]
 		ma := uint16(1 << e.leftTable)
 		mb := uint16(1 << e.rightTable)
 		if (a&ma != 0 && b&mb != 0) || (a&mb != 0 && b&ma != 0) {
-			return e
+			return e, i
 		}
 	}
-	return nil
+	return nil, -1
 }
 
 type dpEntry struct {
@@ -299,6 +307,8 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 				continue
 			}
 			var best *dpEntry
+			var bestEdgeIdx int
+			bestEdgeIdx = -1
 			enumerateSplits(mask, func(a, b uint16) {
 				if !isConnectedMask(a, g) || !isConnectedMask(b, g) {
 					return
@@ -306,7 +316,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 				if !hasCrossEdge(a, b, g) {
 					return
 				}
-				edge := findEdgeBetween(a, b, g)
+				edge, edgeIdx := findEdgeBetweenIdx(a, b, g)
 				if edge == nil {
 					return
 				}
@@ -319,11 +329,25 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 				if best == nil || cost < best.cost {
 					join := buildJoinFromDP(entryA.plan, entryB.plan, a, b, edge, g)
 					best = &dpEntry{plan: join, cost: cost}
+					bestEdgeIdx = edgeIdx
 				}
 			})
 			if best != nil {
 				dp[mask] = *best
-				markEdgesInMask(mask, g, edgeUsed)
+				if bestEdgeIdx >= 0 {
+					// Mark only the SPECIFIC edge picked at this
+					// DP step. Internal edges of the two subsets
+					// were marked when their dp[] entries were
+					// computed. Marking all edges in mask (the old
+					// behaviour) over‑consumes when two tables are
+					// connected by multiple equality conjuncts —
+					// e.g. TPC‑H Q9's partsupp↔lineitem (ps_suppkey
+					// =l_suppkey AND ps_partkey=l_partkey): the
+					// join uses one edge, the other should remain
+					// a residual conjunct that pushdown can AND
+					// onto the join's predicate.
+					edgeUsed[bestEdgeIdx] = true
+				}
 			}
 		}
 	}
@@ -333,7 +357,13 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 		return nil, conjuncts, nil
 	}
 
-	// Build residual conjuncts.
+	// Build residual conjuncts. A conjunct is consumed only if the
+	// SPECIFIC edge that carries its predicate was used by the DP
+	// — checking by table-pair alone over‑consumes when two
+	// tables are connected by multiple equalities (e.g. TPC‑H Q9's
+	// partsupp↔lineitem ps_suppkey=l_suppkey AND ps_partkey=
+	// l_partkey: only one edge wins; the other must surface as
+	// residual so pushdown can AND it onto the join's predicate).
 	residual := make([]Expr, 0, len(conjuncts))
 	for _, c := range conjuncts {
 		bin, ok := c.(*BinaryOp)
@@ -349,11 +379,10 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 		}
 		used := false
 		for i, e := range g.edges {
-			if e.leftTable == li && e.rightTable == ri && edgeUsed[i] {
-				used = true
-				break
+			if !edgeUsed[i] {
+				continue
 			}
-			if e.leftTable == ri && e.rightTable == li && edgeUsed[i] {
+			if e.predicate == bin {
 				used = true
 				break
 			}
@@ -362,7 +391,6 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 			residual = append(residual, c)
 		}
 	}
-
 	return fullEntry.plan, residual, nil
 }
 
@@ -917,6 +945,71 @@ func remapWithBindings(node Node, bindings []rangeBinding) {
 	applyJoinTreePosMap(node, posMap)
 }
 
+// remapTopProjection applies a bindings‑based posMap to ColumnRefs
+// in the top Project's Targets and any Sort keys above the join
+// tree, stopping as soon as a Filter / Aggregate / Join / MHJ is
+// reached (those were already remapped by the earlier
+// remapWithBindings pass — walking into them would double‑remap).
+//
+// Used for inline‑view subqueries (TPC‑H Q7/Q8/Q9), whose recursive
+// planSelect resolves Project targets against FROM‑clause bindings
+// after the join tree was rewritten — so the targets carry stale
+// FROM‑order indices that the join‑tree remap already corrected
+// elsewhere.
+func remapTopProjection(out Node, bindings []rangeBinding) {
+	if out == nil || len(bindings) == 0 {
+		return
+	}
+	// Find the join‑tree subtree (the Filter / Join / MHJ node)
+	// to derive the posMap from. Walk down past Project / Sort /
+	// Limit / LockRows wrappers until we hit it.
+	root := out
+	for {
+		switch n := root.(type) {
+		case *Project:
+			root = n.Child
+			continue
+		case *Sort:
+			root = n.Child
+			continue
+		case *Limit:
+			root = n.Child
+			continue
+		case *LockRows:
+			root = n.Child
+			continue
+		}
+		break
+	}
+	posMap := buildBindingsPosMap(root, bindings)
+	if posMap == nil {
+		return
+	}
+	// Now walk the wrappers and remap only their direct
+	// expressions.
+	n := out
+	for n != nil {
+		switch x := n.(type) {
+		case *Project:
+			for i := range x.Targets {
+				remapByPosMap(&x.Targets[i], posMap)
+			}
+			n = x.Child
+		case *Sort:
+			for i := range x.Keys {
+				remapByPosMap(&x.Keys[i].Expr, posMap)
+			}
+			n = x.Child
+		case *Limit:
+			n = x.Child
+		case *LockRows:
+			n = x.Child
+		default:
+			return
+		}
+	}
+}
+
 // remapAggExprsWithBindings remaps the GroupExprs and Agg.Arg
 // expressions of the Aggregate node that is at or directly below node
 // (unwrapping at most one Filter wrapper for the HAVING clause).
@@ -1177,8 +1270,17 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 	case *Join:
 		applyJoinTreePosMap(n.Left, posMap)
 		applyJoinTreePosMap(n.Right, posMap)
-		// Join.Predicate / LeftKey / RightKey were built with per‑
-		// subset indices by buildJoinFromDP — do NOT remap them.
+		// Re‑resolve Join keys/predicate by NAME against the
+		// post‑rewrite child output schemas. The bushy DP produced
+		// subset‑FROM‑order indices, but rewriteMultiWayChain may
+		// have OID‑sorted the inner subtree (the MHJ), invalidating
+		// those indices. Looking up by ColumnRef.Name in the
+		// freshly‑exposed schemas is robust to any in‑place
+		// reordering — column names are unique per table
+		// (TPC‑H prefixes p_, s_, l_, …). Self‑joins use SeqScan
+		// alias‑aware schemas; ambiguous matches keep the original
+		// index untouched.
+		reresolveJoinByName(n)
 	case *Filter:
 		applyJoinTreePosMap(n.Child, posMap)
 		remapByPosMap(&n.Predicate, posMap)
@@ -1194,5 +1296,128 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		}
 	case *Aggregate:
 		return // stop — aggregate expressions are a different scope
+	}
+}
+
+// reresolveJoinByName re‑binds ColumnRef indices in a Join's keys
+// and predicate by matching ColumnRef.Name against the actual output
+// schemas of n.Left and n.Right. Used after rewriteMultiWayChain to
+// fix indices that pointed into the pre‑rewrite (subset‑FROM‑order)
+// schema and now need to land in the post‑rewrite (e.g. OID‑sorted
+// MHJ output) schema.
+//
+// Also refreshes j.schema from the current Left/Right outputs so that
+// outer Joins (whose Left is this Join) see a current layout when
+// they themselves rebind. Without this refresh, the cached schema
+// from buildJoinFromDP keeps the pre‑rewrite layout and outer Joins
+// rebind to stale positions.
+//
+// When a name is ambiguous (appears in multiple positions, e.g.
+// self‑joins), the original index is preserved for that ref.
+func reresolveJoinByName(j *Join) {
+	if j == nil {
+		return
+	}
+	leftSchema := j.Left.Output()
+	rightSchema := j.Right.Output()
+	leftWidth := len(leftSchema)
+	// Refresh cached merged schema.
+	merged := make(Schema, leftWidth+len(rightSchema))
+	copy(merged, leftSchema)
+	copy(merged[leftWidth:], rightSchema)
+	j.schema = merged
+
+	// findUnique returns the unique index of name in schema
+	// (offset by `offset`), or -1 if absent or duplicated.
+	findUnique := func(schema Schema, name string, offset int) int {
+		hit := -1
+		for i, c := range schema {
+			if c.Name == name {
+				if hit >= 0 {
+					return -1 // duplicate
+				}
+				hit = i + offset
+			}
+		}
+		return hit
+	}
+
+	rebind := func(e Expr, leftSide bool) {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			return
+		}
+		var newIdx int
+		if leftSide {
+			newIdx = findUnique(leftSchema, cr.Name, 0)
+		} else {
+			newIdx = findUnique(rightSchema, cr.Name, leftWidth)
+		}
+		if newIdx >= 0 {
+			cr.Index = newIdx
+		}
+	}
+	// Note the ORIGINAL leftWidth before refreshing j.schema so we
+	// can classify each predicate ColumnRef by its pre-rewrite
+	// index. This matters for joins where the same column name
+	// appears on both sides (e.g. `a INNER JOIN b ON a.id = b.id`):
+	// looking up "id" in leftSchema first would silently rebind
+	// the right-side ColumnRef onto the left, producing a
+	// predicate of `a.id = a.id`.
+	predRebind := func(e Expr) {
+		cr, ok := e.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			return
+		}
+		if cr.Index < leftWidth {
+			if newIdx := findUnique(leftSchema, cr.Name, 0); newIdx >= 0 {
+				cr.Index = newIdx
+			}
+		} else {
+			if newIdx := findUnique(rightSchema, cr.Name, leftWidth); newIdx >= 0 {
+				cr.Index = newIdx
+			}
+		}
+	}
+	rebind(j.LeftKey, true)
+	rebind(j.RightKey, false)
+	visitColumnRefs(j.Predicate, predRebind)
+}
+
+// visitColumnRefs invokes fn on every ColumnRef (and OuterColumnRef
+// via type fallthrough — left out: outer refs reach a different
+// scope) found in the expression tree, including arms of CaseExpr
+// and arguments of FuncCall, BinaryOp, UnaryOp, ExtractExpr.
+func visitColumnRefs(e Expr, fn func(Expr)) {
+	if e == nil {
+		return
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		fn(x)
+	case *BinaryOp:
+		visitColumnRefs(x.Left, fn)
+		visitColumnRefs(x.Right, fn)
+	case *UnaryOp:
+		visitColumnRefs(x.Operand, fn)
+	case *FuncCall:
+		for _, a := range x.Args {
+			visitColumnRefs(a, fn)
+		}
+	case *ExtractExpr:
+		visitColumnRefs(x.Source, fn)
+	case *CaseExpr:
+		if x.Operand != nil {
+			visitColumnRefs(x.Operand, fn)
+		}
+		for _, w := range x.Whens {
+			visitColumnRefs(w.When, fn)
+			visitColumnRefs(w.Then, fn)
+		}
+		if x.Else != nil {
+			visitColumnRefs(x.Else, fn)
+		}
+	case *InExpr:
+		visitColumnRefs(x.Operand, fn)
 	}
 }

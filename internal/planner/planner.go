@@ -467,6 +467,23 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		return nil, err
 	}
 	out := Node(&Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema})
+	// resolveTargets resolves SELECT targets against ctx.bindings,
+	// which holds FROM‑clause offsets — but rewriteMultiWayChain /
+	// bushy DP may have re‑laid out the underlying join tree
+	// (e.g. OID‑sorted MHJ output). Remap the freshly‑added
+	// Project's targets (and any Sort keys above the join tree)
+	// using the same bindings posMap so they land at actual scan
+	// offsets. For aggregate queries the targets reference
+	// aggregate‑output indices (small and outside any FROM
+	// binding's range) so the remap is a no‑op. Inline‑view
+	// subqueries (TPC‑H Q7/Q8/Q9) hit this path with FROM‑order
+	// indices and need the remap to fire. We deliberately do NOT
+	// walk below the Project's join‑tree boundary — those nodes
+	// were already remapped by the earlier remapWithBindings call,
+	// and walking them again would double‑remap.
+	if agg == nil && len(savedBindings) > 0 {
+		remapTopProjection(out, savedBindings)
+	}
 	if len(s.Locking) > 0 {
 		// M0021-0002 — wrap the SELECT plan in a LockRows
 		// node carrying the resolved per-relation locking

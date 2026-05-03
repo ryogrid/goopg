@@ -778,26 +778,79 @@ Target: identical ≥ 20, divergent ≤ 2 (Q1 + Q14 numeric precision only).
         IDENTICAL; Q5, Q7, Q9, Q10 still divergent).
         (landed 2026‑05‑04)
 
-- [ ] M0041-0002: Fix remaining 4 queries (Q5, Q7, Q9, Q10).
-      Design doc `docs/design/0041-0002-fix-remaining-6-queries.md`
-      (now scoped down to 4 queries).
+- [x] M0041-0002 (partial): MHJ executor + bushy DP residual fixes.
+      Design doc `docs/design/0041-0002-fix-remaining-6-queries.md`.
+      (landed 2026‑05‑04: parity 15→**17** identical; Q5 and Q10
+      now IDENTICAL; Q7 and Q9 still fail.)
 
-  - [ ] Q7 (`nation n1, nation n2` self‑join inside inline‑view
-        subquery): goopg returns 3 rows vs upstream 1. Self‑join
-        alias plumbing landed but the inline‑view subquery's outer
-        ColumnRefs may still reference stale positions.
+  - [x] Q5 IDENTICAL — fixed by:
+    - **MHJ chain `visited` tracking** (`internal/executor/multi_hash_join.go`)
+      so 4+‑table chains don't loop back into a previously‑consumed
+      build table on a later iteration.
+    - **Branched chain build**: any already‑visited table can serve
+      as the source of a new step (not just the most recent), so
+      probe tables that connect to multiple subtrees (Q5's
+      lineitem→supplier→…→region path AND lineitem→orders→customer
+      path) reach all build tables in a single MHJ.
+    - **Per‑step `buildKeyCol`**: each build table is hashed on the
+      column the chain actually probes (the OTHER side of the
+      relevant `MultiHashKey`), not the legacy "first key
+      mentioning this table" heuristic which picked the wrong
+      column for tables participating in two keys.
 
-  - [ ] Q5 (6‑table star, supplier degree=3): goopg returns 0 rows.
-        MHJ chain‑detection rejected (star‑graph guard); bindings
-        posMap should align binary‑tree ColumnRefs but the result
-        still empty — likely an additional plan shape not covered
-        by `applyJoinTreePosMap`'s walk.
+  - [x] Q10 IDENTICAL — fixed by the visited‑tracking change above.
 
-  - [ ] Q9 (6‑table star, lineitem at centre, multi‑column joins
-        on partsupp): goopg returns 0 rows vs upstream 6.
+  - [x] **Bushy DP residual conjuncts** (`internal/planner/bushy.go`)
+    — `markEdgesInMask` over‑consumed when two tables were
+    connected by multiple equalities (Q9's partsupp↔lineitem:
+    `ps_suppkey=l_suppkey AND ps_partkey=l_partkey`). DP now marks
+    only the SPECIFIC edge picked at each step (`bestEdgeIdx`)
+    and the residual builder matches by edge.predicate identity,
+    so the unused equality surfaces as a residual conjunct.
 
-  - [ ] Q10 (4‑table inline‑view‑less query): goopg returns 0 rows
-        vs upstream 1. Smallest plan; investigate first.
+  - [x] **Inline‑view Project remap** (`planner.go` + `bushy.go`'s
+    `remapTopProjection`): inline‑view subqueries (Q7/Q8/Q9
+    `select … from (select …) shipping/profit/all_nations`) had
+    Project targets resolved AFTER the join‑tree rewrites, so
+    they kept FROM‑order indices. The new top‑projection pass
+    walks Project / Sort wrappers above the join tree (stopping
+    before Filter/Aggregate/Join) and applies the bindings
+    posMap, fixing EXTRACT/arithmetic expressions that referenced
+    stale base‑column positions.
+
+  - [x] **Outer‑Join key re‑resolution by name**
+    (`reresolveJoinByName` in `bushy.go`): Joins above an MHJ had
+    LeftKey/RightKey/Predicate in subset‑FROM‑order, but MHJ
+    rewrite re‑laid the inner output in OID order. The pass now
+    re‑binds those refs by `ColumnRef.Name` against the
+    post‑rewrite Left/Right output schemas (with `predRebind`
+    using the original Index range to disambiguate when the same
+    name appears in both children, e.g. `INNER JOIN b ON
+    a.id = b.id`), and refreshes `j.schema` so outer Joins see a
+    current layout.
+
+  - [ ] Q7 still divergent (3 rows vs 1). The `nation n1, n2`
+        self‑join's MHJ correctly distinguishes the two via
+        `(table*, alias)` `scanKey`, but the outer GROUP BY
+        produces extra rows — likely an alias‑name collision in
+        `predRebind` / `findUnique` when both `n_name` columns
+        appear in MHJ output.
+
+  - [ ] Q9 still divergent at row=3 col=2 (5570 vs 5795). Row
+        count is now correct (6/6); a single sum value disagrees.
+        The residual `ps_partkey=l_partkey` is now generated and
+        kept, but pushdown can't move it onto the inner Join
+        because the conjunct's ColumnRef indices are global
+        FROM‑order while the Join's schema is subset‑FROM‑order
+        (width‑based `classifyConjunctSide` mis‑classifies). Needs
+        a name‑based side‑classification (mirror the
+        `predRebind` approach) inside `pushOneConjunct`, or a
+        coord‑translation step on the residual conjunct before
+        pushdown.
+
+  - [ ] Verification (final): `TestTPCHResultParity` identical ≥
+        19, divergent = 3 (Q1+Q8+Q14 precision allowlisted),
+        errored = 0.
 
   - [ ] Verification: `TestTPCHResultParity` identical ≥ 19,
         divergent = 3 (Q1+Q8+Q14 precision allowlisted), errored = 0.
