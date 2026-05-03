@@ -880,6 +880,102 @@ previously‑allowlisted numeric‑precision deltas (Q1, Q8, Q14).
         22/22 PASS. `go test ./...` clean (only pre‑existing
         `tmp/` build error unaffected).
 
+## Milestone 0042 — Align goopg I/O with upstream PostgreSQL
+
+See `docs/milestones/0042-pg-io-alignment.md`.
+Drop direct‑I/O code paths in WAL and storage; tighten the WAL
+buffer / WAL writer / client‑backend goroutine interaction so
+the per‑connection goroutine model behaves like upstream's
+per‑backend process model. Anchor doc:
+`docs/design/0042-0001-pg-io-survey.md` (English).
+
+- [ ] M0042-0001: PostgreSQL I/O subsystem survey (English).
+      Design doc `docs/design/0042-0001-pg-io-survey.md`.
+  - [ ] WAL writes & durability: `XLogWrite`, `XLogFlush`,
+        `XLogBackgroundFlush`, `issue_xlog_fsync` paths;
+        `wal_sync_method`; `WALInsertLock` array; page-aligned
+        ring; durability barriers (`fdatasync`,
+        `synchronous_commit`).
+  - [ ] Page-data writes/reads/eviction: `BufferAlloc`,
+        `BufferSync`, `FlushBuffer`, `StrategyGetBuffer`
+        (clock sweep), WAL-before-data invariant.
+  - [ ] Background writer (`bgwriter.c`): cadence, role, why
+        no fsync.
+  - [ ] Checkpointer (`checkpointer.c`,
+        `xlog.c::CreateCheckPoint`): trigger conditions,
+        flush phase, fsync phase, WAL retention.
+  - [ ] WAL buffer ring: `wal_buffers`, `WALBufMappingLock`,
+        eviction-when-full, `XLogInsert` →
+        `WALWriteLock` handoff.
+  - [ ] Dedicated WAL writer (`walwriter.c`): cadence
+        (`wal_writer_delay`), opportunistic fsync
+        (`wal_writer_flush_after`), why distinct from
+        `bgwriter`.
+  - [ ] Client backend (`postmaster.c`, `postgres.c`):
+        per-process responsibilities; what it does NOT own.
+  - [ ] Index against `postgres/src/backend/...` files cited
+        inline.
+
+- [ ] M0042-0002: Buffered-I/O migration. Drop O_DIRECT.
+      Design doc `docs/design/0042-0002-buffered-io-migration.md`.
+  - [ ] Delete `internal/wal/direct_io_linux.go`,
+        `direct_io_other.go`; remove `enableDirectIO`,
+        `writeAtDirectIO`, `directIOActive`, RMW scratch.
+  - [ ] Delete `internal/storage/direct_io_linux.go`
+        (and `_other.go` if present); drop
+        `setDirectIOIfRequested`.
+  - [ ] Drop `Manager.AlignedIO` field and any callers.
+  - [ ] Retire `wal_direct_io` GUC from
+        `internal/config/defaults.go` and any parser refs.
+  - [ ] Update tests that toggled direct-I/O; keep arena page
+        alignment but remove the direct-I/O justification
+        comment.
+  - [ ] Mark `0010-0001`, `0010-0003` as superseded.
+  - [ ] Verification: `git grep O_DIRECT internal/` empty;
+        `TestTPCHResultParity` still identical=22 divergent=0
+        errored=0; `go test ./...` clean.
+
+- [ ] M0042-0003: WAL buffer + WAL writer alignment.
+      Design doc `docs/design/0042-0003-wal-buffer-and-writer-alignment.md`.
+  - [ ] Add `walwriterLoop` goroutine: timer-driven drain
+        (`wal_writer_delay`, default 200ms) +
+        opportunistic fsync (`wal_writer_flush_after`,
+        default 1 MiB).
+  - [ ] Public API rebind: `XLogInsert` (returns LSN) /
+        `XLogFlush(lsn)` (blocks on `flushedLSN >= lsn`).
+  - [ ] Insertion-lock array (8 slots) for parallel
+        `XLogInsert`.
+  - [ ] WAL ring page eviction blocks on `writtenLSN`,
+        not on doing the write inline.
+  - [ ] Wire `synchronous_commit` GUC (default on); commit
+        path calls `XLogFlush(commitLSN)` when on.
+  - [ ] Update `internal/wal/checkpointer.go`,
+        `internal/storage/bufpool.go::evictLocked`,
+        `internal/server/dispatch.go::Commit` to the new
+        API.
+  - [ ] Verification: `go test ./internal/wal/... -race`,
+        full TPC-H parity, manual kill-9 durability check.
+
+- [ ] M0042-0004: Client backend goroutine alignment.
+      Design doc `docs/design/0042-0004-client-backend-goroutine-alignment.md`.
+  - [ ] Document the per-connection goroutine model in
+        `internal/server/server.go` package comments.
+  - [ ] Assert (dev-mode panic) that `Pool.FlushAll` /
+        `Pool.FlushAllPaced` and `wal.Writer` direct
+        `writeAt` are only called from checkpointer /
+        walwriter goroutines.
+  - [ ] Wire commit-time `XLogFlush(commitLSN)` from the
+        client goroutine when `synchronous_commit = on`.
+  - [ ] Optional first cut: add `pageWriterLoop` (bgwriter
+        goroutine) that pre-flushes dirty pages on
+        `bgwriter_delay` (default 200ms). Skippable; if
+        skipped, leave a TODO citing `0042-0001` §4.
+  - [ ] Add `TestBackendGoroutineDoesNotFsync` regression
+        test.
+  - [ ] Verification: `go test ./internal/server/...
+        ./internal/storage/... ./internal/wal/...
+        -race`, full TPC-H parity.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
