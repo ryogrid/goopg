@@ -591,13 +591,6 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 		return nil, nil, 0
 	}
 
-	// Sort scans by catalog OID (FROM‑clause creation order) so
-	// ColumnRef indices from remapKeyToSubset (which use FROM
-	// order) align with the scan‑width‑based key lookup.  The
-	// tree walk collects scans in DFS pre‑order, which may
-	// differ from FROM order for bushy DP trees.
-	_ = scanWidths // used by walk
-
 	// Determine probe table: the one with the largest row count.
 	probeIdx := 0
 	probeRows := int64(0)
