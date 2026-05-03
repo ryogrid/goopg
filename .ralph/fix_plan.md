@@ -741,9 +741,21 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
 - [x] M0040-0003: End‑to‑end verification.
   - [x] `TestRunTPCHQueriesAgainstSyntheticData`: 22/22 PASS.
   - [x] `TestTPCHResultParity`: identical=13 divergent=9 errored=0 (no regression).
-  - [ ] HammerDB SF=1 power test: Q20 ≤ 120 s — deferred (WSL2
-        environment; needs stable x86_64 Linux).
+  - [ ] HammerDB SF=1 power test: Q14=28.8s, Q2=4.8s, Q9=51.4s all PASS.
+        **Q20 timed out at 1 h** — the lineitem scalar subquery is
+        evaluated once per distinct partsupp (PK) row (800K unique
+        keys), so caching doesn't help.  Need recursive scalar
+        subquery unnest inside IN-subquery inner plans.
   - [x] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
+
+  Follow-up (recursive scalar subquery unnest):
+  - [ ] Extend `unnestSubqueriesInPlan` to descend into IN-subquery
+        inner plans and unnest correlated scalar SubqueryExpr nodes
+        as aggregation hash‑joins.  This would rewrite Q20's
+        innermost `SELECT 0.5*SUM(...) FROM lineitem WHERE ...` into
+        a HashJoin partsupp ⋈ Aggregate(lineitem) — eliminating the
+        per‑row lineitem scan.
+  - [ ] Complete the HammerDB SF=1 power test with all 22 queries.
 
 ## Notes
 
