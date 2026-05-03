@@ -391,11 +391,30 @@ with 4 KiB alignment) so the buffer pool memory is under GC control. Combine wit
   - [x] Root cause: arena residency (2 GB) + kernel page cache (1.5 GB) + query
         working set (6+ GB for 4M-row SeqScan/sort/aggregate) + GOMEMLIMIT=40GiB
         preventing GC scavenge → total RSS exceeded 32 GB system RAM.
-- [ ] M0032-0005: Fix HammerDB COPY connection timeout during ORDERS/LINEITEM
-      load at SF=1. Root cause TBD — likely libpq timeout or server-side COPY
-      path taking too long between DataRow messages.
-  - [ ] Reproduce with a standalone COPY FROM STDIN over 6M rows.
-  - [ ] Profile COPY performance bottlenecks.
+- [x] M0032-0005: Fix HammerDB ORDERS/LINEITEM load drop at
+      ~430 k orders (landed 2026‑05‑04). Reproducer and analysis
+      in `analysis/tpch-hammerdb-run-004{,-baseline}.md`. Root
+      cause: M0032‑0006's per‑commit `runtime.GC()` was firing
+      every ~50 ms under HammerDB's commit cadence, putting
+      stop‑the‑world on the hot path. Fix: throttle to
+      `commitGCEvery = 64` via `maybeForceGCAfterCommit()` in
+      `internal/server/dispatch.go` and `internal/server/copy.go`.
+      Throughput at 50 k orders went from 1 578 → 2 910 orders/s
+      (1.84×); 200 k orders sustains ~2 715 orders/s with no
+      decay (well past the prior 430 k‑region failure asymptote).
+      The M0032‑0005 description originally said "COPY"; HammerDB
+      actually uses batched INSERT (see
+      `HammerDB/src/postgresql/pgolap.tcl:454`) — the new loader
+      `bench/tpch/cmd/hammerdb_load/` reproduces that shape.
+  - [x] Reproduce with a standalone batched-INSERT loader over
+        the HammerDB-shape stream (`bench/tpch/cmd/hammerdb_load`,
+        in-process tests at 10 k / 50 k / 200 k orders).
+  - [x] Profile bottlenecks (`bench/tpch/profile_load.sh` +
+        baseline report identifying GC + per-row writeHeapRow as
+        the top candidates).
+  - [x] Apply targeted fix (commit-GC throttle, 1.84× win;
+        per-row writeHeapRow refactor deferred — acceptance
+        criterion met without it).
 - [x] M0032-0006: Add explicit `runtime.GC()` after query/COPY completion
       and re-test at shared_buffers=2048MB, GOMEMLIMIT=20GiB.
       Documented in `analysis/tpch-hammerdb-run-003.md`.

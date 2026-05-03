@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
@@ -15,6 +16,24 @@ import (
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
+
+// commitGCEvery throttles the post-commit forced GC introduced by
+// M0032-0006. The original `runtime.GC()` after every commit kept
+// RSS bounded but added tens of milliseconds to every commit's
+// response time — a measurable factor in the M0032-0005
+// batched-INSERT throughput decay (see
+// analysis/tpch-hammerdb-run-004-baseline.md). Firing GC every
+// commitGCEvery commits keeps the RSS-bounding intent while
+// removing the per-commit stop-the-world cost.
+const commitGCEvery = 64
+
+var commitGCCounter atomic.Uint64
+
+func maybeForceGCAfterCommit() {
+	if n := commitGCCounter.Add(1); n%commitGCEvery == 0 {
+		runtime.GC()
+	}
+}
 
 // dispatchSimpleQueryViaExecutor is the parser-driven path for the
 // simple-query protocol: it parses the SQL, plans each statement,
@@ -120,7 +139,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
 	commit = true
-	runtime.GC()
+	maybeForceGCAfterCommit()
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
