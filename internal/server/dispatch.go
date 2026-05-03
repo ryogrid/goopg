@@ -2,10 +2,8 @@ package server
 
 import (
 	"fmt"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
@@ -17,23 +15,12 @@ import (
 	"github.com/goopg/goopg/internal/sqlstate"
 )
 
-// commitGCEvery throttles the post-commit forced GC introduced by
-// M0032-0006. The original `runtime.GC()` after every commit kept
-// RSS bounded but added tens of milliseconds to every commit's
-// response time — a measurable factor in the M0032-0005
-// batched-INSERT throughput decay (see
-// analysis/tpch-hammerdb-run-004-baseline.md). Firing GC every
-// commitGCEvery commits keeps the RSS-bounding intent while
-// removing the per-commit stop-the-world cost.
-const commitGCEvery = 64
-
-var commitGCCounter atomic.Uint64
-
-func maybeForceGCAfterCommit() {
-	if n := commitGCCounter.Add(1); n%commitGCEvery == 0 {
-		runtime.GC()
-	}
-}
+// maybeForceGCAfterCommit was introduced by M0032-0006 to bound RSS
+// growth after commits. M0032-0005 throttled it to every 64 commits.
+// Removed entirely: GOMEMLIMIT provides the RSS ceiling without
+// forced stop-the-world pauses, and the throttled GC still appeared
+// as 91 % GC overhead in run-005's Q9 profile on 1.8 M-row data.
+func maybeForceGCAfterCommit() {}
 
 // dispatchSimpleQueryViaExecutor is the parser-driven path for the
 // simple-query protocol: it parses the SQL, plans each statement,
