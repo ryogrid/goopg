@@ -627,9 +627,9 @@ Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
       `analysis/tpch-power-test-0038-report.md`.
   - [x] Schema build, data load, index create, ANALYZE — all PASS
   - [x] Chain detection active, MultiHashJoin confirmed in Q2 plan
-  - [x] Q14 completed in 25.7 s (first query in HammerDB order)
-  - [ ] 9 queries return 0 rows (vs upstream >0) due to planner
-        column-index misalignment in bushy DP / unnest pipeline
+  - [x] Q14 completed in 25.7 s (HammerDB power test, query 1 of 22)
+  - [ ] Power test interrupted by WSL2 OOM during Q2 — remaining 20/22
+        queries untested at SF=1 (needs stable x86_64 Linux, not WSL2)
 
 - [x] M0038-0003: Fix `compareDatum` cross-kind errors for TPC-H.
       (landed 2026-05-03) Detailed report at
@@ -637,9 +637,12 @@ Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
   - [x] Add `promoteCrossKind` — implicit string→numeric/time/int
         promotion in `compareDatum` (`executor/expr.go`)
   - [x] String-comparison fallback for irreconcilable cross-kind pairs
-  - [x] All 4 `goopg-errored` queries eliminated (now 0 errored)
-  - [x] Parity matrix: identical=13, divergent=9, errored=0
-  - [x] No query crashes — remaining divergent queries return 0 rows
+  - [x] TPC-H parity test (synthetic data, 59 rows): all 22 queries
+        complete without compareDatum errors
+  - [x] Parity matrix: identical=13, divergent=9, goopg-errored=0
+        (was 4 errored before fix)
+  - [x] No query crashes in parity test — 9 divergent queries return
+        0 rows due to planner column-index misalignment (separate issue)
 
   Remaining planner-index misalignment (not M0038):
   - [ ] Planner column-index misalignment in multi-table joins causes

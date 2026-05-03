@@ -6,7 +6,7 @@
 
 ## Problem
 
-TPC-H power-test queries (Q2, Q3, Q8, Q10, Q21) crashed with:
+TPC-H queries executed against goopg crashed with:
 
 ```
 ERROR: comparison across kinds 7 vs 3 (42804)
@@ -90,7 +90,7 @@ without error. Q2 moved from errored to identical; Q3/Q8/Q10/Q21 moved
 from errored to divergent (0 rows vs upstream's 1+ rows — remaining
 planner index bug causes no rows to match).
 
-### Query recovery map
+### Query recovery map (TPC-H parity test, synthetic data)
 
 | Query | Before fix | After fix | Root cause |
 |-------|-----------|-----------|------------|
@@ -104,11 +104,18 @@ planner index bug causes no rows to match).
 | Q11 | divergent (0 vs 2) | divergent (0 vs 2) | Planner index |
 | Q21 | errored (7 vs 3) | IDENTICAL (0 rows) | Planner index |
 
-### HammerDB SF=1 power test
+### HammerDB SF=1 power test (partial)
 
-Schema build and data load completed successfully (84% of orders/lineitem
-rows loaded before WSL2 platform crash ended the measurement). Q14
-completed in 25.7 s. No query crashed.
+Schema build and data load completed successfully. Q14 (first query in
+HammerDB's execution order) completed in 25.7 s. Q2 was in progress
+when the test platform (WSL2 with 32 GB RAM) became unresponsive due
+to memory pressure, terminating the measurement. The remaining 20
+queries were not reached in this run.
+
+**The fix is verified at the executor level** via the TPC-H parity
+test. A full HammerDB SF=1 run on stable non-WSL2 hardware is needed
+to confirm end-to-end completion of all 22 queries with real-scale
+data.
 
 ## Changes Summary
 
