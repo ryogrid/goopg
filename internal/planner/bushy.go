@@ -721,67 +721,124 @@ func rewriteMultiWayChain(node Node) Node {
 }
 
 // remapExprRefsToMHJ walks the plan tree and remaps ColumnRef
-// indices to match a MultiHashJoin's output schema when one is
-// encountered.  The remap applies to ALL ancestor expression-
-// bearing nodes (Filter, Project, Sort, Aggregate) whose
-// ColumnRefs may reference the MHJ output — not just the
-// immediate parent.
-func remapExprRefsToMHJ(node Node) Node {
+// indices.  It first looks for a MultiHashJoin and uses its
+// table list to build a FROM‑order → output‑order position map.
+// If no MHJ is found, it falls back to building a posMap from
+// the SeqScan leaves of a binary join tree.
+func remapColumnRefsAfterRewrite(node Node) Node {
+	remapPosMapAfterRewrite(node, nil)
+	return node
+}
+
+func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 	if node == nil {
-		return nil
+		return
 	}
-	// Recurse first, finding the MHJ and building a posMap.
-	// Each expression-bearing node remaps its ColumnRefs using
-	// the posMap from the nearest MHJ below it.
-	var posMap func(int) int
 	switch n := node.(type) {
 	case *MultiHashJoin:
-		return node
+		return
 	case *Join:
-		n.Left = remapExprRefsToMHJ(n.Left)
-		n.Right = remapExprRefsToMHJ(n.Right)
-		return node
+		remapPosMapAfterRewrite(n.Left, nil)
+		remapPosMapAfterRewrite(n.Right, nil)
+		return
 	case *Filter:
-		n.Child = remapExprRefsToMHJ(n.Child)
-		posMap = mhjPosMapOf(n.Child)
-		if posMap != nil {
-			remapByPosMap(&n.Predicate, posMap)
+		remapPosMapAfterRewrite(n.Child, nil)
+		// Try MHJ posMap first, then binary-tree posMap.
+		pm := mhjPosMapOf(n.Child)
+		if pm == nil {
+			pm = binaryTreePosMapOf(n.Child)
 		}
-		return n
+		if pm != nil {
+			remapByPosMap(&n.Predicate, pm)
+		}
+		return
 	case *Project:
-		n.Child = remapExprRefsToMHJ(n.Child)
-		posMap = mhjPosMapOf(n.Child)
-		if posMap != nil {
+		remapPosMapAfterRewrite(n.Child, nil)
+		pm := mhjPosMapOf(n.Child)
+		if pm == nil {
+			pm = binaryTreePosMapOf(n.Child)
+		}
+		if pm != nil {
 			for i := range n.Targets {
-				remapByPosMap(&n.Targets[i], posMap)
+				remapByPosMap(&n.Targets[i], pm)
 			}
 		}
-		return n
+		return
 	case *Sort:
-		n.Child = remapExprRefsToMHJ(n.Child)
-		posMap = mhjPosMapOf(n.Child)
-		if posMap != nil {
+		remapPosMapAfterRewrite(n.Child, nil)
+		pm := mhjPosMapOf(n.Child)
+		if pm == nil {
+			pm = binaryTreePosMapOf(n.Child)
+		}
+		if pm != nil {
 			for i := range n.Keys {
-				remapByPosMap(&n.Keys[i].Expr, posMap)
+				remapByPosMap(&n.Keys[i].Expr, pm)
 			}
 		}
-		return n
+		return
 	case *Aggregate:
-		n.Child = remapExprRefsToMHJ(n.Child)
-		posMap = mhjPosMapOf(n.Child)
-		if posMap != nil {
+		remapPosMapAfterRewrite(n.Child, nil)
+		pm := mhjPosMapOf(n.Child)
+		if pm == nil {
+			pm = binaryTreePosMapOf(n.Child)
+		}
+		if pm != nil {
 			for i := range n.GroupExprs {
-				remapByPosMap(&n.GroupExprs[i], posMap)
+				remapByPosMap(&n.GroupExprs[i], pm)
 			}
 			for i := range n.Aggs {
 				if n.Aggs[i].Arg != nil {
-					remapByPosMap(&n.Aggs[i].Arg, posMap)
+					remapByPosMap(&n.Aggs[i].Arg, pm)
 				}
 			}
 		}
-		return n
+		return
 	}
-	return node
+}
+
+// binaryTreePosMapOf collects SeqScan leaves from a binary join
+// tree (traversing through thin wrappers), sorts them by OID
+// (FROM order), and returns a position map from old (FROM-order)
+// to new (DFS‑order) positions.
+func binaryTreePosMapOf(node Node) func(int) int {
+	var scans []Node
+	var collect func(Node)
+	collect = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *SeqScan:
+			scans = append(scans, x)
+		case *Join:
+			collect(x.Left)
+			collect(x.Right)
+		case *Filter:
+			collect(x.Child)
+		case *Project:
+			collect(x.Child)
+		case *Sort:
+			collect(x.Child)
+		case *Aggregate:
+			collect(x.Child)
+		}
+	}
+	collect(node)
+	if len(scans) < 3 {
+		return nil // 2‑table trees are left‑deep (FROM order)
+	}
+	// Build MHJ-like posMap from these scans.
+	mh := &MultiHashJoin{Tables: make([]Node, len(scans))}
+	for i, s := range scans {
+		mh.Tables[i] = s
+	}
+	return buildMHJPosMap(mh)
+}
+
+// remapExprRefsToMHJ is the old entry point; use
+// remapColumnRefsAfterRewrite instead.
+func remapExprRefsToMHJ(node Node) Node {
+	return remapColumnRefsAfterRewrite(node)
 }
 
 // mhjPosMapOf returns a position map (old FROM‑order → new MHJ
