@@ -642,16 +642,40 @@ Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
   - [x] Parity matrix: identical=13, divergent=9, goopg-errored=0
         (was 4 errored before fix)
   - [x] No query crashes in parity test — 9 divergent queries return
-        0 rows due to planner column-index misalignment (separate issue)
+         0 rows due to planner column-index misalignment (separate issue)
 
-  Remaining planner-index misalignment (not M0038):
-  - [ ] Planner column-index misalignment in multi-table joins causes
-        Q3/Q5/Q7/Q8/Q9/Q10/Q11 to return 0 rows (wrong ColumnRef
-        indices prevent rows from matching). Affects 9 of 22 TPC-H
-        queries even after `compareDatum` error fix.
-  - [ ] Fix: resolve ColumnRef indices correctly through bushy-DP /
-        unnest pipeline so join keys reference the right physical
-        columns. See `analysis/0038-fix-compareDatum-cross-kind.md`.
+  Remaining planner-index misalignment → now tracked as M0039 below.
+
+## Milestone 0039 — Fix Planner Column-Index Alignment
+
+See `docs/milestones/0039-fix-planner-column-ref.md`.
+Fix three ColumnRef-index alignment bugs in bushy DP / pushdown / unnest
+pipeline so TPC-H queries return correct row counts (9/22 return 0 rows
+today) and the MultiHashJoin operator (M0038) resolves all join keys.
+
+- [ ] M0039-0001: Planner column-index alignment fix. Design doc
+      `docs/design/0039-0001-planner-column-ref-fix.md`.
+
+  - [ ] Fix A: `pushPredicatesIntoCrossJoins` global→local remap.
+        After `splitEqualityForHash`, remap ColumnRef indices from
+        FROM-clause global scope to the Join's local output schema.
+
+  - [ ] Fix B: Unnest-pass ColumnRef alignment. After bushy DP or
+        chain detection rewrites a subtree, remap ColumnRef indices
+        in parent operators (Join keys, Filter/Sort/Project exprs)
+        that referenced the old subtree.
+
+  - [ ] Fix C: `buildJoinFromDP` residual offset bug. Audit edge
+        ColumnRef aliasing in `buildJoinGraph` / `buildJoinFromDP`;
+        ensure `remapKeyToSubset` input ColumnRefs are not
+        inadvertently mutated by prior calls.
+
+  - [ ] Verification: 0 TPC-H queries return 0 rows (target ≤ 0);
+        MultiHashJoin resolves all 4 keys for Q2; parity matrix
+        identical ≥ 20.
+
+  - [ ] HammerDB SF=1 power test on stable Linux with
+        shared_buffers=2048MB + GOMEMLIMIT=20GiB.
 
   Follow-ups for future milestones:
   - [ ] Cost-based plan selection: choose MultiHashJoin only when estimated

@@ -195,4 +195,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0038-0001 | [Multi-Way Hash Join Operator](0038-0001-multi-way-hash-join.md) | accepted | Replace chains of N binary hash joins with a single operator that builds N-1 hash tables and probes one fact table via chain-lookups. Eliminates intermediate result sets. |
 
+| 0039-0001 | [Planner Column-Index Alignment Fix](0039-0001-planner-column-ref-fix.md) | draft | Fix three ColumnRef-index alignment bugs in bushy DP / pushdown / unnest pipeline so TPC-H queries return correct row counts and MultiHashJoin resolves all join keys. See `docs/milestones/0039-fix-planner-column-ref.md`. |
+
 Append new rows in numeric order. Do not reorder.
