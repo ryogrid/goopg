@@ -665,13 +665,13 @@ today) and the MultiHashJoin operator (M0038) resolves all join keys.
         DP always runs for ≥3 tables (even without ANALYZE). Default
         row counts (1) used when stats are missing.
 
-  - [x] Fix B: `remapExprRefsToMHJ` + `remapColumnRefs` — walks
-        plan tree after chain detection and remaps ALL ColumnRef
-        indices (Filter, Project, Sort, Aggregate GroupExprs,
-        Aggregate call Args) from binary‑tree order to MHJ
-        output order.  Uses `mhjSchemaOf` to traverse thin
-        wrappers (Filter/Project/Sort/Aggregate) to find the
-        MHJ schema.
+  - [x] Fix B: Sort MHJ tables by OID (FROM‑order) before building
+        output schema.  The MHJ was built with tables in DFS tree‑walk
+        order, which differed from the binary tree's FROM‑clause order.
+        Sorting by OID makes the MHJ output match the binary tree
+        output, eliminating the need for downstream ColumnRef remapping
+        in most cases.  Keys and probe index also remapped.
+        Parity: identical 13→14, divergent 9→8, errored 0.
 
   - [x] Fix C: `multiHashJoinOp` currentOff bug — `currentOff` was
         reset to 0 instead of `destOff` after each hash-key lookup,

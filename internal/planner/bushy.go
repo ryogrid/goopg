@@ -670,18 +670,53 @@ func rewriteMultiWayChain(node Node) Node {
 		ProbeTable: probeIdx,
 		Filters:    nil,
 	}
-	// Build output schema from all tables.
+	// Sort the tables (scans) by catalog OID so the output
+	// schema is in FROM-clause (table-creation) order, matching
+	// the binary join tree that was replaced.  Without this
+	// sort, the schema is in DFS tree-walk order which differs
+	// for bushy DP trees and would require downstream ColumnRef
+	// remapping.
+	//
+	// The sort also remaps the MultiHashKey table indices and
+	// the probe table index.
+	type idxEntry struct {
+		idx  int
+		oid  uint32
+		scan *SeqScan
+	}
+	items := make([]idxEntry, len(scans))
+	for i, s := range scans {
+		items[i] = idxEntry{idx: i, scan: s.(*SeqScan), oid: s.(*SeqScan).Table.OID}
+	}
+	byOID := func(i, j int) bool { return items[i].oid < items[j].oid }
+	for i := range items {
+		for j := i + 1; j < len(items); j++ {
+			if byOID(j, i) {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+	// Build old-to-new scan index mapping.
+	oldToNew := make([]int, len(scans))
+	sortedScans := make([]Node, len(scans))
+	for newIdx, item := range items {
+		oldToNew[item.idx] = newIdx
+		sortedScans[newIdx] = scans[item.idx]
+	}
+	// Update keys and probe table.
+	for i := range keys {
+		keys[i].LeftTable = oldToNew[keys[i].LeftTable]
+		keys[i].RightTable = oldToNew[keys[i].RightTable]
+	}
+	mh.Tables = sortedScans
+	mh.ProbeTable = oldToNew[probeIdx]
+
+	// Build output schema from all tables (now in FROM order).
 	fullSchema := make(Schema, 0)
-	for _, s := range scans {
+	for _, s := range sortedScans {
 		fullSchema = append(fullSchema, s.Output()...)
 	}
 	mh.schema = fullSchema
-	// Remap parent ColumnRef indices: the MultiHashJoin output
-	// schema may be in a different order (DFS walk) than the
-	// original binary join tree (FROM-clause / DP join order).
-	// Walk the plan tree that contains this MHJ and remap any
-	// ColumnRefs that indexed into the old subtree so they
-	// point to the correct positions in the MHJ output.
 	return mh
 }
 
@@ -695,67 +730,69 @@ func remapExprRefsToMHJ(node Node) Node {
 	if node == nil {
 		return nil
 	}
-	// Recurse first, collecting any MHJ schema we encounter.
-	var mhSchema Schema
+	// Recurse first, finding the MHJ and building a posMap.
+	// Each expression-bearing node remaps its ColumnRefs using
+	// the posMap from the nearest MHJ below it.
+	var posMap func(int) int
 	switch n := node.(type) {
 	case *MultiHashJoin:
-		mhSchema = n.Output()
+		return node
+	case *Join:
+		n.Left = remapExprRefsToMHJ(n.Left)
+		n.Right = remapExprRefsToMHJ(n.Right)
+		return node
 	case *Filter:
 		n.Child = remapExprRefsToMHJ(n.Child)
-		mhSchema = mhjSchemaOf(n.Child)
-		if mhSchema != nil {
-			remapColumnRefs(&n.Predicate, mhSchema)
+		posMap = mhjPosMapOf(n.Child)
+		if posMap != nil {
+			remapByPosMap(&n.Predicate, posMap)
 		}
 		return n
 	case *Project:
 		n.Child = remapExprRefsToMHJ(n.Child)
-		mhSchema = mhjSchemaOf(n.Child)
-		if mhSchema != nil {
+		posMap = mhjPosMapOf(n.Child)
+		if posMap != nil {
 			for i := range n.Targets {
-				remapColumnRefs(&n.Targets[i], mhSchema)
+				remapByPosMap(&n.Targets[i], posMap)
 			}
 		}
 		return n
 	case *Sort:
 		n.Child = remapExprRefsToMHJ(n.Child)
-		mhSchema = mhjSchemaOf(n.Child)
-		if mhSchema != nil {
+		posMap = mhjPosMapOf(n.Child)
+		if posMap != nil {
 			for i := range n.Keys {
-				remapColumnRefs(&n.Keys[i].Expr, mhSchema)
+				remapByPosMap(&n.Keys[i].Expr, posMap)
 			}
 		}
 		return n
 	case *Aggregate:
 		n.Child = remapExprRefsToMHJ(n.Child)
-		mhSchema = mhjSchemaOf(n.Child)
-		if mhSchema != nil {
+		posMap = mhjPosMapOf(n.Child)
+		if posMap != nil {
 			for i := range n.GroupExprs {
-				remapColumnRefs(&n.GroupExprs[i], mhSchema)
+				remapByPosMap(&n.GroupExprs[i], posMap)
 			}
 			for i := range n.Aggs {
 				if n.Aggs[i].Arg != nil {
-					remapColumnRefs(&n.Aggs[i].Arg, mhSchema)
+					remapByPosMap(&n.Aggs[i].Arg, posMap)
 				}
 			}
 		}
 		return n
-	case *Join:
-		n.Left = remapExprRefsToMHJ(n.Left)
-		n.Right = remapExprRefsToMHJ(n.Right)
 	}
 	return node
 }
 
-// mhjSchemaOf returns the output schema of the first MultiHashJoin
-// found by traversing through thin wrappers (Filter, Project) in
-// the subtree.
-func mhjSchemaOf(node Node) Schema {
+// mhjPosMapOf returns a position map (old FROM‑order → new MHJ
+// DFS‑order) if the subtree contains a MultiHashJoin, or nil.
+func mhjPosMapOf(node Node) func(int) int {
 	for {
 		if node == nil {
 			return nil
 		}
 		if mh, ok := node.(*MultiHashJoin); ok {
-			return mh.Output()
+			return buildMHJPosMap(mh)
 		}
 		switch n := node.(type) {
 		case *Filter:
@@ -773,31 +810,87 @@ func mhjSchemaOf(node Node) Schema {
 }
 
 // remapColumnRefs walks an expression tree and updates any
-// ColumnRef.Index to match the column's position in the given
-// schema (identified by column name).  This corrects stale
-// indices after a plan-tree rewrite changes the output order.
-func remapColumnRefs(e *Expr, schema Schema) {
+// ColumnRef.Index using a position map built from the
+// MultiHashJoin's table OIDs.  This correctly handles duplicate
+// column names across different table instances (e.g. two
+// nation tables each with n_name).
+func remapByPosMap(e *Expr, posMap func(int) int) {
 	if e == nil || *e == nil {
 		return
 	}
 	switch x := (*e).(type) {
 	case *ColumnRef:
-		for i, col := range schema {
-			if col.Name == x.Name && x.Index != i {
-				cl := *x
-				cl.Index = i
-				*e = &cl
-				return
-			}
+		newIdx := posMap(x.Index)
+		if newIdx != x.Index {
+			cl := *x
+			cl.Index = newIdx
+			*e = &cl
 		}
 	case *BinaryOp:
-		remapColumnRefs(&x.Left, schema)
-		remapColumnRefs(&x.Right, schema)
+		remapByPosMap(&x.Left, posMap)
+		remapByPosMap(&x.Right, posMap)
 	case *UnaryOp:
-		remapColumnRefs(&x.Operand, schema)
+		remapByPosMap(&x.Operand, posMap)
 	case *FuncCall:
 		for i := range x.Args {
-			remapColumnRefs(&x.Args[i], schema)
+			remapByPosMap(&x.Args[i], posMap)
 		}
+	case *ExtractExpr:
+		remapByPosMap(&x.Source, posMap)
+	}
+}
+
+// buildMHJPosMap returns a position map from old (FROM‑order
+// binary tree) column positions to new (MHJ DFS‑order) column
+// positions for the given MultiHashJoin.  The map uses table
+// OIDs to correctly disambiguate duplicate column names.
+func buildMHJPosMap(mh *MultiHashJoin) func(int) int {
+	type tblInfo struct {
+		oid uint32
+		off int
+		w   int
+	}
+	infos := make([]tblInfo, len(mh.Tables))
+	off := 0
+	for i, t := range mh.Tables {
+		if s, ok := t.(*SeqScan); ok {
+			infos[i] = tblInfo{oid: s.Table.OID, off: off, w: len(s.Output())}
+			off += len(s.Output())
+		}
+	}
+	// Sort by OID to get FROM‑order.
+	sorted := make([]tblInfo, len(infos))
+	copy(sorted, infos)
+	for i := range sorted {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[i].oid > sorted[j].oid {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+	fromWidth := 0
+	for i := range sorted {
+		fromWidth += sorted[i].w
+	}
+	return func(oldIdx int) int {
+		if oldIdx < 0 || oldIdx >= fromWidth {
+			return oldIdx
+		}
+		off2 := 0
+		for si := range sorted {
+			w := sorted[si].w
+			if oldIdx >= off2 && oldIdx < off2+w {
+				colIdx := oldIdx - off2
+				targetOID := sorted[si].oid
+				for ei := range infos {
+					if infos[ei].oid == targetOID {
+						return infos[ei].off + colIdx
+					}
+				}
+				break
+			}
+			off2 += w
+		}
+		return oldIdx
 	}
 }
