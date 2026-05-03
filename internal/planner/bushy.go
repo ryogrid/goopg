@@ -794,6 +794,53 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		}
 		return
 	}
+	// After processing this node, walk its expressions to find
+	// subquery inner plans and recursively remap them.
+	subRemap := func(exprs []Expr) {
+		var visitor func(Expr)
+		visitor = func(e Expr) {
+			if e == nil {
+				return
+			}
+			switch x := e.(type) {
+			case *SubqueryExpr:
+				remapPosMapAfterRewrite(x.Plan, nil)
+			case *InExpr:
+				if x.Plan != nil {
+					remapPosMapAfterRewrite(x.Plan, nil)
+				}
+			case *BinaryOp:
+				visitor(x.Left)
+				visitor(x.Right)
+			case *UnaryOp:
+				visitor(x.Operand)
+			case *FuncCall:
+				for _, a := range x.Args {
+					visitor(a)
+				}
+			}
+		}
+		for _, e := range exprs {
+			visitor(e)
+		}
+	}
+	switch n := node.(type) {
+	case *Filter:
+		subRemap([]Expr{n.Predicate})
+	case *Project:
+		subRemap(n.Targets)
+	case *Sort:
+		for i := range n.Keys {
+			subRemap([]Expr{n.Keys[i].Expr})
+		}
+	case *Aggregate:
+		subRemap(n.GroupExprs)
+		for i := range n.Aggs {
+			if n.Aggs[i].Arg != nil {
+				subRemap([]Expr{n.Aggs[i].Arg})
+			}
+		}
+	}
 }
 
 // binaryTreePosMapOf collects SeqScan leaves from a binary join

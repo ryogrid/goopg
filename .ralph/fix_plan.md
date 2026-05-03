@@ -749,25 +749,37 @@ See `docs/milestones/0041-close-parity-gaps.md`.
 Fix the remaining 8 DIVERGENT TPC‑H parity queries (identical=14 today).
 Target: identical ≥ 20, divergent ≤ 2 (Q1 + Q14 numeric precision only).
 
-- [ ] M0041-0001: Close parity gaps. Design doc
-      `docs/design/0041-0001-close-parity-gaps.md`.
+- [x] M0041-0001: Generalize ColumnRef remap to binary join trees.
+      Design doc `docs/design/0041-0001-close-parity-gaps.md`.
 
-  - [ ] Fix A: Re‑wire `remapExprRefsToMHJ` (with `remapByPosMap` and
-        OID‑based `buildMHJPosMap`) so Filter predicates and aggregate
-        expressions are remapped after `rewriteMultiWayChain` AND after
-        `buildAggregateStage`.
+  - [x] Fix A: `remapColumnRefsAfterRewrite` with OID‑based
+        `buildMHJPosMap` + `binaryTreePosMapOf` (traverses
+        Filter/Project/Sort/Aggregate wrappers).  MHJ queries
+        and ≥3‑table binary join trees both remapped.
+        Parity: identical=14 (no regression).
 
-  - [ ] Fix B: For MHJ queries with subqueries (Q7), ensure the remap
-        traverses into `SubqueryExpr.Plan` / `InExpr.Plan` inner plans.
+  - [ ] Fix B: Subquery plan traversal — `remapPosMapAfterRewrite`
+        must descend into `SubqueryExpr.Plan` / `InExpr.Plan`
+        inner plans (Q7, Q10, Q11).
 
-  - [ ] Fix C: For non‑MHJ queries (Q5, Q8, Q10), fall back to
-        `pushPredicatesIntoCrossJoins` (left‑deep, FROM‑order) when
-        the bushy DP produces a non‑left‑deep tree.  Left‑deep trees
-        have FROM‑order output schemas, avoiding column misalignment.
+  - [ ] Fix C: Non‑MHJ star‑shaped queries (Q5, Q8, Q9) — bushy DP
+        binary join trees may still have ColumnRef misalignment.
+        `binaryTreePosMapOf` infrastructure is in place but may not
+        cover all plan shapes.
 
-  - [ ] Verification: `TestTPCHResultParity` identical ≥ 20,
-        divergent ≤ 2, errored = 0.
-        `TestRunTPCHQueriesAgainstSyntheticData`: 22/22 PASS.
+- [ ] M0041-0002: Fix remaining 6 queries (subquery + star). Design doc
+      `docs/design/0041-0002-fix-remaining-6-queries.md`.
+
+  - [ ] Subquery fix: add `SubqueryExpr.Plan` / `InExpr.Plan`
+        traversal to `remapPosMapAfterRewrite`.  Expected to fix
+        Q7, Q10, Q11 (queries with subqueries containing MHJ or
+        binary join trees).
+
+  - [ ] Star‑shape fix: investigate Q5/Q8/Q9 plan shapes and
+        determine why `binaryTreePosMapOf` doesn't help.
+
+  - [ ] Verification: `TestTPCHResultParity` identical ≥ 18,
+        divergent ≤ 4 (Q1+Q14 precision), errored = 0.
 
 ## Notes
 
