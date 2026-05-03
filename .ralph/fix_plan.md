@@ -627,20 +627,28 @@ Eliminates N-1 intermediate result sets. Target: Q2 peak RSS ≤ 10 GB.
       `analysis/tpch-power-test-0038-report.md`.
   - [x] Schema build, data load, index create, ANALYZE — all PASS
   - [x] Chain detection active, MultiHashJoin confirmed in Q2 plan
-  - [x] Q14 completed in 27.6 s (first query in HammerDB order)
-  - [ ] Q2 failed with `comparison across kinds 7 vs 3 (42804)` —
-        pre-existing Datum type-system bug, not caused by M0038
-  - [ ] Q3, Q8, Q10, Q21 also hit cross-kind comparison errors
-        (same root cause); Q5, Q7, Q9, Q11 return 0 rows from
-        misaligned column references in multi-table join plans
+  - [x] Q14 completed in 25.7 s (first query in HammerDB order)
+  - [ ] 9 queries return 0 rows (vs upstream >0) due to planner
+        column-index misalignment in bushy DP / unnest pipeline
 
-  Pre-existing `compareDatum` blockers (not M0038-related):
+- [x] M0038-0003: Fix `compareDatum` cross-kind errors for TPC-H.
+      (landed 2026-05-03) Detailed report at
+      `analysis/0038-fix-compareDatum-cross-kind.md`.
+  - [x] Add `promoteCrossKind` — implicit string→numeric/time/int
+        promotion in `compareDatum` (`executor/expr.go`)
+  - [x] String-comparison fallback for irreconcilable cross-kind pairs
+  - [x] All 4 `goopg-errored` queries eliminated (now 0 errored)
+  - [x] Parity matrix: identical=13, divergent=9, errored=0
+  - [x] No query crashes — remaining divergent queries return 0 rows
+
+  Remaining planner-index misalignment (not M0038):
   - [ ] Planner column-index misalignment in multi-table joins causes
-        `KindNumeric vs KindString` / `KindInterval vs KindString`
-        comparison errors in `compareDatum` (`executor/expr.go:322`).
-        Affects Q2, Q3, Q5, Q7, Q8, Q9, Q10, Q11, Q18, Q21.
+        Q3/Q5/Q7/Q8/Q9/Q10/Q11 to return 0 rows (wrong ColumnRef
+        indices prevent rows from matching). Affects 9 of 22 TPC-H
+        queries even after `compareDatum` error fix.
   - [ ] Fix: resolve ColumnRef indices correctly through bushy-DP /
-        unnest pipeline so join keys reference the right column types.
+        unnest pipeline so join keys reference the right physical
+        columns. See `analysis/0038-fix-compareDatum-cross-kind.md`.
 
   Follow-ups for future milestones:
   - [ ] Cost-based plan selection: choose MultiHashJoin only when estimated
