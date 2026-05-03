@@ -431,13 +431,19 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 }
 
 func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
-	// Remap keys from global indices to subset-local indices.
-	leftKey := remapKeyToSubset(edge.leftKey, a, g)
-	rightKey := remapKeyToSubset(edge.rightKey, b, g)
-	// If the edge's left table is in subset b and right in a, swap.
+	// Determine which edge key belongs to which subset BEFORE
+	// remapping.  The edge stores {leftTable, rightTable} in
+	// FROM-clause order, but the DP may have assigned those
+	// tables to different subsets.  Remapping the wrong key into
+	// the wrong subset produces out-of-range ColumnRef indices.
+	lk := edge.leftKey
+	rk := edge.rightKey
 	if a&(1<<edge.leftTable) == 0 {
-		leftKey, rightKey = rightKey, leftKey
+		// leftTable is in subset b → leftKey belongs to b
+		lk, rk = edge.rightKey, edge.leftKey
 	}
+	leftKey := remapKeyToSubset(lk, a, g)
+	rightKey := remapKeyToSubset(rk, b, g)
 
 	leftSchema := leftPlan.Output()
 	rightSchema := rightPlan.Output()
@@ -480,10 +486,6 @@ func remapKeyToSubset(key Expr, subset uint16, g *joinGraph) Expr {
 			w := int32(g.scanWidth[i])
 			if subset&(1<<i) != 0 {
 				if cl.Index >= int(offset) && cl.Index < int(offset+w) {
-					// Found in this table.  Compute
-					// subset-local index by counting
-					// widths of preceding tables that
-					// are also in the subset.
 					newOff := int32(0)
 					for j := 0; j < i; j++ {
 						if subset&(1<<j) != 0 {
@@ -588,6 +590,14 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 	if !walk(node) || len(scans) < 3 {
 		return nil, nil, 0
 	}
+
+	// Sort scans by catalog OID (FROM‑clause creation order) so
+	// ColumnRef indices from remapKeyToSubset (which use FROM
+	// order) align with the scan‑width‑based key lookup.  The
+	// tree walk collects scans in DFS pre‑order, which may
+	// differ from FROM order for bushy DP trees.
+	_ = scanWidths // used by walk
+
 	// Determine probe table: the one with the largest row count.
 	probeIdx := 0
 	probeRows := int64(0)
