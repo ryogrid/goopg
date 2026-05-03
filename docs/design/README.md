@@ -197,4 +197,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0039-0001 | [Planner Column-Index Alignment Fix](0039-0001-planner-column-ref-fix.md) | draft | Fix three ColumnRef-index alignment bugs in bushy DP / pushdown / unnest pipeline so TPC-H queries return correct row counts and MultiHashJoin resolves all join keys. See `docs/milestones/0039-fix-planner-column-ref.md`. |
 
+| 0040-0001 | [Subquery Caching and IN‑Subquery Unnest](0040-0001-subquery-caching-and-unnest.md) | draft | Two-part optimisation: (1) cache correlated subquery results per outer-key to eliminate per-row re-execution; (2) extend the unnest pass to rewrite `IN(subquery)` as hash semi-join. Targets TPC‑H Q20 ≤ 120 s. See `docs/milestones/0040-correlated-subquery-optimization.md`. |
+
 Append new rows in numeric order. Do not reorder.
