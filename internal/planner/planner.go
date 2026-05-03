@@ -363,8 +363,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// expressions (incl. unnest keys) stay aligned.
 	node = rewriteMultiWayChain(node)
 	node = remapExprRefsToMHJ(node)
+	// Second pass: use FROM‑clause bindings to correct any
+	// remaining order differences (OID ≠ FROM order).
+	if len(ctx.bindings) > 0 {
+		remapWithBindings(node, ctx.bindings)
+	}
 
 	var agg *aggregateSurface
+	savedBindings := ctx.bindings
 	if needsAggregateStage(s) {
 		var having Expr
 		var err error
@@ -380,6 +386,9 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// again after the aggregate is built so its GroupExprs / Sort
 		// keys / Project targets point to the correct MHJ positions.
 		node = remapExprRefsToMHJ(node)
+		if len(savedBindings) > 0 {
+			remapWithBindings(node, savedBindings)
+		}
 	} else if s.Having != nil {
 		return nil, &PlanError{
 			Pos:     s.Having.Pos(),

@@ -888,6 +888,72 @@ func remapExprRefsToMHJ(node Node) Node {
 	return remapColumnRefsAfterRewrite(node)
 }
 
+// remapWithBindings applies a second remap pass using FROM‑clause
+// bindings to correct any remaining OID‑vs‑FROM order mismatch
+// after the OID‑sorted MHJ schema has been built and the first
+// remap pass (OID‑based posMap) has run.
+func remapWithBindings(node Node, bindings []rangeBinding) {
+	if node == nil || len(bindings) == 0 {
+		return
+	}
+	var scans []Node
+	var collect func(Node)
+	collect = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *SeqScan:
+			scans = append(scans, x)
+		case *Join:
+			collect(x.Left)
+			collect(x.Right)
+		case *MultiHashJoin:
+			for _, t := range x.Tables {
+				if s, ok := t.(*SeqScan); ok {
+					scans = append(scans, s)
+				}
+			}
+		case *Filter:
+			collect(x.Child)
+		case *Project:
+			collect(x.Child)
+		case *Sort:
+			collect(x.Child)
+		case *Aggregate:
+			collect(x.Child)
+		}
+	}
+	collect(node)
+	if len(scans) == 0 {
+		return
+	}
+
+	scanOff := 0
+	scanMap := make(map[*catalog.Table]int)
+	for _, s := range scans {
+		scanMap[s.(*SeqScan).Table] = scanOff
+		scanOff += len(s.Output())
+	}
+	posMap := func(oldIdx int) int {
+		for _, b := range bindings {
+			if b.table == nil {
+				continue
+			}
+			scanPos, ok := scanMap[b.table]
+			if !ok {
+				continue
+			}
+			w := len(b.table.Columns)
+			if oldIdx >= b.offset && oldIdx < b.offset+w {
+				return scanPos + (oldIdx - b.offset)
+			}
+		}
+		return oldIdx
+	}
+	remapPosMapAfterRewrite(node, posMap)
+}
+
 // mhjPosMapOf returns a position map (old FROM‑order → new MHJ
 // DFS‑order) if the subtree contains a MultiHashJoin, or nil.
 func mhjPosMapOf(node Node) func(int) int {
