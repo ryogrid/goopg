@@ -741,11 +741,16 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
 - [x] M0040-0003: End‑to‑end verification.
   - [x] `TestRunTPCHQueriesAgainstSyntheticData`: 22/22 PASS.
   - [x] `TestTPCHResultParity`: identical=13 divergent=9 errored=0 (no regression).
-  - [ ] HammerDB SF=1 power test: Q14=28.8s, Q2=4.8s, Q9=51.4s all PASS.
-        **Q20 timed out at 1 h** — the lineitem scalar subquery is
-        evaluated once per distinct partsupp (PK) row (800K unique
-        keys), so caching doesn't help.  Need recursive scalar
-        subquery unnest inside IN-subquery inner plans.
+  - [x] HammerDB SF=1 power test partial run (run-005, 2026‑05‑04).
+        Documented in `analysis/tpch-hammerdb-run-005.md`.
+        Q14=14.3s ✓, Q2=20.8s ✓.
+        Q9 TIMEOUT (28+ min) — MHJ `expandChain` materialises all
+        rows into heap on 1.8M-lineitem data, causing 91% GC overhead.
+        ORDERS/LINEITEM load still drops at 450K orders under HammerDB
+        (residual M0032-0005 issue with HammerDB's TCP socket).
+        Q20 and remaining queries not reached.
+        Two new issues identified: (A) MHJ lazy-iterator refactor
+        needed (see below); (B) HammerDB load TCP drop still open.
   - [x] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
 
 - [ ] M0040-0004: Recursive subquery unnest inside IN/SubqueryExpr
@@ -898,6 +903,27 @@ previously‑allowlisted numeric‑precision deltas (Q1, Q8, Q14).
         — **PASS**. `TestRunTPCHQueriesAgainstSyntheticData`
         22/22 PASS. `go test ./...` clean (only pre‑existing
         `tmp/` build error unaffected).
+
+## Milestone 0043 — MHJ lazy-iterator refactor (P0 blocker for Q9/SF=1)
+
+Identified in `analysis/tpch-hammerdb-run-005.md` (2026-05-04).
+The M0041-0002 `expandChain` in `multiHashJoinOp.Open()`
+(`internal/executor/multi_hash_join.go`) materialises **all** cross-
+product rows into `o.rows []Row` before yielding any result. On 1.8M-
+lineitem data (30% SF=1), Q9's 6-table join fills > 19 GB heap and
+causes 91% GC overhead — the query never finishes in practice.
+
+- [ ] M0043-0001: Replace `expandChain` + `o.rows` materialisation
+      with a lazy per-call iterator. Design doc
+      `docs/design/0043-0001-mhj-lazy-iterator.md`.
+  - [ ] Add lazy state fields to `multiHashJoinOp`: per-step cursor
+        indices (analogous to `lazyMatchIdx` in binary `joinOp`).
+  - [ ] `Open()`: build hash tables only; do NOT materialise rows.
+  - [ ] `Next()`: advance the cursor chain one step at a time, yield
+        one row per call. Backtrack when a step is exhausted.
+  - [ ] Remove `o.rows []Row`, `o.idx int` fields.
+  - [ ] Verify: Q9 completes in O(10s) on 1.8M-lineitem partial data;
+        `TestTPCHResultParity` still identical=22 divergent=0.
 
 ## Milestone 0042 — Align goopg I/O with upstream PostgreSQL
 
