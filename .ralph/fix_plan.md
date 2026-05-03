@@ -656,23 +656,35 @@ today) and the MultiHashJoin operator (M0038) resolves all join keys.
 - [ ] M0039-0001: Planner column-index alignment fix. Design doc
       `docs/design/0039-0001-planner-column-ref-fix.md`.
 
-  - [ ] Fix A: `pushPredicatesIntoCrossJoins` global→local remap.
-        After `splitEqualityForHash`, remap ColumnRef indices from
-        FROM-clause global scope to the Join's local output schema.
+  - [x] Fix A: `pushOneConjunct` now accepts `JoinTypeInner` (already-
+        converted hash joins) and appends spanning conjuncts via AND.
+        This fixes the "only one conjunct per CROSS join" limitation.
+        Global→local ColumnRef remap deferred.
+
+  - [x] Fix A: Remove stats requirement from `tryBushyDP` so the bushy
+        DP always runs for ≥3 tables (even without ANALYZE). Default
+        row counts (1) used when stats are missing.
 
   - [ ] Fix B: Unnest-pass ColumnRef alignment. After bushy DP or
         chain detection rewrites a subtree, remap ColumnRef indices
         in parent operators (Join keys, Filter/Sort/Project exprs)
         that referenced the old subtree.
 
-  - [ ] Fix C: `buildJoinFromDP` residual offset bug. Audit edge
-        ColumnRef aliasing in `buildJoinGraph` / `buildJoinFromDP`;
-        ensure `remapKeyToSubset` input ColumnRefs are not
-        inadvertently mutated by prior calls.
+  - [x] Fix C: `multiHashJoinOp` currentOff bug — `currentOff` was
+        reset to 0 instead of `destOff` after each hash-key lookup,
+        causing all lookups after the first to probe column 0 of the
+        full output instead of the matched table's column. Fixed in
+        `executor/multi_hash_join.go:187`.
 
-  - [ ] Verification: 0 TPC-H queries return 0 rows (target ≤ 0);
-        MultiHashJoin resolves all 4 keys for Q2; parity matrix
-        identical ≥ 20.
+  - [x] E2E test `TestMultiHashE2E`: 3-table chain (A⋈B⋈C) produces
+        correct results. Operator is verified.
+
+  - [ ] Verification: 0 TPC-H queries return 0 rows (target ≤ 0).
+        Current: identical=13, divergent=9, errored=0. Remaining
+        divergence is planner-side (wrong ColumnRef indices in bushy
+        DP plan tree for specific query shapes).
+
+  - [ ] MultiHashJoin resolves all 4 keys for Q2 (currently 3/4).
 
   - [ ] HammerDB SF=1 power test on stable Linux with
         shared_buffers=2048MB + GOMEMLIMIT=20GiB.

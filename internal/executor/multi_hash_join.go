@@ -184,8 +184,10 @@ func (o *multiHashJoinOp) Next() (Row, error) {
 				destOff += len(o.nulls[i])
 			}
 			copy(out[destOff:], match)
-			currentOff = 0 // now the full accumulated output
-			currentLen = len(out)
+			// Next step's srcCol is relative to the matched
+			// table's columns, not the whole output row.
+			currentOff = destOff
+			currentLen = len(match)
 		}
 
 		if !matched {

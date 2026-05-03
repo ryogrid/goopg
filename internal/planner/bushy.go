@@ -35,10 +35,12 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	if ctx == nil || len(ctx.bindings) < 3 {
 		return node, pred
 	}
-	// Check all tables have stats.
+	// Collect tables; enumerateBushyPlans handles missing stats
+	// with RowCount=1 defaults internally, so the DP works even
+	// before ANALYZE has populated statistics.
 	tables := make([]*catalog.Table, len(ctx.bindings))
 	for i, b := range ctx.bindings {
-		if b.table == nil || b.table.Stats == nil || b.table.Stats.RowCount <= 0 {
+		if b.table == nil {
 			return node, pred
 		}
 		tables[i] = b.table

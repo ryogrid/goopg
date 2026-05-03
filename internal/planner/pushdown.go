@@ -63,35 +63,44 @@ func pushOneConjunct(node Node, c Expr) bool {
 	if pushOneConjunct(j.Right, c) {
 		return true
 	}
-	if j.Type != JoinTypeCross {
-		return false
-	}
 	leftWidth := len(j.Left.Output())
 	totalWidth := leftWidth + len(j.Right.Output())
 	side := classifyConjunctSide(c, leftWidth, totalWidth)
 	if side != sideMixed {
 		return false
 	}
-	// Predicate spans both sides — promote the Join.
-	j.Type = JoinTypeInner
-	j.Predicate = c
-	if lk, rk, okSplit := splitEqualityForHash(c, leftWidth); okSplit {
-		j.LeftKey = lk
-		j.RightKey = rk
-		j.Algo = JoinAlgoHash
-		lRows := EstimateRows(j.Left)
-		rRows := EstimateRows(j.Right)
-		// Cost-driven INNER algorithm pick when stats are
-		// present; rule-based hash is the fallback (see
-		// docs/design/0006-0004-join-algorithm-selection.md).
-		if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
-			j.Algo = algo
+	if j.Type == JoinTypeCross {
+		// Predicate spans both sides — promote the Join.
+		j.Type = JoinTypeInner
+		j.Predicate = c
+		if lk, rk, okSplit := splitEqualityForHash(c, leftWidth); okSplit {
+			j.LeftKey = lk
+			j.RightKey = rk
+			j.Algo = JoinAlgoHash
+			lRows := EstimateRows(j.Left)
+			rRows := EstimateRows(j.Right)
+			if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
+				j.Algo = algo
+			}
+			if j.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
+				j.BuildLeft = true
+			}
 		}
-		if j.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
-			j.BuildLeft = true
-		}
+		return true
 	}
-	return true
+	// Join is already Inner/Hash — append the conjunct to the
+	// existing predicate via AND.  This handles the case where
+	// the bushy DP or a prior pushdown pass consumed one edge
+	// but left a different spanning conjunct unapplied.
+	if j.Type == JoinTypeInner {
+		if j.Predicate == nil {
+			j.Predicate = c
+		} else {
+			j.Predicate = &BinaryOp{pos: c.Pos(), Op: "AND", Left: j.Predicate, Right: c}
+		}
+		return true
+	}
+	return false
 }
 
 // sideOutOfScope is a sentinel returned by classifyConjunctSide
