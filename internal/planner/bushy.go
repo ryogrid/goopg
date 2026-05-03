@@ -519,14 +519,11 @@ func markEdgesInMask(mask uint16, g *joinGraph, used []bool) {
 // a valid chain (≥3 tables, all JoinAlgoHash, all inner, chained).
 func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 	var scans []Node
-	var scanWidths []int // number of columns in each scan's output
 	var keys []MultiHashKey
 
 	var walk func(n Node) bool
 	walk = func(n Node) bool {
 		if s, ok := n.(*SeqScan); ok {
-			sz := len(s.Output())
-			scanWidths = append(scanWidths, sz)
 			scans = append(scans, s)
 			return true
 		}
@@ -559,24 +556,14 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 		rightEnd := len(scans)
 
 		// Determine which scan and column the left/right join keys
-		// reference.  LeftKey.ColumnRef.Index is relative to the
-		// left child's output schema.  RightKey.ColumnRef.Index
-		// was shifted by left child output width in
-		// buildJoinFromDP — we un-shift before searching the
-		// right subtree's scans.
-		li, lc := scanForCol(scanWidths, leftStart, leftEnd, j.LeftKey)
-
-		leftWidth := 0
-		for i := leftStart; i < leftEnd; i++ {
-			leftWidth += scanWidths[i]
-		}
-		rightKey := j.RightKey
-		if cr, ok := rightKey.(*ColumnRef); ok {
-			adjusted := *cr
-			adjusted.Index -= leftWidth
-			rightKey = &adjusted
-		}
-		ri, rc := scanForCol(scanWidths, leftEnd, rightEnd, rightKey)
+		// reference.  We resolve by column name rather than by
+		// ColumnRef.Index, because remapKeyToSubset (called from
+		// buildJoinFromDP) produces FROM-order indices while the
+		// tree walk collects scans in DFS order — the two orders
+		// may differ for bushy DP trees.  Column names are
+		// unique (prefixed by table), so the lookup is unambiguous.
+		li, lc := findScanByColName(scans, leftStart, leftEnd, j.LeftKey)
+		ri, rc := findScanByColName(scans, leftEnd, rightEnd, j.RightKey)
 		if li >= 0 && ri >= 0 {
 			keys = append(keys, MultiHashKey{
 				LeftTable:  li,
@@ -588,6 +575,27 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 		return true
 	}
 	if !walk(node) || len(scans) < 3 {
+		return nil, nil, 0
+	}
+
+	// Verify the keys form a simple chain: each table may appear
+	// at most twice (once as "source", once as "destination").
+	// Star graphs (e.g. lineitem at the centre of Q9) cannot be
+	// expressed as a single chain; the MultiHashJoin probe loop
+	// only follows one path through the keys.
+	chainOK := true
+	tableDeg := make([]int, len(scans))
+	for _, k := range keys {
+		tableDeg[k.LeftTable]++
+		tableDeg[k.RightTable]++
+	}
+	for _, d := range tableDeg {
+		if d > 2 {
+			chainOK = false
+			break
+		}
+	}
+	if !chainOK {
 		return nil, nil, 0
 	}
 
@@ -603,20 +611,27 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int) {
 	return scans, keys, probeIdx
 }
 
-// scanForCol maps a ColumnRef (whose index is relative to the
-// schema of scans[start..end)) back to the global scan index and
-// the per-scan column offset.
-func scanForCol(widths []int, start, end int, key Expr) (scanIdx int, colInScan int) {
+// findScanByColName resolves a join-key ColumnRef to a
+// (scan-index, column-within-scan) pair by matching the column
+// name against scans[start..end).  Column names are unique per
+// table (TPC-H prefixes: p_partkey, s_suppkey, …) so the lookup
+// is unambiguous.  Returns (-1, 0) when the key type is not a
+// ColumnRef or the name is not found.
+func findScanByColName(scans []Node, start, end int, key Expr) (scanIdx int, colIdx int) {
 	cr, ok := key.(*ColumnRef)
 	if !ok {
 		return -1, 0
 	}
-	relOff := 0
 	for i := start; i < end; i++ {
-		if cr.Index >= relOff && cr.Index < relOff+widths[i] {
-			return i, cr.Index - relOff
+		s, ok := scans[i].(*SeqScan)
+		if !ok {
+			continue
 		}
-		relOff += widths[i]
+		for j, col := range s.Output() {
+			if col.Name == cr.Name {
+				return i, j
+			}
+		}
 	}
 	return -1, 0
 }
