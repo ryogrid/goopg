@@ -74,4 +74,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0037 | Spill-to-disk hash join (Grace hash join)                                | accepted       | `0037-hash-join-spill-to-disk.md` |
 | 0038 | Multi-way hash join                                                     | accepted        | `0038-multi-way-hash-join.md` |
 | 0039 | Fix planner column-index alignment (correct join results)               | planned         | `0039-fix-planner-column-ref.md` |
-| 0040 | Correlated subquery optimization (caching + IN-unnest)                  | planned         | `0040-correlated-subquery-optimization.md` |
+| 0040 | Correlated subquery optimization (caching + IN-unnest)                  | accepted        | `0040-correlated-subquery-optimization.md` |

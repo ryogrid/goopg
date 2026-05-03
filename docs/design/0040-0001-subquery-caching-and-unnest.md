@@ -1,6 +1,6 @@
 # 0040-0001 — Subquery Result Caching and IN‑Subquery Unnest
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0040
 **Date:** 2026-05-03
 

@@ -58,6 +58,16 @@ type Context struct {
 	// innermost outer scope.
 	OuterRows []Row
 
+	// SubqueryCache stores subquery results keyed by outer-row
+	// values so correlated subqueries are executed at most once
+	// per distinct outer value rather than per outer row.  Keys
+	// are datumKey-derived strings; values are []Dat um for
+	// InExpr or Datum for scalar subqueries.  The cache is
+	// notionally per-subquery — a production implementation
+	// would namespace by InExpr/SubqueryExpr identity.
+	SubqueryCache      map[string][]Datum
+	SubqueryCacheScope int // OuterRows len when cached; cleared on change
+
 	// StatsTarget is the effective `default_statistics_target`
 	// GUC value for the current statement. ANALYZE uses
 	// `targrows = StatsTarget * 300` for sample sizing, mirrors

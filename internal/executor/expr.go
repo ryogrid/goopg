@@ -636,6 +636,21 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 // exactly one column. Otherwise evaluates the value list.
 func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) {
 	if x.Plan != nil {
+		// Consult the subquery cache so correlated IN
+		// subqueries are evaluated at most once per distinct
+		// outer-row value rather than per outer row.  This
+		// reduces Q20-like queries from O(outer×inner) to
+		// O(inner) per distinct correlation key.
+		if ctx.SubqueryCache != nil {
+			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
+				clear(ctx.SubqueryCache)
+				ctx.SubqueryCacheScope = len(ctx.OuterRows)
+			}
+			key := subqueryCacheKey(row)
+			if cached, ok := ctx.SubqueryCache[key]; ok {
+				return cached, nil
+			}
+		}
 		// Push the outer row so correlated refs inside the
 		// IN-subquery resolve against it. Pop on return.
 		ctx.OuterRows = append(ctx.OuterRows, row)
@@ -663,6 +678,13 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 			}
 			out = append(out, r[0])
 		}
+		// Cache the result so subsequent rows with the same
+		// correlation values skip the inner-plan execution.
+		if ctx.SubqueryCache == nil {
+			ctx.SubqueryCache = make(map[string][]Datum)
+			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		}
+		ctx.SubqueryCache[subqueryCacheKey(row)] = out
 		return out, nil
 	}
 	out := make([]Datum, len(x.List))
@@ -720,7 +742,31 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
-	return subqueryImpl(x, ctx)
+	// Check cache for scalar subquery results keyed by outer row.
+	if ctx.SubqueryCache != nil {
+		if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
+			clear(ctx.SubqueryCache)
+			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		}
+		key := subqueryCacheKey(row)
+		if cached, ok := ctx.SubqueryCache[key]; ok {
+			if len(cached) == 1 {
+				return cached[0], nil
+			}
+			return NullDatum, nil
+		}
+	}
+	val, err := subqueryImpl(x, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	// Store in cache
+	if ctx.SubqueryCache == nil {
+		ctx.SubqueryCache = make(map[string][]Datum)
+		ctx.SubqueryCacheScope = len(ctx.OuterRows)
+	}
+	ctx.SubqueryCache[subqueryCacheKey(row)] = []Datum{val}
+	return val, nil
 }
 
 func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
@@ -1047,4 +1093,15 @@ func pgFormatToGoLayout(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// subqueryCacheKey builds a deterministic string key from an
+// outer row so correlated subquery results can be cached per
+// distinct correlation value.
+func subqueryCacheKey(row Row) string {
+	parts := make([]string, len(row))
+	for i, d := range row {
+		parts[i] = datumKey(d)
+	}
+	return strings.Join(parts, "|")
 }

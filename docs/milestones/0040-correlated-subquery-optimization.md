@@ -1,6 +1,6 @@
 # Milestone 0040 — Correlated Subquery Optimization
 
-**Status:** planned
+**Status:** accepted
 **Depends on:** M0038 (multi-way hash join), M0033 (subquery unnesting)
 **Drives:** Reduce TPC-H Q20 execution time from >1 h to ≤120 s by eliminating per-outer-row subquery re-execution. Enable unnesting of `IN (subquery)` expressions.
 
