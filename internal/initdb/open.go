@@ -118,6 +118,12 @@ type OpenOptions struct {
 	AIOMethod         string
 	AIOWorkers        int
 	AIOMaxConcurrency int
+
+	// WALSegmentSize overrides the WAL segment file size. 0 uses the
+	// default (wal.DefaultSegmentSize = 16 MiB). Tests pass a smaller
+	// value (e.g. 1 MiB) to exercise WAL retention with less data.
+	// Maps directly to wal.Config.SegmentSize.
+	WALSegmentSize int64
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -191,6 +197,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	walCfg := wal.Config{
 		WALDir:             filepath.Join(abs, "pg_wal"),
+		SegmentSize:        opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
 		Preallocate:        opts.WALInitZero,
 		DirectIO:           opts.WALDirectIO,
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
