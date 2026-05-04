@@ -1646,12 +1646,15 @@ and unblocks PL/pgSQL exception blocks (M0015).
       drop (SubXactAborted entries). 9 unit tests including
       `TestSubxactStackLockOwnerCorrectnessModel` (DoD) and
       `TestSubxactStackNilSafe`.)
-- [ ] M0050-0002: Subxact xid & visibility. Design doc
-      `docs/design/0050-0002-subxact-xid-and-visibility.md`. In-memory
-      subxact-to-parent map; `XidInProgress` resolves via
-      `TopLevelXid`; aborted-subxact rows invisible after parent
-      commit. DoD: visibility matrix `(subxact, parent)` matches
-      upstream cell-by-cell.
+- [x] M0050-0002: Subxact xid & visibility. Design doc
+      `docs/design/0050-0002-subxact-xid-and-visibility.md`. (landed
+      2026-05-05: `subxactFields` embedded in Manager: `RegisterSubXid`,
+      `MarkSubxactAborted`, `TopLevelXid`, `IsAborted`, `IsSubxact`.
+      `SubxactResolver` interface (Manager satisfies). `SeesCommittedXIDWithSubxacts`:
+      aborted → invisible; else resolve via `TopLevelXid` + normal
+      `SeesCommittedXID`. `TupleVisibleSubxact` wraps with nil-safe
+      degradation. DoD: `TestSubxactVisibilityMatrix` (3-cell matrix),
+      `TestTopLevelXidChain`, `TestSubxactAbortHidesRowAfterParentCommit`.)
 - [ ] M0050-0003: Subxact WAL & recovery. Design doc
       `docs/design/0050-0003-subxact-wal-and-recovery.md`. New WAL
       records `XactAssignment` / `XactRollbackTo` / `XactSubAbort`;

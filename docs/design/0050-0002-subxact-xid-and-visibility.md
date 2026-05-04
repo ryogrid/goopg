@@ -1,60 +1,95 @@
-# 0050-0002 — Subxact xid allocation and visibility
+# Subxact XID Allocation and Visibility — M0050-0002
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0050 — Savepoints and subtransactions
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-Once subxacts can write rows, the snapshot manager has to answer
-"is xid X visible to snapshot S?" correctly. With nesting, the answer
-depends on the parent xact's status and on whether X (a subxact xid)
-was individually rolled back.
+When subtransactions write rows, the snapshot manager must answer "is XID X
+visible to snapshot S?" correctly for subxact XIDs. Visibility depends on
+both the subxact's own status (individually rolled back?) and its parent's
+top-level status.
 
-## Plan
+## 2. Design
 
-1. In-memory subxact-to-parent map (the pg_subtrans equivalent): a
-   bounded LRU keyed by SubXid → ParentXid. Populated at every subxact
-   xid allocation; consulted at every visibility check.
-2. New helpers in `internal/mvcc/`:
-   - `TopLevelXid(xid) Xid` — walks the subxact-to-parent chain.
-   - `SubxactRolledBack(subxid) bool` — checks against the per-top-
-     level "rolled back subxacts" bitmap.
-3. `XidInProgress` extended:
-   - Resolve to top-level xid.
-   - If top-level is committed: still in-progress for *this* visibility
-     test if `subxid` itself was rolled back (an aborted subxact's row
-     stays invisible even after the parent commits). Otherwise visible.
-   - If top-level is aborted: invisible.
-   - If top-level is in-progress: in-progress.
-4. **Snapshot capture.** A snapshot is a tuple (xmin, xmax, xip[], xact
-   status accessor). Subxacts inherit the parent's snapshot at
-   savepoint time; on `ROLLBACK TO`, the new sibling subxact gets a
-   fresh snapshot. The `xip[]` array tracks top-level xids only, as in
-   upstream — subxact resolution is via the parent map.
-5. Persistence: the in-memory subxact map only needs to survive while
-   the top-level xact is in flight. Crash recovery rebuilds it from the
-   WAL assignment records (0050-0003); after a clean commit/abort the
-   entries can be evicted.
+### 2.1 Subxact map (`internal/mvcc/subxact_visibility.go`)
 
-## Definition of Done
+The `Manager` embeds a `subxactFields` struct:
 
-- Visibility test matrix in `internal/mvcc/`:
-  `(subxact-status, parent-status) × (snapshot-mode)` — every cell
-  matches upstream's behaviour.
-- Stress test: 2 sessions, one with a 4-deep savepoint chain, the
-  other reading; correct rows visible at every commit/rollback step.
+```go
+type subxactFields struct {
+    subxactMu      sync.RWMutex
+    subxactParents map[storage.TransactionID]storage.TransactionID  // subxid → parent xid
+    subxactAborted map[storage.TransactionID]bool                   // aborted subxids
+}
+```
 
-## Upstream reference
+Maps are lazily initialised on first use. The Manager exposes:
 
-- `postgres/src/backend/access/transam/subtrans.c` — pg_subtrans SLRU
-  (in-memory cache for goopg).
-- `postgres/src/backend/utils/time/snapmgr.c` — snapshot fields.
-- `postgres/src/backend/access/heap/heapam_visibility.c` —
-  `HeapTupleSatisfiesMVCC` / subxact branch.
+```go
+func (m *Manager) RegisterSubXid(subxid, parentXid storage.TransactionID)
+func (m *Manager) MarkSubxactAborted(subxid storage.TransactionID)
+func (m *Manager) TopLevelXid(xid storage.TransactionID) storage.TransactionID
+func (m *Manager) IsAborted(xid storage.TransactionID) bool
+func (m *Manager) IsSubxact(xid storage.TransactionID) bool
+```
 
-## goopg references
+### 2.2 `SubxactResolver` interface
 
-- `internal/mvcc/snapshot.go`, `internal/mvcc/visibility.go`.
-- 0050-0001 — stack provides the parent map population.
+`Manager` satisfies `SubxactResolver`:
+
+```go
+type SubxactResolver interface {
+    TopLevelXid(xid storage.TransactionID) storage.TransactionID
+    IsAborted(xid storage.TransactionID) bool
+    IsSubxact(xid storage.TransactionID) bool
+}
+```
+
+### 2.3 `SeesCommittedXIDWithSubxacts`
+
+Visibility rules for subxact XIDs:
+
+1. If `xid` is individually aborted → **invisible** (ROLLBACK TO SAVEPOINT).
+2. Resolve `xid` to its top-level ancestor via `TopLevelXid`.
+3. Apply normal `Snapshot.SeesCommittedXID` against the top-level XID.
+
+With `nil` resolver, degrades to standard `SeesCommittedXID`.
+
+### 2.4 `TupleVisibleSubxact`
+
+`TupleVisibleSubxact(h, snap, currentXID, resolver)` replaces
+`SeesCommittedXID(h.Xmin)` and `SeesCommittedXID(h.Xmax)` calls with
+`SeesCommittedXIDWithSubxacts(snap, xid, resolver)`. With `nil` resolver it
+matches `TupleVisible` exactly (existing callers unaffected).
+
+### 2.5 Lazy XID allocation
+
+`SubTransactionState.SubXid` starts at 0. When a subxact first writes,
+the heap-write path (M0050-0003/0004) calls `Manager.RegisterSubXid(subxid, parentXid)`.
+Until then the subxact has no XID and its writes ride on the parent's XID.
+
+## 3. Visibility matrix
+
+| subxact status | parent status | snapshot sees? |
+|---|---|---|
+| active | in-progress | no (parent in InProgress) |
+| committed (RELEASE) | committed | yes (parent past Xmin) |
+| aborted (ROLLBACK TO) | committed | **no** (IsAborted = true) |
+| aborted | in-progress | no (parent in InProgress) |
+| active | committed | yes (subxact not aborted, parent committed) |
+
+Matches upstream `HeapTupleSatisfiesMVCC` subxact branch.
+
+## 4. Tests (`internal/mvcc/subxact_visibility_test.go`)
+
+| Test | Coverage |
+|---|---|
+| `TestSubxactVisibilityMatrix` | **DoD**: 3 matrix cells (active/parent-inprog, committed/parent-committed, aborted/parent-committed) |
+| `TestTopLevelXidChain` | Multi-level parent walk |
+| `TestSeesCommittedXIDWithSubxactsNilResolver` | Nil resolver degrades correctly |
+| `TestTupleVisibleSubxactDegrades` | TupleVisibleSubxact matches TupleVisible with nil |
+| `TestSubxactAbortHidesRowAfterParentCommit` | Aborted-subxact row invisible even after parent commit |

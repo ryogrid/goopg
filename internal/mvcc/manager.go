@@ -38,6 +38,11 @@ type Manager struct {
 	nextXID    storage.TransactionID
 	active     map[storage.TransactionID]*txState
 	xactMarker func(storage.TransactionID, XactMarker) error
+
+	// subxact tracking (M0050-0002): maps subxact XIDs to their parent
+	// XIDs, and records individually-aborted subxact XIDs. Lazily
+	// initialised on first use. Protected by subxactMu.
+	subxactFields
 }
 
 // NewManager returns a fresh manager whose first assigned xid is 3,
