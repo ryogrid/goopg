@@ -969,7 +969,7 @@ caused 91% GC overhead — the query never finished in practice.
         first-ever full SF=1 Q9 completion. Q20 still TIMEOUT
         but that is independent (M0040-0004 territory). Documented
         in `analysis/tpch-hammerdb-run-007.md`.
-  - [ ] M0043-0003 (follow-up, optional): Q9 not yet under the
+  - [ ] M0043-0003: Q9 not yet under the
         "single-digit minutes" target. Hot paths to revisit:
         `datumKey()` string allocation per probe lookup
         (~22 M calls for Q9), `evalExpr` per-call dispatch cost
