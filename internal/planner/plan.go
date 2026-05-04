@@ -692,18 +692,22 @@ type DDL struct {
 func (n *DDL) Pos() int       { return n.pos }
 func (n *DDL) Output() Schema { return nil }
 
-// Transaction — BEGIN / COMMIT / ROLLBACK.
+// Transaction — BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / ROLLBACK TO.
 type TransactionVerb int
 
 const (
-	TxBegin TransactionVerb = iota
+	TxBegin      TransactionVerb = iota
 	TxCommit
 	TxRollback
+	TxSavepoint  // SAVEPOINT name
+	TxRelease    // RELEASE [SAVEPOINT] name
+	TxRollbackTo // ROLLBACK TO [SAVEPOINT] name
 )
 
 type Transaction struct {
 	pos  int
 	Verb TransactionVerb
+	Name string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
 }
 
 func (n *Transaction) Pos() int       { return n.pos }

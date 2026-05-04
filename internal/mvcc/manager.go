@@ -158,6 +158,22 @@ func (m *Manager) Rollback(tx Transaction) error {
 	return m.finish(tx, XactAbort)
 }
 
+// AllocateSubXid allocates a fresh XID for a subtransaction and registers
+// it as a child of parentXid. The sub-XID is not tracked in the active map
+// (subxact XIDs are not independent top-level transactions); visibility is
+// handled entirely by SeesCommittedXIDWithSubxacts via the subxact map.
+func (m *Manager) AllocateSubXid(parentXid storage.TransactionID) (storage.TransactionID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.nextXID == ^storage.TransactionID(0) {
+		return 0, ErrXIDWraparound
+	}
+	subXid := m.nextXID
+	m.nextXID++
+	m.addSubxactEntry(subXid, parentXid)
+	return subXid, nil
+}
+
 // ActiveCount returns the number of in-progress transactions.
 func (m *Manager) ActiveCount() int {
 	m.mu.Lock()

@@ -74,6 +74,12 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &Transaction{pos: s.Pos(), Verb: TxCommit}, nil
 	case *parser.RollbackStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxRollback}, nil
+	case *parser.SavepointStmt:
+		return &Transaction{pos: s.Pos(), Verb: TxSavepoint, Name: s.Name}, nil
+	case *parser.ReleaseSavepointStmt:
+		return &Transaction{pos: s.Pos(), Verb: TxRelease, Name: s.Name}, nil
+	case *parser.RollbackToSavepointStmt:
+		return &Transaction{pos: s.Pos(), Verb: TxRollbackTo, Name: s.Name}, nil
 
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt:

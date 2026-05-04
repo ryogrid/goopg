@@ -188,7 +188,7 @@ func (o *seqScanOp) Next() (Row, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !mvcc.TupleVisible(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
 				continue
 			}
 			row, err := DecodeRow(o.cols, tuple.Data)
@@ -964,7 +964,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				ctx.Pool.Unpin(s)
 				return err
 			}
-			if !mvcc.TupleVisible(tuple.Header, ctx.Snap, ctx.Tx.XID) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
 				continue
 			}
 			if err := DecodeRowInto(scanRow, cols, tuple.Data); err != nil {

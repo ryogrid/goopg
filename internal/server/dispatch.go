@@ -369,6 +369,12 @@ func transactionTag(v planner.TransactionVerb) string {
 		return "COMMIT"
 	case planner.TxRollback:
 		return "ROLLBACK"
+	case planner.TxSavepoint:
+		return "SAVEPOINT"
+	case planner.TxRelease:
+		return "RELEASE"
+	case planner.TxRollbackTo:
+		return "ROLLBACK"
 	}
 	return "OK"
 }

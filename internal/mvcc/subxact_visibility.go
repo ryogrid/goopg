@@ -135,11 +135,15 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 	}
 	xmaxIsLockOnly := h.Xmax != storage.InvalidTransactionID && storage.IsHeapTupleLockOnly(h.Infomask)
 
-	if h.Xmin == currentXID {
+	// A tuple is self-visible when its xmin was written by the current
+	// transaction. Inside a subtransaction the top-level XID (and any
+	// intermediate ancestor XID) also qualifies as "self": tuples
+	// inserted before the savepoint remain visible inside it.
+	if isCurrentTxXID(h.Xmin, currentXID, r) {
 		if xmaxIsLockOnly {
 			return true
 		}
-		return h.Xmax != currentXID
+		return !isCurrentTxXID(h.Xmax, currentXID, r)
 	}
 	if !SeesCommittedXIDWithSubxacts(snap, h.Xmin, r) {
 		return false
@@ -150,10 +154,28 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 	if xmaxIsLockOnly {
 		return true
 	}
-	if h.Xmax == currentXID {
+	if isCurrentTxXID(h.Xmax, currentXID, r) {
 		return false
 	}
 	return !SeesCommittedXIDWithSubxacts(snap, h.Xmax, r)
+}
+
+// isCurrentTxXID reports whether xid was written by the current transaction.
+// It returns true when xid equals currentXID exactly, OR when currentXID is
+// a subtransaction and xid is its top-level ancestor (a parent XID inserted
+// before the savepoint). The v0 subxact model records all sub-XIDs as
+// children of the top-level XID, so TopLevelXid resolves in one hop.
+func isCurrentTxXID(xid, currentXID storage.TransactionID, r SubxactResolver) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	if xid == currentXID {
+		return true
+	}
+	if r == nil || !r.IsSubxact(currentXID) {
+		return false
+	}
+	return xid == r.TopLevelXid(currentXID)
 }
 
 // SubxactMapForManager attaches a SubxactMap to the Manager's subxact
