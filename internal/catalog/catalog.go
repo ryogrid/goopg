@@ -68,6 +68,13 @@ type Table struct {
 	// rules-only join order. Mirrors upstream's pg_class
 	// reltuples / relpages plus per-column pg_statistic data.
 	Stats *TableStats
+
+	// RelFrozenXID is the minimum XID still present in the heap as an
+	// unfrozen xmin. VACUUM FREEZE advances this toward the current XID.
+	// When currentXID − RelFrozenXID exceeds autovacuum_freeze_max_age,
+	// autovacuum triggers an anti-wraparound vacuum. Zero means no freeze
+	// pass has run yet on this table. Mirrors pg_class.relfrozenxid.
+	RelFrozenXID storage.TransactionID
 }
 
 // TableStats captures the pg_class-shaped table-level stats

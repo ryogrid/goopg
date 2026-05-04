@@ -133,6 +133,11 @@ type Context struct {
 	// check it to skip heap fetches for ALL_VISIBLE pages; VACUUM sets bits
 	// after verifying all tuples are universally visible.
 	VM *storage.VisibilityMap
+
+	// FreezeMinAge is the vacuum_freeze_min_age GUC value (M0046-0005).
+	// VACUUM rewrites xmin → FrozenTransactionID for tuples older than
+	// currentXID − FreezeMinAge. Zero disables freezing.
+	FreezeMinAge int64
 }
 
 // acquireRelLock funnels every operator's relation-level lock

@@ -31,6 +31,15 @@ type TransactionID uint32
 const (
 	// InvalidTransactionID is xid 0.
 	InvalidTransactionID TransactionID = 0
+
+	// FrozenTransactionID is the permanent-visibility XID (= 2). Any tuple
+	// whose xmin is rewritten to FrozenTransactionID by VACUUM FREEZE is
+	// visible to all past, present, and future snapshots — it is exempt from
+	// normal MVCC visibility rules. Mirrors PostgreSQL's FrozenTransactionId.
+	// Because FrozenTransactionID(2) < FirstNormalTransactionID(3) ≤ every
+	// snapshot's Xmin, the existing SeesCommittedXID check already returns
+	// true for frozen tuples without any code change to TupleVisible.
+	FrozenTransactionID TransactionID = 2
 )
 
 // HeapTupleHeader infomask flag bits. Values mirror upstream's

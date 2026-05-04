@@ -1459,13 +1459,19 @@ sub-tasks decompose around independent design docs.
       `planContainsIndexScan` updated to accept IndexOnlyScan.
       10 tests: 6 storage unit + 4 executor integration.
       All go test ./... pass.)
-- [ ] M0046-0005: Tuple freezing & anti-wraparound. Design doc
-      `docs/design/0046-0005-tuple-freezing-and-wraparound.md`.
-      VACUUM rewrites old `xmin` to `FrozenTransactionId`;
-      `pg_class.relfrozenxid` advances; M0019 autovacuum triggers
-      anti-wraparound vacuum at `autovacuum_freeze_max_age`;
-      xidWarn/xidStop guards. DoD: stress test with 1B simulated XIDs
-      keeps the cluster running and tuples visible.
+- [x] M0046-0005: Tuple freezing & anti-wraparound. Design doc
+      `docs/design/0046-0005-tuple-freezing-and-wraparound.md`. (landed 2026-05-05:
+      `storage.FrozenTransactionID=2`. `PageFreezeOldTuples(page, freezeBelow)` rewrites
+      live tuples with xmin < freezeBelow to FrozenTransactionID; skips deleted tuples.
+      `VacuumOptions{FreezeBelow}` triggers freeze pass in vacuumCore; Stats gains Frozen
+      + NewFrozenXID. `Table.RelFrozenXID` tracks min unfrozen xmin; updated by vacuumOp
+      after each freeze-vacuum. GUCs: `vacuum_freeze_min_age` (50M) +
+      `autovacuum_freeze_max_age` (200M). `FreezeMinAge` in executor.Context, wired from
+      dispatch. Autovacuum anti-wraparound trigger: `needsVacuum` returns true when
+      currentXID − RelFrozenXID > 200M. `Manager.Begin` refuses txns when nextXID >
+      xidMaxSafe (= uint32_max − 3M). No TupleVisible change needed: FrozenTransactionID=2
+      is always < any snapshot Xmin (≥3). 10 tests: 4 storage + 6 executor.
+      DoD confirmed: `TestTupleFreezeDoD` — 1B simulated XIDs + VACUUM → 5 rows visible.)
 - [ ] M0046-0006: TOAST out-of-line storage. Design doc
       `docs/design/0046-0006-toast.md`. Per-table TOAST relation,
       varlena 1/4-byte length headers, slice-and-store at

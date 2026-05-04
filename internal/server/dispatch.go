@@ -92,6 +92,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	ctx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
 	ctx.FSM = s.cfg.FSM
 	ctx.VM = s.cfg.VM
+	ctx.FreezeMinAge = sessionFreezeMinAge(sess)
 	ctx.PubSub = s.cfg.PubSub
 	ctx.LockMgr = s.cfg.LockMgr
 	ctx.BackendID = backendID
@@ -158,6 +159,23 @@ func sessionStatsTarget(sess *config.SessionRegistry) int {
 // sessionOpportunisticPrune reads the enable_opportunistic_prune GUC
 // (M0046-0002). Returns true (enabled) when sess is nil or the GUC value
 // can't be parsed, matching the BootVal "on" default.
+// sessionFreezeMinAge reads vacuum_freeze_min_age (M0046-0005).
+// Returns 50_000_000 (50M XIDs) when sess is nil or the GUC is missing.
+func sessionFreezeMinAge(sess *config.SessionRegistry) int64 {
+	if sess == nil {
+		return 50_000_000
+	}
+	_, eff, ok := sess.Get("vacuum_freeze_min_age")
+	if !ok {
+		return 50_000_000
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || v < 0 {
+		return 50_000_000
+	}
+	return v
+}
+
 func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
 	if sess == nil {
 		return true // default on

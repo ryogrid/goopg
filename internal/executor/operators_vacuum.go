@@ -9,8 +9,9 @@ import (
 )
 
 // vacuumOp executes a VACUUM statement, running heap page-prune on the
-// target relations and updating the FSM with the resulting free space
-// (M0046-0003). VACUUM without a target list vacuums all user tables.
+// target relations and updating the FSM, VM, and relfrozenxid with the
+// resulting state (M0046-0003/0004/0005). VACUUM without a target list
+// vacuums all user tables.
 type vacuumOp struct {
 	plan *planner.Utility
 	ctx  *Context
@@ -40,36 +41,70 @@ func (o *vacuumOp) Next() (Row, error) {
 	}
 
 	vs := o.plan.Stmt.(*parser.VacuumStmt)
-	rels := o.vacuumTargets(vs)
-	for _, rel := range rels {
-		_, _ = vacuum.VacuumWithFSMAndVM(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.FSM, o.ctx.VM)
+
+	// Compute freeze horizon (M0046-0005): tuples with xmin < freezeBelow
+	// will have their xmin rewritten to FrozenTransactionID.
+	var freezeBelow storage.TransactionID
+	if o.ctx.FreezeMinAge > 0 {
+		currentXID := o.ctx.TxnMgr.NextXID()
+		if int64(currentXID) > o.ctx.FreezeMinAge {
+			freezeBelow = currentXID - storage.TransactionID(o.ctx.FreezeMinAge)
+		}
+	}
+
+	opts := vacuum.VacuumOptions{
+		FSM:         o.ctx.FSM,
+		VM:          o.ctx.VM,
+		FreezeBelow: freezeBelow,
+	}
+
+	for _, tbl := range o.vacuumTableTargets(vs) {
+		rel := o.ctx.Catalog.RelFileNode(tbl)
+		stats, err := vacuum.VacuumWithOptions(o.ctx.Pool, o.ctx.TxnMgr, rel, opts)
+		if err == nil && freezeBelow > 0 && stats.NewFrozenXID != 0 {
+			// Advance relfrozenxid to the lowest unfrozen xmin found.
+			tbl.RelFrozenXID = stats.NewFrozenXID
+		} else if err == nil && freezeBelow > 0 && stats.NewFrozenXID == 0 && stats.Frozen > 0 {
+			// All tuples frozen — relfrozenxid advances to freezeBelow.
+			tbl.RelFrozenXID = freezeBelow
+		}
 	}
 	return nil, EOF
 }
 
-// vacuumTargets resolves the list of heap RelFileNodes to vacuum.
-func (o *vacuumOp) vacuumTargets(vs *parser.VacuumStmt) []storage.RelFileNode {
+// vacuumTableTargets resolves the *catalog.Table list to vacuum (so we can
+// update RelFrozenXID after each pass).
+func (o *vacuumOp) vacuumTableTargets(vs *parser.VacuumStmt) []*catalog.Table {
 	cat := o.ctx.Catalog
 	if len(vs.Targets) > 0 {
-		var out []storage.RelFileNode
+		var out []*catalog.Table
 		for _, name := range vs.Targets {
 			tbl, ok := cat.LookupTable(name)
 			if !ok || tbl.Virtual {
 				continue
 			}
-			out = append(out, cat.RelFileNode(tbl))
+			out = append(out, tbl)
 		}
 		return out
 	}
-	// No explicit targets: vacuum every non-virtual user table.
 	if im, ok := cat.(*catalog.InMemory); ok {
-		var out []storage.RelFileNode
+		var out []*catalog.Table
 		for _, tbl := range im.AllTables() {
 			if !tbl.Virtual {
-				out = append(out, cat.RelFileNode(tbl))
+				out = append(out, tbl)
 			}
 		}
 		return out
 	}
 	return nil
+}
+
+// vacuumTargets keeps backward compatibility (used by FSM tests).
+func (o *vacuumOp) vacuumTargets(vs *parser.VacuumStmt) []storage.RelFileNode {
+	tbls := o.vacuumTableTargets(vs)
+	out := make([]storage.RelFileNode, 0, len(tbls))
+	for _, t := range tbls {
+		out = append(out, o.ctx.Catalog.RelFileNode(t))
+	}
+	return out
 }

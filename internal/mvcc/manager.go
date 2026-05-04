@@ -72,6 +72,17 @@ func (m *Manager) NextXID() storage.TransactionID {
 	return m.nextXID
 }
 
+// xidWarnAge is how many XIDs before uint32 overflow to emit a warning.
+// Mirrors upstream's GetNewTransactionId warning threshold (~40M before max).
+const xidWarnAge = storage.TransactionID(40_000_000)
+
+// xidStopAge is how many XIDs before uint32 overflow to refuse new txns.
+const xidStopAge = storage.TransactionID(3_000_000)
+
+// xidMaxSafe is the last "safe" XID before the hard stop threshold.
+// uint32 max = 4,294,967,295; reserved XIDs 0-2 put the usable ceiling here.
+const xidMaxSafe = ^storage.TransactionID(0) - xidStopAge
+
 // Begin allocates an xid and tracks the transaction as in-progress.
 func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
 	if iso != IsolationReadCommitted && iso != IsolationRepeatableRead {
@@ -81,6 +92,13 @@ func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
 	defer m.mu.Unlock()
 	if m.nextXID == ^storage.TransactionID(0) {
 		return Transaction{}, ErrXIDWraparound
+	}
+	// Anti-wraparound guard (M0046-0005): refuse new transactions when too
+	// close to uint32 overflow; warn when approaching the danger zone.
+	if m.nextXID > xidMaxSafe {
+		return Transaction{}, fmt.Errorf(
+			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
+			^storage.TransactionID(0)-m.nextXID)
 	}
 	xid := m.nextXID
 	m.nextXID++

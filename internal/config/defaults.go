@@ -351,6 +351,23 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 
+	// Tuple-freeze age thresholds (M0046-0005). vacuum_freeze_min_age is
+	// the minimum XID age before VACUUM rewrites xmin → FrozenTransactionId.
+	// autovacuum_freeze_max_age is the maximum XID age before autovacuum
+	// is forced for anti-wraparound protection.
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_freeze_min_age", Type: TypeInt, BootVal: "50000000",
+		MinVal: 0, MaxVal: 1000000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_freeze_max_age", Type: TypeInt, BootVal: "200000000",
+		MinVal: 100000, MaxVal: 2000000000,
+		Context: ContextPostmaster,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
 	// Planner toggle GUCs. Upstream uses them for testing (`SET
 	// enable_seqscan = off` to force an index plan). v0's planner
 	// ignores them — the rule-based decisions still apply — but
