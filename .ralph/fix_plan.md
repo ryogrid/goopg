@@ -1219,21 +1219,21 @@ restart bug *without* requiring pg_control by:
 (b) discovering the latest checkpoint LSN by scanning the
 retained WAL backwards.
 
-- [ ] M0045-0001: `detectWritePos` from a non-zero starting
+- [x] M0045-0001: `detectWritePos` from a non-zero starting
       segment. Design doc
       `docs/design/0045-0001-detect-write-pos-from-non-zero-segment.md`.
-  - [ ] Replace `expected := uint64(i)` with
-        `expected := firstSegNo + uint64(i)` in the segment-loop
-        of `internal/wal/writer.go::detectWritePos`. Drop the
-        unconditional `if segNos[0] != 0 { return error }`.
-  - [ ] Compute `writePos = firstSegNo*segSize +
-        bytesUsedInLastSeg` so the LSN convention (segment K at
-        byte offset K·segSize) is preserved.
-  - [ ] Gap-detection still flags real corruption
-        (e.g., segments 575 and 577 with 576 missing).
-  - [ ] Unit test
-        `internal/wal/writer_test.go::TestDetectWritePos_NonZeroFirstSeg`
-        covers the run-007 reproducer (firstSegNo = 0x23F).
+      (landed 2026-05-04: removed `if segNos[0] != 0` rejection;
+      writePos now starts at `firstSegNo*segSize`; gap detection
+      uses `firstSegNo+i`. 4 unit tests in `writer_detect_test.go`.
+      Full `go test ./internal/wal/` green.)
+  - [x] Drop `if segNos[0] != 0 { return error }` rejection
+  - [x] Initialize `writePos = int64(firstSegNo) * segSize`
+  - [x] Change gap detection: `expected = firstSegNo + uint64(i)`
+  - [x] Gap detection still flags genuine corruption
+  - [x] Unit tests: `TestDetectWritePos_NonZeroFirstSeg` (0x23F),
+        `TestDetectWritePos_ZeroFirstSegStillWorks`,
+        `TestDetectWritePos_GapDetectionAfterNonZeroStart`,
+        `TestDetectWritePos_SingleNonZeroSegment`
 
 - [ ] M0045-0002: Restart replay of post-checkpoint WAL records.
       Design doc

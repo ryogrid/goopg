@@ -870,14 +870,24 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 	}
 	sort.Slice(segNos, func(i, j int) bool { return segNos[i] < segNos[j] })
 
-	if segNos[0] != 0 {
-		return 0, 0, fmt.Errorf("wal: first segment is %s, expected %s", formatSegmentName(segNos[0]), formatSegmentName(0))
-	}
+	// M0045-0001: Accept a non-zero first segment. Normal WAL
+	// retention deletes pre-checkpoint segments, so after one full
+	// retention cycle segment 0 is gone. Rejecting any first segment
+	// other than 0 contradicts the retention contract.
+	//
+	// The old check `if segNos[0] != 0 { return error }` is dropped.
+	// Gap detection (missing segment in the retained range) is still
+	// done correctly by comparing consecutive entries.
+	firstSegNo := segNos[0]
 
-	var writePos int64
+	// Start writePos at the absolute LSN of the first retained segment
+	// so the result is an absolute byte offset, not one relative to
+	// segment 0. Without this, the caller would treat the returned
+	// position as if it started at byte 0 instead of firstSegNo*segSize.
+	var writePos int64 = int64(firstSegNo) * segSize
 	var prevRecPtr uint64
 	for i := 0; i < len(segNos); i++ {
-		expected := uint64(i)
+		expected := firstSegNo + uint64(i)
 		if segNos[i] != expected {
 			return 0, 0, fmt.Errorf("wal: gap at segment %s", formatSegmentName(expected))
 		}

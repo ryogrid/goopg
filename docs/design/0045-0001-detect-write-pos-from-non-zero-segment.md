@@ -1,6 +1,6 @@
 # 0045-0001 — `detectWritePos` from a Non-Zero Starting Segment
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0045
 **Date:** 2026-05-04
 
