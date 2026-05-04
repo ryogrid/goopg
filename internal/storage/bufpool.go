@@ -141,20 +141,35 @@ type Pool struct {
 	asyncFlushBatchSize atomic.Int32
 
 	// poolMu guards byTag, slots[*].tag/valid/dirty, slots[*].pinCount,
-	// slots[*].usageCount, slots[*].fpiSinceCheckpoint, and clockHand.
+	// slots[*].usageCount, slots[*].fpiSinceCheckpoint, clockHand,
+	// and ioByTag.
 	// It does NOT guard the page bytes — those are guarded by
 	// Slot.contentMu.
 	poolMu    sync.Mutex
 	byTag     map[BufferTag]int
 	clockHand int
 
-	// OnPinWait is an optional hook called when Pool.Pin cannot find
-	// the buffer in the pool and must wait for a disk read.  The hook
-	// fires before the I/O; the ReadBlock/WriteBlock hooks on Manager
-	// cover the actual I/O wait.  initdb.Open sets this via
-	// activity.LookupGoroutine so pg_stat_activity can report
-	// BufferPin wait events.
+	// ioByTag tracks BufferTags currently being read from disk
+	// (BM_IO_IN_PROGRESS, M0048-0001). A goroutine requesting a tag
+	// that is already in ioByTag waits on ioCond instead of starting
+	// a second concurrent disk read. This ensures smgr.ReadBlock is
+	// called exactly once per page miss regardless of concurrency.
+	// Both fields are guarded by poolMu.
+	ioByTag map[BufferTag]struct{}
+	ioCond  *sync.Cond
+
+	// OnPinWait is an optional hook called when Pool.Pin performs an
+	// actual disk read (the one goroutine that wins the I/O race).
+	// initdb.Open sets this via activity.LookupGoroutine to record
+	// BufferPin wait events in pg_stat_activity.
 	OnPinWait func()
+
+	// OnBufferIOWait is an optional hook called when a goroutine must
+	// wait for an in-flight read issued by another goroutine to complete
+	// (BM_IO_IN_PROGRESS, M0048-0001). Fires once per waiting goroutine
+	// before it blocks on ioCond. initdb.Open can set this to record
+	// BufferIO wait events in pg_stat_activity.
+	OnBufferIOWait func()
 
 	// OnFlushAll is an optional hook called at the start of FlushAll
 	// and FlushAllPaced before any I/O.  initdb.Open wires an
@@ -327,6 +342,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		arena:          a,
 		slots:          make([]*Slot, cfg.Slots),
 		byTag:          make(map[BufferTag]int, cfg.Slots),
+		ioByTag:        make(map[BufferTag]struct{}),
 		wal:            cfg.WAL,
 		logFPI:         cfg.LogPageImage,
 		logBtreeSplit:  cfg.LogBtreeSplit,
@@ -341,6 +357,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
+	p.ioCond = sync.NewCond(&p.poolMu)
 	for i := range p.slots {
 		p.slots[i] = &Slot{page: a.slot(i)}
 	}
@@ -613,19 +630,52 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 
 // Pin returns the slot holding tag, reading from disk if necessary.
 // The slot's pinCount is incremented; the caller MUST call Unpin.
+//
+// BM_IO_IN_PROGRESS (M0048-0001): when two goroutines miss the cache for
+// the same tag simultaneously, only the first one issues a disk read.
+// The others wait on p.ioCond until the read completes, then pick up the
+// cached result. This guarantees smgr.ReadBlock is called exactly once
+// per cache miss regardless of concurrency.
 func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	p.poolMu.Lock()
-	if idx, ok := p.byTag[tag]; ok {
-		s := p.slots[idx]
-		s.pinCount++
-		if s.usageCount < maxUsageCount {
-			s.usageCount++
+
+	// Outer loop: a goroutine may need to wait multiple times if spurious
+	// wakeups occur or if ioCond is signalled before the tag is published.
+	for {
+		// Fast path: tag is already cached.
+		if idx, ok := p.byTag[tag]; ok {
+			s := p.slots[idx]
+			s.pinCount++
+			if s.usageCount < maxUsageCount {
+				s.usageCount++
+			}
+			p.poolMu.Unlock()
+			return s, nil
 		}
-		p.poolMu.Unlock()
-		return s, nil
+
+		// If another goroutine is already reading this exact tag from disk,
+		// wait for it to finish rather than issuing a duplicate read.
+		if _, inFlight := p.ioByTag[tag]; inFlight {
+			if p.OnBufferIOWait != nil {
+				p.OnBufferIOWait()
+			}
+			p.ioCond.Wait() // atomically releases poolMu and sleeps
+			continue        // re-check cache hit and in-flight status
+		}
+
+		// No in-flight read for this tag — we win the I/O race.
+		break
 	}
+
+	// Mark this tag as in-flight BEFORE evicting a victim slot or
+	// releasing poolMu. Subsequent goroutines requesting the same tag
+	// will see ioByTag[tag] and wait instead of starting a duplicate read.
+	p.ioByTag[tag] = struct{}{}
+
 	slotIdx, err := p.evictLocked()
 	if err != nil {
+		delete(p.ioByTag, tag)
+		p.ioCond.Broadcast()
 		p.poolMu.Unlock()
 		return nil, err
 	}
@@ -637,6 +687,10 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		err := p.flushSlot(oldTag, s.page)
 		s.contentMu.Unlock()
 		if err != nil {
+			p.poolMu.Lock()
+			delete(p.ioByTag, tag)
+			p.ioCond.Broadcast()
+			p.poolMu.Unlock()
 			return nil, fmt.Errorf("flush victim: %w", err)
 		}
 		p.poolMu.Lock()
@@ -656,8 +710,14 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	}
 	err = p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
 	s.contentMu.Unlock()
+
+	// Remove from ioByTag and wake waiters regardless of success or
+	// failure so they can either pick up the cached page or retry.
+	p.poolMu.Lock()
+	delete(p.ioByTag, tag)
+	p.ioCond.Broadcast()
+
 	if err != nil {
-		p.poolMu.Lock()
 		s.tag = BufferTag{}
 		s.pinCount = 0
 		s.usageCount = 0
@@ -666,10 +726,9 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		p.poolMu.Unlock()
 		return nil, err
 	}
-	p.poolMu.Lock()
 	if idx, ok := p.byTag[tag]; ok {
-		// Another goroutine published this tag while we were doing I/O.
-		// Use that slot and release ours.
+		// Another goroutine published this tag while we were reading
+		// (e.g. via PinNew). Use that slot and release ours.
 		existing := p.slots[idx]
 		existing.pinCount++
 		if existing.usageCount < maxUsageCount {

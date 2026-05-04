@@ -1533,11 +1533,16 @@ See `docs/milestones/0048-buffer-pool-concurrency.md`. Closes the
 buffer-pool gaps in `docs/reference/ref-003-buffer-pool.md` and the
 checkpoint-pacing gap in `ref-004-checkpointer.md`.
 
-- [ ] M0048-0001: `BM_IO_IN_PROGRESS` atomic flag. Design doc
-      `docs/design/0048-0001-io-in-progress-flag.md`. Atomic flag bit
-      on `BufferDesc`; concurrent miss waiters block on a CV; new
-      `BufferIO` wait-event class. DoD: 64-goroutine same-page-pin
-      stress shows `smgr.Read` invocation count = 1.
+- [x] M0048-0001: `BM_IO_IN_PROGRESS` atomic flag. Design doc
+      `docs/design/0048-0001-io-in-progress-flag.md`. (landed 2026-05-05:
+      `Pool.ioByTag map[BufferTag]struct{}` + `ioCond *sync.Cond` (backed by
+      poolMu). `Pin` loop: first goroutine marks ioByTag[tag] before eviction,
+      reads page, then `delete(ioByTag[tag]) + ioCond.Broadcast()`; subsequent
+      goroutines calling Pin on same tag see ioByTag and `ioCond.Wait()` then
+      pick up the cached slot. `OnBufferIOWait` hook for BufferIO activity
+      events. 3 tests: DoD (64 goroutines → smgr.Read=1), distinct blocks (8
+      reads), race-detector stress (16 goroutines, 4-slot pool). All pass with
+      -race.)
 - [ ] M0048-0002: SeqScan strategy ring. Design doc
       `docs/design/0048-0002-strategy-ring-seqscan.md`. New
       `BufferAccessStrategy` interface (32-slot `bulkReadStrategy`);
