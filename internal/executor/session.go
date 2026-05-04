@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // Session stores per-connection state the Transaction operator needs
@@ -16,13 +17,23 @@ type Session interface {
 	EndExplicitTransaction()
 }
 
+// DDLUndoEntry records one CREATE TABLE or CREATE INDEX performed inside
+// an explicit transaction so that ROLLBACK can reverse the catalog mutation
+// and remove the physical relfile (M0030-0006).
+type DDLUndoEntry struct {
+	Name    parser.ObjectName
+	RelOID  uint32 // physical relfile OID (= table.OID or index.OID)
+	IsIndex bool
+}
+
 // BasicSession is a minimal Session implementation for the v0
 // executor path.
 type BasicSession struct {
-	isolation mvcc.IsolationLevel
-	inTx      bool
-	tx        mvcc.Transaction
-	snap      mvcc.Snapshot
+	isolation  mvcc.IsolationLevel
+	inTx       bool
+	tx         mvcc.Transaction
+	snap       mvcc.Snapshot
+	pendingDDL []DDLUndoEntry // DDL creates pending rollback
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -61,4 +72,19 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.tx = mvcc.Transaction{}
 	s.snap = mvcc.Snapshot{}
 	s.inTx = false
+	s.pendingDDL = nil // cleared on both commit (no undo needed) and rollback
+}
+
+// RecordDDLCreate records a CREATE TABLE or CREATE INDEX for potential rollback.
+// Called by DDL operators after catalog.CreateTable / catalog.CreateIndex succeed.
+func (s *BasicSession) RecordDDLCreate(e DDLUndoEntry) {
+	s.pendingDDL = append(s.pendingDDL, e)
+}
+
+// TakePendingDDLCreates drains and returns the pending DDL undo list.
+// Called by execRollback to obtain the list of creates that need undoing.
+func (s *BasicSession) TakePendingDDLCreates() []DDLUndoEntry {
+	p := append([]DDLUndoEntry(nil), s.pendingDDL...)
+	s.pendingDDL = nil
+	return p
 }

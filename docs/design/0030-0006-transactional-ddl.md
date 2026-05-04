@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | draft                          |
+| Status      | accepted (Phase 1 landed 2026-05-04) |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -53,3 +53,52 @@ One challenge with transactional DDL is maintaining the consistency of the in-me
 ### Manual Verification
 - Use `psql` to perform complex DDL operations inside transactions and verify the results after `COMMIT` and `ROLLBACK`.
 - Verify that multiple sessions stay in sync with catalog changes.
+
+## What Landed (Phase 1 — 2026-05-04)
+
+**Scope**: In-session ROLLBACK undoes CREATE TABLE and CREATE INDEX catalog mutations.
+Concurrent DDL visibility and pg_xact-based crash recovery deferred.
+
+### `internal/executor/session.go`
+
+- `DDLUndoEntry` struct: `{Name parser.ObjectName, RelOID uint32, IsIndex bool}`
+- `pendingDDL []DDLUndoEntry` field added to `BasicSession`
+- `RecordDDLCreate(e DDLUndoEntry)` — appends to the undo list
+- `TakePendingDDLCreates() []DDLUndoEntry` — drains and returns the list
+- `EndExplicitTransaction()` now clears `pendingDDL` (commit = discard undo list)
+
+### `internal/executor/operators_tx.go`
+
+- `execRollback`: before `TxnMgr.Rollback`, calls `sess.TakePendingDDLCreates()` and
+  runs `rollbackDDLCreate` for each entry.
+- `rollbackDDLCreate(ctx, entry)`: calls `Catalog.DropTable` or `Catalog.DropIndex`,
+  then `Pool.InvalidateRel` + `Pool.Manager().DropRelation` to remove the physical
+  relfile. The pg_class/pg_attribute rows written by DDL-sync have the aborted xmin
+  and are invisible via MVCC in subsequent sessions.
+
+### `internal/executor/operators_ddl.go`
+
+- `execCreateTable`: after `catalog.CreateTable` succeeds, calls
+  `sess.RecordDDLCreate(DDLUndoEntry{...IsIndex: false})`.
+- `createBTreeIndex`: after full build succeeds, calls
+  `sess.RecordDDLCreate(DDLUndoEntry{...IsIndex: true})`.
+
+### Tests (5 new in `transactional_ddl_test.go`)
+
+- `TestTransactionalCreateTableRollback` — BEGIN; CREATE TABLE; ROLLBACK → absent
+- `TestTransactionalCreateTableCommit` — BEGIN; CREATE TABLE; COMMIT → present
+- `TestTransactionalCreateIndexRollback` — BEGIN; CREATE INDEX; ROLLBACK → absent
+- `TestTransactionalDDLMultipleCreatesRollback` — 3 tables all rolled back
+- `TestAutoCommitDDLSurvivesImplicitTransaction` — DDL without BEGIN auto-commits
+
+### Known Limitations (Phase 2)
+
+- Rolled-back tables may re-appear after a crash+restart: the pg_class rows have
+  aborted xmin but `loadUserTablesFromHeap` uses `xmax == 0` as its visibility
+  check. Without a pg_xact commit-status log, startup cannot distinguish committed
+  from aborted rows. Fix: stamp xmax on the pg_class row during rollback (or
+  implement pg_xact).
+- DROP TABLE inside a ROLLBACK is not yet supported — the physical file is already
+  deleted before ROLLBACK can restore it (pre-existing limitation).
+- Concurrent DDL visibility (`ISOLATION LEVEL SERIALIZABLE` catalog invalidation)
+  deferred.

@@ -353,8 +353,15 @@ loading switch.**
       OIDDate(1082), OIDTime(1083), OIDTimestampTZ(1184). TypeNameToOID +
       OIDToTypeName expanded. pg_attribute SQL surface verified by
       TestPGAttributeSQLSurfaceForUserTable. pg_index deferred.
-- [ ] Transactional DDL foundation (M0030-0006).
+- [x] Transactional DDL foundation (M0030-0006).
       Design doc `docs/design/0030-0006-transactional-ddl.md`.
+      **Phase 1 landed 2026-05-04**: DDLUndoEntry + pendingDDL in BasicSession.
+      execRollback takes pending DDL undo list and calls rollbackDDLCreate for each:
+      Catalog.DropTable/DropIndex + Pool.InvalidateRel + Manager.DropRelation.
+      execCreateTable and createBTreeIndex record entries via RecordDDLCreate.
+      5 tests: BEGIN+ROLLBACK removes table, BEGIN+COMMIT keeps it, index rollback,
+      multiple creates rollback, auto-commit. Known limitation: crash+restart may
+      show rolled-back tables (no pg_xact commit log — Phase 2).
 
 ## Milestone 0031 — TPC-H Q2 Memory Estimation & GC Leak Code Review
 

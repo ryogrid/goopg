@@ -232,6 +232,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Record for rollback before heap sync — if heap sync fails the catalog
+	// entry is already live and must be cleaned up on ROLLBACK.
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -507,6 +512,10 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
 		return err
+	}
+	// Record for rollback before heap sync (index is live in catalog now).
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
 	}
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {

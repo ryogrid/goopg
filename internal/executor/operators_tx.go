@@ -3,8 +3,10 @@ package executor
 import (
 	"fmt"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // transactionOp is a one-shot operator that mutates explicit
@@ -92,12 +94,45 @@ func (o *transactionOp) execRollback() error {
 		// PostgreSQL returns a warning for ROLLBACK outside tx block.
 		return nil
 	}
+	// Undo any DDL creates that happened in this transaction before
+	// marking the transaction as aborted.  Must happen BEFORE
+	// TxnMgr.Rollback so the catalog DropTable/DropIndex can still
+	// find the entries (they're still in the in-memory map).
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
+		for _, entry := range sess.TakePendingDDLCreates() {
+			rollbackDDLCreate(o.ctx, entry)
+		}
+	}
 	if err := o.ctx.TxnMgr.Rollback(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	o.ctx.Session.EndExplicitTransaction()
 	o.clearCtxTransaction()
 	return nil
+}
+
+// rollbackDDLCreate undoes one CREATE TABLE or CREATE INDEX by removing the
+// catalog entry and physical relfile. The physical file removal mirrors what
+// execDropTable does — no WAL record is needed here since the XID stamped on
+// the pg_class/pg_attribute rows is now aborted, making those rows invisible
+// via MVCC in subsequent sessions. The startup scan's `xmax == 0` filter
+// will still see the aborted row until VACUUM removes it; this is a known
+// limitation pending pg_xact persistence (M0030-0006 Phase 2).
+func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
+	rel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: entry.RelOID,
+		Fork:   storage.MainFork,
+	}
+	if entry.IsIndex {
+		_ = ctx.Catalog.DropIndex(entry.Name)
+	} else {
+		_ = ctx.Catalog.DropTable(entry.Name)
+	}
+	if ctx.Pool != nil {
+		ctx.Pool.InvalidateRel(rel)
+		_ = ctx.Pool.Manager().DropRelation(rel)
+	}
 }
 
 func (o *transactionOp) clearCtxTransaction() {
