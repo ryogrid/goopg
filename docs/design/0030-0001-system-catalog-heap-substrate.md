@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | accepted (Phase 1 landed 2026-05-04) |
+| Status      | accepted (Phase 1+2 landed 2026-05-04) |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -102,10 +102,75 @@ Catalog row codec, startup-load switch, and DDL-sync wiring are deferred to Phas
 - `initdb_test.go`: `TestInitCreatesSystemCatalogRelfiles` (file existence + size),
   `TestSystemCatalogRelfilesAreValidHeapPages` (non-zero + `!IsNew`) — all pass.
 
-### Deferred
+### Deferred (from Phase 1)
 
 - Catalog row codec (encode/decode `pg_class`/`pg_attribute`/`pg_type` tuples as heap rows).
+  → **Landed in Phase 2** — see below.
 - Row seeding (initial `pg_class` entry for itself, `pg_attribute` column definitions, etc.).
+  → **Landed in Phase 2** — see below.
 - Startup-load switch: populate `catalog.InMemory` from heap tables instead of JSON snapshot.
 - DDL-sync wiring: `CREATE TABLE`/`CREATE INDEX` writes rows into the system catalog heap tables.
+- Virtual-view integration: source `pg_tables`, `pg_indexes` from heap-backed tables.
+
+## What Landed (Phase 2 — 2026-05-04)
+
+**Scope**: Catalog row codec + initial seeding at `initdb` time.
+Startup-load switch and DDL-sync wiring are deferred to Phase 3+.
+
+### `internal/catalog/codec.go` (new file)
+
+Three row types and their binary encoder/decoder, compatible with
+`executor.EncodeRow`/`DecodeRowInto` so a SeqScan on the system catalog
+files produces correct values without special-casing:
+
+- `PGClassRow` + `EncodePGClassRow` / `DecodePGClassRow`  
+- `PGAttributeRow` + `EncodePGAttributeRow` / `DecodePGAttributeRow`  
+- `PGTypeRow` + `EncodePGTypeRow` / `DecodePGTypeRow`
+
+Column-schema functions: `PGClassColumns()` (8 cols), `PGAttributeColumns()` (6),
+`PGTypeColumns()` (7).
+
+Namespace OID constants: `PGCatalogNamespaceOID = 11`, `PublicNamespaceOID = 2200`.
+
+Built-in type OID constants: `OIDBool=16`, `OIDInt8=20`, `OIDInt2=21`, `OIDInt4=23`,
+`OIDText=25`, `OIDOID=26`, `OIDBpChar=1042`, `OIDVarChar=1043`,
+`OIDTimestamp=1114`, `OIDNumeric=1700`.
+
+Encoding format (per column): `null_byte(0x00) || value_bytes` where
+int4=4-byte BE, bool=1-byte, text=4-byte-BE-len+UTF-8.
+
+### `internal/initdb/catalog_seed.go` (new file)
+
+Bootstrap row definitions for the three system catalogs:
+- `pgTypeBootstrapRows()` — 10 built-in type entries
+- `pgClassBootstrapRows()` — 3 self-referential catalog entries
+- `pgAttributeBootstrapRows()` — 21 column definitions (8+6+7)
+- `typeOIDForCatalogColumn()` — maps v0 type-name strings to OIDs
+
+### `internal/initdb/initdb.go` changes
+
+`bootstrapSystemCatalogs` rewritten to seed rows:
+- Calls `extendWithRows(mgr, relOID, rows)` per catalog
+- `extendWithRows`: inits page, appends `NewHeapTuple(bootstrapXID=1, ...)` per row,
+  calls `Manager.Extend` with the seeded page
+- Bootstrap tuples use `xmin=1` (BootstrapTransactionID) so they are
+  always visible to all subsequent sessions
+
+### Tests (12 new)
+
+Codec round-trip tests in `codec_test.go`:
+`TestEncodePGClassRowRoundTrip`, `TestEncodePGClassRowRelIsSharedTrue`,
+`TestEncodePGAttributeRowRoundTrip`, `TestEncodePGAttributeRowDropped`,
+`TestEncodePGTypeRowRoundTrip` (4 type cases), column count tests (×3),
+`TestBuiltinTypeOIDs`.
+
+Seeding read-back tests in `initdb_test.go`:
+`TestBootstrappedPGTypeRowsReadable` (verifies 7 required types present),
+`TestBootstrappedPGClassRowsReadable` (pg_type/pg_attribute/pg_class entries),
+`TestBootstrappedPGAttributeRowsReadable` (8+6+7 column counts + spot-check).
+
+### Still Deferred
+
+- Startup-load switch: replace `loadCatalogSnapshot` with heap-table scan.
+- DDL-sync wiring: `CREATE TABLE`/`CREATE INDEX`/`DROP TABLE` write to pg_class/pg_attribute.
 - Virtual-view integration: source `pg_tables`, `pg_indexes` from heap-backed tables.

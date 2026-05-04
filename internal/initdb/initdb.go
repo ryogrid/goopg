@@ -118,39 +118,69 @@ func Init(opts Options) error {
 
 // bootstrapSystemCatalogs creates the three core system catalog heap
 // relfiles (pg_type, pg_attribute, pg_class) under
-// <dataDir>/base/<DefaultDBOid>/. Each file gets one initialised empty
-// page so subsequent Open finds non-zero-length files and the storage
-// manager can determine NBlocks without special-casing.
+// <dataDir>/base/<DefaultDBOid>/ and seeds them with their initial rows.
 //
 // The storage manager is created and closed inline — no buffer pool is
-// needed for a one-shot Extend of a blank page.
+// needed for a one-shot Extend of a seeded page.
+//
+// Row encoding matches executor.EncodeRow so a SeqScan on the resulting
+// relfile produces the correct values without special-casing.  Transaction
+// IDs are set to bootstrapXID (1) so the rows are always visible.
 func bootstrapSystemCatalogs(dataDir string) error {
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
 	defer mgr.Close()
 
-	page := make([]byte, storage.BlockSize)
-	if err := storage.InitPage(storage.Page(page)); err != nil {
-		return err
+	// pg_type: built-in type entries.
+	var pgTypeData [][]byte
+	for _, tr := range pgTypeBootstrapRows() {
+		pgTypeData = append(pgTypeData, catalog.EncodePGTypeRow(tr))
+	}
+	if err := extendWithRows(mgr, catalog.TypeRelationId, pgTypeData); err != nil {
+		return fmt.Errorf("seed pg_type: %w", err)
 	}
 
-	// Create one relfile per system catalog in OID order so the file
-	// names under base/<DBOid>/ are stable across re-inits.
-	sysRelOIDs := []uint32{
-		catalog.TypeRelationId,      // 1247  base/1/1247
-		catalog.AttributeRelationId, // 1249  base/1/1249
-		catalog.RelationRelationId,  // 1259  base/1/1259
+	// pg_class: self-referential entries for the three system catalogs.
+	var pgClassData [][]byte
+	for _, cr := range pgClassBootstrapRows() {
+		pgClassData = append(pgClassData, catalog.EncodePGClassRow(cr))
 	}
-	for _, relOID := range sysRelOIDs {
-		rel := storage.RelFileNode{
-			DBOid:  catalog.DefaultDBOid,
-			RelOid: relOID,
-			Fork:   storage.MainFork,
-		}
-		if _, err := mgr.Extend(rel, page); err != nil {
-			return fmt.Errorf("extend system catalog OID %d: %w", relOID, err)
-		}
+	if err := extendWithRows(mgr, catalog.RelationRelationId, pgClassData); err != nil {
+		return fmt.Errorf("seed pg_class: %w", err)
 	}
+
+	// pg_attribute: column definitions for the three system catalogs.
+	var pgAttrData [][]byte
+	for _, ar := range pgAttributeBootstrapRows() {
+		pgAttrData = append(pgAttrData, catalog.EncodePGAttributeRow(ar))
+	}
+	if err := extendWithRows(mgr, catalog.AttributeRelationId, pgAttrData); err != nil {
+		return fmt.Errorf("seed pg_attribute: %w", err)
+	}
+
 	return nil
+}
+
+// extendWithRows initialises a fresh page, writes all rows as heap tuples
+// with bootstrapXID, and appends it as block 0 via Manager.Extend.
+func extendWithRows(mgr *storage.Manager, relOID uint32, rows [][]byte) error {
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	xid := storage.TransactionID(bootstrapXID)
+	for i, data := range rows {
+		t := storage.NewHeapTuple(xid, storage.InvalidTransactionID, data)
+		if _, err := storage.PageAddHeapTuple(page, t); err != nil {
+			return fmt.Errorf("row %d: %w", i, err)
+		}
+	}
+	rel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: relOID,
+		Fork:   storage.MainFork,
+	}
+	_, err := mgr.Extend(rel, page)
+	return err
 }
 
 // ensureEmptyDir is upstream's "directory must be empty" guard.

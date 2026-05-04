@@ -303,8 +303,14 @@ loading switch.**
       AttributeRelationId=1249, RelationRelationId=1259) + IsSystemRelation
       helper added to internal/catalog/catalog.go. bootstrapSystemCatalogs
       in initdb.Init() creates base/1/1247, base/1/1249, base/1/1259 as
-      one-page relfiles. 5 new tests pass. Remaining sub-phases deferred:
-      catalog row codec, seeding, startup-load switch, DDL-sync wiring.
+      one-page relfiles. 5 new tests pass.
+      **Phase 2 landed 2026-05-04**: Catalog row codec (codec.go with
+      PGClassRow/PGAttributeRow/PGTypeRow + encode/decode), seeding at
+      initdb time (10 pg_type rows, 3 pg_class rows, 21 pg_attribute rows),
+      and 12 new tests (round-trip + seeded content read-back). Format
+      compatible with executor.EncodeRow/DecodeRowInto.
+      Remaining sub-phases deferred: startup-load switch (Phase 3),
+      DDL-sync wiring (Phase 4).
 - [ ] DDL WAL record kinds: RecordKindCatalog* and RecordKindSmgr*
       plus redo handlers (M0030-0002). Design doc
       `docs/design/0030-0002-ddl-wal-records.md`.
