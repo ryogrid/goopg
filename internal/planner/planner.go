@@ -516,6 +516,8 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks}
 	}
+	// Collapse all-constant sub-expressions in the final plan tree.
+	foldPlanConstants(out)
 	return out, nil
 }
 

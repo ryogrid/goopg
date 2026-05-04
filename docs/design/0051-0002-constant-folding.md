@@ -1,7 +1,7 @@
 # 0051-0002 — Constant folding
 
-**Status:** draft
-**Date:** 2026-05-04
+**Status:** accepted
+**Date:** 2026-05-05
 **Milestone:** 0051 — Planner expression-level improvements
 **Supersedes:** —
 
@@ -18,7 +18,48 @@ The same pass also handles boolean simplification (`a AND TRUE → a`,
 `CAST(literal AS T)` to a literal of T. A natural extension is `IS NULL`
 on a literal NULL → TRUE etc.
 
-## Plan
+## Implementation (landed 2026-05-05)
+
+### New file: `internal/planner/foldconst.go`
+
+`FoldConstants(expr Expr) Expr` — bottom-up recursive pass. Per node type:
+- **Literals** (`IntegerConst`, `StringConst`, `NumericConst`, `BooleanConst`,
+  `NullConst`, `TypedStringLit`, `IntervalLit`, `ParamRef`) — returned unchanged.
+- **BinaryOp** — both children folded first, then:
+  - `AND`/`OR`: short-circuit regardless of the other child's type:
+    `FALSE AND x → FALSE`, `TRUE AND x → x`, `TRUE OR x → TRUE`, `FALSE OR x → x`.
+    Kleene rules for `NULL AND FALSE → FALSE` and `NULL OR TRUE → TRUE`.
+  - NULL propagation: if either non-AND/OR operand is `NullConst`, result is `NullConst`.
+  - Both children are literals: evaluate via `evalLiteralBinary` → return result literal.
+  - Non-literal child present: return `BinaryOp` with recursively-folded children.
+- **UnaryOp** — `-`/`+` on `IntegerConst`/`NumericConst`, `NOT` on `BooleanConst`.
+- **CaseExpr** — each WHEN condition folded; `WHEN FALSE` branches dropped; `WHEN TRUE`
+  branch terminates with that THEN, subsequent WHENs dropped.
+- **Other** (`ExtractExpr`, `InExpr`, `FuncCall`) — children recursively folded; node type
+  unchanged.
+
+`foldPlanConstants(node Node)` — in-place plan-tree walk that applies `FoldConstants`
+to every embedded expression (`Filter.Predicate`, `Project.Targets`, `Sort.Keys`,
+`Limit.Limit/Offset`, `Aggregate.GroupExprs/Aggs`, `Join.LeftKey/RightKey/Predicate`,
+`WindowAgg`).
+
+### Wiring: `internal/planner/planner.go`
+
+`foldPlanConstants(out)` called at the end of `planSelect()` just before the final
+`return out, nil`. This covers SELECT, INSERT (via subquery planner), and any
+UPDATE/DELETE that drives through `Plan()`.
+
+### Operators evaluated by `evalLiteralBinary`
+
+| Operands | Operations |
+|----------|------------|
+| int × int | `+`, `-`, `*`, `/` (integer division), `%` |
+| int/num × int/num | `+`, `-`, `*`, `/` (promotes to float64 for numeric mix) |
+| str × str | `\|\|` (concat), `=`, `<>`, `<`, `>`, `<=`, `>=` |
+| int/num × int/num | comparisons `=`, `<>`, `<`, `>`, `<=`, `>=` |
+| bool × bool | `AND`, `OR` (both literal — short-circuit path handles mixed) |
+
+### Original Plan
 
 1. New file `internal/planner/foldconst.go::FoldConstants(expr) Expr`.
 2. Recursive walk; bottom-up.
@@ -35,12 +76,8 @@ on a literal NULL → TRUE etc.
      `FALSE`; if a WHEN's condition is `TRUE`, drop subsequent WHENs.
    - `CastExpr` — evaluate against the type's input/output coercion when
      the inner is a Literal.
-4. Wire-in: analyzer's existing post-bind phase calls `FoldConstants`
-   on every expression in: target list, WHERE, ON, HAVING, GROUP BY,
-   ORDER BY, JOIN-ON predicates, CHECK constraints.
-5. Pure-function predicate: a small allow-list of stable+immutable
-   built-ins (`length`, `upper`, `lower`, `substring(literal, ..., ...)`).
-   Volatile / stable functions (`now`, `random`) are not folded.
+4. Wire-in: `foldPlanConstants` at the end of `planSelect()`.
+5. Function calls are not folded (volatile-function exclusion still applies).
 
 ## Definition of Done
 
