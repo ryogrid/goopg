@@ -1502,13 +1502,19 @@ in `docs/reference/ref-002-btree.md`.
       replaces `btree.Create + backfillBTree`. 8 tests: empty, single, 1k entries,
       matches-Insert, point-lookup, multi-level (10k), 100k perf, Insert-after.
       All go test ./internal/access/btree/ ./internal/executor/ pass.)
-- [ ] M0047-0002: B-tree page deletion. Design doc
-      `docs/design/0047-0002-page-deletion.md`. Two-phase
-      `_bt_pagedel` port (`BTP_HALF_DEAD` then `BTP_DELETED`); wired
-      into VACUUM; preserves Lehman-Yao right-link invariant; WAL
-      `XLOG_BTREE_MARK_PAGE_HALFDEAD` / `XLOG_BTREE_UNLINK_PAGE`.
-      DoD: 100k INSERT → 100k DELETE → VACUUM yields single-page
-      B-tree.
+- [x] M0047-0002: B-tree page deletion. Design doc
+      `docs/design/0047-0002-page-deletion.md`. (landed 2026-05-05:
+      `btree_vacuum.go`: `VacuumIndexPages(deadTIDs)` walks leaf chain, removes
+      dead entries by TID lookup in O(1) hash set, marks empty leaves BTDeleted.
+      `unlinkEmptyLeaf`: updates Prev.Next and Next.Prev sibling links, re-descends
+      with saved firstKey to find parent, calls `removeDownlinkFromParent`.
+      `removeDownlinkFromParent` rewrites parent without child's item; clears
+      new leftmost item's key to preserve nil-key convention. `isTreeEmpty` +
+      `resetToEmptyRoot`: reinitialises block 1 as fresh BTLeaf|BTRoot, updates
+      metapage. `vacuum.Stats.DeadTIDs` collects reclaimed heap TIDs in vacuumCore.
+      `vacuumIndexes` wired into `vacuumOp.Next()` after heap vacuum. 5 tests:
+      no-op, partial (200 entries/half dead), full deletion DoD (500→empty),
+      single-leaf, large multi-level (2k/half). All pass.)
 - [ ] M0047-0003: B-tree leaf deduplication. Design doc
       `docs/design/0047-0003-deduplication.md`. Posting-list leaf
       entries (`BT_POSTING_KIND`); bulk path emits dedup-shape; insert

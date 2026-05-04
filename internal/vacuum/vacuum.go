@@ -23,6 +23,10 @@ type Stats struct {
 	Frozen       int // tuples whose xmin was rewritten to FrozenTransactionID
 	OldestXmin   storage.TransactionID
 	NewFrozenXID storage.TransactionID // lowest unfrozen xmin after this pass (0 if all frozen)
+	// DeadTIDs is the list of heap (block, offset) pointers that were
+	// reclaimed in this pass. Index vacuum uses these to remove stale
+	// index entries (M0047-0002).
+	DeadTIDs []storage.ItemPointer
 }
 
 // VacuumOptions controls optional vacuum behaviours beyond the core dead-tuple
@@ -140,6 +144,10 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 				pool.MarkDirty(slot)
 			}
 			pageDirty = true
+			// Collect dead TIDs for index vacuum (M0047-0002).
+			for _, s := range deadSlots {
+				stats.DeadTIDs = append(stats.DeadTIDs, storage.ItemPointer{Block: blk, Offset: s})
+			}
 		}
 
 		// Tuple-freeze pass (M0046-0005): rewrite old xmin → FrozenTransactionID.

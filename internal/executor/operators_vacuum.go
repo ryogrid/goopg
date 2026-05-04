@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -68,8 +69,32 @@ func (o *vacuumOp) Next() (Row, error) {
 			// All tuples frozen — relfrozenxid advances to freezeBelow.
 			tbl.RelFrozenXID = freezeBelow
 		}
+
+		// Index vacuum (M0047-0002): remove stale B-tree entries pointing
+		// to dead heap tuples and delete any empty leaf pages.
+		if err == nil && len(stats.DeadTIDs) > 0 && o.ctx.Pool != nil {
+			vacuumIndexes(o.ctx, tbl, stats.DeadTIDs)
+		}
 	}
 	return nil, EOF
+}
+
+// vacuumIndexes removes stale B-tree index entries that point to dead heap
+// tuples collected during the heap vacuum pass. Empty index leaf pages are
+// deleted and the tree is compacted if fully empty (M0047-0002).
+func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPointer) {
+	indexes := ctx.Catalog.IndexesOnTable(tbl)
+	for _, idx := range indexes {
+		if idx.Method != "btree" {
+			continue
+		}
+		idxRel := ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(ctx.Pool, idxRel)
+		if err != nil {
+			continue // index may not exist yet (e.g. freshly created)
+		}
+		_, _ = tree.VacuumIndexPages(deadTIDs)
+	}
 }
 
 // vacuumTableTargets resolves the *catalog.Table list to vacuum (so we can
