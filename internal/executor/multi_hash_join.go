@@ -6,30 +6,34 @@ import (
 
 // multiHashJoinOp replaces a chain of N binary hash joins.
 // Build phase: drain N-1 small "build" tables into hash tables.
-// Probe phase: stream the one "probe" table, chain-lookup through
-// hash tables, and emit joined rows lazily via Next().
+// Probe phase: stream the one "probe" table; for each probe row,
+// iterate all match combinations across the chain steps lazily via
+// Next(), one output row per call.
+//
+// M0043: replaced the previous expandChain() full-materialisation
+// (which stored all rows in o.rows before yielding any, causing
+// >19 GB heap + 91% GC overhead on Q9 with 1.8M lineitem rows)
+// with a lazy cursor-based iterator.
 type multiHashJoinOp struct {
-	plan       *planner.MultiHashJoin
-	children   []Operator
-	hashTbls   []map[string][]Row // one per build child; multi-value
-	probeOp    Operator
-	keySteps   []keyStep // ordered lookup chain
-	filters    []planner.Expr
-	nulls      []Row // null-padded rows for schema
-	tableOff   []int // precomputed offset of each table in output
-	schema     planner.Schema
-	ctx        *Context
+	plan     *planner.MultiHashJoin
+	children []Operator
+	hashTbls []map[string][]Row // one per build child; multi-value
+	probeOp  Operator
+	keySteps []keyStep // ordered lookup chain
+	filters  []planner.Expr
+	nulls    []Row  // null-padded rows for schema
+	tableOff []int  // precomputed offset of each table in output
+	schema   planner.Schema
+	ctx      *Context
 
-	// Materialised join output state. The chain may produce
-	// multiple rows per probe row when any build table has multi-
-	// row matches per key (e.g. TPC-H Q9 partsupp where two
-	// partsupps share each ps_suppkey). Open() drives the chain
-	// once and stores all output rows; Next() yields them one at
-	// a time. (Lazy expansion across multiple multi-match steps
-	// would require nested iterators — the synthetic dataset is
-	// small and this materialisation has negligible cost.)
-	rows []Row
-	idx  int
+	// Lazy iterator state (M0043). Per-step cursor arrays are
+	// len(keySteps); the outer loop advances from the last step
+	// backwards (like an odometer).
+	lazyOut      Row     // current shared output buffer (reused across Next calls)
+	lazyMatches  [][]Row // lazyMatches[i] = hash-table matches for step i given the current prefix
+	lazyCursors  []int   // lazyCursors[i] = index into lazyMatches[i]
+	lazyInit     bool    // true once the first probe row has been fetched
+	lazyProbeEOF bool    // true once probeOp is exhausted
 }
 
 // keyStep describes one chain-lookup: take the value at the
@@ -57,8 +61,8 @@ func newMultiHashJoinOp(plan *planner.MultiHashJoin, children []Operator) *multi
 
 func (o *multiHashJoinOp) Open(ctx *Context) error {
 	o.ctx = ctx
-	o.rows = nil
-	o.idx = 0
+	o.lazyInit = false
+	o.lazyProbeEOF = false
 	nTables := len(o.plan.Tables)
 	o.hashTbls = make([]map[string][]Row, nTables)
 	if o.nulls == nil || len(o.nulls) != nTables || len(o.nulls[0]) == 0 {
@@ -174,8 +178,8 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 		o.hashTbls[i] = ht
 	}
 
-	// Open probe child and drive the entire join — produce the
-	// Cartesian expansion across multi-match chain steps up front.
+	// Open the probe child for streaming. The actual joining is
+	// done lazily in Next().
 	o.probeOp = o.children[probe]
 	if err := o.probeOp.Open(ctx); err != nil {
 		return err
@@ -188,87 +192,163 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 		o.tableOff[i] = acc
 		acc += len(o.nulls[i])
 	}
-	for {
-		probeRow, err := o.probeOp.Next()
-		if err == EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		out := make(Row, 0, len(o.schema))
-		for i := 0; i < nTables; i++ {
-			out = append(out, o.nulls[i]...)
-		}
-		copy(out[o.tableOff[o.plan.ProbeTable]:], probeRow)
-		if err := o.expandChain(out, 0); err != nil {
-			return err
-		}
-	}
+
+	// Allocate per-step cursor state.
+	o.lazyMatches = make([][]Row, len(o.keySteps))
+	o.lazyCursors = make([]int, len(o.keySteps))
+	// Allocate the shared output buffer.
+	o.lazyOut = make(Row, acc)
 	return nil
 }
 
-// expandChain drives the chain of hash lookups depth-first, emitting
-// one output row per Cartesian combination of multi-row matches at
-// each step. Materialising all output rows up front avoids holding
-// per-step iterator state across Next() calls; the synthetic dataset
-// is small and TPC-H scales fit comfortably in memory.
-func (o *multiHashJoinOp) expandChain(out Row, stepIdx int) error {
-	if stepIdx >= len(o.keySteps) {
-		// Leaf: apply residual filters, emit if all pass.
-		for _, f := range o.filters {
-			v, err := evalExpr(f, out, o.ctx)
-			if err != nil {
-				return err
-			}
-			if v.IsNull() || !(v.Kind == KindBool && v.Bool) {
-				return nil
-			}
+// Next returns the next joined row by advancing the lazy cursor state.
+// It streams probe rows one at a time and iterates all match
+// combinations across chain steps without materialising the full
+// Cartesian product into memory.
+func (o *multiHashJoinOp) Next() (Row, error) {
+	for {
+		if o.lazyProbeEOF {
+			return nil, EOF
 		}
-		// Copy out (caller may overwrite slots in subsequent
-		// recursion levels for sibling matches).
-		row := make(Row, len(out))
-		copy(row, out)
-		o.rows = append(o.rows, row)
+
+		if !o.lazyInit {
+			// Fetch the first/next probe row.
+			if err := o.advanceProbe(); err != nil {
+				return nil, err
+			}
+			if o.lazyProbeEOF {
+				return nil, EOF
+			}
+			// Init step cursors for the new probe row, starting
+			// from step 0.
+			if ok := o.initStepsFrom(0); !ok {
+				// No match at some step — try next probe row.
+				o.lazyInit = false
+				continue
+			}
+			o.lazyInit = true
+			// Cursors already point at first match per step;
+			// apply all steps and check filters.
+			if ok, err := o.applyAndFilter(); err != nil {
+				return nil, err
+			} else if ok {
+				return o.copyOut(), nil
+			}
+			// Filter rejected — fall through to advance.
+		}
+
+		// Advance cursors (odometer from last step).
+		advanced := false
+		for s := len(o.keySteps) - 1; s >= 0; s-- {
+			o.lazyCursors[s]++
+			if o.lazyCursors[s] < len(o.lazyMatches[s]) {
+				// Apply this step's new match into lazyOut.
+				m := o.lazyMatches[s][o.lazyCursors[s]]
+				dstOff := o.tableOff[o.keySteps[s].hashTblIndex]
+				copy(o.lazyOut[dstOff:], m)
+				// Re-init all deeper steps from s+1.
+				if ok := o.initStepsFrom(s + 1); !ok {
+					// No match at a deeper step; continue
+					// incrementing s (backtrack).
+					continue
+				}
+				advanced = true
+				break
+			}
+			// This step is exhausted — reset and backtrack.
+			o.lazyCursors[s] = 0
+		}
+
+		if !advanced {
+			// All steps exhausted for this probe row — next probe.
+			o.lazyInit = false
+			continue
+		}
+
+		if ok, err := o.applyAndFilter(); err != nil {
+			return nil, err
+		} else if ok {
+			return o.copyOut(), nil
+		}
+		// Filter rejected — loop to advance again.
+	}
+}
+
+// advanceProbe fetches the next probe row and copies it into lazyOut.
+func (o *multiHashJoinOp) advanceProbe() error {
+	probeRow, err := o.probeOp.Next()
+	if err == EOF {
+		o.lazyProbeEOF = true
 		return nil
 	}
-	step := o.keySteps[stepIdx]
-	srcOff := o.tableOff[step.srcTable]
-	srcLen := len(o.nulls[step.srcTable])
-	if step.srcCol >= srcLen {
-		return nil // no source value
+	if err != nil {
+		return err
 	}
-	keyVal := out[srcOff+step.srcCol]
-	matches := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
-	if len(matches) == 0 {
-		return nil // INNER semantics: no matches → drop branch
+	// Reset lazyOut to nulls, then overlay the probe row.
+	nTables := len(o.plan.Tables)
+	for i := 0; i < nTables; i++ {
+		copy(o.lazyOut[o.tableOff[i]:], o.nulls[i])
 	}
-	dstOff := o.tableOff[step.hashTblIndex]
-	for _, m := range matches {
-		copy(out[dstOff:], m)
-		if err := o.expandChain(out, stepIdx+1); err != nil {
-			return err
-		}
-	}
-	// Restore null padding so sibling branches don't see leftover
-	// values from this match.
-	copy(out[dstOff:], o.nulls[step.hashTblIndex])
+	copy(o.lazyOut[o.tableOff[o.plan.ProbeTable]:], probeRow)
 	return nil
 }
 
-func (o *multiHashJoinOp) Next() (Row, error) {
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+// initStepsFrom initialises match slices and cursors for steps
+// [startStep .. len(keySteps)-1] based on the current lazyOut
+// content. Returns false if any step has no matches (meaning this
+// combination of probe+prefix yields no output rows at all).
+func (o *multiHashJoinOp) initStepsFrom(startStep int) bool {
+	for s := startStep; s < len(o.keySteps); s++ {
+		step := o.keySteps[s]
+		srcOff := o.tableOff[step.srcTable]
+		srcLen := len(o.nulls[step.srcTable])
+		if step.srcCol >= srcLen {
+			return false
+		}
+		keyVal := o.lazyOut[srcOff+step.srcCol]
+		matches := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
+		if len(matches) == 0 {
+			return false // INNER semantics: no match → skip
+		}
+		o.lazyMatches[s] = matches
+		o.lazyCursors[s] = 0
+		// Apply first match of this step into lazyOut.
+		dstOff := o.tableOff[step.hashTblIndex]
+		copy(o.lazyOut[dstOff:], matches[0])
 	}
-	row := o.rows[o.idx]
-	o.idx++
-	return row, nil
+	return true
+}
+
+// applyAndFilter evaluates the residual filters on the current
+// lazyOut row. Returns true when the row should be emitted.
+func (o *multiHashJoinOp) applyAndFilter() (bool, error) {
+	for _, f := range o.filters {
+		v, err := evalExpr(f, o.lazyOut, o.ctx)
+		if err != nil {
+			return false, err
+		}
+		if v.IsNull() || !(v.Kind == KindBool && v.Bool) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// copyOut returns a fresh copy of lazyOut so callers can hold a
+// reference across subsequent Next() calls.
+func (o *multiHashJoinOp) copyOut() Row {
+	row := make(Row, len(o.lazyOut))
+	copy(row, o.lazyOut)
+	return row
 }
 
 func (o *multiHashJoinOp) Close() error {
 	o.hashTbls = nil
 	o.nulls = nil
 	o.keySteps = nil
+	o.lazyOut = nil
+	o.lazyMatches = nil
+	o.lazyCursors = nil
 	o.ctx = nil
 	for _, c := range o.children {
 		_ = c.Close()
