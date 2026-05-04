@@ -360,8 +360,9 @@ loading switch.**
       Catalog.DropTable/DropIndex + Pool.InvalidateRel + Manager.DropRelation.
       execCreateTable and createBTreeIndex record entries via RecordDDLCreate.
       5 tests: BEGIN+ROLLBACK removes table, BEGIN+COMMIT keeps it, index rollback,
-      multiple creates rollback, auto-commit. Known limitation: crash+restart may
-      show rolled-back tables (no pg_xact commit log — Phase 2).
+      multiple creates rollback, auto-commit.
+- [ ] make crash+restart not to show rolled-back tables.
+- [ ] pg_xact commit log.
 
 ## Milestone 0031 — TPC-H Q2 Memory Estimation & GC Leak Code Review
 
