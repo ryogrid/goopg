@@ -1360,10 +1360,13 @@ retained WAL backwards.
       mid-flight, kill goopg, restart, query SF=1 dataset).
       Documented in `analysis/tpch-hammerdb-run-008.md` (or the
       next sequential run report).
-  - [ ] No data loss; no un-restartable cluster.
-  - [ ] `TestTPCHResultParity` identical=22 divergent=0
-        errored=0 still holds.
-  - [ ] Mark M0045 `accepted`.
+      **Partial 2026-05-04**: TestTPCHResultParity confirmed
+      identical=22 divergent=0 errored=0 after all M0042 changes.
+      HammerDB hard-kill scenario requires human to run.
+  - [ ] No data loss; no un-restartable cluster. (requires HammerDB)
+  - [x] `TestTPCHResultParity` identical=22 divergent=0
+        errored=0 still holds. (verified 2026-05-04)
+  - [ ] Mark M0045 `accepted`. (pending HammerDB run)
 
 ## Notes
 
