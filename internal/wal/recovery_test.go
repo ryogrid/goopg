@@ -819,3 +819,132 @@ func TestReplayRecordsPostCheckpointAfterRetention(t *testing.T) {
 
 // _ avoids an unused-import lint when this file ends up alone.
 var _ = filepath.Base
+
+// TestEncodeDecodeSmgrCreateRoundTrip verifies that EncodeSmgrCreate +
+// DecodeSmgrCreate preserves the RelFileNode fields exactly.
+func TestEncodeDecodeSmgrCreateRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 16384, Fork: storage.MainFork}
+	enc := EncodeSmgrCreate(rel)
+	if enc[0] != RecordKindSmgrCreate {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindSmgrCreate)
+	}
+	if len(enc) != smgrRecordSize {
+		t.Errorf("encoded len = %d, want %d", len(enc), smgrRecordSize)
+	}
+	got, err := DecodeSmgrCreate(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != rel {
+		t.Errorf("decoded rel = %+v, want %+v", got, rel)
+	}
+}
+
+// TestEncodeDecodeSmgrTruncateRoundTrip verifies SmgrTruncate round-trip.
+func TestEncodeDecodeSmgrTruncateRoundTrip(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 99999, Fork: storage.MainFork}
+	enc := EncodeSmgrTruncate(rel)
+	if enc[0] != RecordKindSmgrTruncate {
+		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindSmgrTruncate)
+	}
+	got, err := DecodeSmgrTruncate(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != rel {
+		t.Errorf("decoded rel = %+v, want %+v", got, rel)
+	}
+}
+
+// TestReplaySmgrCreateCreatesRelfile verifies that replaying a SmgrCreate
+// record creates the relfile with one block when it doesn't already exist.
+func TestReplaySmgrCreateCreatesRelfile(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 55555, Fork: storage.MainFork}
+
+	// File must not exist before replay.
+	n, _ := mgr.NBlocks(rel)
+	if n != 0 {
+		t.Fatalf("expected 0 blocks before replay, got %d", n)
+	}
+
+	payload := EncodeSmgrCreate(rel)
+	applied, err := ApplyRecord(mgr, Record{Payload: payload})
+	if err != nil {
+		t.Fatalf("ApplyRecord SmgrCreate: %v", err)
+	}
+	if !applied {
+		t.Error("ApplyRecord returned applied=false for SmgrCreate")
+	}
+
+	n, err = mgr.NBlocks(rel)
+	if err != nil {
+		t.Fatalf("NBlocks after replay: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("NBlocks after SmgrCreate replay = %d, want 1", n)
+	}
+}
+
+// TestReplaySmgrCreateIdempotent verifies that replaying SmgrCreate on an
+// already-present relfile is a no-op (no error, NBlocks unchanged).
+func TestReplaySmgrCreateIdempotent(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 66666, Fork: storage.MainFork}
+
+	// Pre-create the relfile with 3 blocks.
+	page := make(storage.Page, storage.BlockSize)
+	_ = storage.InitPage(page)
+	for i := 0; i < 3; i++ {
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	payload := EncodeSmgrCreate(rel)
+	if _, err := ApplyRecord(mgr, Record{Payload: payload}); err != nil {
+		t.Fatalf("ApplyRecord SmgrCreate idempotent: %v", err)
+	}
+	n, _ := mgr.NBlocks(rel)
+	if n != 3 {
+		t.Errorf("NBlocks after idempotent replay = %d, want 3", n)
+	}
+}
+
+// TestReplaySmgrTruncateZerosRelfile verifies that SmgrTruncate replay
+// reduces the relfile to 0 blocks.
+func TestReplaySmgrTruncateZerosRelfile(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 77777, Fork: storage.MainFork}
+
+	// Pre-create with 2 blocks.
+	page := make(storage.Page, storage.BlockSize)
+	_ = storage.InitPage(page)
+	for i := 0; i < 2; i++ {
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	payload := EncodeSmgrTruncate(rel)
+	applied, err := ApplyRecord(mgr, Record{Payload: payload})
+	if err != nil {
+		t.Fatalf("ApplyRecord SmgrTruncate: %v", err)
+	}
+	if !applied {
+		t.Error("ApplyRecord returned applied=false for SmgrTruncate")
+	}
+	n, _ := mgr.NBlocks(rel)
+	if n != 0 {
+		t.Errorf("NBlocks after SmgrTruncate = %d, want 0", n)
+	}
+}

@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | draft                          |
+| Status      | accepted (landed 2026-05-04)   |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |

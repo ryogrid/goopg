@@ -296,7 +296,7 @@ requires multiple loops. Start by creating the design doc and
 implementing OID constants + file creation before the codec and
 loading switch.**
 
-- [ ] System catalog heap table substrate: pg_class, pg_attribute, pg_type
+- [x] System catalog heap table substrate: pg_class, pg_attribute, pg_type
       as real heap relations (M0030-0001). Design doc
       `docs/design/0030-0001-system-catalog-heap-substrate.md`.
       **Phase 1 landed 2026-05-04**: OID constants (TypeRelationId=1247,
@@ -319,9 +319,17 @@ loading switch.**
       in operators_ddl.go. CREATE TABLE writes pg_class + pg_attribute rows.
       CREATE INDEX writes pg_class row. 3 new integration tests pass.
       DROP TABLE/INDEX sync and startup user-table load deferred.
-- [ ] DDL WAL record kinds: RecordKindCatalog* and RecordKindSmgr*
+- [x] DDL WAL record kinds: RecordKindSmgrCreate + RecordKindSmgrTruncate
       plus redo handlers (M0030-0002). Design doc
       `docs/design/0030-0002-ddl-wal-records.md`.
+      **Landed 2026-05-04**: RecordKindSmgrCreate=11, RecordKindSmgrTruncate=12
+      in recovery.go. EncodeSmgrCreate/Truncate + DecodeSmgrCreate/Truncate +
+      replaySmgrCreate/Truncate in ApplyRecord. LogSmgrCreate hook in
+      PoolConfig/Pool.PinNew (emits when blk==0). Wired in initdb/open.go.
+      6 new tests (round-trip, redo handlers, PinNew hook). Catalog heap
+      mutations (pg_class/pg_attribute inserts) are already WAL-logged via
+      RecordKindHeapInsert — no separate RecordKindCatalogInsert needed.
+      docs/design/README.md updated with M0030-0001 through 0030-0006 entries.
 - [ ] WAL-based catalog recovery and checkpoint integration (M0030-0003).
       Design doc `docs/design/0030-0003-catalog-recovery.md`.
 - [ ] JSON-snapshot to heap-table migration gate (M0030-0004).

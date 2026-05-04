@@ -102,6 +102,10 @@ type Pool struct {
 	// record. Used by VACUUM to capture the dead-slot list rather
 	// than a full-page image on each pruned page.
 	logHeapVacuum LogHeapVacuumFunc
+	// logSmgrCreate emits a relation-file creation WAL record
+	// (RecordKindSmgrCreate) when Pool.PinNew creates block 0 of
+	// a new relation. Set via PoolConfig.LogSmgrCreate.
+	logSmgrCreate func(rel RelFileNode) error
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -201,6 +205,14 @@ type PoolConfig struct {
 	// each pruned page.
 	LogHeapVacuum LogHeapVacuumFunc
 
+	// LogSmgrCreate, when non-nil, is called by PinNew when it
+	// creates block 0 of a relation (the first Extend). The hook
+	// should emit a RecordKindSmgrCreate WAL record so crash
+	// recovery can recreate the relfile before replaying data pages.
+	// Failures are logged but not propagated, matching the FPI hook
+	// behaviour. See docs/design/0030-0002-ddl-wal-records.md.
+	LogSmgrCreate func(rel RelFileNode) error
+
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -281,6 +293,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapDelete:  cfg.LogHeapDelete,
 		logHeapLock:    cfg.LogHeapLock,
 		logHeapVacuum:  cfg.LogHeapVacuum,
+		logSmgrCreate:  cfg.LogSmgrCreate,
 		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
@@ -506,6 +519,14 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	s.contentMu.Unlock()
 	if err != nil {
 		return nil, InvalidBlockNumber, err
+	}
+	// Emit SmgrCreate WAL record on first block creation so crash
+	// recovery can recreate the relfile before replaying data pages.
+	if blk == 0 && p.logSmgrCreate != nil {
+		if emitErr := p.logSmgrCreate(rel); emitErr != nil {
+			p.logger.Error("SmgrCreate WAL emission failed", "rel", rel, "err", emitErr)
+			// Don't propagate — storage mutation already committed.
+		}
 	}
 	tag := BufferTag{Rel: rel, Block: blk}
 

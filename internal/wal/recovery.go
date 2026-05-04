@@ -83,6 +83,20 @@ const (
 	// "kind(1) | rel(9) | blk(4) | lineSlot(2) | xmax(4) |
 	//  lockStrength(2)" = 22 bytes.
 	RecordKindHeapLock byte = 10
+	// RecordKindSmgrCreate logs the first extension of a relation file
+	// (mirrors upstream's XLOG_SMGR_CREATE in
+	// postgres/src/include/catalog/storage_xlog.h). Emitted by the buffer
+	// pool when Pool.PinNew creates block 0 of a new relation. Redo:
+	// ensure the relfile exists with at least one initialised block.
+	// Format: "kind(1) | DBOid(4) | RelOid(4) | Fork(1)" = 10 bytes.
+	RecordKindSmgrCreate byte = 11
+	// RecordKindSmgrTruncate logs a relation-file truncation (mirrors
+	// upstream's XLOG_SMGR_TRUNCATE). Emitted by TRUNCATE TABLE. Redo:
+	// truncate the relfile to 0 blocks. Same format as SmgrCreate.
+	RecordKindSmgrTruncate byte = 12
+
+	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
+	smgrRecordSize = 10
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
@@ -279,6 +293,66 @@ func DecodeHeapLock(payload []byte) (rel storage.RelFileNode, blk storage.BlockN
 	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
 	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
 	lockStrength = binary.LittleEndian.Uint16(payload[20:22])
+	return
+}
+
+// EncodeSmgrCreate encodes a relation-file creation record.
+// Mirrors upstream's XLOG_SMGR_CREATE. The redo handler ensures
+// the relfile has at least one initialised block (idempotent).
+func EncodeSmgrCreate(rel storage.RelFileNode) []byte {
+	out := make([]byte, smgrRecordSize)
+	out[0] = RecordKindSmgrCreate
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	return out
+}
+
+// DecodeSmgrCreate decodes a SmgrCreate record payload.
+func DecodeSmgrCreate(payload []byte) (rel storage.RelFileNode, err error) {
+	if len(payload) < smgrRecordSize {
+		err = fmt.Errorf("wal: invalid smgr-create payload len %d (want %d)", len(payload), smgrRecordSize)
+		return
+	}
+	if payload[0] != RecordKindSmgrCreate {
+		err = fmt.Errorf("wal: record kind %d is not smgr-create", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	return
+}
+
+// EncodeSmgrTruncate encodes a relation-file truncation record.
+// Mirrors upstream's XLOG_SMGR_TRUNCATE. The redo handler truncates
+// the relfile to 0 blocks.
+func EncodeSmgrTruncate(rel storage.RelFileNode) []byte {
+	out := make([]byte, smgrRecordSize)
+	out[0] = RecordKindSmgrTruncate
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	return out
+}
+
+// DecodeSmgrTruncate decodes a SmgrTruncate record payload.
+func DecodeSmgrTruncate(payload []byte) (rel storage.RelFileNode, err error) {
+	if len(payload) < smgrRecordSize {
+		err = fmt.Errorf("wal: invalid smgr-truncate payload len %d (want %d)", len(payload), smgrRecordSize)
+		return
+	}
+	if payload[0] != RecordKindSmgrTruncate {
+		err = fmt.Errorf("wal: record kind %d is not smgr-truncate", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
 	return
 }
 
@@ -532,6 +606,16 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
 		return false, nil
+	case RecordKindSmgrCreate:
+		if err := replaySmgrCreate(mgr, r.Payload); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindSmgrTruncate:
+		if err := replaySmgrTruncate(mgr, r.Payload); err != nil {
+			return false, err
+		}
+		return true, nil
 	default:
 		return false, fmt.Errorf("unsupported kind %d", r.Payload[0])
 	}
@@ -883,4 +967,45 @@ func DiscoverLastCheckpointLSN(walDir string, segmentSize int64) (uint64, error)
 			"the cluster may need to be re-initialized with 'goopg init'", walDir)
 	}
 	return lastLSN, nil
+}
+
+// replaySmgrCreate ensures the relation file identified by the record has at
+// least one initialised block. Idempotent: if the file already has blocks,
+// this is a no-op. Mirrors XLOG_SMGR_CREATE redo semantics.
+func replaySmgrCreate(mgr *storage.Manager, payload []byte) error {
+	rel, err := DecodeSmgrCreate(payload)
+	if err != nil {
+		return err
+	}
+	n, err := mgr.NBlocks(rel)
+	if err != nil {
+		return fmt.Errorf("wal: smgr-create replay NBlocks: %w", err)
+	}
+	if n > 0 {
+		return nil // already exists — idempotent
+	}
+	page := make([]byte, storage.BlockSize)
+	if initErr := storage.InitPage(storage.Page(page)); initErr != nil {
+		return initErr
+	}
+	_, err = mgr.Extend(rel, page)
+	return err
+}
+
+// replaySmgrTruncate truncates the relfile to 0 blocks. Idempotent: if the
+// file is already empty (0 blocks), this is a no-op. Mirrors
+// XLOG_SMGR_TRUNCATE redo semantics.
+func replaySmgrTruncate(mgr *storage.Manager, payload []byte) error {
+	rel, err := DecodeSmgrTruncate(payload)
+	if err != nil {
+		return err
+	}
+	n, err := mgr.NBlocks(rel)
+	if err != nil {
+		return fmt.Errorf("wal: smgr-truncate replay NBlocks: %w", err)
+	}
+	if n == 0 {
+		return nil // already empty — idempotent
+	}
+	return mgr.TruncateRelation(rel)
 }

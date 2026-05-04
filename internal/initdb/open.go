@@ -311,6 +311,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Relation-file creation WAL record (M0030-0002). Emitted by
+	// Pool.PinNew when it creates block 0 of a new relfile so crash
+	// recovery can recreate the file before replaying data pages.
+	logSmgrCreate := func(rel storage.RelFileNode) error {
+		payload := wal.EncodeSmgrCreate(rel)
+		_, _, err := walWriter.Append(payload)
+		return err
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
@@ -321,6 +330,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapDelete:  logHeapDelete,
 		LogHeapVacuum:  logHeapVacuum,
 		LogHeapLock:    logHeapLock,
+		LogSmgrCreate:  logSmgrCreate,
 		FullPageWrites: true,
 	})
 	if err != nil {
