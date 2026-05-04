@@ -750,6 +750,29 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	return s, nil
 }
 
+// Capacity returns the total number of buffer slots in the pool.
+// Used by scan strategies to decide whether to activate a ring buffer.
+func (p *Pool) Capacity() int { return len(p.slots) }
+
+// TryPin returns the pool slot for tag if it is already cached,
+// incrementing pinCount. Returns (nil, false) when the tag is not in
+// the pool — no disk read is attempted. Used by ScanRing to detect
+// cache hits without evicting other pages on misses (M0048-0002).
+func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	idx, ok := p.byTag[tag]
+	if !ok {
+		return nil, false
+	}
+	s := p.slots[idx]
+	s.pinCount++
+	if s.usageCount < maxUsageCount {
+		s.usageCount++
+	}
+	return s, true
+}
+
 // Unpin decrements the slot's pin count.
 func (p *Pool) Unpin(s *Slot) {
 	p.poolMu.Lock()

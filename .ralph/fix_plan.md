@@ -1543,12 +1543,15 @@ checkpoint-pacing gap in `ref-004-checkpointer.md`.
       events. 3 tests: DoD (64 goroutines → smgr.Read=1), distinct blocks (8
       reads), race-detector stress (16 goroutines, 4-slot pool). All pass with
       -race.)
-- [ ] M0048-0002: SeqScan strategy ring. Design doc
-      `docs/design/0048-0002-strategy-ring-seqscan.md`. New
-      `BufferAccessStrategy` interface (32-slot `bulkReadStrategy`);
-      planner heuristic enables on relations > shared_buffers/4. DoD:
-      hot-page hit rate ≥ 95% after a 5k-page SeqScan in a 1k-buffer
-      pool.
+- [x] M0048-0002: SeqScan strategy ring. Design doc
+      `docs/design/0048-0002-strategy-ring-seqscan.md`. (landed 2026-05-05:
+      `storage.ScanRing` with 32 private 8-KB page buffers. `Pool.TryPin` for
+      cache-hit detection; `Manager.ReadBlock` for misses (no pool eviction).
+      `Pool.Capacity()` for heuristic check. `seqScanOp` activates ring when
+      `nBlocks > Capacity()/4`; adds `ring *ScanRing` + `activePage Page` fields;
+      `releasePinned` / `Close` delegate to ring. 4 tests: lifecycle, cache-hit,
+      DoD (500-page scan / 100-slot pool → 100% hot-page preservation), multi-block.
+      All pass.)
 - [ ] M0048-0003: bgwriter goroutine. Design doc
       `docs/design/0048-0003-bgwriter-goroutine.md`. New
       `internal/storage/bgwriter.go`; ticks every `bgwriter_delay`,

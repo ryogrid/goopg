@@ -37,6 +37,17 @@ type seqScanOp struct {
 	slotMax  int
 	pinned   *storage.Slot
 
+	// activePage holds the current page bytes regardless of source
+	// (pool slot or ring buffer). Set alongside pinned (for pool) or
+	// independently (for ring). Readers use this instead of
+	// o.pinned.Page() so ring-buffered pages work transparently.
+	activePage storage.Page
+
+	// ring is the SeqScan strategy ring (M0048-0002). When non-nil,
+	// cache misses are served from private ring buffers instead of
+	// evicting pool pages.  Activated when nBlocks > pool.Capacity()/4.
+	ring *storage.ScanRing
+
 	// prefetchedThru is the highest block (exclusive) we've
 	// already issued a Pool.Prefetch hint for. SeqScan walks
 	// blocks strictly forward, so the prefetcher just needs to
@@ -78,6 +89,12 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curSlot = 0
 	o.slotMax = 0
 	o.prefetchedThru = 0
+	// Activate the ring strategy when the relation is large enough that a
+	// full sequential scan would evict most hot pages from the shared pool.
+	// Threshold: pool capacity / 4, matching upstream's heuristic.
+	if ctx.Pool != nil && int(n) > ctx.Pool.Capacity()/4 {
+		o.ring = storage.NewScanRing(ctx.Pool, rel)
+	}
 	o.refillPrefetchWindow(rel)
 	return nil
 }
@@ -98,9 +115,14 @@ func (o *seqScanOp) refillPrefetchWindow(rel storage.RelFileNode) {
 }
 
 func (o *seqScanOp) Close() error {
-	if o.pinned != nil {
+	if o.ring != nil {
+		o.ring.Close()
+		o.ring = nil
+		o.activePage = nil
+	} else if o.pinned != nil {
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
+		o.activePage = nil
 	}
 	return nil
 }
@@ -110,22 +132,33 @@ func (o *seqScanOp) Close() error {
 func (o *seqScanOp) Next() (Row, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	for {
-		if o.pinned == nil {
+		if o.pinned == nil && o.activePage == nil {
 			if o.curBlock >= o.nBlocks {
 				return nil, EOF
 			}
-			slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: o.curBlock})
-			if err != nil {
-				return nil, err
+			if o.ring != nil {
+				// Ring strategy: cache hit → pool slot (with RLock);
+				// cache miss → private ring buffer (no pool eviction).
+				page, err := o.ring.AcquirePage(o.curBlock)
+				if err != nil {
+					return nil, err
+				}
+				o.activePage = page
+			} else {
+				slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: o.curBlock})
+				if err != nil {
+					return nil, err
+				}
+				// Hold the page's read lock for the lifetime of our
+				// iteration over its line pointers so writers
+				// (PageAddHeapTuple / PageSetHeapTupleXmax) can't tear
+				// the bytes we're decoding. RUnlock fires from
+				// releasePinned.
+				slot.RLock()
+				o.pinned = slot
+				o.activePage = slot.Page()
 			}
-			// Hold the page's read lock for the lifetime of our
-			// iteration over its line pointers so writers
-			// (PageAddHeapTuple / PageSetHeapTupleXmax) can't tear
-			// the bytes we're decoding. RUnlock fires from
-			// releasePinned.
-			slot.RLock()
-			o.pinned = slot
-			page := slot.Page()
+			page := o.activePage
 			if storage.IsNew(page) {
 				o.releasePinned()
 				o.curBlock++
@@ -140,7 +173,7 @@ func (o *seqScanOp) Next() (Row, error) {
 			o.curSlot = 1
 		}
 		for int(o.curSlot) <= o.slotMax {
-			page := o.pinned.Page()
+			page := o.activePage
 			tuple, err := storage.PageGetHeapTuple(page, o.curSlot)
 			o.curSlot++
 			if err != nil {
@@ -191,10 +224,14 @@ func (o *seqScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool
 }
 
 func (o *seqScanOp) releasePinned() {
-	if o.pinned != nil {
+	if o.ring != nil {
+		o.ring.ReleasePage()
+		o.activePage = nil
+	} else if o.pinned != nil {
 		o.pinned.RUnlock()
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
+		o.activePage = nil
 	}
 }
 
