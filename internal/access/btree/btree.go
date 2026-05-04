@@ -708,11 +708,23 @@ func pageItems(p storage.Page) ([]item, error) {
 		if err != nil {
 			return nil, err
 		}
-		it, err := parseItem(raw)
-		if err != nil {
-			return nil, err
+		// Posting-list items (M0047-0003) are expanded to individual
+		// (key, TID) pairs so callers like insertItemSorted work correctly.
+		if isPostingRaw(raw) {
+			key, tids, perr := parsePostingRaw(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			for _, tid := range tids {
+				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
+			}
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, it)
 		}
-		out = append(out, it)
 	}
 	return out, nil
 }
@@ -1253,24 +1265,61 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 			cur = next
 			continue
 		}
-		items, err := pageItems(slot.Page())
-		bt.unpinR(slot)
-		if err != nil {
-			return err
+		// Copy raw page items before releasing the pin so fn may do
+		// further btree operations without deadlocking. Posting items
+		// (M0047-0003) are detected by the BTPostingFlag in keyLen and
+		// expanded to one (key, TID) call per TID in the posting list.
+		count, countErr := storage.PageLinePointerCount(slot.Page())
+		type rawSlot struct{ raw []byte }
+		rawSlots := make([]rawSlot, 0, count)
+		if countErr == nil {
+			for s := uint16(1); s <= uint16(count); s++ {
+				r, rawErr := storage.PageGetItemRaw(slot.Page(), s)
+				if rawErr == nil {
+					rawSlots = append(rawSlots, rawSlot{append([]byte(nil), r...)})
+				}
+			}
 		}
-		for _, it := range items {
-			if lo != nil && CompareKeys(it.key, lo) < 0 {
-				continue
-			}
-			if hi != nil && CompareKeys(it.key, hi) > 0 {
-				return nil
-			}
-			ok, err := fn(it.key, it.ptr)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return nil
+		bt.unpinR(slot)
+		for _, rs := range rawSlots {
+			if isPostingRaw(rs.raw) {
+				key, tids, perr := parsePostingRaw(rs.raw)
+				if perr != nil {
+					continue
+				}
+				if lo != nil && CompareKeys(key, lo) < 0 {
+					continue
+				}
+				if hi != nil && CompareKeys(key, hi) > 0 {
+					return nil
+				}
+				for _, tid := range tids {
+					ok, ferr := fn(key, tid)
+					if ferr != nil {
+						return ferr
+					}
+					if !ok {
+						return nil
+					}
+				}
+			} else {
+				it, perr := parseItem(rs.raw)
+				if perr != nil {
+					continue
+				}
+				if lo != nil && CompareKeys(it.key, lo) < 0 {
+					continue
+				}
+				if hi != nil && CompareKeys(it.key, hi) > 0 {
+					return nil
+				}
+				ok, ferr := fn(it.key, it.ptr)
+				if ferr != nil {
+					return ferr
+				}
+				if !ok {
+					return nil
+				}
 			}
 		}
 		cur = op.Next

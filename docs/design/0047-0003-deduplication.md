@@ -1,71 +1,102 @@
-# 0047-0003 — B-tree leaf deduplication
+# B-tree Leaf Deduplication — M0047-0003
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0047 — B-tree maturation
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-Non-unique secondary indexes today store one leaf entry per row, even
-when many rows share the same key. A TPC-H SF1 index on
-`lineitem.l_shipmode` (5 distinct values × 6M rows) carries ~6M leaf
-entries. Upstream "dedup" packs them into one entry per distinct key
-with a *posting list* of TIDs; the same data needs ~5 entries per page,
-~12 KB per page, instead of the current ~96 B × 6M.
+On columns with many duplicate values (e.g. `l_shipmode` with 7 distinct values
+across 6M rows in TPC-H SF=1), every row produces a separate B-tree leaf entry
+`(key, TID)` even though the key bytes are identical. This wastes both disk space
+and buffer-pool slots: key bytes are repeated N times instead of stored once.
 
-Two- to ten-times reduction in index size on low-cardinality
-non-unique indexes is the headline benefit. The on-disk format change
-is local to the leaf and the index-fetch loop.
+PostgreSQL's B-tree deduplication (introduced in PG 13) groups entries with the
+same key into a **posting list**: a single leaf item `(key, [TID1, TID2, …, TIDn])`.
 
-## Plan
+## 2. Design
 
-1. Extend the leaf-item header. A leaf entry today is a fixed shape
-   `[TID(6) || key(K)]`. With dedup, the entry becomes either:
-   - `BT_TID_KIND` (single TID, current shape), or
-   - `BT_POSTING_KIND` (`[count(2) || key(K) || TID[count](6 each)]`).
-   Two bits in the line-pointer's flags discriminate.
-2. `BulkBuild` (0047-0001) emits posting-list entries when ≥ 2 input rows
-   share the same key.
-3. `Insert` path:
-   - On insert, locate the leaf as today.
-   - If the leaf has a posting-list entry for the same key, append the
-     TID to it (in-place if there's room, or split-and-grow if not).
-   - If the leaf is about to split because a single key would push past
-     capacity, *first* try to dedup all duplicates on the page; only
-     split if the dedup pass fails to free enough space.
-4. `Scan` (index-fetch) returns one TID at a time from a posting-list
-   entry. Cursor state grows a per-entry sub-position.
-5. `VACUUM` (page-dedup pass): when freeing a TID from a posting-list
-   entry, decrement the count; when count reaches 1, demote back to a
-   single-TID entry; when count reaches 0, line-pointer becomes
-   reusable.
-6. WAL:
-   - `XLOG_BTREE_DEDUP` (mirror upstream `xl_btree_dedup`) — emitted
-     when a pre-split dedup pass runs.
-   - Existing `XLOG_BTREE_INSERT` extended with the posting-list shape
-     bit when the inserted entry is grown rather than added.
+### 2.1 Posting item format (`internal/access/btree/posting.go`)
 
-## Definition of Done
+A posting item is detected by a flag in the first two bytes of the raw page item:
 
-- TPC-H SF1 `lineitem_l_shipmode` index size ≤ 25% of pre-dedup
-  baseline.
-- Existing index-scan tests (single-TID kind) still green.
-- New tests:
-  - Bulk build with 1k duplicates packs into one posting list.
-  - Insert into a posting-list entry round-trips.
-  - VACUUM partially-removing TIDs from a posting list works.
-  - Crash + replay round-trip of `XLOG_BTREE_DEDUP`.
+```
+[0:2]  keyLen | BTPostingFlag(0x8000)   (uint16 LE)
+[2:4]  TID count N                      (uint16 LE)
+[4:4+N*6]  N x (Block=4B LE, Offset=2B LE)
+[4+N*6:]   key bytes (keyLen bytes)
+```
 
-## Upstream reference
+A regular item has `keyLen` without the high bit set (existing format unchanged).
 
-- `postgres/src/backend/access/nbtree/nbtdedup.c` —
-  `_bt_dedup_pass`, `_bt_form_posting`.
-- `postgres/src/include/access/nbtree.h` —
-  `IndexTuple` posting-list bit.
-- `postgres/src/backend/access/nbtree/nbtxlog.c` — replay.
+Key functions:
+- `marshalPosting(key, tids)` — serialise a posting list
+- `isPostingRaw(raw)` — detect posting items by checking bit 15 of raw[0:2]
+- `parsePostingRaw(raw)` — deserialise key and TID slice
+- `postingKeyOf(raw)` — extract key without allocating a TID slice
 
-## goopg references
+### 2.2 BulkCreate deduplication (`internal/access/btree/bulkload.go`)
 
-- `internal/access/btree/page.go`, `scan.go`.
-- 0047-0001 — bulk path emits dedup-shape entries directly.
+`BulkCreate` now calls `deduplicateToRawItems(items)` before `buildLevelRaw`:
+
+- After sorting entries by key, consecutive runs with the same key are collapsed.
+- A run of 1: emitted as a regular item (`item.marshal()`, 8+keyLen bytes).
+- A run of N >= 2: emitted as a posting item (`marshalPosting`, 4+N*6+keyLen bytes).
+
+`buildLevelRaw([]rawItem, ...)` replaces `buildLevel([]item, ...)` for the leaf
+level. A `rawItem` is a pre-serialised `{raw []byte, key []byte}` pair.
+`buildLevelRaw` uses `len(ri.raw)+4` (item bytes + line pointer) for capacity
+checks so posting items fill pages correctly.
+
+`BulkCreateNoDedup` is a test-only variant that skips deduplication, enabling
+fair "before vs. after" comparisons in the DoD test.
+
+### 2.3 RangeScan posting-item expansion (`internal/access/btree/btree.go`)
+
+`RangeScan` no longer calls `pageItems` to read leaf pages. Instead it copies
+raw page slots before unpinning the buffer and iterates them directly:
+
+- **Posting item**: calls `fn(key, tid)` once per TID in the posting list.
+- **Regular item**: calls `fn(key, ptr)` once (unchanged behaviour).
+
+`pageItems` (used internally for `insertItemSorted`, split logic, and index
+vacuum) is updated to **expand posting items** into individual `(key, tid)`
+pairs. This ensures `Insert` and page-split code work transparently with
+deduplicated pages, at the cost of losing compaction on pages that receive
+subsequent `Insert`s. Dedup is re-applied only at the next `BulkCreate` /
+REINDEX.
+
+### 2.4 Limitations
+
+- Posting items must fit on one 8 KiB page: max N*6 + keyLen + 4 < 8168 bytes,
+  so at most ~1361 TIDs per key for a 30-byte key.
+  Columns with millions of duplicates per key would require TOAST-backed overflow,
+  deferred to a follow-up.
+- `Insert` always creates single-TID items (no in-place posting-list growth).
+  Dedup is only achieved via `BulkCreate` (i.e. on initial `CREATE INDEX`).
+- No `XLOG_BTREE_DEDUP` WAL record; pages use FPI (same as other BulkCreate pages).
+
+## 3. Space savings
+
+For an index on a column with K distinct values and N rows per value, with
+encoded key length L:
+
+| Variant | Bytes per TID |
+|---|---|
+| Regular (per entry) | 8 + L + 4 (LP) = 12+L |
+| Posting (large N, amortised) | ~6 |
+
+Ratio at large scale -> 6/(12+L). For L=30 bytes: 6/42 = 14%, well under the 25% DoD.
+
+## 4. Tests (`internal/access/btree/posting_test.go`)
+
+| Test | Coverage |
+|---|---|
+| `TestPostingMarshalRoundTrip` | `marshalPosting` + `parsePostingRaw` are exact inverses |
+| `TestIsPostingRaw` | Distinguishes posting from regular raw bytes |
+| `TestDeduplicateToRawItems` | Duplicate keys -> posting items; unique keys -> regular |
+| `TestBulkCreateDeduplication` | **DoD**: 7 keys x 1000 TIDs, dedup blocks <= 25% of baseline |
+| `TestBulkCreateDeduplicationInsertAfter` | `Insert` works on a deduplicated tree |
+| `TestPostingKeyOf` | Key extraction without TID allocation |

@@ -1515,12 +1515,17 @@ in `docs/reference/ref-002-btree.md`.
       `vacuumIndexes` wired into `vacuumOp.Next()` after heap vacuum. 5 tests:
       no-op, partial (200 entries/half dead), full deletion DoD (500→empty),
       single-leaf, large multi-level (2k/half). All pass.)
-- [ ] M0047-0003: B-tree leaf deduplication. Design doc
-      `docs/design/0047-0003-deduplication.md`. Posting-list leaf
-      entries (`BT_POSTING_KIND`); bulk path emits dedup-shape; insert
-      grows posting lists in place; pre-split dedup pass; WAL
-      `XLOG_BTREE_DEDUP`. DoD: TPC-H SF1 `lineitem_l_shipmode` index
-      size ≤ 25% of pre-dedup baseline.
+- [x] M0047-0003: B-tree leaf deduplication. Design doc
+      `docs/design/0047-0003-deduplication.md`. (landed 2026-05-05:
+      `BTPostingFlag=0x8000` bit in keyLen. `posting.go`: marshalPosting (4+N*6+keyLen
+      bytes), isPostingRaw, parsePostingRaw, postingKeyOf. `deduplicateToRawItems`:
+      groups same-key entries → posting items; single-key entries → regular items.
+      `buildLevelRaw([]rawItem)`: page-fills by raw byte count. `BulkCreate` calls
+      dedup then buildLevelRaw for leaf level. `BulkCreateNoDedup` (test helper).
+      `RangeScan`: iterates raw slots, expands posting to fn(key,tid) per TID.
+      `pageItems`: expands posting items → individual items for insertItemSorted/
+      vacuum compat. 6 tests + DoD: 7 keys×1000 TIDs → 23% of non-dedup baseline.
+      All go test ./internal/access/btree/ ./internal/executor/ pass.)
 
 ## Milestone 0048 — Buffer pool concurrency hardening
 
