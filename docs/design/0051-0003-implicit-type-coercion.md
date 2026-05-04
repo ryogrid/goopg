@@ -1,7 +1,7 @@
 # 0051-0003 — Implicit type coercion
 
-**Status:** draft
-**Date:** 2026-05-04
+**Status:** accepted
+**Date:** 2026-05-05
 **Milestone:** 0051 — Planner expression-level improvements
 **Supersedes:** —
 
@@ -24,7 +24,72 @@ When the analyzer can't find an exact-match operator for `(L, R)`, it
 walks each side along the lattice until they agree, picking the
 "shorter total walk".
 
-## Plan
+## Implementation (landed 2026-05-05)
+
+### New file: `internal/analyzer/coerce.go`
+
+Three exported helpers:
+
+1. **`NumericCoercePrecedence(typeName string) int`** — maps a type name to its
+   position on the numeric coercion lattice (`int2=0, int4=1, int8=2, numeric=3,
+   float4=4, float8=5`). Returns -1 for non-numeric types. Type aliases
+   (`integer`, `smallint`, `bigint`, `decimal`, `real`, `double precision`) are
+   mapped to their canonical positions.
+
+2. **`PromoteNumericType(l, r catalog.Type) catalog.Type`** — returns the wider
+   of two numeric types. `unknown`-typed literals yield to the concrete side.
+   Returns empty Type when either side is non-numeric (caller handles the error).
+
+3. **`PromoteStringType(l, r catalog.Type) catalog.Type`** — returns `text` for
+   mixed string-family types (`text ↔ varchar ↔ char ↔ bpchar`), with
+   unknown-type yielding to the concrete side.
+
+4. **`PromoteTimestampType(l, r catalog.Type) catalog.Type`** — returns the
+   wider of `date` (0) → `timestamp` (1) → `timestamptz` (2).
+
+### Modified: `internal/analyzer/analyzer.go` — BinaryOp arithmetic branch
+
+For `+`, `-`, `*`, `/`, `%` operators the result type is now computed via
+`PromoteNumericType(leftTyp, rightTyp)` instead of blindly returning `leftTyp`.
+This ensures that:
+
+| Left   | Right   | Result (before) | Result (after) |
+|--------|---------|-----------------|----------------|
+| int8   | numeric | int8 ✗          | numeric ✓      |
+| int4   | int8    | int4 ✗          | int8 ✓         |
+| numeric| float8  | numeric ✗       | float8 ✓       |
+| unknown| numeric | unknown         | numeric ✓      |
+
+For `||` (string concat): now uses `PromoteStringType` to return the correct
+wider string type (`text`) for mixed `text`/`varchar`/`char` operands.
+
+### Key design decision: no CastExpr wrapping
+
+The design doc plan called for wrapping operands with `CastExpr`. This was not
+implemented because:
+1. CastExpr is a no-op in the planner v0 (passes through the inner expression).
+2. The executor's `promoteCrossKind` already handles runtime mixed-numeric
+   evaluation correctly.
+3. The gap was purely in the **reported result type** from the analyzer, not
+   in runtime semantics. Fixing `PromoteNumericType` in the result type path
+   closes the gap without touching the planner or executor.
+
+### Tests: `internal/analyzer/coerce_test.go` (9 new tests)
+
+- `TestNumericCoercePrecedence`: lattice ordering + all type aliases.
+- `TestPromoteNumericTypeMatrix`: DoD matrix — all 6×6 pairs of numeric types
+  return the wider type.
+- `TestPromoteNumericTypeUnknown`: unknown/untyped operands yield to concrete.
+- `TestPromoteStringType`: text/varchar/char all promote to text.
+- `TestBinaryOpArithmeticResultTypes`: spot-checks that `SELECT 1 + 1.5` etc.
+  parse and analyze without error.
+- `TestBinaryOpCrossNumericComparisons`: all 6×6 pairs × 6 comparison operators.
+- `TestBinaryOpCrossNumericArithmetic`: all 4×4 integer/numeric pairs × 4
+  arithmetic operators.
+- `TestInvalidCrossTypesStillError`: `text + int` and `int = text` still error.
+- `TestStringConcatMixedTypes`: text/varchar/char concat combinations all pass.
+
+### Original Plan
 
 1. New helper `internal/analyzer/coerce.go::FindCommonType(L, R) (T,
    error)`. Uses the upstream-shaped lattice table.

@@ -798,7 +798,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
-			if leftTyp.Name != "unknown" {
+			// Return the wider type per the coercion lattice
+			// (int2→int4→int8→numeric→float4→float8), so that
+			// `int8 + numeric` correctly reports numeric, not int8.
+			if promoted := PromoteNumericType(leftTyp, rightTyp); promoted.Name != "" {
+				return promoted, nil
+			}
+			if !isUnknownType(leftTyp) {
 				return leftTyp, nil
 			}
 			return rightTyp, nil
@@ -806,7 +812,8 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator || requires string operands")
 			}
-			return catalog.Type{Name: "text"}, nil
+			// Mixed string types (text || varchar, etc.) promote to text.
+			return PromoteStringType(leftTyp, rightTyp), nil
 		case "LIKE", "NOT LIKE":
 			// Both operands must be string-like (text/varchar/char/
 			// bpchar/unknown). Pattern can be a literal or column.
