@@ -1,6 +1,6 @@
 # 0045-0003 — Checkpoint Marker Discovery (No `pg_control`)
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0045
 **Date:** 2026-05-04
 

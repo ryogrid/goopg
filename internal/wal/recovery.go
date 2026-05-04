@@ -830,3 +830,42 @@ func replayLimit(records []Record) (int, uint64) {
 	}
 	return lastCheckpointIdx + 1, checkpointLSN
 }
+
+// DiscoverLastCheckpointLSN scans the WAL directory for the most
+// recent checkpoint record and returns its EndLSN. This is needed
+// for M0045-0002's startup replay: begin replay from the last
+// checkpoint so post-checkpoint dirty pages are recovered without
+// re-reading the entire WAL history.
+//
+// Because WAL retention removes pre-checkpoint segments, the scan
+// must tolerate a non-zero first segment (M0045-0001). ReadAll already
+// starts from the first retained segment after the readStream fix.
+//
+// Returns (0, nil) for a fresh cluster (no WAL segments present).
+// Returns an error if WAL segments exist but no checkpoint is found —
+// this indicates an unrecoverable cluster state that requires
+// re-initialization.
+func DiscoverLastCheckpointLSN(walDir string, segmentSize int64) (uint64, error) {
+	if segmentSize <= 0 {
+		segmentSize = DefaultSegmentSize
+	}
+	records, err := ReadAll(walDir, segmentSize)
+	if err != nil {
+		return 0, fmt.Errorf("wal: discover checkpoint: %w", err)
+	}
+	if len(records) == 0 {
+		return 0, nil // fresh cluster or empty WAL directory
+	}
+	// Scan for the LAST checkpoint record in the retained range.
+	var lastLSN uint64
+	for _, r := range records {
+		if len(r.Payload) > 0 && r.Payload[0] == RecordKindCheckpoint {
+			lastLSN = r.EndLSN
+		}
+	}
+	if lastLSN == 0 {
+		return 0, fmt.Errorf("wal: no checkpoint record found in %s; "+
+			"the cluster may need to be re-initialized with 'goopg init'", walDir)
+	}
+	return lastLSN, nil
+}

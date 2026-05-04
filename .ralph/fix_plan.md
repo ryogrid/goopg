@@ -1184,8 +1184,8 @@ composite-key bytewise comparison stays correct.
         l_shipdate/l_commitdate/l_receiptdate (timestamp × 4).
   - [x] `TestTPCHResultParity` identical=22 divergent=0 errored=0 — PASS.
   - [ ] Wall-time gate (Q3/Q6/Q14/Q15/Q19 ≥30% improvement vs run-007)
-        requires actual HammerDB run-008 against SF=1 data — pending
-        manual execution. NOTE: equality (=) index scans are active now;
+        requires actual HammerDB run-008 against SF=1 data
+        NOTE: equality (=) index scans are active now;
         range-predicate scans (BETWEEN/</>) need a follow-up planner
         change to activate date-range Q1/Q6/Q14/Q15/Q19 speed-up.
   - [x] Milestone M0044 marked accepted for coding completeness
@@ -1252,20 +1252,20 @@ retained WAL backwards.
         records, calls the recovery driver, and asserts
         `ApplyLSN()` matches the last record's end-LSN.
 
-- [ ] M0045-0003: Discover the last-checkpoint LSN without
+- [x] M0045-0003: Discover the last-checkpoint LSN without
       pg_control. Design doc
       `docs/design/0045-0003-checkpoint-marker-discovery.md`.
-  - [ ] New helper
-        `discoverLastCheckpointLSN(walDir, segSize) (uint64, error)`
-        in `internal/wal/recovery.go` (new file). Walks segments
-        in reverse (newest first), uses the existing
-        `internal/wal/iterator.go` machinery to scan for the
-        checkpoint record-type tag.
-  - [ ] If no marker is found in any retained segment, return a
-        diagnostic error pointing the operator to `--reset` —
-        do NOT silently start with `lastCkptLSN = 0`.
-  - [ ] Unit tests for "marker in newest segment", "marker in an
-        older segment", "no marker anywhere".
+      (landed 2026-05-04: `DiscoverLastCheckpointLSN` in recovery.go
+      + fix `readStream`/`ReadAll` to start from first retained segment
+      + apply `baseOffset = firstSegNo*segSize` to returned LSNs.
+      5 unit tests in discover_checkpoint_test.go. Full
+      `go test ./internal/wal/` green.)
+  - [x] `DiscoverLastCheckpointLSN(walDir, segSize)` in recovery.go
+  - [x] `ReadAll` / `readStreamFrom` / `firstAvailableSegment` fixes
+        for retained WAL (no longer requires segment 0)
+  - [x] `baseOffset` applied to LSNs for absolute positions
+  - [x] No-checkpoint error diagnostic
+  - [x] 5 unit tests covering all cases
 
 - [ ] M0045-0004: Integration test —
       `restart_after_retention_test.go`. Design doc
