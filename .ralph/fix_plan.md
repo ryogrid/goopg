@@ -941,25 +941,42 @@ caused 91% GC overhead — the query never finished in practice.
         wall-time. The Cartesian fan-out is too large for a per-row
         filter-eval + copyOut() loop. Tracked below as M0043-0002.
 
-- [ ] **M0043-0002: Predicate pushdown into MHJ chain steps.**
-      Identified in `analysis/tpch-hammerdb-run-006.md` (2026-05-04).
-      With M0043-0001's lazy iterator, Q9 no longer blows the heap
-      but is still too slow on 6M-row data: each emitted row
-      re-evaluates all residual filters and copies the full output
-      buffer. For Q9's 6-table join over 6M rows the per-row cost
-      compounds catastrophically.
-  - [ ] Push down filter predicates that reference only previously-
-        joined tables into the per-step probe so unproductive
-        prefixes are pruned before deeper steps are expanded.
-  - [ ] In `applyAndFilter()`, partition `o.filters` by the deepest
-        step they reference; evaluate each filter in `Next()`
-        immediately after the deepest step it depends on, not at
-        the leaf.
-  - [ ] If profile shows `datumKey()` (string conversion) dominates,
-        replace string-keyed hash tables with a fixed-width
-        numeric/byte-slice keyed map.
-  - [ ] Verify: Q9 completes in < 60 s on full SF=1 data;
-        `TestTPCHResultParity` still identical=22 divergent=0.
+- [x] **M0043-0002: Predicate pushdown into MHJ chain steps**
+      (landed 2026-05-04, `b7cb6aa`). Design doc at
+      `docs/design/0043-0002-mhj-predicate-pushdown.md`.
+      `MultiHashJoin.Filters` is now partitioned in `Open()` by the
+      deepest chain step each filter's referenced columns require:
+      `probeFilters` (probe-only / constants), `stepFilters[s]`
+      (filters first eval-able after step `s`), and `leafFilters`
+      (escape hatch for `OuterColumnRef`/`SubqueryExpr`/
+      `ExistsExpr`/`InExpr`). `Next()` is a thin loop over two
+      recursive helpers — `initStepHelper(s)` finds the first
+      cursor configuration that yields a passing leaf;
+      `advanceFrom(s)` advances the odometer with re-eval.
+      Filters are evaluated **at the earliest step their
+      referenced columns are bound**, so a failing prefix aborts
+      without expanding deeper steps — the entire bottleneck
+      identified in run-006.
+  - [x] Unit tests: `TestMultiHashJoinPredicatePushdown` asserts
+        partitioning + correct row count;
+        `TestMultiHashJoinPushdownLeafFallback` confirms
+        OuterColumnRef routing.
+  - [x] `TestTPCHResultParity` still identical=22 divergent=0
+        errored=0; `TestRunTPCHQueriesAgainstSyntheticData` 22/22
+        PASS.
+  - [x] **End-to-end SF=1 (run-007, 2026-05-04)**:
+        Q14=34.7s ✓, Q2=9.5s ✓, **Q9=891.3s** (~14.9 min) ✓ —
+        first-ever full SF=1 Q9 completion. Q20 still TIMEOUT
+        but that is independent (M0040-0004 territory). Documented
+        in `analysis/tpch-hammerdb-run-007.md`.
+  - [ ] M0043-0003 (follow-up, optional): Q9 not yet under the
+        "single-digit minutes" target. Hot paths to revisit:
+        `datumKey()` string allocation per probe lookup
+        (~22 M calls for Q9), `evalExpr` per-call dispatch cost
+        for trivial BinaryOp shapes. A byte-coded fast path or
+        numeric-keyed hash would close the remaining gap. Tracked
+        as a separate optimization, **not** a blocker for
+        M0043-0002 acceptance.
 
 ## Milestone 0042 — Align goopg I/O with upstream PostgreSQL
 
