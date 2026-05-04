@@ -543,6 +543,11 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// Advance pd_prune_xid so opportunistic pruning knows when
+	// this page first became prunable (M0046-0002).
+	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(xmax))
+	}
 	return nil
 }
 
@@ -654,7 +659,52 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
 	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead
+	// once xmax is committed and xmax < OldestXmin.
+	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(xmax))
+	}
 	return nil
+}
+
+// PageGetItemID returns the raw ItemID for a 1-based line pointer slot.
+// Used by opportunistic pruning and HOT chain following to inspect line
+// pointer flags without attempting to decode a full heap tuple.
+func PageGetItemID(p Page, slot uint16) (ItemID, error) {
+	if slot == 0 {
+		return ItemID{}, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return ItemID{}, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ItemID{}, ErrInvalidSlot
+	}
+	return readItemID(p, idx)
+}
+
+// PageSetItemIDRedirect converts the line pointer at 1-based slot into an
+// ItemIDRedirect pointing to targetSlot. Used by opportunistic pruning when a
+// dead HOT-chain root is freed: the line pointer is kept (so the index entry
+// remains valid) but redirected to the live chain tip.
+//
+// The Offset field of the resulting ItemID carries the 1-based target slot;
+// Length is set to zero (the tuple data will be freed by the compaction pass).
+func PageSetItemIDRedirect(p Page, slot uint16, targetSlot uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	return writeItemID(p, idx, ItemID{Offset: targetSlot, Flags: ItemIDRedirect, Length: 0})
 }
 
 // PageGetItemRaw returns the raw item bytes at the 1-based slot. The

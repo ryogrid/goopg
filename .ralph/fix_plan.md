@@ -1419,13 +1419,21 @@ sub-tasks decompose around independent design docs.
       index-scan chain following, indexed-col fallback, depth-2 chain, unit test
       for followHOTChain. All `go test ./...` pass (hammerdb_load benchmark
       timeout is pre-existing, not caused by this change).)
-- [ ] M0046-0002: Opportunistic page pruning. Design doc
-      `docs/design/0046-0002-page-pruning.md`. New
-      `internal/access/heap/prune.go` with `PagePruneOpt` and
-      `pagePrune`; wire into the buffer-pin path under
-      `enable_opportunistic_prune` (default on); WAL
-      `XLOG_HEAP2_PRUNE`. DoD: tight UPDATE loop in a single
-      transaction does not grow the page beyond steady-state.
+- [x] M0046-0002: Opportunistic page pruning. Design doc
+      `docs/design/0046-0002-page-pruning.md`. (landed 2026-05-05:
+      `pd_prune_xid` updated by `PageSetHeapTupleXmax` +
+      `PageStampHotOldTuple`. `PagePruneOpt` in `storage/prune.go`:
+      reclaims dead tuples (xmax < OldestXmin) inline — HOT chain roots →
+      `ItemIDRedirect`, HOT-only/standalone → `ItemIDUnused`. `PruneResult`
+      carries redirect pairs + unused slots for WAL. `PageSetItemIDRedirect` +
+      `PageGetItemID` helpers in heap.go. `followHOTChain` follows redirects
+      transparently. `tryApplyHOTUpdate` prune-and-retry when
+      `ErrNoSpaceInPage` and `EnableOpportunisticPrune`. `RecordKindHeapPruneOpt=14`
+      WAL (Encode/Decode/Replay). `LogHeapPruneOptFunc` pool hook; wired in
+      initdb/open.go. GUC `enable_opportunistic_prune` (default on).
+      `ctx.EnableOpportunisticPrune` wired from dispatch. 8 tests.
+      `go test ./internal/storage/ ./internal/wal/ ./internal/initdb/
+      ./internal/executor/` all green.)
 - [ ] M0046-0003: Free Space Map fork. Design doc
       `docs/design/0046-0003-free-space-map.md`. New `_fsm` fork,
       tree-of-pages summarisation, `GetPageWithFreeSpace` /

@@ -91,6 +91,14 @@ const (
 	// Format: "kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
 	//          oldSlot(2) | xmax(4) | newTupleBytes(var)" = 20 bytes fixed.
 	RecordKindHeapHotUpdate byte = 13
+	// RecordKindHeapPruneOpt is a logical opportunistic-pruning record
+	// (M0046-0002). Mirrors PostgreSQL's XLOG_HEAP2_PRUNE. Emitted when
+	// the HOT-update path reclaims dead tuple slots inline (without a
+	// full VACUUM pass). Same format as RecordKindHeapVacuum so the
+	// replay path is identical. Format:
+	// "kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
+	//  count(2) | slots[count](2 each)" = 16 + 2*count bytes.
+	RecordKindHeapPruneOpt byte = 14
 	// RecordKindSmgrCreate logs the first extension of a relation file
 	// (mirrors upstream's XLOG_SMGR_CREATE in
 	// postgres/src/include/catalog/storage_xlog.h). Emitted by the buffer
@@ -346,6 +354,80 @@ func DecodeHeapHotUpdate(payload []byte) (rel storage.RelFileNode, blk storage.B
 	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
 	tupleBytes = make([]byte, len(payload)-heapHotUpdateHeaderSize)
 	copy(tupleBytes, payload[heapHotUpdateHeaderSize:])
+	return
+}
+
+// heapPruneOptHdrSize: kind(1) + rel(9) + blk(4) + nRedirects(2) + nUnused(2) = 18.
+const heapPruneOptHdrSize = 18
+
+// EncodeHeapPruneOpt encodes one opportunistic page-pruning redo record
+// (M0046-0002, mirrors PostgreSQL's XLOG_HEAP2_PRUNE). Carries two lists:
+//   - redirects: (oldSlot, newSlot) pairs for HOT chain root slots that were
+//     converted to ItemIDRedirect so the index entry stays valid.
+//   - unused: slot numbers marked ItemIDUnused (HOT-only and standalone dead).
+//
+// Format:
+//   kind(1) | rel(9) | blk(4) | nRedirects(2) | nUnused(2) |
+//   redirects[nRedirects*4] | unusedSlots[nUnused*2]
+func EncodeHeapPruneOpt(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) []byte {
+	sz := heapPruneOptHdrSize + 4*len(redirects) + 2*len(unused)
+	out := make([]byte, sz)
+	out[0] = RecordKindHeapPruneOpt
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], uint16(len(redirects)))
+	binary.LittleEndian.PutUint16(out[16:18], uint16(len(unused)))
+	off := heapPruneOptHdrSize
+	for _, r := range redirects {
+		binary.LittleEndian.PutUint16(out[off:off+2], r[0])
+		binary.LittleEndian.PutUint16(out[off+2:off+4], r[1])
+		off += 4
+	}
+	for _, s := range unused {
+		binary.LittleEndian.PutUint16(out[off:off+2], s)
+		off += 2
+	}
+	return out
+}
+
+// DecodeHeapPruneOpt returns the rel + block + redirect pairs + unused slots
+// carried by a HeapPruneOpt record payload.
+func DecodeHeapPruneOpt(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16, err error) {
+	if len(payload) < heapPruneOptHdrSize {
+		err = fmt.Errorf("wal: invalid heap-prune-opt payload len %d (want >= %d)", len(payload), heapPruneOptHdrSize)
+		return
+	}
+	if payload[0] != RecordKindHeapPruneOpt {
+		err = fmt.Errorf("wal: record kind %d is not heap-prune-opt", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	nRedirects := int(binary.LittleEndian.Uint16(payload[14:16]))
+	nUnused := int(binary.LittleEndian.Uint16(payload[16:18]))
+	want := heapPruneOptHdrSize + 4*nRedirects + 2*nUnused
+	if len(payload) != want {
+		err = fmt.Errorf("wal: heap-prune-opt payload len %d want %d (nRedirects=%d nUnused=%d)", len(payload), want, nRedirects, nUnused)
+		return
+	}
+	off := heapPruneOptHdrSize
+	redirects = make([][2]uint16, nRedirects)
+	for i := range redirects {
+		redirects[i][0] = binary.LittleEndian.Uint16(payload[off : off+2])
+		redirects[i][1] = binary.LittleEndian.Uint16(payload[off+2 : off+4])
+		off += 4
+	}
+	unused = make([]uint16, nUnused)
+	for i := range unused {
+		unused[i] = binary.LittleEndian.Uint16(payload[off : off+2])
+		off += 2
+	}
 	return
 }
 
@@ -664,6 +746,11 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	case RecordKindHeapPruneOpt:
+		if err := replayHeapPruneOpt(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
 	case RecordKindSmgrCreate:
 		if err := replaySmgrCreate(mgr, r.Payload); err != nil {
 			return false, err
@@ -948,6 +1035,46 @@ func replayHeapHotUpdate(mgr *storage.Manager, r Record) error {
 	if err := storage.PageStampHotOldTuple(page, oldSlot, xmax, blk, newSlot); err != nil {
 		return fmt.Errorf("wal: heap-hot-update stamp old tuple: %w", err)
 	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
+}
+
+// replayHeapPruneOpt applies one opportunistic page-pruning record
+// (M0046-0002). Applies redirect pairs (ItemIDRedirect) then marks unused
+// slots via VacuumHeapPageBySlots. Idempotent via pd_lsn.
+func replayHeapPruneOpt(mgr *storage.Manager, r Record) error {
+	rel, blk, redirects, unused, err := DecodeHeapPruneOpt(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-prune-opt replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-prune-opt replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	// Apply redirect line pointer conversions first.
+	for _, redir := range redirects {
+		if err := storage.PageSetItemIDRedirect(page, redir[0], redir[1]); err != nil {
+			return fmt.Errorf("wal: heap-prune-opt redirect slot=%d→%d: %w", redir[0], redir[1], err)
+		}
+	}
+	// Compact the page: mark unused slots and repack live tuples.
+	if _, err := storage.VacuumHeapPageBySlots(page, unused); err != nil {
+		return fmt.Errorf("wal: heap-prune-opt vacuum: %w", err)
+	}
+	storage.MustHeader(page).SetPruneXID(0)
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(rel, blk, page)
 }

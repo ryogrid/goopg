@@ -375,6 +375,25 @@ func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
 	return true
 }
 
+// markHeapPruneOptDirty emits a logical opportunistic-pruning WAL record
+// (RecordKindHeapPruneOpt, M0046-0002) and marks the page dirty. Falls
+// back to a conservative MarkDirty (full FPI) when no WAL hook is wired.
+// The caller must hold the page's exclusive content lock.
+func markHeapPruneOptDirty(
+	pool *storage.Pool, slot *storage.Slot,
+	rel storage.RelFileNode, blk storage.BlockNumber,
+	result storage.PruneResult,
+) error {
+	logPrune := pool.LogHeapPruneOpt()
+	if logPrune == nil {
+		pool.MarkDirty(slot)
+		return nil
+	}
+	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+		return logPrune(rel, blk, result.Redirects, result.Unused)
+	})
+}
+
 // markHeapHotUpdateDirty is the WAL-logging counterpart of
 // markHeapInsertDirty / markHeapDeleteDirty for the HOT path: it
 // emits one atomic HeapHotUpdate record covering both the old-tuple
@@ -433,11 +452,25 @@ func tryApplyHOTUpdate(
 	s.Lock()
 
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
+	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
+		// Page full: attempt opportunistic pruning before giving up on HOT.
+		if ctx.EnableOpportunisticPrune && ctx.TxnMgr != nil {
+			oldestXmin := ctx.TxnMgr.OldestXmin()
+			result, pruneErr := storage.PagePruneOpt(s.Page(), oldestXmin)
+			if pruneErr == nil && (len(result.Redirects)+len(result.Unused)) > 0 {
+				// Emit WAL for the prune BEFORE the HOT-insert WAL so replay
+				// restores space first.
+				if pderr := markHeapPruneOptDirty(ctx.Pool, s, rel, blk, result); pderr == nil {
+					newSlot, addErr = storage.PageAddHeapTuple(s.Page(), tup)
+				}
+			}
+		}
+	}
 	if addErr != nil {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if errors.Is(addErr, storage.ErrNoSpaceInPage) {
-			return false, nil // no space — caller falls back to normal path
+			return false, nil // caller falls back to normal path
 		}
 		return false, addErr
 	}

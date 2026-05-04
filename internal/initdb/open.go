@@ -307,6 +307,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Opportunistic page-pruning change record (M0046-0002). Carries
+	// the freed slot list so replay can deterministically reclaim the
+	// same dead slots without re-running the isDead predicate.
+	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) (storage.LSN, error) {
+		payload := wal.EncodeHeapPruneOpt(rel, blk, redirects, unused)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Atomic HOT-update change record (M0046-0001). Encodes the
 	// old-slot xmax stamp + new tuple bytes on the same page in one
 	// record so replay can reconstruct the HOT chain atomically.
@@ -339,6 +351,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapVacuum:    logHeapVacuum,
 		LogHeapLock:      logHeapLock,
 		LogHeapHotUpdate: logHeapHotUpdate,
+		LogHeapPruneOpt:  logHeapPruneOpt,
 		LogSmgrCreate:    logSmgrCreate,
 		FullPageWrites: true,
 	})

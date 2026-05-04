@@ -118,6 +118,11 @@ type Context struct {
 	// spill-to-disk. Zero means unlimited (no spill). Defaults to
 	// 512 MiB when the GUC is active. See milestone 0037.
 	WorkMem int64
+
+	// EnableOpportunisticPrune mirrors the enable_opportunistic_prune
+	// GUC (M0046-0002). When true, the HOT-update path calls
+	// PagePruneOpt before falling back to a relation extension.
+	EnableOpportunisticPrune bool
 }
 
 // acquireRelLock funnels every operator's relation-level lock

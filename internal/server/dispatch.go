@@ -89,6 +89,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	ctx.Checkpointer = s.cfg.Checkpointer
 	ctx.StatsTarget = sessionStatsTarget(sess)
 	ctx.WorkMem = sessionWorkMem(sess)
+	ctx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
 	ctx.PubSub = s.cfg.PubSub
 	ctx.LockMgr = s.cfg.LockMgr
 	ctx.BackendID = backendID
@@ -152,6 +153,20 @@ func sessionStatsTarget(sess *config.SessionRegistry) int {
 // sessionWorkMem reads the effective `work_mem` GUC from the session
 // registry and returns it as bytes. Returns 0 (unlimited) when sess
 // is nil or the value can't be parsed.
+// sessionOpportunisticPrune reads the enable_opportunistic_prune GUC
+// (M0046-0002). Returns true (enabled) when sess is nil or the GUC value
+// can't be parsed, matching the BootVal "on" default.
+func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
+	if sess == nil {
+		return true // default on
+	}
+	_, eff, ok := sess.Get("enable_opportunistic_prune")
+	if !ok {
+		return true // GUC not registered yet, default on
+	}
+	return strings.EqualFold(strings.TrimSpace(eff), "on")
+}
+
 func sessionWorkMem(sess *config.SessionRegistry) int64 {
 	if sess == nil {
 		return 0

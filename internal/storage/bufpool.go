@@ -107,6 +107,9 @@ type Pool struct {
 	// same page in one record. nil disables the optimisation and
 	// the executor falls back to separate delete+insert FPIs.
 	logHeapHotUpdate LogHeapHotUpdateFunc
+	// logHeapPruneOpt emits an opportunistic page-pruning WAL record
+	// (M0046-0002). nil disables the optimisation (FPI fallback).
+	logHeapPruneOpt LogHeapPruneOptFunc
 	// logSmgrCreate emits a relation-file creation WAL record
 	// (RecordKindSmgrCreate) when Pool.PinNew creates block 0 of
 	// a new relation. Set via PoolConfig.LogSmgrCreate.
@@ -224,6 +227,11 @@ type PoolConfig struct {
 	// the same page) instead of separate delete+insert FPIs.
 	LogHeapHotUpdate LogHeapHotUpdateFunc
 
+	// LogHeapPruneOpt, when non-nil, is exposed via
+	// Pool.LogHeapPruneOpt so the opportunistic pruning path can
+	// emit a logical prune record instead of a full FPI.
+	LogHeapPruneOpt LogHeapPruneOptFunc
+
 	// LogSmgrCreate, when non-nil, is called by PinNew when it
 	// creates block 0 of a relation (the first Extend). The hook
 	// should emit a RecordKindSmgrCreate WAL record so crash
@@ -292,6 +300,13 @@ type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16
 // slot. See docs/design/0046-0001-hot-updates.md.
 type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
 
+// LogHeapPruneOptFunc emits one opportunistic page-pruning redo record
+// (M0046-0002, RecordKindHeapPruneOpt). Carries redirect pairs (for HOT
+// chain roots converted to ItemIDRedirect) and unused slot numbers (for
+// HOT-only and standalone dead tuples). Replay applies both operations to
+// bring the page back to the pruned state.
+type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, unused []uint16) (LSN, error)
+
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by a
 // Go-heap arena. Returns an error if slots <= 0 or the arena alloc
 // fails.
@@ -321,6 +336,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapLock:      cfg.LogHeapLock,
 		logHeapVacuum:    cfg.LogHeapVacuum,
 		logHeapHotUpdate: cfg.LogHeapHotUpdate,
+		logHeapPruneOpt:  cfg.LogHeapPruneOpt,
 		logSmgrCreate:    cfg.LogSmgrCreate,
 		logger:         logger,
 	}
@@ -372,6 +388,10 @@ func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
 // hook (M0046-0001), or nil if none was wired. Callers fall back to
 // per-page FPI via MarkDirty when nil.
 func (p *Pool) LogHeapHotUpdate() LogHeapHotUpdateFunc { return p.logHeapHotUpdate }
+
+// LogHeapPruneOpt returns the configured opportunistic-pruning
+// change-record hook (M0046-0002), or nil if none was wired.
+func (p *Pool) LogHeapPruneOpt() LogHeapPruneOptFunc { return p.logHeapPruneOpt }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 // Mirrors upstream's full_page_writes SIGHUP-context GUC.

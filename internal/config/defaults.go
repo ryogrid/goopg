@@ -342,6 +342,15 @@ func BuildDefaultRegistry() *Registry {
 		Scope: ScopeSession | ScopeTransaction,
 	}))
 
+	// Opportunistic page pruning (M0046-0002). When on, the HOT-update
+	// path tries to reclaim universally-dead tuples inline when a page
+	// is full, avoiding an unnecessary relation extension.
+	r.MustRegister(NewVariable(Variable{
+		Name: "enable_opportunistic_prune", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
 	// Planner toggle GUCs. Upstream uses them for testing (`SET
 	// enable_seqscan = off` to force an index plan). v0's planner
 	// ignores them — the rule-based decisions still apply — but

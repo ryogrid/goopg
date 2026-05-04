@@ -17,10 +17,31 @@ import (
 // HOT invariant: all versions in a chain reside on the same page, so no
 // additional I/O is needed. The caller must hold at least a read lock on
 // the page for the duration of this call.
+//
+// ItemIDRedirect line pointers (created by opportunistic pruning when a chain
+// root is freed) are followed transparently — the redirect leads to the live
+// chain tip, skipping the freed slots.
 func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID) (storage.HeapTuple, uint16, bool) {
 	const maxChain = 64
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
+		// Check line-pointer flags before fetching tuple bytes.
+		item, err := storage.PageGetItemID(page, cur)
+		if err != nil {
+			return storage.HeapTuple{}, 0, false
+		}
+		if item.Flags == storage.ItemIDRedirect {
+			// Pruning converted this slot to a redirect. Follow it.
+			next := item.Offset // Offset holds the redirect target slot
+			if next == cur {
+				return storage.HeapTuple{}, 0, false // self-reference guard
+			}
+			cur = next
+			continue
+		}
+		if item.Flags != storage.ItemIDNormal {
+			return storage.HeapTuple{}, 0, false // unused or dead slot
+		}
 		t, err := storage.PageGetHeapTuple(page, cur)
 		if err != nil {
 			return storage.HeapTuple{}, 0, false
