@@ -1,10 +1,12 @@
-// WAL direct-I/O + walsender ring observability view:
-// `pg_stat_wal_io`. One row when a WAL writer is attached,
-// zero rows otherwise. Surfaces M0010-0001's direct-write
-// counters and M0010-0002's in-memory ring metrics in one
-// place so an operator triaging WAL throughput / cache pressure
-// can SELECT one view rather than chasing two log lines and a
-// strace.
+// WAL walsender ring + buffer observability view: `pg_stat_wal_io`.
+// One row when a WAL writer is attached, zero rows otherwise.
+// Surfaces M0010-0002's in-memory ring metrics and M0013-0003's WAL
+// buffer counters in one place so an operator triaging WAL throughput
+// can SELECT one view rather than chasing log lines.
+//
+// O_DIRECT columns (direct_io_active, direct_io_fallback_reason,
+// direct_writes, tail_rmw_writes) were removed as part of M0042-0002
+// (Buffered-I/O migration). The ring and WAL-buffer columns are retained.
 //
 // See docs/design/0010-0003-wal-direct-io-observability-and-operations.md.
 
@@ -19,60 +21,22 @@ import (
 
 // registerStatWALIOView installs `pg_catalog.pg_stat_wal_io`
 // backed by the process-wide *wal.Writer. Emits exactly one row
-// when the writer is non-nil; zero rows otherwise (so a SELECT
-// against the view in a no-WAL test environment doesn't surface
-// a missing-table error).
+// when the writer is non-nil; zero rows otherwise.
 //
 // Columns:
-//   - direct_io_active: "t" / "f" — true when wal_direct_io=on
-//     AND the probe succeeded; effective mode at runtime.
-//   - direct_io_fallback_reason: human-readable reason the probe
-//     fell back, or "" when (a) DirectIO=off, or (b) DirectIO=on
-//     and probe ok.
-//   - direct_writes: lifetime count of writeAtDirectIO regions
-//     that committed via O_DIRECT pwrite. Always 0 in buffered
-//     mode.
-//   - tail_rmw_writes: subset of direct_writes where the user
-//     range wasn't already block-aligned and the writer paid
-//     for a real read-modify-write. tail_rmw_writes /
-//     direct_writes is the alignment-induced read amplification
-//     the operator can compare against the baseline.
-//   - send_buffer_capacity_bytes: the wal_sender_memory_buffer
-//     GUC value. 0 when the ring is disabled.
-//   - send_buffer_bytes_resident: bytes currently in the ring
-//     (≤ capacity). Always 0 when ring is disabled.
-//   - send_buffer_hits / send_buffer_misses: lifetime
-//     RecordIterator.readBytesAt outcomes against the ring.
-//     hits / (hits + misses) is the cache hit-rate the
-//     operator should keep > 95% to make the ring worthwhile.
-//   - wal_buffers_capacity_bytes (M0013-0003): the wal_buffers
-//     GUC value. 0 when the buffer is disabled.
-//   - wal_buffers_bytes_resident (M0013-0003): live byte count
-//     in the in-memory WAL buffer. 0 when disabled.
-//   - wal_buffers_overflow_drain_bytes (M0013-0003): lifetime
-//     bytes drained because Append would have overflowed the
-//     buffer. High values indicate undersized wal_buffers.
-//   - wal_buffers_flush_drain_bytes (M0013-0003): lifetime bytes
-//     drained by FlushUpTo's Stage 1 (commit / eviction /
-//     checkpoint). The "natural" cost of WAL durability through
-//     the buffer; high values are healthy.
-//   - format_version (M0014-0004 step 2 finalisation): the active
-//     on-disk WAL format the writer is emitting — `legacy` for
-//     pre-M0014 8-byte length+CRC32-IEEE frames, `pgcompat` for
-//     the M0014 PG18-compatible format (XLogPageHeader +
-//     XLogRecord with CRC32C and MAXALIGN(8) record padding).
-//     Static for the writer's lifetime; satisfies M0014 DoD #9
-//     "Runtime observability exposes WAL format mode/version" at
-//     the SQL level.
+//   - send_buffer_capacity_bytes: the wal_sender_memory_buffer GUC value.
+//   - send_buffer_bytes_resident: bytes currently in the ring.
+//   - send_buffer_hits / send_buffer_misses: RecordIterator ring outcomes.
+//   - wal_buffers_capacity_bytes (M0013-0003): the wal_buffers GUC value.
+//   - wal_buffers_bytes_resident (M0013-0003): live byte count in buffer.
+//   - wal_buffers_overflow_drain_bytes (M0013-0003): lifetime bytes drained on overflow.
+//   - wal_buffers_flush_drain_bytes (M0013-0003): lifetime bytes drained by FlushUpTo.
+//   - format_version (M0014-0004): active on-disk WAL format (`legacy` / `pgcompat`).
 func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_wal_io",
 		Columns: []catalog.Column{
-			{Name: "direct_io_active", Type: catalog.Type{Name: "text"}},
-			{Name: "direct_io_fallback_reason", Type: catalog.Type{Name: "text"}},
-			{Name: "direct_writes", Type: catalog.Type{Name: "text"}},
-			{Name: "tail_rmw_writes", Type: catalog.Type{Name: "text"}},
 			{Name: "send_buffer_capacity_bytes", Type: catalog.Type{Name: "text"}},
 			{Name: "send_buffer_bytes_resident", Type: catalog.Type{Name: "text"}},
 			{Name: "send_buffer_hits", Type: catalog.Type{Name: "text"}},
@@ -98,15 +62,7 @@ func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 			hits = ring.Hits()
 			misses = ring.Misses()
 		}
-		active := "f"
-		if w.DirectIORequested() && w.DirectIOFallbackReason() == "" {
-			active = "t"
-		}
 		return [][]string{{
-			active,
-			w.DirectIOFallbackReason(),
-			fmt.Sprintf("%d", w.DirectIOWrites()),
-			fmt.Sprintf("%d", w.TailRMWWrites()),
 			fmt.Sprintf("%d", capBytes),
 			fmt.Sprintf("%d", resident),
 			fmt.Sprintf("%d", hits),

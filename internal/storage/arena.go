@@ -7,8 +7,8 @@ import "fmt"
 //
 // Allocation strategy: a single Go-heap allocation over-reserved by
 // one extra page so the start can be trimmed to 4 KiB alignment.
-// This satisfies the Linux O_DIRECT alignment requirement for the
-// data-file I/O path when AlignedIO is enabled.
+// 4 KiB alignment matches the natural alignment of most Linux
+// filesystems and is preferable for efficient page I/O.
 type arena struct {
 	mem []byte // the carved-up memory; length == nslots * BlockSize
 }

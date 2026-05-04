@@ -203,7 +203,6 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
-		walDirectIO := boolGUC(registry, "wal_direct_io", false)
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
 		aioMethod := stringGUC(registry, "io_method", "")
@@ -214,7 +213,6 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			DataDir:               *dataDir,
 			PoolSlots:             poolSlots,
 			WALInitZero:           walInitZero,
-			WALDirectIO:           walDirectIO,
 			WALSenderMemoryBuffer: walSenderMemBuf,
 			WALBuffers:            walBuffers,
 			AIOMethod:             aioMethod,
@@ -251,33 +249,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				"workers", aioWorkers,
 				"max_concurrency", aioMax)
 		}
-		// WAL direct-I/O startup line: surfaces whether the
-		// operator's `wal_direct_io=on` request actually took
-		// effect or fell back to buffered. Three cases:
-		//   - requested=false           → no log line (silent default)
-		//   - requested=true, ok=true   → event=wal_direct_io_active
-		//   - requested=true, ok=false  → event=wal_direct_io_fallback
-		// Mirrors the M0009 `event=aio_engine_attached` /
-		// `event=aio_method_fallback` shape so operators grep one
-		// vocabulary across both subsystems. See
-		// docs/design/0010-0001-wal-direct-io-write-path.md.
-		if rt.WAL != nil && rt.WAL.DirectIORequested() {
-			if reason := rt.WAL.DirectIOFallbackReason(); reason != "" {
-				logger.Warn("wal direct io fallback",
-					"event", "wal_direct_io_fallback",
-					"requested", true,
-					"reason", reason)
-			} else {
-				logger.Info("wal direct io active",
-					"event", "wal_direct_io_active",
-					"requested", true)
-			}
-		}
-		// Walsender in-memory WAL handoff (M0010-0002): when
-		// the ring is configured, log its capacity at startup
-		// so an operator can verify the rollout — particularly
-		// important when wal_direct_io=on, since the ring is
-		// the page-cache replacement for sender-path reads.
+		// Walsender in-memory WAL handoff (M0010-0002): log ring
+		// capacity at startup so an operator can verify the rollout.
 		if rt.WAL != nil && rt.WAL.MemRing() != nil {
 			logger.Info("wal sender memory buffer attached",
 				"event", "wal_sender_memory_buffer_attached",

@@ -72,29 +72,12 @@ type OpenOptions struct {
 	// small value.
 	PoolSlots int
 
-	// AlignedIO forwards through to storage.ManagerConfig.AlignedIO.
-	// Production deployments want O_DIRECT|O_DSYNC; tests typically
-	// leave this false.
-	AlignedIO bool
-
 	// WALInitZero, when true, forwards to wal.Config.Preallocate
 	// so new WAL segments are zero-filled to SegmentSize at
 	// creation time. Mirrors upstream's `wal_init_zero` GUC.
 	// cmd/goopg start sets this from the GUC; tests typically
 	// leave it false.
 	WALInitZero bool
-
-	// WALDirectIO, when true, forwards to wal.Config.DirectIO
-	// so WAL writes go through the O_DIRECT path on Linux
-	// filesystems that honour it (ext4, XFS). Mirrors
-	// upstream's `wal_direct_io` GUC. cmd/goopg start sets
-	// this from the GUC; on filesystems where O_DIRECT is
-	// unsupported (tmpfs, overlayfs) the writer transparently
-	// falls back to buffered writes — Runtime.WAL exposes the
-	// fallback reason via DirectIOFallbackReason() so the
-	// startup logger can surface it. See
-	// docs/design/0010-0001-wal-direct-io-write-path.md.
-	WALDirectIO bool
 
 	// WALSenderMemoryBuffer sizes the in-memory WAL byte ring
 	// the walsender RecordIterator consults before falling
@@ -153,8 +136,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	mgr := storage.NewManager(storage.ManagerConfig{
-		DataDir:   abs,
-		AlignedIO: opts.AlignedIO,
+		DataDir: abs,
 	})
 
 	// Activity registry (M0022): must be created early so WAL writer,
@@ -200,7 +182,6 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WALDir:             filepath.Join(abs, "pg_wal"),
 		SegmentSize:        opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
 		Preallocate:        opts.WALInitZero,
-		DirectIO:           opts.WALDirectIO,
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
 		WALBuffers:         opts.WALBuffers,
 		OnLoopStart: func() {

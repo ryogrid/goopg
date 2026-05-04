@@ -217,7 +217,7 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0042-0001 | [PostgreSQL I/O Subsystem Survey](0042-0001-pg-io-survey.md) | accepted | English reference doc covering upstream PG's WAL writes/durability, page reads/writes/eviction, background writer, checkpointer, WAL buffer ring, dedicated WAL writer process, and per-backend process. Cites `postgres/src/backend/...` exhaustively. Anchor for the M0042 refactor docs. See `docs/milestones/0042-pg-io-alignment.md`. |
 
-| 0042-0002 | [Buffered-I/O Migration](0042-0002-buffered-io-migration.md) | draft | Removes `O_DIRECT` / `O_DSYNC` / page-aligned-RMW paths from `internal/wal/writer.go` and `internal/storage/smgr.go`, retires `wal_direct_io` GUC and `Manager.AlignedIO` toggle, supersedes `0010-0001` and `0010-0003`. Buffered writes + `fdatasync` only. |
+| 0042-0002 | [Buffered-I/O Migration](0042-0002-buffered-io-migration.md) | accepted | Removes `O_DIRECT` / `O_DSYNC` / page-aligned-RMW paths from `internal/wal/writer.go` and `internal/storage/smgr.go`, retires `wal_direct_io` GUC and `Manager.AlignedIO` toggle. Deleted 4 files, removed 5 methods, simplified writeAt dispatch. All tests pass; `git grep O_DIRECT internal/` returns only comments. |
 
 | 0042-0003 | [WAL Buffer + WAL Writer Alignment](0042-0003-wal-buffer-and-writer-alignment.md) | draft | Dedicated `walwriter` goroutine drains the WAL ring on `wal_writer_delay`; client backends synchronous-commit via `XLogFlush` waiting on published `flushedLSN`; insertion-lock array gives N-way parallel `XLogInsert`. Mirrors upstream `walwriter.c` + `WALInsertLock[]` semantics. |
 

@@ -30,12 +30,8 @@ func TestStatWALIOEmptyWithoutWriter(t *testing.T) {
 }
 
 // TestStatWALIORendersWriterCounters: with a real wal.Writer
-// configured for the in-memory ring AND a probed direct-I/O
-// state, the view emits one row whose columns reflect the live
-// counters. Doesn't require the probe to succeed (we accept
-// either active or fallback) — just pins that the column shape
-// is correct and the values move when the underlying state
-// moves.
+// configured for the in-memory ring, the view emits one row whose
+// columns reflect the live counters.
 func TestStatWALIORendersWriterCounters(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
 	w, err := wal.NewWriter(wal.Config{
@@ -58,24 +54,16 @@ func TestStatWALIORendersWriterCounters(t *testing.T) {
 	}
 	row := rows[0]
 
-	// Column order: direct_io_active, direct_io_fallback_reason,
-	// direct_writes, tail_rmw_writes, send_buffer_capacity_bytes,
-	// send_buffer_bytes_resident, send_buffer_hits,
-	// send_buffer_misses.
-	if row[0] != "f" {
-		t.Errorf("direct_io_active=%q, want f (DirectIO not requested)", row[0])
+	// Column order (M0042-0002: O_DIRECT columns removed):
+	// send_buffer_capacity_bytes, send_buffer_bytes_resident,
+	// send_buffer_hits, send_buffer_misses, wal_buffers_capacity_bytes,
+	// wal_buffers_bytes_resident, wal_buffers_overflow_drain_bytes,
+	// wal_buffers_flush_drain_bytes, format_version.
+	if row[0] != "65536" {
+		t.Errorf("send_buffer_capacity_bytes=%q, want 65536", row[0])
 	}
-	if row[1] != "" {
-		t.Errorf("direct_io_fallback_reason=%q, want empty", row[1])
-	}
-	if row[2] != "0" {
-		t.Errorf("direct_writes=%q, want 0", row[2])
-	}
-	if row[4] != "65536" {
-		t.Errorf("send_buffer_capacity_bytes=%q, want 65536", row[4])
-	}
-	if row[5] != "0" {
-		t.Errorf("send_buffer_bytes_resident=%q, want 0 before any append", row[5])
+	if row[1] != "0" {
+		t.Errorf("send_buffer_bytes_resident=%q, want 0 before any append", row[1])
 	}
 
 	// Append a record so the ring fills, then re-render.
@@ -84,66 +72,16 @@ func TestStatWALIORendersWriterCounters(t *testing.T) {
 	}
 	rows = tbl.VirtualRows()
 	row = rows[0]
-	resident, err := strconv.ParseInt(row[5], 10, 64)
+	resident, err := strconv.ParseInt(row[1], 10, 64)
 	if err != nil || resident == 0 {
-		t.Errorf("send_buffer_bytes_resident=%q, want > 0 after Append (err=%v)", row[5], err)
-	}
-}
-
-// TestStatWALIOActiveWhenProbeOk: when DirectIO is requested
-// and the probe succeeds (the dev-host /tmp is ext4), the
-// active column is "t" and the fallback reason is empty.
-// Skips on probe fallback so the test passes under
-// tmpfs / overlayfs / non-Linux.
-func TestStatWALIOActiveWhenProbeOk(t *testing.T) {
-	walDir := filepath.Join(t.TempDir(), "pg_wal")
-	w, err := wal.NewWriter(wal.Config{
-		WALDir:      walDir,
-		SegmentSize: 4096,
-		DirectIO:    true,
-		Preallocate: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer w.Close()
-	if reason := w.DirectIOFallbackReason(); reason != "" {
-		t.Skipf("O_DIRECT unsupported here: %s", reason)
-	}
-	cat := catalog.NewInMemory()
-	if err := registerStatWALIOView(cat, w); err != nil {
-		t.Fatal(err)
-	}
-
-	// Drive a write so direct_writes / tail_rmw_writes bump.
-	if _, _, err := w.Append([]byte("xyz")); err != nil {
-		t.Fatal(err)
-	}
-
-	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_wal_io"})
-	row := tbl.VirtualRows()[0]
-	if row[0] != "t" {
-		t.Errorf("direct_io_active=%q, want t (probe succeeded)", row[0])
-	}
-	if row[1] != "" {
-		t.Errorf("direct_io_fallback_reason=%q, want empty", row[1])
-	}
-	directWrites, _ := strconv.ParseInt(row[2], 10, 64)
-	if directWrites == 0 {
-		t.Errorf("direct_writes=0 after Append, want > 0")
-	}
-	tailRMW, _ := strconv.ParseInt(row[3], 10, 64)
-	if tailRMW == 0 {
-		t.Errorf("tail_rmw_writes=0 after small Append, want > 0 (3-byte payload definitely not block-aligned)")
+		t.Errorf("send_buffer_bytes_resident=%q, want > 0 after Append (err=%v)", row[1], err)
 	}
 }
 
 // TestStatWALIOFormatVersionColumn pins the M0014-0004 step-2
 // finalisation: the trailing format_version column reports
 // `legacy` for the default writer and `pgcompat` when
-// PageHeaders=true. Static for the writer's lifetime — the
-// column position is at the end of the row so callers reading
-// older indexes don't shift.
+// PageHeaders=true.
 func TestStatWALIOFormatVersionColumn(t *testing.T) {
 	t.Run("legacy", func(t *testing.T) {
 		w, err := wal.NewWriter(wal.Config{

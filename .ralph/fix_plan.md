@@ -1116,24 +1116,25 @@ per‑backend process model. Anchor doc:
   - [x] Index against `postgres/src/backend/...` files cited
         inline.
 
-- [ ] M0042-0002: Buffered-I/O migration. Drop O_DIRECT.
+- [x] M0042-0002: Buffered-I/O migration. Drop O_DIRECT.
       Design doc `docs/design/0042-0002-buffered-io-migration.md`.
-  - [ ] Delete `internal/wal/direct_io_linux.go`,
-        `direct_io_other.go`; remove `enableDirectIO`,
-        `writeAtDirectIO`, `directIOActive`, RMW scratch.
-  - [ ] Delete `internal/storage/direct_io_linux.go`
-        (and `_other.go` if present); drop
-        `setDirectIOIfRequested`.
-  - [ ] Drop `Manager.AlignedIO` field and any callers.
-  - [ ] Retire `wal_direct_io` GUC from
-        `internal/config/defaults.go` and any parser refs.
-  - [ ] Update tests that toggled direct-I/O; keep arena page
-        alignment but remove the direct-I/O justification
-        comment.
-  - [ ] Mark `0010-0001`, `0010-0003` as superseded.
-  - [ ] Verification: `git grep O_DIRECT internal/` empty;
-        `TestTPCHResultParity` still identical=22 divergent=0
-        errored=0; `go test ./...` clean.
+      **Landed 2026-05-04**: Deleted direct_io_linux.go,
+      direct_io_other.go, direct_io_test.go (wal) + direct_io_linux.go
+      (storage). Removed DirectIO Config field, directIOActive/Scratch/
+      BlockSize state fields, writeAtDirectIO method, DirectIORequested/
+      FallbackReason/Writes/TailRMWWrites Writer methods, directIOCounters
+      type, directIOScratchCap const. Simplified writeAt to 2-path
+      (AIO|buffered). Removed AlignedIO from ManagerConfig/OpenOptions,
+      wal_direct_io GUC, WALDirectIO cmd option, direct_io* pg_stat_wal_io
+      columns. Updated arena.go comment. All tests pass.
+  - [x] Delete direct_io files (4 files)
+  - [x] Remove enableDirectIO, writeAtDirectIO, directIOActive, RMW scratch
+  - [x] Delete setDirectIOIfRequested; drop Manager.AlignedIO
+  - [x] Retire wal_direct_io GUC
+  - [x] Update tests; keep arena alignment; remove DIO justification comment
+  - [x] Verification: git grep O_DIRECT internal/ → comments only;
+        go test ./internal/wal/ ./internal/storage/ ./internal/initdb/
+        ./internal/executor/ ./internal/planner/ ./internal/config/ PASS
 
 - [ ] M0042-0003: WAL buffer + WAL writer alignment.
       Design doc `docs/design/0042-0003-wal-buffer-and-writer-alignment.md`.

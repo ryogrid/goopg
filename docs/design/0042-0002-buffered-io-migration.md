@@ -1,6 +1,6 @@
 # 0042-0002 — Buffered-I/O migration (drop O_DIRECT)
 
-**Status:** draft
+**Status:** accepted (landed 2026-05-04)
 **Parent milestone:** M0042
 **Depends on:** `0042-0001-pg-io-survey.md`
 **Date:** 2026-05-04

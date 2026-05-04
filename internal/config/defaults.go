@@ -180,27 +180,11 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
-	// wal_direct_io requests Linux O_DIRECT writes for WAL
-	// segments so newly-written WAL bytes don't pollute the OS
-	// page cache. Default `off` keeps the legacy buffered path.
-	// On filesystems / kernels that don't honour O_DIRECT
-	// (tmpfs, overlayfs, every non-Linux GOOS) the writer
-	// transparently falls back to buffered writes and logs
-	// `event=wal_direct_io_fallback` at startup. See
-	// docs/design/0010-0001-wal-direct-io-write-path.md.
-	r.MustRegister(NewVariable(Variable{
-		Name: "wal_direct_io", Type: TypeBool, BootVal: "off",
-		Context: ContextPostmaster,
-		Scope:   ScopeServer,
-	}))
-
 	// wal_sender_memory_buffer sizes (in bytes) the in-memory
 	// ring of recent WAL bytes used by walsender's
 	// RecordIterator. 0 disables the ring; >0 mirrors every
 	// successful WAL write so senders can stream without
-	// disk reads (especially valuable when wal_direct_io=on
-	// keeps recent WAL out of the OS page cache). Default
-	// 16 MiB matches the M0010 milestone default. See
+	// disk reads. Default 16 MiB. See
 	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_memory_buffer", Type: TypeInt, BootVal: "16777216",
