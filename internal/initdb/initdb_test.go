@@ -1,10 +1,14 @@
 package initdb
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // TestInitLaysOutDirectoryStructure pins the directory layout
@@ -89,6 +93,88 @@ func TestInitAcceptsExistingEmptyDir(t *testing.T) {
 func TestInitRejectsEmptyOption(t *testing.T) {
 	if err := Init(Options{}); err == nil {
 		t.Fatal("expected error for empty DataDir")
+	}
+}
+
+// TestInitCreatesSystemCatalogRelfiles verifies that goopg init creates
+// one heap relfile for each of the three core system catalogs under
+// base/<DefaultDBOid>/. Each file must be exactly BlockSize bytes (one
+// initialised empty page), confirming bootstrapSystemCatalogs ran.
+func TestInitCreatesSystemCatalogRelfiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	type entry struct {
+		name string
+		oid  uint32
+	}
+	sysRels := []entry{
+		{"pg_type", catalog.TypeRelationId},
+		{"pg_attribute", catalog.AttributeRelationId},
+		{"pg_class", catalog.RelationRelationId},
+	}
+	for _, rel := range sysRels {
+		path := filepath.Join(dir, "base",
+			fmt.Sprint(catalog.DefaultDBOid),
+			fmt.Sprint(rel.oid))
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("%s (OID %d): expected file %q not found: %v", rel.name, rel.oid, path, err)
+			continue
+		}
+		if st.IsDir() {
+			t.Errorf("%s: path is a directory", rel.name)
+			continue
+		}
+		if want := int64(storage.BlockSize); st.Size() != want {
+			t.Errorf("%s: size=%d want %d (one block)", rel.name, st.Size(), want)
+		}
+	}
+}
+
+// TestSystemCatalogRelfilesAreValidHeapPages checks that the relfiles
+// written by bootstrapSystemCatalogs contain a valid initialised page
+// (not raw zeros) — i.e. InitPage ran successfully.
+func TestSystemCatalogRelfilesAreValidHeapPages(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, oid := range []uint32{
+		catalog.TypeRelationId,
+		catalog.AttributeRelationId,
+		catalog.RelationRelationId,
+	} {
+		path := filepath.Join(dir, "base",
+			fmt.Sprint(catalog.DefaultDBOid),
+			fmt.Sprint(oid))
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("OID %d: read %q: %v", oid, path, err)
+		}
+		if len(raw) != storage.BlockSize {
+			t.Fatalf("OID %d: file size %d want %d", oid, len(raw), storage.BlockSize)
+		}
+		// A properly initialised page must NOT be all-zeros: InitPage
+		// writes a non-zero pd_pagesize_version field.
+		allZero := true
+		for _, b := range raw {
+			if b != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			t.Errorf("OID %d: page is all-zeros (InitPage did not run?)", oid)
+		}
+		// Verify storage.IsNew reports false — an initialised page
+		// has pd_upper set to BlockSize, not 0.
+		if storage.IsNew(storage.Page(raw)) {
+			t.Errorf("OID %d: page reports IsNew=true (header not written?)", oid)
+		}
 	}
 }
 

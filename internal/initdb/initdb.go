@@ -2,10 +2,12 @@
 //
 // Mirrors upstream's initdb at the directory level (base/, global/,
 // pg_wal/, pg_xact/, PG_VERSION) so an operator familiar with
-// PostgreSQL can navigate the tree. v0 doesn't yet bootstrap a
-// system catalog or write a pg_control file — those land alongside
-// the on-disk catalog work in milestone 7+. The design rationale
-// is in docs/design/0017-data-directory.md.
+// PostgreSQL can navigate the tree. System catalog heap files
+// (pg_class, pg_attribute, pg_type) are created as real relfiles
+// during Init so subsequent Open finds the OID-keyed files under
+// base/<DBOid>/. The design rationale is in
+// docs/design/0017-data-directory.md and
+// docs/design/0030-0001-system-catalog-heap-substrate.md.
 //
 // Spec references:
 //
@@ -23,6 +25,7 @@ import (
 	"strconv"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // CatalogVersion is the value written into the data directory's
@@ -105,6 +108,46 @@ func Init(opts Options) error {
 		path := filepath.Join(abs, f.Path)
 		if err := os.WriteFile(path, f.Build(), f.Mode); err != nil {
 			return fmt.Errorf("goopg init: write %q: %w", path, err)
+		}
+	}
+	if err := bootstrapSystemCatalogs(abs); err != nil {
+		return fmt.Errorf("goopg init: system catalogs: %w", err)
+	}
+	return nil
+}
+
+// bootstrapSystemCatalogs creates the three core system catalog heap
+// relfiles (pg_type, pg_attribute, pg_class) under
+// <dataDir>/base/<DefaultDBOid>/. Each file gets one initialised empty
+// page so subsequent Open finds non-zero-length files and the storage
+// manager can determine NBlocks without special-casing.
+//
+// The storage manager is created and closed inline — no buffer pool is
+// needed for a one-shot Extend of a blank page.
+func bootstrapSystemCatalogs(dataDir string) error {
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	page := make([]byte, storage.BlockSize)
+	if err := storage.InitPage(storage.Page(page)); err != nil {
+		return err
+	}
+
+	// Create one relfile per system catalog in OID order so the file
+	// names under base/<DBOid>/ are stable across re-inits.
+	sysRelOIDs := []uint32{
+		catalog.TypeRelationId,      // 1247  base/1/1247
+		catalog.AttributeRelationId, // 1249  base/1/1249
+		catalog.RelationRelationId,  // 1259  base/1/1259
+	}
+	for _, relOID := range sysRelOIDs {
+		rel := storage.RelFileNode{
+			DBOid:  catalog.DefaultDBOid,
+			RelOid: relOID,
+			Fork:   storage.MainFork,
+		}
+		if _, err := mgr.Extend(rel, page); err != nil {
+			return fmt.Errorf("extend system catalog OID %d: %w", relOID, err)
 		}
 	}
 	return nil

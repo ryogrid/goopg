@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | draft                          |
+| Status      | accepted (Phase 1 landed 2026-05-04) |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -73,3 +73,39 @@ Existing virtual views like `pg_tables` and `pg_indexes` will be updated to sour
 ### Manual Verification
 - Run `initdb` and inspect the `base/` directory for the reserved OID files.
 - Use `goopg` to query `pg_class` and verify the output.
+
+## What Landed (Phase 1 — 2026-05-04)
+
+**Scope**: OID constants + `IsSystemRelation` helper + heap file creation at `initdb` time.
+Catalog row codec, startup-load switch, and DDL-sync wiring are deferred to Phase 2 (M0030-0002+).
+
+### `internal/catalog/catalog.go`
+
+- Added `TypeRelationId = 1247`, `AttributeRelationId = 1249`, `RelationRelationId = 1259`
+  matching upstream's `pg_type.h` / `pg_attribute.h` / `pg_class.h`.
+- Added `IsSystemRelation(oid uint32) bool` — returns true when `oid < FirstUserOID`.
+  Used by executor and bootstrap code to gate system-relation behaviour.
+
+### `internal/initdb/initdb.go`
+
+- Added `bootstrapSystemCatalogs(dataDir string) error`:
+  creates one empty heap relfile for each system catalog using `storage.Manager.Extend`.
+  Files land at `base/<DefaultDBOid>/<oid>` (e.g. `base/1/1259` for pg_class).
+  Each file is exactly `BlockSize` bytes (one `InitPage`-initialised blank page).
+- `Init()` now calls `bootstrapSystemCatalogs` after directory/file creation.
+- Added `import "github.com/goopg/goopg/internal/storage"`.
+
+### Tests
+
+- `catalog_test.go`: `TestSystemCatalogOIDConstants`, `TestIsSystemRelation`,
+  `TestSystemRelationOIDsBelowFirstUserOID` — all pass.
+- `initdb_test.go`: `TestInitCreatesSystemCatalogRelfiles` (file existence + size),
+  `TestSystemCatalogRelfilesAreValidHeapPages` (non-zero + `!IsNew`) — all pass.
+
+### Deferred
+
+- Catalog row codec (encode/decode `pg_class`/`pg_attribute`/`pg_type` tuples as heap rows).
+- Row seeding (initial `pg_class` entry for itself, `pg_attribute` column definitions, etc.).
+- Startup-load switch: populate `catalog.InMemory` from heap tables instead of JSON snapshot.
+- DDL-sync wiring: `CREATE TABLE`/`CREATE INDEX` writes rows into the system catalog heap tables.
+- Virtual-view integration: source `pg_tables`, `pg_indexes` from heap-backed tables.

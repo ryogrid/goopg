@@ -186,10 +186,28 @@ type InMemory struct {
 	routines *Routines
 }
 
+// Fixed OIDs for the three core system catalog heap tables.
+// Values match upstream's pg_class.h / pg_attribute.h / pg_type.h
+// so tools that query OID columns by numeric value (e.g. ODBC metadata
+// probes) see the expected numbers.
+const (
+	TypeRelationId      uint32 = 1247 // pg_type
+	AttributeRelationId uint32 = 1249 // pg_attribute
+	RelationRelationId  uint32 = 1259 // pg_class
+)
+
 // FirstUserOID is the first OID handed out for user-created tables.
 // 16384 is upstream's `FirstNormalObjectId` — anything below is
 // reserved for system catalogs.
 const FirstUserOID uint32 = 16384
+
+// IsSystemRelation reports whether oid belongs to the reserved system-
+// catalog OID range (anything below FirstUserOID). Used by the executor
+// and storage bootstrap to gate behaviour that only makes sense for
+// system relations (e.g. skipping WAL for catalog seeding writes).
+func IsSystemRelation(oid uint32) bool {
+	return oid < FirstUserOID
+}
 
 // DefaultDBOid is the v0 default database OID. Real multi-database
 // support (CREATE DATABASE) lives in milestone 7; until then every
