@@ -1952,6 +1952,14 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		// numeric literal on the rhs of `=`. The executor's
 		// encodeBTreeKeyForColumn picks the right encoding from
 		// the column type.
+	case *StringConst:
+		// M0044-0005: varchar/char column indexes — probe key is
+		// a plain string literal; evaluates to KindString at
+		// runtime and routes through EncodeVarchar/EncodeChar.
+	case *TypedStringLit:
+		// M0044-0005: timestamp column indexes — probe key is a
+		// typed literal like `timestamp '1995-01-01'`; evaluates
+		// to KindTime and routes through EncodeTimestamp.
 	default:
 		return nil, false, nil
 	}

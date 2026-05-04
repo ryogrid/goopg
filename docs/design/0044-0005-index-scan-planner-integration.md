@@ -1,6 +1,6 @@
 # 0044-0005 — Index-scan Planner Integration for New Key Types
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0044
 **Date:** 2026-05-04
 

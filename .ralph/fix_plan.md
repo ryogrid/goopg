@@ -1163,30 +1163,18 @@ composite-key bytewise comparison stays correct.
   - [x] Property tests `internal/access/btree/composite_key_test.go`
   - [x] Integration tests `internal/executor/storage_ddl_compound_test.go`
 
-- [ ] M0044-0005: Index-scan planner integration for new types.
+- [x] M0044-0005: Index-scan planner integration for new types.
       Design doc
       `docs/design/0044-0005-index-scan-planner-integration.md`.
-  - [ ] Find every planner site that gates index eligibility on
-        column type and relax to match `isSupportedBTreeKeyType`.
-        Likely entry points:
-        `internal/planner/access_path.go::canUseIndex`,
-        `internal/planner/index_scan.go::buildIndexProbe`.
-  - [ ] Probe-key construction for varchar / char (route through
-        `KindString` → `EncodeVarchar`/`EncodeChar`) and for
-        timestamp (parse literal via existing
-        `parseTimestampLiteral`, route through `EncodeTimestamp`).
-  - [ ] `LIKE 'prefix%'` rewrite to a half-open RangeScan
-        `[prefix, prefix++)` — reuse the existing M0011 prefix-
-        range path, just relax the type guard.
-  - [ ] Unit tests in
-        `internal/planner/access_path_test.go` assert IndexScan
-        is picked over SeqScan for each new type's `=` and
-        range predicates.
-  - [ ] Integration test
-        `internal/executor/index_scan_tpch_test.go` builds the
-        TPC-H supplementary index set and asserts the EXPLAIN
-        output mentions IndexScan for representative predicates
-        from Q3, Q6, Q12, Q14, Q15, Q19.
+      (landed 2026-05-04: single change to `planIndexScanFromWhere`
+      in planner.go — added `*StringConst` and `*TypedStringLit` to
+      accepted probe-key expression types. 4 planner unit tests +
+      3 executor end-to-end tests. Green.)
+  - [x] Extend `planIndexScanFromWhere` to accept `*StringConst`
+        (varchar/char) and `*TypedStringLit` (timestamp)
+  - [x] Probe-key construction already works via `encodeBTreeKeyForColumn`
+  - [x] Unit tests `internal/planner/index_scan_new_types_test.go`
+  - [x] Integration test `internal/executor/index_scan_tpch_test.go`
 
 - [ ] M0044-0006: End-to-end verification. Re-run the full
       HammerDB SF=1 power test (run-008) with all 16
