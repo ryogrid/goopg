@@ -1472,11 +1472,19 @@ sub-tasks decompose around independent design docs.
       xidMaxSafe (= uint32_max − 3M). No TupleVisible change needed: FrozenTransactionID=2
       is always < any snapshot Xmin (≥3). 10 tests: 4 storage + 6 executor.
       DoD confirmed: `TestTupleFreezeDoD` — 1B simulated XIDs + VACUUM → 5 rows visible.)
-- [ ] M0046-0006: TOAST out-of-line storage. Design doc
-      `docs/design/0046-0006-toast.md`. Per-table TOAST relation,
-      varlena 1/4-byte length headers, slice-and-store at
-      `TOAST_TUPLE_THRESHOLD`, lazy detoast in expression evaluator,
-      pglz compression. DoD: 1 MiB `text` round-trip succeeds.
+- [x] M0046-0006: TOAST out-of-line storage. Design doc
+      `docs/design/0046-0006-toast.md`. (landed 2026-05-05:
+      `KindToastPointer` datum (Bytes=12-byte pointer). EncodeRow/DecodeRowInto
+      use flag-byte=2 for TOAST pointers. `ToastLargeColumnsIfNeeded` in
+      writeHeapRowReturning replaces values >2000 bytes with KindToastPointer.
+      `toastStore`: slices value into 1996-byte chunks; encodes as [chunk_id,
+      chunk_seq, chunk_data] rows written to toastRel = mainRel.RelOid +
+      100M. `DetoastValue`: scans toastRel for matching chunk_id, reassembles.
+      `DetoastRow`: resolves KindToastPointer datums back to KindString/KindBytes.
+      `needsDetoast` called in seqScanOp.Next() and indexScanOp.Open() scanFn.
+      No pglz compression (deferred). 6 tests: DoD TestToastRoundTripDoD
+      (1 MiB text round-trip), inline small, 3-chunk, bytea, codec, OID.
+      All go test ./internal/executor/ pass.)
 
 ## Milestone 0047 — B-tree maturation
 

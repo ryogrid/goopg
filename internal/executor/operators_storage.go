@@ -156,6 +156,13 @@ func (o *seqScanOp) Next() (Row, error) {
 			if err != nil {
 				continue
 			}
+			// Detoast any out-of-line column values (M0046-0006).
+			if needsDetoast(row) {
+				row, err = DetoastRow(o.ctx, rel, o.cols, row)
+				if err != nil {
+					continue // skip undetoastable tuple
+				}
+			}
 			return row, nil
 		}
 		o.releasePinned()
@@ -999,6 +1006,14 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 // location.
 func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
 	var ptr storage.ItemPointer
+
+	// TOAST oversized column values before encoding (M0046-0006).
+	var toastErr error
+	row, toastErr = ToastLargeColumnsIfNeeded(ctx, rel, cols, row)
+	if toastErr != nil {
+		return ptr, &ExecError{Code: "XX000", Message: toastErr.Error()}
+	}
+
 	body, err := EncodeRow(cols, row)
 	if err != nil {
 		return ptr, &ExecError{Code: "XX000", Message: err.Error()}

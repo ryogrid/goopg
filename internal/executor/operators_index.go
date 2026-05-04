@@ -148,6 +148,13 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		if err != nil {
 			return false, err
 		}
+		// Detoast any out-of-line column values (M0046-0006).
+		if needsDetoast(row) {
+			row, err = DetoastRow(ctx, heapRel, o.plan.Table.Columns, row)
+			if err != nil {
+				return true, nil // skip undetoastable tuple
+			}
+		}
 		o.rows = append(o.rows, row)
 		// Record the actual live slot (not the index-pointed slot) so
 		// lockRowsOp stamps the current version for SELECT FOR UPDATE.

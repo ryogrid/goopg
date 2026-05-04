@@ -37,6 +37,12 @@ func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
 			out = append(out, 1)
 			continue
 		}
+		// TOAST pointer: flag byte 0x02 followed by 12-byte pointer.
+		if d.Kind == KindToastPointer {
+			out = append(out, 2)
+			out = append(out, d.Bytes...)
+			continue
+		}
 		out = append(out, 0)
 		buf, err := encodeValue(c.Type, d)
 		if err != nil {
@@ -70,6 +76,16 @@ func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
 		off++
 		if flag == 1 {
 			dst[i] = NullDatum
+			continue
+		}
+		// TOAST pointer: 12 bytes following the 0x02 flag byte.
+		if flag == 2 {
+			const toastPtrSize = 12
+			if off+toastPtrSize > len(data) {
+				return fmt.Errorf("DecodeRow: %s: truncated TOAST pointer", c.Name)
+			}
+			dst[i] = Datum{Kind: KindToastPointer, Bytes: append([]byte(nil), data[off:off+toastPtrSize]...)}
+			off += toastPtrSize
 			continue
 		}
 		v, n, err := decodeValue(c.Type, data[off:])

@@ -38,6 +38,14 @@ const (
 	// system milestone. See
 	// docs/design/0003-0012-numeric-arithmetic.md.
 	KindNumeric
+	// KindToastPointer is an unresolved TOAST reference (M0046-0006).
+	// The Bytes field carries the 12-byte on-disk TOAST pointer:
+	// [toast_oid(4)|total_len(4)|num_chunks(4)]. The value must be
+	// detoasted (via DetoastRow) before it is used in expressions.
+	// Scan operators detoast automatically; callers that operate on
+	// raw decoded rows (e.g. UPDATE predicates) receive already-detoasted
+	// datums from the underlying scan.
+	KindToastPointer
 )
 
 // Datum is one column value flowing through the operator tree. v0
