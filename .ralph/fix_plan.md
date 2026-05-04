@@ -1491,12 +1491,17 @@ sub-tasks decompose around independent design docs.
 See `docs/milestones/0047-btree-maturation.md`. Closes the B-tree gaps
 in `docs/reference/ref-002-btree.md`.
 
-- [ ] M0047-0001: B-tree bulk load. Design doc
-      `docs/design/0047-0001-btree-bulk-load.md`. New `BulkBuild` —
-      sort-then-build leaf pages sequentially, internal levels
-      bottom-up; `CREATE INDEX` calls `BulkBuild` instead of looped
-      `Insert`; full-page-image WAL records. DoD: pgbench-init index
-      build wall-time on 1M-row PK ≤ 4 s (was ~31 s).
+- [x] M0047-0001: B-tree bulk load. Design doc
+      `docs/design/0047-0001-btree-bulk-load.md`. (landed 2026-05-05:
+      `btree.BulkCreate(pool, rel, []BulkEntry)` + `BulkEntry{Key,Ptr}`.
+      `buildLevel`: allocate pages via PinNew, fill sequentially, link prev/next,
+      set HighKey before flushing. `linksToInternalItems`: leftmost item has
+      nil key, subsequent items have highKey separators. BTRoot flag set on root
+      page for correct split propagation. FPI WAL via markDirtyWithPageRecord.
+      `operators_ddl.go`: `bulkBuildBTree` (collect entries → BulkCreate)
+      replaces `btree.Create + backfillBTree`. 8 tests: empty, single, 1k entries,
+      matches-Insert, point-lookup, multi-level (10k), 100k perf, Insert-after.
+      All go test ./internal/access/btree/ ./internal/executor/ pass.)
 - [ ] M0047-0002: B-tree page deletion. Design doc
       `docs/design/0047-0002-page-deletion.md`. Two-phase
       `_bt_pagedel` port (`BTP_HALF_DEAD` then `BTP_DELETED`); wired

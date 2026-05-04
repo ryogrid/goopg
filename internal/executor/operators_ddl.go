@@ -501,13 +501,7 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Create(o.ctx.Pool, idxRel)
-	if err != nil {
-		_ = o.ctx.Catalog.DropIndex(idxName)
-		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
-		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
-	}
-	if err := o.backfillBTree(tree, tbl, cols, unique, idxName.String(), pos); err != nil {
+	if err := o.bulkBuildBTree(idxRel, tbl, cols, unique, idxName.String(), pos); err != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
@@ -523,6 +517,79 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		}
 	}
 	return nil
+}
+
+// bulkBuildBTree collects all heap entries into memory, then calls
+// btree.BulkCreate for a sort-then-build pass (M0047-0001). This replaces
+// the old Create+backfillBTree flow and is significantly faster for large
+// tables because it avoids per-key tree traversals and page splits.
+func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
+	entries, err := o.collectBTreeEntries(tbl, cols, unique, indexName, pos)
+	if err != nil {
+		return err
+	}
+	_, err = btree.BulkCreate(o.ctx.Pool, idxRel, entries)
+	if err != nil {
+		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	return nil
+}
+
+// collectBTreeEntries scans the heap, decodes visible tuples, encodes
+// B-tree keys, enforces uniqueness, and returns the entries for bulk build.
+func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) ([]btree.BulkEntry, error) {
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	seen := map[string]struct{}{}
+	var entries []btree.BulkEntry
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
+		page := slot.Page()
+		if storage.IsNew(page) {
+			o.ctx.Pool.Unpin(slot)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			o.ctx.Pool.Unpin(slot)
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
+		for i := uint16(1); i <= uint16(count); i++ {
+			tuple, err := storage.PageGetHeapTuple(page, i)
+			if err != nil {
+				continue
+			}
+			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			row, err := DecodeRow(tbl.Columns, tuple.Data)
+			if err != nil {
+				continue
+			}
+			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
+			if encErr != nil {
+				o.ctx.Pool.Unpin(slot)
+				return nil, encErr
+			}
+			if unique {
+				if _, exists := seen[string(key)]; exists {
+					o.ctx.Pool.Unpin(slot)
+					return nil, &ExecError{Code: "23505", Pos: pos,
+						Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
+				}
+				seen[string(key)] = struct{}{}
+			}
+			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
+		}
+		o.ctx.Pool.Unpin(slot)
+	}
+	return entries, nil
 }
 
 func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
