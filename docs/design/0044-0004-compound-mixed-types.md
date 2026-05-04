@@ -1,6 +1,6 @@
 # 0044-0004 — Compound B-tree Indexes Over Mixed Types
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0044
 **Date:** 2026-05-04
 

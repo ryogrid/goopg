@@ -1154,22 +1154,14 @@ composite-key bytewise comparison stays correct.
   - [x] Unit tests `internal/access/btree/timestamp_key_test.go`
   - [x] Integration test `internal/executor/storage_ddl_timestamp_test.go`
 
-- [ ] M0044-0004: Compound B-tree indexes over mixed types.
+- [x] M0044-0004: Compound B-tree indexes over mixed types.
       Design doc `docs/design/0044-0004-compound-mixed-types.md`.
-  - [ ] Verify (no source change) that
-        `encodeCompositeBTreeKey` produces correctly-ordered
-        composite keys when concatenating any mix of
-        `{int4, int8, numeric, varchar, char, timestamp}` —
-        each encoding is already a prefix code, so the
-        concatenation is automatically a prefix code.
-  - [ ] New randomised property test
-        `internal/access/btree/composite_key_test.go` over the
-        mixed-type matrix.
-  - [ ] Integration test
-        `internal/executor/storage_ddl_compound_test.go` builds
-        the four canonical TPC-H mixed compound indexes
-        (timestamp+numeric, char+numeric, varchar+numeric,
-        timestamp+numeric+numeric) and asserts row-count parity.
+      (landed 2026-05-04: no source changes — verification only.
+      7 btree property tests + 4 executor integration tests.
+      All green. Self-termination proof documented in design doc.)
+  - [x] Verify correctness of encodeCompositeBTreeKey (no source change)
+  - [x] Property tests `internal/access/btree/composite_key_test.go`
+  - [x] Integration tests `internal/executor/storage_ddl_compound_test.go`
 
 - [ ] M0044-0005: Index-scan planner integration for new types.
       Design doc
