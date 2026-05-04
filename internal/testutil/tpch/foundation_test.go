@@ -45,7 +45,7 @@ func TestFoundationSeqScanFilterJoin(t *testing.T) {
 	// --- Create tables ---
 	tables := []string{
 		`CREATE TABLE t1 (id INT8, name TEXT, val NUMERIC)`,
-		`CREATE TABLE t2 (id INT8, desc TEXT)`,
+		`CREATE TABLE t2 (id INT8, descr TEXT)`,
 		`CREATE TABLE t3 (id INT8, qty INT8, price NUMERIC)`,
 	}
 	for _, ddl := range tables {
@@ -113,7 +113,7 @@ func TestFoundationSeqScanFilterJoin(t *testing.T) {
 	}
 
 	// --- Test 5: 2-table INNER JOIN (hash join) ---
-	rows, err = c.Query(ctx, `SELECT t1.name, t2.desc FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id`)
+	rows, err = c.Query(ctx, `SELECT t1.name, t2.descr FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id`)
 	if err != nil {
 		t.Fatalf("JOIN: %v", err)
 	}

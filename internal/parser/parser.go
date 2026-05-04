@@ -173,6 +173,10 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseCommit()
 	case KwRollback, KwAbort:
 		return p.parseRollback()
+	case KwSavepoint:
+		return p.parseSavepoint()
+	case KwRelease:
+		return p.parseReleaseSavepoint()
 	case KwVacuum:
 		return p.parseVacuum()
 	case KwAnalyze, KwAnalyse:
@@ -468,11 +472,53 @@ func (p *parser) parseCommit() (Stmt, error) {
 	return &CommitStmt{pos: t.Pos}, nil
 }
 
-// parseRollback: ROLLBACK [WORK | TRANSACTION] | ABORT [WORK | TRANSACTION]
+// parseRollback: ROLLBACK [WORK | TRANSACTION] | ROLLBACK TO [SAVEPOINT] name | ABORT [WORK | TRANSACTION]
 func (p *parser) parseRollback() (Stmt, error) {
 	t := p.advance()
+	// ROLLBACK TO [SAVEPOINT] name
+	if p.acceptKeyword(KwTo) {
+		_ = p.acceptKeyword(KwSavepoint)
+		name, err := p.parseSavepointName()
+		if err != nil {
+			return nil, err
+		}
+		return &RollbackToSavepointStmt{pos: t.Pos, Name: name}, nil
+	}
 	_ = p.acceptKeyword(KwWork) || p.acceptKeyword(KwTransaction)
 	return &RollbackStmt{pos: t.Pos}, nil
+}
+
+// parseSavepoint: SAVEPOINT name
+func (p *parser) parseSavepoint() (Stmt, error) {
+	t := p.advance() // consume SAVEPOINT
+	name, err := p.parseSavepointName()
+	if err != nil {
+		return nil, err
+	}
+	return &SavepointStmt{pos: t.Pos, Name: name}, nil
+}
+
+// parseReleaseSavepoint: RELEASE [SAVEPOINT] name
+func (p *parser) parseReleaseSavepoint() (Stmt, error) {
+	t := p.advance() // consume RELEASE
+	_ = p.acceptKeyword(KwSavepoint)
+	name, err := p.parseSavepointName()
+	if err != nil {
+		return nil, err
+	}
+	return &ReleaseSavepointStmt{pos: t.Pos, Name: name}, nil
+}
+
+// parseSavepointName reads the savepoint identifier. Accepts both
+// TokenIdent and keyword tokens so names like "my_savepoint" and
+// unreserved-keyword names work without quoting.
+func (p *parser) parseSavepointName() (string, error) {
+	t := p.cur()
+	if t.Kind != TokenIdent && t.Kind != TokenKeyword {
+		return "", p.errAtCur("expected savepoint name")
+	}
+	p.advance()
+	return t.Value, nil
 }
 
 // parseVacuum: VACUUM [VERBOSE] [ANALYZE] [target [, target …]]
@@ -563,12 +609,14 @@ func (p *parser) parseIdent() (Token, error) {
 		p.advance()
 		return t, nil
 	case TokenKeyword:
-		// Allow keyword-as-name in v0 — upstream classifies these as
-		// "unreserved", and the keyword set we recognise overlaps with
-		// table-name candidates (e.g. `analyze`). The analyzer can
-		// reject reserved names later when the catalog distinguishes.
-		p.advance()
-		return t, nil
+		// Accept the keyword as an identifier only when it is not reserved.
+		// Unreserved, col_name, and type_func_name keywords (per upstream's
+		// kwlist.h split) are safe as column names, table names, and aliases.
+		// Reserved keywords (SELECT, FROM, WHERE, AND, …) must be quoted.
+		if IsColNameKeyword(Keyword(t.Value)) {
+			p.advance()
+			return t, nil
+		}
 	}
 	return Token{}, p.errAtCur("expected identifier")
 }
