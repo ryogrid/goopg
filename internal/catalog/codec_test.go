@@ -133,10 +133,80 @@ func TestBuiltinTypeOIDs(t *testing.T) {
 		{"OIDVarChar", OIDVarChar, 1043},
 		{"OIDTimestamp", OIDTimestamp, 1114},
 		{"OIDNumeric", OIDNumeric, 1700},
+		{"OIDBytea", OIDBytea, 17},
+		{"OIDFloat4", OIDFloat4, 700},
+		{"OIDFloat8", OIDFloat8, 701},
+		{"OIDDate", OIDDate, 1082},
+		{"OIDTime", OIDTime, 1083},
+		{"OIDTimestampTZ", OIDTimestampTZ, 1184},
 	}
 	for _, tc := range cases {
 		if tc.oid != tc.want {
 			t.Errorf("%s = %d, want %d", tc.name, tc.oid, tc.want)
 		}
+	}
+}
+
+// TestTypeNameToOIDRoundTrip verifies that TypeNameToOID and OIDToTypeName
+// are inverses for the canonical type names (M0030-0005).
+func TestTypeNameToOIDRoundTrip(t *testing.T) {
+	pairs := []struct{ name string; oid uint32 }{
+		{"bool", OIDBool},
+		{"bytea", OIDBytea},
+		{"int8", OIDInt8},
+		{"int2", OIDInt2},
+		{"int4", OIDInt4},
+		{"text", OIDText},
+		{"oid", OIDOID},
+		{"float4", OIDFloat4},
+		{"float8", OIDFloat8},
+		{"date", OIDDate},
+		{"time", OIDTime},
+		{"timestamp", OIDTimestamp},
+		{"timestamptz", OIDTimestampTZ},
+		{"bpchar", OIDBpChar},
+		{"varchar", OIDVarChar},
+		{"numeric", OIDNumeric},
+	}
+	for _, p := range pairs {
+		gotOID := TypeNameToOID(p.name)
+		if gotOID != p.oid {
+			t.Errorf("TypeNameToOID(%q) = %d, want %d", p.name, gotOID, p.oid)
+		}
+		gotName := OIDToTypeName(p.oid)
+		if gotName != p.name {
+			t.Errorf("OIDToTypeName(%d) = %q, want %q", p.oid, gotName, p.name)
+		}
+	}
+}
+
+// TestTypeNameToOIDAlternativeNames verifies type name aliases resolve correctly.
+func TestTypeNameToOIDAlternativeNames(t *testing.T) {
+	cases := []struct{ alias string; wantOID uint32 }{
+		{"integer", OIDInt4},
+		{"int", OIDInt4},
+		{"bigint", OIDInt8},
+		{"smallint", OIDInt2},
+		{"boolean", OIDBool},
+		{"decimal", OIDNumeric},
+		{"real", OIDFloat4},
+		{"double precision", OIDFloat8},
+		{"character varying", OIDVarChar},
+		{"character", OIDBpChar},
+		{"timestamp without time zone", OIDTimestamp},
+		{"timestamp with time zone", OIDTimestampTZ},
+		{"time without time zone", OIDTime},
+	}
+	for _, tc := range cases {
+		if got := TypeNameToOID(tc.alias); got != tc.wantOID {
+			t.Errorf("TypeNameToOID(%q) = %d, want %d", tc.alias, got, tc.wantOID)
+		}
+	}
+}
+
+// TestTypeNameToOIDUnknownFallsBackToText verifies the safe default.
+func TestTypeNameToOIDUnknownFallsBackToText(t *testing.T) {
+	if got := TypeNameToOID("totally_unknown_type"); got != OIDText {
+		t.Errorf("unknown type OID = %d, want %d (OIDText)", got, OIDText)
 	}
 }

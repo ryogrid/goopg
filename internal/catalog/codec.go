@@ -30,17 +30,24 @@ const (
 )
 
 // Built-in type OIDs from postgres/src/include/catalog/pg_type.h.
+// Extended in M0030-0005 to cover all types that pgoTypeOIDFor handled.
 const (
-	OIDBool      uint32 = 16
-	OIDInt8      uint32 = 20
-	OIDInt2      uint32 = 21
-	OIDInt4      uint32 = 23
-	OIDText      uint32 = 25
-	OIDOID       uint32 = 26
-	OIDBpChar    uint32 = 1042
-	OIDVarChar   uint32 = 1043
-	OIDTimestamp uint32 = 1114
-	OIDNumeric   uint32 = 1700
+	OIDBool        uint32 = 16
+	OIDBytea       uint32 = 17
+	OIDInt8        uint32 = 20
+	OIDInt2        uint32 = 21
+	OIDInt4        uint32 = 23
+	OIDText        uint32 = 25
+	OIDOID         uint32 = 26
+	OIDFloat4      uint32 = 700
+	OIDFloat8      uint32 = 701
+	OIDDate        uint32 = 1082
+	OIDTime        uint32 = 1083
+	OIDTimestamp   uint32 = 1114
+	OIDTimestampTZ uint32 = 1184
+	OIDBpChar      uint32 = 1042
+	OIDVarChar     uint32 = 1043
+	OIDNumeric     uint32 = 1700
 )
 
 // PGClassRow is the v0 on-disk shape of one pg_class tuple.
@@ -389,9 +396,10 @@ func nextVarlen(data []byte, off int) (string, int, error) {
 }
 
 // TypeNameToOID maps a goopg type name string to its canonical pg_type OID.
-// Used by DDL-sync (operators_ddl.go) when writing pg_attribute rows and by
-// initdb seeding (catalog_seed.go). Returns OIDText as a safe fallback for
-// unknown types.
+// Used by DDL-sync (operators_ddl.go) when writing pg_attribute rows, by
+// initdb seeding (catalog_seed.go), and by pgoutput.go for column OID
+// resolution (M0030-0005). Returns OIDText as a safe fallback for unknown
+// types.
 func TypeNameToOID(typName string) uint32 {
 	switch strings.ToLower(typName) {
 	case "int4", "int", "integer":
@@ -408,9 +416,20 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDBpChar
 	case "bool", "boolean":
 		return OIDBool
-	case "timestamp", "timestamp without time zone",
-		"timestamptz", "timestamp with time zone":
+	case "bytea":
+		return OIDBytea
+	case "float4", "real":
+		return OIDFloat4
+	case "float8", "double precision":
+		return OIDFloat8
+	case "date":
+		return OIDDate
+	case "time", "time without time zone":
+		return OIDTime
+	case "timestamp", "timestamp without time zone":
 		return OIDTimestamp
+	case "timestamptz", "timestamp with time zone":
+		return OIDTimestampTZ
 	case "numeric", "decimal":
 		return OIDNumeric
 	case "oid":
@@ -423,7 +442,8 @@ func TypeNameToOID(typName string) uint32 {
 // OIDToTypeName is the inverse of TypeNameToOID: maps a canonical pg_type
 // OID to the goopg type name string used in catalog.Type. Used by
 // loadUserTablesFromHeap (M0030-0003) when reconstructing column types
-// from pg_attribute rows. Returns "text" for unknown OIDs.
+// from pg_attribute rows. Extended in M0030-0005 to cover all OIDs that
+// TypeNameToOID produces. Returns "text" for unknown OIDs.
 func OIDToTypeName(oid uint32) string {
 	switch oid {
 	case OIDInt4:
@@ -440,8 +460,20 @@ func OIDToTypeName(oid uint32) string {
 		return "bpchar"
 	case OIDBool:
 		return "bool"
+	case OIDBytea:
+		return "bytea"
+	case OIDFloat4:
+		return "float4"
+	case OIDFloat8:
+		return "float8"
+	case OIDDate:
+		return "date"
+	case OIDTime:
+		return "time"
 	case OIDTimestamp:
 		return "timestamp"
+	case OIDTimestampTZ:
+		return "timestamptz"
 	case OIDNumeric:
 		return "numeric"
 	case OIDOID:

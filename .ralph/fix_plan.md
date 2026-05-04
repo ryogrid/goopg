@@ -346,8 +346,13 @@ loading switch.**
       helper appends to existing pages. Detection via pg_class user-row
       count (no CatalogVersion needed). 4 tests: migration fires, idempotent,
       no-op on fresh cluster, pg_attribute rows written.
-- [ ] pg_attribute / pg_type SQL surface and OID resolution (M0030-0005).
+- [x] pg_attribute / pg_type SQL surface and OID resolution (M0030-0005).
       Design doc `docs/design/0030-0005-catalog-sql-surface.md`.
+      **Landed 2026-05-04**: pgoTypeOIDFor() replaced with catalog.TypeNameToOID.
+      New OID constants: OIDBytea(17), OIDFloat4(700), OIDFloat8(701),
+      OIDDate(1082), OIDTime(1083), OIDTimestampTZ(1184). TypeNameToOID +
+      OIDToTypeName expanded. pg_attribute SQL surface verified by
+      TestPGAttributeSQLSurfaceForUserTable. pg_index deferred.
 - [ ] Transactional DDL foundation (M0030-0006).
       Design doc `docs/design/0030-0006-transactional-ddl.md`.
 

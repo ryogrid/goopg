@@ -10,6 +10,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -488,5 +489,103 @@ func TestOpenOldClusterWithoutM0030FilesStillWorks(t *testing.T) {
 	}
 	if _, ok := rt.Catalog.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_attribute"}); ok {
 		t.Error("pg_attribute in catalog but relfile was removed")
+	}
+}
+
+// TestPGAttributeSQLSurfaceForUserTable verifies the M0030-0005 requirement:
+// `SELECT attname, atttypid FROM pg_attribute WHERE attrelid = X` returns
+// correct column metadata for a user-defined table after CREATE TABLE.
+//
+// This exercises the full path: DDL-sync writes to pg_attribute heap,
+// the heap-backed table registration allows a SeqScan, MVCC visibility
+// passes bootstrap-XID rows, and the attname/atttypid values are correct.
+func TestPGAttributeSQLSurfaceForUserTable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+
+	// Create a table with known columns — DDL-sync writes to pg_attribute.
+	runDDL(t, rt, "CREATE TABLE surf_test (id int4 NOT NULL, label text, active bool)")
+
+	// Verify pg_attribute is registered as non-virtual (heap-backed).
+	pgAttr, ok := rt.Catalog.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_attribute"})
+	if !ok {
+		t.Fatal("pg_attribute not in catalog")
+	}
+	if pgAttr.Virtual {
+		t.Fatal("pg_attribute is Virtual=true — expected heap-backed")
+	}
+
+	// Get the user table's OID.
+	tbl, ok := rt.Catalog.LookupTable(parser.ObjectName{Name: "surf_test"})
+	if !ok {
+		t.Fatal("surf_test not in catalog")
+	}
+
+	// Scan pg_attribute via the storage pool to verify column data.
+	pgAttrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	nBlocks, err := rt.Pool.NBlocks(pgAttrRel)
+	if err != nil {
+		t.Fatalf("NBlocks pg_attribute: %v", err)
+	}
+
+	colsByName := map[string]catalog.PGAttributeRow{}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		slot, err := rt.Pool.Pin(storage.BufferTag{Rel: pgAttrRel, Block: blk})
+		if err != nil {
+			t.Fatalf("Pin pg_attribute blk %d: %v", blk, err)
+		}
+		page := slot.Page()
+		count, _ := storage.PageLinePointerCount(page)
+		for s := uint16(1); s <= uint16(count); s++ {
+			ht, err := storage.PageGetHeapTuple(page, s)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			row, err := catalog.DecodePGAttributeRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if row.AttRelID == tbl.OID {
+				colsByName[row.AttName] = row
+			}
+		}
+		rt.Pool.Unpin(slot)
+	}
+
+	if len(colsByName) != 3 {
+		t.Fatalf("expected 3 pg_attribute rows for surf_test, got %d (names: %v)",
+			len(colsByName), colsByName)
+	}
+
+	// Verify atttypid values match TypeNameToOID (M0030-0005 OID resolution).
+	if got := colsByName["id"].AttTypID; got != catalog.OIDInt4 {
+		t.Errorf("id.atttypid = %d, want %d (int4)", got, catalog.OIDInt4)
+	}
+	if got := colsByName["label"].AttTypID; got != catalog.OIDText {
+		t.Errorf("label.atttypid = %d, want %d (text)", got, catalog.OIDText)
+	}
+	if got := colsByName["active"].AttTypID; got != catalog.OIDBool {
+		t.Errorf("active.atttypid = %d, want %d (bool)", got, catalog.OIDBool)
+	}
+	// Verify attnotnull.
+	if !colsByName["id"].AttNotNull {
+		t.Error("id.attnotnull should be true")
+	}
+	if colsByName["label"].AttNotNull {
+		t.Error("label.attnotnull should be false")
 	}
 }
