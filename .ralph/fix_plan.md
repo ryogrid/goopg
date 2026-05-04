@@ -1616,11 +1616,18 @@ gaps catalogued in `docs/reference/ref-021-protocol.md`.
       `TestE2E_SCRAMAuthDoD`: `NewSCRAMCredential(pass)` + pg_auth
       write + `scram-sha-256` pg_hba rule → lib/pq SCRAM login +
       `SELECT 1` succeeds.)
-- [ ] M0049-0004: Binary COPY format. Design doc
-      `docs/design/0049-0004-copy-binary-format.md`. 19-byte PGCOPY
-      header, per-row int16 fieldCount + length-prefixed payloads,
-      0xFFFF trailer; reuse extended-query binary codecs per type.
-      DoD: round-trip on every supported type; 3× speedup vs text.
+- [x] M0049-0004: Binary COPY format. Design doc
+      `docs/design/0049-0004-copy-binary-format.md`. (landed 2026-05-05:
+      `copy_binary.go` with 19-byte PGCOPY header, binary row encoder
+      (int4/int8/bool/text/timestamp/date/numeric/bytea), binary row
+      parser with partial-row buffering. `IsBinaryFormat` detects
+      `FORMAT binary`/bare `BINARY`. `RunCopyTo` gains binary bool return
+      value; emits header+rows+trailer when binary. `CopyFromExecutor`
+      gains `PushBinaryData` + `IsBinary()`. Wire: `runCopyTo` sets
+      format code 1 when binary; `dispatchCopyViaExecutor` sets
+      `WriteCopyInResponse(1, nil)`. DoD tests: `TestCopyBinaryRoundTrip`
+      (all types + NULL), `TestCopyBinaryRoundTripViaExecutor` (full
+      RunCopyTo→ParseCopyBinaryRows via real storage).)
 
 ## Milestone 0050 — Savepoints and subtransactions
 

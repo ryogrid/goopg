@@ -162,7 +162,11 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 			}
 			return nil, nil
 		}
-		if err := w.WriteCopyInResponse(0, nil); err != nil {
+		fmtCode := byte(0)
+		if executor.IsBinaryFormat(plan.Options) {
+			fmtCode = 1
+		}
+		if err := w.WriteCopyInResponse(fmtCode, nil); err != nil {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			return nil, err
 		}
@@ -182,10 +186,17 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 // runCopyTo drives the CopyOutResponse / CopyData* / CopyDone /
 // CommandComplete / ReadyForQuery sequence for a CopyTo plan.
 func (s *Server) runCopyTo(w *protocol.FrameWriter, ctx *executor.Context, plan *planner.Copy) error {
-	if err := w.WriteCopyOutResponse(0, nil); err != nil {
+	// Peek at the options to decide the wire format code before opening
+	// the operator — WriteCopyOutResponse must precede any CopyData frames.
+	binary := executor.IsBinaryFormat(plan.Options)
+	fmtCode := byte(0)
+	if binary {
+		fmtCode = 1
+	}
+	if err := w.WriteCopyOutResponse(fmtCode, nil); err != nil {
 		return err
 	}
-	count, err := executor.RunCopyTo(ctx, plan, func(line []byte) error {
+	count, _, err := executor.RunCopyTo(ctx, plan, func(line []byte) error {
 		return w.WriteCopyData(line)
 	})
 	if err != nil {
@@ -230,12 +241,30 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 	switch f.Type {
 	case protocol.MsgCopyData:
 		if st.fromExec != nil {
-			if err := st.consumeExecCopyData(f.Payload); err != nil {
-				// Decode/insert error: drain remaining frames until
-				// CopyDone/CopyFail by leaving fromExec set but
-				// signalling a wire-level error. Simplest: emit
-				// ErrorResponse + ReadyForQuery and abort the
-				// transaction.
+			var err error
+			if st.fromExec.IsBinary() {
+				var done bool
+				done, err = st.fromExec.PushBinaryData(f.Payload)
+				if err == nil && done {
+					// Trailer found inside CopyData — treat as CopyDone.
+					rows := st.fromExec.RowsInserted()
+					if st.mgr != nil {
+						_ = st.mgr.Commit(st.tx)
+					}
+					if cerr := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); cerr != nil {
+						return true, cerr
+					}
+					maybeForceGCAfterCommit()
+					if cerr := w.WriteReadyForQuery(protocol.TxStatusIdle); cerr != nil {
+						return true, cerr
+					}
+					return true, nil
+				}
+			} else {
+				err = st.consumeExecCopyData(f.Payload)
+			}
+			if err != nil {
+				// Decode/insert error: abort transaction and report.
 				if st.mgr != nil {
 					_ = st.mgr.Rollback(st.tx)
 				}
