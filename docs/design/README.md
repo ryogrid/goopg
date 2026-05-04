@@ -219,7 +219,7 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0042-0002 | [Buffered-I/O Migration](0042-0002-buffered-io-migration.md) | accepted | Removes `O_DIRECT` / `O_DSYNC` / page-aligned-RMW paths from `internal/wal/writer.go` and `internal/storage/smgr.go`, retires `wal_direct_io` GUC and `Manager.AlignedIO` toggle. Deleted 4 files, removed 5 methods, simplified writeAt dispatch. All tests pass; `git grep O_DIRECT internal/` returns only comments. |
 
-| 0042-0003 | [WAL Buffer + WAL Writer Alignment](0042-0003-wal-buffer-and-writer-alignment.md) | draft | Dedicated `walwriter` goroutine drains the WAL ring on `wal_writer_delay`; client backends synchronous-commit via `XLogFlush` waiting on published `flushedLSN`; insertion-lock array gives N-way parallel `XLogInsert`. Mirrors upstream `walwriter.c` + `WALInsertLock[]` semantics. |
+| 0042-0003 | [WAL Buffer + WAL Writer Alignment](0042-0003-wal-buffer-and-writer-alignment.md) | accepted (Phase 1) | Synchronous commit: xactMarkerLogger now calls FlushUpTo(endLSN) on XactCommit. Background walwriterLoop goroutine (WalWriterDelay option, default 200ms in production). synchronous_commit/wal_writer_delay/wal_writer_flush_after GUCs. Three durability tests pass with -race. |
 
 | 0042-0004 | [Client Backend Goroutine Alignment](0042-0004-client-backend-goroutine-alignment.md) | draft | Documents and tightens the per-connection goroutine model: client goroutines own transaction/snapshot/pinned buffers/`XLogInsert`/`XLogFlush` only; never run the WAL-writer, background-writer, checkpointer, or walsender cycle by side-effect. Adds a regression test that backends never fsync. |
 

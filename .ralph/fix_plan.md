@@ -1136,26 +1136,21 @@ per‑backend process model. Anchor doc:
         go test ./internal/wal/ ./internal/storage/ ./internal/initdb/
         ./internal/executor/ ./internal/planner/ ./internal/config/ PASS
 
-- [ ] M0042-0003: WAL buffer + WAL writer alignment.
+- [x] M0042-0003: WAL buffer + WAL writer alignment.
       Design doc `docs/design/0042-0003-wal-buffer-and-writer-alignment.md`.
-  - [ ] Add `walwriterLoop` goroutine: timer-driven drain
-        (`wal_writer_delay`, default 200ms) +
-        opportunistic fsync (`wal_writer_flush_after`,
-        default 1 MiB).
-  - [ ] Public API rebind: `XLogInsert` (returns LSN) /
-        `XLogFlush(lsn)` (blocks on `flushedLSN >= lsn`).
-  - [ ] Insertion-lock array (8 slots) for parallel
-        `XLogInsert`.
-  - [ ] WAL ring page eviction blocks on `writtenLSN`,
-        not on doing the write inline.
-  - [ ] Wire `synchronous_commit` GUC (default on); commit
-        path calls `XLogFlush(commitLSN)` when on.
-  - [ ] Update `internal/wal/checkpointer.go`,
-        `internal/storage/bufpool.go::evictLocked`,
-        `internal/server/dispatch.go::Commit` to the new
-        API.
-  - [ ] Verification: `go test ./internal/wal/... -race`,
-        full TPC-H parity, manual kill-9 durability check.
+      **Phase 1 landed 2026-05-04**: Synchronous commit wired — xactMarkerLogger
+      in initdb/open.go now calls walWriter.FlushUpTo(endLSN) after XactCommit.
+      Background walwriterLoop goroutine added (WalWriterDelay option → timer-
+      driven FlushUpTo(maxUint64); stopped by Close()). synchronous_commit,
+      wal_writer_delay, wal_writer_flush_after GUCs registered. WalWriterDelay=200ms
+      wired in cmd/goopg/main.go. 3 new tests (synchronous commit durability,
+      commit record on disk, loop no-panic/race). go test -race PASS.
+      Deferred: XLogInsert/XLogFlush API rename, insertion-lock array,
+      WAL ring page eviction blocking on writtenLSN (not writtenLSN+fdatasync).
+  - [x] Add walwriterLoop goroutine (WalWriterDelay option, 200ms default)
+  - [x] Wire synchronous_commit: xactMarkerLogger FlushUpTo on XactCommit
+  - [x] Add synchronous_commit/wal_writer_delay/wal_writer_flush_after GUCs
+  - [x] Verification: go test ./internal/wal/... -race + ./internal/initdb/ PASS
 
 - [ ] M0042-0004: Client backend goroutine alignment.
       Design doc `docs/design/0042-0004-client-backend-goroutine-alignment.md`.

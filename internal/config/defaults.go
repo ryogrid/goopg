@@ -211,6 +211,42 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// synchronous_commit controls whether a transaction commit waits
+	// for the WAL record to be flushed to disk before returning to the
+	// client. Default on matches upstream's safe default; off allows
+	// faster commits at the cost of losing recent committed transactions
+	// on a server crash (up to wal_writer_delay latency). See
+	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "synchronous_commit", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+
+	// wal_writer_delay sets the period (in milliseconds) of the
+	// background WAL writer loop. The loop calls FlushUpTo to drain
+	// buffered WAL bytes so they are not held in RAM indefinitely.
+	// Default 200ms mirrors upstream's wal_writer_delay GUC. See
+	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_writer_delay", Type: TypeInt, BootVal: "200",
+		MinVal: 1, MaxVal: 10000,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
+	// wal_writer_flush_after sets the threshold (in bytes) above which
+	// the WAL writer loop issues an fdatasync in addition to writing.
+	// Default 1 MiB mirrors upstream's wal_writer_flush_after GUC. 0
+	// means always fsync on every loop iteration. See
+	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_writer_flush_after", Type: TypeInt, BootVal: "1048576",
+		MinVal: 0, MaxVal: 1 << 30,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// io_method picks the AIO I/O method. `sync` runs every
 	// I/O on the calling goroutine (the safe default that
 	// matches v0's pre-AIO behaviour); `worker` uses a

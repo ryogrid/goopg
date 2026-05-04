@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/aio"
@@ -55,6 +56,11 @@ type Runtime struct {
 	// `WalReceiver` instead of accepting client writes directly.
 	// See docs/design/0005-0001-streaming-replication-architecture.md.
 	Standby bool
+
+	// walwriterStop, when non-nil, is closed by Close() to signal the
+	// background WAL writer loop to exit. nil when the loop wasn't
+	// started (WalWriterDelay == 0 in tests).
+	walwriterStop chan struct{}
 }
 
 // OpenOptions controls Open.
@@ -108,6 +114,14 @@ type OpenOptions struct {
 	// value (e.g. 1 MiB) to exercise WAL retention with less data.
 	// Maps directly to wal.Config.SegmentSize.
 	WALSegmentSize int64
+
+	// WalWriterDelay controls the period of the background WAL writer
+	// loop (M0042-0003). The loop calls FlushUpTo(maxUint64) every
+	// WalWriterDelay to ensure buffered WAL bytes reach disk even when
+	// no commits or checkpoints are in flight. 0 disables the loop
+	// (used by tests that don't need background flushing). Default in
+	// production: 200ms (mirrors upstream's wal_writer_delay GUC).
+	WalWriterDelay time.Duration
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -361,8 +375,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}
-		_, _, err := walWriter.Append(payload)
-		return err
+		_, endLSN, err := walWriter.Append(payload)
+		if err != nil {
+			return err
+		}
+		// Synchronous commit (M0042-0003): flush the commit WAL record to
+		// disk before returning to the client so the transaction is durable
+		// across a server crash. Mirrors upstream's synchronous_commit = on
+		// default. Aborts are not flushed (they're discarded on replay).
+		if kind == mvcc.XactCommit {
+			return walWriter.FlushUpTo(endLSN)
+		}
+		return nil
 	})
 	if err := loadCatalogSnapshot(abs, cat, txnMgr); err != nil {
 		_ = pool.Close()
@@ -614,7 +638,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: standby signal: %w", err)
 	}
 
-	return &Runtime{
+	rt := &Runtime{
 		StorageMgr:   mgr,
 		Pool:         pool,
 		TxnMgr:       txnMgr,
@@ -630,7 +654,32 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Activity:       act,
 		DataDir:        abs,
 		Standby:        standby,
-	}, nil
+	}
+
+	// Background WAL writer loop (M0042-0003): timer-driven periodic flush
+	// so buffered WAL bytes reach disk even when no commits are in flight.
+	// Mirrors upstream's walwriter process cadence. Disabled (delay == 0)
+	// in tests that don't need background flushing.
+	if opts.WalWriterDelay > 0 && walWriter != nil {
+		stop := make(chan struct{})
+		rt.walwriterStop = stop
+		go func() {
+			ticker := time.NewTicker(opts.WalWriterDelay)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					// Drain and sync any buffered WAL. Fast no-op when
+					// nothing was written since the last flush.
+					_ = walWriter.FlushUpTo(^uint64(0))
+				case <-stop:
+					return
+				}
+			}
+		}()
+	}
+
+	return rt, nil
 }
 
 // aioEngineAdapter bridges *aio.Engine to storage.AIOEngine.
@@ -1220,6 +1269,12 @@ func (r *Runtime) SaveCatalog() error {
 func (r *Runtime) Close() error {
 	if r == nil {
 		return nil
+	}
+	// Stop the background WAL writer loop before draining the pool so the
+	// loop can't issue FlushUpTo calls that race with the final WAL close.
+	if r.walwriterStop != nil {
+		close(r.walwriterStop)
+		r.walwriterStop = nil
 	}
 	var firstErr error
 	if r.Pool != nil {

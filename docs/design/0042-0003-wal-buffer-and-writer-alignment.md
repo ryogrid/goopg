@@ -1,6 +1,6 @@
 # 0042-0003 — WAL buffer + WAL writer goroutine alignment
 
-**Status:** draft
+**Status:** accepted (Phase 1 landed 2026-05-04)
 **Parent milestone:** M0042
 **Depends on:** `0042-0001-pg-io-survey.md`
 **Date:** 2026-05-04
