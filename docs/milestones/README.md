@@ -80,3 +80,9 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0043 | MHJ executor optimisations (lazy iterator + predicate pushdown) | accepted | `0043-mhj-executor-optimisations.md` |
 | 0044 | B-tree key support for HammerDB TPC-H schema types (varchar, char, timestamp, mixed compound) | planned | `0044-btree-tpch-key-types.md` |
 | 0045 | Crash recovery from non-zero starting WAL segment       | planned  | `0045-wal-recovery-non-zero-start.md` |
+| 0046 | Heap & MVCC maturation (HOT, FSM, VM, freezing, page pruning, TOAST) | planned | `0046-heap-mvcc-maturation.md` |
+| 0047 | B-tree maturation: bulk load, page deletion, deduplication | planned | `0047-btree-maturation.md` |
+| 0048 | Buffer pool concurrency hardening (IO_IN_PROGRESS, strategy ring, bgwriter, checkpoint pacing) | planned | `0048-buffer-pool-concurrency.md` |
+| 0049 | Protocol parity: cancellation, error detail, SCRAM-SHA-256, COPY binary | planned | `0049-protocol-parity.md` |
+| 0050 | Savepoints and subtransactions                                   | planned | `0050-savepoints-and-subtransactions.md` |
+| 0051 | Planner expression-level improvements (constant folding, implicit coercion, keyword categorisation, LIKE→range) | planned | `0051-planner-expression-improvements.md` |

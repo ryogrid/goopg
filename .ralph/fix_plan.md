@@ -1397,6 +1397,196 @@ retained WAL backwards.
   - [x] `TestTPCHResultParity` identical=22 divergent=0 errored=0.
   - [x] M0045 `accepted`.
 
+## Milestone 0046 — Heap & MVCC maturation
+
+See `docs/milestones/0046-heap-mvcc-maturation.md`. Closes the heap
+gaps catalogued in `docs/reference/ref-007-heap-mvcc.md`. Substantial;
+sub-tasks decompose around independent design docs.
+
+- [ ] M0046-0001: Heap-Only Tuples (HOT). Design doc
+      `docs/design/0046-0001-hot-updates.md`. Detect "no indexed column
+      changed" via per-relation indexed-column bitmap, redirect tuple
+      version on the same heap page via `t_ctid`, mark
+      `HEAP_HOT_UPDATED` / `HEAP_ONLY_TUPLE`, **skip the index-insert
+      loop**. Index-fetch follows the chain. WAL: new `XLH_HOT_UPDATE`
+      flag bit on existing `HEAP_UPDATE` record. DoD: pgbench-style
+      UPDATE workload index-size growth ≤ 10% of pre-HOT baseline at
+      100k transactions.
+- [ ] M0046-0002: Opportunistic page pruning. Design doc
+      `docs/design/0046-0002-page-pruning.md`. New
+      `internal/access/heap/prune.go` with `PagePruneOpt` and
+      `pagePrune`; wire into the buffer-pin path under
+      `enable_opportunistic_prune` (default on); WAL
+      `XLOG_HEAP2_PRUNE`. DoD: tight UPDATE loop in a single
+      transaction does not grow the page beyond steady-state.
+- [ ] M0046-0003: Free Space Map fork. Design doc
+      `docs/design/0046-0003-free-space-map.md`. New `_fsm` fork,
+      tree-of-pages summarisation, `GetPageWithFreeSpace` /
+      `RecordPageWithFreeSpace`; `heapInsert` consults FSM before
+      extending. DoD: 100k INSERT + 50k DELETE + VACUUM yields a
+      single-page heap.
+- [ ] M0046-0004: Visibility Map fork. Design doc
+      `docs/design/0046-0004-visibility-map.md`. New `_vm` fork, 2-bits-
+      per-block (ALL_VISIBLE / ALL_FROZEN), VACUUM sets, page
+      modifications clear, `IndexOnlyScan` plan branch checks bit.
+      DoD: `EXPLAIN (ANALYZE, BUFFERS)` on a covered query reports
+      zero heap reads after VACUUM.
+- [ ] M0046-0005: Tuple freezing & anti-wraparound. Design doc
+      `docs/design/0046-0005-tuple-freezing-and-wraparound.md`.
+      VACUUM rewrites old `xmin` to `FrozenTransactionId`;
+      `pg_class.relfrozenxid` advances; M0019 autovacuum triggers
+      anti-wraparound vacuum at `autovacuum_freeze_max_age`;
+      xidWarn/xidStop guards. DoD: stress test with 1B simulated XIDs
+      keeps the cluster running and tuples visible.
+- [ ] M0046-0006: TOAST out-of-line storage. Design doc
+      `docs/design/0046-0006-toast.md`. Per-table TOAST relation,
+      varlena 1/4-byte length headers, slice-and-store at
+      `TOAST_TUPLE_THRESHOLD`, lazy detoast in expression evaluator,
+      pglz compression. DoD: 1 MiB `text` round-trip succeeds.
+
+## Milestone 0047 — B-tree maturation
+
+See `docs/milestones/0047-btree-maturation.md`. Closes the B-tree gaps
+in `docs/reference/ref-002-btree.md`.
+
+- [ ] M0047-0001: B-tree bulk load. Design doc
+      `docs/design/0047-0001-btree-bulk-load.md`. New `BulkBuild` —
+      sort-then-build leaf pages sequentially, internal levels
+      bottom-up; `CREATE INDEX` calls `BulkBuild` instead of looped
+      `Insert`; full-page-image WAL records. DoD: pgbench-init index
+      build wall-time on 1M-row PK ≤ 4 s (was ~31 s).
+- [ ] M0047-0002: B-tree page deletion. Design doc
+      `docs/design/0047-0002-page-deletion.md`. Two-phase
+      `_bt_pagedel` port (`BTP_HALF_DEAD` then `BTP_DELETED`); wired
+      into VACUUM; preserves Lehman-Yao right-link invariant; WAL
+      `XLOG_BTREE_MARK_PAGE_HALFDEAD` / `XLOG_BTREE_UNLINK_PAGE`.
+      DoD: 100k INSERT → 100k DELETE → VACUUM yields single-page
+      B-tree.
+- [ ] M0047-0003: B-tree leaf deduplication. Design doc
+      `docs/design/0047-0003-deduplication.md`. Posting-list leaf
+      entries (`BT_POSTING_KIND`); bulk path emits dedup-shape; insert
+      grows posting lists in place; pre-split dedup pass; WAL
+      `XLOG_BTREE_DEDUP`. DoD: TPC-H SF1 `lineitem_l_shipmode` index
+      size ≤ 25% of pre-dedup baseline.
+
+## Milestone 0048 — Buffer pool concurrency hardening
+
+See `docs/milestones/0048-buffer-pool-concurrency.md`. Closes the
+buffer-pool gaps in `docs/reference/ref-003-buffer-pool.md` and the
+checkpoint-pacing gap in `ref-004-checkpointer.md`.
+
+- [ ] M0048-0001: `BM_IO_IN_PROGRESS` atomic flag. Design doc
+      `docs/design/0048-0001-io-in-progress-flag.md`. Atomic flag bit
+      on `BufferDesc`; concurrent miss waiters block on a CV; new
+      `BufferIO` wait-event class. DoD: 64-goroutine same-page-pin
+      stress shows `smgr.Read` invocation count = 1.
+- [ ] M0048-0002: SeqScan strategy ring. Design doc
+      `docs/design/0048-0002-strategy-ring-seqscan.md`. New
+      `BufferAccessStrategy` interface (32-slot `bulkReadStrategy`);
+      planner heuristic enables on relations > shared_buffers/4. DoD:
+      hot-page hit rate ≥ 95% after a 5k-page SeqScan in a 1k-buffer
+      pool.
+- [ ] M0048-0003: bgwriter goroutine. Design doc
+      `docs/design/0048-0003-bgwriter-goroutine.md`. New
+      `internal/storage/bgwriter.go`; ticks every `bgwriter_delay`,
+      writes ≤ `bgwriter_lru_maxpages` per tick, no fsync. DoD:
+      foreground victim-search dirty hit rate ≤ 5% on pgbench mixed.
+- [ ] M0048-0004: Checkpoint write pacing. Design doc
+      `docs/design/0048-0004-checkpoint-write-pacing.md`. Wire
+      `checkpoint_completion_target` GUC; sleep-between-batches paces
+      flush over `target × interval`; segment-driven trigger flushes
+      fast. DoD: 200k dirty buffers, target=0.5, interval=30s →
+      finishes 14–17 s; foreground TPS impact ≤ 20%.
+
+## Milestone 0049 — Protocol parity
+
+See `docs/milestones/0049-protocol-parity.md`. Closes the protocol
+gaps catalogued in `docs/reference/ref-021-protocol.md`.
+
+- [ ] M0049-0001: Query cancellation (`CancelRequest`). Design doc
+      `docs/design/0049-0001-query-cancellation.md`. Magic-protocol-
+      code listener (`80877102`); per-session BackendKeyData
+      `(pid, secretKey)`; executor poll points; SQLSTATE 57014. DoD:
+      psql Ctrl-C against `pg_sleep(60)` returns within 200 ms.
+- [ ] M0049-0002: Full ErrorResponse fields. Design doc
+      `docs/design/0049-0002-error-response-fields.md`. Encoder
+      grows D/H/P/W/s/t/c/F/L/R fields; parser threads byte offset
+      into `Position`; analyzer threads schema/table/column. DoD:
+      psql renders correct caret-pointer line on syntax errors.
+- [ ] M0049-0003: SCRAM-SHA-256 authentication. Design doc
+      `docs/design/0049-0003-scram-sha-256.md`. Server-side SCRAM
+      exchange; new `auth-method = scram-sha-256` in pg_hba; new
+      verifier format in pg_authid. DoD: psql / pgx / JDBC connect
+      against a SCRAM-only HBA rule.
+- [ ] M0049-0004: Binary COPY format. Design doc
+      `docs/design/0049-0004-copy-binary-format.md`. 19-byte PGCOPY
+      header, per-row int16 fieldCount + length-prefixed payloads,
+      0xFFFF trailer; reuse extended-query binary codecs per type.
+      DoD: round-trip on every supported type; 3× speedup vs text.
+
+## Milestone 0050 — Savepoints and subtransactions
+
+See `docs/milestones/0050-savepoints-and-subtransactions.md`. Closes
+the savepoint gap in `docs/reference/ref-022-session-management.md`
+and unblocks PL/pgSQL exception blocks (M0015).
+
+- [ ] M0050-0001: Subxact stack & state machine. Design doc
+      `docs/design/0050-0001-subxact-stack-and-state-machine.md`.
+      `TransactionState.Stack` of `SubTransactionState`; SAVEPOINT
+      push, RELEASE collapse-up, ROLLBACK TO rewind+push-fresh; lock-
+      owner re-assignment. Lazy subxact xid allocation. DoD: stack
+      operations covered by unit tests; lock owner correctness
+      verified.
+- [ ] M0050-0002: Subxact xid & visibility. Design doc
+      `docs/design/0050-0002-subxact-xid-and-visibility.md`. In-memory
+      subxact-to-parent map; `XidInProgress` resolves via
+      `TopLevelXid`; aborted-subxact rows invisible after parent
+      commit. DoD: visibility matrix `(subxact, parent)` matches
+      upstream cell-by-cell.
+- [ ] M0050-0003: Subxact WAL & recovery. Design doc
+      `docs/design/0050-0003-subxact-wal-and-recovery.md`. New WAL
+      records `XactAssignment` / `XactRollbackTo` / `XactSubAbort`;
+      Commit/Abort grow `subXids[]`; replay rebuilds the parent map.
+      DoD: crash + restart with in-flight savepoints reproduces
+      correct visibility.
+- [ ] M0050-0004: Savepoint SQL surface & error recovery. Design doc
+      `docs/design/0050-0004-savepoint-sql-surface-and-error-recovery.md`.
+      Parser & executor for `SAVEPOINT` / `RELEASE` / `ROLLBACK TO`;
+      implicit-savepoint helper for `\set ON_ERROR_ROLLBACK on`;
+      SQLSTATE 25P01 / 25P02 enforcement. DoD: worked-example
+      integration test (a + ROLLBACK TO + c) returns exactly {a, c}.
+
+## Milestone 0051 — Planner expression-level improvements
+
+See `docs/milestones/0051-planner-expression-improvements.md`. Closes
+gaps in `docs/reference/ref-010-parser.md` and `ref-011-planner.md`.
+
+- [ ] M0051-0001: Keyword categorisation. Design doc
+      `docs/design/0051-0001-keyword-categorisation.md`. Replace flat
+      keyword list with reserved / type_func_name / col_name /
+      unreserved (per upstream `kwlist.h`); parser-level helper
+      `acceptIdentOrColNameKeyword()`. DoD: columns named `name`,
+      `value`, `type`, `user`, etc. parse without quoting.
+- [ ] M0051-0002: Constant folding. Design doc
+      `docs/design/0051-0002-constant-folding.md`. New
+      `internal/planner/foldconst.go::FoldConstants(expr)`; bottom-up
+      walk; folds arithmetic, string concat, boolean simplification,
+      comparison folding, CAST(literal). DoD: `EXPLAIN ... WHERE x >
+      1+2` shows `x > 3`.
+- [ ] M0051-0003: Implicit type coercion. Design doc
+      `docs/design/0051-0003-implicit-type-coercion.md`. Coercion
+      lattice (`int2→int4→int8→numeric→float4→float8`,
+      `text↔varchar↔char(n)`, `date→timestamp`); operator/function
+      resolution walks the lattice when no exact match exists. DoD:
+      TPC-H queries that today need explicit `CAST` run unchanged
+      after dropping the casts.
+- [ ] M0051-0004: LIKE prefix → range translation. Design doc
+      `docs/design/0051-0004-like-to-range.md`. `ExtractPrefix` +
+      `IncrementString` helpers; analyzer adds redundant `col >=
+      prefix AND col < successor` predicate alongside the original
+      LIKE; gated on C-collation for v0. DoD: TPC-H Q14 / Q20 use
+      IndexScan on a prefix-LIKE-able indexed column.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
