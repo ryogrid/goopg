@@ -123,6 +123,11 @@ type Context struct {
 	// GUC (M0046-0002). When true, the HOT-update path calls
 	// PagePruneOpt before falling back to a relation extension.
 	EnableOpportunisticPrune bool
+
+	// FSM is the Free Space Map (M0046-0003). When non-nil, writeHeapRow
+	// consults it before extending the relation, and VACUUM updates it
+	// after reclaiming dead tuples so freed pages can be reused.
+	FSM *storage.FSM
 }
 
 // acquireRelLock funnels every operator's relation-level lock

@@ -1032,6 +1032,10 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		}
 		if lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
 			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
+			// Update FSM with remaining free space (M0046-0003).
+			if ctx.FSM != nil {
+				ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
+			}
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
 			if derr == nil {
@@ -1043,9 +1047,31 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 			ctx.Pool.Unpin(slot)
 			return false, err
 		}
+		// Page full: invalidate FSM entry so future lookups skip it.
+		if ctx.FSM != nil {
+			ctx.FSM.RecordFreeSpace(rel, blk, 0)
+		}
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
 		return false, nil
+	}
+
+	// FSM consultation (M0046-0003): if a page freed by a previous
+	// VACUUM has enough room, use it before trying the last block or
+	// extending the relation.
+	minFreeBytes := uint16(len(tupleBytes) + 4) // 4 = itemIDSize (line pointer size)
+	if ctx.FSM != nil {
+		if fsmBlk, ok := ctx.FSM.GetPageWithFreeSpace(rel, minFreeBytes); ok {
+			appended, err := tryAppendToBlock(fsmBlk)
+			if err != nil {
+				return ptr, err
+			}
+			if appended {
+				return ptr, nil
+			}
+			// Stale FSM entry — invalidation was already done in
+			// tryAppendToBlock above; fall through to normal path.
+		}
 	}
 
 	// Try the last existing block first.
@@ -1097,6 +1123,10 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, err
 	}
 	derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
+	// New page: record its free space in the FSM (M0046-0003).
+	if ctx.FSM != nil {
+		ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
+	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	if derr == nil {

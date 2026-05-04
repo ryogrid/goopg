@@ -39,6 +39,18 @@ type Stats struct {
 // VACUUM does not touch indexes — see Reindex for the bridge until
 // B-tree page deletion lands.
 func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Stats, error) {
+	return vacuumCore(pool, mgr, rel, nil)
+}
+
+// VacuumWithFSM is Vacuum with a Free Space Map (M0046-0003). After
+// reclaiming dead tuples on each page, the page's remaining free space
+// is recorded in fsm so subsequent INSERT operations can find the page
+// without extending the relation. fsm may be nil (identical to Vacuum).
+func VacuumWithFSM(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, fsm *storage.FSM) (Stats, error) {
+	return vacuumCore(pool, mgr, rel, fsm)
+}
+
+func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, fsm *storage.FSM) (Stats, error) {
 	horizon := mgr.OldestXmin()
 	nBlocks, err := pool.NBlocks(rel)
 	if err != nil {
@@ -94,6 +106,11 @@ func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Sta
 			} else {
 				pool.MarkDirty(slot)
 			}
+		}
+		// Record updated free space in FSM so future inserts can reuse
+		// the reclaimed space without extending the relation (M0046-0003).
+		if fsm != nil {
+			fsm.RecordFreeSpaceForPage(rel, blk, page)
 		}
 		slot.Unlock()
 		pool.Unpin(slot)

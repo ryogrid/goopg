@@ -151,14 +151,13 @@ func Build(plan planner.Node) (Operator, error) {
 	case *planner.Explain:
 		return newExplainOp(p), nil
 	case *planner.Utility:
-		// VACUUM / ANALYZE / SHOW / SET / RESET are utility
-		// statements. The wire layer already handles SHOW/SET/RESET
-		// via the legacy string-matching path in
-		// internal/server/query.go, so they shouldn't reach here in
-		// practice. ANALYZE drives the catalog-stats collector
-		// (per-table row count + per-column NDistinct/NullFrac);
-		// VACUUM still routes through utilityNoOp until the
-		// vacuum package exposes a stmt-driven entry point.
+		// VACUUM / ANALYZE / SHOW / SET / RESET are utility statements.
+		// VACUUM runs the heap page-prune and updates the FSM (M0046-0003).
+		// ANALYZE drives the catalog-stats collector. SHOW/SET/RESET are
+		// handled by the wire layer and shouldn't reach here in practice.
+		if _, ok := p.Stmt.(*parser.VacuumStmt); ok {
+			return newVacuumOp(p), nil
+		}
 		if as, ok := p.Stmt.(*parser.AnalyzeStmt); ok {
 			return newAnalyzeOp(as), nil
 		}

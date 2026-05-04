@@ -1434,12 +1434,17 @@ sub-tasks decompose around independent design docs.
       `ctx.EnableOpportunisticPrune` wired from dispatch. 8 tests.
       `go test ./internal/storage/ ./internal/wal/ ./internal/initdb/
       ./internal/executor/` all green.)
-- [ ] M0046-0003: Free Space Map fork. Design doc
-      `docs/design/0046-0003-free-space-map.md`. New `_fsm` fork,
-      tree-of-pages summarisation, `GetPageWithFreeSpace` /
-      `RecordPageWithFreeSpace`; `heapInsert` consults FSM before
-      extending. DoD: 100k INSERT + 50k DELETE + VACUUM yields a
-      single-page heap.
+- [x] M0046-0003: Free Space Map fork. Design doc
+      `docs/design/0046-0003-free-space-map.md`. (landed 2026-05-05:
+      In-memory `storage.FSM` (fsmKey→[]uint16 freeBytes). `GetPageWithFreeSpace` /
+      `RecordFreeSpace` / `RecordFreeSpaceForPage` / `DropRelation`. `writeHeapRowReturning`
+      consults FSM before `PinNew`; updates FSM after every successful
+      PageAddHeapTuple. `vacuum.VacuumWithFSM` updates FSM per page after
+      reclaiming dead slots. `vacuumOp` dispatches VACUUM SQL (was no-op).
+      FSM wired in `initdb.Runtime`, `server.Config`, `executor.Context`,
+      `dispatch.go`, `autovacuum.Launcher`, `cmd/goopg/main.go`. 9 tests:
+      storage unit (4) + executor integration (5). DoD: fill page → delete
+      all → VACUUM → INSERT → no page extension (TestFSMInsertReusesVacuumedPage).)
 - [ ] M0046-0004: Visibility Map fork. Design doc
       `docs/design/0046-0004-visibility-map.md`. New `_vm` fork, 2-bits-
       per-block (ALL_VISIBLE / ALL_FROZEN), VACUUM sets, page

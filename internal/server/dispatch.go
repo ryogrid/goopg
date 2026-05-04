@@ -90,6 +90,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	ctx.StatsTarget = sessionStatsTarget(sess)
 	ctx.WorkMem = sessionWorkMem(sess)
 	ctx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
+	ctx.FSM = s.cfg.FSM
 	ctx.PubSub = s.cfg.PubSub
 	ctx.LockMgr = s.cfg.LockMgr
 	ctx.BackendID = backendID

@@ -109,6 +109,11 @@ type Config struct {
 	Pool    *storage.Pool
 	TxnMgr  *mvcc.Manager
 
+	// FSM is the in-memory free-space map (M0046-0003). When non-nil,
+	// INSERT consults it to reuse pages freed by VACUUM instead of
+	// extending the relation. nil disables the optimisation.
+	FSM *storage.FSM
+
 	// LockMgr, when set, is plumbed into every executor.Context
 	// the dispatch path constructs. Operators consult it for
 	// relation-level lock acquisition; deadlock detection is

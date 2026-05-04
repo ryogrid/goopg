@@ -22,6 +22,9 @@ type Launcher struct {
 	Pool   *storage.Pool
 	TxnMgr *mvcc.Manager
 	Cat    catalog.Catalog
+	// FSM, when non-nil, is updated by each autovacuum pass so
+	// subsequent INSERT operations can reuse freed pages (M0046-0003).
+	FSM *storage.FSM
 
 	// NapInterval is the time between launcher wakeups.
 	NapInterval time.Duration
@@ -119,7 +122,7 @@ func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 		if last, ok := l.lastVacuum[key]; !ok || now.Sub(last) >= l.MinVacuumAge {
 			if l.needsVacuum(tbl) {
 				log.Info("autovacuum: running vacuum", "table", key)
-				stats, err := vacuum.Vacuum(l.Pool, l.TxnMgr, rel)
+				stats, err := vacuum.VacuumWithFSM(l.Pool, l.TxnMgr, rel, l.FSM)
 				if err != nil {
 					log.Error("autovacuum: vacuum failed", "table", key, "error", err)
 				} else {

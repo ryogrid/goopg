@@ -1,61 +1,137 @@
-# 0046-0003 — Free Space Map (FSM)
+# Free Space Map (FSM) — M0046-0003
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0046 — Heap & MVCC maturation
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-goopg's `heapInsert` always extends the relation when the last-cached
-target page can't fit the row. A workload with INSERT/DELETE churn ends up
-with many half-empty pages but never reuses them. Upstream solves this
-with the FSM: a per-relation tree-of-pages stored in a separate fork
-(`<relfilenode>_fsm`) that summarises free-bytes per heap page; insert
-target selection consults the FSM before extending.
+Without a Free Space Map, every `INSERT` attempts to append to the last
+heap block. After `DELETE` + `VACUUM` reclaims dead slots, the freed pages
+are invisible to the insert path: the relation is extended even though
+existing blocks have room. This causes steady heap growth in update-heavy
+workloads.
 
-## Plan
+PostgreSQL addresses this with the FSM fork (`_fsm`): a per-relation file
+that summarises free bytes per heap page, enabling the insertion code to find
+a suitable existing page in O(log N) rather than scanning every block.
 
-1. New fork constant `INIT_FORKNUM_FSM` in `internal/storage/smgr.go` /
-   the RelFile fork enum.
-2. `internal/storage/freespace/` package: tree-of-pages summarisation,
-   leaf-page format (one byte per heap page indicating power-of-two
-   free bytes — mirror upstream's bucket).
-3. `FreeSpace.GetPageWithFreeSpace(rel, neededBytes) BlockNumber` returns
-   the first page whose summarised free-bytes ≥ needed; falls back to
-   `InvalidBlockNumber` (caller extends).
-4. `FreeSpace.RecordPageWithFreeSpace(rel, blk, free)` updates the leaf
-   bucket, propagates upward when a higher bucket changes.
-5. Wire-in points:
-   - `heapInsert` — replace "use cached target page" with
-     `GetPageWithFreeSpace`.
-   - `heapVacuum` (after prune / after page truncation) — call
-     `RecordPageWithFreeSpace` with the new free byte count.
-   - `heap_page_prune_opt` — likewise after a successful prune.
-6. WAL: piggy-back on existing heap WAL records — FSM updates are
-   non-critical (correct values are eventually rebuilt from data pages),
-   so they go through `MarkDirty` only and are flushed by the bgwriter,
-   not transaction-synchronously.
+## 2. Design
 
-## Definition of Done
+### 2.1 In-memory FSM (`internal/storage/fsm.go`)
 
-- New FSM fork created on first heap-relation init / on first insert if
-  missing.
-- `heapInsert` consults FSM and reuses non-tail pages when they have
-  free space.
-- 100k INSERT + 50k DELETE + VACUUM yields a single-page heap (regression
-  test).
-- Crash + restart with stale FSM still produces correct (if conservative)
-  insert decisions; rebuild path runs lazily.
+For v0 the FSM is a pure in-memory structure — no `_fsm` fork file is read
+or written. The `FSMFork` constant and `_fsm` filename pattern are already
+defined in `storage/page.go` and `storage/smgr.go` for future disk
+persistence (M0046-0003 follow-up).
 
-## Upstream reference
+```go
+type FSM struct {
+    mu    sync.RWMutex
+    pages map[fsmKey][]uint16   // [DBOid,RelOid] → freeBytes per BlockNumber
+}
+```
 
-- `postgres/src/backend/storage/freespace/freespace.c`,
-  `fsmpage.c` — tree, summarisation, lookup.
-- `postgres/src/include/storage/freespace.h` — public API.
+The key is `{DBOid, RelOid}` (no fork: the FSM always maps MainFork pages).
+`uint16` captures 0–65535 bytes free; a `BlockSize`-page holds at most 8192
+bytes so this is exact.
 
-## goopg references
+Key methods:
+- `GetPageWithFreeSpace(rel, minFreeBytes) (BlockNumber, bool)` — linear scan
+  of the slice; returns the first block with `free >= minFreeBytes`.
+- `RecordFreeSpace(rel, blk, freeBytes)` — updates one entry; extends the
+  slice if needed.
+- `RecordFreeSpaceForPage(rel, blk, page)` — reads `PageHeader.FreeSpace()`
+  and calls `RecordFreeSpace`; used by VACUUM and the insert path.
+- `DropRelation(rel)` — removes all entries; called on DROP TABLE / TRUNCATE.
 
-- `internal/storage/smgr.go` — fork enumeration.
-- `internal/access/heap/heapam.go` — insert target selection.
-- 0046-0002 — prune updates FSM after reclaim.
+All methods are nil-safe: a `nil` `*FSM` silently no-ops, so test fixtures
+that don't configure storage are unaffected.
+
+### 2.2 VACUUM integration (`internal/vacuum/vacuum.go`)
+
+`VacuumWithFSM(pool, mgr, rel, fsm)` wraps the existing `Vacuum` logic
+through a shared `vacuumCore` implementation. After `VacuumHeapPageBySlots`
+reclaims dead slots on each page, `fsm.RecordFreeSpaceForPage(rel, blk, page)`
+records the updated free space. `Vacuum(...)` remains unchanged (passes
+`fsm=nil`).
+
+Autovacuum (`internal/autovacuum/launcher.go`) now carries a `FSM` field
+and calls `VacuumWithFSM` so background vacuums populate the map without
+any code change in callers.
+
+### 2.3 Insert path integration (`internal/executor/operators_storage.go`)
+
+`writeHeapRowReturning` consults the FSM **before** the "try last block" step:
+
+```go
+minFreeBytes := uint16(len(tupleBytes) + 4)  // 4 = line-pointer size
+if ctx.FSM != nil {
+    if fsmBlk, ok := ctx.FSM.GetPageWithFreeSpace(rel, minFreeBytes); ok {
+        if appended, _ := tryAppendToBlock(fsmBlk); appended {
+            return ptr, nil
+        }
+        ctx.FSM.RecordFreeSpace(rel, fsmBlk, 0) // invalidate stale entry
+    }
+}
+// ... existing last-block + PinNew path
+```
+
+After every successful `PageAddHeapTuple` (in `tryAppendToBlock` and in the
+`PinNew` path), `ctx.FSM.RecordFreeSpaceForPage` updates the FSM with the
+page's remaining free space. This keeps the map accurate as the page fills.
+
+### 2.4 VACUUM SQL dispatch (`internal/executor/`)
+
+`vacuumOp` is a new executor operator dispatched for `*parser.VacuumStmt`.
+It replaces the previous `utilityNoOp` path, running
+`vacuum.VacuumWithFSM(pool, txnMgr, rel, ctx.FSM)` for each target
+relation. Without explicit targets, it vacuums all non-virtual user tables
+via `catalog.InMemory.AllTables()`.
+
+### 2.5 Wiring
+
+| Location | Change |
+|---|---|
+| `initdb.Runtime` | New `FSM *storage.FSM` field; created by `Open()` |
+| `server.Config` | New `FSM *storage.FSM` field |
+| `server/dispatch.go` | `ctx.FSM = s.cfg.FSM` |
+| `cmd/goopg/main.go` | `cfg.FSM = rt.FSM` |
+| `autovacuum.Launcher` | New `FSM *storage.FSM` field; used in vacuum dispatch |
+| `executor.Context` | New `FSM *storage.FSM` field |
+
+## 3. Invariants
+
+| Property | Guarantee |
+|---|---|
+| No stale reuse | If FSM returns a full block, the insert invalidates the entry and falls through to the normal path — no duplicate writes |
+| nil-safe | All methods no-op on a nil FSM |
+| VACUUM population | `VacuumWithFSM` always calls `RecordFreeSpaceForPage` after each page scan |
+| Insert population | After every successful `PageAddHeapTuple`, the FSM is updated with the remaining free space |
+
+## 4. Tests
+
+| Test | Coverage |
+|---|---|
+| `TestFSMBasic` | Round-trip RecordFreeSpace / GetPageWithFreeSpace; invalidation |
+| `TestFSMDropRelation` | DropRelation clears entries |
+| `TestFSMRecordFreeSpaceForPage` | Reads PageHeader.FreeSpace() |
+| `TestFSMNilSafe` | Nil FSM no-ops |
+| `TestFSMInsertReusesVacuumedPage` | DoD: INSERT + DELETE + VACUUM + INSERT → no relation extension |
+| `TestVacuumUpdatesFSM` | VACUUM updates FSM with post-vacuum free space |
+| `TestFSMInsertUpdatesFSM` | INSERT populates FSM with remaining page free space |
+| `TestVacuumSQLDispatch` | VACUUM SQL routes to vacuumOp (not utilityNoOp) |
+| `TestFSMMultiTransactionReuse` | Multi-tx lifecycle: fill → delete → vacuum → reuse |
+
+## 5. Deferred
+
+- **Disk persistence** (`_fsm` fork file): the FSM is in-memory only; it is
+  empty after a server restart until VACUUM runs. Upstream's `pg_freespacemap`
+  tree-of-pages format is reserved for a follow-up.
+- **GetPageWithFreeSpace O(log N)**: current scan is O(N pages). The FSM's
+  page count is bounded by the relation size; for typical workloads this is
+  fast enough.  A binary heap or tree would improve worst-case for very large
+  tables.
+- **TRUNCATE integration**: `DropRelation` is not yet called on `TRUNCATE TABLE`.

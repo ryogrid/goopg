@@ -35,6 +35,9 @@ type Runtime struct {
 	Pool         *storage.Pool
 	TxnMgr       *mvcc.Manager
 	Catalog      catalog.Catalog
+	// FSM is the in-memory free-space map (M0046-0003). VACUUM updates
+	// it; INSERT consults it before extending the relation.
+	FSM          *storage.FSM
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
@@ -735,6 +738,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Activity:       act,
 		DataDir:        abs,
 		Standby:        standby,
+		FSM:            storage.NewFSM(),
 	}
 
 	// Background WAL writer loop (M0042-0003): timer-driven periodic flush
