@@ -751,6 +751,20 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
         Q20 and remaining queries not reached.
         Two new issues identified: (A) MHJ lazy-iterator refactor
         needed (see below); (B) HammerDB load TCP drop still open.
+  - [x] **HammerDB SF=1 FULL schema build (run-006, 2026‑05‑04).**
+        Documented in `analysis/tpch-hammerdb-run-006.md`.
+        **First-ever full SF=1 build via HammerDB:** orders=1,500,000,
+        lineitem=6,001,985, all 16 indexes created, ANALYZE done.
+        ORDERS/LINEITEM load drop **FIXED** via `runtime.GC()`
+        removal (99fda6e). The forced GC introduced by M0032-0006
+        was itself the cause of the connection drop — its
+        stop-the-world pauses on a 5–10 GB heap exceeded HammerDB
+        libpq's tolerance.
+        Power test: Q14=34.5s ✓, Q2=9.94s ✓ on full SF=1 data.
+        Q9 still TIMEOUT (>16 min) but **no heap explosion** —
+        M0043-0001 lazy iterator working as designed; needs
+        further executor optimisation (predicate pushdown — see
+        Milestone 0043 follow-ups).
   - [x] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
 
 - [ ] M0040-0004: Recursive subquery unnest inside IN/SubqueryExpr
@@ -904,25 +918,47 @@ previously‑allowlisted numeric‑precision deltas (Q1, Q8, Q14).
         22/22 PASS. `go test ./...` clean (only pre‑existing
         `tmp/` build error unaffected).
 
-## Milestone 0043 — MHJ lazy-iterator refactor (P0 blocker for Q9/SF=1)
+## Milestone 0043 — MHJ lazy iteration & predicate pushdown
 
 Identified in `analysis/tpch-hammerdb-run-005.md` (2026-05-04).
 The M0041-0002 `expandChain` in `multiHashJoinOp.Open()`
-(`internal/executor/multi_hash_join.go`) materialises **all** cross-
+(`internal/executor/multi_hash_join.go`) materialised **all** cross-
 product rows into `o.rows []Row` before yielding any result. On 1.8M-
-lineitem data (30% SF=1), Q9's 6-table join fills > 19 GB heap and
-causes 91% GC overhead — the query never finishes in practice.
+lineitem data (30% SF=1), Q9's 6-table join filled > 19 GB heap and
+caused 91% GC overhead — the query never finished in practice.
 
-- [ ] M0043-0001: Replace `expandChain` + `o.rows` materialisation
-      with a lazy per-call iterator. Design doc
-      `docs/design/0043-0001-mhj-lazy-iterator.md`.
-  - [ ] Add lazy state fields to `multiHashJoinOp`: per-step cursor
-        indices (analogous to `lazyMatchIdx` in binary `joinOp`).
-  - [ ] `Open()`: build hash tables only; do NOT materialise rows.
-  - [ ] `Next()`: advance the cursor chain one step at a time, yield
-        one row per call. Backtrack when a step is exhausted.
-  - [ ] Remove `o.rows []Row`, `o.idx int` fields.
-  - [ ] Verify: Q9 completes in O(10s) on 1.8M-lineitem partial data;
+- [x] **M0043-0001: MHJ lazy iterator** (landed 2026‑05‑04, b9dc46f).
+      Replaced `expandChain` + `o.rows` materialisation with a lazy
+      per-call iterator using `lazyOut`, `lazyMatches`, `lazyCursors`
+      (odometer-style cursor advancement). Open() now only builds
+      hash tables; Next() advances cursors one row at a time and
+      backtracks via initStepsFrom() when a step is exhausted.
+  - [x] Verified: `TestTPCHResultParity` identical=22 divergent=0
+        (unchanged), `TestRunTPCHQueriesAgainstSyntheticData`
+        22/22 PASS, run-006 Q9 no longer crashes the heap (RSS
+        bounded at 11 GB vs 19 GB explosion in run-005).
+  - [x] Caveat: Q9 on full SF=1 (6M lineitem) still exceeds 16 min
+        wall-time. The Cartesian fan-out is too large for a per-row
+        filter-eval + copyOut() loop. Tracked below as M0043-0002.
+
+- [ ] **M0043-0002: Predicate pushdown into MHJ chain steps.**
+      Identified in `analysis/tpch-hammerdb-run-006.md` (2026-05-04).
+      With M0043-0001's lazy iterator, Q9 no longer blows the heap
+      but is still too slow on 6M-row data: each emitted row
+      re-evaluates all residual filters and copies the full output
+      buffer. For Q9's 6-table join over 6M rows the per-row cost
+      compounds catastrophically.
+  - [ ] Push down filter predicates that reference only previously-
+        joined tables into the per-step probe so unproductive
+        prefixes are pruned before deeper steps are expanded.
+  - [ ] In `applyAndFilter()`, partition `o.filters` by the deepest
+        step they reference; evaluate each filter in `Next()`
+        immediately after the deepest step it depends on, not at
+        the leaf.
+  - [ ] If profile shows `datumKey()` (string conversion) dominates,
+        replace string-keyed hash tables with a fixed-width
+        numeric/byte-slice keyed map.
+  - [ ] Verify: Q9 completes in < 60 s on full SF=1 data;
         `TestTPCHResultParity` still identical=22 divergent=0.
 
 ## Milestone 0042 — Align goopg I/O with upstream PostgreSQL
