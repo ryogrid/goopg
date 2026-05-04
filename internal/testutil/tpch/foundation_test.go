@@ -136,17 +136,20 @@ func TestFoundationSeqScanFilterJoin(t *testing.T) {
 		t.Errorf("LIKE 'a%%': got %v, want [[alpha]]", rows)
 	}
 
-	// --- Test 7: 3-table JOIN (known planner issue: ≥3 tables) ---
-	// The bushy DP / MultiHashJoin chain detection may produce
-	// ColumnRef misalignment for ≥3 tables.  This is tracked
-	// under M0039 / M0041.  Don't fail the whole test, but log.
+	// --- Test 7: 3-table JOIN ---
+	// M0039/M0041 fixed ColumnRef misalignment for ≥3 tables.
+	// alpha (id=1) has t3.qty=100, filtered by WHERE t3.qty>150; only beta rows remain.
 	rows, err = c.Query(ctx, `SELECT t1.name, t3.qty FROM t1 JOIN t2 ON t1.id = t2.id JOIN t3 ON t1.id = t3.id WHERE t3.qty > 150 ORDER BY t3.qty`)
 	if err != nil {
 		t.Fatalf("3-table JOIN: %v", err)
 	}
 	if len(rows) != 2 {
-		t.Logf("KNOWN ISSUE (M0039/M0041): 3‑table JOIN got %d rows, want 2 — ColumnRef misalignment for ≥3 tables", len(rows))
-	} else if rows[0][0] != "alpha" {
-		t.Errorf("3-table JOIN row 0: %v", rows[0])
+		t.Fatalf("3-table JOIN: got %d rows, want 2", len(rows))
+	}
+	if rows[0][0] != "beta" || rows[0][1] != "200" {
+		t.Errorf("3-table JOIN row 0: got %v, want [beta 200]", rows[0])
+	}
+	if rows[1][0] != "beta" || rows[1][1] != "300" {
+		t.Errorf("3-table JOIN row 1: got %v, want [beta 300]", rows[1])
 	}
 }
