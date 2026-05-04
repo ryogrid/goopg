@@ -1074,6 +1074,130 @@ per‑backend process model. Anchor doc:
         ./internal/storage/... ./internal/wal/...
         -race`, full TPC-H parity.
 
+## Milestone 0044 — B-tree key support for HammerDB TPC-H schema types
+
+See `docs/milestones/0044-btree-tpch-key-types.md`.
+Identified in `analysis/tpch-additional-indexes.md` (2026-05-04):
+8 of the 16 supplementary TPC-H indexes fail today with
+"btree v0 only supports int4 / numeric keys" because the schema
+uses `varchar` / `char` / `timestamp` columns that the current
+B-tree key encoder rejects. This blocks Index Scan plans for
+every date-range filter in TPC-H (Q1/Q3/Q4/Q5/Q6/Q7/Q8/Q10/Q12
+/Q14/Q15/Q20) and for the segment / type filters in Q3 and Q13.
+
+Both **single-column** and **compound (multi-column) mixed-type**
+indexes must work. Both **PRIMARY KEY** (unique) and
+**secondary** (non-unique) paths must accept the new types. The
+existing `encodeCompositeBTreeKey` concatenation strategy needs
+each new encoding to be **self-terminating** (prefix code) so
+composite-key bytewise comparison stays correct.
+
+- [ ] M0044-0001: `varchar(N)` B-tree key encoding. Design doc
+      `docs/design/0044-0001-varchar-key-encoding.md`.
+  - [ ] Add `EncodeVarchar(payload []byte) []byte` to
+        `internal/access/btree/btree.go` — `0x00 0x01` escape
+        rule for embedded `0x00`/`0x01`, then `0x00` terminator.
+  - [ ] Extend `encodeBTreeKeyForColumn` in
+        `internal/executor/operators_ddl.go` with a `varchar`
+        branch that pulls the runtime `KindString` Datum bytes
+        and routes through `EncodeVarchar`.
+  - [ ] Relax `isSupportedBTreeKeyType` to accept `varchar`,
+        `character varying`. (`text` deferred to a follow-up.)
+  - [ ] New unit test
+        `internal/access/btree/varchar_key_test.go` — ordering
+        across mixed-length payloads, empty string, escape
+        cases.
+  - [ ] Integration test
+        `internal/executor/storage_ddl_varchar_test.go` builds a
+        single-column varchar index, asserts row-count parity
+        between IndexScan and SeqScan, and exercises UNIQUE
+        violations.
+
+- [ ] M0044-0002: `char(N)` B-tree key encoding. Design doc
+      `docs/design/0044-0002-char-key-encoding.md`.
+  - [ ] Add `EncodeChar(payload []byte) []byte` to
+        `internal/access/btree/btree.go` — trim trailing 0x20
+        bytes, then route through `EncodeVarchar`. Matches
+        PostgreSQL's blank-padded compare semantics.
+  - [ ] Extend `encodeBTreeKeyForColumn` with a `char` branch.
+  - [ ] Relax `isSupportedBTreeKeyType` to accept `char`,
+        `character`, `bpchar`.
+  - [ ] Unit test asserting
+        `EncodeChar("A         ") == EncodeChar("A")` and
+        ordering across pad/no-pad inputs.
+  - [ ] Integration test inserts both forms and verifies UNIQUE
+        rejects the duplicate.
+
+- [ ] M0044-0003: `timestamp` B-tree key encoding. Design doc
+      `docs/design/0044-0003-timestamp-key-encoding.md`.
+  - [ ] Add `EncodeTimestamp(microsSince2000 int64) []byte` to
+        `internal/access/btree/btree.go` — 8-byte BE sign-flipped,
+        identical layout to `EncodeInt8`.
+  - [ ] Extend `encodeBTreeKeyForColumn` with a `timestamp`
+        branch driven by the runtime `KindTime` Datum.
+  - [ ] Relax `isSupportedBTreeKeyType` to accept `timestamp`,
+        `timestamp without time zone`. (`timestamptz` deferred.)
+  - [ ] Unit test covering chronological ordering across the
+        epoch boundary and a few TPC-H-shaped dates.
+  - [ ] Integration test builds a `lineitem(l_shipdate)` index
+        and verifies a `[1995-01-01, 1996-01-01)` RangeScan
+        returns the same rows as a SeqScan with the same
+        predicate.
+
+- [ ] M0044-0004: Compound B-tree indexes over mixed types.
+      Design doc `docs/design/0044-0004-compound-mixed-types.md`.
+  - [ ] Verify (no source change) that
+        `encodeCompositeBTreeKey` produces correctly-ordered
+        composite keys when concatenating any mix of
+        `{int4, int8, numeric, varchar, char, timestamp}` —
+        each encoding is already a prefix code, so the
+        concatenation is automatically a prefix code.
+  - [ ] New randomised property test
+        `internal/access/btree/composite_key_test.go` over the
+        mixed-type matrix.
+  - [ ] Integration test
+        `internal/executor/storage_ddl_compound_test.go` builds
+        the four canonical TPC-H mixed compound indexes
+        (timestamp+numeric, char+numeric, varchar+numeric,
+        timestamp+numeric+numeric) and asserts row-count parity.
+
+- [ ] M0044-0005: Index-scan planner integration for new types.
+      Design doc
+      `docs/design/0044-0005-index-scan-planner-integration.md`.
+  - [ ] Find every planner site that gates index eligibility on
+        column type and relax to match `isSupportedBTreeKeyType`.
+        Likely entry points:
+        `internal/planner/access_path.go::canUseIndex`,
+        `internal/planner/index_scan.go::buildIndexProbe`.
+  - [ ] Probe-key construction for varchar / char (route through
+        `KindString` → `EncodeVarchar`/`EncodeChar`) and for
+        timestamp (parse literal via existing
+        `parseTimestampLiteral`, route through `EncodeTimestamp`).
+  - [ ] `LIKE 'prefix%'` rewrite to a half-open RangeScan
+        `[prefix, prefix++)` — reuse the existing M0011 prefix-
+        range path, just relax the type guard.
+  - [ ] Unit tests in
+        `internal/planner/access_path_test.go` assert IndexScan
+        is picked over SeqScan for each new type's `=` and
+        range predicates.
+  - [ ] Integration test
+        `internal/executor/index_scan_tpch_test.go` builds the
+        TPC-H supplementary index set and asserts the EXPLAIN
+        output mentions IndexScan for representative predicates
+        from Q3, Q6, Q12, Q14, Q15, Q19.
+
+- [ ] M0044-0006: End-to-end verification. Re-run the full
+      HammerDB SF=1 power test (run-008) with all 16
+      supplementary indexes built and document wall-time deltas
+      vs run-007 in `analysis/tpch-hammerdb-run-008.md`.
+  - [ ] All 16 supplementary indexes succeed (vs. 8/16 today).
+  - [ ] Q3 / Q6 / Q14 / Q15 / Q19 wall times improve by ≥ 30 %
+        relative to run-007 — confirms the planner is using the
+        new indexes.
+  - [ ] `TestTPCHResultParity` identical=22 divergent=0 errored=0.
+  - [ ] Mark milestone `accepted` and tick the M0011 follow-up
+        boxes that this milestone subsumes.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

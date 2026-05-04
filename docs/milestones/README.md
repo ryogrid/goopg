@@ -77,3 +77,5 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0040 | Correlated subquery optimization (caching + IN-unnest)                  | accepted        | `0040-correlated-subquery-optimization.md` |
 | 0041 | Close remaining TPC-H result-parity gaps                                | accepted        | `0041-close-parity-gaps.md` |
 | 0042 | Align goopg's I/O subsystem with upstream PostgreSQL (buffered I/O, WAL writer, client backend) | planned | `0042-pg-io-alignment.md` |
+| 0043 | MHJ executor optimisations (lazy iterator + predicate pushdown) | accepted | `0043-mhj-executor-optimisations.md` |
+| 0044 | B-tree key support for HammerDB TPC-H schema types (varchar, char, timestamp, mixed compound) | planned | `0044-btree-tpch-key-types.md` |
