@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | draft                          |
+| Status      | accepted (landed 2026-05-04)   |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -58,3 +58,44 @@ The migration process must be idempotent. If the server crashes during migration
 ### Manual Verification
 - Manually create a simple `pg_catalog.json` and verify that the server converts it to heap tables on startup.
 - Verify that once migrated, the server no longer depends on the JSON file.
+
+## What Landed (2026-05-04)
+
+**Scope**: One-shot migration from JSON-only catalog to heap-table format.
+JSON decommission (removing JSON after migration) deferred.
+
+### `internal/initdb/open.go`
+
+- `maybeMigrateCatalogToHeap(mgr, cat)` — called in `Open()` after `loadCatalogSnapshot`
+  and before `loadSystemCatalogsIfPresent`. Detection logic:
+  1. pg_class relfile absent → pre-M0030-0001 cluster → no-op
+  2. pg_class has user-table rows (OID ≥ FirstUserOID) → already migrated → no-op
+  3. pg_class has 0 user rows AND in-memory catalog has user tables → MIGRATE
+  Migration: encodes all user tables as pg_class + pg_attribute heap tuples (using
+  bootstrapXID=1 for visibility) and appends them via `appendCatalogRows`.
+
+- `appendCatalogRows(mgr, rel, tuples)` — appends HeapTuples to the last page of an
+  existing relfile, extending to new pages when full. Used by migration to backfill
+  rows without disturbing existing bootstrap rows.
+
+### Detection (simplified from design doc)
+
+Instead of a `CatalogVersion` control file, migration is detected by inspecting
+pg_class for user-table rows. This is simpler and avoids a new file format but
+requires that the migration be idempotent: if interrupted mid-way, subsequent
+startups skip migration (pg_class has >0 user rows even if incomplete).
+
+### Tests (4 new in `catalog_migration_test.go`)
+
+- `TestMigrationFromLegacyJSONCluster` — creates legacy cluster (table via raw
+  catalog API → JSON only, not heap), opens → migration writes to pg_class
+- `TestMigrationIdempotent` — two opens → exactly 1 user row in pg_class
+- `TestMigrationNewClusterIsNoOp` — fresh cluster (no user tables) → no user rows
+  in pg_class after open
+- `TestMigrationPGAttributeRowsWritten` — column definitions also migrated
+
+### Still Deferred
+
+- JSON decommission: rename/remove `pg_catalog.json` after successful migration.
+- `CatalogVersion` field in JSON for explicit v0/v1 detection.
+- Migration of index metadata (pg_index or extended pg_class).

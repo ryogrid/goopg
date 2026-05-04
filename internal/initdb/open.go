@@ -389,6 +389,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// One-shot migration: if this is a legacy JSON-only cluster whose
+	// pg_class has no user-table rows, write all in-memory user tables to
+	// the pg_class/pg_attribute heap relfiles so future startups use the
+	// heap path (M0030-0004). Runs after loadCatalogSnapshot so the
+	// catalog is already populated from JSON; runs before
+	// loadSystemCatalogsIfPresent so system-catalog registration follows.
+	if err := maybeMigrateCatalogToHeap(mgr, cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: catalog migration: %w", err)
+	}
 	// Register system catalog heap tables (pg_type, pg_attribute) if their
 	// relfiles exist.  Must run after loadCatalogSnapshot / Restore so the
 	// registration survives the catalog reset that Restore() performs.
@@ -852,6 +864,164 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 	}
 
 	return nil
+}
+
+// maybeMigrateCatalogToHeap implements the M0030-0004 one-shot migration
+// gate. It detects legacy JSON-only clusters (pg_class relfile present but
+// no user-table rows) and, when the in-memory catalog (loaded from JSON) has
+// user tables, writes them to pg_class/pg_attribute so future startups use
+// the heap path.
+//
+// Safe conditions:
+//   - No pg_class relfile: old cluster without M0030-0001 files → no-op.
+//   - pg_class has user rows (OID ≥ FirstUserOID): already migrated → no-op.
+//   - In-memory catalog has no user tables: nothing to migrate → no-op.
+//
+// Idempotent: if interrupted mid-way, the next startup sees some user rows
+// in pg_class and skips migration; the remaining tables are loaded from JSON
+// via TryRegisterUserTable's idempotency.
+func maybeMigrateCatalogToHeap(mgr *storage.Manager, cat *catalog.InMemory) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	nClassBlocks, err := mgr.NBlocks(classRel)
+	if err != nil || nClassBlocks == 0 {
+		return nil // no pg_class relfile — pre-M0030-0001 cluster
+	}
+
+	// Scan pg_class for any user-table row (fast early-exit).
+	page := make(storage.Page, storage.BlockSize)
+	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
+		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
+			return fmt.Errorf("maybeMigrate: scan pg_class blk %d: %w", blk, err)
+		}
+		count, _ := storage.PageLinePointerCount(page)
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID {
+				continue
+			}
+			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			row, err := catalog.DecodePGClassRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if row.OID >= catalog.FirstUserOID {
+				return nil // already has user rows — migration done
+			}
+		}
+	}
+
+	// pg_class has no user rows. Get user tables from the in-memory catalog.
+	userTables := cat.AllTables()
+	if len(userTables) == 0 {
+		return nil // nothing to migrate
+	}
+
+	// Build pg_class and pg_attribute tuples for all user tables.
+	xid := storage.TransactionID(bootstrapXID) // migration rows use bootstrap XID
+	var classTuples []storage.HeapTuple
+	var attrTuples []storage.HeapTuple
+
+	for _, tbl := range userTables {
+		ns := catalog.PublicNamespaceOID
+		if tbl.Schema == "pg_catalog" {
+			ns = catalog.PGCatalogNamespaceOID
+		}
+		classData := catalog.EncodePGClassRow(catalog.PGClassRow{
+			OID:            tbl.OID,
+			RelName:        tbl.Name,
+			RelNamespace:   uint32(ns),
+			RelKind:        "r",
+			RelNAtts:       int32(len(tbl.Columns)),
+			RelFileNode:    tbl.OID,
+			RelPersistence: "p",
+		})
+		classTuples = append(classTuples, storage.NewHeapTuple(xid, storage.InvalidTransactionID, classData))
+
+		for _, col := range tbl.Columns {
+			attrData := catalog.EncodePGAttributeRow(catalog.PGAttributeRow{
+				AttRelID:  tbl.OID,
+				AttName:   col.Name,
+				AttTypID:  catalog.TypeNameToOID(col.Type.Name),
+				AttNum:    int32(col.Ordinal + 1),
+				AttNotNull: col.NotNull,
+			})
+			attrTuples = append(attrTuples, storage.NewHeapTuple(xid, storage.InvalidTransactionID, attrData))
+		}
+	}
+
+	// Write pg_class rows.
+	if err := appendCatalogRows(mgr, classRel, classTuples); err != nil {
+		return fmt.Errorf("maybeMigrate: write pg_class: %w", err)
+	}
+
+	// Write pg_attribute rows.
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if nAttrBlocks, _ := mgr.NBlocks(attrRel); nAttrBlocks > 0 {
+		if err := appendCatalogRows(mgr, attrRel, attrTuples); err != nil {
+			return fmt.Errorf("maybeMigrate: write pg_attribute: %w", err)
+		}
+	}
+	return nil
+}
+
+// appendCatalogRows appends HeapTuples to the last page of a relfile,
+// extending to new pages when the current page is full. Used by the
+// catalog migration (M0030-0004) to backfill user-table rows into
+// pg_class and pg_attribute without disturbing the existing bootstrap rows.
+func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []storage.HeapTuple) error {
+	if len(tuples) == 0 {
+		return nil
+	}
+	nBlocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return fmt.Errorf("NBlocks: %w", err)
+	}
+	if nBlocks == 0 {
+		return fmt.Errorf("appendCatalogRows: relfile OID %d has 0 blocks", rel.RelOid)
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+	curBlk := nBlocks - 1
+	if err := mgr.ReadBlock(rel, curBlk, page); err != nil {
+		return fmt.Errorf("ReadBlock %d: %w", curBlk, err)
+	}
+
+	for _, tup := range tuples {
+		if _, addErr := storage.PageAddHeapTuple(page, tup); addErr == nil {
+			continue
+		}
+		// Page full — flush current, extend new page.
+		if err := mgr.WriteBlock(rel, curBlk, page); err != nil {
+			return fmt.Errorf("WriteBlock %d: %w", curBlk, err)
+		}
+		for i := range page {
+			page[i] = 0
+		}
+		if err := storage.InitPage(page); err != nil {
+			return err
+		}
+		curBlk, err = mgr.Extend(rel, page)
+		if err != nil {
+			return fmt.Errorf("Extend: %w", err)
+		}
+		if _, addErr := storage.PageAddHeapTuple(page, tup); addErr != nil {
+			return fmt.Errorf("PageAddHeapTuple on fresh page: %w", addErr)
+		}
+	}
+	return mgr.WriteBlock(rel, curBlk, page)
 }
 
 // loadUserTablesFromHeap supplements the in-memory catalog with user tables

@@ -338,8 +338,14 @@ loading switch.**
       last SaveCatalog (crash scenario) are recovered from heap.
       TestCreateTableSurvivesRestartViaCatalogHeap: delete JSON → restart → table
       present from heap. JSON decommission deferred to M0030-0004.
-- [ ] JSON-snapshot to heap-table migration gate (M0030-0004).
+- [x] JSON-snapshot to heap-table migration gate (M0030-0004).
       Design doc `docs/design/0030-0004-catalog-migration-gate.md`.
+      **Landed 2026-05-04**: maybeMigrateCatalogToHeap in Open() detects
+      legacy JSON-only clusters (pg_class has 0 user rows), writes all
+      in-memory user tables to pg_class/pg_attribute. appendCatalogRows
+      helper appends to existing pages. Detection via pg_class user-row
+      count (no CatalogVersion needed). 4 tests: migration fires, idempotent,
+      no-op on fresh cluster, pg_attribute rows written.
 - [ ] pg_attribute / pg_type SQL surface and OID resolution (M0030-0005).
       Design doc `docs/design/0030-0005-catalog-sql-surface.md`.
 - [ ] Transactional DDL foundation (M0030-0006).
