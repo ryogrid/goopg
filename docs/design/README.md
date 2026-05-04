@@ -219,4 +219,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0044-0001 | [VARCHAR B-tree Key Encoding (M0044)](0044-0001-varchar-key-encoding.md) | accepted | Self-terminating, sortable `EncodeVarchar` encoding for `varchar(N)` B-tree keys. Uses `0x01` as escape introducer: `0x00`→`[0x01,0x01]`, `0x01`→`[0x01,0x02]`, terminator `0x00`. Bytewise order matches C-locale string order. Self-terminating design makes it safe for composite keys. Extends `encodeBTreeKeyForColumn` + `isSupportedBTreeKeyType` in DDL executor. Five btree unit tests + three executor integration tests (CREATE INDEX, UNIQUE rejection, RangeScan parity). Unblocks 8 failing TPC-H varchar/char/timestamp supplementary indexes. |
 
+| 0044-0002 | [CHAR B-tree Key Encoding (M0044)](0044-0002-char-key-encoding.md) | accepted | `EncodeChar` = trim trailing spaces + `EncodeVarchar`. Implements PostgreSQL blank-padded comparison semantics: 'A' and 'A         ' produce identical key bytes. Adds `isCharType` (char/character/bpchar) + char case in `encodeBTreeKeyForColumn`. Five unit tests (trim equality, monotone order, all-spaces edge, leading-space preservation, TPC-H shapes) + two integration tests (CREATE INDEX, UNIQUE duplicate rejection). |
+
 Append new rows in numeric order. Do not reorder.

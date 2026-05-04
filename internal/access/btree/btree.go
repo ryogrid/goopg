@@ -351,6 +351,21 @@ func EncodeVarchar(payload []byte) []byte {
 	return out
 }
 
+// EncodeChar encodes a CHAR(N) (blank-padded character) value as a
+// sortable, self-terminating byte sequence matching PostgreSQL's
+// blank-padded comparison semantics.
+//
+// Trailing 0x20 (space) bytes are stripped before encoding, so
+// 'A' and 'A         ' (any number of trailing spaces) produce
+// identical bytes — required for index correctness when goopg stores
+// the declared-length-padded form in the heap but the query probes
+// with an unpadded literal.
+//
+// After trimming, the encoding is identical to EncodeVarchar.
+func EncodeChar(payload []byte) []byte {
+	return EncodeVarchar(bytes.TrimRight(payload, " "))
+}
+
 // CompareKeys is straight bytewise lexicographic comparison.
 //
 // For int4 keys (all 4 bytes) this matches numeric order by

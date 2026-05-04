@@ -1130,20 +1130,17 @@ composite-key bytewise comparison stays correct.
   - [x] Unit tests `internal/access/btree/varchar_key_test.go`
   - [x] Integration test `internal/executor/storage_ddl_varchar_test.go`
 
-- [ ] M0044-0002: `char(N)` B-tree key encoding. Design doc
+- [x] M0044-0002: `char(N)` B-tree key encoding. Design doc
       `docs/design/0044-0002-char-key-encoding.md`.
-  - [ ] Add `EncodeChar(payload []byte) []byte` to
-        `internal/access/btree/btree.go` — trim trailing 0x20
-        bytes, then route through `EncodeVarchar`. Matches
-        PostgreSQL's blank-padded compare semantics.
-  - [ ] Extend `encodeBTreeKeyForColumn` with a `char` branch.
-  - [ ] Relax `isSupportedBTreeKeyType` to accept `char`,
-        `character`, `bpchar`.
-  - [ ] Unit test asserting
-        `EncodeChar("A         ") == EncodeChar("A")` and
-        ordering across pad/no-pad inputs.
-  - [ ] Integration test inserts both forms and verifies UNIQUE
-        rejects the duplicate.
+      (landed 2026-05-04: `EncodeChar = EncodeVarchar(TrimRight(payload, " "))`.
+      `isCharType` (char/character/bpchar) + char case in
+      `encodeBTreeKeyForColumn`. 5 unit tests + 2 executor integration
+      tests. `go test ./internal/access/btree/ ./internal/executor/` green.)
+  - [x] Add `EncodeChar(payload []byte) []byte` to btree.go
+  - [x] Extend `encodeBTreeKeyForColumn` with char branch
+  - [x] Relax `isSupportedBTreeKeyType` to accept char/character/bpchar
+  - [x] Unit tests `internal/access/btree/char_key_test.go`
+  - [x] Integration test `internal/executor/storage_ddl_char_test.go`
 
 - [ ] M0044-0003: `timestamp` B-tree key encoding. Design doc
       `docs/design/0044-0003-timestamp-key-encoding.md`.

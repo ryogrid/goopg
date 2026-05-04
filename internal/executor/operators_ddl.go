@@ -622,6 +622,11 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeVarchar([]byte(v.String)), nil
+	case isCharType(col.Type.Name):
+		if v.Kind != KindString {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
+		}
+		return btree.EncodeChar([]byte(v.String)), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
@@ -675,12 +680,23 @@ func isVarcharType(name string) bool {
 	}
 }
 
+// isCharType returns true for the fixed-length blank-padded character
+// types accepted by M0044-0002 B-tree key encoding.
+func isCharType(name string) bool {
+	switch strings.ToLower(name) {
+	case "char", "character", "bpchar":
+		return true
+	default:
+		return false
+	}
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
-// and numeric landed for HammerDB TPC-H compatibility. varchar/char
-// landed for M0044-0001.
+// and numeric landed for HammerDB TPC-H compatibility. varchar landed
+// in M0044-0001; char landed in M0044-0002.
 func isSupportedBTreeKeyType(name string) bool {
-	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) || isVarcharType(name)
+	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) || isVarcharType(name) || isCharType(name)
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
