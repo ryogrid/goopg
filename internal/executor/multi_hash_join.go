@@ -10,10 +10,17 @@ import (
 // iterate all match combinations across the chain steps lazily via
 // Next(), one output row per call.
 //
-// M0043: replaced the previous expandChain() full-materialisation
-// (which stored all rows in o.rows before yielding any, causing
-// >19 GB heap + 91% GC overhead on Q9 with 1.8M lineitem rows)
-// with a lazy cursor-based iterator.
+// M0043-0001: replaced expandChain() full-materialisation (which
+// stored all rows in o.rows before yielding any, causing >19 GB heap
+// + 91% GC overhead on Q9 with 1.8M lineitem rows) with a lazy
+// cursor-based iterator.
+//
+// M0043-0002: residual filters are partitioned by the deepest chain
+// step their referenced columns require, and evaluated immediately
+// after that step's match is bound. A failing per-step filter aborts
+// the current cursor prefix without expanding deeper steps. This
+// converts O(probe × all-step Cartesian) expansion into early-exit
+// search.
 type multiHashJoinOp struct {
 	plan     *planner.MultiHashJoin
 	children []Operator
@@ -21,18 +28,24 @@ type multiHashJoinOp struct {
 	probeOp  Operator
 	keySteps []keyStep // ordered lookup chain
 	filters  []planner.Expr
-	nulls    []Row  // null-padded rows for schema
-	tableOff []int  // precomputed offset of each table in output
+	nulls    []Row // null-padded rows for schema
+	tableOff []int // precomputed offset of each table in output
 	schema   planner.Schema
 	ctx      *Context
 
-	// Lazy iterator state (M0043). Per-step cursor arrays are
+	// M0043-0002 filter partitioning. Populated in Open() once
+	// per query; consulted on the hot path.
+	probeFilters []planner.Expr   // eval after advanceProbe
+	stepFilters  [][]planner.Expr // stepFilters[s] = filters first eval-able after step s
+	leafFilters  []planner.Expr   // catch-all (subqueries / OuterColumnRef / out-of-scope refs)
+
+	// Lazy iterator state. Per-step cursor arrays are
 	// len(keySteps); the outer loop advances from the last step
 	// backwards (like an odometer).
 	lazyOut      Row     // current shared output buffer (reused across Next calls)
 	lazyMatches  [][]Row // lazyMatches[i] = hash-table matches for step i given the current prefix
 	lazyCursors  []int   // lazyCursors[i] = index into lazyMatches[i]
-	lazyInit     bool    // true once the first probe row has been fetched
+	lazyInit     bool    // true once a probe row has yielded a valid leaf
 	lazyProbeEOF bool    // true once probeOp is exhausted
 }
 
@@ -193,6 +206,11 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 		acc += len(o.nulls[i])
 	}
 
+	// M0043-0002: classify each filter by the deepest chain step
+	// its referenced columns require, so step-time eval can prune
+	// prefixes before they expand into deeper steps.
+	o.partitionFilters()
+
 	// Allocate per-step cursor state.
 	o.lazyMatches = make([][]Row, len(o.keySteps))
 	o.lazyCursors = make([]int, len(o.keySteps))
@@ -201,10 +219,125 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 	return nil
 }
 
-// Next returns the next joined row by advancing the lazy cursor state.
-// It streams probe rows one at a time and iterates all match
-// combinations across chain steps without materialising the full
-// Cartesian product into memory.
+// partitionFilters splits o.filters into probeFilters,
+// stepFilters[s], and leafFilters according to the deepest chain
+// step each filter's referenced columns require. Called once per
+// Open(); off the hot path.
+func (o *multiHashJoinOp) partitionFilters() {
+	nTables := len(o.plan.Tables)
+	nSteps := len(o.keySteps)
+	o.probeFilters = nil
+	o.stepFilters = make([][]planner.Expr, nSteps)
+	o.leafFilters = nil
+
+	if len(o.filters) == 0 {
+		return
+	}
+
+	// bindStepOfTable[t] = -1 if t is the probe (bound by
+	// advanceProbe), s if t is bound by chain step s, -2 if t
+	// is unreachable from the chain (defensive — should not
+	// occur in practice).
+	bindStepOfTable := make([]int, nTables)
+	for i := range bindStepOfTable {
+		bindStepOfTable[i] = -2
+	}
+	bindStepOfTable[o.plan.ProbeTable] = -1
+	for s, k := range o.keySteps {
+		bindStepOfTable[k.hashTblIndex] = s
+	}
+
+	// tableEnd[t] = exclusive upper bound of table t's column
+	// range in lazyOut. tableEnd is len(nulls[t]) past tableOff.
+	tableEnd := make([]int, nTables)
+	for i := 0; i < nTables; i++ {
+		tableEnd[i] = o.tableOff[i] + len(o.nulls[i])
+	}
+
+	tableOf := func(idx int) int {
+		// Linear scan is fine: nTables ≤ ~10 in practice.
+		for t := 0; t < nTables; t++ {
+			if idx >= o.tableOff[t] && idx < tableEnd[t] {
+				return t
+			}
+		}
+		return -1 // out of range — should never happen
+	}
+
+	for _, f := range o.filters {
+		var (
+			outOfScope bool
+			anyTable   bool
+			maxStep    = -1 // pessimistic (probe-only); raised by per-table joins
+		)
+		// Walk the expression tree once, accumulating the
+		// deepest binding step encountered along the way.
+		walkColumnRefs(f, func(idx int) {
+			t := tableOf(idx)
+			if t < 0 || bindStepOfTable[t] == -2 {
+				outOfScope = true
+				return
+			}
+			anyTable = true
+			if bs := bindStepOfTable[t]; bs > maxStep {
+				maxStep = bs
+			}
+		}, func() {
+			outOfScope = true
+		})
+
+		if outOfScope {
+			o.leafFilters = append(o.leafFilters, f)
+			continue
+		}
+		if !anyTable || maxStep == -1 {
+			// Constant or probe-only; evaluate at probe time.
+			o.probeFilters = append(o.probeFilters, f)
+			continue
+		}
+		o.stepFilters[maxStep] = append(o.stepFilters[maxStep], f)
+	}
+}
+
+// walkColumnRefs visits every ColumnRef.Index in e via onIdx.
+// Triggers onOuter for any reference that disqualifies pushdown
+// (OuterColumnRef, SubqueryExpr, ExistsExpr, InExpr). Mirrors the
+// planner's pushdown.go::walkColumnRefs walker so the executor does
+// not depend on internal/planner's package layout.
+func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
+	switch x := e.(type) {
+	case nil:
+	case *planner.ColumnRef:
+		onIdx(x.Index)
+	case *planner.OuterColumnRef:
+		onOuter()
+	case *planner.SubqueryExpr, *planner.ExistsExpr, *planner.InExpr:
+		onOuter()
+	case *planner.BinaryOp:
+		walkColumnRefs(x.Left, onIdx, onOuter)
+		walkColumnRefs(x.Right, onIdx, onOuter)
+	case *planner.UnaryOp:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *planner.FuncCall:
+		for _, a := range x.Args {
+			walkColumnRefs(a, onIdx, onOuter)
+		}
+	case *planner.CaseExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+		for _, w := range x.Whens {
+			walkColumnRefs(w.When, onIdx, onOuter)
+			walkColumnRefs(w.Then, onIdx, onOuter)
+		}
+		walkColumnRefs(x.Else, onIdx, onOuter)
+	case *planner.ExtractExpr:
+		walkColumnRefs(x.Source, onIdx, onOuter)
+	}
+}
+
+// Next returns the next joined row. The state machine alternates
+// between "advance to next probe + initialise chain" and "advance
+// the cursor odometer". Filters are evaluated at the earliest step
+// where their referenced columns are bound.
 func (o *multiHashJoinOp) Next() (Row, error) {
 	for {
 		if o.lazyProbeEOF {
@@ -212,65 +345,45 @@ func (o *multiHashJoinOp) Next() (Row, error) {
 		}
 
 		if !o.lazyInit {
-			// Fetch the first/next probe row.
+			// Fetch the next probe row.
 			if err := o.advanceProbe(); err != nil {
 				return nil, err
 			}
 			if o.lazyProbeEOF {
 				return nil, EOF
 			}
-			// Init step cursors for the new probe row, starting
-			// from step 0.
-			if ok := o.initStepsFrom(0); !ok {
-				// No match at some step — try next probe row.
-				o.lazyInit = false
+			// Probe-only filters (and constants) — evaluated
+			// once per probe row; failure skips the row.
+			if ok, err := o.evalFilters(o.probeFilters); err != nil {
+				return nil, err
+			} else if !ok {
+				continue
+			}
+			// Find the first valid combination across all
+			// chain steps. Failure means this probe row has
+			// no valid join match; advance to the next probe.
+			ok, err := o.initStepHelper(0)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
 				continue
 			}
 			o.lazyInit = true
-			// Cursors already point at first match per step;
-			// apply all steps and check filters.
-			if ok, err := o.applyAndFilter(); err != nil {
-				return nil, err
-			} else if ok {
-				return o.copyOut(), nil
-			}
-			// Filter rejected — fall through to advance.
+			return o.copyOut(), nil
 		}
 
-		// Advance cursors (odometer from last step).
-		advanced := false
-		for s := len(o.keySteps) - 1; s >= 0; s-- {
-			o.lazyCursors[s]++
-			if o.lazyCursors[s] < len(o.lazyMatches[s]) {
-				// Apply this step's new match into lazyOut.
-				m := o.lazyMatches[s][o.lazyCursors[s]]
-				dstOff := o.tableOff[o.keySteps[s].hashTblIndex]
-				copy(o.lazyOut[dstOff:], m)
-				// Re-init all deeper steps from s+1.
-				if ok := o.initStepsFrom(s + 1); !ok {
-					// No match at a deeper step; continue
-					// incrementing s (backtrack).
-					continue
-				}
-				advanced = true
-				break
-			}
-			// This step is exhausted — reset and backtrack.
-			o.lazyCursors[s] = 0
+		// Already on a valid combination; advance to the next.
+		ok, err := o.advanceFrom(len(o.keySteps) - 1)
+		if err != nil {
+			return nil, err
 		}
-
-		if !advanced {
-			// All steps exhausted for this probe row — next probe.
+		if !ok {
+			// All combinations exhausted for this probe row.
 			o.lazyInit = false
 			continue
 		}
-
-		if ok, err := o.applyAndFilter(); err != nil {
-			return nil, err
-		} else if ok {
-			return o.copyOut(), nil
-		}
-		// Filter rejected — loop to advance again.
+		return o.copyOut(), nil
 	}
 }
 
@@ -293,36 +406,100 @@ func (o *multiHashJoinOp) advanceProbe() error {
 	return nil
 }
 
-// initStepsFrom initialises match slices and cursors for steps
-// [startStep .. len(keySteps)-1] based on the current lazyOut
-// content. Returns false if any step has no matches (meaning this
-// combination of probe+prefix yields no output rows at all).
-func (o *multiHashJoinOp) initStepsFrom(startStep int) bool {
-	for s := startStep; s < len(o.keySteps); s++ {
-		step := o.keySteps[s]
-		srcOff := o.tableOff[step.srcTable]
-		srcLen := len(o.nulls[step.srcTable])
-		if step.srcCol >= srcLen {
-			return false
-		}
-		keyVal := o.lazyOut[srcOff+step.srcCol]
-		matches := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
-		if len(matches) == 0 {
-			return false // INNER semantics: no match → skip
-		}
-		o.lazyMatches[s] = matches
-		o.lazyCursors[s] = 0
-		// Apply first match of this step into lazyOut.
-		dstOff := o.tableOff[step.hashTblIndex]
-		copy(o.lazyOut[dstOff:], matches[0])
+// initStepHelper recursively descends from step `s` to the leaf,
+// binding the first match at each step that yields a leaf where
+// every step-filter (at every level) and every leaf-filter passes.
+// Returns (true, nil) on success with lazyOut populated; (false,
+// nil) when no valid configuration exists from this state.
+func (o *multiHashJoinOp) initStepHelper(s int) (bool, error) {
+	if s >= len(o.keySteps) {
+		// Base case: leaf. Evaluate any filters that did not
+		// classify into per-step filters (subqueries, etc).
+		return o.evalFilters(o.leafFilters)
 	}
-	return true
+	step := o.keySteps[s]
+	srcOff := o.tableOff[step.srcTable]
+	srcLen := len(o.nulls[step.srcTable])
+	if step.srcCol >= srcLen {
+		return false, nil
+	}
+	keyVal := o.lazyOut[srcOff+step.srcCol]
+	matches := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
+	if len(matches) == 0 {
+		return false, nil
+	}
+	o.lazyMatches[s] = matches
+	dstOff := o.tableOff[step.hashTblIndex]
+	stepFs := o.stepFilters[s]
+	for c := 0; c < len(matches); c++ {
+		copy(o.lazyOut[dstOff:], matches[c])
+		o.lazyCursors[s] = c
+		// Evaluate filters whose deepest table is this step.
+		// If any reject, skip this match without descending.
+		if ok, err := o.evalFilters(stepFs); err != nil {
+			return false, err
+		} else if !ok {
+			continue
+		}
+		// Try to bind deeper steps.
+		ok, err := o.initStepHelper(s + 1)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+		// Deeper steps had no valid combination for this
+		// match; try the next match at this step.
+	}
+	return false, nil
 }
 
-// applyAndFilter evaluates the residual filters on the current
-// lazyOut row. Returns true when the row should be emitted.
-func (o *multiHashJoinOp) applyAndFilter() (bool, error) {
-	for _, f := range o.filters {
+// advanceFrom moves the chain cursor from a valid leaf to the next
+// valid leaf, starting from step `s`. Returns (true, nil) when a
+// next configuration exists; (false, nil) when this probe row is
+// exhausted.
+func (o *multiHashJoinOp) advanceFrom(s int) (bool, error) {
+	if s < 0 {
+		return false, nil
+	}
+	step := o.keySteps[s]
+	dstOff := o.tableOff[step.hashTblIndex]
+	matches := o.lazyMatches[s]
+	stepFs := o.stepFilters[s]
+	for {
+		o.lazyCursors[s]++
+		if o.lazyCursors[s] >= len(matches) {
+			// Exhausted at this level — recursive backtrack.
+			// Parent's advance will re-init this level (and
+			// everything deeper) via initStepHelper, so we
+			// don't need to manually reset cursor[s] here.
+			return o.advanceFrom(s - 1)
+		}
+		copy(o.lazyOut[dstOff:], matches[o.lazyCursors[s]])
+		// Re-evaluate this step's filters with the new match.
+		if ok, err := o.evalFilters(stepFs); err != nil {
+			return false, err
+		} else if !ok {
+			continue
+		}
+		// Find the first valid configuration for deeper steps.
+		ok, err := o.initStepHelper(s + 1)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+		// Deeper init failed; try the next match at this level.
+	}
+}
+
+// evalFilters returns true iff every filter in `fs` evaluates to
+// boolean-true on the current lazyOut. NULL or non-bool results
+// reject the row, matching the M0043-0001 leaf-eval semantics.
+func (o *multiHashJoinOp) evalFilters(fs []planner.Expr) (bool, error) {
+	for _, f := range fs {
 		v, err := evalExpr(f, o.lazyOut, o.ctx)
 		if err != nil {
 			return false, err
@@ -349,6 +526,9 @@ func (o *multiHashJoinOp) Close() error {
 	o.lazyOut = nil
 	o.lazyMatches = nil
 	o.lazyCursors = nil
+	o.probeFilters = nil
+	o.stepFilters = nil
+	o.leafFilters = nil
 	o.ctx = nil
 	for _, c := range o.children {
 		_ = c.Close()

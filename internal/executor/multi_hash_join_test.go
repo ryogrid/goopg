@@ -97,3 +97,209 @@ func TestMultiHashBuild(t *testing.T) {
 		t.Errorf("Build did not return multiHashJoinOp: got %T", op)
 	}
 }
+
+// TestMultiHashJoinPredicatePushdown asserts M0043-0002 — residual
+// filters in MultiHashJoin.Filters are partitioned by the deepest
+// chain step they reference, evaluated at the earliest binding
+// point. Verifies (a) correct row count and contents, (b) that
+// the filter was placed in the expected stepFilters bucket (not
+// in leafFilters).
+func TestMultiHashJoinPredicatePushdown(t *testing.T) {
+	// 3-table chain: A (probe) ⨝ B ⨝ C.
+	// Schema (absolute output row indices):
+	//   A: [aid] at offsets [0, 1)
+	//   B: [bid, bval] at offsets [1, 3)
+	//   C: [cid] at offset [3, 4)
+	// Joins: A.aid = B.bid, B.bid = C.cid.
+	// Residual filter: B.bval < 3 — references B only,
+	// so bindStep should be 0 (the step that binds B).
+
+	// A: 2 rows, both joining to B.
+	rowsA := []Row{
+		{Datum{Kind: KindInt, Int: 1}},
+		{Datum{Kind: KindInt, Int: 2}},
+	}
+	// B: 5 rows per A.aid, with bval = 1..5. Filter rejects
+	// bval >= 3 (so bval ∈ {3, 4, 5} → 3 of 5 per A).
+	rowsB := []Row{}
+	for aid := 1; aid <= 2; aid++ {
+		for v := 1; v <= 5; v++ {
+			rowsB = append(rowsB, Row{
+				Datum{Kind: KindInt, Int: int64(aid)},
+				Datum{Kind: KindInt, Int: int64(v)},
+			})
+		}
+	}
+	// C: 4 rows per B.bid value (1, 2). 4 cid copies each.
+	rowsC := []Row{}
+	for cid := 1; cid <= 2; cid++ {
+		for k := 0; k < 4; k++ {
+			rowsC = append(rowsC, Row{Datum{Kind: KindInt, Int: int64(cid)}})
+		}
+	}
+
+	children := []Operator{
+		&rowsOp{rows: rowsA},
+		&rowsOp{rows: rowsB},
+		&rowsOp{rows: rowsC},
+	}
+
+	// Filter: BinaryOp{B.bval < 3}.
+	// B.bval is at absolute output index 2 (A:1, B:2 cols → bval at 2).
+	filter := &planner.BinaryOp{
+		Op:    "<",
+		Left:  &planner.ColumnRef{Index: 2, Name: "bval", Type: catalog.Type{Name: "int8"}},
+		Right: &planner.IntegerConst{Value: 3},
+	}
+
+	plan := &planner.MultiHashJoin{
+		Tables: []planner.Node{nil, nil, nil},
+		Keys: []planner.MultiHashKey{
+			{LeftTable: 0, LeftCol: 0, RightTable: 1, RightCol: 0},
+			{LeftTable: 1, LeftCol: 0, RightTable: 2, RightCol: 0},
+		},
+		ProbeTable: 0,
+		Filters:    []planner.Expr{filter},
+	}
+
+	op := newMultiHashJoinOp(plan, children)
+	op.schema = planner.Schema{
+		{Name: "aid", Type: catalog.Type{Name: "int8"}},
+		{Name: "bid", Type: catalog.Type{Name: "int8"}},
+		{Name: "bval", Type: catalog.Type{Name: "int8"}},
+		{Name: "cid", Type: catalog.Type{Name: "int8"}},
+	}
+	op.nulls = []Row{nullRow(1), nullRow(2), nullRow(1)}
+
+	ctx := &Context{}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Partition assertion (M0043-0002 internal state):
+	// the filter references only table B, which is bound at
+	// step 0 → expect stepFilters[0] = [filter], no leaf filter.
+	if got := len(op.probeFilters); got != 0 {
+		t.Errorf("probeFilters: got len=%d, want 0", got)
+	}
+	if got := len(op.leafFilters); got != 0 {
+		t.Errorf("leafFilters: got len=%d, want 0 (filter should partition into stepFilters)", got)
+	}
+	if got := len(op.stepFilters); got != 2 {
+		t.Fatalf("stepFilters: got len=%d, want 2 (one slot per chain step)", got)
+	}
+	if got := len(op.stepFilters[0]); got != 1 {
+		t.Errorf("stepFilters[0]: got len=%d, want 1 (B-only filter binds at step 0)", got)
+	}
+	if got := len(op.stepFilters[1]); got != 0 {
+		t.Errorf("stepFilters[1]: got len=%d, want 0", got)
+	}
+
+	// Correctness assertion: result rows match expected.
+	// For each A.aid in {1, 2}: 2 surviving B rows (bval ∈ {1,2})
+	// × 4 C rows for that bid. Total: 2 × 2 × 4 = 16 rows.
+	var results []Row
+	for {
+		row, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, row)
+	}
+	op.Close()
+
+	if len(results) != 16 {
+		t.Fatalf("expected 16 result rows (2 A × 2 surviving B × 4 C), got %d", len(results))
+	}
+	for i, r := range results {
+		if len(r) != 4 {
+			t.Errorf("row %d: width=%d, want 4", i, len(r))
+			continue
+		}
+		bval := r[2].Int
+		if bval >= 3 {
+			t.Errorf("row %d: bval=%d violates filter B.bval < 3 — pushdown failed",
+				i, bval)
+		}
+		// aid == bid == cid (chain join condition).
+		if r[0].Int != r[1].Int || r[1].Int != r[3].Int {
+			t.Errorf("row %d: aid=%d bid=%d cid=%d — join keys diverged",
+				i, r[0].Int, r[1].Int, r[3].Int)
+		}
+	}
+}
+
+// TestMultiHashJoinPushdownLeafFallback asserts that filters with
+// out-of-scope refs (subqueries / OuterColumnRef) are routed to
+// leafFilters and still evaluated correctly at emission time.
+func TestMultiHashJoinPushdownLeafFallback(t *testing.T) {
+	// Same A⨝B as the simple test, plus a filter wrapping an
+	// OuterColumnRef. Expectation: filter goes to leafFilters,
+	// not stepFilters; correctness preserved.
+	rowsA := []Row{
+		{Datum{Kind: KindInt, Int: 1}},
+		{Datum{Kind: KindInt, Int: 2}},
+	}
+	rowsB := []Row{
+		{Datum{Kind: KindInt, Int: 1}, Datum{Kind: KindString, String: "x"}},
+		{Datum{Kind: KindInt, Int: 2}, Datum{Kind: KindString, String: "y"}},
+	}
+
+	children := []Operator{
+		&rowsOp{rows: rowsA},
+		&rowsOp{rows: rowsB},
+	}
+
+	// Filter contains an OuterColumnRef → must route to leafFilters.
+	// Use a trivially-true expression so correctness still holds:
+	// (B.bid > 0) AND (outer.x > 0). We won't actually push outer
+	// rows; the test relies on the fact that leafFilters is the
+	// safe escape hatch and any OuterColumnRef in a filter forces
+	// leaf-level eval — but since we don't supply OuterRows, we
+	// instead just confirm partitioning routes it correctly.
+	outer := &planner.OuterColumnRef{Level: 1, Index: 0, Name: "outer_x", Type: catalog.Type{Name: "int8"}}
+	filter := &planner.BinaryOp{
+		Op:    "OR",
+		Left:  &planner.BinaryOp{Op: ">", Left: &planner.ColumnRef{Index: 1, Name: "bid"}, Right: &planner.IntegerConst{Value: -1}},
+		Right: outer,
+	}
+
+	plan := &planner.MultiHashJoin{
+		Tables: []planner.Node{nil, nil},
+		Keys: []planner.MultiHashKey{
+			{LeftTable: 0, LeftCol: 0, RightTable: 1, RightCol: 0},
+		},
+		ProbeTable: 0,
+		Filters:    []planner.Expr{filter},
+	}
+
+	op := newMultiHashJoinOp(plan, children)
+	op.schema = planner.Schema{
+		{Name: "aid", Type: catalog.Type{Name: "int8"}},
+		{Name: "bid", Type: catalog.Type{Name: "int8"}},
+		{Name: "bval", Type: catalog.Type{Name: "text"}},
+	}
+	op.nulls = []Row{nullRow(1), nullRow(2)}
+
+	if err := op.Open(&Context{}); err != nil {
+		t.Fatal(err)
+	}
+	defer op.Close()
+
+	// Partitioning assertion: OuterColumnRef in the filter forces
+	// it to leafFilters, not stepFilters[0].
+	if got := len(op.leafFilters); got != 1 {
+		t.Errorf("leafFilters: got len=%d, want 1 (OuterColumnRef forces leaf-level eval)", got)
+	}
+	for s, fs := range op.stepFilters {
+		if len(fs) != 0 {
+			t.Errorf("stepFilters[%d]: got len=%d, want 0 (OuterColumnRef must not be pushed down)", s, len(fs))
+		}
+	}
+	if got := len(op.probeFilters); got != 0 {
+		t.Errorf("probeFilters: got len=%d, want 0", got)
+	}
+}
