@@ -794,17 +794,24 @@ Target: Q20 ≤ 120 s at SF=1 partial data.
         Milestone 0043 follow-ups).
   - [x] Config: `shared_buffers=2048MB`, `GOMEMLIMIT=20GiB`.
 
-- [ ] M0040-0004: Recursive subquery unnest inside IN/SubqueryExpr
+- [x] M0040-0004: Recursive subquery unnest inside IN/SubqueryExpr
         inner plans. Design doc at
         `docs/design/0040-0002-recursive-subquery-unnest.md`.
-  - [ ] Extend `unnestSubqueriesInPlan` to swing into
+        (landed 2026-05-04: added `walkSubqueryPlansInExpr` to
+        `internal/planner/unnest.go`; called at end of Filter case in
+        `unnestSubqueriesInPlan`. Fixes Q20's lineitem scalar subquery
+        (correlated with partsupp) which was never processed when the
+        outer non-correlated IN blocked `unnestInExpr` entry.
+        `TestRecursiveUnnestInsideNonUnnestableIN` PASS.
+        TPC-H parity identical=22 divergent=0 errored=0.)
+  - [x] Extend `unnestSubqueriesInPlan` to swing into
           `SubqueryExpr.Plan` and `InExpr.Plan` and recursively
           unnest scalar `SubqueryExpr` nodes found there.
-  - [ ] The M0033 `canUnnestSubquery` / `unnestSubquery`
+  - [x] The M0033 `canUnnestSubquery` / `unnestSubquery`
           machinery (GROUP BY aggregate + hash join) already
           handles the scalar pattern — only the walker entry
           point needs extending.
-  - [ ] Verify: Q20's innermost `SELECT 0.5*SUM(...) FROM
+  - [x] Verify: Q20's innermost `SELECT 0.5*SUM(...) FROM
           lineitem WHERE ...` becomes HashJoin(partsupp ⋈
           Aggregate(lineitem GROUP BY l_partkey, l_suppkey)).
 

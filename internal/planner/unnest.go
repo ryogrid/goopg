@@ -44,6 +44,11 @@ func unnestSubqueriesInPlan(node Node) Node {
 				return newOuter
 			}
 		}
+		// M0040-0004: walk remaining SubqueryExpr/InExpr inner plans
+		// even when those expressions cannot be pulled up to this level
+		// (e.g. Q20's lineitem scalar subquery inside the partsupp IN
+		// clause, where the outer IN itself has no equijoin correlation).
+		n.Predicate = walkSubqueryPlansInExpr(n.Predicate)
 	case *Join:
 		n.Left = unnestSubqueriesInPlan(n.Left)
 		n.Right = unnestSubqueriesInPlan(n.Right)
@@ -57,6 +62,45 @@ func unnestSubqueriesInPlan(node Node) Node {
 		n.Child = unnestSubqueriesInPlan(n.Child)
 	}
 	return node
+}
+
+// walkSubqueryPlansInExpr walks an expression tree and recursively
+// applies unnestSubqueriesInPlan to the inner plan of every
+// SubqueryExpr and InExpr node found. It is called after the
+// pull-up loops in unnestSubqueriesInPlan so that subqueries that
+// cannot be lifted to the current join level still have their own
+// inner plan trees optimised.
+func walkSubqueryPlansInExpr(e Expr) Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *SubqueryExpr:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *InExpr:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *BinaryOp:
+		x.Left = walkSubqueryPlansInExpr(x.Left)
+		x.Right = walkSubqueryPlansInExpr(x.Right)
+	case *UnaryOp:
+		x.Operand = walkSubqueryPlansInExpr(x.Operand)
+	case *FuncCall:
+		for i := range x.Args {
+			x.Args[i] = walkSubqueryPlansInExpr(x.Args[i])
+		}
+	case *CaseExpr:
+		if x.Operand != nil {
+			x.Operand = walkSubqueryPlansInExpr(x.Operand)
+		}
+		for i := range x.Whens {
+			x.Whens[i].When = walkSubqueryPlansInExpr(x.Whens[i].When)
+			x.Whens[i].Then = walkSubqueryPlansInExpr(x.Whens[i].Then)
+		}
+		x.Else = walkSubqueryPlansInExpr(x.Else)
+	case *ExtractExpr:
+		x.Source = walkSubqueryPlansInExpr(x.Source)
+	}
+	return e
 }
 
 func findSubqueryInExpr(e Expr) *SubqueryExpr {
