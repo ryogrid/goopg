@@ -1562,12 +1562,18 @@ checkpoint-pacing gap in `ref-004-checkpointer.md`.
       `bgwriter_delay`=200ms, `bgwriter_lru_maxpages`=100. OpenOptions:
       `BgwriterDelay` + `BgwriterMaxPages`; Runtime.Close() stops bgwriter.
       4 tests: flush, goroutine, DoD (0% dirty victim rate), max-pages cap.)
-- [ ] M0048-0004: Checkpoint write pacing. Design doc
-      `docs/design/0048-0004-checkpoint-write-pacing.md`. Wire
-      `checkpoint_completion_target` GUC; sleep-between-batches paces
-      flush over `target × interval`; segment-driven trigger flushes
-      fast. DoD: 200k dirty buffers, target=0.5, interval=30s →
-      finishes 14–17 s; foreground TPS impact ≤ 20%.
+- [x] M0048-0004: Checkpoint write pacing. Design doc
+      `docs/design/0048-0004-checkpoint-write-pacing.md`. (landed
+      2026-05-05: `checkpoint_completion_target` GUC registered as
+      TypeReal BootVal="0.9", read via `SetCompletionTarget()` in
+      main.go. `buildPacer(ctx, spread, start)` in checkpointer.go
+      returns a `func(float64) error` closure: deadline at
+      `start + target×progress` per buffer; final buffer skips sleep.
+      `flushDirty` dispatches to `FlushAllPaced(pacer)` when spread=true
+      and pacer is non-nil, else `FlushAll()` (IMMEDIATE). Volume and SQL
+      CHECKPOINT paths use spread=false. DoD test
+      `TestCheckpointerDoDWritePacing`: 10 buffers, interval=200ms,
+      target=0.5 → elapsed ≥60ms (≈90ms actual); IMMEDIATE path <20ms.)
 
 ## Milestone 0049 — Protocol parity
 

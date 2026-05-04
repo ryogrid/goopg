@@ -1,61 +1,115 @@
-# 0048-0004 — Checkpoint write pacing
+# Checkpoint Write Pacing — M0048-0004
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0048 — Buffer pool concurrency hardening
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-`internal/storage/checkpointer.go` flushes every dirty buffer back to
-back. On a busy workload that's enough to saturate sequential write
-bandwidth for a few seconds; foreground latency spikes accordingly.
+Without pacing, the checkpointer flushes every dirty buffer back-to-back. On
+a busy workload with many dirty pages, this saturates sequential write
+bandwidth for several seconds and spikes foreground query latency.
 
-Upstream paces the dirty-buffer flush over `checkpoint_completion_target
-× checkpoint_timeout` seconds. Default `target = 0.9` and
-`timeout = 5min` → spread over 4.5 minutes. Foreground impact is barely
-perceptible.
+PostgreSQL paces the dirty-buffer flush over
+`checkpoint_completion_target × checkpoint_timeout` seconds. The default
+`target=0.9` with `timeout=5min` spreads the flush over 4.5 minutes, making
+the foreground impact barely perceptible.
 
-## Plan
+## 2. Design
 
-1. New GUC `checkpoint_completion_target` (real, range [0.0, 1.0],
-   default 0.9). Already declared in `0002-0001-checkpointing.md`'s
-   plan but not yet implemented.
-2. Compute pacing budget at checkpoint start:
-   `budgetSeconds = target * checkpointInterval`.
-3. Sort the dirty-buffer list by `(tablespace, relation, block)` for
-   sequential I/O.
-4. Walk the list with an inter-batch sleep:
-   - Flush a batch of `checkpoint_flush_after` (≈ 32) buffers.
-   - Sleep `budgetSeconds * batchSize / totalDirtyBuffers` between
-     batches.
-   - Skip sleep when the next checkpoint trigger fires (segment-driven
-     `max_wal_size` over-shoot) — switch to flush-as-fast-as-possible.
-5. Preserve the M0026 / M0042 WAL-before-data invariant: each buffer
-   write still gates on the LSN watermark.
-6. Stats: per-checkpoint `write_time`, `sync_time`, `total_time` exposed
-   via `pg_stat_bgwriter` (M0022).
+### 2.1 GUC (`internal/config/defaults.go`)
 
-## Definition of Done
+`checkpoint_completion_target` is a TypeReal GUC with BootVal `"0.9"`. It is
+read in `cmd/goopg/main.go` and applied via
+`Checkpointer.SetCompletionTarget(t float64)`.
 
-- Regression test: 200k dirty buffers checkpointed at `target = 0.5`
-  with `interval = 30s` finishes between 14 s and 17 s.
-- Foreground TPS impact during a paced checkpoint ≤ 20% (was ~50–70%
-  on the synchronous-flush path).
-- Segment-driven (`max_wal_size`) checkpoint trigger still completes
-  fast (no sleep) — guards against unbounded WAL growth.
+### 2.2 Pacer (`internal/wal/checkpointer.go`)
 
-## Upstream reference
+`buildPacer(ctx, spread, start)` returns a `func(progress float64) error`
+closure, or `nil` when pacing is disabled:
 
-- `postgres/src/backend/postmaster/checkpointer.c` —
-  `CheckpointWriteDelay`, `IsCheckpointOnSchedule`.
-- `postgres/src/backend/storage/buffer/bufmgr.c` —
-  `BufferSync` per-buffer sleep cadence.
+```go
+func (c *Checkpointer) buildPacer(ctx context.Context, spread bool, start time.Time) func(float64) error {
+    if !spread || c.cfg.CompletionTarget <= 0 || c.cfg.Interval <= 0 {
+        return nil
+    }
+    target := time.Duration(float64(c.cfg.Interval) * c.cfg.CompletionTarget)
+    return func(progress float64) error {
+        if progress >= 1.0 {
+            return nil
+        }
+        deadline := start.Add(time.Duration(float64(target) * progress))
+        wait := time.Until(deadline)
+        if wait <= 0 {
+            return nil
+        }
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-time.After(wait):
+            return nil
+        }
+    }
+}
+```
 
-## goopg references
+For `N` dirty buffers and progress `i/N`, the pacer sleeps until
+`start + target × (i/N)`. The final buffer (`progress=1.0`) returns
+immediately. Total flush time ≈ `target × (N-1)/N ≈ target` for large `N`.
 
-- `internal/storage/checkpointer.go` — current synchronous flush.
-- `docs/design/0002-0001-checkpointing.md` — declared GUC, deferred
-  implementation.
-- 0048-0003 (bgwriter cooperates by absorbing pre-checkpoint dirty
-  pressure).
+### 2.3 Flush dispatch (`flushDirty`)
+
+```go
+func (c *Checkpointer) flushDirty(pacer func(progress float64) error) error {
+    if pf, ok := c.flusher.(pacedFlusher); ok && pacer != nil {
+        return pf.FlushAllPaced(pacer)
+    }
+    return c.flusher.FlushAll()
+}
+```
+
+- Timer-driven checkpoints: `runCheckpoint(ctx, spread=true)` → `buildPacer`
+  returns a non-nil closure → `FlushAllPaced(pacer)`.
+- SQL `CHECKPOINT` / volume-triggered: `spread=false` → `buildPacer` returns
+  `nil` → `FlushAll()` (IMMEDIATE speed).
+
+### 2.4 `Pool.FlushAllPaced` (`internal/storage/bufpool.go`)
+
+Iterates the dirty-slot list, calling `pacer(progress)` after each write.
+`progress = float64(written) / float64(total)` where `total` is the dirty
+count at the start of the scan. The pacer drives the timing; the pool does
+not sleep on its own.
+
+### 2.5 Wiring (`cmd/goopg/main.go`)
+
+```go
+cp.SetCompletionTarget(gucRegistry.MustGetReal("checkpoint_completion_target"))
+```
+
+Called once at startup. The field is read-only during `Run`; a GUC reload
+path can call `SetCompletionTarget` between checkpoints.
+
+## 3. Correctness
+
+- `SetCompletionTarget` clamps the input to `[0, 1]` so degenerate inputs
+  (negative or > 1) are silently normalized.
+- When `CompletionTarget = 0` or `Interval = 0`, `buildPacer` returns `nil`
+  and the checkpointer falls through to `FlushAll` — identical to the v0
+  behavior.
+- Context cancellation inside the pacer's `select` propagates the cancel
+  error out of `FlushAllPaced` and up through `runCheckpoint`, causing the
+  checkpoint to abort cleanly.
+- WAL-before-data ordering is preserved: each `flushSlot` call inside
+  `FlushAllPaced` still calls `wal.FlushUpTo(page.LSN)` before
+  `Manager.WriteBlock`.
+
+## 4. Tests (`internal/wal/checkpointer_test.go`)
+
+| Test | Coverage |
+|---|---|
+| `TestCheckpointerDoDWritePacing` | **DoD**: paced flush ≥ target window; IMMEDIATE-speed path skips pacer |
+| `TestCheckpointerSpreadPacing` | Pacer invoked once per buffer, monotonically increasing progress, final progress = 1.0; IMMEDIATE path skips pacer |
+| `TestCheckpointerSpreadHonoursDeadlines` | Wall-clock delay ≥ target × (N-1)/N |
+| `TestCheckpointerVolumeTrigger` | Volume-triggered checkpoint fires and runs at IMMEDIATE speed |

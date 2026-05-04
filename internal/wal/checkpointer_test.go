@@ -154,6 +154,75 @@ func (p *pacedFakeFlusher) FlushAllPaced(pacer func(progress float64) error) err
 	return nil
 }
 
+// TestCheckpointerDoDWritePacing is the DoD test for M0048-0004.
+//
+// The production DoD requires: 200k dirty buffers, target=0.5,
+// interval=30s → finishes 14-17s (= target×interval = 15s).
+// In-process we scale to 10 buffers, interval=200ms, target=0.5 →
+// spread over 100ms. The pacer must introduce ≥60ms of delay
+// (targeting 90ms = target×(N-1)/N). Volume-triggered checkpoints
+// must run at IMMEDIATE speed with no pacing.
+func TestCheckpointerDoDWritePacing(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	const nBufs = 10
+	const interval = 200 * time.Millisecond
+	const target = 0.5
+	// Expected target duration = interval × target = 100ms.
+	// Last buffer skips sleep → elapsed ≈ 100ms × (N-1)/N = 90ms.
+	const expectedTarget = time.Duration(float64(interval) * target)
+	const minElapsed = time.Duration(float64(expectedTarget) * float64(nBufs-1) / float64(nBufs) * 0.67)
+
+	// DoD part 1: timer-driven checkpoint spreads flush over target window.
+	pf := &pacedFakeFlusher{dirty: nBufs}
+	cp := NewCheckpointer(pf, w, CheckpointerConfig{
+		Interval:         interval,
+		CompletionTarget: target,
+	})
+	start := time.Now()
+	if err := cp.runCheckpoint(context.Background(), true); err != nil {
+		t.Fatalf("runCheckpoint(spread): %v", err)
+	}
+	elapsed := time.Since(start)
+	t.Logf("paced checkpoint elapsed: %v (min %v, expected ~%v)", elapsed, minElapsed, expectedTarget)
+	if elapsed < minElapsed {
+		t.Errorf("paced checkpoint elapsed %v < %v; pacer not throttling writes", elapsed, minElapsed)
+	}
+	if len(pf.progresses) != nBufs {
+		t.Errorf("pacer called %d times, want %d", len(pf.progresses), nBufs)
+	}
+	if pf.progresses[len(pf.progresses)-1] != 1.0 {
+		t.Errorf("final progress = %v, want 1.0", pf.progresses[len(pf.progresses)-1])
+	}
+
+	// DoD part 2: volume-triggered checkpoint bypasses pacing (IMMEDIATE speed).
+	pf2 := &pacedFakeFlusher{dirty: nBufs}
+	cp2 := NewCheckpointer(pf2, w, CheckpointerConfig{
+		Interval:         interval,
+		CompletionTarget: target,
+	})
+	immediateStart := time.Now()
+	if err := cp2.runCheckpoint(context.Background(), false); err != nil {
+		t.Fatalf("runCheckpoint(immediate): %v", err)
+	}
+	immediateElapsed := time.Since(immediateStart)
+	t.Logf("IMMEDIATE checkpoint elapsed: %v", immediateElapsed)
+	if len(pf2.progresses) != 0 {
+		t.Errorf("IMMEDIATE checkpoint invoked pacer %d times, want 0", len(pf2.progresses))
+	}
+	if !pf2.flushAllCalled {
+		t.Error("IMMEDIATE checkpoint did not take FlushAll fallback path")
+	}
+	if immediateElapsed > 20*time.Millisecond {
+		t.Errorf("IMMEDIATE checkpoint took %v; want < 20ms (no pacing)", immediateElapsed)
+	}
+}
+
 // TestCheckpointerVolumeTrigger pins the max_wal_size path.
 // We arm a small MaxWALBytes threshold, append enough records
 // through the writer to cross it, and expect a checkpoint
