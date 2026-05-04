@@ -46,7 +46,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			}
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
-		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+		msg, extra := syntaxErrorMsg(err)
+		return s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...)
 	}
 	if len(stmts) == 0 {
 		if err := w.WriteEmptyQueryResponse(); err != nil {

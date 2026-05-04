@@ -212,14 +212,17 @@ func (s *Server) respondSelectOne(w *protocol.FrameWriter) error {
 // writeQueryError emits an ErrorResponse with the given SQLSTATE plus a
 // trailing ReadyForQuery, matching how upstream finishes a failed simple
 // Query (the parse error is reported and the connection stays open).
-func (s *Server) writeQueryError(w *protocol.FrameWriter, code sqlstate.Code, msg string) error {
-	if err := w.WriteErrorResponse([]protocol.ErrorField{
+// extra fields (e.g. FieldPosition) are appended after the standard set.
+func (s *Server) writeQueryError(w *protocol.FrameWriter, code sqlstate.Code, msg string, extra ...protocol.ErrorField) error {
+	fields := []protocol.ErrorField{
 		{Code: protocol.FieldSeverity, Value: "ERROR"},
 		{Code: protocol.FieldSeverityNonLocal, Value: "ERROR"},
 		{Code: protocol.FieldSQLState, Value: string(code)},
 		{Code: protocol.FieldMessage, Value: msg},
 		{Code: protocol.FieldRoutine, Value: "server.handleQuery"},
-	}); err != nil {
+	}
+	fields = append(fields, extra...)
+	if err := w.WriteErrorResponse(fields); err != nil {
 		return err
 	}
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)

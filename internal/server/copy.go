@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/config"
@@ -408,6 +409,27 @@ func (st *copyInState) consumeTextCopyData(chunk []byte) {
 		}
 	}
 	st.partialRow = chunk[len(chunk)-1] != '\n'
+}
+
+// syntaxErrorMsg returns the human-readable message and optional extra
+// ErrorFields for a parser error. When err is *parser.SyntaxError it strips
+// the internal "(byte N)" suffix and returns a FieldPosition field carrying
+// the 1-based byte offset so psql can render the caret-pointer line.
+func syntaxErrorMsg(err error) (msg string, extra []protocol.ErrorField) {
+	var se *parser.SyntaxError
+	if errors.As(err, &se) {
+		msg = se.Error()
+		if idx := strings.LastIndex(msg, " (byte "); idx >= 0 {
+			msg = msg[:idx]
+		}
+		if se.Pos >= 0 {
+			extra = []protocol.ErrorField{
+				{Code: protocol.FieldPosition, Value: strconv.Itoa(se.Pos + 1)},
+			}
+		}
+		return msg, extra
+	}
+	return err.Error(), nil
 }
 
 // planErrorFields extracts the SQLSTATE + message from a planner

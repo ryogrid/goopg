@@ -28,7 +28,16 @@ import (
 func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
-		return nil, &extendedQueryError{Code: sqlstate.SyntaxError, Message: err.Error()}
+		msg, extra := syntaxErrorMsg(err)
+		qerr := &extendedQueryError{Code: sqlstate.SyntaxError, Message: msg}
+		for _, f := range extra {
+			if f.Code == protocol.FieldPosition {
+				if p, _ := strconv.Atoi(f.Value); p > 0 {
+					qerr.Position = p
+				}
+			}
+		}
+		return nil, qerr
 	}
 	if len(stmts) == 0 {
 		return &extendedQueryResult{Empty: true}, nil

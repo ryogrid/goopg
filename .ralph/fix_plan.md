@@ -1593,11 +1593,18 @@ gaps catalogued in `docs/reference/ref-021-protocol.md`.
       New `pg_sleep(seconds)` function waits on `select{time.After, Ctx.Done}`.
       DoD test `TestE2E_QueryCancellation_DoDPgSleep`: `pg_sleep(60)` + 100ms
       context cancel → SQLSTATE 57014 in ~101ms (limit 200ms).)​
-- [ ] M0049-0002: Full ErrorResponse fields. Design doc
-      `docs/design/0049-0002-error-response-fields.md`. Encoder
-      grows D/H/P/W/s/t/c/F/L/R fields; parser threads byte offset
-      into `Position`; analyzer threads schema/table/column. DoD:
-      psql renders correct caret-pointer line on syntax errors.
+- [x] M0049-0002: Full ErrorResponse fields. Design doc
+      `docs/design/0049-0002-error-response-fields.md`. (landed
+      2026-05-05: added FieldPosition/Where/Schema/Table/Column
+      constants to protocol. `syntaxErrorMsg(err)` strips `(byte N)`
+      suffix and returns `FieldPosition=Pos+1` (1-based) from
+      `*parser.SyntaxError`. Simple query path: `dispatchSimpleQuery...`
+      calls `syntaxErrorMsg` and passes extra fields to `writeQueryError`
+      (now variadic). Extended path: `extendedQueryError.Position` +
+      `extendedMessageError.Position` → `writeExtendedMessageError`
+      emits FieldPosition when non-zero. DoD tests:
+      `TestErrorResponseDoDPositionField` (position='14' for `SELECT 1
+      FROM`); `TestSyntaxErrorPositionValue` (position in range).)
 - [ ] M0049-0003: SCRAM-SHA-256 authentication. Design doc
       `docs/design/0049-0003-scram-sha-256.md`. Server-side SCRAM
       exchange; new `auth-method = scram-sha-256` in pg_hba; new
