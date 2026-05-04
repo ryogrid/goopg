@@ -130,11 +130,14 @@ func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 }
 
 // planContainsIndexScan walks a plan tree (depth-first) and reports
-// whether any node is an IndexScan. Used by the TPC-H integration
-// test to confirm the planner picked the index path even when the
-// outer node is a Project / Filter wrapper.
+// whether any node is an IndexScan or IndexOnlyScan. Used by the TPC-H
+// integration test to confirm the planner picked the index path even when
+// the outer node is a Project / Filter wrapper.
 func planContainsIndexScan(n planner.Node) bool {
 	if _, ok := n.(*planner.IndexScan); ok {
+		return true
+	}
+	if _, ok := n.(*planner.IndexOnlyScan); ok {
 		return true
 	}
 	switch v := n.(type) {

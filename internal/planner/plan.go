@@ -287,6 +287,29 @@ type IndexScan struct {
 func (n *IndexScan) Pos() int       { return n.pos }
 func (n *IndexScan) Output() Schema { return n.schema }
 
+// IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
+// come from the B-tree index key, so no heap fetch is needed when the
+// visibility map reports ALL_VISIBLE for the target page.
+//
+// The output schema contains ONLY the projected covered columns (a subset
+// of the full table schema). When the VM bit is not set for a page the
+// executor falls back to a regular heap fetch.
+type IndexOnlyScan struct {
+	pos     int
+	Table   *catalog.Table
+	Index   *catalog.Index
+	Key     Expr
+	LowKey  Expr
+	HighKey Expr
+	// Covered is the slice of catalog.Column entries that the output schema
+	// contains (a subset of Index.Columns, in projection order).
+	Covered []catalog.Column
+	schema  Schema
+}
+
+func (n *IndexOnlyScan) Pos() int       { return n.pos }
+func (n *IndexOnlyScan) Output() Schema { return n.schema }
+
 // JoinType is the physical join shape emitted by the planner.
 type JoinType int
 

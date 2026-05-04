@@ -114,6 +114,11 @@ type Config struct {
 	// extending the relation. nil disables the optimisation.
 	FSM *storage.FSM
 
+	// VM is the in-memory visibility map (M0046-0004). When non-nil,
+	// index-only scans check it to skip heap fetches for ALL_VISIBLE
+	// pages. VACUUM sets the bits. nil disables the optimisation.
+	VM *storage.VisibilityMap
+
 	// LockMgr, when set, is plumbed into every executor.Context
 	// the dispatch path constructs. Operators consult it for
 	// relation-level lock acquisition; deadlock detection is

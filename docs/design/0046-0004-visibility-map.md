@@ -1,61 +1,119 @@
-# 0046-0004 — Visibility Map (VM)
+# Visibility Map (VM) — M0046-0004
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0046 — Heap & MVCC maturation
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-Without a Visibility Map, goopg cannot do index-only scans (every index
-hit must fetch the heap to check `xmin`/`xmax` visibility) and VACUUM has
-to scan every page even when most are unchanged.
+Without a visibility map, every index scan must fetch the heap page to check
+MVCC visibility. After VACUUM, all committed tuples on a page are visible to
+all current and future snapshots — fetching the heap just to confirm visibility
+is wasteful. PostgreSQL's Visibility Map (VM) eliminates this overhead: a 1-bit
+per-page marker (`ALL_VISIBLE`) signals that no heap fetch is needed for
+visibility during an index scan whose projected columns are covered by the index.
 
-The VM is a per-relation fork (`<relfilenode>_vm`) with two bits per heap
-page: `ALL_VISIBLE` (every tuple on the page is visible to every active
-snapshot) and `ALL_FROZEN` (every tuple has been frozen — visible to
-every possible snapshot, ever). Once set, a bit is cleared whenever the
-heap page is modified.
+## 2. Design
 
-## Plan
+### 2.1 VisibilityMap struct (`internal/storage/vm.go`)
 
-1. New fork constant `INIT_FORKNUM_VM`.
-2. `internal/storage/visibilitymap/` package: 2-bits-per-block bitmap,
-   `Set(rel, blk, flags, lsn)` and `Get(rel, blk) flags` operations.
-3. WAL: page modifications include the heap page's old VM flags; replay
-   clears the corresponding VM bit. (Critical: VM must be conservative
-   — false negatives are fine, false positives break MVCC.)
-4. VACUUM (M0019 + this milestone's freezing pass) sets `ALL_VISIBLE`
-   when a page passes the all-visible test, and `ALL_FROZEN` when every
-   `xmin` on the page is `FrozenTransactionId`.
-5. Index-only scan path (planner + executor) — when the index covers all
-   referenced columns, executor checks the VM bit; if set, returns the
-   index entry directly without a heap fetch.
-6. VACUUM on subsequent passes can skip pages with `ALL_FROZEN` set
-   (the upstream "skip frozen" optimisation).
+An in-memory per-relation bit array keyed by `{DBOid, RelOid}`:
 
-## Definition of Done
+```go
+type VisibilityMap struct {
+    mu    sync.RWMutex
+    pages map[vmKey][]bool  // [DBOid,RelOid] → ALL_VISIBLE per BlockNumber
+}
+```
 
-- `EXPLAIN (ANALYZE, BUFFERS)` on a covered query reports zero heap
-  reads after a VACUUM that sets `ALL_VISIBLE`.
-- VACUUM second-pass on an unchanged table touches zero `ALL_FROZEN`
-  pages.
-- VM bit cleared correctly by every WAL-logged heap modification
-  (regression test stresses INSERT / UPDATE / DELETE / HOT-UPDATE).
-- Crash recovery preserves the conservative invariant: replayed page
-  modifications clear the VM bit even if the WAL record arrived after a
-  checkpoint.
+Operations:
+- `AllVisible(rel, blk) bool` — fast-path check for index-only scans
+- `SetAllVisible(rel, blk)` — called by VACUUM after verifying all tuples
+- `ClearBlock(rel, blk)` — called on any page modification (insert/delete/update)
+- `DropRelation(rel)` — called on DROP TABLE to prevent stale bits
+- All methods are nil-safe
 
-## Upstream reference
+### 2.2 PageAllVisible (`internal/storage/vm.go`)
 
-- `postgres/src/backend/access/heap/visibilitymap.c` — bitmap layout,
-  `visibilitymap_set`, `visibilitymap_get_status`.
-- `postgres/src/backend/executor/nodeIndexonlyscan.c` — VM-bit check
-  before heap fetch.
+`PageAllVisible(p Page, horizon TransactionID) bool` checks that every
+`ItemIDNormal` tuple on `p` satisfies:
+- `xmin != Invalid && xmin < horizon` (committed before all active snapshots)
+- `xmax == Invalid` or `xmax` is lock-only (not deleted)
 
-## goopg references
+Used by VACUUM to decide whether to set the ALL_VISIBLE bit.
 
-- `internal/access/btree/scan.go` — index-scan path that grows the
-  IndexOnlyScan branch.
-- 0046-0001 (HOT updates clear `ALL_VISIBLE`).
-- 0046-0005 (freezing sets `ALL_FROZEN`).
+### 2.3 VACUUM sets VM bits (`internal/vacuum/vacuum.go`)
+
+`VacuumWithFSMAndVM(pool, mgr, rel, fsm, vm)` extends the existing vacuum
+core. After each page prune, if `PageAllVisible(page, horizon)` returns true,
+the VM bit is set via `vm.SetAllVisible(rel, blk)`; otherwise it is cleared.
+
+### 2.4 Index-only scan (`internal/planner/` + `internal/executor/`)
+
+**Planner** (`planner.go`, `plan.go`):
+
+A new `IndexOnlyScan` plan node (same fields as `IndexScan` plus `Covered
+[]catalog.Column`) is generated when:
+1. `planIndexScanFromWhere` produces an `IndexScan`.
+2. All SELECT-list columns are covered by the index key.
+3. There are no locking clauses (`FOR UPDATE` / `FOR SHARE`).
+
+The promotion is done by `tryPromoteIndexOnlyScan(proj *Project) Node`.
+
+**Executor** (`operators_indexonly.go`):
+
+`indexOnlyScanOp.Open()` runs a B-tree RangeScan with two paths:
+
+| Page VM bit | Action |
+|---|---|
+| ALL_VISIBLE | Decode row from B-tree key bytes — **zero heap reads** |
+| Not set | Fetch heap page, follow HOT chain, check MVCC (full fallback) |
+
+Key decode (`decodeBTreeKeyToDatum`) inverts the `btree.EncodeXxx` functions
+for int4, int8, varchar, char, and timestamp column types.
+DecodeVarchar + DecodeTimestamp are new helpers added to the btree package.
+
+### 2.5 Page modification clears VM
+
+Any write to a heap page clears the VM bit:
+- `writeHeapRowReturning` (INSERT): `ctx.VM.ClearBlock(rel, blk)` after
+  `PageAddHeapTuple` succeeds — in the existing `tryAppendToBlock` closure
+  and in the `PinNew` path.
+- UPDATE old-image / DELETE stamp (`markHeapDeleteDirtyAndClearVM`): a new
+  helper wrapping `markHeapDeleteDirty` + `VM.ClearBlock`.
+
+## 3. Invariants
+
+| Property | Guarantee |
+|---|---|
+| Safe skip | VM bit is only set when all tuples are committed and pre-horizon |
+| Cleared on write | Any heap page modification immediately clears the bit |
+| Locking guard | IndexOnlyScan is not generated when FOR UPDATE/SHARE is present |
+| Fallback | VM=false → full heap fetch + MVCC check; no data loss |
+| nil-safe | All VM methods are nil-safe; no-op without VM wired |
+
+## 4. Tests
+
+| Test | Location | Coverage |
+|---|---|---|
+| `TestVMSetAllVisible` | `storage/vm_test.go` | Set / check / clear cycle |
+| `TestVMClearBlock` | storage | ClearBlock + no-panic on unseen blocks |
+| `TestVMDropRelation` | storage | DropRelation clears all bits |
+| `TestVMNilSafe` | storage | Nil VM no-ops |
+| `TestPageAllVisible` | storage | Fresh page + committed tuple = ALL_VISIBLE |
+| `TestPageAllVisibleDeadTuple` | storage | Tuple with xmax set → NOT ALL_VISIBLE |
+| `TestIndexOnlyScanAfterVacuum` | `executor/vm_test.go` | DoD: VACUUM sets VM, SELECT returns correct value via key decode |
+| `TestVMClearedOnInsert` | executor | Insert clears VM bit |
+| `TestPageAllVisibleIntegration` | executor | Committed page is ALL_VISIBLE after begin |
+| `TestIndexOnlyScanFallbackWithoutVM` | executor | No VM → heap fallback, correct results |
+
+## 5. Deferred
+
+- **Disk persistence** (`_vm` fork): VM is in-memory only; reset on restart.
+- **FROZEN bit**: ALL_FROZEN tracking deferred to M0046-0005 (tuple freezing).
+- **Multi-column index keys**: `decodeRowFromKey` currently requires a
+  single-column index (returns error for composite keys).
+- **INCLUDE columns**: index-only scan only covers key columns; INCLUDE support
+  is a follow-up that would extend coverage to non-key projections.

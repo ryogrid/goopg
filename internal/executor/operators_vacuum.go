@@ -42,7 +42,7 @@ func (o *vacuumOp) Next() (Row, error) {
 	vs := o.plan.Stmt.(*parser.VacuumStmt)
 	rels := o.vacuumTargets(vs)
 	for _, rel := range rels {
-		_, _ = vacuum.VacuumWithFSM(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.FSM)
+		_, _ = vacuum.VacuumWithFSMAndVM(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.FSM, o.ctx.VM)
 	}
 	return nil, EOF
 }

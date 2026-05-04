@@ -81,6 +81,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newSeqScanOp(p)), nil
 	case *planner.IndexScan:
 		return maybeInstrument(p, newIndexScanOp(p)), nil
+	case *planner.IndexOnlyScan:
+		return maybeInstrument(p, newIndexOnlyScanOp(p)), nil
 	case *planner.LockRows:
 		child, err := Build(p.Child)
 		if err != nil {

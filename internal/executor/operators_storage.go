@@ -660,7 +660,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				o.ctx.Pool.Unpin(s)
 				return nil, err
 			}
-			derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -743,7 +743,7 @@ func (o *updateOp) Next() (Row, error) {
 				o.ctx.Pool.Unpin(s)
 				return nil, err
 			}
-			derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -831,7 +831,7 @@ func (o *deleteOp) Next() (Row, error) {
 			o.ctx.Pool.Unpin(s)
 			return nil, err
 		}
-		derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, v.blk, v.slot, o.ctx.Tx.XID)
+		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, v.blk, v.slot, o.ctx.Tx.XID)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		if derr != nil {
@@ -1036,6 +1036,10 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 			if ctx.FSM != nil {
 				ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
 			}
+			// Clear VM: page was modified, no longer ALL_VISIBLE (M0046-0004).
+			if ctx.VM != nil {
+				ctx.VM.ClearBlock(rel, blk)
+			}
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
 			if derr == nil {
@@ -1127,6 +1131,10 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	if ctx.FSM != nil {
 		ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
 	}
+	// New page starts dirty — not ALL_VISIBLE (M0046-0004).
+	if ctx.VM != nil {
+		ctx.VM.ClearBlock(rel, blk)
+	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
 	if derr == nil {
@@ -1174,4 +1182,20 @@ func markHeapDeleteDirty(
 	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
 		return logDel(rel, blk, lineSlot, xmax)
 	})
+}
+
+// markHeapDeleteDirtyAndClearVM is markHeapDeleteDirty + VM clear (M0046-0004).
+// Any page that has a tuple deleted is no longer ALL_VISIBLE.
+func markHeapDeleteDirtyAndClearVM(
+	ctx *Context, slot *storage.Slot,
+	rel storage.RelFileNode, blk storage.BlockNumber,
+	lineSlot uint16, xmax storage.TransactionID,
+) error {
+	if err := markHeapDeleteDirty(ctx.Pool, slot, rel, blk, lineSlot, xmax); err != nil {
+		return err
+	}
+	if ctx.VM != nil {
+		ctx.VM.ClearBlock(rel, blk)
+	}
+	return nil
 }

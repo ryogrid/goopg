@@ -38,6 +38,9 @@ type Runtime struct {
 	// FSM is the in-memory free-space map (M0046-0003). VACUUM updates
 	// it; INSERT consults it before extending the relation.
 	FSM          *storage.FSM
+	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
+	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
+	VM           *storage.VisibilityMap
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
@@ -739,6 +742,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DataDir:        abs,
 		Standby:        standby,
 		FSM:            storage.NewFSM(),
+		VM:             storage.NewVisibilityMap(),
 	}
 
 	// Background WAL writer loop (M0042-0003): timer-driven periodic flush

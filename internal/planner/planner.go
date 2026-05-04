@@ -466,7 +466,19 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := Node(&Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema})
+	proj := &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}
+	// Promote to IndexOnlyScan (M0046-0004) only when there are no locking
+	// clauses. FOR UPDATE / FOR SHARE rely on the IndexScan leaf being
+	// accessible via lockRowsOp's currentTIDProvider chain.
+	var out Node
+	if len(s.Locking) == 0 {
+		if promoted := tryPromoteIndexOnlyScan(proj); promoted != proj {
+			out = promoted
+		}
+	}
+	if out == nil {
+		out = Node(proj)
+	}
 	// resolveTargets resolves SELECT targets against ctx.bindings,
 	// which holds FROM‑clause offsets — but rewriteMultiWayChain /
 	// bushy DP may have re‑laid out the underlying join tree
@@ -3015,4 +3027,72 @@ func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
 		return true
 	}
 	return false
+}
+
+
+// tryPromoteIndexOnlyScan examines a freshly-built Project node and promotes
+// it to an IndexOnlyScan (M0046-0004) when all of the following hold:
+//  1. The Project's direct child (ignoring Filter wrappers) is an IndexScan.
+//  2. All target expressions are ColumnRefs whose names appear in the index key.
+//
+// Returns the original proj unchanged if the conditions are not met.
+func tryPromoteIndexOnlyScan(proj *Project) Node {
+	if proj == nil {
+		return proj
+	}
+	// Strip a single Filter wrapper if present (e.g. range predicates).
+	child := proj.Child
+	var filter *Filter
+	if f, ok := child.(*Filter); ok {
+		filter = f
+		child = f.Child
+	}
+	idxScan, ok := child.(*IndexScan)
+	if !ok {
+		return proj
+	}
+	// Check that every projected column is in the index key.
+	idxColSet := make(map[string]bool, len(idxScan.Index.Columns))
+	for _, c := range idxScan.Index.Columns {
+		idxColSet[c] = true
+	}
+	covered := make([]catalog.Column, 0, len(proj.Targets))
+	for _, t := range proj.Targets {
+		cr, isCR := t.(*ColumnRef)
+		if !isCR || !idxColSet[cr.Name] {
+			return proj // target not in index — cannot use index-only
+		}
+		// Find the full column definition from the table.
+		col, found := func() (catalog.Column, bool) {
+			for _, c := range idxScan.Table.Columns {
+				if c.Name == cr.Name {
+					return c, true
+				}
+			}
+			return catalog.Column{}, false
+		}()
+		if !found {
+			return proj
+		}
+		covered = append(covered, col)
+	}
+	if len(covered) == 0 {
+		return proj
+	}
+	ios := &IndexOnlyScan{
+		pos:     idxScan.pos,
+		Table:   idxScan.Table,
+		Index:   idxScan.Index,
+		Key:     idxScan.Key,
+		LowKey:  idxScan.LowKey,
+		HighKey: idxScan.HighKey,
+		Covered: covered,
+		schema:  proj.schema,
+	}
+	if filter != nil {
+		// Keep the Filter but replace its child with IndexOnlyScan.
+		filter.Child = ios
+		return filter
+	}
+	return ios
 }

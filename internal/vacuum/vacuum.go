@@ -39,7 +39,7 @@ type Stats struct {
 // VACUUM does not touch indexes — see Reindex for the bridge until
 // B-tree page deletion lands.
 func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Stats, error) {
-	return vacuumCore(pool, mgr, rel, nil)
+	return vacuumCore(pool, mgr, rel, nil, nil)
 }
 
 // VacuumWithFSM is Vacuum with a Free Space Map (M0046-0003). After
@@ -47,10 +47,20 @@ func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Sta
 // is recorded in fsm so subsequent INSERT operations can find the page
 // without extending the relation. fsm may be nil (identical to Vacuum).
 func VacuumWithFSM(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, fsm *storage.FSM) (Stats, error) {
-	return vacuumCore(pool, mgr, rel, fsm)
+	return vacuumCore(pool, mgr, rel, fsm, nil)
 }
 
-func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, fsm *storage.FSM) (Stats, error) {
+// VacuumWithFSMAndVM runs vacuum, updating both the FSM (M0046-0003) and the
+// Visibility Map (M0046-0004). After each page prune, if all remaining tuples
+// are universally visible (committed xmin < OldestXmin, no xmax), the VM bit
+// is set so index-only scans can skip heap fetches on that page.
+func VacuumWithFSMAndVM(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
+	fsm *storage.FSM, vm *storage.VisibilityMap) (Stats, error) {
+	return vacuumCore(pool, mgr, rel, fsm, vm)
+}
+
+func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
+	fsm *storage.FSM, vm *storage.VisibilityMap) (Stats, error) {
 	horizon := mgr.OldestXmin()
 	nBlocks, err := pool.NBlocks(rel)
 	if err != nil {
@@ -111,6 +121,16 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, 
 		// the reclaimed space without extending the relation (M0046-0003).
 		if fsm != nil {
 			fsm.RecordFreeSpaceForPage(rel, blk, page)
+		}
+		// Set ALL_VISIBLE in VM if all remaining tuples on the page are
+		// universally committed (M0046-0004). This enables index-only
+		// scans to skip heap fetches entirely for this page.
+		if vm != nil {
+			if storage.PageAllVisible(page, horizon) {
+				vm.SetAllVisible(rel, blk)
+			} else {
+				vm.ClearBlock(rel, blk)
+			}
 		}
 		slot.Unlock()
 		pool.Unpin(slot)

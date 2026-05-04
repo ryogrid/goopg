@@ -128,6 +128,11 @@ type Context struct {
 	// consults it before extending the relation, and VACUUM updates it
 	// after reclaiming dead tuples so freed pages can be reused.
 	FSM *storage.FSM
+
+	// VM is the Visibility Map (M0046-0004). When non-nil, index-only scans
+	// check it to skip heap fetches for ALL_VISIBLE pages; VACUUM sets bits
+	// after verifying all tuples are universally visible.
+	VM *storage.VisibilityMap
 }
 
 // acquireRelLock funnels every operator's relation-level lock

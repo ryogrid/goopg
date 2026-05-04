@@ -283,6 +283,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.Pool = rt.Pool
 		cfg.TxnMgr = rt.TxnMgr
 		cfg.FSM = rt.FSM
+		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
 		cfg.WalSenders = rt.WalSenders

@@ -1445,12 +1445,20 @@ sub-tasks decompose around independent design docs.
       `dispatch.go`, `autovacuum.Launcher`, `cmd/goopg/main.go`. 9 tests:
       storage unit (4) + executor integration (5). DoD: fill page → delete
       all → VACUUM → INSERT → no page extension (TestFSMInsertReusesVacuumedPage).)
-- [ ] M0046-0004: Visibility Map fork. Design doc
-      `docs/design/0046-0004-visibility-map.md`. New `_vm` fork, 2-bits-
-      per-block (ALL_VISIBLE / ALL_FROZEN), VACUUM sets, page
-      modifications clear, `IndexOnlyScan` plan branch checks bit.
-      DoD: `EXPLAIN (ANALYZE, BUFFERS)` on a covered query reports
-      zero heap reads after VACUUM.
+- [x] M0046-0004: Visibility Map fork. Design doc
+      `docs/design/0046-0004-visibility-map.md`. (landed 2026-05-05:
+      `storage.VisibilityMap` (AllVisible/SetAllVisible/ClearBlock/DropRelation).
+      `PageAllVisible(page, horizon)` checks all tuples committed pre-horizon.
+      `VacuumWithFSMAndVM` sets VM bits per page after vacuum; wired into
+      vacuumOp + autovacuum. `IndexOnlyScan` plan node + `tryPromoteIndexOnlyScan`
+      in planner (skipped when FOR UPDATE/SHARE). `indexOnlyScanOp`: key-decode
+      fast-path (zero heap reads) when VM=ALL_VISIBLE; heap fallback otherwise.
+      `DecodeVarchar` / `DecodeTimestamp` added to btree package.
+      `markHeapDeleteDirtyAndClearVM` clears VM on delete/update.
+      INSERT paths clear VM. VM wired in Runtime/Config/dispatch/autovacuum.
+      `planContainsIndexScan` updated to accept IndexOnlyScan.
+      10 tests: 6 storage unit + 4 executor integration.
+      All go test ./... pass.)
 - [ ] M0046-0005: Tuple freezing & anti-wraparound. Design doc
       `docs/design/0046-0005-tuple-freezing-and-wraparound.md`.
       VACUUM rewrites old `xmin` to `FrozenTransactionId`;

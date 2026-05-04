@@ -25,6 +25,9 @@ type Launcher struct {
 	// FSM, when non-nil, is updated by each autovacuum pass so
 	// subsequent INSERT operations can reuse freed pages (M0046-0003).
 	FSM *storage.FSM
+	// VM, when non-nil, gets ALL_VISIBLE bits set per page after
+	// autovacuum so index-only scans can skip heap fetches (M0046-0004).
+	VM *storage.VisibilityMap
 
 	// NapInterval is the time between launcher wakeups.
 	NapInterval time.Duration
@@ -122,7 +125,7 @@ func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 		if last, ok := l.lastVacuum[key]; !ok || now.Sub(last) >= l.MinVacuumAge {
 			if l.needsVacuum(tbl) {
 				log.Info("autovacuum: running vacuum", "table", key)
-				stats, err := vacuum.VacuumWithFSM(l.Pool, l.TxnMgr, rel, l.FSM)
+				stats, err := vacuum.VacuumWithFSMAndVM(l.Pool, l.TxnMgr, rel, l.FSM, l.VM)
 				if err != nil {
 					log.Error("autovacuum: vacuum failed", "table", key, "error", err)
 				} else {

@@ -381,6 +381,41 @@ func EncodeTimestamp(microsSince2000 int64) []byte {
 	return EncodeInt8(microsSince2000)
 }
 
+// DecodeTimestamp inverts EncodeTimestamp (identical to DecodeInt8).
+func DecodeTimestamp(b []byte) (int64, error) { return DecodeInt8(b) }
+
+// DecodeVarchar inverts EncodeVarchar: strips the 0x00 terminator and
+// unescapes 0x01-prefixed bytes. Used by index-only scan (M0046-0004)
+// to reconstruct string values from B-tree key bytes without a heap fetch.
+func DecodeVarchar(b []byte) ([]byte, error) {
+	if len(b) == 0 || b[len(b)-1] != 0x00 {
+		return nil, fmt.Errorf("btree: varchar key missing 0x00 terminator")
+	}
+	out := make([]byte, 0, len(b)-1)
+	src := b[:len(b)-1] // strip terminator
+	for i := 0; i < len(src); {
+		c := src[i]
+		if c == 0x01 {
+			if i+1 >= len(src) {
+				return nil, fmt.Errorf("btree: varchar key: truncated escape at byte %d", i)
+			}
+			switch src[i+1] {
+			case 0x01:
+				out = append(out, 0x00)
+			case 0x02:
+				out = append(out, 0x01)
+			default:
+				return nil, fmt.Errorf("btree: varchar key: invalid escape %02x at byte %d", src[i+1], i)
+			}
+			i += 2
+		} else {
+			out = append(out, c)
+			i++
+		}
+	}
+	return out, nil
+}
+
 // CompareKeys is straight bytewise lexicographic comparison.
 //
 // For int4 keys (all 4 bytes) this matches numeric order by
