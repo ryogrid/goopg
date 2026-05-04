@@ -1635,13 +1635,17 @@ See `docs/milestones/0050-savepoints-and-subtransactions.md`. Closes
 the savepoint gap in `docs/reference/ref-022-session-management.md`
 and unblocks PL/pgSQL exception blocks (M0015).
 
-- [ ] M0050-0001: Subxact stack & state machine. Design doc
+- [x] M0050-0001: Subxact stack & state machine. Design doc
       `docs/design/0050-0001-subxact-stack-and-state-machine.md`.
-      `TransactionState.Stack` of `SubTransactionState`; SAVEPOINT
-      push, RELEASE collapse-up, ROLLBACK TO rewind+push-fresh; lock-
-      owner re-assignment. Lazy subxact xid allocation. DoD: stack
-      operations covered by unit tests; lock owner correctness
-      verified.
+      (landed 2026-05-05: `SubxactStack` in `internal/mvcc/subxact.go`
+      with `Push(name,snap)`, `Release(name)`, `RollbackTo(name,snap)`,
+      `AbortAll()`; `SubTransactionState{Id SubTxnId, Name, SubXid
+      TransactionID, Snap *Snapshot, Status SubXactStatus, Parent}`;
+      nil-safe on all methods. `SubTxnId` is the lock-manager identity
+      key: RELEASE → promote (SubXactCommitted entries), ROLLBACK TO →
+      drop (SubXactAborted entries). 9 unit tests including
+      `TestSubxactStackLockOwnerCorrectnessModel` (DoD) and
+      `TestSubxactStackNilSafe`.)
 - [ ] M0050-0002: Subxact xid & visibility. Design doc
       `docs/design/0050-0002-subxact-xid-and-visibility.md`. In-memory
       subxact-to-parent map; `XidInProgress` resolves via

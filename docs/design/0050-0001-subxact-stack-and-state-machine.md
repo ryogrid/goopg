@@ -1,69 +1,88 @@
-# 0050-0001 — Subtransaction stack and state machine
+# Subtransaction Stack and State Machine — M0050-0001
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0050 — Savepoints and subtransactions
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-`TransactionState` today is a single struct per session: one xid, one
-snapshot, one rolled-back-or-committed result. Savepoints introduce
-nesting: `BEGIN; ...; SAVEPOINT s1; ...; SAVEPOINT s2; ROLLBACK TO s1;
-COMMIT;`. The session must keep a stack of subxact states and update
-the right subset on each verb.
+The MVCC manager and session state today support a single flat transaction
+(one XID, one snapshot). Savepoints require a stack of sub-transaction states
+with snapshot capture, rewind, and lock-owner tracking semantics.
 
-## Plan
+## 2. Design
 
-1. New struct in `internal/mvcc/`:
-   ```go
-   type SubTransactionState struct {
-       Id        SubTxnId       // monotonic counter, scoped to top-level xact
-       Name      string         // SAVEPOINT name, "" for implicit
-       Parent    *SubTransactionState
-       SubXid    Xid            // assigned lazily when first row written
-       Snapshot  *Snapshot      // copy of current snapshot at push
-       Status    SubXactStatus  // active | committed | aborted
-   }
-   ```
-2. `TransactionState` grows a `Stack []*SubTransactionState`. Index 0
-   is the top-level xact (existing fields move into it).
-3. Verbs:
-   - `SAVEPOINT name` → push new entry, copy current snapshot,
-     name-set; record in WAL once a subxact xid is allocated.
-   - `RELEASE SAVEPOINT name` → pop the named entry and any above it,
-     promoting their (a) inserted rows' xmin (still subxact xid; the
-     parent's commit will commit them too), (b) acquired locks
-     (transferred to parent's lock owner), (c) WAL-recorded actions
-     (no-op — they all rode on subxact xids that the parent will
-     commit).
-   - `ROLLBACK TO SAVEPOINT name` → pop the named entry and any above
-     it; mark each as aborted; release locks acquired *only* by them;
-     emit subxact-abort WAL records; **then push a fresh entry with
-     the same name** (matches upstream).
-   - `ROLLBACK` (top-level) → mark every entry on the stack aborted in
-     reverse order, then mark top-level aborted.
-4. Subxact xid allocation is **lazy** — only when a subxact actually
-   writes (insert/update/delete or DDL) does it consume a fresh xid via
-   `XidAdvance`. Mirrors upstream's `AssignTransactionId` chain.
+### 2.1 Types (`internal/mvcc/subxact.go`)
 
-## Definition of Done
+```go
+type SubTxnId uint32        // monotonic per top-level transaction
+type SubXactStatus int       // active | committed | aborted
 
-- Stack push/pop/rewind covered by unit tests in `internal/mvcc/`.
-- Lock-owner re-assignment correctness — locks acquired by a subxact
-  promoted to parent on RELEASE, dropped on ROLLBACK TO.
-- Visibility tests (defer to 0050-0002).
+type SubTransactionState struct {
+    Id     SubTxnId
+    Name   string                   // SAVEPOINT name; "" for implicit
+    SubXid storage.TransactionID    // 0 until first write (lazy)
+    Snap   *Snapshot                // snapshot at push time
+    Status SubXactStatus
+    Parent *SubTransactionState
+}
+```
 
-## Upstream reference
+### 2.2 `SubxactStack` (`internal/mvcc/subxact.go`)
 
-- `postgres/src/backend/access/transam/xact.c` —
-  `BeginInternalSubTransaction`, `RollbackToSavepoint`,
-  `ReleaseSavepoint`, `EndSubTransaction`, `AbortSubTransaction`.
-- `postgres/src/include/access/xact.h` — `TransactionState` shape.
+An ordered list of `*SubTransactionState`, oldest first. All methods are
+nil-safe (zero-value session state before any SAVEPOINT).
 
-## goopg references
+| Method | Semantics |
+|---|---|
+| `Push(name, snap)` | Create entry with monotonic Id, copy snapshot, link Parent |
+| `Top()` | Innermost active entry |
+| `Find(name)` | Innermost active entry with given name |
+| `Release(name)` | Mark named + inner entries `SubXactCommitted`, pop from slice; caller promotes locks to parent |
+| `RollbackTo(name, newSnap)` | Mark named + inner entries `SubXactAborted`, pop, push fresh entry with same name; caller drops locks |
+| `AbortAll()` | Mark all entries aborted, clear slice; called by top-level `ROLLBACK` |
 
-- `internal/mvcc/transaction.go` — current single-state type.
-- `internal/lock/` — lock owners need subxact awareness.
-- 0050-0002 — visibility model.
-- 0050-0003 — WAL records.
+### 2.3 Subxact xid allocation (lazy)
+
+`SubTransactionState.SubXid` is 0 until the first write within the
+subtransaction. M0050-0002/0003 wire the actual XID assignment call
+(`Manager.AllocateSubXid`) into `writeHeapRow` and the WAL path.
+
+### 2.4 Lock-owner tracking model
+
+`SubTxnId` is the identifier the lock manager (M0050-0004) will use to
+track lock ownership:
+
+- **RELEASE**: released entries are `SubXactCommitted`; caller calls
+  `LockManager.TransferLocks(subxactId, parentId)` for each.
+- **ROLLBACK TO**: aborted entries are `SubXactAborted`; caller calls
+  `LockManager.ReleaseBySubxact(subxactId)` for each.
+
+The `SubTxnId` field on returned entries provides the precise
+identity needed for these calls.
+
+## 3. Correctness
+
+- `Push` captures a snapshot copy so rewinding to a savepoint restores
+  the correct snapshot without aliasing.
+- `RollbackTo` pushes a fresh entry with a new (higher) `Id` so that
+  post-rollback mutations in the same savepoint name do not collide with
+  the aborted entry's `SubTxnId` in the lock manager.
+- All methods are nil-safe: a session that has never issued `SAVEPOINT`
+  has a nil `*SubxactStack` and all operations return the zero value.
+
+## 4. Tests (`internal/mvcc/subxact_test.go`)
+
+| Test | Coverage |
+|---|---|
+| `TestSubxactStackPush` | Monotonic Id, parent linkage, snapshot capture, active status |
+| `TestSubxactStackRelease` | Named + inner entries committed; outer entries unchanged |
+| `TestSubxactStackReleaseNotFound` | Error on missing name; stack unchanged |
+| `TestSubxactStackRollbackTo` | Named + inner aborted; fresh entry pushed with higher Id |
+| `TestSubxactStackRollbackToNotFound` | Error on missing name; stack unchanged |
+| `TestSubxactStackAbortAll` | All entries aborted; stack cleared |
+| `TestSubxactStackNilSafe` | All methods safe on nil receiver |
+| `TestSubxactStackLockOwnerCorrectnessModel` | **DoD**: Released entries = lock-promote targets; aborted entries = lock-drop targets |
+| `TestSubxactStackSnapshotCapture` | Each entry holds distinct snapshot; RollbackTo fresh entry gets new snapshot |
