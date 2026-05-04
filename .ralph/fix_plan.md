@@ -1198,6 +1198,107 @@ composite-key bytewise comparison stays correct.
   - [ ] Mark milestone `accepted` and tick the M0011 follow-up
         boxes that this milestone subsumes.
 
+## Milestone 0045 — Crash recovery from non-zero starting WAL segment
+
+See `docs/milestones/0045-wal-recovery-non-zero-start.md`.
+Identified during run-007 (`analysis/tpch-hammerdb-run-007.md`):
+hard-killing goopg mid-power-test made the cluster un-restartable.
+Symptom from `bench/tpch/runtime_goopg/goopg.log` after restart:
+
+```
+goopg start: goopg: wal: wal: first segment is
+00000000000000000000023F, expected 000000000000000000000000
+```
+
+`internal/wal/writer.go:874` rejects any data directory whose
+smallest WAL segment isn't 0. Slot-aware retention
+(`internal/wal/retention.go`) deletes pre-checkpoint segments as
+part of normal operation, so segment 0 is gone after even one
+full retention cycle. The hard rejection contradicts the
+retention contract.
+
+PostgreSQL handles this via pg_control (latest checkpoint LSN
+recorded persistently). Goopg's `internal/initdb/initdb.go:6`
+explicitly notes "no system catalog or write a pg_control file
+— those land alongside [later milestones]". M0045 fixes the
+restart bug *without* requiring pg_control by:
+(a) accepting first segment > 0 in `detectWritePos`, and
+(b) discovering the latest checkpoint LSN by scanning the
+retained WAL backwards.
+
+- [ ] M0045-0001: `detectWritePos` from a non-zero starting
+      segment. Design doc
+      `docs/design/0045-0001-detect-write-pos-from-non-zero-segment.md`.
+  - [ ] Replace `expected := uint64(i)` with
+        `expected := firstSegNo + uint64(i)` in the segment-loop
+        of `internal/wal/writer.go::detectWritePos`. Drop the
+        unconditional `if segNos[0] != 0 { return error }`.
+  - [ ] Compute `writePos = firstSegNo*segSize +
+        bytesUsedInLastSeg` so the LSN convention (segment K at
+        byte offset K·segSize) is preserved.
+  - [ ] Gap-detection still flags real corruption
+        (e.g., segments 575 and 577 with 576 missing).
+  - [ ] Unit test
+        `internal/wal/writer_test.go::TestDetectWritePos_NonZeroFirstSeg`
+        covers the run-007 reproducer (firstSegNo = 0x23F).
+
+- [ ] M0045-0002: Restart replay of post-checkpoint WAL records.
+      Design doc
+      `docs/design/0045-0002-restart-replay-of-post-checkpoint-records.md`.
+  - [ ] Wire `wal.NewRecordIterator(startLSN=lastCkptLSN)` and
+        `wal.StreamReplayer.Run` into the goopg startup path
+        (likely `cmd/goopg/main.go::runStart` or
+        `internal/server/server.go::startBackends`).
+  - [ ] Reuse `StreamReplayer`'s existing idempotency — re-
+        applying a record whose effects already landed on disk
+        is a no-op via the buffer pool's per-page LSN check.
+  - [ ] On replay error, abort startup with the affected LSN in
+        the diagnostic; do not silently bring the listener up.
+  - [ ] Unit test in `internal/wal/recovery_test.go` synthesises
+        a WAL stream with a checkpoint marker followed by N
+        records, calls the recovery driver, and asserts
+        `ApplyLSN()` matches the last record's end-LSN.
+
+- [ ] M0045-0003: Discover the last-checkpoint LSN without
+      pg_control. Design doc
+      `docs/design/0045-0003-checkpoint-marker-discovery.md`.
+  - [ ] New helper
+        `discoverLastCheckpointLSN(walDir, segSize) (uint64, error)`
+        in `internal/wal/recovery.go` (new file). Walks segments
+        in reverse (newest first), uses the existing
+        `internal/wal/iterator.go` machinery to scan for the
+        checkpoint record-type tag.
+  - [ ] If no marker is found in any retained segment, return a
+        diagnostic error pointing the operator to `--reset` —
+        do NOT silently start with `lastCkptLSN = 0`.
+  - [ ] Unit tests for "marker in newest segment", "marker in an
+        older segment", "no marker anywhere".
+
+- [ ] M0045-0004: Integration test —
+      `restart_after_retention_test.go`. Design doc
+      `docs/design/0045-0004-integration-test-kill-and-restart.md`.
+  - [ ] New file `internal/server/restart_after_retention_test.go`.
+  - [ ] Phase 1: bring up goopg with a small segment size
+        (1 MiB), seed enough data to drive retention past
+        segment 0, force ≥ 2 checkpoints + retention.
+  - [ ] Phase 2: hard-kill the server (skip Close(); fsync the
+        data dir to mirror SIGKILL post-state).
+  - [ ] Phase 3: restart against the same data dir; assert all
+        seed rows are still readable.
+  - [ ] Test must FAIL on `master` (pre-fix) with the
+        `first segment is …, expected …` error and PASS after
+        M0045-0001 lands.
+
+- [ ] M0045-0005: TPC-H end-to-end regression. Re-run the
+      run-007 hard-kill scenario (HammerDB power test
+      mid-flight, kill goopg, restart, query SF=1 dataset).
+      Documented in `analysis/tpch-hammerdb-run-008.md` (or the
+      next sequential run report).
+  - [ ] No data loss; no un-restartable cluster.
+  - [ ] `TestTPCHResultParity` identical=22 divergent=0
+        errored=0 still holds.
+  - [ ] Mark M0045 `accepted`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
