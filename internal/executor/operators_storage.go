@@ -351,10 +351,114 @@ func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
 	return nil
 }
 
+// hotUpdateEligible returns true when a HOT update is legal for the
+// given Update plan: no column that is being changed participates in
+// any index on the target table. When this returns true the executor
+// may write the new tuple version to the same page as the old one and
+// skip any index inserts. If no indexes exist, all updates are
+// HOT-eligible (the same-page placement is still beneficial for
+// space reuse even without an index-cost saving).
+func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
+	indexes := ctx.Catalog.IndexesOnTable(plan.Table)
+	for _, idx := range indexes {
+		for _, idxCol := range idx.Columns {
+			for i, set := range plan.Set {
+				if set == nil {
+					continue
+				}
+				if plan.Table.Columns[i].Name == idxCol {
+					return false // indexed column is being changed
+				}
+			}
+		}
+	}
+	return true
+}
+
+// markHeapHotUpdateDirty is the WAL-logging counterpart of
+// markHeapInsertDirty / markHeapDeleteDirty for the HOT path: it
+// emits one atomic HeapHotUpdate record covering both the old-tuple
+// stamp and the new-tuple insert on the same page. Falls back to a
+// conservative MarkDirty (full FPI on next checkpoint) when no WAL
+// hook is wired.
+func markHeapHotUpdateDirty(
+	pool *storage.Pool, slot *storage.Slot,
+	rel storage.RelFileNode, blk storage.BlockNumber,
+	oldLineSlot uint16, xmax storage.TransactionID,
+	tupleBytes []byte,
+) error {
+	logHot := pool.LogHeapHotUpdate()
+	if logHot == nil {
+		pool.MarkDirty(slot)
+		return nil
+	}
+	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+		return logHot(rel, blk, oldLineSlot, xmax, tupleBytes)
+	})
+}
+
+// tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
+// (blk, oldSlot). It:
+//  1. Encodes newRow with HeapOnlyTuple set in the tuple infomask.
+//  2. Tries PageAddHeapTuple on the same page; returns (false, nil) on
+//     ErrNoSpaceInPage so the caller falls back to the normal path.
+//  3. On success, stamps the old slot via PageStampHotOldTuple and
+//     emits one atomic HeapHotUpdate WAL record.
+//
+// The caller must not hold the page's content lock — this function
+// acquires and releases it internally.
+func tryApplyHOTUpdate(
+	ctx *Context,
+	rel storage.RelFileNode,
+	cols []catalog.Column,
+	blk storage.BlockNumber,
+	oldSlot uint16,
+	newRow Row,
+) (bool, error) {
+	body, err := EncodeRow(cols, newRow)
+	if err != nil {
+		return false, &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	tup := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	tup.Header.Infomask |= storage.HeapOnlyTuple
+	tupleBytes, err := tup.MarshalBinary()
+	if err != nil {
+		return false, err
+	}
+
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return false, err
+	}
+	s.Lock()
+
+	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
+	if addErr != nil {
+		s.Unlock()
+		ctx.Pool.Unpin(s)
+		if errors.Is(addErr, storage.ErrNoSpaceInPage) {
+			return false, nil // no space — caller falls back to normal path
+		}
+		return false, addErr
+	}
+
+	if err := storage.PageStampHotOldTuple(s.Page(), oldSlot, ctx.Tx.XID, blk, newSlot); err != nil {
+		s.Unlock()
+		ctx.Pool.Unpin(s)
+		return false, err
+	}
+
+	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, ctx.Tx.XID, tupleBytes)
+	s.Unlock()
+	ctx.Pool.Unpin(s)
+	return true, derr
+}
+
 // updateOp scans the target relation and rewrites visible matching
-// tuples. v0 uses upstream's "delete + insert" pattern: stamp xmax on
-// the old tuple, write the new image as a fresh heap tuple. HOT
-// chains and same-page updates are deferred.
+// tuples. The primary strategy is a HOT update (same-page insert,
+// no index entry added) when no indexed column is being changed and
+// the page has space. Falls back to the classic delete+insert pattern
+// when HOT is ineligible or the page is full.
 type updateOp struct {
 	plan         *planner.Update
 	scan         *planner.SeqScan
@@ -444,32 +548,31 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			return false, err
 		}
 		slot.RLock()
-		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// Follow the HOT chain: the index pointer may be stale (pointing
+		// to an earlier version whose CTID leads to the live version).
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
-		if err != nil {
-			return false, err
-		}
-		if !mvcc.TupleVisible(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID) {
+		if !found {
 			return true, nil
 		}
-		// Check for foreign tuple lock (M0021 step 2b).
+		// Check for foreign tuple lock (M0021 step 2b) on the live version.
 		if foreignLockOnly(tuple.Header, o.ctx.Tx.XID) {
-			ptr := storage.ItemPointer{Block: ptr.Block, Offset: ptr.Offset}
-			if err := o.ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
+			livePtr := storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
+			if err := o.ctx.acquireTupleLock(rel, livePtr, lockmgr.ExclusiveLock); err != nil {
 				return false, err
 			}
-			// Re-read after lock released.
+			// Re-read after lock released — follow chain again.
 			slot2, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 			if err != nil {
 				return false, err
 			}
 			slot2.RLock()
-			tuple, err = storage.PageGetHeapTuple(slot2.Page(), ptr.Offset)
+			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
 			slot2.RUnlock()
 			o.ctx.Pool.Unpin(slot2)
-			if err != nil {
-				return false, err
+			if !found {
+				return true, nil
 			}
 		}
 		row, err := DecodeRow(cols, tuple.Data)
@@ -492,7 +595,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		}
 		pending = append(pending, pendingUpdate{
 			blk:    ptr.Block,
-			slot:   ptr.Offset,
+			slot:   actualSlot, // use live slot, not the index-pointed slot
 			newRow: newRow,
 		})
 		return true, nil
@@ -501,26 +604,38 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		return nil, err
 	}
 
-	// Modification phase: stamp xmax and write new tuple.
+	// Modification phase: HOT update when eligible, else delete+insert.
+	hotEligible := hotUpdateEligible(o.plan, o.ctx)
 	for _, pu := range pending {
-		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
-		if err != nil {
-			return nil, err
+		used := false
+		if hotEligible {
+			var err error
+			used, err = tryApplyHOTUpdate(o.ctx, rel, cols, pu.blk, pu.slot, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 		}
-		s.Lock()
-		if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+		if !used {
+			// HOT ineligible or page full — fall back to normal delete+insert.
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+			if err != nil {
+				return nil, err
+			}
+			s.Lock()
+			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				return nil, err
+			}
+			derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
-			return nil, err
-		}
-		derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
-		s.Unlock()
-		o.ctx.Pool.Unpin(s)
-		if derr != nil {
-			return nil, derr
-		}
-		if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
-			return nil, err
+			if derr != nil {
+				return nil, derr
+			}
+			if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
+				return nil, err
+			}
 		}
 		o.rowsAffected++
 	}
@@ -574,25 +689,36 @@ func (o *updateOp) Next() (Row, error) {
 	}); err != nil {
 		return nil, err
 	}
+	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
 	for _, pu := range pending {
-		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
-		if err != nil {
-			return nil, err
+		used := false
+		if hotEligibleSeq {
+			var err error
+			used, err = tryApplyHOTUpdate(o.ctx, rel, cols, pu.blk, pu.slot, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 		}
-		s.Lock()
-		if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+		if !used {
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+			if err != nil {
+				return nil, err
+			}
+			s.Lock()
+			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				return nil, err
+			}
+			derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
-			return nil, err
-		}
-		derr := markHeapDeleteDirty(o.ctx.Pool, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
-		s.Unlock()
-		o.ctx.Pool.Unpin(s)
-		if derr != nil {
-			return nil, derr
-		}
-		if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
-			return nil, err
+			if derr != nil {
+				return nil, derr
+			}
+			if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
+				return nil, err
+			}
 		}
 		o.rowsAffected++
 	}

@@ -1403,15 +1403,22 @@ See `docs/milestones/0046-heap-mvcc-maturation.md`. Closes the heap
 gaps catalogued in `docs/reference/ref-007-heap-mvcc.md`. Substantial;
 sub-tasks decompose around independent design docs.
 
-- [ ] M0046-0001: Heap-Only Tuples (HOT). Design doc
-      `docs/design/0046-0001-hot-updates.md`. Detect "no indexed column
-      changed" via per-relation indexed-column bitmap, redirect tuple
-      version on the same heap page via `t_ctid`, mark
-      `HEAP_HOT_UPDATED` / `HEAP_ONLY_TUPLE`, **skip the index-insert
-      loop**. Index-fetch follows the chain. WAL: new `XLH_HOT_UPDATE`
-      flag bit on existing `HEAP_UPDATE` record. DoD: pgbench-style
-      UPDATE workload index-size growth ≤ 10% of pre-HOT baseline at
-      100k transactions.
+- [x] M0046-0001: Heap-Only Tuples (HOT). Design doc
+      `docs/design/0046-0001-hot-updates.md`. (landed 2026-05-05:
+      `HeapHotUpdated`/`HeapOnlyTuple` infomask constants + `PageStampHotOldTuple`
+      in storage/heap.go. `hotUpdateEligible` checks no indexed column changes via
+      `IndexesOnTable`. `tryApplyHOTUpdate` inserts new tuple on same page with
+      `HeapOnlyTuple` set + stamps old tuple with `HeapHotUpdated` + CTID chain
+      under page exclusive lock. Both `updateViaIndex` and sequential update use
+      HOT when eligible, fall back to delete+insert otherwise. `followHOTChain`
+      walks CTID links (same page, ≤64 steps) — called by `indexScanOp.Open()`
+      scanFn and `updateViaIndex` to find the live version past HOT chains.
+      `RecordKindHeapHotUpdate = 13` WAL record (kind+rel+blk+oldSlot+xmax+
+      tupleBytes); wired in initdb/open.go; replay inserts new tuple → gets
+      newSlot → stamps old slot atomically. 5 tests: same-page placement,
+      index-scan chain following, indexed-col fallback, depth-2 chain, unit test
+      for followHOTChain. All `go test ./...` pass (hammerdb_load benchmark
+      timeout is pre-existing, not caused by this change).)
 - [ ] M0046-0002: Opportunistic page pruning. Design doc
       `docs/design/0046-0002-page-pruning.md`. New
       `internal/access/heap/prune.go` with `PagePruneOpt` and

@@ -1,72 +1,137 @@
-# 0046-0001 — Heap-Only Tuples (HOT)
+# Heap-Only Tuples (HOT) — M0046-0001
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0046 — Heap & MVCC maturation
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-`docs/reference/ref-007-heap-mvcc.md` notes that goopg's `heap_update` always
-inserts a fresh tuple **and** writes a new index entry on every index, even
-when the UPDATE did not touch any indexed column. On UPDATE-heavy workloads
-this is the single biggest source of index bloat: a 100-million-row table
-with one secondary index can grow that index by gigabytes per day even
-though the indexed key is stable.
+Every UPDATE on a heap relation currently follows the "delete + insert" pattern:
+1. Stamp `xmax` on the old tuple (in-place header write).
+2. Append the new tuple to the last heap page (may extend the relation).
 
-Upstream solves this with HOT — a new tuple version is chained on the same
-heap page via `t_ctid`, the redirect carries `HEAP_HOT_UPDATED` /
-`HEAP_ONLY_TUPLE` flags, and **no index entries are written**. The next
-`heap_page_prune_opt` collapses dead links in the chain. Index lookups
-that land on a redirect entry follow the chain through `t_ctid`.
+This has two costs:
+- **Heap bloat**: each UPDATE adds a new page slot; old slots are only reclaimed
+  by VACUUM.
+- **Index bloat** (future): once index maintenance is wired for regular INSERTs,
+  every UPDATE would append a new index entry pointing at the new TID even when
+  no indexed column changed.
 
-## Plan
+PostgreSQL's *Heap-Only Tuple* mechanism (HOT, upstream
+`postgres/src/backend/access/heap/heapam.c`) eliminates both costs when no
+indexed column is modified and there is free space on the existing page.
 
-1. Detect "no indexed column changed". `internal/access/heap` gains
-   `HeapDetermineModifiedColumns(rel, old, new)`; `internal/catalog`
-   exposes the indexed-column bitmap per relation.
-2. New tuple-header bits `HEAP_HOT_UPDATED`, `HEAP_ONLY_TUPLE` in
-   `internal/access/heap` (mirroring upstream constants exactly).
-3. Modify `heap_update` to:
-   - Try same-page insert first when (a) no indexed column changed and
-     (b) free space is available on the page hosting the old tuple.
-   - On success: stamp `t_ctid` on old tuple to point to the new
-     line-pointer slot, set `HEAP_HOT_UPDATED` on old, `HEAP_ONLY_TUPLE`
-     on new, **skip the index-insert loop**.
-   - Fall back to the existing cross-page update when either condition
-     fails.
-4. Index-fetch path (`internal/access/btree/scan.go` / index-scan operator)
-   walks the HOT chain when the heap entry it lands on is marked
-   `HEAP_HOT_UPDATED`.
-5. WAL: a HOT update emits a `HEAP_UPDATE` record with the new
-   `XLH_HOT_UPDATE` flag bit. Recovery applies the same same-page-insert +
-   redirect-stamp idempotently (page LSN gates re-application — depends on
-   M0017 / M0045's pd_lsn discipline).
-6. VACUUM (`internal/storage/vacuum.go`) recognises HOT chains during the
-   prune phase and reclaims the entire chain when its tail is dead.
+## 2. Design
 
-## Definition of Done
+### 2.1 Eligibility
 
-- HOT same-page update path lands behind a feature flag GUC
-  (`enable_hot_updates`, default on).
-- pgbench-style UPDATE workload: index size growth ≤ 10% of pre-HOT
-  baseline at 100k transactions.
-- Existing index-fetch tests still green; new test exercising HOT-chain
-  follow-through is added.
-- WAL replay round-trip test: HOT update record applied to a clone yields
-  byte-identical page state.
+A HOT update is attempted when **all** of the following hold:
 
-## Upstream reference
+1. `hotUpdateEligible(plan, ctx)` returns `true`: none of the columns referenced
+   in `plan.Set[i] != nil` appears in any index on the table
+   (`ctx.Catalog.IndexesOnTable`).
+2. `tryApplyHOTUpdate` succeeds: `PageAddHeapTuple` on the *same* block as the
+   old tuple finds enough free space.
 
-- `postgres/src/backend/access/heap/heapam.c` — `heap_update`,
-  `HeapDetermineModifiedColumns`.
-- `postgres/src/backend/access/heap/pruneheap.c` —
-  `heap_page_prune_opt` (consumed by 0046-0002).
-- `postgres/src/include/access/htup_details.h` — `HEAP_HOT_UPDATED`,
-  `HEAP_ONLY_TUPLE`, `HEAP_UPDATED`.
+When either condition fails the update falls back to the classic delete+insert
+path unchanged.
 
-## goopg references
+### 2.2 Storage layer additions (`internal/storage/heap.go`)
 
-- `internal/access/heap/heapam.go` — current `Update` path.
-- `docs/design/root-0006-storage-format.md` — tuple-header layout.
-- `docs/design/root-0007-mvcc-and-snapshots.md` — visibility invariants.
+Two new infomask constants mirror upstream:
+
+```go
+HeapHotUpdated uint16 = 0x4000   // HEAP_HOT_UPDATED upstream
+HeapOnlyTuple  uint16 = 0x8000   // HEAP_ONLY_TUPLE  upstream
+```
+
+`PageStampHotOldTuple(page, oldSlot, xmax, blk, newSlot)` performs in-place
+header mutations on the old tuple:
+- Write `xmax` at `off+4`.
+- Write CTID `(blk, newSlot)` at `off+12`–`off+18`.
+- Clear `HeapXmaxLockOnly | HeapXmaxLockMask` (same as `PageSetHeapTupleXmax`).
+- Set `HeapHotUpdated` in infomask at `off+20`.
+
+### 2.3 HOT update execution (`internal/executor/operators_storage.go`)
+
+`tryApplyHOTUpdate(ctx, rel, cols, blk, oldSlot, newRow) (bool, error)`:
+1. Encode `newRow`; set `HeapOnlyTuple` in `tuple.Header.Infomask` before
+   marshalling.
+2. Pin page `blk` with exclusive lock.
+3. `PageAddHeapTuple(page, tuple)` → `newSlot`; return `(false, nil)` on
+   `ErrNoSpaceInPage` (caller falls back to normal path).
+4. `PageStampHotOldTuple(page, oldSlot, ctx.Tx.XID, blk, newSlot)`.
+5. `markHeapHotUpdateDirty` (WAL record or FPI fallback).
+6. Return `(true, nil)`.
+
+Both `updateViaIndex` and the sequential `Next()` path call
+`hotUpdateEligible` once per statement and gate `tryApplyHOTUpdate` per row.
+
+### 2.4 WAL record (`internal/wal/recovery.go`)
+
+`RecordKindHeapHotUpdate = 13` (new constant after `RecordKindSmgrTruncate = 12`).
+
+Fixed header (20 bytes) + variable new-tuple bytes:
+```
+kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) | oldSlot(2) | xmax(4)
+```
+
+`tupleBytes` is the marshalled new tuple with `HeapOnlyTuple` already set in its
+infomask so the replay path gets the correct flag without extra bookkeeping.
+
+**Replay** (`replayHeapHotUpdate`):
+1. Read page `blk` (error if block absent or uninitialized).
+2. pd_lsn idempotency check — skip if `LSN >= record.EndLSN`.
+3. `ParseHeapTuple(tupleBytes)` → `tup`.
+4. `PageAddHeapTuple(page, tup)` → `newSlot`.
+5. `PageStampHotOldTuple(page, oldSlot, xmax, blk, newSlot)`.
+6. Update pd_lsn; write page back.
+
+The WAL hook is wired in `internal/initdb/open.go` as `logHeapHotUpdate`,
+following the same pattern as `logHeapDelete` / `logHeapInsert`.
+
+### 2.5 HOT chain following (`internal/executor/operators_index.go`)
+
+`followHOTChain(page, startSlot, snap, xid) (HeapTuple, uint16, bool)`:
+- Walk `startSlot → CTID.Offset` up to 64 steps (chain depth guard).
+- For each slot: `TupleVisible` → return it. Not visible + `HeapHotUpdated` →
+  advance to `CTID.Offset`.
+- Return `(_, _, false)` when chain is exhausted or a self-reference is detected.
+
+Both `indexScanOp.Open()` `scanFn` and `updateViaIndex` call `followHOTChain`
+instead of the previous direct `PageGetHeapTuple` + visibility check. The `tids`
+slice in `indexScanOp` records the *actual live slot* from the chain walk so
+`lockRowsOp` stamps the correct version for `SELECT FOR UPDATE`.
+
+Sequential scans (`seqScanOp`) do **not** use `followHOTChain`: MVCC handles
+HOT-only tuples directly (they have `xmin = update_xid`; standard visibility
+applies).
+
+## 3. Invariants
+
+| Property | Guarantee |
+|---|---|
+| Same-page chain | All versions in a HOT chain reside on the same block. |
+| HOT-only flag | Any tuple with `HeapOnlyTuple` has no direct index entry (future index maintenance must respect this). |
+| Atomic WAL record | Old-tuple stamp + new-tuple insert encoded in one record; replay is all-or-nothing under pd_lsn idempotency. |
+| Fallback | Page-full → classic delete + insert path, no data loss. |
+
+## 4. Tests (`internal/executor/hot_update_test.go`)
+
+| Test | Coverage |
+|---|---|
+| `TestHOTUpdateSamePage` | New tuple lands on same page; old tuple flags `HeapHotUpdated` + CTID chain; new tuple flags `HeapOnlyTuple`; no heap page growth. |
+| `TestHOTUpdateIndexScanFindsNewVersion` | Index scan returns HOT-updated value via chain following. |
+| `TestHOTUpdateIndexedColumnFallback` | Update of indexed column → normal path (no `HeapHotUpdated` flag). |
+| `TestHOTUpdateChainDepthTwo` | Two consecutive HOT updates → depth-2 chain; index scan returns final version. |
+| `TestFollowHOTChainDirect` | Unit test: manually constructed HOT chain traversed correctly. |
+
+## 5. Deferred
+
+- **ItemIDRedirect** line pointers — VACUUM-phase HOT chain compaction (M0046-0002).
+- **Visibility map integration** — cleared on any page modification once the VM fork exists.
+- **Index maintenance for regular INSERTs** — when wired, non-HOT UPDATEs will
+  insert into indexes; `hotUpdateEligible` already prevents double-indexing on
+  the HOT path.

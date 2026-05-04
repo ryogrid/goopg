@@ -307,6 +307,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Atomic HOT-update change record (M0046-0001). Encodes the
+	// old-slot xmax stamp + new tuple bytes on the same page in one
+	// record so replay can reconstruct the HOT chain atomically.
+	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
+		payload := wal.EncodeHeapHotUpdate(rel, blk, oldSlot, xmax, tupleBytes)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Relation-file creation WAL record (M0030-0002). Emitted by
 	// Pool.PinNew when it creates block 0 of a new relfile so crash
 	// recovery can recreate the file before replaying data pages.
@@ -323,10 +335,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeSplit:  logBtreeSplit,
 		LogHeapInsert:  logHeapInsert,
 		LogBtreeInsert: logBtreeInsert,
-		LogHeapDelete:  logHeapDelete,
-		LogHeapVacuum:  logHeapVacuum,
-		LogHeapLock:    logHeapLock,
-		LogSmgrCreate:  logSmgrCreate,
+		LogHeapDelete:    logHeapDelete,
+		LogHeapVacuum:    logHeapVacuum,
+		LogHeapLock:      logHeapLock,
+		LogHeapHotUpdate: logHeapHotUpdate,
+		LogSmgrCreate:    logSmgrCreate,
 		FullPageWrites: true,
 	})
 	if err != nil {

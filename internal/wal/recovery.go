@@ -83,6 +83,14 @@ const (
 	// "kind(1) | rel(9) | blk(4) | lineSlot(2) | xmax(4) |
 	//  lockStrength(2)" = 22 bytes.
 	RecordKindHeapLock byte = 10
+	// RecordKindHeapHotUpdate is a logical HOT-update record (M0046-0001).
+	// Encodes the old-slot xmax stamp + HeapHotUpdated infomask + CTID
+	// chain linkage + the new tuple bytes (which carry HeapOnlyTuple in
+	// their infomask) — all on the same heap page. Replay inserts the
+	// new tuple (obtaining newSlot), then stamps the old slot.
+	// Format: "kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
+	//          oldSlot(2) | xmax(4) | newTupleBytes(var)" = 20 bytes fixed.
+	RecordKindHeapHotUpdate byte = 13
 	// RecordKindSmgrCreate logs the first extension of a relation file
 	// (mirrors upstream's XLOG_SMGR_CREATE in
 	// postgres/src/include/catalog/storage_xlog.h). Emitted by the buffer
@@ -120,6 +128,10 @@ const (
 	// heapLockSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1)
 	// + Block(4) + LineSlot(2) + Xmax(4) + LockStrength(2) = 22.
 	heapLockSize = 22
+	// heapHotUpdateHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + Block(4) + OldSlot(2) + Xmax(4) = 20. Variable
+	// new-tuple bytes follow.
+	heapHotUpdateHeaderSize = 20
 )
 
 // EncodeXactCommit encodes a logical-decoding commit marker for
@@ -293,6 +305,47 @@ func DecodeHeapLock(payload []byte) (rel storage.RelFileNode, blk storage.BlockN
 	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
 	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
 	lockStrength = binary.LittleEndian.Uint16(payload[20:22])
+	return
+}
+
+// EncodeHeapHotUpdate encodes one atomic HOT-update redo record
+// (M0046-0001). The record captures the old-slot xmax stamp and the
+// new tuple bytes (which carry HeapOnlyTuple in their infomask) — both
+// on the same heap page. Replay inserts the new tuple (getting
+// newSlot), then stamps the old slot via PageStampHotOldTuple.
+func EncodeHeapHotUpdate(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot uint16, xmax storage.TransactionID, tupleBytes []byte) []byte {
+	out := make([]byte, heapHotUpdateHeaderSize+len(tupleBytes))
+	out[0] = RecordKindHeapHotUpdate
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], oldSlot)
+	binary.LittleEndian.PutUint32(out[16:20], uint32(xmax))
+	copy(out[heapHotUpdateHeaderSize:], tupleBytes)
+	return out
+}
+
+// DecodeHeapHotUpdate decodes a HeapHotUpdate record payload.
+func DecodeHeapHotUpdate(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, oldSlot uint16, xmax storage.TransactionID, tupleBytes []byte, err error) {
+	if len(payload) < heapHotUpdateHeaderSize {
+		err = fmt.Errorf("wal: invalid heap-hot-update payload len %d (want >= %d)", len(payload), heapHotUpdateHeaderSize)
+		return
+	}
+	if payload[0] != RecordKindHeapHotUpdate {
+		err = fmt.Errorf("wal: record kind %d is not heap-hot-update", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	oldSlot = binary.LittleEndian.Uint16(payload[14:16])
+	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
+	tupleBytes = make([]byte, len(payload)-heapHotUpdateHeaderSize)
+	copy(tupleBytes, payload[heapHotUpdateHeaderSize:])
 	return
 }
 
@@ -606,6 +659,11 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
 		return false, nil
+	case RecordKindHeapHotUpdate:
+		if err := replayHeapHotUpdate(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
 	case RecordKindSmgrCreate:
 		if err := replaySmgrCreate(mgr, r.Payload); err != nil {
 			return false, err
@@ -847,6 +905,48 @@ func replayHeapInsert(mgr *storage.Manager, r Record) error {
 		// support out-of-order slot assignment, so this is a hard
 		// error rather than a silent fix-up.
 		return fmt.Errorf("wal: heap-insert replay slot drift: got %d, want %d (block %d)", got, lineSlot, blk)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
+}
+
+// replayHeapHotUpdate applies one atomic HOT-update record (M0046-0001).
+// The page must already exist (the old tuple is already on it). Idempotent
+// via pd_lsn. Replay:
+//  1. Insert the new tuple (which carries HeapOnlyTuple in infomask).
+//  2. Stamp the old slot: xmax + HeapHotUpdated + CTID = (blk, newSlot).
+func replayHeapHotUpdate(mgr *storage.Manager, r Record) error {
+	rel, blk, oldSlot, xmax, tupleBytes, err := DecodeHeapHotUpdate(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-hot-update replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-hot-update replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	tup, err := storage.ParseHeapTuple(tupleBytes)
+	if err != nil {
+		return fmt.Errorf("wal: heap-hot-update decode new tuple: %w", err)
+	}
+	newSlot, err := storage.PageAddHeapTuple(page, tup)
+	if err != nil {
+		return fmt.Errorf("wal: heap-hot-update insert new tuple: %w", err)
+	}
+	if err := storage.PageStampHotOldTuple(page, oldSlot, xmax, blk, newSlot); err != nil {
+		return fmt.Errorf("wal: heap-hot-update stamp old tuple: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(rel, blk, page)

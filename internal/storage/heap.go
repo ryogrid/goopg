@@ -66,6 +66,18 @@ const (
 	// `(infomask & HeapXmaxLockMask) != 0` is the
 	// "this is a row-lock holding xmax" predicate.
 	HeapXmaxLockMask = HeapXmaxKeyShrLock | HeapXmaxExclLock
+
+	// HeapHotUpdated indicates this tuple was HOT-updated: xmax is
+	// stamped and a new version was written to the same heap page.
+	// The CTID field points to the successor version's slot. Callers
+	// following an index pointer must walk the chain (same page, follow
+	// CTID.Offset) until they find a tuple without this bit set.
+	// Mirrors PostgreSQL's HEAP_HOT_UPDATED (0x4000).
+	HeapHotUpdated uint16 = 0x4000
+	// HeapOnlyTuple indicates this tuple is a HOT-only version: it was
+	// inserted as the successor in a HOT update chain and has no direct
+	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000).
+	HeapOnlyTuple uint16 = 0x8000
 )
 
 // IsHeapTupleLockOnly reports whether `infomask` indicates the
@@ -595,6 +607,52 @@ func PageSetHeapTupleLockOnly(p Page, slot uint16, xmax TransactionID, lockStren
 	infomask &^= HeapXmaxInvalid // xmax is now a real (lock-only) value
 	infomask |= HeapXmaxLockOnly
 	infomask |= lockStrength & HeapXmaxLockMask
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	return nil
+}
+
+// PageStampHotOldTuple stamps a HOT-update on the old-image tuple at
+// oldSlot: writes xmax, sets HeapHotUpdated in infomask, and updates the
+// CTID to (blk, newSlot) so index-scan callers can walk the HOT chain
+// to the live successor version. Mirrors the actions upstream performs
+// inside heap_update when it detects no indexed column changed.
+//
+// The caller must hold the page's exclusive content lock across the
+// entire HOT-update sequence (new tuple insert + this stamp) so the
+// chain is never torn between two page modifications.
+func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockNumber, newSlot uint16) error {
+	if oldSlot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(oldSlot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, oldSlot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, oldSlot, off)
+	}
+	// Set xmax.
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	// Set CTID to (blk, newSlot) — same-page chain link.
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
+	// Update infomask: clear lock-only bits (a delete supersedes any
+	// lingering row-lock), then set HeapHotUpdated.
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
 }

@@ -102,6 +102,11 @@ type Pool struct {
 	// record. Used by VACUUM to capture the dead-slot list rather
 	// than a full-page image on each pruned page.
 	logHeapVacuum LogHeapVacuumFunc
+	// logHeapHotUpdate emits an atomic HOT-update WAL record
+	// (M0046-0001): old-slot xmax stamp + new tuple insert on the
+	// same page in one record. nil disables the optimisation and
+	// the executor falls back to separate delete+insert FPIs.
+	logHeapHotUpdate LogHeapHotUpdateFunc
 	// logSmgrCreate emits a relation-file creation WAL record
 	// (RecordKindSmgrCreate) when Pool.PinNew creates block 0 of
 	// a new relation. Set via PoolConfig.LogSmgrCreate.
@@ -213,6 +218,12 @@ type PoolConfig struct {
 	// each pruned page.
 	LogHeapVacuum LogHeapVacuumFunc
 
+	// LogHeapHotUpdate, when non-nil, is exposed via
+	// Pool.LogHeapHotUpdate so the executor's HOT-update path can
+	// emit a single atomic change record (old-stamp + new-insert on
+	// the same page) instead of separate delete+insert FPIs.
+	LogHeapHotUpdate LogHeapHotUpdateFunc
+
 	// LogSmgrCreate, when non-nil, is called by PinNew when it
 	// creates block 0 of a relation (the first Extend). The hook
 	// should emit a RecordKindSmgrCreate WAL record so crash
@@ -273,6 +284,14 @@ type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xma
 // write or recovery. See docs/design/0002-0003-redo-records.md.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
+// LogHeapHotUpdateFunc emits one atomic HOT-update redo record
+// (M0046-0001). The record encodes the old-slot xmax stamp +
+// HeapHotUpdated infomask + CTID chain + the new tuple bytes (which
+// carry HeapOnlyTuple in their infomask) — all on the same heap page.
+// Replay inserts the new tuple, derives newSlot, then stamps the old
+// slot. See docs/design/0046-0001-hot-updates.md.
+type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
+
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by a
 // Go-heap arena. Returns an error if slots <= 0 or the arena alloc
 // fails.
@@ -298,10 +317,11 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logBtreeSplit:  cfg.LogBtreeSplit,
 		logHeapInsert:  cfg.LogHeapInsert,
 		logBtreeInsert: cfg.LogBtreeInsert,
-		logHeapDelete:  cfg.LogHeapDelete,
-		logHeapLock:    cfg.LogHeapLock,
-		logHeapVacuum:  cfg.LogHeapVacuum,
-		logSmgrCreate:  cfg.LogSmgrCreate,
+		logHeapDelete:    cfg.LogHeapDelete,
+		logHeapLock:      cfg.LogHeapLock,
+		logHeapVacuum:    cfg.LogHeapVacuum,
+		logHeapHotUpdate: cfg.LogHeapHotUpdate,
+		logSmgrCreate:    cfg.LogSmgrCreate,
 		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
@@ -347,6 +367,11 @@ func (p *Pool) LogHeapLock() LogHeapLockFunc { return p.logHeapLock }
 // hook, or nil if none was wired. Callers fall back to per-page
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
+
+// LogHeapHotUpdate returns the configured HOT-update change-record
+// hook (M0046-0001), or nil if none was wired. Callers fall back to
+// per-page FPI via MarkDirty when nil.
+func (p *Pool) LogHeapHotUpdate() LogHeapHotUpdateFunc { return p.logHeapHotUpdate }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
 // Mirrors upstream's full_page_writes SIGHUP-context GUC.

@@ -10,6 +10,37 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// followHOTChain walks the HOT chain starting at startSlot on the given
+// page and returns the first visible tuple along with its actual slot.
+// Returns (HeapTuple{}, 0, false) when no visible tuple exists in the chain.
+//
+// HOT invariant: all versions in a chain reside on the same page, so no
+// additional I/O is needed. The caller must hold at least a read lock on
+// the page for the duration of this call.
+func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID) (storage.HeapTuple, uint16, bool) {
+	const maxChain = 64
+	cur := startSlot
+	for i := 0; i < maxChain; i++ {
+		t, err := storage.PageGetHeapTuple(page, cur)
+		if err != nil {
+			return storage.HeapTuple{}, 0, false
+		}
+		if mvcc.TupleVisible(t.Header, snap, xid) {
+			return t, cur, true
+		}
+		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+			// Chain end: tuple is not visible and has no successor.
+			return storage.HeapTuple{}, 0, false
+		}
+		next := t.Header.CTID.Offset
+		if next == cur {
+			return storage.HeapTuple{}, 0, false // self-reference guard
+		}
+		cur = next
+	}
+	return storage.HeapTuple{}, 0, false
+}
+
 type indexScanOp struct {
 	plan *planner.IndexScan
 	ctx  *Context
@@ -83,13 +114,13 @@ func (o *indexScanOp) Open(ctx *Context) error {
 			return false, err
 		}
 		slot.RLock()
-		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// Follow the HOT chain: the index still points to the original
+		// tuple location even after HOT updates. followHOTChain walks
+		// CTID links (same page) until it finds the live version.
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
 		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
-		if err != nil {
-			return false, err
-		}
-		if !mvcc.TupleVisible(tuple.Header, ctx.Snap, ctx.Tx.XID) {
+		if !found {
 			return true, nil
 		}
 		row, err := DecodeRow(o.plan.Table.Columns, tuple.Data)
@@ -97,7 +128,9 @@ func (o *indexScanOp) Open(ctx *Context) error {
 			return false, err
 		}
 		o.rows = append(o.rows, row)
-		o.tids = append(o.tids, ptr)
+		// Record the actual live slot (not the index-pointed slot) so
+		// lockRowsOp stamps the current version for SELECT FOR UPDATE.
+		o.tids = append(o.tids, storage.ItemPointer{Block: ptr.Block, Offset: actualSlot})
 		return true, nil
 	}
 
