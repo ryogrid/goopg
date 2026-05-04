@@ -361,12 +361,14 @@ func (n *Aggregate) Pos() int       { return n.pos }
 func (n *Aggregate) Output() Schema { return n.schema }
 
 // WindowFunc is one supported window-function invocation in a
-// WindowAgg node. Stage A supports row_number/rank only; both
-// return int8.
+// WindowAgg node. Stage A supports row_number/rank (no args,
+// int8 return); Stage B adds lag/lead (1-3 args, return type
+// matches first arg).
 type WindowFunc struct {
 	pos  int
 	Name string
 	Type catalog.Type
+	Args []Expr // lag/lead: [value, offset?, default?]
 }
 
 func (w WindowFunc) Pos() int { return w.pos }

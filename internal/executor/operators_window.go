@@ -119,45 +119,97 @@ func (o *windowOp) evalWindowFuncs() error {
 	if len(o.plan.Funcs) == 0 {
 		return nil
 	}
-	base := 0
+	colBase := 0
 	if len(o.rows) > 0 {
-		base = len(o.rows[0]) - len(o.plan.Funcs)
+		colBase = len(o.rows[0]) - len(o.plan.Funcs)
 	}
-	var (
-		prevPartition string
-		hasPrev       bool
-		rowNum        int64
-		rank          int64
-	)
-	for i := range o.rows {
-		partKey, err := o.partitionKey(o.rows[i])
+
+	// Find partition start indices (rows are already sorted by partition key).
+	pStarts := []int{0}
+	if len(o.rows) > 0 {
+		prevKey, err := o.partitionKey(o.rows[0])
 		if err != nil {
 			return err
 		}
-		if !hasPrev || partKey != prevPartition {
-			rowNum = 1
-			rank = 1
-			prevPartition = partKey
-			hasPrev = true
-		} else {
-			rowNum++
-			peer, err := o.samePeer(o.rows[i-1], o.rows[i])
+		for i := 1; i < len(o.rows); i++ {
+			key, err := o.partitionKey(o.rows[i])
 			if err != nil {
 				return err
 			}
-			if !peer {
-				rank = rowNum
+			if key != prevKey {
+				pStarts = append(pStarts, i)
+				prevKey = key
 			}
 		}
-		for j, fn := range o.plan.Funcs {
-			idx := base + j
-			switch strings.ToLower(fn.Name) {
-			case "row_number":
-				o.rows[i][idx] = Datum{Kind: KindInt, Int: rowNum}
-			case "rank":
-				o.rows[i][idx] = Datum{Kind: KindInt, Int: rank}
-			default:
-				return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
+	}
+	pStarts = append(pStarts, len(o.rows)) // sentinel
+
+	// Evaluate each partition independently.
+	for p := 0; p < len(pStarts)-1; p++ {
+		pStart := pStarts[p]
+		pEnd := pStarts[p+1]
+		rowNum := int64(0)
+		rank := int64(1)
+
+		for i := pStart; i < pEnd; i++ {
+			rowNum++
+			if i > pStart {
+				peer, err := o.samePeer(o.rows[i-1], o.rows[i])
+				if err != nil {
+					return err
+				}
+				if !peer {
+					rank = rowNum
+				}
+			}
+			localIdx := i - pStart // 0-based position within this partition
+
+			for j, fn := range o.plan.Funcs {
+				colIdx := colBase + j
+				switch strings.ToLower(fn.Name) {
+				case "row_number":
+					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: rowNum}
+				case "rank":
+					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: rank}
+				case "lag", "lead":
+					offset := int64(1)
+					if len(fn.Args) >= 2 {
+						v, err := evalExpr(fn.Args[1], o.rows[i], o.ctx)
+						if err != nil {
+							return err
+						}
+						if v.Kind == KindInt {
+							offset = v.Int
+						}
+					}
+					var targetLocal int
+					if strings.ToLower(fn.Name) == "lag" {
+						targetLocal = localIdx - int(offset)
+					} else {
+						targetLocal = localIdx + int(offset)
+					}
+					targetGlobal := pStart + targetLocal
+					if targetGlobal < pStart || targetGlobal >= pEnd {
+						// Out of partition — return default or NULL.
+						if len(fn.Args) >= 3 {
+							v, err := evalExpr(fn.Args[2], o.rows[i], o.ctx)
+							if err != nil {
+								return err
+							}
+							o.rows[i][colIdx] = v
+						} else {
+							o.rows[i][colIdx] = NullDatum
+						}
+					} else {
+						v, err := evalExpr(fn.Args[0], o.rows[targetGlobal], o.ctx)
+						if err != nil {
+							return err
+						}
+						o.rows[i][colIdx] = v
+					}
+				default:
+					return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
+				}
 			}
 		}
 	}

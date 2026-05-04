@@ -81,8 +81,17 @@ Substantial. Decompose when picked up.
   - [x] M0020-S10: finalize design docs
             `0020-0003-window-executor.md` and
             `0020-0004-window-explain-and-tests.md` + README index.
-- [ ] Stage B: lag/lead + frame clauses + named windows.
-      Decompose when picked up.
+- [x] Stage B: lag/lead (landed 2026-05-04). Design doc
+      `docs/design/0020-0005-lag-lead-semantics-and-testing.md`.
+      `lag(value [, offset [, default]])` and `lead()` with
+      partition-boundary isolation and explicit default support.
+      Analyzer validates 1–3 args and derives return type from first
+      arg. Planner resolves args via `resolveExprForWindowInput`;
+      `inferExprType` helper derives catalog type. Executor refactored
+      to two-phase partition-discovery + per-partition loop with
+      partition-local offset indexing. Six new tests cover basic
+      lag/lead, explicit offset, explicit default, and boundary
+      isolation. Frame clauses and named windows remain deferred.
 
 ## Milestone 0022 — pg_stat_activity support
 

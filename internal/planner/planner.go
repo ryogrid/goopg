@@ -1168,7 +1168,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		if _, exists := byKey[k]; exists {
 			continue
 		}
-		wf, err := buildWindowFunc(fc)
+		wf, err := buildWindowFunc(fc, inputCtx, agg)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -1222,17 +1222,52 @@ func collectWindowCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
 	return out, nil
 }
 
-func buildWindowFunc(fc *parser.FuncCall) (WindowFunc, error) {
+// inferExprType returns the catalog type of a resolved planner Expr.
+// Used to derive the return type of lag/lead from their first argument.
+func inferExprType(e Expr) catalog.Type {
+	switch x := e.(type) {
+	case *ColumnRef:
+		return x.Type
+	case *OuterColumnRef:
+		return x.Type
+	case *IntegerConst:
+		return catalog.Type{Name: "int8"}
+	case *NumericConst:
+		return catalog.Type{Name: "numeric"}
+	case *StringConst:
+		return catalog.Type{Name: "text"}
+	case *BooleanConst:
+		return catalog.Type{Name: "bool"}
+	default:
+		return catalog.Type{Name: "text"}
+	}
+}
+
+func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggregateSurface) (WindowFunc, error) {
 	name := strings.ToLower(fc.Name.Name)
 	switch name {
 	case "row_number", "rank":
 		if fc.Star || fc.Distinct || len(fc.Args) != 0 {
 			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name)}
 		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}}, nil
+	case "lag", "lead":
+		if fc.Star || fc.Distinct || len(fc.Args) < 1 || len(fc.Args) > 3 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() requires 1 to 3 arguments", name)}
+		}
+		args := make([]Expr, 0, len(fc.Args))
+		for _, a := range fc.Args {
+			resolved, err := resolveExprForWindowInput(a, inputCtx, agg)
+			if err != nil {
+				return WindowFunc{}, err
+			}
+			args = append(args, resolved)
+		}
+		retType := inferExprType(args[0])
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: retType, Args: args}, nil
 	default:
 		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
 	}
-	return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}}, nil
 }
 
 func windowCallKey(fc *parser.FuncCall) string {

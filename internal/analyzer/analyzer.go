@@ -864,10 +864,34 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 
 func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error) {
 	name := strings.ToLower(x.Name.Name)
+	var retType catalog.Type
 	switch name {
 	case "row_number", "rank":
 		if x.Star || x.Distinct || len(x.Args) != 0 {
 			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name))
+		}
+		retType = catalog.Type{Name: "int8"}
+	case "lag", "lead":
+		if x.Star || x.Distinct {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept DISTINCT or * in v0", name))
+		}
+		if len(x.Args) < 1 || len(x.Args) > 3 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() requires 1 to 3 arguments", name))
+		}
+		valueTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		retType = valueTyp
+		if len(x.Args) >= 2 {
+			if _, err := analyzeExpr(x.Args[1], ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		if len(x.Args) >= 3 {
+			if _, err := analyzeExpr(x.Args[2], ctx); err != nil {
+				return catalog.Type{}, err
+			}
 		}
 	default:
 		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
@@ -888,7 +912,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 			return catalog.Type{}, err
 		}
 	}
-	return catalog.Type{Name: "int8"}, nil
+	return retType, nil
 }
 
 func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error) {
