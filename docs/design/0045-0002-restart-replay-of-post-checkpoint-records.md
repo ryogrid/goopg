@@ -1,6 +1,6 @@
 # 0045-0002 — Restart Replay of Post-Checkpoint WAL Records
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0045
 **Date:** 2026-05-04
 

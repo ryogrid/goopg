@@ -440,15 +440,26 @@ func DecodePageImage(payload []byte) (storage.RelFileNode, storage.BlockNumber, 
 }
 
 // ReplayRecords replays decoded WAL records into storage.
+//
+// M0045-0002: replay starts FROM the last checkpoint (inclusive),
+// not up to it. The checkpoint marks a point where all dirty pages
+// were flushed; only records AFTER the checkpoint need to be applied
+// to recover pages that may not have been flushed before the crash.
+// Records before the checkpoint are already on disk and ApplyRecord's
+// per-page LSN check makes re-application a safe no-op, but we skip
+// them as an optimisation.
+//
+// If no checkpoint record exists, all records are replayed from the
+// start (safe for fresh clusters or WAL without checkpoints).
 func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) {
 	stats := ReplayStats{Records: len(records)}
-	replayUntil, checkpointLSN := replayLimit(records)
+	startIdx, checkpointLSN := replayStart(records)
 	stats.CheckpointLSN = checkpointLSN
 
-	for i, r := range records[:replayUntil] {
+	for i, r := range records[startIdx:] {
 		applied, err := ApplyRecord(mgr, r)
 		if err != nil {
-			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
+			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", startIdx+i, r.StartLSN, r.EndLSN, err)
 		}
 		if applied {
 			stats.Applied++
@@ -813,22 +824,26 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 	return writeBlockOrExtend(mgr, rel, blk, page)
 }
 
-func replayLimit(records []Record) (int, uint64) {
-	lastCheckpointIdx := -1
+// replayStart returns the index of the LAST checkpoint record in
+// records plus its EndLSN. Crash recovery should replay records
+// starting from this index: everything before the checkpoint was
+// already flushed to disk by the checkpoint operation.
+//
+// If no checkpoint is found, returns (0, 0) — replay all records
+// from the beginning (correct for fresh clusters or early startup).
+func replayStart(records []Record) (int, uint64) {
+	startIdx := 0
 	var checkpointLSN uint64
 	for i, r := range records {
 		if len(r.Payload) == 0 {
 			continue
 		}
 		if r.Payload[0] == RecordKindCheckpoint {
-			lastCheckpointIdx = i
+			startIdx = i // start FROM this checkpoint (inclusive)
 			checkpointLSN = r.EndLSN
 		}
 	}
-	if lastCheckpointIdx == -1 {
-		return len(records), 0
-	}
-	return lastCheckpointIdx + 1, checkpointLSN
+	return startIdx, checkpointLSN
 }
 
 // DiscoverLastCheckpointLSN scans the WAL directory for the most

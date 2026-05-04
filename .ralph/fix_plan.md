@@ -1235,22 +1235,20 @@ retained WAL backwards.
         `TestDetectWritePos_GapDetectionAfterNonZeroStart`,
         `TestDetectWritePos_SingleNonZeroSegment`
 
-- [ ] M0045-0002: Restart replay of post-checkpoint WAL records.
+- [x] M0045-0002: Restart replay of post-checkpoint WAL records.
       Design doc
       `docs/design/0045-0002-restart-replay-of-post-checkpoint-records.md`.
-  - [ ] Wire `wal.NewRecordIterator(startLSN=lastCkptLSN)` and
-        `wal.StreamReplayer.Run` into the goopg startup path
-        (likely `cmd/goopg/main.go::runStart` or
-        `internal/server/server.go::startBackends`).
-  - [ ] Reuse `StreamReplayer`'s existing idempotency — re-
-        applying a record whose effects already landed on disk
-        is a no-op via the buffer pool's per-page LSN check.
-  - [ ] On replay error, abort startup with the affected LSN in
-        the diagnostic; do not silently bring the listener up.
-  - [ ] Unit test in `internal/wal/recovery_test.go` synthesises
-        a WAL stream with a checkpoint marker followed by N
-        records, calls the recovery driver, and asserts
-        `ApplyLSN()` matches the last record's end-LSN.
+      (landed 2026-05-04: `replayLimit` renamed to `replayStart`
+      with inverted semantics — now returns the START index of the
+      last checkpoint so ReplayRecords applies records[startIdx:]
+      instead of records[:stopIdx]. Pre-checkpoint records skipped
+      (already on disk). 3 tests updated/added. Full WAL suite green.)
+  - [x] `replayStart` returns start-from-checkpoint index
+  - [x] `ReplayRecords` applies records[startIdx:] not records[:replayUntil]
+  - [x] On replay error, abort with LSN in diagnostic (existing)
+  - [x] `TestReplayRecordsStartsFromLastCheckpoint` (updated from old "stops" test)
+  - [x] `TestReplayRecordsPostCheckpointAfterRetention` (new end-to-end test)
+  - [x] `TestReplayFromDirEndToEnd*` updated for new semantics
 
 - [x] M0045-0003: Discover the last-checkpoint LSN without
       pg_control. Design doc
