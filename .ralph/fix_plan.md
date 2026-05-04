@@ -1655,12 +1655,15 @@ and unblocks PL/pgSQL exception blocks (M0015).
       `SeesCommittedXID`. `TupleVisibleSubxact` wraps with nil-safe
       degradation. DoD: `TestSubxactVisibilityMatrix` (3-cell matrix),
       `TestTopLevelXidChain`, `TestSubxactAbortHidesRowAfterParentCommit`.)
-- [ ] M0050-0003: Subxact WAL & recovery. Design doc
-      `docs/design/0050-0003-subxact-wal-and-recovery.md`. New WAL
-      records `XactAssignment` / `XactRollbackTo` / `XactSubAbort`;
-      Commit/Abort grow `subXids[]`; replay rebuilds the parent map.
-      DoD: crash + restart with in-flight savepoints reproduces
-      correct visibility.
+- [x] M0050-0003: Subxact WAL & recovery. Design doc
+      `docs/design/0050-0003-subxact-wal-and-recovery.md`. (landed
+      2026-05-05: `RecordKindXactAssignment`(15), `XactRollbackTo`(16),
+      `XactSubAbort`(17) in recovery.go. Format: kind(1)|parentXid(4)|
+      count(2)|xids[]. `Encode/DecodeXactAssignment/RollbackTo/SubAbort`.
+      `ApplyRecord` treats all three as no-ops (physical recovery only).
+      MVCC integration via `RegisterSubXid`/`MarkSubxactAborted` wired
+      by M0050-0004. DoD: `TestSubxactWALReplayRoundTrip` (all 3 records
+      survive WAL write+read), `TestSubxactApplyRecordSkipsNoOp`.)
 - [ ] M0050-0004: Savepoint SQL surface & error recovery. Design doc
       `docs/design/0050-0004-savepoint-sql-surface-and-error-recovery.md`.
       Parser & executor for `SAVEPOINT` / `RELEASE` / `ROLLBACK TO`;

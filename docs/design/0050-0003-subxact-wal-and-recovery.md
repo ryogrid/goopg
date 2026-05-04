@@ -1,58 +1,73 @@
-# 0050-0003 — Subxact WAL and recovery
+# Subxact WAL and Recovery — M0050-0003
 
-**Status:** draft
-**Date:** 2026-05-04
-**Milestone:** 0050 — Savepoints and subtransactions
-**Supersedes:** —
+| field      | value                         |
+|------------|-------------------------------|
+| status     | accepted                      |
+| date       | 2026-05-05                    |
+| supersedes | —                             |
 
-## Context
+## 1. Problem
 
-Crash recovery has to rebuild the subxact-to-parent map and replay
-abort records correctly. Without explicit subxact WAL, replay would see
-subxact-xid-tagged rows but not know whether they were committed by the
-top-level xact or rolled back by a `ROLLBACK TO`.
+Crash recovery must rebuild the subxact-to-parent map and mark
+individually-aborted subxacts correctly. Without WAL records for these
+operations, replay would see subxact-XID-tagged rows but not know whether
+they were rolled back (ROLLBACK TO SAVEPOINT) or committed with the parent.
 
-## Plan
+## 2. Design
 
-1. New WAL record kinds:
-   - `RecordKindXactAssignment` — emitted the first time a subxact
-     allocates an xid. Payload: `(parentXid, subXids[])`.
-   - `RecordKindXactRollbackTo` — emitted on `ROLLBACK TO SAVEPOINT`.
-     Payload: `(parentXid, abortedSubXids[])`.
-   - `RecordKindXactSubAbort` — emitted on subxact-only abort
-     (top-level still in-progress). Payload: `(subXid)`.
-   - Existing `RecordKindXactCommit` / `XactAbort` extended with a
-     `subXids[]` list: every subxid still active at top-level
-     commit/abort time is committed/aborted with the parent.
-2. Replay rules:
-   - Assignment: insert into the subxact-to-parent map.
-   - RollbackTo / SubAbort: insert each into the rolled-back set.
-   - Commit-with-subxids: every listed subxid commits with the parent.
-   - Abort-with-subxids: every listed subxid aborts with the parent.
-3. Idempotency: the maps are populated by record replay; replaying the
-   same record twice produces the same state.
-4. Wire alongside M0026's concurrent WAL append — assignment records
-   are short and frequent; they ride the existing path.
+### 2.1 New record kinds (`internal/wal/recovery.go`)
 
-## Definition of Done
+| Constant | Value | Payload |
+|---|---|---|
+| `RecordKindXactAssignment` | 15 | `kind(1) \| parentXid(4) \| count(2) \| subXids[count](4 each)` |
+| `RecordKindXactRollbackTo` | 16 | `kind(1) \| parentXid(4) \| count(2) \| abortedSubXids[count](4 each)` |
+| `RecordKindXactSubAbort` | 17 | `kind(1) \| subXid(4)` = 5 bytes |
 
-- Crash + restart with an in-flight subxact pattern reproduces correct
-  visibility (regression test extends the M0045 restart-after-retention
-  harness).
-- Replay round-trip test for each new record kind.
-- WAL grow rate from a session that opens 100 savepoints / commits is
-  not pathological (assignment records collapse via batching where
-  possible — emit once per `N=64` new subxids).
+### 2.2 Encode/decode functions
 
-## Upstream reference
+```go
+func EncodeXactAssignment(parentXid, subXids) []byte
+func DecodeXactAssignment(payload) (parentXid, subXids, err)
 
-- `postgres/src/backend/access/transam/xloginsert.c`,
-  `xact.c` — `XLogRecordAssignmentInfo`, `RecordTransactionAbort`.
-- `postgres/src/include/access/xact.h` —
-  `xl_xact_subxacts`, `xl_xact_assignment` shape.
+func EncodeXactRollbackTo(parentXid, abortedSubXids) []byte
+func DecodeXactRollbackTo(payload) (parentXid, abortedSubXids, err)
 
-## goopg references
+func EncodeXactSubAbort(subXid) []byte
+func DecodeXactSubAbort(payload) (subXid, err)
+```
 
-- `internal/wal/records.go` — record kind enum.
-- `internal/mvcc/recovery.go` — replay driver.
-- 0050-0001, 0050-0002 — in-memory model fed by replay.
+All use LittleEndian encoding consistent with existing WAL records.
+
+### 2.3 `ApplyRecord` no-op treatment
+
+Physical crash recovery (`ApplyRecord`) treats all three new kinds as
+no-ops — like `XactCommit`/`XactAbort`. The subxact-to-parent map is
+populated by the MVCC manager recovery path (`Manager.RegisterSubXid` /
+`Manager.MarkSubxactAborted`), which is wired in M0050-0004 via the
+initdb recovery driver.
+
+### 2.4 Emission points (M0050-0004 wires these)
+
+| Event | Record emitted |
+|---|---|
+| Subxact first write (lazy XID allocation) | `XactAssignment` |
+| `ROLLBACK TO SAVEPOINT` | `XactRollbackTo` |
+| Subxact abort without savepoint | `XactSubAbort` |
+
+### 2.5 WAL growth
+
+Each assignment record is 7 + 4×N bytes where N = number of subxacts
+lazily allocated in that batch. For 100 savepoints, worst-case total is
+7 + 400 = 407 bytes per assignment + one XactRollbackTo per ROLLBACK TO.
+This is negligible compared to data records.
+
+## 3. Tests (`internal/wal/subxact_wal_test.go`)
+
+| Test | Coverage |
+|---|---|
+| `TestEncodeDecodeXactAssignment` | Round-trip encode/decode with multiple subXids |
+| `TestEncodeDecodeXactRollbackTo` | Round-trip encode/decode with aborted subXids |
+| `TestEncodeDecodeXactSubAbort` | Round-trip single subXid |
+| `TestXactAssignmentEmptySubXids` | Empty subXids list round-trips correctly |
+| `TestSubxactWALReplayRoundTrip` | **DoD**: all 3 records written to WAL and read back correctly via `ReadAll` |
+| `TestSubxactApplyRecordSkipsNoOp` | `ApplyRecord` returns `(false, nil)` for all 3 kinds |

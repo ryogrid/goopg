@@ -111,6 +111,24 @@ const (
 	// truncate the relfile to 0 blocks. Same format as SmgrCreate.
 	RecordKindSmgrTruncate byte = 12
 
+	// RecordKindXactAssignment records the first lazy XID allocation
+	// for one or more subtransactions (M0050-0003). Emitted when a
+	// subxact writes for the first time; replay populates the
+	// subxact-to-parent map in mvcc.Manager. Format:
+	//   kind(1) | parentXid(4) | count(2) | subXids[count](4 each)
+	RecordKindXactAssignment byte = 15
+
+	// RecordKindXactRollbackTo records ROLLBACK TO SAVEPOINT (M0050-0003).
+	// Replay marks each listed subXid as individually aborted in
+	// mvcc.Manager. Format:
+	//   kind(1) | parentXid(4) | count(2) | abortedSubXids[count](4 each)
+	RecordKindXactRollbackTo byte = 16
+
+	// RecordKindXactSubAbort records a single subxact abort triggered
+	// without a named savepoint (M0050-0003). Format:
+	//   kind(1) | subXid(4) = 5 bytes total.
+	RecordKindXactSubAbort byte = 17
+
 	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
 	smgrRecordSize = 10
 
@@ -141,6 +159,96 @@ const (
 	// new-tuple bytes follow.
 	heapHotUpdateHeaderSize = 20
 )
+
+// EncodeXactAssignment encodes a subxact XID assignment record (M0050-0003).
+// parentXid is the top-level transaction; subXids lists the subxact XIDs
+// that are now children of parentXid. Replay calls Manager.RegisterSubXid
+// for each entry. Format: kind(1) | parentXid(4) | count(2) | subXids[].
+func EncodeXactAssignment(parentXid storage.TransactionID, subXids []storage.TransactionID) []byte {
+	out := make([]byte, 7+4*len(subXids))
+	out[0] = RecordKindXactAssignment
+	binary.LittleEndian.PutUint32(out[1:5], uint32(parentXid))
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(subXids)))
+	for i, s := range subXids {
+		binary.LittleEndian.PutUint32(out[7+4*i:], uint32(s))
+	}
+	return out
+}
+
+// DecodeXactAssignment decodes a RecordKindXactAssignment payload.
+func DecodeXactAssignment(payload []byte) (parentXid storage.TransactionID, subXids []storage.TransactionID, err error) {
+	if len(payload) < 7 {
+		return 0, nil, fmt.Errorf("wal: xact-assignment payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindXactAssignment {
+		return 0, nil, fmt.Errorf("wal: record kind %d is not xact-assignment", payload[0])
+	}
+	parentXid = storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5]))
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+4*count {
+		return 0, nil, fmt.Errorf("wal: xact-assignment payload truncated (need %d bytes)", 7+4*count)
+	}
+	subXids = make([]storage.TransactionID, count)
+	for i := range subXids {
+		subXids[i] = storage.TransactionID(binary.LittleEndian.Uint32(payload[7+4*i:]))
+	}
+	return parentXid, subXids, nil
+}
+
+// EncodeXactRollbackTo encodes a ROLLBACK TO SAVEPOINT record (M0050-0003).
+// parentXid is the top-level transaction; abortedSubXids lists the subxact
+// XIDs that were individually rolled back. Replay calls Manager.MarkSubxactAborted
+// for each. Format: kind(1) | parentXid(4) | count(2) | abortedSubXids[].
+func EncodeXactRollbackTo(parentXid storage.TransactionID, abortedSubXids []storage.TransactionID) []byte {
+	out := make([]byte, 7+4*len(abortedSubXids))
+	out[0] = RecordKindXactRollbackTo
+	binary.LittleEndian.PutUint32(out[1:5], uint32(parentXid))
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(abortedSubXids)))
+	for i, s := range abortedSubXids {
+		binary.LittleEndian.PutUint32(out[7+4*i:], uint32(s))
+	}
+	return out
+}
+
+// DecodeXactRollbackTo decodes a RecordKindXactRollbackTo payload.
+func DecodeXactRollbackTo(payload []byte) (parentXid storage.TransactionID, abortedSubXids []storage.TransactionID, err error) {
+	if len(payload) < 7 {
+		return 0, nil, fmt.Errorf("wal: xact-rollback-to payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindXactRollbackTo {
+		return 0, nil, fmt.Errorf("wal: record kind %d is not xact-rollback-to", payload[0])
+	}
+	parentXid = storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5]))
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+4*count {
+		return 0, nil, fmt.Errorf("wal: xact-rollback-to payload truncated (need %d bytes)", 7+4*count)
+	}
+	abortedSubXids = make([]storage.TransactionID, count)
+	for i := range abortedSubXids {
+		abortedSubXids[i] = storage.TransactionID(binary.LittleEndian.Uint32(payload[7+4*i:]))
+	}
+	return parentXid, abortedSubXids, nil
+}
+
+// EncodeXactSubAbort encodes a single subxact abort record (M0050-0003).
+// Replay calls Manager.MarkSubxactAborted(subXid). Format: kind(1)|subXid(4).
+func EncodeXactSubAbort(subXid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindXactSubAbort
+	binary.LittleEndian.PutUint32(out[1:5], uint32(subXid))
+	return out
+}
+
+// DecodeXactSubAbort decodes a RecordKindXactSubAbort payload.
+func DecodeXactSubAbort(payload []byte) (subXid storage.TransactionID, err error) {
+	if len(payload) != xactRecordSize {
+		return 0, fmt.Errorf("wal: xact-subabort payload len %d (want %d)", len(payload), xactRecordSize)
+	}
+	if payload[0] != RecordKindXactSubAbort {
+		return 0, fmt.Errorf("wal: record kind %d is not xact-subabort", payload[0])
+	}
+	return storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5])), nil
+}
 
 // EncodeXactCommit encodes a logical-decoding commit marker for
 // xid. Crash recovery skips this kind; only the M0008 logical
@@ -740,6 +848,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// markers exist purely so the M0008 logical decoder can
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
+		return false, nil
+	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
+		// Subxact markers (M0050-0003) — physical page recovery is
+		// a no-op. The mvcc.Manager rebuilds its subxact-to-parent
+		// map from these records during recovery; the physical replay
+		// path (ReplayRecords) has no access to mvcc.Manager. The
+		// full integration is wired by the recovery driver in
+		// internal/initdb/open.go (M0050-0004).
 		return false, nil
 	case RecordKindHeapHotUpdate:
 		if err := replayHeapHotUpdate(mgr, r); err != nil {
