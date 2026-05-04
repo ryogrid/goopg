@@ -20,6 +20,7 @@ package catalog
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 )
 
 // Namespace OIDs — matching upstream's bootstrap constants.
@@ -385,4 +386,36 @@ func nextVarlen(data []byte, off int) (string, int, error) {
 	}
 	s := string(data[off : off+sz])
 	return s, off + sz, nil
+}
+
+// TypeNameToOID maps a goopg type name string to its canonical pg_type OID.
+// Used by DDL-sync (operators_ddl.go) when writing pg_attribute rows and by
+// initdb seeding (catalog_seed.go). Returns OIDText as a safe fallback for
+// unknown types.
+func TypeNameToOID(typName string) uint32 {
+	switch strings.ToLower(typName) {
+	case "int4", "int", "integer":
+		return OIDInt4
+	case "int8", "bigint":
+		return OIDInt8
+	case "int2", "smallint":
+		return OIDInt2
+	case "text":
+		return OIDText
+	case "varchar", "character varying":
+		return OIDVarChar
+	case "char", "character", "bpchar":
+		return OIDBpChar
+	case "bool", "boolean":
+		return OIDBool
+	case "timestamp", "timestamp without time zone",
+		"timestamptz", "timestamp with time zone":
+		return OIDTimestamp
+	case "numeric", "decimal":
+		return OIDNumeric
+	case "oid":
+		return OIDOID
+	default:
+		return OIDText // safe fallback
+	}
 }

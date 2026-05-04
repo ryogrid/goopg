@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | accepted (Phase 1+2+3 landed 2026-05-04) |
+| Status      | accepted (Phase 1+2+3+4 landed 2026-05-04) |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -221,6 +221,50 @@ After `goopg init` + `goopg start`:
 ### Still Deferred (from Phase 3)
 
 - DDL-sync wiring: `CREATE TABLE` writes pg_class + pg_attribute rows.
-- `DROP TABLE`: marks rows with xmax (delete-stamp).
+  → **Landed in Phase 4** — see below.
 - `CREATE INDEX`: writes pg_class row for the index relation.
-- Virtual-view integration: source `pg_tables`, `pg_indexes` from heap.
+  → **Landed in Phase 4** — see below.
+- `DROP TABLE`: marks rows with xmax (delete-stamp). Still deferred.
+- Virtual-view integration: source `pg_tables`, `pg_indexes` from heap. Still deferred.
+
+## What Landed (Phase 4 — 2026-05-04)
+
+**Scope**: DDL-sync wiring — `CREATE TABLE` and `CREATE INDEX` write rows into
+pg_class / pg_attribute heap files. `DROP TABLE`/`DROP INDEX` sync deferred.
+
+### `internal/catalog/codec.go` changes
+
+- `TypeNameToOID(typName string) uint32` — maps goopg type name strings
+  (int4, int8, text, bool, varchar, etc.) to canonical pg_type OIDs.
+
+### `internal/executor/operators_ddl.go` changes
+
+Three new package-private helpers:
+- `catalogHeapSyncAvailable(ctx) bool` — checks if pg_attribute is registered
+  as non-virtual (proxy for M0030-0001 relfiles being present).
+- `syncTableToCatalogHeap(ctx, tbl)` — writes one pg_class row + one
+  pg_attribute row per column via `writeHeapRow`.
+- `syncIndexToCatalogHeap(ctx, idx)` — writes one pg_class row (relkind='i').
+- `namespaceOIDForSchema(schema) uint32` — maps schema name to namespace OID.
+
+Wiring:
+- `execCreateTable`: captures returned `*catalog.Table`, calls
+  `syncTableToCatalogHeap` when sync is available.
+- `createBTreeIndex`: calls `syncIndexToCatalogHeap` after backfill succeeds.
+- `catalogHeapSyncAvailable` guards both — no-op on pre-M0030-0001 clusters.
+
+### Tests (3 new in `ddl_catalog_sync_test.go`)
+
+Integration tests using `initdb.Init + Open + full executor pipeline`:
+- `TestCreateTableSyncsToPGClass` — pg_class row present with correct OID/name/relkind/relnatts
+- `TestCreateTableSyncsToPGAttribute` — pg_attribute rows for all columns with correct type OIDs
+- `TestCreateIndexSyncsToPGClass` — pg_class row for index with relkind='i'
+
+### Still Deferred (from Phase 4)
+
+- `DROP TABLE`/`DROP INDEX` sync: set xmax on catalog rows.
+- DDL-sync for `ALTER TABLE ADD COLUMN` / `DROP COLUMN`.
+- Startup-load of user tables from pg_class/pg_attribute (requires
+  DDL-sync to be complete — pg_class would then have all tables).
+- Virtual-view integration: replace the dynamic virtual pg_class/pg_tables
+  with heap-backed scanning.

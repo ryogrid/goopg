@@ -228,8 +228,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			NotNull: c.NotNull,
 		}
 	}
-	if _, err := o.ctx.Catalog.CreateTable(s.Name, cols); err != nil {
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
 	}
 	return nil
 }
@@ -501,6 +507,11 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
 		return err
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
 	}
 	return nil
 }
@@ -925,4 +936,96 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		return &ExecError{Code: "42725", Pos: s.Pos(), Message: err.Error()}
 	}
 	return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+}
+
+// --- DDL catalog heap sync (M0030-0001 Phase 4) ---
+
+// catalogHeapSyncAvailable returns true when the M0030-0001 system catalog
+// heap relfiles are accessible and DDL operations should write rows to
+// pg_class / pg_attribute. The proxy indicator is whether pg_attribute is
+// registered as a real (non-virtual) table — that is set by
+// loadSystemCatalogsIfPresent in initdb.Open when the relfiles are present.
+func catalogHeapSyncAvailable(ctx *Context) bool {
+	if ctx == nil || ctx.Pool == nil {
+		return false
+	}
+	pgAttr, ok := ctx.Catalog.LookupTable(
+		parser.ObjectName{Schema: "pg_catalog", Name: "pg_attribute"})
+	return ok && !pgAttr.Virtual
+}
+
+// namespaceOIDForSchema maps a schema name to its pg_catalog namespace OID.
+func namespaceOIDForSchema(schema string) uint32 {
+	if schema == "" || schema == "public" {
+		return catalog.PublicNamespaceOID
+	}
+	return catalog.PGCatalogNamespaceOID
+}
+
+// syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
+// column for tbl. Called by execCreateTable after in-memory catalog is updated.
+func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classRow := Row{
+		{Kind: KindInt, Int: int64(tbl.OID)},
+		{Kind: KindString, String: tbl.Name},
+		{Kind: KindInt, Int: int64(namespaceOIDForSchema(tbl.Schema))},
+		{Kind: KindString, String: "r"},
+		{Kind: KindInt, Int: int64(len(tbl.Columns))},
+		{Kind: KindInt, Int: int64(tbl.OID)},
+		{Kind: KindString, String: "p"},
+		{Kind: KindBool, Bool: false},
+	}
+	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+		return fmt.Errorf("pg_class: %w", err)
+	}
+
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	for _, col := range tbl.Columns {
+		typOID := catalog.TypeNameToOID(col.Type.Name)
+		attrRow := Row{
+			{Kind: KindInt, Int: int64(tbl.OID)},
+			{Kind: KindString, String: col.Name},
+			{Kind: KindInt, Int: int64(typOID)},
+			{Kind: KindInt, Int: int64(col.Ordinal + 1)},
+			{Kind: KindBool, Bool: col.NotNull},
+			{Kind: KindBool, Bool: false},
+		}
+		if err := writeHeapRow(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
+			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
+		}
+	}
+	return nil
+}
+
+// syncIndexToCatalogHeap writes a pg_class row for idx. Called by
+// createBTreeIndex after the full index build succeeds.
+func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classRow := Row{
+		{Kind: KindInt, Int: int64(idx.OID)},
+		{Kind: KindString, String: idx.Name},
+		{Kind: KindInt, Int: int64(namespaceOIDForSchema(idx.Schema))},
+		{Kind: KindString, String: "i"},
+		{Kind: KindInt, Int: 0},
+		{Kind: KindInt, Int: int64(idx.OID)},
+		{Kind: KindString, String: "p"},
+		{Kind: KindBool, Bool: false},
+	}
+	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+		return fmt.Errorf("pg_class for index: %w", err)
+	}
+	return nil
 }

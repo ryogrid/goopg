@@ -314,7 +314,11 @@ loading switch.**
       Open() registers pg_type (1247) and pg_attribute (1249) as real heap-backed
       tables when their relfiles are present. SELECT * FROM pg_type now works.
       4 new tests. Backward compat: old clusters without M0030 relfiles unaffected.
-      Remaining sub-phase deferred: DDL-sync wiring (Phase 4).
+      **Phase 4 landed 2026-05-04**: DDL-sync wiring. TypeNameToOID in codec.go.
+      catalogHeapSyncAvailable + syncTableToCatalogHeap + syncIndexToCatalogHeap
+      in operators_ddl.go. CREATE TABLE writes pg_class + pg_attribute rows.
+      CREATE INDEX writes pg_class row. 3 new integration tests pass.
+      DROP TABLE/INDEX sync and startup user-table load deferred.
 - [ ] DDL WAL record kinds: RecordKindCatalog* and RecordKindSmgr*
       plus redo handlers (M0030-0002). Design doc
       `docs/design/0030-0002-ddl-wal-records.md`.
