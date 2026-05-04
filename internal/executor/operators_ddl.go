@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -12,6 +13,11 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// pgEpoch is the PostgreSQL epoch: 2000-01-01 00:00:00 UTC.
+// Timestamps stored as KindTime datums are converted to microseconds
+// relative to this epoch for B-tree key encoding.
+var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // ddlOp is a one-shot operator that runs a DDL statement against the
 // catalog and (when applicable) the storage manager. It produces no
@@ -627,6 +633,12 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeChar([]byte(v.String)), nil
+	case isTimestampType(col.Type.Name):
+		if v.Kind != KindTime {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
+		}
+		micros := v.Time.Sub(pgEpoch).Microseconds()
+		return btree.EncodeTimestamp(micros), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
@@ -691,12 +703,24 @@ func isCharType(name string) bool {
 	}
 }
 
+// isTimestampType returns true for timestamp (without time zone) types
+// accepted by M0044-0003 B-tree key encoding.
+func isTimestampType(name string) bool {
+	switch strings.ToLower(name) {
+	case "timestamp", "timestamp without time zone":
+		return true
+	default:
+		return false
+	}
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
 // and numeric landed for HammerDB TPC-H compatibility. varchar landed
-// in M0044-0001; char landed in M0044-0002.
+// in M0044-0001; char in M0044-0002; timestamp in M0044-0003.
 func isSupportedBTreeKeyType(name string) bool {
-	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) || isVarcharType(name) || isCharType(name)
+	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
+		isVarcharType(name) || isCharType(name) || isTimestampType(name)
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {

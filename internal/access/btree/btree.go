@@ -366,6 +366,21 @@ func EncodeChar(payload []byte) []byte {
 	return EncodeVarchar(bytes.TrimRight(payload, " "))
 }
 
+// EncodeTimestamp encodes a timestamp value as a sortable 8-byte
+// sequence whose bytewise comparison matches chronological order.
+//
+// The input is the number of microseconds since the PostgreSQL epoch
+// (2000-01-01 00:00:00 UTC); negative values are valid and represent
+// timestamps before the epoch.
+//
+// The layout is identical to EncodeInt8: 8-byte big-endian with the
+// sign bit flipped so negative values (pre-epoch timestamps) sort
+// before positive values (post-epoch timestamps) under bytewise
+// comparison.
+func EncodeTimestamp(microsSince2000 int64) []byte {
+	return EncodeInt8(microsSince2000)
+}
+
 // CompareKeys is straight bytewise lexicographic comparison.
 //
 // For int4 keys (all 4 bytes) this matches numeric order by

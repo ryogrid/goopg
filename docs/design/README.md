@@ -221,4 +221,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0044-0002 | [CHAR B-tree Key Encoding (M0044)](0044-0002-char-key-encoding.md) | accepted | `EncodeChar` = trim trailing spaces + `EncodeVarchar`. Implements PostgreSQL blank-padded comparison semantics: 'A' and 'A         ' produce identical key bytes. Adds `isCharType` (char/character/bpchar) + char case in `encodeBTreeKeyForColumn`. Five unit tests (trim equality, monotone order, all-spaces edge, leading-space preservation, TPC-H shapes) + two integration tests (CREATE INDEX, UNIQUE duplicate rejection). |
 
+| 0044-0003 | [TIMESTAMP B-tree Key Encoding (M0044)](0044-0003-timestamp-key-encoding.md) | accepted | `EncodeTimestamp(microsSince2000)` = `EncodeInt8` (identical 8-byte sign-flipped big-endian encoding). Adds `pgEpoch` + `isTimestampType` + timestamp case in `encodeBTreeKeyForColumn` (converts `KindTime` `time.Time` to microseconds via `t.Sub(pgEpoch).Microseconds()`). Five unit tests (chronological order, epoch boundary crossing, fixed-length, equality, TPC-H date shapes) + two integration tests (CREATE INDEX, RangeScan `[1995-01-01, 1995-12-31]` parity). Enables l_shipdate/o_orderdate indexes for TPC-H date-range queries. |
+
 Append new rows in numeric order. Do not reorder.

@@ -1142,21 +1142,17 @@ composite-key bytewise comparison stays correct.
   - [x] Unit tests `internal/access/btree/char_key_test.go`
   - [x] Integration test `internal/executor/storage_ddl_char_test.go`
 
-- [ ] M0044-0003: `timestamp` B-tree key encoding. Design doc
+- [x] M0044-0003: `timestamp` B-tree key encoding. Design doc
       `docs/design/0044-0003-timestamp-key-encoding.md`.
-  - [ ] Add `EncodeTimestamp(microsSince2000 int64) []byte` to
-        `internal/access/btree/btree.go` — 8-byte BE sign-flipped,
-        identical layout to `EncodeInt8`.
-  - [ ] Extend `encodeBTreeKeyForColumn` with a `timestamp`
-        branch driven by the runtime `KindTime` Datum.
-  - [ ] Relax `isSupportedBTreeKeyType` to accept `timestamp`,
-        `timestamp without time zone`. (`timestamptz` deferred.)
-  - [ ] Unit test covering chronological ordering across the
-        epoch boundary and a few TPC-H-shaped dates.
-  - [ ] Integration test builds a `lineitem(l_shipdate)` index
-        and verifies a `[1995-01-01, 1996-01-01)` RangeScan
-        returns the same rows as a SeqScan with the same
-        predicate.
+      (landed 2026-05-04: `EncodeTimestamp` = `EncodeInt8`;
+      `pgEpoch` + `isTimestampType` (timestamp / timestamp without
+      time zone) + timestamp case in `encodeBTreeKeyForColumn`.
+      5 unit tests + 2 executor integration tests. Green.)
+  - [x] Add `EncodeTimestamp(microsSince2000 int64) []byte`
+  - [x] Extend `encodeBTreeKeyForColumn` with timestamp branch
+  - [x] Relax `isSupportedBTreeKeyType` for timestamp types
+  - [x] Unit tests `internal/access/btree/timestamp_key_test.go`
+  - [x] Integration test `internal/executor/storage_ddl_timestamp_test.go`
 
 - [ ] M0044-0004: Compound B-tree indexes over mixed types.
       Design doc `docs/design/0044-0004-compound-mixed-types.md`.
