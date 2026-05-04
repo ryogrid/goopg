@@ -308,6 +308,22 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		logger.Info("loaded pg_hba.conf", "path", *hbaPath, "rules", len(policy.Rules))
 	}
 
+	// Auto-load pg_auth from the data directory when it exists.
+	// pg_auth format: one "username:secret" per line; secret is
+	// plaintext, md5<hex>, or a SCRAM-SHA-256 verifier string.
+	if *dataDir != "" {
+		pgAuthPath := filepath.Join(*dataDir, "pg_auth")
+		if _, statErr := os.Stat(pgAuthPath); statErr == nil {
+			store, err := auth.LoadUsersFile(pgAuthPath)
+			if err != nil {
+				fmt.Fprintf(stderr, "goopg start: %v\n", err)
+				return 1
+			}
+			cfg.UserStore = store
+			logger.Info("loaded pg_auth", "path", pgAuthPath)
+		}
+	}
+
 	// Honour the checkpoint_timeout GUC (milestone 0002). Default of
 	// 300s matches upstream; the prior hard-coded 10s was a
 	// development convenience. A future reload path will reapply

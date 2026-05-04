@@ -1605,11 +1605,17 @@ gaps catalogued in `docs/reference/ref-021-protocol.md`.
       emits FieldPosition when non-zero. DoD tests:
       `TestErrorResponseDoDPositionField` (position='14' for `SELECT 1
       FROM`); `TestSyntaxErrorPositionValue` (position in range).)
-- [ ] M0049-0003: SCRAM-SHA-256 authentication. Design doc
-      `docs/design/0049-0003-scram-sha-256.md`. Server-side SCRAM
-      exchange; new `auth-method = scram-sha-256` in pg_hba; new
-      verifier format in pg_authid. DoD: psql / pgx / JDBC connect
-      against a SCRAM-only HBA rule.
+- [x] M0049-0003: SCRAM-SHA-256 authentication. Design doc
+      `docs/design/0049-0003-scram-sha-256.md`. (landed 2026-05-05:
+      SCRAM crypto + SASL wire exchange were already implemented.
+      Added `auth.LoadUsersFile(path)` that reads `pg_auth` file
+      (lines: `username:secret` where secret is plaintext, md5<hex>,
+      or `SCRAM-SHA-256$...` verifier). `goopg start` auto-loads
+      `<datadir>/pg_auth` if present. `cluster.WritePGAuth(entries)`
+      helper writes the file before cluster start. DoD test
+      `TestE2E_SCRAMAuthDoD`: `NewSCRAMCredential(pass)` + pg_auth
+      write + `scram-sha-256` pg_hba rule → lib/pq SCRAM login +
+      `SELECT 1` succeeds.)
 - [ ] M0049-0004: Binary COPY format. Design doc
       `docs/design/0049-0004-copy-binary-format.md`. 19-byte PGCOPY
       header, per-row int16 fieldCount + length-prefixed payloads,

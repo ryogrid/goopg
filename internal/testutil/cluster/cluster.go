@@ -408,6 +408,21 @@ func (c *Cluster) AppendPGHBA(line string) error {
 	return appendLine(filepath.Join(c.dataDir, "pg_hba.conf"), line)
 }
 
+// WritePGAuth writes (or replaces) <datadir>/pg_auth with lines of the
+// form "username:secret". The server auto-loads this file on startup
+// to populate its in-memory UserStore for password/SCRAM auth.
+func (c *Cluster) WritePGAuth(entries map[string]string) error {
+	var sb strings.Builder
+	sb.WriteString("# pg_auth: username:secret (plaintext, md5<hex>, or SCRAM verifier)\n")
+	for user, secret := range entries {
+		sb.WriteString(user)
+		sb.WriteByte(':')
+		sb.WriteString(secret)
+		sb.WriteByte('\n')
+	}
+	return os.WriteFile(filepath.Join(c.dataDir, "pg_auth"), []byte(sb.String()), 0o600)
+}
+
 // WaitForLogContains waits until cluster log output contains needle.
 func (c *Cluster) WaitForLogContains(needle string, timeout time.Duration) error {
 	return util.WaitForFileContains(c.logPath, needle, timeout)
