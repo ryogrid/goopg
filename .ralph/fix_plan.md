@@ -128,7 +128,12 @@ Decompose when picked up.
 - [x] AutovacuumMain: Launcher.OnRunStart/OnRunEnd hook fields
       for goroutine registration. (landed 2026-04-30)
 
-- [ ] Buffile I/O wait events (BuffileRead / BuffileWrite)
+- [x] Buffile I/O wait events (BuffileRead / BuffileWrite).
+      Wire `WaitBuffileRead` / `WaitBuffileWrite` into `spillWriter.WriteRow`
+      and `spillReader.ReadRow` via `activity.LookupGoroutine()` +
+      `WaitEventStart/End` calls. Constants were already defined in
+      `internal/activity/activity.go`; only `internal/executor/spill.go`
+      was changed. (landed 2026-05-04)
 
 ## Milestone 0027 — Low-risk performance optimisations
 

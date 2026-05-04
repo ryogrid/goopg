@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -36,13 +37,19 @@ func (w *spillWriter) WriteRow(row Row) error {
 	// Prefix with total length for framing.
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(w.buf)))
-	if _, err := w.f.Write(lenBuf); err != nil {
-		return err
+	reg, pid := activity.LookupGoroutine()
+	if reg != nil {
+		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileWrite)
 	}
-	if _, err := w.f.Write(w.buf); err != nil {
-		return err
+	_, err1 := w.f.Write(lenBuf)
+	_, err2 := w.f.Write(w.buf)
+	if reg != nil {
+		reg.WaitEventEnd(pid)
 	}
-	return nil
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 func (w *spillWriter) Close() error {
@@ -67,13 +74,28 @@ func newSpillReader(path string) (*spillReader, error) {
 
 func (r *spillReader) ReadRow() (Row, error) {
 	var lenBuf [4]byte
-	if _, err := io.ReadFull(r.f, lenBuf[:]); err != nil {
-		return nil, err
+	reg, pid := activity.LookupGoroutine()
+	if reg != nil {
+		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	}
+	_, errLen := io.ReadFull(r.f, lenBuf[:])
+	if reg != nil {
+		reg.WaitEventEnd(pid)
+	}
+	if errLen != nil {
+		return nil, errLen
 	}
 	dataLen := binary.LittleEndian.Uint32(lenBuf[:])
 	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(r.f, data); err != nil {
-		return nil, fmt.Errorf("spillReader: truncated row: %w", err)
+	if reg != nil {
+		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	}
+	_, errData := io.ReadFull(r.f, data)
+	if reg != nil {
+		reg.WaitEventEnd(pid)
+	}
+	if errData != nil {
+		return nil, fmt.Errorf("spillReader: truncated row: %w", errData)
 	}
 	nCols, n := binary.Uvarint(data)
 	if n <= 0 {
