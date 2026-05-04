@@ -25,6 +25,7 @@ import (
 	"strconv"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -113,7 +114,27 @@ func Init(opts Options) error {
 	if err := bootstrapSystemCatalogs(abs); err != nil {
 		return fmt.Errorf("goopg init: system catalogs: %w", err)
 	}
+	if err := bootstrapCLog(abs); err != nil {
+		return fmt.Errorf("goopg init: clog: %w", err)
+	}
 	return nil
+}
+
+// bootstrapCLog creates the initial commit log at <dataDir>/global/pg_xact and
+// marks the PostgreSQL bootstrap transaction IDs (BootstrapTransactionID=1,
+// FrozenTransactionID=2) as committed. These XIDs stamp the system-catalog
+// seed rows written by bootstrapSystemCatalogs; without this, a restart would
+// find Unknown status for xmin=1 and skip those rows.
+func bootstrapCLog(dataDir string) error {
+	path := filepath.Join(dataDir, "global", "pg_xact")
+	c, err := mvcc.OpenCLog(path)
+	if err != nil {
+		return err
+	}
+	if err := c.SetCommitted(mvcc.BootstrapTransactionID); err != nil {
+		return fmt.Errorf("mark bootstrap xid: %w", err)
+	}
+	return c.SetCommitted(mvcc.FrozenTransactionID)
 }
 
 // bootstrapSystemCatalogs creates the three core system catalog heap

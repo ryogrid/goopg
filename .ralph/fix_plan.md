@@ -371,7 +371,21 @@ loading switch.**
       New test TestRollbackedTableNotVisibleAfterRestart: BEGIN; CREATE TABLE
       rollback_ghost; ROLLBACK; Close; Re-Open → table absent. All executor/
       initdb/wal/storage tests pass.)
-- [ ] pg_xact commit log.
+- [x] pg_xact commit log.
+      (landed 2026-05-04: internal/mvcc/clog.go — flat-byte file at
+      <DataDir>/global/pg_xact mapping XID→(Unknown=0/Committed=1/Aborted=2).
+      initdb.Init() calls bootstrapCLog() marking XIDs 1+2 COMMITTED.
+      Open() opens clog, extends xactMarker hook to call SetCommitted/SetAborted
+      on every commit/abort, calls InitializeAsCommitted(nextXID) for old clusters
+      (upgrade path), passes clog to loadUserTablesFromHeap.
+      loadUserTablesFromHeap now skips pg_class rows where clog.GetStatus(xmin)
+      != TxnStatusCommitted — handles crash-without-ROLLBACK case.
+      7 unit tests (TestCLogRoundTrip, TestCLogPersistence, TestCLogUnknownFor
+      MissingEntry, TestCLogIsEmpty, TestCLogInitializeAsCommitted,
+      TestCLogInitializeDoesNotOverwriteNonZero, TestCLogIdempotent).
+      2 integration tests (TestCrashMidTransactionTableNotVisibleAfterRestart,
+      TestCommittedTableSurvivesCrashRestart). Design doc
+      docs/design/0030-0007-pg-xact-commit-log.md. All go test ./... pass.)
 
 ## Milestone 0031 — TPC-H Q2 Memory Estimation & GC Leak Code Review
 

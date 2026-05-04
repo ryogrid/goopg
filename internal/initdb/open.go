@@ -388,6 +388,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// buffer. Errors propagate back through Commit / Rollback so
 	// a WAL-append failure stops the txn from finishing. See
 	// docs/design/0008-0001-logical-decoding-pipeline.md.
+	// Open the commit log (pg_xact). Created by bootstrapCLog during initdb;
+	// upgraded on old clusters by InitializeAsCommitted.
+	clogPath := filepath.Join(abs, "global", "pg_xact")
+	clog, err := mvcc.OpenCLog(clogPath)
+	if err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: open clog: %w", err)
+	}
 	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
 		var payload []byte
 		switch kind {
@@ -407,7 +417,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// across a server crash. Mirrors upstream's synchronous_commit = on
 		// default. Aborts are not flushed (they're discarded on replay).
 		if kind == mvcc.XactCommit {
-			return walWriter.FlushUpTo(endLSN)
+			if werr := walWriter.FlushUpTo(endLSN); werr != nil {
+				return werr
+			}
+		}
+		// Persist commit/abort status in clog (M0030-0007). Non-fatal: the
+		// WAL XactCommit record is the primary durability mechanism.
+		switch kind {
+		case mvcc.XactCommit:
+			_ = clog.SetCommitted(xid)
+		case mvcc.XactAbort:
+			_ = clog.SetAborted(xid)
 		}
 		return nil
 	})
@@ -416,6 +436,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, err
+	}
+	// Upgrade path: if the clog is empty (old cluster started before M0030-0007
+	// landed), initialize all prior XIDs as committed so loadUserTablesFromHeap
+	// doesn't reject their rows.
+	if clog.IsEmpty() {
+		if uerr := clog.InitializeAsCommitted(txnMgr.NextXID()); uerr != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: clog upgrade: %w", uerr)
+		}
 	}
 	// One-shot migration: if this is a legacy JSON-only cluster whose
 	// pg_class has no user-table rows, write all in-memory user tables to
@@ -444,7 +475,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// snapshot (e.g. crash before SaveCatalog), this path recovers it from the
 	// WAL-replayed heap pages. Idempotent: tables already loaded from JSON are
 	// skipped. Safe on old clusters — skips if pg_class relfile is absent.
-	if err := loadUserTablesFromHeap(mgr, cat); err != nil {
+	// The clog is passed to filter rows whose xmin was never committed (M0030-0007).
+	if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -1088,10 +1120,15 @@ func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []s
 // this scan recovers the new tables from the WAL-replayed heap pages on the
 // next startup.
 //
+// The clog parameter (M0030-0007) filters out rows whose xmin was never
+// committed — this handles tables created in transactions that crashed before
+// reaching COMMIT. If clog is nil (should not happen after M0030-0007 landed)
+// the scan falls back to the old xmax-only check.
+//
 // The scan is safe on old clusters (pre-M0030-0001) that have no pg_class relfile
 // and is idempotent with the JSON snapshot path (tables already loaded from JSON
 // are skipped via TryRegisterUserTable's exists-check).
-func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory) error {
+func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
 	classRel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
 		RelOid: catalog.RelationRelationId,
@@ -1124,6 +1161,10 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory) error {
 			}
 			if ht.Header.Xmax != storage.InvalidTransactionID {
 				continue // deleted
+			}
+			// Skip rows from uncommitted or crashed transactions (M0030-0007).
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
+				continue
 			}
 			row, err := catalog.DecodePGClassRow(ht.Data)
 			if err != nil {
