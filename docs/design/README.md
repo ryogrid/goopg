@@ -217,4 +217,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 
 | 0042-0004 | [Client Backend Goroutine Alignment](0042-0004-client-backend-goroutine-alignment.md) | draft | Documents and tightens the per-connection goroutine model: client goroutines own transaction/snapshot/pinned buffers/`XLogInsert`/`XLogFlush` only; never run the WAL-writer, background-writer, checkpointer, or walsender cycle by side-effect. Adds a regression test that backends never fsync. |
 
+| 0044-0001 | [VARCHAR B-tree Key Encoding (M0044)](0044-0001-varchar-key-encoding.md) | accepted | Self-terminating, sortable `EncodeVarchar` encoding for `varchar(N)` B-tree keys. Uses `0x01` as escape introducer: `0x00`→`[0x01,0x01]`, `0x01`→`[0x01,0x02]`, terminator `0x00`. Bytewise order matches C-locale string order. Self-terminating design makes it safe for composite keys. Extends `encodeBTreeKeyForColumn` + `isSupportedBTreeKeyType` in DDL executor. Five btree unit tests + three executor integration tests (CREATE INDEX, UNIQUE rejection, RangeScan parity). Unblocks 8 failing TPC-H varchar/char/timestamp supplementary indexes. |
+
 Append new rows in numeric order. Do not reorder.

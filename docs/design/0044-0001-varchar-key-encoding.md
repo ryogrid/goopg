@@ -1,6 +1,6 @@
 # 0044-0001 — `varchar(N)` B-tree Key Encoding
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0044
 **Date:** 2026-05-04
 

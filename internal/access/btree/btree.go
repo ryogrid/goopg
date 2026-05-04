@@ -315,6 +315,42 @@ func EncodeNumericKey(mantissa *big.Int, scale int16) []byte {
 	return out
 }
 
+// EncodeVarchar encodes a variable-length string as a self-terminating
+// byte sequence whose bytewise lexicographic order matches the C-locale
+// (byte-wise) SQL ordering of the original strings. Suitable as a
+// B-tree key component in both single-column and composite indexes.
+//
+// Encoding rules:
+//   - 0x01 is the escape introducer.
+//   - Each 0x00 byte in the payload is replaced by [0x01, 0x01].
+//   - Each 0x01 byte in the payload is replaced by [0x01, 0x02].
+//   - All other bytes are passed through unchanged.
+//   - A single 0x00 byte is appended as the end-of-key terminator.
+//
+// This ensures 0x00 appears only as the terminator (never inside the
+// payload after escaping), making the encoding self-terminating:
+// concatenating two EncodeVarchar results in a composite key whose
+// bytewise comparison correctly implements multi-column SQL ordering.
+//
+// Bytewise order of encoded strings matches bytewise (C-locale) order
+// of the original inputs. Decoding is intentionally not provided:
+// B-tree probe paths always re-encode from the live Datum.
+func EncodeVarchar(payload []byte) []byte {
+	out := make([]byte, 0, len(payload)+1)
+	for _, b := range payload {
+		switch b {
+		case 0x00:
+			out = append(out, 0x01, 0x01)
+		case 0x01:
+			out = append(out, 0x01, 0x02)
+		default:
+			out = append(out, b)
+		}
+	}
+	out = append(out, 0x00)
+	return out
+}
+
 // CompareKeys is straight bytewise lexicographic comparison.
 //
 // For int4 keys (all 4 bytes) this matches numeric order by

@@ -289,6 +289,12 @@ See `analysis/tpch-hammerdb-run-001.md` for the full run report.
 
 See `docs/milestones/0030-catalog-persistence-and-ddl-wal.md`.
 Decomposed into the six design-doc seams the milestone calls out.
+**NOTE (2026-05-04): M0030-0001 spans 6 sub-phases (OID constants,
+SysTableID helper, pg_class/pg_attribute/pg_type heap file creation at
+initdb, catalog row codec, startup-load switch, DDL-sync wiring) and
+requires multiple loops. Start by creating the design doc and
+implementing OID constants + file creation before the codec and
+loading switch.**
 
 - [ ] System catalog heap table substrate: pg_class, pg_attribute, pg_type
       as real heap relations (M0030-0001). Design doc
@@ -1106,26 +1112,23 @@ existing `encodeCompositeBTreeKey` concatenation strategy needs
 each new encoding to be **self-terminating** (prefix code) so
 composite-key bytewise comparison stays correct.
 
-- [ ] M0044-0001: `varchar(N)` B-tree key encoding. Design doc
+- [x] M0044-0001: `varchar(N)` B-tree key encoding. Design doc
       `docs/design/0044-0001-varchar-key-encoding.md`.
-  - [ ] Add `EncodeVarchar(payload []byte) []byte` to
-        `internal/access/btree/btree.go` — `0x00 0x01` escape
-        rule for embedded `0x00`/`0x01`, then `0x00` terminator.
-  - [ ] Extend `encodeBTreeKeyForColumn` in
-        `internal/executor/operators_ddl.go` with a `varchar`
-        branch that pulls the runtime `KindString` Datum bytes
-        and routes through `EncodeVarchar`.
-  - [ ] Relax `isSupportedBTreeKeyType` to accept `varchar`,
-        `character varying`. (`text` deferred to a follow-up.)
-  - [ ] New unit test
-        `internal/access/btree/varchar_key_test.go` — ordering
-        across mixed-length payloads, empty string, escape
-        cases.
-  - [ ] Integration test
-        `internal/executor/storage_ddl_varchar_test.go` builds a
-        single-column varchar index, asserts row-count parity
-        between IndexScan and SeqScan, and exercises UNIQUE
-        violations.
+      (landed 2026-05-04: `EncodeVarchar` uses `0x01` escape
+      introducer — `0x00`→`[0x01,0x01]`, `0x01`→`[0x01,0x02]`,
+      terminator `0x00`. `isVarcharType` + varchar case in
+      `encodeBTreeKeyForColumn` + `isSupportedBTreeKeyType`
+      extended. 5 btree unit tests + 3 executor integration
+      tests. `go test ./internal/access/btree/ ./internal/executor/`
+      green.)
+  - [x] Add `EncodeVarchar(payload []byte) []byte` to
+        `internal/access/btree/btree.go`
+  - [x] Extend `encodeBTreeKeyForColumn` in
+        `internal/executor/operators_ddl.go` with varchar branch
+  - [x] Relax `isSupportedBTreeKeyType` to accept `varchar`,
+        `character varying`
+  - [x] Unit tests `internal/access/btree/varchar_key_test.go`
+  - [x] Integration test `internal/executor/storage_ddl_varchar_test.go`
 
 - [ ] M0044-0002: `char(N)` B-tree key encoding. Design doc
       `docs/design/0044-0002-char-key-encoding.md`.
