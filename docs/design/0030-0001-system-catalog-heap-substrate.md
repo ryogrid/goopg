@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | accepted (Phase 1+2 landed 2026-05-04) |
+| Status      | accepted (Phase 1+2+3 landed 2026-05-04) |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -169,8 +169,58 @@ Seeding read-back tests in `initdb_test.go`:
 `TestBootstrappedPGClassRowsReadable` (pg_type/pg_attribute/pg_class entries),
 `TestBootstrappedPGAttributeRowsReadable` (8+6+7 column counts + spot-check).
 
-### Still Deferred
+### Still Deferred (from Phase 2)
 
 - Startup-load switch: replace `loadCatalogSnapshot` with heap-table scan.
+  → **Landed in Phase 3** — see below.
 - DDL-sync wiring: `CREATE TABLE`/`CREATE INDEX`/`DROP TABLE` write to pg_class/pg_attribute.
 - Virtual-view integration: source `pg_tables`, `pg_indexes` from heap-backed tables.
+
+## What Landed (Phase 3 — 2026-05-04)
+
+**Scope**: Startup-load switch — register pg_type and pg_attribute as real heap-backed
+catalog tables at Open time. DDL-sync wiring deferred to Phase 4.
+
+### `internal/catalog/catalog.go` changes
+
+- `RegisterRealTable(t *Table) error` — new method to install a system catalog table
+  (non-virtual, OID below FirstUserOID). Idempotent on duplicate with same OID.
+
+### `internal/catalog/persist.go` changes
+
+- `Snapshot()` now skips tables where `IsSystemRelation(t.OID)` is true, so pg_type
+  and pg_attribute are never written to the JSON snapshot. They are re-registered
+  from heap relfiles on every startup.
+
+### `internal/initdb/open.go` changes
+
+- `loadSystemCatalogsIfPresent(dataDir, cat)` — new function called in `Open()` after
+  `loadCatalogSnapshot`. Checks if the M0030-0001 relfiles exist under
+  `base/<DefaultDBOid>/`; if present, registers the corresponding tables:
+  - pg_type (OID 1247): columns from `PGTypeColumns()`
+  - pg_attribute (OID 1249): columns from `PGAttributeColumns()`
+- On old clusters (pre-M0030-0001, no relfiles), the function is a no-op — backward
+  compatible.
+- Called AFTER `loadCatalogSnapshot`/`Restore()` to survive the catalog reset.
+
+### Effect
+
+After `goopg init` + `goopg start`:
+- `SELECT * FROM pg_type` now scans the heap file and returns the 10 seeded built-in
+  types. No special virtual-table registration needed.
+- `SELECT * FROM pg_attribute WHERE attrelid = 1259` returns the 8 pg_class columns.
+- pg_class remains a virtual table (dynamic user-table listing still required).
+
+### Tests (4 new in `open_test.go`)
+
+- `TestOpenRegistersSystemCatalogHeapTables` — pg_type and pg_attribute present, non-virtual, correct OID
+- `TestOpenPGTypeIsNotVirtual` — VirtualRows is nil  
+- `TestOpenSystemCatalogNotInJSONSnapshot` — Save + reopen, no duplication in JSON
+- `TestOpenOldClusterWithoutM0030FilesStillWorks` — files removed, Open succeeds
+
+### Still Deferred (from Phase 3)
+
+- DDL-sync wiring: `CREATE TABLE` writes pg_class + pg_attribute rows.
+- `DROP TABLE`: marks rows with xmax (delete-stamp).
+- `CREATE INDEX`: writes pg_class row for the index relation.
+- Virtual-view integration: source `pg_tables`, `pg_indexes` from heap.

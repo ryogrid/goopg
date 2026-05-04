@@ -378,6 +378,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// Register system catalog heap tables (pg_type, pg_attribute) if their
+	// relfiles exist.  Must run after loadCatalogSnapshot / Restore so the
+	// registration survives the catalog reset that Restore() performs.
+	// Safe to skip on old clusters without the M0030-0001 relfiles.
+	if err := loadSystemCatalogsIfPresent(abs, cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: system catalog load: %w", err)
+	}
 
 	// Replication-slot registry. The retention path on the
 	// checkpointer (wired below in cmd/goopg start once the GUC
@@ -773,6 +783,53 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *wal.Checkpointer) e
 		}}
 	}
 	return cat.RegisterVirtualTable(tbl)
+}
+
+// loadSystemCatalogsIfPresent registers pg_type and pg_attribute as
+// real heap-backed catalog tables when their M0030-0001 relfiles are
+// present under <dataDir>/base/<DefaultDBOid>/.
+//
+// On fresh clusters (after goopg init with Phase 1+2 changes), the
+// relfiles exist and contain seeded rows.  On old clusters that were
+// initialized before M0030-0001, the files are absent and this
+// function is a no-op — backward compatible.
+//
+// The registration uses catalog.RegisterRealTable (non-virtual,
+// OID-pre-set), so a SeqScan on these tables reads directly from the
+// heap relfile.  The rows are visible to all sessions because they
+// were written with xmin=BootstrapTransactionID (1).
+func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
+	base := filepath.Join(dataDir, "base", fmt.Sprint(catalog.DefaultDBOid))
+
+	// pg_type (OID 1247) — built-in type catalog.
+	pgTypeFile := filepath.Join(base, fmt.Sprint(catalog.TypeRelationId))
+	if _, err := os.Stat(pgTypeFile); err == nil {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_type",
+			Columns: catalog.PGTypeColumns(),
+			OID:     catalog.TypeRelationId,
+		}
+		if err := cat.RegisterRealTable(t); err != nil {
+			return fmt.Errorf("register pg_type: %w", err)
+		}
+	}
+
+	// pg_attribute (OID 1249) — column definition catalog.
+	pgAttrFile := filepath.Join(base, fmt.Sprint(catalog.AttributeRelationId))
+	if _, err := os.Stat(pgAttrFile); err == nil {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_attribute",
+			Columns: catalog.PGAttributeColumns(),
+			OID:     catalog.AttributeRelationId,
+		}
+		if err := cat.RegisterRealTable(t); err != nil {
+			return fmt.Errorf("register pg_attribute: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // loadCatalogSnapshot reads <dir>/global/pg_catalog.json (if

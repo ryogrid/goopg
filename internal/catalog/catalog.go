@@ -429,6 +429,46 @@ func (c *InMemory) registerSystemTables() {
 	c.tables["pg_catalog.pg_tables"] = pgTables
 }
 
+// RegisterRealTable installs a heap-backed system catalog table.
+// Used at startup to register pg_type and pg_attribute after their
+// relfiles are confirmed present on disk. The table must have
+// Virtual=false and a pre-assigned OID below FirstUserOID
+// (i.e. IsSystemRelation(t.OID) must be true).
+//
+// If an entry with the same qualified name already exists and has
+// the same OID, the call is a no-op (idempotent). This handles
+// the case where Restore() loaded the table from a JSON snapshot
+// before loadSystemCatalogsIfPresent ran.
+//
+// System catalog tables are excluded from Snapshot() so they are
+// never persisted to JSON — they are always re-registered at
+// startup from their heap relfiles.
+func (c *InMemory) RegisterRealTable(t *Table) error {
+	if t == nil {
+		return fmt.Errorf("RegisterRealTable: nil table")
+	}
+	if t.Virtual {
+		return fmt.Errorf("RegisterRealTable: table %q must not be virtual", t.QualifiedName())
+	}
+	if !IsSystemRelation(t.OID) {
+		return fmt.Errorf("RegisterRealTable: OID %d is above FirstUserOID; use CreateTable instead", t.OID)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
+	if existing, ok := c.tables[k]; ok {
+		if existing.OID == t.OID {
+			return nil // already registered — idempotent
+		}
+		return fmt.Errorf("RegisterRealTable: %q already exists with OID %d (want %d)", k, existing.OID, t.OID)
+	}
+	for i := range t.Columns {
+		t.Columns[i].Ordinal = i
+	}
+	c.tables[k] = t
+	return nil
+}
+
 // RegisterVirtualTable installs a virtual table built by an
 // out-of-tree caller. Used by the runtime to wire stats views
 // (`pg_stat_checkpointer`, etc.) whose row data lives outside

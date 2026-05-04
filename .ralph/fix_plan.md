@@ -309,8 +309,12 @@ loading switch.**
       initdb time (10 pg_type rows, 3 pg_class rows, 21 pg_attribute rows),
       and 12 new tests (round-trip + seeded content read-back). Format
       compatible with executor.EncodeRow/DecodeRowInto.
-      Remaining sub-phases deferred: startup-load switch (Phase 3),
-      DDL-sync wiring (Phase 4).
+      **Phase 3 landed 2026-05-04**: Startup-load switch. catalog.RegisterRealTable
+      + Snapshot skips IsSystemRelation OIDs; loadSystemCatalogsIfPresent in
+      Open() registers pg_type (1247) and pg_attribute (1249) as real heap-backed
+      tables when their relfiles are present. SELECT * FROM pg_type now works.
+      4 new tests. Backward compat: old clusters without M0030 relfiles unaffected.
+      Remaining sub-phase deferred: DDL-sync wiring (Phase 4).
 - [ ] DDL WAL record kinds: RecordKindCatalog* and RecordKindSmgr*
       plus redo handlers (M0030-0002). Design doc
       `docs/design/0030-0002-ddl-wal-records.md`.

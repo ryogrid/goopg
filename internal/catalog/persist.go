@@ -73,6 +73,12 @@ func (c *InMemory) Snapshot() Snapshot {
 			// snapshot without preserving anything useful.
 			continue
 		}
+		if IsSystemRelation(t.OID) {
+			// System catalog heap tables (pg_type, pg_attribute, etc.)
+			// are re-registered at startup from their heap relfiles;
+			// they must not appear in the JSON snapshot.
+			continue
+		}
 		s.Tables = append(s.Tables, TableEntry{
 			OID:     t.OID,
 			Schema:  t.Schema,
