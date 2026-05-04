@@ -1,6 +1,6 @@
 # 0042-0001 — PostgreSQL I/O Subsystem Survey
 
-**Status:** draft
+**Status:** accepted
 **Parent milestone:** M0042
 **Date:** 2026-05-04
 **Audience:** goopg implementers preparing the M0042 buffered-I/O

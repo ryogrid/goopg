@@ -1085,31 +1085,35 @@ the per‑connection goroutine model behaves like upstream's
 per‑backend process model. Anchor doc:
 `docs/design/0042-0001-pg-io-survey.md` (English).
 
-- [ ] M0042-0001: PostgreSQL I/O subsystem survey (English).
+- [x] M0042-0001: PostgreSQL I/O subsystem survey (English).
       Design doc `docs/design/0042-0001-pg-io-survey.md`.
-  - [ ] WAL writes & durability: `XLogWrite`, `XLogFlush`,
+      **Accepted 2026-05-04**: Comprehensive 10-section survey covering
+      WAL writes/durability, page-data path, bgwriter, checkpointer,
+      WAL buffer ring, dedicated walwriter, client-backend responsibilities,
+      goopg mapping, and upstream file references.
+  - [x] WAL writes & durability: `XLogWrite`, `XLogFlush`,
         `XLogBackgroundFlush`, `issue_xlog_fsync` paths;
         `wal_sync_method`; `WALInsertLock` array; page-aligned
         ring; durability barriers (`fdatasync`,
         `synchronous_commit`).
-  - [ ] Page-data writes/reads/eviction: `BufferAlloc`,
+  - [x] Page-data writes/reads/eviction: `BufferAlloc`,
         `BufferSync`, `FlushBuffer`, `StrategyGetBuffer`
         (clock sweep), WAL-before-data invariant.
-  - [ ] Background writer (`bgwriter.c`): cadence, role, why
+  - [x] Background writer (`bgwriter.c`): cadence, role, why
         no fsync.
-  - [ ] Checkpointer (`checkpointer.c`,
+  - [x] Checkpointer (`checkpointer.c`,
         `xlog.c::CreateCheckPoint`): trigger conditions,
         flush phase, fsync phase, WAL retention.
-  - [ ] WAL buffer ring: `wal_buffers`, `WALBufMappingLock`,
+  - [x] WAL buffer ring: `wal_buffers`, `WALBufMappingLock`,
         eviction-when-full, `XLogInsert` →
         `WALWriteLock` handoff.
-  - [ ] Dedicated WAL writer (`walwriter.c`): cadence
+  - [x] Dedicated WAL writer (`walwriter.c`): cadence
         (`wal_writer_delay`), opportunistic fsync
         (`wal_writer_flush_after`), why distinct from
         `bgwriter`.
-  - [ ] Client backend (`postmaster.c`, `postgres.c`):
+  - [x] Client backend (`postmaster.c`, `postgres.c`):
         per-process responsibilities; what it does NOT own.
-  - [ ] Index against `postgres/src/backend/...` files cited
+  - [x] Index against `postgres/src/backend/...` files cited
         inline.
 
 - [ ] M0042-0002: Buffered-I/O migration. Drop O_DIRECT.
