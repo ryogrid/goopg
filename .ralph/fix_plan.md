@@ -1552,11 +1552,16 @@ checkpoint-pacing gap in `ref-004-checkpointer.md`.
       `releasePinned` / `Close` delegate to ring. 4 tests: lifecycle, cache-hit,
       DoD (500-page scan / 100-slot pool → 100% hot-page preservation), multi-block.
       All pass.)
-- [ ] M0048-0003: bgwriter goroutine. Design doc
-      `docs/design/0048-0003-bgwriter-goroutine.md`. New
-      `internal/storage/bgwriter.go`; ticks every `bgwriter_delay`,
-      writes ≤ `bgwriter_lru_maxpages` per tick, no fsync. DoD:
-      foreground victim-search dirty hit rate ≤ 5% on pgbench mixed.
+- [x] M0048-0003: bgwriter goroutine. Design doc
+      `docs/design/0048-0003-bgwriter-goroutine.md`. (landed 2026-05-05:
+      `storage.Bgwriter` goroutine ticks every `BgwriterDelay`, calls
+      `Pool.WriteDirtyPages(maxPages)` which snapshots dirty unpinned slots
+      under poolMu, then flushes each under contentMu.RLock (WAL FlushUpTo +
+      WriteBlock, no fsync). `Pool.dirtyVictimCount/totalVictimCount` counters
+      in evictLocked; `DirtyVictimRate()` + `ResetVictimStats()`. GUCs:
+      `bgwriter_delay`=200ms, `bgwriter_lru_maxpages`=100. OpenOptions:
+      `BgwriterDelay` + `BgwriterMaxPages`; Runtime.Close() stops bgwriter.
+      4 tests: flush, goroutine, DoD (0% dirty victim rate), max-pages cap.)
 - [ ] M0048-0004: Checkpoint write pacing. Design doc
       `docs/design/0048-0004-checkpoint-write-pacing.md`. Wire
       `checkpoint_completion_target` GUC; sleep-between-batches paces

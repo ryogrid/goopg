@@ -67,6 +67,10 @@ type Runtime struct {
 	// background WAL writer loop to exit. nil when the loop wasn't
 	// started (WalWriterDelay == 0 in tests).
 	walwriterStop chan struct{}
+
+	// bgwriter is the background page-writer goroutine (M0048-0003).
+	// nil when BgwriterDelay == 0 or BgwriterMaxPages == 0.
+	bgwriter *storage.Bgwriter
 }
 
 // OpenOptions controls Open.
@@ -128,6 +132,18 @@ type OpenOptions struct {
 	// (used by tests that don't need background flushing). Default in
 	// production: 200ms (mirrors upstream's wal_writer_delay GUC).
 	WalWriterDelay time.Duration
+
+	// BgwriterDelay controls the period of the background page-writer
+	// goroutine (M0048-0003). The bgwriter proactively flushes dirty
+	// buffer-pool pages to reduce synchronous I/O on eviction.
+	// 0 disables the bgwriter. Default 200ms mirrors upstream's
+	// bgwriter_delay GUC.
+	BgwriterDelay time.Duration
+
+	// BgwriterMaxPages caps dirty pages written per bgwriter tick.
+	// 0 disables the bgwriter. Default 100 mirrors upstream's
+	// bgwriter_lru_maxpages GUC.
+	BgwriterMaxPages int
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -768,6 +784,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}()
 	}
 
+	// Background page-writer goroutine (M0048-0003): proactively flushes
+	// dirty buffer-pool pages so eviction rarely needs synchronous I/O.
+	if opts.BgwriterDelay > 0 && opts.BgwriterMaxPages > 0 {
+		rt.bgwriter = storage.NewBgwriter(pool, opts.BgwriterDelay, opts.BgwriterMaxPages)
+		rt.bgwriter.Start()
+	}
+
 	return rt, nil
 }
 
@@ -1367,6 +1390,11 @@ func (r *Runtime) SaveCatalog() error {
 func (r *Runtime) Close() error {
 	if r == nil {
 		return nil
+	}
+	// Stop the background page-writer before draining the pool (M0048-0003).
+	if r.bgwriter != nil {
+		r.bgwriter.Stop()
+		r.bgwriter = nil
 	}
 	// Stop the background WAL writer loop before draining the pool so the
 	// loop can't issue FlushUpTo calls that race with the final WAL close.

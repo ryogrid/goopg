@@ -247,6 +247,26 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// bgwriter_delay controls how often (in milliseconds) the background
+	// writer goroutine wakes up to flush dirty buffer-pool pages.
+	// Default 200ms mirrors upstream's bgwriter_delay GUC (M0048-0003).
+	r.MustRegister(NewVariable(Variable{
+		Name: "bgwriter_delay", Type: TypeInt, BootVal: "200",
+		MinVal: 10, MaxVal: 10000,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
+	// bgwriter_lru_maxpages caps how many dirty pages the background
+	// writer flushes per tick. 0 disables the bgwriter. Default 100
+	// mirrors upstream's bgwriter_lru_maxpages GUC (M0048-0003).
+	r.MustRegister(NewVariable(Variable{
+		Name: "bgwriter_lru_maxpages", Type: TypeInt, BootVal: "100",
+		MinVal: 0, MaxVal: 1000,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// io_method picks the AIO I/O method. `sync` runs every
 	// I/O on the calling goroutine (the safe default that
 	// matches v0's pre-AIO behaviour); `worker` uses a

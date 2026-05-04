@@ -206,6 +206,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
 		walWriterDelayMS := intGUC(registry, "wal_writer_delay", 200)
+		bgwriterDelayMS := intGUC(registry, "bgwriter_delay", 200)
+		bgwriterMaxPages := intGUC(registry, "bgwriter_lru_maxpages", 100)
 		aioMethod := stringGUC(registry, "io_method", "")
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
@@ -217,6 +219,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WALSenderMemoryBuffer: walSenderMemBuf,
 			WALBuffers:            walBuffers,
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
+			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
+			BgwriterMaxPages:      bgwriterMaxPages,
 			AIOMethod:             aioMethod,
 			AIOWorkers:            aioWorkers,
 			AIOMaxConcurrency:     aioMax,

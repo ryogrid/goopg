@@ -178,6 +178,20 @@ type Pool struct {
 	// nil disables the check (tests that don't set up activity
 	// goroutine registration).
 	OnFlushAll func()
+
+	// Dirty-victim instrumentation (M0048-0003): counts how many times
+	// the foreground victim-search (evictLocked) encounters a dirty page
+	// that must be flushed synchronously, vs. total victims processed.
+	// Used to measure bgwriter effectiveness (DoD: dirty rate ≤ 5%).
+	// Protected by poolMu.
+	dirtyVictimCount int64
+	totalVictimCount int64
+
+	// bgwriterHand is the clock-hand position for the bgwriter's
+	// independent pass through the slot array (M0048-0003). Separate from
+	// clockHand so the bgwriter doesn't interfere with the eviction sweep.
+	// Guarded by poolMu.
+	bgwriterHand int
 }
 
 // PoolConfig controls Pool sizing.
@@ -1130,7 +1144,94 @@ func (p *Pool) evictLocked() (int, error) {
 			s.usageCount--
 			continue
 		}
+		// Track dirty-victim rate for bgwriter effectiveness (M0048-0003).
+		p.totalVictimCount++
+		if s.dirty {
+			p.dirtyVictimCount++
+		}
 		return idx, nil
 	}
 	return 0, ErrNoBuffer
+}
+
+// DirtyVictimRate returns the fraction of foreground evictions that
+// encountered a dirty page and had to flush it synchronously. Used to
+// measure bgwriter effectiveness (DoD: rate ≤ 5%). Acquires poolMu.
+func (p *Pool) DirtyVictimRate() float64 {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	if p.totalVictimCount == 0 {
+		return 0
+	}
+	return float64(p.dirtyVictimCount) / float64(p.totalVictimCount)
+}
+
+// ResetVictimStats resets the dirty-victim counters to zero.
+func (p *Pool) ResetVictimStats() {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	p.dirtyVictimCount = 0
+	p.totalVictimCount = 0
+}
+
+// WriteDirtyPages proactively flushes up to maxPages dirty slots in one
+// bgwriter tick. It scans from p.bgwriterHand (independent from the
+// eviction clockHand), flushes WAL-before-data ordering, and writes each
+// dirty page to disk without fsync — the checkpointer handles durability.
+// Returns the number of pages flushed.
+//
+// Called only by the bgwriter goroutine; must NOT be called by client
+// backends (use FlushAll/FlushAllPaced for checkpoint-level flushes).
+func (p *Pool) WriteDirtyPages(maxPages int) int {
+	if maxPages <= 0 {
+		return 0
+	}
+
+	// Snapshot up to maxPages dirty, unpinned slots under poolMu.
+	type victim struct {
+		idx int
+		tag BufferTag
+	}
+	p.poolMu.Lock()
+	n := len(p.slots)
+	victims := make([]victim, 0, maxPages)
+	start := p.bgwriterHand
+	for i := 0; i < n && len(victims) < maxPages; i++ {
+		idx := (start + i) % n
+		s := p.slots[idx]
+		if s.valid && s.dirty && s.pinCount == 0 {
+			victims = append(victims, victim{idx: idx, tag: s.tag})
+		}
+	}
+	// Advance bgwriterHand past the scanned range.
+	p.bgwriterHand = (start + n) % n
+	p.poolMu.Unlock()
+
+	// Flush each victim under its shared content lock (read lock is
+	// sufficient — we only need stable page bytes, not exclusive access).
+	written := 0
+	for _, v := range victims {
+		s := p.slots[v.idx]
+		s.contentMu.RLock()
+
+		// Re-check under poolMu that the slot is still the same dirty page.
+		p.poolMu.Lock()
+		stillValid := s.valid && s.tag == v.tag && s.dirty && s.pinCount == 0
+		p.poolMu.Unlock()
+
+		if stillValid {
+			if err := p.flushSlot(v.tag, s.page); err == nil {
+				// Clear dirty flag under poolMu; re-check tag to avoid
+				// a race where the slot was reused for a different block.
+				p.poolMu.Lock()
+				if s.tag == v.tag {
+					s.dirty = false
+				}
+				p.poolMu.Unlock()
+				written++
+			}
+		}
+		s.contentMu.RUnlock()
+	}
+	return written
 }
