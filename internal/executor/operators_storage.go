@@ -292,10 +292,18 @@ func extractScan(child planner.Node) (seq *planner.SeqScan, pred planner.Expr, i
 			return inner, c.Predicate, nil, nil
 		case *planner.IndexScan:
 			scan := &planner.SeqScan{Table: inner.Table}
-			combined := &planner.BinaryOp{
-				Op:    "AND",
-				Left:  c.Predicate,
-				Right: indexScanPredicate(inner),
+			idxPred := indexScanPredicate(inner)
+			var combined planner.Expr
+			if idxPred == nil {
+				// Range scan — no synthesised equality predicate;
+				// the Filter predicate alone is the full condition.
+				combined = c.Predicate
+			} else {
+				combined = &planner.BinaryOp{
+					Op:    "AND",
+					Left:  c.Predicate,
+					Right: idxPred,
+				}
 			}
 			return scan, combined, inner, nil
 		}
@@ -313,7 +321,18 @@ func extractScan(child planner.Node) (seq *planner.SeqScan, pred planner.Expr, i
 // ordinal. v0 indexes are single-column so Index.Columns[0] is
 // the relevant name; resolving against the IndexScan's parent
 // schema gives the correct output index for ColumnRef.
+//
+// Range scans (Key == nil) return nil — UPDATE/DELETE with range
+// predicates fall through to seq-scan, which is correct and safe.
 func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
+	if ix.Key == nil {
+		// Range scan: no equality predicate to synthesise.
+		// The caller (extractScan) will combine this nil with
+		// any Filter predicate already present. Returning nil
+		// here causes the update/delete path to fall through to
+		// a full seq-scan with Filter, which is always correct.
+		return nil
+	}
 	col := ix.Index.Columns[0]
 	out := ix.Output()
 	for i, sc := range out {

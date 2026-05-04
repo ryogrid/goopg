@@ -230,6 +230,12 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.Key != nil {
 			walkExprTree(n.Key, visit)
 		}
+		if n.LowKey != nil {
+			walkExprTree(n.LowKey, visit)
+		}
+		if n.HighKey != nil {
+			walkExprTree(n.HighKey, visit)
+		}
 	case *WindowAgg:
 		walkPlanExprs(n.Child, visit)
 		for _, p := range n.PartitionBy {
@@ -423,6 +429,12 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		c := *n
 		if n.Key != nil {
 			c.Key = cloneExprReplacingOuter(n.Key, replace)
+		}
+		if n.LowKey != nil {
+			c.LowKey = cloneExprReplacingOuter(n.LowKey, replace)
+		}
+		if n.HighKey != nil {
+			c.HighKey = cloneExprReplacingOuter(n.HighKey, replace)
 		}
 		return &c, nil
 	case *MultiHashJoin:

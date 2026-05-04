@@ -1182,6 +1182,10 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 }
 
 // RangeScan invokes fn for every (key, ptr) pair where lo ≤ key ≤ hi.
+// Either bound may be nil to indicate an open-ended range:
+//   - nil lo means no lower bound (scan from the leftmost key).
+//   - nil hi means no upper bound (scan through the rightmost key).
+//
 // fn returning false stops the scan; the returned error from fn aborts
 // with that error.
 //
@@ -1206,7 +1210,9 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 		// have returned a leaf that has since been split. Skip
 		// rightward until we land on a page whose key range
 		// covers `lo` (or we run out of pages).
-		if keyExceedsHighKey(op, lo) {
+		// When lo is nil, keyExceedsHighKey(op, nil) is always false
+		// (nil compares less than any real key), so we never skip — correct.
+		if lo != nil && keyExceedsHighKey(op, lo) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
@@ -1218,10 +1224,10 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 			return err
 		}
 		for _, it := range items {
-			if CompareKeys(it.key, lo) < 0 {
+			if lo != nil && CompareKeys(it.key, lo) < 0 {
 				continue
 			}
-			if CompareKeys(it.key, hi) > 0 {
+			if hi != nil && CompareKeys(it.key, hi) > 0 {
 				return nil
 			}
 			ok, err := fn(it.key, it.ptr)

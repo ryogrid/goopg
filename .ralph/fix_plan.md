@@ -722,7 +722,14 @@ today) and the MultiHashJoin operator (M0038) resolves all join keys.
         Q3, Q11 now IDENTICAL.  Only Q7 errored (EXTRACT date
         type).  `TestRunTPCHQueriesAgainstSyntheticData`: 22/22
         PASS.
-  - [ ] Secondary index scans to accelerate sequential-scan-dominated queries.
+  - [x] Secondary index scans to accelerate sequential-scan-dominated queries.
+        (landed 2026-05-04: `tryRangeIndexScan` in `internal/planner/planner.go`
+        extends `planIndexScanFromWhere` to emit `Filter(IndexScan{LowKey,HighKey})`
+        for `<`/`<=`/`>`/`>=`/`BETWEEN` predicates on indexed columns. B-tree
+        `RangeScan` updated to support nil lo/hi bounds. Key expressions may be
+        any constant expression (date arithmetic included). 4 planner tests + 3
+        executor integration tests. TPC-H parity identical=22 divergent=0 errored=0.
+        Design doc `docs/design/0039-0002-range-index-scan.md`.)
 
 ## Milestone 0040 — Correlated Subquery Optimization
 

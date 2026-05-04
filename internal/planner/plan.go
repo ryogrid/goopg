@@ -266,14 +266,22 @@ type SeqScan struct {
 func (n *SeqScan) Pos() int       { return n.pos }
 func (n *SeqScan) Output() Schema { return n.schema }
 
-// IndexScan probes a single-column B-tree index with an equality key.
-// v0 supports only `col = const` / `col = $N` shapes.
+// IndexScan probes a single-column B-tree index with an equality key
+// or a range of keys.
+//
+// Equality scan (col = key): Key is non-nil; LowKey and HighKey are nil.
+// Range scan (lo ≤ col ≤ hi): Key is nil; LowKey and/or HighKey are set.
+//   - LowKey non-nil means inclusive lower bound (col >= LowKey).
+//   - HighKey non-nil means inclusive upper bound (col <= HighKey).
+//   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
-	pos    int
-	Table  *catalog.Table
-	Index  *catalog.Index
-	Key    Expr
-	schema Schema
+	pos     int
+	Table   *catalog.Table
+	Index   *catalog.Index
+	Key     Expr  // non-nil for equality scan (LowKey==HighKey implied)
+	LowKey  Expr  // inclusive lower bound for range scan; nil = no lower bound
+	HighKey Expr  // inclusive upper bound for range scan; nil = no upper bound
+	schema  Schema
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }

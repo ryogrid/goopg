@@ -1914,7 +1914,8 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	tbl := ctx.bindings[0].table
 	b, ok := where.(*parser.BinaryOp)
 	if !ok || b.Op != "=" {
-		return nil, false, nil
+		// Not an equality predicate — try range index scan.
+		return tryRangeIndexScan(where, tbl, ctx, cat)
 	}
 	leftCol, lIsCol := b.Left.(*parser.ColumnRef)
 	rightCol, rIsCol := b.Right.(*parser.ColumnRef)
@@ -1990,6 +1991,200 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 		}
 	}
 	return nil
+}
+
+// collectAndConjuncts walks an AND chain and returns the leaf conjuncts.
+// A non-AND node returns a single-element slice containing itself.
+func collectAndConjuncts(e parser.Expr) []parser.Expr {
+	b, ok := e.(*parser.BinaryOp)
+	if !ok || b.Op != "AND" {
+		return []parser.Expr{e}
+	}
+	result := collectAndConjuncts(b.Left)
+	result = append(result, collectAndConjuncts(b.Right)...)
+	return result
+}
+
+// isConstantExpr reports whether the RESOLVED (planner.Expr) expression
+// contains no column references or subqueries — i.e., its value does not
+// depend on the current row.
+func isConstantExpr(e Expr) bool {
+	switch x := e.(type) {
+	case *ColumnRef, *OuterColumnRef:
+		return false
+	case *SubqueryExpr, *ExistsExpr, *InExpr:
+		return false
+	case *BinaryOp:
+		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
+	case *UnaryOp:
+		return isConstantExpr(x.Operand)
+	case *IntegerConst, *StringConst, *NumericConst,
+		*TypedStringLit, *IntervalLit,
+		*NullConst, *BooleanConst, *ParamRef:
+		return true
+	case *ExtractExpr:
+		return isConstantExpr(x.Source)
+	case *CaseExpr:
+		if x.Operand != nil && !isConstantExpr(x.Operand) {
+			return false
+		}
+		for _, w := range x.Whens {
+			if !isConstantExpr(w.When) || !isConstantExpr(w.Then) {
+				return false
+			}
+		}
+		if x.Else != nil && !isConstantExpr(x.Else) {
+			return false
+		}
+		return true
+	case *FuncCall:
+		for _, a := range x.Args {
+			if !isConstantExpr(a) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false // conservative
+	}
+}
+
+// flipRangeOp flips a comparison operator for the "key op col" → "col flippedOp key"
+// canonical form (column on the left).
+func flipRangeOp(op string) string {
+	switch op {
+	case "<":
+		return ">"
+	case "<=":
+		return ">="
+	case ">":
+		return "<"
+	case ">=":
+		return "<="
+	}
+	return op
+}
+
+// tryRangeIndexScan attempts to build a Filter(IndexScan{LowKey,HighKey})
+// from a WHERE expression containing one or more range predicates (< <= > >=)
+// on a single B-tree-indexed column. Returns (nil, false, nil) when no range
+// index is applicable.
+func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	conjuncts := collectAndConjuncts(where)
+
+	var chosenColName string
+	var chosenIdx *catalog.Index
+	var loKey Expr // inclusive lower bound
+	var hiKey Expr // inclusive upper bound
+
+	for _, conj := range conjuncts {
+		b, ok := conj.(*parser.BinaryOp)
+		if !ok {
+			continue
+		}
+		op := b.Op
+		if op != "<" && op != "<=" && op != ">" && op != ">=" {
+			continue
+		}
+
+		var colRef *parser.ColumnRef
+		var keyExpr parser.Expr
+		colOnLeft := false
+
+		if lc, ok := b.Left.(*parser.ColumnRef); ok {
+			colRef = lc
+			keyExpr = b.Right
+			colOnLeft = true
+		} else if rc, ok := b.Right.(*parser.ColumnRef); ok {
+			colRef = rc
+			keyExpr = b.Left
+			colOnLeft = false
+		} else {
+			continue
+		}
+
+		// Make sure the other side is NOT also a column ref
+		if colOnLeft {
+			if _, ok := b.Right.(*parser.ColumnRef); ok {
+				continue
+			}
+		} else {
+			if _, ok := b.Left.(*parser.ColumnRef); ok {
+				continue
+			}
+		}
+
+		// Flip op to canonical "col op key" form
+		canonOp := op
+		if !colOnLeft {
+			canonOp = flipRangeOp(op)
+		}
+
+		// Resolve column
+		resolvedCol, err := resolveColumnRef(colRef, ctx)
+		if err != nil {
+			continue
+		}
+		col, ok := resolvedCol.(*ColumnRef)
+		if !ok {
+			continue
+		}
+
+		// Ensure column is from the target table (not outer ref)
+		if chosenColName == "" {
+			// First indexed column: look up a B-tree index for it
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			if idx == nil {
+				continue
+			}
+			chosenColName = col.Name
+			chosenIdx = idx
+		} else if col.Name != chosenColName {
+			// Different column — ignore this conjunct (keep first column)
+			continue
+		}
+
+		// Resolve the key expression
+		resolvedKey, err := resolveExpr(keyExpr, ctx)
+		if err != nil {
+			continue
+		}
+		if !isConstantExpr(resolvedKey) {
+			continue
+		}
+
+		// Assign bounds based on canonical operator
+		switch canonOp {
+		case ">", ">=":
+			if loKey == nil {
+				loKey = resolvedKey
+			}
+		case "<", "<=":
+			if hiKey == nil {
+				hiKey = resolvedKey
+			}
+		}
+	}
+
+	if chosenIdx == nil {
+		return nil, false, nil
+	}
+
+	// Resolve the full WHERE predicate for the Filter node
+	fullPred, err := resolveExpr(where, ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	scan := &IndexScan{
+		pos:     where.Pos(),
+		Table:   tbl,
+		Index:   chosenIdx,
+		LowKey:  loKey,
+		HighKey: hiKey,
+		schema:  ctx.schema,
+	}
+	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {

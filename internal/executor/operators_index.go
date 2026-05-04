@@ -46,19 +46,38 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		return err
 	}
 
-	key, ok, err := o.lookupKey()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
-	}
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := btree.Open(ctx.Pool, idxRel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
-	err = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+
+	var loBytes, hiBytes []byte
+	if o.plan.Key != nil {
+		// Equality scan: probe key is both lo and hi.
+		key, ok, err := o.lookupKey()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		loBytes = key
+		hiBytes = key
+	} else {
+		// Range scan: evaluate lo/hi bounds independently.
+		lo, hiB, ok, err := o.lookupRangeBounds()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		loBytes = lo
+		hiBytes = hiB
+	}
+
+	scanFn := func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
 			return false, err
@@ -80,8 +99,9 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		o.rows = append(o.rows, row)
 		o.tids = append(o.tids, ptr)
 		return true, nil
-	})
-	if err != nil {
+	}
+
+	if err := tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	return nil
@@ -137,4 +157,54 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 		return nil, false, encErr
 	}
 	return key, true, nil
+}
+
+// lookupRangeBounds evaluates LowKey and HighKey for a range scan.
+// Returns (loKey, hiKey, ok, err). ok=false when a non-nil bound
+// evaluates to NULL (the scan should produce no rows). Either loKey
+// or hiKey may be nil for an open-ended range.
+func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, err error) {
+	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	if !found {
+		return nil, nil, false, &ExecError{
+			Code:    "XX000",
+			Pos:     o.plan.Pos(),
+			Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name),
+		}
+	}
+
+	if o.plan.LowKey != nil {
+		v, evalErr := evalExpr(o.plan.LowKey, nil, o.ctx)
+		if evalErr != nil {
+			return nil, nil, false, evalErr
+		}
+		if v.IsNull() {
+			// NULL lower bound → skip entire scan (no row can satisfy >= NULL)
+			return nil, nil, false, nil
+		}
+		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.LowKey.Pos())
+		if encErr != nil {
+			return nil, nil, false, encErr
+		}
+		loKey = k
+	}
+
+	if o.plan.HighKey != nil {
+		v, evalErr := evalExpr(o.plan.HighKey, nil, o.ctx)
+		if evalErr != nil {
+			return nil, nil, false, evalErr
+		}
+		if v.IsNull() {
+			// NULL upper bound → skip entire scan (no row can satisfy <= NULL)
+			return nil, nil, false, nil
+		}
+		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.HighKey.Pos())
+		if encErr != nil {
+			return nil, nil, false, encErr
+		}
+		hiKey = k
+	}
+
+	// ok = true as long as at least one bound is specified (the scan is valid)
+	return loKey, hiKey, true, nil
 }
