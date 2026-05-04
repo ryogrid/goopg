@@ -1265,20 +1265,18 @@ retained WAL backwards.
   - [x] No-checkpoint error diagnostic
   - [x] 5 unit tests covering all cases
 
-- [ ] M0045-0004: Integration test —
+- [x] M0045-0004: Integration test —
       `restart_after_retention_test.go`. Design doc
       `docs/design/0045-0004-integration-test-kill-and-restart.md`.
-  - [ ] New file `internal/server/restart_after_retention_test.go`.
-  - [ ] Phase 1: bring up goopg with a small segment size
-        (1 MiB), seed enough data to drive retention past
-        segment 0, force ≥ 2 checkpoints + retention.
-  - [ ] Phase 2: hard-kill the server (skip Close(); fsync the
-        data dir to mirror SIGKILL post-state).
-  - [ ] Phase 3: restart against the same data dir; assert all
-        seed rows are still readable.
-  - [ ] Test must FAIL on `master` (pre-fix) with the
-        `first segment is …, expected …` error and PASS after
-        M0045-0001 lands.
+      (landed 2026-05-04: `TestRestartAfterRetention` in
+      `internal/server/restart_after_retention_test.go`. WALSegmentSize
+      added to `initdb.OpenOptions` (threaded to `wal.Config.SegmentSize`).
+      1 MiB segments, 2 batches of 5 000 rows each, 2 explicit checkpoints
+      → retention removes segment 0 (confirmed in log). hardKill + restart
+      recovers all 10 000 rows. COPY data chunked at 256 KiB per frame to
+      stay within MaxRegularMessageLength. Wall time: ~1 s. Full
+      `go test ./internal/server/ ./internal/initdb/ ./internal/wal/`
+      green.)
 
 - [ ] M0045-0005: TPC-H end-to-end regression. Re-run the
       run-007 hard-kill scenario (HammerDB power test

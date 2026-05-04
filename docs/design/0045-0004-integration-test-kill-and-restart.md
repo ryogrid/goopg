@@ -1,6 +1,6 @@
 # 0045-0004 — Integration Test: Kill-and-Restart Regression
 
-**Status:** draft
+**Status:** landed 2026-05-04
 **Parent milestone:** M0045
 **Date:** 2026-05-04
 
