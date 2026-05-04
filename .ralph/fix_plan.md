@@ -674,7 +674,7 @@ Fix three ColumnRef-index alignment bugs in bushy DP / pushdown / unnest
 pipeline so TPC-H queries return correct row counts (9/22 return 0 rows
 today) and the MultiHashJoin operator (M0038) resolves all join keys.
 
-- [ ] M0039-0001: Planner column-index alignment fix. Design doc
+- [x] M0039-0001: Planner column-index alignment fix. Design doc
       `docs/design/0039-0001-planner-column-ref-fix.md`.
 
   - [x] Fix A: `pushOneConjunct` now accepts `JoinTypeInner` (already-
@@ -1003,14 +1003,26 @@ caused 91% GC overhead — the query never finished in practice.
         first-ever full SF=1 Q9 completion. Q20 still TIMEOUT
         but that is independent (M0040-0004 territory). Documented
         in `analysis/tpch-hammerdb-run-007.md`.
-  - [ ] M0043-0003: Q9 not yet under the
-        "single-digit minutes" target. Hot paths to revisit:
-        `datumKey()` string allocation per probe lookup
-        (~22 M calls for Q9), `evalExpr` per-call dispatch cost
-        for trivial BinaryOp shapes. A byte-coded fast path or
-        numeric-keyed hash would close the remaining gap. Tracked
-        as a separate optimization, **not** a blocker for
-        M0043-0002 acceptance.
+  - [x] M0043-0003: MHJ int64 fast-path hash tables (landed 2026-05-04).
+        Design doc `docs/design/0043-0003-mhj-int64-fastpath.md`.
+        - `datumToInt64Key(d Datum) (int64, bool)` — converts KindInt
+          and KindNumeric (scale=0 after normalisation) to int64 without
+          any allocation. Falls back to string key for other types.
+        - MHJ `Open()`: one-pass scan of build rows; if ALL keys are
+          int64-representable, populates `intHashTbls[i] map[int64][]Row`
+          and sets `hashTblIsInt[i]=true`.
+        - `initStepHelper()` probe: selects `intHashTbls` vs `hashTbls`
+          via `hashTblIsInt`; zero allocation for integer/scale-0-numeric
+          keys.
+        - Fixes double `datumKey()` call in original build loop.
+        - `canonicalNumericKey()` and `datumKey()` for KindTime/Interval
+          now use `strconv.AppendInt` instead of `fmt.Sprintf` for
+          the string-key fallback path.
+        - Expected impact: ~22M string allocations per Q9 SF=1 query
+          eliminated; GC pause overhead reduced significantly.
+        - Tests: `TestDatumToInt64Key` (10 sub-cases), 
+          `TestMultiHashInt64FastPath` (correctness + isInt assertion).
+          TPC-H parity identical=22 divergent=0 errored=0.
 
 ## Milestone 0042 — Align goopg I/O with upstream PostgreSQL
 

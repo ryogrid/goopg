@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/planner"
@@ -732,6 +733,36 @@ func nullRow(n int) Row {
 	return out
 }
 
+// datumToInt64Key converts d to an int64 hash key without any allocation.
+// Returns (key, true) when d is KindInt or a KindNumeric that normalises
+// to an integer (scale == 0 after stripping trailing zeros). Returns
+// (0, false) for NULL, bool, string, time, interval, and fractional
+// numerics. Used by the MHJ int64 fast path (M0043-0003).
+//
+// The int64 canonical form matches canonicalNumericKey: KindInt(v) and
+// KindNumeric{mantissa=v*10^n, scale=n} both produce the same int64
+// after normalisation, preserving cross-kind hash equality.
+func datumToInt64Key(d Datum) (int64, bool) {
+	switch d.Kind {
+	case KindInt:
+		return d.Int, true
+	case KindNumeric:
+		if d.NumericBig != nil {
+			return 0, false // overflow lane: not representable as int64
+		}
+		m, s := d.NumericMantissa, int(d.NumericScale)
+		for s > 0 && m%10 == 0 {
+			m /= 10
+			s--
+		}
+		if s == 0 {
+			return m, true
+		}
+		return 0, false // fractional numeric
+	}
+	return 0, false
+}
+
 func datumKey(d Datum) string {
 	switch d.Kind {
 	case KindNull:
@@ -754,9 +785,17 @@ func datumKey(d Datum) string {
 	case KindBytes:
 		return "x:" + string(d.Bytes)
 	case KindTime:
-		return fmt.Sprintf("t:%d", d.Time.UnixNano())
+		var buf [20]byte
+		b := append(buf[:0], 't', ':')
+		b = strconv.AppendInt(b, d.Time.UnixNano(), 10)
+		return string(b)
 	case KindInterval:
-		return fmt.Sprintf("v:%d:%d", d.IntervalMonths, d.IntervalDays)
+		var buf [32]byte
+		b := append(buf[:0], 'v', ':')
+		b = strconv.AppendInt(b, int64(d.IntervalMonths), 10)
+		b = append(b, ':')
+		b = strconv.AppendInt(b, int64(d.IntervalDays), 10)
+		return string(b)
 	}
 	return fmt.Sprintf("k:%d", d.Kind)
 }
@@ -779,5 +818,12 @@ func canonicalNumericKey(mantissa int64, scale int) string {
 		mantissa /= 10
 		scale--
 	}
-	return fmt.Sprintf("m:%d:%d", mantissa, scale)
+	// Use strconv.AppendInt instead of fmt.Sprintf to avoid format-string
+	// parsing overhead on the string-key hot path.
+	var buf [32]byte
+	b := append(buf[:0], 'm', ':')
+	b = strconv.AppendInt(b, mantissa, 10)
+	b = append(b, ':')
+	b = strconv.AppendInt(b, int64(scale), 10)
+	return string(b)
 }

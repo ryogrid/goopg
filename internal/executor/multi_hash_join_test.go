@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -302,4 +303,133 @@ func TestMultiHashJoinPushdownLeafFallback(t *testing.T) {
 	if got := len(op.probeFilters); got != 0 {
 		t.Errorf("probeFilters: got len=%d, want 0", got)
 	}
+}
+
+// TestDatumToInt64Key verifies the M0043-0003 fast-path key converter.
+func TestDatumToInt64Key(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Datum
+		want int64
+		ok   bool
+	}{
+		{"KindInt zero", Datum{Kind: KindInt, Int: 0}, 0, true},
+		{"KindInt positive", Datum{Kind: KindInt, Int: 42}, 42, true},
+		{"KindInt negative", Datum{Kind: KindInt, Int: -7}, -7, true},
+		{"KindInt MaxInt64", Datum{Kind: KindInt, Int: math.MaxInt64}, math.MaxInt64, true},
+		// KindNumeric scale=0: treated as integer
+		{"KindNumeric scale0", Datum{Kind: KindNumeric, NumericMantissa: 123, NumericScale: 0}, 123, true},
+		// KindNumeric with trailing zeros: strip to canonical
+		{"KindNumeric trailing zeros", Datum{Kind: KindNumeric, NumericMantissa: 1000, NumericScale: 3}, 1, true},
+		// KindNumeric fractional: not representable
+		{"KindNumeric fractional", Datum{Kind: KindNumeric, NumericMantissa: 15, NumericScale: 1}, 0, false},
+		// KindNull: not representable
+		{"KindNull", NullDatum, 0, false},
+		// KindBool: not representable
+		{"KindBool true", Datum{Kind: KindBool, Bool: true}, 0, false},
+		// KindString: not representable
+		{"KindString", Datum{Kind: KindString, String: "hello"}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := datumToInt64Key(tc.d)
+			if ok != tc.ok {
+				t.Fatalf("ok=%v want %v", ok, tc.ok)
+			}
+			if ok && got != tc.want {
+				t.Fatalf("key=%d want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMultiHashInt64FastPath verifies M0043-0003: a MHJ over int-keyed
+// tables activates hashTblIsInt=true and produces correct results via the
+// zero-allocation int64 probe path. Uses the same direct rowsOp pattern
+// as TestMultiHashJoinTwoTables to avoid DDL plumbing.
+func TestMultiHashInt64FastPath(t *testing.T) {
+	// A[id] (probe) ⨝ B[bid, fk_a] ⨝ C[cid, fk_b, cval]
+	// All keys are KindInt → triggers int64 fast path.
+	rowsA := []Row{
+		{Datum{Kind: KindInt, Int: 1}},
+		{Datum{Kind: KindInt, Int: 2}},
+		{Datum{Kind: KindInt, Int: 99}}, // no match in B
+	}
+	rowsB := []Row{
+		{Datum{Kind: KindInt, Int: 10}, Datum{Kind: KindInt, Int: 1}}, // fk_a=1
+		{Datum{Kind: KindInt, Int: 20}, Datum{Kind: KindInt, Int: 2}}, // fk_a=2
+	}
+	rowsC := []Row{
+		{Datum{Kind: KindInt, Int: 100}, Datum{Kind: KindInt, Int: 10}, Datum{Kind: KindInt, Int: 42}}, // fk_b=10
+		{Datum{Kind: KindInt, Int: 200}, Datum{Kind: KindInt, Int: 20}, Datum{Kind: KindInt, Int: 99}}, // fk_b=20
+	}
+
+	children := []Operator{
+		&rowsOp{rows: rowsA},
+		&rowsOp{rows: rowsB},
+		&rowsOp{rows: rowsC},
+	}
+	plan := &planner.MultiHashJoin{
+		Tables: []planner.Node{nil, nil, nil},
+		Keys: []planner.MultiHashKey{
+			{LeftTable: 0, LeftCol: 0, RightTable: 1, RightCol: 1}, // a.id = b.fk_a
+			{LeftTable: 1, LeftCol: 0, RightTable: 2, RightCol: 1}, // b.bid = c.fk_b
+		},
+		ProbeTable: 0,
+	}
+
+	op := newMultiHashJoinOp(plan, children)
+	op.schema = planner.Schema{
+		{Name: "aid", Type: catalog.Type{Name: "int8"}},
+		{Name: "bid", Type: catalog.Type{Name: "int8"}},
+		{Name: "fk_a", Type: catalog.Type{Name: "int8"}},
+		{Name: "cid", Type: catalog.Type{Name: "int8"}},
+		{Name: "fk_b", Type: catalog.Type{Name: "int8"}},
+		{Name: "cval", Type: catalog.Type{Name: "int8"}},
+	}
+	op.nulls = []Row{nullRow(1), nullRow(2), nullRow(3)}
+
+	ctx := &Context{}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify int64 fast path was activated for build tables (B=1, C=2).
+	for i, isInt := range op.hashTblIsInt {
+		if i == plan.ProbeTable {
+			continue
+		}
+		if !isInt {
+			t.Errorf("hashTblIsInt[%d]=false; int64 fast path not activated for integer-keyed table", i)
+		}
+	}
+
+	var results []Row
+	for {
+		row, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, copyRow(row))
+	}
+	op.Close()
+
+	// Expect 2 joined rows: (a=1⋈b=10⋈c=100) and (a=2⋈b=20⋈c=200).
+	if len(results) != 2 {
+		t.Fatalf("got %d rows, want 2; results=%v", len(results), results)
+	}
+	// Check cval column (index 5) for correctness.
+	cvals := map[int64]bool{results[0][5].Int: true, results[1][5].Int: true}
+	if !cvals[42] || !cvals[99] {
+		t.Errorf("expected cvals {42, 99}, got %v", cvals)
+	}
+}
+
+func copyRow(r Row) Row {
+	out := make(Row, len(r))
+	copy(out, r)
+	return out
 }

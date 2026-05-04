@@ -24,7 +24,13 @@ import (
 type multiHashJoinOp struct {
 	plan     *planner.MultiHashJoin
 	children []Operator
-	hashTbls []map[string][]Row // one per build child; multi-value
+	hashTbls []map[string][]Row // one per build child; multi-value (string-key path)
+	// M0043-0003: int64 fast-path hash tables. When hashTblIsInt[i] is
+	// true, intHashTbls[i] is used instead of hashTbls[i]. Eliminates
+	// string allocation on the probe hot path for int/numeric-scale-0
+	// join keys (~22M calls for Q9 at SF=1).
+	intHashTbls []map[int64][]Row // one per build child; used when keys are int64-representable
+	hashTblIsInt []bool           // hashTblIsInt[i] == true means intHashTbls[i] is active
 	probeOp  Operator
 	keySteps []keyStep // ordered lookup chain
 	filters  []planner.Expr
@@ -78,6 +84,8 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 	o.lazyProbeEOF = false
 	nTables := len(o.plan.Tables)
 	o.hashTbls = make([]map[string][]Row, nTables)
+	o.intHashTbls = make([]map[int64][]Row, nTables)
+	o.hashTblIsInt = make([]bool, nTables)
 	if o.nulls == nil || len(o.nulls) != nTables || len(o.nulls[0]) == 0 {
 		o.nulls = make([]Row, nTables)
 		for i := range o.nulls {
@@ -182,13 +190,39 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 				}
 			}
 		}
-		ht := make(map[string][]Row, len(rows))
-		for _, r := range rows {
-			if keyCol >= 0 && keyCol < len(r) {
-				ht[datumKey(r[keyCol])] = append(ht[datumKey(r[keyCol])], r)
+		// M0043-0003: probe whether ALL keys are int64-representable.
+		// One-pass scan; if any row fails, fall back to the string map.
+		allInt64 := len(rows) > 0
+		if allInt64 && keyCol >= 0 {
+			for _, r := range rows {
+				if keyCol < len(r) {
+					if _, ok := datumToInt64Key(r[keyCol]); !ok {
+						allInt64 = false
+						break
+					}
+				}
 			}
 		}
-		o.hashTbls[i] = ht
+		if allInt64 && keyCol >= 0 {
+			intHt := make(map[int64][]Row, len(rows))
+			for _, r := range rows {
+				if keyCol < len(r) {
+					k, _ := datumToInt64Key(r[keyCol])
+					intHt[k] = append(intHt[k], r)
+				}
+			}
+			o.intHashTbls[i] = intHt
+			o.hashTblIsInt[i] = true
+		} else {
+			ht := make(map[string][]Row, len(rows))
+			for _, r := range rows {
+				if keyCol >= 0 && keyCol < len(r) {
+					k := datumKey(r[keyCol])
+					ht[k] = append(ht[k], r)
+				}
+			}
+			o.hashTbls[i] = ht
+		}
 	}
 
 	// Open the probe child for streaming. The actual joining is
@@ -424,7 +458,16 @@ func (o *multiHashJoinOp) initStepHelper(s int) (bool, error) {
 		return false, nil
 	}
 	keyVal := o.lazyOut[srcOff+step.srcCol]
-	matches := o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
+	// M0043-0003: zero-allocation probe for int64-keyed hash tables.
+	var matches []Row
+	if o.hashTblIsInt[step.hashTblIndex] {
+		if k, ok := datumToInt64Key(keyVal); ok {
+			matches = o.intHashTbls[step.hashTblIndex][k]
+		}
+		// else: key not int64-representable (e.g. NULL) → no matches
+	} else {
+		matches = o.hashTbls[step.hashTblIndex][datumKey(keyVal)]
+	}
 	if len(matches) == 0 {
 		return false, nil
 	}
@@ -521,6 +564,8 @@ func (o *multiHashJoinOp) copyOut() Row {
 
 func (o *multiHashJoinOp) Close() error {
 	o.hashTbls = nil
+	o.intHashTbls = nil
+	o.hashTblIsInt = nil
 	o.nulls = nil
 	o.keySteps = nil
 	o.lazyOut = nil
