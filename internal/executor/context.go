@@ -15,6 +15,11 @@ import (
 // Open / Next call. It is constructed by the wire-protocol path at
 // statement start and torn down at statement end.
 type Context struct {
+	// Ctx, when non-nil, is the per-query cancellable context. Operators
+	// poll Ctx.Err() periodically to detect query cancellation
+	// (CancelRequest / psql Ctrl-C → SQLSTATE 57014).
+	Ctx context.Context
+
 	// Params holds bind values for $1, $2, ... — Params[i-1] is $i.
 	Params []Datum
 	// Now is the wall-clock value `current_timestamp` and friends
@@ -159,8 +164,12 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if c.Activity != nil && c.ActivityPID != "" {
 		c.Activity.WaitEventStart(c.ActivityPID, activity.WaitTypeLock, activity.WaitRelationLock)
 	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
 	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
-	err := c.LockMgr.Acquire(context.Background(), c.BackendID, tag, mode)
+	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
 	if c.Activity != nil && c.ActivityPID != "" {
 		c.Activity.WaitEventEnd(c.ActivityPID)
 	}
@@ -189,8 +198,12 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 	if c.LockMgr == nil {
 		return nil
 	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
 	tag := tupleLockTag(rel, ptr)
-	err := c.LockMgr.Acquire(context.Background(), c.BackendID, tag, mode)
+	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
 	if err == nil {
 		return nil
 	}

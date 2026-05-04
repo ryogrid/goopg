@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"strings"
@@ -280,7 +281,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 	}
 }
 
-func (s *Server) handleExecuteFrame(state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry) (*extendedMessageError, error) {
+func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry) (*extendedMessageError, error) {
 	pr := payloadReader{buf: payload}
 	portalName, err := pr.readCString()
 	if err != nil {
@@ -304,7 +305,7 @@ func (s *Server) handleExecuteFrame(state *extendedState, payload []byte, w *pro
 	}
 
 	if portal.Result == nil {
-		res, qerr := s.executeExtendedQuery(sess, portal.Statement.Query, portal.Params)
+		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params)
 		if qerr != nil {
 			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Routine: "server.handleExecuteFrame"}, nil
 		}
@@ -393,7 +394,7 @@ func (s *Server) handleCloseFrame(state *extendedState, payload []byte) *extende
 	}
 }
 
-func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
@@ -495,7 +496,7 @@ func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string
 		}
 	}
 	if s.cfg.hasStorage() {
-		return s.executeExtendedQueryViaExecutor(sess, trimmed, params)
+		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params)
 	}
 
 	if len(params) > 0 {

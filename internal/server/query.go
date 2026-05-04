@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -28,7 +29,7 @@ const (
 // Everything else still returns a feature-not-supported ErrorResponse.
 // Each statement is terminated with ReadyForQuery('I') so the client
 // can keep going.
-func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) error {
+func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) error {
 	q, err := extractCString(payload)
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -81,7 +82,7 @@ func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegist
 	}
 
 	if s.cfg.hasStorage() {
-		return s.dispatchSimpleQueryViaExecutor(w, sess, trimmed)
+		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed)
 	}
 
 	return s.writeQueryError(w, sqlstate.FeatureNotSupported,

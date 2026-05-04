@@ -136,6 +136,12 @@ func (o *seqScanOp) Next() (Row, error) {
 			if o.curBlock >= o.nBlocks {
 				return nil, EOF
 			}
+			// Poll for query cancellation at each new block boundary.
+			if o.ctx.Ctx != nil {
+				if err := o.ctx.Ctx.Err(); err != nil {
+					return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
 			if o.ring != nil {
 				// Ring strategy: cache hit → pool slot (with RLock);
 				// cache miss → private ring buffer (no pool eviction).

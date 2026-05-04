@@ -509,6 +509,11 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
+		if ctx.Ctx != nil {
+			if cerr := ctx.Ctx.Err(); cerr != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 
 		key, groupValues, err := o.evalGroupKey(row)
 		if err != nil {

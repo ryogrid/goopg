@@ -916,6 +916,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_date":
 		t := ctx.Now
 		return Datum{Kind: KindTime, Time: t.Truncate(24 * 60 * 60 * 1e9)}, nil
+	case "pg_sleep":
+		return evalPgSleep(x, row, ctx)
 	case "to_timestamp":
 		return evalToTimestamp(x, row, ctx)
 	case "to_date":
@@ -970,6 +972,47 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // NULL inputs propagate to NULL output.
 //
 // The 2-argument form returns the substring from `from` to the end of
+// evalPgSleep implements pg_sleep(seconds). Sleeps for the given
+// duration while honouring query cancellation via ctx.Ctx.
+func evalPgSleep(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 1 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep(double precision) requires exactly 1 argument"}
+	}
+	secs, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if secs.IsNull() {
+		return NullDatum, nil
+	}
+	var d time.Duration
+	switch secs.Kind {
+	case KindInt:
+		d = time.Duration(secs.Int) * time.Second
+	case KindNumeric:
+		f, err := strconv.ParseFloat(secs.Format(), 64)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep: invalid numeric value"}
+		}
+		d = time.Duration(f * float64(time.Second))
+	default:
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep argument must be numeric"}
+	}
+	if d < 0 {
+		d = 0
+	}
+	if ctx.Ctx != nil {
+		select {
+		case <-time.After(d):
+		case <-ctx.Ctx.Done():
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	} else {
+		time.Sleep(d)
+	}
+	return NullDatum, nil
+}
+
 // the string. Negative `from` values are clamped per upstream:
 // `substr('abcdef', -2, 4)` returns `'a'` (start at position 1, length
 // becomes 1 after subtracting the negative offset). For a v0 simple

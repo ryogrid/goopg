@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,7 +34,7 @@ type copyInState struct {
 	mgr      *mvcc.Manager
 }
 
-func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) (*copyInState, error) {
+func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) (*copyInState, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -44,7 +45,7 @@ func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.Session
 	}
 	_, matchable, upper, empty := normalizeSimpleQuery(q)
 	if empty || !strings.HasPrefix(upper, "COPY ") {
-		if err := s.handleQuery(w, sess, payload); err != nil {
+		if err := s.handleQuery(ctx, w, sess, payload); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -55,7 +56,7 @@ func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.Session
 	// (42P01, 42703, 42601, 0A000); the wire layer just forwards
 	// them.
 	if s.cfg.hasStorage() {
-		st, err := s.dispatchCopyViaExecutor(w, matchable)
+		st, err := s.dispatchCopyViaExecutor(ctx, w, matchable)
 		if err != nil {
 			return nil, err
 		}
@@ -86,7 +87,7 @@ func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.Session
 // dispatchCopyViaExecutor parses + plans the COPY statement and
 // either streams rows out (CopyTo) or arms the connection's CopyIn
 // frame consumer (CopyFrom).
-func (s *Server) dispatchCopyViaExecutor(w *protocol.FrameWriter, sql string) (*copyInState, error) {
+func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string) (*copyInState, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.SyntaxError, err.Error()); err != nil {
@@ -135,23 +136,24 @@ func (s *Server) dispatchCopyViaExecutor(w *protocol.FrameWriter, sql string) (*
 		}
 		return nil, nil
 	}
-	ctx := executor.NewContext()
-	ctx.Pool = s.cfg.Pool
-	ctx.Catalog = s.cfg.Catalog
-	ctx.TxnMgr = s.cfg.TxnMgr
-	ctx.Tx = tx
-	ctx.Snap = snap
+	ectx := executor.NewContext()
+	ectx.Ctx = ctx
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
 
 	switch plan.Direction {
 	case planner.CopyTo:
-		err := s.runCopyTo(w, ctx, plan)
+		err := s.runCopyTo(w, ectx, plan)
 		_ = s.cfg.TxnMgr.Commit(tx)
 		if err != nil {
 			return nil, err
 		}
 		return nil, nil
 	case planner.CopyFrom:
-		from, err := executor.NewCopyFromExecutor(ctx, plan)
+		from, err := executor.NewCopyFromExecutor(ectx, plan)
 		if err != nil {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			if err := s.writeQueryError(w, execErrCode(err), execErrMsg(err)); err != nil {

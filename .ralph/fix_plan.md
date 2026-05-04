@@ -1580,11 +1580,19 @@ checkpoint-pacing gap in `ref-004-checkpointer.md`.
 See `docs/milestones/0049-protocol-parity.md`. Closes the protocol
 gaps catalogued in `docs/reference/ref-021-protocol.md`.
 
-- [ ] M0049-0001: Query cancellation (`CancelRequest`). Design doc
-      `docs/design/0049-0001-query-cancellation.md`. Magic-protocol-
-      code listener (`80877102`); per-session BackendKeyData
-      `(pid, secretKey)`; executor poll points; SQLSTATE 57014. DoD:
-      psql Ctrl-C against `pg_sleep(60)` returns within 200 ms.
+- [x] M0049-0001: Query cancellation (`CancelRequest`). Design doc
+      `docs/design/0049-0001-query-cancellation.md`. (landed 2026-05-05:
+      `backendCancelRegistry` maps pid→{secretKey, queryCancel}. In
+      `handleStartup`, `CancelRequestCode` parses 8-byte payload (pid+key)
+      and calls `cancelReg.cancelQuery`. In `runPostStartupLoop`, each
+      MsgQuery/MsgExecute creates per-query `context.WithCancel(connCtx)`,
+      stored in entry for cancel-request dispatch. `executor.Context.Ctx`
+      field threads context to operators. Poll in `seqScanOp.Next()` (per
+      block) and `aggregateOp.Open()` (per row). `acquireRelLock` /
+      `acquireTupleLock` use `ctx.Ctx` instead of `context.Background()`.
+      New `pg_sleep(seconds)` function waits on `select{time.After, Ctx.Done}`.
+      DoD test `TestE2E_QueryCancellation_DoDPgSleep`: `pg_sleep(60)` + 100ms
+      context cancel → SQLSTATE 57014 in ~101ms (limit 200ms).)​
 - [ ] M0049-0002: Full ErrorResponse fields. Design doc
       `docs/design/0049-0002-error-response-fields.md`. Encoder
       grows D/H/P/W/s/t/c/F/L/R fields; parser threads byte offset

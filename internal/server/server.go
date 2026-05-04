@@ -251,10 +251,12 @@ type Server struct {
 	ready    chan struct{} // closed once listener is bound
 	addr     atomic.Pointer[net.TCPAddr]
 
-	connWG    sync.WaitGroup
-	nextPID   atomic.Uint32
+	connWG        sync.WaitGroup
+	nextPID       atomic.Uint32
 	nextBackendID atomic.Uint32
-	closeOnce sync.Once
+	closeOnce     sync.Once
+
+	cancelReg *backendCancelRegistry
 
 	// controlListener is the operator-facing command socket; nil
 	// when DataDir is unset (in-process tests).
@@ -266,8 +268,9 @@ type Server struct {
 func New(cfg Config) *Server {
 	cfg.defaults()
 	s := &Server{
-		cfg:   cfg,
-		ready: make(chan struct{}),
+		cfg:       cfg,
+		ready:     make(chan struct{}),
+		cancelReg: newCancelRegistry(),
 	}
 	s.nextPID.Store(0)
 	return s
@@ -581,12 +584,21 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// update pg_stat_activity state.
 	_ = sess.Set("goopg.backend_pid", pidStr, false)
 
-	if err := s.sendStartupReply(w, sess, pid); err != nil {
+	// Generate and register cancel credentials for this connection.
+	secret, err := newSecretKey()
+	if err != nil {
+		logger.Info("secret key generation failed", "err", err)
+		return
+	}
+	cancelEntry := s.cancelReg.register(pid, secret)
+	defer s.cancelReg.unregister(pid)
+
+	if err := s.sendStartupReply(w, sess, pid, secret); err != nil {
 		logger.Info("startup reply failed", "err", err)
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, r, w, sess, logger, isReplication)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -713,8 +725,16 @@ func (s *Server) handleStartup(r *protocol.FrameReader, w *protocol.FrameWriter)
 			}
 			continue
 		case protocol.CancelRequestCode:
-			// v0 has no backends to cancel; close silently per protocol.
-			return nil, errors.New("cancel request received (v0 ignores)")
+			// Dispatch cancel to the target backend and close silently.
+			// The protocol spec says: after sending CancelRequest the
+			// client closes the connection immediately; the server closes
+			// its end silently without any reply.
+			if len(payload) == 8 {
+				targetPID := binary.BigEndian.Uint32(payload[0:4])
+				targetSecret := binary.BigEndian.Uint32(payload[4:8])
+				s.cancelReg.cancelQuery(targetPID, targetSecret)
+			}
+			return nil, errors.New("cancel request handled")
 		}
 		if version != protocol.ProtocolVersion3_0 {
 			major, minor := version>>16, version&0xFFFF
@@ -735,16 +755,13 @@ func (s *Server) handleStartup(r *protocol.FrameReader, w *protocol.FrameWriter)
 // sendStartupReply emits the post-auth portion of the startup sequence:
 // the ParameterStatus block (driven by the GUC registry), BackendKeyData,
 // and ReadyForQuery. AuthenticationOk has already been written by
-// checkAuth at this point.
-func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionRegistry, pid uint32) error {
+// checkAuth at this point. secret must be the same value registered in
+// the cancel registry so that CancelRequest can look up the backend.
+func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionRegistry, pid, secret uint32) error {
 	for _, kv := range sess.ReportableVariables() {
 		if err := w.WriteParameterStatus(kv.Name, kv.Value); err != nil {
 			return err
 		}
-	}
-	secret, err := newSecretKey()
-	if err != nil {
-		return err
 	}
 	if err := w.WriteBackendKeyData(pid, secret); err != nil {
 		return err
@@ -759,7 +776,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
 	extended := newExtendedState()
 	var copyIn *copyInState
 	for {
@@ -797,6 +814,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 		case protocol.MsgTerminate:
 			return
 		case protocol.MsgQuery:
+			// Create a per-query cancellable context and register its
+			// cancel function so an incoming CancelRequest can fire it.
+			queryCtx, queryCancel := context.WithCancel(ctx)
+			entry.setQueryCancel(queryCancel)
+
 			// Replication-mode connections route MsgQuery through the
 			// replication-command dispatcher instead of the regular
 			// SQL path. The dispatcher recognises IDENTIFY_SYSTEM /
@@ -806,6 +828,8 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 			// like SHOW still work for diagnostics.
 			if isReplication {
 				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload)
+				entry.clearQueryCancel()
+				queryCancel()
 				if err != nil {
 					logger.Debug("replication command write error", "err", err)
 					return
@@ -814,7 +838,9 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 					break
 				}
 			}
-			nextCopyIn, err := s.handleQueryOrCopy(w, sess, f.Payload)
+			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload)
+			entry.clearQueryCancel()
+			queryCancel()
 			if err != nil {
 				logger.Debug("handleQueryOrCopy write error", "err", err)
 				return
@@ -856,7 +882,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 				extended.syncRequired = true
 			}
 		case protocol.MsgExecute:
-			em, err := s.handleExecuteFrame(extended, f.Payload, w, sess)
+			queryCtx, queryCancel := context.WithCancel(ctx)
+			entry.setQueryCancel(queryCancel)
+			em, err := s.handleExecuteFrame(queryCtx, extended, f.Payload, w, sess)
+			entry.clearQueryCancel()
+			queryCancel()
 			if err != nil {
 				return
 			}

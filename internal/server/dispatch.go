@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -36,7 +37,7 @@ func maybeForceGCAfterCommit() {}
 //
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
-func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
+func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		if tag, ok := compatNoopCommandTag(sql); ok {
@@ -80,22 +81,23 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
-	ctx := executor.NewContext()
-	ctx.Pool = s.cfg.Pool
-	ctx.Catalog = s.cfg.Catalog
-	ctx.TxnMgr = s.cfg.TxnMgr
-	ctx.Tx = tx
-	ctx.Snap = snap
-	ctx.Checkpointer = s.cfg.Checkpointer
-	ctx.StatsTarget = sessionStatsTarget(sess)
-	ctx.WorkMem = sessionWorkMem(sess)
-	ctx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
-	ctx.FSM = s.cfg.FSM
-	ctx.VM = s.cfg.VM
-	ctx.FreezeMinAge = sessionFreezeMinAge(sess)
-	ctx.PubSub = s.cfg.PubSub
-	ctx.LockMgr = s.cfg.LockMgr
-	ctx.BackendID = backendID
+	ectx := executor.NewContext()
+	ectx.Ctx = ctx
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.Checkpointer = s.cfg.Checkpointer
+	ectx.StatsTarget = sessionStatsTarget(sess)
+	ectx.WorkMem = sessionWorkMem(sess)
+	ectx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
+	ectx.FSM = s.cfg.FSM
+	ectx.VM = s.cfg.VM
+	ectx.FreezeMinAge = sessionFreezeMinAge(sess)
+	ectx.PubSub = s.cfg.PubSub
+	ectx.LockMgr = s.cfg.LockMgr
+	ectx.BackendID = backendID
 
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {
@@ -114,9 +116,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 		if err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
-		ctx.Snap = snap2
+		ectx.Snap = snap2
 
-		if err := s.executeOneSimpleStmt(w, ctx, stmt); err != nil {
+		if err := s.executeOneSimpleStmt(w, ectx, stmt); err != nil {
 			return err
 		}
 	}
