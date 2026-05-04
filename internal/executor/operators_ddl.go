@@ -949,6 +949,73 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 
 // --- DDL catalog heap sync (M0030-0001 Phase 4) ---
 
+// stampCatalogRows pins every page of rel and sets xmax on each live tuple
+// (xmin≠0, xmax=0) for which match returns true. Used by
+// deleteCatalogRowsForOID to physically mark rolled-back catalog rows as
+// deleted so the startup scan in loadUserTablesFromHeap skips them.
+func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.TransactionID, match func(data []byte) bool) {
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil || nBlocks == 0 {
+		return
+	}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			continue
+		}
+		pinned.Lock()
+		page := pinned.Page()
+		count, err := storage.PageLinePointerCount(page)
+		if err == nil {
+			for lineNo := uint16(1); lineNo <= uint16(count); lineNo++ {
+				ht, err := storage.PageGetHeapTuple(page, lineNo)
+				if err != nil {
+					continue
+				}
+				if ht.Header.Xmin == storage.InvalidTransactionID {
+					continue
+				}
+				if ht.Header.Xmax != storage.InvalidTransactionID {
+					continue
+				}
+				if !match(ht.Data) {
+					continue
+				}
+				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
+					continue
+				}
+				_ = markHeapDeleteDirty(ctx.Pool, pinned, rel, blk, lineNo, xmax)
+			}
+		}
+		pinned.Unlock()
+		ctx.Pool.Unpin(pinned)
+	}
+}
+
+// deleteCatalogRowsForOID stamps xmax on all live pg_class and pg_attribute
+// rows for relOID. Called from rollbackDDLCreate so that after a crash+restart
+// the startup catalog loader's xmax==0 filter skips the rolled-back rows.
+func deleteCatalogRowsForOID(ctx *Context, relOID uint32, xmax storage.TransactionID) {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
+		row, err := catalog.DecodePGClassRow(data)
+		return err == nil && row.OID == relOID
+	})
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
+		row, err := catalog.DecodePGAttributeRow(data)
+		return err == nil && row.AttRelID == relOID
+	})
+}
+
 // catalogHeapSyncAvailable returns true when the M0030-0001 system catalog
 // heap relfiles are accessible and DDL operations should write rows to
 // pg_class / pg_attribute. The proxy indicator is whether pg_attribute is

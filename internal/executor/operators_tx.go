@@ -112,12 +112,9 @@ func (o *transactionOp) execRollback() error {
 }
 
 // rollbackDDLCreate undoes one CREATE TABLE or CREATE INDEX by removing the
-// catalog entry and physical relfile. The physical file removal mirrors what
-// execDropTable does — no WAL record is needed here since the XID stamped on
-// the pg_class/pg_attribute rows is now aborted, making those rows invisible
-// via MVCC in subsequent sessions. The startup scan's `xmax == 0` filter
-// will still see the aborted row until VACUUM removes it; this is a known
-// limitation pending pg_xact persistence (M0030-0006 Phase 2).
+// catalog entry, the physical relfile, and — when the M0030 catalog heap
+// substrate is available — stamping xmax on the pg_class/pg_attribute rows so
+// the startup loader's xmax==0 filter skips them after a crash+restart.
 func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	rel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
@@ -132,6 +129,12 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	if ctx.Pool != nil {
 		ctx.Pool.InvalidateRel(rel)
 		_ = ctx.Pool.Manager().DropRelation(rel)
+	}
+	// Stamp xmax on the pg_class / pg_attribute rows so that after a
+	// crash+restart the heap loader's xmax==0 filter skips them. Without this,
+	// WAL replay restores the HeapInsert records and the table reappears.
+	if catalogHeapSyncAvailable(ctx) && ctx.Tx.XID != storage.InvalidTransactionID {
+		deleteCatalogRowsForOID(ctx, entry.RelOID, ctx.Tx.XID)
 	}
 }
 

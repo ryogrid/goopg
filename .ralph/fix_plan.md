@@ -361,7 +361,16 @@ loading switch.**
       execCreateTable and createBTreeIndex record entries via RecordDDLCreate.
       5 tests: BEGIN+ROLLBACK removes table, BEGIN+COMMIT keeps it, index rollback,
       multiple creates rollback, auto-commit.
-- [ ] make crash+restart not to show rolled-back tables.
+- [x] make crash+restart not to show rolled-back tables.
+      (landed 2026-05-04: rollbackDDLCreate now calls deleteCatalogRowsForOID
+      which stamps xmax on all live pg_class/pg_attribute rows for the
+      rolled-back OID via stampCatalogRows. After WAL replay on restart,
+      loadUserTablesFromHeap's xmax==0 filter correctly skips those rows.
+      stampCatalogRows pins each catalog page under the page lock, scans
+      live tuples (xmin≠0, xmax=0), calls PageSetHeapTupleXmax + markHeapDeleteDirty.
+      New test TestRollbackedTableNotVisibleAfterRestart: BEGIN; CREATE TABLE
+      rollback_ghost; ROLLBACK; Close; Re-Open → table absent. All executor/
+      initdb/wal/storage tests pass.)
 - [ ] pg_xact commit log.
 
 ## Milestone 0031 — TPC-H Q2 Memory Estimation & GC Leak Code Review
@@ -1382,6 +1391,19 @@ retained WAL backwards.
   than what fits in a single agent invocation.
 - Every non-trivial subsystem must land alongside (or just before) a design
   doc under `docs/design/`. The spec treats this as a hard requirement.
+
+## Maintenance Fixes
+
+- [x] Fix `TestFoundationSeqScanFilterJoin` test 7 stale expectation (2026-05-04).
+      rows[0][0] was expected to be "alpha" but alpha's t3.qty=100 is filtered
+      by WHERE t3.qty>150; correct first row is [beta 200]. Stale from before
+      M0039/M0041 fixed ColumnRef alignment for ≥3-table joins. Row-count check
+      promoted from t.Logf to t.Fatalf. File: `internal/testutil/tpch/foundation_test.go`.
+
+- [x] Silence `tmp/` build errors under `go test ./...` (2026-05-04).
+      tmp/ utility scripts (find_wal_record.go, tuple_size.go, walprobe_main.go)
+      all declared `package main`, causing "main redeclared" errors. Added
+      `//go:build ignore` to each. (Note: tmp/ is in .gitignore; change is local.)
 
 ## Completed
 

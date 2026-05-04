@@ -235,3 +235,49 @@ func TestAutoCommitDDLSurvivesImplicitTransaction(t *testing.T) {
 		t.Error("auto_tbl missing after auto-commit CREATE TABLE")
 	}
 }
+
+// TestRollbackedTableNotVisibleAfterRestart is the regression test for the
+// crash+restart scenario: BEGIN; CREATE TABLE; ROLLBACK followed by a server
+// restart must not re-surface the rolled-back table via the heap catalog loader.
+//
+// Before the fix, rollbackDDLCreate only cleaned up the in-memory catalog and
+// deleted the relfile, but left the pg_class/pg_attribute rows on disk with
+// xmax=0. After WAL replay on restart, loadUserTablesFromHeap found those rows
+// (xmin≠0, xmax=0) and re-registered the table.
+//
+// After the fix, rollbackDDLCreate stamps xmax on those rows via
+// deleteCatalogRowsForOID so the startup scan skips them.
+func TestRollbackedTableNotVisibleAfterRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 1: BEGIN; CREATE TABLE rollback_ghost; ROLLBACK then close.
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newTxnConn(rt1, t)
+	conn.run("BEGIN")
+	conn.run("CREATE TABLE rollback_ghost (id int4, val text)")
+	conn.run("ROLLBACK")
+
+	// Sanity: table must not be visible in the live catalog.
+	if _, ok := rt1.Catalog.LookupTable(parser.ObjectName{Name: "rollback_ghost"}); ok {
+		t.Error("rollback_ghost still in catalog after ROLLBACK — transactional DDL broken")
+	}
+	rt1.Close()
+
+	// Phase 2: re-open (simulating crash recovery + WAL replay).
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatalf("re-open after rollback: %v", err)
+	}
+	defer rt2.Close()
+
+	// Phase 3: rolled-back table must NOT reappear after restart.
+	if _, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "rollback_ghost"}); ok {
+		t.Error("rollback_ghost reappeared after restart — catalog heap rows not stamped on rollback")
+	}
+}
