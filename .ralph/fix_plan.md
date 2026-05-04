@@ -330,8 +330,14 @@ loading switch.**
       mutations (pg_class/pg_attribute inserts) are already WAL-logged via
       RecordKindHeapInsert — no separate RecordKindCatalogInsert needed.
       docs/design/README.md updated with M0030-0001 through 0030-0006 entries.
-- [ ] WAL-based catalog recovery and checkpoint integration (M0030-0003).
+- [x] WAL-based catalog recovery and checkpoint integration (M0030-0003).
       Design doc `docs/design/0030-0003-catalog-recovery.md`.
+      **Landed 2026-05-04**: OIDToTypeName + TryRegisterUserTable (catalog).
+      loadUserTablesFromHeap in Open() scans pg_class/pg_attribute heap pages
+      after WAL replay to supplement JSON catalog load. User tables created after
+      last SaveCatalog (crash scenario) are recovered from heap.
+      TestCreateTableSurvivesRestartViaCatalogHeap: delete JSON → restart → table
+      present from heap. JSON decommission deferred to M0030-0004.
 - [ ] JSON-snapshot to heap-table migration gate (M0030-0004).
       Design doc `docs/design/0030-0004-catalog-migration-gate.md`.
 - [ ] pg_attribute / pg_type SQL surface and OID resolution (M0030-0005).

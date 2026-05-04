@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/activity"
@@ -397,6 +398,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: system catalog load: %w", err)
+	}
+	// Supplement the catalog with user tables found in the pg_class/pg_attribute
+	// heap files (M0030-0003). If a table was created after the last JSON
+	// snapshot (e.g. crash before SaveCatalog), this path recovers it from the
+	// WAL-replayed heap pages. Idempotent: tables already loaded from JSON are
+	// skipped. Safe on old clusters — skips if pg_class relfile is absent.
+	if err := loadUserTablesFromHeap(mgr, cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
 	}
 
 	// Replication-slot registry. The retention path on the
@@ -839,6 +851,143 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 		}
 	}
 
+	return nil
+}
+
+// loadUserTablesFromHeap supplements the in-memory catalog with user tables
+// found in the pg_class and pg_attribute heap relfiles (M0030-0003). It scans
+// all live (xmin≠0, xmax=0) pg_class rows with relkind='r' and OID ≥ FirstUserOID,
+// then collects their column definitions from pg_attribute rows, and calls
+// TryRegisterUserTable for each.
+//
+// This is the primary crash-recovery path for user tables: if the server crashes
+// after DDL-sync writes to the heap but before SaveCatalog() writes the JSON,
+// this scan recovers the new tables from the WAL-replayed heap pages on the
+// next startup.
+//
+// The scan is safe on old clusters (pre-M0030-0001) that have no pg_class relfile
+// and is idempotent with the JSON snapshot path (tables already loaded from JSON
+// are skipped via TryRegisterUserTable's exists-check).
+func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	nClassBlocks, err := mgr.NBlocks(classRel)
+	if err != nil || nClassBlocks == 0 {
+		return nil // pg_class absent or empty — old cluster or fresh initdb
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+
+	// Pass 1: collect user table rows from pg_class.
+	var userTableRows []catalog.PGClassRow
+	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
+		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
+			return fmt.Errorf("loadUserTablesFromHeap: read pg_class blk %d: %w", blk, err)
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID {
+				continue // not a real tuple
+			}
+			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue // deleted
+			}
+			row, err := catalog.DecodePGClassRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if row.RelKind == "r" && row.OID >= catalog.FirstUserOID {
+				userTableRows = append(userTableRows, row)
+			}
+		}
+	}
+	if len(userTableRows) == 0 {
+		return nil // no user tables in heap
+	}
+
+	// Pass 2: collect pg_attribute rows for user tables.
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	nAttrBlocks, err := mgr.NBlocks(attrRel)
+	if err != nil || nAttrBlocks == 0 {
+		return nil // no attributes — can't reconstruct columns
+	}
+
+	attrByRelOID := map[uint32][]catalog.PGAttributeRow{}
+	for blk := storage.BlockNumber(0); blk < nAttrBlocks; blk++ {
+		if err := mgr.ReadBlock(attrRel, blk, page); err != nil {
+			return fmt.Errorf("loadUserTablesFromHeap: read pg_attribute blk %d: %w", blk, err)
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID {
+				continue
+			}
+			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			row, err := catalog.DecodePGAttributeRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID {
+				attrByRelOID[row.AttRelID] = append(attrByRelOID[row.AttRelID], row)
+			}
+		}
+	}
+
+	// Pass 3: register each user table with its heap-recovered column definitions.
+	for _, tr := range userTableRows {
+		attrRows := attrByRelOID[tr.OID]
+		sort.Slice(attrRows, func(i, j int) bool {
+			return attrRows[i].AttNum < attrRows[j].AttNum
+		})
+
+		cols := make([]catalog.Column, len(attrRows))
+		for i, ar := range attrRows {
+			cols[i] = catalog.Column{
+				Name:    ar.AttName,
+				Type:    catalog.Type{Name: catalog.OIDToTypeName(ar.AttTypID)},
+				NotNull: ar.AttNotNull,
+				Ordinal: i,
+			}
+		}
+
+		schema := ""
+		if tr.RelNamespace == catalog.PGCatalogNamespaceOID {
+			schema = "pg_catalog"
+		}
+
+		tbl := &catalog.Table{
+			Schema:  schema,
+			Name:    tr.RelName,
+			Columns: cols,
+			OID:     tr.OID,
+		}
+		if err := cat.TryRegisterUserTable(tbl); err != nil {
+			return fmt.Errorf("loadUserTablesFromHeap: register %q: %w", tr.RelName, err)
+		}
+	}
 	return nil
 }
 

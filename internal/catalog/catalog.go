@@ -429,6 +429,33 @@ func (c *InMemory) registerSystemTables() {
 	c.tables["pg_catalog.pg_tables"] = pgTables
 }
 
+// TryRegisterUserTable installs a user table recovered from the pg_class/
+// pg_attribute heap scan during startup (M0030-0003). Unlike CreateTable,
+// it preserves the original OID from the heap row and is idempotent:
+// if a table with the same qualified name already exists (e.g. loaded from
+// the JSON snapshot), the call is a no-op and returns nil. nextOID is
+// advanced past tbl.OID to prevent future allocations from colliding with
+// existing heap-stored relations.
+func (c *InMemory) TryRegisterUserTable(tbl *Table) error {
+	if tbl == nil {
+		return fmt.Errorf("TryRegisterUserTable: nil table")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
+	if _, exists := c.tables[k]; exists {
+		return nil // already registered — idempotent
+	}
+	for i := range tbl.Columns {
+		tbl.Columns[i].Ordinal = i
+	}
+	c.tables[k] = tbl
+	if tbl.OID >= c.nextOID {
+		c.nextOID = tbl.OID + 1
+	}
+	return nil
+}
+
 // RegisterRealTable installs a heap-backed system catalog table.
 // Used at startup to register pg_type and pg_attribute after their
 // relfiles are confirmed present on disk. The table must have

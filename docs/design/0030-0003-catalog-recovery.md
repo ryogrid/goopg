@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | draft                          |
+| Status      | accepted (landed 2026-05-04)   |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -49,3 +49,45 @@ We will add a new counter to `pg_stat_wal_io` to track the number of catalog-rel
 ### Manual Verification
 - Inspect the server logs during startup to ensure WAL replay is correctly processing `RecordKindCatalog*` records.
 - Verify that `pg_stat_wal_io` shows non-zero counts for `catalog_records` after DDL operations.
+
+## What Landed (2026-05-04)
+
+**Scope**: Supplement JSON catalog load with heap scan for crash-recovered user tables.
+Full JSON decommission (M0030-0004 migration gate) is deferred.
+
+### `internal/catalog/codec.go`
+- `OIDToTypeName(oid uint32) string` — inverse of `TypeNameToOID`, maps pg_type OIDs
+  back to goopg type name strings for column reconstruction.
+
+### `internal/catalog/catalog.go`
+- `TryRegisterUserTable(tbl *Table) error` — installs a user table recovered from
+  heap with its original OID. Idempotent: if the table is already in the catalog
+  (e.g. loaded from JSON), returns nil without modifying state. Advances `nextOID`
+  past `tbl.OID` to prevent future OID collisions.
+
+### `internal/initdb/open.go`
+- `loadUserTablesFromHeap(mgr, cat)` — called in `Open()` after
+  `loadSystemCatalogsIfPresent`. Three-pass scan:
+  1. pg_class blocks → collect rows with `relkind='r'` and `OID >= FirstUserOID`
+  2. pg_attribute blocks → collect column rows by `attrelid`
+  3. For each user table: sort columns by attnum, build `catalog.Table`, call
+     `TryRegisterUserTable`
+  Visibility rule: `xmin ≠ 0 && xmax = 0` (committed, not deleted — conservative
+  for startup, full MVCC deferred to M0030-0006).
+  Safe on old clusters (no pg_class relfile → immediate return).
+  Ordering relative to JSON load: JSON loads first, heap supplements missing tables.
+
+### Effect
+After `goopg init` + DDL + crash (before `SaveCatalog`):
+- WAL replay restores pg_class/pg_attribute heap pages.
+- `loadUserTablesFromHeap` finds the user table rows and registers them.
+- Table is accessible even without the JSON snapshot.
+
+`TestCreateTableSurvivesRestartViaCatalogHeap` proves this end-to-end:
+creates a table, saves catalog, deletes JSON, restarts — table still present.
+
+### Still Deferred
+- JSON decommission (replace JSON path entirely with heap) — M0030-0004.
+- Index recovery from heap (requires pg_index or extended pg_class).
+- Checkpoint record storing last catalog mutation LSN.
+- `pg_stat_wal_io` catalog_records counter.

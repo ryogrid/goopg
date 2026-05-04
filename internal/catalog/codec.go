@@ -419,3 +419,34 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDText // safe fallback
 	}
 }
+
+// OIDToTypeName is the inverse of TypeNameToOID: maps a canonical pg_type
+// OID to the goopg type name string used in catalog.Type. Used by
+// loadUserTablesFromHeap (M0030-0003) when reconstructing column types
+// from pg_attribute rows. Returns "text" for unknown OIDs.
+func OIDToTypeName(oid uint32) string {
+	switch oid {
+	case OIDInt4:
+		return "int4"
+	case OIDInt8:
+		return "int8"
+	case OIDInt2:
+		return "int2"
+	case OIDText:
+		return "text"
+	case OIDVarChar:
+		return "varchar"
+	case OIDBpChar:
+		return "bpchar"
+	case OIDBool:
+		return "bool"
+	case OIDTimestamp:
+		return "timestamp"
+	case OIDNumeric:
+		return "numeric"
+	case OIDOID:
+		return "oid"
+	default:
+		return "text"
+	}
+}
