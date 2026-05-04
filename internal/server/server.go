@@ -1,9 +1,28 @@
 // Package server implements the goopg listener and per-connection lifecycle.
 //
-// v0 supports the protocol-3.0 startup handshake only: it sends
-// AuthenticationOk, a fixed ParameterStatus block, BackendKeyData, and
-// ReadyForQuery, then rejects every subsequent frontend message with an
-// "unsupported" ErrorResponse. The simple Query path arrives in milestone 2.
+// # Per-connection goroutine model (M0042-0004)
+//
+// goopg spawns one goroutine per client TCP connection (serveConn). That
+// goroutine is the per-backend analogue of PostgreSQL's per-backend process
+// and owns exactly what the upstream backend owns:
+//
+//   - The active transaction state (mvcc.Transaction / mvcc.Snapshot).
+//   - The pinned-buffer set for the transaction's lifetime (storage.Pool.Pin/Unpin).
+//   - All WAL insert calls (wal.Writer.Append — runs on the client goroutine).
+//   - The synchronous-commit WAL flush (wal.Writer.FlushUpTo after commit).
+//
+// The goroutine does NOT own:
+//   - Background page flushing — that is Pool.FlushAll / Pool.FlushAllPaced,
+//     which are checkpointer-only (see internal/wal/checkpointer.go).
+//   - The WAL writer drain cycle — that is the walwriterLoop goroutine
+//     started by initdb.Open (M0042-0003).
+//   - Replication sender cycles — those are independent walsender goroutines.
+//   - Checkpointer / autovacuum / WAL retention — all independent goroutines.
+//
+// This boundary matches PostgreSQL's "only the backend process may pin
+// buffers and insert WAL; background processes flush/sync" model.
+// Assertions for the FlushAll boundary are wired via Pool.OnFlushAll.
+// See docs/design/0042-0004-client-backend-goroutine-alignment.md.
 //
 // Design: docs/design/0002-wire-protocol.md.
 package server

@@ -143,6 +143,19 @@ func (r *Registry) Unregister(pid string) {
 	delete(r.backends, pid)
 }
 
+// GetBackendType returns the BackendType field for the backend registered
+// under pid, or "" if no backend with that pid exists.  Used by the
+// M0042-0004 FlushAll goroutine assertion in initdb/open.go.
+func (r *Registry) GetBackendType(pid string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.backends[pid]
+	if !ok {
+		return ""
+	}
+	return b.BackendType
+}
+
 // Snapshot returns a consistent copy of all registered backends.
 func (r *Registry) Snapshot() []Backend {
 	r.mu.RLock()

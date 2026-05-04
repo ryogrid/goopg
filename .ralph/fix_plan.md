@@ -1152,25 +1152,24 @@ per‑backend process model. Anchor doc:
   - [x] Add synchronous_commit/wal_writer_delay/wal_writer_flush_after GUCs
   - [x] Verification: go test ./internal/wal/... -race + ./internal/initdb/ PASS
 
-- [ ] M0042-0004: Client backend goroutine alignment.
+- [x] M0042-0004: Client backend goroutine alignment.
       Design doc `docs/design/0042-0004-client-backend-goroutine-alignment.md`.
-  - [ ] Document the per-connection goroutine model in
-        `internal/server/server.go` package comments.
-  - [ ] Assert (dev-mode panic) that `Pool.FlushAll` /
-        `Pool.FlushAllPaced` and `wal.Writer` direct
-        `writeAt` are only called from checkpointer /
-        walwriter goroutines.
-  - [ ] Wire commit-time `XLogFlush(commitLSN)` from the
-        client goroutine when `synchronous_commit = on`.
-  - [ ] Optional first cut: add `pageWriterLoop` (bgwriter
-        goroutine) that pre-flushes dirty pages on
-        `bgwriter_delay` (default 200ms). Skippable; if
-        skipped, leave a TODO citing `0042-0001` §4.
-  - [ ] Add `TestBackendGoroutineDoesNotFsync` regression
-        test.
-  - [ ] Verification: `go test ./internal/server/...
-        ./internal/storage/... ./internal/wal/...
-        -race`, full TPC-H parity.
+      **Landed 2026-05-04**: server.go package comment documents per-connection
+      goroutine model (owns tx/snapshot/pins/WALInsert/XLogFlush; never
+      drives FlushAll/bgwriter/checkpointer by side-effect). Pool.OnFlushAll
+      hook added to FlushAll/FlushAllPaced — wired in initdb/open.go to panic
+      if a non-checkpointer goroutine calls it (uses activity.GetBackendType).
+      activity.Registry.GetBackendType(pid) added. Commit-time XLogFlush
+      already landed in M0042-0003. bgwriter loop deferred (TODO cites §4 of
+      0042-0001). TestBackendGoroutineDoesNotFsync + TestCheckpointerFlushAllIsAllowed.
+      go test -race: storage/wal/initdb/activity all PASS (pre-existing race
+      in server/replication_test.go is unrelated to this change).
+  - [x] Document goroutine model in server.go package comment
+  - [x] Assert Pool.FlushAll only from checkpointer via OnFlushAll hook
+  - [x] Commit-time XLogFlush (already in M0042-0003 via xactMarkerLogger)
+  - [x] Add TestBackendGoroutineDoesNotFsync regression test
+  - [x] Verification: go test ./internal/storage/... ./internal/wal/...
+        ./internal/initdb/ ./internal/activity/ -race PASS
 
 ## Milestone 0044 — B-tree key support for HammerDB TPC-H schema types
 

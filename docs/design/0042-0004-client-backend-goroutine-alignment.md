@@ -1,6 +1,6 @@
 # 0042-0004 — Client backend goroutine alignment
 
-**Status:** draft
+**Status:** accepted (landed 2026-05-04)
 **Parent milestone:** M0042
 **Depends on:** `0042-0001-pg-io-survey.md`,
 `0042-0003-wal-buffer-and-writer-alignment.md`

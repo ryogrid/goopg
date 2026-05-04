@@ -147,6 +147,14 @@ type Pool struct {
 	// activity.LookupGoroutine so pg_stat_activity can report
 	// BufferPin wait events.
 	OnPinWait func()
+
+	// OnFlushAll is an optional hook called at the start of FlushAll
+	// and FlushAllPaced before any I/O.  initdb.Open wires an
+	// assertion that these callers are checkpointer or walwriter
+	// goroutines — never client-backend goroutines (M0042-0004).
+	// nil disables the check (tests that don't set up activity
+	// goroutine registration).
+	OnFlushAll func()
 }
 
 // PoolConfig controls Pool sizing.
@@ -794,7 +802,14 @@ func (p *Pool) maybeEmitFPI(s *Slot) {
 // bit. Equivalent to FlushAllPaced with a no-op pacer; convenient
 // for callers that don't want to spread the work over time
 // (CheckpointNow, Pool.Close).
+//
+// FlushAll is reserved for the checkpointer goroutine. Client-backend
+// goroutines must never call it (M0042-0004 invariant). The OnFlushAll
+// hook fires here for assertions; see Pool.OnFlushAll.
 func (p *Pool) FlushAll() error {
+	if p.OnFlushAll != nil {
+		p.OnFlushAll()
+	}
 	return p.FlushAllPaced(nil)
 }
 
@@ -818,6 +833,9 @@ func (p *Pool) FlushAll() error {
 // pwrite-ing. With batch=1 the loop is bit-identical to the
 // legacy per-slot serial flush.
 func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
+	if p.OnFlushAll != nil {
+		p.OnFlushAll()
+	}
 	p.poolMu.Lock()
 	type pending struct {
 		idx int

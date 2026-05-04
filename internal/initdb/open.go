@@ -340,6 +340,29 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
 		}
 	}
+	// Wire FlushAll goroutine assertion (M0042-0004): Pool.FlushAll and
+	// Pool.FlushAllPaced must only be called from the checkpointer goroutine
+	// or from Pool.Close (unregistered goroutine). Client-backend goroutines
+	// must never drive full-buffer flushes — they only flush WAL at commit.
+	// The check uses the activity registry; if the calling goroutine is
+	// registered and its BackendType is neither "checkpointer" nor
+	// "autovacuum" nor "" (unregistered / Pool.Close), we panic with a
+	// clear message so the invariant violation surfaces immediately in dev.
+	pool.OnFlushAll = func() {
+		reg, pid := activity.LookupGoroutine()
+		if reg == nil {
+			return // unregistered goroutine — Pool.Close or tests, OK
+		}
+		bt := reg.GetBackendType(pid)
+		switch bt {
+		case "checkpointer", "autovacuum", "walwriter", "":
+			// expected callers
+		default:
+			panic("BUG(M0042-0004): Pool.FlushAll called from " + bt +
+				" goroutine — only checkpointer should flush all pages;" +
+				" client backends must not drive full-buffer I/O directly")
+		}
+	}
 	// With an AIO engine attached, opt the Pool into prefetching
 	// so heap-scan / future bitmap-scan / ANALYZE callers issuing
 	// `Pool.Prefetch(tag)` hints actually warm the page cache via
