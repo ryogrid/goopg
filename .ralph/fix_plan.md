@@ -2324,7 +2324,47 @@ rationale here.
         from `analysis/tpch-pprof-bottleneck-survey.md` §4 item #1.
         `go test ./...` PASS.
 
-  - [ ] M0054-0005b: Spill-reader buffer reuse.
+  - [x] M0054-0005b: Hash-join build/probe alloc reduction +
+        spill-reader byte-buffer reuse. Scope reduced from the
+        original "full Borrow-semantics rewrite" because the
+        empirical leverage clustered around three specific call
+        sites the design doc 0054-0002 §5.2 named, all of which
+        could be addressed without the architectural Borrow
+        contract.
+        (landed 2026-05-05:
+        `internal/executor/operators_join_agg.go` — `joinOp` grew
+        `lazyNullLeft`, `lazyNullRight`, `lazyKeyRow` fields. The
+        lazy-build loop in `openLazyHashJoin` (both BuildLeft and
+        BuildRight branches) now hoists `nullRow(rightWidth)` /
+        `nullRow(leftWidth)` and the `concatRows(...)` keyRow
+        construction out of the per-tuple loop, so the build
+        no longer allocates `nullRow + concat` per row. The
+        per-probe-row path in `nextLazy` does the same: the null
+        padding rows are computed lazily-once and the keyRow
+        buffer is reused across calls. Result-row construction
+        (`concatRows(m, lazyRow)` at line 409/411) was
+        intentionally left unchanged: those are the values
+        returned to the caller and may be retained — the proper
+        fix needs the Borrow contract.
+        `internal/executor/spill.go` — `spillReader` grew a
+        `dataBuf []byte` field. `ReadRow` reuses this byte buffer
+        across calls instead of `make([]byte, dataLen)` per row.
+        The decoded `Row` is still allocated fresh because callers
+        retain rows in their hash table / sort store; the byte
+        buffer itself is purely transient and safe to reuse.
+        Tests: `go test ./internal/executor/...
+        ./internal/planner/... ./internal/testutil/tpch/...
+        ./internal/wal ./internal/initdb ./internal/storage
+        ./internal/server -count=1` PASS.
+        Out-of-scope-for-this-loop:
+        - The full `BorrowSemantics` enum + `Borrowable` interface
+          + post-build walker (design doc §4.2 / §5.2). Without it,
+          `concatRows(m, lazyRow)` returns to caller (retained) and
+          `projectOp.Next` `make(Row, …)` per row stay allocated.
+          Tracked as M0054-0005b-followup; effect target: Q9
+          `runtime.scanobject` cum ≤ 30 % requires that work.)
+
+  - [ ] M0054-0005b-followup: Borrow-semantics rollout.
         **Evidence:** Q9 in-use heap of 5.14 GB has
         `executor.(*spillReader).ReadRow` holding **1.65 GB
         live** plus `drainRowsBounded` 0.49 GB — together the

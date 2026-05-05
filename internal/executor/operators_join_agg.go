@@ -32,6 +32,15 @@ type joinOp struct {
 	lazyActive  bool // true between probeRow and last match
 	lazyLW      int  // left schema width
 	lazyRW      int  // right schema width
+
+	// M0054-0005b: per-Open() reusable buffers for nullRow / hash
+	// key evaluation. The pre-fix path called `nullRow(width)` and
+	// `concatRows(...)` on every probe row, allocating fresh slices.
+	// These buffers stay constant for a given (leftWidth, rightWidth)
+	// pair, so a single allocation per side is enough.
+	lazyNullLeft  Row
+	lazyNullRight Row
+	lazyKeyRow    Row
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -130,12 +139,21 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	if budget <= 0 {
 		budget = 512 * 1024 * 1024 // default 512 MiB
 	}
+	// M0054-0005b: hoist the per-iteration `nullRow(...)` allocation
+	// out of the build loop. The hash-key evaluation only needs the
+	// other-side columns to be present so column-index resolution
+	// works; the values are not read. We also reuse a single
+	// `keyRow` buffer per side to avoid `concatRows`'s per-row
+	// `make(Row, leftW+rightW)` churn (M0054-0004 cumulative
+	// `concatRows` 56 GB on Q9, 7,980 GB on Q20).
 	if o.plan.BuildLeft {
 		if err := o.left.Open(ctx); err != nil { return err }
 		buildOp, err := drainRowsBounded(o.left, budget)
 		_ = o.left.Close()
 		if err != nil { return err }
 		if err := buildOp.Open(ctx); err != nil { return err }
+		var nullRight Row
+		var keyRow Row
 		for {
 			l, err := buildOp.Next()
 			if err == EOF { break }
@@ -143,7 +161,15 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 			if leftWidth == 0 && len(l) > 0 {
 				leftWidth = len(l); o.lazyLW = leftWidth
 			}
-			key, ok, err := o.evalHashKey(o.plan.LeftKey, concatRows(l, nullRow(rightWidth)))
+			if nullRight == nil {
+				nullRight = nullRow(rightWidth)
+			}
+			if keyRow == nil || len(keyRow) != leftWidth+rightWidth {
+				keyRow = make(Row, leftWidth+rightWidth)
+			}
+			copy(keyRow[:leftWidth], l)
+			copy(keyRow[leftWidth:], nullRight)
+			key, ok, err := o.evalHashKey(o.plan.LeftKey, keyRow)
 			if err != nil { return err }
 			if !ok { continue }
 			if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
@@ -159,6 +185,8 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	_ = o.right.Close()
 	if err != nil { return err }
 	if err := buildOp.Open(ctx); err != nil { return err }
+	var nullLeft Row
+	var keyRow Row
 	for {
 		r, err := buildOp.Next()
 		if err == EOF { break }
@@ -166,7 +194,15 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r); o.lazyRW = rightWidth
 		}
-		key, ok, err := o.evalHashKey(o.plan.RightKey, concatRows(nullRow(leftWidth), r))
+		if nullLeft == nil {
+			nullLeft = nullRow(leftWidth)
+		}
+		if keyRow == nil || len(keyRow) != leftWidth+rightWidth {
+			keyRow = make(Row, leftWidth+rightWidth)
+		}
+		copy(keyRow[:leftWidth], nullLeft)
+		copy(keyRow[leftWidth:], r)
+		key, ok, err := o.evalHashKey(o.plan.RightKey, keyRow)
 		if err != nil { return err }
 		if !ok { continue }
 		if o.lazyHash == nil { o.lazyHash = make(map[string][]Row) }
@@ -364,8 +400,16 @@ func (o *joinOp) Next() (Row, error) {
 
 // nextLazy yields one joined row at a time for lazy hash joins.
 func (o *joinOp) nextLazy() (Row, error) {
-	nullLeft := nullRow(o.lazyLW)
-	nullRight := nullRow(o.lazyRW)
+	// M0054-0005b: reuse the operator's per-Open null padding rows
+	// instead of allocating per call.
+	if o.lazyNullLeft == nil || len(o.lazyNullLeft) != o.lazyLW {
+		o.lazyNullLeft = nullRow(o.lazyLW)
+	}
+	if o.lazyNullRight == nil || len(o.lazyNullRight) != o.lazyRW {
+		o.lazyNullRight = nullRow(o.lazyRW)
+	}
+	nullLeft := o.lazyNullLeft
+	nullRight := o.lazyNullRight
 	for {
 		// Continue serving matches from current probe row. Apply
 		// the full join Predicate per emitted row — hash matching
@@ -402,14 +446,23 @@ func (o *joinOp) nextLazy() (Row, error) {
 			return nil, err
 		}
 		o.lazyRow = r
+		// M0054-0005b: reuse a single keyRow buffer across probe
+		// rows. evalHashKey only reads the column slot the join key
+		// references, so the throwaway buffer is safe.
+		w := o.lazyLW + o.lazyRW
+		if o.lazyKeyRow == nil || len(o.lazyKeyRow) != w {
+			o.lazyKeyRow = make(Row, w)
+		}
 		var key string
 		var ok bool
 		if o.plan.BuildLeft {
-			// Build left: probe is right. Hash key from right row.
-			key, ok, err = o.evalHashKey(o.plan.RightKey, concatRows(nullLeft, r))
+			copy(o.lazyKeyRow[:o.lazyLW], nullLeft)
+			copy(o.lazyKeyRow[o.lazyLW:], r)
+			key, ok, err = o.evalHashKey(o.plan.RightKey, o.lazyKeyRow)
 		} else {
-			// Build right: probe is left. Hash key from left row.
-			key, ok, err = o.evalHashKey(o.plan.LeftKey, concatRows(r, nullRight))
+			copy(o.lazyKeyRow[:o.lazyLW], r)
+			copy(o.lazyKeyRow[o.lazyLW:], nullRight)
+			key, ok, err = o.evalHashKey(o.plan.LeftKey, o.lazyKeyRow)
 		}
 		if err != nil {
 			return nil, err

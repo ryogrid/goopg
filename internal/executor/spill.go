@@ -62,6 +62,15 @@ func (w *spillWriter) Path() string { return w.path }
 type spillReader struct {
 	f    *os.File
 	path string
+
+	// M0054-0005b: reusable byte buffer for ReadRow's per-row
+	// payload. The pre-fix path called `make([]byte, dataLen)`
+	// per row, contributing to the cumulative byte-buffer churn
+	// the M0054-0004 pprof survey flagged. The buffer grows
+	// monotonically to fit the largest row seen and is never
+	// shrunk — typical TPC-H rows are well-bounded so the steady
+	// state is small.
+	dataBuf []byte
 }
 
 func newSpillReader(path string) (*spillReader, error) {
@@ -86,7 +95,16 @@ func (r *spillReader) ReadRow() (Row, error) {
 		return nil, errLen
 	}
 	dataLen := binary.LittleEndian.Uint32(lenBuf[:])
-	data := make([]byte, dataLen)
+	// M0054-0005b: reuse r.dataBuf across calls to avoid the
+	// per-row `make([]byte, dataLen)` allocation. The Row that
+	// follows is decoded into a fresh `Row` (callers retain it),
+	// but `data` is only used inside this function.
+	if cap(r.dataBuf) < int(dataLen) {
+		r.dataBuf = make([]byte, dataLen)
+	} else {
+		r.dataBuf = r.dataBuf[:dataLen]
+	}
+	data := r.dataBuf
 	if reg != nil {
 		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
