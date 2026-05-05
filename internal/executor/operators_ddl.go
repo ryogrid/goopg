@@ -545,7 +545,8 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	}
 	seen := map[string]struct{}{}
 	var entries []btree.BulkEntry
-	var scanRow Row // M0054-0005c: reusable decode buffer (see comment below).
+	var scanRow Row                                // M0054-0005c: reusable decode buffer (see comment below).
+	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -580,7 +581,12 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			if err := DecodeRowInto(scanRow, tbl.Columns, tuple.Data); err != nil {
+			// M0054-0005c-followup: skip per-column heap
+			// allocations for columns the index doesn't reference.
+			// Other columns must still be size-scanned to advance
+			// the offset (variable-length codec) but their string/
+			// numeric payloads are not materialised.
+			if err := DecodeRowProjection(scanRow, tbl.Columns, tuple.Data, keep); err != nil {
 				continue
 			}
 			row := scanRow
@@ -604,6 +610,24 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	return entries, nil
 }
 
+// buildKeepMaskForIndex returns a per-column boolean mask whose
+// `i`-th entry is true iff `tableCols[i]` is referenced by `indexCols`.
+// Used by `DecodeRowProjection` to skip per-column heap allocations
+// for columns the index does not need. (M0054-0005c-followup.)
+func buildKeepMaskForIndex(tableCols []catalog.Column, indexCols []*catalog.Column) []bool {
+	want := make(map[string]struct{}, len(indexCols))
+	for _, ic := range indexCols {
+		want[ic.Name] = struct{}{}
+	}
+	keep := make([]bool, len(tableCols))
+	for i := range tableCols {
+		if _, ok := want[tableCols[i].Name]; ok {
+			keep[i] = true
+		}
+	}
+	return keep
+}
+
 func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
@@ -611,7 +635,8 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	seen := map[string]struct{}{}
-	var scanRow Row // M0054-0005c: reusable decode buffer.
+	var scanRow Row                                  // M0054-0005c: reusable decode buffer.
+	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -639,10 +664,11 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				continue
 			}
 			// M0054-0005c: reuse the decode buffer.
+			// M0054-0005c-followup: skip non-index column payloads.
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			if err := DecodeRowInto(scanRow, tbl.Columns, tuple.Data); err != nil {
+			if err := DecodeRowProjection(scanRow, tbl.Columns, tuple.Data, keep); err != nil {
 				continue
 			}
 			row := scanRow

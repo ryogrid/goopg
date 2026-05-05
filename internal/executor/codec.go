@@ -62,6 +62,110 @@ func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 	return row, nil
 }
 
+// DecodeRowProjection (M0054-0005c-followup) decodes only the columns
+// whose index is true in `keep`, skipping payload allocation for
+// other columns. dst[i] for i where !keep[i] is set to NullDatum
+// (a marker, NOT the SQL NULL — callers must not read those slots).
+//
+// The variable-length column codec means we cannot skip past a
+// column without parsing its length header, so the savings come
+// from the per-column heap allocations: varchar/char/text avoid
+// the `string(data[4:4+n])` copy and numeric avoids the
+// `parseNumeric` big.Int materialisation. For a TPC-H index-build
+// path that needs only the indexed key column out of N, this
+// removes the dominant allocation source flagged by
+// `M0054-0004` pprof (DecodeRow 39 % cum in the `idx` window).
+//
+// Caller invariants:
+//   - `len(dst) >= len(cols)`
+//   - `len(keep) >= len(cols)`
+func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []bool) error {
+	off := 0
+	for i, c := range cols {
+		if off >= len(data) {
+			dst[i] = NullDatum
+			continue
+		}
+		flag := data[off]
+		off++
+		if flag == 1 {
+			dst[i] = NullDatum
+			continue
+		}
+		if flag == 2 {
+			const toastPtrSize = 12
+			if off+toastPtrSize > len(data) {
+				return fmt.Errorf("DecodeRowProjection: %s: truncated TOAST pointer", c.Name)
+			}
+			if keep[i] {
+				dst[i] = Datum{Kind: KindToastPointer, Bytes: append([]byte(nil), data[off:off+toastPtrSize]...)}
+			} else {
+				dst[i] = NullDatum
+			}
+			off += toastPtrSize
+			continue
+		}
+		if keep[i] {
+			v, n, err := decodeValue(c.Type, data[off:])
+			if err != nil {
+				return fmt.Errorf("DecodeRowProjection: %s: %w", c.Name, err)
+			}
+			dst[i] = v
+			off += n
+			continue
+		}
+		// Not kept: advance offset only. Avoids the per-column
+		// heap allocations (string copy, big.Int).
+		n, err := decodeValueSize(c.Type, data[off:])
+		if err != nil {
+			return fmt.Errorf("DecodeRowProjection: %s: %w", c.Name, err)
+		}
+		dst[i] = NullDatum
+		off += n
+	}
+	return nil
+}
+
+// decodeValueSize returns just the byte length of an encoded value
+// without materialising a Datum. Used by DecodeRowProjection to
+// skip columns whose payload the caller does not need.
+// (M0054-0005c-followup.)
+func decodeValueSize(t catalog.Type, data []byte) (int, error) {
+	switch t.Name {
+	case "int4", "integer", "int":
+		if len(data) < 4 {
+			return 0, fmt.Errorf("truncated int4")
+		}
+		return 4, nil
+	case "int8", "bigint":
+		if len(data) < 8 {
+			return 0, fmt.Errorf("truncated int8")
+		}
+		return 8, nil
+	case "bool", "boolean":
+		if len(data) < 1 {
+			return 0, fmt.Errorf("truncated bool")
+		}
+		return 1, nil
+	case "timestamp", "timestamptz", "date":
+		if len(data) < 8 {
+			return 0, fmt.Errorf("truncated %s", t.Name)
+		}
+		return 8, nil
+	default:
+		// numeric, varchar, char, text — all use a 4-byte big-endian
+		// length prefix followed by `n` bytes of payload.
+		if len(data) < 4 {
+			return 0, fmt.Errorf("truncated varlen header")
+		}
+		n := int(binary.BigEndian.Uint32(data[:4]))
+		if 4+n > len(data) {
+			return 0, fmt.Errorf("truncated varlen body")
+		}
+		return 4 + n, nil
+	}
+}
+
 // DecodeRowInto fills an existing Row slice from encoded tuple data.
 // Avoids the allocation that DecodeRow would make. The caller must
 // ensure len(dst) == len(cols). M0027-0001.

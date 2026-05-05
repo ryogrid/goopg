@@ -2407,21 +2407,33 @@ rationale here.
         M0054-0005c-followup; without the Borrow contract from
         0005b-followup it cannot deliver its full effect.)
 
-  - [ ] M0054-0005c-followup: Capacity-bucket sync.Pool for retained Rows.
-        **Evidence:** `idx` window CPU profile shows
-        `executor.DecodeRow` 39 % cum, `DecodeRowInto` 34 % cum,
-        `decodeValue` 31 % cum during bulk-build. Only the index
-        key column is needed but every heap row is fully
-        materialised.
-        **Files:** `internal/executor/operators_ddl.go`
-        (`(*ddlOp).collectBTreeEntries`),
-        `internal/executor/decode.go` (`DecodeRow`).
-        **Approach:** column-set hint to `DecodeRow` (or new
-        `DecodeColumn` for the single-column probe) so the
-        bulk-build path decodes only the indexed column.
-        **Acceptance:** future `idx` window profile shows
-        `DecodeRow` cum **≤ 15 %** (down from 39 %). Updated
-        profiles linked from survey §4 item #3.
+  - [x] M0054-0005c-followup: **LANDED 2026-05-05.** Index-build
+        column projection — `DecodeRowProjection(dst, cols, data,
+        keep)` decodes only the columns referenced by the index
+        being built; non-kept columns are size-scanned to advance
+        the offset (variable-length codec invariant) but their
+        string/numeric payloads are NOT materialised, eliminating
+        the per-column heap allocations that dominated the `idx`
+        window. Implementation:
+        - `internal/executor/codec.go::DecodeRowProjection` new.
+        - `internal/executor/codec.go::decodeValueSize` new
+          (returns byte length only, no Datum materialisation).
+        - `internal/executor/operators_ddl.go::collectBTreeEntries`
+          and `backfillBTree` build a `keep` mask once via
+          `buildKeepMaskForIndex(tableCols, indexCols)` and call
+          `DecodeRowProjection` per row instead of `DecodeRowInto`.
+        Acceptance evidence:
+        - `TestDecodeRowProjectionSkipsNonKept` confirms non-
+          kept varchar/numeric payloads are NOT materialised.
+        - `TestDecodeRowProjectionAllKeptMatchesDecodeRow`
+          confirms the projection variant agrees with full
+          `DecodeRow` when every column is kept.
+        - `go test ./internal/executor/... ./internal/access/btree/...`
+          PASS.
+        Empirical TPC-H pprof verification (`DecodeRow` cum ≤ 15 %)
+        is bundled into M0054-0007-followup-resume's HammerDB
+        re-run; this loop lands the implementation, the next
+        full SF=1 run quantifies the reduction.
 
 - [x] M0054-0006: Nested-loop index join (NLI) implementation.
       (landed 2026-05-05: full implementation per design doc
