@@ -1802,7 +1802,72 @@ SF=1 run using **only `hammerdbcli`** (no manual `psql` DDL), capture all
 phase results, and write a structured English report. Update fix_plan.md task
 statuses based on run outcomes.
 
-- [ ] M0053-0001: Execute a complete HammerDB TPC-H SF=1 run (schema build →
+Pre-run improvements (M0053-0000..M0053-0005) address gaps identified by
+code audit before the run, then M0053-0006 executes the run, M0053-0007 reports.
+
+- [ ] M0053-0000: Static code audit confirming index-creation pipeline is real,
+      not mocked. Verify (a) `execCreateIndex()` → `bulkBuildBTree()` →
+      `btree.BulkCreate()` writes real B-tree pages; (b)
+      `planIndexScanFromWhere()` / `tryRangeIndexScan()` emit real IndexScan
+      nodes; (c) `tree.RangeScan()` performs real B-tree descent; (d) no
+      `panic("not implemented")` / stub in any index-related path. Spot-check
+      via `EXPLAIN SELECT * FROM <table> WHERE <col> = <const>` against a
+      live cluster to observe IndexScan emission. Document planner
+      limitations (single-column constant-RHS only) so M0053-0001..0003
+      know what to fix.
+
+- [ ] M0053-0001: Composite index leading-column support. Modify
+      `findBTreeIndexForColumn(col)` in `internal/planner/planner.go` to also
+      accept composite indexes when `idx.Columns[0] == col`. The resulting
+      IndexScan uses the leading column; B-tree key encoding is already
+      prefix-comparable so `RangeScan(LowKey, HighKey)` with a leading-column
+      key works without storage-layer changes. Affects HammerDB TPC-H
+      composite PKs (`PARTSUPP(PS_PARTKEY, PS_SUPPKEY)`,
+      `LINEITEM(L_LINENUMBER, L_ORDERKEY)`) and `LINEITEM_PART_SUPP_FKIDX
+      (L_PARTKEY, L_SUPPKEY)`. Add planner unit tests proving leading-column
+      match emits IndexScan, non-leading-column match falls back to SeqScan.
+
+- [ ] M0053-0002: Non-constant RHS for date expressions. TPC-H queries use
+      RHS like `date '1998-12-01' - interval '90 day'` which is a computed
+      expression, not a literal. The `isConstantExpr()` predicate may reject
+      such expressions and force SeqScan. Fix: re-run `FoldConstants()` on
+      candidate predicates inside `tryRangeIndexScan` before checking, OR
+      extend `isConstantExpr()` to fold-and-check recursively. Add planner
+      tests covering date arithmetic (`l_shipdate <= date 'X' - interval 'Y'`)
+      and interval addition (`o_orderdate >= date 'X' AND o_orderdate < date
+      'X' + interval '3 month'`). Column-vs-column equality is intentionally
+      out of scope (covered by M0053-0004).
+
+- [ ] M0053-0003: IN-list predicate support for index selection. Q12 uses
+      `l_shipmode IN ('MAIL', 'SHIP')`. Convert `col IN (c1, c2, ...)` to
+      `col = c1 OR col = c2 OR ...` at the plan level before
+      `planIndexScanFromWhere` runs, so the existing equality+OR path can
+      pick up an index. Add planner tests verifying IN-list with all-constant
+      RHS uses index when available; mixed constant/non-constant falls back
+      to SeqScan.
+
+- [ ] M0053-0004: Nested-loop index join scope assessment. Multi-table
+      equality joins (`o_orderkey = l_orderkey`) currently always use hash
+      join (SeqScan inner). NL index join would scan only matching inner
+      rows. Write `docs/design/0053-0002-nested-loop-index-join-scope.md`
+      assessing implementation effort (parameterized IndexScan, planner
+      rule, cost estimation, executor operator) and decide: implement minimal
+      version inside M0053 or defer to a new M0054. If deferred, document
+      reasoning and create the M0054 milestone entry.
+
+- [ ] M0053-0005: B-tree posting-list overflow fix. `deduplicateToRawItems()`
+      in `internal/access/btree/bulkload.go` calls `marshalPosting()` without
+      a size check, so posting items >32767 bytes are rejected by
+      `storage.PageAddItemRaw()` and CREATE INDEX fails (run-010 hit this on
+      `IDX_LINEITEM_ORDERKEY_FKIDX` with `len=35669`). Fix: when
+      `len(raw) > 32767`, split TIDs into multiple non-deduplicated entries
+      (option 1, preferred) or fail with a clean `ErrPostingOverflow`
+      propagated to CREATE INDEX (option 3, minimum acceptable). Update
+      `docs/design/0047-0003-deduplication.md` §2.4 to mark this resolved.
+      Add a regression test that deliberately creates a key with enough
+      duplicates to overflow the limit and verifies the new path.
+
+- [ ] M0053-0006: Execute a complete HammerDB TPC-H SF=1 run (schema build →
       data load → CREATE INDEX → ANALYZE → Q1–Q22 power test) using only
       `hammerdbcli`. Start goopg with `setup_goopg.sh --reset`. Run
       `build_schema_goopg.sh` and `run_power_test_goopg.sh` in the background
@@ -1813,9 +1878,10 @@ statuses based on run outcomes.
       `analysis/tpch-hammerdb-run-011.md` following the schema in
       `docs/design/0053-0001-hammerdb-tpch-run-verification-procedure.md`.
 
-- [ ] M0053-0002: Update fix_plan.md task statuses based on M0053-0001
-      results. Mark M0053-0001 complete. If any phase failed, add a new
-      sub-task tracking the failure. Commit and push all changes (milestone
+- [ ] M0053-0007: Update fix_plan.md task statuses based on M0053-0006
+      results. Mark M0053-0000..M0053-0006 complete. If any phase failed,
+      add a new sub-task tracking the failure. Commit and push all changes
+      (milestone
       doc, design doc, report, fix_plan.md updates).
 
 ## Notes
