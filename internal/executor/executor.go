@@ -36,18 +36,33 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
+		// M0054-0005a-followup: projectOp ALWAYS copies its
+		// child's row into `o.out` (then either clones or returns
+		// borrowed). So the child is always safe to borrow,
+		// regardless of project's own borrow contract.
+		setChildBorrow(child, BorrowedRow)
 		return maybeInstrument(p, newProjectOp(p, child)), nil
 	case *planner.Filter:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
+		// M0054-0005a-followup: filterOp is a pure pass-through
+		// — it returns its child's row unchanged. So filter's
+		// own borrow contract must MATCH its child's. We leave
+		// the child at the default OwnedRow at Build time;
+		// filterOp.SetBorrow propagates to the child only when
+		// the eventual parent (project, output sink) flips the
+		// filter itself to BorrowedRow.
 		return maybeInstrument(p, newFilterOp(p, child)), nil
 	case *planner.Limit:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
+		// M0054-0005a-followup: limitOp is pass-through like
+		// filterOp; child borrow propagates from limit's own
+		// parent via SetBorrow.
 		return maybeInstrument(p, newLimitOp(p, child)), nil
 	case *planner.Sort:
 		child, err := Build(p.Child)

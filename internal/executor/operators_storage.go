@@ -31,6 +31,12 @@ type seqScanOp struct {
 	ctx  *Context
 	cols []catalog.Column
 
+	// M0054-0005a-followup: borrow-semantics flag. When set to
+	// `BorrowedRow`, Next returns `o.scanRow` directly without
+	// the M0054-0005a defensive clone — the parent has promised
+	// to consume the row before pulling the next.
+	borrow BorrowSemantics
+
 	nBlocks  storage.BlockNumber
 	curBlock storage.BlockNumber
 	curSlot  uint16
@@ -78,6 +84,10 @@ func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 }
 
 func (o *seqScanOp) Schema() planner.Schema { return o.plan.Output() }
+
+// SetBorrow flips seqScanOp into borrow-on-output mode. (M0054-
+// 0005a-followup; design doc 0054-0002 §4.2.)
+func (o *seqScanOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -223,6 +233,14 @@ func (o *seqScanOp) Next() (Row, error) {
 					continue // skip undetoastable tuple
 				}
 				row = detoasted
+			}
+			// M0054-0005a-followup: when our parent declared
+			// borrow-OK, return o.scanRow directly. Otherwise
+			// clone (the M0054-0005a defensive copy) so the
+			// caller can retain the row across the next
+			// `Next()` call.
+			if o.borrow == BorrowedRow {
+				return row, nil
 			}
 			return cloneRow(row), nil
 		}

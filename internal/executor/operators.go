@@ -47,30 +47,49 @@ type projectOp struct {
 	targets []planner.Expr
 	schema  planner.Schema
 	ctx     *Context
+	// M0054-0005a-followup: borrow-semantics output buffer reuse.
+	// When `borrow == BorrowedRow`, Next returns `out` directly;
+	// otherwise it clones before returning. Default OwnedRow.
+	borrow BorrowSemantics
+	out    Row
 }
 
 func newProjectOp(plan *planner.Project, child Operator) *projectOp {
 	return &projectOp{child: child, targets: plan.Targets, schema: plan.Output()}
 }
 
-func (o *projectOp) Open(ctx *Context) error { o.ctx = ctx; return o.child.Open(ctx) }
-func (o *projectOp) Schema() planner.Schema  { return o.schema }
-func (o *projectOp) Close() error            { return o.child.Close() }
+func (o *projectOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	if cap(o.out) < len(o.targets) {
+		o.out = make(Row, len(o.targets))
+	} else {
+		o.out = o.out[:len(o.targets)]
+	}
+	return o.child.Open(ctx)
+}
+func (o *projectOp) Schema() planner.Schema { return o.schema }
+func (o *projectOp) Close() error           { return o.child.Close() }
+
+// SetBorrow marks projectOp as eligible to return borrowed
+// rows. (M0054-0005a-followup.)
+func (o *projectOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 func (o *projectOp) Next() (Row, error) {
 	in, err := o.child.Next()
 	if err != nil {
 		return nil, err
 	}
-	out := make(Row, len(o.targets))
 	for i, t := range o.targets {
 		v, err := evalExpr(t, in, o.ctx)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = v
+		o.out[i] = v
 	}
-	return out, nil
+	if o.borrow == BorrowedRow {
+		return o.out, nil
+	}
+	return cloneRow(o.out), nil
 }
 
 // filterOp drops rows where the predicate doesn't evaluate to TRUE.
@@ -79,6 +98,10 @@ type filterOp struct {
 	child Operator
 	pred  planner.Expr
 	ctx   *Context
+	// M0054-0005a-followup: pure pass-through borrow. The Filter
+	// returns its child's row unchanged, so it can borrow exactly
+	// as long as its parent allows it.
+	borrow BorrowSemantics
 }
 
 func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
@@ -88,6 +111,16 @@ func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
 func (o *filterOp) Open(ctx *Context) error { o.ctx = ctx; return o.child.Open(ctx) }
 func (o *filterOp) Schema() planner.Schema  { return o.child.Schema() }
 func (o *filterOp) Close() error            { return o.child.Close() }
+
+// SetBorrow propagates the borrow contract to the child. filterOp
+// itself never copies — it just hands through. So borrow-OK at
+// filter ⇒ borrow-OK at child. (M0054-0005a-followup.)
+func (o *filterOp) SetBorrow(s BorrowSemantics) {
+	o.borrow = s
+	if b, ok := o.child.(Borrowable); ok {
+		b.SetBorrow(s)
+	}
+}
 
 func (o *filterOp) Next() (Row, error) {
 	for {
@@ -115,6 +148,16 @@ type limitOp struct {
 	offsetCount int64
 	emitted     int64
 	skipped     int64
+	// M0054-0005a-followup: pass-through borrow.
+	borrow BorrowSemantics
+}
+
+// SetBorrow propagates to the child. (M0054-0005a-followup.)
+func (o *limitOp) SetBorrow(s BorrowSemantics) {
+	o.borrow = s
+	if b, ok := o.child.(Borrowable); ok {
+		b.SetBorrow(s)
+	}
 }
 
 func newLimitOp(plan *planner.Limit, child Operator) *limitOp {

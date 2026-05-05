@@ -82,6 +82,24 @@ func newSpillReader(path string) (*spillReader, error) {
 }
 
 func (r *spillReader) ReadRow() (Row, error) {
+	// Backwards-compatible thin wrapper around ReadRowInto: allocate
+	// a fresh Row and fill. Used by callers that need an OwnedRow
+	// (e.g., parent retains the row).
+	row, err := r.ReadRowInto(nil)
+	if err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// ReadRowInto (M0054-0005b-followup) decodes the next spilled row
+// into the caller-provided `dst` slice when its capacity is
+// sufficient; otherwise allocates a fresh slice and returns it.
+// Either way, the returned Row's contents are invalidated by the
+// next ReadRowInto call, so callers that retain rows must clone
+// the result. Pipeline-pass callers pass a single reusable `dst`
+// across calls.
+func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 	var lenBuf [4]byte
 	reg, pid := activity.LookupGoroutine()
 	if reg != nil {
@@ -96,9 +114,7 @@ func (r *spillReader) ReadRow() (Row, error) {
 	}
 	dataLen := binary.LittleEndian.Uint32(lenBuf[:])
 	// M0054-0005b: reuse r.dataBuf across calls to avoid the
-	// per-row `make([]byte, dataLen)` allocation. The Row that
-	// follows is decoded into a fresh `Row` (callers retain it),
-	// but `data` is only used inside this function.
+	// per-row `make([]byte, dataLen)` allocation.
 	if cap(r.dataBuf) < int(dataLen) {
 		r.dataBuf = make([]byte, dataLen)
 	} else {
@@ -119,7 +135,16 @@ func (r *spillReader) ReadRow() (Row, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("spillReader: invalid column count")
 	}
-	row := make(Row, nCols)
+	// M0054-0005b-followup: reuse the caller-provided Row slot
+	// when it has sufficient capacity. Saves the per-row
+	// `make(Row, nCols)` allocation that the M0054-0004 in-use
+	// heap pprof flagged as 1.65 GB live in Q9.
+	row := dst
+	if cap(row) < int(nCols) {
+		row = make(Row, nCols)
+	} else {
+		row = row[:nCols]
+	}
 	pos := n
 	for i := uint64(0); i < nCols; i++ {
 		d, n2, err := decodeDatum(data[pos:])
@@ -380,18 +405,37 @@ func (o *rowsOp) Close() error {
 
 // spillOp implements Operator over a spillReader.
 type spillOp struct {
-	r    *spillReader
-	ctx  *Context
+	r   *spillReader
+	ctx *Context
+	// M0054-0005b-followup: reusable output Row buffer. When
+	// `borrow == BorrowedRow`, Next returns `out` directly;
+	// otherwise it clones before returning (default OwnedRow).
+	borrow BorrowSemantics
+	out    Row
 }
 
-func (o *spillOp) Open(*Context) error { return nil }
+func (o *spillOp) Open(*Context) error    { return nil }
 func (o *spillOp) Schema() planner.Schema { return nil }
+
+// SetBorrow flips spillOp into borrow-on-output mode. The caller
+// (a sort merge or hash-join probe loop) must consume each row
+// before pulling the next when set to BorrowedRow.
+// (M0054-0005b-followup.)
+func (o *spillOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
+
 func (o *spillOp) Next() (Row, error) {
-	row, err := o.r.ReadRow()
+	row, err := o.r.ReadRowInto(o.out)
 	if err == io.EOF {
 		return nil, EOF
 	}
-	return row, err
+	if err != nil {
+		return nil, err
+	}
+	o.out = row // re-cap for the next call
+	if o.borrow == BorrowedRow {
+		return row, nil
+	}
+	return cloneRow(row), nil
 }
 func (o *spillOp) Close() error {
 	o.r.Close()
