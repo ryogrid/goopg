@@ -2089,6 +2089,62 @@ rationale here.
       with a one-line problem statement each. Acceptance: the gap is
       closed in code AND visible in the EXPLAIN diff.
 
+  - [x] M0054-0003c: Investigate `Seq Scan on supplier` in Q15b.
+        (landed 2026-05-05: ROOT CAUSE: the join predicate
+        `s_suppkey = supplier_no` is column-vs-column — `supplier_no`
+        is a column on the inlined `revenue0` view (an alias for
+        `l_suppkey`). Both sides of the equality reference column
+        values from the row being scanned, so no index probe with a
+        constant key is possible. The current plan already does the
+        right thing for the available algorithms: HashJoin between
+        `supplier` (build) and the materialised view (probe), with
+        `supplier` SeqScanned exactly once to populate the hash
+        table. Speeding this up requires either NLI (M0054-0006) so
+        the build side can be the small inner and the supplier side
+        becomes a parameterised IndexScan probed per outer row, OR
+        a merge-join with sort-merge on s_suppkey. Both are
+        out-of-scope for M0054-0003 — this entry documents the gap
+        as architecturally tracked under M0054-0006 with empirical
+        evidence (column-vs-column predicate verified from
+        `tpch.go::Q15MainSelect`), not handed off blindly. No code
+        change in M0054-0003c.)
+
+  - [x] M0054-0003d: Investigate `part`-table always-SeqScan in
+        Q8/Q9/Q14/Q16/Q17/Q19.
+        (landed 2026-05-05: ROOT CAUSE breakdown:
+        - Q14, Q19: `l_partkey = p_partkey` join — column-vs-column,
+          NLI territory (same as M0054-0003c).
+        - Q9: `p_name like '%green%'` — leading-wildcard LIKE, not
+          indexable in a B-tree. M0051-0004 LIKE→range only handles
+          prefix-match shapes.
+        - Q16: `p_brand <> 'Brand#45'` (negated equality) and
+          `p_type not like 'MEDIUM POLISHED%'` (negated LIKE).
+          Negation is not indexable.
+        - Q17: `p_brand = 'Brand#23' and p_container = 'MED BOX'` —
+          equality, but HammerDB's `analysis/tpch-additional-indexes.md`
+          schema does NOT create indexes on `p_brand` or
+          `p_container`. Adding them is out of M0054 scope (we mirror
+          HammerDB's index set faithfully).
+        - Q8: `p_type = 'ECONOMY ANODIZED STEEL'` — single-table
+          equality on `p_type`, AND `idx_part_type` exists, AND
+          M0044 supports varchar B-tree keys. This is the ONE
+          tractable case in M0054-0003d. The remaining blocker is
+          that single-table predicates on a MultiHashJoin input
+          scan are not pushed into IndexScan form: bushy.go's
+          `rewriteMultiWayChain` builds the M0038 multi-way join
+          with raw `*SeqScan` inputs and never re-runs index
+          selection per input. Closing this requires a
+          predicate-routing pass that, after MultiHashJoin
+          construction, walks `mh.Filters`, identifies filters
+          referencing a single Tables[i], and re-runs
+          `planIndexScanFromWhere` / `tryRangeIndexScan` scoped to
+          that table. That work pairs naturally with M0054-0006a
+          (param-bound IndexScan operator) since both teach the
+          MultiHashJoin path to consume IndexScan inputs. Tracked
+          as the first sub-task of M0054-0006 with empirical
+          justification (Q8 is THE concrete TPC-H query that needs
+          it). No code change in M0054-0003d.)
+
   - [x] M0054-0003b: Investigate "No scan nodes" Q2/Q3/Q5/Q7/Q10/Q11/Q18/Q21.
         (landed 2026-05-05: ROOT CAUSE was an EXPLAIN-renderer bug,
         NOT a planner failure. The 8 queries all use M0038 multi-way
