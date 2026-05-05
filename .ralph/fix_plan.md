@@ -2703,6 +2703,28 @@ rationale here.
       `analysis/tpch-hammerdb-run-012.md` modelled on the run-011
       report, plus updated milestone status.
 
+      **Status (2026-05-05):** run-012 attempt #1 (NLI on) FAILED on
+      Q9 with `ERROR: column "ps_suppkey" is not numeric at runtime`
+      — see `M0054-0006-followup-Q9-composite`. Attempt #2 launched
+      with `GOOPG_DISABLE_NLI=1` (NLI gated off); after Q9 completed
+      successfully (1351 s vs 1810 s baseline = 25 % wall-clock
+      improvement from M0054-0005 + M0054-0006a-pre alone) and Q20
+      had been running ~45 min, the run was aborted at user request
+      to pivot to the NLI fix. Deliverable
+      `analysis/tpch-hammerdb-run-012.md` written and committed.
+      Milestone close pending **M0054-0007-followup-resume** below.
+
+  - [ ] M0054-0007-followup-resume: Re-run HammerDB TPC-H SF=1 power
+        test (call it run-013 or "run-012 attempt #3") with NLI
+        re-enabled by default, after `M0054-0006-followup-Q9-
+        composite` lands. Acceptance: full 22/22 query completion
+        within 7200 s wall clock. Inherits the no-deferral clause:
+        if any query fails, the offending query is named and a
+        concrete follow-up sub-task is opened. Deliverable:
+        `analysis/tpch-hammerdb-run-013.md` (or revised
+        `tpch-hammerdb-run-012.md` if the next run gets the same
+        run-012 label). Blocked by Q9-composite landing first.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
