@@ -1792,6 +1792,32 @@ tracks the new regression separately so we don't retro-edit history.
       - Q14: 42.9 s, Q2: 9.7 s, Q9: in progress (expected ~900 s SF=1)
       All `go test ./...` pass (hammerdb_load suite: 312s with 600s timeout).)
 
+## Milestone 0053 — HammerDB TPC-H Complete Run Verification & Report
+
+See `docs/milestones/0053-hammerdb-tpch-complete-run-verification.md`.
+Design doc: `docs/design/0053-0001-hammerdb-tpch-run-verification-procedure.md`.
+
+Goal: perform a clean, unambiguous, fully-attended end-to-end HammerDB TPC-H
+SF=1 run using **only `hammerdbcli`** (no manual `psql` DDL), capture all
+phase results, and write a structured English report. Update fix_plan.md task
+statuses based on run outcomes.
+
+- [ ] M0053-0001: Execute a complete HammerDB TPC-H SF=1 run (schema build →
+      data load → CREATE INDEX → ANALYZE → Q1–Q22 power test) using only
+      `hammerdbcli`. Start goopg with `setup_goopg.sh --reset`. Run
+      `build_schema_goopg.sh` and `run_power_test_goopg.sh` in the background
+      with a 2-hour wall-clock timeout. Monitor progress every ~10 minutes by
+      tailing the log files. Record per-table row counts, index creation
+      outcomes (pass/fail/transient), ANALYZE outcome, and per-query timing
+      for Q1–Q22. Write a structured English report to
+      `analysis/tpch-hammerdb-run-011.md` following the schema in
+      `docs/design/0053-0001-hammerdb-tpch-run-verification-procedure.md`.
+
+- [ ] M0053-0002: Update fix_plan.md task statuses based on M0053-0001
+      results. Mark M0053-0001 complete. If any phase failed, add a new
+      sub-task tracking the failure. Commit and push all changes (milestone
+      doc, design doc, report, fix_plan.md updates).
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

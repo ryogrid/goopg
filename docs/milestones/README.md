@@ -86,3 +86,5 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0049 | Protocol parity: cancellation, error detail, SCRAM-SHA-256, COPY binary | planned | `0049-protocol-parity.md` |
 | 0050 | Savepoints and subtransactions                                   | planned | `0050-savepoints-and-subtransactions.md` |
 | 0051 | Planner expression-level improvements (constant folding, implicit coercion, keyword categorisation, LIKE→range) | planned | `0051-planner-expression-improvements.md` |
+| 0052 | HammerDB TPC-H end-to-end regression on `perf-analysis` (oversized-message fix) | accepted | (tasks in `.ralph/fix_plan.md` — no separate milestone file; fixed via M0052-0001 + M0052-0002) |
+| 0053 | HammerDB TPC-H complete run verification & English report | in-progress | `0053-hammerdb-tpch-complete-run-verification.md` |
