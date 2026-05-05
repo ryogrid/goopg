@@ -203,3 +203,20 @@ func padZeros(n int) string {
 // Row is one tuple in flight: a slice of Datums aligned with the
 // emitting operator's Schema.
 type Row []Datum
+
+// cloneRow returns a fresh `Row` that shares no backing array with
+// `src`. Used by leaf scan operators (seqScan, indexScan,
+// spillReader) when their internal decode buffer is reused across
+// `Next()` calls and the caller may retain the returned row beyond
+// the next call (M0054-0005a). The Datum element type is a value
+// (no pointer-bearing fields beyond strings/bytes which are
+// immutable), so a `copy` is sufficient — no deep-copy of nested
+// data needed.
+func cloneRow(src Row) Row {
+	if src == nil {
+		return nil
+	}
+	dst := make(Row, len(src))
+	copy(dst, src)
+	return dst
+}

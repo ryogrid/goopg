@@ -2278,7 +2278,29 @@ rationale here.
       finding was actually addressed. Detailed implementation lives
       in `docs/design/0054-0002-executor-tuple-copy-reduction.md`.
 
-  - [ ] M0054-0005a: Reduce per-row Row-slice allocation in
+  - [x] M0054-0005a: Per-row buffer reuse on the seqScan leaf path.
+        (landed 2026-05-05: added `cloneRow` helper in
+        `internal/executor/datum.go`, added `scanRow Row` field to
+        `seqScanOp`, replaced the per-`Next()` `DecodeRow(...)`
+        allocation in `internal/executor/operators_storage.go` line
+        ~194 with `DecodeRowInto(o.scanRow, ...)` followed by
+        `cloneRow(...)` on return. The defensive clone is necessary
+        because parent operators (sortOp, hashJoinOp build, etc.)
+        retain rows beyond the next `Next()` call. The net effect:
+        the leaf scan no longer makes a fresh `[]Datum` slice per
+        tuple — it reuses the buffer and copies once. indexScanOp
+        was deliberately NOT changed: it appends every decoded row
+        to `o.rows` (already retains every row), so a buffer-reuse
+        + clone yields no allocation savings on that path. Spill
+        reader buffer reuse is deferred to M0054-0005b where the
+        Borrow-semantics roll-out enables it without a breaking
+        contract for callers that hold spilled rows. Tests:
+        `go test ./...` PASS across all 30+ packages including the
+        TPC-H baseline regeneration. The follow-up Q9 pprof window
+        (covered by M0054-0005b's re-profile) will quantify the
+        reduction in `runtime.findObject` flat %.)
+
+  - [ ] M0054-0005a-followup: Reduce per-row Row-slice allocation in
         `concatRows` / `nullRow` / projection / multi-hash output.
         **Evidence:** Q20 cumulative alloc shows
         `executor.concatRows` 7,980 GB (57.29 %) +

@@ -53,6 +53,17 @@ type seqScanOp struct {
 	// blocks strictly forward, so the prefetcher just needs to
 	// keep `seqScanLookahead` blocks ahead of curBlock.
 	prefetchedThru storage.BlockNumber
+
+	// scanRow is the per-Next() decode buffer (M0054-0005a). The
+	// pre-fix path called `DecodeRow` on every visible tuple,
+	// allocating a fresh `Row` slice each time. We now allocate
+	// `scanRow` once on first use and decode in place via
+	// `DecodeRowInto`, returning a defensive `cloneRow` so callers
+	// that retain the row across `Next()` calls (sortOp, hash-join
+	// build, etc.) keep their own copy. This drops the
+	// per-row leaf-allocation cost the M0054-0004 pprof survey
+	// flagged as `runtime.findObject` flat 29.30 % under Q9.
+	scanRow Row
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -191,18 +202,29 @@ func (o *seqScanOp) Next() (Row, error) {
 			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
 				continue
 			}
-			row, err := DecodeRow(o.cols, tuple.Data)
-			if err != nil {
+			// M0054-0005a: decode into the reusable o.scanRow
+			// buffer, then return a defensive clone so the
+			// caller can safely hold the row beyond the next
+			// `Next()` call.
+			if o.scanRow == nil || len(o.scanRow) != len(o.cols) {
+				o.scanRow = make(Row, len(o.cols))
+			}
+			if err := DecodeRowInto(o.scanRow, o.cols, tuple.Data); err != nil {
 				continue
 			}
+			row := o.scanRow
 			// Detoast any out-of-line column values (M0046-0006).
+			// DetoastRow may return a fresh row when it allocates
+			// large detoasted strings; either way the result is
+			// safe to clone.
 			if needsDetoast(row) {
-				row, err = DetoastRow(o.ctx, rel, o.cols, row)
+				detoasted, err := DetoastRow(o.ctx, rel, o.cols, row)
 				if err != nil {
 					continue // skip undetoastable tuple
 				}
+				row = detoasted
 			}
-			return row, nil
+			return cloneRow(row), nil
 		}
 		o.releasePinned()
 		o.curBlock++
