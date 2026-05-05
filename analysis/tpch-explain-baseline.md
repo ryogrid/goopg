@@ -173,8 +173,8 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | supplier | — |
-| 2 | Index Scan | lineitem | idx_lineitem_shipdate |
+| 1 | Index Scan | lineitem | idx_lineitem_shipdate |
+| 2 | Index Scan | supplier | supplier_pk |
 
 ### Q16
 
@@ -257,5 +257,5 @@ for an M0054-0003 sub-task investigation.
 | part | Q19 | Q14, Q16, Q17, Q2, Q8, Q9 |
 | partsupp | Q11, Q16, Q2, Q9 | — |
 | region | Q2, Q5, Q8 | — |
-| supplier | Q11, Q15b, Q2, Q20, Q21, Q5, Q7, Q8 | Q9 |
+| supplier | Q11, Q2, Q20, Q21, Q5, Q7, Q8 | Q15b, Q9 |
 

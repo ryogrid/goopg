@@ -223,6 +223,62 @@ func firstNLI(n Node) *NestedLoopIndexJoin {
 	return nil
 }
 
+// TestNLIRulePromotesAcrossFilterCrossJoinFromView
+// (M0054-0006-followup-Q15b) covers the view-substitution shape
+// where the WHERE equi-conjunct ends up on a top-level Filter and
+// the underlying Join is a CROSS JOIN with no Predicate. The
+// rule must hoist the cross-side equi-conjunct from the Filter
+// into the Join, flip Cross→Inner, and emit NLI on the indexed
+// supplier table.
+func TestNLIRulePromotesAcrossFilterCrossJoinFromView(t *testing.T) {
+	cat := catalog.NewInMemory()
+	supplier, err := cat.CreateTable(parser.ObjectName{Name: "supplier"}, []catalog.Column{
+		{Name: "s_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "s_name", Type: catalog.Type{Name: "varchar", Args: []int64{25}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "supplier_pk"}, supplier,
+		[]string{"s_suppkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "l_extendedprice", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Install revenue0 as a real catalog VIEW. The view-substitution
+	// path is what produces the Cross-Join + top-Filter shape.
+	viewStmts, err := parser.Parse(`SELECT l_suppkey, sum(l_extendedprice) FROM lineitem GROUP BY l_suppkey`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	innerSel := viewStmts[0].(*parser.SelectStmt)
+	if _, err := cat.CreateView(parser.ObjectName{Name: "revenue0"},
+		[]catalog.Column{
+			{Name: "supplier_no", Type: catalog.Type{Name: "int4"}},
+			{Name: "total_revenue", Type: catalog.Type{Name: "int4"}},
+		},
+		[]string{"supplier_no", "total_revenue"},
+		innerSel, true); err != nil {
+		t.Fatalf("CreateView: %v", err)
+	}
+	stmt := parseOne(t, `SELECT s_suppkey, s_name, total_revenue FROM supplier, revenue0 WHERE s_suppkey = supplier_no`)
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	nli := firstNLI(node)
+	if nli == nil {
+		t.Fatalf("expected NLI in view-shaped Q15b plan; tree: %s", describePlanTree(node))
+	}
+	if nli.Inner.Index == nil || nli.Inner.Index.Name != "supplier_pk" {
+		t.Fatalf("expected supplier_pk on inner; got %v", nli.Inner.Index)
+	}
+}
+
 // findNLI returns true when the plan tree contains a
 // `*NestedLoopIndexJoin` anywhere.
 func findNLI(n Node) bool {

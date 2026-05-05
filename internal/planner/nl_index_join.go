@@ -91,6 +91,44 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 		}
 		return x
 	case *Filter:
+		// M0054-0006-followup-Q15b: cross-side equi-conjuncts in a
+		// Filter sitting over an unconstrained *Join (no Predicate
+		// / LeftKey / RightKey) are produced by view substitution
+		// — the inlined view body lifts the WHERE equality up to
+		// a top-level Filter rather than attaching it to the
+		// Join. Push such conjuncts into the Join.Predicate so the
+		// standard NLI rule fires, leaving non-cross-side
+		// conjuncts on the Filter.
+		if jc, ok := x.Child.(*Join); ok && jc.Predicate == nil && jc.LeftKey == nil && jc.RightKey == nil &&
+			(jc.Type == JoinTypeInner || jc.Type == JoinTypeCross) {
+			leftWidth := len(jc.Left.Output())
+			crossEqs, residuals := splitFilterPredicateForNLI(x.Predicate, leftWidth)
+			if len(crossEqs) > 0 {
+				origType := jc.Type
+				jc.Predicate = andChainForNLI(crossEqs)
+				// A CROSS JOIN with an injected equi-conjunct is
+				// semantically an INNER join — flip the type so
+				// `tryBuildNLI` (which only accepts INNER/LEFT)
+				// can fire.
+				if jc.Type == JoinTypeCross {
+					jc.Type = JoinTypeInner
+				}
+				newChild := walkRewriteNLI(jc, cat)
+				if _, isNLI := newChild.(*NestedLoopIndexJoin); isNLI {
+					if len(residuals) == 0 {
+						return newChild
+					}
+					x.Child = newChild
+					x.Predicate = andChainForNLI(residuals)
+					return x
+				}
+				// Promotion failed — restore the Join's
+				// pre-modification state so we don't leak the
+				// synthetic Predicate or flipped Type.
+				jc.Predicate = nil
+				jc.Type = origType
+			}
+		}
 		x.Child = walkRewriteNLI(x.Child, cat)
 		return x
 	case *Project:
@@ -328,6 +366,58 @@ func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table,
 		}
 	}
 	return best, bestKeys
+}
+
+// splitFilterPredicateForNLI walks an AND-chained Filter predicate
+// and partitions the leaf conjuncts into "cross-side equi-
+// conjuncts" (suitable for promotion to NLI Predicate) and
+// "residuals" (everything else — non-equality, same-side, scalar).
+// `leftWidth` is the join's left-side schema width: a `*ColumnRef`
+// with `Index < leftWidth` belongs to the LEFT side. Cross-side
+// means one ColumnRef on each side. (M0054-0006-followup-Q15b.)
+func splitFilterPredicateForNLI(e Expr, leftWidth int) (cross []Expr, residual []Expr) {
+	for _, c := range walkAndConjunctsNLI(e) {
+		if isCrossSideEquiConjunctNLI(c, leftWidth) {
+			cross = append(cross, c)
+		} else {
+			residual = append(residual, c)
+		}
+	}
+	return cross, residual
+}
+
+// isCrossSideEquiConjunctNLI reports whether `e` is a binary
+// equality whose left and right ColumnRefs reference opposite
+// sides of the join (one Index < leftWidth, the other ≥ leftWidth).
+func isCrossSideEquiConjunctNLI(e Expr, leftWidth int) bool {
+	bop, ok := e.(*BinaryOp)
+	if !ok || bop.Op != "=" {
+		return false
+	}
+	a, aOK := bop.Left.(*ColumnRef)
+	b, bOK := bop.Right.(*ColumnRef)
+	if !aOK || !bOK {
+		return false
+	}
+	aLeft := a.Index >= 0 && a.Index < leftWidth
+	bLeft := b.Index >= 0 && b.Index < leftWidth
+	return aLeft != bLeft
+}
+
+// andChainForNLI rebuilds an AND chain from a slice of leaf
+// conjuncts. Single element returns itself; empty returns nil.
+func andChainForNLI(conjuncts []Expr) Expr {
+	if len(conjuncts) == 0 {
+		return nil
+	}
+	if len(conjuncts) == 1 {
+		return conjuncts[0]
+	}
+	out := conjuncts[0]
+	for i := 1; i < len(conjuncts); i++ {
+		out = &BinaryOp{Op: "AND", Left: out, Right: conjuncts[i]}
+	}
+	return out
 }
 
 // isBTreeIndex returns true when idx.Method is "btree" (case-insensitive).

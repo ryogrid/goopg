@@ -2517,10 +2517,34 @@ rationale here.
         gets an NLI plan on the part side. Acceptance: Q19
         baseline shows `Index Scan using part_pk on part`.
 
-  - [ ] M0054-0006-followup-Q15b: handle the binary join produced
-        by an inlined VIEW reference (supplier × revenue0).
-        Acceptance: Q15b baseline shows `Index Scan using
-        supplier_pk on supplier` (or another supplier index).
+  - [x] M0054-0006-followup-Q15b: **LANDED 2026-05-05.** Handle
+        the binary join produced by an inlined VIEW reference
+        (supplier × revenue0). ROOT CAUSE: view substitution
+        in `planScanRangeVar` produces `Filter(s_suppkey =
+        supplier_no, Join{Type=Cross, Predicate=nil}(SeqScan
+        supplier, Aggregate(...)))` — the WHERE equi-conjunct
+        is hoisted to the top Filter and the underlying Join is
+        a CROSS JOIN with no predicate, so `tryBuildNLI` could
+        not see the equi-conjunct. FIX: in `walkRewriteNLI`'s
+        `*Filter` case, when child is a Cross/Inner Join with
+        empty Predicate/LeftKey/RightKey, split AND-chained
+        Filter conjuncts into cross-side equi-conjuncts vs.
+        residuals (`splitFilterPredicateForNLI`), inject the
+        equi-conjuncts into `Join.Predicate`, flip Cross→Inner,
+        recurse. If NLI fires, residuals stay on the Filter; if
+        not, restore the Join's pre-modification state.
+        Acceptance evidence:
+        - `analysis/tpch-explain-baseline.md` Q15b regenerated
+          shows `Index Scan using supplier_pk on supplier` (was
+          `Seq Scan on supplier`). The supplier-table index-
+          utilisation column updates: Q15b moves from "SeqScan-
+          only" to "IndexScan-using". No regressions in any
+          other Q row.
+        - `TestNLIRulePromotesAcrossFilterCrossJoinFromView`
+          asserts the rule fires for a real catalog VIEW with
+          the canonical Q15b shape.
+        - All existing single- and composite-key NLI tests
+          continue to PASS.
 
   - [x] M0054-0006e-followup: **LANDED 2026-05-05.** Wired
         `SET enable_nestloop_index = off|on` to the planner's
