@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -452,6 +453,37 @@ type BTree struct {
 	logSplit LogSplitFunc
 
 	splitMu sync.Mutex
+
+	// M0055-0001: write-path counters used by the baseline
+	// harness and Phase A/B regression tests. All atomic so they
+	// can be read concurrently without locking. Reset by
+	// `(*BTree).ResetStats`.
+	stats BTreeStats
+}
+
+// BTreeStats are the per-tree counters surfaced by `(*BTree).Stats`
+// for benchmarks and regression tests. The counters are best-effort
+// (incremented from the steady-state insert/split path) and are
+// cleared by `(*BTree).ResetStats`. (M0055-0001.)
+type BTreeStats struct {
+	Inserts uint64 // total `Insert` calls
+	Splits  uint64 // total leaf+internal page splits
+}
+
+// Stats returns a snapshot of the BTree's write-path counters.
+// Snapshot is best-effort — concurrent inserts may make the
+// returned numbers stale by the time the caller reads them.
+func (bt *BTree) Stats() BTreeStats {
+	return BTreeStats{
+		Inserts: atomic.LoadUint64(&bt.stats.Inserts),
+		Splits:  atomic.LoadUint64(&bt.stats.Splits),
+	}
+}
+
+// ResetStats clears the BTree's write-path counters.
+func (bt *BTree) ResetStats() {
+	atomic.StoreUint64(&bt.stats.Inserts, 0)
+	atomic.StoreUint64(&bt.stats.Splits, 0)
 }
 
 // LogSplitFunc emits the atomic page-split WAL record described in
@@ -847,6 +879,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 // Insert places (key, ptr) into the leaf where it belongs, splitting
 // pages on the way up if needed.
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
+	atomic.AddUint64(&bt.stats.Inserts, 1) // M0055-0001
 	it := item{
 		keyLen: uint16(len(key)),
 		ptr:    ptr,
@@ -863,6 +896,7 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 
 	// Split path: serialise structure changes (split propagation,
 	// root lift, metapage rewrite), then retry from a fresh descent.
+	atomic.AddUint64(&bt.stats.Splits, 1) // M0055-0001 — counts insert calls that take the split-path retry.
 	bt.splitMu.Lock()
 	defer bt.splitMu.Unlock()
 

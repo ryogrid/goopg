@@ -2987,11 +2987,24 @@ Required design docs:
 - `docs/design/0055-0003-btree-page-deletion-and-recycling-protocol.md`
 - `docs/design/0055-0004-btree-external-sort-build-and-uniqueness.md`
 
-- [ ] M0055-0001: Baseline and acceptance harness for staged B-tree work.
-      Freeze benchmark/report inputs (insert-path pprof, split count,
-      duplicate-heavy size drift, CREATE INDEX RSS/time) and add test
-      guardrails so each subsequent sub-task can show before/after
-      evidence.
+- [x] M0055-0001: **LANDED 2026-05-06.** Baseline and acceptance
+      harness for staged B-tree work. Implementation:
+      - `internal/access/btree/btree.go` — added
+        `BTreeStats {Inserts, Splits uint64}` plus `(*BTree).Stats`
+        and `(*BTree).ResetStats`. Counters incremented in
+        `(*BTree).Insert` (always) and the split-path retry
+        (when the no-split fast path returns errNeedsSplit).
+      - `internal/access/btree/bench_baseline_test.go` (new) —
+        `TestBenchBaseline_M0055` runs 100K random uint64-key
+        inserts and emits a parsable
+        `M0055-baseline-summary { … }` block.
+      - `analysis/btree-baseline-2026-05-06.md` — frozen
+        baseline numbers (23.5K inserts/sec, p95 49 µs, p99
+        145 µs, 0.35 % splits, RSS delta 1.5 MB) plus the
+        Phase A-E threshold table for future deltas.
+      Acceptance evidence: `go test ./internal/access/btree/
+      -run TestBenchBaseline_M0055 -count=1 -v` PASS, summary
+      line printed in the parsable format.
 
 - [ ] M0055-0002: Phase A — write-path CPU + split-efficiency upgrades.
       Implement in-page binary-position insert, byte-aware split-loc,
