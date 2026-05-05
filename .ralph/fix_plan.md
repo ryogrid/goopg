@@ -1993,6 +1993,102 @@ code audit before the run, then M0053-0006 executes the run, M0053-0007 reports.
       check is effectively non-functional — any sufficiently active
       workload eventually shadows the checkpointer entry and panics.)
 
+## Milestone 0054 — TPC-H Performance & Optimisation Follow-Through
+
+See `docs/milestones/0054-tpch-performance-and-optimisation.md`.
+Methodology: `docs/design/0054-0001-tpch-perf-investigation-methodology.md`.
+
+Closes the empirical follow-through that M0053 deferred. **Strict
+no-deferral policy** applies (see milestone document §"Strict
+no-deferral policy"): tasks may NOT be closed by forwarding to
+another milestone unless that milestone is created and populated in
+the same loop, the user is informed in writing, and a clear empirical
+reason is recorded. "Out of scope" is not an acceptable closure
+rationale here.
+
+- [ ] M0054-0001: CREATE DATABASE WAL persistence. After a server
+      crash, `pg_database` retains only `postgres`; the user database
+      vanishes. M0030 closed without covering DATABASE-level DDL
+      (covers only `pg_class / pg_attribute / pg_type`). Add a WAL
+      record kind for `CREATE DATABASE` (and `DROP DATABASE` /
+      `ALTER DATABASE` if cheap), a redo handler, and recovery
+      integration. Regression test: `setup_goopg.sh --reset` → create
+      db → `kill -9` of the goopg process → restart → assert the
+      database is present and queryable. Files:
+      `internal/wal/records.go`, `internal/initdb/` recovery path,
+      `internal/executor/operators_ddl.go` (CREATE DATABASE emit-WAL).
+
+- [ ] M0054-0002: TPC-H index utilisation audit (EXPLAIN-driven). For
+      each of Q1..Q22 against a populated schema (10 % SF=1 via
+      `internal/testutil/tpch/` helpers + ANALYZE), capture
+      `EXPLAIN (FORMAT JSON)` and assert a baseline plan-shape (which
+      SeqScans / IndexScans / Joins). Publish
+      `analysis/tpch-explain-baseline.md` listing every Q1..Q22 plan,
+      the indexes used (or not), and the 3 most impactful
+      "should-be-IndexScan-but-is-SeqScan" gaps. The first run BAKES
+      IN the current state; subsequent runs flag improvements +
+      regressions. Files: new test under
+      `internal/testutil/tpch/index_utilisation_test.go`, new
+      analysis report.
+
+- [ ] M0054-0003: Close the index-utilisation gaps surfaced by
+      M0054-0002. Each gap closed produces an EXPLAIN diff committed
+      to the M0054-0002 baseline test snapshot. **DO NOT forward
+      unsized:** when M0054-0002 finishes, decompose the work into
+      M0054-0003a / M0054-0003b / ... sub-tasks here in fix_plan.md
+      with a one-line problem statement each. Acceptance: the gap is
+      closed in code AND visible in the EXPLAIN diff.
+
+- [ ] M0054-0004: pprof-driven bottleneck profiling under the
+      HammerDB power test. Promote `pprof-all.sh` (currently
+      untracked) to a tracked file; wire
+      `runtime.SetMutexProfileFraction(1)` /
+      `runtime.SetBlockProfileRate(1)` behind a GUC or env-var
+      toggle. Capture cpu / heap / mutex / block / goroutine profiles
+      at three windows: (W1) during steady-state Q9, (W2) during
+      steady-state Q20, (W3) at end-of-run / right before timeout.
+      Produce `analysis/tpch-pprof-bottleneck-survey.md` listing the
+      top 10 hot functions per profile, the top 3 lock contention
+      hotspots, and the top 3 allocation hotspots — each with a
+      concrete actionable next step. **No "needs more investigation"
+      hand-waving.**
+
+- [ ] M0054-0005: Implement the top-3 pprof-flagged perf fixes.
+      Three concrete code changes, each with a before/after
+      `pprof -top` slice or a before/after EXPLAIN ANALYZE timing
+      slice cited in the analysis report. Sized at the time
+      M0054-0004 finishes; if any single fix is too large, it spawns
+      its own M0054-0005a sub-task — but the parent does not close
+      until the work is real (landed code, not a forwarding pointer).
+
+- [ ] M0054-0006: Nested-loop index join (NLI) — implementation, not
+      scope. `docs/design/0053-0002-nested-loop-index-join-scope.md`
+      already specified the implementation skeleton; M0054 lands
+      every sub-task it called out:
+      M0054-0006a — `Param`-bound IndexScan operator (binds a value
+      at runtime, probes via existing `tree.RangeScan`).
+      M0054-0006b — `NestedLoopIndexJoin` plan node + executor
+      (`internal/executor/operators_nljoin.go`).
+      M0054-0006c — Planner rule: detect equi-join, pick index side,
+      emit NLI when the cost model says it wins (uses M0006 stats —
+      if stats are insufficient, M0054-0006c explicitly opens a
+      named sub-task rather than silently falling back).
+      M0054-0006d — Result-parity test matrix vs HashJoin for
+      representative TPC-H join shapes.
+      M0054-0006e — EXPLAIN renders `Nested Loop` with the inner
+      IndexScan; cost-model gate; rollback path.
+
+- [ ] M0054-0007: Re-run HammerDB TPC-H SF=1 power test → run-012.
+      Verify the cumulative effect of M0054-0001..0006 on the
+      end-to-end workflow. **The pass criterion is full 22/22 query
+      completion within the 2-hour wall-clock budget.** If any query
+      times out, the specific query is named, the slowness
+      root-caused with EXPLAIN ANALYZE + a pprof slice, and a
+      concrete follow-up sub-task is opened — the milestone does NOT
+      close on a "still slow but improved" excuse. Deliverable:
+      `analysis/tpch-hammerdb-run-012.md` modelled on the run-011
+      report, plus updated milestone status.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
