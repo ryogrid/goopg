@@ -306,13 +306,32 @@ func LookupGoroutine() (*Registry, string) {
 }
 
 func goroutineID() string {
+	// runtime.Stack header format: "goroutine N [running]:\n..."
+	// Skip past the "goroutine " prefix (10 chars) and read up to the
+	// next space, which is the boundary before "[running]".
+	const prefix = "goroutine "
 	buf := make([]byte, 64)
 	n := runtime.Stack(buf, false)
+	if n < len(prefix) {
+		return "0"
+	}
 	s := string(buf[:n])
-	// "goroutine N [running]:..." → extract "N"
-	for i := 0; i < n; i++ {
+	if s[:len(prefix)] != prefix {
+		return "0"
+	}
+	// Pre-fix bug (M0053-0006): the previous loop searched the WHOLE
+	// string for the FIRST space — that landed on s[9]==' ' (the space
+	// inside "goroutine "), and `s[9:i]` returned the trailing 'e' /
+	// even an empty string when len(prefix)==10. The result was that
+	// every goroutine shared the same goroutineMap key (""), so
+	// LookupGoroutine returned whichever backend most recently called
+	// RegisterCurrentGoroutine. That broke the M0042-0004 client-vs-
+	// checkpointer assertion and caused TPC-H Q9 power test to panic
+	// when a connection-handler goroutine's "client_backend" entry
+	// shadowed the checkpointer's "cp-0" entry.
+	for i := len(prefix); i < n; i++ {
 		if s[i] == ' ' {
-			return s[9:i]
+			return s[len(prefix):i]
 		}
 	}
 	return "0"

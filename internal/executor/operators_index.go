@@ -116,6 +116,15 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		}
 		loBytes = key
 		hiBytes = key
+		// Composite-index leading-column probe (M0053-0001):
+		// page keys carry suffix bytes for the trailing columns, so the
+		// inclusive upper bound must be widened to match every key whose
+		// leading bytes equal `key`. CompareKeys is byte-wise via
+		// bytes.Compare; appending 0xFF padding produces an upper bound
+		// that exceeds any realistic trailing-column encoding.
+		if len(o.plan.Index.Columns) > 1 {
+			hiBytes = appendCompositeUpperPadding(key)
+		}
 	} else {
 		// Range scan: evaluate lo/hi bounds independently.
 		lo, hiB, ok, err := o.lookupRangeBounds()
@@ -127,6 +136,9 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		}
 		loBytes = lo
 		hiBytes = hiB
+		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
+			hiBytes = appendCompositeUpperPadding(hiBytes)
+		}
 	}
 
 	scanFn := func(_ []byte, ptr storage.ItemPointer) (bool, error) {
@@ -268,4 +280,24 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 
 	// ok = true as long as at least one bound is specified (the scan is valid)
 	return loKey, hiKey, true, nil
+}
+
+// compositeUpperPaddingLen is how many 0xFF bytes are appended to a
+// leading-column key to form an inclusive upper bound for a composite
+// index probe (M0053-0001). It must exceed the maximum suffix-column
+// encoding for any plausible composite key. 64 bytes covers up to
+// ~8 trailing int4/int8 columns, ~3 NUMERIC(38) columns, or 1 varchar(60).
+// PostgreSQL's MaxHighKeyLen on goopg is 32, but leaf keys are not
+// truncated, so a generous bound is required.
+const compositeUpperPaddingLen = 64
+
+// appendCompositeUpperPadding returns key with `compositeUpperPaddingLen`
+// trailing 0xFF bytes. Caller-owned slice; the input is not aliased.
+func appendCompositeUpperPadding(key []byte) []byte {
+	out := make([]byte, len(key)+compositeUpperPaddingLen)
+	copy(out, key)
+	for i := len(key); i < len(out); i++ {
+		out[i] = 0xFF
+	}
+	return out
 }

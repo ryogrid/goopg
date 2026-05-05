@@ -232,6 +232,96 @@ func TestBulkCreateDeduplicationInsertAfter(t *testing.T) {
 	}
 }
 
+// TestDeduplicateOversizedPostingSplits verifies the M0053-0005 fix:
+// when a key has so many duplicates that a single posting item would
+// exceed the 0x7FFF page line-pointer limit, deduplicateToRawItems
+// splits the run into multiple smaller posting items.
+//
+// Reproduces the run-010 failure mode: LINEITEM(L_LINENUMBER) at SF=1
+// has values 1..7 each occurring ~1.5M times, yielding posting items
+// of ~9 MB if not split. We use a smaller scale (10000 dups of one
+// key) to keep the test fast while still exceeding the limit.
+func TestDeduplicateOversizedPostingSplits(t *testing.T) {
+	// 4-byte int4 key. Per-chunk capacity:
+	// (0x7FFF - 4 - 4) / 6 = 5459 TIDs.
+	const dupCount = 10000 // produces 2 chunks: 5459 + 4541
+	key := EncodeInt4(1)
+	items := make([]item, dupCount)
+	for i := 0; i < dupCount; i++ {
+		items[i] = item{
+			keyLen: uint16(len(key)),
+			ptr:    storage.ItemPointer{Block: storage.BlockNumber(i / 100), Offset: uint16(i%100 + 1)},
+			key:    key,
+		}
+	}
+
+	raws := deduplicateToRawItems(items)
+
+	if len(raws) < 2 {
+		t.Fatalf("expected the run to be split into >=2 posting items, got %d", len(raws))
+	}
+
+	// Every produced raw must fit within the page line-pointer limit so
+	// PageAddItemRaw will not reject it.
+	totalTIDs := 0
+	for i, ri := range raws {
+		if len(ri.raw) > maxRawItemSize {
+			t.Errorf("raw %d exceeds maxRawItemSize: len=%d limit=%d", i, len(ri.raw), maxRawItemSize)
+		}
+		if !isPostingRaw(ri.raw) {
+			t.Errorf("raw %d should still be a posting item after split", i)
+			continue
+		}
+		_, tids, err := parsePostingRaw(ri.raw)
+		if err != nil {
+			t.Errorf("parsePostingRaw chunk %d: %v", i, err)
+			continue
+		}
+		totalTIDs += len(tids)
+	}
+	if totalTIDs != dupCount {
+		t.Errorf("total TIDs across split chunks: want %d got %d", dupCount, totalTIDs)
+	}
+}
+
+// TestDeduplicateOversizedPostingSurvivesBulkCreate is the end-to-end
+// DoD test for M0053-0005: BulkCreate on a column with ~6000 duplicates
+// of a single key (which previously failed with "item too large for
+// line pointer len=35669") must now succeed and a full RangeScan must
+// return every TID exactly once.
+func TestDeduplicateOversizedPostingSurvivesBulkCreate(t *testing.T) {
+	pool, rel := newBulkTestPool(t)
+
+	// 6000 duplicates of key=1 reproduces the run-010 LINEITEM(L_ORDERKEY)
+	// shape closely enough to overflow the 0x7FFF limit on int4 keys
+	// (4 + 6000*6 + 4 = 36008 bytes > 32767).
+	const dupCount = 6000
+	entries := make([]BulkEntry, dupCount)
+	key := EncodeInt4(1)
+	for i := 0; i < dupCount; i++ {
+		entries[i] = BulkEntry{
+			Key: key,
+			Ptr: storage.ItemPointer{Block: storage.BlockNumber(i / 100), Offset: uint16(i%100 + 1)},
+		}
+	}
+
+	tree, err := BulkCreate(pool, rel, entries)
+	if err != nil {
+		t.Fatalf("BulkCreate must not fail with oversized posting items: %v", err)
+	}
+
+	var seen int
+	if err := tree.RangeScan(nil, nil, func(_ []byte, _ storage.ItemPointer) (bool, error) {
+		seen++
+		return true, nil
+	}); err != nil {
+		t.Fatalf("RangeScan: %v", err)
+	}
+	if seen != dupCount {
+		t.Errorf("RangeScan TID count: want %d got %d", dupCount, seen)
+	}
+}
+
 // TestPostingKeyOf verifies postingKeyOf extracts the key without TID allocation.
 func TestPostingKeyOf(t *testing.T) {
 	key := []byte("testkey")

@@ -72,8 +72,15 @@ REINDEX.
 
 - Posting items must fit on one 8 KiB page: max N*6 + keyLen + 4 < 8168 bytes,
   so at most ~1361 TIDs per key for a 30-byte key.
-  Columns with millions of duplicates per key would require TOAST-backed overflow,
-  deferred to a follow-up.
+  **Resolved by M0053-0005 (2026-05-05):** when a duplicate run would
+  produce a posting item exceeding `maxRawItemSize = 8000` bytes,
+  `deduplicateToRawItems` splits the run into multiple smaller posting
+  items each containing a chunk of TIDs. Multiple posting items with the
+  same key on a page (or across pages) are handled correctly by
+  `RangeScan` (it iterates items sequentially). This avoids the
+  TOAST-backed overflow design and keeps every posting item single-page.
+  Tested by `TestDeduplicateOversizedPostingSurvivesBulkCreate` (6000
+  duplicates of one int4 key).
 - `Insert` always creates single-TID items (no in-place posting-list growth).
   Dedup is only achieved via `BulkCreate` (i.e. on initial `CREATE INDEX`).
 - No `XLOG_BTREE_DEDUP` WAL record; pages use FPI (same as other BulkCreate pages).

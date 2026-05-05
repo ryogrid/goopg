@@ -412,11 +412,30 @@ func itemsToRawItems(items []item) []rawItem {
 	return out
 }
 
+// maxRawItemSize bounds an individual on-page item so that
+//  1. it satisfies storage.PageAddItemRaw's 15-bit Length field (0x7FFF), and
+//  2. it physically fits on an 8 KiB page after page header (24 B), B-tree
+//     opaque trailer (48 B, includes HighKey reserve) and the new line
+//     pointer (4 B). 8192 - 24 - 48 - 4 = 8116 — round down for safety.
+//
+// M0053-0005 uses this constant to split oversized posting-list runs into
+// multiple smaller posting items so each fits on a single page.
+const maxRawItemSize = 8000
+
 // deduplicateToRawItems groups consecutive same-key items into
 // posting-list rawItems (M0047-0003). Items must already be sorted by key.
 //
 //   - A run of 1: marshalled as a normal item (8+keyLen bytes).
 //   - A run of N≥2: marshalled as a posting-list item (4+N×6+keyLen bytes).
+//
+// M0053-0005: When a single run would produce a posting item exceeding
+// the 15-bit page line-pointer limit (0x7FFF bytes), the run is split
+// into multiple posting items each containing a chunk of TIDs.
+// PostgreSQL's btree readers handle multiple same-key items on a page
+// without issue (they iterate items sequentially), so correctness is
+// preserved at the cost of slightly higher index size for very
+// high-cardinality keys (e.g. LINEITEM(L_LINENUMBER) at TPC-H SF=1
+// where one value can have ~1.5M duplicates).
 func deduplicateToRawItems(items []item) []rawItem {
 	out := make([]rawItem, 0, len(items))
 	i := 0
@@ -433,7 +452,31 @@ func deduplicateToRawItems(items []item) []rawItem {
 			for k := i; k < j; k++ {
 				tids[k-i] = items[k].ptr
 			}
-			out = append(out, rawItem{raw: marshalPosting(key, tids), key: key})
+			// Compute the maximum number of TIDs that fit in one posting
+			// item: maxRawItemSize - postingHeaderSize - len(key) bytes
+			// available for TIDs at 6 bytes each.
+			maxTIDsPerChunk := (maxRawItemSize - postingHeaderSize - len(key)) / 6
+			if maxTIDsPerChunk < 1 {
+				// Pathological: key alone exceeds the page limit. Fall
+				// back to single-item-per-TID encoding so each entry
+				// still fits (it.marshal() uses 8+keyLen bytes; if even
+				// that overflows, the underlying PageAddItemRaw will
+				// reject and the caller sees a clean error).
+				for k := i; k < j; k++ {
+					out = append(out, rawItem{raw: items[k].marshal(), key: key})
+				}
+			} else if len(tids) <= maxTIDsPerChunk {
+				out = append(out, rawItem{raw: marshalPosting(key, tids), key: key})
+			} else {
+				for off := 0; off < len(tids); off += maxTIDsPerChunk {
+					end := off + maxTIDsPerChunk
+					if end > len(tids) {
+						end = len(tids)
+					}
+					chunk := tids[off:end]
+					out = append(out, rawItem{raw: marshalPosting(key, chunk), key: key})
+				}
+			}
 		}
 		i = j
 	}

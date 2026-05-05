@@ -2001,19 +2001,35 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	}, true, nil
 }
 
+// findBTreeIndexForColumn locates a B-tree index whose leading column
+// matches `col`. M0053-0001: composite indexes are accepted when their
+// FIRST key column matches; the resulting IndexScan probes only the
+// leading-column value. This is correct because B-tree key encoding is
+// a byte-wise concatenation of column encodings — any leaf key whose
+// leading-column bytes equal the probe value is a candidate. The
+// executor (`indexScanOp.lookupKey`) widens the upper bound with 0xFF
+// padding so the inclusive RangeScan range covers all suffix values.
+//
+// A single-column-only index is preferred when both shapes match the
+// column (cheaper probe — exact equality vs. prefix range) so the
+// search returns a single-column index first when one exists.
 func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string) *catalog.Index {
+	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if strings.ToLower(idx.Method) != "btree" {
 			continue
 		}
-		if len(idx.Columns) != 1 {
+		if len(idx.Columns) == 0 || idx.Columns[0] != col {
 			continue
 		}
-		if idx.Columns[0] == col {
+		if len(idx.Columns) == 1 {
 			return idx
 		}
+		if composite == nil {
+			composite = idx
+		}
 	}
-	return nil
+	return composite
 }
 
 // collectAndConjuncts walks an AND chain and returns the leaf conjuncts.
@@ -3060,6 +3076,13 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	}
 	idxScan, ok := child.(*IndexScan)
 	if !ok {
+		return proj
+	}
+	// M0053-0001: composite indexes are now reachable via IndexScan
+	// (leading-column probe), but the IndexOnlyScan executor cannot
+	// decode multi-column keys back to row Datums yet. Skip promotion
+	// for composite indexes so the row is fetched from the heap path.
+	if len(idxScan.Index.Columns) != 1 {
 		return proj
 	}
 	// Check that every projected column is in the index key.

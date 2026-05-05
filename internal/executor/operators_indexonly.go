@@ -63,6 +63,9 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 		loBytes = key
 		hiBytes = key
+		if len(o.plan.Index.Columns) > 1 {
+			hiBytes = appendCompositeUpperPadding(key)
+		}
 	} else {
 		lo, hi, ok, err := o.lookupRangeBounds()
 		if err != nil {
@@ -73,6 +76,9 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 		loBytes = lo
 		hiBytes = hi
+		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
+			hiBytes = appendCompositeUpperPadding(hiBytes)
+		}
 	}
 
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
