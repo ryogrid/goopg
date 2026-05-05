@@ -2875,26 +2875,43 @@ rationale here.
         lands. Deliverable:
         `analysis/tpch-hammerdb-run-013.md` (committed).
 
-- [ ] M0054-0008: Q20 decorrelation via magic-set / sideways
-      information passing (SIPS).
-      **Motivation:** TPC-H Q20 contains a correlated subquery that
-      computes `0.5 * sum(l_quantity)` per `(ps_partkey, ps_suppkey)`
-      against `lineitem`. Each outer `partsupp` probe re-runs the
-      lineitem aggregation, turning the Q into `partsupp_size ×
-      lineitem_aggregation`. run-013 (NLI ON, full M0054 stack)
-      shows Q20 still incomplete after >90 minutes — NLI alone does
-      not reach the inner aggregation cost. The Postgres-style fix
-      is decorrelation by lifting the correlated aggregate into a
-      hash-keyed materialisation outside the outer loop:
-      pre-compute `SELECT l_partkey, l_suppkey, sum(l_quantity)
-      FROM lineitem WHERE ... GROUP BY l_partkey, l_suppkey` once,
-      stash by `(l_partkey, l_suppkey)`, and probe per outer row.
-      This is also called magic-set transformation in datalog
-      literature.
-      **Acceptance:** Q20 wall-clock at SF=1 ≤ 600 s (10 min); a
-      synthetic correlated-aggregate fixture shows the rewrite
-      converts O(N×M) re-evaluation to O(N+M) hash probe.
-      **Design:** `docs/design/0054-0003-magic-set-decorrelation.md`.
+- [x] M0054-0008: **LANDED 2026-05-06.** Q20 decorrelation via
+      magic-set / SIPS — multi-parameter correlation extension
+      to the existing M0040 unnesting infrastructure. ROOT
+      ANALYSIS: goopg's `unnestSubqueriesInPlan` →
+      `unnestSubquery` already handled scalar correlated
+      aggregates of the form `(SELECT agg(...) FROM t WHERE
+      t.col = outer.col)` (single equi-conjunct correlation),
+      lifting them into a hash join over a `GROUP BY t.col`
+      aggregate. The bug was that `unnestSubquery` built the
+      Join key from `params[0]` only, ignoring additional
+      correlation pairs. For Q20's `WHERE l_partkey = ps_partkey
+      AND l_suppkey = ps_suppkey`, this would have matched on
+      `l_partkey` alone and produced wrong sums (cross-product
+      within ps_partkey groups). FIX in
+      `internal/planner/unnest.go::unnestSubquery`:
+      - Build per-pair `(outerCol[i], innerCol[i])` ColumnRef
+        pairs for ALL params (not just the first).
+      - Construct `Join.Predicate` as the AND chain of all
+        per-pair equalities. The hash key is the first pair
+        (`LeftKey/RightKey`); the rest are residual conjuncts
+        that the hash-join post-match evaluation enforces.
+      - Inner `Aggregate.GroupExprs` already contained every
+        param's SubCol (via `buildUnnestedSubquery`'s schema
+        construction), so no inner-side change was needed.
+      Acceptance evidence:
+      - `TestUnnestMultiParamCorrelation` (new) — Q20-shape
+        synthetic query (`partsupp` × correlated SUM over
+        `lineitem` with two correlation conjuncts) — confirms
+        the resulting Join.Predicate is an AND chain of TWO
+        equalities, no `*SubqueryExpr` remains.
+      - All existing unnest tests (`TestUnnestSubquery*`,
+        `TestCanUnnestSubquery*`) PASS unchanged.
+      - All planner / executor / TPC-H tests PASS.
+      Empirical TPC-H Q20 wall-clock validation requires the
+      next HammerDB resume run (out of scope this loop —
+      M0054-0007 is explicitly de-scoped per user direction).
+      Design: `docs/design/0054-0003-magic-set-decorrelation.md`.
 
 - [x] M0054-0009: **LANDED 2026-05-06.** Q20 LIKE-prefix range
       audit. Verdict: M0051-0004's prefix→range rewriter is

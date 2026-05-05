@@ -790,17 +790,46 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	}
 	filter.Predicate = combineAnd(newConjuncts)
 
-	outerKeyExpr := &ColumnRef{
-		pos:   params[0].OuterRef.Pos(),
-		Index: params[0].OuterRef.Index,
-		Name:  params[0].OuterRef.Name,
-		Type:  params[0].OuterRef.Type,
+	// M0054-0008: handle multi-parameter correlation. The inner
+	// Aggregate now groups by every correlation column (built by
+	// buildUnnestedSubquery), and the outer join needs to bind
+	// every (outer-col, inner-col) pair. The first pair becomes
+	// the hash key (LeftKey/RightKey); additional pairs go into
+	// the join Predicate as AND-conjuncts so the hash-join's
+	// post-match evaluation filters out rows that match the first
+	// key but disagree on the remaining keys. Without this fix,
+	// a Q20-shape subquery with `l_partkey = ps_partkey AND
+	// l_suppkey = ps_suppkey` would match on l_partkey alone and
+	// produce wrong sums.
+	outerKeyExprs := make([]*ColumnRef, len(params))
+	innerKeyExprs := make([]*ColumnRef, len(params))
+	for i, p := range params {
+		outerKeyExprs[i] = &ColumnRef{
+			pos:   p.OuterRef.Pos(),
+			Index: p.OuterRef.Index,
+			Name:  p.OuterRef.Name,
+			Type:  p.OuterRef.Type,
+		}
+		innerKeyExprs[i] = &ColumnRef{
+			pos:   p.SubCol.Pos(),
+			Index: outerWidth + i, // i-th group-by column in subSchema
+			Name:  p.SubCol.Name,
+			Type:  p.SubCol.Type,
+		}
 	}
-	innerKeyExpr := &ColumnRef{
-		pos:   params[0].SubCol.Pos(),
-		Index: outerWidth,
-		Name:  params[0].SubCol.Name,
-		Type:  params[0].SubCol.Type,
+	// Build the join Predicate as AND of all per-pair equalities.
+	var joinPredicate Expr = &BinaryOp{
+		pos: sub.Pos(), Op: "=",
+		Left:  outerKeyExprs[0],
+		Right: innerKeyExprs[0],
+	}
+	for i := 1; i < len(params); i++ {
+		eq := &BinaryOp{
+			pos: sub.Pos(), Op: "=",
+			Left:  outerKeyExprs[i],
+			Right: innerKeyExprs[i],
+		}
+		joinPredicate = &BinaryOp{pos: sub.Pos(), Op: "AND", Left: joinPredicate, Right: eq}
 	}
 	mergedSchema := make(Schema, outerWidth+len(subSchema))
 	copy(mergedSchema, outerChild.Output())
@@ -813,10 +842,13 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 		Algo:      JoinAlgoHash,
 		Left:      outerChild,
 		Right:     subPlan,
-		Predicate: &BinaryOp{pos: sub.Pos(), Op: "=", Left: outerKeyExpr, Right: innerKeyExpr},
-		LeftKey:   outerKeyExpr,
-		RightKey:  &ColumnRef{pos: sub.Pos(), Index: 0, Name: params[0].SubCol.Name, Type: params[0].SubCol.Type},
-		schema:    mergedSchema,
+		Predicate: joinPredicate,
+		// Hash key uses the FIRST param's pair. The remaining
+		// per-pair equalities are enforced as residuals via the
+		// Predicate above.
+		LeftKey:  outerKeyExprs[0],
+		RightKey: &ColumnRef{pos: sub.Pos(), Index: 0, Name: params[0].SubCol.Name, Type: params[0].SubCol.Type},
+		schema:   mergedSchema,
 	}
 	filter.Child = join
 	return outer, nil
