@@ -40,6 +40,22 @@ func maybeForceGCAfterCommit() {}
 func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
+		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
+		// here (the parser doesn't recognise them yet) so we can
+		// (a) update the catalog so subsequent connections see the
+		// database in pg_database / can connect to it, and (b) emit a
+		// WAL record so the registration survives a crash. Other
+		// commands fall through to the wire-protocol no-op tag handler.
+		if handled, herr := s.tryHandleDatabaseDDL(sql); handled {
+			if herr != nil {
+				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
+			}
+			tag := databaseDDLCommandTag(sql)
+			if err := w.WriteCommandComplete(tag); err != nil {
+				return err
+			}
+			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		}
 		if tag, ok := compatNoopCommandTag(sql); ok {
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err

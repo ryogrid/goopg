@@ -531,6 +531,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
 	}
 
+	// M0054-0001: replay CREATE/DROP DATABASE WAL records into the
+	// catalog's database registry. Physical WAL replay (line ~212
+	// above) ignored these records because they don't touch on-disk
+	// storage in v0; the recovery driver applies them here, after the
+	// catalog is fully constructed, so the next connection sees an
+	// accurate `pg_database`. Order matters: a drop following a
+	// create cancels out, so we walk records in stream order.
+	if err := replayDatabaseDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
+	}
+
 	// Replication-slot registry. The retention path on the
 	// checkpointer (wired below in cmd/goopg start once the GUC
 	// values are known) consults this to decide which WAL

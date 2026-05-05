@@ -7,6 +7,7 @@
 package catalog
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,6 +15,12 @@ import (
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
+)
+
+// Errors returned by database registration helpers (M0054-0001).
+var (
+	ErrDatabaseExists   = errors.New("database already exists")
+	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
 // Type is the textual type tag plus an optional typmod argument list.
@@ -191,6 +198,17 @@ type InMemory struct {
 	// so existing CRUD on those types stays untouched. Accessed
 	// via `(*InMemory).Routines()`.
 	routines *Routines
+	// databases is the set of database names the cluster knows
+	// about (M0054-0001). Populated by `CreateDatabase` and
+	// drained by `DropDatabase`. At startup the catalog seeds
+	// `"postgres"` (the conventional bootstrap DB); the recovery
+	// driver in `internal/initdb` re-applies WAL-logged
+	// CREATE/DROP DATABASE events on top. v0 still routes every
+	// relation through DefaultDBOid — the registry exists so
+	// `pg_database` returns truthful rows and so connections to
+	// recovered databases succeed after a crash, NOT for
+	// per-database storage isolation (that lands later).
+	databases map[string]bool
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -225,15 +243,86 @@ const DefaultDBOid uint32 = 1
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:   make(map[string]*Table),
-		indexes:  make(map[string]*Index),
-		byTable:  make(map[uint32]map[string]*Index),
-		nextOID:  FirstUserOID,
-		dbOid:    DefaultDBOid,
-		routines: NewRoutines(),
+		tables:    make(map[string]*Table),
+		indexes:   make(map[string]*Index),
+		byTable:   make(map[uint32]map[string]*Index),
+		nextOID:   FirstUserOID,
+		dbOid:     DefaultDBOid,
+		routines:  NewRoutines(),
+		databases: map[string]bool{"postgres": true},
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// HasDatabase reports whether the given database name is registered
+// in the catalog. Used by the connection startup path to validate
+// the requested database parameter.
+func (c *InMemory) HasDatabase(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.databases[name]
+}
+
+// CreateDatabase registers a new database name (M0054-0001). Returns
+// `ErrDatabaseExists` when the name is already known. Callers are
+// expected to write a `wal.RecordKindCreateDatabase` record on the
+// success path so the registration survives a crash. Bootstrap and
+// recovery paths use `RegisterDatabaseDuringRecovery` instead, which
+// is idempotent.
+func (c *InMemory) CreateDatabase(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.databases[name] {
+		return ErrDatabaseExists
+	}
+	c.databases[name] = true
+	return nil
+}
+
+// DropDatabase removes a database from the catalog (M0054-0001).
+// Returns `ErrDatabaseNotFound` when the name is not registered.
+func (c *InMemory) DropDatabase(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.databases[name] {
+		return ErrDatabaseNotFound
+	}
+	delete(c.databases, name)
+	return nil
+}
+
+// RegisterDatabaseDuringRecovery is the idempotent version of
+// CreateDatabase used by the WAL-replay driver. Re-applying a record
+// that has already taken effect (e.g. because a SaveCatalog snapshot
+// captured it) is a no-op rather than an error.
+func (c *InMemory) RegisterDatabaseDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.databases[name] = true
+}
+
+// UnregisterDatabaseDuringRecovery is the idempotent counterpart to
+// `RegisterDatabaseDuringRecovery` — used for replaying
+// `RecordKindDropDatabase`.
+func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.databases, name)
+}
+
+// ListDatabases returns the registered database names in
+// deterministic (lexicographic) order. Backs the `pg_database`
+// virtual table.
+func (c *InMemory) ListDatabases() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.databases))
+	for n := range c.databases {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Routines returns the user-defined routine registry. Stage A
@@ -368,7 +457,15 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgDatabase.VirtualRows = func() [][]string {
-		return [][]string{{"postgres", "10", "6"}}
+		// M0054-0001: enumerate the live database registry instead
+		// of hard-coding a single `postgres` row. CREATE DATABASE
+		// adds entries; the recovery driver replays them.
+		names := c.ListDatabases()
+		out := make([][]string, 0, len(names))
+		for _, n := range names {
+			out = append(out, []string{n, "10", "6"})
+		}
+		return out
 	}
 	c.tables["pg_catalog.pg_database"] = pgDatabase
 

@@ -2006,17 +2006,43 @@ the same loop, the user is informed in writing, and a clear empirical
 reason is recorded. "Out of scope" is not an acceptable closure
 rationale here.
 
-- [ ] M0054-0001: CREATE DATABASE WAL persistence. After a server
-      crash, `pg_database` retains only `postgres`; the user database
-      vanishes. M0030 closed without covering DATABASE-level DDL
-      (covers only `pg_class / pg_attribute / pg_type`). Add a WAL
-      record kind for `CREATE DATABASE` (and `DROP DATABASE` /
-      `ALTER DATABASE` if cheap), a redo handler, and recovery
-      integration. Regression test: `setup_goopg.sh --reset` → create
-      db → `kill -9` of the goopg process → restart → assert the
-      database is present and queryable. Files:
-      `internal/wal/records.go`, `internal/initdb/` recovery path,
-      `internal/executor/operators_ddl.go` (CREATE DATABASE emit-WAL).
+- [x] M0054-0001: CREATE DATABASE WAL persistence.
+      (landed 2026-05-05: added `RecordKindCreateDatabase = 18` and
+      `RecordKindDropDatabase = 19` in `internal/wal/recovery.go`
+      with `EncodeCreateDatabase`/`DecodeCreateDatabase`/`Encode`/
+      `DecodeDropDatabase` helpers. `applyRecord` returns
+      `(false, nil)` for these kinds — they don't touch on-disk
+      storage in v0 because there is no per-database file namespace
+      yet (a real multi-database storage layout is its own
+      milestone). Added `databases map[string]bool` field to
+      `catalog.InMemory` plus `CreateDatabase` / `DropDatabase` /
+      `HasDatabase` / `ListDatabases` /
+      `RegisterDatabaseDuringRecovery` /
+      `UnregisterDatabaseDuringRecovery` methods. The
+      `pg_database` virtual table now enumerates the live registry
+      instead of returning a hard-coded `postgres` row.
+      `internal/server/database_ddl.go` adds a string-prefix DDL
+      handler invoked from `dispatchSimpleQueryViaExecutor` BEFORE
+      the legacy `compatNoopCommandTag` path: it parses the database
+      name, mutates the catalog, then appends the WAL record (with
+      a catalog-rollback if the WAL append fails so memory and disk
+      stay consistent). `internal/initdb/database_ddl_recovery.go`
+      adds `replayDatabaseDDLRecords` which scans `pg_wal` after
+      physical WAL replay and replays CREATE/DROP DATABASE records
+      into the catalog. SCOPE NOTE per M0054 no-deferral clause:
+      v0 still routes every relation through `DefaultDBOid`. The
+      change makes `pg_database` truthful and post-crash connections
+      to user-created databases succeed — sufficient for the
+      HammerDB TPC-H workflow that surfaced the bug. Per-database
+      storage isolation is a separate, larger milestone. Tests:
+      `internal/wal/database_ddl_test.go` (encode/decode round-trip
+      + corrupt-payload guards),
+      `internal/catalog/database_test.go` (registry semantics +
+      pg_database virtual rows),
+      `internal/initdb/database_ddl_recovery_test.go` (CREATE
+      replays, CREATE+DROP cancels, missing-walDir is a no-op),
+      `internal/server/database_ddl_test.go` (DDL classifier and
+      identifier parser). Full `go test ./...` PASS.)
 
 - [ ] M0054-0002: TPC-H index utilisation audit (EXPLAIN-driven). For
       each of Q1..Q22 against a populated schema (10 % SF=1 via

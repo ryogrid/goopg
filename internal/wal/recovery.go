@@ -129,6 +129,23 @@ const (
 	//   kind(1) | subXid(4) = 5 bytes total.
 	RecordKindXactSubAbort byte = 17
 
+	// RecordKindCreateDatabase records a `CREATE DATABASE <name>` event
+	// so the catalog's per-instance database list can be reconstructed
+	// after a crash (M0054-0001). The redo path does NOT touch on-disk
+	// storage — goopg v0 has no per-database file namespacing — so
+	// applyRecord returns (false, nil); the recovery driver in
+	// internal/initdb scans the WAL for these records after physical
+	// replay and re-registers each database name in the catalog.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindCreateDatabase byte = 18
+
+	// RecordKindDropDatabase records a `DROP DATABASE <name>` event.
+	// Counterpart to RecordKindCreateDatabase. Same format / replay
+	// semantics; the recovery driver removes the name from the
+	// catalog instead of adding it.
+	RecordKindDropDatabase byte = 19
+
 	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
 	smgrRecordSize = 10
 
@@ -159,6 +176,65 @@ const (
 	// new-tuple bytes follow.
 	heapHotUpdateHeaderSize = 20
 )
+
+// EncodeCreateDatabase encodes a CREATE DATABASE event (M0054-0001).
+// Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeCreateDatabase(name string) []byte {
+	if len(name) > 0xFFFF {
+		// goopg's identifier length cap is far below 64 KiB; truncating
+		// here is defensive — this branch is unreachable under normal
+		// CREATE DATABASE syntax.
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindCreateDatabase
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload.
+func DecodeCreateDatabase(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateDatabase {
+		return "", fmt.Errorf("wal: record kind %d is not create-database", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeDropDatabase encodes a DROP DATABASE event (M0054-0001).
+// Format identical to EncodeCreateDatabase.
+func EncodeDropDatabase(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropDatabase
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropDatabase decodes a RecordKindDropDatabase payload.
+func DecodeDropDatabase(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-database payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropDatabase {
+		return "", fmt.Errorf("wal: record kind %d is not drop-database", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-database payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
 
 // EncodeXactAssignment encodes a subxact XID assignment record (M0050-0003).
 // parentXid is the top-level transaction; subXids lists the subxact XIDs
@@ -848,6 +924,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// markers exist purely so the M0008 logical decoder can
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
+		return false, nil
+	case RecordKindCreateDatabase, RecordKindDropDatabase:
+		// CREATE/DROP DATABASE records (M0054-0001) carry only a database
+		// name; goopg v0 has no per-database file namespacing, so the
+		// physical replay path has nothing to do. The recovery driver in
+		// internal/initdb/open.go scans the WAL for these records after
+		// physical replay and re-applies them to the catalog's database
+		// list.
 		return false, nil
 	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
 		// Subxact markers (M0050-0003) — physical page recovery is
