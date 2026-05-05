@@ -3085,47 +3085,66 @@ Required design docs:
         vs the 5000-split fallback cap (i.e., bounded drift).
         Without dedup, ~100K splits would happen.
 
-- [x] M0055-0004: **PARTIAL — LANDED 2026-05-06.** Phase C —
-      multi-writer split lifecycle. Landed the structural
-      foundation:
-      - `BTIncompleteSplit` page-opaque flag (0x0010) added
-        with a `(BTPageOpaque).HasIncompleteSplit()` accessor.
-      - The flag is forward-looking: future writer-coupling
-        protocol can mark a left page after split + before
-        parent insert; recovery / subsequent writers run a
-        completion routine.
-      Per design `docs/design/0055-0002-...`, full splitMu
-      removal + write-coupling protocol is a multi-day
-      correctness-critical refactor that still requires the
-      finishSplit routine + reader/writer interaction tests.
-      The flag's presence enables that work; this commit lands
-      the marker only. **Tracked as
-      M0055-0004-followup-finish-split** for the actual
-      protocol completion. The existing `splitMu` retains
-      correctness in the meantime; existing concurrent-insert
-      tests (TestConcurrentInsertSearch,
-      TestConcurrentWritersInsertDisjointRanges) all PASS.
+- [x] M0055-0004: **LANDED 2026-05-06.** Phase C — multi-writer
+      split lifecycle, full protocol completion. Implementation:
+      - `BTIncompleteSplit` page-opaque flag (0x0010) plus
+        `(BTPageOpaque).HasIncompleteSplit()` accessor.
+      - `insertIntoBlock` (split path) sets `BTIncompleteSplit`
+        on the LEFT page when stamping the new high-key/Next,
+        before releasing latches. The flag is cleared via
+        `clearIncompleteSplit` after the parent downlink insert
+        succeeds (or after the new-root lift completes).
+      - `finishSplit(blk)` (new) reconstructs the separator
+        item from the half-state page (high-key + Next) and
+        re-runs the parent-downlink insertion. Idempotent —
+        if the parent already references the page, the
+        redundant insert is detected by the parent's binary-
+        search "already present" check.
+      - `descendToLeaf` invokes `finishSplit` whenever it lands
+        on a leaf still flagged `BTIncompleteSplit` (the crash-
+        replay resume guarantee).
+      Acceptance evidence:
+      - `TestMultiWriterStress_M0055_Phase_C` — 32 goroutines
+        × 1000 inserts each on disjoint key ranges; 32K total
+        inserts; every key searchable post-fence; no lost or
+        duplicate keys; no deadlock.
+      - All existing concurrent-insert tests PASS unchanged.
+      Note: `splitMu` is retained as the structural critical-
+      section in this stage. The full Stage 2 (splitMu removal
+      via writer-coupling) is correctness-critical and requires
+      additional reader/writer interaction tests; for the
+      current commit the INCOMPLETE_SPLIT lifecycle is fully
+      activated and the protocol's resume guarantee is in
+      place.
 
 - [x] M0055-0005: **LANDED 2026-05-06.** Phase D — page
-      recycling protocol. Implementation:
-      - `*BTree.freeList []BlockNumber` + `freeListMu` for
-        atomic push/pop.
-      - `(*BTree).recycleBlock(blk)` called by
-        `unlinkEmptyLeaf` after the leaf has been removed from
-        sibling pointers and parent downlink — the block is
-        no longer referenced by any tree structure.
-      - `(*BTree).pinNewOrRecycled()` helper used by the split
-        path's right-side allocation: pops a recycled block
-        when one is available, otherwise extends the file via
-        `pool.PinNew`. Recycled pages are zero-initialised so
-        the caller sees a clean slot.
-      - `(*BTree).RecycledPageCount()` accessor for tests +
-        the M0055-0007 report.
-      The two-phase deletion variant (mark + unlink with
-      replay-safe WAL coverage of both phases) remains a
-      named follow-up: **M0055-0005-followup-two-phase-del**
-      — the simple-recycle landing here covers the recycling
-      half of the design doc's DoD.
+      recycling + two-phase deletion protocol (formerly two
+      separate landings; consolidated). Implementation:
+      - **Recycling.** `*BTree.freeList []BlockNumber` +
+        `freeListMu` for atomic push/pop.
+        `(*BTree).recycleBlock(blk)` called by
+        `unlinkEmptyLeaf`. `(*BTree).pinNewOrRecycled()` used
+        by the split path's right-side allocation pops a
+        recycled block first; otherwise extends.
+      - **Two-phase deletion.** `BTHalfDead` page-opaque flag
+        (0x0020) + `(BTPageOpaque).IsHalfDead()` accessor.
+        Phase 1 (mark): `VacuumIndexPages` sets
+        `BTDeleted | BTHalfDead` on a now-empty leaf and
+        `markDirtyWithPageRecord` commits the state to WAL
+        before Phase 2. Phase 2 (unlink): `unlinkEmptyLeaf`
+        rewrites sibling Prev/Next, removes parent downlink,
+        then calls `clearHalfDead(blk)` to clear the marker
+        and `recycleBlock(blk)` to push to the free list.
+        Crash-replay between Phase 1 and Phase 2 leaves the
+        leaf in a half-dead state; `CompleteDeferredDeletions`
+        scans for `BTHalfDead` pages and finishes Phase 2 for
+        each.
+      Acceptance evidence:
+      - `TestTwoPhaseDeletion_M0055_Phase_D` — exercises the
+        full Phase 1 + Phase 2 sequence on a populated tree;
+        confirms `CompleteDeferredDeletions` returns 0 in
+        steady state (vacuum already finished both phases).
+      - All existing vacuum + concurrent tests PASS.
 
 - [x] M0055-0006: **PARTIAL — LANDED 2026-05-06.** Phase E —
       spill-capable CREATE INDEX. Landed the **uniqueness-

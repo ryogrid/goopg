@@ -92,8 +92,16 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 				}
 			}
 			if len(kept) == 0 {
-				// Leaf is now empty — mark it for unlinking.
-				op.Flags |= BTDeleted
+				// M0055-0005-followup-two-phase-del: PHASE 1 mark.
+				// Set BOTH BTDeleted (existing flag, used by
+				// readers / callers as the "this page has been
+				// vacuumed empty" signal) AND BTHalfDead — the
+				// new two-phase marker that says "PHASE 1 has
+				// committed to disk; PHASE 2 unlink remains".
+				// Crash-replay restores the half-dead state so
+				// a subsequent vacuum or descent picks up where
+				// we left off.
+				op.Flags |= BTDeleted | BTHalfDead
 				writeOpaque(slot.Page(), op)
 				emptyLeaves = append(emptyLeaves, emptyLeafInfo{
 					blk:      cur,
@@ -224,11 +232,72 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	if err := bt.removeDownlinkFromParent(parentBlk, leaf.blk); err != nil {
 		return err
 	}
+	// M0055-0005-followup-two-phase-del: PHASE 2 complete —
+	// clear the BTHalfDead marker so future vacuum passes don't
+	// retry the unlink. A subsequent crash before recycle is
+	// safe: the page is already orphaned from the tree
+	// structure; the recycle step is local bookkeeping.
+	if err := bt.clearHalfDead(leaf.blk); err != nil {
+		return err
+	}
 	// M0055-0005 Phase D: page recycling. The unlinked leaf is
 	// no longer referenced by parent or siblings; its block can
 	// be reused by future allocations on this tree.
 	bt.recycleBlock(leaf.blk)
 	return nil
+}
+
+// clearHalfDead (M0055-0005-followup-two-phase-del) clears the
+// BTHalfDead marker on a fully-unlinked page. Invoked at the
+// end of a successful Phase 2 unlink. Leaving the flag set
+// on a not-yet-recycled page is also safe (a later vacuum
+// would just re-attempt the now-no-op unlink); but clearing
+// it keeps the page-state observable to crash-replay
+// inspectors.
+func (bt *BTree) clearHalfDead(blk storage.BlockNumber) error {
+	slot, err := bt.pinW(blk)
+	if err != nil {
+		return err
+	}
+	op := readOpaque(slot.Page())
+	op.Flags &^= BTHalfDead
+	writeOpaque(slot.Page(), op)
+	err = bt.markDirtyWithPageRecord(slot, blk)
+	bt.unpinW(slot)
+	return err
+}
+
+// CompleteDeferredDeletions (M0055-0005-followup-two-phase-del)
+// scans the tree for any pages still flagged BTHalfDead (Phase
+// 1 committed, Phase 2 not finished — typical post-crash
+// state) and finishes the unlink + recycle for each. Called by
+// vacuum maintenance and by tests that simulate crashed
+// deletes.
+func (bt *BTree) CompleteDeferredDeletions() (int, error) {
+	rel := bt.rel
+	nBlocks, err := bt.pool.NBlocks(rel)
+	if err != nil {
+		return 0, err
+	}
+	completed := 0
+	for blk := storage.BlockNumber(1); blk < nBlocks; blk++ {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			continue
+		}
+		op := readOpaque(slot.Page())
+		if !op.IsHalfDead() {
+			bt.unpinR(slot)
+			continue
+		}
+		info := emptyLeafInfo{blk: blk, prev: op.Prev, next: op.Next}
+		bt.unpinR(slot)
+		if err := bt.unlinkEmptyLeaf(info); err != nil {
+			return completed, err
+		}
+		completed++
+	}
+	return completed, nil
 }
 
 // removeParentDownlinkByBlock finds the parent of blk by walking the

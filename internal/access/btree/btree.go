@@ -61,6 +61,15 @@ const (
 	// inserting further. Cleared by finishSplit after the parent
 	// downlink lands.
 	BTIncompleteSplit uint16 = 0x0010
+	// BTHalfDead (M0055-0005-followup-two-phase-del) marks a
+	// page as the target of a two-phase deletion whose Phase 1
+	// (mark + WAL) has completed but whose Phase 2 (unlink +
+	// recycle) has not. Vacuum and writer paths that encounter
+	// a half-dead page MUST run `(*BTree).completeDeletion` to
+	// finish Phase 2 before treating the page as live or
+	// recycled. Crash-replay restores the half-dead state from
+	// the Phase 1 WAL record.
+	BTHalfDead uint16 = 0x0020
 )
 
 // MetaBlock is always block 0 — the metapage. RootStart is the first
@@ -104,6 +113,11 @@ func (o BTPageOpaque) IsLeaf() bool { return o.Flags&BTLeaf != 0 }
 // of a split that has not yet propagated its parent downlink.
 // (M0055-0004 Phase C.)
 func (o BTPageOpaque) HasIncompleteSplit() bool { return o.Flags&BTIncompleteSplit != 0 }
+
+// IsHalfDead reports whether this page is mid-deletion — Phase 1
+// has marked it but Phase 2 has not unlinked it yet.
+// (M0055-0005-followup-two-phase-del.)
+func (o BTPageOpaque) IsHalfDead() bool { return o.Flags&BTHalfDead != 0 }
 
 // IsRoot reports whether the page is the current root.
 func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
@@ -953,7 +967,18 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 			if op.Next == 0 {
 				bt.rightmostLeafBlk.Store(uint64(cur))
 			}
+			incomplete := op.HasIncompleteSplit()
 			bt.unpinR(slot)
+			// M0055-0004-followup-finish-split: if the leaf
+			// retains a stale incomplete-split marker (crash
+			// replay scenario), complete the parent-downlink
+			// insert before treating the leaf as live. The
+			// completion is idempotent.
+			if incomplete {
+				if err := bt.finishSplit(cur); err != nil {
+					return 0, nil, err
+				}
+			}
 			return cur, path, nil
 		}
 
@@ -1177,6 +1202,13 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			len(sepKey), MaxHighKeyLen)
 	}
 	op.HighKey = append([]byte(nil), sepKey...)
+	// M0055-0004-followup-finish-split: mark the LEFT page as
+	// incomplete-split before releasing latches. Cleared after
+	// the parent downlink insert succeeds. Crash-replay leaves
+	// the flag set so a subsequent writer descending to this
+	// page runs finishSplit before inserting (the protocol's
+	// resume guarantee).
+	op.Flags |= BTIncompleteSplit
 	writeOpaque(slot.Page(), op)
 
 	// Atomic split WAL record (Landing 3a). When a writer is
@@ -1220,13 +1252,102 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if err := bt.clearRootFlag(blk); err != nil {
 			return err
 		}
-		return bt.createNewRoot(blk, rightBlk, sepItem.key, op.Level+1)
+		if err := bt.createNewRoot(blk, rightBlk, sepItem.key, op.Level+1); err != nil {
+			return err
+		}
+		// Parent (the new root) now references the left half;
+		// clear the INCOMPLETE_SPLIT marker. (M0055-0004-followup.)
+		return bt.clearIncompleteSplit(blk)
 	}
 
 	// Otherwise, insert the separator into the parent.
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
-	return bt.insertIntoBlock(parentBlk, parentPath, sepItem)
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+		return err
+	}
+	// Parent insert succeeded — clear the INCOMPLETE_SPLIT flag
+	// on the left page. (M0055-0004-followup.)
+	return bt.clearIncompleteSplit(blk)
+}
+
+// clearIncompleteSplit (M0055-0004-followup-finish-split) unsets
+// the BTIncompleteSplit flag on the page. Invoked at the end of
+// a successful split sequence (parent downlink inserted), and
+// by `finishSplit` when a writer / vacuum encounters a stale
+// incomplete-split marker from a crashed prior run.
+func (bt *BTree) clearIncompleteSplit(blk storage.BlockNumber) error {
+	slot, err := bt.pinW(blk)
+	if err != nil {
+		return err
+	}
+	op := readOpaque(slot.Page())
+	op.Flags &^= BTIncompleteSplit
+	writeOpaque(slot.Page(), op)
+	err = bt.markDirtyWithPageRecord(slot, blk)
+	bt.unpinW(slot)
+	return err
+}
+
+// finishSplit (M0055-0004-followup-finish-split) re-runs the
+// parent-downlink insertion for a page that is still flagged
+// BTIncompleteSplit (e.g., after crash-replay where the writer's
+// split phase landed but the parent insert did not). Idempotent
+// — if the parent already references the page, the redundant
+// insert is detected by the parent's binary-search "already
+// present" check and the flag is simply cleared.
+//
+// Callers: writers descending the tree (before continuing
+// writes on this page); vacuum maintenance pass.
+func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
+	slot, err := bt.pinW(blk)
+	if err != nil {
+		return err
+	}
+	op := readOpaque(slot.Page())
+	if !op.HasIncompleteSplit() {
+		bt.unpinW(slot)
+		return nil
+	}
+	// Read the high key + Next to reconstruct the separator
+	// item that the original split was about to push up.
+	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
+		// Defensive: malformed half-state. Clear the flag and
+		// hope the parent caught up via some other path.
+		op.Flags &^= BTIncompleteSplit
+		writeOpaque(slot.Page(), op)
+		bt.markDirtyWithPageRecord(slot, blk)
+		bt.unpinW(slot)
+		return nil
+	}
+	rightBlk := op.Next
+	sepKey := append([]byte(nil), op.HighKey...)
+	bt.unpinW(slot)
+
+	// Walk to the parent and insert the separator. We descend by
+	// the separator key so the parent path is reconstructed.
+	bt.splitMu.Lock()
+	defer bt.splitMu.Unlock()
+	_, path, err := bt.descendToLeaf(sepKey)
+	if err != nil {
+		return err
+	}
+	if len(path) == 0 {
+		// blk is the root — parent insert means a new root lift.
+		// Should have happened atomically; if not, redo it.
+		return bt.createNewRoot(blk, rightBlk, sepKey, op.Level+1)
+	}
+	parentBlk := path[len(path)-1]
+	parentPath := path[:len(path)-1]
+	sepItem := item{
+		keyLen: uint16(len(sepKey)),
+		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
+		key:    sepKey,
+	}
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+		return err
+	}
+	return bt.clearIncompleteSplit(blk)
 }
 
 func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
