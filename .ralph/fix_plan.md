@@ -2860,16 +2860,20 @@ rationale here.
       `analysis/tpch-hammerdb-run-012.md` written and committed.
       Milestone close pending **M0054-0007-followup-resume** below.
 
-  - [ ] M0054-0007-followup-resume: Re-run HammerDB TPC-H SF=1 power
-        test (call it run-013 or "run-012 attempt #3") with NLI
-        re-enabled by default, after `M0054-0006-followup-Q9-
-        composite` lands. Acceptance: full 22/22 query completion
-        within 7200 s wall clock. Inherits the no-deferral clause:
-        if any query fails, the offending query is named and a
-        concrete follow-up sub-task is opened. Deliverable:
-        `analysis/tpch-hammerdb-run-013.md` (or revised
-        `tpch-hammerdb-run-012.md` if the next run gets the same
-        run-012 label). Blocked by Q9-composite landing first.
+  - [ ] M0054-0007-followup-resume: **PARTIAL — DEFERRED.**
+        run-013 executed 2026-05-05/06 with NLI re-enabled by
+        default. Result: 3/22 queries completed cleanly (Q14
+        30.06 s, Q2 5.36 s, **Q9 138 s — a 92.4 % wall-clock
+        reduction vs run-011's 1810 s**). Q20 timed out at the
+        7200 s budget after ~117 minutes, dominated by its
+        correlated-aggregate subquery which NLI alone does not
+        decorrelate. The 22/22 close criterion is **NOT MET**.
+        Q9 confirmed the M0054-0006-followup-Q9-composite fix:
+        composite-key NLI on partsupp_pk now probes correctly
+        without the partial-prefix `is not numeric at runtime`
+        regression. Re-opens after M0054-0008 (Q20 decorrelation)
+        lands. Deliverable:
+        `analysis/tpch-hammerdb-run-013.md` (committed).
 
 - [ ] M0054-0008: Q20 decorrelation via magic-set / sideways
       information passing (SIPS).
