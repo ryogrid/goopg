@@ -19,13 +19,27 @@ Root node: `Projection`
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | region | — |
+| 2 | Seq Scan | nation | — |
+| 3 | Seq Scan | supplier | — |
+| 4 | Seq Scan | part | — |
+| 5 | Seq Scan | partsupp | — |
+| 6 | Seq Scan | region | — |
+| 7 | Seq Scan | nation | — |
+| 8 | Seq Scan | supplier | — |
+| 9 | Seq Scan | partsupp | — |
 
 ### Q3
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | customer | — |
+| 2 | Seq Scan | orders | — |
+| 3 | Seq Scan | lineitem | — |
 
 ### Q4
 
@@ -39,7 +53,14 @@ Root node: `Projection`
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | region | — |
+| 2 | Seq Scan | nation | — |
+| 3 | Seq Scan | supplier | — |
+| 4 | Seq Scan | customer | — |
+| 5 | Seq Scan | orders | — |
+| 6 | Seq Scan | lineitem | — |
 
 ### Q6
 
@@ -53,7 +74,14 @@ Root node: `Projection`
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | nation | — |
+| 2 | Seq Scan | nation | — |
+| 3 | Seq Scan | supplier | — |
+| 4 | Seq Scan | customer | — |
+| 5 | Seq Scan | orders | — |
+| 6 | Seq Scan | lineitem | — |
 
 ### Q8
 
@@ -61,7 +89,14 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | part | — |
+| 1 | Seq Scan | region | — |
+| 2 | Seq Scan | nation | — |
+| 3 | Seq Scan | nation | — |
+| 4 | Seq Scan | supplier | — |
+| 5 | Seq Scan | customer | — |
+| 6 | Seq Scan | orders | — |
+| 7 | Seq Scan | lineitem | — |
+| 8 | Seq Scan | part | — |
 
 ### Q9
 
@@ -69,21 +104,33 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | supplier | — |
-| 2 | Seq Scan | nation | — |
-| 3 | Seq Scan | part | — |
+| 1 | Seq Scan | partsupp | — |
+| 2 | Seq Scan | orders | — |
+| 3 | Seq Scan | lineitem | — |
+| 4 | Seq Scan | supplier | — |
+| 5 | Seq Scan | nation | — |
+| 6 | Seq Scan | part | — |
 
 ### Q10
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | nation | — |
+| 2 | Seq Scan | customer | — |
+| 3 | Seq Scan | orders | — |
+| 4 | Seq Scan | lineitem | — |
 
 ### Q11
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | nation | — |
+| 2 | Seq Scan | supplier | — |
+| 3 | Seq Scan | partsupp | — |
 
 ### Q12
 
@@ -152,7 +199,11 @@ Root node: `Projection`
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | customer | — |
+| 2 | Seq Scan | orders | — |
+| 3 | Seq Scan | lineitem | — |
 
 ### Q19
 
@@ -176,7 +227,12 @@ Root node: `Projection`
 
 Root node: `Projection`
 
-No scan nodes — plan likely uses Values / no underlying tables.
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | nation | — |
+| 2 | Seq Scan | supplier | — |
+| 3 | Seq Scan | orders | — |
+| 4 | Seq Scan | lineitem | — |
 
 ### Q22
 
@@ -194,11 +250,12 @@ for an M0054-0003 sub-task investigation.
 
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
-| customer | Q13, Q22 | — |
-| lineitem | Q12, Q14, Q17, Q19 | Q1, Q15a, Q15b, Q6 |
-| nation | Q20, Q9 | — |
-| orders | Q12, Q13 | Q4 |
-| part | Q14, Q16, Q17, Q19, Q8, Q9 | — |
-| partsupp | Q16 | — |
-| supplier | Q15b, Q20, Q9 | — |
+| customer | Q10, Q13, Q18, Q22, Q3, Q5, Q7, Q8 | — |
+| lineitem | Q10, Q12, Q14, Q17, Q18, Q19, Q21, Q3, Q5, Q7, Q8, Q9 | Q1, Q15a, Q15b, Q6 |
+| nation | Q10, Q11, Q2, Q20, Q21, Q5, Q7, Q8, Q9 | — |
+| orders | Q10, Q12, Q13, Q18, Q21, Q3, Q5, Q7, Q8, Q9 | Q4 |
+| part | Q14, Q16, Q17, Q19, Q2, Q8, Q9 | — |
+| partsupp | Q11, Q16, Q2, Q9 | — |
+| region | Q2, Q5, Q8 | — |
+| supplier | Q11, Q15b, Q2, Q20, Q21, Q5, Q7, Q8, Q9 | — |
 

@@ -2089,6 +2089,29 @@ rationale here.
       with a one-line problem statement each. Acceptance: the gap is
       closed in code AND visible in the EXPLAIN diff.
 
+  - [x] M0054-0003b: Investigate "No scan nodes" Q2/Q3/Q5/Q7/Q10/Q11/Q18/Q21.
+        (landed 2026-05-05: ROOT CAUSE was an EXPLAIN-renderer bug,
+        NOT a planner failure. The 8 queries all use M0038 multi-way
+        hash join (`*planner.MultiHashJoin`), but
+        `internal/executor/operators_explain.go` was missing two
+        cases for that node type: (1) `describePlan()` fell through
+        to the default `%T` formatter and emitted the literal Go
+        type name `"*planner.MultiHashJoin"`; (2) `planChildren()`
+        returned `nil` because there was no case for
+        `MultiHashJoin.Tables`, so the EXPLAIN walker never
+        recursed into the join's input plans — every underlying
+        scan was invisible. Fix: add explicit cases. Now Q2 shows
+        7 scan nodes, Q3 shows 3, Q5 shows 6, Q7 shows 6, Q10 shows
+        4, Q11 shows 3, Q18 shows 3, Q21 shows 4. The regenerated
+        baseline reveals a stronger gap pattern: every MultiHashJoin
+        input today is a SeqScan even when an index exists on the
+        join column. That is M0054-0006 territory (NLI/parameterised
+        IndexScan inputs to hash join probe sides) and is tracked
+        there. `go test ./internal/testutil/tpch/...` PASS;
+        `go test ./...` PASS for all packages — the only flake is
+        `bench/tpch/cmd/hammerdb_load` which simply needs >300s,
+        unrelated to this change.)
+
   - [x] M0054-0003a: Close the Q15 baseline blind-spot.
         (landed 2026-05-05: added `Q15ViewBody()` and
         `Q15MainSelect()` helpers in
