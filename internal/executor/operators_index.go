@@ -73,6 +73,17 @@ type indexScanOp struct {
 	// lockRowsOp.currentTID after Next emits the row.
 	tids []storage.ItemPointer
 	idx  int
+
+	// M0054-0006a: state captured at Open() time and reused across
+	// Rescan() calls when the index probe is driven by an outer row
+	// from a parent NestedLoopIndexJoin.
+	heapRel storage.RelFileNode
+	tree    *btree.BTree
+	// outerRow is the row that the parent NLI bound via BindOuter.
+	// nil when this scan is run from a single-table path (the
+	// historical case): then `o.plan.Key` / `LowKey` / `HighKey`
+	// must reduce to constants.
+	outerRow Row
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -81,7 +92,24 @@ func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
 
 func (o *indexScanOp) Schema() planner.Schema { return o.plan.Output() }
 
+// Open performs the one-time prep (lock + btree.Open) and then runs
+// a single drain pass with no outer row bound (the historical
+// single-table-IndexScan path). Parent operators that drive multiple
+// probes (M0054-0006 NestedLoopIndexJoin) instead call Open and
+// then `Rescan(outerRow)` per outer row.
 func (o *indexScanOp) Open(ctx *Context) error {
+	if err := o.openPrep(ctx); err != nil {
+		return err
+	}
+	return o.Rescan(nil)
+}
+
+// openPrep does the one-time setup that is independent of any outer
+// row binding: context capture, relation lock acquisition, and
+// btree.Open. NLI parents call this directly and then issue
+// `Rescan(outerRow)` once per outer row without re-acquiring locks
+// or re-opening the index.
+func (o *indexScanOp) openPrep(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "IndexScan requires storage handles in Context"}
 	}
@@ -89,19 +117,46 @@ func (o *indexScanOp) Open(ctx *Context) error {
 	o.rows = nil
 	o.tids = nil
 	o.idx = 0
+	o.outerRow = nil
 
-	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(heapRel, lockmgr.AccessShareLock); err != nil {
+	o.heapRel = ctx.Catalog.RelFileNode(o.plan.Table)
+	if err := ctx.acquireRelLock(o.heapRel, lockmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
 		return err
 	}
-
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := btree.Open(ctx.Pool, idxRel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+	}
+	o.tree = tree
+	return nil
+}
+
+// BindOuter is invoked by the M0054-0006 NestedLoopIndexJoin parent
+// before each Rescan. The bound row is the input to evalExpr when
+// resolving Key / LowKey / HighKey expressions that reference outer
+// columns (a planner.ColumnRef whose Index is offset by the inner
+// schema width).
+func (o *indexScanOp) BindOuter(row Row) {
+	o.outerRow = row
+}
+
+// Rescan re-drains the underlying index after binding an outer row.
+// The historical single-table-IndexScan path calls Open which calls
+// Rescan(nil); the M0054-0006 NLI path calls Open once then Rescan
+// per outer row.
+func (o *indexScanOp) Rescan(outerRow Row) error {
+	o.rows = o.rows[:0]
+	o.tids = o.tids[:0]
+	o.idx = 0
+	o.outerRow = outerRow
+
+	if o.tree == nil {
+		// Defensive: openPrep must have been called.
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "indexScanOp.Rescan called before Open"}
 	}
 
 	var loBytes, hiBytes []byte
@@ -141,6 +196,8 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		}
 	}
 
+	ctx := o.ctx
+	heapRel := o.heapRel
 	scanFn := func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
@@ -174,7 +231,7 @@ func (o *indexScanOp) Open(ctx *Context) error {
 		return true, nil
 	}
 
-	if err := tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
+	if err := o.tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	return nil
@@ -210,7 +267,7 @@ func (o *indexScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bo
 }
 
 func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
-	v, err := evalExpr(o.plan.Key, nil, o.ctx)
+	v, err := evalExpr(o.plan.Key, o.outerRow, o.ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -247,7 +304,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 	}
 
 	if o.plan.LowKey != nil {
-		v, evalErr := evalExpr(o.plan.LowKey, nil, o.ctx)
+		v, evalErr := evalExpr(o.plan.LowKey, o.outerRow, o.ctx)
 		if evalErr != nil {
 			return nil, nil, false, evalErr
 		}
@@ -263,7 +320,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 	}
 
 	if o.plan.HighKey != nil {
-		v, evalErr := evalExpr(o.plan.HighKey, nil, o.ctx)
+		v, evalErr := evalExpr(o.plan.HighKey, o.outerRow, o.ctx)
 		if evalErr != nil {
 			return nil, nil, false, evalErr
 		}

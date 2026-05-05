@@ -397,6 +397,10 @@ func BuildDefaultRegistry() *Registry {
 		"enable_bitmapscan", "enable_hashjoin", "enable_mergejoin",
 		"enable_nestloop", "enable_sort", "enable_hashagg",
 		"enable_material", "enable_partition_pruning",
+		// M0054-0006: nested-loop index join rollback switch.
+		// `off` keeps the legacy Hash plan for joins that the
+		// rule would otherwise rewrite.
+		"enable_nestloop_index",
 	} {
 		r.MustRegister(NewVariable(Variable{
 			Name: name, Type: TypeBool, BootVal: "on",

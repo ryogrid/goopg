@@ -379,6 +379,13 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
 	// `Index Scan using idx_part_type on part`).
 	node = rewriteScanInputsWithSingleTablePredicates(node, cat)
+	// M0054-0006: rewrite eligible binary `*Join{Algo:Hash}` /
+	// `*Join{Algo:NestedLoop}` nodes to `*NestedLoopIndexJoin` when
+	// the equi-join predicate matches a single-column B-tree index
+	// on the inner side AND the cost gate accepts. The pass is a
+	// no-op when the package-level kill-switch is off
+	// (`SetNLIEnabled(false)`).
+	node = rewriteJoinsToNLI(node, cat)
 	node = remapExprRefsToMHJ(node)
 	// Second pass: use FROM‑clause bindings to correct any
 	// remaining order differences (OID ≠ FROM order).

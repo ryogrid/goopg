@@ -107,9 +107,9 @@ Root node: `Projection`
 | 1 | Seq Scan | partsupp | — |
 | 2 | Seq Scan | orders | — |
 | 3 | Seq Scan | lineitem | — |
-| 4 | Seq Scan | supplier | — |
-| 5 | Seq Scan | nation | — |
-| 6 | Seq Scan | part | — |
+| 4 | Index Scan | supplier | supplier_pk |
+| 5 | Index Scan | nation | nation_pk |
+| 6 | Index Scan | part | part_pk |
 
 ### Q10
 
@@ -138,8 +138,8 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | orders | — |
-| 2 | Index Scan | lineitem | idx_lineitem_receiptdate |
+| 1 | Index Scan | lineitem | idx_lineitem_receiptdate |
+| 2 | Index Scan | orders | orders_pk |
 
 ### Q13
 
@@ -157,7 +157,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Index Scan | lineitem | idx_lineitem_shipdate |
-| 2 | Seq Scan | part | — |
+| 2 | Index Scan | part | part_pk |
 
 ### Q15a
 
@@ -183,7 +183,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | partsupp | — |
-| 2 | Seq Scan | part | — |
+| 2 | Index Scan | part | part_pk |
 
 ### Q17
 
@@ -192,7 +192,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | lineitem | — |
-| 2 | Seq Scan | part | — |
+| 2 | Index Scan | part | part_pk |
 | 3 | Seq Scan | lineitem | — |
 
 ### Q18
@@ -221,7 +221,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | supplier | — |
-| 2 | Seq Scan | nation | — |
+| 2 | Index Scan | nation | nation_pk |
 
 ### Q21
 
@@ -252,10 +252,10 @@ for an M0054-0003 sub-task investigation.
 |-------|------------------|--------------------|
 | customer | Q10, Q13, Q18, Q22, Q5, Q7, Q8 | Q3 |
 | lineitem | Q10, Q17, Q18, Q19, Q21, Q5, Q8, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q3, Q6, Q7 |
-| nation | Q10, Q11, Q2, Q20, Q21, Q5, Q7, Q8, Q9 | — |
-| orders | Q12, Q13, Q18, Q21, Q7, Q9 | Q10, Q3, Q4, Q5, Q8 |
-| part | Q14, Q16, Q17, Q19, Q9 | Q2, Q8 |
+| nation | Q10, Q11, Q2, Q21, Q5, Q7, Q8 | Q20, Q9 |
+| orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q3, Q4, Q5, Q8 |
+| part | Q19 | Q14, Q16, Q17, Q2, Q8, Q9 |
 | partsupp | Q11, Q16, Q2, Q9 | — |
 | region | Q2, Q5, Q8 | — |
-| supplier | Q11, Q15b, Q2, Q20, Q21, Q5, Q7, Q8, Q9 | — |
+| supplier | Q11, Q15b, Q2, Q20, Q21, Q5, Q7, Q8 | Q9 |
 

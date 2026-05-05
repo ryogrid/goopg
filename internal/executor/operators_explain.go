@@ -375,6 +375,12 @@ func describePlan(n planner.Node) string {
 		// explicitly so EXPLAIN shows the join shape instead of
 		// the Go type name "*planner.MultiHashJoin".
 		return fmt.Sprintf("Multi-Way Hash Join (%d tables)", len(p.Tables))
+	case *planner.NestedLoopIndexJoin:
+		// M0054-0006: render `Nested Loop` matching upstream's
+		// EXPLAIN output for a nested-loop join with an inner
+		// IndexScan side. The inner IndexScan node renders its
+		// own label (`Index Scan using <idx> on <table>`) below.
+		return fmt.Sprintf("Nested Loop (%s)", joinTypeName(p.Type))
 	}
 	return fmt.Sprintf("%T", n)
 }
@@ -432,6 +438,9 @@ func planChildren(n planner.Node) []planner.Node {
 		out := make([]planner.Node, len(p.Tables))
 		copy(out, p.Tables)
 		return out
+	case *planner.NestedLoopIndexJoin:
+		// M0054-0006: render outer driver and inner index probe.
+		return []planner.Node{p.Outer, p.Inner}
 	}
 	return nil
 }

@@ -65,6 +65,14 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newJoinOp(p, left, right)), nil
+	case *planner.NestedLoopIndexJoin:
+		outer, err := Build(p.Outer)
+		if err != nil {
+			return nil, err
+		}
+		// Inner is always an *IndexScan by plan-node contract.
+		innerScan := newIndexScanOp(p.Inner)
+		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
 	case *planner.Aggregate:
 		child, err := Build(p.Child)
 		if err != nil {

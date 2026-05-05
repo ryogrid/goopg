@@ -2423,7 +2423,111 @@ rationale here.
         `DecodeRow` cum **≤ 15 %** (down from 39 %). Updated
         profiles linked from survey §4 item #3.
 
-- [ ] M0054-0006: Nested-loop index join (NLI) — implementation, not
+- [x] M0054-0006: Nested-loop index join (NLI) implementation.
+      (landed 2026-05-05: full implementation per design doc
+      0053-0002, with the explicit Q14 / Q15b / Q19 inheritance
+      from M0054-0003c/d evaluated against the regenerated
+      baseline.
+
+      **0006a — Param-bound IndexScan operator:**
+      `internal/executor/operators_index.go` refactored — `Open`
+      now calls `openPrep` (lock + btree.Open) followed by
+      `Rescan(nil)`. New `BindOuter(row Row)` and `Rescan(outerRow
+      Row)` APIs let the M0054-0006b NLI operator drive
+      per-outer-row probes without re-acquiring the relation
+      lock. `lookupKey` / `lookupRangeBounds` now evaluate Key /
+      LowKey / HighKey expressions against `o.outerRow`, so a
+      `*ColumnRef` whose `Index` lies in the joined-row
+      coordinate system resolves correctly.
+
+      **0006b — `NestedLoopIndexJoin` plan node + executor:**
+      `internal/planner/plan.go` adds `*NestedLoopIndexJoin`
+      (Type / Outer / Inner *IndexScan / Predicate / schema).
+      `internal/executor/operators_nljoin.go` (new): operator
+      opens outer + inner-prep once; per outer row it constructs
+      `outer ++ nullInner` into a reusable `joinBuf`, calls
+      `inner.BindOuter(joinBuf)` and `inner.Rescan(joinBuf)`,
+      then iterates inner.Next concatenating each match into
+      joinBuf. Supports INNER and LEFT join types; LEFT emits
+      `outer ++ nullRow` exactly once when no inner row matches.
+      Residual predicate is evaluated per emitted row.
+      Joined output is cloned via `cloneRow` so callers that
+      retain rows (sort / aggregate build) get their own copy.
+
+      **0006c — Planner rule + cost gate:**
+      `internal/planner/nl_index_join.go` (new): post-pass run
+      from `planSelect` after
+      `rewriteScanInputsWithSingleTablePredicates`. Walks the
+      tree; for binary `*Join` (Hash or NestedLoop) with
+      JoinType INNER or LEFT and an equi-conjunct of the form
+      `outer.colA = inner.colB`, where the inner side is a
+      `*SeqScan` and a single-column-leading B-tree index on
+      `colB` exists, rewrites to `*NestedLoopIndexJoin` with the
+      inner replaced by `*IndexScan{Key: outerColRef}`. The
+      cost gate (`nliCostGateAccepts`) accepts when outer
+      EstimateRows ≤ 100000 (heuristic) or when no estimate is
+      available (be optimistic — typical outers are small).
+      RIGHT / FULL joins keep Hash for outer-row preservation.
+
+      **0006d — Result-parity test:**
+      `internal/planner/nl_index_join_test.go` (new):
+      `TestNLIRulePromotesEquiJoinOnIndexedInner`,
+      `TestNLIRuleSkipsWhenInnerHasNoIndex`,
+      `TestNLIRuleRespectsKillSwitch` — all PASS.
+      `internal/testutil/tpch/nli_parity_test.go` (new):
+      `TestNLIResultParityVsHashJoin` — cluster-backed test that
+      runs the same equi-join twice (NLI on / off via the
+      package toggle) and asserts identical row sets. PASS.
+
+      **0006e — EXPLAIN / kill-switch:**
+      `internal/executor/operators_explain.go::describePlan` adds
+      `*planner.NestedLoopIndexJoin → "Nested Loop (INNER|LEFT)"`,
+      `planChildren` returns `[Outer, Inner]`. The
+      `enable_nestloop_index` GUC is registered in
+      `internal/config/defaults.go` (default `on`); the planner
+      reads a package-level `nliEnabled atomic.Bool` toggled via
+      `SetNLIEnabled(bool)`. SQL-level GUC integration (so SET
+      affects the planner pass) is plumbing-only and tracked as
+      M0054-0006e-followup.
+
+      **Inheritance acceptance:**
+      Q14 baseline now reads `Index Scan | part | part_pk` (from
+      `Seq Scan | part`) — NLI rule fired. The full plan is
+      `Nested Loop (INNER) → outer=lineitem, inner=Index Scan
+      using part_pk on part`.
+      Q19 still SeqScan (the join predicate is buried in a 3-way
+      OR over branded conjuncts; my equi-extraction only handles
+      a single top-level `=`. Q19 needs a disjunctive-equi-key
+      extraction, tracked as M0054-0006-followup-Q19).
+      Q15b still SeqScan on supplier (the join goes through an
+      inlined `revenue0` view; the planner rewrite happens on
+      the parser-side join shape but the supplier × revenue0
+      binary join structure does not carry a `LeftKey/RightKey`
+      ColumnRef pair my rule recognises. Tracked as
+      M0054-0006-followup-Q15b).
+
+      Tests: `go test ./...` PASS across all 30+ packages.
+      Cumulative effect: at least Q14 in the M0054-0002 baseline
+      flips to IndexScan via NLI; the rule infrastructure is
+      generic and will catch additional shapes as they're
+      surfaced.)
+
+  - [ ] M0054-0006-followup-Q19: extract equi-keys from
+        disjunctive predicates so Q19's three-branch OR shape
+        gets an NLI plan on the part side. Acceptance: Q19
+        baseline shows `Index Scan using part_pk on part`.
+
+  - [ ] M0054-0006-followup-Q15b: handle the binary join produced
+        by an inlined VIEW reference (supplier × revenue0).
+        Acceptance: Q15b baseline shows `Index Scan using
+        supplier_pk on supplier` (or another supplier index).
+
+  - [ ] M0054-0006e-followup: wire the `enable_nestloop_index`
+        GUC through to `nliEnabled.Store(...)` so SQL-level SET
+        propagates to the planner. Currently the SQL GUC
+        registers without effect; the package-level toggle is
+        the only runtime control surface.
+
       scope. `docs/design/0053-0002-nested-loop-index-join-scope.md`
       already specified the implementation skeleton; M0054 lands
       every sub-task it called out:

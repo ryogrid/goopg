@@ -287,6 +287,30 @@ type IndexScan struct {
 func (n *IndexScan) Pos() int       { return n.pos }
 func (n *IndexScan) Output() Schema { return n.schema }
 
+// NestedLoopIndexJoin (M0054-0006) joins Outer (any plan node) with
+// Inner (an `*IndexScan`) by re-probing the index for each outer row.
+// The inner's `Key` / `LowKey` / `HighKey` `Expr` may reference outer-
+// row columns via `*ColumnRef` whose `Index` is offset by the outer
+// schema width — the executor binds the outer row before each
+// `Rescan` so `evalExpr` resolves correctly. Predicate carries any
+// non-equi residual conjuncts that the IndexScan probe alone does
+// not enforce.
+//
+// Supported `JoinType` set is INNER and LEFT. For LEFT, when the
+// inner probe yields no rows, the operator emits `outer ++
+// nullRow(innerWidth)` to preserve outer rows.
+type NestedLoopIndexJoin struct {
+	pos       int
+	Type      JoinType
+	Outer     Node
+	Inner     *IndexScan
+	Predicate Expr // residual filter applied per joined row
+	schema    Schema
+}
+
+func (n *NestedLoopIndexJoin) Pos() int       { return n.pos }
+func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
+
 // IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
 // come from the B-tree index key, so no heap fetch is needed when the
 // visibility map reports ALL_VISIBLE for the target page.
