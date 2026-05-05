@@ -1664,43 +1664,98 @@ and unblocks PL/pgSQL exception blocks (M0015).
       MVCC integration via `RegisterSubXid`/`MarkSubxactAborted` wired
       by M0050-0004. DoD: `TestSubxactWALReplayRoundTrip` (all 3 records
       survive WAL write+read), `TestSubxactApplyRecordSkipsNoOp`.)
-- [ ] M0050-0004: Savepoint SQL surface & error recovery. Design doc
+- [x] M0050-0004: Savepoint SQL surface & error recovery. Design doc
       `docs/design/0050-0004-savepoint-sql-surface-and-error-recovery.md`.
-      Parser & executor for `SAVEPOINT` / `RELEASE` / `ROLLBACK TO`;
-      implicit-savepoint helper for `\set ON_ERROR_ROLLBACK on`;
-      SQLSTATE 25P01 / 25P02 enforcement. DoD: worked-example
-      integration test (a + ROLLBACK TO + c) returns exactly {a, c}.
+      (landed 2026-05-05: Planner `TxSavepoint/TxRelease/TxRollbackTo` + `Name`
+      field. `Manager.AllocateSubXid(parentXid)` allocates a fresh sub-XID
+      registered in the global subxact map (not in active). `BasicSession`
+      extended with `subxactStack`, `currentSubXid`, `txFailed` +
+      `EffectiveWriterXID/PushSavepoint/ReleaseSavepoint/RollbackToSavepoint`.
+      `execSavepoint/execRelease/execRollbackTo` with 25P01 guard (outside tx)
+      and 3B001 for non-existent savepoints. `TupleVisibleSubxact` gains
+      `isCurrentTxXID` helper (recognises ancestor XIDs as "self" so pre-savepoint
+      inserts remain visible inside the subxact). `operators_storage.go` seqScan
+      + lock-row scan now use `TupleVisibleSubxact`. `transactionTag` extended
+      for new verbs. 4 new tests including `TestSavepointDoD` (INSERT a; SAVEPOINT
+      s; INSERT b; ROLLBACK TO s; INSERT c → only a,c visible after COMMIT). All
+      go test ./... pass. Deferred: wire-protocol session tx management across
+      Query messages and `\set ON_ERROR_ROLLBACK on` implicit savepoints.)
 
 ## Milestone 0051 — Planner expression-level improvements
 
 See `docs/milestones/0051-planner-expression-improvements.md`. Closes
 gaps in `docs/reference/ref-010-parser.md` and `ref-011-planner.md`.
 
-- [ ] M0051-0001: Keyword categorisation. Design doc
-      `docs/design/0051-0001-keyword-categorisation.md`. Replace flat
-      keyword list with reserved / type_func_name / col_name /
-      unreserved (per upstream `kwlist.h`); parser-level helper
-      `acceptIdentOrColNameKeyword()`. DoD: columns named `name`,
-      `value`, `type`, `user`, etc. parse without quoting.
-- [ ] M0051-0002: Constant folding. Design doc
-      `docs/design/0051-0002-constant-folding.md`. New
-      `internal/planner/foldconst.go::FoldConstants(expr)`; bottom-up
-      walk; folds arithmetic, string concat, boolean simplification,
-      comparison folding, CAST(literal). DoD: `EXPLAIN ... WHERE x >
-      1+2` shows `x > 3`.
-- [ ] M0051-0003: Implicit type coercion. Design doc
-      `docs/design/0051-0003-implicit-type-coercion.md`. Coercion
-      lattice (`int2→int4→int8→numeric→float4→float8`,
-      `text↔varchar↔char(n)`, `date→timestamp`); operator/function
-      resolution walks the lattice when no exact match exists. DoD:
-      TPC-H queries that today need explicit `CAST` run unchanged
-      after dropping the casts.
-- [ ] M0051-0004: LIKE prefix → range translation. Design doc
-      `docs/design/0051-0004-like-to-range.md`. `ExtractPrefix` +
-      `IncrementString` helpers; analyzer adds redundant `col >=
-      prefix AND col < successor` predicate alongside the original
-      LIKE; gated on C-collation for v0. DoD: TPC-H Q14 / Q20 use
-      IndexScan on a prefix-LIKE-able indexed column.
+- [x] M0051-0001: Keyword categorisation. Design doc
+      `docs/design/0051-0001-keyword-categorisation.md`.
+      (landed 2026-05-05: NEW `internal/parser/keywords.go` — `KeywordCategory`
+      enum + `keywordCategory` map (all ~80 goopg keywords, per upstream kwlist.h).
+      `IsColNameKeyword()` gate in `parseIdent()`: reserved keywords (SELECT, FROM,
+      WHERE, AND, OR, NULL, TRUE, FALSE, CREATE, TABLE, …) produce "expected
+      identifier" when unquoted; unreserved/col_name/type_func accepted as before.
+      foundation_test.go `desc` column renamed to `descr` (desc is reserved).
+      6 new tests in keywords_test.go including `TestColNameKeywordsAsColumnNamesDoD`
+      and `TestReservedKeywordsRejectedAsColumnNames`. All go test ./... pass.)
+- [x] M0051-0002: Constant folding. Design doc
+      `docs/design/0051-0002-constant-folding.md`.
+      (landed 2026-05-05: `internal/planner/foldconst.go` — `FoldConstants(Expr)`
+      bottom-up fold + `foldPlanConstants(Node)` plan-tree walk. Integer/string/
+      numeric/bool arithmetic + comparisons; AND/OR short-circuit; Kleene NULL
+      rules; CaseExpr dead-branch elimination. Wired at end of `planSelect()`.
+      9 tests in `foldconst_test.go` including `TestFoldConstantsDoD`
+      (`WHERE x > 1+2` produces `x > IntegerConst{3}`) and `TestFoldTrueAndDoD`
+      (`TRUE AND x=1` → AND eliminated). All go test ./... pass.)
+- [x] M0051-0003: Implicit type coercion. Design doc
+      `docs/design/0051-0003-implicit-type-coercion.md`.
+      (landed 2026-05-05: NEW `internal/analyzer/coerce.go` —
+      `NumericCoercePrecedence`/`PromoteNumericType`/`PromoteStringType`/
+      `PromoteTimestampType`. BinaryOp arithmetic result type now uses
+      `PromoteNumericType` (`int8+numeric→numeric`, etc.). No CastExpr
+      wrapping needed (executor `promoteCrossKind` handles runtime coercion).
+      9 tests in `coerce_test.go` including DoD `TestPromoteNumericTypeMatrix`
+      (6×6 all-pair matrix). TPC-H parity identical=22 divergent=0 errored=0.
+      All go test ./... pass.)
+- [x] M0051-0004: LIKE prefix → range translation. Design doc
+      `docs/design/0051-0004-like-to-range.md`.
+      (landed 2026-05-05: `internal/planner/likeprefix.go` —
+      `ExtractLikePrefix`/`IncrementString`/`injectLikeRangePredicates`.
+      Wired in `planSelect()` before `planIndexScanFromWhere`; existing
+      `tryRangeIndexScan` (M0039-0002) picks up injected `>=`/`<` conjuncts.
+      8 tests: DoD `TestLikeToRangeDoD_PrefixPattern` (`LIKE 'foo%'` with
+      B-tree → `Filter(IndexScan{LowKey:'foo',HighKey:'fop'},pred)`);
+      `TestLikeToRangeTPCHQ14Shape` (`PROMO%` → LowKey='PROMO',HighKey='PROMP').
+      All go test ./... pass.)
+
+## Milestone 0052 — HammerDB TPC-H end-to-end regression on `perf-analysis`
+
+Identified during the user-driven verification documented in
+`analysis/tpch-hammerdb-run-009.md` (2026-05-05). The same workflow that
+completed in run-008 (2026-05-04) now aborts during the ORDERS/LINEITEM
+load. Workflow used: only `bench/tpch/setup_goopg.sh --reset`,
+`build_schema_goopg.sh`, `run_power_test_goopg.sh`, `stop_goopg.sh` — no
+manual psql DDL. Schema build, COPY load (REGION..PARTSUPP), ORDERS load
+up to 61 000 rows (LINEITEM up to 244 591) all succeed; the next ORDERS
+batch crashes the backend with `server closed the connection
+unexpectedly`. Index creation, ANALYZE, and Q1–Q22 are not reached.
+
+The earlier section "Milestone 0029a — TPC-H Index Support" and M0044-0006
+remain checked because they describe past observed behaviour; this entry
+tracks the new regression separately so we don't retro-edit history.
+
+- [ ] M0052-0001: Reproduce the ORDERS/LINEITEM COPY backend disconnect on
+      `perf-analysis` HEAD with verbose logging. The goopg server stays up
+      and serves new connections — only the COPY backend goroutine dies,
+      and it does so without any `level=ERROR` / panic stack-trace in
+      `bench/tpch/runtime_goopg/goopg.log`. Add an unconditional structured
+      log on backend-goroutine exit (panic-or-not) so the next occurrence
+      is observable. Suspect surface: parser changes carried on this
+      branch (`internal/parser/ast.go`, `internal/parser/token.go`) and/or
+      a `recover()` in the COPY/extended-protocol handler that swallows
+      panics. Reference: `analysis/tpch-hammerdb-run-009.md`.
+- [ ] M0052-0002: Fix the root cause once M0052-0001 surfaces it, and
+      re-run HammerDB end-to-end as run-010 to confirm the full
+      schema-build → CREATE INDEX → ANALYZE → Q1..Q22 path completes
+      without manual intervention.
 
 ## Notes
 
