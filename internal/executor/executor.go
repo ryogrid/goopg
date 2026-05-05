@@ -36,18 +36,33 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
+		// M0054-0005a-followup: projectOp ALWAYS copies its
+		// child's row into `o.out` (then either clones or returns
+		// borrowed). So the child is always safe to borrow,
+		// regardless of project's own borrow contract.
+		setChildBorrow(child, BorrowedRow)
 		return maybeInstrument(p, newProjectOp(p, child)), nil
 	case *planner.Filter:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
+		// M0054-0005a-followup: filterOp is a pure pass-through
+		// — it returns its child's row unchanged. So filter's
+		// own borrow contract must MATCH its child's. We leave
+		// the child at the default OwnedRow at Build time;
+		// filterOp.SetBorrow propagates to the child only when
+		// the eventual parent (project, output sink) flips the
+		// filter itself to BorrowedRow.
 		return maybeInstrument(p, newFilterOp(p, child)), nil
 	case *planner.Limit:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
+		// M0054-0005a-followup: limitOp is pass-through like
+		// filterOp; child borrow propagates from limit's own
+		// parent via SetBorrow.
 		return maybeInstrument(p, newLimitOp(p, child)), nil
 	case *planner.Sort:
 		child, err := Build(p.Child)
@@ -65,6 +80,14 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newJoinOp(p, left, right)), nil
+	case *planner.NestedLoopIndexJoin:
+		outer, err := Build(p.Outer)
+		if err != nil {
+			return nil, err
+		}
+		// Inner is always an *IndexScan by plan-node contract.
+		innerScan := newIndexScanOp(p.Inner)
+		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
 	case *planner.Aggregate:
 		child, err := Build(p.Child)
 		if err != nil {
@@ -81,6 +104,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newSeqScanOp(p)), nil
 	case *planner.IndexScan:
 		return maybeInstrument(p, newIndexScanOp(p)), nil
+	case *planner.IndexOnlyScan:
+		return maybeInstrument(p, newIndexOnlyScanOp(p)), nil
 	case *planner.LockRows:
 		child, err := Build(p.Child)
 		if err != nil {
@@ -151,14 +176,13 @@ func Build(plan planner.Node) (Operator, error) {
 	case *planner.Explain:
 		return newExplainOp(p), nil
 	case *planner.Utility:
-		// VACUUM / ANALYZE / SHOW / SET / RESET are utility
-		// statements. The wire layer already handles SHOW/SET/RESET
-		// via the legacy string-matching path in
-		// internal/server/query.go, so they shouldn't reach here in
-		// practice. ANALYZE drives the catalog-stats collector
-		// (per-table row count + per-column NDistinct/NullFrac);
-		// VACUUM still routes through utilityNoOp until the
-		// vacuum package exposes a stmt-driven entry point.
+		// VACUUM / ANALYZE / SHOW / SET / RESET are utility statements.
+		// VACUUM runs the heap page-prune and updates the FSM (M0046-0003).
+		// ANALYZE drives the catalog-stats collector. SHOW/SET/RESET are
+		// handled by the wire layer and shouldn't reach here in practice.
+		if _, ok := p.Stmt.(*parser.VacuumStmt); ok {
+			return newVacuumOp(p), nil
+		}
 		if as, ok := p.Stmt.(*parser.AnalyzeStmt); ok {
 			return newAnalyzeOp(as), nil
 		}

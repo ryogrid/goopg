@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"time"
 
+	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -35,13 +37,19 @@ func (w *spillWriter) WriteRow(row Row) error {
 	// Prefix with total length for framing.
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(w.buf)))
-	if _, err := w.f.Write(lenBuf); err != nil {
-		return err
+	reg, pid := activity.LookupGoroutine()
+	if reg != nil {
+		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileWrite)
 	}
-	if _, err := w.f.Write(w.buf); err != nil {
-		return err
+	_, err1 := w.f.Write(lenBuf)
+	_, err2 := w.f.Write(w.buf)
+	if reg != nil {
+		reg.WaitEventEnd(pid)
 	}
-	return nil
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 func (w *spillWriter) Close() error {
@@ -54,6 +62,15 @@ func (w *spillWriter) Path() string { return w.path }
 type spillReader struct {
 	f    *os.File
 	path string
+
+	// M0054-0005b: reusable byte buffer for ReadRow's per-row
+	// payload. The pre-fix path called `make([]byte, dataLen)`
+	// per row, contributing to the cumulative byte-buffer churn
+	// the M0054-0004 pprof survey flagged. The buffer grows
+	// monotonically to fit the largest row seen and is never
+	// shrunk — typical TPC-H rows are well-bounded so the steady
+	// state is small.
+	dataBuf []byte
 }
 
 func newSpillReader(path string) (*spillReader, error) {
@@ -65,20 +82,69 @@ func newSpillReader(path string) (*spillReader, error) {
 }
 
 func (r *spillReader) ReadRow() (Row, error) {
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(r.f, lenBuf[:]); err != nil {
+	// Backwards-compatible thin wrapper around ReadRowInto: allocate
+	// a fresh Row and fill. Used by callers that need an OwnedRow
+	// (e.g., parent retains the row).
+	row, err := r.ReadRowInto(nil)
+	if err != nil {
 		return nil, err
 	}
+	return row, nil
+}
+
+// ReadRowInto (M0054-0005b-followup) decodes the next spilled row
+// into the caller-provided `dst` slice when its capacity is
+// sufficient; otherwise allocates a fresh slice and returns it.
+// Either way, the returned Row's contents are invalidated by the
+// next ReadRowInto call, so callers that retain rows must clone
+// the result. Pipeline-pass callers pass a single reusable `dst`
+// across calls.
+func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
+	var lenBuf [4]byte
+	reg, pid := activity.LookupGoroutine()
+	if reg != nil {
+		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	}
+	_, errLen := io.ReadFull(r.f, lenBuf[:])
+	if reg != nil {
+		reg.WaitEventEnd(pid)
+	}
+	if errLen != nil {
+		return nil, errLen
+	}
 	dataLen := binary.LittleEndian.Uint32(lenBuf[:])
-	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(r.f, data); err != nil {
-		return nil, fmt.Errorf("spillReader: truncated row: %w", err)
+	// M0054-0005b: reuse r.dataBuf across calls to avoid the
+	// per-row `make([]byte, dataLen)` allocation.
+	if cap(r.dataBuf) < int(dataLen) {
+		r.dataBuf = make([]byte, dataLen)
+	} else {
+		r.dataBuf = r.dataBuf[:dataLen]
+	}
+	data := r.dataBuf
+	if reg != nil {
+		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	}
+	_, errData := io.ReadFull(r.f, data)
+	if reg != nil {
+		reg.WaitEventEnd(pid)
+	}
+	if errData != nil {
+		return nil, fmt.Errorf("spillReader: truncated row: %w", errData)
 	}
 	nCols, n := binary.Uvarint(data)
 	if n <= 0 {
 		return nil, fmt.Errorf("spillReader: invalid column count")
 	}
-	row := make(Row, nCols)
+	// M0054-0005b-followup: reuse the caller-provided Row slot
+	// when it has sufficient capacity. Saves the per-row
+	// `make(Row, nCols)` allocation that the M0054-0004 in-use
+	// heap pprof flagged as 1.65 GB live in Q9.
+	row := dst
+	if cap(row) < int(nCols) {
+		row = make(Row, nCols)
+	} else {
+		row = row[:nCols]
+	}
 	pos := n
 	for i := uint64(0); i < nCols; i++ {
 		d, n2, err := decodeDatum(data[pos:])
@@ -125,8 +191,21 @@ func encodeDatum(d Datum, buf []byte) []byte {
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonths))
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDays))
 	case KindNumeric:
-		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.NumericMantissa))
-		buf = append(buf, byte(d.NumericScale))
+		// 2-byte int16 scale + length-prefixed signed-magnitude
+		// big.Int bytes (1 sign byte + magnitude). Per-query
+		// spill files have no on-disk back-compat constraint,
+		// so the wider layout is safe; fits-int64 values still
+		// pack into 2 + 4 + 1 + ≤8 bytes ≈ 15 bytes.
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(d.NumericScale))
+		mant := numericMant(d)
+		signByte := byte(0)
+		if mant.Sign() < 0 {
+			signByte = 1
+		}
+		mag := new(big.Int).Abs(mant).Bytes()
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(mag)))
+		buf = append(buf, signByte)
+		buf = append(buf, mag...)
 	}
 	return buf
 }
@@ -188,12 +267,24 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		days := int32(binary.LittleEndian.Uint32(data[pos+4:]))
 		return Datum{Kind: KindInterval, IntervalMonths: months, IntervalDays: days}, pos + 8, nil
 	case KindNumeric:
-		if pos+9 > len(data) {
+		if pos+6 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated numeric at %d", pos)
 		}
-		m := int64(binary.LittleEndian.Uint64(data[pos:]))
-		s := int8(data[pos+8])
-		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, pos + 9, nil
+		s := int16(binary.LittleEndian.Uint16(data[pos:]))
+		pos += 2
+		mlen := int(binary.LittleEndian.Uint32(data[pos:]))
+		pos += 4
+		if pos+1+mlen > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated numeric body at %d (want %d)", pos, mlen)
+		}
+		signByte := data[pos]
+		pos++
+		mag := new(big.Int).SetBytes(data[pos : pos+mlen])
+		if signByte != 0 {
+			mag.Neg(mag)
+		}
+		pos += mlen
+		return newNumeric(mag, int(s)), pos, nil
 	default:
 		return Datum{}, 0, fmt.Errorf("unknown datum kind %d", kind)
 	}
@@ -314,18 +405,37 @@ func (o *rowsOp) Close() error {
 
 // spillOp implements Operator over a spillReader.
 type spillOp struct {
-	r    *spillReader
-	ctx  *Context
+	r   *spillReader
+	ctx *Context
+	// M0054-0005b-followup: reusable output Row buffer. When
+	// `borrow == BorrowedRow`, Next returns `out` directly;
+	// otherwise it clones before returning (default OwnedRow).
+	borrow BorrowSemantics
+	out    Row
 }
 
-func (o *spillOp) Open(*Context) error { return nil }
+func (o *spillOp) Open(*Context) error    { return nil }
 func (o *spillOp) Schema() planner.Schema { return nil }
+
+// SetBorrow flips spillOp into borrow-on-output mode. The caller
+// (a sort merge or hash-join probe loop) must consume each row
+// before pulling the next when set to BorrowedRow.
+// (M0054-0005b-followup.)
+func (o *spillOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
+
 func (o *spillOp) Next() (Row, error) {
-	row, err := o.r.ReadRow()
+	row, err := o.r.ReadRowInto(o.out)
 	if err == io.EOF {
 		return nil, EOF
 	}
-	return row, err
+	if err != nil {
+		return nil, err
+	}
+	o.out = row // re-cap for the next call
+	if o.borrow == BorrowedRow {
+		return row, nil
+	}
+	return cloneRow(row), nil
 }
 func (o *spillOp) Close() error {
 	o.r.Close()

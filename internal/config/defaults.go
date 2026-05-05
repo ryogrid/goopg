@@ -180,27 +180,11 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
-	// wal_direct_io requests Linux O_DIRECT writes for WAL
-	// segments so newly-written WAL bytes don't pollute the OS
-	// page cache. Default `off` keeps the legacy buffered path.
-	// On filesystems / kernels that don't honour O_DIRECT
-	// (tmpfs, overlayfs, every non-Linux GOOS) the writer
-	// transparently falls back to buffered writes and logs
-	// `event=wal_direct_io_fallback` at startup. See
-	// docs/design/0010-0001-wal-direct-io-write-path.md.
-	r.MustRegister(NewVariable(Variable{
-		Name: "wal_direct_io", Type: TypeBool, BootVal: "off",
-		Context: ContextPostmaster,
-		Scope:   ScopeServer,
-	}))
-
 	// wal_sender_memory_buffer sizes (in bytes) the in-memory
 	// ring of recent WAL bytes used by walsender's
 	// RecordIterator. 0 disables the ring; >0 mirrors every
 	// successful WAL write so senders can stream without
-	// disk reads (especially valuable when wal_direct_io=on
-	// keeps recent WAL out of the OS page cache). Default
-	// 16 MiB matches the M0010 milestone default. See
+	// disk reads. Default 16 MiB. See
 	// docs/design/0010-0002-walsender-in-memory-wal-handoff.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_memory_buffer", Type: TypeInt, BootVal: "16777216",
@@ -223,6 +207,62 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_buffers", Type: TypeInt, BootVal: "16777216",
 		MinVal: 0, MaxVal: 1 << 30,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
+	// synchronous_commit controls whether a transaction commit waits
+	// for the WAL record to be flushed to disk before returning to the
+	// client. Default on matches upstream's safe default; off allows
+	// faster commits at the cost of losing recent committed transactions
+	// on a server crash (up to wal_writer_delay latency). See
+	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "synchronous_commit", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession,
+	}))
+
+	// wal_writer_delay sets the period (in milliseconds) of the
+	// background WAL writer loop. The loop calls FlushUpTo to drain
+	// buffered WAL bytes so they are not held in RAM indefinitely.
+	// Default 200ms mirrors upstream's wal_writer_delay GUC. See
+	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_writer_delay", Type: TypeInt, BootVal: "200",
+		MinVal: 1, MaxVal: 10000,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
+	// wal_writer_flush_after sets the threshold (in bytes) above which
+	// the WAL writer loop issues an fdatasync in addition to writing.
+	// Default 1 MiB mirrors upstream's wal_writer_flush_after GUC. 0
+	// means always fsync on every loop iteration. See
+	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_writer_flush_after", Type: TypeInt, BootVal: "1048576",
+		MinVal: 0, MaxVal: 1 << 30,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
+	// bgwriter_delay controls how often (in milliseconds) the background
+	// writer goroutine wakes up to flush dirty buffer-pool pages.
+	// Default 200ms mirrors upstream's bgwriter_delay GUC (M0048-0003).
+	r.MustRegister(NewVariable(Variable{
+		Name: "bgwriter_delay", Type: TypeInt, BootVal: "200",
+		MinVal: 10, MaxVal: 10000,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
+	// bgwriter_lru_maxpages caps how many dirty pages the background
+	// writer flushes per tick. 0 disables the bgwriter. Default 100
+	// mirrors upstream's bgwriter_lru_maxpages GUC (M0048-0003).
+	r.MustRegister(NewVariable(Variable{
+		Name: "bgwriter_lru_maxpages", Type: TypeInt, BootVal: "100",
+		MinVal: 0, MaxVal: 1000,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
@@ -322,6 +362,32 @@ func BuildDefaultRegistry() *Registry {
 		Scope: ScopeSession | ScopeTransaction,
 	}))
 
+	// Opportunistic page pruning (M0046-0002). When on, the HOT-update
+	// path tries to reclaim universally-dead tuples inline when a page
+	// is full, avoiding an unnecessary relation extension.
+	r.MustRegister(NewVariable(Variable{
+		Name: "enable_opportunistic_prune", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
+	// Tuple-freeze age thresholds (M0046-0005). vacuum_freeze_min_age is
+	// the minimum XID age before VACUUM rewrites xmin → FrozenTransactionId.
+	// autovacuum_freeze_max_age is the maximum XID age before autovacuum
+	// is forced for anti-wraparound protection.
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_freeze_min_age", Type: TypeInt, BootVal: "50000000",
+		MinVal: 0, MaxVal: 1000000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "autovacuum_freeze_max_age", Type: TypeInt, BootVal: "200000000",
+		MinVal: 100000, MaxVal: 2000000000,
+		Context: ContextPostmaster,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
 	// Planner toggle GUCs. Upstream uses them for testing (`SET
 	// enable_seqscan = off` to force an index plan). v0's planner
 	// ignores them — the rule-based decisions still apply — but
@@ -331,6 +397,10 @@ func BuildDefaultRegistry() *Registry {
 		"enable_bitmapscan", "enable_hashjoin", "enable_mergejoin",
 		"enable_nestloop", "enable_sort", "enable_hashagg",
 		"enable_material", "enable_partition_pruning",
+		// M0054-0006: nested-loop index join rollback switch.
+		// `off` keeps the legacy Hash plan for joins that the
+		// rule would otherwise rewrite.
+		"enable_nestloop_index",
 	} {
 		r.MustRegister(NewVariable(Variable{
 			Name: name, Type: TypeBool, BootVal: "on",

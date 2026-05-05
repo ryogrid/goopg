@@ -28,13 +28,32 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 		segmentSize = DefaultSegmentSize
 	}
 
-	stream, err := readStream(walDir, segmentSize)
+	// M0045-0001/0003: WAL retention may remove segment 0.  Determine
+	// the first retained segment so (a) we read the correct files and
+	// (b) we offset all LSN values by firstSegNo*segmentSize so that
+	// returned StartLSN/EndLSN are ABSOLUTE byte positions — matching
+	// the values the WAL writer assigned and the values stored in page
+	// pd_lsn headers for idempotency checks.
+	firstSegNoI, err := firstAvailableSegment(walDir)
+	if err != nil {
+		return nil, err
+	}
+	if firstSegNoI < 0 {
+		return nil, nil
+	}
+	firstSegNo := uint64(firstSegNoI)
+
+	stream, err := readStreamFrom(walDir, segmentSize, firstSegNo)
 	if err != nil {
 		return nil, err
 	}
 	if len(stream) == 0 {
 		return nil, nil
 	}
+
+	// baseOffset is the absolute byte position of the first byte of
+	// stream[].  LSN = baseOffset + stream_offset + 1 (1-based).
+	baseOffset := firstSegNo * uint64(segmentSize)
 
 	// Format auto-detection: a successful classification picks
 	// the matching reader path. Classification errors (e.g.
@@ -45,7 +64,7 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 	// page-emitted segment as legacy would surface as a CRC
 	// mismatch on the very first record.
 	if format, derr := DetectWALFormat(walDir); derr == nil && format == WALFormatPGCompat {
-		return readAllPageAware(stream, segmentSize)
+		return readAllPageAware(stream, segmentSize, baseOffset)
 	}
 
 	var records []Record
@@ -69,7 +88,7 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
 		}
-		start := uint64(off) + 1
+		start := baseOffset + uint64(off) + 1
 		end := start + uint64(n) - 1
 		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: payload})
 		off += n
@@ -84,7 +103,7 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 // may straddle page boundaries. Record-byte LSNs include the page
 // header bytes between record fragments, mirroring upstream's
 // LSN-as-byte-offset semantics.
-func readAllPageAware(stream []byte, segSize int64) ([]Record, error) {
+func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record, error) {
 	var records []Record
 	off := 0
 	for off < len(stream) {
@@ -144,8 +163,8 @@ func readAllPageAware(stream []byte, segSize int64) ([]Record, error) {
 			}
 			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, n, len(fullBytes))
 		}
-		start := uint64(off) + 1
-		end := uint64(off) + uint64(consumed)
+		start := baseOffset + uint64(off) + 1
+		end := baseOffset + uint64(off) + uint64(consumed)
 		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: payload})
 		off += consumed
 	}
@@ -153,15 +172,56 @@ func readAllPageAware(stream []byte, segSize int64) ([]Record, error) {
 }
 
 func readStream(walDir string, segSize int64) ([]byte, error) {
+	// M0045-0001 / M0045-0003: WAL retention deletes pre-checkpoint
+	// segments so segment 0 may no longer be present. Enumerate the
+	// directory to find the first available segment and start from
+	// there instead of always starting at 0.
+	firstSegNo, err := firstAvailableSegment(walDir)
+	if err != nil {
+		return nil, err
+	}
+	if firstSegNo < 0 {
+		return nil, nil // fresh cluster, no WAL
+	}
+	return readStreamFrom(walDir, segSize, uint64(firstSegNo))
+}
+
+// firstAvailableSegment scans walDir and returns the smallest segment
+// number found, or -1 when no WAL segments exist.
+func firstAvailableSegment(walDir string) (int64, error) {
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return -1, nil
+		}
+		return -1, fmt.Errorf("wal: list %s: %w", walDir, err)
+	}
+	first := int64(-1)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		segNo, ok := parseSegmentName(e.Name())
+		if !ok {
+			continue
+		}
+		if first < 0 || int64(segNo) < first {
+			first = int64(segNo)
+		}
+	}
+	return first, nil
+}
+
+// readStreamFrom concatenates all WAL segments starting at firstSegNo
+// into a single byte slice. Stops on the first gap (missing segment)
+// or when the last segment is shorter than segSize (lazy-grow sentinel).
+func readStreamFrom(walDir string, segSize int64, firstSegNo uint64) ([]byte, error) {
 	stream := make([]byte, 0)
-	for segNo := uint64(0); ; segNo++ {
+	for segNo := firstSegNo; ; segNo++ {
 		path := filepath.Join(walDir, formatSegmentName(segNo))
 		b, err := os.ReadFile(path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				if segNo == 0 {
-					return nil, nil
-				}
 				break
 			}
 			return nil, fmt.Errorf("wal: read %s: %w", path, err)
@@ -170,11 +230,10 @@ func readStream(walDir string, segSize int64) ([]byte, error) {
 			return nil, fmt.Errorf("wal: segment %s too large: %d > %d", path, len(b), segSize)
 		}
 		stream = append(stream, b...)
-		// Legacy lazy-grown last segment: shorter than segSize, no
-		// next segment exists. Preallocated mode: every segment is
-		// full-size, and we keep reading until ENOENT. The EOS
-		// sentinel inside the byte stream terminates record
-		// iteration in ReadAll.
+		// Legacy lazy-grown last segment: shorter than segSize means
+		// there is no next segment. Preallocated mode: full-size
+		// segments continue until ENOENT. The EOS sentinel inside
+		// the byte stream terminates record iteration in ReadAll.
 		if int64(len(b)) < segSize {
 			break
 		}

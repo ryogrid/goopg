@@ -66,7 +66,7 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0029 | HammerDB TPC-H end-to-end run on goopg                                      | planned  | `0029-hammerdb-tpch-run.md` |
 | 0030 | Catalog persistence and DDL WAL                                             | planned  | `0030-catalog-persistence-and-ddl-wal.md` |
 | 0031 | TPC-H Q2 memory estimation & GC leak code review                           | accepted  | `0031-tpch-q2-memory-analysis-and-gc-code-review.md` |
-| 0032 | Buffer pool arena: mmap → Go heap replacement                          | accepted   | `0032-buffer-pool-heap-arena.md` |
+| 0032 | Buffer pool arena: mmap → Go heap replacement (incl. M0032-0005 HammerDA-shape load fix) | accepted   | `0032-buffer-pool-heap-arena.md` |
 | 0033 | Planner-level subquery unnesting                                         | accepted    | `0033-subquery-unnesting.md` |
 | 0034 | Bushy join tree / join-graph optimization                                | accepted     | `0034-bushy-join-optimization.md` |
 | 0035 | Streaming hash join & bushy-unnest verification                          | accepted      | `0035-streaming-hash-join.md` |
@@ -74,3 +74,19 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0037 | Spill-to-disk hash join (Grace hash join)                                | accepted       | `0037-hash-join-spill-to-disk.md` |
 | 0038 | Multi-way hash join                                                     | accepted        | `0038-multi-way-hash-join.md` |
 | 0039 | Fix planner column-index alignment (correct join results)               | planned         | `0039-fix-planner-column-ref.md` |
+| 0040 | Correlated subquery optimization (caching + IN-unnest)                  | accepted        | `0040-correlated-subquery-optimization.md` |
+| 0041 | Close remaining TPC-H result-parity gaps                                | accepted        | `0041-close-parity-gaps.md` |
+| 0042 | Align goopg's I/O subsystem with upstream PostgreSQL (buffered I/O, WAL writer, client backend) | planned | `0042-pg-io-alignment.md` |
+| 0043 | MHJ executor optimisations (lazy iterator + predicate pushdown) | accepted | `0043-mhj-executor-optimisations.md` |
+| 0044 | B-tree key support for HammerDB TPC-H schema types (varchar, char, timestamp, mixed compound) | planned | `0044-btree-tpch-key-types.md` |
+| 0045 | Crash recovery from non-zero starting WAL segment       | planned  | `0045-wal-recovery-non-zero-start.md` |
+| 0046 | Heap & MVCC maturation (HOT, FSM, VM, freezing, page pruning, TOAST) | planned | `0046-heap-mvcc-maturation.md` |
+| 0047 | B-tree maturation: bulk load, page deletion, deduplication | planned | `0047-btree-maturation.md` |
+| 0048 | Buffer pool concurrency hardening (IO_IN_PROGRESS, strategy ring, bgwriter, checkpoint pacing) | planned | `0048-buffer-pool-concurrency.md` |
+| 0049 | Protocol parity: cancellation, error detail, SCRAM-SHA-256, COPY binary | planned | `0049-protocol-parity.md` |
+| 0050 | Savepoints and subtransactions                                   | planned | `0050-savepoints-and-subtransactions.md` |
+| 0051 | Planner expression-level improvements (constant folding, implicit coercion, keyword categorisation, LIKE→range) | planned | `0051-planner-expression-improvements.md` |
+| 0052 | HammerDB TPC-H end-to-end regression on `perf-analysis` (oversized-message fix) | accepted | (tasks in `.ralph/fix_plan.md` — no separate milestone file; fixed via M0052-0001 + M0052-0002) |
+| 0053 | HammerDB TPC-H complete run verification & English report | accepted (PARTIAL) | `0053-hammerdb-tpch-complete-run-verification.md` |
+| 0054 | TPC-H performance & optimisation follow-through (closes M0053 deferrals: NLI, CREATE DATABASE WAL, EXPLAIN-driven index audit, pprof bottleneck survey, run-012 22/22 verification) | planned | `0054-tpch-performance-and-optimisation.md` |
+| 0055 | Staged B-tree enhancement program (write-path CPU reduction, steady-state dedup, multi-writer split protocol, deletion/recycling hardening, external-sort index build) | planned | `0055-staged-btree-enhancement-program.md` |

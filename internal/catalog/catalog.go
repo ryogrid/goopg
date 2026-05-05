@@ -7,6 +7,7 @@
 package catalog
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,6 +15,12 @@ import (
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
+)
+
+// Errors returned by database registration helpers (M0054-0001).
+var (
+	ErrDatabaseExists   = errors.New("database already exists")
+	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
 // Type is the textual type tag plus an optional typmod argument list.
@@ -68,6 +75,23 @@ type Table struct {
 	// rules-only join order. Mirrors upstream's pg_class
 	// reltuples / relpages plus per-column pg_statistic data.
 	Stats *TableStats
+
+	// SmallDimension flags a table whose row count is known to
+	// be ≤ a tiny constant — the canonical TPC-H examples are
+	// `region` (5 rows) and `nation` (25 rows). The planner uses
+	// the flag as a cardinality fallback when ANALYZE-derived
+	// stats are absent: a hash join with a SmallDimension side
+	// pins the small side as the build side regardless of the
+	// other side's estimated rows. See M0054-0010 / design doc
+	// `docs/design/0054-0005-hash-join-small-side-build.md`.
+	SmallDimension bool
+
+	// RelFrozenXID is the minimum XID still present in the heap as an
+	// unfrozen xmin. VACUUM FREEZE advances this toward the current XID.
+	// When currentXID − RelFrozenXID exceeds autovacuum_freeze_max_age,
+	// autovacuum triggers an anti-wraparound vacuum. Zero means no freeze
+	// pass has run yet on this table. Mirrors pg_class.relfrozenxid.
+	RelFrozenXID storage.TransactionID
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -184,12 +208,41 @@ type InMemory struct {
 	// so existing CRUD on those types stays untouched. Accessed
 	// via `(*InMemory).Routines()`.
 	routines *Routines
+	// databases is the set of database names the cluster knows
+	// about (M0054-0001). Populated by `CreateDatabase` and
+	// drained by `DropDatabase`. At startup the catalog seeds
+	// `"postgres"` (the conventional bootstrap DB); the recovery
+	// driver in `internal/initdb` re-applies WAL-logged
+	// CREATE/DROP DATABASE events on top. v0 still routes every
+	// relation through DefaultDBOid — the registry exists so
+	// `pg_database` returns truthful rows and so connections to
+	// recovered databases succeed after a crash, NOT for
+	// per-database storage isolation (that lands later).
+	databases map[string]bool
 }
+
+// Fixed OIDs for the three core system catalog heap tables.
+// Values match upstream's pg_class.h / pg_attribute.h / pg_type.h
+// so tools that query OID columns by numeric value (e.g. ODBC metadata
+// probes) see the expected numbers.
+const (
+	TypeRelationId      uint32 = 1247 // pg_type
+	AttributeRelationId uint32 = 1249 // pg_attribute
+	RelationRelationId  uint32 = 1259 // pg_class
+)
 
 // FirstUserOID is the first OID handed out for user-created tables.
 // 16384 is upstream's `FirstNormalObjectId` — anything below is
 // reserved for system catalogs.
 const FirstUserOID uint32 = 16384
+
+// IsSystemRelation reports whether oid belongs to the reserved system-
+// catalog OID range (anything below FirstUserOID). Used by the executor
+// and storage bootstrap to gate behaviour that only makes sense for
+// system relations (e.g. skipping WAL for catalog seeding writes).
+func IsSystemRelation(oid uint32) bool {
+	return oid < FirstUserOID
+}
 
 // DefaultDBOid is the v0 default database OID. Real multi-database
 // support (CREATE DATABASE) lives in milestone 7; until then every
@@ -200,15 +253,86 @@ const DefaultDBOid uint32 = 1
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:   make(map[string]*Table),
-		indexes:  make(map[string]*Index),
-		byTable:  make(map[uint32]map[string]*Index),
-		nextOID:  FirstUserOID,
-		dbOid:    DefaultDBOid,
-		routines: NewRoutines(),
+		tables:    make(map[string]*Table),
+		indexes:   make(map[string]*Index),
+		byTable:   make(map[uint32]map[string]*Index),
+		nextOID:   FirstUserOID,
+		dbOid:     DefaultDBOid,
+		routines:  NewRoutines(),
+		databases: map[string]bool{"postgres": true},
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// HasDatabase reports whether the given database name is registered
+// in the catalog. Used by the connection startup path to validate
+// the requested database parameter.
+func (c *InMemory) HasDatabase(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.databases[name]
+}
+
+// CreateDatabase registers a new database name (M0054-0001). Returns
+// `ErrDatabaseExists` when the name is already known. Callers are
+// expected to write a `wal.RecordKindCreateDatabase` record on the
+// success path so the registration survives a crash. Bootstrap and
+// recovery paths use `RegisterDatabaseDuringRecovery` instead, which
+// is idempotent.
+func (c *InMemory) CreateDatabase(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.databases[name] {
+		return ErrDatabaseExists
+	}
+	c.databases[name] = true
+	return nil
+}
+
+// DropDatabase removes a database from the catalog (M0054-0001).
+// Returns `ErrDatabaseNotFound` when the name is not registered.
+func (c *InMemory) DropDatabase(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.databases[name] {
+		return ErrDatabaseNotFound
+	}
+	delete(c.databases, name)
+	return nil
+}
+
+// RegisterDatabaseDuringRecovery is the idempotent version of
+// CreateDatabase used by the WAL-replay driver. Re-applying a record
+// that has already taken effect (e.g. because a SaveCatalog snapshot
+// captured it) is a no-op rather than an error.
+func (c *InMemory) RegisterDatabaseDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.databases[name] = true
+}
+
+// UnregisterDatabaseDuringRecovery is the idempotent counterpart to
+// `RegisterDatabaseDuringRecovery` — used for replaying
+// `RecordKindDropDatabase`.
+func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.databases, name)
+}
+
+// ListDatabases returns the registered database names in
+// deterministic (lexicographic) order. Backs the `pg_database`
+// virtual table.
+func (c *InMemory) ListDatabases() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.databases))
+	for n := range c.databases {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Routines returns the user-defined routine registry. Stage A
@@ -343,7 +467,15 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgDatabase.VirtualRows = func() [][]string {
-		return [][]string{{"postgres", "10", "6"}}
+		// M0054-0001: enumerate the live database registry instead
+		// of hard-coding a single `postgres` row. CREATE DATABASE
+		// adds entries; the recovery driver replays them.
+		names := c.ListDatabases()
+		out := make([][]string, 0, len(names))
+		for _, n := range names {
+			out = append(out, []string{n, "10", "6"})
+		}
+		return out
 	}
 	c.tables["pg_catalog.pg_database"] = pgDatabase
 
@@ -409,6 +541,73 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_tables"] = pgTables
+}
+
+// TryRegisterUserTable installs a user table recovered from the pg_class/
+// pg_attribute heap scan during startup (M0030-0003). Unlike CreateTable,
+// it preserves the original OID from the heap row and is idempotent:
+// if a table with the same qualified name already exists (e.g. loaded from
+// the JSON snapshot), the call is a no-op and returns nil. nextOID is
+// advanced past tbl.OID to prevent future allocations from colliding with
+// existing heap-stored relations.
+func (c *InMemory) TryRegisterUserTable(tbl *Table) error {
+	if tbl == nil {
+		return fmt.Errorf("TryRegisterUserTable: nil table")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
+	if _, exists := c.tables[k]; exists {
+		return nil // already registered — idempotent
+	}
+	for i := range tbl.Columns {
+		tbl.Columns[i].Ordinal = i
+	}
+	c.tables[k] = tbl
+	if tbl.OID >= c.nextOID {
+		c.nextOID = tbl.OID + 1
+	}
+	return nil
+}
+
+// RegisterRealTable installs a heap-backed system catalog table.
+// Used at startup to register pg_type and pg_attribute after their
+// relfiles are confirmed present on disk. The table must have
+// Virtual=false and a pre-assigned OID below FirstUserOID
+// (i.e. IsSystemRelation(t.OID) must be true).
+//
+// If an entry with the same qualified name already exists and has
+// the same OID, the call is a no-op (idempotent). This handles
+// the case where Restore() loaded the table from a JSON snapshot
+// before loadSystemCatalogsIfPresent ran.
+//
+// System catalog tables are excluded from Snapshot() so they are
+// never persisted to JSON — they are always re-registered at
+// startup from their heap relfiles.
+func (c *InMemory) RegisterRealTable(t *Table) error {
+	if t == nil {
+		return fmt.Errorf("RegisterRealTable: nil table")
+	}
+	if t.Virtual {
+		return fmt.Errorf("RegisterRealTable: table %q must not be virtual", t.QualifiedName())
+	}
+	if !IsSystemRelation(t.OID) {
+		return fmt.Errorf("RegisterRealTable: OID %d is above FirstUserOID; use CreateTable instead", t.OID)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(parser.ObjectName{Schema: t.Schema, Name: t.Name})
+	if existing, ok := c.tables[k]; ok {
+		if existing.OID == t.OID {
+			return nil // already registered — idempotent
+		}
+		return fmt.Errorf("RegisterRealTable: %q already exists with OID %d (want %d)", k, existing.OID, t.OID)
+	}
+	for i := range t.Columns {
+		t.Columns[i].Ordinal = i
+	}
+	c.tables[k] = t
+	return nil
 }
 
 // RegisterVirtualTable installs a virtual table built by an

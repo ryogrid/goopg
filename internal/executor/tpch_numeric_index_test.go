@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -87,7 +88,7 @@ func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 	}
 	// SampleInserts inserts orders 1..8 with NUMERIC o_orderkey.
 	for _, k := range []int64{1, 4, 8} {
-		if _, found, err := tree.Search(btree.EncodeNumericKey(k, 0)); err != nil || !found {
+		if _, found, err := tree.Search(btree.EncodeNumericKey(big.NewInt(k), 0)); err != nil || !found {
 			t.Errorf("orders_pk search o_orderkey=%d: found=%v err=%v", k, found, err)
 		}
 	}
@@ -129,11 +130,14 @@ func TestTPCHNumericSingleColumnIndexesAccepted(t *testing.T) {
 }
 
 // planContainsIndexScan walks a plan tree (depth-first) and reports
-// whether any node is an IndexScan. Used by the TPC-H integration
-// test to confirm the planner picked the index path even when the
-// outer node is a Project / Filter wrapper.
+// whether any node is an IndexScan or IndexOnlyScan. Used by the TPC-H
+// integration test to confirm the planner picked the index path even when
+// the outer node is a Project / Filter wrapper.
 func planContainsIndexScan(n planner.Node) bool {
 	if _, ok := n.(*planner.IndexScan); ok {
+		return true
+	}
+	if _, ok := n.(*planner.IndexOnlyScan); ok {
 		return true
 	}
 	switch v := n.(type) {

@@ -12,12 +12,9 @@ import (
 // Manager is the storage manager. It owns one open file per loaded
 // (RelFileNode) and routes ReadBlock/WriteBlock/Extend through them.
 //
-// v0 opens primary data files with O_RDWR|O_CREATE; the O_DIRECT flag
-// is requested when AlignedIO is true (the production path) and
-// omitted when false (test-friendly path). Direct I/O alignment is
-// the caller's responsibility — buffer pool slots come from the
-// page-aligned arena, so callers using the buffer manager always
-// satisfy the alignment requirement.
+// Data files are opened with plain O_RDWR|O_CREATE (buffered I/O);
+// durability comes from fdatasync at checkpoint time, not per-write.
+// This mirrors upstream PostgreSQL's relation-file I/O model.
 //
 // The Manager is goroutine-safe.
 // AIOEngine is the optional AIO seam. When attached via
@@ -100,11 +97,6 @@ type ManagerConfig struct {
 	// <DataDir>/base/<dbOid>/<relOid>[<fork-suffix>].
 	DataDir string
 
-	// AlignedIO requests O_DIRECT|O_DSYNC. When true, all read/write
-	// buffers must be 4 KiB-aligned and reads/writes must be at
-	// 4 KiB-multiple offsets and lengths. The buffer-pool arena
-	// guarantees this; callers using their own buffers must too.
-	AlignedIO bool
 }
 
 // NewManager constructs an empty Manager. Files open lazily on first
@@ -361,10 +353,6 @@ func (m *Manager) relFile(rel RelFileNode) (*relFile, error) {
 	osFile, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", path, err)
-	}
-	if err := setDirectIOIfRequested(osFile, m.cfg.AlignedIO); err != nil {
-		_ = osFile.Close()
-		return nil, fmt.Errorf("set O_DIRECT %s: %w", path, err)
 	}
 	st, err := osFile.Stat()
 	if err != nil {

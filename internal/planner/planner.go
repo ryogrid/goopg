@@ -74,6 +74,12 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &Transaction{pos: s.Pos(), Verb: TxCommit}, nil
 	case *parser.RollbackStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxRollback}, nil
+	case *parser.SavepointStmt:
+		return &Transaction{pos: s.Pos(), Verb: TxSavepoint, Name: s.Name}, nil
+	case *parser.ReleaseSavepointStmt:
+		return &Transaction{pos: s.Pos(), Verb: TxRelease, Name: s.Name}, nil
+	case *parser.RollbackToSavepointStmt:
+		return &Transaction{pos: s.Pos(), Verb: TxRollbackTo, Name: s.Name}, nil
 
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt:
@@ -310,7 +316,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	if s.Where != nil {
 		if isSimpleSingle {
-			if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+			// M0051-0004: inject synthetic range predicates alongside any
+			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
+			whereForIndex := injectLikeRangePredicates(s.Where)
+			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat); err != nil {
 				return nil, err
 			} else if ok {
 				node = idxNode
@@ -361,9 +370,31 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// MultiHashJoin node.  Column indices are remapped inside
 	// collectMultiHashTables using scanForCol, so parent
 	// expressions (incl. unnest keys) stay aligned.
-	node = rewriteMultiWayChain(node)
+	node = rewriteMultiWayChain(node, cat)
+	// M0054-0006a-pre: after MultiHashJoin construction, walk the
+	// plan tree and route single-table constant-RHS equality
+	// predicates from `*Filter` wrappers and `mh.Filters` into the
+	// matching `*SeqScan` input by rewriting it to `*IndexScan`.
+	// Closes the M0054-0003d Q8 case
+	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
+	// `Index Scan using idx_part_type on part`).
+	node = rewriteScanInputsWithSingleTablePredicates(node, cat)
+	// M0054-0006: rewrite eligible binary `*Join{Algo:Hash}` /
+	// `*Join{Algo:NestedLoop}` nodes to `*NestedLoopIndexJoin` when
+	// the equi-join predicate matches a single-column B-tree index
+	// on the inner side AND the cost gate accepts. The pass is a
+	// no-op when the package-level kill-switch is off
+	// (`SetNLIEnabled(false)`).
+	node = rewriteJoinsToNLI(node, cat)
+	node = remapExprRefsToMHJ(node)
+	// Second pass: use FROM‑clause bindings to correct any
+	// remaining order differences (OID ≠ FROM order).
+	if len(ctx.bindings) > 0 {
+		remapWithBindings(node, ctx.bindings)
+	}
 
 	var agg *aggregateSurface
+	savedBindings := ctx.bindings
 	if needsAggregateStage(s) {
 		var having Expr
 		var err error
@@ -373,6 +404,13 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		if having != nil {
 			node = &Filter{pos: s.Having.Pos(), Child: node, Predicate: having}
+		}
+		// The aggregate stage resolves GroupExprs / Agg.Arg against
+		// ctx.bindings (FROM‑clause order).  Remap only those two
+		// fields — not the HAVING predicate, which uses aggregate‑
+		// output column indices and must not be touched.
+		if len(savedBindings) > 0 {
+			remapAggExprsWithBindings(node, savedBindings)
 		}
 	} else if s.Having != nil {
 		return nil, &PlanError{
@@ -452,7 +490,36 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := Node(&Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema})
+	proj := &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}
+	// Promote to IndexOnlyScan (M0046-0004) only when there are no locking
+	// clauses. FOR UPDATE / FOR SHARE rely on the IndexScan leaf being
+	// accessible via lockRowsOp's currentTIDProvider chain.
+	var out Node
+	if len(s.Locking) == 0 {
+		if promoted := tryPromoteIndexOnlyScan(proj); promoted != proj {
+			out = promoted
+		}
+	}
+	if out == nil {
+		out = Node(proj)
+	}
+	// resolveTargets resolves SELECT targets against ctx.bindings,
+	// which holds FROM‑clause offsets — but rewriteMultiWayChain /
+	// bushy DP may have re‑laid out the underlying join tree
+	// (e.g. OID‑sorted MHJ output). Remap the freshly‑added
+	// Project's targets (and any Sort keys above the join tree)
+	// using the same bindings posMap so they land at actual scan
+	// offsets. For aggregate queries the targets reference
+	// aggregate‑output indices (small and outside any FROM
+	// binding's range) so the remap is a no‑op. Inline‑view
+	// subqueries (TPC‑H Q7/Q8/Q9) hit this path with FROM‑order
+	// indices and need the remap to fire. We deliberately do NOT
+	// walk below the Project's join‑tree boundary — those nodes
+	// were already remapped by the earlier remapWithBindings call,
+	// and walking them again would double‑remap.
+	if agg == nil && len(savedBindings) > 0 {
+		remapTopProjection(out, savedBindings)
+	}
 	if len(s.Locking) > 0 {
 		// M0021-0002 — wrap the SELECT plan in a LockRows
 		// node carrying the resolved per-relation locking
@@ -467,6 +534,8 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks}
 	}
+	// Collapse all-constant sub-expressions in the final plan tree.
+	foldPlanConstants(out)
 	return out, nil
 }
 
@@ -757,7 +826,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
 	}
-	return &SeqScan{pos: rv.Pos(), Table: tbl, schema: ctx.schema}, b, nil
+	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
 
 // buildVirtualValues materialises a virtual table's current rows as
@@ -1137,7 +1206,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		if _, exists := byKey[k]; exists {
 			continue
 		}
-		wf, err := buildWindowFunc(fc)
+		wf, err := buildWindowFunc(fc, inputCtx, agg)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -1191,17 +1260,52 @@ func collectWindowCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
 	return out, nil
 }
 
-func buildWindowFunc(fc *parser.FuncCall) (WindowFunc, error) {
+// inferExprType returns the catalog type of a resolved planner Expr.
+// Used to derive the return type of lag/lead from their first argument.
+func inferExprType(e Expr) catalog.Type {
+	switch x := e.(type) {
+	case *ColumnRef:
+		return x.Type
+	case *OuterColumnRef:
+		return x.Type
+	case *IntegerConst:
+		return catalog.Type{Name: "int8"}
+	case *NumericConst:
+		return catalog.Type{Name: "numeric"}
+	case *StringConst:
+		return catalog.Type{Name: "text"}
+	case *BooleanConst:
+		return catalog.Type{Name: "bool"}
+	default:
+		return catalog.Type{Name: "text"}
+	}
+}
+
+func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggregateSurface) (WindowFunc, error) {
 	name := strings.ToLower(fc.Name.Name)
 	switch name {
 	case "row_number", "rank":
 		if fc.Star || fc.Distinct || len(fc.Args) != 0 {
 			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name)}
 		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}}, nil
+	case "lag", "lead":
+		if fc.Star || fc.Distinct || len(fc.Args) < 1 || len(fc.Args) > 3 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() requires 1 to 3 arguments", name)}
+		}
+		args := make([]Expr, 0, len(fc.Args))
+		for _, a := range fc.Args {
+			resolved, err := resolveExprForWindowInput(a, inputCtx, agg)
+			if err != nil {
+				return WindowFunc{}, err
+			}
+			args = append(args, resolved)
+		}
+		retType := inferExprType(args[0])
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: retType, Args: args}, nil
 	default:
 		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
 	}
-	return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}}, nil
 }
 
 func windowCallKey(fc *parser.FuncCall) string {
@@ -1848,7 +1952,8 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	tbl := ctx.bindings[0].table
 	b, ok := where.(*parser.BinaryOp)
 	if !ok || b.Op != "=" {
-		return nil, false, nil
+		// Not an equality predicate — try range index scan.
+		return tryRangeIndexScan(where, tbl, ctx, cat)
 	}
 	leftCol, lIsCol := b.Left.(*parser.ColumnRef)
 	rightCol, rIsCol := b.Right.(*parser.ColumnRef)
@@ -1886,6 +1991,14 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		// numeric literal on the rhs of `=`. The executor's
 		// encodeBTreeKeyForColumn picks the right encoding from
 		// the column type.
+	case *StringConst:
+		// M0044-0005: varchar/char column indexes — probe key is
+		// a plain string literal; evaluates to KindString at
+		// runtime and routes through EncodeVarchar/EncodeChar.
+	case *TypedStringLit:
+		// M0044-0005: timestamp column indexes — probe key is a
+		// typed literal like `timestamp '1995-01-01'`; evaluates
+		// to KindTime and routes through EncodeTimestamp.
 	default:
 		return nil, false, nil
 	}
@@ -1903,19 +2016,229 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	}, true, nil
 }
 
+// findBTreeIndexForColumn locates a B-tree index whose leading column
+// matches `col`. M0053-0001: composite indexes are accepted when their
+// FIRST key column matches; the resulting IndexScan probes only the
+// leading-column value. This is correct because B-tree key encoding is
+// a byte-wise concatenation of column encodings — any leaf key whose
+// leading-column bytes equal the probe value is a candidate. The
+// executor (`indexScanOp.lookupKey`) widens the upper bound with 0xFF
+// padding so the inclusive RangeScan range covers all suffix values.
+//
+// A single-column-only index is preferred when both shapes match the
+// column (cheaper probe — exact equality vs. prefix range) so the
+// search returns a single-column index first when one exists.
 func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string) *catalog.Index {
+	var composite *catalog.Index
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if strings.ToLower(idx.Method) != "btree" {
 			continue
 		}
-		if len(idx.Columns) != 1 {
+		if len(idx.Columns) == 0 || idx.Columns[0] != col {
 			continue
 		}
-		if idx.Columns[0] == col {
+		if len(idx.Columns) == 1 {
 			return idx
 		}
+		if composite == nil {
+			composite = idx
+		}
 	}
-	return nil
+	return composite
+}
+
+// collectAndConjuncts walks an AND chain and returns the leaf conjuncts.
+// A non-AND node returns a single-element slice containing itself.
+func collectAndConjuncts(e parser.Expr) []parser.Expr {
+	b, ok := e.(*parser.BinaryOp)
+	if !ok || b.Op != "AND" {
+		return []parser.Expr{e}
+	}
+	result := collectAndConjuncts(b.Left)
+	result = append(result, collectAndConjuncts(b.Right)...)
+	return result
+}
+
+// isConstantExpr reports whether the RESOLVED (planner.Expr) expression
+// contains no column references or subqueries — i.e., its value does not
+// depend on the current row.
+func isConstantExpr(e Expr) bool {
+	switch x := e.(type) {
+	case *ColumnRef, *OuterColumnRef:
+		return false
+	case *SubqueryExpr, *ExistsExpr, *InExpr:
+		return false
+	case *BinaryOp:
+		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
+	case *UnaryOp:
+		return isConstantExpr(x.Operand)
+	case *IntegerConst, *StringConst, *NumericConst,
+		*TypedStringLit, *IntervalLit,
+		*NullConst, *BooleanConst, *ParamRef:
+		return true
+	case *ExtractExpr:
+		return isConstantExpr(x.Source)
+	case *CaseExpr:
+		if x.Operand != nil && !isConstantExpr(x.Operand) {
+			return false
+		}
+		for _, w := range x.Whens {
+			if !isConstantExpr(w.When) || !isConstantExpr(w.Then) {
+				return false
+			}
+		}
+		if x.Else != nil && !isConstantExpr(x.Else) {
+			return false
+		}
+		return true
+	case *FuncCall:
+		for _, a := range x.Args {
+			if !isConstantExpr(a) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false // conservative
+	}
+}
+
+// flipRangeOp flips a comparison operator for the "key op col" → "col flippedOp key"
+// canonical form (column on the left).
+func flipRangeOp(op string) string {
+	switch op {
+	case "<":
+		return ">"
+	case "<=":
+		return ">="
+	case ">":
+		return "<"
+	case ">=":
+		return "<="
+	}
+	return op
+}
+
+// tryRangeIndexScan attempts to build a Filter(IndexScan{LowKey,HighKey})
+// from a WHERE expression containing one or more range predicates (< <= > >=)
+// on a single B-tree-indexed column. Returns (nil, false, nil) when no range
+// index is applicable.
+func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	conjuncts := collectAndConjuncts(where)
+
+	var chosenColName string
+	var chosenIdx *catalog.Index
+	var loKey Expr // inclusive lower bound
+	var hiKey Expr // inclusive upper bound
+
+	for _, conj := range conjuncts {
+		b, ok := conj.(*parser.BinaryOp)
+		if !ok {
+			continue
+		}
+		op := b.Op
+		if op != "<" && op != "<=" && op != ">" && op != ">=" {
+			continue
+		}
+
+		var colRef *parser.ColumnRef
+		var keyExpr parser.Expr
+		colOnLeft := false
+
+		if lc, ok := b.Left.(*parser.ColumnRef); ok {
+			colRef = lc
+			keyExpr = b.Right
+			colOnLeft = true
+		} else if rc, ok := b.Right.(*parser.ColumnRef); ok {
+			colRef = rc
+			keyExpr = b.Left
+			colOnLeft = false
+		} else {
+			continue
+		}
+
+		// Make sure the other side is NOT also a column ref
+		if colOnLeft {
+			if _, ok := b.Right.(*parser.ColumnRef); ok {
+				continue
+			}
+		} else {
+			if _, ok := b.Left.(*parser.ColumnRef); ok {
+				continue
+			}
+		}
+
+		// Flip op to canonical "col op key" form
+		canonOp := op
+		if !colOnLeft {
+			canonOp = flipRangeOp(op)
+		}
+
+		// Resolve column
+		resolvedCol, err := resolveColumnRef(colRef, ctx)
+		if err != nil {
+			continue
+		}
+		col, ok := resolvedCol.(*ColumnRef)
+		if !ok {
+			continue
+		}
+
+		// Ensure column is from the target table (not outer ref)
+		if chosenColName == "" {
+			// First indexed column: look up a B-tree index for it
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			if idx == nil {
+				continue
+			}
+			chosenColName = col.Name
+			chosenIdx = idx
+		} else if col.Name != chosenColName {
+			// Different column — ignore this conjunct (keep first column)
+			continue
+		}
+
+		// Resolve the key expression
+		resolvedKey, err := resolveExpr(keyExpr, ctx)
+		if err != nil {
+			continue
+		}
+		if !isConstantExpr(resolvedKey) {
+			continue
+		}
+
+		// Assign bounds based on canonical operator
+		switch canonOp {
+		case ">", ">=":
+			if loKey == nil {
+				loKey = resolvedKey
+			}
+		case "<", "<=":
+			if hiKey == nil {
+				hiKey = resolvedKey
+			}
+		}
+	}
+
+	if chosenIdx == nil {
+		return nil, false, nil
+	}
+
+	// Resolve the full WHERE predicate for the Filter node
+	fullPred, err := resolveExpr(where, ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	scan := &IndexScan{
+		pos:     where.Pos(),
+		Table:   tbl,
+		Index:   chosenIdx,
+		LowKey:  loKey,
+		HighKey: hiKey,
+		schema:  ctx.schema,
+	}
+	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
@@ -2746,4 +3069,79 @@ func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
 		return true
 	}
 	return false
+}
+
+
+// tryPromoteIndexOnlyScan examines a freshly-built Project node and promotes
+// it to an IndexOnlyScan (M0046-0004) when all of the following hold:
+//  1. The Project's direct child (ignoring Filter wrappers) is an IndexScan.
+//  2. All target expressions are ColumnRefs whose names appear in the index key.
+//
+// Returns the original proj unchanged if the conditions are not met.
+func tryPromoteIndexOnlyScan(proj *Project) Node {
+	if proj == nil {
+		return proj
+	}
+	// Strip a single Filter wrapper if present (e.g. range predicates).
+	child := proj.Child
+	var filter *Filter
+	if f, ok := child.(*Filter); ok {
+		filter = f
+		child = f.Child
+	}
+	idxScan, ok := child.(*IndexScan)
+	if !ok {
+		return proj
+	}
+	// M0053-0001: composite indexes are now reachable via IndexScan
+	// (leading-column probe), but the IndexOnlyScan executor cannot
+	// decode multi-column keys back to row Datums yet. Skip promotion
+	// for composite indexes so the row is fetched from the heap path.
+	if len(idxScan.Index.Columns) != 1 {
+		return proj
+	}
+	// Check that every projected column is in the index key.
+	idxColSet := make(map[string]bool, len(idxScan.Index.Columns))
+	for _, c := range idxScan.Index.Columns {
+		idxColSet[c] = true
+	}
+	covered := make([]catalog.Column, 0, len(proj.Targets))
+	for _, t := range proj.Targets {
+		cr, isCR := t.(*ColumnRef)
+		if !isCR || !idxColSet[cr.Name] {
+			return proj // target not in index — cannot use index-only
+		}
+		// Find the full column definition from the table.
+		col, found := func() (catalog.Column, bool) {
+			for _, c := range idxScan.Table.Columns {
+				if c.Name == cr.Name {
+					return c, true
+				}
+			}
+			return catalog.Column{}, false
+		}()
+		if !found {
+			return proj
+		}
+		covered = append(covered, col)
+	}
+	if len(covered) == 0 {
+		return proj
+	}
+	ios := &IndexOnlyScan{
+		pos:     idxScan.pos,
+		Table:   idxScan.Table,
+		Index:   idxScan.Index,
+		Key:     idxScan.Key,
+		LowKey:  idxScan.LowKey,
+		HighKey: idxScan.HighKey,
+		Covered: covered,
+		schema:  proj.schema,
+	}
+	if filter != nil {
+		// Keep the Filter but replace its child with IndexOnlyScan.
+		filter.Child = ios
+		return filter
+	}
+	return ios
 }

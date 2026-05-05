@@ -17,10 +17,38 @@ import (
 // Stats summarises the outcome of one Vacuum invocation across every
 // block in the relation.
 type Stats struct {
-	Pages      int // blocks visited
-	Live       int // tuples that survived this pass
-	Dead       int // tuples reclaimed (LP_NORMAL -> LP_UNUSED)
-	OldestXmin storage.TransactionID
+	Pages        int // blocks visited
+	Live         int // tuples that survived this pass
+	Dead         int // tuples reclaimed (LP_NORMAL -> LP_UNUSED)
+	Frozen       int // tuples whose xmin was rewritten to FrozenTransactionID
+	OldestXmin   storage.TransactionID
+	NewFrozenXID storage.TransactionID // lowest unfrozen xmin after this pass (0 if all frozen)
+	// DeadTIDs is the list of heap (block, offset) pointers that were
+	// reclaimed in this pass. Index vacuum uses these to remove stale
+	// index entries (M0047-0002).
+	DeadTIDs []storage.ItemPointer
+}
+
+// VacuumOptions controls optional vacuum behaviours beyond the core dead-tuple
+// reclamation. All fields are optional; zero values disable the feature.
+type VacuumOptions struct {
+	// FSM, when non-nil, receives updated free-space entries after each page
+	// prune so subsequent INSERTs can reuse freed space (M0046-0003).
+	FSM *storage.FSM
+	// VM, when non-nil, gets ALL_VISIBLE bits set per page after the prune
+	// so index-only scans can skip heap fetches (M0046-0004).
+	VM *storage.VisibilityMap
+	// FreezeBelow, when > 0, activates tuple freezing (M0046-0005).
+	// Any tuple with xmin < FreezeBelow is rewritten to FrozenTransactionID
+	// so XID wraparound cannot make it invisible.
+	FreezeBelow storage.TransactionID
+}
+
+// VacuumWithOptions is the full-featured Vacuum entry point. All optional
+// behaviours (FSM, VM, freeze) are controlled through opts.
+func VacuumWithOptions(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
+	opts VacuumOptions) (Stats, error) {
+	return vacuumCore(pool, mgr, rel, opts)
 }
 
 // Vacuum runs a heap page-prune across every block of rel using the
@@ -39,6 +67,23 @@ type Stats struct {
 // VACUUM does not touch indexes — see Reindex for the bridge until
 // B-tree page deletion lands.
 func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Stats, error) {
+	return vacuumCore(pool, mgr, rel, VacuumOptions{})
+}
+
+// VacuumWithFSM is Vacuum with a Free Space Map (M0046-0003).
+func VacuumWithFSM(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, fsm *storage.FSM) (Stats, error) {
+	return vacuumCore(pool, mgr, rel, VacuumOptions{FSM: fsm})
+}
+
+// VacuumWithFSMAndVM runs vacuum, updating both the FSM (M0046-0003) and the
+// Visibility Map (M0046-0004).
+func VacuumWithFSMAndVM(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
+	fsm *storage.FSM, vm *storage.VisibilityMap) (Stats, error) {
+	return vacuumCore(pool, mgr, rel, VacuumOptions{FSM: fsm, VM: vm})
+}
+
+func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
+	opts VacuumOptions) (Stats, error) {
 	horizon := mgr.OldestXmin()
 	nBlocks, err := pool.NBlocks(rel)
 	if err != nil {
@@ -69,6 +114,10 @@ func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Sta
 		// writers can't tear the dead-set scan + repack + pd_lsn
 		// stamp under MarkDirtyChangeRecord.
 		slot.Lock()
+
+		pageDirty := false
+
+		// Dead-tuple reclamation pass.
 		deadSlots, err := storage.CollectDeadHeapSlots(page, isDead)
 		if err != nil {
 			slot.Unlock()
@@ -93,6 +142,41 @@ func Vacuum(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (Sta
 				}
 			} else {
 				pool.MarkDirty(slot)
+			}
+			pageDirty = true
+			// Collect dead TIDs for index vacuum (M0047-0002).
+			for _, s := range deadSlots {
+				stats.DeadTIDs = append(stats.DeadTIDs, storage.ItemPointer{Block: blk, Offset: s})
+			}
+		}
+
+		// Tuple-freeze pass (M0046-0005): rewrite old xmin → FrozenTransactionID.
+		if opts.FreezeBelow > 0 {
+			fs, ferr := storage.PageFreezeOldTuples(page, opts.FreezeBelow)
+			if ferr == nil && fs.Frozen > 0 {
+				pool.MarkDirty(slot) // conservative FPI for freeze
+				pageDirty = true
+				stats.Frozen += fs.Frozen
+			}
+			// Track the minimum unfrozen xmin across all pages for relfrozenxid.
+			if fs.MinUnfrozenXID != 0 {
+				if stats.NewFrozenXID == 0 || fs.MinUnfrozenXID < stats.NewFrozenXID {
+					stats.NewFrozenXID = fs.MinUnfrozenXID
+				}
+			}
+			_ = pageDirty
+		}
+
+		// Record updated free space in FSM (M0046-0003).
+		if opts.FSM != nil {
+			opts.FSM.RecordFreeSpaceForPage(rel, blk, page)
+		}
+		// Set ALL_VISIBLE in VM (M0046-0004).
+		if opts.VM != nil {
+			if storage.PageAllVisible(page, horizon) {
+				opts.VM.SetAllVisible(rel, blk)
+			} else {
+				opts.VM.ClearBlock(rel, blk)
 			}
 		}
 		slot.Unlock()

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -28,7 +29,7 @@ const (
 // Everything else still returns a feature-not-supported ErrorResponse.
 // Each statement is terminated with ReadyForQuery('I') so the client
 // can keep going.
-func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) error {
+func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) error {
 	q, err := extractCString(payload)
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -81,7 +82,7 @@ func (s *Server) handleQuery(w *protocol.FrameWriter, sess *config.SessionRegist
 	}
 
 	if s.cfg.hasStorage() {
-		return s.dispatchSimpleQueryViaExecutor(w, sess, trimmed)
+		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed)
 	}
 
 	return s.writeQueryError(w, sqlstate.FeatureNotSupported,
@@ -211,14 +212,17 @@ func (s *Server) respondSelectOne(w *protocol.FrameWriter) error {
 // writeQueryError emits an ErrorResponse with the given SQLSTATE plus a
 // trailing ReadyForQuery, matching how upstream finishes a failed simple
 // Query (the parse error is reported and the connection stays open).
-func (s *Server) writeQueryError(w *protocol.FrameWriter, code sqlstate.Code, msg string) error {
-	if err := w.WriteErrorResponse([]protocol.ErrorField{
+// extra fields (e.g. FieldPosition) are appended after the standard set.
+func (s *Server) writeQueryError(w *protocol.FrameWriter, code sqlstate.Code, msg string, extra ...protocol.ErrorField) error {
+	fields := []protocol.ErrorField{
 		{Code: protocol.FieldSeverity, Value: "ERROR"},
 		{Code: protocol.FieldSeverityNonLocal, Value: "ERROR"},
 		{Code: protocol.FieldSQLState, Value: string(code)},
 		{Code: protocol.FieldMessage, Value: msg},
 		{Code: protocol.FieldRoutine, Value: "server.handleQuery"},
-	}); err != nil {
+	}
+	fields = append(fields, extra...)
+	if err := w.WriteErrorResponse(fields); err != nil {
 		return err
 	}
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)

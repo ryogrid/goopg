@@ -15,6 +15,11 @@ import (
 // Open / Next call. It is constructed by the wire-protocol path at
 // statement start and torn down at statement end.
 type Context struct {
+	// Ctx, when non-nil, is the per-query cancellable context. Operators
+	// poll Ctx.Err() periodically to detect query cancellation
+	// (CancelRequest / psql Ctrl-C → SQLSTATE 57014).
+	Ctx context.Context
+
 	// Params holds bind values for $1, $2, ... — Params[i-1] is $i.
 	Params []Datum
 	// Now is the wall-clock value `current_timestamp` and friends
@@ -57,6 +62,16 @@ type Context struct {
 	// `OuterRows[len(OuterRows)-Level]` — Level 1 is the
 	// innermost outer scope.
 	OuterRows []Row
+
+	// SubqueryCache stores subquery results keyed by outer-row
+	// values so correlated subqueries are executed at most once
+	// per distinct outer value rather than per outer row.  Keys
+	// are datumKey-derived strings; values are []Dat um for
+	// InExpr or Datum for scalar subqueries.  The cache is
+	// notionally per-subquery — a production implementation
+	// would namespace by InExpr/SubqueryExpr identity.
+	SubqueryCache      map[string][]Datum
+	SubqueryCacheScope int // OuterRows len when cached; cleared on change
 
 	// StatsTarget is the effective `default_statistics_target`
 	// GUC value for the current statement. ANALYZE uses
@@ -108,6 +123,26 @@ type Context struct {
 	// spill-to-disk. Zero means unlimited (no spill). Defaults to
 	// 512 MiB when the GUC is active. See milestone 0037.
 	WorkMem int64
+
+	// EnableOpportunisticPrune mirrors the enable_opportunistic_prune
+	// GUC (M0046-0002). When true, the HOT-update path calls
+	// PagePruneOpt before falling back to a relation extension.
+	EnableOpportunisticPrune bool
+
+	// FSM is the Free Space Map (M0046-0003). When non-nil, writeHeapRow
+	// consults it before extending the relation, and VACUUM updates it
+	// after reclaiming dead tuples so freed pages can be reused.
+	FSM *storage.FSM
+
+	// VM is the Visibility Map (M0046-0004). When non-nil, index-only scans
+	// check it to skip heap fetches for ALL_VISIBLE pages; VACUUM sets bits
+	// after verifying all tuples are universally visible.
+	VM *storage.VisibilityMap
+
+	// FreezeMinAge is the vacuum_freeze_min_age GUC value (M0046-0005).
+	// VACUUM rewrites xmin → FrozenTransactionID for tuples older than
+	// currentXID − FreezeMinAge. Zero disables freezing.
+	FreezeMinAge int64
 }
 
 // acquireRelLock funnels every operator's relation-level lock
@@ -129,8 +164,12 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if c.Activity != nil && c.ActivityPID != "" {
 		c.Activity.WaitEventStart(c.ActivityPID, activity.WaitTypeLock, activity.WaitRelationLock)
 	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
 	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
-	err := c.LockMgr.Acquire(context.Background(), c.BackendID, tag, mode)
+	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
 	if c.Activity != nil && c.ActivityPID != "" {
 		c.Activity.WaitEventEnd(c.ActivityPID)
 	}
@@ -159,8 +198,12 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 	if c.LockMgr == nil {
 		return nil
 	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
 	tag := tupleLockTag(rel, ptr)
-	err := c.LockMgr.Acquire(context.Background(), c.BackendID, tag, mode)
+	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
 	if err == nil {
 		return nil
 	}

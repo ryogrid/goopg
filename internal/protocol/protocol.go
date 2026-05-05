@@ -5,6 +5,8 @@
 // References to upstream PostgreSQL files use repository-relative paths.
 package protocol
 
+import "errors"
+
 // Protocol version constants (mirrors postgres/src/include/libpq/pqcomm.h).
 //
 // PostgreSQL encodes a protocol version as (major << 16) | minor, big-endian
@@ -32,12 +34,18 @@ const (
 // postgres/src/include/libpq/pqcomm.h:118 (MAX_STARTUP_PACKET_LENGTH).
 const MaxStartupPacketLength = 10000
 
-// MaxRegularMessageLength caps every post-startup message's payload. The
-// upstream codebase does not impose a single ceiling here; we pick 1 MiB as
-// a defensive limit to keep a malicious client from forcing us to allocate
-// arbitrarily large buffers. The COPY path (milestone 6) will lift this for
-// data rows specifically.
-const MaxRegularMessageLength = 1 << 20
+// MaxRegularMessageLength caps every post-startup message's payload.
+// Upstream PostgreSQL imposes no hard per-message limit; here we set 16 MiB
+// as a practical upper bound that covers all standard workloads (including
+// HammerDB's TPC-H LINEITEM batches of ~1.75 MiB max) while still bounding
+// the per-connection allocation a malicious client could force.
+const MaxRegularMessageLength = 16 << 20 // 16 MiB
+
+// ErrFrameTooLarge is returned by ReadFrame when an incoming message exceeds
+// MaxRegularMessageLength. Unlike a connection-level EOF, the stream is still
+// synchronised after this error (the oversized payload has been drained), so
+// the caller may send a proper error response and continue the session.
+var ErrFrameTooLarge = errors.New("frame payload exceeds MaxRegularMessageLength")
 
 // Backend message type bytes. Mirrors PqMsg_* in
 // postgres/src/include/libpq/protocol.h.

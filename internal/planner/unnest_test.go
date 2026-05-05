@@ -277,6 +277,92 @@ where s_suppkey = (
 	}
 }
 
+// TestRecursiveUnnestInsideNonUnnestableIN verifies M0040-0004:
+// A correlated scalar subquery inside a non-unnestable IN expression's
+// inner plan should be unnested by walkSubqueryPlansInExpr even when the
+// outer IN itself cannot be pulled up (no equijoin between outer and
+// the IN's inner plan). Q20-like structure: the lineitem aggregate inside
+// the partsupp filter should become a HashJoin(b ⋈ Agg(c GROUP BY c_b_key)).
+func TestRecursiveUnnestInsideNonUnnestableIN(t *testing.T) {
+	// a(a_id int), b(b_id int, b_val numeric, b_key int), c(c_id int, c_b_key int, c_qty numeric)
+	cat := catalog.NewInMemory()
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "a"}, []catalog.Column{
+		{Name: "a_id", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "b"}, []catalog.Column{
+		{Name: "b_id", Type: catalog.Type{Name: "int4"}},
+		{Name: "b_val", Type: catalog.Type{Name: "numeric"}},
+		{Name: "b_key", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "c"}, []catalog.Column{
+		{Name: "c_id", Type: catalog.Type{Name: "int4"}},
+		{Name: "c_b_key", Type: catalog.Type{Name: "int4"}},
+		{Name: "c_qty", Type: catalog.Type{Name: "numeric"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Outer IN is non-correlated (no equijoin between a and b in b's WHERE).
+	// Inner scalar subquery IS correlated with b (c_b_key = b_key).
+	sql := `SELECT a_id FROM a WHERE a_id IN (
+		SELECT b_id FROM b
+		WHERE b_val > (SELECT SUM(c_qty) FROM c WHERE c_b_key = b_key)
+	)`
+	stmt := parseOne(t, sql)
+	plan, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	// Navigate to the InExpr in the top-level Filter predicate.
+	proj, ok := plan.(*Project)
+	if !ok {
+		t.Fatalf("root=%T, want *Project", plan)
+	}
+	f, ok := proj.Child.(*Filter)
+	if !ok {
+		t.Fatalf("Project.Child=%T, want *Filter", proj.Child)
+	}
+	in := findInExprInPred(f.Predicate)
+	if in == nil {
+		t.Fatal("no InExpr found in top-level Filter predicate")
+	}
+
+	// M0040-0004: InExpr.Plan should NOT have a SubqueryExpr —
+	// the scalar subquery was unnested to a HashJoin.
+	if findSubqueryInPlan(in.Plan) {
+		t.Error("InExpr.Plan still contains SubqueryExpr; walkSubqueryPlansInExpr did not recurse")
+	}
+	// The unnested plan should contain a HashJoin with Aggregate child.
+	if !hasJoinWithAggregateChild(in.Plan) {
+		t.Error("InExpr.Plan should have HashJoin(b, Agg(c)) after scalar subquery unnesting")
+	}
+}
+
+// findInExprInPred finds the first InExpr with a Plan != nil in an expression.
+func findInExprInPred(e Expr) *InExpr {
+	if e == nil {
+		return nil
+	}
+	if in, ok := e.(*InExpr); ok && in.Plan != nil {
+		return in
+	}
+	switch x := e.(type) {
+	case *BinaryOp:
+		if r := findInExprInPred(x.Left); r != nil {
+			return r
+		}
+		return findInExprInPred(x.Right)
+	case *UnaryOp:
+		return findInExprInPred(x.Operand)
+	}
+	return nil
+}
+
 func TestCannotUnnestExistsExpr(t *testing.T) {
 	q := `select s_name from supplier
 where exists (

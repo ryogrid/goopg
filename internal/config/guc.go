@@ -219,12 +219,43 @@ func NewVariable(spec Variable) *Variable {
 // either set it up before launching the listener (the common case) or
 // guard external access through a SessionRegistry.
 type Registry struct {
-	vars map[string]*Variable
+	vars     map[string]*Variable
+	onChange map[string]func(value string) // M0054-0006e-followup
 }
 
 // NewRegistry returns an empty registry. Most callers want
 // BuildDefaultRegistry instead.
-func NewRegistry() *Registry { return &Registry{vars: map[string]*Variable{}} }
+func NewRegistry() *Registry {
+	return &Registry{
+		vars:     map[string]*Variable{},
+		onChange: map[string]func(value string){},
+	}
+}
+
+// OnChange registers a process-global callback fired whenever a
+// session successfully `SET`s the named variable (case-insensitive).
+// The callback receives the canonicalised value AFTER the session
+// layer is updated. Use cases: bridging SQL-level toggles to
+// package-level atomic flags such as `planner.SetNLIEnabled`. Only
+// one callback per name is supported; a second registration replaces
+// the first. (M0054-0006e-followup.)
+func (r *Registry) OnChange(name string, fn func(value string)) {
+	if r.onChange == nil {
+		r.onChange = map[string]func(value string){}
+	}
+	r.onChange[strings.ToLower(name)] = fn
+}
+
+// invokeOnChange calls the registered callback (if any) for `name`.
+// Used by SessionRegistry.Set / Reset to bridge to package globals.
+func (r *Registry) invokeOnChange(name, value string) {
+	if r == nil || r.onChange == nil {
+		return
+	}
+	if fn, ok := r.onChange[strings.ToLower(name)]; ok {
+		fn(value)
+	}
+}
 
 // Register adds or replaces a variable. Returns an error if a variable
 // with the same name already exists with a different type — that is

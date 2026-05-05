@@ -35,6 +35,11 @@ type instrumentedOp struct {
 	stats *nodeStats
 }
 
+// underlying lets `setChildBorrow` (M0054-0005a-followup) reach
+// the wrapped operator so EXPLAIN ANALYZE wiring does not block
+// the borrow contract.
+func (o *instrumentedOp) underlying() Operator { return o.inner }
+
 // Schema delegates to the wrapped operator. EXPLAIN ANALYZE never
 // changes the executed plan's output schema — the wrap is a pure
 // counter sidecar.

@@ -31,6 +31,15 @@ type TransactionID uint32
 const (
 	// InvalidTransactionID is xid 0.
 	InvalidTransactionID TransactionID = 0
+
+	// FrozenTransactionID is the permanent-visibility XID (= 2). Any tuple
+	// whose xmin is rewritten to FrozenTransactionID by VACUUM FREEZE is
+	// visible to all past, present, and future snapshots — it is exempt from
+	// normal MVCC visibility rules. Mirrors PostgreSQL's FrozenTransactionId.
+	// Because FrozenTransactionID(2) < FirstNormalTransactionID(3) ≤ every
+	// snapshot's Xmin, the existing SeesCommittedXID check already returns
+	// true for frozen tuples without any code change to TupleVisible.
+	FrozenTransactionID TransactionID = 2
 )
 
 // HeapTupleHeader infomask flag bits. Values mirror upstream's
@@ -66,6 +75,18 @@ const (
 	// `(infomask & HeapXmaxLockMask) != 0` is the
 	// "this is a row-lock holding xmax" predicate.
 	HeapXmaxLockMask = HeapXmaxKeyShrLock | HeapXmaxExclLock
+
+	// HeapHotUpdated indicates this tuple was HOT-updated: xmax is
+	// stamped and a new version was written to the same heap page.
+	// The CTID field points to the successor version's slot. Callers
+	// following an index pointer must walk the chain (same page, follow
+	// CTID.Offset) until they find a tuple without this bit set.
+	// Mirrors PostgreSQL's HEAP_HOT_UPDATED (0x4000).
+	HeapHotUpdated uint16 = 0x4000
+	// HeapOnlyTuple indicates this tuple is a HOT-only version: it was
+	// inserted as the successor in a HOT update chain and has no direct
+	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000).
+	HeapOnlyTuple uint16 = 0x8000
 )
 
 // IsHeapTupleLockOnly reports whether `infomask` indicates the
@@ -330,6 +351,130 @@ func PageAddItemRaw(p Page, raw []byte) (uint16, error) {
 	return uint16(count + 1), nil
 }
 
+// PageInsertItemRawAt (M0055-0002 Phase A) inserts `raw` at the
+// 1-based slot, shifting any existing line pointers at [slot, count]
+// to [slot+1, count+1]. New tuple bytes are placed at the
+// pd_upper - len(raw) boundary. The 1-based slot number returned
+// equals the input `slot`. Returns `ErrNoSpaceInPage` when the
+// page lacks free space.
+//
+// This is the in-place upstream-aligned counterpart to the
+// O(n) decode+rewrite path used previously by btree.insertItemSorted.
+// Call sites that know the insertion offset (e.g. via binary search
+// on existing line pointers) can avoid re-encoding every item on
+// the page on each insert.
+func PageInsertItemRawAt(p Page, slot uint16, raw []byte) (uint16, error) {
+	h, err := Header(p)
+	if err != nil {
+		return 0, err
+	}
+	if len(raw) > 0x7FFF {
+		return 0, fmt.Errorf("item too large for line pointer len=%d", len(raw))
+	}
+	lower := int(h.Lower())
+	upper := int(h.Upper())
+	needed := itemIDSize + len(raw)
+	if upper-lower < needed {
+		return 0, ErrNoSpaceInPage
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	if int(slot) < 1 || int(slot) > count+1 {
+		return 0, fmt.Errorf("PageInsertItemRawAt: slot %d out of range [1,%d]", slot, count+1)
+	}
+	// Append the new tuple bytes at upper-len(raw); existing tuple
+	// data on the page does NOT need to move (each line pointer
+	// references its tuple by absolute offset, so existing items
+	// remain addressable).
+	newUpper := upper - len(raw)
+	copy(p[newUpper:upper], raw)
+	// Shift the line-pointer array's [slot-1 .. count) entries right
+	// by one slot (line pointers are 0-based in the array but
+	// 1-based externally).
+	idx := int(slot) - 1
+	if idx < count {
+		// Read line pointers from idx..count-1 and write them at idx+1..count.
+		// Each ItemID is itemIDSize bytes; use a memmove by copying the
+		// bytes via the line-pointer accessors.
+		for j := count; j > idx; j-- {
+			id, err := readItemID(p, j-1)
+			if err != nil {
+				return 0, err
+			}
+			if err := writeItemID(p, j, id); err != nil {
+				return 0, err
+			}
+		}
+	}
+	// Write the new line pointer at idx.
+	newID := ItemID{Offset: uint16(newUpper), Flags: ItemIDNormal, Length: uint16(len(raw))}
+	if err := writeItemID(p, idx, newID); err != nil {
+		return 0, err
+	}
+	h.SetLower(uint16(lower + itemIDSize))
+	h.SetUpper(uint16(newUpper))
+	return slot, nil
+}
+
+// PageReplaceItemRaw (M0055-0003) replaces the line pointer's
+// payload at the 1-based slot with `raw`. When the new bytes fit
+// in the existing line pointer's slot, it overwrites in place.
+// When `raw` is larger AND the page has free space, it allocates
+// a fresh tuple-region location at pd_upper-len and updates the
+// line pointer to reference the new location (the old bytes
+// become garbage, reclaimed by the next vacuum / repack). Returns
+// `ErrNoSpaceInPage` when neither the existing slot nor a fresh
+// allocation fits.
+//
+// Used by the steady-state-insert dedup path: when an inserted key
+// matches an existing posting-list line pointer, the new payload
+// (existing TIDs + new TID) is written via this helper so the
+// page line-pointer count stays the same.
+func PageReplaceItemRaw(p Page, slot uint16, raw []byte) error {
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	if int(slot) < 1 || int(slot) > count {
+		return fmt.Errorf("PageReplaceItemRaw: slot %d out of range [1,%d]", slot, count)
+	}
+	id, err := readItemID(p, int(slot)-1)
+	if err != nil {
+		return err
+	}
+	if len(raw) > 0x7FFF {
+		return fmt.Errorf("item too large for line pointer len=%d", len(raw))
+	}
+	if int(id.Length) >= len(raw) {
+		// Fits in the existing slot — overwrite in place. Update
+		// the line pointer's length to the (possibly shorter) new
+		// payload; the trailing bytes become garbage.
+		copy(p[id.Offset:int(id.Offset)+len(raw)], raw)
+		newID := ItemID{Offset: id.Offset, Flags: id.Flags, Length: uint16(len(raw))}
+		return writeItemID(p, int(slot)-1, newID)
+	}
+	// Need to grow — allocate fresh space at pd_upper-len.
+	h, err := Header(p)
+	if err != nil {
+		return err
+	}
+	lower := int(h.Lower())
+	upper := int(h.Upper())
+	if upper-lower < len(raw) {
+		return ErrNoSpaceInPage
+	}
+	newUpper := upper - len(raw)
+	copy(p[newUpper:upper], raw)
+	newID := ItemID{Offset: uint16(newUpper), Flags: id.Flags, Length: uint16(len(raw))}
+	if err := writeItemID(p, int(slot)-1, newID); err != nil {
+		return err
+	}
+	h.SetUpper(uint16(newUpper))
+	return nil
+}
+
 // HeapPageVacuumStats reports the outcome of a single-page vacuum.
 type HeapPageVacuumStats struct {
 	Dead int // line pointers transitioned LP_NORMAL -> LP_UNUSED
@@ -531,6 +676,11 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// Advance pd_prune_xid so opportunistic pruning knows when
+	// this page first became prunable (M0046-0002).
+	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(xmax))
+	}
 	return nil
 }
 
@@ -597,6 +747,97 @@ func PageSetHeapTupleLockOnly(p Page, slot uint16, xmax TransactionID, lockStren
 	infomask |= lockStrength & HeapXmaxLockMask
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
+}
+
+// PageStampHotOldTuple stamps a HOT-update on the old-image tuple at
+// oldSlot: writes xmax, sets HeapHotUpdated in infomask, and updates the
+// CTID to (blk, newSlot) so index-scan callers can walk the HOT chain
+// to the live successor version. Mirrors the actions upstream performs
+// inside heap_update when it detects no indexed column changed.
+//
+// The caller must hold the page's exclusive content lock across the
+// entire HOT-update sequence (new tuple insert + this stamp) so the
+// chain is never torn between two page modifications.
+func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockNumber, newSlot uint16) error {
+	if oldSlot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(oldSlot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, oldSlot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, oldSlot, off)
+	}
+	// Set xmax.
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	// Set CTID to (blk, newSlot) — same-page chain link.
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
+	// Update infomask: clear lock-only bits (a delete supersedes any
+	// lingering row-lock), then set HeapHotUpdated.
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	infomask |= HeapHotUpdated
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead
+	// once xmax is committed and xmax < OldestXmin.
+	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(xmax))
+	}
+	return nil
+}
+
+// PageGetItemID returns the raw ItemID for a 1-based line pointer slot.
+// Used by opportunistic pruning and HOT chain following to inspect line
+// pointer flags without attempting to decode a full heap tuple.
+func PageGetItemID(p Page, slot uint16) (ItemID, error) {
+	if slot == 0 {
+		return ItemID{}, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return ItemID{}, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ItemID{}, ErrInvalidSlot
+	}
+	return readItemID(p, idx)
+}
+
+// PageSetItemIDRedirect converts the line pointer at 1-based slot into an
+// ItemIDRedirect pointing to targetSlot. Used by opportunistic pruning when a
+// dead HOT-chain root is freed: the line pointer is kept (so the index entry
+// remains valid) but redirected to the live chain tip.
+//
+// The Offset field of the resulting ItemID carries the 1-based target slot;
+// Length is set to zero (the tuple data will be freed by the compaction pass).
+func PageSetItemIDRedirect(p Page, slot uint16, targetSlot uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	return writeItemID(p, idx, ItemID{Offset: targetSlot, Flags: ItemIDRedirect, Length: 0})
 }
 
 // PageGetItemRaw returns the raw item bytes at the 1-based slot. The

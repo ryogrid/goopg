@@ -95,6 +95,11 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 		_, eff, _ := s.Get(name)
 		s.onReportableChange(v.Name, eff)
 	}
+	// M0054-0006e-followup: process-global change callback. Fires
+	// AFTER the session/local layer is updated so callbacks see the
+	// post-Set effective value via .Get().
+	_, eff, _ := s.Get(name)
+	s.global.invokeOnChange(v.Name, eff)
 	return nil
 }
 
@@ -111,6 +116,9 @@ func (s *SessionRegistry) Reset(name string) error {
 	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
 		s.onReportableChange(v.Name, v.Value)
 	}
+	// M0054-0006e-followup: invoke the process-global change
+	// callback for the post-Reset value (which is the global default).
+	s.global.invokeOnChange(v.Name, v.Value)
 	return nil
 }
 

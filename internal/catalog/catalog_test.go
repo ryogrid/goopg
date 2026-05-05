@@ -199,3 +199,55 @@ func TestPgIndexesView(t *testing.T) {
 		t.Errorf("indexname=%q want %q", got, want)
 	}
 }
+
+// TestSystemCatalogOIDConstants verifies the fixed OIDs match upstream's
+// values so ODBC/JDBC metadata probes that look up by numeric OID see the
+// expected numbers.
+func TestSystemCatalogOIDConstants(t *testing.T) {
+	cases := []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"TypeRelationId (pg_type)", TypeRelationId, 1247},
+		{"AttributeRelationId (pg_attribute)", AttributeRelationId, 1249},
+		{"RelationRelationId (pg_class)", RelationRelationId, 1259},
+		{"FirstUserOID", FirstUserOID, 16384},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestIsSystemRelation checks the OID range boundary.
+func TestIsSystemRelation(t *testing.T) {
+	cases := []struct {
+		oid  uint32
+		want bool
+	}{
+		{TypeRelationId, true},
+		{AttributeRelationId, true},
+		{RelationRelationId, true},
+		{FirstUserOID - 1, true},
+		{FirstUserOID, false},
+		{FirstUserOID + 1, false},
+		{0xFFFFFFFF, false},
+	}
+	for _, tc := range cases {
+		if got := IsSystemRelation(tc.oid); got != tc.want {
+			t.Errorf("IsSystemRelation(%d) = %v, want %v", tc.oid, got, tc.want)
+		}
+	}
+}
+
+// TestSystemRelationOIDsBelowFirstUserOID is a cross-check: all three
+// fixed catalog OIDs must be recognised as system relations.
+func TestSystemRelationOIDsBelowFirstUserOID(t *testing.T) {
+	for _, oid := range []uint32{TypeRelationId, AttributeRelationId, RelationRelationId} {
+		if !IsSystemRelation(oid) {
+			t.Errorf("OID %d should be a system relation (< FirstUserOID %d)", oid, FirstUserOID)
+		}
+	}
+}

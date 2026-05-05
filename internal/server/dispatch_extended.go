@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 
@@ -24,10 +25,19 @@ import (
 // are rejected at Bind time); we feed them through to
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
-func (s *Server) executeExtendedQueryViaExecutor(sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
-		return nil, &extendedQueryError{Code: sqlstate.SyntaxError, Message: err.Error()}
+		msg, extra := syntaxErrorMsg(err)
+		qerr := &extendedQueryError{Code: sqlstate.SyntaxError, Message: msg}
+		for _, f := range extra {
+			if f.Code == protocol.FieldPosition {
+				if p, _ := strconv.Atoi(f.Value); p > 0 {
+					qerr.Position = p
+				}
+			}
+		}
+		return nil, qerr
 	}
 	if len(stmts) == 0 {
 		return &extendedQueryResult{Empty: true}, nil
@@ -66,23 +76,24 @@ func (s *Server) executeExtendedQueryViaExecutor(sess *config.SessionRegistry, q
 		return nil, perr
 	}
 
-	ctx := executor.NewContext()
-	ctx.Pool = s.cfg.Pool
-	ctx.Catalog = s.cfg.Catalog
-	ctx.TxnMgr = s.cfg.TxnMgr
-	ctx.Tx = tx
-	ctx.Snap = snap
-	ctx.Params = datums
-	ctx.Checkpointer = s.cfg.Checkpointer
-	ctx.StatsTarget = sessionStatsTarget(sess)
-	ctx.WorkMem = sessionWorkMem(sess)
-	ctx.PubSub = s.cfg.PubSub
+	ectx := executor.NewContext()
+	ectx.Ctx = ctx
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.Params = datums
+	ectx.Checkpointer = s.cfg.Checkpointer
+	ectx.StatsTarget = sessionStatsTarget(sess)
+	ectx.WorkMem = sessionWorkMem(sess)
+	ectx.PubSub = s.cfg.PubSub
 
 	op, err := executor.Build(node)
 	if err != nil {
 		return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 	}
-	if err := op.Open(ctx); err != nil {
+	if err := op.Open(ectx); err != nil {
 		_ = op.Close()
 		return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 	}

@@ -27,6 +27,28 @@ func unnestSubqueriesInPlan(node Node) Node {
 				return newOuter
 			}
 		}
+		// M0040-0002: also try to unnest IN (subquery) expressions
+		for {
+			in := findInExprInExpr(n.Predicate)
+			if in == nil {
+				break
+			}
+			newOuter, err := unnestInExpr(in, node)
+			if err != nil || newOuter == nil {
+				break
+			}
+			node = newOuter
+			if f, ok := newOuter.(*Filter); ok {
+				n = f
+			} else {
+				return newOuter
+			}
+		}
+		// M0040-0004: walk remaining SubqueryExpr/InExpr inner plans
+		// even when those expressions cannot be pulled up to this level
+		// (e.g. Q20's lineitem scalar subquery inside the partsupp IN
+		// clause, where the outer IN itself has no equijoin correlation).
+		n.Predicate = walkSubqueryPlansInExpr(n.Predicate)
 	case *Join:
 		n.Left = unnestSubqueriesInPlan(n.Left)
 		n.Right = unnestSubqueriesInPlan(n.Right)
@@ -40,6 +62,45 @@ func unnestSubqueriesInPlan(node Node) Node {
 		n.Child = unnestSubqueriesInPlan(n.Child)
 	}
 	return node
+}
+
+// walkSubqueryPlansInExpr walks an expression tree and recursively
+// applies unnestSubqueriesInPlan to the inner plan of every
+// SubqueryExpr and InExpr node found. It is called after the
+// pull-up loops in unnestSubqueriesInPlan so that subqueries that
+// cannot be lifted to the current join level still have their own
+// inner plan trees optimised.
+func walkSubqueryPlansInExpr(e Expr) Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *SubqueryExpr:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *InExpr:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *BinaryOp:
+		x.Left = walkSubqueryPlansInExpr(x.Left)
+		x.Right = walkSubqueryPlansInExpr(x.Right)
+	case *UnaryOp:
+		x.Operand = walkSubqueryPlansInExpr(x.Operand)
+	case *FuncCall:
+		for i := range x.Args {
+			x.Args[i] = walkSubqueryPlansInExpr(x.Args[i])
+		}
+	case *CaseExpr:
+		if x.Operand != nil {
+			x.Operand = walkSubqueryPlansInExpr(x.Operand)
+		}
+		for i := range x.Whens {
+			x.Whens[i].When = walkSubqueryPlansInExpr(x.Whens[i].When)
+			x.Whens[i].Then = walkSubqueryPlansInExpr(x.Whens[i].Then)
+		}
+		x.Else = walkSubqueryPlansInExpr(x.Else)
+	case *ExtractExpr:
+		x.Source = walkSubqueryPlansInExpr(x.Source)
+	}
+	return e
 }
 
 func findSubqueryInExpr(e Expr) *SubqueryExpr {
@@ -212,6 +273,12 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 	case *IndexScan:
 		if n.Key != nil {
 			walkExprTree(n.Key, visit)
+		}
+		if n.LowKey != nil {
+			walkExprTree(n.LowKey, visit)
+		}
+		if n.HighKey != nil {
+			walkExprTree(n.HighKey, visit)
 		}
 	case *WindowAgg:
 		walkPlanExprs(n.Child, visit)
@@ -406,6 +473,12 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		c := *n
 		if n.Key != nil {
 			c.Key = cloneExprReplacingOuter(n.Key, replace)
+		}
+		if n.LowKey != nil {
+			c.LowKey = cloneExprReplacingOuter(n.LowKey, replace)
+		}
+		if n.HighKey != nil {
+			c.HighKey = cloneExprReplacingOuter(n.HighKey, replace)
 		}
 		return &c, nil
 	case *MultiHashJoin:
@@ -717,17 +790,46 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	}
 	filter.Predicate = combineAnd(newConjuncts)
 
-	outerKeyExpr := &ColumnRef{
-		pos:   params[0].OuterRef.Pos(),
-		Index: params[0].OuterRef.Index,
-		Name:  params[0].OuterRef.Name,
-		Type:  params[0].OuterRef.Type,
+	// M0054-0008: handle multi-parameter correlation. The inner
+	// Aggregate now groups by every correlation column (built by
+	// buildUnnestedSubquery), and the outer join needs to bind
+	// every (outer-col, inner-col) pair. The first pair becomes
+	// the hash key (LeftKey/RightKey); additional pairs go into
+	// the join Predicate as AND-conjuncts so the hash-join's
+	// post-match evaluation filters out rows that match the first
+	// key but disagree on the remaining keys. Without this fix,
+	// a Q20-shape subquery with `l_partkey = ps_partkey AND
+	// l_suppkey = ps_suppkey` would match on l_partkey alone and
+	// produce wrong sums.
+	outerKeyExprs := make([]*ColumnRef, len(params))
+	innerKeyExprs := make([]*ColumnRef, len(params))
+	for i, p := range params {
+		outerKeyExprs[i] = &ColumnRef{
+			pos:   p.OuterRef.Pos(),
+			Index: p.OuterRef.Index,
+			Name:  p.OuterRef.Name,
+			Type:  p.OuterRef.Type,
+		}
+		innerKeyExprs[i] = &ColumnRef{
+			pos:   p.SubCol.Pos(),
+			Index: outerWidth + i, // i-th group-by column in subSchema
+			Name:  p.SubCol.Name,
+			Type:  p.SubCol.Type,
+		}
 	}
-	innerKeyExpr := &ColumnRef{
-		pos:   params[0].SubCol.Pos(),
-		Index: outerWidth,
-		Name:  params[0].SubCol.Name,
-		Type:  params[0].SubCol.Type,
+	// Build the join Predicate as AND of all per-pair equalities.
+	var joinPredicate Expr = &BinaryOp{
+		pos: sub.Pos(), Op: "=",
+		Left:  outerKeyExprs[0],
+		Right: innerKeyExprs[0],
+	}
+	for i := 1; i < len(params); i++ {
+		eq := &BinaryOp{
+			pos: sub.Pos(), Op: "=",
+			Left:  outerKeyExprs[i],
+			Right: innerKeyExprs[i],
+		}
+		joinPredicate = &BinaryOp{pos: sub.Pos(), Op: "AND", Left: joinPredicate, Right: eq}
 	}
 	mergedSchema := make(Schema, outerWidth+len(subSchema))
 	copy(mergedSchema, outerChild.Output())
@@ -740,11 +842,260 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 		Algo:      JoinAlgoHash,
 		Left:      outerChild,
 		Right:     subPlan,
-		Predicate: &BinaryOp{pos: sub.Pos(), Op: "=", Left: outerKeyExpr, Right: innerKeyExpr},
-		LeftKey:   outerKeyExpr,
-		RightKey:  &ColumnRef{pos: sub.Pos(), Index: 0, Name: params[0].SubCol.Name, Type: params[0].SubCol.Type},
+		Predicate: joinPredicate,
+		// Hash key uses the FIRST param's pair. The remaining
+		// per-pair equalities are enforced as residuals via the
+		// Predicate above.
+		LeftKey:  outerKeyExprs[0],
+		RightKey: &ColumnRef{pos: sub.Pos(), Index: 0, Name: params[0].SubCol.Name, Type: params[0].SubCol.Type},
+		schema:   mergedSchema,
+	}
+	filter.Child = join
+	return outer, nil
+}
+
+// --- M0040-0002: IN (subquery) → semi-join unnest ---
+
+// findInExprInExpr walks an expression tree looking for an
+// InExpr node whose source is a subquery (Plan != nil).
+func findInExprInExpr(e Expr) *InExpr {
+	if e == nil {
+		return nil
+	}
+	if in, ok := e.(*InExpr); ok && in.Plan != nil {
+		return in
+	}
+	switch x := e.(type) {
+	case *BinaryOp:
+		if s := findInExprInExpr(x.Left); s != nil {
+			return s
+		}
+		return findInExprInExpr(x.Right)
+	case *UnaryOp:
+		return findInExprInExpr(x.Operand)
+	case *FuncCall:
+		for _, a := range x.Args {
+			if s := findInExprInExpr(a); s != nil {
+				return s
+			}
+		}
+	case *CaseExpr:
+		if x.Operand != nil {
+			if s := findInExprInExpr(x.Operand); s != nil {
+				return s
+			}
+		}
+		for _, w := range x.Whens {
+			if s := findInExprInExpr(w.When); s != nil {
+				return s
+			}
+			if s := findInExprInExpr(w.Then); s != nil {
+				return s
+			}
+		}
+		if x.Else != nil {
+			return findInExprInExpr(x.Else)
+		}
+	case *ExtractExpr:
+		return findInExprInExpr(x.Source)
+	}
+	return nil
+}
+
+// canUnnestInExpr checks whether an IN (subquery) is a candidate
+// for unnesting into a semi-join.  The inner plan must be a
+// simple SELECT col FROM table WHERE col = outer_ref (no
+// aggregate, no GROUP BY).  All OuterColumnRef nodes must
+// participate in equijoin pairs.
+func canUnnestInExpr(in *InExpr) bool {
+	plan := in.Plan
+	if plan == nil {
+		return false
+	}
+	// Collect equijoin pairs — all OuterColumnRefs must be in
+	// equality joins with inner ColumnRefs.
+	params := collectUnnestParams(plan)
+	if params == nil || len(params) == 0 {
+		return false
+	}
+	// Reject nested IN subqueries inside the IN-subquery — those
+	// need their own unnest pass first.
+	var hasNestedIn bool
+	walkPlanExprs(plan, func(e Expr) {
+		if in2, ok := e.(*InExpr); ok && in2.Plan != nil {
+			hasNestedIn = true
+		}
+	})
+	if hasNestedIn {
+		return false
+	}
+	return true
+}
+
+// unnestInExpr rewrites an IN (subquery) as a semi-join.
+//
+//	Filter(column IN (SELECT inner_col FROM ... WHERE inner_col = outer.col), outer)
+//	→  JoinTypeSemi(outer, inner_plan_clone)
+//
+// The inner plan is cloned with OuterColumnRef → ColumnRef
+// replacement so it no longer depends on the outer scope.
+func unnestInExpr(in *InExpr, outer Node) (Node, error) {
+	if !canUnnestInExpr(in) {
+		return nil, nil
+	}
+	params := collectUnnestParams(in.Plan)
+	if len(params) == 0 {
+		return nil, nil
+	}
+	// Replace OuterColumnRefs in the inner plan with their
+	// corresponding ColumnRefs so the inner plan is self-contained.
+	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
+	for _, p := range params {
+		replace[p.OuterRef] = p.SubCol
+	}
+	innerPlan, err := clonePlanReplacingOuter(in.Plan, replace)
+	if err != nil {
+		return nil, err
+	}
+	// Recursively unnest any scalar subqueries still inside the
+	// inner plan (e.g. Q20's lineitem aggregate inside the
+	// partsupp IN subquery).
+	innerPlan = unnestSubqueriesInPlan(innerPlan)
+
+	// Find the Filter that wraps the outer node.
+	filter, conjunct := findFilterContainingInExpr(outer, in)
+	if filter == nil {
+		return nil, nil
+	}
+
+	outerChild := filter.Child
+	outerWidth := len(outerChild.Output())
+	innerWidth := len(innerPlan.Output())
+
+	// Build semi-join keys.
+	outerKey := &ColumnRef{
+		pos:   params[0].OuterRef.Pos(),
+		Index: params[0].OuterRef.Index,
+		Name:  params[0].OuterRef.Name,
+		Type:  params[0].OuterRef.Type,
+	}
+	innerKey := &ColumnRef{
+		pos:   params[0].SubCol.Pos(),
+		Index: outerWidth,
+		Name:  params[0].SubCol.Name,
+		Type:  params[0].SubCol.Type,
+	}
+
+	// Build a semi-join predicate that replaces the IN expression
+	// in the filter.  `column = inner_col` (single param).
+	semiPred := &BinaryOp{pos: in.Pos(), Op: "=", Left: outerKey, Right: innerKey}
+
+	// Remove the IN conjunct from the filter and add the
+	// semi-join predicate.
+	conjuncts := splitAnd(filter.Predicate)
+	newConjuncts := make([]Expr, 0, len(conjuncts))
+	found := false
+	for _, c := range conjuncts {
+		if c == conjunct {
+			if !found {
+				newConjuncts = append(newConjuncts, semiPred)
+				found = true
+			}
+			// skip the original IN conjunct
+		} else {
+			newConjuncts = append(newConjuncts, c)
+		}
+	}
+	if !found {
+		newConjuncts = append(newConjuncts, semiPred)
+	}
+	filter.Predicate = combineAnd(newConjuncts)
+
+	mergedSchema := make(Schema, outerWidth+innerWidth)
+	copy(mergedSchema, outerChild.Output())
+	copy(mergedSchema[outerWidth:], innerPlan.Output())
+
+	// Use inner join with dedup on the right side (semi-join)
+	// — JoinTypeSemi builds a deduplicated set of the right
+	// child and probes from the left.
+	join := &Join{
+		pos:       in.Pos(),
+		Type:      JoinTypeInner,
+		Algo:      JoinAlgoHash,
+		Left:      outerChild,
+		Right:     innerPlan,
+		Predicate: semiPred,
+		LeftKey:   outerKey,
+		RightKey:  innerKey,
 		schema:    mergedSchema,
 	}
 	filter.Child = join
 	return outer, nil
+}
+
+// findFilterContainingInExpr walks the plan tree looking for the
+// Filter node that wraps inner containing the given conjunct
+// expression (the IN expression).
+func findFilterContainingInExpr(node Node, target *InExpr) (*Filter, Expr) {
+	if node == nil {
+		return nil, nil
+	}
+	if f, ok := node.(*Filter); ok {
+		if c := findExprInExpr(f.Predicate, func(e Expr) bool {
+			return e == target
+		}); c != nil {
+			return f, c
+		}
+	}
+	switch n := node.(type) {
+	case *Join:
+		if f, c := findFilterContainingInExpr(n.Left, target); f != nil {
+			return f, c
+		}
+		return findFilterContainingInExpr(n.Right, target)
+	case *Filter:
+		return findFilterContainingInExpr(n.Child, target)
+	case *Project:
+		return findFilterContainingInExpr(n.Child, target)
+	case *Aggregate:
+		return findFilterContainingInExpr(n.Child, target)
+	case *Sort:
+		return findFilterContainingInExpr(n.Child, target)
+	case *Limit:
+		return findFilterContainingInExpr(n.Child, target)
+	case *MultiHashJoin:
+		for _, tbl := range n.Tables {
+			if f, c := findFilterContainingInExpr(tbl, target); f != nil {
+				return f, c
+			}
+		}
+	}
+	return nil, nil
+}
+
+// findExprInExpr returns the first non-nil expression in the
+// tree for which match returns true.  Returns nil if no match.
+func findExprInExpr(e Expr, match func(Expr) bool) Expr {
+	if e == nil {
+		return nil
+	}
+	if match(e) {
+		return e
+	}
+	switch x := e.(type) {
+	case *BinaryOp:
+		if r := findExprInExpr(x.Left, match); r != nil {
+			return r
+		}
+		return findExprInExpr(x.Right, match)
+	case *UnaryOp:
+		return findExprInExpr(x.Operand, match)
+	case *FuncCall:
+		for _, a := range x.Args {
+			if r := findExprInExpr(a, match); r != nil {
+				return r
+			}
+		}
+	}
+	return nil
 }

@@ -48,6 +48,60 @@ func pushPredicatesIntoCrossJoins(node Node) Node {
 	return f
 }
 
+// allColumnRefNamesInScope reports whether every named ColumnRef in
+// c references a column that appears in the output schema of at
+// least one SeqScan/IndexScan in j's subtree. Used to guard
+// pushOneConjunct against width-based mis-classification when a
+// conjunct's ColumnRef indices coincidentally fall in this Join's
+// width range but actually point at tables outside the subtree.
+func allColumnRefNamesInScope(c Expr, j *Join) bool {
+	names := map[string]bool{}
+	var collect func(Node)
+	collect = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *SeqScan:
+			for _, col := range x.Output() {
+				names[col.Name] = true
+			}
+		case *IndexScan:
+			for _, col := range x.Output() {
+				names[col.Name] = true
+			}
+		case *MultiHashJoin:
+			for _, t := range x.Tables {
+				collect(t)
+			}
+		case *Join:
+			collect(x.Left)
+			collect(x.Right)
+		case *Filter:
+			collect(x.Child)
+		case *Project:
+			for _, c := range x.Output() {
+				names[c.Name] = true
+			}
+		case *Sort:
+			collect(x.Child)
+		case *Aggregate:
+			for _, c := range x.Output() {
+				names[c.Name] = true
+			}
+		}
+	}
+	collect(j.Left)
+	collect(j.Right)
+	allIn := true
+	visitColumnRefsByName(c, func(name string) {
+		if !names[name] {
+			allIn = false
+		}
+	})
+	return allIn
+}
+
 // pushOneConjunct attempts to push a single conjunct down the join
 // tree. Returns true when the conjunct landed on a Join — the
 // caller drops it from the residual filter list.
@@ -69,6 +123,18 @@ func pushOneConjunct(node Node, c Expr) bool {
 	if side != sideMixed {
 		return false
 	}
+	// Width-based classification can produce a sideMixed verdict for
+	// a conjunct whose ColumnRefs (in their original FROM-order
+	// indices) happen to fall in this Join's [0, totalWidth) range
+	// but actually reference tables outside this Join's subtree
+	// (e.g. TPC-H Q9's `ps_partkey = l_partkey` mis-classified onto
+	// a 4-table Inner Join that doesn't include partsupp because
+	// partsupp's global FROM offset coincidentally lies in the
+	// 4-table subset's width range). Validate by NAME against the
+	// scans in this Join's subtree before committing to push.
+	if !allColumnRefNamesInScope(c, j) {
+		return false
+	}
 	if j.Type == JoinTypeCross {
 		// Predicate spans both sides — promote the Join.
 		j.Type = JoinTypeInner
@@ -82,8 +148,18 @@ func pushOneConjunct(node Node, c Expr) bool {
 			if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
 				j.Algo = algo
 			}
-			if j.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
-				j.BuildLeft = true
+			if j.Algo == JoinAlgoHash {
+				if lRows > 0 && rRows > 0 && lRows < rRows {
+					j.BuildLeft = true
+				}
+				// M0054-0010: small-dimension override.
+				leftSmall := IsSmallDimensionSide(j.Left)
+				rightSmall := IsSmallDimensionSide(j.Right)
+				if leftSmall && !rightSmall {
+					j.BuildLeft = true
+				} else if rightSmall && !leftSmall {
+					j.BuildLeft = false
+				}
 			}
 		}
 		return true

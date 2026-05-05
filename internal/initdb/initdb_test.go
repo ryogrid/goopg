@@ -1,10 +1,14 @@
 package initdb
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // TestInitLaysOutDirectoryStructure pins the directory layout
@@ -92,6 +96,88 @@ func TestInitRejectsEmptyOption(t *testing.T) {
 	}
 }
 
+// TestInitCreatesSystemCatalogRelfiles verifies that goopg init creates
+// one heap relfile for each of the three core system catalogs under
+// base/<DefaultDBOid>/. Each file must be exactly BlockSize bytes (one
+// initialised empty page), confirming bootstrapSystemCatalogs ran.
+func TestInitCreatesSystemCatalogRelfiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	type entry struct {
+		name string
+		oid  uint32
+	}
+	sysRels := []entry{
+		{"pg_type", catalog.TypeRelationId},
+		{"pg_attribute", catalog.AttributeRelationId},
+		{"pg_class", catalog.RelationRelationId},
+	}
+	for _, rel := range sysRels {
+		path := filepath.Join(dir, "base",
+			fmt.Sprint(catalog.DefaultDBOid),
+			fmt.Sprint(rel.oid))
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("%s (OID %d): expected file %q not found: %v", rel.name, rel.oid, path, err)
+			continue
+		}
+		if st.IsDir() {
+			t.Errorf("%s: path is a directory", rel.name)
+			continue
+		}
+		if want := int64(storage.BlockSize); st.Size() != want {
+			t.Errorf("%s: size=%d want %d (one block)", rel.name, st.Size(), want)
+		}
+	}
+}
+
+// TestSystemCatalogRelfilesAreValidHeapPages checks that the relfiles
+// written by bootstrapSystemCatalogs contain a valid initialised page
+// (not raw zeros) — i.e. InitPage ran successfully.
+func TestSystemCatalogRelfilesAreValidHeapPages(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, oid := range []uint32{
+		catalog.TypeRelationId,
+		catalog.AttributeRelationId,
+		catalog.RelationRelationId,
+	} {
+		path := filepath.Join(dir, "base",
+			fmt.Sprint(catalog.DefaultDBOid),
+			fmt.Sprint(oid))
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("OID %d: read %q: %v", oid, path, err)
+		}
+		if len(raw) != storage.BlockSize {
+			t.Fatalf("OID %d: file size %d want %d", oid, len(raw), storage.BlockSize)
+		}
+		// A properly initialised page must NOT be all-zeros: InitPage
+		// writes a non-zero pd_pagesize_version field.
+		allZero := true
+		for _, b := range raw {
+			if b != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			t.Errorf("OID %d: page is all-zeros (InitPage did not run?)", oid)
+		}
+		// Verify storage.IsNew reports false — an initialised page
+		// has pd_upper set to BlockSize, not 0.
+		if storage.IsNew(storage.Page(raw)) {
+			t.Errorf("OID %d: page reports IsNew=true (header not written?)", oid)
+		}
+	}
+}
+
 // TestPGHBADefaultRules: the sample pg_hba.conf trusts loopback
 // and rejects everything else, matching auth.DefaultPolicy() so
 // goopg init's defaults align with goopg start's defaults.
@@ -110,4 +196,199 @@ func TestPGHBADefaultRules(t *testing.T) {
 			t.Errorf("pg_hba.conf missing %q", needle)
 		}
 	}
+}
+
+// TestBootstrappedPGTypeRowsReadable verifies that the pg_type relfile
+// written during initdb contains decodeable rows for the built-in types.
+func TestBootstrappedPGTypeRowsReadable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read block 0 of pg_type directly via the storage manager.
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, page); err != nil {
+		t.Fatalf("ReadBlock pg_type: %v", err)
+	}
+
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatalf("PageLinePointerCount: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("pg_type page has zero tuples")
+	}
+
+	// Decode each tuple and collect type names.
+	typesByOID := map[uint32]catalog.PGTypeRow{}
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		ht, err := storage.PageGetHeapTuple(page, slot)
+		if err != nil {
+			t.Fatalf("slot %d: %v", slot, err)
+		}
+		row, err := catalog.DecodePGTypeRow(ht.Data)
+		if err != nil {
+			t.Fatalf("slot %d decode: %v", slot, err)
+		}
+		typesByOID[row.OID] = row
+	}
+
+	// Verify expected types are present.
+	required := map[uint32]string{
+		catalog.OIDBool:      "bool",
+		catalog.OIDInt4:      "int4",
+		catalog.OIDInt8:      "int8",
+		catalog.OIDText:      "text",
+		catalog.OIDVarChar:   "varchar",
+		catalog.OIDTimestamp: "timestamp",
+		catalog.OIDNumeric:   "numeric",
+	}
+	for oid, wantName := range required {
+		row, ok := typesByOID[oid]
+		if !ok {
+			t.Errorf("pg_type: OID %d (%s) not found", oid, wantName)
+			continue
+		}
+		if row.TypName != wantName {
+			t.Errorf("OID %d: typname=%q want %q", oid, row.TypName, wantName)
+		}
+		if row.TypNamespace != catalog.PGCatalogNamespaceOID {
+			t.Errorf("OID %d: typnamespace=%d want %d", oid, row.TypNamespace, catalog.PGCatalogNamespaceOID)
+		}
+	}
+}
+
+// TestBootstrappedPGClassRowsReadable verifies that pg_class contains the
+// three self-referential system catalog entries.
+func TestBootstrappedPGClassRowsReadable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, page); err != nil {
+		t.Fatalf("ReadBlock pg_class: %v", err)
+	}
+
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatalf("PageLinePointerCount: %v", err)
+	}
+
+	classByOID := map[uint32]catalog.PGClassRow{}
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		ht, err := storage.PageGetHeapTuple(page, slot)
+		if err != nil {
+			t.Fatalf("slot %d: %v", slot, err)
+		}
+		row, err := catalog.DecodePGClassRow(ht.Data)
+		if err != nil {
+			t.Fatalf("slot %d decode: %v", slot, err)
+		}
+		classByOID[row.OID] = row
+	}
+
+	required := map[uint32]string{
+		catalog.TypeRelationId:      "pg_type",
+		catalog.AttributeRelationId: "pg_attribute",
+		catalog.RelationRelationId:  "pg_class",
+	}
+	for oid, wantName := range required {
+		row, ok := classByOID[oid]
+		if !ok {
+			t.Errorf("pg_class: OID %d (%s) not found", oid, wantName)
+			continue
+		}
+		if row.RelName != wantName {
+			t.Errorf("OID %d: relname=%q want %q", oid, row.RelName, wantName)
+		}
+		if row.RelFileNode != oid {
+			t.Errorf("OID %d: relfilenode=%d want %d", oid, row.RelFileNode, oid)
+		}
+	}
+}
+
+// TestBootstrappedPGAttributeRowsReadable verifies that pg_attribute
+// contains column definitions for all three system catalogs.
+func TestBootstrappedPGAttributeRowsReadable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, page); err != nil {
+		t.Fatalf("ReadBlock pg_attribute: %v", err)
+	}
+
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatalf("PageLinePointerCount: %v", err)
+	}
+
+	// Gather attnames per relation.
+	byRelID := map[uint32][]string{}
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		ht, err := storage.PageGetHeapTuple(page, slot)
+		if err != nil {
+			t.Fatalf("slot %d: %v", slot, err)
+		}
+		row, err := catalog.DecodePGAttributeRow(ht.Data)
+		if err != nil {
+			t.Fatalf("slot %d decode: %v", slot, err)
+		}
+		byRelID[row.AttRelID] = append(byRelID[row.AttRelID], row.AttName)
+	}
+
+	// pg_class should have 8 columns, pg_attribute 6, pg_type 7.
+	for relOID, wantCount := range map[uint32]int{
+		catalog.RelationRelationId:  8,
+		catalog.AttributeRelationId: 6,
+		catalog.TypeRelationId:      7,
+	} {
+		cols := byRelID[relOID]
+		if len(cols) != wantCount {
+			t.Errorf("pg_attribute: relOID %d has %d cols, want %d (cols: %v)",
+				relOID, len(cols), wantCount, cols)
+		}
+	}
+
+	// Spot-check: pg_class must have an "oid" and "relname" entry.
+	pgClassCols := byRelID[catalog.RelationRelationId]
+	found := map[string]bool{}
+	for _, c := range pgClassCols {
+		found[c] = true
+	}
+	for _, must := range []string{"oid", "relname", "relkind"} {
+		if !found[must] {
+			t.Errorf("pg_attribute: pg_class missing column %q", must)
+		}
+	}
+	_ = fmt.Sprintf // suppress unused import
 }

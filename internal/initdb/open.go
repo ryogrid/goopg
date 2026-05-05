@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/aio"
@@ -33,6 +35,12 @@ type Runtime struct {
 	Pool         *storage.Pool
 	TxnMgr       *mvcc.Manager
 	Catalog      catalog.Catalog
+	// FSM is the in-memory free-space map (M0046-0003). VACUUM updates
+	// it; INSERT consults it before extending the relation.
+	FSM          *storage.FSM
+	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
+	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
+	VM           *storage.VisibilityMap
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
@@ -54,6 +62,15 @@ type Runtime struct {
 	// `WalReceiver` instead of accepting client writes directly.
 	// See docs/design/0005-0001-streaming-replication-architecture.md.
 	Standby bool
+
+	// walwriterStop, when non-nil, is closed by Close() to signal the
+	// background WAL writer loop to exit. nil when the loop wasn't
+	// started (WalWriterDelay == 0 in tests).
+	walwriterStop chan struct{}
+
+	// bgwriter is the background page-writer goroutine (M0048-0003).
+	// nil when BgwriterDelay == 0 or BgwriterMaxPages == 0.
+	bgwriter *storage.Bgwriter
 }
 
 // OpenOptions controls Open.
@@ -71,29 +88,12 @@ type OpenOptions struct {
 	// small value.
 	PoolSlots int
 
-	// AlignedIO forwards through to storage.ManagerConfig.AlignedIO.
-	// Production deployments want O_DIRECT|O_DSYNC; tests typically
-	// leave this false.
-	AlignedIO bool
-
 	// WALInitZero, when true, forwards to wal.Config.Preallocate
 	// so new WAL segments are zero-filled to SegmentSize at
 	// creation time. Mirrors upstream's `wal_init_zero` GUC.
 	// cmd/goopg start sets this from the GUC; tests typically
 	// leave it false.
 	WALInitZero bool
-
-	// WALDirectIO, when true, forwards to wal.Config.DirectIO
-	// so WAL writes go through the O_DIRECT path on Linux
-	// filesystems that honour it (ext4, XFS). Mirrors
-	// upstream's `wal_direct_io` GUC. cmd/goopg start sets
-	// this from the GUC; on filesystems where O_DIRECT is
-	// unsupported (tmpfs, overlayfs) the writer transparently
-	// falls back to buffered writes — Runtime.WAL exposes the
-	// fallback reason via DirectIOFallbackReason() so the
-	// startup logger can surface it. See
-	// docs/design/0010-0001-wal-direct-io-write-path.md.
-	WALDirectIO bool
 
 	// WALSenderMemoryBuffer sizes the in-memory WAL byte ring
 	// the walsender RecordIterator consults before falling
@@ -118,6 +118,32 @@ type OpenOptions struct {
 	AIOMethod         string
 	AIOWorkers        int
 	AIOMaxConcurrency int
+
+	// WALSegmentSize overrides the WAL segment file size. 0 uses the
+	// default (wal.DefaultSegmentSize = 16 MiB). Tests pass a smaller
+	// value (e.g. 1 MiB) to exercise WAL retention with less data.
+	// Maps directly to wal.Config.SegmentSize.
+	WALSegmentSize int64
+
+	// WalWriterDelay controls the period of the background WAL writer
+	// loop (M0042-0003). The loop calls FlushUpTo(maxUint64) every
+	// WalWriterDelay to ensure buffered WAL bytes reach disk even when
+	// no commits or checkpoints are in flight. 0 disables the loop
+	// (used by tests that don't need background flushing). Default in
+	// production: 200ms (mirrors upstream's wal_writer_delay GUC).
+	WalWriterDelay time.Duration
+
+	// BgwriterDelay controls the period of the background page-writer
+	// goroutine (M0048-0003). The bgwriter proactively flushes dirty
+	// buffer-pool pages to reduce synchronous I/O on eviction.
+	// 0 disables the bgwriter. Default 200ms mirrors upstream's
+	// bgwriter_delay GUC.
+	BgwriterDelay time.Duration
+
+	// BgwriterMaxPages caps dirty pages written per bgwriter tick.
+	// 0 disables the bgwriter. Default 100 mirrors upstream's
+	// bgwriter_lru_maxpages GUC.
+	BgwriterMaxPages int
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -146,8 +172,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	mgr := storage.NewManager(storage.ManagerConfig{
-		DataDir:   abs,
-		AlignedIO: opts.AlignedIO,
+		DataDir: abs,
 	})
 
 	// Activity registry (M0022): must be created early so WAL writer,
@@ -191,8 +216,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	walCfg := wal.Config{
 		WALDir:             filepath.Join(abs, "pg_wal"),
+		SegmentSize:        opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
 		Preallocate:        opts.WALInitZero,
-		DirectIO:           opts.WALDirectIO,
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
 		WALBuffers:         opts.WALBuffers,
 		OnLoopStart: func() {
@@ -304,6 +329,39 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Opportunistic page-pruning change record (M0046-0002). Carries
+	// the freed slot list so replay can deterministically reclaim the
+	// same dead slots without re-running the isDead predicate.
+	logHeapPruneOpt := func(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) (storage.LSN, error) {
+		payload := wal.EncodeHeapPruneOpt(rel, blk, redirects, unused)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
+	// Atomic HOT-update change record (M0046-0001). Encodes the
+	// old-slot xmax stamp + new tuple bytes on the same page in one
+	// record so replay can reconstruct the HOT chain atomically.
+	logHeapHotUpdate := func(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot uint16, xmax storage.TransactionID, tupleBytes []byte) (storage.LSN, error) {
+		payload := wal.EncodeHeapHotUpdate(rel, blk, oldSlot, xmax, tupleBytes)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
+	// Relation-file creation WAL record (M0030-0002). Emitted by
+	// Pool.PinNew when it creates block 0 of a new relfile so crash
+	// recovery can recreate the file before replaying data pages.
+	logSmgrCreate := func(rel storage.RelFileNode) error {
+		payload := wal.EncodeSmgrCreate(rel)
+		_, _, err := walWriter.Append(payload)
+		return err
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
@@ -311,9 +369,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeSplit:  logBtreeSplit,
 		LogHeapInsert:  logHeapInsert,
 		LogBtreeInsert: logBtreeInsert,
-		LogHeapDelete:  logHeapDelete,
-		LogHeapVacuum:  logHeapVacuum,
-		LogHeapLock:    logHeapLock,
+		LogHeapDelete:    logHeapDelete,
+		LogHeapVacuum:    logHeapVacuum,
+		LogHeapLock:      logHeapLock,
+		LogHeapHotUpdate: logHeapHotUpdate,
+		LogHeapPruneOpt:  logHeapPruneOpt,
+		LogSmgrCreate:    logSmgrCreate,
 		FullPageWrites: true,
 	})
 	if err != nil {
@@ -325,6 +386,29 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	pool.OnPinWait = func() {
 		if reg, pid := activity.LookupGoroutine(); reg != nil {
 			reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+		}
+	}
+	// Wire FlushAll goroutine assertion (M0042-0004): Pool.FlushAll and
+	// Pool.FlushAllPaced must only be called from the checkpointer goroutine
+	// or from Pool.Close (unregistered goroutine). Client-backend goroutines
+	// must never drive full-buffer flushes — they only flush WAL at commit.
+	// The check uses the activity registry; if the calling goroutine is
+	// registered and its BackendType is neither "checkpointer" nor
+	// "autovacuum" nor "" (unregistered / Pool.Close), we panic with a
+	// clear message so the invariant violation surfaces immediately in dev.
+	pool.OnFlushAll = func() {
+		reg, pid := activity.LookupGoroutine()
+		if reg == nil {
+			return // unregistered goroutine — Pool.Close or tests, OK
+		}
+		bt := reg.GetBackendType(pid)
+		switch bt {
+		case "checkpointer", "autovacuum", "walwriter", "":
+			// expected callers
+		default:
+			panic("BUG(M0042-0004): Pool.FlushAll called from " + bt +
+				" goroutine — only checkpointer should flush all pages;" +
+				" client backends must not drive full-buffer I/O directly")
 		}
 	}
 	// With an AIO engine attached, opt the Pool into prefetching
@@ -352,6 +436,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// buffer. Errors propagate back through Commit / Rollback so
 	// a WAL-append failure stops the txn from finishing. See
 	// docs/design/0008-0001-logical-decoding-pipeline.md.
+	// Open the commit log (pg_xact). Created by bootstrapCLog during initdb;
+	// upgraded on old clusters by InitializeAsCommitted.
+	clogPath := filepath.Join(abs, "global", "pg_xact")
+	clog, err := mvcc.OpenCLog(clogPath)
+	if err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: open clog: %w", err)
+	}
 	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
 		var payload []byte
 		switch kind {
@@ -362,14 +456,93 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		default:
 			return fmt.Errorf("goopg: unknown xact marker %v", kind)
 		}
-		_, _, err := walWriter.Append(payload)
-		return err
+		_, endLSN, err := walWriter.Append(payload)
+		if err != nil {
+			return err
+		}
+		// Synchronous commit (M0042-0003): flush the commit WAL record to
+		// disk before returning to the client so the transaction is durable
+		// across a server crash. Mirrors upstream's synchronous_commit = on
+		// default. Aborts are not flushed (they're discarded on replay).
+		if kind == mvcc.XactCommit {
+			if werr := walWriter.FlushUpTo(endLSN); werr != nil {
+				return werr
+			}
+		}
+		// Persist commit/abort status in clog (M0030-0007). Non-fatal: the
+		// WAL XactCommit record is the primary durability mechanism.
+		switch kind {
+		case mvcc.XactCommit:
+			_ = clog.SetCommitted(xid)
+		case mvcc.XactAbort:
+			_ = clog.SetAborted(xid)
+		}
+		return nil
 	})
 	if err := loadCatalogSnapshot(abs, cat, txnMgr); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, err
+	}
+	// Upgrade path: if the clog is empty (old cluster started before M0030-0007
+	// landed), initialize all prior XIDs as committed so loadUserTablesFromHeap
+	// doesn't reject their rows.
+	if clog.IsEmpty() {
+		if uerr := clog.InitializeAsCommitted(txnMgr.NextXID()); uerr != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: clog upgrade: %w", uerr)
+		}
+	}
+	// One-shot migration: if this is a legacy JSON-only cluster whose
+	// pg_class has no user-table rows, write all in-memory user tables to
+	// the pg_class/pg_attribute heap relfiles so future startups use the
+	// heap path (M0030-0004). Runs after loadCatalogSnapshot so the
+	// catalog is already populated from JSON; runs before
+	// loadSystemCatalogsIfPresent so system-catalog registration follows.
+	if err := maybeMigrateCatalogToHeap(mgr, cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: catalog migration: %w", err)
+	}
+	// Register system catalog heap tables (pg_type, pg_attribute) if their
+	// relfiles exist.  Must run after loadCatalogSnapshot / Restore so the
+	// registration survives the catalog reset that Restore() performs.
+	// Safe to skip on old clusters without the M0030-0001 relfiles.
+	if err := loadSystemCatalogsIfPresent(abs, cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: system catalog load: %w", err)
+	}
+	// Supplement the catalog with user tables found in the pg_class/pg_attribute
+	// heap files (M0030-0003). If a table was created after the last JSON
+	// snapshot (e.g. crash before SaveCatalog), this path recovers it from the
+	// WAL-replayed heap pages. Idempotent: tables already loaded from JSON are
+	// skipped. Safe on old clusters — skips if pg_class relfile is absent.
+	// The clog is passed to filter rows whose xmin was never committed (M0030-0007).
+	if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
+	}
+
+	// M0054-0001: replay CREATE/DROP DATABASE WAL records into the
+	// catalog's database registry. Physical WAL replay (line ~212
+	// above) ignored these records because they don't touch on-disk
+	// storage in v0; the recovery driver applies them here, after the
+	// catalog is fully constructed, so the next connection sees an
+	// accurate `pg_database`. Order matters: a drop following a
+	// create cancels out, so we walk records in stream order.
+	if err := replayDatabaseDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
 	}
 
 	// Replication-slot registry. The retention path on the
@@ -582,7 +755,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: standby signal: %w", err)
 	}
 
-	return &Runtime{
+	rt := &Runtime{
 		StorageMgr:   mgr,
 		Pool:         pool,
 		TxnMgr:       txnMgr,
@@ -598,7 +771,41 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Activity:       act,
 		DataDir:        abs,
 		Standby:        standby,
-	}, nil
+		FSM:            storage.NewFSM(),
+		VM:             storage.NewVisibilityMap(),
+	}
+
+	// Background WAL writer loop (M0042-0003): timer-driven periodic flush
+	// so buffered WAL bytes reach disk even when no commits are in flight.
+	// Mirrors upstream's walwriter process cadence. Disabled (delay == 0)
+	// in tests that don't need background flushing.
+	if opts.WalWriterDelay > 0 && walWriter != nil {
+		stop := make(chan struct{})
+		rt.walwriterStop = stop
+		go func() {
+			ticker := time.NewTicker(opts.WalWriterDelay)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					// Drain and sync any buffered WAL. Fast no-op when
+					// nothing was written since the last flush.
+					_ = walWriter.FlushUpTo(^uint64(0))
+				case <-stop:
+					return
+				}
+			}
+		}()
+	}
+
+	// Background page-writer goroutine (M0048-0003): proactively flushes
+	// dirty buffer-pool pages so eviction rarely needs synchronous I/O.
+	if opts.BgwriterDelay > 0 && opts.BgwriterMaxPages > 0 {
+		rt.bgwriter = storage.NewBgwriter(pool, opts.BgwriterDelay, opts.BgwriterMaxPages)
+		rt.bgwriter.Start()
+	}
+
+	return rt, nil
 }
 
 // aioEngineAdapter bridges *aio.Engine to storage.AIOEngine.
@@ -768,6 +975,357 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *wal.Checkpointer) e
 	return cat.RegisterVirtualTable(tbl)
 }
 
+// loadSystemCatalogsIfPresent registers pg_type and pg_attribute as
+// real heap-backed catalog tables when their M0030-0001 relfiles are
+// present under <dataDir>/base/<DefaultDBOid>/.
+//
+// On fresh clusters (after goopg init with Phase 1+2 changes), the
+// relfiles exist and contain seeded rows.  On old clusters that were
+// initialized before M0030-0001, the files are absent and this
+// function is a no-op — backward compatible.
+//
+// The registration uses catalog.RegisterRealTable (non-virtual,
+// OID-pre-set), so a SeqScan on these tables reads directly from the
+// heap relfile.  The rows are visible to all sessions because they
+// were written with xmin=BootstrapTransactionID (1).
+func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
+	base := filepath.Join(dataDir, "base", fmt.Sprint(catalog.DefaultDBOid))
+
+	// pg_type (OID 1247) — built-in type catalog.
+	pgTypeFile := filepath.Join(base, fmt.Sprint(catalog.TypeRelationId))
+	if _, err := os.Stat(pgTypeFile); err == nil {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_type",
+			Columns: catalog.PGTypeColumns(),
+			OID:     catalog.TypeRelationId,
+		}
+		if err := cat.RegisterRealTable(t); err != nil {
+			return fmt.Errorf("register pg_type: %w", err)
+		}
+	}
+
+	// pg_attribute (OID 1249) — column definition catalog.
+	pgAttrFile := filepath.Join(base, fmt.Sprint(catalog.AttributeRelationId))
+	if _, err := os.Stat(pgAttrFile); err == nil {
+		t := &catalog.Table{
+			Schema:  "pg_catalog",
+			Name:    "pg_attribute",
+			Columns: catalog.PGAttributeColumns(),
+			OID:     catalog.AttributeRelationId,
+		}
+		if err := cat.RegisterRealTable(t); err != nil {
+			return fmt.Errorf("register pg_attribute: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// maybeMigrateCatalogToHeap implements the M0030-0004 one-shot migration
+// gate. It detects legacy JSON-only clusters (pg_class relfile present but
+// no user-table rows) and, when the in-memory catalog (loaded from JSON) has
+// user tables, writes them to pg_class/pg_attribute so future startups use
+// the heap path.
+//
+// Safe conditions:
+//   - No pg_class relfile: old cluster without M0030-0001 files → no-op.
+//   - pg_class has user rows (OID ≥ FirstUserOID): already migrated → no-op.
+//   - In-memory catalog has no user tables: nothing to migrate → no-op.
+//
+// Idempotent: if interrupted mid-way, the next startup sees some user rows
+// in pg_class and skips migration; the remaining tables are loaded from JSON
+// via TryRegisterUserTable's idempotency.
+func maybeMigrateCatalogToHeap(mgr *storage.Manager, cat *catalog.InMemory) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	nClassBlocks, err := mgr.NBlocks(classRel)
+	if err != nil || nClassBlocks == 0 {
+		return nil // no pg_class relfile — pre-M0030-0001 cluster
+	}
+
+	// Scan pg_class for any user-table row (fast early-exit).
+	page := make(storage.Page, storage.BlockSize)
+	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
+		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
+			return fmt.Errorf("maybeMigrate: scan pg_class blk %d: %w", blk, err)
+		}
+		count, _ := storage.PageLinePointerCount(page)
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID {
+				continue
+			}
+			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			row, err := catalog.DecodePGClassRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if row.OID >= catalog.FirstUserOID {
+				return nil // already has user rows — migration done
+			}
+		}
+	}
+
+	// pg_class has no user rows. Get user tables from the in-memory catalog.
+	userTables := cat.AllTables()
+	if len(userTables) == 0 {
+		return nil // nothing to migrate
+	}
+
+	// Build pg_class and pg_attribute tuples for all user tables.
+	xid := storage.TransactionID(bootstrapXID) // migration rows use bootstrap XID
+	var classTuples []storage.HeapTuple
+	var attrTuples []storage.HeapTuple
+
+	for _, tbl := range userTables {
+		ns := catalog.PublicNamespaceOID
+		if tbl.Schema == "pg_catalog" {
+			ns = catalog.PGCatalogNamespaceOID
+		}
+		classData := catalog.EncodePGClassRow(catalog.PGClassRow{
+			OID:            tbl.OID,
+			RelName:        tbl.Name,
+			RelNamespace:   uint32(ns),
+			RelKind:        "r",
+			RelNAtts:       int32(len(tbl.Columns)),
+			RelFileNode:    tbl.OID,
+			RelPersistence: "p",
+		})
+		classTuples = append(classTuples, storage.NewHeapTuple(xid, storage.InvalidTransactionID, classData))
+
+		for _, col := range tbl.Columns {
+			attrData := catalog.EncodePGAttributeRow(catalog.PGAttributeRow{
+				AttRelID:  tbl.OID,
+				AttName:   col.Name,
+				AttTypID:  catalog.TypeNameToOID(col.Type.Name),
+				AttNum:    int32(col.Ordinal + 1),
+				AttNotNull: col.NotNull,
+			})
+			attrTuples = append(attrTuples, storage.NewHeapTuple(xid, storage.InvalidTransactionID, attrData))
+		}
+	}
+
+	// Write pg_class rows.
+	if err := appendCatalogRows(mgr, classRel, classTuples); err != nil {
+		return fmt.Errorf("maybeMigrate: write pg_class: %w", err)
+	}
+
+	// Write pg_attribute rows.
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if nAttrBlocks, _ := mgr.NBlocks(attrRel); nAttrBlocks > 0 {
+		if err := appendCatalogRows(mgr, attrRel, attrTuples); err != nil {
+			return fmt.Errorf("maybeMigrate: write pg_attribute: %w", err)
+		}
+	}
+	return nil
+}
+
+// appendCatalogRows appends HeapTuples to the last page of a relfile,
+// extending to new pages when the current page is full. Used by the
+// catalog migration (M0030-0004) to backfill user-table rows into
+// pg_class and pg_attribute without disturbing the existing bootstrap rows.
+func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []storage.HeapTuple) error {
+	if len(tuples) == 0 {
+		return nil
+	}
+	nBlocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return fmt.Errorf("NBlocks: %w", err)
+	}
+	if nBlocks == 0 {
+		return fmt.Errorf("appendCatalogRows: relfile OID %d has 0 blocks", rel.RelOid)
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+	curBlk := nBlocks - 1
+	if err := mgr.ReadBlock(rel, curBlk, page); err != nil {
+		return fmt.Errorf("ReadBlock %d: %w", curBlk, err)
+	}
+
+	for _, tup := range tuples {
+		if _, addErr := storage.PageAddHeapTuple(page, tup); addErr == nil {
+			continue
+		}
+		// Page full — flush current, extend new page.
+		if err := mgr.WriteBlock(rel, curBlk, page); err != nil {
+			return fmt.Errorf("WriteBlock %d: %w", curBlk, err)
+		}
+		for i := range page {
+			page[i] = 0
+		}
+		if err := storage.InitPage(page); err != nil {
+			return err
+		}
+		curBlk, err = mgr.Extend(rel, page)
+		if err != nil {
+			return fmt.Errorf("Extend: %w", err)
+		}
+		if _, addErr := storage.PageAddHeapTuple(page, tup); addErr != nil {
+			return fmt.Errorf("PageAddHeapTuple on fresh page: %w", addErr)
+		}
+	}
+	return mgr.WriteBlock(rel, curBlk, page)
+}
+
+// loadUserTablesFromHeap supplements the in-memory catalog with user tables
+// found in the pg_class and pg_attribute heap relfiles (M0030-0003). It scans
+// all live (xmin≠0, xmax=0) pg_class rows with relkind='r' and OID ≥ FirstUserOID,
+// then collects their column definitions from pg_attribute rows, and calls
+// TryRegisterUserTable for each.
+//
+// This is the primary crash-recovery path for user tables: if the server crashes
+// after DDL-sync writes to the heap but before SaveCatalog() writes the JSON,
+// this scan recovers the new tables from the WAL-replayed heap pages on the
+// next startup.
+//
+// The clog parameter (M0030-0007) filters out rows whose xmin was never
+// committed — this handles tables created in transactions that crashed before
+// reaching COMMIT. If clog is nil (should not happen after M0030-0007 landed)
+// the scan falls back to the old xmax-only check.
+//
+// The scan is safe on old clusters (pre-M0030-0001) that have no pg_class relfile
+// and is idempotent with the JSON snapshot path (tables already loaded from JSON
+// are skipped via TryRegisterUserTable's exists-check).
+func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	nClassBlocks, err := mgr.NBlocks(classRel)
+	if err != nil || nClassBlocks == 0 {
+		return nil // pg_class absent or empty — old cluster or fresh initdb
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+
+	// Pass 1: collect user table rows from pg_class.
+	var userTableRows []catalog.PGClassRow
+	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
+		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
+			return fmt.Errorf("loadUserTablesFromHeap: read pg_class blk %d: %w", blk, err)
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID {
+				continue // not a real tuple
+			}
+			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue // deleted
+			}
+			// Skip rows from uncommitted or crashed transactions (M0030-0007).
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
+				continue
+			}
+			row, err := catalog.DecodePGClassRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if row.RelKind == "r" && row.OID >= catalog.FirstUserOID {
+				userTableRows = append(userTableRows, row)
+			}
+		}
+	}
+	if len(userTableRows) == 0 {
+		return nil // no user tables in heap
+	}
+
+	// Pass 2: collect pg_attribute rows for user tables.
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	nAttrBlocks, err := mgr.NBlocks(attrRel)
+	if err != nil || nAttrBlocks == 0 {
+		return nil // no attributes — can't reconstruct columns
+	}
+
+	attrByRelOID := map[uint32][]catalog.PGAttributeRow{}
+	for blk := storage.BlockNumber(0); blk < nAttrBlocks; blk++ {
+		if err := mgr.ReadBlock(attrRel, blk, page); err != nil {
+			return fmt.Errorf("loadUserTablesFromHeap: read pg_attribute blk %d: %w", blk, err)
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID {
+				continue
+			}
+			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			row, err := catalog.DecodePGAttributeRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID {
+				attrByRelOID[row.AttRelID] = append(attrByRelOID[row.AttRelID], row)
+			}
+		}
+	}
+
+	// Pass 3: register each user table with its heap-recovered column definitions.
+	for _, tr := range userTableRows {
+		attrRows := attrByRelOID[tr.OID]
+		sort.Slice(attrRows, func(i, j int) bool {
+			return attrRows[i].AttNum < attrRows[j].AttNum
+		})
+
+		cols := make([]catalog.Column, len(attrRows))
+		for i, ar := range attrRows {
+			cols[i] = catalog.Column{
+				Name:    ar.AttName,
+				Type:    catalog.Type{Name: catalog.OIDToTypeName(ar.AttTypID)},
+				NotNull: ar.AttNotNull,
+				Ordinal: i,
+			}
+		}
+
+		schema := ""
+		if tr.RelNamespace == catalog.PGCatalogNamespaceOID {
+			schema = "pg_catalog"
+		}
+
+		tbl := &catalog.Table{
+			Schema:  schema,
+			Name:    tr.RelName,
+			Columns: cols,
+			OID:     tr.OID,
+		}
+		if err := cat.TryRegisterUserTable(tbl); err != nil {
+			return fmt.Errorf("loadUserTablesFromHeap: register %q: %w", tr.RelName, err)
+		}
+	}
+	return nil
+}
+
 // loadCatalogSnapshot reads <dir>/global/pg_catalog.json (if
 // present) into cat. A missing file is fine — that's the
 // fresh-from-init case. Anything else (read error, JSON parse
@@ -846,6 +1404,17 @@ func (r *Runtime) SaveCatalog() error {
 func (r *Runtime) Close() error {
 	if r == nil {
 		return nil
+	}
+	// Stop the background page-writer before draining the pool (M0048-0003).
+	if r.bgwriter != nil {
+		r.bgwriter.Stop()
+		r.bgwriter = nil
+	}
+	// Stop the background WAL writer loop before draining the pool so the
+	// loop can't issue FlushUpTo calls that race with the final WAL close.
+	if r.walwriterStop != nil {
+		close(r.walwriterStop)
+		r.walwriterStop = nil
 	}
 	var firstErr error
 	if r.Pool != nil {

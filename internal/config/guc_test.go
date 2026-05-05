@@ -120,6 +120,38 @@ func TestReportableHookFires(t *testing.T) {
 	}
 }
 
+// TestOnChangeCallbackFires (M0054-0006e-followup) confirms the
+// registry-level OnChange callback fires when a session SETs the
+// named variable, and on Reset is invoked with the global default.
+func TestOnChangeCallbackFires(t *testing.T) {
+	r := BuildDefaultRegistry()
+	var values []string
+	r.OnChange("enable_nestloop_index", func(value string) {
+		values = append(values, value)
+	})
+	sess := NewSessionRegistry(r)
+	if err := sess.Set("enable_nestloop_index", "off", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Set("enable_nestloop_index", "on", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Reset("enable_nestloop_index"); err != nil {
+		t.Fatal(err)
+	}
+	// Expect: ["off", "on", "on"] — Reset returns to the default
+	// "on" registered in defaults.go.
+	want := []string{"off", "on", "on"}
+	if len(values) != len(want) {
+		t.Fatalf("got %d callbacks (%v), want %d (%v)", len(values), values, len(want), want)
+	}
+	for i := range want {
+		if values[i] != want[i] {
+			t.Errorf("callback %d: got %q, want %q", i, values[i], want[i])
+		}
+	}
+}
+
 func TestApplyConfigEntriesUnknownReturnsError(t *testing.T) {
 	r := BuildDefaultRegistry()
 	err := r.ApplyConfigEntries([]ConfigEntry{

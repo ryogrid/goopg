@@ -2,10 +2,12 @@
 //
 // Mirrors upstream's initdb at the directory level (base/, global/,
 // pg_wal/, pg_xact/, PG_VERSION) so an operator familiar with
-// PostgreSQL can navigate the tree. v0 doesn't yet bootstrap a
-// system catalog or write a pg_control file — those land alongside
-// the on-disk catalog work in milestone 7+. The design rationale
-// is in docs/design/0017-data-directory.md.
+// PostgreSQL can navigate the tree. System catalog heap files
+// (pg_class, pg_attribute, pg_type) are created as real relfiles
+// during Init so subsequent Open finds the OID-keyed files under
+// base/<DBOid>/. The design rationale is in
+// docs/design/0017-data-directory.md and
+// docs/design/0030-0001-system-catalog-heap-substrate.md.
 //
 // Spec references:
 //
@@ -23,6 +25,8 @@ import (
 	"strconv"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // CatalogVersion is the value written into the data directory's
@@ -107,7 +111,97 @@ func Init(opts Options) error {
 			return fmt.Errorf("goopg init: write %q: %w", path, err)
 		}
 	}
+	if err := bootstrapSystemCatalogs(abs); err != nil {
+		return fmt.Errorf("goopg init: system catalogs: %w", err)
+	}
+	if err := bootstrapCLog(abs); err != nil {
+		return fmt.Errorf("goopg init: clog: %w", err)
+	}
 	return nil
+}
+
+// bootstrapCLog creates the initial commit log at <dataDir>/global/pg_xact and
+// marks the PostgreSQL bootstrap transaction IDs (BootstrapTransactionID=1,
+// FrozenTransactionID=2) as committed. These XIDs stamp the system-catalog
+// seed rows written by bootstrapSystemCatalogs; without this, a restart would
+// find Unknown status for xmin=1 and skip those rows.
+func bootstrapCLog(dataDir string) error {
+	path := filepath.Join(dataDir, "global", "pg_xact")
+	c, err := mvcc.OpenCLog(path)
+	if err != nil {
+		return err
+	}
+	if err := c.SetCommitted(mvcc.BootstrapTransactionID); err != nil {
+		return fmt.Errorf("mark bootstrap xid: %w", err)
+	}
+	return c.SetCommitted(mvcc.FrozenTransactionID)
+}
+
+// bootstrapSystemCatalogs creates the three core system catalog heap
+// relfiles (pg_type, pg_attribute, pg_class) under
+// <dataDir>/base/<DefaultDBOid>/ and seeds them with their initial rows.
+//
+// The storage manager is created and closed inline — no buffer pool is
+// needed for a one-shot Extend of a seeded page.
+//
+// Row encoding matches executor.EncodeRow so a SeqScan on the resulting
+// relfile produces the correct values without special-casing.  Transaction
+// IDs are set to bootstrapXID (1) so the rows are always visible.
+func bootstrapSystemCatalogs(dataDir string) error {
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	// pg_type: built-in type entries.
+	var pgTypeData [][]byte
+	for _, tr := range pgTypeBootstrapRows() {
+		pgTypeData = append(pgTypeData, catalog.EncodePGTypeRow(tr))
+	}
+	if err := extendWithRows(mgr, catalog.TypeRelationId, pgTypeData); err != nil {
+		return fmt.Errorf("seed pg_type: %w", err)
+	}
+
+	// pg_class: self-referential entries for the three system catalogs.
+	var pgClassData [][]byte
+	for _, cr := range pgClassBootstrapRows() {
+		pgClassData = append(pgClassData, catalog.EncodePGClassRow(cr))
+	}
+	if err := extendWithRows(mgr, catalog.RelationRelationId, pgClassData); err != nil {
+		return fmt.Errorf("seed pg_class: %w", err)
+	}
+
+	// pg_attribute: column definitions for the three system catalogs.
+	var pgAttrData [][]byte
+	for _, ar := range pgAttributeBootstrapRows() {
+		pgAttrData = append(pgAttrData, catalog.EncodePGAttributeRow(ar))
+	}
+	if err := extendWithRows(mgr, catalog.AttributeRelationId, pgAttrData); err != nil {
+		return fmt.Errorf("seed pg_attribute: %w", err)
+	}
+
+	return nil
+}
+
+// extendWithRows initialises a fresh page, writes all rows as heap tuples
+// with bootstrapXID, and appends it as block 0 via Manager.Extend.
+func extendWithRows(mgr *storage.Manager, relOID uint32, rows [][]byte) error {
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	xid := storage.TransactionID(bootstrapXID)
+	for i, data := range rows {
+		t := storage.NewHeapTuple(xid, storage.InvalidTransactionID, data)
+		if _, err := storage.PageAddHeapTuple(page, t); err != nil {
+			return fmt.Errorf("row %d: %w", i, err)
+		}
+	}
+	rel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: relOID,
+		Fork:   storage.MainFork,
+	}
+	_, err := mgr.Extend(rel, page)
+	return err
 }
 
 // ensureEmptyDir is upstream's "directory must be empty" guard.

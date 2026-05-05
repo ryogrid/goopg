@@ -798,7 +798,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
-			if leftTyp.Name != "unknown" {
+			// Return the wider type per the coercion lattice
+			// (int2→int4→int8→numeric→float4→float8), so that
+			// `int8 + numeric` correctly reports numeric, not int8.
+			if promoted := PromoteNumericType(leftTyp, rightTyp); promoted.Name != "" {
+				return promoted, nil
+			}
+			if !isUnknownType(leftTyp) {
 				return leftTyp, nil
 			}
 			return rightTyp, nil
@@ -806,7 +812,8 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator || requires string operands")
 			}
-			return catalog.Type{Name: "text"}, nil
+			// Mixed string types (text || varchar, etc.) promote to text.
+			return PromoteStringType(leftTyp, rightTyp), nil
 		case "LIKE", "NOT LIKE":
 			// Both operands must be string-like (text/varchar/char/
 			// bpchar/unknown). Pattern can be a literal or column.
@@ -864,10 +871,34 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 
 func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error) {
 	name := strings.ToLower(x.Name.Name)
+	var retType catalog.Type
 	switch name {
 	case "row_number", "rank":
 		if x.Star || x.Distinct || len(x.Args) != 0 {
 			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name))
+		}
+		retType = catalog.Type{Name: "int8"}
+	case "lag", "lead":
+		if x.Star || x.Distinct {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept DISTINCT or * in v0", name))
+		}
+		if len(x.Args) < 1 || len(x.Args) > 3 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() requires 1 to 3 arguments", name))
+		}
+		valueTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		retType = valueTyp
+		if len(x.Args) >= 2 {
+			if _, err := analyzeExpr(x.Args[1], ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		if len(x.Args) >= 3 {
+			if _, err := analyzeExpr(x.Args[2], ctx); err != nil {
+				return catalog.Type{}, err
+			}
 		}
 	default:
 		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
@@ -888,7 +919,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 			return catalog.Type{}, err
 		}
 	}
-	return catalog.Type{Name: "int8"}, nil
+	return retType, nil
 }
 
 func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error) {
@@ -1059,7 +1090,13 @@ func resolveTable(ctx *scope, rv parser.RangeVar) (*catalog.Table, error) {
 func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	body := cte.Query
 	if body.SetOp == nil || body.SetOp.Type != parser.SetOpUnion || !body.SetOp.All {
-		return analyzeError(cte.Pos(), "0A000", "WITH RECURSIVE requires UNION ALL")
+		// No recursive self-join — just analyse the body as a
+		// regular CTE.  The planner enforces the UNION ALL
+		// requirement for true recursive CTEs.
+		if err := analyzeSelectWithParent(body, ctx.cat, ctx); err != nil {
+			return err
+		}
+		return registerAnalyzedCTE(cte, ctx)
 	}
 
 	// Analyze the anchor (left side) without the CTE in scope.
@@ -1102,9 +1139,9 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		colAliases[i] = c.Name
 	}
 	ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{
-		Name:       cte.Name,
-		Columns:    cols,
-		Virtual:    true,
+		Name:              cte.Name,
+		Columns:           cols,
+		Virtual:           true,
 		ViewColumnAliases: colAliases,
 	}
 
@@ -1146,43 +1183,47 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 		if err := analyzeSelectWithParent(cte.Query, ctx.cat, ctx); err != nil {
 			return err
 		}
-		// Build the synthetic catalog.Table mirroring
-		// synthesizeSubqueryTable.
-		innerCtx := &scope{cat: ctx.cat, parent: ctx}
-		if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
-			rels, err := buildSelectScopeIn(cte.Query, innerCtx)
-			if err != nil {
-				return err
-			}
-			innerCtx.rels = rels
+		if err := registerAnalyzedCTE(cte, ctx); err != nil {
+			return err
 		}
-		innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-		for i, tgt := range cte.Query.Targets {
-			name := tgt.Alias
-			if name == "" {
-				name = deriveAnalyzerTargetName(tgt.Expr)
-			}
-			if name == "" {
-				name = fmt.Sprintf("?column?%d", i+1)
-			}
-			typ, err := analyzeExpr(tgt.Expr, innerCtx)
-			if err != nil {
-				return err
-			}
-			innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
-		}
-		// Apply column-alias list if specified. Arity must match.
-		if len(cte.Columns) > 0 {
-			if len(cte.Columns) != len(innerCols) {
-				return analyzeError(cte.Pos(), "42P10",
-					fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
-			}
-			for i, alias := range cte.Columns {
-				innerCols[i].Name = alias
-			}
-		}
-		ctx.ctes[nameKey] = &catalog.Table{Name: cte.Name, Columns: innerCols}
 	}
+	return nil
+}
+
+func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
+	innerCtx := &scope{cat: ctx.cat, parent: ctx}
+	if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
+		rels, err := buildSelectScopeIn(cte.Query, innerCtx)
+		if err != nil {
+			return err
+		}
+		innerCtx.rels = rels
+	}
+	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
+	for i, tgt := range cte.Query.Targets {
+		name := tgt.Alias
+		if name == "" {
+			name = deriveAnalyzerTargetName(tgt.Expr)
+		}
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
+		}
+		typ, err := analyzeExpr(tgt.Expr, innerCtx)
+		if err != nil {
+			return err
+		}
+		innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
+	}
+	if len(cte.Columns) > 0 {
+		if len(cte.Columns) != len(innerCols) {
+			return analyzeError(cte.Pos(), "42P10",
+				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
+		}
+		for i, alias := range cte.Columns {
+			innerCols[i].Name = alias
+		}
+	}
+	ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{Name: cte.Name, Columns: innerCols}
 	return nil
 }
 

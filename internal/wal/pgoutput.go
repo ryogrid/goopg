@@ -327,39 +327,12 @@ func pgoDecodeValue(t catalog.Type, data []byte) ([]byte, int, error) {
 	return out, 4 + ln, nil
 }
 
-// pgoTypeOIDFor maps a v0 catalog type name to the upstream
-// PostgreSQL type OID. Apply workers cast the wire bytes back
-// to typed values via this OID, so the mapping must match
-// `pg_type` for the v0 type set. Unknown types fall back to
-// 25 (text) — the apply worker still gets a string.
+// pgoTypeOIDFor maps a v0 catalog type name to the upstream PostgreSQL type
+// OID used in pgoutput Relation messages. Delegates to catalog.TypeNameToOID
+// (M0030-0005) so the mapping is authoritative and in sync with pg_type.
+// Unknown types fall back to 25 (text) — the apply worker still gets a string.
 func pgoTypeOIDFor(name string) uint32 {
-	switch name {
-	case "bool", "boolean":
-		return 16
-	case "bytea":
-		return 17
-	case "int8", "bigint":
-		return 20
-	case "int2", "smallint":
-		return 21
-	case "int4", "integer", "int":
-		return 23
-	case "text":
-		return 25
-	case "varchar":
-		return 1043
-	case "char":
-		return 1042
-	case "date":
-		return 1082
-	case "timestamp":
-		return 1114
-	case "timestamptz":
-		return 1184
-	case "numeric", "decimal":
-		return 1700
-	}
-	return 25 // text
+	return catalog.TypeNameToOID(name)
 }
 
 // pgoTimestamp returns upstream's "Postgres epoch microseconds"

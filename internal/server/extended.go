@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/config"
@@ -38,9 +40,10 @@ type boundParam struct {
 }
 
 type extendedMessageError struct {
-	Code    sqlstate.Code
-	Message string
-	Routine string
+	Code     sqlstate.Code
+	Message  string
+	Routine  string
+	Position int // 1-based byte offset; 0 = omit FieldPosition
 }
 
 type extendedQueryResult struct {
@@ -51,8 +54,9 @@ type extendedQueryResult struct {
 }
 
 type extendedQueryError struct {
-	Code    sqlstate.Code
-	Message string
+	Code     sqlstate.Code
+	Message  string
+	Position int // 1-based byte offset; 0 = omit FieldPosition
 }
 
 func newExtendedState() *extendedState {
@@ -67,13 +71,17 @@ func (s *Server) writeExtendedMessageError(w *protocol.FrameWriter, em *extended
 	if routine == "" {
 		routine = "server.runPostStartupLoop"
 	}
-	return w.WriteErrorResponse([]protocol.ErrorField{
+	fields := []protocol.ErrorField{
 		{Code: protocol.FieldSeverity, Value: "ERROR"},
 		{Code: protocol.FieldSeverityNonLocal, Value: "ERROR"},
 		{Code: protocol.FieldSQLState, Value: string(em.Code)},
 		{Code: protocol.FieldMessage, Value: em.Message},
 		{Code: protocol.FieldRoutine, Value: routine},
-	})
+	}
+	if em.Position > 0 {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldPosition, Value: strconv.Itoa(em.Position)})
+	}
+	return w.WriteErrorResponse(fields)
 }
 
 func (s *Server) handleParseFrame(state *extendedState, payload []byte) *extendedMessageError {
@@ -280,7 +288,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 	}
 }
 
-func (s *Server) handleExecuteFrame(state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry) (*extendedMessageError, error) {
+func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry) (*extendedMessageError, error) {
 	pr := payloadReader{buf: payload}
 	portalName, err := pr.readCString()
 	if err != nil {
@@ -304,9 +312,9 @@ func (s *Server) handleExecuteFrame(state *extendedState, payload []byte, w *pro
 	}
 
 	if portal.Result == nil {
-		res, qerr := s.executeExtendedQuery(sess, portal.Statement.Query, portal.Params)
+		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params)
 		if qerr != nil {
-			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Routine: "server.handleExecuteFrame"}, nil
+			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
 		}
 		portal.Result = res
 		portal.RowPos = 0
@@ -393,7 +401,7 @@ func (s *Server) handleCloseFrame(state *extendedState, payload []byte) *extende
 	}
 }
 
-func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
@@ -495,7 +503,7 @@ func (s *Server) executeExtendedQuery(sess *config.SessionRegistry, query string
 		}
 	}
 	if s.cfg.hasStorage() {
-		return s.executeExtendedQueryViaExecutor(sess, trimmed, params)
+		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params)
 	}
 
 	if len(params) > 0 {

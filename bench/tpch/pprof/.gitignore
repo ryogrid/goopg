@@ -1,0 +1,6 @@
+# Binary pprof captures and goroutine dumps are large and don't compress;
+# the M0054-0004 survey doc (analysis/tpch-pprof-bottleneck-survey.md)
+# captures the analysed findings. Profiles are kept locally for ad-hoc
+# inspection but are never committed.
+*.prof
+*.txt

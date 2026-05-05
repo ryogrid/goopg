@@ -2,9 +2,10 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/config"
@@ -34,7 +35,7 @@ type copyInState struct {
 	mgr      *mvcc.Manager
 }
 
-func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) (*copyInState, error) {
+func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) (*copyInState, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -45,7 +46,7 @@ func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.Session
 	}
 	_, matchable, upper, empty := normalizeSimpleQuery(q)
 	if empty || !strings.HasPrefix(upper, "COPY ") {
-		if err := s.handleQuery(w, sess, payload); err != nil {
+		if err := s.handleQuery(ctx, w, sess, payload); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -56,7 +57,7 @@ func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.Session
 	// (42P01, 42703, 42601, 0A000); the wire layer just forwards
 	// them.
 	if s.cfg.hasStorage() {
-		st, err := s.dispatchCopyViaExecutor(w, matchable)
+		st, err := s.dispatchCopyViaExecutor(ctx, w, matchable)
 		if err != nil {
 			return nil, err
 		}
@@ -87,7 +88,7 @@ func (s *Server) handleQueryOrCopy(w *protocol.FrameWriter, sess *config.Session
 // dispatchCopyViaExecutor parses + plans the COPY statement and
 // either streams rows out (CopyTo) or arms the connection's CopyIn
 // frame consumer (CopyFrom).
-func (s *Server) dispatchCopyViaExecutor(w *protocol.FrameWriter, sql string) (*copyInState, error) {
+func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string) (*copyInState, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.SyntaxError, err.Error()); err != nil {
@@ -136,23 +137,24 @@ func (s *Server) dispatchCopyViaExecutor(w *protocol.FrameWriter, sql string) (*
 		}
 		return nil, nil
 	}
-	ctx := executor.NewContext()
-	ctx.Pool = s.cfg.Pool
-	ctx.Catalog = s.cfg.Catalog
-	ctx.TxnMgr = s.cfg.TxnMgr
-	ctx.Tx = tx
-	ctx.Snap = snap
+	ectx := executor.NewContext()
+	ectx.Ctx = ctx
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
 
 	switch plan.Direction {
 	case planner.CopyTo:
-		err := s.runCopyTo(w, ctx, plan)
+		err := s.runCopyTo(w, ectx, plan)
 		_ = s.cfg.TxnMgr.Commit(tx)
 		if err != nil {
 			return nil, err
 		}
 		return nil, nil
 	case planner.CopyFrom:
-		from, err := executor.NewCopyFromExecutor(ctx, plan)
+		from, err := executor.NewCopyFromExecutor(ectx, plan)
 		if err != nil {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			if err := s.writeQueryError(w, execErrCode(err), execErrMsg(err)); err != nil {
@@ -160,7 +162,11 @@ func (s *Server) dispatchCopyViaExecutor(w *protocol.FrameWriter, sql string) (*
 			}
 			return nil, nil
 		}
-		if err := w.WriteCopyInResponse(0, nil); err != nil {
+		fmtCode := byte(0)
+		if executor.IsBinaryFormat(plan.Options) {
+			fmtCode = 1
+		}
+		if err := w.WriteCopyInResponse(fmtCode, nil); err != nil {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			return nil, err
 		}
@@ -180,10 +186,17 @@ func (s *Server) dispatchCopyViaExecutor(w *protocol.FrameWriter, sql string) (*
 // runCopyTo drives the CopyOutResponse / CopyData* / CopyDone /
 // CommandComplete / ReadyForQuery sequence for a CopyTo plan.
 func (s *Server) runCopyTo(w *protocol.FrameWriter, ctx *executor.Context, plan *planner.Copy) error {
-	if err := w.WriteCopyOutResponse(0, nil); err != nil {
+	// Peek at the options to decide the wire format code before opening
+	// the operator — WriteCopyOutResponse must precede any CopyData frames.
+	binary := executor.IsBinaryFormat(plan.Options)
+	fmtCode := byte(0)
+	if binary {
+		fmtCode = 1
+	}
+	if err := w.WriteCopyOutResponse(fmtCode, nil); err != nil {
 		return err
 	}
-	count, err := executor.RunCopyTo(ctx, plan, func(line []byte) error {
+	count, _, err := executor.RunCopyTo(ctx, plan, func(line []byte) error {
 		return w.WriteCopyData(line)
 	})
 	if err != nil {
@@ -228,12 +241,30 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 	switch f.Type {
 	case protocol.MsgCopyData:
 		if st.fromExec != nil {
-			if err := st.consumeExecCopyData(f.Payload); err != nil {
-				// Decode/insert error: drain remaining frames until
-				// CopyDone/CopyFail by leaving fromExec set but
-				// signalling a wire-level error. Simplest: emit
-				// ErrorResponse + ReadyForQuery and abort the
-				// transaction.
+			var err error
+			if st.fromExec.IsBinary() {
+				var done bool
+				done, err = st.fromExec.PushBinaryData(f.Payload)
+				if err == nil && done {
+					// Trailer found inside CopyData — treat as CopyDone.
+					rows := st.fromExec.RowsInserted()
+					if st.mgr != nil {
+						_ = st.mgr.Commit(st.tx)
+					}
+					if cerr := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); cerr != nil {
+						return true, cerr
+					}
+					maybeForceGCAfterCommit()
+					if cerr := w.WriteReadyForQuery(protocol.TxStatusIdle); cerr != nil {
+						return true, cerr
+					}
+					return true, nil
+				}
+			} else {
+				err = st.consumeExecCopyData(f.Payload)
+			}
+			if err != nil {
+				// Decode/insert error: abort transaction and report.
 				if st.mgr != nil {
 					_ = st.mgr.Rollback(st.tx)
 				}
@@ -288,7 +319,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); err != nil {
 				return true, err
 			}
-			runtime.GC()
+			maybeForceGCAfterCommit()
 			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
 				return true, err
 			}
@@ -407,6 +438,27 @@ func (st *copyInState) consumeTextCopyData(chunk []byte) {
 		}
 	}
 	st.partialRow = chunk[len(chunk)-1] != '\n'
+}
+
+// syntaxErrorMsg returns the human-readable message and optional extra
+// ErrorFields for a parser error. When err is *parser.SyntaxError it strips
+// the internal "(byte N)" suffix and returns a FieldPosition field carrying
+// the 1-based byte offset so psql can render the caret-pointer line.
+func syntaxErrorMsg(err error) (msg string, extra []protocol.ErrorField) {
+	var se *parser.SyntaxError
+	if errors.As(err, &se) {
+		msg = se.Error()
+		if idx := strings.LastIndex(msg, " (byte "); idx >= 0 {
+			msg = msg[:idx]
+		}
+		if se.Pos >= 0 {
+			extra = []protocol.ErrorField{
+				{Code: protocol.FieldPosition, Value: strconv.Itoa(se.Pos + 1)},
+			}
+		}
+		return msg, extra
+	}
+	return err.Error(), nil
 }
 
 // planErrorFields extracts the SQLSTATE + message from a planner

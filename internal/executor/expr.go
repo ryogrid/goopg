@@ -63,7 +63,7 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(), Message: err.Error()}
 		}
-		return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: s}, nil
+		return newNumeric(m, int(s)), nil
 	case *planner.StringConst:
 		return Datum{Kind: KindString, String: x.Value}, nil
 	case *planner.NullConst:
@@ -156,7 +156,19 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
 		// the int side to KindNumeric{scale=0} and reuse the same
-		// scale-aligning helpers.
+		// scale-aligning helpers.  Also try to parse string
+		// operands as numeric (columns loaded via INSERT may be
+		// stored as strings before the type system enforces types).
+		if left.Kind == KindString {
+			if m, s, err := parseNumeric(left.String); err == nil {
+				left = newNumeric(m, int(s))
+			}
+		}
+		if right.Kind == KindString {
+			if m, s, err := parseNumeric(right.String); err == nil {
+				right = newNumeric(m, int(s))
+			}
+		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
@@ -333,7 +345,7 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 	case KindNumeric:
 		if m, sc, err := parseNumeric(s); err == nil {
-			return Datum{Kind: KindNumeric, NumericMantissa: m, NumericScale: sc}
+			return newNumeric(m, int(sc))
 		}
 	case KindTime:
 		if t, err := parseCopyTimestamp(s); err == nil {
@@ -490,6 +502,15 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	if src.Kind != KindTime {
+		// Try to parse a string as timestamp (planner may assign
+		// string storage for date columns loaded via INSERT).
+		if src.Kind == KindString {
+			if t, err := parseCopyTimestamp(src.String); err == nil {
+				src = Datum{Kind: KindTime, Time: t}
+			}
+		}
+	}
+	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT(%s FROM …) requires timestamp/date input", x.Field)}
 	}
 	n, err := extractTimestampField(x.Field, src.Time, x.Pos())
@@ -636,6 +657,21 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 // exactly one column. Otherwise evaluates the value list.
 func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) {
 	if x.Plan != nil {
+		// Consult the subquery cache so correlated IN
+		// subqueries are evaluated at most once per distinct
+		// outer-row value rather than per outer row.  This
+		// reduces Q20-like queries from O(outer×inner) to
+		// O(inner) per distinct correlation key.
+		if ctx.SubqueryCache != nil {
+			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
+				clear(ctx.SubqueryCache)
+				ctx.SubqueryCacheScope = len(ctx.OuterRows)
+			}
+			key := subqueryCacheKey(row)
+			if cached, ok := ctx.SubqueryCache[key]; ok {
+				return cached, nil
+			}
+		}
 		// Push the outer row so correlated refs inside the
 		// IN-subquery resolve against it. Pop on return.
 		ctx.OuterRows = append(ctx.OuterRows, row)
@@ -663,6 +699,13 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 			}
 			out = append(out, r[0])
 		}
+		// Cache the result so subsequent rows with the same
+		// correlation values skip the inner-plan execution.
+		if ctx.SubqueryCache == nil {
+			ctx.SubqueryCache = make(map[string][]Datum)
+			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		}
+		ctx.SubqueryCache[subqueryCacheKey(row)] = out
 		return out, nil
 	}
 	out := make([]Datum, len(x.List))
@@ -720,7 +763,31 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
-	return subqueryImpl(x, ctx)
+	// Check cache for scalar subquery results keyed by outer row.
+	if ctx.SubqueryCache != nil {
+		if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
+			clear(ctx.SubqueryCache)
+			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		}
+		key := subqueryCacheKey(row)
+		if cached, ok := ctx.SubqueryCache[key]; ok {
+			if len(cached) == 1 {
+				return cached[0], nil
+			}
+			return NullDatum, nil
+		}
+	}
+	val, err := subqueryImpl(x, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	// Store in cache
+	if ctx.SubqueryCache == nil {
+		ctx.SubqueryCache = make(map[string][]Datum)
+		ctx.SubqueryCacheScope = len(ctx.OuterRows)
+	}
+	ctx.SubqueryCache[subqueryCacheKey(row)] = []Datum{val}
+	return val, nil
 }
 
 func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
@@ -849,6 +916,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_date":
 		t := ctx.Now
 		return Datum{Kind: KindTime, Time: t.Truncate(24 * 60 * 60 * 1e9)}, nil
+	case "pg_sleep":
+		return evalPgSleep(x, row, ctx)
 	case "to_timestamp":
 		return evalToTimestamp(x, row, ctx)
 	case "to_date":
@@ -903,6 +972,47 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // NULL inputs propagate to NULL output.
 //
 // The 2-argument form returns the substring from `from` to the end of
+// evalPgSleep implements pg_sleep(seconds). Sleeps for the given
+// duration while honouring query cancellation via ctx.Ctx.
+func evalPgSleep(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 1 {
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep(double precision) requires exactly 1 argument"}
+	}
+	secs, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if secs.IsNull() {
+		return NullDatum, nil
+	}
+	var d time.Duration
+	switch secs.Kind {
+	case KindInt:
+		d = time.Duration(secs.Int) * time.Second
+	case KindNumeric:
+		f, err := strconv.ParseFloat(secs.Format(), 64)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep: invalid numeric value"}
+		}
+		d = time.Duration(f * float64(time.Second))
+	default:
+		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "pg_sleep argument must be numeric"}
+	}
+	if d < 0 {
+		d = 0
+	}
+	if ctx.Ctx != nil {
+		select {
+		case <-time.After(d):
+		case <-ctx.Ctx.Done():
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	} else {
+		time.Sleep(d)
+	}
+	return NullDatum, nil
+}
+
 // the string. Negative `from` values are clamped per upstream:
 // `substr('abcdef', -2, 4)` returns `'a'` (start at position 1, length
 // becomes 1 after subtracting the negative offset). For a v0 simple
@@ -1047,4 +1157,15 @@ func pgFormatToGoLayout(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// subqueryCacheKey builds a deterministic string key from an
+// outer row so correlated subquery results can be cached per
+// distinct correlation value.
+func subqueryCacheKey(row Row) string {
+	parts := make([]string, len(row))
+	for i, d := range row {
+		parts[i] = datumKey(d)
+	}
+	return strings.Join(parts, "|")
 }

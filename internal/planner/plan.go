@@ -259,24 +259,85 @@ func (*FuncCall) exprNode()  {}
 type SeqScan struct {
 	pos    int
 	Table  *catalog.Table
+	Alias  string // FROM-clause alias; empty when not specified
 	schema Schema
 }
 
 func (n *SeqScan) Pos() int       { return n.pos }
 func (n *SeqScan) Output() Schema { return n.schema }
 
-// IndexScan probes a single-column B-tree index with an equality key.
-// v0 supports only `col = const` / `col = $N` shapes.
+// IndexScan probes a single-column B-tree index with an equality key
+// or a range of keys.
+//
+// Equality scan (col = key): Key is non-nil; LowKey and HighKey are nil.
+// Range scan (lo ≤ col ≤ hi): Key is nil; LowKey and/or HighKey are set.
+//   - LowKey non-nil means inclusive lower bound (col >= LowKey).
+//   - HighKey non-nil means inclusive upper bound (col <= HighKey).
+//   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
-	pos    int
-	Table  *catalog.Table
-	Index  *catalog.Index
-	Key    Expr
-	schema Schema
+	pos     int
+	Table   *catalog.Table
+	Index   *catalog.Index
+	Key     Expr  // non-nil for single-column equality scan (LowKey==HighKey implied)
+	Keys    []Expr // M0054-0006-followup-Q9-composite: multi-column equality probe.
+	// Keys[i] binds Index.Columns[i] in declared order. When non-empty, takes
+	// priority over Key. len(Keys) == len(Index.Columns) means a full equality
+	// probe (no suffix padding); a shorter prefix is rejected by the planner
+	// to keep the executor probe path purely equality-shaped.
+	LowKey  Expr  // inclusive lower bound for range scan; nil = no lower bound
+	HighKey Expr  // inclusive upper bound for range scan; nil = no upper bound
+	schema  Schema
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
 func (n *IndexScan) Output() Schema { return n.schema }
+
+// NestedLoopIndexJoin (M0054-0006) joins Outer (any plan node) with
+// Inner (an `*IndexScan`) by re-probing the index for each outer row.
+// The inner's `Key` / `LowKey` / `HighKey` `Expr` may reference outer-
+// row columns via `*ColumnRef` whose `Index` is offset by the outer
+// schema width — the executor binds the outer row before each
+// `Rescan` so `evalExpr` resolves correctly. Predicate carries any
+// non-equi residual conjuncts that the IndexScan probe alone does
+// not enforce.
+//
+// Supported `JoinType` set is INNER and LEFT. For LEFT, when the
+// inner probe yields no rows, the operator emits `outer ++
+// nullRow(innerWidth)` to preserve outer rows.
+type NestedLoopIndexJoin struct {
+	pos       int
+	Type      JoinType
+	Outer     Node
+	Inner     *IndexScan
+	Predicate Expr // residual filter applied per joined row
+	schema    Schema
+}
+
+func (n *NestedLoopIndexJoin) Pos() int       { return n.pos }
+func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
+
+// IndexOnlyScan is a covered index scan (M0046-0004): all projected columns
+// come from the B-tree index key, so no heap fetch is needed when the
+// visibility map reports ALL_VISIBLE for the target page.
+//
+// The output schema contains ONLY the projected covered columns (a subset
+// of the full table schema). When the VM bit is not set for a page the
+// executor falls back to a regular heap fetch.
+type IndexOnlyScan struct {
+	pos     int
+	Table   *catalog.Table
+	Index   *catalog.Index
+	Key     Expr
+	LowKey  Expr
+	HighKey Expr
+	// Covered is the slice of catalog.Column entries that the output schema
+	// contains (a subset of Index.Columns, in projection order).
+	Covered []catalog.Column
+	schema  Schema
+}
+
+func (n *IndexOnlyScan) Pos() int       { return n.pos }
+func (n *IndexOnlyScan) Output() Schema { return n.schema }
 
 // JoinType is the physical join shape emitted by the planner.
 type JoinType int
@@ -360,12 +421,14 @@ func (n *Aggregate) Pos() int       { return n.pos }
 func (n *Aggregate) Output() Schema { return n.schema }
 
 // WindowFunc is one supported window-function invocation in a
-// WindowAgg node. Stage A supports row_number/rank only; both
-// return int8.
+// WindowAgg node. Stage A supports row_number/rank (no args,
+// int8 return); Stage B adds lag/lead (1-3 args, return type
+// matches first arg).
 type WindowFunc struct {
 	pos  int
 	Name string
 	Type catalog.Type
+	Args []Expr // lag/lead: [value, offset?, default?]
 }
 
 func (w WindowFunc) Pos() int { return w.pos }
@@ -658,18 +721,22 @@ type DDL struct {
 func (n *DDL) Pos() int       { return n.pos }
 func (n *DDL) Output() Schema { return nil }
 
-// Transaction — BEGIN / COMMIT / ROLLBACK.
+// Transaction — BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / ROLLBACK TO.
 type TransactionVerb int
 
 const (
-	TxBegin TransactionVerb = iota
+	TxBegin      TransactionVerb = iota
 	TxCommit
 	TxRollback
+	TxSavepoint  // SAVEPOINT name
+	TxRelease    // RELEASE [SAVEPOINT] name
+	TxRollbackTo // ROLLBACK TO [SAVEPOINT] name
 )
 
 type Transaction struct {
 	pos  int
 	Verb TransactionVerb
+	Name string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
 }
 
 func (n *Transaction) Pos() int       { return n.pos }

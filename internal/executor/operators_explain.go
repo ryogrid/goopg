@@ -370,6 +370,17 @@ func describePlan(n planner.Node) string {
 		// detail is too verbose for the single-line label and
 		// is left to a future VERBOSE-only extension.
 		return "LockRows"
+	case *planner.MultiHashJoin:
+		// M0054-0003b: render the M0038 multi-way hash join
+		// explicitly so EXPLAIN shows the join shape instead of
+		// the Go type name "*planner.MultiHashJoin".
+		return fmt.Sprintf("Multi-Way Hash Join (%d tables)", len(p.Tables))
+	case *planner.NestedLoopIndexJoin:
+		// M0054-0006: render `Nested Loop` matching upstream's
+		// EXPLAIN output for a nested-loop join with an inner
+		// IndexScan side. The inner IndexScan node renders its
+		// own label (`Index Scan using <idx> on <table>`) below.
+		return fmt.Sprintf("Nested Loop (%s)", joinTypeName(p.Type))
 	}
 	return fmt.Sprintf("%T", n)
 }
@@ -417,6 +428,19 @@ func planChildren(n planner.Node) []planner.Node {
 		return []planner.Node{p.Child}
 	case *planner.LockRows:
 		return []planner.Node{p.Child}
+	case *planner.MultiHashJoin:
+		// M0054-0003b: walk every input table of the multi-way
+		// hash join. Without this, EXPLAIN truncates the plan
+		// tree at the MultiHashJoin label and the underlying
+		// SeqScan / IndexScan nodes are invisible — that was
+		// the root cause of Q2/Q3/Q5/Q7/Q10/Q11/Q18/Q21
+		// reporting "No scan nodes" in the M0054-0002 baseline.
+		out := make([]planner.Node, len(p.Tables))
+		copy(out, p.Tables)
+		return out
+	case *planner.NestedLoopIndexJoin:
+		// M0054-0006: render outer driver and inner index probe.
+		return []planner.Node{p.Outer, p.Inner}
 	}
 	return nil
 }

@@ -24,7 +24,7 @@ func TestRunCopyToTableDefaultColumns(t *testing.T) {
 		Endpoint:    planner.CopyEndpointStdout,
 	}
 	var lines []string
-	count, err := RunCopyTo(ctx, plan, func(b []byte) error {
+	count, _, err := RunCopyTo(ctx, plan, func(b []byte) error {
 		lines = append(lines, string(b))
 		return nil
 	})
@@ -61,7 +61,7 @@ func TestRunCopyToTableProjectionAndReorder(t *testing.T) {
 		Endpoint:    planner.CopyEndpointStdout,
 	}
 	var got []string
-	if _, err := RunCopyTo(ctx, plan, func(b []byte) error {
+	if _, _, err := RunCopyTo(ctx, plan, func(b []byte) error {
 		got = append(got, string(b))
 		return nil
 	}); err != nil {
@@ -93,7 +93,7 @@ func TestRunCopyToQueryForm(t *testing.T) {
 		t.Fatalf("planner returned %T, want *planner.Copy", node)
 	}
 	var lines []string
-	count, err := RunCopyTo(ctx, plan, func(b []byte) error {
+	count, _, err := RunCopyTo(ctx, plan, func(b []byte) error {
 		lines = append(lines, string(b))
 		return nil
 	})
@@ -140,7 +140,7 @@ func TestCopyFromExecutorRoundTrip(t *testing.T) {
 		Endpoint:    planner.CopyEndpointStdout,
 	}
 	var out []string
-	if _, err := RunCopyTo(ctx, toPlan, func(b []byte) error {
+	if _, _, err := RunCopyTo(ctx, toPlan, func(b []byte) error {
 		out = append(out, string(b))
 		return nil
 	}); err != nil {
@@ -195,7 +195,7 @@ func TestRunCopyToFileEndpointRejected(t *testing.T) {
 			ColumnIndex: []int{0, 1},
 			Endpoint:    ep,
 		}
-		_, err := RunCopyTo(ctx, plan, func([]byte) error { return nil })
+		_, _, err := RunCopyTo(ctx, plan, func([]byte) error { return nil })
 		if err == nil {
 			t.Errorf("ep=%v: expected error", ep)
 			continue

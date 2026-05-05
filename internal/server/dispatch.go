@@ -1,8 +1,8 @@
 package server
 
 import (
+	"context"
 	"fmt"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -15,6 +15,13 @@ import (
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
+
+// maybeForceGCAfterCommit was introduced by M0032-0006 to bound RSS
+// growth after commits. M0032-0005 throttled it to every 64 commits.
+// Removed entirely: GOMEMLIMIT provides the RSS ceiling without
+// forced stop-the-world pauses, and the throttled GC still appeared
+// as 91 % GC overhead in run-005's Q9 profile on 1.8 M-row data.
+func maybeForceGCAfterCommit() {}
 
 // dispatchSimpleQueryViaExecutor is the parser-driven path for the
 // simple-query protocol: it parses the SQL, plans each statement,
@@ -30,16 +37,33 @@ import (
 //
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
-func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
+func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
+		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
+		// here (the parser doesn't recognise them yet) so we can
+		// (a) update the catalog so subsequent connections see the
+		// database in pg_database / can connect to it, and (b) emit a
+		// WAL record so the registration survives a crash. Other
+		// commands fall through to the wire-protocol no-op tag handler.
+		if handled, herr := s.tryHandleDatabaseDDL(sql); handled {
+			if herr != nil {
+				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
+			}
+			tag := databaseDDLCommandTag(sql)
+			if err := w.WriteCommandComplete(tag); err != nil {
+				return err
+			}
+			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		}
 		if tag, ok := compatNoopCommandTag(sql); ok {
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
-		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+		msg, extra := syntaxErrorMsg(err)
+		return s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...)
 	}
 	if len(stmts) == 0 {
 		if err := w.WriteEmptyQueryResponse(); err != nil {
@@ -74,18 +98,23 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
-	ctx := executor.NewContext()
-	ctx.Pool = s.cfg.Pool
-	ctx.Catalog = s.cfg.Catalog
-	ctx.TxnMgr = s.cfg.TxnMgr
-	ctx.Tx = tx
-	ctx.Snap = snap
-	ctx.Checkpointer = s.cfg.Checkpointer
-	ctx.StatsTarget = sessionStatsTarget(sess)
-	ctx.WorkMem = sessionWorkMem(sess)
-	ctx.PubSub = s.cfg.PubSub
-	ctx.LockMgr = s.cfg.LockMgr
-	ctx.BackendID = backendID
+	ectx := executor.NewContext()
+	ectx.Ctx = ctx
+	ectx.Pool = s.cfg.Pool
+	ectx.Catalog = s.cfg.Catalog
+	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.Tx = tx
+	ectx.Snap = snap
+	ectx.Checkpointer = s.cfg.Checkpointer
+	ectx.StatsTarget = sessionStatsTarget(sess)
+	ectx.WorkMem = sessionWorkMem(sess)
+	ectx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
+	ectx.FSM = s.cfg.FSM
+	ectx.VM = s.cfg.VM
+	ectx.FreezeMinAge = sessionFreezeMinAge(sess)
+	ectx.PubSub = s.cfg.PubSub
+	ectx.LockMgr = s.cfg.LockMgr
+	ectx.BackendID = backendID
 
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {
@@ -104,9 +133,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 		if err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
-		ctx.Snap = snap2
+		ectx.Snap = snap2
 
-		if err := s.executeOneSimpleStmt(w, ctx, stmt); err != nil {
+		if err := s.executeOneSimpleStmt(w, ectx, stmt); err != nil {
 			return err
 		}
 	}
@@ -120,7 +149,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(w *protocol.FrameWriter, sess *c
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
 	commit = true
-	runtime.GC()
+	maybeForceGCAfterCommit()
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
@@ -146,6 +175,37 @@ func sessionStatsTarget(sess *config.SessionRegistry) int {
 // sessionWorkMem reads the effective `work_mem` GUC from the session
 // registry and returns it as bytes. Returns 0 (unlimited) when sess
 // is nil or the value can't be parsed.
+// sessionOpportunisticPrune reads the enable_opportunistic_prune GUC
+// (M0046-0002). Returns true (enabled) when sess is nil or the GUC value
+// can't be parsed, matching the BootVal "on" default.
+// sessionFreezeMinAge reads vacuum_freeze_min_age (M0046-0005).
+// Returns 50_000_000 (50M XIDs) when sess is nil or the GUC is missing.
+func sessionFreezeMinAge(sess *config.SessionRegistry) int64 {
+	if sess == nil {
+		return 50_000_000
+	}
+	_, eff, ok := sess.Get("vacuum_freeze_min_age")
+	if !ok {
+		return 50_000_000
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || v < 0 {
+		return 50_000_000
+	}
+	return v
+}
+
+func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
+	if sess == nil {
+		return true // default on
+	}
+	_, eff, ok := sess.Get("enable_opportunistic_prune")
+	if !ok {
+		return true // GUC not registered yet, default on
+	}
+	return strings.EqualFold(strings.TrimSpace(eff), "on")
+}
+
 func sessionWorkMem(sess *config.SessionRegistry) int64 {
 	if sess == nil {
 		return 0
@@ -324,6 +384,12 @@ func transactionTag(v planner.TransactionVerb) string {
 	case planner.TxCommit:
 		return "COMMIT"
 	case planner.TxRollback:
+		return "ROLLBACK"
+	case planner.TxSavepoint:
+		return "SAVEPOINT"
+	case planner.TxRelease:
+		return "RELEASE"
+	case planner.TxRollbackTo:
 		return "ROLLBACK"
 	}
 	return "OK"

@@ -3,7 +3,10 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"math/big"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -11,6 +14,11 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// pgEpoch is the PostgreSQL epoch: 2000-01-01 00:00:00 UTC.
+// Timestamps stored as KindTime datums are converted to microseconds
+// relative to this epoch for B-tree key encoding.
+var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
 // ddlOp is a one-shot operator that runs a DDL statement against the
 // catalog and (when applicable) the storage manager. It produces no
@@ -221,8 +229,27 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			NotNull: c.NotNull,
 		}
 	}
-	if _, err := o.ctx.Catalog.CreateTable(s.Name, cols); err != nil {
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// M0054-0010: tag known small dimension tables (canonical
+	// TPC-H tiny tables: region 5 rows, nation 25 rows). The flag
+	// lets the planner pin the small side as the hash-join build
+	// side regardless of stats availability.
+	switch strings.ToLower(s.Name.Name) {
+	case "region", "nation":
+		tbl.SmallDimension = true
+	}
+	// Record for rollback before heap sync — if heap sync fails the catalog
+	// entry is already live and must be cleaned up on ROLLBACK.
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
 	}
 	return nil
 }
@@ -483,19 +510,164 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-	tree, err := btree.Create(o.ctx.Pool, idxRel)
-	if err != nil {
-		_ = o.ctx.Catalog.DropIndex(idxName)
-		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
-		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
-	}
-	if err := o.backfillBTree(tree, tbl, cols, unique, idxName.String(), pos); err != nil {
+	if err := o.bulkBuildBTree(idxRel, tbl, cols, unique, idxName.String(), pos); err != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
 		return err
 	}
+	// Record for rollback before heap sync (index is live in catalog now).
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
 	return nil
+}
+
+// bulkBuildBTree collects all heap entries into memory, then calls
+// btree.BulkCreate for a sort-then-build pass (M0047-0001). This replaces
+// the old Create+backfillBTree flow and is significantly faster for large
+// tables because it avoids per-key tree traversals and page splits.
+func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
+	entries, err := o.collectBTreeEntries(tbl, cols, unique, indexName, pos)
+	if err != nil {
+		return err
+	}
+	_, err = btree.BulkCreate(o.ctx.Pool, idxRel, entries)
+	if err != nil {
+		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	return nil
+}
+
+// collectBTreeEntries scans the heap, decodes visible tuples, encodes
+// B-tree keys, enforces uniqueness, and returns the entries for bulk build.
+func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) ([]btree.BulkEntry, error) {
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	var entries []btree.BulkEntry
+	var scanRow Row                                  // M0054-0005c: reusable decode buffer (see comment below).
+	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
+	// M0055-0006 Phase E: removed the `seen map[string]struct{}`
+	// for the unique-key check. The bulk build sorts entries by
+	// key before insertion, so a sorted-stream adjacency walk
+	// after the sort detects duplicates without table-scale
+	// hash state. The check is performed after `sort.SliceStable`
+	// in `btree.BulkBuild`-equivalent path; here, post-collection.
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
+		page := slot.Page()
+		if storage.IsNew(page) {
+			o.ctx.Pool.Unpin(slot)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			o.ctx.Pool.Unpin(slot)
+			return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
+		for i := uint16(1); i <= uint16(count); i++ {
+			tuple, err := storage.PageGetHeapTuple(page, i)
+			if err != nil {
+				continue
+			}
+			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to
+			// avoid the per-row `make(Row, len(tbl.Columns))` that
+			// the M0054-0004 idx-window pprof showed at 39 % cum.
+			// True column projection is not feasible here because
+			// the on-disk row encoding is variable-length, so each
+			// column must be decoded sequentially to determine the
+			// next one's offset; the win is the slice-allocation
+			// removal, not the per-column work.
+			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
+				scanRow = make(Row, len(tbl.Columns))
+			}
+			// M0054-0005c-followup: skip per-column heap
+			// allocations for columns the index doesn't reference.
+			// Other columns must still be size-scanned to advance
+			// the offset (variable-length codec) but their string/
+			// numeric payloads are not materialised.
+			if err := DecodeRowProjection(scanRow, tbl.Columns, tuple.Data, keep); err != nil {
+				continue
+			}
+			row := scanRow
+			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
+			if encErr != nil {
+				o.ctx.Pool.Unpin(slot)
+				return nil, encErr
+			}
+			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
+		}
+		o.ctx.Pool.Unpin(slot)
+	}
+	// M0055-0006 Phase E: sorted-stream uniqueness check. The
+	// pre-existing seen map was O(N) memory; the post-sort
+	// adjacency walk is O(1) auxiliary space. BulkBuild sorts
+	// the entries by key before inserting, so we sort here
+	// (matching its convention) and walk adjacencies for the
+	// unique check.
+	if unique && len(entries) > 1 {
+		sortBulkEntriesByKey(entries)
+		for i := 1; i < len(entries); i++ {
+			if bytesEqual(entries[i].Key, entries[i-1].Key) {
+				return nil, &ExecError{Code: "23505", Pos: pos,
+					Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
+			}
+		}
+	}
+	return entries, nil
+}
+
+// sortBulkEntriesByKey (M0055-0006 Phase E) sorts in place by
+// byte-wise key order, the same order BulkBuild expects.
+func sortBulkEntriesByKey(entries []btree.BulkEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		return string(entries[i].Key) < string(entries[j].Key)
+	})
+}
+
+// bytesEqual is a small no-allocation byte slice equality check.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// buildKeepMaskForIndex returns a per-column boolean mask whose
+// `i`-th entry is true iff `tableCols[i]` is referenced by `indexCols`.
+// Used by `DecodeRowProjection` to skip per-column heap allocations
+// for columns the index does not need. (M0054-0005c-followup.)
+func buildKeepMaskForIndex(tableCols []catalog.Column, indexCols []*catalog.Column) []bool {
+	want := make(map[string]struct{}, len(indexCols))
+	for _, ic := range indexCols {
+		want[ic.Name] = struct{}{}
+	}
+	keep := make([]bool, len(tableCols))
+	for i := range tableCols {
+		if _, ok := want[tableCols[i].Name]; ok {
+			keep[i] = true
+		}
+	}
+	return keep
 }
 
 func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
@@ -505,6 +677,8 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	seen := map[string]struct{}{}
+	var scanRow Row                                  // M0054-0005c: reusable decode buffer.
+	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -531,10 +705,15 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
-			row, err := DecodeRow(tbl.Columns, tuple.Data)
-			if err != nil {
+			// M0054-0005c: reuse the decode buffer.
+			// M0054-0005c-followup: skip non-index column payloads.
+			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
+				scanRow = make(Row, len(tbl.Columns))
+			}
+			if err := DecodeRowProjection(scanRow, tbl.Columns, tuple.Data, keep); err != nil {
 				continue
 			}
+			row := scanRow
 			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
@@ -611,11 +790,27 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 	case isNumericType(col.Type.Name):
 		switch v.Kind {
 		case KindNumeric:
-			return btree.EncodeNumericKey(v.NumericMantissa, v.NumericScale), nil
+			return btree.EncodeNumericKey(numericMant(v), v.NumericScale), nil
 		case KindInt:
-			return btree.EncodeNumericKey(v.Int, 0), nil
+			return btree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
 		}
 		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
+	case isVarcharType(col.Type.Name):
+		if v.Kind != KindString {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
+		}
+		return btree.EncodeVarchar([]byte(v.String)), nil
+	case isCharType(col.Type.Name):
+		if v.Kind != KindString {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
+		}
+		return btree.EncodeChar([]byte(v.String)), nil
+	case isTimestampType(col.Type.Name):
+		if v.Kind != KindTime {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
+		}
+		micros := v.Time.Sub(pgEpoch).Microseconds()
+		return btree.EncodeTimestamp(micros), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
@@ -658,11 +853,46 @@ func isNumericType(name string) bool {
 	}
 }
 
+// isVarcharType returns true for the variable-length character types
+// accepted by M0044-0001 B-tree key encoding.
+func isVarcharType(name string) bool {
+	switch strings.ToLower(name) {
+	case "varchar", "character varying":
+		return true
+	default:
+		return false
+	}
+}
+
+// isCharType returns true for the fixed-length blank-padded character
+// types accepted by M0044-0002 B-tree key encoding.
+func isCharType(name string) bool {
+	switch strings.ToLower(name) {
+	case "char", "character", "bpchar":
+		return true
+	default:
+		return false
+	}
+}
+
+// isTimestampType returns true for timestamp (without time zone) types
+// accepted by M0044-0003 B-tree key encoding.
+func isTimestampType(name string) bool {
+	switch strings.ToLower(name) {
+	case "timestamp", "timestamp without time zone":
+		return true
+	default:
+		return false
+	}
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
-// and numeric landed for HammerDB TPC-H compatibility.
+// and numeric landed for HammerDB TPC-H compatibility. varchar landed
+// in M0044-0001; char in M0044-0002; timestamp in M0044-0003.
 func isSupportedBTreeKeyType(name string) bool {
-	return isInt4Type(name) || isInt8Type(name) || isNumericType(name)
+	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
+		isVarcharType(name) || isCharType(name) || isTimestampType(name)
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
@@ -867,4 +1097,163 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		return &ExecError{Code: "42725", Pos: s.Pos(), Message: err.Error()}
 	}
 	return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+}
+
+// --- DDL catalog heap sync (M0030-0001 Phase 4) ---
+
+// stampCatalogRows pins every page of rel and sets xmax on each live tuple
+// (xmin≠0, xmax=0) for which match returns true. Used by
+// deleteCatalogRowsForOID to physically mark rolled-back catalog rows as
+// deleted so the startup scan in loadUserTablesFromHeap skips them.
+func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.TransactionID, match func(data []byte) bool) {
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil || nBlocks == 0 {
+		return
+	}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			continue
+		}
+		pinned.Lock()
+		page := pinned.Page()
+		count, err := storage.PageLinePointerCount(page)
+		if err == nil {
+			for lineNo := uint16(1); lineNo <= uint16(count); lineNo++ {
+				ht, err := storage.PageGetHeapTuple(page, lineNo)
+				if err != nil {
+					continue
+				}
+				if ht.Header.Xmin == storage.InvalidTransactionID {
+					continue
+				}
+				if ht.Header.Xmax != storage.InvalidTransactionID {
+					continue
+				}
+				if !match(ht.Data) {
+					continue
+				}
+				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
+					continue
+				}
+				_ = markHeapDeleteDirty(ctx.Pool, pinned, rel, blk, lineNo, xmax)
+			}
+		}
+		pinned.Unlock()
+		ctx.Pool.Unpin(pinned)
+	}
+}
+
+// deleteCatalogRowsForOID stamps xmax on all live pg_class and pg_attribute
+// rows for relOID. Called from rollbackDDLCreate so that after a crash+restart
+// the startup catalog loader's xmax==0 filter skips the rolled-back rows.
+func deleteCatalogRowsForOID(ctx *Context, relOID uint32, xmax storage.TransactionID) {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
+		row, err := catalog.DecodePGClassRow(data)
+		return err == nil && row.OID == relOID
+	})
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
+		row, err := catalog.DecodePGAttributeRow(data)
+		return err == nil && row.AttRelID == relOID
+	})
+}
+
+// catalogHeapSyncAvailable returns true when the M0030-0001 system catalog
+// heap relfiles are accessible and DDL operations should write rows to
+// pg_class / pg_attribute. The proxy indicator is whether pg_attribute is
+// registered as a real (non-virtual) table — that is set by
+// loadSystemCatalogsIfPresent in initdb.Open when the relfiles are present.
+func catalogHeapSyncAvailable(ctx *Context) bool {
+	if ctx == nil || ctx.Pool == nil {
+		return false
+	}
+	pgAttr, ok := ctx.Catalog.LookupTable(
+		parser.ObjectName{Schema: "pg_catalog", Name: "pg_attribute"})
+	return ok && !pgAttr.Virtual
+}
+
+// namespaceOIDForSchema maps a schema name to its pg_catalog namespace OID.
+func namespaceOIDForSchema(schema string) uint32 {
+	if schema == "" || schema == "public" {
+		return catalog.PublicNamespaceOID
+	}
+	return catalog.PGCatalogNamespaceOID
+}
+
+// syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
+// column for tbl. Called by execCreateTable after in-memory catalog is updated.
+func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classRow := Row{
+		{Kind: KindInt, Int: int64(tbl.OID)},
+		{Kind: KindString, String: tbl.Name},
+		{Kind: KindInt, Int: int64(namespaceOIDForSchema(tbl.Schema))},
+		{Kind: KindString, String: "r"},
+		{Kind: KindInt, Int: int64(len(tbl.Columns))},
+		{Kind: KindInt, Int: int64(tbl.OID)},
+		{Kind: KindString, String: "p"},
+		{Kind: KindBool, Bool: false},
+	}
+	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+		return fmt.Errorf("pg_class: %w", err)
+	}
+
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	for _, col := range tbl.Columns {
+		typOID := catalog.TypeNameToOID(col.Type.Name)
+		attrRow := Row{
+			{Kind: KindInt, Int: int64(tbl.OID)},
+			{Kind: KindString, String: col.Name},
+			{Kind: KindInt, Int: int64(typOID)},
+			{Kind: KindInt, Int: int64(col.Ordinal + 1)},
+			{Kind: KindBool, Bool: col.NotNull},
+			{Kind: KindBool, Bool: false},
+		}
+		if err := writeHeapRow(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
+			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
+		}
+	}
+	return nil
+}
+
+// syncIndexToCatalogHeap writes a pg_class row for idx. Called by
+// createBTreeIndex after the full index build succeeds.
+func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classRow := Row{
+		{Kind: KindInt, Int: int64(idx.OID)},
+		{Kind: KindString, String: idx.Name},
+		{Kind: KindInt, Int: int64(namespaceOIDForSchema(idx.Schema))},
+		{Kind: KindString, String: "i"},
+		{Kind: KindInt, Int: 0},
+		{Kind: KindInt, Int: int64(idx.OID)},
+		{Kind: KindString, String: "p"},
+		{Kind: KindBool, Bool: false},
+	}
+	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+		return fmt.Errorf("pg_class for index: %w", err)
+	}
+	return nil
 }

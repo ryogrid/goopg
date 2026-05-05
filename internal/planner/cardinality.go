@@ -87,6 +87,31 @@ func tableRows(tbl *catalog.Table) int64 {
 	return tbl.Stats.RowCount
 }
 
+// IsSmallDimensionSide (M0054-0010) returns true when the plan
+// node `n` reads from a `SmallDimension`-flagged catalog table
+// (or is trivially derived from one — Filter, Project, Sort
+// over such a scan). Used by the join build-side selector to
+// pin tiny dim-tables (region, nation) on the build side
+// regardless of stats availability.
+func IsSmallDimensionSide(n Node) bool {
+	if n == nil {
+		return false
+	}
+	switch x := n.(type) {
+	case *SeqScan:
+		return x.Table != nil && x.Table.SmallDimension
+	case *IndexScan:
+		return x.Table != nil && x.Table.SmallDimension
+	case *Filter:
+		return IsSmallDimensionSide(x.Child)
+	case *Project:
+		return IsSmallDimensionSide(x.Child)
+	case *Sort:
+		return IsSmallDimensionSide(x.Child)
+	}
+	return false
+}
+
 // estimateJoin uses the upstream-aligned formula
 // `|L| * |R| / max(NDistinct(L.k), NDistinct(R.k))` for
 // specialised equality joins (hash / merge) with disjoint-side

@@ -1,11 +1,13 @@
 package auth
 
 import (
+	"bufio"
 	"crypto/md5"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 )
@@ -175,6 +177,64 @@ func (m *MapUserStore) Lookup(user string) (Credential, bool) {
 	defer m.mu.RUnlock()
 	c, ok := m.users[user]
 	return c, ok
+}
+
+// LoadUsersFile reads a pg_auth-style credential file and returns a
+// populated MapUserStore. Each non-blank, non-comment line has the form:
+//
+//	username:secret
+//
+// where secret is one of:
+//   - a plaintext password (no prefix)
+//   - "md5<32 hex chars>" (pre-shadowed MD5 verifier)
+//   - "SCRAM-SHA-256$…" (upstream SCRAM verifier string)
+//
+// Lines beginning with '#' are comments and are silently skipped.
+// Returns an error if the file cannot be read or a line is malformed.
+func LoadUsersFile(path string) (*MapUserStore, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	store := NewMapUserStore()
+	scanner := bufio.NewScanner(f)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.IndexByte(line, ':')
+		if idx < 1 {
+			return nil, fmt.Errorf("pg_auth line %d: expected 'username:secret' format", lineNo)
+		}
+		username := line[:idx]
+		secret := line[idx+1:]
+		var cred Credential
+		switch {
+		case strings.HasPrefix(secret, "SCRAM-SHA-256$"):
+			if _, err := ParseSCRAMSecret(secret); err != nil {
+				return nil, fmt.Errorf("pg_auth line %d: invalid SCRAM secret: %w", lineNo, err)
+			}
+			cred = Credential{Type: PasswordSCRAMSHA256, Secret: secret}
+		case strings.HasPrefix(secret, "md5") && len(secret) == 35:
+			if c, err := ParseMD5Stored(secret); err != nil {
+				return nil, fmt.Errorf("pg_auth line %d: invalid MD5 secret: %w", lineNo, err)
+			} else {
+				cred = c
+			}
+		default:
+			cred = NewPlaintextCredential(secret)
+		}
+		store.Set(username, cred)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("pg_auth: %w", err)
+	}
+	return store, nil
 }
 
 // ErrInvalidPassword is returned when password / md5 verification fails.

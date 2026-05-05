@@ -88,6 +88,21 @@ When porting any concept, cite the upstream file path (e.g.
 `postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
 and/or code comment. Never modify, vendor, or import code from `./postgres/`.
 
+## Design reference policy
+
+When evaluating or creating a design, treat the PostgreSQL implementation under
+`./postgres/` as the oracle reference first. Mirror upstream behavior and
+semantics where feasible, then adapt the design for `goopg`'s runtime model.
+
+While using PostgreSQL as the oracle, always account for:
+
+- Programming-language differences between C and Go (memory management,
+  ownership/lifetimes, error handling style, and standard library/runtime
+  behavior).
+- Execution-model differences between PostgreSQL's multi-process architecture
+  and `goopg`'s multi-threaded (goroutine-based) architecture, including
+  synchronization, isolation boundaries, and failure-propagation behavior.
+
 ## LSP
 
 `gopls` is the recommended LSP for navigating `goopg`'s own code. Use it for
@@ -127,3 +142,4 @@ and/or code comment. Never modify, vendor, or import code from `./postgres/`.
   origin is chosen later).
 - Reported `server_version` is tracked in design doc `root-0001-architecture-overview.md`
   so client gating (`pgx`, JDBC, `psql`) behaves predictably.
+

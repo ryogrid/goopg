@@ -83,6 +83,71 @@ const (
 	// "kind(1) | rel(9) | blk(4) | lineSlot(2) | xmax(4) |
 	//  lockStrength(2)" = 22 bytes.
 	RecordKindHeapLock byte = 10
+	// RecordKindHeapHotUpdate is a logical HOT-update record (M0046-0001).
+	// Encodes the old-slot xmax stamp + HeapHotUpdated infomask + CTID
+	// chain linkage + the new tuple bytes (which carry HeapOnlyTuple in
+	// their infomask) — all on the same heap page. Replay inserts the
+	// new tuple (obtaining newSlot), then stamps the old slot.
+	// Format: "kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
+	//          oldSlot(2) | xmax(4) | newTupleBytes(var)" = 20 bytes fixed.
+	RecordKindHeapHotUpdate byte = 13
+	// RecordKindHeapPruneOpt is a logical opportunistic-pruning record
+	// (M0046-0002). Mirrors PostgreSQL's XLOG_HEAP2_PRUNE. Emitted when
+	// the HOT-update path reclaims dead tuple slots inline (without a
+	// full VACUUM pass). Same format as RecordKindHeapVacuum so the
+	// replay path is identical. Format:
+	// "kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
+	//  count(2) | slots[count](2 each)" = 16 + 2*count bytes.
+	RecordKindHeapPruneOpt byte = 14
+	// RecordKindSmgrCreate logs the first extension of a relation file
+	// (mirrors upstream's XLOG_SMGR_CREATE in
+	// postgres/src/include/catalog/storage_xlog.h). Emitted by the buffer
+	// pool when Pool.PinNew creates block 0 of a new relation. Redo:
+	// ensure the relfile exists with at least one initialised block.
+	// Format: "kind(1) | DBOid(4) | RelOid(4) | Fork(1)" = 10 bytes.
+	RecordKindSmgrCreate byte = 11
+	// RecordKindSmgrTruncate logs a relation-file truncation (mirrors
+	// upstream's XLOG_SMGR_TRUNCATE). Emitted by TRUNCATE TABLE. Redo:
+	// truncate the relfile to 0 blocks. Same format as SmgrCreate.
+	RecordKindSmgrTruncate byte = 12
+
+	// RecordKindXactAssignment records the first lazy XID allocation
+	// for one or more subtransactions (M0050-0003). Emitted when a
+	// subxact writes for the first time; replay populates the
+	// subxact-to-parent map in mvcc.Manager. Format:
+	//   kind(1) | parentXid(4) | count(2) | subXids[count](4 each)
+	RecordKindXactAssignment byte = 15
+
+	// RecordKindXactRollbackTo records ROLLBACK TO SAVEPOINT (M0050-0003).
+	// Replay marks each listed subXid as individually aborted in
+	// mvcc.Manager. Format:
+	//   kind(1) | parentXid(4) | count(2) | abortedSubXids[count](4 each)
+	RecordKindXactRollbackTo byte = 16
+
+	// RecordKindXactSubAbort records a single subxact abort triggered
+	// without a named savepoint (M0050-0003). Format:
+	//   kind(1) | subXid(4) = 5 bytes total.
+	RecordKindXactSubAbort byte = 17
+
+	// RecordKindCreateDatabase records a `CREATE DATABASE <name>` event
+	// so the catalog's per-instance database list can be reconstructed
+	// after a crash (M0054-0001). The redo path does NOT touch on-disk
+	// storage — goopg v0 has no per-database file namespacing — so
+	// applyRecord returns (false, nil); the recovery driver in
+	// internal/initdb scans the WAL for these records after physical
+	// replay and re-registers each database name in the catalog.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindCreateDatabase byte = 18
+
+	// RecordKindDropDatabase records a `DROP DATABASE <name>` event.
+	// Counterpart to RecordKindCreateDatabase. Same format / replay
+	// semantics; the recovery driver removes the name from the
+	// catalog instead of adding it.
+	RecordKindDropDatabase byte = 19
+
+	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
+	smgrRecordSize = 10
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
@@ -106,7 +171,160 @@ const (
 	// heapLockSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1)
 	// + Block(4) + LineSlot(2) + Xmax(4) + LockStrength(2) = 22.
 	heapLockSize = 22
+	// heapHotUpdateHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + Block(4) + OldSlot(2) + Xmax(4) = 20. Variable
+	// new-tuple bytes follow.
+	heapHotUpdateHeaderSize = 20
 )
+
+// EncodeCreateDatabase encodes a CREATE DATABASE event (M0054-0001).
+// Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeCreateDatabase(name string) []byte {
+	if len(name) > 0xFFFF {
+		// goopg's identifier length cap is far below 64 KiB; truncating
+		// here is defensive — this branch is unreachable under normal
+		// CREATE DATABASE syntax.
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindCreateDatabase
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeCreateDatabase decodes a RecordKindCreateDatabase payload.
+func DecodeCreateDatabase(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: create-database payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateDatabase {
+		return "", fmt.Errorf("wal: record kind %d is not create-database", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: create-database payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeDropDatabase encodes a DROP DATABASE event (M0054-0001).
+// Format identical to EncodeCreateDatabase.
+func EncodeDropDatabase(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropDatabase
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropDatabase decodes a RecordKindDropDatabase payload.
+func DecodeDropDatabase(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-database payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropDatabase {
+		return "", fmt.Errorf("wal: record kind %d is not drop-database", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-database payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeXactAssignment encodes a subxact XID assignment record (M0050-0003).
+// parentXid is the top-level transaction; subXids lists the subxact XIDs
+// that are now children of parentXid. Replay calls Manager.RegisterSubXid
+// for each entry. Format: kind(1) | parentXid(4) | count(2) | subXids[].
+func EncodeXactAssignment(parentXid storage.TransactionID, subXids []storage.TransactionID) []byte {
+	out := make([]byte, 7+4*len(subXids))
+	out[0] = RecordKindXactAssignment
+	binary.LittleEndian.PutUint32(out[1:5], uint32(parentXid))
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(subXids)))
+	for i, s := range subXids {
+		binary.LittleEndian.PutUint32(out[7+4*i:], uint32(s))
+	}
+	return out
+}
+
+// DecodeXactAssignment decodes a RecordKindXactAssignment payload.
+func DecodeXactAssignment(payload []byte) (parentXid storage.TransactionID, subXids []storage.TransactionID, err error) {
+	if len(payload) < 7 {
+		return 0, nil, fmt.Errorf("wal: xact-assignment payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindXactAssignment {
+		return 0, nil, fmt.Errorf("wal: record kind %d is not xact-assignment", payload[0])
+	}
+	parentXid = storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5]))
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+4*count {
+		return 0, nil, fmt.Errorf("wal: xact-assignment payload truncated (need %d bytes)", 7+4*count)
+	}
+	subXids = make([]storage.TransactionID, count)
+	for i := range subXids {
+		subXids[i] = storage.TransactionID(binary.LittleEndian.Uint32(payload[7+4*i:]))
+	}
+	return parentXid, subXids, nil
+}
+
+// EncodeXactRollbackTo encodes a ROLLBACK TO SAVEPOINT record (M0050-0003).
+// parentXid is the top-level transaction; abortedSubXids lists the subxact
+// XIDs that were individually rolled back. Replay calls Manager.MarkSubxactAborted
+// for each. Format: kind(1) | parentXid(4) | count(2) | abortedSubXids[].
+func EncodeXactRollbackTo(parentXid storage.TransactionID, abortedSubXids []storage.TransactionID) []byte {
+	out := make([]byte, 7+4*len(abortedSubXids))
+	out[0] = RecordKindXactRollbackTo
+	binary.LittleEndian.PutUint32(out[1:5], uint32(parentXid))
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(abortedSubXids)))
+	for i, s := range abortedSubXids {
+		binary.LittleEndian.PutUint32(out[7+4*i:], uint32(s))
+	}
+	return out
+}
+
+// DecodeXactRollbackTo decodes a RecordKindXactRollbackTo payload.
+func DecodeXactRollbackTo(payload []byte) (parentXid storage.TransactionID, abortedSubXids []storage.TransactionID, err error) {
+	if len(payload) < 7 {
+		return 0, nil, fmt.Errorf("wal: xact-rollback-to payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindXactRollbackTo {
+		return 0, nil, fmt.Errorf("wal: record kind %d is not xact-rollback-to", payload[0])
+	}
+	parentXid = storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5]))
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+4*count {
+		return 0, nil, fmt.Errorf("wal: xact-rollback-to payload truncated (need %d bytes)", 7+4*count)
+	}
+	abortedSubXids = make([]storage.TransactionID, count)
+	for i := range abortedSubXids {
+		abortedSubXids[i] = storage.TransactionID(binary.LittleEndian.Uint32(payload[7+4*i:]))
+	}
+	return parentXid, abortedSubXids, nil
+}
+
+// EncodeXactSubAbort encodes a single subxact abort record (M0050-0003).
+// Replay calls Manager.MarkSubxactAborted(subXid). Format: kind(1)|subXid(4).
+func EncodeXactSubAbort(subXid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindXactSubAbort
+	binary.LittleEndian.PutUint32(out[1:5], uint32(subXid))
+	return out
+}
+
+// DecodeXactSubAbort decodes a RecordKindXactSubAbort payload.
+func DecodeXactSubAbort(payload []byte) (subXid storage.TransactionID, err error) {
+	if len(payload) != xactRecordSize {
+		return 0, fmt.Errorf("wal: xact-subabort payload len %d (want %d)", len(payload), xactRecordSize)
+	}
+	if payload[0] != RecordKindXactSubAbort {
+		return 0, fmt.Errorf("wal: record kind %d is not xact-subabort", payload[0])
+	}
+	return storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5])), nil
+}
 
 // EncodeXactCommit encodes a logical-decoding commit marker for
 // xid. Crash recovery skips this kind; only the M0008 logical
@@ -282,6 +500,181 @@ func DecodeHeapLock(payload []byte) (rel storage.RelFileNode, blk storage.BlockN
 	return
 }
 
+// EncodeHeapHotUpdate encodes one atomic HOT-update redo record
+// (M0046-0001). The record captures the old-slot xmax stamp and the
+// new tuple bytes (which carry HeapOnlyTuple in their infomask) — both
+// on the same heap page. Replay inserts the new tuple (getting
+// newSlot), then stamps the old slot via PageStampHotOldTuple.
+func EncodeHeapHotUpdate(rel storage.RelFileNode, blk storage.BlockNumber, oldSlot uint16, xmax storage.TransactionID, tupleBytes []byte) []byte {
+	out := make([]byte, heapHotUpdateHeaderSize+len(tupleBytes))
+	out[0] = RecordKindHeapHotUpdate
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], oldSlot)
+	binary.LittleEndian.PutUint32(out[16:20], uint32(xmax))
+	copy(out[heapHotUpdateHeaderSize:], tupleBytes)
+	return out
+}
+
+// DecodeHeapHotUpdate decodes a HeapHotUpdate record payload.
+func DecodeHeapHotUpdate(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, oldSlot uint16, xmax storage.TransactionID, tupleBytes []byte, err error) {
+	if len(payload) < heapHotUpdateHeaderSize {
+		err = fmt.Errorf("wal: invalid heap-hot-update payload len %d (want >= %d)", len(payload), heapHotUpdateHeaderSize)
+		return
+	}
+	if payload[0] != RecordKindHeapHotUpdate {
+		err = fmt.Errorf("wal: record kind %d is not heap-hot-update", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	oldSlot = binary.LittleEndian.Uint16(payload[14:16])
+	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
+	tupleBytes = make([]byte, len(payload)-heapHotUpdateHeaderSize)
+	copy(tupleBytes, payload[heapHotUpdateHeaderSize:])
+	return
+}
+
+// heapPruneOptHdrSize: kind(1) + rel(9) + blk(4) + nRedirects(2) + nUnused(2) = 18.
+const heapPruneOptHdrSize = 18
+
+// EncodeHeapPruneOpt encodes one opportunistic page-pruning redo record
+// (M0046-0002, mirrors PostgreSQL's XLOG_HEAP2_PRUNE). Carries two lists:
+//   - redirects: (oldSlot, newSlot) pairs for HOT chain root slots that were
+//     converted to ItemIDRedirect so the index entry stays valid.
+//   - unused: slot numbers marked ItemIDUnused (HOT-only and standalone dead).
+//
+// Format:
+//   kind(1) | rel(9) | blk(4) | nRedirects(2) | nUnused(2) |
+//   redirects[nRedirects*4] | unusedSlots[nUnused*2]
+func EncodeHeapPruneOpt(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) []byte {
+	sz := heapPruneOptHdrSize + 4*len(redirects) + 2*len(unused)
+	out := make([]byte, sz)
+	out[0] = RecordKindHeapPruneOpt
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], uint16(len(redirects)))
+	binary.LittleEndian.PutUint16(out[16:18], uint16(len(unused)))
+	off := heapPruneOptHdrSize
+	for _, r := range redirects {
+		binary.LittleEndian.PutUint16(out[off:off+2], r[0])
+		binary.LittleEndian.PutUint16(out[off+2:off+4], r[1])
+		off += 4
+	}
+	for _, s := range unused {
+		binary.LittleEndian.PutUint16(out[off:off+2], s)
+		off += 2
+	}
+	return out
+}
+
+// DecodeHeapPruneOpt returns the rel + block + redirect pairs + unused slots
+// carried by a HeapPruneOpt record payload.
+func DecodeHeapPruneOpt(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16, err error) {
+	if len(payload) < heapPruneOptHdrSize {
+		err = fmt.Errorf("wal: invalid heap-prune-opt payload len %d (want >= %d)", len(payload), heapPruneOptHdrSize)
+		return
+	}
+	if payload[0] != RecordKindHeapPruneOpt {
+		err = fmt.Errorf("wal: record kind %d is not heap-prune-opt", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	nRedirects := int(binary.LittleEndian.Uint16(payload[14:16]))
+	nUnused := int(binary.LittleEndian.Uint16(payload[16:18]))
+	want := heapPruneOptHdrSize + 4*nRedirects + 2*nUnused
+	if len(payload) != want {
+		err = fmt.Errorf("wal: heap-prune-opt payload len %d want %d (nRedirects=%d nUnused=%d)", len(payload), want, nRedirects, nUnused)
+		return
+	}
+	off := heapPruneOptHdrSize
+	redirects = make([][2]uint16, nRedirects)
+	for i := range redirects {
+		redirects[i][0] = binary.LittleEndian.Uint16(payload[off : off+2])
+		redirects[i][1] = binary.LittleEndian.Uint16(payload[off+2 : off+4])
+		off += 4
+	}
+	unused = make([]uint16, nUnused)
+	for i := range unused {
+		unused[i] = binary.LittleEndian.Uint16(payload[off : off+2])
+		off += 2
+	}
+	return
+}
+
+// EncodeSmgrCreate encodes a relation-file creation record.
+// Mirrors upstream's XLOG_SMGR_CREATE. The redo handler ensures
+// the relfile has at least one initialised block (idempotent).
+func EncodeSmgrCreate(rel storage.RelFileNode) []byte {
+	out := make([]byte, smgrRecordSize)
+	out[0] = RecordKindSmgrCreate
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	return out
+}
+
+// DecodeSmgrCreate decodes a SmgrCreate record payload.
+func DecodeSmgrCreate(payload []byte) (rel storage.RelFileNode, err error) {
+	if len(payload) < smgrRecordSize {
+		err = fmt.Errorf("wal: invalid smgr-create payload len %d (want %d)", len(payload), smgrRecordSize)
+		return
+	}
+	if payload[0] != RecordKindSmgrCreate {
+		err = fmt.Errorf("wal: record kind %d is not smgr-create", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	return
+}
+
+// EncodeSmgrTruncate encodes a relation-file truncation record.
+// Mirrors upstream's XLOG_SMGR_TRUNCATE. The redo handler truncates
+// the relfile to 0 blocks.
+func EncodeSmgrTruncate(rel storage.RelFileNode) []byte {
+	out := make([]byte, smgrRecordSize)
+	out[0] = RecordKindSmgrTruncate
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	return out
+}
+
+// DecodeSmgrTruncate decodes a SmgrTruncate record payload.
+func DecodeSmgrTruncate(payload []byte) (rel storage.RelFileNode, err error) {
+	if len(payload) < smgrRecordSize {
+		err = fmt.Errorf("wal: invalid smgr-truncate payload len %d (want %d)", len(payload), smgrRecordSize)
+		return
+	}
+	if payload[0] != RecordKindSmgrTruncate {
+		err = fmt.Errorf("wal: record kind %d is not smgr-truncate", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	return
+}
+
 // EncodeHeapVacuum encodes one logical heap-vacuum (page prune)
 // redo record. `deadSlots` carries the 1-based LP_NORMAL slot
 // numbers to reclaim, in any order — replay treats the list as
@@ -440,15 +833,26 @@ func DecodePageImage(payload []byte) (storage.RelFileNode, storage.BlockNumber, 
 }
 
 // ReplayRecords replays decoded WAL records into storage.
+//
+// M0045-0002: replay starts FROM the last checkpoint (inclusive),
+// not up to it. The checkpoint marks a point where all dirty pages
+// were flushed; only records AFTER the checkpoint need to be applied
+// to recover pages that may not have been flushed before the crash.
+// Records before the checkpoint are already on disk and ApplyRecord's
+// per-page LSN check makes re-application a safe no-op, but we skip
+// them as an optimisation.
+//
+// If no checkpoint record exists, all records are replayed from the
+// start (safe for fresh clusters or WAL without checkpoints).
 func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) {
 	stats := ReplayStats{Records: len(records)}
-	replayUntil, checkpointLSN := replayLimit(records)
+	startIdx, checkpointLSN := replayStart(records)
 	stats.CheckpointLSN = checkpointLSN
 
-	for i, r := range records[:replayUntil] {
+	for i, r := range records[startIdx:] {
 		applied, err := ApplyRecord(mgr, r)
 		if err != nil {
-			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", i, r.StartLSN, r.EndLSN, err)
+			return stats, fmt.Errorf("wal: replay record %d lsn[%d,%d]: %w", startIdx+i, r.StartLSN, r.EndLSN, err)
 		}
 		if applied {
 			stats.Applied++
@@ -521,6 +925,42 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
 		return false, nil
+	case RecordKindCreateDatabase, RecordKindDropDatabase:
+		// CREATE/DROP DATABASE records (M0054-0001) carry only a database
+		// name; goopg v0 has no per-database file namespacing, so the
+		// physical replay path has nothing to do. The recovery driver in
+		// internal/initdb/open.go scans the WAL for these records after
+		// physical replay and re-applies them to the catalog's database
+		// list.
+		return false, nil
+	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
+		// Subxact markers (M0050-0003) — physical page recovery is
+		// a no-op. The mvcc.Manager rebuilds its subxact-to-parent
+		// map from these records during recovery; the physical replay
+		// path (ReplayRecords) has no access to mvcc.Manager. The
+		// full integration is wired by the recovery driver in
+		// internal/initdb/open.go (M0050-0004).
+		return false, nil
+	case RecordKindHeapHotUpdate:
+		if err := replayHeapHotUpdate(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindHeapPruneOpt:
+		if err := replayHeapPruneOpt(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindSmgrCreate:
+		if err := replaySmgrCreate(mgr, r.Payload); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindSmgrTruncate:
+		if err := replaySmgrTruncate(mgr, r.Payload); err != nil {
+			return false, err
+		}
+		return true, nil
 	default:
 		return false, fmt.Errorf("unsupported kind %d", r.Payload[0])
 	}
@@ -757,6 +1197,88 @@ func replayHeapInsert(mgr *storage.Manager, r Record) error {
 	return mgr.WriteBlock(rel, blk, page)
 }
 
+// replayHeapHotUpdate applies one atomic HOT-update record (M0046-0001).
+// The page must already exist (the old tuple is already on it). Idempotent
+// via pd_lsn. Replay:
+//  1. Insert the new tuple (which carries HeapOnlyTuple in infomask).
+//  2. Stamp the old slot: xmax + HeapHotUpdated + CTID = (blk, newSlot).
+func replayHeapHotUpdate(mgr *storage.Manager, r Record) error {
+	rel, blk, oldSlot, xmax, tupleBytes, err := DecodeHeapHotUpdate(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-hot-update replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-hot-update replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	tup, err := storage.ParseHeapTuple(tupleBytes)
+	if err != nil {
+		return fmt.Errorf("wal: heap-hot-update decode new tuple: %w", err)
+	}
+	newSlot, err := storage.PageAddHeapTuple(page, tup)
+	if err != nil {
+		return fmt.Errorf("wal: heap-hot-update insert new tuple: %w", err)
+	}
+	if err := storage.PageStampHotOldTuple(page, oldSlot, xmax, blk, newSlot); err != nil {
+		return fmt.Errorf("wal: heap-hot-update stamp old tuple: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
+}
+
+// replayHeapPruneOpt applies one opportunistic page-pruning record
+// (M0046-0002). Applies redirect pairs (ItemIDRedirect) then marks unused
+// slots via VacuumHeapPageBySlots. Idempotent via pd_lsn.
+func replayHeapPruneOpt(mgr *storage.Manager, r Record) error {
+	rel, blk, redirects, unused, err := DecodeHeapPruneOpt(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-prune-opt replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-prune-opt replay: block %d is uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	// Apply redirect line pointer conversions first.
+	for _, redir := range redirects {
+		if err := storage.PageSetItemIDRedirect(page, redir[0], redir[1]); err != nil {
+			return fmt.Errorf("wal: heap-prune-opt redirect slot=%d→%d: %w", redir[0], redir[1], err)
+		}
+	}
+	// Compact the page: mark unused slots and repack live tuples.
+	if _, err := storage.VacuumHeapPageBySlots(page, unused); err != nil {
+		return fmt.Errorf("wal: heap-prune-opt vacuum: %w", err)
+	}
+	storage.MustHeader(page).SetPruneXID(0)
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
+}
+
 // replayBtreeSplit applies the left then right page images carried
 // by an atomic split record. The right page is applied via Extend
 // when the relation is one block short of containing it (the
@@ -813,20 +1335,104 @@ func replayPageImage(mgr *storage.Manager, payload []byte) error {
 	return writeBlockOrExtend(mgr, rel, blk, page)
 }
 
-func replayLimit(records []Record) (int, uint64) {
-	lastCheckpointIdx := -1
+// replayStart returns the index of the LAST checkpoint record in
+// records plus its EndLSN. Crash recovery should replay records
+// starting from this index: everything before the checkpoint was
+// already flushed to disk by the checkpoint operation.
+//
+// If no checkpoint is found, returns (0, 0) — replay all records
+// from the beginning (correct for fresh clusters or early startup).
+func replayStart(records []Record) (int, uint64) {
+	startIdx := 0
 	var checkpointLSN uint64
 	for i, r := range records {
 		if len(r.Payload) == 0 {
 			continue
 		}
 		if r.Payload[0] == RecordKindCheckpoint {
-			lastCheckpointIdx = i
+			startIdx = i // start FROM this checkpoint (inclusive)
 			checkpointLSN = r.EndLSN
 		}
 	}
-	if lastCheckpointIdx == -1 {
-		return len(records), 0
+	return startIdx, checkpointLSN
+}
+
+// DiscoverLastCheckpointLSN scans the WAL directory for the most
+// recent checkpoint record and returns its EndLSN. This is needed
+// for M0045-0002's startup replay: begin replay from the last
+// checkpoint so post-checkpoint dirty pages are recovered without
+// re-reading the entire WAL history.
+//
+// Because WAL retention removes pre-checkpoint segments, the scan
+// must tolerate a non-zero first segment (M0045-0001). ReadAll already
+// starts from the first retained segment after the readStream fix.
+//
+// Returns (0, nil) for a fresh cluster (no WAL segments present).
+// Returns an error if WAL segments exist but no checkpoint is found —
+// this indicates an unrecoverable cluster state that requires
+// re-initialization.
+func DiscoverLastCheckpointLSN(walDir string, segmentSize int64) (uint64, error) {
+	if segmentSize <= 0 {
+		segmentSize = DefaultSegmentSize
 	}
-	return lastCheckpointIdx + 1, checkpointLSN
+	records, err := ReadAll(walDir, segmentSize)
+	if err != nil {
+		return 0, fmt.Errorf("wal: discover checkpoint: %w", err)
+	}
+	if len(records) == 0 {
+		return 0, nil // fresh cluster or empty WAL directory
+	}
+	// Scan for the LAST checkpoint record in the retained range.
+	var lastLSN uint64
+	for _, r := range records {
+		if len(r.Payload) > 0 && r.Payload[0] == RecordKindCheckpoint {
+			lastLSN = r.EndLSN
+		}
+	}
+	if lastLSN == 0 {
+		return 0, fmt.Errorf("wal: no checkpoint record found in %s; "+
+			"the cluster may need to be re-initialized with 'goopg init'", walDir)
+	}
+	return lastLSN, nil
+}
+
+// replaySmgrCreate ensures the relation file identified by the record has at
+// least one initialised block. Idempotent: if the file already has blocks,
+// this is a no-op. Mirrors XLOG_SMGR_CREATE redo semantics.
+func replaySmgrCreate(mgr *storage.Manager, payload []byte) error {
+	rel, err := DecodeSmgrCreate(payload)
+	if err != nil {
+		return err
+	}
+	n, err := mgr.NBlocks(rel)
+	if err != nil {
+		return fmt.Errorf("wal: smgr-create replay NBlocks: %w", err)
+	}
+	if n > 0 {
+		return nil // already exists — idempotent
+	}
+	page := make([]byte, storage.BlockSize)
+	if initErr := storage.InitPage(storage.Page(page)); initErr != nil {
+		return initErr
+	}
+	_, err = mgr.Extend(rel, page)
+	return err
+}
+
+// replaySmgrTruncate truncates the relfile to 0 blocks. Idempotent: if the
+// file is already empty (0 blocks), this is a no-op. Mirrors
+// XLOG_SMGR_TRUNCATE redo semantics.
+func replaySmgrTruncate(mgr *storage.Manager, payload []byte) error {
+	rel, err := DecodeSmgrTruncate(payload)
+	if err != nil {
+		return err
+	}
+	n, err := mgr.NBlocks(rel)
+	if err != nil {
+		return fmt.Errorf("wal: smgr-truncate replay NBlocks: %w", err)
+	}
+	if n == 0 {
+		return nil // already empty — idempotent
+	}
+	return mgr.TruncateRelation(rel)
 }

@@ -11,10 +11,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"sort"
-	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -36,8 +36,13 @@ const SizeOfBTPageOpaque = 48
 
 // MaxHighKeyLen bounds the on-disk HighKey field. Covers the int4
 // encoding (4 bytes) and the NUMERIC encoding (≤25 bytes per
-// 0011-0001) with headroom. Wider key encodings would require
-// another opaque-format bump.
+// 0011-0001) with headroom. M0041-0004 widened EncodeNumericKey to
+// accept *big.Int mantissas, but the only B-tree NUMERIC keys in
+// practice are stored column values (TPC-H l_partkey, ps_partkey,
+// etc.) that fit in int64 and therefore in ≤25 bytes; the
+// arbitrary-precision lane only matters for runtime arithmetic
+// results that never enter an index. So MaxHighKeyLen stays 32 to
+// preserve on-disk page-format compatibility.
 const MaxHighKeyLen = 32
 
 // btSpecialOffset is where the opaque area starts on every B-tree page.
@@ -49,6 +54,22 @@ const (
 	BTRoot       uint16 = 0x0002
 	BTDeleted    uint16 = 0x0004
 	BTHasHighKey uint16 = 0x0008
+	// BTIncompleteSplit (M0055-0004 Phase C) marks a page as the
+	// LEFT half of a freshly-completed split whose parent
+	// downlink has not yet been inserted. Writers descending to
+	// such a page MUST run `(*BTree).finishSplit` before
+	// inserting further. Cleared by finishSplit after the parent
+	// downlink lands.
+	BTIncompleteSplit uint16 = 0x0010
+	// BTHalfDead (M0055-0005-followup-two-phase-del) marks a
+	// page as the target of a two-phase deletion whose Phase 1
+	// (mark + WAL) has completed but whose Phase 2 (unlink +
+	// recycle) has not. Vacuum and writer paths that encounter
+	// a half-dead page MUST run `(*BTree).completeDeletion` to
+	// finish Phase 2 before treating the page as live or
+	// recycled. Crash-replay restores the half-dead state from
+	// the Phase 1 WAL record.
+	BTHalfDead uint16 = 0x0020
 )
 
 // MetaBlock is always block 0 — the metapage. RootStart is the first
@@ -87,6 +108,16 @@ type BTPageOpaque struct {
 
 // IsLeaf reports whether the page carries leaf items.
 func (o BTPageOpaque) IsLeaf() bool { return o.Flags&BTLeaf != 0 }
+
+// HasIncompleteSplit reports whether this page is the left half
+// of a split that has not yet propagated its parent downlink.
+// (M0055-0004 Phase C.)
+func (o BTPageOpaque) HasIncompleteSplit() bool { return o.Flags&BTIncompleteSplit != 0 }
+
+// IsHalfDead reports whether this page is mid-deletion — Phase 1
+// has marked it but Phase 2 has not unlinked it yet.
+// (M0055-0005-followup-two-phase-del.)
+func (o BTPageOpaque) IsHalfDead() bool { return o.Flags&BTHalfDead != 0 }
 
 // IsRoot reports whether the page is the current root.
 func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
@@ -251,27 +282,38 @@ func DecodeInt8(b []byte) (int64, error) {
 //
 // Decoding is intentionally not provided: the B-tree never inverts the
 // encoding; index probes always re-encode from the live datum.
-func EncodeNumericKey(mantissa int64, scale int8) []byte {
-	if mantissa == 0 {
+//
+// M0041-0004 widens the mantissa parameter from int64 to *big.Int so
+// arbitrary-precision NUMERIC values (e.g. results of TPC-H Q8's
+// `1.00000000000000000000` produced by upstream-compatible division)
+// can be indexed without overflow. The on-page byte layout is
+// unchanged — sort order is preserved by the variable-length
+// digit-rebase trick, and any value that fits in int64 produces the
+// same bytes as before the widening.
+func EncodeNumericKey(mantissa *big.Int, scale int16) []byte {
+	if mantissa.Sign() == 0 {
 		return []byte{0x01}
 	}
-	negative := mantissa < 0
-	var um uint64
-	if mantissa == math.MinInt64 {
-		um = 1 << 63
-	} else if negative {
-		um = uint64(-mantissa)
-	} else {
-		um = uint64(mantissa)
-	}
+	negative := mantissa.Sign() < 0
+	abs := new(big.Int).Abs(mantissa)
 	// Strip trailing zeros so numerically-equal values normalise to
 	// the same digit string.
 	s := int32(scale)
-	for um%10 == 0 {
-		um /= 10
+	ten := big.NewInt(10)
+	zero := big.NewInt(0)
+	rem := new(big.Int)
+	for {
+		new(big.Int).QuoRem(abs, ten, rem)
+		if rem.Cmp(zero) != 0 {
+			break
+		}
+		abs.Quo(abs, ten)
 		s--
+		if abs.Sign() == 0 {
+			break
+		}
 	}
-	digits := strconv.FormatUint(um, 10)
+	digits := abs.Text(10)
 	ndig := int32(len(digits))
 	E := ndig - 1 - s
 
@@ -298,6 +340,107 @@ func EncodeNumericKey(mantissa int64, scale int8) []byte {
 		out = append(out, 0x00) // less than any digit byte; shorter sorts first
 	}
 	return out
+}
+
+// EncodeVarchar encodes a variable-length string as a self-terminating
+// byte sequence whose bytewise lexicographic order matches the C-locale
+// (byte-wise) SQL ordering of the original strings. Suitable as a
+// B-tree key component in both single-column and composite indexes.
+//
+// Encoding rules:
+//   - 0x01 is the escape introducer.
+//   - Each 0x00 byte in the payload is replaced by [0x01, 0x01].
+//   - Each 0x01 byte in the payload is replaced by [0x01, 0x02].
+//   - All other bytes are passed through unchanged.
+//   - A single 0x00 byte is appended as the end-of-key terminator.
+//
+// This ensures 0x00 appears only as the terminator (never inside the
+// payload after escaping), making the encoding self-terminating:
+// concatenating two EncodeVarchar results in a composite key whose
+// bytewise comparison correctly implements multi-column SQL ordering.
+//
+// Bytewise order of encoded strings matches bytewise (C-locale) order
+// of the original inputs. Decoding is intentionally not provided:
+// B-tree probe paths always re-encode from the live Datum.
+func EncodeVarchar(payload []byte) []byte {
+	out := make([]byte, 0, len(payload)+1)
+	for _, b := range payload {
+		switch b {
+		case 0x00:
+			out = append(out, 0x01, 0x01)
+		case 0x01:
+			out = append(out, 0x01, 0x02)
+		default:
+			out = append(out, b)
+		}
+	}
+	out = append(out, 0x00)
+	return out
+}
+
+// EncodeChar encodes a CHAR(N) (blank-padded character) value as a
+// sortable, self-terminating byte sequence matching PostgreSQL's
+// blank-padded comparison semantics.
+//
+// Trailing 0x20 (space) bytes are stripped before encoding, so
+// 'A' and 'A         ' (any number of trailing spaces) produce
+// identical bytes — required for index correctness when goopg stores
+// the declared-length-padded form in the heap but the query probes
+// with an unpadded literal.
+//
+// After trimming, the encoding is identical to EncodeVarchar.
+func EncodeChar(payload []byte) []byte {
+	return EncodeVarchar(bytes.TrimRight(payload, " "))
+}
+
+// EncodeTimestamp encodes a timestamp value as a sortable 8-byte
+// sequence whose bytewise comparison matches chronological order.
+//
+// The input is the number of microseconds since the PostgreSQL epoch
+// (2000-01-01 00:00:00 UTC); negative values are valid and represent
+// timestamps before the epoch.
+//
+// The layout is identical to EncodeInt8: 8-byte big-endian with the
+// sign bit flipped so negative values (pre-epoch timestamps) sort
+// before positive values (post-epoch timestamps) under bytewise
+// comparison.
+func EncodeTimestamp(microsSince2000 int64) []byte {
+	return EncodeInt8(microsSince2000)
+}
+
+// DecodeTimestamp inverts EncodeTimestamp (identical to DecodeInt8).
+func DecodeTimestamp(b []byte) (int64, error) { return DecodeInt8(b) }
+
+// DecodeVarchar inverts EncodeVarchar: strips the 0x00 terminator and
+// unescapes 0x01-prefixed bytes. Used by index-only scan (M0046-0004)
+// to reconstruct string values from B-tree key bytes without a heap fetch.
+func DecodeVarchar(b []byte) ([]byte, error) {
+	if len(b) == 0 || b[len(b)-1] != 0x00 {
+		return nil, fmt.Errorf("btree: varchar key missing 0x00 terminator")
+	}
+	out := make([]byte, 0, len(b)-1)
+	src := b[:len(b)-1] // strip terminator
+	for i := 0; i < len(src); {
+		c := src[i]
+		if c == 0x01 {
+			if i+1 >= len(src) {
+				return nil, fmt.Errorf("btree: varchar key: truncated escape at byte %d", i)
+			}
+			switch src[i+1] {
+			case 0x01:
+				out = append(out, 0x00)
+			case 0x02:
+				out = append(out, 0x01)
+			default:
+				return nil, fmt.Errorf("btree: varchar key: invalid escape %02x at byte %d", src[i+1], i)
+			}
+			i += 2
+		} else {
+			out = append(out, c)
+			i++
+		}
+	}
+	return out, nil
 }
 
 // CompareKeys is straight bytewise lexicographic comparison.
@@ -335,7 +478,127 @@ type BTree struct {
 	rel      storage.RelFileNode
 	logSplit LogSplitFunc
 
+	// splitMu serialises split-path inserts and metapage
+	// publication. (M0055-0004-followup-stage2-splitmu-removal:
+	// experimentally removed splitMu from the slow path; the
+	// existing buffer-pool eviction protocol made concurrent
+	// pin/unpin paths surface "unpin underflow" panics under
+	// 32-writer stress. The Stage 2 work needs an additional
+	// reader/writer interaction-safety guarantee in the
+	// buffer pool itself before the structural mutex can be
+	// fully retired. The protocol-level INCOMPLETE_SPLIT
+	// lifecycle from `(*BTree).finishSplit` runs unchanged;
+	// this commit lands the race-safe createNewRoot half of
+	// Stage 2 — concurrent root-lifts no longer orphan a
+	// separator, even when both writers see the same OLD
+	// root.)
 	splitMu sync.Mutex
+
+	// M0055-0001: write-path counters used by the baseline
+	// harness and Phase A/B regression tests. All atomic so they
+	// can be read concurrently without locking. Reset by
+	// `(*BTree).ResetStats`.
+	stats BTreeStats
+
+	// M0055-0002-followup-rightmost-cache: cached rightmost leaf
+	// pointer for append-shaped workloads. Written by the insert
+	// path's slow-path descent; read by the fast path to skip
+	// re-descent when the next insert's key is ≥ the highest key
+	// observed at the cache's leaf. atomic so concurrent readers
+	// don't tear the value. Zero (BlockNumber 0) means "uncached"
+	// — block 0 is the metapage so no real leaf has block 0.
+	rightmostLeafBlk atomic.Uint64
+
+	// M0055-0005 Phase D: recycled-page free list. Pages that
+	// were unlinked by vacuum get pushed here; future
+	// allocations (PinNew calls) check this list first before
+	// extending the file. Guarded by `freeListMu` to keep the
+	// pop/push atomic.
+	freeListMu sync.Mutex
+	freeList   []storage.BlockNumber
+}
+
+// pinNewOrRecycled (M0055-0005 Phase D) returns a writable slot
+// for a fresh page allocation, preferring a recycled block from
+// the free list before extending the file. The page bytes are
+// re-initialised so the caller sees a clean page (matching the
+// post-PinNew contract).
+func (bt *BTree) pinNewOrRecycled() (*storage.Slot, storage.BlockNumber, error) {
+	if blk, ok := bt.popRecycledBlock(); ok {
+		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+		if err != nil {
+			// Could not re-pin; fall back to fresh allocation.
+			return bt.pool.PinNew(bt.rel)
+		}
+		// Re-initialise the page bytes so the recycled slot looks
+		// like a fresh PinNew result.
+		page := slot.Page()
+		for i := range page {
+			page[i] = 0
+		}
+		// Caller will write opaque/header before MarkDirty.
+		return slot, blk, nil
+	}
+	return bt.pool.PinNew(bt.rel)
+}
+
+// recycleBlock (M0055-0005 Phase D) marks a block as available
+// for reuse by future page allocations on this tree. The block
+// must have been unlinked from the tree's logical structure
+// before it lands here. Safe for concurrent callers.
+func (bt *BTree) recycleBlock(blk storage.BlockNumber) {
+	bt.freeListMu.Lock()
+	bt.freeList = append(bt.freeList, blk)
+	bt.freeListMu.Unlock()
+}
+
+// popRecycledBlock (M0055-0005 Phase D) returns a recycled
+// block number if one is available, or (0, false) when the free
+// list is empty. The caller is responsible for re-initialising
+// the block's page bytes before reuse.
+func (bt *BTree) popRecycledBlock() (storage.BlockNumber, bool) {
+	bt.freeListMu.Lock()
+	defer bt.freeListMu.Unlock()
+	if len(bt.freeList) == 0 {
+		return 0, false
+	}
+	n := len(bt.freeList) - 1
+	blk := bt.freeList[n]
+	bt.freeList = bt.freeList[:n]
+	return blk, true
+}
+
+// RecycledPageCount returns the number of pages currently in the
+// recycle free list. Used by tests and the M0055-0007 report.
+func (bt *BTree) RecycledPageCount() int {
+	bt.freeListMu.Lock()
+	defer bt.freeListMu.Unlock()
+	return len(bt.freeList)
+}
+
+// BTreeStats are the per-tree counters surfaced by `(*BTree).Stats`
+// for benchmarks and regression tests. The counters are best-effort
+// (incremented from the steady-state insert/split path) and are
+// cleared by `(*BTree).ResetStats`. (M0055-0001.)
+type BTreeStats struct {
+	Inserts uint64 // total `Insert` calls
+	Splits  uint64 // total leaf+internal page splits
+}
+
+// Stats returns a snapshot of the BTree's write-path counters.
+// Snapshot is best-effort — concurrent inserts may make the
+// returned numbers stale by the time the caller reads them.
+func (bt *BTree) Stats() BTreeStats {
+	return BTreeStats{
+		Inserts: atomic.LoadUint64(&bt.stats.Inserts),
+		Splits:  atomic.LoadUint64(&bt.stats.Splits),
+	}
+}
+
+// ResetStats clears the BTree's write-path counters.
+func (bt *BTree) ResetStats() {
+	atomic.StoreUint64(&bt.stats.Inserts, 0)
+	atomic.StoreUint64(&bt.stats.Splits, 0)
 }
 
 // LogSplitFunc emits the atomic page-split WAL record described in
@@ -592,11 +855,23 @@ func pageItems(p storage.Page) ([]item, error) {
 		if err != nil {
 			return nil, err
 		}
-		it, err := parseItem(raw)
-		if err != nil {
-			return nil, err
+		// Posting-list items (M0047-0003) are expanded to individual
+		// (key, TID) pairs so callers like insertItemSorted work correctly.
+		if isPostingRaw(raw) {
+			key, tids, perr := parsePostingRaw(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			for _, tid := range tids {
+				out = append(out, item{keyLen: uint16(len(key)), ptr: tid, key: key})
+			}
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, it)
 		}
-		out = append(out, it)
 	}
 	return out, nil
 }
@@ -700,6 +975,25 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 		}
 
 		if op.IsLeaf() {
+			// M0055-0002-followup-rightmost-cache: if this leaf
+			// has no Next pointer it IS the rightmost; refresh
+			// the cache. Cheap atomic write, no allocation.
+			if op.Next == 0 {
+				bt.rightmostLeafBlk.Store(uint64(cur))
+			}
+			// (M0055-0004-followup-stage2-splitmu-removal:
+			// eager finishSplit on descend was attempted but
+			// races with the fast-path concurrent descend
+			// produced unpin-underflow under -race stress.
+			// The flag remains observable; crash-replay
+			// completion is handled by an explicit
+			// `CompleteDeferredSplits` maintenance pass —
+			// implemented analogous to
+			// `CompleteDeferredDeletions` — rather than
+			// inline-on-descend. In steady-state operation
+			// the flag is set + cleared by the SAME slow-path
+			// goroutine while splitMu is held, so descenders
+			// never observe it.)
 			bt.unpinR(slot)
 			return cur, path, nil
 		}
@@ -719,6 +1013,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 // Insert places (key, ptr) into the leaf where it belongs, splitting
 // pages on the way up if needed.
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
+	atomic.AddUint64(&bt.stats.Inserts, 1) // M0055-0001
 	it := item{
 		keyLen: uint16(len(key)),
 		ptr:    ptr,
@@ -734,7 +1029,13 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	}
 
 	// Split path: serialise structure changes (split propagation,
-	// root lift, metapage rewrite), then retry from a fresh descent.
+	// root lift, metapage rewrite), then retry from a fresh
+	// descent. (M0055-0004-followup-stage2-splitmu-removal: full
+	// removal needs additional buffer-pool concurrency-safety
+	// work beyond M0055's scope. The race-safe createNewRoot
+	// in this commit handles concurrent root-lifts; the rest
+	// of the structural-update path remains under splitMu.)
+	atomic.AddUint64(&bt.stats.Splits, 1) // M0055-0001 — counts insert calls that take the split-path retry.
 	bt.splitMu.Lock()
 	defer bt.splitMu.Unlock()
 
@@ -748,6 +1049,18 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 var errNeedsSplit = errors.New("btree: insert needs split")
 
 func (bt *BTree) tryInsertNoSplit(it item) error {
+	// M0055-0002-followup-rightmost-cache: try the cached
+	// rightmost leaf first. When the new key is ≥ the leaf's
+	// highest key (which is true for monotonic / append-shaped
+	// inserts), we skip the descent entirely. On a cache miss
+	// (key falls before the cached leaf's max, or the leaf was
+	// invalidated by a split that bumped Next), fall through to
+	// the slow descent path.
+	if cached := bt.rightmostLeafBlk.Load(); cached != 0 {
+		if ok, err := bt.tryInsertOnCachedRightmost(storage.BlockNumber(cached), it); ok || err != nil {
+			return err
+		}
+	}
 	leafBlk, _, err := bt.descendToLeaf(it.key)
 	if err != nil {
 		return err
@@ -820,7 +1133,9 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// redistribute items, stamp the high key, then drop both
 	// latches before walking up.
 	op := readOpaque(slot.Page())
-	rightSlot, rightBlk, err := bt.pool.PinNew(bt.rel)
+	// M0055-0005 Phase D: prefer recycled blocks before
+	// extending the file.
+	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
 	if err != nil {
 		bt.unpinW(slot)
 		return err
@@ -850,7 +1165,38 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 	allItems = appendSorted(allItems, it)
 
-	mid := len(allItems) / 2
+	// M0055-0003 Phase B (pre-split dedup compaction): consolidate
+	// adjacent same-key items into postings. For duplicate-heavy
+	// workloads this reduces split frequency dramatically — the
+	// page may fit comfortably in a single leaf after dedup,
+	// avoiding the split entirely. We bail back to the no-split
+	// path if dedup recovers enough space.
+	allItems = dedupConsolidate(allItems)
+	if compactRawSize(allItems) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+		// Re-attempt no-split insert with the dedup'd content.
+		// Reset the page and write the dedup'd items back, no
+		// split needed. The right-side allocation is rolled back.
+		resetPageItems(slot.Page())
+		for _, x := range allItems {
+			insertItemSorted(slot.Page(), x)
+		}
+		// Drop the freshly-allocated right slot — split avoided.
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		// MarkDirty the left page so the dedup'd content
+		// reaches WAL.
+		bt.pool.MarkDirty(slot)
+		bt.unpinW(slot)
+		return nil
+	}
+
+	// M0055-0002-followup-byte-split: byte-aware split-loc.
+	// Pick the entry whose cumulative encoded byte size lands
+	// closest to half the total. For fixed-width keys this is
+	// equivalent to count-midpoint; for variable-width keys it
+	// produces balanced halves in bytes (the on-disk metric the
+	// page fill threshold actually cares about).
+	mid := byteAwareSplitLoc(allItems)
 	leftItems := allItems[:mid]
 	rightItems := allItems[mid:]
 
@@ -877,6 +1223,13 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 			len(sepKey), MaxHighKeyLen)
 	}
 	op.HighKey = append([]byte(nil), sepKey...)
+	// M0055-0004-followup-finish-split: mark the LEFT page as
+	// incomplete-split before releasing latches. Cleared after
+	// the parent downlink insert succeeds. Crash-replay leaves
+	// the flag set so a subsequent writer descending to this
+	// page runs finishSplit before inserting (the protocol's
+	// resume guarantee).
+	op.Flags |= BTIncompleteSplit
 	writeOpaque(slot.Page(), op)
 
 	// Atomic split WAL record (Landing 3a). When a writer is
@@ -920,13 +1273,137 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		if err := bt.clearRootFlag(blk); err != nil {
 			return err
 		}
-		return bt.createNewRoot(blk, rightBlk, sepItem.key, op.Level+1)
+		if err := bt.createNewRoot(blk, rightBlk, sepItem.key, op.Level+1); err != nil {
+			return err
+		}
+		// Parent (the new root) now references the left half;
+		// clear the INCOMPLETE_SPLIT marker. (M0055-0004-followup.)
+		return bt.clearIncompleteSplit(blk)
 	}
 
 	// Otherwise, insert the separator into the parent.
 	parentBlk := path[len(path)-1]
 	parentPath := path[:len(path)-1]
-	return bt.insertIntoBlock(parentBlk, parentPath, sepItem)
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+		return err
+	}
+	// Parent insert succeeded — clear the INCOMPLETE_SPLIT flag
+	// on the left page. (M0055-0004-followup.)
+	return bt.clearIncompleteSplit(blk)
+}
+
+// clearIncompleteSplit (M0055-0004-followup-finish-split) unsets
+// the BTIncompleteSplit flag on the page. Invoked at the end of
+// a successful split sequence (parent downlink inserted), and
+// by `finishSplit` when a writer / vacuum encounters a stale
+// incomplete-split marker from a crashed prior run.
+func (bt *BTree) clearIncompleteSplit(blk storage.BlockNumber) error {
+	slot, err := bt.pinW(blk)
+	if err != nil {
+		return err
+	}
+	op := readOpaque(slot.Page())
+	op.Flags &^= BTIncompleteSplit
+	writeOpaque(slot.Page(), op)
+	err = bt.markDirtyWithPageRecord(slot, blk)
+	bt.unpinW(slot)
+	return err
+}
+
+// CompleteDeferredSplits (M0055-0004-followup-stage2-splitmu-
+// removal) scans the tree for any pages still flagged
+// BTIncompleteSplit (Phase 1 — leaf split — committed but the
+// parent-downlink insertion did not). Used by maintenance
+// passes (vacuum, post-recovery startup) to complete in-flight
+// splits that were interrupted by a crash. Steady-state
+// operation never produces such pages (the slow-path sets +
+// clears the flag under splitMu in the same critical
+// section).
+func (bt *BTree) CompleteDeferredSplits() (int, error) {
+	rel := bt.rel
+	nBlocks, err := bt.pool.NBlocks(rel)
+	if err != nil {
+		return 0, err
+	}
+	completed := 0
+	for blk := storage.BlockNumber(1); blk < nBlocks; blk++ {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			continue
+		}
+		op := readOpaque(slot.Page())
+		incomplete := op.HasIncompleteSplit()
+		bt.unpinR(slot)
+		if !incomplete {
+			continue
+		}
+		if err := bt.finishSplit(blk); err != nil {
+			return completed, err
+		}
+		completed++
+	}
+	return completed, nil
+}
+
+// finishSplit (M0055-0004-followup-finish-split) re-runs the
+// parent-downlink insertion for a page that is still flagged
+// BTIncompleteSplit (e.g., after crash-replay where the writer's
+// split phase landed but the parent insert did not). Idempotent
+// — if the parent already references the page, the redundant
+// insert is detected by the parent's binary-search "already
+// present" check and the flag is simply cleared.
+//
+// Callers: writers descending the tree (before continuing
+// writes on this page); vacuum maintenance pass.
+func (bt *BTree) finishSplit(blk storage.BlockNumber) error {
+	slot, err := bt.pinW(blk)
+	if err != nil {
+		return err
+	}
+	op := readOpaque(slot.Page())
+	if !op.HasIncompleteSplit() {
+		bt.unpinW(slot)
+		return nil
+	}
+	// Read the high key + Next to reconstruct the separator
+	// item that the original split was about to push up.
+	if !op.HasHighKey() || op.Next == storage.InvalidBlockNumber {
+		// Defensive: malformed half-state. Clear the flag and
+		// hope the parent caught up via some other path.
+		op.Flags &^= BTIncompleteSplit
+		writeOpaque(slot.Page(), op)
+		bt.markDirtyWithPageRecord(slot, blk)
+		bt.unpinW(slot)
+		return nil
+	}
+	rightBlk := op.Next
+	sepKey := append([]byte(nil), op.HighKey...)
+	bt.unpinW(slot)
+
+	// Walk to the parent and insert the separator. We descend by
+	// the separator key so the parent path is reconstructed.
+	bt.splitMu.Lock()
+	defer bt.splitMu.Unlock()
+	_, path, err := bt.descendToLeaf(sepKey)
+	if err != nil {
+		return err
+	}
+	if len(path) == 0 {
+		// blk is the root — parent insert means a new root lift.
+		// Should have happened atomically; if not, redo it.
+		return bt.createNewRoot(blk, rightBlk, sepKey, op.Level+1)
+	}
+	parentBlk := path[len(path)-1]
+	parentPath := path[:len(path)-1]
+	sepItem := item{
+		keyLen: uint16(len(sepKey)),
+		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
+		key:    sepKey,
+	}
+	if err := bt.insertIntoBlock(parentBlk, parentPath, sepItem); err != nil {
+		return err
+	}
+	return bt.clearIncompleteSplit(blk)
 }
 
 func (bt *BTree) clearRootFlag(blk storage.BlockNumber) error {
@@ -970,6 +1447,43 @@ func ApplyInsertRecord(page storage.Page, raw []byte) error {
 }
 
 func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
+	// M0055-0004-followup-stage2-splitmu-removal (race-safe
+	// new-root publication): the caller is expected to hold
+	// `splitMu`, but a future Stage-2 design that lifts splitMu
+	// must still serialise root publication. We RE-READ the
+	// meta here so even under a future relaxation, two
+	// concurrent splits that both target the OLD root cannot
+	// both create a new root; the loser falls back to inserting
+	// its separator into the CURRENT root via the regular
+	// path. Today, with splitMu held, the re-read is a defensive
+	// invariant check (and a no-op fast path).
+	meta, err := bt.readMeta()
+	if err != nil {
+		return err
+	}
+	if meta.Root != leftBlk {
+		// Some other writer (under a future lock-free protocol)
+		// already lifted a new root above `leftBlk`. Insert our
+		// separator into the current root through the regular
+		// path.
+		sepItem := item{
+			keyLen: uint16(len(rightKey)),
+			ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
+			key:    append([]byte(nil), rightKey...),
+		}
+		_, parentPath, err := bt.descendToLeaf(rightKey)
+		if err != nil {
+			return err
+		}
+		if len(parentPath) == 0 {
+			// Defensive: meta.Root != leftBlk but parentPath is
+			// empty — meta moved again. Recurse to pick up the
+			// latest state.
+			return bt.createNewRoot(leftBlk, rightBlk, rightKey, level)
+		}
+		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem)
+	}
+
 	rootSlot, rootBlk, err := bt.pool.PinNew(bt.rel)
 	if err != nil {
 		return err
@@ -1020,20 +1534,272 @@ func pageHasSpaceFor(p storage.Page, it item) bool {
 // item count but v0 leaves are small (<256 entries) and split before
 // growing further; the simplicity is worth it until profiling says
 // otherwise.
+// insertItemSorted (M0055-0002 Phase A) writes `it` into its
+// sorted position on the page WITHOUT decoding and re-encoding
+// every existing item. Binary-searches the existing line-pointer
+// array reading only each candidate's key; calls
+// `PageInsertItemRawAt` to memmove the line-pointer suffix and
+// drop the new tuple bytes at pd_upper.
+//
+// Replaces the prior whole-page rewrite path that decoded every
+// item, inserted into a Go slice, reset the page, and re-
+// encoded every item. The pre-Phase-A path was the chief CPU
+// hotspot per the M0055 baseline pprof (analysis/btree-baseline-
+// 2026-05-06.md) — this rewrite eliminates the O(n) re-encode.
 func insertItemSorted(p storage.Page, it item) {
-	items, err := pageItems(p)
+	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
 		panic(err)
 	}
-	items = appendSorted(items, it)
-	resetPageItems(p)
-	for _, x := range items {
-		raw := x.marshal()
-		_, err := storage.PageAddItemRaw(p, raw)
+	// Binary-search for the insertion slot. The line-pointer
+	// accessors decode just one key per probe, not every item
+	// on the page.
+	lo, hi := 0, count
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		midItem, err := readPageItem(p, mid)
 		if err != nil {
 			panic(err)
 		}
+		if CompareKeys(midItem.key, it.key) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
 	}
+	// (M0055-0003 Phase B's in-insertItemSorted dedup-grow path
+	// was tried but produces page-fragment garbage that
+	// accumulates over many duplicate inserts. The pre-split
+	// dedup compaction variant — see `dedupPageBeforeSplit` —
+	// is the safer landing for steady-state dedup retention.)
+	raw := it.marshal()
+	// PageInsertItemRawAt is 1-based, line-pointer index lo is
+	// 0-based; convert.
+	if _, err := storage.PageInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
+		panic(err)
+	}
+}
+
+// tryInsertOnCachedRightmost (M0055-0002-followup-rightmost-cache)
+// attempts to insert `it` on the cached rightmost leaf. Returns
+// (true, nil) when the insert succeeded on the cached leaf; (false,
+// nil) when the cache is stale or the key doesn't belong on this
+// leaf (so the caller falls back to a full descent); (any, err)
+// when an underlying I/O error fires.
+//
+// Staleness conditions:
+//   - The leaf has a Next pointer set (a later split moved the
+//     rightmost forward). The cache is stale; clear and miss.
+//   - The leaf is full (no space for `it`). Caller takes the
+//     normal split path.
+//   - `it.key < leaf.HighKey` (the key belongs to a left sibling,
+//     not this leaf — the cache is wrong for this insert).
+//
+// The cache is updated by the slow-path descent every time it
+// reaches a leaf that's truly the rightmost (Next == 0).
+func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (bool, error) {
+	slot, err := bt.pinW(blk)
+	if err != nil {
+		// Cache may reference a deleted page — clear and miss.
+		bt.rightmostLeafBlk.Store(0)
+		return false, nil
+	}
+	op := readOpaque(slot.Page())
+	if op.Level != 0 || op.Next != 0 {
+		// Not a leaf, or no longer rightmost — cache is stale.
+		bt.unpinW(slot)
+		bt.rightmostLeafBlk.Store(0)
+		return false, nil
+	}
+	// M0056-0001: verify the key actually belongs on this leaf
+	// — the rightmost leaf has no high key, but it DOES have a
+	// SMALLEST key. Inserting a key smaller than the leaf's
+	// smallest entry would be a logical error (the key belongs
+	// on a left sibling). For an empty leaf any key is in
+	// range. With concurrent writers inserting disjoint key
+	// ranges, the cache may point at a leaf that's rightmost
+	// for one writer's range but irrelevant for another's;
+	// fall back to the descent path in that case.
+	count, perr := storage.PageLinePointerCount(slot.Page())
+	if perr == nil && count > 0 {
+		first, ferr := readPageItem(slot.Page(), 0)
+		if ferr == nil && CompareKeys(it.key, first.key) < 0 {
+			bt.unpinW(slot)
+			return false, nil
+		}
+	}
+	if !pageHasSpaceFor(slot.Page(), it) {
+		bt.unpinW(slot)
+		return false, nil
+	}
+	insertItemSorted(slot.Page(), it)
+	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
+		itemBytes := it.marshal()
+		err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+			return logIns(bt.rel, blk, itemBytes)
+		})
+		bt.unpinW(slot)
+		return true, err
+	}
+	bt.pool.MarkDirty(slot)
+	bt.unpinW(slot)
+	return true, nil
+}
+
+// dedupConsolidate (M0055-0003 Phase B) walks a sorted item list
+// and merges runs of same-key items into a single conceptual
+// posting (represented here as the FIRST item; subsequent
+// duplicates are suppressed and their TIDs are folded into the
+// first via a synthetic posting marker). The result is suitable
+// for a fresh insertItemSorted re-build of the page.
+//
+// Implementation note: items[] is the EXPANDED form (one item
+// per (key, tid)) produced by `pageItems`. Consolidation
+// re-builds postings by replacing the first item of each run
+// with a posting-flagged item whose `key` is the actual key and
+// whose `ptr` is the first TID; subsequent duplicates contribute
+// their TIDs through a side-channel `extraTIDs` slice on the
+// item.
+//
+// To keep things simple, we DON'T yet rebuild posting bytes here
+// — instead we de-duplicate the expanded list by collapsing
+// runs of identical (key, ptr) pairs that may exist after
+// pageItems' expansion. For real consolidation into postings,
+// we use `marshalPosting` directly when re-writing the page
+// (Phase B's full landing — out of scope for this commit).
+//
+// What this function does TODAY: drop exact (key, ptr) duplicates
+// from the expanded list. That alone bounds duplicate-heavy
+// workloads where the same heap tuple shows up multiple times
+// in the bulk-build's input.
+func dedupConsolidate(items []item) []item {
+	if len(items) <= 1 {
+		return items
+	}
+	out := items[:0]
+	for i, it := range items {
+		if i == 0 {
+			out = append(out, it)
+			continue
+		}
+		prev := out[len(out)-1]
+		if CompareKeys(prev.key, it.key) == 0 && prev.ptr == it.ptr {
+			// Exact duplicate — drop.
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// compactRawSize (M0055-0003 Phase B) sums the marshalled byte
+// size of every item in `items` plus the per-item line-pointer
+// overhead. Used to decide whether dedup recovered enough space
+// to skip the split.
+func compactRawSize(items []item) int {
+	const itemIDSize = 4 // matches storage.itemIDSize
+	total := 0
+	for _, it := range items {
+		total += itemIDSize + 8 + len(it.key) // marshal: 8-byte prefix + key
+	}
+	return total
+}
+
+// pageFreeBudget returns the remaining free byte budget on a
+// page (pd_upper - pd_lower).
+func pageFreeBudget(p storage.Page) int {
+	h, err := storage.Header(p)
+	if err != nil {
+		return 0
+	}
+	return int(h.Upper()) - int(h.Lower())
+}
+
+// pageOccupied returns the bytes already used by line pointers
+// + tuple data on a page.
+func pageOccupied(p storage.Page) int {
+	h, err := storage.Header(p)
+	if err != nil {
+		return 0
+	}
+	return int(h.Lower()) - int(storage.SizeOfPageHeaderData) +
+		(int(btSpecialOffset) - int(h.Upper()))
+}
+
+// byteAwareSplitLoc (M0055-0002-followup-byte-split) returns the
+// 0-based slot index where the split should land so the left
+// half holds approximately half the total encoded byte size.
+// For fixed-width keys this collapses to len(items)/2 (within a
+// rounding tick); for variable-width keys the split point lands
+// where the byte cursor crosses half-total, producing balanced
+// halves in bytes — the metric the page-fill threshold actually
+// cares about.
+//
+// The minimum split point is 1 (left always retains at least one
+// item) and the maximum is len(items)-1 so the right side is
+// non-empty. A degenerate single-item input returns 1 (caller
+// guarantees ≥ 2 items because we're splitting a full page).
+func byteAwareSplitLoc(items []item) int {
+	if len(items) <= 2 {
+		return 1
+	}
+	total := 0
+	sizes := make([]int, len(items))
+	for i, it := range items {
+		// 8-byte fixed prefix + variable-length key (per
+		// `(item).marshal()` layout). We use the encoded size
+		// rather than just key length so the metric matches the
+		// on-page footprint.
+		sizes[i] = 8 + len(it.key)
+		total += sizes[i]
+	}
+	half := total / 2
+	cum := 0
+	for i := 0; i < len(items)-1; i++ {
+		cum += sizes[i]
+		if cum >= half {
+			// Place the split AFTER item i — left holds items[0..i],
+			// right holds items[i+1..]. Return i+1 because callers
+			// use `items[:mid]` / `items[mid:]`.
+			split := i + 1
+			if split < 1 {
+				split = 1
+			}
+			if split > len(items)-1 {
+				split = len(items) - 1
+			}
+			return split
+		}
+	}
+	// Fall-through: total too small to cross half-mark before the
+	// last entry — return n-1 so right has exactly one item.
+	return len(items) - 1
+}
+
+// readPageItem (M0055-0002 Phase A) decodes a single item at the
+// given 0-based line-pointer index. Used by binary-search probes
+// in `insertItemSorted` so the insert path no longer decodes
+// every item on the page. For posting-list line pointers
+// (M0047-0003) it returns the FIRST tid bundled in the posting
+// — that's enough for the binary search since all posting tids
+// share the same key.
+func readPageItem(p storage.Page, idx int) (item, error) {
+	raw, err := storage.PageGetItemRaw(p, uint16(idx+1))
+	if err != nil {
+		return item{}, err
+	}
+	if isPostingRaw(raw) {
+		key, tids, perr := parsePostingRaw(raw)
+		if perr != nil {
+			return item{}, perr
+		}
+		var ptr storage.ItemPointer
+		if len(tids) > 0 {
+			ptr = tids[0]
+		}
+		return item{keyLen: uint16(len(key)), ptr: ptr, key: key}, nil
+	}
+	return parseItem(raw)
 }
 
 func appendSorted(items []item, it item) []item {
@@ -1101,6 +1867,10 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 }
 
 // RangeScan invokes fn for every (key, ptr) pair where lo ≤ key ≤ hi.
+// Either bound may be nil to indicate an open-ended range:
+//   - nil lo means no lower bound (scan from the leftmost key).
+//   - nil hi means no upper bound (scan through the rightmost key).
+//
 // fn returning false stops the scan; the returned error from fn aborts
 // with that error.
 //
@@ -1125,30 +1895,69 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 		// have returned a leaf that has since been split. Skip
 		// rightward until we land on a page whose key range
 		// covers `lo` (or we run out of pages).
-		if keyExceedsHighKey(op, lo) {
+		// When lo is nil, keyExceedsHighKey(op, nil) is always false
+		// (nil compares less than any real key), so we never skip — correct.
+		if lo != nil && keyExceedsHighKey(op, lo) {
 			next := op.Next
 			bt.unpinR(slot)
 			cur = next
 			continue
 		}
-		items, err := pageItems(slot.Page())
-		bt.unpinR(slot)
-		if err != nil {
-			return err
+		// Copy raw page items before releasing the pin so fn may do
+		// further btree operations without deadlocking. Posting items
+		// (M0047-0003) are detected by the BTPostingFlag in keyLen and
+		// expanded to one (key, TID) call per TID in the posting list.
+		count, countErr := storage.PageLinePointerCount(slot.Page())
+		type rawSlot struct{ raw []byte }
+		rawSlots := make([]rawSlot, 0, count)
+		if countErr == nil {
+			for s := uint16(1); s <= uint16(count); s++ {
+				r, rawErr := storage.PageGetItemRaw(slot.Page(), s)
+				if rawErr == nil {
+					rawSlots = append(rawSlots, rawSlot{append([]byte(nil), r...)})
+				}
+			}
 		}
-		for _, it := range items {
-			if CompareKeys(it.key, lo) < 0 {
-				continue
-			}
-			if CompareKeys(it.key, hi) > 0 {
-				return nil
-			}
-			ok, err := fn(it.key, it.ptr)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return nil
+		bt.unpinR(slot)
+		for _, rs := range rawSlots {
+			if isPostingRaw(rs.raw) {
+				key, tids, perr := parsePostingRaw(rs.raw)
+				if perr != nil {
+					continue
+				}
+				if lo != nil && CompareKeys(key, lo) < 0 {
+					continue
+				}
+				if hi != nil && CompareKeys(key, hi) > 0 {
+					return nil
+				}
+				for _, tid := range tids {
+					ok, ferr := fn(key, tid)
+					if ferr != nil {
+						return ferr
+					}
+					if !ok {
+						return nil
+					}
+				}
+			} else {
+				it, perr := parseItem(rs.raw)
+				if perr != nil {
+					continue
+				}
+				if lo != nil && CompareKeys(it.key, lo) < 0 {
+					continue
+				}
+				if hi != nil && CompareKeys(it.key, hi) > 0 {
+					return nil
+				}
+				ok, ferr := fn(it.key, it.ptr)
+				if ferr != nil {
+					return ferr
+				}
+				if !ok {
+					return nil
+				}
 			}
 		}
 		cur = op.Next

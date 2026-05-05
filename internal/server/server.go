@@ -1,9 +1,28 @@
 // Package server implements the goopg listener and per-connection lifecycle.
 //
-// v0 supports the protocol-3.0 startup handshake only: it sends
-// AuthenticationOk, a fixed ParameterStatus block, BackendKeyData, and
-// ReadyForQuery, then rejects every subsequent frontend message with an
-// "unsupported" ErrorResponse. The simple Query path arrives in milestone 2.
+// # Per-connection goroutine model (M0042-0004)
+//
+// goopg spawns one goroutine per client TCP connection (serveConn). That
+// goroutine is the per-backend analogue of PostgreSQL's per-backend process
+// and owns exactly what the upstream backend owns:
+//
+//   - The active transaction state (mvcc.Transaction / mvcc.Snapshot).
+//   - The pinned-buffer set for the transaction's lifetime (storage.Pool.Pin/Unpin).
+//   - All WAL insert calls (wal.Writer.Append — runs on the client goroutine).
+//   - The synchronous-commit WAL flush (wal.Writer.FlushUpTo after commit).
+//
+// The goroutine does NOT own:
+//   - Background page flushing — that is Pool.FlushAll / Pool.FlushAllPaced,
+//     which are checkpointer-only (see internal/wal/checkpointer.go).
+//   - The WAL writer drain cycle — that is the walwriterLoop goroutine
+//     started by initdb.Open (M0042-0003).
+//   - Replication sender cycles — those are independent walsender goroutines.
+//   - Checkpointer / autovacuum / WAL retention — all independent goroutines.
+//
+// This boundary matches PostgreSQL's "only the backend process may pin
+// buffers and insert WAL; background processes flush/sync" model.
+// Assertions for the FlushAll boundary are wired via Pool.OnFlushAll.
+// See docs/design/0042-0004-client-backend-goroutine-alignment.md.
 //
 // Design: docs/design/0002-wire-protocol.md.
 package server
@@ -90,6 +109,16 @@ type Config struct {
 	Pool    *storage.Pool
 	TxnMgr  *mvcc.Manager
 
+	// FSM is the in-memory free-space map (M0046-0003). When non-nil,
+	// INSERT consults it to reuse pages freed by VACUUM instead of
+	// extending the relation. nil disables the optimisation.
+	FSM *storage.FSM
+
+	// VM is the in-memory visibility map (M0046-0004). When non-nil,
+	// index-only scans check it to skip heap fetches for ALL_VISIBLE
+	// pages. VACUUM sets the bits. nil disables the optimisation.
+	VM *storage.VisibilityMap
+
 	// LockMgr, when set, is plumbed into every executor.Context
 	// the dispatch path constructs. Operators consult it for
 	// relation-level lock acquisition; deadlock detection is
@@ -174,6 +203,12 @@ type Config struct {
 	// socket. Empty disables both — useful for in-process tests
 	// that don't want a sticky pidfile in /tmp.
 	DataDir string
+
+	// MaxQueryPayloadBytes, when non-zero, overrides MaxRegularMessageLength
+	// as the per-connection payload ceiling for regular (post-startup) frames.
+	// Tests set this to a small value to exercise the oversized-frame path
+	// without sending multi-MiB messages. Zero means use MaxRegularMessageLength.
+	MaxQueryPayloadBytes int
 }
 
 // hasStorage reports whether all three storage handles are configured.
@@ -222,10 +257,12 @@ type Server struct {
 	ready    chan struct{} // closed once listener is bound
 	addr     atomic.Pointer[net.TCPAddr]
 
-	connWG    sync.WaitGroup
-	nextPID   atomic.Uint32
+	connWG        sync.WaitGroup
+	nextPID       atomic.Uint32
 	nextBackendID atomic.Uint32
-	closeOnce sync.Once
+	closeOnce     sync.Once
+
+	cancelReg *backendCancelRegistry
 
 	// controlListener is the operator-facing command socket; nil
 	// when DataDir is unset (in-process tests).
@@ -237,8 +274,9 @@ type Server struct {
 func New(cfg Config) *Server {
 	cfg.defaults()
 	s := &Server{
-		cfg:   cfg,
-		ready: make(chan struct{}),
+		cfg:       cfg,
+		ready:     make(chan struct{}),
+		cancelReg: newCancelRegistry(),
 	}
 	s.nextPID.Store(0)
 	return s
@@ -416,9 +454,22 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		"remote", raw.RemoteAddr().String(),
 		"pid", pid,
 	)
+	// Catch any unrecovered panic so every backend exit is logged at ERROR
+	// rather than crashing the process without a log entry. This is a
+	// defensive observability wrapper — no panics are expected in normal
+	// operation. The connection is always closed and the entry unregistered.
+	var exitErr any
 	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("backend goroutine panic", "panic", r)
+			exitErr = r
+		}
 		_ = raw.Close()
-		logger.Debug("connection closed")
+		if exitErr != nil {
+			logger.Info("connection closed", "reason", "panic")
+		} else {
+			logger.Info("connection closed")
+		}
 	}()
 
 	connCtx, cancel := context.WithCancel(ctx)
@@ -439,7 +490,12 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// Bound the handshake.
 	_ = raw.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
 
-	r := protocol.NewFrameReader(raw)
+	var r *protocol.FrameReader
+	if s.cfg.MaxQueryPayloadBytes > 0 {
+		r = protocol.NewFrameReaderWithLimit(raw, s.cfg.MaxQueryPayloadBytes)
+	} else {
+		r = protocol.NewFrameReader(raw)
+	}
 	w := protocol.NewFrameWriter(raw)
 
 	params, err := s.handleStartup(r, w)
@@ -552,12 +608,21 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// update pg_stat_activity state.
 	_ = sess.Set("goopg.backend_pid", pidStr, false)
 
-	if err := s.sendStartupReply(w, sess, pid); err != nil {
+	// Generate and register cancel credentials for this connection.
+	secret, err := newSecretKey()
+	if err != nil {
+		logger.Info("secret key generation failed", "err", err)
+		return
+	}
+	cancelEntry := s.cancelReg.register(pid, secret)
+	defer s.cancelReg.unregister(pid)
+
+	if err := s.sendStartupReply(w, sess, pid, secret); err != nil {
 		logger.Info("startup reply failed", "err", err)
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, r, w, sess, logger, isReplication)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -684,8 +749,16 @@ func (s *Server) handleStartup(r *protocol.FrameReader, w *protocol.FrameWriter)
 			}
 			continue
 		case protocol.CancelRequestCode:
-			// v0 has no backends to cancel; close silently per protocol.
-			return nil, errors.New("cancel request received (v0 ignores)")
+			// Dispatch cancel to the target backend and close silently.
+			// The protocol spec says: after sending CancelRequest the
+			// client closes the connection immediately; the server closes
+			// its end silently without any reply.
+			if len(payload) == 8 {
+				targetPID := binary.BigEndian.Uint32(payload[0:4])
+				targetSecret := binary.BigEndian.Uint32(payload[4:8])
+				s.cancelReg.cancelQuery(targetPID, targetSecret)
+			}
+			return nil, errors.New("cancel request handled")
 		}
 		if version != protocol.ProtocolVersion3_0 {
 			major, minor := version>>16, version&0xFFFF
@@ -706,16 +779,13 @@ func (s *Server) handleStartup(r *protocol.FrameReader, w *protocol.FrameWriter)
 // sendStartupReply emits the post-auth portion of the startup sequence:
 // the ParameterStatus block (driven by the GUC registry), BackendKeyData,
 // and ReadyForQuery. AuthenticationOk has already been written by
-// checkAuth at this point.
-func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionRegistry, pid uint32) error {
+// checkAuth at this point. secret must be the same value registered in
+// the cancel registry so that CancelRequest can look up the backend.
+func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionRegistry, pid, secret uint32) error {
 	for _, kv := range sess.ReportableVariables() {
 		if err := w.WriteParameterStatus(kv.Name, kv.Value); err != nil {
 			return err
 		}
-	}
-	secret, err := newSecretKey()
-	if err != nil {
-		return err
 	}
 	if err := w.WriteBackendKeyData(pid, secret); err != nil {
 		return err
@@ -730,7 +800,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
 	extended := newExtendedState()
 	var copyIn *copyInState
 	for {
@@ -740,8 +810,23 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 		}
 		f, err := r.ReadFrame()
 		if err != nil {
+			if errors.Is(err, protocol.ErrFrameTooLarge) {
+				// The oversized payload was already drained by ReadFrame so the
+				// stream is re-synchronised. Send a proper error response and
+				// keep the session alive so HammerDB / libpq can retry.
+				logger.Info("oversized client message rejected", "err", err)
+				if werr := s.writeQueryError(w, sqlstate.ProtocolViolation, err.Error()); werr != nil {
+					logger.Info("write error after oversized message", "err", werr)
+					return
+				}
+				if werr := w.Flush(); werr != nil {
+					logger.Info("flush error after oversized message", "err", werr)
+					return
+				}
+				continue
+			}
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-				logger.Debug("read frame error", "err", err)
+				logger.Info("connection read error", "err", err)
 			}
 			return
 		}
@@ -768,6 +853,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 		case protocol.MsgTerminate:
 			return
 		case protocol.MsgQuery:
+			// Create a per-query cancellable context and register its
+			// cancel function so an incoming CancelRequest can fire it.
+			queryCtx, queryCancel := context.WithCancel(ctx)
+			entry.setQueryCancel(queryCancel)
+
 			// Replication-mode connections route MsgQuery through the
 			// replication-command dispatcher instead of the regular
 			// SQL path. The dispatcher recognises IDENTIFY_SYSTEM /
@@ -777,17 +867,21 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 			// like SHOW still work for diagnostics.
 			if isReplication {
 				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload)
+				entry.clearQueryCancel()
+				queryCancel()
 				if err != nil {
-					logger.Debug("replication command write error", "err", err)
+					logger.Info("replication command write error", "err", err)
 					return
 				}
 				if handled {
 					break
 				}
 			}
-			nextCopyIn, err := s.handleQueryOrCopy(w, sess, f.Payload)
+			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload)
+			entry.clearQueryCancel()
+			queryCancel()
 			if err != nil {
-				logger.Debug("handleQueryOrCopy write error", "err", err)
+				logger.Info("query write error", "err", err)
 				return
 			}
 			copyIn = nextCopyIn
@@ -827,7 +921,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, r *protocol.FrameReader
 				extended.syncRequired = true
 			}
 		case protocol.MsgExecute:
-			em, err := s.handleExecuteFrame(extended, f.Payload, w, sess)
+			queryCtx, queryCancel := context.WithCancel(ctx)
+			entry.setQueryCancel(queryCancel)
+			em, err := s.handleExecuteFrame(queryCtx, extended, f.Payload, w, sess)
+			entry.clearQueryCancel()
+			queryCancel()
 			if err != nil {
 				return
 			}

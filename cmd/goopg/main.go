@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,6 +30,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/server"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -138,11 +140,50 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// M0054-0004: optional mutex / block profile activation. The
+	// goroutine, heap, and CPU profiles work without runtime
+	// configuration, but `/debug/pprof/mutex` and `/debug/pprof/block`
+	// return empty samples unless `runtime.SetMutexProfileFraction(N)`
+	// and `runtime.SetBlockProfileRate(N)` have been called. These
+	// profiles add a small per-event overhead (~1-2% under contention)
+	// so they stay off by default; operators opt in via env vars when
+	// running the M0054-0004 bottleneck survey:
+	//
+	//   GOOPG_MUTEX_PROFILE_RATE=1   — sample every contention event
+	//   GOOPG_BLOCK_PROFILE_RATE=1   — sample every blocking event
+	//
+	// Higher integer values reduce sample rate (1 in N events). The
+	// pprof endpoint itself is always on so cpu / heap / goroutine
+	// captures need no configuration.
+	if v := os.Getenv("GOOPG_MUTEX_PROFILE_RATE"); v != "" {
+		if r, err := strconv.Atoi(v); err == nil && r > 0 {
+			runtime.SetMutexProfileFraction(r)
+			logger.Info("mutex profiling enabled", "rate", r)
+		}
+	}
+	if v := os.Getenv("GOOPG_BLOCK_PROFILE_RATE"); v != "" {
+		if r, err := strconv.Atoi(v); err == nil && r > 0 {
+			runtime.SetBlockProfileRate(r)
+			logger.Info("block profiling enabled", "rate", r)
+		}
+	}
+
+	// M0054-0006: NLI rollback switch. The default is "on"; set
+	// `GOOPG_DISABLE_NLI=1` to revert to the pre-M0054-0006 plan
+	// shape (the M0054-0006a-pre input-IndexScan rewrite stays
+	// active — only the NestedLoopIndexJoin promotion is gated).
+	if v := os.Getenv("GOOPG_DISABLE_NLI"); v == "1" || v == "true" {
+		planner.SetNLIEnabled(false)
+		logger.Info("nestloop index join disabled via env", "var", "GOOPG_DISABLE_NLI")
+	}
+
 	// Start pprof HTTP endpoint on 127.0.0.1:6060 for CPU/heap profiling.
 	// Available endpoints:
 	//   /debug/pprof/profile?seconds=30  — CPU profile (download with go tool pprof)
 	//   /debug/pprof/heap               — heap profile
 	//   /debug/pprof/goroutine          — goroutine dump
+	//   /debug/pprof/mutex              — mutex contention (needs GOOPG_MUTEX_PROFILE_RATE>0)
+	//   /debug/pprof/block              — blocking events  (needs GOOPG_BLOCK_PROFILE_RATE>0)
 	go func() {
 		pprofAddr := "127.0.0.1:6060"
 		ln, err := net.Listen("tcp", pprofAddr)
@@ -186,6 +227,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// buffer pool. Without a config file this is just the seeded
 	// defaults; with one we apply the file's entries on top.
 	registry := config.BuildDefaultRegistry()
+
+	// M0054-0006e-followup: bridge SQL `SET enable_nestloop_index =
+	// off|on` to the planner's process-global atomic kill-switch.
+	// Sessions can now toggle the rule at runtime; the most-recent
+	// SET wins process-wide (matches the package-level `atomic.Bool`
+	// design).
+	registry.OnChange("enable_nestloop_index", func(value string) {
+		planner.SetNLIEnabled(value == "on" || value == "true" || value == "1")
+	})
 	if *confPath != "" {
 		entries, err := config.ParseConfigFile(*confPath)
 		if err != nil {
@@ -203,9 +253,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if *dataDir != "" {
 		poolSlots := poolSlotsFromGUC(registry)
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
-		walDirectIO := boolGUC(registry, "wal_direct_io", false)
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
+		walWriterDelayMS := intGUC(registry, "wal_writer_delay", 200)
+		bgwriterDelayMS := intGUC(registry, "bgwriter_delay", 200)
+		bgwriterMaxPages := intGUC(registry, "bgwriter_lru_maxpages", 100)
 		aioMethod := stringGUC(registry, "io_method", "")
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
@@ -214,9 +266,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			DataDir:               *dataDir,
 			PoolSlots:             poolSlots,
 			WALInitZero:           walInitZero,
-			WALDirectIO:           walDirectIO,
 			WALSenderMemoryBuffer: walSenderMemBuf,
 			WALBuffers:            walBuffers,
+			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
+			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
+			BgwriterMaxPages:      bgwriterMaxPages,
 			AIOMethod:             aioMethod,
 			AIOWorkers:            aioWorkers,
 			AIOMaxConcurrency:     aioMax,
@@ -251,33 +305,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 				"workers", aioWorkers,
 				"max_concurrency", aioMax)
 		}
-		// WAL direct-I/O startup line: surfaces whether the
-		// operator's `wal_direct_io=on` request actually took
-		// effect or fell back to buffered. Three cases:
-		//   - requested=false           → no log line (silent default)
-		//   - requested=true, ok=true   → event=wal_direct_io_active
-		//   - requested=true, ok=false  → event=wal_direct_io_fallback
-		// Mirrors the M0009 `event=aio_engine_attached` /
-		// `event=aio_method_fallback` shape so operators grep one
-		// vocabulary across both subsystems. See
-		// docs/design/0010-0001-wal-direct-io-write-path.md.
-		if rt.WAL != nil && rt.WAL.DirectIORequested() {
-			if reason := rt.WAL.DirectIOFallbackReason(); reason != "" {
-				logger.Warn("wal direct io fallback",
-					"event", "wal_direct_io_fallback",
-					"requested", true,
-					"reason", reason)
-			} else {
-				logger.Info("wal direct io active",
-					"event", "wal_direct_io_active",
-					"requested", true)
-			}
-		}
-		// Walsender in-memory WAL handoff (M0010-0002): when
-		// the ring is configured, log its capacity at startup
-		// so an operator can verify the rollout — particularly
-		// important when wal_direct_io=on, since the ring is
-		// the page-cache replacement for sender-path reads.
+		// Walsender in-memory WAL handoff (M0010-0002): log ring
+		// capacity at startup so an operator can verify the rollout.
 		if rt.WAL != nil && rt.WAL.MemRing() != nil {
 			logger.Info("wal sender memory buffer attached",
 				"event", "wal_sender_memory_buffer_attached",
@@ -307,6 +336,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.Catalog = rt.Catalog
 		cfg.Pool = rt.Pool
 		cfg.TxnMgr = rt.TxnMgr
+		cfg.FSM = rt.FSM
+		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
 		cfg.WalSenders = rt.WalSenders
@@ -325,6 +356,22 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		cfg.Policy = policy
 		logger.Info("loaded pg_hba.conf", "path", *hbaPath, "rules", len(policy.Rules))
+	}
+
+	// Auto-load pg_auth from the data directory when it exists.
+	// pg_auth format: one "username:secret" per line; secret is
+	// plaintext, md5<hex>, or a SCRAM-SHA-256 verifier string.
+	if *dataDir != "" {
+		pgAuthPath := filepath.Join(*dataDir, "pg_auth")
+		if _, statErr := os.Stat(pgAuthPath); statErr == nil {
+			store, err := auth.LoadUsersFile(pgAuthPath)
+			if err != nil {
+				fmt.Fprintf(stderr, "goopg start: %v\n", err)
+				return 1
+			}
+			cfg.UserStore = store
+			logger.Info("loaded pg_auth", "path", pgAuthPath)
+		}
 	}
 
 	// Honour the checkpoint_timeout GUC (milestone 0002). Default of

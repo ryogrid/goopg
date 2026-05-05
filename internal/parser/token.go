@@ -207,6 +207,10 @@ const (
 	KwOut       Keyword = "out"
 	KwInout     Keyword = "inout"
 	KwVariadic  Keyword = "variadic"
+
+	// M0050-0004: savepoint keywords.
+	KwSavepoint Keyword = "savepoint"
+	KwRelease   Keyword = "release"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -339,6 +343,8 @@ var keywords = map[string]Keyword{
 	"out":          KwOut,
 	"inout":        KwInout,
 	"variadic":     KwVariadic,
+	"savepoint":    KwSavepoint,
+	"release":      KwRelease,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

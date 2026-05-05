@@ -1036,3 +1036,60 @@ func TestWriteBlockAIOPopulatesTarget(t *testing.T) {
 		t.Errorf("Target=%q want %q", got, want)
 	}
 }
+
+// TestPinNewEmitsSmgrCreateOnFirstBlock verifies that Pool.PinNew calls the
+// LogSmgrCreate hook with the correct RelFileNode when it creates block 0 of
+// a new relation, and does NOT call it for subsequent blocks.
+func TestPinNewEmitsSmgrCreateOnFirstBlock(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 88888, Fork: MainFork}
+
+	var emitted []RelFileNode
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots: 8,
+		LogSmgrCreate: func(r RelFileNode) error {
+			emitted = append(emitted, r)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// First PinNew: creates block 0 → should emit SmgrCreate.
+	s0, blk0, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blk0 != 0 {
+		t.Errorf("first PinNew: blk=%d want 0", blk0)
+	}
+	pool.MarkDirty(s0)
+	pool.Unpin(s0)
+
+	if len(emitted) != 1 {
+		t.Fatalf("SmgrCreate calls after block 0 = %d, want 1", len(emitted))
+	}
+	if emitted[0] != rel {
+		t.Errorf("emitted rel = %+v, want %+v", emitted[0], rel)
+	}
+
+	// Second PinNew: creates block 1 → must NOT emit SmgrCreate.
+	s1, blk1, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blk1 != 1 {
+		t.Errorf("second PinNew: blk=%d want 1", blk1)
+	}
+	pool.MarkDirty(s1)
+	pool.Unpin(s1)
+
+	if len(emitted) != 1 {
+		t.Errorf("SmgrCreate calls after block 1 = %d, want still 1", len(emitted))
+	}
+}

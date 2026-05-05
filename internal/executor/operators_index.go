@@ -10,6 +10,58 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// followHOTChain walks the HOT chain starting at startSlot on the given
+// page and returns the first visible tuple along with its actual slot.
+// Returns (HeapTuple{}, 0, false) when no visible tuple exists in the chain.
+//
+// HOT invariant: all versions in a chain reside on the same page, so no
+// additional I/O is needed. The caller must hold at least a read lock on
+// the page for the duration of this call.
+//
+// ItemIDRedirect line pointers (created by opportunistic pruning when a chain
+// root is freed) are followed transparently — the redirect leads to the live
+// chain tip, skipping the freed slots.
+func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID) (storage.HeapTuple, uint16, bool) {
+	const maxChain = 64
+	cur := startSlot
+	for i := 0; i < maxChain; i++ {
+		// Check line-pointer flags before fetching tuple bytes.
+		item, err := storage.PageGetItemID(page, cur)
+		if err != nil {
+			return storage.HeapTuple{}, 0, false
+		}
+		if item.Flags == storage.ItemIDRedirect {
+			// Pruning converted this slot to a redirect. Follow it.
+			next := item.Offset // Offset holds the redirect target slot
+			if next == cur {
+				return storage.HeapTuple{}, 0, false // self-reference guard
+			}
+			cur = next
+			continue
+		}
+		if item.Flags != storage.ItemIDNormal {
+			return storage.HeapTuple{}, 0, false // unused or dead slot
+		}
+		t, err := storage.PageGetHeapTuple(page, cur)
+		if err != nil {
+			return storage.HeapTuple{}, 0, false
+		}
+		if mvcc.TupleVisible(t.Header, snap, xid) {
+			return t, cur, true
+		}
+		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+			// Chain end: tuple is not visible and has no successor.
+			return storage.HeapTuple{}, 0, false
+		}
+		next := t.Header.CTID.Offset
+		if next == cur {
+			return storage.HeapTuple{}, 0, false // self-reference guard
+		}
+		cur = next
+	}
+	return storage.HeapTuple{}, 0, false
+}
+
 type indexScanOp struct {
 	plan *planner.IndexScan
 	ctx  *Context
@@ -21,6 +73,17 @@ type indexScanOp struct {
 	// lockRowsOp.currentTID after Next emits the row.
 	tids []storage.ItemPointer
 	idx  int
+
+	// M0054-0006a: state captured at Open() time and reused across
+	// Rescan() calls when the index probe is driven by an outer row
+	// from a parent NestedLoopIndexJoin.
+	heapRel storage.RelFileNode
+	tree    *btree.BTree
+	// outerRow is the row that the parent NLI bound via BindOuter.
+	// nil when this scan is run from a single-table path (the
+	// historical case): then `o.plan.Key` / `LowKey` / `HighKey`
+	// must reduce to constants.
+	outerRow Row
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -29,7 +92,24 @@ func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
 
 func (o *indexScanOp) Schema() planner.Schema { return o.plan.Output() }
 
+// Open performs the one-time prep (lock + btree.Open) and then runs
+// a single drain pass with no outer row bound (the historical
+// single-table-IndexScan path). Parent operators that drive multiple
+// probes (M0054-0006 NestedLoopIndexJoin) instead call Open and
+// then `Rescan(outerRow)` per outer row.
 func (o *indexScanOp) Open(ctx *Context) error {
+	if err := o.openPrep(ctx); err != nil {
+		return err
+	}
+	return o.Rescan(nil)
+}
+
+// openPrep does the one-time setup that is independent of any outer
+// row binding: context capture, relation lock acquisition, and
+// btree.Open. NLI parents call this directly and then issue
+// `Rescan(outerRow)` once per outer row without re-acquiring locks
+// or re-opening the index.
+func (o *indexScanOp) openPrep(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "IndexScan requires storage handles in Context"}
 	}
@@ -37,51 +117,137 @@ func (o *indexScanOp) Open(ctx *Context) error {
 	o.rows = nil
 	o.tids = nil
 	o.idx = 0
+	o.outerRow = nil
 
-	heapRel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(heapRel, lockmgr.AccessShareLock); err != nil {
+	o.heapRel = ctx.Catalog.RelFileNode(o.plan.Table)
+	if err := ctx.acquireRelLock(o.heapRel, lockmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
 		return err
-	}
-
-	key, ok, err := o.lookupKey()
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return nil
 	}
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := btree.Open(ctx.Pool, idxRel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
-	err = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+	o.tree = tree
+	return nil
+}
+
+// BindOuter is invoked by the M0054-0006 NestedLoopIndexJoin parent
+// before each Rescan. The bound row is the input to evalExpr when
+// resolving Key / LowKey / HighKey expressions that reference outer
+// columns (a planner.ColumnRef whose Index is offset by the inner
+// schema width).
+func (o *indexScanOp) BindOuter(row Row) {
+	o.outerRow = row
+}
+
+// Rescan re-drains the underlying index after binding an outer row.
+// The historical single-table-IndexScan path calls Open which calls
+// Rescan(nil); the M0054-0006 NLI path calls Open once then Rescan
+// per outer row.
+func (o *indexScanOp) Rescan(outerRow Row) error {
+	o.rows = o.rows[:0]
+	o.tids = o.tids[:0]
+	o.idx = 0
+	o.outerRow = outerRow
+
+	if o.tree == nil {
+		// Defensive: openPrep must have been called.
+		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "indexScanOp.Rescan called before Open"}
+	}
+
+	var loBytes, hiBytes []byte
+	if len(o.plan.Keys) > 0 {
+		// Multi-column equality probe (M0054-0006-followup-Q9-
+		// composite). Encode each leading column from
+		// `Index.Columns[0..len(Keys)-1]` in order. The planner
+		// guarantees `len(Keys) == len(Index.Columns)` whenever
+		// `Keys` is non-empty, so no suffix padding is required —
+		// we synthesise a full equality probe.
+		key, ok, err := o.lookupKeys()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		loBytes = key
+		hiBytes = key
+	} else if o.plan.Key != nil {
+		// Single-column equality scan: probe key is both lo and hi.
+		key, ok, err := o.lookupKey()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		loBytes = key
+		hiBytes = key
+		// Composite-index leading-column probe (M0053-0001):
+		// page keys carry suffix bytes for the trailing columns, so the
+		// inclusive upper bound must be widened to match every key whose
+		// leading bytes equal `key`. CompareKeys is byte-wise via
+		// bytes.Compare; appending 0xFF padding produces an upper bound
+		// that exceeds any realistic trailing-column encoding.
+		if len(o.plan.Index.Columns) > 1 {
+			hiBytes = appendCompositeUpperPadding(key)
+		}
+	} else {
+		// Range scan: evaluate lo/hi bounds independently.
+		lo, hiB, ok, err := o.lookupRangeBounds()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		loBytes = lo
+		hiBytes = hiB
+		if len(o.plan.Index.Columns) > 1 && hiBytes != nil {
+			hiBytes = appendCompositeUpperPadding(hiBytes)
+		}
+	}
+
+	ctx := o.ctx
+	heapRel := o.heapRel
+	scanFn := func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
 			return false, err
 		}
 		slot.RLock()
-		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		// Follow the HOT chain: the index still points to the original
+		// tuple location even after HOT updates. followHOTChain walks
+		// CTID links (same page) until it finds the live version.
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
 		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
-		if err != nil {
-			return false, err
-		}
-		if !mvcc.TupleVisible(tuple.Header, ctx.Snap, ctx.Tx.XID) {
+		if !found {
 			return true, nil
 		}
 		row, err := DecodeRow(o.plan.Table.Columns, tuple.Data)
 		if err != nil {
 			return false, err
 		}
+		// Detoast any out-of-line column values (M0046-0006).
+		if needsDetoast(row) {
+			row, err = DetoastRow(ctx, heapRel, o.plan.Table.Columns, row)
+			if err != nil {
+				return true, nil // skip undetoastable tuple
+			}
+		}
 		o.rows = append(o.rows, row)
-		o.tids = append(o.tids, ptr)
+		// Record the actual live slot (not the index-pointed slot) so
+		// lockRowsOp stamps the current version for SELECT FOR UPDATE.
+		o.tids = append(o.tids, storage.ItemPointer{Block: ptr.Block, Offset: actualSlot})
 		return true, nil
-	})
-	if err != nil {
+	}
+
+	if err := o.tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	return nil
@@ -116,8 +282,51 @@ func (o *indexScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bo
 	return rel, o.tids[o.idx-1], true
 }
 
+// lookupKeys evaluates each `Keys[i]` against the bound outer row
+// and concatenates the per-column B-tree encodings to form the
+// multi-column equality probe key. Returns ok=false when any
+// component evaluates to NULL — equality on NULL is unknown, so
+// the probe correctly produces zero rows. (M0054-0006-followup-
+// Q9-composite.)
+func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
+	if len(o.plan.Keys) != len(o.plan.Index.Columns) {
+		// Defensive: the planner is contractually required to
+		// supply one Key per index column. A mismatch here is a
+		// planner bug, surfaced as runtime XX000 with the index
+		// name so the bug is named at the failure site.
+		return nil, false, &ExecError{
+			Code: "XX000", Pos: o.plan.Pos(),
+			Message: fmt.Sprintf("indexScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns", len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),
+		}
+	}
+	var probe []byte
+	for i, ke := range o.plan.Keys {
+		v, err := evalExpr(ke, o.outerRow, o.ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		if v.IsNull() {
+			return nil, false, nil
+		}
+		colName := o.plan.Index.Columns[i]
+		col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		if !found {
+			return nil, false, &ExecError{
+				Code: "XX000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("indexed column %q not found on table %q", colName, o.plan.Table.Name),
+			}
+		}
+		segment, encErr := encodeBTreeKeyForColumn(v, col, ke.Pos())
+		if encErr != nil {
+			return nil, false, encErr
+		}
+		probe = append(probe, segment...)
+	}
+	return probe, true, nil
+}
+
 func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
-	v, err := evalExpr(o.plan.Key, nil, o.ctx)
+	v, err := evalExpr(o.plan.Key, o.outerRow, o.ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -137,4 +346,74 @@ func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
 		return nil, false, encErr
 	}
 	return key, true, nil
+}
+
+// lookupRangeBounds evaluates LowKey and HighKey for a range scan.
+// Returns (loKey, hiKey, ok, err). ok=false when a non-nil bound
+// evaluates to NULL (the scan should produce no rows). Either loKey
+// or hiKey may be nil for an open-ended range.
+func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, err error) {
+	col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, o.plan.Index.Columns[0])
+	if !found {
+		return nil, nil, false, &ExecError{
+			Code:    "XX000",
+			Pos:     o.plan.Pos(),
+			Message: fmt.Sprintf("indexed column %q not found on table %q", o.plan.Index.Columns[0], o.plan.Table.Name),
+		}
+	}
+
+	if o.plan.LowKey != nil {
+		v, evalErr := evalExpr(o.plan.LowKey, o.outerRow, o.ctx)
+		if evalErr != nil {
+			return nil, nil, false, evalErr
+		}
+		if v.IsNull() {
+			// NULL lower bound → skip entire scan (no row can satisfy >= NULL)
+			return nil, nil, false, nil
+		}
+		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.LowKey.Pos())
+		if encErr != nil {
+			return nil, nil, false, encErr
+		}
+		loKey = k
+	}
+
+	if o.plan.HighKey != nil {
+		v, evalErr := evalExpr(o.plan.HighKey, o.outerRow, o.ctx)
+		if evalErr != nil {
+			return nil, nil, false, evalErr
+		}
+		if v.IsNull() {
+			// NULL upper bound → skip entire scan (no row can satisfy <= NULL)
+			return nil, nil, false, nil
+		}
+		k, encErr := encodeBTreeKeyForColumn(v, col, o.plan.HighKey.Pos())
+		if encErr != nil {
+			return nil, nil, false, encErr
+		}
+		hiKey = k
+	}
+
+	// ok = true as long as at least one bound is specified (the scan is valid)
+	return loKey, hiKey, true, nil
+}
+
+// compositeUpperPaddingLen is how many 0xFF bytes are appended to a
+// leading-column key to form an inclusive upper bound for a composite
+// index probe (M0053-0001). It must exceed the maximum suffix-column
+// encoding for any plausible composite key. 64 bytes covers up to
+// ~8 trailing int4/int8 columns, ~3 NUMERIC(38) columns, or 1 varchar(60).
+// PostgreSQL's MaxHighKeyLen on goopg is 32, but leaf keys are not
+// truncated, so a generous bound is required.
+const compositeUpperPaddingLen = 64
+
+// appendCompositeUpperPadding returns key with `compositeUpperPaddingLen`
+// trailing 0xFF bytes. Caller-owned slice; the input is not aliased.
+func appendCompositeUpperPadding(key []byte) []byte {
+	out := make([]byte, len(key)+compositeUpperPaddingLen)
+	copy(out, key)
+	for i := len(key); i < len(out); i++ {
+		out[i] = 0xFF
+	}
+	return out
 }

@@ -2,10 +2,26 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
+
+// IsBinaryFormat reports whether the COPY options select binary format.
+// Recognises `FORMAT binary` (new-style) and bare `BINARY` keyword (legacy).
+func IsBinaryFormat(opts []parser.CopyOption) bool {
+	for _, o := range opts {
+		if strings.EqualFold(o.Name, "format") && strings.EqualFold(o.Value, "binary") {
+			return true
+		}
+		if strings.EqualFold(o.Name, "binary") && o.Bool {
+			return true
+		}
+	}
+	return false
+}
 
 // RunCopyTo drives a planner.Copy whose Direction is CopyTo. For
 // table-form, it builds a SeqScan over plan.Table; for query-form, it
@@ -21,35 +37,47 @@ import (
 // source touches storage. Query-form expressions that don't touch
 // storage (e.g. `COPY (SELECT 1) TO STDOUT`) work with a bare
 // NewContext().
-func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (int64, error) {
+// RunCopyTo drives a planner.Copy whose Direction is CopyTo.
+// When the plan's options select binary format, it emits the 19-byte
+// PGCOPY header, binary rows, and the 2-byte trailer; otherwise it
+// emits text rows (one per call to emit). Returns the row count and
+// whether binary format was selected (so the caller can set the
+// wire-protocol format code accordingly).
+func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count int64, binary bool, err error) {
 	if plan == nil || plan.Direction != planner.CopyTo {
-		return 0, &ExecError{Code: "XX000", Message: "RunCopyTo: plan is nil or not CopyTo"}
+		return 0, false, &ExecError{Code: "XX000", Message: "RunCopyTo: plan is nil or not CopyTo"}
 	}
 	if err := rejectFileEndpoint(plan); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
-	src, cols, projection, err := buildCopySource(plan)
-	if err != nil {
-		return 0, err
+	binary = IsBinaryFormat(plan.Options)
+
+	src, cols, projection, buildErr := buildCopySource(plan)
+	if buildErr != nil {
+		return 0, binary, buildErr
 	}
-	if err := src.Open(ctx); err != nil {
+	if openErr := src.Open(ctx); openErr != nil {
 		_ = src.Close()
-		return 0, err
+		return 0, binary, openErr
 	}
 	defer src.Close()
 
-	var (
-		count int64
-		buf   []byte
-	)
+	if binary {
+		hdr := CopyBinaryHeader()
+		if err := emit(hdr); err != nil {
+			return 0, true, err
+		}
+	}
+
+	var buf []byte
 	for {
-		row, err := src.Next()
-		if err == EOF {
+		row, nextErr := src.Next()
+		if nextErr == EOF {
 			break
 		}
-		if err != nil {
-			return count, err
+		if nextErr != nil {
+			return count, binary, nextErr
 		}
 		if projection != nil {
 			projected := make(Row, len(projection))
@@ -59,34 +87,47 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (int64
 			row = projected
 		}
 		buf = buf[:0]
-		buf, err = EncodeCopyTextRow(buf, row, cols)
-		if err != nil {
-			return count, err
+		var encErr error
+		if binary {
+			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
+		} else {
+			buf, encErr = EncodeCopyTextRow(buf, row, cols)
+		}
+		if encErr != nil {
+			return count, binary, encErr
 		}
 		// Hand a copy to emit so callers can keep references safely.
 		line := make([]byte, len(buf))
 		copy(line, buf)
 		if err := emit(line); err != nil {
-			return count, err
+			return count, binary, err
 		}
 		count++
 	}
-	return count, nil
+
+	if binary {
+		trailer := AppendCopyBinaryTrailer(nil)
+		if err := emit(trailer); err != nil {
+			return count, true, err
+		}
+	}
+	return count, binary, nil
 }
 
-// CopyFromExecutor receives COPY TEXT lines from the wire and writes
-// them through the heap-write path. The wire layer is responsible for
-// splitting incoming CopyData payloads on `\n` (respecting the
-// COPY-TEXT escape rule that backslashed bytes inside a value never
-// appear unescaped on the wire — there's no actual backslash-newline
-// continuation in the line layer, only inside fields). Each line
-// passes through DecodeCopyTextRow → reorder via ColumnIndex →
-// writeHeapRow.
+// CopyFromExecutor receives COPY TEXT or COPY BINARY data from the wire
+// and writes it through the heap-write path.
+//
+// Text path: the wire layer splits CopyData payloads on '\n' and calls PushLine.
+// Binary path: the wire layer accumulates CopyData payloads and calls PushBinaryData.
 type CopyFromExecutor struct {
-	ctx     *Context
-	plan    *planner.Copy
-	cols    []catalog.Column // table's full column list, in declared order
-	rowsIn  int64
+	ctx    *Context
+	plan   *planner.Copy
+	cols   []catalog.Column // table's full column list, in declared order
+	rowsIn int64
+
+	// binary path state
+	binaryBuf         []byte
+	binaryHeaderSeen  bool
 }
 
 // NewCopyFromExecutor binds a CopyFromExecutor to ctx and plan.
@@ -139,6 +180,59 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 	}
 	c.rowsIn++
 	return nil
+}
+
+// PushBinaryData accepts a chunk of binary COPY data, accumulates it,
+// and inserts all complete rows it contains. The header (19 bytes) must
+// be present at the start of the first chunk; subsequent chunks continue
+// the stream. Returns (done, error) where done=true means the trailer
+// was found and no more rows should be expected.
+func (c *CopyFromExecutor) PushBinaryData(chunk []byte) (done bool, err error) {
+	c.binaryBuf = append(c.binaryBuf, chunk...)
+
+	if !c.binaryHeaderSeen {
+		n, parseErr := ParseCopyBinaryHeader(c.binaryBuf)
+		if parseErr != nil {
+			if len(c.binaryBuf) < 19 {
+				return false, nil // need more data
+			}
+			return false, &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY BINARY: %v", parseErr)}
+		}
+		c.binaryBuf = c.binaryBuf[n:]
+		c.binaryHeaderSeen = true
+	}
+
+	listedCols := make([]catalog.Column, len(c.plan.ColumnIndex))
+	for i, ord := range c.plan.ColumnIndex {
+		listedCols[i] = c.cols[ord]
+	}
+
+	rows, trailerFound, consumed, parseErr := ParseCopyBinaryRows(c.binaryBuf, listedCols)
+	if parseErr != nil {
+		return false, &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY BINARY: %v", parseErr)}
+	}
+	c.binaryBuf = c.binaryBuf[consumed:]
+
+	for _, src := range rows {
+		row := make(Row, len(c.cols))
+		for i := range c.cols {
+			row[i] = NullDatum
+		}
+		for srcIdx, tgtOrd := range c.plan.ColumnIndex {
+			row[tgtOrd] = src[srcIdx]
+		}
+		rel := c.ctx.Catalog.RelFileNode(c.plan.Table)
+		if writeErr := writeHeapRow(c.ctx, rel, c.cols, row); writeErr != nil {
+			return false, writeErr
+		}
+		c.rowsIn++
+	}
+	return trailerFound, nil
+}
+
+// IsBinary reports whether this executor is in binary mode.
+func (c *CopyFromExecutor) IsBinary() bool {
+	return IsBinaryFormat(c.plan.Options)
 }
 
 // RowsInserted reports how many rows have been successfully appended.

@@ -2,7 +2,7 @@
 
 | Field       | Value                          |
 | ----------- | ------------------------------ |
-| Status      | draft                          |
+| Status      | accepted (landed 2026-05-04)   |
 | Date        | 2026-05-01                     |
 | Milestone   | 0030 — Catalog Persistence and DDL WAL |
 | Refines     | [docs/milestones/0030-catalog-persistence-and-ddl-wal.md](../milestones/0030-catalog-persistence-and-ddl-wal.md) |
@@ -53,3 +53,48 @@ We will extend existing views in `pg_catalog` (like `pg_tables`, `pg_indexes`) t
 ### Manual Verification
 - Connect to `goopg` using `psql` and run `\d` and `\dt` commands to ensure they work correctly against the new heap-backed catalogs.
 - Verify that `SELECT * FROM pg_type` returns a comprehensive list of system types.
+
+## What Landed (2026-05-04)
+
+**Scope**: OID unification (pgoTypeOIDFor → catalog.TypeNameToOID) + type constants
+expansion + pg_attribute SQL surface test. pg_index deferred.
+
+### `internal/catalog/codec.go`
+
+**New OID constants**: `OIDBytea` (17), `OIDFloat4` (700), `OIDFloat8` (701),
+`OIDDate` (1082), `OIDTime` (1083), `OIDTimestampTZ` (1184).
+
+**Expanded `TypeNameToOID`**: now handles bytea, float4/real, float8/double precision,
+date, time/time without time zone, timestamptz/timestamp with time zone.
+
+**Expanded `OIDToTypeName`**: symmetric inverse for all new OIDs.
+
+### `internal/wal/pgoutput.go`
+
+`pgoTypeOIDFor(name)` now delegates to `catalog.TypeNameToOID(name)` — the hard-coded
+switch table is replaced with the authoritative codec function. The pgoutput plugin
+therefore uses the same OID mapping as DDL-sync and heap-catalog seeding.
+
+### SQL surface (already working via prior phases)
+
+- `SELECT * FROM pg_type` ✓ (Phase 3: heap-backed registration, 10 seeded rows)
+- `SELECT * FROM pg_attribute WHERE attrelid = X` ✓ (Phase 4: DDL-sync writes
+  rows; Phase 3+M0030-0003: startup scan; Phase M0030-0004: migration gate)
+- `SELECT attname, atttypid FROM pg_attribute WHERE attrelid = X` ✓ verified by
+  `TestPGAttributeSQLSurfaceForUserTable` — scans heap relfile via Pool, checks
+  OID values match `catalog.OIDInt4`/`OIDText`/`OIDBool`.
+
+### Tests (5 new in `codec_test.go` + 1 in `open_test.go`)
+
+- `TestBuiltinTypeOIDs`: extended with 6 new OID constants
+- `TestTypeNameToOIDRoundTrip`: all canonical names → OID → name round-trip
+- `TestTypeNameToOIDAlternativeNames`: aliases (integer, real, bigint, etc.)
+- `TestTypeNameToOIDUnknownFallsBackToText`: safe default
+- `TestPGAttributeSQLSurfaceForUserTable`: end-to-end pg_attribute heap scan
+
+### Still Deferred
+
+- `pg_index` as a real heap table (index metadata is still in Go structs).
+- Dynamic pg_type lookup at slot creation time (pgoTypeOIDFor now uses the codec
+  function; a future enhancement could scan the actual pg_type relfile at startup
+  to support user-defined types).

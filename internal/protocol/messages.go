@@ -228,9 +228,16 @@ const (
 	FieldMessage          byte = 'M'
 	FieldDetail           byte = 'D'
 	FieldHint             byte = 'H'
-	FieldFile             byte = 'F'
-	FieldLine             byte = 'L'
-	FieldRoutine          byte = 'R'
+	// FieldPosition is a decimal 1-based byte offset into the original query
+	// string. psql uses it to render the caret-pointer line under the error.
+	FieldPosition byte = 'P'
+	FieldWhere    byte = 'W'
+	FieldSchema   byte = 's'
+	FieldTable    byte = 't'
+	FieldColumn   byte = 'c'
+	FieldFile     byte = 'F'
+	FieldLine     byte = 'L'
+	FieldRoutine  byte = 'R'
 )
 
 // WriteErrorResponse emits 'E' / [code,value\0]+ / \0.

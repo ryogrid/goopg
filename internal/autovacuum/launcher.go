@@ -22,6 +22,12 @@ type Launcher struct {
 	Pool   *storage.Pool
 	TxnMgr *mvcc.Manager
 	Cat    catalog.Catalog
+	// FSM, when non-nil, is updated by each autovacuum pass so
+	// subsequent INSERT operations can reuse freed pages (M0046-0003).
+	FSM *storage.FSM
+	// VM, when non-nil, gets ALL_VISIBLE bits set per page after
+	// autovacuum so index-only scans can skip heap fetches (M0046-0004).
+	VM *storage.VisibilityMap
 
 	// NapInterval is the time between launcher wakeups.
 	NapInterval time.Duration
@@ -119,7 +125,26 @@ func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 		if last, ok := l.lastVacuum[key]; !ok || now.Sub(last) >= l.MinVacuumAge {
 			if l.needsVacuum(tbl) {
 				log.Info("autovacuum: running vacuum", "table", key)
-				stats, err := vacuum.Vacuum(l.Pool, l.TxnMgr, rel)
+				// Compute freeze horizon (M0046-0005).
+				var freezeBelow storage.TransactionID
+				if l.TxnMgr != nil {
+					currentXID := l.TxnMgr.NextXID()
+					const freezeMinAge = storage.TransactionID(50_000_000)
+					if currentXID > freezeMinAge {
+						freezeBelow = currentXID - freezeMinAge
+					}
+				}
+				stats, err := vacuum.VacuumWithOptions(l.Pool, l.TxnMgr, rel, vacuum.VacuumOptions{
+					FSM: l.FSM, VM: l.VM, FreezeBelow: freezeBelow,
+				})
+				if err == nil && freezeBelow > 0 {
+					if stats.NewFrozenXID != 0 {
+						tbl.RelFrozenXID = stats.NewFrozenXID
+					} else if stats.Frozen > 0 {
+						tbl.RelFrozenXID = freezeBelow
+					}
+				}
+				_ = stats // suppress "declared but not used" before log below
 				if err != nil {
 					log.Error("autovacuum: vacuum failed", "table", key, "error", err)
 				} else {
@@ -153,11 +178,22 @@ func (l *Launcher) loadTables() []*catalog.Table {
 	return nil
 }
 
+// autovacuumFreezeMaxAge is the XID age at which autovacuum is forced for
+// anti-wraparound protection. Mirrors autovacuum_freeze_max_age default.
+const autovacuumFreezeMaxAge = storage.TransactionID(200_000_000)
+
 // needsVacuum returns true if the table should be vacuumed.
-// v0 uses a simple heuristic: vacuum if the table has any
-// stats (has been analyzed) and RowCount > 0; otherwise skip
-// (no data yet or never analyzed).
+// The primary trigger is the regular data-change heuristic; the secondary
+// (higher-priority) trigger is XID-age anti-wraparound (M0046-0005).
 func (l *Launcher) needsVacuum(tbl *catalog.Table) bool {
+	// Anti-wraparound trigger: force vacuum when relfrozenxid is too old.
+	if tbl.RelFrozenXID != storage.InvalidTransactionID && l.TxnMgr != nil {
+		currentXID := l.TxnMgr.NextXID()
+		if currentXID > tbl.RelFrozenXID &&
+			currentXID-tbl.RelFrozenXID > autovacuumFreezeMaxAge {
+			return true
+		}
+	}
 	if tbl.Stats == nil {
 		return true
 	}
