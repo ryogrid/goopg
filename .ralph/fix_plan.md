@@ -2261,6 +2261,51 @@ rationale here.
       M0054-0006e — EXPLAIN renders `Nested Loop` with the inner
       IndexScan; cost-model gate; rollback path.
 
+      **Inherited from M0054-0003c (delegated 2026-05-05):**
+      M0054-0006 must close the `Q15b: Seq Scan on supplier`
+      gap surfaced by `analysis/tpch-explain-baseline.md`. The
+      predicate `s_suppkey = supplier_no` (column-vs-column join
+      against the inlined `revenue0` view) is exactly the shape
+      NLI exists to optimise. Acceptance for M0054-0006d MUST
+      include a parity-test row that re-runs the M0054-0002
+      baseline test after NLI lands and confirms the Q15b
+      `supplier` row in the Aggregate gaps section transitions
+      from `Seq Scan` to `Index Scan using supplier_pk`.
+
+      **Inherited from M0054-0003d (delegated 2026-05-05):**
+      M0054-0006 must close the part-table SeqScan in Q14, Q19
+      (column-vs-column `l_partkey = p_partkey`). Same parity-
+      test acceptance as above: regenerate the baseline, confirm
+      Q14 / Q19 list `Index Scan using part_pk on part` instead
+      of `Seq Scan`. Q9 (leading-wildcard LIKE) and Q16 (negated
+      predicates) are NOT covered — they are not NLI gaps. Q17
+      (no HammerDB index on p_brand / p_container) is also out
+      of scope. Q8 (`p_type = const` with `idx_part_type`) is
+      separately inherited as **M0054-0006a-pre**: build a
+      single-table-predicate-routing pass that, after
+      `bushy.go::rewriteMultiWayChain` constructs a
+      MultiHashJoin, walks `mh.Filters` and converts any
+      `single-table.col OP const` filter into an `IndexScan`
+      input via `planIndexScanFromWhere` /
+      `tryRangeIndexScan` scoped to that single table. This
+      pass is a natural prerequisite for M0054-0006a (param-
+      bound IndexScan) since both teach MultiHashJoin to consume
+      IndexScan inputs. Acceptance: regenerated baseline shows
+      Q8 reporting `Index Scan using idx_part_type on part`
+      instead of `Seq Scan on part`.
+
+      **General delegation policy** (added to milestone-internal
+      delegations, 2026-05-05): when a sub-task closes by
+      delegating residual work to another sub-task, the
+      receiving sub-task's description MUST be amended in the
+      same loop with (a) the specific gap inherited, (b) the
+      empirical evidence pinpointing it (concrete query / table
+      / predicate, not "performance"), and (c) the acceptance
+      criterion that proves the original gap is closed (typically
+      a parity test or a regenerated artifact). Closing without
+      this amendment violates the M0054 no-deferral clause.
+      Apply this policy to all subsequent M0054 sub-tasks.
+
 - [ ] M0054-0007: Re-run HammerDB TPC-H SF=1 power test → run-012.
       Verify the cumulative effect of M0054-0001..0006 on the
       end-to-end workflow. **The pass criterion is full 22/22 query
