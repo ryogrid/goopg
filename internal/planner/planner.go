@@ -316,7 +316,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	if s.Where != nil {
 		if isSimpleSingle {
-			if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+			// M0051-0004: inject synthetic range predicates alongside any
+			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
+			whereForIndex := injectLikeRangePredicates(s.Where)
+			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat); err != nil {
 				return nil, err
 			} else if ok {
 				node = idxNode
