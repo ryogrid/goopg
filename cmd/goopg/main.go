@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -138,11 +139,41 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	// M0054-0004: optional mutex / block profile activation. The
+	// goroutine, heap, and CPU profiles work without runtime
+	// configuration, but `/debug/pprof/mutex` and `/debug/pprof/block`
+	// return empty samples unless `runtime.SetMutexProfileFraction(N)`
+	// and `runtime.SetBlockProfileRate(N)` have been called. These
+	// profiles add a small per-event overhead (~1-2% under contention)
+	// so they stay off by default; operators opt in via env vars when
+	// running the M0054-0004 bottleneck survey:
+	//
+	//   GOOPG_MUTEX_PROFILE_RATE=1   — sample every contention event
+	//   GOOPG_BLOCK_PROFILE_RATE=1   — sample every blocking event
+	//
+	// Higher integer values reduce sample rate (1 in N events). The
+	// pprof endpoint itself is always on so cpu / heap / goroutine
+	// captures need no configuration.
+	if v := os.Getenv("GOOPG_MUTEX_PROFILE_RATE"); v != "" {
+		if r, err := strconv.Atoi(v); err == nil && r > 0 {
+			runtime.SetMutexProfileFraction(r)
+			logger.Info("mutex profiling enabled", "rate", r)
+		}
+	}
+	if v := os.Getenv("GOOPG_BLOCK_PROFILE_RATE"); v != "" {
+		if r, err := strconv.Atoi(v); err == nil && r > 0 {
+			runtime.SetBlockProfileRate(r)
+			logger.Info("block profiling enabled", "rate", r)
+		}
+	}
+
 	// Start pprof HTTP endpoint on 127.0.0.1:6060 for CPU/heap profiling.
 	// Available endpoints:
 	//   /debug/pprof/profile?seconds=30  — CPU profile (download with go tool pprof)
 	//   /debug/pprof/heap               — heap profile
 	//   /debug/pprof/goroutine          — goroutine dump
+	//   /debug/pprof/mutex              — mutex contention (needs GOOPG_MUTEX_PROFILE_RATE>0)
+	//   /debug/pprof/block              — blocking events  (needs GOOPG_BLOCK_PROFILE_RATE>0)
 	go func() {
 		pprofAddr := "127.0.0.1:6060"
 		ln, err := net.Listen("tcp", pprofAddr)

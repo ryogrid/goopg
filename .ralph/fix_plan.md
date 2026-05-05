@@ -2222,27 +2222,116 @@ rationale here.
         message, and the Aggregate gaps `lineitem` row's SeqScan /
         IndexScan tally is updated to include Q15a.
 
-- [ ] M0054-0004: pprof-driven bottleneck profiling under the
-      HammerDB power test. Promote `pprof-all.sh` (currently
-      untracked) to a tracked file; wire
-      `runtime.SetMutexProfileFraction(1)` /
-      `runtime.SetBlockProfileRate(1)` behind a GUC or env-var
-      toggle. Capture cpu / heap / mutex / block / goroutine profiles
-      at three windows: (W1) during steady-state Q9, (W2) during
-      steady-state Q20, (W3) at end-of-run / right before timeout.
-      Produce `analysis/tpch-pprof-bottleneck-survey.md` listing the
-      top 10 hot functions per profile, the top 3 lock contention
-      hotspots, and the top 3 allocation hotspots — each with a
-      concrete actionable next step. **No "needs more investigation"
-      hand-waving.**
+- [x] M0054-0004: pprof-driven bottleneck profiling under the
+      HammerDB power test.
+      (landed 2026-05-05: promoted `pprof-all.sh` to a tracked file
+      (was untracked). `cmd/goopg/main.go` now reads
+      `GOOPG_MUTEX_PROFILE_RATE` / `GOOPG_BLOCK_PROFILE_RATE` env
+      vars at startup; setting them to a positive integer enables
+      contention/blocking sampling via
+      `runtime.SetMutexProfileFraction` /
+      `runtime.SetBlockProfileRate`. A fresh HammerDB SF=1
+      build+power-test was run with both rates = 1; profiles
+      captured for five windows (`load`, `idx`, `q9`, `q20`,
+      `end`) under `bench/tpch/pprof/`. Survey published to
+      `analysis/tpch-pprof-bottleneck-survey.md`. THE BIG FINDINGS:
+      - **Q9 is GC-bound, not compute-bound.** 78 % of CPU is
+        spent in `runtime.systemstack` / `gcDrain` /
+        `scanobject` / `findObject`. Actual query work
+        (`aggregateOp.Open`) is only 18.37 % cum. Live heap 5 GB
+        with `spillReader.ReadRow` holding 1.65 GB.
+      - **Q20 is allocation-bound.** Cumulative 13.4 TB allocated
+        across `concatRows` (7,980 GB / 57.29 %) and `nullRow`
+        (5,413 GB / 38.86 %). All flowing through
+        `(*aggregateOp).Open` → `(*projectOp).Next`. The
+        correlated EXISTS subquery is being evaluated per outer
+        row (M0040 caching apparently does not extend to the
+        deepest correlated layer).
+      - **CREATE INDEX is tuple-decode-bound.** `DecodeRow` 39 %
+        cum during bulk-build because every heap row is fully
+        materialised even though only the index key column is
+        needed.
+      - Mutex / block contention is healthy across the board;
+        `bgwriter.WriteDirtyPages` is the only mutex hotspot
+        (95 %) and it's a single goroutine path, not a multi-
+        goroutine bottleneck.
+      Top-3 actionable items recorded in §4 of the survey doc and
+      delegated to M0054-0005 as M0054-0005a/0005b/0005c per the
+      M0054 no-deferral clause. Detailed Stage A/B/C design lives
+      in `docs/design/0054-0002-executor-tuple-copy-reduction.md`
+      (written by a sub-agent during the Q9 wait).
+      Caveat: mutex/block profiling at rate=1 added ~60 % wall-
+      time vs run-011 (Q9 1809 s → 3444 s). M0054-0007 reruns
+      without these flags. Build/run logs:
+      `bench/tpch/logs/build_goopg_20260505T164903.log`,
+      `bench/tpch/logs/run_goopg_20260505T170404.log`.)
 
 - [ ] M0054-0005: Implement the top-3 pprof-flagged perf fixes.
       Three concrete code changes, each with a before/after
       `pprof -top` slice or a before/after EXPLAIN ANALYZE timing
-      slice cited in the analysis report. Sized at the time
-      M0054-0004 finishes; if any single fix is too large, it spawns
-      its own M0054-0005a sub-task — but the parent does not close
-      until the work is real (landed code, not a forwarding pointer).
+      slice cited in the analysis report.
+
+      **Inherited from M0054-0004 (delegated 2026-05-05):** the
+      three named sub-tasks below are the M0054-0004 top-3
+      actionable items, copied with empirical evidence and the
+      parity acceptance criteria so the closure proves the survey
+      finding was actually addressed. Detailed implementation lives
+      in `docs/design/0054-0002-executor-tuple-copy-reduction.md`.
+
+  - [ ] M0054-0005a: Reduce per-row Row-slice allocation in
+        `concatRows` / `nullRow` / projection / multi-hash output.
+        **Evidence:** Q20 cumulative alloc shows
+        `executor.concatRows` 7,980 GB (57.29 %) +
+        `executor.nullRow` 5,413 GB (38.86 %) = 96 % of all
+        allocations channel through these two functions
+        (`(*aggregateOp).Open` → `(*projectOp).Next` 97 % cum).
+        Q9 keeps 0.16 GB live but their churn drives
+        `runtime.scanobject` to 76.75 % cum / 16.93 % flat.
+        **Files:** `internal/executor/row.go` (concatRows /
+        nullRow), `internal/executor/operators.go::projectOp.Next`,
+        `internal/executor/multi_hash_join.go::copyOut`. Approach
+        per design doc: introduce a per-operator reusable output
+        buffer with a `BorrowSemantics` capability bit, so
+        pipeline-internal callers re-use the slice and only
+        retention-needing operators (Sort, HashJoin-build,
+        Materialize) explicitly copy.
+        **Acceptance:** TPC-H Q9 re-run shows
+        `runtime.scanobject` cum **≤ 30 %** (down from 76.75 %);
+        Q20 re-run shows `concatRows + nullRow` cumulative
+        **≤ 1 TB** (down from 13.4 TB). Updated profiles linked
+        from `analysis/tpch-pprof-bottleneck-survey.md` §4 item #1.
+        `go test ./...` PASS.
+
+  - [ ] M0054-0005b: Spill-reader buffer reuse.
+        **Evidence:** Q9 in-use heap of 5.14 GB has
+        `executor.(*spillReader).ReadRow` holding **1.65 GB
+        live** plus `drainRowsBounded` 0.49 GB — together the
+        largest goopg-level live allocation under any TPC-H
+        query. Drives `findObject` to 30.57 % cum / 29.30 % flat
+        in Q9.
+        **Files:** `internal/executor/spill.go` (`spillReader.ReadRow`,
+        `drainRowsBounded`, `drainRows`).
+        **Approach:** read spilled rows into a reusable byte
+        buffer + decode into a re-used `Row` slot.
+        **Acceptance:** Q9 re-run shows `spillReader.ReadRow`
+        flat heap **≤ 200 MB** (down from 1.65 GB). Updated
+        profiles linked from survey §4 item #2.
+
+  - [ ] M0054-0005c: Index-build column projection.
+        **Evidence:** `idx` window CPU profile shows
+        `executor.DecodeRow` 39 % cum, `DecodeRowInto` 34 % cum,
+        `decodeValue` 31 % cum during bulk-build. Only the index
+        key column is needed but every heap row is fully
+        materialised.
+        **Files:** `internal/executor/operators_ddl.go`
+        (`(*ddlOp).collectBTreeEntries`),
+        `internal/executor/decode.go` (`DecodeRow`).
+        **Approach:** column-set hint to `DecodeRow` (or new
+        `DecodeColumn` for the single-column probe) so the
+        bulk-build path decodes only the indexed column.
+        **Acceptance:** future `idx` window profile shows
+        `DecodeRow` cum **≤ 15 %** (down from 39 %). Updated
+        profiles linked from survey §4 item #3.
 
 - [ ] M0054-0006: Nested-loop index join (NLI) — implementation, not
       scope. `docs/design/0053-0002-nested-loop-index-join-scope.md`
