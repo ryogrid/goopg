@@ -102,6 +102,127 @@ func TestNLIRuleRespectsKillSwitch(t *testing.T) {
 	}
 }
 
+// TestNLIRulePromotesCompositeKeyJoinWithFullLeadingPrefix
+// (M0054-0006-followup-Q9-composite) asserts that when every
+// leading column of a composite B-tree index is bound by an
+// equi-conjunct, the rule emits an NLI with `Keys` populated
+// and a multi-column probe.
+func TestNLIRulePromotesCompositeKeyJoinWithFullLeadingPrefix(t *testing.T) {
+	cat := catalog.NewInMemory()
+	parts, err := cat.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
+		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "ps_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "ps_supplycost", Type: catalog.Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "partsupp_pk"}, parts,
+		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	_, err = cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_orderkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "l_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt := parseOne(t, `SELECT * FROM lineitem, partsupp WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey`)
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	nli := firstNLI(node)
+	if nli == nil {
+		t.Fatalf("expected NLI in plan; tree: %s", describePlanTree(node))
+	}
+	if got := len(nli.Inner.Keys); got != 2 {
+		t.Fatalf("expected Inner.Keys length 2 for composite-key full-prefix probe; got %d (Inner.Key=%v)", got, nli.Inner.Key)
+	}
+	if nli.Inner.Index == nil || nli.Inner.Index.Name != "partsupp_pk" {
+		t.Fatalf("expected partsupp_pk index; got %v", nli.Inner.Index)
+	}
+}
+
+// TestNLIRuleSkipsCompositeIndexWithPartialKey
+// (M0054-0006-followup-Q9-composite) asserts the regression
+// guard: when only the leading column of a composite index has
+// an equi-conjunct, the rule MUST refuse to promote and the
+// plan keeps a HashJoin (or whatever the upstream rules
+// produced). Promoting on a partial prefix would hit the Q9
+// "is not numeric at runtime" regression.
+func TestNLIRuleSkipsCompositeIndexWithPartialKey(t *testing.T) {
+	cat := catalog.NewInMemory()
+	parts, err := cat.CreateTable(parser.ObjectName{Name: "partsupp"}, []catalog.Column{
+		{Name: "ps_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "ps_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only a composite index — single-column index on ps_partkey
+	// is intentionally absent so the rule has only the composite
+	// to choose from.
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "partsupp_pk"}, parts,
+		[]string{"ps_partkey", "ps_suppkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	_, err = cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Predicate binds only ps_partkey — ps_suppkey unbound.
+	stmt := parseOne(t, `SELECT * FROM lineitem, partsupp WHERE l_partkey = ps_partkey`)
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if findNLI(node) {
+		t.Fatalf("partial-prefix on composite index must not promote to NLI; tree: %s", describePlanTree(node))
+	}
+}
+
+// firstNLI returns the first *NestedLoopIndexJoin found in the
+// plan tree, or nil. Used by tests that inspect the produced
+// NLI's inner keys.
+func firstNLI(n Node) *NestedLoopIndexJoin {
+	if n == nil {
+		return nil
+	}
+	switch x := n.(type) {
+	case *NestedLoopIndexJoin:
+		return x
+	case *Project:
+		return firstNLI(x.Child)
+	case *Filter:
+		return firstNLI(x.Child)
+	case *Sort:
+		return firstNLI(x.Child)
+	case *Limit:
+		return firstNLI(x.Child)
+	case *Aggregate:
+		return firstNLI(x.Child)
+	case *WindowAgg:
+		return firstNLI(x.Child)
+	case *Join:
+		if r := firstNLI(x.Left); r != nil {
+			return r
+		}
+		return firstNLI(x.Right)
+	case *MultiHashJoin:
+		for _, t := range x.Tables {
+			if r := firstNLI(t); r != nil {
+				return r
+			}
+		}
+	}
+	return nil
+}
+
 // findNLI returns true when the plan tree contains a
 // `*NestedLoopIndexJoin` anywhere.
 func findNLI(n Node) bool {

@@ -278,7 +278,12 @@ type IndexScan struct {
 	pos     int
 	Table   *catalog.Table
 	Index   *catalog.Index
-	Key     Expr  // non-nil for equality scan (LowKey==HighKey implied)
+	Key     Expr  // non-nil for single-column equality scan (LowKey==HighKey implied)
+	Keys    []Expr // M0054-0006-followup-Q9-composite: multi-column equality probe.
+	// Keys[i] binds Index.Columns[i] in declared order. When non-empty, takes
+	// priority over Key. len(Keys) == len(Index.Columns) means a full equality
+	// probe (no suffix padding); a shorter prefix is rejected by the planner
+	// to keep the executor probe path purely equality-shaped.
 	LowKey  Expr  // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr  // inclusive upper bound for range scan; nil = no upper bound
 	schema  Schema

@@ -160,8 +160,24 @@ func (o *indexScanOp) Rescan(outerRow Row) error {
 	}
 
 	var loBytes, hiBytes []byte
-	if o.plan.Key != nil {
-		// Equality scan: probe key is both lo and hi.
+	if len(o.plan.Keys) > 0 {
+		// Multi-column equality probe (M0054-0006-followup-Q9-
+		// composite). Encode each leading column from
+		// `Index.Columns[0..len(Keys)-1]` in order. The planner
+		// guarantees `len(Keys) == len(Index.Columns)` whenever
+		// `Keys` is non-empty, so no suffix padding is required —
+		// we synthesise a full equality probe.
+		key, ok, err := o.lookupKeys()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		loBytes = key
+		hiBytes = key
+	} else if o.plan.Key != nil {
+		// Single-column equality scan: probe key is both lo and hi.
 		key, ok, err := o.lookupKey()
 		if err != nil {
 			return err
@@ -264,6 +280,49 @@ func (o *indexScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bo
 	}
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	return rel, o.tids[o.idx-1], true
+}
+
+// lookupKeys evaluates each `Keys[i]` against the bound outer row
+// and concatenates the per-column B-tree encodings to form the
+// multi-column equality probe key. Returns ok=false when any
+// component evaluates to NULL — equality on NULL is unknown, so
+// the probe correctly produces zero rows. (M0054-0006-followup-
+// Q9-composite.)
+func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
+	if len(o.plan.Keys) != len(o.plan.Index.Columns) {
+		// Defensive: the planner is contractually required to
+		// supply one Key per index column. A mismatch here is a
+		// planner bug, surfaced as runtime XX000 with the index
+		// name so the bug is named at the failure site.
+		return nil, false, &ExecError{
+			Code: "XX000", Pos: o.plan.Pos(),
+			Message: fmt.Sprintf("indexScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns", len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),
+		}
+	}
+	var probe []byte
+	for i, ke := range o.plan.Keys {
+		v, err := evalExpr(ke, o.outerRow, o.ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		if v.IsNull() {
+			return nil, false, nil
+		}
+		colName := o.plan.Index.Columns[i]
+		col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		if !found {
+			return nil, false, &ExecError{
+				Code: "XX000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("indexed column %q not found on table %q", colName, o.plan.Table.Name),
+			}
+		}
+		segment, encErr := encodeBTreeKeyForColumn(v, col, ke.Pos())
+		if encErr != nil {
+			return nil, false, encErr
+		}
+		probe = append(probe, segment...)
+	}
+	return probe, true, nil
 }
 
 func (o *indexScanOp) lookupKey() ([]byte, bool, error) {

@@ -123,6 +123,16 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 
 // tryBuildNLI returns a *NestedLoopIndexJoin replacement for `j`
 // when the equi-join shape and index availability admit it.
+//
+// Composite-index handling (M0054-0006-followup-Q9-composite):
+// when the chosen index has more than one leading column, every
+// such column MUST be bound by an equi-conjunct from j.Predicate;
+// otherwise we refuse to promote and keep HashJoin. Promoting on
+// only the leading column would emit a partial-prefix probe, and
+// the unbound trailing columns would carry whatever value the
+// inner scan happens to read — opening the door to the Q9
+// `column "ps_suppkey" is not numeric at runtime` regression
+// observed in run-012 attempt #1.
 func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// Only INNER and LEFT join types are supported. RIGHT/FULL
 	// require both sides materialised for the outer-row
@@ -145,11 +155,21 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	if !leftIsCol || !rightIsCol {
 		return nil, false
 	}
-	innerScan, innerKey, outerKey := pickInnerSide(j, leftCol, rightCol, leftWidth)
+	innerScan, _, _ := pickInnerSide(j, leftCol, rightCol, leftWidth)
 	if innerScan == nil {
 		return nil, false
 	}
-	idx := findBTreeIndexForColumn(cat, innerScan.Table, innerKey.Name)
+	// Collect ALL cross-side equi-conjuncts available to bind
+	// inner-side columns to outer-side expressions. The seed
+	// equi-conjunct (from extractEquiKeys) is always among these.
+	innerToOuter := collectCrossSideEquiKeys(j, leftWidth, innerScan)
+	if len(innerToOuter) == 0 {
+		return nil, false
+	}
+	// Choose an index that lives on `innerScan.Table` and whose
+	// EVERY leading column appears in `innerToOuter`. Prefer the
+	// longest such index (most columns bound = most selective).
+	idx, keys := pickIndexCoveringAllLeadingColumns(cat, innerScan.Table, innerToOuter)
 	if idx == nil {
 		return nil, false
 	}
@@ -163,17 +183,21 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		return nil, false
 	}
 
-	// Build the inner IndexScan whose Key references the outer
-	// column. The Key Expr is the OUTER ColumnRef directly — its
-	// `Index` is in joined-row coordinates (`outer ++ inner`),
-	// which is exactly what `nestedLoopIndexJoinOp` binds before
-	// each Rescan, so `evalExpr` resolves correctly.
+	// Build the inner IndexScan. For single-column indexes we
+	// keep using `Key` for backward compatibility with all
+	// existing single-column callers / tests; for composite
+	// indexes we use `Keys` so the executor encodes every
+	// leading column in declared order with no suffix padding.
 	inner := &IndexScan{
 		pos:    innerScan.Pos(),
 		Table:  innerScan.Table,
 		Index:  idx,
-		Key:    outerKey,
 		schema: innerScan.Output(),
+	}
+	if len(keys) == 1 {
+		inner.Key = keys[0]
+	} else {
+		inner.Keys = keys
 	}
 	// Build the joined output schema. NLI always emits
 	// `outer ++ inner` regardless of which side contributed which
@@ -196,6 +220,125 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		schema: joinedSchema,
 	}
 	return nli, true
+}
+
+// collectCrossSideEquiKeys walks j.Predicate (and j.LeftKey/RightKey
+// when Algo=Hash) and returns a map of inner-column-name → outer
+// expression. Only equi-conjuncts that genuinely cross the join
+// (one ColumnRef on each side, by joined-row coordinates relative
+// to leftWidth) are collected. innerScan defines which side counts
+// as "inner" — the side NOT equal to innerScan is "outer".
+func collectCrossSideEquiKeys(j *Join, leftWidth int, innerScan *SeqScan) map[string]Expr {
+	result := map[string]Expr{}
+	innerIsRight := Node(innerScan) == j.Right
+	addEq := func(a, b Expr) {
+		ac, aIsCol := a.(*ColumnRef)
+		bc, bIsCol := b.(*ColumnRef)
+		if !aIsCol || !bIsCol {
+			return
+		}
+		aLeft := ac.Index >= 0 && ac.Index < leftWidth
+		bLeft := bc.Index >= 0 && bc.Index < leftWidth
+		// Must be cross-side.
+		if aLeft == bLeft {
+			return
+		}
+		// Pick the inner-side ref. innerIsRight ⇒ inner-side has
+		// Index in [leftWidth, leftWidth+innerWidth).
+		var innerRef, outerRef *ColumnRef
+		if innerIsRight {
+			if !aLeft {
+				innerRef, outerRef = ac, bc
+			} else {
+				innerRef, outerRef = bc, ac
+			}
+		} else {
+			if aLeft {
+				innerRef, outerRef = ac, bc
+			} else {
+				innerRef, outerRef = bc, ac
+			}
+		}
+		if _, exists := result[innerRef.Name]; !exists {
+			result[innerRef.Name] = outerRef
+		}
+	}
+	// Hash-join's primary equi-key.
+	if j.LeftKey != nil && j.RightKey != nil {
+		addEq(j.LeftKey, j.RightKey)
+	}
+	// AND-conjuncts in Predicate.
+	for _, c := range walkAndConjunctsNLI(j.Predicate) {
+		bop, ok := c.(*BinaryOp)
+		if !ok || bop.Op != "=" {
+			continue
+		}
+		addEq(bop.Left, bop.Right)
+	}
+	return result
+}
+
+// walkAndConjunctsNLI flattens an AND chain into its leaf conjuncts.
+func walkAndConjunctsNLI(e Expr) []Expr {
+	if e == nil {
+		return nil
+	}
+	bop, ok := e.(*BinaryOp)
+	if !ok || bop.Op != "AND" {
+		return []Expr{e}
+	}
+	out := walkAndConjunctsNLI(bop.Left)
+	out = append(out, walkAndConjunctsNLI(bop.Right)...)
+	return out
+}
+
+// pickIndexCoveringAllLeadingColumns returns the longest B-tree
+// index on `tbl` whose EVERY column is bound by an entry in
+// `innerToOuter`. Single-column indexes also satisfy this when
+// the bound key is in the map. Returns (nil, nil) if no such index
+// exists. The returned `keys` slice is in `Index.Columns` order
+// — keys[i] is the outer Expr for Index.Columns[i].
+func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table, innerToOuter map[string]Expr) (*catalog.Index, []Expr) {
+	var best *catalog.Index
+	var bestKeys []Expr
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if !isBTreeIndex(idx) {
+			continue
+		}
+		if len(idx.Columns) == 0 {
+			continue
+		}
+		keys := make([]Expr, 0, len(idx.Columns))
+		covered := true
+		for _, col := range idx.Columns {
+			outer, ok := innerToOuter[col]
+			if !ok {
+				covered = false
+				break
+			}
+			keys = append(keys, outer)
+		}
+		if !covered {
+			continue
+		}
+		// Prefer the longest covered index (most-selective).
+		if best == nil || len(idx.Columns) > len(best.Columns) {
+			best = idx
+			bestKeys = keys
+		}
+	}
+	return best, bestKeys
+}
+
+// isBTreeIndex returns true when idx.Method is "btree" (case-insensitive).
+func isBTreeIndex(idx *catalog.Index) bool {
+	m := idx.Method
+	// avoid pulling in strings.ToLower for a hot path; method is
+	// always either "btree" or "BTREE".
+	if m == "btree" || m == "BTREE" {
+		return true
+	}
+	return false
 }
 
 // extractEquiKeys returns the `(leftKey, rightKey, ok)` triple from

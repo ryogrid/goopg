@@ -2528,8 +2528,45 @@ rationale here.
         registers without effect; the package-level toggle is
         the only runtime control surface.
 
-  - [ ] M0054-0006-followup-Q9-composite: NLI composite-index
-        regression — TPC-H Q9 fails at runtime with
+  - [x] M0054-0006-followup-Q9-composite: **LANDED 2026-05-05.**
+        Planner + executor extended to require ALL leading
+        columns of a composite B-tree index be bound by
+        equi-conjuncts before promoting an inner SeqScan to NLI.
+        Implementation:
+        - `internal/planner/plan.go::IndexScan` gained `Keys
+          []Expr` (multi-column equality probe).
+        - `internal/planner/nl_index_join.go::tryBuildNLI`
+          rewrites: collect every cross-side equi-conjunct
+          (`collectCrossSideEquiKeys`), then pick the longest
+          B-tree index whose every column is covered
+          (`pickIndexCoveringAllLeadingColumns`). Composite
+          index with partial-prefix predicate is REFUSED — the
+          plan keeps HashJoin.
+        - `internal/executor/operators_index.go::lookupKeys`
+          (new) encodes each `Keys[i]` against
+          `Index.Columns[i]` in declared order, no 0xFF padding.
+          The single-column `Key` path is preserved for
+          backward compatibility with all existing single-
+          column callers / tests.
+        Acceptance evidence:
+        - `go test ./internal/planner/... -run TestNLI` 5/5 PASS
+          including new `TestNLIRulePromotesCompositeKeyJoin
+          WithFullLeadingPrefix` and
+          `TestNLIRuleSkipsCompositeIndexWithPartialKey`.
+        - `go test ./internal/testutil/tpch/... -run
+          TestNLIResultParity` 2/2 PASS — cluster-backed
+          composite-key parity (`TestNLIResultParityComposite
+          Key`) round-trips identical row sets between NLI-on
+          and NLI-off (7/7 rows match for a Q9-shaped fixture).
+        - `GOOPG_DISABLE_NLI=1` env-var stays as emergency
+          escape hatch; default is now safe.
+        Live HammerDB Q9 with NLI enabled is tracked under
+        `M0054-0007-followup-resume` (pending the next full
+        2-hour run).
+
+  - [x] M0054-0006-followup-Q9-composite (ORIGINAL — superseded
+        by the LANDED entry above; preserved for context):
+        NLI composite-index regression — TPC-H Q9 fails at runtime with
         `ERROR: column "ps_suppkey" is not numeric at runtime`
         when NLI is enabled. Reproduced against HammerDB SF=1
         run-012 attempt #1 (2026-05-05); mitigated for run-012
