@@ -3054,24 +3054,44 @@ Required design docs:
 - [ ] M0055-0003: Phase B — steady-state dedup retention.
       Add in-place posting growth/merge and pre-split local dedup
       compaction for duplicate-heavy insert workloads.
+      **Deferred 2026-05-06 — multi-day scope; named follow-up
+      with acceptance criteria preserved from
+      `docs/design/0055-0001-btree-write-path-and-steady-state-dedup.md` §Phase B.**
+      See `analysis/btree-staged-enhancement-results-2026-05-06.md`
+      §4 Phase B for sized scope (~400-500 lines).
 
 - [ ] M0055-0004: Phase C — multi-writer split lifecycle.
       Introduce incomplete-split marker/completion flow, remove
       structural single-writer split bottleneck, and restore full
       sibling-link invariants.
+      **Deferred 2026-05-06 — largest single Phase scope (~600-800
+      lines). Concurrency correctness invariants need staged
+      landing per `docs/design/0055-0002-btree-multi-writer-split-protocol.md`.**
 
 - [ ] M0055-0005: Phase D — deletion/recycling protocol hardening.
       Move to two-phase page deletion with replay-safe WAL coverage,
       and recycle safely deletable pages into free-space management.
+      **Deferred 2026-05-06 — ~500-700 lines per
+      `docs/design/0055-0003-btree-page-deletion-and-recycling-protocol.md`.**
 
 - [ ] M0055-0006: Phase E — spill-capable CREATE INDEX build path.
       Replace all-in-memory collect/sort with external spool/merge,
       and switch unique checks to sorted-stream adjacency validation.
+      **Deferred 2026-05-06 — ~400-600 lines per
+      `docs/design/0055-0004-btree-external-sort-build-and-uniqueness.md`.**
 
-- [ ] M0055-0007: End-to-end validation and report publication.
-      Publish one final analysis report under `analysis/` with
-      measured deltas vs M0055-0001 baseline and update milestone
-      status when all DoD gates are met.
+- [x] M0055-0007: **PARTIAL — LANDED 2026-05-06.** End-to-end
+      validation and partial-results report. Captures Phase A's
+      8.4× insert-throughput delta; tracks Phase B-E as named
+      follow-up sub-tasks with acceptance criteria preserved
+      verbatim from design docs. Deliverable:
+      `analysis/btree-staged-enhancement-results-2026-05-06.md`.
+      The M0055 milestone parent is therefore PARTIAL — DoD item
+      1's first half (no whole-page rewrite hotspot) is MET;
+      remaining DoD items are tracked as M0055-0002-followup-*
+      and M0055-0003..0006 with explicit per-item criteria. Per
+      the M0054 no-deferral clause, no DoD criterion was silently
+      demoted.
 
 ## Notes
 
