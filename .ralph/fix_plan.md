@@ -2522,11 +2522,17 @@ rationale here.
         Acceptance: Q15b baseline shows `Index Scan using
         supplier_pk on supplier` (or another supplier index).
 
-  - [ ] M0054-0006e-followup: wire the `enable_nestloop_index`
-        GUC through to `nliEnabled.Store(...)` so SQL-level SET
-        propagates to the planner. Currently the SQL GUC
-        registers without effect; the package-level toggle is
-        the only runtime control surface.
+  - [x] M0054-0006e-followup: **LANDED 2026-05-05.** Wired
+        `SET enable_nestloop_index = off|on` to the planner's
+        package-global `nliEnabled` atomic via a new
+        `(*config.Registry).OnChange(name, fn)` callback hook
+        + `(SessionRegistry).Set/Reset` invoke. Registered in
+        `cmd/goopg/main.go` after `BuildDefaultRegistry`.
+        Acceptance: new `TestOnChangeCallbackFires` PASSes —
+        SET off → on → RESET delivers ["off","on","on"] to the
+        callback. SQL-level toggle now functional process-wide
+        (matches the package-level atomic.Bool design — most-
+        recent SET wins across sessions).
 
   - [x] M0054-0006-followup-Q9-composite: **LANDED 2026-05-05.**
         Planner + executor extended to require ALL leading
