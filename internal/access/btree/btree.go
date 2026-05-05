@@ -1611,7 +1611,23 @@ func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (b
 		bt.rightmostLeafBlk.Store(0)
 		return false, nil
 	}
-	// The rightmost leaf has no high key; any key is in range.
+	// M0056-0001: verify the key actually belongs on this leaf
+	// — the rightmost leaf has no high key, but it DOES have a
+	// SMALLEST key. Inserting a key smaller than the leaf's
+	// smallest entry would be a logical error (the key belongs
+	// on a left sibling). For an empty leaf any key is in
+	// range. With concurrent writers inserting disjoint key
+	// ranges, the cache may point at a leaf that's rightmost
+	// for one writer's range but irrelevant for another's;
+	// fall back to the descent path in that case.
+	count, perr := storage.PageLinePointerCount(slot.Page())
+	if perr == nil && count > 0 {
+		first, ferr := readPageItem(slot.Page(), 0)
+		if ferr == nil && CompareKeys(it.key, first.key) < 0 {
+			bt.unpinW(slot)
+			return false, nil
+		}
+	}
 	if !pageHasSpaceFor(slot.Page(), it) {
 		bt.unpinW(slot)
 		return false, nil

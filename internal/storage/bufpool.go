@@ -592,16 +592,36 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	delete(p.byTag, s.tag)
 	s.valid = false
 	s.dirty = false
+	// M0056-0001: reserve the slot BEFORE releasing poolMu so a
+	// concurrent `Pin` call's `evictLocked` skips it. Without
+	// this reservation the slot is observable to evictLocked
+	// (pinCount==0, usageCount==0) and could be stolen mid-I/O,
+	// trampling our subsequent tag/pinCount publication. Mirrors
+	// the regular `Pin` path's pre-publication reservation at
+	// line ~717.
+	s.tag = BufferTag{}
+	s.pinCount = 1
+	s.usageCount = 1
 	p.poolMu.Unlock()
 
 	s.contentMu.Lock()
 	if err := InitPage(s.page); err != nil {
 		s.contentMu.Unlock()
+		// Roll back the reservation — slot returns to the free
+		// pool with pinCount=0.
+		p.poolMu.Lock()
+		s.pinCount = 0
+		s.usageCount = 0
+		p.poolMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
 	blk, err := p.mgr.Extend(rel, s.page)
 	s.contentMu.Unlock()
 	if err != nil {
+		p.poolMu.Lock()
+		s.pinCount = 0
+		s.usageCount = 0
+		p.poolMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
 	// Emit SmgrCreate WAL record on first block creation so crash
@@ -618,7 +638,9 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	if idx, ok := p.byTag[tag]; ok {
 		// Another goroutine already loaded/published this freshly
 		// extended block while we were outside poolMu. Reuse that
-		// slot and release ours back to the free pool.
+		// slot and release ours back to the free pool. Our
+		// reserved pinCount=1 from the I/O window is decremented
+		// to 0 here; the existing slot's pinCount is incremented.
 		existing := p.slots[idx]
 		existing.pinCount++
 		if existing.usageCount < maxUsageCount {
@@ -635,8 +657,10 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	s.tag = tag
 	s.valid = true
 	s.dirty = true // Extend wrote it but the in-memory page was just initialised; flag dirty so any subsequent mutation flushes
-	s.pinCount = 1
-	s.usageCount = 1
+	// M0056-0001: pinCount/usageCount were already set to 1 as
+	// the reservation before we released poolMu. Don't overwrite
+	// them here; the caller's first Unpin will balance the
+	// reservation.
 	p.byTag[tag] = slotIdx
 	p.poolMu.Unlock()
 	return s, blk, nil
