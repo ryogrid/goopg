@@ -1182,20 +1182,71 @@ func pageHasSpaceFor(p storage.Page, it item) bool {
 // item count but v0 leaves are small (<256 entries) and split before
 // growing further; the simplicity is worth it until profiling says
 // otherwise.
+// insertItemSorted (M0055-0002 Phase A) writes `it` into its
+// sorted position on the page WITHOUT decoding and re-encoding
+// every existing item. Binary-searches the existing line-pointer
+// array reading only each candidate's key; calls
+// `PageInsertItemRawAt` to memmove the line-pointer suffix and
+// drop the new tuple bytes at pd_upper.
+//
+// Replaces the prior whole-page rewrite path that decoded every
+// item, inserted into a Go slice, reset the page, and re-
+// encoded every item. The pre-Phase-A path was the chief CPU
+// hotspot per the M0055 baseline pprof (analysis/btree-baseline-
+// 2026-05-06.md) — this rewrite eliminates the O(n) re-encode.
 func insertItemSorted(p storage.Page, it item) {
-	items, err := pageItems(p)
+	count, err := storage.PageLinePointerCount(p)
 	if err != nil {
 		panic(err)
 	}
-	items = appendSorted(items, it)
-	resetPageItems(p)
-	for _, x := range items {
-		raw := x.marshal()
-		_, err := storage.PageAddItemRaw(p, raw)
+	// Binary-search for the insertion slot. The line-pointer
+	// accessors decode just one key per probe, not every item
+	// on the page.
+	lo, hi := 0, count
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		midItem, err := readPageItem(p, mid)
 		if err != nil {
 			panic(err)
 		}
+		if CompareKeys(midItem.key, it.key) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
 	}
+	raw := it.marshal()
+	// PageInsertItemRawAt is 1-based, line-pointer index lo is
+	// 0-based; convert.
+	if _, err := storage.PageInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
+		panic(err)
+	}
+}
+
+// readPageItem (M0055-0002 Phase A) decodes a single item at the
+// given 0-based line-pointer index. Used by binary-search probes
+// in `insertItemSorted` so the insert path no longer decodes
+// every item on the page. For posting-list line pointers
+// (M0047-0003) it returns the FIRST tid bundled in the posting
+// — that's enough for the binary search since all posting tids
+// share the same key.
+func readPageItem(p storage.Page, idx int) (item, error) {
+	raw, err := storage.PageGetItemRaw(p, uint16(idx+1))
+	if err != nil {
+		return item{}, err
+	}
+	if isPostingRaw(raw) {
+		key, tids, perr := parsePostingRaw(raw)
+		if perr != nil {
+			return item{}, perr
+		}
+		var ptr storage.ItemPointer
+		if len(tids) > 0 {
+			ptr = tids[0]
+		}
+		return item{keyLen: uint16(len(key)), ptr: ptr, key: key}, nil
+	}
+	return parseItem(raw)
 }
 
 func appendSorted(items []item, it item) []item {

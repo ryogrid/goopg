@@ -351,6 +351,73 @@ func PageAddItemRaw(p Page, raw []byte) (uint16, error) {
 	return uint16(count + 1), nil
 }
 
+// PageInsertItemRawAt (M0055-0002 Phase A) inserts `raw` at the
+// 1-based slot, shifting any existing line pointers at [slot, count]
+// to [slot+1, count+1]. New tuple bytes are placed at the
+// pd_upper - len(raw) boundary. The 1-based slot number returned
+// equals the input `slot`. Returns `ErrNoSpaceInPage` when the
+// page lacks free space.
+//
+// This is the in-place upstream-aligned counterpart to the
+// O(n) decode+rewrite path used previously by btree.insertItemSorted.
+// Call sites that know the insertion offset (e.g. via binary search
+// on existing line pointers) can avoid re-encoding every item on
+// the page on each insert.
+func PageInsertItemRawAt(p Page, slot uint16, raw []byte) (uint16, error) {
+	h, err := Header(p)
+	if err != nil {
+		return 0, err
+	}
+	if len(raw) > 0x7FFF {
+		return 0, fmt.Errorf("item too large for line pointer len=%d", len(raw))
+	}
+	lower := int(h.Lower())
+	upper := int(h.Upper())
+	needed := itemIDSize + len(raw)
+	if upper-lower < needed {
+		return 0, ErrNoSpaceInPage
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return 0, err
+	}
+	if int(slot) < 1 || int(slot) > count+1 {
+		return 0, fmt.Errorf("PageInsertItemRawAt: slot %d out of range [1,%d]", slot, count+1)
+	}
+	// Append the new tuple bytes at upper-len(raw); existing tuple
+	// data on the page does NOT need to move (each line pointer
+	// references its tuple by absolute offset, so existing items
+	// remain addressable).
+	newUpper := upper - len(raw)
+	copy(p[newUpper:upper], raw)
+	// Shift the line-pointer array's [slot-1 .. count) entries right
+	// by one slot (line pointers are 0-based in the array but
+	// 1-based externally).
+	idx := int(slot) - 1
+	if idx < count {
+		// Read line pointers from idx..count-1 and write them at idx+1..count.
+		// Each ItemID is itemIDSize bytes; use a memmove by copying the
+		// bytes via the line-pointer accessors.
+		for j := count; j > idx; j-- {
+			id, err := readItemID(p, j-1)
+			if err != nil {
+				return 0, err
+			}
+			if err := writeItemID(p, j, id); err != nil {
+				return 0, err
+			}
+		}
+	}
+	// Write the new line pointer at idx.
+	newID := ItemID{Offset: uint16(newUpper), Flags: ItemIDNormal, Length: uint16(len(raw))}
+	if err := writeItemID(p, idx, newID); err != nil {
+		return 0, err
+	}
+	h.SetLower(uint16(lower + itemIDSize))
+	h.SetUpper(uint16(newUpper))
+	return slot, nil
+}
+
 // HeapPageVacuumStats reports the outcome of a single-page vacuum.
 type HeapPageVacuumStats struct {
 	Dead int // line pointers transitioned LP_NORMAL -> LP_UNUSED

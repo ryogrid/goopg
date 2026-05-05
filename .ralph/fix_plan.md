@@ -3006,9 +3006,50 @@ Required design docs:
       -run TestBenchBaseline_M0055 -count=1 -v` PASS, summary
       line printed in the parsable format.
 
-- [ ] M0055-0002: Phase A — write-path CPU + split-efficiency upgrades.
-      Implement in-page binary-position insert, byte-aware split-loc,
-      and rightmost-leaf insert fastpath cache.
+- [x] M0055-0002: **PARTIAL — LANDED 2026-05-06.** Phase A —
+      write-path CPU + split-efficiency upgrades. The PRIMARY
+      improvement (in-place binary-position insert) landed and
+      delivered an **8.4× insert throughput** improvement on the
+      M0055-0001 baseline harness:
+      - 23 540 → 197 864 inserts/sec (+741 %)
+      - p95 49 µs → 6 µs (-87.8 %)
+      - p99 145 µs → 13 µs (-91.0 %)
+      Implementation:
+      - `internal/storage/heap.go::PageInsertItemRawAt` (new) —
+        in-place upstream-aligned insert that places the new
+        tuple bytes at pd_upper-len, shifts the line-pointer
+        suffix right by one slot via per-slot
+        `readItemID/writeItemID`, and writes the new line
+        pointer at the requested 1-based slot. No whole-page
+        rewrite.
+      - `internal/access/btree/btree.go::insertItemSorted`
+        rewritten to binary-search the line-pointer array via
+        a new `readPageItem(p, idx)` (decodes one item per
+        probe, not the whole page), then call
+        `PageInsertItemRawAt`.
+      - All existing btree tests (TestInsertSearchRoundTrip,
+        TestLeafSplit, TestRangeScan, TestConcurrent*, etc.)
+        PASS unchanged.
+      - Baseline analysis report
+        `analysis/btree-baseline-2026-05-06.md` extended with
+        the Phase A delta.
+      Acceptance threshold (≥ 30 % inserts/sec improvement) met
+      by ~25× the bar.
+
+      Two Phase A items deferred as named follow-ups:
+  - [ ] M0055-0002-followup-byte-split: byte-aware split-loc
+        policy for variable-width keys. The current count-midpoint
+        is correct for fixed-width keys but produces unbalanced
+        halves on varlen-key workloads.
+        Acceptance: a varlen-key variant of the M0055-0001
+        harness (e.g. random text keys 8-64 bytes) shows
+        ≥ 10 % split count reduction vs count-midpoint.
+  - [ ] M0055-0002-followup-rightmost-cache: rightmost-leaf
+        insert fastpath cache on `*BTree`. Append-shaped
+        workloads (timestamp / serial-id indexes) skip the
+        descent.
+        Acceptance: a monotonic-insert micro-bench shows
+        ≥ 2× throughput vs the current Phase A in-place path.
 
 - [ ] M0055-0003: Phase B — steady-state dedup retention.
       Add in-place posting growth/merge and pre-split local dedup

@@ -92,3 +92,60 @@ The test is `testing.Short`-skipped so it does NOT run under
 `go test -short`. CI that wants to track the numbers should run
 without `-short` and parse the `M0055-baseline-summary { … }`
 block.
+
+## 6. Phase A delta (M0055-0002, 2026-05-06)
+
+After landing M0055-0002 (in-place insert via `PageInsertItemRawAt`
++ binary-search line-pointer probe in `insertItemSorted`), the
+same harness reports:
+
+```
+M0055-baseline-summary {
+  inserts=100000
+  total_ms=505.40
+  inserts_per_sec=197864
+  splits=346 (0.35 %)
+  p50_us=4
+  p95_us=6
+  p99_us=13
+  max_us=658
+  rss_delta_mb=3.8
+}
+```
+
+### Delta vs §3 baseline
+
+| Metric | Baseline | Phase A | Δ |
+|--------|----------|---------|------|
+| total_ms | 4 248 | 505 | **-88.1 %** |
+| inserts_per_sec | 23 540 | 197 864 | **+741 %** (8.4× speedup) |
+| splits | 346 | 346 | 0 % (deterministic at SF=1) |
+| p50_us | 23 | 4 | -82.6 % |
+| p95_us | 49 | 6 | -87.8 % |
+| p99_us | 145 | 13 | -91.0 % |
+| max_us | 6 128 | 658 | -89.3 % |
+
+The whole-page rewrite-on-insert hotspot is eliminated. The
+remaining cost is dominated by the binary-search decode-per-probe
+(~log₂(items) decode calls per insert) plus pin/unpin. Phase A's
+acceptance threshold (≥ 30 % inserts/sec improvement) is met by
+a margin of ~25× the bar.
+
+### Phase A scope clarification
+
+This commit lands **(1) in-place binary-position insert**. The
+other two Phase A items —
+**(2) byte-aware split-loc** and
+**(3) rightmost-leaf insert fastpath cache** —
+are deferred to follow-ups:
+
+- (2) is a no-op for fixed-width int4/uint64 keys (count-midpoint
+  ≡ byte-midpoint when every entry is the same size). The bench
+  here uses uint64 keys so the difference would be invisible.
+  A varlen-key variant of this bench should land alongside the
+  byte-aware-split-loc commit so the split-count delta is
+  measurable.
+- (3) is an additive optimisation on top of the in-place insert.
+  Largest expected win is on monotonic / append-shaped workloads
+  (B-tree-style timestamp / serial-id indexes). Tracked as
+  `M0055-0002-followup-rightmost-cache`.
