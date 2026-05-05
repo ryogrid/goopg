@@ -143,15 +143,3 @@ While using PostgreSQL as the oracle, always account for:
 - Reported `server_version` is tracked in design doc `root-0001-architecture-overview.md`
   so client gating (`pgx`, JDBC, `psql`) behaves predictably.
 
-## Temporarily Deferred Tasks
-
-The following tasks must be skipped during loop selection. Even if a
-matching item appears in `.ralph/fix_plan.md`, do **not** pick it up and
-do **not** run the underlying workload. Their inclusion in the fix plan
-is for tracking only — execution is paused until this section is
-revised.
-
-- Full HammerDB-driven TPC-H end-to-end runs (schema build + supplementary
-  index creation + ANALYZE + power test against goopg). Treat any
-  fix-plan task that prescribes running HammerDB to completion as
-  deferred, regardless of which milestone it sits under.

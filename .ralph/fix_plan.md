@@ -2528,6 +2528,74 @@ rationale here.
         registers without effect; the package-level toggle is
         the only runtime control surface.
 
+  - [ ] M0054-0006-followup-Q9-composite: NLI composite-index
+        regression — TPC-H Q9 fails at runtime with
+        `ERROR: column "ps_suppkey" is not numeric at runtime`
+        when NLI is enabled. Reproduced against HammerDB SF=1
+        run-012 attempt #1 (2026-05-05); mitigated for run-012
+        attempt #2 by `GOOPG_DISABLE_NLI=1` env-var
+        (`cmd/goopg/main.go` calls `planner.SetNLIEnabled(false)`
+        on startup). Q1, Q2, Q14 etc. complete with NLI on; the
+        regression is specific to multi-equi-conjunct joins on
+        a composite-key index.
+
+        **Root-cause hypothesis (Explore agent audit, 2026-05-05)**
+        Most likely cause: planner+executor only bind the **leading
+        column** of a composite B-tree index when promoting an
+        eligible `*Join` to `*NestedLoopIndexJoin`.
+        - `internal/planner/nl_index_join.go:152`
+          (`findBTreeIndexForColumn`) probes by single column name,
+          so for `partsupp_pk(ps_partkey, ps_suppkey)` the rule
+          accepts the index when only `ps_partkey` is in the
+          equi-conjunct list.
+        - `internal/planner/nl_index_join.go:175` sets
+          `IndexScan.Key` to a single outer-column ColumnRef; the
+          trailing column of the composite index is never bound.
+        - `internal/executor/operators_index.go:269-289`
+          (`lookupKey`) encodes only `index.Columns[0]` and pads
+          trailing columns with `0xFF` (range upper) — the probe
+          becomes a partial-key range over `(ps_partkey, *)`.
+        - The residual conjunct `l_suppkey = ps_suppkey` is then
+          evaluated against the joined row, but in some code path
+          the comparison receives `ps_suppkey` as an unencoded
+          value (NULL or string-typed datum) → "is not numeric
+          at runtime".
+
+        **Why:** NLI was a M0054-0006 deliverable that closed the
+        Q14/Q15b/Q19 baseline gaps (see M0054-0006a-pre line 2558),
+        but the planner rule did not gate against composite-key
+        indexes nor extract multi-column equi-keys, so a Q9-style
+        join with two equi-conjuncts on a composite-key index is
+        promoted to NLI with only the leading column bound — a
+        partial-key probe whose result violates the residual
+        predicate's type expectation.
+
+        **How to apply / acceptance:**
+        1. `tryBuildNLI` extended: if the candidate index has > 1
+           leading column, require that an equi-conjunct exists
+           for *each* leading column up to the prefix used; bind
+           all of them on `IndexScan.Key`. If not all are present,
+           refuse to promote (fall back to HashJoin).
+        2. `lookupKey` / `IndexScan.Key` encoding extended to
+           accept a multi-column key vector and encode each column
+           in declared order, not via 0xFF padding.
+        3. Planner unit test: a Q9-shaped fixture
+           `(part(p_partkey int4 PK), partsupp(ps_partkey int4,
+           ps_suppkey int4, PRIMARY KEY (ps_partkey, ps_suppkey)),
+           supplier(s_suppkey int4 PK))` with `WHERE
+           l_partkey = ps_partkey AND l_suppkey = ps_suppkey`
+           must produce either (a) a NLI with both columns bound,
+           or (b) a HashJoin (no partial-key promotion).
+        4. Cluster-backed parity test: same fixture, query result
+           parity NLI-on vs NLI-off (`internal/testutil/tpch/
+           nli_parity_test.go` extended to a composite-key
+           variant).
+        5. Live: HammerDB SF=1 with NLI on completes Q9 without
+           the runtime type error (re-run run-012 with NLI on
+           after the fix and confirm Q9 passes).
+        6. Until accepted, the kill-switch env var
+           `GOOPG_DISABLE_NLI=1` remains the documented mitigation.
+
       scope. `docs/design/0053-0002-nested-loop-index-join-scope.md`
       already specified the implementation skeleton; M0054 lands
       every sub-task it called out:

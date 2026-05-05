@@ -30,6 +30,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/server"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -165,6 +166,15 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			runtime.SetBlockProfileRate(r)
 			logger.Info("block profiling enabled", "rate", r)
 		}
+	}
+
+	// M0054-0006: NLI rollback switch. The default is "on"; set
+	// `GOOPG_DISABLE_NLI=1` to revert to the pre-M0054-0006 plan
+	// shape (the M0054-0006a-pre input-IndexScan rewrite stays
+	// active — only the NestedLoopIndexJoin promotion is gated).
+	if v := os.Getenv("GOOPG_DISABLE_NLI"); v == "1" || v == "true" {
+		planner.SetNLIEnabled(false)
+		logger.Info("nestloop index join disabled via env", "var", "GOOPG_DISABLE_NLI")
 	}
 
 	// Start pprof HTTP endpoint on 127.0.0.1:6060 for CPU/heap profiling.
