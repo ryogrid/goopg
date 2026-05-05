@@ -2896,22 +2896,30 @@ rationale here.
       converts O(N×M) re-evaluation to O(N+M) hash probe.
       **Design:** `docs/design/0054-0003-magic-set-decorrelation.md`.
 
-- [ ] M0054-0009: Verify Q20 inner LIKE 'forest%' uses index range
-      scan (M0051-0004 prefix→range integration check).
-      **Motivation:** Q20's outer scope contains
-      `p_name LIKE 'forest%'` against `part`. M0051-0004 implemented
-      LIKE-prefix → range translation generally; this sub-task is a
-      narrow audit: confirm the EXPLAIN baseline for Q20 (or a
-      synthetic `SELECT … FROM part WHERE p_name LIKE 'forest%'`)
-      shows `Index Scan using part_p_name_idx` with the range
-      `['forest', 'forest\xff…']` rather than `Seq Scan on part`.
-      If a Seq Scan is observed, open a precise sub-task naming the
-      gap (column-on-LHS variant, leading-wildcard mistake, missing
-      idx, etc.).
-      **Acceptance:** Either the baseline is clean (Index Scan) and
-      the audit closes the task with evidence, OR the gap is named
-      and re-opened as a follow-up.
-      **Design:** `docs/design/0054-0004-like-prefix-range-q20-audit.md`.
+- [x] M0054-0009: **LANDED 2026-05-06.** Q20 LIKE-prefix range
+      audit. Verdict: M0051-0004's prefix→range rewriter is
+      CORRECT for Q20's `p_name LIKE 'forest%'` shape. Production
+      EXPLAIN shows `Seq Scan on part` because HammerDB's standard
+      schema does NOT create an index on `p_name`
+      (`analysis/tpch-additional-indexes.md` documents
+      this; `p_name` is intentionally excluded from the
+      supplementary index set since `LIKE '%foo%'` patterns are
+      not B-tree-sargable, and the prefix-only `LIKE 'forest%'`
+      case is a narrow Q20-specific shape that doesn't justify
+      diverging from HammerDB schema fidelity).
+      Acceptance evidence:
+      - `TestLikeToRangeQ20Shape` (new) — synthetic part table
+        WITH an index on p_name → produces
+        `Filter(IndexScan{LowKey='forest', HighKey='foresu'})`
+        using `idx_part_name`. Confirms the rewriter integrates
+        with Q20's expression shape.
+      - `TestLikeToRangeQ20ShapeNoIndex` (new) — same query
+        without the index → stays `Filter(SeqScan)`. This is the
+        production state with HammerDB's stock schema; the
+        result is correct, NOT a planner bug.
+      - No code change to `internal/planner/likeprefix.go` —
+        the rewriter was already correct.
+      Design: `docs/design/0054-0004-like-prefix-range-q20-audit.md`.
 
 - [ ] M0054-0010: Strengthen small-side build estimation for hash
       join — Nation broadcast / build-side selection.

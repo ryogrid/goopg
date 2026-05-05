@@ -125,6 +125,99 @@ func TestLikeToRangeDoD_PrefixPattern(t *testing.T) {
 	}
 }
 
+// TestLikeToRangeQ20Shape (M0054-0009 audit) confirms M0051-0004's
+// prefix→range translation activates correctly for TPC-H Q20's
+// `p_name LIKE 'forest%'` shape WHEN an index on p_name exists.
+// This pins the integration: the rewriter is correct;
+// HammerDB's standard schema does NOT create an index on p_name
+// (see analysis/tpch-additional-indexes.md), which is why the
+// production EXPLAIN for Q20 shows SeqScan on part. The audit
+// verdict is therefore: M0051-0004 is correct; the production
+// gap is the missing index, which is by-design upstream and
+// out of scope for M0054 (would require diverging from HammerDB
+// schema fidelity).
+func TestLikeToRangeQ20Shape(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
+		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "p_name", Type: catalog.Type{Name: "varchar", Args: []int64{55}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Synthetic index on p_name — NOT created by HammerDB by
+	// default. This test asserts the planner WOULD pick IndexScan
+	// if such an index were present, validating the rewriter for
+	// the Q20 expression shape.
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "idx_part_name"}, tbl,
+		[]string{"p_name"}, false, "btree", false); err != nil {
+		t.Fatal(err)
+	}
+	stmts, err := parser.Parse("SELECT p_partkey FROM part WHERE p_name LIKE 'forest%'")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	node, err := Plan(stmts[0], cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if proj, ok := node.(*Project); ok {
+		node = proj.Child
+	}
+	filt, ok := node.(*Filter)
+	if !ok {
+		t.Fatalf("expected Filter (below Project), got %T", node)
+	}
+	idx, ok := filt.Child.(*IndexScan)
+	if !ok {
+		t.Fatalf("expected Filter(IndexScan), got Filter(%T) — Q20 LIKE-prefix range integration broken", filt.Child)
+	}
+	if lo, ok := idx.LowKey.(*StringConst); !ok || lo.Value != "forest" {
+		t.Errorf("LowKey: want 'forest', got %T %v", idx.LowKey, idx.LowKey)
+	}
+	if hi, ok := idx.HighKey.(*StringConst); !ok || hi.Value != "fores\x75" /* 'forest'+1 → "forest"[:5]+'u' = "foresu" */ {
+		// Strict-greater successor of 'forest' is 'foresu' (last byte 't'=0x74 → 0x75='u').
+		// Re-check by reading the actual value if literal mismatch.
+		t.Errorf("HighKey: want 'foresu' (forest+1), got %T %v", idx.HighKey, idx.HighKey)
+	}
+	if idx.Index == nil || idx.Index.Name != "idx_part_name" {
+		t.Errorf("expected idx_part_name on inner; got %v", idx.Index)
+	}
+}
+
+// TestLikeToRangeQ20ShapeNoIndex (M0054-0009 negative case) —
+// when no index on p_name exists, the plan stays SeqScan. This is
+// the production state with HammerDB's stock schema. The result
+// is correct (LIKE filter applied via Filter on top of SeqScan);
+// it is NOT a planner bug.
+func TestLikeToRangeQ20ShapeNoIndex(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
+		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "p_name", Type: catalog.Type{Name: "varchar", Args: []int64{55}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stmts, err := parser.Parse("SELECT p_partkey FROM part WHERE p_name LIKE 'forest%'")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	node, err := Plan(stmts[0], cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if proj, ok := node.(*Project); ok {
+		node = proj.Child
+	}
+	filt, ok := node.(*Filter)
+	if !ok {
+		t.Fatalf("expected Filter (below Project), got %T", node)
+	}
+	if _, ok := filt.Child.(*SeqScan); !ok {
+		t.Fatalf("expected Filter(SeqScan) when no index on p_name; got Filter(%T)", filt.Child)
+	}
+}
+
 // TestLikeToRangeDoD_ExactPattern verifies that LIKE 'foo' (no wildcards)
 // produces a range IndexScan with bounds ['foo', 'fop'). The LIKE post-filter
 // ensures only exact 'foo' is returned; the range narrows the B-tree scan.
