@@ -5,6 +5,8 @@
 // References to upstream PostgreSQL files use repository-relative paths.
 package protocol
 
+import "errors"
+
 // Protocol version constants (mirrors postgres/src/include/libpq/pqcomm.h).
 //
 // PostgreSQL encodes a protocol version as (major << 16) | minor, big-endian
@@ -38,6 +40,12 @@ const MaxStartupPacketLength = 10000
 // arbitrarily large buffers. The COPY path (milestone 6) will lift this for
 // data rows specifically.
 const MaxRegularMessageLength = 1 << 20
+
+// ErrFrameTooLarge is returned by ReadFrame when an incoming message exceeds
+// MaxRegularMessageLength. Unlike a connection-level EOF, the stream is still
+// synchronised after this error (the oversized payload has been drained), so
+// the caller may send a proper error response and continue the session.
+var ErrFrameTooLarge = errors.New("frame payload exceeds MaxRegularMessageLength")
 
 // Backend message type bytes. Mirrors PqMsg_* in
 // postgres/src/include/libpq/protocol.h.

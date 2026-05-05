@@ -448,9 +448,22 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		"remote", raw.RemoteAddr().String(),
 		"pid", pid,
 	)
+	// Catch any unrecovered panic so every backend exit is logged at ERROR
+	// rather than crashing the process without a log entry. This is a
+	// defensive observability wrapper — no panics are expected in normal
+	// operation. The connection is always closed and the entry unregistered.
+	var exitErr any
 	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("backend goroutine panic", "panic", r)
+			exitErr = r
+		}
 		_ = raw.Close()
-		logger.Debug("connection closed")
+		if exitErr != nil {
+			logger.Info("connection closed", "reason", "panic")
+		} else {
+			logger.Info("connection closed")
+		}
 	}()
 
 	connCtx, cancel := context.WithCancel(ctx)
@@ -786,8 +799,23 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 		}
 		f, err := r.ReadFrame()
 		if err != nil {
+			if errors.Is(err, protocol.ErrFrameTooLarge) {
+				// The oversized payload was already drained by ReadFrame so the
+				// stream is re-synchronised. Send a proper error response and
+				// keep the session alive so HammerDB / libpq can retry.
+				logger.Info("oversized client message rejected", "err", err)
+				if werr := s.writeQueryError(w, sqlstate.ProtocolViolation, err.Error()); werr != nil {
+					logger.Info("write error after oversized message", "err", werr)
+					return
+				}
+				if werr := w.Flush(); werr != nil {
+					logger.Info("flush error after oversized message", "err", werr)
+					return
+				}
+				continue
+			}
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-				logger.Debug("read frame error", "err", err)
+				logger.Info("connection read error", "err", err)
 			}
 			return
 		}
@@ -831,7 +859,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 				entry.clearQueryCancel()
 				queryCancel()
 				if err != nil {
-					logger.Debug("replication command write error", "err", err)
+					logger.Info("replication command write error", "err", err)
 					return
 				}
 				if handled {
@@ -842,7 +870,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {
-				logger.Debug("handleQueryOrCopy write error", "err", err)
+				logger.Info("query write error", "err", err)
 				return
 			}
 			copyIn = nextCopyIn

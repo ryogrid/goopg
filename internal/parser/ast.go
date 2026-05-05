@@ -48,6 +48,33 @@ type RollbackStmt struct{ pos int }
 func (s *RollbackStmt) Pos() int  { return s.pos }
 func (s *RollbackStmt) stmtNode() {}
 
+// SavepointStmt — `SAVEPOINT name`.
+type SavepointStmt struct {
+	pos  int
+	Name string
+}
+
+func (s *SavepointStmt) Pos() int  { return s.pos }
+func (s *SavepointStmt) stmtNode() {}
+
+// ReleaseSavepointStmt — `RELEASE [SAVEPOINT] name`.
+type ReleaseSavepointStmt struct {
+	pos  int
+	Name string
+}
+
+func (s *ReleaseSavepointStmt) Pos() int  { return s.pos }
+func (s *ReleaseSavepointStmt) stmtNode() {}
+
+// RollbackToSavepointStmt — `ROLLBACK TO [SAVEPOINT] name`.
+type RollbackToSavepointStmt struct {
+	pos  int
+	Name string
+}
+
+func (s *RollbackToSavepointStmt) Pos() int  { return s.pos }
+func (s *RollbackToSavepointStmt) stmtNode() {}
+
 // VacuumStmt — `VACUUM [VERBOSE] [ANALYZE] [target [, …]]`.
 type VacuumStmt struct {
 	pos     int

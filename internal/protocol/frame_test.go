@@ -91,16 +91,63 @@ func TestParseStartupParameters_MissingTerminator(t *testing.T) {
 // from a malicious client claiming a multi-GB message length.
 func TestFrameReaderRejectsOversizePayload(t *testing.T) {
 	// Build a header claiming length = MaxRegularMessageLength + 5 (i.e.
-	// payload = MaxRegularMessageLength + 1).
-	hdr := []byte{'Q', 0, 0, 0, 0}
-	tooBig := uint32(MaxRegularMessageLength + 5)
-	hdr[1] = byte(tooBig >> 24)
-	hdr[2] = byte(tooBig >> 16)
-	hdr[3] = byte(tooBig >> 8)
-	hdr[4] = byte(tooBig)
-	r := NewFrameReader(bytes.NewReader(hdr))
-	if _, err := r.ReadFrame(); err == nil {
+	// payload = MaxRegularMessageLength + 1), with actual payload bytes so
+	// the drain path succeeds and ErrFrameTooLarge is returned.
+	payloadLen := MaxRegularMessageLength + 1
+	total := uint32(payloadLen + 4)
+	hdr := []byte{
+		'Q',
+		byte(total >> 24), byte(total >> 16), byte(total >> 8), byte(total),
+	}
+	var buf bytes.Buffer
+	buf.Write(hdr)
+	buf.Write(make([]byte, payloadLen)) // actual payload so drain succeeds
+	r := NewFrameReader(&buf)
+	_, err := r.ReadFrame()
+	if err == nil {
 		t.Fatal("expected oversize error, got nil")
+	}
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("expected ErrFrameTooLarge, got %v", err)
+	}
+}
+
+// TestFrameReaderResynchronisesAfterOversizePayload verifies that after
+// rejecting an oversized message, the reader is still synchronised and can
+// read the next (normal-sized) message successfully. This is the property
+// that allows the server to send an error response and continue the session
+// rather than dropping the connection.
+func TestFrameReaderResynchronisesAfterOversizePayload(t *testing.T) {
+	var buf bytes.Buffer
+
+	// First: an oversized MsgQuery with payloadLen = MaxRegularMessageLength + 1
+	payloadLen := MaxRegularMessageLength + 1
+	total := uint32(payloadLen + 4)
+	hdr := []byte{
+		'Q',
+		byte(total >> 24), byte(total >> 16), byte(total >> 8), byte(total),
+	}
+	buf.Write(hdr)
+	buf.Write(make([]byte, payloadLen))
+
+	// Second: a tiny valid MsgSync (just the 5-byte header, payload length 4)
+	buf.Write([]byte{'S', 0, 0, 0, 4})
+
+	r := NewFrameReader(&buf)
+
+	// First read: expect ErrFrameTooLarge.
+	_, err := r.ReadFrame()
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("first read: expected ErrFrameTooLarge, got %v", err)
+	}
+
+	// Second read: stream should be re-synchronised; expect MsgSync.
+	f, err := r.ReadFrame()
+	if err != nil {
+		t.Fatalf("second read: unexpected error %v", err)
+	}
+	if f.Type != MsgSync {
+		t.Fatalf("second read: expected MsgSync ('S'), got %q", f.Type)
 	}
 }
 

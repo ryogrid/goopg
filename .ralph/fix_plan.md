@@ -1742,7 +1742,7 @@ The earlier section "Milestone 0029a — TPC-H Index Support" and M0044-0006
 remain checked because they describe past observed behaviour; this entry
 tracks the new regression separately so we don't retro-edit history.
 
-- [ ] M0052-0001: Reproduce the ORDERS/LINEITEM COPY backend disconnect on
+- [x] M0052-0001: Reproduce the ORDERS/LINEITEM COPY backend disconnect on
       `perf-analysis` HEAD with verbose logging. The goopg server stays up
       and serves new connections — only the COPY backend goroutine dies,
       and it does so without any `level=ERROR` / panic stack-trace in
@@ -1752,6 +1752,25 @@ tracks the new regression separately so we don't retro-edit history.
       branch (`internal/parser/ast.go`, `internal/parser/token.go`) and/or
       a `recover()` in the COPY/extended-protocol handler that swallows
       panics. Reference: `analysis/tpch-hammerdb-run-009.md`.
+      (landed 2026-05-05: Root cause identified — HammerDB's batched LINEITEM
+      INSERT accumulates ~4000+ VALUES rows totalling ~1 MiB, occasionally
+      exceeding `MaxRegularMessageLength=1<<20`. Pre-fix: `ReadFrame` read the
+      5-byte header, detected the oversize, returned an error WITHOUT draining
+      the payload, then `runPostStartupLoop` silently returned (Debug log only),
+      causing libpq to see "server closed the connection unexpectedly". 
+      Fix: (a) `ReadFrame` now drains the oversized payload via `io.CopyN`
+      before returning `ErrFrameTooLarge`; (b) `runPostStartupLoop` checks
+      `errors.Is(err, ErrFrameTooLarge)` and sends a proper `ErrorResponse`
+      + continues the session instead of dropping; (c) `serveConn` deferred
+      panic recovery logs at ERROR, and all silent exits elevated to INFO.
+      Parser compile error also fixed: `KwSavepoint`/`KwRelease` constants
+      and `SavepointStmt`/`ReleaseSavepointStmt`/`RollbackToSavepointStmt`
+      AST nodes committed (they were in the working tree but not HEAD, making
+      the committed code fail to build).
+      DoD: `TestE2EOversizedMessageDoD` — send >1 MiB query → ErrorResponse
+      returned, session alive, SELECT 1 succeeds on same connection.
+      `TestFrameReaderResynchronisesAfterOversizePayload` — stream stays in
+      sync after oversized read. All `go test ./...` pass.)
 - [ ] M0052-0002: Fix the root cause once M0052-0001 surfaces it, and
       re-run HammerDB end-to-end as run-010 to confirm the full
       schema-build → CREATE INDEX → ANALYZE → Q1..Q22 path completes
