@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"time"
 
@@ -551,10 +552,15 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	if err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	seen := map[string]struct{}{}
 	var entries []btree.BulkEntry
-	var scanRow Row                                // M0054-0005c: reusable decode buffer (see comment below).
+	var scanRow Row                                  // M0054-0005c: reusable decode buffer (see comment below).
 	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
+	// M0055-0006 Phase E: removed the `seen map[string]struct{}`
+	// for the unique-key check. The bulk build sorts entries by
+	// key before insertion, so a sorted-stream adjacency walk
+	// after the sort detects duplicates without table-scale
+	// hash state. The check is performed after `sort.SliceStable`
+	// in `btree.BulkBuild`-equivalent path; here, post-collection.
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -603,19 +609,47 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 				o.ctx.Pool.Unpin(slot)
 				return nil, encErr
 			}
-			if unique {
-				if _, exists := seen[string(key)]; exists {
-					o.ctx.Pool.Unpin(slot)
-					return nil, &ExecError{Code: "23505", Pos: pos,
-						Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
-				}
-				seen[string(key)] = struct{}{}
-			}
 			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
 		}
 		o.ctx.Pool.Unpin(slot)
 	}
+	// M0055-0006 Phase E: sorted-stream uniqueness check. The
+	// pre-existing seen map was O(N) memory; the post-sort
+	// adjacency walk is O(1) auxiliary space. BulkBuild sorts
+	// the entries by key before inserting, so we sort here
+	// (matching its convention) and walk adjacencies for the
+	// unique check.
+	if unique && len(entries) > 1 {
+		sortBulkEntriesByKey(entries)
+		for i := 1; i < len(entries); i++ {
+			if bytesEqual(entries[i].Key, entries[i-1].Key) {
+				return nil, &ExecError{Code: "23505", Pos: pos,
+					Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
+			}
+		}
+	}
 	return entries, nil
+}
+
+// sortBulkEntriesByKey (M0055-0006 Phase E) sorts in place by
+// byte-wise key order, the same order BulkBuild expects.
+func sortBulkEntriesByKey(entries []btree.BulkEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		return string(entries[i].Key) < string(entries[j].Key)
+	})
+}
+
+// bytesEqual is a small no-allocation byte slice equality check.
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // buildKeepMaskForIndex returns a per-column boolean mask whose

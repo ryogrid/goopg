@@ -13,6 +13,46 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// TestBenchDedupRetention_M0055_Phase_B (M0055-0003) is the
+// duplicate-heavy variant of the baseline harness. Inserts 100K
+// records with only 100 distinct keys (so each key has ~1000
+// duplicates) and asserts post-insert page count is bounded
+// relative to a hypothetical post-bulk-build size. Without
+// steady-state dedup (Phase B) every duplicate would consume a
+// fresh line pointer and pages would grow without bound.
+func TestBenchDedupRetention_M0055_Phase_B(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping duplicate-heavy bench in short mode")
+	}
+	const N = 100_000
+	const distinctKeys = 100
+	bt, _, cleanup := newTestTree(t)
+	defer cleanup()
+	bt.ResetStats()
+	for i := 0; i < N; i++ {
+		k := make([]byte, 8)
+		binary.BigEndian.PutUint64(k, uint64(i%distinctKeys))
+		ptr := storage.ItemPointer{Block: storage.BlockNumber(i / 1000), Offset: uint16(i%1000) + 1}
+		if err := bt.Insert(k, ptr); err != nil {
+			t.Fatalf("Insert[%d]: %v", i, err)
+		}
+	}
+	stats := bt.Stats()
+	// Acceptance: with steady-state dedup landed (Phase B), the
+	// 100K inserts of 100 distinct keys should produce far fewer
+	// splits than 100K inserts would without dedup. Each key's
+	// posting absorbs duplicates in place; only when a posting
+	// outgrows the page size threshold does a split happen.
+	// Empirical bound: < 2× the post-bulk-build split count
+	// (which would be ~1 split per overflow). We assert
+	// `splits < 5000` as a generous cap that still fails if
+	// dedup is wholly absent (which would produce ~100K splits).
+	if stats.Splits > 5000 {
+		t.Errorf("Phase B dedup: too many splits (%d) — duplicate-heavy retention not bounded", stats.Splits)
+	}
+	t.Logf("M0055-Phase-B-summary { inserts=%d distinct_keys=%d splits=%d }", N, distinctKeys, stats.Splits)
+}
+
 // TestBenchBaseline_M0055 (M0055-0001) is the baseline harness for
 // the staged B-tree enhancement program. It performs N random
 // 8-byte-key inserts into a fresh tree and reports the

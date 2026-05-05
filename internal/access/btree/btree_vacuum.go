@@ -221,7 +221,14 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 		return nil
 	}
 	parentBlk := path[len(path)-1]
-	return bt.removeDownlinkFromParent(parentBlk, leaf.blk)
+	if err := bt.removeDownlinkFromParent(parentBlk, leaf.blk); err != nil {
+		return err
+	}
+	// M0055-0005 Phase D: page recycling. The unlinked leaf is
+	// no longer referenced by parent or siblings; its block can
+	// be reused by future allocations on this tree.
+	bt.recycleBlock(leaf.blk)
+	return nil
 }
 
 // removeParentDownlinkByBlock finds the parent of blk by walking the

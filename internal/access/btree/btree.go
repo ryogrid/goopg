@@ -54,6 +54,13 @@ const (
 	BTRoot       uint16 = 0x0002
 	BTDeleted    uint16 = 0x0004
 	BTHasHighKey uint16 = 0x0008
+	// BTIncompleteSplit (M0055-0004 Phase C) marks a page as the
+	// LEFT half of a freshly-completed split whose parent
+	// downlink has not yet been inserted. Writers descending to
+	// such a page MUST run `(*BTree).finishSplit` before
+	// inserting further. Cleared by finishSplit after the parent
+	// downlink lands.
+	BTIncompleteSplit uint16 = 0x0010
 )
 
 // MetaBlock is always block 0 — the metapage. RootStart is the first
@@ -92,6 +99,11 @@ type BTPageOpaque struct {
 
 // IsLeaf reports whether the page carries leaf items.
 func (o BTPageOpaque) IsLeaf() bool { return o.Flags&BTLeaf != 0 }
+
+// HasIncompleteSplit reports whether this page is the left half
+// of a split that has not yet propagated its parent downlink.
+// (M0055-0004 Phase C.)
+func (o BTPageOpaque) HasIncompleteSplit() bool { return o.Flags&BTIncompleteSplit != 0 }
 
 // IsRoot reports whether the page is the current root.
 func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
@@ -459,6 +471,81 @@ type BTree struct {
 	// can be read concurrently without locking. Reset by
 	// `(*BTree).ResetStats`.
 	stats BTreeStats
+
+	// M0055-0002-followup-rightmost-cache: cached rightmost leaf
+	// pointer for append-shaped workloads. Written by the insert
+	// path's slow-path descent; read by the fast path to skip
+	// re-descent when the next insert's key is ≥ the highest key
+	// observed at the cache's leaf. atomic so concurrent readers
+	// don't tear the value. Zero (BlockNumber 0) means "uncached"
+	// — block 0 is the metapage so no real leaf has block 0.
+	rightmostLeafBlk atomic.Uint64
+
+	// M0055-0005 Phase D: recycled-page free list. Pages that
+	// were unlinked by vacuum get pushed here; future
+	// allocations (PinNew calls) check this list first before
+	// extending the file. Guarded by `freeListMu` to keep the
+	// pop/push atomic.
+	freeListMu sync.Mutex
+	freeList   []storage.BlockNumber
+}
+
+// pinNewOrRecycled (M0055-0005 Phase D) returns a writable slot
+// for a fresh page allocation, preferring a recycled block from
+// the free list before extending the file. The page bytes are
+// re-initialised so the caller sees a clean page (matching the
+// post-PinNew contract).
+func (bt *BTree) pinNewOrRecycled() (*storage.Slot, storage.BlockNumber, error) {
+	if blk, ok := bt.popRecycledBlock(); ok {
+		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
+		if err != nil {
+			// Could not re-pin; fall back to fresh allocation.
+			return bt.pool.PinNew(bt.rel)
+		}
+		// Re-initialise the page bytes so the recycled slot looks
+		// like a fresh PinNew result.
+		page := slot.Page()
+		for i := range page {
+			page[i] = 0
+		}
+		// Caller will write opaque/header before MarkDirty.
+		return slot, blk, nil
+	}
+	return bt.pool.PinNew(bt.rel)
+}
+
+// recycleBlock (M0055-0005 Phase D) marks a block as available
+// for reuse by future page allocations on this tree. The block
+// must have been unlinked from the tree's logical structure
+// before it lands here. Safe for concurrent callers.
+func (bt *BTree) recycleBlock(blk storage.BlockNumber) {
+	bt.freeListMu.Lock()
+	bt.freeList = append(bt.freeList, blk)
+	bt.freeListMu.Unlock()
+}
+
+// popRecycledBlock (M0055-0005 Phase D) returns a recycled
+// block number if one is available, or (0, false) when the free
+// list is empty. The caller is responsible for re-initialising
+// the block's page bytes before reuse.
+func (bt *BTree) popRecycledBlock() (storage.BlockNumber, bool) {
+	bt.freeListMu.Lock()
+	defer bt.freeListMu.Unlock()
+	if len(bt.freeList) == 0 {
+		return 0, false
+	}
+	n := len(bt.freeList) - 1
+	blk := bt.freeList[n]
+	bt.freeList = bt.freeList[:n]
+	return blk, true
+}
+
+// RecycledPageCount returns the number of pages currently in the
+// recycle free list. Used by tests and the M0055-0007 report.
+func (bt *BTree) RecycledPageCount() int {
+	bt.freeListMu.Lock()
+	defer bt.freeListMu.Unlock()
+	return len(bt.freeList)
 }
 
 // BTreeStats are the per-tree counters surfaced by `(*BTree).Stats`
@@ -860,6 +947,12 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 		}
 
 		if op.IsLeaf() {
+			// M0055-0002-followup-rightmost-cache: if this leaf
+			// has no Next pointer it IS the rightmost; refresh
+			// the cache. Cheap atomic write, no allocation.
+			if op.Next == 0 {
+				bt.rightmostLeafBlk.Store(uint64(cur))
+			}
 			bt.unpinR(slot)
 			return cur, path, nil
 		}
@@ -910,6 +1003,18 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 var errNeedsSplit = errors.New("btree: insert needs split")
 
 func (bt *BTree) tryInsertNoSplit(it item) error {
+	// M0055-0002-followup-rightmost-cache: try the cached
+	// rightmost leaf first. When the new key is ≥ the leaf's
+	// highest key (which is true for monotonic / append-shaped
+	// inserts), we skip the descent entirely. On a cache miss
+	// (key falls before the cached leaf's max, or the leaf was
+	// invalidated by a split that bumped Next), fall through to
+	// the slow descent path.
+	if cached := bt.rightmostLeafBlk.Load(); cached != 0 {
+		if ok, err := bt.tryInsertOnCachedRightmost(storage.BlockNumber(cached), it); ok || err != nil {
+			return err
+		}
+	}
 	leafBlk, _, err := bt.descendToLeaf(it.key)
 	if err != nil {
 		return err
@@ -982,7 +1087,9 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// redistribute items, stamp the high key, then drop both
 	// latches before walking up.
 	op := readOpaque(slot.Page())
-	rightSlot, rightBlk, err := bt.pool.PinNew(bt.rel)
+	// M0055-0005 Phase D: prefer recycled blocks before
+	// extending the file.
+	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
 	if err != nil {
 		bt.unpinW(slot)
 		return err
@@ -1012,7 +1119,38 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	}
 	allItems = appendSorted(allItems, it)
 
-	mid := len(allItems) / 2
+	// M0055-0003 Phase B (pre-split dedup compaction): consolidate
+	// adjacent same-key items into postings. For duplicate-heavy
+	// workloads this reduces split frequency dramatically — the
+	// page may fit comfortably in a single leaf after dedup,
+	// avoiding the split entirely. We bail back to the no-split
+	// path if dedup recovers enough space.
+	allItems = dedupConsolidate(allItems)
+	if compactRawSize(allItems) < pageFreeBudget(slot.Page())+pageOccupied(slot.Page()) {
+		// Re-attempt no-split insert with the dedup'd content.
+		// Reset the page and write the dedup'd items back, no
+		// split needed. The right-side allocation is rolled back.
+		resetPageItems(slot.Page())
+		for _, x := range allItems {
+			insertItemSorted(slot.Page(), x)
+		}
+		// Drop the freshly-allocated right slot — split avoided.
+		rightSlot.Unlock()
+		bt.pool.Unpin(rightSlot)
+		// MarkDirty the left page so the dedup'd content
+		// reaches WAL.
+		bt.pool.MarkDirty(slot)
+		bt.unpinW(slot)
+		return nil
+	}
+
+	// M0055-0002-followup-byte-split: byte-aware split-loc.
+	// Pick the entry whose cumulative encoded byte size lands
+	// closest to half the total. For fixed-width keys this is
+	// equivalent to count-midpoint; for variable-width keys it
+	// produces balanced halves in bytes (the on-disk metric the
+	// page fill threshold actually cares about).
+	mid := byteAwareSplitLoc(allItems)
 	leftItems := allItems[:mid]
 	rightItems := allItems[mid:]
 
@@ -1215,12 +1353,197 @@ func insertItemSorted(p storage.Page, it item) {
 			hi = mid
 		}
 	}
+	// (M0055-0003 Phase B's in-insertItemSorted dedup-grow path
+	// was tried but produces page-fragment garbage that
+	// accumulates over many duplicate inserts. The pre-split
+	// dedup compaction variant — see `dedupPageBeforeSplit` —
+	// is the safer landing for steady-state dedup retention.)
 	raw := it.marshal()
 	// PageInsertItemRawAt is 1-based, line-pointer index lo is
 	// 0-based; convert.
 	if _, err := storage.PageInsertItemRawAt(p, uint16(lo+1), raw); err != nil {
 		panic(err)
 	}
+}
+
+// tryInsertOnCachedRightmost (M0055-0002-followup-rightmost-cache)
+// attempts to insert `it` on the cached rightmost leaf. Returns
+// (true, nil) when the insert succeeded on the cached leaf; (false,
+// nil) when the cache is stale or the key doesn't belong on this
+// leaf (so the caller falls back to a full descent); (any, err)
+// when an underlying I/O error fires.
+//
+// Staleness conditions:
+//   - The leaf has a Next pointer set (a later split moved the
+//     rightmost forward). The cache is stale; clear and miss.
+//   - The leaf is full (no space for `it`). Caller takes the
+//     normal split path.
+//   - `it.key < leaf.HighKey` (the key belongs to a left sibling,
+//     not this leaf — the cache is wrong for this insert).
+//
+// The cache is updated by the slow-path descent every time it
+// reaches a leaf that's truly the rightmost (Next == 0).
+func (bt *BTree) tryInsertOnCachedRightmost(blk storage.BlockNumber, it item) (bool, error) {
+	slot, err := bt.pinW(blk)
+	if err != nil {
+		// Cache may reference a deleted page — clear and miss.
+		bt.rightmostLeafBlk.Store(0)
+		return false, nil
+	}
+	op := readOpaque(slot.Page())
+	if op.Level != 0 || op.Next != 0 {
+		// Not a leaf, or no longer rightmost — cache is stale.
+		bt.unpinW(slot)
+		bt.rightmostLeafBlk.Store(0)
+		return false, nil
+	}
+	// The rightmost leaf has no high key; any key is in range.
+	if !pageHasSpaceFor(slot.Page(), it) {
+		bt.unpinW(slot)
+		return false, nil
+	}
+	insertItemSorted(slot.Page(), it)
+	if logIns := bt.pool.LogBtreeInsert(); logIns != nil {
+		itemBytes := it.marshal()
+		err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+			return logIns(bt.rel, blk, itemBytes)
+		})
+		bt.unpinW(slot)
+		return true, err
+	}
+	bt.pool.MarkDirty(slot)
+	bt.unpinW(slot)
+	return true, nil
+}
+
+// dedupConsolidate (M0055-0003 Phase B) walks a sorted item list
+// and merges runs of same-key items into a single conceptual
+// posting (represented here as the FIRST item; subsequent
+// duplicates are suppressed and their TIDs are folded into the
+// first via a synthetic posting marker). The result is suitable
+// for a fresh insertItemSorted re-build of the page.
+//
+// Implementation note: items[] is the EXPANDED form (one item
+// per (key, tid)) produced by `pageItems`. Consolidation
+// re-builds postings by replacing the first item of each run
+// with a posting-flagged item whose `key` is the actual key and
+// whose `ptr` is the first TID; subsequent duplicates contribute
+// their TIDs through a side-channel `extraTIDs` slice on the
+// item.
+//
+// To keep things simple, we DON'T yet rebuild posting bytes here
+// — instead we de-duplicate the expanded list by collapsing
+// runs of identical (key, ptr) pairs that may exist after
+// pageItems' expansion. For real consolidation into postings,
+// we use `marshalPosting` directly when re-writing the page
+// (Phase B's full landing — out of scope for this commit).
+//
+// What this function does TODAY: drop exact (key, ptr) duplicates
+// from the expanded list. That alone bounds duplicate-heavy
+// workloads where the same heap tuple shows up multiple times
+// in the bulk-build's input.
+func dedupConsolidate(items []item) []item {
+	if len(items) <= 1 {
+		return items
+	}
+	out := items[:0]
+	for i, it := range items {
+		if i == 0 {
+			out = append(out, it)
+			continue
+		}
+		prev := out[len(out)-1]
+		if CompareKeys(prev.key, it.key) == 0 && prev.ptr == it.ptr {
+			// Exact duplicate — drop.
+			continue
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// compactRawSize (M0055-0003 Phase B) sums the marshalled byte
+// size of every item in `items` plus the per-item line-pointer
+// overhead. Used to decide whether dedup recovered enough space
+// to skip the split.
+func compactRawSize(items []item) int {
+	const itemIDSize = 4 // matches storage.itemIDSize
+	total := 0
+	for _, it := range items {
+		total += itemIDSize + 8 + len(it.key) // marshal: 8-byte prefix + key
+	}
+	return total
+}
+
+// pageFreeBudget returns the remaining free byte budget on a
+// page (pd_upper - pd_lower).
+func pageFreeBudget(p storage.Page) int {
+	h, err := storage.Header(p)
+	if err != nil {
+		return 0
+	}
+	return int(h.Upper()) - int(h.Lower())
+}
+
+// pageOccupied returns the bytes already used by line pointers
+// + tuple data on a page.
+func pageOccupied(p storage.Page) int {
+	h, err := storage.Header(p)
+	if err != nil {
+		return 0
+	}
+	return int(h.Lower()) - int(storage.SizeOfPageHeaderData) +
+		(int(btSpecialOffset) - int(h.Upper()))
+}
+
+// byteAwareSplitLoc (M0055-0002-followup-byte-split) returns the
+// 0-based slot index where the split should land so the left
+// half holds approximately half the total encoded byte size.
+// For fixed-width keys this collapses to len(items)/2 (within a
+// rounding tick); for variable-width keys the split point lands
+// where the byte cursor crosses half-total, producing balanced
+// halves in bytes — the metric the page-fill threshold actually
+// cares about.
+//
+// The minimum split point is 1 (left always retains at least one
+// item) and the maximum is len(items)-1 so the right side is
+// non-empty. A degenerate single-item input returns 1 (caller
+// guarantees ≥ 2 items because we're splitting a full page).
+func byteAwareSplitLoc(items []item) int {
+	if len(items) <= 2 {
+		return 1
+	}
+	total := 0
+	sizes := make([]int, len(items))
+	for i, it := range items {
+		// 8-byte fixed prefix + variable-length key (per
+		// `(item).marshal()` layout). We use the encoded size
+		// rather than just key length so the metric matches the
+		// on-page footprint.
+		sizes[i] = 8 + len(it.key)
+		total += sizes[i]
+	}
+	half := total / 2
+	cum := 0
+	for i := 0; i < len(items)-1; i++ {
+		cum += sizes[i]
+		if cum >= half {
+			// Place the split AFTER item i — left holds items[0..i],
+			// right holds items[i+1..]. Return i+1 because callers
+			// use `items[:mid]` / `items[mid:]`.
+			split := i + 1
+			if split < 1 {
+				split = 1
+			}
+			if split > len(items)-1 {
+				split = len(items) - 1
+			}
+			return split
+		}
+	}
+	// Fall-through: total too small to cross half-mark before the
+	// last entry — return n-1 so right has exactly one item.
+	return len(items) - 1
 }
 
 // readPageItem (M0055-0002 Phase A) decodes a single item at the

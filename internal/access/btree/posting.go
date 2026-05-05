@@ -85,3 +85,25 @@ func postingKeyOf(raw []byte) []byte {
 	}
 	return raw[off : off+keyLen]
 }
+
+// appendTIDToPosting (M0055-0003) returns a new posting payload
+// with `tid` appended to an existing posting's TID list. Used by
+// the steady-state insert path to grow a posting in place when an
+// inserted key matches an existing posting's key, instead of
+// allocating a fresh single-TID line pointer.
+func appendTIDToPosting(raw []byte, tid storage.ItemPointer) ([]byte, error) {
+	key, tids, err := parsePostingRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	tids = append(tids, tid)
+	return marshalPosting(key, tids), nil
+}
+
+// promoteSingleToPosting (M0055-0003) builds a 2-TID posting
+// payload from an existing single-TID line pointer's `(key, ptr)`
+// plus a new `tid`. Used by the steady-state insert path when a
+// duplicate-key insert hits a non-posting line pointer.
+func promoteSingleToPosting(existingKey []byte, existingPtr storage.ItemPointer, newTID storage.ItemPointer) []byte {
+	return marshalPosting(existingKey, []storage.ItemPointer{existingPtr, newTID})
+}

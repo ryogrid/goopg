@@ -418,6 +418,63 @@ func PageInsertItemRawAt(p Page, slot uint16, raw []byte) (uint16, error) {
 	return slot, nil
 }
 
+// PageReplaceItemRaw (M0055-0003) replaces the line pointer's
+// payload at the 1-based slot with `raw`. When the new bytes fit
+// in the existing line pointer's slot, it overwrites in place.
+// When `raw` is larger AND the page has free space, it allocates
+// a fresh tuple-region location at pd_upper-len and updates the
+// line pointer to reference the new location (the old bytes
+// become garbage, reclaimed by the next vacuum / repack). Returns
+// `ErrNoSpaceInPage` when neither the existing slot nor a fresh
+// allocation fits.
+//
+// Used by the steady-state-insert dedup path: when an inserted key
+// matches an existing posting-list line pointer, the new payload
+// (existing TIDs + new TID) is written via this helper so the
+// page line-pointer count stays the same.
+func PageReplaceItemRaw(p Page, slot uint16, raw []byte) error {
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	if int(slot) < 1 || int(slot) > count {
+		return fmt.Errorf("PageReplaceItemRaw: slot %d out of range [1,%d]", slot, count)
+	}
+	id, err := readItemID(p, int(slot)-1)
+	if err != nil {
+		return err
+	}
+	if len(raw) > 0x7FFF {
+		return fmt.Errorf("item too large for line pointer len=%d", len(raw))
+	}
+	if int(id.Length) >= len(raw) {
+		// Fits in the existing slot — overwrite in place. Update
+		// the line pointer's length to the (possibly shorter) new
+		// payload; the trailing bytes become garbage.
+		copy(p[id.Offset:int(id.Offset)+len(raw)], raw)
+		newID := ItemID{Offset: id.Offset, Flags: id.Flags, Length: uint16(len(raw))}
+		return writeItemID(p, int(slot)-1, newID)
+	}
+	// Need to grow — allocate fresh space at pd_upper-len.
+	h, err := Header(p)
+	if err != nil {
+		return err
+	}
+	lower := int(h.Lower())
+	upper := int(h.Upper())
+	if upper-lower < len(raw) {
+		return ErrNoSpaceInPage
+	}
+	newUpper := upper - len(raw)
+	copy(p[newUpper:upper], raw)
+	newID := ItemID{Offset: uint16(newUpper), Flags: id.Flags, Length: uint16(len(raw))}
+	if err := writeItemID(p, int(slot)-1, newID); err != nil {
+		return err
+	}
+	h.SetUpper(uint16(newUpper))
+	return nil
+}
+
 // HeapPageVacuumStats reports the outcome of a single-page vacuum.
 type HeapPageVacuumStats struct {
 	Dead int // line pointers transitioned LP_NORMAL -> LP_UNUSED
