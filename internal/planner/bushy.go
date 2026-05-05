@@ -785,8 +785,11 @@ func findScanByColName(scans []Node, start, end int, key Expr) (scanIdx int, col
 }
 
 // rewriteMultiWayChain walks the plan tree and replaces chains of
-// ≥3 hash-joined tables with MultiHashJoin nodes.
-func rewriteMultiWayChain(node Node) Node {
+// ≥3 hash-joined tables with MultiHashJoin nodes. The catalog
+// argument is forwarded to `rewriteMHJInputsWithSingleTablePredicates`
+// so single-table constant-RHS filters can promote their input scan
+// from `SeqScan` to `IndexScan` (M0054-0006a-pre).
+func rewriteMultiWayChain(node Node, cat catalog.Catalog) Node {
 	if node == nil {
 		return nil
 	}
@@ -798,14 +801,14 @@ func rewriteMultiWayChain(node Node) Node {
 		// crossing a plan-phase boundary mixes table scopes.
 		switch n := node.(type) {
 		case *Join:
-			n.Left = rewriteMultiWayChain(n.Left)
-			n.Right = rewriteMultiWayChain(n.Right)
+			n.Left = rewriteMultiWayChain(n.Left, cat)
+			n.Right = rewriteMultiWayChain(n.Right, cat)
 		case *Filter:
-			n.Child = rewriteMultiWayChain(n.Child)
+			n.Child = rewriteMultiWayChain(n.Child, cat)
 		case *Project:
-			n.Child = rewriteMultiWayChain(n.Child)
+			n.Child = rewriteMultiWayChain(n.Child, cat)
 		case *Sort:
-			n.Child = rewriteMultiWayChain(n.Child)
+			n.Child = rewriteMultiWayChain(n.Child, cat)
 		}
 		return node
 	}
@@ -865,6 +868,15 @@ func rewriteMultiWayChain(node Node) Node {
 		fullSchema = append(fullSchema, s.Output()...)
 	}
 	mh.schema = fullSchema
+
+	// M0054-0006a-pre: rewrite SeqScan inputs to IndexScan whenever a
+	// single-table constant-RHS filter from `mh.Filters` admits a
+	// usable B-tree index. Closes the M0054-0003d Q8 gap
+	// (`p_type = 'ECONOMY ANODIZED STEEL'` → `Index Scan using
+	// idx_part_type on part`). Mutates mh in place; absorbed
+	// conjuncts are removed from mh.Filters.
+	rewriteMHJInputsWithSingleTablePredicates(mh, cat)
+
 	return mh
 }
 

@@ -2361,6 +2361,41 @@ rationale here.
       `supplier` row in the Aggregate gaps section transitions
       from `Seq Scan` to `Index Scan using supplier_pk`.
 
+      **M0054-0006a-pre (landed 2026-05-05) — single-table
+      predicate routing into scan inputs:** new
+      `internal/planner/mhj_input_rewrite.go` adds a generic
+      post-pass invoked from `planSelect` right after
+      `rewriteMultiWayChain`. It walks the plan tree once; for every
+      `*Filter` it finds (or `*MultiHashJoin.Filters` directly), it
+      groups single-table constant-RHS conjuncts by (target SeqScan,
+      column) and rewrites the matching `*SeqScan` into an
+      `*IndexScan` when a B-tree index is available. Both equality
+      and range bounds are supported (eq → `Key`; `>=`/`<=`/`>`/`<`
+      → `LowKey`/`HighKey`). The pass descends into `MultiHashJoin`
+      so an outer `Filter` wrapping a MHJ can absorb predicates into
+      `mh.Tables[i]`. Equality conjuncts are dropped from the
+      surrounding predicate (single-column IndexScan probe is
+      exact); range conjuncts are kept (RangeScan is inclusive-only,
+      so strict `>`/`<` boundary cases stay double-checked by the
+      Filter). Same conservative envelope as the existing
+      `planIndexScanFromWhere` / `tryRangeIndexScan`: only
+      `*IntegerConst` / `*NumericConst` / `*StringConst` /
+      `*TypedStringLit` / `*ParamRef` keys; column-vs-column
+      predicates and ambiguous column-name self-joins decline.
+      Aggregate / WindowAgg subtrees are NOT crossed.
+      **Generality verified by regenerating
+      `analysis/tpch-explain-baseline.md`:** the rewrite triggers
+      across many TPC-H queries, not only Q8 — Q3 (customer +
+      orders + lineitem all promoted), Q5 (orders), Q8 (part +
+      orders), Q10 (orders), Q12 (lineitem), Q2 (part) all moved
+      from SeqScan to IndexScan, with no regression on the
+      previously-IndexScan-using Q1 / Q4 / Q6 / Q14 / Q15a / Q15b.
+      **Q8 acceptance from M0054-0003d met:** Q8 plan now lists
+      `Index Scan using idx_part_type on part`. Tests:
+      `go test ./internal/planner ./internal/executor
+      ./internal/testutil/tpch ./internal/initdb ./internal/wal
+      ./internal/catalog ./internal/storage` PASS.
+
       **Inherited from M0054-0003d (delegated 2026-05-05):**
       M0054-0006 must close the part-table SeqScan in Q14, Q19
       (column-vs-column `l_partkey = p_partkey`). Same parity-

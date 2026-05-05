@@ -370,7 +370,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// MultiHashJoin node.  Column indices are remapped inside
 	// collectMultiHashTables using scanForCol, so parent
 	// expressions (incl. unnest keys) stay aligned.
-	node = rewriteMultiWayChain(node)
+	node = rewriteMultiWayChain(node, cat)
+	// M0054-0006a-pre: after MultiHashJoin construction, walk the
+	// plan tree and route single-table constant-RHS equality
+	// predicates from `*Filter` wrappers and `mh.Filters` into the
+	// matching `*SeqScan` input by rewriting it to `*IndexScan`.
+	// Closes the M0054-0003d Q8 case
+	// (`p_type = 'ECONOMY ANODIZED STEEL'` →
+	// `Index Scan using idx_part_type on part`).
+	node = rewriteScanInputsWithSingleTablePredicates(node, cat)
 	node = remapExprRefsToMHJ(node)
 	// Second pass: use FROM‑clause bindings to correct any
 	// remaining order differences (OID ≠ FROM order).
