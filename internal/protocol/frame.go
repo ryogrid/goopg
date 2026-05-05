@@ -38,13 +38,22 @@ type FrameReader struct {
 	OnAfterRead  func()
 }
 
-// NewFrameReader wraps r with the v0 message-size limits. Tests can pass a
-// smaller maxRegular to exercise overflow handling.
+// NewFrameReader wraps r with the production message-size limits.
 func NewFrameReader(r io.Reader) *FrameReader {
 	return &FrameReader{
 		r:        bufio.NewReader(r),
 		maxStart: MaxStartupPacketLength,
 		maxRegul: MaxRegularMessageLength,
+	}
+}
+
+// NewFrameReaderWithLimit wraps r with a custom regular-message payload limit.
+// Use in tests to exercise the overflow path without sending multi-MiB messages.
+func NewFrameReaderWithLimit(r io.Reader, maxPayload int) *FrameReader {
+	return &FrameReader{
+		r:        bufio.NewReader(r),
+		maxStart: MaxStartupPacketLength,
+		maxRegul: maxPayload,
 	}
 }
 

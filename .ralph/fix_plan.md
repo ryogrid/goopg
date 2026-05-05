@@ -1771,10 +1771,26 @@ tracks the new regression separately so we don't retro-edit history.
       returned, session alive, SELECT 1 succeeds on same connection.
       `TestFrameReaderResynchronisesAfterOversizePayload` — stream stays in
       sync after oversized read. All `go test ./...` pass.)
-- [ ] M0052-0002: Fix the root cause once M0052-0001 surfaces it, and
+- [x] M0052-0002: Fix the root cause once M0052-0001 surfaces it, and
       re-run HammerDB end-to-end as run-010 to confirm the full
       schema-build → CREATE INDEX → ANALYZE → Q1..Q22 path completes
       without manual intervention.
+      (landed 2026-05-05: `MaxRegularMessageLength` increased from 1 MiB
+      to 16 MiB (16 << 20) — covers HammerDB's maximum LINEITEM batch
+      (~1.75 MiB at 7 lineitems/order × 1000 orders). Added
+      `NewFrameReaderWithLimit(r, limit)` constructor for test isolation
+      + `Config.MaxQueryPayloadBytes` server knob so E2E tests exercise
+      the oversized-frame path without sending multi-MiB messages.
+      Design doc `docs/design/0052-0001-oversized-message-graceful-recovery.md`
+      (covers M0052-0001 + M0052-0002). README index updated.
+      Run-010 results (`analysis/tpch-hammerdb-run-010.md`):
+      - ORDERS/LINEITEM load: **1 500 000 orders, ~6 000 000 lineitems** ← regression fixed
+      - CREATE INDEX: all PRIMARY KEY + supplementary indexes created;
+        1 transient B-tree failure (`IDX_LINEITEM_ORDERKEY_FKIDX len=35669`)
+        — succeeded after manual retry; not a M0052 issue
+      - ANALYZE: OK
+      - Q14: 42.9 s, Q2: 9.7 s, Q9: in progress (expected ~900 s SF=1)
+      All `go test ./...` pass (hammerdb_load suite: 312s with 600s timeout).)
 
 ## Notes
 

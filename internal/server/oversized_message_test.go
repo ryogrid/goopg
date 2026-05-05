@@ -16,14 +16,16 @@ import (
 )
 
 // TestE2EOversizedMessageDoD verifies that when a client sends a SQL message
-// whose payload exceeds MaxRegularMessageLength, the server:
+// whose payload exceeds the server's per-connection limit, the server:
 //   (a) sends a proper ErrorResponse (not a silent TCP close), and
 //   (b) continues serving subsequent queries on the same connection.
 //
 // This is the DoD for M0052-0001 / M0052-0002: the HammerDB TPC-H loader
-// can send INSERT statements with thousands of VALUES rows that occasionally
-// exceed the 1 MiB per-message limit. Before this fix the server silently
-// dropped the connection.
+// sends INSERT statements that can approach or exceed the message limit.
+// Before this fix the server silently dropped the connection. The test uses
+// Config.MaxQueryPayloadBytes=1024 so the test message stays tiny (avoids
+// sending multi-MiB data over TCP in a unit test while still exercising the
+// same code path).
 func TestE2EOversizedMessageDoD(t *testing.T) {
 	// Start a minimal server backed by real storage.
 	dir := t.TempDir()
@@ -32,14 +34,16 @@ func TestE2EOversizedMessageDoD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
+	const testLimit = 1024 // tiny per-connection limit so the test doesn't need to send MiBs
 	srv := New(Config{
-		Address:          "127.0.0.1:0",
-		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
-		AcceptDeadline:   25 * time.Millisecond,
-		HandshakeTimeout: 2 * time.Second,
-		Catalog:          catalog.NewInMemory(),
-		Pool:             pool,
-		TxnMgr:           mvcc.NewManager(),
+		Address:              "127.0.0.1:0",
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AcceptDeadline:       25 * time.Millisecond,
+		HandshakeTimeout:     2 * time.Second,
+		Catalog:              catalog.NewInMemory(),
+		Pool:                 pool,
+		TxnMgr:               mvcc.NewManager(),
+		MaxQueryPayloadBytes: testLimit,
 	})
 	ctx := t.Context()
 	done := make(chan error, 1)
@@ -70,8 +74,8 @@ func TestE2EOversizedMessageDoD(t *testing.T) {
 		t.Fatalf("drain startup: %v", err)
 	}
 
-	// Send an oversized MsgQuery (> MaxRegularMessageLength).
-	oversizedSQL := bytes.Repeat([]byte("SELECT 1;\n"), protocol.MaxRegularMessageLength/9+100)
+	// Send an oversized MsgQuery (> testLimit = 1024 bytes).
+	oversizedSQL := bytes.Repeat([]byte("SELECT 1;\n"), testLimit/9+10)
 	if err := sendSimpleQuery(conn, oversizedSQL); err != nil {
 		t.Fatalf("send oversized query: %v", err)
 	}

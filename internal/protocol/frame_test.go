@@ -87,13 +87,17 @@ func TestParseStartupParameters_MissingTerminator(t *testing.T) {
 	}
 }
 
-// TestFrameReaderRejectsOversizePayload guards against memory-exhaustion DoS
-// from a malicious client claiming a multi-GB message length.
+// testFrameLimit is the limit used in oversize-frame unit tests. Using a
+// tiny value avoids allocating or sending multi-MiB buffers while still
+// exercising the ErrFrameTooLarge path through the same code as production.
+const testFrameLimit = 256
+
+// TestFrameReaderRejectsOversizePayload guards the ErrFrameTooLarge sentinel
+// and the drain-before-return behaviour on a reader with a small custom limit.
 func TestFrameReaderRejectsOversizePayload(t *testing.T) {
-	// Build a header claiming length = MaxRegularMessageLength + 5 (i.e.
-	// payload = MaxRegularMessageLength + 1), with actual payload bytes so
-	// the drain path succeeds and ErrFrameTooLarge is returned.
-	payloadLen := MaxRegularMessageLength + 1
+	// Build a header claiming payload = testFrameLimit+1 bytes, followed by
+	// the actual payload bytes so the drain path succeeds.
+	payloadLen := testFrameLimit + 1
 	total := uint32(payloadLen + 4)
 	hdr := []byte{
 		'Q',
@@ -101,8 +105,8 @@ func TestFrameReaderRejectsOversizePayload(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	buf.Write(hdr)
-	buf.Write(make([]byte, payloadLen)) // actual payload so drain succeeds
-	r := NewFrameReader(&buf)
+	buf.Write(make([]byte, payloadLen))
+	r := NewFrameReaderWithLimit(&buf, testFrameLimit)
 	_, err := r.ReadFrame()
 	if err == nil {
 		t.Fatal("expected oversize error, got nil")
@@ -120,8 +124,8 @@ func TestFrameReaderRejectsOversizePayload(t *testing.T) {
 func TestFrameReaderResynchronisesAfterOversizePayload(t *testing.T) {
 	var buf bytes.Buffer
 
-	// First: an oversized MsgQuery with payloadLen = MaxRegularMessageLength + 1
-	payloadLen := MaxRegularMessageLength + 1
+	// First: a MsgQuery exceeding testFrameLimit.
+	payloadLen := testFrameLimit + 1
 	total := uint32(payloadLen + 4)
 	hdr := []byte{
 		'Q',
@@ -130,10 +134,10 @@ func TestFrameReaderResynchronisesAfterOversizePayload(t *testing.T) {
 	buf.Write(hdr)
 	buf.Write(make([]byte, payloadLen))
 
-	// Second: a tiny valid MsgSync (just the 5-byte header, payload length 4)
+	// Second: a tiny valid MsgSync (payload length 4 = zero bytes after header).
 	buf.Write([]byte{'S', 0, 0, 0, 4})
 
-	r := NewFrameReader(&buf)
+	r := NewFrameReaderWithLimit(&buf, testFrameLimit)
 
 	// First read: expect ErrFrameTooLarge.
 	_, err := r.ReadFrame()

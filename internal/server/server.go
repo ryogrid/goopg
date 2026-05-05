@@ -203,6 +203,12 @@ type Config struct {
 	// socket. Empty disables both — useful for in-process tests
 	// that don't want a sticky pidfile in /tmp.
 	DataDir string
+
+	// MaxQueryPayloadBytes, when non-zero, overrides MaxRegularMessageLength
+	// as the per-connection payload ceiling for regular (post-startup) frames.
+	// Tests set this to a small value to exercise the oversized-frame path
+	// without sending multi-MiB messages. Zero means use MaxRegularMessageLength.
+	MaxQueryPayloadBytes int
 }
 
 // hasStorage reports whether all three storage handles are configured.
@@ -484,7 +490,12 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// Bound the handshake.
 	_ = raw.SetDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
 
-	r := protocol.NewFrameReader(raw)
+	var r *protocol.FrameReader
+	if s.cfg.MaxQueryPayloadBytes > 0 {
+		r = protocol.NewFrameReaderWithLimit(raw, s.cfg.MaxQueryPayloadBytes)
+	} else {
+		r = protocol.NewFrameReader(raw)
+	}
 	w := protocol.NewFrameWriter(raw)
 
 	params, err := s.handleStartup(r, w)
