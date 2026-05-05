@@ -2871,6 +2871,54 @@ rationale here.
         `tpch-hammerdb-run-012.md` if the next run gets the same
         run-012 label). Blocked by Q9-composite landing first.
 
+## Milestone 0055 — Staged B-tree Enhancement Program
+
+See `docs/milestones/0055-staged-btree-enhancement-program.md`.
+
+Reference inputs:
+
+- `analysis/btree-simplifications-and-performance-upgrade-plan-2026-05-05.md`
+- `analysis/btree-goopg-vs-postgres-reference-map-2026-05-05.md`
+
+Required design docs:
+
+- `docs/design/0055-0001-btree-write-path-and-steady-state-dedup.md`
+- `docs/design/0055-0002-btree-multi-writer-split-protocol.md`
+- `docs/design/0055-0003-btree-page-deletion-and-recycling-protocol.md`
+- `docs/design/0055-0004-btree-external-sort-build-and-uniqueness.md`
+
+- [ ] M0055-0001: Baseline and acceptance harness for staged B-tree work.
+      Freeze benchmark/report inputs (insert-path pprof, split count,
+      duplicate-heavy size drift, CREATE INDEX RSS/time) and add test
+      guardrails so each subsequent sub-task can show before/after
+      evidence.
+
+- [ ] M0055-0002: Phase A — write-path CPU + split-efficiency upgrades.
+      Implement in-page binary-position insert, byte-aware split-loc,
+      and rightmost-leaf insert fastpath cache.
+
+- [ ] M0055-0003: Phase B — steady-state dedup retention.
+      Add in-place posting growth/merge and pre-split local dedup
+      compaction for duplicate-heavy insert workloads.
+
+- [ ] M0055-0004: Phase C — multi-writer split lifecycle.
+      Introduce incomplete-split marker/completion flow, remove
+      structural single-writer split bottleneck, and restore full
+      sibling-link invariants.
+
+- [ ] M0055-0005: Phase D — deletion/recycling protocol hardening.
+      Move to two-phase page deletion with replay-safe WAL coverage,
+      and recycle safely deletable pages into free-space management.
+
+- [ ] M0055-0006: Phase E — spill-capable CREATE INDEX build path.
+      Replace all-in-memory collect/sort with external spool/merge,
+      and switch unique checks to sorted-stream adjacency validation.
+
+- [ ] M0055-0007: End-to-end validation and report publication.
+      Publish one final analysis report under `analysis/` with
+      measured deltas vs M0055-0001 baseline and update milestone
+      status when all DoD gates are met.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

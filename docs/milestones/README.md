@@ -89,3 +89,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0052 | HammerDB TPC-H end-to-end regression on `perf-analysis` (oversized-message fix) | accepted | (tasks in `.ralph/fix_plan.md` — no separate milestone file; fixed via M0052-0001 + M0052-0002) |
 | 0053 | HammerDB TPC-H complete run verification & English report | accepted (PARTIAL) | `0053-hammerdb-tpch-complete-run-verification.md` |
 | 0054 | TPC-H performance & optimisation follow-through (closes M0053 deferrals: NLI, CREATE DATABASE WAL, EXPLAIN-driven index audit, pprof bottleneck survey, run-012 22/22 verification) | planned | `0054-tpch-performance-and-optimisation.md` |
+| 0055 | Staged B-tree enhancement program (write-path CPU reduction, steady-state dedup, multi-writer split protocol, deletion/recycling hardening, external-sort index build) | planned | `0055-staged-btree-enhancement-program.md` |
