@@ -2044,18 +2044,42 @@ rationale here.
       `internal/server/database_ddl_test.go` (DDL classifier and
       identifier parser). Full `go test ./...` PASS.)
 
-- [ ] M0054-0002: TPC-H index utilisation audit (EXPLAIN-driven). For
-      each of Q1..Q22 against a populated schema (10 % SF=1 via
-      `internal/testutil/tpch/` helpers + ANALYZE), capture
-      `EXPLAIN (FORMAT JSON)` and assert a baseline plan-shape (which
-      SeqScans / IndexScans / Joins). Publish
-      `analysis/tpch-explain-baseline.md` listing every Q1..Q22 plan,
-      the indexes used (or not), and the 3 most impactful
-      "should-be-IndexScan-but-is-SeqScan" gaps. The first run BAKES
-      IN the current state; subsequent runs flag improvements +
-      regressions. Files: new test under
-      `internal/testutil/tpch/index_utilisation_test.go`, new
-      analysis report.
+- [x] M0054-0002: TPC-H index utilisation audit (EXPLAIN-driven).
+      (landed 2026-05-05: new
+      `internal/testutil/tpch/index_utilisation_test.go` —
+      `TestTPCHIndexUtilisationBaseline` — spins up a real cluster
+      via the existing `internal/testutil/cluster` harness, loads
+      TPC-H DDL + SampleInserts, applies all 8 HammerDB-equivalent
+      PRIMARY KEY constraints (incl. composite `partsupp_pk
+      (ps_partkey, ps_suppkey)` and `lineitem_pk (l_linenumber,
+      l_orderkey)`) plus 16 supplementary indexes mirroring
+      HammerDB's schema, runs ANALYZE, and captures
+      `EXPLAIN (FORMAT JSON)` for each of Q1..Q22. The plan-walker
+      classifies each scan node from goopg's descriptive Node Type
+      strings ("Seq Scan on T", "Index Scan using I on T") and
+      writes the audit to `analysis/tpch-explain-baseline.md`.
+      Findings on the synthetic fixture:
+      - Q1 (l_shipdate range), Q4 (o_orderdate range), and Q6
+        (l_shipdate range) already use the M0044/M0051 timestamp
+        index path — confirming the constant-folding + range-index
+        plumbing is healthy.
+      - Q15 is a non-SELECT slot (CREATE OR REPLACE VIEW) —
+        EXPLAIN not applicable, recorded as such.
+      - 8 queries report "No scan nodes" (root=Projection with no
+        underlying scans) — Q2/Q3/Q5/Q7/Q10/Q11/Q18/Q21. These are
+        the multi-table-join / subquery-heavy queries where the
+        planner currently emits an empty / Values plan rather than
+        a real scan tree. Investigation deferred to M0054-0003 sub-
+        tasks (NOT to another milestone — we have the baseline now).
+      - Tables with the most SeqScan-when-an-index-exists hits:
+        `part` (6 queries: Q8/Q9/Q14/Q16/Q17/Q19),
+        `lineitem` (4 queries: Q12/Q14/Q17/Q19),
+        `customer` (Q13/Q22), `partsupp` (Q16),
+        `nation`/`supplier` (Q9, Q20).
+      The report names these explicitly in the "Aggregate gaps"
+      section so M0054-0003 can pick the highest-leverage sub-tasks.
+      `go test ./internal/testutil/tpch/ -run
+      TestTPCHIndexUtilisationBaseline` PASS (~0.6s).)
 
 - [ ] M0054-0003: Close the index-utilisation gaps surfaced by
       M0054-0002. Each gap closed produces an EXPLAIN diff committed
