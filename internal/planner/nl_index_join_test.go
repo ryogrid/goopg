@@ -279,6 +279,47 @@ func TestNLIRulePromotesAcrossFilterCrossJoinFromView(t *testing.T) {
 	}
 }
 
+// TestNLIRulePromotesAcrossOROfANDsCommonEqui
+// (M0054-0006-followup-Q19) covers the Q19-shape disjunctive
+// predicate where the join equi-conjunct is repeated in every
+// OR branch. The rule must factor the common equi-conjunct
+// into the join key while keeping the full OR as the residual
+// Predicate on NLI for per-branch filtering.
+func TestNLIRulePromotesAcrossOROfANDsCommonEqui(t *testing.T) {
+	cat := catalog.NewInMemory()
+	part, err := cat.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
+		{Name: "p_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "p_brand", Type: catalog.Type{Name: "char", Args: []int64{10}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "part_pk"}, part, []string{"p_partkey"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "lineitem"}, []catalog.Column{
+		{Name: "l_partkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "l_quantity", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stmt := parseOne(t, `SELECT * FROM lineitem, part WHERE
+		(p_partkey = l_partkey AND p_brand = 'Brand#12' AND l_quantity >= 1)
+		OR (p_partkey = l_partkey AND p_brand = 'Brand#23' AND l_quantity >= 10)
+		OR (p_partkey = l_partkey AND p_brand = 'Brand#34' AND l_quantity >= 20)`)
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	nli := firstNLI(node)
+	if nli == nil {
+		t.Fatalf("expected NLI from OR-factor; tree: %s", describePlanTree(node))
+	}
+	if nli.Inner.Index == nil || nli.Inner.Index.Name != "part_pk" {
+		t.Fatalf("expected part_pk on inner; got %v", nli.Inner.Index)
+	}
+}
+
 // findNLI returns true when the plan tree contains a
 // `*NestedLoopIndexJoin` anywhere.
 func findNLI(n Node) bool {

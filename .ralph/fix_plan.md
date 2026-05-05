@@ -2559,10 +2559,42 @@ rationale here.
       generic and will catch additional shapes as they're
       surfaced.)
 
-  - [ ] M0054-0006-followup-Q19: extract equi-keys from
-        disjunctive predicates so Q19's three-branch OR shape
-        gets an NLI plan on the part side. Acceptance: Q19
-        baseline shows `Index Scan using part_pk on part`.
+  - [x] M0054-0006-followup-Q19: **LANDED 2026-05-05.** Extract
+        equi-keys from disjunctive predicates. ROOT CAUSE: Q19's
+        WHERE is a 3-way OR-of-ANDs where the join equi-conjunct
+        `p_partkey = l_partkey` is repeated in EVERY branch. The
+        planner produces `Filter(OR-of-ANDs, Join{Type=Cross,
+        Predicate=nil})` (the same view-substitution pattern
+        seen in Q15b but with OR instead of single equi). The
+        existing M0054-0006-followup-Q15b walker handled
+        AND-chains only — the OR pred reached
+        `splitFilterPredicateForNLI` as a single non-equi
+        conjunct and went entirely into residuals. FIX:
+        - `extractCommonCrossSideEquiAcrossOR(pred, leftWidth)`
+          (new) returns the cross-side equi-conjunct present in
+          EVERY OR branch; nil otherwise. Equality match by
+          `*ColumnRef.Index` pair (in either order).
+        - `splitFilterPredicateForNLI` extended: when an
+          AND-leaf is itself an OR-of-ANDs with a common cross-
+          side equi, the helper factors that equi into the
+          cross slice while leaving the OR on the residual
+          slice. The OR-residual remains on the parent Filter
+          for per-row branch evaluation; the equi-conjunct
+          becomes the IndexScan probe.
+        - `tryBuildNLI` extended: when extractEquiKeys fails,
+          retries via `extractCommonCrossSideEquiAcrossOR(j.Predicate)`
+          and seeds `innerToOuter` directly so the AND-walking
+          `collectCrossSideEquiKeys` is bypassed for the OR
+          case.
+        Acceptance evidence:
+        - `analysis/tpch-explain-baseline.md` Q19 regenerated
+          shows `Index Scan using part_pk on part` (was
+          `Seq Scan on part`). No regressions on Q1-Q22.
+        - `TestNLIRulePromotesAcrossOROfANDsCommonEqui` asserts
+          the rule fires on a 3-way OR-of-ANDs with the common
+          equi factored.
+        - All 7 NLI rule unit tests + cluster-backed parity
+          tests continue to PASS.
 
   - [x] M0054-0006-followup-Q15b: **LANDED 2026-05-05.** Handle
         the binary join produced by an inlined VIEW reference

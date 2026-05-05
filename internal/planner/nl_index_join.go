@@ -44,6 +44,7 @@ import (
 // programmatic kill-switch but not a SQL-driven one.
 var nliEnabled atomic.Bool
 
+
 func init() {
 	nliEnabled.Store(true)
 }
@@ -159,6 +160,106 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 	return n
 }
 
+// extractCommonCrossSideEquiAcrossOR (M0054-0006-followup-Q19)
+// scans an OR-of-AND predicate (Q19 shape) for a cross-side
+// equi-conjunct (`outer.col = inner.col`) that appears in EVERY
+// disjunct. When found, it can be used as the IndexScan probe
+// key while keeping the full OR as a residual Predicate on NLI.
+//
+// `leftWidth` is the join's left-side schema width: a `*ColumnRef`
+// with `Index < leftWidth` belongs to the LEFT side.
+//
+// Returns (eqExpr, true) when ok; (nil, false) otherwise.
+func extractCommonCrossSideEquiAcrossOR(pred Expr, leftWidth int) (Expr, bool) {
+	bop, ok := pred.(*BinaryOp)
+	if !ok || bop.Op != "OR" {
+		return nil, false
+	}
+	branches := walkOrConjunctsNLI(bop)
+	if len(branches) < 2 {
+		return nil, false
+	}
+	// Collect the cross-side equi-conjuncts present in the FIRST
+	// branch — these are the candidates for the common factor.
+	firstEquis := []Expr{}
+	for _, c := range walkAndConjunctsNLI(branches[0]) {
+		if isCrossSideEquiConjunctNLI(c, leftWidth) {
+			firstEquis = append(firstEquis, c)
+		}
+	}
+	if len(firstEquis) == 0 {
+		return nil, false
+	}
+	// For each remaining branch, narrow the candidate set to
+	// those equi-conjuncts that also appear there. Equality is
+	// by structural ColumnRef-pair match (Op=`=` with the same
+	// two ColumnRef.Index values, in either order).
+	for i := 1; i < len(branches); i++ {
+		branchEquis := []Expr{}
+		for _, c := range walkAndConjunctsNLI(branches[i]) {
+			if isCrossSideEquiConjunctNLI(c, leftWidth) {
+				branchEquis = append(branchEquis, c)
+			}
+		}
+		next := firstEquis[:0]
+		for _, candidate := range firstEquis {
+			for _, b := range branchEquis {
+				if sameCrossSideEquiNLI(candidate, b) {
+					next = append(next, candidate)
+					break
+				}
+			}
+		}
+		firstEquis = next
+		if len(firstEquis) == 0 {
+			return nil, false
+		}
+	}
+	// Pick the first surviving common equi-conjunct.
+	return firstEquis[0], true
+}
+
+// walkOrConjunctsNLI flattens an OR-chain into its disjunct leaves.
+// A non-OR node returns a single-element slice containing itself.
+func walkOrConjunctsNLI(e Expr) []Expr {
+	if e == nil {
+		return nil
+	}
+	bop, ok := e.(*BinaryOp)
+	if !ok || bop.Op != "OR" {
+		return []Expr{e}
+	}
+	out := walkOrConjunctsNLI(bop.Left)
+	out = append(out, walkOrConjunctsNLI(bop.Right)...)
+	return out
+}
+
+// sameCrossSideEquiNLI reports whether two cross-side equi-
+// conjuncts reference the same pair of `*ColumnRef.Index` values
+// (in either order). Used to identify the common factor across
+// OR branches in Q19's shape.
+func sameCrossSideEquiNLI(a, b Expr) bool {
+	ab, aOK := a.(*BinaryOp)
+	bb, bOK := b.(*BinaryOp)
+	if !aOK || !bOK || ab.Op != "=" || bb.Op != "=" {
+		return false
+	}
+	al, alOK := ab.Left.(*ColumnRef)
+	ar, arOK := ab.Right.(*ColumnRef)
+	bl, blOK := bb.Left.(*ColumnRef)
+	br, brOK := bb.Right.(*ColumnRef)
+	if !alOK || !arOK || !blOK || !brOK {
+		return false
+	}
+	if al.Index == bl.Index && ar.Index == br.Index {
+		return true
+	}
+	if al.Index == br.Index && ar.Index == bl.Index {
+		return true
+	}
+	return false
+}
+
 // tryBuildNLI returns a *NestedLoopIndexJoin replacement for `j`
 // when the equi-join shape and index availability admit it.
 //
@@ -180,10 +281,26 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	}
 	// Equi-join detection: prefer the `LeftKey = RightKey` shape
 	// already attached when Algo == Hash. Fall back to inspecting
-	// `Predicate` for non-Hash joins.
+	// `Predicate` for non-Hash joins. M0054-0006-followup-Q19:
+	// when the predicate is OR-of-ANDs (Q19 shape), look for an
+	// equi-conjunct common to every branch — it's still safe to
+	// use as the IndexScan probe key, with the full OR retained
+	// as a residual Predicate on the NLI.
 	leftKey, rightKey, ok := extractEquiKeys(j)
+	residualPred := Expr(nil)
 	if !ok {
-		return nil, false
+		leftWidth := len(j.Left.Output())
+		if eq, found := extractCommonCrossSideEquiAcrossOR(j.Predicate, leftWidth); found {
+			if bop, isBin := eq.(*BinaryOp); isBin && bop.Op == "=" {
+				leftKey = bop.Left
+				rightKey = bop.Right
+				ok = true
+				residualPred = j.Predicate
+			}
+		}
+		if !ok {
+			return nil, false
+		}
 	}
 	leftWidth := len(j.Left.Output())
 	// Identify which side of the equi-conjunct references the
@@ -193,7 +310,7 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	if !leftIsCol || !rightIsCol {
 		return nil, false
 	}
-	innerScan, _, _ := pickInnerSide(j, leftCol, rightCol, leftWidth)
+	innerScan, innerKey, outerKey := pickInnerSide(j, leftCol, rightCol, leftWidth)
 	if innerScan == nil {
 		return nil, false
 	}
@@ -201,6 +318,16 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// inner-side columns to outer-side expressions. The seed
 	// equi-conjunct (from extractEquiKeys) is always among these.
 	innerToOuter := collectCrossSideEquiKeys(j, leftWidth, innerScan)
+	// M0054-0006-followup-Q19: when the equi-conjunct came from
+	// the OR-factor path, j.Predicate is the giant OR which the
+	// AND-walking `collectCrossSideEquiKeys` cannot decompose.
+	// Seed the map directly with the common equi-conjunct so
+	// the index-coverage check can fire.
+	if residualPred != nil && innerKey != nil && outerKey != nil {
+		if _, present := innerToOuter[innerKey.Name]; !present {
+			innerToOuter[innerKey.Name] = outerKey
+		}
+	}
 	if len(innerToOuter) == 0 {
 		return nil, false
 	}
@@ -247,15 +374,19 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	joinedSchema = append(joinedSchema, inner.Output()...)
 
 	nli := &NestedLoopIndexJoin{
-		pos:       j.pos,
-		Type:      j.Type,
-		Outer:     outerNode,
-		Inner:     inner,
-		Predicate: nil, // residuals stay attached at outer Filter; the
-		// equi-conjunct is fully consumed by the IndexScan probe,
-		// and the planner already separated non-key conjuncts
-		// upstream via `pushdown.go`.
-		schema: joinedSchema,
+		pos:   j.pos,
+		Type:  j.Type,
+		Outer: outerNode,
+		Inner: inner,
+		// M0054-0006-followup-Q19: when the equi-conjunct came
+		// from the OR-factoring path, the original OR predicate
+		// stays as a residual so each emitted joined row is
+		// filtered by the per-branch ANDs the OR encoded.
+		// Otherwise no residual: the equi-conjunct is fully
+		// consumed by the IndexScan probe and non-key conjuncts
+		// are separated upstream via `pushdown.go`.
+		Predicate: residualPred,
+		schema:    joinedSchema,
 	}
 	return nli, true
 }
@@ -375,15 +506,61 @@ func pickIndexCoveringAllLeadingColumns(cat catalog.Catalog, tbl *catalog.Table,
 // `leftWidth` is the join's left-side schema width: a `*ColumnRef`
 // with `Index < leftWidth` belongs to the LEFT side. Cross-side
 // means one ColumnRef on each side. (M0054-0006-followup-Q15b.)
+//
+// M0054-0006-followup-Q19 extension: when an AND-leaf is itself
+// an OR-of-ANDs whose every branch contains the same cross-side
+// equi-conjunct, that common equi is factored out into the cross
+// slice while the OR stays on the residual slice. This unlocks
+// the Q19 shape where the join equi-conjunct is repeated in
+// each disjunct of a 3-way OR.
 func splitFilterPredicateForNLI(e Expr, leftWidth int) (cross []Expr, residual []Expr) {
+	seenCrossKey := map[string]struct{}{}
+	addCross := func(eq Expr) {
+		// Deduplicate by ColumnRef.Index pair so a redundant
+		// equi-conjunct in both an AND-leaf AND inside an OR-leaf
+		// doesn't appear twice.
+		bop, ok := eq.(*BinaryOp)
+		if !ok || bop.Op != "=" {
+			cross = append(cross, eq)
+			return
+		}
+		l, lOK := bop.Left.(*ColumnRef)
+		r, rOK := bop.Right.(*ColumnRef)
+		if !lOK || !rOK {
+			cross = append(cross, eq)
+			return
+		}
+		a, b := l.Index, r.Index
+		if a > b {
+			a, b = b, a
+		}
+		key := stringFromInts(a, b)
+		if _, dup := seenCrossKey[key]; dup {
+			return
+		}
+		seenCrossKey[key] = struct{}{}
+		cross = append(cross, eq)
+	}
 	for _, c := range walkAndConjunctsNLI(e) {
 		if isCrossSideEquiConjunctNLI(c, leftWidth) {
-			cross = append(cross, c)
-		} else {
-			residual = append(residual, c)
+			addCross(c)
+			continue
 		}
+		if eq, ok := extractCommonCrossSideEquiAcrossOR(c, leftWidth); ok {
+			addCross(eq)
+			residual = append(residual, c)
+			continue
+		}
+		residual = append(residual, c)
 	}
 	return cross, residual
+}
+
+// stringFromInts builds a small key for the dedup map without
+// pulling in fmt for the hot path.
+func stringFromInts(a, b int) string {
+	// Two-digit-ish range is enough for join column indices.
+	return string(rune(a&0x7fff)) + string(rune(b&0x7fff))
 }
 
 // isCrossSideEquiConjunctNLI reports whether `e` is a binary

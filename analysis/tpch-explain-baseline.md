@@ -212,7 +212,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | lineitem | — |
-| 2 | Seq Scan | part | — |
+| 2 | Index Scan | part | part_pk |
 
 ### Q20
 
@@ -254,7 +254,6 @@ for an M0054-0003 sub-task investigation.
 | lineitem | Q10, Q17, Q18, Q19, Q21, Q5, Q8, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q3, Q6, Q7 |
 | nation | Q10, Q11, Q2, Q21, Q5, Q7, Q8 | Q20, Q9 |
 | orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q3, Q4, Q5, Q8 |
-| part | Q19 | Q14, Q16, Q17, Q2, Q8, Q9 |
 | partsupp | Q11, Q16, Q2, Q9 | — |
 | region | Q2, Q5, Q8 | — |
 | supplier | Q11, Q2, Q20, Q21, Q5, Q7, Q8 | Q15b, Q9 |
