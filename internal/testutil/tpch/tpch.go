@@ -23,8 +23,15 @@ import (
 func Catalog() (catalog.Catalog, error) {
 	c := catalog.NewInMemory()
 	for _, def := range tableDefs() {
-		if _, err := c.CreateTable(parser.ObjectName{Name: def.Name}, def.Columns); err != nil {
+		t, err := c.CreateTable(parser.ObjectName{Name: def.Name}, def.Columns)
+		if err != nil {
 			return nil, err
+		}
+		// M0054-0010: tag known small dimension tables so the
+		// planner pins them on the build side regardless of
+		// whether ANALYZE has populated stats.
+		if def.Name == "region" || def.Name == "nation" {
+			t.SmallDimension = true
 		}
 	}
 	return c, nil

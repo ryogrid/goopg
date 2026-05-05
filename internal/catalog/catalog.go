@@ -76,6 +76,16 @@ type Table struct {
 	// reltuples / relpages plus per-column pg_statistic data.
 	Stats *TableStats
 
+	// SmallDimension flags a table whose row count is known to
+	// be ≤ a tiny constant — the canonical TPC-H examples are
+	// `region` (5 rows) and `nation` (25 rows). The planner uses
+	// the flag as a cardinality fallback when ANALYZE-derived
+	// stats are absent: a hash join with a SmallDimension side
+	// pins the small side as the build side regardless of the
+	// other side's estimated rows. See M0054-0010 / design doc
+	// `docs/design/0054-0005-hash-join-small-side-build.md`.
+	SmallDimension bool
+
 	// RelFrozenXID is the minimum XID still present in the heap as an
 	// unfrozen xmin. VACUUM FREEZE advances this toward the current XID.
 	// When currentXID − RelFrozenXID exceeds autovacuum_freeze_max_age,

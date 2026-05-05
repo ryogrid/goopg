@@ -491,6 +491,20 @@ func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *j
 	lRows := EstimateRows(leftPlan)
 	rRows := EstimateRows(rightPlan)
 	buildLeft := lRows > 0 && rRows > 0 && lRows < rRows
+	// M0054-0010: when one side is a known small-dimension table
+	// (region, nation) but stats are absent on the other side,
+	// pin the small-dim side to the build side. Without stats the
+	// row-count comparison above defaults to false (== build on
+	// right), so a left-side small-dim table would otherwise
+	// hash-build on the much larger right side. Detect both
+	// directions here.
+	leftSmall := IsSmallDimensionSide(leftPlan)
+	rightSmall := IsSmallDimensionSide(rightPlan)
+	if leftSmall && !rightSmall {
+		buildLeft = true
+	} else if rightSmall && !leftSmall {
+		buildLeft = false
+	}
 
 	// For the RightKey, shift indices to the right side by left schema width.
 	if cr, ok := rightKey.(*ColumnRef); ok {

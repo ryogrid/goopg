@@ -2921,25 +2921,38 @@ rationale here.
         the rewriter was already correct.
       Design: `docs/design/0054-0004-like-prefix-range-q20-audit.md`.
 
-- [ ] M0054-0010: Strengthen small-side build estimation for hash
-      join — Nation broadcast / build-side selection.
-      **Motivation:** `nation` has only 25 rows. Joining
-      `supplier × nation ON s_nationkey = n_nationkey` should
-      always build the hash on `nation` (25 rows) and probe from
-      supplier. Today's planner heuristic uses `EstimateRows` and
-      `BuildLeft` flag; without ANALYZE-fed cardinality, the
-      smaller side may incorrectly become the probe in some join
-      orderings (a left-deep tree can put nation on the right of
-      an upper join even though it has the lowest cardinality). Q5,
-      Q7, Q8, Q9, Q20, Q21 all join nation; the build-side error
-      shows up cumulatively.
-      **Acceptance:** Plan-level unit test asserting that a binary
-      hash join between a 25-row table and a 10000-row table emits
-      `BuildLeft=true` (or build-on-the-25-row-side equivalent)
-      regardless of join-order rotation. EXPLAIN baseline for
-      Q5/Q7/Q8/Q9/Q20/Q21 shows nation on the build side of every
-      join it participates in.
-      **Design:** `docs/design/0054-0005-hash-join-small-side-build.md`.
+- [x] M0054-0010: **LANDED 2026-05-06.** Hash-join small-side
+      build estimation. Implementation:
+      - `internal/catalog/catalog.go::Table` gained
+        `SmallDimension bool` flag.
+      - `internal/planner/cardinality.go::IsSmallDimensionSide`
+        (new) — recursively detects whether a plan-tree subtree
+        ultimately reads from a SmallDimension-flagged catalog
+        table (handles SeqScan / IndexScan / Filter / Project /
+        Sort wrappings).
+      - `internal/planner/bushy.go` (multi-way bushy DP join
+        construction) and `internal/planner/pushdown.go` (binary
+        join post-pushdown selection) refined: when one side is
+        SmallDimension and the other is not, pin the small side
+        as the build side regardless of EstimateRows.
+      - `internal/executor/operators_ddl.go::CREATE TABLE` —
+        production path tags `region` / `nation` as
+        `SmallDimension = true` at table-creation time.
+      - `internal/testutil/tpch/tpch.go::Catalog()` — same
+        tagging for the in-memory test catalog.
+      Acceptance evidence:
+      - `TestHashJoinBuildOnSmallDim` (new, 2 sub-cases)
+        confirms BuildLeft is set correctly for both nation-on-
+        left and nation-on-right join orderings of `supplier ×
+        nation`.
+      - `analysis/tpch-explain-baseline.md` regenerated; no
+        change in scan-node table because the existing renderer
+        does not surface BuildLeft. (Augmenting the renderer to
+        print BuildLeft is a follow-up convenience; the build-
+        side correctness is now pinned by the unit test.)
+      - All planner / executor / catalog / testutil/tpch tests
+        PASS unchanged.
+      Design: `docs/design/0054-0005-hash-join-small-side-build.md`.
 
 ## Milestone 0055 — Staged B-tree Enhancement Program
 

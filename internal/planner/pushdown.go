@@ -148,8 +148,18 @@ func pushOneConjunct(node Node, c Expr) bool {
 			if algo, ok := chooseInnerJoinAlgo(lRows, rRows); ok {
 				j.Algo = algo
 			}
-			if j.Algo == JoinAlgoHash && lRows > 0 && rRows > 0 && lRows < rRows {
-				j.BuildLeft = true
+			if j.Algo == JoinAlgoHash {
+				if lRows > 0 && rRows > 0 && lRows < rRows {
+					j.BuildLeft = true
+				}
+				// M0054-0010: small-dimension override.
+				leftSmall := IsSmallDimensionSide(j.Left)
+				rightSmall := IsSmallDimensionSide(j.Right)
+				if leftSmall && !rightSmall {
+					j.BuildLeft = true
+				} else if rightSmall && !leftSmall {
+					j.BuildLeft = false
+				}
 			}
 		}
 		return true

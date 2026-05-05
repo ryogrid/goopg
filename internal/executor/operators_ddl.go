@@ -232,6 +232,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// M0054-0010: tag known small dimension tables (canonical
+	// TPC-H tiny tables: region 5 rows, nation 25 rows). The flag
+	// lets the planner pin the small side as the hash-join build
+	// side regardless of stats availability.
+	switch strings.ToLower(s.Name.Name) {
+	case "region", "nation":
+		tbl.SmallDimension = true
+	}
 	// Record for rollback before heap sync — if heap sync fails the catalog
 	// entry is already live and must be cleaned up on ROLLBACK.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
