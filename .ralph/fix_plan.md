@@ -2871,6 +2871,64 @@ rationale here.
         `tpch-hammerdb-run-012.md` if the next run gets the same
         run-012 label). Blocked by Q9-composite landing first.
 
+- [ ] M0054-0008: Q20 decorrelation via magic-set / sideways
+      information passing (SIPS).
+      **Motivation:** TPC-H Q20 contains a correlated subquery that
+      computes `0.5 * sum(l_quantity)` per `(ps_partkey, ps_suppkey)`
+      against `lineitem`. Each outer `partsupp` probe re-runs the
+      lineitem aggregation, turning the Q into `partsupp_size ×
+      lineitem_aggregation`. run-013 (NLI ON, full M0054 stack)
+      shows Q20 still incomplete after >90 minutes — NLI alone does
+      not reach the inner aggregation cost. The Postgres-style fix
+      is decorrelation by lifting the correlated aggregate into a
+      hash-keyed materialisation outside the outer loop:
+      pre-compute `SELECT l_partkey, l_suppkey, sum(l_quantity)
+      FROM lineitem WHERE ... GROUP BY l_partkey, l_suppkey` once,
+      stash by `(l_partkey, l_suppkey)`, and probe per outer row.
+      This is also called magic-set transformation in datalog
+      literature.
+      **Acceptance:** Q20 wall-clock at SF=1 ≤ 600 s (10 min); a
+      synthetic correlated-aggregate fixture shows the rewrite
+      converts O(N×M) re-evaluation to O(N+M) hash probe.
+      **Design:** `docs/design/0054-0003-magic-set-decorrelation.md`.
+
+- [ ] M0054-0009: Verify Q20 inner LIKE 'forest%' uses index range
+      scan (M0051-0004 prefix→range integration check).
+      **Motivation:** Q20's outer scope contains
+      `p_name LIKE 'forest%'` against `part`. M0051-0004 implemented
+      LIKE-prefix → range translation generally; this sub-task is a
+      narrow audit: confirm the EXPLAIN baseline for Q20 (or a
+      synthetic `SELECT … FROM part WHERE p_name LIKE 'forest%'`)
+      shows `Index Scan using part_p_name_idx` with the range
+      `['forest', 'forest\xff…']` rather than `Seq Scan on part`.
+      If a Seq Scan is observed, open a precise sub-task naming the
+      gap (column-on-LHS variant, leading-wildcard mistake, missing
+      idx, etc.).
+      **Acceptance:** Either the baseline is clean (Index Scan) and
+      the audit closes the task with evidence, OR the gap is named
+      and re-opened as a follow-up.
+      **Design:** `docs/design/0054-0004-like-prefix-range-q20-audit.md`.
+
+- [ ] M0054-0010: Strengthen small-side build estimation for hash
+      join — Nation broadcast / build-side selection.
+      **Motivation:** `nation` has only 25 rows. Joining
+      `supplier × nation ON s_nationkey = n_nationkey` should
+      always build the hash on `nation` (25 rows) and probe from
+      supplier. Today's planner heuristic uses `EstimateRows` and
+      `BuildLeft` flag; without ANALYZE-fed cardinality, the
+      smaller side may incorrectly become the probe in some join
+      orderings (a left-deep tree can put nation on the right of
+      an upper join even though it has the lowest cardinality). Q5,
+      Q7, Q8, Q9, Q20, Q21 all join nation; the build-side error
+      shows up cumulatively.
+      **Acceptance:** Plan-level unit test asserting that a binary
+      hash join between a 25-row table and a 10000-row table emits
+      `BuildLeft=true` (or build-on-the-25-row-side equivalent)
+      regardless of join-order rotation. EXPLAIN baseline for
+      Q5/Q7/Q8/Q9/Q20/Q21 shows nation on the build side of every
+      join it participates in.
+      **Design:** `docs/design/0054-0005-hash-join-small-side-build.md`.
+
 ## Milestone 0055 — Staged B-tree Enhancement Program
 
 See `docs/milestones/0055-staged-btree-enhancement-program.md`.
