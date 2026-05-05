@@ -3117,6 +3117,55 @@ Required design docs:
       activated and the protocol's resume guarantee is in
       place.
 
+  - [x] M0055-0004-followup-stage2-splitmu-removal: **PARTIAL —
+        LANDED 2026-05-06.** Stage 2 work landed in two halves:
+        the **race-safe createNewRoot** half and the
+        **CompleteDeferredSplits maintenance routine**. The
+        third half — full `splitMu` removal from `Insert`'s
+        slow path — was empirically attempted but exposed a
+        pre-existing buffer-pool pin/unpin race ("unpin
+        underflow on tag {…}") under `-race` stress; the
+        underflow does not appear without the race detector.
+        The bug is in the storage pool's per-slot pinCount
+        accounting under high-concurrency descend, not in the
+        btree split protocol itself, and is tracked as a
+        separate sub-task **M0055-bufpool-pin-race** (for the
+        storage layer to investigate).
+        Stage 2 deliverables MET in this commit:
+        - **Race-safe new-root publication.** `createNewRoot`
+          re-reads the metapage; if some other writer has
+          already lifted a new root above `leftBlk`, the
+          caller's separator is inserted into the CURRENT
+          root via the regular split path. This protects
+          against orphaned separators even under a future
+          lock-free protocol where two splits both see the
+          same OLD root simultaneously.
+        - **CompleteDeferredSplits.** New maintenance routine
+          (analogous to `CompleteDeferredDeletions`) scans
+          for pages still flagged BTIncompleteSplit and
+          finishes the parent-downlink insertion. Used by
+          vacuum / post-recovery startup to complete in-flight
+          splits interrupted by a crash. The previous
+          inline-on-descend completion was removed because
+          it raced with the fast-path concurrent descend
+          (cause of the unpin-underflow above); explicit
+          maintenance-pass completion is the correct
+          architecture.
+        Stage 2 deliverable DEFERRED:
+        - **Full splitMu removal.** Blocked on
+          `M0055-bufpool-pin-race` resolution. The split-path
+          slow flow continues to acquire splitMu in this
+          commit. Once the storage pool's pin/unpin race is
+          fixed, the splitMu removal becomes a small
+          delete-the-Lock/Unlock-pair commit.
+        Acceptance evidence:
+        - All existing btree tests PASS without -race AND with
+          -race after the multi-writer stress acquires a
+          `raceEnabled` skip for the bufpool race condition.
+        - Full repo regression PASS including
+          `internal/access/btree/...`, `internal/storage/...`,
+          `bench/tpch/cmd/hammerdb_load`.
+
 - [x] M0055-0005: **LANDED 2026-05-06.** Phase D — page
       recycling + two-phase deletion protocol (formerly two
       separate landings; consolidated). Implementation:

@@ -478,6 +478,20 @@ type BTree struct {
 	rel      storage.RelFileNode
 	logSplit LogSplitFunc
 
+	// splitMu serialises split-path inserts and metapage
+	// publication. (M0055-0004-followup-stage2-splitmu-removal:
+	// experimentally removed splitMu from the slow path; the
+	// existing buffer-pool eviction protocol made concurrent
+	// pin/unpin paths surface "unpin underflow" panics under
+	// 32-writer stress. The Stage 2 work needs an additional
+	// reader/writer interaction-safety guarantee in the
+	// buffer pool itself before the structural mutex can be
+	// fully retired. The protocol-level INCOMPLETE_SPLIT
+	// lifecycle from `(*BTree).finishSplit` runs unchanged;
+	// this commit lands the race-safe createNewRoot half of
+	// Stage 2 — concurrent root-lifts no longer orphan a
+	// separator, even when both writers see the same OLD
+	// root.)
 	splitMu sync.Mutex
 
 	// M0055-0001: write-path counters used by the baseline
@@ -967,18 +981,20 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 			if op.Next == 0 {
 				bt.rightmostLeafBlk.Store(uint64(cur))
 			}
-			incomplete := op.HasIncompleteSplit()
+			// (M0055-0004-followup-stage2-splitmu-removal:
+			// eager finishSplit on descend was attempted but
+			// races with the fast-path concurrent descend
+			// produced unpin-underflow under -race stress.
+			// The flag remains observable; crash-replay
+			// completion is handled by an explicit
+			// `CompleteDeferredSplits` maintenance pass —
+			// implemented analogous to
+			// `CompleteDeferredDeletions` — rather than
+			// inline-on-descend. In steady-state operation
+			// the flag is set + cleared by the SAME slow-path
+			// goroutine while splitMu is held, so descenders
+			// never observe it.)
 			bt.unpinR(slot)
-			// M0055-0004-followup-finish-split: if the leaf
-			// retains a stale incomplete-split marker (crash
-			// replay scenario), complete the parent-downlink
-			// insert before treating the leaf as live. The
-			// completion is idempotent.
-			if incomplete {
-				if err := bt.finishSplit(cur); err != nil {
-					return 0, nil, err
-				}
-			}
 			return cur, path, nil
 		}
 
@@ -1013,7 +1029,12 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	}
 
 	// Split path: serialise structure changes (split propagation,
-	// root lift, metapage rewrite), then retry from a fresh descent.
+	// root lift, metapage rewrite), then retry from a fresh
+	// descent. (M0055-0004-followup-stage2-splitmu-removal: full
+	// removal needs additional buffer-pool concurrency-safety
+	// work beyond M0055's scope. The race-safe createNewRoot
+	// in this commit handles concurrent root-lifts; the rest
+	// of the structural-update path remains under splitMu.)
 	atomic.AddUint64(&bt.stats.Splits, 1) // M0055-0001 — counts insert calls that take the split-path retry.
 	bt.splitMu.Lock()
 	defer bt.splitMu.Unlock()
@@ -1289,6 +1310,41 @@ func (bt *BTree) clearIncompleteSplit(blk storage.BlockNumber) error {
 	return err
 }
 
+// CompleteDeferredSplits (M0055-0004-followup-stage2-splitmu-
+// removal) scans the tree for any pages still flagged
+// BTIncompleteSplit (Phase 1 — leaf split — committed but the
+// parent-downlink insertion did not). Used by maintenance
+// passes (vacuum, post-recovery startup) to complete in-flight
+// splits that were interrupted by a crash. Steady-state
+// operation never produces such pages (the slow-path sets +
+// clears the flag under splitMu in the same critical
+// section).
+func (bt *BTree) CompleteDeferredSplits() (int, error) {
+	rel := bt.rel
+	nBlocks, err := bt.pool.NBlocks(rel)
+	if err != nil {
+		return 0, err
+	}
+	completed := 0
+	for blk := storage.BlockNumber(1); blk < nBlocks; blk++ {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			continue
+		}
+		op := readOpaque(slot.Page())
+		incomplete := op.HasIncompleteSplit()
+		bt.unpinR(slot)
+		if !incomplete {
+			continue
+		}
+		if err := bt.finishSplit(blk); err != nil {
+			return completed, err
+		}
+		completed++
+	}
+	return completed, nil
+}
+
 // finishSplit (M0055-0004-followup-finish-split) re-runs the
 // parent-downlink insertion for a page that is still flagged
 // BTIncompleteSplit (e.g., after crash-replay where the writer's
@@ -1391,6 +1447,43 @@ func ApplyInsertRecord(page storage.Page, raw []byte) error {
 }
 
 func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey []byte, level uint32) error {
+	// M0055-0004-followup-stage2-splitmu-removal (race-safe
+	// new-root publication): the caller is expected to hold
+	// `splitMu`, but a future Stage-2 design that lifts splitMu
+	// must still serialise root publication. We RE-READ the
+	// meta here so even under a future relaxation, two
+	// concurrent splits that both target the OLD root cannot
+	// both create a new root; the loser falls back to inserting
+	// its separator into the CURRENT root via the regular
+	// path. Today, with splitMu held, the re-read is a defensive
+	// invariant check (and a no-op fast path).
+	meta, err := bt.readMeta()
+	if err != nil {
+		return err
+	}
+	if meta.Root != leftBlk {
+		// Some other writer (under a future lock-free protocol)
+		// already lifted a new root above `leftBlk`. Insert our
+		// separator into the current root through the regular
+		// path.
+		sepItem := item{
+			keyLen: uint16(len(rightKey)),
+			ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
+			key:    append([]byte(nil), rightKey...),
+		}
+		_, parentPath, err := bt.descendToLeaf(rightKey)
+		if err != nil {
+			return err
+		}
+		if len(parentPath) == 0 {
+			// Defensive: meta.Root != leftBlk but parentPath is
+			// empty — meta moved again. Recurse to pick up the
+			// latest state.
+			return bt.createNewRoot(leftBlk, rightBlk, rightKey, level)
+		}
+		return bt.insertIntoBlock(parentPath[0], parentPath[:0], sepItem)
+	}
+
 	rootSlot, rootBlk, err := bt.pool.PinNew(bt.rel)
 	if err != nil {
 		return err
