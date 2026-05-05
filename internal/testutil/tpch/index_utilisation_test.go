@@ -121,31 +121,59 @@ func TestTPCHIndexUtilisationBaseline(t *testing.T) {
 	// Capture per-query EXPLAIN JSON.
 	queries := tpch.Queries()
 	results := make([]qResult, 0, 22)
-	for q := 1; q <= 22; q++ {
-		sql := queries[q]
-		// Q15's query slot starts with `CREATE OR REPLACE VIEW` which
-		// EXPLAIN cannot wrap; skip the EXPLAIN call but still record
-		// it so the report enumerates all 22 slots.
-		lower := strings.ToLower(strings.TrimSpace(sql))
-		if strings.HasPrefix(lower, "create ") || strings.HasPrefix(lower, "drop ") {
-			results = append(results, qResult{num: q, ok: false, err: "non-SELECT slot — EXPLAIN not applicable"})
-			continue
-		}
+	// captureExplain runs EXPLAIN (FORMAT JSON) on a single SELECT
+	// and appends the result under the given label.
+	captureExplain := func(num int, label, sql string) {
 		rows, err := c.Query(ctx, "EXPLAIN (FORMAT JSON) "+sql)
 		if err != nil {
-			results = append(results, qResult{num: q, ok: false, err: truncate(err.Error(), 200)})
-			continue
+			results = append(results, qResult{num: num, label: label, ok: false, err: truncate(err.Error(), 200)})
+			return
 		}
 		if len(rows) == 0 || len(rows[0]) == 0 {
-			results = append(results, qResult{num: q, ok: false, err: "EXPLAIN returned no rows"})
-			continue
+			results = append(results, qResult{num: num, label: label, ok: false, err: "EXPLAIN returned no rows"})
+			return
 		}
 		shape, perr := parseExplainJSON(rows[0][0])
 		if perr != nil {
-			results = append(results, qResult{num: q, ok: false, err: "parse: " + perr.Error()})
+			results = append(results, qResult{num: num, label: label, ok: false, err: "parse: " + perr.Error()})
+			return
+		}
+		results = append(results, qResult{num: num, label: label, ok: true, summary: shape})
+	}
+
+	for q := 1; q <= 22; q++ {
+		sql := queries[q]
+		label := fmt.Sprintf("Q%d", q)
+		// Q15 special case (M0054-0003a): the `Queries()[15]` slot is
+		// the CREATE OR REPLACE VIEW sub-statement of HammerDB's Q15.
+		// EXPLAIN cannot wrap it directly, so we instead:
+		//   1. execute the CREATE VIEW so revenue0 exists,
+		//   2. EXPLAIN the VIEW body as Q15a (the lineitem range scan),
+		//   3. EXPLAIN the main SELECT as Q15b (supplier+revenue0 join),
+		//   4. drop the view as cleanup.
+		// This recovers the index-usage signal that the previous
+		// "non-SELECT slot" skip was hiding.
+		if q == 15 {
+			if _, err := c.Query(ctx, sql); err != nil {
+				results = append(results, qResult{num: 15, label: "Q15a", ok: false, err: "CREATE VIEW failed: " + truncate(err.Error(), 160)})
+				results = append(results, qResult{num: 15, label: "Q15b", ok: false, err: "CREATE VIEW failed (skipped)"})
+				continue
+			}
+			captureExplain(15, "Q15a", tpch.Q15ViewBody())
+			captureExplain(15, "Q15b", tpch.Q15MainSelect())
+			if _, err := c.Query(ctx, "DROP VIEW revenue0"); err != nil {
+				t.Logf("DROP VIEW revenue0: %v (continuing — Q15 cleanup is best-effort)", err)
+			}
 			continue
 		}
-		results = append(results, qResult{num: q, ok: true, summary: shape})
+		// Other CREATE/DROP slots — defensive guard, not currently hit
+		// because no other query starts with CREATE/DROP.
+		lower := strings.ToLower(strings.TrimSpace(sql))
+		if strings.HasPrefix(lower, "create ") || strings.HasPrefix(lower, "drop ") {
+			results = append(results, qResult{num: q, label: label, ok: false, err: "non-SELECT slot — EXPLAIN not applicable"})
+			continue
+		}
+		captureExplain(q, label, sql)
 	}
 
 	// Assertion: every SELECT slot must EXPLAIN. A failure here means
@@ -154,11 +182,13 @@ func TestTPCHIndexUtilisationBaseline(t *testing.T) {
 	// — the report is the artifact downstream M0054-0003 sub-tasks
 	// consume.
 	for _, r := range results {
-		// Q15 is the one explicit non-SELECT slot; failures there are
-		// expected and surfaced as `ok=false, err="non-SELECT slot…"`.
-		if !r.ok && !strings.Contains(r.err, "non-SELECT slot") {
-			t.Errorf("Q%d EXPLAIN failed: %s", r.num, r.err)
+		if r.ok {
+			continue
 		}
+		if strings.Contains(r.err, "non-SELECT slot") {
+			continue
+		}
+		t.Errorf("%s EXPLAIN failed: %s", r.label, r.err)
 	}
 
 	// Render the report.
@@ -169,9 +199,13 @@ func TestTPCHIndexUtilisationBaseline(t *testing.T) {
 	t.Logf("M0054-0002 baseline report: %s", reportPath)
 }
 
-// qResult records the EXPLAIN outcome for one TPC-H query.
+// qResult records the EXPLAIN outcome for one TPC-H query slot.
+// The label is the rendered query identifier (e.g. "Q1", "Q15a",
+// "Q15b") and `num` is the parent query number used as a sort key
+// (Q15a/Q15b both have num=15).
 type qResult struct {
 	num     int
+	label   string
 	ok      bool
 	err     string
 	summary planShape
@@ -283,7 +317,11 @@ func writeExplainBaselineReport(path string, results []qResult) error {
 	fmt.Fprintln(&b, "## Per-query plan shapes")
 	fmt.Fprintln(&b)
 	for _, r := range results {
-		fmt.Fprintf(&b, "### Q%d\n\n", r.num)
+		label := r.label
+		if label == "" {
+			label = fmt.Sprintf("Q%d", r.num)
+		}
+		fmt.Fprintf(&b, "### %s\n\n", label)
 		if !r.ok {
 			fmt.Fprintf(&b, "EXPLAIN unavailable: `%s`\n\n", r.err)
 			continue
@@ -325,7 +363,7 @@ func writeExplainBaselineReport(path string, results []qResult) error {
 		fmt.Fprintln(&b, "| Table | Seq Scan queries | Index Scan queries |")
 		fmt.Fprintln(&b, "|-------|------------------|--------------------|")
 		for _, g := range gaps {
-			fmt.Fprintf(&b, "| %s | %s | %s |\n", g.table, joinInts(g.seqQueries), joinInts(g.idxQueries))
+			fmt.Fprintf(&b, "| %s | %s | %s |\n", g.table, joinLabels(g.seqLabels), joinLabels(g.idxLabels))
 		}
 		fmt.Fprintln(&b)
 	}
@@ -334,22 +372,28 @@ func writeExplainBaselineReport(path string, results []qResult) error {
 
 type tableGap struct {
 	table      string
-	seqQueries []int
-	idxQueries []int
+	seqLabels  []string
+	idxLabels  []string
 }
 
 // computeIndexGaps groups scan entries by table and reports tables
 // where SeqScan happened in some queries even though IndexScan was
-// possible (or did happen) in others.
+// possible (or did happen) in others. Labels are query identifiers
+// like "Q1" / "Q15a" so multi-statement slots (M0054-0003a) surface
+// the correct sub-entry.
 func computeIndexGaps(results []qResult) []tableGap {
 	type entry struct {
-		seq []int
-		idx []int
+		seq []string
+		idx []string
 	}
 	per := map[string]*entry{}
 	for _, r := range results {
 		if !r.ok {
 			continue
+		}
+		label := r.label
+		if label == "" {
+			label = fmt.Sprintf("Q%d", r.num)
 		}
 		for _, s := range r.summary.scans {
 			if s.Table == "" {
@@ -362,9 +406,9 @@ func computeIndexGaps(results []qResult) []tableGap {
 			}
 			switch s.NodeType {
 			case "Seq Scan":
-				e.seq = append(e.seq, r.num)
+				e.seq = append(e.seq, label)
 			case "Index Scan", "Index Only Scan":
-				e.idx = append(e.idx, r.num)
+				e.idx = append(e.idx, label)
 			}
 		}
 	}
@@ -373,19 +417,20 @@ func computeIndexGaps(results []qResult) []tableGap {
 		if len(e.seq) == 0 {
 			continue
 		}
-		out = append(out, tableGap{table: tbl, seqQueries: dedupSorted(e.seq), idxQueries: dedupSorted(e.idx)})
+		out = append(out, tableGap{table: tbl, seqLabels: dedupSortedStrings(e.seq), idxLabels: dedupSortedStrings(e.idx)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].table < out[j].table })
 	return out
 }
 
-func dedupSorted(in []int) []int {
+func dedupSortedStrings(in []string) []string {
 	if len(in) == 0 {
 		return nil
 	}
-	sort.Ints(in)
-	out := []int{in[0]}
-	for _, v := range in[1:] {
+	sorted := append([]string(nil), in...)
+	sort.Strings(sorted)
+	out := []string{sorted[0]}
+	for _, v := range sorted[1:] {
 		if v != out[len(out)-1] {
 			out = append(out, v)
 		}
@@ -393,13 +438,9 @@ func dedupSorted(in []int) []int {
 	return out
 }
 
-func joinInts(in []int) string {
+func joinLabels(in []string) string {
 	if len(in) == 0 {
 		return "—"
 	}
-	parts := make([]string, len(in))
-	for i, v := range in {
-		parts[i] = fmt.Sprintf("Q%d", v)
-	}
-	return strings.Join(parts, ", ")
+	return strings.Join(in, ", ")
 }

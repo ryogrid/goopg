@@ -127,6 +127,41 @@ func Queries() map[int]string {
 	}
 }
 
+// Q15ViewBody returns the SELECT body of HammerDB Q15's first
+// sub-statement (the `CREATE OR REPLACE VIEW revenue0 (...) AS
+// <select>` line). Used by `TestTPCHIndexUtilisationBaseline`
+// (M0054-0003a) so the baseline EXPLAIN audit captures the plan
+// shape the VIEW would compile to — without this helper Q15
+// reports "non-SELECT slot — EXPLAIN not applicable" and hides a
+// real index-usage opportunity (`l_shipdate` range scan that
+// matches `idx_lineitem_shipdate`).
+//
+// The body is the SELECT sub-expression of `Queries()[15]`,
+// byte-for-byte. Keep the two in sync if either is edited.
+func Q15ViewBody() string {
+	return "select l_suppkey, sum(l_extendedprice * (1 - l_discount)) " +
+		"from lineitem " +
+		"where l_shipdate >= to_date('1996-01-01', 'YYYY-MM-DD') " +
+		"and l_shipdate < (to_date('1996-01-01', 'YYYY-MM-DD') + interval '3 month') " +
+		"group by l_suppkey"
+}
+
+// Q15MainSelect returns HammerDB Q15's second sub-statement — the
+// canonical TPC-H Q15 main SELECT that joins `supplier` with the
+// `revenue0` view created by the first sub-statement, filtered by
+// the maximum total_revenue across the view (a scalar subquery).
+//
+// The first sub-statement (CREATE OR REPLACE VIEW) is in
+// `Queries()[15]`. The third (DROP VIEW) has no EXPLAIN-able plan
+// shape and is therefore not exposed as a helper here.
+func Q15MainSelect() string {
+	return "select s_suppkey, s_name, s_address, s_phone, total_revenue " +
+		"from supplier, revenue0 " +
+		"where s_suppkey = supplier_no " +
+		"and total_revenue = (select max(total_revenue) from revenue0) " +
+		"order by s_suppkey"
+}
+
 func tableDefs() []TableDef {
 	return []TableDef{
 		{

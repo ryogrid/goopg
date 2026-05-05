@@ -112,9 +112,22 @@ Root node: `Projection`
 | 1 | Seq Scan | lineitem | — |
 | 2 | Seq Scan | part | — |
 
-### Q15
+### Q15a
 
-EXPLAIN unavailable: `non-SELECT slot — EXPLAIN not applicable`
+Root node: `Projection`
+
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Index Scan | lineitem | idx_lineitem_shipdate |
+
+### Q15b
+
+Root node: `Projection`
+
+| # | Node Type | Table | Index |
+|---|-----------|-------|-------|
+| 1 | Seq Scan | supplier | — |
+| 2 | Index Scan | lineitem | idx_lineitem_shipdate |
 
 ### Q16
 
@@ -182,10 +195,10 @@ for an M0054-0003 sub-task investigation.
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
 | customer | Q13, Q22 | — |
-| lineitem | Q12, Q14, Q17, Q19 | Q1, Q6 |
-| nation | Q9, Q20 | — |
+| lineitem | Q12, Q14, Q17, Q19 | Q1, Q15a, Q15b, Q6 |
+| nation | Q20, Q9 | — |
 | orders | Q12, Q13 | Q4 |
-| part | Q8, Q9, Q14, Q16, Q17, Q19 | — |
+| part | Q14, Q16, Q17, Q19, Q8, Q9 | — |
 | partsupp | Q16 | — |
-| supplier | Q9, Q20 | — |
+| supplier | Q15b, Q20, Q9 | — |
 

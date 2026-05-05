@@ -2089,6 +2089,60 @@ rationale here.
       with a one-line problem statement each. Acceptance: the gap is
       closed in code AND visible in the EXPLAIN diff.
 
+  - [x] M0054-0003a: Close the Q15 baseline blind-spot.
+        (landed 2026-05-05: added `Q15ViewBody()` and
+        `Q15MainSelect()` helpers in
+        `internal/testutil/tpch/tpch.go` and special-cased the Q15
+        slot in `TestTPCHIndexUtilisationBaseline`. The test now
+        executes the CREATE VIEW, EXPLAINs the VIEW body and the
+        main SELECT separately as Q15a / Q15b, then runs DROP VIEW
+        as cleanup. `qResult` / `tableGap` switched from numeric
+        query IDs to label strings so the Aggregate gaps section
+        reports `Q15a` / `Q15b` distinctly. Findings on the
+        regenerated `analysis/tpch-explain-baseline.md`:
+        - Q15a (VIEW inner SELECT): `Index Scan using
+          idx_lineitem_shipdate on lineitem` — the
+          `l_shipdate` range probe is being picked, same shape as
+          Q1 / Q6.
+        - Q15b (main SELECT): `Seq Scan on supplier` +
+          `Index Scan using idx_lineitem_shipdate on lineitem`
+          (the latter via the inlined VIEW body inside the scalar
+          subquery).
+        - Aggregate gaps now show Q15b on the `supplier` SeqScan
+          row (S_SUPPKEY PK probe is currently a SeqScan — a real
+          M0054-0003 candidate) and Q15a / Q15b on the `lineitem`
+          IndexScan side. The previous "Q15 = EXPLAIN unavailable"
+          line is gone. `go test ./...` PASS.)
+        `tpch.Queries()[15]` only stores the first of HammerDB Q15's
+        three statements (CREATE OR REPLACE VIEW revenue0 / main
+        SELECT / DROP VIEW); the M0054-0002 baseline reports it as
+        "non-SELECT slot — EXPLAIN not applicable" and skips it
+        entirely. Index usage opportunities here are real, not
+        absent: the VIEW body's WHERE is a `l_shipdate` range scan
+        (a candidate for `idx_lineitem_shipdate`, same shape as
+        Q1/Q6) and the main SELECT does a `s_suppkey` PK probe plus
+        a scalar subquery over the view.
+        Implementation:
+        1. Add `Q15ViewBody() string` and `Q15MainSelect() string`
+           helpers to `internal/testutil/tpch/tpch.go` (the SELECT
+           body extracted from the VIEW definition, and the
+           canonical main SELECT statement respectively). DROP VIEW
+           is not added because it has no EXPLAIN-able shape.
+        2. Extend `TestTPCHIndexUtilisationBaseline` in
+           `internal/testutil/tpch/index_utilisation_test.go`: at
+           the Q15 slot, run the VIEW definition first, then capture
+           `EXPLAIN (FORMAT JSON)` for `Q15ViewBody()` and
+           `Q15MainSelect()` separately, render them in the report
+           as Q15a (VIEW inner SELECT) and Q15b (main SELECT), and
+           run DROP VIEW only as cleanup.
+        3. Regenerate `analysis/tpch-explain-baseline.md` so the
+           Q15a / Q15b plan shapes flow into the Aggregate gaps
+           section correctly.
+        Acceptance: the report's Q15 section now contains plan-shape
+        tables for Q15a and Q15b instead of the "non-SELECT slot"
+        message, and the Aggregate gaps `lineitem` row's SeqScan /
+        IndexScan tally is updated to include Q15a.
+
 - [ ] M0054-0004: pprof-driven bottleneck profiling under the
       HammerDB power test. Promote `pprof-all.sh` (currently
       untracked) to a tracked file; wire
