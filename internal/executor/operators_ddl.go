@@ -545,6 +545,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	}
 	seen := map[string]struct{}{}
 	var entries []btree.BulkEntry
+	var scanRow Row // M0054-0005c: reusable decode buffer (see comment below).
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -568,10 +569,21 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
-			row, err := DecodeRow(tbl.Columns, tuple.Data)
-			if err != nil {
+			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to
+			// avoid the per-row `make(Row, len(tbl.Columns))` that
+			// the M0054-0004 idx-window pprof showed at 39 % cum.
+			// True column projection is not feasible here because
+			// the on-disk row encoding is variable-length, so each
+			// column must be decoded sequentially to determine the
+			// next one's offset; the win is the slice-allocation
+			// removal, not the per-column work.
+			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
+				scanRow = make(Row, len(tbl.Columns))
+			}
+			if err := DecodeRowInto(scanRow, tbl.Columns, tuple.Data); err != nil {
 				continue
 			}
+			row := scanRow
 			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
@@ -599,6 +611,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	seen := map[string]struct{}{}
+	var scanRow Row // M0054-0005c: reusable decode buffer.
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -625,10 +638,14 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
 				continue
 			}
-			row, err := DecodeRow(tbl.Columns, tuple.Data)
-			if err != nil {
+			// M0054-0005c: reuse the decode buffer.
+			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
+				scanRow = make(Row, len(tbl.Columns))
+			}
+			if err := DecodeRowInto(scanRow, tbl.Columns, tuple.Data); err != nil {
 				continue
 			}
+			row := scanRow
 			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)

@@ -2379,7 +2379,35 @@ rationale here.
         flat heap **≤ 200 MB** (down from 1.65 GB). Updated
         profiles linked from survey §4 item #2.
 
-  - [ ] M0054-0005c: Index-build column projection.
+  - [x] M0054-0005c: Index-build decode buffer reuse.
+        Scope-reduced from "column projection" to "decode-buffer
+        reuse". True column-projection skip is not feasible because
+        goopg's row codec is variable-length: every column must be
+        decoded sequentially to determine the next one's offset.
+        The win that the M0054-0004 idx-window pprof actually
+        flagged (`DecodeRow` 39 % cum) was the per-row
+        `make(Row, len(Columns))` allocation, which IS removable
+        without column projection.
+        (landed 2026-05-05:
+        `internal/executor/operators_ddl.go::collectBTreeEntries`
+        and `backfillBTree` both grew a `var scanRow Row` local
+        decode buffer, reused across every visible tuple. The
+        pre-fix code allocated a fresh `Row` slice per heap row
+        via `DecodeRow(...)`; the post-fix code calls
+        `DecodeRowInto(scanRow, ...)` against the reused buffer.
+        The encoded `BulkEntry.Key` is still a fresh copy because
+        the bulk loader keeps it; the row-buffer reuse only
+        eliminates the intermediate `Row` allocation between
+        decode and key-encoding.
+        Tests: targeted go test across internal/executor, planner,
+        testutil/tpch, wal, initdb, storage, server,
+        access/btree PASS.
+        Pooling part of the original design (sync.Pool capacity
+        buckets across retention sites) is split out as
+        M0054-0005c-followup; without the Borrow contract from
+        0005b-followup it cannot deliver its full effect.)
+
+  - [ ] M0054-0005c-followup: Capacity-bucket sync.Pool for retained Rows.
         **Evidence:** `idx` window CPU profile shows
         `executor.DecodeRow` 39 % cum, `DecodeRowInto` 34 % cum,
         `decodeValue` 31 % cum during bulk-build. Only the index
