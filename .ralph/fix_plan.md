@@ -2860,6 +2860,20 @@ rationale here.
       `analysis/tpch-hammerdb-run-012.md` written and committed.
       Milestone close pending **M0054-0007-followup-resume** below.
 
+  - [ ] M0054-0007-checkpoint-before-run: **PROCESS REQUIREMENT.**
+        After every schema build + ANALYZE and before launching
+        a power test, issue a `CHECKPOINT` to flush dirty pages
+        and ensure the I/O profile is clean at the start of the
+        benchmark. Without a CHECKPOINT, the first few queries
+        may be slowed by WAL-dirty pages being flushed
+        concurrently. Use:
+        ```
+        ./tmp/goopg-bench-bin checkpoint -D bench/tpch/runtime_goopg/data
+        ```
+        This requirement applies to all future M0054-0007 resume
+        runs and any other power tests that immediately follow a
+        schema build.
+
   - [ ] M0054-0007-followup-resume: **PARTIAL — DEFERRED.**
         run-013 executed 2026-05-05/06 with NLI re-enabled by
         default. Result: 3/22 queries completed cleanly (Q14
@@ -3270,6 +3284,89 @@ Required design doc:
 - [ ] M0056-0004: Phase D — end-to-end validation. Re-runs the
       full M0055 stress suite under `-race` after splitMu
       removal lands.
+
+## Milestone 0057 — TPC-H Measurement Prerequisites
+
+See `docs/milestones/0057-tpch-measurement-prerequisites.md`.
+
+⚠ **NO-DEFERRAL POLICY:** Do NOT close any sub-task silently. If blocked,
+mark it `BLOCKED: <reason>` and open a named follow-up. A coding agent
+reading this file must be able to identify unfinished work without
+reading commit messages.
+
+- [ ] M0057-0001: Background-worker activity logging.
+      **Goal:** Add INFO-level log lines in bgwriter, WAL writer,
+      checkpointer, and autovacuum so benchmark runs show daemon
+      activity.
+      **Design:** `docs/design/0057-0001-background-worker-logging.md`.
+      **Files:** `internal/storage/bgwriter.go`,
+        `internal/wal/writer.go`, `internal/wal/checkpointer.go`,
+        `internal/autovacuum/launcher.go`,
+        `internal/config/defaults.go` (GUC: log_bgwriter_activity,
+        log_walwriter_activity).
+      **Acceptance:** analysis report
+        `analysis/0057-background-worker-activity.md` committed with
+        annotated log excerpt showing which daemons fired during a Q14
+        single-run.
+      **DO NOT DEFER** — if a daemon is silent when it should be active,
+      open a named bug sub-task before closing this.
+
+- [ ] M0057-0002: Checkpoint suppression during power test.
+      **Goal:** Prevent checkpointer from firing mid-benchmark.
+      **Design:** `docs/design/0057-0002-checkpoint-config-for-benchmarks.md`.
+      **Files:** `bench/tpch/setup_goopg.sh` (write GUC lines to
+        postgresql.conf: checkpoint_timeout = 24h, max_wal_size = 1024GB).
+      **Acceptance:** Power-test server log contains NO
+        `"checkpoint start"` between the pre-test CHECKPOINT and end
+        of run. Confirmed via M0057-0001's logging.
+      **DO NOT DEFER.**
+
+- [ ] M0057-0003: HammerDB build-script CHECKPOINT audit.
+      **Goal:** Determine whether the `buildschema` Tcl script issues
+      `CHECKPOINT` explicitly.
+      **Design:** inline in analysis report.
+      **Files (output):** `analysis/hammerdb-checkpoint-audit.md`.
+      **Acceptance:** Audit report committed. If CHECKPOINT is NOT
+        issued, confirm WAL replay correctness or open
+        `M0057-0003-wal-replay-gap`. No silent close.
+      **DO NOT DEFER.**
+
+- [ ] M0057-0004: tpch-runner per-query cancellation.
+      **Goal:** Implement PostgreSQL CancelRequest so a hung query can
+      be interrupted without restarting the server.
+      **Design:** `docs/design/0057-0003-tpch-runner-cancellation.md`.
+      **Files:** `internal/server/server.go` (BackendKeyData, cancel
+        registry, CancelRequest handler), `internal/protocol/`,
+        `cmd/tpch-runner/main.go` (`--cancel-after` flag).
+      **Acceptance:**
+        - `tpch-runner --queries=9 --cancel-after=5s` returns
+          57014 within ~5s; server CPU drops immediately.
+        - `go test ./internal/server/ -run TestCancelRequest` PASS.
+      **DO NOT DEFER.** If server-side cancel is missing, this is a
+      protocol conformance gap.
+
+- [ ] M0057-0005: Crash recovery (kill -KILL) verification.
+      **Goal:** Confirm SIGKILL does not prevent clean restart.
+      Crash recovery is a minimum RDBMS requirement.
+      **Design:** `docs/design/0057-0004-crash-recovery-verification.md`.
+      **Files (output):** `internal/testutil/cluster/kill_recovery_test.go`
+        (new), `internal/wal/replay.go` (fix if needed).
+      **Acceptance:**
+        - `go test ./internal/testutil/cluster/ -run TestKillKillRecovery
+          -count=1 -timeout 120s` PASS.
+        - Manual test on SF=1 documented in
+          `analysis/0057-crash-recovery-test.md`.
+      **DO NOT DEFER under any circumstances.** If recovery fails,
+      fix the WAL redo path before marking this done.
+
+- [ ] M0057-0006: cmd/tpch-runner README.md.
+      **Goal:** Written, user-facing README so the project owner can
+      manually operate the bench tooling.
+      **File:** `cmd/tpch-runner/README.md` (written 2026-05-06).
+      **Acceptance:** README covers prerequisites, HammerDB build
+        workflow, single-query run, cancel, full 22-query stream, and
+        flags reference. Project owner can follow it cold.
+      **Status:** LANDED 2026-05-06.
 
 ## Notes
 
