@@ -1,10 +1,3 @@
-# goopg Fix Plan
-
-The roadmap below is derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md`. The
-"Definition of Done (Initial Milestone)" in §10 of the spec is the target;
-items here decompose that target into agent-sized chunks. Pick the topmost
-unchecked item unless a dependency forces a different order.
-
 ## Milestone 0020 — Window functions
 
 See `docs/milestones/0020-window-functions-over-row-number-rank-lag-lead.md`.

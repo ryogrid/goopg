@@ -1,3 +1,12 @@
+# goopg Fix Plan
+
+The roadmap below is derived from `.ralph/specs/GOAL_AND_REQUIREMENTS.md`. The
+"Definition of Done (Initial Milestone)" in §10 of the spec is the target;
+items here decompose that target into agent-sized chunks. Pick the topmost
+unchecked item unless a dependency forces a different order.
+
+NOTE: past milestones are stored in `completed_milestones/` and should NOT be copied. If you need to reference a past milestone, you can see these files for the historical record, but they are not part of the active fix plan. Only items in this file are actionable.
+
 ## Milestone 0054 — TPC-H Performance & Optimisation Follow-Through
 
 See `docs/milestones/0054-tpch-performance-and-optimisation.md`.
