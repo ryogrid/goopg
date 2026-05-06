@@ -54,6 +54,17 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// M0061-0001: Semi / Anti join must run through the lazy hash
+	// path; the materialising NL / Merge paths don't implement
+	// "emit probe row at most once" semantics. The planner only
+	// emits Semi/Anti with Algo=JoinAlgoHash, but defend against
+	// future changes that might leave Algo unset.
+	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+		if o.plan.Algo != planner.JoinAlgoHash {
+			return fmt.Errorf("internal error: semi/anti join requires hash algorithm, got %d", o.plan.Algo)
+		}
+		return o.openLazyHashJoin(ctx)
+	}
 	if o.plan.Algo == planner.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)
 	}
@@ -156,7 +167,16 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	// `keyRow` buffer per side to avoid `concatRows`'s per-row
 	// `make(Row, leftW+rightW)` churn (M0054-0004 cumulative
 	// `concatRows` 56 GB on Q9, 7,980 GB on Q20).
-	if o.plan.BuildLeft {
+	// M0061-0001: Semi / Anti join semantics require the OUTER
+	// (left) side to drive the probe loop and the INNER (right)
+	// side to be hashed. BuildLeft is INNER-only by contract; we
+	// also defend here so a stray flag doesn't silently break the
+	// emit-once-per-probe-row invariant.
+	buildLeft := o.plan.BuildLeft
+	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+		buildLeft = false
+	}
+	if buildLeft {
 		if err := o.left.Open(ctx); err != nil { return err }
 		buildOp, err := drainRowsBounded(o.left, budget)
 		_ = o.left.Close()
@@ -495,6 +515,25 @@ func (o *joinOp) nextLazy() (Row, error) {
 		matches := o.lazyHash[key]
 		if !ok {
 			matches = nil
+		}
+		// M0061-0001: Semi / Anti emit just the probe row at most
+		// once. NULL probe key never matches (`ok == false`):
+		//   - Semi: skip the probe row (no match).
+		//   - Anti: keep the probe row (matches PostgreSQL
+		//     `NOT EXISTS` semantics — equality cannot be true).
+		if o.plan.Type == planner.JoinTypeSemi {
+			if len(matches) == 0 {
+				continue
+			}
+			o.lazyRow = nil
+			return r, nil
+		}
+		if o.plan.Type == planner.JoinTypeAnti {
+			if len(matches) > 0 {
+				continue
+			}
+			o.lazyRow = nil
+			return r, nil
 		}
 		if len(matches) == 0 {
 			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {

@@ -44,6 +44,25 @@ func unnestSubqueriesInPlan(node Node) Node {
 				return newOuter
 			}
 		}
+		// M0061-0001: EXISTS / NOT EXISTS → semi-join / anti-join.
+		// Same shape as the IN loop above; runs after IN-unnesting so
+		// any IN inside an EXISTS subquery has already been pulled up.
+		for {
+			ex := findExistsExprInExpr(n.Predicate)
+			if ex == nil {
+				break
+			}
+			newOuter, err := unnestExistsExpr(ex, node)
+			if err != nil || newOuter == nil {
+				break
+			}
+			node = newOuter
+			if f, ok := newOuter.(*Filter); ok {
+				n = f
+			} else {
+				return newOuter
+			}
+		}
 		// M0040-0004: walk remaining SubqueryExpr/InExpr inner plans
 		// even when those expressions cannot be pulled up to this level
 		// (e.g. Q20's lineitem scalar subquery inside the partsupp IN
@@ -78,6 +97,8 @@ func walkSubqueryPlansInExpr(e Expr) Expr {
 	case *SubqueryExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *InExpr:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *ExistsExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *BinaryOp:
 		x.Left = walkSubqueryPlansInExpr(x.Left)
@@ -1098,4 +1119,275 @@ func findExprInExpr(e Expr, match func(Expr) bool) Expr {
 		}
 	}
 	return nil
+}
+
+// --- M0061-0001: EXISTS / NOT EXISTS → semi-join / anti-join ---
+
+// findExistsExprInExpr walks an expression tree looking for an
+// ExistsExpr that lives at a top-level conjunct position. Like the
+// IN-unnesting pass we reuse the structural walker; the
+// canUnnestExistsExpr gate then checks that the EXISTS conjunct can
+// be safely lifted (correlated equijoin only).
+func findExistsExprInExpr(e Expr) *ExistsExpr {
+	if e == nil {
+		return nil
+	}
+	if ex, ok := e.(*ExistsExpr); ok && ex.Plan != nil {
+		return ex
+	}
+	switch x := e.(type) {
+	case *BinaryOp:
+		if s := findExistsExprInExpr(x.Left); s != nil {
+			return s
+		}
+		return findExistsExprInExpr(x.Right)
+	case *UnaryOp:
+		return findExistsExprInExpr(x.Operand)
+	case *FuncCall:
+		for _, a := range x.Args {
+			if s := findExistsExprInExpr(a); s != nil {
+				return s
+			}
+		}
+	case *CaseExpr:
+		if x.Operand != nil {
+			if s := findExistsExprInExpr(x.Operand); s != nil {
+				return s
+			}
+		}
+		for _, w := range x.Whens {
+			if s := findExistsExprInExpr(w.When); s != nil {
+				return s
+			}
+			if s := findExistsExprInExpr(w.Then); s != nil {
+				return s
+			}
+		}
+		if x.Else != nil {
+			return findExistsExprInExpr(x.Else)
+		}
+	case *ExtractExpr:
+		return findExistsExprInExpr(x.Source)
+	}
+	return nil
+}
+
+// canUnnestExistsExpr accepts only correlated EXISTS subqueries
+// where every OuterColumnRef appears in an equijoin pair.
+//
+// Non-correlated EXISTS already collapses to a single inner-plan
+// execution via M0058-0001's IsNonCorrelated cache; converting it
+// to a join is unnecessary churn and would lose the cache hit when
+// the same EXISTS appears across many queries.
+//
+// EXISTS subqueries with nested IN / EXISTS that themselves can
+// not be unnested are rejected — leaving them as SubPlans is safer
+// than introducing a join with a still-correlated inner plan.
+func canUnnestExistsExpr(ex *ExistsExpr) bool {
+	plan := ex.Plan
+	if plan == nil {
+		return false
+	}
+	if ex.IsNonCorrelated {
+		return false
+	}
+	params := collectUnnestParams(plan)
+	if len(params) == 0 {
+		return false
+	}
+	var hasNestedSub bool
+	walkPlanExprs(plan, func(e Expr) {
+		if in2, ok := e.(*InExpr); ok && in2.Plan != nil {
+			hasNestedSub = true
+		}
+		if ex2, ok := e.(*ExistsExpr); ok && ex2.Plan != nil {
+			hasNestedSub = true
+		}
+		if sq2, ok := e.(*SubqueryExpr); ok && sq2.Plan != nil {
+			hasNestedSub = true
+		}
+	})
+	if hasNestedSub {
+		return false
+	}
+	return true
+}
+
+// unnestExistsExpr rewrites a top-level EXISTS / NOT EXISTS
+// conjunct into a semi-join / anti-join.
+//
+//	Filter(EXISTS(SELECT ... WHERE inner = outer.col)     , outer)
+//	→  Filter(other_preds, JoinTypeSemi(outer, inner_clone))
+//
+//	Filter(NOT EXISTS(SELECT ... WHERE inner = outer.col) , outer)
+//	→  Filter(other_preds, JoinTypeAnti(outer, inner_clone))
+//
+// `NOT EXISTS` arrives from the parser as `UnaryOp("NOT",
+// ExistsExpr{Negated: false})` — we look for the EXISTS at a
+// top-level conjunct position OR wrapped in a single NOT UnaryOp
+// at a top-level conjunct position.
+//
+// The inner plan is cloned with OuterColumnRef → ColumnRef
+// replacement so it is self-contained; remaining inner-plan
+// optimisation runs via the recursive unnestSubqueriesInPlan call
+// below.
+//
+// The join's output schema is the LEFT (outer) schema only —
+// downstream column indices are unchanged from before unnesting.
+func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
+	if !canUnnestExistsExpr(ex) {
+		return nil, nil
+	}
+	params := collectUnnestParams(ex.Plan)
+	if len(params) == 0 {
+		return nil, nil
+	}
+
+	// Find the Filter that contains this ExistsExpr conjunct.
+	filter, conjunct := findFilterContainingExistsExpr(outer, ex)
+	if filter == nil {
+		return nil, nil
+	}
+
+	// The EXISTS may sit at a top-level conjunct directly, or be
+	// wrapped in a `NOT` UnaryOp (the parser's representation of
+	// `NOT EXISTS`). Determine the actual top-level conjunct and
+	// whether the EXISTS is negated.
+	negated := ex.Negated
+	conjuncts := splitAnd(filter.Predicate)
+	topConjunct := Expr(nil)
+	for _, c := range conjuncts {
+		if c == conjunct {
+			topConjunct = c
+			break
+		}
+		if u, ok := c.(*UnaryOp); ok && (u.Op == "NOT" || u.Op == "not") {
+			if u.Operand == conjunct {
+				topConjunct = c
+				negated = !negated
+				break
+			}
+		}
+	}
+	if topConjunct == nil {
+		// EXISTS is buried in a non-conjunct context (e.g. an
+		// OR branch or inside a function call). Cannot lift to
+		// a join without changing semantics.
+		return nil, nil
+	}
+
+	// Replace OuterColumnRefs with ColumnRefs and clone the inner
+	// plan so it no longer carries outer-scope dependencies.
+	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
+	for _, p := range params {
+		replace[p.OuterRef] = p.SubCol
+	}
+	innerPlan, err := clonePlanReplacingOuter(ex.Plan, replace)
+	if err != nil {
+		return nil, err
+	}
+	innerPlan = unnestSubqueriesInPlan(innerPlan)
+
+	outerChild := filter.Child
+	outerWidth := len(outerChild.Output())
+
+	// Build keys. The probe (outer) key uses the outer column ref
+	// at its original index; the build (inner) key uses the inner
+	// ColumnRef adjusted to point into the inner plan's own
+	// schema, NOT a merged schema, because the join's output is
+	// outer-only and the build side reads from a row of inner
+	// width alone (see executor's openLazyHashJoin path for
+	// BuildLeft=false).
+	outerKey := &ColumnRef{
+		pos:   params[0].OuterRef.Pos(),
+		Index: params[0].OuterRef.Index,
+		Name:  params[0].OuterRef.Name,
+		Type:  params[0].OuterRef.Type,
+	}
+	// The executor's evalHashKey is given a padded row of width
+	// (leftWidth + rightWidth). For semi/anti the right key reads
+	// the inner column from the right-side region of that padded
+	// row, so its Index must be `outerWidth + innerColIndex`.
+	innerKey := &ColumnRef{
+		pos:   params[0].SubCol.Pos(),
+		Index: outerWidth + params[0].SubCol.Index,
+		Name:  params[0].SubCol.Name,
+		Type:  params[0].SubCol.Type,
+	}
+
+	// Drop the EXISTS conjunct (or its wrapping NOT) entirely;
+	// the join encodes the equality predicate via (LeftKey,
+	// RightKey) and the negation via Type=Anti.
+	newConjuncts := make([]Expr, 0, len(conjuncts))
+	for _, c := range conjuncts {
+		if c != topConjunct {
+			newConjuncts = append(newConjuncts, c)
+		}
+	}
+	if len(newConjuncts) == 0 {
+		// All conjuncts consumed — keep the Filter wrapping but
+		// with a true-predicate so downstream code that recurses
+		// through Filter still finds the join.
+		filter.Predicate = &BooleanConst{pos: ex.Pos(), Value: true}
+	} else {
+		filter.Predicate = combineAnd(newConjuncts)
+	}
+
+	joinType := JoinTypeSemi
+	if negated {
+		joinType = JoinTypeAnti
+	}
+	join := &Join{
+		pos:      ex.Pos(),
+		Type:     joinType,
+		Algo:     JoinAlgoHash,
+		Left:     outerChild,
+		Right:    innerPlan,
+		LeftKey:  outerKey,
+		RightKey: innerKey,
+		// Schema is the outer side only — semi/anti joins do not
+		// project inner columns.
+		schema: append(Schema(nil), outerChild.Output()...),
+	}
+	filter.Child = join
+	return outer, nil
+}
+
+// findFilterContainingExistsExpr walks the plan tree looking for
+// the Filter whose predicate contains the target ExistsExpr.
+func findFilterContainingExistsExpr(node Node, target *ExistsExpr) (*Filter, Expr) {
+	if node == nil {
+		return nil, nil
+	}
+	if f, ok := node.(*Filter); ok {
+		if c := findExprInExpr(f.Predicate, func(e Expr) bool {
+			return e == target
+		}); c != nil {
+			return f, c
+		}
+	}
+	switch n := node.(type) {
+	case *Join:
+		if f, c := findFilterContainingExistsExpr(n.Left, target); f != nil {
+			return f, c
+		}
+		return findFilterContainingExistsExpr(n.Right, target)
+	case *Filter:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Project:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Aggregate:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Sort:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Limit:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *MultiHashJoin:
+		for _, tbl := range n.Tables {
+			if f, c := findFilterContainingExistsExpr(tbl, target); f != nil {
+				return f, c
+			}
+		}
+	}
+	return nil, nil
 }

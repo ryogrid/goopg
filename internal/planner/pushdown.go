@@ -244,10 +244,26 @@ func walkColumnRefs(e Expr, onIdx func(int), onOuter func()) {
 		onIdx(x.Index)
 	case *OuterColumnRef:
 		onOuter()
-	case *SubqueryExpr, *ExistsExpr, *InExpr:
+	case *SubqueryExpr, *ExistsExpr:
 		// Subqueries can reference outer columns; treat as out
 		// of scope rather than walking into the inner plan.
 		onOuter()
+	case *InExpr:
+		// `col IN (subquery)` is out-of-scope (the subquery may
+		// reference outer columns). `col IN (literal, ...)` is
+		// fine — walk the operand and the literal list. (M0061
+		// fix: previously treated all InExpr as out-of-scope,
+		// which blocked Q19 / Q22 from pushdown because of their
+		// `p_container IN (...)` / `c_phone IN (...)` literal
+		// lists.)
+		if x.Plan != nil {
+			onOuter()
+			return
+		}
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+		for _, item := range x.List {
+			walkColumnRefs(item, onIdx, onOuter)
+		}
 	case *BinaryOp:
 		walkColumnRefs(x.Left, onIdx, onOuter)
 		walkColumnRefs(x.Right, onIdx, onOuter)

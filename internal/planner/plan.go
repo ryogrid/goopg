@@ -362,6 +362,14 @@ const (
 	JoinTypeRight
 	JoinTypeFull
 	JoinTypeCross
+	// JoinTypeSemi emits each left (probe) row exactly once if it
+	// has at least one match on the right (build). Output schema is
+	// the left side only. Produced by EXISTS-unnesting (M0061-0001).
+	JoinTypeSemi
+	// JoinTypeAnti emits each left (probe) row exactly once if it
+	// has NO match on the right (build). Output schema is the left
+	// side only. Produced by NOT-EXISTS-unnesting (M0061-0001).
+	JoinTypeAnti
 )
 
 // JoinAlgo is the physical algorithm the executor uses for a Join.
