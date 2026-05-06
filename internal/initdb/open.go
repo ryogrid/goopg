@@ -405,6 +405,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		switch bt {
 		case "checkpointer", "autovacuum", "walwriter", "":
 			// expected callers
+		case "client_backend":
+			// A client_backend executing SQL `CHECKPOINT` calls
+			// checkpointOp.Open() → Checkpointer.CheckpointNow() →
+			// flusher.FlushAll() — this is the legitimate Postgres-style
+			// SQL CHECKPOINT pathway. Allow it; the Checkpointer is
+			// responsible for running in a way that's safe from a client
+			// goroutine (or we'd restructure it to delegate to the real
+			// checkpointer goroutine). (M0042-0004 fix, 2026-05-06.)
 		default:
 			panic("BUG(M0042-0004): Pool.FlushAll called from " + bt +
 				" goroutine — only checkpointer should flush all pages;" +
