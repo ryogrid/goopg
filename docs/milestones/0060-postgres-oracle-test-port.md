@@ -1,6 +1,6 @@
 # Milestone 0060 — PostgreSQL Oracle Test-Port Foundation
 
-**Status:** planned
+**Status:** completed
 **Depends on:** Milestone 0004 (TAP test port), Milestone 0023 (syntax integration suite)
 **Drives:** Continuous PostgreSQL-oracle compatibility validation through migrated upstream test suites.
 
@@ -73,15 +73,33 @@ including rationale and follow-up milestone references.
 ## Required Design Docs
 
 - `docs/design/0060-0001-postgres-test-porting-strategy.md`
+- `docs/design/0060-0002-postgres-oracle-port-framework.md`
 
 ## Definition of Done
 
-- [ ] Migration strategy by test type is accepted and tracked in design docs.
-- [ ] Upstream migration target code list is documented and maintained.
-- [ ] Explicit defer/excluded tracking file exists and is reviewable.
-- [ ] Client-tool test migration path is implemented (not treated as skip-only).
-- [ ] Initial oracle report can distinguish pass/defer/excluded by suite.
-- [ ] `go test ./...` remains green for in-tree tests.
+- [x] Migration strategy by test type is accepted and tracked in design docs.
+- [x] Upstream migration target code list is documented and maintained.
+- [x] Explicit defer/excluded tracking file exists and is reviewable.
+- [x] Client-tool test migration path is implemented (not treated as skip-only).
+- [x] Initial oracle report can distinguish pass/defer/excluded by suite.
+- [x] `go test ./...` remains green for in-tree tests.
+
+## Landed Artifacts
+
+- `docs/test-port/postgres-oracle-target-inventory.csv`
+- `docs/test-port/postgres-oracle-target-inventory.md`
+- `docs/test-port/postgres-oracle-port-status.csv`
+- `docs/test-port/postgres-oracle-port-status.md`
+- `docs/test-port/upstream-regress-coverage.md`
+- `docs/test-port/upstream-isolation-coverage.md`
+- `docs/test-port/upstream-tap-coverage.md`
+- `analysis/postgres-oracle-compatibility-report.md`
+- `cmd/gen-oracle-inventory/`
+- `cmd/gen-regress-coverage/`
+- `cmd/gen-isolation-coverage/`
+- `cmd/gen-oracle-port-status/`
+- `cmd/gen-oracle-report/`
+- `internal/testport/framework/`
 
 ## Out of Scope
 

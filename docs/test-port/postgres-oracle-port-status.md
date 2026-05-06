@@ -1,33 +1,47 @@
 # PostgreSQL Oracle Test-Port Status
 
-This file tracks migration-target and non-passing visibility for M0060.
+Generated from `docs/test-port/postgres-oracle-port-status.csv`.
 
 Status meanings:
-
 - `port`: migrated and pass-required.
 - `defer`: in scope, not yet pass-required.
-- `excluded`: explicitly out of scope by M0060 exclusion policy.
+- `excluded`: explicitly out of scope by policy.
 
-## In-Scope But Not Yet Pass-Required (`defer`)
+## Suite Summary
 
-| id | upstream_path | suite_type | status | pass_required | rationale | deferred_to |
-|----|---------------|------------|--------|---------------|-----------|-------------|
-| D-001 | `postgres/src/test/regress` | regress | defer | no | Requires dedicated pg_regress-compatible runner and output normalization. | `M0060-0002` |
-| D-002 | `postgres/src/test/isolation` | isolation | defer | no | Requires deterministic multi-session scheduler and expected-schedule comparator. | `M0060-0004` |
-| D-003 | `postgres/src/test/recovery` | tap | defer | no | Recovery TAP scenarios require staged harness expansion and feature enablement. | `M0060-0005` |
-| D-004 | `postgres/src/test/subscription` | tap | defer | no | Subscription/logical replication scenarios need staged porting and capability growth. | `M0060-0005` |
-| D-005 | `postgres/src/bin/*/t` | tap | defer | no | Client-tool TAP suites are migration targets under M0060 and must be reclassified from legacy skip. | `M0060-0003` |
-| D-006 | `postgres/src/test/modules/*` | mixed | defer | no | Requires per-module dependency classification before migration. | `M0060-0005` |
-| D-007 | `postgres/contrib/*/{sql,expected,t}` | mixed | defer | no | Contrib suites require phased migration by dependency class. | `M0060-0005` |
+| suite_type | port | defer | excluded |
+| ---------- | ----:| -----:| --------:|
+| isolation | 0 | 1 | 0 |
+| mixed | 0 | 2 | 0 |
+| modules | 0 | 0 | 1 |
+| regress | 0 | 1 | 0 |
+| tap | 10 | 3 | 1 |
 
-## Explicitly Excluded (`excluded`)
+## Entries
 
 | id | upstream_path | suite_type | status | pass_required | rationale | deferred_to |
 |----|---------------|------------|--------|---------------|-----------|-------------|
-| E-001 | `postgres/src/test/modules/unsafe_tests` | modules | excluded | no | Explicit unsafe test set is outside goopg compatibility target by policy. | `-` |
+| P-001 | `postgres/src/bin/initdb/t/001_initdb.pl` | tap | port | yes | Ported to go test as TestPort_Initdb001 in internal/testport/tap_port_test.go | `-` |
+| P-002 | `postgres/src/bin/pg_ctl/t/001_start_stop.pl` | tap | port | yes | Ported to go test as TestPort_PgCtl001StartStop | `-` |
+| P-003 | `postgres/src/bin/pg_ctl/t/002_status.pl` | tap | port | yes | Ported to go test as TestPort_PgCtl002Status | `-` |
+| P-004 | `postgres/src/bin/pg_ctl/t/003_promote.pl` | tap | port | yes | Adapted and ported as TestPort_PgCtl003PromoteAdapted | `-` |
+| P-005 | `postgres/src/bin/pg_ctl/t/004_logrotate.pl` | tap | port | yes | Adapted and ported as TestPort_PgCtl004LogrotateAdapted | `-` |
+| P-006 | `postgres/src/bin/pgbench/t/001_pgbench_with_server.pl` | tap | port | yes | Ported to go test as TestPort_Pgbench001WithServer | `-` |
+| P-007 | `postgres/src/bin/pgbench/t/002_pgbench_no_server.pl` | tap | port | yes | Ported to go test as TestPort_Pgbench002NoServer | `-` |
+| P-008 | `postgres/src/bin/psql/t/001_basic.pl` | tap | port | yes | Ported to go test as TestPort_Psql001Basic | `-` |
+| P-009 | `postgres/src/bin/psql/t/010_tab_completion.pl` | tap | port | yes | Adapted and ported as TestPort_Psql010TabCompletionAdapted | `-` |
+| P-010 | `postgres/src/bin/psql/t/020_cancel.pl` | tap | port | yes | Adapted and ported as TestPort_Psql020CancelAdapted | `-` |
+| D-001 | `postgres/src/test/regress` | regress | defer | no | Requires dedicated pg_regress-compatible runner and normalization policy while upstream SQL files remain migration targets. | `M0060-0002` |
+| D-002 | `postgres/src/test/isolation` | isolation | defer | no | Requires deterministic multi-session scheduler and expected-schedule comparator integration. | `M0060-0004` |
+| D-003 | `postgres/src/test/recovery` | tap | defer | no | Recovery TAP scenarios require replication/failover capability growth before pass-required promotion. | `M0060-0005` |
+| D-004 | `postgres/src/test/subscription` | tap | defer | no | Subscription TAP scenarios require logical replication capability growth before pass-required promotion. | `M0060-0005` |
+| D-005 | `postgres/src/bin/scripts/t` | tap | defer | no | Client utility script suites are in scope and tracked but require broader SQL/catalog parity before pass-required promotion. | `M0060-0003` |
+| D-006 | `postgres/src/test/modules` | mixed | defer | no | Modules migration is staged by dependency class and extension assumptions. | `M0060-0005` |
+| D-007 | `postgres/contrib` | mixed | defer | no | Contrib migration is staged by dependency class and extension/runtime assumptions. | `M0060-0005` |
+| E-001 | `postgres/src/test/modules/unsafe_tests` | modules | excluded | no | Explicit unsafe suite is outside compatibility scope by policy. | `-` |
+| E-002 | `postgres/src/bin/pg_dump/t` | tap | excluded | no | Client binary behavior depends on utility surfaces intentionally outside current server-focused scope. | `-` |
 
 ## Notes
 
-- Do not keep non-passing migration targets undocumented.
-- Each `defer` row must map to a concrete milestone task.
-- Add rows at finer granularity as migration proceeds (directory -> file -> case).
+- Every non-passing target must be present here as `defer` or `excluded`.
+- `defer` entries must reference a follow-up milestone task.

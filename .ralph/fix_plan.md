@@ -1604,63 +1604,135 @@ Design: `docs/design/0059-0001-borrowrow-volcano-row-lifetime-optimization.md`.
 
 See `docs/milestones/0060-postgres-oracle-test-port.md`.
 Design: `docs/design/0060-0001-postgres-test-porting-strategy.md`.
-Status list: `docs/test-port/postgres-oracle-port-status.md`.
+Framework design: `docs/design/0060-0002-postgres-oracle-port-framework.md`.
+Status list: `docs/test-port/postgres-oracle-port-status.md`
+(`docs/test-port/postgres-oracle-port-status.csv` source of truth).
 
-- [ ] M0060-0001: Freeze upstream migration inventory.
+- [x] M0060-0001: Freeze upstream migration inventory.
       **Goal:** Create and maintain a canonical migration target list
       covering regress/isolation/recovery/subscription/client-tools/modules/contrib.
       **Acceptance:**
         - Target list is documented in milestone/design docs.
         - `docs/test-port/postgres-oracle-port-status.md` contains initial rows.
 
-- [ ] M0060-0002: pg_regress migration harness foundation.
+  **LANDED 2026-05-07.**
+  Added `cmd/gen-oracle-inventory` and generated:
+  - `docs/test-port/postgres-oracle-target-inventory.csv`
+  - `docs/test-port/postgres-oracle-target-inventory.md`
+  Inventory now captures canonical counts/examples for regress,
+  isolation, recovery, subscription, client-tools TAP, modules,
+  and contrib.
+
+- [x] M0060-0002: pg_regress migration harness foundation.
       **Goal:** Build a Go runner for upstream `src/test/regress`
       SQL+expected style tests with deterministic output normalization.
       **Acceptance:**
         - Harness can execute at least one representative regress subset.
         - Results are reportable as pass/defer/excluded.
 
-- [ ] M0060-0003: TAP migration foundation (including client tools).
+  **LANDED 2026-05-07.**
+  Added framework primitives in `internal/testport/framework/regress.go`:
+  `DiscoverRegressCases`, `RunRegressSubset`,
+  `NormalizeRegressOutput`, and status model (`port`/`defer`/
+  `excluded`). Added generator `cmd/gen-regress-coverage` with
+  output `docs/test-port/upstream-regress-coverage.md`.
+  Added tests in `internal/testport/framework/regress_test.go`
+  proving representative subset execution and status reporting.
+
+- [x] M0060-0003: TAP migration foundation (including client tools).
       **Goal:** Port TAP execution patterns to Go tests and move client-tool
       suites from legacy skip-only posture to migration target posture.
       **Acceptance:**
         - `src/bin/*/t` migration plan is active and tracked.
         - TAP lineage mapping stays auditable.
 
-- [ ] M0060-0004: isolation spec scheduler foundation.
+  **LANDED 2026-05-07.**
+  Expanded `cmd/gen-tap-coverage` scope to include:
+  - `postgres/src/test/recovery/t/*.pl`
+  - `postgres/src/test/subscription/t/*.pl`
+  - `postgres/src/bin/*/t/*.pl`
+  Classification now uses governance-aligned statuses
+  (`port`/`defer`/`excluded`; legacy `skip` removed).
+  Regenerated `docs/test-port/upstream-tap-coverage.md` and
+  preserved auditable TAP lineage to existing Go ports in
+  `internal/testport/tap_port_test.go`.
+
+- [x] M0060-0004: isolation spec scheduler foundation.
       **Goal:** Implement deterministic multi-session scheduler support
       for `src/test/isolation` spec migration.
       **Acceptance:**
         - Scheduler runs representative spec steps across multiple sessions.
         - Output comparison workflow is defined and tested.
 
-- [ ] M0060-0005: recovery/subscription/modules/contrib staged migration.
+  **LANDED 2026-05-07.**
+  Added `internal/testport/framework/isolation.go` with:
+  `DiscoverIsolationSpecs`, `ParseIsolationSpec`, and
+  `RunIsolationPermutation` deterministic scheduler.
+  Added generator `cmd/gen-isolation-coverage` with output
+  `docs/test-port/upstream-isolation-coverage.md`.
+  Added tests in `internal/testport/framework/isolation_test.go`
+  proving multi-session permutation execution order and parsed
+  output flow.
+
+- [x] M0060-0005: recovery/subscription/modules/contrib staged migration.
       **Goal:** Stage migration of `src/test/recovery`, `src/test/subscription`,
       `src/test/modules/*`, and `contrib` suites by dependency class.
       **Acceptance:**
         - Each suite has explicit status entries (`port`/`defer`/`excluded`).
         - No silent non-passing target remains undocumented.
 
-- [ ] M0060-0006: Defer/excluded governance and CI visibility.
+  **LANDED 2026-05-07.**
+  Added explicit staged entries in
+  `docs/test-port/postgres-oracle-port-status.csv` for:
+  - `postgres/src/test/recovery` (`defer`)
+  - `postgres/src/test/subscription` (`defer`)
+  - `postgres/src/test/modules` (`defer` + excluded unsafe subset)
+  - `postgres/contrib` (`defer`)
+  plus regenerated markdown status output. Dependency-class staging
+  rationale is now explicit and auditable.
+
+- [x] M0060-0006: Defer/excluded governance and CI visibility.
       **Goal:** Ensure every non-passing migration target is listed with
       rationale and follow-up reference.
       **Acceptance:**
         - `docs/test-port/postgres-oracle-port-status.md` is CI-auditable.
         - Unexpected failures are distinguishable from known defers.
 
-- [ ] M0060-0007: Oracle compatibility reporting.
+  **LANDED 2026-05-07.**
+  Introduced machine-readable governance source:
+  `docs/test-port/postgres-oracle-port-status.csv`.
+  Added validator + renderer in `internal/testport/framework/status.go`
+  and generator `cmd/gen-oracle-port-status`.
+  Added validation tests in
+  `internal/testport/framework/status_test.go`.
+  CI now validates status schema and uniqueness rules via `go test`.
+
+- [x] M0060-0007: Oracle compatibility reporting.
       **Goal:** Produce suite-level report summarizing pass/defer/excluded
       progress across migrated upstream test families.
       **Acceptance:**
         - Report includes per-suite counts and notable blockers.
         - Report can be regenerated from repository state.
 
-- [ ] M0060-0008: Initial milestone gate.
+  **LANDED 2026-05-07.**
+  Added `cmd/gen-oracle-report` and generated
+  `analysis/postgres-oracle-compatibility-report.md` with:
+  inventory snapshot, suite-level status totals, and deferred
+  blocker table. Report is reproducible from repository state.
+
+- [x] M0060-0008: Initial milestone gate.
       **Goal:** Land first validated slice across all core test families
       (regress, TAP, isolation) while keeping tree stable.
       **Acceptance:**
         - Representative migrated tests pass in CI.
         - `go test ./...` PASS.
+
+  **LANDED 2026-05-07.**
+  Representative foundations validated:
+  - TAP representative ports: `go test ./internal/testport/...` PASS.
+  - Regress harness foundation: `go test ./internal/testport/framework -run TestRunRegressSubsetReportsStatuses` PASS.
+  - Isolation scheduler foundation: `go test ./internal/testport/framework -run TestParseAndRunIsolationPermutation` PASS.
+  Full gate: `go test ./... -count=1` PASS.
 
 ## Notes
 
