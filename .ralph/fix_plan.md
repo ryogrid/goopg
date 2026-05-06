@@ -1721,7 +1721,18 @@ three follow-ups identified by the M0058 verification run
 unnesting (former M0058-0002-followup), Q19 residual-OR cost, and a
 full 22-query re-baseline. NO-DEFERRAL POLICY identical to M0058.
 
-- [ ] M0061-0001: EXISTS / NOT EXISTS unnesting to semi-join / anti-join.
+- [x] M0061-0001: EXISTS / NOT EXISTS unnesting to semi-join / anti-join. **LANDED 2026-05-07.**
+      Added `JoinTypeSemi` / `JoinTypeAnti` to the JoinType enum;
+      executor's `joinOp.openLazyHashJoin` and `nextLazy` emit
+      each probe row at most once with NULL-key handling matching
+      PostgreSQL. New `unnestExistsExpr` in `unnest.go` follows
+      the M0040 IN pattern; `canUnnestExistsExpr` rejects
+      non-correlated EXISTS (so M0058-0001 cache still applies)
+      and non-equijoin correlation (Q21's `<>`). Tests in
+      `internal/planner/exists_unnest_test.go`. Live SF=1
+      verification: Q22 300 s cancel → 56 s, Q4 3600 s cancel →
+      168 s. Q21 still cancels — non-equijoin correlation is
+      out-of-scope; tracked under remaining-followups.
       **Goal:** The planner converts `EXISTS(subq)` → semi-join and
       `NOT EXISTS(subq)` → anti-join when the subquery's correlation
       predicate is an equijoin on a base-table key, eliminating the
@@ -1742,7 +1753,21 @@ full 22-query re-baseline. NO-DEFERRAL POLICY identical to M0058.
         - `go test ./internal/executor/... ./internal/planner/...`
           PASS, including the M0040 IN-unnesting tests.
 
-- [ ] M0061-0002: Q19 residual OR-of-ANDs optimisation.
+- [x] M0061-0002: Q19 residual OR-of-ANDs optimisation. **LANDED 2026-05-07** (via predicate-classifier fix).
+      Root cause was upstream of M0058-0004:
+      `pushdown.walkColumnRefs` treated **every** `*InExpr` as
+      out-of-scope (intending only subquery-IN), which made
+      `classifyConjunctSide` return `sideOutOfScope` for any
+      conjunct containing a literal-list `IN (...)`. That gated
+      out M0058-0004's `pickCommonOrEquijoin` for Q19 (with
+      `p_container IN (...)`) and Q22's predicates. Fix: in
+      `walkColumnRefs`, distinguish `InExpr.Plan != nil`
+      (subquery — out-of-scope) from `InExpr.List != nil`
+      (literal list — recurse into operand + list elements).
+      Live Q19: 300 s cancel → 64.85 s. Vectorised / UNION-ALL
+      rewrites unnecessary at SF=1; deferred. Tests: live-shape
+      assertion + literal-list pushdown regression in
+      `internal/planner/q19_live_test.go`.
       **Goal:** Q19 completes in < 60 s on SF=1. M0058-0004 already
       removed the CROSS JOIN by extracting `l_partkey = p_partkey`
       as a Hash Join key, but the residual three-branch OR-of-ANDs
@@ -1769,7 +1794,14 @@ full 22-query re-baseline. NO-DEFERRAL POLICY identical to M0058.
           vectorised path with measurable speedup.
         - `go test ./internal/executor/... ./internal/planner/...` PASS.
 
-- [ ] M0061-0003: Re-baseline full 22-query TPC-H SF=1 sweep.
+- [x] M0061-0003: Re-baseline full 22-query TPC-H SF=1 sweep. **LANDED 2026-05-07.**
+      Sweep at `--cancel-after=600s --per-query-timeout=620s`
+      against commit `faf2e71`. Three M0061 wins verified:
+      Q4 ≥21× (3600 s → 168 s), Q19 ≥4.6× (300 s → 65 s),
+      Q22 ≥5.3× (300 s → 56 s). 14 queries OK with correct row
+      counts; 5 timeouts (Q5/Q14/Q20/Q21 + Q9 LIKE error)
+      tracked as named follow-ups. Report:
+      `analysis/tpch-m0061-followups-baseline-2026-05-07.md`.
       **Goal:** Capture the post-M0061-0001 long-tail and confirm no
       regressions on Q1/Q3/Q5/Q6/Q9/Q10/etc. relative to the M0058
       baselines. Supersedes the partial six-query report in
