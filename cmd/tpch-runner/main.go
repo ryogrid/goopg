@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"flag"
 	"fmt"
 	"os"
@@ -115,6 +116,13 @@ func runQ15WithCancel(db *sql.DB, budget, cancelAfter time.Duration, signalFile 
 // ~751). When the context is cancelled, lib/pq sends the cancel
 // packet; the backend returns SQLSTATE 57014; the connection is not
 // closed.
+//
+// Connection isolation: every query acquires a *fresh* `*sql.Conn`
+// via db.Conn(ctx) and Close()s it on exit. Combined with
+// MaxOpenConns=1, this guarantees a pristine TCP/protocol state
+// across queries; one query's error (e.g. SQLSTATE 42883 from Q9's
+// LIKE) cannot leave the next query staring at a stale row stream
+// (a multi-query M0061-0003 sweep observation).
 func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.Duration, signalFile string, doExplain bool) {
 	stmt := body
 	if doExplain {
@@ -160,8 +168,29 @@ func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.
 		}()
 	}
 
+	// Acquire a dedicated connection for this query and force
+	// it to be DISCARDED on return (not pooled). conn.Raw with
+	// driver.ErrBadConn marks the underlying connection bad so
+	// the subsequent Close() drops it from the pool. The next
+	// query then opens a fresh TCP+startup. This isolation
+	// prevents a broken-pipe / dangling-row-stream from one
+	// query's error path bleeding into the next (a multi-query
+	// M0061-0003 sweep observation).
+	connCtx, connCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	conn, connErr := db.Conn(connCtx)
+	connCancel()
+	if connErr != nil {
+		fmt.Printf("%s: ERROR — db.Conn: %v\n", label, connErr)
+		return
+	}
+	defer func() {
+		// Mark the conn bad so it isn't pooled, then close it.
+		_ = conn.Raw(func(driverConn interface{}) error { return driver.ErrBadConn })
+		conn.Close()
+	}()
+
 	t0 := time.Now()
-	rows, err := db.QueryContext(queryCtx, stmt)
+	rows, err := conn.QueryContext(queryCtx, stmt)
 	if err != nil {
 		fmt.Printf("%s: ERROR after %.2fs — %v\n", label, time.Since(t0).Seconds(), err)
 		return
