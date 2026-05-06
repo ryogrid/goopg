@@ -870,15 +870,22 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeB
 		return nil, rangeBinding{}, err
 	}
 	innerSchema := inner.Output()
+	// Use explicit column-alias list when provided: (SELECT …) AS t (c1, c2).
+	// This overrides the target-list aliases from the inner SELECT.
 	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
 	schema := make(Schema, 0, len(rv.Subquery.Targets))
 	for i, tgt := range rv.Subquery.Targets {
-		name := tgt.Alias
-		if name == "" {
-			name = deriveSubqueryTargetName(tgt.Expr)
-		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+		var name string
+		if i < len(rv.Columns) && rv.Columns[i] != "" {
+			name = rv.Columns[i] // explicit column alias from (SELECT …) AS t (col_alias)
+		} else {
+			name = tgt.Alias
+			if name == "" {
+				name = deriveSubqueryTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", i+1)
+			}
 		}
 		var typ catalog.Type
 		if i < len(innerSchema) {
