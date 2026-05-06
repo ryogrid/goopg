@@ -1600,6 +1600,68 @@ Design: `docs/design/0059-0001-borrowrow-volcano-row-lifetime-optimization.md`.
         - Relevant executor/planner parity tests pass.
         - `go test ./...` PASS.
 
+## Milestone 0060 — PostgreSQL Oracle Test-Port Foundation
+
+See `docs/milestones/0060-postgres-oracle-test-port.md`.
+Design: `docs/design/0060-0001-postgres-test-porting-strategy.md`.
+Status list: `docs/test-port/postgres-oracle-port-status.md`.
+
+- [ ] M0060-0001: Freeze upstream migration inventory.
+      **Goal:** Create and maintain a canonical migration target list
+      covering regress/isolation/recovery/subscription/client-tools/modules/contrib.
+      **Acceptance:**
+        - Target list is documented in milestone/design docs.
+        - `docs/test-port/postgres-oracle-port-status.md` contains initial rows.
+
+- [ ] M0060-0002: pg_regress migration harness foundation.
+      **Goal:** Build a Go runner for upstream `src/test/regress`
+      SQL+expected style tests with deterministic output normalization.
+      **Acceptance:**
+        - Harness can execute at least one representative regress subset.
+        - Results are reportable as pass/defer/excluded.
+
+- [ ] M0060-0003: TAP migration foundation (including client tools).
+      **Goal:** Port TAP execution patterns to Go tests and move client-tool
+      suites from legacy skip-only posture to migration target posture.
+      **Acceptance:**
+        - `src/bin/*/t` migration plan is active and tracked.
+        - TAP lineage mapping stays auditable.
+
+- [ ] M0060-0004: isolation spec scheduler foundation.
+      **Goal:** Implement deterministic multi-session scheduler support
+      for `src/test/isolation` spec migration.
+      **Acceptance:**
+        - Scheduler runs representative spec steps across multiple sessions.
+        - Output comparison workflow is defined and tested.
+
+- [ ] M0060-0005: recovery/subscription/modules/contrib staged migration.
+      **Goal:** Stage migration of `src/test/recovery`, `src/test/subscription`,
+      `src/test/modules/*`, and `contrib` suites by dependency class.
+      **Acceptance:**
+        - Each suite has explicit status entries (`port`/`defer`/`excluded`).
+        - No silent non-passing target remains undocumented.
+
+- [ ] M0060-0006: Defer/excluded governance and CI visibility.
+      **Goal:** Ensure every non-passing migration target is listed with
+      rationale and follow-up reference.
+      **Acceptance:**
+        - `docs/test-port/postgres-oracle-port-status.md` is CI-auditable.
+        - Unexpected failures are distinguishable from known defers.
+
+- [ ] M0060-0007: Oracle compatibility reporting.
+      **Goal:** Produce suite-level report summarizing pass/defer/excluded
+      progress across migrated upstream test families.
+      **Acceptance:**
+        - Report includes per-suite counts and notable blockers.
+        - Report can be regenerated from repository state.
+
+- [ ] M0060-0008: Initial milestone gate.
+      **Goal:** Land first validated slice across all core test families
+      (regress, TAP, isolation) while keeping tree stable.
+      **Acceptance:**
+        - Representative migrated tests pass in CI.
+        - `go test ./...` PASS.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

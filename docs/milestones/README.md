@@ -94,3 +94,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0057 | TPC-H measurement prerequisites (background-worker logging, checkpoint suppression, tpch-runner cancel, crash recovery) | planned | `0057-tpch-measurement-prerequisites.md` |
 | 0058 | TPC-H SubPlan & join-unnesting performance fixes (non-correlated cache, EXISTS→semi-join, NUMERIC fast path, OR-of-ANDs join, TCP cancel) | planned | `0058-tpch-subplan-join-perf.md` |
 | 0059 | Executor BorrowRow optimization (Volcano row-lifetime copy reduction) | planned | `0059-executor-borrowrow-optimization.md` |
+| 0060 | PostgreSQL oracle test-port foundation (TAP/pg_regress/isolation/recovery/subscription/client-tools) | planned | `0060-postgres-oracle-test-port.md` |
