@@ -1425,6 +1425,112 @@ reading commit messages.
         flags reference. Project owner can follow it cold.
       **Status:** LANDED 2026-05-06.
 
+## Milestone 0058 — TPC-H SubPlan & Join-Unnesting Performance Fixes
+
+Identified during the M0054-0007 emulate run (2026-05-06). Five query
+classes fail to complete within the 1-hour budget due to executor and
+planner gaps. Design doc: `docs/design/0058-0001-subplan-and-join-optimisation.md`.
+
+- [ ] M0058-0001: Non-correlated SubPlan constant-key cache.
+      **Goal:** For subqueries with zero `OuterColumnRef` references the
+      result is constant across all outer rows. The current `SubqueryCache`
+      keys on the full outer row and misses every time, causing repeated
+      full re-evaluation. Use a fixed cache key (e.g. `""`) for such
+      subqueries so only the first evaluation executes.
+      **Root cause:** `SubqueryCache` in `internal/executor/context.go`;
+      key derivation serialises the outer row unconditionally.
+      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §2.
+      **Files:** `internal/executor/context.go`, `internal/executor/expr.go`,
+        `internal/planner/planner.go` (set `IsNonCorrelated` flag),
+        relevant plan-node struct.
+      **Acceptance:**
+        - Q11 completes in < 120 s (was CANCELLED at 3600 s).
+        - Q18 completes without OOM (RSS stays < 4 GB).
+        - `go test ./internal/executor/...` PASS.
+
+- [ ] M0058-0002: EXISTS/NOT EXISTS → semi-join/anti-join unnesting.
+      **Goal:** The planner evaluates `EXISTS`/`NOT EXISTS` correlated
+      subqueries as SubPlans (one Open/Next/Close per outer row).
+      Unnesting to semi-join / anti-join eliminates per-row operator
+      overhead and allows the inner side to be built once into a hash
+      table or use an NLI scan.
+      **Root cause:** M0040 unnesting pass does not handle EXISTS/NOT EXISTS.
+      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §3.
+      **Files:** `internal/planner/planner.go` (unnesting pass),
+        `internal/executor/operators_join_agg.go` (SemiJoinOp / AntiJoinOp).
+      **Acceptance:**
+        - Q4 completes in < 60 s (was CANCELLED at 3600 s).
+        - Q21 completes in < 60 s (was CANCELLED at 2634 s).
+        - EXPLAIN for Q4 shows `Semi Join` or `Hash Join` (not SubPlan).
+        - `go test ./internal/executor/... ./internal/planner/...` PASS.
+
+- [ ] M0058-0003: NUMERIC int64 fast path in parseNumeric().
+      **Goal:** `parseNumeric()` allocates a `*big.Int` per NUMERIC column
+      per row. HammerDB's TPC-H schema declares integer-valued columns
+      (quantities, keys, etc.) as NUMERIC. An int64 fast path for values
+      with `dscale==0` and small `ndigits` eliminates the allocation.
+      **Root cause:** Unconditional `*big.Int` alloc in NUMERIC decode path.
+      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §4.
+      **Files:** NUMERIC decode location (internal/pgproto/ or
+        internal/executor/scan.go).
+      **Acceptance:**
+        - Q17 elapsed ≤ 40 s (baseline 70.4 s; ≥ 43 % reduction).
+        - `go test ./...` PASS.
+
+- [ ] M0058-0004: OR-of-ANDs join-condition extraction (Q19).
+      **Goal:** Q19's WHERE clause contains `(p_partkey=l_partkey AND …) OR
+      (p_partkey=l_partkey AND …) OR …`. The planner does not extract the
+      common equijoin key from within the OR branches, emitting
+      `Nested Loop (CROSS)` with 1.2 T estimated rows. Extract the common
+      factor as the join key; leave the full OR as a residual filter.
+      **Root cause:** Join-condition extractor in `internal/planner/planner.go`
+      does not descend into OR sub-expressions.
+      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §5.
+      **Files:** `internal/planner/planner.go`.
+      **Acceptance:**
+        - Q19 EXPLAIN shows `Hash Join` on l_partkey=p_partkey (not CROSS).
+        - Q19 completes in < 120 s.
+        - `go test ./internal/planner/...` PASS.
+
+- [ ] M0058-0005: TCP disconnect → immediate queryCtx.Cancel().
+      **Goal:** When a client disconnects or sends CancelRequest, goopg
+      detects it only at the next write, leaving the backend goroutine
+      consuming CPU for minutes. Wire EOF / CancelRequest detection to
+      call `queryCtx.Cancel()` immediately so the existing `ctx.Err()`
+      checks in SubPlan / join loops terminate the query within 1 ms.
+      **Root cause:** `internal/server/server.go` client loop; no
+      "watch for disconnect while query runs" goroutine.
+      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §6.
+      **Files:** `internal/server/server.go`.
+      **Acceptance:**
+        - After `touch /tmp/cancel_query` (tpch-runner signal), CPU drops
+          to < 5 % within 5 s measured by `ps -p <pid> -o %cpu`.
+        - No goroutine leak confirmed by `go tool pprof` goroutine profile.
+        - `go test ./internal/server/...` PASS.
+
+- [ ] M0058-0006: WaitEventEnd hooks for I/O paths in open.go.
+      **Goal:** 6 of 14 `WaitEventStart` call sites in
+      `internal/storage/open.go` lack a matching `WaitEventEnd`, causing
+      `pg_stat_activity.wait_event` to always be null during I/O.
+      Add deferred `WaitEventEnd()` calls so the field reflects actual
+      I/O activity.
+      **Root cause:** Missing `defer WaitEventEnd()` after each start.
+      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §7.
+      **Files:** `internal/storage/open.go`.
+      **Acceptance:**
+        - `pg_stat_activity.wait_event` shows non-null values during an
+          intentionally I/O-heavy query (cold buffer pool SeqScan on lineitem).
+        - `go test ./internal/storage/...` PASS.
+
+- [ ] M0058-0007: Verification re-run of Q4, Q11, Q18, Q19 with all fixes.
+      **Goal:** Run tpch-runner on Q4/Q11/Q18/Q19 after M0058-0001..0005
+      are merged and document the new elapsed times and row counts.
+      **Acceptance:**
+        - Q4 OK < 60 s, Q11 OK < 120 s, Q18 OK < 300 s, Q19 OK < 120 s.
+        - Results documented in `analysis/tpch-runner-measurement-report-2026-05-06.md`
+          or a follow-up report.
+        - `go test ./...` PASS.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
