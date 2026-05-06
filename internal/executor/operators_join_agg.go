@@ -91,12 +91,22 @@ func (o *joinOp) Open(ctx *Context) error {
 
 // runNestedLoop is the universal fallback. O(N*M) over the two
 // drained sides; supports INNER / LEFT / RIGHT / FULL / CROSS.
+//
+// Cancellation: ctx.Err() is checked once per outer-row loop so a
+// CancelRequest interrupts a long join even when the inner side has
+// no per-row hooks. (M0058-0005.) Q5 and Q13 ran 60+ minutes without
+// responding to cancellation before this check existed.
 func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
 	nullLeft := nullRow(leftWidth)
 	nullRight := nullRow(rightWidth)
 
 	rightMatched := make([]bool, len(rightRows))
-	for _, l := range leftRows {
+	for i, l := range leftRows {
+		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		matched := false
 		for j, r := range rightRows {
 			joined := concatRows(l, r)
@@ -238,6 +248,13 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 
 	i, j := 0, 0
 	for i < len(leftKeyed) && j < len(rightKeyed) {
+		// M0058-0005: cheap ctx check every 256 left-side rows so a
+		// CancelRequest interrupts a long sort-merge join promptly.
+		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		cmp, err := compareDatum(leftKeyed[i].key, rightKeyed[j].key, o.plan.Pos())
 		if err != nil {
 			return err
@@ -410,6 +427,14 @@ func (o *joinOp) nextLazy() (Row, error) {
 	}
 	nullLeft := o.lazyNullLeft
 	nullRight := o.lazyNullRight
+	// Cancellation: cheap ctx check per Next() call so a long
+	// probe-only join responds promptly to CancelRequest.
+	// (M0058-0005.)
+	if o.ctx != nil && o.ctx.Ctx != nil {
+		if err := o.ctx.Ctx.Err(); err != nil {
+			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	for {
 		// Continue serving matches from current probe row. Apply
 		// the full join Predicate per emitted row — hash matching

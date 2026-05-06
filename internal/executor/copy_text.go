@@ -302,6 +302,12 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		return Datum{Kind: KindTime, Time: ts}, nil
 	case "numeric", "decimal":
 		text := string(raw)
+		// M0058-0003: int64 fast path for integer-valued NUMERIC. The
+		// HammerDB COPY stream is overwhelmingly small integers since
+		// all integer columns are typed NUMERIC.
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, NumericMantissa: v, NumericScale: scale}, nil
+		}
 		// Validate the text is a valid numeric literal before
 		// storing.  This catches column-alignment bugs at COPY
 		// time instead of silently storing wrong-byte data that

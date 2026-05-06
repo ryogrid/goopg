@@ -388,6 +388,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
 		}
 	}
+	pool.OnPinDone = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventEnd(pid)
+		}
+	}
 	// Wire FlushAll goroutine assertion (M0042-0004): Pool.FlushAll and
 	// Pool.FlushAllPaced must only be called from the checkpointer goroutine
 	// or from Pool.Close (unregistered goroutine). Client-backend goroutines
@@ -726,10 +731,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// Wire data-file I/O wait-event hooks so pg_stat_activity records
 	// DataFileRead / DataFileWrite / DataFileExtend / DataFileSync
-	// when backends block on storage operations.
+	// when backends block on storage operations.  Each Wait/Done pair
+	// is balanced (M0058-0006) so wait_event clears once the I/O
+	// completes.
 	mgr.OnReadWait = func() {
 		if reg, pid := activity.LookupGoroutine(); reg != nil {
 			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileRead)
+		}
+	}
+	mgr.OnReadDone = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventEnd(pid)
 		}
 	}
 	mgr.OnWriteWait = func() {
@@ -737,14 +749,29 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
+	mgr.OnWriteDone = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventEnd(pid)
+		}
+	}
 	mgr.OnExtendWait = func() {
 		if reg, pid := activity.LookupGoroutine(); reg != nil {
 			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileExtend)
 		}
 	}
+	mgr.OnExtendDone = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventEnd(pid)
+		}
+	}
 	mgr.OnSyncWait = func() {
 		if reg, pid := activity.LookupGoroutine(); reg != nil {
 			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileSync)
+		}
+	}
+	mgr.OnSyncDone = func() {
+		if reg, pid := activity.LookupGoroutine(); reg != nil {
+			reg.WaitEventEnd(pid)
 		}
 	}
 
@@ -753,6 +780,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		walWriter.OnWALSync = func() {
 			if reg, pid := activity.LookupGoroutine(); reg != nil {
 				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitWALSync)
+			}
+		}
+		walWriter.OnWALSyncDone = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventEnd(pid)
 			}
 		}
 	}

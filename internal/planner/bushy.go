@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"fmt"
 	"math/bits"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -121,15 +122,11 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 		cumOffsets[i+1] = cumOffsets[i] + w
 	}
 
-	for _, c := range conjuncts {
-		bin, ok := c.(*BinaryOp)
-		if !ok || bin.Op != "=" {
-			continue
-		}
+	addEdge := func(bin *BinaryOp) {
 		li := tableForCol(bin.Left, cumOffsets)
 		ri := tableForCol(bin.Right, cumOffsets)
 		if li < 0 || ri < 0 || li == ri {
-			continue
+			return
 		}
 		g.edges = append(g.edges, joinEdge{
 			leftTable:  li,
@@ -139,7 +136,86 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 			rightKey:   bin.Right,
 		})
 	}
+	for _, c := range conjuncts {
+		if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+			addEdge(bin)
+			continue
+		}
+		// M0058-0004: descend into OR-of-ANDs predicates so a join
+		// predicate like Q19's `(p_partkey=l_partkey AND ...) OR
+		// (p_partkey=l_partkey AND ...) OR (...)` contributes a join
+		// edge. The full OR remains as a residual predicate; this
+		// only feeds the join-order DP.
+		for _, eq := range plannerCommonEquijoinsAcrossOr(c) {
+			addEdge(eq)
+		}
+	}
 	return g
+}
+
+// plannerCommonEquijoinsAcrossOr is the planner-Expr counterpart of
+// commonEquijoinsAcrossOr in joinorder.go. Returns equality
+// expressions of the form `t1.col = t2.col` that appear in every
+// branch of an OR predicate.
+func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
+	bin, ok := e.(*BinaryOp)
+	if !ok || bin.Op != "OR" {
+		return nil
+	}
+	branches := flattenPlannerOr(bin)
+	if len(branches) < 2 {
+		return nil
+	}
+	branchEqs := make([]map[string]*BinaryOp, len(branches))
+	for i, br := range branches {
+		branchEqs[i] = map[string]*BinaryOp{}
+		for _, c := range splitAnd(br) {
+			b, ok := c.(*BinaryOp)
+			if !ok || b.Op != "=" {
+				continue
+			}
+			lc, lok := b.Left.(*ColumnRef)
+			rc, rok := b.Right.(*ColumnRef)
+			if !lok || !rok {
+				continue
+			}
+			branchEqs[i][colRefIndexPairKey(lc, rc)] = b
+		}
+	}
+	var common []*BinaryOp
+	for k, v := range branchEqs[0] {
+		ok := true
+		for j := 1; j < len(branchEqs); j++ {
+			if _, present := branchEqs[j][k]; !present {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			common = append(common, v)
+		}
+	}
+	return common
+}
+
+func flattenPlannerOr(e Expr) []Expr {
+	bin, ok := e.(*BinaryOp)
+	if !ok || bin.Op != "OR" {
+		return []Expr{e}
+	}
+	out := flattenPlannerOr(bin.Left)
+	out = append(out, flattenPlannerOr(bin.Right)...)
+	return out
+}
+
+// colRefIndexPairKey produces an order-independent key for two
+// planner ColumnRef nodes via their resolved column indices.
+func colRefIndexPairKey(a, b *ColumnRef) string {
+	li, ri := a.Index, b.Index
+	if li > ri {
+		li, ri = ri, li
+	}
+	return fmt.Sprintf("%d==%d", li, ri)
 }
 
 // tableForCol returns the FROM-table index that all ColumnRef nodes

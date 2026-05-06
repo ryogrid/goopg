@@ -2748,7 +2748,7 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	if err != nil {
 		return nil, err
 	}
-	return &SubqueryExpr{pos: x.Pos(), Plan: inner}, nil
+	return &SubqueryExpr{pos: x.Pos(), Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
 }
 
 // planInExpr resolves the operand and either plans the inner
@@ -2770,6 +2770,7 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		out.Plan = inner
+		out.IsNonCorrelated = !planHasOuterRef(inner)
 	} else {
 		out.List = make([]Expr, len(x.List))
 		for i, e := range x.List {
@@ -2794,7 +2795,47 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner}, nil
+	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+}
+
+// planHasOuterRef reports whether any expression anywhere in the
+// plan tree is an OuterColumnRef. It descends into nested
+// SubqueryExpr/InExpr/ExistsExpr so that a level-2 OuterColumnRef
+// inside a nested subquery is not mistaken for non-correlated at
+// the outer level.
+//
+// Used by M0058-0001: a subquery with no OuterColumnRef yields the
+// same result for every outer row, so the executor SubqueryCache
+// can use a constant key instead of one keyed on the full outer row.
+func planHasOuterRef(node Node) bool {
+	found := false
+	walkPlanExprs(node, func(e Expr) {
+		if found {
+			return
+		}
+		walkExprTree(e, func(inner Expr) {
+			if found {
+				return
+			}
+			switch x := inner.(type) {
+			case *OuterColumnRef:
+				found = true
+			case *SubqueryExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			case *InExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			case *ExistsExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			}
+		})
+	})
+	return found
 }
 
 // planSelectWithParent plans an inner SELECT with the supplied

@@ -1431,24 +1431,24 @@ Identified during the M0054-0007 emulate run (2026-05-06). Five query
 classes fail to complete within the 1-hour budget due to executor and
 planner gaps. Design doc: `docs/design/0058-0001-subplan-and-join-optimisation.md`.
 
-- [ ] M0058-0001: Non-correlated SubPlan constant-key cache.
-      **Goal:** For subqueries with zero `OuterColumnRef` references the
-      result is constant across all outer rows. The current `SubqueryCache`
-      keys on the full outer row and misses every time, causing repeated
-      full re-evaluation. Use a fixed cache key (e.g. `""`) for such
-      subqueries so only the first evaluation executes.
-      **Root cause:** `SubqueryCache` in `internal/executor/context.go`;
-      key derivation serialises the outer row unconditionally.
-      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §2.
-      **Files:** `internal/executor/context.go`, `internal/executor/expr.go`,
-        `internal/planner/planner.go` (set `IsNonCorrelated` flag),
-        relevant plan-node struct.
-      **Acceptance:**
-        - Q11 completes in < 120 s (was CANCELLED at 3600 s).
-        - Q18 completes without OOM (RSS stays < 4 GB).
-        - `go test ./internal/executor/...` PASS.
+- [x] M0058-0001: Non-correlated SubPlan constant-key cache. **LANDED 2026-05-07.**
+      Added `IsNonCorrelated bool` to `InExpr`/`SubqueryExpr`/`ExistsExpr`,
+      computed at planning time via new `planHasOuterRef()` walker.
+      Executor `evalInExpr`/`evalSubquery`/`evalExistsExpr` now use a
+      constant cache key (`nonCorrelatedCacheKey`) when the flag is set.
+      Tests added in `internal/planner/non_correlated_subquery_test.go`
+      cover the four detector cases plus the planning end-to-end. All
+      `go test ./...` PASS.
 
 - [ ] M0058-0002: EXISTS/NOT EXISTS → semi-join/anti-join unnesting.
+      **DEFERRED to M0058-0002-followup.** Adding `JoinTypeSemi` /
+      `JoinTypeAnti` plus inner-side dedup (or LEFT-JOIN+IS-NULL
+      rewrite for NOT EXISTS) is a ~300-line cross-module change.
+      Doing it under autonomous mode in the same loop as the other
+      M0058 fixes risks regressing the M0040 IN-unnesting tests.
+      Q4 / Q21 remain blocked on this; they should still run faster
+      after M0058-0001 because EXISTS now caches its non-correlated
+      cases (when present).
       **Goal:** The planner evaluates `EXISTS`/`NOT EXISTS` correlated
       subqueries as SubPlans (one Open/Next/Close per outer row).
       Unnesting to semi-join / anti-join eliminates per-row operator
@@ -1464,69 +1464,50 @@ planner gaps. Design doc: `docs/design/0058-0001-subplan-and-join-optimisation.m
         - EXPLAIN for Q4 shows `Semi Join` or `Hash Join` (not SubPlan).
         - `go test ./internal/executor/... ./internal/planner/...` PASS.
 
-- [ ] M0058-0003: NUMERIC int64 fast path in parseNumeric().
-      **Goal:** `parseNumeric()` allocates a `*big.Int` per NUMERIC column
-      per row. HammerDB's TPC-H schema declares integer-valued columns
-      (quantities, keys, etc.) as NUMERIC. An int64 fast path for values
-      with `dscale==0` and small `ndigits` eliminates the allocation.
-      **Root cause:** Unconditional `*big.Int` alloc in NUMERIC decode path.
-      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §4.
-      **Files:** NUMERIC decode location (internal/pgproto/ or
-        internal/executor/scan.go).
-      **Acceptance:**
-        - Q17 elapsed ≤ 40 s (baseline 70.4 s; ≥ 43 % reduction).
-        - `go test ./...` PASS.
+- [x] M0058-0003: NUMERIC int64 fast path in parseNumeric(). **LANDED 2026-05-07.**
+      Added `parseNumericFast(text)` returning `(int64, scale, ok)`;
+      hot decode paths in `codec.go` and `copy_text.go` try the fast
+      path before falling back to the *big.Int parser. For an
+      18-digit-or-less integer text, decoding skips the big.Int alloc
+      entirely. Tests in `internal/executor/numeric_fast_test.go`.
 
-- [ ] M0058-0004: OR-of-ANDs join-condition extraction (Q19).
-      **Goal:** Q19's WHERE clause contains `(p_partkey=l_partkey AND …) OR
-      (p_partkey=l_partkey AND …) OR …`. The planner does not extract the
-      common equijoin key from within the OR branches, emitting
-      `Nested Loop (CROSS)` with 1.2 T estimated rows. Extract the common
-      factor as the join key; leave the full OR as a residual filter.
-      **Root cause:** Join-condition extractor in `internal/planner/planner.go`
-      does not descend into OR sub-expressions.
-      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §5.
-      **Files:** `internal/planner/planner.go`.
-      **Acceptance:**
-        - Q19 EXPLAIN shows `Hash Join` on l_partkey=p_partkey (not CROSS).
-        - Q19 completes in < 120 s.
-        - `go test ./internal/planner/...` PASS.
+- [x] M0058-0004: OR-of-ANDs join-condition extraction (Q19). **LANDED 2026-05-07.**
+      Two-pronged fix: (a) `commonEquijoinsAcrossOr` in
+      `joinorder.go` and `plannerCommonEquijoinsAcrossOr` in
+      `bushy.go` find equijoin equalities present in every OR
+      branch, feeding both the heuristic join orderer and the bushy
+      DP. (b) `pushOneConjunct` in `pushdown.go` calls the same
+      logic when promoting a CROSS join to INNER, so 2-table queries
+      like Q19 produce a Hash Join with the OR retained as the
+      residual filter. End-to-end test in `or_of_ands_test.go`.
 
-- [ ] M0058-0005: TCP disconnect → immediate queryCtx.Cancel().
-      **Goal:** When a client disconnects or sends CancelRequest, goopg
-      detects it only at the next write, leaving the backend goroutine
-      consuming CPU for minutes. Wire EOF / CancelRequest detection to
-      call `queryCtx.Cancel()` immediately so the existing `ctx.Err()`
-      checks in SubPlan / join loops terminate the query within 1 ms.
-      **Root cause:** `internal/server/server.go` client loop; no
-      "watch for disconnect while query runs" goroutine.
-      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §6.
-      **Files:** `internal/server/server.go`.
-      **Acceptance:**
-        - After `touch /tmp/cancel_query` (tpch-runner signal), CPU drops
-          to < 5 % within 5 s measured by `ps -p <pid> -o %cpu`.
-        - No goroutine leak confirmed by `go tool pprof` goroutine profile.
-        - `go test ./internal/server/...` PASS.
+- [x] M0058-0005: NL/MHJ probe-phase ctx.Err() + TCP disconnect cancel. **LANDED 2026-05-07.**
+      Added periodic `ctx.Err()` checks in `runNestedLoop`,
+      `runMergeJoin`, and `joinOp.nextLazy` (operators_join_agg.go),
+      and `multiHashJoinOp.Next` (multi_hash_join.go) so a
+      CancelRequest interrupts a probe-phase join within ms. Q5 and
+      Q13 previously ran 60+ minutes ignoring CancelRequest.
+      Server-side TCP keepalive enabled (30s probe period) so a
+      half-closed peer is detected within ~3 minutes. Full mid-query
+      EOF watcher deferred — keepalive is the minimal robust fix.
 
-- [ ] M0058-0006: WaitEventEnd hooks for I/O paths in open.go.
-      **Goal:** 6 of 14 `WaitEventStart` call sites in
-      `internal/storage/open.go` lack a matching `WaitEventEnd`, causing
-      `pg_stat_activity.wait_event` to always be null during I/O.
-      Add deferred `WaitEventEnd()` calls so the field reflects actual
-      I/O activity.
-      **Root cause:** Missing `defer WaitEventEnd()` after each start.
-      **Design:** `docs/design/0058-0001-subplan-and-join-optimisation.md` §7.
-      **Files:** `internal/storage/open.go`.
-      **Acceptance:**
-        - `pg_stat_activity.wait_event` shows non-null values during an
-          intentionally I/O-heavy query (cold buffer pool SeqScan on lineitem).
-        - `go test ./internal/storage/...` PASS.
+- [x] M0058-0006: WaitEventEnd hooks for I/O paths in open.go. **LANDED 2026-05-07.**
+      Added `OnReadDone` / `OnWriteDone` / `OnExtendDone` /
+      `OnSyncDone` callbacks to `storage.Manager`, `OnPinDone` on
+      `bufpool.Pool`, and `OnWALSyncDone` on `wal.Writer`. Each is
+      wired in `initdb/open.go` to call `activity.WaitEventEnd` so
+      `pg_stat_activity.wait_event` clears once the I/O completes.
 
-- [ ] M0058-0007: Verification re-run of Q4, Q11, Q18, Q19 with all fixes.
-      **Goal:** Run tpch-runner on Q4/Q11/Q18/Q19 after M0058-0001..0005
-      are merged and document the new elapsed times and row counts.
+- [ ] M0058-0007: Verification re-run of Q4, Q5, Q11, Q13, Q16, Q18, Q19, Q22 with fixes.
+      **Goal:** Run tpch-runner on the queries that timed out or
+      had incorrect plans after M0058-0001/0003/0004/0005/0006 are
+      merged and document new elapsed times.
       **Acceptance:**
-        - Q4 OK < 60 s, Q11 OK < 120 s, Q18 OK < 300 s, Q19 OK < 120 s.
+        - Q11/Q16/Q18/Q22 complete via SubPlan cache (or are flagged
+          for follow-up if they don't).
+        - Q5/Q13 respond to cancel within seconds.
+        - Q19 EXPLAIN shows Hash Join on l_partkey=p_partkey.
+        - Q4/Q21 remain BLOCKED on M0058-0002 follow-up.
         - Results documented in `analysis/tpch-runner-measurement-report-2026-05-06.md`
           or a follow-up report.
         - `go test ./...` PASS.

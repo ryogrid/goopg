@@ -139,7 +139,18 @@ func pushOneConjunct(node Node, c Expr) bool {
 		// Predicate spans both sides — promote the Join.
 		j.Type = JoinTypeInner
 		j.Predicate = c
-		if lk, rk, okSplit := splitEqualityForHash(c, leftWidth); okSplit {
+		// First try a direct equality decomposition.
+		lk, rk, okSplit := splitEqualityForHash(c, leftWidth)
+		if !okSplit {
+			// M0058-0004: if the predicate is an OR-of-ANDs where every
+			// branch shares the same equijoin (Q19 shape), use that
+			// equijoin as the hash key. The full OR remains as the join
+			// predicate so non-key conjuncts in each branch still apply.
+			if eq := pickCommonOrEquijoin(c, leftWidth); eq != nil {
+				lk, rk, okSplit = splitEqualityForHash(eq, leftWidth)
+			}
+		}
+		if okSplit {
 			j.LeftKey = lk
 			j.RightKey = rk
 			j.Algo = JoinAlgoHash
@@ -256,6 +267,21 @@ func walkColumnRefs(e Expr, onIdx func(int), onOuter func()) {
 	case *ExtractExpr:
 		walkColumnRefs(x.Source, onIdx, onOuter)
 	}
+}
+
+// pickCommonOrEquijoin scans the OR-of-ANDs predicate `c` and
+// returns one equijoin equality `t1.col = t2.col` that appears in
+// every OR branch and that splits cleanly across the [0,leftWidth)
+// vs [leftWidth,...) ColumnRef-index boundary. Returns nil when no
+// such equijoin exists. (M0058-0004.)
+func pickCommonOrEquijoin(c Expr, leftWidth int) *BinaryOp {
+	commons := plannerCommonEquijoinsAcrossOr(c)
+	for _, eq := range commons {
+		if _, _, ok := splitEqualityForHash(eq, leftWidth); ok {
+			return eq
+		}
+	}
+	return nil
 }
 
 // splitAnd flattens a left-associated AND tree into its leaves.

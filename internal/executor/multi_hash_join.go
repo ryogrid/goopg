@@ -372,7 +372,17 @@ func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
 // between "advance to next probe + initialise chain" and "advance
 // the cursor odometer". Filters are evaluated at the earliest step
 // where their referenced columns are bound.
+//
+// Cancellation: ctx.Err() is checked once per Next() call so a
+// CancelRequest interrupts the probe phase promptly.  Q5 ran 60+
+// minutes without responding to cancel before this check existed.
+// (M0058-0005.)
 func (o *multiHashJoinOp) Next() (Row, error) {
+	if o.ctx != nil && o.ctx.Ctx != nil {
+		if err := o.ctx.Ctx.Err(); err != nil {
+			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	for {
 		if o.lazyProbeEOF {
 			return nil, EOF

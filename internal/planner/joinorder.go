@@ -165,7 +165,7 @@ func collectEqualityEdges(where parser.Expr, indexByKey map[string]int, colToRel
 	for i := range out {
 		out[i] = map[int]struct{}{}
 	}
-	walkConjuncts(where, func(c parser.Expr) {
+	addEdge := func(c parser.Expr) {
 		bin, ok := c.(*parser.BinaryOp)
 		if !ok || bin.Op != "=" {
 			return
@@ -182,8 +182,91 @@ func collectEqualityEdges(where parser.Expr, indexByKey map[string]int, colToRel
 		}
 		out[li][ri] = struct{}{}
 		out[ri][li] = struct{}{}
+	}
+	walkConjuncts(where, func(c parser.Expr) {
+		// Direct AND-conjunct match.
+		addEdge(c)
+		// M0058-0004: Q19's WHERE clause is an OR of ANDs where every
+		// branch shares the same equijoin (`p_partkey = l_partkey`).
+		// Extract those common equijoins so the planner sees the join
+		// edge and emits a Hash Join instead of `Nested Loop (CROSS)`.
+		for _, eq := range commonEquijoinsAcrossOr(c) {
+			addEdge(eq)
+		}
 	})
 	return out
+}
+
+// commonEquijoinsAcrossOr inspects a top-level OR expression and
+// returns the set of equality predicates `t1.col = t2.col` that
+// appear (semantically) in every OR branch. The full OR predicate
+// remains in the WHERE clause as a residual filter; this only adds
+// join-edge information for cost-based ordering. (M0058-0004.)
+func commonEquijoinsAcrossOr(e parser.Expr) []parser.Expr {
+	bin, ok := e.(*parser.BinaryOp)
+	if !ok || strings.ToUpper(bin.Op) != "OR" {
+		return nil
+	}
+	branches := flattenOrBranches(bin)
+	if len(branches) < 2 {
+		return nil
+	}
+	branchEqs := make([]map[string]parser.Expr, len(branches))
+	for i, br := range branches {
+		branchEqs[i] = map[string]parser.Expr{}
+		walkConjuncts(br, func(c parser.Expr) {
+			b, ok := c.(*parser.BinaryOp)
+			if !ok || b.Op != "=" {
+				return
+			}
+			lc, lok := b.Left.(*parser.ColumnRef)
+			rc, rok := b.Right.(*parser.ColumnRef)
+			if !lok || !rok {
+				return
+			}
+			branchEqs[i][colRefPairKey(lc, rc)] = c
+		})
+	}
+	// Intersect across branches.
+	var common []parser.Expr
+	for k, v := range branchEqs[0] {
+		ok := true
+		for j := 1; j < len(branchEqs); j++ {
+			if _, present := branchEqs[j][k]; !present {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			common = append(common, v)
+		}
+	}
+	return common
+}
+
+// flattenOrBranches recursively splits an OR tree into a flat list of
+// branch expressions. `(a OR b) OR c` returns [a, b, c]; non-OR
+// inputs return [e].
+func flattenOrBranches(e parser.Expr) []parser.Expr {
+	bin, ok := e.(*parser.BinaryOp)
+	if !ok || strings.ToUpper(bin.Op) != "OR" {
+		return []parser.Expr{e}
+	}
+	out := flattenOrBranches(bin.Left)
+	out = append(out, flattenOrBranches(bin.Right)...)
+	return out
+}
+
+// colRefPairKey produces a canonical (order-independent) key for a
+// pair of ColumnRefs so equijoin equalities like `a.x = b.y` and
+// `b.y = a.x` collapse onto the same key during set intersection.
+func colRefPairKey(a, b *parser.ColumnRef) string {
+	left := strings.ToLower(a.Table) + "." + strings.ToLower(a.Column)
+	right := strings.ToLower(b.Table) + "." + strings.ToLower(b.Column)
+	if left > right {
+		left, right = right, left
+	}
+	return left + "==" + right
 }
 
 // resolveRefToRel maps a parser.ColumnRef to the FROM-list index

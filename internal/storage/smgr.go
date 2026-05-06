@@ -89,6 +89,16 @@ type Manager struct {
 	OnWriteWait  func()
 	OnExtendWait func()
 	OnSyncWait   func()
+
+	// OnReadDone / OnWriteDone / OnExtendDone / OnSyncDone are
+	// optional hooks called immediately after the corresponding I/O
+	// operation completes (including on error). Paired with the
+	// `*Wait` hooks so observability code can balance every
+	// WaitEventStart with a WaitEventEnd. (M0058-0006.)
+	OnReadDone   func()
+	OnWriteDone  func()
+	OnExtendDone func()
+	OnSyncDone   func()
 }
 
 // ManagerConfig controls how files are opened.
@@ -247,6 +257,9 @@ func (m *Manager) ReadBlock(rel RelFileNode, blk BlockNumber, buf []byte) error 
 	if m.OnReadWait != nil {
 		m.OnReadWait()
 	}
+	if m.OnReadDone != nil {
+		defer m.OnReadDone()
+	}
 	f, err := m.relFile(rel)
 	if err != nil {
 		return err
@@ -264,6 +277,9 @@ func (m *Manager) WriteBlock(rel RelFileNode, blk BlockNumber, buf []byte) error
 	if m.OnWriteWait != nil {
 		m.OnWriteWait()
 	}
+	if m.OnWriteDone != nil {
+		defer m.OnWriteDone()
+	}
 	f, err := m.relFile(rel)
 	if err != nil {
 		return err
@@ -279,6 +295,9 @@ func (m *Manager) Extend(rel RelFileNode, buf []byte) (BlockNumber, error) {
 	}
 	if m.OnExtendWait != nil {
 		m.OnExtendWait()
+	}
+	if m.OnExtendDone != nil {
+		defer m.OnExtendDone()
 	}
 	f, err := m.relFile(rel)
 	if err != nil {
@@ -302,6 +321,9 @@ func (m *Manager) NBlocks(rel RelFileNode) (BlockNumber, error) {
 func (m *Manager) Sync(rel RelFileNode) error {
 	if m.OnSyncWait != nil {
 		m.OnSyncWait()
+	}
+	if m.OnSyncDone != nil {
+		defer m.OnSyncDone()
 	}
 	f, err := m.relFile(rel)
 	if err != nil {

@@ -266,6 +266,12 @@ type Writer struct {
 	// pg_stat_activity can report WALWrite / WALSync wait events.
 	OnWALWrite func()
 	OnWALSync  func()
+
+	// OnWALSyncDone pairs with OnWALSync — called immediately after
+	// the fdatasync completes (success or error) so observability
+	// code can balance every WaitEventStart with a WaitEventEnd.
+	// (M0058-0006.)
+	OnWALSyncDone func()
 }
 
 type state struct {
@@ -566,6 +572,9 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	}
 	if w.OnWALSync != nil {
 		w.OnWALSync()
+	}
+	if w.OnWALSyncDone != nil {
+		defer w.OnWALSyncDone()
 	}
 	resp := make(chan result, 1)
 	if err := w.send(op{kind: opFlush, lsn: lsn, resp: resp}); err != nil {

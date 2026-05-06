@@ -670,13 +670,21 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		// outer-row value rather than per outer row.  This
 		// reduces Q20-like queries from O(outer×inner) to
 		// O(inner) per distinct correlation key.
+		//
+		// For non-correlated subqueries (M0058-0001), the
+		// inner plan returns the same set for every outer row,
+		// so a constant cache key collapses re-evaluation to
+		// a single execution.
+		cacheKey := subqueryCacheKey(row)
+		if x.IsNonCorrelated {
+			cacheKey = nonCorrelatedCacheKey(x)
+		}
 		if ctx.SubqueryCache != nil {
 			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
 				clear(ctx.SubqueryCache)
 				ctx.SubqueryCacheScope = len(ctx.OuterRows)
 			}
-			key := subqueryCacheKey(row)
-			if cached, ok := ctx.SubqueryCache[key]; ok {
+			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
 				return cached, nil
 			}
 		}
@@ -713,7 +721,7 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 			ctx.SubqueryCache = make(map[string][]Datum)
 			ctx.SubqueryCacheScope = len(ctx.OuterRows)
 		}
-		ctx.SubqueryCache[subqueryCacheKey(row)] = out
+		ctx.SubqueryCache[cacheKey] = out
 		return out, nil
 	}
 	out := make([]Datum, len(x.List))
@@ -743,6 +751,34 @@ func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error)
 	// outcome.
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	// For non-correlated EXISTS (M0058-0001), the inner plan
+	// returns the same boolean for every outer row. Cache it
+	// under a constant key.
+	if x.IsNonCorrelated {
+		cacheKey := nonCorrelatedCacheKey(x)
+		if ctx.SubqueryCache != nil {
+			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
+				clear(ctx.SubqueryCache)
+				ctx.SubqueryCacheScope = len(ctx.OuterRows)
+			}
+			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
+				if len(cached) == 1 {
+					return cached[0], nil
+				}
+			}
+		}
+		val, err := existsImpl(x, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if ctx.SubqueryCache == nil {
+			ctx.SubqueryCache = make(map[string][]Datum)
+			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		}
+		ctx.SubqueryCache[cacheKey] = []Datum{val}
+		return val, nil
+	}
 	return existsImpl(x, ctx)
 }
 
@@ -783,14 +819,18 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
-	// Check cache for scalar subquery results keyed by outer row.
+	// Check cache for scalar subquery results. For non-correlated
+	// subqueries (M0058-0001), use a constant cache key.
+	cacheKey := subqueryCacheKey(row)
+	if x.IsNonCorrelated {
+		cacheKey = nonCorrelatedCacheKey(x)
+	}
 	if ctx.SubqueryCache != nil {
 		if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
 			clear(ctx.SubqueryCache)
 			ctx.SubqueryCacheScope = len(ctx.OuterRows)
 		}
-		key := subqueryCacheKey(row)
-		if cached, ok := ctx.SubqueryCache[key]; ok {
+		if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
 			if len(cached) == 1 {
 				return cached[0], nil
 			}
@@ -806,7 +846,7 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 		ctx.SubqueryCache = make(map[string][]Datum)
 		ctx.SubqueryCacheScope = len(ctx.OuterRows)
 	}
-	ctx.SubqueryCache[subqueryCacheKey(row)] = []Datum{val}
+	ctx.SubqueryCache[cacheKey] = []Datum{val}
 	return val, nil
 }
 
@@ -1188,4 +1228,14 @@ func subqueryCacheKey(row Row) string {
 		parts[i] = datumKey(d)
 	}
 	return strings.Join(parts, "|")
+}
+
+// nonCorrelatedCacheKey returns a constant cache key for a given
+// non-correlated subquery node. The pointer-derived suffix keeps
+// keys for distinct subquery sites distinct within a single query
+// (so two unrelated non-correlated SubPlans don't share a cached
+// result), while collapsing all outer rows for the same SubPlan
+// onto a single entry. (M0058-0001.)
+func nonCorrelatedCacheKey(x interface{}) string {
+	return fmt.Sprintf("\x00nc:%p", x)
 }

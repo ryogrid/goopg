@@ -103,12 +103,18 @@ func (*ExtractExpr) exprNode()  {}
 // resolution. Either Plan or List is non-nil. v0 supports the
 // uncorrelated form only — the executor evaluates the inner
 // once, builds a set, then probes per outer row.
+//
+// IsNonCorrelated is true when the inner Plan contains zero
+// OuterColumnRef nodes; the executor uses a constant cache
+// key in that case so the SubPlan executes only once across
+// all outer rows. (M0058-0001.)
 type InExpr struct {
-	pos     int
-	Operand Expr
-	Negated bool
-	Plan    Node // populated when the source is a subquery
-	List    []Expr
+	pos             int
+	Operand         Expr
+	Negated         bool
+	Plan            Node // populated when the source is a subquery
+	List            []Expr
+	IsNonCorrelated bool
 }
 
 func (e *InExpr) Pos() int { return e.pos }
@@ -117,10 +123,14 @@ func (*InExpr) exprNode()  {}
 // ExistsExpr mirrors parser.ExistsExpr. The executor opens the
 // inner plan, asks for one row, and reports the bool. NOT
 // EXISTS is the same path with the result negated.
+//
+// IsNonCorrelated is true when Plan contains zero
+// OuterColumnRef nodes — see InExpr for the cache implication.
 type ExistsExpr struct {
-	pos     int
-	Negated bool
-	Plan    Node
+	pos             int
+	Negated         bool
+	Plan            Node
+	IsNonCorrelated bool
 }
 
 func (e *ExistsExpr) Pos() int { return e.pos }
@@ -131,9 +141,13 @@ func (*ExistsExpr) exprNode()  {}
 // closes Plan once at evaluation time and returns the single
 // cell as the expression's value. Multi-row / multi-column
 // subqueries trigger a runtime error.
+//
+// IsNonCorrelated is true when Plan contains zero
+// OuterColumnRef nodes — see InExpr for the cache implication.
 type SubqueryExpr struct {
-	pos  int
-	Plan Node
+	pos             int
+	Plan            Node
+	IsNonCorrelated bool
 }
 
 func (e *SubqueryExpr) Pos() int { return e.pos }
