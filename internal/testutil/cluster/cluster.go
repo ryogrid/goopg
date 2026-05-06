@@ -213,6 +213,23 @@ func (c *Cluster) Stop(mode ShutdownMode) error {
 	return nil
 }
 
+// Kill sends SIGKILL to the goopg server process unconditionally
+// (simulates an OOM kill or `kill -9`). Use for crash-recovery tests.
+// The process is gone immediately; data directory is left as-is for
+// WAL replay on the next Start().
+func (c *Cluster) Kill() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil || c.cmd.Process == nil {
+		return errors.New("cluster not running")
+	}
+	if err := c.cmd.Process.Kill(); err != nil {
+		return fmt.Errorf("kill: %w", err)
+	}
+	c.cmd = nil
+	return nil
+}
+
 // Restart performs stop+start.
 func (c *Cluster) Restart(mode ShutdownMode) error {
 	if err := c.Stop(mode); err != nil {

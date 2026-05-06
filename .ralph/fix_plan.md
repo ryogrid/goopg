@@ -3345,7 +3345,7 @@ reading commit messages.
       **DO NOT DEFER.** If server-side cancel is missing, this is a
       protocol conformance gap.
 
-- [ ] M0057-0005: Crash recovery (kill -KILL) verification.
+- [x] M0057-0005: Crash recovery (kill -KILL) verification.
       **Goal:** Confirm SIGKILL does not prevent clean restart.
       Crash recovery is a minimum RDBMS requirement.
       **Design:** `docs/design/0057-0004-crash-recovery-verification.md`.
@@ -3359,7 +3359,7 @@ reading commit messages.
       **DO NOT DEFER under any circumstances.** If recovery fails,
       fix the WAL redo path before marking this done.
 
-- [ ] M0057-0006: cmd/tpch-runner README.md.
+- [x] M0057-0006: cmd/tpch-runner README.md.
       **Goal:** Written, user-facing README so the project owner can
       manually operate the bench tooling.
       **File:** `cmd/tpch-runner/README.md` (written 2026-05-06).
