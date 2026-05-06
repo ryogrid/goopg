@@ -277,5 +277,6 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 | 0055-0002 | [B-tree Multi-Writer Split Protocol (M0055)](0055-0002-btree-multi-writer-split-protocol.md) | draft | Design for incomplete-split lifecycle, split-completion rules, lock ordering, and sibling invariant restoration needed to remove structural single-writer bottlenecks safely. |
 | 0055-0003 | [B-tree Page Deletion and Recycling Protocol (M0055)](0055-0003-btree-page-deletion-and-recycling-protocol.md) | draft | Design for two-phase page deletion, replay-safe unlink progression, and safe page recycling into free-space management under vacuum churn. |
 | 0055-0004 | [B-tree External Sort Build and Streaming Uniqueness (M0055)](0055-0004-btree-external-sort-build-and-uniqueness.md) | draft | Design for spill-capable CREATE INDEX sort/build and adjacency-based uniqueness checks to remove all-in-memory scaling limits. |
+| 0059-0001 | [BorrowRow Volcano Row-Lifetime Optimization (M0059)](0059-0001-borrowrow-volcano-row-lifetime-optimization.md) | draft | Expands BorrowSemantics propagation and row-lifetime ownership boundaries to reduce executor tuple-copy and GC overhead while preserving correctness at retaining operators. |
 
 Append new rows in numeric order. Do not reorder.

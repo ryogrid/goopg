@@ -1531,6 +1531,75 @@ planner gaps. Design doc: `docs/design/0058-0001-subplan-and-join-optimisation.m
           or a follow-up report.
         - `go test ./...` PASS.
 
+## Milestone 0059 — Executor BorrowRow Optimization
+
+See `docs/milestones/0059-executor-borrowrow-optimization.md`.
+Design: `docs/design/0059-0001-borrowrow-volcano-row-lifetime-optimization.md`.
+
+- [ ] M0059-0001: Borrow-lifetime matrix and contract audit.
+      **Goal:** Classify each operator edge as Borrow-safe or
+      Owned-required and capture the matrix in code comments/tests.
+      **Files:** `internal/executor/operator.go`,
+        `internal/executor/borrow_test.go`.
+      **Acceptance:**
+        - Matrix is documented and aligned with current operator behavior.
+        - Regression tests pin OwnedRow vs BorrowedRow invariants.
+
+- [ ] M0059-0002: Build-time Borrow propagation widening.
+      **Goal:** Expand borrow propagation to all safe pipeline edges
+      while preserving Owned boundaries for retaining operators.
+      **Files:** `internal/executor/executor.go`,
+        `internal/executor/operator.go`,
+        `internal/executor/instrument.go`.
+      **Acceptance:**
+        - Safe chains run in BorrowedRow mode by default.
+        - Retaining operators still force Owned semantics at boundaries.
+        - `go test ./internal/executor/...` PASS.
+
+- [ ] M0059-0003: Hot-path operator copy elimination (phase 1).
+      **Goal:** Remove redundant row clones in the highest-impact
+      borrow-safe operators from profile baselines.
+      **Files:** `internal/executor/operators_storage.go`,
+        `internal/executor/operators.go`, `internal/executor/spill.go`.
+      **Acceptance:**
+        - Targeted operators avoid unnecessary clone/copy on BorrowedRow paths.
+        - No correctness regressions in row-lifetime tests.
+
+- [ ] M0059-0004: Hot-path operator copy elimination (phase 2).
+      **Goal:** Extend borrow-safe handling to additional scan/join
+      operators where lifetime guarantees allow it.
+      **Files:** `internal/executor/operators_index.go`,
+        `internal/executor/operators_indexonly.go`,
+        `internal/executor/operators_nljoin.go`.
+      **Acceptance:**
+        - Additional operators participate in BorrowedRow without alias bugs.
+        - `go test ./internal/executor/...` PASS.
+
+- [ ] M0059-0005: Retention-boundary hardening tests.
+      **Goal:** Add focused tests proving sort/hash/materialize paths
+      cannot accidentally retain borrowed rows.
+      **Files:** `internal/executor/borrow_test.go`,
+        join/sort/materialize-related test files under `internal/executor/`.
+      **Acceptance:**
+        - Failing test reproduces each targeted boundary bug class.
+        - Fixed code path passes and protects against regressions.
+
+- [ ] M0059-0006: Profile and benchmark delta verification.
+      **Goal:** Capture before/after allocation and GC deltas for
+      representative TPC-H queries impacted by tuple-copy churn.
+      **Files (output):** `analysis/tpch-borrowrow-optimization-report.md`
+        (new report), optional profile artifacts under `bench/tpch/pprof/`.
+      **Acceptance:**
+        - Report includes alloc bytes and top symbol deltas.
+        - Report includes at least one wall-clock comparison slice.
+
+- [ ] M0059-0007: End-to-end parity and stability gate.
+      **Goal:** Prove BorrowRow rollout keeps result parity and
+      cancellation/timeout behavior stable.
+      **Acceptance:**
+        - Relevant executor/planner parity tests pass.
+        - `go test ./...` PASS.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
