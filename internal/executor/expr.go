@@ -732,6 +732,12 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 // regardless of column count — EXISTS only cares whether at
 // least one row exists.
 func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error) {
+	// Check for query cancellation before each EXISTS/NOT EXISTS evaluation.
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	// Push the outer row so correlated column refs in the inner
 	// plan can resolve against it. Pop on return regardless of
 	// outcome.
