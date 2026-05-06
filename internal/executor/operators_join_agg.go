@@ -65,11 +65,11 @@ func (o *joinOp) Open(ctx *Context) error {
 		return err
 	}
 
-	leftRows, err := drainRows(o.left)
+	leftRows, err := drainRowsCtx(o.left, ctx)
 	if err != nil {
 		return err
 	}
-	rightRows, err := drainRows(o.right)
+	rightRows, err := drainRowsCtx(o.right, ctx)
 	if err != nil {
 		return err
 	}
@@ -761,8 +761,20 @@ func (o *aggregateOp) Close() error {
 func (o *aggregateOp) Schema() planner.Schema { return o.schema }
 
 func drainRows(op Operator) ([]Row, error) {
+	return drainRowsCtx(op, nil)
+}
+
+// drainRowsCtx drains all rows from op, checking ctx.Err() every 1000
+// rows so a CancelRequest can interrupt long hash-join build phases.
+func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 	rows := make([]Row, 0)
+	n := 0
 	for {
+		if ctx != nil && ctx.Ctx != nil && n%1000 == 0 {
+			if err := ctx.Ctx.Err(); err != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		row, err := op.Next()
 		if err == EOF {
 			return rows, nil
@@ -773,6 +785,7 @@ func drainRows(op Operator) ([]Row, error) {
 		dup := make(Row, len(row))
 		copy(dup, row)
 		rows = append(rows, dup)
+		n++
 	}
 }
 

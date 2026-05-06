@@ -168,7 +168,7 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 		if err := child.Open(ctx); err != nil {
 			return err
 		}
-		rows, err := drainRows(child)
+		rows, err := drainRowsCtx(child, ctx)
 		_ = child.Close()
 		if err != nil {
 			return err

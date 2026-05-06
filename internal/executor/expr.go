@@ -657,6 +657,14 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 // exactly one column. Otherwise evaluates the value list.
 func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) {
 	if x.Plan != nil {
+		// Check for query cancellation before each SubPlan evaluation.
+		// Each call may scan millions of rows; this single atomic read
+		// costs ~5 ns vs microseconds-to-seconds of SubPlan work.
+		if ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		// Consult the subquery cache so correlated IN
 		// subqueries are evaluated at most once per distinct
 		// outer-row value rather than per outer row.  This
@@ -761,6 +769,12 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 // outer row. Correlated subqueries (parameter pull-up) are
 // deferred; see docs/design/0003-0008-subqueries.md.
 func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
+	// Check for query cancellation before each scalar SubPlan evaluation.
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
 	// Check cache for scalar subquery results keyed by outer row.
