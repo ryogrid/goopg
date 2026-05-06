@@ -3,6 +3,7 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -113,6 +114,11 @@ type Config struct {
 	// write in the state loop.  Set by initdb.Open so the activity
 	// registry can report WALWrite wait events.
 	OnWALWrite func()
+
+	// Logger, when non-nil, is used to emit INFO-level log lines
+	// for each WAL flush (M0057-0001). Defaults to slog.Default()
+	// when nil.
+	Logger *slog.Logger
 }
 
 // AIOEngine is the wal-side seam onto an AIO engine. Mirrors
@@ -1121,6 +1127,12 @@ func (s *state) flushUpTo(lsn uint64) error {
 	}
 
 	s.flushedLSN = lsn
+	// M0057-0001: LOG each WAL flush so benchmark runs show WAL writer activity.
+	l := s.cfg.Logger
+	if l == nil {
+		l = slog.Default()
+	}
+	l.Info("walwriter flush", "lsn", lsn, "segments_fsynced", len(dirty))
 	return nil
 }
 

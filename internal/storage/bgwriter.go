@@ -1,6 +1,9 @@
 package storage
 
-import "time"
+import (
+	"log/slog"
+	"time"
+)
 
 // Bgwriter is the background writer goroutine (M0048-0003). It proactively
 // flushes dirty buffer-pool pages to disk on a timer so that foreground
@@ -23,6 +26,7 @@ type Bgwriter struct {
 	maxPages int
 	stop     chan struct{}
 	done     chan struct{}
+	logger   *slog.Logger
 }
 
 // NewBgwriter creates a Bgwriter bound to pool. delay is the inter-tick
@@ -34,6 +38,14 @@ func NewBgwriter(pool *Pool, delay time.Duration, maxPages int) *Bgwriter {
 		maxPages: maxPages,
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
+		logger:   slog.Default(),
+	}
+}
+
+// SetLogger wires a custom logger. Must be called before Start().
+func (b *Bgwriter) SetLogger(l *slog.Logger) {
+	if l != nil {
+		b.logger = l
 	}
 }
 
@@ -58,7 +70,9 @@ func (b *Bgwriter) run() {
 	for {
 		select {
 		case <-ticker.C:
-			b.pool.WriteDirtyPages(b.maxPages)
+			if n := b.pool.WriteDirtyPages(b.maxPages); n > 0 {
+				b.logger.Info("bgwriter flush", "pages", n)
+			}
 		case <-b.stop:
 			return
 		}
