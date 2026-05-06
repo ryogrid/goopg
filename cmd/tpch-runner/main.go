@@ -141,8 +141,31 @@ func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.
 		return
 	}
 	rowCount := 0
+	var explainLines []string
+	cols, _ := rows.Columns()
 	for rows.Next() {
 		rowCount++
+		if doExplain {
+			// EXPLAIN output: collect all columns of each row (goopg
+			// returns a single text column; collect defensively).
+			vals := make([]interface{}, len(cols))
+			ptrs := make([]interface{}, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err == nil {
+				line := ""
+				for i, v := range vals {
+					if i > 0 {
+						line += "\t"
+					}
+					if v != nil {
+						line += fmt.Sprintf("%v", v)
+					}
+				}
+				explainLines = append(explainLines, line)
+			}
+		}
 	}
 	closeErr := rows.Err()
 	rows.Close()
@@ -151,7 +174,15 @@ func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.
 		fmt.Printf("%s: ERROR after %.2fs (%d rows scanned) — %v\n", label, elapsed.Seconds(), rowCount, closeErr)
 		return
 	}
-	fmt.Printf("%s: OK elapsed=%.2fs rows=%d\n", label, elapsed.Seconds(), rowCount)
+	if doExplain {
+		fmt.Printf("%s: EXPLAIN plan:\n", label)
+		for _, l := range explainLines {
+			fmt.Printf("  %s\n", l)
+		}
+		fmt.Printf("%s: OK elapsed=%.2fs\n", label, elapsed.Seconds())
+	} else {
+		fmt.Printf("%s: OK elapsed=%.2fs rows=%d\n", label, elapsed.Seconds(), rowCount)
+	}
 }
 
 // runOne dispatches a single Q. Q15 is special-cased into
