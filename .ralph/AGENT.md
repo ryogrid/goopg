@@ -136,6 +136,22 @@ While using PostgreSQL as the oracle, always account for:
   newly-discovered follow-ups, and note any tasks that turned out to be
   larger than expected.
 
+## Completion and Deferral Discipline
+
+- Do not mark a milestone as complete in `.ralph/fix_plan.md` until there is
+  clear evidence that every milestone requirement is actually finished.
+- Apply the same standard to individual tasks: only mark complete when the
+  task is truly done, verified, and no required work remains.
+- Do not use "deferred" or "future work" as an easy escape hatch for
+  unfinished required scope.
+- If a blocker prevents completion, record the blocker explicitly and keep the
+  task and milestone unchecked.
+- If work must be delegated to a later task or milestone, add explicit
+  cross-referenced follow-up tasks so the handoff is unambiguous from both the
+  source and destination entries.
+- "Partially complete" is still incomplete. Never mark partial completion as
+  done.
+
 ## Key Learnings
 
 - Go module path is `github.com/goopg/goopg` (placeholder; rename if a real
