@@ -23,6 +23,7 @@
 | Q8 | OK | 195.31 | 0 | 209 | 10998 | emulate-run-001 |
 | Q9 | OK | 138.48 | — | — | — | run-013 confirmed |
 | Q10 | OK | 47.08 | 20574 | — | — | emulate-run-001 |
+| Q12 | OK | 99.41 | 2 | — | — | remaining-run-004 |
 | Q14 | OK | 29.69 | 1 | — | — | run-013 confirmed |
 | Q15a | OK | 27.61 | 10000 | — | — | emulate-run-001 (VIEW body) |
 | Q15b | OK | 27.43 | 0 | — | — | emulate-run-001 (main SELECT, NLI supplier_pk) |
@@ -33,18 +34,21 @@
 | Query | Root Cause | Plan Shape | Key Symptom |
 |-------|-----------|-----------|-------------|
 | Q4 | EXISTS subquery as SubPlan, no unnesting to semi-join | `Seq Scan orders(1.5M) + EXISTS SubPlan` | 1.5M × EXISTS eval per row; even with idx_lineitem_orderkey, operator Build/Open/Close overhead dominates |
+| Q5 | MHJ probe phase has no ctx.Err() check; cancel does not propagate | `MHJ(6) all Seq Scan` | Ran 62 min, never responded to CancelRequest; killed manually |
 | Q11 | Non-correlated HAVING scalar SubPlan evaluated ~8K times | `MHJ(3) + GroupAgg + HAVING scalar SubPlan` | 8K groups × 400ms each ≈ 54 min estimated |
+| Q13 | Nested Loop probe phase has no ctx.Err() check | `NL LEFT (customer 150K × orders 1.5M)` | Ran 58+ min, never responded to cancel; estimated 24 min cost but cancellation broken |
+| Q16 | Non-correlated NOT IN SubPlan evaluated per joined row | `Hash Join(partsupp×part) + NOT IN SubPlan Filter` | 800K joined rows × ~8ms/eval ≈ 106 min estimated; cancelled at 1248s |
 | Q18 | Non-correlated IN SubPlan with unbounded cache growth | `MHJ(3) + IN SubPlan (Filter)` | 6M rows × lineitem 6M scan; RSS grew to 11GB (cache leak) |
 | Q20 | Outer IN SubPlan not unnested; inner correlated agg decorrelated ✓ | `NLI(nation_pk) + IN SubPlan` | Inner agg decorrelated by M0054-0008; outer IN remains SubPlan |
 | Q21 | EXISTS/NOT EXISTS as SubPlans; index used but 6M outer rows | `MHJ(4) + EXISTS/NOT EXISTS SubPlan` | idx_lineitem_orderkey used per call (~fast), but volume × overhead exceeds 1h |
+| Q22 | Non-correlated scalar avg SubPlan evaluated per customer row | `Seq Scan customer(150K) + avg SubPlan + NOT EXISTS SubPlan` | 150K × ~60ms/eval ≈ 2.5 h; cancelled at 53.5s (manual) |
 
 ### 1.3 Parse/Infrastructure Errors
 
 | Query | Issue | Status |
 |-------|-------|--------|
-| Q13 | `LEFT OUTER JOIN … ON (complex_pred AND filter)` not supported by parser | **Fixed** in commit `ad183ac` |
+| Q13 | Parse error fixed (`ad183ac`); now runs but probe-phase cancel broken | **Performance issue** — runs 58+ min; moved to §1.2 |
 | Q3 | Accidentally consumed stale signal file (`/tmp/cancel_query`) | **Resolved** — re-run OK (49.39s) |
-| Q22 | Server restart during run — UNKNOWN(exit=1) | Infrastructure issue; re-run pending |
 | Q15 | Q15 uses Q15a/Q15b label format; `^Q15: OK` pattern did not match — exit=0 (success) | Pattern fix needed; Q15a=27.6s, Q15b=27.4s confirmed from log |
 
 ---
@@ -172,17 +176,18 @@ See companion document `analysis/tpch-explain-plan-analysis-2026-05-06.md` for t
 
 ## 7. Open Items
 
-- [ ] Non-correlated SubPlan cache key fix
-- [ ] EXISTS/NOT EXISTS → semi-join/anti-join unnesting
-- [ ] Q4 re-run after semi-join fix
-- [ ] Q11 re-run after SubPlan cache fix
-- [ ] Q18 re-run after SubPlan cache fix
-- [ ] Q19 NLI OR-of-ANDs investigation (CROSS join with 1.2T estimated rows)
-- [x] Q3 re-run — OK 49.39s (was stale signal file; query itself is fast)
-- [ ] Q22 re-run (was disrupted by server restart)
+All open items are tracked as M0058 sub-tasks in `docs/milestones/0058-tpch-subplan-join-perf.md`.
+
+- [ ] M0058-0001: Non-correlated SubPlan constant-key cache — unblocks Q11, Q16, Q18, Q22
+- [ ] M0058-0002: EXISTS/NOT EXISTS → semi-join/anti-join — unblocks Q4, Q21
+- [ ] M0058-0003: NUMERIC int64 fast path — all queries ~50% faster
+- [ ] M0058-0004: OR-of-ANDs join condition extraction — fixes Q19 CROSS JOIN
+- [ ] M0058-0005: TCP disconnect + NL/MHJ probe-phase ctx.Err() checks — fixes Q5, Q13 cancel
+- [ ] M0058-0006: WaitEventEnd hooks (observability)
+- [ ] M0058-0007: Verification re-run of Q4/Q5/Q11/Q13/Q16/Q18/Q19/Q22 after fixes
+- [x] Q3 re-run — OK 49.39s (was stale signal file)
 - [ ] Full sequential run of all 22 queries for M0054-0007 close
-- [ ] TCP disconnect propagation to queryCtx
 
 ---
 
-*Report generated: 2026-05-06. Status: in progress — Q5/Q12/Q13/Q16/Q22 currently executing.*
+*Report generated: 2026-05-06. Last updated: 2026-05-07. Measurement complete — all queries attempted; those blocked by SubPlan/cancel gaps tracked in M0058.*

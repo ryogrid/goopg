@@ -20,8 +20,9 @@ misses on every row because the outer row changes.
 | Query | Symptom | Estimated cost |
 |-------|---------|---------------|
 | Q11 | HAVING scalar SubPlan re-evaluated ~8 K times | ~54 min |
+| Q16 | NOT IN SubPlan re-evaluated ~800 K times (joined rows) | ~106 min; cancelled at 1248s |
 | Q18 | IN SubPlan re-evaluated ~6 M times + unbounded RSS | timeout + OOM |
-| Q22 | scalar avg SubPlan re-evaluated ~150 K times | ~2.5 min overhead |
+| Q22 | scalar avg SubPlan re-evaluated ~150 K times | ~2.5 h; cancelled at 53.5s |
 
 **Fix:** detect zero-`OuterColumnRef` subqueries at planning time; use a
 constant cache key (e.g., `""` or the subquery node address) so every
@@ -70,7 +71,20 @@ estimated rows, filtered afterward.
 predicates across OR branches, converting the CROSS join to a Hash Join
 keyed on the common predicate; the per-row OR filter is applied above.
 
-### Gap 5 — TCP disconnect does not propagate to queryCtx
+### Gap 5 — Cancel does not propagate through NL/MHJ probe phase; TCP disconnect not wired
+
+In addition to TCP disconnect not calling `queryCtx.Cancel()`, the
+Nested Loop join (`operators_join.go`) and MHJ probe phase
+(`multi_hash_join.go`) do not check `ctx.Err()` during iteration.
+This means CancelRequest is also ignored once the query enters the
+probe phase, even if the cancel registry fires correctly.
+
+| Query | Duration before forceful kill | Root cause |
+|-------|-------------------------------|------------|
+| Q5 | 62 min | MHJ probe phase — no ctx.Err() check |
+| Q13 | 58+ min | Nested Loop probe phase — no ctx.Err() check |
+
+### Gap 5 (original) — TCP disconnect does not propagate to queryCtx
 
 After a client disconnects or sends CancelRequest, the goopg server
 goroutine detects the broken pipe only at the next network write. Until
@@ -91,7 +105,8 @@ after M0054 commits `a216093` + `f0b1c2c`).
 - **M0058-0003** NUMERIC int64 fast path in parseNumeric() (~200 lines,
   all queries ~50 % faster)
 - **M0058-0004** OR-of-ANDs join condition extraction for Q19 (~100 lines)
-- **M0058-0005** TCP disconnect → immediate queryCtx.Cancel() (~50 lines)
+- **M0058-0005** TCP disconnect → immediate queryCtx.Cancel(); also add ctx.Err() to
+  Nested Loop and MHJ probe phases (~100 lines; unblocks Q5, Q13)
 - **M0058-0006** WaitEventEnd hooks for I/O paths in open.go (~20 lines,
   observability only)
 - **M0058-0007** Verification re-run: Q4, Q11, Q18, Q19 with all fixes
