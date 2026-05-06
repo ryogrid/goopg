@@ -1441,14 +1441,14 @@ planner gaps. Design doc: `docs/design/0058-0001-subplan-and-join-optimisation.m
       `go test ./...` PASS.
 
 - [ ] M0058-0002: EXISTS/NOT EXISTS → semi-join/anti-join unnesting.
-      **DEFERRED to M0058-0002-followup.** Adding `JoinTypeSemi` /
+      **BLOCKED — tracked in M0061-0001.** Adding `JoinTypeSemi` /
       `JoinTypeAnti` plus inner-side dedup (or LEFT-JOIN+IS-NULL
       rewrite for NOT EXISTS) is a ~300-line cross-module change.
-      Doing it under autonomous mode in the same loop as the other
-      M0058 fixes risks regressing the M0040 IN-unnesting tests.
-      Q4 / Q21 remain blocked on this; they should still run faster
-      after M0058-0001 because EXISTS now caches its non-correlated
-      cases (when present).
+      Carved out of the M0058 autonomous loop to avoid regressing
+      M0040 IN-unnesting tests; Q22 verification (2026-05-07,
+      `analysis/tpch-m0058-verification-2026-05-07.md`) confirms
+      Q22 still times out at 300 s for the same root cause.
+      See `docs/milestones/0061-tpch-m0058-followups.md`.
       **Goal:** The planner evaluates `EXISTS`/`NOT EXISTS` correlated
       subqueries as SubPlans (one Open/Next/Close per outer row).
       Unnesting to semi-join / anti-join eliminates per-row operator
@@ -1498,19 +1498,17 @@ planner gaps. Design doc: `docs/design/0058-0001-subplan-and-join-optimisation.m
       wired in `initdb/open.go` to call `activity.WaitEventEnd` so
       `pg_stat_activity.wait_event` clears once the I/O completes.
 
-- [ ] M0058-0007: Verification re-run of Q4, Q5, Q11, Q13, Q16, Q18, Q19, Q22 with fixes.
-      **Goal:** Run tpch-runner on the queries that timed out or
-      had incorrect plans after M0058-0001/0003/0004/0005/0006 are
-      merged and document new elapsed times.
-      **Acceptance:**
-        - Q11/Q16/Q18/Q22 complete via SubPlan cache (or are flagged
-          for follow-up if they don't).
-        - Q5/Q13 respond to cancel within seconds.
-        - Q19 EXPLAIN shows Hash Join on l_partkey=p_partkey.
-        - Q4/Q21 remain BLOCKED on M0058-0002 follow-up.
-        - Results documented in `analysis/tpch-runner-measurement-report-2026-05-06.md`
-          or a follow-up report.
-        - `go test ./...` PASS.
+- [x] M0058-0007: Verification re-run of Q4, Q5, Q11, Q13, Q16, Q18, Q19, Q22 with fixes.
+      **LANDED 2026-05-07.** Six-query verification run executed
+      against commit `d509107`. Q11 3600 s → 4.55 s (≥790×),
+      Q16 1248 s → 4.44 s (≥280×), Q18 first completion at 107.29 s,
+      Q17 unchanged (within noise; expected on NLI-pruned shape).
+      Cancel latency on Q22 / Q19 now ms-scale (M0058-0005 verified).
+      Q22 still times out at 300 s due to correlated NOT EXISTS;
+      tracked under M0061-0001. Q19 cancels at 300 s due to residual
+      OR-of-ANDs filter; tracked under M0061-0002. Full results in
+      `analysis/tpch-m0058-verification-2026-05-07.md`. Re-baseline
+      of all 22 queries deferred to M0061-0003.
 
 ## Milestone 0059 — Executor BorrowRow Optimization
 
@@ -1714,6 +1712,81 @@ Status list: `docs/test-port/postgres-oracle-port-status.md`
   - Regress harness foundation: `go test ./internal/testport/framework -run TestRunRegressSubsetReportsStatuses` PASS.
   - Isolation scheduler foundation: `go test ./internal/testport/framework -run TestParseAndRunIsolationPermutation` PASS.
   Full gate: `go test ./... -count=1` PASS.
+
+## Milestone 0061 — TPC-H M0058 Follow-ups
+
+See `docs/milestones/0061-tpch-m0058-followups.md`. Captures the
+three follow-ups identified by the M0058 verification run
+(`analysis/tpch-m0058-verification-2026-05-07.md`): EXISTS/NOT EXISTS
+unnesting (former M0058-0002-followup), Q19 residual-OR cost, and a
+full 22-query re-baseline. NO-DEFERRAL POLICY identical to M0058.
+
+- [ ] M0061-0001: EXISTS / NOT EXISTS unnesting to semi-join / anti-join.
+      **Goal:** The planner converts `EXISTS(subq)` → semi-join and
+      `NOT EXISTS(subq)` → anti-join when the subquery's correlation
+      predicate is an equijoin on a base-table key, eliminating the
+      per-outer-row SubPlan Open/Next/Close.
+      **Root cause:** the M0040 unnesting pass handles `IN` only.
+      **Files:** `internal/planner/planner.go` (unnesting pass),
+        `internal/executor/operators_join_agg.go` (`SemiJoinOp` /
+        `AntiJoinOp` or `JoinTypeSemi` / `JoinTypeAnti` extension).
+      **Design:** `docs/design/0061-0001-exists-anti-semi-join-unnesting.md`
+        (new — must land before or with the implementation).
+      **Acceptance:**
+        - Q4 completes in < 60 s (was CANCELLED at 3600 s).
+        - Q21 completes in < 60 s (was CANCELLED at 2634 s).
+        - Q22 completes in < 60 s (was CANCELLED at 300 s on
+          2026-05-07; correlated NOT EXISTS).
+        - EXPLAIN for Q4 / Q21 / Q22 shows Semi Join / Anti Join (or
+          hash-keyed equivalent), not a SubPlan re-evaluated per row.
+        - `go test ./internal/executor/... ./internal/planner/...`
+          PASS, including the M0040 IN-unnesting tests.
+
+- [ ] M0061-0002: Q19 residual OR-of-ANDs optimisation.
+      **Goal:** Q19 completes in < 60 s on SF=1. M0058-0004 already
+      removed the CROSS JOIN by extracting `l_partkey = p_partkey`
+      as a Hash Join key, but the residual three-branch OR-of-ANDs
+      filter is evaluated row-by-row and dominates: Q19 cancelled at
+      300 s on 2026-05-07.
+      **Approach options (decide in design doc):**
+        (a) Vectorise the three-branch OR-of-ANDs filter so each
+            branch's predicate evaluates as a column-batched mask
+            instead of per-row interpretation; or
+        (b) Teach the planner to rewrite the OR-of-ANDs into
+            `UNION ALL` of three independent joins, each with
+            branch-specific build-side filters (brand / container /
+            quantity / shipmode), letting the build side prune
+            most rows before the probe.
+      **Files:** `internal/executor/expr.go` (vectorised path) or
+        `internal/planner/planner.go` + `optimizer.go` (UNION-ALL
+        rewrite); plus tests under `internal/planner/`.
+      **Design:** `docs/design/0061-0002-q19-or-of-ands-residual.md`
+        (new — must compare both options with cost-model evidence).
+      **Acceptance:**
+        - Q19 completes in < 60 s on SF=1 (was CANCELLED at 300 s).
+        - EXPLAIN shows either no residual OR-of-ANDs filter on the
+          probe output, or the OR survives but evaluates in a
+          vectorised path with measurable speedup.
+        - `go test ./internal/executor/... ./internal/planner/...` PASS.
+
+- [ ] M0061-0003: Re-baseline full 22-query TPC-H SF=1 sweep.
+      **Goal:** Capture the post-M0061-0001 long-tail and confirm no
+      regressions on Q1/Q3/Q5/Q6/Q9/Q10/etc. relative to the M0058
+      baselines. Supersedes the partial six-query report in
+      `analysis/tpch-m0058-verification-2026-05-07.md`.
+      **Run parameters:** tpch-runner against `runtime_goopg`,
+        `--per-query-timeout=620s --cancel-after=600s`, all 22
+        queries, server log captured.
+      **Files:** `analysis/tpch-m0058-followups-baseline-<date>.md`
+        (new) with per-query status / elapsed / rows / vs-baseline
+        delta and a regression callout list.
+      **Acceptance:**
+        - Report committed under `analysis/`.
+        - All queries either complete inside 600 s or carry a named
+          follow-up entry (no silent failures).
+        - Any regression vs. the M0058 verification baselines is
+          flagged with a hypothesis and reproduction command.
+      **Blocked by:** M0061-0001 (so Q4/Q21/Q22 can complete).
 
 ## Notes
 
