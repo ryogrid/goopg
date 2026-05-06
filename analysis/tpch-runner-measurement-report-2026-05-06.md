@@ -5,7 +5,7 @@
 **Tool:** `cmd/tpch-runner` (goopg-native query runner replacing hammerdbcli)  
 **Data:** SF=1, ANALYZE run, all HammerDB supplementary indexes present  
 **Stack:** M0054 + M0055 + M0056-0001 + M0057 + M0042-0004 fix  
-**Note:** This report captures a partial run. Queries Q11 onwards are still executing; this document will be updated as results arrive.
+**Note:** This report is partially updated as of 2026-05-06 20:01 JST. Q19 is currently executing; Q5/Q7/Q12/Q9 remain. Updated from first commit to add Q15/Q1/Q10 results.
 
 ---
 
@@ -15,11 +15,17 @@
 
 | Query | Status | Elapsed (s) | Rows | p50 CPU% | Peak RSS MB | Source |
 |-------|--------|------------|------|---------|-------------|--------|
+| Q1 | OK | 41.83 | 4 | — | — | emulate-run-001 |
 | Q2 | OK | 5.36 | 460 | — | — | run-013 confirmed |
+| Q3 | OK | 49.39 | 11462 | — | — | remaining-run-001 |
 | Q6 | OK | 32.72 | 1 | 71 | 5159 | emulate-run-001 |
+| Q7 | OK | 34.98 | 4 | — | — | remaining-run-002 |
 | Q8 | OK | 195.31 | 0 | 209 | 10998 | emulate-run-001 |
 | Q9 | OK | 138.48 | — | — | — | run-013 confirmed |
+| Q10 | OK | 47.08 | 20574 | — | — | emulate-run-001 |
 | Q14 | OK | 29.69 | 1 | — | — | run-013 confirmed |
+| Q15a | OK | 27.61 | 10000 | — | — | emulate-run-001 (VIEW body) |
+| Q15b | OK | 27.43 | 0 | — | — | emulate-run-001 (main SELECT, NLI supplier_pk) |
 | Q17 | OK | 70.37 | 1 | 93 | 5145 | emulate-run-001 |
 
 ### 1.2 Timed-Out / Cancelled Queries (1-hour budget)
@@ -37,8 +43,9 @@
 | Query | Issue | Status |
 |-------|-------|--------|
 | Q13 | `LEFT OUTER JOIN … ON (complex_pred AND filter)` not supported by parser | **Fixed** in commit `ad183ac` |
-| Q3 | Accidentally consumed stale signal file (`/tmp/cancel_query`) | Infrastructure issue; Q3 itself is fast |
-| Q22 | Server restart during run — UNKNOWN(exit=1) | Infrastructure issue |
+| Q3 | Accidentally consumed stale signal file (`/tmp/cancel_query`) | **Resolved** — re-run OK (49.39s) |
+| Q22 | Server restart during run — UNKNOWN(exit=1) | Infrastructure issue; re-run pending |
+| Q15 | Q15 uses Q15a/Q15b label format; `^Q15: OK` pattern did not match — exit=0 (success) | Pattern fix needed; Q15a=27.6s, Q15b=27.4s confirmed from log |
 
 ---
 
@@ -171,10 +178,11 @@ See companion document `analysis/tpch-explain-plan-analysis-2026-05-06.md` for t
 - [ ] Q11 re-run after SubPlan cache fix
 - [ ] Q18 re-run after SubPlan cache fix
 - [ ] Q19 NLI OR-of-ANDs investigation (CROSS join with 1.2T estimated rows)
-- [ ] Q3, Q22 re-run (both were disrupted by infrastructure issues, not query problems)
+- [x] Q3 re-run — OK 49.39s (was stale signal file; query itself is fast)
+- [ ] Q22 re-run (was disrupted by server restart)
 - [ ] Full sequential run of all 22 queries for M0054-0007 close
 - [ ] TCP disconnect propagation to queryCtx
 
 ---
 
-*Report generated: 2026-05-06. Status: in progress — Q11 currently executing.*
+*Report generated: 2026-05-06. Status: in progress — Q5/Q12/Q13/Q16/Q22 currently executing.*
