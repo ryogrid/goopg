@@ -36,6 +36,7 @@ func main() {
 	queriesFlag := flag.String("queries", "", "comma-separated query numbers (1..22). empty = all")
 	perQueryTimeout := flag.Duration("per-query-timeout", 600*time.Second, "per-query wall clock budget")
 	cancelAfter := flag.Duration("cancel-after", 0, "send a CancelRequest after this duration (0 = disabled). Uses lib/pq context cancel; server-side query returns SQLSTATE 57014.")
+	signalFile := flag.String("signal-file", "", "path to a sentinel file; when the file appears the current query is cancelled (context cancel + CancelRequest) and the runner moves to the next query. The file is removed after detection. Useful for manual mid-run interruption without stopping the whole process.")
 	doExplain := flag.Bool("explain", false, "issue EXPLAIN <query> instead of the query body")
 	doCheckpoint := flag.Bool("checkpoint", false, "issue a CHECKPOINT and exit (ignore -queries)")
 	flag.Parse()
@@ -69,32 +70,32 @@ func main() {
 	queries := tpch.Queries()
 	wantQs := selectQueries(*queriesFlag)
 	for _, qn := range wantQs {
-		runOneWithCancel(db, qn, queries, *perQueryTimeout, *cancelAfter, *doExplain)
+		runOneWithCancel(db, qn, queries, *perQueryTimeout, *cancelAfter, *signalFile, *doExplain)
 	}
 }
 
 // runOneWithCancel is a thin wrapper around runOne that passes the
-// cancelAfter duration through to timeOne.
-func runOneWithCancel(db *sql.DB, qn int, queries map[int]string, budget, cancelAfter time.Duration, doExplain bool) {
+// cancelAfter duration and signalFile through to timeOne.
+func runOneWithCancel(db *sql.DB, qn int, queries map[int]string, budget, cancelAfter time.Duration, signalFile string, doExplain bool) {
 	body, ok := queries[qn]
 	if !ok {
 		fmt.Printf("Q%d: no query body — skipping\n", qn)
 		return
 	}
 	if qn == 15 {
-		runQ15WithCancel(db, budget, cancelAfter, doExplain)
+		runQ15WithCancel(db, budget, cancelAfter, signalFile, doExplain)
 		return
 	}
-	timeOneWithCancel(db, fmt.Sprintf("Q%d", qn), body, budget, cancelAfter, doExplain)
+	timeOneWithCancel(db, fmt.Sprintf("Q%d", qn), body, budget, cancelAfter, signalFile, doExplain)
 }
 
 // runQ15WithCancel is the Q15 special case with cancel support.
-func runQ15WithCancel(db *sql.DB, budget, cancelAfter time.Duration, doExplain bool) {
+func runQ15WithCancel(db *sql.DB, budget, cancelAfter time.Duration, signalFile string, doExplain bool) {
 	if !doExplain {
-		timeOneWithCancel(db, "Q15-CREATEVIEW", "create or replace view revenue0 (supplier_no, total_revenue) as "+tpch.Q15ViewBody(), budget, cancelAfter, false)
+		timeOneWithCancel(db, "Q15-CREATEVIEW", "create or replace view revenue0 (supplier_no, total_revenue) as "+tpch.Q15ViewBody(), budget, cancelAfter, signalFile, false)
 	}
-	timeOneWithCancel(db, "Q15a-VIEWBODY", tpch.Q15ViewBody(), budget, cancelAfter, doExplain)
-	timeOneWithCancel(db, "Q15b-MAIN", tpch.Q15MainSelect(), budget, cancelAfter, doExplain)
+	timeOneWithCancel(db, "Q15a-VIEWBODY", tpch.Q15ViewBody(), budget, cancelAfter, signalFile, doExplain)
+	timeOneWithCancel(db, "Q15b-MAIN", tpch.Q15MainSelect(), budget, cancelAfter, signalFile, doExplain)
 	if !doExplain {
 		_, _ = db.Exec("drop view if exists revenue0")
 	}
@@ -114,7 +115,7 @@ func runQ15WithCancel(db *sql.DB, budget, cancelAfter time.Duration, doExplain b
 // ~751). When the context is cancelled, lib/pq sends the cancel
 // packet; the backend returns SQLSTATE 57014; the connection is not
 // closed.
-func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.Duration, doExplain bool) {
+func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.Duration, signalFile string, doExplain bool) {
 	stmt := body
 	if doExplain {
 		stmt = "EXPLAIN " + body
@@ -132,6 +133,31 @@ func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.
 	if cancelAfter > 0 && cancelAfter < budget {
 		cancelTimer = time.AfterFunc(cancelAfter, queryCancel)
 		defer cancelTimer.Stop()
+	}
+
+	// Signal-file poller: check every 500ms whether the sentinel file
+	// appeared. When found, remove it and cancel the query context so
+	// lib/pq sends a CancelRequest while the primary connection stays
+	// alive for the next query. The goroutine exits when queryCtx is
+	// done (either by this poller, cancelAfter, or the budget timeout).
+	if signalFile != "" {
+		go func() {
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-queryCtx.Done():
+					return
+				case <-ticker.C:
+					if _, err := os.Stat(signalFile); err == nil {
+						fmt.Printf("%s: signal-file detected (%s) — cancelling query\n", label, signalFile)
+						os.Remove(signalFile) // best-effort
+						queryCancel()
+						return
+					}
+				}
+			}
+		}()
 	}
 
 	t0 := time.Now()
