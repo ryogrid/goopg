@@ -35,6 +35,7 @@ func main() {
 	pass := flag.String("password", "tpch", "password")
 	queriesFlag := flag.String("queries", "", "comma-separated query numbers (1..22). empty = all")
 	perQueryTimeout := flag.Duration("per-query-timeout", 600*time.Second, "per-query wall clock budget")
+	cancelAfter := flag.Duration("cancel-after", 0, "send a CancelRequest after this duration (0 = disabled). Uses lib/pq context cancel; server-side query returns SQLSTATE 57014.")
 	doExplain := flag.Bool("explain", false, "issue EXPLAIN <query> instead of the query body")
 	doCheckpoint := flag.Bool("checkpoint", false, "issue a CHECKPOINT and exit (ignore -queries)")
 	flag.Parse()
@@ -68,8 +69,89 @@ func main() {
 	queries := tpch.Queries()
 	wantQs := selectQueries(*queriesFlag)
 	for _, qn := range wantQs {
-		runOne(db, qn, queries, *perQueryTimeout, *doExplain)
+		runOneWithCancel(db, qn, queries, *perQueryTimeout, *cancelAfter, *doExplain)
 	}
+}
+
+// runOneWithCancel is a thin wrapper around runOne that passes the
+// cancelAfter duration through to timeOne.
+func runOneWithCancel(db *sql.DB, qn int, queries map[int]string, budget, cancelAfter time.Duration, doExplain bool) {
+	body, ok := queries[qn]
+	if !ok {
+		fmt.Printf("Q%d: no query body — skipping\n", qn)
+		return
+	}
+	if qn == 15 {
+		runQ15WithCancel(db, budget, cancelAfter, doExplain)
+		return
+	}
+	timeOneWithCancel(db, fmt.Sprintf("Q%d", qn), body, budget, cancelAfter, doExplain)
+}
+
+// runQ15WithCancel is the Q15 special case with cancel support.
+func runQ15WithCancel(db *sql.DB, budget, cancelAfter time.Duration, doExplain bool) {
+	if !doExplain {
+		timeOneWithCancel(db, "Q15-CREATEVIEW", "create or replace view revenue0 (supplier_no, total_revenue) as "+tpch.Q15ViewBody(), budget, cancelAfter, false)
+	}
+	timeOneWithCancel(db, "Q15a-VIEWBODY", tpch.Q15ViewBody(), budget, cancelAfter, doExplain)
+	timeOneWithCancel(db, "Q15b-MAIN", tpch.Q15MainSelect(), budget, cancelAfter, doExplain)
+	if !doExplain {
+		_, _ = db.Exec("drop view if exists revenue0")
+	}
+}
+
+// timeOneWithCancel runs a single SQL statement with two independent
+// timers:
+//
+//   - budget: if the query is still running after budget, close the
+//     connection (old behaviour — lib/pq sends CancelRequest then
+//     closes).
+//   - cancelAfter: if >0 and < budget, fire a context cancel after
+//     cancelAfter so lib/pq sends a CancelRequest while the
+//     connection stays alive for the next query.
+//
+// Server-side: goopg already implements CancelRequest (server.go line
+// ~751). When the context is cancelled, lib/pq sends the cancel
+// packet; the backend returns SQLSTATE 57014; the connection is not
+// closed.
+func timeOneWithCancel(db *sql.DB, label, body string, budget, cancelAfter time.Duration, doExplain bool) {
+	stmt := body
+	if doExplain {
+		stmt = "EXPLAIN " + body
+	}
+	// Outer context governs the hard wall-clock budget.
+	outerCtx, outerCancel := context.WithTimeout(context.Background(), budget)
+	defer outerCancel()
+
+	// Per-query cancellable context for the --cancel-after path.
+	queryCtx, queryCancel := context.WithCancel(outerCtx)
+	defer queryCancel()
+
+	// Fire cancel after cancelAfter (if set and shorter than budget).
+	var cancelTimer *time.Timer
+	if cancelAfter > 0 && cancelAfter < budget {
+		cancelTimer = time.AfterFunc(cancelAfter, queryCancel)
+		defer cancelTimer.Stop()
+	}
+
+	t0 := time.Now()
+	rows, err := db.QueryContext(queryCtx, stmt)
+	if err != nil {
+		fmt.Printf("%s: ERROR after %.2fs — %v\n", label, time.Since(t0).Seconds(), err)
+		return
+	}
+	rowCount := 0
+	for rows.Next() {
+		rowCount++
+	}
+	closeErr := rows.Err()
+	rows.Close()
+	elapsed := time.Since(t0)
+	if closeErr != nil {
+		fmt.Printf("%s: ERROR after %.2fs (%d rows scanned) — %v\n", label, elapsed.Seconds(), rowCount, closeErr)
+		return
+	}
+	fmt.Printf("%s: OK elapsed=%.2fs rows=%d\n", label, elapsed.Seconds(), rowCount)
 }
 
 // runOne dispatches a single Q. Q15 is special-cased into

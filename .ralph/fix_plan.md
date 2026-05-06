@@ -3294,7 +3294,7 @@ mark it `BLOCKED: <reason>` and open a named follow-up. A coding agent
 reading this file must be able to identify unfinished work without
 reading commit messages.
 
-- [ ] M0057-0001: Background-worker activity logging.
+- [x] M0057-0001: Background-worker activity logging. LANDED 2026-05-06.
       **Goal:** Add INFO-level log lines in bgwriter, WAL writer,
       checkpointer, and autovacuum so benchmark runs show daemon
       activity.
@@ -3311,7 +3311,7 @@ reading commit messages.
       **DO NOT DEFER** — if a daemon is silent when it should be active,
       open a named bug sub-task before closing this.
 
-- [ ] M0057-0002: Checkpoint suppression during power test.
+- [x] M0057-0002: Checkpoint suppression during power test.
       **Goal:** Prevent checkpointer from firing mid-benchmark.
       **Design:** `docs/design/0057-0002-checkpoint-config-for-benchmarks.md`.
       **Files:** `bench/tpch/setup_goopg.sh` (write GUC lines to
@@ -3321,7 +3321,7 @@ reading commit messages.
         of run. Confirmed via M0057-0001's logging.
       **DO NOT DEFER.**
 
-- [ ] M0057-0003: HammerDB build-script CHECKPOINT audit.
+- [x] M0057-0003: HammerDB build-script CHECKPOINT audit.
       **Goal:** Determine whether the `buildschema` Tcl script issues
       `CHECKPOINT` explicitly.
       **Design:** inline in analysis report.
@@ -3331,7 +3331,7 @@ reading commit messages.
         `M0057-0003-wal-replay-gap`. No silent close.
       **DO NOT DEFER.**
 
-- [ ] M0057-0004: tpch-runner per-query cancellation.
+- [x] M0057-0004: tpch-runner per-query cancellation.
       **Goal:** Implement PostgreSQL CancelRequest so a hung query can
       be interrupted without restarting the server.
       **Design:** `docs/design/0057-0003-tpch-runner-cancellation.md`.

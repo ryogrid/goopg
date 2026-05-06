@@ -116,7 +116,7 @@ Print the query plan without executing the query:
 | `--password` | `tpch` | Password |
 | `--queries` | (all 1–22) | Comma-separated query numbers, e.g. `9,20,6`. Empty = all in 1..22 order. |
 | `--per-query-timeout` | `600s` | Per-query wall-clock budget. Timeout closes the connection (see M0057-0004 for true cancel). |
-| `--cancel-after` | (unset) | **(M0057-0004)** Send CancelRequest after this duration; connection stays alive. |
+| `--cancel-after` | `0` (disabled) | Send a context cancel after this duration; lib/pq sends CancelRequest to the server, returning SQLSTATE 57014. Connection stays alive for the next query. Requires `--per-query-timeout` ≥ this value. |
 | `--explain` | false | Issue `EXPLAIN <query>` instead of executing. |
 | `--checkpoint` | false | Issue a `CHECKPOINT` and exit. Convenience wrapper around `goopg checkpoint`. |
 
