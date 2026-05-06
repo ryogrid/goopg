@@ -2889,6 +2889,49 @@ rationale here.
         lands. Deliverable:
         `analysis/tpch-hammerdb-run-013.md` (committed).
 
+  - [ ] M0054-0007-followup-emulate: TPC-H power-test emulation via
+        tpch-runner (M0057-compliant infrastructure). Replaces the
+        HammerDB tclsh driver for individual-query measurement.
+        **Execution specification:**
+        1. Schema setup via existing `bench/tpch/setup_goopg.sh
+           --reset` + `bench/tpch/build_schema_goopg.sh` (data load,
+           CREATE INDEX, ANALYZE). All scripts run in the background
+           with Monitor watching for FINISHED SUCCESS.
+        2. After ANALYZE completes, issue `CHECKPOINT` via
+           `goopg checkpoint -D ...` before any query.
+        3. Print to stdout at run start: the HammerDB log path, the
+           goopg DB cluster directory, and the tpch-runner log path.
+        4. Queries are issued via tpch-runner (not hammerdbcli).
+           Execution order:
+           - **Q20 first** (the historically stalled query; test it
+             first in isolation).
+           - Then the remaining TPC-H HammerDB canonical stream order
+             (14, 2, 9, 20, 6, 17, 18, 8, 21, 13, 3, 22, 16, 4, 11,
+             15, 1, 10, 19, 5, 7, 12) with Q14 and Q2 **skipped**
+             (already confirmed in run-013: ~30 s and ~6 s), Q20
+             **skipped** (already run first), and **Q9 deferred to
+             the very end**.
+           - Final order: Q20, Q6, Q17, Q18, Q8, Q21, Q13, Q3, Q22,
+             Q16, Q4, Q11, Q15, Q1, Q10, Q19, Q5, Q7, Q12, Q9.
+           - Per-query cancel timeout: **3600 s (1 h)** via
+             `--cancel-after=3600s`. A cancelled query counts as
+             TIMEOUT in the report and the runner moves to the next Q.
+        5. During each query, a background shell script samples
+           CPU (%) and RSS (MB) of the goopg server process every
+           30 s and appends lines to a per-query metrics file. The
+           sampler is started just before the query and stopped
+           (killed) immediately after the query returns.
+        6. After all queries, write `analysis/tpch-emulate-run-001.md`
+           with a per-query table (elapsed s, rows, status, p50_cpu %,
+           peak_rss MB) and a summary section.
+        **Acceptance:**
+        - All 20 non-skipped queries either complete or are explicitly
+          marked TIMEOUT; no query leaves the server in a stuck state.
+        - `analysis/tpch-emulate-run-001.md` committed.
+        - `bench/tpch/scripts/resource_monitor.sh` committed.
+        **DO NOT DEFER** unless the schema build itself fails; in that
+        case name the exact error and open a sub-task.
+
 - [x] M0054-0008: **LANDED 2026-05-06.** Q20 decorrelation via
       magic-set / SIPS — multi-parameter correlation extension
       to the existing M0040 unnesting infrastructure. ROOT
