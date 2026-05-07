@@ -1062,6 +1062,10 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		subRemap([]Expr{n.Predicate})
 		return
 	case *Project:
+		// M0063-0001: skip isolated-scope Projects (view rename wrapper).
+		if n.IsolatedScope {
+			return
+		}
 		remapPosMapAfterRewrite(n.Child, nil)
 		pm := mhjPosMapOf(n.Child)
 		if pm != nil {
@@ -1444,6 +1448,16 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		case *Filter:
 			collect(x.Child)
 		case *Project:
+			// M0063-0001: SubqueryAlias-style Projects (view
+			// rename wrapper) bound an isolated subquery scope.
+			// Advance `off` by the projected schema width but do
+			// NOT recurse into the Child — its scans are inner-
+			// scope and must not enter the outer FROM-bindings
+			// scanMap.
+			if x.IsolatedScope {
+				off += len(x.Output())
+				return
+			}
 			collect(x.Child)
 		case *Sort:
 			collect(x.Child)
@@ -1535,6 +1549,11 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		applyJoinTreePosMap(n.Child, posMap)
 		remapByPosMap(&n.Predicate, posMap)
 	case *Project:
+		// M0063-0001: SubqueryAlias-style Projects (view rename
+		// wrapper) are isolated subquery scopes. Don't recurse.
+		if n.IsolatedScope {
+			return
+		}
 		applyJoinTreePosMap(n.Child, posMap)
 		for i := range n.Targets {
 			remapByPosMap(&n.Targets[i], posMap)
@@ -1547,6 +1566,24 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 	case *Aggregate:
 		return // stop — aggregate expressions are a different scope
 	}
+}
+
+// findUniqueColumnIndex returns the unique index of `name` in
+// `schema` (plus `offset`), or -1 when the name is absent or
+// appears more than once. Lifted out of `reresolveJoinByName`'s
+// closure (M0063-0001) so the NLI rewrite path can re-bind a
+// derived-table outer's Key index by Name.
+func findUniqueColumnIndex(schema Schema, name string, offset int) int {
+	hit := -1
+	for i, c := range schema {
+		if c.Name == name {
+			if hit >= 0 {
+				return -1 // duplicate
+			}
+			hit = i + offset
+		}
+	}
+	return hit
 }
 
 // reresolveJoinByName re‑binds ColumnRef indices in a Join's keys
@@ -1577,20 +1614,7 @@ func reresolveJoinByName(j *Join) {
 	copy(merged[leftWidth:], rightSchema)
 	j.schema = merged
 
-	// findUnique returns the unique index of name in schema
-	// (offset by `offset`), or -1 if absent or duplicated.
-	findUnique := func(schema Schema, name string, offset int) int {
-		hit := -1
-		for i, c := range schema {
-			if c.Name == name {
-				if hit >= 0 {
-					return -1 // duplicate
-				}
-				hit = i + offset
-			}
-		}
-		return hit
-	}
+	findUnique := findUniqueColumnIndex
 
 	rebind := func(e Expr, leftSide bool) {
 		cr, ok := e.(*ColumnRef)

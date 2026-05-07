@@ -492,6 +492,14 @@ type Project struct {
 	Child   Node
 	Targets []Expr
 	schema  Schema
+	// IsolatedScope is set on Projects that wrap an isolated
+	// subquery scope (e.g. M0063-0001's view-rename wrapping).
+	// applyJoinTreePosMap / remapPosMapAfterRewrite skip the
+	// Child when this is true; only the Targets are
+	// outer-scope (and even then their ColumnRefs are inner-
+	// indexed-then-outer-relabeled, so they should not be
+	// remapped by the outer FROM-bindings posMap).
+	IsolatedScope bool
 }
 
 func (n *Project) Pos() int       { return n.pos }

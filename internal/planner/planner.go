@@ -821,7 +821,36 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 			schema[i] = SchemaColumn{Name: c.Name, Type: innerSchema[i].Type}
 		}
 		ctx.schema = schema
-		return inner, b, nil
+		// M0063-0001: wrap the inner plan in a Project that
+		// re-aliases columns to the view's catalog names. Without
+		// this rename, `inner.Output()` continues to expose the
+		// view body's target-list names (e.g. `l_suppkey`,
+		// `sum`), but the OUTER scope resolves columns against
+		// the view's catalog Table (`supplier_no`,
+		// `total_revenue`). Downstream re-resolution passes
+		// (M0063-0001's NLI Key Name re-bind, `reresolveJoinByName`,
+		// etc.) need `inner.Output()` to advertise the same names
+		// the outer scope resolved against — otherwise the
+		// re-bind fails to match and the original (incorrect)
+		// FROM-cumulative Index is left in place. Q15b's NLI
+		// of supplier-on-revenue0 was the canonical breakage.
+		targets := make([]Expr, len(tbl.Columns))
+		for i, c := range tbl.Columns {
+			targets[i] = &ColumnRef{
+				pos:   rv.Pos(),
+				Index: i,
+				Name:  c.Name,
+				Type:  innerSchema[i].Type,
+			}
+		}
+		renamed := &Project{
+			pos:           rv.Pos(),
+			Child:         inner,
+			Targets:       targets,
+			schema:        append(Schema(nil), schema...),
+			IsolatedScope: true,
+		}
+		return renamed, b, nil
 	}
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
