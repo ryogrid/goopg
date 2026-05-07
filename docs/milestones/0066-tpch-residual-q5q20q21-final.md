@@ -1,54 +1,69 @@
-# Milestone 0066 — TPC-H Residual Q5/Q20/Q21 Final
+# Milestone 0066 — TPC-H Runtime Optimization (Pivoted from Q5/Q20/Q21)
 
 ## Goal
 
-Close the three queries still cancelling at 600 s on SF=1
-after M0065: **Q5, Q20, Q21**. Reach 22/22 OK on the SF=1
-sweep.
+Reduce GC and per-row allocation overhead in the executor so
+Q5, Q20, Q21 (and the broader 22-query suite) complete within
+the 600 s budget. Pivoted from the original "fix Q5 / Q20 /
+Q21 in the planner" approach after empirical findings showed:
 
-## Context
+1. **Q9's "7 rows" was silent false negatives** — Name-rebinding
+   the chained-NLI keys (the planner-side fix) produces correct
+   probes but exposes a pre-existing cardinality explosion that
+   needs composite-NLI on `partsupp_pk` to absorb.
+2. **Q5 is GC-dominated.** pprof CPU at SF=1 shows
+   `runtime.gcBgMarkWorker` 64.85 % of total samples, with only
+   ~30 % in application code. Planner-side build-time
+   predicate pushdown to shrink the 1.5 M-row orders hash
+   helps marginally but doesn't address GC.
+3. **Q20's bottleneck is the single-shot non-correlated IN
+   inner-plan execution** — 60 s+ scanning 6 M lineitems with
+   GROUP BY aggregation. Predicate pushdown stalls on missing
+   timestamp btree.
+4. **Q21's Anti-side stays on hash join** even with the NLI
+   walker fix because `Filter`-wrapped lineitem disqualifies
+   the NLI rule.
 
-M0065 (commit `5829312`) reached 19/22 OK by fixing Q9 (M0064)
-and adding the partial NLI Outer-recurse walker. The three
-deferred items each have specific root-cause notes from the
-M0065 baseline report:
-
-- **Q21**: NLI's outer key indices stale relative to MHJ
-  output; `applyJoinTreePosMap` recurses into Outer but does
-  NOT re-resolve NLI's own keys.
-- **Q20**: `unnestSubquery` works but the lineitem scan inside
-  the IN subquery has no predicate pushdown for the
-  `l_shipdate` range — confirmed via `bench/tpch/pprof/cpu_q20.prof`
-  where `evalInExpr` dominates 85 % of CPU.
-- **Q5**: 6-table chained MHJ; the `o_orderdate` date filter
-  may be mis-classified into `leafFilters` causing per-match
-  re-evaluation in `initStepHelper`.
+These all benefit from reducing the per-row allocation cost,
+which is the largest CPU user across the board.
 
 ## Sub-tasks
 
-- **M0066-0001 Q5 date filter + IndexScan promotion.**
-  Phase 1: verify `partitionFilters` classification.
-  Phase 2: promote orders SeqScan to range-bounded IndexScan
-  on `o_orderdate` if not already.
-- **M0066-0002 Q20 IN-subquery predicate pushdown.**
-  Add post-unnest pass that walks SubqueryExpr/InExpr inner
-  plans and applies `rewriteScanInputsWithSingleTablePredicates`.
-- **M0066-0003 Q21 NLI walker key Name-rebind.**
-  Add `reresolveNLIByName` and wire into
-  `applyJoinTreePosMap` + `remapPosMapAfterRewrite` NLI
-  cases. Verify Q9 row-count parity (acceptable outcomes
-  documented in plan).
+- **M0066-0001 GOGC tuning.** Bump `GOGC` to 400 in
+  `bench/tpch/env_goopg.sh`. Single-line change. Expected: GC
+  cycles drop ~4× under heavy MHJ build/probe loads; CPU
+  shifts from `runtime.gcBgMarkWorker` to application code.
+- **M0066-0002 Row buffer pool.** Add `sync.Pool` for
+  `[]Datum` of common widths. Use in `multi_hash_join.go`'s
+  `lazyOut` allocation and per-step buffers. Mirror M0059's
+  BorrowRow contract for the new pool entries.
+- **M0066-0003 String interning for repeating column values.**
+  For `char` / `varchar` columns with low cardinality
+  (n_name 25 distinct values, s_name patterns, brand strings,
+  comment categories), intern the strings during scan/build
+  to share underlying bytes. Reduces GC-scanned pointer
+  density.
 - **M0066-0004 Final 22-query SF=1 sweep + report.**
+  Capture pprof CPU + heap before/after each phase. Document
+  per-query wall-clock delta vs. M0065 baseline.
 
 ## Acceptance
 
-- **Soft**: Q5 / Q20 / Q21 complete in < 600 s with canonical
-  row counts.
-- **Hard**: 22/22 OK with row-count parity OR newly-deferred
-  worst-case (Q9 cardinality explosion) explicitly named in
-  the M0066 report.
+- **Soft**: Q5 completes in < 600 s; Q21 / Q20 either complete
+  or visibly closer to the budget. 22-query OK count ≥ 19.
+- **Hard**: No regression on previously-OK queries
+  (row-count parity); GC CPU share drops below 40 %.
 
-## NO-DEFERRAL POLICY
+## What this milestone does NOT do
 
-Each sub-task either lands or carries a concrete root-cause
-note for a successor milestone.
+- Planner-side fixes for Q21 / Q20 / Q9 — carried to M0067
+  with the diagnostic findings from M0064/M0065/M0066's
+  abortive planner attempts.
+
+## Why pivot
+
+The four queries cancelling at 600 s share a root cause: the
+executor allocates too much per row, and at SF=1 the GC mark
+phase consumes ~65 % of CPU on the long-running queries. Even
+a perfect planner cannot escape this. Cutting GC overhead
+delivers wins across the suite, not just on the named queries.

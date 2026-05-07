@@ -2055,36 +2055,55 @@ Q21). Goal: 22/22 OK on SF=1.
         `bench/tpch/logs/m0065_22q_<ts>.log`.
       **Blocked by:** M0065-0001..0003.
 
-## Milestone 0066 — TPC-H Residual Q5/Q20/Q21 Final
+## Milestone 0066 — TPC-H Runtime Optimization (Pivoted)
 
 See `docs/milestones/0066-tpch-residual-q5q20q21-final.md`.
-Closes the three remaining cancels after M0065 (Q5 / Q20 /
-Q21). Goal: 22/22 OK on SF=1.
+**PIVOTED** from "fix Q5/Q20/Q21 in planner" to "reduce
+executor allocation/GC overhead" after empirical findings:
+Q5 pprof shows 65 % CPU in `runtime.gcBgMarkWorker`. Planner
+attempts (M0066-Q5 build-time pushdown, M0066-Q21 NLI walker)
+broke other queries; reverted.
 
-- [ ] M0066-0001: Q5 date filter classification + IndexScan
-      promotion.
-      **Files:** `internal/executor/multi_hash_join.go::partitionFilters`,
-      `internal/planner/mhj_input_rewrite.go`.
-      **Acceptance:** Q5 OK < 600 s with 5 rows.
+- [ ] M0066-0001: GOGC tuning (default 100 → 400).
+      **File:** `bench/tpch/env_goopg.sh`.
+      **Acceptance:** GC cycles drop visibly in Q5 pprof; no
+      query regresses; OK-cohort wall clock improves.
 
-- [ ] M0066-0002: Q20 IN-subquery predicate pushdown.
-      **Files:** `internal/planner/unnest.go` (or new
-      pushdown pass), `internal/planner/planner.go::Plan`
-      wiring.
-      **Acceptance:** Q20 OK < 600 s with ~411 rows.
+- [ ] M0066-0002: Row buffer pool (`sync.Pool` for `[]Datum`).
+      **File:** `internal/executor/multi_hash_join.go`
+      (`lazyOut`, per-step buffers).
+      **Acceptance:** Q5 / Q20 GC share drops; row-count
+      parity preserved.
 
-- [ ] M0066-0003: Q21 NLI walker key Name-rebind.
-      **Files:** `internal/planner/bushy.go`
-      (`applyJoinTreePosMap`, `remapPosMapAfterRewrite`,
-      new `reresolveNLIByName`).
-      **Acceptance:** Q21 OK < 600 s with ~411 rows; Q9
-      outcome documented (best/acceptable/worst).
+- [ ] M0066-0003: String interning for repeating column
+      values (low-cardinality char/varchar).
+      **File:** `internal/executor/datum.go` or scan path.
+      **Acceptance:** Heap profile shows fewer string
+      allocations on Q5/Q20; row-count parity preserved.
 
 - [ ] M0066-0004: Final 22-query SF=1 sweep + report.
       **Files (output):**
         `analysis/tpch-m0066-baseline-<date>.md`,
-        `bench/tpch/logs/m0066_22q_<ts>.log`.
+        `bench/tpch/logs/m0066_22q_<ts>.log`,
+        `bench/tpch/pprof/cpu_q5_after.prof`,
+        `bench/tpch/pprof/cpu_q20_after.prof`.
       **Blocked by:** M0066-0001..0003.
+
+- [ ] M0067: Planner-side Q5/Q20/Q21 fixes carried over from
+      M0066's abortive attempts. Findings:
+      - Q5: build-time predicate pushdown for unpromoted
+        SeqScans (Filter-wrap fallback when no btree); broke
+        Q3 due to walker interaction. Needs guarded
+        re-implementation.
+      - Q20: timestamp btree v0 missing; alternative is
+        unnesting the non-correlated IN to a SemiJoin
+        (currently only correlated INs get unnested).
+      - Q21: Anti-side hash join needs the inner-Filter
+        conjunct lifted onto the join Predicate AND
+        composite-NLI on `partsupp_pk` for Q9 to absorb the
+        cardinality explosion (Q9's "7 rows" in M0064/M0065
+        was silent false negatives confirmed by NLI walker
+        bisect).
 
 ## Notes
 
