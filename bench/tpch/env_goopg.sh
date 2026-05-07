@@ -74,11 +74,12 @@ mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
 # Override with `GOMEMLIMIT=20GiB` for hosts with ≥ 64 GB RAM.
 export GOMEMLIMIT=${GOMEMLIMIT:-12GiB}
 
-# M0066-0001: GOGC bumped from default 100 (= GC after heap doubles)
-# to 400 (= GC after 5× growth) so the MHJ build / probe phase on
-# Q5/Q9/Q20 doesn't burn 65 % of CPU in `runtime.gcBgMarkWorker`
-# (per `bench/tpch/pprof/cpu_q5.prof`). GOMEMLIMIT remains the
-# absolute cap so the runtime falls back to a soft limit when the
-# heap approaches it. Override with `GOGC=100` for memory-tight
-# hosts.
-export GOGC=${GOGC:-400}
+# M0066-0001: GOGC=off disables proactive growth-triggered GC; the
+# runtime only collects when heap approaches GOMEMLIMIT. For TPC-H
+# SF=1 the MHJ build phase allocates ~3-4 GiB transiently — well
+# below the 12 GiB cap — so GC effectively never runs during the
+# query. Pre-pivot pprof at GOGC=100 showed 65 % of CPU in
+# `runtime.gcBgMarkWorker`; at GOGC=400 still 55 %; GOGC=off
+# trades memory headroom for raw throughput. Override with
+# `GOGC=100` for memory-tight hosts.
+export GOGC=${GOGC:-off}
