@@ -60,6 +60,57 @@ func newNumeric(b *big.Int, scale int) Datum {
 	return Datum{Kind: KindNumeric, NumericBig: bb, NumericScale: int16(scale)}
 }
 
+// parseNumericFast attempts an int64-only fast path for the
+// overwhelmingly common case where the textual NUMERIC literal is a
+// plain decimal integer with no fraction, no exponent, and a value
+// fitting in 18 decimal digits (always int64-safe). Returns
+// (mantissa, scale=0, true) on success; (0, 0, false) when the input
+// requires the *big.Int slow path. (M0058-0003.)
+//
+// HammerDB's TPC-H schema declares all integer columns as NUMERIC,
+// so the typical lineitem row has 16 NUMERIC columns whose textual
+// payload is a small integer. The slow-path big.Int allocation
+// (~100 bytes + GC pressure) used to dominate SeqScan cost (~400 ns
+// per column).  This helper avoids the allocation entirely when the
+// digit count is in the int64 range.
+func parseNumericFast(text string) (int64, int16, bool) {
+	s := text
+	if len(s) == 0 {
+		return 0, 0, false
+	}
+	// Strip a single leading sign.
+	neg := false
+	switch s[0] {
+	case '+':
+		s = s[1:]
+	case '-':
+		neg = true
+		s = s[1:]
+	}
+	if len(s) == 0 || len(s) > 18 {
+		// Empty after sign, or more than 18 digits — uncertain int64
+		// fit. Fall back to slow path. (math.MinInt64 is 19 digits
+		// but we only accept 18-digit positive magnitudes; this loses
+		// a sliver of fast-path coverage in exchange for a branch-free
+		// loop.)
+		return 0, 0, false
+	}
+	var v int64
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			// Decimal point, exponent, leading whitespace etc. all
+			// fail the fast path.
+			return 0, 0, false
+		}
+		v = v*10 + int64(c-'0')
+	}
+	if neg {
+		v = -v
+	}
+	return v, 0, true
+}
+
 // parseNumeric parses a SQL NUMERIC literal — `123`, `123.45`,
 // `-1.5`, `1.5e3`, `1.5e-2` — into a (mantissa *big.Int, scale)
 // pair. Scale is non-negative; positive exponents shift digits out
@@ -70,6 +121,8 @@ func newNumeric(b *big.Int, scale int) Datum {
 // arbitrary precision — the carrier is *big.Int. The returned
 // mantissa fits in int64 for the common case (callers go via
 // newNumeric to land on the fast path).
+//
+// Hot callers should try parseNumericFast first (M0058-0003).
 func parseNumeric(text string) (*big.Int, int16, error) {
 	s := strings.TrimSpace(text)
 	if s == "" {

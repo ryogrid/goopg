@@ -704,9 +704,58 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 		if err != nil {
 			return nil, nil, err
 		}
+		joinType := mapJoinType(j.Type)
+		// M0063-0005: for LEFT JOIN, partition the ON conjuncts.
+		// Single-inner-side conjuncts (referencing only the right
+		// range-var's columns) move to a Filter wrapping the
+		// inner plan BEFORE the join, so the join's residual
+		// Predicate can decompose into a clean equi-pair and the
+		// hash path can fire. The classic Q13 shape:
+		//   `customer LEFT JOIN orders ON c_custkey = o_custkey
+		//      AND o_comment NOT LIKE '%special%requests%'`
+		// previously fell through to a Nested Loop because the
+		// AND-chain didn't split as a single equality. Pushing
+		// the inner-only NOT-LIKE before the join leaves a clean
+		// equi-pair on `c_custkey = o_custkey` that
+		// `splitEqualityForHash` accepts. Outer-only conjuncts
+		// CANNOT move (LEFT JOIN preserves unmatched outer
+		// rows); they stay in the join Predicate.
+		if joinType == JoinTypeLeft && pred != nil {
+			leftWidth := len(leftCtx.schema)
+			totalWidth := leftWidth + len(rightNode.Output())
+			conjuncts := splitAnd(pred)
+			var keep []Expr
+			var innerOnly []Expr
+			for _, c := range conjuncts {
+				switch classifyConjunctSide(c, leftWidth, totalWidth) {
+				case sideRight:
+					innerOnly = append(innerOnly, c)
+				default:
+					keep = append(keep, c)
+				}
+			}
+			if len(innerOnly) > 0 {
+				// Inner-only conjuncts were resolved against the
+				// merged outer schema; their ColumnRef.Index values
+				// reference the inner range-var at outer-cumulative
+				// offset `leftWidth`. Now that they evaluate against
+				// the inner-only row, shift each ColumnRef.Index by
+				// `-leftWidth` so it points into the inner schema.
+				shifted := make([]Expr, len(innerOnly))
+				for i, c := range innerOnly {
+					shifted[i] = shiftColumnRefsBy(c, -leftWidth)
+				}
+				rightNode = &Filter{
+					pos:       j.Pos(),
+					Child:     rightNode,
+					Predicate: combineAnd(shifted),
+				}
+			}
+			pred = combineAnd(keep)
+		}
 		jn := &Join{
 			pos:       j.Pos(),
-			Type:      mapJoinType(j.Type),
+			Type:      joinType,
 			Left:      leftNode,
 			Right:     rightNode,
 			Predicate: pred,
@@ -821,7 +870,36 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 			schema[i] = SchemaColumn{Name: c.Name, Type: innerSchema[i].Type}
 		}
 		ctx.schema = schema
-		return inner, b, nil
+		// M0063-0001: wrap the inner plan in a Project that
+		// re-aliases columns to the view's catalog names. Without
+		// this rename, `inner.Output()` continues to expose the
+		// view body's target-list names (e.g. `l_suppkey`,
+		// `sum`), but the OUTER scope resolves columns against
+		// the view's catalog Table (`supplier_no`,
+		// `total_revenue`). Downstream re-resolution passes
+		// (M0063-0001's NLI Key Name re-bind, `reresolveJoinByName`,
+		// etc.) need `inner.Output()` to advertise the same names
+		// the outer scope resolved against — otherwise the
+		// re-bind fails to match and the original (incorrect)
+		// FROM-cumulative Index is left in place. Q15b's NLI
+		// of supplier-on-revenue0 was the canonical breakage.
+		targets := make([]Expr, len(tbl.Columns))
+		for i, c := range tbl.Columns {
+			targets[i] = &ColumnRef{
+				pos:   rv.Pos(),
+				Index: i,
+				Name:  c.Name,
+				Type:  innerSchema[i].Type,
+			}
+		}
+		renamed := &Project{
+			pos:           rv.Pos(),
+			Child:         inner,
+			Targets:       targets,
+			schema:        append(Schema(nil), schema...),
+			IsolatedScope: true,
+		}
+		return renamed, b, nil
 	}
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
@@ -870,15 +948,22 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeB
 		return nil, rangeBinding{}, err
 	}
 	innerSchema := inner.Output()
+	// Use explicit column-alias list when provided: (SELECT …) AS t (c1, c2).
+	// This overrides the target-list aliases from the inner SELECT.
 	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
 	schema := make(Schema, 0, len(rv.Subquery.Targets))
 	for i, tgt := range rv.Subquery.Targets {
-		name := tgt.Alias
-		if name == "" {
-			name = deriveSubqueryTargetName(tgt.Expr)
-		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+		var name string
+		if i < len(rv.Columns) && rv.Columns[i] != "" {
+			name = rv.Columns[i] // explicit column alias from (SELECT …) AS t (col_alias)
+		} else {
+			name = tgt.Alias
+			if name == "" {
+				name = deriveSubqueryTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", i+1)
+			}
 		}
 		var typ catalog.Type
 		if i < len(innerSchema) {
@@ -2741,7 +2826,7 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	if err != nil {
 		return nil, err
 	}
-	return &SubqueryExpr{pos: x.Pos(), Plan: inner}, nil
+	return &SubqueryExpr{pos: x.Pos(), Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
 }
 
 // planInExpr resolves the operand and either plans the inner
@@ -2763,6 +2848,7 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		out.Plan = inner
+		out.IsNonCorrelated = !planHasOuterRef(inner)
 	} else {
 		out.List = make([]Expr, len(x.List))
 		for i, e := range x.List {
@@ -2787,7 +2873,47 @@ func planExistsExpr(x *parser.ExistsExpr, parent *resolveContext) (Expr, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner}, nil
+	return &ExistsExpr{pos: x.Pos(), Negated: x.Negated, Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+}
+
+// planHasOuterRef reports whether any expression anywhere in the
+// plan tree is an OuterColumnRef. It descends into nested
+// SubqueryExpr/InExpr/ExistsExpr so that a level-2 OuterColumnRef
+// inside a nested subquery is not mistaken for non-correlated at
+// the outer level.
+//
+// Used by M0058-0001: a subquery with no OuterColumnRef yields the
+// same result for every outer row, so the executor SubqueryCache
+// can use a constant key instead of one keyed on the full outer row.
+func planHasOuterRef(node Node) bool {
+	found := false
+	walkPlanExprs(node, func(e Expr) {
+		if found {
+			return
+		}
+		walkExprTree(e, func(inner Expr) {
+			if found {
+				return
+			}
+			switch x := inner.(type) {
+			case *OuterColumnRef:
+				found = true
+			case *SubqueryExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			case *InExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			case *ExistsExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			}
+		})
+	})
+	return found
 }
 
 // planSelectWithParent plans an inner SELECT with the supplied
@@ -3144,4 +3270,54 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		return filter
 	}
 	return ios
+}
+
+// shiftColumnRefsBy walks an expression tree and adds `delta` to
+// every ColumnRef's Index. OuterColumnRefs are left alone (they
+// reference an enclosing scope). Used by M0063-0005 to translate
+// outer-cumulative-indexed conjuncts back to inner-scope when
+// they're pushed below a LEFT JOIN.
+func shiftColumnRefsBy(e Expr, delta int) Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		cl := *x
+		cl.Index += delta
+		return &cl
+	case *BinaryOp:
+		return &BinaryOp{
+			pos:   x.Pos(),
+			Op:    x.Op,
+			Left:  shiftColumnRefsBy(x.Left, delta),
+			Right: shiftColumnRefsBy(x.Right, delta),
+		}
+	case *UnaryOp:
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftColumnRefsBy(x.Operand, delta)}
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = shiftColumnRefsBy(a, delta)
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+	case *CaseExpr:
+		whens := make([]CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			whens[i] = CaseWhen{
+				When: shiftColumnRefsBy(w.When, delta),
+				Then: shiftColumnRefsBy(w.Then, delta),
+			}
+		}
+		return &CaseExpr{
+			pos:     x.Pos(),
+			Operand: shiftColumnRefsBy(x.Operand, delta),
+			Whens:   whens,
+			Else:    shiftColumnRefsBy(x.Else, delta),
+		}
+	case *ExtractExpr:
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: shiftColumnRefsBy(x.Source, delta)}
+	default:
+		return e
+	}
 }

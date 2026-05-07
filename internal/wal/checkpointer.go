@@ -271,6 +271,13 @@ func (c *Checkpointer) CheckpointNow() error {
 // spent in flushDirty, matching upstream's checkpointer view.
 func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	start := time.Now()
+	checkpointType := "requested"
+	if spread {
+		checkpointType = "scheduled"
+	}
+	// M0057-0001: log checkpoint start so benchmark runs can confirm
+	// whether the checkpointer fires mid-measurement.
+	c.cfg.Logger.Info("checkpoint start", "type", checkpointType)
 	pacer := c.buildPacer(ctx, spread, start)
 
 	flushStart := time.Now()
@@ -308,6 +315,12 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 			c.cfg.Logger.Warn("wal retention failed", "err", err)
 		}
 	}
+	// M0057-0001: log checkpoint complete so benchmark runs can see
+	// when the checkpointer finishes and whether it was mid-benchmark.
+	c.cfg.Logger.Info("checkpoint complete",
+		"type", checkpointType,
+		"lsn", endLSN,
+		"elapsed_ms", time.Since(start).Milliseconds())
 	return nil
 }
 

@@ -46,6 +46,56 @@ When performing cleanup, refactoring, or restructuring tasks:
 - Ralph loop state consistency (every loop): run `make ralph-state-guard` immediately before the final status block
 - Include executed gates in the status RECOMMENDATION line (for auditability)
 
+## 🔬 PostgreSQL Oracle Test Porting
+
+`docs/test-port/postgres-oracle-port-status.csv` is the authoritative source for which
+upstream tests must pass, are deferred, or are excluded by policy.
+
+### Status meanings
+
+| status | pass_required | meaning |
+|--------|--------------|---------|
+| `port` | yes | Ported to Go; must always pass. Run on every relevant change. |
+| `defer` | no | In scope, not yet pass-required. Promote to `port` when the prerequisite lands. |
+| `excluded` | no | Out of scope by policy. Do not port. |
+
+### Running oracle tests (NOT part of `go test ./...`)
+
+Ported tests are slow and invoke external client binaries. Never run them as
+part of the default suite. Run explicitly:
+
+```bash
+go test -v -run TestPort_ ./internal/testport/        # all ported TAP tests
+go test -v -run TestPort_Psql001Basic ./internal/testport/  # one specific test
+```
+
+### When to port a deferred test
+
+When you implement a feature or fix that satisfies a `defer` entry's stated
+blocker, you MUST in the same loop:
+
+1. Port the test to Go in `internal/testport/` (or the relevant subsystem test file).
+2. Update `docs/test-port/postgres-oracle-port-status.csv`:
+   - `status` → `port`, `pass_required` → `yes`
+   - Fill in the `rationale` with the Go test function name, clear the `deferred_to` field.
+3. Regenerate `docs/test-port/postgres-oracle-port-status.md` via `go run ./cmd/gen-oracle-port-status`.
+4. Verify the ported test passes: `go test -v -run <TestFuncName> ./internal/testport/`.
+
+### Deferred suite unlock conditions
+
+| id | upstream path | prerequisite before porting |
+|----|--------------|----------------------------|
+| D-001 | `postgres/src/test/regress` | pg_regress-compatible runner + output normalization (M0060-0002) |
+| D-002 | `postgres/src/test/isolation` | deterministic multi-session scheduler + expected-schedule comparator (M0060-0004) |
+| D-003 | `postgres/src/test/recovery` | replication / failover capability (M0060-0005) |
+| D-004 | `postgres/src/test/subscription` | logical replication capability (M0060-0005) |
+| D-005 | `postgres/src/bin/scripts/t` | broader SQL / catalog parity (M0060-0003) |
+| D-006 | `postgres/src/test/modules` | extension framework (M0060-0005) |
+| D-007 | `postgres/contrib` | extension framework (M0060-0005) |
+
+The target inventory (test counts per suite) is in
+`docs/test-port/postgres-oracle-target-inventory.csv`.
+
 ## Execution Guidelines
 - Before making changes: search codebase using subagents
 - After implementation: run ESSENTIAL tests for the modified code only

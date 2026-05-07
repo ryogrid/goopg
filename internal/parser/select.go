@@ -453,6 +453,25 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		if rv.Alias == "" {
 			return RangeVar{}, &SyntaxError{Pos: pos, Message: "subquery in FROM must have an alias"}
 		}
+		// Optional column-alias list: (SELECT …) AS t (col1, col2, …)
+		// Used by Q13-style derived tables that rename columns.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume (
+			for {
+				t, err := p.parseIdent()
+				if err != nil {
+					return RangeVar{}, err
+				}
+				rv.Columns = append(rv.Columns, identText(t))
+				if p.acceptSymbol(",") {
+					continue
+				}
+				break
+			}
+			if !p.acceptSymbol(")") {
+				return RangeVar{}, p.errAtCur("expected ')' after column alias list")
+			}
+		}
 		return rv, nil
 	}
 	obj, err := p.parseObjectName()

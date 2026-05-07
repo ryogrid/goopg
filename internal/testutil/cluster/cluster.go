@@ -213,6 +213,23 @@ func (c *Cluster) Stop(mode ShutdownMode) error {
 	return nil
 }
 
+// Kill sends SIGKILL to the goopg server process unconditionally
+// (simulates an OOM kill or `kill -9`). Use for crash-recovery tests.
+// The process is gone immediately; data directory is left as-is for
+// WAL replay on the next Start().
+func (c *Cluster) Kill() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil || c.cmd.Process == nil {
+		return errors.New("cluster not running")
+	}
+	if err := c.cmd.Process.Kill(); err != nil {
+		return fmt.Errorf("kill: %w", err)
+	}
+	c.cmd = nil
+	return nil
+}
+
 // Restart performs stop+start.
 func (c *Cluster) Restart(mode ShutdownMode) error {
 	if err := c.Stop(mode); err != nil {
@@ -396,6 +413,29 @@ func (c *Cluster) Query(ctx context.Context, sqlText string) ([][]string, error)
 		return nil, err
 	}
 	return out, nil
+}
+
+// RunClientTool runs a PostgreSQL client tool (createdb, dropdb, vacuumdb,
+// reindexdb, clusterdb, createuser, dropuser, pg_isready, etc.) with
+// -h/-p/-U connection flags pre-filled from this cluster's listen address
+// and user.  The named binary must be on PATH.
+func (c *Cluster) RunClientTool(name string, args ...string) (util.CommandResult, error) {
+	if _, err := exec.LookPath(name); err != nil {
+		return util.CommandResult{ExitCode: -1}, fmt.Errorf("%s not found in PATH: %w", name, err)
+	}
+	host, port, err := splitHostPort(c.listenAddr)
+	if err != nil {
+		return util.CommandResult{}, err
+	}
+	base := []string{"-h", host, "-p", port, "-U", c.user}
+	base = append(base, args...)
+	return util.RunCommand(util.CommandSpec{
+		Name:    name,
+		Args:    base,
+		Dir:     c.repoRoot,
+		Env:     []string{"PGPASSWORD="},
+		Timeout: 60 * time.Second,
+	})
 }
 
 // AppendPostgresqlConf appends one line to postgresql.conf.

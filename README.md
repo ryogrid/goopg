@@ -108,3 +108,19 @@ rm -rf ./tmp/goopg-data
 
 `goopg start` exits when it receives `SIGINT` / `SIGTERM` or when
 `goopg stop -D <datadir>` requests a shutdown over the control socket.
+
+## Active Development Milestones
+
+| Milestone | Title | Status |
+|-----------|-------|--------|
+| 0053 | HammerDB TPC-H complete-run verification | landed |
+| 0054 | TPC-H performance and optimisation | in progress |
+| 0055 | Staged B-tree enhancement program | largely landed |
+| 0056 | Buffer-pool PinNew race fix + splitMu removal | in progress |
+| **0057** | **TPC-H measurement prerequisites** | **planned** |
+
+Milestone 0057 addresses the benchmark infrastructure prerequisites —
+background-worker visibility, checkpoint suppression, crash recovery,
+and per-query cancellation — needed for reliable M0054-0007 runs.
+See `docs/milestones/0057-tpch-measurement-prerequisites.md` for the
+full plan and `cmd/tpch-runner/README.md` for the query-runner tool.

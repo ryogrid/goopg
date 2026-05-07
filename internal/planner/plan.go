@@ -103,12 +103,18 @@ func (*ExtractExpr) exprNode()  {}
 // resolution. Either Plan or List is non-nil. v0 supports the
 // uncorrelated form only — the executor evaluates the inner
 // once, builds a set, then probes per outer row.
+//
+// IsNonCorrelated is true when the inner Plan contains zero
+// OuterColumnRef nodes; the executor uses a constant cache
+// key in that case so the SubPlan executes only once across
+// all outer rows. (M0058-0001.)
 type InExpr struct {
-	pos     int
-	Operand Expr
-	Negated bool
-	Plan    Node // populated when the source is a subquery
-	List    []Expr
+	pos             int
+	Operand         Expr
+	Negated         bool
+	Plan            Node // populated when the source is a subquery
+	List            []Expr
+	IsNonCorrelated bool
 }
 
 func (e *InExpr) Pos() int { return e.pos }
@@ -117,10 +123,14 @@ func (*InExpr) exprNode()  {}
 // ExistsExpr mirrors parser.ExistsExpr. The executor opens the
 // inner plan, asks for one row, and reports the bool. NOT
 // EXISTS is the same path with the result negated.
+//
+// IsNonCorrelated is true when Plan contains zero
+// OuterColumnRef nodes — see InExpr for the cache implication.
 type ExistsExpr struct {
-	pos     int
-	Negated bool
-	Plan    Node
+	pos             int
+	Negated         bool
+	Plan            Node
+	IsNonCorrelated bool
 }
 
 func (e *ExistsExpr) Pos() int { return e.pos }
@@ -131,9 +141,13 @@ func (*ExistsExpr) exprNode()  {}
 // closes Plan once at evaluation time and returns the single
 // cell as the expression's value. Multi-row / multi-column
 // subqueries trigger a runtime error.
+//
+// IsNonCorrelated is true when Plan contains zero
+// OuterColumnRef nodes — see InExpr for the cache implication.
 type SubqueryExpr struct {
-	pos  int
-	Plan Node
+	pos             int
+	Plan            Node
+	IsNonCorrelated bool
 }
 
 func (e *SubqueryExpr) Pos() int { return e.pos }
@@ -277,6 +291,11 @@ func (n *SeqScan) Output() Schema { return n.schema }
 type IndexScan struct {
 	pos     int
 	Table   *catalog.Table
+	Alias   string // FROM-clause alias; empty when not specified. M0062-0002
+	// preserves the alias when an `IndexScan` is substituted for a
+	// `SeqScan` (e.g. by `mhj_input_rewrite`); without it,
+	// `buildBindingsPosMap` cannot disambiguate self-joins like Q8's
+	// `nation n1, nation n2` after one side flips to IndexScan.
 	Index   *catalog.Index
 	Key     Expr  // non-nil for single-column equality scan (LowKey==HighKey implied)
 	Keys    []Expr // M0054-0006-followup-Q9-composite: multi-column equality probe.
@@ -348,6 +367,14 @@ const (
 	JoinTypeRight
 	JoinTypeFull
 	JoinTypeCross
+	// JoinTypeSemi emits each left (probe) row exactly once if it
+	// has at least one match on the right (build). Output schema is
+	// the left side only. Produced by EXISTS-unnesting (M0061-0001).
+	JoinTypeSemi
+	// JoinTypeAnti emits each left (probe) row exactly once if it
+	// has NO match on the right (build). Output schema is the left
+	// side only. Produced by NOT-EXISTS-unnesting (M0061-0001).
+	JoinTypeAnti
 )
 
 // JoinAlgo is the physical algorithm the executor uses for a Join.
@@ -465,6 +492,14 @@ type Project struct {
 	Child   Node
 	Targets []Expr
 	schema  Schema
+	// IsolatedScope is set on Projects that wrap an isolated
+	// subquery scope (e.g. M0063-0001's view-rename wrapping).
+	// applyJoinTreePosMap / remapPosMapAfterRewrite skip the
+	// Child when this is true; only the Targets are
+	// outer-scope (and even then their ColumnRefs are inner-
+	// indexed-then-outer-relabeled, so they should not be
+	// remapped by the outer FROM-bindings posMap).
+	IsolatedScope bool
 }
 
 func (n *Project) Pos() int       { return n.pos }

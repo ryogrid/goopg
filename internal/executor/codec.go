@@ -329,6 +329,13 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated numeric body")
 		}
 		text := string(data[4 : 4+n])
+		// M0058-0003: int64 fast path for integer-valued NUMERIC.
+		// HammerDB's TPC-H schema stores all integer columns as
+		// NUMERIC; the fast path avoids ~400 ns of big.Int allocation
+		// per column on every row decoded.
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, NumericMantissa: v, NumericScale: scale}, 4 + n, nil
+		}
 		m, s, err := parseNumeric(text)
 		if err != nil {
 			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)

@@ -87,12 +87,26 @@ func Build(plan planner.Node) (Operator, error) {
 		}
 		// Inner is always an *IndexScan by plan-node contract.
 		innerScan := newIndexScanOp(p.Inner)
+		// M0059-0002: NLI consumes one outer row at a time, copies
+		// it into o.joinBuf, then runs the inner Rescan. The outer
+		// row is released before the next pull, so it is safe to
+		// receive borrowed rows from the outer side. The inner is
+		// an *IndexScan that pre-materialises into o.rows[] at
+		// Open() — borrow is a no-op there.
+		setChildBorrow(outer, BorrowedRow)
 		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
 	case *planner.Aggregate:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
+		// M0059-0002: aggregateOp.Open's drain loop consumes each
+		// child row, extracts value-typed Datums into aggRuntime
+		// fields and into a fresh groupValues Row, then releases
+		// the source row before pulling the next. Datums hold
+		// independent string allocations from the scan decode
+		// path, so borrowed input is safe.
+		setChildBorrow(child, BorrowedRow)
 		return maybeInstrument(p, newAggregateOp(p, child)), nil
 	case *planner.WindowAgg:
 		child, err := Build(p.Child)

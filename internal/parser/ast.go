@@ -213,7 +213,8 @@ type RangeVar struct {
 	pos      int
 	Schema   string
 	Name     string
-	Alias    string // empty when no AS clause
+	Alias    string   // empty when no AS clause
+	Columns  []string // optional column-alias list: (SELECT …) AS t (c1, c2)
 	Subquery *SelectStmt
 }
 

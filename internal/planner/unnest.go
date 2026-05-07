@@ -44,6 +44,25 @@ func unnestSubqueriesInPlan(node Node) Node {
 				return newOuter
 			}
 		}
+		// M0061-0001: EXISTS / NOT EXISTS → semi-join / anti-join.
+		// Same shape as the IN loop above; runs after IN-unnesting so
+		// any IN inside an EXISTS subquery has already been pulled up.
+		for {
+			ex := findExistsExprInExpr(n.Predicate)
+			if ex == nil {
+				break
+			}
+			newOuter, err := unnestExistsExpr(ex, node)
+			if err != nil || newOuter == nil {
+				break
+			}
+			node = newOuter
+			if f, ok := newOuter.(*Filter); ok {
+				n = f
+			} else {
+				return newOuter
+			}
+		}
 		// M0040-0004: walk remaining SubqueryExpr/InExpr inner plans
 		// even when those expressions cannot be pulled up to this level
 		// (e.g. Q20's lineitem scalar subquery inside the partsupp IN
@@ -78,6 +97,8 @@ func walkSubqueryPlansInExpr(e Expr) Expr {
 	case *SubqueryExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *InExpr:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *ExistsExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *BinaryOp:
 		x.Left = walkSubqueryPlansInExpr(x.Left)
@@ -903,11 +924,28 @@ func findInExprInExpr(e Expr) *InExpr {
 }
 
 // canUnnestInExpr checks whether an IN (subquery) is a candidate
-// for unnesting into a semi-join.  The inner plan must be a
-// simple SELECT col FROM table WHERE col = outer_ref (no
-// aggregate, no GROUP BY).  All OuterColumnRef nodes must
-// participate in equijoin pairs.
+// for unnesting into a semi-join.  The inner plan must have a
+// correlation predicate of the shape `inner_col = outer_ref`
+// (every OuterColumnRef participates in an equijoin pair).
+//
+// M0062-0004: nested IN subqueries are accepted **iff** every
+// nested IN is itself unnestable. This unblocks Q20 (depth-2 IN
+// chain). The recursion cap prevents pathological nesting.
 func canUnnestInExpr(in *InExpr) bool {
+	return canUnnestInExprDepth(in, 0)
+}
+
+// canUnnestInExprDepth is the recursive worker for
+// canUnnestInExpr. The depth cap is intentionally low: real TPC-H
+// queries don't nest beyond 2 levels, and an unbounded recursion
+// would let a hostile or pathologically nested predicate run a
+// quadratic walkPlanExprs scan per level.
+const maxNestedInUnnestDepth = 4
+
+func canUnnestInExprDepth(in *InExpr, depth int) bool {
+	if depth > maxNestedInUnnestDepth {
+		return false
+	}
 	plan := in.Plan
 	if plan == nil {
 		return false
@@ -918,15 +956,21 @@ func canUnnestInExpr(in *InExpr) bool {
 	if params == nil || len(params) == 0 {
 		return false
 	}
-	// Reject nested IN subqueries inside the IN-subquery — those
-	// need their own unnest pass first.
-	var hasNestedIn bool
+	// M0062-0004: nested IN subqueries are now accepted *if* each
+	// is itself unnestable. The pre-fix blanket reject blocked
+	// Q20's depth-2 IN. The recursive `unnestSubqueriesInPlan`
+	// call inside `unnestInExpr` (at the inner-plan-clone step)
+	// will lift the inner IN up first; this gate just admits the
+	// outer.
+	allNestedUnnestable := true
 	walkPlanExprs(plan, func(e Expr) {
 		if in2, ok := e.(*InExpr); ok && in2.Plan != nil {
-			hasNestedIn = true
+			if !canUnnestInExprDepth(in2, depth+1) {
+				allNestedUnnestable = false
+			}
 		}
 	})
-	if hasNestedIn {
+	if !allNestedUnnestable {
 		return false
 	}
 	return true
@@ -1098,4 +1142,621 @@ func findExprInExpr(e Expr, match func(Expr) bool) Expr {
 		}
 	}
 	return nil
+}
+
+// --- M0061-0001: EXISTS / NOT EXISTS → semi-join / anti-join ---
+
+// findExistsExprInExpr walks an expression tree looking for an
+// ExistsExpr that lives at a top-level conjunct position. Like the
+// IN-unnesting pass we reuse the structural walker; the
+// canUnnestExistsExpr gate then checks that the EXISTS conjunct can
+// be safely lifted (correlated equijoin only).
+func findExistsExprInExpr(e Expr) *ExistsExpr {
+	if e == nil {
+		return nil
+	}
+	if ex, ok := e.(*ExistsExpr); ok && ex.Plan != nil {
+		return ex
+	}
+	switch x := e.(type) {
+	case *BinaryOp:
+		if s := findExistsExprInExpr(x.Left); s != nil {
+			return s
+		}
+		return findExistsExprInExpr(x.Right)
+	case *UnaryOp:
+		return findExistsExprInExpr(x.Operand)
+	case *FuncCall:
+		for _, a := range x.Args {
+			if s := findExistsExprInExpr(a); s != nil {
+				return s
+			}
+		}
+	case *CaseExpr:
+		if x.Operand != nil {
+			if s := findExistsExprInExpr(x.Operand); s != nil {
+				return s
+			}
+		}
+		for _, w := range x.Whens {
+			if s := findExistsExprInExpr(w.When); s != nil {
+				return s
+			}
+			if s := findExistsExprInExpr(w.Then); s != nil {
+				return s
+			}
+		}
+		if x.Else != nil {
+			return findExistsExprInExpr(x.Else)
+		}
+	case *ExtractExpr:
+		return findExistsExprInExpr(x.Source)
+	}
+	return nil
+}
+
+// liftInnerOnlyFilterConjuncts walks `node` and removes from
+// every Filter's Predicate any top-level conjunct that is NOT
+// a trivial tautology and contains NO OuterColumnRef
+// (assumes stripOuterRefConjuncts has already removed those).
+// The removed conjuncts are returned in caller order so the
+// caller can lift them to a parent join's Predicate. Used by
+// M0063-0004's EXISTS-unnesting tail.
+func liftInnerOnlyFilterConjuncts(node Node) []Expr {
+	if node == nil {
+		return nil
+	}
+	var lifted []Expr
+	switch n := node.(type) {
+	case *Filter:
+		conjs := splitAnd(n.Predicate)
+		out := make([]Expr, 0, len(conjs))
+		for _, c := range conjs {
+			// Tautology check: ColumnRef = ColumnRef same Index/Name.
+			if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+				if l, lok := bin.Left.(*ColumnRef); lok {
+					if r, rok := bin.Right.(*ColumnRef); rok {
+						if l.Index == r.Index && l.Name == r.Name {
+							continue
+						}
+					}
+				}
+			}
+			// BooleanConst(true) → drop.
+			if bc, ok := c.(*BooleanConst); ok && bc.Value {
+				continue
+			}
+			lifted = append(lifted, c)
+		}
+		// Replace inner Filter predicate with `true`.
+		n.Predicate = &BooleanConst{pos: n.pos, Value: true}
+		_ = out
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Project:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Aggregate:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Sort:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Limit:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	}
+	return lifted
+}
+
+// unwrapTrivialWrappers strips Project(Filter(true, x)) /
+// Project(x) wrappers when they don't change the row shape. Used
+// by M0063-0004's EXISTS-unnesting tail to expose a bare
+// *SeqScan to `pickInnerSide` so NLI can fire for the resulting
+// hash Semi / Anti join.
+func unwrapTrivialWrappers(n Node) Node {
+	for {
+		switch x := n.(type) {
+		case *Filter:
+			if bc, ok := x.Predicate.(*BooleanConst); ok && bc.Value {
+				n = x.Child
+				continue
+			}
+			return n
+		case *Project:
+			// Identity Project: Targets are ColumnRef{Index: i}
+			// in order, len matches Child schema, and the
+			// Project carries no IsolatedScope flag.
+			if x.IsolatedScope {
+				return n
+			}
+			child := x.Child
+			if child == nil {
+				return n
+			}
+			if len(x.Targets) != len(child.Output()) {
+				return n
+			}
+			identity := true
+			for i, t := range x.Targets {
+				cr, ok := t.(*ColumnRef)
+				if !ok || cr.Index != i {
+					identity = false
+					break
+				}
+			}
+			if !identity {
+				return n
+			}
+			n = child
+			continue
+		default:
+			return n
+		}
+	}
+}
+
+// stripOuterRefConjuncts walks `node` and removes from every
+// Filter's Predicate any top-level conjunct that still references
+// an OuterColumnRef. Used by `unnestExistsExpr` (M0062-0005)
+// after cloning the inner plan: the residual conjuncts we lifted
+// to the join's Predicate must not also be evaluated by the
+// inner Filter (they reference unbound OuterColumnRefs at the
+// inner plan's scope). Conjuncts that became self-equality
+// tautologies via the equijoin `replace` map are also dropped.
+func stripOuterRefConjuncts(node Node) {
+	if node == nil {
+		return
+	}
+	switch n := node.(type) {
+	case *Filter:
+		conjs := splitAnd(n.Predicate)
+		out := make([]Expr, 0, len(conjs))
+		for _, c := range conjs {
+			hasOuter := false
+			tautology := false
+			walkExprTree(c, func(e Expr) {
+				if _, ok := e.(*OuterColumnRef); ok {
+					hasOuter = true
+				}
+			})
+			if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+				if l, lok := bin.Left.(*ColumnRef); lok {
+					if r, rok := bin.Right.(*ColumnRef); rok {
+						if l.Index == r.Index && l.Name == r.Name {
+							tautology = true
+						}
+					}
+				}
+			}
+			if hasOuter || tautology {
+				continue
+			}
+			out = append(out, c)
+		}
+		if len(out) == 0 {
+			n.Predicate = &BooleanConst{pos: n.pos, Value: true}
+		} else {
+			n.Predicate = combineAnd(out)
+		}
+		stripOuterRefConjuncts(n.Child)
+	case *Project:
+		stripOuterRefConjuncts(n.Child)
+	case *Aggregate:
+		stripOuterRefConjuncts(n.Child)
+	case *Sort:
+		stripOuterRefConjuncts(n.Child)
+	case *Limit:
+		stripOuterRefConjuncts(n.Child)
+	case *Join:
+		stripOuterRefConjuncts(n.Left)
+		stripOuterRefConjuncts(n.Right)
+	}
+}
+
+// existsUnnestPlan describes how an EXISTS subquery's correlation
+// predicate decomposes for unnesting:
+//   - Params: equijoin pairs that become the join's hash key(s).
+//   - Residuals: the original (uncloned) BinaryOp / general
+//     conjunct expressions that reference an OuterColumnRef but
+//     are NOT a pure column-equijoin pair. Examples: `<>`,
+//     range comparisons, function calls. After unnesting these
+//     are lifted onto the join's `Predicate` with both inner
+//     ColumnRefs shifted by `outerWidth` and OuterColumnRefs
+//     rewritten to ColumnRefs at their outer-side index.
+//
+// (M0062-0005.)
+type existsUnnestPlan struct {
+	Params    []unnestParam
+	Residuals []Expr
+}
+
+// collectExistsUnnestParamsAndResiduals splits the inner plan's
+// top-level conjuncts (anywhere a Filter sits) into:
+//   - equijoin params (existing collectUnnestParams logic), and
+//   - non-equi residuals that reference an OuterColumnRef.
+//
+// Returns nil if the plan has any OuterColumnRef that does NOT
+// appear in either bucket — those would still be correlated after
+// the lift, which we cannot handle.
+func collectExistsUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
+	var params []unnestParam
+	var residuals []Expr
+	outerInEquijoin := make(map[*OuterColumnRef]bool)
+	outerInResidual := make(map[*OuterColumnRef]bool)
+
+	// Walk every Filter in the inner plan; only top-level
+	// conjuncts of a Filter's Predicate may be lifted (an
+	// OuterColumnRef nested inside an OR or a function call
+	// can't be cleanly removed from the inner plan).
+	var walkFilters func(Node)
+	walkFilters = func(n Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.(type) {
+		case *Filter:
+			walkFilters(x.Child)
+			for _, c := range splitAnd(x.Predicate) {
+				bin, ok := c.(*BinaryOp)
+				if ok && bin.Op == "=" {
+					outer, col := extractEquijoinPair(bin.Left, bin.Right)
+					if outer != nil && col != nil {
+						params = append(params, unnestParam{OuterRef: outer, SubCol: col})
+						outerInEquijoin[outer] = true
+						continue
+					}
+				}
+				// Non-equijoin conjunct. If it mentions an
+				// OuterColumnRef and ONLY has top-level outer
+				// refs (no OuterColumnRef nested under e.g. a
+				// further OR or CASE), record it as a residual.
+				var refs []*OuterColumnRef
+				outerOK := true
+				walkExprTree(c, func(e Expr) {
+					if oc, ok := e.(*OuterColumnRef); ok {
+						refs = append(refs, oc)
+					}
+				})
+				_ = outerOK
+				if len(refs) > 0 {
+					residuals = append(residuals, c)
+					for _, oc := range refs {
+						outerInResidual[oc] = true
+					}
+				}
+			}
+		case *Project:
+			walkFilters(x.Child)
+		case *Aggregate:
+			walkFilters(x.Child)
+		case *Sort:
+			walkFilters(x.Child)
+		case *Limit:
+			walkFilters(x.Child)
+		case *Join:
+			walkFilters(x.Left)
+			walkFilters(x.Right)
+		}
+	}
+	walkFilters(node)
+
+	// Verify every OuterColumnRef is accounted for.
+	allAccounted := true
+	walkPlanExprs(node, func(e Expr) {
+		if o, ok := e.(*OuterColumnRef); ok {
+			if !outerInEquijoin[o] && !outerInResidual[o] {
+				allAccounted = false
+			}
+		}
+	})
+	if !allAccounted {
+		return nil
+	}
+	return &existsUnnestPlan{Params: params, Residuals: residuals}
+}
+
+// canUnnestExistsExpr accepts a correlated EXISTS subquery whose
+// correlation predicate can be split into equijoin keys plus
+// liftable non-equijoin residuals. M0062-0005 added the residual
+// path to handle Q21's `l2.l_suppkey <> l1.l_suppkey` correlation
+// alongside the equi-pair `l2.l_orderkey = l1.l_orderkey`.
+//
+// Non-correlated EXISTS already collapses to a single inner-plan
+// execution via M0058-0001's IsNonCorrelated cache; converting it
+// to a join is unnecessary churn and would lose the cache hit when
+// the same EXISTS appears across many queries.
+//
+// EXISTS subqueries with nested IN / EXISTS that themselves can
+// not be unnested are rejected — leaving them as SubPlans is safer
+// than introducing a join with a still-correlated inner plan.
+func canUnnestExistsExpr(ex *ExistsExpr) bool {
+	plan := ex.Plan
+	if plan == nil {
+		return false
+	}
+	if ex.IsNonCorrelated {
+		return false
+	}
+	eup := collectExistsUnnestParamsAndResiduals(plan)
+	if eup == nil || len(eup.Params) == 0 {
+		// Need at least one equijoin to drive the hash join.
+		return false
+	}
+	var hasNestedSub bool
+	walkPlanExprs(plan, func(e Expr) {
+		if in2, ok := e.(*InExpr); ok && in2.Plan != nil {
+			hasNestedSub = true
+		}
+		if ex2, ok := e.(*ExistsExpr); ok && ex2.Plan != nil {
+			hasNestedSub = true
+		}
+		if sq2, ok := e.(*SubqueryExpr); ok && sq2.Plan != nil {
+			hasNestedSub = true
+		}
+	})
+	if hasNestedSub {
+		return false
+	}
+	return true
+}
+
+// unnestExistsExpr rewrites a top-level EXISTS / NOT EXISTS
+// conjunct into a semi-join / anti-join.
+//
+//	Filter(EXISTS(SELECT ... WHERE inner = outer.col)     , outer)
+//	→  Filter(other_preds, JoinTypeSemi(outer, inner_clone))
+//
+//	Filter(NOT EXISTS(SELECT ... WHERE inner = outer.col) , outer)
+//	→  Filter(other_preds, JoinTypeAnti(outer, inner_clone))
+//
+// `NOT EXISTS` arrives from the parser as `UnaryOp("NOT",
+// ExistsExpr{Negated: false})` — we look for the EXISTS at a
+// top-level conjunct position OR wrapped in a single NOT UnaryOp
+// at a top-level conjunct position.
+//
+// The inner plan is cloned with OuterColumnRef → ColumnRef
+// replacement so it is self-contained; remaining inner-plan
+// optimisation runs via the recursive unnestSubqueriesInPlan call
+// below.
+//
+// The join's output schema is the LEFT (outer) schema only —
+// downstream column indices are unchanged from before unnesting.
+func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
+	if !canUnnestExistsExpr(ex) {
+		return nil, nil
+	}
+	eup := collectExistsUnnestParamsAndResiduals(ex.Plan)
+	if eup == nil || len(eup.Params) == 0 {
+		return nil, nil
+	}
+	params := eup.Params
+
+	// Find the Filter that contains this ExistsExpr conjunct.
+	filter, conjunct := findFilterContainingExistsExpr(outer, ex)
+	if filter == nil {
+		return nil, nil
+	}
+
+	// The EXISTS may sit at a top-level conjunct directly, or be
+	// wrapped in a `NOT` UnaryOp (the parser's representation of
+	// `NOT EXISTS`). Determine the actual top-level conjunct and
+	// whether the EXISTS is negated.
+	negated := ex.Negated
+	conjuncts := splitAnd(filter.Predicate)
+	topConjunct := Expr(nil)
+	for _, c := range conjuncts {
+		if c == conjunct {
+			topConjunct = c
+			break
+		}
+		if u, ok := c.(*UnaryOp); ok && (u.Op == "NOT" || u.Op == "not") {
+			if u.Operand == conjunct {
+				topConjunct = c
+				negated = !negated
+				break
+			}
+		}
+	}
+	if topConjunct == nil {
+		// EXISTS is buried in a non-conjunct context (e.g. an
+		// OR branch or inside a function call). Cannot lift to
+		// a join without changing semantics.
+		return nil, nil
+	}
+
+	// Replace OuterColumnRefs with ColumnRefs and clone the inner
+	// plan so it no longer carries outer-scope dependencies.
+	replace := make(map[*OuterColumnRef]*ColumnRef, len(params))
+	for _, p := range params {
+		replace[p.OuterRef] = p.SubCol
+	}
+	innerPlan, err := clonePlanReplacingOuter(ex.Plan, replace)
+	if err != nil {
+		return nil, err
+	}
+	// M0062-0005: strip any conjuncts from the cloned inner plan's
+	// Filters that still reference an OuterColumnRef. The residual
+	// conjuncts have been lifted to the join's Predicate; if they
+	// stayed in the inner plan the executor would try to evaluate
+	// an unbound OuterColumnRef at build time. The equi-pair
+	// conjuncts were already neutralised by the `replace` map (they
+	// became self-equality tautologies) — those are also removed
+	// for cleanliness.
+	if len(eup.Residuals) > 0 {
+		stripOuterRefConjuncts(innerPlan)
+	}
+	// Always strip even if no residuals — the equi-pair conjuncts
+	// have been replaced by self-equality tautologies and should
+	// be removed for plan tidiness AND so M0063-0004's NLI rewrite
+	// can see a bare SeqScan beneath.
+	stripOuterRefConjuncts(innerPlan)
+	innerPlan = unnestSubqueriesInPlan(innerPlan)
+	// M0063-0004: simplify trivial wrappers so M0054-0006 NLI can
+	// recognise the inner side as a *SeqScan in `pickInnerSide`.
+	// Project(Filter(true, x)) → Project(x) → x when the Project
+	// is identity AND the Filter's predicate is true. EXISTS
+	// shapes whose inner Filter only has the equi-pair (now a
+	// stripped tautology) end up as bare SeqScans — Q21's first
+	// EXISTS qualifies; the NOT EXISTS doesn't (its inner Filter
+	// still has `l_receiptdate > l_commitdate`).
+	innerPlan = unwrapTrivialWrappers(innerPlan)
+	var innerOnlyLifted []Expr
+
+	outerChild := filter.Child
+	outerWidth := len(outerChild.Output())
+
+	// Build keys. The probe (outer) key uses the outer column ref
+	// at its original index; the build (inner) key uses the inner
+	// ColumnRef adjusted to point into the inner plan's own
+	// schema, NOT a merged schema, because the join's output is
+	// outer-only and the build side reads from a row of inner
+	// width alone (see executor's openLazyHashJoin path for
+	// BuildLeft=false).
+	outerKey := &ColumnRef{
+		pos:   params[0].OuterRef.Pos(),
+		Index: params[0].OuterRef.Index,
+		Name:  params[0].OuterRef.Name,
+		Type:  params[0].OuterRef.Type,
+	}
+	// The executor's evalHashKey is given a padded row of width
+	// (leftWidth + rightWidth). For semi/anti the right key reads
+	// the inner column from the right-side region of that padded
+	// row, so its Index must be `outerWidth + innerColIndex`.
+	innerKey := &ColumnRef{
+		pos:   params[0].SubCol.Pos(),
+		Index: outerWidth + params[0].SubCol.Index,
+		Name:  params[0].SubCol.Name,
+		Type:  params[0].SubCol.Type,
+	}
+
+	// Drop the EXISTS conjunct (or its wrapping NOT) entirely;
+	// the join encodes the equality predicate via (LeftKey,
+	// RightKey) and the negation via Type=Anti.
+	newConjuncts := make([]Expr, 0, len(conjuncts))
+	for _, c := range conjuncts {
+		if c != topConjunct {
+			newConjuncts = append(newConjuncts, c)
+		}
+	}
+	if len(newConjuncts) == 0 {
+		// All conjuncts consumed — keep the Filter wrapping but
+		// with a true-predicate so downstream code that recurses
+		// through Filter still finds the join.
+		filter.Predicate = &BooleanConst{pos: ex.Pos(), Value: true}
+	} else {
+		filter.Predicate = combineAnd(newConjuncts)
+	}
+
+	joinType := JoinTypeSemi
+	if negated {
+		joinType = JoinTypeAnti
+	}
+
+	// M0062-0005: lift non-equijoin residuals (e.g. Q21's
+	// `l2.l_suppkey <> l1.l_suppkey`) into the join's Predicate
+	// after rewriting indices: OuterColumnRef → ColumnRef at the
+	// outer's original Index, inner ColumnRef → ColumnRef at
+	// `outerWidth + originalIndex`. The join evaluates Predicate
+	// against the (outer ++ inner) joined row.
+	var joinPredicate Expr
+	if len(eup.Residuals) > 0 || len(innerOnlyLifted) > 0 {
+		var rewriteIdx func(Expr) Expr
+		rewriteIdx = func(e Expr) Expr {
+			if e == nil {
+				return nil
+			}
+			switch x := e.(type) {
+			case *OuterColumnRef:
+				return &ColumnRef{
+					pos:   x.Pos(),
+					Index: x.Index,
+					Name:  x.Name,
+					Type:  x.Type,
+				}
+			case *ColumnRef:
+				cl := *x
+				cl.Index = outerWidth + x.Index
+				return &cl
+			case *BinaryOp:
+				return &BinaryOp{
+					pos:   x.Pos(),
+					Op:    x.Op,
+					Left:  rewriteIdx(x.Left),
+					Right: rewriteIdx(x.Right),
+				}
+			case *UnaryOp:
+				return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: rewriteIdx(x.Operand)}
+			case *FuncCall:
+				args := make([]Expr, len(x.Args))
+				for i, a := range x.Args {
+					args[i] = rewriteIdx(a)
+				}
+				return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+			default:
+				return e
+			}
+		}
+		var residualConj []Expr
+		for _, r := range eup.Residuals {
+			residualConj = append(residualConj, rewriteIdx(r))
+		}
+		// M0063-0004: inner-only conjuncts (no OuterColumnRef)
+		// also need their inner ColumnRef indices shifted by
+		// outerWidth so they evaluate against the joinBuf.
+		for _, r := range innerOnlyLifted {
+			residualConj = append(residualConj, rewriteIdx(r))
+		}
+		joinPredicate = combineAnd(residualConj)
+	}
+
+	join := &Join{
+		pos:       ex.Pos(),
+		Type:      joinType,
+		Algo:      JoinAlgoHash,
+		Left:      outerChild,
+		Right:     innerPlan,
+		Predicate: joinPredicate,
+		LeftKey:   outerKey,
+		RightKey:  innerKey,
+		// Schema is the outer side only — semi/anti joins do not
+		// project inner columns.
+		schema: append(Schema(nil), outerChild.Output()...),
+	}
+	filter.Child = join
+	return outer, nil
+}
+
+// findFilterContainingExistsExpr walks the plan tree looking for
+// the Filter whose predicate contains the target ExistsExpr.
+func findFilterContainingExistsExpr(node Node, target *ExistsExpr) (*Filter, Expr) {
+	if node == nil {
+		return nil, nil
+	}
+	if f, ok := node.(*Filter); ok {
+		if c := findExprInExpr(f.Predicate, func(e Expr) bool {
+			return e == target
+		}); c != nil {
+			return f, c
+		}
+	}
+	switch n := node.(type) {
+	case *Join:
+		if f, c := findFilterContainingExistsExpr(n.Left, target); f != nil {
+			return f, c
+		}
+		return findFilterContainingExistsExpr(n.Right, target)
+	case *Filter:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Project:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Aggregate:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Sort:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *Limit:
+		return findFilterContainingExistsExpr(n.Child, target)
+	case *MultiHashJoin:
+		for _, tbl := range n.Tables {
+			if f, c := findFilterContainingExistsExpr(tbl, target); f != nil {
+				return f, c
+			}
+		}
+	}
+	return nil, nil
 }

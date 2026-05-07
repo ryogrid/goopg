@@ -63,6 +63,43 @@ Integration tests that need a real `psql`/`pgbench` belong under
 `internal/<subsystem>/...` next to the code they exercise, gated by a build
 tag (`//go:build integration`) so the default `go test ./...` stays fast.
 
+### PostgreSQL Oracle Test Port (separate from `go test ./...`)
+
+Ported upstream TAP tests live in `internal/testport/tap_port_test.go`.
+They invoke real client tools (`psql`, `pgbench`, `pg_ctl`) and can take
+several minutes. Do NOT include them in the default full-suite run.
+
+```bash
+# Run all ported PostgreSQL oracle TAP tests (slow; requires client tools)
+go test -v -run TestPort_ ./internal/testport/
+
+# Run one specific oracle test
+go test -v -run TestPort_Psql001Basic ./internal/testport/
+
+# Run all testport tests (oracle TAP + integration suites)
+go test -v -tags integration ./internal/testport/
+```
+
+The current ported-test inventory and deferral status is in
+`docs/test-port/postgres-oracle-port-status.csv` and
+`docs/test-port/postgres-oracle-port-status.md`.
+
+Deferred suites (`status=defer` in the CSV) must NOT be run as part of
+`go test ./...` — they are either expected to have failures or depend on
+infrastructure not yet available. Run them explicitly when investigating
+a specific feature area:
+
+```bash
+# Regress (SQL-level, requires pg_regress-compatible runner — D-001)
+# see docs/test-port/upstream-regress-coverage.md
+
+# Isolation (multi-session scheduler — D-002)
+# see docs/test-port/upstream-isolation-coverage.md
+
+# Recovery / subscription TAP (replication infrastructure — D-003, D-004)
+# see postgres/src/test/recovery/t/ and postgres/src/test/subscription/t/
+```
+
 ## Lint and format
 
 ```bash
@@ -87,6 +124,8 @@ global -f path/to/file.c        # list symbols defined in a file
 When porting any concept, cite the upstream file path (e.g.
 `postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
 and/or code comment. Never modify, vendor, or import code from `./postgres/`.
+
+Markdowned official PostgreSQL documentation is placed `postgres/official_docs_in_md/` for easy reference and linking. When citing the official docs, link to
 
 ## Design reference policy
 
@@ -135,6 +174,22 @@ While using PostgreSQL as the oracle, always account for:
 - Update `.ralph/fix_plan.md` at the end of every loop: tick boxes, add
   newly-discovered follow-ups, and note any tasks that turned out to be
   larger than expected.
+
+## Completion and Deferral Discipline
+
+- Do not mark a milestone as complete in `.ralph/fix_plan.md` until there is
+  clear evidence that every milestone requirement is actually finished.
+- Apply the same standard to individual tasks: only mark complete when the
+  task is truly done, verified, and no required work remains.
+- Do not use "deferred" or "future work" as an easy escape hatch for
+  unfinished required scope.
+- If a blocker prevents completion, record the blocker explicitly and keep the
+  task and milestone unchecked.
+- If work must be delegated to a later task or milestone, add explicit
+  cross-referenced follow-up tasks so the handoff is unambiguous from both the
+  source and destination entries.
+- "Partially complete" is still incomplete. Never mark partial completion as
+  done.
 
 ## Key Learnings
 

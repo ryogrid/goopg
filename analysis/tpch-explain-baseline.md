@@ -48,6 +48,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Index Scan | orders | idx_orders_orderdate |
+| 2 | Seq Scan | lineitem | — |
 
 ### Q5
 
@@ -241,6 +242,7 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | customer | — |
+| 2 | Seq Scan | orders | — |
 
 ## Aggregate gaps
 
@@ -251,9 +253,9 @@ for an M0054-0003 sub-task investigation.
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
 | customer | Q10, Q13, Q18, Q22, Q5, Q7, Q8 | Q3 |
-| lineitem | Q10, Q17, Q18, Q19, Q21, Q5, Q8, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q3, Q6, Q7 |
+| lineitem | Q10, Q17, Q18, Q19, Q21, Q4, Q5, Q8, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q3, Q6, Q7 |
 | nation | Q10, Q11, Q2, Q21, Q5, Q7, Q8 | Q20, Q9 |
-| orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q3, Q4, Q5, Q8 |
+| orders | Q13, Q18, Q21, Q22, Q7, Q9 | Q10, Q12, Q3, Q4, Q5, Q8 |
 | partsupp | Q11, Q16, Q2, Q9 | — |
 | region | Q2, Q5, Q8 | — |
 | supplier | Q11, Q2, Q20, Q21, Q5, Q7, Q8 | Q15b, Q9 |

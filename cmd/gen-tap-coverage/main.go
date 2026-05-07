@@ -47,7 +47,7 @@ func main() {
 	}
 	defer f.Close()
 
-	counts := map[string]int{"port": 0, "skip": 0, "defer": 0}
+	counts := map[string]int{"port": 0, "excluded": 0, "defer": 0}
 	for _, r := range rows {
 		counts[r.Status]++
 	}
@@ -58,9 +58,10 @@ func main() {
 	fmt.Fprintf(f, "Generated at: %s\n\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintln(f, "Scope in this file:")
 	fmt.Fprintln(f, "- `postgres/src/test/recovery/t/*.pl`")
+	fmt.Fprintln(f, "- `postgres/src/test/subscription/t/*.pl`")
 	fmt.Fprintln(f, "- `postgres/src/bin/*/t/*.pl`")
 	fmt.Fprintln(f)
-	fmt.Fprintf(f, "Total tests: **%d** (port=%d, skip=%d, defer=%d)\n\n", len(rows), counts["port"], counts["skip"], counts["defer"])
+	fmt.Fprintf(f, "Total tests: **%d** (port=%d, defer=%d, excluded=%d)\n\n", len(rows), counts["port"], counts["defer"], counts["excluded"])
 	fmt.Fprintln(f, "| Path | Status | Rationale |")
 	fmt.Fprintln(f, "| ---- | ------ | --------- |")
 	for _, r := range rows {
@@ -112,6 +113,12 @@ func collect(root string) ([]string, error) {
 	}); err != nil {
 		return nil, err
 	}
+	subscriptionDir := filepath.Join(root, "postgres", "src", "test", "subscription", "t")
+	if err := walk(subscriptionDir, func(rel string) bool {
+		return strings.HasPrefix(rel, "postgres/src/test/subscription/t/")
+	}); err != nil {
+		return nil, err
+	}
 	binDir := filepath.Join(root, "postgres", "src", "bin")
 	if err := walk(binDir, func(rel string) bool {
 		return strings.HasPrefix(rel, "postgres/src/bin/") && strings.Contains(rel, "/t/")
@@ -126,6 +133,9 @@ func classify(rel string) (status, rationale string) {
 	if strings.HasPrefix(rel, "postgres/src/test/recovery/t/") {
 		return "defer", "Requires replication/failover/recovery semantics not yet implemented in goopg v0."
 	}
+	if strings.HasPrefix(rel, "postgres/src/test/subscription/t/") {
+		return "defer", "Requires logical replication/subscription semantics not yet implemented in goopg v0."
+	}
 	tool := binTool(rel)
 	switch tool {
 	case "pgbench", "psql", "pg_isready", "pg_ctl", "initdb":
@@ -133,7 +143,7 @@ func classify(rel string) (status, rationale string) {
 	case "scripts":
 		return "defer", "Depends on broader SQL/catalog parity for PostgreSQL utility scripts."
 	default:
-		return "skip", fmt.Sprintf("Upstream binary %q is outside goopg's current server-focused scope.", tool)
+		return "excluded", fmt.Sprintf("Upstream binary %q is outside goopg's current server-focused scope.", tool)
 	}
 }
 

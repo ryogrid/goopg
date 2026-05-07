@@ -210,16 +210,41 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		}
 		return Datum{Kind: KindBool, Bool: cmpResult(op, cmp)}, nil
 	case "LIKE", "NOT LIKE":
-		if left.Kind != KindString || right.Kind != KindString {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands", op)}
+		// M0062-followup: accept KindBytes operands as UTF-8 text so a
+		// varchar that arrives as bytes (e.g. via a row-reshaping path
+		// that drops Kind) still evaluates correctly. Mirrors
+		// `compareDatum`'s cross-Kind tolerance and aligns LIKE with
+		// the comparators it sits next to. The error message includes
+		// the actual Datum kinds so any residual non-string-non-bytes
+		// case is diagnosable in one run instead of needing a server
+		// log dive.
+		ls, lok := datumAsString(left)
+		rs, rok := datumAsString(right)
+		if !lok || !rok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands (got left.Kind=%d right.Kind=%d)", op, left.Kind, right.Kind)}
 		}
-		matched := matchSQLLike(left.String, right.String)
+		matched := matchSQLLike(ls, rs)
 		if op == "NOT LIKE" {
 			matched = !matched
 		}
 		return Datum{Kind: KindBool, Bool: matched}, nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
+}
+
+// datumAsString returns d's character payload as a Go string when
+// the value is text-like (KindString or KindBytes). Used by LIKE so
+// a varchar value that arrives as bytes still evaluates correctly,
+// mirroring `compareDatum`'s cross-Kind tolerance for character
+// data.
+func datumAsString(d Datum) (string, bool) {
+	switch d.Kind {
+	case KindString:
+		return d.String, true
+	case KindBytes:
+		return string(d.Bytes), true
+	}
+	return "", false
 }
 
 // matchSQLLike implements SQL LIKE pattern semantics: '%' matches
@@ -657,18 +682,34 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 // exactly one column. Otherwise evaluates the value list.
 func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) {
 	if x.Plan != nil {
+		// Check for query cancellation before each SubPlan evaluation.
+		// Each call may scan millions of rows; this single atomic read
+		// costs ~5 ns vs microseconds-to-seconds of SubPlan work.
+		if ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		// Consult the subquery cache so correlated IN
 		// subqueries are evaluated at most once per distinct
 		// outer-row value rather than per outer row.  This
 		// reduces Q20-like queries from O(outer×inner) to
 		// O(inner) per distinct correlation key.
+		//
+		// For non-correlated subqueries (M0058-0001), the
+		// inner plan returns the same set for every outer row,
+		// so a constant cache key collapses re-evaluation to
+		// a single execution.
+		cacheKey := subqueryCacheKey(row)
+		if x.IsNonCorrelated {
+			cacheKey = nonCorrelatedCacheKey(x)
+		}
 		if ctx.SubqueryCache != nil {
 			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
 				clear(ctx.SubqueryCache)
 				ctx.SubqueryCacheScope = len(ctx.OuterRows)
 			}
-			key := subqueryCacheKey(row)
-			if cached, ok := ctx.SubqueryCache[key]; ok {
+			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
 				return cached, nil
 			}
 		}
@@ -705,7 +746,7 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 			ctx.SubqueryCache = make(map[string][]Datum)
 			ctx.SubqueryCacheScope = len(ctx.OuterRows)
 		}
-		ctx.SubqueryCache[subqueryCacheKey(row)] = out
+		ctx.SubqueryCache[cacheKey] = out
 		return out, nil
 	}
 	out := make([]Datum, len(x.List))
@@ -724,11 +765,45 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 // regardless of column count — EXISTS only cares whether at
 // least one row exists.
 func evalExistsExpr(x *planner.ExistsExpr, row Row, ctx *Context) (Datum, error) {
+	// Check for query cancellation before each EXISTS/NOT EXISTS evaluation.
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	// Push the outer row so correlated column refs in the inner
 	// plan can resolve against it. Pop on return regardless of
 	// outcome.
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	// For non-correlated EXISTS (M0058-0001), the inner plan
+	// returns the same boolean for every outer row. Cache it
+	// under a constant key.
+	if x.IsNonCorrelated {
+		cacheKey := nonCorrelatedCacheKey(x)
+		if ctx.SubqueryCache != nil {
+			if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
+				clear(ctx.SubqueryCache)
+				ctx.SubqueryCacheScope = len(ctx.OuterRows)
+			}
+			if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
+				if len(cached) == 1 {
+					return cached[0], nil
+				}
+			}
+		}
+		val, err := existsImpl(x, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if ctx.SubqueryCache == nil {
+			ctx.SubqueryCache = make(map[string][]Datum)
+			ctx.SubqueryCacheScope = len(ctx.OuterRows)
+		}
+		ctx.SubqueryCache[cacheKey] = []Datum{val}
+		return val, nil
+	}
 	return existsImpl(x, ctx)
 }
 
@@ -761,16 +836,26 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 // outer row. Correlated subqueries (parameter pull-up) are
 // deferred; see docs/design/0003-0008-subqueries.md.
 func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error) {
+	// Check for query cancellation before each scalar SubPlan evaluation.
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
-	// Check cache for scalar subquery results keyed by outer row.
+	// Check cache for scalar subquery results. For non-correlated
+	// subqueries (M0058-0001), use a constant cache key.
+	cacheKey := subqueryCacheKey(row)
+	if x.IsNonCorrelated {
+		cacheKey = nonCorrelatedCacheKey(x)
+	}
 	if ctx.SubqueryCache != nil {
 		if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
 			clear(ctx.SubqueryCache)
 			ctx.SubqueryCacheScope = len(ctx.OuterRows)
 		}
-		key := subqueryCacheKey(row)
-		if cached, ok := ctx.SubqueryCache[key]; ok {
+		if cached, ok := ctx.SubqueryCache[cacheKey]; ok {
 			if len(cached) == 1 {
 				return cached[0], nil
 			}
@@ -786,7 +871,7 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 		ctx.SubqueryCache = make(map[string][]Datum)
 		ctx.SubqueryCacheScope = len(ctx.OuterRows)
 	}
-	ctx.SubqueryCache[subqueryCacheKey(row)] = []Datum{val}
+	ctx.SubqueryCache[cacheKey] = []Datum{val}
 	return val, nil
 }
 
@@ -1168,4 +1253,14 @@ func subqueryCacheKey(row Row) string {
 		parts[i] = datumKey(d)
 	}
 	return strings.Join(parts, "|")
+}
+
+// nonCorrelatedCacheKey returns a constant cache key for a given
+// non-correlated subquery node. The pointer-derived suffix keeps
+// keys for distinct subquery sites distinct within a single query
+// (so two unrelated non-correlated SubPlans don't share a cached
+// result), while collapsing all outer rows for the same SubPlan
+// onto a single entry. (M0058-0001.)
+func nonCorrelatedCacheKey(x interface{}) string {
+	return fmt.Sprintf("\x00nc:%p", x)
 }

@@ -164,6 +164,11 @@ type Pool struct {
 	// BufferPin wait events in pg_stat_activity.
 	OnPinWait func()
 
+	// OnPinDone pairs with OnPinWait — called immediately after the
+	// disk-read finishes so observability code can balance every
+	// WaitEventStart with a WaitEventEnd. (M0058-0006.)
+	OnPinDone func()
+
 	// OnBufferIOWait is an optional hook called when a goroutine must
 	// wait for an in-flight read issued by another goroutine to complete
 	// (BM_IO_IN_PROGRESS, M0048-0001). Fires once per waiting goroutine
@@ -747,6 +752,9 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		p.OnPinWait()
 	}
 	err = p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
+	if p.OnPinDone != nil {
+		p.OnPinDone()
+	}
 	s.contentMu.Unlock()
 
 	// Remove from ioByTag and wake waiters regardless of success or

@@ -273,10 +273,13 @@ func sameCrossSideEquiNLI(a, b Expr) bool {
 // `column "ps_suppkey" is not numeric at runtime` regression
 // observed in run-012 attempt #1.
 func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
-	// Only INNER and LEFT join types are supported. RIGHT/FULL
-	// require both sides materialised for the outer-row
-	// preservation contract.
-	if j.Type != JoinTypeInner && j.Type != JoinTypeLeft {
+	// Supported join types: INNER, LEFT (existing), and as of
+	// M0063-0004: Semi / Anti for index-driven EXISTS / NOT
+	// EXISTS unnested by M0061-0001. RIGHT / FULL require both
+	// sides materialised for outer-row preservation and stay on
+	// the hash / merge paths.
+	if j.Type != JoinTypeInner && j.Type != JoinTypeLeft &&
+		j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
 		return nil, false
 	}
 	// Equi-join detection: prefer the `LeftKey = RightKey` shape
@@ -347,6 +350,51 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	if !nliCostGateAccepts(outerNode, innerScan, idx) {
 		return nil, false
 	}
+	// M0063-0001: skip NLI when the outer is an isolated-scope
+	// Project (a derived-table or view rename wrapper). Those
+	// shapes have an asymmetric row layout: NLI's substituted
+	// `outer ++ inner` schema flips relative to the original
+	// `*Join{Left: outer, Right: inner-SeqScan}` if `inner` was
+	// the original Right (which it usually is for Q15b /
+	// derived-supplier shapes), and the parent Filter's
+	// ColumnRefs — resolved against the original Left ++ Right
+	// layout — would land on the wrong slots at runtime. The
+	// hash-join path handles this case correctly. Q15b's NLI
+	// path is what triggered the regression; this gate keeps
+	// the NLI rewrite for SeqScan outers (Q14 etc.) and
+	// declines for Project-wrapped derived outers.
+	if p, ok := outerNode.(*Project); ok && p.IsolatedScope {
+		return nil, false
+	}
+
+	// M0063-0001: re-bind each outer-side Key's ColumnRef.Index
+	// against the chosen `outerNode.Output()` schema by Name.
+	// `keys` are outer-side ColumnRefs originally resolved against
+	// the join's pre-substitution merged-schema (FROM-cumulative
+	// offsets). At runtime, NLI binds the OUTER row to the inner
+	// IndexScan; the Key is evaluated against `outerRow` whose
+	// width equals `len(outerNode.Output())`. If `outerNode` is a
+	// derived-table sub-plan whose Output schema doesn't match the
+	// FROM cumulative offsets, the Key's Index would point past
+	// the bound row and `lookupKey()` would silently return zero
+	// matches (Q8 / Q15b 0-rows symptom).
+	//
+	// Name re-bind is safe: the outer-side ColumnRef Name was
+	// resolved at SQL-parse / planSelect time and stays valid
+	// regardless of subsequent plan-tree shape changes. A
+	// Name-ambiguous case (the same Name appears twice in the
+	// outer schema, e.g. self-join) keeps the original Index
+	// (defensive).
+	outerSchema := outerNode.Output()
+	for _, k := range keys {
+		cr, ok := k.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			continue
+		}
+		if newIdx := findUniqueColumnIndex(outerSchema, cr.Name, 0); newIdx >= 0 {
+			cr.Index = newIdx
+		}
+	}
 
 	// Build the inner IndexScan. For single-column indexes we
 	// keep using `Key` for backward compatibility with all
@@ -364,14 +412,19 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	} else {
 		inner.Keys = keys
 	}
-	// Build the joined output schema. NLI always emits
+	// Build the joined output schema. NLI usually emits
 	// `outer ++ inner` regardless of which side contributed which
-	// to the original Join — the Join's `schema` already encodes
-	// this. We rebuild from outer.Output() ++ inner.Output() to
-	// keep the substitution self-consistent.
-	joinedSchema := make(Schema, 0, len(outerNode.Output())+len(inner.Output()))
-	joinedSchema = append(joinedSchema, outerNode.Output()...)
-	joinedSchema = append(joinedSchema, inner.Output()...)
+	// to the original Join. M0063-0004: Semi / Anti emit only
+	// the OUTER schema — the inner side is consumed only for
+	// matching, never projected.
+	var joinedSchema Schema
+	if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+		joinedSchema = append(Schema(nil), outerNode.Output()...)
+	} else {
+		joinedSchema = make(Schema, 0, len(outerNode.Output())+len(inner.Output()))
+		joinedSchema = append(joinedSchema, outerNode.Output()...)
+		joinedSchema = append(joinedSchema, inner.Output()...)
+	}
 
 	nli := &NestedLoopIndexJoin{
 		pos:   j.pos,

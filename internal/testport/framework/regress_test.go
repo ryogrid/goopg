@@ -1,0 +1,83 @@
+package framework
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+type mockRegressExec struct {
+	outputs map[string]string
+	errs    map[string]error
+}
+
+func (m *mockRegressExec) ExecuteSQL(_ context.Context, sql string) (string, error) {
+	if err, ok := m.errs[sql]; ok {
+		return "", err
+	}
+	if out, ok := m.outputs[sql]; ok {
+		return out, nil
+	}
+	return "", errors.New("defer: not implemented")
+}
+
+func TestRunRegressSubsetReportsStatuses(t *testing.T) {
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/sql/pass_case.sql"), "SELECT 1;\n")
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/expected/pass_case.out"), "1\n")
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/sql/defer_case.sql"), "SELECT defer;\n")
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/expected/defer_case.out"), "defer\n")
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/sql/excluded_case.sql"), "SELECT excluded;\n")
+	mustWrite(t, filepath.Join(repo, "postgres/src/test/regress/expected/excluded_case.out"), "excluded\n")
+
+	cases, err := DiscoverRegressCases(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) != 3 {
+		t.Fatalf("cases=%d want 3", len(cases))
+	}
+
+	exec := &mockRegressExec{
+		outputs: map[string]string{
+			"SELECT 1;\n": "1\n",
+		},
+		errs: map[string]error{
+			"SELECT defer;\n":    ErrDeferred,
+			"SELECT excluded;\n": ErrExcluded,
+		},
+	}
+	results, err := RunRegressSubset(context.Background(), repo, cases, exec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("results=%d want 3", len(results))
+	}
+
+	got := map[string]string{}
+	for _, r := range results {
+		got[r.Name] = r.Status
+	}
+	if got["pass_case"] != "port" {
+		t.Fatalf("pass_case status=%q want port", got["pass_case"])
+	}
+	if got["defer_case"] != "defer" {
+		t.Fatalf("defer_case status=%q want defer", got["defer_case"])
+	}
+	if got["excluded_case"] != "excluded" {
+		t.Fatalf("excluded_case status=%q want excluded", got["excluded_case"])
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

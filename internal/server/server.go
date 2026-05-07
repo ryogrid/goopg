@@ -454,6 +454,16 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		"remote", raw.RemoteAddr().String(),
 		"pid", pid,
 	)
+	// M0058-0005: enable TCP keepalive with a 30-second probe so a
+	// half-closed peer (client crash, network partition) is detected
+	// within ~3 minutes instead of the OS default (~2 hours). Once
+	// the OS marks the conn dead, the next Read or Write surfaces an
+	// error to the goroutine, which then propagates to the executor
+	// loop's ctx.Err() checks and unwinds the query.
+	if tcp, ok := raw.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+	}
 	// Catch any unrecovered panic so every backend exit is logged at ERROR
 	// rather than crashing the process without a log entry. This is a
 	// defensive observability wrapper — no panics are expected in normal

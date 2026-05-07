@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"fmt"
 	"math/bits"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -121,15 +122,11 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 		cumOffsets[i+1] = cumOffsets[i] + w
 	}
 
-	for _, c := range conjuncts {
-		bin, ok := c.(*BinaryOp)
-		if !ok || bin.Op != "=" {
-			continue
-		}
+	addEdge := func(bin *BinaryOp) {
 		li := tableForCol(bin.Left, cumOffsets)
 		ri := tableForCol(bin.Right, cumOffsets)
 		if li < 0 || ri < 0 || li == ri {
-			continue
+			return
 		}
 		g.edges = append(g.edges, joinEdge{
 			leftTable:  li,
@@ -139,7 +136,86 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 			rightKey:   bin.Right,
 		})
 	}
+	for _, c := range conjuncts {
+		if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+			addEdge(bin)
+			continue
+		}
+		// M0058-0004: descend into OR-of-ANDs predicates so a join
+		// predicate like Q19's `(p_partkey=l_partkey AND ...) OR
+		// (p_partkey=l_partkey AND ...) OR (...)` contributes a join
+		// edge. The full OR remains as a residual predicate; this
+		// only feeds the join-order DP.
+		for _, eq := range plannerCommonEquijoinsAcrossOr(c) {
+			addEdge(eq)
+		}
+	}
 	return g
+}
+
+// plannerCommonEquijoinsAcrossOr is the planner-Expr counterpart of
+// commonEquijoinsAcrossOr in joinorder.go. Returns equality
+// expressions of the form `t1.col = t2.col` that appear in every
+// branch of an OR predicate.
+func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
+	bin, ok := e.(*BinaryOp)
+	if !ok || bin.Op != "OR" {
+		return nil
+	}
+	branches := flattenPlannerOr(bin)
+	if len(branches) < 2 {
+		return nil
+	}
+	branchEqs := make([]map[string]*BinaryOp, len(branches))
+	for i, br := range branches {
+		branchEqs[i] = map[string]*BinaryOp{}
+		for _, c := range splitAnd(br) {
+			b, ok := c.(*BinaryOp)
+			if !ok || b.Op != "=" {
+				continue
+			}
+			lc, lok := b.Left.(*ColumnRef)
+			rc, rok := b.Right.(*ColumnRef)
+			if !lok || !rok {
+				continue
+			}
+			branchEqs[i][colRefIndexPairKey(lc, rc)] = b
+		}
+	}
+	var common []*BinaryOp
+	for k, v := range branchEqs[0] {
+		ok := true
+		for j := 1; j < len(branchEqs); j++ {
+			if _, present := branchEqs[j][k]; !present {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			common = append(common, v)
+		}
+	}
+	return common
+}
+
+func flattenPlannerOr(e Expr) []Expr {
+	bin, ok := e.(*BinaryOp)
+	if !ok || bin.Op != "OR" {
+		return []Expr{e}
+	}
+	out := flattenPlannerOr(bin.Left)
+	out = append(out, flattenPlannerOr(bin.Right)...)
+	return out
+}
+
+// colRefIndexPairKey produces an order-independent key for two
+// planner ColumnRef nodes via their resolved column indices.
+func colRefIndexPairKey(a, b *ColumnRef) string {
+	li, ri := a.Index, b.Index
+	if li > ri {
+		li, ri = ri, li
+	}
+	return fmt.Sprintf("%d==%d", li, ri)
 }
 
 // tableForCol returns the FROM-table index that all ColumnRef nodes
@@ -960,7 +1036,17 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		return
 	case *Join:
 		remapPosMapAfterRewrite(n.Left, nil)
-		remapPosMapAfterRewrite(n.Right, nil)
+		// M0062-0005: Semi / Anti joins carry an isolated subquery
+		// scope on their Right (the cloned EXISTS inner plan). Do
+		// not descend with the outer scope's posMap — the inner
+		// plan was already independently optimised by the
+		// recursive `unnestSubqueriesInPlan` call inside
+		// `unnestExistsExpr`, and its ColumnRefs use inner-scope
+		// indices that must not be remapped against outer
+		// bindings.
+		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
+			remapPosMapAfterRewrite(n.Right, nil)
+		}
 		subRemap([]Expr{n.Predicate, n.LeftKey, n.RightKey})
 		return
 	case *Filter:
@@ -976,6 +1062,10 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		subRemap([]Expr{n.Predicate})
 		return
 	case *Project:
+		// M0063-0001: skip isolated-scope Projects (view rename wrapper).
+		if n.IsolatedScope {
+			return
+		}
 		remapPosMapAfterRewrite(n.Child, nil)
 		pm := mhjPosMapOf(n.Child)
 		if pm != nil {
@@ -1327,11 +1417,19 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
 			off += len(x.Output())
 		case *IndexScan:
-			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: ""}, off: off})
+			// M0062-0002: preserve Alias so self-joins (Q8 `nation n1, nation n2`)
+			// can disambiguate when one side flips to IndexScan.
+			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
 			off += len(x.Output())
 		case *MultiHashJoin:
 			for _, t := range x.Tables {
-				if s, ok := t.(*SeqScan); ok {
+				switch s := t.(type) {
+				case *SeqScan:
+					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
+					off += len(s.Output())
+				case *IndexScan:
+					// M0062-0002: same alias preservation as the
+					// top-level IndexScan arm.
 					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
 					off += len(s.Output())
 				}
@@ -1339,9 +1437,27 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		case *Join:
 			collect(x.Left)
 			collect(x.Right)
+		case *NestedLoopIndexJoin:
+			// M0062-0006: NLI sits between Filter and the underlying
+			// MHJ for Q9-shape plans. Without this case the collect
+			// walker stops at NLI and `buildBindingsPosMap` returns
+			// an empty scanMap, so `p_name`'s ColumnRef.Index is
+			// never re-resolved against the OID-sorted MHJ output.
+			collect(x.Outer)
+			collect(x.Inner)
 		case *Filter:
 			collect(x.Child)
 		case *Project:
+			// M0063-0001: SubqueryAlias-style Projects (view
+			// rename wrapper) bound an isolated subquery scope.
+			// Advance `off` by the projected schema width but do
+			// NOT recurse into the Child — its scans are inner-
+			// scope and must not enter the outer FROM-bindings
+			// scanMap.
+			if x.IsolatedScope {
+				off += len(x.Output())
+				return
+			}
 			collect(x.Child)
 		case *Sort:
 			collect(x.Child)
@@ -1410,7 +1526,14 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		return
 	case *Join:
 		applyJoinTreePosMap(n.Left, posMap)
-		applyJoinTreePosMap(n.Right, posMap)
+		// M0062-0005: Semi/Anti joins' Right side is the cloned
+		// EXISTS inner plan — an isolated subquery scope whose
+		// ColumnRefs use inner-scope indices and must NOT be
+		// remapped by the outer FROM-bindings posMap. (The same
+		// rule applies in `remapPosMapAfterRewrite`.)
+		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
+			applyJoinTreePosMap(n.Right, posMap)
+		}
 		// Re‑resolve Join keys/predicate by NAME against the
 		// post‑rewrite child output schemas. The bushy DP produced
 		// subset‑FROM‑order indices, but rewriteMultiWayChain may
@@ -1426,6 +1549,11 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		applyJoinTreePosMap(n.Child, posMap)
 		remapByPosMap(&n.Predicate, posMap)
 	case *Project:
+		// M0063-0001: SubqueryAlias-style Projects (view rename
+		// wrapper) are isolated subquery scopes. Don't recurse.
+		if n.IsolatedScope {
+			return
+		}
 		applyJoinTreePosMap(n.Child, posMap)
 		for i := range n.Targets {
 			remapByPosMap(&n.Targets[i], posMap)
@@ -1438,6 +1566,24 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 	case *Aggregate:
 		return // stop — aggregate expressions are a different scope
 	}
+}
+
+// findUniqueColumnIndex returns the unique index of `name` in
+// `schema` (plus `offset`), or -1 when the name is absent or
+// appears more than once. Lifted out of `reresolveJoinByName`'s
+// closure (M0063-0001) so the NLI rewrite path can re-bind a
+// derived-table outer's Key index by Name.
+func findUniqueColumnIndex(schema Schema, name string, offset int) int {
+	hit := -1
+	for i, c := range schema {
+		if c.Name == name {
+			if hit >= 0 {
+				return -1 // duplicate
+			}
+			hit = i + offset
+		}
+	}
+	return hit
 }
 
 // reresolveJoinByName re‑binds ColumnRef indices in a Join's keys
@@ -1468,20 +1614,7 @@ func reresolveJoinByName(j *Join) {
 	copy(merged[leftWidth:], rightSchema)
 	j.schema = merged
 
-	// findUnique returns the unique index of name in schema
-	// (offset by `offset`), or -1 if absent or duplicated.
-	findUnique := func(schema Schema, name string, offset int) int {
-		hit := -1
-		for i, c := range schema {
-			if c.Name == name {
-				if hit >= 0 {
-					return -1 // duplicate
-				}
-				hit = i + offset
-			}
-		}
-		return hit
-	}
+	findUnique := findUniqueColumnIndex
 
 	rebind := func(e Expr, leftSide bool) {
 		cr, ok := e.(*ColumnRef)

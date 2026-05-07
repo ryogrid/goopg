@@ -168,7 +168,7 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 		if err := child.Open(ctx); err != nil {
 			return err
 		}
-		rows, err := drainRows(child)
+		rows, err := drainRowsCtx(child, ctx)
 		_ = child.Close()
 		if err != nil {
 			return err
@@ -372,7 +372,17 @@ func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
 // between "advance to next probe + initialise chain" and "advance
 // the cursor odometer". Filters are evaluated at the earliest step
 // where their referenced columns are bound.
+//
+// Cancellation: ctx.Err() is checked once per Next() call so a
+// CancelRequest interrupts the probe phase promptly.  Q5 ran 60+
+// minutes without responding to cancel before this check existed.
+// (M0058-0005.)
 func (o *multiHashJoinOp) Next() (Row, error) {
+	if o.ctx != nil && o.ctx.Ctx != nil {
+		if err := o.ctx.Ctx.Err(); err != nil {
+			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	for {
 		if o.lazyProbeEOF {
 			return nil, EOF
@@ -475,6 +485,17 @@ func (o *multiHashJoinOp) initStepHelper(s int) (bool, error) {
 	dstOff := o.tableOff[step.hashTblIndex]
 	stepFs := o.stepFilters[s]
 	for c := 0; c < len(matches); c++ {
+		// M0062-0001: ctx check inside the per-match loop.
+		// Next()'s outer check fires once per emitted row; for
+		// Q5-shape queries where many matches survive the chain
+		// but downstream filters reject most, the inner loop can
+		// run for seconds without yielding to the caller. Cadence
+		// 4096 mirrors runNestedLoop's inner-loop guard.
+		if c&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		copy(o.lazyOut[dstOff:], matches[c])
 		o.lazyCursors[s] = c
 		// Evaluate filters whose deepest table is this step.
@@ -511,6 +532,15 @@ func (o *multiHashJoinOp) advanceFrom(s int) (bool, error) {
 	matches := o.lazyMatches[s]
 	stepFs := o.stepFilters[s]
 	for {
+		// M0062-0001: ctx check inside the advance loop (cadence
+		// every 4096 cursor advances). Same rationale as
+		// initStepHelper: a single Next() may iterate many matches
+		// here when downstream filters reject most.
+		if o.lazyCursors[s]&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		o.lazyCursors[s]++
 		if o.lazyCursors[s] >= len(matches) {
 			// Exhausted at this level — recursive backtrack.

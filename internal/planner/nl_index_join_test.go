@@ -227,10 +227,19 @@ func firstNLI(n Node) *NestedLoopIndexJoin {
 // (M0054-0006-followup-Q15b) covers the view-substitution shape
 // where the WHERE equi-conjunct ends up on a top-level Filter and
 // the underlying Join is a CROSS JOIN with no Predicate. The
-// rule must hoist the cross-side equi-conjunct from the Filter
-// into the Join, flip Cross→Inner, and emit NLI on the indexed
-// supplier table.
-func TestNLIRulePromotesAcrossFilterCrossJoinFromView(t *testing.T) {
+// rule used to emit NLI on the indexed supplier table here, but
+// M0063-0001 disabled NLI for outers that are isolated-scope
+// Project wrappers (view-rename / derived-table). The runtime
+// row layout flips when the inner SeqScan is on the original
+// Right and the outer is the IsolatedScope subtree (Q15b's
+// shape), causing the parent Filter's ColumnRefs to land on the
+// wrong slots. The hash-join path handles this correctly.
+//
+// This test now asserts the gate fires: the plan must NOT
+// contain an NLI when the outer is an IsolatedScope-wrapped
+// view. Re-enable when the row-layout-flip is fixed at the
+// `nliRewrite` substitution level.
+func TestNLIRuleSkipsIsolatedScopeOuter(t *testing.T) {
 	cat := catalog.NewInMemory()
 	supplier, err := cat.CreateTable(parser.ObjectName{Name: "supplier"}, []catalog.Column{
 		{Name: "s_suppkey", Type: catalog.Type{Name: "int4"}, NotNull: true},
@@ -270,12 +279,8 @@ func TestNLIRulePromotesAcrossFilterCrossJoinFromView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	nli := firstNLI(node)
-	if nli == nil {
-		t.Fatalf("expected NLI in view-shaped Q15b plan; tree: %s", describePlanTree(node))
-	}
-	if nli.Inner.Index == nil || nli.Inner.Index.Name != "supplier_pk" {
-		t.Fatalf("expected supplier_pk on inner; got %v", nli.Inner.Index)
+	if nli := firstNLI(node); nli != nil {
+		t.Fatalf("M0063-0001: NLI must NOT fire for IsolatedScope outer; tree: %s", describePlanTree(node))
 	}
 }
 

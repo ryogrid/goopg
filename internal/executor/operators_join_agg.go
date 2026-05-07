@@ -54,6 +54,17 @@ func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
 
 func (o *joinOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// M0061-0001: Semi / Anti join must run through the lazy hash
+	// path; the materialising NL / Merge paths don't implement
+	// "emit probe row at most once" semantics. The planner only
+	// emits Semi/Anti with Algo=JoinAlgoHash, but defend against
+	// future changes that might leave Algo unset.
+	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+		if o.plan.Algo != planner.JoinAlgoHash {
+			return fmt.Errorf("internal error: semi/anti join requires hash algorithm, got %d", o.plan.Algo)
+		}
+		return o.openLazyHashJoin(ctx)
+	}
 	if o.plan.Algo == planner.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)
 	}
@@ -65,11 +76,11 @@ func (o *joinOp) Open(ctx *Context) error {
 		return err
 	}
 
-	leftRows, err := drainRows(o.left)
+	leftRows, err := drainRowsCtx(o.left, ctx)
 	if err != nil {
 		return err
 	}
-	rightRows, err := drainRows(o.right)
+	rightRows, err := drainRowsCtx(o.right, ctx)
 	if err != nil {
 		return err
 	}
@@ -91,14 +102,35 @@ func (o *joinOp) Open(ctx *Context) error {
 
 // runNestedLoop is the universal fallback. O(N*M) over the two
 // drained sides; supports INNER / LEFT / RIGHT / FULL / CROSS.
+//
+// Cancellation: ctx.Err() is checked once per outer-row loop so a
+// CancelRequest interrupts a long join even when the inner side has
+// no per-row hooks. (M0058-0005.) Q5 and Q13 ran 60+ minutes without
+// responding to cancellation before this check existed.
 func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth int) error {
 	nullLeft := nullRow(leftWidth)
 	nullRight := nullRow(rightWidth)
 
 	rightMatched := make([]bool, len(rightRows))
-	for _, l := range leftRows {
+	for i, l := range leftRows {
+		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		matched := false
 		for j, r := range rightRows {
+			// M0062-followup: also check ctx.Err() inside the inner
+			// loop, every 4096 iterations. Q13 (customer LEFT JOIN
+			// orders, 150K × 1.5M with a NOT LIKE residual) ran 300 s
+			// past --cancel-after=600s in the M0061-0003 sweep
+			// because the *outer* check (every 256 outer rows) only
+			// fired between full passes of the 1.5M-row inner.
+			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+				if err := o.ctx.Ctx.Err(); err != nil {
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
 			joined := concatRows(l, r)
 			ok, err := o.joinPredicateMatch(joined)
 			if err != nil {
@@ -118,6 +150,15 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 
 	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
 		for j, r := range rightRows {
+			// M0062-followup: ctx check inside the unmatched-right
+			// emission loop too. RIGHT/FULL join over a multi-million-
+			// row right side could otherwise stall cancel here even
+			// after the join body has finished.
+			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+				if err := o.ctx.Ctx.Err(); err != nil {
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
 			if rightMatched[j] {
 				continue
 			}
@@ -146,7 +187,16 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	// `keyRow` buffer per side to avoid `concatRows`'s per-row
 	// `make(Row, leftW+rightW)` churn (M0054-0004 cumulative
 	// `concatRows` 56 GB on Q9, 7,980 GB on Q20).
-	if o.plan.BuildLeft {
+	// M0061-0001: Semi / Anti join semantics require the OUTER
+	// (left) side to drive the probe loop and the INNER (right)
+	// side to be hashed. BuildLeft is INNER-only by contract; we
+	// also defend here so a stray flag doesn't silently break the
+	// emit-once-per-probe-row invariant.
+	buildLeft := o.plan.BuildLeft
+	if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+		buildLeft = false
+	}
+	if buildLeft {
 		if err := o.left.Open(ctx); err != nil { return err }
 		buildOp, err := drainRowsBounded(o.left, budget)
 		_ = o.left.Close()
@@ -154,7 +204,19 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		if err := buildOp.Open(ctx); err != nil { return err }
 		var nullRight Row
 		var keyRow Row
+		buildCount := 0
 		for {
+			// M0062-followup: ctx check inside the build loop. With
+			// 6M-row build inputs (Q21's anti-join lineitem) the
+			// build alone runs minutes; without this check the
+			// cancel-after deadline can be exceeded by 100+ s
+			// while build keeps draining.
+			if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+				if err := ctx.Ctx.Err(); err != nil {
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
+			buildCount++
 			l, err := buildOp.Next()
 			if err == EOF { break }
 			if err != nil { return err }
@@ -187,7 +249,15 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	if err := buildOp.Open(ctx); err != nil { return err }
 	var nullLeft Row
 	var keyRow Row
+	buildCount := 0
 	for {
+		// M0062-followup: same ctx check on the build-right path.
+		if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		buildCount++
 		r, err := buildOp.Next()
 		if err == EOF { break }
 		if err != nil { return err }
@@ -238,6 +308,13 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 
 	i, j := 0, 0
 	for i < len(leftKeyed) && j < len(rightKeyed) {
+		// M0058-0005: cheap ctx check every 256 left-side rows so a
+		// CancelRequest interrupts a long sort-merge join promptly.
+		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		cmp, err := compareDatum(leftKeyed[i].key, rightKeyed[j].key, o.plan.Pos())
 		if err != nil {
 			return err
@@ -410,6 +487,14 @@ func (o *joinOp) nextLazy() (Row, error) {
 	}
 	nullLeft := o.lazyNullLeft
 	nullRight := o.lazyNullRight
+	// Cancellation: cheap ctx check per Next() call so a long
+	// probe-only join responds promptly to CancelRequest.
+	// (M0058-0005.)
+	if o.ctx != nil && o.ctx.Ctx != nil {
+		if err := o.ctx.Ctx.Err(); err != nil {
+			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
 	for {
 		// Continue serving matches from current probe row. Apply
 		// the full join Predicate per emitted row — hash matching
@@ -470,6 +555,25 @@ func (o *joinOp) nextLazy() (Row, error) {
 		matches := o.lazyHash[key]
 		if !ok {
 			matches = nil
+		}
+		// M0061-0001: Semi / Anti emit just the probe row at most
+		// once. NULL probe key never matches (`ok == false`):
+		//   - Semi: skip the probe row (no match).
+		//   - Anti: keep the probe row (matches PostgreSQL
+		//     `NOT EXISTS` semantics — equality cannot be true).
+		if o.plan.Type == planner.JoinTypeSemi {
+			if len(matches) == 0 {
+				continue
+			}
+			o.lazyRow = nil
+			return r, nil
+		}
+		if o.plan.Type == planner.JoinTypeAnti {
+			if len(matches) > 0 {
+				continue
+			}
+			o.lazyRow = nil
+			return r, nil
 		}
 		if len(matches) == 0 {
 			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
@@ -587,7 +691,16 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	o.rows = make([]Row, 0, len(order))
-	for _, key := range order {
+	for idx, key := range order {
+		// M0062-followup: mirror the input-drain ctx check (line ~629)
+		// on the output-materialisation loop. A 1 M-group aggregate's
+		// rebuild can otherwise take seconds without a cancel
+		// opportunity.
+		if idx&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		gr := groups[key]
 		if gr == nil {
 			continue
@@ -761,8 +874,20 @@ func (o *aggregateOp) Close() error {
 func (o *aggregateOp) Schema() planner.Schema { return o.schema }
 
 func drainRows(op Operator) ([]Row, error) {
+	return drainRowsCtx(op, nil)
+}
+
+// drainRowsCtx drains all rows from op, checking ctx.Err() every 1000
+// rows so a CancelRequest can interrupt long hash-join build phases.
+func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 	rows := make([]Row, 0)
+	n := 0
 	for {
+		if ctx != nil && ctx.Ctx != nil && n%1000 == 0 {
+			if err := ctx.Ctx.Err(); err != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		row, err := op.Next()
 		if err == EOF {
 			return rows, nil
@@ -773,6 +898,7 @@ func drainRows(op Operator) ([]Row, error) {
 		dup := make(Row, len(row))
 		copy(dup, row)
 		rows = append(rows, dup)
+		n++
 	}
 }
 

@@ -53,8 +53,12 @@ if [[ ! -s "${PGDATA}/PG_VERSION" ]]; then
         echo "listen_addresses = '127.0.0.1'"
         echo "port = ${PG_PORT}"
         echo "shared_buffers = 2048MB"
-        echo "checkpoint_timeout = 15min"
-        echo "max_wal_size = 4GB"
+        # M0057-0002: suppress mid-benchmark checkpoints. 24-hour time
+        # threshold and 1 TiB WAL threshold are both unreachable in a
+        # 2-hour SF=1 power test. A manual CHECKPOINT is issued before
+        # the power test starts (M0054-0007-checkpoint-before-run).
+        echo "checkpoint_timeout = 24h"
+        echo "max_wal_size = 1024GB"
     } >>"${PGDATA}/postgresql.conf"
 
     # HammerDB connects with user=postgres password=postgres. Goopg's

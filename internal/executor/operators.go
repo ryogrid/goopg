@@ -123,7 +123,16 @@ func (o *filterOp) SetBorrow(s BorrowSemantics) {
 }
 
 func (o *filterOp) Next() (Row, error) {
+	rejected := 0
 	for {
+		// M0062-followup: a highly-selective filter can drain millions
+		// of child rows without yielding to the parent, blocking
+		// cancel propagation. Check ctx every 4096 rejections.
+		if rejected&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		row, err := o.child.Next()
 		if err != nil {
 			return nil, err
@@ -135,6 +144,7 @@ func (o *filterOp) Next() (Row, error) {
 		if !v.IsNull() && v.Kind == KindBool && v.Bool {
 			return row, nil
 		}
+		rejected++
 	}
 }
 
@@ -232,6 +242,14 @@ func (o *sortOp) Open(ctx *Context) error {
 		return err
 	}
 	for {
+		// M0062-followup: a sort over millions of rows can otherwise
+		// drain the child without a cancel opportunity. ctx check
+		// every 4096 rows pulled.
+		if len(o.rows)&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		row, err := o.child.Next()
 		if err == EOF {
 			break
