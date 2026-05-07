@@ -1921,6 +1921,29 @@ identical to M0061 / M0062.
       `IsolatedScope` flag with skip in
       `applyJoinTreePosMap` / `remapPosMapAfterRewrite` /
       `buildBindingsPosMap`.
+      **M0064 follow-up** 2026-05-07: the blanket Name re-bind
+      regressed Q9 (chained NLI). Gated the rebind on
+      `outerNode` being `*MultiHashJoin` — preserves Q8/Q15b
+      and restores Q9 to ~240 s / 7 rows.
+
+- [x] M0064: Q9 chained-NLI regression caused by M0063-0001's
+      Name re-bind. **LANDED** 2026-05-07. The unconditional
+      rebind in `nliRewrite` (after picking `outerKey`) walked
+      Q9's `*NestedLoopIndexJoin`-as-outer keys whose original
+      Index already matched the runtime row layout, moving them
+      onto a different table's column. Fix: gate the rebind on
+      `outerNode.(*MultiHashJoin)` AND skip when the original
+      Index is in-bounds and points at a column with the matching
+      Name. See
+      `analysis/tpch-m0064-baseline-2026-05-07.md`.
+
+- [ ] M0064-Q21-walker (carried from M0063-0004 partial): make
+      `applyJoinTreePosMap` recurse into
+      `*NestedLoopIndexJoin` so post-NLI-rewrite key remap fires
+      and the EXISTS-unnesting tail's `liftInnerOnlyFilterConjuncts`
+      can run safely. Today the lift is reverted because NLI keys
+      stay at FROM-cumulative indices and probing breaks at runtime
+      (`column "l_orderkey" is not numeric`).
 
 - [ ] M0063-0002: Q5 six-table MHJ probe throughput.
       **Status:** DEFERRED → carried into a successor

@@ -367,32 +367,39 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		return nil, false
 	}
 
-	// M0063-0001: re-bind each outer-side Key's ColumnRef.Index
-	// against the chosen `outerNode.Output()` schema by Name.
-	// `keys` are outer-side ColumnRefs originally resolved against
-	// the join's pre-substitution merged-schema (FROM-cumulative
-	// offsets). At runtime, NLI binds the OUTER row to the inner
-	// IndexScan; the Key is evaluated against `outerRow` whose
-	// width equals `len(outerNode.Output())`. If `outerNode` is a
-	// derived-table sub-plan whose Output schema doesn't match the
-	// FROM cumulative offsets, the Key's Index would point past
-	// the bound row and `lookupKey()` would silently return zero
-	// matches (Q8 / Q15b 0-rows symptom).
+	// M0063-0001 / M0064: re-bind each outer-side Key's
+	// ColumnRef.Index against the chosen `outerNode.Output()`
+	// schema by Name — but only when `outerNode` is a
+	// *MultiHashJoin. That's the shape where (a) the upstream
+	// rewrite OID-sorted (or otherwise reordered) the joined
+	// output schema, and (b) the j.Predicate's ColumnRef indices
+	// were resolved at parse time against the FROM-cumulative
+	// layout and so disagree with the runtime row layout the MHJ
+	// actually produces (Q8's `l_partkey` rebind 40 → 42, where
+	// 40 maps to `l_quantity` in the OID-sorted layout).
 	//
-	// Name re-bind is safe: the outer-side ColumnRef Name was
-	// resolved at SQL-parse / planSelect time and stays valid
-	// regardless of subsequent plan-tree shape changes. A
-	// Name-ambiguous case (the same Name appears twice in the
-	// outer schema, e.g. self-join) keeps the original Index
-	// (defensive).
-	outerSchema := outerNode.Output()
-	for _, k := range keys {
-		cr, ok := k.(*ColumnRef)
-		if !ok || cr.Name == "" {
-			continue
-		}
-		if newIdx := findUniqueColumnIndex(outerSchema, cr.Name, 0); newIdx >= 0 {
-			cr.Index = newIdx
+	// For *NestedLoopIndexJoin outers (Q9's chained-NLI shape)
+	// the downstream remap walkers (`remapExprRefsToMHJ`,
+	// `remapWithBindings`) leave NLI keys in their pre-rewrite
+	// indices on purpose; rebinding here would move the probe
+	// onto a different table's column at runtime even though the
+	// schema annotation looks OID-sorted (Q9's `l_suppkey` 15 → 24
+	// regression). For other outer kinds (SeqScan, Filter, …) the
+	// Index space matches the runtime layout directly and rebind
+	// is unnecessary.
+	if _, outerIsMHJ := outerNode.(*MultiHashJoin); outerIsMHJ {
+		outerSchema := outerNode.Output()
+		for _, k := range keys {
+			cr, ok := k.(*ColumnRef)
+			if !ok || cr.Name == "" {
+				continue
+			}
+			if cr.Index >= 0 && cr.Index < len(outerSchema) && outerSchema[cr.Index].Name == cr.Name {
+				continue
+			}
+			if newIdx := findUniqueColumnIndex(outerSchema, cr.Name, 0); newIdx >= 0 {
+				cr.Index = newIdx
+			}
 		}
 	}
 
