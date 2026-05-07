@@ -1885,6 +1885,27 @@ here for traceability:
         - Live `./tpch-runner -queries=20` completes inside the
           600 s budget.
 
+- [ ] M0062-0006: Q9 NLI schema-substitution column indices.
+      **Goal:** Q9 OK with the canonical TPC-H row count (175
+      groups for SF=1) and no SQLSTATE 42883.
+      **Root cause (per `analysis/tpch-m0062-q9-bisect-2026-05-07.md`):**
+      `internal/planner/nl_index_join.go::nliRewrite` builds the
+      substitution schema as `outer ++ inner`; for the Q9 chain
+      the parent Filter's `*ColumnRef` indices were resolved
+      against the original Join's pre-substitution layout and
+      now point at the wrong slots. `p_name` resolves to a
+      `KindTime` Datum at LIKE-eval time.
+      **Files:** `internal/planner/nl_index_join.go` (re-resolve
+        parent ColumnRefs after substitution, OR keep the
+        original `Left ++ Right` order), and possibly the
+        `executor/operators_nljoin.go` join-row layout.
+      **Workaround until merged:** `SET enable_nestloop_index =
+        off` for affected sessions.
+      **Acceptance:**
+        - Live `./tpch-runner -queries=9` returns rows.
+        - `internal/testutil/tpch/nli_parity_test.go` extended
+          to cover the Q9 multi-NLI shape.
+
 - [ ] M0062-0005: Q21 non-equijoin EXISTS correlation.
       **Goal:** Q21 OK in < 600 s on SF=1. M0061-0001's
       equijoin gate declines `<>` correlations; needs a

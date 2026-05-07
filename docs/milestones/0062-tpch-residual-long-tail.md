@@ -70,6 +70,14 @@ follow-up work but distinct from the M0062 long-tail bucket:
   l1.l_suppkey)`. The `<>` correlation predicate makes
   M0061-0001's equijoin gate decline; needs a range-correlation
   EXISTS path or per-outer-row indexed re-scan.
+- **M0062-0006** Q9 NLI schema-substitution column-index bug.
+  Bisect identified `13fad01` (M0054-0006 NLI) as the breaker.
+  With NLI on, Q9's parent Filter `*ColumnRef` for `p_name`
+  resolves at runtime to a `KindTime` Datum (a date column),
+  surfacing as SQLSTATE 42883. See
+  `analysis/tpch-m0062-q9-bisect-2026-05-07.md`. Workaround
+  `SET enable_nestloop_index = off`; proper fix re-resolves
+  parent ColumnRef indices after the NLI substitution.
 
 ## Required Design Docs
 
@@ -90,6 +98,7 @@ Per sub-task, when implemented:
 - [ ] M0062-0003 merged; Q15b returns the canonical row.
 - [ ] M0062-0004 merged; Q20 OK in < 600 s on SF=1.
 - [ ] M0062-0005 merged; Q21 OK in < 600 s on SF=1.
+- [ ] M0062-0006 merged; Q9 returns rows with NLI on.
 - [ ] `go test ./...` PASS after each sub-task.
 
 ## ⚠ NO-DEFERRAL POLICY
