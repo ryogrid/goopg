@@ -100,6 +100,8 @@ including rationale and follow-up milestone references.
 - `cmd/gen-oracle-port-status/`
 - `cmd/gen-oracle-report/`
 - `internal/testport/framework/`
+- `internal/testport/framework/isolation_runner.go` — `IsolationRunner`: multi-session concurrent executor with blocking detection, PQprint-compatible output, global+per-session setup/teardown
+- `internal/testport/isolation_port_test.go` — `TestPort_IsolationSuite` (all 121 specs), `TestPort_IsolationReadWriteUnique`, `TestPort_IsolationLockCommittedUpdate`
 - `internal/testport/scripts_port_test.go` — 13 tests porting `postgres/src/bin/scripts/t/*.pl`
   - P-011 (`080_pg_isready.pl`): fully ported, passes
   - 12 others (clusterdb, createdb, createuser, dropdb, dropuser, reindexdb, vacuumdb, connstr):

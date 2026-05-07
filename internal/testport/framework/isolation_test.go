@@ -22,14 +22,17 @@ func (m *mockIsolationExec) ExecuteStep(_ context.Context, session string, sql s
 }
 
 func TestParseAndRunIsolationPermutation(t *testing.T) {
+	// Real spec format: steps declared under their session (position-based).
 	spec := `
 session "s1"
-session "s2"
 step "s1_begin" { BEGIN; }
-step "s2_begin" { BEGIN; }
 step "s1_probe" {
   SELECT 1;
 }
+
+session "s2"
+step "s2_begin" { BEGIN; }
+
 permutation "s1_begin" "s2_begin" "s1_probe"
 `
 	path := filepath.Join(t.TempDir(), "demo.spec")
