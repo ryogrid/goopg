@@ -126,11 +126,26 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 						return cloneRow(o.joinBuf), nil
 					}
 				}
+				// M0063-0004: Anti-join fallback. When no inner
+				// match passed evalPredicate AND the join is
+				// JoinTypeAnti, emit the outer row alone (the
+				// "matched at least one" indicator was set when
+				// any inner pass would have happened — by the
+				// !o.leftJoinEmitted reuse on Anti below).
+				if o.plan.Type == planner.JoinTypeAnti && !o.leftJoinEmitted {
+					o.leftJoinEmitted = true
+					if o.borrow == BorrowedRow {
+						return o.currentOuter, nil
+					}
+					return cloneRow(o.currentOuter), nil
+				}
 				continue
 			}
 			if err != nil {
 				return nil, err
 			}
+			// Mark that some inner row was produced (used by
+			// LEFT and Anti's "no-match" fallbacks).
 			o.leftJoinEmitted = true
 			o.fillJoinBuf(o.currentOuter, innerRow)
 			ok, perr := o.evalPredicate(o.joinBuf)
@@ -138,6 +153,30 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 				return nil, perr
 			}
 			if !ok {
+				// Inner row failed the residual Predicate.
+				// Reset the leftJoinEmitted bit so Anti's
+				// "no qualifying match" fallback can fire if
+				// every inner row fails.
+				if o.plan.Type == planner.JoinTypeAnti {
+					o.leftJoinEmitted = false
+				}
+				continue
+			}
+			// M0063-0004: Semi emits the OUTER row exactly
+			// once on first qualifying match; advance to the
+			// next outer.
+			if o.plan.Type == planner.JoinTypeSemi {
+				o.innerExhausted = true
+				if o.borrow == BorrowedRow {
+					return o.currentOuter, nil
+				}
+				return cloneRow(o.currentOuter), nil
+			}
+			// M0063-0004: Anti's qualifying inner match means
+			// the outer row will NOT be emitted. Fast-forward
+			// past remaining inner rows.
+			if o.plan.Type == planner.JoinTypeAnti {
+				o.innerExhausted = true
 				continue
 			}
 			if o.borrow == BorrowedRow {

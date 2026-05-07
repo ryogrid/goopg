@@ -1195,6 +1195,102 @@ func findExistsExprInExpr(e Expr) *ExistsExpr {
 	return nil
 }
 
+// liftInnerOnlyFilterConjuncts walks `node` and removes from
+// every Filter's Predicate any top-level conjunct that is NOT
+// a trivial tautology and contains NO OuterColumnRef
+// (assumes stripOuterRefConjuncts has already removed those).
+// The removed conjuncts are returned in caller order so the
+// caller can lift them to a parent join's Predicate. Used by
+// M0063-0004's EXISTS-unnesting tail.
+func liftInnerOnlyFilterConjuncts(node Node) []Expr {
+	if node == nil {
+		return nil
+	}
+	var lifted []Expr
+	switch n := node.(type) {
+	case *Filter:
+		conjs := splitAnd(n.Predicate)
+		out := make([]Expr, 0, len(conjs))
+		for _, c := range conjs {
+			// Tautology check: ColumnRef = ColumnRef same Index/Name.
+			if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+				if l, lok := bin.Left.(*ColumnRef); lok {
+					if r, rok := bin.Right.(*ColumnRef); rok {
+						if l.Index == r.Index && l.Name == r.Name {
+							continue
+						}
+					}
+				}
+			}
+			// BooleanConst(true) → drop.
+			if bc, ok := c.(*BooleanConst); ok && bc.Value {
+				continue
+			}
+			lifted = append(lifted, c)
+		}
+		// Replace inner Filter predicate with `true`.
+		n.Predicate = &BooleanConst{pos: n.pos, Value: true}
+		_ = out
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Project:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Aggregate:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Sort:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	case *Limit:
+		lifted = append(lifted, liftInnerOnlyFilterConjuncts(n.Child)...)
+	}
+	return lifted
+}
+
+// unwrapTrivialWrappers strips Project(Filter(true, x)) /
+// Project(x) wrappers when they don't change the row shape. Used
+// by M0063-0004's EXISTS-unnesting tail to expose a bare
+// *SeqScan to `pickInnerSide` so NLI can fire for the resulting
+// hash Semi / Anti join.
+func unwrapTrivialWrappers(n Node) Node {
+	for {
+		switch x := n.(type) {
+		case *Filter:
+			if bc, ok := x.Predicate.(*BooleanConst); ok && bc.Value {
+				n = x.Child
+				continue
+			}
+			return n
+		case *Project:
+			// Identity Project: Targets are ColumnRef{Index: i}
+			// in order, len matches Child schema, and the
+			// Project carries no IsolatedScope flag.
+			if x.IsolatedScope {
+				return n
+			}
+			child := x.Child
+			if child == nil {
+				return n
+			}
+			if len(x.Targets) != len(child.Output()) {
+				return n
+			}
+			identity := true
+			for i, t := range x.Targets {
+				cr, ok := t.(*ColumnRef)
+				if !ok || cr.Index != i {
+					identity = false
+					break
+				}
+			}
+			if !identity {
+				return n
+			}
+			n = child
+			continue
+		default:
+			return n
+		}
+	}
+}
+
 // stripOuterRefConjuncts walks `node` and removes from every
 // Filter's Predicate any top-level conjunct that still references
 // an OuterColumnRef. Used by `unnestExistsExpr` (M0062-0005)
@@ -1485,7 +1581,22 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	if len(eup.Residuals) > 0 {
 		stripOuterRefConjuncts(innerPlan)
 	}
+	// Always strip even if no residuals — the equi-pair conjuncts
+	// have been replaced by self-equality tautologies and should
+	// be removed for plan tidiness AND so M0063-0004's NLI rewrite
+	// can see a bare SeqScan beneath.
+	stripOuterRefConjuncts(innerPlan)
 	innerPlan = unnestSubqueriesInPlan(innerPlan)
+	// M0063-0004: simplify trivial wrappers so M0054-0006 NLI can
+	// recognise the inner side as a *SeqScan in `pickInnerSide`.
+	// Project(Filter(true, x)) → Project(x) → x when the Project
+	// is identity AND the Filter's predicate is true. EXISTS
+	// shapes whose inner Filter only has the equi-pair (now a
+	// stripped tautology) end up as bare SeqScans — Q21's first
+	// EXISTS qualifies; the NOT EXISTS doesn't (its inner Filter
+	// still has `l_receiptdate > l_commitdate`).
+	innerPlan = unwrapTrivialWrappers(innerPlan)
+	var innerOnlyLifted []Expr
 
 	outerChild := filter.Child
 	outerWidth := len(outerChild.Output())
@@ -1544,7 +1655,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// `outerWidth + originalIndex`. The join evaluates Predicate
 	// against the (outer ++ inner) joined row.
 	var joinPredicate Expr
-	if len(eup.Residuals) > 0 {
+	if len(eup.Residuals) > 0 || len(innerOnlyLifted) > 0 {
 		var rewriteIdx func(Expr) Expr
 		rewriteIdx = func(e Expr) Expr {
 			if e == nil {
@@ -1581,8 +1692,14 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 				return e
 			}
 		}
-		residualConj := make([]Expr, 0, len(eup.Residuals))
+		var residualConj []Expr
 		for _, r := range eup.Residuals {
+			residualConj = append(residualConj, rewriteIdx(r))
+		}
+		// M0063-0004: inner-only conjuncts (no OuterColumnRef)
+		// also need their inner ColumnRef indices shifted by
+		// outerWidth so they evaluate against the joinBuf.
+		for _, r := range innerOnlyLifted {
 			residualConj = append(residualConj, rewriteIdx(r))
 		}
 		joinPredicate = combineAnd(residualConj)

@@ -273,10 +273,13 @@ func sameCrossSideEquiNLI(a, b Expr) bool {
 // `column "ps_suppkey" is not numeric at runtime` regression
 // observed in run-012 attempt #1.
 func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
-	// Only INNER and LEFT join types are supported. RIGHT/FULL
-	// require both sides materialised for the outer-row
-	// preservation contract.
-	if j.Type != JoinTypeInner && j.Type != JoinTypeLeft {
+	// Supported join types: INNER, LEFT (existing), and as of
+	// M0063-0004: Semi / Anti for index-driven EXISTS / NOT
+	// EXISTS unnested by M0061-0001. RIGHT / FULL require both
+	// sides materialised for outer-row preservation and stay on
+	// the hash / merge paths.
+	if j.Type != JoinTypeInner && j.Type != JoinTypeLeft &&
+		j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
 		return nil, false
 	}
 	// Equi-join detection: prefer the `LeftKey = RightKey` shape
@@ -409,14 +412,19 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	} else {
 		inner.Keys = keys
 	}
-	// Build the joined output schema. NLI always emits
+	// Build the joined output schema. NLI usually emits
 	// `outer ++ inner` regardless of which side contributed which
-	// to the original Join — the Join's `schema` already encodes
-	// this. We rebuild from outer.Output() ++ inner.Output() to
-	// keep the substitution self-consistent.
-	joinedSchema := make(Schema, 0, len(outerNode.Output())+len(inner.Output()))
-	joinedSchema = append(joinedSchema, outerNode.Output()...)
-	joinedSchema = append(joinedSchema, inner.Output()...)
+	// to the original Join. M0063-0004: Semi / Anti emit only
+	// the OUTER schema — the inner side is consumed only for
+	// matching, never projected.
+	var joinedSchema Schema
+	if j.Type == JoinTypeSemi || j.Type == JoinTypeAnti {
+		joinedSchema = append(Schema(nil), outerNode.Output()...)
+	} else {
+		joinedSchema = make(Schema, 0, len(outerNode.Output())+len(inner.Output()))
+		joinedSchema = append(joinedSchema, outerNode.Output()...)
+		joinedSchema = append(joinedSchema, inner.Output()...)
+	}
 
 	nli := &NestedLoopIndexJoin{
 		pos:   j.pos,
