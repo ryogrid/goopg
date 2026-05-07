@@ -41,15 +41,63 @@ type RowCounter interface {
 // (`OwnedRow`) or whose contents are invalidated by the next
 // Next() (`BorrowedRow`).
 //
-// The default is `OwnedRow`. The post-build walker
-// `setBorrowSemanticsRec` flips the bit to `BorrowedRow` on
-// Operators whose parent is one of `filterOp` / `projectOp` /
-// `limitOp` / `outputOp` — pipeline-internal consumers that read
-// each row before pulling the next one. Operators that retain
-// rows (sort, hash-build, materialize, aggregate) leave the
-// child at `OwnedRow` so the row stays valid for retention.
+// The default is `OwnedRow`. The post-build walker propagation
+// (`setChildBorrow` from Build paths in `executor.go`) flips the
+// bit to `BorrowedRow` on Operators whose parent is in the
+// borrow-safe class.
 //
-// (M0054-0005a-followup; design doc 0054-0002 §4.2.)
+// # Operator class matrix (M0059-0001)
+//
+// Class 1 — pass-through. Reads each row, hands it back up, then
+// pulls the next. Cannot retain. Safe to receive AND emit
+// borrowed rows.
+//   - filterOp        (operators.go)
+//   - limitOp         (operators.go; LIMIT/OFFSET)
+//   - projectOp       (operators.go; copies input cells into o.out)
+//
+// Class 2 — compute-only / streaming consumer. Reads each input
+// row, computes per-row state, releases the input before
+// pulling next. Safe to receive borrowed rows; may emit either
+// kind depending on output buffer reuse.
+//   - aggregateOp's input drain (operators_join_agg.go) —
+//     copies group keys into a fresh Row before retaining; the
+//     input row itself is released after applyAgg.
+//   - windowOp                  (operators_window.go)
+//   - nestedLoopIndexJoinOp's outer input (operators_nljoin.go) —
+//     concatenates outer+inner into o.joinBuf per Next.
+//
+// Class 3 — retaining / materializing. Holds rows across Next()
+// calls. MUST receive owned rows (default OwnedRow). Forces its
+// child back to OwnedRow regardless of grandparent's class.
+//   - sortOp           (operators.go; appends to o.rows[])
+//   - joinOp           (operators_join_agg.go; build-side hash, lazyHash)
+//   - multiHashJoinOp  (multi_hash_join.go; per-step hash tables)
+//   - SetOpAll / RecursiveUnion (operators.go; UNION ALL retains)
+//   - hashAggregateOp's group-state retention (when present)
+//
+// Leaf scans — class 2 emit. Decode-into a per-Next() buffer and
+// either return it directly (BorrowedRow) or `cloneRow` it
+// (OwnedRow).
+//   - seqScanOp        (operators_storage.go)
+//   - indexScanOp      (operators_index.go) — currently
+//     pre-materialises into o.rows[] at Open(), so the rows are
+//     stable across Next() and SetBorrow is a no-op for this op.
+//   - indexOnlyScanOp  (operators_indexonly.go) — same as above.
+//   - copyToOp         (copy.go) — terminal sink, doesn't emit.
+//
+// # Propagation rules
+//
+// - A class-1 parent: child gets BorrowedRow.
+// - A class-2 parent: child gets BorrowedRow IF the parent's
+//   own consumer allows; else the parent's SetBorrow chain
+//   short-circuits.
+// - A class-3 parent: child stays at OwnedRow (default). The
+//   class-3 op MUST NOT call SetBorrow on its child; doing so
+//   would invalidate retained rows. Tests in
+//   `borrow_test.go::TestRetentionBoundaryStaysOwned*` pin this.
+//
+// (M0054-0005a-followup; M0059-0001 — design doc 0059-0001-
+// borrowrow-volcano-row-lifetime-optimization.md.)
 type BorrowSemantics int
 
 const (

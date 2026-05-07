@@ -61,11 +61,21 @@ type nestedLoopIndexJoinOp struct {
 	innerExhausted bool
 	leftJoinEmitted bool // for LEFT outer: did we emit the null-padded fallback?
 	openOnce       bool
+
+	// M0059-0003: borrow contract. When set to BorrowedRow, Next()
+	// returns o.joinBuf directly without the defensive cloneRow
+	// — the parent has promised to consume the row before pulling
+	// the next one. Default OwnedRow.
+	borrow BorrowSemantics
 }
 
 func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, inner *indexScanOp) *nestedLoopIndexJoinOp {
 	return &nestedLoopIndexJoinOp{plan: p, outer: outer, inner: inner}
 }
+
+// SetBorrow flips nestedLoopIndexJoinOp into borrow-on-output mode.
+// (M0059-0003.)
+func (o *nestedLoopIndexJoinOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 func (o *nestedLoopIndexJoinOp) Schema() planner.Schema {
 	return o.plan.Output()
@@ -110,6 +120,9 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 					if ok, perr := o.evalPredicate(o.joinBuf); perr != nil {
 						return nil, perr
 					} else if ok {
+						if o.borrow == BorrowedRow {
+							return o.joinBuf, nil
+						}
 						return cloneRow(o.joinBuf), nil
 					}
 				}
@@ -126,6 +139,9 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 			}
 			if !ok {
 				continue
+			}
+			if o.borrow == BorrowedRow {
+				return o.joinBuf, nil
 			}
 			return cloneRow(o.joinBuf), nil
 		}

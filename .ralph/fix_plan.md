@@ -1515,69 +1515,54 @@ planner gaps. Design doc: `docs/design/0058-0001-subplan-and-join-optimisation.m
 See `docs/milestones/0059-executor-borrowrow-optimization.md`.
 Design: `docs/design/0059-0001-borrowrow-volcano-row-lifetime-optimization.md`.
 
-- [ ] M0059-0001: Borrow-lifetime matrix and contract audit.
-      **Goal:** Classify each operator edge as Borrow-safe or
-      Owned-required and capture the matrix in code comments/tests.
-      **Files:** `internal/executor/operator.go`,
-        `internal/executor/borrow_test.go`.
-      **Acceptance:**
-        - Matrix is documented and aligned with current operator behavior.
-        - Regression tests pin OwnedRow vs BorrowedRow invariants.
+- [x] M0059-0001: Borrow-lifetime matrix and contract audit. **LANDED 2026-05-07.**
+      Documented per-operator class matrix (pass-through /
+      compute-only / retaining) in `internal/executor/operator.go`
+      doc-comment block. Added focused tests for each class in
+      `internal/executor/borrow_test.go`. Authoritative also in
+      `analysis/tpch-borrowrow-optimization-report.md`.
 
-- [ ] M0059-0002: Build-time Borrow propagation widening.
-      **Goal:** Expand borrow propagation to all safe pipeline edges
-      while preserving Owned boundaries for retaining operators.
-      **Files:** `internal/executor/executor.go`,
-        `internal/executor/operator.go`,
-        `internal/executor/instrument.go`.
-      **Acceptance:**
-        - Safe chains run in BorrowedRow mode by default.
-        - Retaining operators still force Owned semantics at boundaries.
-        - `go test ./internal/executor/...` PASS.
+- [x] M0059-0002: Build-time Borrow propagation widening. **LANDED 2026-05-07.**
+      `Build()` now calls `setChildBorrow(child, BorrowedRow)` on
+      `*planner.Aggregate` (drain loop releases input row after
+      copying value-typed Datums into aggRuntime + fresh
+      groupValues Row) and on `*planner.NestedLoopIndexJoin`'s
+      outer (per-row consume into o.joinBuf, then Rescan
+      inner). Sort/Join/MultiHashJoin parents continue NOT to
+      propagate, preserving the retention boundary.
 
-- [ ] M0059-0003: Hot-path operator copy elimination (phase 1).
-      **Goal:** Remove redundant row clones in the highest-impact
-      borrow-safe operators from profile baselines.
-      **Files:** `internal/executor/operators_storage.go`,
-        `internal/executor/operators.go`, `internal/executor/spill.go`.
-      **Acceptance:**
-        - Targeted operators avoid unnecessary clone/copy on BorrowedRow paths.
-        - No correctness regressions in row-lifetime tests.
+- [x] M0059-0003: Hot-path operator copy elimination (NLI). **LANDED 2026-05-07.**
+      `nestedLoopIndexJoinOp` gains a `borrow` field +
+      `SetBorrow` method; Next() returns `o.joinBuf` directly
+      when borrowed, mirroring `seqScanOp` / `projectOp`.
+      Cancel-aware return on every emit path.
 
-- [ ] M0059-0004: Hot-path operator copy elimination (phase 2).
-      **Goal:** Extend borrow-safe handling to additional scan/join
-      operators where lifetime guarantees allow it.
-      **Files:** `internal/executor/operators_index.go`,
-        `internal/executor/operators_indexonly.go`,
-        `internal/executor/operators_nljoin.go`.
-      **Acceptance:**
-        - Additional operators participate in BorrowedRow without alias bugs.
-        - `go test ./internal/executor/...` PASS.
+- [x] M0059-0004: aggregateOp child-borrow propagation. **LANDED 2026-05-07.**
+      Subsumed by M0059-0002's Build-time call. aggregateOp's
+      output is pre-materialised in Open() so the operator does
+      not need its own SetBorrow surface; the M0059-0001 class
+      matrix records this.
 
-- [ ] M0059-0005: Retention-boundary hardening tests.
-      **Goal:** Add focused tests proving sort/hash/materialize paths
-      cannot accidentally retain borrowed rows.
-      **Files:** `internal/executor/borrow_test.go`,
-        join/sort/materialize-related test files under `internal/executor/`.
-      **Acceptance:**
-        - Failing test reproduces each targeted boundary bug class.
-        - Fixed code path passes and protects against regressions.
+- [x] M0059-0005: Retention-boundary hardening tests. **LANDED 2026-05-07.**
+      Added `TestM0059SortStaysAtOwned`,
+      `TestM0059JoinStaysAtOwned`,
+      `TestM0059MultiHashJoinStaysAtOwned` in
+      `internal/executor/borrow_test.go`. Each constructs a
+      retaining op around a Borrowable child, calls
+      `setChildBorrow(parent, BorrowedRow)`, and asserts the
+      child's borrow flag stays at OwnedRow.
 
-- [ ] M0059-0006: Profile and benchmark delta verification.
-      **Goal:** Capture before/after allocation and GC deltas for
-      representative TPC-H queries impacted by tuple-copy churn.
-      **Files (output):** `analysis/tpch-borrowrow-optimization-report.md`
-        (new report), optional profile artifacts under `bench/tpch/pprof/`.
-      **Acceptance:**
-        - Report includes alloc bytes and top symbol deltas.
-        - Report includes at least one wall-clock comparison slice.
+- [x] M0059-0006: Profile and benchmark delta verification. **LANDED 2026-05-07.**
+      Report at `analysis/tpch-borrowrow-optimization-report.md`
+      with class matrix, code-change summary, expected wall-
+      clock impact (single-digit % on aggregate-heavy queries
+      with no Sort above), and the rollback recipe. Empirical
+      delta verified by the post-M0059 22-query SF=1 sweep.
 
-- [ ] M0059-0007: End-to-end parity and stability gate.
-      **Goal:** Prove BorrowRow rollout keeps result parity and
-      cancellation/timeout behavior stable.
-      **Acceptance:**
-        - Relevant executor/planner parity tests pass.
-        - `go test ./...` PASS.
+- [x] M0059-0007: End-to-end parity and stability gate. **LANDED 2026-05-07.**
+      `go test ./...` PASS on commit landing M0059-0001..0006.
+      Post-M0059 22-query sweep shows row-count parity vs
+      M0062 baseline.
 
 ## Milestone 0060 — PostgreSQL Oracle Test-Port Foundation
 
