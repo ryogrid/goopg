@@ -210,16 +210,41 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		}
 		return Datum{Kind: KindBool, Bool: cmpResult(op, cmp)}, nil
 	case "LIKE", "NOT LIKE":
-		if left.Kind != KindString || right.Kind != KindString {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands", op)}
+		// M0062-followup: accept KindBytes operands as UTF-8 text so a
+		// varchar that arrives as bytes (e.g. via a row-reshaping path
+		// that drops Kind) still evaluates correctly. Mirrors
+		// `compareDatum`'s cross-Kind tolerance and aligns LIKE with
+		// the comparators it sits next to. The error message includes
+		// the actual Datum kinds so any residual non-string-non-bytes
+		// case is diagnosable in one run instead of needing a server
+		// log dive.
+		ls, lok := datumAsString(left)
+		rs, rok := datumAsString(right)
+		if !lok || !rok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands (got left.Kind=%d right.Kind=%d)", op, left.Kind, right.Kind)}
 		}
-		matched := matchSQLLike(left.String, right.String)
+		matched := matchSQLLike(ls, rs)
 		if op == "NOT LIKE" {
 			matched = !matched
 		}
 		return Datum{Kind: KindBool, Bool: matched}, nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
+}
+
+// datumAsString returns d's character payload as a Go string when
+// the value is text-like (KindString or KindBytes). Used by LIKE so
+// a varchar value that arrives as bytes still evaluates correctly,
+// mirroring `compareDatum`'s cross-Kind tolerance for character
+// data.
+func datumAsString(d Datum) (string, bool) {
+	switch d.Kind {
+	case KindString:
+		return d.String, true
+	case KindBytes:
+		return string(d.Bytes), true
+	}
+	return "", false
 }
 
 // matchSQLLike implements SQL LIKE pattern semantics: '%' matches

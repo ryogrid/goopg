@@ -1,6 +1,9 @@
 package executor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestMatchSQLLike pins the LIKE pattern semantics implemented for
 // TPC-H Q2/Q9/Q13/Q14/Q16/Q20: '%' matches any (possibly empty) run,
@@ -56,5 +59,47 @@ func TestMatchSQLLike(t *testing.T) {
 		if got != c.want {
 			t.Errorf("matchSQLLike(%q, %q) = %v, want %v", c.s, c.pat, got, c.want)
 		}
+	}
+}
+
+// TestEvalLikeAcceptsKindBytes pins the M0062-followup forward fix
+// (Q9 LIKE regression). varchar values that arrive at the LIKE
+// evaluator as KindBytes (via any row-reshaping path) must be
+// treated as UTF-8 text, not rejected with SQLSTATE 42883.
+func TestEvalLikeAcceptsKindBytes(t *testing.T) {
+	left := Datum{Kind: KindBytes, Bytes: []byte("forest green slate")}
+	right := Datum{Kind: KindString, String: "%green%"}
+	got, err := evalBinary("LIKE", left, right, 0)
+	if err != nil {
+		t.Fatalf("LIKE on KindBytes left: unexpected error %v", err)
+	}
+	if got.Kind != KindBool || !got.Bool {
+		t.Errorf("LIKE bytes vs string: got %#v, want bool true", got)
+	}
+
+	// Both-sides-bytes also works (defensive symmetry).
+	right2 := Datum{Kind: KindBytes, Bytes: []byte("%green%")}
+	got2, err := evalBinary("NOT LIKE", left, right2, 0)
+	if err != nil {
+		t.Fatalf("NOT LIKE on KindBytes both: %v", err)
+	}
+	if got2.Kind != KindBool || got2.Bool {
+		t.Errorf("NOT LIKE bytes vs bytes: got %#v, want bool false", got2)
+	}
+}
+
+// TestEvalLikeKindReportedInError pins the upgraded diagnostic
+// message: when a non-text-like Kind reaches LIKE, the error must
+// include the actual kinds so log triage doesn't need a re-run.
+func TestEvalLikeKindReportedInError(t *testing.T) {
+	left := Datum{Kind: KindInt, Int: 42}
+	right := Datum{Kind: KindString, String: "%foo%"}
+	_, err := evalBinary("LIKE", left, right, 0)
+	if err == nil {
+		t.Fatalf("LIKE on KindInt: expected error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "left.Kind=") || !strings.Contains(msg, "right.Kind=") {
+		t.Errorf("LIKE error message lacks Kind diagnostic: %q", msg)
 	}
 }

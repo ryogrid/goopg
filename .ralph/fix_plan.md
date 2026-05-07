@@ -1820,6 +1820,82 @@ full 22-query re-baseline. NO-DEFERRAL POLICY identical to M0058.
           flagged with a hypothesis and reproduction command.
       **Blocked by:** M0061-0001 (so Q4/Q21/Q22 can complete).
 
+## Milestone 0062 — TPC-H Residual Long-Tail
+
+See `docs/milestones/0062-tpch-residual-long-tail.md`. Tracks the
+five queries still blocked after M0061 wins were verified by the
+M0061-0003 sweep: Q5 (slow probe), Q8 (0-rows correctness), Q15b
+(0-rows correctness), Q20 (nested-IN decorrelation), Q21
+(non-equijoin EXISTS). NO-DEFERRAL POLICY identical to M0061.
+
+Two same-day fixes from the M0061-0003 follow-up work also live
+here for traceability:
+
+- [x] M0062-Q9 fix: LIKE accepts KindBytes, error message logs
+      Kind. Forward fix in `internal/executor/expr.go`'s LIKE
+      branch + helper `datumAsString`. Tests in
+      `internal/executor/like_test.go`. **LANDED 2026-05-07.**
+      Root-cause bisect tracked separately under M0062 (results
+      in `analysis/tpch-m0062-q9-bisect-2026-05-07.md` once
+      complete).
+- [x] M0062-Q13 fix: ctx.Err() in `runNestedLoop` inner loop
+      every 4096 iterations + RIGHT/FULL unmatched-emit loop;
+      ctx in `aggregateOp.Open` output materialisation;
+      defense-in-depth ctx in `sortOp.Open` and
+      `filterOp.Next`. Files:
+      `internal/executor/operators_join_agg.go`,
+      `internal/executor/operators.go`. **LANDED 2026-05-07.**
+
+- [ ] M0062-0001: Q5 cancel-at-600 s — slow six-table MHJ probe.
+      **Goal:** Q5 OK in < 600 s on SF=1, OR cancel returns < 1 s.
+      **Files:** `internal/executor/multi_hash_join.go`,
+        `internal/planner/bushy.go` (build-order tuning).
+      **Acceptance:**
+        - Live `./tpch-runner -queries=5 -cancel-after=600s`
+          either completes inside the budget or returns 57014
+          within 1 s of cancel-after.
+        - `go test ./internal/executor/...` PASS.
+
+- [ ] M0062-0002: Q8 0-rows correctness regression.
+      **Goal:** Q8 returns the canonical TPC-H row count
+      (typically 2 rows for SF=1: years 1995 and 1996).
+      **Files:** to be determined after diagnosis. Likely
+        `internal/executor/expr.go::extract`,
+        `internal/planner/foldconst.go`, or a join-condition
+        path.
+      **Acceptance:**
+        - Live `./tpch-runner -queries=8` returns rows.
+        - End-to-end test in `internal/testutil/tpch/` pinning
+          the canonical Q8 output.
+
+- [ ] M0062-0003: Q15b 0-rows correctness regression.
+      **Goal:** Q15b returns its canonical row.
+      **Files:** TBD. The view-body Q15a returns 10000 rows OK;
+        Q15b's `revenue0` view + max-filter returns 0.
+      **Acceptance:**
+        - Live `./tpch-runner -queries=15` returns rows in Q15b.
+
+- [ ] M0062-0004: Q20 nested-IN decorrelation.
+      **Goal:** Q20 OK in < 600 s on SF=1. Q20 has two nested
+      IN levels plus a correlated scalar; M0061-0001 only
+      handles single-level IN/EXISTS.
+      **Files:** `internal/planner/unnest.go`,
+        `internal/planner/planner.go`.
+      **Acceptance:**
+        - Live `./tpch-runner -queries=20` completes inside the
+          600 s budget.
+
+- [ ] M0062-0005: Q21 non-equijoin EXISTS correlation.
+      **Goal:** Q21 OK in < 600 s on SF=1. M0061-0001's
+      equijoin gate declines `<>` correlations; needs a
+      range-correlation path (e.g. NL with anti-semi-join or
+      per-outer-row indexed re-scan).
+      **Files:** `internal/planner/unnest.go`,
+        `internal/executor/operators_join_agg.go`.
+      **Acceptance:**
+        - Live `./tpch-runner -queries=21` completes inside the
+          600 s budget.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

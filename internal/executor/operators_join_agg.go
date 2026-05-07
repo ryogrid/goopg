@@ -120,6 +120,17 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 		}
 		matched := false
 		for j, r := range rightRows {
+			// M0062-followup: also check ctx.Err() inside the inner
+			// loop, every 4096 iterations. Q13 (customer LEFT JOIN
+			// orders, 150K × 1.5M with a NOT LIKE residual) ran 300 s
+			// past --cancel-after=600s in the M0061-0003 sweep
+			// because the *outer* check (every 256 outer rows) only
+			// fired between full passes of the 1.5M-row inner.
+			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+				if err := o.ctx.Ctx.Err(); err != nil {
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
 			joined := concatRows(l, r)
 			ok, err := o.joinPredicateMatch(joined)
 			if err != nil {
@@ -139,6 +150,15 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 
 	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
 		for j, r := range rightRows {
+			// M0062-followup: ctx check inside the unmatched-right
+			// emission loop too. RIGHT/FULL join over a multi-million-
+			// row right side could otherwise stall cancel here even
+			// after the join body has finished.
+			if j&0xFFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+				if err := o.ctx.Ctx.Err(); err != nil {
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
 			if rightMatched[j] {
 				continue
 			}
@@ -651,7 +671,16 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	o.rows = make([]Row, 0, len(order))
-	for _, key := range order {
+	for idx, key := range order {
+		// M0062-followup: mirror the input-drain ctx check (line ~629)
+		// on the output-materialisation loop. A 1 M-group aggregate's
+		// rebuild can otherwise take seconds without a cancel
+		// opportunity.
+		if idx&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
 		gr := groups[key]
 		if gr == nil {
 			continue
