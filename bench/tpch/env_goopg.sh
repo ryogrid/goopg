@@ -65,8 +65,11 @@ export TMP="${RUNTIME_DIR}/tmp"
 mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
 
 # The shared_buffers arena is a Go heap allocation under GC control.
-# GOMEMLIMIT=4GiB keeps the Go heap footprint constrained on ≤ 32 GB
-# machines while still accommodating the shared_buffers arena (256 MB
-# default). Larger shared_buffers values (e.g. 2000 MB) need ≥ 64 GB
-# system RAM — see analysis/tpch-hammerdb-run-002.md.
-export GOMEMLIMIT=20GiB
+# GOMEMLIMIT bounds the Go heap footprint. M0061-0004 lowered this
+# from 20 GiB to 12 GiB after a WSL2 32 GB host crashed during a
+# 22-query sweep with peak VmHWM=16 GB; with shared_buffers=2 GB
+# plus a generous safety margin, 12 GiB still fits TPC-H SF=1
+# while keeping ≥ 18 GB free for the OS, swap-avoidance, and any
+# co-resident processes (browser, IDE, claude-code itself).
+# Override with `GOMEMLIMIT=20GiB` for hosts with ≥ 64 GB RAM.
+export GOMEMLIMIT=${GOMEMLIMIT:-12GiB}

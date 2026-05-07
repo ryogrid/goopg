@@ -3,8 +3,11 @@ package server
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
@@ -16,12 +19,52 @@ import (
 	"github.com/goopg/goopg/internal/sqlstate"
 )
 
-// maybeForceGCAfterCommit was introduced by M0032-0006 to bound RSS
-// growth after commits. M0032-0005 throttled it to every 64 commits.
-// Removed entirely: GOMEMLIMIT provides the RSS ceiling without
-// forced stop-the-world pauses, and the throttled GC still appeared
-// as 91 % GC overhead in run-005's Q9 profile on 1.8 M-row data.
-func maybeForceGCAfterCommit() {}
+// queryHeapHighWaterMark is the per-query peak HeapInuse seen at
+// the end of `dispatchSimpleQueryViaExecutor`. If a query crosses
+// the soft threshold (heapReleaseThresholdBytes) we trigger a GC
+// and return memory to the OS via debug.FreeOSMemory(). Cheaper
+// queries skip the call to avoid the GC-overhead regressions
+// M0032-0005 documented (91 % GC time on Q9).
+//
+// M0061-0004: WSL2 went down during the M0061-0003 sweep with
+// peak VmHWM=16 GB, suggesting a process-level memory pressure.
+// `maybeForceGCAfterCommit` had been a no-op since M0032 ripped
+// out the unconditional GC. We now do a *conditional* free —
+// only when HeapInuse crossed the threshold during this query.
+const heapReleaseThresholdBytes = 4 << 30 // 4 GiB
+
+// queriesWithoutFreeCounter accumulates queries since the last
+// FreeOSMemory(). Even if no single query crosses the threshold,
+// we still issue one Free every N queries so a long sequence of
+// medium queries (Q1..Q22 sweep) cannot accumulate unreclaimed
+// retained allocations indefinitely.
+var queriesWithoutFreeCounter int64
+
+const queriesPerForcedFree = 8
+
+// maybeForceGCAfterCommit triggers `runtime.GC()` +
+// `debug.FreeOSMemory()` at the end of a Query message when
+// either:
+//   - HeapInuse > heapReleaseThresholdBytes  (this query was big), or
+//   - we've gone queriesPerForcedFree queries without a Free   (drift).
+//
+// Performance: each Free call is ~50–500 ms on a 4 GiB heap and
+// happens at most once per query, on the path where the client
+// has *already* received its CommandComplete (the GC pause is
+// invisible to the just-finished query). The next query may pay
+// a cold-cache penalty on first allocation, but at our query
+// granularity (seconds) that is negligible.
+func maybeForceGCAfterCommit() {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	n := atomic.AddInt64(&queriesWithoutFreeCounter, 1)
+	if ms.HeapInuse < heapReleaseThresholdBytes && n < queriesPerForcedFree {
+		return
+	}
+	atomic.StoreInt64(&queriesWithoutFreeCounter, 0)
+	runtime.GC()
+	debug.FreeOSMemory()
+}
 
 // dispatchSimpleQueryViaExecutor is the parser-driven path for the
 // simple-query protocol: it parses the SQL, plans each statement,
