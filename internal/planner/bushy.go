@@ -1545,6 +1545,16 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		// alias‑aware schemas; ambiguous matches keep the original
 		// index untouched.
 		reresolveJoinByName(n)
+	case *NestedLoopIndexJoin:
+		// M0065-0001: walk into Outer (so deeper Joins get their
+		// keys reresolved). Don't touch NLI's own keys here —
+		// posMap remap and Name re-resolve both empirically break
+		// Q9's chained-NLI shape (where the existing keys already
+		// align with the runtime row layout). Q21's mismatching
+		// Anti-NLI keys are a separate problem tracked under
+		// M0065-Q21-walker; the safe thing is to leave NLI keys
+		// alone in this walker.
+		applyJoinTreePosMap(n.Outer, posMap)
 	case *Filter:
 		applyJoinTreePosMap(n.Child, posMap)
 		remapByPosMap(&n.Predicate, posMap)
