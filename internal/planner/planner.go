@@ -704,9 +704,58 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 		if err != nil {
 			return nil, nil, err
 		}
+		joinType := mapJoinType(j.Type)
+		// M0063-0005: for LEFT JOIN, partition the ON conjuncts.
+		// Single-inner-side conjuncts (referencing only the right
+		// range-var's columns) move to a Filter wrapping the
+		// inner plan BEFORE the join, so the join's residual
+		// Predicate can decompose into a clean equi-pair and the
+		// hash path can fire. The classic Q13 shape:
+		//   `customer LEFT JOIN orders ON c_custkey = o_custkey
+		//      AND o_comment NOT LIKE '%special%requests%'`
+		// previously fell through to a Nested Loop because the
+		// AND-chain didn't split as a single equality. Pushing
+		// the inner-only NOT-LIKE before the join leaves a clean
+		// equi-pair on `c_custkey = o_custkey` that
+		// `splitEqualityForHash` accepts. Outer-only conjuncts
+		// CANNOT move (LEFT JOIN preserves unmatched outer
+		// rows); they stay in the join Predicate.
+		if joinType == JoinTypeLeft && pred != nil {
+			leftWidth := len(leftCtx.schema)
+			totalWidth := leftWidth + len(rightNode.Output())
+			conjuncts := splitAnd(pred)
+			var keep []Expr
+			var innerOnly []Expr
+			for _, c := range conjuncts {
+				switch classifyConjunctSide(c, leftWidth, totalWidth) {
+				case sideRight:
+					innerOnly = append(innerOnly, c)
+				default:
+					keep = append(keep, c)
+				}
+			}
+			if len(innerOnly) > 0 {
+				// Inner-only conjuncts were resolved against the
+				// merged outer schema; their ColumnRef.Index values
+				// reference the inner range-var at outer-cumulative
+				// offset `leftWidth`. Now that they evaluate against
+				// the inner-only row, shift each ColumnRef.Index by
+				// `-leftWidth` so it points into the inner schema.
+				shifted := make([]Expr, len(innerOnly))
+				for i, c := range innerOnly {
+					shifted[i] = shiftColumnRefsBy(c, -leftWidth)
+				}
+				rightNode = &Filter{
+					pos:       j.Pos(),
+					Child:     rightNode,
+					Predicate: combineAnd(shifted),
+				}
+			}
+			pred = combineAnd(keep)
+		}
 		jn := &Join{
 			pos:       j.Pos(),
-			Type:      mapJoinType(j.Type),
+			Type:      joinType,
 			Left:      leftNode,
 			Right:     rightNode,
 			Predicate: pred,
@@ -3221,4 +3270,54 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		return filter
 	}
 	return ios
+}
+
+// shiftColumnRefsBy walks an expression tree and adds `delta` to
+// every ColumnRef's Index. OuterColumnRefs are left alone (they
+// reference an enclosing scope). Used by M0063-0005 to translate
+// outer-cumulative-indexed conjuncts back to inner-scope when
+// they're pushed below a LEFT JOIN.
+func shiftColumnRefsBy(e Expr, delta int) Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		cl := *x
+		cl.Index += delta
+		return &cl
+	case *BinaryOp:
+		return &BinaryOp{
+			pos:   x.Pos(),
+			Op:    x.Op,
+			Left:  shiftColumnRefsBy(x.Left, delta),
+			Right: shiftColumnRefsBy(x.Right, delta),
+		}
+	case *UnaryOp:
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftColumnRefsBy(x.Operand, delta)}
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = shiftColumnRefsBy(a, delta)
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+	case *CaseExpr:
+		whens := make([]CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			whens[i] = CaseWhen{
+				When: shiftColumnRefsBy(w.When, delta),
+				Then: shiftColumnRefsBy(w.Then, delta),
+			}
+		}
+		return &CaseExpr{
+			pos:     x.Pos(),
+			Operand: shiftColumnRefsBy(x.Operand, delta),
+			Whens:   whens,
+			Else:    shiftColumnRefsBy(x.Else, delta),
+		}
+	case *ExtractExpr:
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: shiftColumnRefsBy(x.Source, delta)}
+	default:
+		return e
+	}
 }
