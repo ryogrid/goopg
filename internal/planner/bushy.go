@@ -1036,7 +1036,17 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		return
 	case *Join:
 		remapPosMapAfterRewrite(n.Left, nil)
-		remapPosMapAfterRewrite(n.Right, nil)
+		// M0062-0005: Semi / Anti joins carry an isolated subquery
+		// scope on their Right (the cloned EXISTS inner plan). Do
+		// not descend with the outer scope's posMap — the inner
+		// plan was already independently optimised by the
+		// recursive `unnestSubqueriesInPlan` call inside
+		// `unnestExistsExpr`, and its ColumnRefs use inner-scope
+		// indices that must not be remapped against outer
+		// bindings.
+		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
+			remapPosMapAfterRewrite(n.Right, nil)
+		}
 		subRemap([]Expr{n.Predicate, n.LeftKey, n.RightKey})
 		return
 	case *Filter:
@@ -1502,7 +1512,14 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		return
 	case *Join:
 		applyJoinTreePosMap(n.Left, posMap)
-		applyJoinTreePosMap(n.Right, posMap)
+		// M0062-0005: Semi/Anti joins' Right side is the cloned
+		// EXISTS inner plan — an isolated subquery scope whose
+		// ColumnRefs use inner-scope indices and must NOT be
+		// remapped by the outer FROM-bindings posMap. (The same
+		// rule applies in `remapPosMapAfterRewrite`.)
+		if n.Type != JoinTypeSemi && n.Type != JoinTypeAnti {
+			applyJoinTreePosMap(n.Right, posMap)
+		}
 		// Re‑resolve Join keys/predicate by NAME against the
 		// post‑rewrite child output schemas. The bushy DP produced
 		// subset‑FROM‑order indices, but rewriteMultiWayChain may

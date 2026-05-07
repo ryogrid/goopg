@@ -73,6 +73,30 @@ func TestUnnestExistsNonCorrelatedStays(t *testing.T) {
 	}
 }
 
+// TestUnnestExistsMixedEquiAndNonEqui pins M0062-0005: an EXISTS
+// whose correlation combines an equi-pair AND a non-equi residual
+// (e.g. Q21's `l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <>
+// l1.l_suppkey`) is unnested as a hash semi-join keyed on the
+// equi-pair, with the `<>` lifted to the join's Predicate.
+func TestUnnestExistsMixedEquiAndNonEqui(t *testing.T) {
+	cat := twoTablesCatalog(t)
+	sql := `SELECT x FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE z = t1.x AND y <> t1.x)`
+	node, err := Plan(parseOne(t, sql), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex := findExistsExpr(node); ex != nil {
+		t.Errorf("ExistsExpr survived: %#v", ex)
+	}
+	j := findFirstJoinByType(node, JoinTypeSemi)
+	if j == nil {
+		t.Fatalf("no JoinTypeSemi: %s", planString(node))
+	}
+	if j.Predicate == nil {
+		t.Errorf("Semi join missing residual Predicate (the `<>` should have been lifted)")
+	}
+}
+
 // TestUnnestExistsNonEquijoinStays verifies that a correlated EXISTS
 // whose correlation is NOT an equijoin (range predicate) falls
 // through to the existing SubPlan path; canUnnestExistsExpr's
