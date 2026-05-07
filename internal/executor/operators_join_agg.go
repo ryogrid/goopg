@@ -204,7 +204,19 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		if err := buildOp.Open(ctx); err != nil { return err }
 		var nullRight Row
 		var keyRow Row
+		buildCount := 0
 		for {
+			// M0062-followup: ctx check inside the build loop. With
+			// 6M-row build inputs (Q21's anti-join lineitem) the
+			// build alone runs minutes; without this check the
+			// cancel-after deadline can be exceeded by 100+ s
+			// while build keeps draining.
+			if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+				if err := ctx.Ctx.Err(); err != nil {
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
+			buildCount++
 			l, err := buildOp.Next()
 			if err == EOF { break }
 			if err != nil { return err }
@@ -237,7 +249,15 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	if err := buildOp.Open(ctx); err != nil { return err }
 	var nullLeft Row
 	var keyRow Row
+	buildCount := 0
 	for {
+		// M0062-followup: same ctx check on the build-right path.
+		if buildCount&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+			if err := ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		buildCount++
 		r, err := buildOp.Next()
 		if err == EOF { break }
 		if err != nil { return err }
