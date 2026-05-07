@@ -415,6 +415,29 @@ func (c *Cluster) Query(ctx context.Context, sqlText string) ([][]string, error)
 	return out, nil
 }
 
+// RunClientTool runs a PostgreSQL client tool (createdb, dropdb, vacuumdb,
+// reindexdb, clusterdb, createuser, dropuser, pg_isready, etc.) with
+// -h/-p/-U connection flags pre-filled from this cluster's listen address
+// and user.  The named binary must be on PATH.
+func (c *Cluster) RunClientTool(name string, args ...string) (util.CommandResult, error) {
+	if _, err := exec.LookPath(name); err != nil {
+		return util.CommandResult{ExitCode: -1}, fmt.Errorf("%s not found in PATH: %w", name, err)
+	}
+	host, port, err := splitHostPort(c.listenAddr)
+	if err != nil {
+		return util.CommandResult{}, err
+	}
+	base := []string{"-h", host, "-p", port, "-U", c.user}
+	base = append(base, args...)
+	return util.RunCommand(util.CommandSpec{
+		Name:    name,
+		Args:    base,
+		Dir:     c.repoRoot,
+		Env:     []string{"PGPASSWORD="},
+		Timeout: 60 * time.Second,
+	})
+}
+
 // AppendPostgresqlConf appends one line to postgresql.conf.
 func (c *Cluster) AppendPostgresqlConf(line string) error {
 	return appendLine(filepath.Join(c.dataDir, "postgresql.conf"), line)

@@ -100,6 +100,26 @@ including rationale and follow-up milestone references.
 - `cmd/gen-oracle-port-status/`
 - `cmd/gen-oracle-report/`
 - `internal/testport/framework/`
+- `internal/testport/scripts_port_test.go` — 13 tests porting `postgres/src/bin/scripts/t/*.pl`
+  - P-011 (`080_pg_isready.pl`): fully ported, passes
+  - 12 others (clusterdb, createdb, createuser, dropdb, dropuser, reindexdb, vacuumdb, connstr):
+    skeleton + `t.Skip` with specific blockers (see D-005a–D-005l in port-status CSV)
+
+## scripts/t Skip Rationale
+
+| Test file | Skip reason |
+|-----------|-------------|
+| 100_vacuumdb.pl, 102_vacuumdb_stages.pl | `VACUUM (opts)` parenthesized syntax not in goopg parser; also needs `pg_catalog.pg_namespace` |
+| 101_vacuumdb_all.pl | Same + multi-database iteration via `pg_database` |
+| 020_createdb.pl | `CREATE DATABASE` not in parser/executor |
+| 050_dropdb.pl | `DROP DATABASE` not in parser/executor; depends on CREATE DATABASE |
+| 040_createuser.pl | `CREATE ROLE/USER` not in parser/executor |
+| 070_dropuser.pl | `DROP ROLE/USER` not in parser/executor |
+| 090_reindexdb.pl | `REINDEX DATABASE/TABLE` not in parser/executor |
+| 091_reindexdb_all.pl | REINDEX + multi-database |
+| 010_clusterdb.pl | `CLUSTER` not in parser/executor |
+| 011_clusterdb_all.pl | CLUSTER + multi-database |
+| 200_connstr.pl | CREATE DATABASE + LATIN1 encoding (goopg is UTF8-only) |
 
 ## Out of Scope
 

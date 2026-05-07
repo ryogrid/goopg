@@ -125,6 +125,8 @@ When porting any concept, cite the upstream file path (e.g.
 `postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
 and/or code comment. Never modify, vendor, or import code from `./postgres/`.
 
+Markdowned official PostgreSQL documentation is placed `postgres/official_docs_in_md/` for easy reference and linking. When citing the official docs, link to
+
 ## Design reference policy
 
 When evaluating or creating a design, treat the PostgreSQL implementation under

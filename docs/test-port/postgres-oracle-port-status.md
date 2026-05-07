@@ -15,7 +15,7 @@ Status meanings:
 | mixed | 0 | 2 | 0 |
 | modules | 0 | 0 | 1 |
 | regress | 0 | 1 | 0 |
-| tap | 10 | 3 | 1 |
+| tap | 11 | 14 | 1 |
 
 ## Entries
 
@@ -35,7 +35,19 @@ Status meanings:
 | D-002 | `postgres/src/test/isolation` | isolation | defer | no | Requires deterministic multi-session scheduler and expected-schedule comparator integration. | `M0060-0004` |
 | D-003 | `postgres/src/test/recovery` | tap | defer | no | Recovery TAP scenarios require replication/failover capability growth before pass-required promotion. | `M0060-0005` |
 | D-004 | `postgres/src/test/subscription` | tap | defer | no | Subscription TAP scenarios require logical replication capability growth before pass-required promotion. | `M0060-0005` |
-| D-005 | `postgres/src/bin/scripts/t` | tap | defer | no | Client utility script suites are in scope and tracked but require broader SQL/catalog parity before pass-required promotion. | `M0060-0003` |
+| P-011 | `postgres/src/bin/scripts/t/080_pg_isready.pl` | tap | port | yes | Ported as TestPort_Scripts080PgIsready in internal/testport/scripts_port_test.go | `-` |
+| D-005a | `postgres/src/bin/scripts/t/100_vacuumdb.pl` | tap | defer | no | Requires VACUUM parenthesized option syntax (VACUUM (FULL/FREEZE/SKIP_DATABASE_STATS/...)) in goopg parser+executor and pg_catalog.pg_namespace catalog view. | `M0060-0003` |
+| D-005b | `postgres/src/bin/scripts/t/102_vacuumdb_stages.pl` | tap | defer | no | Requires same VACUUM parenthesized syntax as D-005a; blocked by same parser gap. | `M0060-0003` |
+| D-005c | `postgres/src/bin/scripts/t/101_vacuumdb_all.pl` | tap | defer | no | Requires VACUUM parenthesized syntax (D-005a) and multi-database iteration via pg_database. | `M0060-0003` |
+| D-005d | `postgres/src/bin/scripts/t/020_createdb.pl` | tap | defer | no | Requires CREATE DATABASE parser+executor stub; goopg currently single-database only. | `M0060-0003` |
+| D-005e | `postgres/src/bin/scripts/t/050_dropdb.pl` | tap | defer | no | Requires DROP DATABASE parser+executor stub; depends on CREATE DATABASE (D-005d). | `M0060-0003` |
+| D-005f | `postgres/src/bin/scripts/t/040_createuser.pl` | tap | defer | no | Requires CREATE ROLE/USER parser+executor stub. | `M0060-0003` |
+| D-005g | `postgres/src/bin/scripts/t/070_dropuser.pl` | tap | defer | no | Requires DROP ROLE/USER parser+executor stub; depends on CREATE ROLE (D-005f). | `M0060-0003` |
+| D-005h | `postgres/src/bin/scripts/t/090_reindexdb.pl` | tap | defer | no | Requires REINDEX DATABASE/TABLE parser+executor stub. | `M0060-0003` |
+| D-005i | `postgres/src/bin/scripts/t/091_reindexdb_all.pl` | tap | defer | no | Requires REINDEX stub (D-005h) and multi-database support. | `M0060-0003` |
+| D-005j | `postgres/src/bin/scripts/t/010_clusterdb.pl` | tap | defer | no | Requires CLUSTER parser+executor stub. | `M0060-0003` |
+| D-005k | `postgres/src/bin/scripts/t/011_clusterdb_all.pl` | tap | defer | no | Requires CLUSTER stub (D-005j) and multi-database support. | `M0060-0003` |
+| D-005l | `postgres/src/bin/scripts/t/200_connstr.pl` | tap | defer | no | Requires CREATE DATABASE (D-005d) and LATIN1 server encoding; goopg currently UTF8-only. | `M0060-0003` |
 | D-006 | `postgres/src/test/modules` | mixed | defer | no | Modules migration is staged by dependency class and extension assumptions. | `M0060-0005` |
 | D-007 | `postgres/contrib` | mixed | defer | no | Contrib migration is staged by dependency class and extension/runtime assumptions. | `M0060-0005` |
 | E-001 | `postgres/src/test/modules/unsafe_tests` | modules | excluded | no | Explicit unsafe suite is outside compatibility scope by policy. | `-` |
