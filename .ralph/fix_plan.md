@@ -1990,6 +1990,71 @@ identical to M0061 / M0062.
       OK; Q9 newly regressed to 600 s cancel and tracked
       as a follow-up).
 
+## Milestone 0065 — TPC-H Residual Long-Tail v3
+
+See `docs/milestones/0065-tpch-residual-long-tail-v3.md`.
+Closes the three remaining cancels after M0064 (Q5 / Q20 /
+Q21). Goal: 22/22 OK on SF=1.
+
+- [ ] M0065-0001: Q21 NLI-aware key remap walker.
+      **Goal:** Q21 OK in < 600 s on SF=1 with ~411 rows.
+      **Approach:** extend `applyJoinTreePosMap` (and
+      `remapPosMapAfterRewrite` if needed) with a
+      `*NestedLoopIndexJoin` case that recurses into
+      Outer/Inner AND remaps Key/Keys/Predicate via
+      posMap. Re-enable
+      `liftInnerOnlyFilterConjuncts(innerPlan)` in
+      `unnestExistsExpr` (currently `var innerOnlyLifted
+      []Expr` declared empty). For Hash joins where
+      `tryBuildNLI` succeeds, propagate `j.Predicate` (the
+      lifted residuals) onto `NLI.Predicate`. Verify
+      Q9 remains OK / 7 rows.
+      **Files:** `internal/planner/bushy.go`
+      (`applyJoinTreePosMap`), `internal/planner/unnest.go`
+      (re-enable lift), `internal/planner/nl_index_join.go`
+      (`tryBuildNLI` Predicate propagation).
+      **Acceptance:**
+        - Q21 OK < 600 s, ~411 rows.
+        - Q9 still OK / 7 rows.
+        - `go test ./...` PASS.
+
+- [ ] M0065-0002: Q20 correlated scalar decorrelation.
+      **Goal:** Q20 OK in < 600 s on SF=1.
+      **Approach:** dump post-`unnestSubqueriesInPlan` Q20
+      tree to identify whether the inner correlated scalar
+      `SELECT 0.5 * SUM(l_quantity) ...` survives. If so,
+      ensure `unnestInExpr`'s post-clone call to
+      `unnestSubqueriesInPlan(innerPlan)` recurses into the
+      cloned partsupp inner plan. If `canUnnestSubquery`
+      rejects the SUM-over-single-Filter shape, relax it.
+      **Files:** `internal/planner/unnest.go`.
+      **Acceptance:**
+        - Q20 OK < 600 s.
+        - EXPLAIN shows GROUP BY aggregate join instead of
+          per-row SubPlan.
+        - `go test ./...` PASS.
+
+- [ ] M0065-0003: Q5 six-table MHJ throughput.
+      **Goal:** Q5 OK in < 600 s on SF=1.
+      **Approach:** profile Q5 with pprof at 1200 s.
+      If per-row cost dominates, hoist constant predicates.
+      If hash-insertion-bound (region/nation small-build),
+      extend `rewriteJoinsToNLI` to walk into
+      `*MultiHashJoin.Tables[i]` and emit per-table NLI
+      candidates.
+      **Files:** `internal/planner/nl_index_join.go`,
+      `internal/executor/multi_hash_join.go`.
+      **Acceptance:**
+        - Q5 OK < 600 s.
+        - pprof artifact in `bench/tpch/pprof/q5-fixed.pprof`.
+        - `go test ./...` PASS.
+
+- [ ] M0065-0004: Final 22-query SF=1 sweep + report.
+      **Files (output):**
+        `analysis/tpch-m0065-baseline-<date>.md`,
+        `bench/tpch/logs/m0065_22q_<ts>.log`.
+      **Blocked by:** M0065-0001..0003.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
