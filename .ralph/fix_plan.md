@@ -2089,8 +2089,62 @@ broke other queries; reverted.
         `bench/tpch/pprof/cpu_q20_after.prof`.
       **Blocked by:** M0066-0001..0003.
 
-- [ ] M0067: Planner-side Q5/Q20/Q21 fixes carried over from
-      M0066's abortive attempts. Findings:
+## Milestone 0067 — TPC-H Structural Runtime Improvements
+
+See `docs/milestones/0067-tpch-structural-runtime.md`. Builds
+on M0066 PIVOT's allocation reductions. Verifies at
+`cancel-after=1200s` (was 600s).
+
+- [ ] M0067-0001: Milestone doc + fix_plan update.
+      **Files:** `docs/milestones/0067-tpch-structural-runtime.md`,
+      `.ralph/fix_plan.md`.
+
+- [ ] M0067-0002: 1200s baseline sweep.
+      **Files (output):**
+        `bench/tpch/logs/m0067_baseline_22q_<ts>.log`.
+      **Acceptance:** OK count documented; deltas vs. M0066
+      `cancel-after=600s` recorded.
+
+- [ ] M0067-0003: Q9 composite-NLI investigation + fix.
+      **Files:** `internal/planner/nl_index_join.go`
+      (`collectCrossSideEquiKeys`,
+      `pickIndexCoveringAllLeadingColumns`).
+      **Acceptance:** Q9 EXPLAIN shows `Index Scan using
+      partsupp_pk on partsupp`; row count documented (likely
+      ≠ 7).
+
+- [ ] M0067-0004: Q21 NLI walker re-attempt
+      (post-composite-NLI).
+      **Files:** `internal/planner/bushy.go`
+      (`applyJoinTreePosMap`, `remapPosMapAfterRewrite`,
+      new `reresolveNLIByName`).
+      **Acceptance:** Q21 OK < 1200 s OR documented blocker
+      (Filter-wrapped lineitem); Q9 stable.
+
+- [ ] M0067-0005: Projection narrowing (stretch).
+      **Files:** `internal/planner/bushy.go` (new
+      `pruneUnusedColumnsInMHJ` pass), `internal/planner/plan.go`.
+      **Acceptance:** Q5 pprof shows duffcopy/memclr share
+      drops; row-count parity preserved.
+
+- [ ] M0067-0006: Final 22-query sweep at `cancel-after=1200s`
+      + report.
+      **Files (output):**
+        `analysis/tpch-m0067-baseline-<date>.md`,
+        `bench/tpch/logs/m0067_22q_<ts>.log`.
+      **Blocked by:** M0067-0001..0005.
+
+## Deferred (former M0067 draft, now superseded)
+
+- [ ] M0068 candidate: Datum struct shrink (~80 → 32 bytes).
+- [ ] M0068 candidate: Q5 build-time predicate pushdown for
+      unpromoted SeqScans — earlier abortive attempt broke
+      Q3 due to walker interaction; needs guarded
+      re-implementation.
+- [ ] M0068 candidate: Q20 timestamp btree v0 OR unnest
+      non-correlated IN to SemiJoin (only correlated INs are
+      currently unnested).
+- [ ] M0068 candidate (deprecated, use anchor below): Findings:
       - Q5: build-time predicate pushdown for unpromoted
         SeqScans (Filter-wrap fallback when no btree); broke
         Q3 due to walker interaction. Needs guarded
