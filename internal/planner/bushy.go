@@ -1403,11 +1403,19 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
 			off += len(x.Output())
 		case *IndexScan:
-			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: ""}, off: off})
+			// M0062-0002: preserve Alias so self-joins (Q8 `nation n1, nation n2`)
+			// can disambiguate when one side flips to IndexScan.
+			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
 			off += len(x.Output())
 		case *MultiHashJoin:
 			for _, t := range x.Tables {
-				if s, ok := t.(*SeqScan); ok {
+				switch s := t.(type) {
+				case *SeqScan:
+					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
+					off += len(s.Output())
+				case *IndexScan:
+					// M0062-0002: same alias preservation as the
+					// top-level IndexScan arm.
 					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
 					off += len(s.Output())
 				}
@@ -1415,6 +1423,14 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		case *Join:
 			collect(x.Left)
 			collect(x.Right)
+		case *NestedLoopIndexJoin:
+			// M0062-0006: NLI sits between Filter and the underlying
+			// MHJ for Q9-shape plans. Without this case the collect
+			// walker stops at NLI and `buildBindingsPosMap` returns
+			// an empty scanMap, so `p_name`'s ColumnRef.Index is
+			// never re-resolved against the OID-sorted MHJ output.
+			collect(x.Outer)
+			collect(x.Inner)
 		case *Filter:
 			collect(x.Child)
 		case *Project:

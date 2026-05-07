@@ -291,6 +291,11 @@ func (n *SeqScan) Output() Schema { return n.schema }
 type IndexScan struct {
 	pos     int
 	Table   *catalog.Table
+	Alias   string // FROM-clause alias; empty when not specified. M0062-0002
+	// preserves the alias when an `IndexScan` is substituted for a
+	// `SeqScan` (e.g. by `mhj_input_rewrite`); without it,
+	// `buildBindingsPosMap` cannot disambiguate self-joins like Q8's
+	// `nation n1, nation n2` after one side flips to IndexScan.
 	Index   *catalog.Index
 	Key     Expr  // non-nil for single-column equality scan (LowKey==HighKey implied)
 	Keys    []Expr // M0054-0006-followup-Q9-composite: multi-column equality probe.
