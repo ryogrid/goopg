@@ -2055,6 +2055,37 @@ Q21). Goal: 22/22 OK on SF=1.
         `bench/tpch/logs/m0065_22q_<ts>.log`.
       **Blocked by:** M0065-0001..0003.
 
+## Milestone 0066 — TPC-H Residual Q5/Q20/Q21 Final
+
+See `docs/milestones/0066-tpch-residual-q5q20q21-final.md`.
+Closes the three remaining cancels after M0065 (Q5 / Q20 /
+Q21). Goal: 22/22 OK on SF=1.
+
+- [ ] M0066-0001: Q5 date filter classification + IndexScan
+      promotion.
+      **Files:** `internal/executor/multi_hash_join.go::partitionFilters`,
+      `internal/planner/mhj_input_rewrite.go`.
+      **Acceptance:** Q5 OK < 600 s with 5 rows.
+
+- [ ] M0066-0002: Q20 IN-subquery predicate pushdown.
+      **Files:** `internal/planner/unnest.go` (or new
+      pushdown pass), `internal/planner/planner.go::Plan`
+      wiring.
+      **Acceptance:** Q20 OK < 600 s with ~411 rows.
+
+- [ ] M0066-0003: Q21 NLI walker key Name-rebind.
+      **Files:** `internal/planner/bushy.go`
+      (`applyJoinTreePosMap`, `remapPosMapAfterRewrite`,
+      new `reresolveNLIByName`).
+      **Acceptance:** Q21 OK < 600 s with ~411 rows; Q9
+      outcome documented (best/acceptable/worst).
+
+- [ ] M0066-0004: Final 22-query SF=1 sweep + report.
+      **Files (output):**
+        `analysis/tpch-m0066-baseline-<date>.md`,
+        `bench/tpch/logs/m0066_22q_<ts>.log`.
+      **Blocked by:** M0066-0001..0003.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
