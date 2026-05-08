@@ -2388,24 +2388,20 @@ row counts and complete; the four outstanding issues are:
 Per the user directive (planner-first; Q20 investigation
 explicit; slot pipeline as later structural track):
 
-- [ ] M0071-0001: Q9 NLI column-rebind fix (planner-only).
-      Re-attempt the M0067-0003 composite-NLI hoist with a
-      narrowed rebind gate that handles the chained-NLI
-      shape (multiple `*NestedLoopIndexJoin` outers in
-      sequence) without moving keys to wrong runtime slots.
-      The M0064 outer-MHJ rebind gate at
-      `internal/planner/nl_index_join.go:399` is the
-      precedent pattern; extend with a third gate for the
-      NLI-as-outer case using a posMap that tracks each
-      layer's substitution.
-      **Files:** `internal/planner/nl_index_join.go`;
-      `internal/planner/bushy.go` (`applyJoinTreePosMap` if
-      posMap recursion is needed).
-      **Acceptance:**
-        - Q9 row count ≥ 90 (target 175).
-        - Q3 row count preserved (regression guard).
-        - `go test ./internal/planner/...
-          ./internal/testutil/tpch/...` PASS.
+- [x] M0071-0001: Q9 NLI column-rebind fix (planner-only)
+      — DEFERRED → **M0071-0005** (slot pipeline).
+      Time-boxed investigation 2026-05-09 confirmed the
+      chained-NLI rebind is structurally blocked by the
+      existing defensive gates at
+      `internal/planner/nl_index_join.go:399` and
+      `internal/planner/bushy.go:1548` — these gates exist
+      precisely because earlier attempts (M0064, M0065,
+      M0067-0003) regressed Q9 worse (M0067-0003: 7 rows
+      → 1 row). The schema-annotation-vs-runtime-layout
+      mismatch requires the unified column-coordinate
+      model that the TupleSlot pipeline (M0071-0005)
+      provides. See
+      `analysis/tpch-m0071-q9-investigation-2026-05-09.md`.
 
 - [ ] M0071-0002: Q20 zero-rows investigation
       (NEW; planner-only).
