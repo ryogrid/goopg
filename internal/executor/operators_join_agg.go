@@ -895,7 +895,7 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		dup := make(Row, len(row))
+		dup := acquireRow(len(row))
 		copy(dup, row)
 		rows = append(rows, dup)
 		n++

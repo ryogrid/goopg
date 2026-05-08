@@ -61,14 +61,18 @@ func newProjectOp(plan *planner.Project, child Operator) *projectOp {
 func (o *projectOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	if cap(o.out) < len(o.targets) {
-		o.out = make(Row, len(o.targets))
+		o.out = acquireRow(len(o.targets))
 	} else {
 		o.out = o.out[:len(o.targets)]
 	}
 	return o.child.Open(ctx)
 }
 func (o *projectOp) Schema() planner.Schema { return o.schema }
-func (o *projectOp) Close() error           { return o.child.Close() }
+func (o *projectOp) Close() error {
+	releaseRow(o.out)
+	o.out = nil
+	return o.child.Close()
+}
 
 // SetBorrow marks projectOp as eligible to return borrowed
 // rows. (M0054-0005a-followup.)

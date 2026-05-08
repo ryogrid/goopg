@@ -264,7 +264,7 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 	o.lazyMatches = make([][]Row, len(o.keySteps))
 	o.lazyCursors = make([]int, len(o.keySteps))
 	// Allocate the shared output buffer.
-	o.lazyOut = make(Row, acc)
+	o.lazyOut = acquireRow(acc)
 	return nil
 }
 
@@ -619,7 +619,10 @@ func (o *multiHashJoinOp) Close() error {
 	o.hashTblIsInt = nil
 	o.nulls = nil
 	o.keySteps = nil
-	o.lazyOut = nil
+	if o.lazyOut != nil {
+		releaseRow(o.lazyOut)
+		o.lazyOut = nil
+	}
 	o.lazyMatches = nil
 	o.lazyCursors = nil
 	o.probeFilters = nil

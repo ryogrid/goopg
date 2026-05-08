@@ -145,6 +145,10 @@ func (o *seqScanOp) Close() error {
 		o.pinned = nil
 		o.activePage = nil
 	}
+	if o.scanRow != nil {
+		releaseRow(o.scanRow)
+		o.scanRow = nil
+	}
 	return nil
 }
 
@@ -217,7 +221,7 @@ func (o *seqScanOp) Next() (Row, error) {
 			// caller can safely hold the row beyond the next
 			// `Next()` call.
 			if o.scanRow == nil || len(o.scanRow) != len(o.cols) {
-				o.scanRow = make(Row, len(o.cols))
+				o.scanRow = acquireRow(len(o.cols))
 			}
 			if err := DecodeRowInto(o.scanRow, o.cols, tuple.Data); err != nil {
 				continue

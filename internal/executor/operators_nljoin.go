@@ -89,7 +89,7 @@ func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	o.outerWidth = len(o.outer.Schema())
 	o.innerWidth = len(o.inner.Schema())
 	o.nullInner = nullRow(o.innerWidth)
-	o.joinBuf = make(Row, o.outerWidth+o.innerWidth)
+	o.joinBuf = acquireRow(o.outerWidth + o.innerWidth)
 	o.currentOuter = nil
 	o.innerExhausted = true
 	o.leftJoinEmitted = true
@@ -214,6 +214,10 @@ func (o *nestedLoopIndexJoinOp) Close() error {
 		_ = o.inner.Close()
 		o.openOnce = false
 	}
+	if o.joinBuf != nil {
+		releaseRow(o.joinBuf)
+		o.joinBuf = nil
+	}
 	return o.outer.Close()
 }
 
@@ -222,7 +226,7 @@ func (o *nestedLoopIndexJoinOp) Close() error {
 // Next call.
 func (o *nestedLoopIndexJoinOp) fillJoinBuf(outer, inner Row) {
 	if len(o.joinBuf) != o.outerWidth+o.innerWidth {
-		o.joinBuf = make(Row, o.outerWidth+o.innerWidth)
+		o.joinBuf = acquireRow(o.outerWidth + o.innerWidth)
 	}
 	copy(o.joinBuf[:o.outerWidth], outer)
 	copy(o.joinBuf[o.outerWidth:], inner)
