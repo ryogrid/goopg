@@ -49,14 +49,14 @@ func TestMultiHashJoinTwoTables(t *testing.T) {
 
 	var results []Row
 	for {
-		row, err := op.Next()
+		row, err := NextRow(op)
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		results = append(results, row)
+		results = append(results, cloneRow(row))
 	}
 	op.Close()
 
@@ -201,14 +201,14 @@ func TestMultiHashJoinPredicatePushdown(t *testing.T) {
 	// × 4 C rows for that bid. Total: 2 × 2 × 4 = 16 rows.
 	var results []Row
 	for {
-		row, err := op.Next()
+		row, err := NextRow(op)
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		results = append(results, row)
+		results = append(results, cloneRow(row))
 	}
 	op.Close()
 
@@ -406,7 +406,7 @@ func TestMultiHashInt64FastPath(t *testing.T) {
 
 	var results []Row
 	for {
-		row, err := op.Next()
+		row, err := NextRow(op)
 		if err == EOF {
 			break
 		}

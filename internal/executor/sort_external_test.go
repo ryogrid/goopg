@@ -38,7 +38,7 @@ func TestM0068SortExternalSpills(t *testing.T) {
 	emitted := 0
 	var prev int64
 	for {
-		row, err := s.Next()
+		row, err := NextRow(s)
 		if err == EOF {
 			break
 		}
@@ -82,7 +82,7 @@ func TestM0068SortNoSpillBelowChunk(t *testing.T) {
 	}
 	emitted := 0
 	for {
-		row, err := s.Next()
+		row, err := NextRow(s)
 		if err == EOF {
 			break
 		}

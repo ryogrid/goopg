@@ -13,10 +13,11 @@ import (
 // expressions. SELECT 1 plans into a Project over a one-row Values
 // with an empty input row.
 type valuesOp struct {
-	rows   [][]planner.Expr
-	idx    int
-	ctx    *Context
-	schema planner.Schema
+	rows    [][]planner.Expr
+	idx     int
+	ctx     *Context
+	schema  planner.Schema
+	outSlot MaterializedSlot // M0069-0001 Stage B per-op slot reuse
 }
 
 func newValuesOp(plan *planner.Values) *valuesOp {
@@ -27,7 +28,7 @@ func (o *valuesOp) Open(ctx *Context) error { o.ctx = ctx; o.idx = 0; return nil
 func (o *valuesOp) Schema() planner.Schema  { return o.schema }
 func (o *valuesOp) Close() error            { return nil }
 
-func (o *valuesOp) Next() (Row, error) {
+func (o *valuesOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -41,7 +42,7 @@ func (o *valuesOp) Next() (Row, error) {
 		}
 		row[i] = v
 	}
-	return row, nil
+	return o.outSlot.set(row), nil
 }
 
 // projectOp evaluates the target list against each child row.
@@ -51,10 +52,15 @@ type projectOp struct {
 	schema  planner.Schema
 	ctx     *Context
 	// M0054-0005a-followup: borrow-semantics output buffer reuse.
-	// When `borrow == BorrowedRow`, Next returns `out` directly;
-	// otherwise it clones before returning. Default OwnedRow.
-	borrow BorrowSemantics
-	out    Row
+	// M0069-0001 Stage B: outSlot wraps `out` and is the per-call
+	// emit slot. Caller must consume / Materialize before next
+	// Next(). The borrow flag is now structural (always
+	// borrow-style at the slot level) but kept here for
+	// compatibility with the legacy Borrowable interface during
+	// the migration.
+	borrow  BorrowSemantics
+	out     Row
+	outSlot MaterializedSlot
 }
 
 func newProjectOp(plan *planner.Project, child Operator) *projectOp {
@@ -81,8 +87,8 @@ func (o *projectOp) Close() error {
 // rows. (M0054-0005a-followup.)
 func (o *projectOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
-func (o *projectOp) Next() (Row, error) {
-	in, err := o.child.Next()
+func (o *projectOp) Next() (TupleSlot, error) {
+	in, err := NextRow(o.child)
 	if err != nil {
 		return nil, err
 	}
@@ -93,22 +99,22 @@ func (o *projectOp) Next() (Row, error) {
 		}
 		o.out[i] = v
 	}
-	if o.borrow == BorrowedRow {
-		return o.out, nil
-	}
-	return cloneRow(o.out), nil
+	// M0069-0001 Stage B: slot points to o.out (reused buffer).
+	// The legacy borrow flag is now structurally borrow-style —
+	// the caller must Materialize() before retention. The
+	// per-call cloneRow that the OwnedRow path used to do has
+	// shifted to the consumer side (sortOp / hash-build).
+	return o.outSlot.set(o.out), nil
 }
 
 // filterOp drops rows where the predicate doesn't evaluate to TRUE.
 // NULL predicates exclude the row, matching SQL semantics.
 type filterOp struct {
-	child Operator
-	pred  planner.Expr
-	ctx   *Context
-	// M0054-0005a-followup: pure pass-through borrow. The Filter
-	// returns its child's row unchanged, so it can borrow exactly
-	// as long as its parent allows it.
-	borrow BorrowSemantics
+	child   Operator
+	pred    planner.Expr
+	ctx     *Context
+	borrow  BorrowSemantics
+	outSlot MaterializedSlot // M0069-0001 Stage B
 }
 
 func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
@@ -129,7 +135,7 @@ func (o *filterOp) SetBorrow(s BorrowSemantics) {
 	}
 }
 
-func (o *filterOp) Next() (Row, error) {
+func (o *filterOp) Next() (TupleSlot, error) {
 	rejected := 0
 	for {
 		// M0062-followup: a highly-selective filter can drain millions
@@ -140,7 +146,7 @@ func (o *filterOp) Next() (Row, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := o.child.Next()
+		row, err := NextRow(o.child)
 		if err != nil {
 			return nil, err
 		}
@@ -149,7 +155,7 @@ func (o *filterOp) Next() (Row, error) {
 			return nil, err
 		}
 		if !v.IsNull() && v.Kind == KindBool && v.BoolValue() {
-			return row, nil
+			return o.outSlot.set(row), nil
 		}
 		rejected++
 	}
@@ -165,8 +171,8 @@ type limitOp struct {
 	offsetCount int64
 	emitted     int64
 	skipped     int64
-	// M0054-0005a-followup: pass-through borrow.
-	borrow BorrowSemantics
+	borrow      BorrowSemantics
+	outSlot     MaterializedSlot // M0069-0001 Stage B
 }
 
 // SetBorrow propagates to the child. (M0054-0005a-followup.)
@@ -211,9 +217,9 @@ func (o *limitOp) Open(ctx *Context) error {
 func (o *limitOp) Schema() planner.Schema { return o.child.Schema() }
 func (o *limitOp) Close() error           { return o.child.Close() }
 
-func (o *limitOp) Next() (Row, error) {
+func (o *limitOp) Next() (TupleSlot, error) {
 	for o.skipped < o.offsetCount {
-		if _, err := o.child.Next(); err != nil {
+		if _, err := NextRow(o.child); err != nil {
 			return nil, err
 		}
 		o.skipped++
@@ -221,12 +227,12 @@ func (o *limitOp) Next() (Row, error) {
 	if o.limitCount >= 0 && o.emitted >= o.limitCount {
 		return nil, EOF
 	}
-	row, err := o.child.Next()
+	row, err := NextRow(o.child)
 	if err != nil {
 		return nil, err
 	}
 	o.emitted++
-	return row, nil
+	return o.outSlot.set(row), nil
 }
 
 // sortOp buffers the child's output then sorts under the supplied
@@ -258,6 +264,7 @@ type sortOp struct {
 	mergeReady bool
 
 	sortErr error
+	outSlot MaterializedSlot // M0069-0001 Stage B per-op slot reuse
 }
 
 func newSortOp(plan *planner.Sort, child Operator) *sortOp {
@@ -296,14 +303,17 @@ func (o *sortOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := o.child.Next()
+		row, err := NextRow(o.child)
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
-		o.rows = append(o.rows, row)
+		// M0069-0001 Stage B: Stage B made the slot's row
+		// invalidated by the next Next() call; sort retains rows
+		// across many calls, so clone before appending.
+		o.rows = append(o.rows, cloneRow(row))
 		chunkBytes += estimatedRowBytes(row)
 		pulled++
 		if chunkBytes >= limit {
@@ -421,7 +431,7 @@ func (o *sortOp) Close() error {
 	return o.child.Close()
 }
 
-func (o *sortOp) Next() (Row, error) {
+func (o *sortOp) Next() (TupleSlot, error) {
 	if len(o.spillFiles) == 0 {
 		// Fully in-memory path.
 		if o.idx >= len(o.rows) {
@@ -429,14 +439,18 @@ func (o *sortOp) Next() (Row, error) {
 		}
 		row := o.rows[o.idx]
 		o.idx++
-		return row, nil
+		return o.outSlot.set(row), nil
 	}
 	if !o.mergeReady {
 		if err := o.initMerge(); err != nil {
 			return nil, err
 		}
 	}
-	return o.popMerge()
+	row, err := o.popMerge()
+	if err != nil {
+		return nil, err
+	}
+	return o.outSlot.set(row), nil
 }
 
 // initMerge opens spill readers, primes each source with one row,

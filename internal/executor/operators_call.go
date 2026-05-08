@@ -15,6 +15,7 @@ type callOp struct {
 	routine *catalog.Routine
 	args    []Datum
 	done    bool
+	outSlot MaterializedSlot
 }
 
 func newCallOp(p *planner.Call) *callOp {
@@ -111,7 +112,7 @@ func (o *callOp) Open(ctx *Context) error {
 
 func (o *callOp) Close() error { return nil }
 
-func (o *callOp) Next() (Row, error) {
+func (o *callOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -231,5 +232,5 @@ func (o *callOp) Next() (Row, error) {
 			}
 		}
 	}
-	return outRow, nil
+	return o.outSlot.set(outRow), nil
 }

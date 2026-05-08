@@ -37,7 +37,7 @@ func runForUpdate(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 	defer op.Close()
 	var rows []Row
 	for {
-		r, err := op.Next()
+		r, err := NextRow(op)
 		if err == EOF {
 			break
 		}

@@ -67,6 +67,7 @@ type upsertOp struct {
 	// the statement for cheap reuse. nil when ArbiterIndex is nil
 	// (the bare DO NOTHING form).
 	arbiterTree *btree.BTree
+	outSlot MaterializedSlot
 }
 
 // RowsAffected satisfies executor.RowCounter — for UPSERT, the
@@ -132,7 +133,7 @@ func (o *upsertOp) Open(ctx *Context) error {
 
 func (o *upsertOp) Close() error { return o.child.Close() }
 
-func (o *upsertOp) Next() (Row, error) {
+func (o *upsertOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -140,7 +141,7 @@ func (o *upsertOp) Next() (Row, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
 	for {
-		src, err := o.child.Next()
+		src, err := NextRow(o.child)
 		if err == EOF {
 			break
 		}

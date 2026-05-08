@@ -18,6 +18,7 @@ type recursiveUnionOp struct {
 	initDone  bool
 	done      bool
 	ctx       *Context
+	outSlot MaterializedSlot
 }
 
 func newRecursiveUnionOp(p *planner.RecursiveUnion, anchor, recursive Operator) *recursiveUnionOp {
@@ -48,7 +49,7 @@ func (o *recursiveUnionOp) Close() error {
 	return nil
 }
 
-func (o *recursiveUnionOp) Next() (Row, error) {
+func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -56,7 +57,7 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 	// Phase 1: drain the anchor.
 	if !o.initDone {
 		for {
-			row, err := o.anchor.Next()
+			row, err := NextRow(o.anchor)
 			if err == EOF {
 				break
 			}
@@ -87,7 +88,7 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 		}
 		iterRows := make([]Row, 0)
 		for {
-			row, err := o.recursive.Next()
+			row, err := NextRow(o.recursive)
 			if err == EOF {
 				break
 			}
@@ -111,7 +112,7 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 
 	row := o.output[o.outIdx]
 	o.outIdx++
-	return row, nil
+	return o.outSlot.set(row), nil
 }
 
 // workTableScanOp reads rows from ctx.WorkTableRows, returning one
@@ -121,6 +122,7 @@ type workTableScanOp struct {
 	plan *planner.WorkTableScan
 	ctx  *Context
 	idx  int
+	outSlot MaterializedSlot
 }
 
 func newWorkTableScanOp(p *planner.WorkTableScan) *workTableScanOp {
@@ -137,11 +139,11 @@ func (o *workTableScanOp) Open(ctx *Context) error {
 
 func (o *workTableScanOp) Close() error { return nil }
 
-func (o *workTableScanOp) Next() (Row, error) {
+func (o *workTableScanOp) Next() (TupleSlot, error) {
 	if o.ctx == nil || o.idx >= len(o.ctx.WorkTableRows) {
 		return nil, EOF
 	}
 	row := o.ctx.WorkTableRows[o.idx]
 	o.idx++
-	return row, nil
+	return o.outSlot.set(row), nil
 }

@@ -750,7 +750,7 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		defer func() { _ = op.Close() }()
 		var out []Datum
 		for {
-			r, err := op.Next()
+			r, err := NextRow(op)
 			if err == EOF {
 				break
 			}
@@ -907,7 +907,7 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	defer func() { _ = op.Close() }()
-	row, err := op.Next()
+	row, err := NextRow(op)
 	if err == EOF {
 		return NullDatum, nil
 	}
@@ -919,7 +919,7 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 	}
 	val := row[0]
 	// Drain to ensure the subquery returned at most one row.
-	if _, err := op.Next(); err != EOF {
+	if _, err := NextRow(op); err != EOF {
 		if err == nil {
 			return Datum{}, &ExecError{Code: "21000", Pos: x.Pos(), Message: "more than one row returned by a subquery used as an expression"}
 		}
