@@ -115,7 +115,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 
 	var rowCount int64
 	for {
-		row, err := op.Next()
+		row, err := executor.NextRow(op)
 		if err == executor.EOF {
 			break
 		}

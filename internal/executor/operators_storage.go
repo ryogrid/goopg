@@ -70,6 +70,7 @@ type seqScanOp struct {
 	// per-row leaf-allocation cost the M0054-0004 pprof survey
 	// flagged as `runtime.findObject` flat 29.30 % under Q9.
 	scanRow Row
+	outSlot MaterializedSlot
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -154,7 +155,7 @@ func (o *seqScanOp) Close() error {
 
 // nextVisible advances through (block, slot) pairs and returns the
 // next tuple visible to the snapshot, or EOF.
-func (o *seqScanOp) Next() (Row, error) {
+func (o *seqScanOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	for {
 		if o.pinned == nil && o.activePage == nil {
@@ -244,9 +245,9 @@ func (o *seqScanOp) Next() (Row, error) {
 			// caller can retain the row across the next
 			// `Next()` call.
 			if o.borrow == BorrowedRow {
-				return row, nil
+				return o.outSlot.set(row), nil
 			}
-			return cloneRow(row), nil
+			return o.outSlot.set(row), nil
 		}
 		o.releasePinned()
 		o.curBlock++
@@ -294,6 +295,7 @@ type insertOp struct {
 	child        Operator
 	rowsAffected int64
 	done         bool
+	outSlot MaterializedSlot
 }
 
 // RowsAffected satisfies executor.RowCounter.
@@ -325,7 +327,7 @@ func (o *insertOp) Close() error { return o.child.Close() }
 // Next runs the insert as a one-shot side effect on first call; the
 // wire-protocol path then issues `INSERT N` rather than streaming
 // rows back. RETURNING is deferred — see fix_plan.
-func (o *insertOp) Next() (Row, error) {
+func (o *insertOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -333,7 +335,7 @@ func (o *insertOp) Next() (Row, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
 	for {
-		src, err := o.child.Next()
+		src, err := NextRow(o.child)
 		if err == EOF {
 			break
 		}
@@ -599,6 +601,7 @@ type updateOp struct {
 	// instead of the full SeqScan path (O(n)). Set by newUpdateOp
 	// when the planner produced an IndexScan.
 	idxScan *planner.IndexScan
+	outSlot MaterializedSlot
 }
 
 // RowsAffected satisfies executor.RowCounter.
@@ -769,7 +772,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	return nil, EOF
 }
 
-func (o *updateOp) Next() (Row, error) {
+func (o *updateOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -780,7 +783,11 @@ func (o *updateOp) Next() (Row, error) {
 
 	// Use IndexScan (B-tree) when available — O(log n) instead of O(n).
 	if o.idxScan != nil {
-		return o.updateViaIndex(rel, cols)
+		row, err := o.updateViaIndex(rel, cols)
+		if err != nil {
+			return nil, err
+		}
+		return o.outSlot.set(row), nil
 	}
 
 	// Fallback: full SeqScan path.
@@ -862,6 +869,7 @@ type deleteOp struct {
 	rowsAffected int64
 	done         bool
 	idxScan      *planner.IndexScan
+	outSlot MaterializedSlot
 }
 
 // RowsAffected satisfies executor.RowCounter.
@@ -894,7 +902,7 @@ func (o *deleteOp) Open(ctx *Context) error {
 
 func (o *deleteOp) Close() error { return nil }
 
-func (o *deleteOp) Next() (Row, error) {
+func (o *deleteOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}

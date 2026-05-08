@@ -84,6 +84,7 @@ type indexScanOp struct {
 	// historical case): then `o.plan.Key` / `LowKey` / `HighKey`
 	// must reduce to constants.
 	outerRow Row
+	outSlot MaterializedSlot
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -253,13 +254,13 @@ func (o *indexScanOp) Rescan(outerRow Row) error {
 	return nil
 }
 
-func (o *indexScanOp) Next() (Row, error) {
+func (o *indexScanOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return o.outSlot.set(r), nil
 }
 
 func (o *indexScanOp) Close() error {

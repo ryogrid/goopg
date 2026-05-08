@@ -34,5 +34,5 @@ func (o *checkpointOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *checkpointOp) Next() (Row, error) { return nil, EOF }
+func (o *checkpointOp) Next() (TupleSlot, error) { return nil, EOF }
 func (o *checkpointOp) Close() error       { return nil }

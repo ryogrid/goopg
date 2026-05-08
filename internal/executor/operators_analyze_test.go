@@ -44,7 +44,7 @@ func TestAnalyzeRelationPopulatesStats(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := op.Next(); err != EOF {
+	if _, err := NextRow(op); err != EOF {
 		t.Fatalf("Insert.Next: %v", err)
 	}
 	_ = op.Close()
@@ -104,7 +104,7 @@ func seedRowsAndAnalyze(t *testing.T, n int, makeRow func(i int) []planner.Expr,
 	if err := op.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := op.Next(); err != EOF {
+	if _, err := NextRow(op); err != EOF {
 		t.Fatalf("Insert.Next: %v", err)
 	}
 	_ = op.Close()

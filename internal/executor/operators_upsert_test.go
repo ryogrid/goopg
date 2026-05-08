@@ -49,7 +49,7 @@ func runUpsertSQL(t *testing.T, ctx *Context, sql string) (rowsAffected int64) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := op.Next(); err != EOF {
+	if _, err := NextRow(op); err != EOF {
 		t.Fatalf("Next: %v", err)
 	}
 	if rc, ok := op.(*upsertOp); ok {

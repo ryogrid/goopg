@@ -72,7 +72,7 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 
 	var buf []byte
 	for {
-		row, nextErr := src.Next()
+		row, nextErr := NextRow(src)
 		if nextErr == EOF {
 			break
 		}

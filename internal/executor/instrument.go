@@ -30,9 +30,10 @@ type nodeStats struct {
 // instrumentedOp wraps inner so the EXPLAIN ANALYZE renderer can
 // surface actual-rows / loops / timing per Node.
 type instrumentedOp struct {
-	inner Operator
-	plan  planner.Node
-	stats *nodeStats
+	inner   Operator
+	plan    planner.Node
+	stats   *nodeStats
+	outSlot MaterializedSlot // M0069-0001 Stage B
 }
 
 // underlying lets `setChildBorrow` (M0054-0005a-followup) reach
@@ -62,8 +63,8 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 // Next records the per-row delta into the running total and
 // (on the first non-EOF row of this Open cycle) records the
 // startup time.
-func (o *instrumentedOp) Next() (Row, error) {
-	row, err := o.inner.Next()
+func (o *instrumentedOp) Next() (TupleSlot, error) {
+	row, err := NextRow(o.inner)
 	if err == EOF {
 		return nil, EOF
 	}
@@ -80,7 +81,7 @@ func (o *instrumentedOp) Next() (Row, error) {
 		o.stats.totalNs += now.Sub(o.stats.rowDeltaT).Nanoseconds()
 		o.stats.rowDeltaT = now
 	}
-	return row, nil
+	return o.outSlot.set(row), nil
 }
 
 // Close finalises the duration. RowsAffected (DML) is forwarded

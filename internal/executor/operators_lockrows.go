@@ -82,6 +82,7 @@ type lockRowsOp struct {
 	pending []pendingLockedRow
 	pos     int
 	drained bool
+	outSlot MaterializedSlot
 }
 
 type pendingLockedRow struct {
@@ -203,7 +204,7 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 // the stamp pass (per-row PageSetHeapTupleLockOnly + WAL emit),
 // then yield the buffered rows. Subsequent calls return rows
 // from the buffer. EOF when the buffer is exhausted.
-func (o *lockRowsOp) Next() (Row, error) {
+func (o *lockRowsOp) Next() (TupleSlot, error) {
 	if !o.drained {
 		if err := o.drainAndStamp(); err != nil {
 			return nil, err
@@ -214,7 +215,7 @@ func (o *lockRowsOp) Next() (Row, error) {
 	}
 	row := o.pending[o.pos].row
 	o.pos++
-	return row, nil
+	return o.outSlot.set(row), nil
 }
 
 // drainAndStamp runs phases 1 and 2 of the two-pass protocol:
@@ -227,14 +228,16 @@ func (o *lockRowsOp) Next() (Row, error) {
 func (o *lockRowsOp) drainAndStamp() error {
 	o.drained = true
 	for {
-		row, err := o.child.Next()
+		row, err := NextRow(o.child)
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
-		entry := pendingLockedRow{row: row}
+		// M0069-0001 Stage B: clone before retaining; the slot's
+		// row buffer is invalidated by the next Next() call.
+		entry := pendingLockedRow{row: cloneRow(row)}
 		if o.scan != nil {
 			if rel, ptr, ok := o.scan.currentTID(); ok {
 				entry.rel = rel

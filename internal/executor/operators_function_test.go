@@ -27,7 +27,7 @@ func runRoutineDDL(t *testing.T, sql string, cat catalog.Catalog) error {
 	}
 	defer op.Close()
 	for {
-		_, err := op.Next()
+		_, err := NextRow(op)
 		if err == EOF {
 			return nil
 		}
