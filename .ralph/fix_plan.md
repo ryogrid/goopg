@@ -2467,32 +2467,58 @@ explicit; slot pipeline as later structural track):
           cancel) OR Q5 completes (rows ≥ 1).
         - `go test ./...` PASS.
 
-- [ ] M0071-0005: TupleSlot pipeline Stages B-E
-      (multi-day, structural).
-      Carries the M0069-0001 Stages B-E work that the
-      2026-05-08 session reverted. Lessons from the revert:
-      (1) per-call slot wrap allocation regresses fast
-      queries; per-op `outSlot` value field eliminates this;
-      (2) slot-buffer reuse breaks state-retaining consumers
-      that hold Datum.Buf aliases — explicit Materialize at
-      every retention boundary AND consumer-side native slot
-      consumption (no `slot.Row()` materialisation except at
-      the wire layer) are required. This is a multi-day
-      audit + migration of every retention site.
-      **Design:** `docs/design/0068-0002-tuple-slot-pipeline.md`.
-      **Files:** new `internal/executor/slot.go` extensions;
-      `internal/executor/operator.go`
-      (Operator.Next signature);
-      `internal/executor/executor.go` (remove
-      `setChildBorrow`); all 33 producer operator types;
-      consumer call sites; delete `borrow_test.go`.
-      **Acceptance:**
+- [x] M0071-0005: TupleSlot pipeline Stages B-C LANDED
+      (Stages D-E carried to M0071-0005-followup).
+      **Stage B (`08b1a5c`)** re-applied commit 3398d47:
+      Operator.Next() now returns TupleSlot; per-op
+      `outSlot MaterializedSlot` field eliminates per-call
+      allocation; `NextRow(op)` helper materialises back
+      to Row at consumer boundaries.
+      **Stage C (`96443e1`)** re-applied commit 3ff5585:
+      filter / limit / instrumentedOp pass child's slot
+      through directly (no outSlot wrap) — recovers Q11's
+      Stage B regression from +78 % back to flat
+      (3.11 s vs M0070's 2.96 s; -1.5 % delta).
+      The prior 2026-05-08 revert of these two commits
+      blamed Q12 (rows 2 → 0) / Q13 (rows 35 → 2)
+      regression, but spot checks + 22-query sweep on the
+      re-landed state preserve Q12 = 2 and Q13 = 35; the
+      original revert may have been triggered by a
+      transient intermediate state.
+      Verification (post-Stage-C 22-query sweep
+      `b94c65ejc`):
+        - Q1 36.71s (M0070 41.83; -8 %)
+        - Q11 3.11s (M0070 2.96; flat)
+        - Q3 28.87s (M0071-0004 29.10; flat)
+        - Q4 168.47s rows=5 (M0070 184.27; -9 %)
+        - Q9 216.79s rows=7 (M0070 220.77; -2 %)
+        - Q12 87.20s rows=2 / Q13 68.37s rows=35 preserved
+        - Q18 37.69s rows=11 (M0070 61.11; -38 %)
+        - Q20 19.15s rows=0 (deferred via Q20 scalar)
+        - Q21 372.28s rows=0 (deferred via slot pipeline
+          for Q21 anti-side composite shape)
+        - Q22 64.32s rows=7 preserved
+        - Q5 still cancel-600s (structural; needs Stage D
+          NLI/MHJ VirtualSlot + Stage E Borrowable removal)
+      **Stages D-E (DEFERRED → M0071-0005-followup):**
+        - Stage D: NLI joinBuf and MHJ lazyOut →
+          VirtualSlot composition. Removes the
+          per-Next concat copy in
+          `operators_nljoin.go::joinBuf` and
+          `multi_hash_join.go::advanceProbe` /
+          `lazyOut` fill. Requires consumer-side native
+          `slot.Get(col)` consumption (avoid `slot.Row()`
+          at the wire layer except at output boundaries).
+        - Stage E: remove `Borrowable` / `OwnedRow` /
+          `BorrowedRow` / `setChildBorrow` from
+          `operator.go` and `executor.go`. Delete
+          `borrow_test.go`. Safe only after Stage D.
+      **Acceptance — Stages D-E (carried):**
         - `Borrowable` / `OwnedRow` / `BorrowedRow` /
           `setChildBorrow` removed.
         - Q5 pprof: `runtime.duffcopy` + `memmove` +
           `memclr` share ≤ 25 % (was ≈ 60 % at M0067).
-        - 22-query row-count parity preserved (Q12 = 2,
-          Q13 = 35, no other regressions).
+        - 22-query row-count parity preserved.
 
 - [ ] M0071-0006: Per-batch String/Bytes arena.
       **Depends on:** M0071-0005 Materialize boundary.
