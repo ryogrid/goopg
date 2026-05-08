@@ -1178,41 +1178,48 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 		Type:  outerCol.Type,
 	}
 
-	semiPred := &BinaryOp{pos: in.Pos(), Op: "=", Left: outerKey, Right: innerKey}
-
-	// Replace the IN conjunct with the SemiJoin predicate.
+	// M0069-0005: drop the IN conjunct from the filter — the
+	// join encodes the equality via (LeftKey, RightKey) and the
+	// SemiJoin type. Mirrors the EXISTS unnest (M0061-0001) which
+	// drops the EXISTS conjunct rather than replacing it with a
+	// predicate. Keeping the predicate in the filter would cause
+	// the planner to re-evaluate it on the join's output (which
+	// is outer-only after Semi) where innerKey's outerWidth
+	// index reaches past the row width and trips
+	// `column ref %s/%d out of range`.
 	conjuncts := splitAnd(filter.Predicate)
 	newConjuncts := make([]Expr, 0, len(conjuncts))
-	found := false
 	for _, c := range conjuncts {
-		if c == conjunct {
-			if !found {
-				newConjuncts = append(newConjuncts, semiPred)
-				found = true
-			}
-		} else {
+		if c != conjunct {
 			newConjuncts = append(newConjuncts, c)
 		}
 	}
-	if !found {
-		newConjuncts = append(newConjuncts, semiPred)
+	if len(newConjuncts) == 0 {
+		filter.Predicate = &BooleanConst{pos: in.Pos(), Value: true}
+	} else {
+		filter.Predicate = combineAnd(newConjuncts)
 	}
-	filter.Predicate = combineAnd(newConjuncts)
 
-	mergedSchema := make(Schema, outerWidth+innerWidth)
-	copy(mergedSchema, outerChild.Output())
-	copy(mergedSchema[outerWidth:], innerPlan.Output())
-
+	// M0069-0005: use JoinTypeSemi with outer-only output schema.
+	// JoinTypeInner with mergedSchema would widen the output by
+	// the inner column, which corrupts column-index references in
+	// any upstream operator (Q18's Aggregate over a 3-table FROM
+	// hit exactly this — the SUM(l_quantity) reference moved past
+	// the outer width). The executor's JoinTypeSemi already emits
+	// just the probe row; preserving the outer schema here keeps
+	// every upstream column index valid.
+	semiPred := &BinaryOp{pos: in.Pos(), Op: "=", Left: outerKey, Right: innerKey}
+	_ = innerWidth
 	join := &Join{
 		pos:       in.Pos(),
-		Type:      JoinTypeInner,
+		Type:      JoinTypeSemi,
 		Algo:      JoinAlgoHash,
 		Left:      outerChild,
 		Right:     innerPlan,
 		Predicate: semiPred,
 		LeftKey:   outerKey,
 		RightKey:  innerKey,
-		schema:    mergedSchema,
+		schema:    append(Schema(nil), outerChild.Output()...),
 	}
 	filter.Child = join
 	return outer, nil
