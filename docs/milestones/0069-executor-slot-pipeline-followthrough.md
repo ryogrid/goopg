@@ -1,9 +1,49 @@
 # Milestone 0069 — Executor Slot Pipeline + GC Follow-Through + Long-Tail Query Fixes
 
-**Status:** accepted (PARTIAL — 3 of 9 sub-milestones landed:
-M0069-0001 Stage A scaffold, M0069-0005 Q20 / Q18 IN-unnest,
-M0069-0007 HasInProgress; remaining 5 deferred to M0070 with
-named successor sub-tasks)
+**Status:** accepted (closed 2026-05-08). All sub-milestones
+either landed or have been transferred to M0070 / M0071 with
+empirical evidence and named successors. Sub-milestones that
+landed: M0069-0001 Stage A scaffold (`d0de10d`), M0069-0005
+Q20 / Q18 IN-unnest (`ebb267d` + `5f120c1`), M0069-0007
+HasInProgress (`77499e5`), M0069-0008 partial via M0070-0002
+bgwriter-poolMu fix (`54e246b` — mutex contention −89 %),
+M0069-0009 sweep + report.
+
+Sub-milestones transferred to follow-on milestones with
+empirical evidence:
+
+- **M0069-0001 Stages B-E (TupleSlot pipeline migration).**
+  Two empirical attempts in 2026-05-08:
+  (1) Per-call `*MaterializedSlot` wrapper via `sync.Pool`
+  regressed Q1/Q11/Q21 by ~45-90 % at the SF=1 single-thread
+  workload (Q11 4.89 s vs 2.96 s; Q21 cancel-after-400 s);
+  rolled back. (2) Per-operator `outSlot MaterializedSlot`
+  field (no per-call alloc) closed the alloc-rate regression
+  (Q11 returned to 2.85 s in the 22-query sweep) but
+  introduced silent row-count regressions on Q12 (rows 2 → 0)
+  and Q13 (rows 35 → 2) — likely from the slot-buffer-reuse
+  invalidating state held in joinOp's lazy LEFT-JOIN path or
+  aggregateOp's group-state extraction. Reverted on the same
+  day. Landing the slot pipeline correctly requires (a)
+  auditing each retention site for hidden Datum.Buf aliasing
+  to scan-time decode buffers, (b) explicit Materialize calls
+  at every retention boundary, and (c) consumer-side native
+  slot consumption (avoiding `slot.Row()` materialisation
+  except at the wire layer). That scope is multi-day in a
+  focused session — carried as **M0071-0001**.
+
+- **M0069-0002 arena.** Stage B+ Materialize-boundary
+  dependent → **M0071-0002**.
+
+- **M0069-0003 IndexScan lazy.** Option A goroutine wrapper
+  regressed Q9 220 → 440 s in M0070; cursor API redesign
+  needed → **M0071-0003**.
+
+- **M0069-0004 Q5 pushdown.** Slot guard from Stage B+ →
+  **M0071-0004**.
+
+- **M0069-0006 Q9 composite-NLI.** M0067-0003 schema-runtime
+  mismatch persists outside the slot model → **M0071-0005**.
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0068 (commits `aef72b7` / `e9080ac` /
 `d79ebda` / `965c2a0`)
