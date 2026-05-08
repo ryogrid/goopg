@@ -2400,6 +2400,114 @@ SI HasInProgress, buffer-pool partitioning). Per the user's
         - Document per-query delta vs M0068; Q5 / Q20
           either complete or document residual structurally.
 
+## Milestone 0070 — Executor Slot Pipeline Completion + Long-Tail Query Closure
+
+See `docs/milestones/0070-executor-slot-pipeline-completion.md`.
+
+Finishes the five M0069 sub-milestones that remained
+deferred (TupleSlot pipeline Stages B-E, String/Bytes arena,
+IndexScan lazy iteration, Q5 predicate pushdown, Q21 / Q9
+planner closure, poolMu partitioning) plus the final 22-query
+sweep. **No further deferral** — per user directive every
+sub-milestone lands in this milestone.
+
+- [ ] M0070-0001: Q21 inner-only conjunct verification +
+      Q9 composite-NLI re-attempt.
+      **Files:** `internal/planner/unnest.go` (Q21 verify);
+      `internal/planner/nl_index_join.go` (Q9 column
+      binding); `internal/planner/q21_live_test.go`.
+      **Acceptance:**
+        - `go test ./internal/planner/...` PASS.
+        - Q9 row count > 7 (canonical ≥ 90).
+        - Q21 row count > 0 (canonical ≥ 411).
+
+- [ ] M0070-0002: Buffer-pool poolMu partitioning.
+      Replace global `poolMu` with N=64 partition mutexes
+      keyed by hash(tag) so concurrent pin/unpin paths
+      don't contend on a single lock. The lock is already
+      released before disk I/O so sharding is feasible.
+      **Files:** `internal/storage/bufpool.go`.
+      **Acceptance:**
+        - `go test ./internal/storage/... ./internal/...`
+          PASS.
+        - Mutex profile delta on Q9 documented (null
+          result acceptable).
+
+- [ ] M0070-0003: TupleSlot pipeline Stages B-E.
+      Stage B flips `Operator.Next()` signature from
+      `(Row, error)` to `(TupleSlot, error)` across ~22
+      operator types and 8 consumer sites. Stage C wires
+      `VirtualSlot` into pass-through operators (filter,
+      project, limit, NLI joinBuf, MHJ probe). Stage D
+      calls `Materialize()` at retention boundaries (sort,
+      hash build, aggregate). Stage E removes `Borrowable`,
+      `OwnedRow`, `BorrowedRow`, `setChildBorrow`.
+      **Design:** `docs/design/0068-0002-tuple-slot-pipeline.md`.
+      **Files:** `internal/executor/operator.go`,
+      `executor.go`, `instrument.go`, `applyworker.go`,
+      every `operators*.go`, `multi_hash_join.go`,
+      `spill.go`, `expr.go`; `internal/server/dispatch*.go`;
+      delete `internal/executor/borrow_test.go`.
+      **Acceptance:**
+        - `Borrowable` interface and BorrowSemantics enum
+          removed (`grep -r "Borrowable\|BorrowedRow\|OwnedRow"
+          internal/` returns 0 in production).
+        - All operators consume + produce `TupleSlot`.
+        - MHJ probe path emits `VirtualSlot{probe, build}`
+          structurally (preserves M0066 PIVOT).
+        - `go test ./...` PASS at each stage.
+
+- [ ] M0070-0004: Per-batch String/Bytes arena.
+      **Design:** `docs/design/0068-0003-batch-string-arena.md`.
+      **Files:** new `internal/executor/arena.go`;
+      `internal/executor/datum.go` (Datum.arena field);
+      `internal/executor/codec.go` (decode into arena);
+      `internal/executor/operators_storage.go` /
+      `operators_index.go` (per-scan Arena lifecycle).
+      **Depends on:** M0070-0003.
+      **Acceptance:**
+        - Arena unit tests (allocate / read / reset /
+          multi-page).
+        - Q5 pprof `inuse_space`: arena pages dominate
+          string memory.
+        - 22-query row-count parity preserved.
+
+- [ ] M0070-0005: Q5 build-time predicate pushdown
+      (slot-guarded re-attempt). Walker guard restricts
+      pushdown to conjuncts whose every column reference
+      classifies to a single source slot under the
+      M0070-0003 slot model.
+      **Files:** `internal/planner/pushdown.go` (extend).
+      **Acceptance:**
+        - Q3 row count preserved at 11462 (regression
+          guard).
+        - Q5 SF=1 probe-time ≥ 30 % drop OR rows > 0.
+
+- [ ] M0070-0006: IndexScan lazy iteration. Refactor
+      `internal/access/btree/btree.go::RangeScan` to expose
+      a cursor (`*RangeCursor.Next()`); IndexScan's
+      `Rescan` becomes lazy. Fallback to goroutine + bounded
+      channel wrapper if Option B's latch-and-resume proves
+      unsafe under concurrent writes.
+      **Files:** `internal/access/btree/btree.go`;
+      `internal/executor/operators_index.go`.
+      **Acceptance:**
+        - `go test ./internal/access/btree/...` PASS.
+        - Q9 SF=1 peak heap drops ≥ 5 GB.
+        - 22-query row-count parity preserved.
+
+- [ ] M0070-0007: Final 22-query SF=1 sweep + GC profile.
+      **Files (output):**
+        `analysis/tpch-m0070-baseline-<date>.md`,
+        `bench/tpch/logs/m0070_22q_<ts>.log`,
+        `bench/tpch/pprof/cpu_q5_m0070.prof`,
+        `bench/tpch/pprof/heap_q5_m0070.prof`.
+      **Acceptance:**
+        - 22-query OK count ≥ 21 at `cancel-after=1200s`.
+        - Q5 either OK or pprof shows residual is no
+          longer duffcopy/memmove dominant.
+        - Q9 silent FN closed (rows ≥ 90).
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
