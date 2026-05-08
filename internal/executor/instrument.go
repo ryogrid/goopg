@@ -62,10 +62,9 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 
 // Next records the per-row delta into the running total and
 // (on the first non-EOF row of this Open cycle) records the
-// startup time. M0069-0001 Stage C: pass-through — return the
-// inner's slot directly to avoid the Row wrap.
+// startup time.
 func (o *instrumentedOp) Next() (TupleSlot, error) {
-	slot, err := o.inner.Next()
+	row, err := NextRow(o.inner)
 	if err == EOF {
 		return nil, EOF
 	}
@@ -82,7 +81,7 @@ func (o *instrumentedOp) Next() (TupleSlot, error) {
 		o.stats.totalNs += now.Sub(o.stats.rowDeltaT).Nanoseconds()
 		o.stats.rowDeltaT = now
 	}
-	return slot, nil
+	return o.outSlot.set(row), nil
 }
 
 // Close finalises the duration. RowsAffected (DML) is forwarded
