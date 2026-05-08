@@ -117,10 +117,30 @@ rm -rf ./tmp/goopg-data
 | 0054 | TPC-H performance and optimisation | in progress |
 | 0055 | Staged B-tree enhancement program | largely landed |
 | 0056 | Buffer-pool PinNew race fix + splitMu removal | in progress |
-| **0057** | **TPC-H measurement prerequisites** | **planned** |
+| 0057 | TPC-H measurement prerequisites | planned |
+| 0066 | Executor runtime allocation reductions (PIVOT) | landed (`perf-analysis`) |
+| 0067 | TPC-H structural runtime — 1200 s baseline + diagnostics | landed (`perf-analysis`) |
+| **0068** | **Executor GC-Optimized Pipeline Refactor** | **planned (`perf-analysis`)** |
 
 Milestone 0057 addresses the benchmark infrastructure prerequisites —
 background-worker visibility, checkpoint suppression, crash recovery,
 and per-query cancellation — needed for reliable M0054-0007 runs.
 See `docs/milestones/0057-tpch-measurement-prerequisites.md` for the
 full plan and `cmd/tpch-runner/README.md` for the query-runner tool.
+
+Milestone 0068 is a **large-scale executor refactor** targeting GC
+overhead and live-heap pointer density. M0066 PIVOT eliminated 99.23 %
+of Q5's allocations (`multiHashJoinOp.copyOut`, 2.02 TB on a 60 s pprof
+window) and removed `time.Parse` from hot loops; Q5 / Q20 still cancel
+at `cancel-after=1200s` because residual cost is **memory-copy bound**
+(`runtime.duffcopy` + `memclr` ≈ 60 % of CPU). M0068 replaces
+`Row = []Datum` with a PostgreSQL-style `TupleSlot` polymorphism
+(Materialized / Virtual / BatchRef), shrinks `Datum` from ~120 to
+≤ 48 bytes, introduces a per-batch byte arena for variable-length
+payload, and pools slots across queries via `sync.Pool`. The
+`BorrowSemantics` row-level contract introduced in M0054-0005a /
+M0059 is **removed** in favor of slot-intrinsic lifetime semantics.
+See `docs/milestones/0068-executor-gc-pipeline-refactor.md` and the
+four design docs `docs/design/0068-000{1..4}-*.md` for the detailed
+plan; sources: `practice/go_gc_optimized_programming.md` and
+`review/postgres_vs_goopg_performance_divergence.md` §1.

@@ -2134,30 +2134,142 @@ on M0066 PIVOT's allocation reductions. Verifies at
         `bench/tpch/logs/m0067_22q_<ts>.log`.
       **Blocked by:** M0067-0001..0005.
 
-## Deferred (former M0067 draft, now superseded)
+## Milestone 0068 — Executor GC-Optimized Pipeline Refactor
 
-- [ ] M0068 candidate: Datum struct shrink (~80 → 32 bytes).
-- [ ] M0068 candidate: Q5 build-time predicate pushdown for
-      unpromoted SeqScans — earlier abortive attempt broke
-      Q3 due to walker interaction; needs guarded
-      re-implementation.
-- [ ] M0068 candidate: Q20 timestamp btree v0 OR unnest
-      non-correlated IN to SemiJoin (only correlated INs are
-      currently unnested).
-- [ ] M0068 candidate (deprecated, use anchor below): Findings:
-      - Q5: build-time predicate pushdown for unpromoted
-        SeqScans (Filter-wrap fallback when no btree); broke
-        Q3 due to walker interaction. Needs guarded
-        re-implementation.
-      - Q20: timestamp btree v0 missing; alternative is
-        unnesting the non-correlated IN to a SemiJoin
-        (currently only correlated INs get unnested).
-      - Q21: Anti-side hash join needs the inner-Filter
-        conjunct lifted onto the join Predicate AND
-        composite-NLI on `partsupp_pk` for Q9 to absorb the
-        cardinality explosion (Q9's "7 rows" in M0064/M0065
-        was silent false negatives confirmed by NLI walker
-        bisect).
+See `docs/milestones/0068-executor-gc-pipeline-refactor.md`
+and design docs `docs/design/0068-000{1..4}-*.md`. Source
+material: `practice/go_gc_optimized_programming.md` and
+`review/postgres_vs_goopg_performance_divergence.md` §1
+"Executor (Operator)" (Severity: High).
+
+Replaces `Row = []Datum` with a PostgreSQL-style
+`TupleSlot` polymorphism, shrinks `Datum` from ~120 to
+≤ 48 bytes, introduces a per-batch byte arena for
+variable-length payload, pools slots cross-query, and
+**removes** the row-level `BorrowSemantics` contract
+(`Borrowable`, `OwnedRow`, `BorrowedRow`,
+`setChildBorrow`) in favor of slot-intrinsic lifetime
+semantics. The user explicitly approved the swap.
+
+- [ ] M0068-0001: Datum compact layout (≤ 48 bytes,
+      ≤ 1 pointer).
+      **Design:** `docs/design/0068-0001-datum-compact-layout.md`.
+      **Files:** `internal/executor/datum.go`,
+      `internal/executor/codec.go`, `internal/executor/expr.go`.
+      **Acceptance:**
+        - `unsafe.Sizeof(Datum{})` ≤ 48.
+        - `go test ./...` PASS.
+        - Q5 pprof live-heap (`inuse_space`) shows
+          ≥ 50 % drop in Datum-related memory.
+        - 22-query row-count parity preserved.
+
+- [ ] M0068-0002: TupleSlot pipeline (replaces
+      BorrowSemantics).
+      **Design:** `docs/design/0068-0002-tuple-slot-pipeline.md`.
+      **Files:** new `internal/executor/slot.go`;
+      `internal/executor/operator.go` (remove `Borrowable`,
+      `OwnedRow`, `BorrowedRow`, `setChildBorrow`);
+      `internal/executor/operators.go`,
+      `operators_storage.go`, `operators_index.go`,
+      `multi_hash_join.go`, `operators_join_agg.go`,
+      `operators_nljoin.go`; delete `borrow_test.go` in
+      favor of slot-lifetime tests.
+      **Acceptance:**
+        - `Borrowable` interface and BorrowSemantics enum
+          removed from `operator.go`.
+        - All operators consume + produce `TupleSlot`.
+        - MHJ probe path emits `VirtualSlot{probe, build}`
+          (preserves the M0066 `copyOut` elimination
+          structurally).
+        - `go test ./...` PASS.
+        - Q5 pprof: `runtime.duffcopy` + `memmove` for
+          slot copies ≤ 10 % of CPU (was 60 % at M0067).
+
+- [ ] M0068-0003: Per-batch string arena.
+      **Design:** `docs/design/0068-0003-batch-string-arena.md`.
+      **Files:** new `internal/executor/arena.go`;
+      `internal/executor/codec.go`,
+      `internal/executor/operators_storage.go`,
+      `internal/executor/operators_index.go`.
+      **Depends on:** M0068-0001 (Datum.arena field),
+      M0068-0002 (slot Materialize boundary).
+      **Acceptance:**
+        - varchar / char / bytea decode allocates from
+          arena, not per-value.
+        - Q5 pprof `inuse_space` for strings shows
+          ~24 K arena pages instead of ~30 M individual
+          string allocations.
+        - 22-query row-count parity preserved.
+
+- [ ] M0068-0004: Cross-query slot pool.
+      **Design:** `docs/design/0068-0004-row-slot-pool.md`.
+      **Files:** new `internal/executor/slot_pool.go`;
+      `internal/executor/operator.go` (slot lifecycle),
+      operators that materialize slots.
+      **Depends on:** M0068-0002.
+      **Acceptance:**
+        - `sync.Pool` keyed by slot width.
+        - Q5 pprof `alloc_space` for
+          `(*MaterializedSlot)` drops ≥ 70 %.
+        - `go test ./...` PASS.
+
+- [ ] M0068-0005: IndexScan lazy iteration.
+      **Files:** `internal/executor/operators_index.go`
+      (`Rescan` no longer pre-materializes into
+      `o.rows[]`; yields one slot per `Next()`).
+      **Acceptance:**
+        - Q9 SF=1 peak heap drops ≥ 5 GB
+          (`go tool pprof -inuse_space`).
+        - 22-query row-count parity preserved.
+
+- [ ] M0068-0006: sortOp memory-bounded.
+      **Files:** `internal/executor/operators.go`
+      (`sortOp.Open` integrates `spill.go`).
+      **Closes:** `review/postgres_vs_goopg_performance_divergence.md` §7
+      Materialization (Severity: High).
+      **Acceptance:**
+        - sortOp respects work_mem budget; spills above
+          threshold.
+        - Q3 / Q19-shape sorts complete under bounded
+          memory at SF=1.
+        - 22-query row-count parity preserved.
+
+- [ ] M0068-0007: Final 22-query SF=1 sweep + GC profile.
+      **Files (output):**
+        `analysis/tpch-m0068-baseline-<date>.md`,
+        `bench/tpch/logs/m0068_22q_<ts>.log`,
+        `bench/tpch/pprof/cpu_q5_m0068.prof`,
+        `bench/tpch/pprof/heap_q5_m0068.prof`.
+      **Blocked by:** M0068-0001..0006.
+      **Acceptance:**
+        - 22-query OK count ≥ 20 at
+          `cancel-after=1200s`.
+        - Q5 pprof `gcBgMarkWorker` CPU share < 15 %
+          (was ~30 % post-M0066, ~65 % at M0065
+          baseline).
+        - Document any flipped-query row counts (Q9 7 →
+          correct, Q21 0 → correct expected as
+          side-effect of slot model repairing the
+          schema-vs-runtime mismatch).
+
+## Deferred (former M0067 draft, now M0069+ candidates)
+
+- [ ] M0069 candidate: Q5 build-time predicate pushdown
+      for unpromoted SeqScans — earlier abortive attempt
+      broke Q3 due to walker interaction; needs guarded
+      re-implementation. Likely benefits from M0068's slot
+      rewrite landing first (more stable column-coordinate
+      conventions).
+- [ ] M0069 candidate: Q20 timestamp btree v0 OR unnest
+      non-correlated IN to SemiJoin (only correlated INs
+      are currently unnested).
+- [ ] M0069 candidate: Q21 Anti-side hash-join inner-Filter
+      conjunct lift + composite-NLI on `partsupp_pk` for Q9
+      to absorb the cardinality explosion.
+- [ ] M0069 candidate: SI `HasInProgress` linear-scan
+      replacement (review §4).
+- [ ] M0069 candidate: Buffer manager `poolMu` partitioning
+      (review §5).
 
 ## Notes
 
