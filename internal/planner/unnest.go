@@ -1145,6 +1145,22 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// (the lineitem aggregate in Q20) are pulled up first.
 	innerPlan = unnestSubqueriesInPlan(innerPlan)
 
+	// M0071-0002: mark the Project at the root of the inner
+	// subquery scope as IsolatedScope so the NLI rewriter
+	// (`internal/planner/nl_index_join.go::tryBuildNLI`) declines
+	// to convert the SemiJoin into an NLI. The conversion would
+	// flip pickInnerSide's outer/inner roles and shift inner-side
+	// Filter ColumnRefs by `partsupp_width`, breaking the inner
+	// subquery's Filter (e.g. Q20's `p_name LIKE 'forest%'`
+	// resolved at part's idx 1 → idx 4 mismatch). M0063-0001's
+	// existing IsolatedScope gate already covers view-rename
+	// wrappers; this hooks the same mechanism for IN-unnested
+	// inner subqueries so the SemiJoin's Right side stays a
+	// hash-built isolated scope.
+	if proj, ok := innerPlan.(*Project); ok {
+		proj.IsolatedScope = true
+	}
+
 	innerOut := innerPlan.Output()
 	if len(innerOut) != 1 {
 		return nil, nil
