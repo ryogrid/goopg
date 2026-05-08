@@ -30,10 +30,10 @@ const numericMaxDisplayScale = 1000
 // the big-int overflow lane (NumericBig != nil). Always returns a
 // fresh *big.Int so callers can mutate without aliasing the Datum.
 func numericMant(d Datum) *big.Int {
-	if d.NumericBig != nil {
-		return new(big.Int).Set(d.NumericBig)
+	if d.NumericBigValue() != nil {
+		return new(big.Int).Set(d.NumericBigValue())
 	}
-	return big.NewInt(d.NumericMantissa)
+	return big.NewInt(d.NumericMantissaValue())
 }
 
 // newNumeric constructs a KindNumeric Datum from a *big.Int
@@ -54,10 +54,10 @@ func newNumeric(b *big.Int, scale int) Datum {
 		scale = 0
 	}
 	if b.Cmp(bigNumericMinInt64) >= 0 && b.Cmp(bigNumericMaxInt64) <= 0 {
-		return Datum{Kind: KindNumeric, NumericMantissa: b.Int64(), NumericScale: int16(scale)}
+		return Datum{Kind: KindNumeric, Int: b.Int64(), Scale: int16(scale)}
 	}
 	bb := new(big.Int).Set(b)
-	return Datum{Kind: KindNumeric, NumericBig: bb, NumericScale: int16(scale)}
+	return Datum{Kind: KindNumeric, Big: bb, Scale: int16(scale)}
 }
 
 // parseNumericFast attempts an int64-only fast path for the
@@ -177,7 +177,7 @@ func parseNumeric(text string) (*big.Int, int16, error) {
 
 // numericFromInt promotes an int64 to KindNumeric form (scale=0).
 func numericFromInt(n int64) Datum {
-	return Datum{Kind: KindNumeric, NumericMantissa: n, NumericScale: 0}
+	return Datum{Kind: KindNumeric, Int: n, Scale: 0}
 }
 
 // promoteToNumeric brings two operands to KindNumeric so the
@@ -204,7 +204,7 @@ func toNumeric(d Datum, op string, pos int) (Datum, error) {
 	case KindInt:
 		return numericFromInt(d.Int), nil
 	case KindString:
-		if m, s, err := parseNumeric(d.String); err == nil {
+		if m, s, err := parseNumeric(d.StringValue()); err == nil {
 			return newNumeric(m, int(s)), nil
 		}
 	}
@@ -237,17 +237,17 @@ func alignNumericBig(am *big.Int, as int16, bm *big.Int, bs int16) (*big.Int, *b
 // overflow is no longer a concern; the result lands on the int64
 // fast path automatically when it fits via newNumeric.
 func numericAdd(a, b Datum) (Datum, error) {
-	am, bm, scale := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	am, bm, scale := alignNumericBig(numericMant(a), a.Scale, numericMant(b), b.Scale)
 	return newNumeric(new(big.Int).Add(am, bm), int(scale)), nil
 }
 
 func numericSub(a, b Datum) (Datum, error) {
-	am, bm, scale := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	am, bm, scale := alignNumericBig(numericMant(a), a.Scale, numericMant(b), b.Scale)
 	return newNumeric(new(big.Int).Sub(am, bm), int(scale)), nil
 }
 
 func numericMul(a, b Datum) (Datum, error) {
-	scale := int(a.NumericScale) + int(b.NumericScale)
+	scale := int(a.Scale) + int(b.Scale)
 	if scale > numericMaxDisplayScale {
 		return Datum{}, fmt.Errorf("numeric scale %d exceeds %d in multiply", scale, numericMaxDisplayScale)
 	}
@@ -274,7 +274,7 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 	}
 	am := numericMant(a)
-	da, db := int(a.NumericScale), int(b.NumericScale)
+	da, db := int(a.Scale), int(b.Scale)
 	if am.Sign() == 0 {
 		// Zero numerator — short-circuit at max(da, db, 0).
 		zScale := da
@@ -412,7 +412,7 @@ func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int
 // numericCmp compares two numeric values, returning -1/0/+1.
 // Aligning scales in advance avoids cross-scale precision loss.
 func numericCmp(a, b Datum) (int, error) {
-	am, bm, _ := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	am, bm, _ := alignNumericBig(numericMant(a), a.Scale, numericMant(b), b.Scale)
 	switch am.Cmp(bm) {
 	case -1:
 		return -1, nil

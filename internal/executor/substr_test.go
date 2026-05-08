@@ -22,7 +22,7 @@ func TestEvalSubstr(t *testing.T) {
 				&planner.IntegerConst{Value: 1},
 				&planner.IntegerConst{Value: 2},
 			},
-			want: Datum{Kind: KindString, String: "13"},
+			want: NewStringDatum("13"),
 		},
 		{
 			name: "two-argument tail form",
@@ -30,7 +30,7 @@ func TestEvalSubstr(t *testing.T) {
 				&planner.StringConst{Value: "abcdef"},
 				&planner.IntegerConst{Value: 3},
 			},
-			want: Datum{Kind: KindString, String: "cdef"},
+			want: NewStringDatum("cdef"),
 		},
 		{
 			name: "start beyond end returns empty",
@@ -39,7 +39,7 @@ func TestEvalSubstr(t *testing.T) {
 				&planner.IntegerConst{Value: 10},
 				&planner.IntegerConst{Value: 5},
 			},
-			want: Datum{Kind: KindString, String: ""},
+			want: NewStringDatum(""),
 		},
 		{
 			name: "count truncates to string length",
@@ -48,7 +48,7 @@ func TestEvalSubstr(t *testing.T) {
 				&planner.IntegerConst{Value: 1},
 				&planner.IntegerConst{Value: 99},
 			},
-			want: Datum{Kind: KindString, String: "abc"},
+			want: NewStringDatum("abc"),
 		},
 		{
 			name: "NULL src propagates",
@@ -67,7 +67,7 @@ func TestEvalSubstr(t *testing.T) {
 			if err != nil {
 				t.Fatalf("evalFuncCall: %v", err)
 			}
-			if got.Kind != c.want.Kind || got.String != c.want.String {
+			if got.Kind != c.want.Kind || got.StringValue() != c.want.StringValue() {
 				t.Fatalf("got %+v, want %+v", got, c.want)
 			}
 		})
@@ -107,11 +107,11 @@ func TestEvalToDate(t *testing.T) {
 	if got.Kind != KindTime {
 		t.Fatalf("got kind=%v, want KindTime", got.Kind)
 	}
-	year, month, day := got.Time.Date()
+	year, month, day := got.TimeValue().Date()
 	if year != 1996 || month != 1 || day != 1 {
-		t.Fatalf("got %v, want 1996-01-01", got.Time)
+		t.Fatalf("got %v, want 1996-01-01", got.TimeValue())
 	}
-	if h, m, s := got.Time.Clock(); h != 0 || m != 0 || s != 0 {
+	if h, m, s := got.TimeValue().Clock(); h != 0 || m != 0 || s != 0 {
 		t.Fatalf("got time-of-day %02d:%02d:%02d, want 00:00:00", h, m, s)
 	}
 

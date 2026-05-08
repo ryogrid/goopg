@@ -171,7 +171,7 @@ func encodeDatum(d Datum, buf []byte) []byte {
 	case KindNull:
 		// nothing else
 	case KindBool:
-		if d.Bool {
+		if d.BoolValue() {
 			buf = append(buf, 1)
 		} else {
 			buf = append(buf, 0)
@@ -179,24 +179,24 @@ func encodeDatum(d Datum, buf []byte) []byte {
 	case KindInt:
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.Int))
 	case KindString:
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.String)))
-		buf = append(buf, d.String...)
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.StringValue())))
+		buf = append(buf, d.StringValue()...)
 	case KindBytes:
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.Bytes)))
-		buf = append(buf, d.Bytes...)
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.BytesValue())))
+		buf = append(buf, d.BytesValue()...)
 	case KindTime:
-		n := d.Time.UTC().UnixNano()
+		n := d.TimeValue().UTC().UnixNano()
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(n))
 	case KindInterval:
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonths))
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDays))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonthsValue()))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDaysValue()))
 	case KindNumeric:
 		// 2-byte int16 scale + length-prefixed signed-magnitude
 		// big.Int bytes (1 sign byte + magnitude). Per-query
 		// spill files have no on-disk back-compat constraint,
 		// so the wider layout is safe; fits-int64 values still
 		// pack into 2 + 4 + 1 + ≤8 bytes ≈ 15 bytes.
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(d.NumericScale))
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(d.Scale))
 		mant := numericMant(d)
 		signByte := byte(0)
 		if mant.Sign() < 0 {
@@ -224,7 +224,7 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		if pos >= len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated bool at %d", pos)
 		}
-		return Datum{Kind: KindBool, Bool: data[pos] != 0}, pos + 1, nil
+		return NewBoolDatum(data[pos] != 0), pos + 1, nil
 	case KindInt:
 		if pos+8 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated int at %d", pos)
@@ -240,7 +240,7 @@ func decodeDatum(data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated string body at %d (want %d)", pos, slen)
 		}
 		s := string(data[pos : pos+int(slen)])
-		return Datum{Kind: KindString, String: s}, pos + int(slen), nil
+		return NewStringDatum(s), pos + int(slen), nil
 	case KindBytes:
 		if pos+4 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated bytes len at %d", pos)
@@ -252,20 +252,20 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		}
 		b := make([]byte, blen)
 		copy(b, data[pos:pos+int(blen)])
-		return Datum{Kind: KindBytes, Bytes: b}, pos + int(blen), nil
+		return NewBytesDatum(b), pos + int(blen), nil
 	case KindTime:
 		if pos+8 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated time at %d", pos)
 		}
 		n := int64(binary.LittleEndian.Uint64(data[pos:]))
-		return Datum{Kind: KindTime, Time: time.Unix(0, n).UTC()}, pos + 8, nil
+		return NewTimeDatum(time.Unix(0, n).UTC()), pos + 8, nil
 	case KindInterval:
 		if pos+8 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated interval at %d", pos)
 		}
 		months := int32(binary.LittleEndian.Uint32(data[pos:]))
 		days := int32(binary.LittleEndian.Uint32(data[pos+4:]))
-		return Datum{Kind: KindInterval, IntervalMonths: months, IntervalDays: days}, pos + 8, nil
+		return NewIntervalDatum(months, days), pos + 8, nil
 	case KindNumeric:
 		if pos+6 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated numeric at %d", pos)
@@ -296,9 +296,9 @@ func estimatedRowBytes(row Row) int64 {
 	for _, d := range row {
 		switch d.Kind {
 		case KindString:
-			n += int64(len(d.String))
+			n += int64(len(d.StringValue()))
 		case KindBytes:
-			n += int64(len(d.Bytes))
+			n += int64(len(d.BytesValue()))
 		}
 	}
 	return n

@@ -25,12 +25,12 @@ func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].Kind != KindNumeric || got[0].NumericMantissa != 42 || got[0].NumericScale != 0 {
+	if got[0].Kind != KindNumeric || got[0].NumericMantissaValue() != 42 || got[0].Scale != 0 {
 		t.Errorf("decoded=%+v; want KindNumeric{42,0}", got[0])
 	}
 
 	// String values with decimals (e.g. HammerDB loader).
-	rowStr := Row{{Kind: KindString, String: "1234567890.12345"}}
+	rowStr := Row{NewStringDatum("1234567890.12345")}
 	bytes2, err := EncodeRow(cols, rowStr)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 
 	// KindNumeric datums (output of NUMERIC arithmetic) format
 	// back to their canonical decimal-text form.
-	rowNum := Row{{Kind: KindNumeric, NumericMantissa: -12345, NumericScale: 3}}
+	rowNum := Row{{Kind: KindNumeric, Int: -12345, Scale: 3}}
 	bytes3, err := EncodeRow(cols, rowNum)
 	if err != nil {
 		t.Fatal(err)

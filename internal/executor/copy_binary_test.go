@@ -35,19 +35,19 @@ func TestCopyBinaryRoundTrip(t *testing.T) {
 		{
 			Datum{Kind: KindInt, Int: 1},
 			Datum{Kind: KindInt, Int: 1000000},
-			Datum{Kind: KindBool, Bool: true},
-			Datum{Kind: KindString, String: "hello world"},
-			Datum{Kind: KindTime, Time: ts},
-			Datum{Kind: KindTime, Time: dt},
+			NewBoolDatum(true),
+			NewStringDatum("hello world"),
+			NewTimeDatum(ts),
+			NewTimeDatum(dt),
 			newNumeric(priceM, int(priceS)),
 		},
 		{
 			Datum{Kind: KindInt, Int: 2},
 			Datum{Kind: KindInt, Int: -42},
-			Datum{Kind: KindBool, Bool: false},
-			Datum{Kind: KindString, String: ""},
-			Datum{Kind: KindTime, Time: pgEpoch},
-			Datum{Kind: KindTime, Time: pgEpoch},
+			NewBoolDatum(false),
+			NewStringDatum(""),
+			NewTimeDatum(pgEpoch),
+			NewTimeDatum(pgEpoch),
 			newNumeric(priceM, int(priceS)),
 		},
 		{
@@ -175,8 +175,8 @@ func TestCopyBinaryRoundTripViaExecutor(t *testing.T) {
 		if decoded[0][0].Int != 1 {
 			t.Errorf("row[0].id = %d, want 1", decoded[0][0].Int)
 		}
-		if decoded[0][1].String != "alpha" {
-			t.Errorf("row[0].label = %q, want alpha", decoded[0][1].String)
+		if decoded[0][1].StringValue() != "alpha" {
+			t.Errorf("row[0].label = %q, want alpha", decoded[0][1].StringValue())
 		}
 	}
 }
@@ -190,15 +190,15 @@ func datumEqual(a, b Datum, col catalog.Column) bool {
 	case KindInt:
 		return a.Int == b.Int
 	case KindBool:
-		return a.Bool == b.Bool
+		return a.BoolValue() == b.BoolValue()
 	case KindString:
-		return a.String == b.String
+		return a.StringValue() == b.StringValue()
 	case KindBytes:
-		return bytes.Equal(a.Bytes, b.Bytes)
+		return bytes.Equal(a.BytesValue(), b.BytesValue())
 	case KindTime:
 		// Compare at microsecond precision (binary timestamp precision).
-		return a.Time.Unix() == b.Time.Unix() &&
-			a.Time.Nanosecond()/1000 == b.Time.Nanosecond()/1000
+		return a.TimeValue().Unix() == b.TimeValue().Unix() &&
+			a.TimeValue().Nanosecond()/1000 == b.TimeValue().Nanosecond()/1000
 	case KindNumeric:
 		return a.Format() == b.Format()
 	}

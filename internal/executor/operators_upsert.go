@@ -329,7 +329,7 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		if v.IsNull() || v.Kind != KindBool || !v.Bool {
+		if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
 			return nil, true, nil
 		}
 	}

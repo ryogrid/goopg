@@ -41,11 +41,11 @@ func TestCanonicalNumericKey(t *testing.T) {
 // arrives as KindInt or as scale-0 KindNumeric.
 func TestDatumKeyNumericInteger(t *testing.T) {
 	intKey := datumKey(Datum{Kind: KindInt, Int: 1})
-	numKey := datumKey(Datum{Kind: KindNumeric, NumericMantissa: 1, NumericScale: 0})
+	numKey := datumKey(Datum{Kind: KindNumeric, Int: 1, Scale: 0})
 	if intKey != numKey {
 		t.Fatalf("KindInt(1) hashed as %q, KindNumeric(1, 0) as %q (must match)", intKey, numKey)
 	}
-	scaledKey := datumKey(Datum{Kind: KindNumeric, NumericMantissa: 1000, NumericScale: 3})
+	scaledKey := datumKey(Datum{Kind: KindNumeric, Int: 1000, Scale: 3})
 	if scaledKey != numKey {
 		t.Fatalf("KindNumeric(1000, 3) hashed as %q, expected %q (1.000 must canonicalise to 1)", scaledKey, numKey)
 	}
@@ -58,13 +58,13 @@ func TestDatumKeyNumericInteger(t *testing.T) {
 // NUMERIC arm and silently returned false for every comparison,
 // dropping all rows.
 func TestCompareEqNumericIntList(t *testing.T) {
-	num := Datum{Kind: KindNumeric, NumericMantissa: 49, NumericScale: 0}
+	num := Datum{Kind: KindNumeric, Int: 49, Scale: 0}
 	intLit := Datum{Kind: KindInt, Int: 49}
 	got, err := compareEq(num, intLit)
 	if err != nil {
 		t.Fatalf("compareEq(NUMERIC 49, INT 49): %v", err)
 	}
-	if got.Kind != KindBool || !got.Bool {
+	if got.Kind != KindBool || !got.BoolValue() {
 		t.Fatalf("compareEq(NUMERIC 49, INT 49)=%+v, want true", got)
 	}
 	// Negative-case: 49 != 14 across kinds.
@@ -72,7 +72,7 @@ func TestCompareEqNumericIntList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compareEq(NUMERIC 49, INT 14): %v", err)
 	}
-	if got.Kind != KindBool || got.Bool {
+	if got.Kind != KindBool || got.BoolValue() {
 		t.Fatalf("compareEq(NUMERIC 49, INT 14)=%+v, want false", got)
 	}
 	// Symmetry: INT vs NUMERIC.
@@ -80,7 +80,7 @@ func TestCompareEqNumericIntList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compareEq(INT 49, NUMERIC 49): %v", err)
 	}
-	if got.Kind != KindBool || !got.Bool {
+	if got.Kind != KindBool || !got.BoolValue() {
 		t.Fatalf("compareEq(INT 49, NUMERIC 49)=%+v, want true (symmetry)", got)
 	}
 	// NULL propagation must still apply.

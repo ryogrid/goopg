@@ -36,7 +36,7 @@ func TestIndexScanEndToEndConstantKey(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows=%d want 1", len(rows))
 	}
-	if rows[0][0].Int != 2 || rows[0][1].String != "beta" {
+	if rows[0][0].Int != 2 || rows[0][1].StringValue() != "beta" {
 		t.Fatalf("row=%+v want [2,beta]", rows[0])
 	}
 }
@@ -64,7 +64,7 @@ func TestIndexScanEndToEndParamKey(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows=%d want 1", len(rows))
 	}
-	if rows[0][0].Int != 3 || rows[0][1].String != "gamma" {
+	if rows[0][0].Int != 3 || rows[0][1].StringValue() != "gamma" {
 		t.Fatalf("row=%+v want [3,gamma]", rows[0])
 	}
 }

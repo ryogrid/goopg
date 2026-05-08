@@ -241,5 +241,5 @@ func (o *nestedLoopIndexJoinOp) evalPredicate(row Row) (bool, error) {
 	if v.IsNull() {
 		return false, nil
 	}
-	return v.Bool, nil
+	return v.BoolValue(), nil
 }

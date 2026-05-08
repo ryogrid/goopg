@@ -110,7 +110,7 @@ func TestInsertThenSeqScanRoundTrip(t *testing.T) {
 		id    int64
 		label string
 	}{{1, "alpha"}, {2, "beta"}, {3, "gamma"}} {
-		if rows[i][0].Int != want.id || rows[i][1].String != want.label {
+		if rows[i][0].Int != want.id || rows[i][1].StringValue() != want.label {
 			t.Errorf("rows[%d]=%+v want id=%d label=%q", i, rows[i], want.id, want.label)
 		}
 	}

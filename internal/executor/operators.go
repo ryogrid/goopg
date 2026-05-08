@@ -141,7 +141,7 @@ func (o *filterOp) Next() (Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !v.IsNull() && v.Kind == KindBool && v.Bool {
+		if !v.IsNull() && v.Kind == KindBool && v.BoolValue() {
 			return row, nil
 		}
 		rejected++

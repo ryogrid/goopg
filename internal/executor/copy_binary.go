@@ -148,7 +148,7 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindBool {
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
 		}
-		if d.Bool {
+		if d.BoolValue() {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
@@ -156,18 +156,18 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
-		return encodeTimestampBinary(d.Time.UTC()), nil
+		return encodeTimestampBinary(d.TimeValue().UTC()), nil
 	case "timestamptz":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
-		return encodeTimestampBinary(d.Time.UTC()), nil
+		return encodeTimestampBinary(d.TimeValue().UTC()), nil
 	case "date":
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
 		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-		days := int32(d.Time.UTC().Truncate(24*time.Hour).Sub(epoch).Hours() / 24)
+		days := int32(d.TimeValue().UTC().Truncate(24*time.Hour).Sub(epoch).Hours() / 24)
 		b := make([]byte, 4)
 		binary.BigEndian.PutUint32(b, uint32(days))
 		return b, nil
@@ -177,9 +177,9 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 		// text / varchar / char / bytea — raw bytes
 		switch d.Kind {
 		case KindString:
-			return []byte(d.String), nil
+			return []byte(d.StringValue()), nil
 		case KindBytes:
-			return d.Bytes, nil
+			return d.BytesValue(), nil
 		case KindInt:
 			b := make([]byte, 8)
 			binary.BigEndian.PutUint64(b, uint64(d.Int))
@@ -208,24 +208,24 @@ func copyBinaryToDatum(t catalog.Type, payload []byte) (Datum, error) {
 		if len(payload) != 1 {
 			return Datum{}, fmt.Errorf("bool: expected 1 byte, got %d", len(payload))
 		}
-		return Datum{Kind: KindBool, Bool: payload[0] != 0}, nil
+		return NewBoolDatum(payload[0] != 0), nil
 	case "timestamp", "timestamptz":
 		if len(payload) != 8 {
 			return Datum{}, fmt.Errorf("timestamp: expected 8 bytes, got %d", len(payload))
 		}
 		usec := int64(binary.BigEndian.Uint64(payload))
-		return Datum{Kind: KindTime, Time: pgEpoch.Add(time.Duration(usec) * time.Microsecond)}, nil
+		return NewTimeDatum(pgEpoch.Add(time.Duration(usec) * time.Microsecond)), nil
 	case "date":
 		if len(payload) != 4 {
 			return Datum{}, fmt.Errorf("date: expected 4 bytes, got %d", len(payload))
 		}
 		days := int32(binary.BigEndian.Uint32(payload))
 		t := pgEpoch.AddDate(0, 0, int(days))
-		return Datum{Kind: KindTime, Time: t}, nil
+		return NewTimeDatum(t), nil
 	case "numeric", "decimal":
 		return decodeNumericBinary(payload)
 	default:
-		return Datum{Kind: KindString, String: string(payload)}, nil
+		return NewStringDatum(string(payload)), nil
 	}
 }
 

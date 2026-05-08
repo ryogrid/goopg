@@ -1019,7 +1019,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 					ctx.Pool.Unpin(s)
 					return err
 				}
-				if v.IsNull() || v.Kind != KindBool || !v.Bool {
+				if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
 					continue
 				}
 			}

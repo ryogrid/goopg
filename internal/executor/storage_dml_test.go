@@ -87,7 +87,7 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 	}
 	got := map[int64]string{}
 	for _, r := range rows {
-		got[r[0].Int] = r[1].String
+		got[r[0].Int] = r[1].StringValue()
 	}
 	want := map[int64]string{1: "alpha", 2: "updated", 3: "gamma"}
 	if len(got) != len(want) {
@@ -211,7 +211,7 @@ func TestUpdateViaIndexScanPath(t *testing.T) {
 	}
 	got := map[int64]string{}
 	for _, r := range rows {
-		got[r[0].Int] = r[1].String
+		got[r[0].Int] = r[1].StringValue()
 	}
 	want := map[int64]string{1: "alpha", 2: "updated", 3: "gamma"}
 	for k, v := range want {

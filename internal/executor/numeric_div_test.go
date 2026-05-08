@@ -12,8 +12,8 @@ import (
 // hardcoded to max(left, right, 6), so the result has more
 // fractional digits but still represents the same quotient.
 func TestNumericDivLargeIntermediateScaleFitsInt64(t *testing.T) {
-	a := Datum{Kind: KindNumeric, NumericMantissa: 9223372036855, NumericScale: 4}
-	b := Datum{Kind: KindNumeric, NumericMantissa: 18446744073710, NumericScale: 4}
+	a := Datum{Kind: KindNumeric, Int: 9223372036855, Scale: 4}
+	b := Datum{Kind: KindNumeric, Int: 18446744073710, Scale: 4}
 	got, err := numericDiv(a, b, 0)
 	if err != nil {
 		t.Fatalf("numericDiv returned error: %v", err)
@@ -28,8 +28,8 @@ func TestNumericDivLargeIntermediateScaleFitsInt64(t *testing.T) {
 	// after the first-digit comparison) ≈ 17 fractional digits.
 	// Format the result and check it equals 0.5 numerically.
 	gotText := numericText(got)
-	if gotText != formatExpected(t, big.NewRat(1, 2), int(got.NumericScale)) {
-		t.Fatalf("numericDiv = %q, want exact representation of 0.5 at scale %d", gotText, got.NumericScale)
+	if gotText != formatExpected(t, big.NewRat(1, 2), int(got.Scale)) {
+		t.Fatalf("numericDiv = %q, want exact representation of 0.5 at scale %d", gotText, got.Scale)
 	}
 }
 
@@ -41,7 +41,7 @@ func formatExpected(t *testing.T, r *big.Rat, scale int) string {
 // TestNumericDivQ1Avg pins Q1's avg pattern: 70 / 6 →
 // "11.6666666666666667" (16 fractional digits, half-rounded).
 func TestNumericDivQ1Avg(t *testing.T) {
-	a := Datum{Kind: KindNumeric, NumericMantissa: 70, NumericScale: 0}
+	a := Datum{Kind: KindNumeric, Int: 70, Scale: 0}
 	b := numericFromInt(6)
 	got, err := numericDiv(a, b, 0)
 	if err != nil {

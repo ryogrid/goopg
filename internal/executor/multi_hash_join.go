@@ -598,7 +598,7 @@ func (o *multiHashJoinOp) evalFilters(fs []planner.Expr) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if v.IsNull() || !(v.Kind == KindBool && v.Bool) {
+		if v.IsNull() || !(v.Kind == KindBool && v.BoolValue()) {
 			return false, nil
 		}
 	}

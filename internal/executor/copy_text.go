@@ -245,7 +245,7 @@ func datumToCopyText(t catalog.Type, d Datum) (string, error) {
 		if d.Kind != KindBool {
 			return "", fmt.Errorf("expected bool datum, got kind %d", d.Kind)
 		}
-		if d.Bool {
+		if d.BoolValue() {
 			return "t", nil
 		}
 		return "f", nil
@@ -253,17 +253,17 @@ func datumToCopyText(t catalog.Type, d Datum) (string, error) {
 		if d.Kind != KindTime {
 			return "", fmt.Errorf("expected time datum, got kind %d", d.Kind)
 		}
-		return d.Time.UTC().Format("2006-01-02 15:04:05.000000"), nil
+		return d.TimeValue().UTC().Format("2006-01-02 15:04:05.000000"), nil
 	default:
 		switch d.Kind {
 		case KindString:
-			return d.String, nil
+			return d.StringValue(), nil
 		case KindBytes:
-			return string(d.Bytes), nil
+			return string(d.BytesValue()), nil
 		case KindInt:
 			return strconv.FormatInt(d.Int, 10), nil
 		case KindBool:
-			if d.Bool {
+			if d.BoolValue() {
 				return "t", nil
 			}
 			return "f", nil
@@ -288,9 +288,9 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 	case "bool", "boolean":
 		switch string(raw) {
 		case "t", "true", "T", "TRUE", "y", "Y", "yes", "1":
-			return Datum{Kind: KindBool, Bool: true}, nil
+			return NewBoolDatum(true), nil
 		case "f", "false", "F", "FALSE", "n", "N", "no", "0":
-			return Datum{Kind: KindBool, Bool: false}, nil
+			return NewBoolDatum(false), nil
 		default:
 			return Datum{}, fmt.Errorf("invalid boolean %q", string(raw))
 		}
@@ -299,14 +299,14 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
-		return Datum{Kind: KindTime, Time: ts}, nil
+		return NewTimeDatum(ts), nil
 	case "numeric", "decimal":
 		text := string(raw)
 		// M0058-0003: int64 fast path for integer-valued NUMERIC. The
 		// HammerDB COPY stream is overwhelmingly small integers since
 		// all integer columns are typed NUMERIC.
 		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, NumericMantissa: v, NumericScale: scale}, nil
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, nil
 		}
 		// Validate the text is a valid numeric literal before
 		// storing.  This catches column-alignment bugs at COPY
@@ -319,7 +319,7 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		return newNumeric(m, int(s)), nil
 	default:
 		// text / varchar / char / unknown — keep as String.
-		return Datum{Kind: KindString, String: string(raw)}, nil
+		return NewStringDatum(string(raw)), nil
 	}
 }
 

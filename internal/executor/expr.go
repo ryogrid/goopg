@@ -65,11 +65,11 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		}
 		return newNumeric(m, int(s)), nil
 	case *planner.StringConst:
-		return Datum{Kind: KindString, String: x.Value}, nil
+		return NewStringDatum(x.Value), nil
 	case *planner.NullConst:
 		return NullDatum, nil
 	case *planner.BooleanConst:
-		return Datum{Kind: KindBool, Bool: x.Value}, nil
+		return NewBoolDatum(x.Value), nil
 	case *planner.ParamRef:
 		if x.Number < 1 || x.Number > len(ctx.Params) {
 			return Datum{}, &ExecError{Code: "08P01", Pos: x.Pos(), Message: fmt.Sprintf("parameter $%d not bound", x.Number)}
@@ -122,7 +122,7 @@ func evalUnary(op string, d Datum, pos int) (Datum, error) {
 		if d.Kind != KindBool {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator NOT requires boolean"}
 		}
-		return Datum{Kind: KindBool, Bool: !d.Bool}, nil
+		return NewBoolDatum(!d.BoolValue()), nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown unary operator %s", op)}
 }
@@ -160,12 +160,12 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		// operands as numeric (columns loaded via INSERT may be
 		// stored as strings before the type system enforces types).
 		if left.Kind == KindString {
-			if m, s, err := parseNumeric(left.String); err == nil {
+			if m, s, err := parseNumeric(left.StringValue()); err == nil {
 				left = newNumeric(m, int(s))
 			}
 		}
 		if right.Kind == KindString {
-			if m, s, err := parseNumeric(right.String); err == nil {
+			if m, s, err := parseNumeric(right.StringValue()); err == nil {
 				right = newNumeric(m, int(s))
 			}
 		}
@@ -202,13 +202,13 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		if left.Kind != KindString || right.Kind != KindString {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
 		}
-		return Datum{Kind: KindString, String: left.String + right.String}, nil
+		return NewStringDatum(left.StringValue() + right.StringValue()), nil
 	case "=", "<", ">", "<=", ">=", "<>", "!=":
 		cmp, err := compareDatum(left, right, pos)
 		if err != nil {
 			return Datum{}, err
 		}
-		return Datum{Kind: KindBool, Bool: cmpResult(op, cmp)}, nil
+		return NewBoolDatum(cmpResult(op, cmp)), nil
 	case "LIKE", "NOT LIKE":
 		// M0062-followup: accept KindBytes operands as UTF-8 text so a
 		// varchar that arrives as bytes (e.g. via a row-reshaping path
@@ -227,7 +227,7 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		if op == "NOT LIKE" {
 			matched = !matched
 		}
-		return Datum{Kind: KindBool, Bool: matched}, nil
+		return NewBoolDatum(matched), nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
 }
@@ -240,9 +240,9 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 func datumAsString(d Datum) (string, bool) {
 	switch d.Kind {
 	case KindString:
-		return d.String, true
+		return d.StringValue(), true
 	case KindBytes:
-		return string(d.Bytes), true
+		return string(d.BytesValue()), true
 	}
 	return "", false
 }
@@ -305,13 +305,13 @@ func matchSQLLike(s, pat string) bool {
 // the way upstream PG does for `timestamp + interval '1 month'`);
 // days are added via the same call.
 func addTimeInterval(t, iv Datum, subtract bool) Datum {
-	months := int(iv.IntervalMonths)
-	days := int(iv.IntervalDays)
+	months := int(iv.IntervalMonthsValue())
+	days := int(iv.IntervalDaysValue())
 	if subtract {
 		months = -months
 		days = -days
 	}
-	return Datum{Kind: KindTime, Time: t.Time.AddDate(0, months, days)}
+	return NewTimeDatum(t.TimeValue().AddDate(0, months, days))
 }
 
 func arithmetic(op string, a, b int64, pos int) (Datum, error) {
@@ -348,9 +348,9 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 	}
 	// One side is KindString — try to parse it as the other's type.
 	if a.Kind == KindString && b.Kind != KindString {
-		a = tryParseStringAs(b.Kind, a.String)
+		a = tryParseStringAs(b.Kind, a.StringValue())
 	} else if b.Kind == KindString && a.Kind != KindString {
-		b = tryParseStringAs(a.Kind, b.String)
+		b = tryParseStringAs(a.Kind, b.StringValue())
 	}
 	// KindInterval has no text parse path yet — leave as-is so
 	// the caller still errors instead of silently producing an
@@ -374,10 +374,10 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 	case KindTime:
 		if t, err := parseCopyTimestamp(s); err == nil {
-			return Datum{Kind: KindTime, Time: t}
+			return NewTimeDatum(t)
 		}
 	}
-	return Datum{Kind: KindString, String: s}
+	return NewStringDatum(s)
 }
 
 // compareDatum returns -1/0/1 the same way upstream's btree
@@ -422,19 +422,19 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		return 0, nil
 	case KindBool:
 		switch {
-		case !a.Bool && b.Bool:
+		case !a.BoolValue() && b.BoolValue():
 			return -1, nil
-		case a.Bool && !b.Bool:
+		case a.BoolValue() && !b.BoolValue():
 			return 1, nil
 		}
 		return 0, nil
 	case KindString:
-		return strings.Compare(a.String, b.String), nil
+		return strings.Compare(a.StringValue(), b.StringValue()), nil
 	case KindTime:
 		switch {
-		case a.Time.Before(b.Time):
+		case a.TimeValue().Before(b.TimeValue()):
 			return -1, nil
-		case a.Time.After(b.Time):
+		case a.TimeValue().After(b.TimeValue()):
 			return 1, nil
 		}
 		return 0, nil
@@ -462,29 +462,29 @@ func cmpResult(op string, cmp int) bool {
 
 // evalAnd / evalOr implement Kleene three-valued logic.
 func evalAnd(a, b Datum) Datum {
-	if !a.IsNull() && a.Kind == KindBool && !a.Bool {
-		return Datum{Kind: KindBool, Bool: false}
+	if !a.IsNull() && a.Kind == KindBool && !a.BoolValue() {
+		return NewBoolDatum(false)
 	}
-	if !b.IsNull() && b.Kind == KindBool && !b.Bool {
-		return Datum{Kind: KindBool, Bool: false}
+	if !b.IsNull() && b.Kind == KindBool && !b.BoolValue() {
+		return NewBoolDatum(false)
 	}
 	if a.IsNull() || b.IsNull() {
 		return NullDatum
 	}
-	return Datum{Kind: KindBool, Bool: a.Bool && b.Bool}
+	return NewBoolDatum(a.BoolValue() && b.BoolValue())
 }
 
 func evalOr(a, b Datum) Datum {
-	if !a.IsNull() && a.Kind == KindBool && a.Bool {
-		return Datum{Kind: KindBool, Bool: true}
+	if !a.IsNull() && a.Kind == KindBool && a.BoolValue() {
+		return NewBoolDatum(true)
 	}
-	if !b.IsNull() && b.Kind == KindBool && b.Bool {
-		return Datum{Kind: KindBool, Bool: true}
+	if !b.IsNull() && b.Kind == KindBool && b.BoolValue() {
+		return NewBoolDatum(true)
 	}
 	if a.IsNull() || b.IsNull() {
 		return NullDatum
 	}
-	return Datum{Kind: KindBool, Bool: a.Bool || b.Bool}
+	return NewBoolDatum(a.BoolValue() || b.BoolValue())
 }
 
 // evalTypedStringLit parses the body of a `<type> 'value'`
@@ -497,7 +497,7 @@ func evalOr(a, b Datum) Datum {
 // showed `time.parse` at 10.5 % cumulative CPU pre-cache.
 func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 	if x.CacheValid {
-		return Datum{Kind: KindTime, Time: x.CachedTime}, nil
+		return NewTimeDatum(x.CachedTime), nil
 	}
 	switch x.Type {
 	case "date":
@@ -507,7 +507,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
-		return Datum{Kind: KindTime, Time: x.CachedTime}, nil
+		return NewTimeDatum(x.CachedTime), nil
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
@@ -517,7 +517,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 			if t, err := time.Parse(layout, x.Value); err == nil {
 				x.CachedTime = t.UTC()
 				x.CacheValid = true
-				return Datum{Kind: KindTime, Time: x.CachedTime}, nil
+				return NewTimeDatum(x.CachedTime), nil
 			}
 		}
 		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
@@ -542,15 +542,15 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		// Try to parse a string as timestamp (planner may assign
 		// string storage for date columns loaded via INSERT).
 		if src.Kind == KindString {
-			if t, err := parseCopyTimestamp(src.String); err == nil {
-				src = Datum{Kind: KindTime, Time: t}
+			if t, err := parseCopyTimestamp(src.StringValue()); err == nil {
+				src = NewTimeDatum(t)
 			}
 		}
 	}
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT(%s FROM …) requires timestamp/date input", x.Field)}
 	}
-	n, err := extractTimestampField(x.Field, src.Time, x.Pos())
+	n, err := extractTimestampField(x.Field, src.TimeValue(), x.Pos())
 	if err != nil {
 		return Datum{}, err
 	}
@@ -613,7 +613,7 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part second argument must be timestamp/date"}
 	}
-	n, err := extractTimestampField(fieldArg.String, src.Time, x.Pos())
+	n, err := extractTimestampField(fieldArg.StringValue(), src.TimeValue(), x.Pos())
 	if err != nil {
 		return Datum{}, err
 	}
@@ -640,18 +640,16 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		x.CachedN = n
 		x.CacheValid = true
 	}
-	d := Datum{Kind: KindInterval}
 	switch x.Unit {
 	case "day":
-		d.IntervalDays = n
+		return NewIntervalDatum(0, n), nil
 	case "month":
-		d.IntervalMonths = n
+		return NewIntervalDatum(n, 0), nil
 	case "year":
-		d.IntervalMonths = n * 12
+		return NewIntervalDatum(n*12, 0), nil
 	default:
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}
-	return d, nil
 }
 
 // evalInExpr evaluates `expr [NOT] IN (subquery | val_list)`.
@@ -691,14 +689,14 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
-		if eq.Kind == KindBool && eq.Bool {
-			return Datum{Kind: KindBool, Bool: !x.Negated}, nil
+		if eq.Kind == KindBool && eq.BoolValue() {
+			return NewBoolDatum(!x.Negated), nil
 		}
 	}
 	if sawNull {
 		return NullDatum, nil
 	}
-	return Datum{Kind: KindBool, Bool: x.Negated}, nil
+	return NewBoolDatum(x.Negated), nil
 }
 
 // collectInValues returns the inner set for `IN (...)`. When
@@ -846,7 +844,7 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 	if err != nil && err != EOF {
 		return Datum{}, err
 	}
-	return Datum{Kind: KindBool, Bool: hasRow != x.Negated}, nil
+	return NewBoolDatum(hasRow != x.Negated), nil
 }
 
 // evalSubquery runs the inner plan inside a SubqueryExpr and
@@ -958,9 +956,9 @@ func evalCaseExpr(x *planner.CaseExpr, row Row, ctx *Context) (Datum, error) {
 			if err != nil {
 				return Datum{}, err
 			}
-			matched = eq.Kind == KindBool && eq.Bool
+			matched = eq.Kind == KindBool && eq.BoolValue()
 		} else {
-			matched = whenVal.Kind == KindBool && whenVal.Bool
+			matched = whenVal.Kind == KindBool && whenVal.BoolValue()
 		}
 		if matched {
 			return evalExpr(w.Then, row, ctx)
@@ -992,25 +990,25 @@ func compareEq(a, b Datum) (Datum, error) {
 		// the error and report not-equal.
 		cmp, err := compareDatum(a, b, 0)
 		if err != nil {
-			return Datum{Kind: KindBool, Bool: false}, nil
+			return NewBoolDatum(false), nil
 		}
-		return Datum{Kind: KindBool, Bool: cmp == 0}, nil
+		return NewBoolDatum(cmp == 0), nil
 	}
 	switch {
 	case a.Kind == KindInt && b.Kind == KindInt:
-		return Datum{Kind: KindBool, Bool: a.Int == b.Int}, nil
+		return NewBoolDatum(a.Int == b.Int), nil
 	case a.Kind == KindBool && b.Kind == KindBool:
-		return Datum{Kind: KindBool, Bool: a.Bool == b.Bool}, nil
+		return NewBoolDatum(a.BoolValue() == b.BoolValue()), nil
 	case a.Kind == KindString && b.Kind == KindString:
-		return Datum{Kind: KindBool, Bool: a.String == b.String}, nil
+		return NewBoolDatum(a.StringValue() == b.StringValue()), nil
 	case a.Kind == KindTime && b.Kind == KindTime:
-		return Datum{Kind: KindBool, Bool: a.Time.Equal(b.Time)}, nil
+		return NewBoolDatum(a.TimeValue().Equal(b.TimeValue())), nil
 	case a.Kind == KindInt && b.Kind == KindString:
-		return Datum{Kind: KindBool, Bool: fmt.Sprintf("%d", a.Int) == b.String}, nil
+		return NewBoolDatum(fmt.Sprintf("%d", a.Int) == b.StringValue()), nil
 	case a.Kind == KindString && b.Kind == KindInt:
-		return Datum{Kind: KindBool, Bool: a.String == fmt.Sprintf("%d", b.Int)}, nil
+		return NewBoolDatum(a.StringValue() == fmt.Sprintf("%d", b.Int)), nil
 	}
-	return Datum{Kind: KindBool, Bool: false}, nil
+	return NewBoolDatum(false), nil
 }
 
 // evalFuncCall resolves a function name against the in-tree registry.
@@ -1021,10 +1019,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	name := strings.ToLower(x.Name)
 	switch name {
 	case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
-		return Datum{Kind: KindTime, Time: ctx.Now}, nil
+		return NewTimeDatum(ctx.Now), nil
 	case "current_date":
 		t := ctx.Now
-		return Datum{Kind: KindTime, Time: t.Truncate(24 * 60 * 60 * 1e9)}, nil
+		return NewTimeDatum(t.Truncate(24 * 60 * 60 * 1e9)), nil
 	case "pg_sleep":
 		return evalPgSleep(x, row, ctx)
 	case "to_timestamp":
@@ -1064,14 +1062,14 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.Kind != KindString || fmtArg.Kind != KindString {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date arguments must be text"}
 	}
-	goLayout := pgFormatToGoLayout(fmtArg.String)
-	t, perr := time.Parse(goLayout, src.String)
+	goLayout := pgFormatToGoLayout(fmtArg.StringValue())
+	t, perr := time.Parse(goLayout, src.StringValue())
 	if perr != nil {
-		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_date: %v (format=%q value=%q)", perr, fmtArg.String, src.String)}
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_date: %v (format=%q value=%q)", perr, fmtArg.StringValue(), src.StringValue())}
 	}
 	year, month, day := t.UTC().Date()
 	out := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
-	return Datum{Kind: KindTime, Time: out}, nil
+	return NewTimeDatum(out), nil
 }
 
 // evalSubstr implements PostgreSQL's `substr(string, from [, count])`
@@ -1147,7 +1145,7 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if fromArg.Kind != KindInt {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr second argument must be integer"}
 	}
-	s := src.String
+	s := src.StringValue()
 	from := fromArg.Int
 	// Upstream's text_substring: 1-based start, treat values <=0 as
 	// shifting the window left of the string. With no length, the
@@ -1159,9 +1157,9 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		idx := int(from) - 1
 		if idx >= len(s) {
-			return Datum{Kind: KindString, String: ""}, nil
+			return NewStringDatum(""), nil
 		}
-		return Datum{Kind: KindString, String: s[idx:]}, nil
+		return NewStringDatum(s[idx:]), nil
 	}
 	cntArg, err := evalExpr(x.Args[2], row, ctx)
 	if err != nil {
@@ -1187,12 +1185,12 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		endIdx = startIdx
 	}
 	if startIdx >= len(s) {
-		return Datum{Kind: KindString, String: ""}, nil
+		return NewStringDatum(""), nil
 	}
 	if endIdx > len(s) {
 		endIdx = len(s)
 	}
-	return Datum{Kind: KindString, String: s[startIdx:endIdx]}, nil
+	return NewStringDatum(s[startIdx:endIdx]), nil
 }
 
 // evalToTimestamp implements PostgreSQL's `to_timestamp(text,
@@ -1220,12 +1218,12 @@ func evalToTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) 
 	if src.Kind != KindString || fmtArg.Kind != KindString {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp arguments must be text"}
 	}
-	goLayout := pgFormatToGoLayout(fmtArg.String)
-	t, perr := time.Parse(goLayout, src.String)
+	goLayout := pgFormatToGoLayout(fmtArg.StringValue())
+	t, perr := time.Parse(goLayout, src.StringValue())
 	if perr != nil {
-		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_timestamp: %v (format=%q value=%q)", perr, fmtArg.String, src.String)}
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_timestamp: %v (format=%q value=%q)", perr, fmtArg.StringValue(), src.StringValue())}
 	}
-	return Datum{Kind: KindTime, Time: t.UTC()}, nil
+	return NewTimeDatum(t.UTC()), nil
 }
 
 // pgFormatToGoLayout translates a v0 subset of upstream PG's

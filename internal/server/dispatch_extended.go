@@ -173,7 +173,7 @@ func paramsToDatums(params []boundParam) ([]executor.Datum, *extendedQueryError)
 			out[i] = executor.Datum{Kind: executor.KindInt, Int: v}
 			continue
 		}
-		out[i] = executor.Datum{Kind: executor.KindString, String: p.Text}
+		out[i] = executor.NewStringDatum(p.Text)
 	}
 	if false {
 		// Reserved for future per-type coercion; references kept to

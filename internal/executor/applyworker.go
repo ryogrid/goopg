@@ -390,16 +390,16 @@ func parsePgoutputText(t catalog.Type, data []byte) (Datum, error) {
 	case "bool", "boolean":
 		switch s {
 		case "t", "true":
-			return Datum{Kind: KindBool, Bool: true}, nil
+			return NewBoolDatum(true), nil
 		case "f", "false":
-			return Datum{Kind: KindBool, Bool: false}, nil
+			return NewBoolDatum(false), nil
 		}
 		return Datum{}, fmt.Errorf("bool parse %q", s)
 	}
 	// Variable-length text-like fallback — text / varchar /
 	// numeric / unknown. Stored as a KindString datum which the
 	// encoder roundtrips via the executor codec's varlen frame.
-	return Datum{Kind: KindString, String: s}, nil
+	return NewStringDatum(s), nil
 }
 
 // SafeRollback rolls back any in-progress txn. Idempotent.

@@ -790,7 +790,7 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 	case isNumericType(col.Type.Name):
 		switch v.Kind {
 		case KindNumeric:
-			return btree.EncodeNumericKey(numericMant(v), v.NumericScale), nil
+			return btree.EncodeNumericKey(numericMant(v), v.Scale), nil
 		case KindInt:
 			return btree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
 		}
@@ -799,17 +799,17 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.String)), nil
+		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isCharType(col.Type.Name):
 		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeChar([]byte(v.String)), nil
+		return btree.EncodeChar([]byte(v.StringValue())), nil
 	case isTimestampType(col.Type.Name):
 		if v.Kind != KindTime {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
 		}
-		micros := v.Time.Sub(pgEpoch).Microseconds()
+		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
 		return btree.EncodeTimestamp(micros), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
@@ -1200,13 +1200,13 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	}
 	classRow := Row{
 		{Kind: KindInt, Int: int64(tbl.OID)},
-		{Kind: KindString, String: tbl.Name},
+		NewStringDatum(tbl.Name),
 		{Kind: KindInt, Int: int64(namespaceOIDForSchema(tbl.Schema))},
-		{Kind: KindString, String: "r"},
+		NewStringDatum("r"),
 		{Kind: KindInt, Int: int64(len(tbl.Columns))},
 		{Kind: KindInt, Int: int64(tbl.OID)},
-		{Kind: KindString, String: "p"},
-		{Kind: KindBool, Bool: false},
+		NewStringDatum("p"),
+		NewBoolDatum(false),
 	}
 	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
 		return fmt.Errorf("pg_class: %w", err)
@@ -1221,11 +1221,11 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		typOID := catalog.TypeNameToOID(col.Type.Name)
 		attrRow := Row{
 			{Kind: KindInt, Int: int64(tbl.OID)},
-			{Kind: KindString, String: col.Name},
+			NewStringDatum(col.Name),
 			{Kind: KindInt, Int: int64(typOID)},
 			{Kind: KindInt, Int: int64(col.Ordinal + 1)},
-			{Kind: KindBool, Bool: col.NotNull},
-			{Kind: KindBool, Bool: false},
+			NewBoolDatum(col.NotNull),
+			NewBoolDatum(false),
 		}
 		if err := writeHeapRow(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
@@ -1244,13 +1244,13 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	}
 	classRow := Row{
 		{Kind: KindInt, Int: int64(idx.OID)},
-		{Kind: KindString, String: idx.Name},
+		NewStringDatum(idx.Name),
 		{Kind: KindInt, Int: int64(namespaceOIDForSchema(idx.Schema))},
-		{Kind: KindString, String: "i"},
+		NewStringDatum("i"),
 		{Kind: KindInt, Int: 0},
 		{Kind: KindInt, Int: int64(idx.OID)},
-		{Kind: KindString, String: "p"},
-		{Kind: KindBool, Bool: false},
+		NewStringDatum("p"),
+		NewBoolDatum(false),
 	}
 	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)

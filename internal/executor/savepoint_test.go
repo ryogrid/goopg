@@ -186,7 +186,7 @@ func TestSavepointDoD(t *testing.T) {
 	}
 	wantVals := map[string]bool{"a": true, "c": true}
 	for _, r := range rows {
-		v := r[1].String
+		v := r[1].StringValue()
 		if !wantVals[v] {
 			t.Errorf("unexpected row val %q in post-rollback scan", v)
 		}
@@ -222,7 +222,7 @@ func TestSavepointDoD(t *testing.T) {
 		t.Fatalf("post-commit: want 2 rows (a, c), got %d: %v", len(rows), rows)
 	}
 	for _, r := range rows {
-		v := r[1].String
+		v := r[1].StringValue()
 		if !wantVals[v] {
 			t.Errorf("post-commit: unexpected row val %q", v)
 		}

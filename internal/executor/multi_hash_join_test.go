@@ -16,8 +16,8 @@ func TestMultiHashJoinTwoTables(t *testing.T) {
 		{Datum{Kind: KindInt, Int: 99}}, // no match
 	}
 	rowsB := []Row{
-		{Datum{Kind: KindInt, Int: 1}, Datum{Kind: KindString, String: "hello"}},
-		{Datum{Kind: KindInt, Int: 2}, Datum{Kind: KindString, String: "world"}},
+		{Datum{Kind: KindInt, Int: 1}, NewStringDatum("hello")},
+		{Datum{Kind: KindInt, Int: 2}, NewStringDatum("world")},
 	}
 
 	children := []Operator{
@@ -69,14 +69,14 @@ func TestMultiHashJoinTwoTables(t *testing.T) {
 	if results[0][0].Int != 1 {
 		t.Errorf("row 1 col 0 (aid): got %d", results[0][0].Int)
 	}
-	if results[0][2].String != "hello" {
-		t.Errorf("row 1 col 2 (bval): got %s", results[0][2].String)
+	if results[0][2].StringValue() != "hello" {
+		t.Errorf("row 1 col 2 (bval): got %s", results[0][2].StringValue())
 	}
 	if results[1][0].Int != 2 {
 		t.Errorf("row 2 col 0 (aid): got %d", results[1][0].Int)
 	}
-	if results[1][2].String != "world" {
-		t.Errorf("row 2 col 2 (bval): got %s", results[1][2].String)
+	if results[1][2].StringValue() != "world" {
+		t.Errorf("row 2 col 2 (bval): got %s", results[1][2].StringValue())
 	}
 }
 
@@ -245,8 +245,8 @@ func TestMultiHashJoinPushdownLeafFallback(t *testing.T) {
 		{Datum{Kind: KindInt, Int: 2}},
 	}
 	rowsB := []Row{
-		{Datum{Kind: KindInt, Int: 1}, Datum{Kind: KindString, String: "x"}},
-		{Datum{Kind: KindInt, Int: 2}, Datum{Kind: KindString, String: "y"}},
+		{Datum{Kind: KindInt, Int: 1}, NewStringDatum("x")},
+		{Datum{Kind: KindInt, Int: 2}, NewStringDatum("y")},
 	}
 
 	children := []Operator{
@@ -318,17 +318,17 @@ func TestDatumToInt64Key(t *testing.T) {
 		{"KindInt negative", Datum{Kind: KindInt, Int: -7}, -7, true},
 		{"KindInt MaxInt64", Datum{Kind: KindInt, Int: math.MaxInt64}, math.MaxInt64, true},
 		// KindNumeric scale=0: treated as integer
-		{"KindNumeric scale0", Datum{Kind: KindNumeric, NumericMantissa: 123, NumericScale: 0}, 123, true},
+		{"KindNumeric scale0", Datum{Kind: KindNumeric, Int: 123, Scale: 0}, 123, true},
 		// KindNumeric with trailing zeros: strip to canonical
-		{"KindNumeric trailing zeros", Datum{Kind: KindNumeric, NumericMantissa: 1000, NumericScale: 3}, 1, true},
+		{"KindNumeric trailing zeros", Datum{Kind: KindNumeric, Int: 1000, Scale: 3}, 1, true},
 		// KindNumeric fractional: not representable
-		{"KindNumeric fractional", Datum{Kind: KindNumeric, NumericMantissa: 15, NumericScale: 1}, 0, false},
+		{"KindNumeric fractional", Datum{Kind: KindNumeric, Int: 15, Scale: 1}, 0, false},
 		// KindNull: not representable
 		{"KindNull", NullDatum, 0, false},
 		// KindBool: not representable
-		{"KindBool true", Datum{Kind: KindBool, Bool: true}, 0, false},
+		{"KindBool true", NewBoolDatum(true), 0, false},
 		// KindString: not representable
-		{"KindString", Datum{Kind: KindString, String: "hello"}, 0, false},
+		{"KindString", NewStringDatum("hello"), 0, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

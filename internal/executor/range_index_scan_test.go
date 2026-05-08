@@ -46,7 +46,7 @@ func setupRangeScanFixture(t *testing.T) (*Context, func()) {
 	for _, r := range rows {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
 			{Kind: KindInt, Int: r.id},
-			{Kind: KindTime, Time: r.ts},
+			NewTimeDatum(r.ts),
 		}); err != nil {
 			cleanup()
 			t.Fatalf("writeHeapRow id=%d: %v", r.id, err)

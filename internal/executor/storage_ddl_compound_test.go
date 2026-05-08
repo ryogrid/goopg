@@ -28,9 +28,9 @@ func TestDDLCompoundTimestampNumericIndex(t *testing.T) {
 
 	rows := []Row{
 		// (id, shipdate, orderkey)
-		{{Kind: KindInt, Int: 1}, {Kind: KindTime, Time: date1995}, {Kind: KindNumeric, NumericMantissa: 1, NumericScale: 0}},
-		{{Kind: KindInt, Int: 2}, {Kind: KindTime, Time: date1995}, {Kind: KindNumeric, NumericMantissa: 2, NumericScale: 0}},
-		{{Kind: KindInt, Int: 3}, {Kind: KindTime, Time: date1996}, {Kind: KindNumeric, NumericMantissa: 1, NumericScale: 0}},
+		{{Kind: KindInt, Int: 1}, NewTimeDatum(date1995), {Kind: KindNumeric, Int: 1, Scale: 0}},
+		{{Kind: KindInt, Int: 2}, NewTimeDatum(date1995), {Kind: KindNumeric, Int: 2, Scale: 0}},
+		{{Kind: KindInt, Int: 3}, NewTimeDatum(date1996), {Kind: KindNumeric, Int: 1, Scale: 0}},
 	}
 	for _, r := range rows {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
@@ -90,18 +90,18 @@ func TestDDLCompoundCharNumericIndex(t *testing.T) {
 	rows := []Row{
 		{
 			{Kind: KindInt, Int: 1},
-			{Kind: KindString, String: "BUILDING  "}, // padded char(10)
-			{Kind: KindNumeric, NumericMantissa: 5, NumericScale: 0},
+			NewStringDatum("BUILDING  "), // padded char(10)
+			{Kind: KindNumeric, Int: 5, Scale: 0},
 		},
 		{
 			{Kind: KindInt, Int: 2},
-			{Kind: KindString, String: "BUILDING  "},
-			{Kind: KindNumeric, NumericMantissa: 7, NumericScale: 0},
+			NewStringDatum("BUILDING  "),
+			{Kind: KindNumeric, Int: 7, Scale: 0},
 		},
 		{
 			{Kind: KindInt, Int: 3},
-			{Kind: KindString, String: "FURNITURE "},
-			{Kind: KindNumeric, NumericMantissa: 1, NumericScale: 0},
+			NewStringDatum("FURNITURE "),
+			{Kind: KindNumeric, Int: 1, Scale: 0},
 		},
 	}
 	for _, r := range rows {
@@ -158,9 +158,9 @@ func TestDDLCompoundVarcharNumericIndex(t *testing.T) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 
 	rows := []Row{
-		{{Kind: KindInt, Int: 1}, {Kind: KindString, String: "ECONOMY ANODIZED BRASS"}, {Kind: KindNumeric, NumericMantissa: 10, NumericScale: 0}},
-		{{Kind: KindInt, Int: 2}, {Kind: KindString, String: "ECONOMY ANODIZED BRASS"}, {Kind: KindNumeric, NumericMantissa: 20, NumericScale: 0}},
-		{{Kind: KindInt, Int: 3}, {Kind: KindString, String: "PROMO BRUSHED STEEL"}, {Kind: KindNumeric, NumericMantissa: 5, NumericScale: 0}},
+		{{Kind: KindInt, Int: 1}, NewStringDatum("ECONOMY ANODIZED BRASS"), {Kind: KindNumeric, Int: 10, Scale: 0}},
+		{{Kind: KindInt, Int: 2}, NewStringDatum("ECONOMY ANODIZED BRASS"), {Kind: KindNumeric, Int: 20, Scale: 0}},
+		{{Kind: KindInt, Int: 3}, NewStringDatum("PROMO BRUSHED STEEL"), {Kind: KindNumeric, Int: 5, Scale: 0}},
 	}
 	for _, r := range rows {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
@@ -204,9 +204,9 @@ func TestDDLCompoundThreeColumnIndex(t *testing.T) {
 	d2 := time.Date(1996, 12, 1, 0, 0, 0, 0, time.UTC)
 
 	rows := []Row{
-		{{Kind: KindInt, Int: 1}, {Kind: KindTime, Time: d1}, {Kind: KindNumeric, NumericMantissa: 370, NumericScale: 0}, {Kind: KindNumeric, NumericMantissa: 1, NumericScale: 0}},
-		{{Kind: KindInt, Int: 2}, {Kind: KindTime, Time: d1}, {Kind: KindNumeric, NumericMantissa: 370, NumericScale: 0}, {Kind: KindNumeric, NumericMantissa: 2, NumericScale: 0}},
-		{{Kind: KindInt, Int: 3}, {Kind: KindTime, Time: d2}, {Kind: KindNumeric, NumericMantissa: 100, NumericScale: 0}, {Kind: KindNumeric, NumericMantissa: 1, NumericScale: 0}},
+		{{Kind: KindInt, Int: 1}, NewTimeDatum(d1), {Kind: KindNumeric, Int: 370, Scale: 0}, {Kind: KindNumeric, Int: 1, Scale: 0}},
+		{{Kind: KindInt, Int: 2}, NewTimeDatum(d1), {Kind: KindNumeric, Int: 370, Scale: 0}, {Kind: KindNumeric, Int: 2, Scale: 0}},
+		{{Kind: KindInt, Int: 3}, NewTimeDatum(d2), {Kind: KindNumeric, Int: 100, Scale: 0}, {Kind: KindNumeric, Int: 1, Scale: 0}},
 	}
 	for _, r := range rows {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {

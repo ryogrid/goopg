@@ -40,7 +40,7 @@ func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
 		// TOAST pointer: flag byte 0x02 followed by 12-byte pointer.
 		if d.Kind == KindToastPointer {
 			out = append(out, 2)
-			out = append(out, d.Bytes...)
+			out = append(out, d.BytesValue()...)
 			continue
 		}
 		out = append(out, 0)
@@ -98,7 +98,7 @@ func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []boo
 				return fmt.Errorf("DecodeRowProjection: %s: truncated TOAST pointer", c.Name)
 			}
 			if keep[i] {
-				dst[i] = Datum{Kind: KindToastPointer, Bytes: append([]byte(nil), data[off:off+toastPtrSize]...)}
+				dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
 			} else {
 				dst[i] = NullDatum
 			}
@@ -188,7 +188,7 @@ func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
 			if off+toastPtrSize > len(data) {
 				return fmt.Errorf("DecodeRow: %s: truncated TOAST pointer", c.Name)
 			}
-			dst[i] = Datum{Kind: KindToastPointer, Bytes: append([]byte(nil), data[off:off+toastPtrSize]...)}
+			dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
 			off += toastPtrSize
 			continue
 		}
@@ -222,7 +222,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindBool {
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
 		}
-		if d.Bool {
+		if d.BoolValue() {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
@@ -239,7 +239,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
 		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(d.Time.UnixNano()))
+		binary.BigEndian.PutUint64(buf[:], uint64(d.TimeValue().UnixNano()))
 		return buf[:], nil
 	case "numeric", "decimal":
 		// NUMERIC values flow on the wire as decimal text in the
@@ -256,9 +256,9 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		case KindInt:
 			return encodeVarlen([]byte(strconv.FormatInt(d.Int, 10))), nil
 		case KindString:
-			return encodeVarlen([]byte(d.String)), nil
+			return encodeVarlen([]byte(d.StringValue())), nil
 		case KindBytes:
-			return encodeVarlen(d.Bytes), nil
+			return encodeVarlen(d.BytesValue()), nil
 		}
 		return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 	default:
@@ -269,9 +269,9 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		var s string
 		switch d.Kind {
 		case KindString:
-			s = d.String
+			s = d.StringValue()
 		case KindBytes:
-			return encodeVarlen(d.Bytes), nil
+			return encodeVarlen(d.BytesValue()), nil
 		case KindInt:
 			return nil, fmt.Errorf("integer datum cannot encode as %s", t.Name)
 		case KindNumeric:
@@ -308,13 +308,13 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		if len(data) < 1 {
 			return Datum{}, 0, fmt.Errorf("truncated bool")
 		}
-		return Datum{Kind: KindBool, Bool: data[0] != 0}, 1, nil
+		return NewBoolDatum(data[0] != 0), 1, nil
 	case "timestamp", "timestamptz", "date":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
 		}
 		ns := int64(binary.BigEndian.Uint64(data[:8]))
-		return Datum{Kind: KindTime, Time: time.Unix(0, ns).UTC()}, 8, nil
+		return NewTimeDatum(time.Unix(0, ns).UTC()), 8, nil
 	case "numeric", "decimal":
 		// Stored as varlen text. Parse into KindNumeric so
 		// arithmetic and comparison can run through the
@@ -334,7 +334,7 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		// NUMERIC; the fast path avoids ~400 ns of big.Int allocation
 		// per column on every row decoded.
 		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, NumericMantissa: v, NumericScale: scale}, 4 + n, nil
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
 		}
 		m, s, err := parseNumeric(text)
 		if err != nil {
@@ -349,6 +349,6 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		if 4+n > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated varlen body")
 		}
-		return Datum{Kind: KindString, String: string(data[4 : 4+n])}, 4 + n, nil
+		return NewStringDatum(string(data[4 : 4+n])), 4 + n, nil
 	}
 }

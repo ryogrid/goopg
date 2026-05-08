@@ -459,7 +459,7 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !v.IsNull() && v.Kind == KindBool && v.Bool, nil
+	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
 }
 
 func (o *joinOp) Next() (Row, error) {
@@ -778,7 +778,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			st.sum += arg.Int
 		case KindNumeric:
 			if !st.hasValue || st.numericSum.Kind != KindNumeric {
-				st.numericSum = Datum{Kind: KindNumeric, NumericScale: arg.NumericScale}
+				st.numericSum = Datum{Kind: KindNumeric, Scale: arg.Scale}
 			}
 			s, err := numericAdd(st.numericSum, arg)
 			if err != nil {
@@ -931,10 +931,10 @@ func datumToInt64Key(d Datum) (int64, bool) {
 	case KindInt:
 		return d.Int, true
 	case KindNumeric:
-		if d.NumericBig != nil {
+		if d.NumericBigValue() != nil {
 			return 0, false // overflow lane: not representable as int64
 		}
-		m, s := d.NumericMantissa, int(d.NumericScale)
+		m, s := d.NumericMantissaValue(), int(d.Scale)
 		for s > 0 && m%10 == 0 {
 			m /= 10
 			s--
@@ -952,7 +952,7 @@ func datumKey(d Datum) string {
 	case KindNull:
 		return "n"
 	case KindBool:
-		if d.Bool {
+		if d.BoolValue() {
 			return "b:t"
 		}
 		return "b:f"
@@ -963,22 +963,22 @@ func datumKey(d Datum) string {
 		// scale-0 KindNumeric. Normalise both to the same shape.
 		return canonicalNumericKey(d.Int, 0)
 	case KindNumeric:
-		return canonicalNumericKey(d.NumericMantissa, int(d.NumericScale))
+		return canonicalNumericKey(d.NumericMantissaValue(), int(d.Scale))
 	case KindString:
-		return "s:" + d.String
+		return "s:" + d.StringValue()
 	case KindBytes:
-		return "x:" + string(d.Bytes)
+		return "x:" + string(d.BytesValue())
 	case KindTime:
 		var buf [20]byte
 		b := append(buf[:0], 't', ':')
-		b = strconv.AppendInt(b, d.Time.UnixNano(), 10)
+		b = strconv.AppendInt(b, d.TimeValue().UnixNano(), 10)
 		return string(b)
 	case KindInterval:
 		var buf [32]byte
 		b := append(buf[:0], 'v', ':')
-		b = strconv.AppendInt(b, int64(d.IntervalMonths), 10)
+		b = strconv.AppendInt(b, int64(d.IntervalMonthsValue()), 10)
 		b = append(b, ':')
-		b = strconv.AppendInt(b, int64(d.IntervalDays), 10)
+		b = strconv.AppendInt(b, int64(d.IntervalDaysValue()), 10)
 		return string(b)
 	}
 	return fmt.Sprintf("k:%d", d.Kind)

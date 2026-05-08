@@ -127,7 +127,7 @@ func TestOpportunisticPruneReclaims(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row after T2 update, got %d", len(rows))
 	}
-	if rows[0][0].Kind != KindString || rows[0][0].String != "pruned" {
+	if rows[0][0].Kind != KindString || rows[0][0].StringValue() != "pruned" {
 		t.Errorf("expected v='pruned', got %+v", rows[0][0])
 	}
 }

@@ -38,7 +38,7 @@ func TestToastRoundTripDoD(t *testing.T) {
 	// the SQL parser and test the codec/TOAST path directly.
 	row := Row{
 		{Kind: KindInt, Int: 1},
-		{Kind: KindString, String: bigValue},
+		NewStringDatum(bigValue),
 	}
 	if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
 		t.Fatalf("INSERT 1 MiB row: %v", err)
@@ -55,11 +55,11 @@ func TestToastRoundTripDoD(t *testing.T) {
 	if rows[0][1].Kind != KindString {
 		t.Errorf("data column: want KindString, got kind %d", rows[0][1].Kind)
 	}
-	if len(rows[0][1].String) != oneMiB {
-		t.Errorf("data length: want %d, got %d", oneMiB, len(rows[0][1].String))
+	if len(rows[0][1].StringValue()) != oneMiB {
+		t.Errorf("data length: want %d, got %d", oneMiB, len(rows[0][1].StringValue()))
 	}
-	if rows[0][1].String != bigValue {
-		t.Errorf("data content mismatch (first 10 chars): %q", rows[0][1].String[:10])
+	if rows[0][1].StringValue() != bigValue {
+		t.Errorf("data content mismatch (first 10 chars): %q", rows[0][1].StringValue()[:10])
 	}
 }
 
@@ -87,7 +87,7 @@ func TestToastInlineSmallValue(t *testing.T) {
 	}
 
 	rows := runQuery(t, ctx, "SELECT v FROM small_test WHERE id = 1")
-	if len(rows) != 1 || rows[0][0].String != "hello" {
+	if len(rows) != 1 || rows[0][0].StringValue() != "hello" {
 		t.Errorf("small value round-trip failed: %+v", rows)
 	}
 }
@@ -109,7 +109,7 @@ func TestToastMultipleChunks(t *testing.T) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	row := Row{
 		{Kind: KindInt, Int: 42},
-		{Kind: KindString, String: threeChunks},
+		NewStringDatum(threeChunks),
 	}
 	if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
 		t.Fatalf("INSERT: %v", err)
@@ -119,8 +119,8 @@ func TestToastMultipleChunks(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
-	if len(rows[0][0].String) != len(threeChunks) {
-		t.Errorf("length mismatch: want %d, got %d", len(threeChunks), len(rows[0][0].String))
+	if len(rows[0][0].StringValue()) != len(threeChunks) {
+		t.Errorf("length mismatch: want %d, got %d", len(threeChunks), len(rows[0][0].StringValue()))
 	}
 }
 
@@ -144,7 +144,7 @@ func TestToastByteaRoundTrip(t *testing.T) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 	row := Row{
 		{Kind: KindInt, Int: 7},
-		{Kind: KindBytes, Bytes: bigBytes},
+		NewBytesDatum(bigBytes),
 	}
 	if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
 		t.Fatalf("INSERT bytea: %v", err)
@@ -166,7 +166,7 @@ func TestToastPointerCodecRoundTrip(t *testing.T) {
 	ptr := []byte{0, 0, 0, 1, 0, 16, 0, 0, 0, 0, 0, 2} // oid=1, len=1M, chunks=2
 	row := Row{
 		{Kind: KindInt, Int: 99},
-		{Kind: KindToastPointer, Bytes: ptr},
+		NewToastPointerDatum(ptr),
 	}
 	encoded, err := EncodeRow(cols, row)
 	if err != nil {
@@ -183,7 +183,7 @@ func TestToastPointerCodecRoundTrip(t *testing.T) {
 	if decoded[1].Kind != KindToastPointer {
 		t.Errorf("data: want KindToastPointer, got kind %d", decoded[1].Kind)
 	}
-	if string(decoded[1].Bytes) != string(ptr) {
+	if string(decoded[1].BytesValue()) != string(ptr) {
 		t.Errorf("pointer bytes mismatch")
 	}
 }
