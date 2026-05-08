@@ -2254,24 +2254,151 @@ semantics. The user explicitly approved the swap.
       eliminate the residual `duffcopy` / `memmove`
       ~60 % share).)
 
-## Deferred (former M0067 draft, now M0069+ candidates)
+## Milestone 0069 — Executor Slot Pipeline + GC Follow-Through + Long-Tail Query Fixes
 
-- [ ] M0069 candidate: Q5 build-time predicate pushdown
-      for unpromoted SeqScans — earlier abortive attempt
-      broke Q3 due to walker interaction; needs guarded
-      re-implementation. Likely benefits from M0068's slot
-      rewrite landing first (more stable column-coordinate
-      conventions).
-- [ ] M0069 candidate: Q20 timestamp btree v0 OR unnest
-      non-correlated IN to SemiJoin (only correlated INs
-      are currently unnested).
-- [ ] M0069 candidate: Q21 Anti-side hash-join inner-Filter
-      conjunct lift + composite-NLI on `partsupp_pk` for Q9
-      to absorb the cardinality explosion.
-- [ ] M0069 candidate: SI `HasInProgress` linear-scan
-      replacement (review §4).
-- [ ] M0069 candidate: Buffer manager `poolMu` partitioning
-      (review §5).
+See `docs/milestones/0069-executor-slot-pipeline-followthrough.md`.
+
+Picks up the three sub-milestones M0068 explicitly deferred
+(TupleSlot pipeline, String/Bytes arena, IndexScan lazy
+iteration) plus the five "M0069 candidate" items that accrued
+from earlier milestones (Q5 / Q20 / Q21 planner improvements,
+SI HasInProgress, buffer-pool partitioning). Per the user's
+"順次着地、可能な限り進める" directive: land in risk-tier order
+(LOW → MED → HIGH); document carry-forwards explicitly.
+
+- [ ] M0069-0001: TupleSlot pipeline (replaces BorrowSemantics).
+      **Design:** `docs/design/0068-0002-tuple-slot-pipeline.md`.
+      **Files:** new `internal/executor/slot.go`;
+      `internal/executor/operator.go` (remove `Borrowable`,
+      `OwnedRow`, `BorrowedRow`); `internal/executor/executor.go`
+      (remove `setChildBorrow`); 32 `Next() (Row, error)`
+      declarations in `operators*.go` / `multi_hash_join.go` /
+      `spill.go` / `instrument.go` / `applyworker.go`;
+      delete `borrow_test.go` in favor of slot-lifetime tests.
+      **Strategy:** adapter-then-migrate over 5 stages
+      (interface + MaterializedSlot → flip Next signature →
+      VirtualSlot for pass-through → Materialize at retention →
+      remove Borrowable).
+      **Acceptance:**
+        - `Borrowable` interface and BorrowSemantics enum
+          removed.
+        - All operators consume + produce `TupleSlot`.
+        - MHJ probe path emits `VirtualSlot{probe, build}`
+          (preserves the M0066 `copyOut` elimination
+          structurally).
+        - `go test ./...` PASS.
+        - Q5 pprof: `runtime.duffcopy` + `memmove` for slot
+          copies ≤ 10 % of CPU (was 60 % at M0067).
+
+- [ ] M0069-0002: Per-batch String/Bytes arena.
+      **Design:** `docs/design/0068-0003-batch-string-arena.md`.
+      **Files:** new `internal/executor/arena.go`;
+      `internal/executor/codec.go` (decode into arena);
+      `internal/executor/operators_storage.go`
+      (per-call Arena per scan iteration);
+      `internal/executor/datum.go` (`Datum.arena` field).
+      **Depends on:** M0069-0001 (slot Materialize boundary).
+      **Acceptance:**
+        - varchar / char / bytea decode allocates from arena,
+          not per-value.
+        - Q5 pprof `inuse_space` for strings shows ~24 K
+          arena pages instead of ~30 M individual string
+          allocations.
+        - 22-query row-count parity preserved.
+
+- [ ] M0069-0003: IndexScan lazy iteration.
+      **Files:** `internal/access/btree/btree.go` (cursor API
+      for `RangeScan`); `internal/executor/operators_index.go`
+      (`Rescan` no longer pre-materializes into `o.rows[]`).
+      **Strategy gate:** start with prototype + benchmark of
+      Option A (goroutine + channel wrapper around the
+      callback `RangeScan`) vs Option B (refactor to expose
+      a real `*Cursor`); pick the safer option.
+      **Acceptance:**
+        - `go test ./internal/access/btree/...` PASS
+          (no regression in concurrent-write tests).
+        - Q9 SF=1 peak heap drops ≥ 5 GB
+          (`go tool pprof -inuse_space`).
+        - 22-query row-count parity preserved.
+
+- [ ] M0069-0004: Q5 build-time predicate pushdown
+      (guarded re-attempt). Earlier abortive attempt broke
+      Q3 due to walker interaction; needs guarded
+      re-implementation gated on slot-classifiable conjuncts
+      from M0069-0001.
+      **Files:** new `internal/planner/predicate_pushdown.go`
+      OR extension of `internal/planner/unnest.go`.
+      **Acceptance:**
+        - Q3 row count preserved (regression guard).
+        - Q5 SF=1 probe-time drops ≥ 30 % vs M0068.
+
+- [ ] M0069-0005: Q20 non-correlated IN-list unnest.
+      `internal/planner/unnest.go` currently only unnests
+      correlated IN-subqueries (M0040-0002). Q20's outer IN
+      against `partsupp` is non-correlated. Extend
+      `tryUnnestINSubquery` to handle the non-correlated case
+      as a SemiJoin.
+      **Files:** `internal/planner/unnest.go`.
+      **Acceptance:**
+        - `go test ./internal/planner/...` PASS.
+        - `cmd/tpch-runner --queries=20` row count > 0
+          within `cancel-after=1200s`.
+
+- [ ] M0069-0006: Q21 anti-side hash-join inner-Filter
+      conjunct lift + composite-NLI on `partsupp_pk` for Q9.
+      Q21: lift inner-only conjuncts into the join's
+      inner-side filter so the anti-join's probe doesn't
+      evaluate them per-row. Q9: re-attempt the M0067-0003
+      composite-NLI fix once M0069-0001's stable column-
+      coordinate model is in place.
+      **Files:** `internal/planner/unnest.go` (Q21);
+      `internal/planner/nl_index_join.go` (Q9 composite NLI).
+      **Acceptance:**
+        - `go test ./internal/planner/...
+          ./internal/testutil/tpch/...` PASS.
+        - `cmd/tpch-runner --queries=9,21
+          --per-query-timeout=600s` Q21 row count > 0
+          (canonical ~411); Q9 row count > 7.
+
+- [ ] M0069-0007: SI HasInProgress non-linear lookup.
+      `internal/mvcc/snapshot.go::HasInProgress` is a linear
+      scan over `s.InProgress` called per-tuple-visibility
+      check. Sort once at snapshot construction; use
+      `sort.Search` for the lookup. Keep linear scan for
+      ≤ 16 entries (small-N constant beats branch-prediction
+      overhead).
+      **Files:** `internal/mvcc/snapshot.go`.
+      **Acceptance:**
+        - `go test ./internal/mvcc/...` PASS.
+        - Microbenchmark `BenchmarkSnapshotHasInProgress`:
+          no regression at small N, ≥ 5x improvement at
+          N=64.
+
+- [ ] M0069-0008: Buffer-pool `poolMu` partitioning.
+      `internal/storage/bufpool.go::poolMu` is a global lock.
+      Profile-gated: capture mutex profile during Q9 / Q20;
+      shard `byTag` + slot metadata into N=64 partitions
+      keyed by `tag.hash % 64` ONLY if `poolMu` shows up as a
+      contention hotspot. If not, document as
+      "no observed contention".
+      **Files:** `internal/storage/bufpool.go`.
+      **Acceptance:**
+        - Mutex profile commit
+          (`bench/tpch/pprof/mutex_q9_m0069.prof`).
+        - Either: partition lands + Q9 / Q20 mutex-wait time
+          drops ≥ 50 %, OR: documented null result.
+
+- [ ] M0069-0009: Final 22-query SF=1 sweep + GC profile.
+      **Files (output):**
+        `analysis/tpch-m0069-baseline-<date>.md`,
+        `bench/tpch/logs/m0069_22q_<ts>.log`,
+        `bench/tpch/pprof/cpu_q5_m0069.prof`,
+        `bench/tpch/pprof/heap_q5_m0069.prof`.
+      **Blocked by:** M0069-0001..0008 (whichever land).
+      **Acceptance:**
+        - 22-query OK count ≥ 20 at `cancel-after=1200s`.
+        - Document per-query delta vs M0068; Q5 / Q20
+          either complete or document residual structurally.
 
 ## Notes
 
