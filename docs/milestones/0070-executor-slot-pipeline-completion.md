@@ -1,6 +1,10 @@
 # Milestone 0070 — Executor Slot Pipeline Completion + Long-Tail Query Closure
 
-**Status:** planned
+**Status:** accepted (PARTIAL — 2 sub-milestones landed
+fully (M0070-0001 Q21 verification, M0070-0002 bgwriter
+contention fix); 4 sub-milestones surfaced a structural
+dependency on M0071-0001 TupleSlot pipeline migration and
+remain documented carry-forwards)
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0069 (commits `a8a272a` / `77499e5` /
 `d0de10d` / `ebb267d` / `5f120c1` / `e4ee8a2`)
