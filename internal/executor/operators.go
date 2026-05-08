@@ -1,6 +1,9 @@
 package executor
 
 import (
+	"container/heap"
+	"io"
+	"os"
 	"sort"
 
 	"github.com/goopg/goopg/internal/planner"
@@ -226,18 +229,54 @@ func (o *limitOp) Next() (Row, error) {
 	return row, nil
 }
 
-// sortOp fully buffers the child's output then sorts under the
-// supplied key list. Stable sort matches upstream's behaviour.
+// sortOp buffers the child's output then sorts under the supplied
+// key list. Stable sort matches upstream's behaviour.
+//
+// M0068-0006: when the in-memory chunk exceeds sortChunkBytes the
+// chunk is sorted, written to a spill file, and freed. After the
+// child is fully drained an N-way merge over the spill files plus
+// the in-memory tail produces the final ordered stream. This keeps
+// peak heap residency bounded by the chunk size regardless of input
+// row count, eliminating the heap blow-up that the M0066 review
+// flagged for large sorts.
 type sortOp struct {
 	child Operator
 	keys  []planner.SortKey
 	ctx   *Context
-	rows  []Row
-	idx   int
+
+	// chunk size threshold for triggering a spill. Default 256 MiB.
+	chunkLimitBytes int64
+
+	// In-memory chunk / tail.
+	rows []Row
+	idx  int
+
+	// External-sort state. Populated only when at least one spill
+	// has occurred during Open().
+	spillFiles []string
+	heap       *sortHeap
+	mergeReady bool
+
+	sortErr error
 }
 
 func newSortOp(plan *planner.Sort, child Operator) *sortOp {
 	return &sortOp{child: child, keys: plan.Keys}
+}
+
+// sortChunkBytes is the in-memory threshold at which a sort chunk
+// is flushed to a spill file. 256 MiB matches the build-side
+// drainRowsBounded default and keeps a single chunk's footprint
+// well below typical container-memory limits while remaining big
+// enough to absorb every TPC-H SF=1 sort that doesn't otherwise
+// require external sort.
+const sortChunkBytes = int64(256 * 1024 * 1024)
+
+func (o *sortOp) chunkLimit() int64 {
+	if o.chunkLimitBytes > 0 {
+		return o.chunkLimitBytes
+	}
+	return sortChunkBytes
 }
 
 func (o *sortOp) Open(ctx *Context) error {
@@ -245,11 +284,14 @@ func (o *sortOp) Open(ctx *Context) error {
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
+	limit := o.chunkLimit()
+	var chunkBytes int64
+	pulled := 0
 	for {
 		// M0062-followup: a sort over millions of rows can otherwise
 		// drain the child without a cancel opportunity. ctx check
 		// every 4096 rows pulled.
-		if len(o.rows)&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+		if pulled&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
 			if err := ctx.Ctx.Err(); err != nil {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
@@ -262,45 +304,101 @@ func (o *sortOp) Open(ctx *Context) error {
 			return err
 		}
 		o.rows = append(o.rows, row)
-	}
-	var sortErr error
-	sort.SliceStable(o.rows, func(i, j int) bool {
-		for _, k := range o.keys {
-			a, err := evalExpr(k.Expr, o.rows[i], ctx)
-			if err != nil {
-				sortErr = err
-				return false
+		chunkBytes += estimatedRowBytes(row)
+		pulled++
+		if chunkBytes >= limit {
+			if err := o.flushChunk(); err != nil {
+				return err
 			}
-			b, err := evalExpr(k.Expr, o.rows[j], ctx)
-			if err != nil {
-				sortErr = err
-				return false
-			}
-			if a.IsNull() && !b.IsNull() {
-				return !k.Desc
-			}
-			if !a.IsNull() && b.IsNull() {
-				return k.Desc
-			}
-			if a.IsNull() && b.IsNull() {
-				continue
-			}
-			cmp, err := compareDatum(a, b, k.Expr.Pos())
-			if err != nil {
-				sortErr = err
-				return false
-			}
-			if cmp == 0 {
-				continue
-			}
-			if k.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
+			o.rows = o.rows[:0]
+			chunkBytes = 0
 		}
-		return false
+	}
+	// Sort the final in-memory tail.
+	o.sortChunk(o.rows)
+	if o.sortErr != nil {
+		return o.sortErr
+	}
+	return nil
+}
+
+// sortChunk in-place sorts a slice using the configured key list.
+// Sets o.sortErr if an evaluator error surfaces during comparison.
+func (o *sortOp) sortChunk(rows []Row) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		return o.lessRows(rows[i], rows[j])
 	})
-	return sortErr
+}
+
+// lessRows returns true iff a should sort before b under the
+// configured key list. Records the first evaluator error in
+// o.sortErr and returns false on error so the comparator stays
+// strict-weak-ordered for the rest of the sort.
+func (o *sortOp) lessRows(a, b Row) bool {
+	for _, k := range o.keys {
+		av, err := evalExpr(k.Expr, a, o.ctx)
+		if err != nil {
+			if o.sortErr == nil {
+				o.sortErr = err
+			}
+			return false
+		}
+		bv, err := evalExpr(k.Expr, b, o.ctx)
+		if err != nil {
+			if o.sortErr == nil {
+				o.sortErr = err
+			}
+			return false
+		}
+		if av.IsNull() && !bv.IsNull() {
+			return !k.Desc
+		}
+		if !av.IsNull() && bv.IsNull() {
+			return k.Desc
+		}
+		if av.IsNull() && bv.IsNull() {
+			continue
+		}
+		cmp, err := compareDatum(av, bv, k.Expr.Pos())
+		if err != nil {
+			if o.sortErr == nil {
+				o.sortErr = err
+			}
+			return false
+		}
+		if cmp == 0 {
+			continue
+		}
+		if k.Desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	}
+	return false
+}
+
+// flushChunk sorts the current in-memory chunk and writes it to a
+// new spill file. The caller must reset o.rows after the call.
+func (o *sortOp) flushChunk() error {
+	o.sortChunk(o.rows)
+	if o.sortErr != nil {
+		return o.sortErr
+	}
+	w, err := newSpillWriter(os.TempDir())
+	if err != nil {
+		return err
+	}
+	for _, r := range o.rows {
+		if werr := w.WriteRow(r); werr != nil {
+			w.Close()
+			return werr
+		}
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	o.spillFiles = append(o.spillFiles, w.Path())
+	return nil
 }
 
 func (o *sortOp) Schema() planner.Schema { return o.child.Schema() }
@@ -308,14 +406,139 @@ func (o *sortOp) Close() error {
 	o.rows = nil
 	o.idx = 0
 	o.ctx = nil
+	if o.heap != nil {
+		for _, s := range o.heap.sources {
+			if s.reader != nil {
+				_ = s.reader.Close()
+			}
+		}
+		o.heap = nil
+	}
+	for _, p := range o.spillFiles {
+		_ = os.Remove(p)
+	}
+	o.spillFiles = nil
 	return o.child.Close()
 }
 
 func (o *sortOp) Next() (Row, error) {
-	if o.idx >= len(o.rows) {
+	if len(o.spillFiles) == 0 {
+		// Fully in-memory path.
+		if o.idx >= len(o.rows) {
+			return nil, EOF
+		}
+		row := o.rows[o.idx]
+		o.idx++
+		return row, nil
+	}
+	if !o.mergeReady {
+		if err := o.initMerge(); err != nil {
+			return nil, err
+		}
+	}
+	return o.popMerge()
+}
+
+// initMerge opens spill readers, primes each source with one row,
+// and builds the min-heap.
+func (o *sortOp) initMerge() error {
+	o.heap = &sortHeap{less: o.lessRows}
+	for _, p := range o.spillFiles {
+		r, err := newSpillReader(p)
+		if err != nil {
+			return err
+		}
+		s := &sortSource{reader: r}
+		if err := s.advance(); err != nil {
+			return err
+		}
+		if !s.eof {
+			heap.Push(o.heap, s)
+		}
+	}
+	if len(o.rows) > 0 {
+		s := &sortSource{rows: o.rows}
+		s.advance()
+		if !s.eof {
+			heap.Push(o.heap, s)
+		}
+	}
+	o.mergeReady = true
+	return nil
+}
+
+// popMerge returns the smallest row across all sources, advancing
+// the source it came from.
+func (o *sortOp) popMerge() (Row, error) {
+	if o.heap.Len() == 0 {
 		return nil, EOF
 	}
-	row := o.rows[o.idx]
-	o.idx++
+	s := heap.Pop(o.heap).(*sortSource)
+	row := s.cur
+	if err := s.advance(); err != nil {
+		return nil, err
+	}
+	if !s.eof {
+		heap.Push(o.heap, s)
+	}
+	if o.sortErr != nil {
+		return nil, o.sortErr
+	}
 	return row, nil
+}
+
+// sortSource is a single input to the N-way merge. Either a
+// spillReader (file-backed chunk) or an in-memory rows slice
+// (the un-spilled tail).
+type sortSource struct {
+	reader *spillReader
+	rows   []Row
+	idx    int
+
+	cur Row
+	eof bool
+}
+
+func (s *sortSource) advance() error {
+	if s.reader != nil {
+		row, err := s.reader.ReadRow()
+		if err == io.EOF {
+			s.eof = true
+			s.cur = nil
+			_ = s.reader.Close()
+			s.reader = nil
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		s.cur = cloneRow(row) // ReadRow's buffer is reused; clone for retain
+		return nil
+	}
+	if s.idx >= len(s.rows) {
+		s.eof = true
+		s.cur = nil
+		return nil
+	}
+	s.cur = s.rows[s.idx]
+	s.idx++
+	return nil
+}
+
+// sortHeap is a min-heap of sortSources keyed by their current row
+// under a row-comparator function.
+type sortHeap struct {
+	sources []*sortSource
+	less    func(a, b Row) bool
+}
+
+func (h *sortHeap) Len() int           { return len(h.sources) }
+func (h *sortHeap) Less(i, j int) bool { return h.less(h.sources[i].cur, h.sources[j].cur) }
+func (h *sortHeap) Swap(i, j int)      { h.sources[i], h.sources[j] = h.sources[j], h.sources[i] }
+func (h *sortHeap) Push(x any)         { h.sources = append(h.sources, x.(*sortSource)) }
+func (h *sortHeap) Pop() any {
+	n := len(h.sources)
+	x := h.sources[n-1]
+	h.sources = h.sources[:n-1]
+	return x
 }
