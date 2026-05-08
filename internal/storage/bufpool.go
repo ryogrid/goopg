@@ -1219,25 +1219,40 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 		return 0
 	}
 
-	// Snapshot up to maxPages dirty, unpinned slots under poolMu.
+	// M0070-0002: bgwriter dominated mutex contention on Q9
+	// (M0070 baseline pprof: ~93 % of contention coming from
+	// this loop holding poolMu across all `n` slots while
+	// foreground Pin / Unpin callers blocked). Snapshot
+	// candidates by acquiring poolMu briefly per scanned slot
+	// instead of holding the lock for the entire scan window.
+	// Each slot's read is consistent (the brief acquire / release
+	// pair sees the slot's metadata atomically) and the
+	// per-victim re-validation at line ~1250 below catches any
+	// staleness introduced between slots in the snapshot pass.
 	type victim struct {
 		idx int
 		tag BufferTag
 	}
-	p.poolMu.Lock()
 	n := len(p.slots)
-	victims := make([]victim, 0, maxPages)
+	p.poolMu.Lock()
 	start := p.bgwriterHand
+	p.bgwriterHand = (start + n) % n
+	p.poolMu.Unlock()
+	victims := make([]victim, 0, maxPages)
 	for i := 0; i < n && len(victims) < maxPages; i++ {
 		idx := (start + i) % n
 		s := p.slots[idx]
-		if s.valid && s.dirty && s.pinCount == 0 {
-			victims = append(victims, victim{idx: idx, tag: s.tag})
+		p.poolMu.Lock()
+		ok := s.valid && s.dirty && s.pinCount == 0
+		var tag BufferTag
+		if ok {
+			tag = s.tag
+		}
+		p.poolMu.Unlock()
+		if ok {
+			victims = append(victims, victim{idx: idx, tag: tag})
 		}
 	}
-	// Advance bgwriterHand past the scanned range.
-	p.bgwriterHand = (start + n) % n
-	p.poolMu.Unlock()
 
 	// Flush each victim under its shared content lock (read lock is
 	// sufficient — we only need stable page bytes, not exclusive access).
