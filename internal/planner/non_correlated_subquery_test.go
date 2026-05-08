@@ -118,10 +118,22 @@ func twoTablesCatalog(t *testing.T) catalog.Catalog {
 
 // TestPlanInExpr_NonCorrelatedFlag verifies that planInExpr sets
 // IsNonCorrelated=true for a subquery with no outer references.
-// (M0058-0001 acceptance: Q18 IN-SubPlan picks up the constant-key cache.)
+// (M0058-0001 acceptance: the IsNonCorrelated flag drives the
+// constant-key cache in the executor when the subquery is NOT
+// unnested.)
+//
+// M0069-0005 update: non-correlated IN-subquery is now unnested
+// to a SemiJoin at planning time, so the test exercises the flag
+// on a plan where the unnest is suppressed (multi-column
+// subquery — `(y, z) IN (...)` shape via two-column SELECT
+// suppresses the unnest because the SemiJoin currently only
+// supports single-key joins).
 func TestPlanInExpr_NonCorrelatedFlag(t *testing.T) {
 	cat := twoTablesCatalog(t)
-	sql := "SELECT x FROM t1 WHERE x IN (SELECT y FROM t2 WHERE z > 0)"
+	// Two-column inner Output() forces the unnest to bail
+	// (isUnnestableNonCorrelatedIn requires len(Output)==1)
+	// so the InExpr survives in the plan with IsNonCorrelated=true.
+	sql := "SELECT x FROM t1 WHERE x IN (SELECT y, z FROM t2 WHERE z > 0)"
 	node, err := Plan(parseOne(t, sql), cat)
 	if err != nil {
 		t.Fatal(err)

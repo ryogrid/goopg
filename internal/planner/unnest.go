@@ -950,6 +950,22 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 	if plan == nil {
 		return false
 	}
+	// M0069-0005: non-correlated IN — the inner plan has zero
+	// OuterColumnRefs and the outer key is the IN's left operand
+	// (`x IN (SELECT y FROM ...)` becomes a SemiJoin on x = y).
+	// This is the cleanest case: no clone-with-replacement, no
+	// equijoin-pair extraction. Q20 hits this shape (the outer
+	// `s_suppkey IN (SELECT ps_suppkey FROM partsupp WHERE ...)`).
+	if in.IsNonCorrelated {
+		if !isUnnestableNonCorrelatedIn(in) {
+			return false
+		}
+		// Nested INs inside the inner plan must be either
+		// unnestable themselves or, more commonly for Q20, will
+		// still execute as cached non-correlated subqueries — the
+		// outer unnest doesn't gate on the inner.
+		return true
+	}
 	// Collect equijoin pairs — all OuterColumnRefs must be in
 	// equality joins with inner ColumnRefs.
 	params := collectUnnestParams(plan)
@@ -976,6 +992,28 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 	return true
 }
 
+// isUnnestableNonCorrelatedIn checks the structural preconditions
+// for unnesting a non-correlated IN: the LHS is a ColumnRef, the
+// IN is not negated (NOT IN requires anti-semi-join semantics
+// which are out of scope for M0069-0005), and the inner plan has
+// exactly one output column. Without these the SemiJoin
+// rewriting would mis-shape the join.
+func isUnnestableNonCorrelatedIn(in *InExpr) bool {
+	if in.Negated {
+		return false
+	}
+	if _, ok := in.Operand.(*ColumnRef); !ok {
+		return false
+	}
+	if in.Plan == nil {
+		return false
+	}
+	if len(in.Plan.Output()) != 1 {
+		return false
+	}
+	return true
+}
+
 // unnestInExpr rewrites an IN (subquery) as a semi-join.
 //
 //	Filter(column IN (SELECT inner_col FROM ... WHERE inner_col = outer.col), outer)
@@ -986,6 +1024,12 @@ func canUnnestInExprDepth(in *InExpr, depth int) bool {
 func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	if !canUnnestInExpr(in) {
 		return nil, nil
+	}
+	// M0069-0005: non-correlated IN takes a separate path that
+	// doesn't go through clonePlanReplacingOuter (no
+	// OuterColumnRefs to replace).
+	if in.IsNonCorrelated {
+		return unnestNonCorrelatedInExpr(in, outer)
 	}
 	params := collectUnnestParams(in.Plan)
 	if len(params) == 0 {
@@ -1062,6 +1106,103 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 	// Use inner join with dedup on the right side (semi-join)
 	// — JoinTypeSemi builds a deduplicated set of the right
 	// child and probes from the left.
+	join := &Join{
+		pos:       in.Pos(),
+		Type:      JoinTypeInner,
+		Algo:      JoinAlgoHash,
+		Left:      outerChild,
+		Right:     innerPlan,
+		Predicate: semiPred,
+		LeftKey:   outerKey,
+		RightKey:  innerKey,
+		schema:    mergedSchema,
+	}
+	filter.Child = join
+	return outer, nil
+}
+
+// unnestNonCorrelatedInExpr handles the non-correlated case where
+// the inner plan has zero OuterColumnRefs (M0069-0005).
+//
+//	Filter(outer_col IN (SELECT inner_col FROM inner_plan), outer)
+//	→ Join(outer, inner_plan, on outer_col = inner_col, semi)
+//
+// This is structurally identical to the correlated path's tail
+// (Join construction + Filter rewrite) but skips the inner-plan
+// clone and the equijoin-pair extraction since there is nothing
+// outer-bound in the inner plan.
+func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
+	if !isUnnestableNonCorrelatedIn(in) {
+		return nil, nil
+	}
+	outerCol, ok := in.Operand.(*ColumnRef)
+	if !ok {
+		return nil, nil
+	}
+	innerPlan := in.Plan
+	// Recursively unnest any subqueries still inside the inner
+	// plan so nested IN/EXISTS/scalar inside the partsupp filter
+	// (the lineitem aggregate in Q20) are pulled up first.
+	innerPlan = unnestSubqueriesInPlan(innerPlan)
+
+	innerOut := innerPlan.Output()
+	if len(innerOut) != 1 {
+		return nil, nil
+	}
+	// The inner key is the single output column of the inner plan.
+	innerKey := &ColumnRef{
+		pos:   in.Pos(),
+		Index: 0, // will be re-indexed below to point into the merged schema
+		Name:  innerOut[0].Name,
+		Type:  innerOut[0].Type,
+	}
+
+	filter, conjunct := findFilterContainingInExpr(outer, in)
+	if filter == nil {
+		return nil, nil
+	}
+
+	outerChild := filter.Child
+	outerWidth := len(outerChild.Output())
+	innerWidth := len(innerPlan.Output())
+
+	// Re-index inner key into the merged (outer ++ inner) coord.
+	innerKey.Index = outerWidth
+
+	// outer key references its column in outerChild's coord —
+	// preserved as-is.
+	outerKey := &ColumnRef{
+		pos:   outerCol.Pos(),
+		Index: outerCol.Index,
+		Name:  outerCol.Name,
+		Type:  outerCol.Type,
+	}
+
+	semiPred := &BinaryOp{pos: in.Pos(), Op: "=", Left: outerKey, Right: innerKey}
+
+	// Replace the IN conjunct with the SemiJoin predicate.
+	conjuncts := splitAnd(filter.Predicate)
+	newConjuncts := make([]Expr, 0, len(conjuncts))
+	found := false
+	for _, c := range conjuncts {
+		if c == conjunct {
+			if !found {
+				newConjuncts = append(newConjuncts, semiPred)
+				found = true
+			}
+		} else {
+			newConjuncts = append(newConjuncts, c)
+		}
+	}
+	if !found {
+		newConjuncts = append(newConjuncts, semiPred)
+	}
+	filter.Predicate = combineAnd(newConjuncts)
+
+	mergedSchema := make(Schema, outerWidth+innerWidth)
+	copy(mergedSchema, outerChild.Output())
+	copy(mergedSchema[outerWidth:], innerPlan.Output())
+
 	join := &Join{
 		pos:       in.Pos(),
 		Type:      JoinTypeInner,

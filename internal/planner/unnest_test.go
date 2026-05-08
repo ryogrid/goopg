@@ -306,9 +306,14 @@ func TestRecursiveUnnestInsideNonUnnestableIN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Outer IN is non-correlated (no equijoin between a and b in b's WHERE).
-	// Inner scalar subquery IS correlated with b (c_b_key = b_key).
-	sql := `SELECT a_id FROM a WHERE a_id IN (
+	// Outer IN's left operand is a NON-ColumnRef (a_id + 1). This
+	// keeps the outer IN non-unnestable under M0069-0005 (the
+	// non-correlated unnest requires Operand to be a *ColumnRef);
+	// the inner scalar subquery IS correlated with b (c_b_key =
+	// b_key) and should still be unnested by
+	// walkSubqueryPlansInExpr — the M0040-0004 invariant this
+	// test pins.
+	sql := `SELECT a_id FROM a WHERE a_id + 1 IN (
 		SELECT b_id FROM b
 		WHERE b_val > (SELECT SUM(c_qty) FROM c WHERE c_b_key = b_key)
 	)`
