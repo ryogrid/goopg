@@ -4,6 +4,8 @@
 package planner
 
 import (
+	"time"
+
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -69,20 +71,45 @@ func (*NumericConst) exprNode()  {}
 // parses `Value` per `Type` at evaluation time so callers can
 // compare against catalog-typed columns without an explicit
 // cast operator.
+//
+// M0066-0002: `Cached*` fields hold a once-parsed result so
+// repeated evaluations of the same literal in a hot loop (e.g.
+// Q5's `o_orderdate >= date '1994-01-01'` evaluated per row)
+// avoid the `time.Parse` cost — pprof showed `time.parse` at
+// 10.5 % cumulative CPU on Q5 SF=1. Each plan tree is owned by
+// one query so no cross-query sharing; the operator pipeline
+// for a query is single-threaded so no intra-query race. The
+// planner leaves these zero; the executor populates on first
+// eval.
 type TypedStringLit struct {
 	pos   int
 	Type  string
 	Value string
+
+	// Cached parsed values. CacheValid signals which fields are
+	// populated (so the zero `time.Time` is distinguishable from
+	// an unparsed value).
+	CacheValid bool
+	CachedTime time.Time
 }
 
 func (e *TypedStringLit) Pos() int { return e.pos }
 func (*TypedStringLit) exprNode()  {}
 
 // IntervalLit mirrors parser.IntervalLit.
+//
+// M0066-0002: `Cached*` fields hold the parsed integer count
+// from `Value` so per-row evaluation doesn't repeat the
+// `strconv.ParseInt` cost (Q5's `interval '1' year` evaluated
+// per orders row pre-cache showed evalIntervalLit at ~2 % cum).
 type IntervalLit struct {
 	pos   int
 	Value string
 	Unit  string
+
+	// Cached parsed N from `Value`. CacheValid signals populated.
+	CacheValid bool
+	CachedN    int32
 }
 
 func (e *IntervalLit) Pos() int { return e.pos }

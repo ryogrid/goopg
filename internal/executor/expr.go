@@ -490,14 +490,24 @@ func evalOr(a, b Datum) Datum {
 // evalTypedStringLit parses the body of a `<type> 'value'`
 // literal at evaluation time. v0 supports date / timestamp /
 // timestamptz; the parsed time is normalised to UTC.
+//
+// M0066-0002: caches the parsed time on the planner node so
+// repeated evaluations in a hot loop (e.g. Q5's date filter
+// applied per orders row) skip the `time.Parse` cost. pprof
+// showed `time.parse` at 10.5 % cumulative CPU pre-cache.
 func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
+	if x.CacheValid {
+		return Datum{Kind: KindTime, Time: x.CachedTime}, nil
+	}
 	switch x.Type {
 	case "date":
 		t, err := time.Parse("2006-01-02", x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid date %q: %v", x.Value, err)}
 		}
-		return Datum{Kind: KindTime, Time: t.UTC()}, nil
+		x.CachedTime = t.UTC()
+		x.CacheValid = true
+		return Datum{Kind: KindTime, Time: x.CachedTime}, nil
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
@@ -505,7 +515,9 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		layouts := []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05", "2006-01-02"}
 		for _, layout := range layouts {
 			if t, err := time.Parse(layout, x.Value); err == nil {
-				return Datum{Kind: KindTime, Time: t.UTC()}, nil
+				x.CachedTime = t.UTC()
+				x.CacheValid = true
+				return Datum{Kind: KindTime, Time: x.CachedTime}, nil
 			}
 		}
 		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
@@ -611,19 +623,31 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // evalIntervalLit parses the integer body of an `interval 'N' unit`
 // literal. The parser already normalised plurals so Unit is one
 // of day / month / year.
+//
+// M0066-0002: caches the parsed N on the planner node so
+// repeated evaluations in a hot loop skip the
+// `strconv.ParseInt` cost.
 func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
-	n, err := strconv.ParseInt(x.Value, 10, 32)
-	if err != nil {
-		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
+	var n int32
+	if x.CacheValid {
+		n = x.CachedN
+	} else {
+		parsed, err := strconv.ParseInt(x.Value, 10, 32)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid interval count %q", x.Value)}
+		}
+		n = int32(parsed)
+		x.CachedN = n
+		x.CacheValid = true
 	}
 	d := Datum{Kind: KindInterval}
 	switch x.Unit {
 	case "day":
-		d.IntervalDays = int32(n)
+		d.IntervalDays = n
 	case "month":
-		d.IntervalMonths = int32(n)
+		d.IntervalMonths = n
 	case "year":
-		d.IntervalMonths = int32(n) * 12
+		d.IntervalMonths = n * 12
 	default:
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}

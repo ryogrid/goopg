@@ -1921,6 +1921,29 @@ identical to M0061 / M0062.
       `IsolatedScope` flag with skip in
       `applyJoinTreePosMap` / `remapPosMapAfterRewrite` /
       `buildBindingsPosMap`.
+      **M0064 follow-up** 2026-05-07: the blanket Name re-bind
+      regressed Q9 (chained NLI). Gated the rebind on
+      `outerNode` being `*MultiHashJoin` — preserves Q8/Q15b
+      and restores Q9 to ~240 s / 7 rows.
+
+- [x] M0064: Q9 chained-NLI regression caused by M0063-0001's
+      Name re-bind. **LANDED** 2026-05-07. The unconditional
+      rebind in `nliRewrite` (after picking `outerKey`) walked
+      Q9's `*NestedLoopIndexJoin`-as-outer keys whose original
+      Index already matched the runtime row layout, moving them
+      onto a different table's column. Fix: gate the rebind on
+      `outerNode.(*MultiHashJoin)` AND skip when the original
+      Index is in-bounds and points at a column with the matching
+      Name. See
+      `analysis/tpch-m0064-baseline-2026-05-07.md`.
+
+- [ ] M0064-Q21-walker (carried from M0063-0004 partial): make
+      `applyJoinTreePosMap` recurse into
+      `*NestedLoopIndexJoin` so post-NLI-rewrite key remap fires
+      and the EXISTS-unnesting tail's `liftInnerOnlyFilterConjuncts`
+      can run safely. Today the lift is reverted because NLI keys
+      stay at FROM-cumulative indices and probing breaks at runtime
+      (`column "l_orderkey" is not numeric`).
 
 - [ ] M0063-0002: Q5 six-table MHJ probe throughput.
       **Status:** DEFERRED → carried into a successor
@@ -1966,6 +1989,175 @@ identical to M0061 / M0062.
       (was 14 / 22 in M0062: +4 net — Q8, Q13, Q15b newly
       OK; Q9 newly regressed to 600 s cancel and tracked
       as a follow-up).
+
+## Milestone 0065 — TPC-H Residual Long-Tail v3
+
+See `docs/milestones/0065-tpch-residual-long-tail-v3.md`.
+Closes the three remaining cancels after M0064 (Q5 / Q20 /
+Q21). Goal: 22/22 OK on SF=1.
+
+- [ ] M0065-0001: Q21 NLI-aware key remap walker.
+      **Goal:** Q21 OK in < 600 s on SF=1 with ~411 rows.
+      **Approach:** extend `applyJoinTreePosMap` (and
+      `remapPosMapAfterRewrite` if needed) with a
+      `*NestedLoopIndexJoin` case that recurses into
+      Outer/Inner AND remaps Key/Keys/Predicate via
+      posMap. Re-enable
+      `liftInnerOnlyFilterConjuncts(innerPlan)` in
+      `unnestExistsExpr` (currently `var innerOnlyLifted
+      []Expr` declared empty). For Hash joins where
+      `tryBuildNLI` succeeds, propagate `j.Predicate` (the
+      lifted residuals) onto `NLI.Predicate`. Verify
+      Q9 remains OK / 7 rows.
+      **Files:** `internal/planner/bushy.go`
+      (`applyJoinTreePosMap`), `internal/planner/unnest.go`
+      (re-enable lift), `internal/planner/nl_index_join.go`
+      (`tryBuildNLI` Predicate propagation).
+      **Acceptance:**
+        - Q21 OK < 600 s, ~411 rows.
+        - Q9 still OK / 7 rows.
+        - `go test ./...` PASS.
+
+- [ ] M0065-0002: Q20 correlated scalar decorrelation.
+      **Goal:** Q20 OK in < 600 s on SF=1.
+      **Approach:** dump post-`unnestSubqueriesInPlan` Q20
+      tree to identify whether the inner correlated scalar
+      `SELECT 0.5 * SUM(l_quantity) ...` survives. If so,
+      ensure `unnestInExpr`'s post-clone call to
+      `unnestSubqueriesInPlan(innerPlan)` recurses into the
+      cloned partsupp inner plan. If `canUnnestSubquery`
+      rejects the SUM-over-single-Filter shape, relax it.
+      **Files:** `internal/planner/unnest.go`.
+      **Acceptance:**
+        - Q20 OK < 600 s.
+        - EXPLAIN shows GROUP BY aggregate join instead of
+          per-row SubPlan.
+        - `go test ./...` PASS.
+
+- [ ] M0065-0003: Q5 six-table MHJ throughput.
+      **Goal:** Q5 OK in < 600 s on SF=1.
+      **Approach:** profile Q5 with pprof at 1200 s.
+      If per-row cost dominates, hoist constant predicates.
+      If hash-insertion-bound (region/nation small-build),
+      extend `rewriteJoinsToNLI` to walk into
+      `*MultiHashJoin.Tables[i]` and emit per-table NLI
+      candidates.
+      **Files:** `internal/planner/nl_index_join.go`,
+      `internal/executor/multi_hash_join.go`.
+      **Acceptance:**
+        - Q5 OK < 600 s.
+        - pprof artifact in `bench/tpch/pprof/q5-fixed.pprof`.
+        - `go test ./...` PASS.
+
+- [ ] M0065-0004: Final 22-query SF=1 sweep + report.
+      **Files (output):**
+        `analysis/tpch-m0065-baseline-<date>.md`,
+        `bench/tpch/logs/m0065_22q_<ts>.log`.
+      **Blocked by:** M0065-0001..0003.
+
+## Milestone 0066 — TPC-H Runtime Optimization (Pivoted)
+
+See `docs/milestones/0066-tpch-residual-q5q20q21-final.md`.
+**PIVOTED** from "fix Q5/Q20/Q21 in planner" to "reduce
+executor allocation/GC overhead" after empirical findings:
+Q5 pprof shows 65 % CPU in `runtime.gcBgMarkWorker`. Planner
+attempts (M0066-Q5 build-time pushdown, M0066-Q21 NLI walker)
+broke other queries; reverted.
+
+- [ ] M0066-0001: GOGC tuning (default 100 → 400).
+      **File:** `bench/tpch/env_goopg.sh`.
+      **Acceptance:** GC cycles drop visibly in Q5 pprof; no
+      query regresses; OK-cohort wall clock improves.
+
+- [ ] M0066-0002: Row buffer pool (`sync.Pool` for `[]Datum`).
+      **File:** `internal/executor/multi_hash_join.go`
+      (`lazyOut`, per-step buffers).
+      **Acceptance:** Q5 / Q20 GC share drops; row-count
+      parity preserved.
+
+- [ ] M0066-0003: String interning for repeating column
+      values (low-cardinality char/varchar).
+      **File:** `internal/executor/datum.go` or scan path.
+      **Acceptance:** Heap profile shows fewer string
+      allocations on Q5/Q20; row-count parity preserved.
+
+- [ ] M0066-0004: Final 22-query SF=1 sweep + report.
+      **Files (output):**
+        `analysis/tpch-m0066-baseline-<date>.md`,
+        `bench/tpch/logs/m0066_22q_<ts>.log`,
+        `bench/tpch/pprof/cpu_q5_after.prof`,
+        `bench/tpch/pprof/cpu_q20_after.prof`.
+      **Blocked by:** M0066-0001..0003.
+
+## Milestone 0067 — TPC-H Structural Runtime Improvements
+
+See `docs/milestones/0067-tpch-structural-runtime.md`. Builds
+on M0066 PIVOT's allocation reductions. Verifies at
+`cancel-after=1200s` (was 600s).
+
+- [ ] M0067-0001: Milestone doc + fix_plan update.
+      **Files:** `docs/milestones/0067-tpch-structural-runtime.md`,
+      `.ralph/fix_plan.md`.
+
+- [ ] M0067-0002: 1200s baseline sweep.
+      **Files (output):**
+        `bench/tpch/logs/m0067_baseline_22q_<ts>.log`.
+      **Acceptance:** OK count documented; deltas vs. M0066
+      `cancel-after=600s` recorded.
+
+- [ ] M0067-0003: Q9 composite-NLI investigation + fix.
+      **Files:** `internal/planner/nl_index_join.go`
+      (`collectCrossSideEquiKeys`,
+      `pickIndexCoveringAllLeadingColumns`).
+      **Acceptance:** Q9 EXPLAIN shows `Index Scan using
+      partsupp_pk on partsupp`; row count documented (likely
+      ≠ 7).
+
+- [ ] M0067-0004: Q21 NLI walker re-attempt
+      (post-composite-NLI).
+      **Files:** `internal/planner/bushy.go`
+      (`applyJoinTreePosMap`, `remapPosMapAfterRewrite`,
+      new `reresolveNLIByName`).
+      **Acceptance:** Q21 OK < 1200 s OR documented blocker
+      (Filter-wrapped lineitem); Q9 stable.
+
+- [ ] M0067-0005: Projection narrowing (stretch).
+      **Files:** `internal/planner/bushy.go` (new
+      `pruneUnusedColumnsInMHJ` pass), `internal/planner/plan.go`.
+      **Acceptance:** Q5 pprof shows duffcopy/memclr share
+      drops; row-count parity preserved.
+
+- [ ] M0067-0006: Final 22-query sweep at `cancel-after=1200s`
+      + report.
+      **Files (output):**
+        `analysis/tpch-m0067-baseline-<date>.md`,
+        `bench/tpch/logs/m0067_22q_<ts>.log`.
+      **Blocked by:** M0067-0001..0005.
+
+## Deferred (former M0067 draft, now superseded)
+
+- [ ] M0068 candidate: Datum struct shrink (~80 → 32 bytes).
+- [ ] M0068 candidate: Q5 build-time predicate pushdown for
+      unpromoted SeqScans — earlier abortive attempt broke
+      Q3 due to walker interaction; needs guarded
+      re-implementation.
+- [ ] M0068 candidate: Q20 timestamp btree v0 OR unnest
+      non-correlated IN to SemiJoin (only correlated INs are
+      currently unnested).
+- [ ] M0068 candidate (deprecated, use anchor below): Findings:
+      - Q5: build-time predicate pushdown for unpromoted
+        SeqScans (Filter-wrap fallback when no btree); broke
+        Q3 due to walker interaction. Needs guarded
+        re-implementation.
+      - Q20: timestamp btree v0 missing; alternative is
+        unnesting the non-correlated IN to a SemiJoin
+        (currently only correlated INs get unnested).
+      - Q21: Anti-side hash join needs the inner-Filter
+        conjunct lifted onto the join Predicate AND
+        composite-NLI on `partsupp_pk` for Q9 to absorb the
+        cardinality explosion (Q9's "7 rows" in M0064/M0065
+        was silent false negatives confirmed by NLI walker
+        bisect).
 
 ## Notes
 

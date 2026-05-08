@@ -73,3 +73,13 @@ mkdir -p "${TMP}" "${LOG_DIR}" "${RUNTIME_DIR}"
 # co-resident processes (browser, IDE, claude-code itself).
 # Override with `GOMEMLIMIT=20GiB` for hosts with ≥ 64 GB RAM.
 export GOMEMLIMIT=${GOMEMLIMIT:-12GiB}
+
+# M0066-0001: GOGC=off disables proactive growth-triggered GC; the
+# runtime only collects when heap approaches GOMEMLIMIT. For TPC-H
+# SF=1 the MHJ build phase allocates ~3-4 GiB transiently — well
+# below the 12 GiB cap — so GC effectively never runs during the
+# query. Pre-pivot pprof at GOGC=100 showed 65 % of CPU in
+# `runtime.gcBgMarkWorker`; at GOGC=400 still 55 %; GOGC=off
+# trades memory headroom for raw throughput. Override with
+# `GOGC=100` for memory-tight hosts.
+export GOGC=${GOGC:-off}

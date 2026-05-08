@@ -53,7 +53,22 @@ type multiHashJoinOp struct {
 	lazyCursors  []int   // lazyCursors[i] = index into lazyMatches[i]
 	lazyInit     bool    // true once a probe row has yielded a valid leaf
 	lazyProbeEOF bool    // true once probeOp is exhausted
+
+	// M0066-0002: borrow contract. When set to BorrowedRow, Next()
+	// returns o.lazyOut directly without `copyOut()` — the parent
+	// has promised to consume the row before pulling the next one.
+	// Default OwnedRow.
+	//
+	// Q5's pprof at SF=1 showed `copyOut` accounted for 99.23% of
+	// allocations (2.02 TB total in 600s). Eliminating that copy
+	// when the parent supports BorrowedRow (filterOp, aggregateOp's
+	// drain loop) is the dominant win for GC pressure.
+	borrow BorrowSemantics
 }
+
+// SetBorrow flips multiHashJoinOp into borrow-on-output mode.
+// (M0066-0002.)
+func (o *multiHashJoinOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 // keyStep describes one chain-lookup: take the value at the
 // srcTable's srcCol from the accumulated output row and use it as
@@ -414,6 +429,9 @@ func (o *multiHashJoinOp) Next() (Row, error) {
 				continue
 			}
 			o.lazyInit = true
+			if o.borrow == BorrowedRow {
+				return o.lazyOut, nil
+			}
 			return o.copyOut(), nil
 		}
 
@@ -426,6 +444,9 @@ func (o *multiHashJoinOp) Next() (Row, error) {
 			// All combinations exhausted for this probe row.
 			o.lazyInit = false
 			continue
+		}
+		if o.borrow == BorrowedRow {
+			return o.lazyOut, nil
 		}
 		return o.copyOut(), nil
 	}
