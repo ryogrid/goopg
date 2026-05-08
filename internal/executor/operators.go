@@ -146,16 +146,20 @@ func (o *filterOp) Next() (TupleSlot, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := NextRow(o.child)
+		// M0069-0001 Stage C: pass-through. Filter returns the
+		// child's slot directly when the predicate matches —
+		// avoids the Row materialisation + outSlot wrap that
+		// Stage B's NextRow boundary imposed.
+		slot, err := o.child.Next()
 		if err != nil {
 			return nil, err
 		}
-		v, err := evalExpr(o.pred, row, o.ctx)
+		v, err := evalExpr(o.pred, slot.Row(), o.ctx)
 		if err != nil {
 			return nil, err
 		}
 		if !v.IsNull() && v.Kind == KindBool && v.BoolValue() {
-			return o.outSlot.set(row), nil
+			return slot, nil
 		}
 		rejected++
 	}
@@ -219,7 +223,7 @@ func (o *limitOp) Close() error           { return o.child.Close() }
 
 func (o *limitOp) Next() (TupleSlot, error) {
 	for o.skipped < o.offsetCount {
-		if _, err := NextRow(o.child); err != nil {
+		if _, err := o.child.Next(); err != nil {
 			return nil, err
 		}
 		o.skipped++
@@ -227,12 +231,13 @@ func (o *limitOp) Next() (TupleSlot, error) {
 	if o.limitCount >= 0 && o.emitted >= o.limitCount {
 		return nil, EOF
 	}
-	row, err := NextRow(o.child)
+	// M0069-0001 Stage C: pass-through.
+	slot, err := o.child.Next()
 	if err != nil {
 		return nil, err
 	}
 	o.emitted++
-	return o.outSlot.set(row), nil
+	return slot, nil
 }
 
 // sortOp buffers the child's output then sorts under the supplied
