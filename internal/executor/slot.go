@@ -69,49 +69,6 @@ func (s *MaterializedSlot) Materialize() *MaterializedSlot {
 // Release to releaseRow() at the slot's lifetime boundary.
 func (s *MaterializedSlot) Release() {}
 
-// set is the per-operator-slot M0069-0001 Stage B emit helper.
-// Each producer keeps a `outSlot MaterializedSlot` field as a
-// VALUE inside its struct (no heap allocation per call); on
-// each Next() it sets the row and returns &o.outSlot. A
-// receiver-pointer method on MaterializedSlot lets `&o.outSlot`
-// be addressed naturally:
-//
-//	func (o *T) Next() (TupleSlot, error) {
-//	    // ... compute row ...
-//	    return o.outSlot.set(row), nil
-//	}
-//
-// The slot pointer is stable per-operator; its `row` field is
-// invalidated by the next `Next()` call on the same operator.
-// Retention consumers (sortOp drain, hash-build, etc.) must
-// call slot.Materialize() (or cloneRow at the slot.Row())
-// before the next Next() call.
-func (s *MaterializedSlot) set(row Row) *MaterializedSlot {
-	s.row = row
-	return s
-}
-
-// withSchema records the schema on this slot — typically called
-// once at operator Open() time.
-func (s *MaterializedSlot) withSchema(sch planner.Schema) {
-	s.schema = sch
-}
-
-// NextRow is a transitional helper for the M0069-0001 Stage B
-// migration: it advances `op` and materialises the slot back to
-// a Row. Operators / call sites that haven't been migrated to
-// consume TupleSlot natively use NextRow to keep reading rows.
-func NextRow(op Operator) (Row, error) {
-	s, err := op.Next()
-	if err != nil {
-		return nil, err
-	}
-	if s == nil {
-		return nil, nil
-	}
-	return s.Row(), nil
-}
-
 // VirtualSlot references column positions across one or more
 // source slots. Stage A defines the type for forward
 // compatibility; the actual operator wiring (filterOp /

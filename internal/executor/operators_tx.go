@@ -15,7 +15,6 @@ type transactionOp struct {
 	plan *planner.Transaction
 	ctx  *Context
 	done bool
-	outSlot MaterializedSlot
 }
 
 func newTransactionOp(p *planner.Transaction) *transactionOp {
@@ -38,7 +37,7 @@ func (o *transactionOp) Open(ctx *Context) error {
 
 func (o *transactionOp) Close() error { return nil }
 
-func (o *transactionOp) Next() (TupleSlot, error) {
+func (o *transactionOp) Next() (Row, error) {
 	if o.done {
 		return nil, EOF
 	}

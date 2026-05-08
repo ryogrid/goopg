@@ -320,7 +320,7 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 	tmpDir := os.TempDir()
 
 	for {
-		row, err := NextRow(op)
+		row, err := op.Next()
 		if err == EOF {
 			break
 		}
@@ -386,18 +386,17 @@ func drainRowsToOp(op Operator) (Operator, error) {
 type rowsOp struct {
 	rows []Row
 	idx  int
-	outSlot MaterializedSlot
 }
 
 func (o *rowsOp) Open(*Context) error { o.idx = 0; return nil }
 func (o *rowsOp) Schema() planner.Schema { return nil } // schema comes from joinOp
-func (o *rowsOp) Next() (TupleSlot, error) {
+func (o *rowsOp) Next() (Row, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return o.outSlot.set(r), nil
+	return r, nil
 }
 func (o *rowsOp) Close() error {
 	o.rows = nil
@@ -413,7 +412,6 @@ type spillOp struct {
 	// otherwise it clones before returning (default OwnedRow).
 	borrow BorrowSemantics
 	out    Row
-	outSlot MaterializedSlot
 }
 
 func (o *spillOp) Open(*Context) error    { return nil }
@@ -425,7 +423,7 @@ func (o *spillOp) Schema() planner.Schema { return nil }
 // (M0054-0005b-followup.)
 func (o *spillOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
-func (o *spillOp) Next() (TupleSlot, error) {
+func (o *spillOp) Next() (Row, error) {
 	row, err := o.r.ReadRowInto(o.out)
 	if err == io.EOF {
 		return nil, EOF
@@ -434,7 +432,10 @@ func (o *spillOp) Next() (TupleSlot, error) {
 		return nil, err
 	}
 	o.out = row // re-cap for the next call
-	return o.outSlot.set(row), nil
+	if o.borrow == BorrowedRow {
+		return row, nil
+	}
+	return cloneRow(row), nil
 }
 func (o *spillOp) Close() error {
 	o.r.Close()

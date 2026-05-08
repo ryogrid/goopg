@@ -18,7 +18,6 @@ type windowOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
-	outSlot MaterializedSlot
 }
 
 func newWindowOp(plan *planner.WindowAgg, child Operator) *windowOp {
@@ -31,7 +30,7 @@ func (o *windowOp) Open(ctx *Context) error {
 		return err
 	}
 	for {
-		row, err := NextRow(o.child)
+		row, err := o.child.Next()
 		if err == EOF {
 			break
 		}
@@ -288,13 +287,13 @@ func compareSortDatums(a, b Datum, pos int, desc bool) (cmp int, decided bool, e
 	return c, true, nil
 }
 
-func (o *windowOp) Next() (TupleSlot, error) {
+func (o *windowOp) Next() (Row, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return o.outSlot.set(row), nil
+	return row, nil
 }
 
 func (o *windowOp) Close() error {

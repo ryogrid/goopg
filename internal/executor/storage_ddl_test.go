@@ -28,7 +28,7 @@ func runDDL(t *testing.T, ctx *Context, sql string) error {
 	if err := op.Open(ctx); err != nil {
 		return err
 	}
-	if _, err := NextRow(op); err != EOF {
+	if _, err := op.Next(); err != EOF {
 		return err
 	}
 	return op.Close()

@@ -103,7 +103,7 @@ func insertRow(t *testing.T, ctx *Context, cat catalog.Catalog, id int64, val st
 	if err := op.Open(ctx); err != nil {
 		t.Fatalf("Insert.Open: %v", err)
 	}
-	if _, err := NextRow(op); err != EOF {
+	if _, err := op.Next(); err != EOF {
 		t.Fatalf("Insert.Next: %v", err)
 	}
 	_ = op.Close()

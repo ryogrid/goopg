@@ -353,7 +353,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 
 	var rowCount int64
 	for {
-		row, err := executor.NextRow(op)
+		row, err := op.Next()
 		if err == executor.EOF {
 			break
 		}

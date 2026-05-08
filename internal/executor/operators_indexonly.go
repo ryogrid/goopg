@@ -21,7 +21,6 @@ type indexOnlyScanOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
-	outSlot MaterializedSlot
 }
 
 func newIndexOnlyScanOp(p *planner.IndexOnlyScan) *indexOnlyScanOp {
@@ -118,13 +117,13 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
+func (o *indexOnlyScanOp) Next() (Row, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return o.outSlot.set(r), nil
+	return r, nil
 }
 
 func (o *indexOnlyScanOp) Close() error {

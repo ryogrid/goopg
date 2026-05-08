@@ -22,7 +22,6 @@ type explainOp struct {
 	plan *planner.Explain
 	rows []Row
 	idx  int
-	outSlot MaterializedSlot
 }
 
 func newExplainOp(p *planner.Explain) *explainOp {
@@ -72,7 +71,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			return err
 		}
 		for {
-			_, err := NextRow(inner)
+			_, err := inner.Next()
 			if errors.Is(err, EOF) {
 				break
 			}
@@ -131,13 +130,13 @@ func (o *explainOp) Open(ctx *Context) error {
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 
-func (o *explainOp) Next() (TupleSlot, error) {
+func (o *explainOp) Next() (Row, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return o.outSlot.set(r), nil
+	return r, nil
 }
 
 func (o *explainOp) Close() error { return nil }

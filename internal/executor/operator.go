@@ -23,7 +23,7 @@ var EOF = errors.New("executor: end of stream")
 // an error.
 type Operator interface {
 	Open(ctx *Context) error
-	Next() (TupleSlot, error)
+	Next() (Row, error)
 	Close() error
 	Schema() planner.Schema
 }
