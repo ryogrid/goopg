@@ -725,22 +725,7 @@ func pickInnerSide(j *Join, leftCol, rightCol *ColumnRef, leftWidth int) (*SeqSc
 		return rss, rightSideRef, leftSideRef
 	}
 	if lss, ok := j.Left.(*SeqScan); ok {
-		// Inner is left; outer is right. M0071-0002-followup:
-		// when this branch fires, the NLI's emitted schema is
-		// `outer ++ inner` = `Right ++ Left`, which is the FLIP
-		// of the original `Left ++ Right`. Downstream operators
-		// whose column refs were bound to the original layout
-		// land on wrong slots after the flip. Decline NLI when
-		// the would-be outer (j.Right) is a scalar-decorrelation
-		// Aggregate — that shape's parent Filter (e.g. Q20's
-		// `ps_availqty > 0.5 * sum`) breaks under the flip
-		// because the chained-NLI defensive gates at line 399
-		// and bushy.go:1548 leave the parent Filter's
-		// ColumnRefs un-rebind'd. The HashJoin path keeps the
-		// canonical Left ⋈ Right schema and works correctly.
-		if _, rightIsAgg := j.Right.(*Aggregate); rightIsAgg {
-			return nil, nil, nil
-		}
+		// Inner is left; outer is right.
 		return lss, leftSideRef, rightSideRef
 	}
 	return nil, nil, nil

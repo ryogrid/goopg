@@ -600,69 +600,6 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 	}
 }
 
-// cloneExprSubstituteAggIdx0 clones an expression tree (typically
-// a scalar subquery's outer Project target) and substitutes every
-// ColumnRef whose Index == 0 with `aggColRef`. This preserves the
-// Project's expression (e.g. `0.5 * sum`) while pointing the
-// agg-result reference at the new merged-coord aggColRef during
-// scalar subquery decorrelation. M0071-0002-followup.
-func cloneExprSubstituteAggIdx0(e Expr, aggColRef *ColumnRef) Expr {
-	if e == nil {
-		return nil
-	}
-	switch x := e.(type) {
-	case *ColumnRef:
-		if x.Index == 0 {
-			cl := *aggColRef
-			return &cl
-		}
-		cl := *x
-		return &cl
-	case *BinaryOp:
-		return &BinaryOp{
-			pos:   x.Pos(),
-			Op:    x.Op,
-			Left:  cloneExprSubstituteAggIdx0(x.Left, aggColRef),
-			Right: cloneExprSubstituteAggIdx0(x.Right, aggColRef),
-		}
-	case *UnaryOp:
-		return &UnaryOp{
-			pos:     x.Pos(),
-			Op:      x.Op,
-			Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef),
-		}
-	case *FuncCall:
-		cl := *x
-		cl.Args = make([]Expr, len(x.Args))
-		for i, a := range x.Args {
-			cl.Args[i] = cloneExprSubstituteAggIdx0(a, aggColRef)
-		}
-		return &cl
-	case *CaseExpr:
-		cl := *x
-		if x.Operand != nil {
-			cl.Operand = cloneExprSubstituteAggIdx0(x.Operand, aggColRef)
-		}
-		cl.Whens = make([]CaseWhen, len(x.Whens))
-		for i, w := range x.Whens {
-			cl.Whens[i] = CaseWhen{
-				When: cloneExprSubstituteAggIdx0(w.When, aggColRef),
-				Then: cloneExprSubstituteAggIdx0(w.Then, aggColRef),
-			}
-		}
-		if x.Else != nil {
-			cl.Else = cloneExprSubstituteAggIdx0(x.Else, aggColRef)
-		}
-		return &cl
-	case *ExtractExpr:
-		cl := *x
-		cl.Source = cloneExprSubstituteAggIdx0(x.Source, aggColRef)
-		return &cl
-	default:
-		return cloneExprLeaf(x)
-	}
-}
-
 func cloneExprLeaf(e Expr) Expr {
 	if e == nil {
 		return nil
@@ -862,25 +799,7 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 		Name:  subSchema[len(params)].Name,
 		Type:  subSchema[len(params)].Type,
 	}
-	// M0071-0002-followup: if the scalar subquery had a Project
-	// wrapper above its Aggregate (e.g. Q20's `SELECT 0.5 *
-	// sum(l_quantity) FROM lineitem WHERE ...`), the Project's
-	// target expression must be preserved when substituting the
-	// scalar SubqueryExpr in the outer Filter's predicate.
-	// Without this, only the raw aggregate result column is
-	// substituted (`sum`), losing the Project's expression
-	// (`0.5 * sum`). For Q20 this caused `ps_availqty > sum`
-	// instead of `ps_availqty > 0.5 * sum`, which over-filters
-	// every row (sum is ~2x the threshold) → 0 rows.
-	var replacement Expr = aggColRef
-	if proj, ok := sub.Plan.(*Project); ok && len(proj.Targets) == 1 {
-		// Clone the Project's target expression, substituting any
-		// ColumnRef with Index == 0 (the agg result's position in
-		// the original Aggregate's output) with the new
-		// merged-coord aggColRef.
-		replacement = cloneExprSubstituteAggIdx0(proj.Targets[0], aggColRef)
-	}
-	newConjunct := replaceExprInConjunct(conjunct, sub, replacement)
+	newConjunct := replaceExprInConjunct(conjunct, sub, aggColRef)
 	conjuncts := splitAnd(filter.Predicate)
 	newConjuncts := make([]Expr, 0, len(conjuncts))
 	for _, c := range conjuncts {
