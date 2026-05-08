@@ -566,8 +566,27 @@ func (o *joinOp) nextLazy() (Row, error) {
 		//   - Semi: skip the probe row (no match).
 		//   - Anti: keep the probe row (matches PostgreSQL
 		//     `NOT EXISTS` semantics — equality cannot be true).
+		//
+		// M0071-0003-followup: when the join carries a residual
+		// Predicate (non-equijoin conjunct lifted from EXISTS body
+		// — Q21's `l3.l_suppkey <> l1.l_suppkey`), the residual
+		// must be evaluated against (probe ++ build) for each
+		// matching build row. Semi keeps the probe iff at least
+		// one matching build row passes the residual; Anti keeps
+		// the probe iff NO matching build row passes. Without
+		// this check, Q21's NOT EXISTS Anti dropped every outer
+		// row on hash-key match alone (l_orderkey shared across
+		// l1/l3) regardless of the residual `l3 <> l1` test, so
+		// Q21 returned 0 rows instead of canonical ~411.
 		if o.plan.Type == planner.JoinTypeSemi {
 			if len(matches) == 0 {
+				continue
+			}
+			anyMatch, perr := o.semiAntiAnyResidualPasses(r, matches)
+			if perr != nil {
+				return nil, perr
+			}
+			if !anyMatch {
 				continue
 			}
 			o.lazyRow = nil
@@ -575,7 +594,13 @@ func (o *joinOp) nextLazy() (Row, error) {
 		}
 		if o.plan.Type == planner.JoinTypeAnti {
 			if len(matches) > 0 {
-				continue
+				anyMatch, perr := o.semiAntiAnyResidualPasses(r, matches)
+				if perr != nil {
+					return nil, perr
+				}
+				if anyMatch {
+					continue
+				}
 			}
 			o.lazyRow = nil
 			return r, nil
@@ -594,6 +619,42 @@ func (o *joinOp) nextLazy() (Row, error) {
 		o.lazyActive = true
 		// Continue loop to yield first match.
 	}
+}
+
+// semiAntiAnyResidualPasses evaluates the join's full Predicate
+// (residual conjuncts beyond the equi-key) against (probeRow ++
+// buildRow) for each candidate build row. Returns true at the
+// first match that passes. M0071-0003-followup: Q21's NOT EXISTS
+// residual `l3.l_suppkey <> l1.l_suppkey` discriminates real
+// matches from key-only-matches; Anti needs all matches to fail
+// the residual to keep the probe; Semi needs any match to pass.
+func (o *joinOp) semiAntiAnyResidualPasses(probe Row, matches []Row) (bool, error) {
+	if o.plan.Predicate == nil {
+		// No residual — the equi-key match is the full match.
+		return true, nil
+	}
+	for _, m := range matches {
+		// Build the (probe ++ inner) joined row in the planner's
+		// merged-coord layout. For BuildLeft=false (the common
+		// EXISTS / NOT EXISTS shape), the probe is the OUTER (left)
+		// and m is the INNER (right). Predicate ColumnRefs at
+		// indices [0, leftWidth) read probe; [leftWidth, total)
+		// read m.
+		var joined Row
+		if o.plan.BuildLeft {
+			joined = concatRows(m, probe)
+		} else {
+			joined = concatRows(probe, m)
+		}
+		ok, err := o.joinPredicateMatch(joined)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (o *joinOp) Close() error {

@@ -1596,6 +1596,19 @@ func findUniqueColumnIndex(schema Schema, name string, offset int) int {
 	return hit
 }
 
+// schemaHasName reports whether `name` appears at least once in
+// `schema` (M0071-0003-followup). Used by `predRebind` to
+// distinguish "absent" from "ambiguous" — see the Q21 schema
+// ambiguity fix below.
+func schemaHasName(schema Schema, name string) bool {
+	for _, c := range schema {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // reresolveJoinByName re‑binds ColumnRef indices in a Join's keys
 // and predicate by matching ColumnRef.Name against the actual output
 // schemas of n.Left and n.Right. Used after rewriteMultiWayChain to
@@ -1645,12 +1658,21 @@ func reresolveJoinByName(j *Join) {
 	// tries the side suggested by the original Index first (so
 	// `a INNER JOIN b ON a.id = b.id` keeps a.id on the left and
 	// b.id on the right when names collide), but falls back to the
-	// other side if the Name isn't found there. This covers
+	// other side if the Name is ABSENT there. This covers
 	// pushOneConjunct's residuals: when a conjunct from a higher
 	// scope is ANDed onto a Join's Predicate, its ColumnRef indices
 	// may already have been remapped by an earlier pass — so the
 	// original-Index side classification can be wrong, and we need
 	// to retry the opposite side by Name.
+	//
+	// M0071-0003-followup: critically, when the suggested side has
+	// the name AMBIGUOUSLY (e.g. Q21's l1.l_suppkey + l2.l_suppkey
+	// both in the EXISTS-Semi's left output after the merged-schema
+	// widen), the fallback to the other side silently re-binds the
+	// ref to the OTHER table's same-named column (l3.l_suppkey on
+	// the Anti's right side). Preserve the original Index in the
+	// ambiguous case — it was set by the binder and is correct
+	// against the pre-rewrite layout.
 	predRebind := func(e Expr) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
@@ -1662,6 +1684,11 @@ func reresolveJoinByName(j *Join) {
 				cr.Index = newIdx
 				return
 			}
+			// Left has the name ambiguously — preserve cr.Index.
+			if schemaHasName(leftSchema, cr.Name) {
+				return
+			}
+			// Absent in left: try right.
 			if newIdx := findUnique(rightSchema, cr.Name, leftWidth); newIdx >= 0 {
 				cr.Index = newIdx
 				return
@@ -1669,6 +1696,9 @@ func reresolveJoinByName(j *Join) {
 		} else {
 			if newIdx := findUnique(rightSchema, cr.Name, leftWidth); newIdx >= 0 {
 				cr.Index = newIdx
+				return
+			}
+			if schemaHasName(rightSchema, cr.Name) {
 				return
 			}
 			if newIdx := findUnique(leftSchema, cr.Name, 0); newIdx >= 0 {
