@@ -2,6 +2,7 @@ package mvcc
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/goopg/goopg/internal/storage"
@@ -65,15 +66,38 @@ func (s Snapshot) Clone() Snapshot {
 	return out
 }
 
+// snapshotLinearScanThreshold is the InProgress array length at or
+// below which the per-tuple visibility check uses a straight-line
+// scan over the slice. Above this, sort.Search's binary search wins.
+// The crossover is empirical (M0069-0007 microbenchmark): at SF=1
+// single-thread the typical InProgress is 1-3 entries, so the
+// threshold keeps the hot path branch-prediction-friendly while
+// guarding against pathological N (concurrent OLTP + analytical
+// mix).
+const snapshotLinearScanThreshold = 16
+
 // HasInProgress returns true when xid is listed in the snapshot's
 // in-progress array.
+//
+// The array is sorted ascending at snapshot construction time
+// (manager.captureSnapshotLocked), so we can binary-search above
+// snapshotLinearScanThreshold. For small N the linear scan stays
+// because branch prediction + cache locality make the simple loop
+// faster than sort.Search's call overhead.
 func (s Snapshot) HasInProgress(xid storage.TransactionID) bool {
-	for _, in := range s.InProgress {
-		if in == xid {
-			return true
+	n := len(s.InProgress)
+	if n <= snapshotLinearScanThreshold {
+		for _, in := range s.InProgress {
+			if in == xid {
+				return true
+			}
 		}
+		return false
 	}
-	return false
+	idx := sort.Search(n, func(i int) bool {
+		return s.InProgress[i] >= xid
+	})
+	return idx < n && s.InProgress[idx] == xid
 }
 
 // SeesCommittedXID reports whether xid is visible as committed to this
