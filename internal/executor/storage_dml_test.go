@@ -30,7 +30,7 @@ func seedItems(t *testing.T, ctx *Context, tbl *catalog.Table) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NextRow(op); err != EOF {
+	if _, err := op.Next(); err != EOF {
 		t.Fatalf("seed insert: %v", err)
 	}
 	_ = op.Close()
@@ -66,7 +66,7 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NextRow(op); err != EOF {
+	if _, err := op.Next(); err != EOF {
 		t.Fatalf("Update.Next: %v", err)
 	}
 	if uo := op.(*updateOp); uo.RowsAffected() != 1 {

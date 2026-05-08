@@ -28,7 +28,6 @@ type ddlOp struct {
 	plan *planner.DDL
 	ctx  *Context
 	done bool
-	outSlot MaterializedSlot
 }
 
 func newDDLOp(p *planner.DDL) *ddlOp { return &ddlOp{plan: p} }
@@ -43,7 +42,7 @@ func (o *ddlOp) Open(ctx *Context) error {
 }
 func (o *ddlOp) Close() error { return nil }
 
-func (o *ddlOp) Next() (TupleSlot, error) {
+func (o *ddlOp) Next() (Row, error) {
 	if o.done {
 		return nil, EOF
 	}

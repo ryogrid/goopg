@@ -41,7 +41,6 @@ type joinOp struct {
 	lazyNullLeft  Row
 	lazyNullRight Row
 	lazyKeyRow    Row
-	outSlot MaterializedSlot
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -218,7 +217,7 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 				}
 			}
 			buildCount++
-			l, err := NextRow(buildOp)
+			l, err := buildOp.Next()
 			if err == EOF { break }
 			if err != nil { return err }
 			if leftWidth == 0 && len(l) > 0 {
@@ -259,7 +258,7 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 			}
 		}
 		buildCount++
-		r, err := NextRow(buildOp)
+		r, err := buildOp.Next()
 		if err == EOF { break }
 		if err != nil { return err }
 		if rightWidth == 0 && len(r) > 0 {
@@ -463,21 +462,17 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
 }
 
-func (o *joinOp) Next() (TupleSlot, error) {
+func (o *joinOp) Next() (Row, error) {
 	// M0036 lazy output: yield joined rows on demand.
 	if o.lazyProbe != nil {
-		row, err := o.nextLazy()
-		if err != nil {
-			return nil, err
-		}
-		return o.outSlot.set(row), nil
+		return o.nextLazy()
 	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return o.outSlot.set(row), nil
+	return row, nil
 }
 
 // nextLazy yields one joined row at a time for lazy hash joins.
@@ -528,7 +523,7 @@ func (o *joinOp) nextLazy() (Row, error) {
 		}
 		o.lazyActive = false
 		// Pull next probe row.
-		r, err := NextRow(o.lazyProbe)
+		r, err := o.lazyProbe.Next()
 		if err == EOF {
 			return nil, EOF
 		}
@@ -625,7 +620,6 @@ type aggregateOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
-	outSlot MaterializedSlot
 }
 
 type aggRuntime struct {
@@ -665,7 +659,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	for {
-		row, err := NextRow(o.child)
+		row, err := o.child.Next()
 		if err == EOF {
 			break
 		}
@@ -861,13 +855,13 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	return NullDatum
 }
 
-func (o *aggregateOp) Next() (TupleSlot, error) {
+func (o *aggregateOp) Next() (Row, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return o.outSlot.set(row), nil
+	return row, nil
 }
 
 func (o *aggregateOp) Close() error {
@@ -894,7 +888,7 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := NextRow(op)
+		row, err := op.Next()
 		if err == EOF {
 			return rows, nil
 		}

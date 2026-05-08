@@ -80,7 +80,7 @@ func TestInsertThenSeqScanRoundTrip(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NextRow(op); err != EOF {
+	if _, err := op.Next(); err != EOF {
 		t.Fatalf("Insert.Next: %v", err)
 	}
 	if io := op.(*insertOp); io.RowsAffected() != 3 {
@@ -213,16 +213,14 @@ func TestInsertExtendsRelation(t *testing.T) {
 func drainScan(op Operator) ([]Row, error) {
 	var out []Row
 	for {
-		row, err := NextRow(op)
+		row, err := op.Next()
 		if err == EOF {
 			return out, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		// M0069-0001 Stage B: the slot's row is invalidated by
-		// the next Next() call; clone before retaining.
-		out = append(out, cloneRow(row))
+		out = append(out, row)
 	}
 }
 
@@ -291,7 +289,7 @@ func TestSeqScanFiresPrefetchesAcrossBlocks(t *testing.T) {
 	if err := op.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NextRow(op); err != EOF {
+	if _, err := op.Next(); err != EOF {
 		t.Fatalf("Insert.Next: %v", err)
 	}
 	_ = op.Close()

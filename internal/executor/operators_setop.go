@@ -12,7 +12,6 @@ type setOp struct {
 	leftDone  bool
 	rightDone bool
 	opened    bool
-	outSlot MaterializedSlot
 }
 
 func newSetOp(p *planner.SetOp, left, right Operator) *setOp {
@@ -49,27 +48,27 @@ func (o *setOp) Close() error {
 	return rErr
 }
 
-func (o *setOp) Next() (TupleSlot, error) {
+func (o *setOp) Next() (Row, error) {
 	if !o.leftDone {
-		row, err := NextRow(o.left)
+		row, err := o.left.Next()
 		if err == EOF {
 			o.leftDone = true
 			o.left.Close()
 		} else if err != nil {
 			return nil, err
 		} else {
-			return o.outSlot.set(row), nil
+			return row, nil
 		}
 	}
 	if !o.rightDone {
-		row, err := NextRow(o.right)
+		row, err := o.right.Next()
 		if err == EOF {
 			o.rightDone = true
 			o.right.Close()
 		} else if err != nil {
 			return nil, err
 		} else {
-			return o.outSlot.set(row), nil
+			return row, nil
 		}
 	}
 	return nil, EOF

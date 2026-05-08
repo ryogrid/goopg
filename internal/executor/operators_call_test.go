@@ -79,7 +79,7 @@ func TestExecCallProcedure(t *testing.T) {
 	}
 	defer op.Close()
 	for {
-		_, err := NextRow(op)
+		_, err := op.Next()
 		if err == EOF {
 			return
 		}

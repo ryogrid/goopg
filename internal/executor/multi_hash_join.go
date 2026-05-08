@@ -54,11 +54,16 @@ type multiHashJoinOp struct {
 	lazyInit     bool    // true once a probe row has yielded a valid leaf
 	lazyProbeEOF bool    // true once probeOp is exhausted
 
-	// M0066-0002: borrow contract. M0069-0001 Stage B: this is now
-	// structural via outSlot — the slot's row is always reused
-	// (no per-call copyOut); retention consumers must Materialize.
-	borrow  BorrowSemantics
-	outSlot MaterializedSlot
+	// M0066-0002: borrow contract. When set to BorrowedRow, Next()
+	// returns o.lazyOut directly without `copyOut()` — the parent
+	// has promised to consume the row before pulling the next one.
+	// Default OwnedRow.
+	//
+	// Q5's pprof at SF=1 showed `copyOut` accounted for 99.23% of
+	// allocations (2.02 TB total in 600s). Eliminating that copy
+	// when the parent supports BorrowedRow (filterOp, aggregateOp's
+	// drain loop) is the dominant win for GC pressure.
+	borrow BorrowSemantics
 }
 
 // SetBorrow flips multiHashJoinOp into borrow-on-output mode.
@@ -387,7 +392,7 @@ func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
 // CancelRequest interrupts the probe phase promptly.  Q5 ran 60+
 // minutes without responding to cancel before this check existed.
 // (M0058-0005.)
-func (o *multiHashJoinOp) Next() (TupleSlot, error) {
+func (o *multiHashJoinOp) Next() (Row, error) {
 	if o.ctx != nil && o.ctx.Ctx != nil {
 		if err := o.ctx.Ctx.Err(); err != nil {
 			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
@@ -424,11 +429,10 @@ func (o *multiHashJoinOp) Next() (TupleSlot, error) {
 				continue
 			}
 			o.lazyInit = true
-			// M0069-0001 Stage B: outSlot wraps lazyOut directly.
-			// The legacy borrow flag is now structural — the slot's
-			// row is invalidated by the next Next() call and the
-			// retention consumer must Materialize before stashing.
-			return o.outSlot.set(o.lazyOut), nil
+			if o.borrow == BorrowedRow {
+				return o.lazyOut, nil
+			}
+			return o.copyOut(), nil
 		}
 
 		// Already on a valid combination; advance to the next.
@@ -441,13 +445,16 @@ func (o *multiHashJoinOp) Next() (TupleSlot, error) {
 			o.lazyInit = false
 			continue
 		}
-		return o.outSlot.set(o.lazyOut), nil
+		if o.borrow == BorrowedRow {
+			return o.lazyOut, nil
+		}
+		return o.copyOut(), nil
 	}
 }
 
 // advanceProbe fetches the next probe row and copies it into lazyOut.
 func (o *multiHashJoinOp) advanceProbe() error {
-	probeRow, err := NextRow(o.probeOp)
+	probeRow, err := o.probeOp.Next()
 	if err == EOF {
 		o.lazyProbeEOF = true
 		return nil

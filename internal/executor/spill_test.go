@@ -104,7 +104,7 @@ func TestDrainRowsBoundedSpill(t *testing.T) {
 	result.Open(ctx)
 	var count int
 	for {
-		_, err := NextRow(result)
+		_, err := result.Next()
 		if err == EOF {
 			break
 		}

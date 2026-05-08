@@ -227,7 +227,7 @@ func newUtilityNoOp(p *planner.Utility) *utilityNoOp { return &utilityNoOp{plan:
 
 func (o *utilityNoOp) Schema() planner.Schema { return nil }
 func (o *utilityNoOp) Open(*Context) error    { return nil }
-func (o *utilityNoOp) Next() (TupleSlot, error)     { return nil, EOF }
+func (o *utilityNoOp) Next() (Row, error)     { return nil, EOF }
 func (o *utilityNoOp) Close() error           { return nil }
 
 // Run is a convenience that opens an operator, drains it into a slice
@@ -240,7 +240,7 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 	}
 	var out []Row
 	for {
-		row, err := NextRow(op)
+		row, err := op.Next()
 		if err == EOF {
 			break
 		}
@@ -248,10 +248,7 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 			_ = op.Close()
 			return nil, err
 		}
-		// M0069-0001 Stage B: the slot's row is invalidated by
-		// the next Next() call; clone before retaining across
-		// the subsequent loop iteration.
-		out = append(out, cloneRow(row))
+		out = append(out, row)
 	}
 	if err := op.Close(); err != nil {
 		return nil, err

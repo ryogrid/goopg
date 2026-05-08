@@ -38,7 +38,6 @@ type analyzeOp struct {
 	stmt *parser.AnalyzeStmt
 	done bool
 	ctx  *Context
-	outSlot MaterializedSlot
 }
 
 func newAnalyzeOp(stmt *parser.AnalyzeStmt) *analyzeOp {
@@ -52,7 +51,7 @@ func (o *analyzeOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *analyzeOp) Next() (TupleSlot, error) {
+func (o *analyzeOp) Next() (Row, error) {
 	if o.done {
 		return nil, EOF
 	}
