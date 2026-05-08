@@ -1818,6 +1818,46 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// outer's original Index, inner ColumnRef → ColumnRef at
 	// `outerWidth + originalIndex`. The join evaluates Predicate
 	// against the (outer ++ inner) joined row.
+	//
+	// M0071-0003: the OuterColumnRef rewrite must re-resolve
+	// `x.Index` against the actual outerChild.Output() schema by
+	// Name. The binder set Index against FROM-cumulative offsets
+	// at parse time; bushy / MHJ / NLI rewrites may have
+	// reordered the runtime row layout (cf. M0064 the same
+	// pattern in nl_index_join.go:399). Without this re-resolve,
+	// Q21's residual `l1.l_suppkey` index points at the wrong
+	// outer column → AntiJoin's per-row Predicate evaluates
+	// against an unrelated value → silent over-match (rows = 0
+	// vs canonical ~411).
+	outerSchema := outerChild.Output()
+	resolveOuterIdx := func(name string, fallback int) int {
+		// Disambiguate self-joins (Q21 has lineitem l1, l2, l3):
+		// the binder's offset uses l1.offset; we look up the
+		// matching offset by walking outerSchema's name list and
+		// finding the one whose absolute position matches the
+		// fallback. This preserves multi-binding semantics.
+		if fallback >= 0 && fallback < len(outerSchema) && outerSchema[fallback].Name == name {
+			return fallback
+		}
+		// The schema's positions diverged from FROM-cumulative.
+		// Walk and pick the first column with matching Name —
+		// safe ONLY when the column name is unique in the outer
+		// schema. For ambiguous cases (self-join) keep fallback.
+		first := -1
+		count := 0
+		for i, c := range outerSchema {
+			if c.Name == name {
+				if first < 0 {
+					first = i
+				}
+				count++
+			}
+		}
+		if count == 1 {
+			return first
+		}
+		return fallback
+	}
 	var joinPredicate Expr
 	if len(eup.Residuals) > 0 || len(innerOnlyLifted) > 0 {
 		var rewriteIdx func(Expr) Expr
@@ -1829,7 +1869,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 			case *OuterColumnRef:
 				return &ColumnRef{
 					pos:   x.Pos(),
-					Index: x.Index,
+					Index: resolveOuterIdx(x.Name, x.Index),
 					Name:  x.Name,
 					Type:  x.Type,
 				}
