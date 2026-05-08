@@ -1,6 +1,9 @@
 # Milestone 0069 — Executor Slot Pipeline + GC Follow-Through + Long-Tail Query Fixes
 
-**Status:** planned
+**Status:** accepted (PARTIAL — 3 of 9 sub-milestones landed:
+M0069-0001 Stage A scaffold, M0069-0005 Q20 / Q18 IN-unnest,
+M0069-0007 HasInProgress; remaining 5 deferred to M0070 with
+named successor sub-tasks)
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0068 (commits `aef72b7` / `e9080ac` /
 `d79ebda` / `965c2a0`)
