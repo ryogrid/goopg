@@ -130,6 +130,15 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 				jc.Type = origType
 			}
 		}
+		// M0067-0003 attempt: Q9 composite-NLI hoist. Reverted —
+		// the hoist correctly moves `ps_partkey = l_partkey` from
+		// the outer Filter into the Hash join's Predicate so
+		// composite `partsupp_pk` fires, but the rebind still
+		// surfaces the schema-annotation-vs-runtime-layout
+		// mismatch (Q9 returned 1 row instead of canonical 7,
+		// confirming the rebind picked the wrong runtime slot).
+		// Defer to M0068 once the underlying schema/layout
+		// reconciliation is solved.
 		x.Child = walkRewriteNLI(x.Child, cat)
 		return x
 	case *Project:
