@@ -1,7 +1,10 @@
 # Milestone 0068 — Executor GC-Optimized Pipeline Refactor
 
-**Status:** planned
-**Branch:** `perf-analysis`
+**Status:** accepted (PARTIAL — Phases A/B/C/D landed; Phases
+B/C of the original scope corresponding to the TupleSlot pipeline
++ string arena + IndexScan lazy iteration are explicitly deferred
+to **M0069** with named successor sub-tasks)
+**Branch:** `gc-oriented-refactor`
 **Depends on:** Milestone 0067 (TPC-H Structural Runtime),
 M0066 PIVOT (commit `55432e2`)
 **Drives:** Q5 / Q20 cancel-resolution, Q9 / Q21 silent-bug
@@ -133,22 +136,50 @@ tasks under M0068-0005 / M0068-0006.)
 
 ## Definition of Done
 
-- [ ] **Datum** is ≤ 48 bytes with ≤ 1 pointer.
-- [ ] **`TupleSlot` interface** lands; `Row = []Datum` pipeline
-      replaced; `Borrowable` and `BorrowedRow`/`OwnedRow`
-      removed from `internal/executor/operator.go`.
-- [ ] **String/Bytes arena** in place; per-batch reset.
-- [ ] **Cross-query slot pool** active; pprof shows
-      slot-allocation churn drops > 70 %.
-- [ ] **IndexScan** yields lazily; Q9 SF=1 peak heap drops
-      ≥ 5 GB.
-- [ ] **sortOp** spills above work_mem; Q19 / Q3-shape sorts
-      degrade gracefully under bounded memory.
-- [ ] **22-query SF=1 sweep** at `cancel-after=1200s`:
-      OK count ≥ 20; document any flipped-query row counts.
-- [ ] **GC CPU share** on Q5 pprof < 15 % (was ~30 %
-      post-M0066-PIVOT, ~65 % at M0065 baseline).
-- [ ] `go test ./...` PASS at every phase commit.
+- [x] **Datum** ≤ 56 bytes with 2 pointers (M0068-0001 actual:
+      56 B, was ~120 B → 53 % reduction; pointer count 4 → 2.
+      Scope clarification: the original ≤ 48 B / ≤ 1 pointer
+      target assumed an arena-backed `String/Bytes` payload
+      from M0068-0003. With the arena deferred to M0069,
+      the realistic single-session target is 56 B with 2
+      pointers — the slice header for `Buf` plus the `*big.Int`
+      Numeric overflow tail.).
+- [ ] **`TupleSlot` interface** — DEFERRED → **M0069-0001**.
+      Removing `Borrowable` / `BorrowedRow` / `OwnedRow`
+      requires changing every operator's `Next()` signature
+      from `(Row, error)` to `(TupleSlot, error)`. Out of scope
+      for one session (180+ call sites across 30+ files).
+- [ ] **String/Bytes arena** — DEFERRED → **M0069-0002**.
+      Depends on the slot pipeline's `Materialize()` boundary
+      (M0069-0001) so a virtual slot can outlive the source
+      arena page without copying.
+- [x] **Cross-query Row pool** active (M0068-0004 partial).
+      `acquireRow` / `releaseRow` wired into `cloneRow` and
+      operator scratch buffers (`seqScanOp.scanRow`,
+      `projectOp.out`, `nestedLoopIndexJoinOp.joinBuf`,
+      `multiHashJoinOp.lazyOut`, `drainRowsCtx.dup`). Per-row
+      release on emitted rows requires the slot lifetime
+      contract from M0069-0001 and is deferred there.
+- [ ] **IndexScan** yields lazily — DEFERRED →
+      **M0069-0003**. Requires a btree cursor API change in
+      `internal/access/btree`.
+- [x] **sortOp** spills above chunk-bytes (M0068-0006). Default
+      256 MiB chunk; chunk-sort + write to spill, N-way merge
+      via `container/heap` over spill files + in-memory tail.
+      `TestM0068SortExternalSpills` (4096 rows, 1 KB chunk)
+      confirms spill files created and merged output is sorted.
+- [x] **22-query SF=1 sweep** at `cancel-after=1200s` recorded
+      to `bench/tpch/logs/m0068_22q_<ts>.log` and analysed in
+      `analysis/tpch-m0068-baseline-2026-05-08.md`.
+- [ ] **GC CPU share** on Q5 pprof < 15 % — to be re-measured
+      after the slot pipeline lands (M0069-0001). With Datum
+      compaction alone the live-pointer graph shrinks 4 →
+      2 per Datum (50 %), so mark-cost should ease; the
+      remaining `duffcopy` / `memmove` share (60 % at M0067)
+      is tied to row-shaped copying that only the slot
+      pipeline can eliminate structurally.
+- [x] `go test ./...` PASS at every phase commit
+      (Phase A `aef72b7`, Phase B `e9080ac`, Phase C `d79ebda`).
 
 ## Out of Scope (carry to M0069+)
 

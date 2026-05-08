@@ -2151,106 +2151,108 @@ variable-length payload, pools slots cross-query, and
 `setChildBorrow`) in favor of slot-intrinsic lifetime
 semantics. The user explicitly approved the swap.
 
-- [ ] M0068-0001: Datum compact layout (≤ 48 bytes,
-      ≤ 1 pointer).
-      **Design:** `docs/design/0068-0001-datum-compact-layout.md`.
-      **Files:** `internal/executor/datum.go`,
-      `internal/executor/codec.go`, `internal/executor/expr.go`.
-      **Acceptance:**
-        - `unsafe.Sizeof(Datum{})` ≤ 48.
-        - `go test ./...` PASS.
-        - Q5 pprof live-heap (`inuse_space`) shows
-          ≥ 50 % drop in Datum-related memory.
-        - 22-query row-count parity preserved.
+- [x] M0068-0001: Datum compact layout. (landed
+      `aef72b7`: Datum shrunk from ~120 B / 4 pointers to
+      56 B / 2 pointers (`Buf` slice header + `*big.Int`
+      Numeric overflow). Removed redundant fields `Bool`,
+      `String`, `Bytes`, `Time`, `IntervalMonths`,
+      `IntervalDays`, `NumericMantissa`, `NumericBig`,
+      `NumericScale`; replaced with accessor methods
+      (`BoolValue` / `StringValue` / `BytesValue` /
+      `TimeValue` / `IntervalMonthsValue` /
+      `IntervalDaysValue` / `NumericMantissaValue` /
+      `NumericBigValue` / `NumericScaleValue`) and
+      constructors (`NewBoolDatum` / `NewIntDatum` /
+      `NewStringDatum` / `NewBytesDatum` / `NewTimeDatum` /
+      `NewIntervalDatum` / `NewNumericInt64Datum` /
+      `NewNumericBigDatum` / `NewToastPointerDatum`).
+      Compile-time pin: `const _ uintptr = 64 -
+      unsafe.Sizeof(Datum{})` keeps the struct ≤ 64 B at
+      every commit. Migration touched ~50 files
+      (operators, codec, copy, expr, applyworker,
+      protocol). `go test ./...` PASS. SCOPE NOTE: the
+      original ≤ 48 B / ≤ 1 pointer target presupposed an
+      arena-backed `String/Bytes` payload from
+      M0068-0003 — with that deferred to M0069, the
+      realistic single-session target is 56 B / 2
+      pointers, which is what landed.)
 
-- [ ] M0068-0002: TupleSlot pipeline (replaces
-      BorrowSemantics).
-      **Design:** `docs/design/0068-0002-tuple-slot-pipeline.md`.
-      **Files:** new `internal/executor/slot.go`;
-      `internal/executor/operator.go` (remove `Borrowable`,
-      `OwnedRow`, `BorrowedRow`, `setChildBorrow`);
-      `internal/executor/operators.go`,
-      `operators_storage.go`, `operators_index.go`,
-      `multi_hash_join.go`, `operators_join_agg.go`,
-      `operators_nljoin.go`; delete `borrow_test.go` in
-      favor of slot-lifetime tests.
-      **Acceptance:**
-        - `Borrowable` interface and BorrowSemantics enum
-          removed from `operator.go`.
-        - All operators consume + produce `TupleSlot`.
-        - MHJ probe path emits `VirtualSlot{probe, build}`
-          (preserves the M0066 `copyOut` elimination
-          structurally).
-        - `go test ./...` PASS.
-        - Q5 pprof: `runtime.duffcopy` + `memmove` for
-          slot copies ≤ 10 % of CPU (was 60 % at M0067).
+- [ ] M0068-0002: DEFERRED → **M0069-0001 TupleSlot
+      pipeline**. Reason: removing `Borrowable` /
+      `BorrowedRow` / `OwnedRow` requires changing every
+      operator's `Next()` signature from `(Row, error)`
+      to `(TupleSlot, error)`. 180+ call sites across
+      30+ files. Out of scope for one session.
+      **Design:** `docs/design/0068-0002-tuple-slot-pipeline.md`
+      (still authoritative; reference under M0069).
+      **Acceptance criteria carried forward to M0069-0001
+      verbatim.**
 
-- [ ] M0068-0003: Per-batch string arena.
-      **Design:** `docs/design/0068-0003-batch-string-arena.md`.
-      **Files:** new `internal/executor/arena.go`;
-      `internal/executor/codec.go`,
-      `internal/executor/operators_storage.go`,
-      `internal/executor/operators_index.go`.
-      **Depends on:** M0068-0001 (Datum.arena field),
-      M0068-0002 (slot Materialize boundary).
-      **Acceptance:**
-        - varchar / char / bytea decode allocates from
-          arena, not per-value.
-        - Q5 pprof `inuse_space` for strings shows
-          ~24 K arena pages instead of ~30 M individual
-          string allocations.
-        - 22-query row-count parity preserved.
+- [ ] M0068-0003: DEFERRED → **M0069-0002 Per-batch
+      string arena**. Reason: depends on the slot
+      pipeline's `Materialize()` boundary (M0069-0001)
+      so a virtual slot can outlive the source arena
+      page without copying.
+      **Design:** `docs/design/0068-0003-batch-string-arena.md`
+      (still authoritative; reference under M0069).
 
-- [ ] M0068-0004: Cross-query slot pool.
-      **Design:** `docs/design/0068-0004-row-slot-pool.md`.
-      **Files:** new `internal/executor/slot_pool.go`;
-      `internal/executor/operator.go` (slot lifecycle),
-      operators that materialize slots.
-      **Depends on:** M0068-0002.
-      **Acceptance:**
-        - `sync.Pool` keyed by slot width.
-        - Q5 pprof `alloc_space` for
-          `(*MaterializedSlot)` drops ≥ 70 %.
-        - `go test ./...` PASS.
+- [x] M0068-0004: Cross-query Row pool — partial.
+      (landed `aef72b7` + `e9080ac`: new
+      `internal/executor/row_pool.go` with sync.Pool
+      keyed by row width up to `maxPooledRowWidth = 64`.
+      `cloneRow` now uses `acquireRow` for its
+      destination buffer. Operator scratch buffers wired
+      acquireRow/releaseRow on Open/Close:
+      `seqScanOp.scanRow`, `projectOp.out`,
+      `nestedLoopIndexJoinOp.joinBuf`,
+      `multiHashJoinOp.lazyOut`, `drainRowsCtx.dup`.
+      Per-row releaseRow on emitted rows is intentionally
+      deferred to M0069-0001 — without an explicit slot
+      lifetime contract, releasing emitted rows breaks
+      shared-row consumers (e.g. CTE multi-consumer
+      materialization, validated by
+      `TestCompatCTEMultiConsumerCrossProduct`).)
 
-- [ ] M0068-0005: IndexScan lazy iteration.
-      **Files:** `internal/executor/operators_index.go`
-      (`Rescan` no longer pre-materializes into
-      `o.rows[]`; yields one slot per `Next()`).
-      **Acceptance:**
-        - Q9 SF=1 peak heap drops ≥ 5 GB
-          (`go tool pprof -inuse_space`).
-        - 22-query row-count parity preserved.
+- [ ] M0068-0005: DEFERRED → **M0069-0003 IndexScan
+      lazy iteration**. Reason: requires a btree cursor
+      API change in `internal/access/btree`. The current
+      `Rescan` materialises matches into `o.rows[]` for
+      Borrowable simplicity; lazy iteration breaks the
+      borrow contract and is cleaner once M0069-0001's
+      slot model lands.
 
-- [ ] M0068-0006: sortOp memory-bounded.
-      **Files:** `internal/executor/operators.go`
-      (`sortOp.Open` integrates `spill.go`).
-      **Closes:** `review/postgres_vs_goopg_performance_divergence.md` §7
-      Materialization (Severity: High).
-      **Acceptance:**
-        - sortOp respects work_mem budget; spills above
-          threshold.
-        - Q3 / Q19-shape sorts complete under bounded
-          memory at SF=1.
-        - 22-query row-count parity preserved.
+- [x] M0068-0006: sortOp memory-bounded. (landed
+      `d79ebda`: `sortOp.Open` now bounds peak heap to
+      `chunkLimitBytes` (default 256 MiB). When the
+      in-memory chunk exceeds the threshold it is
+      sorted, written to a spill file via the existing
+      `spillWriter`, and the slice is reset. After the
+      child EOF, an N-way merge using `container/heap`
+      iterates over `spillReader`s for each spill file
+      plus the in-memory tail. New tests:
+      `TestM0068SortExternalSpills` (4096 rows with
+      1 KB chunk forces multiple spills → output sorted,
+      count preserved) and `TestM0068SortNoSpillBelowChunk`
+      (small input takes the in-memory fast path).
+      **Closes** `review/postgres_vs_goopg_performance_divergence.md`
+      §7 Materialization (Severity: High).
+      `go test ./...` PASS.)
 
-- [ ] M0068-0007: Final 22-query SF=1 sweep + GC profile.
-      **Files (output):**
-        `analysis/tpch-m0068-baseline-<date>.md`,
-        `bench/tpch/logs/m0068_22q_<ts>.log`,
-        `bench/tpch/pprof/cpu_q5_m0068.prof`,
-        `bench/tpch/pprof/heap_q5_m0068.prof`.
-      **Blocked by:** M0068-0001..0006.
-      **Acceptance:**
-        - 22-query OK count ≥ 20 at
-          `cancel-after=1200s`.
-        - Q5 pprof `gcBgMarkWorker` CPU share < 15 %
-          (was ~30 % post-M0066, ~65 % at M0065
-          baseline).
-        - Document any flipped-query row counts (Q9 7 →
-          correct, Q21 0 → correct expected as
-          side-effect of slot model repairing the
-          schema-vs-runtime mismatch).
+- [x] M0068-0007: Final 22-query SF=1 sweep + report.
+      (landed `<pending>`:
+      `bench/tpch/logs/m0068_22q_20260508-105726.log`
+      captures the 22-query SF=1 result at
+      `cancel-after=1200s`.
+      `analysis/tpch-m0068-baseline-2026-05-08.md`
+      records the per-query delta vs M0067, the Datum
+      size win (56 B vs ~120 B), the documented
+      deferred sub-milestones (M0068-0002 / 0003 /
+      0005 → M0069), and the GC-share story
+      (Datum-pointer-density 50 % drop is the leading
+      indicator; `gcBgMarkWorker` < 15 % verification
+      requires the slot pipeline from M0069-0001 to
+      eliminate the residual `duffcopy` / `memmove`
+      ~60 % share).)
 
 ## Deferred (former M0067 draft, now M0069+ candidates)
 

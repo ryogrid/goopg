@@ -1,0 +1,24 @@
+Q1: OK elapsed=46.31s rows=4
+Q2: OK elapsed=9.44s rows=470
+Q3: OK elapsed=37.68s rows=11462
+Q4: OK elapsed=175.07s rows=5
+Q5: ERROR after 1200.01s — pq: canceling statement due to user request (57014)
+Q6: OK elapsed=33.02s rows=1
+Q7: OK elapsed=36.76s rows=4
+Q8: OK elapsed=188.96s rows=2
+Q9: OK elapsed=220.74s rows=7
+Q10: OK elapsed=35.08s rows=20574
+Q11: OK elapsed=3.03s rows=1142
+Q12: OK elapsed=90.46s rows=2
+Q13: OK elapsed=61.42s rows=35
+Q14: OK elapsed=35.17s rows=1
+Q15-CREATEVIEW: OK elapsed=0.00s rows=0
+Q15a-VIEWBODY: OK elapsed=27.22s rows=10000
+Q15b-MAIN: OK elapsed=56.04s rows=1
+Q16: OK elapsed=6.56s rows=18170
+Q17: OK elapsed=70.13s rows=1
+Q18: OK elapsed=91.26s rows=11
+Q19: OK elapsed=63.98s rows=1
+Q20: ERROR after 1200.00s — pq: canceling statement due to user request (57014)
+Q21: OK elapsed=387.76s rows=0
+Q22: OK elapsed=61.00s rows=7

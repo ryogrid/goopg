@@ -133,14 +133,21 @@ overhead and live-heap pointer density. M0066 PIVOT eliminated 99.23 %
 of Q5's allocations (`multiHashJoinOp.copyOut`, 2.02 TB on a 60 s pprof
 window) and removed `time.Parse` from hot loops; Q5 / Q20 still cancel
 at `cancel-after=1200s` because residual cost is **memory-copy bound**
-(`runtime.duffcopy` + `memclr` ≈ 60 % of CPU). M0068 replaces
-`Row = []Datum` with a PostgreSQL-style `TupleSlot` polymorphism
-(Materialized / Virtual / BatchRef), shrinks `Datum` from ~120 to
-≤ 48 bytes, introduces a per-batch byte arena for variable-length
-payload, and pools slots across queries via `sync.Pool`. The
-`BorrowSemantics` row-level contract introduced in M0054-0005a /
-M0059 is **removed** in favor of slot-intrinsic lifetime semantics.
-See `docs/milestones/0068-executor-gc-pipeline-refactor.md` and the
-four design docs `docs/design/0068-000{1..4}-*.md` for the detailed
-plan; sources: `practice/go_gc_optimized_programming.md` and
-`review/postgres_vs_goopg_performance_divergence.md` §1.
+(`runtime.duffcopy` + `memclr` ≈ 60 % of CPU). M0068 status (PARTIAL;
+landed on `gc-oriented-refactor`):
+
+- **Datum compact layout (M0068-0001)** — Datum shrunk from ~120 B /
+  4 pointers to **56 B / 2 pointers** (commit `aef72b7`).
+- **Row pool (M0068-0004, partial)** — `sync.Pool` keyed by row width
+  via `internal/executor/row_pool.go`; wired into `cloneRow` and
+  operator scratch buffers (commit `e9080ac`).
+- **sortOp memory-bounded (M0068-0006)** — chunked external sort with
+  spill files + N-way merge over `container/heap` (commit `d79ebda`).
+
+The TupleSlot pipeline (replaces `BorrowSemantics`), per-batch string
+arena, and IndexScan lazy iteration are **deferred to M0069**
+(`M0069-0001` / `0002` / `0003`) — they require changing every
+operator's `Next()` signature, which is out of scope for one session.
+See `docs/milestones/0068-executor-gc-pipeline-refactor.md`,
+`analysis/tpch-m0068-baseline-2026-05-08.md`, and the four design docs
+`docs/design/0068-000{1..4}-*.md` for the detailed plan.
