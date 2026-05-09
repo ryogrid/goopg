@@ -48,27 +48,25 @@ type multiHashJoinOp struct {
 	// Lazy iterator state. Per-step cursor arrays are
 	// len(keySteps); the outer loop advances from the last step
 	// backwards (like an odometer).
-	lazyOut      Row     // current shared output buffer (reused across Next calls)
 	lazyMatches  [][]Row // lazyMatches[i] = hash-table matches for step i given the current prefix
 	lazyCursors  []int   // lazyCursors[i] = index into lazyMatches[i]
 	lazyInit     bool    // true once a probe row has yielded a valid leaf
 	lazyProbeEOF bool    // true once probeOp is exhausted
 
-	// M0066-0002: borrow contract. When set to BorrowedRow, Next()
-	// returns o.lazyOut directly without `copyOut()` — the parent
-	// has promised to consume the row before pulling the next one.
-	// Default OwnedRow.
+	// M0071-0014 Stage D-2: VirtualSlot composition replaces the
+	// per-Next lazyOut concat. tableSlots[i] is a persistent
+	// MaterializedSlot per joined table whose .row field is
+	// overwritten in place — probe slot per advanceProbe, build
+	// slots per match step. virtualOut composes them in OID-sorted
+	// output order via tableOff[]. Predicate / filter evaluation
+	// reads virtualOut.Get(col) — zero allocation per match.
 	//
-	// Q5's pprof at SF=1 showed `copyOut` accounted for 99.23% of
-	// allocations (2.02 TB total in 600s). Eliminating that copy
-	// when the parent supports BorrowedRow (filterOp, aggregateOp's
-	// drain loop) is the dominant win for GC pressure.
-	borrow BorrowSemantics
+	// Q5's pprof at SF=1 previously showed copyOut accounted for
+	// 99.23% of allocations (2.02 TB total in 600s); virtualOut
+	// eliminates that copy entirely.
+	tableSlots []*MaterializedSlot
+	virtualOut *VirtualSlot
 }
-
-// SetBorrow flips multiHashJoinOp into borrow-on-output mode.
-// (M0066-0002.)
-func (o *multiHashJoinOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 // keyStep describes one chain-lookup: take the value at the
 // srcTable's srcCol from the accumulated output row and use it as
@@ -263,8 +261,33 @@ func (o *multiHashJoinOp) Open(ctx *Context) error {
 	// Allocate per-step cursor state.
 	o.lazyMatches = make([][]Row, len(o.keySteps))
 	o.lazyCursors = make([]int, len(o.keySteps))
-	// Allocate the shared output buffer.
-	o.lazyOut = acquireRow(acc)
+
+	// M0071-0014 Stage D-2: persistent slot composition replacing
+	// the old o.lazyOut Row. Each table gets its own
+	// MaterializedSlot whose .row is overwritten in place — probe
+	// per advanceProbe, builds per match step. virtualOut sources
+	// these in OID-sorted output order via tableOff[] / per-table
+	// width.
+	o.tableSlots = make([]*MaterializedSlot, nTables)
+	for i := 0; i < nTables; i++ {
+		o.tableSlots[i] = SlotFromRow(nil, o.nulls[i])
+	}
+	sources := make([]TupleSlot, nTables)
+	for i := 0; i < nTables; i++ {
+		sources[i] = o.tableSlots[i]
+	}
+	cols := make([]virtualCol, acc)
+	for tIdx := 0; tIdx < nTables; tIdx++ {
+		width := len(o.nulls[tIdx])
+		off := o.tableOff[tIdx]
+		for col := 0; col < width; col++ {
+			cols[off+col] = virtualCol{
+				sourceIdx: int16(tIdx),
+				sourceCol: int16(col),
+			}
+		}
+	}
+	o.virtualOut = NewVirtualSlot(o.schema, sources, cols)
 	return nil
 }
 
@@ -429,10 +452,7 @@ func (o *multiHashJoinOp) Next() (TupleSlot, error) {
 				continue
 			}
 			o.lazyInit = true
-			if o.borrow == BorrowedRow {
-				return asSlot(o.Schema(), o.lazyOut), nil
-			}
-			return asSlot(o.Schema(), o.copyOut()), nil
+			return o.virtualOut, nil
 		}
 
 		// Already on a valid combination; advance to the next.
@@ -445,14 +465,16 @@ func (o *multiHashJoinOp) Next() (TupleSlot, error) {
 			o.lazyInit = false
 			continue
 		}
-		if o.borrow == BorrowedRow {
-			return asSlot(o.Schema(), o.lazyOut), nil
-		}
-		return asSlot(o.Schema(), o.copyOut()), nil
+		return o.virtualOut, nil
 	}
 }
 
-// advanceProbe fetches the next probe row and copies it into lazyOut.
+// advanceProbe fetches the next probe row and binds it into the
+// probe table's slot. Other tables' slots are reset to their
+// per-table null padding so a subsequent step's match either
+// overwrites that slot's row or leaves it as null padding (the
+// initStepHelper / advanceFrom paths always overwrite before
+// emit, so the reset is defensive).
 func (o *multiHashJoinOp) advanceProbe() error {
 	probeSlot, err := o.probeOp.Next()
 	if err == EOF {
@@ -463,12 +485,11 @@ func (o *multiHashJoinOp) advanceProbe() error {
 		return err
 	}
 	probeRow := slotRow(probeSlot)
-	// Reset lazyOut to nulls, then overlay the probe row.
 	nTables := len(o.plan.Tables)
 	for i := 0; i < nTables; i++ {
-		copy(o.lazyOut[o.tableOff[i]:], o.nulls[i])
+		o.tableSlots[i].row = o.nulls[i]
 	}
-	copy(o.lazyOut[o.tableOff[o.plan.ProbeTable]:], probeRow)
+	o.tableSlots[o.plan.ProbeTable].row = probeRow
 	return nil
 }
 
@@ -484,12 +505,13 @@ func (o *multiHashJoinOp) initStepHelper(s int) (bool, error) {
 		return o.evalFilters(o.leafFilters)
 	}
 	step := o.keySteps[s]
-	srcOff := o.tableOff[step.srcTable]
 	srcLen := len(o.nulls[step.srcTable])
 	if step.srcCol >= srcLen {
 		return false, nil
 	}
-	keyVal := o.lazyOut[srcOff+step.srcCol]
+	// Read the lookup key directly from the source table's slot
+	// (the chain-level prefix of bound rows lives in tableSlots).
+	keyVal := o.tableSlots[step.srcTable].Get(step.srcCol)
 	// M0043-0003: zero-allocation probe for int64-keyed hash tables.
 	var matches []Row
 	if o.hashTblIsInt[step.hashTblIndex] {
@@ -504,7 +526,6 @@ func (o *multiHashJoinOp) initStepHelper(s int) (bool, error) {
 		return false, nil
 	}
 	o.lazyMatches[s] = matches
-	dstOff := o.tableOff[step.hashTblIndex]
 	stepFs := o.stepFilters[s]
 	for c := 0; c < len(matches); c++ {
 		// M0062-0001: ctx check inside the per-match loop.
@@ -518,7 +539,7 @@ func (o *multiHashJoinOp) initStepHelper(s int) (bool, error) {
 				return false, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		copy(o.lazyOut[dstOff:], matches[c])
+		o.tableSlots[step.hashTblIndex].row = matches[c]
 		o.lazyCursors[s] = c
 		// Evaluate filters whose deepest table is this step.
 		// If any reject, skip this match without descending.
@@ -550,7 +571,6 @@ func (o *multiHashJoinOp) advanceFrom(s int) (bool, error) {
 		return false, nil
 	}
 	step := o.keySteps[s]
-	dstOff := o.tableOff[step.hashTblIndex]
 	matches := o.lazyMatches[s]
 	stepFs := o.stepFilters[s]
 	for {
@@ -571,7 +591,7 @@ func (o *multiHashJoinOp) advanceFrom(s int) (bool, error) {
 			// don't need to manually reset cursor[s] here.
 			return o.advanceFrom(s - 1)
 		}
-		copy(o.lazyOut[dstOff:], matches[o.lazyCursors[s]])
+		o.tableSlots[step.hashTblIndex].row = matches[o.lazyCursors[s]]
 		// Re-evaluate this step's filters with the new match.
 		if ok, err := o.evalFilters(stepFs); err != nil {
 			return false, err
@@ -591,11 +611,12 @@ func (o *multiHashJoinOp) advanceFrom(s int) (bool, error) {
 }
 
 // evalFilters returns true iff every filter in `fs` evaluates to
-// boolean-true on the current lazyOut. NULL or non-bool results
-// reject the row, matching the M0043-0001 leaf-eval semantics.
+// boolean-true on the current virtualOut composition. NULL or
+// non-bool results reject the row, matching the M0043-0001
+// leaf-eval semantics.
 func (o *multiHashJoinOp) evalFilters(fs []planner.Expr) (bool, error) {
 	for _, f := range fs {
-		v, err := evalExpr(f, o.lazyOut, o.ctx)
+		v, err := evalExprSlot(f, o.virtualOut, o.ctx)
 		if err != nil {
 			return false, err
 		}
@@ -606,24 +627,14 @@ func (o *multiHashJoinOp) evalFilters(fs []planner.Expr) (bool, error) {
 	return true, nil
 }
 
-// copyOut returns a fresh copy of lazyOut so callers can hold a
-// reference across subsequent Next() calls.
-func (o *multiHashJoinOp) copyOut() Row {
-	row := make(Row, len(o.lazyOut))
-	copy(row, o.lazyOut)
-	return row
-}
-
 func (o *multiHashJoinOp) Close() error {
 	o.hashTbls = nil
 	o.intHashTbls = nil
 	o.hashTblIsInt = nil
 	o.nulls = nil
 	o.keySteps = nil
-	if o.lazyOut != nil {
-		releaseRow(o.lazyOut)
-		o.lazyOut = nil
-	}
+	o.tableSlots = nil
+	o.virtualOut = nil
 	o.lazyMatches = nil
 	o.lazyCursors = nil
 	o.probeFilters = nil

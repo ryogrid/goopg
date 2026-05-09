@@ -24,14 +24,14 @@ type joinOp struct {
 	idx  int
 
 	// M0036 lazy-output state (hash join only)
-	lazyHash    map[string][]Row // build-side hash table
-	lazyProbe   Operator         // probe side (streaming)
-	lazyRow     Row              // current probe row
-	lazyMatches []Row            // matches for current probe row (borrowed from lazyHash)
+	lazyHash     map[string][]Row // build-side hash table
+	lazyProbe    Operator         // probe side (streaming)
+	lazyRow      Row              // current probe row
+	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
-	lazyActive  bool // true between probeRow and last match
-	lazyLW      int  // left schema width
-	lazyRW      int  // right schema width
+	lazyActive   bool // true between probeRow and last match
+	lazyLW       int  // left schema width
+	lazyRW       int  // right schema width
 
 	// M0054-0005b: per-Open() reusable buffers for nullRow / hash
 	// key evaluation. The pre-fix path called `nullRow(width)` and
@@ -41,6 +41,21 @@ type joinOp struct {
 	lazyNullLeft  Row
 	lazyNullRight Row
 	lazyKeyRow    Row
+
+	// M0071-0014 Stage D-2: VirtualSlot composition replaces the
+	// nextLazy concatRows allocations. lazyBuildSlot's .row holds
+	// the matched build row (for INNER / LEFT-no-match-fallback);
+	// lazyProbeSlot's .row holds the current probe row;
+	// lazyVirtualOut composes them in plan.Output() order
+	// (BuildLeft swaps the source order). lazyOuterOnlySlot is the
+	// emit slot for Semi / Anti, which return the probe row alone.
+	// Allocated lazily on first nextLazy invocation (Open path is
+	// shared with non-hash joinOp algorithms which don't need the
+	// virtual composition).
+	lazyBuildSlot     *MaterializedSlot
+	lazyProbeSlot     *MaterializedSlot
+	lazyVirtualOut    *VirtualSlot
+	lazyOuterOnlySlot *MaterializedSlot
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -464,6 +479,61 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
 }
 
+// joinPredicateMatchSlot evaluates plan.Predicate against a slot
+// (typically o.lazyVirtualOut). Caller must update the source-slot
+// .row fields before invocation.
+func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
+	if o.plan.Predicate == nil {
+		return true, nil
+	}
+	v, err := evalExprSlot(o.plan.Predicate, slot, o.ctx)
+	if err != nil {
+		return false, err
+	}
+	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
+}
+
+// ensureLazyVirtual lazily builds the persistent VirtualSlot used
+// by nextLazy to emit joined rows without per-match concat. Source
+// order depends on BuildLeft so plan.Output()'s left++right column
+// layout is preserved.
+func (o *joinOp) ensureLazyVirtual() {
+	if o.lazyVirtualOut != nil {
+		return
+	}
+	leftSchema := o.left.Schema()
+	rightSchema := o.right.Schema()
+	o.lazyBuildSlot = SlotFromRow(nil, nil)
+	o.lazyProbeSlot = SlotFromRow(nil, nil)
+	o.lazyOuterOnlySlot = SlotFromRow(o.schema, nil)
+	cols := make([]virtualCol, 0, o.lazyLW+o.lazyRW)
+	if o.plan.BuildLeft {
+		// Output is left ++ right; build side is left → sources
+		// [build, probe], cols (0,*) ++ (1,*).
+		_ = leftSchema
+		_ = rightSchema
+		for i := 0; i < o.lazyLW; i++ {
+			cols = append(cols, virtualCol{sourceIdx: 0, sourceCol: int16(i)})
+		}
+		for i := 0; i < o.lazyRW; i++ {
+			cols = append(cols, virtualCol{sourceIdx: 1, sourceCol: int16(i)})
+		}
+		o.lazyVirtualOut = NewVirtualSlot(o.schema,
+			[]TupleSlot{o.lazyBuildSlot, o.lazyProbeSlot}, cols)
+		return
+	}
+	// !BuildLeft: probe is left, build is right → sources
+	// [probe, build].
+	for i := 0; i < o.lazyLW; i++ {
+		cols = append(cols, virtualCol{sourceIdx: 0, sourceCol: int16(i)})
+	}
+	for i := 0; i < o.lazyRW; i++ {
+		cols = append(cols, virtualCol{sourceIdx: 1, sourceCol: int16(i)})
+	}
+	o.lazyVirtualOut = NewVirtualSlot(o.schema,
+		[]TupleSlot{o.lazyProbeSlot, o.lazyBuildSlot}, cols)
+}
+
 func (o *joinOp) Next() (TupleSlot, error) {
 	// M0036 lazy output: yield joined rows on demand.
 	if o.lazyProbe != nil {
@@ -478,6 +548,13 @@ func (o *joinOp) Next() (TupleSlot, error) {
 }
 
 // nextLazy yields one joined row at a time for lazy hash joins.
+//
+// M0071-0014 Stage D-2: per-match concatRows is replaced by
+// VirtualSlot composition. lazyBuildSlot.row / lazyProbeSlot.row
+// are overwritten in place; predicate eval reads via
+// joinPredicateMatchSlot. The plan-emit Schema is preserved by
+// the cols mapping in ensureLazyVirtual (BuildLeft swaps source
+// order).
 func (o *joinOp) nextLazy() (TupleSlot, error) {
 	// M0054-0005b: reuse the operator's per-Open null padding rows
 	// instead of allocating per call.
@@ -489,6 +566,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 	}
 	nullLeft := o.lazyNullLeft
 	nullRight := o.lazyNullRight
+	o.ensureLazyVirtual()
 	// Cancellation: cheap ctx check per Next() call so a long
 	// probe-only join responds promptly to CancelRequest.
 	// (M0058-0005.)
@@ -508,20 +586,16 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		for o.lazyActive && o.lazyMatchIdx < len(o.lazyMatches) {
 			m := o.lazyMatches[o.lazyMatchIdx]
 			o.lazyMatchIdx++
-			var joined Row
-			if o.plan.BuildLeft {
-				joined = concatRows(m, o.lazyRow)
-			} else {
-				joined = concatRows(o.lazyRow, m)
-			}
-			ok, err := o.joinPredicateMatch(joined)
+			o.lazyBuildSlot.row = m
+			o.lazyProbeSlot.row = o.lazyRow
+			ok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
 				continue
 			}
-			return asSlot(o.Schema(), joined), nil
+			return o.lazyVirtualOut, nil
 		}
 		o.lazyActive = false
 		// Pull next probe row.
@@ -578,18 +652,16 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// canonical ~411.
 		//
 		// Walk matches and apply Predicate; treat a "match" as
-		// hash match AND Predicate=TRUE.
+		// hash match AND Predicate=TRUE. The slot composition
+		// already covers both Semi/Anti and INNER predicate eval
+		// — re-bind the build slot per candidate match.
 		if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
 			anyMatch := false
 			if ok && len(matches) > 0 {
+				o.lazyProbeSlot.row = r
 				for _, m := range matches {
-					var joined Row
-					if o.plan.BuildLeft {
-						joined = concatRows(m, r)
-					} else {
-						joined = concatRows(r, m)
-					}
-					pok, err := o.joinPredicateMatch(joined)
+					o.lazyBuildSlot.row = m
+					pok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
 					if err != nil {
 						return nil, err
 					}
@@ -604,20 +676,26 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 					continue
 				}
 				o.lazyRow = nil
-				return asSlot(o.Schema(), r), nil
+				o.lazyOuterOnlySlot.row = r
+				return o.lazyOuterOnlySlot, nil
 			}
 			// Anti: keep iff no match passed the predicate.
 			if anyMatch {
 				continue
 			}
 			o.lazyRow = nil
-			return asSlot(o.Schema(), r), nil
+			o.lazyOuterOnlySlot.row = r
+			return o.lazyOuterOnlySlot, nil
 		}
 		if len(matches) == 0 {
 			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
-				// LEFT JOIN: preserve unmatched left rows.
+				// LEFT JOIN: preserve unmatched left rows. Bind
+				// build slot to nullRight padding; virtualOut
+				// already composes [probe, build] for !BuildLeft.
 				o.lazyRow = nil
-				return asSlot(o.Schema(), concatRows(r, nullRight)), nil
+				o.lazyProbeSlot.row = r
+				o.lazyBuildSlot.row = nullRight
+				return o.lazyVirtualOut, nil
 			}
 			// No matches, not LEFT — skip this probe row.
 			continue
