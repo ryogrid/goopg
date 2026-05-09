@@ -561,15 +561,50 @@ func (o *joinOp) nextLazy() (Row, error) {
 		//   - Semi: skip the probe row (no match).
 		//   - Anti: keep the probe row (matches PostgreSQL
 		//     `NOT EXISTS` semantics — equality cannot be true).
-		if o.plan.Type == planner.JoinTypeSemi {
-			if len(matches) == 0 {
-				continue
+		//
+		// M0071-0009: hash matches are necessary but not
+		// sufficient — the planner may have lifted residual
+		// non-equi conjuncts (e.g. Q21's
+		// `l3.l_suppkey <> l1.l_suppkey`) onto the join Predicate
+		// via unnestExistsExpr's M0062-0005 residual lift. Without
+		// re-evaluating the Predicate per match, Anti silently
+		// over-excludes (every l1 self-matches a late l3 hash
+		// entry where l3=l1, so the residual is essential to
+		// distinguish self-match from a different-supplier
+		// match). This was Q21's silent-FN root cause: 0 rows vs
+		// canonical ~411.
+		//
+		// Walk matches and apply Predicate; treat a "match" as
+		// hash match AND Predicate=TRUE.
+		if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+			anyMatch := false
+			if ok && len(matches) > 0 {
+				for _, m := range matches {
+					var joined Row
+					if o.plan.BuildLeft {
+						joined = concatRows(m, r)
+					} else {
+						joined = concatRows(r, m)
+					}
+					pok, err := o.joinPredicateMatch(joined)
+					if err != nil {
+						return nil, err
+					}
+					if pok {
+						anyMatch = true
+						break
+					}
+				}
 			}
-			o.lazyRow = nil
-			return r, nil
-		}
-		if o.plan.Type == planner.JoinTypeAnti {
-			if len(matches) > 0 {
+			if o.plan.Type == planner.JoinTypeSemi {
+				if !anyMatch {
+					continue
+				}
+				o.lazyRow = nil
+				return r, nil
+			}
+			// Anti: keep iff no match passed the predicate.
+			if anyMatch {
 				continue
 			}
 			o.lazyRow = nil

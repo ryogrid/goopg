@@ -157,12 +157,34 @@ type rangeBinding struct {
 	// `<target>.col` accidentally match the excluded side.
 	// Mirrors the analyzer's scopeRel.qualifiedOnly.
 	qualifiedOnly bool
+	// sourceIdx is a per-FROM-clause monotonic identifier
+	// (M0071-0009) propagated into SchemaColumn.SourceTableIdx
+	// for every column produced by this binding. Distinct values
+	// for self-join siblings (Q21's lineitem l1/l2/l3) make the
+	// (Name, SourceTableIdx) pair unique even when Name alone
+	// collides. Counter starts at 1; zero means "no identity
+	// assigned" (CTE / subquery-only / ON CONFLICT excluded) and
+	// falls back to Name-only matching in downstream rebinds.
+	sourceIdx int16
 }
 
 func tableSchema(t *catalog.Table) Schema {
+	// Legacy callers that don't track source identity get 0 in
+	// the SchemaColumn.SourceTableIdx slot, which downstream
+	// rebind helpers treat as "unknown" and fall back to
+	// Name-only matching.
+	return tableSchemaWithSource(t, 0)
+}
+
+// tableSchemaWithSource (M0071-0009) is tableSchema's variant
+// that stamps each produced SchemaColumn with the given
+// SourceTableIdx. Callers building rangeBindings thread their
+// per-FROM monotonic source identifier in here; legacy callers
+// that don't track source identity (-1) keep Name-only behavior.
+func tableSchemaWithSource(t *catalog.Table, sourceIdx int16) Schema {
 	out := make(Schema, len(t.Columns))
 	for i, c := range t.Columns {
-		out[i] = SchemaColumn{Name: c.Name, Type: c.Type}
+		out[i] = SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx}
 	}
 	return out
 }
@@ -177,8 +199,12 @@ func newResolveContext(bindings []rangeBinding, schema Schema) *resolveContext {
 }
 
 func singleBindingContext(table *catalog.Table, alias string) *resolveContext {
-	b := rangeBinding{table: table, alias: alias, offset: 0}
-	return newResolveContext([]rangeBinding{b}, tableSchema(table))
+	// Single-binding scope (INSERT/UPDATE/DELETE/COPY targets,
+	// view substitution helpers): SourceTableIdx 1 because the
+	// scope only ever has one binding and disambiguation isn't
+	// needed; 0 stays reserved for "unknown / derived".
+	b := rangeBinding{table: table, alias: alias, offset: 0, sourceIdx: 1}
+	return newResolveContext([]rangeBinding{b}, tableSchemaWithSource(table, 1))
 }
 
 func appendSchema(left, right Schema) Schema {
@@ -257,13 +283,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		rv := s.From[0]
 		// Delegate the simple-single-table case to
 		// planScanRangeVar so view substitution / virtual-rows
-		// dispatch live in one place.
-		nrv, b, err := planScanRangeVar(rv, cat)
+		// dispatch live in one place. SourceTableIdx 1 — only
+		// one binding ever in this branch (0 is the
+		// "unknown / derived" sentinel).
+		nrv, b, err := planScanRangeVar(rv, cat, 1)
 		if err != nil {
 			return nil, err
 		}
 		node = nrv
-		schema := tableSchema(b.table)
+		schema := tableSchemaWithSource(b.table, b.sourceIdx)
 		// View substitution may have rewritten the schema to
 		// merge the view's column names with the inner plan's
 		// types — preserve it.
@@ -275,7 +303,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				if i < len(innerOut) {
 					ty = innerOut[i].Type
 				}
-				schema[i] = SchemaColumn{Name: c.Name, Type: ty}
+				schema[i] = SchemaColumn{Name: c.Name, Type: ty, SourceTableIdx: b.sourceIdx}
 			}
 		}
 		ctx = newResolveContext([]rangeBinding{b}, schema)
@@ -620,8 +648,11 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	}
 	var root Node
 	var bindings []rangeBinding
+	// Counter starts at 1; zero is reserved as the "unknown /
+	// derived" sentinel for SchemaColumn.SourceTableIdx.
+	nextSourceIdx := int16(1)
 	for _, item := range s.FromExprs {
-		itemNode, itemBindings, err := planFromItem(item, cat)
+		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -654,11 +685,15 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *resolveContext, error) {
 	var root Node
 	var bindings []rangeBinding
+	// Counter starts at 1; zero is reserved as the "unknown /
+	// derived" sentinel for SchemaColumn.SourceTableIdx.
+	nextSourceIdx := int16(1)
 	for _, rv := range from {
-		n, b, err := planScanRangeVar(rv, cat)
+		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx)
 		if err != nil {
 			return nil, nil, err
 		}
+		nextSourceIdx++
 		if root == nil {
 			root = n
 			bindings = append(bindings, b)
@@ -680,17 +715,19 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	return root, newResolveContext(bindings, root.Output()), nil
 }
 
-func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBinding, error) {
-	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat)
+func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16) (Node, []rangeBinding, error) {
+	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx)
 	if err != nil {
 		return nil, nil, err
 	}
+	*nextSourceIdx++
 	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output())
 	for _, j := range item.Joins {
-		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat)
+		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx)
 		if err != nil {
 			return nil, nil, err
 		}
+		*nextSourceIdx++
 		rightBinding.offset = len(leftCtx.schema)
 
 		rightCtx := newResolveContext([]rangeBinding{rightBinding}, appendSchema(leftCtx.schema, rightNode.Output()))
@@ -804,9 +841,9 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog) (Node, []rangeBindi
 	return leftNode, leftCtx.bindings, nil
 }
 
-func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBinding, error) {
+func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
 	if rv.Subquery != nil {
-		return planSubqueryRangeVar(rv, cat)
+		return planSubqueryRangeVar(rv, cat, sourceIdx)
 	}
 	// CTE substitution (M0016-0002): an unschemed name takes the
 	// CTE before falling through to the catalog. CTE names are
@@ -820,7 +857,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 			if alias == "" {
 				alias = ce.name
 			}
-			b := rangeBinding{table: ce.table, alias: alias, offset: 0}
+			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx}
 			scan := &CTEScan{
 				pos:    rv.Pos(),
 				Name:   ce.name,
@@ -839,8 +876,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 			Message: fmt.Sprintf("relation %q does not exist", rv.Name),
 		}
 	}
-	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0}
-	ctx := newResolveContext([]rangeBinding{b}, tableSchema(tbl))
+	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+	ctx := newResolveContext([]rangeBinding{b}, tableSchemaWithSource(tbl, sourceIdx))
 	// View: plan the stored inner SELECT and substitute its
 	// node. The outer ctx's schema (built from the view's
 	// catalog Table) takes precedence for downstream name
@@ -867,7 +904,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBindi
 		// comparisons see the right type tag.
 		schema := make(Schema, len(tbl.Columns))
 		for i, c := range tbl.Columns {
-			schema[i] = SchemaColumn{Name: c.Name, Type: innerSchema[i].Type}
+			schema[i] = SchemaColumn{Name: c.Name, Type: innerSchema[i].Type, SourceTableIdx: b.sourceIdx}
 		}
 		ctx.schema = schema
 		// M0063-0001: wrap the inner plan in a Project that
@@ -942,7 +979,7 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 // never registered in the catalog — it lives only to satisfy
 // the rangeBinding contract that downstream column resolution
 // uses.
-func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeBinding, error) {
+func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
 	inner, err := Plan(rv.Subquery, cat)
 	if err != nil {
 		return nil, rangeBinding{}, err
@@ -970,10 +1007,17 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog) (Node, rangeB
 			typ = innerSchema[i].Type
 		}
 		cols = append(cols, catalog.Column{Name: name, Type: typ})
+		// Subquery columns are derived (an inner SELECT's
+		// computed targets); they have no base-table identity at
+		// the outer scope. The binding's sourceIdx still gets the
+		// caller's monotonic value so qualified `sub.col`
+		// references can be disambiguated against sibling
+		// bindings, but the columns themselves stay at 0
+		// (Go zero-value = unknown).
 		schema = append(schema, SchemaColumn{Name: name, Type: typ})
 	}
 	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
-	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0}
+	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
 	return inner, b, nil
 }
 
@@ -2443,13 +2487,17 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		primaryAlias = tbl.Name
 	}
 	n := len(tbl.Columns)
+	// Primary at sourceIdx=1, excluded at sourceIdx=2 — both refer
+	// to the same catalog table but disambiguate by source so
+	// `excluded.col` and `<target>.col` rebind helpers don't
+	// collapse into the same Index.
 	bindings := []rangeBinding{
-		{table: tbl, alias: primaryAlias, offset: 0},
-		{table: tbl, alias: "excluded", offset: n, qualifiedOnly: true},
+		{table: tbl, alias: primaryAlias, offset: 0, sourceIdx: 1},
+		{table: tbl, alias: "excluded", offset: n, qualifiedOnly: true, sourceIdx: 2},
 	}
 	mergedSchema := make(Schema, 0, 2*n)
-	mergedSchema = append(mergedSchema, tableSchema(tbl)...)
-	mergedSchema = append(mergedSchema, tableSchema(tbl)...)
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 1)...)
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 2)...)
 	ctx := newResolveContext(bindings, mergedSchema)
 	ctx.cat = cat
 
@@ -2666,7 +2714,15 @@ func resolveTargets(targets []parser.ResTarget, ctx *resolveContext) ([]Expr, Sc
 		}
 		name, typ := targetMeta(expr, t)
 		out = append(out, expr)
-		schema = append(schema, SchemaColumn{Name: name, Type: typ})
+		// Pure ColumnRef pass-through preserves the source
+		// identity so downstream rebinds can disambiguate
+		// self-join Names. Computed expressions (BinaryOp,
+		// FuncCall, etc.) leave SourceTableIdx at 0 = unknown.
+		var srcIdx int16
+		if cr, ok := expr.(*ColumnRef); ok {
+			srcIdx = cr.SourceTableIdx
+		}
+		schema = append(schema, SchemaColumn{Name: name, Type: typ, SourceTableIdx: srcIdx})
 	}
 	return out, schema, nil
 }
@@ -2696,8 +2752,8 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	for _, b := range bset {
 		for i, c := range b.table.Columns {
 			idx := b.offset + i
-			outExpr = append(outExpr, &ColumnRef{pos: star.Pos(), Index: idx, Name: c.Name, Type: c.Type})
-			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type})
+			outExpr = append(outExpr, &ColumnRef{pos: star.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
+			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 		}
 	}
 	return outExpr, outSchema, nil
@@ -3143,9 +3199,9 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if strings.EqualFold(c.Name, x.Column) {
 				idx := b.offset + i
 				if level == 0 {
-					return &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type}, true, nil
+					return &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}, true, nil
 				}
-				return &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type}, true, nil
+				return &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}, true, nil
 			}
 		}
 		// The qualifier matched a binding at this level but the
@@ -3169,9 +3225,9 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
 			}
 			if level == 0 {
-				found = &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type}
+				found = &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}
 			} else {
-				found = &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type}
+				found = &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}
 			}
 		}
 	}

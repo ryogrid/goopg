@@ -907,16 +907,18 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	innerKeyExprs := make([]*ColumnRef, len(params))
 	for i, p := range params {
 		outerKeyExprs[i] = &ColumnRef{
-			pos:   p.OuterRef.Pos(),
-			Index: p.OuterRef.Index,
-			Name:  p.OuterRef.Name,
-			Type:  p.OuterRef.Type,
+			pos:            p.OuterRef.Pos(),
+			Index:          p.OuterRef.Index,
+			Name:           p.OuterRef.Name,
+			Type:           p.OuterRef.Type,
+			SourceTableIdx: p.OuterRef.SourceTableIdx,
 		}
 		innerKeyExprs[i] = &ColumnRef{
-			pos:   p.SubCol.Pos(),
-			Index: outerWidth + i, // i-th group-by column in subSchema
-			Name:  p.SubCol.Name,
-			Type:  p.SubCol.Type,
+			pos:            p.SubCol.Pos(),
+			Index:          outerWidth + i, // i-th group-by column in subSchema
+			Name:           p.SubCol.Name,
+			Type:           p.SubCol.Type,
+			SourceTableIdx: p.SubCol.SourceTableIdx,
 		}
 	}
 	// Build the join Predicate as AND of all per-pair equalities.
@@ -1143,16 +1145,18 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 
 	// Build semi-join keys.
 	outerKey := &ColumnRef{
-		pos:   params[0].OuterRef.Pos(),
-		Index: params[0].OuterRef.Index,
-		Name:  params[0].OuterRef.Name,
-		Type:  params[0].OuterRef.Type,
+		pos:            params[0].OuterRef.Pos(),
+		Index:          params[0].OuterRef.Index,
+		Name:           params[0].OuterRef.Name,
+		Type:           params[0].OuterRef.Type,
+		SourceTableIdx: params[0].OuterRef.SourceTableIdx,
 	}
 	innerKey := &ColumnRef{
-		pos:   params[0].SubCol.Pos(),
-		Index: outerWidth,
-		Name:  params[0].SubCol.Name,
-		Type:  params[0].SubCol.Type,
+		pos:            params[0].SubCol.Pos(),
+		Index:          outerWidth,
+		Name:           params[0].SubCol.Name,
+		Type:           params[0].SubCol.Type,
+		SourceTableIdx: params[0].SubCol.SourceTableIdx,
 	}
 
 	// Build a semi-join predicate that replaces the IN expression
@@ -1269,10 +1273,11 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// outer key references its column in outerChild's coord —
 	// preserved as-is.
 	outerKey := &ColumnRef{
-		pos:   outerCol.Pos(),
-		Index: outerCol.Index,
-		Name:  outerCol.Name,
-		Type:  outerCol.Type,
+		pos:            outerCol.Pos(),
+		Index:          outerCol.Index,
+		Name:           outerCol.Name,
+		Type:           outerCol.Type,
+		SourceTableIdx: outerCol.SourceTableIdx,
 	}
 
 	// M0069-0005: drop the IN conjunct from the filter — the
@@ -1854,20 +1859,22 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// width alone (see executor's openLazyHashJoin path for
 	// BuildLeft=false).
 	outerKey := &ColumnRef{
-		pos:   params[0].OuterRef.Pos(),
-		Index: params[0].OuterRef.Index,
-		Name:  params[0].OuterRef.Name,
-		Type:  params[0].OuterRef.Type,
+		pos:            params[0].OuterRef.Pos(),
+		Index:          params[0].OuterRef.Index,
+		Name:           params[0].OuterRef.Name,
+		Type:           params[0].OuterRef.Type,
+		SourceTableIdx: params[0].OuterRef.SourceTableIdx,
 	}
 	// The executor's evalHashKey is given a padded row of width
 	// (leftWidth + rightWidth). For semi/anti the right key reads
 	// the inner column from the right-side region of that padded
 	// row, so its Index must be `outerWidth + innerColIndex`.
 	innerKey := &ColumnRef{
-		pos:   params[0].SubCol.Pos(),
-		Index: outerWidth + params[0].SubCol.Index,
-		Name:  params[0].SubCol.Name,
-		Type:  params[0].SubCol.Type,
+		pos:            params[0].SubCol.Pos(),
+		Index:          outerWidth + params[0].SubCol.Index,
+		Name:           params[0].SubCol.Name,
+		Type:           params[0].SubCol.Type,
+		SourceTableIdx: params[0].SubCol.SourceTableIdx,
 	}
 
 	// Drop the EXISTS conjunct (or its wrapping NOT) entirely;
@@ -1911,19 +1918,40 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// against an unrelated value → silent over-match (rows = 0
 	// vs canonical ~411).
 	outerSchema := outerChild.Output()
-	resolveOuterIdx := func(name string, fallback int) int {
+	resolveOuterIdx := func(name string, fallback int, sourceTableIdx int16) int {
 		// Disambiguate self-joins (Q21 has lineitem l1, l2, l3):
 		// the binder's offset uses l1.offset; we look up the
 		// matching offset by walking outerSchema's name list and
 		// finding the one whose absolute position matches the
 		// fallback. This preserves multi-binding semantics.
 		if fallback >= 0 && fallback < len(outerSchema) && outerSchema[fallback].Name == name {
-			return fallback
+			// Position still aligns AND (when known) the source
+			// identity also matches; trust the binder's index.
+			if sourceTableIdx == 0 || outerSchema[fallback].SourceTableIdx == sourceTableIdx {
+				return fallback
+			}
+			// Position aligns by Name but source-identity tells
+			// us this slot belongs to a sibling self-join binding
+			// — fall through to the SourceTableIdx-aware lookup.
 		}
-		// The schema's positions diverged from FROM-cumulative.
-		// Walk and pick the first column with matching Name —
-		// safe ONLY when the column name is unique in the outer
-		// schema. For ambiguous cases (self-join) keep fallback.
+		// M0071-0009: when the OuterColumnRef knows its source
+		// identity (SourceTableIdx > 0), prefer the column whose
+		// schema entry matches both Name and SourceTableIdx. This
+		// is what makes Q21's l3.l_suppkey <> l1.l_suppkey resolve
+		// correctly even though `l_suppkey` appears multiple times
+		// in the outer schema.
+		if sourceTableIdx != 0 {
+			for i, c := range outerSchema {
+				if c.Name == name && c.SourceTableIdx == sourceTableIdx {
+					return i
+				}
+			}
+		}
+		// The schema's positions diverged from FROM-cumulative
+		// AND we have no source identity (or no match). Walk and
+		// pick the first column with matching Name — safe ONLY
+		// when the column name is unique in the outer schema.
+		// For ambiguous cases (self-join) keep fallback.
 		first := -1
 		count := 0
 		for i, c := range outerSchema {
@@ -1949,10 +1977,11 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 			switch x := e.(type) {
 			case *OuterColumnRef:
 				return &ColumnRef{
-					pos:   x.Pos(),
-					Index: resolveOuterIdx(x.Name, x.Index),
-					Name:  x.Name,
-					Type:  x.Type,
+					pos:            x.Pos(),
+					Index:          resolveOuterIdx(x.Name, x.Index, x.SourceTableIdx),
+					Name:           x.Name,
+					Type:           x.Type,
+					SourceTableIdx: x.SourceTableIdx,
 				}
 			case *ColumnRef:
 				cl := *x
