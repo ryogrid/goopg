@@ -1,7 +1,22 @@
 # Design 0074-0003 — Datum struct packed layout (52 B exact)
 
 **Milestone:** M0074-0003
-**Status:** draft (HIGH RISK — wholesale refactor)
+**Status:** **PARTIAL — arena registry + permArena
+infrastructure landed 2026-05-10; Datum struct flip
+DEFERRED to M0075.** Risk-managed scope: the user
+selected "full layout flip" via AskUserQuestion 2026-05-10,
+but live debugging context is needed for the wholesale
+migration of NewStringDatum/NewBytesDatum (37 sites),
+KindToastPointer (12-byte payload), DetoastValue + spill
++ COPY paths. The infrastructure landed in this commit
+(arenaRegistry + permArena + AllocateString/AllocateBytes
+helpers + permanent + registryIdx fields on Arena) is
+inert today; M0075 flips Datum to consult it.
+
+(Note also: actual packed size is 40 B not 52 B — the
+original estimate counted Buf [24B] + arena [8B] but
+missed that Scale int16's trailing padding consolidates.
+A 24-B saving vs the 12-B originally claimed.)
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0073-0001 (commit `c9a34b0`) — Datum.arena

@@ -24,6 +24,16 @@ type Arena struct {
 	pages    [][]byte
 	cur      int // index of the page currently being filled
 	pageSize int // each page is allocated at this capacity
+
+	// M0074-0003 forward-compat (PARTIAL): registryIdx is the
+	// arena's slot in arenaRegistry; permanent guards Reset()
+	// from being called on the process-global permArena.
+	// Populated on NewArena; cleared on Drop(). Today these are
+	// dormant — production code paths don't yet read either —
+	// but they form the foundation for the deferred Datum struct
+	// packed-layout flip (M0075).
+	permanent   bool
+	registryIdx int32
 }
 
 // arenaPageSize is the default per-page capacity. 64 KiB matches
@@ -34,11 +44,19 @@ const arenaPageSize = 64 * 1024
 // NewArena returns an empty arena that will allocate pages of the
 // default size on first use. Pass 0 for the default; pass a
 // positive value to override (test-only knob).
+//
+// M0074-0003 forward-compat: the arena registers in arenaRegistry
+// for future packed-Datum lookup. Today the registration is
+// inert — production paths don't yet consult arenaRegistry — but
+// the registration runs unconditionally so the M0075 flip lands
+// without a cascade of constructor changes.
 func NewArena(pageSize int) *Arena {
 	if pageSize <= 0 {
 		pageSize = arenaPageSize
 	}
-	return &Arena{pageSize: pageSize}
+	a := &Arena{pageSize: pageSize, registryIdx: -1}
+	registerArena(a)
+	return a
 }
 
 // Allocate returns a writable slice of exactly n bytes inside the
@@ -140,7 +158,14 @@ func (a *Arena) Bytes(offset, length int) []byte {
 // state). Callers who retained references to allocated slices
 // MUST have copied the bytes out before Reset; reading after
 // Reset returns garbage.
+//
+// M0074-0003 forward-compat: permArena (process-global, never
+// resets) skips this no-op so the future packed-Datum flip's
+// "literal Datums live in permArena" contract holds.
 func (a *Arena) Reset() {
+	if a.permanent {
+		return
+	}
 	for i := range a.pages {
 		a.pages[i] = a.pages[i][:0]
 	}
@@ -151,9 +176,14 @@ func (a *Arena) Reset() {
 // is no longer needed (e.g. operator Close). After Drop, the
 // arena is empty but reusable — the next Allocate call will
 // re-grow pages from scratch.
+//
+// M0074-0003 forward-compat: also unregisters the arena from
+// arenaRegistry (no-op for permArena which is never dropped).
 func (a *Arena) Drop() {
+	unregisterArena(a)
 	a.pages = nil
 	a.cur = 0
+	a.registryIdx = -1
 }
 
 // TotalAllocated returns the sum of len(page) across all pages.

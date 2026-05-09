@@ -129,12 +129,17 @@ B (0006) → C (0004) → D (0002) → E (0001) → F (0003).
       entry for vectorisable arms; seqScanOp predicate
       batch path; Q5 `evalBinary` cum CPU ≤ 15 %;
       `evalExprSlot` cum ≤ 50 %.
-- [ ] M0074-0003 lands: `Buf []byte` → `(ArenaRef,
-      Offset, Length)` int32 triplet; permArena +
-      arenaRegistry infrastructure; struct = 52 B exact;
-      all 38 NewStringDatum/NewBytesDatum sites + detoast
-      + spill + COPY paths migrated; full SF=1 sweep
-      preserved.
+- [ ] M0074-0003 PARTIAL: arenaRegistry + permArena
+      infrastructure landed (`permanent bool` +
+      `registryIdx int32` on Arena, `AllocateString` /
+      `AllocateBytes` helpers, register-on-NewArena,
+      unregister-on-Drop). The Datum struct flip
+      (`Buf []byte` → `(ArenaRef, Offset, Length)`
+      int32 triplet) is DEFERRED to M0075 — risk-managed
+      scope under autonomous-mode constraints.
+      Structurally the infrastructure is inert today;
+      M0075 flips Datum to consult it. Note: real packed
+      size will be 40 B (not 52 B as originally estimated).
 - [ ] 22-query SF=1 sweep at M0074 close: Q12=2, Q13=35,
       Q21≥100, Q9 = 175 rows DETERMINISTICALLY, Q22=7,
       all other rows preserved.
