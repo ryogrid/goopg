@@ -79,7 +79,38 @@ func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 // Caller invariants:
 //   - `len(dst) >= len(cols)`
 //   - `len(keep) >= len(cols)`
+//
+// arena == nil falls back to the legacy `make([]byte)` path —
+// behaviour byte-for-byte identical regardless of caller.
 func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []bool) error {
+	return decodeRowProjectionArena(dst, cols, data, keep, nil)
+}
+
+// DecodeRowProjectionIntoArena is the arena-aware sibling of
+// DecodeRowProjection. When arena != nil, projected variable-length
+// columns (varchar / char / text / bytea, numeric text storage)
+// emit Datums whose payload lives in the arena's pages — single
+// allocation per page amortises across thousands of strings.
+// Skipped columns produce no Datum allocation in either mode.
+//
+// Used by index-build paths (operators_ddl.go: collectBTreeEntries
+// and backfillBTree) where the decoded Datum's lifetime ends at
+// encodeBTreeKeyForColumn — the encoded key is a fresh []byte copy.
+//
+// Caller invariants (same as DecodeRowProjection plus):
+//   - arena.Reset() bound to the producer's batch boundary
+//     (per-page in DDL paths).
+//   - Datums must not be retained past the next Reset.
+//
+// arena == nil falls back to the legacy `make([]byte)` path —
+// behaviour byte-for-byte identical to DecodeRowProjection.
+//
+// M0074-0004 — see docs/design/0074-0004-decode-row-projection-arena.md.
+func DecodeRowProjectionIntoArena(dst Row, cols []catalog.Column, data []byte, keep []bool, arena *Arena) error {
+	return decodeRowProjectionArena(dst, cols, data, keep, arena)
+}
+
+func decodeRowProjectionArena(dst Row, cols []catalog.Column, data []byte, keep []bool, arena *Arena) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
@@ -98,6 +129,10 @@ func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []boo
 				return fmt.Errorf("DecodeRowProjection: %s: truncated TOAST pointer", c.Name)
 			}
 			if keep[i] {
+				// TOAST pointer: always Buf-backed regardless
+				// of arena (mirrors DecodeRowIntoArena's flag==2
+				// path). Detoast may run later and needs the
+				// pointer to outlive arena Reset.
 				dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
 			} else {
 				dst[i] = NullDatum
@@ -106,7 +141,16 @@ func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []boo
 			continue
 		}
 		if keep[i] {
-			v, n, err := decodeValue(c.Type, data[off:])
+			var (
+				v   Datum
+				n   int
+				err error
+			)
+			if arena != nil {
+				v, n, err = decodeValueArena(c.Type, data[off:], arena)
+			} else {
+				v, n, err = decodeValue(c.Type, data[off:])
+			}
 			if err != nil {
 				return fmt.Errorf("DecodeRowProjection: %s: %w", c.Name, err)
 			}
