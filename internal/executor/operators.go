@@ -45,16 +45,17 @@ func (o *valuesOp) Next() (TupleSlot, error) {
 }
 
 // projectOp evaluates the target list against each child row.
+//
+// M0071-0015 Stage E: targets are evaluated into a freshly-cloned
+// Row each Next() — projectOp's child slot is consumed inside this
+// function (slot is no longer accessed after the loop), so the
+// child's lifetime contract is satisfied by the slot itself.
 type projectOp struct {
 	child   Operator
 	targets []planner.Expr
 	schema  planner.Schema
 	ctx     *Context
-	// M0054-0005a-followup: borrow-semantics output buffer reuse.
-	// When `borrow == BorrowedRow`, Next returns `out` directly;
-	// otherwise it clones before returning. Default OwnedRow.
-	borrow BorrowSemantics
-	out    Row
+	out     Row
 }
 
 func newProjectOp(plan *planner.Project, child Operator) *projectOp {
@@ -77,10 +78,6 @@ func (o *projectOp) Close() error {
 	return o.child.Close()
 }
 
-// SetBorrow marks projectOp as eligible to return borrowed
-// rows. (M0054-0005a-followup.)
-func (o *projectOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
-
 func (o *projectOp) Next() (TupleSlot, error) {
 	inSlot, err := o.child.Next()
 	if err != nil {
@@ -93,9 +90,6 @@ func (o *projectOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 		o.out[i] = v
-	}
-	if o.borrow == BorrowedRow {
-		return asSlot(o.schema, o.out), nil
 	}
 	return asSlot(o.schema, cloneRow(o.out)), nil
 }

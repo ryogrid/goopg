@@ -405,25 +405,16 @@ func (o *rowsOp) Close() error {
 	return nil
 }
 
-// spillOp implements Operator over a spillReader.
+// spillOp implements Operator over a spillReader. M0071-0015 Stage E:
+// always cloneRow; consumers materialize via the slot pipeline.
 type spillOp struct {
 	r   *spillReader
 	ctx *Context
-	// M0054-0005b-followup: reusable output Row buffer. When
-	// `borrow == BorrowedRow`, Next returns `out` directly;
-	// otherwise it clones before returning (default OwnedRow).
-	borrow BorrowSemantics
-	out    Row
+	out Row
 }
 
 func (o *spillOp) Open(*Context) error    { return nil }
 func (o *spillOp) Schema() planner.Schema { return nil }
-
-// SetBorrow flips spillOp into borrow-on-output mode. The caller
-// (a sort merge or hash-join probe loop) must consume each row
-// before pulling the next when set to BorrowedRow.
-// (M0054-0005b-followup.)
-func (o *spillOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 func (o *spillOp) Next() (TupleSlot, error) {
 	row, err := o.r.ReadRowInto(o.out)
@@ -434,9 +425,6 @@ func (o *spillOp) Next() (TupleSlot, error) {
 		return nil, err
 	}
 	o.out = row // re-cap for the next call
-	if o.borrow == BorrowedRow {
-		return asSlot(nil, row), nil
-	}
 	return asSlot(nil, cloneRow(row)), nil
 }
 func (o *spillOp) Close() error {

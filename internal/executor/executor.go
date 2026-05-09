@@ -36,11 +36,10 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		// M0054-0005a-followup: projectOp ALWAYS copies its
-		// child's row into `o.out` (then either clones or returns
-		// borrowed). So the child is always safe to borrow,
-		// regardless of project's own borrow contract.
-		setChildBorrow(child, BorrowedRow)
+		// M0071-0015 Stage E: projectOp materialises evaluated
+		// targets into o.out and clones for the consumer; child
+		// slot lifetime is bounded by projectOp's per-Next read
+		// — no borrow contract needed.
 		return maybeInstrument(p, newProjectOp(p, child)), nil
 	case *planner.Filter:
 		child, err := Build(p.Child)
@@ -99,13 +98,11 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		// M0059-0002: aggregateOp.Open's drain loop consumes each
-		// child row, extracts value-typed Datums into aggRuntime
-		// fields and into a fresh groupValues Row, then releases
-		// the source row before pulling the next. Datums hold
-		// independent string allocations from the scan decode
-		// path, so borrowed input is safe.
-		setChildBorrow(child, BorrowedRow)
+		// M0071-0015 Stage E: aggregateOp.Open's drain loop
+		// extracts value-typed Datums into aggRuntime fields and
+		// into a fresh groupValues Row before pulling the next
+		// child slot — slot lifetime is bounded by the per-Next
+		// read, no borrow contract needed.
 		return maybeInstrument(p, newAggregateOp(p, child)), nil
 	case *planner.WindowAgg:
 		child, err := Build(p.Child)
