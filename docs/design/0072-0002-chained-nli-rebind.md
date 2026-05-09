@@ -1,13 +1,24 @@
 # Design 0072-0002 — Chained-NLI IndexScan key rebind (Q9 row-count fix)
 
 **Milestone:** M0072-0002
-**Status:** draft
+**Status:** **DEFERRED to M0073** (implementation attempt
+landed on `gc-oriented-refactor` produced a runtime
+explosion — Q9 cancelled at 600s with no rows; reverted
+2026-05-09. Root cause: even with
+`findColumnIndexByNameAndSource`, the IndexScan key
+ColumnRef in the chained-NLI shape lands on a low-
+selectivity column at runtime, producing a per-outer
+match-set that doesn't fit within the cancel budget. The
+fix requires full virtual-coord propagation so each slot
+addresses its own `(sourceIdx, sourceCol)` mapping rather
+than a flat `ColumnRef.Index`.)
 **Owner:** TBD
-**Branch:** `gc-oriented-refactor` (continuation)
+**Branch:** `gc-oriented-refactor` (revert landed before
+implementation commit; retained as design history)
 **Depends on:** M0071-0009
 (`SchemaColumn.SourceTableIdx`),
 M0072-0001 (slot-aware BindOuter — recommended but not strictly
-required).
+required), M0073 (virtual-coord propagation — new milestone).
 
 ## Context
 
@@ -177,11 +188,44 @@ condition; pre-existing MHJ rebind is untouched.
   the correct outer-schema position via
   `findColumnIndexByNameAndSource`.
 
+## Implementation outcome (2026-05-09)
+
+The implementation landed on a feature branch with
+`outerIsNLI || outerIsMHJ` extending the rebind block at
+`internal/planner/nl_index_join.go:399`, using
+`findColumnIndexByNameAndSource` from M0071-0009 plus the
+SourceTableIdx-aware "already bound" guard. Pre-commit gate
+result:
+
+- Q12=2 ✓
+- Q13=35 ✓
+- Q21=381 ✓
+- **Q9 cancelled at 380s → cancelled again at 600s; runtime
+  observed >18 minutes in tpch-runner before kill.** No
+  result emerged. The runtime did not crash; the inner-loop
+  `ctx.Err()` checks fire as expected, but the per-outer
+  match-set produced after rebind is large enough to exceed
+  any reasonable cancel budget.
+
+Root cause: the SourceTableIdx-aware lookup correctly
+disambiguates self-join Name collisions, but the rebind
+target column is high-cardinality at runtime (chained-NLI
+shape with `lineitem` self-joins where multiple aliases
+match the same supplier or part). The IndexScan probe
+expands per-outer instead of narrowing.
+
+The change was reverted; M0072-0002 is documented here as
+history. The cleaner fix is **M0073: full virtual-coord
+propagation through SlotView** — each slot reads
+`(sourceIdx, sourceCol)` from its own per-operator mapping,
+making schema position structurally equivalent to runtime
+position regardless of intermediate operator reorderings.
+
 ## Risks
 
 | # | Risk | Mitigation |
 |---|------|-----------|
-| R1 | Q9 7→1 regression returns | The fix uses `findColumnIndexByNameAndSource`, which M0067-0003 didn't have. Pre-commit gate runs Q9; hard floor at ≥ 7 rows. If broken, revert. |
+| R1 | Q9 7→1 regression returns | The fix uses `findColumnIndexByNameAndSource`, which M0067-0003 didn't have. Pre-commit gate runs Q9; hard floor at ≥ 7 rows. If broken, revert. **Outcome: triggered the cancel-budget regression mode (Q9 hung); reverted, deferred to M0073.** |
 | R2 | Q21 (M0071-0009 win) regression — Q21 also relies on the predRebind path | The rebind helper extends `findColumnIndexByNameAndSource` (the same utility M0071-0009 uses). Q21 must stay at ≥ 100 rows; gate. |
 | R3 | Chained NLI 3+ deep — the rebind only walks one level of outer | The walker is recursive on NestedLoopIndexJoin outers (the outer's outer is an NLI too); same `outerIsNLI` test fires. Pin via `TestM0072ChainedNLIRebind` with a 3-deep synthesised plan. |
 | R4 | Other queries silently regress (the M0064 gate was added for a reason) | 21-query sweep at every commit; full row-count check; no >10% wall-time regression vs HEAD. |

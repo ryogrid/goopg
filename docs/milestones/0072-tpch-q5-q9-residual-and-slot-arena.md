@@ -1,12 +1,21 @@
-# Milestone 0072 — Q5 GC residual + Q9 chained-NLI fix + slot-arena landing
+# Milestone 0072 — Q5 GC residual + slot-arena landing (Q9 deferred to M0073)
 
-**Status:** planned
+**Status:** in-progress
 **Branch:** `gc-oriented-refactor` (continuation of M0071-0011..0015)
 **Depends on:** M0071-0015 (commit `3f5a905`) — slot pipeline complete.
 **Drives:** Q5 next-bottleneck reduction (`btree.RangeScan + acquireRow`
-50.81% post-Stage-D-2 → ≤ 25%); Q9 chained-NLI 7 → ≥ 90 rows
-(target ~175); per-batch String/Bytes arena landing (M0071-0006
-unblocked).
+50.81% post-Stage-D-2 → ≤ 25%); per-batch String/Bytes arena
+landing (M0071-0006 unblocked).
+
+**Q9 update (2026-05-09):** The chained-NLI rebind attempt
+(M0072-0002, see `docs/design/0072-0002-chained-nli-rebind.md`)
+was implemented and reverted same-session. The
+SourceTableIdx-aware rebind disambiguates the self-join name
+collision but lands on a high-cardinality runtime column;
+Q9 cancelled at 600s with no rows. Q9 carries to **M0073**
+where full virtual-coord propagation through SlotView
+addresses the schema-position-vs-runtime-position equivalence
+structurally rather than via index rewriting.
 
 ## Context
 
@@ -52,13 +61,13 @@ implementation commits cite authoritative references.
 
 ## Sub-milestones
 
-| # | Sub-milestone | Risk | Tier | Depends on |
-| - | ------------- | ---- | ---- | ---------- |
-| 0001 | indexScanOp slot-aware BindOuter (Q5 GC fix) | LOW-MED | structural | — |
-| 0002 | Chained-NLI IndexScan key rebind (Q9 fix) | MED | planner-first | — |
-| 0003 | TypedStringLit plan-time Datum hoisting | LOW | perf | — |
-| 0004 | Per-batch String/Bytes arena (M0071-0006 land) | MED-HIGH | structural | 0001 |
-| 0005 | Final 22-query SF=1 sweep + handover (M0072 close) | — | — | 0001..0004 |
+| # | Sub-milestone | Risk | Tier | Status |
+| - | ------------- | ---- | ---- | ------ |
+| 0001 | indexScanOp slot-aware BindOuter (Q5 GC fix) | LOW-MED | structural | LANDED `c16f3f2` |
+| 0002 | Chained-NLI IndexScan key rebind (Q9 fix) | MED | planner-first | DEFERRED → M0073 (see design 0072-0002 §"Implementation outcome") |
+| 0003 | TypedStringLit plan-time Datum hoisting | LOW | perf | pending |
+| 0004 | Per-batch String/Bytes arena (M0071-0006 land) | MED-HIGH | structural | pending |
+| 0005 | Final 22-query SF=1 sweep + handover (M0072 close) | — | — | pending |
 
 ## Design references
 
@@ -79,17 +88,22 @@ design doc.
 ## Definition of Done
 
 **Mandatory (correctness; must land for milestone closure):**
-- [ ] M0072-0001 lands: `indexScanOp.BindOuter(SlotView, int)`;
+- [x] M0072-0001 lands: `indexScanOp.BindOuter(SlotView, int)`;
       `boundRow` deletion in `nestedLoopIndexJoinOp`; Q12=2 /
       Q13=35 / Q21=381 preserved; new `nlj_indexscan_slot_test`
-      pins the contract.
-- [ ] M0072-0002 lands: `outerIsNLI` rebind extension; Q9
-      row count ≥ 90 (target ~175); Q9 row count never below
-      7 (M0067-0003 regression mode triggers immediate
-      revert); `TestM0072ChainedNLIRebind` and
-      `TestNLIResultParityCompositeKey` extended.
+      pins the contract. **Landed `c16f3f2`.**
+- [ ] ~~M0072-0002 lands: `outerIsNLI` rebind extension~~ —
+      **Deferred to M0073.** See design 0072-0002
+      §"Implementation outcome": the rebind landed correctly
+      from a planner-disambiguation standpoint but produced
+      a runtime explosion (Q9 cancelled at 600s with no
+      rows; reverted same session). Q9 carries to M0073
+      where full virtual-coord propagation through SlotView
+      addresses the schema-position-vs-runtime-position
+      mismatch structurally rather than via index rewriting.
 - [ ] 22-query SF=1 sweep at M0072 close: Q12=2, Q13=35,
-      Q21≥100, plus all other rows preserved.
+      Q21≥100, Q9 unchanged at 7 rows (M0073 scope), plus
+      all other rows preserved.
 
 **Best-effort (perf; may carry to M0073):**
 - [ ] M0072-0003 lands: TypedStringLit / IntervalLit
@@ -118,8 +132,11 @@ design doc.
 
 - **Full virtual-coord propagation through slot** — the
   cleaner fix for Q9 (slot Get reads via `(sourceIdx,
-  sourceCol)` rather than flat `ColumnRef.Index`). M0072-0002
-  takes the targeted-rebind shortcut. M0073 candidate.
+  sourceCol)` rather than flat `ColumnRef.Index`).
+  **M0072-0002's rebind shortcut was attempted and reverted
+  same session — runtime explosion mode (Q9 cancelled at
+  600s with no rows). Q9 now carries to M0073 with full
+  virtual-coord propagation as the correct structural fix.**
 - **IndexOnlyScan slot-aware BindOuter** — currently never
   driven from NLI; M0072-0001 leaves a no-op stub for
   interface consistency.
