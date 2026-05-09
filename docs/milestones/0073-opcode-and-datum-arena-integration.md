@@ -1,6 +1,14 @@
 # Milestone 0073 — OpCode int enum + Datum/arena integration (Q5 perf + Q9 wall-time compression)
 
-**Status:** planned
+**Status:** closed (2026-05-10) — Commits `c696cea`,
+`58efeb0`, `c9a34b0`, `d0bfe99` (M0073-0001..0004) +
+Commit E (M0073-0005, this handover). Q5 total heap
+dropped 1463 GB → 404 GB (−72 %). Row counts: 21/22
+preserved, Q5 still cancels at 600 s (structural — M0074
+addresses CPU-bound `evalExprSlot`). Q9 row count carries
+forward as the bimodal mode-1 baseline (7 rows / 223 s
+this cycle); compression target Q9 ≤ 600 s deferred to
+M0074. See [`docs/handover/2026-05-10-tpch-status-phase5.md`](../handover/2026-05-10-tpch-status-phase5.md).
 **Branch:** `gc-oriented-refactor` (continuation of M0072)
 **Depends on:** M0072-0001 (commit `c16f3f2`) — slot-aware
 BindOuter; M0072-0004 (commit `b081767`) — Arena type
