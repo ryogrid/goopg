@@ -66,7 +66,7 @@ implementation commits cite authoritative references.
 | 0001 | indexScanOp slot-aware BindOuter (Q5 GC fix) | LOW-MED | structural | LANDED `c16f3f2` |
 | 0002 | Chained-NLI IndexScan key rebind (Q9 fix) | MED | planner-first | DEFERRED → M0073 (see design 0072-0002 §"Implementation outcome") |
 | 0003 | TypedStringLit plan-time Datum hoisting | LOW | perf | NO-OP (already optimized — see §"M0072-0003 disposition") |
-| 0004 | Per-batch String/Bytes arena (M0071-0006 land) | MED-HIGH | structural | pending |
+| 0004 | Per-batch String/Bytes arena (M0071-0006 land) | MED-HIGH | structural | PARTIAL — Arena type + tests landed; Datum integration carries to M0073 (see §"M0072-0004 disposition") |
 | 0005 | Final 22-query SF=1 sweep + handover (M0072 close) | — | — | pending |
 
 ## Design references
@@ -116,10 +116,16 @@ design doc.
       `Datum` to a shared package (cross-package hoisting)
       which is out of M0072 scope. See §"M0072-0003
       disposition" below.
-- [ ] M0072-0004 lands: per-batch String/Bytes arena;
-      `acquireRow` ≤ 5% of Q5 heap; `KindStringArena` /
-      `KindBytesArena` Datum variants live; new arena unit
-      tests pass.
+- [/] M0072-0004 PARTIAL: Arena type + 6 unit tests landed
+      (`internal/executor/arena.go` + `arena_test.go`).
+      Datum integration (replacing per-Datum `Buf []byte`
+      with `(arena, offset, length)`) is the structurally
+      risky piece — the M0066-0002 / M0071-0006 history
+      shows that touching Datum.Buf semantics easily
+      triggers the Q12=2/Q13=35 silent-regression mode.
+      Carries to M0073 alongside the Q9 virtual-coord
+      propagation work (both share the Datum / SlotView
+      refactor surface). See §"M0072-0004 disposition".
 
 **Q5 bottleneck reduction (best-effort):**
 - [ ] Q5 either completes (rows ≥ 1) OR Q5 heap profile
@@ -187,15 +193,51 @@ Datum hoisting**. M0072-0003 is closed as no-op; the
 if Q5 still warrants further per-row eval optimisation
 after the M0072-0001 / M0072-0004 wins land.
 
+## M0072-0004 disposition (partial: Arena type only)
+
+The plan called for landing the per-batch String/Bytes
+arena per `docs/design/0068-0003-batch-string-arena.md`,
+including:
+
+1. `internal/executor/arena.go` — Arena type.
+2. `Datum.arena` field replacing per-Datum `Buf []byte`.
+3. `KindStringArena` / `KindBytesArena` Datum variants.
+4. `DecodeRowInto` arena-aware decode path.
+5. `seqScanOp` / `indexScanOp` per-call arena binding.
+6. `slot.Materialize()` Datum-promotion at retention
+   sites.
+
+**Landed:** Step 1 only — `internal/executor/arena.go`
+with the Arena type plus 6 unit tests pinning Allocate /
+Reset (reuse) / page growth / oversized payload /
+zero-length / Drop semantics.
+
+**Deferred to M0073:** Steps 2-6. The Datum struct
+modification (replacing `Buf []byte` with an arena
+reference) is the M0066-0002 silent-regression surface —
+the M0071 slot pipeline history (commits `08b1a5c`,
+`96443e1`, `3398d47` reverted) demonstrates that touching
+Datum.Buf semantics + retention-site invariants together
+easily triggers Q12 = 0 / Q13 = 2 silent regressions.
+M0073 unifies the Datum / SlotView refactor (Q9
+virtual-coord propagation also needs Datum changes; doing
+them together amortises the silent-regression bisect cost
+to one milestone instead of two).
+
+The Arena lives here so the M0073 work can wire it without
+re-litigating the type design. The unit tests pin the
+Arena's contract for the future caller.
+
 ## Out of scope (carry to M0073+)
 
-- **Full virtual-coord propagation through slot** — the
-  cleaner fix for Q9 (slot Get reads via `(sourceIdx,
-  sourceCol)` rather than flat `ColumnRef.Index`).
-  **M0072-0002's rebind shortcut was attempted and reverted
-  same session — runtime explosion mode (Q9 cancelled at
-  600s with no rows). Q9 now carries to M0073 with full
-  virtual-coord propagation as the correct structural fix.**
+- **M0073: unified Datum + SlotView virtual-coord
+  refactor.** Combines (a) full virtual-coord propagation
+  through SlotView so each slot reads `(sourceIdx,
+  sourceCol)` from its own per-operator mapping (Q9 fix),
+  and (b) `Datum.Buf` → arena-backed reference (M0072-0004
+  steps 2-6). Both share the Datum / SlotView surface —
+  unifying them amortises the Q12=2/Q13=35 silent-
+  regression bisect cost to one milestone.
 - **IndexOnlyScan slot-aware BindOuter** — currently never
   driven from NLI; M0072-0001 leaves a no-op stub for
   interface consistency.
