@@ -191,12 +191,12 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// scale-aligning helpers.  Also try to parse string
 		// operands as numeric (columns loaded via INSERT may be
 		// stored as strings before the type system enforces types).
-		if left.Kind == KindString {
+		if (left.Kind == KindString || left.Kind == KindStringArena) {
 			if m, s, err := parseNumeric(left.StringValue()); err == nil {
 				left = newNumeric(m, int(s))
 			}
 		}
-		if right.Kind == KindString {
+		if (right.Kind == KindString || right.Kind == KindStringArena) {
 			if m, s, err := parseNumeric(right.StringValue()); err == nil {
 				right = newNumeric(m, int(s))
 			}
@@ -231,7 +231,7 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
 	case parser.OpConcat:
-		if left.Kind != KindString || right.Kind != KindString {
+		if (left.Kind != KindString && left.Kind != KindStringArena) || (right.Kind != KindString && right.Kind != KindStringArena) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
 		}
 		return NewStringDatum(left.StringValue() + right.StringValue()), nil
@@ -271,9 +271,9 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 // data.
 func datumAsString(d Datum) (string, bool) {
 	switch d.Kind {
-	case KindString:
+	case KindString, KindStringArena:
 		return d.StringValue(), true
-	case KindBytes:
+	case KindBytes, KindBytesArena:
 		return string(d.BytesValue()), true
 	}
 	return "", false
@@ -378,10 +378,14 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 	if a.Kind == b.Kind {
 		return a, b
 	}
-	// One side is KindString — try to parse it as the other's type.
-	if a.Kind == KindString && b.Kind != KindString {
+	// M0073-0001: treat KindString / KindStringArena uniformly
+	// as "string" for the cross-kind parse-and-compare path.
+	aIsString := a.Kind == KindString || a.Kind == KindStringArena
+	bIsString := b.Kind == KindString || b.Kind == KindStringArena
+	// One side is string — try to parse it as the other's type.
+	if aIsString && !bIsString {
 		a = tryParseStringAs(b.Kind, a.StringValue())
-	} else if b.Kind == KindString && a.Kind != KindString {
+	} else if bIsString && !aIsString {
 		b = tryParseStringAs(a.Kind, b.StringValue())
 	}
 	// KindInterval has no text parse path yet — leave as-is so
@@ -438,6 +442,21 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		return numericCmp(a, b)
 	}
 	if a.Kind != b.Kind {
+		// M0073-0001: arena and non-arena string/bytes Datums
+		// are logically the same Kind for comparison purposes.
+		// Treat KindString ↔ KindStringArena and KindBytes ↔
+		// KindBytesArena as same-kind so the per-kind switch
+		// below dispatches correctly.
+		aIsString := a.Kind == KindString || a.Kind == KindStringArena
+		bIsString := b.Kind == KindString || b.Kind == KindStringArena
+		if aIsString && bIsString {
+			return strings.Compare(a.StringValue(), b.StringValue()), nil
+		}
+		aIsBytes := a.Kind == KindBytes || a.Kind == KindBytesArena
+		bIsBytes := b.Kind == KindBytes || b.Kind == KindBytesArena
+		if aIsBytes && bIsBytes {
+			return strings.Compare(string(a.BytesValue()), string(b.BytesValue())), nil
+		}
 		// Fall back to string comparison so planner-side column
 		// misalignments don't crash the entire query.  The result
 		// may not be PostgreSQL-correct, but the query completes.
@@ -460,7 +479,7 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			return 1, nil
 		}
 		return 0, nil
-	case KindString:
+	case KindString, KindStringArena:
 		return strings.Compare(a.StringValue(), b.StringValue()), nil
 	case KindTime:
 		switch {
@@ -1028,18 +1047,24 @@ func compareEq(a, b Datum) (Datum, error) {
 		}
 		return NewBoolDatum(cmp == 0), nil
 	}
+	// M0073-0001: treat KindString and KindStringArena as
+	// equivalent for equality (likewise KindBytes /
+	// KindBytesArena). The arena variant is a storage detail;
+	// the logical Kind is "string" / "bytes".
+	aIsString := a.Kind == KindString || a.Kind == KindStringArena
+	bIsString := b.Kind == KindString || b.Kind == KindStringArena
 	switch {
 	case a.Kind == KindInt && b.Kind == KindInt:
 		return NewBoolDatum(a.Int == b.Int), nil
 	case a.Kind == KindBool && b.Kind == KindBool:
 		return NewBoolDatum(a.BoolValue() == b.BoolValue()), nil
-	case a.Kind == KindString && b.Kind == KindString:
+	case aIsString && bIsString:
 		return NewBoolDatum(a.StringValue() == b.StringValue()), nil
 	case a.Kind == KindTime && b.Kind == KindTime:
 		return NewBoolDatum(a.TimeValue().Equal(b.TimeValue())), nil
-	case a.Kind == KindInt && b.Kind == KindString:
+	case a.Kind == KindInt && bIsString:
 		return NewBoolDatum(fmt.Sprintf("%d", a.Int) == b.StringValue()), nil
-	case a.Kind == KindString && b.Kind == KindInt:
+	case aIsString && b.Kind == KindInt:
 		return NewBoolDatum(a.StringValue() == fmt.Sprintf("%d", b.Int)), nil
 	}
 	return NewBoolDatum(false), nil
@@ -1093,7 +1118,7 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString || fmtArg.Kind != KindString {
+	if (src.Kind != KindString && src.Kind != KindStringArena) || (fmtArg.Kind != KindString && fmtArg.Kind != KindStringArena) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date arguments must be text"}
 	}
 	goLayout := pgFormatToGoLayout(fmtArg.StringValue())
@@ -1173,7 +1198,7 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() || fromArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString {
+	if src.Kind != KindString && src.Kind != KindStringArena {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
 	}
 	if fromArg.Kind != KindInt {
@@ -1249,7 +1274,7 @@ func evalToTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) 
 	if src.IsNull() || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString || fmtArg.Kind != KindString {
+	if (src.Kind != KindString && src.Kind != KindStringArena) || (fmtArg.Kind != KindString && fmtArg.Kind != KindStringArena) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp arguments must be text"}
 	}
 	goLayout := pgFormatToGoLayout(fmtArg.StringValue())

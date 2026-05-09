@@ -205,7 +205,7 @@ func toNumeric(d Datum, op parser.OpCode, pos int) (Datum, error) {
 		return d, nil
 	case KindInt:
 		return numericFromInt(d.Int), nil
-	case KindString:
+	case KindString, KindStringArena:
 		if m, s, err := parseNumeric(d.StringValue()); err == nil {
 			return newNumeric(m, int(s)), nil
 		}

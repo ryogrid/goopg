@@ -178,10 +178,10 @@ func encodeDatum(d Datum, buf []byte) []byte {
 		}
 	case KindInt:
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.Int))
-	case KindString:
+	case KindString, KindStringArena:
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.StringValue())))
 		buf = append(buf, d.StringValue()...)
-	case KindBytes:
+	case KindBytes, KindBytesArena:
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.BytesValue())))
 		buf = append(buf, d.BytesValue()...)
 	case KindTime:
@@ -230,7 +230,7 @@ func decodeDatum(data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated int at %d", pos)
 		}
 		return Datum{Kind: KindInt, Int: int64(binary.LittleEndian.Uint64(data[pos:]))}, pos + 8, nil
-	case KindString:
+	case KindString, KindStringArena:
 		if pos+4 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated string len at %d", pos)
 		}
@@ -241,7 +241,7 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		}
 		s := string(data[pos : pos+int(slen)])
 		return NewStringDatum(s), pos + int(slen), nil
-	case KindBytes:
+	case KindBytes, KindBytesArena:
 		if pos+4 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated bytes len at %d", pos)
 		}
@@ -295,9 +295,9 @@ func estimatedRowBytes(row Row) int64 {
 	n := int64(len(row) * 48) // Datum struct fixed overhead
 	for _, d := range row {
 		switch d.Kind {
-		case KindString:
+		case KindString, KindStringArena:
 			n += int64(len(d.StringValue()))
-		case KindBytes:
+		case KindBytes, KindBytesArena:
 			n += int64(len(d.BytesValue()))
 		}
 	}
@@ -355,8 +355,18 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 			}
 			continue
 		}
-		dup := make(Row, len(row))
-		copy(dup, row)
+		// M0073-0004 retention boundary: arena-backed Datums must
+		// be promoted to owned []byte before we accumulate, since
+		// the producer's next Next may trigger arena.Reset and
+		// invalidate the previous page's bytes. The non-arena
+		// fast path preserves the legacy O(width) struct copy.
+		var dup Row
+		if rowHasArena(row) {
+			dup = cloneRowOwned(row)
+		} else {
+			dup = make(Row, len(row))
+			copy(dup, row)
+		}
 		rows = append(rows, dup)
 	}
 

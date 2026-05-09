@@ -220,7 +220,11 @@ func drainScan(op Operator) ([]Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, slot.Row())
+		// Materialize at the public Run boundary so tests
+		// receive owned rows (M0073-0001 promotion: arena-
+		// backed Datums become regular KindString / KindBytes
+		// with Buf payload). Mirrors executor.Run's contract.
+		out = append(out, slot.Materialize().Row())
 	}
 }
 

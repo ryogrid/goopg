@@ -248,6 +248,41 @@ func newBytesArenaDatum(arena *Arena, offset, length int) Datum {
 	}
 }
 
+// MaterializeArena promotes an arena-backed Datum to a regular
+// Buf-backed Datum (KindString / KindBytes) by copying the arena
+// bytes into a fresh []byte. Non-arena Datums pass through
+// unchanged. Used at retention boundaries inside operator state
+// (e.g. aggregateOp.applyAgg's st.value for min/max over varchar
+// — the source arena pages may be reset before the aggregate
+// finishes draining).
+//
+// M0073-0004.
+func (d Datum) MaterializeArena() Datum {
+	switch d.Kind {
+	case KindStringArena:
+		length := int(d.Int & 0xFFFFFFFF)
+		if length == 0 || d.arena == nil {
+			return Datum{Kind: KindString}
+		}
+		offset := int(d.Int >> 32)
+		src := d.arena.Bytes(offset, length)
+		buf := make([]byte, length)
+		copy(buf, src)
+		return Datum{Kind: KindString, Buf: buf}
+	case KindBytesArena:
+		length := int(d.Int & 0xFFFFFFFF)
+		if length == 0 || d.arena == nil {
+			return Datum{Kind: KindBytes}
+		}
+		offset := int(d.Int >> 32)
+		src := d.arena.Bytes(offset, length)
+		buf := make([]byte, length)
+		copy(buf, src)
+		return Datum{Kind: KindBytes, Buf: buf}
+	}
+	return d
+}
+
 // rowHasArena reports whether any Datum in r is arena-backed.
 // Used by Materialize's fast-path skip — most pipeline rows mid-
 // batch are arena-backed (post-M0073-0004 producer wiring); at the
@@ -354,10 +389,10 @@ func (d Datum) Format() string {
 		return "f"
 	case KindInt:
 		return strconv.FormatInt(d.Int, 10)
-	case KindString:
+	case KindString, KindStringArena:
 		return d.StringValue()
-	case KindBytes:
-		return string(d.Buf)
+	case KindBytes, KindBytesArena:
+		return string(d.BytesValue())
 	case KindTime:
 		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
 	case KindInterval:

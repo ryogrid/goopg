@@ -843,6 +843,13 @@ func (o *aggregateOp) evalGroupKey(row Row) (string, Row, error) {
 		if err != nil {
 			return "", nil, err
 		}
+		// M0073-0004 retention boundary: arena-backed Datums
+		// (varchar / char / text / bytea group keys) must be
+		// promoted to owned []byte before they enter
+		// groupRuntime.groupValues — the next input page's
+		// arena.Reset would invalidate them otherwise.
+		// MaterializeArena is a no-op for non-arena Datums.
+		v = v.MaterializeArena()
 		vals = append(vals, v)
 		parts = append(parts, datumKey(v))
 	}
@@ -909,7 +916,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 		st.hasValue = true
 	case "min":
 		if !st.hasValue {
-			st.value = arg
+			// M0073-0004 retention boundary: arena-backed
+			// Datums must be promoted before storage in
+			// st.value (next input page's Reset would
+			// invalidate the arena bytes otherwise).
+			st.value = arg.MaterializeArena()
 			st.hasValue = true
 			return nil
 		}
@@ -918,11 +929,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			return err
 		}
 		if cmp < 0 {
-			st.value = arg
+			st.value = arg.MaterializeArena()
 		}
 	case "max":
 		if !st.hasValue {
-			st.value = arg
+			st.value = arg.MaterializeArena()
 			st.hasValue = true
 			return nil
 		}
@@ -931,7 +942,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			return err
 		}
 		if cmp > 0 {
-			st.value = arg
+			st.value = arg.MaterializeArena()
 		}
 	default:
 		return &ExecError{Code: "0A000", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s is not supported", call.Name)}
@@ -996,6 +1007,14 @@ func drainRows(op Operator) ([]Row, error) {
 
 // drainRowsCtx drains all rows from op, checking ctx.Err() every 1000
 // rows so a CancelRequest can interrupt long hash-join build phases.
+//
+// M0073-0004 retention boundary: when slots carry arena-backed Datums
+// (KindStringArena / KindBytesArena), the cloneRowOwned helper deep-
+// copies the arena bytes into owned []byte. Without this, the build-
+// side hash tables would alias the source operator's per-page arena
+// pages — invalidated on the next arena.Reset() (typically per-page
+// in seqScan, per-Rescan in indexScan). The fast path
+// (rowHasArena=false) preserves the legacy O(width) struct copy.
 func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 	rows := make([]Row, 0)
 	n := 0
@@ -1013,8 +1032,13 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 			return nil, err
 		}
 		row := slotRow(slot)
-		dup := acquireRow(len(row))
-		copy(dup, row)
+		var dup Row
+		if rowHasArena(row) {
+			dup = cloneRowOwned(row)
+		} else {
+			dup = acquireRow(len(row))
+			copy(dup, row)
+		}
 		rows = append(rows, dup)
 		n++
 	}
@@ -1082,9 +1106,9 @@ func datumKey(d Datum) string {
 		return canonicalNumericKey(d.Int, 0)
 	case KindNumeric:
 		return canonicalNumericKey(d.NumericMantissaValue(), int(d.Scale))
-	case KindString:
+	case KindString, KindStringArena:
 		return "s:" + d.StringValue()
-	case KindBytes:
+	case KindBytes, KindBytesArena:
 		return "x:" + string(d.BytesValue())
 	case KindTime:
 		var buf [20]byte

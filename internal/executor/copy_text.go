@@ -256,9 +256,9 @@ func datumToCopyText(t catalog.Type, d Datum) (string, error) {
 		return d.TimeValue().UTC().Format("2006-01-02 15:04:05.000000"), nil
 	default:
 		switch d.Kind {
-		case KindString:
+		case KindString, KindStringArena:
 			return d.StringValue(), nil
-		case KindBytes:
+		case KindBytes, KindBytesArena:
 			return string(d.BytesValue()), nil
 		case KindInt:
 			return strconv.FormatInt(d.Int, 10), nil

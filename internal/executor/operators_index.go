@@ -96,6 +96,14 @@ type indexScanOp struct {
 	// scanRow + cloneRow on append matches seqScanOp's M0054-0005a
 	// pattern and removes the per-tuple alloc from the hot path.
 	scanRow Row
+
+	// arena is the per-Rescan byte allocator for varchar / char /
+	// text / bytea payload (M0073-0004). Reset at the top of every
+	// Rescan, freeing the previous outer's match-set bytes; consumers
+	// that retain rows past the boundary call slot.Materialize() to
+	// deep-copy. Open's standalone path (Rescan(nil, 0)) also uses
+	// this; the arena is owned for the operator's lifetime.
+	arena *Arena
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -131,6 +139,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.idx = 0
 	o.outerSlot = nil
 	o.outerWidth = 0
+	o.arena = NewArena(0)
 
 	o.heapRel = ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(o.heapRel, lockmgr.AccessShareLock); err != nil {
@@ -169,6 +178,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.idx = 0
 	o.outerSlot = outerSlot
 	o.outerWidth = outerWidth
+	// M0073-0004: rewind per-Rescan byte arena. The previous
+	// outer's match-set arena bytes are freed; consumers that
+	// retained rows past this boundary already deep-copied via
+	// slot.Materialize().
+	if o.arena != nil {
+		o.arena.Reset()
+	}
 
 	if o.tree == nil {
 		// Defensive: openPrep must have been called.
@@ -252,7 +268,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
 			o.scanRow = acquireRow(len(o.plan.Table.Columns))
 		}
-		if err := DecodeRowInto(o.scanRow, o.plan.Table.Columns, tuple.Data); err != nil {
+		if err := DecodeRowIntoArena(o.scanRow, o.plan.Table.Columns, tuple.Data, o.arena); err != nil {
 			return false, err
 		}
 		row := o.scanRow
@@ -294,6 +310,10 @@ func (o *indexScanOp) Close() error {
 	if o.scanRow != nil {
 		releaseRow(o.scanRow)
 		o.scanRow = nil
+	}
+	if o.arena != nil {
+		o.arena.Drop()
+		o.arena = nil
 	}
 	return nil
 }
