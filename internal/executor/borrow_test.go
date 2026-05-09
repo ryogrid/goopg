@@ -103,19 +103,9 @@ func TestM0059BuildNLIOuterIsBorrowed(t *testing.T) {
 	}
 }
 
-// TestM0059NLIBorrowFlag pins that nestedLoopIndexJoinOp's
-// SetBorrow flips its own borrow flag (so Next() can return
-// o.joinBuf directly when the parent is borrow-safe).
-func TestM0059NLIBorrowFlag(t *testing.T) {
-	o := &nestedLoopIndexJoinOp{}
-	if o.borrow != OwnedRow {
-		t.Fatalf("default: borrow = %v, want OwnedRow", o.borrow)
-	}
-	o.SetBorrow(BorrowedRow)
-	if o.borrow != BorrowedRow {
-		t.Errorf("after SetBorrow(BorrowedRow): borrow = %v, want BorrowedRow", o.borrow)
-	}
-}
+// (M0071-0013 Stage D-1 removed nestedLoopIndexJoinOp's borrow
+// flag — joinBuf is gone, replaced by VirtualSlot composition;
+// the operator is structurally pass-through at the slot level.)
 
 // --- M0059-0005: retention-boundary regression tests ---
 

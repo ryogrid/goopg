@@ -87,13 +87,12 @@ func Build(plan planner.Node) (Operator, error) {
 		}
 		// Inner is always an *IndexScan by plan-node contract.
 		innerScan := newIndexScanOp(p.Inner)
-		// M0059-0002: NLI consumes one outer row at a time, copies
-		// it into o.joinBuf, then runs the inner Rescan. The outer
-		// row is released before the next pull, so it is safe to
-		// receive borrowed rows from the outer side. The inner is
-		// an *IndexScan that pre-materialises into o.rows[] at
-		// Open() — borrow is a no-op there.
-		setChildBorrow(outer, BorrowedRow)
+		// M0071-0013 Stage D-1: NLI now composes outer + inner via
+		// a persistent VirtualSlot. outerMS.row is overwritten per
+		// outer row before the inner Rescan; the IndexScan still
+		// reads outer columns from the bound Row (slot-aware
+		// BindOuter is M0072 future work). No borrow contract
+		// needed at this boundary.
 		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
 	case *planner.Aggregate:
 		child, err := Build(p.Child)
