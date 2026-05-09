@@ -51,6 +51,22 @@ const (
 	// raw decoded rows (e.g. UPDATE predicates) receive already-detoasted
 	// datums from the underlying scan.
 	KindToastPointer
+	// KindStringArena is an arena-backed string Datum (M0073-0001).
+	// Buf is unused; arena != nil. Datum.Int packs (offset << 32) |
+	// (length & 0xFFFFFFFF) — offset is the arena-relative byte
+	// offset returned by Arena.Allocate; length is the byte count.
+	// StringValue() resolves via arena.Bytes(offset, length).
+	//
+	// Lifetime: the underlying bytes are valid until the arena's
+	// next Reset() call. Callers that retain the Datum across a
+	// Reset MUST go through slot.Materialize(), which calls
+	// cloneRowOwned to deep-copy arena bytes into a regular
+	// KindString Datum (Buf-backed). See
+	// docs/design/0073-0001-datum-arena-field.md.
+	KindStringArena
+	// KindBytesArena mirrors KindStringArena for raw bytes payload.
+	// BytesValue() resolves via arena.Bytes(offset, length).
+	KindBytesArena
 )
 
 // Datum is one column value flowing through the operator tree.
@@ -84,17 +100,25 @@ const (
 // without owning the producer's storage.
 type Datum struct {
 	Kind  DatumKind // 8B (Go int)
-	Int   int64     // 8B
-	Buf   []byte    // 24B (slice header)
+	Int   int64     // 8B (arena-Datum: (offset<<32)|length)
+	Buf   []byte    // 24B (slice header; nil for arena variants)
 	Big   *big.Int  // 8B
 	Scale int16     // 2B
+	// arena is non-nil only when Kind is KindStringArena /
+	// KindBytesArena. Datum.Int packs the (offset, length) into
+	// the arena's byte stream; StringValue() / BytesValue() resolve
+	// via arena.Bytes(offset, length). For all other Kinds, arena
+	// is nil and the legacy Buf-based path applies.
+	//
+	// M0073-0001 — see docs/design/0073-0001-datum-arena-field.md.
+	arena *Arena // 8B
+	// 6B padding → 64B exact.
 }
 
-// Compile-time assertion that Datum is no larger than 64 bytes
-// (we target ~48-56 with padding). When the runtime adds fields,
-// this catches unintended growth at build time. The trick: build a
-// zero-length array whose size is `64 - sizeof(Datum)`. If that is
-// negative, the array bound is invalid and the build fails.
+// Compile-time assertion that Datum is exactly 64 bytes after
+// M0073-0001 added the arena pointer. Pre-M0073 the struct was
+// 56 B with 8 B padding; the new field consumed all the headroom.
+// Future field additions trigger the M0074 packed-layout work.
 const _ uintptr = 64 - unsafe.Sizeof(Datum{}) // compile error if > 64
 
 // NullDatum is the canonical null value. Any Kind with IsNull() true
@@ -109,20 +133,37 @@ func (d Datum) IsNull() bool { return d.Kind == KindNull }
 // BoolValue extracts the bool payload of a KindBool Datum.
 func (d Datum) BoolValue() bool { return d.Int != 0 }
 
-// StringValue extracts the string payload of a KindString Datum.
-// Returned string aliases Buf (zero-copy); callers must not mutate
-// Buf while the returned string is live.
+// StringValue extracts the string payload of a KindString /
+// KindStringArena Datum. Returned string aliases the underlying
+// bytes (zero-copy); callers must not mutate the source while the
+// returned string is live, and MUST treat the returned string as
+// invalid past the arena's next Reset() when the source is an
+// arena-backed Datum (M0073-0001).
 func (d Datum) StringValue() string {
+	if d.Kind == KindStringArena {
+		buf := d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))
+		if len(buf) == 0 {
+			return ""
+		}
+		return unsafe.String(&buf[0], len(buf))
+	}
 	if len(d.Buf) == 0 {
 		return ""
 	}
 	return unsafe.String(&d.Buf[0], len(d.Buf))
 }
 
-// BytesValue returns the byte payload of KindBytes / KindToastPointer.
-// The slice aliases Buf; callers MUST NOT mutate it unless they own
-// the producer's storage.
-func (d Datum) BytesValue() []byte { return d.Buf }
+// BytesValue returns the byte payload of KindBytes / KindBytesArena
+// / KindToastPointer. The slice aliases the underlying bytes (Buf
+// for non-arena variants, arena page for arena variants); callers
+// MUST NOT mutate it, and MUST treat arena-backed bytes as invalid
+// past the arena's next Reset().
+func (d Datum) BytesValue() []byte {
+	if d.Kind == KindBytesArena {
+		return d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))
+	}
+	return d.Buf
+}
 
 // TimeValue returns the timestamp payload of a KindTime Datum,
 // reconstructed from the Unix nanoseconds stored in Int. Always UTC.
@@ -185,6 +226,83 @@ func NewStringDatum(s string) Datum {
 // NewBytesDatum constructs a KindBytes Datum.
 func NewBytesDatum(b []byte) Datum {
 	return Datum{Kind: KindBytes, Buf: b}
+}
+
+// newStringArenaDatum constructs a KindStringArena Datum encoding
+// the (offset, length) pair into the Int field. Used by the
+// arena-aware decode path (M0073-0002 wires this through).
+func newStringArenaDatum(arena *Arena, offset, length int) Datum {
+	return Datum{
+		Kind:  KindStringArena,
+		Int:   int64(offset)<<32 | int64(length)&0xFFFFFFFF,
+		arena: arena,
+	}
+}
+
+// newBytesArenaDatum constructs a KindBytesArena Datum.
+func newBytesArenaDatum(arena *Arena, offset, length int) Datum {
+	return Datum{
+		Kind:  KindBytesArena,
+		Int:   int64(offset)<<32 | int64(length)&0xFFFFFFFF,
+		arena: arena,
+	}
+}
+
+// rowHasArena reports whether any Datum in r is arena-backed.
+// Used by Materialize's fast-path skip — most pipeline rows mid-
+// batch are arena-backed (post-M0073-0004 producer wiring); at the
+// retention boundary (sortOp / windowOp / lockRowsOp / executor.Run)
+// Materialize calls cloneRowOwned to deep-copy arena bytes into
+// owned []byte. Pre-M0073-0004 (this commit) the helper is unused
+// in production; the test surface exercises it directly.
+func rowHasArena(r Row) bool {
+	for _, d := range r {
+		if d.Kind == KindStringArena || d.Kind == KindBytesArena {
+			return true
+		}
+	}
+	return false
+}
+
+// cloneRowOwned produces a Row with the same logical values as
+// src but with arena-backed Datums promoted to regular KindString
+// / KindBytes Datums whose Buf is freshly allocated. Non-arena
+// Datums pass through unchanged.
+//
+// Used by MaterializedSlot.Materialize at the slot pipeline's
+// retention boundaries so consumers that hold rows past the
+// producer's next Reset() see independent storage.
+func cloneRowOwned(src Row) Row {
+	dst := acquireRow(len(src))
+	for i, d := range src {
+		switch d.Kind {
+		case KindStringArena:
+			length := int(d.Int & 0xFFFFFFFF)
+			if length == 0 || d.arena == nil {
+				dst[i] = Datum{Kind: KindString}
+				continue
+			}
+			offset := int(d.Int >> 32)
+			src := d.arena.Bytes(offset, length)
+			buf := make([]byte, length)
+			copy(buf, src)
+			dst[i] = Datum{Kind: KindString, Buf: buf}
+		case KindBytesArena:
+			length := int(d.Int & 0xFFFFFFFF)
+			if length == 0 || d.arena == nil {
+				dst[i] = Datum{Kind: KindBytes}
+				continue
+			}
+			offset := int(d.Int >> 32)
+			src := d.arena.Bytes(offset, length)
+			buf := make([]byte, length)
+			copy(buf, src)
+			dst[i] = Datum{Kind: KindBytes, Buf: buf}
+		default:
+			dst[i] = d
+		}
+	}
+	return dst
 }
 
 // NewTimeDatum constructs a KindTime Datum from a time.Time.

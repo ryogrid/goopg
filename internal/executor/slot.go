@@ -76,7 +76,24 @@ func (s *MaterializedSlot) Width() int             { return len(s.row) }
 func (s *MaterializedSlot) Get(col int) Datum      { return s.row[col] }
 func (s *MaterializedSlot) IsNull(col int) bool    { return s.row[col].IsNull() }
 func (s *MaterializedSlot) Row() Row               { return s.row }
+
+// Materialize promotes any arena-backed Datums in the row to
+// owned KindString / KindBytes Datums (Buf-backed) so the
+// returned slot's bytes survive the producer's next
+// arena.Reset(). When no arena Datums are present, returns
+// self — the no-arena fast path is byte-for-byte unchanged
+// from the M0069-0001 contract.
+//
+// M0073-0001 introduced the arena variants; the promotion
+// path is exercised once M0073-0004 wires SeqScan / IndexScan
+// arena binding. Without producer wiring (this commit) the
+// rowHasArena fast path is always false in production flow,
+// so Materialize stays a no-op for backward compatibility.
 func (s *MaterializedSlot) Materialize() *MaterializedSlot {
+	if !rowHasArena(s.row) {
+		return s
+	}
+	s.row = cloneRowOwned(s.row)
 	return s
 }
 

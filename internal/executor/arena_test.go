@@ -10,11 +10,11 @@ import (
 func TestM0072ArenaAllocateRead(t *testing.T) {
 	a := NewArena(0)
 
-	s1 := a.Allocate(8)
+	s1 , _ := a.Allocate(8)
 	copy(s1, []byte("abcdefgh"))
-	s2 := a.Allocate(4)
+	s2 , _ := a.Allocate(4)
 	copy(s2, []byte("WXYZ"))
-	s3 := a.Allocate(16)
+	s3 , _ := a.Allocate(16)
 	copy(s3, []byte("0123456789ABCDEF"))
 
 	if !bytes.Equal(s1, []byte("abcdefgh")) {
@@ -38,7 +38,7 @@ func TestM0072ArenaResetReuses(t *testing.T) {
 	a := NewArena(0)
 
 	for i := 0; i < 10; i++ {
-		s := a.Allocate(32)
+		s , _ := a.Allocate(32)
 		copy(s, bytes.Repeat([]byte{byte('A' + i)}, 32))
 	}
 	pagesBefore := a.PageCount()
@@ -52,7 +52,7 @@ func TestM0072ArenaResetReuses(t *testing.T) {
 	}
 
 	// New allocations should reuse the existing page memory.
-	s := a.Allocate(16)
+	s , _ := a.Allocate(16)
 	copy(s, []byte("after-reset-payload"[:16]))
 	if got := a.PageCount(); got != pagesBefore {
 		t.Errorf("PageCount after Reset+Allocate: got %d, want unchanged %d",
@@ -69,12 +69,12 @@ func TestM0072ArenaResetReuses(t *testing.T) {
 func TestM0072ArenaPageGrowth(t *testing.T) {
 	a := NewArena(64) // tiny pages to force growth
 
-	s1 := a.Allocate(48)
+	s1 , _ := a.Allocate(48)
 	copy(s1, bytes.Repeat([]byte{'X'}, 48))
 
 	// 48 + 32 = 80 > 64 → should land in page 2 and leave s1
 	// intact in page 1.
-	s2 := a.Allocate(32)
+	s2 , _ := a.Allocate(32)
 	copy(s2, bytes.Repeat([]byte{'Y'}, 32))
 
 	if !bytes.Equal(s1, bytes.Repeat([]byte{'X'}, 48)) {
@@ -94,16 +94,16 @@ func TestM0072ArenaOversizedAllocation(t *testing.T) {
 	a := NewArena(64)
 
 	// Small allocation establishes the active small page.
-	s1 := a.Allocate(16)
+	s1 , _ := a.Allocate(16)
 	copy(s1, []byte("0123456789ABCDEF"))
 
 	// Oversized payload (256 > 64) gets its own dedicated page.
-	big := a.Allocate(256)
+	big , _ := a.Allocate(256)
 	copy(big, bytes.Repeat([]byte{'B'}, 256))
 
 	// Subsequent small allocation should still land in the
 	// original active page (s2 fits next to s1).
-	s2 := a.Allocate(16)
+	s2 , _ := a.Allocate(16)
 	copy(s2, bytes.Repeat([]byte{'S'}, 16))
 
 	if !bytes.Equal(s1, []byte("0123456789ABCDEF")) {
@@ -121,7 +121,7 @@ func TestM0072ArenaOversizedAllocation(t *testing.T) {
 // returns nil so callers don't get a stale page reference.
 func TestM0072ArenaZeroLengthAllocation(t *testing.T) {
 	a := NewArena(0)
-	if got := a.Allocate(0); got != nil {
+	if got , _ := a.Allocate(0); got != nil {
 		t.Errorf("Allocate(0) = %v, want nil", got)
 	}
 }
@@ -141,7 +141,7 @@ func TestM0072ArenaDropResets(t *testing.T) {
 	}
 
 	// Reusable after Drop.
-	s := a.Allocate(8)
+	s , _ := a.Allocate(8)
 	if len(s) != 8 {
 		t.Errorf("post-Drop Allocate(8) returned len %d", len(s))
 	}
