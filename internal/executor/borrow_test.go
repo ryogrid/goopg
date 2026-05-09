@@ -70,29 +70,9 @@ func TestBorrowPropagatesThroughFilterAndProject(t *testing.T) {
 
 // --- M0059-0001: per-operator-class borrow contract tests ---
 
-// TestClass1FilterPropagatesBorrowToChild pins the class-1
-// invariant: filterOp.SetBorrow flips its child's contract too.
-func TestClass1FilterPropagatesBorrowToChild(t *testing.T) {
-	src := &fakeBorrowSource{rows: []Row{{{Kind: KindInt, Int: 7}}}}
-	// Construct directly to avoid newFilterOp's plan-pointer
-	// dereference for predicate extraction.
-	f := &filterOp{child: src}
-	f.SetBorrow(BorrowedRow)
-	if src.borrow != BorrowedRow {
-		t.Errorf("filterOp.SetBorrow did not propagate to child: src.borrow = %v", src.borrow)
-	}
-}
-
-// TestClass1LimitPropagatesBorrowToChild pins the class-1
-// invariant for limitOp.
-func TestClass1LimitPropagatesBorrowToChild(t *testing.T) {
-	src := &fakeBorrowSource{rows: []Row{{{Kind: KindInt, Int: 7}}}}
-	l := &limitOp{child: src, limitCount: -1}
-	l.SetBorrow(BorrowedRow)
-	if src.borrow != BorrowedRow {
-		t.Errorf("limitOp.SetBorrow did not propagate to child: src.borrow = %v", src.borrow)
-	}
-}
+// (M0071-0012 Stage C removed the filterOp / limitOp borrow
+// propagation tests — those operators are now structurally
+// pass-through and own no Row buffer; SetBorrow no longer exists.)
 
 // TestM0059BuildAggregateChildIsBorrowed pins M0059-0002:
 // Build wires *planner.Aggregate's child as BorrowedRow because

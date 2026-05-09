@@ -102,14 +102,16 @@ func (o *projectOp) Next() (TupleSlot, error) {
 
 // filterOp drops rows where the predicate doesn't evaluate to TRUE.
 // NULL predicates exclude the row, matching SQL semantics.
+//
+// M0071-0012 Stage C: pass-through. The predicate is evaluated
+// directly against the child's slot via evalExprSlot — no Row
+// materialisation in the hot path. Matching slots are forwarded
+// to the parent unchanged, so filter never owns Row buffers and
+// no borrow contract is needed.
 type filterOp struct {
 	child Operator
 	pred  planner.Expr
 	ctx   *Context
-	// M0054-0005a-followup: pure pass-through borrow. The Filter
-	// returns its child's row unchanged, so it can borrow exactly
-	// as long as its parent allows it.
-	borrow BorrowSemantics
 }
 
 func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
@@ -119,16 +121,6 @@ func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
 func (o *filterOp) Open(ctx *Context) error { o.ctx = ctx; return o.child.Open(ctx) }
 func (o *filterOp) Schema() planner.Schema  { return o.child.Schema() }
 func (o *filterOp) Close() error            { return o.child.Close() }
-
-// SetBorrow propagates the borrow contract to the child. filterOp
-// itself never copies — it just hands through. So borrow-OK at
-// filter ⇒ borrow-OK at child. (M0054-0005a-followup.)
-func (o *filterOp) SetBorrow(s BorrowSemantics) {
-	o.borrow = s
-	if b, ok := o.child.(Borrowable); ok {
-		b.SetBorrow(s)
-	}
-}
 
 func (o *filterOp) Next() (TupleSlot, error) {
 	rejected := 0
@@ -145,8 +137,12 @@ func (o *filterOp) Next() (TupleSlot, error) {
 		if err != nil {
 			return nil, err
 		}
-		row := slotRow(slot)
-		v, err := evalExpr(o.pred, row, o.ctx)
+		if slot == nil {
+			// DML / utility ops surface (nil, nil) for "advance
+			// done, no row to surface" — propagate without eval.
+			return nil, nil
+		}
+		v, err := evalExprSlot(o.pred, slot, o.ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -159,6 +155,10 @@ func (o *filterOp) Next() (TupleSlot, error) {
 
 // limitOp implements LIMIT/OFFSET. Both are evaluated once at Open
 // so a long stream doesn't re-evaluate.
+//
+// M0071-0012 Stage C: pass-through. limitOp returns the child's
+// slot unchanged on each emitted row — it owns no Row buffer and
+// no borrow contract is needed.
 type limitOp struct {
 	child       Operator
 	limitExpr   planner.Expr
@@ -167,16 +167,6 @@ type limitOp struct {
 	offsetCount int64
 	emitted     int64
 	skipped     int64
-	// M0054-0005a-followup: pass-through borrow.
-	borrow BorrowSemantics
-}
-
-// SetBorrow propagates to the child. (M0054-0005a-followup.)
-func (o *limitOp) SetBorrow(s BorrowSemantics) {
-	o.borrow = s
-	if b, ok := o.child.(Borrowable); ok {
-		b.SetBorrow(s)
-	}
 }
 
 func newLimitOp(plan *planner.Limit, child Operator) *limitOp {
