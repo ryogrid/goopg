@@ -52,7 +52,7 @@ func TestUpdateRewritesMatchingRows(t *testing.T) {
 		Child: &planner.Filter{
 			Child: &planner.SeqScan{Table: tbl},
 			Predicate: &planner.BinaryOp{
-				Op:    "=",
+				Op: parser.OpEq,
 				Left:  &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
 				Right: &planner.IntegerConst{Value: 2},
 			},
@@ -114,7 +114,7 @@ func TestDeleteStampsXmax(t *testing.T) {
 		Child: &planner.Filter{
 			Child: &planner.SeqScan{Table: tbl},
 			Predicate: &planner.BinaryOp{
-				Op:    "=",
+				Op: parser.OpEq,
 				Left:  &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
 				Right: &planner.IntegerConst{Value: 2},
 			},

@@ -1,5 +1,7 @@
 package planner
 
+import "github.com/goopg/goopg/internal/parser"
+
 // unnestSubqueriesInPlan walks the plan tree and attempts to
 // unnest any SubqueryExpr found in Filter predicates. This is
 // the post-pass called after the initial plan tree is built
@@ -200,7 +202,7 @@ func collectUnnestParams(node Node) []unnestParam {
 	outerInEquijoin := make(map[*OuterColumnRef]bool)
 	walkPlanExprs(node, func(e Expr) {
 		bin, ok := e.(*BinaryOp)
-		if !ok || bin.Op != "=" {
+		if !ok || bin.Op != parser.OpEq {
 			return
 		}
 		outer, col := extractEquijoinPair(bin.Left, bin.Right)
@@ -923,17 +925,17 @@ func unnestSubquery(sub *SubqueryExpr, outer Node) (Node, error) {
 	}
 	// Build the join Predicate as AND of all per-pair equalities.
 	var joinPredicate Expr = &BinaryOp{
-		pos: sub.Pos(), Op: "=",
+		pos: sub.Pos(), Op: parser.OpEq,
 		Left:  outerKeyExprs[0],
 		Right: innerKeyExprs[0],
 	}
 	for i := 1; i < len(params); i++ {
 		eq := &BinaryOp{
-			pos: sub.Pos(), Op: "=",
+			pos: sub.Pos(), Op: parser.OpEq,
 			Left:  outerKeyExprs[i],
 			Right: innerKeyExprs[i],
 		}
-		joinPredicate = &BinaryOp{pos: sub.Pos(), Op: "AND", Left: joinPredicate, Right: eq}
+		joinPredicate = &BinaryOp{pos: sub.Pos(), Op: parser.OpAnd, Left: joinPredicate, Right: eq}
 	}
 	mergedSchema := make(Schema, outerWidth+len(subSchema))
 	copy(mergedSchema, outerChild.Output())
@@ -1161,7 +1163,7 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 
 	// Build a semi-join predicate that replaces the IN expression
 	// in the filter.  `column = inner_col` (single param).
-	semiPred := &BinaryOp{pos: in.Pos(), Op: "=", Left: outerKey, Right: innerKey}
+	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
 
 	// Remove the IN conjunct from the filter and add the
 	// semi-join predicate.
@@ -1310,7 +1312,7 @@ func unnestNonCorrelatedInExpr(in *InExpr, outer Node) (Node, error) {
 	// the outer width). The executor's JoinTypeSemi already emits
 	// just the probe row; preserving the outer schema here keeps
 	// every upstream column index valid.
-	semiPred := &BinaryOp{pos: in.Pos(), Op: "=", Left: outerKey, Right: innerKey}
+	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
 	_ = innerWidth
 	join := &Join{
 		pos:       in.Pos(),
@@ -1463,7 +1465,7 @@ func liftInnerOnlyFilterConjuncts(node Node) []Expr {
 		out := make([]Expr, 0, len(conjs))
 		for _, c := range conjs {
 			// Tautology check: ColumnRef = ColumnRef same Index/Name.
-			if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+			if bin, ok := c.(*BinaryOp); ok && bin.Op == parser.OpEq {
 				if l, lok := bin.Left.(*ColumnRef); lok {
 					if r, rok := bin.Right.(*ColumnRef); rok {
 						if l.Index == r.Index && l.Name == r.Name {
@@ -1565,7 +1567,7 @@ func stripOuterRefConjuncts(node Node) {
 					hasOuter = true
 				}
 			})
-			if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+			if bin, ok := c.(*BinaryOp); ok && bin.Op == parser.OpEq {
 				if l, lok := bin.Left.(*ColumnRef); lok {
 					if r, rok := bin.Right.(*ColumnRef); rok {
 						if l.Index == r.Index && l.Name == r.Name {
@@ -1644,7 +1646,7 @@ func collectExistsUnnestParamsAndResiduals(node Node) *existsUnnestPlan {
 			walkFilters(x.Child)
 			for _, c := range splitAnd(x.Predicate) {
 				bin, ok := c.(*BinaryOp)
-				if ok && bin.Op == "=" {
+				if ok && bin.Op == parser.OpEq {
 					outer, col := extractEquijoinPair(bin.Left, bin.Right)
 					if outer != nil && col != nil {
 						params = append(params, unnestParam{OuterRef: outer, SubCol: col})
@@ -1795,7 +1797,7 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 			topConjunct = c
 			break
 		}
-		if u, ok := c.(*UnaryOp); ok && (u.Op == "NOT" || u.Op == "not") {
+		if u, ok := c.(*UnaryOp); ok && u.Op == parser.OpNot {
 			if u.Operand == conjunct {
 				topConjunct = c
 				negated = !negated

@@ -292,9 +292,12 @@ func (e *ParamRef) Pos() int { return e.pos }
 func (*ParamRef) exprNode()  {}
 
 // BinaryOp — Left Op Right.
+//
+// M0073-0003: Op is now parser.OpCode (int8 enum), was
+// string. Mirror of parser.BinaryOp's field type.
 type BinaryOp struct {
 	pos   int
-	Op    string
+	Op    parser.OpCode
 	Left  Expr
 	Right Expr
 }
@@ -303,9 +306,11 @@ func (e *BinaryOp) Pos() int { return e.pos }
 func (*BinaryOp) exprNode()  {}
 
 // UnaryOp — Op Operand.
+//
+// M0073-0003: Op is parser.OpCode (int8 enum), was string.
 type UnaryOp struct {
 	pos     int
-	Op      string
+	Op      parser.OpCode
 	Operand Expr
 }
 

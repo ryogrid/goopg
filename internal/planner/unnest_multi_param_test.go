@@ -60,7 +60,7 @@ func TestUnnestMultiParamCorrelation(t *testing.T) {
 	}
 	for _, c := range conjuncts {
 		bop, ok := c.(*BinaryOp)
-		if !ok || bop.Op != "=" {
+		if !ok || bop.Op != parser.OpEq {
 			t.Errorf("expected binary `=` conjunct, got %T %v", c, c)
 		}
 	}

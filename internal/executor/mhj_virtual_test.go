@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -126,7 +127,7 @@ func TestM0071MHJEvalFiltersViaSlot(t *testing.T) {
 		},
 	)
 	pred := &planner.BinaryOp{
-		Op:    "=",
+		Op:    parser.OpEq,
 		Left:  &planner.ColumnRef{Index: 0},
 		Right: &planner.ColumnRef{Index: 1},
 	}

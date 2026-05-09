@@ -3,7 +3,8 @@ package planner
 import (
 	"fmt"
 	"strconv"
-	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // FoldConstants performs a bottom-up constant-folding pass on a resolved
@@ -138,12 +139,10 @@ func foldPlanConstants(node Node) {
 // tryFoldBinaryOp attempts to evaluate a binary operation whose operands have
 // already been folded. Returns nil when the fold cannot be performed (e.g.,
 // one operand is a non-literal ColumnRef).
-func tryFoldBinaryOp(pos int, op string, l, r Expr) Expr {
-	opU := strings.ToUpper(op)
-
+func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 	// Boolean short-circuit for AND/OR regardless of the other operand's type.
-	switch opU {
-	case "AND":
+	switch op {
+	case parser.OpAnd:
 		if lb, ok := l.(*BooleanConst); ok {
 			if !lb.Value {
 				return &BooleanConst{pos: pos, Value: false} // FALSE AND x → FALSE
@@ -167,7 +166,7 @@ func tryFoldBinaryOp(pos int, op string, l, r Expr) Expr {
 				return &BooleanConst{pos: pos, Value: false}
 			}
 		}
-	case "OR":
+	case parser.OpOr:
 		if lb, ok := l.(*BooleanConst); ok {
 			if lb.Value {
 				return &BooleanConst{pos: pos, Value: true} // TRUE OR x → TRUE
@@ -207,7 +206,7 @@ func tryFoldBinaryOp(pos int, op string, l, r Expr) Expr {
 	if !lok || !rok {
 		return nil
 	}
-	result, err := evalLiteralBinary(pos, opU, lv, rv)
+	result, err := evalLiteralBinary(pos, op, lv, rv)
 	if err != nil {
 		return nil // silently skip: leave expression unfolded on type mismatch
 	}
@@ -215,16 +214,16 @@ func tryFoldBinaryOp(pos int, op string, l, r Expr) Expr {
 }
 
 // tryFoldUnaryOp attempts to evaluate a unary operation on a literal.
-func tryFoldUnaryOp(pos int, op string, operand Expr) Expr {
+func tryFoldUnaryOp(pos int, op parser.OpCode, operand Expr) Expr {
 	if _, ok := operand.(*NullConst); ok {
 		return &NullConst{pos: pos}
 	}
-	switch strings.ToUpper(op) {
-	case "NOT":
+	switch op {
+	case parser.OpNot:
 		if bc, ok := operand.(*BooleanConst); ok {
 			return &BooleanConst{pos: pos, Value: !bc.Value}
 		}
-	case "-":
+	case parser.OpUnaryNeg:
 		if ic, ok := operand.(*IntegerConst); ok {
 			return &IntegerConst{pos: pos, Value: -ic.Value}
 		}
@@ -234,7 +233,7 @@ func tryFoldUnaryOp(pos int, op string, operand Expr) Expr {
 			}
 			return &NumericConst{pos: pos, Value: "-" + nc.Value}
 		}
-	case "+":
+	case parser.OpUnaryPos:
 		if _, ok := operand.(*IntegerConst); ok {
 			return operand
 		}
@@ -312,27 +311,27 @@ func toLiteralValue(e Expr) (literalValue, bool) {
 // evalLiteralBinary evaluates a binary operator over two literal values and
 // returns the result as a planner literal expression. Returns an error when
 // the types are incompatible with the operator.
-func evalLiteralBinary(pos int, op string, l, r literalValue) (Expr, error) {
+func evalLiteralBinary(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 	switch op {
-	case "+", "-", "*", "/", "%":
+	case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 		return evalArith(pos, op, l, r)
-	case "||":
+	case parser.OpConcat:
 		if l.kind == "str" && r.kind == "str" {
 			return &StringConst{pos: pos, Value: l.strV + r.strV}, nil
 		}
 		return nil, fmt.Errorf("|| requires string operands")
-	case "=", "<>", "!=", "<", ">", "<=", ">=":
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpGt, parser.OpLe, parser.OpGe:
 		cmp, err := litCompare(l, r)
 		if err != nil {
 			return nil, err
 		}
 		return &BooleanConst{pos: pos, Value: cmpResult(op, cmp)}, nil
-	case "AND":
+	case parser.OpAnd:
 		if l.kind == "bool" && r.kind == "bool" {
 			return &BooleanConst{pos: pos, Value: l.boolV && r.boolV}, nil
 		}
 		return nil, fmt.Errorf("AND requires boolean operands")
-	case "OR":
+	case parser.OpOr:
 		if l.kind == "bool" && r.kind == "bool" {
 			return &BooleanConst{pos: pos, Value: l.boolV || r.boolV}, nil
 		}
@@ -341,23 +340,23 @@ func evalLiteralBinary(pos int, op string, l, r literalValue) (Expr, error) {
 	return nil, fmt.Errorf("unsupported operator %s", op)
 }
 
-func evalArith(pos int, op string, l, r literalValue) (Expr, error) {
+func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 	// Promote both sides: int×int stays int; anything with num → numeric.
 	if l.kind == "int" && r.kind == "int" {
 		a, b := l.intV, r.intV
 		switch op {
-		case "+":
+		case parser.OpAdd:
 			return &IntegerConst{pos: pos, Value: a + b}, nil
-		case "-":
+		case parser.OpSub:
 			return &IntegerConst{pos: pos, Value: a - b}, nil
-		case "*":
+		case parser.OpMul:
 			return &IntegerConst{pos: pos, Value: a * b}, nil
-		case "/":
+		case parser.OpDiv:
 			if b == 0 {
 				return nil, fmt.Errorf("division by zero")
 			}
 			return &IntegerConst{pos: pos, Value: a / b}, nil
-		case "%":
+		case parser.OpMod:
 			if b == 0 {
 				return nil, fmt.Errorf("division by zero")
 			}
@@ -379,13 +378,13 @@ func evalArith(pos int, op string, l, r literalValue) (Expr, error) {
 	}
 	var result float64
 	switch op {
-	case "+":
+	case parser.OpAdd:
 		result = lf + rf
-	case "-":
+	case parser.OpSub:
 		result = lf - rf
-	case "*":
+	case parser.OpMul:
 		result = lf * rf
-	case "/":
+	case parser.OpDiv:
 		if rf == 0 {
 			return nil, fmt.Errorf("division by zero")
 		}
@@ -497,19 +496,19 @@ func cmpF64(a, b float64) int {
 	return 0
 }
 
-func cmpResult(op string, cmp int) bool {
+func cmpResult(op parser.OpCode, cmp int) bool {
 	switch op {
-	case "=":
+	case parser.OpEq:
 		return cmp == 0
-	case "<>", "!=":
+	case parser.OpNe:
 		return cmp != 0
-	case "<":
+	case parser.OpLt:
 		return cmp < 0
-	case ">":
+	case parser.OpGt:
 		return cmp > 0
-	case "<=":
+	case parser.OpLe:
 		return cmp <= 0
-	case ">=":
+	case parser.OpGe:
 		return cmp >= 0
 	}
 	return false

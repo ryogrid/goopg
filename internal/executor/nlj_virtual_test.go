@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -71,7 +72,7 @@ func TestM0071NLIPredicateSlotEval(t *testing.T) {
 	outerSchema := planner.Schema{{Name: "o0"}}
 	innerSchema := planner.Schema{{Name: "i0"}}
 	pred := &planner.BinaryOp{
-		Op:    "=",
+		Op: parser.OpEq,
 		Left:  &planner.ColumnRef{Name: "o0", Index: 0},
 		Right: &planner.ColumnRef{Name: "i0", Index: 1},
 	}

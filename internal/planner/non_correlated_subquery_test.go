@@ -18,7 +18,7 @@ func TestPlanHasOuterRef_NonCorrelated(t *testing.T) {
 			pos:   0,
 			Child: &SeqScan{pos: 0, Table: &catalog.Table{Name: "customer"}},
 			Predicate: &BinaryOp{
-				pos: 0, Op: ">",
+				pos: 0, Op: parser.OpGt,
 				Left:  &ColumnRef{pos: 0, Index: 5, Name: "c_acctbal", Type: catalog.Type{Name: "numeric"}},
 				Right: &IntegerConst{pos: 0, Value: 0},
 			},
@@ -42,7 +42,7 @@ func TestPlanHasOuterRef_Correlated(t *testing.T) {
 		pos:   0,
 		Child: &SeqScan{pos: 0, Table: &catalog.Table{Name: "lineitem"}},
 		Predicate: &BinaryOp{
-			pos: 0, Op: "=",
+			pos: 0, Op: parser.OpEq,
 			Left:  &ColumnRef{pos: 0, Index: 1, Name: "l_partkey", Type: catalog.Type{Name: "int8"}},
 			Right: outer,
 		},
@@ -64,7 +64,7 @@ func TestPlanHasOuterRef_NestedSubquery(t *testing.T) {
 		pos:   0,
 		Child: &SeqScan{pos: 0, Table: &catalog.Table{Name: "t2"}},
 		Predicate: &BinaryOp{
-			pos: 0, Op: "=",
+			pos: 0, Op: parser.OpEq,
 			Left:  &ColumnRef{pos: 0, Index: 0, Name: "y", Type: catalog.Type{Name: "int8"}},
 			Right: outer,
 		},

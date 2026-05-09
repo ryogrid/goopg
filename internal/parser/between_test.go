@@ -19,15 +19,15 @@ func TestParseBetweenDesugar(t *testing.T) {
 	}
 	sel := stmts[0].(*SelectStmt)
 	andOp, ok := sel.Where.(*BinaryOp)
-	if !ok || andOp.Op != "AND" {
+	if !ok || andOp.Op != OpAnd {
 		t.Fatalf("WHERE root=%T(%v), want BinaryOp{AND}", sel.Where, sel.Where)
 	}
 	ge, ok := andOp.Left.(*BinaryOp)
-	if !ok || ge.Op != ">=" {
+	if !ok || ge.Op != OpGe {
 		t.Errorf("AND.Left=%T(%v), want BinaryOp{>=}", andOp.Left, andOp.Left)
 	}
 	le, ok := andOp.Right.(*BinaryOp)
-	if !ok || le.Op != "<=" {
+	if !ok || le.Op != OpLe {
 		t.Errorf("AND.Right=%T(%v), want BinaryOp{<=}", andOp.Right, andOp.Right)
 	}
 }
@@ -39,11 +39,11 @@ func TestParseNotBetweenDesugar(t *testing.T) {
 	}
 	sel := stmts[0].(*SelectStmt)
 	notOp, ok := sel.Where.(*UnaryOp)
-	if !ok || notOp.Op != "NOT" {
+	if !ok || notOp.Op != OpNot {
 		t.Fatalf("WHERE root=%T(%v), want UnaryOp{NOT}", sel.Where, sel.Where)
 	}
 	andOp, ok := notOp.Operand.(*BinaryOp)
-	if !ok || andOp.Op != "AND" {
+	if !ok || andOp.Op != OpAnd {
 		t.Errorf("NOT.Operand=%T(%v), want BinaryOp{AND}", notOp.Operand, notOp.Operand)
 	}
 }
@@ -60,7 +60,7 @@ func TestParseBetweenWithTrailingAnd(t *testing.T) {
 	sel := stmts[0].(*SelectStmt)
 	// Top-level should be `((BETWEEN-tree) AND (y > 5))`.
 	root, ok := sel.Where.(*BinaryOp)
-	if !ok || root.Op != "AND" {
+	if !ok || root.Op != OpAnd {
 		t.Fatalf("WHERE root=%T(%v), want top-level AND", sel.Where, sel.Where)
 	}
 	// Left side is the BETWEEN desugar — itself an AND of two
@@ -70,7 +70,7 @@ func TestParseBetweenWithTrailingAnd(t *testing.T) {
 	}
 	// Right side is the y > 5 comparison.
 	gt, ok := root.Right.(*BinaryOp)
-	if !ok || gt.Op != ">" {
+	if !ok || gt.Op != OpGt {
 		t.Errorf("AND.Right=%T(%v), want BinaryOp{>}", root.Right, root.Right)
 	}
 }

@@ -104,42 +104,42 @@ func TestFoldBooleanShortCircuit(t *testing.T) {
 	}{
 		{
 			"TRUE AND col",
-			&BinaryOp{Op: "AND", Left: &BooleanConst{Value: true}, Right: col},
+			&BinaryOp{Op: parser.OpAnd, Left: &BooleanConst{Value: true}, Right: col},
 			col,
 		},
 		{
 			"FALSE AND col",
-			&BinaryOp{Op: "AND", Left: &BooleanConst{Value: false}, Right: col},
+			&BinaryOp{Op: parser.OpAnd, Left: &BooleanConst{Value: false}, Right: col},
 			&BooleanConst{Value: false},
 		},
 		{
 			"col AND TRUE",
-			&BinaryOp{Op: "AND", Left: col, Right: &BooleanConst{Value: true}},
+			&BinaryOp{Op: parser.OpAnd, Left: col, Right: &BooleanConst{Value: true}},
 			col,
 		},
 		{
 			"col AND FALSE",
-			&BinaryOp{Op: "AND", Left: col, Right: &BooleanConst{Value: false}},
+			&BinaryOp{Op: parser.OpAnd, Left: col, Right: &BooleanConst{Value: false}},
 			&BooleanConst{Value: false},
 		},
 		{
 			"TRUE OR col",
-			&BinaryOp{Op: "OR", Left: &BooleanConst{Value: true}, Right: col},
+			&BinaryOp{Op: parser.OpOr, Left: &BooleanConst{Value: true}, Right: col},
 			&BooleanConst{Value: true},
 		},
 		{
 			"FALSE OR col",
-			&BinaryOp{Op: "OR", Left: &BooleanConst{Value: false}, Right: col},
+			&BinaryOp{Op: parser.OpOr, Left: &BooleanConst{Value: false}, Right: col},
 			col,
 		},
 		{
 			"col OR TRUE",
-			&BinaryOp{Op: "OR", Left: col, Right: &BooleanConst{Value: true}},
+			&BinaryOp{Op: parser.OpOr, Left: col, Right: &BooleanConst{Value: true}},
 			&BooleanConst{Value: true},
 		},
 		{
 			"col OR FALSE",
-			&BinaryOp{Op: "OR", Left: col, Right: &BooleanConst{Value: false}},
+			&BinaryOp{Op: parser.OpOr, Left: col, Right: &BooleanConst{Value: false}},
 			col,
 		},
 	}
@@ -176,13 +176,13 @@ func TestFoldNullPropagation(t *testing.T) {
 		expr Expr
 		want string // "*NullConst" or "*BooleanConst(true/false)"
 	}{
-		{"NULL + 1", &BinaryOp{Op: "+", Left: null, Right: one}, "*NullConst"},
-		{"1 + NULL", &BinaryOp{Op: "+", Left: one, Right: null}, "*NullConst"},
-		{"NULL = 1", &BinaryOp{Op: "=", Left: null, Right: one}, "*NullConst"},
-		{"NULL AND FALSE", &BinaryOp{Op: "AND", Left: null, Right: falseV}, "*BooleanConst(false)"},
-		{"NULL AND TRUE", &BinaryOp{Op: "AND", Left: null, Right: trueV}, "*NullConst"},
-		{"NULL OR TRUE", &BinaryOp{Op: "OR", Left: null, Right: trueV}, "*BooleanConst(true)"},
-		{"NULL OR FALSE", &BinaryOp{Op: "OR", Left: null, Right: falseV}, "*NullConst"},
+		{"NULL + 1", &BinaryOp{Op: parser.OpAdd, Left: null, Right: one}, "*NullConst"},
+		{"1 + NULL", &BinaryOp{Op: parser.OpAdd, Left: one, Right: null}, "*NullConst"},
+		{"NULL = 1", &BinaryOp{Op: parser.OpEq, Left: null, Right: one}, "*NullConst"},
+		{"NULL AND FALSE", &BinaryOp{Op: parser.OpAnd, Left: null, Right: falseV}, "*BooleanConst(false)"},
+		{"NULL AND TRUE", &BinaryOp{Op: parser.OpAnd, Left: null, Right: trueV}, "*NullConst"},
+		{"NULL OR TRUE", &BinaryOp{Op: parser.OpOr, Left: null, Right: trueV}, "*BooleanConst(true)"},
+		{"NULL OR FALSE", &BinaryOp{Op: parser.OpOr, Left: null, Right: falseV}, "*NullConst"},
 	}
 	for _, tc := range cases {
 		folded := FoldConstants(tc.expr)
@@ -206,16 +206,16 @@ func TestFoldNullPropagation(t *testing.T) {
 // TestFoldUnaryOps verifies unary operator folding.
 func TestFoldUnaryOps(t *testing.T) {
 	cases := []struct {
-		op   string
-		in   Expr
+		op    parser.OpCode
+		in    Expr
 		wantT string
 		wantV interface{}
 	}{
-		{"-", &IntegerConst{Value: 5}, "*IntegerConst", int64(-5)},
-		{"-", &IntegerConst{Value: -3}, "*IntegerConst", int64(3)},
-		{"+", &IntegerConst{Value: 7}, "*IntegerConst", int64(7)},
-		{"NOT", &BooleanConst{Value: true}, "*BooleanConst", false},
-		{"NOT", &BooleanConst{Value: false}, "*BooleanConst", true},
+		{parser.OpUnaryNeg, &IntegerConst{Value: 5}, "*IntegerConst", int64(-5)},
+		{parser.OpUnaryNeg, &IntegerConst{Value: -3}, "*IntegerConst", int64(3)},
+		{parser.OpUnaryPos, &IntegerConst{Value: 7}, "*IntegerConst", int64(7)},
+		{parser.OpNot, &BooleanConst{Value: true}, "*BooleanConst", false},
+		{parser.OpNot, &BooleanConst{Value: false}, "*BooleanConst", true},
 	}
 	for _, tc := range cases {
 		folded := FoldConstants(&UnaryOp{Op: tc.op, Operand: tc.in})
@@ -247,9 +247,9 @@ func TestFoldUnaryOps(t *testing.T) {
 // sub-trees).
 func TestFoldNonLiteralPassThrough(t *testing.T) {
 	col := &ColumnRef{Index: 0, Name: "x", Type: catalog.Type{Name: "int4"}}
-	three := &BinaryOp{Op: "+", Left: &IntegerConst{Value: 1}, Right: &IntegerConst{Value: 2}}
+	three := &BinaryOp{Op: parser.OpAdd, Left: &IntegerConst{Value: 1}, Right: &IntegerConst{Value: 2}}
 	// x > 1+2  →  x > 3
-	expr := &BinaryOp{Op: ">", Left: col, Right: three}
+	expr := &BinaryOp{Op: parser.OpGt, Left: col, Right: three}
 	folded := FoldConstants(expr)
 	bin, ok := folded.(*BinaryOp)
 	if !ok {
@@ -304,7 +304,7 @@ func TestFoldConstantsDoD(t *testing.T) {
 	if !ok {
 		t.Fatalf("predicate: want *BinaryOp, got %T", filt.Predicate)
 	}
-	if bin.Op != ">" {
+	if bin.Op != parser.OpGt {
 		t.Fatalf("predicate op: want >, got %s", bin.Op)
 	}
 	if _, ok := bin.Left.(*ColumnRef); !ok {
@@ -347,7 +347,7 @@ func TestFoldTrueAndDoD(t *testing.T) {
 		t.Fatalf("root (below Project): want *Filter, got %T", node)
 	}
 	// The predicate must not be a BinaryOp with Op="AND"
-	if bin, isBin := filt.Predicate.(*BinaryOp); isBin && bin.Op == "AND" {
+	if bin, isBin := filt.Predicate.(*BinaryOp); isBin && bin.Op == parser.OpAnd {
 		t.Errorf("TRUE AND x=1: AND was not eliminated; predicate is still %T{Op:%s}", bin, bin.Op)
 	}
 }

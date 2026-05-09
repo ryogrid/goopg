@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // nliEnabled is the package-level kill-switch the M0054-0006
@@ -181,7 +182,7 @@ func walkRewriteNLI(n Node, cat catalog.Catalog) Node {
 // Returns (eqExpr, true) when ok; (nil, false) otherwise.
 func extractCommonCrossSideEquiAcrossOR(pred Expr, leftWidth int) (Expr, bool) {
 	bop, ok := pred.(*BinaryOp)
-	if !ok || bop.Op != "OR" {
+	if !ok || bop.Op != parser.OpOr {
 		return nil, false
 	}
 	branches := walkOrConjunctsNLI(bop)
@@ -235,7 +236,7 @@ func walkOrConjunctsNLI(e Expr) []Expr {
 		return nil
 	}
 	bop, ok := e.(*BinaryOp)
-	if !ok || bop.Op != "OR" {
+	if !ok || bop.Op != parser.OpOr {
 		return []Expr{e}
 	}
 	out := walkOrConjunctsNLI(bop.Left)
@@ -250,7 +251,7 @@ func walkOrConjunctsNLI(e Expr) []Expr {
 func sameCrossSideEquiNLI(a, b Expr) bool {
 	ab, aOK := a.(*BinaryOp)
 	bb, bOK := b.(*BinaryOp)
-	if !aOK || !bOK || ab.Op != "=" || bb.Op != "=" {
+	if !aOK || !bOK || ab.Op != parser.OpEq || bb.Op != parser.OpEq {
 		return false
 	}
 	al, alOK := ab.Left.(*ColumnRef)
@@ -303,7 +304,7 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	if !ok {
 		leftWidth := len(j.Left.Output())
 		if eq, found := extractCommonCrossSideEquiAcrossOR(j.Predicate, leftWidth); found {
-			if bop, isBin := eq.(*BinaryOp); isBin && bop.Op == "=" {
+			if bop, isBin := eq.(*BinaryOp); isBin && bop.Op == parser.OpEq {
 				leftKey = bop.Left
 				rightKey = bop.Right
 				ok = true
@@ -508,7 +509,7 @@ func collectCrossSideEquiKeys(j *Join, leftWidth int, innerScan *SeqScan) map[st
 	// AND-conjuncts in Predicate.
 	for _, c := range walkAndConjunctsNLI(j.Predicate) {
 		bop, ok := c.(*BinaryOp)
-		if !ok || bop.Op != "=" {
+		if !ok || bop.Op != parser.OpEq {
 			continue
 		}
 		addEq(bop.Left, bop.Right)
@@ -522,7 +523,7 @@ func walkAndConjunctsNLI(e Expr) []Expr {
 		return nil
 	}
 	bop, ok := e.(*BinaryOp)
-	if !ok || bop.Op != "AND" {
+	if !ok || bop.Op != parser.OpAnd {
 		return []Expr{e}
 	}
 	out := walkAndConjunctsNLI(bop.Left)
@@ -589,7 +590,7 @@ func splitFilterPredicateForNLI(e Expr, leftWidth int) (cross []Expr, residual [
 		// equi-conjunct in both an AND-leaf AND inside an OR-leaf
 		// doesn't appear twice.
 		bop, ok := eq.(*BinaryOp)
-		if !ok || bop.Op != "=" {
+		if !ok || bop.Op != parser.OpEq {
 			cross = append(cross, eq)
 			return
 		}
@@ -637,7 +638,7 @@ func stringFromInts(a, b int) string {
 // sides of the join (one Index < leftWidth, the other ≥ leftWidth).
 func isCrossSideEquiConjunctNLI(e Expr, leftWidth int) bool {
 	bop, ok := e.(*BinaryOp)
-	if !ok || bop.Op != "=" {
+	if !ok || bop.Op != parser.OpEq {
 		return false
 	}
 	a, aOK := bop.Left.(*ColumnRef)
@@ -661,7 +662,7 @@ func andChainForNLI(conjuncts []Expr) Expr {
 	}
 	out := conjuncts[0]
 	for i := 1; i < len(conjuncts); i++ {
-		out = &BinaryOp{Op: "AND", Left: out, Right: conjuncts[i]}
+		out = &BinaryOp{Op: parser.OpAnd, Left: out, Right: conjuncts[i]}
 	}
 	return out
 }
@@ -685,7 +686,7 @@ func extractEquiKeys(j *Join) (Expr, Expr, bool) {
 	if j.LeftKey != nil && j.RightKey != nil {
 		return j.LeftKey, j.RightKey, true
 	}
-	if bop, ok := j.Predicate.(*BinaryOp); ok && bop.Op == "=" {
+	if bop, ok := j.Predicate.(*BinaryOp); ok && bop.Op == parser.OpEq {
 		return bop.Left, bop.Right, true
 	}
 	return nil, nil, false

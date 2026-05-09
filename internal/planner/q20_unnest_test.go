@@ -124,9 +124,9 @@ func exprDebugIdx(e Expr) string {
 	case *OuterColumnRef:
 		return "OuterCol[" + x.Name + "/" + itoa(x.Index) + "]"
 	case *BinaryOp:
-		return "(" + exprDebugIdx(x.Left) + " " + x.Op + " " + exprDebugIdx(x.Right) + ")"
+		return "(" + exprDebugIdx(x.Left) + " " + x.Op.String() + " " + exprDebugIdx(x.Right) + ")"
 	case *UnaryOp:
-		return "(" + x.Op + exprDebugIdx(x.Operand) + ")"
+		return "(" + x.Op.String() + exprDebugIdx(x.Operand) + ")"
 	case *FuncCall:
 		args := make([]string, len(x.Args))
 		for i, a := range x.Args {

@@ -748,13 +748,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if err != nil {
 			return catalog.Type{}, err
 		}
-		switch strings.ToUpper(x.Op) {
-		case "+", "-":
+		switch x.Op {
+		case parser.OpUnaryPos, parser.OpUnaryNeg:
 			if !isNumericLike(opTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires a numeric operand", x.Op))
 			}
 			return opTyp, nil
-		case "NOT":
+		case parser.OpNot:
 			if !isBooleanLike(opTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator NOT requires a boolean operand")
 			}
@@ -771,27 +771,27 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if err != nil {
 			return catalog.Type{}, err
 		}
-		switch strings.ToUpper(x.Op) {
-		case "AND", "OR":
+		switch x.Op {
+		case parser.OpAnd, parser.OpOr:
 			if !isBooleanLike(leftTyp) || !isBooleanLike(rightTyp) {
-				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires boolean operands", strings.ToUpper(x.Op)))
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires boolean operands", x.Op))
 			}
 			return catalog.Type{Name: "bool"}, nil
-		case "=", "<>", "!=", "<", "<=", ">", ">=":
+		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			if !isComparable(leftTyp, rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s has incompatible operand types %q and %q", x.Op, leftTyp.Name, rightTyp.Name))
 			}
 			return catalog.Type{Name: "bool"}, nil
-		case "+", "-", "*", "/", "%":
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 			// timestamp/date ± interval → timestamp. TPC-H Q1
 			// (`l_shipdate <= date '...' - interval '90' day`)
 			// hits this; v0 returns the result as `timestamp`
 			// since date is internally a timestamp.
-			if (x.Op == "+" || x.Op == "-") &&
+			if (x.Op == parser.OpAdd || x.Op == parser.OpSub) &&
 				isTimestampLike(leftTyp) && strings.EqualFold(rightTyp.Name, "interval") {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
-			if x.Op == "+" &&
+			if x.Op == parser.OpAdd &&
 				strings.EqualFold(leftTyp.Name, "interval") && isTimestampLike(rightTyp) {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
@@ -808,13 +808,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				return leftTyp, nil
 			}
 			return rightTyp, nil
-		case "||":
+		case parser.OpConcat:
 			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator || requires string operands")
 			}
 			// Mixed string types (text || varchar, etc.) promote to text.
 			return PromoteStringType(leftTyp, rightTyp), nil
-		case "LIKE", "NOT LIKE":
+		case parser.OpLike, parser.OpNotLike:
 			// Both operands must be string-like (text/varchar/char/
 			// bpchar/unknown). Pattern can be a literal or column.
 			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {

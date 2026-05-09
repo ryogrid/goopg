@@ -1,5 +1,7 @@
 package planner
 
+import "github.com/goopg/goopg/internal/parser"
+
 // Single-table predicate routing into scan inputs (M0054-0006a-pre).
 //
 // The M0054-0002 EXPLAIN baseline showed several queries doing
@@ -140,7 +142,7 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 	type classified struct {
 		conj    Expr
 		key     scanColumnKey
-		op      string
+		op      parser.OpCode
 		val     Expr
 		matched bool
 	}
@@ -163,16 +165,16 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 			groups[k] = b
 		}
 		switch op {
-		case "=":
+		case parser.OpEq:
 			if b.eqKey == nil {
 				b.eqKey = val
 				b.eqConjunct = c
 			}
-		case ">=", ">":
+		case parser.OpGe, parser.OpGt:
 			if b.loKey == nil {
 				b.loKey = val
 			}
-		case "<=", "<":
+		case parser.OpLe, parser.OpLt:
 			if b.hiKey == nil {
 				b.hiKey = val
 			}
@@ -264,15 +266,15 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 // commuted to keep the column on the left.)
 //
 // Returns (col, canonical-op, key-const, ok).
-func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, string, Expr, bool) {
+func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, parser.OpCode, Expr, bool) {
 	bop, ok := f.(*BinaryOp)
 	if !ok {
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	switch bop.Op {
-	case "=", "<", "<=", ">", ">=":
+	case parser.OpEq, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 	default:
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 
 	var col *ColumnRef
@@ -286,15 +288,15 @@ func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, string, Expr, bool) 
 		key = bop.Left
 		colOnLeft = false
 	} else {
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	if _, isCol := key.(*ColumnRef); isCol {
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	switch key.(type) {
 	case *IntegerConst, *NumericConst, *StringConst, *TypedStringLit, *ParamRef:
 	default:
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	canonOp := bop.Op
 	if !colOnLeft {
@@ -305,16 +307,16 @@ func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, string, Expr, bool) 
 
 // flipRangeOpForRewrite flips the comparison so the column is
 // canonically on the left. Keeps `=` as is.
-func flipRangeOpForRewrite(op string) string {
+func flipRangeOpForRewrite(op parser.OpCode) parser.OpCode {
 	switch op {
-	case "<":
-		return ">"
-	case "<=":
-		return ">="
-	case ">":
-		return "<"
-	case ">=":
-		return "<="
+	case parser.OpLt:
+		return parser.OpGt
+	case parser.OpLe:
+		return parser.OpGe
+	case parser.OpGt:
+		return parser.OpLt
+	case parser.OpGe:
+		return parser.OpLe
 	}
 	return op
 }
@@ -447,7 +449,7 @@ func splitPlannerAnd(e Expr) []Expr {
 		return nil
 	}
 	bop, ok := e.(*BinaryOp)
-	if !ok || bop.Op != "AND" {
+	if !ok || bop.Op != parser.OpAnd {
 		return []Expr{e}
 	}
 	out := splitPlannerAnd(bop.Left)
@@ -462,7 +464,7 @@ func joinPlannerAnd(conjs []Expr) Expr {
 	}
 	out := conjs[0]
 	for _, c := range conjs[1:] {
-		out = &BinaryOp{Op: "AND", Left: out, Right: c}
+		out = &BinaryOp{Op: parser.OpAnd, Left: out, Right: c}
 	}
 	return out
 }
@@ -529,16 +531,16 @@ func rewriteMHJInputsWithSingleTablePredicates(mh *MultiHashJoin, cat catalog.Ca
 			groups[k] = b
 		}
 		switch op {
-		case "=":
+		case parser.OpEq:
 			if b.eqKey == nil {
 				b.eqKey = val
 				b.eqConjunct = f
 			}
-		case ">=", ">":
+		case parser.OpGe, parser.OpGt:
 			if b.loKey == nil {
 				b.loKey = val
 			}
-		case "<=", "<":
+		case parser.OpLe, parser.OpLt:
 			if b.hiKey == nil {
 				b.hiKey = val
 			}

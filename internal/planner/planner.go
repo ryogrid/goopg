@@ -1059,11 +1059,11 @@ func buildUsingPredicate(pos int, cols []string, leftCtx, rightCtx *resolveConte
 		if err != nil {
 			return nil, err
 		}
-		eq := &BinaryOp{pos: pos, Op: "=", Left: l, Right: r}
+		eq := &BinaryOp{pos: pos, Op: parser.OpEq, Left: l, Right: r}
 		if pred == nil {
 			pred = eq
 		} else {
-			pred = &BinaryOp{pos: pos, Op: "AND", Left: pred, Right: eq}
+			pred = &BinaryOp{pos: pos, Op: parser.OpAnd, Left: pred, Right: eq}
 		}
 	}
 	return pred, nil
@@ -1141,7 +1141,7 @@ func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) pa
 // — the planner keeps the nested-loop algorithm for those.
 func splitEqualityForHash(pred Expr, leftWidth int) (Expr, Expr, bool) {
 	bin, ok := pred.(*BinaryOp)
-	if !ok || bin.Op != "=" {
+	if !ok || bin.Op != parser.OpEq {
 		return nil, nil, false
 	}
 	lSide := exprSide(bin.Left, leftWidth)
@@ -2047,9 +2047,9 @@ func parserExprKey(e parser.Expr) string {
 	case *parser.ColumnRef:
 		return "c:" + strings.ToLower(x.Schema) + "." + strings.ToLower(x.Table) + "." + strings.ToLower(x.Column)
 	case *parser.UnaryOp:
-		return "u:" + strings.ToUpper(x.Op) + ":" + parserExprKey(x.Operand)
+		return "u:" + x.Op.String() + ":" + parserExprKey(x.Operand)
 	case *parser.BinaryOp:
-		return "b:" + strings.ToUpper(x.Op) + ":(" + parserExprKey(x.Left) + "):(" + parserExprKey(x.Right) + ")"
+		return "b:" + x.Op.String() + ":(" + parserExprKey(x.Left) + "):(" + parserExprKey(x.Right) + ")"
 	case *parser.FuncCall:
 		k := strings.Builder{}
 		k.WriteString("f:")
@@ -2080,7 +2080,7 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	}
 	tbl := ctx.bindings[0].table
 	b, ok := where.(*parser.BinaryOp)
-	if !ok || b.Op != "=" {
+	if !ok || b.Op != parser.OpEq {
 		// Not an equality predicate — try range index scan.
 		return tryRangeIndexScan(where, tbl, ctx, cat)
 	}
@@ -2180,7 +2180,7 @@ func findBTreeIndexForColumn(cat catalog.Catalog, tbl *catalog.Table, col string
 // A non-AND node returns a single-element slice containing itself.
 func collectAndConjuncts(e parser.Expr) []parser.Expr {
 	b, ok := e.(*parser.BinaryOp)
-	if !ok || b.Op != "AND" {
+	if !ok || b.Op != parser.OpAnd {
 		return []parser.Expr{e}
 	}
 	result := collectAndConjuncts(b.Left)
@@ -2234,16 +2234,16 @@ func isConstantExpr(e Expr) bool {
 
 // flipRangeOp flips a comparison operator for the "key op col" → "col flippedOp key"
 // canonical form (column on the left).
-func flipRangeOp(op string) string {
+func flipRangeOp(op parser.OpCode) parser.OpCode {
 	switch op {
-	case "<":
-		return ">"
-	case "<=":
-		return ">="
-	case ">":
-		return "<"
-	case ">=":
-		return "<="
+	case parser.OpLt:
+		return parser.OpGt
+	case parser.OpLe:
+		return parser.OpGe
+	case parser.OpGt:
+		return parser.OpLt
+	case parser.OpGe:
+		return parser.OpLe
 	}
 	return op
 }
@@ -2266,7 +2266,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 			continue
 		}
 		op := b.Op
-		if op != "<" && op != "<=" && op != ">" && op != ">=" {
+		if op != parser.OpLt && op != parser.OpLe && op != parser.OpGt && op != parser.OpGe {
 			continue
 		}
 
@@ -2338,11 +2338,11 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 
 		// Assign bounds based on canonical operator
 		switch canonOp {
-		case ">", ">=":
+		case parser.OpGt, parser.OpGe:
 			if loKey == nil {
 				loKey = resolvedKey
 			}
-		case "<", "<=":
+		case parser.OpLt, parser.OpLe:
 			if hiKey == nil {
 				hiKey = resolvedKey
 			}
@@ -2796,8 +2796,8 @@ func exprType(e Expr) catalog.Type {
 		// layer advertises a TypeOID consistent with the formatted
 		// cell text — without this, sum(numeric * numeric) lands as
 		// int8 and libpq's Go driver fails ParseInt on `20667.0000`.
-		switch strings.ToUpper(x.Op) {
-		case "+", "-", "*", "/", "%":
+		switch x.Op {
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 			lt := exprType(x.Left)
 			rt := exprType(x.Right)
 			if isNumericTypeName(lt.Name) || isNumericTypeName(rt.Name) {
@@ -2807,14 +2807,14 @@ func exprType(e Expr) catalog.Type {
 				return catalog.Type{Name: "int8"}
 			}
 			return catalog.Type{Name: "unknown"}
-		case "||":
+		case parser.OpConcat:
 			return catalog.Type{Name: "text"}
-		case "AND", "OR", "=", "<>", "!=", "<", "<=", ">", ">=", "LIKE", "NOT LIKE":
+		case parser.OpAnd, parser.OpOr, parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpLike, parser.OpNotLike:
 			return catalog.Type{Name: "bool"}
 		}
 		return catalog.Type{Name: "unknown"}
 	case *UnaryOp:
-		if strings.ToUpper(x.Op) == "NOT" {
+		if x.Op == parser.OpNot {
 			return catalog.Type{Name: "bool"}
 		}
 		return exprType(x.Operand)

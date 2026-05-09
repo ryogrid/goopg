@@ -16,6 +16,7 @@
 package planner
 
 import (
+	"github.com/goopg/goopg/internal/parser"
 	"strconv"
 	"strings"
 
@@ -31,23 +32,23 @@ func clauseSelectivity(expr Expr, child Node) float64 {
 	switch e := expr.(type) {
 	case *BinaryOp:
 		switch e.Op {
-		case "AND":
+		case parser.OpAnd:
 			// Independence assumption — upstream's default.
 			return clauseSelectivity(e.Left, child) * clauseSelectivity(e.Right, child)
-		case "OR":
+		case parser.OpOr:
 			a := clauseSelectivity(e.Left, child)
 			b := clauseSelectivity(e.Right, child)
 			return a + b - a*b
-		case "=":
+		case parser.OpEq:
 			return eqOpSelectivity(e.Left, e.Right, child)
-		case "<>", "!=":
+		case parser.OpNe:
 			eq := eqOpSelectivity(e.Left, e.Right, child)
 			return 1 - eq
-		case "<", "<=", ">", ">=":
+		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			return rangeOpSelectivity(e.Op, e.Left, e.Right, child)
 		}
 	case *UnaryOp:
-		if strings.EqualFold(e.Op, "NOT") {
+		if e.Op == parser.OpNot {
 			return 1 - clauseSelectivity(e.Operand, child)
 		}
 	case *InExpr:
@@ -132,7 +133,7 @@ func eqSelectivityForColumn(stats *catalog.ColumnStats, val Expr) float64 {
 // Returns the histogram-bucket interpolation, scaled to the
 // non-MCV mass, plus contributions from MCV values that satisfy
 // the predicate.
-func rangeOpSelectivity(op string, left, right Expr, child Node) float64 {
+func rangeOpSelectivity(op parser.OpCode, left, right Expr, child Node) float64 {
 	col, val, swapped, ok := normalizeColumnConstRange(left, right)
 	if !ok {
 		return defaultIneqSelectivity
@@ -185,7 +186,7 @@ func rangeOpSelectivity(op string, left, right Expr, child Node) float64 {
 // histogramOpSelectivity returns the fraction of the histogram's
 // mass (treated as 1.0 across the boundaries) that satisfies op
 // for the given literal. Boundaries are sorted ascending.
-func histogramOpSelectivity(op string, bounds []string, literal, typeName string) float64 {
+func histogramOpSelectivity(op parser.OpCode, bounds []string, literal, typeName string) float64 {
 	k := len(bounds) - 1 // bucket count
 	if k < 1 {
 		return defaultIneqSelectivity
@@ -199,10 +200,10 @@ func histogramOpSelectivity(op string, bounds []string, literal, typeName string
 		}
 	}
 	switch op {
-	case "<", "<=":
+	case parser.OpLt, parser.OpLe:
 		if idx <= 0 {
 			// literal <= bounds[0]: nothing to the left.
-			if idx == 0 && op == "<=" && histCmp(bounds[0], literal, typeName) == 0 {
+			if idx == 0 && op == parser.OpLe && histCmp(bounds[0], literal, typeName) == 0 {
 				// literal == low boundary; <= keeps a sliver of
 				// the first bucket. Approximate as 1/k.
 				return 1.0 / float64(k)
@@ -216,11 +217,11 @@ func histogramOpSelectivity(op string, bounds []string, literal, typeName string
 		whole := float64(idx-1) / float64(k)
 		frac := bucketFraction(bounds[idx-1], bounds[idx], literal, typeName)
 		return whole + frac/float64(k)
-	case ">", ">=":
+	case parser.OpGt, parser.OpGe:
 		// Symmetric: 1 - sel(<) for >=, 1 - sel(<=) for >.
-		flip := "<="
-		if op == ">=" {
-			flip = "<"
+		flip := parser.OpLe
+		if op == parser.OpGe {
+			flip = parser.OpLt
 		}
 		return 1.0 - histogramOpSelectivity(flip, bounds, literal, typeName)
 	}
@@ -248,15 +249,15 @@ func bucketFraction(lo, hi, lit, typeName string) float64 {
 
 // rangeOpMatches reports whether `cmp(a,b) <op> 0` holds for the
 // given op. cmp is -1/0/1 in the usual sense.
-func rangeOpMatches(op string, cmp int) bool {
+func rangeOpMatches(op parser.OpCode, cmp int) bool {
 	switch op {
-	case "<":
+	case parser.OpLt:
 		return cmp < 0
-	case "<=":
+	case parser.OpLe:
 		return cmp <= 0
-	case ">":
+	case parser.OpGt:
 		return cmp > 0
-	case ">=":
+	case parser.OpGe:
 		return cmp >= 0
 	}
 	return false
@@ -323,16 +324,16 @@ func normalizeColumnConstRange(l, r Expr) (*ColumnRef, Expr, bool, bool) {
 	return nil, nil, false, false
 }
 
-func swapInequalityOp(op string) string {
+func swapInequalityOp(op parser.OpCode) parser.OpCode {
 	switch op {
-	case "<":
-		return ">"
-	case "<=":
-		return ">="
-	case ">":
-		return "<"
-	case ">=":
-		return "<="
+	case parser.OpLt:
+		return parser.OpGt
+	case parser.OpLe:
+		return parser.OpGe
+	case parser.OpGt:
+		return parser.OpLt
+	case parser.OpGe:
+		return parser.OpLe
 	}
 	return op
 }

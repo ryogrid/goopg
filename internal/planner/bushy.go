@@ -5,6 +5,7 @@ import (
 	"math/bits"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
@@ -137,7 +138,7 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 		})
 	}
 	for _, c := range conjuncts {
-		if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+		if bin, ok := c.(*BinaryOp); ok && bin.Op == parser.OpEq {
 			addEdge(bin)
 			continue
 		}
@@ -159,7 +160,7 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 // branch of an OR predicate.
 func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
 	bin, ok := e.(*BinaryOp)
-	if !ok || bin.Op != "OR" {
+	if !ok || bin.Op != parser.OpOr {
 		return nil
 	}
 	branches := flattenPlannerOr(bin)
@@ -171,7 +172,7 @@ func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
 		branchEqs[i] = map[string]*BinaryOp{}
 		for _, c := range splitAnd(br) {
 			b, ok := c.(*BinaryOp)
-			if !ok || b.Op != "=" {
+			if !ok || b.Op != parser.OpEq {
 				continue
 			}
 			lc, lok := b.Left.(*ColumnRef)
@@ -200,7 +201,7 @@ func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
 
 func flattenPlannerOr(e Expr) []Expr {
 	bin, ok := e.(*BinaryOp)
-	if !ok || bin.Op != "OR" {
+	if !ok || bin.Op != parser.OpOr {
 		return []Expr{e}
 	}
 	out := flattenPlannerOr(bin.Left)
@@ -349,7 +350,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 		residual := make([]Expr, 0, len(conjuncts))
 		for _, c := range conjuncts {
 			bin, ok := c.(*BinaryOp)
-			if !ok || bin.Op != "=" {
+			if !ok || bin.Op != parser.OpEq {
 				residual = append(residual, c)
 			}
 		}
@@ -443,7 +444,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 	residual := make([]Expr, 0, len(conjuncts))
 	for _, c := range conjuncts {
 		bin, ok := c.(*BinaryOp)
-		if !ok || bin.Op != "=" {
+		if !ok || bin.Op != parser.OpEq {
 			residual = append(residual, c)
 			continue
 		}
@@ -595,7 +596,7 @@ func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *j
 		Algo:      JoinAlgoHash,
 		Left:      leftPlan,
 		Right:     rightPlan,
-		Predicate: &BinaryOp{pos: 0, Op: "=", Left: leftKey, Right: rightKey},
+		Predicate: &BinaryOp{pos: 0, Op: parser.OpEq, Left: leftKey, Right: rightKey},
 		LeftKey:   leftKey,
 		RightKey:  rightKey,
 		BuildLeft: buildLeft,
@@ -775,7 +776,7 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int, []Expr) {
 // AND'd Predicate.
 func isCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
 	bin, ok := c.(*BinaryOp)
-	if !ok || bin.Op != "=" {
+	if !ok || bin.Op != parser.OpEq {
 		return false
 	}
 	return bin.Left == leftKey && bin.Right == rightKey

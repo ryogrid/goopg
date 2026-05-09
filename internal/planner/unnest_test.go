@@ -11,7 +11,7 @@ func TestCanUnnestSubqueryBasic(t *testing.T) {
 	// Directly construct an unnestable SubqueryExpr.
 	outerCol := &OuterColumnRef{pos: 0, Level: 1, Index: 0, Name: "p_partkey", Type: catalog.Type{Name: "int8"}}
 	subCol := &ColumnRef{pos: 0, Index: 0, Name: "ps_partkey", Type: catalog.Type{Name: "int8"}}
-	eqExpr := &BinaryOp{pos: 0, Op: "=", Left: outerCol, Right: subCol}
+	eqExpr := &BinaryOp{pos: 0, Op: parser.OpEq, Left: outerCol, Right: subCol}
 	// Subquery plan: Aggregate over Filter over SeqScan
 	agg := &Aggregate{
 		pos: 0,
@@ -48,9 +48,9 @@ func TestCanUnnestSubqueryWithExtraOuterRef(t *testing.T) {
 	subCol := &ColumnRef{pos: 0, Index: 0, Name: "ps_partkey", Type: catalog.Type{Name: "int8"}}
 	outerExtra := &OuterColumnRef{pos: 0, Level: 1, Index: 1, Name: "p_size", Type: catalog.Type{Name: "int8"}}
 
-	eqExpr := &BinaryOp{pos: 0, Op: "=", Left: outerEq, Right: subCol}
-	extraExpr := &BinaryOp{pos: 0, Op: ">", Left: outerExtra, Right: &ColumnRef{pos: 0, Index: 3, Name: "ps_availqty", Type: catalog.Type{Name: "int8"}}}
-	pred := &BinaryOp{pos: 0, Op: "AND", Left: eqExpr, Right: extraExpr}
+	eqExpr := &BinaryOp{pos: 0, Op: parser.OpEq, Left: outerEq, Right: subCol}
+	extraExpr := &BinaryOp{pos: 0, Op: parser.OpGt, Left: outerExtra, Right: &ColumnRef{pos: 0, Index: 3, Name: "ps_availqty", Type: catalog.Type{Name: "int8"}}}
+	pred := &BinaryOp{pos: 0, Op: parser.OpAnd, Left: eqExpr, Right: extraExpr}
 
 	agg := &Aggregate{
 		pos: 0,

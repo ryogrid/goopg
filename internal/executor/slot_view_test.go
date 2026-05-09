@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -77,19 +78,19 @@ func TestM0071EvalExprSlotMatchesRow(t *testing.T) {
 		&planner.ColumnRef{Name: "c2", Index: 2},
 		&planner.ColumnRef{Name: "c4null", Index: 4},
 		// UnaryOp
-		&planner.UnaryOp{Op: "-", Operand: &planner.ColumnRef{Index: 0}},
-		&planner.UnaryOp{Op: "NOT", Operand: &planner.ColumnRef{Index: 3}},
+		&planner.UnaryOp{Op: parser.OpSub, Operand: &planner.ColumnRef{Index: 0}},
+		&planner.UnaryOp{Op: parser.OpNot, Operand: &planner.ColumnRef{Index: 3}},
 		// BinaryOp
-		&planner.BinaryOp{Op: "+",
+		&planner.BinaryOp{Op: parser.OpAdd,
 			Left:  &planner.ColumnRef{Index: 0},
 			Right: &planner.ColumnRef{Index: 2}},
-		&planner.BinaryOp{Op: "=",
+		&planner.BinaryOp{Op: parser.OpEq,
 			Left:  &planner.ColumnRef{Index: 0},
 			Right: &planner.IntegerConst{Value: 7}},
-		&planner.BinaryOp{Op: "<",
+		&planner.BinaryOp{Op: parser.OpLt,
 			Left:  &planner.ColumnRef{Index: 0},
 			Right: &planner.ColumnRef{Index: 2}},
-		&planner.BinaryOp{Op: "AND",
+		&planner.BinaryOp{Op: parser.OpAnd,
 			Left:  &planner.BooleanConst{Value: true},
 			Right: &planner.ColumnRef{Index: 3}},
 	}

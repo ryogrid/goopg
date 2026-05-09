@@ -20,6 +20,8 @@
 // See docs/design/0003-0001-planner-overview.md.
 package planner
 
+import "github.com/goopg/goopg/internal/parser"
+
 // pushPredicatesIntoCrossJoins is the entry point for the pass.
 // Returns the (possibly rewritten) tree. The caller passes the node
 // it built around the WHERE filter — typically a *Filter wrapping
@@ -183,7 +185,7 @@ func pushOneConjunct(node Node, c Expr) bool {
 		if j.Predicate == nil {
 			j.Predicate = c
 		} else {
-			j.Predicate = &BinaryOp{pos: c.Pos(), Op: "AND", Left: j.Predicate, Right: c}
+			j.Predicate = &BinaryOp{pos: c.Pos(), Op: parser.OpAnd, Left: j.Predicate, Right: c}
 		}
 		return true
 	}
@@ -308,7 +310,7 @@ func splitAnd(e Expr) []Expr {
 		return nil
 	}
 	bin, ok := e.(*BinaryOp)
-	if !ok || bin.Op != "AND" {
+	if !ok || bin.Op != parser.OpAnd {
 		return []Expr{e}
 	}
 	out := splitAnd(bin.Left)
@@ -324,7 +326,7 @@ func combineAnd(conjuncts []Expr) Expr {
 	}
 	out := conjuncts[0]
 	for _, c := range conjuncts[1:] {
-		out = &BinaryOp{pos: out.Pos(), Op: "AND", Left: out, Right: c}
+		out = &BinaryOp{pos: out.Pos(), Op: parser.OpAnd, Left: out, Right: c}
 	}
 	return out
 }

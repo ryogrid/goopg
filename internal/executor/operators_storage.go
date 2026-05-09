@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -383,7 +384,7 @@ func extractScan(child planner.Node) (seq *planner.SeqScan, pred planner.Expr, i
 				combined = c.Predicate
 			} else {
 				combined = &planner.BinaryOp{
-					Op:    "AND",
+					Op:    parser.OpAnd,
 					Left:  c.Predicate,
 					Right: idxPred,
 				}
@@ -421,7 +422,7 @@ func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
 	for i, sc := range out {
 		if sc.Name == col {
 			return &planner.BinaryOp{
-				Op:    "=",
+				Op:    parser.OpEq,
 				Left:  &planner.ColumnRef{Index: i, Name: col, Type: sc.Type},
 				Right: ix.Key,
 			}

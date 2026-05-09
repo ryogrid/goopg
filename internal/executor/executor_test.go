@@ -160,7 +160,7 @@ func TestExecJoinVariants(t *testing.T) {
 		return &planner.Values{Rows: rows}
 	}
 	pred := &planner.BinaryOp{
-		Op: "=",
+		Op: parser.OpEq,
 		Left: &planner.ColumnRef{
 			Index: 0,
 			Name:  "l",
@@ -329,12 +329,12 @@ func TestExecBooleanThreeValuedLogic(t *testing.T) {
 	cases := []struct {
 		name string
 		a, b Datum
-		op   string
+		op   parser.OpCode
 		want Datum
 	}{
-		{"and-null-false", NullDatum, NewBoolDatum(false), "AND", NewBoolDatum(false)},
-		{"or-null-true", NullDatum, NewBoolDatum(true), "OR", NewBoolDatum(true)},
-		{"and-null-true", NullDatum, NewBoolDatum(true), "AND", NullDatum},
+		{"and-null-false", NullDatum, NewBoolDatum(false), parser.OpAnd, NewBoolDatum(false)},
+		{"or-null-true", NullDatum, NewBoolDatum(true), parser.OpOr, NewBoolDatum(true)},
+		{"and-null-true", NullDatum, NewBoolDatum(true), parser.OpAnd, NullDatum},
 	}
 	for _, c := range cases {
 		got, err := evalBinary(c.op, c.a, c.b, 0)

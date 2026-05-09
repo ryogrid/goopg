@@ -83,7 +83,7 @@ func TestParseUpdatePgbench(t *testing.T) {
 		t.Fatalf("set=%+v", upd.Set)
 	}
 	bo, ok := upd.Set[0].Expr.(*BinaryOp)
-	if !ok || bo.Op != "+" {
+	if !ok || bo.Op != OpAdd {
 		t.Fatalf("set[0].Expr=%+v", upd.Set[0].Expr)
 	}
 	if upd.Where == nil {

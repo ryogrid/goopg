@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -132,22 +133,22 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 }
 
 // evalUnary handles -, +, NOT.
-func evalUnary(op string, d Datum, pos int) (Datum, error) {
+func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 	if d.IsNull() {
 		return NullDatum, nil
 	}
 	switch op {
-	case "-":
+	case parser.OpUnaryNeg:
 		if d.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary - requires integer"}
 		}
 		return Datum{Kind: KindInt, Int: -d.Int}, nil
-	case "+":
+	case parser.OpUnaryPos:
 		if d.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary + requires integer"}
 		}
 		return d, nil
-	case "NOT":
+	case parser.OpNot:
 		if d.Kind != KindBool {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator NOT requires boolean"}
 		}
@@ -159,18 +160,20 @@ func evalUnary(op string, d Datum, pos int) (Datum, error) {
 // evalBinary handles arithmetic, comparison, and boolean operators.
 // SQL three-valued logic: NULL operand on most operators yields NULL;
 // AND/OR follow Kleene's rules.
-func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
-	switch op {
-	case "AND":
-		return evalAnd(left, right), nil
-	case "OR":
-		return evalOr(left, right), nil
+func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+	if op.IsBoolean() {
+		switch op {
+		case parser.OpAnd:
+			return evalAnd(left, right), nil
+		case parser.OpOr:
+			return evalOr(left, right), nil
+		}
 	}
 	if left.IsNull() || right.IsNull() {
 		return NullDatum, nil
 	}
 	switch op {
-	case "+", "-":
+	case parser.OpAdd, parser.OpSub:
 		// timestamp/date ± interval and interval + timestamp/date
 		// route through the time-arithmetic path before falling
 		// back to integer arithmetic. v0 doesn't support
@@ -178,9 +181,9 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		// timestamp - timestamp (returns interval upstream;
 		// scope-deferred until the type system).
 		if left.Kind == KindTime && right.Kind == KindInterval {
-			return addTimeInterval(left, right, op == "-"), nil
+			return addTimeInterval(left, right, op == parser.OpSub), nil
 		}
-		if op == "+" && left.Kind == KindInterval && right.Kind == KindTime {
+		if op == parser.OpAdd && left.Kind == KindInterval && right.Kind == KindTime {
 			return addTimeInterval(right, left, false), nil
 		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
@@ -203,22 +206,22 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 			if err != nil {
 				return Datum{}, err
 			}
-			if op == "+" {
+			if op == parser.OpAdd {
 				return numericAdd(a, b)
 			}
 			return numericSub(a, b)
 		}
 		fallthrough
-	case "*", "/", "%":
+	case parser.OpMul, parser.OpDiv, parser.OpMod:
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
 				return Datum{}, err
 			}
 			switch op {
-			case "*":
+			case parser.OpMul:
 				return numericMul(a, b)
-			case "/":
+			case parser.OpDiv:
 				return numericDiv(a, b, pos)
 			}
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s not supported on numeric", op)}
@@ -227,18 +230,18 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
-	case "||":
+	case parser.OpConcat:
 		if left.Kind != KindString || right.Kind != KindString {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
 		}
 		return NewStringDatum(left.StringValue() + right.StringValue()), nil
-	case "=", "<", ">", "<=", ">=", "<>", "!=":
+	case parser.OpEq, parser.OpLt, parser.OpGt, parser.OpLe, parser.OpGe, parser.OpNe:
 		cmp, err := compareDatum(left, right, pos)
 		if err != nil {
 			return Datum{}, err
 		}
 		return NewBoolDatum(cmpResult(op, cmp)), nil
-	case "LIKE", "NOT LIKE":
+	case parser.OpLike, parser.OpNotLike:
 		// M0062-followup: accept KindBytes operands as UTF-8 text so a
 		// varchar that arrives as bytes (e.g. via a row-reshaping path
 		// that drops Kind) still evaluates correctly. Mirrors
@@ -253,7 +256,7 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands (got left.Kind=%d right.Kind=%d)", op, left.Kind, right.Kind)}
 		}
 		matched := matchSQLLike(ls, rs)
-		if op == "NOT LIKE" {
+		if op == parser.OpNotLike {
 			matched = !matched
 		}
 		return NewBoolDatum(matched), nil
@@ -343,21 +346,21 @@ func addTimeInterval(t, iv Datum, subtract bool) Datum {
 	return NewTimeDatum(t.TimeValue().AddDate(0, months, days))
 }
 
-func arithmetic(op string, a, b int64, pos int) (Datum, error) {
+func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 	var r int64
 	switch op {
-	case "+":
+	case parser.OpAdd:
 		r = a + b
-	case "-":
+	case parser.OpSub:
 		r = a - b
-	case "*":
+	case parser.OpMul:
 		r = a * b
-	case "/":
+	case parser.OpDiv:
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 		}
 		r = a / b
-	case "%":
+	case parser.OpMod:
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 		}
@@ -471,19 +474,19 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 	return 0, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("comparison not supported for kind %d", a.Kind)}
 }
 
-func cmpResult(op string, cmp int) bool {
+func cmpResult(op parser.OpCode, cmp int) bool {
 	switch op {
-	case "=":
+	case parser.OpEq:
 		return cmp == 0
-	case "<>", "!=":
+	case parser.OpNe:
 		return cmp != 0
-	case "<":
+	case parser.OpLt:
 		return cmp < 0
-	case "<=":
+	case parser.OpLe:
 		return cmp <= 0
-	case ">":
+	case parser.OpGt:
 		return cmp > 0
-	case ">=":
+	case parser.OpGe:
 		return cmp >= 0
 	}
 	return false

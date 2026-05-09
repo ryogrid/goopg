@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -148,7 +149,7 @@ func TestMultiHashJoinPredicatePushdown(t *testing.T) {
 	// Filter: BinaryOp{B.bval < 3}.
 	// B.bval is at absolute output index 2 (A:1, B:2 cols → bval at 2).
 	filter := &planner.BinaryOp{
-		Op:    "<",
+		Op:    parser.OpLt,
 		Left:  &planner.ColumnRef{Index: 2, Name: "bval", Type: catalog.Type{Name: "int8"}},
 		Right: &planner.IntegerConst{Value: 3},
 	}
@@ -263,8 +264,8 @@ func TestMultiHashJoinPushdownLeafFallback(t *testing.T) {
 	// instead just confirm partitioning routes it correctly.
 	outer := &planner.OuterColumnRef{Level: 1, Index: 0, Name: "outer_x", Type: catalog.Type{Name: "int8"}}
 	filter := &planner.BinaryOp{
-		Op:    "OR",
-		Left:  &planner.BinaryOp{Op: ">", Left: &planner.ColumnRef{Index: 1, Name: "bid"}, Right: &planner.IntegerConst{Value: -1}},
+		Op:    parser.OpOr,
+		Left:  &planner.BinaryOp{Op: parser.OpGt, Left: &planner.ColumnRef{Index: 1, Name: "bid"}, Right: &planner.IntegerConst{Value: -1}},
 		Right: outer,
 	}
 

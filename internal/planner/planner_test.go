@@ -72,7 +72,7 @@ func TestPlanPgbenchSelect(t *testing.T) {
 		t.Fatalf("Filter.Child=%T want *SeqScan", filt.Child)
 	}
 	pred, ok := filt.Predicate.(*BinaryOp)
-	if !ok || pred.Op != "=" {
+	if !ok || pred.Op != parser.OpEq {
 		t.Fatalf("predicate=%+v", filt.Predicate)
 	}
 	if cr, ok := pred.Left.(*ColumnRef); !ok || cr.Index != 0 || cr.Name != "aid" {
@@ -98,7 +98,7 @@ func TestPlanSelectResolvesTableAlias(t *testing.T) {
 		t.Fatalf("child=%T want *Filter", proj.Child)
 	}
 	pred, ok := filt.Predicate.(*BinaryOp)
-	if !ok || pred.Op != "=" {
+	if !ok || pred.Op != parser.OpEq {
 		t.Fatalf("predicate=%+v", filt.Predicate)
 	}
 	if _, ok := pred.Left.(*ColumnRef); !ok {

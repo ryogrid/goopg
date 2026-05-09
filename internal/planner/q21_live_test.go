@@ -99,7 +99,7 @@ func exprDebug(e Expr) string {
 	case *ColumnRef:
 		return strings.Join([]string{"ColRef[", x.Name, "/", "[", "]"}, "")
 	case *BinaryOp:
-		return "(" + exprDebug(x.Left) + " " + x.Op + " " + exprDebug(x.Right) + ")"
+		return "(" + exprDebug(x.Left) + " " + x.Op.String() + " " + exprDebug(x.Right) + ")"
 	case *BooleanConst:
 		if x.Value {
 			return "true"

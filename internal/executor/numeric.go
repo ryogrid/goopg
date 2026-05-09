@@ -5,6 +5,8 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 var (
@@ -185,7 +187,7 @@ func numericFromInt(n int64) Datum {
 // scale=0; KindString rejects with 42883 (the analyzer should
 // have caught it, but evaluator-side checks keep mistakes
 // localised). Both operands are returned as KindNumeric on success.
-func promoteToNumeric(a, b Datum, op string, pos int) (Datum, Datum, error) {
+func promoteToNumeric(a, b Datum, op parser.OpCode, pos int) (Datum, Datum, error) {
 	an, err := toNumeric(a, op, pos)
 	if err != nil {
 		return Datum{}, Datum{}, err
@@ -197,7 +199,7 @@ func promoteToNumeric(a, b Datum, op string, pos int) (Datum, Datum, error) {
 	return an, bn, nil
 }
 
-func toNumeric(d Datum, op string, pos int) (Datum, error) {
+func toNumeric(d Datum, op parser.OpCode, pos int) (Datum, error) {
 	switch d.Kind {
 	case KindNumeric:
 		return d, nil
