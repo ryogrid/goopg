@@ -27,7 +27,28 @@ func (e *ExecError) Error() string {
 // evalExpr resolves a planner expression against the input row.
 // Operators that produce no input pass nil for `row`; in that case
 // any ColumnRef resolution is an internal error.
+//
+// Thin wrapper over evalExprSlot — Row callers continue to work
+// unchanged. New slot-aware sites (NLI/MHJ predicate eval) call
+// evalExprSlot directly so VirtualSlot composition can read via
+// slot.Get(col) without materializing a Row per emitted match.
 func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
+	var slot SlotView
+	if row != nil {
+		slot = rowSlotView(row)
+	}
+	return evalExprSlot(e, slot, ctx)
+}
+
+// evalExprSlot is the slot-aware sibling of evalExpr. ColumnRef
+// reads via slot.Get(col); helpers that push ctx.OuterRows
+// (Subquery/In/Exists/Extract/FuncCall/CaseExpr) reach back to
+// Row via slotToRow — those paths are out of scope for the M0071
+// keystone refactor and stay on Row to limit blast radius.
+//
+// nil slot is permitted (mirrors the M0054 contract for valuesOp /
+// limitOp / DML operators that have no input row).
+func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	switch x := e.(type) {
 	case *planner.OuterColumnRef:
 		// Look up the row from the lexical-scope stack pushed
@@ -37,25 +58,25 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		if idx < 0 || idx >= len(ctx.OuterRows) {
 			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/level=%d out of range (depth=%d)", x.Name, x.Level, len(ctx.OuterRows))}
 		}
-		row := ctx.OuterRows[idx]
-		if x.Index < 0 || x.Index >= len(row) {
-			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(row))}
+		outer := ctx.OuterRows[idx]
+		if x.Index < 0 || x.Index >= len(outer) {
+			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(outer))}
 		}
-		return row[x.Index], nil
+		return outer[x.Index], nil
 	case *planner.CaseExpr:
-		return evalCaseExpr(x, row, ctx)
+		return evalCaseExpr(x, slotToRow(slot), ctx)
 	case *planner.SubqueryExpr:
-		return evalSubquery(x, row, ctx)
+		return evalSubquery(x, slotToRow(slot), ctx)
 	case *planner.InExpr:
-		return evalInExpr(x, row, ctx)
+		return evalInExpr(x, slotToRow(slot), ctx)
 	case *planner.ExistsExpr:
-		return evalExistsExpr(x, row, ctx)
+		return evalExistsExpr(x, slotToRow(slot), ctx)
 	case *planner.TypedStringLit:
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
 		return evalIntervalLit(x)
 	case *planner.ExtractExpr:
-		return evalExtract(x, row, ctx)
+		return evalExtract(x, slotToRow(slot), ctx)
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
 	case *planner.NumericConst:
@@ -76,28 +97,36 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		}
 		return ctx.Params[x.Number-1], nil
 	case *planner.ColumnRef:
-		if row == nil || x.Index >= len(row) {
-			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d out of range", x.Name, x.Index)}
+		if slot == nil {
+			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d on nil slot", x.Name, x.Index)}
 		}
-		return row[x.Index], nil
+		// rowSlotView's underlying len is the only width signal
+		// available without widening the SlotView interface; for
+		// non-Row slots we trust the planner-bound Index.
+		if rs, ok := slot.(rowSlotView); ok {
+			if x.Index < 0 || x.Index >= len(rs) {
+				return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d out of range", x.Name, x.Index)}
+			}
+		}
+		return slot.Get(x.Index), nil
 	case *planner.UnaryOp:
-		operand, err := evalExpr(x.Operand, row, ctx)
+		operand, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		return evalUnary(x.Op, operand, x.Pos())
 	case *planner.BinaryOp:
-		left, err := evalExpr(x.Left, row, ctx)
+		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
-		right, err := evalExpr(x.Right, row, ctx)
+		right, err := evalExprSlot(x.Right, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		return evalBinary(x.Op, left, right, x.Pos())
 	case *planner.FuncCall:
-		return evalFuncCall(x, row, ctx)
+		return evalFuncCall(x, slotToRow(slot), ctx)
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
 }

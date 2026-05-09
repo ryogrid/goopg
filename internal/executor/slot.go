@@ -16,10 +16,9 @@ import (
 // See `docs/design/0068-0002-tuple-slot-pipeline.md` for the
 // authoritative design.
 type TupleSlot interface {
+	SlotView
 	Schema() planner.Schema
 	Width() int
-	Get(col int) Datum
-	IsNull(col int) bool
 
 	// Row exposes the slot as a Row=[]Datum view. For a
 	// MaterializedSlot this is zero-copy. For a future
@@ -36,6 +35,24 @@ type TupleSlot interface {
 	// own backing storage (VirtualSlot, BatchRefSlot).
 	Release()
 }
+
+// SlotView is the read-only column interface that evalExprSlot
+// accepts. Both *MaterializedSlot and *VirtualSlot satisfy it
+// via their Get/IsNull methods (TupleSlot embeds SlotView).
+// Plain Row=[]Datum is wrapped via rowSlotView for legacy
+// call sites that still pass Row to evalExpr.
+type SlotView interface {
+	Get(col int) Datum
+	IsNull(col int) bool
+}
+
+// rowSlotView adapts a Row=[]Datum to SlotView. Zero-cost
+// (type conversion, no alloc) — used at evalExpr's legacy
+// entry where callers still pass Row.
+type rowSlotView Row
+
+func (r rowSlotView) Get(col int) Datum   { return r[col] }
+func (r rowSlotView) IsNull(col int) bool { return r[col].IsNull() }
 
 // MaterializedSlot owns its underlying Row=[]Datum slice. Used
 // at hash-table storage, sort buffer, aggregate group key, and
@@ -138,4 +155,33 @@ func slotRow(slot TupleSlot) Row {
 		return nil
 	}
 	return slot.Row()
+}
+
+// slotToRow extracts a Row from a SlotView for legacy helpers
+// (evalSubquery / evalInExpr / evalExistsExpr / evalExtract /
+// evalFuncCall / evalCaseExpr) that still take Row. Type-asserts
+// to known concrete impls for zero-copy when possible; falls back
+// to materialization for unrecognized SlotView shapes.
+//
+// nil view → nil row (preserves the "operators with no input"
+// contract documented at evalExpr).
+func slotToRow(view SlotView) Row {
+	switch v := view.(type) {
+	case nil:
+		return nil
+	case rowSlotView:
+		return Row(v)
+	case *MaterializedSlot:
+		if v == nil {
+			return nil
+		}
+		return v.row
+	case *VirtualSlot:
+		if v == nil {
+			return nil
+		}
+		return v.Row()
+	default:
+		return nil
+	}
 }
