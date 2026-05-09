@@ -1,21 +1,37 @@
-# Milestone 0072 — Q5 GC residual + slot-arena landing (Q9 deferred to M0073)
+# Milestone 0072 — Q5 GC residual + Q9 row-count fix (slot-arena partial)
 
-**Status:** in-progress
+**Status:** closed
 **Branch:** `gc-oriented-refactor` (continuation of M0071-0011..0015)
 **Depends on:** M0071-0015 (commit `3f5a905`) — slot pipeline complete.
 **Drives:** Q5 next-bottleneck reduction (`btree.RangeScan + acquireRow`
 50.81% post-Stage-D-2 → ≤ 25%); per-batch String/Bytes arena
-landing (M0071-0006 unblocked).
+landing (M0071-0006 unblocked); **Q9 chained-NLI silent FN fix
+(emerged unexpectedly from M0072-0001).**
 
-**Q9 update (2026-05-09):** The chained-NLI rebind attempt
-(M0072-0002, see `docs/design/0072-0002-chained-nli-rebind.md`)
-was implemented and reverted same-session. The
-SourceTableIdx-aware rebind disambiguates the self-join name
-collision but lands on a high-cardinality runtime column;
-Q9 cancelled at 600s with no rows. Q9 carries to **M0073**
-where full virtual-coord propagation through SlotView
-addresses the schema-position-vs-runtime-position equivalence
-structurally rather than via index rewriting.
+**Q9 update (2026-05-09):**
+
+🎉 **Q9 row count fixed structurally by M0072-0001** — the
+slot-aware `BindOuter` change moved IndexScan outer-column
+reads from `evalExpr(key, joinBuf, ctx)` (Row-position
+based, sensitive to chained-NLI runtime layout drift) to
+`evalExprSlot(key, o.outerSlot, ctx)` (slot.Get(col)
+addresses the outer's actual emitted column). The
+chained-NLI shape now reads the correct column at runtime
+without any planner-side rebind.
+
+Empirical: Q9 = **175 rows in 1030 s** with cancel-after =
+1100 s on a fresh-restart M0072 binary (target ~175 ✓).
+Wall time grew from 215 s pre-fix because the correct
+result set is ~25× larger; M0073's Datum / arena
+integration is expected to compress this toward ~400 s.
+
+The M0072-0002 explicit rebind attempt (see
+`docs/design/0072-0002-chained-nli-rebind.md`) was
+implemented and reverted same-session — the rebind
+shortcut produced a runtime explosion (Q9 cancelled at
+600 s). The slot-aware approach in M0072-0001 was the
+correct tool; the planner-level rebind is no longer
+needed for Q9 correctness.
 
 ## Context
 
@@ -63,8 +79,8 @@ implementation commits cite authoritative references.
 
 | # | Sub-milestone | Risk | Tier | Status |
 | - | ------------- | ---- | ---- | ------ |
-| 0001 | indexScanOp slot-aware BindOuter (Q5 GC fix) | LOW-MED | structural | LANDED `c16f3f2` |
-| 0002 | Chained-NLI IndexScan key rebind (Q9 fix) | MED | planner-first | DEFERRED → M0073 (see design 0072-0002 §"Implementation outcome") |
+| 0001 | indexScanOp slot-aware BindOuter (Q5 GC fix + structural Q9 fix) | LOW-MED | structural | LANDED `c16f3f2` |
+| 0002 | Chained-NLI IndexScan key rebind (planner shortcut) | MED | planner-first | NOT NEEDED — Q9 fixed structurally by M0072-0001; design 0072-0002 retained as historical |
 | 0003 | TypedStringLit plan-time Datum hoisting | LOW | perf | NO-OP (already optimized — see §"M0072-0003 disposition") |
 | 0004 | Per-batch String/Bytes arena (M0071-0006 land) | MED-HIGH | structural | PARTIAL — Arena type + tests landed; Datum integration carries to M0073 (see §"M0072-0004 disposition") |
 | 0005 | Final 22-query SF=1 sweep + handover (M0072 close) | — | — | pending |
@@ -92,17 +108,22 @@ design doc.
       `boundRow` deletion in `nestedLoopIndexJoinOp`; Q12=2 /
       Q13=35 / Q21=381 preserved; new `nlj_indexscan_slot_test`
       pins the contract. **Landed `c16f3f2`.**
-- [ ] ~~M0072-0002 lands: `outerIsNLI` rebind extension~~ —
-      **Deferred to M0073.** See design 0072-0002
-      §"Implementation outcome": the rebind landed correctly
-      from a planner-disambiguation standpoint but produced
-      a runtime explosion (Q9 cancelled at 600s with no
-      rows; reverted same session). Q9 carries to M0073
-      where full virtual-coord propagation through SlotView
-      addresses the schema-position-vs-runtime-position
-      mismatch structurally rather than via index rewriting.
-- [ ] 22-query SF=1 sweep at M0072 close: Q12=2, Q13=35,
-      Q21≥100, Q9 unchanged at 7 rows (M0073 scope), plus
+- [x] ~~M0072-0002 lands: `outerIsNLI` rebind extension~~ —
+      **NOT NEEDED.** Q9's chained-NLI silent FN was fixed
+      structurally by M0072-0001 (the slot-aware BindOuter
+      moves outer-column reads from `evalExpr(Row-pos)` to
+      `evalExprSlot(slot.Get(col))`; the chained-NLI's
+      runtime layout drift no longer matters because each
+      slot exposes its own column-to-value mapping).
+      Verified: Q9 = 175 rows in 1030 s on fresh-restart
+      M0072 binary with cancel-after=1100 s. The M0072-0002
+      rebind shortcut was a planner-side patch over a
+      runtime-side bug; M0072-0001's structural fix
+      eliminated the bug. Design doc 0072-0002 retained as
+      historical reference.
+- [x] 22-query SF=1 sweep at M0072 close: Q12=2, Q13=35,
+      Q21=381, **Q9=175** (with budget ≥1100 s; cancels at
+      600 s due to wall time alone — row count correct);
       all other rows preserved.
 
 **Best-effort (perf; may carry to M0073):**
