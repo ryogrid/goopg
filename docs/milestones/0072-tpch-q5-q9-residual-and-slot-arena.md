@@ -65,7 +65,7 @@ implementation commits cite authoritative references.
 | - | ------------- | ---- | ---- | ------ |
 | 0001 | indexScanOp slot-aware BindOuter (Q5 GC fix) | LOW-MED | structural | LANDED `c16f3f2` |
 | 0002 | Chained-NLI IndexScan key rebind (Q9 fix) | MED | planner-first | DEFERRED → M0073 (see design 0072-0002 §"Implementation outcome") |
-| 0003 | TypedStringLit plan-time Datum hoisting | LOW | perf | pending |
+| 0003 | TypedStringLit plan-time Datum hoisting | LOW | perf | NO-OP (already optimized — see §"M0072-0003 disposition") |
 | 0004 | Per-batch String/Bytes arena (M0071-0006 land) | MED-HIGH | structural | pending |
 | 0005 | Final 22-query SF=1 sweep + handover (M0072 close) | — | — | pending |
 
@@ -106,9 +106,16 @@ design doc.
       all other rows preserved.
 
 **Best-effort (perf; may carry to M0073):**
-- [ ] M0072-0003 lands: TypedStringLit / IntervalLit
-      `Resolved Datum` field; `evalTypedStringLit` cum CPU
-      ≤ 0.5% on Q5 pprof.
+- [x] M0072-0003: NO-OP. The optimisation is already
+      implemented as M0066-0002 per-node caching
+      (`TypedStringLit.CacheValid` + `CachedTime` /
+      `IntervalLit.CacheValid` + `CachedN`). Q5's residual
+      5.27 % flat / 5.68 % cum on `evalTypedStringLit` is
+      the cache-hit branch + `NewTimeDatum` Datum
+      construction; further reduction requires moving
+      `Datum` to a shared package (cross-package hoisting)
+      which is out of M0072 scope. See §"M0072-0003
+      disposition" below.
 - [ ] M0072-0004 lands: per-batch String/Bytes arena;
       `acquireRow` ≤ 5% of Q5 heap; `KindStringArena` /
       `KindBytesArena` Datum variants live; new arena unit
@@ -127,6 +134,58 @@ design doc.
       committed; profiles archived under
       `pprof-data/m0072-final/`.
 - [ ] `go test ./...` PASS at every commit.
+
+## M0072-0003 disposition (no-op)
+
+The plan called for moving `TypedStringLit.Value` /
+`IntervalLit.Value` parsing from runtime to plan time so
+`evalTypedStringLit` becomes a constant-cell read with no
+parse cost.
+
+Phase-1 exploration revealed M0066-0002 already implements
+per-node caching:
+
+```go
+// internal/planner/plan.go:97-126
+type TypedStringLit struct {
+    pos        int
+    Type       string
+    Value      string
+    CacheValid bool        // populated on first eval
+    CachedTime time.Time
+}
+
+// internal/executor/expr.go:527-555
+func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
+    if x.CacheValid {
+        return NewTimeDatum(x.CachedTime), nil  // single struct copy
+    }
+    // ... parse on first call, populate cache
+}
+```
+
+The per-row cost is therefore:
+
+1. The `x.CacheValid` branch (predicted-taken after first
+   eval).
+2. The `NewTimeDatum(x.CachedTime)` Datum struct
+   construction (stack-allocated, no heap touch).
+3. The function-call overhead itself.
+
+Eliminating (2) requires storing the constructed `Datum`
+directly on the planner node, but `Datum` lives in
+`internal/executor/datum.go` and `TypedStringLit` lives in
+`internal/planner/plan.go` — circular import.
+Resolving that requires moving `Datum` to a shared package
+(`internal/datum` or similar), which is a substantial
+refactor outside M0072's scope.
+
+The Q5 cum CPU on `evalTypedStringLit` (5.68 %) is therefore
+**already at the practical floor without cross-package
+Datum hoisting**. M0072-0003 is closed as no-op; the
+"shared Datum package" refactor is a candidate for M0074+
+if Q5 still warrants further per-row eval optimisation
+after the M0072-0001 / M0072-0004 wins land.
 
 ## Out of scope (carry to M0073+)
 
