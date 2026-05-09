@@ -392,7 +392,7 @@ func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
 // CancelRequest interrupts the probe phase promptly.  Q5 ran 60+
 // minutes without responding to cancel before this check existed.
 // (M0058-0005.)
-func (o *multiHashJoinOp) Next() (Row, error) {
+func (o *multiHashJoinOp) Next() (TupleSlot, error) {
 	if o.ctx != nil && o.ctx.Ctx != nil {
 		if err := o.ctx.Ctx.Err(); err != nil {
 			return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
@@ -430,9 +430,9 @@ func (o *multiHashJoinOp) Next() (Row, error) {
 			}
 			o.lazyInit = true
 			if o.borrow == BorrowedRow {
-				return o.lazyOut, nil
+				return asSlot(o.Schema(), o.lazyOut), nil
 			}
-			return o.copyOut(), nil
+			return asSlot(o.Schema(), o.copyOut()), nil
 		}
 
 		// Already on a valid combination; advance to the next.
@@ -446,15 +446,15 @@ func (o *multiHashJoinOp) Next() (Row, error) {
 			continue
 		}
 		if o.borrow == BorrowedRow {
-			return o.lazyOut, nil
+			return asSlot(o.Schema(), o.lazyOut), nil
 		}
-		return o.copyOut(), nil
+		return asSlot(o.Schema(), o.copyOut()), nil
 	}
 }
 
 // advanceProbe fetches the next probe row and copies it into lazyOut.
 func (o *multiHashJoinOp) advanceProbe() error {
-	probeRow, err := o.probeOp.Next()
+	probeSlot, err := o.probeOp.Next()
 	if err == EOF {
 		o.lazyProbeEOF = true
 		return nil
@@ -462,6 +462,7 @@ func (o *multiHashJoinOp) advanceProbe() error {
 	if err != nil {
 		return err
 	}
+	probeRow := slotRow(probeSlot)
 	// Reset lazyOut to nulls, then overlay the probe row.
 	nTables := len(o.plan.Tables)
 	for i := 0; i < nTables; i++ {

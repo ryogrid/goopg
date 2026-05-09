@@ -119,3 +119,23 @@ func (s *VirtualSlot) Materialize() *MaterializedSlot {
 // the source slots. The operator pipeline contract (M0070+) will
 // require sources to outlive their VirtualSlot consumers.
 func (s *VirtualSlot) Release() {}
+
+// asSlot wraps a Row in a MaterializedSlot for return at the
+// Operator.Next() boundary (M0071-0010 Stage B). nil row →
+// nil slot, so EOF returns stay clean.
+func asSlot(s planner.Schema, r Row) TupleSlot {
+	if r == nil {
+		return nil
+	}
+	return SlotFromRow(s, r)
+}
+
+// slotRow extracts the Row view from a slot. nil slot → nil row.
+// Used at consumer sites during the M0071-0010 Stage B migration
+// while internal operator logic still works on Row.
+func slotRow(slot TupleSlot) Row {
+	if slot == nil {
+		return nil
+	}
+	return slot.Row()
+}

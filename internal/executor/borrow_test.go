@@ -21,10 +21,11 @@ func TestBorrowSemanticsDefaultIsOwnedRow(t *testing.T) {
 	if op.borrow != OwnedRow {
 		t.Fatalf("default borrow = %v, want OwnedRow", op.borrow)
 	}
-	first, err := op.Next()
+	firstSlot, err := op.Next()
 	if err != nil {
 		t.Fatal(err)
 	}
+	first := firstSlot.Row()
 	// Pull the next row — should not invalidate `first` because
 	// the borrow contract said OwnedRow (the default).
 	_, err = op.Next()
@@ -219,14 +220,14 @@ func (o *fakeBorrowSource) Close() error           { return nil }
 func (o *fakeBorrowSource) SetBorrow(s BorrowSemantics) {
 	o.borrow = s
 }
-func (o *fakeBorrowSource) Next() (Row, error) {
+func (o *fakeBorrowSource) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
 	if o.borrow == BorrowedRow {
-		return r, nil
+		return asSlot(nil, r), nil
 	}
-	return cloneRow(r), nil
+	return asSlot(nil, cloneRow(r)), nil
 }

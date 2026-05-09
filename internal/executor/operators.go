@@ -27,7 +27,7 @@ func (o *valuesOp) Open(ctx *Context) error { o.ctx = ctx; o.idx = 0; return nil
 func (o *valuesOp) Schema() planner.Schema  { return o.schema }
 func (o *valuesOp) Close() error            { return nil }
 
-func (o *valuesOp) Next() (Row, error) {
+func (o *valuesOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -41,7 +41,7 @@ func (o *valuesOp) Next() (Row, error) {
 		}
 		row[i] = v
 	}
-	return row, nil
+	return asSlot(o.schema, row), nil
 }
 
 // projectOp evaluates the target list against each child row.
@@ -81,11 +81,12 @@ func (o *projectOp) Close() error {
 // rows. (M0054-0005a-followup.)
 func (o *projectOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
-func (o *projectOp) Next() (Row, error) {
-	in, err := o.child.Next()
+func (o *projectOp) Next() (TupleSlot, error) {
+	inSlot, err := o.child.Next()
 	if err != nil {
 		return nil, err
 	}
+	in := slotRow(inSlot)
 	for i, t := range o.targets {
 		v, err := evalExpr(t, in, o.ctx)
 		if err != nil {
@@ -94,9 +95,9 @@ func (o *projectOp) Next() (Row, error) {
 		o.out[i] = v
 	}
 	if o.borrow == BorrowedRow {
-		return o.out, nil
+		return asSlot(o.schema, o.out), nil
 	}
-	return cloneRow(o.out), nil
+	return asSlot(o.schema, cloneRow(o.out)), nil
 }
 
 // filterOp drops rows where the predicate doesn't evaluate to TRUE.
@@ -129,7 +130,7 @@ func (o *filterOp) SetBorrow(s BorrowSemantics) {
 	}
 }
 
-func (o *filterOp) Next() (Row, error) {
+func (o *filterOp) Next() (TupleSlot, error) {
 	rejected := 0
 	for {
 		// M0062-followup: a highly-selective filter can drain millions
@@ -140,16 +141,17 @@ func (o *filterOp) Next() (Row, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err != nil {
 			return nil, err
 		}
+		row := slotRow(slot)
 		v, err := evalExpr(o.pred, row, o.ctx)
 		if err != nil {
 			return nil, err
 		}
 		if !v.IsNull() && v.Kind == KindBool && v.BoolValue() {
-			return row, nil
+			return slot, nil
 		}
 		rejected++
 	}
@@ -211,7 +213,7 @@ func (o *limitOp) Open(ctx *Context) error {
 func (o *limitOp) Schema() planner.Schema { return o.child.Schema() }
 func (o *limitOp) Close() error           { return o.child.Close() }
 
-func (o *limitOp) Next() (Row, error) {
+func (o *limitOp) Next() (TupleSlot, error) {
 	for o.skipped < o.offsetCount {
 		if _, err := o.child.Next(); err != nil {
 			return nil, err
@@ -221,12 +223,12 @@ func (o *limitOp) Next() (Row, error) {
 	if o.limitCount >= 0 && o.emitted >= o.limitCount {
 		return nil, EOF
 	}
-	row, err := o.child.Next()
+	slot, err := o.child.Next()
 	if err != nil {
 		return nil, err
 	}
 	o.emitted++
-	return row, nil
+	return slot, nil
 }
 
 // sortOp buffers the child's output then sorts under the supplied
@@ -296,13 +298,18 @@ func (o *sortOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
+		// Materialize at retention boundary: sortOp holds rows
+		// across many Next() calls, so the slot's lifetime
+		// contract requires us to take ownership of an
+		// independent row. (M0071-0010 Stage B.)
+		row := slot.Materialize().Row()
 		o.rows = append(o.rows, row)
 		chunkBytes += estimatedRowBytes(row)
 		pulled++
@@ -421,7 +428,7 @@ func (o *sortOp) Close() error {
 	return o.child.Close()
 }
 
-func (o *sortOp) Next() (Row, error) {
+func (o *sortOp) Next() (TupleSlot, error) {
 	if len(o.spillFiles) == 0 {
 		// Fully in-memory path.
 		if o.idx >= len(o.rows) {
@@ -429,14 +436,18 @@ func (o *sortOp) Next() (Row, error) {
 		}
 		row := o.rows[o.idx]
 		o.idx++
-		return row, nil
+		return asSlot(o.Schema(), row), nil
 	}
 	if !o.mergeReady {
 		if err := o.initMerge(); err != nil {
 			return nil, err
 		}
 	}
-	return o.popMerge()
+	row, err := o.popMerge()
+	if err != nil {
+		return nil, err
+	}
+	return asSlot(o.Schema(), row), nil
 }
 
 // initMerge opens spill readers, primes each source with one row,

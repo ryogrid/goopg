@@ -38,13 +38,14 @@ func TestM0068SortExternalSpills(t *testing.T) {
 	emitted := 0
 	var prev int64
 	for {
-		row, err := s.Next()
+		slot, err := s.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			t.Fatalf("Next: %v", err)
 		}
+		row := slot.Row()
 		if emitted > 0 && row[0].Int < prev {
 			t.Fatalf("merge order violated at %d: %d < %d", emitted, row[0].Int, prev)
 		}
@@ -82,13 +83,14 @@ func TestM0068SortNoSpillBelowChunk(t *testing.T) {
 	}
 	emitted := 0
 	for {
-		row, err := s.Next()
+		slot, err := s.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			t.Fatalf("Next: %v", err)
 		}
+		row := slot.Row()
 		if got, want := row[0].Int, int64(emitted); got != want {
 			t.Fatalf("row %d: got %d, want %d", emitted, got, want)
 		}

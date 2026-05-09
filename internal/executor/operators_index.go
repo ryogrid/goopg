@@ -253,13 +253,13 @@ func (o *indexScanOp) Rescan(outerRow Row) error {
 	return nil
 }
 
-func (o *indexScanOp) Next() (Row, error) {
+func (o *indexScanOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return asSlot(o.Schema(), r), nil
 }
 
 func (o *indexScanOp) Close() error {

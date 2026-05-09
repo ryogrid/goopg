@@ -37,14 +37,14 @@ func runForUpdate(t *testing.T, ctx *Context, sql string) ([]Row, error) {
 	defer op.Close()
 	var rows []Row
 	for {
-		r, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
-		rows = append(rows, r)
+		rows = append(rows, slot.Row())
 	}
 	return rows, nil
 }

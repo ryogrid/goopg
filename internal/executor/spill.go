@@ -320,7 +320,7 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 	tmpDir := os.TempDir()
 
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			break
 		}
@@ -330,6 +330,7 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 			}
 			return nil, err
 		}
+		row := slotRow(slot)
 		totalBytes += estimatedRowBytes(row)
 		if totalBytes > maxBytes && !spilled {
 			// Flush accumulated rows to spill file.
@@ -384,19 +385,20 @@ func drainRowsToOp(op Operator) (Operator, error) {
 
 // rowsOp implements Operator over a pre-drained []Row.
 type rowsOp struct {
-	rows []Row
-	idx  int
+	rows   []Row
+	idx    int
+	schema planner.Schema
 }
 
-func (o *rowsOp) Open(*Context) error { o.idx = 0; return nil }
-func (o *rowsOp) Schema() planner.Schema { return nil } // schema comes from joinOp
-func (o *rowsOp) Next() (Row, error) {
+func (o *rowsOp) Open(*Context) error    { o.idx = 0; return nil }
+func (o *rowsOp) Schema() planner.Schema { return o.schema } // schema comes from joinOp/upstream
+func (o *rowsOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return asSlot(o.schema, r), nil
 }
 func (o *rowsOp) Close() error {
 	o.rows = nil
@@ -423,7 +425,7 @@ func (o *spillOp) Schema() planner.Schema { return nil }
 // (M0054-0005b-followup.)
 func (o *spillOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
-func (o *spillOp) Next() (Row, error) {
+func (o *spillOp) Next() (TupleSlot, error) {
 	row, err := o.r.ReadRowInto(o.out)
 	if err == io.EOF {
 		return nil, EOF
@@ -433,9 +435,9 @@ func (o *spillOp) Next() (Row, error) {
 	}
 	o.out = row // re-cap for the next call
 	if o.borrow == BorrowedRow {
-		return row, nil
+		return asSlot(nil, row), nil
 	}
-	return cloneRow(row), nil
+	return asSlot(nil, cloneRow(row)), nil
 }
 func (o *spillOp) Close() error {
 	o.r.Close()

@@ -750,13 +750,14 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		defer func() { _ = op.Close() }()
 		var out []Datum
 		for {
-			r, err := op.Next()
+			slot, err := op.Next()
 			if err == EOF {
 				break
 			}
 			if err != nil {
 				return nil, err
 			}
+			r := slotRow(slot)
 			if len(r) != 1 {
 				return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("subquery used as IN argument returned %d columns, expected 1", len(r))}
 			}
@@ -907,13 +908,14 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	defer func() { _ = op.Close() }()
-	row, err := op.Next()
+	slot, err := op.Next()
 	if err == EOF {
 		return NullDatum, nil
 	}
 	if err != nil {
 		return Datum{}, err
 	}
+	row := slotRow(slot)
 	if len(row) != 1 {
 		return Datum{}, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("scalar subquery returned %d columns, expected 1", len(row))}
 	}

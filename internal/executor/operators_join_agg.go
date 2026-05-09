@@ -217,9 +217,10 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 				}
 			}
 			buildCount++
-			l, err := buildOp.Next()
+			lSlot, err := buildOp.Next()
 			if err == EOF { break }
 			if err != nil { return err }
+			l := slotRow(lSlot)
 			if leftWidth == 0 && len(l) > 0 {
 				leftWidth = len(l); o.lazyLW = leftWidth
 			}
@@ -258,9 +259,10 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 			}
 		}
 		buildCount++
-		r, err := buildOp.Next()
+		rSlot, err := buildOp.Next()
 		if err == EOF { break }
 		if err != nil { return err }
+		r := slotRow(rSlot)
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r); o.lazyRW = rightWidth
 		}
@@ -462,7 +464,7 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
 }
 
-func (o *joinOp) Next() (Row, error) {
+func (o *joinOp) Next() (TupleSlot, error) {
 	// M0036 lazy output: yield joined rows on demand.
 	if o.lazyProbe != nil {
 		return o.nextLazy()
@@ -472,11 +474,11 @@ func (o *joinOp) Next() (Row, error) {
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return row, nil
+	return asSlot(o.Schema(), row), nil
 }
 
 // nextLazy yields one joined row at a time for lazy hash joins.
-func (o *joinOp) nextLazy() (Row, error) {
+func (o *joinOp) nextLazy() (TupleSlot, error) {
 	// M0054-0005b: reuse the operator's per-Open null padding rows
 	// instead of allocating per call.
 	if o.lazyNullLeft == nil || len(o.lazyNullLeft) != o.lazyLW {
@@ -519,17 +521,18 @@ func (o *joinOp) nextLazy() (Row, error) {
 			if !ok {
 				continue
 			}
-			return joined, nil
+			return asSlot(o.Schema(), joined), nil
 		}
 		o.lazyActive = false
 		// Pull next probe row.
-		r, err := o.lazyProbe.Next()
+		probeSlot, err := o.lazyProbe.Next()
 		if err == EOF {
 			return nil, EOF
 		}
 		if err != nil {
 			return nil, err
 		}
+		r := slotRow(probeSlot)
 		o.lazyRow = r
 		// M0054-0005b: reuse a single keyRow buffer across probe
 		// rows. evalHashKey only reads the column slot the join key
@@ -601,20 +604,20 @@ func (o *joinOp) nextLazy() (Row, error) {
 					continue
 				}
 				o.lazyRow = nil
-				return r, nil
+				return asSlot(o.Schema(), r), nil
 			}
 			// Anti: keep iff no match passed the predicate.
 			if anyMatch {
 				continue
 			}
 			o.lazyRow = nil
-			return r, nil
+			return asSlot(o.Schema(), r), nil
 		}
 		if len(matches) == 0 {
 			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
 				// LEFT JOIN: preserve unmatched left rows.
 				o.lazyRow = nil
-				return concatRows(r, nullRight), nil
+				return asSlot(o.Schema(), concatRows(r, nullRight)), nil
 			}
 			// No matches, not LEFT — skip this probe row.
 			continue
@@ -694,7 +697,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	for {
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
@@ -706,6 +709,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
+		row := slotRow(slot)
 
 		key, groupValues, err := o.evalGroupKey(row)
 		if err != nil {
@@ -890,13 +894,13 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	return NullDatum
 }
 
-func (o *aggregateOp) Next() (Row, error) {
+func (o *aggregateOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return row, nil
+	return asSlot(o.schema, row), nil
 }
 
 func (o *aggregateOp) Close() error {
@@ -923,13 +927,14 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			return rows, nil
 		}
 		if err != nil {
 			return nil, err
 		}
+		row := slotRow(slot)
 		dup := acquireRow(len(row))
 		copy(dup, row)
 		rows = append(rows, dup)

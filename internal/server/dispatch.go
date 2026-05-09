@@ -353,7 +353,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 
 	var rowCount int64
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == executor.EOF {
 			break
 		}
@@ -362,6 +362,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
 		}
 		if len(schema) > 0 {
+			row := slot.Row()
 			cells := make([][]byte, len(row))
 			for i, d := range row {
 				if d.IsNull() {

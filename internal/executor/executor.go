@@ -227,7 +227,7 @@ func newUtilityNoOp(p *planner.Utility) *utilityNoOp { return &utilityNoOp{plan:
 
 func (o *utilityNoOp) Schema() planner.Schema { return nil }
 func (o *utilityNoOp) Open(*Context) error    { return nil }
-func (o *utilityNoOp) Next() (Row, error)     { return nil, EOF }
+func (o *utilityNoOp) Next() (TupleSlot, error) { return nil, EOF }
 func (o *utilityNoOp) Close() error           { return nil }
 
 // Run is a convenience that opens an operator, drains it into a slice
@@ -240,7 +240,7 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 	}
 	var out []Row
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			break
 		}
@@ -248,7 +248,15 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 			_ = op.Close()
 			return nil, err
 		}
-		out = append(out, row)
+		// Some operators (DML, transaction-control utility ops)
+		// return a nil slot with nil err to signal "advance done,
+		// no row to surface". Skip those.
+		if slot == nil {
+			continue
+		}
+		// Materialize at the public Run boundary so callers
+		// receive independent rows.
+		out = append(out, slot.Materialize().Row())
 	}
 	if err := op.Close(); err != nil {
 		return nil, err

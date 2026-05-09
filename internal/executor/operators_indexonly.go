@@ -117,13 +117,13 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *indexOnlyScanOp) Next() (Row, error) {
+func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return asSlot(o.Schema(), r), nil
 }
 
 func (o *indexOnlyScanOp) Close() error {

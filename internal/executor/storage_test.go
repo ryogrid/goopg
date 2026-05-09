@@ -213,14 +213,14 @@ func TestInsertExtendsRelation(t *testing.T) {
 func drainScan(op Operator) ([]Row, error) {
 	var out []Row
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			return out, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, row)
+		out = append(out, slot.Row())
 	}
 }
 

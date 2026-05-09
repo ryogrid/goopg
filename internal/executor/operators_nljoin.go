@@ -103,12 +103,12 @@ func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
+func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 	for {
 		// If we're still serving inner matches for the current
 		// outer row, emit them first.
 		if o.currentOuter != nil && !o.innerExhausted {
-			innerRow, err := o.inner.Next()
+			innerSlot, err := o.inner.Next()
 			if err == EOF {
 				o.innerExhausted = true
 				// LEFT-join fallback: when no inner row matched
@@ -121,9 +121,9 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 						return nil, perr
 					} else if ok {
 						if o.borrow == BorrowedRow {
-							return o.joinBuf, nil
+							return asSlot(o.Schema(), o.joinBuf), nil
 						}
-						return cloneRow(o.joinBuf), nil
+						return asSlot(o.Schema(), cloneRow(o.joinBuf)), nil
 					}
 				}
 				// M0063-0004: Anti-join fallback. When no inner
@@ -135,15 +135,16 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 				if o.plan.Type == planner.JoinTypeAnti && !o.leftJoinEmitted {
 					o.leftJoinEmitted = true
 					if o.borrow == BorrowedRow {
-						return o.currentOuter, nil
+						return asSlot(o.Schema(), o.currentOuter), nil
 					}
-					return cloneRow(o.currentOuter), nil
+					return asSlot(o.Schema(), cloneRow(o.currentOuter)), nil
 				}
 				continue
 			}
 			if err != nil {
 				return nil, err
 			}
+			innerRow := slotRow(innerSlot)
 			// Mark that some inner row was produced (used by
 			// LEFT and Anti's "no-match" fallbacks).
 			o.leftJoinEmitted = true
@@ -168,9 +169,9 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 			if o.plan.Type == planner.JoinTypeSemi {
 				o.innerExhausted = true
 				if o.borrow == BorrowedRow {
-					return o.currentOuter, nil
+					return asSlot(o.Schema(), o.currentOuter), nil
 				}
-				return cloneRow(o.currentOuter), nil
+				return asSlot(o.Schema(), cloneRow(o.currentOuter)), nil
 			}
 			// M0063-0004: Anti's qualifying inner match means
 			// the outer row will NOT be emitted. Fast-forward
@@ -180,19 +181,20 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 				continue
 			}
 			if o.borrow == BorrowedRow {
-				return o.joinBuf, nil
+				return asSlot(o.Schema(), o.joinBuf), nil
 			}
-			return cloneRow(o.joinBuf), nil
+			return asSlot(o.Schema(), cloneRow(o.joinBuf)), nil
 		}
 
 		// Pull the next outer row.
-		outerRow, err := o.outer.Next()
+		outerSlot, err := o.outer.Next()
 		if err == EOF {
 			return nil, EOF
 		}
 		if err != nil {
 			return nil, err
 		}
+		outerRow := slotRow(outerSlot)
 		o.currentOuter = outerRow
 
 		// Bind the outer row into the joinBuf shape so the inner's

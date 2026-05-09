@@ -115,7 +115,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 
 	var rowCount int64
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == executor.EOF {
 			break
 		}
@@ -124,6 +124,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 		}
 		if len(schema) > 0 {
+			row := slot.Row()
 			cells := make([][]byte, len(row))
 			for i, d := range row {
 				if d.IsNull() {

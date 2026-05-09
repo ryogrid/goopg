@@ -130,13 +130,13 @@ func (o *explainOp) Open(ctx *Context) error {
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 
-func (o *explainOp) Next() (Row, error) {
+func (o *explainOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return asSlot(o.Schema(), r), nil
 }
 
 func (o *explainOp) Close() error { return nil }

@@ -42,7 +42,7 @@ func (o *ddlOp) Open(ctx *Context) error {
 }
 func (o *ddlOp) Close() error { return nil }
 
-func (o *ddlOp) Next() (Row, error) {
+func (o *ddlOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}

@@ -154,7 +154,7 @@ func (o *seqScanOp) Close() error {
 
 // nextVisible advances through (block, slot) pairs and returns the
 // next tuple visible to the snapshot, or EOF.
-func (o *seqScanOp) Next() (Row, error) {
+func (o *seqScanOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	for {
 		if o.pinned == nil && o.activePage == nil {
@@ -244,9 +244,9 @@ func (o *seqScanOp) Next() (Row, error) {
 			// caller can retain the row across the next
 			// `Next()` call.
 			if o.borrow == BorrowedRow {
-				return row, nil
+				return asSlot(o.Schema(), row), nil
 			}
-			return cloneRow(row), nil
+			return asSlot(o.Schema(), cloneRow(row)), nil
 		}
 		o.releasePinned()
 		o.curBlock++
@@ -325,7 +325,7 @@ func (o *insertOp) Close() error { return o.child.Close() }
 // Next runs the insert as a one-shot side effect on first call; the
 // wire-protocol path then issues `INSERT N` rather than streaming
 // rows back. RETURNING is deferred — see fix_plan.
-func (o *insertOp) Next() (Row, error) {
+func (o *insertOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -333,13 +333,14 @@ func (o *insertOp) Next() (Row, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
 	for {
-		src, err := o.child.Next()
+		srcSlot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
+		src := slotRow(srcSlot)
 		// Reorder source row -> table column order via plan.ColumnIndex.
 		row := make(Row, len(cols))
 		for i := range cols {
@@ -634,7 +635,7 @@ func (o *updateOp) Close() error { return nil }
 // updateViaIndex uses the B-tree to find the tuple to update (O(log n))
 // instead of scanning all pages. Falls back to the path in Next() when
 // no IndexScan is available.
-func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column) (Row, error) {
+func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column) (TupleSlot, error) {
 	ix := o.idxScan
 	idxRel := o.ctx.Catalog.IndexRelFileNode(ix.Index)
 	tree, err := btree.Open(o.ctx.Pool, idxRel)
@@ -769,7 +770,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	return nil, EOF
 }
 
-func (o *updateOp) Next() (Row, error) {
+func (o *updateOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -894,7 +895,7 @@ func (o *deleteOp) Open(ctx *Context) error {
 
 func (o *deleteOp) Close() error { return nil }
 
-func (o *deleteOp) Next() (Row, error) {
+func (o *deleteOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}

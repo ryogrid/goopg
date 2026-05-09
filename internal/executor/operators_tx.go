@@ -37,7 +37,7 @@ func (o *transactionOp) Open(ctx *Context) error {
 
 func (o *transactionOp) Close() error { return nil }
 
-func (o *transactionOp) Next() (Row, error) {
+func (o *transactionOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
