@@ -49,7 +49,30 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 //
 // nil slot is permitted (mirrors the M0054 contract for valuesOp /
 // limitOp / DML operators that have no input row).
+//
+// M0074-0001: ColumnRef is the dominant case in Q5 (predicate +
+// projection refs over filtered lineitem rows). Hoisted to a
+// fast-path early-return ahead of the type switch — saves the
+// 12-arm type-test sequence on the hot path. evalExprSlot cum
+// CPU at M0073-final was 68.68 % cum; this hoist trims dispatch.
 func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
+	// Fast path: ColumnRef. M0074-0001 hoist.
+	if cref, ok := e.(*planner.ColumnRef); ok {
+		if slot == nil {
+			return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d on nil slot", cref.Name, cref.Index)}
+		}
+		if rs, ok := slot.(rowSlotView); ok {
+			if cref.Index < 0 || cref.Index >= len(rs) {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of range", cref.Name, cref.Index)}
+			}
+		}
+		if vs, ok := slot.(*VirtualSlot); ok {
+			if cref.Index < 0 || cref.Index >= vs.Width() {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of VirtualSlot range %d (chained-NLI?)", cref.Name, cref.Index, vs.Width())}
+			}
+		}
+		return slot.Get(cref.Index), nil
+	}
 	switch x := e.(type) {
 	case *planner.OuterColumnRef:
 		// Look up the row from the lexical-scope stack pushed
@@ -97,29 +120,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, &ExecError{Code: "08P01", Pos: x.Pos(), Message: fmt.Sprintf("parameter $%d not bound", x.Number)}
 		}
 		return ctx.Params[x.Number-1], nil
-	case *planner.ColumnRef:
-		if slot == nil {
-			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d on nil slot", x.Name, x.Index)}
-		}
-		// rowSlotView's underlying len is the only width signal
-		// available without widening the SlotView interface; for
-		// non-Row slots we trust the planner-bound Index.
-		if rs, ok := slot.(rowSlotView); ok {
-			if x.Index < 0 || x.Index >= len(rs) {
-				return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d out of range", x.Name, x.Index)}
-			}
-		}
-		// M0074-0002: defensive bounds check for *VirtualSlot.
-		// In chained-NLI scenarios, the inner IndexScan's
-		// predicate ColumnRef.Index can mismatch the outer
-		// VirtualSlot's runtime composition, producing silently
-		// wrong reads. Surface the mismatch as a hard error.
-		if vs, ok := slot.(*VirtualSlot); ok {
-			if x.Index < 0 || x.Index >= vs.Width() {
-				return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d out of VirtualSlot range %d (chained-NLI?)", x.Name, x.Index, vs.Width())}
-			}
-		}
-		return slot.Get(x.Index), nil
+	// ColumnRef handled by the M0074-0001 fast-path above.
 	case *planner.UnaryOp:
 		operand, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
