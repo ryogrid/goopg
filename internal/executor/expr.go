@@ -109,6 +109,16 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d out of range", x.Name, x.Index)}
 			}
 		}
+		// M0074-0002: defensive bounds check for *VirtualSlot.
+		// In chained-NLI scenarios, the inner IndexScan's
+		// predicate ColumnRef.Index can mismatch the outer
+		// VirtualSlot's runtime composition, producing silently
+		// wrong reads. Surface the mismatch as a hard error.
+		if vs, ok := slot.(*VirtualSlot); ok {
+			if x.Index < 0 || x.Index >= vs.Width() {
+				return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d out of VirtualSlot range %d (chained-NLI?)", x.Name, x.Index, vs.Width())}
+			}
+		}
 		return slot.Get(x.Index), nil
 	case *planner.UnaryOp:
 		operand, err := evalExprSlot(x.Operand, slot, ctx)

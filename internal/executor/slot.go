@@ -129,6 +129,15 @@ func (s *VirtualSlot) Get(col int) Datum {
 	c := s.cols[col]
 	return s.sources[c.sourceIdx].Get(int(c.sourceCol))
 }
+
+// VirtualCol returns the runtime coordinate (sourceIdx,
+// sourceCol) for the col-th output column. Used by
+// chained-NLI diagnostics + future planner-side rebind
+// (M0074-0002 forward-compat surface).
+func (s *VirtualSlot) VirtualCol(col int) (sourceIdx, sourceCol int) {
+	c := s.cols[col]
+	return int(c.sourceIdx), int(c.sourceCol)
+}
 func (s *VirtualSlot) IsNull(col int) bool {
 	c := s.cols[col]
 	return s.sources[c.sourceIdx].IsNull(int(c.sourceCol))

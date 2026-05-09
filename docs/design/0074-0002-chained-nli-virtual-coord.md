@@ -1,7 +1,22 @@
 # Design 0074-0002 — Chained-NLI virtual-coord propagation through SlotView
 
 **Milestone:** M0074-0002
-**Status:** draft
+**Status:** **PARTIAL — conservative infrastructure landed
+2026-05-10; planner-side rebind DEFERRED to M0075.**
+The M0074 session landed the forward-compat surface
+(`VirtualCol(col)` accessor on `*VirtualSlot`,
+defensive bounds check in `evalExprSlot`'s ColumnRef
+arm) but did NOT land the planner-side rebind that
+fixes Q9's bimodal mode-1 (7 rows). Reasoning: the
+M0072-0002 attempt at the same problem (with full
+SourceTableIdx-aware rebind) caused a runtime explosion
+(Q9 cancelled at 380-600 s with 0 rows produced). The
+true structural fix needs evidence-based debugging
+(EXPLAIN comparison + per-outer match-set analysis) that
+this session couldn't perform. Q9 stays at the bimodal
+mode-1 baseline (7 rows); the conservative
+infrastructure makes future debugging easier (clear
+error vs silent wrong reads). See M0075 candidate.
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0071-0009 (`SchemaColumn.SourceTableIdx`);

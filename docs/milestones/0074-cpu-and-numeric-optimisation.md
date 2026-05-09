@@ -116,9 +116,13 @@ B (0006) → C (0004) → D (0002) → E (0001) → F (0003).
 - [ ] M0074-0004 lands: `DecodeRowProjectionIntoArena`
       variant; index-build call sites wired; SF=1 sweep
       unchanged.
-- [ ] M0074-0002 lands: VirtualSlot-aware ColumnRef
-      resolution at evalExprSlot boundary; Q9 = 175 rows
-      DETERMINISTICALLY (no longer bimodal); Q21 still
+- [ ] M0074-0002 PARTIAL: forward-compat infrastructure
+      landed (`VirtualCol(col)` accessor + defensive
+      bounds check in evalExprSlot). The planner-side
+      rebind (the actual Q9 fix) is DEFERRED to M0075
+      pending evidence-based debugging — the M0072-0002
+      attempt at the same problem caused a runtime hang.
+      Q9 stays at the mode-1 baseline (7 rows); Q21 still
       = 381 rows.
 - [ ] M0074-0001 lands: ColumnRef hoisted to first
       switch arm in evalExprSlot; `evalBinaryBatch`
