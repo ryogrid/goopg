@@ -1,0 +1,155 @@
+# Milestone 0072 — Q5 GC residual + Q9 chained-NLI fix + slot-arena landing
+
+**Status:** planned
+**Branch:** `gc-oriented-refactor` (continuation of M0071-0011..0015)
+**Depends on:** M0071-0015 (commit `3f5a905`) — slot pipeline complete.
+**Drives:** Q5 next-bottleneck reduction (`btree.RangeScan + acquireRow`
+50.81% post-Stage-D-2 → ≤ 25%); Q9 chained-NLI 7 → ≥ 90 rows
+(target ~175); per-batch String/Bytes arena landing (M0071-0006
+unblocked).
+
+## Context
+
+After M0071-0015 close, the gc-oriented-refactor branch's
+TPC-H SF=1 state is captured in
+`docs/handover/2026-05-09-tpch-status-phase3.md`:
+
+- **21 / 22 queries return correct row counts** at the
+  Phase-3 baseline. Q21 = 381 rows (M0071-0009 win).
+- **Q5 still cancels at 600s** — slot pipeline complete, but
+  the GC bottleneck has shifted from MHJ `lazyOut` (was
+  99.23% / 2.02 TB pre-Stage-D-2) to:
+  - `btree.RangeScan` 27.02% / 470 GB
+  - `acquireRow` (via `indexScanOp`) 23.79% / 414 GB
+  - Total 50.81% of the Q5 heap after the slot pipeline win.
+- **Q9 still 7 rows** (target ~175). The Stage D-1 NLI
+  VirtualSlot doesn't reach the IndexScan's internal row
+  layer; the planner-bound `ColumnRef.Index` still points at
+  the stale outer-schema position when the outer is itself a
+  chained NLI.
+
+Per `docs/handover/2026-05-09-tpch-status-phase3.md` §4
+(Recommended next steps):
+
+> M0072 is the single change that unlocks BOTH Q5 (next GC
+> bottleneck) AND Q9 (chained-NLI schema-runtime equivalence).
+
+The M0064 `outerIsMHJ` rebind gate at
+`internal/planner/nl_index_join.go:399` exists because MHJ
+reorders schema by OID, breaking parse-time column-index
+layout. M0067-0003 attempted to remove the gate naively and
+went 7 → 1 rows on Q9. M0071-0009 introduced
+`SchemaColumn.SourceTableIdx` which gives
+`findColumnIndexByNameAndSource` a stable disambiguation
+contract — that didn't exist for M0067-0003. M0072-0002
+extends the rebind block to outerIsNLI using the now-
+disambiguatable Name+SourceTableIdx lookup.
+
+This milestone runs as a single focused session with five
+small commits, each gated on Q12=2 / Q13=35 / Q21=381 plus a
+21-query sweep. Docs land first (Commit A) so subsequent
+implementation commits cite authoritative references.
+
+## Sub-milestones
+
+| # | Sub-milestone | Risk | Tier | Depends on |
+| - | ------------- | ---- | ---- | ---------- |
+| 0001 | indexScanOp slot-aware BindOuter (Q5 GC fix) | LOW-MED | structural | — |
+| 0002 | Chained-NLI IndexScan key rebind (Q9 fix) | MED | planner-first | — |
+| 0003 | TypedStringLit plan-time Datum hoisting | LOW | perf | — |
+| 0004 | Per-batch String/Bytes arena (M0071-0006 land) | MED-HIGH | structural | 0001 |
+| 0005 | Final 22-query SF=1 sweep + handover (M0072 close) | — | — | 0001..0004 |
+
+## Design references
+
+- `docs/design/0072-0001-indexscan-slot-bindouter.md` (NEW) —
+  authoritative for **M0072-0001**.
+- `docs/design/0072-0002-chained-nli-rebind.md` (NEW) —
+  authoritative for **M0072-0002**.
+- `docs/design/0068-0003-batch-string-arena.md` —
+  authoritative for **M0072-0004**, unchanged from M0071-0006.
+- `docs/design/0068-0002-tuple-slot-pipeline.md` — slot
+  pipeline contract; M0072-0001 extends BindOuter into the
+  same contract.
+
+The TypedStringLit hoist (M0072-0003) is small enough to
+track via this milestone doc + commit message; no separate
+design doc.
+
+## Definition of Done
+
+**Mandatory (correctness; must land for milestone closure):**
+- [ ] M0072-0001 lands: `indexScanOp.BindOuter(SlotView, int)`;
+      `boundRow` deletion in `nestedLoopIndexJoinOp`; Q12=2 /
+      Q13=35 / Q21=381 preserved; new `nlj_indexscan_slot_test`
+      pins the contract.
+- [ ] M0072-0002 lands: `outerIsNLI` rebind extension; Q9
+      row count ≥ 90 (target ~175); Q9 row count never below
+      7 (M0067-0003 regression mode triggers immediate
+      revert); `TestM0072ChainedNLIRebind` and
+      `TestNLIResultParityCompositeKey` extended.
+- [ ] 22-query SF=1 sweep at M0072 close: Q12=2, Q13=35,
+      Q21≥100, plus all other rows preserved.
+
+**Best-effort (perf; may carry to M0073):**
+- [ ] M0072-0003 lands: TypedStringLit / IntervalLit
+      `Resolved Datum` field; `evalTypedStringLit` cum CPU
+      ≤ 0.5% on Q5 pprof.
+- [ ] M0072-0004 lands: per-batch String/Bytes arena;
+      `acquireRow` ≤ 5% of Q5 heap; `KindStringArena` /
+      `KindBytesArena` Datum variants live; new arena unit
+      tests pass.
+
+**Q5 bottleneck reduction (best-effort):**
+- [ ] Q5 either completes (rows ≥ 1) OR Q5 heap profile
+      shows `btree.RangeScan + acquireRow` ≤ 25% (was
+      50.81% post-Stage-D-2 baseline). Even with the
+      reduction, Q5 may still cancel at 600s — that's
+      acceptable; the structural improvement alone is the
+      milestone deliverable.
+
+**Final:**
+- [ ] M0072-0005 sweep + handover doc (Phase 4)
+      committed; profiles archived under
+      `pprof-data/m0072-final/`.
+- [ ] `go test ./...` PASS at every commit.
+
+## Out of scope (carry to M0073+)
+
+- **Full virtual-coord propagation through slot** — the
+  cleaner fix for Q9 (slot Get reads via `(sourceIdx,
+  sourceCol)` rather than flat `ColumnRef.Index`). M0072-0002
+  takes the targeted-rebind shortcut. M0073 candidate.
+- **IndexOnlyScan slot-aware BindOuter** — currently never
+  driven from NLI; M0072-0001 leaves a no-op stub for
+  interface consistency.
+- **`evalSubquery / evalInExpr / evalExistsExpr` slot-native
+  paths** — still go through `slotToRow` adapter (M0071-0011
+  scope).
+- **Q20 distributional gap** (99 vs canonical ~186) —
+  confirmed dataset variance in
+  `docs/design/0071-0002-q20-zero-rows-diagnostic.md`.
+- **Buffer-pool poolMu byTag partitioning** (M0071-0008
+  carry-forward) — independent perf target; not driven by
+  Q5/Q9.
+
+## References
+
+- `docs/handover/2026-05-09-tpch-status-phase3.md` — M0071-0015
+  close + Q5 pprof findings (post-Stage-D-2 baseline).
+- `pprof-data/m0071-0014/q5.cpu.prof` /
+  `pprof-data/m0071-0014/q5.heap.prof` — the captures driving
+  M0072-0001 / M0072-0004 targets.
+- `internal/planner/nl_index_join.go:399` — the M0064
+  `outerIsMHJ` rebind gate, target of M0072-0002 extension.
+- `internal/planner/bushy.go::findColumnIndexByNameAndSource`
+  — M0071-0009 utility, reused by M0072-0002.
+- `internal/executor/operators_index.go:143-145` —
+  `BindOuter(row Row)` signature, target of M0072-0001
+  refactor.
+- `internal/executor/operators_nljoin.go:38-251` —
+  `nestedLoopIndexJoinOp.boundRow` allocation, target of
+  M0072-0001 deletion.
+- `internal/testutil/tpch/nli_parity_test.go:102-107` —
+  Q9 cluster-backed parity test; M0072-0002 acceptance
+  criterion.
