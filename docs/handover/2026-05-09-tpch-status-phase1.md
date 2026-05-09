@@ -1,12 +1,25 @@
-# TPC-H Status Handover — goopg / `gc-oriented-refactor` (2026-05-09 Phase 1)
+# TPC-H Status Handover — goopg / `gc-oriented-refactor` (2026-05-09 Phase 1+2)
 
 ## Audience
 
 A coding agent picking up TPC-H correctness/performance
 work on goopg. Branch: `gc-oriented-refactor`. Starting
-HEAD: `e8c3779` (M0071-0009 Q21 Path B landed). Supersedes
+HEAD: `0090def` (M0071-0010 Stage B landed; M0071-0009 Q21
+fix preceding). Supersedes
 [`docs/handover/2026-05-09-tpch-status.md`](2026-05-09-tpch-status.md)
 which captured the pre-M0071-0009 baseline.
+
+## 0. Recent commits in this branch
+
+- `0090def` feat(m0071-0010): Stage B — Operator.Next returns
+  TupleSlot. 33 operator types touched; producer cloneRow
+  preserved; Materialize at retention sites
+  (sortOp/windowOp/lockRowsOp). Q12=2/Q13=35/Q21=381 + all
+  regressions clean. Foundation for Stages C+D+E.
+- `48d7354` docs(handover): TPC-H Phase 1 status post-M0071-0009.
+- `e8c3779` feat(m0071-0009): Q21 0→381 rows via three coupled
+  fixes (SchemaColumn.SourceTableIdx + reresolveJoinByName
+  Semi/Anti schema preserve + nextLazy residual Predicate eval).
 
 ## 1. Current TPC-H SF=1 status (post-M0071-0009)
 
@@ -102,15 +115,20 @@ matches and treats "match" as hash-match AND
   schema width (= leftWidth, no merged-leak) and predicate
   ColumnRef SourceTableIdx distinctness.
 
-## 3. Remaining work (Q5 + Q9)
+## 3. Remaining work (Q5 + Q9) — Stages C+D+E
 
-Both require the slot pipeline (design
+Both require completion of the slot pipeline (design
 [`docs/design/0068-0002-tuple-slot-pipeline.md`](../design/0068-0002-tuple-slot-pipeline.md)).
-The 2026-05-09 session attempted Phase 2+3 one-shot but
-reverted (Operator.Next signature change cascades to ~33
-operators + evalExpr refactor + Borrowable removal). The
-work is multi-day; Stage A scaffold remains intact at
-`internal/executor/slot.go`.
+Stage B landed in `0090def` (M0071-0010); Stages C+D+E
+remain.
+
+**Stage B in `0090def`** changed Operator.Next signature to
+return TupleSlot. The 33 producer operators wrap their existing
+Row return via SlotFromRow at the boundary; producer cloneRow
+paths stay in place. Retention sites (sortOp.Open,
+windowOp.Open, lockRowsOp.drainAndStamp) call
+slot.Materialize() at the lifetime boundary. Q12/Q13 stay
+green. **This is the foundation Stages C+D+E build on.**
 
 ### 3.1 Q5 — structural cancel
 
@@ -153,49 +171,54 @@ data. Reload via `dbgen` if absolute parity needed.
 
 ## 4. Recommended next steps
 
-### Path A — slot pipeline (Stages B-E coupled), MULTI-DAY
+### Stages C+D+E (build on `0090def`), MULTI-DAY
 
-**Targets**: Q5 (cancel→completion), Q9 (silent FN
-7→≥90).
+**Targets**: Q5 (cancel→completion via per-row concat
+elimination), Q9 (silent FN 7→≥90 via slot virtual coords).
 
-**Approach**: land Stages B-E **together**, not separately.
-The mechanical scope:
-- Operator.Next() returns TupleSlot (33 producers wrap
-  via SlotFromRow at boundary).
-- evalExpr accepts slot interface (`Get(int) Datum;
-  IsNull(int) bool`) so VirtualSlot composition doesn't
-  require materialization.
-- NLI joinBuf → VirtualSlot{outer, inner}; predicate
-  evaluation walks Get(col).
-- MHJ lazyOut → VirtualSlot{probe, build0..buildN}; per-step
-  match rebinds source slot pointers.
-- filterOp/limitOp/instrumentedOp/projectOp pass-through via
-  VirtualSlot.
-- Remove Borrowable / OwnedRow / BorrowedRow /
-  setChildBorrow; delete `internal/executor/borrow_test.go`.
+**The big remaining piece is `evalExpr` slot-awareness.**
+Today `evalExpr(e, row, ctx)` takes a `Row=[]Datum` and
+ColumnRef.Eval reads `row[c.Index]`. For VirtualSlot
+composition to actually reduce per-row concat (Q5 GC
+target), the predicate evaluator must read via
+`slot.Get(col)` — otherwise NLI/MHJ still materialize at
+the boundary and we save nothing.
 
-**Pre-commit gate per the plan**: build, fresh-restart,
-**Q12=2 + Q13=35 + 22-sweep** — these are the prior-Stage-B
-silent-regression triggers. If they break, do not commit;
-bisect by reverting individual retention-site Materialize
-calls.
+**Approach**:
+1. Add `evalExprSlot(e, slot TupleSlot, ctx) (Datum, error)`
+   — parallel evaluator that uses slot.Get(col)/IsNull(col).
+   Or: refactor `evalExpr` to accept a small interface
+   `{ Get(int) Datum; IsNull(int) bool }` that both Row
+   (via wrapper) and TupleSlot satisfy.
+2. NLI: replace `joinBuf` Row reuse with a persistent
+   `VirtualSlot{outerSlot, innerSlot}`. Predicate eval
+   uses evalExprSlot. Returns the VirtualSlot directly
+   (consumer materializes if it retains).
+3. MHJ: replace `lazyOut` Row reuse with
+   `VirtualSlot{probeSlot, build0Slot..buildNSlot}`. Each
+   step's match rebinds the build slot pointer (no copy).
+4. filterOp/limitOp/instrumentedOp pass-through directly
+   (no Row materialization in the hot path).
+5. Stage E cleanup: remove Borrowable / OwnedRow /
+   BorrowedRow / setChildBorrow; delete borrow_test.go
+   (no longer pinning the deprecated contract). Operators
+   that had `if o.borrow == BorrowedRow ... else clone` can
+   collapse to "always pass-through" (filter/limit) or
+   "always materialize at retention" (sort/agg/join build).
 
-**Q12/Q13 silent-regression cause** (per the past 2 attempts):
-when Stage B removes producer cloneRow, retention sites
-that hold row references go stale on the next producer
-Next() (slot's row buffer is reused). Fix: at retention
-sites (sortOp.Open, aggregateOp.evalGroupKey, joinOp lazyHash,
-multiHashJoin Open, lockRowsOp pending, windowOp, recursive
-union output), call `slot.Materialize().Row()` to ensure
-independence. Crucially, `MaterializedSlot.Materialize()`
-must be a real deep-copy (not a no-op) for slot-buffer-reuse
-producers; today it's no-op.
+**Pre-commit gate**: build, fresh-restart, Q12=2 +
+Q13=35 + 22-sweep. The Stage B foundation in `0090def`
+already preserves Q12/Q13 with my approach (producer
+cloneRow + retention-site Materialize); maintain this
+discipline for Stages C+D+E.
 
 **Acceptance**:
 - Q12=2, Q13=35 preserved (gate)
 - Q3=11462, Q4=5, Q18=11, Q20=99, Q21≥100, Q22=7 preserved
 - Q5 completes (rows ≥ 1) OR ≥30% faster than 600s cancel
-- Q9 row count ≥ 90 (target 175)
+- Q9 row count ≥ 90 (target 175 — uncertain; slot virtual
+  coords may not fully resolve chained-NLI schema-runtime
+  layout mismatch)
 - pprof Q5: `duffcopy + memmove + memclr` ≤ 25%
   (target ≤ 10% per design 0068-0002)
 
