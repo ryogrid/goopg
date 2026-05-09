@@ -79,11 +79,23 @@ type indexScanOp struct {
 	// from a parent NestedLoopIndexJoin.
 	heapRel storage.RelFileNode
 	tree    *btree.BTree
-	// outerRow is the row that the parent NLI bound via BindOuter.
-	// nil when this scan is run from a single-table path (the
-	// historical case): then `o.plan.Key` / `LowKey` / `HighKey`
-	// must reduce to constants.
-	outerRow Row
+	// M0072-0001: outerSlot is the slot the parent NLI bound via
+	// BindOuter. The slot's Get(col) is read by lookupKey /
+	// lookupRangeBounds / lookupKeys via evalExprSlot. nil when this
+	// scan is run from a single-table path (the historical case):
+	// then `o.plan.Key` / `LowKey` / `HighKey` must reduce to
+	// constants. outerWidth is captured at BindOuter time so the
+	// per-call evalExprSlot path has a consistent width hint
+	// (preserves the legacy `len(o.outerRow)` bound check
+	// equivalence without requiring a Width() method on SlotView).
+	outerSlot  SlotView
+	outerWidth int
+
+	// M0072-0001: scanRow is the per-tuple decode buffer. DecodeRow
+	// previously allocated a fresh Row per matched tuple; reusing
+	// scanRow + cloneRow on append matches seqScanOp's M0054-0005a
+	// pattern and removes the per-tuple alloc from the hot path.
+	scanRow Row
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -101,7 +113,7 @@ func (o *indexScanOp) Open(ctx *Context) error {
 	if err := o.openPrep(ctx); err != nil {
 		return err
 	}
-	return o.Rescan(nil)
+	return o.Rescan(nil, 0)
 }
 
 // openPrep does the one-time setup that is independent of any outer
@@ -117,7 +129,8 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	o.rows = nil
 	o.tids = nil
 	o.idx = 0
-	o.outerRow = nil
+	o.outerSlot = nil
+	o.outerWidth = 0
 
 	o.heapRel = ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(o.heapRel, lockmgr.AccessShareLock); err != nil {
@@ -136,23 +149,26 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 }
 
 // BindOuter is invoked by the M0054-0006 NestedLoopIndexJoin parent
-// before each Rescan. The bound row is the input to evalExpr when
-// resolving Key / LowKey / HighKey expressions that reference outer
-// columns (a planner.ColumnRef whose Index is offset by the inner
-// schema width).
-func (o *indexScanOp) BindOuter(row Row) {
-	o.outerRow = row
+// before each Rescan. The bound slot is the input to evalExprSlot
+// when resolving Key / LowKey / HighKey expressions that reference
+// outer columns. (M0072-0001: was BindOuter(row Row); reads now go
+// through SlotView.Get(col) so the NLI parent passes its persistent
+// outerMS slot directly without the legacy `boundRow` concat.)
+func (o *indexScanOp) BindOuter(slot SlotView, outerWidth int) {
+	o.outerSlot = slot
+	o.outerWidth = outerWidth
 }
 
-// Rescan re-drains the underlying index after binding an outer row.
+// Rescan re-drains the underlying index after binding an outer slot.
 // The historical single-table-IndexScan path calls Open which calls
-// Rescan(nil); the M0054-0006 NLI path calls Open once then Rescan
+// Rescan(nil, 0); the M0054-0006 NLI path calls Open once then Rescan
 // per outer row.
-func (o *indexScanOp) Rescan(outerRow Row) error {
+func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	o.rows = o.rows[:0]
 	o.tids = o.tids[:0]
 	o.idx = 0
-	o.outerRow = outerRow
+	o.outerSlot = outerSlot
+	o.outerWidth = outerWidth
 
 	if o.tree == nil {
 		// Defensive: openPrep must have been called.
@@ -229,18 +245,28 @@ func (o *indexScanOp) Rescan(outerRow Row) error {
 		if !found {
 			return true, nil
 		}
-		row, err := DecodeRow(o.plan.Table.Columns, tuple.Data)
-		if err != nil {
+		// M0072-0001: decode into the reusable o.scanRow buffer
+		// (mirrors seqScanOp's M0054-0005a pattern). cloneRow on
+		// append below preserves retention semantics — o.rows[]
+		// keeps independent rows even though scanRow is reused.
+		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
+			o.scanRow = acquireRow(len(o.plan.Table.Columns))
+		}
+		if err := DecodeRowInto(o.scanRow, o.plan.Table.Columns, tuple.Data); err != nil {
 			return false, err
 		}
+		row := o.scanRow
 		// Detoast any out-of-line column values (M0046-0006).
+		// DetoastRow may return a fresh row; either way clone-on-
+		// append below handles ownership.
 		if needsDetoast(row) {
-			row, err = DetoastRow(ctx, heapRel, o.plan.Table.Columns, row)
+			detoasted, err := DetoastRow(ctx, heapRel, o.plan.Table.Columns, row)
 			if err != nil {
 				return true, nil // skip undetoastable tuple
 			}
+			row = detoasted
 		}
-		o.rows = append(o.rows, row)
+		o.rows = append(o.rows, cloneRow(row))
 		// Record the actual live slot (not the index-pointed slot) so
 		// lockRowsOp stamps the current version for SELECT FOR UPDATE.
 		o.tids = append(o.tids, storage.ItemPointer{Block: ptr.Block, Offset: actualSlot})
@@ -265,6 +291,10 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 func (o *indexScanOp) Close() error {
 	o.rows = nil
 	o.tids = nil
+	if o.scanRow != nil {
+		releaseRow(o.scanRow)
+		o.scanRow = nil
+	}
 	return nil
 }
 
@@ -301,7 +331,7 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 	}
 	var probe []byte
 	for i, ke := range o.plan.Keys {
-		v, err := evalExpr(ke, o.outerRow, o.ctx)
+		v, err := evalExprSlot(ke, o.outerSlot, o.ctx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -326,7 +356,7 @@ func (o *indexScanOp) lookupKeys() ([]byte, bool, error) {
 }
 
 func (o *indexScanOp) lookupKey() ([]byte, bool, error) {
-	v, err := evalExpr(o.plan.Key, o.outerRow, o.ctx)
+	v, err := evalExprSlot(o.plan.Key, o.outerSlot, o.ctx)
 	if err != nil {
 		return nil, false, err
 	}
@@ -363,7 +393,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 	}
 
 	if o.plan.LowKey != nil {
-		v, evalErr := evalExpr(o.plan.LowKey, o.outerRow, o.ctx)
+		v, evalErr := evalExprSlot(o.plan.LowKey, o.outerSlot, o.ctx)
 		if evalErr != nil {
 			return nil, nil, false, evalErr
 		}
@@ -379,7 +409,7 @@ func (o *indexScanOp) lookupRangeBounds() (loKey []byte, hiKey []byte, ok bool, 
 	}
 
 	if o.plan.HighKey != nil {
-		v, evalErr := evalExpr(o.plan.HighKey, o.outerRow, o.ctx)
+		v, evalErr := evalExprSlot(o.plan.HighKey, o.outerSlot, o.ctx)
 		if evalErr != nil {
 			return nil, nil, false, evalErr
 		}

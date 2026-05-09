@@ -67,12 +67,9 @@ type nestedLoopIndexJoinOp struct {
 	// outer schema). Reused; .row points to currentOuter.
 	outerOnly *MaterializedSlot
 
-	// boundRow is the (outer ++ nullInner) Row passed to
-	// inner.BindOuter / Rescan. The IndexScan still takes a Row
-	// (slot-awareness deferred to M0072), so we pay one alloc per
-	// outer for the bound shape. Reused across the operator's
-	// lifetime.
-	boundRow Row
+	// (M0072-0001 deleted the per-outer boundRow; the IndexScan
+	// now consumes o.outerMS directly via its slot-aware
+	// BindOuter / Rescan signature.)
 
 	// state: when an outer row is being processed, currentOuter
 	// holds it and innerExhausted tracks whether we've already
@@ -99,7 +96,6 @@ func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	o.outerWidth = len(o.outer.Schema())
 	o.innerWidth = len(o.inner.Schema())
 	o.nullInner = nullRow(o.innerWidth)
-	o.boundRow = acquireRow(o.outerWidth + o.innerWidth)
 
 	// Build virtualOut once. Sources are [outerMS, innerMS] and
 	// the column mapping is [(0,0)..(0,outerW-1), (1,0)..(1,innerW-1)].
@@ -214,17 +210,15 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 		outerRow := slotRow(outerSlot)
 		o.currentOuter = outerRow
 
-		// Bind the outer row into the boundRow shape so the inner's
-		// key expressions can resolve outer column references via
-		// `o.outerRow` in `lookupKey` / `lookupRangeBounds`. The
-		// IndexScan still consumes a Row (slot-aware BindOuter is
-		// M0072 future work) — boundRow is reused across calls so
-		// the alloc is once per Open, not per outer.
-		copy(o.boundRow[:o.outerWidth], outerRow)
-		copy(o.boundRow[o.outerWidth:], o.nullInner)
-		o.inner.BindOuter(o.boundRow)
+		// M0072-0001: bind the outer row into o.outerMS once and
+		// pass the persistent slot directly to the inner IndexScan.
+		// The inner reads outer columns via o.outerSlot.Get(col)
+		// (evalExprSlot at lookupKey / lookupRangeBounds), so no
+		// concatenated `boundRow` alloc is needed per outer.
+		o.outerMS.row = outerRow
+		o.inner.BindOuter(o.outerMS, o.outerWidth)
 
-		if err := o.inner.Rescan(o.boundRow); err != nil {
+		if err := o.inner.Rescan(o.outerMS, o.outerWidth); err != nil {
 			return nil, err
 		}
 		o.innerExhausted = false
@@ -236,10 +230,6 @@ func (o *nestedLoopIndexJoinOp) Close() error {
 	if o.openOnce {
 		_ = o.inner.Close()
 		o.openOnce = false
-	}
-	if o.boundRow != nil {
-		releaseRow(o.boundRow)
-		o.boundRow = nil
 	}
 	return o.outer.Close()
 }
