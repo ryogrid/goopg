@@ -76,7 +76,7 @@ func scanItems(t *testing.T, ctx *Context, tbl *catalog.Table) map[int64]string 
 	}
 	out := map[int64]string{}
 	for _, r := range rows {
-		out[r[0].Int] = r[1].String
+		out[r[0].Int] = r[1].StringValue()
 	}
 	return out
 }

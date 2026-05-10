@@ -30,13 +30,16 @@ func (o *windowOp) Open(ctx *Context) error {
 		return err
 	}
 	for {
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
+		// Materialize at retention boundary: windowOp holds rows
+		// across many Next() calls. (M0071-0010 Stage B.)
+		row := slot.Materialize().Row()
 		dup := make(Row, len(row))
 		copy(dup, row)
 		o.rows = append(o.rows, dup)
@@ -287,13 +290,13 @@ func compareSortDatums(a, b Datum, pos int, desc bool) (cmp int, decided bool, e
 	return c, true, nil
 }
 
-func (o *windowOp) Next() (Row, error) {
+func (o *windowOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return row, nil
+	return asSlot(o.schema, row), nil
 }
 
 func (o *windowOp) Close() error {

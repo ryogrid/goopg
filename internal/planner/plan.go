@@ -23,9 +23,22 @@ type Node interface {
 type Schema []SchemaColumn
 
 // SchemaColumn is one entry in a plan node's output schema.
+//
+// SourceTableIdx (M0071-0009) identifies which FROM-clause range
+// binding produced this column. The binder assigns 1..N (one per
+// base-table FROM-binding within a single planning scope) when
+// the column originates from a base-table scan. Zero (the Go
+// zero-value) means "unknown / derived" — used for Project
+// targets that aren't pure ColumnRef pass-throughs, aggregate
+// outputs, computed expressions, and subquery-derived columns.
+// Used by `findColumnIndexByNameAndSource` and `predRebind` to
+// disambiguate self-joins (e.g. Q21's three lineitem aliases
+// l1/l2/l3 sharing `l_suppkey`) when MHJ OID-sorts the schema
+// and Name-only disambiguation fails.
 type SchemaColumn struct {
-	Name string
-	Type catalog.Type
+	Name           string
+	Type           catalog.Type
+	SourceTableIdx int16
 }
 
 // Expr is implemented by every planner expression. The planner
@@ -218,11 +231,19 @@ func (*BooleanConst) exprNode()  {}
 
 // ColumnRef points at a column in the child operator's output.
 // Index is 0-based into the input row.
+//
+// SourceTableIdx (M0071-0009) carries the source-table identity
+// that the binder resolved this reference against, so downstream
+// rewrites that rebuild the row layout (MHJ OID-sort, Join key
+// rebind) can disambiguate by source when Name alone is
+// ambiguous. Zero (the Go zero-value) means "unknown / derived";
+// in that case rebind helpers fall back to Name-only resolution.
 type ColumnRef struct {
-	pos   int
-	Index int
-	Name  string // resolved column name (for diagnostics)
-	Type  catalog.Type
+	pos            int
+	Index          int
+	Name           string // resolved column name (for diagnostics)
+	Type           catalog.Type
+	SourceTableIdx int16
 }
 
 func (e *ColumnRef) Pos() int { return e.pos }
@@ -234,12 +255,19 @@ func (*ColumnRef) exprNode()  {}
 // scope) — matches upstream's Var.varlevelsup. Only emitted
 // by the planner when a ColumnRef in a subquery resolves up
 // the parent chain instead of locally.
+//
+// SourceTableIdx mirrors `ColumnRef.SourceTableIdx` for the
+// outer-scope binding, used by `unnestExistsExpr.resolveOuterIdx`
+// (M0071-0009) to disambiguate self-join outer references when
+// the Anti-join's residual `l3.l_suppkey <> l1.l_suppkey`
+// otherwise falls back to the original (potentially stale) Index.
 type OuterColumnRef struct {
-	pos   int
-	Level int
-	Index int
-	Name  string
-	Type  catalog.Type
+	pos            int
+	Level          int
+	Index          int
+	Name           string
+	Type           catalog.Type
+	SourceTableIdx int16
 }
 
 func (e *OuterColumnRef) Pos() int { return e.pos }
@@ -264,9 +292,12 @@ func (e *ParamRef) Pos() int { return e.pos }
 func (*ParamRef) exprNode()  {}
 
 // BinaryOp — Left Op Right.
+//
+// M0073-0003: Op is now parser.OpCode (int8 enum), was
+// string. Mirror of parser.BinaryOp's field type.
 type BinaryOp struct {
 	pos   int
-	Op    string
+	Op    parser.OpCode
 	Left  Expr
 	Right Expr
 }
@@ -275,9 +306,11 @@ func (e *BinaryOp) Pos() int { return e.pos }
 func (*BinaryOp) exprNode()  {}
 
 // UnaryOp — Op Operand.
+//
+// M0073-0003: Op is parser.OpCode (int8 enum), was string.
 type UnaryOp struct {
 	pos     int
-	Op      string
+	Op      parser.OpCode
 	Operand Expr
 }
 

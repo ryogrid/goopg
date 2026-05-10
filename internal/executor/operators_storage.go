@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -30,12 +31,6 @@ type seqScanOp struct {
 	plan *planner.SeqScan
 	ctx  *Context
 	cols []catalog.Column
-
-	// M0054-0005a-followup: borrow-semantics flag. When set to
-	// `BorrowedRow`, Next returns `o.scanRow` directly without
-	// the M0054-0005a defensive clone — the parent has promised
-	// to consume the row before pulling the next.
-	borrow BorrowSemantics
 
 	nBlocks  storage.BlockNumber
 	curBlock storage.BlockNumber
@@ -70,6 +65,15 @@ type seqScanOp struct {
 	// per-row leaf-allocation cost the M0054-0004 pprof survey
 	// flagged as `runtime.findObject` flat 29.30 % under Q9.
 	scanRow Row
+
+	// arena is the per-page byte allocator backing varchar / char
+	// / text / bytea Datums emitted by DecodeRowIntoArena.
+	// Reset() at the per-block boundary (when curBlock advances)
+	// frees all variable-length payload allocated for the
+	// previous page's tuples; consumers that retain rows past
+	// the boundary must call slot.Materialize() to deep-copy.
+	// (M0073-0004.)
+	arena *Arena
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -84,10 +88,6 @@ func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 }
 
 func (o *seqScanOp) Schema() planner.Schema { return o.plan.Output() }
-
-// SetBorrow flips seqScanOp into borrow-on-output mode. (M0054-
-// 0005a-followup; design doc 0054-0002 §4.2.)
-func (o *seqScanOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -110,6 +110,10 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curSlot = 0
 	o.slotMax = 0
 	o.prefetchedThru = 0
+	// M0073-0004: per-page byte arena for varchar / char / text /
+	// bytea payload. Reset on block-advance below. Lifetime tied
+	// to the operator; Close drops the pages.
+	o.arena = NewArena(0)
 	// Activate the ring strategy when the relation is large enough that a
 	// full sequential scan would evict most hot pages from the shared pool.
 	// Threshold: pool capacity / 4, matching upstream's heuristic.
@@ -145,12 +149,20 @@ func (o *seqScanOp) Close() error {
 		o.pinned = nil
 		o.activePage = nil
 	}
+	if o.scanRow != nil {
+		releaseRow(o.scanRow)
+		o.scanRow = nil
+	}
+	if o.arena != nil {
+		o.arena.Drop()
+		o.arena = nil
+	}
 	return nil
 }
 
 // nextVisible advances through (block, slot) pairs and returns the
 // next tuple visible to the snapshot, or EOF.
-func (o *seqScanOp) Next() (Row, error) {
+func (o *seqScanOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	for {
 		if o.pinned == nil && o.activePage == nil {
@@ -213,13 +225,17 @@ func (o *seqScanOp) Next() (Row, error) {
 				continue
 			}
 			// M0054-0005a: decode into the reusable o.scanRow
-			// buffer, then return a defensive clone so the
-			// caller can safely hold the row beyond the next
-			// `Next()` call.
+			// buffer. M0073-0004: route varchar / char / text /
+			// bytea payload through the per-page arena so per-
+			// tuple `make([]byte)` allocs are amortised across
+			// the page (one alloc per ~64 KiB). Reset is bound
+			// to the curBlock++ boundary below; consumers that
+			// retain rows past the boundary call slot.Materialize
+			// which deep-copies arena bytes via cloneRowOwned.
 			if o.scanRow == nil || len(o.scanRow) != len(o.cols) {
-				o.scanRow = make(Row, len(o.cols))
+				o.scanRow = acquireRow(len(o.cols))
 			}
-			if err := DecodeRowInto(o.scanRow, o.cols, tuple.Data); err != nil {
+			if err := DecodeRowIntoArena(o.scanRow, o.cols, tuple.Data, o.arena); err != nil {
 				continue
 			}
 			row := o.scanRow
@@ -234,18 +250,29 @@ func (o *seqScanOp) Next() (Row, error) {
 				}
 				row = detoasted
 			}
-			// M0054-0005a-followup: when our parent declared
-			// borrow-OK, return o.scanRow directly. Otherwise
-			// clone (the M0054-0005a defensive copy) so the
-			// caller can retain the row across the next
-			// `Next()` call.
-			if o.borrow == BorrowedRow {
-				return row, nil
-			}
-			return cloneRow(row), nil
+			// M0071-0015 Stage E: producers always cloneRow.
+			// The slot pipeline's retention boundaries
+			// (sortOp.Open, windowOp.Open, lockRowsOp,
+			// executor.Run) call slot.Materialize() when they
+			// need ownership; consumers that only read within
+			// a single Next can use the slot directly.
+			return asSlot(o.Schema(), cloneRow(row)), nil
 		}
 		o.releasePinned()
 		o.curBlock++
+		// M0073-0004: rewind the per-page byte arena. All slots
+		// emitted from the just-finished page have either been
+		// consumed by the parent or had their arena Datums
+		// promoted to owned []byte via slot.Materialize() at the
+		// retention boundary (sortOp.Open / windowOp.Open /
+		// lockRowsOp.drainAndStamp / executor.Run; aggregateOp's
+		// targeted MaterializeArena in evalGroupKey + applyAgg).
+		// Reset rewinds page len to 0 but keeps capacity, so the
+		// next page's decode reuses the same backing bytes — no
+		// per-page allocation in steady state.
+		if o.arena != nil {
+			o.arena.Reset()
+		}
 		// As the scan walks forward, top up the prefetch window
 		// so the next-but-one block is being read by the AIO
 		// engine while we decode the current page.
@@ -321,7 +348,7 @@ func (o *insertOp) Close() error { return o.child.Close() }
 // Next runs the insert as a one-shot side effect on first call; the
 // wire-protocol path then issues `INSERT N` rather than streaming
 // rows back. RETURNING is deferred — see fix_plan.
-func (o *insertOp) Next() (Row, error) {
+func (o *insertOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -329,13 +356,14 @@ func (o *insertOp) Next() (Row, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
 	for {
-		src, err := o.child.Next()
+		srcSlot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
+		src := slotRow(srcSlot)
 		// Reorder source row -> table column order via plan.ColumnIndex.
 		row := make(Row, len(cols))
 		for i := range cols {
@@ -390,7 +418,7 @@ func extractScan(child planner.Node) (seq *planner.SeqScan, pred planner.Expr, i
 				combined = c.Predicate
 			} else {
 				combined = &planner.BinaryOp{
-					Op:    "AND",
+					Op:    parser.OpAnd,
 					Left:  c.Predicate,
 					Right: idxPred,
 				}
@@ -428,7 +456,7 @@ func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
 	for i, sc := range out {
 		if sc.Name == col {
 			return &planner.BinaryOp{
-				Op:    "=",
+				Op:    parser.OpEq,
 				Left:  &planner.ColumnRef{Index: i, Name: col, Type: sc.Type},
 				Right: ix.Key,
 			}
@@ -630,7 +658,7 @@ func (o *updateOp) Close() error { return nil }
 // updateViaIndex uses the B-tree to find the tuple to update (O(log n))
 // instead of scanning all pages. Falls back to the path in Next() when
 // no IndexScan is available.
-func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column) (Row, error) {
+func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column) (TupleSlot, error) {
 	ix := o.idxScan
 	idxRel := o.ctx.Catalog.IndexRelFileNode(ix.Index)
 	tree, err := btree.Open(o.ctx.Pool, idxRel)
@@ -765,7 +793,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	return nil, EOF
 }
 
-func (o *updateOp) Next() (Row, error) {
+func (o *updateOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -890,7 +918,7 @@ func (o *deleteOp) Open(ctx *Context) error {
 
 func (o *deleteOp) Close() error { return nil }
 
-func (o *deleteOp) Next() (Row, error) {
+func (o *deleteOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -1019,7 +1047,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 					ctx.Pool.Unpin(s)
 					return err
 				}
-				if v.IsNull() || v.Kind != KindBool || !v.Bool {
+				if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
 					continue
 				}
 			}

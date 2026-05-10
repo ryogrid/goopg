@@ -217,9 +217,14 @@ func (*StarExpr) exprNode()  {}
 
 // BinaryOp is `Left Op Right` for the arithmetic, string-concat,
 // comparison, and boolean operators v0 recognises.
+//
+// M0073-0003: Op is now an OpCode int8 enum (was string).
+// Switching on OpCode produces a jump-table dispatch in the
+// hot path (`evalBinary`); the per-row string-compare cost
+// flagged by Q5's M0072-final pprof is gone.
 type BinaryOp struct {
 	pos   int
-	Op    string
+	Op    OpCode
 	Left  Expr
 	Right Expr
 }
@@ -228,9 +233,11 @@ func (e *BinaryOp) Pos() int { return e.pos }
 func (*BinaryOp) exprNode()  {}
 
 // UnaryOp is `Op Operand`. v0 uses it for `-x`, `+x`, and `NOT x`.
+//
+// M0073-0003: Op is now an OpCode int8 enum (was string).
 type UnaryOp struct {
 	pos     int
-	Op      string
+	Op      OpCode
 	Operand Expr
 }
 

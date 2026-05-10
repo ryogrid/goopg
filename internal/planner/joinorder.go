@@ -167,7 +167,7 @@ func collectEqualityEdges(where parser.Expr, indexByKey map[string]int, colToRel
 	}
 	addEdge := func(c parser.Expr) {
 		bin, ok := c.(*parser.BinaryOp)
-		if !ok || bin.Op != "=" {
+		if !ok || bin.Op != parser.OpEq {
 			return
 		}
 		l, lok := bin.Left.(*parser.ColumnRef)
@@ -204,7 +204,7 @@ func collectEqualityEdges(where parser.Expr, indexByKey map[string]int, colToRel
 // join-edge information for cost-based ordering. (M0058-0004.)
 func commonEquijoinsAcrossOr(e parser.Expr) []parser.Expr {
 	bin, ok := e.(*parser.BinaryOp)
-	if !ok || strings.ToUpper(bin.Op) != "OR" {
+	if !ok || bin.Op != parser.OpOr {
 		return nil
 	}
 	branches := flattenOrBranches(bin)
@@ -216,7 +216,7 @@ func commonEquijoinsAcrossOr(e parser.Expr) []parser.Expr {
 		branchEqs[i] = map[string]parser.Expr{}
 		walkConjuncts(br, func(c parser.Expr) {
 			b, ok := c.(*parser.BinaryOp)
-			if !ok || b.Op != "=" {
+			if !ok || b.Op != parser.OpEq {
 				return
 			}
 			lc, lok := b.Left.(*parser.ColumnRef)
@@ -249,7 +249,7 @@ func commonEquijoinsAcrossOr(e parser.Expr) []parser.Expr {
 // inputs return [e].
 func flattenOrBranches(e parser.Expr) []parser.Expr {
 	bin, ok := e.(*parser.BinaryOp)
-	if !ok || strings.ToUpper(bin.Op) != "OR" {
+	if !ok || bin.Op != parser.OpOr {
 		return []parser.Expr{e}
 	}
 	out := flattenOrBranches(bin.Left)
@@ -318,7 +318,7 @@ func walkConjuncts(e parser.Expr, visit func(parser.Expr)) {
 	if e == nil {
 		return
 	}
-	if bin, ok := e.(*parser.BinaryOp); ok && strings.ToUpper(bin.Op) == "AND" {
+	if bin, ok := e.(*parser.BinaryOp); ok && bin.Op == parser.OpAnd {
 		walkConjuncts(bin.Left, visit)
 		walkConjuncts(bin.Right, visit)
 		return

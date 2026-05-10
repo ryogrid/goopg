@@ -203,7 +203,7 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 // the stamp pass (per-row PageSetHeapTupleLockOnly + WAL emit),
 // then yield the buffered rows. Subsequent calls return rows
 // from the buffer. EOF when the buffer is exhausted.
-func (o *lockRowsOp) Next() (Row, error) {
+func (o *lockRowsOp) Next() (TupleSlot, error) {
 	if !o.drained {
 		if err := o.drainAndStamp(); err != nil {
 			return nil, err
@@ -214,7 +214,7 @@ func (o *lockRowsOp) Next() (Row, error) {
 	}
 	row := o.pending[o.pos].row
 	o.pos++
-	return row, nil
+	return asSlot(o.Schema(), row), nil
 }
 
 // drainAndStamp runs phases 1 and 2 of the two-pass protocol:
@@ -227,13 +227,17 @@ func (o *lockRowsOp) Next() (Row, error) {
 func (o *lockRowsOp) drainAndStamp() error {
 	o.drained = true
 	for {
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
+		// Materialize at retention boundary: lockRowsOp's two-pass
+		// protocol holds rows across the entire stamp loop.
+		// (M0071-0010 Stage B.)
+		row := slot.Materialize().Row()
 		entry := pendingLockedRow{row: row}
 		if o.scan != nil {
 			if rel, ptr, ok := o.scan.currentTID(); ok {

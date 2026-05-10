@@ -48,27 +48,27 @@ func (o *setOp) Close() error {
 	return rErr
 }
 
-func (o *setOp) Next() (Row, error) {
+func (o *setOp) Next() (TupleSlot, error) {
 	if !o.leftDone {
-		row, err := o.left.Next()
+		slot, err := o.left.Next()
 		if err == EOF {
 			o.leftDone = true
 			o.left.Close()
 		} else if err != nil {
 			return nil, err
 		} else {
-			return row, nil
+			return slot, nil
 		}
 	}
 	if !o.rightDone {
-		row, err := o.right.Next()
+		slot, err := o.right.Next()
 		if err == EOF {
 			o.rightDone = true
 			o.right.Close()
 		} else if err != nil {
 			return nil, err
 		} else {
-			return row, nil
+			return slot, nil
 		}
 	}
 	return nil, EOF

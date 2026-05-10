@@ -26,7 +26,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 		{Kind: KindInt, Int: 1},
 		{Kind: KindInt, Int: 1},
 		{Kind: KindInt, Int: 0},
-		{Kind: KindString, String: ""},
+		NewStringDatum(""),
 	}
 	got, err := EncodeCopyTextRow(nil, row, cols)
 	if err != nil {
@@ -43,7 +43,7 @@ func TestEncodeCopyTextRowPgbenchShape(t *testing.T) {
 // verifies the rest of the byte stream passes through untouched.
 func TestEncodeCopyTextRowEscaping(t *testing.T) {
 	cols := []catalog.Column{{Name: "s", Type: catalog.Type{Name: "text"}}}
-	row := Row{{Kind: KindString, String: "a\\b\nc\rd\te"}}
+	row := Row{NewStringDatum("a\\b\nc\rd\te")}
 	got, err := EncodeCopyTextRow(nil, row, cols)
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestEncodeCopyTextRowNullSentinel(t *testing.T) {
 		{Name: "a", Type: catalog.Type{Name: "int4"}},
 		{Name: "b", Type: catalog.Type{Name: "text"}},
 	}
-	row := Row{NullDatum, {Kind: KindString, String: "x"}}
+	row := Row{NullDatum, NewStringDatum("x")}
 	got, err := EncodeCopyTextRow(nil, row, cols)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestDecodeCopyTextRowPgbenchShape(t *testing.T) {
 		{Kind: KindInt, Int: 42},
 		{Kind: KindInt, Int: 1},
 		{Kind: KindInt, Int: 100},
-		{Kind: KindString, String: "hello"},
+		NewStringDatum("hello"),
 	}
 	if !rowsEqual(got, want) {
 		t.Errorf("got %+v want %+v", got, want)
@@ -105,7 +105,7 @@ func TestDecodeCopyTextRowNull(t *testing.T) {
 	if !got[0].IsNull() {
 		t.Errorf("col 0 not null: %+v", got[0])
 	}
-	if got[1].Kind != KindString || got[1].String != "xNy" {
+	if got[1].Kind != KindString || got[1].StringValue() != "xNy" {
 		t.Errorf("col 1 = %+v want xNy", got[1])
 	}
 }
@@ -137,7 +137,7 @@ func TestDecodeCopyTextRowEscapes(t *testing.T) {
 			t.Errorf("%q: %v", tc.in, err)
 			continue
 		}
-		if got[0].Kind != KindString || got[0].String != tc.want {
+		if got[0].Kind != KindString || got[0].StringValue() != tc.want {
 			t.Errorf("%q -> %+v, want %q", tc.in, got[0], tc.want)
 		}
 	}
@@ -166,8 +166,8 @@ func TestRoundTripBoolAndTimestamp(t *testing.T) {
 	}
 	now := time.Date(2026, 4, 28, 12, 34, 56, 789000*1000, time.UTC)
 	row := Row{
-		{Kind: KindBool, Bool: true},
-		{Kind: KindTime, Time: now},
+		NewBoolDatum(true),
+		NewTimeDatum(now),
 	}
 	enc, err := EncodeCopyTextRow(nil, row, cols)
 	if err != nil {
@@ -181,11 +181,11 @@ func TestRoundTripBoolAndTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].Kind != KindBool || got[0].Bool != true {
+	if got[0].Kind != KindBool || got[0].BoolValue() != true {
 		t.Errorf("bool: %+v", got[0])
 	}
-	if got[1].Kind != KindTime || !got[1].Time.Equal(now) {
-		t.Errorf("ts: %v want %v", got[1].Time, now)
+	if got[1].Kind != KindTime || !got[1].TimeValue().Equal(now) {
+		t.Errorf("ts: %v want %v", got[1].TimeValue(), now)
 	}
 }
 
@@ -203,19 +203,19 @@ func rowsEqual(a, b Row) bool {
 				return false
 			}
 		case KindBool:
-			if a[i].Bool != b[i].Bool {
+			if a[i].BoolValue() != b[i].BoolValue() {
 				return false
 			}
 		case KindString:
-			if a[i].String != b[i].String {
+			if a[i].StringValue() != b[i].StringValue() {
 				return false
 			}
 		case KindBytes:
-			if !bytes.Equal(a[i].Bytes, b[i].Bytes) {
+			if !bytes.Equal(a[i].BytesValue(), b[i].BytesValue()) {
 				return false
 			}
 		case KindTime:
-			if !a[i].Time.Equal(b[i].Time) {
+			if !a[i].TimeValue().Equal(b[i].TimeValue()) {
 				return false
 			}
 		}

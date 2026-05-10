@@ -48,7 +48,7 @@ func (o *recursiveUnionOp) Close() error {
 	return nil
 }
 
-func (o *recursiveUnionOp) Next() (Row, error) {
+func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -56,13 +56,14 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 	// Phase 1: drain the anchor.
 	if !o.initDone {
 		for {
-			row, err := o.anchor.Next()
+			slot, err := o.anchor.Next()
 			if err == EOF {
 				break
 			}
 			if err != nil {
 				return nil, err
 			}
+			row := slotRow(slot)
 			r := make(Row, len(row))
 			copy(r, row)
 			o.working = append(o.working, r)
@@ -87,7 +88,7 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 		}
 		iterRows := make([]Row, 0)
 		for {
-			row, err := o.recursive.Next()
+			slot, err := o.recursive.Next()
 			if err == EOF {
 				break
 			}
@@ -95,6 +96,7 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 				o.recursive.Close()
 				return nil, err
 			}
+			row := slotRow(slot)
 			r := make(Row, len(row))
 			copy(r, row)
 			iterRows = append(iterRows, r)
@@ -111,7 +113,7 @@ func (o *recursiveUnionOp) Next() (Row, error) {
 
 	row := o.output[o.outIdx]
 	o.outIdx++
-	return row, nil
+	return asSlot(o.Schema(), row), nil
 }
 
 // workTableScanOp reads rows from ctx.WorkTableRows, returning one
@@ -137,11 +139,11 @@ func (o *workTableScanOp) Open(ctx *Context) error {
 
 func (o *workTableScanOp) Close() error { return nil }
 
-func (o *workTableScanOp) Next() (Row, error) {
+func (o *workTableScanOp) Next() (TupleSlot, error) {
 	if o.ctx == nil || o.idx >= len(o.ctx.WorkTableRows) {
 		return nil, EOF
 	}
 	row := o.ctx.WorkTableRows[o.idx]
 	o.idx++
-	return row, nil
+	return asSlot(o.Schema(), row), nil
 }

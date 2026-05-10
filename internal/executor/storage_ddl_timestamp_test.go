@@ -32,7 +32,7 @@ func TestDDLCreateTimestampBTreeIndexAcceptsType(t *testing.T) {
 	for i, d := range dates {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindTime, Time: d},
+			NewTimeDatum(d),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -87,7 +87,7 @@ func TestDDLTimestampRangeScanParity(t *testing.T) {
 	for i, d := range allDates {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindTime, Time: d},
+			NewTimeDatum(d),
 		}); err != nil {
 			t.Fatal(err)
 		}

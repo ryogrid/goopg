@@ -95,15 +95,15 @@ func (o *explainOp) Open(ctx *Context) error {
 			if err != nil {
 				return fmt.Errorf("explain: marshal JSON: %w", err)
 			}
-			o.rows = []Row{{Datum{Kind: KindString, String: string(out)}}}
+			o.rows = []Row{{NewStringDatum(string(out))}}
 			return nil
 		}
 		var b strings.Builder
 		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats)
 		if summary {
 			o.rows = append(o.rows,
-				Row{Datum{Kind: KindString, String: fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs))}},
-				Row{Datum{Kind: KindString, String: fmt.Sprintf("Execution Time: %.3f ms", nsToMs(execNs))}},
+				Row{NewStringDatum(fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs)))},
+				Row{NewStringDatum(fmt.Sprintf("Execution Time: %.3f ms", nsToMs(execNs)))},
 			)
 		}
 		return nil
@@ -120,7 +120,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		if err != nil {
 			return fmt.Errorf("explain: marshal JSON: %w", err)
 		}
-		o.rows = []Row{{Datum{Kind: KindString, String: string(out)}}}
+		o.rows = []Row{{NewStringDatum(string(out))}}
 		return nil
 	}
 	var b strings.Builder
@@ -130,13 +130,13 @@ func (o *explainOp) Open(ctx *Context) error {
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 
-func (o *explainOp) Next() (Row, error) {
+func (o *explainOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return asSlot(o.Schema(), r), nil
 }
 
 func (o *explainOp) Close() error { return nil }
@@ -165,12 +165,12 @@ func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts p
 	if est := planner.EstimateRows(n); est > 0 {
 		label += fmt.Sprintf(" (rows=%d)", est)
 	}
-	*rows = append(*rows, Row{Datum{Kind: KindString, String: label}})
+	*rows = append(*rows, Row{NewStringDatum(label)})
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
-			*rows = append(*rows, Row{Datum{Kind: KindString, String: outline}})
+			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
 
@@ -217,12 +217,12 @@ func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row,
 			label += fmt.Sprintf(" (actual rows=%d loops=%d)", s.rowsOut, s.loops)
 		}
 	}
-	*rows = append(*rows, Row{Datum{Kind: KindString, String: label}})
+	*rows = append(*rows, Row{NewStringDatum(label)})
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
-			*rows = append(*rows, Row{Datum{Kind: KindString, String: outline}})
+			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
 

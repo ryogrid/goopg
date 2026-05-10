@@ -17,9 +17,9 @@ func TestSpillRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := []Row{
-		{Datum{Kind: KindInt, Int: 1}, Datum{Kind: KindString, String: "hello"}},
+		{Datum{Kind: KindInt, Int: 1}, NewStringDatum("hello")},
 		{Datum{Kind: KindInt, Int: 2}, Datum{Kind: KindNull}},
-		{Datum{Kind: KindNumeric, NumericMantissa: 12345, NumericScale: 2}, Datum{Kind: KindString, String: "world"}},
+		{Datum{Kind: KindNumeric, Int: 12345, Scale: 2}, NewStringDatum("world")},
 	}
 	for _, row := range rows {
 		if err := w.WriteRow(row); err != nil {
@@ -55,7 +55,7 @@ func TestSpillRoundTrip(t *testing.T) {
 					t.Errorf("row %d col %d: kind mismatch", i, j)
 				} else if row[j].Kind == KindInt && row[j].Int != readBack[i][j].Int {
 					t.Errorf("row %d col %d: int mismatch", i, j)
-				} else if row[j].Kind == KindString && row[j].String != readBack[i][j].String {
+				} else if row[j].Kind == KindString && row[j].StringValue() != readBack[i][j].StringValue() {
 					t.Errorf("row %d col %d: string mismatch", i, j)
 				}
 			}
@@ -89,7 +89,7 @@ func TestDrainRowsBoundedSpill(t *testing.T) {
 	// 10K rows with 512-byte strings, 1 KB budget → should spill.
 	rows := make([]Row, 10000)
 	for i := range rows {
-		rows[i] = Row{Datum{Kind: KindString, String: makeString(512)}}
+		rows[i] = Row{NewStringDatum(makeString(512))}
 	}
 	op := &rowsOp{rows: rows}
 	result, err := drainRowsBounded(op, 1024) // 1 KB — tiny budget forces spill

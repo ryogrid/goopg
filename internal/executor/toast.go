@@ -100,10 +100,10 @@ func ToastLargeColumnsIfNeeded(ctx *Context, rel storage.RelFileNode, cols []cat
 		}
 		var data []byte
 		switch d.Kind {
-		case KindString:
-			data = []byte(d.String)
-		case KindBytes:
-			data = d.Bytes
+		case KindString, KindStringArena:
+			data = []byte(d.StringValue())
+		case KindBytes, KindBytesArena:
+			data = d.BytesValue()
 		default:
 			continue
 		}
@@ -119,7 +119,7 @@ func ToastLargeColumnsIfNeeded(ctx *Context, rel storage.RelFileNode, cols []cat
 		if err != nil {
 			return nil, fmt.Errorf("TOAST %s: %w", col.Name, err)
 		}
-		newRow[i] = Datum{Kind: KindToastPointer, Bytes: ptr}
+		newRow[i] = NewToastPointerDatum(ptr)
 	}
 	if newRow != nil {
 		return newRow, nil
@@ -142,7 +142,7 @@ func toastStore(ctx *Context, toastRel storage.RelFileNode, data []byte) ([]byte
 		chunkRow := Row{
 			{Kind: KindInt, Int: int64(oid)},
 			{Kind: KindInt, Int: int64(seq)},
-			{Kind: KindBytes, Bytes: chunkData},
+			NewBytesDatum(chunkData),
 		}
 		body, err := EncodeRow(toastCols, chunkRow)
 		if err != nil {
@@ -278,10 +278,10 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 			// types (even bytea). Accept both kinds so chunk data
 			// stored as either bytes or string is correctly captured.
 			switch row[2].Kind {
-			case KindBytes:
-				chunks[seq] = row[2].Bytes
-			case KindString:
-				chunks[seq] = []byte(row[2].String)
+			case KindBytes, KindBytesArena:
+				chunks[seq] = row[2].BytesValue()
+			case KindString, KindStringArena:
+				chunks[seq] = []byte(row[2].StringValue())
 			}
 		}
 		slot.RUnlock()
@@ -309,15 +309,15 @@ func DetoastRow(ctx *Context, mainRel storage.RelFileNode, cols []catalog.Column
 		if d.Kind != KindToastPointer {
 			continue
 		}
-		data, err := DetoastValue(ctx, toastRel, d.Bytes)
+		data, err := DetoastValue(ctx, toastRel, d.BytesValue())
 		if err != nil {
 			return nil, fmt.Errorf("detoast column %s: %w", cols[i].Name, err)
 		}
 		// Return as the appropriate datum kind for the column type.
 		if cols[i].Type.Name == "bytea" {
-			newRow[i] = Datum{Kind: KindBytes, Bytes: data}
+			newRow[i] = NewBytesDatum(data)
 		} else {
-			newRow[i] = Datum{Kind: KindString, String: string(data)}
+			newRow[i] = NewStringDatum(string(data))
 		}
 	}
 	return newRow, nil

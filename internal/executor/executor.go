@@ -36,11 +36,10 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		// M0054-0005a-followup: projectOp ALWAYS copies its
-		// child's row into `o.out` (then either clones or returns
-		// borrowed). So the child is always safe to borrow,
-		// regardless of project's own borrow contract.
-		setChildBorrow(child, BorrowedRow)
+		// M0071-0015 Stage E: projectOp materialises evaluated
+		// targets into o.out and clones for the consumer; child
+		// slot lifetime is bounded by projectOp's per-Next read
+		// — no borrow contract needed.
 		return maybeInstrument(p, newProjectOp(p, child)), nil
 	case *planner.Filter:
 		child, err := Build(p.Child)
@@ -87,26 +86,23 @@ func Build(plan planner.Node) (Operator, error) {
 		}
 		// Inner is always an *IndexScan by plan-node contract.
 		innerScan := newIndexScanOp(p.Inner)
-		// M0059-0002: NLI consumes one outer row at a time, copies
-		// it into o.joinBuf, then runs the inner Rescan. The outer
-		// row is released before the next pull, so it is safe to
-		// receive borrowed rows from the outer side. The inner is
-		// an *IndexScan that pre-materialises into o.rows[] at
-		// Open() — borrow is a no-op there.
-		setChildBorrow(outer, BorrowedRow)
+		// M0071-0013 Stage D-1: NLI now composes outer + inner via
+		// a persistent VirtualSlot. outerMS.row is overwritten per
+		// outer row before the inner Rescan; the IndexScan still
+		// reads outer columns from the bound Row (slot-aware
+		// BindOuter is M0072 future work). No borrow contract
+		// needed at this boundary.
 		return maybeInstrument(p, newNestedLoopIndexJoinOp(p, outer, innerScan)), nil
 	case *planner.Aggregate:
 		child, err := Build(p.Child)
 		if err != nil {
 			return nil, err
 		}
-		// M0059-0002: aggregateOp.Open's drain loop consumes each
-		// child row, extracts value-typed Datums into aggRuntime
-		// fields and into a fresh groupValues Row, then releases
-		// the source row before pulling the next. Datums hold
-		// independent string allocations from the scan decode
-		// path, so borrowed input is safe.
-		setChildBorrow(child, BorrowedRow)
+		// M0071-0015 Stage E: aggregateOp.Open's drain loop
+		// extracts value-typed Datums into aggRuntime fields and
+		// into a fresh groupValues Row before pulling the next
+		// child slot — slot lifetime is bounded by the per-Next
+		// read, no borrow contract needed.
 		return maybeInstrument(p, newAggregateOp(p, child)), nil
 	case *planner.WindowAgg:
 		child, err := Build(p.Child)
@@ -227,7 +223,7 @@ func newUtilityNoOp(p *planner.Utility) *utilityNoOp { return &utilityNoOp{plan:
 
 func (o *utilityNoOp) Schema() planner.Schema { return nil }
 func (o *utilityNoOp) Open(*Context) error    { return nil }
-func (o *utilityNoOp) Next() (Row, error)     { return nil, EOF }
+func (o *utilityNoOp) Next() (TupleSlot, error) { return nil, EOF }
 func (o *utilityNoOp) Close() error           { return nil }
 
 // Run is a convenience that opens an operator, drains it into a slice
@@ -240,7 +236,7 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 	}
 	var out []Row
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			break
 		}
@@ -248,7 +244,15 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 			_ = op.Close()
 			return nil, err
 		}
-		out = append(out, row)
+		// Some operators (DML, transaction-control utility ops)
+		// return a nil slot with nil err to signal "advance done,
+		// no row to surface". Skip those.
+		if slot == nil {
+			continue
+		}
+		// Materialize at the public Run boundary so callers
+		// receive independent rows.
+		out = append(out, slot.Materialize().Row())
 	}
 	if err := op.Close(); err != nil {
 		return nil, err

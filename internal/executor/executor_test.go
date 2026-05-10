@@ -160,7 +160,7 @@ func TestExecJoinVariants(t *testing.T) {
 		return &planner.Values{Rows: rows}
 	}
 	pred := &planner.BinaryOp{
-		Op: "=",
+		Op: parser.OpEq,
 		Left: &planner.ColumnRef{
 			Index: 0,
 			Name:  "l",
@@ -329,12 +329,12 @@ func TestExecBooleanThreeValuedLogic(t *testing.T) {
 	cases := []struct {
 		name string
 		a, b Datum
-		op   string
+		op   parser.OpCode
 		want Datum
 	}{
-		{"and-null-false", NullDatum, Datum{Kind: KindBool, Bool: false}, "AND", Datum{Kind: KindBool, Bool: false}},
-		{"or-null-true", NullDatum, Datum{Kind: KindBool, Bool: true}, "OR", Datum{Kind: KindBool, Bool: true}},
-		{"and-null-true", NullDatum, Datum{Kind: KindBool, Bool: true}, "AND", NullDatum},
+		{"and-null-false", NullDatum, NewBoolDatum(false), parser.OpAnd, NewBoolDatum(false)},
+		{"or-null-true", NullDatum, NewBoolDatum(true), parser.OpOr, NewBoolDatum(true)},
+		{"and-null-true", NullDatum, NewBoolDatum(true), parser.OpAnd, NullDatum},
 	}
 	for _, c := range cases {
 		got, err := evalBinary(c.op, c.a, c.b, 0)
@@ -342,7 +342,7 @@ func TestExecBooleanThreeValuedLogic(t *testing.T) {
 			t.Errorf("%s: %v", c.name, err)
 			continue
 		}
-		if got.Kind != c.want.Kind || got.Bool != c.want.Bool {
+		if got.Kind != c.want.Kind || got.BoolValue() != c.want.BoolValue() {
 			t.Errorf("%s: got=%+v want=%+v", c.name, got, c.want)
 		}
 	}
@@ -372,7 +372,7 @@ func TestExecCurrentTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows[0][0].Kind != KindTime || !rows[0][0].Time.Equal(ctx.Now) {
+	if rows[0][0].Kind != KindTime || !rows[0][0].TimeValue().Equal(ctx.Now) {
 		t.Errorf("got %+v", rows[0][0])
 	}
 }

@@ -1,5 +1,7 @@
 package planner
 
+import "github.com/goopg/goopg/internal/parser"
+
 // Single-table predicate routing into scan inputs (M0054-0006a-pre).
 //
 // The M0054-0002 EXPLAIN baseline showed several queries doing
@@ -78,6 +80,10 @@ func rewriteScanInputsWithSingleTablePredicates(n Node, cat catalog.Catalog) Nod
 			x.Tables[i] = rewriteScanInputsWithSingleTablePredicates(x.Tables[i], cat)
 		}
 		rewriteMHJInputsWithSingleTablePredicates(x, cat)
+		// M0071-0004: push remaining single-source non-indexable
+		// filters down onto matching Tables[i] so build-side
+		// cardinality drops before MHJ hash-builds.
+		pushSingleSourceFiltersIntoMHJTables(x)
 		return x
 	case *Aggregate:
 		x.Child = rewriteScanInputsWithSingleTablePredicates(x.Child, cat)
@@ -136,7 +142,7 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 	type classified struct {
 		conj    Expr
 		key     scanColumnKey
-		op      string
+		op      parser.OpCode
 		val     Expr
 		matched bool
 	}
@@ -159,16 +165,16 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 			groups[k] = b
 		}
 		switch op {
-		case "=":
+		case parser.OpEq:
 			if b.eqKey == nil {
 				b.eqKey = val
 				b.eqConjunct = c
 			}
-		case ">=", ">":
+		case parser.OpGe, parser.OpGt:
 			if b.loKey == nil {
 				b.loKey = val
 			}
-		case "<=", "<":
+		case parser.OpLe, parser.OpLt:
 			if b.hiKey == nil {
 				b.hiKey = val
 			}
@@ -260,15 +266,15 @@ func absorbConjunctsIntoSubtree(pred Expr, parent *Filter, cat catalog.Catalog) 
 // commuted to keep the column on the left.)
 //
 // Returns (col, canonical-op, key-const, ok).
-func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, string, Expr, bool) {
+func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, parser.OpCode, Expr, bool) {
 	bop, ok := f.(*BinaryOp)
 	if !ok {
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	switch bop.Op {
-	case "=", "<", "<=", ">", ">=":
+	case parser.OpEq, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 	default:
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 
 	var col *ColumnRef
@@ -282,15 +288,15 @@ func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, string, Expr, bool) 
 		key = bop.Left
 		colOnLeft = false
 	} else {
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	if _, isCol := key.(*ColumnRef); isCol {
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	switch key.(type) {
 	case *IntegerConst, *NumericConst, *StringConst, *TypedStringLit, *ParamRef:
 	default:
-		return nil, "", nil, false
+		return nil, parser.OpUnknown, nil, false
 	}
 	canonOp := bop.Op
 	if !colOnLeft {
@@ -301,16 +307,16 @@ func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, string, Expr, bool) 
 
 // flipRangeOpForRewrite flips the comparison so the column is
 // canonically on the left. Keeps `=` as is.
-func flipRangeOpForRewrite(op string) string {
+func flipRangeOpForRewrite(op parser.OpCode) parser.OpCode {
 	switch op {
-	case "<":
-		return ">"
-	case "<=":
-		return ">="
-	case ">":
-		return "<"
-	case ">=":
-		return "<="
+	case parser.OpLt:
+		return parser.OpGt
+	case parser.OpLe:
+		return parser.OpGe
+	case parser.OpGt:
+		return parser.OpLt
+	case parser.OpGe:
+		return parser.OpLe
 	}
 	return op
 }
@@ -443,7 +449,7 @@ func splitPlannerAnd(e Expr) []Expr {
 		return nil
 	}
 	bop, ok := e.(*BinaryOp)
-	if !ok || bop.Op != "AND" {
+	if !ok || bop.Op != parser.OpAnd {
 		return []Expr{e}
 	}
 	out := splitPlannerAnd(bop.Left)
@@ -458,7 +464,7 @@ func joinPlannerAnd(conjs []Expr) Expr {
 	}
 	out := conjs[0]
 	for _, c := range conjs[1:] {
-		out = &BinaryOp{Op: "AND", Left: out, Right: c}
+		out = &BinaryOp{Op: parser.OpAnd, Left: out, Right: c}
 	}
 	return out
 }
@@ -525,16 +531,16 @@ func rewriteMHJInputsWithSingleTablePredicates(mh *MultiHashJoin, cat catalog.Ca
 			groups[k] = b
 		}
 		switch op {
-		case "=":
+		case parser.OpEq:
 			if b.eqKey == nil {
 				b.eqKey = val
 				b.eqConjunct = f
 			}
-		case ">=", ">":
+		case parser.OpGe, parser.OpGt:
 			if b.loKey == nil {
 				b.loKey = val
 			}
-		case "<=", "<":
+		case parser.OpLe, parser.OpLt:
 			if b.hiKey == nil {
 				b.hiKey = val
 			}
@@ -594,4 +600,144 @@ func rewriteMHJInputsWithSingleTablePredicates(mh *MultiHashJoin, cat catalog.Ca
 		kept = append(kept, f)
 	}
 	mh.Filters = kept
+}
+
+// pushSingleSourceFiltersIntoMHJTables (M0071-0004) walks
+// mh.Filters and pushes any conjunct whose every ColumnRef
+// references a single Tables[i]'s column-range down onto a
+// Filter wrapping that Tables[i]. Unlike
+// rewriteMHJInputsWithSingleTablePredicates, this does NOT
+// require an index to exist — non-equality conjuncts (e.g.
+// `r_name = 'ASIA'` on Q5's region without an r_name index)
+// still benefit because the build-side Tables[i] gets fewer
+// rows before MHJ's hash-build / probe.
+//
+// Q3 regression guard: every conjunct that references columns
+// from multiple Tables[i] (or no Tables[i]) is left in
+// mh.Filters untouched. The push happens iff every ColumnRef
+// in the conjunct lands in [tableOffset[i], tableOffset[i+1]).
+//
+// The conjunct's ColumnRef indices are SHIFTED to be local to
+// Tables[i].Output() so the wrapped Filter evaluates against
+// Tables[i]'s row directly.
+func pushSingleSourceFiltersIntoMHJTables(mh *MultiHashJoin) {
+	if mh == nil || len(mh.Filters) == 0 || len(mh.Tables) == 0 {
+		return
+	}
+	// Compute cumulative offsets for each Tables[i].
+	offsets := make([]int, len(mh.Tables)+1)
+	for i, t := range mh.Tables {
+		offsets[i+1] = offsets[i] + len(t.Output())
+	}
+	// For each conjunct, find the unique Tables[i] whose
+	// [offsets[i], offsets[i+1]) range covers ALL ColumnRefs.
+	tableForConjunct := func(c Expr) int {
+		target := -1
+		ok := true
+		walkColumnRefs(c, func(idx int) {
+			if !ok {
+				return
+			}
+			t := -1
+			for i := 0; i < len(mh.Tables); i++ {
+				if idx >= offsets[i] && idx < offsets[i+1] {
+					t = i
+					break
+				}
+			}
+			if t < 0 {
+				ok = false
+				return
+			}
+			if target < 0 {
+				target = t
+			} else if target != t {
+				ok = false
+			}
+		}, func() { ok = false })
+		if !ok {
+			return -1
+		}
+		return target
+	}
+	// shiftColumnRefs adjusts every ColumnRef.Index in `e` by
+	// `delta` (typically -offsets[i] to localise indices to
+	// Tables[i]).
+	var shiftColumnRefs func(Expr, int)
+	shiftColumnRefs = func(e Expr, delta int) {
+		if e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case *ColumnRef:
+			x.Index += delta
+		case *BinaryOp:
+			shiftColumnRefs(x.Left, delta)
+			shiftColumnRefs(x.Right, delta)
+		case *UnaryOp:
+			shiftColumnRefs(x.Operand, delta)
+		case *FuncCall:
+			for _, a := range x.Args {
+				shiftColumnRefs(a, delta)
+			}
+		}
+	}
+	kept := make([]Expr, 0, len(mh.Filters))
+	for _, f := range mh.Filters {
+		idx := tableForConjunct(f)
+		if idx < 0 {
+			kept = append(kept, f)
+			continue
+		}
+		// Localise indices and wrap Tables[idx] in a Filter.
+		// Clone the expr first so the shift doesn't mutate any
+		// shared subtree (mh.Filters may share structure with
+		// the enclosing Filter's predicate).
+		local := cloneExprForShift(f)
+		shiftColumnRefs(local, -offsets[idx])
+		// Wrap Tables[idx]: if it's already a Filter, AND the
+		// conjunct into the existing predicate; otherwise wrap.
+		if existing, ok := mh.Tables[idx].(*Filter); ok {
+			existing.Predicate = combineAnd([]Expr{existing.Predicate, local})
+		} else {
+			mh.Tables[idx] = &Filter{
+				Child:     mh.Tables[idx],
+				Predicate: local,
+			}
+		}
+	}
+	mh.Filters = kept
+}
+
+// cloneExprForShift makes a structural copy of an expression
+// so index shifts on one branch don't propagate to other
+// references in the plan tree. Only the ColumnRef-/operator-
+// branches that pushSingleSourceFiltersIntoMHJTables walks
+// are actually mutated, so the clone only needs to copy
+// those.
+func cloneExprForShift(e Expr) Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		cl := *x
+		return &cl
+	case *BinaryOp:
+		return &BinaryOp{
+			Op:    x.Op,
+			Left:  cloneExprForShift(x.Left),
+			Right: cloneExprForShift(x.Right),
+		}
+	case *UnaryOp:
+		return &UnaryOp{Op: x.Op, Operand: cloneExprForShift(x.Operand)}
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = cloneExprForShift(a)
+		}
+		return &FuncCall{Name: x.Name, Args: args, Star: x.Star}
+	default:
+		return e
+	}
 }

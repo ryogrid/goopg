@@ -72,13 +72,14 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 
 	var buf []byte
 	for {
-		row, nextErr := src.Next()
+		slot, nextErr := src.Next()
 		if nextErr == EOF {
 			break
 		}
 		if nextErr != nil {
 			return count, binary, nextErr
 		}
+		row := slotRow(slot)
 		if projection != nil {
 			projected := make(Row, len(projection))
 			for i, idx := range projection {

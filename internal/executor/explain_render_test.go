@@ -37,7 +37,7 @@ func runExplainRows(t *testing.T, ctx *Context, sql string) []string {
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
 		if len(r) > 0 && r[0].Kind == KindString {
-			out = append(out, r[0].String)
+			out = append(out, r[0].StringValue())
 		}
 	}
 	return out

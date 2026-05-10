@@ -95,3 +95,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0058 | TPC-H SubPlan & join-unnesting performance fixes (non-correlated cache, EXISTS→semi-join, NUMERIC fast path, OR-of-ANDs join, TCP cancel) | planned | `0058-tpch-subplan-join-perf.md` |
 | 0059 | Executor BorrowRow optimization (Volcano row-lifetime copy reduction) | planned | `0059-executor-borrowrow-optimization.md` |
 | 0060 | PostgreSQL oracle test-port foundation (TAP/pg_regress/isolation/recovery/subscription/client-tools) | completed | `0060-postgres-oracle-test-port.md` |
+| 0068 | Executor GC-Optimized Pipeline Refactor (compact Datum, TupleSlot, batch arena, slot pool — replaces BorrowSemantics) | planned (`perf-analysis`) | `0068-executor-gc-pipeline-refactor.md` |

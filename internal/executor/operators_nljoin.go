@@ -51,31 +51,38 @@ type nestedLoopIndexJoinOp struct {
 	// resolves its key (so the outer-column slot is the only
 	// non-NULL value visible).
 	nullInner Row
-	// joinBuf is the per-Next() reusable concatenation buffer.
-	joinBuf Row
+
+	// M0071-0013 Stage D-1: VirtualSlot composition replaces the
+	// per-Next joinBuf concat. outerMS / innerMS are persistent
+	// MaterializedSlots whose .row field is overwritten in place
+	// per match; virtualOut sources [outerMS, innerMS] and serves
+	// as the operator's emit slot. Predicate evaluation reads via
+	// virtualOut.Get(col) — zero allocation per match.
+	outerMS    *MaterializedSlot
+	innerMS    *MaterializedSlot
+	virtualOut *VirtualSlot
+
+	// outerOnly is the operator's emit slot for Semi / Anti, which
+	// emit the outer row alone (their plan.Output() schema is the
+	// outer schema). Reused; .row points to currentOuter.
+	outerOnly *MaterializedSlot
+
+	// (M0072-0001 deleted the per-outer boundRow; the IndexScan
+	// now consumes o.outerMS directly via its slot-aware
+	// BindOuter / Rescan signature.)
 
 	// state: when an outer row is being processed, currentOuter
 	// holds it and innerExhausted tracks whether we've already
 	// drained the inner's matches for this outer row.
-	currentOuter   Row
-	innerExhausted bool
+	currentOuter    Row
+	innerExhausted  bool
 	leftJoinEmitted bool // for LEFT outer: did we emit the null-padded fallback?
-	openOnce       bool
-
-	// M0059-0003: borrow contract. When set to BorrowedRow, Next()
-	// returns o.joinBuf directly without the defensive cloneRow
-	// — the parent has promised to consume the row before pulling
-	// the next one. Default OwnedRow.
-	borrow BorrowSemantics
+	openOnce        bool
 }
 
 func newNestedLoopIndexJoinOp(p *planner.NestedLoopIndexJoin, outer Operator, inner *indexScanOp) *nestedLoopIndexJoinOp {
 	return &nestedLoopIndexJoinOp{plan: p, outer: outer, inner: inner}
 }
-
-// SetBorrow flips nestedLoopIndexJoinOp into borrow-on-output mode.
-// (M0059-0003.)
-func (o *nestedLoopIndexJoinOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
 
 func (o *nestedLoopIndexJoinOp) Schema() planner.Schema {
 	return o.plan.Output()
@@ -89,7 +96,21 @@ func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	o.outerWidth = len(o.outer.Schema())
 	o.innerWidth = len(o.inner.Schema())
 	o.nullInner = nullRow(o.innerWidth)
-	o.joinBuf = make(Row, o.outerWidth+o.innerWidth)
+
+	// Build virtualOut once. Sources are [outerMS, innerMS] and
+	// the column mapping is [(0,0)..(0,outerW-1), (1,0)..(1,innerW-1)].
+	o.outerMS = SlotFromRow(o.outer.Schema(), nil)
+	o.innerMS = SlotFromRow(o.inner.Schema(), nil)
+	cols := make([]virtualCol, 0, o.outerWidth+o.innerWidth)
+	for i := 0; i < o.outerWidth; i++ {
+		cols = append(cols, virtualCol{sourceIdx: 0, sourceCol: int16(i)})
+	}
+	for i := 0; i < o.innerWidth; i++ {
+		cols = append(cols, virtualCol{sourceIdx: 1, sourceCol: int16(i)})
+	}
+	o.virtualOut = NewVirtualSlot(o.Schema(), []TupleSlot{o.outerMS, o.innerMS}, cols)
+	o.outerOnly = SlotFromRow(o.Schema(), nil)
+
 	o.currentOuter = nil
 	o.innerExhausted = true
 	o.leftJoinEmitted = true
@@ -103,12 +124,12 @@ func (o *nestedLoopIndexJoinOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
+func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 	for {
 		// If we're still serving inner matches for the current
 		// outer row, emit them first.
 		if o.currentOuter != nil && !o.innerExhausted {
-			innerRow, err := o.inner.Next()
+			innerSlot, err := o.inner.Next()
 			if err == EOF {
 				o.innerExhausted = true
 				// LEFT-join fallback: when no inner row matched
@@ -116,14 +137,12 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 				// row exactly once before advancing.
 				if !o.leftJoinEmitted && o.plan.Type == planner.JoinTypeLeft {
 					o.leftJoinEmitted = true
-					o.fillJoinBuf(o.currentOuter, o.nullInner)
-					if ok, perr := o.evalPredicate(o.joinBuf); perr != nil {
+					o.outerMS.row = o.currentOuter
+					o.innerMS.row = o.nullInner
+					if ok, perr := o.evalPredicateSlot(); perr != nil {
 						return nil, perr
 					} else if ok {
-						if o.borrow == BorrowedRow {
-							return o.joinBuf, nil
-						}
-						return cloneRow(o.joinBuf), nil
+						return o.virtualOut, nil
 					}
 				}
 				// M0063-0004: Anti-join fallback. When no inner
@@ -134,21 +153,21 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 				// !o.leftJoinEmitted reuse on Anti below).
 				if o.plan.Type == planner.JoinTypeAnti && !o.leftJoinEmitted {
 					o.leftJoinEmitted = true
-					if o.borrow == BorrowedRow {
-						return o.currentOuter, nil
-					}
-					return cloneRow(o.currentOuter), nil
+					o.outerOnly.row = o.currentOuter
+					return o.outerOnly, nil
 				}
 				continue
 			}
 			if err != nil {
 				return nil, err
 			}
+			innerRow := slotRow(innerSlot)
 			// Mark that some inner row was produced (used by
 			// LEFT and Anti's "no-match" fallbacks).
 			o.leftJoinEmitted = true
-			o.fillJoinBuf(o.currentOuter, innerRow)
-			ok, perr := o.evalPredicate(o.joinBuf)
+			o.outerMS.row = o.currentOuter
+			o.innerMS.row = innerRow
+			ok, perr := o.evalPredicateSlot()
 			if perr != nil {
 				return nil, perr
 			}
@@ -167,10 +186,8 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 			// next outer.
 			if o.plan.Type == planner.JoinTypeSemi {
 				o.innerExhausted = true
-				if o.borrow == BorrowedRow {
-					return o.currentOuter, nil
-				}
-				return cloneRow(o.currentOuter), nil
+				o.outerOnly.row = o.currentOuter
+				return o.outerOnly, nil
 			}
 			// M0063-0004: Anti's qualifying inner match means
 			// the outer row will NOT be emitted. Fast-forward
@@ -179,29 +196,29 @@ func (o *nestedLoopIndexJoinOp) Next() (Row, error) {
 				o.innerExhausted = true
 				continue
 			}
-			if o.borrow == BorrowedRow {
-				return o.joinBuf, nil
-			}
-			return cloneRow(o.joinBuf), nil
+			return o.virtualOut, nil
 		}
 
 		// Pull the next outer row.
-		outerRow, err := o.outer.Next()
+		outerSlot, err := o.outer.Next()
 		if err == EOF {
 			return nil, EOF
 		}
 		if err != nil {
 			return nil, err
 		}
+		outerRow := slotRow(outerSlot)
 		o.currentOuter = outerRow
 
-		// Bind the outer row into the joinBuf shape so the inner's
-		// key expressions can resolve outer column references via
-		// `o.outerRow` in `lookupKey` / `lookupRangeBounds`.
-		o.fillJoinBuf(outerRow, o.nullInner)
-		o.inner.BindOuter(o.joinBuf)
+		// M0072-0001: bind the outer row into o.outerMS once and
+		// pass the persistent slot directly to the inner IndexScan.
+		// The inner reads outer columns via o.outerSlot.Get(col)
+		// (evalExprSlot at lookupKey / lookupRangeBounds), so no
+		// concatenated `boundRow` alloc is needed per outer.
+		o.outerMS.row = outerRow
+		o.inner.BindOuter(o.outerMS, o.outerWidth)
 
-		if err := o.inner.Rescan(o.joinBuf); err != nil {
+		if err := o.inner.Rescan(o.outerMS, o.outerWidth); err != nil {
 			return nil, err
 		}
 		o.innerExhausted = false
@@ -217,29 +234,19 @@ func (o *nestedLoopIndexJoinOp) Close() error {
 	return o.outer.Close()
 }
 
-// fillJoinBuf copies outer + inner into the per-Next reusable
-// joinBuf. Caller must clone before retaining beyond the next
-// Next call.
-func (o *nestedLoopIndexJoinOp) fillJoinBuf(outer, inner Row) {
-	if len(o.joinBuf) != o.outerWidth+o.innerWidth {
-		o.joinBuf = make(Row, o.outerWidth+o.innerWidth)
-	}
-	copy(o.joinBuf[:o.outerWidth], outer)
-	copy(o.joinBuf[o.outerWidth:], inner)
-}
-
-// evalPredicate evaluates plan.Predicate against the joined row,
-// or returns true when no residual predicate is present.
-func (o *nestedLoopIndexJoinOp) evalPredicate(row Row) (bool, error) {
+// evalPredicateSlot evaluates plan.Predicate against o.virtualOut
+// (which sources [outerMS, innerMS]). Both source slots' .row
+// fields must be set by the caller before invocation.
+func (o *nestedLoopIndexJoinOp) evalPredicateSlot() (bool, error) {
 	if o.plan.Predicate == nil {
 		return true, nil
 	}
-	v, err := evalExpr(o.plan.Predicate, row, o.ctx)
+	v, err := evalExprSlot(o.plan.Predicate, o.virtualOut, o.ctx)
 	if err != nil {
 		return false, err
 	}
 	if v.IsNull() {
 		return false, nil
 	}
-	return v.Bool, nil
+	return v.BoolValue(), nil
 }

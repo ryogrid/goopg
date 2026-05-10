@@ -24,9 +24,9 @@ func TestDDLCreateVarcharBTreeIndexAcceptsType(t *testing.T) {
 	rel := ctx.Catalog.RelFileNode(tbl)
 
 	rows := []Row{
-		{{Kind: KindInt, Int: 1}, {Kind: KindString, String: "FURNITURE"}},
-		{{Kind: KindInt, Int: 2}, {Kind: KindString, String: "HOUSEHOLD"}},
-		{{Kind: KindInt, Int: 3}, {Kind: KindString, String: "MACHINERY"}},
+		{{Kind: KindInt, Int: 1}, NewStringDatum("FURNITURE")},
+		{{Kind: KindInt, Int: 2}, NewStringDatum("HOUSEHOLD")},
+		{{Kind: KindInt, Int: 3}, NewStringDatum("MACHINERY")},
 	}
 	for _, r := range rows {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
@@ -70,7 +70,7 @@ func TestDDLVarcharUniqueIndexRejectsDuplicates(t *testing.T) {
 	for i := int64(1); i <= 2; i++ {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
 			{Kind: KindInt, Int: i},
-			{Kind: KindString, String: "PROMO BRUSHED STEEL"},
+			NewStringDatum("PROMO BRUSHED STEEL"),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -104,7 +104,7 @@ func TestDDLVarcharIndexSeqScanParity(t *testing.T) {
 	for i, seg := range data {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindString, String: seg},
+			NewStringDatum(seg),
 		}); err != nil {
 			t.Fatal(err)
 		}

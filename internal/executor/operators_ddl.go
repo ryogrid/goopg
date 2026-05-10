@@ -42,7 +42,7 @@ func (o *ddlOp) Open(ctx *Context) error {
 }
 func (o *ddlOp) Close() error { return nil }
 
-func (o *ddlOp) Next() (Row, error) {
+func (o *ddlOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -555,12 +555,14 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	var entries []btree.BulkEntry
 	var scanRow Row                                  // M0054-0005c: reusable decode buffer (see comment below).
 	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
-	// M0055-0006 Phase E: removed the `seen map[string]struct{}`
-	// for the unique-key check. The bulk build sorts entries by
-	// key before insertion, so a sorted-stream adjacency walk
-	// after the sort detects duplicates without table-scale
-	// hash state. The check is performed after `sort.SliceStable`
-	// in `btree.BulkBuild`-equivalent path; here, post-collection.
+	// M0074-0004: per-page arena for projected varchar / char /
+	// numeric payloads. Reset on page advance; Drop on return.
+	// Datum lifetime ends at encodeBTreeKeyForColumn — the
+	// encoded BulkEntry.Key is an explicit append-copy
+	// (entries[].Key, line below), so retention beyond Reset
+	// is not a concern.
+	arena := NewArena(0)
+	defer arena.Drop()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -600,7 +602,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			// Other columns must still be size-scanned to advance
 			// the offset (variable-length codec) but their string/
 			// numeric payloads are not materialised.
-			if err := DecodeRowProjection(scanRow, tbl.Columns, tuple.Data, keep); err != nil {
+			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, arena); err != nil {
 				continue
 			}
 			row := scanRow
@@ -611,6 +613,11 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			}
 			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
 		}
+		// M0074-0004: page boundary — reset arena. All Datums
+		// from this page were consumed by encodeBTreeKeyForColumn
+		// and the resulting BulkEntry.Key is an explicit append-
+		// copy, so no Datum reference outlives this point.
+		arena.Reset()
 		o.ctx.Pool.Unpin(slot)
 	}
 	// M0055-0006 Phase E: sorted-stream uniqueness check. The
@@ -679,6 +686,12 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 	seen := map[string]struct{}{}
 	var scanRow Row                                  // M0054-0005c: reusable decode buffer.
 	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
+	// M0074-0004: per-page arena. Datums consumed by
+	// encodeBTreeKeyForColumn; resulting key is copied (line below
+	// `seen[string(key)]` allocates a Go string from the bytes,
+	// and `tree.Insert` copies into btree pages).
+	arena := NewArena(0)
+	defer arena.Drop()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -710,7 +723,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			if err := DecodeRowProjection(scanRow, tbl.Columns, tuple.Data, keep); err != nil {
+			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, arena); err != nil {
 				continue
 			}
 			row := scanRow
@@ -731,6 +744,8 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 			}
 		}
+		// M0074-0004: page boundary — reset arena.
+		arena.Reset()
 		o.ctx.Pool.Unpin(slot)
 	}
 	return nil
@@ -790,26 +805,26 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 	case isNumericType(col.Type.Name):
 		switch v.Kind {
 		case KindNumeric:
-			return btree.EncodeNumericKey(numericMant(v), v.NumericScale), nil
+			return btree.EncodeNumericKey(numericMant(v), v.Scale), nil
 		case KindInt:
 			return btree.EncodeNumericKey(big.NewInt(v.Int), 0), nil
 		}
 		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
 	case isVarcharType(col.Type.Name):
-		if v.Kind != KindString {
+		if v.Kind != KindString && v.Kind != KindStringArena {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeVarchar([]byte(v.String)), nil
+		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isCharType(col.Type.Name):
-		if v.Kind != KindString {
+		if v.Kind != KindString && v.Kind != KindStringArena {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
-		return btree.EncodeChar([]byte(v.String)), nil
+		return btree.EncodeChar([]byte(v.StringValue())), nil
 	case isTimestampType(col.Type.Name):
 		if v.Kind != KindTime {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
 		}
-		micros := v.Time.Sub(pgEpoch).Microseconds()
+		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
 		return btree.EncodeTimestamp(micros), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
@@ -1200,13 +1215,13 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	}
 	classRow := Row{
 		{Kind: KindInt, Int: int64(tbl.OID)},
-		{Kind: KindString, String: tbl.Name},
+		NewStringDatum(tbl.Name),
 		{Kind: KindInt, Int: int64(namespaceOIDForSchema(tbl.Schema))},
-		{Kind: KindString, String: "r"},
+		NewStringDatum("r"),
 		{Kind: KindInt, Int: int64(len(tbl.Columns))},
 		{Kind: KindInt, Int: int64(tbl.OID)},
-		{Kind: KindString, String: "p"},
-		{Kind: KindBool, Bool: false},
+		NewStringDatum("p"),
+		NewBoolDatum(false),
 	}
 	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
 		return fmt.Errorf("pg_class: %w", err)
@@ -1221,11 +1236,11 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		typOID := catalog.TypeNameToOID(col.Type.Name)
 		attrRow := Row{
 			{Kind: KindInt, Int: int64(tbl.OID)},
-			{Kind: KindString, String: col.Name},
+			NewStringDatum(col.Name),
 			{Kind: KindInt, Int: int64(typOID)},
 			{Kind: KindInt, Int: int64(col.Ordinal + 1)},
-			{Kind: KindBool, Bool: col.NotNull},
-			{Kind: KindBool, Bool: false},
+			NewBoolDatum(col.NotNull),
+			NewBoolDatum(false),
 		}
 		if err := writeHeapRow(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
@@ -1244,13 +1259,13 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	}
 	classRow := Row{
 		{Kind: KindInt, Int: int64(idx.OID)},
-		{Kind: KindString, String: idx.Name},
+		NewStringDatum(idx.Name),
 		{Kind: KindInt, Int: int64(namespaceOIDForSchema(idx.Schema))},
-		{Kind: KindString, String: "i"},
+		NewStringDatum("i"),
 		{Kind: KindInt, Int: 0},
 		{Kind: KindInt, Int: int64(idx.OID)},
-		{Kind: KindString, String: "p"},
-		{Kind: KindBool, Bool: false},
+		NewStringDatum("p"),
+		NewBoolDatum(false),
 	}
 	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)

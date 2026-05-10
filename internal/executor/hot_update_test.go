@@ -168,7 +168,7 @@ func TestHOTUpdateIndexScanFindsNewVersion(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
-	if rows[0][1].Kind != KindString || rows[0][1].String != "Bob" {
+	if rows[0][1].Kind != KindString || rows[0][1].StringValue() != "Bob" {
 		t.Errorf("expected name='Bob', got %+v", rows[0][1])
 	}
 }
@@ -250,7 +250,7 @@ func TestHOTUpdateChainDepthTwo(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected 1 row, got %d", len(rows))
 	}
-	if rows[0][0].Kind != KindString || rows[0][0].String != "v3" {
+	if rows[0][0].Kind != KindString || rows[0][0].StringValue() != "v3" {
 		t.Errorf("expected v='v3', got %+v", rows[0][0])
 	}
 }

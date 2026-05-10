@@ -40,7 +40,7 @@ func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
 		// TOAST pointer: flag byte 0x02 followed by 12-byte pointer.
 		if d.Kind == KindToastPointer {
 			out = append(out, 2)
-			out = append(out, d.Bytes...)
+			out = append(out, d.BytesValue()...)
 			continue
 		}
 		out = append(out, 0)
@@ -79,7 +79,38 @@ func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 // Caller invariants:
 //   - `len(dst) >= len(cols)`
 //   - `len(keep) >= len(cols)`
+//
+// arena == nil falls back to the legacy `make([]byte)` path —
+// behaviour byte-for-byte identical regardless of caller.
 func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []bool) error {
+	return decodeRowProjectionArena(dst, cols, data, keep, nil)
+}
+
+// DecodeRowProjectionIntoArena is the arena-aware sibling of
+// DecodeRowProjection. When arena != nil, projected variable-length
+// columns (varchar / char / text / bytea, numeric text storage)
+// emit Datums whose payload lives in the arena's pages — single
+// allocation per page amortises across thousands of strings.
+// Skipped columns produce no Datum allocation in either mode.
+//
+// Used by index-build paths (operators_ddl.go: collectBTreeEntries
+// and backfillBTree) where the decoded Datum's lifetime ends at
+// encodeBTreeKeyForColumn — the encoded key is a fresh []byte copy.
+//
+// Caller invariants (same as DecodeRowProjection plus):
+//   - arena.Reset() bound to the producer's batch boundary
+//     (per-page in DDL paths).
+//   - Datums must not be retained past the next Reset.
+//
+// arena == nil falls back to the legacy `make([]byte)` path —
+// behaviour byte-for-byte identical to DecodeRowProjection.
+//
+// M0074-0004 — see docs/design/0074-0004-decode-row-projection-arena.md.
+func DecodeRowProjectionIntoArena(dst Row, cols []catalog.Column, data []byte, keep []bool, arena *Arena) error {
+	return decodeRowProjectionArena(dst, cols, data, keep, arena)
+}
+
+func decodeRowProjectionArena(dst Row, cols []catalog.Column, data []byte, keep []bool, arena *Arena) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
@@ -98,7 +129,11 @@ func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []boo
 				return fmt.Errorf("DecodeRowProjection: %s: truncated TOAST pointer", c.Name)
 			}
 			if keep[i] {
-				dst[i] = Datum{Kind: KindToastPointer, Bytes: append([]byte(nil), data[off:off+toastPtrSize]...)}
+				// TOAST pointer: always Buf-backed regardless
+				// of arena (mirrors DecodeRowIntoArena's flag==2
+				// path). Detoast may run later and needs the
+				// pointer to outlive arena Reset.
+				dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
 			} else {
 				dst[i] = NullDatum
 			}
@@ -106,7 +141,16 @@ func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []boo
 			continue
 		}
 		if keep[i] {
-			v, n, err := decodeValue(c.Type, data[off:])
+			var (
+				v   Datum
+				n   int
+				err error
+			)
+			if arena != nil {
+				v, n, err = decodeValueArena(c.Type, data[off:], arena)
+			} else {
+				v, n, err = decodeValue(c.Type, data[off:])
+			}
 			if err != nil {
 				return fmt.Errorf("DecodeRowProjection: %s: %w", c.Name, err)
 			}
@@ -169,7 +213,42 @@ func decodeValueSize(t catalog.Type, data []byte) (int, error) {
 // DecodeRowInto fills an existing Row slice from encoded tuple data.
 // Avoids the allocation that DecodeRow would make. The caller must
 // ensure len(dst) == len(cols). M0027-0001.
+//
+// When the producer wants varchar / char / text / bytea payload to
+// land in a per-batch arena instead of in fresh per-column
+// `make([]byte)` allocations, use DecodeRowIntoArena (M0073-0002).
+// The arena variant emits KindStringArena / KindBytesArena Datums
+// whose payload lives in the arena's pages until Reset().
 func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
+	return decodeRowIntoArena(dst, cols, data, nil)
+}
+
+// DecodeRowIntoArena is the arena-aware sibling of DecodeRowInto.
+// When arena != nil, variable-length columns (varchar, char, text,
+// bytea, numeric text storage) emit Datums whose Buf payload lives
+// in the arena's pages — a single allocation per page (typically
+// 64 KiB) amortises across thousands of strings, eliminating the
+// per-column heap alloc that dominated Q5 / Q9 post-M0072
+// (`acquireRow` 25 % cum heap on Q5).
+//
+// Caller invariants:
+//   - arena.Reset() bound to the producer's batch boundary
+//     (per-page in seqScanOp; per-Rescan in indexScanOp).
+//   - Consumers retaining slots past the next Reset MUST go
+//     through slot.Materialize(), which calls cloneRowOwned to
+//     deep-copy arena bytes into owned []byte. The 4 retention
+//     sites (executor.Run, sortOp.Open, windowOp.Open,
+//     lockRowsOp.drainAndStamp) already do this.
+//
+// arena == nil falls back to the legacy `make([]byte)` path —
+// behaviour byte-for-byte identical to DecodeRowInto.
+//
+// M0073-0002 — see docs/design/0073-0002-decode-arena-binding.md.
+func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+	return decodeRowIntoArena(dst, cols, data, arena)
+}
+
+func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
@@ -183,16 +262,28 @@ func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
 			continue
 		}
 		// TOAST pointer: 12 bytes following the 0x02 flag byte.
+		// Always Buf-backed regardless of arena binding —
+		// detoasted bytes (when DetoastRow runs later) need to
+		// outlive the arena's Reset cycle.
 		if flag == 2 {
 			const toastPtrSize = 12
 			if off+toastPtrSize > len(data) {
 				return fmt.Errorf("DecodeRow: %s: truncated TOAST pointer", c.Name)
 			}
-			dst[i] = Datum{Kind: KindToastPointer, Bytes: append([]byte(nil), data[off:off+toastPtrSize]...)}
+			dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
 			off += toastPtrSize
 			continue
 		}
-		v, n, err := decodeValue(c.Type, data[off:])
+		var (
+			v   Datum
+			n   int
+			err error
+		)
+		if arena != nil {
+			v, n, err = decodeValueArena(c.Type, data[off:], arena)
+		} else {
+			v, n, err = decodeValue(c.Type, data[off:])
+		}
 		if err != nil {
 			return fmt.Errorf("DecodeRow: %s: %w", c.Name, err)
 		}
@@ -222,7 +313,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		if d.Kind != KindBool {
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
 		}
-		if d.Bool {
+		if d.BoolValue() {
 			return []byte{1}, nil
 		}
 		return []byte{0}, nil
@@ -239,7 +330,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
 		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(d.Time.UnixNano()))
+		binary.BigEndian.PutUint64(buf[:], uint64(d.TimeValue().UnixNano()))
 		return buf[:], nil
 	case "numeric", "decimal":
 		// NUMERIC values flow on the wire as decimal text in the
@@ -255,10 +346,10 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			return encodeVarlen([]byte(numericText(d))), nil
 		case KindInt:
 			return encodeVarlen([]byte(strconv.FormatInt(d.Int, 10))), nil
-		case KindString:
-			return encodeVarlen([]byte(d.String)), nil
-		case KindBytes:
-			return encodeVarlen(d.Bytes), nil
+		case KindString, KindStringArena:
+			return encodeVarlen([]byte(d.StringValue())), nil
+		case KindBytes, KindBytesArena:
+			return encodeVarlen(d.BytesValue()), nil
 		}
 		return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 	default:
@@ -268,10 +359,10 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		// representation (mirrors the dedicated numeric arm above).
 		var s string
 		switch d.Kind {
-		case KindString:
-			s = d.String
-		case KindBytes:
-			return encodeVarlen(d.Bytes), nil
+		case KindString, KindStringArena:
+			s = d.StringValue()
+		case KindBytes, KindBytesArena:
+			return encodeVarlen(d.BytesValue()), nil
 		case KindInt:
 			return nil, fmt.Errorf("integer datum cannot encode as %s", t.Name)
 		case KindNumeric:
@@ -308,13 +399,13 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		if len(data) < 1 {
 			return Datum{}, 0, fmt.Errorf("truncated bool")
 		}
-		return Datum{Kind: KindBool, Bool: data[0] != 0}, 1, nil
+		return NewBoolDatum(data[0] != 0), 1, nil
 	case "timestamp", "timestamptz", "date":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
 		}
 		ns := int64(binary.BigEndian.Uint64(data[:8]))
-		return Datum{Kind: KindTime, Time: time.Unix(0, ns).UTC()}, 8, nil
+		return NewTimeDatum(time.Unix(0, ns).UTC()), 8, nil
 	case "numeric", "decimal":
 		// Stored as varlen text. Parse into KindNumeric so
 		// arithmetic and comparison can run through the
@@ -334,7 +425,7 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		// NUMERIC; the fast path avoids ~400 ns of big.Int allocation
 		// per column on every row decoded.
 		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, NumericMantissa: v, NumericScale: scale}, 4 + n, nil
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
 		}
 		m, s, err := parseNumeric(text)
 		if err != nil {
@@ -349,6 +440,78 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		if 4+n > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated varlen body")
 		}
-		return Datum{Kind: KindString, String: string(data[4 : 4+n])}, 4 + n, nil
+		return NewStringDatum(string(data[4 : 4+n])), 4 + n, nil
+	}
+}
+
+// decodeValueArena mirrors decodeValue but routes variable-length
+// payload (varchar / char / text / bytea — the `default` switch
+// arm in decodeValue) through arena.Allocate instead of
+// `make([]byte)`. Numeric text remains on the legacy parse path
+// (Datum.Int / Big / Scale), as does every fixed-width type.
+//
+// M0073-0002. The split between decodeValue and decodeValueArena
+// keeps the legacy callers (DecodeRow, DecodeRowProjection, toast
+// resolution, ANALYZE) byte-for-byte unchanged — only the
+// per-page seqScan / per-Rescan indexScan path opts in.
+func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, error) {
+	switch t.Name {
+	case "int4", "integer", "int":
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated int4")
+		}
+		v := int32(binary.BigEndian.Uint32(data[:4]))
+		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
+	case "int8", "bigint":
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated int8")
+		}
+		v := int64(binary.BigEndian.Uint64(data[:8]))
+		return Datum{Kind: KindInt, Int: v}, 8, nil
+	case "bool", "boolean":
+		if len(data) < 1 {
+			return Datum{}, 0, fmt.Errorf("truncated bool")
+		}
+		return NewBoolDatum(data[0] != 0), 1, nil
+	case "timestamp", "timestamptz", "date":
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
+		}
+		ns := int64(binary.BigEndian.Uint64(data[:8]))
+		return NewTimeDatum(time.Unix(0, ns).UTC()), 8, nil
+	case "numeric", "decimal":
+		// Numeric stays on the parse path — Datum.Int / Big /
+		// Scale carry the value, no Buf payload to arena.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated numeric")
+		}
+		n := int(binary.BigEndian.Uint32(data[:4]))
+		if 4+n > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated numeric body")
+		}
+		text := string(data[4 : 4+n])
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
+		}
+		m, s, err := parseNumeric(text)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
+		}
+		return newNumeric(m, int(s)), 4 + n, nil
+	default:
+		// varchar / char / text / bytea: arena-backed.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated varlen header")
+		}
+		n := int(binary.BigEndian.Uint32(data[:4]))
+		if 4+n > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated varlen body")
+		}
+		if n == 0 {
+			return Datum{Kind: KindStringArena, arena: arena}, 4, nil
+		}
+		buf, offset := arena.Allocate(n)
+		copy(buf, data[4:4+n])
+		return newStringArenaDatum(arena, offset, n), 4 + n, nil
 	}
 }

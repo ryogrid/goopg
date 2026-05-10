@@ -25,9 +25,9 @@ func TestDDLCreateCharBTreeIndexAcceptsType(t *testing.T) {
 	// Insert rows with both trimmed and padded forms of the same
 	// logical value. Both should be found by the same index key.
 	rows := []Row{
-		{{Kind: KindInt, Int: 1}, {Kind: KindString, String: "FURNITURE "}}, // padded
-		{{Kind: KindInt, Int: 2}, {Kind: KindString, String: "BUILDING"}},   // unpadded
-		{{Kind: KindInt, Int: 3}, {Kind: KindString, String: "MACHINERY "}}, // padded
+		{{Kind: KindInt, Int: 1}, NewStringDatum("FURNITURE ")}, // padded
+		{{Kind: KindInt, Int: 2}, NewStringDatum("BUILDING")},   // unpadded
+		{{Kind: KindInt, Int: 3}, NewStringDatum("MACHINERY ")}, // padded
 	}
 	for _, r := range rows {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
@@ -79,7 +79,7 @@ func TestDDLCharUniqueIndexRejectsPaddedDuplicate(t *testing.T) {
 	for i := int64(1); i <= 2; i++ {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
 			{Kind: KindInt, Int: i},
-			{Kind: KindString, String: "N"},
+			NewStringDatum("N"),
 		}); err != nil {
 			t.Fatal(err)
 		}

@@ -107,8 +107,8 @@ func TestUDFIfStmt(t *testing.T) {
 			t.Errorf("input %d: evalExpr: %v", tc.input, err)
 			continue
 		}
-		if res.Kind != KindString || res.String != tc.want {
-			t.Errorf("input %d: res = %v, want %q", tc.input, res.String, tc.want)
+		if res.Kind != KindString || res.StringValue() != tc.want {
+			t.Errorf("input %d: res = %v, want %q", tc.input, res.StringValue(), tc.want)
 		}
 	}
 }

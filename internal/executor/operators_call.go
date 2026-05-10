@@ -111,7 +111,7 @@ func (o *callOp) Open(ctx *Context) error {
 
 func (o *callOp) Close() error { return nil }
 
-func (o *callOp) Next() (Row, error) {
+func (o *callOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -231,5 +231,5 @@ func (o *callOp) Next() (Row, error) {
 			}
 		}
 	}
-	return outRow, nil
+	return asSlot(o.Schema(), outRow), nil
 }

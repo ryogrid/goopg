@@ -32,7 +32,7 @@ func (o *vacuumOp) Close() error { return nil }
 
 // Next runs the VACUUM as a one-shot side effect. Errors are suppressed:
 // a VACUUM failure should not abort the client session.
-func (o *vacuumOp) Next() (Row, error) {
+func (o *vacuumOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}

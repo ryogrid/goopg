@@ -171,32 +171,32 @@ func encodeDatum(d Datum, buf []byte) []byte {
 	case KindNull:
 		// nothing else
 	case KindBool:
-		if d.Bool {
+		if d.BoolValue() {
 			buf = append(buf, 1)
 		} else {
 			buf = append(buf, 0)
 		}
 	case KindInt:
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.Int))
-	case KindString:
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.String)))
-		buf = append(buf, d.String...)
-	case KindBytes:
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.Bytes)))
-		buf = append(buf, d.Bytes...)
+	case KindString, KindStringArena:
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.StringValue())))
+		buf = append(buf, d.StringValue()...)
+	case KindBytes, KindBytesArena:
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.BytesValue())))
+		buf = append(buf, d.BytesValue()...)
 	case KindTime:
-		n := d.Time.UTC().UnixNano()
+		n := d.TimeValue().UTC().UnixNano()
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(n))
 	case KindInterval:
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonths))
-		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDays))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalMonthsValue()))
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(d.IntervalDaysValue()))
 	case KindNumeric:
 		// 2-byte int16 scale + length-prefixed signed-magnitude
 		// big.Int bytes (1 sign byte + magnitude). Per-query
 		// spill files have no on-disk back-compat constraint,
 		// so the wider layout is safe; fits-int64 values still
 		// pack into 2 + 4 + 1 + ≤8 bytes ≈ 15 bytes.
-		buf = binary.LittleEndian.AppendUint16(buf, uint16(d.NumericScale))
+		buf = binary.LittleEndian.AppendUint16(buf, uint16(d.Scale))
 		mant := numericMant(d)
 		signByte := byte(0)
 		if mant.Sign() < 0 {
@@ -224,13 +224,13 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		if pos >= len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated bool at %d", pos)
 		}
-		return Datum{Kind: KindBool, Bool: data[pos] != 0}, pos + 1, nil
+		return NewBoolDatum(data[pos] != 0), pos + 1, nil
 	case KindInt:
 		if pos+8 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated int at %d", pos)
 		}
 		return Datum{Kind: KindInt, Int: int64(binary.LittleEndian.Uint64(data[pos:]))}, pos + 8, nil
-	case KindString:
+	case KindString, KindStringArena:
 		if pos+4 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated string len at %d", pos)
 		}
@@ -240,8 +240,8 @@ func decodeDatum(data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated string body at %d (want %d)", pos, slen)
 		}
 		s := string(data[pos : pos+int(slen)])
-		return Datum{Kind: KindString, String: s}, pos + int(slen), nil
-	case KindBytes:
+		return NewStringDatum(s), pos + int(slen), nil
+	case KindBytes, KindBytesArena:
 		if pos+4 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated bytes len at %d", pos)
 		}
@@ -252,20 +252,20 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		}
 		b := make([]byte, blen)
 		copy(b, data[pos:pos+int(blen)])
-		return Datum{Kind: KindBytes, Bytes: b}, pos + int(blen), nil
+		return NewBytesDatum(b), pos + int(blen), nil
 	case KindTime:
 		if pos+8 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated time at %d", pos)
 		}
 		n := int64(binary.LittleEndian.Uint64(data[pos:]))
-		return Datum{Kind: KindTime, Time: time.Unix(0, n).UTC()}, pos + 8, nil
+		return NewTimeDatum(time.Unix(0, n).UTC()), pos + 8, nil
 	case KindInterval:
 		if pos+8 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated interval at %d", pos)
 		}
 		months := int32(binary.LittleEndian.Uint32(data[pos:]))
 		days := int32(binary.LittleEndian.Uint32(data[pos+4:]))
-		return Datum{Kind: KindInterval, IntervalMonths: months, IntervalDays: days}, pos + 8, nil
+		return NewIntervalDatum(months, days), pos + 8, nil
 	case KindNumeric:
 		if pos+6 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated numeric at %d", pos)
@@ -295,10 +295,10 @@ func estimatedRowBytes(row Row) int64 {
 	n := int64(len(row) * 48) // Datum struct fixed overhead
 	for _, d := range row {
 		switch d.Kind {
-		case KindString:
-			n += int64(len(d.String))
-		case KindBytes:
-			n += int64(len(d.Bytes))
+		case KindString, KindStringArena:
+			n += int64(len(d.StringValue()))
+		case KindBytes, KindBytesArena:
+			n += int64(len(d.BytesValue()))
 		}
 	}
 	return n
@@ -320,7 +320,7 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 	tmpDir := os.TempDir()
 
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			break
 		}
@@ -330,6 +330,7 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 			}
 			return nil, err
 		}
+		row := slotRow(slot)
 		totalBytes += estimatedRowBytes(row)
 		if totalBytes > maxBytes && !spilled {
 			// Flush accumulated rows to spill file.
@@ -354,8 +355,18 @@ func drainRowsBounded(op Operator, maxBytes int64) (Operator, error) {
 			}
 			continue
 		}
-		dup := make(Row, len(row))
-		copy(dup, row)
+		// M0073-0004 retention boundary: arena-backed Datums must
+		// be promoted to owned []byte before we accumulate, since
+		// the producer's next Next may trigger arena.Reset and
+		// invalidate the previous page's bytes. The non-arena
+		// fast path preserves the legacy O(width) struct copy.
+		var dup Row
+		if rowHasArena(row) {
+			dup = cloneRowOwned(row)
+		} else {
+			dup = make(Row, len(row))
+			copy(dup, row)
+		}
 		rows = append(rows, dup)
 	}
 
@@ -384,46 +395,38 @@ func drainRowsToOp(op Operator) (Operator, error) {
 
 // rowsOp implements Operator over a pre-drained []Row.
 type rowsOp struct {
-	rows []Row
-	idx  int
+	rows   []Row
+	idx    int
+	schema planner.Schema
 }
 
-func (o *rowsOp) Open(*Context) error { o.idx = 0; return nil }
-func (o *rowsOp) Schema() planner.Schema { return nil } // schema comes from joinOp
-func (o *rowsOp) Next() (Row, error) {
+func (o *rowsOp) Open(*Context) error    { o.idx = 0; return nil }
+func (o *rowsOp) Schema() planner.Schema { return o.schema } // schema comes from joinOp/upstream
+func (o *rowsOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return asSlot(o.schema, r), nil
 }
 func (o *rowsOp) Close() error {
 	o.rows = nil
 	return nil
 }
 
-// spillOp implements Operator over a spillReader.
+// spillOp implements Operator over a spillReader. M0071-0015 Stage E:
+// always cloneRow; consumers materialize via the slot pipeline.
 type spillOp struct {
 	r   *spillReader
 	ctx *Context
-	// M0054-0005b-followup: reusable output Row buffer. When
-	// `borrow == BorrowedRow`, Next returns `out` directly;
-	// otherwise it clones before returning (default OwnedRow).
-	borrow BorrowSemantics
-	out    Row
+	out Row
 }
 
 func (o *spillOp) Open(*Context) error    { return nil }
 func (o *spillOp) Schema() planner.Schema { return nil }
 
-// SetBorrow flips spillOp into borrow-on-output mode. The caller
-// (a sort merge or hash-join probe loop) must consume each row
-// before pulling the next when set to BorrowedRow.
-// (M0054-0005b-followup.)
-func (o *spillOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
-
-func (o *spillOp) Next() (Row, error) {
+func (o *spillOp) Next() (TupleSlot, error) {
 	row, err := o.r.ReadRowInto(o.out)
 	if err == io.EOF {
 		return nil, EOF
@@ -432,10 +435,7 @@ func (o *spillOp) Next() (Row, error) {
 		return nil, err
 	}
 	o.out = row // re-cap for the next call
-	if o.borrow == BorrowedRow {
-		return row, nil
-	}
-	return cloneRow(row), nil
+	return asSlot(nil, cloneRow(row)), nil
 }
 func (o *spillOp) Close() error {
 	o.r.Close()

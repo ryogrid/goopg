@@ -24,14 +24,14 @@ type joinOp struct {
 	idx  int
 
 	// M0036 lazy-output state (hash join only)
-	lazyHash    map[string][]Row // build-side hash table
-	lazyProbe   Operator         // probe side (streaming)
-	lazyRow     Row              // current probe row
-	lazyMatches []Row            // matches for current probe row (borrowed from lazyHash)
+	lazyHash     map[string][]Row // build-side hash table
+	lazyProbe    Operator         // probe side (streaming)
+	lazyRow      Row              // current probe row
+	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
-	lazyActive  bool // true between probeRow and last match
-	lazyLW      int  // left schema width
-	lazyRW      int  // right schema width
+	lazyActive   bool // true between probeRow and last match
+	lazyLW       int  // left schema width
+	lazyRW       int  // right schema width
 
 	// M0054-0005b: per-Open() reusable buffers for nullRow / hash
 	// key evaluation. The pre-fix path called `nullRow(width)` and
@@ -41,6 +41,21 @@ type joinOp struct {
 	lazyNullLeft  Row
 	lazyNullRight Row
 	lazyKeyRow    Row
+
+	// M0071-0014 Stage D-2: VirtualSlot composition replaces the
+	// nextLazy concatRows allocations. lazyBuildSlot's .row holds
+	// the matched build row (for INNER / LEFT-no-match-fallback);
+	// lazyProbeSlot's .row holds the current probe row;
+	// lazyVirtualOut composes them in plan.Output() order
+	// (BuildLeft swaps the source order). lazyOuterOnlySlot is the
+	// emit slot for Semi / Anti, which return the probe row alone.
+	// Allocated lazily on first nextLazy invocation (Open path is
+	// shared with non-hash joinOp algorithms which don't need the
+	// virtual composition).
+	lazyBuildSlot     *MaterializedSlot
+	lazyProbeSlot     *MaterializedSlot
+	lazyVirtualOut    *VirtualSlot
+	lazyOuterOnlySlot *MaterializedSlot
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -217,9 +232,10 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 				}
 			}
 			buildCount++
-			l, err := buildOp.Next()
+			lSlot, err := buildOp.Next()
 			if err == EOF { break }
 			if err != nil { return err }
+			l := slotRow(lSlot)
 			if leftWidth == 0 && len(l) > 0 {
 				leftWidth = len(l); o.lazyLW = leftWidth
 			}
@@ -258,9 +274,10 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 			}
 		}
 		buildCount++
-		r, err := buildOp.Next()
+		rSlot, err := buildOp.Next()
 		if err == EOF { break }
 		if err != nil { return err }
+		r := slotRow(rSlot)
 		if rightWidth == 0 && len(r) > 0 {
 			rightWidth = len(r); o.lazyRW = rightWidth
 		}
@@ -459,10 +476,65 @@ func (o *joinOp) joinPredicateMatch(row Row) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !v.IsNull() && v.Kind == KindBool && v.Bool, nil
+	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
 }
 
-func (o *joinOp) Next() (Row, error) {
+// joinPredicateMatchSlot evaluates plan.Predicate against a slot
+// (typically o.lazyVirtualOut). Caller must update the source-slot
+// .row fields before invocation.
+func (o *joinOp) joinPredicateMatchSlot(slot SlotView) (bool, error) {
+	if o.plan.Predicate == nil {
+		return true, nil
+	}
+	v, err := evalExprSlot(o.plan.Predicate, slot, o.ctx)
+	if err != nil {
+		return false, err
+	}
+	return !v.IsNull() && v.Kind == KindBool && v.BoolValue(), nil
+}
+
+// ensureLazyVirtual lazily builds the persistent VirtualSlot used
+// by nextLazy to emit joined rows without per-match concat. Source
+// order depends on BuildLeft so plan.Output()'s left++right column
+// layout is preserved.
+func (o *joinOp) ensureLazyVirtual() {
+	if o.lazyVirtualOut != nil {
+		return
+	}
+	leftSchema := o.left.Schema()
+	rightSchema := o.right.Schema()
+	o.lazyBuildSlot = SlotFromRow(nil, nil)
+	o.lazyProbeSlot = SlotFromRow(nil, nil)
+	o.lazyOuterOnlySlot = SlotFromRow(o.schema, nil)
+	cols := make([]virtualCol, 0, o.lazyLW+o.lazyRW)
+	if o.plan.BuildLeft {
+		// Output is left ++ right; build side is left → sources
+		// [build, probe], cols (0,*) ++ (1,*).
+		_ = leftSchema
+		_ = rightSchema
+		for i := 0; i < o.lazyLW; i++ {
+			cols = append(cols, virtualCol{sourceIdx: 0, sourceCol: int16(i)})
+		}
+		for i := 0; i < o.lazyRW; i++ {
+			cols = append(cols, virtualCol{sourceIdx: 1, sourceCol: int16(i)})
+		}
+		o.lazyVirtualOut = NewVirtualSlot(o.schema,
+			[]TupleSlot{o.lazyBuildSlot, o.lazyProbeSlot}, cols)
+		return
+	}
+	// !BuildLeft: probe is left, build is right → sources
+	// [probe, build].
+	for i := 0; i < o.lazyLW; i++ {
+		cols = append(cols, virtualCol{sourceIdx: 0, sourceCol: int16(i)})
+	}
+	for i := 0; i < o.lazyRW; i++ {
+		cols = append(cols, virtualCol{sourceIdx: 1, sourceCol: int16(i)})
+	}
+	o.lazyVirtualOut = NewVirtualSlot(o.schema,
+		[]TupleSlot{o.lazyProbeSlot, o.lazyBuildSlot}, cols)
+}
+
+func (o *joinOp) Next() (TupleSlot, error) {
 	// M0036 lazy output: yield joined rows on demand.
 	if o.lazyProbe != nil {
 		return o.nextLazy()
@@ -472,11 +544,18 @@ func (o *joinOp) Next() (Row, error) {
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return row, nil
+	return asSlot(o.Schema(), row), nil
 }
 
 // nextLazy yields one joined row at a time for lazy hash joins.
-func (o *joinOp) nextLazy() (Row, error) {
+//
+// M0071-0014 Stage D-2: per-match concatRows is replaced by
+// VirtualSlot composition. lazyBuildSlot.row / lazyProbeSlot.row
+// are overwritten in place; predicate eval reads via
+// joinPredicateMatchSlot. The plan-emit Schema is preserved by
+// the cols mapping in ensureLazyVirtual (BuildLeft swaps source
+// order).
+func (o *joinOp) nextLazy() (TupleSlot, error) {
 	// M0054-0005b: reuse the operator's per-Open null padding rows
 	// instead of allocating per call.
 	if o.lazyNullLeft == nil || len(o.lazyNullLeft) != o.lazyLW {
@@ -487,6 +566,7 @@ func (o *joinOp) nextLazy() (Row, error) {
 	}
 	nullLeft := o.lazyNullLeft
 	nullRight := o.lazyNullRight
+	o.ensureLazyVirtual()
 	// Cancellation: cheap ctx check per Next() call so a long
 	// probe-only join responds promptly to CancelRequest.
 	// (M0058-0005.)
@@ -506,30 +586,27 @@ func (o *joinOp) nextLazy() (Row, error) {
 		for o.lazyActive && o.lazyMatchIdx < len(o.lazyMatches) {
 			m := o.lazyMatches[o.lazyMatchIdx]
 			o.lazyMatchIdx++
-			var joined Row
-			if o.plan.BuildLeft {
-				joined = concatRows(m, o.lazyRow)
-			} else {
-				joined = concatRows(o.lazyRow, m)
-			}
-			ok, err := o.joinPredicateMatch(joined)
+			o.lazyBuildSlot.row = m
+			o.lazyProbeSlot.row = o.lazyRow
+			ok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
 				continue
 			}
-			return joined, nil
+			return o.lazyVirtualOut, nil
 		}
 		o.lazyActive = false
 		// Pull next probe row.
-		r, err := o.lazyProbe.Next()
+		probeSlot, err := o.lazyProbe.Next()
 		if err == EOF {
 			return nil, EOF
 		}
 		if err != nil {
 			return nil, err
 		}
+		r := slotRow(probeSlot)
 		o.lazyRow = r
 		// M0054-0005b: reuse a single keyRow buffer across probe
 		// rows. evalHashKey only reads the column slot the join key
@@ -561,25 +638,64 @@ func (o *joinOp) nextLazy() (Row, error) {
 		//   - Semi: skip the probe row (no match).
 		//   - Anti: keep the probe row (matches PostgreSQL
 		//     `NOT EXISTS` semantics — equality cannot be true).
-		if o.plan.Type == planner.JoinTypeSemi {
-			if len(matches) == 0 {
+		//
+		// M0071-0009: hash matches are necessary but not
+		// sufficient — the planner may have lifted residual
+		// non-equi conjuncts (e.g. Q21's
+		// `l3.l_suppkey <> l1.l_suppkey`) onto the join Predicate
+		// via unnestExistsExpr's M0062-0005 residual lift. Without
+		// re-evaluating the Predicate per match, Anti silently
+		// over-excludes (every l1 self-matches a late l3 hash
+		// entry where l3=l1, so the residual is essential to
+		// distinguish self-match from a different-supplier
+		// match). This was Q21's silent-FN root cause: 0 rows vs
+		// canonical ~411.
+		//
+		// Walk matches and apply Predicate; treat a "match" as
+		// hash match AND Predicate=TRUE. The slot composition
+		// already covers both Semi/Anti and INNER predicate eval
+		// — re-bind the build slot per candidate match.
+		if o.plan.Type == planner.JoinTypeSemi || o.plan.Type == planner.JoinTypeAnti {
+			anyMatch := false
+			if ok && len(matches) > 0 {
+				o.lazyProbeSlot.row = r
+				for _, m := range matches {
+					o.lazyBuildSlot.row = m
+					pok, err := o.joinPredicateMatchSlot(o.lazyVirtualOut)
+					if err != nil {
+						return nil, err
+					}
+					if pok {
+						anyMatch = true
+						break
+					}
+				}
+			}
+			if o.plan.Type == planner.JoinTypeSemi {
+				if !anyMatch {
+					continue
+				}
+				o.lazyRow = nil
+				o.lazyOuterOnlySlot.row = r
+				return o.lazyOuterOnlySlot, nil
+			}
+			// Anti: keep iff no match passed the predicate.
+			if anyMatch {
 				continue
 			}
 			o.lazyRow = nil
-			return r, nil
-		}
-		if o.plan.Type == planner.JoinTypeAnti {
-			if len(matches) > 0 {
-				continue
-			}
-			o.lazyRow = nil
-			return r, nil
+			o.lazyOuterOnlySlot.row = r
+			return o.lazyOuterOnlySlot, nil
 		}
 		if len(matches) == 0 {
 			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft {
-				// LEFT JOIN: preserve unmatched left rows.
+				// LEFT JOIN: preserve unmatched left rows. Bind
+				// build slot to nullRight padding; virtualOut
+				// already composes [probe, build] for !BuildLeft.
 				o.lazyRow = nil
-				return concatRows(r, nullRight), nil
+				o.lazyProbeSlot.row = r
+				o.lazyBuildSlot.row = nullRight
+				return o.lazyVirtualOut, nil
 			}
 			// No matches, not LEFT — skip this probe row.
 			continue
@@ -659,7 +775,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	for {
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
@@ -671,6 +787,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
+		row := slotRow(slot)
 
 		key, groupValues, err := o.evalGroupKey(row)
 		if err != nil {
@@ -726,6 +843,13 @@ func (o *aggregateOp) evalGroupKey(row Row) (string, Row, error) {
 		if err != nil {
 			return "", nil, err
 		}
+		// M0073-0004 retention boundary: arena-backed Datums
+		// (varchar / char / text / bytea group keys) must be
+		// promoted to owned []byte before they enter
+		// groupRuntime.groupValues — the next input page's
+		// arena.Reset would invalidate them otherwise.
+		// MaterializeArena is a no-op for non-arena Datums.
+		v = v.MaterializeArena()
 		vals = append(vals, v)
 		parts = append(parts, datumKey(v))
 	}
@@ -778,7 +902,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			st.sum += arg.Int
 		case KindNumeric:
 			if !st.hasValue || st.numericSum.Kind != KindNumeric {
-				st.numericSum = Datum{Kind: KindNumeric, NumericScale: arg.NumericScale}
+				st.numericSum = Datum{Kind: KindNumeric, Scale: arg.Scale}
 			}
 			s, err := numericAdd(st.numericSum, arg)
 			if err != nil {
@@ -792,7 +916,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 		st.hasValue = true
 	case "min":
 		if !st.hasValue {
-			st.value = arg
+			// M0073-0004 retention boundary: arena-backed
+			// Datums must be promoted before storage in
+			// st.value (next input page's Reset would
+			// invalidate the arena bytes otherwise).
+			st.value = arg.MaterializeArena()
 			st.hasValue = true
 			return nil
 		}
@@ -801,11 +929,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			return err
 		}
 		if cmp < 0 {
-			st.value = arg
+			st.value = arg.MaterializeArena()
 		}
 	case "max":
 		if !st.hasValue {
-			st.value = arg
+			st.value = arg.MaterializeArena()
 			st.hasValue = true
 			return nil
 		}
@@ -814,7 +942,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			return err
 		}
 		if cmp > 0 {
-			st.value = arg
+			st.value = arg.MaterializeArena()
 		}
 	default:
 		return &ExecError{Code: "0A000", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s is not supported", call.Name)}
@@ -855,13 +983,13 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	return NullDatum
 }
 
-func (o *aggregateOp) Next() (Row, error) {
+func (o *aggregateOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return row, nil
+	return asSlot(o.schema, row), nil
 }
 
 func (o *aggregateOp) Close() error {
@@ -879,6 +1007,14 @@ func drainRows(op Operator) ([]Row, error) {
 
 // drainRowsCtx drains all rows from op, checking ctx.Err() every 1000
 // rows so a CancelRequest can interrupt long hash-join build phases.
+//
+// M0073-0004 retention boundary: when slots carry arena-backed Datums
+// (KindStringArena / KindBytesArena), the cloneRowOwned helper deep-
+// copies the arena bytes into owned []byte. Without this, the build-
+// side hash tables would alias the source operator's per-page arena
+// pages — invalidated on the next arena.Reset() (typically per-page
+// in seqScan, per-Rescan in indexScan). The fast path
+// (rowHasArena=false) preserves the legacy O(width) struct copy.
 func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 	rows := make([]Row, 0)
 	n := 0
@@ -888,15 +1024,21 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			return rows, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		dup := make(Row, len(row))
-		copy(dup, row)
+		row := slotRow(slot)
+		var dup Row
+		if rowHasArena(row) {
+			dup = cloneRowOwned(row)
+		} else {
+			dup = acquireRow(len(row))
+			copy(dup, row)
+		}
 		rows = append(rows, dup)
 		n++
 	}
@@ -931,10 +1073,10 @@ func datumToInt64Key(d Datum) (int64, bool) {
 	case KindInt:
 		return d.Int, true
 	case KindNumeric:
-		if d.NumericBig != nil {
+		if d.NumericBigValue() != nil {
 			return 0, false // overflow lane: not representable as int64
 		}
-		m, s := d.NumericMantissa, int(d.NumericScale)
+		m, s := d.NumericMantissaValue(), int(d.Scale)
 		for s > 0 && m%10 == 0 {
 			m /= 10
 			s--
@@ -952,7 +1094,7 @@ func datumKey(d Datum) string {
 	case KindNull:
 		return "n"
 	case KindBool:
-		if d.Bool {
+		if d.BoolValue() {
 			return "b:t"
 		}
 		return "b:f"
@@ -963,22 +1105,22 @@ func datumKey(d Datum) string {
 		// scale-0 KindNumeric. Normalise both to the same shape.
 		return canonicalNumericKey(d.Int, 0)
 	case KindNumeric:
-		return canonicalNumericKey(d.NumericMantissa, int(d.NumericScale))
-	case KindString:
-		return "s:" + d.String
-	case KindBytes:
-		return "x:" + string(d.Bytes)
+		return canonicalNumericKey(d.NumericMantissaValue(), int(d.Scale))
+	case KindString, KindStringArena:
+		return "s:" + d.StringValue()
+	case KindBytes, KindBytesArena:
+		return "x:" + string(d.BytesValue())
 	case KindTime:
 		var buf [20]byte
 		b := append(buf[:0], 't', ':')
-		b = strconv.AppendInt(b, d.Time.UnixNano(), 10)
+		b = strconv.AppendInt(b, d.TimeValue().UnixNano(), 10)
 		return string(b)
 	case KindInterval:
 		var buf [32]byte
 		b := append(buf[:0], 'v', ':')
-		b = strconv.AppendInt(b, int64(d.IntervalMonths), 10)
+		b = strconv.AppendInt(b, int64(d.IntervalMonthsValue()), 10)
 		b = append(b, ':')
-		b = strconv.AppendInt(b, int64(d.IntervalDays), 10)
+		b = strconv.AppendInt(b, int64(d.IntervalDaysValue()), 10)
 		return string(b)
 	}
 	return fmt.Sprintf("k:%d", d.Kind)

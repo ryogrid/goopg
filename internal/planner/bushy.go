@@ -5,6 +5,7 @@ import (
 	"math/bits"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // scanKey uniquely identifies a scan by its catalog table pointer and
@@ -137,7 +138,7 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 		})
 	}
 	for _, c := range conjuncts {
-		if bin, ok := c.(*BinaryOp); ok && bin.Op == "=" {
+		if bin, ok := c.(*BinaryOp); ok && bin.Op == parser.OpEq {
 			addEdge(bin)
 			continue
 		}
@@ -159,7 +160,7 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 // branch of an OR predicate.
 func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
 	bin, ok := e.(*BinaryOp)
-	if !ok || bin.Op != "OR" {
+	if !ok || bin.Op != parser.OpOr {
 		return nil
 	}
 	branches := flattenPlannerOr(bin)
@@ -171,7 +172,7 @@ func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
 		branchEqs[i] = map[string]*BinaryOp{}
 		for _, c := range splitAnd(br) {
 			b, ok := c.(*BinaryOp)
-			if !ok || b.Op != "=" {
+			if !ok || b.Op != parser.OpEq {
 				continue
 			}
 			lc, lok := b.Left.(*ColumnRef)
@@ -200,7 +201,7 @@ func plannerCommonEquijoinsAcrossOr(e Expr) []*BinaryOp {
 
 func flattenPlannerOr(e Expr) []Expr {
 	bin, ok := e.(*BinaryOp)
-	if !ok || bin.Op != "OR" {
+	if !ok || bin.Op != parser.OpOr {
 		return []Expr{e}
 	}
 	out := flattenPlannerOr(bin.Left)
@@ -349,7 +350,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 		residual := make([]Expr, 0, len(conjuncts))
 		for _, c := range conjuncts {
 			bin, ok := c.(*BinaryOp)
-			if !ok || bin.Op != "=" {
+			if !ok || bin.Op != parser.OpEq {
 				residual = append(residual, c)
 			}
 		}
@@ -443,7 +444,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 	residual := make([]Expr, 0, len(conjuncts))
 	for _, c := range conjuncts {
 		bin, ok := c.(*BinaryOp)
-		if !ok || bin.Op != "=" {
+		if !ok || bin.Op != parser.OpEq {
 			residual = append(residual, c)
 			continue
 		}
@@ -595,7 +596,7 @@ func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *j
 		Algo:      JoinAlgoHash,
 		Left:      leftPlan,
 		Right:     rightPlan,
-		Predicate: &BinaryOp{pos: 0, Op: "=", Left: leftKey, Right: rightKey},
+		Predicate: &BinaryOp{pos: 0, Op: parser.OpEq, Left: leftKey, Right: rightKey},
 		LeftKey:   leftKey,
 		RightKey:  rightKey,
 		BuildLeft: buildLeft,
@@ -775,7 +776,7 @@ func collectMultiHashTables(node Node) ([]Node, []MultiHashKey, int, []Expr) {
 // AND'd Predicate.
 func isCanonicalKeyEquality(c Expr, leftKey, rightKey Expr) bool {
 	bin, ok := c.(*BinaryOp)
-	if !ok || bin.Op != "=" {
+	if !ok || bin.Op != parser.OpEq {
 		return false
 	}
 	return bin.Left == leftKey && bin.Right == rightKey
@@ -1596,6 +1597,29 @@ func findUniqueColumnIndex(schema Schema, name string, offset int) int {
 	return hit
 }
 
+// findColumnIndexByNameAndSource (M0071-0009) returns the index
+// of the column whose Name and SourceTableIdx both match, plus
+// the given offset. Returns -1 when no match or multiple matches.
+// Used by predRebind / NLI Key rebind when the binder's
+// SourceTableIdx is known and Name alone may be ambiguous
+// (self-joins like Q21's lineitem l1/l2/l3).
+//
+// `sourceTableIdx == 0` is the "unknown / derived" sentinel —
+// callers must not invoke this helper with a zero source idx;
+// they should fall back to findUniqueColumnIndex instead.
+func findColumnIndexByNameAndSource(schema Schema, name string, sourceTableIdx int16, offset int) int {
+	hit := -1
+	for i, c := range schema {
+		if c.Name == name && c.SourceTableIdx == sourceTableIdx {
+			if hit >= 0 {
+				return -1 // duplicate (same name + same source twice — shouldn't happen in well-formed schemas, but guard)
+			}
+			hit = i + offset
+		}
+	}
+	return hit
+}
+
 // reresolveJoinByName re‑binds ColumnRef indices in a Join's keys
 // and predicate by matching ColumnRef.Name against the actual output
 // schemas of n.Left and n.Right. Used after rewriteMultiWayChain to
@@ -1618,13 +1642,38 @@ func reresolveJoinByName(j *Join) {
 	leftSchema := j.Left.Output()
 	rightSchema := j.Right.Output()
 	leftWidth := len(leftSchema)
-	// Refresh cached merged schema.
-	merged := make(Schema, leftWidth+len(rightSchema))
-	copy(merged, leftSchema)
-	copy(merged[leftWidth:], rightSchema)
-	j.schema = merged
+	// Refresh cached merged schema. Semi/Anti joins (M0061-0001
+	// EXISTS / NOT-EXISTS unnest) emit Outer (= Left) only at
+	// runtime, so their cached schema must NOT widen to merged
+	// even though the predicate evaluates against the padded
+	// (Left ++ Right) row. Without this guard, downstream
+	// outer-Joins observe a 15-col layout for what runtime
+	// produces as 11 cols, and predRebind picks Left positions
+	// for refs that should land in Right (Q21's NOT-EXISTS
+	// `l3.l_suppkey <> l1.l_suppkey` collapsed onto l2's
+	// l_suppkey leaked into the SemiJoin's stale merged schema —
+	// silent FN, 0 rows vs canonical ~411).
+	if j.Type != JoinTypeSemi && j.Type != JoinTypeAnti {
+		merged := make(Schema, leftWidth+len(rightSchema))
+		copy(merged, leftSchema)
+		copy(merged[leftWidth:], rightSchema)
+		j.schema = merged
+	}
 
 	findUnique := findUniqueColumnIndex
+
+	// resolveSide tries SourceTableIdx-aware lookup first when
+	// the ColumnRef carries a known source identity (M0071-0009);
+	// falls back to Name-only when source identity is unknown.
+	// Returns -1 on miss.
+	resolveSide := func(schema Schema, cr *ColumnRef, offset int) int {
+		if cr.SourceTableIdx != 0 {
+			if newIdx := findColumnIndexByNameAndSource(schema, cr.Name, cr.SourceTableIdx, offset); newIdx >= 0 {
+				return newIdx
+			}
+		}
+		return findUnique(schema, cr.Name, offset)
+	}
 
 	rebind := func(e Expr, leftSide bool) {
 		cr, ok := e.(*ColumnRef)
@@ -1633,9 +1682,9 @@ func reresolveJoinByName(j *Join) {
 		}
 		var newIdx int
 		if leftSide {
-			newIdx = findUnique(leftSchema, cr.Name, 0)
+			newIdx = resolveSide(leftSchema, cr, 0)
 		} else {
-			newIdx = findUnique(rightSchema, cr.Name, leftWidth)
+			newIdx = resolveSide(rightSchema, cr, leftWidth)
 		}
 		if newIdx >= 0 {
 			cr.Index = newIdx
@@ -1651,6 +1700,12 @@ func reresolveJoinByName(j *Join) {
 	// may already have been remapped by an earlier pass — so the
 	// original-Index side classification can be wrong, and we need
 	// to retry the opposite side by Name.
+	//
+	// M0071-0009: when the ColumnRef carries SourceTableIdx
+	// (set by the binder from the rangeBinding's source identity),
+	// resolveSide prefers the (Name, SourceTableIdx) match — Q21's
+	// 3 lineitem aliases all named `l_suppkey` are no longer
+	// "ambiguous"; each disambiguates by its source.
 	predRebind := func(e Expr) {
 		cr, ok := e.(*ColumnRef)
 		if !ok || cr.Name == "" {
@@ -1658,20 +1713,20 @@ func reresolveJoinByName(j *Join) {
 		}
 		tryLeftFirst := cr.Index < leftWidth
 		if tryLeftFirst {
-			if newIdx := findUnique(leftSchema, cr.Name, 0); newIdx >= 0 {
+			if newIdx := resolveSide(leftSchema, cr, 0); newIdx >= 0 {
 				cr.Index = newIdx
 				return
 			}
-			if newIdx := findUnique(rightSchema, cr.Name, leftWidth); newIdx >= 0 {
+			if newIdx := resolveSide(rightSchema, cr, leftWidth); newIdx >= 0 {
 				cr.Index = newIdx
 				return
 			}
 		} else {
-			if newIdx := findUnique(rightSchema, cr.Name, leftWidth); newIdx >= 0 {
+			if newIdx := resolveSide(rightSchema, cr, leftWidth); newIdx >= 0 {
 				cr.Index = newIdx
 				return
 			}
-			if newIdx := findUnique(leftSchema, cr.Name, 0); newIdx >= 0 {
+			if newIdx := resolveSide(leftSchema, cr, 0); newIdx >= 0 {
 				cr.Index = newIdx
 				return
 			}

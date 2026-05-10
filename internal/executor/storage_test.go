@@ -110,7 +110,7 @@ func TestInsertThenSeqScanRoundTrip(t *testing.T) {
 		id    int64
 		label string
 	}{{1, "alpha"}, {2, "beta"}, {3, "gamma"}} {
-		if rows[i][0].Int != want.id || rows[i][1].String != want.label {
+		if rows[i][0].Int != want.id || rows[i][1].StringValue() != want.label {
 			t.Errorf("rows[%d]=%+v want id=%d label=%q", i, rows[i], want.id, want.label)
 		}
 	}
@@ -213,14 +213,18 @@ func TestInsertExtendsRelation(t *testing.T) {
 func drainScan(op Operator) ([]Row, error) {
 	var out []Row
 	for {
-		row, err := op.Next()
+		slot, err := op.Next()
 		if err == EOF {
 			return out, nil
 		}
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, row)
+		// Materialize at the public Run boundary so tests
+		// receive owned rows (M0073-0001 promotion: arena-
+		// backed Datums become regular KindString / KindBytes
+		// with Buf payload). Mirrors executor.Run's contract.
+		out = append(out, slot.Materialize().Row())
 	}
 }
 

@@ -2,9 +2,12 @@ package executor
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 var (
@@ -12,6 +15,135 @@ var (
 	bigNumericMinInt64 = big.NewInt(-9223372036854775808)
 	bigNumericMaxInt64 = big.NewInt(9223372036854775807)
 )
+
+// int64Pow10[i] = 10^i for i in [0, 18]. 10^19 overflows
+// int64. Used by mulInt64Pow10 for scale alignment in the
+// M0074-0006 int64 fast-path.
+var int64Pow10 = [19]int64{
+	1, 10, 100, 1000, 10000, 100000, 1000000,
+	10000000, 100000000, 1000000000,
+	10000000000, 100000000000, 1000000000000,
+	10000000000000, 100000000000000,
+	1000000000000000, 10000000000000000,
+	100000000000000000, 1000000000000000000,
+}
+
+// mulInt64Pow10 returns v * 10^exp, with ok=false on
+// int64 overflow. exp must be ≥ 0. The bound check uses
+// division (math.MaxInt64 / p) to avoid the multiply
+// itself wrapping. (M0074-0006.)
+func mulInt64Pow10(v int64, exp int) (int64, bool) {
+	if exp < 0 {
+		// Negative exponent is a caller bug.
+		return 0, false
+	}
+	if v == 0 {
+		// Zero never overflows, regardless of exp.
+		return 0, true
+	}
+	if exp > 18 {
+		// 10^exp > MaxInt64; non-zero v always overflows.
+		return 0, false
+	}
+	if exp == 0 {
+		return v, true
+	}
+	p := int64Pow10[exp]
+	if v > 0 {
+		if v > math.MaxInt64/p {
+			return 0, false
+		}
+	} else {
+		if v < math.MinInt64/p {
+			return 0, false
+		}
+	}
+	return v * p, true
+}
+
+// alignNumericInt64 brings two int64 mantissas to a
+// common scale via mulInt64Pow10. ok=false on overflow.
+// (M0074-0006.)
+func alignNumericInt64(am int64, ascale int16, bm int64, bscale int16) (int64, int64, bool) {
+	diff := int(ascale) - int(bscale)
+	switch {
+	case diff == 0:
+		return am, bm, true
+	case diff > 0:
+		// a has more decimals; scale b up by 10^diff
+		scaled, ok := mulInt64Pow10(bm, diff)
+		if !ok {
+			return 0, 0, false
+		}
+		return am, scaled, true
+	default:
+		scaled, ok := mulInt64Pow10(am, -diff)
+		if !ok {
+			return 0, 0, false
+		}
+		return scaled, bm, true
+	}
+}
+
+// numericCmpInt64Fast compares two int64-mantissa NUMERIC
+// values after scale alignment. Returns (cmp, ok) where
+// ok=false signals overflow during alignment — caller
+// should fall through to the big.Int slow path.
+// (M0074-0006.)
+func numericCmpInt64Fast(am int64, ascale int16, bm int64, bscale int16) (int, bool) {
+	am2, bm2, ok := alignNumericInt64(am, ascale, bm, bscale)
+	if !ok {
+		return 0, false
+	}
+	switch {
+	case am2 < bm2:
+		return -1, true
+	case am2 > bm2:
+		return 1, true
+	}
+	return 0, true
+}
+
+// addInt64Overflow returns a + b, with ok=false on int64
+// overflow. (M0074-0006.)
+func addInt64Overflow(a, b int64) (int64, bool) {
+	r := a + b
+	// Overflow iff sign(a) == sign(b) && sign(r) != sign(a).
+	if (a >= 0) == (b >= 0) && (r >= 0) != (a >= 0) {
+		return 0, false
+	}
+	return r, true
+}
+
+// subInt64Overflow returns a - b, with ok=false on int64
+// overflow. (M0074-0006.)
+func subInt64Overflow(a, b int64) (int64, bool) {
+	r := a - b
+	// Overflow iff sign(a) != sign(b) && sign(r) != sign(a).
+	if (a >= 0) != (b >= 0) && (r >= 0) != (a >= 0) {
+		return 0, false
+	}
+	return r, true
+}
+
+// mulInt64Overflow returns a * b, with ok=false on int64
+// overflow. (M0074-0006.)
+func mulInt64Overflow(a, b int64) (int64, bool) {
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	// MinInt64 * -1 overflows.
+	if a == math.MinInt64 || b == math.MinInt64 {
+		if a == -1 || b == -1 {
+			return 0, false
+		}
+	}
+	r := a * b
+	if r/b != a {
+		return 0, false
+	}
+	return r, true
+}
 
 // numericMinSigDigits mirrors upstream's NUMERIC_MIN_SIG_DIGITS
 // (postgres/src/include/utils/numeric.h:50). Division ensures the
@@ -30,10 +162,10 @@ const numericMaxDisplayScale = 1000
 // the big-int overflow lane (NumericBig != nil). Always returns a
 // fresh *big.Int so callers can mutate without aliasing the Datum.
 func numericMant(d Datum) *big.Int {
-	if d.NumericBig != nil {
-		return new(big.Int).Set(d.NumericBig)
+	if d.NumericBigValue() != nil {
+		return new(big.Int).Set(d.NumericBigValue())
 	}
-	return big.NewInt(d.NumericMantissa)
+	return big.NewInt(d.NumericMantissaValue())
 }
 
 // newNumeric constructs a KindNumeric Datum from a *big.Int
@@ -54,10 +186,10 @@ func newNumeric(b *big.Int, scale int) Datum {
 		scale = 0
 	}
 	if b.Cmp(bigNumericMinInt64) >= 0 && b.Cmp(bigNumericMaxInt64) <= 0 {
-		return Datum{Kind: KindNumeric, NumericMantissa: b.Int64(), NumericScale: int16(scale)}
+		return Datum{Kind: KindNumeric, Int: b.Int64(), Scale: int16(scale)}
 	}
 	bb := new(big.Int).Set(b)
-	return Datum{Kind: KindNumeric, NumericBig: bb, NumericScale: int16(scale)}
+	return Datum{Kind: KindNumeric, Big: bb, Scale: int16(scale)}
 }
 
 // parseNumericFast attempts an int64-only fast path for the
@@ -177,7 +309,7 @@ func parseNumeric(text string) (*big.Int, int16, error) {
 
 // numericFromInt promotes an int64 to KindNumeric form (scale=0).
 func numericFromInt(n int64) Datum {
-	return Datum{Kind: KindNumeric, NumericMantissa: n, NumericScale: 0}
+	return Datum{Kind: KindNumeric, Int: n, Scale: 0}
 }
 
 // promoteToNumeric brings two operands to KindNumeric so the
@@ -185,7 +317,7 @@ func numericFromInt(n int64) Datum {
 // scale=0; KindString rejects with 42883 (the analyzer should
 // have caught it, but evaluator-side checks keep mistakes
 // localised). Both operands are returned as KindNumeric on success.
-func promoteToNumeric(a, b Datum, op string, pos int) (Datum, Datum, error) {
+func promoteToNumeric(a, b Datum, op parser.OpCode, pos int) (Datum, Datum, error) {
 	an, err := toNumeric(a, op, pos)
 	if err != nil {
 		return Datum{}, Datum{}, err
@@ -197,14 +329,14 @@ func promoteToNumeric(a, b Datum, op string, pos int) (Datum, Datum, error) {
 	return an, bn, nil
 }
 
-func toNumeric(d Datum, op string, pos int) (Datum, error) {
+func toNumeric(d Datum, op parser.OpCode, pos int) (Datum, error) {
 	switch d.Kind {
 	case KindNumeric:
 		return d, nil
 	case KindInt:
 		return numericFromInt(d.Int), nil
-	case KindString:
-		if m, s, err := parseNumeric(d.String); err == nil {
+	case KindString, KindStringArena:
+		if m, s, err := parseNumeric(d.StringValue()); err == nil {
 			return newNumeric(m, int(s)), nil
 		}
 	}
@@ -237,19 +369,59 @@ func alignNumericBig(am *big.Int, as int16, bm *big.Int, bs int16) (*big.Int, *b
 // overflow is no longer a concern; the result lands on the int64
 // fast path automatically when it fits via newNumeric.
 func numericAdd(a, b Datum) (Datum, error) {
-	am, bm, scale := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	// M0074-0006: int64 fast-path. Skip big.Int when both
+	// operands are in the int64 lane and the aligned sum
+	// doesn't overflow.
+	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+		am, bm, ok := alignNumericInt64(a.NumericMantissaValue(), a.Scale,
+			b.NumericMantissaValue(), b.Scale)
+		if ok {
+			scale := a.Scale
+			if b.Scale > scale {
+				scale = b.Scale
+			}
+			if r, ok := addInt64Overflow(am, bm); ok {
+				return Datum{Kind: KindNumeric, Int: r, Scale: scale}, nil
+			}
+		}
+	}
+	am, bm, scale := alignNumericBig(numericMant(a), a.Scale, numericMant(b), b.Scale)
 	return newNumeric(new(big.Int).Add(am, bm), int(scale)), nil
 }
 
 func numericSub(a, b Datum) (Datum, error) {
-	am, bm, scale := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	// M0074-0006: int64 fast-path. Skip big.Int when both
+	// operands are in the int64 lane and the aligned diff
+	// doesn't overflow.
+	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+		am, bm, ok := alignNumericInt64(a.NumericMantissaValue(), a.Scale,
+			b.NumericMantissaValue(), b.Scale)
+		if ok {
+			scale := a.Scale
+			if b.Scale > scale {
+				scale = b.Scale
+			}
+			if r, ok := subInt64Overflow(am, bm); ok {
+				return Datum{Kind: KindNumeric, Int: r, Scale: scale}, nil
+			}
+		}
+	}
+	am, bm, scale := alignNumericBig(numericMant(a), a.Scale, numericMant(b), b.Scale)
 	return newNumeric(new(big.Int).Sub(am, bm), int(scale)), nil
 }
 
 func numericMul(a, b Datum) (Datum, error) {
-	scale := int(a.NumericScale) + int(b.NumericScale)
+	scale := int(a.Scale) + int(b.Scale)
 	if scale > numericMaxDisplayScale {
 		return Datum{}, fmt.Errorf("numeric scale %d exceeds %d in multiply", scale, numericMaxDisplayScale)
+	}
+	// M0074-0006: int64 fast-path. Skip big.Int when both
+	// operands are in the int64 lane and the product
+	// doesn't overflow.
+	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+		if r, ok := mulInt64Overflow(a.NumericMantissaValue(), b.NumericMantissaValue()); ok {
+			return Datum{Kind: KindNumeric, Int: r, Scale: int16(scale)}, nil
+		}
 	}
 	prod := new(big.Int).Mul(numericMant(a), numericMant(b))
 	return newNumeric(prod, scale), nil
@@ -274,7 +446,7 @@ func numericDiv(a, b Datum, pos int) (Datum, error) {
 		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 	}
 	am := numericMant(a)
-	da, db := int(a.NumericScale), int(b.NumericScale)
+	da, db := int(a.Scale), int(b.Scale)
 	if am.Sign() == 0 {
 		// Zero numerator — short-circuit at max(da, db, 0).
 		zScale := da
@@ -411,8 +583,22 @@ func nbaseWeightAndFirstDigit(absStr string, dscale int) (weight, firstdigit int
 
 // numericCmp compares two numeric values, returning -1/0/+1.
 // Aligning scales in advance avoids cross-scale precision loss.
+//
+// M0074-0006: int64 fast-path skips big.Int allocation when
+// both operands are in the int64 lane (Big == nil) and the
+// aligned mantissas don't overflow int64. TPC-H NUMERIC(15,2)
+// columns all fit easily; on Q5 this eliminates ~5.86 % flat
+// CPU previously consumed by numericMant's per-call big.Int
+// allocation.
 func numericCmp(a, b Datum) (int, error) {
-	am, bm, _ := alignNumericBig(numericMant(a), a.NumericScale, numericMant(b), b.NumericScale)
+	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+		if cmp, ok := numericCmpInt64Fast(a.NumericMantissaValue(), a.Scale,
+			b.NumericMantissaValue(), b.Scale); ok {
+			return cmp, nil
+		}
+		// Fall through to big.Int slow path on overflow.
+	}
+	am, bm, _ := alignNumericBig(numericMant(a), a.Scale, numericMant(b), b.Scale)
 	switch am.Cmp(bm) {
 	case -1:
 		return -1, nil

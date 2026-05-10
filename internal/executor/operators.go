@@ -1,6 +1,9 @@
 package executor
 
 import (
+	"container/heap"
+	"io"
+	"os"
 	"sort"
 
 	"github.com/goopg/goopg/internal/planner"
@@ -24,7 +27,7 @@ func (o *valuesOp) Open(ctx *Context) error { o.ctx = ctx; o.idx = 0; return nil
 func (o *valuesOp) Schema() planner.Schema  { return o.schema }
 func (o *valuesOp) Close() error            { return nil }
 
-func (o *valuesOp) Next() (Row, error) {
+func (o *valuesOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
@@ -38,20 +41,21 @@ func (o *valuesOp) Next() (Row, error) {
 		}
 		row[i] = v
 	}
-	return row, nil
+	return asSlot(o.schema, row), nil
 }
 
 // projectOp evaluates the target list against each child row.
+//
+// M0071-0015 Stage E: targets are evaluated into a freshly-cloned
+// Row each Next() — projectOp's child slot is consumed inside this
+// function (slot is no longer accessed after the loop), so the
+// child's lifetime contract is satisfied by the slot itself.
 type projectOp struct {
 	child   Operator
 	targets []planner.Expr
 	schema  planner.Schema
 	ctx     *Context
-	// M0054-0005a-followup: borrow-semantics output buffer reuse.
-	// When `borrow == BorrowedRow`, Next returns `out` directly;
-	// otherwise it clones before returning. Default OwnedRow.
-	borrow BorrowSemantics
-	out    Row
+	out     Row
 }
 
 func newProjectOp(plan *planner.Project, child Operator) *projectOp {
@@ -61,24 +65,25 @@ func newProjectOp(plan *planner.Project, child Operator) *projectOp {
 func (o *projectOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	if cap(o.out) < len(o.targets) {
-		o.out = make(Row, len(o.targets))
+		o.out = acquireRow(len(o.targets))
 	} else {
 		o.out = o.out[:len(o.targets)]
 	}
 	return o.child.Open(ctx)
 }
 func (o *projectOp) Schema() planner.Schema { return o.schema }
-func (o *projectOp) Close() error           { return o.child.Close() }
+func (o *projectOp) Close() error {
+	releaseRow(o.out)
+	o.out = nil
+	return o.child.Close()
+}
 
-// SetBorrow marks projectOp as eligible to return borrowed
-// rows. (M0054-0005a-followup.)
-func (o *projectOp) SetBorrow(s BorrowSemantics) { o.borrow = s }
-
-func (o *projectOp) Next() (Row, error) {
-	in, err := o.child.Next()
+func (o *projectOp) Next() (TupleSlot, error) {
+	inSlot, err := o.child.Next()
 	if err != nil {
 		return nil, err
 	}
+	in := slotRow(inSlot)
 	for i, t := range o.targets {
 		v, err := evalExpr(t, in, o.ctx)
 		if err != nil {
@@ -86,22 +91,21 @@ func (o *projectOp) Next() (Row, error) {
 		}
 		o.out[i] = v
 	}
-	if o.borrow == BorrowedRow {
-		return o.out, nil
-	}
-	return cloneRow(o.out), nil
+	return asSlot(o.schema, cloneRow(o.out)), nil
 }
 
 // filterOp drops rows where the predicate doesn't evaluate to TRUE.
 // NULL predicates exclude the row, matching SQL semantics.
+//
+// M0071-0012 Stage C: pass-through. The predicate is evaluated
+// directly against the child's slot via evalExprSlot — no Row
+// materialisation in the hot path. Matching slots are forwarded
+// to the parent unchanged, so filter never owns Row buffers and
+// no borrow contract is needed.
 type filterOp struct {
 	child Operator
 	pred  planner.Expr
 	ctx   *Context
-	// M0054-0005a-followup: pure pass-through borrow. The Filter
-	// returns its child's row unchanged, so it can borrow exactly
-	// as long as its parent allows it.
-	borrow BorrowSemantics
 }
 
 func newFilterOp(plan *planner.Filter, child Operator) *filterOp {
@@ -112,17 +116,7 @@ func (o *filterOp) Open(ctx *Context) error { o.ctx = ctx; return o.child.Open(c
 func (o *filterOp) Schema() planner.Schema  { return o.child.Schema() }
 func (o *filterOp) Close() error            { return o.child.Close() }
 
-// SetBorrow propagates the borrow contract to the child. filterOp
-// itself never copies — it just hands through. So borrow-OK at
-// filter ⇒ borrow-OK at child. (M0054-0005a-followup.)
-func (o *filterOp) SetBorrow(s BorrowSemantics) {
-	o.borrow = s
-	if b, ok := o.child.(Borrowable); ok {
-		b.SetBorrow(s)
-	}
-}
-
-func (o *filterOp) Next() (Row, error) {
+func (o *filterOp) Next() (TupleSlot, error) {
 	rejected := 0
 	for {
 		// M0062-followup: a highly-selective filter can drain millions
@@ -133,16 +127,21 @@ func (o *filterOp) Next() (Row, error) {
 				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err != nil {
 			return nil, err
 		}
-		v, err := evalExpr(o.pred, row, o.ctx)
+		if slot == nil {
+			// DML / utility ops surface (nil, nil) for "advance
+			// done, no row to surface" — propagate without eval.
+			return nil, nil
+		}
+		v, err := evalExprSlot(o.pred, slot, o.ctx)
 		if err != nil {
 			return nil, err
 		}
-		if !v.IsNull() && v.Kind == KindBool && v.Bool {
-			return row, nil
+		if !v.IsNull() && v.Kind == KindBool && v.BoolValue() {
+			return slot, nil
 		}
 		rejected++
 	}
@@ -150,6 +149,10 @@ func (o *filterOp) Next() (Row, error) {
 
 // limitOp implements LIMIT/OFFSET. Both are evaluated once at Open
 // so a long stream doesn't re-evaluate.
+//
+// M0071-0012 Stage C: pass-through. limitOp returns the child's
+// slot unchanged on each emitted row — it owns no Row buffer and
+// no borrow contract is needed.
 type limitOp struct {
 	child       Operator
 	limitExpr   planner.Expr
@@ -158,16 +161,6 @@ type limitOp struct {
 	offsetCount int64
 	emitted     int64
 	skipped     int64
-	// M0054-0005a-followup: pass-through borrow.
-	borrow BorrowSemantics
-}
-
-// SetBorrow propagates to the child. (M0054-0005a-followup.)
-func (o *limitOp) SetBorrow(s BorrowSemantics) {
-	o.borrow = s
-	if b, ok := o.child.(Borrowable); ok {
-		b.SetBorrow(s)
-	}
 }
 
 func newLimitOp(plan *planner.Limit, child Operator) *limitOp {
@@ -204,7 +197,7 @@ func (o *limitOp) Open(ctx *Context) error {
 func (o *limitOp) Schema() planner.Schema { return o.child.Schema() }
 func (o *limitOp) Close() error           { return o.child.Close() }
 
-func (o *limitOp) Next() (Row, error) {
+func (o *limitOp) Next() (TupleSlot, error) {
 	for o.skipped < o.offsetCount {
 		if _, err := o.child.Next(); err != nil {
 			return nil, err
@@ -214,26 +207,62 @@ func (o *limitOp) Next() (Row, error) {
 	if o.limitCount >= 0 && o.emitted >= o.limitCount {
 		return nil, EOF
 	}
-	row, err := o.child.Next()
+	slot, err := o.child.Next()
 	if err != nil {
 		return nil, err
 	}
 	o.emitted++
-	return row, nil
+	return slot, nil
 }
 
-// sortOp fully buffers the child's output then sorts under the
-// supplied key list. Stable sort matches upstream's behaviour.
+// sortOp buffers the child's output then sorts under the supplied
+// key list. Stable sort matches upstream's behaviour.
+//
+// M0068-0006: when the in-memory chunk exceeds sortChunkBytes the
+// chunk is sorted, written to a spill file, and freed. After the
+// child is fully drained an N-way merge over the spill files plus
+// the in-memory tail produces the final ordered stream. This keeps
+// peak heap residency bounded by the chunk size regardless of input
+// row count, eliminating the heap blow-up that the M0066 review
+// flagged for large sorts.
 type sortOp struct {
 	child Operator
 	keys  []planner.SortKey
 	ctx   *Context
-	rows  []Row
-	idx   int
+
+	// chunk size threshold for triggering a spill. Default 256 MiB.
+	chunkLimitBytes int64
+
+	// In-memory chunk / tail.
+	rows []Row
+	idx  int
+
+	// External-sort state. Populated only when at least one spill
+	// has occurred during Open().
+	spillFiles []string
+	heap       *sortHeap
+	mergeReady bool
+
+	sortErr error
 }
 
 func newSortOp(plan *planner.Sort, child Operator) *sortOp {
 	return &sortOp{child: child, keys: plan.Keys}
+}
+
+// sortChunkBytes is the in-memory threshold at which a sort chunk
+// is flushed to a spill file. 256 MiB matches the build-side
+// drainRowsBounded default and keeps a single chunk's footprint
+// well below typical container-memory limits while remaining big
+// enough to absorb every TPC-H SF=1 sort that doesn't otherwise
+// require external sort.
+const sortChunkBytes = int64(256 * 1024 * 1024)
+
+func (o *sortOp) chunkLimit() int64 {
+	if o.chunkLimitBytes > 0 {
+		return o.chunkLimitBytes
+	}
+	return sortChunkBytes
 }
 
 func (o *sortOp) Open(ctx *Context) error {
@@ -241,62 +270,126 @@ func (o *sortOp) Open(ctx *Context) error {
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
+	limit := o.chunkLimit()
+	var chunkBytes int64
+	pulled := 0
 	for {
 		// M0062-followup: a sort over millions of rows can otherwise
 		// drain the child without a cancel opportunity. ctx check
 		// every 4096 rows pulled.
-		if len(o.rows)&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
+		if pulled&0xFFF == 0 && ctx != nil && ctx.Ctx != nil {
 			if err := ctx.Ctx.Err(); err != nil {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row, err := o.child.Next()
+		slot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return err
 		}
+		// Materialize at retention boundary: sortOp holds rows
+		// across many Next() calls, so the slot's lifetime
+		// contract requires us to take ownership of an
+		// independent row. (M0071-0010 Stage B.)
+		row := slot.Materialize().Row()
 		o.rows = append(o.rows, row)
-	}
-	var sortErr error
-	sort.SliceStable(o.rows, func(i, j int) bool {
-		for _, k := range o.keys {
-			a, err := evalExpr(k.Expr, o.rows[i], ctx)
-			if err != nil {
-				sortErr = err
-				return false
+		chunkBytes += estimatedRowBytes(row)
+		pulled++
+		if chunkBytes >= limit {
+			if err := o.flushChunk(); err != nil {
+				return err
 			}
-			b, err := evalExpr(k.Expr, o.rows[j], ctx)
-			if err != nil {
-				sortErr = err
-				return false
-			}
-			if a.IsNull() && !b.IsNull() {
-				return !k.Desc
-			}
-			if !a.IsNull() && b.IsNull() {
-				return k.Desc
-			}
-			if a.IsNull() && b.IsNull() {
-				continue
-			}
-			cmp, err := compareDatum(a, b, k.Expr.Pos())
-			if err != nil {
-				sortErr = err
-				return false
-			}
-			if cmp == 0 {
-				continue
-			}
-			if k.Desc {
-				return cmp > 0
-			}
-			return cmp < 0
+			o.rows = o.rows[:0]
+			chunkBytes = 0
 		}
-		return false
+	}
+	// Sort the final in-memory tail.
+	o.sortChunk(o.rows)
+	if o.sortErr != nil {
+		return o.sortErr
+	}
+	return nil
+}
+
+// sortChunk in-place sorts a slice using the configured key list.
+// Sets o.sortErr if an evaluator error surfaces during comparison.
+func (o *sortOp) sortChunk(rows []Row) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		return o.lessRows(rows[i], rows[j])
 	})
-	return sortErr
+}
+
+// lessRows returns true iff a should sort before b under the
+// configured key list. Records the first evaluator error in
+// o.sortErr and returns false on error so the comparator stays
+// strict-weak-ordered for the rest of the sort.
+func (o *sortOp) lessRows(a, b Row) bool {
+	for _, k := range o.keys {
+		av, err := evalExpr(k.Expr, a, o.ctx)
+		if err != nil {
+			if o.sortErr == nil {
+				o.sortErr = err
+			}
+			return false
+		}
+		bv, err := evalExpr(k.Expr, b, o.ctx)
+		if err != nil {
+			if o.sortErr == nil {
+				o.sortErr = err
+			}
+			return false
+		}
+		if av.IsNull() && !bv.IsNull() {
+			return !k.Desc
+		}
+		if !av.IsNull() && bv.IsNull() {
+			return k.Desc
+		}
+		if av.IsNull() && bv.IsNull() {
+			continue
+		}
+		cmp, err := compareDatum(av, bv, k.Expr.Pos())
+		if err != nil {
+			if o.sortErr == nil {
+				o.sortErr = err
+			}
+			return false
+		}
+		if cmp == 0 {
+			continue
+		}
+		if k.Desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	}
+	return false
+}
+
+// flushChunk sorts the current in-memory chunk and writes it to a
+// new spill file. The caller must reset o.rows after the call.
+func (o *sortOp) flushChunk() error {
+	o.sortChunk(o.rows)
+	if o.sortErr != nil {
+		return o.sortErr
+	}
+	w, err := newSpillWriter(os.TempDir())
+	if err != nil {
+		return err
+	}
+	for _, r := range o.rows {
+		if werr := w.WriteRow(r); werr != nil {
+			w.Close()
+			return werr
+		}
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	o.spillFiles = append(o.spillFiles, w.Path())
+	return nil
 }
 
 func (o *sortOp) Schema() planner.Schema { return o.child.Schema() }
@@ -304,14 +397,143 @@ func (o *sortOp) Close() error {
 	o.rows = nil
 	o.idx = 0
 	o.ctx = nil
+	if o.heap != nil {
+		for _, s := range o.heap.sources {
+			if s.reader != nil {
+				_ = s.reader.Close()
+			}
+		}
+		o.heap = nil
+	}
+	for _, p := range o.spillFiles {
+		_ = os.Remove(p)
+	}
+	o.spillFiles = nil
 	return o.child.Close()
 }
 
-func (o *sortOp) Next() (Row, error) {
-	if o.idx >= len(o.rows) {
+func (o *sortOp) Next() (TupleSlot, error) {
+	if len(o.spillFiles) == 0 {
+		// Fully in-memory path.
+		if o.idx >= len(o.rows) {
+			return nil, EOF
+		}
+		row := o.rows[o.idx]
+		o.idx++
+		return asSlot(o.Schema(), row), nil
+	}
+	if !o.mergeReady {
+		if err := o.initMerge(); err != nil {
+			return nil, err
+		}
+	}
+	row, err := o.popMerge()
+	if err != nil {
+		return nil, err
+	}
+	return asSlot(o.Schema(), row), nil
+}
+
+// initMerge opens spill readers, primes each source with one row,
+// and builds the min-heap.
+func (o *sortOp) initMerge() error {
+	o.heap = &sortHeap{less: o.lessRows}
+	for _, p := range o.spillFiles {
+		r, err := newSpillReader(p)
+		if err != nil {
+			return err
+		}
+		s := &sortSource{reader: r}
+		if err := s.advance(); err != nil {
+			return err
+		}
+		if !s.eof {
+			heap.Push(o.heap, s)
+		}
+	}
+	if len(o.rows) > 0 {
+		s := &sortSource{rows: o.rows}
+		s.advance()
+		if !s.eof {
+			heap.Push(o.heap, s)
+		}
+	}
+	o.mergeReady = true
+	return nil
+}
+
+// popMerge returns the smallest row across all sources, advancing
+// the source it came from.
+func (o *sortOp) popMerge() (Row, error) {
+	if o.heap.Len() == 0 {
 		return nil, EOF
 	}
-	row := o.rows[o.idx]
-	o.idx++
+	s := heap.Pop(o.heap).(*sortSource)
+	row := s.cur
+	if err := s.advance(); err != nil {
+		return nil, err
+	}
+	if !s.eof {
+		heap.Push(o.heap, s)
+	}
+	if o.sortErr != nil {
+		return nil, o.sortErr
+	}
 	return row, nil
+}
+
+// sortSource is a single input to the N-way merge. Either a
+// spillReader (file-backed chunk) or an in-memory rows slice
+// (the un-spilled tail).
+type sortSource struct {
+	reader *spillReader
+	rows   []Row
+	idx    int
+
+	cur Row
+	eof bool
+}
+
+func (s *sortSource) advance() error {
+	if s.reader != nil {
+		row, err := s.reader.ReadRow()
+		if err == io.EOF {
+			s.eof = true
+			s.cur = nil
+			_ = s.reader.Close()
+			s.reader = nil
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		s.cur = cloneRow(row) // ReadRow's buffer is reused; clone for retain
+		return nil
+	}
+	if s.idx >= len(s.rows) {
+		s.eof = true
+		s.cur = nil
+		return nil
+	}
+	s.cur = s.rows[s.idx]
+	s.idx++
+	return nil
+}
+
+// sortHeap is a min-heap of sortSources keyed by their current row
+// under a row-comparator function.
+type sortHeap struct {
+	sources []*sortSource
+	less    func(a, b Row) bool
+}
+
+func (h *sortHeap) Len() int           { return len(h.sources) }
+func (h *sortHeap) Less(i, j int) bool { return h.less(h.sources[i].cur, h.sources[j].cur) }
+func (h *sortHeap) Swap(i, j int)      { h.sources[i], h.sources[j] = h.sources[j], h.sources[i] }
+func (h *sortHeap) Push(x any)         { h.sources = append(h.sources, x.(*sortSource)) }
+func (h *sortHeap) Pop() any {
+	n := len(h.sources)
+	x := h.sources[n-1]
+	h.sources = h.sources[:n-1]
+	return x
 }

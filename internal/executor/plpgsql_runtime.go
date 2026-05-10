@@ -218,7 +218,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
-		if !cond.IsNull() && cond.Kind == KindBool && cond.Bool {
+		if !cond.IsNull() && cond.Kind == KindBool && cond.BoolValue() {
 			return executePLpgSQLStmtList(s.Then, r, frame, ctx)
 		}
 		for _, elsif := range s.Elsifs {
@@ -226,7 +226,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if err != nil {
 				return Datum{}, flowNone, err
 			}
-			if !cond.IsNull() && cond.Kind == KindBool && cond.Bool {
+			if !cond.IsNull() && cond.Kind == KindBool && cond.BoolValue() {
 				return executePLpgSQLStmtList(elsif.Then, r, frame, ctx)
 			}
 		}
@@ -258,7 +258,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if err != nil {
 				return Datum{}, flowNone, err
 			}
-			if cond.IsNull() || !cond.Bool {
+			if cond.IsNull() || !cond.BoolValue() {
 				return Datum{}, flowNone, nil
 			}
 			res, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
@@ -371,7 +371,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if err != nil {
 				return Datum{}, flowNone, err
 			}
-			if cond.IsNull() || !cond.Bool {
+			if cond.IsNull() || !cond.BoolValue() {
 				return Datum{}, flowNone, nil
 			}
 		}
@@ -383,7 +383,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if err != nil {
 				return Datum{}, flowNone, err
 			}
-			if cond.IsNull() || !cond.Bool {
+			if cond.IsNull() || !cond.BoolValue() {
 				return Datum{}, flowNone, nil
 			}
 		}
@@ -561,8 +561,8 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		case KindInt:
 			return v, nil
 		case KindNumeric:
-			if v.NumericScale == 0 {
-				return Datum{Kind: KindInt, Int: v.NumericMantissa}, nil
+			if v.Scale == 0 {
+				return Datum{Kind: KindInt, Int: v.NumericMantissaValue()}, nil
 			}
 		}
 	case isNumericType(tn):
@@ -574,10 +574,10 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		}
 	case isTextTypeName(tn):
 		switch v.Kind {
-		case KindString:
+		case KindString, KindStringArena:
 			return v, nil
-		case KindBytes:
-			return Datum{Kind: KindString, String: string(v.Bytes)}, nil
+		case KindBytes, KindBytesArena:
+			return NewStringDatum(string(v.BytesValue())), nil
 		}
 	case isBoolTypeName(tn):
 		if v.Kind == KindBool {
@@ -607,9 +607,9 @@ func datumKindName(v Datum) string {
 		return "boolean"
 	case KindInt:
 		return "integer"
-	case KindString:
+	case KindString, KindStringArena:
 		return "text"
-	case KindBytes:
+	case KindBytes, KindBytesArena:
 		return "bytea"
 	case KindTime:
 		return "timestamp"

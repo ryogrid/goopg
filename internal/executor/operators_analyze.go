@@ -51,7 +51,7 @@ func (o *analyzeOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *analyzeOp) Next() (Row, error) {
+func (o *analyzeOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // makeStatsTable builds a *catalog.Table populated with the
@@ -38,7 +39,7 @@ func TestSelectivityEqualityHitsMCV(t *testing.T) {
 
 	scan := &SeqScan{Table: tbl}
 	pred := &BinaryOp{
-		Op:    "=",
+		Op: parser.OpEq,
 		Left:  &ColumnRef{Index: 0, Name: "label", Type: catalog.Type{Name: "text"}},
 		Right: &StringConst{Value: "F"},
 	}
@@ -66,7 +67,7 @@ func TestSelectivityEqualityFallsThroughMCV(t *testing.T) {
 
 	scan := &SeqScan{Table: tbl}
 	pred := &BinaryOp{
-		Op:    "=",
+		Op: parser.OpEq,
 		Left:  &ColumnRef{Index: 0, Name: "label", Type: catalog.Type{Name: "text"}},
 		Right: &StringConst{Value: "P"},
 	}
@@ -92,7 +93,7 @@ func TestSelectivityRangeUsesHistogram(t *testing.T) {
 
 	scan := &SeqScan{Table: tbl}
 	pred := &BinaryOp{
-		Op:    "<",
+		Op: parser.OpLt,
 		Left:  &ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
 		Right: &IntegerConst{Value: 200},
 	}
@@ -120,14 +121,14 @@ func TestSelectivityAndProductRule(t *testing.T) {
 
 	scan := &SeqScan{Table: tbl}
 	pred := &BinaryOp{
-		Op: "AND",
+		Op: parser.OpAnd,
 		Left: &BinaryOp{
-			Op:    "=",
+			Op: parser.OpEq,
 			Left:  &ColumnRef{Index: 0, Name: "label", Type: catalog.Type{Name: "text"}},
 			Right: &StringConst{Value: "F"},
 		},
 		Right: &BinaryOp{
-			Op:    "<",
+			Op: parser.OpLt,
 			Left:  &ColumnRef{Index: 1, Name: "id", Type: catalog.Type{Name: "int4"}},
 			Right: &IntegerConst{Value: 200},
 		},
@@ -155,14 +156,14 @@ func TestSelectivityOrInclusionExclusion(t *testing.T) {
 
 	scan := &SeqScan{Table: tbl}
 	pred := &BinaryOp{
-		Op: "OR",
+		Op: parser.OpOr,
 		Left: &BinaryOp{
-			Op:    "=",
+			Op: parser.OpEq,
 			Left:  &ColumnRef{Index: 0, Name: "label", Type: catalog.Type{Name: "text"}},
 			Right: &StringConst{Value: "F"},
 		},
 		Right: &BinaryOp{
-			Op:    "=",
+			Op: parser.OpEq,
 			Left:  &ColumnRef{Index: 0, Name: "label", Type: catalog.Type{Name: "text"}},
 			Right: &StringConst{Value: "O"},
 		},
@@ -186,7 +187,7 @@ func TestSelectivityFallsBackToOneThirdWhenNoStats(t *testing.T) {
 	}
 	scan := &SeqScan{Table: tbl}
 	pred := &BinaryOp{
-		Op:    "<",
+		Op: parser.OpLt,
 		Left:  &ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}},
 		Right: &IntegerConst{Value: 200},
 	}

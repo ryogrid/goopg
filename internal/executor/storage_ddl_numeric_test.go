@@ -34,9 +34,9 @@ func TestDDLCreateNumericBTreeIndexAcceptsType(t *testing.T) {
 	//   1.00 -> (100, 2)
 	//   2.5  -> (25, 1)
 	rows := []Row{
-		{{Kind: KindInt, Int: 1}, {Kind: KindNumeric, NumericMantissa: 10, NumericScale: 1}},
-		{{Kind: KindInt, Int: 2}, {Kind: KindNumeric, NumericMantissa: 25, NumericScale: 1}},
-		{{Kind: KindInt, Int: 3}, {Kind: KindNumeric, NumericMantissa: 7, NumericScale: 0}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindNumeric, Int: 10, Scale: 1}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindNumeric, Int: 25, Scale: 1}},
+		{{Kind: KindInt, Int: 3}, {Kind: KindNumeric, Int: 7, Scale: 0}},
 	}
 	for _, r := range rows {
 		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
@@ -83,10 +83,10 @@ func TestDDLNumericUniqueIndexCollapsesScales(t *testing.T) {
 	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "pk"})
 	rel := ctx.Catalog.RelFileNode(tbl)
 	// Insert 1.0 and 1.00 — numerically equal, textually different.
-	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindNumeric, NumericMantissa: 10, NumericScale: 1}}); err != nil {
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindNumeric, Int: 10, Scale: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindNumeric, NumericMantissa: 100, NumericScale: 2}}); err != nil {
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindNumeric, Int: 100, Scale: 2}}); err != nil {
 		t.Fatal(err)
 	}
 	err := runDDL(t, ctx, "CREATE UNIQUE INDEX idx_pk_n ON pk (n)")
@@ -123,7 +123,7 @@ func TestDDLNumericIndexSplitWithVariableLengthHighKey(t *testing.T) {
 	for i := 0; i < nRows; i++ {
 		// Vary mantissa magnitude (1..nRows) and scale (i%4) so the
 		// encoded byte length varies across rows.
-		row := Row{{Kind: KindNumeric, NumericMantissa: int64(i + 1), NumericScale: int16(i % 4)}}
+		row := Row{{Kind: KindNumeric, Int: int64(i + 1), Scale: int16(i % 4)}}
 		if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
 			t.Fatal(err)
 		}

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -27,7 +28,51 @@ func (e *ExecError) Error() string {
 // evalExpr resolves a planner expression against the input row.
 // Operators that produce no input pass nil for `row`; in that case
 // any ColumnRef resolution is an internal error.
+//
+// Thin wrapper over evalExprSlot — Row callers continue to work
+// unchanged. New slot-aware sites (NLI/MHJ predicate eval) call
+// evalExprSlot directly so VirtualSlot composition can read via
+// slot.Get(col) without materializing a Row per emitted match.
 func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
+	var slot SlotView
+	if row != nil {
+		slot = rowSlotView(row)
+	}
+	return evalExprSlot(e, slot, ctx)
+}
+
+// evalExprSlot is the slot-aware sibling of evalExpr. ColumnRef
+// reads via slot.Get(col); helpers that push ctx.OuterRows
+// (Subquery/In/Exists/Extract/FuncCall/CaseExpr) reach back to
+// Row via slotToRow — those paths are out of scope for the M0071
+// keystone refactor and stay on Row to limit blast radius.
+//
+// nil slot is permitted (mirrors the M0054 contract for valuesOp /
+// limitOp / DML operators that have no input row).
+//
+// M0074-0001: ColumnRef is the dominant case in Q5 (predicate +
+// projection refs over filtered lineitem rows). Hoisted to a
+// fast-path early-return ahead of the type switch — saves the
+// 12-arm type-test sequence on the hot path. evalExprSlot cum
+// CPU at M0073-final was 68.68 % cum; this hoist trims dispatch.
+func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
+	// Fast path: ColumnRef. M0074-0001 hoist.
+	if cref, ok := e.(*planner.ColumnRef); ok {
+		if slot == nil {
+			return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d on nil slot", cref.Name, cref.Index)}
+		}
+		if rs, ok := slot.(rowSlotView); ok {
+			if cref.Index < 0 || cref.Index >= len(rs) {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of range", cref.Name, cref.Index)}
+			}
+		}
+		if vs, ok := slot.(*VirtualSlot); ok {
+			if cref.Index < 0 || cref.Index >= vs.Width() {
+				return Datum{}, &ExecError{Code: "XX000", Pos: cref.Pos(), Message: fmt.Sprintf("column ref %s/%d out of VirtualSlot range %d (chained-NLI?)", cref.Name, cref.Index, vs.Width())}
+			}
+		}
+		return slot.Get(cref.Index), nil
+	}
 	switch x := e.(type) {
 	case *planner.OuterColumnRef:
 		// Look up the row from the lexical-scope stack pushed
@@ -37,25 +82,25 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		if idx < 0 || idx >= len(ctx.OuterRows) {
 			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/level=%d out of range (depth=%d)", x.Name, x.Level, len(ctx.OuterRows))}
 		}
-		row := ctx.OuterRows[idx]
-		if x.Index < 0 || x.Index >= len(row) {
-			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(row))}
+		outer := ctx.OuterRows[idx]
+		if x.Index < 0 || x.Index >= len(outer) {
+			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("outer column ref %s/idx=%d out of range (width=%d)", x.Name, x.Index, len(outer))}
 		}
-		return row[x.Index], nil
+		return outer[x.Index], nil
 	case *planner.CaseExpr:
-		return evalCaseExpr(x, row, ctx)
+		return evalCaseExpr(x, slotToRow(slot), ctx)
 	case *planner.SubqueryExpr:
-		return evalSubquery(x, row, ctx)
+		return evalSubquery(x, slotToRow(slot), ctx)
 	case *planner.InExpr:
-		return evalInExpr(x, row, ctx)
+		return evalInExpr(x, slotToRow(slot), ctx)
 	case *planner.ExistsExpr:
-		return evalExistsExpr(x, row, ctx)
+		return evalExistsExpr(x, slotToRow(slot), ctx)
 	case *planner.TypedStringLit:
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
 		return evalIntervalLit(x)
 	case *planner.ExtractExpr:
-		return evalExtract(x, row, ctx)
+		return evalExtract(x, slotToRow(slot), ctx)
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
 	case *planner.NumericConst:
@@ -65,64 +110,60 @@ func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 		}
 		return newNumeric(m, int(s)), nil
 	case *planner.StringConst:
-		return Datum{Kind: KindString, String: x.Value}, nil
+		return NewStringDatum(x.Value), nil
 	case *planner.NullConst:
 		return NullDatum, nil
 	case *planner.BooleanConst:
-		return Datum{Kind: KindBool, Bool: x.Value}, nil
+		return NewBoolDatum(x.Value), nil
 	case *planner.ParamRef:
 		if x.Number < 1 || x.Number > len(ctx.Params) {
 			return Datum{}, &ExecError{Code: "08P01", Pos: x.Pos(), Message: fmt.Sprintf("parameter $%d not bound", x.Number)}
 		}
 		return ctx.Params[x.Number-1], nil
-	case *planner.ColumnRef:
-		if row == nil || x.Index >= len(row) {
-			return Datum{}, &ExecError{Code: "XX000", Pos: x.Pos(), Message: fmt.Sprintf("column ref %s/%d out of range", x.Name, x.Index)}
-		}
-		return row[x.Index], nil
+	// ColumnRef handled by the M0074-0001 fast-path above.
 	case *planner.UnaryOp:
-		operand, err := evalExpr(x.Operand, row, ctx)
+		operand, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		return evalUnary(x.Op, operand, x.Pos())
 	case *planner.BinaryOp:
-		left, err := evalExpr(x.Left, row, ctx)
+		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
-		right, err := evalExpr(x.Right, row, ctx)
+		right, err := evalExprSlot(x.Right, slot, ctx)
 		if err != nil {
 			return Datum{}, err
 		}
 		return evalBinary(x.Op, left, right, x.Pos())
 	case *planner.FuncCall:
-		return evalFuncCall(x, row, ctx)
+		return evalFuncCall(x, slotToRow(slot), ctx)
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
 }
 
 // evalUnary handles -, +, NOT.
-func evalUnary(op string, d Datum, pos int) (Datum, error) {
+func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 	if d.IsNull() {
 		return NullDatum, nil
 	}
 	switch op {
-	case "-":
+	case parser.OpUnaryNeg:
 		if d.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary - requires integer"}
 		}
 		return Datum{Kind: KindInt, Int: -d.Int}, nil
-	case "+":
+	case parser.OpUnaryPos:
 		if d.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary + requires integer"}
 		}
 		return d, nil
-	case "NOT":
+	case parser.OpNot:
 		if d.Kind != KindBool {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator NOT requires boolean"}
 		}
-		return Datum{Kind: KindBool, Bool: !d.Bool}, nil
+		return NewBoolDatum(!d.BoolValue()), nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown unary operator %s", op)}
 }
@@ -130,18 +171,20 @@ func evalUnary(op string, d Datum, pos int) (Datum, error) {
 // evalBinary handles arithmetic, comparison, and boolean operators.
 // SQL three-valued logic: NULL operand on most operators yields NULL;
 // AND/OR follow Kleene's rules.
-func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
-	switch op {
-	case "AND":
-		return evalAnd(left, right), nil
-	case "OR":
-		return evalOr(left, right), nil
+func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+	if op.IsBoolean() {
+		switch op {
+		case parser.OpAnd:
+			return evalAnd(left, right), nil
+		case parser.OpOr:
+			return evalOr(left, right), nil
+		}
 	}
 	if left.IsNull() || right.IsNull() {
 		return NullDatum, nil
 	}
 	switch op {
-	case "+", "-":
+	case parser.OpAdd, parser.OpSub:
 		// timestamp/date ± interval and interval + timestamp/date
 		// route through the time-arithmetic path before falling
 		// back to integer arithmetic. v0 doesn't support
@@ -149,9 +192,9 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		// timestamp - timestamp (returns interval upstream;
 		// scope-deferred until the type system).
 		if left.Kind == KindTime && right.Kind == KindInterval {
-			return addTimeInterval(left, right, op == "-"), nil
+			return addTimeInterval(left, right, op == parser.OpSub), nil
 		}
-		if op == "+" && left.Kind == KindInterval && right.Kind == KindTime {
+		if op == parser.OpAdd && left.Kind == KindInterval && right.Kind == KindTime {
 			return addTimeInterval(right, left, false), nil
 		}
 		// NUMERIC ± NUMERIC, NUMERIC ± INT, INT ± NUMERIC: promote
@@ -159,13 +202,13 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 		// scale-aligning helpers.  Also try to parse string
 		// operands as numeric (columns loaded via INSERT may be
 		// stored as strings before the type system enforces types).
-		if left.Kind == KindString {
-			if m, s, err := parseNumeric(left.String); err == nil {
+		if (left.Kind == KindString || left.Kind == KindStringArena) {
+			if m, s, err := parseNumeric(left.StringValue()); err == nil {
 				left = newNumeric(m, int(s))
 			}
 		}
-		if right.Kind == KindString {
-			if m, s, err := parseNumeric(right.String); err == nil {
+		if (right.Kind == KindString || right.Kind == KindStringArena) {
+			if m, s, err := parseNumeric(right.StringValue()); err == nil {
 				right = newNumeric(m, int(s))
 			}
 		}
@@ -174,22 +217,22 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 			if err != nil {
 				return Datum{}, err
 			}
-			if op == "+" {
+			if op == parser.OpAdd {
 				return numericAdd(a, b)
 			}
 			return numericSub(a, b)
 		}
 		fallthrough
-	case "*", "/", "%":
+	case parser.OpMul, parser.OpDiv, parser.OpMod:
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
 				return Datum{}, err
 			}
 			switch op {
-			case "*":
+			case parser.OpMul:
 				return numericMul(a, b)
-			case "/":
+			case parser.OpDiv:
 				return numericDiv(a, b, pos)
 			}
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s not supported on numeric", op)}
@@ -198,18 +241,18 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
-	case "||":
-		if left.Kind != KindString || right.Kind != KindString {
+	case parser.OpConcat:
+		if (left.Kind != KindString && left.Kind != KindStringArena) || (right.Kind != KindString && right.Kind != KindStringArena) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
 		}
-		return Datum{Kind: KindString, String: left.String + right.String}, nil
-	case "=", "<", ">", "<=", ">=", "<>", "!=":
+		return NewStringDatum(left.StringValue() + right.StringValue()), nil
+	case parser.OpEq, parser.OpLt, parser.OpGt, parser.OpLe, parser.OpGe, parser.OpNe:
 		cmp, err := compareDatum(left, right, pos)
 		if err != nil {
 			return Datum{}, err
 		}
-		return Datum{Kind: KindBool, Bool: cmpResult(op, cmp)}, nil
-	case "LIKE", "NOT LIKE":
+		return NewBoolDatum(cmpResult(op, cmp)), nil
+	case parser.OpLike, parser.OpNotLike:
 		// M0062-followup: accept KindBytes operands as UTF-8 text so a
 		// varchar that arrives as bytes (e.g. via a row-reshaping path
 		// that drops Kind) still evaluates correctly. Mirrors
@@ -224,10 +267,10 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands (got left.Kind=%d right.Kind=%d)", op, left.Kind, right.Kind)}
 		}
 		matched := matchSQLLike(ls, rs)
-		if op == "NOT LIKE" {
+		if op == parser.OpNotLike {
 			matched = !matched
 		}
-		return Datum{Kind: KindBool, Bool: matched}, nil
+		return NewBoolDatum(matched), nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
 }
@@ -239,10 +282,10 @@ func evalBinary(op string, left, right Datum, pos int) (Datum, error) {
 // data.
 func datumAsString(d Datum) (string, bool) {
 	switch d.Kind {
-	case KindString:
-		return d.String, true
-	case KindBytes:
-		return string(d.Bytes), true
+	case KindString, KindStringArena:
+		return d.StringValue(), true
+	case KindBytes, KindBytesArena:
+		return string(d.BytesValue()), true
 	}
 	return "", false
 }
@@ -305,30 +348,30 @@ func matchSQLLike(s, pat string) bool {
 // the way upstream PG does for `timestamp + interval '1 month'`);
 // days are added via the same call.
 func addTimeInterval(t, iv Datum, subtract bool) Datum {
-	months := int(iv.IntervalMonths)
-	days := int(iv.IntervalDays)
+	months := int(iv.IntervalMonthsValue())
+	days := int(iv.IntervalDaysValue())
 	if subtract {
 		months = -months
 		days = -days
 	}
-	return Datum{Kind: KindTime, Time: t.Time.AddDate(0, months, days)}
+	return NewTimeDatum(t.TimeValue().AddDate(0, months, days))
 }
 
-func arithmetic(op string, a, b int64, pos int) (Datum, error) {
+func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 	var r int64
 	switch op {
-	case "+":
+	case parser.OpAdd:
 		r = a + b
-	case "-":
+	case parser.OpSub:
 		r = a - b
-	case "*":
+	case parser.OpMul:
 		r = a * b
-	case "/":
+	case parser.OpDiv:
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 		}
 		r = a / b
-	case "%":
+	case parser.OpMod:
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 		}
@@ -346,11 +389,15 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 	if a.Kind == b.Kind {
 		return a, b
 	}
-	// One side is KindString — try to parse it as the other's type.
-	if a.Kind == KindString && b.Kind != KindString {
-		a = tryParseStringAs(b.Kind, a.String)
-	} else if b.Kind == KindString && a.Kind != KindString {
-		b = tryParseStringAs(a.Kind, b.String)
+	// M0073-0001: treat KindString / KindStringArena uniformly
+	// as "string" for the cross-kind parse-and-compare path.
+	aIsString := a.Kind == KindString || a.Kind == KindStringArena
+	bIsString := b.Kind == KindString || b.Kind == KindStringArena
+	// One side is string — try to parse it as the other's type.
+	if aIsString && !bIsString {
+		a = tryParseStringAs(b.Kind, a.StringValue())
+	} else if bIsString && !aIsString {
+		b = tryParseStringAs(a.Kind, b.StringValue())
 	}
 	// KindInterval has no text parse path yet — leave as-is so
 	// the caller still errors instead of silently producing an
@@ -374,10 +421,10 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 		}
 	case KindTime:
 		if t, err := parseCopyTimestamp(s); err == nil {
-			return Datum{Kind: KindTime, Time: t}
+			return NewTimeDatum(t)
 		}
 	}
-	return Datum{Kind: KindString, String: s}
+	return NewStringDatum(s)
 }
 
 // compareDatum returns -1/0/1 the same way upstream's btree
@@ -406,6 +453,21 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		return numericCmp(a, b)
 	}
 	if a.Kind != b.Kind {
+		// M0073-0001: arena and non-arena string/bytes Datums
+		// are logically the same Kind for comparison purposes.
+		// Treat KindString ↔ KindStringArena and KindBytes ↔
+		// KindBytesArena as same-kind so the per-kind switch
+		// below dispatches correctly.
+		aIsString := a.Kind == KindString || a.Kind == KindStringArena
+		bIsString := b.Kind == KindString || b.Kind == KindStringArena
+		if aIsString && bIsString {
+			return strings.Compare(a.StringValue(), b.StringValue()), nil
+		}
+		aIsBytes := a.Kind == KindBytes || a.Kind == KindBytesArena
+		bIsBytes := b.Kind == KindBytes || b.Kind == KindBytesArena
+		if aIsBytes && bIsBytes {
+			return strings.Compare(string(a.BytesValue()), string(b.BytesValue())), nil
+		}
 		// Fall back to string comparison so planner-side column
 		// misalignments don't crash the entire query.  The result
 		// may not be PostgreSQL-correct, but the query completes.
@@ -422,19 +484,19 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		return 0, nil
 	case KindBool:
 		switch {
-		case !a.Bool && b.Bool:
+		case !a.BoolValue() && b.BoolValue():
 			return -1, nil
-		case a.Bool && !b.Bool:
+		case a.BoolValue() && !b.BoolValue():
 			return 1, nil
 		}
 		return 0, nil
-	case KindString:
-		return strings.Compare(a.String, b.String), nil
+	case KindString, KindStringArena:
+		return strings.Compare(a.StringValue(), b.StringValue()), nil
 	case KindTime:
 		switch {
-		case a.Time.Before(b.Time):
+		case a.TimeValue().Before(b.TimeValue()):
 			return -1, nil
-		case a.Time.After(b.Time):
+		case a.TimeValue().After(b.TimeValue()):
 			return 1, nil
 		}
 		return 0, nil
@@ -442,19 +504,19 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 	return 0, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("comparison not supported for kind %d", a.Kind)}
 }
 
-func cmpResult(op string, cmp int) bool {
+func cmpResult(op parser.OpCode, cmp int) bool {
 	switch op {
-	case "=":
+	case parser.OpEq:
 		return cmp == 0
-	case "<>", "!=":
+	case parser.OpNe:
 		return cmp != 0
-	case "<":
+	case parser.OpLt:
 		return cmp < 0
-	case "<=":
+	case parser.OpLe:
 		return cmp <= 0
-	case ">":
+	case parser.OpGt:
 		return cmp > 0
-	case ">=":
+	case parser.OpGe:
 		return cmp >= 0
 	}
 	return false
@@ -462,29 +524,29 @@ func cmpResult(op string, cmp int) bool {
 
 // evalAnd / evalOr implement Kleene three-valued logic.
 func evalAnd(a, b Datum) Datum {
-	if !a.IsNull() && a.Kind == KindBool && !a.Bool {
-		return Datum{Kind: KindBool, Bool: false}
+	if !a.IsNull() && a.Kind == KindBool && !a.BoolValue() {
+		return NewBoolDatum(false)
 	}
-	if !b.IsNull() && b.Kind == KindBool && !b.Bool {
-		return Datum{Kind: KindBool, Bool: false}
+	if !b.IsNull() && b.Kind == KindBool && !b.BoolValue() {
+		return NewBoolDatum(false)
 	}
 	if a.IsNull() || b.IsNull() {
 		return NullDatum
 	}
-	return Datum{Kind: KindBool, Bool: a.Bool && b.Bool}
+	return NewBoolDatum(a.BoolValue() && b.BoolValue())
 }
 
 func evalOr(a, b Datum) Datum {
-	if !a.IsNull() && a.Kind == KindBool && a.Bool {
-		return Datum{Kind: KindBool, Bool: true}
+	if !a.IsNull() && a.Kind == KindBool && a.BoolValue() {
+		return NewBoolDatum(true)
 	}
-	if !b.IsNull() && b.Kind == KindBool && b.Bool {
-		return Datum{Kind: KindBool, Bool: true}
+	if !b.IsNull() && b.Kind == KindBool && b.BoolValue() {
+		return NewBoolDatum(true)
 	}
 	if a.IsNull() || b.IsNull() {
 		return NullDatum
 	}
-	return Datum{Kind: KindBool, Bool: a.Bool || b.Bool}
+	return NewBoolDatum(a.BoolValue() || b.BoolValue())
 }
 
 // evalTypedStringLit parses the body of a `<type> 'value'`
@@ -497,7 +559,7 @@ func evalOr(a, b Datum) Datum {
 // showed `time.parse` at 10.5 % cumulative CPU pre-cache.
 func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 	if x.CacheValid {
-		return Datum{Kind: KindTime, Time: x.CachedTime}, nil
+		return NewTimeDatum(x.CachedTime), nil
 	}
 	switch x.Type {
 	case "date":
@@ -507,7 +569,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
-		return Datum{Kind: KindTime, Time: x.CachedTime}, nil
+		return NewTimeDatum(x.CachedTime), nil
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
@@ -517,7 +579,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 			if t, err := time.Parse(layout, x.Value); err == nil {
 				x.CachedTime = t.UTC()
 				x.CacheValid = true
-				return Datum{Kind: KindTime, Time: x.CachedTime}, nil
+				return NewTimeDatum(x.CachedTime), nil
 			}
 		}
 		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
@@ -542,15 +604,15 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		// Try to parse a string as timestamp (planner may assign
 		// string storage for date columns loaded via INSERT).
 		if src.Kind == KindString {
-			if t, err := parseCopyTimestamp(src.String); err == nil {
-				src = Datum{Kind: KindTime, Time: t}
+			if t, err := parseCopyTimestamp(src.StringValue()); err == nil {
+				src = NewTimeDatum(t)
 			}
 		}
 	}
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT(%s FROM …) requires timestamp/date input", x.Field)}
 	}
-	n, err := extractTimestampField(x.Field, src.Time, x.Pos())
+	n, err := extractTimestampField(x.Field, src.TimeValue(), x.Pos())
 	if err != nil {
 		return Datum{}, err
 	}
@@ -613,7 +675,7 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part second argument must be timestamp/date"}
 	}
-	n, err := extractTimestampField(fieldArg.String, src.Time, x.Pos())
+	n, err := extractTimestampField(fieldArg.StringValue(), src.TimeValue(), x.Pos())
 	if err != nil {
 		return Datum{}, err
 	}
@@ -640,18 +702,16 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 		x.CachedN = n
 		x.CacheValid = true
 	}
-	d := Datum{Kind: KindInterval}
 	switch x.Unit {
 	case "day":
-		d.IntervalDays = n
+		return NewIntervalDatum(0, n), nil
 	case "month":
-		d.IntervalMonths = n
+		return NewIntervalDatum(n, 0), nil
 	case "year":
-		d.IntervalMonths = n * 12
+		return NewIntervalDatum(n*12, 0), nil
 	default:
 		return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("interval unit %q is not supported in v0", x.Unit)}
 	}
-	return d, nil
 }
 
 // evalInExpr evaluates `expr [NOT] IN (subquery | val_list)`.
@@ -691,14 +751,14 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
-		if eq.Kind == KindBool && eq.Bool {
-			return Datum{Kind: KindBool, Bool: !x.Negated}, nil
+		if eq.Kind == KindBool && eq.BoolValue() {
+			return NewBoolDatum(!x.Negated), nil
 		}
 	}
 	if sawNull {
 		return NullDatum, nil
 	}
-	return Datum{Kind: KindBool, Bool: x.Negated}, nil
+	return NewBoolDatum(x.Negated), nil
 }
 
 // collectInValues returns the inner set for `IN (...)`. When
@@ -752,13 +812,14 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		defer func() { _ = op.Close() }()
 		var out []Datum
 		for {
-			r, err := op.Next()
+			slot, err := op.Next()
 			if err == EOF {
 				break
 			}
 			if err != nil {
 				return nil, err
 			}
+			r := slotRow(slot)
 			if len(r) != 1 {
 				return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("subquery used as IN argument returned %d columns, expected 1", len(r))}
 			}
@@ -846,7 +907,7 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 	if err != nil && err != EOF {
 		return Datum{}, err
 	}
-	return Datum{Kind: KindBool, Bool: hasRow != x.Negated}, nil
+	return NewBoolDatum(hasRow != x.Negated), nil
 }
 
 // evalSubquery runs the inner plan inside a SubqueryExpr and
@@ -909,13 +970,14 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	defer func() { _ = op.Close() }()
-	row, err := op.Next()
+	slot, err := op.Next()
 	if err == EOF {
 		return NullDatum, nil
 	}
 	if err != nil {
 		return Datum{}, err
 	}
+	row := slotRow(slot)
 	if len(row) != 1 {
 		return Datum{}, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("scalar subquery returned %d columns, expected 1", len(row))}
 	}
@@ -958,9 +1020,9 @@ func evalCaseExpr(x *planner.CaseExpr, row Row, ctx *Context) (Datum, error) {
 			if err != nil {
 				return Datum{}, err
 			}
-			matched = eq.Kind == KindBool && eq.Bool
+			matched = eq.Kind == KindBool && eq.BoolValue()
 		} else {
-			matched = whenVal.Kind == KindBool && whenVal.Bool
+			matched = whenVal.Kind == KindBool && whenVal.BoolValue()
 		}
 		if matched {
 			return evalExpr(w.Then, row, ctx)
@@ -992,25 +1054,31 @@ func compareEq(a, b Datum) (Datum, error) {
 		// the error and report not-equal.
 		cmp, err := compareDatum(a, b, 0)
 		if err != nil {
-			return Datum{Kind: KindBool, Bool: false}, nil
+			return NewBoolDatum(false), nil
 		}
-		return Datum{Kind: KindBool, Bool: cmp == 0}, nil
+		return NewBoolDatum(cmp == 0), nil
 	}
+	// M0073-0001: treat KindString and KindStringArena as
+	// equivalent for equality (likewise KindBytes /
+	// KindBytesArena). The arena variant is a storage detail;
+	// the logical Kind is "string" / "bytes".
+	aIsString := a.Kind == KindString || a.Kind == KindStringArena
+	bIsString := b.Kind == KindString || b.Kind == KindStringArena
 	switch {
 	case a.Kind == KindInt && b.Kind == KindInt:
-		return Datum{Kind: KindBool, Bool: a.Int == b.Int}, nil
+		return NewBoolDatum(a.Int == b.Int), nil
 	case a.Kind == KindBool && b.Kind == KindBool:
-		return Datum{Kind: KindBool, Bool: a.Bool == b.Bool}, nil
-	case a.Kind == KindString && b.Kind == KindString:
-		return Datum{Kind: KindBool, Bool: a.String == b.String}, nil
+		return NewBoolDatum(a.BoolValue() == b.BoolValue()), nil
+	case aIsString && bIsString:
+		return NewBoolDatum(a.StringValue() == b.StringValue()), nil
 	case a.Kind == KindTime && b.Kind == KindTime:
-		return Datum{Kind: KindBool, Bool: a.Time.Equal(b.Time)}, nil
-	case a.Kind == KindInt && b.Kind == KindString:
-		return Datum{Kind: KindBool, Bool: fmt.Sprintf("%d", a.Int) == b.String}, nil
-	case a.Kind == KindString && b.Kind == KindInt:
-		return Datum{Kind: KindBool, Bool: a.String == fmt.Sprintf("%d", b.Int)}, nil
+		return NewBoolDatum(a.TimeValue().Equal(b.TimeValue())), nil
+	case a.Kind == KindInt && bIsString:
+		return NewBoolDatum(fmt.Sprintf("%d", a.Int) == b.StringValue()), nil
+	case aIsString && b.Kind == KindInt:
+		return NewBoolDatum(a.StringValue() == fmt.Sprintf("%d", b.Int)), nil
 	}
-	return Datum{Kind: KindBool, Bool: false}, nil
+	return NewBoolDatum(false), nil
 }
 
 // evalFuncCall resolves a function name against the in-tree registry.
@@ -1021,10 +1089,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	name := strings.ToLower(x.Name)
 	switch name {
 	case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
-		return Datum{Kind: KindTime, Time: ctx.Now}, nil
+		return NewTimeDatum(ctx.Now), nil
 	case "current_date":
 		t := ctx.Now
-		return Datum{Kind: KindTime, Time: t.Truncate(24 * 60 * 60 * 1e9)}, nil
+		return NewTimeDatum(t.Truncate(24 * 60 * 60 * 1e9)), nil
 	case "pg_sleep":
 		return evalPgSleep(x, row, ctx)
 	case "to_timestamp":
@@ -1061,17 +1129,17 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString || fmtArg.Kind != KindString {
+	if (src.Kind != KindString && src.Kind != KindStringArena) || (fmtArg.Kind != KindString && fmtArg.Kind != KindStringArena) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date arguments must be text"}
 	}
-	goLayout := pgFormatToGoLayout(fmtArg.String)
-	t, perr := time.Parse(goLayout, src.String)
+	goLayout := pgFormatToGoLayout(fmtArg.StringValue())
+	t, perr := time.Parse(goLayout, src.StringValue())
 	if perr != nil {
-		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_date: %v (format=%q value=%q)", perr, fmtArg.String, src.String)}
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_date: %v (format=%q value=%q)", perr, fmtArg.StringValue(), src.StringValue())}
 	}
 	year, month, day := t.UTC().Date()
 	out := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
-	return Datum{Kind: KindTime, Time: out}, nil
+	return NewTimeDatum(out), nil
 }
 
 // evalSubstr implements PostgreSQL's `substr(string, from [, count])`
@@ -1141,13 +1209,13 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() || fromArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString {
+	if src.Kind != KindString && src.Kind != KindStringArena {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
 	}
 	if fromArg.Kind != KindInt {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr second argument must be integer"}
 	}
-	s := src.String
+	s := src.StringValue()
 	from := fromArg.Int
 	// Upstream's text_substring: 1-based start, treat values <=0 as
 	// shifting the window left of the string. With no length, the
@@ -1159,9 +1227,9 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		idx := int(from) - 1
 		if idx >= len(s) {
-			return Datum{Kind: KindString, String: ""}, nil
+			return NewStringDatum(""), nil
 		}
-		return Datum{Kind: KindString, String: s[idx:]}, nil
+		return NewStringDatum(s[idx:]), nil
 	}
 	cntArg, err := evalExpr(x.Args[2], row, ctx)
 	if err != nil {
@@ -1187,12 +1255,12 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		endIdx = startIdx
 	}
 	if startIdx >= len(s) {
-		return Datum{Kind: KindString, String: ""}, nil
+		return NewStringDatum(""), nil
 	}
 	if endIdx > len(s) {
 		endIdx = len(s)
 	}
-	return Datum{Kind: KindString, String: s[startIdx:endIdx]}, nil
+	return NewStringDatum(s[startIdx:endIdx]), nil
 }
 
 // evalToTimestamp implements PostgreSQL's `to_timestamp(text,
@@ -1217,15 +1285,15 @@ func evalToTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) 
 	if src.IsNull() || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString || fmtArg.Kind != KindString {
+	if (src.Kind != KindString && src.Kind != KindStringArena) || (fmtArg.Kind != KindString && fmtArg.Kind != KindStringArena) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp arguments must be text"}
 	}
-	goLayout := pgFormatToGoLayout(fmtArg.String)
-	t, perr := time.Parse(goLayout, src.String)
+	goLayout := pgFormatToGoLayout(fmtArg.StringValue())
+	t, perr := time.Parse(goLayout, src.StringValue())
 	if perr != nil {
-		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_timestamp: %v (format=%q value=%q)", perr, fmtArg.String, src.String)}
+		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("to_timestamp: %v (format=%q value=%q)", perr, fmtArg.StringValue(), src.StringValue())}
 	}
-	return Datum{Kind: KindTime, Time: t.UTC()}, nil
+	return NewTimeDatum(t.UTC()), nil
 }
 
 // pgFormatToGoLayout translates a v0 subset of upstream PG's

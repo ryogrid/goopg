@@ -117,13 +117,13 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *indexOnlyScanOp) Next() (Row, error) {
+func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return r, nil
+	return asSlot(o.Schema(), r), nil
 }
 
 func (o *indexOnlyScanOp) Close() error {
@@ -187,7 +187,7 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 		if err != nil {
 			return NullDatum, err
 		}
-		return Datum{Kind: KindString, String: string(b)}, nil
+		return NewStringDatum(string(b)), nil
 
 	case isTimestampType(typeName):
 		v, err := btree.DecodeTimestamp(key)
@@ -195,7 +195,7 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 			return NullDatum, err
 		}
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
-		return Datum{Kind: KindTime, Time: ts}, nil
+		return NewTimeDatum(ts), nil
 
 	default:
 		return NullDatum, fmt.Errorf("index-only scan: unsupported key type %q for key decode", typeName)

@@ -132,7 +132,7 @@ func (o *upsertOp) Open(ctx *Context) error {
 
 func (o *upsertOp) Close() error { return o.child.Close() }
 
-func (o *upsertOp) Next() (Row, error) {
+func (o *upsertOp) Next() (TupleSlot, error) {
 	if o.done {
 		return nil, EOF
 	}
@@ -140,13 +140,14 @@ func (o *upsertOp) Next() (Row, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
 	for {
-		src, err := o.child.Next()
+		srcSlot, err := o.child.Next()
 		if err == EOF {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
+		src := slotRow(srcSlot)
 		// Reorder source row → target column order via plan.ColumnIndex.
 		inserted := make(Row, len(cols))
 		for i := range cols {
@@ -329,7 +330,7 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		if v.IsNull() || v.Kind != KindBool || !v.Bool {
+		if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
 			return nil, true, nil
 		}
 	}

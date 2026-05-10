@@ -49,7 +49,7 @@ func TestParseSelectPgbenchSelectOnly(t *testing.T) {
 		t.Fatalf("from=%+v", s.From)
 	}
 	bo, ok := s.Where.(*BinaryOp)
-	if !ok || bo.Op != "=" {
+	if !ok || bo.Op != OpEq {
 		t.Fatalf("where=%+v", s.Where)
 	}
 	if l, ok := bo.Left.(*ColumnRef); !ok || l.Column != "aid" {
@@ -158,7 +158,7 @@ func TestParseSelectGroupByHaving(t *testing.T) {
 		t.Errorf("groupBy[0]=%+v", s.GroupBy[0])
 	}
 	h, ok := s.Having.(*BinaryOp)
-	if !ok || h.Op != ">" {
+	if !ok || h.Op != OpGt {
 		t.Fatalf("having=%+v", s.Having)
 	}
 }
@@ -263,9 +263,9 @@ func exprString(e Expr) string {
 		}
 		return s + x.Column
 	case *BinaryOp:
-		return "(" + exprString(x.Left) + " " + x.Op + " " + exprString(x.Right) + ")"
+		return "(" + exprString(x.Left) + " " + x.Op.String() + " " + exprString(x.Right) + ")"
 	case *UnaryOp:
-		return "(" + x.Op + " " + exprString(x.Operand) + ")"
+		return "(" + x.Op.String() + " " + exprString(x.Operand) + ")"
 	case *FuncCall:
 		args := ""
 		if x.Star {

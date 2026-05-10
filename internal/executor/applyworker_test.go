@@ -110,8 +110,8 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	if rows[0][0].Int != 7 {
 		t.Errorf("col[0]=%v want 7", rows[0][0])
 	}
-	if rows[0][1].String != "alpha" {
-		t.Errorf("col[1]=%q want alpha", rows[0][1].String)
+	if rows[0][1].StringValue() != "alpha" {
+		t.Errorf("col[1]=%q want alpha", rows[0][1].StringValue())
 	}
 }
 

@@ -22,9 +22,9 @@ func TestDecodeRowProjectionSkipsNonKept(t *testing.T) {
 	}
 	row := Row{
 		{Kind: KindInt, Int: 42},
-		{Kind: KindString, String: strings.Repeat("X", 30)},
+		NewStringDatum(strings.Repeat("X", 30)),
 		{Kind: KindInt, Int: 99},
-		{Kind: KindString, String: strings.Repeat("Y", 100)},
+		NewStringDatum(strings.Repeat("Y", 100)),
 	}
 	encoded, err := EncodeRow(cols, row)
 	if err != nil {
@@ -46,11 +46,11 @@ func TestDecodeRowProjectionSkipsNonKept(t *testing.T) {
 	}
 	// Non-kept columns must have empty/null payload (NullDatum is
 	// the marker — caller must not read these slots).
-	if dst[1].Kind == KindString && dst[1].String != "" {
-		t.Errorf("dst[1] (name): unexpectedly materialised payload %q", dst[1].String)
+	if dst[1].Kind == KindString && dst[1].StringValue() != "" {
+		t.Errorf("dst[1] (name): unexpectedly materialised payload %q", dst[1].StringValue())
 	}
-	if dst[3].Kind == KindString && dst[3].String != "" {
-		t.Errorf("dst[3] (comment): unexpectedly materialised payload %q", dst[3].String)
+	if dst[3].Kind == KindString && dst[3].StringValue() != "" {
+		t.Errorf("dst[3] (comment): unexpectedly materialised payload %q", dst[3].StringValue())
 	}
 
 	// Sanity: full DecodeRow recovers all columns. Confirms the
@@ -59,11 +59,11 @@ func TestDecodeRowProjectionSkipsNonKept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if full[1].String != strings.Repeat("X", 30) {
-		t.Errorf("full[1]: got %q, want X*30", full[1].String)
+	if full[1].StringValue() != strings.Repeat("X", 30) {
+		t.Errorf("full[1]: got %q, want X*30", full[1].StringValue())
 	}
-	if full[3].String != strings.Repeat("Y", 100) {
-		t.Errorf("full[3]: got %q, want Y*100", full[3].String)
+	if full[3].StringValue() != strings.Repeat("Y", 100) {
+		t.Errorf("full[3]: got %q, want Y*100", full[3].StringValue())
 	}
 }
 
@@ -82,7 +82,7 @@ func TestDecodeRowProjectionAllKeptMatchesDecodeRow(t *testing.T) {
 	// to KindNumeric. Avoids depending on a numeric-test helper.
 	row := Row{
 		{Kind: KindInt, Int: 7},
-		{Kind: KindString, String: "hello"},
+		NewStringDatum("hello"),
 		{Kind: KindInt, Int: 314},
 	}
 	encoded, err := EncodeRow(cols, row)
@@ -106,7 +106,7 @@ func TestDecodeRowProjectionAllKeptMatchesDecodeRow(t *testing.T) {
 	if dstProj[0].Int != dstFull[0].Int {
 		t.Errorf("a int: proj=%d full=%d", dstProj[0].Int, dstFull[0].Int)
 	}
-	if dstProj[1].String != dstFull[1].String {
-		t.Errorf("b string: proj=%q full=%q", dstProj[1].String, dstFull[1].String)
+	if dstProj[1].StringValue() != dstFull[1].StringValue() {
+		t.Errorf("b string: proj=%q full=%q", dstProj[1].StringValue(), dstFull[1].StringValue())
 	}
 }

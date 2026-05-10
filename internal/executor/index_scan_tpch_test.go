@@ -36,7 +36,7 @@ func newTpchTypeFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 	for i, ptype := range []string{"ECONOMY ANODIZED BRASS", "PROMO BRUSHED STEEL", "STANDARD ANODIZED TIN"} {
 		if err := writeHeapRow(ctx, ctx.Catalog.RelFileNode(partTbl), partTbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindString, String: ptype},
+			NewStringDatum(ptype),
 		}); err != nil {
 			cleanup()
 			t.Fatal(err)
@@ -48,7 +48,7 @@ func newTpchTypeFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 	for i, seg := range []string{"FURNITURE", "HOUSEHOLD", "MACHINERY"} {
 		if err := writeHeapRow(ctx, ctx.Catalog.RelFileNode(custTbl), custTbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindString, String: seg},
+			NewStringDatum(seg),
 		}); err != nil {
 			cleanup()
 			t.Fatal(err)
@@ -65,7 +65,7 @@ func newTpchTypeFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 	for i, d := range dates {
 		if err := writeHeapRow(ctx, ctx.Catalog.RelFileNode(litemTbl), litemTbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindTime, Time: d},
+			NewTimeDatum(d),
 		}); err != nil {
 			cleanup()
 			t.Fatal(err)
@@ -102,7 +102,7 @@ func TestIndexScanVarcharEndToEnd(t *testing.T) {
 	for i, ptype := range []string{"ECONOMY ANODIZED BRASS", "PROMO BRUSHED STEEL", "STANDARD ANODIZED TIN"} {
 		if err := writeHeapRow(ctx, rel, partTbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindString, String: ptype},
+			NewStringDatum(ptype),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +155,7 @@ func TestIndexScanCharEndToEnd(t *testing.T) {
 	for i, seg := range []string{"AUTOMOBILE", "FURNITURE", "MACHINERY"} {
 		if err := writeHeapRow(ctx, rel, custTbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindString, String: seg},
+			NewStringDatum(seg),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -212,7 +212,7 @@ func TestIndexScanTimestampEndToEnd(t *testing.T) {
 	for i, d := range dates {
 		if err := writeHeapRow(ctx, rel, litemTbl.Columns, Row{
 			{Kind: KindInt, Int: int64(i + 1)},
-			{Kind: KindTime, Time: d},
+			NewTimeDatum(d),
 		}); err != nil {
 			t.Fatal(err)
 		}

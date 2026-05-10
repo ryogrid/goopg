@@ -100,7 +100,7 @@ func injectLikeRangePredicates(where parser.Expr) parser.Expr {
 
 	for _, conj := range conjuncts {
 		b, ok := conj.(*parser.BinaryOp)
-		if !ok || b.Op != "LIKE" {
+		if !ok || b.Op != parser.OpLike {
 			continue
 		}
 		colRef, ok := b.Left.(*parser.ColumnRef)
@@ -121,13 +121,13 @@ func injectLikeRangePredicates(where parser.Expr) parser.Expr {
 		// it additionally rejects 'foob', 'fooz', etc. The range narrows
 		// the B-tree scan so the executor reads only the candidate rows.
 		extra = append(extra, &parser.BinaryOp{
-			Op:    ">=",
+			Op:    parser.OpGe,
 			Left:  colRef,
 			Right: &parser.StringConst{Value: prefix},
 		})
 		if succ, ok := IncrementString(prefix); ok {
 			extra = append(extra, &parser.BinaryOp{
-				Op:    "<",
+				Op:    parser.OpLt,
 				Left:  colRef,
 				Right: &parser.StringConst{Value: succ},
 			})
@@ -140,7 +140,7 @@ func injectLikeRangePredicates(where parser.Expr) parser.Expr {
 	// Reconstruct: original WHERE AND (all extra predicates).
 	result := where
 	for _, e := range extra {
-		result = &parser.BinaryOp{Op: "AND", Left: result, Right: e}
+		result = &parser.BinaryOp{Op: parser.OpAnd, Left: result, Right: e}
 	}
 	return result
 }

@@ -637,7 +637,7 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
-				left = &BinaryOp{pos: pos, Op: "LIKE", Left: left, Right: rhs}
+				left = &BinaryOp{pos: pos, Op: OpLike, Left: left, Right: rhs}
 				continue
 			}
 			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
@@ -649,7 +649,7 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if err != nil {
 					return nil, err
 				}
-				left = &BinaryOp{pos: pos, Op: "NOT LIKE", Left: left, Right: rhs}
+				left = &BinaryOp{pos: pos, Op: OpNotLike, Left: left, Right: rhs}
 				continue
 			}
 			// `expr [NOT] BETWEEN low AND high` desugars to
@@ -769,58 +769,85 @@ func (p *parser) consumeTypeIdent() (string, error) {
 	return "", p.errAtCur("expected type name")
 }
 
-// peekBinaryOp returns the operator text and precedence of the current
+// peekBinaryOp returns the OpCode and precedence of the current
 // token if it can extend an expression as a left-associative binary
 // operator. Returns ok=false when the current token can't.
-func (p *parser) peekBinaryOp() (string, int, bool) {
+//
+// M0073-0003: returns OpCode (was string) so the construction site
+// at parseExprPrec can build BinaryOp without re-parsing the token
+// text.
+func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 	t := p.cur()
 	switch t.Kind {
 	case TokenOperator:
 		switch t.Value {
-		case "+", "-":
-			return t.Value, precAddSub, true
-		case "*", "/", "%":
-			return t.Value, precMulDiv, true
+		case "+":
+			return OpAdd, precAddSub, true
+		case "-":
+			return OpSub, precAddSub, true
+		case "*":
+			return OpMul, precMulDiv, true
+		case "/":
+			return OpDiv, precMulDiv, true
+		case "%":
+			return OpMod, precMulDiv, true
 		case "||":
-			return t.Value, precConcat, true
-		case "=", "<", ">", "<=", ">=", "<>", "!=":
-			return t.Value, precCompare, true
+			return OpConcat, precConcat, true
+		case "=":
+			return OpEq, precCompare, true
+		case "<":
+			return OpLt, precCompare, true
+		case ">":
+			return OpGt, precCompare, true
+		case "<=":
+			return OpLe, precCompare, true
+		case ">=":
+			return OpGe, precCompare, true
+		case "<>", "!=":
+			return OpNe, precCompare, true
 		}
 	case TokenSymbol:
 		// '*' is also a symbol token (target-list wildcard) — but in
 		// expression context it's a multiplication operator.
 		if t.Value == "*" {
-			return "*", precMulDiv, true
+			return OpMul, precMulDiv, true
 		}
 	case TokenKeyword:
 		switch t.Keyword {
 		case KwAnd:
-			return "AND", precAnd, true
+			return OpAnd, precAnd, true
 		case KwOr:
-			return "OR", precOr, true
+			return OpOr, precOr, true
 		}
 	}
-	return "", 0, false
+	return OpUnknown, 0, false
 }
 
 // parseUnary handles prefix operators and falls through to parsePrimary.
 func (p *parser) parseUnary() (Expr, error) {
 	t := p.cur()
 	switch {
-	case t.Kind == TokenOperator && (t.Value == "-" || t.Value == "+"):
+	case t.Kind == TokenOperator && t.Value == "-":
 		p.advance()
 		operand, err := p.parseExprPrec(precUnary)
 		if err != nil {
 			return nil, err
 		}
-		return &UnaryOp{pos: t.Pos, Op: t.Value, Operand: operand}, nil
+		return &UnaryOp{pos: t.Pos, Op: OpUnaryNeg, Operand: operand}, nil
+	case t.Kind == TokenOperator && t.Value == "+":
+		p.advance()
+		operand, err := p.parseExprPrec(precUnary)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryOp{pos: t.Pos, Op: OpUnaryPos, Operand: operand}, nil
 	case t.Kind == TokenKeyword && t.Keyword == KwNot:
 		p.advance()
 		operand, err := p.parseExprPrec(precNot)
 		if err != nil {
 			return nil, err
 		}
-		return &UnaryOp{pos: t.Pos, Op: "NOT", Operand: operand}, nil
+		return &UnaryOp{pos: t.Pos, Op: OpNot, Operand: operand}, nil
 	}
 	return p.parsePrimary()
 }
@@ -1100,11 +1127,11 @@ func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error
 	if err != nil {
 		return nil, err
 	}
-	ge := &BinaryOp{pos: pos, Op: ">=", Left: left, Right: low}
-	le := &BinaryOp{pos: pos, Op: "<=", Left: left, Right: high}
-	combined := Expr(&BinaryOp{pos: pos, Op: "AND", Left: ge, Right: le})
+	ge := &BinaryOp{pos: pos, Op: OpGe, Left: left, Right: low}
+	le := &BinaryOp{pos: pos, Op: OpLe, Left: left, Right: high}
+	combined := Expr(&BinaryOp{pos: pos, Op: OpAnd, Left: ge, Right: le})
 	if negated {
-		combined = &UnaryOp{pos: pos, Op: "NOT", Operand: combined}
+		combined = &UnaryOp{pos: pos, Op: OpNot, Operand: combined}
 	}
 	return combined, nil
 }
