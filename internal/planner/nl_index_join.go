@@ -397,8 +397,20 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// regression). For other outer kinds (SeqScan, Filter, …) the
 	// Index space matches the runtime layout directly and rebind
 	// is unnecessary.
-	if _, outerIsMHJ := outerNode.(*MultiHashJoin); outerIsMHJ {
+	_, outerIsMHJ := outerNode.(*MultiHashJoin)
+	_, outerIsNLI := outerNode.(*NestedLoopIndexJoin)
+	if outerIsMHJ || outerIsNLI {
 		outerSchema := outerNode.Output()
+		// M0075-0002: for *NestedLoopIndexJoin outers
+		// (Q9's chained-NLI shape) the rebind needs the per-
+		// outer selectivity guard. M0072-0002 attempted the
+		// rebind without it and Q9 hung at 380-600 s with 0
+		// rows because the resolved column was high-
+		// cardinality at runtime. The guard rejects rebinds
+		// where the new column's NDistinct produces a per-
+		// outer match-set above nliRebindSelectivityThreshold.
+		// MHJ outers (already-stable from M0064) retain the
+		// original Name-only rebind path.
 		for _, k := range keys {
 			cr, ok := k.(*ColumnRef)
 			if !ok || cr.Name == "" {
@@ -407,9 +419,29 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 			if cr.Index >= 0 && cr.Index < len(outerSchema) && outerSchema[cr.Index].Name == cr.Name {
 				continue
 			}
-			if newIdx := findUniqueColumnIndex(outerSchema, cr.Name, 0); newIdx >= 0 {
-				cr.Index = newIdx
+			var newIdx int
+			if outerIsNLI {
+				// SourceTableIdx-aware lookup (M0071-0009).
+				if cr.SourceTableIdx == 0 {
+					// No source disambiguator → too risky to
+					// guess; preserve original index.
+					continue
+				}
+				newIdx = findColumnIndexByNameAndSource(outerSchema, cr.Name, cr.SourceTableIdx, 0)
+				if newIdx < 0 {
+					continue
+				}
+				// Per-outer selectivity guard: M0075-0002.
+				if !rebindPassesSelectivityGuard(outerNode, outerSchema, newIdx) {
+					continue
+				}
+			} else {
+				newIdx = findUniqueColumnIndex(outerSchema, cr.Name, 0)
+				if newIdx < 0 {
+					continue
+				}
 			}
+			cr.Index = newIdx
 		}
 	}
 

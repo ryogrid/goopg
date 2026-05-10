@@ -32,7 +32,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile
+.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-report
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -49,6 +49,8 @@ help:
 	@echo "  make ralph-state-check  Validate .ralph/status.json and .ralph/progress.json consistency."
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
 	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
+	@echo "  make pgbench-compare    Run pgbench comparison between goopg and PostgreSQL."
+	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo
 	@echo "Variables (override with 'make VAR=value'):"
 	@echo "  DATA_DIR=$(DATA_DIR)"
@@ -205,3 +207,28 @@ pgo-profile:
 	@wait
 	@echo "Profile captured: default.pgo"
 	@ls -la "$(REPO_ROOT)/default.pgo"
+
+# ---------------------------------------------------------------
+# pgbench Performance Comparison
+#
+# Runs pgbench comparison between goopg and PostgreSQL with:
+#   - 3 workloads: standard, simple-update, select-only
+#   - 100 clients, 100 threads, scale factor 100
+#   - 3 minutes per test
+#   - Alternating execution between systems
+#   - Shared buffers: 2.5GB, WAL buffers: 100MB
+#   - Checkpoint settings to prevent interruption
+#
+# Uses separate ports (5433 for goopg, 5434 for PostgreSQL)
+# to avoid conflicts with existing instances.
+# ---------------------------------------------------------------
+
+pgbench-compare: build
+	@echo "Running pgbench performance comparison..."
+	@"$(REPO_ROOT)/bench/pgbench-compare/run_comparison.sh"
+	@echo ""
+	@echo "Generating report..."
+	@"$(REPO_ROOT)/bench/pgbench-compare/generate_report.sh"
+
+pgbench-compare-report:
+	@"$(REPO_ROOT)/bench/pgbench-compare/generate_report.sh"

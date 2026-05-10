@@ -139,9 +139,21 @@ F (0002) → G (0006).
       Module is correct (unit tests PASS); the
       planner-side hook needs join-graph cost-model
       refinement before re-attempt. M0076-0004 (planned).
-- [ ] M0075-0002 lands: chained-NLI rebind with per-outer
-      selectivity guard; **Q9 ≥ 100 rows DETERMINISTICALLY**
-      (≥ 175 stretch); Q21 still = 381.
+- [x] M0075-0002 PARTIAL: selectivity guard landed at
+      `internal/planner/nl_index_join_selectivity.go`;
+      `nl_index_join.go:400` rebind block extended to
+      fire for `*NestedLoopIndexJoin` outers via
+      `findColumnIndexByNameAndSource` + per-outer
+      selectivity check. **The M0072-0002 hang is
+      structurally prevented** (Q9 = 7 rows / 239 s
+      mode-1 baseline preserved). Q21 = 381 rows
+      single-NLI win preserved. The 100-row stretch
+      target is NOT met — guard correctly rejects all
+      Q9 rebinds (column NDistinct estimates + table
+      rowcount produce per-outer match-set > 100 for
+      every candidate). M0076-0005 (planned): combine
+      with M0075-0001 equivalence-class synthesis +
+      refine selectivity threshold.
 - [x] M0075-0007 PARTIAL: Makefile `bench-build-optimized` +
       `pgo-profile` targets landed as M0076-iteration
       infrastructure. Empirical result on this workload:
