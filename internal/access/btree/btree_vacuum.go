@@ -85,11 +85,14 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 
 		if len(kept) < len(items) {
 			resetPageItems(slot.Page())
+			keptRaw := make([][]byte, 0, len(kept))
 			for _, it := range kept {
-				if _, err := storage.PageAddItemRaw(slot.Page(), it.marshal()); err != nil {
+				raw := it.marshal()
+				if _, err := storage.PageAddItemRaw(slot.Page(), raw); err != nil {
 					bt.unpinW(slot)
 					return totalRemoved, err
 				}
+				keptRaw = append(keptRaw, raw)
 			}
 			if len(kept) == 0 {
 				// M0055-0005-followup-two-phase-del: PHASE 1 mark.
@@ -110,7 +113,21 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 					next:     op.Next,
 				})
 			}
-			if err := bt.markDirtyWithPageRecord(slot, cur); err != nil {
+			// M0079-0002: emit a logical btree-vacuum record
+			// carrying the kept-items projection + post-vacuum
+			// opaque flags instead of the prior FPI path. Falls
+			// back to FPI via `markDirtyWithPageRecord` when no
+			// hook is wired (test harnesses without a WAL
+			// writer).
+			if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
+				flagsAfter := readOpaque(slot.Page()).Flags
+				if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+					return logVac(bt.rel, cur, keptRaw, flagsAfter)
+				}); err != nil {
+					bt.unpinW(slot)
+					return totalRemoved, err
+				}
+			} else if err := bt.markDirtyWithPageRecord(slot, cur); err != nil {
 				bt.unpinW(slot)
 				return totalRemoved, err
 			}

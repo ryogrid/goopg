@@ -102,6 +102,10 @@ type Pool struct {
 	// record. Used by VACUUM to capture the dead-slot list rather
 	// than a full-page image on each pruned page.
 	logHeapVacuum LogHeapVacuumFunc
+	// logBtreeVacuum emits a logical btree-vacuum (kept-items)
+	// WAL record. Used by `btree.VacuumIndexPages` to avoid
+	// FPI per pruned leaf. (M0079-0002.)
+	logBtreeVacuum LogBtreeVacuumFunc
 	// logHeapHotUpdate emits an atomic HOT-update WAL record
 	// (M0046-0001): old-slot xmax stamp + new tuple insert on the
 	// same page in one record. nil disables the optimisation and
@@ -261,6 +265,15 @@ type PoolConfig struct {
 	// each pruned page.
 	LogHeapVacuum LogHeapVacuumFunc
 
+	// LogBtreeVacuum, when non-nil, is exposed via
+	// Pool.LogBtreeVacuum so the btree VACUUM path can emit a
+	// kept-items + opaque-flags change record instead of a full
+	// FPI on each pruned leaf. The kept-items list carries each
+	// surviving item's raw bytes (the same blob
+	// `pageAddItemRaw` writes); replay rebuilds the page's
+	// kept-items projection. (M0079-0002.)
+	LogBtreeVacuum LogBtreeVacuumFunc
+
 	// LogHeapHotUpdate, when non-nil, is exposed via
 	// Pool.LogHeapHotUpdate so the executor's HOT-update path can
 	// emit a single atomic change record (old-stamp + new-insert on
@@ -341,6 +354,14 @@ type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xma
 // write or recovery. See docs/design/0002-0003-redo-records.md.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
+// LogBtreeVacuumFunc emits one logical btree-vacuum redo
+// record carrying the kept-items projection and post-vacuum
+// opaque flags for a pruned leaf page. Mirrors the producer-
+// side of `btree.ReplayVacuumPage`. The signature lives in
+// storage so the btree access method can consume it without
+// importing internal/wal. (M0079-0002.)
+type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, keptItems [][]byte, opaqueFlags uint16) (LSN, error)
+
 // LogHeapHotUpdateFunc emits one atomic HOT-update redo record
 // (M0046-0001). The record encodes the old-slot xmax stamp +
 // HeapHotUpdated infomask + CTID chain + the new tuple bytes (which
@@ -385,6 +406,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapDelete:    cfg.LogHeapDelete,
 		logHeapLock:      cfg.LogHeapLock,
 		logHeapVacuum:    cfg.LogHeapVacuum,
+		logBtreeVacuum:   cfg.LogBtreeVacuum,
 		logHeapHotUpdate: cfg.LogHeapHotUpdate,
 		logHeapPruneOpt:  cfg.LogHeapPruneOpt,
 		logSmgrCreate:    cfg.LogSmgrCreate,
@@ -448,6 +470,12 @@ func (p *Pool) LogHeapLock() LogHeapLockFunc { return p.logHeapLock }
 // hook, or nil if none was wired. Callers fall back to per-page
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
+
+// LogBtreeVacuum returns the configured btree-vacuum
+// kept-items change-record emitter (M0079-0002). Callers
+// (btree.VacuumIndexPages) fall back to FPI via
+// MarkDirtyChangeRecord when nil.
+func (p *Pool) LogBtreeVacuum() LogBtreeVacuumFunc { return p.logBtreeVacuum }
 
 // LogHeapHotUpdate returns the configured HOT-update change-record
 // hook (M0046-0001), or nil if none was wired. Callers fall back to

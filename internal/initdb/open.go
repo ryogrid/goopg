@@ -318,6 +318,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Logical btree-vacuum (kept-items + opaque flags) change
+	// record (M0079-0002). Replaces the FPI path in
+	// `btree.VacuumIndexPages` so per-page vacuum cost is
+	// proportional to surviving items rather than 8 KiB of
+	// page bytes.
+	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, keptItems [][]byte, opaqueFlags uint16) (storage.LSN, error) {
+		payload := wal.EncodeBtreeVacuum(rel, blk, keptItems, opaqueFlags)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Row-lock (lock-only xmax + lock-strength) change record.
 	// M0021 tuple-level locking step 2 producer hook.
 	logHeapLock := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16) (storage.LSN, error) {
@@ -383,6 +397,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeInsert: logBtreeInsert,
 		LogHeapDelete:    logHeapDelete,
 		LogHeapVacuum:    logHeapVacuum,
+		LogBtreeVacuum:   logBtreeVacuum,
 		LogHeapLock:      logHeapLock,
 		LogHeapHotUpdate: logHeapHotUpdate,
 		LogHeapPruneOpt:  logHeapPruneOpt,

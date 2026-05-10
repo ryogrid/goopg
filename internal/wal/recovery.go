@@ -181,6 +181,47 @@ const (
 	//   kind(1) | oid(4) | schemaLen(2) | nameLen(2) | schema | name
 	RecordKindDropIndex byte = 21
 
+	// RecordKindBtreeVacuum is a logical change record for one
+	// B-tree page vacuum (M0079-0002). VACUUM emits one per page
+	// where dead heap pointers were filtered out. Carries the
+	// post-vacuum kept-items as raw bytes (each item is a
+	// btree-internal `keyLen | ptr.block | ptr.offset | key`
+	// blob — the same shape `pageAddItemRaw` writes) plus the
+	// post-vacuum opaque flags so replay can rebuild the page's
+	// kept-items projection AND apply the half-dead / deleted
+	// flag transition that VacuumIndexPages performs in the
+	// same critical section when the page becomes empty.
+	//
+	// The kept-items-as-raw-bytes encoding (vs PostgreSQL's
+	// removed-slot-list) is necessary because goopg's
+	// VacuumIndexPages explodes posting-list line pointers into
+	// individual (key, TID) items — a slot-list replay couldn't
+	// reproduce that explosion without re-running the
+	// `pageItems` posting-list expansion. Carrying kept items
+	// directly makes replay layout-stable regardless of how the
+	// pre-vacuum page packed its line pointers.
+	//
+	// Replaces the prior FPI-via-`markDirtyWithPageRecord` path
+	// (~8 KiB per touched page) with a logical record (~item
+	// bytes per page; ~50-90 % smaller for typical leaves).
+	// Replay is idempotent via pd_lsn. See
+	// `docs/design/0079-0002-btree-record-wal-parity.md`.
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
+	//   itemCount(2) |
+	//   item0Len(2) | item0Bytes | ... | itemKLen(2) | itemKBytes |
+	//   opaqueFlags(2)
+	RecordKindBtreeVacuum byte = 22
+
+	// btreeVacuumHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + Block(4) + itemCount(2) = 16. Mirrors
+	// heapVacuumHeaderSize.
+	btreeVacuumHeaderSize = 16
+	// btreeVacuumTrailerSize: opaqueFlags(2). Trails the
+	// variable-length item-bytes payload.
+	btreeVacuumTrailerSize = 2
+
 	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
 	smgrRecordSize = 10
 
@@ -900,6 +941,87 @@ func DecodeHeapVacuum(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 	return
 }
 
+// BtreeVacuumPayload mirrors `EncodeBtreeVacuum`'s on-wire
+// fields for callers that prefer struct construction. KeptItems
+// carries each surviving btree item's raw bytes (the same
+// blob `pageAddItemRaw` writes) in the order they will be
+// re-added to the page. OpaqueFlags is the post-vacuum
+// `BTPageOpaque.Flags` value (overwritten verbatim during
+// replay). (M0079-0002.)
+type BtreeVacuumPayload struct {
+	Rel         storage.RelFileNode
+	Blk         storage.BlockNumber
+	KeptItems   [][]byte
+	OpaqueFlags uint16
+}
+
+// EncodeBtreeVacuum encodes one logical B-tree vacuum redo
+// record. (M0079-0002.)
+func EncodeBtreeVacuum(rel storage.RelFileNode, blk storage.BlockNumber, keptItems [][]byte, opaqueFlags uint16) []byte {
+	bodySize := 0
+	for _, it := range keptItems {
+		bodySize += 2 + len(it)
+	}
+	out := make([]byte, btreeVacuumHeaderSize+bodySize+btreeVacuumTrailerSize)
+	out[0] = RecordKindBtreeVacuum
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], uint16(len(keptItems)))
+	off := btreeVacuumHeaderSize
+	for _, it := range keptItems {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(it)))
+		off += 2
+		off += copy(out[off:], it)
+	}
+	binary.LittleEndian.PutUint16(out[off:off+2], opaqueFlags)
+	return out
+}
+
+// DecodeBtreeVacuum decodes a `RecordKindBtreeVacuum` payload
+// into the rel + block + kept-items list + post-vacuum opaque
+// flags. (M0079-0002.)
+func DecodeBtreeVacuum(payload []byte) (BtreeVacuumPayload, error) {
+	var p BtreeVacuumPayload
+	if len(payload) < btreeVacuumHeaderSize+btreeVacuumTrailerSize {
+		return p, fmt.Errorf("wal: invalid btree-vacuum payload len %d (want >= %d)", len(payload), btreeVacuumHeaderSize+btreeVacuumTrailerSize)
+	}
+	if payload[0] != RecordKindBtreeVacuum {
+		return p, fmt.Errorf("wal: record kind %d is not btree-vacuum", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.Blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	count := int(binary.LittleEndian.Uint16(payload[14:16]))
+	off := btreeVacuumHeaderSize
+	p.KeptItems = make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		if off+2 > len(payload)-btreeVacuumTrailerSize {
+			return p, fmt.Errorf("wal: btree-vacuum payload truncated at item %d header", i)
+		}
+		itLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if off+itLen > len(payload)-btreeVacuumTrailerSize {
+			return p, fmt.Errorf("wal: btree-vacuum payload truncated at item %d body (want %d bytes)", i, itLen)
+		}
+		// Copy so the caller can use the slice safely after
+		// payload buffer is reused.
+		dup := make([]byte, itLen)
+		copy(dup, payload[off:off+itLen])
+		p.KeptItems = append(p.KeptItems, dup)
+		off += itLen
+	}
+	if off+btreeVacuumTrailerSize != len(payload) {
+		return p, fmt.Errorf("wal: btree-vacuum payload trailer offset %d (len %d) does not match expected %d", off, len(payload), len(payload)-btreeVacuumTrailerSize)
+	}
+	p.OpaqueFlags = binary.LittleEndian.Uint16(payload[off : off+2])
+	return p, nil
+}
+
 // EncodeBtreeInsert encodes one logical B-tree non-split insert
 // redo record. The opaque `item` payload is whatever bytes the
 // caller stored on the page (in v0,
@@ -1092,6 +1214,11 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	case RecordKindBtreeVacuum:
+		if err := replayBtreeVacuum(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
 	case RecordKindCheckpoint:
 		return false, nil
 	case RecordKindXactCommit, RecordKindXactAbort:
@@ -1214,6 +1341,40 @@ func replayHeapVacuum(mgr *storage.Manager, r Record) error {
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(rel, blk, page)
+}
+
+// replayBtreeVacuum applies one logical B-tree vacuum redo
+// record. The page must already exist (CREATE INDEX or earlier
+// btree mutation produced it). Idempotent via pd_lsn — the
+// record carries the post-vacuum kept-items projection plus
+// the post-vacuum opaque flags. (M0079-0002.)
+func replayBtreeVacuum(mgr *storage.Manager, r Record) error {
+	p, err := DecodeBtreeVacuum(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(p.Rel)
+	if err != nil {
+		return err
+	}
+	if p.Blk >= nblocks {
+		return fmt.Errorf("wal: btree-vacuum replay: block %d does not exist (nblocks=%d)", p.Blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(p.Rel, p.Blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: btree-vacuum replay: block %d is uninitialised", p.Blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil // already applied
+	}
+	if err := btree.ReplayVacuumPage(page, p.KeptItems, p.OpaqueFlags); err != nil {
+		return fmt.Errorf("wal: btree-vacuum apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(p.Rel, p.Blk, page)
 }
 
 // replayHeapLock applies one row-lock redo record. The page must
