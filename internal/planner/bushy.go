@@ -159,7 +159,23 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 		relInfos[i].bindingIdx = i
 	}
 
-	g := buildJoinGraph(tables, scans, scanWidth, dpConjuncts, 0, ctx.bindings)
+	// M0077-0004 (Slice D): synthesise selective anchored
+	// equality edges from `dpConjuncts` + `relInfos`. Edges
+	// fire only from anchor (SmallDimension /
+	// strongly-filtered / small-anchor-rows) relations to
+	// non-anchor relations in the same class — the design
+	// 02 §5 rule that avoids the M0075-0001 / M0076-0001 Q9
+	// hang while still adding Q5's missing
+	// `c_nationkey = n_nationkey` edge when applicable.
+	// Tagged inferred via `inferredCount` so the edge
+	// inherits M0076-0004's penalty multiplier.
+	anchoredEdges := inferAnchoredEqualities(dpConjuncts, relInfos)
+	if len(anchoredEdges) > 0 {
+		dpConjuncts = append(dpConjuncts, anchoredEdges...)
+	}
+	inferredCount := len(anchoredEdges)
+
+	g := buildJoinGraph(tables, scans, scanWidth, dpConjuncts, inferredCount, ctx.bindings)
 	if g == nil || len(g.edges) == 0 {
 		return node, pred
 	}

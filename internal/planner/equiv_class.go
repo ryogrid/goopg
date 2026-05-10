@@ -196,6 +196,169 @@ func inferTransitiveEqualities(conjuncts []Expr) []Expr {
 	return added
 }
 
+// smallAnchorRowsThreshold is the design 02 §5 small-anchor
+// row-count limit. A relation whose post-filter rowcount fits
+// in this many rows qualifies as an "anchor" — the bushy DP
+// is allowed to synthesise equality edges from it to any
+// non-anchor relation in its equivalence class. The initial
+// value of 1024 is intentionally permissive; raising the bar
+// (e.g., 256) is a safe regression-tightening knob for future
+// tuning. (M0077-0004 / Slice D.)
+const smallAnchorRowsThreshold = 1024
+
+// inferAnchoredEqualities is the M0077-0004 (Slice D)
+// selective alternative to `inferTransitiveEqualities`.
+// Instead of the full transitive closure, it synthesises
+// only edges that go FROM an anchor relation TO a
+// non-anchor relation in the same equivalence class, where
+// "anchor" means at least one of:
+//
+//  1. the relation is `SmallDimension`-flagged
+//     (catalog hint — region / nation in TPC-H);
+//  2. its local filter halved the relation
+//     (`filteredRows*2 ≤ baseRows`);
+//  3. its post-filter rowcount fits inside
+//     `smallAnchorRowsThreshold`.
+//
+// The output edges are tagged inferred via
+// `buildJoinGraph`'s `inferredCount` parameter, so
+// M0076-0004's `inferredEdgePenalty` keeps them as a final
+// tiebreaker against an explicit equivalent.
+//
+// Why this avoids the M0075-0001 / M0076-0001 Q9 regression
+// mode: large-fact equivalence classes whose members are
+// neither SmallDimension nor selectively filtered get NO
+// synthesised edges. The Q9 hang at 380-600 s with 0 rows
+// was caused by the global hook firing on exactly that
+// shape; the anchored rule structurally excludes it.
+//
+// (M0077-0004 / Slice D per design 02 §5.)
+func inferAnchoredEqualities(conjuncts []Expr, rels []baseRelInfo) []Expr {
+	if len(conjuncts) == 0 || len(rels) == 0 {
+		return nil
+	}
+
+	// Mark each relation as anchor / non-anchor and build a
+	// SourceTableIdx → bindingIdx lookup (so ColumnRefs can
+	// be mapped back to their relation when checking
+	// anchor-ness during class iteration).
+	isAnchor := make(map[int]bool, len(rels))
+	srcToBinding := make(map[int16]int, len(rels))
+	for _, ri := range rels {
+		if ri.bindingIdx < 0 || ri.sourceIdx == 0 {
+			continue
+		}
+		srcToBinding[ri.sourceIdx] = ri.bindingIdx
+		switch {
+		case ri.isSmallDimension:
+			isAnchor[ri.bindingIdx] = true
+		case ri.hasLocalFilter && ri.baseRows > 0 && ri.filteredRows > 0 &&
+			ri.filteredRows*2 <= ri.baseRows:
+			isAnchor[ri.bindingIdx] = true
+		case ri.filteredRows > 0 && ri.filteredRows <= smallAnchorRowsThreshold:
+			isAnchor[ri.bindingIdx] = true
+		}
+	}
+	if len(isAnchor) == 0 {
+		// No anchor exists in any class → nothing to
+		// synthesise from.
+		return nil
+	}
+
+	// Pass 1: build equivalence classes from explicit
+	// `ColumnRef = ColumnRef` predicates (mirrors
+	// inferTransitiveEqualities). Record explicit pairs to
+	// avoid re-emitting them.
+	ec := newEquivClasses()
+	seenPairs := make(map[[2]columnIdent]bool)
+	columnRefByIdent := make(map[columnIdent]*ColumnRef)
+	for _, c := range conjuncts {
+		la, lb, ok := isColumnRefEquality(c)
+		if !ok {
+			continue
+		}
+		ia := identOf(la)
+		ib := identOf(lb)
+		if ia == ib {
+			continue
+		}
+		ec.union(ia, ib)
+		seenPairs[orderedPair(ia, ib)] = true
+		columnRefByIdent[ia] = la
+		columnRefByIdent[ib] = lb
+	}
+
+	// Pass 2: for each class, partition members into
+	// anchors and non-anchors. Synthesise anchor →
+	// non-anchor edges only. Skip pairs already seen
+	// (explicit predicates). Cap synthesised edges per
+	// (target, class) to one — the anchor brings the
+	// non-anchor under selective control once, additional
+	// edges to the same target add no new selectivity.
+	//
+	// Iterate classes in the same deterministic order as
+	// inferTransitiveEqualities so synthesised conjunct
+	// sequence is reproducible (M0076-0004 carry).
+	classMap := ec.classes()
+	roots := make([]columnIdent, 0, len(classMap))
+	for root := range classMap {
+		roots = append(roots, root)
+	}
+	sort.SliceStable(roots, func(i, j int) bool {
+		return compareColumnIdent(roots[i], roots[j]) < 0
+	})
+
+	var added []Expr
+	for _, root := range roots {
+		members := classMap[root]
+		// Split into anchors / non-anchors via SourceTableIdx → bindingIdx → isAnchor.
+		anchors := make([]columnIdent, 0, len(members))
+		nonAnchors := make([]columnIdent, 0, len(members))
+		for _, m := range members {
+			cr := columnRefByIdent[m]
+			if cr == nil {
+				continue
+			}
+			bIdx, ok := srcToBinding[cr.SourceTableIdx]
+			if !ok {
+				// SourceTableIdx unknown — treat as non-anchor.
+				nonAnchors = append(nonAnchors, m)
+				continue
+			}
+			if isAnchor[bIdx] {
+				anchors = append(anchors, m)
+			} else {
+				nonAnchors = append(nonAnchors, m)
+			}
+		}
+		if len(anchors) == 0 || len(nonAnchors) == 0 {
+			continue
+		}
+		// One synthesised edge per non-anchor target. Prefer
+		// the first anchor (already in deterministic order
+		// from `classes()`).
+		for _, target := range nonAnchors {
+			source := anchors[0]
+			pair := orderedPair(source, target)
+			if seenPairs[pair] {
+				continue
+			}
+			a := columnRefByIdent[source]
+			b := columnRefByIdent[target]
+			if a == nil || b == nil {
+				continue
+			}
+			added = append(added, &BinaryOp{
+				Op:    parser.OpEq,
+				Left:  a,
+				Right: b,
+			})
+			seenPairs[pair] = true
+		}
+	}
+	return added
+}
+
 // isColumnRefEquality returns the (left, right) ColumnRefs
 // when expr is `ColRef = ColRef` with matching types.
 // Otherwise (_, _, false).

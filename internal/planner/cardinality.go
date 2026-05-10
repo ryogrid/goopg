@@ -95,7 +95,12 @@ func tableRows(tbl *catalog.Table) int64 {
 // `dpEntry.rows` from `filteredRows`, and Slice C's 3-part
 // hash-join cost reads the same field for build / probe inputs.
 type baseRelInfo struct {
-	bindingIdx       int
+	bindingIdx int
+	// sourceIdx mirrors `rangeBinding.sourceIdx` so
+	// `inferAnchoredEqualities` can translate a
+	// `ColumnRef.SourceTableIdx` (the column's binding-of-origin
+	// identifier) back to the matching `baseRelInfo` entry.
+	sourceIdx        int16
 	table            *catalog.Table
 	baseRows         int64
 	filteredRows     int64
@@ -118,6 +123,7 @@ type baseRelInfo struct {
 func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInfo {
 	info := baseRelInfo{
 		bindingIdx:     -1,
+		sourceIdx:      binding.sourceIdx,
 		table:          binding.table,
 		localFilter:    local,
 		hasLocalFilter: local != nil,
