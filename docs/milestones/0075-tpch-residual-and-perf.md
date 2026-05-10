@@ -108,9 +108,16 @@ F (0002) → G (0006).
 - [ ] M0075-0005 lands: `numericDiv` int64 fast-path
       via `mulInt64Pow10`; full SF=1 sweep row-count
       preserved.
-- [ ] M0075-0003 lands: Datum struct = 40 B exact;
-      `Buf []byte` + `arena *Arena` removed; constructor
-      flip via permArena; full SF=1 sweep preserved.
+- [x] M0075-0003 DEFERRED to M0076 — attempt 2026-05-10
+      hit the M0071-Stage-B silent-regression pattern:
+      tight gate passed, 21-q sweep showed Q10/Q11/Q12/
+      Q15/Q16/Q20/Q21 row counts crashing to 0 and
+      Q13/Q22 mis-counting. Suspected root cause:
+      arenaRegistry slot reuse aliasing retained Datums
+      across query boundaries. Reverted before commit
+      per pre-commit gate discipline. M0076-0001
+      (planned): retention-site audit + sticky
+      per-query arena slots before re-attempt.
 - [ ] M0075-0004 lands: filterOp batch path wired;
       eligibility detector excludes non-amenable
       predicates; 21-q row-count parity.
