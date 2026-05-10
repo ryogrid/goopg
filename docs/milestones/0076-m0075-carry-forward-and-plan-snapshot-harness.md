@@ -1,6 +1,23 @@
 # Milestone 0076 — M0075 carry-forward + plan-snapshot regression harness
 
-**Status:** planned
+**Status:** accepted (2026-05-10) — Q5-priority reorder
+session per user directive. Commits `8ace779`,
+`b27869c`, `2511184`, `83e7853` (M0076-0006 / 0004 /
+0001) + Commit I (M0076-0007, this handover). 22-q
+sweep: zero row-count regression vs Phase-7 baseline
+(Q12=2, Q13=35, Q21=381, Q22=7, Q9=7 mode-1 baseline
+preserved). 2 sub-milestones FULL (M0076-0006 plan-
+snapshot harness; M0076-0004 cost-model preparation
+infrastructure); 5 PARTIAL/DEFERRED to M0077 per the
+M0076 plan's R7 (Q5 fix gate is the keystone — when
+the M0076-0001 hook re-enable failed empirically with
+synthesised plan estimating 303M-row intermediate,
+remaining commits E/F/G/H deferred). The Q5 attempt
+identified the **build-side memory term in
+`estimateJoinCost`** as the keystone structural fix
+(M0077-0001). See
+[`docs/handover/2026-05-10-tpch-status-phase8.md`](../handover/2026-05-10-tpch-status-phase8.md)
+and [`tmp/q5-plan-analysis.md`](../../tmp/q5-plan-analysis.md).
 **Branch:** `gc-oriented-refactor` (continuation of M0075)
 **Depends on:**
 - M0075-final (commit `9120dc8`) — Phase 7 handover
