@@ -1,6 +1,17 @@
 # Milestone 0074 — CPU optimisation + Q9 structural fix + Datum packed layout
 
-**Status:** planned
+**Status:** closed (2026-05-10) — Commits `54f3536`,
+`8080efa`, `4906451`, `bdee869`, `3bc631d`, `4d892ac`
+(M0074-0001..0006) + Commit G (M0074-0005, this handover).
+22-q sweep: zero row-count regression vs Phase-5 baseline
+(Q12=2, Q13=35, Q21=381, Q22=7, Q9=7); Q5 still cancels
+at 1100 s (CPU-bound; M0075 plan-level work). Two
+sub-milestones landed in full scope (M0074-0006 numeric
+int64 fast-path; M0074-0004 DecodeRowProjectionIntoArena);
+three landed in PARTIAL scope (M0074-0001/0002/0003
+forward-compat infrastructure; risky implementation
+deferred to M0075 under autonomous-mode risk management).
+See [`docs/handover/2026-05-10-tpch-status-phase6.md`](../handover/2026-05-10-tpch-status-phase6.md).
 **Branch:** `gc-oriented-refactor` (continuation of M0073)
 **Depends on:** M0073-0005 (commit `1e33801`) — M0073
 close handover; M0073-0001 (commit `c9a34b0`) — Datum.arena
