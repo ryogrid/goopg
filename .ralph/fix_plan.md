@@ -2937,6 +2937,99 @@ Plan-diff query categories (per design 03 §2):
           → M0077-final on Q5 wall time, Q9 row count,
           row-count parity.
 
+## Recently completed — M0079 + M0080 (WAL + catalog parity)
+
+These milestones landed in a single 2026-05-11 session that
+started from a pgbench TPS regression (60 TPS → 0.86 TPS after
+restart) and ended with PostgreSQL parity across every heap +
+btree WAL record kind and every persistent-metadata surface.
+
+- [x] **M0079** — Catalog DDL WAL recovery + btree WAL parity
+      (accepted 2026-05-11). See
+      `docs/milestones/0079-catalog-and-btree-wal-recovery.md`.
+      Commits: `b48551f` (M0079-0001 catalog DDL),
+      `0bb88f6` (M0079-0002 BtreeVacuum),
+      `03803f0` (M0079-0003 BtreeUnlinkPage + BtreeNewRoot +
+      BtreeMarkPageHalfDead),
+      `2ba63a8` (M0079-0004 BtreeNewRoot producer wiring).
+      Design docs: `docs/design/0079-0001-index-ddl-wal-recovery.md`,
+      `docs/design/0079-0002-btree-record-wal-parity.md`,
+      `docs/design/0079-0003-btree-page-deletion-and-root-wal.md`.
+      Root cause that drove the milestone: goopg's
+      `Runtime.SaveCatalog` was the only persistence path for
+      index metadata, ran only on graceful shutdown — SIGKILL /
+      OOM bypassed it, leaving `pgbench_accounts_pkey` absent
+      after restart, every `WHERE aid = :aid` falling back to
+      a 10M-row Seq Scan.
+
+- [x] **M0080** — Heap WAL parity + persistent VM + persistent
+      FSM (accepted 2026-05-11). See
+      `docs/milestones/0080-heap-wal-parity-and-vm-fsm-persistence.md`.
+      Commits: `2ba63a8` (M0080-0001 HeapFreeze),
+      `0afc743` (M0080-0002 HeapUpdate / HeapMultiInsert /
+      HeapVisible / BtreeReusePage / BtreeMetaCleanup record
+      infrastructure),
+      `4e621c5` (M0080-0003 VM persistence + M0080-0004 FSM
+      persistence). Design docs:
+      `docs/design/0080-0001-heap-freeze-and-multi-insert-wal.md`,
+      `docs/design/0080-0002-remaining-pg-parity-records.md`.
+      Persistence audit close: after M0080, every PostgreSQL
+      persistent-metadata surface has a goopg counterpart —
+      `pg_xact` (clog), catalog (JSON + WAL), `pg_wal`,
+      `pg_replslot`, heap / index relfiles, VM
+      (`<DataDir>/global/pg_vm_state.bin`), FSM
+      (`<DataDir>/global/pg_fsm_state.bin`), and subxact via
+      WAL-replay rebuild. Remaining PG features without a
+      goopg counterpart (`pg_multixact`, `pg_twophase`,
+      `pg_commit_ts`) correspond to executor-level features
+      goopg has not yet implemented and are tracked as
+      M0083 / M0084 / M0085.
+
+## New milestone format (M0078, M0081+)
+
+Starting from M0078, fix_plan.md lists milestones by name
+only. **Task-level breakdown is NOT carried in fix_plan.md
+upfront** — when a milestone is picked up for work, its tasks
+are filled into its `docs/milestones/00NN-*.md` file (and
+optionally copied here) at that time. This keeps the active
+roadmap scannable instead of carrying ~50 line task lists for
+work that hasn't started.
+
+Each milestone doc carries a **Required design docs** section
+listing the `docs/design/` files to author when the milestone
+is picked up. The implementation is gated on those design docs
+landing first (per the project's "design-doc-first" rule in the
+spec).
+
+### Active / planned milestones (milestone-only)
+
+- [ ] **M0078** — pgbench-compare re-validation post-M0079
+      catalog fix.
+      `docs/milestones/0078-pgbench-compare-revalidation.md`.
+
+- [ ] **M0081** — WAL record producer wiring (atomic
+      HEAP_UPDATE, HEAP2_MULTI_INSERT, HEAP2_VISIBLE,
+      BTREE_REUSE_PAGE, BTREE_META_CLEANUP,
+      BTREE_MARK_PAGE_HALFDEAD).
+      `docs/milestones/0081-wal-record-producer-wiring.md`.
+
+- [ ] **M0082** — Per-relation VM / FSM fork files
+      (PG-aligned layout under `base/<DBOid>/<RelOid>_vm` /
+      `_fsm`).
+      `docs/milestones/0082-vm-fsm-per-relation-fork-files.md`.
+
+- [ ] **M0083** — pg_multixact + multi-row locking metadata
+      (XLOG_HEAP2_LOCK_UPDATED).
+      `docs/milestones/0083-multixact-multi-row-locking.md`.
+
+- [ ] **M0084** — PREPARE TRANSACTION + pg_twophase
+      persistence.
+      `docs/milestones/0084-two-phase-commit-prepare-transaction.md`.
+
+- [ ] **M0085** — pg_commit_ts (optional commit timestamps;
+      `track_commit_timestamp` GUC).
+      `docs/milestones/0085-commit-timestamps-pg-commit-ts.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
