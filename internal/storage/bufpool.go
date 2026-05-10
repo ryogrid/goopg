@@ -114,6 +114,12 @@ type Pool struct {
 	// (RecordKindSmgrCreate) when Pool.PinNew creates block 0 of
 	// a new relation. Set via PoolConfig.LogSmgrCreate.
 	logSmgrCreate func(rel RelFileNode) error
+	// logChangeRecord emits a pre-encoded change record (e.g.
+	// RecordKindCreateIndex) on behalf of the executor without
+	// requiring an executor → wal direct dependency. Set via
+	// PoolConfig.LogChangeRecord. Exposed via
+	// Pool.LogChangeRecord. (M0079-0001.)
+	logChangeRecord func(payload []byte) (LSN, error)
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -274,6 +280,15 @@ type PoolConfig struct {
 	// behaviour. See docs/design/0030-0002-ddl-wal-records.md.
 	LogSmgrCreate func(rel RelFileNode) error
 
+	// LogChangeRecord, when non-nil, is exposed via
+	// Pool.LogChangeRecord so DDL-emitting executors can append a
+	// pre-encoded WAL record (e.g. RecordKindCreateIndex) without
+	// importing the wal package. The function returns the record's
+	// end LSN; failures are propagated so the executor can roll back
+	// the in-memory catalog mutation that produced the record.
+	// (M0079-0001 / pgbench recovery fix.)
+	LogChangeRecord func(payload []byte) (LSN, error)
+
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -373,6 +388,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapHotUpdate: cfg.LogHeapHotUpdate,
 		logHeapPruneOpt:  cfg.LogHeapPruneOpt,
 		logSmgrCreate:    cfg.LogSmgrCreate,
+		logChangeRecord:  cfg.LogChangeRecord,
 		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
@@ -398,6 +414,19 @@ func (p *Pool) LogPageImage() func(rel RelFileNode, blk BlockNumber, page Page) 
 // hook, or nil if none was wired. Callers fall back to per-page
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
+
+// LogChangeRecord appends a pre-encoded WAL change record. Used
+// by DDL paths in the executor (CREATE / DROP INDEX) to emit
+// catalog-only records without an executor → wal hard
+// dependency. Returns 0 / nil when no hook is wired (the
+// executor's caller-side check decides whether to roll back the
+// in-memory mutation). (M0079-0001.)
+func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
+	if p == nil || p.logChangeRecord == nil {
+		return 0, nil
+	}
+	return p.logChangeRecord(payload)
+}
 
 // LogBtreeInsert returns the configured btree non-split insert
 // change-record hook, or nil if none was wired. Callers fall

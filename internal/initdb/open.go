@@ -362,6 +362,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return err
 	}
 
+	// Generic catalog-DDL WAL append (M0079-0001). The executor's
+	// CREATE / DROP INDEX paths use this to emit pre-encoded
+	// `RecordKindCreateIndex` / `RecordKindDropIndex` records
+	// without taking a direct dependency on the wal package. The
+	// returned LSN matches the record's end position; callers
+	// don't currently use it but the signature mirrors the other
+	// Log* hooks for consistency.
+	logChangeRecord := func(payload []byte) (storage.LSN, error) {
+		_, end, err := walWriter.Append(payload)
+		return storage.LSN(end), err
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
@@ -375,6 +387,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogHeapHotUpdate: logHeapHotUpdate,
 		LogHeapPruneOpt:  logHeapPruneOpt,
 		LogSmgrCreate:    logSmgrCreate,
+		LogChangeRecord:  logChangeRecord,
 		FullPageWrites: true,
 	})
 	if err != nil {
@@ -556,6 +569,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
+	}
+
+	// M0079-0001: replay CREATE/DROP INDEX WAL records into the
+	// in-memory catalog. Without this pass, indexes created
+	// after the last SaveCatalog snapshot would disappear from
+	// the catalog after a non-graceful restart even though
+	// their relfiles and btree pages are restored by physical
+	// replay. The pgbench `pgbench_accounts.aid` PK was the
+	// surfacing case (~70x TPS regression after restart because
+	// every UPDATE fell back to a 10M-row Seq Scan). Must run
+	// AFTER `loadUserTablesFromHeap` so the owning table is
+	// already in the catalog when we register the index.
+	if err := replayIndexDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
 	}
 
 	// Replication-slot registry. The retention path on the

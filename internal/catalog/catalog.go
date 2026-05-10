@@ -321,6 +321,109 @@ func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
 	delete(c.databases, name)
 }
 
+// RegisterIndexDuringRecovery is the idempotent version of
+// CreateIndex used by the WAL-replay driver. Differs from
+// CreateIndex in three ways: (a) the OID comes from the WAL
+// record rather than `nextOID++`, so the recovered catalog
+// entry maps to the same on-disk relfile that physical replay
+// just restored; (b) re-applying a record whose Index already
+// exists in the catalog (e.g. because a JSON snapshot captured
+// it) is a no-op rather than an error; (c) `nextOID` is
+// advanced past the recovered OID so subsequent allocations
+// don't collide.
+//
+// Used by `internal/initdb.replayIndexDDLRecords` to restore
+// the in-memory index registry after a crash that bypassed
+// SaveCatalog. (M0079-0001.)
+func (c *InMemory) RegisterIndexDuringRecovery(
+	schema string,
+	name string,
+	tableOID uint32,
+	cols []string,
+	unique bool,
+	method string,
+	primary bool,
+	oid uint32,
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tbl, ok := c.tableByOID(tableOID)
+	if !ok {
+		// Owning table not yet recovered — caller must run
+		// `loadUserTablesFromHeap` (or equivalent) before
+		// replaying CREATE INDEX records.
+		return
+	}
+	k := key(parser.ObjectName{Schema: schema, Name: name})
+	if existing, dup := c.indexes[k]; dup {
+		// JSON snapshot or earlier WAL pass already registered
+		// this index. Idempotent no-op.
+		_ = existing
+		c.advanceNextOIDLocked(oid)
+		return
+	}
+	idx := &Index{
+		Schema:  schema,
+		Name:    name,
+		Table:   tbl,
+		Columns: append([]string(nil), cols...),
+		Unique:  unique,
+		Method:  strings.ToLower(method),
+		Primary: primary,
+		OID:     oid,
+	}
+	c.indexes[k] = idx
+	if c.byTable[tbl.OID] == nil {
+		c.byTable[tbl.OID] = map[string]*Index{}
+	}
+	c.byTable[tbl.OID][k] = idx
+	c.advanceNextOIDLocked(oid)
+}
+
+// UnregisterIndexDuringRecovery is the idempotent counterpart
+// to `RegisterIndexDuringRecovery` — used for replaying
+// `RecordKindDropIndex`. (M0079-0001.)
+func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(parser.ObjectName{Schema: schema, Name: name})
+	idx, ok := c.indexes[k]
+	if !ok {
+		return
+	}
+	delete(c.indexes, k)
+	if idx.Table != nil {
+		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+			delete(perTable, k)
+			if len(perTable) == 0 {
+				delete(c.byTable, idx.Table.OID)
+			}
+		}
+	}
+}
+
+// tableByOID returns the *Table whose OID matches; caller must
+// hold c.mu (read or write). Used by the recovery hooks to map
+// a WAL-encoded table OID back to the in-memory entry without
+// re-walking c.tables on every call site.
+func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
+	for _, t := range c.tables {
+		if t.OID == oid {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// advanceNextOIDLocked nudges nextOID past `oid` so subsequent
+// allocations don't collide with the recovered identifier.
+// Caller must hold c.mu.
+func (c *InMemory) advanceNextOIDLocked(oid uint32) {
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
 // ListDatabases returns the registered database names in
 // deterministic (lexicographic) order. Backs the `pg_database`
 // virtual table.

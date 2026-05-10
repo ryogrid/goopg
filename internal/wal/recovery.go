@@ -146,6 +146,41 @@ const (
 	// catalog instead of adding it.
 	RecordKindDropDatabase byte = 19
 
+	// RecordKindCreateIndex records a `CREATE INDEX` event so the
+	// catalog's in-memory index registry can be reconstructed after
+	// a crash that bypasses SaveCatalog (M0079-0001 / pgbench
+	// recovery fix).
+	//
+	// Background: goopg has no `pg_index` heap relation, so the
+	// pg_class row written by `syncIndexToCatalogHeap` (relkind='i')
+	// is insufficient to fully reconstruct an Index — the column
+	// list, unique flag, primary flag, and owning-table OID are
+	// missing. Without WAL-driven recovery the index disappears
+	// from the catalog after restart even though its relfile and
+	// btree pages are intact on disk; pgbench's `pgbench_accounts.aid`
+	// PK was the surfacing case (~70x TPS regression after restart
+	// because every UPDATE fell back to a 10M-row Seq Scan).
+	//
+	// Same redo semantics as RecordKindCreateDatabase: physical
+	// replay (`ApplyRecord`) is a no-op — heap pages and btree
+	// pages are already restored by other record kinds — and the
+	// catalog-side replay runs once after physical recovery
+	// finishes via `internal/initdb.replayIndexDDLRecords`.
+	//
+	// Format:
+	//   kind(1) | oid(4) | tableOid(4) | unique(1) | primary(1) |
+	//   schemaLen(2) | nameLen(2) | methodLen(2) | numCols(2) |
+	//   schema | name | method | colName0Len(2) | colName0 | ... |
+	//   colNameKLen(2) | colNameK
+	RecordKindCreateIndex byte = 20
+
+	// RecordKindDropIndex is the counterpart to
+	// RecordKindCreateIndex. Carries the index OID + qualified
+	// name so the recovery driver can locate and unregister it.
+	// Format:
+	//   kind(1) | oid(4) | schemaLen(2) | nameLen(2) | schema | name
+	RecordKindDropIndex byte = 21
+
 	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
 	smgrRecordSize = 10
 
@@ -234,6 +269,148 @@ func DecodeDropDatabase(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-database payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// CreateIndexPayload carries the metadata needed to fully
+// reconstruct a btree index in the in-memory catalog during
+// recovery. Order of fields mirrors `catalog.Index`'s exported
+// state. (M0079-0001.)
+type CreateIndexPayload struct {
+	OID      uint32
+	TableOID uint32
+	Schema   string
+	Name     string
+	Method   string
+	Columns  []string
+	Unique   bool
+	Primary  bool
+}
+
+// EncodeCreateIndex encodes a CREATE INDEX event (M0079-0001).
+// Format documented at the RecordKindCreateIndex constant.
+func EncodeCreateIndex(p CreateIndexPayload) []byte {
+	const headerSize = 1 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 2
+	totalLen := headerSize + len(p.Schema) + len(p.Name) + len(p.Method)
+	for _, c := range p.Columns {
+		totalLen += 2 + len(c)
+	}
+	out := make([]byte, totalLen)
+	out[0] = RecordKindCreateIndex
+	binary.LittleEndian.PutUint32(out[1:5], p.OID)
+	binary.LittleEndian.PutUint32(out[5:9], p.TableOID)
+	if p.Unique {
+		out[9] = 1
+	}
+	if p.Primary {
+		out[10] = 1
+	}
+	binary.LittleEndian.PutUint16(out[11:13], uint16(len(p.Schema)))
+	binary.LittleEndian.PutUint16(out[13:15], uint16(len(p.Name)))
+	binary.LittleEndian.PutUint16(out[15:17], uint16(len(p.Method)))
+	binary.LittleEndian.PutUint16(out[17:19], uint16(len(p.Columns)))
+	off := headerSize
+	off += copy(out[off:], p.Schema)
+	off += copy(out[off:], p.Name)
+	off += copy(out[off:], p.Method)
+	for _, c := range p.Columns {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
+		off += 2
+		off += copy(out[off:], c)
+	}
+	return out
+}
+
+// DecodeCreateIndex decodes a RecordKindCreateIndex payload.
+func DecodeCreateIndex(payload []byte) (CreateIndexPayload, error) {
+	const headerSize = 1 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 2
+	if len(payload) < headerSize {
+		return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateIndex {
+		return CreateIndexPayload{}, fmt.Errorf("wal: record kind %d is not create-index", payload[0])
+	}
+	p := CreateIndexPayload{
+		OID:      binary.LittleEndian.Uint32(payload[1:5]),
+		TableOID: binary.LittleEndian.Uint32(payload[5:9]),
+		Unique:   payload[9] != 0,
+		Primary:  payload[10] != 0,
+	}
+	schemaLen := int(binary.LittleEndian.Uint16(payload[11:13]))
+	nameLen := int(binary.LittleEndian.Uint16(payload[13:15]))
+	methodLen := int(binary.LittleEndian.Uint16(payload[15:17]))
+	numCols := int(binary.LittleEndian.Uint16(payload[17:19]))
+	off := headerSize
+	if len(payload) < off+schemaLen+nameLen+methodLen {
+		return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated in fixed strings")
+	}
+	p.Schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	p.Name = string(payload[off : off+nameLen])
+	off += nameLen
+	p.Method = string(payload[off : off+methodLen])
+	off += methodLen
+	p.Columns = make([]string, 0, numCols)
+	for i := 0; i < numCols; i++ {
+		if len(payload) < off+2 {
+			return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated at column %d header", i)
+		}
+		colLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+colLen {
+			return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated at column %d body", i)
+		}
+		p.Columns = append(p.Columns, string(payload[off:off+colLen]))
+		off += colLen
+	}
+	return p, nil
+}
+
+// DropIndexPayload carries enough metadata to identify which
+// index to remove from the catalog during recovery.
+// (M0079-0001.)
+type DropIndexPayload struct {
+	OID    uint32
+	Schema string
+	Name   string
+}
+
+// EncodeDropIndex encodes a DROP INDEX event (M0079-0001).
+// Format documented at the RecordKindDropIndex constant.
+func EncodeDropIndex(p DropIndexPayload) []byte {
+	const headerSize = 1 + 4 + 2 + 2
+	out := make([]byte, headerSize+len(p.Schema)+len(p.Name))
+	out[0] = RecordKindDropIndex
+	binary.LittleEndian.PutUint32(out[1:5], p.OID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(p.Schema)))
+	binary.LittleEndian.PutUint16(out[7:9], uint16(len(p.Name)))
+	off := headerSize
+	off += copy(out[off:], p.Schema)
+	copy(out[off:], p.Name)
+	return out
+}
+
+// DecodeDropIndex decodes a RecordKindDropIndex payload.
+func DecodeDropIndex(payload []byte) (DropIndexPayload, error) {
+	const headerSize = 1 + 4 + 2 + 2
+	if len(payload) < headerSize {
+		return DropIndexPayload{}, fmt.Errorf("wal: drop-index payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropIndex {
+		return DropIndexPayload{}, fmt.Errorf("wal: record kind %d is not drop-index", payload[0])
+	}
+	p := DropIndexPayload{
+		OID: binary.LittleEndian.Uint32(payload[1:5]),
+	}
+	schemaLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	nameLen := int(binary.LittleEndian.Uint16(payload[7:9]))
+	off := headerSize
+	if len(payload) < off+schemaLen+nameLen {
+		return DropIndexPayload{}, fmt.Errorf("wal: drop-index payload truncated")
+	}
+	p.Schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	p.Name = string(payload[off : off+nameLen])
+	return p, nil
 }
 
 // EncodeXactAssignment encodes a subxact XID assignment record (M0050-0003).
@@ -932,6 +1109,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/open.go scans the WAL for these records after
 		// physical replay and re-applies them to the catalog's database
 		// list.
+		return false, nil
+	case RecordKindCreateIndex, RecordKindDropIndex:
+		// CREATE/DROP INDEX records (M0079-0001) carry the catalog
+		// metadata that goopg's heap representation cannot fully
+		// store (no pg_index relation). The on-disk btree pages and
+		// the index relfile are restored by RecordKindBtreeInsert /
+		// RecordKindSmgrCreate; the in-memory catalog state is
+		// reconstructed by `internal/initdb.replayIndexDDLRecords`
+		// after physical replay finishes.
 		return false, nil
 	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
 		// Subxact markers (M0050-0003) — physical page recovery is
