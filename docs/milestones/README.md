@@ -95,4 +95,12 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0058 | TPC-H SubPlan & join-unnesting performance fixes (non-correlated cache, EXISTS→semi-join, NUMERIC fast path, OR-of-ANDs join, TCP cancel) | planned | `0058-tpch-subplan-join-perf.md` |
 | 0059 | Executor BorrowRow optimization (Volcano row-lifetime copy reduction) | planned | `0059-executor-borrowrow-optimization.md` |
 | 0060 | PostgreSQL oracle test-port foundation (TAP/pg_regress/isolation/recovery/subscription/client-tools) | completed | `0060-postgres-oracle-test-port.md` |
-| 0068 | Executor GC-Optimized Pipeline Refactor (compact Datum, TupleSlot, batch arena, slot pool — replaces BorrowSemantics) | planned (`perf-analysis`) | `0068-executor-gc-pipeline-refactor.md` |
+| 0068 | Executor GC-Optimized Pipeline Refactor (compact Datum, TupleSlot, batch arena, slot pool — replaces BorrowSemantics) | accepted | `0068-executor-gc-pipeline-refactor.md` |
+| 0069 | Executor slot-pipeline follow-through + GC + long-tail query fixes | accepted | `0069-executor-slot-pipeline-followthrough.md` |
+| 0070 | Executor slot-pipeline completion + long-tail query closure | accepted | `0070-executor-slot-pipeline-completion.md` |
+| 0071 | TPC-H correctness closure (planner-first) + slot-pipeline carry-forward (incl. M0071-0009 Q21 0→381 rows) | accepted | `0071-tpch-correctness-and-runtime-followup.md` |
+| 0072 | TPC-H Q5/Q9 residual + slot-arena infra (M0072-0001 slot-aware BindOuter; M0072-0004 Arena type landed; M0072-0002 chained-NLI rebind reverted) | accepted | `0072-tpch-q5-q9-residual-and-slot-arena.md` |
+| 0073 | OpCode int8 + Datum arena integration (Q5 heap −72 %: 1463 → 404 GB via arena wiring) | accepted | `0073-opcode-and-datum-arena-integration.md` |
+| 0074 | CPU + numeric optimisation (M0074-0006 numericCmp/Add/Sub/Mul int64 fast-path; M0074-0001/0002/0003 forward-compat infra; mixed scope) | accepted | `0074-cpu-and-numeric-optimisation.md` |
+| 0075 | TPC-H residual: Q5 plan-level / Q9 rebind / Datum packed / filter batch / numericDiv / build-toolchain (M0075-0005 numericDiv int64 FULL; 0001/0002/0003/0004/0007 PARTIAL — see Phase 7 handover) | accepted | `0075-tpch-residual-and-perf.md` |
+| 0076 | M0075 carry-forward: arena retention audit + Datum packed re-attempt + filterOp batch wiring + cost-model refinement + Q9 chained-NLI + plan-snapshot regression harness | planned | `0076-m0075-carry-forward-and-plan-snapshot-harness.md` |

@@ -1,0 +1,7 @@
+# Ignore database data directories
+goopg-data/
+postgres-data/
+
+# Keep results but they can be large
+# Uncomment if you want to ignore results too:
+# results/

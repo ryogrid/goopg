@@ -1,7 +1,21 @@
 # Design 0075-0002 — Q9 chained-NLI rebind WITH per-outer selectivity guard
 
 **Milestone:** M0075-0002
-**Status:** draft (HIGH RISK — re-attempts M0072-0002)
+**Status:** **PARTIAL — selectivity guard landed
+2026-05-10; M0072-0002 hang prevented but Q9 row-count
+target NOT met.** Empirical result: the guard correctly
+rejects the unsafe rebind that hung Q9 in the M0072-0002
+attempt; Q9 remains at the bimodal mode-1 baseline (7
+rows / 239 s) instead of regressing. Q21 single-NLI win
+preserved at 381 rows. The 100-row stretch target for
+M0075-0002 is NOT achieved — that requires unlocking
+GOOD rebinds that the current threshold + NDistinct-
+based estimate doesn't recognise. M0076-0005 candidate:
+combine the guard with the M0075-0001 equivalence-class
+synthesis (also currently disabled) so the join graph
+has additional edges; AND/OR refine the cardinality
+estimate to differentiate selective from non-selective
+columns more accurately.
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0071-0009 — `SchemaColumn.SourceTableIdx`,

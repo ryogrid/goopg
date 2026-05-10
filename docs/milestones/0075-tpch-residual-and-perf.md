@@ -1,6 +1,19 @@
 # Milestone 0075 — TPC-H residual: Q5 plan-level / Q9 rebind / Datum packed / filter batch / numericDiv
 
-**Status:** planned
+**Status:** closed (2026-05-10) — Commits `79b5ac0`,
+`8230af8`, `aafef4f`, `8135c31`, `7b4a6c7`, `e89c98a`,
+`ce2fe43` (M0075-0001..0007) + Commit G (M0075-0006,
+this handover). 22-q sweep: zero row-count regression
+vs Phase-6 baseline (Q12=2, Q13=35, Q21=381, Q22=7,
+Q9=7 mode-1 baseline preserved). One sub-milestone
+landed in FULL scope (M0075-0005 numericDiv int64 fast-
+path; ~3 pp Q5 evalExprSlot cum CPU drop), four landed
+in PARTIAL scope (forward-compat infrastructure; risky
+implementation deferred to M0076 per autonomous-mode
+risk management). M0075-0007 build-toolchain bundle
+showed +9.5 % wall-time regression — Makefile lands as
+M0076-0003 investigation infrastructure. See
+[`docs/handover/2026-05-10-tpch-status-phase7.md`](../handover/2026-05-10-tpch-status-phase7.md).
 **Branch:** `gc-oriented-refactor` (continuation of M0074)
 **Depends on:** M0074-final (commit `639272a`) — Phase 6
 handover; M0074-0006 — `mulInt64Pow10` /
@@ -86,7 +99,8 @@ F (0002) → G (0006).
 | 0004 | filterOp predicate batch wiring | MED | perf | M0074-0001 (evalBinaryBatch + detector) |
 | 0001 | Q5 equivalence-class inference | MED | perf | — |
 | 0002 | Q9 chained-NLI rebind WITH selectivity guard | HIGH | structural | M0071-0009 (SourceTableIdx); M0074-0002 (VirtualCol accessor) |
-| 0006 | Final 22-query SF=1 sweep + Phase 7 handover | — | — | 0001..0005 |
+| 0007 | Build-toolchain optimisation (PGO + GOAMD64=v3 + ldflags + trimpath) | LOW | perf-build | Go 1.21+ |
+| 0006 | Final 22-query SF=1 sweep + Phase 7 handover | — | — | 0001..0005 + 0007 |
 
 ## Design references
 
@@ -95,6 +109,7 @@ F (0002) → G (0006).
 - `docs/design/0075-0003-datum-packed-flip.md` (NEW)
 - `docs/design/0075-0004-filter-batch-wiring.md` (NEW)
 - `docs/design/0075-0005-numeric-div-int64-fast-path.md` (NEW)
+- `docs/design/0075-0007-build-toolchain-optimisation.md` (NEW; inserted 2026-05-10 by user request)
 - `docs/design/0072-0002-chained-nli-rebind.md` —
   reverted approach; M0075-0002 carries lessons.
 - `docs/design/0074-0003-datum-packed-layout.md` —
@@ -108,17 +123,63 @@ F (0002) → G (0006).
 - [ ] M0075-0005 lands: `numericDiv` int64 fast-path
       via `mulInt64Pow10`; full SF=1 sweep row-count
       preserved.
-- [ ] M0075-0003 lands: Datum struct = 40 B exact;
-      `Buf []byte` + `arena *Arena` removed; constructor
-      flip via permArena; full SF=1 sweep preserved.
-- [ ] M0075-0004 lands: filterOp batch path wired;
-      eligibility detector excludes non-amenable
-      predicates; 21-q row-count parity.
-- [ ] M0075-0001 lands: equivalence-class inference;
-      Q5 plan visibly different (EXPLAIN); 21-q parity.
-- [ ] M0075-0002 lands: chained-NLI rebind with per-outer
-      selectivity guard; **Q9 ≥ 100 rows DETERMINISTICALLY**
-      (≥ 175 stretch); Q21 still = 381.
+- [x] M0075-0003 DEFERRED to M0076 — attempt 2026-05-10
+      hit the M0071-Stage-B silent-regression pattern:
+      tight gate passed, 21-q sweep showed Q10/Q11/Q12/
+      Q15/Q16/Q20/Q21 row counts crashing to 0 and
+      Q13/Q22 mis-counting. Suspected root cause:
+      arenaRegistry slot reuse aliasing retained Datums
+      across query boundaries. Reverted before commit
+      per pre-commit gate discipline. M0076-0001
+      (planned): retention-site audit + sticky
+      per-query arena slots before re-attempt.
+- [x] M0075-0004 DEFERRED to M0076 — same risk surface
+      as M0075-0003: the batch path requires Materialize-
+      each-row before buffering, and Materialize across
+      batch/page boundaries was just shown to be fragile.
+      Landing the wiring before M0076-0001's retention-
+      site audit would re-expose the slot-reuse aliasing
+      that broke M0075-0003. M0074-0001 evalBinaryBatch
+      + detectors stay landed as forward-compat. M0076-0002
+      (planned).
+- [x] M0075-0001 PARTIAL: `inferTransitiveEqualities`
+      module + 9 unit tests landed at
+      `internal/planner/equiv_class.go`; the planner-
+      side hook into `tryBushyDP` was attempted then
+      reverted. Empirical result: enabling the
+      synthesised conjuncts caused Q9 to cancel at the
+      600 s budget (was 219-256 s baseline mode-1).
+      Module is correct (unit tests PASS); the
+      planner-side hook needs join-graph cost-model
+      refinement before re-attempt. M0076-0004 (planned).
+- [x] M0075-0002 PARTIAL: selectivity guard landed at
+      `internal/planner/nl_index_join_selectivity.go`;
+      `nl_index_join.go:400` rebind block extended to
+      fire for `*NestedLoopIndexJoin` outers via
+      `findColumnIndexByNameAndSource` + per-outer
+      selectivity check. **The M0072-0002 hang is
+      structurally prevented** (Q9 = 7 rows / 239 s
+      mode-1 baseline preserved). Q21 = 381 rows
+      single-NLI win preserved. The 100-row stretch
+      target is NOT met — guard correctly rejects all
+      Q9 rebinds (column NDistinct estimates + table
+      rowcount produce per-outer match-set > 100 for
+      every candidate). M0076-0005 (planned): combine
+      with M0075-0001 equivalence-class synthesis +
+      refine selectivity threshold.
+- [x] M0075-0007 PARTIAL: Makefile `bench-build-optimized` +
+      `pgo-profile` targets landed as M0076-iteration
+      infrastructure. Empirical result on this workload:
+      PGO + GOAMD64=v3 + ldflags="-s -w" + trimpath
+      produced **net +9.5 % wall-time regression** on the
+      tight-gate suite (Q12 +12 %, Q13 +17 %, Q21 +8 %,
+      Q22 +17 %, Q9 +6 %). Correctness preserved (all
+      row counts matched baseline). Binary size dropped
+      30 % (14.1 → 9.9 MB) as expected. Investigation
+      of which knob is responsible deferred to M0076-0003.
+      Default `make bench-build` flow remains
+      unoptimised so subsequent M0075 perf measurements
+      compare against the M0075-0005 baseline (`8230af8`).
 - [ ] 22-query SF=1 sweep at M0075 close: Q12=2, Q13=35,
       Q21≥100, Q22=7, Q9 ≥ 100, all other rows preserved.
 

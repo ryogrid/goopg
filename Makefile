@@ -32,7 +32,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard
+.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -49,6 +49,8 @@ help:
 	@echo "  make ralph-state-check  Validate .ralph/status.json and .ralph/progress.json consistency."
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
 	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
+	@echo "  make pgbench-compare    Run pgbench comparison between goopg and PostgreSQL."
+	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo
 	@echo "Variables (override with 'make VAR=value'):"
 	@echo "  DATA_DIR=$(DATA_DIR)"
@@ -135,3 +137,151 @@ ralph-state-guard:
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json -fix; \
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json; \
 	fi
+
+# ---------------------------------------------------------------
+# M0075-0007: build-toolchain optimisation targets.
+#
+# The bench flow uses tmp/goopg-bench-bin as the binary the
+# tpch-runner connects against. `bench-build` produces the
+# unoptimised default; `bench-build-optimized` adds:
+#   - PGO via -pgo=default.pgo (Go 1.21+ GA)
+#   - GOAMD64=v3 (AVX2/BMI2/FMA — verify CPU support before
+#     enabling; default v3, override with `make GOAMD64=v1 ...`)
+#   - -ldflags="-s -w" to strip DWARF + symbol table (smaller
+#     binary; better i-cache locality; pprof unaffected)
+#   - -trimpath for reproducible builds
+#
+# `pgo-profile` captures default.pgo from a TPC-H mixed workload
+# (Q1+Q3+Q12+Q13+Q21) against an already-running goopg server.
+# Run `make bench-build && nohup tmp/goopg-bench-bin start ...`
+# in another terminal first; this target captures while the
+# tpch-runner is driving load.
+# ---------------------------------------------------------------
+
+GOAMD64 ?= v3
+
+bench-build:
+	@mkdir -p "$(REPO_ROOT)/tmp"
+	go build -o "$(REPO_ROOT)/tmp/goopg-bench-bin" ./cmd/goopg
+
+# Optimised bench build: PGO if default.pgo present, GOAMD64=v3,
+# linker strip, trimpath. Fall back gracefully when default.pgo
+# is missing.
+bench-build-optimized:
+	@mkdir -p "$(REPO_ROOT)/tmp"
+	@if [ -f "$(REPO_ROOT)/default.pgo" ]; then \
+		echo "Building optimised binary with PGO (default.pgo) + GOAMD64=$(GOAMD64) + -ldflags='-s -w' + -trimpath"; \
+		GOAMD64=$(GOAMD64) go build \
+			-pgo="$(REPO_ROOT)/default.pgo" \
+			-ldflags="-s -w" \
+			-trimpath \
+			-o "$(REPO_ROOT)/tmp/goopg-bench-bin" \
+			./cmd/goopg; \
+	else \
+		echo "Building optimised binary WITHOUT PGO (default.pgo not found) + GOAMD64=$(GOAMD64) + -ldflags='-s -w' + -trimpath"; \
+		echo "  Run 'make pgo-profile' first to capture default.pgo for the full optimisation."; \
+		GOAMD64=$(GOAMD64) go build \
+			-ldflags="-s -w" \
+			-trimpath \
+			-o "$(REPO_ROOT)/tmp/goopg-bench-bin" \
+			./cmd/goopg; \
+	fi
+	@ls -la "$(REPO_ROOT)/tmp/goopg-bench-bin"
+
+# Capture default.pgo from a TPC-H mixed workload. Requires
+# the bench server to be running (run `make bench-build` then
+# start the server manually with the TPC-H runtime data
+# directory). Captures over 480 s while the tpch-runner drives
+# Q1+Q3+Q12+Q13+Q21 sequentially.
+pgo-profile:
+	@if ! curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:6060/debug/pprof/ 2>/dev/null | grep -q 200; then \
+		echo "pgo-profile: pprof endpoint at 127.0.0.1:6060 not reachable. Start the bench server first." >&2; \
+		exit 1; \
+	fi
+	@echo "Capturing PGO profile (480 s) into default.pgo while running Q1+Q3+Q12+Q13+Q21..."
+	curl -s -o "$(REPO_ROOT)/default.pgo" \
+		"http://127.0.0.1:6060/debug/pprof/profile?seconds=480" &
+	@sleep 1
+	"$(REPO_ROOT)/tpch-runner" --queries=1,3,12,13,21 \
+		--per-query-timeout=620s --cancel-after=600s
+	@wait
+	@echo "Profile captured: default.pgo"
+	@ls -la "$(REPO_ROOT)/default.pgo"
+
+# ---------------------------------------------------------------
+# pgbench Performance Comparison
+#
+# Runs pgbench comparison between goopg and PostgreSQL with:
+#   - 3 workloads: standard, simple-update, select-only
+#   - 100 clients, 100 threads, scale factor 100
+#   - 3 minutes per test
+#   - Alternating execution between systems
+#   - Shared buffers: 2.5GB, WAL buffers: 100MB
+#   - Checkpoint settings to prevent interruption
+#
+# Uses separate ports (5433 for goopg, 5434 for PostgreSQL)
+# to avoid conflicts with existing instances.
+# ---------------------------------------------------------------
+
+pgbench-compare: build
+	@echo "Running pgbench performance comparison..."
+	@"$(REPO_ROOT)/bench/pgbench-compare/run_comparison.sh"
+	@echo ""
+	@echo "Generating report..."
+	@"$(REPO_ROOT)/bench/pgbench-compare/generate_report.sh"
+
+pgbench-compare-report:
+	@"$(REPO_ROOT)/bench/pgbench-compare/generate_report.sh"
+
+# ---------------------------------------------------------------
+# M0076-0006: plan-snapshot regression harness.
+#
+# Capture EXPLAIN output for each TPC-H query against a
+# running goopg cluster, compare against a saved baseline
+# in plan_snapshots/<label>.txt. Provides fast feedback
+# (~30s) for planner-only iterations vs the full 21-q
+# sweep cost (~25min).
+#
+# Three equality modes (default: structural):
+#   structural    — strips (rows=N) cost annotations;
+#                   ignores cost variance.
+#   strict-text   — byte-for-byte comparison.
+#   semantic-cost — structural + cost ±10% tolerance.
+#
+# Usage:
+#   make plan-snapshot-capture LABEL=m0076-baseline-ffc3429
+#   make plan-diff             LABEL=m0076-baseline-ffc3429
+#   make plan-diff             LABEL=m0076-baseline-ffc3429 MODE=strict-text
+#
+# Requires goopg-bench-bin running on 127.0.0.1:65433
+# (the standard tpch-runner port).
+# ---------------------------------------------------------------
+
+PLAN_SNAPSHOT_BIN := $(REPO_ROOT)/tmp/plan-snapshot
+PLAN_HOST    ?= 127.0.0.1
+PLAN_PORT    ?= 65433
+PLAN_DB      ?= tpch
+PLAN_USER    ?= tpch
+PLAN_PASS    ?= tpch
+LABEL        ?=
+MODE         ?= structural
+
+plan-snapshot-build:
+	@mkdir -p "$(REPO_ROOT)/tmp"
+	go build -o "$(PLAN_SNAPSHOT_BIN)" ./cmd/plan-snapshot
+
+plan-snapshot-capture: plan-snapshot-build
+	@if [ -z "$(LABEL)" ]; then \
+		echo "make plan-snapshot-capture requires LABEL=<name>"; exit 2; \
+	fi
+	"$(PLAN_SNAPSHOT_BIN)" capture --label "$(LABEL)" \
+		--host "$(PLAN_HOST)" --port $(PLAN_PORT) \
+		--db "$(PLAN_DB)" --user "$(PLAN_USER)" --password "$(PLAN_PASS)"
+
+plan-diff: plan-snapshot-build
+	@if [ -z "$(LABEL)" ]; then \
+		echo "make plan-diff requires LABEL=<name>"; exit 2; \
+	fi
+	"$(PLAN_SNAPSHOT_BIN)" diff --label "$(LABEL)" --mode "$(MODE)" \
+		--host "$(PLAN_HOST)" --port $(PLAN_PORT) \
+		--db "$(PLAN_DB)" --user "$(PLAN_USER)" --password "$(PLAN_PASS)"

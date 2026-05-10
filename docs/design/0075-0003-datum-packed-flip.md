@@ -1,7 +1,27 @@
 # Design 0075-0003 — Datum struct full flip (64 B → 40 B)
 
 **Milestone:** M0075-0003
-**Status:** draft (MED-HIGH RISK — central-type flip)
+**Status:** **DEFERRED to M0076** — attempt 2026-05-10
+hit a silent-regression pattern reminiscent of
+M0071-Stage-B: tight gate (Q12=2, Q13=35, Q21=381,
+Q22=7, Q9=7) passed but the 21-q sweep showed multiple
+queries dropping rows or returning wrong counts (Q10=0,
+Q11=0, Q12=0, Q13=36, Q15a=0, Q16=0, Q20=0, Q21=0,
+Q22=210). Plan explicitly directed an immediate revert;
+attempt was reverted before commit. Suspected root
+cause: arenaRegistry slot reuse — when an operator's
+arena is Drop()ped, its slot is freed and reassigned
+round-robin to a later operator's arena, so any retained
+Datum from the earlier query holding ArenaRef=K now
+resolves to the WRONG bytes via
+`arenaRegistry[K].Bytes(...)`. The fix needs either:
+(a) sticky/per-query slots that don't recycle until
+end-of-query, or (b) an audit of every retention site
+ensuring cloneRowOwned promotes per-batch arena Datums
+to permArena BEFORE the source arena's Drop. This audit
+is the M0076-0001 deliverable. The M0074-0003
+infrastructure (arenaRegistry + permArena) stays
+landed; only the actual struct flip is deferred.
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0074-0003 (commit `4d892ac`) —

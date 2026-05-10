@@ -1,7 +1,19 @@
 # Design 0075-0004 — filterOp predicate batch wiring
 
 **Milestone:** M0075-0004
-**Status:** draft
+**Status:** **DEFERRED to M0076** alongside M0075-0003.
+The batch wiring requires Materialize-each-row before
+adding to the per-batch buffer (R1 mitigation in this
+design's risk register), and Materialize behaviour
+across batch/page boundaries is currently fragile —
+exposed by M0075-0003's silent-regression revert at
+2026-05-10. Re-attempting the batch wiring before the
+M0076-0001 retention-site audit is unsafe; the same
+arena slot-reuse aliasing that broke M0075-0003 would
+manifest in the batch path's per-row Materialize calls.
+M0074-0001's `evalBinaryBatch` + detectors stay landed
+as forward-compat surface; the wiring is the deferred
+piece. M0076-0002 (planned).
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** M0074-0001 (commit `3bc631d`) —
