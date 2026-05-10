@@ -86,7 +86,8 @@ F (0002) → G (0006).
 | 0004 | filterOp predicate batch wiring | MED | perf | M0074-0001 (evalBinaryBatch + detector) |
 | 0001 | Q5 equivalence-class inference | MED | perf | — |
 | 0002 | Q9 chained-NLI rebind WITH selectivity guard | HIGH | structural | M0071-0009 (SourceTableIdx); M0074-0002 (VirtualCol accessor) |
-| 0006 | Final 22-query SF=1 sweep + Phase 7 handover | — | — | 0001..0005 |
+| 0007 | Build-toolchain optimisation (PGO + GOAMD64=v3 + ldflags + trimpath) | LOW | perf-build | Go 1.21+ |
+| 0006 | Final 22-query SF=1 sweep + Phase 7 handover | — | — | 0001..0005 + 0007 |
 
 ## Design references
 
@@ -95,6 +96,7 @@ F (0002) → G (0006).
 - `docs/design/0075-0003-datum-packed-flip.md` (NEW)
 - `docs/design/0075-0004-filter-batch-wiring.md` (NEW)
 - `docs/design/0075-0005-numeric-div-int64-fast-path.md` (NEW)
+- `docs/design/0075-0007-build-toolchain-optimisation.md` (NEW; inserted 2026-05-10 by user request)
 - `docs/design/0072-0002-chained-nli-rebind.md` —
   reverted approach; M0075-0002 carries lessons.
 - `docs/design/0074-0003-datum-packed-layout.md` —
@@ -132,6 +134,19 @@ F (0002) → G (0006).
 - [ ] M0075-0002 lands: chained-NLI rebind with per-outer
       selectivity guard; **Q9 ≥ 100 rows DETERMINISTICALLY**
       (≥ 175 stretch); Q21 still = 381.
+- [x] M0075-0007 PARTIAL: Makefile `bench-build-optimized` +
+      `pgo-profile` targets landed as M0076-iteration
+      infrastructure. Empirical result on this workload:
+      PGO + GOAMD64=v3 + ldflags="-s -w" + trimpath
+      produced **net +9.5 % wall-time regression** on the
+      tight-gate suite (Q12 +12 %, Q13 +17 %, Q21 +8 %,
+      Q22 +17 %, Q9 +6 %). Correctness preserved (all
+      row counts matched baseline). Binary size dropped
+      30 % (14.1 → 9.9 MB) as expected. Investigation
+      of which knob is responsible deferred to M0076-0003.
+      Default `make bench-build` flow remains
+      unoptimised so subsequent M0075 perf measurements
+      compare against the M0075-0005 baseline (`8230af8`).
 - [ ] 22-query SF=1 sweep at M0075 close: Q12=2, Q13=35,
       Q21≥100, Q22=7, Q9 ≥ 100, all other rows preserved.
 
