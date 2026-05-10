@@ -304,6 +304,91 @@ const (
 	// +Block(4)+count(2) = 16. Mirrors heapVacuumHeaderSize.
 	heapFreezeHeaderSize = 16
 
+	// RecordKindHeapUpdate is the M0080-0002 atomic non-HOT
+	// UPDATE record. Counterpart to PostgreSQL's
+	// XLOG_HEAP_UPDATE. Combines the old-tuple xmax stamp +
+	// new-tuple insert into a single WAL entry so replay's
+	// per-page idempotency can apply both halves under one
+	// pd_lsn boundary. Replaces the prior pair (HeapDelete +
+	// HeapInsert) for non-HOT UPDATE; the HOT path continues
+	// to use `RecordKindHeapHotUpdate` (atomic same-page).
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) |
+	//   oldBlk(4) | oldLineSlot(2) | xmax(4) |
+	//   newBlk(4) | newLineSlot(2) | tupleLen(4) | tupleBytes
+	RecordKindHeapUpdate byte = 27
+
+	// heapUpdateHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
+	// Fork(1) + oldBlk(4) + oldLineSlot(2) + xmax(4) +
+	// newBlk(4) + newLineSlot(2) + tupleLen(4) = 30.
+	heapUpdateHeaderSize = 30
+
+	// RecordKindHeapMultiInsert is the M0080-0002 bulk insert
+	// record. Counterpart to PostgreSQL's
+	// XLOG_HEAP2_MULTI_INSERT. Carries N tuples destined for
+	// the SAME heap page in one record so COPY / bulk INSERT
+	// don't pay the per-tuple WAL header overhead.
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
+	//   count(2) |
+	//   [lineSlot0(2) | tupleLen0(4) | tupleBytes0 | ...]
+	RecordKindHeapMultiInsert byte = 28
+
+	// heapMultiInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4)
+	// + Fork(1) + Block(4) + count(2) = 16.
+	heapMultiInsertHeaderSize = 16
+
+	// RecordKindHeapVisible is the M0080-0003 visibility-map
+	// update record. Counterpart to PostgreSQL's
+	// XLOG_HEAP2_VISIBLE. Carries the heap-block number whose
+	// VM bit is being set or cleared, plus the cutoff XID
+	// for ALL_VISIBLE / ALL_FROZEN flags.
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) | heapBlk(4) |
+	//   flags(1) | cutoffXid(4)
+	//
+	// flags bits:
+	//   0x01 = setAllVisible (vs clearAllVisible)
+	//   0x02 = setAllFrozen
+	RecordKindHeapVisible byte = 29
+
+	// heapVisibleSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
+	// +heapBlk(4)+flags(1)+cutoffXid(4) = 19.
+	heapVisibleSize = 19
+
+	// RecordKindBtreeReusePage is the M0080-0004 page-recycle
+	// notification record. Counterpart to PostgreSQL's
+	// XLOG_BTREE_REUSE_PAGE. Emitted when a recycled page is
+	// allocated to a new use; tells standbys (when goopg gains
+	// hot-standby reads) that the old contents are formally
+	// discarded.
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) | blk(4) |
+	//   recycledFromXid(4)
+	RecordKindBtreeReusePage byte = 30
+
+	// btreeReusePageSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
+	// +blk(4)+recycledFromXid(4) = 18.
+	btreeReusePageSize = 18
+
+	// RecordKindBtreeMetaCleanup is the M0080-0004 metapage
+	// cleanup-XID update record. Counterpart to PostgreSQL's
+	// XLOG_BTREE_META_CLEANUP. Used by `_bt_set_cleanup_info`
+	// to advance the metapage's vacuum-cleanup horizon.
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) |
+	//   numHeapTuples(8) | lastCleanupNumDeletedTuples(8)
+	RecordKindBtreeMetaCleanup byte = 31
+
+	// btreeMetaCleanupSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
+	// +numHeapTuples(8)+lastCleanupNumDeletedTuples(8) = 26.
+	btreeMetaCleanupSize = 26
+
 	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
 	smgrRecordSize = 10
 
@@ -1342,6 +1427,276 @@ func DecodeHeapFreeze(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 	return
 }
 
+// HeapUpdatePayload mirrors the M0080-0002 atomic UPDATE
+// record's on-wire fields. Captures both the old tuple's
+// xmax stamp + the new tuple's insert in one record.
+type HeapUpdatePayload struct {
+	Rel         storage.RelFileNode
+	OldBlk      storage.BlockNumber
+	OldLineSlot uint16
+	Xmax        storage.TransactionID
+	NewBlk      storage.BlockNumber
+	NewLineSlot uint16
+	Tuple       []byte
+}
+
+// EncodeHeapUpdate encodes the M0080-0002 atomic UPDATE
+// record. (M0080-0002.)
+func EncodeHeapUpdate(p HeapUpdatePayload) []byte {
+	out := make([]byte, heapUpdateHeaderSize+len(p.Tuple))
+	out[0] = RecordKindHeapUpdate
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(p.OldBlk))
+	binary.LittleEndian.PutUint16(out[14:16], p.OldLineSlot)
+	binary.LittleEndian.PutUint32(out[16:20], uint32(p.Xmax))
+	binary.LittleEndian.PutUint32(out[20:24], uint32(p.NewBlk))
+	binary.LittleEndian.PutUint16(out[24:26], p.NewLineSlot)
+	binary.LittleEndian.PutUint32(out[26:30], uint32(len(p.Tuple)))
+	copy(out[heapUpdateHeaderSize:], p.Tuple)
+	return out
+}
+
+// DecodeHeapUpdate decodes a `RecordKindHeapUpdate` payload.
+// (M0080-0002.)
+func DecodeHeapUpdate(payload []byte) (HeapUpdatePayload, error) {
+	var p HeapUpdatePayload
+	if len(payload) < heapUpdateHeaderSize {
+		return p, fmt.Errorf("wal: heap-update payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindHeapUpdate {
+		return p, fmt.Errorf("wal: record kind %d is not heap-update", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.OldBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	p.OldLineSlot = binary.LittleEndian.Uint16(payload[14:16])
+	p.Xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
+	p.NewBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[20:24]))
+	p.NewLineSlot = binary.LittleEndian.Uint16(payload[24:26])
+	tupLen := int(binary.LittleEndian.Uint32(payload[26:30]))
+	if heapUpdateHeaderSize+tupLen != len(payload) {
+		return p, fmt.Errorf("wal: heap-update payload tuple-len mismatch (have %d, want %d)", len(payload)-heapUpdateHeaderSize, tupLen)
+	}
+	p.Tuple = make([]byte, tupLen)
+	copy(p.Tuple, payload[heapUpdateHeaderSize:])
+	return p, nil
+}
+
+// HeapMultiInsertEntry is one tuple's destination + bytes
+// inside a `RecordKindHeapMultiInsert`. (M0080-0002.)
+type HeapMultiInsertEntry struct {
+	LineSlot uint16
+	Tuple    []byte
+}
+
+// HeapMultiInsertPayload mirrors the M0080-0002 bulk-insert
+// record's on-wire fields.
+type HeapMultiInsertPayload struct {
+	Rel     storage.RelFileNode
+	Blk     storage.BlockNumber
+	Entries []HeapMultiInsertEntry
+}
+
+// EncodeHeapMultiInsert encodes the M0080-0002 bulk-insert
+// record carrying N tuples destined for the same page.
+func EncodeHeapMultiInsert(p HeapMultiInsertPayload) []byte {
+	bodySize := 0
+	for _, e := range p.Entries {
+		bodySize += 2 + 4 + len(e.Tuple)
+	}
+	out := make([]byte, heapMultiInsertHeaderSize+bodySize)
+	out[0] = RecordKindHeapMultiInsert
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(p.Blk))
+	binary.LittleEndian.PutUint16(out[14:16], uint16(len(p.Entries)))
+	off := heapMultiInsertHeaderSize
+	for _, e := range p.Entries {
+		binary.LittleEndian.PutUint16(out[off:off+2], e.LineSlot)
+		off += 2
+		binary.LittleEndian.PutUint32(out[off:off+4], uint32(len(e.Tuple)))
+		off += 4
+		off += copy(out[off:], e.Tuple)
+	}
+	return out
+}
+
+// DecodeHeapMultiInsert decodes a `RecordKindHeapMultiInsert`
+// payload. (M0080-0002.)
+func DecodeHeapMultiInsert(payload []byte) (HeapMultiInsertPayload, error) {
+	var p HeapMultiInsertPayload
+	if len(payload) < heapMultiInsertHeaderSize {
+		return p, fmt.Errorf("wal: heap-multi-insert payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindHeapMultiInsert {
+		return p, fmt.Errorf("wal: record kind %d is not heap-multi-insert", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.Blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	count := int(binary.LittleEndian.Uint16(payload[14:16]))
+	off := heapMultiInsertHeaderSize
+	p.Entries = make([]HeapMultiInsertEntry, 0, count)
+	for i := 0; i < count; i++ {
+		if off+6 > len(payload) {
+			return p, fmt.Errorf("wal: heap-multi-insert truncated at entry %d header", i)
+		}
+		slot := binary.LittleEndian.Uint16(payload[off : off+2])
+		off += 2
+		tupLen := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if off+tupLen > len(payload) {
+			return p, fmt.Errorf("wal: heap-multi-insert truncated at entry %d body", i)
+		}
+		dup := make([]byte, tupLen)
+		copy(dup, payload[off:off+tupLen])
+		p.Entries = append(p.Entries, HeapMultiInsertEntry{LineSlot: slot, Tuple: dup})
+		off += tupLen
+	}
+	if off != len(payload) {
+		return p, fmt.Errorf("wal: heap-multi-insert trailing bytes (%d remaining)", len(payload)-off)
+	}
+	return p, nil
+}
+
+// HeapVisiblePayload mirrors the M0080-0003 VM update record
+// fields.
+type HeapVisiblePayload struct {
+	Rel       storage.RelFileNode
+	HeapBlk   storage.BlockNumber
+	Flags     uint8
+	CutoffXid storage.TransactionID
+}
+
+// HeapVisible flag bits.
+const (
+	HeapVisibleSetAllVisible uint8 = 0x01
+	HeapVisibleSetAllFrozen  uint8 = 0x02
+)
+
+// EncodeHeapVisible encodes the M0080-0003 visibility-map
+// update record.
+func EncodeHeapVisible(p HeapVisiblePayload) []byte {
+	out := make([]byte, heapVisibleSize)
+	out[0] = RecordKindHeapVisible
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(p.HeapBlk))
+	out[14] = p.Flags
+	binary.LittleEndian.PutUint32(out[15:19], uint32(p.CutoffXid))
+	return out
+}
+
+// DecodeHeapVisible decodes a `RecordKindHeapVisible` payload.
+func DecodeHeapVisible(payload []byte) (HeapVisiblePayload, error) {
+	var p HeapVisiblePayload
+	if len(payload) != heapVisibleSize {
+		return p, fmt.Errorf("wal: heap-visible payload len %d (want %d)", len(payload), heapVisibleSize)
+	}
+	if payload[0] != RecordKindHeapVisible {
+		return p, fmt.Errorf("wal: record kind %d is not heap-visible", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.HeapBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	p.Flags = payload[14]
+	p.CutoffXid = storage.TransactionID(binary.LittleEndian.Uint32(payload[15:19]))
+	return p, nil
+}
+
+// BtreeReusePagePayload mirrors the M0080-0004 page-recycle
+// record fields.
+type BtreeReusePagePayload struct {
+	Rel             storage.RelFileNode
+	Blk             storage.BlockNumber
+	RecycledFromXid storage.TransactionID
+}
+
+// EncodeBtreeReusePage encodes the M0080-0004 record.
+func EncodeBtreeReusePage(p BtreeReusePagePayload) []byte {
+	out := make([]byte, btreeReusePageSize)
+	out[0] = RecordKindBtreeReusePage
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(p.Blk))
+	binary.LittleEndian.PutUint32(out[14:18], uint32(p.RecycledFromXid))
+	return out
+}
+
+// DecodeBtreeReusePage decodes a `RecordKindBtreeReusePage` payload.
+func DecodeBtreeReusePage(payload []byte) (BtreeReusePagePayload, error) {
+	var p BtreeReusePagePayload
+	if len(payload) != btreeReusePageSize {
+		return p, fmt.Errorf("wal: btree-reuse-page payload len %d (want %d)", len(payload), btreeReusePageSize)
+	}
+	if payload[0] != RecordKindBtreeReusePage {
+		return p, fmt.Errorf("wal: record kind %d is not btree-reuse-page", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.Blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	p.RecycledFromXid = storage.TransactionID(binary.LittleEndian.Uint32(payload[14:18]))
+	return p, nil
+}
+
+// BtreeMetaCleanupPayload mirrors the M0080-0004 metapage
+// cleanup-XID record fields.
+type BtreeMetaCleanupPayload struct {
+	Rel                          storage.RelFileNode
+	NumHeapTuples                int64
+	LastCleanupNumDeletedTuples  int64
+}
+
+// EncodeBtreeMetaCleanup encodes the M0080-0004 metapage
+// cleanup-XID update record.
+func EncodeBtreeMetaCleanup(p BtreeMetaCleanupPayload) []byte {
+	out := make([]byte, btreeMetaCleanupSize)
+	out[0] = RecordKindBtreeMetaCleanup
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint64(out[10:18], uint64(p.NumHeapTuples))
+	binary.LittleEndian.PutUint64(out[18:26], uint64(p.LastCleanupNumDeletedTuples))
+	return out
+}
+
+// DecodeBtreeMetaCleanup decodes a `RecordKindBtreeMetaCleanup`
+// payload.
+func DecodeBtreeMetaCleanup(payload []byte) (BtreeMetaCleanupPayload, error) {
+	var p BtreeMetaCleanupPayload
+	if len(payload) != btreeMetaCleanupSize {
+		return p, fmt.Errorf("wal: btree-meta-cleanup payload len %d (want %d)", len(payload), btreeMetaCleanupSize)
+	}
+	if payload[0] != RecordKindBtreeMetaCleanup {
+		return p, fmt.Errorf("wal: record kind %d is not btree-meta-cleanup", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.NumHeapTuples = int64(binary.LittleEndian.Uint64(payload[10:18]))
+	p.LastCleanupNumDeletedTuples = int64(binary.LittleEndian.Uint64(payload[18:26]))
+	return p, nil
+}
+
 // EncodeBtreeInsert encodes one logical B-tree non-split insert
 // redo record. The opaque `item` payload is whatever bytes the
 // caller stored on the page (in v0,
@@ -1559,6 +1914,26 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	case RecordKindHeapUpdate:
+		if err := replayHeapUpdate(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindHeapMultiInsert:
+		if err := replayHeapMultiInsert(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindHeapVisible, RecordKindBtreeReusePage, RecordKindBtreeMetaCleanup:
+		// Catalog/metadata-only records (M0080-0003 / M0080-0004).
+		// VM updates, page-recycle notifications, and metapage
+		// cleanup-XID advances do not require a physical replay
+		// step in goopg's current design — VM is recomputed by
+		// VACUUM after a crash and the cleanup-XID is informational
+		// (no producer site relies on its exact value across a
+		// crash). Records are recognised so a future hot-standby
+		// or VM-backed visibility path can consume them.
+		return false, nil
 	case RecordKindCheckpoint:
 		return false, nil
 	case RecordKindXactCommit, RecordKindXactAbort:
@@ -1714,6 +2089,126 @@ func replayBtreeVacuum(mgr *storage.Manager, r Record) error {
 		return fmt.Errorf("wal: btree-vacuum apply: %w", err)
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(p.Rel, p.Blk, page)
+}
+
+// replayHeapUpdate applies the M0080-0002 atomic non-HOT
+// UPDATE record. Stamps xmax on the old tuple AND inserts the
+// new tuple at the recorded slot. Each page is independently
+// pd_lsn-idempotent. (M0080-0002.)
+func replayHeapUpdate(mgr *storage.Manager, r Record) error {
+	p, err := DecodeHeapUpdate(r.Payload)
+	if err != nil {
+		return err
+	}
+	endLSN := storage.LSN(r.EndLSN)
+	nblocks, err := mgr.NBlocks(p.Rel)
+	if err != nil {
+		return err
+	}
+	if p.OldBlk >= nblocks {
+		return fmt.Errorf("wal: heap-update replay: old block %d does not exist (nblocks=%d)", p.OldBlk, nblocks)
+	}
+	if p.NewBlk >= nblocks {
+		return fmt.Errorf("wal: heap-update replay: new block %d does not exist (nblocks=%d)", p.NewBlk, nblocks)
+	}
+	// Old tuple xmax stamp.
+	oldPage := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(p.Rel, p.OldBlk, oldPage); err != nil {
+		return err
+	}
+	if storage.IsNew(oldPage) {
+		return fmt.Errorf("wal: heap-update replay: old block %d uninitialised", p.OldBlk)
+	}
+	if storage.MustHeader(oldPage).LSN() < endLSN {
+		if err := storage.PageSetHeapTupleXmax(oldPage, p.OldLineSlot, p.Xmax); err != nil {
+			return fmt.Errorf("wal: heap-update old-stamp: %w", err)
+		}
+		storage.MustHeader(oldPage).SetLSN(endLSN)
+		if err := mgr.WriteBlock(p.Rel, p.OldBlk, oldPage); err != nil {
+			return err
+		}
+	}
+	// New tuple insert.
+	newPage := make(storage.Page, storage.BlockSize)
+	if p.NewBlk == p.OldBlk {
+		// Same page: re-read the post-xmax-stamp version.
+		if err := mgr.ReadBlock(p.Rel, p.NewBlk, newPage); err != nil {
+			return err
+		}
+	} else {
+		if err := mgr.ReadBlock(p.Rel, p.NewBlk, newPage); err != nil {
+			return err
+		}
+	}
+	if storage.IsNew(newPage) {
+		// Allow uninitialised — first heap insert on a fresh page.
+		if err := storage.InitPage(newPage); err != nil {
+			return err
+		}
+	}
+	if storage.MustHeader(newPage).LSN() < endLSN {
+		tup, err := storage.ParseHeapTuple(p.Tuple)
+		if err != nil {
+			return fmt.Errorf("wal: heap-update parse new tuple: %w", err)
+		}
+		got, err := storage.PageAddHeapTuple(newPage, tup)
+		if err != nil {
+			return fmt.Errorf("wal: heap-update insert new: %w", err)
+		}
+		if got != p.NewLineSlot {
+			return fmt.Errorf("wal: heap-update replay slot drift: got %d, want %d (block %d)", got, p.NewLineSlot, p.NewBlk)
+		}
+		storage.MustHeader(newPage).SetLSN(endLSN)
+		if err := mgr.WriteBlock(p.Rel, p.NewBlk, newPage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replayHeapMultiInsert applies the M0080-0002 bulk-insert
+// record. All tuples target the same page; pd_lsn idempotency
+// applies to the whole batch. (M0080-0002.)
+func replayHeapMultiInsert(mgr *storage.Manager, r Record) error {
+	p, err := DecodeHeapMultiInsert(r.Payload)
+	if err != nil {
+		return err
+	}
+	endLSN := storage.LSN(r.EndLSN)
+	nblocks, err := mgr.NBlocks(p.Rel)
+	if err != nil {
+		return err
+	}
+	if p.Blk >= nblocks {
+		return fmt.Errorf("wal: heap-multi-insert replay: block %d does not exist (nblocks=%d)", p.Blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(p.Rel, p.Blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		if err := storage.InitPage(page); err != nil {
+			return err
+		}
+	}
+	if storage.MustHeader(page).LSN() >= endLSN {
+		return nil
+	}
+	for i, e := range p.Entries {
+		tup, err := storage.ParseHeapTuple(e.Tuple)
+		if err != nil {
+			return fmt.Errorf("wal: heap-multi-insert parse entry %d: %w", i, err)
+		}
+		got, err := storage.PageAddHeapTuple(page, tup)
+		if err != nil {
+			return fmt.Errorf("wal: heap-multi-insert insert entry %d: %w", i, err)
+		}
+		if got != e.LineSlot {
+			return fmt.Errorf("wal: heap-multi-insert slot drift: got %d, want %d (entry %d, block %d)", got, e.LineSlot, i, p.Blk)
+		}
+	}
+	storage.MustHeader(page).SetLSN(endLSN)
 	return mgr.WriteBlock(p.Rel, p.Blk, page)
 }
 
