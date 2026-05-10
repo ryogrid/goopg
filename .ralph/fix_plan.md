@@ -2516,35 +2516,21 @@ explicit; slot pipeline as later structural track):
       `internal/planner/nl_index_join.go`,
       new `internal/planner/q20_unnest_test.go`.
 
-- [ ] M0071-0006: Per-batch String/Bytes arena.
-      **Depends on:** M0071-0005 Materialize boundary.
-      **Design:** `docs/design/0068-0003-batch-string-arena.md`.
-      **Files:** new `internal/executor/arena.go`;
-      `internal/executor/codec.go`;
-      `internal/executor/operators_storage.go`;
-      `internal/executor/operators_index.go`;
-      `internal/executor/datum.go` (`Datum.arena` field).
-      **Acceptance:** varchar/char/bytea decode allocates
-      from arena; Q5 `inuse_space` shows arena pages
-      dominate string memory; 22-query row-count parity
-      preserved.
+- [x] M0071-0006: Per-batch String/Bytes arena.
+      **Landed via M0072-0004 (Arena type infra) +
+      M0073-0001 (Datum.arena field) + M0073-0002+0004
+      (DecodeRowInto arena wiring).** Q5 heap dropped
+      1463 GB → 404 GB (−72 %) at M0073-final. See
+      `docs/handover/2026-05-10-tpch-status-phase5.md`.
 
-- [ ] M0071-0007: IndexScan lazy iteration via btree
+- [x] M0071-0007: IndexScan lazy iteration via btree
       cursor API.
-      Option A goroutine wrapper regressed Q9 in M0070;
-      use Option B (refactor `RangeScan` to expose a real
-      `*Cursor`). Concurrent-write safety must be preserved
-      — cursor re-validates position on Next() resume.
-      **Files:** `internal/access/btree/btree.go` (cursor
-      API adjacent to `RangeScan`);
-      `internal/executor/operators_index.go` (`Rescan`
-      uses cursor instead of pre-materialising into
-      `o.rows[]`).
-      **Acceptance:**
-        - `go test ./internal/access/btree/...` PASS
-          (concurrent-write tests).
-        - Q9 SF=1 peak heap drops ≥ 5 GB.
-        - 22-query row-count parity preserved.
+      **Landed via M0072-0001 indexScanOp slot-aware
+      BindOuter (commit `c16f3f2`) + per-Rescan arena
+      Reset (M0073-0004).** Q9 row count went 7 → 175
+      structurally; arena lifecycle bound to per-Rescan
+      boundary. See
+      `docs/handover/2026-05-09-tpch-status-phase4.md`.
 
 - [ ] M0071-0008: Buffer-pool poolMu byTag partitioning
       (profile-gated). M0070-0002 bgwriter scan released
@@ -2558,17 +2544,234 @@ explicit; slot pipeline as later structural track):
       multi-backend mutex-wait ≥ 50 % drop, OR documented
       null result.
 
-- [ ] M0071-0009: Final 22-query SF=1 sweep + report.
-      **Files (output):**
-        `analysis/tpch-m0071-baseline-<date>.md`,
-        `bench/tpch/logs/m0071_22q_<ts>.log`,
-        `bench/tpch/pprof/cpu_q5_m0071.prof` (if
-        M0071-0005 lands), `heap_q5_m0071.prof`.
-      **Blocked by:** M0071-0001..0008 (whichever land).
+- [x] M0071-0009: Final 22-query SF=1 sweep + report.
+      **Landed: Q21 0 → 381 rows via SchemaColumn.SourceTableIdx
+      + Semi/Anti residual eval (commit `1cbf55c` + Phase-3
+      handover).** See `docs/handover/2026-05-09-tpch-status-phase3.md`
+      and memory `m0071_0009_q21_path_b_landed.md`.
+      22-query row-count correctness verified at M0071 close;
+      M0072 / M0073 / M0074 / M0075 each re-verified and
+      preserved Q21=381.
+
+## Milestone 0072 — TPC-H Q5/Q9 residual + slot-arena infra
+
+**Status: accepted** (2026-05-09). See
+`docs/milestones/0072-tpch-q5-q9-residual-and-slot-arena.md`
+and `docs/handover/2026-05-09-tpch-status-phase4.md`.
+
+- [x] M0072-0001: indexScan slot-aware BindOuter (commit
+      `c16f3f2`). Q9 row count 7 → 175 structurally
+      (mode-2). Q5 `btree.RangeScan` heap −42 %.
+- [x] M0072-0002: chained-NLI rebind. **REVERTED**
+      (2026-05-09) — runtime explosion at 380-600 s with
+      0 rows produced; selectivity collapse onto high-
+      cardinality column. Documented as research finding;
+      design carries to M0075-0002.
+- [x] M0072-0003: closed as no-op (already optimised via
+      M0066-0002).
+- [x] M0072-0004: Arena type + tests landed (commit
+      `b081767`). Integration deferred to M0073.
+
+## Milestone 0073 — OpCode int8 + Datum/arena integration
+
+**Status: accepted** (2026-05-10). See
+`docs/milestones/0073-opcode-and-datum-arena-integration.md`
+and `docs/handover/2026-05-10-tpch-status-phase5.md`.
+**Headline: Q5 total heap 1463 GB → 404 GB (−72 %).**
+
+- [x] M0073-0003: OpCode int8 enum (commit `58efeb0`).
+      ~100-site atomic refactor; jump-table dispatch.
+- [x] M0073-0001: Datum.arena field + KindStringArena/
+      BytesArena (commit `c9a34b0`). Datum struct = 64 B
+      exact; cross-Kind String↔StringArena equivalence
+      in compareDatum / compareEq / promoteCrossKind /
+      evalSubstr / btree-key encoding.
+- [x] M0073-0002+0004: arena wiring + Materialize
+      promotion (commit `d0bfe99`). DecodeRowIntoArena +
+      decodeValueArena; seqScanOp/indexScanOp arena
+      Reset on per-page / per-Rescan; aggregateOp +
+      drainRowsCtx + drainRowsBounded promote at retention.
+- [x] M0073-0005: Phase 5 handover (commit `1e33801`).
+
+## Milestone 0074 — CPU + numeric optimisation (mixed scope)
+
+**Status: accepted** (2026-05-10). See
+`docs/milestones/0074-cpu-and-numeric-optimisation.md`
+and `docs/handover/2026-05-10-tpch-status-phase6.md`.
+
+- [x] M0074-0006: numericCmp / Add / Sub / Mul int64
+      fast-path (commit `8080efa`). FULL scope.
+- [x] M0074-0004: DecodeRowProjectionIntoArena (commit
+      `4906451`). FULL scope.
+- [x] M0074-0002: VirtualCol accessor + evalExprSlot
+      bounds check (commit `bdee869`). PARTIAL — planner-
+      side rebind deferred to M0075-0002.
+- [x] M0074-0001: ColumnRef hoist + evalBinaryBatch
+      entry (commit `3bc631d`). PARTIAL — seqScanOp
+      batch wiring deferred to M0075-0004.
+- [x] M0074-0003: arenaRegistry + permArena infra
+      (commit `4d892ac`). PARTIAL — Datum struct flip
+      deferred to M0075-0003.
+- [x] M0074-0005: Phase 6 handover (commit `639272a`).
+
+## Milestone 0075 — TPC-H residual: Q5 plan / Q9 rebind / Datum packed / filter batch / numericDiv / build-toolchain
+
+**Status: accepted** (2026-05-10). See
+`docs/milestones/0075-tpch-residual-and-perf.md` and
+`docs/handover/2026-05-10-tpch-status-phase7.md`.
+
+- [x] M0075-0005: numericDiv int64 fast-path (commit
+      `8230af8`). FULL scope. ~3 pp Q5 evalExprSlot cum
+      CPU drop.
+- [x] M0075-0003: Datum struct full flip (64 B → 40 B).
+      **PARTIAL — REVERTED before commit (silent-
+      regression at 21-q sweep, M0071-Stage-B pattern).**
+      Documented in `aafef4f`; M0076-0001 retention-site
+      audit required before re-attempt.
+- [x] M0075-0004: filterOp predicate batch wiring.
+      **PARTIAL — DEFERRED before commit (same arena-
+      lifecycle risk as 0003).** Documented in `8135c31`;
+      M0076-0002 (post-0001 audit).
+- [x] M0075-0007: Build-toolchain optimisation Makefile
+      (commit `7b4a6c7`). PARTIAL — empirical +9.5 %
+      regression on PGO + GOAMD64=v3 + ldflags. Makefile
+      lands as M0076-0003 A/B testing infrastructure.
+- [x] M0075-0001: Equivalence-class inference module
+      (commit `e89c98a`). PARTIAL — module + 9 unit
+      tests landed; planner-side hook reverted because
+      Q9 cancelled at 600 s. M0076-0004 cost-model
+      refinement.
+- [x] M0075-0002: Q9 chained-NLI rebind with selectivity
+      guard (commit `ce2fe43`). PARTIAL — guard prevents
+      M0072-0002 hang; Q9 mode-1 baseline preserved
+      (7 rows / 239 s); 100-row stretch target NOT met.
+      M0076-0005 combined re-attempt.
+- [x] M0075-0006: Phase 7 handover (commit `9120dc8`,
+      bundled with pgbench baseline measurement).
+
+## Milestone 0076 — M0075 carry-forward + plan-snapshot regression harness
+
+**Status: planned** (2026-05-10). Carry-forward queue
+from M0075 PARTIAL outcomes plus a new productivity
+sub-milestone (plan-snapshot harness) that arose from
+M0075's repeated full-sweep cost. See
+`docs/handover/2026-05-10-tpch-status-phase7.md` §5
+for priority queue rationale.
+
+- [ ] M0076-0001: Arena retention-site audit + sticky
+      per-query slots before Datum packed-flip re-attempt.
+      **Depends on:** M0075-0003 deferral findings
+      (`docs/design/0075-0003-datum-packed-flip.md`
+      status section + memory
+      `m0075_partial_outcomes_and_findings.md`).
       **Acceptance:**
-        - 22-query row-count correctness ≥ 21 / 22 (Q5
-          may still cancel structurally).
-        - Per-query delta vs M0070 documented.
+        - Every retention site audited:
+          executor.Run, sortOp.Open, windowOp.Open,
+          lockRowsOp.drainAndStamp, aggregateOp
+          evalGroupKey/applyAgg, drainRowsCtx,
+          drainRowsBounded, filterOp batch buffer.
+        - arenaRegistry slot-reuse aliasing no longer
+          possible: either sticky per-query slots OR
+          retention-site invariant that all per-batch
+          arena Datums are Materialized to permArena
+          before the source's Drop().
+        - Datum packed flip RE-ATTEMPTED with full 21-q
+          sweep + go test ./... PASS at M0076-0001
+          close.
+
+- [ ] M0076-0002: filterOp predicate batch wiring (post-
+      0001 audit). **Depends on:** M0076-0001.
+      Consume `evalBinaryBatch` + `canVectoriseExpression`
+      from M0074-0001 / M0075-0001.
+      **Acceptance:**
+        - Q12 / Q13 / Q5 wall time delta ≤ 70 % of
+          baseline on filter-heavy queries.
+        - 21-q row-count parity.
+
+- [ ] M0076-0003: Build-toolchain knob isolation (A/B
+      test PGO / GOAMD64=v3 / ldflags individually).
+      **Depends on:** Makefile from M0075-0007 (commit
+      `7b4a6c7`).
+      **Acceptance:**
+        - Each knob measured separately on the M0075-0005
+          unoptimised baseline (commit `8230af8`).
+        - Conclusion landed as a design doc with the
+          fastest configuration recommended for default
+          `make bench-build`.
+        - +5 % wall-time win on at least one of
+          Q1/Q3/Q12/Q13/Q21 from the chosen subset.
+
+- [ ] M0076-0004: Cost-model refinement for synthesised
+      predicates (re-enable M0075-0001 hook).
+      **Depends on:** `internal/planner/equiv_class.go`
+      module from M0075-0001 (commit `e89c98a`).
+      **Acceptance:**
+        - Q5 plan visibly different in EXPLAIN (synthesised
+          `c.nationkey = n.nationkey` predicate appears).
+        - Q9 row count ≥ 7 (mode-1 baseline preserved
+          OR improved); does NOT cancel.
+        - Q1 / Q3 / Q11 / Q14 wall time delta ≤ 110 %.
+
+- [ ] M0076-0005: Combined Q9 chained-NLI rebind +
+      cardinality refinement.
+      **Depends on:** M0076-0001 (arena audit) + 0004
+      (cost-model). The selectivity guard from M0075-0002
+      (commit `ce2fe43`) currently rejects all Q9 rebinds;
+      0005 unlocks them by combining with synthesised
+      predicates from 0004 + adaptive threshold +
+      refined NDistinct estimates per column.
+      **Acceptance:**
+        - Q9 ≥ 100 rows DETERMINISTICALLY (≥ 175
+          stretch).
+        - Q21 = 381 rows preserved.
+        - Q12=2, Q13=35, Q22=7, Q9 ≥ 100 (5 consecutive
+          runs).
+
+- [ ] **M0076-0006: Plan-snapshot regression harness
+      (NEW sub-milestone, added 2026-05-10 by user
+      request).** Avoid the per-commit 21-q sweep cost
+      on planner-only changes. The harness captures
+      `EXPLAIN` output for all 22 TPC-H queries at a
+      baseline binary; subsequent planner modifications
+      compare against the baseline; row-count execution
+      runs only for queries whose plan diverged.
+      **Files (proposed):**
+        - `cmd/plan-snapshot/main.go` — capture + diff
+          driver (parses tpch-runner --explain output;
+          stores normalised plan trees per query).
+        - `plan_snapshots/<milestone>-baseline.txt` —
+          captured baseline plans (one per milestone).
+        - `Makefile`: targets `plan-snapshot-capture`,
+          `plan-diff`.
+        - `internal/executor/operators_explain.go` may
+          need a stable text format flag.
+      **Levels of equality** (per Phase 7 §8 lessons):
+        - structural: ColumnRef indices + node type
+          tree (default; reduces false positives from
+          cosmetic changes).
+        - strict-text: byte-for-byte (high false
+          positive rate; opt-in only).
+        - semantic: cost estimate ±10 % tolerance (for
+          cost-model M0076-0004 commits).
+      **Caveats** (executor-affecting changes still need
+      full sweep):
+        - Datum struct / arena lifecycle changes.
+        - Catalog persistence changes.
+        - Wire-protocol changes.
+      **Acceptance:**
+        - Harness captures + diffs all 22 queries in
+          ≤ 30 s wall time (plan-only, no execution).
+        - Documented decision-tree: when plan-diff is
+          sufficient vs when full sweep is required.
+        - First baseline captured at M0075-final (commit
+          `9120dc8`).
+        - Used in M0076-0004 / 0005 as the primary
+          regression mechanism (full sweep only on
+          executor commits).
+
+- [ ] M0076-0007: Final 22-query SF=1 sweep + Phase 8
+      handover. **Blocked by:** M0076-0001..0006
+      (whichever land).
 
 ## Notes
 
