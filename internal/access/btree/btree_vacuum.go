@@ -730,6 +730,20 @@ func (bt *BTree) resetToEmptyRoot() error {
 		Level: 0,
 		Flags: BTLeaf | BTRoot,
 	})
+
+	// M0079-0004: emit a single LogBtreeNewRoot record covering
+	// both the empty-leaf-root content (no items) + metapage
+	// update. Falls back to per-page FPI when the hook is unset.
+	if emitter := bt.pool.LogBtreeNewRoot(); emitter != nil {
+		lsn, err := emitter(bt.rel, rootBlk, 0, nil)
+		if err != nil {
+			bt.unpinW(rootSlot)
+			return err
+		}
+		bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
+		bt.unpinW(rootSlot)
+		return bt.updateRootMetaWithLSN(rootBlk, 0, lsn)
+	}
 	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
 		bt.unpinW(rootSlot)
 		return err

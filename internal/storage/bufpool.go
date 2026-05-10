@@ -111,6 +111,8 @@ type Pool struct {
 	logBtreeUnlinkPage       LogBtreeUnlinkPageFunc
 	logBtreeNewRoot          LogBtreeNewRootFunc
 	logBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
+	// M0080-0001 logical record for VACUUM FREEZE.
+	logHeapFreeze LogHeapFreezeFunc
 	// logHeapHotUpdate emits an atomic HOT-update WAL record
 	// (M0046-0001): old-slot xmax stamp + new tuple insert on the
 	// same page in one record. nil disables the optimisation and
@@ -303,6 +305,14 @@ type PoolConfig struct {
 	// "already-empty" path. (M0079-0003.)
 	LogBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
 
+	// LogHeapFreeze, when non-nil, is exposed via
+	// Pool.LogHeapFreeze so the VACUUM FREEZE path can emit
+	// a logical record carrying the frozen-tuple slot list
+	// instead of an FPI for each frozen page. The hook lives
+	// in storage so internal/vacuum can consume it without
+	// importing internal/wal. (M0080-0001.)
+	LogHeapFreeze LogHeapFreezeFunc
+
 	// LogHeapHotUpdate, when non-nil, is exposed via
 	// Pool.LogHeapHotUpdate so the executor's HOT-update path can
 	// emit a single atomic change record (old-stamp + new-insert on
@@ -426,6 +436,11 @@ type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, level uint32
 // half-dead transition record.
 type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, flagsAfter uint16) (LSN, error)
 
+// LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record
+// carrying the 1-based ascending list of LP_NORMAL slot numbers
+// whose tuple xmin was rewritten to FrozenTransactionID.
+type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)
+
 // LogHeapHotUpdateFunc emits one atomic HOT-update redo record
 // (M0046-0001). The record encodes the old-slot xmax stamp +
 // HeapHotUpdated infomask + CTID chain + the new tuple bytes (which
@@ -474,6 +489,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logBtreeUnlinkPage:       cfg.LogBtreeUnlinkPage,
 		logBtreeNewRoot:          cfg.LogBtreeNewRoot,
 		logBtreeMarkPageHalfDead: cfg.LogBtreeMarkPageHalfDead,
+		logHeapFreeze:            cfg.LogHeapFreeze,
 		logHeapHotUpdate: cfg.LogHeapHotUpdate,
 		logHeapPruneOpt:  cfg.LogHeapPruneOpt,
 		logSmgrCreate:    cfg.LogSmgrCreate,
@@ -558,6 +574,11 @@ func (p *Pool) LogBtreeNewRoot() LogBtreeNewRootFunc { return p.logBtreeNewRoot 
 func (p *Pool) LogBtreeMarkPageHalfDead() LogBtreeMarkPageHalfDeadFunc {
 	return p.logBtreeMarkPageHalfDead
 }
+
+// LogHeapFreeze returns the configured heap-freeze
+// change-record emitter (M0080-0001). Callers fall back to
+// MarkDirty (FPI) when nil.
+func (p *Pool) LogHeapFreeze() LogHeapFreezeFunc { return p.logHeapFreeze }
 
 // LogHeapHotUpdate returns the configured HOT-update change-record
 // hook (M0046-0001), or nil if none was wired. Callers fall back to

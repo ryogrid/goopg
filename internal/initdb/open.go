@@ -381,6 +381,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// M0080-0001: heap-freeze logical record.
+	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) (storage.LSN, error) {
+		payload := wal.EncodeHeapFreeze(rel, blk, frozenSlots)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Row-lock (lock-only xmax + lock-strength) change record.
 	// M0021 tuple-level locking step 2 producer hook.
 	logHeapLock := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16) (storage.LSN, error) {
@@ -450,6 +460,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeUnlinkPage:       logBtreeUnlinkPage,
 		LogBtreeNewRoot:          logBtreeNewRoot,
 		LogBtreeMarkPageHalfDead: logBtreeMarkPageHalfDead,
+		LogHeapFreeze:            logHeapFreeze,
 		LogHeapLock:      logHeapLock,
 		LogHeapHotUpdate: logHeapHotUpdate,
 		LogHeapPruneOpt:  logHeapPruneOpt,

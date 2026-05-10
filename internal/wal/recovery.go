@@ -283,6 +283,27 @@ const (
 	// +leafBlk(4)+flagsAfter(2) = 16.
 	btreeMarkHalfDeadSize = 16
 
+	// RecordKindHeapFreeze is the M0080-0001 logical heap-freeze
+	// record. VACUUM FREEZE rewrites tuple xmin values to
+	// FrozenTransactionID; this record carries the 1-based
+	// LP_NORMAL slot numbers whose tuples were frozen so replay
+	// can reapply the rewrite deterministically. Counterpart to
+	// PostgreSQL's XLOG_HEAP2_FREEZE_PAGE (and the freeze portion
+	// of XLOG_HEAP2_PRUNE_VACUUM_SCAN in PG17+).
+	//
+	// Replaces the FPI fallback at `internal/vacuum/vacuum.go`
+	// line 157 with a logical record (~16-200 bytes per page vs
+	// 8 KiB FPI).
+	//
+	// Format identical to RecordKindHeapVacuum:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) | Block(4) |
+	//   count(2) | slots[count](2 each)
+	RecordKindHeapFreeze byte = 26
+
+	// heapFreezeHeaderSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
+	// +Block(4)+count(2) = 16. Mirrors heapVacuumHeaderSize.
+	heapFreezeHeaderSize = 16
+
 	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
 	smgrRecordSize = 10
 
@@ -1274,6 +1295,53 @@ func DecodeBtreeMarkPageHalfDead(payload []byte) (BtreeMarkHalfDeadPayload, erro
 	return p, nil
 }
 
+// EncodeHeapFreeze encodes the M0080-0001 heap-freeze record.
+// `frozenSlots` is the 1-based ascending list of LP_NORMAL slots
+// whose tuple xmin was rewritten to FrozenTransactionID.
+func EncodeHeapFreeze(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) []byte {
+	out := make([]byte, heapFreezeHeaderSize+2*len(frozenSlots))
+	out[0] = RecordKindHeapFreeze
+	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+	out[9] = byte(rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+	binary.LittleEndian.PutUint16(out[14:16], uint16(len(frozenSlots)))
+	for i, s := range frozenSlots {
+		binary.LittleEndian.PutUint16(out[heapFreezeHeaderSize+2*i:heapFreezeHeaderSize+2*i+2], s)
+	}
+	return out
+}
+
+// DecodeHeapFreeze decodes a `RecordKindHeapFreeze` payload.
+// (M0080-0001.)
+func DecodeHeapFreeze(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16, err error) {
+	if len(payload) < heapFreezeHeaderSize {
+		err = fmt.Errorf("wal: invalid heap-freeze payload len %d (want >= %d)", len(payload), heapFreezeHeaderSize)
+		return
+	}
+	if payload[0] != RecordKindHeapFreeze {
+		err = fmt.Errorf("wal: record kind %d is not heap-freeze", payload[0])
+		return
+	}
+	rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	count := int(binary.LittleEndian.Uint16(payload[14:16]))
+	want := heapFreezeHeaderSize + 2*count
+	if len(payload) != want {
+		err = fmt.Errorf("wal: heap-freeze payload len %d does not match count=%d (want %d)", len(payload), count, want)
+		return
+	}
+	frozenSlots = make([]uint16, count)
+	for i := 0; i < count; i++ {
+		frozenSlots[i] = binary.LittleEndian.Uint16(payload[heapFreezeHeaderSize+2*i : heapFreezeHeaderSize+2*i+2])
+	}
+	return
+}
+
 // EncodeBtreeInsert encodes one logical B-tree non-split insert
 // redo record. The opaque `item` payload is whatever bytes the
 // caller stored on the page (in v0,
@@ -1486,6 +1554,11 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	case RecordKindHeapFreeze:
+		if err := replayHeapFreeze(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
 	case RecordKindCheckpoint:
 		return false, nil
 	case RecordKindXactCommit, RecordKindXactAbort:
@@ -1642,6 +1715,39 @@ func replayBtreeVacuum(mgr *storage.Manager, r Record) error {
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(p.Rel, p.Blk, page)
+}
+
+// replayHeapFreeze applies the M0080-0001 heap-freeze record.
+// Reads the page, idempotency-checks via pd_lsn, then calls
+// `storage.PageFreezeBySlots` to rewrite the listed tuples'
+// xmin to FrozenTransactionID. (M0080-0001.)
+func replayHeapFreeze(mgr *storage.Manager, r Record) error {
+	rel, blk, frozenSlots, err := DecodeHeapFreeze(r.Payload)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	if blk >= nblocks {
+		return fmt.Errorf("wal: heap-freeze replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, blk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: heap-freeze replay: block %d uninitialised", blk)
+	}
+	if storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+		return nil
+	}
+	if err := storage.PageFreezeBySlots(page, frozenSlots); err != nil {
+		return fmt.Errorf("wal: heap-freeze apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(rel, blk, page)
 }
 
 // replayBtreeUnlinkPage applies the M0079-0003 atomic
