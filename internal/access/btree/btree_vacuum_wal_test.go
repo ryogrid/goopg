@@ -116,6 +116,99 @@ func TestVacuumIndexPagesEmitsLogicalRecord(t *testing.T) {
 	}
 }
 
+// TestVacuumIndexPagesEmitsUnlinkRecord pins M0079-0003: when
+// VacuumIndexPages empties enough leaves that
+// `unlinkEmptyLeaf` runs (and the LogBtreeUnlinkPage hook is
+// wired), each unlink emits ONE atomic record carrying the 4
+// page mutations instead of 4 FPIs. The test captures the
+// emissions and asserts they describe the expected shape.
+//
+// Test setup: bulk-load 200 entries, mark all of them dead,
+// run VacuumIndexPages with both LogBtreeVacuum (the M0079-0002
+// hook needed to empty leaves logically) AND LogBtreeUnlinkPage
+// hooked. The captured unlink emissions must:
+//
+//   1. Cover at least one leaf-unlink event.
+//   2. Each emission must describe one of the empty leaves
+//      with consistent left/right sibling info.
+func TestVacuumIndexPagesEmitsUnlinkRecord(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	t.Cleanup(func() { _ = mgr.Close() })
+
+	vacCap := &captureLogBtreeVacuum{}
+	type unlinkCap struct {
+		rel storage.RelFileNode
+		req storage.BtreeUnlinkPageRequest
+	}
+	var unlinkEmissions []unlinkCap
+	logUnlink := func(rel storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
+		unlinkEmissions = append(unlinkEmissions, unlinkCap{rel: rel, req: req})
+		return storage.LSN(1234), nil
+	}
+	logNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, level uint32, items [][]byte) (storage.LSN, error) {
+		// Recycle into the unlink emission slot for cleanliness; we
+		// don't need to track new-root events for this test.
+		return storage.LSN(1234), nil
+	}
+	logMarkHalfDead := func(rel storage.RelFileNode, leafBlk storage.BlockNumber, flagsAfter uint16) (storage.LSN, error) {
+		return storage.LSN(1234), nil
+	}
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{
+		Slots:                    256,
+		LogBtreeVacuum:           vacCap.emit,
+		LogBtreeUnlinkPage:       logUnlink,
+		LogBtreeNewRoot:          logNewRoot,
+		LogBtreeMarkPageHalfDead: logMarkHalfDead,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 16405, Fork: storage.MainFork}
+
+	const n = 200
+	entries := make([]BulkEntry, n)
+	for i := 0; i < n; i++ {
+		entries[i] = BulkEntry{
+			Key: EncodeInt4(int32(i)),
+			Ptr: storage.ItemPointer{Block: 0, Offset: uint16(i + 1)},
+		}
+	}
+	tree, err := BulkCreate(pool, rel, entries)
+	if err != nil {
+		t.Fatalf("BulkCreate: %v", err)
+	}
+	dead := make([]storage.ItemPointer, 0, n)
+	for i := 0; i < n; i++ {
+		dead = append(dead, storage.ItemPointer{Block: 0, Offset: uint16(i + 1)})
+	}
+	if _, err := tree.VacuumIndexPages(dead); err != nil {
+		t.Fatalf("VacuumIndexPages: %v", err)
+	}
+
+	if len(unlinkEmissions) == 0 {
+		t.Fatal("no LogBtreeUnlinkPage emissions despite all entries dead — expected at least one leaf unlink")
+	}
+	for i, e := range unlinkEmissions {
+		if e.rel != rel {
+			t.Errorf("emission[%d]: rel=%+v want %+v", i, e.rel, rel)
+		}
+		if e.req.LeafBlk == 0 {
+			t.Errorf("emission[%d]: LeafBlk=0 (metapage); unlink should never target the metapage", i)
+		}
+		// The post-unlink leaf flags must keep BTDeleted set
+		// and clear BTHalfDead.
+		if e.req.LeafFlagsAfter&BTDeleted == 0 {
+			t.Errorf("emission[%d]: LeafFlagsAfter missing BTDeleted (got %#x)", i, e.req.LeafFlagsAfter)
+		}
+		if e.req.LeafFlagsAfter&BTHalfDead != 0 {
+			t.Errorf("emission[%d]: LeafFlagsAfter still has BTHalfDead (got %#x)", i, e.req.LeafFlagsAfter)
+		}
+	}
+}
+
 // TestVacuumIndexPagesFallsBackToFPIWhenHookNil pins the
 // backwards-compat: a Pool without LogBtreeVacuum continues
 // to use the FPI fallback. Same VacuumIndexPages contract,

@@ -332,6 +332,55 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// M0079-0003 logical records covering the remaining FPI
+	// fallback paths in btree page deletion + root replacement.
+	logBtreeUnlinkPage := func(rel storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
+		payload := wal.EncodeBtreeUnlinkPage(wal.BtreeUnlinkPagePayload{
+			Rel:              rel,
+			LeafBlk:          req.LeafBlk,
+			LeafFlagsAfter:   req.LeafFlagsAfter,
+			HasLeftSib:       req.HasLeftSib,
+			LeftSibBlk:       req.LeftSibBlk,
+			LeftSibNewNext:   req.LeftSibNewNext,
+			HasRightSib:      req.HasRightSib,
+			RightSibBlk:      req.RightSibBlk,
+			RightSibNewPrev: req.RightSibNewPrev,
+			HasParent:        req.HasParent,
+			ParentBlk:        req.ParentBlk,
+			ParentRemoveSlot: req.ParentRemoveSlot,
+		})
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, level uint32, items [][]byte) (storage.LSN, error) {
+		payload := wal.EncodeBtreeNewRoot(wal.BtreeNewRootPayload{
+			Rel:     rel,
+			RootBlk: rootBlk,
+			Level:   level,
+			Items:   items,
+		})
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+	logBtreeMarkPageHalfDead := func(rel storage.RelFileNode, leafBlk storage.BlockNumber, flagsAfter uint16) (storage.LSN, error) {
+		payload := wal.EncodeBtreeMarkPageHalfDead(wal.BtreeMarkHalfDeadPayload{
+			Rel:        rel,
+			LeafBlk:    leafBlk,
+			FlagsAfter: flagsAfter,
+		})
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Row-lock (lock-only xmax + lock-strength) change record.
 	// M0021 tuple-level locking step 2 producer hook.
 	logHeapLock := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16) (storage.LSN, error) {
@@ -397,7 +446,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeInsert: logBtreeInsert,
 		LogHeapDelete:    logHeapDelete,
 		LogHeapVacuum:    logHeapVacuum,
-		LogBtreeVacuum:   logBtreeVacuum,
+		LogBtreeVacuum:           logBtreeVacuum,
+		LogBtreeUnlinkPage:       logBtreeUnlinkPage,
+		LogBtreeNewRoot:          logBtreeNewRoot,
+		LogBtreeMarkPageHalfDead: logBtreeMarkPageHalfDead,
 		LogHeapLock:      logHeapLock,
 		LogHeapHotUpdate: logHeapHotUpdate,
 		LogHeapPruneOpt:  logHeapPruneOpt,

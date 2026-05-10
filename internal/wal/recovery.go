@@ -222,6 +222,67 @@ const (
 	// variable-length item-bytes payload.
 	btreeVacuumTrailerSize = 2
 
+	// RecordKindBtreeUnlinkPage is the M0079-0003 atomic
+	// page-deletion record covering the four mutations
+	// `unlinkEmptyLeaf` performs (left sibling Next pointer,
+	// right sibling Prev pointer, leaf opaque flags, parent
+	// downlink removal). Counterpart to PostgreSQL's
+	// XLOG_BTREE_UNLINK_PAGE. Replaces 4 FPIs (~32 KiB) with a
+	// single ~30-50 byte logical record.
+	//
+	// Each of the 4 pages has its own pd_lsn idempotency check
+	// during replay so a partial replay can resume cleanly.
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) |
+	//   leafBlk(4) | leafFlagsAfter(2) |
+	//   leftSibValid(1) | leftSibBlk(4) | leftSibNewNext(4) |
+	//   rightSibValid(1) | rightSibBlk(4) | rightSibNewPrev(4) |
+	//   parentValid(1) | parentBlk(4) | parentRemoveSlot(2)
+	RecordKindBtreeUnlinkPage byte = 23
+
+	// btreeUnlinkPageSize: 1+4+4+1+4+2+1+4+4+1+4+4+1+4+2 = 41 bytes.
+	btreeUnlinkPageSize = 41
+
+	// RecordKindBtreeNewRoot is the M0079-0003 root-replacement
+	// record, used when (a) a split bubbles up and creates a
+	// new root, or (b) VACUUM empties the entire tree and
+	// resets to a single-page empty root. Counterpart to
+	// PostgreSQL's XLOG_BTREE_NEWROOT.
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) |
+	//   rootBlk(4) | level(4) | itemCount(2) |
+	//   [item0Len(2) | item0Bytes | ... | itemKLen(2) | itemKBytes]
+	RecordKindBtreeNewRoot byte = 24
+
+	// btreeNewRootHeaderSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
+	// +rootBlk(4)+level(4)+itemCount(2) = 20.
+	btreeNewRootHeaderSize = 20
+
+	// RecordKindBtreeMarkPageHalfDead is the M0079-0003
+	// flags-only record emitted at the start of two-phase page
+	// deletion. Most M0079-0002 vacuum passes that empty a
+	// leaf bundle the BTHalfDead | BTDeleted transition into
+	// the BtreeVacuum record's `OpaqueFlags` trailer; this
+	// standalone record is for the case where the leaf was
+	// already empty before the dead-set scan and only the
+	// flag transition needs WAL coverage.
+	//
+	// Counterpart to PostgreSQL's XLOG_BTREE_MARK_PAGE_HALFDEAD
+	// (control-only — goopg does not need the parent /
+	// topparent backup blocks because phase 2 is a separate
+	// record in our design).
+	//
+	// Format:
+	//   kind(1) | DBOid(4) | RelOid(4) | Fork(1) |
+	//   leafBlk(4) | flagsAfter(2)
+	RecordKindBtreeMarkPageHalfDead byte = 25
+
+	// btreeMarkHalfDeadSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
+	// +leafBlk(4)+flagsAfter(2) = 16.
+	btreeMarkHalfDeadSize = 16
+
 	// smgrRecordSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1) = 10 bytes.
 	smgrRecordSize = 10
 
@@ -1022,6 +1083,197 @@ func DecodeBtreeVacuum(payload []byte) (BtreeVacuumPayload, error) {
 	return p, nil
 }
 
+// BtreeUnlinkPagePayload mirrors `EncodeBtreeUnlinkPage`'s
+// on-wire fields. (M0079-0003.)
+type BtreeUnlinkPagePayload struct {
+	Rel              storage.RelFileNode
+	LeafBlk          storage.BlockNumber
+	LeafFlagsAfter   uint16
+	HasLeftSib       bool
+	LeftSibBlk       storage.BlockNumber
+	LeftSibNewNext   storage.BlockNumber
+	HasRightSib      bool
+	RightSibBlk      storage.BlockNumber
+	RightSibNewPrev  storage.BlockNumber
+	HasParent        bool
+	ParentBlk        storage.BlockNumber
+	ParentRemoveSlot uint16
+}
+
+// EncodeBtreeUnlinkPage encodes the M0079-0003 atomic
+// page-deletion record. Replay reapplies sibling Prev/Next
+// patches, the leaf opaque-flags transition, and the parent
+// downlink removal under per-page pd_lsn idempotency.
+func EncodeBtreeUnlinkPage(p BtreeUnlinkPagePayload) []byte {
+	out := make([]byte, btreeUnlinkPageSize)
+	out[0] = RecordKindBtreeUnlinkPage
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(p.LeafBlk))
+	binary.LittleEndian.PutUint16(out[14:16], p.LeafFlagsAfter)
+	if p.HasLeftSib {
+		out[16] = 1
+	}
+	binary.LittleEndian.PutUint32(out[17:21], uint32(p.LeftSibBlk))
+	binary.LittleEndian.PutUint32(out[21:25], uint32(p.LeftSibNewNext))
+	if p.HasRightSib {
+		out[25] = 1
+	}
+	binary.LittleEndian.PutUint32(out[26:30], uint32(p.RightSibBlk))
+	binary.LittleEndian.PutUint32(out[30:34], uint32(p.RightSibNewPrev))
+	if p.HasParent {
+		out[34] = 1
+	}
+	binary.LittleEndian.PutUint32(out[35:39], uint32(p.ParentBlk))
+	binary.LittleEndian.PutUint16(out[39:41], p.ParentRemoveSlot)
+	return out
+}
+
+// DecodeBtreeUnlinkPage decodes a `RecordKindBtreeUnlinkPage`
+// payload. (M0079-0003.)
+func DecodeBtreeUnlinkPage(payload []byte) (BtreeUnlinkPagePayload, error) {
+	var p BtreeUnlinkPagePayload
+	if len(payload) != btreeUnlinkPageSize {
+		return p, fmt.Errorf("wal: btree-unlink-page payload len %d (want %d)", len(payload), btreeUnlinkPageSize)
+	}
+	if payload[0] != RecordKindBtreeUnlinkPage {
+		return p, fmt.Errorf("wal: record kind %d is not btree-unlink-page", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.LeafBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	p.LeafFlagsAfter = binary.LittleEndian.Uint16(payload[14:16])
+	p.HasLeftSib = payload[16] != 0
+	p.LeftSibBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[17:21]))
+	p.LeftSibNewNext = storage.BlockNumber(binary.LittleEndian.Uint32(payload[21:25]))
+	p.HasRightSib = payload[25] != 0
+	p.RightSibBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[26:30]))
+	p.RightSibNewPrev = storage.BlockNumber(binary.LittleEndian.Uint32(payload[30:34]))
+	p.HasParent = payload[34] != 0
+	p.ParentBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[35:39]))
+	p.ParentRemoveSlot = binary.LittleEndian.Uint16(payload[39:41])
+	return p, nil
+}
+
+// BtreeNewRootPayload mirrors `EncodeBtreeNewRoot`'s on-wire
+// fields. (M0079-0003.)
+type BtreeNewRootPayload struct {
+	Rel     storage.RelFileNode
+	RootBlk storage.BlockNumber
+	Level   uint32
+	Items   [][]byte
+}
+
+// EncodeBtreeNewRoot encodes the M0079-0003 root-replacement
+// record. Used when (a) a split bubbles up to a new root, or
+// (b) VACUUM resets to an empty root after fully emptying the
+// tree.
+func EncodeBtreeNewRoot(p BtreeNewRootPayload) []byte {
+	bodySize := 0
+	for _, it := range p.Items {
+		bodySize += 2 + len(it)
+	}
+	out := make([]byte, btreeNewRootHeaderSize+bodySize)
+	out[0] = RecordKindBtreeNewRoot
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(p.RootBlk))
+	binary.LittleEndian.PutUint32(out[14:18], p.Level)
+	binary.LittleEndian.PutUint16(out[18:20], uint16(len(p.Items)))
+	off := btreeNewRootHeaderSize
+	for _, it := range p.Items {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(it)))
+		off += 2
+		off += copy(out[off:], it)
+	}
+	return out
+}
+
+// DecodeBtreeNewRoot decodes a `RecordKindBtreeNewRoot` payload.
+// (M0079-0003.)
+func DecodeBtreeNewRoot(payload []byte) (BtreeNewRootPayload, error) {
+	var p BtreeNewRootPayload
+	if len(payload) < btreeNewRootHeaderSize {
+		return p, fmt.Errorf("wal: btree-newroot payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindBtreeNewRoot {
+		return p, fmt.Errorf("wal: record kind %d is not btree-newroot", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.RootBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	p.Level = binary.LittleEndian.Uint32(payload[14:18])
+	count := int(binary.LittleEndian.Uint16(payload[18:20]))
+	off := btreeNewRootHeaderSize
+	p.Items = make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		if off+2 > len(payload) {
+			return p, fmt.Errorf("wal: btree-newroot truncated at item %d header", i)
+		}
+		itLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if off+itLen > len(payload) {
+			return p, fmt.Errorf("wal: btree-newroot truncated at item %d body", i)
+		}
+		dup := make([]byte, itLen)
+		copy(dup, payload[off:off+itLen])
+		p.Items = append(p.Items, dup)
+		off += itLen
+	}
+	if off != len(payload) {
+		return p, fmt.Errorf("wal: btree-newroot trailing bytes (%d remaining)", len(payload)-off)
+	}
+	return p, nil
+}
+
+// BtreeMarkHalfDeadPayload mirrors `EncodeBtreeMarkPageHalfDead`'s
+// on-wire fields. (M0079-0003.)
+type BtreeMarkHalfDeadPayload struct {
+	Rel         storage.RelFileNode
+	LeafBlk     storage.BlockNumber
+	FlagsAfter  uint16
+}
+
+// EncodeBtreeMarkPageHalfDead encodes the M0079-0003 leaf-only
+// half-dead transition record.
+func EncodeBtreeMarkPageHalfDead(p BtreeMarkHalfDeadPayload) []byte {
+	out := make([]byte, btreeMarkHalfDeadSize)
+	out[0] = RecordKindBtreeMarkPageHalfDead
+	binary.LittleEndian.PutUint32(out[1:5], p.Rel.DBOid)
+	binary.LittleEndian.PutUint32(out[5:9], p.Rel.RelOid)
+	out[9] = byte(p.Rel.Fork)
+	binary.LittleEndian.PutUint32(out[10:14], uint32(p.LeafBlk))
+	binary.LittleEndian.PutUint16(out[14:16], p.FlagsAfter)
+	return out
+}
+
+// DecodeBtreeMarkPageHalfDead decodes the record. (M0079-0003.)
+func DecodeBtreeMarkPageHalfDead(payload []byte) (BtreeMarkHalfDeadPayload, error) {
+	var p BtreeMarkHalfDeadPayload
+	if len(payload) != btreeMarkHalfDeadSize {
+		return p, fmt.Errorf("wal: btree-mark-halfdead payload len %d (want %d)", len(payload), btreeMarkHalfDeadSize)
+	}
+	if payload[0] != RecordKindBtreeMarkPageHalfDead {
+		return p, fmt.Errorf("wal: record kind %d is not btree-mark-halfdead", payload[0])
+	}
+	p.Rel = storage.RelFileNode{
+		DBOid:  binary.LittleEndian.Uint32(payload[1:5]),
+		RelOid: binary.LittleEndian.Uint32(payload[5:9]),
+		Fork:   storage.ForkNumber(payload[9]),
+	}
+	p.LeafBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
+	p.FlagsAfter = binary.LittleEndian.Uint16(payload[14:16])
+	return p, nil
+}
+
 // EncodeBtreeInsert encodes one logical B-tree non-split insert
 // redo record. The opaque `item` payload is whatever bytes the
 // caller stored on the page (in v0,
@@ -1219,6 +1471,21 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	case RecordKindBtreeUnlinkPage:
+		if err := replayBtreeUnlinkPage(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindBtreeNewRoot:
+		if err := replayBtreeNewRoot(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
+	case RecordKindBtreeMarkPageHalfDead:
+		if err := replayBtreeMarkPageHalfDead(mgr, r); err != nil {
+			return false, err
+		}
+		return true, nil
 	case RecordKindCheckpoint:
 		return false, nil
 	case RecordKindXactCommit, RecordKindXactAbort:
@@ -1375,6 +1642,157 @@ func replayBtreeVacuum(mgr *storage.Manager, r Record) error {
 	}
 	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
 	return mgr.WriteBlock(p.Rel, p.Blk, page)
+}
+
+// replayBtreeUnlinkPage applies the M0079-0003 atomic
+// page-deletion record. Each of the four pages (left sibling,
+// right sibling, leaf, parent) is independently idempotent
+// via pd_lsn — replay can resume cleanly after a partial
+// crash. (M0079-0003.)
+func replayBtreeUnlinkPage(mgr *storage.Manager, r Record) error {
+	p, err := DecodeBtreeUnlinkPage(r.Payload)
+	if err != nil {
+		return err
+	}
+	endLSN := storage.LSN(r.EndLSN)
+
+	apply := func(blk storage.BlockNumber, fn func(page storage.Page) error) error {
+		nblocks, err := mgr.NBlocks(p.Rel)
+		if err != nil {
+			return err
+		}
+		if blk >= nblocks {
+			return fmt.Errorf("wal: btree-unlink replay: block %d does not exist (nblocks=%d)", blk, nblocks)
+		}
+		page := make(storage.Page, storage.BlockSize)
+		if err := mgr.ReadBlock(p.Rel, blk, page); err != nil {
+			return err
+		}
+		if storage.IsNew(page) {
+			return fmt.Errorf("wal: btree-unlink replay: block %d uninitialised", blk)
+		}
+		if storage.MustHeader(page).LSN() >= endLSN {
+			return nil
+		}
+		if err := fn(page); err != nil {
+			return err
+		}
+		storage.MustHeader(page).SetLSN(endLSN)
+		return mgr.WriteBlock(p.Rel, blk, page)
+	}
+
+	if p.HasLeftSib {
+		if err := apply(p.LeftSibBlk, func(page storage.Page) error {
+			return btree.ReplaySetSiblingNext(page, p.LeftSibNewNext)
+		}); err != nil {
+			return fmt.Errorf("wal: btree-unlink left sib: %w", err)
+		}
+	}
+	if p.HasRightSib {
+		if err := apply(p.RightSibBlk, func(page storage.Page) error {
+			return btree.ReplaySetSiblingPrev(page, p.RightSibNewPrev)
+		}); err != nil {
+			return fmt.Errorf("wal: btree-unlink right sib: %w", err)
+		}
+	}
+	if err := apply(p.LeafBlk, func(page storage.Page) error {
+		return btree.ReplaySetOpaqueFlags(page, p.LeafFlagsAfter)
+	}); err != nil {
+		return fmt.Errorf("wal: btree-unlink leaf: %w", err)
+	}
+	if p.HasParent {
+		if err := apply(p.ParentBlk, func(page storage.Page) error {
+			return btree.ReplayRemoveParentDownlink(page, p.ParentRemoveSlot)
+		}); err != nil {
+			return fmt.Errorf("wal: btree-unlink parent: %w", err)
+		}
+	}
+	return nil
+}
+
+// replayBtreeNewRoot applies the M0079-0003 root-replacement
+// record. Reconstructs the new root page from scratch using
+// the carried items and updates the metapage to point at it.
+// (M0079-0003.)
+func replayBtreeNewRoot(mgr *storage.Manager, r Record) error {
+	p, err := DecodeBtreeNewRoot(r.Payload)
+	if err != nil {
+		return err
+	}
+	endLSN := storage.LSN(r.EndLSN)
+	nblocks, err := mgr.NBlocks(p.Rel)
+	if err != nil {
+		return err
+	}
+	if p.RootBlk >= nblocks {
+		return fmt.Errorf("wal: btree-newroot replay: root block %d does not exist (nblocks=%d)", p.RootBlk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(p.Rel, p.RootBlk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: btree-newroot replay: root block %d uninitialised", p.RootBlk)
+	}
+	if storage.MustHeader(page).LSN() < endLSN {
+		if err := btree.ReplayNewRootPage(page, p.Level, p.Items); err != nil {
+			return fmt.Errorf("wal: btree-newroot apply: %w", err)
+		}
+		storage.MustHeader(page).SetLSN(endLSN)
+		if err := mgr.WriteBlock(p.Rel, p.RootBlk, page); err != nil {
+			return err
+		}
+	}
+
+	// Metapage update — separate idempotency check so a partial
+	// replay (root written but meta not) can resume.
+	metaPage := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(p.Rel, btree.MetaBlock, metaPage); err != nil {
+		return err
+	}
+	if storage.IsNew(metaPage) {
+		return fmt.Errorf("wal: btree-newroot replay: metapage uninitialised")
+	}
+	if storage.MustHeader(metaPage).LSN() >= endLSN {
+		return nil
+	}
+	if err := btree.ReplayMetaSetRoot(metaPage, p.RootBlk, p.Level); err != nil {
+		return fmt.Errorf("wal: btree-newroot meta apply: %w", err)
+	}
+	storage.MustHeader(metaPage).SetLSN(endLSN)
+	return mgr.WriteBlock(p.Rel, btree.MetaBlock, metaPage)
+}
+
+// replayBtreeMarkPageHalfDead applies the M0079-0003 leaf-only
+// half-dead transition record. (M0079-0003.)
+func replayBtreeMarkPageHalfDead(mgr *storage.Manager, r Record) error {
+	p, err := DecodeBtreeMarkPageHalfDead(r.Payload)
+	if err != nil {
+		return err
+	}
+	endLSN := storage.LSN(r.EndLSN)
+	nblocks, err := mgr.NBlocks(p.Rel)
+	if err != nil {
+		return err
+	}
+	if p.LeafBlk >= nblocks {
+		return fmt.Errorf("wal: btree-mark-halfdead replay: block %d does not exist (nblocks=%d)", p.LeafBlk, nblocks)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(p.Rel, p.LeafBlk, page); err != nil {
+		return err
+	}
+	if storage.IsNew(page) {
+		return fmt.Errorf("wal: btree-mark-halfdead replay: block %d uninitialised", p.LeafBlk)
+	}
+	if storage.MustHeader(page).LSN() >= endLSN {
+		return nil
+	}
+	if err := btree.ReplaySetOpaqueFlags(page, p.FlagsAfter); err != nil {
+		return fmt.Errorf("wal: btree-mark-halfdead apply: %w", err)
+	}
+	storage.MustHeader(page).SetLSN(endLSN)
+	return mgr.WriteBlock(p.Rel, p.LeafBlk, page)
 }
 
 // replayHeapLock applies one row-lock redo record. The page must
