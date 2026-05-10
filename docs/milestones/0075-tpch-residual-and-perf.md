@@ -129,8 +129,16 @@ F (0002) → G (0006).
       that broke M0075-0003. M0074-0001 evalBinaryBatch
       + detectors stay landed as forward-compat. M0076-0002
       (planned).
-- [ ] M0075-0001 lands: equivalence-class inference;
-      Q5 plan visibly different (EXPLAIN); 21-q parity.
+- [x] M0075-0001 PARTIAL: `inferTransitiveEqualities`
+      module + 9 unit tests landed at
+      `internal/planner/equiv_class.go`; the planner-
+      side hook into `tryBushyDP` was attempted then
+      reverted. Empirical result: enabling the
+      synthesised conjuncts caused Q9 to cancel at the
+      600 s budget (was 219-256 s baseline mode-1).
+      Module is correct (unit tests PASS); the
+      planner-side hook needs join-graph cost-model
+      refinement before re-attempt. M0076-0004 (planned).
 - [ ] M0075-0002 lands: chained-NLI rebind with per-outer
       selectivity guard; **Q9 ≥ 100 rows DETERMINISTICALLY**
       (≥ 175 stretch); Q21 still = 381.

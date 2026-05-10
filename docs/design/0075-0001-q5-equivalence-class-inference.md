@@ -1,7 +1,21 @@
 # Design 0075-0001 — Q5 equivalence-class inference for transitive equalities
 
 **Milestone:** M0075-0001
-**Status:** draft
+**Status:** **PARTIAL — module + 9 unit tests landed
+2026-05-10; the planner-side hook into `tryBushyDP` was
+attempted then reverted. Empirical result: enabling the
+synthesised conjuncts caused Q9 to cancel at the 600 s
+budget (was 219-256 s baseline mode-1). The
+`inferTransitiveEqualities` function works correctly in
+unit tests (all 9 PASS), but feeding the closure
+predicates into the bushy DP enumerator changes Q9's
+join graph in a way that pessimises plan selection —
+the additional edges expose join orders the cost model
+ranks higher than the current good plan. Investigation
+deferred to M0076.** The module lands as forward-compat
+infrastructure (`internal/planner/equiv_class.go` +
+`equiv_class_test.go`) so M0076's investigation can
+build on a tested, correct closure implementation.
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** none (pure planner-side addition).
