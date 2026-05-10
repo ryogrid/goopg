@@ -1,6 +1,6 @@
 # Milestone 0077 — Q5 planner fix: binary tree preservation + cost-model maturation
 
-**Status:** planned
+**Status:** accepted (2026-05-11)
 **Branch:** `gc-oriented-refactor` / `try-codex`
 (continuation of M0076)
 **Depends on:** M0076-final (Phase 8 handover at
