@@ -1,6 +1,8 @@
 package planner
 
 import (
+	"sort"
+
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -78,17 +80,29 @@ func (ec *equivClasses) union(a, b columnIdent) {
 // classes returns each equivalence class as a slice of
 // its members. Classes with only one member are skipped
 // (no closure to synthesise from a singleton).
+//
+// M0076-0004: each class's member slice is sorted by
+// `compareColumnIdent` so the synthesised conjunct
+// sequence in `inferTransitiveEqualities` is
+// reproducible across runs (essential for plan-snapshot
+// diff stability — Go's map iteration is intentionally
+// nondeterministic).
 func (ec *equivClasses) classes() map[columnIdent][]columnIdent {
 	result := make(map[columnIdent][]columnIdent)
 	for k := range ec.parent {
 		root := ec.find(k)
 		result[root] = append(result[root], k)
 	}
-	// Filter out singletons.
+	// Filter out singletons + sort each class.
 	for root, members := range result {
 		if len(members) < 2 {
 			delete(result, root)
+			continue
 		}
+		sort.SliceStable(members, func(i, j int) bool {
+			return compareColumnIdent(members[i], members[j]) < 0
+		})
+		result[root] = members
 	}
 	return result
 }
@@ -141,8 +155,24 @@ func inferTransitiveEqualities(conjuncts []Expr) []Expr {
 	// equivalence class with ≥ 2 members, emit
 	// `member[i] = member[j]` for every pair NOT in
 	// seenPairs.
+	//
+	// M0076-0004: iterate classes in a deterministic
+	// order (sorted by root columnIdent). Without this,
+	// Go's map iteration order varies per run and the
+	// synthesised conjunct sequence appended to the DP's
+	// conjunct list shifts between runs, causing
+	// non-reproducible plan choices.
 	var added []Expr
-	for _, members := range ec.classes() {
+	classMap := ec.classes()
+	roots := make([]columnIdent, 0, len(classMap))
+	for root := range classMap {
+		roots = append(roots, root)
+	}
+	sort.SliceStable(roots, func(i, j int) bool {
+		return compareColumnIdent(roots[i], roots[j]) < 0
+	})
+	for _, root := range roots {
+		members := classMap[root]
 		for i := 0; i < len(members); i++ {
 			for j := i + 1; j < len(members); j++ {
 				p := orderedPair(members[i], members[j])

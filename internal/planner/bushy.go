@@ -24,7 +24,28 @@ type joinEdge struct {
 	predicate  Expr // the BinaryOp("=") expression
 	leftKey    Expr // left-hand side key expression
 	rightKey   Expr // right-hand side key expression
+
+	// M0076-0004: marks edges produced from synthesised
+	// (transitively-inferred) conjuncts. estimateJoinCost
+	// applies `inferredEdgePenalty` (> 1.0) to these edges
+	// to bias the bushy DP away from plans that exploit
+	// transitivity as if it were independent selectivity.
+	// Set by buildJoinGraph when an edge originates from
+	// the synthesised tail of the conjunct list (post-
+	// inferTransitiveEqualities). Default false.
+	isInferred bool
 }
+
+// inferredEdgePenalty is the multiplier applied to
+// estimateJoinCost when the joinEdge is `isInferred=true`.
+// > 1.0 means inferred edges are MORE EXPENSIVE than
+// explicit edges, so the bushy DP prefers plans driven
+// by original predicates. Initial value 2.0 chosen as
+// a conservative starting point; M0076-0001 (Commit D)
+// verifies whether this prevents the Q9 regression mode
+// when the inferTransitiveEqualities hook is enabled.
+// (M0076-0004.)
+const inferredEdgePenalty = 2.0
 
 // joinGraph is an undirected graph where nodes are FROM tables and
 // edges are equijoin predicates from the WHERE clause.
@@ -65,7 +86,11 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 		return node, pred
 	}
 	conjuncts := splitAnd(pred)
-	g := buildJoinGraph(tables, scans, scanWidth, conjuncts, ctx.bindings)
+	// M0076-0004: inferredCount=0 here — the
+	// inferTransitiveEqualities hook is enabled in
+	// M0076-0001 (Commit D), and at that point the
+	// caller will compute the count and pass it through.
+	g := buildJoinGraph(tables, scans, scanWidth, conjuncts, 0, ctx.bindings)
 	if g == nil || len(g.edges) == 0 {
 		return node, pred
 	}
@@ -104,7 +129,15 @@ func extractScans(node Node) ([]Node, []int) {
 }
 
 // buildJoinGraph extracts equijoin edges from WHERE conjuncts.
-func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conjuncts []Expr, bindings []rangeBinding) *joinGraph {
+//
+// M0076-0004: `inferredCount` tags the last N conjuncts
+// in the slice as synthesised (transitively-inferred via
+// inferTransitiveEqualities). Edges produced from those
+// conjuncts get `joinEdge.isInferred = true` so
+// estimateJoinCost can apply the penalty multiplier.
+// inferredCount = 0 means no synthesised conjuncts (the
+// historical pre-M0076 behaviour).
+func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conjuncts []Expr, inferredCount int, bindings []rangeBinding) *joinGraph {
 	g := &joinGraph{
 		nodes:     len(tables),
 		tables:    tables,
@@ -123,7 +156,7 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 		cumOffsets[i+1] = cumOffsets[i] + w
 	}
 
-	addEdge := func(bin *BinaryOp) {
+	addEdge := func(bin *BinaryOp, isInferred bool) {
 		li := tableForCol(bin.Left, cumOffsets)
 		ri := tableForCol(bin.Right, cumOffsets)
 		if li < 0 || ri < 0 || li == ri {
@@ -135,11 +168,20 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 			predicate:  bin,
 			leftKey:    bin.Left,
 			rightKey:   bin.Right,
+			isInferred: isInferred,
 		})
 	}
-	for _, c := range conjuncts {
+	// M0076-0004: explicitStart is the index AFTER which all
+	// conjuncts are synthesised. inferredCount=0 → all conjuncts
+	// are explicit (pre-M0076 behaviour preserved).
+	explicitEnd := len(conjuncts) - inferredCount
+	if explicitEnd < 0 {
+		explicitEnd = 0
+	}
+	for i, c := range conjuncts {
+		isInferred := i >= explicitEnd
 		if bin, ok := c.(*BinaryOp); ok && bin.Op == parser.OpEq {
-			addEdge(bin)
+			addEdge(bin, isInferred)
 			continue
 		}
 		// M0058-0004: descend into OR-of-ANDs predicates so a join
@@ -148,7 +190,7 @@ func buildJoinGraph(tables []*catalog.Table, scans []Node, scanWidth []int, conj
 		// edge. The full OR remains as a residual predicate; this
 		// only feeds the join-order DP.
 		for _, eq := range plannerCommonEquijoinsAcrossOr(c) {
-			addEdge(eq)
+			addEdge(eq, isInferred)
 		}
 	}
 	return g
@@ -540,6 +582,22 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 	cost := product / ndv
 	if cost < 1 {
 		cost = 1
+	}
+	// M0076-0004: penalise edges produced from synthesised
+	// (transitively-inferred) conjuncts. The bushy DP
+	// minimises cost; multiplying by inferredEdgePenalty
+	// (>1.0) makes inferred edges look more expensive so
+	// the DP prefers plans driven by explicit predicates.
+	// This prevents the Q9 regression mode that caused
+	// M0075-0001's hook revert (synthesised edges had
+	// equal weight to explicit ones, letting the DP pick
+	// build-heavy plans that exploit transitive
+	// redundancy as if it were independent selectivity).
+	if edge.isInferred {
+		cost = int64(float64(cost) * inferredEdgePenalty)
+		if cost < 1 {
+			cost = 1
+		}
 	}
 	return cost
 }

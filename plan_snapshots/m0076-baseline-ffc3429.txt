@@ -151,11 +151,7 @@ Projection (rows=9510)
   ->  GroupAggregate (1 keys, 1 aggregates) (rows=9510)
     ->  Filter (rows=666939)
       ->  Seq Scan on lineitem (stats) (rows=6002455)
-=== Q15b-MAIN
-[ERROR: pq: relation "revenue0" does not exist (42P01)]
 === Q16
-
-=== Q17
 Projection (rows=12472)
   ->  Sort (rows=12472)
     ->  GroupAggregate (3 keys, 1 aggregates) (rows=12472)
@@ -163,7 +159,7 @@ Projection (rows=12472)
         ->  Hash Join (INNER) (rows=5640953)
           ->  Seq Scan on partsupp (stats) (rows=800000)
           ->  Seq Scan on part (stats) (rows=200000)
-=== Q18
+=== Q17
 Projection (rows=1)
   ->  Aggregate (1 aggregates) (rows=1)
     ->  Filter (rows=50020)
@@ -174,7 +170,7 @@ Projection (rows=1)
         ->  GroupAggregate (1 keys, 1 aggregates) (rows=27897)
           ->  Filter (rows=30012)
             ->  Seq Scan on lineitem (stats) (rows=6002455)
-=== Q19
+=== Q18
 Projection
   ->  Sort
     ->  GroupAggregate (5 keys, 1 aggregates)
@@ -188,13 +184,13 @@ Projection
             ->  Filter (rows=9903)
               ->  GroupAggregate (1 keys, 1 aggregates) (rows=29711)
                 ->  Seq Scan on lineitem (stats) (rows=6002455)
-=== Q20
+=== Q19
 Projection (rows=1)
   ->  Aggregate (1 aggregates) (rows=1)
     ->  Hash Join (INNER) (rows=43032978)
       ->  Seq Scan on lineitem (stats) (rows=6002455)
       ->  Seq Scan on part (stats) (rows=200000)
-=== Q21
+=== Q20
 Projection
   ->  Sort
     ->  Filter
@@ -213,7 +209,7 @@ Projection
               ->  Projection (rows=66666)
                 ->  Filter (rows=66666)
                   ->  Seq Scan on part (stats) (rows=200000)
-=== Q22
+=== Q21
 Projection
   ->  Sort
     ->  GroupAggregate (1 keys, 1 aggregates)
@@ -228,3 +224,12 @@ Projection
             ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem (rows=1)
           ->  Filter (rows=2000818)
             ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q22
+Projection (rows=416666)
+  ->  Sort (rows=416666)
+    ->  GroupAggregate (1 keys, 2 aggregates) (rows=416666)
+      ->  Projection (rows=833333)
+        ->  Filter (rows=833333)
+          ->  Hash Join (?) (rows=7500000)
+            ->  Seq Scan on customer (stats) (rows=150000)
+            ->  Seq Scan on orders (stats) (rows=1500000)
