@@ -1,7 +1,7 @@
 # Design 0075-0001 — Q5 equivalence-class inference for transitive equalities
 
-**Milestone:** M0075-0001
-**Status:** **PARTIAL — module + 9 unit tests landed
+**Milestone:** M0075-0001 / M0076-0001 (carry-forward)
+**Status:** **PARTIAL × 2 — module + 9 unit tests landed
 2026-05-10; the planner-side hook into `tryBushyDP` was
 attempted then reverted. Empirical result: enabling the
 synthesised conjuncts caused Q9 to cancel at the 600 s
@@ -16,6 +16,30 @@ deferred to M0076.** The module lands as forward-compat
 infrastructure (`internal/planner/equiv_class.go` +
 `equiv_class_test.go`) so M0076's investigation can
 build on a tested, correct closure implementation.
+
+**M0076-0001 second attempt (2026-05-10):** With the
+M0076-0004 cost-model preparation in place
+(inferredEdgePenalty=2.0, deterministic synthesis
+ordering, joinEdge.isInferred tagging), re-enabled the
+hook in tryBushyDP. Empirical result: Q5 still
+cancelled at 1100 s. Plan-diff showed the synthesised
+`c.c_nationkey = n.n_nationkey` edge DID appear in
+Q5's plan (structural change from
+`MultiHashJoin(6 tables)` to nested `Hash Join → Hash
+Join → MultiHashJoin(4 tables)`), but the new plan was
+WORSE — its intermediate `Hash Join (INNER) (rows=303042055)`
+estimates 303 M rows for the lineitem⋈orders join,
+eclipsing the baseline plan's already-uncompletable
+cardinality. The cost model picked the new plan
+because the synthesised edge made it look cheap on
+paper (`(L * R) / max(NDistinct)` formula favours
+high-NDistinct keys regardless of build-side memory
+cost). M0076-0001 reverted behavioural change, keeps
+M0076-0004 infrastructure dormant. M0077-0001
+candidate: build-side memory cost in
+`estimateJoinCost` so synthesised plans don't beat the
+baseline simply by exploiting transitivity as
+selectivity proxy.
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** none (pure planner-side addition).

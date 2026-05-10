@@ -86,10 +86,29 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 		return node, pred
 	}
 	conjuncts := splitAnd(pred)
-	// M0076-0004: inferredCount=0 here — the
-	// inferTransitiveEqualities hook is enabled in
-	// M0076-0001 (Commit D), and at that point the
-	// caller will compute the count and pass it through.
+	// M0076-0001 attempt 2026-05-10: re-enabled the
+	// inferTransitiveEqualities hook with M0076-0004's
+	// inferredEdgePenalty=2.0 cost-model preparation.
+	// Empirical result: Q5 still cancelled at 1100s. The
+	// synthesised `c.c_nationkey = n.n_nationkey` edge
+	// DID appear in Q5's plan (plan-diff showed
+	// structural change from MultiHashJoin(6 tables) to
+	// nested Hash Joins), but the new plan was WORSE —
+	// it estimated 303M rows for the intermediate
+	// lineitem⋈orders join, eclipsing the baseline plan's
+	// (already-uncompletable) cardinality.
+	//
+	// Per the M0076 plan risk register R2 + verification
+	// protocol: revert behavioural change, keep the
+	// M0076-0004 structural infrastructure (joinEdge
+	// isInferred field, inferredEdgePenalty constant,
+	// buildJoinGraph inferredCount param). Q5 unlock
+	// requires deeper cost-model work (build-side memory
+	// cost) deferred to M0077.
+	//
+	// inferredCount=0 keeps the historical pre-M0076
+	// behaviour. The hook + cost-model are dormant
+	// infrastructure for M0077.
 	g := buildJoinGraph(tables, scans, scanWidth, conjuncts, 0, ctx.bindings)
 	if g == nil || len(g.edges) == 0 {
 		return node, pred
