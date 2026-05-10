@@ -116,4 +116,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0086 | Autovacuum needsVacuum PG-parity heuristics (dead/modified-tuple counters, GUC + per-table `reloptions`, `autovacuum_enabled`) | planned | `0086-autovacuum-needs-vacuum-pg-parity.md` |
 | 0087 | Autovacuum `loadTables` via `catalog.Catalog` interface (remove `*catalog.InMemory` type assertion) | planned | `0087-autovacuum-load-tables-via-catalog-interface.md` |
 | 0088 | WAL torn-tail recovery (treat zero-tail bytes after a corrupt record as end-of-WAL, mirroring PG crash-recovery semantics) | planned | `0088-wal-torn-tail-recovery.md` |
-| 0089 | Checkpoint + stop durability + data-file fsync (wire `Manager.Sync` into checkpoint, audit dirty-tracking on extend, implicit shutdown checkpoint) | planned | `0089-checkpoint-stop-durability-and-fsync.md` |
+| 0089 | Checkpoint + stop durability + data-file fsync (wire `Manager.Sync` into checkpoint, audit dirty-tracking on extend, implicit shutdown checkpoint) | partial (-0001 + -0003 landed; -0002 audit still required for heavy-concurrency scale-100 pgbench fix) | `0089-checkpoint-stop-durability-and-fsync.md` |

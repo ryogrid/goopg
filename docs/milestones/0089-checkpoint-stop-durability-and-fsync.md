@@ -1,6 +1,8 @@
 # Milestone 0089 — Checkpoint + stop durability + data-file fsync
 
-**Status:** planned
+**Status:** partial — M0089-0001 + M0089-0003 landed
+2026-05-11; M0089-0002 (the load-bearing dirty-tracking-on-extend
+audit) still required.
 **Depends on:** M0079 (catalog DDL WAL recovery), M0080 (heap WAL
 parity + VM/FSM persistence)
 **Drives:** clean stop+restart durability for write-heavy
@@ -73,6 +75,49 @@ likely-load-bearing piece of this milestone. See design 0089-0002.)
 
 Tasks will be detailed when this milestone is picked up. See the
 fix_plan.md note about the milestone-only convention.
+
+## Status update — 2026-05-11
+
+**M0089-0001 (data-file fsync on checkpoint)** — LANDED in
+commit `5745875`. Added `Manager.SyncAll` that fdatasyncs every
+open data file; wired into `Checkpointer.runCheckpoint` after
+`FlushAllPaced` via the new `dataFileSyncer` interface (satisfied
+by `Pool.SyncAllDataFiles`).
+
+**M0089-0003 (final checkpoint on stop)** — LANDED in commit
+`5745875`. `OnStop` (`internal/server/server.go`) now calls
+`Checkpointer.CheckpointNow()` before `runCancel()`. Users no
+longer need to chain `goopg checkpoint && goopg stop`.
+
+**M0089-0002 (dirty-tracking-on-extend audit)** — STILL REQUIRED.
+Post-fix pgbench re-measurement (2026-05-11 08:35) reproduces
+the bug at scale 100 with `-c 100`:
+- standard workload completes (69.48 TPS, 12,628 txns, 0 failed).
+- checkpoint + stop + restart leaves `pgbench_history` at 0 bytes
+  and pgbench_accounts inconsistent with its pkey.
+- A subsequent `simple-update` workload aborts every client with
+  `ERROR: short read at block` on the SELECT command (post-UPDATE
+  read of the just-modified accounts row via the pkey).
+
+Scale-5 / scale-10 reproductions (smaller workloads) work
+correctly across the same checkpoint+stop+restart cycle. The bug
+is heavy-concurrency + scale-dependent — most likely a
+buffer-pool dirty-tracking gap on freshly-extended pages, possibly
+combined with btree pkey persistence (the pkey indexes blocks
+that the heap file on disk lacks).
+
+The investigation needs to:
+- Audit `Pool.PinNew` + `Pool.Extend` for the precise dirty-bit
+  state at every transition (initial extend writes empty page;
+  caller's PageAddHeapTuple mutates buffer pool slot; eviction
+  may flush stale-content state if dirty bit is cleared
+  prematurely).
+- Determine whether the btree index path has its own
+  dirty-tracking gap (the pkey's pointers-past-EOF symptom may
+  be that, not heap durability).
+- Add an end-to-end test that wipes data dir, runs pgbench at
+  scale 100 with `-c 100 -T 180`, checkpoint+stop+restart, then
+  runs simple-update with `-c 100 -T 30` — asserts 0 errors.
 
 ## Definition of Done (sketch)
 
