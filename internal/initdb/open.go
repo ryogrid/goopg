@@ -923,6 +923,34 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		VM:             storage.NewVisibilityMap(),
 	}
 
+	// M0080-0003: load persistent Visibility Map state from
+	// `<DataDir>/global/pg_vm_state.bin` if present. A missing
+	// file is fine — that's the fresh-from-init case OR a cluster
+	// from before VM persistence existed. Failure to load is a
+	// hard startup error so the operator sees the issue rather
+	// than running with empty VM bits (which would still be
+	// CORRECT semantically — a cleared VM bit is a conservative
+	// "must check heap" — but would degrade index-only-scan
+	// performance until the next VACUUM rebuilt the bits).
+	if err := rt.VM.Load(storage.VMStatePath(rt.DataDir)); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: vm load: %w", err)
+	}
+
+	// M0080-0004: load persistent FSM state. Same shape /
+	// nil-safety as the VM load above. A missing file is the
+	// fresh-cluster case; a corrupt one is a hard startup
+	// failure (running with stale FSM bits would direct INSERTs
+	// to wrong pages and waste time on retries).
+	if err := rt.FSM.Load(storage.FSMStatePath(rt.DataDir)); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: fsm load: %w", err)
+	}
+
 	// Background WAL writer loop (M0042-0003): timer-driven periodic flush
 	// so buffered WAL bytes reach disk even when no commits are in flight.
 	// Mirrors upstream's walwriter process cadence. Disabled (delay == 0)
@@ -1545,6 +1573,29 @@ func (r *Runtime) SaveCatalog() error {
 		return fmt.Errorf("goopg: rename catalog snapshot: %w", err)
 	}
 	return nil
+}
+
+// SaveVM writes the runtime's VisibilityMap state to
+// `<DataDir>/global/pg_vm_state.bin` atomically (temp file +
+// rename). Callers — typically the graceful-shutdown defer in
+// `cmd/goopg/main.go` — invoke this alongside SaveCatalog so
+// VM bits survive a clean restart. Returns nil when r or VM
+// is nil, mirroring SaveCatalog's nil-safety. (M0080-0003.)
+func (r *Runtime) SaveVM() error {
+	if r == nil || r.VM == nil {
+		return nil
+	}
+	return r.VM.Save(storage.VMStatePath(r.DataDir))
+}
+
+// SaveFSM writes the runtime's FSM state to
+// `<DataDir>/global/pg_fsm_state.bin` atomically. Same shape
+// as SaveVM. (M0080-0004.)
+func (r *Runtime) SaveFSM() error {
+	if r == nil || r.FSM == nil {
+		return nil
+	}
+	return r.FSM.Save(storage.FSMStatePath(r.DataDir))
 }
 
 // Close releases the runtime's storage handles. Safe to call

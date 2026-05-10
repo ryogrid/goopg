@@ -331,6 +331,22 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			if err := rt.SaveCatalog(); err != nil {
 				logger.Warn("save catalog snapshot failed", "err", err)
 			}
+			// M0080-0003: persist the Visibility Map's in-memory
+			// state so index-only scans don't lose their VM
+			// bits across a clean restart. A failure here only
+			// degrades performance (next VACUUM rebuilds the
+			// bits), so we log a warning rather than aborting
+			// shutdown.
+			if err := rt.SaveVM(); err != nil {
+				logger.Warn("save vm state failed", "err", err)
+			}
+			// M0080-0004: persist the Free-Space Map's in-memory
+			// state so INSERTs after a clean restart don't always
+			// extend the relation just because the FSM is empty.
+			// Same warn-and-continue posture as SaveVM.
+			if err := rt.SaveFSM(); err != nil {
+				logger.Warn("save fsm state failed", "err", err)
+			}
 			_ = rt.Close()
 		}()
 		cfg.Catalog = rt.Catalog
