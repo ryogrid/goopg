@@ -103,4 +103,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0073 | OpCode int8 + Datum arena integration (Q5 heap −72 %: 1463 → 404 GB via arena wiring) | accepted | `0073-opcode-and-datum-arena-integration.md` |
 | 0074 | CPU + numeric optimisation (M0074-0006 numericCmp/Add/Sub/Mul int64 fast-path; M0074-0001/0002/0003 forward-compat infra; mixed scope) | accepted | `0074-cpu-and-numeric-optimisation.md` |
 | 0075 | TPC-H residual: Q5 plan-level / Q9 rebind / Datum packed / filter batch / numericDiv / build-toolchain (M0075-0005 numericDiv int64 FULL; 0001/0002/0003/0004/0007 PARTIAL — see Phase 7 handover) | accepted | `0075-tpch-residual-and-perf.md` |
-| 0076 | M0075 carry-forward: arena retention audit + Datum packed re-attempt + filterOp batch wiring + cost-model refinement + Q9 chained-NLI + plan-snapshot regression harness | planned | (TBD: `0076-m0075-carry-forward.md`) |
+| 0076 | M0075 carry-forward: arena retention audit + Datum packed re-attempt + filterOp batch wiring + cost-model refinement + Q9 chained-NLI + plan-snapshot regression harness | planned | `0076-m0075-carry-forward-and-plan-snapshot-harness.md` |
