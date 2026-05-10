@@ -76,6 +76,7 @@ init_goopg() {
     cat >> "$GOOPG_DATA_DIR/postgresql.conf" <<EOF
 
 # Performance comparison settings
+max_connections = 200
 shared_buffers = $SHARED_BUFFERS
 wal_buffers = $WAL_BUFFERS_BYTES
 checkpoint_timeout = $CHECKPOINT_TIMEOUT
@@ -109,6 +110,7 @@ init_postgres() {
 
 # Performance comparison settings
 port = $POSTGRES_PORT
+max_connections = 200
 shared_buffers = $SHARED_BUFFERS
 wal_buffers = $WAL_BUFFERS_MB
 checkpoint_timeout = $CHECKPOINT_TIMEOUT

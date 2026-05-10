@@ -1,6 +1,19 @@
 # Milestone 0075 — TPC-H residual: Q5 plan-level / Q9 rebind / Datum packed / filter batch / numericDiv
 
-**Status:** planned
+**Status:** closed (2026-05-10) — Commits `79b5ac0`,
+`8230af8`, `aafef4f`, `8135c31`, `7b4a6c7`, `e89c98a`,
+`ce2fe43` (M0075-0001..0007) + Commit G (M0075-0006,
+this handover). 22-q sweep: zero row-count regression
+vs Phase-6 baseline (Q12=2, Q13=35, Q21=381, Q22=7,
+Q9=7 mode-1 baseline preserved). One sub-milestone
+landed in FULL scope (M0075-0005 numericDiv int64 fast-
+path; ~3 pp Q5 evalExprSlot cum CPU drop), four landed
+in PARTIAL scope (forward-compat infrastructure; risky
+implementation deferred to M0076 per autonomous-mode
+risk management). M0075-0007 build-toolchain bundle
+showed +9.5 % wall-time regression — Makefile lands as
+M0076-0003 investigation infrastructure. See
+[`docs/handover/2026-05-10-tpch-status-phase7.md`](../handover/2026-05-10-tpch-status-phase7.md).
 **Branch:** `gc-oriented-refactor` (continuation of M0074)
 **Depends on:** M0074-final (commit `639272a`) — Phase 6
 handover; M0074-0006 — `mulInt64Pow10` /
