@@ -138,11 +138,32 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 		dpConjuncts, locals = partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
 	}
 
+	// M0077-0002 (Slice B): build per-binding `baseRelInfo`
+	// before the DP runs so singleton subsets can seed their
+	// row counts from post-filter cardinality. The slice is
+	// always built (even when Slice A's gate declined to
+	// partition); empty `locals` simply yields
+	// `filteredRows == baseRows` and the prior bushy DP
+	// behaviour is preserved.
+	relInfos := make([]baseRelInfo, len(ctx.bindings))
+	for i, b := range ctx.bindings {
+		var local Expr
+		if preds := locals.byBinding[i]; len(preds) > 0 {
+			local = combineAnd(preds)
+		}
+		var leafScan Node
+		if i < len(scans) {
+			leafScan = scans[i]
+		}
+		relInfos[i] = estimateBaseRelInfo(b, leafScan, local)
+		relInfos[i].bindingIdx = i
+	}
+
 	g := buildJoinGraph(tables, scans, scanWidth, dpConjuncts, 0, ctx.bindings)
 	if g == nil || len(g.edges) == 0 {
 		return node, pred
 	}
-	bushyPlan, residual, err := enumerateBushyPlans(g, dpConjuncts, cat)
+	bushyPlan, residual, err := enumerateBushyPlans(g, dpConjuncts, relInfos, cat)
 	if err != nil || bushyPlan == nil {
 		return node, pred
 	}
@@ -433,10 +454,17 @@ func findEdgeBetweenIdx(a, b uint16, g *joinGraph) (*joinEdge, int) {
 
 type dpEntry struct {
 	plan Node
+	// M0077-0002 (Slice B): post-filter row count for this
+	// subset. Singletons take `baseRelInfo.filteredRows`;
+	// composed subsets take the chosen join's output
+	// cardinality. `buildJoinFromDP` reads this for the
+	// build-side decision (replacing the prior
+	// `EstimateRows(plan)` re-evaluation).
+	rows int64
 	cost int64
 }
 
-func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (Node, []Expr, error) {
+func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo, cat catalog.Catalog) (Node, []Expr, error) {
 	if g.nodes == 0 {
 		return nil, nil, nil
 	}
@@ -452,11 +480,19 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 		return g.scans[0], residual, nil
 	}
 
+	// M0077-0002 (Slice B): seed singleton subsets with
+	// post-filter rowcounts from `relInfos` when available.
+	// Falls back to the historical `tableRows` lookup with a
+	// 1-row floor for nodes that lack a corresponding entry
+	// (defensive against test fixtures and shape changes).
 	rowCounts := make([]int64, g.nodes)
 	for i, tbl := range g.tables {
-		if tbl != nil && tbl.Stats != nil && tbl.Stats.RowCount > 0 {
+		switch {
+		case i < len(relInfos) && relInfos[i].filteredRows > 0:
+			rowCounts[i] = relInfos[i].filteredRows
+		case tbl != nil && tbl.Stats != nil && tbl.Stats.RowCount > 0:
 			rowCounts[i] = tbl.Stats.RowCount
-		} else {
+		default:
 			rowCounts[i] = 1
 		}
 	}
@@ -466,7 +502,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 
 	for i := 0; i < g.nodes; i++ {
 		mask := uint16(1 << i)
-		dp[mask] = dpEntry{plan: g.scans[i], cost: rowCounts[i]}
+		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i]}
 	}
 
 	for size := 2; size <= g.nodes; size++ {
@@ -497,10 +533,17 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 				if !okA || !okB {
 					return
 				}
-				cost := estimateJoinCost(entryA.cost, entryB.cost, edge, g, cat)
+				// M0077-0002 (Slice B): drive cost + composed
+				// row estimate from the post-filter rowcounts
+				// stored in the DP entries instead of re-reading
+				// `EstimateRows(plan)` for every probe. The
+				// formula stays the existing single-output one
+				// (`(L*R)/maxNDV`); Slice C replaces it with
+				// the 3-part cost.
+				cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
 				if best == nil || cost < best.cost {
-					join := buildJoinFromDP(entryA.plan, entryB.plan, a, b, edge, g)
-					best = &dpEntry{plan: join, cost: cost}
+					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, edge, g)
+					best = &dpEntry{plan: join, rows: cost, cost: cost}
 					bestEdgeIdx = edgeIdx
 				}
 			})
@@ -655,7 +698,7 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 	return cost
 }
 
-func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
+func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
 	// Determine which edge key belongs to which subset BEFORE
 	// remapping.  The edge stores {leftTable, rightTable} in
 	// FROM-clause order, but the DP may have assigned those
@@ -676,8 +719,19 @@ func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *j
 	copy(mergedSchema, leftSchema)
 	copy(mergedSchema[len(leftSchema):], rightSchema)
 
-	lRows := EstimateRows(leftPlan)
-	rRows := EstimateRows(rightPlan)
+	// M0077-0002 (Slice B): build-side decision uses the
+	// post-filter rowcounts threaded through `dpEntry.rows`
+	// rather than re-reading `EstimateRows(plan)` per call.
+	// Falls back to `EstimateRows` only when the caller passed
+	// a non-positive sentinel (defensive against test fixtures).
+	lRows := leftRows
+	if lRows <= 0 {
+		lRows = EstimateRows(leftPlan)
+	}
+	rRows := rightRows
+	if rRows <= 0 {
+		rRows = EstimateRows(rightPlan)
+	}
 	buildLeft := lRows > 0 && rRows > 0 && lRows < rRows
 	// M0054-0010: when one side is a known small-dimension table
 	// (region, nation) but stats are absent on the other side,
