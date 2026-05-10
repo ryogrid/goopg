@@ -3040,6 +3040,20 @@ spec).
       `*catalog.InMemory` type assertion).
       `docs/milestones/0087-autovacuum-load-tables-via-catalog-interface.md`.
 
+- [ ] **M0088** — WAL torn-tail recovery (treat zero-tail
+      bytes after a corrupt record as end-of-WAL, mirroring
+      PG crash-recovery semantics). Surfaced by pgbench
+      SIGKILL repro on 2026-05-11.
+      `docs/milestones/0088-wal-torn-tail-recovery.md`.
+
+- [ ] **M0089** — Checkpoint + stop durability + data-file
+      fsync (wire `Manager.Sync` into checkpoint, audit
+      dirty-tracking on extend, implicit shutdown
+      checkpoint). Surfaced by pgbench `standard` →
+      restart → `simple-update` chain on 2026-05-11
+      (post-restart `short read at block`).
+      `docs/milestones/0089-checkpoint-stop-durability-and-fsync.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
