@@ -3030,6 +3030,16 @@ spec).
       `track_commit_timestamp` GUC).
       `docs/milestones/0085-commit-timestamps-pg-commit-ts.md`.
 
+- [ ] **M0086** — Autovacuum `needsVacuum` PG-parity
+      heuristics (dead/modified-tuple counters, GUC +
+      per-table `reloptions`, `autovacuum_enabled`).
+      `docs/milestones/0086-autovacuum-needs-vacuum-pg-parity.md`.
+
+- [ ] **M0087** — Autovacuum `loadTables` via
+      `catalog.Catalog` interface (remove
+      `*catalog.InMemory` type assertion).
+      `docs/milestones/0087-autovacuum-load-tables-via-catalog-interface.md`.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

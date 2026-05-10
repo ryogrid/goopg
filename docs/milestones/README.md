@@ -113,3 +113,5 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0083 | pg_multixact + multi-row locking metadata (XLOG_HEAP2_LOCK_UPDATED, MultiXactId persistence) | planned | `0083-multixact-multi-row-locking.md` |
 | 0084 | PREPARE TRANSACTION + pg_twophase persistence (XLOG_XACT_PREPARE, distributed-txn 2PC support) | planned | `0084-two-phase-commit-prepare-transaction.md` |
 | 0085 | pg_commit_ts (optional commit-timestamps subsystem; `track_commit_timestamp` GUC) | planned (low priority) | `0085-commit-timestamps-pg-commit-ts.md` |
+| 0086 | Autovacuum needsVacuum PG-parity heuristics (dead/modified-tuple counters, GUC + per-table `reloptions`, `autovacuum_enabled`) | planned | `0086-autovacuum-needs-vacuum-pg-parity.md` |
+| 0087 | Autovacuum `loadTables` via `catalog.Catalog` interface (remove `*catalog.InMemory` type assertion) | planned | `0087-autovacuum-load-tables-via-catalog-interface.md` |
