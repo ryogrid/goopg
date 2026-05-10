@@ -541,6 +541,14 @@ type Filter struct {
 	pos       int
 	Child     Node
 	Predicate Expr
+	// LeafLocal marks Filter wrappers attached by Slice A
+	// (M0077-0001 / attachRelationLocalFilters) directly above
+	// a leaf scan. The Predicate's ColumnRef.Index values are
+	// in LEAF-LOCAL coordinates, NOT FROM-cumulative — they
+	// must NOT be touched by the post-rewrite posMap passes
+	// (applyJoinTreePosMap, remapPosMapAfterRewrite), which
+	// assume cumulative coordinates.
+	LeafLocal bool
 }
 
 func (n *Filter) Pos() int       { return n.pos }

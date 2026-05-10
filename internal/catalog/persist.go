@@ -3,6 +3,7 @@ package catalog
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -20,7 +21,7 @@ import (
 // CatalogVersion bumps. See docs/design/0017-data-directory.md for
 // the migration gate.
 type Snapshot struct {
-	NextOID uint32       `json:"next_oid"`
+	NextOID uint32 `json:"next_oid"`
 	// NextXID is the mvcc.Manager.nextXID at save time. Restored on
 	// the next startup so persisted heap tuples (whose xmin/xmax
 	// come from previous sessions) are visible to the new session's
@@ -38,11 +39,12 @@ type Snapshot struct {
 // cleanly into Stats==nil and are restored as unanalysed
 // relations. See docs/design/0006-0002-stats-persistence.md.
 type TableEntry struct {
-	OID     uint32      `json:"oid"`
-	Schema  string      `json:"schema,omitempty"`
-	Name    string      `json:"name"`
-	Columns []Column    `json:"columns"`
-	Stats   *TableStats `json:"stats,omitempty"`
+	OID            uint32      `json:"oid"`
+	Schema         string      `json:"schema,omitempty"`
+	Name           string      `json:"name"`
+	Columns        []Column    `json:"columns"`
+	Stats          *TableStats `json:"stats,omitempty"`
+	SmallDimension bool        `json:"small_dimension,omitempty"`
 }
 
 // IndexEntry mirrors Index for serialization. TableOID points at
@@ -80,11 +82,12 @@ func (c *InMemory) Snapshot() Snapshot {
 			continue
 		}
 		s.Tables = append(s.Tables, TableEntry{
-			OID:     t.OID,
-			Schema:  t.Schema,
-			Name:    t.Name,
-			Columns: append([]Column(nil), t.Columns...),
-			Stats:   cloneTableStats(t.Stats),
+			OID:            t.OID,
+			Schema:         t.Schema,
+			Name:           t.Name,
+			Columns:        append([]Column(nil), t.Columns...),
+			Stats:          cloneTableStats(t.Stats),
+			SmallDimension: t.SmallDimension,
 		})
 	}
 	for _, idx := range c.indexes {
@@ -127,11 +130,12 @@ func (c *InMemory) Restore(s Snapshot) error {
 			cols[i] = col
 		}
 		t := &Table{
-			Schema:  te.Schema,
-			Name:    te.Name,
-			Columns: cols,
-			OID:     te.OID,
-			Stats:   cloneTableStats(te.Stats),
+			Schema:         te.Schema,
+			Name:           te.Name,
+			Columns:        cols,
+			OID:            te.OID,
+			Stats:          cloneTableStats(te.Stats),
+			SmallDimension: te.SmallDimension || isKnownSmallDimensionName(te.Name),
 		}
 		k := key(parser.ObjectName{Schema: te.Schema, Name: te.Name})
 		if _, dup := c.tables[k]; dup {
@@ -170,6 +174,14 @@ func (c *InMemory) Restore(s Snapshot) error {
 	// the persisted snapshot but must be present on every startup.
 	c.registerSystemTables()
 	return nil
+}
+
+func isKnownSmallDimensionName(name string) bool {
+	switch strings.ToLower(name) {
+	case "region", "nation":
+		return true
+	}
+	return false
 }
 
 // cloneTableStats deep-copies a TableStats so the snapshot copy

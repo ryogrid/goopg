@@ -109,13 +109,47 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	// inferredCount=0 keeps the historical pre-M0076
 	// behaviour. The hook + cost-model are dormant
 	// infrastructure for M0077.
-	g := buildJoinGraph(tables, scans, scanWidth, conjuncts, 0, ctx.bindings)
+
+	// M0077-0001 (Slice A): partition single-binding
+	// predicates out of the join-DP conjunct list
+	// before buildJoinGraph; they get attached to leaf
+	// scans below as Filter wrappers AFTER the bushy DP
+	// picks a binary tree. This preserves Q5's binary
+	// shape because the existing collectMultiHashTables
+	// path declines on Filter(SeqScan) leaves.
+	//
+	// shouldAttachBeforeMHJ gates the rollout: only
+	// FROM-clauses with ≥ 5 tables (the shape that
+	// triggers MultiHashJoin packing) get pre-MHJ
+	// attachment. Smaller queries keep their pre-M0077
+	// behaviour. See docs/design/fix-for-q5/01.
+	var locals relationLocalFilters
+	dpConjuncts := conjuncts
+	if shouldAttachBeforeMHJ(ctx.bindings) {
+		// Build cumOffsets matching the bindings'
+		// FROM-cumulative output coordinates.
+		cumOffsets := make([]int, len(ctx.bindings)+1)
+		for i, b := range ctx.bindings {
+			cumOffsets[i] = b.offset
+		}
+		// Total schema width = last binding's offset + its width.
+		last := ctx.bindings[len(ctx.bindings)-1]
+		cumOffsets[len(ctx.bindings)] = last.offset + len(last.table.Columns)
+		dpConjuncts, locals = partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
+	}
+
+	g := buildJoinGraph(tables, scans, scanWidth, dpConjuncts, 0, ctx.bindings)
 	if g == nil || len(g.edges) == 0 {
 		return node, pred
 	}
-	bushyPlan, residual, err := enumerateBushyPlans(g, conjuncts, cat)
+	bushyPlan, residual, err := enumerateBushyPlans(g, dpConjuncts, cat)
 	if err != nil || bushyPlan == nil {
 		return node, pred
+	}
+	// M0077-0001: attach partitioned local predicates to
+	// the matching leaf scans on the bushy plan.
+	if len(locals.byBinding) > 0 {
+		bushyPlan = attachRelationLocalFilters(bushyPlan, locals, scans, ctx.bindings)
 	}
 	if len(residual) == 0 {
 		// All conjuncts consumed — Filter is unnecessary.
@@ -1128,6 +1162,12 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		subRemap([]Expr{n.Predicate, n.LeftKey, n.RightKey})
 		return
 	case *Filter:
+		// M0077-0001: Filter wrappers attached above leaf scans
+		// by Slice A carry leaf-local Predicate ColumnRefs (NOT
+		// FROM-cumulative). Skip the cumulative-space posMap.
+		if n.LeafLocal {
+			return
+		}
 		remapPosMapAfterRewrite(n.Child, nil)
 		// Only use MHJ posMap (OID‑based); binaryTreePosMapOf is
 		// disabled here because it assumes OID order == FROM order
@@ -1634,6 +1674,13 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		// alone in this walker.
 		applyJoinTreePosMap(n.Outer, posMap)
 	case *Filter:
+		// M0077-0001: Slice A leaf-local Filter wrappers carry
+		// leaf-scoped ColumnRefs; skip both the recursion (Child
+		// is a SeqScan; nothing to remap there) and the predicate
+		// remap (would corrupt local indices).
+		if n.LeafLocal {
+			return
+		}
 		applyJoinTreePosMap(n.Child, posMap)
 		remapByPosMap(&n.Predicate, posMap)
 	case *Project:
