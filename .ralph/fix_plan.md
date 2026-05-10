@@ -2773,6 +2773,170 @@ for priority queue rationale.
       handover. **Blocked by:** M0076-0001..0006
       (whichever land).
 
+## Milestone 0077 — Q5 planner fix: binary-tree preservation + cost-model maturation
+
+**Status: planned** (2026-05-10). Authoritative
+specification at `docs/design/fix-for-q5/{README, 01,
+02, 03}.md` (4-document design bundle authored by user
+2026-05-10). Milestone doc at
+`docs/milestones/0077-q5-planner-fix-binary-tree-and-cost-model.md`.
+
+**Why this milestone:** M0076-0001 attempt 2 (re-enable
+M0075-0001 transitivity hook with M0076-0004
+inferredEdgePenalty=2.0) produced a Q5 plan with a
+303M-row lineitem⋈orders intermediate. Empirical
+finding (`tmp/q5-plan-analysis.md` §3.4): goopg's
+`estimateJoinCost = (L*R)/max(NDistinct)` formula has
+no build-side memory term, so it can't distinguish
+"build a 6M-row hash table on lineitem" from "build a
+30K-row table on filtered customers" — both look
+~6M cost.
+
+**Slice ordering (per design 03 §4):** local filters
+first (Slice A) → post-filter row estimates (Slice B)
+→ build-side cost (Slice C) → anchored synthesis
+(Slice D). Each slice is independently revertible;
+failure at slice N does not require reverting earlier
+slices.
+
+**Pre-commit gate** (focused execution + plan-diff,
+per design 03 §3.3):
+```sh
+./tpch-runner --queries=3,5,8,9,12,13,21,22 \
+    --per-query-timeout=620s --cancel-after=600s
+for q in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 16 17 18 19 20 21 22; do
+    ./tmp/plan-snapshot diff --label m0076-baseline-ffc3429 --queries=$q
+done
+```
+
+Plan-diff query categories (per design 03 §2):
+- **Must change**: Q5.
+- **May change with focused gate**: Q2, Q3, Q7, Q8,
+  Q9, Q10, Q11, Q12, Q13, Q18, Q21.
+- **Should stay identical**: Q1, Q4, Q6, Q14, Q15,
+  Q16, Q17, Q19, Q20, Q22 — diff = STOP-AND-EXPLAIN.
+
+- [ ] M0077-0001 (Slice A): local predicate partition
+      + attachment.
+      **Design:** `docs/design/fix-for-q5/01-target-shape-and-local-filtering.md`.
+      **Files:** new
+      `internal/planner/local_filters.go`
+      (partitionConjunctsForJoinPlanning,
+      attachRelationLocalFilters, localizeExprToLeaf,
+      shouldAttachBeforeMHJ);
+      `internal/planner/planner.go::Plan` rewires the
+      pipeline per design 01 §4
+      (partition → DP → pushPredicatesIntoCrossJoins →
+      unnestSubqueriesInPlan → attachRelationLocalFilters
+      → rewriteMultiWayChain).
+      `internal/planner/multi_hash_chain.go` —
+      promote skip-on-`Filter(SeqScan)` contract via
+      inline comment + unit test.
+      Pre-MHJ attachment scope is narrow: one-binding
+      predicates only; no subqueries / OuterRefs;
+      attached as `Filter(leaf)` not `IndexScan`;
+      `shouldAttachBeforeMHJ` rule: `fromCount>=5 +
+      (SmallDimension OR reliably-selective)`.
+      **Acceptance:**
+        - Q5 plan-diff REQUIRED divergence; no
+          `Multi-Way Hash Join (6 tables)` line;
+          `Filter(SeqScan(region))` and
+          `Filter(SeqScan(orders))` leaves visible.
+        - Focused gate row-count parity (Q3=11462,
+          Q12=2, Q13=35, Q21=381, Q22=7, Q9 ≥ 7).
+        - "Should stay identical" plan-diff MATCH.
+
+- [ ] M0077-0002 (Slice B): filtered base-row
+      estimates.
+      **Design:** `docs/design/fix-for-q5/02-cost-model-and-selective-equivalence.md` §2-3.
+      **Files:** `internal/planner/cardinality.go`
+      adds `baseRelInfo` struct, `selectivityEstimate`
+      with `reliable` flag,
+      `clauseSelectivityWithSource`,
+      `estimateBaseRelInfo`.
+      `internal/planner/bushy.go::dpEntry` extended
+      with `rows int64`; singleton subsets use
+      `baseRelInfo.filteredRows`; composed subsets
+      use stored DP rows (NOT
+      `EstimateRows(plan)` re-eval);
+      `buildJoinFromDP` reads `dpEntry.rows`.
+      **Acceptance:**
+        - No new edges; row-count plumbing only.
+        - Plan-diff: Q5 may further refine join
+          order (still binary, still no 6-MHJ);
+          "should stay identical" set still MATCH.
+        - Focused gate parity preserved; Q9 unchanged.
+
+- [ ] M0077-0003 (Slice C): build-side-aware 3-part
+      hash-join cost.
+      **Design:** `docs/design/fix-for-q5/02-cost-model-and-selective-equivalence.md` §3-4.
+      **Files:**
+      `internal/planner/bushy.go::estimateJoinCost`
+      replaces single-output formula with
+      `output*1 + build*4 + probe*1` (initial
+      constants per design recommendation).
+      `buildJoinFromDP` build-side choice uses
+      `dpEntry.rows` from both subplans.
+      **Acceptance:**
+        - Q5 plan stops preferring large-build
+          alternatives (M0076-0001's 303M-row plan no
+          longer rank-best).
+        - Q9 unchanged (no new edges yet).
+        - Focused gate row-count parity preserved.
+
+- [ ] M0077-0004 (Slice D): anchored equality
+      synthesis (Q5 unlock).
+      **Design:** `docs/design/fix-for-q5/02-cost-model-and-selective-equivalence.md` §5.
+      **Files:** `internal/planner/equiv_class.go`
+      adds `inferAnchoredEqualities(conjuncts,
+      []baseRelInfo) []Expr` (reuses union-find).
+      Anchor rule: `filteredRows*2 ≤ baseRows OR
+      SmallDimension OR filteredRows ≤ 1024`;
+      synthesise only anchor → non-anchor edges; ≤ 1
+      synthesised edge per (target, class).
+      `internal/planner/bushy.go::tryBushyDP` calls
+      `inferAnchoredEqualities` AFTER Slice A
+      partition + Slice B baseRelInfo build; passes
+      synthesised count via `inferredCount` (M0076-0004)
+      so edges are tagged `isInferred=true`.
+      **Acceptance:**
+        - **Q5 reaches the binary hash-join family
+          described in `tmp/q5-plan-analysis.md` §2.**
+          Filter(region) inside; Filter(orders) inside;
+          customer⋈nation via synthesised edge;
+          lineitem joined LAST as probe.
+        - Q9 ≥ 7 mode-1 baseline preserved (anchored
+          rule excludes Q9's unfiltered fact-table
+          classes).
+        - Q3=11462, Q12=2, Q13=35, Q21=381 preserved.
+        - "Should stay identical" set MATCH.
+      **If Q5 still cancels at 1100s** (R7 from plan):
+        - plan-diff confirms new edge appears AND
+          intermediate < 303M? → bottleneck is
+          executor (M0078 candidate).
+        - plan still bad? → retune Slice C constants
+          (build*8 / build*16) OR constrain anchored
+          rule (filteredRows ≤ 256 instead of 1024).
+
+- [ ] M0077-0005 (Slice final): final 22-query SF=1
+      sweep + Phase 9 handover.
+      **Files (output):**
+        `docs/handover/2026-05-10-tpch-status-phase9.md`
+        (or dated for actual close);
+        `pprof-data/m0077-final/q5.{cpu,heap}.prof`;
+        `pprof-data/m0077-final/q9.{cpu,heap}.prof`;
+        `plan_snapshots/m0077-final.txt`;
+        `MEMORY.md` update.
+      **Blocked by:** M0077-0001..0004.
+      **Acceptance** (per design 03 §6):
+        - 22-q SF=1 sweep at HEAD = M0077-0004 binary.
+        - Q5 + Q9 pprof captures (`inuse_space` per
+          Phase-6 lessons).
+        - Cross-milestone summary table M0073-final
+          → M0074-final → M0075-final → M0076-final
+          → M0077-final on Q5 wall time, Q9 row count,
+          row-count parity.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
