@@ -533,17 +533,16 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 				if !okA || !okB {
 					return
 				}
-				// M0077-0002 (Slice B): drive cost + composed
-				// row estimate from the post-filter rowcounts
-				// stored in the DP entries instead of re-reading
-				// `EstimateRows(plan)` for every probe. The
-				// formula stays the existing single-output one
-				// (`(L*R)/maxNDV`); Slice C replaces it with
-				// the 3-part cost.
-				cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
+				// M0077-0003 (Slice C): cost is the 3-part
+				// `output + build*4 + probe` value; outputRows
+				// becomes the composed subset's `dpEntry.rows`
+				// so deeper DP levels see this subset's
+				// cardinality estimate rather than its cost
+				// (the two diverge once the build term enters).
+				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
 				if best == nil || cost < best.cost {
 					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, edge, g)
-					best = &dpEntry{plan: join, rows: cost, cost: cost}
+					best = &dpEntry{plan: join, rows: outRows, cost: cost}
 					bestEdgeIdx = edgeIdx
 				}
 			})
@@ -646,7 +645,41 @@ func enumerateSplits(mask uint16, fn func(a, b uint16)) {
 	}
 }
 
-func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) int64 {
+// M0077-0003 (Slice C): three-part hash-join cost weights per
+// design 02 §3. The build term must be heavy enough that the
+// DP visibly prefers plans whose hash-build inputs are small
+// (filtered region/nation, customer) over plans that build a
+// hash table from a large unfiltered fact (lineitem/orders).
+// Probe and output remain at unit weight so the formula stays
+// approximately proportional to total work for selective
+// filtered plans.
+const (
+	outputRowWeight = 1
+	hashBuildWeight = 4
+	hashProbeWeight = 1
+)
+
+// estimateJoinCost returns (outputRows, cost) for a candidate
+// hash join over the given filtered row counts. cost is the
+// 3-part formula:
+//
+//	cost = outputRows*outputRowWeight
+//	     + buildRows*hashBuildWeight
+//	     + probeRows*hashProbeWeight
+//
+// buildRows is the smaller side (the side that hashes); probeRows
+// is the larger side (the side that streams). M0076-0004's
+// inferredEdgePenalty multiplier is applied AFTER the 3-part
+// sum so an inferred edge of any shape gets the same penalty
+// factor relative to its explicit equivalent.
+//
+// The single-output `(L*R)/maxNDV` quantity is still computed —
+// it becomes outputRows, also stored in `dpEntry.rows` so
+// downstream subsets see this subset's cardinality estimate
+// rather than re-reading raw table sizes.
+//
+// (M0077-0003 / Slice C per design 02 §3.)
+func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
 	if leftRows <= 0 {
 		leftRows = 1
 	}
@@ -674,28 +707,37 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 			}
 		}
 	}
-	product := leftRows * rightRows
-	cost := product / ndv
+	outputRows = leftRows * rightRows / ndv
+	if outputRows < 1 {
+		outputRows = 1
+	}
+	// Build side = smaller, probe side = larger. This is the
+	// same heuristic `buildJoinFromDP` uses to pick BuildLeft;
+	// keeping the cost-side and physical-side decisions in
+	// sync prevents the "right shape, wrong build" failure mode
+	// design 02 §4 calls out.
+	buildRows, probeRows := leftRows, rightRows
+	if rightRows < leftRows {
+		buildRows, probeRows = rightRows, leftRows
+	}
+	cost = outputRows*outputRowWeight +
+		buildRows*hashBuildWeight +
+		probeRows*hashProbeWeight
 	if cost < 1 {
 		cost = 1
 	}
 	// M0076-0004: penalise edges produced from synthesised
-	// (transitively-inferred) conjuncts. The bushy DP
-	// minimises cost; multiplying by inferredEdgePenalty
-	// (>1.0) makes inferred edges look more expensive so
-	// the DP prefers plans driven by explicit predicates.
-	// This prevents the Q9 regression mode that caused
-	// M0075-0001's hook revert (synthesised edges had
-	// equal weight to explicit ones, letting the DP pick
-	// build-heavy plans that exploit transitive
-	// redundancy as if it were independent selectivity).
+	// (transitively-inferred) conjuncts. Slice D adds these
+	// only via anchored synthesis; the penalty stays as a final
+	// tiebreaker so even an anchored edge isn't preferred over
+	// an explicit equivalent of identical 3-part cost.
 	if edge.isInferred {
 		cost = int64(float64(cost) * inferredEdgePenalty)
 		if cost < 1 {
 			cost = 1
 		}
 	}
-	return cost
+	return outputRows, cost
 }
 
 func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
