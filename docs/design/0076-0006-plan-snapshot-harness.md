@@ -1,7 +1,20 @@
 # Design 0076-0006 — Plan-snapshot regression harness
 
 **Milestone:** M0076-0006
-**Status:** draft (LOW RISK — pure tooling)
+**Status:** **landed 2026-05-10 (commit pending) with
+documented caveat:** when running diff on all 22 queries
+in a single batch, ~9 queries show plan divergence due
+to connection-pool ordering effects (state accumulates
+on the connection across consecutive EXPLAIN
+invocations). When running per-query (`--queries=N`)
+all queries match deterministically. **Recommended
+workflow:** for a single planner commit's verification,
+diff per-query against the baseline (`for q in 1 2 ...
+22; do plan-snapshot diff --queries=$q; done`); the
+batch mode is useful for surveying many queries' plans
+quickly but is not a stable regression mechanism. Root
+cause investigation (planner-side nondeterminism vs
+pool-state) deferred to M0077.
 **Owner:** TBD
 **Branch:** `gc-oriented-refactor` (continuation)
 **Depends on:** none (independent of M0076-0001..0005).

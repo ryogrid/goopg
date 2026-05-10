@@ -1,0 +1,230 @@
+=== Q1
+Projection (rows=1000409)
+  ->  Sort (rows=1000409)
+    ->  GroupAggregate (2 keys, 8 aggregates) (rows=1000409)
+      ->  Filter (rows=2000818)
+        ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q2
+Projection
+  ->  Sort
+    ->  Filter
+      ->  Hash Join (INNER)
+        ->  Multi-Way Hash Join (5 tables)
+          ->  Seq Scan on partsupp (stats) (rows=800000)
+          ->  Seq Scan on part (stats) (rows=200000)
+          ->  Seq Scan on supplier (stats) (rows=10000)
+          ->  Seq Scan on nation (stats) (rows=25)
+          ->  Seq Scan on region (stats) (rows=5)
+        ->  GroupAggregate (1 keys, 1 aggregates)
+          ->  Filter
+            ->  Multi-Way Hash Join (4 tables)
+              ->  Seq Scan on partsupp (stats) (rows=800000)
+              ->  Seq Scan on supplier (stats) (rows=10000)
+              ->  Seq Scan on nation (stats) (rows=25)
+              ->  Seq Scan on region (stats) (rows=5)
+=== Q3
+Projection
+  ->  Sort
+    ->  GroupAggregate (3 keys, 1 aggregates)
+      ->  Filter
+        ->  Multi-Way Hash Join (3 tables)
+          ->  Seq Scan on orders (stats) (rows=1500000)
+          ->  Seq Scan on customer (stats) (rows=150000)
+          ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q4
+Projection (rows=5557827)
+  ->  Sort (rows=5557827)
+    ->  GroupAggregate (1 keys, 1 aggregates) (rows=5557827)
+      ->  Filter (rows=11115655)
+        ->  Hash Join (?) (rows=100040900)
+          ->  Seq Scan on orders (stats) (rows=1500000)
+          ->  Filter (rows=2000818)
+            ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q5
+Projection
+  ->  Sort
+    ->  GroupAggregate (1 keys, 1 aggregates)
+      ->  Filter
+        ->  Multi-Way Hash Join (6 tables)
+          ->  Seq Scan on orders (stats) (rows=1500000)
+          ->  Seq Scan on customer (stats) (rows=150000)
+          ->  Seq Scan on supplier (stats) (rows=10000)
+          ->  Seq Scan on nation (stats) (rows=25)
+          ->  Seq Scan on region (stats) (rows=5)
+          ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q6
+Projection (rows=1)
+  ->  Aggregate (1 aggregates) (rows=1)
+    ->  Filter (rows=247934)
+      ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q7
+Projection
+  ->  Sort
+    ->  GroupAggregate (3 keys, 1 aggregates)
+      ->  Projection
+        ->  Filter
+          ->  Multi-Way Hash Join (6 tables)
+            ->  Seq Scan on orders (stats) (rows=1500000)
+            ->  Seq Scan on customer (stats) (rows=150000)
+            ->  Seq Scan on supplier (stats) (rows=10000)
+            ->  Seq Scan on nation (stats) (rows=25)
+            ->  Seq Scan on nation (stats) (rows=25)
+            ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q8
+Projection
+  ->  Sort
+    ->  GroupAggregate (1 keys, 2 aggregates)
+      ->  Projection
+        ->  Filter
+          ->  Nested Loop (INNER)
+            ->  Multi-Way Hash Join (7 tables)
+              ->  Seq Scan on orders (stats) (rows=1500000)
+              ->  Seq Scan on customer (stats) (rows=150000)
+              ->  Seq Scan on supplier (stats) (rows=10000)
+              ->  Seq Scan on nation (stats) (rows=25)
+              ->  Seq Scan on nation (stats) (rows=25)
+              ->  Seq Scan on region (stats) (rows=5)
+              ->  Seq Scan on lineitem (stats) (rows=6002455)
+            ->  Index Scan using part_pk on part (rows=1)
+=== Q9
+Projection
+  ->  Sort
+    ->  GroupAggregate (2 keys, 1 aggregates)
+      ->  Projection
+        ->  Filter
+          ->  Nested Loop (INNER)
+            ->  Nested Loop (INNER)
+              ->  Multi-Way Hash Join (4 tables)
+                ->  Seq Scan on part (stats) (rows=200000)
+                ->  Seq Scan on supplier (stats) (rows=10000)
+                ->  Seq Scan on nation (stats) (rows=25)
+                ->  Seq Scan on lineitem (stats) (rows=6002455)
+              ->  Index Scan using orders_pk on orders (rows=1)
+            ->  Index Scan using partsupp_supplier_fkidx on partsupp (rows=1)
+=== Q10
+Projection
+  ->  Sort
+    ->  GroupAggregate (7 keys, 1 aggregates)
+      ->  Filter
+        ->  Multi-Way Hash Join (4 tables)
+          ->  Seq Scan on orders (stats) (rows=1500000)
+          ->  Seq Scan on customer (stats) (rows=150000)
+          ->  Seq Scan on nation (stats) (rows=25)
+          ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q11
+Projection
+  ->  Sort
+    ->  Filter
+      ->  GroupAggregate (1 keys, 1 aggregates)
+        ->  Filter
+          ->  Multi-Way Hash Join (3 tables)
+            ->  Seq Scan on partsupp (stats) (rows=800000)
+            ->  Seq Scan on supplier (stats) (rows=10000)
+            ->  Seq Scan on nation (stats) (rows=25)
+=== Q12
+Projection (rows=18526)
+  ->  Sort (rows=18526)
+    ->  GroupAggregate (1 keys, 1 aggregates) (rows=18526)
+      ->  Filter (rows=37052)
+        ->  Hash Join (INNER, build=left) (rows=300122750)
+          ->  Seq Scan on orders (stats) (rows=1500000)
+          ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q13
+Projection (rows=625000)
+  ->  Sort (rows=625000)
+    ->  GroupAggregate (1 keys, 1 aggregates) (rows=625000)
+      ->  Projection (rows=1250000)
+        ->  GroupAggregate (1 keys, 1 aggregates) (rows=1250000)
+          ->  Hash Join (LEFT) (rows=2500000)
+            ->  Seq Scan on customer (stats) (rows=150000)
+            ->  Filter (rows=500000)
+              ->  Seq Scan on orders (stats) (rows=1500000)
+=== Q14
+Projection (rows=1)
+  ->  Aggregate (2 aggregates) (rows=1)
+    ->  Filter (rows=4781442)
+      ->  Hash Join (INNER) (rows=43032978)
+        ->  Seq Scan on lineitem (stats) (rows=6002455)
+        ->  Seq Scan on part (stats) (rows=200000)
+=== Q15a-VIEWBODY
+Projection (rows=9510)
+  ->  GroupAggregate (1 keys, 1 aggregates) (rows=9510)
+    ->  Filter (rows=666939)
+      ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q15b-MAIN
+[ERROR: pq: relation "revenue0" does not exist (42P01)]
+=== Q16
+
+=== Q17
+Projection (rows=12472)
+  ->  Sort (rows=12472)
+    ->  GroupAggregate (3 keys, 1 aggregates) (rows=12472)
+      ->  Filter (rows=24945)
+        ->  Hash Join (INNER) (rows=5640953)
+          ->  Seq Scan on partsupp (stats) (rows=800000)
+          ->  Seq Scan on part (stats) (rows=200000)
+=== Q18
+Projection (rows=1)
+  ->  Aggregate (1 aggregates) (rows=1)
+    ->  Filter (rows=50020)
+      ->  Hash Join (INNER) (rows=6002454936)
+        ->  Hash Join (INNER) (rows=43032978)
+          ->  Seq Scan on lineitem (stats) (rows=6002455)
+          ->  Seq Scan on part (stats) (rows=200000)
+        ->  GroupAggregate (1 keys, 1 aggregates) (rows=27897)
+          ->  Filter (rows=30012)
+            ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q19
+Projection
+  ->  Sort
+    ->  GroupAggregate (5 keys, 1 aggregates)
+      ->  Filter
+        ->  Hash Join (?)
+          ->  Multi-Way Hash Join (3 tables)
+            ->  Seq Scan on orders (stats) (rows=1500000)
+            ->  Seq Scan on customer (stats) (rows=150000)
+            ->  Seq Scan on lineitem (stats) (rows=6002455)
+          ->  Projection (rows=9903)
+            ->  Filter (rows=9903)
+              ->  GroupAggregate (1 keys, 1 aggregates) (rows=29711)
+                ->  Seq Scan on lineitem (stats) (rows=6002455)
+=== Q20
+Projection (rows=1)
+  ->  Aggregate (1 aggregates) (rows=1)
+    ->  Hash Join (INNER) (rows=43032978)
+      ->  Seq Scan on lineitem (stats) (rows=6002455)
+      ->  Seq Scan on part (stats) (rows=200000)
+=== Q21
+Projection
+  ->  Sort
+    ->  Filter
+      ->  Hash Join (?)
+        ->  Nested Loop (INNER)
+          ->  Seq Scan on supplier (stats) (rows=10000)
+          ->  Index Scan using nation_pk on nation (rows=1)
+        ->  Projection (rows=53221)
+          ->  Filter (rows=53221)
+            ->  Hash Join (?) (rows=159665)
+              ->  Hash Join (INNER) (rows=479)
+                ->  Seq Scan on partsupp (stats) (rows=800000)
+                ->  GroupAggregate (2 keys, 1 aggregates) (rows=17)
+                  ->  Filter (rows=35)
+                    ->  Seq Scan on lineitem (stats) (rows=6002455)
+              ->  Projection (rows=66666)
+                ->  Filter (rows=66666)
+                  ->  Seq Scan on part (stats) (rows=200000)
+=== Q22
+Projection
+  ->  Sort
+    ->  GroupAggregate (1 keys, 1 aggregates)
+      ->  Filter
+        ->  Hash Join (?)
+          ->  Nested Loop (?)
+            ->  Multi-Way Hash Join (4 tables)
+              ->  Seq Scan on orders (stats) (rows=1500000)
+              ->  Seq Scan on supplier (stats) (rows=10000)
+              ->  Seq Scan on nation (stats) (rows=25)
+              ->  Seq Scan on lineitem (stats) (rows=6002455)
+            ->  Index Scan using idx_lineitem_orderkey_fkidx on lineitem (rows=1)
+          ->  Filter (rows=2000818)
+            ->  Seq Scan on lineitem (stats) (rows=6002455)

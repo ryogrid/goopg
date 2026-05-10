@@ -32,7 +32,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-report
+.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -232,3 +232,56 @@ pgbench-compare: build
 
 pgbench-compare-report:
 	@"$(REPO_ROOT)/bench/pgbench-compare/generate_report.sh"
+
+# ---------------------------------------------------------------
+# M0076-0006: plan-snapshot regression harness.
+#
+# Capture EXPLAIN output for each TPC-H query against a
+# running goopg cluster, compare against a saved baseline
+# in plan_snapshots/<label>.txt. Provides fast feedback
+# (~30s) for planner-only iterations vs the full 21-q
+# sweep cost (~25min).
+#
+# Three equality modes (default: structural):
+#   structural    — strips (rows=N) cost annotations;
+#                   ignores cost variance.
+#   strict-text   — byte-for-byte comparison.
+#   semantic-cost — structural + cost ±10% tolerance.
+#
+# Usage:
+#   make plan-snapshot-capture LABEL=m0076-baseline-ffc3429
+#   make plan-diff             LABEL=m0076-baseline-ffc3429
+#   make plan-diff             LABEL=m0076-baseline-ffc3429 MODE=strict-text
+#
+# Requires goopg-bench-bin running on 127.0.0.1:65433
+# (the standard tpch-runner port).
+# ---------------------------------------------------------------
+
+PLAN_SNAPSHOT_BIN := $(REPO_ROOT)/tmp/plan-snapshot
+PLAN_HOST    ?= 127.0.0.1
+PLAN_PORT    ?= 65433
+PLAN_DB      ?= tpch
+PLAN_USER    ?= tpch
+PLAN_PASS    ?= tpch
+LABEL        ?=
+MODE         ?= structural
+
+plan-snapshot-build:
+	@mkdir -p "$(REPO_ROOT)/tmp"
+	go build -o "$(PLAN_SNAPSHOT_BIN)" ./cmd/plan-snapshot
+
+plan-snapshot-capture: plan-snapshot-build
+	@if [ -z "$(LABEL)" ]; then \
+		echo "make plan-snapshot-capture requires LABEL=<name>"; exit 2; \
+	fi
+	"$(PLAN_SNAPSHOT_BIN)" capture --label "$(LABEL)" \
+		--host "$(PLAN_HOST)" --port $(PLAN_PORT) \
+		--db "$(PLAN_DB)" --user "$(PLAN_USER)" --password "$(PLAN_PASS)"
+
+plan-diff: plan-snapshot-build
+	@if [ -z "$(LABEL)" ]; then \
+		echo "make plan-diff requires LABEL=<name>"; exit 2; \
+	fi
+	"$(PLAN_SNAPSHOT_BIN)" diff --label "$(LABEL)" --mode "$(MODE)" \
+		--host "$(PLAN_HOST)" --port $(PLAN_PORT) \
+		--db "$(PLAN_DB)" --user "$(PLAN_USER)" --password "$(PLAN_PASS)"
