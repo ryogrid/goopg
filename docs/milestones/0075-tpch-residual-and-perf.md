@@ -118,9 +118,15 @@ F (0002) → G (0006).
       per pre-commit gate discipline. M0076-0001
       (planned): retention-site audit + sticky
       per-query arena slots before re-attempt.
-- [ ] M0075-0004 lands: filterOp batch path wired;
-      eligibility detector excludes non-amenable
-      predicates; 21-q row-count parity.
+- [x] M0075-0004 DEFERRED to M0076 — same risk surface
+      as M0075-0003: the batch path requires Materialize-
+      each-row before buffering, and Materialize across
+      batch/page boundaries was just shown to be fragile.
+      Landing the wiring before M0076-0001's retention-
+      site audit would re-expose the slot-reuse aliasing
+      that broke M0075-0003. M0074-0001 evalBinaryBatch
+      + detectors stay landed as forward-compat. M0076-0002
+      (planned).
 - [ ] M0075-0001 lands: equivalence-class inference;
       Q5 plan visibly different (EXPLAIN); 21-q parity.
 - [ ] M0075-0002 lands: chained-NLI rebind with per-outer
