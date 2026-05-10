@@ -569,6 +569,21 @@ func tryApplyHOTUpdate(
 	}
 	s.Lock()
 
+	// Race check: between the scan-time RLock release and this Lock
+	// acquire, a concurrent UPDATE/DELETE or an opportunistic prune
+	// in another session may have flipped the old slot out of
+	// LP_NORMAL. Detect that here, before adding the new tuple, so
+	// we don't leave an orphan tuple body that a later
+	// PageStampHotOldTuple would have abandoned. Caller treats
+	// (false, nil) as "skip this row" — same fall-through as the
+	// page-full case.
+	if oldItem, ierr := storage.PageGetItemID(s.Page(), oldSlot); ierr == nil &&
+		oldItem.Flags != storage.ItemIDNormal {
+		s.Unlock()
+		ctx.Pool.Unpin(s)
+		return false, nil
+	}
+
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
 	if addErr != nil && errors.Is(addErr, storage.ErrNoSpaceInPage) {
 		// Page full: attempt opportunistic pruning before giving up on HOT.
@@ -776,6 +791,14 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
+				if errors.Is(err, storage.ErrUnsupportedItem) {
+					// Concurrent UPDATE/DELETE or opportunistic
+					// prune flipped this slot out of LP_NORMAL
+					// after scan-time. Skip — goopg has no
+					// EvalPlanQual yet, so we drop the row
+					// rather than abort the transaction.
+					continue
+				}
 				return nil, err
 			}
 			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
@@ -859,6 +882,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
+				if errors.Is(err, storage.ErrUnsupportedItem) {
+					// Concurrent UPDATE/DELETE or opportunistic
+					// prune flipped this slot out of LP_NORMAL
+					// after scan-time. Skip — goopg has no
+					// EvalPlanQual yet, so we drop the row
+					// rather than abort the transaction.
+					continue
+				}
 				return nil, err
 			}
 			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
@@ -947,6 +978,14 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
+			if errors.Is(err, storage.ErrUnsupportedItem) {
+				// Concurrent UPDATE/DELETE or opportunistic
+				// prune flipped this slot out of LP_NORMAL
+				// after scan-time. Skip — goopg has no
+				// EvalPlanQual yet, so we drop the row
+				// rather than abort the transaction.
+				continue
+			}
 			return nil, err
 		}
 		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, v.blk, v.slot, o.ctx.Tx.XID)
