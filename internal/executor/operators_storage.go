@@ -611,6 +611,13 @@ func tryApplyHOTUpdate(
 	if err := storage.PageStampHotOldTuple(s.Page(), oldSlot, ctx.Tx.XID, blk, newSlot); err != nil {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
+		if errors.Is(err, storage.ErrUnsupportedItem) {
+			// PagePruneOpt above (page-full fallback) can invalidate
+			// the old slot in a tight window between our pre-check
+			// and this stamp. Caller treats (false, nil) as "skip
+			// this row" — same fall-through as the page-full case.
+			return false, nil
+		}
 		return false, err
 	}
 
