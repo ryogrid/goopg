@@ -79,19 +79,23 @@ func ReadAll(walDir string, segmentSize int64) ([]Record, error) {
 		}
 		payload, n, err := decodeRecord(stream[off:])
 		if err != nil {
-			// M0088-0001: torn-tail heuristic. If the bytes AFTER
-			// the corrupt record's claimed end are all zero, this
-			// is a non-clean shutdown signature — the writer was
-			// killed mid-record and the preallocated zero-fill
-			// tail extends to EOF. Treat as EOS. Real mid-stream
-			// corruption (CRC mismatch with a valid following
-			// record) leaves non-zero bytes after `record_end`,
-			// so it still surfaces as an error. Indistinguishable
-			// edge case: the very last record in a normal stream
-			// gets corrupted in-place — but PG semantics already
-			// accept this trade-off (the tail is unrecoverable
-			// either way).
+			// M0088-0001: graceful end-of-WAL detection. Either
+			// signal triggers EOS treatment (instead of fatal
+			// startup error):
+			//   (a) post-record-bytes are all zero (the torn-tail
+			//       signal — writer killed mid-record, preallocated
+			//       zero-fill tail extends to EOF), OR
+			//   (b) the corrupt offset is within one segment-size
+			//       of EOF (the pre-existing positional heuristic,
+			//       retained so post-retention edge cases keep
+			//       working).
+			// Real mid-stream corruption (CRC mismatch followed
+			// by a valid record's non-zero bytes far from EOF)
+			// still surfaces.
 			if afterCorruptIsZeroTail(stream, off) {
+				break
+			}
+			if int64(len(stream)-off) <= segmentSize {
 				break
 			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
@@ -141,13 +145,13 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		}
 		h, err := DecodeXLogRecordHeader(header)
 		if err != nil {
-			// M0088-0001: torn-tail tolerance — see comment in
-			// ReadAll. For the page-aware path the simplest safe
-			// check is "everything from the corrupt header on is
-			// zero" because page headers in the preallocated tail
-			// are also zero (xlog_page.go writes them only when
-			// emitting real data into a page).
+			// M0088-0001: see ReadAll. Page-aware path uses
+			// "everything from the corrupt header on is zero" OR
+			// "within one segment-size of EOF" as the EOS signal.
 			if isPreallocatedTail(stream[off:]) {
+				break
+			}
+			if int64(len(stream)-off) <= segSize {
 				break
 			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
@@ -155,6 +159,9 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		total := int(h.TotLen)
 		if total < xlogRecordHeaderSize {
 			if isPreallocatedTail(stream[off:]) {
+				break
+			}
+			if int64(len(stream)-off) <= segSize {
 				break
 			}
 			return nil, fmt.Errorf("wal: decode at offset %d: bad xlog total length %d", off, total)
@@ -166,17 +173,14 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		}
 		payload, n, err := decodeRecordXLog(fullBytes)
 		if err != nil {
-			// Compute the byte offset AFTER the corrupt record
-			// (accounting for page-header bytes inside the span)
-			// and check that tail. If the writer was killed
-			// mid-record, those post-record bytes are all zero;
-			// if a real mid-stream record is corrupt, the next
-			// record's bytes follow.
 			tailStart := off + consumed
 			if tailStart > len(stream) {
 				tailStart = len(stream)
 			}
 			if isPreallocatedTail(stream[tailStart:]) {
+				break
+			}
+			if int64(len(stream)-off) <= segSize {
 				break
 			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
@@ -187,6 +191,9 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 				tailStart = len(stream)
 			}
 			if isPreallocatedTail(stream[tailStart:]) {
+				break
+			}
+			if int64(len(stream)-off) <= segSize {
 				break
 			}
 			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, n, len(fullBytes))

@@ -99,10 +99,11 @@ func TestReadAllStopsAtTornTailEarlySegment(t *testing.T) {
 
 // TestReadAllPropagatesRealMidStreamCorruption is the
 // safety check: a corrupt record followed by non-zero bytes
-// (simulating real bit-flip in the middle of an otherwise-
-// valid WAL) must STILL fail. This pins the conservative
-// behaviour — we only tolerate corrupt records whose tail
-// is solid zeros (the preallocated signal).
+// AND far enough from EOF that the segmentSize positional
+// fallback does NOT mask it must STILL fail. This pins the
+// real-corruption detection so a WAL with a single corrupt
+// record in the middle and a normal record after it produces
+// an error rather than silently truncating.
 func TestReadAllPropagatesRealMidStreamCorruption(t *testing.T) {
 	dir := t.TempDir()
 
@@ -111,9 +112,23 @@ func TestReadAllPropagatesRealMidStreamCorruption(t *testing.T) {
 	r3 := encodeRecord([]byte("third"))
 	r2[4] ^= 0xFF // flip CRC of record 2
 
-	// r1 + corrupt r2 + valid r3 + zero-tail.
-	stream := append(append(append([]byte{}, r1...), r2...), r3...)
-	writeSegment(t, dir, 0, stream, tornTailSegmentSize)
+	// Segment 0: r1 + corrupt r2 + valid r3, zero-fill rest.
+	stream0 := append(append(append([]byte{}, r1...), r2...), r3...)
+	writeSegment(t, dir, 0, stream0, tornTailSegmentSize)
+
+	// Segments 1 + 2 + 3: contain real (non-zero) record bytes so
+	// the corrupt record at offset 13 in segment 0 is far from EOF
+	// AND followed by non-zero content. (Specifically: zeros until
+	// the segment boundary, but the NEXT segment starts with a real
+	// record — so the post-record region in segment 0 alone is zero,
+	// but the overall stream past the corrupt record is non-zero.)
+	r4 := encodeRecord([]byte("fourth-in-seg1"))
+	stream1 := append([]byte{}, r4...)
+	writeSegment(t, dir, 1, stream1, tornTailSegmentSize)
+	r5 := encodeRecord([]byte("fifth-in-seg2"))
+	writeSegment(t, dir, 2, r5, tornTailSegmentSize)
+	r6 := encodeRecord([]byte("sixth-in-seg3"))
+	writeSegment(t, dir, 3, r6, tornTailSegmentSize)
 
 	_, err := ReadAll(dir, tornTailSegmentSize)
 	if err == nil {

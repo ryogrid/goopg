@@ -631,6 +631,17 @@ func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // drop or truncate relation files. Pinning still flows through Pool.
 func (p *Pool) Manager() *Manager { return p.mgr }
 
+// SyncAllDataFiles fdatasyncs every open data file. Implements the
+// `dataFileSyncer` interface that internal/wal/checkpointer.go uses
+// after the dirty-page flush, so checkpoint completion is durable
+// against host crash. M0089-0001.
+func (p *Pool) SyncAllDataFiles() error {
+	if p.mgr == nil {
+		return nil
+	}
+	return p.mgr.SyncAll()
+}
+
 // SetPrefetchEnabled toggles Pool.Prefetch's behaviour. When
 // false, Prefetch is a no-op. Idempotent. The wiring layer
 // (initdb.Open) sets this true once an AIO engine is attached
