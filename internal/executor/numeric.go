@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"math/bits"
 	"strconv"
 	"strings"
 
@@ -427,6 +428,200 @@ func numericMul(a, b Datum) (Datum, error) {
 	return newNumeric(prod, scale), nil
 }
 
+// decimalDigitCount returns the number of decimal digits
+// in |v| (returns 1 for v == 0). Uses bits.Len64 + log10
+// table approximation to avoid floating-point math.
+// (M0075-0005.)
+//
+// Algorithm: bits.Len64(v) = floor(log2(v)) + 1, so
+// floor(log2(v)) = bitsLen - 1. Then floor(log10(v)) ≈
+// floor(log2(v)) * log10(2). log10(2) ≈ 0.30103, scaled
+// integer 1233 / 4096 = 0.30103515. The result n is an
+// approximation of floor(log10(v)); refine via direct
+// pow-table comparison.
+func decimalDigitCount(v int64) int {
+	if v == 0 {
+		return 1
+	}
+	if v < 0 {
+		v = -v
+	}
+	bitsLen := bits.Len64(uint64(v))
+	// Approximate floor(log10(v)) — guaranteed an UPPER
+	// bound, then walk down if v < 10^n.
+	n := ((bitsLen - 1) * 1233) >> 12
+	// Refine boundaries: if v >= 10^(n+1), bump up.
+	if n+1 <= 18 && v >= int64Pow10[n+1] {
+		n++
+	}
+	return n + 1
+}
+
+// floorDiv4 returns floor(x / 4). Go's integer division
+// rounds toward zero; this adjusts for negative inputs.
+// Mirrors upstream's NBASE weight floor semantics.
+// (M0075-0005.)
+func floorDiv4(x int) int {
+	if x >= 0 {
+		return x / 4
+	}
+	return -((-x + 3) / 4)
+}
+
+// firstNBaseDigitInt64 mirrors nbaseWeightAndFirstDigit's
+// NBASE first-digit extraction, but operates on the int64
+// mantissa directly without decimal-string conversion.
+// |absV| is the absolute mantissa, nd its decimal digit
+// count, dscale the decimal scale, w the NBASE weight.
+// (M0075-0005.)
+func firstNBaseDigitInt64(absV int64, nd, dscale, w int) int {
+	msbDecPos := nd - 1 - dscale
+	posInNBASE := msbDecPos - 4*w // 0..3
+	firstdigit := 0
+	for i := 0; i <= posInNBASE; i++ {
+		var d int
+		if i < nd {
+			// Extract i-th decimal digit from absV (MSB first).
+			power := nd - 1 - i
+			if power >= 0 && power < len(int64Pow10) {
+				divisor := int64Pow10[power]
+				d = int((absV / divisor) % 10)
+			}
+		}
+		firstdigit = firstdigit*10 + d
+	}
+	return firstdigit
+}
+
+// numericDivScaleInt64 is the int64 mirror of numericDivScale.
+// Computes the result scale via upstream's NBASE=10000 formula
+// without decimal-string conversion. (M0075-0005.)
+func numericDivScaleInt64(am, bm int64, da, db int) int {
+	absA := am
+	if absA < 0 {
+		absA = -absA
+	}
+	absB := bm
+	if absB < 0 {
+		absB = -absB
+	}
+	if absA == 0 {
+		// Caller short-circuits zero numerator before this; defensive.
+		return 0
+	}
+	ndA := decimalDigitCount(absA)
+	ndB := decimalDigitCount(absB)
+	msbA := ndA - 1 - da
+	msbB := ndB - 1 - db
+	wA := floorDiv4(msbA)
+	wB := floorDiv4(msbB)
+	fdA := firstNBaseDigitInt64(absA, ndA, da, wA)
+	fdB := firstNBaseDigitInt64(absB, ndB, db, wB)
+	qweight := wA - wB
+	if fdA <= fdB {
+		qweight--
+	}
+	rscale := numericMinSigDigits - qweight*4
+	if da > rscale {
+		rscale = da
+	}
+	if db > rscale {
+		rscale = db
+	}
+	if rscale < 0 {
+		rscale = 0
+	}
+	if rscale > numericMaxDisplayScale {
+		rscale = numericMaxDisplayScale
+	}
+	return rscale
+}
+
+// numericDivInt64Fast computes a / b using int64 arithmetic
+// when both operands are in the int64 lane and the shifted
+// numerator fits in int64. Returns (result, ok); ok=false
+// signals overflow — caller falls through to big.Int slow
+// path. (M0075-0005.)
+//
+// Result-correctness invariant: when ok=true, the output
+// must match numericDiv's big.Int slow path bit-for-bit.
+// Pinned by TestNumericDivInt64FastVsBigPath fuzz.
+func numericDivInt64Fast(a, b Datum) (Datum, bool) {
+	am := a.NumericMantissaValue()
+	bm := b.NumericMantissaValue()
+	da, db := int(a.Scale), int(b.Scale)
+
+	// Zero numerator → result scale = max(da, db, 0).
+	if am == 0 {
+		zScale := da
+		if db > zScale {
+			zScale = db
+		}
+		if zScale < 0 {
+			zScale = 0
+		}
+		return Datum{Kind: KindNumeric, Int: 0, Scale: int16(zScale)}, true
+	}
+
+	rscale := numericDivScaleInt64(am, bm, da, db)
+	shift := rscale + db - da
+
+	// Numerator scaling: am * 10^shift (or am / 10^|shift|).
+	var num int64
+	if shift > 0 {
+		v, ok := mulInt64Pow10(am, shift)
+		if !ok {
+			return Datum{}, false
+		}
+		num = v
+	} else if shift < 0 {
+		s := -shift
+		if s > 18 {
+			return Datum{}, false
+		}
+		num = am / int64Pow10[s]
+	} else {
+		num = am
+	}
+
+	// Integer divide.
+	q := num / bm
+	rem := num % bm
+
+	// Round half-away-from-zero (matches big.Int slow path).
+	absRem := rem
+	if absRem < 0 {
+		absRem = -absRem
+	}
+	absB := bm
+	if absB < 0 {
+		absB = -absB
+	}
+
+	if absRem != 0 && 2*absRem >= absB {
+		// 2*absRem could in theory overflow if absRem is near MaxInt64/2;
+		// guard against it.
+		if absRem > math.MaxInt64/2 {
+			// Overflow boundary; defer to big.Int.
+			return Datum{}, false
+		}
+		if q == 0 {
+			// Sign of unrepresentable quotient comes from num*bm.
+			if (num < 0) != (bm < 0) {
+				q = -1
+			} else {
+				q = 1
+			}
+		} else if q > 0 {
+			q++
+		} else {
+			q--
+		}
+	}
+
+	return Datum{Kind: KindNumeric, Int: q, Scale: int16(rscale)}, true
+}
+
 // numericDiv computes a / b with PostgreSQL-compatible result
 // scale. Mirrors `select_div_scale` (postgres/src/backend/utils/adt/
 // numeric.c:10135-10195):
@@ -440,7 +635,21 @@ func numericMul(a, b Datum) (Datum, error) {
 //
 // Quotient is rounded half-away-from-zero, matching upstream's
 // `div_var` with rounding=true. Division by zero raises 22012.
+//
+// M0075-0005: int64 fast-path skips big.Int allocation when
+// both operands are in the int64 lane and the shifted
+// numerator fits in int64. Covers the dominant TPC-H avg/sum
+// hot path (Q1, Q3, Q5, Q14).
 func numericDiv(a, b Datum, pos int) (Datum, error) {
+	if a.NumericBigValue() == nil && b.NumericBigValue() == nil {
+		bmFast := b.NumericMantissaValue()
+		if bmFast == 0 {
+			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
+		}
+		if d, ok := numericDivInt64Fast(a, b); ok {
+			return d, nil
+		}
+	}
 	bm := numericMant(b)
 	if bm.Sign() == 0 {
 		return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
