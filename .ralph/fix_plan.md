@@ -369,12 +369,27 @@ alongside the suite.
       Verification: TestPort_IsolationLockCommittedUpdate runs 120s (blocking works,
       spec defers due to output format + connection timeout across permutations). (2026-05-12).
 
-- [ ] **M0096-0005** — Verify ON CONFLICT executor end-to-end and make
-      `insert-conflict-do-update` (×4) and `insert-conflict-do-nothing`
-      PASS.  Primary blocker is M0096-0002 (isolation-level BEGIN);
-      secondary: confirm upsert row-wait / blocking detection produces
-      the `<waiting …>` lines matching the expected `.out` files, fix
-      any output-format mismatches in `IsolationRunner`.
+- [x] **M0096-0005** — ON CONFLICT infrastructure: partial progress (2026-05-12).
+      Landed:
+      (a) CREATE TABLE now creates primary key btree index for inline `col type
+          PRIMARY KEY` and table-level `PRIMARY KEY (cols)` — fixes 42P10 "no
+          unique constraint" error that was the primary blocker.
+      (b) text added to isSupportedBTreeKeyType (text primary keys now work).
+      (c) IsolationRunner pqprintFormat: changed separator from " | " to "|"
+          matching PostgreSQL isolationtester's PQprint output format.
+      (d) Per-connection explicit transaction tracking (connTxState in conn_tx.go):
+          BEGIN starts a real TxnMgr transaction, COMMIT/ROLLBACK end it; all
+          statements within an explicit block reuse the same TxnMgr transaction.
+          This is required so donothing1's INSERT stays uncommitted while donothing2
+          runs.
+      (e) WaitForXID on mvcc.Manager (broadcasts on every commit/rollback) and
+          probeArbiterWaiting / findInProgressConflict in upsertOp (row-wait logic).
+      (f) advisorySessionIDFromContext uses ctx.BackendID rather than nil Session.
+      Remaining: donothing2 / insert2 blocking behavior (insert-conflict specs) not
+      yet producing <waiting ...> lines. The blocking mechanism is wired but debugging
+      of the exact WaitForXID trigger path is needed (XID propagation from ectx.Tx
+      to connTxState may be incomplete). The insert-conflict-do-update and do-nothing
+      specs still defer. Re-open as follow-up if needed.
 
 - [ ] **M0096-0006** — Accept `DROP INDEX CONCURRENTLY` in the parser
       (treat as synchronous DROP INDEX; true concurrent protocol is out

@@ -252,6 +252,34 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
+
+	// Primary key index creation (M0096-0005).
+	//
+	// Two syntactic forms are supported:
+	//   a) Inline: `col type PRIMARY KEY`         → ColumnDef.Primary == true
+	//   b) Table-level: `PRIMARY KEY (col1, col2)` → s.PrimaryKey != nil
+	//
+	// Both need a B-tree index with unique=true, primary=true so that
+	// ON CONFLICT (col) can match the constraint via resolveArbiterIndex.
+	var pkCols []string
+	if len(s.PrimaryKey) > 0 {
+		pkCols = s.PrimaryKey
+	} else {
+		for _, c := range s.Columns {
+			if c.Primary {
+				pkCols = append(pkCols, c.Name)
+			}
+		}
+	}
+	if len(pkCols) > 0 {
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, true, true); err != nil {
+			// Propagate B-tree index errors (e.g. unsupported key type).
+			// This makes CREATE TABLE fail cleanly rather than silently creating
+			// a table without its primary key constraint.
+			return err
+		}
+	}
 	return nil
 }
 
@@ -970,6 +998,9 @@ func isTimestampType(name string) bool {
 // and numeric landed for HammerDB TPC-H compatibility. varchar landed
 // in M0044-0001; char in M0044-0002; timestamp in M0044-0003.
 func isSupportedBTreeKeyType(name string) bool {
+	if strings.ToLower(name) == "text" {
+		return true
+	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name)
 }

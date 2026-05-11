@@ -1,6 +1,7 @@
 package mvcc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -75,6 +76,10 @@ type Manager struct {
 	active     map[TxnHandle]*txState
 	xactMarker func(storage.TransactionID, XactMarker) error
 
+	// commitCond is broadcast whenever a transaction commits or aborts.
+	// Used by WaitForXID to block until a specific XID finishes.
+	commitCond *sync.Cond
+
 	// subxact tracking (M0050-0002): maps subxact XIDs to their parent
 	// XIDs, and records individually-aborted subxact XIDs. Lazily
 	// initialised on first use. Protected by subxactMu.
@@ -84,11 +89,13 @@ type Manager struct {
 // NewManager returns a fresh manager whose first assigned xid is 3,
 // mirroring PostgreSQL's first normal xid.
 func NewManager() *Manager {
-	return &Manager{
+	m := &Manager{
 		nextXID:    FirstNormalTransactionID,
 		nextHandle: 1,
 		active:     map[TxnHandle]*txState{},
 	}
+	m.commitCond = sync.NewCond(&m.mu)
+	return m
 }
 
 // SetNextXID advances nextXID forward without allocating it. Used on
@@ -315,7 +322,51 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 		}
 	}
 	delete(m.active, tx.Handle)
+	// Broadcast to unblock any goroutine waiting in WaitForXID.
+	m.commitCond.Broadcast()
 	return nil
+}
+
+// WaitForXID blocks until the transaction identified by xid is no longer
+// in-progress (committed or aborted) or ctx is cancelled.  Returns nil when
+// the transaction has finished, or ctx.Err() on cancellation.
+//
+// This is used by the ON CONFLICT executor to implement the "speculative
+// insert" row-wait: when an upsert detects that a conflicting row belongs
+// to an in-progress transaction, it blocks here until that transaction
+// commits or aborts before re-evaluating the conflict.
+func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) error {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Wake up the Cond.Wait below so it can check ctx.
+			m.commitCond.Broadcast()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for m.xidInProgress(xid) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		m.commitCond.Wait()
+	}
+	return ctx.Err()
+}
+
+// xidInProgress reports whether xid is assigned to any currently active
+// transaction. Called with m.mu held.
+func (m *Manager) xidInProgress(xid storage.TransactionID) bool {
+	for _, state := range m.active {
+		if state.xid == xid {
+			return true
+		}
+	}
+	return false
 }
 
 // XactMarker discriminates the two transaction-end markers fed to

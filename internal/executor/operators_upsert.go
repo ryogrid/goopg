@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -157,7 +158,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			inserted[tgtIdx] = src[srcIdx]
 		}
 
-		conflictPtr, conflictRow, conflicted, err := o.probeArbiter(rel, cols, inserted)
+		conflictPtr, conflictRow, conflicted, err := o.probeArbiterWaiting(rel, cols, inserted)
 		if err != nil {
 			return nil, err
 		}
@@ -252,6 +253,78 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 		return storage.ItemPointer{}, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: scanErr.Error()}
 	}
 	return foundPtr, foundRow, found, nil
+}
+
+// probeArbiterWaiting wraps probeArbiter with row-wait semantics:
+// if a non-visible tuple from an in-progress transaction is found,
+// block until that transaction commits or aborts, then re-probe.
+// This implements the "speculative insert" blocking that makes
+// INSERT … ON CONFLICT produce correct <waiting ...> output in
+// concurrent isolation tests.
+func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.ItemPointer, Row, bool, error) {
+	for {
+		ptr, row, found, err := o.probeArbiter(rel, cols, inserted)
+		if err != nil || found {
+			return ptr, row, found, err
+		}
+		// No visible conflict. Check for in-progress tuples that
+		// could become conflicts once the other transaction finishes.
+		inProgressXID, hasInProgress := o.findInProgressConflict(rel, cols, inserted)
+		if !hasInProgress {
+			return storage.ItemPointer{}, nil, false, nil
+		}
+		// Wait for the in-progress transaction to complete.
+		qctx := o.ctx.Ctx
+		if qctx == nil {
+			qctx = context.Background()
+		}
+		if o.ctx.TxnMgr != nil {
+			if werr := o.ctx.TxnMgr.WaitForXID(qctx, inProgressXID); werr != nil {
+				// Context cancelled (e.g. IsolationRunner drain timeout).
+				return storage.ItemPointer{}, nil, false, nil
+			}
+		}
+		// After the other transaction ended, refresh the snapshot and re-probe.
+		if o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
+			if snap, serr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); serr == nil {
+				o.ctx.Snap = snap.Clone()
+			}
+		}
+	}
+}
+
+// findInProgressConflict scans the arbiter index for a tuple whose xmin
+// is from a currently in-progress transaction (not yet committed/aborted).
+// Returns the in-progress XID and true if found; (0, false) otherwise.
+func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.TransactionID, bool) {
+	if o.arbiterTree == nil || o.ctx == nil {
+		return 0, false
+	}
+	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	if err != nil || key == nil {
+		return 0, false
+	}
+	var foundXID storage.TransactionID
+	_ = o.arbiterTree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+		if err != nil {
+			return false, err
+		}
+		slot.RLock()
+		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		slot.RUnlock()
+		o.ctx.Pool.Unpin(slot)
+		if err != nil {
+			return true, nil
+		}
+		xmin := tuple.Header.Xmin
+		if xmin != storage.InvalidTransactionID && o.ctx.Snap.HasInProgress(xmin) {
+			foundXID = xmin
+			return false, nil // stop scanning
+		}
+		return true, nil
+	})
+	return foundXID, foundXID != 0
 }
 
 // applyInsert is the no-conflict happy path. Writes the heap row

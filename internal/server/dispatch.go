@@ -80,7 +80,7 @@ func maybeForceGCAfterCommit() {
 //
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
-func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
+func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
@@ -132,12 +132,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	}
-	// Begin one statement-level transaction per Query message and
-	// commit at the end. v0 doesn't yet plumb session-level
-	// BEGIN/COMMIT into the wire layer.
-	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
-	if err != nil {
-		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+	// Session-level explicit transaction support (M0096-0005):
+	// When the client has issued BEGIN, reuse the open TxnMgr transaction
+	// rather than starting a fresh auto-commit one.  Each statement-level
+	// dispatch that is NOT inside an explicit transaction still auto-commits.
+	var tx mvcc.Transaction
+	autoCommit := true
+	if connTx != nil && connTx.InExplicit() {
+		tx = connTx.Tx()
+		autoCommit = false
+	} else {
+		var err error
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+		if err != nil {
+			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+		}
 	}
 	// Each Query message gets a fresh BackendID for the lock
 	// manager; the youngest-backend victim policy from M0012-0002
@@ -145,7 +154,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	backendID := lockmgr.BackendID(s.nextBackendID.Add(1))
 	commit := false
 	defer func() {
-		if !commit {
+		if autoCommit && !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 		}
 		// Always drop locks at txn end so a leftover holder
@@ -165,6 +174,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.Catalog = s.cfg.Catalog
 	ectx.TxnMgr = s.cfg.TxnMgr
 	ectx.Tx = tx
+	// Wire the per-connection session into the executor so advisory locks
+	// and other session-scoped state are properly tracked.
+	if connTx != nil {
+		if sess := connTx.Session(); sess != nil {
+			ectx.Session = sess
+		}
+	}
 	ectx.Snap = snap
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
@@ -196,7 +212,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		}
 		ectx.Snap = snap2
 
-		if err := s.executeOneSimpleStmt(w, ectx, stmt); err != nil {
+		if err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit); err != nil {
 			return err
 		}
 	}
@@ -206,11 +222,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			reg.UpdateState(pid, "idle", "")
 		}
 	}
-	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
-		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+	if autoCommit {
+		if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+		}
+		commit = true
+		maybeForceGCAfterCommit()
 	}
-	commit = true
-	maybeForceGCAfterCommit()
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
@@ -317,21 +335,54 @@ func normalizeCompatSQL(sql string) string {
 // executeOneSimpleStmt plans and runs one statement, emitting the
 // per-statement wire messages but NOT ReadyForQuery (the caller
 // terminates the batch).
-func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt) error {
+//
+// connTx, if non-nil, tracks the per-connection explicit transaction
+// state so BEGIN/COMMIT/ROLLBACK can open/close real TxnMgr transactions.
+// autoCommitPtr, if non-nil, is set to false when a BEGIN starts an
+// explicit transaction (telling the caller not to auto-commit).
+func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool) error {
 	node, err := planner.Plan(stmt, s.cfg.Catalog)
 	if err != nil {
 		code, msg := planErrorFields(err)
 		return s.writeQueryError(w, code, msg)
 	}
-	// Transaction verbs are no-ops at the wire layer for v0: every
-	// simple-query Query message already runs inside a per-batch
-	// ReadCommitted transaction (see dispatchSimpleQueryViaExecutor).
-	// Pgbench -i's BEGIN ... COMMIT envelope around the COPY/ALTER
-	// block needs to succeed without erroring; full session-tx
-	// semantics (multi-batch atomicity, savepoints) wait for the
-	// session-state plumbing in a follow-up loop.
-	if tx, ok := node.(*planner.Transaction); ok {
-		return w.WriteCommandComplete(transactionTag(tx.Verb))
+	// Transaction verbs: BEGIN/COMMIT/ROLLBACK require per-connection
+	// explicit transaction management (M0096-0005). BEGIN promotes the
+	// current auto-commit transaction into a persistent explicit one;
+	// COMMIT/ROLLBACK finalise it and release the session-level state.
+	if txNode, ok := node.(*planner.Transaction); ok {
+		switch txNode.Verb {
+		case planner.TxBegin:
+			if connTx != nil && !connTx.InExplicit() && autoCommitPtr != nil {
+				// Promote the current auto-commit transaction to explicit.
+				*autoCommitPtr = false
+				connTx.Begin(ctx.Tx)
+			}
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		case planner.TxCommit:
+			if connTx != nil && connTx.InExplicit() {
+				if err := s.cfg.TxnMgr.Commit(connTx.Tx()); err != nil {
+					connTx.End()
+					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+				}
+				connTx.End()
+				maybeForceGCAfterCommit()
+				// Leave *autoCommitPtr = false so the caller does NOT attempt
+				// a second TxnMgr.Commit on the already-committed transaction.
+			}
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		case planner.TxRollback:
+			if connTx != nil && connTx.InExplicit() {
+				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+				connTx.End()
+				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
+			}
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		default:
+			// Other verbs (SAVEPOINT, ROLLBACK TO, RELEASE) pass through
+			// the existing logic.
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		}
 	}
 	op, err := executor.Build(node)
 	if err != nil {
