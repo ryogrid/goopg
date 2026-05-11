@@ -689,7 +689,7 @@ M0097-0001 wires it up.
       `overlay()`, `format()`, hash functions (`md5`, `sha256`),
       `pg_typeof`, `generate_series` overloads.
 
-- [ ] **M0097-0012** — Functions + PL/pgSQL parity.
+- [x] **M0097-0012** — Functions + PL/pgSQL parity.
       Target tests: `create_function_sql`, `create_procedure`,
       `plpgsql`, `rangefuncs`, `misc_functions` (overlap with 0011).
       Work: SQL-language functions with multiple statements, `CALL`

@@ -133,6 +133,18 @@ type ForStmt struct {
 func (f *ForStmt) Pos() int         { return f.pos }
 func (f *ForStmt) plpgsqlStmtNode() {}
 
+// ForSelectStmt is `FOR rec IN query LOOP stmts END LOOP;`.
+// M0097-0012: query cursor loop over a SQL SELECT result.
+type ForSelectStmt struct {
+	pos  int
+	Var  string // record variable name
+	SQL  string // raw SQL text of the SELECT query
+	Body []Stmt
+}
+
+func (f *ForSelectStmt) Pos() int         { return f.pos }
+func (f *ForSelectStmt) plpgsqlStmtNode() {}
+
 // ExitStmt is `EXIT [ WHEN condition ];`. Stage A 4d only
 // supports exiting the innermost loop.
 type ExitStmt struct {
@@ -184,6 +196,24 @@ type SQLStmt struct {
 
 func (s *SQLStmt) Pos() int          { return s.pos }
 func (s *SQLStmt) plpgsqlStmtNode() {}
+
+// ExceptionHandler is one WHEN clause in an EXCEPTION block.
+// Conditions are SQLSTATE codes or condition names. M0097-0012.
+type ExceptionHandler struct {
+	Conditions []string
+	Body       []Stmt
+}
+
+// ExceptionBlock wraps a BEGIN...EXCEPTION...END section.
+// TryBody is the protected statement list. M0097-0012.
+type ExceptionBlock struct {
+	pos      int
+	TryBody  []Stmt
+	Handlers []*ExceptionHandler
+}
+
+func (e *ExceptionBlock) Pos() int         { return e.pos }
+func (e *ExceptionBlock) plpgsqlStmtNode() {}
 
 // RaiseStmt is `RAISE [level] 'message'`. Level is "notice",
 // "warning", "exception" / "error" (default). NOTICE and WARNING are

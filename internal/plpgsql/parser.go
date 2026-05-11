@@ -122,11 +122,16 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 		startPos = beginTok.Pos
 	}
 	block := &Block{pos: startPos, Declarations: decls}
-	stmts, err := p.parseStmtList(parser.KwEnd)
+	// parseStmtList terminates at END or at "exception" identifier.
+	stmts, excBlock, err := p.parseStmtListWithException(parser.KwEnd)
 	if err != nil {
 		return nil, err
 	}
-	block.Statements = stmts
+	if excBlock != nil {
+		block.Statements = append(stmts, excBlock)
+	} else {
+		block.Statements = stmts
+	}
 	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
 		return nil, err
 	}
@@ -137,6 +142,99 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 		return nil, p.errAtCur("unexpected tokens after END")
 	}
 	return block, nil
+}
+
+// parseStmtListWithException parses statements until END or EXCEPTION.
+// If EXCEPTION is found, parses the handler blocks and returns them
+// as an *ExceptionBlock alongside the main statements. M0097-0012.
+func (p *bodyParser) parseStmtListWithException(terminators ...parser.Keyword) ([]Stmt, *ExceptionBlock, error) {
+	var stmts []Stmt
+Loop:
+	for {
+		t := p.cur()
+		if t.Kind == parser.TokenEOF {
+			return nil, nil, p.errAtCur("unexpected EOF (expected END)")
+		}
+		if t.Kind == parser.TokenKeyword {
+			for _, term := range terminators {
+				if t.Keyword == term {
+					break Loop
+				}
+			}
+		}
+		// Check for EXCEPTION (identifier).
+		if t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "exception") {
+			excBlock, err := p.parseExceptionBlock()
+			if err != nil {
+				return stmts, nil, err
+			}
+			return stmts, excBlock, nil
+		}
+		stmt, err := p.parseStmt()
+		if err != nil {
+			return nil, nil, err
+		}
+		stmts = append(stmts, stmt)
+	}
+	return stmts, nil, nil
+}
+
+// parseExceptionBlock parses EXCEPTION WHEN ... THEN ... (END handled by caller).
+// M0097-0012.
+func (p *bodyParser) parseExceptionBlock() (*ExceptionBlock, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "exception"
+	excBlk := &ExceptionBlock{pos: pos}
+	for {
+		t := p.cur()
+		// Stop at END (the caller will consume it).
+		if t.Kind == parser.TokenKeyword && t.Keyword == parser.KwEnd {
+			break
+		}
+		if t.Kind == parser.TokenEOF {
+			break
+		}
+		// Parse WHEN conditions THEN stmts.
+		if !(t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "when")) &&
+			!(t.Kind == parser.TokenKeyword && t.Keyword == parser.KwWhen) {
+			break
+		}
+		p.advance() // consume WHEN
+		// Collect condition names until THEN.
+		var conditions []string
+		for {
+			ct := p.cur()
+			if ct.Kind == parser.TokenKeyword && ct.Keyword == parser.KwThen {
+				p.advance()
+				break
+			}
+			if ct.Kind == parser.TokenEOF {
+				break
+			}
+			if ct.Kind == parser.TokenIdent || ct.Kind == parser.TokenKeyword {
+				if !strings.EqualFold(ct.Value, "or") {
+					conditions = append(conditions, ct.Value)
+				}
+			}
+			p.advance()
+		}
+		// Parse handler body until next WHEN or END.
+		handlerStmts, _, err := p.parseStmtListWithException(parser.KwEnd)
+		if err != nil {
+			return nil, err
+		}
+		// Check if stopped at WHEN (not END).
+		if ht := p.cur(); ht.Kind == parser.TokenKeyword && ht.Keyword == parser.KwEnd {
+			excBlk.Handlers = append(excBlk.Handlers, &ExceptionHandler{
+				Conditions: conditions, Body: handlerStmts,
+			})
+			break
+		}
+		excBlk.Handlers = append(excBlk.Handlers, &ExceptionHandler{
+			Conditions: conditions, Body: handlerStmts,
+		})
+	}
+	return excBlk, nil
 }
 
 // parseStmtList parses zero-or-more statements terminated by one
@@ -251,8 +349,9 @@ func (p *bodyParser) parseWhile() (*WhileStmt, error) {
 	return &WhileStmt{pos: whileTok.Pos, Cond: cond, Body: body}, nil
 }
 
-// parseFor parses `FOR var IN [REVERSE] lower..upper [BY step] LOOP stmts END LOOP ;`.
-func (p *bodyParser) parseFor() (*ForStmt, error) {
+// parseFor parses FOR loops: integer-range (`FOR var IN low..high`)
+// or query-based (`FOR rec IN SELECT ...`). M0097-0012 extended.
+func (p *bodyParser) parseFor() (Stmt, error) {
 	forTok, err := p.expectKeyword(parser.KwFor)
 	if err != nil {
 		return nil, err
@@ -265,6 +364,63 @@ func (p *bodyParser) parseFor() (*ForStmt, error) {
 		return nil, err
 	}
 	isReverse := p.acceptKeyword(parser.KwReverse)
+
+	// Determine if this is a query-based FOR (starts with SELECT, EXECUTE,
+	// or a subquery parenthesis) or an integer-range FOR (contains ..).
+	// Peek ahead: if the first real token is SELECT/EXECUTE/( it's a query FOR.
+	isQueryFor := false
+	if !isReverse {
+		t := p.cur()
+		if t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwSelect ||
+			t.Keyword == parser.KwInsert || t.Keyword == parser.KwUpdate ||
+			t.Keyword == parser.KwDelete || t.Keyword == parser.KwWith ||
+			t.Keyword == parser.KwExecute) {
+			isQueryFor = true
+		} else if t.Kind == parser.TokenSymbol && t.Value == "(" {
+			isQueryFor = true
+		}
+	}
+
+	if isQueryFor {
+		// FOR rec IN query LOOP stmts END LOOP;  M0097-0012.
+		sqlStart := p.cur().Pos
+		depth := 0
+		for p.cur().Kind != parser.TokenEOF {
+			t := p.cur()
+			if t.Kind == parser.TokenSymbol && t.Value == "(" {
+				depth++
+			} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
+				depth--
+			} else if t.Kind == parser.TokenKeyword && t.Keyword == parser.KwLoop && depth == 0 {
+				break
+			}
+			p.advance()
+		}
+		sqlEnd := p.cur().Pos
+		sqlText := strings.TrimSpace(p.src[sqlStart:sqlEnd])
+		p.advance() // LOOP
+		body, err := p.parseStmtList(parser.KwEnd)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(parser.KwLoop); err != nil {
+			return nil, p.errAtCur("expected END LOOP to close FOR statement")
+		}
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate FOR statement")
+		}
+		return &ForSelectStmt{
+			pos:  forTok.Pos,
+			Var:  varName,
+			SQL:  sqlText,
+			Body: body,
+		}, nil
+	}
+
+	// Integer-range FOR: FOR var IN [REVERSE] lower..upper [BY step] LOOP.
 	lower, err := p.scanExprTo("lower bound", func(t parser.Token) bool {
 		return t.Kind == parser.TokenOperator && t.Value == ".."
 	})

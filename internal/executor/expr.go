@@ -1856,6 +1856,47 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// SRF returning sequence parameters — stub returns NULL.
 		return NullDatum, nil
 
+	// ── Function introspection stubs (M0097-0012) ─────────────────────────
+	case "pg_get_functiondef":
+		// pg_get_functiondef(func_oid) → text — returns function DDL.
+		// Stub: look up in routine registry and reconstruct definition.
+		if len(x.Args) == 1 {
+			nameArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || nameArg.IsNull() {
+				return NullDatum, nil
+			}
+			// The argument might be a regproc (function name cast to OID).
+			// Try to look up the function by name.
+			rs := ctx.Catalog.Routines()
+			if rs != nil {
+				name := nameArg.StringValue()
+				candidates := rs.LookupByName(parseRoutineName(name))
+				if len(candidates) > 0 {
+					r := candidates[0]
+					body := fmt.Sprintf("CREATE OR REPLACE FUNCTION %s(", r.Name)
+					for i, arg := range r.ArgNames {
+						if i > 0 {
+							body += ", "
+						}
+						body += arg + " " + r.ArgTypes[i].Name
+					}
+					body += ") RETURNS " + r.ReturnType.Name + " LANGUAGE " + r.Language + " AS $$\n" + r.Body + "\n$$"
+					return NewStringDatum(body), nil
+				}
+			}
+			return NullDatum, nil
+		}
+	case "pg_get_function_arguments", "pg_get_function_result":
+		return NewStringDatum(""), nil
+	case "pg_proc":
+		return NullDatum, nil
+	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
+		// Type cast functions — return the argument as-is (stub).
+		if len(x.Args) == 1 {
+			return evalExpr(x.Args[0], row, ctx)
+		}
+		return NullDatum, nil
+
 	// ── String functions (M0097-0005) ─────────────────────────────────────
 	case "repeat":
 		// repeat(text, int) → text

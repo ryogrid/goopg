@@ -464,9 +464,162 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.ForSelectStmt:
+		// FOR rec IN query LOOP ... END LOOP — query cursor loop. M0097-0012.
+		sql := s.SQL
+		if frame.trig != nil {
+			sql = substituteTriggerRefs(sql, frame.trig)
+		}
+		// Execute the query and collect rows.
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			return Datum{}, flowNone, &ExecError{Code: "42601", Message: fmt.Sprintf("FOR query parse error: %v", err)}
+		}
+		if len(stmts) == 0 {
+			return Datum{}, flowNone, nil
+		}
+		plan, err := planner.Plan(stmts[0], ctx.Catalog)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		op, err := Build(plan)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		if err := op.Open(ctx); err != nil {
+			op.Close()
+			return Datum{}, flowNone, err
+		}
+		varName := strings.ToLower(s.Var)
+		for {
+			slot, err := op.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				op.Close()
+				return Datum{}, flowNone, err
+			}
+			// Bind row columns to the loop variable's sub-fields.
+			// For each column in the slot, inject as _<var>_<colname> in frame.
+			if slot != nil && slot.Schema() != nil {
+				row := slotRow(slot)
+				for i, sc := range slot.Schema() {
+					colKey := "_" + varName + "_" + strings.ToLower(sc.Name)
+					if idx, ok := frame.indexByName[colKey]; ok {
+						if i < len(row) {
+							frame.values[idx] = row[i]
+						}
+					} else {
+						// Auto-register new column variable.
+						_ = frame.add(colKey, sc.Type, NullDatum)
+						if i < len(row) {
+							if idx2, ok2 := frame.indexByName[colKey]; ok2 {
+								frame.values[idx2] = row[i]
+							}
+						}
+					}
+				}
+			}
+			v, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
+			if err != nil {
+				op.Close()
+				return Datum{}, flowNone, err
+			}
+			if flow == flowReturn || flow == flowReturnTriggerOld || flow == flowReturnTriggerNew || flow == flowReturnTriggerNull {
+				op.Close()
+				return v, flow, nil
+			}
+			if flow == flowExit {
+				break
+			}
+		}
+		op.Close()
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.ExceptionBlock:
+		// BEGIN...EXCEPTION...END — try/catch block. M0097-0012.
+		// Execute TryBody; if it errors, try matching handlers.
+		v, flow, err := executePLpgSQLStmtList(s.TryBody, r, frame, ctx)
+		if err == nil {
+			return v, flow, nil
+		}
+		// Determine SQLSTATE from error.
+		sqlstate := "XX000"
+		if ee, ok := err.(*ExecError); ok {
+			sqlstate = ee.Code
+		}
+		// Try each handler.
+		for _, h := range s.Handlers {
+			if exceptionHandlerMatches(h.Conditions, sqlstate) {
+				hv, hflow, herr := executePLpgSQLStmtList(h.Body, r, frame, ctx)
+				if herr != nil {
+					return Datum{}, flowNone, herr
+				}
+				return hv, hflow, nil
+			}
+		}
+		// No handler matched — re-propagate.
+		return Datum{}, flowNone, err
+
 	default:
 		return Datum{}, flowNone, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL statement %T", stmt)}
 	}
+}
+
+// exceptionHandlerMatches reports whether any condition in the handler
+// matches the given SQLSTATE. M0097-0012.
+func exceptionHandlerMatches(conditions []string, sqlstate string) bool {
+	for _, cond := range conditions {
+		switch strings.ToUpper(cond) {
+		case "OTHERS":
+			return true
+		case sqlstate:
+			return true
+		}
+		// Check common condition names.
+		switch strings.ToLower(cond) {
+		case "others", "when others":
+			return true
+		case "division_by_zero":
+			if sqlstate == "22012" {
+				return true
+			}
+		case "unique_violation":
+			if sqlstate == "23505" {
+				return true
+			}
+		case "foreign_key_violation":
+			if sqlstate == "23503" {
+				return true
+			}
+		case "undefined_function", "undefined_object":
+			if sqlstate == "42883" || sqlstate == "42704" {
+				return true
+			}
+		case "no_data_found":
+			if sqlstate == "P0002" {
+				return true
+			}
+		case "too_many_rows":
+			if sqlstate == "P0003" {
+				return true
+			}
+		case "syntax_error":
+			if sqlstate == "42601" {
+				return true
+			}
+		case "undefined_table":
+			if sqlstate == "42P01" {
+				return true
+			}
+		case "not_null_violation":
+			if sqlstate == "23502" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, error) {
