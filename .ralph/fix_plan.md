@@ -192,16 +192,19 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
       Key files: `internal/testutil/replcluster/replcluster.go`,
       `internal/testport/e2e_replication_test.go`.
 
-- [ ] **M0094-0002** — Design doc `0094-0002-logical-apply-delete-update.md`
-      status → `accepted`. In `internal/wal/reorder.go::Close()`, fold
-      consecutive `(xid, rel, Delete)` + `(xid, rel, Insert)` pairs into a
-      single `ChangeUpdate{OldTuple, NewTuple}`. Extend `internal/wal/pgoutput.go`
-      to emit pgoutput `U` message for `ChangeUpdate`. Implement
-      `applyDelete()` in `internal/executor/applyworker.go` (key-tuple heap
-      scan + markHeapDelete). Implement `applyUpdate()` (key-tuple lookup +
-      row overwrite). Un-skip `TestE2E_LogicalReplication` testing INSERT +
-      DELETE + UPDATE end-to-end. Unit tests: `TestReorderFoldDeleteInsertToUpdate`,
-      `TestPgoutputUpdateMessageEncoding`. All tests pass.
+- [x] **M0094-0002** — Design doc `0094-0002-logical-apply-delete-update.md`
+      status → `accepted` (2026-05-11). Extended `RecordKindHeapDelete` WAL
+      format to carry old-tuple bytes (optional); extended `LogHeapDeleteFunc`
+      hook signature; executor DELETE/UPDATE paths capture pre-delete tuple.
+      Classifier populates `Change.OldTuple`. `ReorderBuffer.Commit()` folds
+      consecutive `(Delete, Insert)` pairs on same rel → `ChangeUpdate`. pgoutput
+      encoder emits `'D'` with 'O' old-tuple body when OldTuple is non-empty;
+      emits new `'U'` message for `ChangeUpdate`. Decoder added `'U'` parsing.
+      `applyDelete()` and `applyUpdate()` implemented in `applyworker.go`
+      via key-tuple heap scan + xmax stamp. `TestE2E_LogicalReplication` un-skipped
+      and passes (INSERT + DELETE + UPDATE end-to-end). Unit tests:
+      `TestReorderFoldDeleteInsertToUpdate`, `TestReorderFoldDoesNotFoldDifferentRels`,
+      `TestPgoutputUpdateMessageEncoding`, `TestPgoutputDeleteWithOldTupleEmitsO`.
 
 - [ ] **M0094-0003** — Design doc `0094-0003-recovery-tap-porting-strategy.md`
       status → `accepted`. Create `internal/testport/recovery_port_test.go`.

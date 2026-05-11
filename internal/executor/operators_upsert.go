@@ -282,7 +282,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, o
 		o.ctx.Pool.Unpin(pinned)
 		return err
 	}
-	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, o.ctx.Tx.XID)
+	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, o.ctx.Tx.XID, nil)
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)
 	if derr != nil {

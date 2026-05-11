@@ -191,3 +191,50 @@ func TestDecoderRequiresPlugin(t *testing.T) {
 		t.Errorf("err=%v want ErrNoPlugin", err)
 	}
 }
+
+// TestReorderFoldDeleteInsertToUpdate verifies that consecutive
+// (ChangeDelete, ChangeInsert) pairs for the same relation in one
+// committed xact are folded into a single ChangeUpdate by Commit().
+func TestReorderFoldDeleteInsertToUpdate(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 42}
+	rb := NewReorderBuffer()
+	const xid = storage.TransactionID(100)
+
+	rb.Append(xid, Change{Kind: ChangeDelete, LSN: 10, Rel: rel, OldTuple: []byte("old")})
+	rb.Append(xid, Change{Kind: ChangeInsert, LSN: 20, Rel: rel, NewTuple: []byte("new")})
+
+	changes, _, ok := rb.Commit(xid)
+	if !ok {
+		t.Fatal("Commit ok=false")
+	}
+	if len(changes) != 1 {
+		t.Fatalf("got %d changes after fold, want 1", len(changes))
+	}
+	c := changes[0]
+	if c.Kind != ChangeUpdate {
+		t.Errorf("kind=%v want ChangeUpdate", c.Kind)
+	}
+	if !reflect.DeepEqual(c.OldTuple, []byte("old")) {
+		t.Errorf("OldTuple=%q want 'old'", c.OldTuple)
+	}
+	if !reflect.DeepEqual(c.NewTuple, []byte("new")) {
+		t.Errorf("NewTuple=%q want 'new'", c.NewTuple)
+	}
+}
+
+// TestReorderFoldDoesNotFoldDifferentRels verifies that
+// (Delete, Insert) pairs on different relations are NOT folded.
+func TestReorderFoldDoesNotFoldDifferentRels(t *testing.T) {
+	relA := storage.RelFileNode{DBOid: 1, RelOid: 10}
+	relB := storage.RelFileNode{DBOid: 1, RelOid: 20}
+	rb := NewReorderBuffer()
+	const xid = storage.TransactionID(101)
+
+	rb.Append(xid, Change{Kind: ChangeDelete, LSN: 10, Rel: relA, OldTuple: []byte("a")})
+	rb.Append(xid, Change{Kind: ChangeInsert, LSN: 20, Rel: relB, NewTuple: []byte("b")})
+
+	changes, _, _ := rb.Commit(xid)
+	if len(changes) != 2 {
+		t.Fatalf("got %d changes, want 2 (cross-rel pairs must not be folded)", len(changes))
+	}
+}

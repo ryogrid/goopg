@@ -1230,7 +1230,7 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
 					continue
 				}
-				_ = markHeapDeleteDirty(ctx.Pool, pinned, rel, blk, lineNo, xmax)
+				_ = markHeapDeleteDirty(ctx.Pool, pinned, rel, blk, lineNo, xmax, nil)
 			}
 		}
 		pinned.Unlock()

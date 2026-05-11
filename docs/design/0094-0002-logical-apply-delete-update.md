@@ -1,6 +1,6 @@
 # 0094-0002 — Logical Replication Apply Completeness (DELETE + UPDATE)
 
-**Status:** draft
+**Status:** accepted (2026-05-11 — Delete+Update apply landed; TestE2E_LogicalReplication passes)
 **Date:** 2026-05-11
 **Milestone:** M0094-0002
 

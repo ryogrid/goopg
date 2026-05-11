@@ -11,11 +11,11 @@ import (
 // of the heap-delete record.
 func TestEncodeDecodeHeapDeleteRoundTrip(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 50, RelOid: 51, Fork: storage.MainFork}
-	enc := EncodeHeapDelete(rel, 13, 7, storage.TransactionID(99))
+	enc := EncodeHeapDelete(rel, 13, 7, storage.TransactionID(99), nil)
 	if enc[0] != RecordKindHeapDelete {
 		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindHeapDelete)
 	}
-	gotRel, gotBlk, gotSlot, gotXmax, err := DecodeHeapDelete(enc)
+	gotRel, gotBlk, gotSlot, gotXmax, _, err := DecodeHeapDelete(enc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestReplayHeapDeleteIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := EncodeHeapDelete(rel, 0, 1, storage.TransactionID(42))
+	rec := EncodeHeapDelete(rel, 0, 1, storage.TransactionID(42), nil)
 	stats, err := ReplayRecords(mgr, []Record{
 		{StartLSN: 1, EndLSN: 100, Payload: rec},
 	})
@@ -640,7 +640,7 @@ func TestEncodeDecodeHeapLockRoundTrip(t *testing.T) {
 // Mirrors the shape-guard tests on the other heap-record decoders.
 func TestDecodeHeapLockRejectsWrongKind(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 70, RelOid: 71, Fork: storage.MainFork}
-	enc := EncodeHeapDelete(rel, 17, 9, storage.TransactionID(123))
+	enc := EncodeHeapDelete(rel, 17, 9, storage.TransactionID(123), nil)
 	if _, _, _, _, _, err := DecodeHeapLock(enc); err == nil {
 		t.Error("expected error decoding heap-delete bytes as heap-lock")
 	}

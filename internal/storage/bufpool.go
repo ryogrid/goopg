@@ -373,10 +373,10 @@ type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, t
 type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN, error)
 
 // LogHeapDeleteFunc emits one logical heap-delete (xmax stamp)
-// redo record. Used by the executor's UPDATE / DELETE paths to
-// avoid an FPI on subsequent dirties of the same page in an
-// epoch. See docs/design/0002-0003-redo-records.md.
-type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID) (LSN, error)
+// redo record. oldTuple carries the pre-delete heap tuple bytes
+// (optional; nil is accepted and omits the old-tuple extension
+// from the WAL record). See docs/design/0002-0003-redo-records.md.
+type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, oldTuple []byte) (LSN, error)
 
 // LogHeapLockFunc emits one row-lock WAL record (M0021 tuple-
 // level locking step 3) and returns the record's end LSN. Used

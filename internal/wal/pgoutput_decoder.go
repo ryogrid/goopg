@@ -164,6 +164,40 @@ func DecodeMessage(payload []byte) (*DecodedMessage, error) {
 		out.RelOID = oid
 		out.OldTuple = cols
 		return out, nil
+	case pgoUpdate:
+		// 'U' | rel_oid(4) | old_tuple_type(1) | OldTupleData | 'N' | NewTupleData
+		oid, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		oldAction, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		var oldCols []DecodedColumn
+		if oldAction == 'K' || oldAction == 'O' {
+			oldCols, err = decodeTupleBody(r)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, fmt.Errorf("pgoutput: update old-tuple type=%q want K or O", oldAction)
+		}
+		newAction, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		if newAction != 'N' {
+			return nil, fmt.Errorf("pgoutput: update new-tuple type=%q want N", newAction)
+		}
+		newCols, err := decodeTupleBody(r)
+		if err != nil {
+			return nil, err
+		}
+		out.RelOID = oid
+		out.OldTuple = oldCols
+		out.NewTuple = newCols
+		return out, nil
 	}
 	return nil, fmt.Errorf("pgoutput: unknown message kind %q", kind)
 }

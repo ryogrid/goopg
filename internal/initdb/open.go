@@ -317,8 +317,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Logical heap-delete (xmax stamp) change record.
-	logHeapDelete := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID) (storage.LSN, error) {
-		payload := wal.EncodeHeapDelete(rel, blk, lineSlot, xmax)
+	// oldTuple carries the pre-delete heap-tuple bytes for logical
+	// replication; nil when the caller doesn't need logical decoding.
+	logHeapDelete := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) (storage.LSN, error) {
+		payload := wal.EncodeHeapDelete(rel, blk, lineSlot, xmax, oldTuple)
 		_, end, err := walWriter.Append(payload)
 		if err != nil {
 			return 0, err

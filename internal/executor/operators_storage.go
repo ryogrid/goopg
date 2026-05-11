@@ -872,9 +872,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 			s.Lock()
 			// M0090-0002: detect concurrent xmax-stamp under the
-			// exclusive Lock before our own stamp.
-			if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), pu.slot); gerr == nil &&
-				isConcurrentlyUpdated(oldTuple.Header, o.ctx.Tx.XID) {
+			// exclusive Lock before our own stamp. Capture old tuple
+			// bytes for WAL logical record (M0094-0002).
+			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				return nil, &ExecError{
@@ -882,6 +883,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					Pos:     o.plan.Pos(),
 					Message: "could not serialize access due to concurrent update",
 				}
+			}
+			var oldTupleBytes []byte
+			if oldGerr == nil {
+				oldTupleBytes, _ = oldTup.MarshalBinary()
 			}
 			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 				s.Unlock()
@@ -896,7 +901,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				}
 				return nil, err
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -983,9 +988,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 			s.Lock()
 			// M0090-0002: detect concurrent xmax-stamp under the
-			// exclusive Lock before our own stamp.
-			if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), pu.slot); gerr == nil &&
-				isConcurrentlyUpdated(oldTuple.Header, o.ctx.Tx.XID) {
+			// exclusive Lock before our own stamp. Capture old tuple
+			// bytes for WAL logical record (M0094-0002).
+			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				return nil, &ExecError{
@@ -993,6 +999,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					Pos:     o.plan.Pos(),
 					Message: "could not serialize access due to concurrent update",
 				}
+			}
+			var oldTupleBytes []byte
+			if oldGerr == nil {
+				oldTupleBytes, _ = oldTup.MarshalBinary()
 			}
 			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 				s.Unlock()
@@ -1007,7 +1017,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				return nil, err
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -1099,8 +1109,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		// M0090-0002: detect concurrent xmax-stamp under the
 		// exclusive Lock before our own stamp. For DELETE, the same
 		// concurrent-update race produces inconsistent xmax state.
-		if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), v.slot); gerr == nil &&
-			isConcurrentlyUpdated(oldTuple.Header, o.ctx.Tx.XID) {
+		// Capture old tuple bytes for the WAL logical record at the
+		// same time (needed by logical replication / M0094-0002).
+		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
+		if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			return nil, &ExecError{
@@ -1108,6 +1120,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				Pos:     o.plan.Pos(),
 				Message: "could not serialize access due to concurrent update",
 			}
+		}
+		var oldTupleBytes []byte
+		if oldGerr == nil {
+			oldTupleBytes, _ = oldTup.MarshalBinary()
 		}
 		if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
 			s.Unlock()
@@ -1122,7 +1138,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			}
 			return nil, err
 		}
-		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, v.blk, v.slot, o.ctx.Tx.XID)
+		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		if derr != nil {
@@ -1473,14 +1489,16 @@ func markHeapInsertDirty(
 }
 
 // markHeapDeleteDirty mirrors markHeapInsertDirty for the xmax
-// stamp paths (UPDATE old image + DELETE). When the pool has a
-// LogHeapDelete hook configured, subsequent dirties of the same
-// page in an epoch emit a fixed-size 20-byte logical record
-// instead of a full FPI.
+// stamp paths (UPDATE old image + DELETE). oldTuple carries the
+// pre-delete heap-tuple bytes for logical replication; pass nil
+// when not needed (DDL, UPSERT). When the pool has a LogHeapDelete
+// hook configured, subsequent dirties of the same page in an epoch
+// emit a logical record instead of a full FPI.
 func markHeapDeleteDirty(
 	pool *storage.Pool, slot *storage.Slot,
 	rel storage.RelFileNode, blk storage.BlockNumber,
 	lineSlot uint16, xmax storage.TransactionID,
+	oldTuple []byte,
 ) error {
 	logDel := pool.LogHeapDelete()
 	if logDel == nil {
@@ -1488,7 +1506,7 @@ func markHeapDeleteDirty(
 		return nil
 	}
 	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-		return logDel(rel, blk, lineSlot, xmax)
+		return logDel(rel, blk, lineSlot, xmax, oldTuple)
 	})
 }
 
@@ -1498,8 +1516,9 @@ func markHeapDeleteDirtyAndClearVM(
 	ctx *Context, slot *storage.Slot,
 	rel storage.RelFileNode, blk storage.BlockNumber,
 	lineSlot uint16, xmax storage.TransactionID,
+	oldTuple []byte,
 ) error {
-	if err := markHeapDeleteDirty(ctx.Pool, slot, rel, blk, lineSlot, xmax); err != nil {
+	if err := markHeapDeleteDirty(ctx.Pool, slot, rel, blk, lineSlot, xmax, oldTuple); err != nil {
 		return err
 	}
 	if ctx.VM != nil {

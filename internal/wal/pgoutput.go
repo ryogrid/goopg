@@ -43,6 +43,7 @@ const (
 	pgoRelation = 'R'
 	pgoInsert   = 'I'
 	pgoDelete   = 'D'
+	pgoUpdate   = 'U'
 )
 
 // pgoutput tuple-column status bytes. Mirror upstream's
@@ -168,12 +169,9 @@ func (p *PgOutput) Change(c Change) error {
 	case ChangeInsert:
 		return p.writeInsert(rel, c.NewTuple)
 	case ChangeDelete:
-		return p.writeDelete(rel)
+		return p.writeDelete(rel, c.OldTuple)
 	case ChangeUpdate:
-		// Deferred: v0 executor emits UPDATE as paired
-		// HeapDelete + HeapInsert. Caller treats this Kind
-		// as a no-op for now.
-		return nil
+		return p.writeUpdate(rel, c.OldTuple, c.NewTuple)
 	}
 	return fmt.Errorf("pgoutput: unknown change kind %d", c.Kind)
 }
@@ -220,17 +218,51 @@ func (p *PgOutput) writeInsert(rel *RelationDef, tuple []byte) error {
 	return err
 }
 
-func (p *PgOutput) writeDelete(rel *RelationDef) error {
-	// v0's HeapDelete record carries no pre-image; the apply
-	// worker resolves the row by (rel, block, slot). Emit a
-	// 0-attribute tuple body so the wire shape is well-formed
-	// — `'K' | nliveatts=0`.
-	buf := make([]byte, 0, 8)
+func (p *PgOutput) writeDelete(rel *RelationDef, oldTuple []byte) error {
+	buf := make([]byte, 0, 64)
 	buf = append(buf, pgoDelete)
 	buf = appendUint32(buf, rel.OID)
-	buf = append(buf, 'K')
-	buf = appendUint16(buf, 0)
+	if len(oldTuple) > 0 {
+		body, err := encodePgoTuple(rel.Columns, oldTuple)
+		if err != nil {
+			return fmt.Errorf("pgoutput: encode delete old-tuple for %q: %w", rel.Name, err)
+		}
+		buf = append(buf, 'O') // full old tuple
+		buf = append(buf, body...)
+	} else {
+		// No pre-image available: emit an empty K body so the
+		// wire shape is well-formed. Apply workers skip empty
+		// old-tuple deletes.
+		buf = append(buf, 'K')
+		buf = appendUint16(buf, 0)
+	}
 	_, err := p.w.Write(buf)
+	return err
+}
+
+func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) error {
+	// 'U' | rel_oid(4) | 'O' | OldTupleData | 'N' | NewTupleData
+	newBody, err := encodePgoTuple(rel.Columns, newTuple)
+	if err != nil {
+		return fmt.Errorf("pgoutput: encode update new-tuple for %q: %w", rel.Name, err)
+	}
+	buf := make([]byte, 0, 6+len(newBody)+64)
+	buf = append(buf, pgoUpdate)
+	buf = appendUint32(buf, rel.OID)
+	if len(oldTuple) > 0 {
+		oldBody, err := encodePgoTuple(rel.Columns, oldTuple)
+		if err != nil {
+			return fmt.Errorf("pgoutput: encode update old-tuple for %q: %w", rel.Name, err)
+		}
+		buf = append(buf, 'O')
+		buf = append(buf, oldBody...)
+	} else {
+		buf = append(buf, 'K')
+		buf = appendUint16(buf, 0)
+	}
+	buf = append(buf, 'N')
+	buf = append(buf, newBody...)
+	_, err = p.w.Write(buf)
 	return err
 }
 

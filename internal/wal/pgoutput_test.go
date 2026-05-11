@@ -337,3 +337,112 @@ func TestPgOutputFilterPerKind(t *testing.T) {
 		t.Errorf("missing I after allowed insert: %x", buf.Bytes())
 	}
 }
+
+// TestPgoutputUpdateMessageEncoding verifies that a ChangeUpdate
+// emits a 'U' message containing both old and new tuple data, and
+// that the decoder round-trips it correctly.
+func TestPgoutputUpdateMessageEncoding(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "val", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	oldBody := encodeBodyV0([]any{1, "hello"}, []string{"int4", "text"})
+	newBody := encodeBodyV0([]any{1, "world"}, []string{"int4", "text"})
+	oldTuple := wrapAsHeapTuple(t, oldBody)
+	newTuple := wrapAsHeapTuple(t, newBody)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	if err := po.Change(Change{Kind: ChangeUpdate, Rel: rel, OldTuple: oldTuple, NewTuple: newTuple}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := buf.Bytes()
+	// First message is 'R' (relation descriptor, lazy-emitted).
+	if len(raw) == 0 || raw[0] != 'R' {
+		t.Fatalf("first byte=%q want R; raw=%x", raw[0], raw)
+	}
+	// Find the 'U' message (after the R).
+	uIdx := bytes.IndexByte(raw, 'U')
+	if uIdx < 0 {
+		t.Fatalf("no U message in output: %x", raw)
+	}
+
+	// Decode the U message.
+	msg, err := DecodeMessage(raw[uIdx:])
+	if err != nil {
+		t.Fatalf("DecodeMessage U: %v", err)
+	}
+	if msg.Kind != 'U' {
+		t.Errorf("decoded kind=%q want U", msg.Kind)
+	}
+	if len(msg.OldTuple) == 0 {
+		t.Error("U message OldTuple is empty")
+	}
+	if len(msg.NewTuple) == 0 {
+		t.Error("U message NewTuple is empty")
+	}
+	// Old tuple: id=1 val='hello'
+	if len(msg.OldTuple) < 2 || msg.OldTuple[1].Status != 't' {
+		t.Errorf("OldTuple[1] (val) status=%q want t", msg.OldTuple[1].Status)
+	}
+	if string(msg.OldTuple[1].Bytes) != "hello" {
+		t.Errorf("OldTuple val=%q want 'hello'", msg.OldTuple[1].Bytes)
+	}
+	// New tuple: id=1 val='world'
+	if len(msg.NewTuple) < 2 || msg.NewTuple[1].Status != 't' {
+		t.Errorf("NewTuple[1] (val) status=%q want t", msg.NewTuple[1].Status)
+	}
+	if string(msg.NewTuple[1].Bytes) != "world" {
+		t.Errorf("NewTuple val=%q want 'world'", msg.NewTuple[1].Bytes)
+	}
+}
+
+// TestPgoutputDeleteWithOldTupleEmitsO verifies that a ChangeDelete
+// with a non-empty OldTuple emits a 'D' message with 'O' tuple type.
+func TestPgoutputDeleteWithOldTupleEmitsO(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	body := encodeBodyV0([]any{42}, []string{"int4"})
+	oldTuple := wrapAsHeapTuple(t, body)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	if err := po.Change(Change{Kind: ChangeDelete, Rel: rel, OldTuple: oldTuple}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := buf.Bytes()
+	dIdx := bytes.IndexByte(raw, 'D')
+	if dIdx < 0 {
+		t.Fatalf("no D message in output: %x", raw)
+	}
+	// Byte after RelOID(4) should be 'O' (full old tuple).
+	if dIdx+5 >= len(raw) {
+		t.Fatalf("D message too short: %x", raw[dIdx:])
+	}
+	tupleType := raw[dIdx+5]
+	if tupleType != 'O' {
+		t.Errorf("D message tuple type=%q want O (full old tuple)", tupleType)
+	}
+
+	// Decode and verify old tuple.
+	msg, err := DecodeMessage(raw[dIdx:])
+	if err != nil {
+		t.Fatalf("DecodeMessage D: %v", err)
+	}
+	if len(msg.OldTuple) == 0 {
+		t.Error("D message OldTuple is empty")
+	}
+	if msg.OldTuple[0].Status != 't' {
+		t.Errorf("OldTuple[0] status=%q want t", msg.OldTuple[0].Status)
+	}
+	if string(msg.OldTuple[0].Bytes) != "42" {
+		t.Errorf("OldTuple[0] val=%q want '42'", msg.OldTuple[0].Bytes)
+	}
+}
