@@ -183,6 +183,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseAnalyze()
 	case KwReindex:
 		return p.parseReindex()
+	case KwCluster:
+		return p.parseCluster()
 	case KwShow:
 		return p.parseShow()
 	case KwSet:
@@ -887,6 +889,49 @@ func (p *parser) parseReindex() (Stmt, error) {
 	}
 	r.Name = name.String()
 	return r, nil
+}
+
+// parseCluster parses CLUSTER statements (M0095-0008).
+//
+// Syntax accepted:
+//
+//	CLUSTER [VERBOSE]
+//	CLUSTER [VERBOSE] tablename [USING indexname]
+//
+// Executor stub: CLUSTER without a table always succeeds.
+// CLUSTER with a table succeeds when the table exists, errors otherwise.
+func (p *parser) parseCluster() (Stmt, error) {
+	t := p.advance() // consume CLUSTER
+	c := &ClusterStmt{pos: t.Pos}
+
+	// Optional VERBOSE.
+	if p.acceptKeyword(KwVerbose) {
+		c.Verbose = true
+	}
+
+	// If the next token starts a statement terminator or is EOF, no table.
+	if p.cur().Kind == TokenEOF ||
+		(p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
+		return c, nil
+	}
+
+	// Parse table name (possibly schema-qualified).
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	c.Target = &name
+
+	// Optional USING indexname.
+	if p.acceptKeyword(KwUsing) {
+		idx, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		c.IndexName = identText(idx)
+	}
+
+	return c, nil
 }
 
 // parseReset: RESET name | RESET ALL

@@ -83,7 +83,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
-		*parser.ReindexStmt:
+		*parser.ReindexStmt, *parser.ClusterStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CheckpointStmt:

@@ -133,6 +133,19 @@ type ReindexStmt struct {
 func (s *ReindexStmt) Pos() int  { return s.pos }
 func (s *ReindexStmt) stmtNode() {}
 
+// ClusterStmt — `CLUSTER [VERBOSE] [tablename [USING indexname]]`.
+// M0095-0008: no-op executor stub.  When a table name is provided the
+// executor verifies the table exists; without a table it always succeeds.
+type ClusterStmt struct {
+	pos        int
+	Verbose    bool
+	Target     *ObjectName // nil when CLUSTER is called with no table
+	IndexName  string      // optional USING clause
+}
+
+func (s *ClusterStmt) Pos() int  { return s.pos }
+func (s *ClusterStmt) stmtNode() {}
+
 // ExplainFormat selects the rendering format for ExplainStmt
 // output. M0018-0001 introduces the AST shape; the renderer
 // honours TEXT today and JSON in 0018-0002 / 0018-0004.

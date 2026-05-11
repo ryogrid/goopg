@@ -487,7 +487,7 @@ func (c *InMemory) registerSystemTables() {
 				t.Name,
 				t.Name,
 				"r",
-				"public",  // relnamespace: public schema OID (returned as name for JOIN)
+				"2200",    // relnamespace: OID of public namespace (matches pg_namespace.oid)
 				"p",       // relpersistence: permanent
 				"0",       // reltoastrelid: no TOAST table
 				"0",       // relpages: estimated page count (0 = unknown)

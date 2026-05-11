@@ -284,11 +284,16 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       goopg is UTF8-only; LATIN1 encoding blocker remains.
       CSV: D-005d/e → port,yes (2026-05-12).
 
-- [ ] **M0095-0008** — Add `CLUSTER` parser+executor stub
-      (`CLUSTER [VERBOSE] [table USING index]`; no-op reorder, returns
-      success).
-      Unblocks: `TestPort_Scripts010Clusterdb`, `011`.
-      CSV: D-005j → port, D-005k → port.
+- [x] **M0095-0008** — CLUSTER parser+executor stub + pg_class relnamespace fix.
+      KwCluster keyword, ClusterStmt AST, parseCluster(), planner Utility
+      routing, clusterOp (table-existence check with schema fallback).
+      Also: pg_class.relnamespace changed from "public" to OID "2200"
+      so catalog JOIN queries work (clusterdb catalog query was returning 0
+      rows). Also: fixed multi-statement SET query bug in query.go (handleQuery
+      now routes queries with internal ';' to parser-based executor path).
+      Design doc: no separate doc required (stub + catalog fix only).
+      Both clusterdb tests pass; all vacuumdb tests unaffected.
+      CSV: D-005j/k → port,yes (2026-05-12).
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 

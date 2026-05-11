@@ -196,6 +196,9 @@ func Build(plan planner.Node) (Operator, error) {
 		if as, ok := p.Stmt.(*parser.AnalyzeStmt); ok {
 			return newAnalyzeOp(as), nil
 		}
+		if cs, ok := p.Stmt.(*parser.ClusterStmt); ok {
+			return newClusterOp(cs), nil
+		}
 		return newUtilityNoOp(p), nil
 	case *planner.Copy:
 		// COPY is currently driven from the wire-protocol layer

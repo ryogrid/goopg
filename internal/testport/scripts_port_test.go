@@ -67,9 +67,6 @@ func TestPort_Scripts080PgIsready(t *testing.T) {
 // Skip: goopg parser does not support the CLUSTER statement. Implement
 // CLUSTER in parser+executor (at minimum a no-op stub) and remove this skip.
 func TestPort_Scripts010Clusterdb(t *testing.T) {
-	t.Skip("CLUSTER statement not supported in goopg parser/executor; " +
-		"add parser+executor stub for CLUSTER before enabling")
-
 	if _, err := exec.LookPath("clusterdb"); err != nil {
 		t.Skip("clusterdb not in PATH")
 	}
@@ -117,9 +114,6 @@ func TestPort_Scripts010Clusterdb(t *testing.T) {
 //
 // Skip: requires CLUSTER SQL support (same as 010) and multi-database awareness.
 func TestPort_Scripts011ClusterdbAll(t *testing.T) {
-	t.Skip("CLUSTER statement not supported in goopg parser/executor; " +
-		"add parser+executor stub for CLUSTER before enabling")
-
 	if _, err := exec.LookPath("clusterdb"); err != nil {
 		t.Skip("clusterdb not in PATH")
 	}

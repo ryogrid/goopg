@@ -46,6 +46,14 @@ func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess 
 	matchable := strings.TrimRight(trimmed, ";")
 	matchable = strings.TrimSpace(matchable)
 
+	// Multi-statement queries (internal ';' after stripping trailing ones)
+	// must go through the parser-based executor so each statement is parsed
+	// and executed individually. The string-matching path below only handles
+	// single statements correctly.
+	if strings.ContainsRune(matchable, ';') && s.cfg.hasStorage() {
+		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed)
+	}
+
 	if strings.EqualFold(matchable, "SELECT 1") {
 		return s.respondSelectOne(w)
 	}
