@@ -256,10 +256,23 @@ func TestOpenWiresXactMarkerHook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// M0093: the xactMarker hook fires only when an XID was
+	// materialised. Call AssignXID so this test still exercises
+	// the WAL-marker emission path.
+	if xid, err := rt.TxnMgr.AssignXID(tx); err != nil {
+		t.Fatal(err)
+	} else {
+		tx.XID = xid
+	}
 	if err := rt.TxnMgr.Commit(tx); err != nil {
 		t.Fatal(err)
 	}
 	tx2, _ := rt.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	if xid, err := rt.TxnMgr.AssignXID(tx2); err != nil {
+		t.Fatal(err)
+	} else {
+		tx2.XID = xid
+	}
 	if err := rt.TxnMgr.Rollback(tx2); err != nil {
 		t.Fatal(err)
 	}

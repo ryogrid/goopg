@@ -145,6 +145,20 @@ type OpenOptions struct {
 	// 0 disables the bgwriter. Default 100 mirrors upstream's
 	// bgwriter_lru_maxpages GUC.
 	BgwriterMaxPages int
+
+	// TrackIOTiming gates the per-I/O activity.LookupGoroutine
+	// wait-event hooks (BufferPin / DataFileRead / Write / Extend
+	// / Sync / AIO). Default false (matches upstream PG's
+	// `track_io_timing = off` default). When false, the hooks are
+	// installed as nil so the storage / pool / AIO layers skip the
+	// `runtime.Stack`-based LookupGoroutine call entirely — a
+	// material saving on hot read paths (M0092-0005).
+	//
+	// pg_stat_activity wait events will not surface I/O blocking
+	// reasons while off; diagnostic sessions can flip the GUC via
+	// postgresql.conf to recover them. Runtime SET is not yet
+	// supported (M0093 candidate).
+	TrackIOTiming bool
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -233,9 +247,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		OnLoopEnd: func() {
 			activity.ClearCurrentGoroutine()
 		},
+		// M0091-0001: OnWALWrite always runs on the WAL writer
+		// goroutine, so we can closure-capture `act` and the
+		// literal PID. No runtime.Stack on the hot path.
 		OnWALWrite: func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitWALWrite)
+			if act != nil {
+				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALWrite)
 			}
 		},
 	}
@@ -474,15 +491,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: bufpool: %w", err)
 	}
-	// Wire BufferPin wait event hook.
-	pool.OnPinWait = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+	// M0092-0005: BufferPin wait-event hook gated by
+	// TrackIOTiming. Default off — saves the per-Pin
+	// runtime.Stack lookup on the hot read path.
+	if opts.TrackIOTiming {
+		pool.OnPinWait = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+			}
 		}
-	}
-	pool.OnPinDone = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventEnd(pid)
+		pool.OnPinDone = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventEnd(pid)
+			}
 		}
 	}
 	// Wire FlushAll goroutine assertion (M0042-0004): Pool.FlushAll and
@@ -821,79 +842,78 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
-	// Wire AIO wait-event hooks so pg_stat_activity can report
-	// "AIO" wait events when backends block on I/O completion.
-	// The hooks use goroutine-ID lookup to find the correct backend
-	// (see activity.RegisterCurrentGoroutine).
-	if aioEngine != nil {
-		aioEngine.OnWaitStart = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitAIO)
+	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity
+	// can report blocking reasons. M0092-0005: gated by
+	// TrackIOTiming (default off — saves the per-Read/Write/Sync/
+	// Extend/AIO `runtime.Stack` LookupGoroutine call on the hot
+	// path). Each Wait/Done pair is balanced (M0058-0006).
+	if opts.TrackIOTiming {
+		if aioEngine != nil {
+			aioEngine.OnWaitStart = func() {
+				if reg, pid := activity.LookupGoroutine(); reg != nil {
+					reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitAIO)
+				}
+			}
+			aioEngine.OnWaitEnd = func() {
+				if reg, pid := activity.LookupGoroutine(); reg != nil {
+					reg.WaitEventEnd(pid)
+				}
 			}
 		}
-		aioEngine.OnWaitEnd = func() {
+		mgr.OnReadWait = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileRead)
+			}
+		}
+		mgr.OnReadDone = func() {
 			if reg, pid := activity.LookupGoroutine(); reg != nil {
 				reg.WaitEventEnd(pid)
 			}
 		}
-	}
-
-	// Wire data-file I/O wait-event hooks so pg_stat_activity records
-	// DataFileRead / DataFileWrite / DataFileExtend / DataFileSync
-	// when backends block on storage operations.  Each Wait/Done pair
-	// is balanced (M0058-0006) so wait_event clears once the I/O
-	// completes.
-	mgr.OnReadWait = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileRead)
+		mgr.OnWriteWait = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileWrite)
+			}
 		}
-	}
-	mgr.OnReadDone = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventEnd(pid)
+		mgr.OnWriteDone = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventEnd(pid)
+			}
 		}
-	}
-	mgr.OnWriteWait = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		mgr.OnExtendWait = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileExtend)
+			}
 		}
-	}
-	mgr.OnWriteDone = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventEnd(pid)
+		mgr.OnExtendDone = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventEnd(pid)
+			}
 		}
-	}
-	mgr.OnExtendWait = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileExtend)
+		mgr.OnSyncWait = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileSync)
+			}
 		}
-	}
-	mgr.OnExtendDone = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventEnd(pid)
-		}
-	}
-	mgr.OnSyncWait = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileSync)
-		}
-	}
-	mgr.OnSyncDone = func() {
-		if reg, pid := activity.LookupGoroutine(); reg != nil {
-			reg.WaitEventEnd(pid)
+		mgr.OnSyncDone = func() {
+			if reg, pid := activity.LookupGoroutine(); reg != nil {
+				reg.WaitEventEnd(pid)
+			}
 		}
 	}
 
 	// Wire WAL I/O wait-event hooks.
+	// M0091-0001: WAL sync runs on the WAL writer goroutine; use
+	// the captured `act` + literal PID instead of LookupGoroutine.
 	if walWriter != nil {
 		walWriter.OnWALSync = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitWALSync)
+			if act != nil {
+				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALSync)
 			}
 		}
 		walWriter.OnWALSyncDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if act != nil {
+				act.WaitEventEnd("wal-writer-0")
 			}
 		}
 	}

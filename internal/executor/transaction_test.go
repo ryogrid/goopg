@@ -45,18 +45,21 @@ func TestTransactionBeginCommitLifecycle(t *testing.T) {
 	if ctx.TxnMgr.ActiveCount() != 1 {
 		t.Fatalf("active count=%d want=1", ctx.TxnMgr.ActiveCount())
 	}
-	tx, snap, ok := sess.CurrentTransaction()
+	tx, _, ok := sess.CurrentTransaction()
 	if !ok {
 		t.Fatal("CurrentTransaction should be set after BEGIN")
 	}
-	if tx.XID == 0 {
-		t.Fatal("xid must be allocated")
+	// M0093: BEGIN returns a tx with a non-zero Handle but XID = 0
+	// (read-only fast-path). Snapshot does NOT include this tx in
+	// InProgress because there's no XID to track yet.
+	if tx.Handle == 0 {
+		t.Fatal("Handle must be allocated by BEGIN")
 	}
-	if !snap.HasInProgress(tx.XID) {
-		t.Fatalf("snapshot should include current xid=%d", tx.XID)
+	if tx.XID != 0 {
+		t.Fatalf("xid=%d want 0 (read-only — XID only materialised on first write)", tx.XID)
 	}
-	if ctx.Tx.XID != tx.XID {
-		t.Fatalf("ctx.Tx=%d want=%d", ctx.Tx.XID, tx.XID)
+	if ctx.Tx.Handle != tx.Handle {
+		t.Fatalf("ctx.Tx.Handle=%d want=%d", ctx.Tx.Handle, tx.Handle)
 	}
 
 	if err := runTransactionStmt(t, ctx, "COMMIT"); err != nil {

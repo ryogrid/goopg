@@ -238,15 +238,25 @@ func TestAutoVacuumAntiWraparoundTrigger(t *testing.T) {
 	}
 }
 
-// TestXIDWarnLimit verifies Manager.Begin() fails when nextXID would exceed
-// the safe maximum.
+// TestXIDWarnLimit verifies the anti-wraparound guard refuses to
+// materialise a new XID when nextXID is too close to overflow.
+//
+// M0093: Begin no longer allocates an XID — the guard moved to
+// AssignXID. The test exercises the new path: Begin succeeds
+// (read-only-fast-path returns Handle without consuming an XID),
+// and AssignXID is the call that fails when nextXID is near the
+// uint32 ceiling.
 func TestXIDWarnLimit(t *testing.T) {
 	mgr := mvcc.NewManager()
 	// Advance to just below the stop limit.
 	mgr.SetNextXID(^storage.TransactionID(0) - 2_000_000)
-	// One more transaction should fail with the anti-wraparound error.
-	_, err := mgr.Begin(mvcc.IsolationReadCommitted)
-	if err == nil {
-		t.Fatal("expected error near XID wraparound, got nil")
+	// Begin still succeeds — it doesn't touch nextXID under M0093.
+	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("Begin unexpectedly failed near wraparound: %v", err)
+	}
+	// AssignXID must fail with the anti-wraparound error.
+	if _, err := mgr.AssignXID(tx); err == nil {
+		t.Fatal("expected AssignXID error near XID wraparound, got nil")
 	}
 }

@@ -208,14 +208,27 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 		outerRow := slotRow(outerSlot)
-		o.currentOuter = outerRow
+		// M0092 (prerequisite for M0092-0002): the upstream child
+		// may return a slot that ALIASES its internal buffer (e.g.,
+		// projectOp.o.out after the cloneRow removal). The next
+		// outer Next() would overwrite that buffer mid-inner-loop,
+		// corrupting o.currentOuter. Defensively copy outerRow into
+		// our own buffer (reusing capacity where possible). This is
+		// strictly safer than aliasing and is unconditionally
+		// correct regardless of upstream behaviour.
+		if cap(o.currentOuter) < len(outerRow) {
+			o.currentOuter = make(Row, len(outerRow))
+		} else {
+			o.currentOuter = o.currentOuter[:len(outerRow)]
+		}
+		copy(o.currentOuter, outerRow)
 
 		// M0072-0001: bind the outer row into o.outerMS once and
 		// pass the persistent slot directly to the inner IndexScan.
 		// The inner reads outer columns via o.outerSlot.Get(col)
 		// (evalExprSlot at lookupKey / lookupRangeBounds), so no
 		// concatenated `boundRow` alloc is needed per outer.
-		o.outerMS.row = outerRow
+		o.outerMS.row = o.currentOuter
 		o.inner.BindOuter(o.outerMS, o.outerWidth)
 
 		if err := o.inner.Rescan(o.outerMS, o.outerWidth); err != nil {

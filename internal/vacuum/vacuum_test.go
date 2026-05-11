@@ -56,10 +56,15 @@ func TestVacuumReclaimsDeadTuples(t *testing.T) {
 
 	mvccMgr := mvcc.NewManager()
 	// Drive next-xid forward so we can place tuples with xids
-	// that will lie below the eventual horizon.
+	// that will lie below the eventual horizon. M0093: AssignXID
+	// to actually materialise the XIDs we then stamp into tuples.
 	tx1, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
 	mvccMgr.Commit(tx1)
 	tx2, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xid2, _ := mvccMgr.AssignXID(tx2)
+	tx2.XID = xid2
 	mvccMgr.Commit(tx2)
 
 	// Tuple A: live (xmin=tx1, xmax=0).
@@ -160,9 +165,14 @@ func TestVacuumReclaimsFreeSpace(t *testing.T) {
 	pool.Unpin(s)
 
 	mvccMgr := mvcc.NewManager()
+	// M0093: AssignXID so the tuples are stamped with real XIDs.
 	creator, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xidC, _ := mvccMgr.AssignXID(creator)
+	creator.XID = xidC
 	mvccMgr.Commit(creator)
 	deleter, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xidD, _ := mvccMgr.AssignXID(deleter)
+	deleter.XID = xidD
 	mvccMgr.Commit(deleter)
 
 	bigPayload := make([]byte, 1000)
@@ -224,6 +234,8 @@ func TestAnalyzeReturnsRowCountAndAvgWidth(t *testing.T) {
 
 	mvccMgr := mvcc.NewManager()
 	creator, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xidC, _ := mvccMgr.AssignXID(creator)
+	creator.XID = xidC
 	mvccMgr.Commit(creator)
 
 	addTuple(t, pool, rel, 0, storage.NewHeapTuple(creator.XID, storage.InvalidTransactionID, []byte("ab")))

@@ -74,6 +74,12 @@ type seqScanOp struct {
 	// the boundary must call slot.Materialize() to deep-copy.
 	// (M0073-0004.)
 	arena *Arena
+
+	// M0092-0007: embedded slot reused across every Next() call.
+	// The returned `&o.slot` pointer is stable across calls; its
+	// `row` field is overwritten per emission. Caller must
+	// consume / Materialize before the next Next() invocation.
+	slot MaterializedSlot
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -250,13 +256,15 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				}
 				row = detoasted
 			}
-			// M0071-0015 Stage E: producers always cloneRow.
-			// The slot pipeline's retention boundaries
-			// (sortOp.Open, windowOp.Open, lockRowsOp,
-			// executor.Run) call slot.Materialize() when they
-			// need ownership; consumers that only read within
-			// a single Next can use the slot directly.
-			return asSlot(o.Schema(), cloneRow(row)), nil
+			// M0092-0007: stack-aliased slot reused across
+			// Next() calls; matches the M0092-0002 contract
+			// (consumers materialize at retention boundaries).
+			// scanRow is reused across the per-page tuple
+			// loop; rows that need retention go through
+			// slot.Materialize().
+			o.slot.schema = o.Schema()
+			o.slot.row = row
+			return &o.slot, nil
 		}
 		o.releasePinned()
 		o.curBlock++
@@ -589,6 +597,14 @@ func tryApplyHOTUpdate(
 	oldSlot uint16,
 	newRow Row,
 ) (bool, error) {
+	// M0093: materialise the transaction's XID BEFORE the
+	// isConcurrentlyUpdated race check (line 646). Calling it
+	// after would feed XID=0 into the check, letting a foreign
+	// xmax stamp slip through as a false negative (orphan visible
+	// tuples — the M0090 invariant we explicitly guard).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return false, err
+	}
 	body, err := EncodeRow(cols, newRow)
 	if err != nil {
 		return false, &ExecError{Code: "XX000", Message: err.Error()}
@@ -900,6 +916,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
+	// M0093: UPDATE is unconditionally a write — materialise the
+	// transaction's XID before the scan so foreignLockOnly /
+	// isConcurrentlyUpdated / tuple-lock acquisition see the real
+	// XID (zero would cause false-negative race detection and
+	// would mis-classify our own locks as foreign).
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return nil, err
+	}
 	tbl := o.plan.Table
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
@@ -1045,6 +1069,12 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
+	// M0093: DELETE is unconditionally a write — materialise the
+	// transaction's XID before the scan so foreign-lock checks see
+	// the real XID.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return nil, err
+	}
 	tbl := o.plan.Table
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
@@ -1260,6 +1290,15 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 // location.
 func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
 	var ptr storage.ItemPointer
+
+	// M0093: lazily materialise the transaction's XID before any
+	// xmin stamp. ToastLargeColumnsIfNeeded may itself call
+	// NewHeapTuple for the TOAST chunk relation; doing this at the
+	// top covers both the TOAST writes and the main-heap NewHeapTuple
+	// below.
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return ptr, err
+	}
 
 	// TOAST oversized column values before encoding (M0046-0006).
 	var toastErr error

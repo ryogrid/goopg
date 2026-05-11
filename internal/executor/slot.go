@@ -77,22 +77,29 @@ func (s *MaterializedSlot) Get(col int) Datum      { return s.row[col] }
 func (s *MaterializedSlot) IsNull(col int) bool    { return s.row[col].IsNull() }
 func (s *MaterializedSlot) Row() Row               { return s.row }
 
-// Materialize promotes any arena-backed Datums in the row to
-// owned KindString / KindBytes Datums (Buf-backed) so the
-// returned slot's bytes survive the producer's next
-// arena.Reset(). When no arena Datums are present, returns
-// self — the no-arena fast path is byte-for-byte unchanged
-// from the M0069-0001 contract.
+// Materialize produces a slot whose Row is independent of the
+// producer's internal buffers. Two cases:
+//   - Any arena-backed Datum (KindStringArena / KindBytesArena)
+//     gets its bytes promoted into a freshly-allocated owned
+//     KindString / KindBytes Datum (via cloneRowOwned).
+//   - Even without arena Datums, the Row slice itself is
+//     deep-copied (M0092-0002 contract) — producers like
+//     projectOp now return slots that ALIAS their internal
+//     `o.out` buffer which is overwritten on the next Next()
+//     call. Without the slice copy, consumers that retain the
+//     slot past the next Next() would see corrupted data.
 //
-// M0073-0001 introduced the arena variants; the promotion
-// path is exercised once M0073-0004 wires SeqScan / IndexScan
-// arena binding. Without producer wiring (this commit) the
-// rowHasArena fast path is always false in production flow,
-// so Materialize stays a no-op for backward compatibility.
+// Pre-M0092-0002, the no-arena fast path returned self because
+// every producer's cloneRow already gave consumers independent
+// rows. The new contract is "slot valid until next Next()
+// unless materialized"; this method is the materialization
+// boundary that honors it.
+//
+// Consumers that retain rows past next Next() MUST call
+// Materialize. Callers that consume immediately (filter/limit
+// pass-through, simple/extended-query result loops that format
+// each cell synchronously) do not need to materialize.
 func (s *MaterializedSlot) Materialize() *MaterializedSlot {
-	if !rowHasArena(s.row) {
-		return s
-	}
 	s.row = cloneRowOwned(s.row)
 	return s
 }

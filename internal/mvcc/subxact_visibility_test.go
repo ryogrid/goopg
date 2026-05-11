@@ -29,10 +29,21 @@ func makeSnap(xmin, xmax storage.TransactionID, inProgress ...storage.Transactio
 func TestSubxactVisibilityMatrix(t *testing.T) {
 	mgr := NewManager()
 
-	// Allocate XIDs.
+	// Allocate XIDs (M0093: lazy XID — call AssignXID so the
+	// synthetic subxact arithmetic below sees real XIDs).
 	txP, _ := mgr.Begin(IsolationReadCommitted) // parent xid
+	if xid, err := mgr.AssignXID(txP); err == nil {
+		txP.XID = xid
+	} else {
+		t.Fatal(err)
+	}
 	txQ, _ := mgr.Begin(IsolationReadCommitted) // concurrent txn (for snapshot xip)
-	subXid := txQ.XID + 1                       // synthetic subxact XID (outside manager.active)
+	if xid, err := mgr.AssignXID(txQ); err == nil {
+		txQ.XID = xid
+	} else {
+		t.Fatal(err)
+	}
+	subXid := txQ.XID + 1 // synthetic subxact XID (outside manager.active)
 	// Manually wire subxact → parent in the manager's subxact map.
 	mgr.RegisterSubXid(subXid, txP.XID)
 
@@ -136,6 +147,13 @@ func TestSubxactAbortHidesRowAfterParentCommit(t *testing.T) {
 	mgr := NewManager()
 
 	txP, _ := mgr.Begin(IsolationReadCommitted)
+	// M0093: materialise the parent's XID; the subxact synthetic
+	// arithmetic below requires a real top-level XID.
+	if xid, err := mgr.AssignXID(txP); err == nil {
+		txP.XID = xid
+	} else {
+		t.Fatal(err)
+	}
 	subXid := txP.XID + 100 // synthetic subxact xid
 
 	// Register subxact, then abort it.

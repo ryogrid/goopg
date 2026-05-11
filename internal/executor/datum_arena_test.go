@@ -187,18 +187,27 @@ func TestM0073MaterializePromotesArenaDatum(t *testing.T) {
 	}
 }
 
-// TestM0073MaterializeNoArenaIsNoOp pins the fast-path
-// invariant: when no Datums are arena-backed, Materialize is
-// equivalent to returning self without any allocation.
-func TestM0073MaterializeNoArenaIsNoOp(t *testing.T) {
+// TestM0092MaterializeAlwaysDeepCopies pins the M0092-0002
+// contract change: Materialize must ALWAYS produce a row
+// independent of the producer's internal buffers, including
+// when no Datums are arena-backed. Pre-M0092 the no-arena
+// path was a no-op; post-M0092 producers (projectOp,
+// indexScanOp) may return slots aliasing internal buffers
+// that get overwritten on the next Next() call, so the slice
+// itself must be copied even without arena Datums.
+func TestM0092MaterializeAlwaysDeepCopies(t *testing.T) {
 	row := Row{NewIntDatum(1), NewStringDatum("x")}
 	slot := SlotFromRow(nil, row)
 	mat := slot.Materialize()
 	if mat != slot {
-		t.Errorf("no-arena fast path should return self; got %p, want %p", mat, slot)
+		t.Errorf("Materialize must return the same slot pointer; got %p, want %p", mat, slot)
 	}
-	// Also: the row backing slice should be the same identity.
-	if &mat.row[0] != &row[0] {
-		t.Errorf("no-arena Materialize should not reallocate row")
+	// The row backing slice MUST be a fresh allocation now.
+	if &mat.row[0] == &row[0] {
+		t.Errorf("Materialize must deep-copy the row slice (M0092-0002 contract)")
+	}
+	// Content must match.
+	if mat.row[0].Int != 1 || mat.row[1].StringValue() != "x" {
+		t.Errorf("Materialize corrupted row content: %+v", mat.row)
 	}
 }

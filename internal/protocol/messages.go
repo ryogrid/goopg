@@ -324,6 +324,33 @@ func (fw *FrameWriter) WriteDataRow(columns [][]byte) error {
 	return fw.WriteFrame(MsgDataRow, payload)
 }
 
+// WriteDataRowReuse writes a DataRow using the caller-provided
+// scratch buffer as the payload backing. The returned slice (possibly
+// grown via append) should be passed back on the next call so the
+// underlying capacity amortises across rows. Saves ~33 B / row vs
+// WriteDataRow's fresh make([]byte) per call (M0092-0004).
+//
+// scratch is reset to length 0 and reused; its previous contents
+// are overwritten. After WriteFrame copies the payload to the
+// underlying writer, the caller may freely truncate the returned
+// slice for the next row.
+func (fw *FrameWriter) WriteDataRowReuse(columns [][]byte, scratch []byte) ([]byte, error) {
+	payload := scratch[:0]
+	payload = appendUint16(payload, uint16(len(columns)))
+	for _, c := range columns {
+		if c == nil {
+			payload = appendUint32(payload, 0xFFFFFFFF) // -1 as int32
+			continue
+		}
+		payload = appendUint32(payload, uint32(len(c)))
+		payload = append(payload, c...)
+	}
+	if err := fw.WriteFrame(MsgDataRow, payload); err != nil {
+		return payload, err
+	}
+	return payload, nil
+}
+
 // WriteCommandComplete emits 'C' with a NUL-terminated tag like "SELECT 1".
 // See postgres/src/backend/tcop/cmdtag.c:BuildQueryCompletionString.
 func (fw *FrameWriter) WriteCommandComplete(tag string) error {

@@ -5,7 +5,8 @@ import (
 )
 
 // TestM0069MaterializedSlot exercises the basic Row-backed slot
-// path: construct, read, materialize (no-op), release.
+// path: construct, read, materialize (always deep-copies per
+// M0092-0002), release.
 func TestM0069MaterializedSlot(t *testing.T) {
 	r := Row{NewIntDatum(10), NewStringDatum("alpha"), Datum{}}
 	s := SlotFromRow(nil, r)
@@ -21,13 +22,18 @@ func TestM0069MaterializedSlot(t *testing.T) {
 	if !s.IsNull(2) {
 		t.Errorf("IsNull(2) = false, want true")
 	}
+	// M0092-0002: Materialize always deep-copies the row slice so
+	// consumers retaining past producer's next Next() see
+	// independent storage. The returned slot may be the same
+	// pointer (in-place update of s.row); the row contents must
+	// match.
 	m := s.Materialize()
 	if m != s {
 		t.Errorf("Materialize on MaterializedSlot must return self")
 	}
 	got := s.Row()
-	if &got[0] != &r[0] {
-		t.Errorf("Row() should be zero-copy, got fresh slice")
+	if got[0].Int != 10 || got[1].StringValue() != "alpha" || !got[2].IsNull() {
+		t.Errorf("Materialize() corrupted row content: %+v", got)
 	}
 	s.Release() // no-op, must not panic
 }

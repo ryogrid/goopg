@@ -21,6 +21,9 @@ type indexOnlyScanOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+	// M0092-0007: embedded slot reused across every Next() call
+	// so we don't allocate a fresh MaterializedSlot per emission.
+	slot MaterializedSlot
 }
 
 func newIndexOnlyScanOp(p *planner.IndexOnlyScan) *indexOnlyScanOp {
@@ -123,7 +126,10 @@ func (o *indexOnlyScanOp) Next() (TupleSlot, error) {
 	}
 	r := o.rows[o.idx]
 	o.idx++
-	return asSlot(o.Schema(), r), nil
+	// M0092-0007: stack-aliased slot reused across Next() calls.
+	o.slot.schema = o.Schema()
+	o.slot.row = r
+	return &o.slot, nil
 }
 
 func (o *indexOnlyScanOp) Close() error {

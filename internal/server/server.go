@@ -585,25 +585,30 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}()
 
 	// Wire client-I/O wait-event hooks on the frame reader/writer.
-	// These fire before and every blocking read/write on the wire.
+	// These fire before and after every blocking read/write on the wire.
+	//
+	// M0091-0001: closure-capture `reg` + `pidStr` (already in scope
+	// above) instead of calling activity.LookupGoroutine each fire.
+	// LookupGoroutine internally invokes runtime.Stack which dominated
+	// ~11 % of CPU during pgbench select-only.
 	r.OnBeforeRead = func() {
-		if rReg, rPid := activity.LookupGoroutine(); rReg != nil {
-			rReg.WaitEventStart(rPid, activity.WaitTypeClient, activity.WaitClientRead)
+		if reg != nil {
+			reg.WaitEventStart(pidStr, activity.WaitTypeClient, activity.WaitClientRead)
 		}
 	}
 	r.OnAfterRead = func() {
-		if rReg, rPid := activity.LookupGoroutine(); rReg != nil {
-			rReg.WaitEventEnd(rPid)
+		if reg != nil {
+			reg.WaitEventEnd(pidStr)
 		}
 	}
 	w.OnBeforeWrite = func() {
-		if wReg, wPid := activity.LookupGoroutine(); wReg != nil {
-			wReg.WaitEventStart(wPid, activity.WaitTypeClient, activity.WaitClientWrite)
+		if reg != nil {
+			reg.WaitEventStart(pidStr, activity.WaitTypeClient, activity.WaitClientWrite)
 		}
 	}
 	w.OnAfterWrite = func() {
-		if wReg, wPid := activity.LookupGoroutine(); wReg != nil {
-			wReg.WaitEventEnd(wPid)
+		if reg != nil {
+			reg.WaitEventEnd(pidStr)
 		}
 	}
 

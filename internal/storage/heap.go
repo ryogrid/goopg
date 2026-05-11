@@ -158,8 +158,22 @@ func (t HeapTuple) MarshalBinary() ([]byte, error) {
 	return out, nil
 }
 
-// ParseHeapTuple decodes one on-page tuple payload.
+// ParseHeapTuple decodes one on-page tuple payload, copying the
+// data section so the returned tuple is independent of `raw`.
 func ParseHeapTuple(raw []byte) (HeapTuple, error) {
+	t, err := parseHeapTupleAlias(raw)
+	if err != nil {
+		return HeapTuple{}, err
+	}
+	t.Data = append([]byte(nil), t.Data...)
+	return t, nil
+}
+
+// parseHeapTupleAlias is the no-copy decode used by
+// PageGetHeapTupleNoCopy (M0092-0006). The returned tuple's Data
+// field aliases `raw`; caller must hold the page pin AND a content
+// RLock for the lifetime of the returned tuple.
+func parseHeapTupleAlias(raw []byte) (HeapTuple, error) {
 	if len(raw) < SizeOfHeapTupleHeaderData {
 		return HeapTuple{}, fmt.Errorf("%w: raw len=%d", ErrCorruptTuple, len(raw))
 	}
@@ -167,7 +181,7 @@ func ParseHeapTuple(raw []byte) (HeapTuple, error) {
 	if hoff < SizeOfHeapTupleHeaderData || hoff > len(raw) {
 		return HeapTuple{}, fmt.Errorf("%w: invalid t_hoff=%d len=%d", ErrCorruptTuple, hoff, len(raw))
 	}
-	t := HeapTuple{
+	return HeapTuple{
 		Header: HeapTupleHeader{
 			Xmin:      TransactionID(binary.LittleEndian.Uint32(raw[0:4])),
 			Xmax:      TransactionID(binary.LittleEndian.Uint32(raw[4:8])),
@@ -177,9 +191,8 @@ func ParseHeapTuple(raw []byte) (HeapTuple, error) {
 			Infomask:  binary.LittleEndian.Uint16(raw[20:22]),
 			Hoff:      uint8(hoff),
 		},
-		Data: append([]byte(nil), raw[hoff:]...),
-	}
-	return t, nil
+		Data: raw[hoff:],
+	}, nil
 }
 
 // ItemIDFlags mirrors PostgreSQL ItemId state bits.
@@ -303,6 +316,39 @@ func PageGetHeapTuple(p Page, slot uint16) (HeapTuple, error) {
 	}
 	raw := append([]byte(nil), p[off:off+ln]...)
 	return ParseHeapTuple(raw)
+}
+
+// PageGetHeapTupleNoCopy reads the tuple at the 1-based slot, with
+// the returned tuple's Data field ALIASING the page bytes (zero
+// copy). Caller MUST hold the page pin AND a content RLock for the
+// lifetime of the returned tuple (so the page can't be written
+// underneath us). Used by the indexScanOp hot read path
+// (M0092-0006); other callers should keep using PageGetHeapTuple.
+func PageGetHeapTupleNoCopy(p Page, slot uint16) (HeapTuple, error) {
+	if slot == 0 {
+		return HeapTuple{}, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return HeapTuple{}, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return HeapTuple{}, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return HeapTuple{}, err
+	}
+	if item.Flags != ItemIDNormal {
+		return HeapTuple{}, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	ln := int(item.Length)
+	if off < 0 || ln < 0 || off+ln > len(p) {
+		return HeapTuple{}, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+	}
+	return parseHeapTupleAlias(p[off : off+ln])
 }
 
 // PageAddItemRaw appends an arbitrary blob as a new item on the page,
@@ -867,6 +913,39 @@ func PageGetItemRaw(p Page, slot uint16) ([]byte, error) {
 		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
 	}
 	return append([]byte(nil), p[off:off+ln]...), nil
+}
+
+// PageGetItemRawNoCopy is the alias-the-page variant of
+// PageGetItemRaw. The returned slice REFERENCES the page bytes
+// directly — no allocation, but the caller MUST hold the page pin
+// for the lifetime of the returned slice and MUST NOT retain it
+// across the unpin. Used by btree.RangeScan's CAT-1 callers per
+// M0091-0002.
+func PageGetItemRawNoCopy(p Page, slot uint16) ([]byte, error) {
+	if slot == 0 {
+		return nil, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return nil, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return nil, err
+	}
+	if item.Flags != ItemIDNormal {
+		return nil, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	ln := int(item.Length)
+	if off < 0 || ln < 0 || off+ln > len(p) {
+		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+	}
+	return p[off : off+ln], nil
 }
 
 func readItemID(p Page, idx int) (ItemID, error) {

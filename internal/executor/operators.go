@@ -56,6 +56,9 @@ type projectOp struct {
 	schema  planner.Schema
 	ctx     *Context
 	out     Row
+	// M0092-0007: stack-aliased slot reused across every Next()
+	// call so we don't allocate a fresh MaterializedSlot per row.
+	slot MaterializedSlot
 }
 
 func newProjectOp(plan *planner.Project, child Operator) *projectOp {
@@ -91,7 +94,17 @@ func (o *projectOp) Next() (TupleSlot, error) {
 		}
 		o.out[i] = v
 	}
-	return asSlot(o.schema, cloneRow(o.out)), nil
+	// M0092-0002: the returned slot ALIASES o.out, which is
+	// overwritten on the next Next() call. Audited consumers
+	// (filterOp, limitOp, simple/extended-query loops, sortOp,
+	// windowOp, lockRowsOp, joinOp, aggregateOp, recursiveUnionOp,
+	// nestedLoopIndexJoinOp post-prereq) all consume / materialize
+	// before the next Next. See
+	// docs/design/0092-0002-projectop-slot-aliasing.md.
+	// M0092-0007: stack-aliased slot reused across Next() calls.
+	o.slot.schema = o.schema
+	o.slot.row = o.out
+	return &o.slot, nil
 }
 
 // filterOp drops rows where the predicate doesn't evaluate to TRUE.
