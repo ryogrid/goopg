@@ -20,15 +20,50 @@ var (
 	ErrXIDWraparound      = errors.New("mvcc: xid wraparound is not implemented")
 )
 
+// TxnHandle is an opaque, monotonically-allocated identifier for an
+// in-progress transaction that exists independently of the XID. It
+// is the active-set key so that read-only transactions (which never
+// receive an XID under the lazy-allocation model — M0093, PG parity)
+// don't collide on the InvalidTransactionID sentinel.
+//
+// Handles are not durable; they exist only within a single Manager
+// lifetime. The first handle is 1; 0 is reserved as the zero value.
+type TxnHandle uint64
+
 // Transaction is one open transaction handle.
 type Transaction struct {
-	XID       storage.TransactionID
+	// Handle is the manager-internal identity of this transaction,
+	// always non-zero for a tx returned by Begin. Used as the
+	// active-set key. Survives lazy XID assignment.
+	Handle TxnHandle
+
+	// XID is the assigned transaction ID. Zero
+	// (storage.InvalidTransactionID) until the first write-path
+	// operation calls Manager.AssignXID — this is the M0093 lazy
+	// allocation mirroring PostgreSQL's RecordTransactionCommit
+	// fast-path for read-only transactions.
+	XID storage.TransactionID
+
 	Isolation IsolationLevel
 }
 
 type txState struct {
 	isolation     IsolationLevel
 	firstSnapshot *Snapshot
+
+	// xid is the assigned transaction ID, or
+	// storage.InvalidTransactionID if no write has materialised one
+	// yet. Set by AssignXID. Once non-zero, never changes.
+	xid storage.TransactionID
+
+	// snapshotXmin tracks the minimum Xmin observed across every
+	// snapshot this transaction has taken. It pins VACUUM's
+	// reclamation horizon for long-running read-only REPEATABLE
+	// READ transactions whose own xid would otherwise be Invalid.
+	// Initialised to Invalid; updated on each SnapshotFor call to
+	// min(prev-or-MaxUint32, snap.Xmin). OldestXmin folds this in
+	// alongside assigned xids (M0093 R-B6 correctness fix).
+	snapshotXmin storage.TransactionID
 }
 
 // Manager tracks active transactions and creates statement snapshots.
@@ -36,7 +71,8 @@ type txState struct {
 type Manager struct {
 	mu         sync.Mutex
 	nextXID    storage.TransactionID
-	active     map[storage.TransactionID]*txState
+	nextHandle TxnHandle
+	active     map[TxnHandle]*txState
 	xactMarker func(storage.TransactionID, XactMarker) error
 
 	// subxact tracking (M0050-0002): maps subxact XIDs to their parent
@@ -49,8 +85,9 @@ type Manager struct {
 // mirroring PostgreSQL's first normal xid.
 func NewManager() *Manager {
 	return &Manager{
-		nextXID: FirstNormalTransactionID,
-		active:  map[storage.TransactionID]*txState{},
+		nextXID:    FirstNormalTransactionID,
+		nextHandle: 1,
+		active:     map[TxnHandle]*txState{},
 	}
 }
 
@@ -88,51 +125,90 @@ const xidStopAge = storage.TransactionID(3_000_000)
 // uint32 max = 4,294,967,295; reserved XIDs 0-2 put the usable ceiling here.
 const xidMaxSafe = ^storage.TransactionID(0) - xidStopAge
 
-// Begin allocates an xid and tracks the transaction as in-progress.
+// Begin allocates a handle and tracks the transaction as in-progress.
+// M0093: NO XID is allocated; the first write path calls AssignXID
+// to materialise one. Returns a Transaction with Handle != 0 and
+// XID == storage.InvalidTransactionID.
 func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
 	if iso != IsolationReadCommitted && iso != IsolationRepeatableRead {
 		return Transaction{}, fmt.Errorf("mvcc: unsupported isolation level %v", iso)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.nextXID == ^storage.TransactionID(0) {
-		return Transaction{}, ErrXIDWraparound
+	handle := m.nextHandle
+	m.nextHandle++
+	m.active[handle] = &txState{
+		isolation:    iso,
+		xid:          storage.InvalidTransactionID,
+		snapshotXmin: ^storage.TransactionID(0), // sentinel: no snapshot yet
 	}
-	// Anti-wraparound guard (M0046-0005): refuse new transactions when too
-	// close to uint32 overflow; warn when approaching the danger zone.
+	return Transaction{Handle: handle, XID: storage.InvalidTransactionID, Isolation: iso}, nil
+}
+
+// AssignXID lazily allocates a real XID for tx (M0093, PG-parity).
+// Idempotent: returns the existing XID on subsequent calls.
+//
+// CRITICAL: callers MUST refresh their Transaction.XID with the
+// returned value BEFORE any code that consults tx.XID as a real
+// XID — in particular before isConcurrentlyUpdated (M0090),
+// NewHeapTuple xmin, PageSetHeapTupleXmax, PageSetHeapTupleLockOnly.
+// Use executor.Context.MaterializeWriterXID() which does this
+// atomically for the common executor call sites.
+func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.active[tx.Handle]
+	if !ok {
+		return 0, ErrUnknownTransaction
+	}
+	if state.xid != storage.InvalidTransactionID {
+		return state.xid, nil
+	}
+	if m.nextXID == ^storage.TransactionID(0) {
+		return 0, ErrXIDWraparound
+	}
+	// Anti-wraparound guard (M0046-0005): refuse new transactions
+	// when too close to uint32 overflow.
 	if m.nextXID > xidMaxSafe {
-		return Transaction{}, fmt.Errorf(
+		return 0, fmt.Errorf(
 			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
 			^storage.TransactionID(0)-m.nextXID)
 	}
-	xid := m.nextXID
+	state.xid = m.nextXID
 	m.nextXID++
-	tx := Transaction{XID: xid, Isolation: iso}
-	m.active[xid] = &txState{isolation: iso}
-	return tx, nil
+	return state.xid, nil
 }
 
 // SnapshotFor returns the statement snapshot for tx.
 //
 // READ COMMITTED gets a fresh snapshot on every call.
 // REPEATABLE READ pins the first snapshot for the whole transaction.
+//
+// M0093: lookup is by Handle (not XID), and the per-state
+// snapshotXmin is updated to the min observed Xmin so OldestXmin
+// can pin VACUUM correctly even for read-only RR transactions.
 func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	state, ok := m.active[tx.XID]
+	state, ok := m.active[tx.Handle]
 	if !ok {
 		return Snapshot{}, ErrUnknownTransaction
 	}
 	if state.isolation != tx.Isolation {
-		return Snapshot{}, fmt.Errorf("mvcc: transaction isolation mismatch xid=%d", tx.XID)
+		return Snapshot{}, fmt.Errorf("mvcc: transaction isolation mismatch handle=%d", tx.Handle)
 	}
 	switch state.isolation {
 	case IsolationReadCommitted:
-		return m.captureSnapshotLocked(), nil
+		s := m.captureSnapshotLocked()
+		if s.Xmin < state.snapshotXmin {
+			state.snapshotXmin = s.Xmin
+		}
+		return s, nil
 	case IsolationRepeatableRead:
 		if state.firstSnapshot == nil {
 			s := m.captureSnapshotLocked()
 			state.firstSnapshot = &s
+			state.snapshotXmin = s.Xmin
 		}
 		return state.firstSnapshot.Clone(), nil
 	default:
@@ -145,6 +221,11 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 // manager's lock with kind=XactCommit before the active-set
 // removal so a hook failure surfaces as a Commit error and the
 // transaction stays in-progress for the caller to retry.
+//
+// M0093: the hook fires ONLY when the transaction was assigned a
+// real XID. Read-only commits skip the hook entirely (no WAL
+// XactCommit record, no fsync, no clog write) — mirroring PG's
+// RecordTransactionCommit fast-path for txns with no XID.
 func (m *Manager) Commit(tx Transaction) error {
 	return m.finish(tx, XactCommit)
 }
@@ -162,6 +243,14 @@ func (m *Manager) Rollback(tx Transaction) error {
 // it as a child of parentXid. The sub-XID is not tracked in the active map
 // (subxact XIDs are not independent top-level transactions); visibility is
 // handled entirely by SeesCommittedXIDWithSubxacts via the subxact map.
+//
+// M0093 note: parentXid must already be a real (non-Invalid) XID. The
+// caller — executor's SAVEPOINT path — calls Context.MaterializeWriterXID
+// first so the parent has a real XID before sub-XIDs are allocated under
+// it. AllocateSubXid does NOT walk the active set to materialise the
+// parent lazily, because by the time control reaches here the executor
+// has already taken the page-level latches required for the actual
+// subxact-introducing statement.
 func (m *Manager) AllocateSubXid(parentXid storage.TransactionID) (storage.TransactionID, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -185,13 +274,22 @@ func (m *Manager) ActiveCount() int {
 // in-progress or future snapshot. Returns nextXID when no transaction
 // is active. VACUUM uses this as the horizon below which xmax-tagged
 // tuples can be reclaimed.
+//
+// M0093: folds in both (a) assigned XIDs of active transactions AND
+// (b) the snapshotXmin of any active txn that has taken a snapshot
+// but not yet been assigned an XID. (b) preserves VACUUM correctness
+// for long-running read-only REPEATABLE READ transactions whose
+// snapshot is still observing tuples xmin >= snapshotXmin.
 func (m *Manager) OldestXmin() storage.TransactionID {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	xmin := m.nextXID
-	for xid := range m.active {
-		if xid < xmin {
-			xmin = xid
+	for _, state := range m.active {
+		if state.xid != storage.InvalidTransactionID && state.xid < xmin {
+			xmin = state.xid
+		}
+		if state.snapshotXmin != ^storage.TransactionID(0) && state.snapshotXmin < xmin {
+			xmin = state.snapshotXmin
 		}
 	}
 	return xmin
@@ -200,19 +298,23 @@ func (m *Manager) OldestXmin() storage.TransactionID {
 func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	state, ok := m.active[tx.XID]
+	state, ok := m.active[tx.Handle]
 	if !ok {
 		return ErrUnknownTransaction
 	}
 	if state.isolation != tx.Isolation {
-		return fmt.Errorf("mvcc: transaction isolation mismatch xid=%d", tx.XID)
+		return fmt.Errorf("mvcc: transaction isolation mismatch handle=%d", tx.Handle)
 	}
-	if m.xactMarker != nil {
-		if err := m.xactMarker(tx.XID, kind); err != nil {
-			return fmt.Errorf("mvcc: xact-marker hook (xid=%d, kind=%v): %w", tx.XID, kind, err)
+	// M0093: invoke the xactMarker hook only when the transaction
+	// was assigned a real XID. Read-only commits skip the hook
+	// entirely — no WAL XactCommit record, no fsync, no clog
+	// write. Mirrors PG's RecordTransactionCommit fast-path.
+	if state.xid != storage.InvalidTransactionID && m.xactMarker != nil {
+		if err := m.xactMarker(state.xid, kind); err != nil {
+			return fmt.Errorf("mvcc: xact-marker hook (xid=%d, kind=%v): %w", state.xid, kind, err)
 		}
 	}
-	delete(m.active, tx.XID)
+	delete(m.active, tx.Handle)
 	return nil
 }
 
@@ -255,12 +357,19 @@ func (m *Manager) SetXactMarkerLogger(fn func(storage.TransactionID, XactMarker)
 }
 
 func (m *Manager) captureSnapshotLocked() Snapshot {
+	// M0093: iterate values (not keys) and include only states
+	// whose xid has been materialised. Read-only txns contribute
+	// no in-progress XID and don't pull Xmin down (their
+	// snapshotXmin is tracked separately for OldestXmin).
 	inProgress := make([]storage.TransactionID, 0, len(m.active))
 	xmin := m.nextXID
-	for xid := range m.active {
-		inProgress = append(inProgress, xid)
-		if xid < xmin {
-			xmin = xid
+	for _, state := range m.active {
+		if state.xid == storage.InvalidTransactionID {
+			continue
+		}
+		inProgress = append(inProgress, state.xid)
+		if state.xid < xmin {
+			xmin = state.xid
 		}
 	}
 	if len(inProgress) == 0 {
