@@ -3109,6 +3109,96 @@ spec).
       follow-up milestone when the abort rate becomes a
       bottleneck for a specific workload.
 
+## M0091 — Select-only TPS regression recovery (planned 2026-05-11)
+
+**Background:** The 2026-05-11 spot measurement of `pgbench -S
+-c 10 -j 10 -T 180` against goopg at scale 100 yielded
+**350.89 TPS / 28.50 ms avg latency**. The historical post-M0026
+baseline documented in
+`analysis/oltp-performance/wal-bottleneck.md` was **6,403 TPS
+at -c 4 / 0.63 ms** — i.e. the current goopg is ~17× slower at
+comparable read-only workloads, with 10–45× higher per-query
+latency. This is a critical regression.
+
+pprof capture
+(`pprof-data/m0091/select-only-c10.{cpu,heap,allocs}.prof`)
+on a sustained -c 10 select-only run identifies three
+concrete bottlenecks:
+
+1. **~70 % of CPU is GC** (`runtime.gcDrain`,
+   `runtime.scanobject`, `runtime.findObject`,
+   `runtime.greyobject`) — sustained per-query allocation
+   rate has GC mark running half the wall-clock per core.
+2. **~11 % of CPU in `activity.goroutineID`** — calls
+   `runtime.Stack(buf, false)` on every wait-event /
+   pgstat_activity lookup, plus allocates a 64-byte buffer +
+   a string per call.
+3. **`btree.RangeScan` copies every leaf-page slot into a
+   fresh `[]byte` per query** (`internal/access/btree/btree.go:1923-1958`):
+   ~400 byte-slice allocations per point-lookup at the scale-
+   100 pkey, driving 230 MB / 30 s allocation rate just from
+   this one site.
+
+Milestone doc:
+`docs/milestones/0091-select-only-tps-regression-recovery.md`.
+
+### Sub-milestones
+
+- [ ] **M0091-0001** — `activity.goroutineID` fast-path:
+      replace `runtime.Stack`-based goroutine identification
+      with a connection-level registration pointer cached on
+      the goroutine's `*Context` (or equivalent injection
+      point). Audit every caller of `activity.LookupGoroutine`
+      to confirm an alternative ID source is in scope.
+      Design doc:
+      `docs/design/0091-0001-activity-tracking-goroutineid-fastpath.md`.
+      Expected gain: 11 % of CPU recovered + reduced GC
+      pressure (no more 64-byte buf + string per lookup).
+
+- [ ] **M0091-0002** — `btree.RangeScan` allocation reduction:
+      rework the per-leaf-page slot copy loop. Two-track design:
+      (a) callers that don't re-enter the btree (most SELECT
+      paths) pass a flag to skip the copy and invoke `fn` with
+      `[]byte` aliasing the still-pinned page; (b) callers that
+      may re-enter use a per-RangeScan arena instead of
+      per-slot `append([]byte(nil), r...)`. Design doc:
+      `docs/design/0091-0002-btree-rangescan-allocation-reduction.md`.
+      Expected gain: 13 % of allocation rate eliminated, GC
+      pressure drops accordingly.
+
+- [ ] **M0091-0003** — pgbench select-only re-measurement at
+      scale 100, -c 10 -j 10 -T 180. Capture fresh
+      `pprof-data/m0091/post-{0001,0002}/` profiles after each
+      sub-milestone for diff visualisation.
+      **Acceptance:** TPS ≥ 1 000 (minimum), GC CPU share <
+      30 %, `activity.goroutineID` CPU share < 1 %, btree
+      per-query allocation < 5 KB. Stretch: TPS ≥ 3 000
+      (historical -c 1 number).
+
+- [ ] **M0091-0004** — *(conditional)* if -0001 + -0002 don't
+      recover throughput to within 3× of the historical
+      baseline, audit per-query Row + Datum allocation in the
+      executor path (`indexScanOp.Open` shows 470 MB / 30 s ≈
+      50 KB per query). Likely tactic: extend the existing
+      M0073 arena lifetime across Rescan invocations / reuse
+      Row buffers via the existing `acquireRow` /
+      `releaseRow` pool. Design doc only when triggered.
+
+- [ ] **M0091-0005** — *(defensive)* add a pprof-baseline
+      regression gate. Pin a baseline `cpu.prof` under
+      `pprof-data/baseline/select-only-c10.cpu.prof` so a
+      future regression of this magnitude can be caught
+      pre-merge by a script that compares the GC CPU share
+      between baseline and a fresh capture. Design doc:
+      `docs/design/0091-0003-pprof-baseline-and-regression-gate.md`.
+
+### Note on prior `## pgbench select-only @ -c 10` section
+
+The measurement immediately below this M0091 block is the
+**reproducer that surfaced this milestone.** It establishes
+the pre-fix baseline (350.89 TPS) against which the M0091
+sub-milestones' improvements are measured.
+
 ## pgbench select-only @ -c 10 (post-M0090, 2026-05-11 12:13)
 
 Spot measurement requested by the user: scale=100, `-c 10
