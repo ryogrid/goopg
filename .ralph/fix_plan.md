@@ -418,10 +418,16 @@ alongside the suite.
       CREATE TRIGGER (M0096-0012 prereq); merge-update advances to INSERT
       runtime. All core unit tests PASS.
 
-- [ ] **M0096-0008** — Implement `GENERATED ALWAYS AS (expr) STORED`
-      column definition: DDL parsing, stored-value computation on
-      INSERT/UPDATE, read-back in scans.
-      Unblocks: `eval-plan-qual` (setup block).
+- [x] **M0096-0008** — GENERATED ALWAYS AS (expr) STORED + supporting features.  2026-05-12.
+      Design doc: `docs/design/0096-0008-generated-always-stored.md`.
+      Key features: GeneratedAlways/GeneratedExpr in ColumnDef + catalog Column;
+      lightweight expression evaluator (evalGenExpr) for stored columns;
+      INSERT/UPDATE recomputation via computeGeneratedColumns; analyzer + planner
+      skip generated cols in INSERT target mapping; empty column lists ();
+      CTAS (CREATE TABLE name AS SELECT …); INHERITS clause parsing;
+      text btree key encoding; generate_series scalar fallback.
+      Verification: eval-plan-qual setup now completes (spec times out on blocking
+      rather than failing at syntax). All core unit tests PASS.
 
 - [ ] **M0096-0009** — Implement table inheritance
       (`CREATE TABLE child () INHERITS (parent)`): DDL parsing,

@@ -2512,11 +2512,19 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 	// Map source-row column index -> target table column ordinal.
+	// Generated columns are excluded from the mapping when no explicit
+	// column list is provided — they are computed by the executor. M0096-0008.
 	var colIndex []int
 	if len(s.Columns) == 0 {
-		colIndex = make([]int, len(tbl.Columns))
-		for i := range tbl.Columns {
-			colIndex[i] = i
+		colIndex = make([]int, 0, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			if col.GeneratedAlways {
+				continue // skip generated columns; executor fills them in
+			}
+			colIndex = append(colIndex, i)
+		}
+		if len(colIndex) == len(tbl.Columns) {
+			// No generated columns — keep original 1:1 mapping for compatibility.
 		}
 	} else {
 		colIndex = make([]int, 0, len(s.Columns))

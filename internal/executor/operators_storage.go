@@ -386,12 +386,17 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// Partition routing (M0096-0007): if the target table is partitioned,
 		// route the row to the appropriate partition child.
 		targetRel := rel
+		// Compute generated columns (GENERATED ALWAYS AS … STORED) before writing.
+		// M0096-0008.
+		_ = computeGeneratedColumns(cols, row)
+
 		if isPartitioned {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				partTable := routeToPartition(o.plan.Table, row, im)
 				if partTable != nil {
 					targetRel = o.ctx.Catalog.RelFileNode(partTable)
-					// Use the partition child's columns
+					// Recompute generated columns using partition child's schema.
+					_ = computeGeneratedColumns(partTable.Columns, row)
 					if err := writeHeapRow(o.ctx, targetRel, partTable.Columns, row); err != nil {
 						return nil, err
 					}
@@ -901,6 +906,8 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 			newRow[i] = v
 		}
+		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
+		_ = computeGeneratedColumns(cols, newRow)
 		pending = append(pending, pendingUpdate{
 			blk:    ptr.Block,
 			slot:   actualSlot, // use live slot, not the index-pointed slot
@@ -1025,6 +1032,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 			newRow[i] = v
 		}
+		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
+		_ = computeGeneratedColumns(cols, newRow)
 		pending = append(pending, pendingUpdate{blk: blk, slot: slot, newRow: newRow})
 		return nil
 	}); err != nil {

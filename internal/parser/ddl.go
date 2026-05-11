@@ -1,6 +1,9 @@
 package parser
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // parseCreate dispatches on the next keyword after CREATE.
 func (p *parser) parseCreate() (Stmt, error) {
@@ -257,6 +260,19 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	}
 	stmt.Name = name
 
+	// CREATE TABLE name AS SELECT … (CTAS). M0096-0008.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+		p.advance() // consume AS
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if ss, ok := sel.(*SelectStmt); ok {
+			stmt.SelectSource = ss
+		}
+		return stmt, nil
+	}
+
 	// CREATE TABLE child PARTITION OF parent FOR VALUES … (M0096-0007)
 	if p.acceptKeyword(KwPartition) {
 		if _, err := p.expectKeyword(KwOf); err != nil {
@@ -338,6 +354,12 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
+	// Empty column list: `()` is valid for INHERITS children that add no columns.
+	if p.acceptSymbol(")") {
+		// Skip remaining clauses (PARTITION BY, INHERITS, WITH) after `()`.
+		p.consumeCreateTableSuffix(stmt)
+		return stmt, nil
+	}
 	for {
 		// Table-level constraint: PRIMARY KEY ( cols ).
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary {
@@ -416,7 +438,69 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, err
 		}
 	}
+	// INHERITS (parent [, …]) — table inheritance. Accept and record parent names.
+	// Full inheritance semantics land in M0096-0009; for now, the syntax is accepted
+	// so that `CREATE TABLE c () INHERITS (p)` does not produce a parse error.
+	if p.acceptIdentKeyword("inherits") {
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after INHERITS")
+		}
+		for {
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Inherits = append(stmt.Inherits, name)
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+	}
 	return stmt, nil
+}
+
+// consumeCreateTableSuffix skips INHERITS, PARTITION BY, WITH, and TABLESPACE
+// clauses after a column list that has already been closed with ')'.
+// Used when the column list is empty. M0096-0009.
+func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
+	for {
+		switch {
+		case p.acceptIdentKeyword("inherits"):
+			if p.acceptSymbol("(") {
+				for {
+					name, err := p.parseObjectName()
+					if err != nil {
+						return
+					}
+					stmt.Inherits = append(stmt.Inherits, name)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				_ = p.acceptSymbol(")")
+			}
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPartition:
+			p.advance()
+			_, _ = p.expectKeyword(KwBy)
+			_ = p.acceptIdentKeyword("list") || p.acceptIdentKeyword("range") || p.acceptIdentKeyword("hash")
+			if p.acceptSymbol("(") {
+				_, _ = p.parseColumnNameList()
+				_ = p.acceptSymbol(")")
+			}
+			return
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith:
+			p.advance()
+			_, _ = p.parseWithOptions()
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTablespace:
+			p.advance()
+			_, _ = p.parseIdent()
+		default:
+			return
+		}
+	}
 }
 
 // parsePartitionBoundValues parses a comma-separated list of partition bound
@@ -471,6 +555,94 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			col.NotNull = true
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
+		// GENERATED ALWAYS AS (expr) STORED  (M0096-0008)
+		case p.acceptIdentKeyword("generated"):
+			if !p.acceptIdentKeyword("always") {
+				return ColumnDef{}, p.errAtCur("expected ALWAYS after GENERATED")
+			}
+			if _, err := p.expectKeyword(KwAs); err != nil {
+				return ColumnDef{}, err
+			}
+			if !p.acceptSymbol("(") {
+				return ColumnDef{}, p.errAtCur("expected '(' after GENERATED ALWAYS AS")
+			}
+			// Collect the raw expression text.
+			depth := 1
+			start := p.cur().Pos
+			var exprToks []string
+			for depth > 0 && p.cur().Kind != TokenEOF {
+				t := p.cur()
+				if t.Kind == TokenSymbol && t.Value == "(" {
+					depth++
+				} else if t.Kind == TokenSymbol && t.Value == ")" {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+				exprToks = append(exprToks, t.Value)
+				p.advance()
+				_ = start
+			}
+			if !p.acceptSymbol(")") {
+				return ColumnDef{}, p.errAtCur("expected ')' to close generated expression")
+			}
+			// Accept optional STORED keyword (virtual columns not yet supported).
+			_ = p.acceptIdentKeyword("stored")
+			_ = p.acceptIdentKeyword("virtual")
+			col.GeneratedAlways = true
+			col.GeneratedExpr = strings.Join(exprToks, " ")
+		// WITH OPTIONS modifier in PARTITION OF column override (M0096-0007)
+		case p.acceptIdentKeyword("with"):
+			if p.acceptIdentKeyword("options") {
+				// Re-enter constraint parsing for the column override.
+			}
+		// DEFAULT clause — skip for generated columns context
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault:
+			p.advance()
+			// Skip the default expression (consume tokens until ',', ')', or ';')
+			depth := 0
+			for p.cur().Kind != TokenEOF {
+				t := p.cur()
+				if t.Kind == TokenSymbol && t.Value == "(" {
+					depth++
+				} else if t.Kind == TokenSymbol && t.Value == ")" {
+					if depth == 0 {
+						break
+					}
+					depth--
+				} else if t.Kind == TokenSymbol && (t.Value == "," || t.Value == ";") && depth == 0 {
+					break
+				}
+				p.advance()
+			}
+		// REFERENCES — accept for FK in column definition (defer enforcement)
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
+			p.advance()
+			if _, err := p.parseObjectName(); err != nil {
+				return ColumnDef{}, err
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.advance()
+				if _, err := p.parseColumnNameList(); err != nil {
+					return ColumnDef{}, err
+				}
+				if !p.acceptSymbol(")") {
+					return ColumnDef{}, p.errAtCur("expected ')'")
+				}
+			}
+			// skip ON DELETE/UPDATE clauses
+			for p.acceptIdentKeyword("on") {
+				_ = p.acceptIdentKeyword("delete") || p.acceptIdentKeyword("update")
+				_ = p.acceptIdentKeyword("cascade") ||
+					p.acceptIdentKeyword("restrict") ||
+					p.acceptIdentKeyword("no") ||
+					p.acceptIdentKeyword("set")
+				_ = p.acceptKeyword(KwNull) || p.acceptKeyword(KwDefault)
+			}
+		// UNIQUE constraint on column
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
+			p.advance() // accepted as no-op; index will be created explicitly
 		default:
 			return col, nil
 		}

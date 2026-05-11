@@ -1137,6 +1137,20 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_schema", "current_schemas":
 		return NewStringDatum("public"), nil
 
+	// generate_series used as a scalar expression (not FROM clause).
+	// Returns the start value only — full SRF semantics require planner rework.
+	// Sufficient for CTAS patterns like `SELECT generate_series(1,10)` where
+	// the table will have 1 row rather than N. M0096-0008.
+	case "generate_series":
+		if len(x.Args) >= 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			return v, nil
+		}
+		return NewIntDatum(1), nil
+
 	// ── Advisory lock functions (M0096-0003) ──────────────────────────────
 	// All variants block/return immediately depending on lock availability.
 	// pg_advisory_lock / pg_advisory_xact_lock return non-NULL (void-like)

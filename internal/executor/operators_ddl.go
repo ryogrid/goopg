@@ -228,12 +228,21 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		return o.execCreatePartitionChild(s)
 	}
 
+	// CREATE TABLE name AS SELECT … (CTAS). M0096-0008.
+	// Create a table whose columns are derived from the SELECT result.
+	// The data is populated by the SELECT execution.
+	if s.SelectSource != nil {
+		return o.execCreateTableAs(s)
+	}
+
 	cols := make([]catalog.Column, len(s.Columns))
 	for i, c := range s.Columns {
 		cols[i] = catalog.Column{
-			Name:    c.Name,
-			Type:    catalog.Type{Name: strings.ToLower(c.Type.Name), Args: append([]int64(nil), c.Type.Args...)},
-			NotNull: c.NotNull,
+			Name:            c.Name,
+			Type:            catalog.Type{Name: strings.ToLower(c.Type.Name), Args: append([]int64(nil), c.Type.Args...)},
+			NotNull:         c.NotNull,
+			GeneratedExpr:   c.GeneratedExpr,
+			GeneratedAlways: c.GeneratedAlways,
 		}
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
@@ -292,6 +301,73 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
 			return err
+		}
+	}
+	return nil
+}
+
+// execCreateTableAs implements `CREATE TABLE name AS SELECT …`.
+// It plans and executes the SELECT, derives column definitions from the result
+// schema, creates the table, and inserts all rows from the SELECT.  M0096-0008.
+func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
+	if o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
+		// No storage: create an empty table with no columns.
+		_, err := o.ctx.Catalog.CreateTable(s.Name, nil)
+		if err != nil {
+			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+		}
+		return nil
+	}
+	// Plan the SELECT to derive the schema.
+	selectNode, err := planner.Plan(s.SelectSource, o.ctx.Catalog)
+	if err != nil {
+		return &ExecError{Code: "42601", Pos: s.Pos(), Message: err.Error()}
+	}
+	outSchema := selectNode.Output()
+	cols := make([]catalog.Column, len(outSchema))
+	for i, sc := range outSchema {
+		typeName := sc.Type.Name
+		if typeName == "" || typeName == "unknown" {
+			typeName = "text"
+		}
+		cols[i] = catalog.Column{
+			Name: sc.Name, Type: catalog.Type{Name: strings.ToLower(typeName)},
+		}
+	}
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	if err != nil {
+		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	// Execute the SELECT and insert all rows.
+	op, buildErr := Build(selectNode)
+	if buildErr != nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: buildErr.Error()}
+	}
+	if err := op.Open(o.ctx); err != nil {
+		_ = op.Close()
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	defer op.Close()
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		}
+		row := slotRow(slot)
+		if err := writeHeapRow(o.ctx, rel, tbl.Columns, row); err != nil {
+			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
 	}
 	return nil
@@ -1039,6 +1115,18 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		}
 		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
 		return btree.EncodeTimestamp(micros), nil
+	case strings.ToLower(col.Type.Name) == "text":
+		// text type: encode as varchar bytes. M0096-0008.
+		var s string
+		switch v.Kind {
+		case KindString, KindStringArena:
+			s = v.StringValue()
+		case KindInt:
+			s = fmt.Sprintf("%d", v.Int)
+		default:
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not text at runtime", col.Name)}
+		}
+		return btree.EncodeVarchar([]byte(s)), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }

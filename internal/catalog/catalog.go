@@ -38,6 +38,11 @@ type Column struct {
 	Type    Type
 	NotNull bool
 	Ordinal int // 0-based heap-tuple position
+	// GeneratedExpr holds the raw SQL expression for a GENERATED ALWAYS AS … STORED
+	// column. Empty for ordinary columns. M0096-0008.
+	GeneratedExpr string
+	// GeneratedAlways is true when the column uses GENERATED ALWAYS AS semantics.
+	GeneratedAlways bool
 }
 
 // Table is one relation in the catalog.

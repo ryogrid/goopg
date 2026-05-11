@@ -660,6 +660,12 @@ type ColumnDef struct {
 	Type    ColumnType
 	NotNull bool
 	Primary bool // inline `PRIMARY KEY` constraint
+	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
+	// M0096-0008.
+	GeneratedAlways bool
+	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
+	// for a stored generated column. Empty for ordinary columns.
+	GeneratedExpr string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
@@ -689,6 +695,13 @@ type CreateTableStmt struct {
 	// PartitionOf is non-nil for `CREATE TABLE child PARTITION OF parent FOR VALUES …`.
 	// M0096-0007.
 	PartitionOf *PartitionOfClause
+	// Inherits lists the parent table names from `INHERITS (parent, …)`.
+	// M0096-0009 will use these; for now the field is populated so the
+	// syntax is accepted and the executor can create the child table.
+	Inherits []ObjectName
+	// SelectSource is non-nil for `CREATE TABLE name AS SELECT …` (CTAS).
+	// The table is created with columns derived from the SELECT result. M0096-0008.
+	SelectSource *SelectStmt
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }

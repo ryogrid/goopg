@@ -1409,7 +1409,20 @@ func lookupColumn(tbl *catalog.Table, name string) (*catalog.Column, bool) {
 
 func resolveInsertTargetColumns(tbl *catalog.Table, cat catalog.Catalog, s *parser.InsertStmt) ([]catalog.Column, error) {
 	if len(s.Columns) == 0 {
-		return append([]catalog.Column(nil), tbl.Columns...), nil
+		// Skip GENERATED ALWAYS AS … STORED columns — they are computed by
+		// the executor, not supplied by the INSERT statement. M0096-0008.
+		out := make([]catalog.Column, 0, len(tbl.Columns))
+		for _, col := range tbl.Columns {
+			if col.GeneratedAlways {
+				continue
+			}
+			out = append(out, col)
+		}
+		if len(out) == len(tbl.Columns) {
+			// No generated columns — return all columns for backward compat.
+			return append([]catalog.Column(nil), tbl.Columns...), nil
+		}
+		return out, nil
 	}
 	out := make([]catalog.Column, 0, len(s.Columns))
 	for _, name := range s.Columns {

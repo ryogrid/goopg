@@ -364,7 +364,10 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		case KindBytes, KindBytesArena:
 			return encodeVarlen(d.BytesValue()), nil
 		case KindInt:
-			return nil, fmt.Errorf("integer datum cannot encode as %s", t.Name)
+			// Coerce integer to text-form when the target column is text-like.
+			// This occurs for CTAS `SELECT generate_series(1,10)` where the
+			// column is given a fallback "text" type. M0096-0008.
+			s = fmt.Sprintf("%d", d.Int)
 		case KindNumeric:
 			s = numericText(d)
 		default:
