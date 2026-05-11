@@ -186,6 +186,18 @@ func TestNLIRuleSkipsCompositeIndexWithPartialKey(t *testing.T) {
 	}
 }
 
+// (M0077-0001 / takeover) Q8's chained-NLI rebind regression
+// (`customer_pk` and `nation_pk` probe keys pointing at stale
+// slots) is locked end-to-end by the live focused TPC-H gate
+// (`./tpch-runner --queries=8`) rather than a synthetic-plan
+// unit test — the live planner's choice of NLI shape depends on
+// SF=1 statistics that the in-memory test fixture cannot
+// reproduce. The rebind helper itself (the type-mismatch
+// override that bypasses M0075-0002's selectivity guard when
+// the runtime probe encoder would otherwise fail with 42804) is
+// pinned by `TestOrigTypeMatchesDetectsRuntimeTypeMismatch` in
+// `nl_index_join_selectivity_test.go`.
+
 // firstNLI returns the first *NestedLoopIndexJoin found in the
 // plan tree, or nil. Used by tests that inspect the produced
 // NLI's inner keys.

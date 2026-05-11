@@ -2773,6 +2773,466 @@ for priority queue rationale.
       handover. **Blocked by:** M0076-0001..0006
       (whichever land).
 
+## Milestone 0077 — Q5 planner fix: binary-tree preservation + cost-model maturation
+
+**Status: planned** (2026-05-10). Authoritative
+specification at `docs/design/fix-for-q5/{README, 01,
+02, 03}.md` (4-document design bundle authored by user
+2026-05-10). Milestone doc at
+`docs/milestones/0077-q5-planner-fix-binary-tree-and-cost-model.md`.
+
+**Why this milestone:** M0076-0001 attempt 2 (re-enable
+M0075-0001 transitivity hook with M0076-0004
+inferredEdgePenalty=2.0) produced a Q5 plan with a
+303M-row lineitem⋈orders intermediate. Empirical
+finding (`tmp/q5-plan-analysis.md` §3.4): goopg's
+`estimateJoinCost = (L*R)/max(NDistinct)` formula has
+no build-side memory term, so it can't distinguish
+"build a 6M-row hash table on lineitem" from "build a
+30K-row table on filtered customers" — both look
+~6M cost.
+
+**Slice ordering (per design 03 §4):** local filters
+first (Slice A) → post-filter row estimates (Slice B)
+→ build-side cost (Slice C) → anchored synthesis
+(Slice D). Each slice is independently revertible;
+failure at slice N does not require reverting earlier
+slices.
+
+**Pre-commit gate** (focused execution + plan-diff,
+per design 03 §3.3):
+```sh
+./tpch-runner --queries=3,5,8,9,12,13,21,22 \
+    --per-query-timeout=620s --cancel-after=600s
+for q in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 16 17 18 19 20 21 22; do
+    ./tmp/plan-snapshot diff --label m0076-baseline-ffc3429 --queries=$q
+done
+```
+
+Plan-diff query categories (per design 03 §2):
+- **Must change**: Q5.
+- **May change with focused gate**: Q2, Q3, Q7, Q8,
+  Q9, Q10, Q11, Q12, Q13, Q18, Q21.
+- **Should stay identical**: Q1, Q4, Q6, Q14, Q15,
+  Q16, Q17, Q19, Q20, Q22 — diff = STOP-AND-EXPLAIN.
+
+- [ ] M0077-0001 (Slice A): local predicate partition
+      + attachment.
+      **Design:** `docs/design/fix-for-q5/01-target-shape-and-local-filtering.md`.
+      **Files:** new
+      `internal/planner/local_filters.go`
+      (partitionConjunctsForJoinPlanning,
+      attachRelationLocalFilters, localizeExprToLeaf,
+      shouldAttachBeforeMHJ);
+      `internal/planner/planner.go::Plan` rewires the
+      pipeline per design 01 §4
+      (partition → DP → pushPredicatesIntoCrossJoins →
+      unnestSubqueriesInPlan → attachRelationLocalFilters
+      → rewriteMultiWayChain).
+      `internal/planner/multi_hash_chain.go` —
+      promote skip-on-`Filter(SeqScan)` contract via
+      inline comment + unit test.
+      Pre-MHJ attachment scope is narrow: one-binding
+      predicates only; no subqueries / OuterRefs;
+      attached as `Filter(leaf)` not `IndexScan`;
+      `shouldAttachBeforeMHJ` rule: `fromCount>=5 +
+      (SmallDimension OR reliably-selective)`.
+      **Acceptance:**
+        - Q5 plan-diff REQUIRED divergence; no
+          `Multi-Way Hash Join (6 tables)` line;
+          `Filter(SeqScan(region))` and
+          `Filter(SeqScan(orders))` leaves visible.
+        - Focused gate row-count parity (Q3=11462,
+          Q12=2, Q13=35, Q21=381, Q22=7, Q9 ≥ 7).
+        - "Should stay identical" plan-diff MATCH.
+
+- [ ] M0077-0002 (Slice B): filtered base-row
+      estimates.
+      **Design:** `docs/design/fix-for-q5/02-cost-model-and-selective-equivalence.md` §2-3.
+      **Files:** `internal/planner/cardinality.go`
+      adds `baseRelInfo` struct, `selectivityEstimate`
+      with `reliable` flag,
+      `clauseSelectivityWithSource`,
+      `estimateBaseRelInfo`.
+      `internal/planner/bushy.go::dpEntry` extended
+      with `rows int64`; singleton subsets use
+      `baseRelInfo.filteredRows`; composed subsets
+      use stored DP rows (NOT
+      `EstimateRows(plan)` re-eval);
+      `buildJoinFromDP` reads `dpEntry.rows`.
+      **Acceptance:**
+        - No new edges; row-count plumbing only.
+        - Plan-diff: Q5 may further refine join
+          order (still binary, still no 6-MHJ);
+          "should stay identical" set still MATCH.
+        - Focused gate parity preserved; Q9 unchanged.
+
+- [ ] M0077-0003 (Slice C): build-side-aware 3-part
+      hash-join cost.
+      **Design:** `docs/design/fix-for-q5/02-cost-model-and-selective-equivalence.md` §3-4.
+      **Files:**
+      `internal/planner/bushy.go::estimateJoinCost`
+      replaces single-output formula with
+      `output*1 + build*4 + probe*1` (initial
+      constants per design recommendation).
+      `buildJoinFromDP` build-side choice uses
+      `dpEntry.rows` from both subplans.
+      **Acceptance:**
+        - Q5 plan stops preferring large-build
+          alternatives (M0076-0001's 303M-row plan no
+          longer rank-best).
+        - Q9 unchanged (no new edges yet).
+        - Focused gate row-count parity preserved.
+
+- [ ] M0077-0004 (Slice D): anchored equality
+      synthesis (Q5 unlock).
+      **Design:** `docs/design/fix-for-q5/02-cost-model-and-selective-equivalence.md` §5.
+      **Files:** `internal/planner/equiv_class.go`
+      adds `inferAnchoredEqualities(conjuncts,
+      []baseRelInfo) []Expr` (reuses union-find).
+      Anchor rule: `filteredRows*2 ≤ baseRows OR
+      SmallDimension OR filteredRows ≤ 1024`;
+      synthesise only anchor → non-anchor edges; ≤ 1
+      synthesised edge per (target, class).
+      `internal/planner/bushy.go::tryBushyDP` calls
+      `inferAnchoredEqualities` AFTER Slice A
+      partition + Slice B baseRelInfo build; passes
+      synthesised count via `inferredCount` (M0076-0004)
+      so edges are tagged `isInferred=true`.
+      **Acceptance:**
+        - **Q5 reaches the binary hash-join family
+          described in `tmp/q5-plan-analysis.md` §2.**
+          Filter(region) inside; Filter(orders) inside;
+          customer⋈nation via synthesised edge;
+          lineitem joined LAST as probe.
+        - Q9 ≥ 7 mode-1 baseline preserved (anchored
+          rule excludes Q9's unfiltered fact-table
+          classes).
+        - Q3=11462, Q12=2, Q13=35, Q21=381 preserved.
+        - "Should stay identical" set MATCH.
+      **If Q5 still cancels at 1100s** (R7 from plan):
+        - plan-diff confirms new edge appears AND
+          intermediate < 303M? → bottleneck is
+          executor (M0078 candidate).
+        - plan still bad? → retune Slice C constants
+          (build*8 / build*16) OR constrain anchored
+          rule (filteredRows ≤ 256 instead of 1024).
+
+- [ ] M0077-0005 (Slice final): final 22-query SF=1
+      sweep + Phase 9 handover.
+      **Files (output):**
+        `docs/handover/2026-05-10-tpch-status-phase9.md`
+        (or dated for actual close);
+        `pprof-data/m0077-final/q5.{cpu,heap}.prof`;
+        `pprof-data/m0077-final/q9.{cpu,heap}.prof`;
+        `plan_snapshots/m0077-final.txt`;
+        `MEMORY.md` update.
+      **Blocked by:** M0077-0001..0004.
+      **Acceptance** (per design 03 §6):
+        - 22-q SF=1 sweep at HEAD = M0077-0004 binary.
+        - Q5 + Q9 pprof captures (`inuse_space` per
+          Phase-6 lessons).
+        - Cross-milestone summary table M0073-final
+          → M0074-final → M0075-final → M0076-final
+          → M0077-final on Q5 wall time, Q9 row count,
+          row-count parity.
+
+## Recently completed — M0079 + M0080 (WAL + catalog parity)
+
+These milestones landed in a single 2026-05-11 session that
+started from a pgbench TPS regression (60 TPS → 0.86 TPS after
+restart) and ended with PostgreSQL parity across every heap +
+btree WAL record kind and every persistent-metadata surface.
+
+- [x] **M0079** — Catalog DDL WAL recovery + btree WAL parity
+      (accepted 2026-05-11). See
+      `docs/milestones/0079-catalog-and-btree-wal-recovery.md`.
+      Commits: `b48551f` (M0079-0001 catalog DDL),
+      `0bb88f6` (M0079-0002 BtreeVacuum),
+      `03803f0` (M0079-0003 BtreeUnlinkPage + BtreeNewRoot +
+      BtreeMarkPageHalfDead),
+      `2ba63a8` (M0079-0004 BtreeNewRoot producer wiring).
+      Design docs: `docs/design/0079-0001-index-ddl-wal-recovery.md`,
+      `docs/design/0079-0002-btree-record-wal-parity.md`,
+      `docs/design/0079-0003-btree-page-deletion-and-root-wal.md`.
+      Root cause that drove the milestone: goopg's
+      `Runtime.SaveCatalog` was the only persistence path for
+      index metadata, ran only on graceful shutdown — SIGKILL /
+      OOM bypassed it, leaving `pgbench_accounts_pkey` absent
+      after restart, every `WHERE aid = :aid` falling back to
+      a 10M-row Seq Scan.
+
+- [x] **M0080** — Heap WAL parity + persistent VM + persistent
+      FSM (accepted 2026-05-11). See
+      `docs/milestones/0080-heap-wal-parity-and-vm-fsm-persistence.md`.
+      Commits: `2ba63a8` (M0080-0001 HeapFreeze),
+      `0afc743` (M0080-0002 HeapUpdate / HeapMultiInsert /
+      HeapVisible / BtreeReusePage / BtreeMetaCleanup record
+      infrastructure),
+      `4e621c5` (M0080-0003 VM persistence + M0080-0004 FSM
+      persistence). Design docs:
+      `docs/design/0080-0001-heap-freeze-and-multi-insert-wal.md`,
+      `docs/design/0080-0002-remaining-pg-parity-records.md`.
+      Persistence audit close: after M0080, every PostgreSQL
+      persistent-metadata surface has a goopg counterpart —
+      `pg_xact` (clog), catalog (JSON + WAL), `pg_wal`,
+      `pg_replslot`, heap / index relfiles, VM
+      (`<DataDir>/global/pg_vm_state.bin`), FSM
+      (`<DataDir>/global/pg_fsm_state.bin`), and subxact via
+      WAL-replay rebuild. Remaining PG features without a
+      goopg counterpart (`pg_multixact`, `pg_twophase`,
+      `pg_commit_ts`) correspond to executor-level features
+      goopg has not yet implemented and are tracked as
+      M0083 / M0084 / M0085.
+
+## New milestone format (M0078, M0081+)
+
+Starting from M0078, fix_plan.md lists milestones by name
+only. **Task-level breakdown is NOT carried in fix_plan.md
+upfront** — when a milestone is picked up for work, its tasks
+are filled into its `docs/milestones/00NN-*.md` file (and
+optionally copied here) at that time. This keeps the active
+roadmap scannable instead of carrying ~50 line task lists for
+work that hasn't started.
+
+Each milestone doc carries a **Required design docs** section
+listing the `docs/design/` files to author when the milestone
+is picked up. The implementation is gated on those design docs
+landing first (per the project's "design-doc-first" rule in the
+spec).
+
+### Active / planned milestones (milestone-only)
+
+- [ ] **M0078** — pgbench-compare re-validation post-M0079
+      catalog fix.
+      `docs/milestones/0078-pgbench-compare-revalidation.md`.
+
+- [ ] **M0081** — WAL record producer wiring (atomic
+      HEAP_UPDATE, HEAP2_MULTI_INSERT, HEAP2_VISIBLE,
+      BTREE_REUSE_PAGE, BTREE_META_CLEANUP,
+      BTREE_MARK_PAGE_HALFDEAD).
+      `docs/milestones/0081-wal-record-producer-wiring.md`.
+
+- [ ] **M0082** — Per-relation VM / FSM fork files
+      (PG-aligned layout under `base/<DBOid>/<RelOid>_vm` /
+      `_fsm`).
+      `docs/milestones/0082-vm-fsm-per-relation-fork-files.md`.
+
+- [ ] **M0083** — pg_multixact + multi-row locking metadata
+      (XLOG_HEAP2_LOCK_UPDATED).
+      `docs/milestones/0083-multixact-multi-row-locking.md`.
+
+- [ ] **M0084** — PREPARE TRANSACTION + pg_twophase
+      persistence.
+      `docs/milestones/0084-two-phase-commit-prepare-transaction.md`.
+
+- [ ] **M0085** — pg_commit_ts (optional commit timestamps;
+      `track_commit_timestamp` GUC).
+      `docs/milestones/0085-commit-timestamps-pg-commit-ts.md`.
+
+- [ ] **M0086** — Autovacuum `needsVacuum` PG-parity
+      heuristics (dead/modified-tuple counters, GUC +
+      per-table `reloptions`, `autovacuum_enabled`).
+      `docs/milestones/0086-autovacuum-needs-vacuum-pg-parity.md`.
+
+- [ ] **M0087** — Autovacuum `loadTables` via
+      `catalog.Catalog` interface (remove
+      `*catalog.InMemory` type assertion).
+      `docs/milestones/0087-autovacuum-load-tables-via-catalog-interface.md`.
+
+- [ ] **M0088** — WAL torn-tail recovery (treat zero-tail
+      bytes after a corrupt record as end-of-WAL, mirroring
+      PG crash-recovery semantics). Surfaced by pgbench
+      SIGKILL repro on 2026-05-11.
+      `docs/milestones/0088-wal-torn-tail-recovery.md`.
+
+- [x] **M0089** — Checkpoint + stop durability + data-file
+      fsync. All three durability boundaries landed 2026-05-11:
+      - M0089-0001 (5745875): `Manager.SyncAll` wired into
+        `Checkpointer.runCheckpoint` via the new
+        `dataFileSyncer` interface.
+      - M0089-0003 (5745875): implicit `CheckpointNow()` inside
+        `OnStop` so `goopg stop` alone is sufficient.
+      - M0089-0002 (this commit): final synchronous
+        `CheckpointNow()` at the top of `Runtime.Close`. Closes
+        the window between OnStop's checkpoint and process exit
+        (during which `runCancel`'s async propagation lets
+        clients keep committing). Unit-pinned by
+        `internal/initdb/close_checkpoint_test.go`.
+      `docs/milestones/0089-checkpoint-stop-durability-and-fsync.md`.
+
+      The scale-100 pgbench symptom that originally drove this
+      milestone PERSISTS after the fix; investigation showed it
+      is caused by separate bugs (history INSERTs at scale 100
+      lost; UPDATE leaves duplicate visible rows). Those are
+      tracked under M0090.
+
+- [x] **M0090** — pgbench scale-100 MVCC + INSERT bugs.
+      Investigation showed the symptom was driven by two
+      distinct bugs; both are now fixed end-to-end:
+
+      - **M0090-0001** (commit `e6778f0`): TRUNCATE / DROP now
+        clear FSM + VM in-memory state. Pre-fix, stale FSM
+        entries pointed INSERTs at non-existent blocks,
+        surfacing as `short read at block`. Design doc:
+        `docs/design/0090-0001-truncate-drops-fsm-vm-entries.md`.
+      - **M0090-0002** (commit `be320c9`): the HOT-update path
+        silently overwrote xmax under concurrent UPDATE,
+        leaving orphan visible tuples (the cause of
+        pgbench_branches drifting to 1,610 visible rows from
+        100). Fixed by detecting the concurrent stamp under
+        the page exclusive Lock and returning SQLSTATE 40001
+        (serialization_failure) so the transaction aborts
+        instead of silently corrupting MVCC. The fix touches
+        all 4 xmax-stamping sites (HOT + 3 non-HOT). Design
+        doc:
+        `docs/design/0090-0002-update-concurrent-xmax-overwrite-fix.md`.
+      - **M0090-0003**: end-to-end pgbench verification at
+        scale 100 (-c 100 -j 100 -T 180) — standard 71.04 TPS
+        / 12 815 txns / 54 failures (0.42 % SQLSTATE 40001,
+        expected); simple-update 83.22 TPS / 15 046 txns /
+        0 failed (no `short read at block`); select-only
+        386.50 TPS / 69 647 txns / 0 failed. Post-run row
+        counts: branches=100 / tellers=1000 (exact, no MVCC
+        drift). Results:
+        `bench/pgbench-compare/results/20260511_goopg_pgbench_m0090_summary.md`.
+
+      `docs/milestones/0090-pgbench-scale-100-mvcc-and-insert-bugs.md`.
+
+      **Deferred follow-up** (filed only if pgbench abort rate
+      under heavier contention becomes blocking): **EvalPlanQual**
+      — re-fetch + re-evaluate the latest tuple version when a
+      concurrent xmax stamp is detected, eliminating the 0.42 %
+      serialization-failure abort rate at -c 100. This is NOT
+      blocking M0090 acceptance — the correctness fix is shipped
+      and the abort rate is acceptable. Tracked as a candidate
+      follow-up milestone when the abort rate becomes a
+      bottleneck for a specific workload.
+
+## M0091 — Select-only TPS regression recovery (planned 2026-05-11)
+
+**Background:** The 2026-05-11 spot measurement of `pgbench -S
+-c 10 -j 10 -T 180` against goopg at scale 100 yielded
+**350.89 TPS / 28.50 ms avg latency**. The historical post-M0026
+baseline documented in
+`analysis/oltp-performance/wal-bottleneck.md` was **6,403 TPS
+at -c 4 / 0.63 ms** — i.e. the current goopg is ~17× slower at
+comparable read-only workloads, with 10–45× higher per-query
+latency. This is a critical regression.
+
+pprof capture
+(`pprof-data/m0091/select-only-c10.{cpu,heap,allocs}.prof`)
+on a sustained -c 10 select-only run identifies three
+concrete bottlenecks:
+
+1. **~70 % of CPU is GC** (`runtime.gcDrain`,
+   `runtime.scanobject`, `runtime.findObject`,
+   `runtime.greyobject`) — sustained per-query allocation
+   rate has GC mark running half the wall-clock per core.
+2. **~11 % of CPU in `activity.goroutineID`** — calls
+   `runtime.Stack(buf, false)` on every wait-event /
+   pgstat_activity lookup, plus allocates a 64-byte buffer +
+   a string per call.
+3. **`btree.RangeScan` copies every leaf-page slot into a
+   fresh `[]byte` per query** (`internal/access/btree/btree.go:1923-1958`):
+   ~400 byte-slice allocations per point-lookup at the scale-
+   100 pkey, driving 230 MB / 30 s allocation rate just from
+   this one site.
+
+Milestone doc:
+`docs/milestones/0091-select-only-tps-regression-recovery.md`.
+
+### Sub-milestones
+
+- [ ] **M0091-0001** — `activity.goroutineID` fast-path:
+      replace `runtime.Stack`-based goroutine identification
+      with a connection-level registration pointer cached on
+      the goroutine's `*Context` (or equivalent injection
+      point). Audit every caller of `activity.LookupGoroutine`
+      to confirm an alternative ID source is in scope.
+      Design doc:
+      `docs/design/0091-0001-activity-tracking-goroutineid-fastpath.md`.
+      Expected gain: 11 % of CPU recovered + reduced GC
+      pressure (no more 64-byte buf + string per lookup).
+
+- [ ] **M0091-0002** — `btree.RangeScan` allocation reduction:
+      rework the per-leaf-page slot copy loop. Two-track design:
+      (a) callers that don't re-enter the btree (most SELECT
+      paths) pass a flag to skip the copy and invoke `fn` with
+      `[]byte` aliasing the still-pinned page; (b) callers that
+      may re-enter use a per-RangeScan arena instead of
+      per-slot `append([]byte(nil), r...)`. Design doc:
+      `docs/design/0091-0002-btree-rangescan-allocation-reduction.md`.
+      Expected gain: 13 % of allocation rate eliminated, GC
+      pressure drops accordingly.
+
+- [ ] **M0091-0003** — pgbench select-only re-measurement at
+      scale 100, -c 10 -j 10 -T 180. Capture fresh
+      `pprof-data/m0091/post-{0001,0002}/` profiles after each
+      sub-milestone for diff visualisation.
+      **Acceptance:** TPS ≥ 1 000 (minimum), GC CPU share <
+      30 %, `activity.goroutineID` CPU share < 1 %, btree
+      per-query allocation < 5 KB. Stretch: TPS ≥ 3 000
+      (historical -c 1 number).
+
+- [ ] **M0091-0004** — *(conditional)* if -0001 + -0002 don't
+      recover throughput to within 3× of the historical
+      baseline, audit per-query Row + Datum allocation in the
+      executor path (`indexScanOp.Open` shows 470 MB / 30 s ≈
+      50 KB per query). Likely tactic: extend the existing
+      M0073 arena lifetime across Rescan invocations / reuse
+      Row buffers via the existing `acquireRow` /
+      `releaseRow` pool. Design doc only when triggered.
+
+- [ ] **M0091-0005** — *(defensive)* add a pprof-baseline
+      regression gate. Pin a baseline `cpu.prof` under
+      `pprof-data/baseline/select-only-c10.cpu.prof` so a
+      future regression of this magnitude can be caught
+      pre-merge by a script that compares the GC CPU share
+      between baseline and a fresh capture. Design doc:
+      `docs/design/0091-0003-pprof-baseline-and-regression-gate.md`.
+
+### Note on prior `## pgbench select-only @ -c 10` section
+
+The measurement immediately below this M0091 block is the
+**reproducer that surfaced this milestone.** It establishes
+the pre-fix baseline (350.89 TPS) against which the M0091
+sub-milestones' improvements are measured.
+
+## pgbench select-only @ -c 10 (post-M0090, 2026-05-11 12:13)
+
+Spot measurement requested by the user: scale=100, `-c 10
+-j 10 -T 180`, select-only workload, same goopg configuration
+as the M0090 verification run (`shared_buffers=2560MB`,
+`wal_buffers=100MB`, etc.). Run against the same scale-100
+data dir from the M0090 verification.
+
+Result file:
+`bench/pgbench-compare/results/20260511_121306_goopg_select-only_c10.txt`.
+
+| metric | value |
+|---|---:|
+| transactions | 63 169 |
+| failed | 0 (0.000 %) |
+| tps | **350.89** |
+| latency avg | 28.50 ms |
+| latency stddev | 11.85 ms |
+| initial connection time | 6.09 ms |
+
+Throughput drifted downward over the 180 s run (10 s sample:
+383.8 TPS → 170 s sample: 313.2 TPS, final 180 s sample:
+356.1 TPS — modest TPS decay observed). 0 failed transactions
+throughout; pkey IndexScan + heap-fetch path is correctness-
+clean under read-only contention.
+
+Cross-reference: the M0090 verification's select-only at the
+same scale but `-c 100 -j 100` yielded 386.50 TPS. At -c 10
+the TPS is lower (350.89) because there are fewer concurrent
+in-flight queries to saturate the CPU; latency per query is
+~28 ms vs ~258 ms at -c 100 (10× less per-query queueing).
+This is the expected concurrency / throughput trade-off
+shape — no anomaly.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every

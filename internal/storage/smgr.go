@@ -332,6 +332,36 @@ func (m *Manager) Sync(rel RelFileNode) error {
 	return f.sync()
 }
 
+// SyncAll issues fdatasync(2) on every open data file. Used by the
+// checkpointer after FlushAllPaced has pwrite'd dirty buffers, so a
+// power-loss between checkpoint completion and the next OS-level
+// flush leaves the data files durable. Without this, the pre-fix
+// behaviour was: checkpoint wrote dirty pages via buffered pwrite,
+// the bytes sat in the OS page cache, and a sudden host loss could
+// rewind the heap to its last-fsync'd state — but the WAL had
+// already advanced its redo pointer past those records. M0089-0001.
+func (m *Manager) SyncAll() error {
+	if m.OnSyncWait != nil {
+		m.OnSyncWait()
+	}
+	if m.OnSyncDone != nil {
+		defer m.OnSyncDone()
+	}
+	m.mu.Lock()
+	files := make([]*relFile, 0, len(m.files))
+	for _, f := range m.files {
+		files = append(files, f)
+	}
+	m.mu.Unlock()
+	var firstErr error
+	for _, f := range files {
+		if err := f.sync(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("sync %s: %w", f.path, err)
+		}
+	}
+	return firstErr
+}
+
 // DropRelation closes the open file (if any) and removes it from
 // disk. The executor's DROP TABLE path calls this after the catalog
 // entry is gone; the buffer pool's InvalidateRel must run beforehand

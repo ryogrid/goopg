@@ -29,8 +29,8 @@ func TestEstimateJoinCostInferredEdgePenalty(t *testing.T) {
 	explicitEdge := &joinEdge{leftTable: 0, rightTable: 1, isInferred: false}
 	inferredEdge := &joinEdge{leftTable: 0, rightTable: 1, isInferred: true}
 
-	costExplicit := estimateJoinCost(1000, 1000, explicitEdge, g, nil)
-	costInferred := estimateJoinCost(1000, 1000, inferredEdge, g, nil)
+	_, costExplicit := estimateJoinCost(1000, 1000, explicitEdge, g, nil)
+	_, costInferred := estimateJoinCost(1000, 1000, inferredEdge, g, nil)
 
 	if costInferred <= costExplicit {
 		t.Errorf("inferred-edge cost should be > explicit; got %d vs %d", costInferred, costExplicit)
@@ -42,10 +42,13 @@ func TestEstimateJoinCostInferredEdgePenalty(t *testing.T) {
 	}
 }
 
-// TestEstimateJoinCostExplicitUnaffected pins that
-// pre-M0076-0004 cost calculations remain unchanged when
-// the edge is not marked inferred. Backward-compat
-// invariant.
+// TestEstimateJoinCostExplicitUnaffected pins the explicit-
+// edge contract for the M0077-0003 3-part formula:
+//
+//	outputRows = (L*R)/maxNDV    = (100*100)/10 = 1000
+//	buildRows  = min(L,R)        = 100
+//	probeRows  = max(L,R)        = 100
+//	cost = 1000*1 + 100*4 + 100*1 = 1500
 func TestEstimateJoinCostExplicitUnaffected(t *testing.T) {
 	tbl := &catalog.Table{
 		Name: "t",
@@ -61,10 +64,13 @@ func TestEstimateJoinCostExplicitUnaffected(t *testing.T) {
 		tables: []*catalog.Table{tbl, tbl},
 	}
 	edge := &joinEdge{leftTable: 0, rightTable: 1}
-	cost := estimateJoinCost(100, 100, edge, g, nil)
-	// product = 100*100 = 10000; ndv = 10; cost = 1000.
-	if cost != 1000 {
-		t.Errorf("explicit edge cost = %d, want 1000 (10000/10)", cost)
+	out, cost := estimateJoinCost(100, 100, edge, g, nil)
+	if out != 1000 {
+		t.Errorf("outputRows = %d, want 1000 (10000/10)", out)
+	}
+	wantCost := int64(1000*outputRowWeight + 100*hashBuildWeight + 100*hashProbeWeight)
+	if cost != wantCost {
+		t.Errorf("explicit edge cost = %d, want %d (3-part: out + build*4 + probe)", cost, wantCost)
 	}
 }
 

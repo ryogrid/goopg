@@ -45,7 +45,6 @@ import (
 // programmatic kill-switch but not a SQL-driven one.
 var nliEnabled atomic.Bool
 
-
 func init() {
 	nliEnabled.Store(true)
 }
@@ -399,8 +398,17 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 	// is unnecessary.
 	_, outerIsMHJ := outerNode.(*MultiHashJoin)
 	_, outerIsNLI := outerNode.(*NestedLoopIndexJoin)
-	if outerIsMHJ || outerIsNLI {
-		outerSchema := outerNode.Output()
+	outerJoin, outerIsJoin := outerNode.(*Join)
+	outerSchema := outerNode.Output()
+	if outerIsJoin {
+		// A binary Join outer may already have a rewritten child
+		// (typically an MHJ) even though its cached schema still
+		// reflects the pre-rewrite layout. Refresh it before we
+		// bind NLI probe keys against the outer row coordinates.
+		reresolveJoinByName(outerJoin)
+		outerSchema = outerJoin.Output()
+	}
+	if outerIsMHJ || outerIsNLI || outerIsJoin {
 		// M0075-0002: for *NestedLoopIndexJoin outers
 		// (Q9's chained-NLI shape) the rebind needs the per-
 		// outer selectivity guard. M0072-0002 attempted the
@@ -419,6 +427,20 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 			if cr.Index >= 0 && cr.Index < len(outerSchema) && outerSchema[cr.Index].Name == cr.Name {
 				continue
 			}
+			// M0077-0001: type-mismatch override. When the
+			// slot the original cr.Index points to carries a
+			// type incompatible with cr.Type, the runtime
+			// IndexScan key encoder will fail with 42804
+			// (`not numeric at runtime`) regardless of the
+			// M0075-0002 selectivity guard's verdict. Detect
+			// that case here so the rebind path can bypass
+			// the guard — Q9's "preserve stale index" mode
+			// works only because Q9's stale slot happens to
+			// have the right runtime type even when the
+			// schema annotation diverges; Q8's stale slot
+			// for `c_nationkey` is `n_name` (char) which the
+			// numeric encoder rejects.
+			origTypeMismatch := !origTypeMatches(cr, outerSchema)
 			var newIdx int
 			if outerIsNLI {
 				// SourceTableIdx-aware lookup (M0071-0009).
@@ -432,7 +454,19 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 					continue
 				}
 				// Per-outer selectivity guard: M0075-0002.
-				if !rebindPassesSelectivityGuard(outerNode, outerSchema, newIdx) {
+				// Bypass when origTypeMismatch — runtime
+				// would fail without rebind (M0077-0001).
+				if !origTypeMismatch && !rebindPassesSelectivityGuard(outerNode, outerSchema, newIdx) {
+					continue
+				}
+			} else if outerIsJoin {
+				if cr.SourceTableIdx != 0 {
+					newIdx = findColumnIndexByNameAndSource(outerSchema, cr.Name, cr.SourceTableIdx, 0)
+				}
+				if newIdx < 0 {
+					newIdx = findUniqueColumnIndex(outerSchema, cr.Name, 0)
+				}
+				if newIdx < 0 {
 					continue
 				}
 			} else {

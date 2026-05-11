@@ -87,6 +87,71 @@ func tableRows(tbl *catalog.Table) int64 {
 	return tbl.Stats.RowCount
 }
 
+// baseRelInfo carries the per-binding row-count estimate and
+// supporting metadata that the bushy DP needs to make join-cost
+// decisions aware of post-filter cardinality. (M0077-0002 /
+// Slice B per design 02 §2.) One entry is built per FROM
+// binding before the DP runs; singleton subsets seed
+// `dpEntry.rows` from `filteredRows`, and Slice C's 3-part
+// hash-join cost reads the same field for build / probe inputs.
+type baseRelInfo struct {
+	bindingIdx int
+	// sourceIdx mirrors `rangeBinding.sourceIdx` so
+	// `inferAnchoredEqualities` can translate a
+	// `ColumnRef.SourceTableIdx` (the column's binding-of-origin
+	// identifier) back to the matching `baseRelInfo` entry.
+	sourceIdx        int16
+	table            *catalog.Table
+	baseRows         int64
+	filteredRows     int64
+	localFilter      Expr
+	hasLocalFilter   bool
+	isSmallDimension bool
+}
+
+// estimateBaseRelInfo computes a `baseRelInfo` for one FROM
+// binding. The local filter (if any) is rebased into leaf-local
+// coordinates via `localizeExprToLeaf` before the selectivity
+// stack reads it, so column-ref lookups via `ColumnRef.Index`
+// land on the leaf scan's own schema. Per design 02 §2, the
+// scaled value is only adopted when the selectivity estimate is
+// `reliable`; fallback selectivities (defaultEq /
+// defaultIneq / defaultGeneric) leave `filteredRows = baseRows`
+// rather than over-trusting an arbitrary 0.005 / 0.333 constant.
+//
+// (M0077-0002 / Slice B.)
+func estimateBaseRelInfo(binding rangeBinding, scan Node, local Expr) baseRelInfo {
+	info := baseRelInfo{
+		bindingIdx:     -1,
+		sourceIdx:      binding.sourceIdx,
+		table:          binding.table,
+		localFilter:    local,
+		hasLocalFilter: local != nil,
+	}
+	if binding.table != nil {
+		info.isSmallDimension = binding.table.SmallDimension
+		info.baseRows = tableRows(binding.table)
+	}
+	info.filteredRows = info.baseRows
+	if local == nil || scan == nil || info.baseRows <= 0 {
+		return info
+	}
+	localized := localizeExprToLeaf(local, binding)
+	sel := clauseSelectivityWithSource(localized, scan)
+	if !sel.reliable {
+		return info
+	}
+	info.filteredRows = scaleByFloat(info.baseRows, sel.value)
+	if info.filteredRows < 1 {
+		// Preserve the bushy DP's "no zero-row singletons"
+		// invariant — without this guard the planner would
+		// collapse a heavily-filtered relation's contribution
+		// to 0 even when at least one row is plausible.
+		info.filteredRows = 1
+	}
+	return info
+}
+
 // IsSmallDimensionSide (M0054-0010) returns true when the plan
 // node `n` reads from a `SmallDimension`-flagged catalog table
 // (or is trivially derived from one — Filter, Project, Sort

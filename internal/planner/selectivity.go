@@ -401,3 +401,123 @@ func columnStatsForChild(idx int, child Node) *catalog.ColumnStats {
 	}
 	return nil
 }
+
+// selectivityEstimate carries a clause's selectivity together
+// with a `reliable` flag that distinguishes stat-driven results
+// from generic fallbacks. (M0077-0002 / Slice B per design 02
+// §2.) Used by `estimateBaseRelInfo` so a relation's filtered
+// row count is only updated from the scaled value when the
+// estimate is trustworthy.
+type selectivityEstimate struct {
+	value    float64
+	reliable bool
+}
+
+// clauseSelectivityWithSource is the reliability-tracking twin
+// of `clauseSelectivity`. It returns the same numeric estimate
+// but also reports whether real column stats drove the result.
+// AND/OR composition is reliable iff both children are; UnaryOp
+// NOT inherits its operand's flag. Equality and range fallbacks
+// (`defaultEqSelectivity`, `defaultIneqSelectivity`) and the
+// generic `defaultGenericSelectivity` are reported as
+// reliable=false. BooleanConst is exact (reliable=true).
+//
+// Slice B uses this to gate updates to
+// `baseRelInfo.filteredRows`: when reliability is false, the
+// row count keeps its pre-filter value rather than picking up
+// arbitrary fallback constants that the cost model would then
+// over-trust.
+func clauseSelectivityWithSource(expr Expr, child Node) selectivityEstimate {
+	if expr == nil {
+		return selectivityEstimate{value: 1.0, reliable: true}
+	}
+	switch e := expr.(type) {
+	case *BinaryOp:
+		switch e.Op {
+		case parser.OpAnd:
+			a := clauseSelectivityWithSource(e.Left, child)
+			b := clauseSelectivityWithSource(e.Right, child)
+			return selectivityEstimate{value: a.value * b.value, reliable: a.reliable && b.reliable}
+		case parser.OpOr:
+			a := clauseSelectivityWithSource(e.Left, child)
+			b := clauseSelectivityWithSource(e.Right, child)
+			return selectivityEstimate{value: a.value + b.value - a.value*b.value, reliable: a.reliable && b.reliable}
+		case parser.OpEq:
+			return eqOpSelectivityWithSource(e.Left, e.Right, child)
+		case parser.OpNe:
+			eq := eqOpSelectivityWithSource(e.Left, e.Right, child)
+			return selectivityEstimate{value: 1 - eq.value, reliable: eq.reliable}
+		case parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+			return rangeOpSelectivityWithSource(e.Op, e.Left, e.Right, child)
+		}
+	case *UnaryOp:
+		if e.Op == parser.OpNot {
+			sub := clauseSelectivityWithSource(e.Operand, child)
+			return selectivityEstimate{value: 1 - sub.value, reliable: sub.reliable}
+		}
+	case *InExpr:
+		if e.Plan != nil || len(e.List) == 0 {
+			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
+		}
+		cr, ok := e.Operand.(*ColumnRef)
+		if !ok {
+			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
+		}
+		stats := columnStatsForChild(cr.Index, child)
+		if stats == nil {
+			return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
+		}
+		var sel float64
+		for _, v := range e.List {
+			sel += eqSelectivityForColumn(stats, v)
+		}
+		if sel > 1.0 {
+			sel = 1.0
+		}
+		if e.Negated {
+			return selectivityEstimate{value: 1 - sel, reliable: true}
+		}
+		return selectivityEstimate{value: sel, reliable: true}
+	case *BooleanConst:
+		if e.Value {
+			return selectivityEstimate{value: 1.0, reliable: true}
+		}
+		return selectivityEstimate{value: 0.0, reliable: true}
+	}
+	return selectivityEstimate{value: defaultGenericSelectivity, reliable: false}
+}
+
+// eqOpSelectivityWithSource is the reliability-tracking twin of
+// `eqOpSelectivity`. Reliable iff a `column = const` shape is
+// matched AND the column has stats.
+func eqOpSelectivityWithSource(left, right Expr, child Node) selectivityEstimate {
+	col, val, ok := normalizeColumnConst(left, right)
+	if !ok {
+		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
+	}
+	stats := columnStatsForChild(col.Index, child)
+	if stats == nil {
+		return selectivityEstimate{value: defaultEqSelectivity, reliable: false}
+	}
+	return selectivityEstimate{value: eqSelectivityForColumn(stats, val), reliable: true}
+}
+
+// rangeOpSelectivityWithSource is the reliability-tracking twin
+// of `rangeOpSelectivity`. Reliable iff a `column <op> const`
+// shape is matched AND the column has a usable histogram.
+// Generic fallback (no histogram, ≥2 entries required) reports
+// reliable=false so `baseRelInfo.filteredRows` falls back to the
+// pre-filter row count.
+func rangeOpSelectivityWithSource(op parser.OpCode, left, right Expr, child Node) selectivityEstimate {
+	col, _, _, ok := normalizeColumnConstRange(left, right)
+	if !ok {
+		return selectivityEstimate{value: defaultIneqSelectivity, reliable: false}
+	}
+	stats := columnStatsForChild(col.Index, child)
+	if stats == nil || len(stats.Histogram) < 2 {
+		return selectivityEstimate{value: defaultIneqSelectivity, reliable: false}
+	}
+	// Histogram present → trust rangeOpSelectivity's interpolation.
+	val := rangeOpSelectivity(op, left, right, child)
+	return selectivityEstimate{value: val, reliable: true}
+}

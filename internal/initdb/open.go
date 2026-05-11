@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -318,6 +319,79 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return storage.LSN(end), nil
 	}
 
+	// Logical btree-vacuum (kept-items + opaque flags) change
+	// record (M0079-0002). Replaces the FPI path in
+	// `btree.VacuumIndexPages` so per-page vacuum cost is
+	// proportional to surviving items rather than 8 KiB of
+	// page bytes.
+	logBtreeVacuum := func(rel storage.RelFileNode, blk storage.BlockNumber, keptItems [][]byte, opaqueFlags uint16) (storage.LSN, error) {
+		payload := wal.EncodeBtreeVacuum(rel, blk, keptItems, opaqueFlags)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
+	// M0079-0003 logical records covering the remaining FPI
+	// fallback paths in btree page deletion + root replacement.
+	logBtreeUnlinkPage := func(rel storage.RelFileNode, req storage.BtreeUnlinkPageRequest) (storage.LSN, error) {
+		payload := wal.EncodeBtreeUnlinkPage(wal.BtreeUnlinkPagePayload{
+			Rel:              rel,
+			LeafBlk:          req.LeafBlk,
+			LeafFlagsAfter:   req.LeafFlagsAfter,
+			HasLeftSib:       req.HasLeftSib,
+			LeftSibBlk:       req.LeftSibBlk,
+			LeftSibNewNext:   req.LeftSibNewNext,
+			HasRightSib:      req.HasRightSib,
+			RightSibBlk:      req.RightSibBlk,
+			RightSibNewPrev: req.RightSibNewPrev,
+			HasParent:        req.HasParent,
+			ParentBlk:        req.ParentBlk,
+			ParentRemoveSlot: req.ParentRemoveSlot,
+		})
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+	logBtreeNewRoot := func(rel storage.RelFileNode, rootBlk storage.BlockNumber, level uint32, items [][]byte) (storage.LSN, error) {
+		payload := wal.EncodeBtreeNewRoot(wal.BtreeNewRootPayload{
+			Rel:     rel,
+			RootBlk: rootBlk,
+			Level:   level,
+			Items:   items,
+		})
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+	logBtreeMarkPageHalfDead := func(rel storage.RelFileNode, leafBlk storage.BlockNumber, flagsAfter uint16) (storage.LSN, error) {
+		payload := wal.EncodeBtreeMarkPageHalfDead(wal.BtreeMarkHalfDeadPayload{
+			Rel:        rel,
+			LeafBlk:    leafBlk,
+			FlagsAfter: flagsAfter,
+		})
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
+	// M0080-0001: heap-freeze logical record.
+	logHeapFreeze := func(rel storage.RelFileNode, blk storage.BlockNumber, frozenSlots []uint16) (storage.LSN, error) {
+		payload := wal.EncodeHeapFreeze(rel, blk, frozenSlots)
+		_, end, err := walWriter.Append(payload)
+		if err != nil {
+			return 0, err
+		}
+		return storage.LSN(end), nil
+	}
+
 	// Row-lock (lock-only xmax + lock-strength) change record.
 	// M0021 tuple-level locking step 2 producer hook.
 	logHeapLock := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, lockStrength uint16) (storage.LSN, error) {
@@ -362,6 +436,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return err
 	}
 
+	// Generic catalog-DDL WAL append (M0079-0001). The executor's
+	// CREATE / DROP INDEX paths use this to emit pre-encoded
+	// `RecordKindCreateIndex` / `RecordKindDropIndex` records
+	// without taking a direct dependency on the wal package. The
+	// returned LSN matches the record's end position; callers
+	// don't currently use it but the signature mirrors the other
+	// Log* hooks for consistency.
+	logChangeRecord := func(payload []byte) (storage.LSN, error) {
+		_, end, err := walWriter.Append(payload)
+		return storage.LSN(end), err
+	}
+
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
 		Slots:          slots,
 		WAL:            walWriter,
@@ -371,10 +457,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		LogBtreeInsert: logBtreeInsert,
 		LogHeapDelete:    logHeapDelete,
 		LogHeapVacuum:    logHeapVacuum,
+		LogBtreeVacuum:           logBtreeVacuum,
+		LogBtreeUnlinkPage:       logBtreeUnlinkPage,
+		LogBtreeNewRoot:          logBtreeNewRoot,
+		LogBtreeMarkPageHalfDead: logBtreeMarkPageHalfDead,
+		LogHeapFreeze:            logHeapFreeze,
 		LogHeapLock:      logHeapLock,
 		LogHeapHotUpdate: logHeapHotUpdate,
 		LogHeapPruneOpt:  logHeapPruneOpt,
 		LogSmgrCreate:    logSmgrCreate,
+		LogChangeRecord:  logChangeRecord,
 		FullPageWrites: true,
 	})
 	if err != nil {
@@ -556,6 +648,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
+	}
+
+	// M0079-0001: replay CREATE/DROP INDEX WAL records into the
+	// in-memory catalog. Without this pass, indexes created
+	// after the last SaveCatalog snapshot would disappear from
+	// the catalog after a non-graceful restart even though
+	// their relfiles and btree pages are restored by physical
+	// replay. The pgbench `pgbench_accounts.aid` PK was the
+	// surfacing case (~70x TPS regression after restart because
+	// every UPDATE fell back to a 10M-row Seq Scan). Must run
+	// AFTER `loadUserTablesFromHeap` so the owning table is
+	// already in the catalog when we register the index.
+	if err := replayIndexDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
 	}
 
 	// Replication-slot registry. The retention path on the
@@ -813,6 +922,34 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Standby:        standby,
 		FSM:            storage.NewFSM(),
 		VM:             storage.NewVisibilityMap(),
+	}
+
+	// M0080-0003: load persistent Visibility Map state from
+	// `<DataDir>/global/pg_vm_state.bin` if present. A missing
+	// file is fine — that's the fresh-from-init case OR a cluster
+	// from before VM persistence existed. Failure to load is a
+	// hard startup error so the operator sees the issue rather
+	// than running with empty VM bits (which would still be
+	// CORRECT semantically — a cleared VM bit is a conservative
+	// "must check heap" — but would degrade index-only-scan
+	// performance until the next VACUUM rebuilt the bits).
+	if err := rt.VM.Load(storage.VMStatePath(rt.DataDir)); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: vm load: %w", err)
+	}
+
+	// M0080-0004: load persistent FSM state. Same shape /
+	// nil-safety as the VM load above. A missing file is the
+	// fresh-cluster case; a corrupt one is a hard startup
+	// failure (running with stale FSM bits would direct INSERTs
+	// to wrong pages and waste time on retries).
+	if err := rt.FSM.Load(storage.FSMStatePath(rt.DataDir)); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: fsm load: %w", err)
 	}
 
 	// Background WAL writer loop (M0042-0003): timer-driven periodic flush
@@ -1439,11 +1576,68 @@ func (r *Runtime) SaveCatalog() error {
 	return nil
 }
 
+// SaveVM writes the runtime's VisibilityMap state to
+// `<DataDir>/global/pg_vm_state.bin` atomically (temp file +
+// rename). Callers — typically the graceful-shutdown defer in
+// `cmd/goopg/main.go` — invoke this alongside SaveCatalog so
+// VM bits survive a clean restart. Returns nil when r or VM
+// is nil, mirroring SaveCatalog's nil-safety. (M0080-0003.)
+func (r *Runtime) SaveVM() error {
+	if r == nil || r.VM == nil {
+		return nil
+	}
+	return r.VM.Save(storage.VMStatePath(r.DataDir))
+}
+
+// SaveFSM writes the runtime's FSM state to
+// `<DataDir>/global/pg_fsm_state.bin` atomically. Same shape
+// as SaveVM. (M0080-0004.)
+func (r *Runtime) SaveFSM() error {
+	if r == nil || r.FSM == nil {
+		return nil
+	}
+	return r.FSM.Save(storage.FSMStatePath(r.DataDir))
+}
+
 // Close releases the runtime's storage handles. Safe to call
 // multiple times — subsequent calls are no-ops.
 func (r *Runtime) Close() error {
 	if r == nil {
 		return nil
+	}
+	// M0089-0002: synchronous final checkpoint while all
+	// background goroutines + the buffer pool are still attached.
+	// This is the load-bearing durability boundary: by the time
+	// Runtime.Close is called from main.go's defer, server.Run has
+	// already returned, all client connections are gone, and all
+	// in-flight transactions have committed/aborted. Any dirty
+	// pages remaining in the buffer pool reflect either (a) commits
+	// that landed AFTER the M0089-0003 OnStop checkpoint completed
+	// (the OnStop runCancel is asynchronous — workers can keep
+	// inserting until they observe the cancel), or (b) heap pages
+	// that the bgwriter never had time to flush.
+	//
+	// Without this checkpoint:
+	//  - Pool.Close calls FlushAll which pwrites dirty slots but
+	//    does NOT fsync the data files (M0089-0001's SyncAll is
+	//    wired into Checkpointer.runCheckpoint, not into Pool.Close).
+	//  - main.go persists FSM/VM state to disk AFTER all this,
+	//    capturing in-memory block references for pages whose
+	//    content lives only in the OS page cache. A subsequent
+	//    open finds the FSM pointing at blocks the heap file is
+	//    too short to contain — surfacing as `ERROR: short read
+	//    at block` on the next workload.
+	//
+	// Errors here are logged but do not abort Close — file handles
+	// must still be released so the process can exit cleanly.
+	if r.Checkpointer != nil {
+		if err := r.Checkpointer.CheckpointNow(); err != nil {
+			slog.Default().Warn(
+				"final shutdown checkpoint failed",
+				"err", err,
+				"note", "data files may not be fully durable on disk",
+			)
+		}
 	}
 	// Stop the background page-writer before draining the pool (M0048-0003).
 	if r.bgwriter != nil {

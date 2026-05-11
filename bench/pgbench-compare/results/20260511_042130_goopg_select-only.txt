@@ -1,0 +1,33 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 10.0 s, 413.9 tps, lat 236.986 ms stddev 54.061, 0 failed
+progress: 20.0 s, 413.7 tps, lat 242.078 ms stddev 53.247, 0 failed
+progress: 30.0 s, 413.1 tps, lat 242.026 ms stddev 47.662, 0 failed
+progress: 40.0 s, 406.8 tps, lat 245.817 ms stddev 51.363, 0 failed
+progress: 50.0 s, 413.9 tps, lat 241.637 ms stddev 46.466, 0 failed
+progress: 60.0 s, 407.7 tps, lat 245.049 ms stddev 49.993, 0 failed
+progress: 70.0 s, 407.4 tps, lat 245.553 ms stddev 47.102, 0 failed
+progress: 80.0 s, 410.9 tps, lat 243.823 ms stddev 47.814, 0 failed
+progress: 90.0 s, 416.9 tps, lat 239.626 ms stddev 41.606, 0 failed
+progress: 100.0 s, 405.3 tps, lat 246.483 ms stddev 44.426, 0 failed
+progress: 110.0 s, 402.1 tps, lat 248.290 ms stddev 45.482, 0 failed
+progress: 120.0 s, 387.1 tps, lat 258.686 ms stddev 47.274, 0 failed
+progress: 130.0 s, 377.7 tps, lat 264.580 ms stddev 45.160, 0 failed
+progress: 140.0 s, 380.6 tps, lat 263.010 ms stddev 43.637, 0 failed
+progress: 150.0 s, 385.6 tps, lat 259.247 ms stddev 42.071, 0 failed
+progress: 160.0 s, 374.4 tps, lat 267.062 ms stddev 46.662, 0 failed
+progress: 170.0 s, 391.7 tps, lat 255.231 ms stddev 48.429, 0 failed
+progress: 180.0 s, 390.9 tps, lat 255.979 ms stddev 41.168, 0 failed
+transaction type: <builtin: select only>
+scaling factor: 123
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 72094
+number of failed transactions: 0 (0.000%)
+latency average = 249.774 ms
+latency stddev = 47.890 ms
+initial connection time = 59.267 ms
+tps = 400.072479 (without initial connection time)

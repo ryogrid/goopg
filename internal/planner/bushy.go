@@ -109,13 +109,84 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	// inferredCount=0 keeps the historical pre-M0076
 	// behaviour. The hook + cost-model are dormant
 	// infrastructure for M0077.
-	g := buildJoinGraph(tables, scans, scanWidth, conjuncts, 0, ctx.bindings)
+
+	// M0077-0001 (Slice A): partition single-binding
+	// predicates out of the join-DP conjunct list
+	// before buildJoinGraph; they get attached to leaf
+	// scans below as Filter wrappers AFTER the bushy DP
+	// picks a binary tree. This preserves Q5's binary
+	// shape because the existing collectMultiHashTables
+	// path declines on Filter(SeqScan) leaves.
+	//
+	// shouldAttachBeforeMHJ gates the rollout: only
+	// FROM-clauses with ≥ 5 tables (the shape that
+	// triggers MultiHashJoin packing) get pre-MHJ
+	// attachment. Smaller queries keep their pre-M0077
+	// behaviour. See docs/design/fix-for-q5/01.
+	var locals relationLocalFilters
+	dpConjuncts := conjuncts
+	if shouldAttachBeforeMHJ(ctx.bindings) {
+		// Build cumOffsets matching the bindings'
+		// FROM-cumulative output coordinates.
+		cumOffsets := make([]int, len(ctx.bindings)+1)
+		for i, b := range ctx.bindings {
+			cumOffsets[i] = b.offset
+		}
+		// Total schema width = last binding's offset + its width.
+		last := ctx.bindings[len(ctx.bindings)-1]
+		cumOffsets[len(ctx.bindings)] = last.offset + len(last.table.Columns)
+		dpConjuncts, locals = partitionConjunctsForJoinPlanning(conjuncts, cumOffsets)
+	}
+
+	// M0077-0002 (Slice B): build per-binding `baseRelInfo`
+	// before the DP runs so singleton subsets can seed their
+	// row counts from post-filter cardinality. The slice is
+	// always built (even when Slice A's gate declined to
+	// partition); empty `locals` simply yields
+	// `filteredRows == baseRows` and the prior bushy DP
+	// behaviour is preserved.
+	relInfos := make([]baseRelInfo, len(ctx.bindings))
+	for i, b := range ctx.bindings {
+		var local Expr
+		if preds := locals.byBinding[i]; len(preds) > 0 {
+			local = combineAnd(preds)
+		}
+		var leafScan Node
+		if i < len(scans) {
+			leafScan = scans[i]
+		}
+		relInfos[i] = estimateBaseRelInfo(b, leafScan, local)
+		relInfos[i].bindingIdx = i
+	}
+
+	// M0077-0004 (Slice D): synthesise selective anchored
+	// equality edges from `dpConjuncts` + `relInfos`. Edges
+	// fire only from anchor (SmallDimension /
+	// strongly-filtered / small-anchor-rows) relations to
+	// non-anchor relations in the same class — the design
+	// 02 §5 rule that avoids the M0075-0001 / M0076-0001 Q9
+	// hang while still adding Q5's missing
+	// `c_nationkey = n_nationkey` edge when applicable.
+	// Tagged inferred via `inferredCount` so the edge
+	// inherits M0076-0004's penalty multiplier.
+	anchoredEdges := inferAnchoredEqualities(dpConjuncts, relInfos)
+	if len(anchoredEdges) > 0 {
+		dpConjuncts = append(dpConjuncts, anchoredEdges...)
+	}
+	inferredCount := len(anchoredEdges)
+
+	g := buildJoinGraph(tables, scans, scanWidth, dpConjuncts, inferredCount, ctx.bindings)
 	if g == nil || len(g.edges) == 0 {
 		return node, pred
 	}
-	bushyPlan, residual, err := enumerateBushyPlans(g, conjuncts, cat)
+	bushyPlan, residual, err := enumerateBushyPlans(g, dpConjuncts, relInfos, cat)
 	if err != nil || bushyPlan == nil {
 		return node, pred
+	}
+	// M0077-0001: attach partitioned local predicates to
+	// the matching leaf scans on the bushy plan.
+	if len(locals.byBinding) > 0 {
+		bushyPlan = attachRelationLocalFilters(bushyPlan, locals, scans, ctx.bindings)
 	}
 	if len(residual) == 0 {
 		// All conjuncts consumed — Filter is unnecessary.
@@ -399,10 +470,17 @@ func findEdgeBetweenIdx(a, b uint16, g *joinGraph) (*joinEdge, int) {
 
 type dpEntry struct {
 	plan Node
+	// M0077-0002 (Slice B): post-filter row count for this
+	// subset. Singletons take `baseRelInfo.filteredRows`;
+	// composed subsets take the chosen join's output
+	// cardinality. `buildJoinFromDP` reads this for the
+	// build-side decision (replacing the prior
+	// `EstimateRows(plan)` re-evaluation).
+	rows int64
 	cost int64
 }
 
-func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (Node, []Expr, error) {
+func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo, cat catalog.Catalog) (Node, []Expr, error) {
 	if g.nodes == 0 {
 		return nil, nil, nil
 	}
@@ -418,11 +496,19 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 		return g.scans[0], residual, nil
 	}
 
+	// M0077-0002 (Slice B): seed singleton subsets with
+	// post-filter rowcounts from `relInfos` when available.
+	// Falls back to the historical `tableRows` lookup with a
+	// 1-row floor for nodes that lack a corresponding entry
+	// (defensive against test fixtures and shape changes).
 	rowCounts := make([]int64, g.nodes)
 	for i, tbl := range g.tables {
-		if tbl != nil && tbl.Stats != nil && tbl.Stats.RowCount > 0 {
+		switch {
+		case i < len(relInfos) && relInfos[i].filteredRows > 0:
+			rowCounts[i] = relInfos[i].filteredRows
+		case tbl != nil && tbl.Stats != nil && tbl.Stats.RowCount > 0:
 			rowCounts[i] = tbl.Stats.RowCount
-		} else {
+		default:
 			rowCounts[i] = 1
 		}
 	}
@@ -432,7 +518,7 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 
 	for i := 0; i < g.nodes; i++ {
 		mask := uint16(1 << i)
-		dp[mask] = dpEntry{plan: g.scans[i], cost: rowCounts[i]}
+		dp[mask] = dpEntry{plan: g.scans[i], rows: rowCounts[i], cost: rowCounts[i]}
 	}
 
 	for size := 2; size <= g.nodes; size++ {
@@ -463,10 +549,16 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, cat catalog.Catalog) (N
 				if !okA || !okB {
 					return
 				}
-				cost := estimateJoinCost(entryA.cost, entryB.cost, edge, g, cat)
+				// M0077-0003 (Slice C): cost is the 3-part
+				// `output + build*4 + probe` value; outputRows
+				// becomes the composed subset's `dpEntry.rows`
+				// so deeper DP levels see this subset's
+				// cardinality estimate rather than its cost
+				// (the two diverge once the build term enters).
+				outRows, cost := estimateJoinCost(entryA.rows, entryB.rows, edge, g, cat)
 				if best == nil || cost < best.cost {
-					join := buildJoinFromDP(entryA.plan, entryB.plan, a, b, edge, g)
-					best = &dpEntry{plan: join, cost: cost}
+					join := buildJoinFromDP(entryA.plan, entryB.plan, entryA.rows, entryB.rows, a, b, edge, g)
+					best = &dpEntry{plan: join, rows: outRows, cost: cost}
 					bestEdgeIdx = edgeIdx
 				}
 			})
@@ -569,7 +661,41 @@ func enumerateSplits(mask uint16, fn func(a, b uint16)) {
 	}
 }
 
-func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) int64 {
+// M0077-0003 (Slice C): three-part hash-join cost weights per
+// design 02 §3. The build term must be heavy enough that the
+// DP visibly prefers plans whose hash-build inputs are small
+// (filtered region/nation, customer) over plans that build a
+// hash table from a large unfiltered fact (lineitem/orders).
+// Probe and output remain at unit weight so the formula stays
+// approximately proportional to total work for selective
+// filtered plans.
+const (
+	outputRowWeight = 1
+	hashBuildWeight = 4
+	hashProbeWeight = 1
+)
+
+// estimateJoinCost returns (outputRows, cost) for a candidate
+// hash join over the given filtered row counts. cost is the
+// 3-part formula:
+//
+//	cost = outputRows*outputRowWeight
+//	     + buildRows*hashBuildWeight
+//	     + probeRows*hashProbeWeight
+//
+// buildRows is the smaller side (the side that hashes); probeRows
+// is the larger side (the side that streams). M0076-0004's
+// inferredEdgePenalty multiplier is applied AFTER the 3-part
+// sum so an inferred edge of any shape gets the same penalty
+// factor relative to its explicit equivalent.
+//
+// The single-output `(L*R)/maxNDV` quantity is still computed —
+// it becomes outputRows, also stored in `dpEntry.rows` so
+// downstream subsets see this subset's cardinality estimate
+// rather than re-reading raw table sizes.
+//
+// (M0077-0003 / Slice C per design 02 §3.)
+func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, cat catalog.Catalog) (outputRows, cost int64) {
 	if leftRows <= 0 {
 		leftRows = 1
 	}
@@ -597,31 +723,40 @@ func estimateJoinCost(leftRows, rightRows int64, edge *joinEdge, g *joinGraph, c
 			}
 		}
 	}
-	product := leftRows * rightRows
-	cost := product / ndv
+	outputRows = leftRows * rightRows / ndv
+	if outputRows < 1 {
+		outputRows = 1
+	}
+	// Build side = smaller, probe side = larger. This is the
+	// same heuristic `buildJoinFromDP` uses to pick BuildLeft;
+	// keeping the cost-side and physical-side decisions in
+	// sync prevents the "right shape, wrong build" failure mode
+	// design 02 §4 calls out.
+	buildRows, probeRows := leftRows, rightRows
+	if rightRows < leftRows {
+		buildRows, probeRows = rightRows, leftRows
+	}
+	cost = outputRows*outputRowWeight +
+		buildRows*hashBuildWeight +
+		probeRows*hashProbeWeight
 	if cost < 1 {
 		cost = 1
 	}
 	// M0076-0004: penalise edges produced from synthesised
-	// (transitively-inferred) conjuncts. The bushy DP
-	// minimises cost; multiplying by inferredEdgePenalty
-	// (>1.0) makes inferred edges look more expensive so
-	// the DP prefers plans driven by explicit predicates.
-	// This prevents the Q9 regression mode that caused
-	// M0075-0001's hook revert (synthesised edges had
-	// equal weight to explicit ones, letting the DP pick
-	// build-heavy plans that exploit transitive
-	// redundancy as if it were independent selectivity).
+	// (transitively-inferred) conjuncts. Slice D adds these
+	// only via anchored synthesis; the penalty stays as a final
+	// tiebreaker so even an anchored edge isn't preferred over
+	// an explicit equivalent of identical 3-part cost.
 	if edge.isInferred {
 		cost = int64(float64(cost) * inferredEdgePenalty)
 		if cost < 1 {
 			cost = 1
 		}
 	}
-	return cost
+	return outputRows, cost
 }
 
-func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
+func buildJoinFromDP(leftPlan, rightPlan Node, leftRows, rightRows int64, a, b uint16, edge *joinEdge, g *joinGraph) *Join {
 	// Determine which edge key belongs to which subset BEFORE
 	// remapping.  The edge stores {leftTable, rightTable} in
 	// FROM-clause order, but the DP may have assigned those
@@ -642,8 +777,19 @@ func buildJoinFromDP(leftPlan, rightPlan Node, a, b uint16, edge *joinEdge, g *j
 	copy(mergedSchema, leftSchema)
 	copy(mergedSchema[len(leftSchema):], rightSchema)
 
-	lRows := EstimateRows(leftPlan)
-	rRows := EstimateRows(rightPlan)
+	// M0077-0002 (Slice B): build-side decision uses the
+	// post-filter rowcounts threaded through `dpEntry.rows`
+	// rather than re-reading `EstimateRows(plan)` per call.
+	// Falls back to `EstimateRows` only when the caller passed
+	// a non-positive sentinel (defensive against test fixtures).
+	lRows := leftRows
+	if lRows <= 0 {
+		lRows = EstimateRows(leftPlan)
+	}
+	rRows := rightRows
+	if rRows <= 0 {
+		rRows = EstimateRows(rightPlan)
+	}
 	buildLeft := lRows > 0 && rRows > 0 && lRows < rRows
 	// M0054-0010: when one side is a known small-dimension table
 	// (region, nation) but stats are absent on the other side,
@@ -1128,6 +1274,12 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		subRemap([]Expr{n.Predicate, n.LeftKey, n.RightKey})
 		return
 	case *Filter:
+		// M0077-0001: Filter wrappers attached above leaf scans
+		// by Slice A carry leaf-local Predicate ColumnRefs (NOT
+		// FROM-cumulative). Skip the cumulative-space posMap.
+		if n.LeafLocal {
+			return
+		}
 		remapPosMapAfterRewrite(n.Child, nil)
 		// Only use MHJ posMap (OID‑based); binaryTreePosMapOf is
 		// disabled here because it assumes OID order == FROM order
@@ -1634,6 +1786,13 @@ func applyJoinTreePosMap(node Node, posMap func(int) int) {
 		// alone in this walker.
 		applyJoinTreePosMap(n.Outer, posMap)
 	case *Filter:
+		// M0077-0001: Slice A leaf-local Filter wrappers carry
+		// leaf-scoped ColumnRefs; skip both the recursion (Child
+		// is a SeqScan; nothing to remap there) and the predicate
+		// remap (would corrupt local indices).
+		if n.LeafLocal {
+			return
+		}
 		applyJoinTreePosMap(n.Child, posMap)
 		remapByPosMap(&n.Predicate, posMap)
 	case *Project:

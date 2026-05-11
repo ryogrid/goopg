@@ -154,7 +154,20 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 		if opts.FreezeBelow > 0 {
 			fs, ferr := storage.PageFreezeOldTuples(page, opts.FreezeBelow)
 			if ferr == nil && fs.Frozen > 0 {
-				pool.MarkDirty(slot) // conservative FPI for freeze
+				// M0080-0001: emit a logical heap-freeze record
+				// when the hook is wired; falls back to MarkDirty
+				// (FPI) for test harnesses without WAL.
+				if logFrz := pool.LogHeapFreeze(); logFrz != nil {
+					if err := pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+						return logFrz(rel, blk, fs.FrozenSlots)
+					}); err != nil {
+						slot.Unlock()
+						pool.Unpin(slot)
+						return stats, err
+					}
+				} else {
+					pool.MarkDirty(slot)
+				}
 				pageDirty = true
 				stats.Frozen += fs.Frozen
 			}

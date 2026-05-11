@@ -843,6 +843,26 @@ func (bt *BTree) updateRootMeta(root storage.BlockNumber, level uint32) error {
 	return nil
 }
 
+// updateRootMetaWithLSN is the M0079-0004 variant used after a
+// `RecordKindBtreeNewRoot` emission. The metapage's pd_lsn is
+// stamped to the newroot record's end LSN so per-page replay
+// idempotency remains intact.
+func (bt *BTree) updateRootMetaWithLSN(root storage.BlockNumber, level uint32, lsn storage.LSN) error {
+	slot, err := bt.pinW(MetaBlock)
+	if err != nil {
+		return err
+	}
+	m := parseMeta(slot.Page())
+	m.Root = root
+	m.Level = level
+	m.FastRoot = root
+	m.FastLevel = level
+	writeMeta(slot.Page(), m)
+	bt.pool.MarkDirtyWithLSNLocked(slot, lsn)
+	bt.unpinW(slot)
+	return nil
+}
+
 // pageItems lists every item on a page in slot order.
 func pageItems(p storage.Page) ([]item, error) {
 	count, err := storage.PageLinePointerCount(p)
@@ -1497,16 +1517,36 @@ func (bt *BTree) createNewRoot(leftBlk, rightBlk storage.BlockNumber, rightKey [
 	})
 
 	// Leftmost internal item: empty key, pointer to leftBlk.
-	insertItemSorted(rootSlot.Page(), item{
+	leftItem := item{
 		keyLen: 0,
 		ptr:    storage.ItemPointer{Block: leftBlk, Offset: 0},
 		key:    nil,
-	})
-	insertItemSorted(rootSlot.Page(), item{
+	}
+	rightItem := item{
 		keyLen: uint16(len(rightKey)),
 		ptr:    storage.ItemPointer{Block: rightBlk, Offset: 0},
 		key:    append([]byte(nil), rightKey...),
-	})
+	}
+	insertItemSorted(rootSlot.Page(), leftItem)
+	insertItemSorted(rootSlot.Page(), rightItem)
+
+	// M0079-0004: emit a single LogBtreeNewRoot record covering
+	// both the new root's content + the metapage update.
+	// Falls back to the legacy per-page FPI path when no hook
+	// is wired (test harnesses without a WAL writer).
+	if emitter := bt.pool.LogBtreeNewRoot(); emitter != nil {
+		items := [][]byte{leftItem.marshal(), rightItem.marshal()}
+		lsn, err := emitter(bt.rel, rootBlk, level, items)
+		if err != nil {
+			rootSlot.Unlock()
+			bt.pool.Unpin(rootSlot)
+			return err
+		}
+		bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
+		rootSlot.Unlock()
+		bt.pool.Unpin(rootSlot)
+		return bt.updateRootMetaWithLSN(rootBlk, level, lsn)
+	}
 	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
 		rootSlot.Unlock()
 		bt.pool.Unpin(rootSlot)

@@ -31,6 +31,15 @@ type epochResetter interface {
 	ResetCheckpointEpoch()
 }
 
+// dataFileSyncer is implemented by anything that can fdatasync every
+// open data file (e.g. *storage.Pool wrapping *storage.Manager.SyncAll).
+// Optional — tests that use stub flushers without storage backing
+// keep working; only production checkpoints need durability across
+// power loss. M0089-0001.
+type dataFileSyncer interface {
+	SyncAllDataFiles() error
+}
+
 type checkpointWAL interface {
 	Append(payload []byte) (uint64, uint64, error)
 	FlushUpTo(lsn uint64) error
@@ -283,6 +292,17 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	flushStart := time.Now()
 	if err := c.flushDirty(pacer); err != nil {
 		return fmt.Errorf("flush dirty pages: %w", err)
+	}
+	// M0089-0001: after pwrite'ing every dirty page, fdatasync the
+	// data files so the bytes are durable before we advance the
+	// checkpoint LSN. Without this, a host crash between
+	// `FlushAllPaced` and the next OS-level flush could rewind the
+	// data files even though WAL replay would believe those records
+	// are already applied.
+	if ds, ok := c.flusher.(dataFileSyncer); ok {
+		if err := ds.SyncAllDataFiles(); err != nil {
+			return fmt.Errorf("sync data files: %w", err)
+		}
 	}
 	c.writeTimeMs.Add(uint64(time.Since(flushStart).Milliseconds()))
 	_, endLSN, err := c.wal.Append(EncodeCheckpoint())

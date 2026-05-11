@@ -13,6 +13,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // pgEpoch is the PostgreSQL epoch: 2000-01-01 00:00:00 UTC.
@@ -348,6 +349,16 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		// M0090-0001: clear FSM + VM entries for the dropped
+		// heap. Same rationale as execTruncate — without this,
+		// a future CREATE TABLE that lands on the same oid would
+		// inherit stale FSM/VM bits from the dropped relation.
+		if o.ctx.FSM != nil {
+			o.ctx.FSM.DropRelation(rel)
+		}
+		if o.ctx.VM != nil {
+			o.ctx.VM.DropRelation(rel)
+		}
 		for _, idxRel := range idxRels {
 			o.ctx.Pool.InvalidateRel(idxRel)
 			if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
@@ -400,12 +411,31 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("index %q does not exist", name.String())}
 		}
 		rel := o.ctx.Catalog.IndexRelFileNode(idx)
+		dropOID := idx.OID
+		dropSchema := idx.Schema
+		dropName := idx.Name
 		if err := o.ctx.Catalog.DropIndex(name); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
 		o.ctx.Pool.InvalidateRel(rel)
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		}
+		// M0079-0001: emit a DROP INDEX WAL record so a
+		// post-crash recovery doesn't resurrect the index from
+		// an earlier RecordKindCreateIndex still in the WAL.
+		// Best-effort: the catalog mutation has already
+		// completed; logging a failure is preferable to
+		// resurrecting a half-dropped index.
+		if o.ctx.Pool != nil {
+			payload := wal.EncodeDropIndex(wal.DropIndexPayload{
+				OID:    dropOID,
+				Schema: dropSchema,
+				Name:   dropName,
+			})
+			if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
+				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("drop-index WAL append: %v", err)}
+			}
 		}
 	}
 	return nil
@@ -523,6 +553,40 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	if catalogHeapSyncAvailable(o.ctx) {
 		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	// M0079-0001: emit a CREATE INDEX WAL record so post-crash
+	// recovery can reconstruct the in-memory catalog entry. The
+	// pg_class heap row written above only carries OID + name +
+	// relkind='i'; the column list, unique flag, primary flag,
+	// and owning-table OID would otherwise be lost on a non-
+	// graceful restart. The WAL record carries the full
+	// metadata; replay happens in
+	// `internal/initdb.replayIndexDDLRecords` after physical
+	// recovery finishes.
+	if o.ctx.Pool != nil {
+		payload := wal.EncodeCreateIndex(wal.CreateIndexPayload{
+			OID:      idx.OID,
+			TableOID: tbl.OID,
+			Schema:   idxName.Schema,
+			Name:     idxName.Name,
+			Method:   "btree",
+			Columns:  append([]string(nil), columns...),
+			Unique:   unique,
+			Primary:  primary,
+		})
+		if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
+			// Best-effort: roll back the in-memory mutation so
+			// memory and (now-incomplete) WAL agree, mirroring
+			// the CreateDatabase emit-then-rollback discipline at
+			// internal/server/database_ddl.go:162-166. The on-
+			// disk btree pages remain — they are harmless without
+			// a catalog entry — but the next graceful SaveCatalog
+			// won't capture this index either.
+			_ = o.ctx.Catalog.DropIndex(idxName)
+			o.ctx.Pool.InvalidateRel(idxRel)
+			_ = o.ctx.Pool.Manager().DropRelation(idxRel)
+			return &ExecError{Code: "XX000", Pos: pos, Message: fmt.Sprintf("create-index WAL append: %v", err)}
 		}
 	}
 	return nil
@@ -925,12 +989,27 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		// M0090-0001: clear FSM + VM entries for the truncated
+		// heap. Without this, the next INSERT consults the FSM,
+		// gets a stale block number, calls Pin → ReadBlock and
+		// errors with `short read at block` because nblocks=0
+		// post-truncate.
+		if o.ctx.FSM != nil {
+			o.ctx.FSM.DropRelation(rel)
+		}
+		if o.ctx.VM != nil {
+			o.ctx.VM.DropRelation(rel)
+		}
 		for _, idx := range idxs {
 			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 			o.ctx.Pool.InvalidateRel(idxRel)
 			if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
+			// FSM/VM are heap-relation maps; index relfiles
+			// have no entries to clear. (Btrees track their
+			// own free space inline.) Pair the FSM/VM cleanup
+			// only with the heap rel above.
 			if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}

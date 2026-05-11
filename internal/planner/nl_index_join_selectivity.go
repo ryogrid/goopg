@@ -97,3 +97,30 @@ func outerScanRowCount(n Node) int64 {
 	}
 	return EstimateRows(n)
 }
+
+// origTypeMatches reports whether the slot at `cr.Index` in
+// `outerSchema` carries a type compatible with `cr.Type`. When
+// it returns false, the runtime IndexScan key encoder will fail
+// with 42804 (`not numeric at runtime`) before any selectivity
+// concern matters — so M0077-0001's tryBuildNLI rebind treats a
+// `false` return as an override that bypasses the M0075-0002
+// selectivity guard.
+//
+// The compatibility test is intentionally conservative: only
+// the catalog Type Name is compared. ColumnRef.Type and the
+// outerSchema entry are both populated from the same catalog
+// types when the schema is current, so a mismatch is a strong
+// signal that the schema annotation drifted (Q8's chained-NLI
+// shape places `n_name` (char) at the slot the probe-key
+// `c_nationkey` (numeric) was originally bound to).
+func origTypeMatches(cr *ColumnRef, outerSchema Schema) bool {
+	if cr == nil {
+		return false
+	}
+	if cr.Index < 0 || cr.Index >= len(outerSchema) {
+		// Out-of-range index can't be "matching"; tryBuildNLI
+		// will treat this as a forced rebind via origTypeMismatch.
+		return false
+	}
+	return outerSchema[cr.Index].Type.Name == cr.Type.Name
+}

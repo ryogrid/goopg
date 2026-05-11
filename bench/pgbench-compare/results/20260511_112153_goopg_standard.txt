@@ -1,0 +1,88 @@
+pgbench (18.3)
+starting vacuum...end.
+pgbench: error: client 12 command 4: no results
+pgbench: error: client 61 command 4: no results
+pgbench: error: client 94 command 4: no results
+pgbench: error: client 82 command 4: no results
+pgbench: error: client 73 command 4: no results
+pgbench: error: client 26 command 4: no results
+pgbench: error: client 58 command 4: no results
+pgbench: error: client 99 command 4: no results
+pgbench: error: client 87 command 4: no results
+pgbench: error: client 69 command 4: no results
+pgbench: error: client 1 command 4: no results
+pgbench: error: client 78 command 4: no results
+pgbench: error: client 79 command 4: no results
+pgbench: error: client 86 command 4: no results
+pgbench: error: client 41 command 4: no results
+pgbench: error: client 98 command 4: no results
+pgbench: error: client 3 command 4: no results
+pgbench: error: client 97 command 4: no results
+pgbench: error: client 29 command 4: no results
+pgbench: error: client 21 command 4: no results
+pgbench: error: client 14 command 4: no results
+pgbench: error: client 64 command 4: no results
+pgbench: error: client 62 command 4: no results
+pgbench: error: client 54 command 4: no results
+pgbench: error: client 36 command 4: no results
+pgbench: error: client 32 command 4: no results
+pgbench: error: client 23 command 4: no results
+pgbench: error: client 42 command 4: no results
+pgbench: error: client 85 command 4: no results
+pgbench: error: client 59 command 4: no results
+pgbench: error: client 57 command 4: no results
+pgbench: error: client 71 command 4: no results
+pgbench: error: client 40 command 4: no results
+pgbench: error: client 18 command 4: no results
+pgbench: error: client 53 command 4: no results
+pgbench: error: client 50 command 4: no results
+pgbench: error: client 55 command 4: no results
+pgbench: error: client 96 command 4: no results
+pgbench: error: client 27 command 4: no results
+pgbench: error: client 10 command 4: no results
+pgbench: error: client 52 command 4: no results
+pgbench: error: client 20 command 4: no results
+pgbench: error: client 47 command 4: no results
+pgbench: error: client 16 command 4: no results
+pgbench: error: client 9 command 4: no results
+pgbench: error: client 33 command 4: no results
+pgbench: error: client 68 command 4: no results
+pgbench: error: client 70 command 4: no results
+progress: 10.0 s, 69.3 tps, lat 841.918 ms stddev 274.020, 48 failed
+pgbench: error: client 84 command 4: no results
+progress: 20.0 s, 76.1 tps, lat 682.433 ms stddev 32.538, 1 failed
+pgbench: error: client 76 command 4: no results
+progress: 30.0 s, 75.3 tps, lat 660.674 ms stddev 32.896, 1 failed
+pgbench: error: client 37 command 4: no results
+pgbench: error: client 56 command 4: no results
+progress: 40.0 s, 74.9 tps, lat 657.576 ms stddev 36.649, 2 failed
+progress: 50.0 s, 75.6 tps, lat 635.088 ms stddev 32.545, 0 failed
+progress: 60.0 s, 75.4 tps, lat 634.363 ms stddev 28.807, 0 failed
+pgbench: error: client 88 command 4: no results
+pgbench: error: client 35 command 4: no results
+progress: 70.0 s, 75.1 tps, lat 623.258 ms stddev 32.231, 2 failed
+progress: 80.0 s, 74.9 tps, lat 614.551 ms stddev 31.464, 0 failed
+progress: 90.0 s, 74.1 tps, lat 619.266 ms stddev 30.408, 0 failed
+progress: 100.0 s, 74.7 tps, lat 617.117 ms stddev 34.656, 0 failed
+progress: 110.0 s, 74.6 tps, lat 619.137 ms stddev 33.409, 0 failed
+progress: 120.0 s, 74.1 tps, lat 618.366 ms stddev 31.489, 0 failed
+progress: 130.0 s, 69.4 tps, lat 660.995 ms stddev 53.902, 0 failed
+progress: 140.0 s, 62.8 tps, lat 731.985 ms stddev 42.671, 0 failed
+progress: 150.0 s, 62.6 tps, lat 731.880 ms stddev 40.557, 0 failed
+progress: 160.0 s, 63.2 tps, lat 728.628 ms stddev 43.392, 0 failed
+progress: 170.0 s, 62.0 tps, lat 740.401 ms stddev 40.883, 0 failed
+progress: 180.0 s, 62.8 tps, lat 735.837 ms stddev 37.603, 0 failed
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 12815
+number of failed transactions: 54 (0.420%)
+latency average = 671.609 ms
+latency stddev = 95.090 ms
+initial connection time = 59.544 ms
+tps = 71.044442 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

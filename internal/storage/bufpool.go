@@ -102,6 +102,17 @@ type Pool struct {
 	// record. Used by VACUUM to capture the dead-slot list rather
 	// than a full-page image on each pruned page.
 	logHeapVacuum LogHeapVacuumFunc
+	// logBtreeVacuum emits a logical btree-vacuum (kept-items)
+	// WAL record. Used by `btree.VacuumIndexPages` to avoid
+	// FPI per pruned leaf. (M0079-0002.)
+	logBtreeVacuum LogBtreeVacuumFunc
+	// M0079-0003 logical records for the remaining FPI fallback
+	// paths in btree page deletion + root replacement.
+	logBtreeUnlinkPage       LogBtreeUnlinkPageFunc
+	logBtreeNewRoot          LogBtreeNewRootFunc
+	logBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
+	// M0080-0001 logical record for VACUUM FREEZE.
+	logHeapFreeze LogHeapFreezeFunc
 	// logHeapHotUpdate emits an atomic HOT-update WAL record
 	// (M0046-0001): old-slot xmax stamp + new tuple insert on the
 	// same page in one record. nil disables the optimisation and
@@ -114,6 +125,12 @@ type Pool struct {
 	// (RecordKindSmgrCreate) when Pool.PinNew creates block 0 of
 	// a new relation. Set via PoolConfig.LogSmgrCreate.
 	logSmgrCreate func(rel RelFileNode) error
+	// logChangeRecord emits a pre-encoded change record (e.g.
+	// RecordKindCreateIndex) on behalf of the executor without
+	// requiring an executor → wal direct dependency. Set via
+	// PoolConfig.LogChangeRecord. Exposed via
+	// Pool.LogChangeRecord. (M0079-0001.)
+	logChangeRecord func(payload []byte) (LSN, error)
 	// fullPageWrites gates FPI emission. The wire/admin layer can
 	// flip it at runtime to mirror upstream's full_page_writes
 	// SIGHUP-context GUC.
@@ -255,6 +272,47 @@ type PoolConfig struct {
 	// each pruned page.
 	LogHeapVacuum LogHeapVacuumFunc
 
+	// LogBtreeVacuum, when non-nil, is exposed via
+	// Pool.LogBtreeVacuum so the btree VACUUM path can emit a
+	// kept-items + opaque-flags change record instead of a full
+	// FPI on each pruned leaf. The kept-items list carries each
+	// surviving item's raw bytes (the same blob
+	// `pageAddItemRaw` writes); replay rebuilds the page's
+	// kept-items projection. (M0079-0002.)
+	LogBtreeVacuum LogBtreeVacuumFunc
+
+	// LogBtreeUnlinkPage, when non-nil, is exposed via
+	// Pool.LogBtreeUnlinkPage so the btree page-deletion path
+	// can emit a single atomic record covering the four
+	// page mutations (prev sibling Next, right sibling Prev,
+	// leaf flags after, parent downlink removal) instead of
+	// 4 separate FPIs. (M0079-0003.)
+	LogBtreeUnlinkPage LogBtreeUnlinkPageFunc
+
+	// LogBtreeNewRoot, when non-nil, is exposed via
+	// Pool.LogBtreeNewRoot so the btree root-replacement path
+	// (post-split bubbling + post-full-vacuum empty reset)
+	// can emit a control-only record carrying the new root's
+	// items + level instead of FPIs. (M0079-0003.)
+	LogBtreeNewRoot LogBtreeNewRootFunc
+
+	// LogBtreeMarkPageHalfDead, when non-nil, is exposed via
+	// Pool.LogBtreeMarkPageHalfDead so the leaf-only flags
+	// transition (when a leaf's already empty before vacuum)
+	// can emit a 16-byte record instead of an FPI. Most
+	// half-dead transitions are bundled into BtreeVacuum's
+	// OpaqueFlags trailer; this hook covers the residual
+	// "already-empty" path. (M0079-0003.)
+	LogBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
+
+	// LogHeapFreeze, when non-nil, is exposed via
+	// Pool.LogHeapFreeze so the VACUUM FREEZE path can emit
+	// a logical record carrying the frozen-tuple slot list
+	// instead of an FPI for each frozen page. The hook lives
+	// in storage so internal/vacuum can consume it without
+	// importing internal/wal. (M0080-0001.)
+	LogHeapFreeze LogHeapFreezeFunc
+
 	// LogHeapHotUpdate, when non-nil, is exposed via
 	// Pool.LogHeapHotUpdate so the executor's HOT-update path can
 	// emit a single atomic change record (old-stamp + new-insert on
@@ -273,6 +331,15 @@ type PoolConfig struct {
 	// Failures are logged but not propagated, matching the FPI hook
 	// behaviour. See docs/design/0030-0002-ddl-wal-records.md.
 	LogSmgrCreate func(rel RelFileNode) error
+
+	// LogChangeRecord, when non-nil, is exposed via
+	// Pool.LogChangeRecord so DDL-emitting executors can append a
+	// pre-encoded WAL record (e.g. RecordKindCreateIndex) without
+	// importing the wal package. The function returns the record's
+	// end LSN; failures are propagated so the executor can roll back
+	// the in-memory catalog mutation that produced the record.
+	// (M0079-0001 / pgbench recovery fix.)
+	LogChangeRecord func(payload []byte) (LSN, error)
 
 	// Logger receives FPI emission failures. nil means
 	// slog.Default().
@@ -326,6 +393,54 @@ type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xma
 // write or recovery. See docs/design/0002-0003-redo-records.md.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
+// LogBtreeVacuumFunc emits one logical btree-vacuum redo
+// record carrying the kept-items projection and post-vacuum
+// opaque flags for a pruned leaf page. Mirrors the producer-
+// side of `btree.ReplayVacuumPage`. The signature lives in
+// storage so the btree access method can consume it without
+// importing internal/wal. (M0079-0002.)
+type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, keptItems [][]byte, opaqueFlags uint16) (LSN, error)
+
+// BtreeUnlinkPageRequest collects the 4-page mutation control
+// info that `RecordKindBtreeUnlinkPage` carries. Mirrors the
+// producer arguments `unlinkEmptyLeaf` would pass after
+// M0079-0003 wiring. The signature lives in storage so the
+// btree access method can consume it without importing
+// internal/wal.
+type BtreeUnlinkPageRequest struct {
+	LeafBlk          BlockNumber
+	LeafFlagsAfter   uint16
+	HasLeftSib       bool
+	LeftSibBlk       BlockNumber
+	LeftSibNewNext   BlockNumber
+	HasRightSib      bool
+	RightSibBlk      BlockNumber
+	RightSibNewPrev  BlockNumber
+	HasParent        bool
+	ParentBlk        BlockNumber
+	ParentRemoveSlot uint16
+}
+
+// LogBtreeUnlinkPageFunc emits the M0079-0003 atomic
+// page-deletion redo record. Returns the record's end LSN so
+// callers can SetPageLSN on each of the 4 dirtied pages.
+type LogBtreeUnlinkPageFunc func(rel RelFileNode, req BtreeUnlinkPageRequest) (LSN, error)
+
+// LogBtreeNewRootFunc emits the M0079-0003 root-replacement
+// record. `items` carries each new-root entry's raw bytes
+// (the same blob pageAddItemRaw writes); empty slice indicates
+// a reset-to-empty-root.
+type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, level uint32, items [][]byte) (LSN, error)
+
+// LogBtreeMarkPageHalfDeadFunc emits the M0079-0003 leaf-only
+// half-dead transition record.
+type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, flagsAfter uint16) (LSN, error)
+
+// LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record
+// carrying the 1-based ascending list of LP_NORMAL slot numbers
+// whose tuple xmin was rewritten to FrozenTransactionID.
+type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)
+
 // LogHeapHotUpdateFunc emits one atomic HOT-update redo record
 // (M0046-0001). The record encodes the old-slot xmax stamp +
 // HeapHotUpdated infomask + CTID chain + the new tuple bytes (which
@@ -370,9 +485,15 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logHeapDelete:    cfg.LogHeapDelete,
 		logHeapLock:      cfg.LogHeapLock,
 		logHeapVacuum:    cfg.LogHeapVacuum,
+		logBtreeVacuum:           cfg.LogBtreeVacuum,
+		logBtreeUnlinkPage:       cfg.LogBtreeUnlinkPage,
+		logBtreeNewRoot:          cfg.LogBtreeNewRoot,
+		logBtreeMarkPageHalfDead: cfg.LogBtreeMarkPageHalfDead,
+		logHeapFreeze:            cfg.LogHeapFreeze,
 		logHeapHotUpdate: cfg.LogHeapHotUpdate,
 		logHeapPruneOpt:  cfg.LogHeapPruneOpt,
 		logSmgrCreate:    cfg.LogSmgrCreate,
+		logChangeRecord:  cfg.LogChangeRecord,
 		logger:         logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
@@ -399,6 +520,19 @@ func (p *Pool) LogPageImage() func(rel RelFileNode, blk BlockNumber, page Page) 
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
 
+// LogChangeRecord appends a pre-encoded WAL change record. Used
+// by DDL paths in the executor (CREATE / DROP INDEX) to emit
+// catalog-only records without an executor → wal hard
+// dependency. Returns 0 / nil when no hook is wired (the
+// executor's caller-side check decides whether to roll back the
+// in-memory mutation). (M0079-0001.)
+func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
+	if p == nil || p.logChangeRecord == nil {
+		return 0, nil
+	}
+	return p.logChangeRecord(payload)
+}
+
 // LogBtreeInsert returns the configured btree non-split insert
 // change-record hook, or nil if none was wired. Callers fall
 // back to per-page FPI via MarkDirty when nil.
@@ -419,6 +553,32 @@ func (p *Pool) LogHeapLock() LogHeapLockFunc { return p.logHeapLock }
 // hook, or nil if none was wired. Callers fall back to per-page
 // FPI via MarkDirty when nil.
 func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
+
+// LogBtreeVacuum returns the configured btree-vacuum
+// kept-items change-record emitter (M0079-0002). Callers
+// (btree.VacuumIndexPages) fall back to FPI via
+// MarkDirtyChangeRecord when nil.
+func (p *Pool) LogBtreeVacuum() LogBtreeVacuumFunc { return p.logBtreeVacuum }
+
+// LogBtreeUnlinkPage returns the configured atomic
+// page-deletion change-record emitter (M0079-0003). Callers
+// fall back to per-page FPIs via markDirtyWithPageRecord when nil.
+func (p *Pool) LogBtreeUnlinkPage() LogBtreeUnlinkPageFunc { return p.logBtreeUnlinkPage }
+
+// LogBtreeNewRoot returns the configured root-replacement
+// change-record emitter (M0079-0003).
+func (p *Pool) LogBtreeNewRoot() LogBtreeNewRootFunc { return p.logBtreeNewRoot }
+
+// LogBtreeMarkPageHalfDead returns the configured leaf-only
+// half-dead transition change-record emitter (M0079-0003).
+func (p *Pool) LogBtreeMarkPageHalfDead() LogBtreeMarkPageHalfDeadFunc {
+	return p.logBtreeMarkPageHalfDead
+}
+
+// LogHeapFreeze returns the configured heap-freeze
+// change-record emitter (M0080-0001). Callers fall back to
+// MarkDirty (FPI) when nil.
+func (p *Pool) LogHeapFreeze() LogHeapFreezeFunc { return p.logHeapFreeze }
 
 // LogHeapHotUpdate returns the configured HOT-update change-record
 // hook (M0046-0001), or nil if none was wired. Callers fall back to
@@ -470,6 +630,17 @@ func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 // Manager exposes the underlying storage manager so DDL operators can
 // drop or truncate relation files. Pinning still flows through Pool.
 func (p *Pool) Manager() *Manager { return p.mgr }
+
+// SyncAllDataFiles fdatasyncs every open data file. Implements the
+// `dataFileSyncer` interface that internal/wal/checkpointer.go uses
+// after the dirty-page flush, so checkpoint completion is durable
+// against host crash. M0089-0001.
+func (p *Pool) SyncAllDataFiles() error {
+	if p.mgr == nil {
+		return nil
+	}
+	return p.mgr.SyncAll()
+}
 
 // SetPrefetchEnabled toggles Pool.Prefetch's behaviour. When
 // false, Prefetch is a no-op. Idempotent. The wiring layer

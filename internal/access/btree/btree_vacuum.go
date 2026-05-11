@@ -2,6 +2,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -85,11 +86,14 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 
 		if len(kept) < len(items) {
 			resetPageItems(slot.Page())
+			keptRaw := make([][]byte, 0, len(kept))
 			for _, it := range kept {
-				if _, err := storage.PageAddItemRaw(slot.Page(), it.marshal()); err != nil {
+				raw := it.marshal()
+				if _, err := storage.PageAddItemRaw(slot.Page(), raw); err != nil {
 					bt.unpinW(slot)
 					return totalRemoved, err
 				}
+				keptRaw = append(keptRaw, raw)
 			}
 			if len(kept) == 0 {
 				// M0055-0005-followup-two-phase-del: PHASE 1 mark.
@@ -110,7 +114,21 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 					next:     op.Next,
 				})
 			}
-			if err := bt.markDirtyWithPageRecord(slot, cur); err != nil {
+			// M0079-0002: emit a logical btree-vacuum record
+			// carrying the kept-items projection + post-vacuum
+			// opaque flags instead of the prior FPI path. Falls
+			// back to FPI via `markDirtyWithPageRecord` when no
+			// hook is wired (test harnesses without a WAL
+			// writer).
+			if logVac := bt.pool.LogBtreeVacuum(); logVac != nil {
+				flagsAfter := readOpaque(slot.Page()).Flags
+				if err := bt.pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+					return logVac(bt.rel, cur, keptRaw, flagsAfter)
+				}); err != nil {
+					bt.unpinW(slot)
+					return totalRemoved, err
+				}
+			} else if err := bt.markDirtyWithPageRecord(slot, cur); err != nil {
 				bt.unpinW(slot)
 				return totalRemoved, err
 			}
@@ -179,7 +197,265 @@ func (bt *BTree) findLeftmostLeaf() (storage.BlockNumber, error) {
 
 // unlinkEmptyLeaf updates sibling Prev/Next pointers to bypass the empty
 // leaf and removes the leaf's downlink from its parent internal page.
+//
+// M0079-0003: when `Pool.LogBtreeUnlinkPage` is wired, all four
+// page mutations (left sibling Next, right sibling Prev, parent
+// downlink removal, leaf BTHalfDead clear) are covered by a
+// single atomic WAL record carrying their control fields. The
+// record's end LSN is stamped onto each dirtied page's
+// pd_lsn so per-page replay is independently idempotent. Falls
+// back to the per-page FPI path when the hook is unset (test
+// harnesses without a WAL writer).
 func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
+	emitter := bt.pool.LogBtreeUnlinkPage()
+	if emitter == nil {
+		return bt.unlinkEmptyLeafFPI(leaf)
+	}
+
+	// Resolve the parent block + the slot index of leaf's
+	// downlink BEFORE any mutation so the WAL record carries
+	// the control fields.
+	parentBlk, parentSlot, hasParent, err := bt.resolveParentDownlink(leaf)
+	if err != nil {
+		return err
+	}
+
+	// Compute the post-unlink leaf flags: BTDeleted (existing
+	// "this page has been vacuumed empty" signal) plus clear
+	// BTHalfDead (Phase 2 complete after the record applies).
+	leafFlagsAfter, err := bt.readLeafFlagsAfterUnlink(leaf.blk)
+	if err != nil {
+		return err
+	}
+
+	req := storage.BtreeUnlinkPageRequest{
+		LeafBlk:          leaf.blk,
+		LeafFlagsAfter:   leafFlagsAfter,
+		HasLeftSib:       leaf.prev != storage.InvalidBlockNumber,
+		LeftSibBlk:       leaf.prev,
+		LeftSibNewNext:   leaf.next,
+		HasRightSib:      leaf.next != storage.InvalidBlockNumber,
+		RightSibBlk:      leaf.next,
+		RightSibNewPrev:  leaf.prev,
+		HasParent:        hasParent,
+		ParentBlk:        parentBlk,
+		ParentRemoveSlot: parentSlot,
+	}
+	lsn, err := emitter(bt.rel, req)
+	if err != nil {
+		return fmt.Errorf("btree: emit unlink record: %w", err)
+	}
+
+	// Apply each mutation with the unlink record's end LSN as
+	// pd_lsn. MarkDirtyWithLSNLocked skips the per-epoch FPI
+	// path the FPI fallback would use; we rely on the unlink
+	// record itself to reconstruct each page's state during
+	// replay.
+	if req.HasLeftSib {
+		if err := bt.applyOpaqueMutation(req.LeftSibBlk, lsn, func(p storage.Page) {
+			op := readOpaque(p)
+			op.Next = req.LeftSibNewNext
+			writeOpaque(p, op)
+		}); err != nil {
+			return err
+		}
+	}
+	if req.HasRightSib {
+		if err := bt.applyOpaqueMutation(req.RightSibBlk, lsn, func(p storage.Page) {
+			op := readOpaque(p)
+			op.Prev = req.RightSibNewPrev
+			writeOpaque(p, op)
+		}); err != nil {
+			return err
+		}
+	}
+	if req.HasParent {
+		if err := bt.applyParentDownlinkRemoval(req.ParentBlk, req.ParentRemoveSlot, lsn); err != nil {
+			return err
+		}
+	}
+	if err := bt.applyOpaqueMutation(req.LeafBlk, lsn, func(p storage.Page) {
+		op := readOpaque(p)
+		op.Flags = req.LeafFlagsAfter
+		writeOpaque(p, op)
+	}); err != nil {
+		return err
+	}
+
+	// M0055-0005 Phase D: page recycling. The unlinked leaf is
+	// no longer referenced by parent or siblings; its block can
+	// be reused by future allocations on this tree.
+	bt.recycleBlock(leaf.blk)
+	return nil
+}
+
+// resolveParentDownlink finds the parent of `leaf` and the
+// 1-based pageItems-order slot index of its downlink. Returns
+// `hasParent=false` for the single-page-tree case where the
+// leaf is also the root. (M0079-0003.)
+func (bt *BTree) resolveParentDownlink(leaf emptyLeafInfo) (storage.BlockNumber, uint16, bool, error) {
+	if leaf.firstKey == nil {
+		// Leftmost leaf with no keys: walk down from root
+		// finding the internal page that downlinks to leaf.blk.
+		parent, ok, err := bt.findParentDownlinkByBlock(leaf.blk)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		if !ok {
+			// Single-page tree (leaf is the root).
+			return 0, 0, false, nil
+		}
+		slot, err := bt.findDownlinkSlotInParent(parent, leaf.blk)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		return parent, slot, slot != 0, nil
+	}
+	_, path, err := bt.descendToLeaf(leaf.firstKey)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(path) == 0 {
+		return 0, 0, false, nil
+	}
+	parent := path[len(path)-1]
+	slot, err := bt.findDownlinkSlotInParent(parent, leaf.blk)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return parent, slot, slot != 0, nil
+}
+
+// findParentDownlinkByBlock walks the tree from the root and
+// returns the internal page that holds a downlink to childBlk.
+// Used for the leftmost-leaf case where leaf.firstKey is nil.
+// (M0079-0003.)
+func (bt *BTree) findParentDownlinkByBlock(childBlk storage.BlockNumber) (storage.BlockNumber, bool, error) {
+	meta, err := bt.readMeta()
+	if err != nil {
+		return 0, false, err
+	}
+	cur := meta.Root
+	for {
+		slot, err := bt.pinR(cur)
+		if err != nil {
+			return 0, false, err
+		}
+		op := readOpaque(slot.Page())
+		if op.IsLeaf() {
+			bt.unpinR(slot)
+			return 0, false, nil
+		}
+		items, perr := pageItems(slot.Page())
+		bt.unpinR(slot)
+		if perr != nil {
+			return 0, false, perr
+		}
+		for _, it := range items {
+			if it.ptr.Block == childBlk {
+				return cur, true, nil
+			}
+		}
+		if len(items) == 0 {
+			return 0, false, nil
+		}
+		cur = items[0].ptr.Block
+	}
+}
+
+// findDownlinkSlotInParent reads parent's items under a shared
+// latch and returns the 1-based slot index whose ptr.Block ==
+// childBlk. Returns 0 when not found. (M0079-0003.)
+func (bt *BTree) findDownlinkSlotInParent(parentBlk, childBlk storage.BlockNumber) (uint16, error) {
+	slot, err := bt.pinR(parentBlk)
+	if err != nil {
+		return 0, err
+	}
+	defer bt.unpinR(slot)
+	items, err := pageItems(slot.Page())
+	if err != nil {
+		return 0, err
+	}
+	for i, it := range items {
+		if it.ptr.Block == childBlk {
+			return uint16(i + 1), nil
+		}
+	}
+	return 0, nil
+}
+
+// readLeafFlagsAfterUnlink computes the post-unlink Flags value
+// for the deleted leaf: clear BTHalfDead (Phase 2 complete);
+// keep BTDeleted set; preserve everything else. (M0079-0003.)
+func (bt *BTree) readLeafFlagsAfterUnlink(leafBlk storage.BlockNumber) (uint16, error) {
+	slot, err := bt.pinR(leafBlk)
+	if err != nil {
+		return 0, err
+	}
+	op := readOpaque(slot.Page())
+	bt.unpinR(slot)
+	flags := op.Flags
+	flags &^= BTHalfDead
+	flags |= BTDeleted
+	return flags, nil
+}
+
+// applyOpaqueMutation runs `mutate` on the given block under the
+// page's exclusive content latch, then stamps `lsn` as pd_lsn
+// via MarkDirtyWithLSNLocked. (M0079-0003.)
+func (bt *BTree) applyOpaqueMutation(blk storage.BlockNumber, lsn storage.LSN, mutate func(storage.Page)) error {
+	s, err := bt.pinW(blk)
+	if err != nil {
+		return err
+	}
+	mutate(s.Page())
+	bt.pool.MarkDirtyWithLSNLocked(s, lsn)
+	bt.unpinW(s)
+	return nil
+}
+
+// applyParentDownlinkRemoval rewrites the parent's items list
+// excluding the removeSlot entry, mirroring
+// `removeDownlinkFromParent`'s leftmost-key adoption. (M0079-0003.)
+func (bt *BTree) applyParentDownlinkRemoval(parentBlk storage.BlockNumber, removeSlot uint16, lsn storage.LSN) error {
+	s, err := bt.pinW(parentBlk)
+	if err != nil {
+		return err
+	}
+	items, err := pageItems(s.Page())
+	if err != nil {
+		bt.unpinW(s)
+		return err
+	}
+	if removeSlot == 0 || int(removeSlot) > len(items) {
+		// Already removed; idempotent no-op.
+		bt.pool.MarkDirtyWithLSNLocked(s, lsn)
+		bt.unpinW(s)
+		return nil
+	}
+	idx := int(removeSlot) - 1
+	newItems := make([]item, 0, len(items)-1)
+	newItems = append(newItems, items[:idx]...)
+	newItems = append(newItems, items[idx+1:]...)
+	if len(newItems) > 0 && len(newItems[0].key) > 0 {
+		newItems[0] = item{keyLen: 0, ptr: newItems[0].ptr, key: nil}
+	}
+	resetPageItems(s.Page())
+	for _, it := range newItems {
+		if _, err := storage.PageAddItemRaw(s.Page(), it.marshal()); err != nil {
+			bt.unpinW(s)
+			return err
+		}
+	}
+	bt.pool.MarkDirtyWithLSNLocked(s, lsn)
+	bt.unpinW(s)
+	return nil
+}
+
+// unlinkEmptyLeafFPI is the legacy per-page FPI emission path,
+// kept as the fallback when LogBtreeUnlinkPage is unwired
+// (test harnesses). (M0079-0003.)
+func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
 	// Update left sibling's Next.
 	if leaf.prev != storage.InvalidBlockNumber {
 		s, err := bt.pinW(leaf.prev)
@@ -454,6 +730,20 @@ func (bt *BTree) resetToEmptyRoot() error {
 		Level: 0,
 		Flags: BTLeaf | BTRoot,
 	})
+
+	// M0079-0004: emit a single LogBtreeNewRoot record covering
+	// both the empty-leaf-root content (no items) + metapage
+	// update. Falls back to per-page FPI when the hook is unset.
+	if emitter := bt.pool.LogBtreeNewRoot(); emitter != nil {
+		lsn, err := emitter(bt.rel, rootBlk, 0, nil)
+		if err != nil {
+			bt.unpinW(rootSlot)
+			return err
+		}
+		bt.pool.MarkDirtyWithLSNLocked(rootSlot, lsn)
+		bt.unpinW(rootSlot)
+		return bt.updateRootMetaWithLSN(rootBlk, 0, lsn)
+	}
 	if err := bt.markDirtyWithPageRecord(rootSlot, rootBlk); err != nil {
 		bt.unpinW(rootSlot)
 		return err

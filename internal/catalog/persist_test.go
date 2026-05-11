@@ -81,6 +81,43 @@ func TestSnapshotRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSnapshotPreservesSmallDimension pins that planner-only catalog
+// hints survive restart. M0077 Slice A gates pre-MHJ leaf-local
+// filter attachment on Table.SmallDimension (region / nation); if the
+// flag is lost across Snapshot/Restore, live bench servers fall back
+// to the historical 6-table Q5 MHJ even though unit tests still pass.
+func TestSnapshotPreservesSmallDimension(t *testing.T) {
+	src := NewInMemory()
+	tbl, err := src.CreateTable(parser.ObjectName{Name: "region"}, []Column{
+		{Name: "r_regionkey", Type: Type{Name: "int4"}},
+		{Name: "r_name", Type: Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl.SmallDimension = true
+
+	raw, err := json.Marshal(src.Snapshot())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded Snapshot
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	dst := NewInMemory()
+	if err := dst.Restore(decoded); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := dst.LookupTable(parser.ObjectName{Name: "region"})
+	if !ok {
+		t.Fatal("region lost across round-trip")
+	}
+	if !got.SmallDimension {
+		t.Fatal("SmallDimension lost across snapshot/restore")
+	}
+}
+
 // TestRestoreRejectsDanglingIndex: an index whose TableOID doesn't
 // resolve in the snapshot is corruption — we want to fail loudly
 // rather than silently install a broken Index pointer.
@@ -217,6 +254,42 @@ func TestRestoreAcceptsLegacySnapshotWithoutStats(t *testing.T) {
 	}
 	if got.Stats != nil {
 		t.Errorf("Stats=%+v want nil for unanalysed legacy table", got.Stats)
+	}
+}
+
+// TestRestoreLegacySnapshotReappliesSmallDimension pins the migration
+// path for snapshots written before TableEntry.small_dimension
+// existed: restore must still recover the create-time hint for the
+// canonical tiny TPC-H tables so planner gates remain live after
+// restart.
+func TestRestoreLegacySnapshotReappliesSmallDimension(t *testing.T) {
+	legacy := []byte(`{
+        "next_oid": 16385,
+        "tables": [
+            {
+                "oid": 16384,
+                "name": "region",
+                "columns": [
+                    {"name": "r_regionkey", "type": {"name": "int4"}, "ordinal": 0},
+                    {"name": "r_name", "type": {"name": "text"}, "ordinal": 1}
+                ]
+            }
+        ]
+    }`)
+	var snap Snapshot
+	if err := json.Unmarshal(legacy, &snap); err != nil {
+		t.Fatalf("unmarshal legacy snapshot: %v", err)
+	}
+	dst := NewInMemory()
+	if err := dst.Restore(snap); err != nil {
+		t.Fatalf("restore legacy snapshot: %v", err)
+	}
+	got, ok := dst.LookupTable(parser.ObjectName{Name: "region"})
+	if !ok {
+		t.Fatal("region lost from legacy snapshot")
+	}
+	if !got.SmallDimension {
+		t.Fatal("legacy snapshot restore should reapply SmallDimension for region")
 	}
 }
 

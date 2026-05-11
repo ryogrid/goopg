@@ -19,6 +19,10 @@ design doc. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md` §9 for the rules.
 - Cite upstream PostgreSQL with repository-relative paths
   (e.g. `postgres/src/backend/storage/buffer/bufmgr.c`).
 
+## Design Bundles
+
+- [fix-for-q5/README.md](fix-for-q5/README.md) - multi-file planner design set for making TPC-H Q5 choose the expected binary hash-join shape while keeping the rest of the TPC-H plan set stable.
+
 ## Index
 
 | #    | Title                                         | Status   | Summary                                                                     |
