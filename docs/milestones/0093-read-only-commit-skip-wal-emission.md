@@ -246,6 +246,17 @@ leaves the lazy-XID work as a future M0094 if needed.
       row count preserved (10M / 10M). Read-write paths
       still emit WAL XactCommit + fsync; only read-only
       commits skip them.
+- [x] **M0093-0005 — TPC-H Q1-Q22 regression sweep**
+      (2026-05-11): fresh setup with M0093 binary
+      (`setup_goopg.sh --reset` → `build_schema_goopg.sh`
+      SF=1 → HammerDB ANALYZE → `tpch-runner` Q1..Q22).
+      **22/22 OK** within the 600-s per-query budget, zero
+      errors, zero timeouts. Q5 18.63s rows=5 (no
+      regression vs M0077's 26s baseline). Q9 175 rows
+      (matches canonical). Q12/Q13 non-zero
+      (pre-commit-gate parity). Total elapsed ~1,248 s.
+      Full report:
+      `analysis/tpch/m0093-q1-q22-regression-sweep.md`.
 
 ## Risk
 
