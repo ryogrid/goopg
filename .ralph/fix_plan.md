@@ -3109,7 +3109,7 @@ spec).
       follow-up milestone when the abort rate becomes a
       bottleneck for a specific workload.
 
-## M0091 — Select-only TPS regression recovery (planned 2026-05-11)
+## M0091 — Select-only TPS regression recovery (partial 2026-05-11)
 
 **Background:** The 2026-05-11 spot measurement of `pgbench -S
 -c 10 -j 10 -T 180` against goopg at scale 100 yielded
@@ -3142,55 +3142,68 @@ concrete bottlenecks:
 Milestone doc:
 `docs/milestones/0091-select-only-tps-regression-recovery.md`.
 
-### Sub-milestones
+### Sub-milestones — partial completion 2026-05-11
 
-- [ ] **M0091-0001** — `activity.goroutineID` fast-path:
-      replace `runtime.Stack`-based goroutine identification
-      with a connection-level registration pointer cached on
-      the goroutine's `*Context` (or equivalent injection
-      point). Audit every caller of `activity.LookupGoroutine`
-      to confirm an alternative ID source is in scope.
-      Design doc:
+- [x] **M0091-0001 (commit `3bdc1ad`)** —
+      `activity.goroutineID` fast-path: closure-capture
+      `reg + pidStr` in the 4 frame reader/writer hooks in
+      `serveConn` (plus WAL writer + WAL sync hooks).
+      Eliminated `runtime.Stack`-based goroutine ID lookup
+      on every TCP read/write boundary. Client-driven
+      Pool/Manager/AIO hooks are left as-is (smaller share,
+      larger refactor). Design doc:
       `docs/design/0091-0001-activity-tracking-goroutineid-fastpath.md`.
-      Expected gain: 11 % of CPU recovered + reduced GC
-      pressure (no more 64-byte buf + string per lookup).
 
-- [ ] **M0091-0002** — `btree.RangeScan` allocation reduction:
-      rework the per-leaf-page slot copy loop. Two-track design:
-      (a) callers that don't re-enter the btree (most SELECT
-      paths) pass a flag to skip the copy and invoke `fn` with
-      `[]byte` aliasing the still-pinned page; (b) callers that
-      may re-enter use a per-RangeScan arena instead of
-      per-slot `append([]byte(nil), r...)`. Design doc:
+- [x] **M0091-0002 (commit `460809c`)** —
+      `btree.RangeScan` zero-copy: rewritten to parse +
+      invoke `fn` while the pin is held. Added
+      `storage.PageGetItemRawNoCopy` and
+      `btree.parseItemNoCopy` for page-aliasing reads.
+      Audited callers: all 4 production callers
+      (indexScanOp, indexOnlyScanOp, upsertOp.probeArbiter,
+      non-HOT UPDATE index-probe) are CAT-1 — they don't
+      retain `key` and don't re-enter the btree.
+      Benchmark:
+      6,189 ns/op → 2,690 ns/op; 275 allocs/op → 15
+      allocs/op. Design doc:
       `docs/design/0091-0002-btree-rangescan-allocation-reduction.md`.
-      Expected gain: 13 % of allocation rate eliminated, GC
-      pressure drops accordingly.
 
-- [ ] **M0091-0003** — pgbench select-only re-measurement at
-      scale 100, -c 10 -j 10 -T 180. Capture fresh
-      `pprof-data/m0091/post-{0001,0002}/` profiles after each
-      sub-milestone for diff visualisation.
-      **Acceptance:** TPS ≥ 1 000 (minimum), GC CPU share <
-      30 %, `activity.goroutineID` CPU share < 1 %, btree
-      per-query allocation < 5 KB. Stretch: TPS ≥ 3 000
-      (historical -c 1 number).
+- [x] **M0091-0003** — pgbench select-only re-measurement
+      at scale 100, -c 10, -T 180 with the patched binary.
+      Pre-fix: 350.89 TPS / 28.50 ms. Post-fix: **510.52
+      TPS / 19.59 ms** — **1.45× improvement**, 0 failed.
+      Below the ≥ 1 000 TPS acceptance bar; residual
+      bottleneck identified (cloneRow → rowPool.New chain;
+      34 % of allocs from a single inlined helper).
+      Results:
+      `bench/pgbench-compare/results/20260511_125349_goopg_select-only_c10_m0091.txt`
+      + `20260511_goopg_select-only_m0091_summary.md`.
 
-- [ ] **M0091-0004** — *(conditional)* if -0001 + -0002 don't
-      recover throughput to within 3× of the historical
-      baseline, audit per-query Row + Datum allocation in the
-      executor path (`indexScanOp.Open` shows 470 MB / 30 s ≈
-      50 KB per query). Likely tactic: extend the existing
-      M0073 arena lifetime across Rescan invocations / reuse
-      Row buffers via the existing `acquireRow` /
-      `releaseRow` pool. Design doc only when triggered.
+- [x] **M0091-0004** — per-query Row + Datum allocation
+      audit (triggered because -0003 didn't hit 1 000 TPS).
+      Found: `executor.cloneRow → acquireRow →
+      rowPool.Get → New → make(Row, width)` is the
+      load-bearing residual. Cloned Rows are never returned
+      to the pool because consumers retain TupleSlot
+      references past `Close()`. Attempted naïve fix
+      (releaseRow in Close) verified to break
+      `internal/executor/vm_test.go:169`. Structural fix
+      requires a lazy-iterate refactor of indexScanOp +
+      slot-aliasing in projectOp — filed as **M0092**
+      (`docs/milestones/0092-lazy-row-emission-in-scan-and-project.md`).
 
-- [ ] **M0091-0005** — *(defensive)* add a pprof-baseline
-      regression gate. Pin a baseline `cpu.prof` under
-      `pprof-data/baseline/select-only-c10.cpu.prof` so a
-      future regression of this magnitude can be caught
-      pre-merge by a script that compares the GC CPU share
-      between baseline and a fresh capture. Design doc:
-      `docs/design/0091-0003-pprof-baseline-and-regression-gate.md`.
+- [ ] **M0091-0005** — *(defensive, deferred)* pprof-
+      baseline regression gate. Not blocking M0091
+      acceptance; useful when M0092 lands so the
+      regression-free state is pinned for future
+      comparison.
+
+### Deferred follow-up
+
+**M0092** — Lazy row emission in indexScanOp + projectOp.
+Required to close the remaining gap (~510 TPS post-M0091 vs
+the historical ~6 400 TPS baseline).
+`docs/milestones/0092-lazy-row-emission-in-scan-and-project.md`.
 
 ### Note on prior `## pgbench select-only @ -c 10` section
 

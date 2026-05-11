@@ -1,6 +1,13 @@
 # Milestone 0091 — Select-only TPS regression recovery (GC + activity tracking + btree.RangeScan allocations)
 
-**Status:** planned
+**Status:** partial 2026-05-11 — M0091-0001 + M0091-0002 +
+design docs landed; M0091-0003 re-measurement shows 1.45×
+recovery (350.89 → 510.52 TPS). Residual bottleneck identified
+(cloneRow allocations in indexScanOp eager materialisation +
+projectOp.Next); full recovery to ≥ 1,000 TPS requires a
+structural refactor that is out of M0091's "targeted
+allocation fixes" theme — filed as the **deferred follow-up**
+described below.
 **Depends on:** M0026 (concurrent WAL Append) — the historical
 baseline used in this milestone is the post-M0026 measurement
 recorded in `analysis/oltp-performance/wal-bottleneck.md`.
@@ -223,6 +230,66 @@ sub-milestone structure:
 - A regression note in
   `analysis/oltp-performance/wal-bottleneck.md` referencing
   this milestone as the corrective action.
+
+## Outcome (2026-05-11 partial)
+
+### Landed
+
+- **Commit `5c34192`** — 3 design docs
+  (`0091-0001`, `0091-0002`, `0091-0003`).
+- **Commit `3bdc1ad` (M0091-0001)** —
+  closure-capture `reg + pidStr` in the 4 frame
+  reader/writer hooks in `serveConn` + WAL writer + WAL sync
+  hooks. Eliminated `runtime.Stack`-based goroutine ID
+  lookup on every TCP read/write boundary.
+- **Commit `460809c` (M0091-0002)** — rewrote
+  `btree.RangeScan` to invoke `fn` while the pin is held,
+  eliminating the per-slot `[]byte` copy loop. Added
+  `storage.PageGetItemRawNoCopy` and `btree.parseItemNoCopy`
+  for page-aliasing reads. Documented the CAT-1 caller
+  contract above `RangeScan`. New benchmark
+  `BenchmarkRangeScanPointLookup` pins the improvement
+  (6,189 ns/op → 2,690 ns/op; 275 allocs/op → 15 allocs/op).
+- **Commit (this commit) — M0091-0003** — pgbench
+  re-measurement at scale 100, -c 10, -T 180:
+  - **TPS 510.52** (vs 350.89 pre-fix → **1.45×**)
+  - latency avg 19.59 ms (vs 28.50 ms → 1.45×)
+  - 0 failed transactions
+  - Results:
+    `bench/pgbench-compare/results/20260511_125349_goopg_select-only_c10_m0091.txt`
+    + `20260511_goopg_select-only_m0091_summary.md`.
+
+### Deferred follow-up (M0092 candidate)
+
+The M0091-0003 acceptance bar was TPS ≥ 1,000. We landed at
+510.52 (half the bar). Post-fix pprof identifies the new
+dominant bottleneck:
+
+- `executor.cloneRow → acquireRow → rowPool.Get → New →
+  make(Row, width)` fires at TWO sites per query:
+  - `operators_index.go:285` — eager
+    `o.rows = append(o.rows, cloneRow(row))` in
+    `indexScanOp`'s scanFn.
+  - `operators.go:94` — projectOp.Next per emitted row.
+- Cloned Rows are never returned to the pool (consumer
+  retains them past Close — releasing on Close was attempted
+  and verified to BREAK existing tests at
+  `internal/executor/vm_test.go:169` that read row data after
+  Close). The pool is effectively cold; every `acquireRow`
+  hits `New` and allocates fresh.
+
+The structural fix is a **lazy-iterate refactor of
+indexScanOp** (and a slot-aliasing refactor of projectOp.Next).
+That work is sizeable enough to warrant its own milestone —
+the M0091 close-out files it as M0092 (or whatever next-
+available number) with the post-fix pprof as the starting
+point.
+
+The post-fix pgbench result (510.52 TPS) is still a
+substantial improvement on the regression baseline (350.89 TPS,
+17× off the historical M0026 baseline of ~6,400 TPS) but
+remains ~12× below the historical baseline. M0092 is required
+to fully recover.
 
 ## References
 
