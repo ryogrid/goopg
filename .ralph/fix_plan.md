@@ -3109,6 +3109,40 @@ spec).
       follow-up milestone when the abort rate becomes a
       bottleneck for a specific workload.
 
+## pgbench select-only @ -c 10 (post-M0090, 2026-05-11 12:13)
+
+Spot measurement requested by the user: scale=100, `-c 10
+-j 10 -T 180`, select-only workload, same goopg configuration
+as the M0090 verification run (`shared_buffers=2560MB`,
+`wal_buffers=100MB`, etc.). Run against the same scale-100
+data dir from the M0090 verification.
+
+Result file:
+`bench/pgbench-compare/results/20260511_121306_goopg_select-only_c10.txt`.
+
+| metric | value |
+|---|---:|
+| transactions | 63 169 |
+| failed | 0 (0.000 %) |
+| tps | **350.89** |
+| latency avg | 28.50 ms |
+| latency stddev | 11.85 ms |
+| initial connection time | 6.09 ms |
+
+Throughput drifted downward over the 180 s run (10 s sample:
+383.8 TPS → 170 s sample: 313.2 TPS, final 180 s sample:
+356.1 TPS — modest TPS decay observed). 0 failed transactions
+throughout; pkey IndexScan + heap-fetch path is correctness-
+clean under read-only contention.
+
+Cross-reference: the M0090 verification's select-only at the
+same scale but `-c 100 -j 100` yielded 386.50 TPS. At -c 10
+the TPS is lower (350.89) because there are fewer concurrent
+in-flight queries to saturate the CPU; latency per query is
+~28 ms vs ~258 ms at -c 100 (10× less per-query queueing).
+This is the expected concurrency / throughput trade-off
+shape — no anomaly.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
