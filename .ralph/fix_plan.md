@@ -697,7 +697,7 @@ M0097-0001 wires it up.
       dynamic SQL, `RAISE` levels, exception handlers, `RETURNS TABLE`,
       `RETURNS SETOF`, `RETURN NEXT`.
 
-- [ ] **M0097-0013** — Views + materialized views + rules parity.
+- [x] **M0097-0013** — Views + materialized views + rules parity.
       Target tests: `create_view`, `select_views`, `updatable_views`,
       `rules`, `matview`.
       Work: `CREATE OR REPLACE VIEW`, view column aliases, `CHECK

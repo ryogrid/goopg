@@ -98,6 +98,14 @@ type Table struct {
 	// pass has run yet on this table. Mirrors pg_class.relfrozenxid.
 	RelFrozenXID storage.TransactionID
 
+	// IsMatView marks this table as a materialized view. The underlying
+	// SELECT query is stored in View; data is materialized in the heap
+	// (unlike regular views). M0097-0013.
+	IsMatView bool
+	// IsPopulated tracks whether REFRESH MATERIALIZED VIEW has been run
+	// (false for WITH NO DATA, true after first REFRESH). M0097-0013.
+	IsPopulated bool
+
 	// ForeignKeys holds FK constraints declared on this table (inline
 	// REFERENCES or ALTER TABLE ADD FOREIGN KEY). M0096-0011.
 	ForeignKeys []ForeignKey
@@ -657,6 +665,9 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "relpersistence", Type: Type{Name: "text"}, Ordinal: 4},
 			{Name: "reltoastrelid", Type: Type{Name: "text"}, Ordinal: 5},
 			{Name: "relpages", Type: Type{Name: "text"}, Ordinal: 6},
+			// relispopulated: true for tables/views, reflects IsPopulated for matviews.
+			// M0097-0013.
+			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 7},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -677,14 +688,25 @@ func (c *InMemory) registerSystemTables() {
 				// regclass probe shape predictable for pgbench.
 				continue
 			}
+			relkind := "r"
+			if t.View != nil && !t.IsMatView {
+				relkind = "v"
+			} else if t.IsMatView {
+				relkind = "m"
+			}
+			populated := "t"
+			if t.IsMatView && !t.IsPopulated {
+				populated = "f"
+			}
 			out = append(out, []string{
 				t.Name,
 				t.Name,
-				"r",
+				relkind,
 				"2200",    // relnamespace: OID of public namespace (matches pg_namespace.oid)
 				"p",       // relpersistence: permanent
 				"0",       // reltoastrelid: no TOAST table
 				"0",       // relpages: estimated page count (0 = unknown)
+				populated, // relispopulated
 			})
 		}
 		return out

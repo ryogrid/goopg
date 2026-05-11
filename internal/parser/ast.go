@@ -941,6 +941,31 @@ type DropViewStmt struct {
 func (s *DropViewStmt) Pos() int  { return s.pos }
 func (s *DropViewStmt) stmtNode() {}
 
+// CreateMatViewStmt — `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS
+// query [WITH NO DATA]`. M0097-0013.
+type CreateMatViewStmt struct {
+	pos         int
+	Name        ObjectName
+	Query       *SelectStmt
+	WithNoData  bool
+	IfNotExists bool
+}
+
+func (s *CreateMatViewStmt) Pos() int  { return s.pos }
+func (s *CreateMatViewStmt) stmtNode() {}
+
+// RefreshMatViewStmt — `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name
+// [WITH [NO] DATA]`. M0097-0013.
+type RefreshMatViewStmt struct {
+	pos         int
+	Name        ObjectName
+	Concurrently bool
+	WithNoData  bool
+}
+
+func (s *RefreshMatViewStmt) Pos() int  { return s.pos }
+func (s *RefreshMatViewStmt) stmtNode() {}
+
 // DropCompatStmt is a compatibility stub for DROP statements whose object
 // types are not fully implemented in goopg v0 (SEQUENCE, SCHEMA, TYPE,
 // DOMAIN, AGGREGATE, COLLATION, etc.). The executor handles IF EXISTS by

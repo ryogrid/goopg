@@ -227,6 +227,14 @@ func (p *parser) parseStatement() (Stmt, error) {
 		p.advance()
 		return p.parseCallStatement(t.Pos)
 	}
+	// Identifier-led statements. M0097-0013.
+	if t.Kind == TokenIdent {
+		switch strings.ToLower(t.Value) {
+		case "refresh":
+			p.advance()
+			return p.parseRefreshMatView(t.Pos)
+		}
+	}
 	return nil, p.errAtCur("unsupported statement")
 }
 

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -91,6 +93,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateSequence(s)
 	case *parser.AlterSequenceStmt:
 		return nil, nil // ALTER SEQUENCE accepted, no-op executor
+	case *parser.CreateMatViewStmt:
+		return nil, o.execCreateMatView(s)
+	case *parser.RefreshMatViewStmt:
+		return nil, o.execRefreshMatView(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -1776,6 +1782,167 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 
 // execDropCompat handles DROP SEQUENCE, DROP SCHEMA, DROP TYPE, DROP DOMAIN,
 // and other object types not fully implemented in goopg v0. For IF EXISTS,
+// truncateRelation stamps xmax on all visible tuples in the relation,
+// effectively truncating it. Used by REFRESH MATERIALIZED VIEW. M0097-0013.
+func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
+	if ctx.Pool == nil {
+		return nil
+	}
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return nil // empty, nothing to do
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return err
+		}
+		s.Lock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.Unlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			s.Unlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			tuple, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				continue
+			}
+			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
+		}
+		s.Unlock()
+		ctx.Pool.Unpin(s)
+	}
+	return nil
+}
+
+// execCreateMatView implements CREATE MATERIALIZED VIEW. M0097-0013.
+// The matview is stored as a regular table (for heap storage) with
+// IsMatView=true. WITH NO DATA skips the initial population.
+func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
+	if o.ctx.Pool == nil || o.ctx.Catalog == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE MATERIALIZED VIEW requires storage"}
+	}
+	// Plan the SELECT query to determine output columns.
+	if err := analyzer.Analyze(s.Query, o.ctx.Catalog); err != nil {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+	}
+	selectPlan, err := planner.Plan(s.Query, o.ctx.Catalog)
+	if err != nil {
+		return err
+	}
+	schema := selectPlan.Output()
+	if schema == nil {
+		return &ExecError{Code: "42P10", Pos: s.Pos(), Message: "materialized view query has no output columns"}
+	}
+	// Build column list from plan output schema.
+	cols := make([]catalog.Column, len(schema))
+	for i, sc := range schema {
+		cols[i] = catalog.Column{Name: sc.Name, Type: sc.Type, Ordinal: i}
+	}
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	if err != nil {
+		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	tbl.IsMatView = true
+	tbl.IsPopulated = !s.WithNoData
+	// Store the SELECT AST as the view query (for REFRESH).
+	tbl.View = s.Query
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	// Populate immediately unless WITH NO DATA.
+	if !s.WithNoData {
+		if err := o.materializeView(tbl, selectPlan); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// materializeView executes the view's SELECT query and writes results
+// to the materialized view heap. Used by both initial populate and REFRESH.
+func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) error {
+	op, err := Build(selectPlan)
+	if err != nil {
+		return err
+	}
+	if err := op.Open(o.ctx); err != nil {
+		op.Close()
+		return err
+	}
+	defer op.Close()
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		row := slotRow(slot)
+		if werr := writeHeapRow(o.ctx, rel, tbl.Columns, row); werr != nil {
+			return werr
+		}
+	}
+	return nil
+}
+
+// execRefreshMatView implements REFRESH MATERIALIZED VIEW. M0097-0013.
+func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
+	if o.ctx.Pool == nil || o.ctx.Catalog == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "REFRESH MATERIALIZED VIEW requires storage"}
+	}
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("materialized view %q does not exist", s.Name.String())}
+	}
+	if !tbl.IsMatView {
+		return &ExecError{Code: "42809", Pos: s.Pos(), Message: fmt.Sprintf("%q is not a materialized view", s.Name.String())}
+	}
+	// Re-plan the SELECT from the stored query.
+	if err := analyzer.Analyze(tbl.View, o.ctx.Catalog); err != nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("refresh plan error: %v", err)}
+	}
+	selectPlan, err := planner.Plan(tbl.View, o.ctx.Catalog)
+	if err != nil {
+		return err
+	}
+	// Truncate existing data (stamp xmax on all rows).
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	if err := truncateRelation(o.ctx, rel); err != nil {
+		return err
+	}
+	// Re-populate.
+	if err := o.materializeView(tbl, selectPlan); err != nil {
+		return err
+	}
+	tbl.IsPopulated = true
+	return nil
+}
+
 // it emits a NOTICE; otherwise it silently succeeds (no catalog check). M0097-0008.
 func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	if s.IfExists {

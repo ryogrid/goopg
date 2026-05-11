@@ -87,6 +87,10 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// CREATE SEQUENCE [IF NOT EXISTS] name [options…] (M0097-0009)
 	case p.acceptIdentKeyword("sequence"):
 		return p.parseCreateSequenceTail(t.Pos, unlogged)
+	// CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS query [WITH NO DATA] (M0097-0013)
+	case p.acceptIdentKeyword("materialized"):
+		_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
+		return p.parseCreateMatViewTail(t.Pos)
 	// Accept CREATE CONSTRAINT TRIGGER (skip CONSTRAINT keyword then TRIGGER)
 	case p.acceptIdentKeyword("constraint"):
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger {
@@ -252,6 +256,92 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	return stmt, nil
+}
+
+// parseCreateMatViewTail picks up after CREATE MATERIALIZED VIEW.
+// Grammar: `[IF NOT EXISTS] name AS <select> [WITH [NO] DATA]`. M0097-0013.
+func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
+	stmt := &CreateMatViewStmt{pos: pos}
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwNot); err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	// Skip optional USING index_method clause.
+	if p.acceptIdentKeyword("using") {
+		_, _ = p.parseIdent()
+	}
+	// Skip optional WITH (storage_params).
+	if p.acceptKeyword(KwWith) && p.acceptSymbol("(") {
+		depth := 1
+		for depth > 0 && p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				depth++
+			} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				depth--
+			}
+			p.advance()
+		}
+	}
+	// Optional TABLESPACE clause.
+	if p.acceptIdentKeyword("tablespace") {
+		_, _ = p.parseIdent()
+	}
+	if _, err := p.expectKeyword(KwAs); err != nil {
+		return nil, err
+	}
+	inner, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	sel, ok := inner.(*SelectStmt)
+	if !ok {
+		return nil, &SyntaxError{Pos: pos, Message: "materialized view body did not produce SELECT"}
+	}
+	stmt.Query = sel
+	// Optional WITH [NO] DATA clause.
+	if p.acceptKeyword(KwWith) {
+		if p.acceptKeyword(KwNot) {
+			_ = p.acceptIdentKeyword("data")
+			stmt.WithNoData = true
+		} else {
+			_ = p.acceptIdentKeyword("data")
+		}
+	}
+	return stmt, nil
+}
+
+// parseRefreshMatView parses `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name
+// [WITH [NO] DATA]`. Called from parser.go after consuming REFRESH. M0097-0013.
+func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
+	stmt := &RefreshMatViewStmt{pos: pos}
+	_ = p.acceptIdentKeyword("materialized")
+	_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
+	stmt.Concurrently = p.acceptIdentKeyword("concurrently")
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	// Optional WITH [NO] DATA.
+	if p.acceptKeyword(KwWith) {
+		if p.acceptKeyword(KwNot) {
+			_ = p.acceptIdentKeyword("data")
+			stmt.WithNoData = true
+		} else {
+			_ = p.acceptIdentKeyword("data")
+		}
+	}
 	return stmt, nil
 }
 
