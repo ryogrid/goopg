@@ -527,7 +527,7 @@ M0097-0001 wires it up.
       report "defer" on initial run (expected). Infrastructure confirmed
       working: cases discovered, test_setup.sql runs best-effort.
 
-- [ ] **M0097-0002** — Formally reclassify ~102 tests as `excluded` in
+- [x] **M0097-0002** — Formally reclassify ~102 tests as `excluded` in
       `docs/test-port/upstream-regress-coverage.md` and in the suite
       runner's policy table.  Excluded categories:
       • Geometric types: `box`, `circle`, `geometry`, `line`, `lseg`,
