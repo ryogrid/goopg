@@ -349,6 +349,16 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		// M0090-0001: clear FSM + VM entries for the dropped
+		// heap. Same rationale as execTruncate — without this,
+		// a future CREATE TABLE that lands on the same oid would
+		// inherit stale FSM/VM bits from the dropped relation.
+		if o.ctx.FSM != nil {
+			o.ctx.FSM.DropRelation(rel)
+		}
+		if o.ctx.VM != nil {
+			o.ctx.VM.DropRelation(rel)
+		}
 		for _, idxRel := range idxRels {
 			o.ctx.Pool.InvalidateRel(idxRel)
 			if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
@@ -979,12 +989,27 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		// M0090-0001: clear FSM + VM entries for the truncated
+		// heap. Without this, the next INSERT consults the FSM,
+		// gets a stale block number, calls Pin → ReadBlock and
+		// errors with `short read at block` because nblocks=0
+		// post-truncate.
+		if o.ctx.FSM != nil {
+			o.ctx.FSM.DropRelation(rel)
+		}
+		if o.ctx.VM != nil {
+			o.ctx.VM.DropRelation(rel)
+		}
 		for _, idx := range idxs {
 			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 			o.ctx.Pool.InvalidateRel(idxRel)
 			if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
+			// FSM/VM are heap-relation maps; index relfiles
+			// have no entries to clear. (Btrees track their
+			// own free space inline.) Pair the FSM/VM cleanup
+			// only with the heap rel above.
 			if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 			}
