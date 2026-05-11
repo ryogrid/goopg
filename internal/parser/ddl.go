@@ -256,6 +256,85 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
+
+	// CREATE TABLE child PARTITION OF parent FOR VALUES … (M0096-0007)
+	if p.acceptKeyword(KwPartition) {
+		if _, err := p.expectKeyword(KwOf); err != nil {
+			return nil, err
+		}
+		parentName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		poc := &PartitionOfClause{pos: pos, Parent: parentName}
+		// Optional column definition list (for adding columns to partition)
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance()
+			if !p.acceptSymbol(")") {
+				// skip column defs inside partition OF for now
+				depth := 1
+				for depth > 0 && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" { depth++ }
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" { depth-- }
+					if depth > 0 { p.advance() }
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+			}
+		}
+		// FOR VALUES ...
+		if p.acceptKeyword(KwFor) {
+			if _, err := p.expectKeyword(KwValues); err != nil {
+				return nil, err
+			}
+			if p.acceptKeyword(KwDefault) || p.acceptIdentKeyword("default") {
+				poc.Default = true
+			} else if p.acceptKeyword(KwIn) {
+				if !p.acceptSymbol("(") {
+					return nil, p.errAtCur("expected '(' after IN")
+				}
+				vals, err := p.parseExprList()
+				if err != nil {
+					return nil, err
+				}
+				poc.InValues = vals
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+			} else if p.acceptIdentKeyword("from") {
+				if !p.acceptSymbol("(") {
+					return nil, p.errAtCur("expected '(' after FROM")
+				}
+				fromVals, err := p.parsePartitionBoundValues()
+				if err != nil {
+					return nil, err
+				}
+				poc.FromValues = fromVals
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+				if !p.acceptKeyword(KwTo) {
+					return nil, p.errAtCur("expected TO")
+				}
+				if !p.acceptSymbol("(") {
+					return nil, p.errAtCur("expected '('")
+				}
+				toVals, err := p.parsePartitionBoundValues()
+				if err != nil {
+					return nil, err
+				}
+				poc.ToValues = toVals
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+			}
+		}
+		stmt.PartitionOf = poc
+		return stmt, nil
+	}
+
+	// Regular CREATE TABLE with column definitions
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
@@ -295,6 +374,34 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		}
 		break
 	}
+	// Optional PARTITION BY {LIST|RANGE|HASH} (col, …) (M0096-0007)
+	if p.acceptKeyword(KwPartition) {
+		if _, err := p.expectKeyword(KwBy); err != nil {
+			return nil, err
+		}
+		method := ""
+		switch {
+		case p.acceptIdentKeyword("list"):
+			method = "LIST"
+		case p.acceptIdentKeyword("range"):
+			method = "RANGE"
+		case p.acceptIdentKeyword("hash"):
+			method = "HASH"
+		default:
+			return nil, p.errAtCur("expected LIST, RANGE, or HASH after PARTITION BY")
+		}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after partition method")
+		}
+		keyCols, err := p.parseColumnNameList()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols}
+	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
 		if err != nil {
@@ -310,6 +417,29 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		}
 	}
 	return stmt, nil
+}
+
+// parsePartitionBoundValues parses a comma-separated list of partition bound
+// values, which may include MINVALUE/MAXVALUE keywords.
+func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
+	var vals []Expr
+	for {
+		if p.acceptIdentKeyword("minvalue") {
+			vals = append(vals, &StringConst{Value: "MINVALUE"})
+		} else if p.acceptIdentKeyword("maxvalue") {
+			vals = append(vals, &StringConst{Value: "MAXVALUE"})
+		} else {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			vals = append(vals, e)
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return vals, nil
 }
 
 // parseColumnDef parses `name TYPE [NOT NULL | PRIMARY KEY]`.
@@ -496,6 +626,9 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropTableStmt{pos: t.Pos, IfExists: ifExists, Names: names, Behavior: behavior}, nil
 	case KwIndex:
 		p.advance()
+		// DROP INDEX CONCURRENTLY — accept the keyword, treat as synchronous.
+		// True concurrent drop protocol is out of scope for v0 (M0096-0006).
+		_ = p.acceptIdentKeyword("concurrently")
 		ifExists, names, behavior, err := p.parseDropTail()
 		if err != nil {
 			return nil, err
@@ -621,6 +754,79 @@ func (p *parser) parseAlter() (Stmt, error) {
 }
 
 func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
+	// ATTACH PARTITION child FOR VALUES … (M0096-0007)
+	if p.acceptIdentKeyword("attach") {
+		if !p.acceptKeyword(KwPartition) {
+			return AlterTableAction{}, p.errAtCur("expected PARTITION after ATTACH")
+		}
+		childName, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		poc := &PartitionOfClause{pos: childName.pos, Parent: childName}
+		// Accept bare DEFAULT (without FOR VALUES) — PostgreSQL allows both
+		// `FOR VALUES DEFAULT` and just `DEFAULT`.
+		if p.acceptKeyword(KwDefault) {
+			poc.Default = true
+		} else if p.acceptKeyword(KwFor) {
+			if _, err := p.expectKeyword(KwValues); err != nil {
+				return AlterTableAction{}, err
+			}
+			if p.acceptKeyword(KwDefault) || p.acceptIdentKeyword("default") {
+				poc.Default = true
+			} else if p.acceptKeyword(KwIn) {
+				if !p.acceptSymbol("(") {
+					return AlterTableAction{}, p.errAtCur("expected '(' after IN")
+				}
+				vals, err := p.parseExprList()
+				if err != nil {
+					return AlterTableAction{}, err
+				}
+				poc.InValues = vals
+				if !p.acceptSymbol(")") {
+					return AlterTableAction{}, p.errAtCur("expected ')'")
+				}
+			} else if p.acceptIdentKeyword("from") {
+				if !p.acceptSymbol("(") {
+					return AlterTableAction{}, p.errAtCur("expected '('")
+				}
+				fromVals, err := p.parsePartitionBoundValues()
+				if err != nil {
+					return AlterTableAction{}, err
+				}
+				poc.FromValues = fromVals
+				if !p.acceptSymbol(")") {
+					return AlterTableAction{}, p.errAtCur("expected ')'")
+				}
+				if !p.acceptKeyword(KwTo) {
+					return AlterTableAction{}, p.errAtCur("expected TO")
+				}
+				if !p.acceptSymbol("(") {
+					return AlterTableAction{}, p.errAtCur("expected '('")
+				}
+				toVals, err := p.parsePartitionBoundValues()
+				if err != nil {
+					return AlterTableAction{}, err
+				}
+				poc.ToValues = toVals
+				if !p.acceptSymbol(")") {
+					return AlterTableAction{}, p.errAtCur("expected ')'")
+				}
+			}
+		}
+		act := AlterTableAction{pos: poc.pos, Kind: AlterTableAttachPartition, AttachPartitionOf: poc}
+		return act, nil
+	}
+	// DETACH PARTITION child (accept and ignore for v0)
+	if p.acceptIdentKeyword("detach") {
+		_ = p.acceptKeyword(KwPartition)
+		if _, err := p.parseObjectName(); err != nil {
+			return AlterTableAction{}, err
+		}
+		// No-op detach: return an empty ADD action that the executor ignores.
+		act := AlterTableAction{pos: p.cur().Pos, Kind: AlterTableAttachPartition}
+		return act, nil
+	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD")
 	}

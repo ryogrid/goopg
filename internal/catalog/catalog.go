@@ -92,6 +92,31 @@ type Table struct {
 	// autovacuum triggers an anti-wraparound vacuum. Zero means no freeze
 	// pass has run yet on this table. Mirrors pg_class.relfrozenxid.
 	RelFrozenXID storage.TransactionID
+
+	// ── Partition support (M0096-0007) ────────────────────────────────────
+	//
+	// PartitionKey holds the column names when this is a partitioned table
+	// (has a PARTITION BY clause). nil for regular tables.
+	PartitionKey []string
+	// PartitionMethod is "LIST", "RANGE", or "HASH" when PartitionKey != nil.
+	PartitionMethod string
+	// PartitionParentOID is the OID of the parent partitioned table if this
+	// table is a partition child. Zero for root / non-partition tables.
+	PartitionParentOID uint32
+	// PartitionBounds holds the partition range/list bounds as strings for
+	// routing and display. For LIST: InValues strings; for RANGE: one
+	// PartitionBound with From/To strings.
+	PartitionBounds []PartitionBound
+}
+
+// PartitionBound describes the bounds for a single partition child.
+// For LIST partitioning, InValues contains the literal string values.
+// For RANGE partitioning, From and To contain the bound strings ("MINVALUE", "MAXVALUE", or a literal).
+// M0096-0007.
+type PartitionBound struct {
+	InValues []string // LIST: values in this partition
+	From     string   // RANGE: lower bound
+	To       string   // RANGE: upper bound
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -219,6 +244,10 @@ type InMemory struct {
 	// recovered databases succeed after a crash, NOT for
 	// per-database storage isolation (that lands later).
 	databases map[string]bool
+
+	// partitionChildren maps parent table OID → slice of child OIDs
+	// for partitioned-table support (M0096-0007).
+	partitionChildren map[uint32][]uint32
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -253,16 +282,99 @@ const DefaultDBOid uint32 = 1
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:    make(map[string]*Table),
-		indexes:   make(map[string]*Index),
-		byTable:   make(map[uint32]map[string]*Index),
-		nextOID:   FirstUserOID,
-		dbOid:     DefaultDBOid,
-		routines:  NewRoutines(),
-		databases: map[string]bool{"postgres": true},
+		tables:            make(map[string]*Table),
+		indexes:           make(map[string]*Index),
+		byTable:           make(map[uint32]map[string]*Index),
+		nextOID:           FirstUserOID,
+		dbOid:             DefaultDBOid,
+		routines:          NewRoutines(),
+		databases:         map[string]bool{"postgres": true},
+		partitionChildren: make(map[uint32][]uint32),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// PartitionChildren returns the OIDs of partition children for a partitioned table.
+// Returns nil if the table has no partitions registered.  M0096-0007.
+func (c *InMemory) PartitionChildren(parentOID uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	children := c.partitionChildren[parentOID]
+	if len(children) == 0 {
+		return nil
+	}
+	out := make([]*Table, 0, len(children))
+	for _, oid := range children {
+		for _, t := range c.tables {
+			if t.OID == oid {
+				out = append(out, t)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// RegisterPartitionChild registers tbl (OID childOID) as a partition of parentOID.
+// M0096-0007.
+func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	c.partitionChildren[parentOID] = append(c.partitionChildren[parentOID], childOID)
+	c.mu.Unlock()
+}
+
+// FindPartitionForValue finds the partition child that matches a given key value
+// string for a LIST-partitioned table. Returns nil if no partition matches.
+// M0096-0007.
+func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				for _, v := range pb.InValues {
+					if v == keyValue {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// FindRangePartitionForValue finds the RANGE partition child that contains keyValue.
+// M0096-0007.
+func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.From == "" && pb.To == "" {
+					continue
+				}
+				var from, to int64 = -1<<62, 1<<62
+				if pb.From != "" && pb.From != "MINVALUE" {
+					fmt.Sscanf(pb.From, "%d", &from)
+				}
+				if pb.To != "" && pb.To != "MAXVALUE" {
+					fmt.Sscanf(pb.To, "%d", &to)
+				}
+				if keyValue >= from && keyValue < to {
+					return t
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // HasDatabase reports whether the given database name is registered

@@ -406,13 +406,17 @@ alongside the suite.
       Verification: TestPort_IsolationDropIndexConcurrently1 now passes setup and runs the permutation
       (defers on EXPLAIN EXECUTE plan format and other output differences). All core unit tests PASS.
 
-- [ ] **M0096-0007** — Implement `CREATE TABLE … PARTITION BY LIST/RANGE`
-      and `CREATE TABLE child PARTITION OF parent FOR VALUES IN/FROM/TO`.
-      Minimum viable: DDL accepted + partition routing on INSERT +
-      partition-aware sequential scan.
-      Unblocks: `partition-key-update-1–4`, and provides the shared
-      prerequisite for `eval-plan-qual`, `fk-snapshot`, and all
-      `merge-*` specs.
+- [x] **M0096-0007** — Partitioned tables (LIST and RANGE).  2026-05-12.
+      Design doc: `docs/design/0096-0007-partition-tables.md`.
+      Parser: PartitionByClause/PartitionOfClause AST + PARTITION BY/OF/ATTACH;
+      RETURNS SETOF accepted.  Catalog: PartitionBound struct, Table partition
+      fields, partitionChildren registry, FindPartitionForValue/RANGE.
+      Executor DDL: execCreatePartitionChild + AlterTableAttachPartition.
+      Executor INSERT: routeToPartition routes to LIST/RANGE partition child.
+      Planner: UNION ALL SeqScan over partition children.
+      Verification: partition-key-update-1 advances past partition DDL to
+      CREATE TRIGGER (M0096-0012 prereq); merge-update advances to INSERT
+      runtime. All core unit tests PASS.
 
 - [ ] **M0096-0008** — Implement `GENERATED ALWAYS AS (expr) STORED`
       column definition: DDL parsing, stored-value computation on

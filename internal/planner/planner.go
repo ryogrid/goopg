@@ -947,6 +947,34 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
 	}
+	// Partition-aware scan (M0096-0007): when scanning a partitioned table,
+	// produce a union of SeqScans over all partition children.
+	if len(tbl.PartitionKey) > 0 {
+		if im, ok := cat.(*catalog.InMemory); ok {
+			children := im.PartitionChildren(tbl.OID)
+			if len(children) > 0 {
+				// Build a UNION ALL of SeqScans over all children.
+				var root Node
+				for _, child := range children {
+					childSchema := tableSchemaWithSource(b.table, sourceIdx)
+					childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
+					if root == nil {
+						root = childScan
+					} else {
+						root = &SetOp{
+							pos:   rv.Pos(),
+							Left:  root,
+							Right: childScan,
+							All:   true,
+						}
+					}
+				}
+				if root != nil {
+					return root, b, nil
+				}
+			}
+		}
+	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
 

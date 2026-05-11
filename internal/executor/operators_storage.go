@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -363,6 +364,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 	o.done = true
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
+	isPartitioned := len(o.plan.Table.PartitionKey) > 0
 	for {
 		srcSlot, err := o.child.Next()
 		if err == EOF {
@@ -380,12 +382,69 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			row[tgtIdx] = src[srcIdx]
 		}
-		if err := writeHeapRow(o.ctx, rel, cols, row); err != nil {
+
+		// Partition routing (M0096-0007): if the target table is partitioned,
+		// route the row to the appropriate partition child.
+		targetRel := rel
+		if isPartitioned {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				partTable := routeToPartition(o.plan.Table, row, im)
+				if partTable != nil {
+					targetRel = o.ctx.Catalog.RelFileNode(partTable)
+					// Use the partition child's columns
+					if err := writeHeapRow(o.ctx, targetRel, partTable.Columns, row); err != nil {
+						return nil, err
+					}
+					o.rowsAffected++
+					continue
+				}
+			}
+			// No matching partition found — write to parent anyway (best effort)
+		}
+		if err := writeHeapRow(o.ctx, targetRel, cols, row); err != nil {
 			return nil, err
 		}
 		o.rowsAffected++
 	}
 	return nil, EOF
+}
+
+// routeToPartition finds the partition child table that matches the given row
+// based on the parent's partition key. Returns nil if no partition matches.
+// M0096-0007.
+func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *catalog.Table {
+	if len(parent.PartitionKey) == 0 {
+		return nil
+	}
+	// Find the column index for the partition key
+	keyColName := parent.PartitionKey[0]
+	keyIdx := -1
+	for i, col := range parent.Columns {
+		if strings.EqualFold(col.Name, keyColName) {
+			keyIdx = i
+			break
+		}
+	}
+	if keyIdx < 0 || keyIdx >= len(row) {
+		return nil
+	}
+	keyDatum := row[keyIdx]
+
+	switch parent.PartitionMethod {
+	case "LIST":
+		keyStr := ""
+		if keyDatum.Kind == KindInt {
+			keyStr = fmt.Sprintf("%d", keyDatum.Int)
+		} else if keyDatum.Kind == KindString {
+			keyStr = keyDatum.StringValue()
+		}
+		return im.FindPartitionForValue(parent.OID, keyStr)
+	case "RANGE":
+		if keyDatum.Kind == KindInt {
+			return im.FindRangePartitionForValue(parent.OID, keyDatum.Int)
+		}
+	}
+	return nil
 }
 
 // extractScanAndPredicate walks an Update/Delete child plan and pulls

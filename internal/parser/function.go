@@ -42,6 +42,8 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 	if _, err := p.expectKeyword(KwReturns); err != nil {
 		return nil, err
 	}
+	// Accept optional SETOF modifier (set-returning functions). M0096-0007.
+	_ = p.acceptIdentKeyword("setof")
 	retType, err := p.parseColumnType()
 	if err != nil {
 		return nil, err

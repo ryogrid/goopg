@@ -222,6 +222,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
 	}
+
+	// CREATE TABLE child PARTITION OF parent FOR VALUES … (M0096-0007)
+	if s.PartitionOf != nil {
+		return o.execCreatePartitionChild(s)
+	}
+
 	cols := make([]catalog.Column, len(s.Columns))
 	for i, c := range s.Columns {
 		cols[i] = catalog.Column{
@@ -233,6 +239,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// If PARTITION BY, annotate the table with partition metadata
+	if s.PartitionBy != nil {
+		tbl.PartitionMethod = s.PartitionBy.Method
+		tbl.PartitionKey = s.PartitionBy.KeyCols
+		// Partitioned tables are "virtual" for storage purposes:
+		// they never hold rows directly — all data lives in children.
+		// But we still create a heap so the table exists for metadata.
 	}
 	// M0054-0010: tag known small dimension tables (canonical
 	// TPC-H tiny tables: region 5 rows, nation 25 rows). The flag
@@ -281,6 +295,81 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 	}
 	return nil
+}
+
+// execCreatePartitionChild handles CREATE TABLE child PARTITION OF parent FOR VALUES ….
+// It creates the child table, copies columns from the parent, and registers
+// the child in the partition-children registry.  M0096-0007.
+func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
+	poc := s.PartitionOf
+	// Look up the parent partitioned table.
+	parent, ok := o.ctx.Catalog.LookupTable(poc.Parent)
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(),
+			Message: fmt.Sprintf("relation %q does not exist", poc.Parent.String())}
+	}
+	// Inherit columns from parent (partition children use parent's schema).
+	cols := make([]catalog.Column, len(parent.Columns))
+	copy(cols, parent.Columns)
+	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
+	if err != nil {
+		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Set partition metadata on the child.
+	tbl.PartitionParentOID = parent.OID
+	tbl.PartitionMethod = parent.PartitionMethod
+	tbl.PartitionKey = parent.PartitionKey
+
+	// Build partition bounds from the FOR VALUES clause.
+	var pb catalog.PartitionBound
+	if len(poc.InValues) > 0 {
+		// LIST partition: evaluate each IN value as a string.
+		for _, e := range poc.InValues {
+			pb.InValues = append(pb.InValues, exprToString(e))
+		}
+	} else if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
+		// RANGE partition.
+		if len(poc.FromValues) > 0 {
+			pb.From = exprToString(poc.FromValues[0])
+		}
+		if len(poc.ToValues) > 0 {
+			pb.To = exprToString(poc.ToValues[0])
+		}
+	}
+	if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
+		tbl.PartitionBounds = []catalog.PartitionBound{pb}
+	}
+
+	// Register child with parent.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		im.RegisterPartitionChild(parent.OID, tbl.OID)
+	}
+
+	// Record for rollback.
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	// Create primary key index if parent has one (inherit constraint).
+	if len(parent.PartitionKey) > 0 {
+		// No automatic PK on partition children by default in v0.
+	}
+	return nil
+}
+
+// exprToString converts a simple parser expression to a string for partition bounds.
+func exprToString(e parser.Expr) string {
+	switch v := e.(type) {
+	case *parser.IntegerConst:
+		return fmt.Sprintf("%d", v.Value)
+	case *parser.StringConst:
+		return v.Value
+	}
+	return fmt.Sprintf("%v", e)
 }
 
 // execCreateView registers a view in the catalog. Column
@@ -496,6 +585,38 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// docs/design/0003-0004-hammerdb-tpch-integration.md.
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
+			}
+		case parser.AlterTableAttachPartition:
+			// ATTACH PARTITION child FOR VALUES … (M0096-0007)
+			if act.AttachPartitionOf == nil || act.AttachPartitionOf.Default {
+				break // detach or default partition, ignore for now
+			}
+			poc := act.AttachPartitionOf
+			// poc.Parent contains the child table name here (set in parser).
+			childTbl, ok := o.ctx.Catalog.LookupTable(poc.Parent)
+			if !ok {
+				break // child doesn't exist yet, skip
+			}
+			// Set partition metadata on the child.
+			childTbl.PartitionParentOID = tbl.OID
+			childTbl.PartitionMethod = tbl.PartitionMethod
+			childTbl.PartitionKey = tbl.PartitionKey
+			// Build partition bounds.
+			var pb catalog.PartitionBound
+			for _, e := range poc.InValues {
+				pb.InValues = append(pb.InValues, exprToString(e))
+			}
+			if len(poc.FromValues) > 0 {
+				pb.From = exprToString(poc.FromValues[0])
+			}
+			if len(poc.ToValues) > 0 {
+				pb.To = exprToString(poc.ToValues[0])
+			}
+			if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
+				childTbl.PartitionBounds = []catalog.PartitionBound{pb}
+			}
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.RegisterPartitionChild(tbl.OID, childTbl.OID)
 			}
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}

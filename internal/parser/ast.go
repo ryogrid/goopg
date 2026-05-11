@@ -683,10 +683,36 @@ type CreateTableStmt struct {
 	// as a string→string map; the analyzer interprets known options
 	// (fillfactor, autovacuum_*, …) and rejects the rest.
 	With map[string]string
+	// PartitionBy is non-nil when `PARTITION BY {LIST|RANGE|HASH} (col, …)` is present.
+	// M0096-0007.
+	PartitionBy *PartitionByClause
+	// PartitionOf is non-nil for `CREATE TABLE child PARTITION OF parent FOR VALUES …`.
+	// M0096-0007.
+	PartitionOf *PartitionOfClause
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }
 func (s *CreateTableStmt) stmtNode() {}
+
+// PartitionByClause describes a PARTITION BY … clause.  M0096-0007.
+type PartitionByClause struct {
+	pos     int
+	Method  string   // "LIST", "RANGE", or "HASH"
+	KeyCols []string // partition key column names
+}
+
+// PartitionOfClause describes a PARTITION OF parent FOR VALUES … clause.
+// Only one of InValues, FromValues+ToValues is populated.  M0096-0007.
+type PartitionOfClause struct {
+	pos      int
+	Parent   ObjectName
+	// LIST partitioning: FOR VALUES IN (v1, v2, …)
+	InValues []Expr
+	// RANGE partitioning: FOR VALUES FROM (lo) TO (hi)
+	FromValues []Expr
+	ToValues   []Expr
+	Default    bool // FOR VALUES DEFAULT
+}
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
 //
@@ -839,6 +865,9 @@ const (
 	// the constraint subsystem lands. See
 	// docs/design/0003-0004-hammerdb-tpch-integration.md.
 	AlterTableAddForeignKey
+	// AlterTableAttachPartition — `ATTACH PARTITION child FOR VALUES …`.
+	// Registers an existing table as a partition of the parent. M0096-0007.
+	AlterTableAttachPartition
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -857,6 +886,10 @@ type AlterTableAction struct {
 	RefTable   ObjectName
 	RefColumns []string
 	Deferrable bool // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
+
+	// AttachPartitionOf is populated for AlterTableAttachPartition.
+	// It holds the child table name and partition bounds. M0096-0007.
+	AttachPartitionOf *PartitionOfClause
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
