@@ -123,7 +123,92 @@ bar). Stretch: ≥ 3 000 (historical -c 1 baseline).
 
 ## Tasks
 
-Tasks will be detailed when this milestone is picked up.
+### Initial sub-milestones (landed 2026-05-11 — see Outcome below)
+
+- M0092-0001 (`8f32c07`) — indexScanOp lazy iteration
+- M0092-0002 (`dc52f60`) — projectOp slot aliasing +
+  Materialize always deep-copies
+- Prerequisite (`5211387`) — NLI currentOuter deep-copy
+- M0092-0003 — pgbench re-measurement (510→437 regressed
+  honestly documented in
+  `bench/pgbench-compare/results/20260511_goopg_select-only_m0092_summary.md`)
+
+### Continuation — broadly-distributed allocation reduction
+
+Filed 2026-05-11 after the M0092 close-out audit showed
+that per-query allocations are now spread across many
+small sites rather than one dominant cloneRow path. The
+M0091 ≥ 1,000 TPS bar remains unmet (post-M0092: 437.62
+TPS); these sub-milestones target the residual.
+
+- **M0092-0004** — Protocol-layer DataRow allocation
+  reduction. Hoist `cells := make([][]byte, ncols)` from
+  the per-row loop, pool the WriteDataRow payload buffer,
+  add `Datum.AppendValueText(dst)` for zero-string-alloc
+  int formatting. ~87 B / row eliminated.
+  Design:
+  `docs/design/0092-0004-protocol-datarow-allocation-reduction.md`.
+- **M0092-0005** — Gate the 14 client-driven
+  `LookupGoroutine` sites in `internal/initdb/open.go`
+  (Pool.OnPinWait/Done, Manager.OnReadWait/Done,
+  AIO.OnWaitStart/End, etc.) behind a
+  `track_io_timing` GUC (default off, matching PG).
+  When off, hooks are nil → zero `runtime.Stack`
+  overhead on the hot path. Design:
+  `docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md`.
+- **M0092-0006** — `ParseHeapTuple` aliasing. Add
+  `PageGetHeapTupleNoCopy` that returns a HeapTuple
+  whose Data field aliases the page; re-order
+  indexScanOp.Next to hold RLock across DecodeRowInto
+  so the alias is valid. ~tuple-size bytes /
+  query eliminated. Design:
+  `docs/design/0092-0006-parseheaptuple-nocopy-aliasing.md`.
+- **M0092-0007** — SlotFromRow stack-aliasing. Each
+  leaf op embeds a `slot MaterializedSlot` field;
+  Next() returns `&o.slot` instead of allocating a
+  fresh one. 32 B / Next eliminated. Design:
+  `docs/design/0092-0007-slotfromrow-stack-aliasing.md`.
+- **M0092-0008** *(DEFERRED — no code change)* — Plan
+  cache for repeated SQL. Per Explore-agent analysis,
+  pgbench's simple-query path client-side-substitutes
+  literals → 0 % cache hit on byte-for-byte SQL key;
+  literal normalization is multi-week work and risks
+  subtle bugs. Filed as a future-milestone candidate
+  when extended-protocol prepared statements are
+  implemented. Design:
+  `docs/design/0092-0008-plan-cache-feasibility.md`.
+- **M0092-0009** — pgbench re-measurement after
+  M0092-0004/0005/0006/0007 land. Target: TPS ≥ 700
+  (honest 1.6× of post-M0092 baseline 437.62; stretch
+  goal: ≥ 1,000 = M0091's bar).
+
+### Why these targets specifically
+
+Post-M0092 alloc profile shows the residual is the sum
+of ~6 small per-query allocations (cells, format string,
+[]byte conversion, payload buffer, SlotFromRow, tuple
+data copy). Each is small; together they keep GC at
+80 % of CPU. The 4 active sub-milestones address 5 of
+these sites; the plan-cache deferral matches the
+pgbench-c10 workload's literal-baking pattern that
+defeats simple-keying.
+
+### Test of GOGC=off / GOMEMLIMIT (negative result)
+
+A quick experiment was run on 2026-05-11 with goopg
+launched as `GOGC=off GOMEMLIMIT=12GiB bin/goopg start
+...` (the TPC-H benchmark's env settings from
+`bench/tpch/env_goopg.sh`). Result: pgbench select-only
+-c 10 -T 180 yielded **407.72 TPS** — slightly LOWER
+than the default-GOGC baseline of 437.62 TPS. The TPC-H
+env settings don't carry over to pgbench-c10; the per-
+query allocation rate is small enough that the heap
+never approaches GOMEMLIMIT and disabling GC just lets
+the heap grow without benefit. The TPC-H comment's
+"65 % of CPU in gcBgMarkWorker" finding applies to
+multi-GB MHJ build phases, not to ~MB-scale OLTP
+workloads. This experiment is documented here so it
+isn't redone.
 
 ## Outcome (2026-05-11)
 
