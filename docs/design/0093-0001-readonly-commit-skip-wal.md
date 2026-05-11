@@ -1,7 +1,65 @@
 # Design 0093-0001 — Skip WAL commit-record emission for read-only transactions
 
-**Status:** draft (filed 2026-05-11).
+**Status:** accepted (filed 2026-05-11; Design B chosen + implemented 2026-05-11).
 **Milestone:** [M0093](../milestones/0093-read-only-commit-skip-wal-emission.md).
+
+## Decision: Design B (lazy XID assignment, PostgreSQL-parity)
+
+After review, the user chose **Design B** over Design A. The
+"flag on transaction state" approach (A) was the simpler
+mechanical change, but Design B matches PostgreSQL's semantics
+exactly and avoids the audit-completeness risk of "did every
+WAL-Append site call NoteWrote?" — under B, the absence of an
+XID at finish() time IS the signal that no write happened, by
+construction.
+
+Implementation shape (landed in commits c00caa5 / 0a17eed /
+54f53d4 / e383a61 / 40a1da0):
+
+- New `mvcc.TxnHandle uint64`. Re-keys `m.active` from
+  `map[TxnID]` to `map[TxnHandle]`.
+- `Transaction` carries both Handle and XID. `Begin` returns
+  Handle != 0, XID == InvalidTransactionID.
+- New `mvcc.Manager.AssignXID(tx) (TxnID, error)` — idempotent
+  lazy materialisation under existing wrap-around guards.
+- `executor.(*Context).MaterializeWriterXID()` — the
+  executor-side helper that write-path operators call before
+  any xmin/xmax stamp. Updates `ctx.Tx.XID` in place and
+  syncs the cached `BasicSession.tx.XID` via
+  `OnTopLevelXIDAssigned`.
+- `Manager.finish` invokes the `xactMarker` hook ONLY when
+  `state.xid != InvalidTransactionID`. Read-only commits emit
+  zero WAL bytes + zero fsync + zero clog write.
+- Snapshot construction filters `m.active` values for
+  materialised XIDs; read-only txns contribute nothing to
+  InProgress.
+- VACUUM correctness preserved by a new per-state
+  `snapshotXmin` field that pins OldestXmin for long-running
+  read-only REPEATABLE READ transactions (without this, a
+  read-only RR snapshot would stop pinning the horizon and
+  VACUUM could prematurely reclaim tuples it still needs —
+  the M0093 R-B6 risk).
+
+Write-site call sites materialising the XID (Commits 3, 4):
+
+- `executor.writeHeapRowReturning` — covers INSERT, UPDATE-
+  fallback insert, UPSERT insert, COPY FROM, and the TOAST
+  chunk-table writes called recursively from
+  `ToastLargeColumnsIfNeeded`.
+- `executor.tryApplyHOTUpdate` (top of function) — before the
+  encode → NewHeapTuple → page-Lock → isConcurrentlyUpdated
+  sequence (R-B1 invariant).
+- `executor.updateOp.Next` / `executor.deleteOp.Next` (top of
+  function) — UPDATE / DELETE are unconditionally writes; the
+  scan phase needs a real XID for the foreignLockOnly checks.
+- `executor.lockRowsOp.stampLock` — SELECT FOR UPDATE / SHARE.
+
+The previous "Recommendation: Design A" subsection below
+documented the alternative; the rest of the doc describes the
+Design B implementation (the A description is preserved for
+historical context).
+
+## Original problem statement
 
 ## Problem
 
@@ -117,12 +175,12 @@ InvalidXid` and skips everything when so.
   path must allocate atomically before any tuple stamp
   to preserve that invariant.
 
-### Recommendation: Design A
+### Original recommendation (superseded): Design A
 
-Smaller blast radius, achieves the same pgbench-S TPS
-outcome (zero commit-record WAL for read-only), and leaves
-Design B as a future optimisation if XID-counter pressure
-ever surfaces as a separate issue.
+The initial recommendation was Design A for smaller blast
+radius. The user chose Design B for PG-parity semantics; see
+the "Decision: Design B" section at the top of this doc for
+the implementation actually landed.
 
 ## Implementation plan (Design A)
 

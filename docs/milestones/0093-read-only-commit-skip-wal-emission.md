@@ -1,6 +1,8 @@
 # Milestone 0093 — Skip WAL emission for read-only commits (PG-parity)
 
-**Status:** planned (filed 2026-05-11).
+**Status:** in-progress (filed 2026-05-11; implementation
+landed 2026-05-11 via Design B — lazy XID assignment, PG
+parity. -0001/-0002 done; -0003/-0004 pending re-measurement).
 **Depends on:** M0091 (TPS regression recovery), M0092
 (broadly-distributed allocation cuts) — M0093 attacks the
 bottleneck that M0092's measurement uncovered.
@@ -203,25 +205,34 @@ leaves the lazy-XID work as a future M0094 if needed.
 
 ## Tasks
 
-- **M0093-0001** — Design doc 0093-0001: design A vs B
-  trade-offs, chosen approach, every WAL-Append site
-  audited, test plan (read-only commit emits NO WAL,
-  read-write commit unchanged, mixed-statement
-  transaction emits commit when ANY statement writes).
-- **M0093-0002** — Implementation: add `wroteWAL` (or
-  equivalent) tracking on the transaction state; wire
-  every WAL-Append from a transactional context to flip
-  it; gate `Manager.finish`'s xactMarker hook on it. Unit
-  tests for the four cases above.
-- **M0093-0003** — Re-measurement: pgbench select-only
-  `-c 10 -j 10 -T 180` post-fix. Capture pprof. Compare
-  to today's 282-342 TPS range. Target: **TPS ≥ 1,000**
-  (M0091's bar). Acceptance: TPS at least 3× of the
-  re-measured baseline (317 TPS) AND zero failed
-  transactions AND no replication-test regression.
-- **M0093-0004** — pgbench standard / simple-update
-  re-measurement to confirm read-write paths still emit
-  commits correctly. No regression vs M0092 baseline.
+- [x] **M0093-0001** — Design doc 0093-0001 (Design A vs B,
+      chosen approach). Decision: **Design B (lazy XID
+      assignment, PG-parity)**. Design doc updated to mark
+      Design B chosen and status accepted (2026-05-11,
+      commit pending).
+- [x] **M0093-0002** — Implementation. Landed via 5 commits
+      on 2026-05-11:
+      - `c00caa5` — mvcc TxnHandle + lazy AssignXID +
+        OldestXmin snapshotXmin fix (R-B6).
+      - `0a17eed` — executor.Context.MaterializeWriterXID
+        helper + BasicSession.OnTopLevelXIDAssigned.
+      - `54f53d4` — wire MaterializeWriterXID at INSERT /
+        TOAST (writeHeapRowReturning).
+      - `e383a61` — wire at UPDATE / HOT / DELETE /
+        LockRows (R-B1: before isConcurrentlyUpdated).
+      - `40a1da0` — test fixups for sites that AssignXID
+        was eagerly assumed.
+      Full unit + testport suite passes (only the pre-
+      existing replcluster failure remains, unrelated).
+- [ ] **M0093-0003** — Re-measurement: pgbench select-only
+      `-c 10 -j 10 -T 180` post-fix. Capture pprof. Compare
+      to today's 282-342 TPS range. Target: **TPS ≥ 1,000**
+      (M0091's bar). Acceptance: TPS at least 3× of the
+      re-measured baseline (317 TPS) AND zero failed
+      transactions AND no replication-test regression.
+- [ ] **M0093-0004** — pgbench standard / simple-update
+      re-measurement to confirm read-write paths still emit
+      commits correctly. No regression vs M0092 baseline.
 
 ## Risk
 
