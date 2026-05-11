@@ -1,0 +1,24 @@
+pgbench (18.3)
+starting vacuum...end.
+pgbench: error: client 8 command 4: no results
+pgbench: error: client 6 command 4: no results
+progress: 10.0 s, 59.6 tps, lat 139.298 ms stddev 38.547, 2 failed
+progress: 20.0 s, 57.4 tps, lat 139.709 ms stddev 33.732, 0 failed
+progress: 30.0 s, 56.9 tps, lat 140.743 ms stddev 31.828, 0 failed
+progress: 40.0 s, 61.4 tps, lat 130.288 ms stddev 36.712, 0 failed
+progress: 50.0 s, 58.7 tps, lat 136.120 ms stddev 35.702, 0 failed
+progress: 60.0 s, 56.3 tps, lat 142.329 ms stddev 37.191, 0 failed
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: simple
+number of clients: 10
+number of threads: 10
+maximum number of tries: 1
+duration: 60 s
+number of transactions actually processed: 3511
+number of failed transactions: 2 (0.057%)
+latency average = 137.947 ms
+latency stddev = 35.918 ms
+initial connection time = 1.646 ms
+tps = 58.427233 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

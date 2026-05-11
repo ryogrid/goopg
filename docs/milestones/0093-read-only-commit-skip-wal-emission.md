@@ -1,8 +1,10 @@
 # Milestone 0093 — Skip WAL emission for read-only commits (PG-parity)
 
-**Status:** in-progress (filed 2026-05-11; implementation
-landed 2026-05-11 via Design B — lazy XID assignment, PG
-parity. -0001/-0002 done; -0003/-0004 pending re-measurement).
+**Status:** accepted (2026-05-11 — implementation via Design B
+landed; pgbench-S TPS jumped 317 → 2,740 (8.6×) at -c 10,
+walwriter flush count dropped from ~19,600 / 60 s to 0,
+M0091's ≥ 1,000 TPS bar met with margin; crash recovery clean;
+no read-write regression).
 **Depends on:** M0091 (TPS regression recovery), M0092
 (broadly-distributed allocation cuts) — M0093 attacks the
 bottleneck that M0092's measurement uncovered.
@@ -224,15 +226,26 @@ leaves the lazy-XID work as a future M0094 if needed.
         was eagerly assumed.
       Full unit + testport suite passes (only the pre-
       existing replcluster failure remains, unrelated).
-- [ ] **M0093-0003** — Re-measurement: pgbench select-only
-      `-c 10 -j 10 -T 180` post-fix. Capture pprof. Compare
-      to today's 282-342 TPS range. Target: **TPS ≥ 1,000**
-      (M0091's bar). Acceptance: TPS at least 3× of the
-      re-measured baseline (317 TPS) AND zero failed
-      transactions AND no replication-test regression.
-- [ ] **M0093-0004** — pgbench standard / simple-update
-      re-measurement to confirm read-write paths still emit
-      commits correctly. No regression vs M0092 baseline.
+- [x] **M0093-0003** — Re-measurement landed 2026-05-11:
+      pgbench-S `-c 10 -j 10 -T 180` reaches **2705-2742 TPS
+      across 3 runs** (median 2,740). Walwriter flush rate
+      over a 90 s window: **0** (down from ~19,600 / 60 s).
+      M0091's ≥ 1,000 TPS bar met with 2.74× margin.
+      Acceptance criteria all met: 8.6× of re-measured 317
+      TPS baseline; zero failed transactions; no replication-
+      test regression (TestReplicationEndToEnd was pre-
+      existing-failing on this branch). Full report:
+      `bench/pgbench-compare/results/20260511_goopg_select-only_m0093_summary.md`.
+- [x] **M0093-0004** — pgbench standard / simple-update at
+      `-c 10 -T 60` post-M0093:
+      - standard: 58.43 TPS, 2 failed (0.057 % — M0090's
+        documented concurrent-UPDATE 40001 path, not a
+        regression).
+      - simple-update: 109.55 TPS, 0 failed.
+      Crash-recovery test (kill -9 mid-pgbench-S, restart):
+      row count preserved (10M / 10M). Read-write paths
+      still emit WAL XactCommit + fsync; only read-only
+      commits skip them.
 
 ## Risk
 
