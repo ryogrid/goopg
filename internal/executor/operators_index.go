@@ -65,14 +65,23 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 type indexScanOp struct {
 	plan *planner.IndexScan
 	ctx  *Context
-	rows []Row
-	// tids parallels rows: tids[i] is the heap (block, slot) the
-	// i-th matched row was decoded from. Captured during the
-	// btree.RangeScan callback so SELECT FOR UPDATE / FOR SHARE
-	// (M0021 step 2c) can stamp per-row lock-only xmax via
-	// lockRowsOp.currentTID after Next emits the row.
-	tids []storage.ItemPointer
-	idx  int
+	// M0092-0001: TID-list-eager + heap-fetch-lazy.
+	// `tids[i]` holds the (block, index-pointed offset) pair for the
+	// i-th match emitted by btree.RangeScan. The HOT-resolved actual
+	// slot offset is computed PER Next() and recorded in lastTID for
+	// currentTID() — the lockRowsOp consumer.
+	//
+	// Pre-M0092 the operator also kept `rows []Row` (fully materialised
+	// matches via cloneRow per scanFn invocation), which dominated 34 %
+	// of allocations in the post-M0091 pgbench select-only profile.
+	// The new lazy model decodes one row per Next() into the reusable
+	// `scanRow` and returns a slot ALIASING it — caller must consume /
+	// Materialize before the next Next() call (standard
+	// MaterializedSlot contract).
+	tids    []storage.ItemPointer
+	idx     int
+	lastTID storage.ItemPointer
+	hasLast bool
 
 	// M0054-0006a: state captured at Open() time and reused across
 	// Rescan() calls when the index probe is driven by an outer row
@@ -91,19 +100,11 @@ type indexScanOp struct {
 	outerSlot  SlotView
 	outerWidth int
 
-	// M0072-0001: scanRow is the per-tuple decode buffer. DecodeRow
-	// previously allocated a fresh Row per matched tuple; reusing
-	// scanRow + cloneRow on append matches seqScanOp's M0054-0005a
-	// pattern and removes the per-tuple alloc from the hot path.
+	// scanRow is the per-Next decode buffer; reused across every
+	// Next() call. The slot returned by Next() aliases this buffer.
+	// Acquired in openPrep from the rowPool (M0068-0004), released
+	// in Close.
 	scanRow Row
-
-	// arena is the per-Rescan byte allocator for varchar / char /
-	// text / bytea payload (M0073-0004). Reset at the top of every
-	// Rescan, freeing the previous outer's match-set bytes; consumers
-	// that retain rows past the boundary call slot.Materialize() to
-	// deep-copy. Open's standalone path (Rescan(nil, 0)) also uses
-	// this; the arena is owned for the operator's lifetime.
-	arena *Arena
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -134,12 +135,11 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "IndexScan requires storage handles in Context"}
 	}
 	o.ctx = ctx
-	o.rows = nil
 	o.tids = nil
 	o.idx = 0
+	o.hasLast = false
 	o.outerSlot = nil
 	o.outerWidth = 0
-	o.arena = NewArena(0)
 
 	o.heapRel = ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(o.heapRel, lockmgr.AccessShareLock); err != nil {
@@ -173,18 +173,11 @@ func (o *indexScanOp) BindOuter(slot SlotView, outerWidth int) {
 // Rescan(nil, 0); the M0054-0006 NLI path calls Open once then Rescan
 // per outer row.
 func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
-	o.rows = o.rows[:0]
 	o.tids = o.tids[:0]
 	o.idx = 0
+	o.hasLast = false
 	o.outerSlot = outerSlot
 	o.outerWidth = outerWidth
-	// M0073-0004: rewind per-Rescan byte arena. The previous
-	// outer's match-set arena bytes are freed; consumers that
-	// retained rows past this boundary already deep-copied via
-	// slot.Materialize().
-	if o.arena != nil {
-		o.arena.Reset()
-	}
 
 	if o.tree == nil {
 		// Defensive: openPrep must have been called.
@@ -244,48 +237,11 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		}
 	}
 
-	ctx := o.ctx
-	heapRel := o.heapRel
+	// M0092-0001: lazy iteration. The scanFn collects only TIDs;
+	// HOT-chain follow + decode + detoast happen per Next() so the
+	// produced row aliases scanRow (no cloneRow per match).
 	scanFn := func(_ []byte, ptr storage.ItemPointer) (bool, error) {
-		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
-		if err != nil {
-			return false, err
-		}
-		slot.RLock()
-		// Follow the HOT chain: the index still points to the original
-		// tuple location even after HOT updates. followHOTChain walks
-		// CTID links (same page) until it finds the live version.
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
-		slot.RUnlock()
-		ctx.Pool.Unpin(slot)
-		if !found {
-			return true, nil
-		}
-		// M0072-0001: decode into the reusable o.scanRow buffer
-		// (mirrors seqScanOp's M0054-0005a pattern). cloneRow on
-		// append below preserves retention semantics — o.rows[]
-		// keeps independent rows even though scanRow is reused.
-		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
-			o.scanRow = acquireRow(len(o.plan.Table.Columns))
-		}
-		if err := DecodeRowIntoArena(o.scanRow, o.plan.Table.Columns, tuple.Data, o.arena); err != nil {
-			return false, err
-		}
-		row := o.scanRow
-		// Detoast any out-of-line column values (M0046-0006).
-		// DetoastRow may return a fresh row; either way clone-on-
-		// append below handles ownership.
-		if needsDetoast(row) {
-			detoasted, err := DetoastRow(ctx, heapRel, o.plan.Table.Columns, row)
-			if err != nil {
-				return true, nil // skip undetoastable tuple
-			}
-			row = detoasted
-		}
-		o.rows = append(o.rows, cloneRow(row))
-		// Record the actual live slot (not the index-pointed slot) so
-		// lockRowsOp stamps the current version for SELECT FOR UPDATE.
-		o.tids = append(o.tids, storage.ItemPointer{Block: ptr.Block, Offset: actualSlot})
+		o.tids = append(o.tids, ptr)
 		return true, nil
 	}
 
@@ -296,24 +252,60 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 }
 
 func (o *indexScanOp) Next() (TupleSlot, error) {
-	if o.idx >= len(o.rows) {
-		return nil, EOF
+	// M0092-0001: lazy iteration. Pin heap, follow HOT, decode into
+	// the reusable scanRow, return slot aliasing it. Caller must
+	// consume / Materialize before the next Next() call.
+	// Loop instead of recursion to bound stack growth on workloads
+	// that skip many invisible tuples (vacuum-pending dead rows).
+	for {
+		if o.idx >= len(o.tids) {
+			o.hasLast = false
+			return nil, EOF
+		}
+		ptr := o.tids[o.idx]
+		o.idx++
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: o.heapRel, Block: ptr.Block})
+		if err != nil {
+			return nil, err
+		}
+		slot.RLock()
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+		slot.RUnlock()
+		o.ctx.Pool.Unpin(slot)
+		if !found {
+			// Tuple invisible (deleted / not yet committed at snap);
+			// skip this TID and try the next.
+			continue
+		}
+		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
+			o.scanRow = acquireRow(len(o.plan.Table.Columns))
+		}
+		if err := DecodeRowInto(o.scanRow, o.plan.Table.Columns, tuple.Data); err != nil {
+			return nil, err
+		}
+		row := o.scanRow
+		if needsDetoast(row) {
+			detoasted, err := DetoastRow(o.ctx, o.heapRel, o.plan.Table.Columns, row)
+			if err != nil {
+				// Skip undetoastable tuple, try the next TID.
+				continue
+			}
+			row = detoasted
+		}
+		// Record the actual (HOT-resolved) live slot for
+		// currentTID() — lockRowsOp stamps the live version.
+		o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
+		o.hasLast = true
+		return asSlot(o.Schema(), row), nil
 	}
-	r := o.rows[o.idx]
-	o.idx++
-	return asSlot(o.Schema(), r), nil
 }
 
 func (o *indexScanOp) Close() error {
-	o.rows = nil
 	o.tids = nil
+	o.hasLast = false
 	if o.scanRow != nil {
 		releaseRow(o.scanRow)
 		o.scanRow = nil
-	}
-	if o.arena != nil {
-		o.arena.Drop()
-		o.arena = nil
 	}
 	return nil
 }
@@ -322,14 +314,18 @@ func (o *indexScanOp) Close() error {
 // emitted row, or ok=false before the first Next() call / past
 // EOF. Mirrors seqScanOp.currentTID for the index-scan path so
 // lockRowsOp can stamp per-row lock-only xmax (M0021 step 2c).
-// idx points one past the last-returned row (Next increments
-// post-fetch), so the just-returned row's TID is at idx-1.
+//
+// M0092-0001: returns the HOT-resolved actual slot (lastTID),
+// recorded by Next() during the HOT-chain follow. Before M0092
+// the operator pre-collected `tids[]` of HOT-resolved offsets
+// during scanFn; the lazy refactor moves HOT-follow to Next()
+// and stashes the result in lastTID.
 func (o *indexScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
-	if o.idx == 0 || o.idx > len(o.tids) {
+	if !o.hasLast {
 		return storage.RelFileNode{}, storage.ItemPointer{}, false
 	}
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
-	return rel, o.tids[o.idx-1], true
+	return rel, o.lastTID, true
 }
 
 // lookupKeys evaluates each `Keys[i]` against the bound outer row
