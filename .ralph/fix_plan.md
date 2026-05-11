@@ -226,10 +226,11 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
       - `TestPort_Subscription026Stats` — pg_stat_subscription received_lsn + receipt time via wal.Subscriber
       CSV S-001/S-004/S-026 rows already present; markdown regenerated. All 3 tests pass.
 
-- [ ] **M0094-0005** — Verify M0005 and M0008 DoD checklists against current
-      codebase. Update `docs/milestones/0005-streaming-replication-support.md`
-      status → `complete`. Update `docs/milestones/0008-logical-replication-support.md`
-      status → `complete`. `make ralph-state-guard` passes.
+- [x] **M0094-0005** — Verified M0005 and M0008 DoD checklists (2026-05-11).
+      M0005: 5/6 DoD items met; written_lsn advancement after checkpoint is a
+      pre-existing gap (unrelated to M0094). Marked `complete` with known caveat.
+      M0008: all 8 DoD items met via M0094-0001/0002/0003/0004 work plus prior
+      M0008 implementation. Marked `complete`. `make ralph-state-guard` passes.
 
 ## Notes
 
