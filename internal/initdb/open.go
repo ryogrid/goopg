@@ -233,9 +233,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		OnLoopEnd: func() {
 			activity.ClearCurrentGoroutine()
 		},
+		// M0091-0001: OnWALWrite always runs on the WAL writer
+		// goroutine, so we can closure-capture `act` and the
+		// literal PID. No runtime.Stack on the hot path.
 		OnWALWrite: func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitWALWrite)
+			if act != nil {
+				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALWrite)
 			}
 		},
 	}
@@ -885,15 +888,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Wire WAL I/O wait-event hooks.
+	// M0091-0001: WAL sync runs on the WAL writer goroutine; use
+	// the captured `act` + literal PID instead of LookupGoroutine.
 	if walWriter != nil {
 		walWriter.OnWALSync = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitWALSync)
+			if act != nil {
+				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALSync)
 			}
 		}
 		walWriter.OnWALSyncDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if act != nil {
+				act.WaitEventEnd("wal-writer-0")
 			}
 		}
 	}
