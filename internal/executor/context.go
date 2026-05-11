@@ -143,6 +143,25 @@ type Context struct {
 	// VACUUM rewrites xmin → FrozenTransactionID for tuples older than
 	// currentXID − FreezeMinAge. Zero disables freezing.
 	FreezeMinAge int64
+
+	// Notices accumulates NOTICE messages emitted during statement execution
+	// (e.g. "table X does not exist, skipping" from DROP IF EXISTS).
+	// The server reads this after each statement and emits NoticeResponse
+	// messages to the client. M0097-0008.
+	Notices []string
+}
+
+// AddNotice appends a NOTICE-severity message to the context's notice queue.
+// Callers: DDL operators that use IF EXISTS on non-existent objects.
+func (c *Context) AddNotice(msg string) {
+	c.Notices = append(c.Notices, msg)
+}
+
+// TakeNotices returns and clears the accumulated notices.
+func (c *Context) TakeNotices() []string {
+	n := c.Notices
+	c.Notices = nil
+	return n
 }
 
 // acquireRelLock funnels every operator's relation-level lock

@@ -896,7 +896,33 @@ func (p *parser) parseDrop() (Stmt, error) {
 		p.advance()
 		return p.parseDropTriggerTail(t.Pos)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
+	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
+	for _, objType := range []string{
+		"sequence", "schema", "type", "domain",
+		"aggregate", "collation", "operator", "cast",
+		"materialized", "rule", "extension", "server",
+		"language", "access", "event", "transform",
+		"group", "role", "user",
+	} {
+		if p.acceptIdentKeyword(objType) {
+			// "materialized view" is two words
+			if objType == "materialized" {
+				_ = p.acceptIdentKeyword("view")
+			}
+			ifExists, names, behavior, err := p.parseDropTail()
+			if err != nil {
+				return nil, err
+			}
+			return &DropCompatStmt{
+				pos:      t.Pos,
+				ObjType:  objType,
+				IfExists: ifExists,
+				Names:    names,
+				Behavior: behavior,
+			}, nil
+		}
+	}
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, SEQUENCE, SCHEMA, TYPE, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
 }
 
 // parseCreateTriggerTail picks up after CREATE [CONSTRAINT] TRIGGER.

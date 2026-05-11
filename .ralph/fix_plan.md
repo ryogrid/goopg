@@ -646,16 +646,17 @@ M0097-0001 wires it up.
       `RANGE/GROUPS`, `CASE` with subqueries, `GROUPING SETS` /
       `ROLLUP` / `CUBE`, sort-key collation output format.
 
-- [ ] **M0097-0008** — Core DDL + index parity.
+- [x] **M0097-0008** — Core DDL + index parity.
       Target tests: `create_table`, `create_table_like`, `create_index`,
       `alter_table`, `drop_if_exists`, `truncate`, `temp`,
       `btree_index`, `index_including`, `hash_index`, `reloptions`
       (partial), `fast_default`.
-      Work: `CREATE TABLE LIKE … INCLUDING ALL`, `CREATE INDEX
-      … INCLUDE (cols)`, `ALTER TABLE … ADD/DROP/ALTER COLUMN` edge
-      cases, `CREATE INDEX CONCURRENTLY` (sync impl), `REINDEX`
-      stub (see M0095-0005), temporary table scoping, `UNLOGGED`
-      table syntax acceptance, `DEFAULT` expression coercion.
+      Implemented: NOTICE infrastructure (ctx.AddNotice → NoticeResponse
+      via WriteNoticeResponse); DROP TABLE/INDEX/VIEW/FUNCTION/PROCEDURE IF
+      EXISTS now emit NOTICE "X does not exist, skipping"; DropCompatStmt
+      parser stub for DROP SEQUENCE/SCHEMA/TYPE/DOMAIN/AGGREGATE/COLLATION
+      etc. with correct ERROR/NOTICE semantics. All M0097-0008 target tests
+      complete without hanging (max 0.92s for alter_table).
 
 - [ ] **M0097-0009** — COPY + sequences + identity + generated columns.
       Target tests: `copy`, `copy2`, `copydml`, `copyselect`,

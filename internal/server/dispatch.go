@@ -497,6 +497,18 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
 	}
 
+	// Emit accumulated NOTICE messages before CommandComplete. M0097-0008.
+	for _, msg := range ctx.TakeNotices() {
+		if nerr := w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "NOTICE"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: protocol.FieldSQLState, Value: "00000"},
+			{Code: protocol.FieldMessage, Value: msg},
+		}); nerr != nil {
+			return nerr
+		}
+	}
+
 	tag := commandTagFor(node, op, rowCount)
 	if tag == "" {
 		tag = "OK"

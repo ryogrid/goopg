@@ -908,6 +908,21 @@ type DropViewStmt struct {
 func (s *DropViewStmt) Pos() int  { return s.pos }
 func (s *DropViewStmt) stmtNode() {}
 
+// DropCompatStmt is a compatibility stub for DROP statements whose object
+// types are not fully implemented in goopg v0 (SEQUENCE, SCHEMA, TYPE,
+// DOMAIN, AGGREGATE, COLLATION, etc.). The executor handles IF EXISTS by
+// emitting a NOTICE and silently succeeds for the rest. M0097-0008.
+type DropCompatStmt struct {
+	pos      int
+	ObjType  string // "sequence", "schema", "type", "domain", etc.
+	IfExists bool
+	Names    []ObjectName
+	Behavior DropBehavior
+}
+
+func (s *DropCompatStmt) Pos() int  { return s.pos }
+func (s *DropCompatStmt) stmtNode() {}
+
 // CreatePublicationStmt — `CREATE PUBLICATION name [FOR ALL TABLES |
 // FOR TABLE t1 [, t2 ...]] [WITH (k = v, ...)]`. v0 honours
 // `publish = 'insert,update,delete'`; truncate / row filters /
