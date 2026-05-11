@@ -189,19 +189,22 @@ func advisorySessionID(sess Session) uintptr {
 }
 
 // advisorySessionIDFromContext returns a stable session identity from an
-// executor Context. When the server wires a per-connection BackendID (the
-// common production path), that is used as the session identifier; this
-// ensures cross-connection lock exclusion works correctly. Falls back to the
-// Session pointer for in-process test paths that use a *BasicSession.
+// executor Context. Advisory locks must survive across statement boundaries
+// within the same connection, so we use the Session pointer (which is
+// per-connection, stable across statements) rather than BackendID (which
+// goopg re-generates for every statement to assign fresh lock-manager slots).
+// Using BackendID would cause the lock to appear "foreign" on the next
+// statement from the same connection, causing self-deadlocks. M0097-0010.
 func advisorySessionIDFromContext(ctx *Context) uintptr {
 	if ctx == nil {
 		return 0
 	}
-	// BackendID is set by the server for every incoming connection and is unique
-	// per connection. Use it as the primary session key.
-	if ctx.BackendID != 0 {
-		return uintptr(ctx.BackendID)
+	// Prefer the Session pointer: it is allocated once per connection and
+	// stays stable across all statements on that connection. BackendID is
+	// per-statement in the simple-query dispatch path.
+	if ctx.Session != nil {
+		return advisorySessionID(ctx.Session)
 	}
-	// Fallback: in-process tests wire a *BasicSession but no BackendID.
-	return advisorySessionID(ctx.Session)
+	// Fallback for contexts that have neither (e.g. unit tests with no Session).
+	return uintptr(ctx.BackendID)
 }

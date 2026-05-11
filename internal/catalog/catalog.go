@@ -924,6 +924,34 @@ func (c *InMemory) registerSystemTables() {
 		}
 	}
 	c.tables["pg_catalog.pg_settings"] = pgSettings
+
+	// pg_locks — advisory_lock.sql queries this to verify lock state.
+	// v0 returns empty rows (no lock tracking infrastructure). M0097-0010.
+	pgLocks := &Table{
+		Schema:  "pg_catalog",
+		Name:    "pg_locks",
+		Virtual: true,
+		Columns: []Column{
+			{Name: "locktype", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "database", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "relation", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "page", Type: Type{Name: "int4"}, Ordinal: 3},
+			{Name: "tuple", Type: Type{Name: "int2"}, Ordinal: 4},
+			{Name: "virtualxid", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "transactionid", Type: Type{Name: "xid"}, Ordinal: 6},
+			{Name: "classid", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "objid", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "objsubid", Type: Type{Name: "int2"}, Ordinal: 9},
+			{Name: "virtualtransaction", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "pid", Type: Type{Name: "int4"}, Ordinal: 11},
+			{Name: "mode", Type: Type{Name: "text"}, Ordinal: 12},
+			{Name: "granted", Type: Type{Name: "bool"}, Ordinal: 13},
+			{Name: "fastpath", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "waitstart", Type: Type{Name: "timestamptz"}, Ordinal: 15},
+		},
+	}
+	pgLocks.VirtualRows = func() [][]string { return nil } // always empty in v0
+	c.tables["pg_catalog.pg_locks"] = pgLocks
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/

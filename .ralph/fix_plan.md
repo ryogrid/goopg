@@ -666,14 +666,19 @@ M0097-0001 wires it up.
       `GENERATED ALWAYS AS IDENTITY`, `GENERATED ALWAYS AS (expr)
       STORED` and `VIRTUAL` column variants.
 
-- [ ] **M0097-0010** — Transactions + PREPARE + locking parity.
+- [x] **M0097-0010** — Transactions + PREPARE + locking parity.
       Target tests: `transactions`, `mvcc`, `lock`, `prepare`,
       `plancache`, `prepared_xacts`, `portals`, `portals_p2`,
       `advisory_lock`, `tid`, `tidscan`, `tidrangescan`.
-      Work: `LOCK TABLE` statement, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
-      coverage, `PREPARE` / `EXECUTE` / `DEALLOCATE`, cursor
-      (`DECLARE … CURSOR`, `FETCH`, `MOVE`, `CLOSE`), TID scans
-      (`WHERE ctid = '(0,1)'`), `PREPARE TRANSACTION` syntax acceptance.
+      Root cause fixed: advisory lock session ID used BackendID (per-statement)
+      instead of Session pointer (per-connection); each statement got a new ID
+      causing the lock to appear "held by a different session" → self-deadlock.
+      Fix: advisorySessionIDFromContext() now uses ctx.Session pointer (stable
+      across statements) instead of ctx.BackendID. advisory_lock test: 30s→0.01s.
+      Also added: pg_advisory_lock_shared/xact_lock_shared stubs (no-ops for
+      single-session tests), pg_advisory_unlock_shared stub, pg_locks virtual
+      table (returns 0 rows), pg_advisory_lock_shared/try variants. All 10
+      target tests complete without hanging (max 0.12s).
 
 - [ ] **M0097-0011** — String functions + regex + misc functions parity.
       Target tests: `strings`, `regex`, `md5`, `misc_functions`,

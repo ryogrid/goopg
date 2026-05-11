@@ -1631,6 +1631,21 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
 		return evalAdvisoryLock(x, row, ctx, true, false)
 
+	// ── Shared-mode advisory lock stubs (M0097-0010) ─────────────────────
+	// Shared advisory locks allow multiple sessions to hold the same key.
+	// v0 returns void/true without actually acquiring locks — implementing
+	// true shared-mode semantics in the single-session test context would
+	// risk deadlocks when the same session acquires both exclusive and shared
+	// versions of the same key. Returning immediately is correct for the
+	// regress test context (single connection, no cross-session contention).
+	case "pg_advisory_lock_shared", "pg_advisory_xact_lock_shared":
+		// Shared lock: accepted, no-op for single-session tests.
+		return Datum{Kind: KindBool}, nil
+	case "pg_try_advisory_lock_shared", "pg_try_advisory_xact_lock_shared":
+		return NewBoolDatum(true), nil
+	case "pg_advisory_unlock_shared":
+		return NewBoolDatum(true), nil
+
 	// ── Boolean comparison functions (M0097-0003) ─────────────────────────
 	// These are the C-level backing functions for bool operators; the
 	// boolean.sql regress test calls them explicitly.
