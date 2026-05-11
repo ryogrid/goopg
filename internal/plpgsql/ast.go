@@ -172,3 +172,28 @@ type ReturnStmt struct {
 
 func (r *ReturnStmt) Pos() int          { return r.pos }
 func (r *ReturnStmt) plpgsqlStmtNode() {}
+
+// SQLStmt is an embedded SQL DML/query statement in a PL/pgSQL body.
+// The raw SQL text is stored verbatim; at execution time the executor
+// substitutes OLD.* / NEW.* references with the trigger context rows,
+// then plans and executes via the normal SQL path. M0096-0012.
+type SQLStmt struct {
+	pos  int
+	SQL  string // raw SQL text (untransformed)
+}
+
+func (s *SQLStmt) Pos() int          { return s.pos }
+func (s *SQLStmt) plpgsqlStmtNode() {}
+
+// RaiseStmt is `RAISE [level] 'message'`. Level is "notice",
+// "warning", "exception" / "error" (default). NOTICE and WARNING are
+// silently discarded; ERROR/EXCEPTION surfaces an ExecError.
+// M0096-0012.
+type RaiseStmt struct {
+	pos   int
+	Level string // "notice", "warning", "error"
+	Msg   string // static message text (format substitution deferred)
+}
+
+func (r *RaiseStmt) Pos() int          { return r.pos }
+func (r *RaiseStmt) plpgsqlStmtNode() {}

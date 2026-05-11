@@ -457,10 +457,17 @@ alongside the suite.
       + DEFERRABLE INITIALLY DEFERRED queued in BasicSession, checked at execCommit.
       Design doc: 0096-0011-fk-enforcement.md.
 
-- [ ] **M0096-0012** — Implement `CREATE TRIGGER … FOR EACH ROW EXECUTE
+- [x] **M0096-0012** — Implement `CREATE TRIGGER … FOR EACH ROW EXECUTE
       FUNCTION/PROCEDURE` + PL/pgSQL trigger body execution.
-      Unblocks: `eval-plan-qual-trigger`, `partition-key-update-3/4`,
-      `fk-snapshot`.
+      Unblocks: `eval-plan-qual-trigger`, `partition-key-update-4`,
+      `fk-snapshot` (partially — RAISE NOTICE not yet interpolated).
+      Parser: KwTrigger; CreateTriggerStmt/DropTriggerStmt; RETURNS TRIGGER.
+      PL/pgSQL: SQLStmt (embedded SQL with OLD/NEW substitution), RaiseStmt
+      (NOTICE=no-op, ERROR=exception), dotted-assign no-op (OLD.b = ...).
+      Catalog: Trigger struct + Triggers on Table.
+      Executor: execCreateTrigger + BEFORE DELETE/INSERT trigger hooks +
+      executePLpgSQLTriggerBody + substituteTriggerRefs.
+      Design doc: 0096-0012-triggers.md.
 
 - [ ] **M0096-0013** — End-to-end pass confirmation: run all 21 dedicated
       test functions from M0096-0001, confirm every spec reports `pass`.

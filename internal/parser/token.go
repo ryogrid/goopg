@@ -232,6 +232,9 @@ const (
 	// M0096-0010: MERGE INTO statement.
 	KwMerge   Keyword = "merge"
 	KwMatched Keyword = "matched"
+
+	// M0096-0012: CREATE/DROP TRIGGER.
+	KwTrigger Keyword = "trigger"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -377,6 +380,7 @@ var keywords = map[string]Keyword{
 	"deallocate":   KwDeallocate,
 	"merge":        KwMerge,
 	"matched":      KwMatched,
+	"trigger":      KwTrigger,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

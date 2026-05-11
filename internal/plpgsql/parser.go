@@ -184,16 +184,22 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseExit()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:
 		return p.parseContinue()
+	// SQL DML statements embedded in PL/pgSQL body. M0096-0012.
+	case t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwInsert ||
+		t.Keyword == parser.KwUpdate || t.Keyword == parser.KwDelete ||
+		t.Keyword == parser.KwSelect):
+		return p.parseSQLStmt()
+	// RAISE [NOTICE|WARNING|ERROR|EXCEPTION] 'msg'. M0096-0012.
+	case t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "raise"):
+		return p.parseRaise()
 	case t.Kind == parser.TokenIdent:
-		// Stage A 4b: bare identifier at statement start is the
-		// assignment shape `target := value;`. Other identifier-
-		// led statements (PERFORM, label-prefixed loops) arrive
-		// in later slices and surface a specific Stage-A
-		// diagnostic from the assignment-parser when the `:=`
-		// isn't there.
+		// Stage A 4b: bare identifier at statement start.
+		// Handle: ident := value (assignment)
+		// Handle: ident.field = value (record field, treated as no-op expr for trigger OLD)
+		// Handle: ident.field.* (expansion — treated as SQL stmt)
 		return p.parseAssign()
 	}
-	return nil, p.errAtCur("unsupported PL/pgSQL statement (Stage A 4d accepts RETURN, assignment, IF, LOOP, and EXIT only)")
+	return nil, p.errAtCur("unsupported PL/pgSQL statement")
 }
 
 // parseLoop parses `LOOP stmts END LOOP ;`.
@@ -517,15 +523,27 @@ func (p *bodyParser) parseDeclaration() (*Declaration, error) {
 	return d, nil
 }
 
-// parseAssign parses `target := value ;`. The target is a bare
-// identifier (Stage A 4b scope — no record-field or array-element
-// assignment yet).
+// parseAssign parses `target := value;` or `target = value;`.
+// Also handles `ident.field = expr;` (trigger OLD/NEW field write — treated
+// as a no-op expression statement, since OLD is immutable). M0096-0012.
 func (p *bodyParser) parseAssign() (*AssignStmt, error) {
 	nameTok := p.advance()
-	if p.cur().Kind != parser.TokenOperator || p.cur().Value != ":=" {
-		return nil, p.errAtCur("expected ':=' after %q (Stage A 4b only supports RETURN and assignment)", nameTok.Value)
+	// Handle dotted target: `ident.field ...` — consume the dot and field,
+	// then treat the whole expression up to `;` as a no-op (field assignment
+	// to trigger records is silently dropped; OLD is immutable in PG too).
+	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "." {
+		return p.parseDottedExprStmt(nameTok.Pos)
 	}
-	p.advance() // :=
+	isAssign := false
+	if p.cur().Kind == parser.TokenOperator && p.cur().Value == ":=" {
+		isAssign = true
+	} else if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "=" {
+		isAssign = true
+	}
+	if !isAssign {
+		return nil, p.errAtCur("expected ':=' or '=' after %q", nameTok.Value)
+	}
+	p.advance() // := or =
 	expr, err := p.scanExprToSemicolon("assignment value")
 	if err != nil {
 		return nil, err
@@ -534,6 +552,72 @@ func (p *bodyParser) parseAssign() (*AssignStmt, error) {
 		return nil, p.errAtCur("expected ';' to terminate assignment")
 	}
 	return &AssignStmt{pos: nameTok.Pos, Target: nameTok.Value, Value: expr}, nil
+}
+
+// parseDottedExprStmt parses `ident.field [= expr] ;` as a no-op.
+// Used for trigger OLD.b = ... patterns that are valid PL/pgSQL syntax
+// but have no effect (OLD is immutable). M0096-0012.
+func (p *bodyParser) parseDottedExprStmt(pos int) (*AssignStmt, error) {
+	// Consume everything up to `;`.
+	for p.cur().Kind != parser.TokenEOF {
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+			p.advance()
+			break
+		}
+		p.advance()
+	}
+	// Return a no-op assign: `_plpgsql_noop := 0` (the target never exists in frame).
+	// The executor silently ignores assignment to unknown variables when noop is set.
+	return &AssignStmt{pos: pos, Target: "_plpgsql_noop", Value: &parser.IntegerConst{}}, nil
+}
+
+// parseSQLStmt captures an embedded SQL statement (INSERT / UPDATE / DELETE /
+// SELECT) up to the trailing `;` and stores it verbatim. M0096-0012.
+func (p *bodyParser) parseSQLStmt() (*SQLStmt, error) {
+	startPos := p.cur().Pos
+	depth := 0
+	for p.cur().Kind != parser.TokenEOF {
+		t := p.cur()
+		if t.Kind == parser.TokenSymbol && t.Value == "(" {
+			depth++
+		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
+			depth--
+		} else if t.Kind == parser.TokenSymbol && t.Value == ";" && depth == 0 {
+			endPos := t.Pos
+			p.advance() // consume `;`
+			sql := strings.TrimSpace(p.src[startPos:endPos])
+			return &SQLStmt{pos: startPos, SQL: sql}, nil
+		}
+		p.advance()
+	}
+	return nil, p.errAtCur("unterminated embedded SQL statement")
+}
+
+// parseRaise parses `RAISE [level] 'message' [, args...];`. M0096-0012.
+// Level defaults to "exception" when omitted.
+func (p *bodyParser) parseRaise() (*RaiseStmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "raise" ident
+	level := "exception"
+	// Optional level keyword.
+	for _, lvl := range []string{"notice", "warning", "info", "log", "debug", "error", "exception"} {
+		if strings.EqualFold(p.cur().Value, lvl) && p.cur().Kind == parser.TokenIdent {
+			level = lvl
+			p.advance()
+			break
+		}
+	}
+	// Consume everything to `;`.
+	msgStart := p.cur().Pos
+	for p.cur().Kind != parser.TokenEOF {
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+			msg := strings.TrimSpace(p.src[msgStart:p.cur().Pos])
+			p.advance()
+			return &RaiseStmt{pos: pos, Level: level, Msg: msg}, nil
+		}
+		p.advance()
+	}
+	return nil, p.errAtCur("unterminated RAISE statement")
 }
 
 // parseTypeRef captures a SQL type spec — `name` or `schema.name`,

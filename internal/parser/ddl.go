@@ -81,8 +81,18 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		p.advance()
 		return p.parseCreateProcedureTail(t.Pos, orReplace)
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger:
+		p.advance()
+		return p.parseCreateTriggerTail(t.Pos)
+	// Accept CREATE CONSTRAINT TRIGGER (skip CONSTRAINT keyword then TRIGGER)
+	case p.acceptIdentKeyword("constraint"):
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger {
+			p.advance()
+			return p.parseCreateTriggerTail(t.Pos)
+		}
+		return nil, p.errAtCur("expected TRIGGER after CREATE CONSTRAINT")
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, or PROCEDURE after CREATE")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
@@ -876,8 +886,138 @@ func (p *parser) parseDrop() (Stmt, error) {
 	case KwProcedure:
 		p.advance()
 		return p.parseDropProcedureTail(t.Pos)
+	case KwTrigger:
+		p.advance()
+		return p.parseDropTriggerTail(t.Pos)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, or PROCEDURE after DROP")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
+}
+
+// parseCreateTriggerTail picks up after CREATE [CONSTRAINT] TRIGGER.
+// Grammar (simplified):
+//   name BEFORE|AFTER|INSTEAD OF event[, ...] ON table
+//   FOR [EACH] {ROW|STATEMENT}
+//   EXECUTE {FUNCTION|PROCEDURE} funcname([]);
+// M0096-0012.
+func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
+	// Trigger name
+	nameTok, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &CreateTriggerStmt{pos: pos, Name: identText(nameTok)}
+
+	// Timing: BEFORE | AFTER | INSTEAD OF
+	switch {
+	case p.acceptIdentKeyword("before"):
+		stmt.Timing = TriggerBefore
+	case p.acceptIdentKeyword("after"):
+		stmt.Timing = TriggerAfter
+	case p.acceptIdentKeyword("instead"):
+		_ = p.acceptKeyword(KwOf)
+		stmt.Timing = TriggerInsteadOf
+	default:
+		return nil, p.errAtCur("expected BEFORE, AFTER, or INSTEAD OF after trigger name")
+	}
+
+	// Events: INSERT | UPDATE | DELETE [OR ...]
+	for {
+		switch {
+		case p.acceptKeyword(KwInsert):
+			stmt.Events = append(stmt.Events, "insert")
+		case p.acceptKeyword(KwUpdate):
+			stmt.Events = append(stmt.Events, "update")
+		case p.acceptKeyword(KwDelete):
+			stmt.Events = append(stmt.Events, "delete")
+		default:
+			return nil, p.errAtCur("expected INSERT, UPDATE, or DELETE in trigger events")
+		}
+		if !p.acceptKeyword(KwOr) {
+			break
+		}
+	}
+
+	// ON table
+	if _, err := p.expectKeyword(KwOn); err != nil {
+		return nil, err
+	}
+	tblName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Table = tblName
+
+	// FOR [EACH] ROW | STATEMENT
+	if p.acceptKeyword(KwFor) {
+		_ = p.acceptIdentKeyword("each")
+		switch {
+		case p.acceptIdentKeyword("row"):
+			stmt.ForEachRow = true
+		case p.acceptIdentKeyword("statement"):
+			stmt.ForEachRow = false
+		default:
+			return nil, p.errAtCur("expected ROW or STATEMENT after FOR [EACH]")
+		}
+	}
+
+	// Optional WHEN (condition) — skip for now.
+	if p.acceptKeyword(KwWhen) {
+		if p.acceptSymbol("(") {
+			depth := 1
+			for depth > 0 && p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					depth++
+				} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+					depth--
+				}
+				p.advance()
+			}
+		}
+	}
+
+	// EXECUTE {FUNCTION|PROCEDURE} funcname([args])
+	if !p.acceptKeyword(KwExecute) {
+		return nil, p.errAtCur("expected EXECUTE in trigger definition")
+	}
+	_ = p.acceptKeyword(KwFunction) || p.acceptKeyword(KwProcedure)
+	funcName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.FuncName = funcName
+	// Skip the argument list (trigger functions take no SQL arguments).
+	if p.acceptSymbol("(") {
+		for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+			p.advance()
+		}
+	}
+	return stmt, nil
+}
+
+// parseDropTriggerTail picks up after DROP TRIGGER.
+// Grammar: [IF EXISTS] name ON table [CASCADE|RESTRICT].
+func (p *parser) parseDropTriggerTail(pos int) (Stmt, error) {
+	ifExists := false
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	nameTok, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(KwOn); err != nil {
+		return nil, err
+	}
+	tbl, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	// Optional CASCADE | RESTRICT.
+	_ = p.acceptKeyword(KwCascade) || p.acceptKeyword(KwRestrict)
+	return &DropTriggerStmt{pos: pos, Name: identText(nameTok), Table: tbl, IfExists: ifExists}, nil
 }
 
 // parseDropPubSubTail picks up after DROP PUBLICATION / DROP

@@ -225,6 +225,47 @@ type MergeStmt struct {
 func (s *MergeStmt) Pos() int  { return s.pos }
 func (s *MergeStmt) stmtNode() {}
 
+// TriggerEvent discriminates BEFORE/AFTER and INSERT/UPDATE/DELETE.
+// M0096-0012.
+type TriggerTiming int
+
+const (
+	TriggerBefore TriggerTiming = iota + 1
+	TriggerAfter
+	TriggerInsteadOf
+)
+
+// CreateTriggerStmt — `CREATE [CONSTRAINT] TRIGGER name
+//   BEFORE|AFTER|INSTEAD OF {INSERT|UPDATE|DELETE[, ...]}
+//   ON table FOR [EACH] {ROW|STATEMENT}
+//   EXECUTE {FUNCTION|PROCEDURE} funcname()`.
+// M0096-0012.
+type CreateTriggerStmt struct {
+	pos      int
+	Name     string
+	Table    ObjectName
+	Timing   TriggerTiming
+	Events   []string // "insert", "update", "delete"
+	ForEachRow bool   // true = ROW, false = STATEMENT
+	FuncName ObjectName
+	// IfNotExists: PostgreSQL 14+ only, not supported yet.
+}
+
+func (s *CreateTriggerStmt) Pos() int  { return s.pos }
+func (s *CreateTriggerStmt) stmtNode() {}
+
+// DropTriggerStmt — `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+// M0096-0012.
+type DropTriggerStmt struct {
+	pos      int
+	Name     string
+	Table    ObjectName
+	IfExists bool
+}
+
+func (s *DropTriggerStmt) Pos() int  { return s.pos }
+func (s *DropTriggerStmt) stmtNode() {}
+
 // ClusterStmt — `CLUSTER [VERBOSE] [tablename [USING indexname]]`.
 // M0095-0008: no-op executor stub.  When a table name is provided the
 // executor verifies the table exists; without a table it always succeeds.

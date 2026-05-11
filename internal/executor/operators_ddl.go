@@ -81,6 +81,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateProcedure(s)
 	case *parser.DropProcedureStmt:
 		return nil, o.execDropProcedure(s)
+	case *parser.CreateTriggerStmt:
+		return nil, o.execCreateTrigger(s)
+	case *parser.DropTriggerStmt:
+		return nil, o.execDropTrigger(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -1631,6 +1635,58 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	}
 	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
+	}
+	return nil
+}
+
+// execCreateTrigger registers a trigger on a table. M0096-0012.
+func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	trig := catalog.Trigger{
+		Name:       s.Name,
+		TableOID:   tbl.OID,
+		Timing:     catalog.TriggerTiming(s.Timing),
+		Events:     append([]string(nil), s.Events...),
+		ForEachRow: s.ForEachRow,
+		FuncName:   s.FuncName.Name,
+		FuncSchema: s.FuncName.Schema,
+	}
+	// Remove any existing trigger with the same name on this table.
+	filtered := tbl.Triggers[:0]
+	for _, t := range tbl.Triggers {
+		if t.Name != s.Name {
+			filtered = append(filtered, t)
+		}
+	}
+	tbl.Triggers = append(filtered, trig)
+	return nil
+}
+
+// execDropTrigger removes a trigger from a table. M0096-0012.
+func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		if s.IfExists {
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	filtered := tbl.Triggers[:0]
+	found := false
+	for _, t := range tbl.Triggers {
+		if t.Name == s.Name {
+			found = true
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	tbl.Triggers = filtered
+	if !found && !s.IfExists {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("trigger %q for table %q does not exist", s.Name, s.Table.Name)}
 	}
 	return nil
 }

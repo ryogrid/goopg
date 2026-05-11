@@ -383,6 +383,15 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			row[tgtIdx] = src[srcIdx]
 		}
 
+		// BEFORE INSERT triggers (M0096-0012).
+		if len(o.plan.Table.Triggers) > 0 {
+			newRow, ok := fireTriggers(o.ctx, o.plan.Table, "before", "insert", nil, row)
+			if !ok {
+				continue // trigger returned NULL — skip this row
+			}
+			row = newRow
+		}
+
 		// FK referential integrity check (M0096-0011): verify parent rows exist
 		// before writing.  Uses the plan table's ForeignKeys (parent partition's
 		// FKs apply to routed child inserts too).
@@ -1182,12 +1191,21 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	}); err != nil {
 		return nil, err
 	}
-	// Enforce FK constraints on deleted rows (M0096-0011).
+	// Fire BEFORE DELETE triggers and enforce FK constraints. M0096-0011/0012.
+	filtered := victims[:0]
 	for _, v := range victims {
+		if len(tbl.Triggers) > 0 {
+			_, ok := fireTriggers(o.ctx, tbl, "before", "delete", v.row, nil)
+			if !ok {
+				continue // trigger returned NULL — skip deletion
+			}
+		}
 		if err := enforceFKOnDelete(o.ctx, tbl, v.row); err != nil {
 			return nil, err
 		}
+		filtered = append(filtered, v)
 	}
+	victims = filtered
 	for _, v := range victims {
 		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: v.blk})
 		if err != nil {

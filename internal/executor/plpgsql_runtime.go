@@ -16,6 +16,22 @@ type plpgsqlFrame struct {
 	indexByName map[string]int
 	types       []catalog.Type
 	values      Row
+	// trig is non-nil when this frame is for a trigger function body.
+	// M0096-0012.
+	trig *plpgsqlTrigCtx
+}
+
+// plpgsqlTrigCtx holds the trigger execution context injected into
+// trigger function frames. M0096-0012.
+type plpgsqlTrigCtx struct {
+	OldRow  Row
+	NewRow  Row
+	Cols    []catalog.Column // table columns (both OLD and NEW use the same schema)
+	TGName  string
+	TGWhen  string // "before" or "after"
+	TGOp    string // "insert", "update", "delete"
+	TGLevel string // "row" or "statement"
+	TGTable string
 }
 
 func newPLpgSQLFrame() *plpgsqlFrame {
@@ -183,6 +199,13 @@ const (
 	flowReturn
 	flowExit
 	flowContinue
+	// flowReturnTriggerOld / flowReturnTriggerNew signal that a trigger
+	// function returned OLD or NEW respectively. The trigger executor
+	// intercepts these before they propagate further. M0096-0012.
+	flowReturnTriggerOld
+	flowReturnTriggerNew
+	// flowReturnTriggerNull signals RETURN NULL from a trigger (skip the row).
+	flowReturnTriggerNull
 )
 
 func executePLpgSQLStmtList(stmts []plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFrame, ctx *Context) (Datum, controlFlow, error) {
@@ -198,6 +221,11 @@ func executePLpgSQLStmtList(stmts []plpgsql.Stmt, r *catalog.Routine, frame *plp
 func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFrame, ctx *Context) (Datum, controlFlow, error) {
 	switch s := stmt.(type) {
 	case *plpgsql.AssignStmt:
+		// _plpgsql_noop is the silent discard target for trigger OLD.b = ...
+		// expressions. M0096-0012.
+		if s.Target == "_plpgsql_noop" {
+			return Datum{}, flowNone, nil
+		}
 		idx, ok := frame.lookup(s.Target)
 		if !ok {
 			return Datum{}, flowNone, &ExecError{Code: "42703", Pos: s.Pos(), Message: fmt.Sprintf("variable %q does not exist", s.Target)}
@@ -390,15 +418,51 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return Datum{}, flowContinue, nil
 
 	case *plpgsql.ReturnStmt:
+		// In trigger context, detect RETURN OLD / RETURN NEW / RETURN NULL.
+		if frame.trig != nil {
+			if cr, ok := s.Expr.(*parser.ColumnRef); ok && cr.Table == "" && cr.Schema == "" {
+				switch strings.ToLower(cr.Column) {
+				case "old":
+					return Datum{}, flowReturnTriggerOld, nil
+				case "new":
+					return Datum{}, flowReturnTriggerNew, nil
+				}
+			}
+			if _, ok := s.Expr.(*parser.NullConst); ok {
+				return Datum{}, flowReturnTriggerNull, nil
+			}
+		}
 		v, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
+		}
+		// For trigger functions, skip type coercion (return type is "trigger").
+		if frame.trig != nil {
+			return v, flowReturn, nil
 		}
 		v, err = coerceDatumToType(v, r.ReturnType, s.Pos(), "RETURN")
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
 		return v, flowReturn, nil
+
+	case *plpgsql.RaiseStmt:
+		// RAISE NOTICE / WARNING / INFO / LOG / DEBUG: silently discard.
+		// RAISE EXCEPTION / ERROR: surface as an executor error.
+		// M0096-0012.
+		switch strings.ToLower(s.Level) {
+		case "error", "exception":
+			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: s.Msg}
+		}
+		// NOTICE and other non-error levels are no-ops in v0.
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.SQLStmt:
+		// Execute embedded SQL with trigger OLD/NEW substitution. M0096-0012.
+		if err := execPLpgSQLEmbeddedSQL(s.SQL, frame, ctx); err != nil {
+			return Datum{}, flowNone, err
+		}
+		return Datum{}, flowNone, nil
 
 	default:
 		return Datum{}, flowNone, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL statement %T", stmt)}
@@ -494,6 +558,21 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 	case *parser.ParamRef:
 		return &planner.ParamRef{Number: x.Number}, nil
 	case *parser.ColumnRef:
+		// Handle OLD.col and NEW.col in trigger context by looking them up
+		// in the pre-injected trigger column variables. M0096-0012.
+		if x.Table != "" && x.Schema == "" && frame.trig != nil {
+			which := strings.ToLower(x.Table)
+			if which == "old" || which == "new" {
+				// Trigger column variables are stored as "_old_<colname>" / "_new_<colname>".
+				varKey := "_" + which + "_" + strings.ToLower(x.Column)
+				idx, ok := frame.lookup(varKey)
+				if !ok {
+					return nil, &ExecError{Code: "42703", Pos: x.Pos(),
+						Message: fmt.Sprintf("column %q not found in trigger %s record", x.Column, which)}
+				}
+				return &planner.ColumnRef{Index: idx, Name: varKey, Type: frame.types[idx]}, nil
+			}
+		}
 		if x.Schema != "" || x.Table != "" {
 			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "qualified names are not supported in PL/pgSQL expressions in v0"}
 		}
@@ -660,4 +739,219 @@ func isTimeTypeName(name string) bool {
 
 func isIntervalTypeName(name string) bool {
 	return strings.EqualFold(name, "interval")
+}
+
+// injectTriggerVars adds OLD/NEW column values as mangled frame variables
+// "_old_<colname>" / "_new_<colname>" so lowerPLpgSQLExpr can resolve
+// OLD.col / NEW.col references. M0096-0012.
+func injectTriggerVars(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) {
+	for i, col := range trig.Cols {
+		colKey := strings.ToLower(col.Name)
+		typ := normalizeCatalogType(col.Type)
+		if trig.OldRow != nil {
+			val := NullDatum
+			if i < len(trig.OldRow) {
+				val = trig.OldRow[i]
+			}
+			_ = frame.add("_old_"+colKey, typ, val)
+		}
+		if trig.NewRow != nil {
+			val := NullDatum
+			if i < len(trig.NewRow) {
+				val = trig.NewRow[i]
+			}
+			_ = frame.add("_new_"+colKey, typ, val)
+		}
+	}
+	// Inject TG_* string variables.
+	strType := catalog.Type{Name: "text"}
+	_ = frame.add("tg_name", strType, NewStringDatum(trig.TGName))
+	_ = frame.add("tg_when", strType, NewStringDatum(trig.TGWhen))
+	_ = frame.add("tg_level", strType, NewStringDatum(trig.TGLevel))
+	_ = frame.add("tg_op", strType, NewStringDatum(trig.TGOp))
+	_ = frame.add("tg_table_name", strType, NewStringDatum(trig.TGTable))
+	_ = frame.add("tg_relname", strType, NewStringDatum(trig.TGTable))
+}
+
+// executePLpgSQLTriggerBody executes a trigger function body with the given
+// trigger context. Returns:
+//   - (newRow, true, nil): trigger returned a row (BEFORE triggers use this)
+//   - (nil, true, nil): trigger returned NULL (skip the row)
+//   - (nil, false, err): execution error
+//
+// M0096-0012.
+func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Context) (Row, bool, error) {
+	if strings.ToLower(r.Language) != "plpgsql" {
+		return nil, true, nil // non-plpgsql trigger: pass-through
+	}
+	block, err := plpgsql.Parse(r.Body)
+	if err != nil {
+		return nil, false, &ExecError{Code: "P0000", Message: fmt.Sprintf("invalid trigger body for %s: %v", r.QualifiedName(), err)}
+	}
+	child := NewContext()
+	if ctx != nil {
+		*child = *ctx
+	}
+	frame := newPLpgSQLFrame()
+	frame.trig = trig
+	injectTriggerVars(frame, trig)
+	// Process DECLARE section.
+	for _, d := range block.Declarations {
+		typ := catalogTypeFromColumnType(d.Type)
+		value := NullDatum
+		if d.Default != nil {
+			value, err = evalPLpgSQLExpr(d.Default, frame, child)
+			if err != nil {
+				return nil, false, err
+			}
+		}
+		value, _ = coerceDatumToType(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name))
+		_ = frame.add(d.Name, typ, value)
+	}
+	_, flow, err := executePLpgSQLStmtList(block.Statements, r, frame, child)
+	if err != nil {
+		return nil, false, err
+	}
+	switch flow {
+	case flowReturnTriggerOld:
+		return trig.OldRow, true, nil
+	case flowReturnTriggerNew:
+		return trig.NewRow, true, nil
+	case flowReturnTriggerNull:
+		return nil, true, nil // NULL = skip the row
+	default:
+		// No explicit RETURN — use OLD for BEFORE DELETE, NEW for others.
+		if strings.ToLower(trig.TGOp) == "delete" {
+			return trig.OldRow, true, nil
+		}
+		return trig.NewRow, true, nil
+	}
+}
+
+// execPLpgSQLEmbeddedSQL executes an embedded SQL statement from a PL/pgSQL
+// body. Trigger OLD.* / NEW.* references are substituted with literal values
+// before parsing. M0096-0012.
+func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error {
+	// Substitute OLD.* → VALUES(v1, v2, ...) and OLD.col → literal.
+	if frame.trig != nil {
+		sql = substituteTriggerRefs(sql, frame.trig)
+	}
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return &ExecError{Code: "42601", Message: fmt.Sprintf("PL/pgSQL embedded SQL parse error: %v", err)}
+	}
+	if len(stmts) == 0 {
+		return nil
+	}
+	for _, stmt := range stmts {
+		plan, err := planner.Plan(stmt, ctx.Catalog)
+		if err != nil {
+			return err
+		}
+		op, err := Build(plan)
+		if err != nil {
+			return err
+		}
+		if err := op.Open(ctx); err != nil {
+			op.Close()
+			return err
+		}
+		// Drain all rows (side-effect execution).
+		for {
+			_, err := op.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				op.Close()
+				return err
+			}
+		}
+		op.Close()
+	}
+	return nil
+}
+
+// substituteTriggerRefs replaces OLD.* / NEW.* / OLD.colname / NEW.colname
+// in a SQL text with the actual literal values from the trigger context.
+// Used by execPLpgSQLEmbeddedSQL for embedded SQL in trigger bodies. M0096-0012.
+func substituteTriggerRefs(sql string, trig *plpgsqlTrigCtx) string {
+	// Replace "OLD.*" and "NEW.*" with their column value lists.
+	for _, which := range []string{"old", "new"} {
+		var row Row
+		if which == "old" {
+			row = trig.OldRow
+		} else {
+			row = trig.NewRow
+		}
+		if row == nil {
+			continue
+		}
+		// Replace "OLD.*" / "NEW.*" with "val1, val2, ..."
+		star := strings.ToUpper(which) + ".*"
+		if strings.Contains(strings.ToUpper(sql), star) {
+			vals := make([]string, len(trig.Cols))
+			for i := range trig.Cols {
+				val := NullDatum
+				if i < len(row) {
+					val = row[i]
+				}
+				vals[i] = datumToSQLLiteral(val)
+			}
+			replacement := strings.Join(vals, ", ")
+			// Case-insensitive replace.
+			sqlUpper := strings.ToUpper(sql)
+			starUpper := strings.ToUpper(star)
+			idx := strings.Index(sqlUpper, starUpper)
+			for idx != -1 {
+				sql = sql[:idx] + replacement + sql[idx+len(star):]
+				sqlUpper = strings.ToUpper(sql)
+				idx = strings.Index(sqlUpper, starUpper)
+			}
+		}
+		// Replace "OLD.colname" / "NEW.colname" with literal values.
+		for i, col := range trig.Cols {
+			ref := strings.ToUpper(which) + "." + strings.ToUpper(col.Name)
+			sqlUpper := strings.ToUpper(sql)
+			idx := strings.Index(sqlUpper, ref)
+			if idx == -1 {
+				continue
+			}
+			val := NullDatum
+			if i < len(row) {
+				val = row[i]
+			}
+			literal := datumToSQLLiteral(val)
+			for idx != -1 {
+				sql = sql[:idx] + literal + sql[idx+len(ref):]
+				sqlUpper = strings.ToUpper(sql)
+				idx = strings.Index(sqlUpper, ref)
+			}
+		}
+	}
+	return sql
+}
+
+// datumToSQLLiteral formats a Datum as a SQL literal string suitable for
+// text substitution in embedded SQL. M0096-0012.
+func datumToSQLLiteral(d Datum) string {
+	if d.IsNull() {
+		return "NULL"
+	}
+	switch d.Kind {
+	case KindInt:
+		return fmt.Sprintf("%d", d.Int)
+	case KindBool:
+		if d.BoolValue() {
+			return "TRUE"
+		}
+		return "FALSE"
+	case KindString:
+		// Escape single quotes.
+		s := strings.ReplaceAll(d.StringValue(), "'", "''")
+		return "'" + s + "'"
+	default:
+		s := strings.ReplaceAll(d.Format(), "'", "''")
+		return "'" + s + "'"
+	}
 }

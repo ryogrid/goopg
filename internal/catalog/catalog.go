@@ -102,6 +102,10 @@ type Table struct {
 	// REFERENCES or ALTER TABLE ADD FOREIGN KEY). M0096-0011.
 	ForeignKeys []ForeignKey
 
+	// Triggers holds row- and statement-level triggers defined on this
+	// table via CREATE TRIGGER. M0096-0012.
+	Triggers []Trigger
+
 	// ── Partition support (M0096-0007) ────────────────────────────────────
 	//
 	// PartitionKey holds the column names when this is a partitioned table
@@ -116,6 +120,28 @@ type Table struct {
 	// routing and display. For LIST: InValues strings; for RANGE: one
 	// PartitionBound with From/To strings.
 	PartitionBounds []PartitionBound
+}
+
+// TriggerTiming mirrors parser.TriggerTiming to avoid importing the
+// parser package in contexts that only need the catalog. M0096-0012.
+type TriggerTiming int
+
+const (
+	TriggerBefore    TriggerTiming = 1
+	TriggerAfter     TriggerTiming = 2
+	TriggerInsteadOf TriggerTiming = 3
+)
+
+// Trigger describes one row-level or statement-level trigger on a table.
+// M0096-0012.
+type Trigger struct {
+	Name       string
+	TableOID   uint32
+	Timing     TriggerTiming
+	Events     []string // "insert", "update", "delete"
+	ForEachRow bool
+	FuncName   string // function/procedure name (unschemed)
+	FuncSchema string
 }
 
 // ForeignKey describes one referential integrity constraint stored on a
