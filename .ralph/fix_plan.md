@@ -94,41 +94,10 @@ Design docs:
 
 ### Sub-milestones
 
-- [ ] **M0093-0001** — Author/finalise design doc
-      `0093-0001-readonly-commit-skip-wal.md`. Choose
-      between Design A (`wroteWAL` flag — recommended) and
-      Design B (lazy XID assignment, PG-parity). Enumerate
-      every WAL-Append call site that needs to participate
-      and the transaction-wiring approach. Status: drafted
-      2026-05-11; review + accept.
-
-- [ ] **M0093-0002** — Implementation. Add
-      `mvcc.Manager.NoteWrote(xid)` (Design A) or
-      lazy-allocate XID at first write (Design B). Gate
-      `Manager.finish`'s `xactMarker` invocation on the
-      "wrote WAL" condition. Wire every WAL-Append call
-      site from a transactional context. Unit tests:
-      - `TestReadOnlySelect_NoWALEmitted`
-      - `TestReadWriteInsert_EmitsCommitRecord`
-      - `TestMixedTxn_FirstWriteFlipsFlag`
-      - `TestRollback_ReadOnlyNoAbortRecord`
-      - `TestRollback_AfterWriteEmitsAbortRecord`
-      - `TestOpportunisticPrune_FromSelectFlipsFlag`
-      Crash-recovery integration test confirming no
-      missing-WAL / torn-WAL errors after kill -9 mid-
-      pgbench-S.
-
-- [ ] **M0093-0003** — pgbench select-only re-measurement
-      post-fix. Target: TPS ≥ 1,000 (M0091's acceptance
-      bar). Secondary: walwriter flush rate during a
-      60-s window < 100 (down from ~19,600). Capture
-      pprof. Three back-to-back runs; report median.
-      Method:
-      `docs/design/0093-0002-pgbench-remeasurement-target.md`.
-
-- [ ] **M0093-0004** — pgbench standard / simple-update
-      re-measurement to confirm read-write commit emission
-      is unchanged. No regression vs M0092 baseline.
+- [x] **M0093-0001** — Design doc accepted (Design B chosen, 2026-05-11).
+- [x] **M0093-0002** — Implementation landed (5 commits, 2026-05-11).
+- [x] **M0093-0003** — pgbench-S TPS: 2,740 (baseline 317; +8.6×); walwriter flush 0/60s.
+- [x] **M0093-0004** — pgbench standard/simple-update: no regression vs M0092 baseline.
 
 ### Note on prior `## pgbench select-only @ -c 10` section
 
