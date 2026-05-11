@@ -869,6 +869,39 @@ func PageGetItemRaw(p Page, slot uint16) ([]byte, error) {
 	return append([]byte(nil), p[off:off+ln]...), nil
 }
 
+// PageGetItemRawNoCopy is the alias-the-page variant of
+// PageGetItemRaw. The returned slice REFERENCES the page bytes
+// directly — no allocation, but the caller MUST hold the page pin
+// for the lifetime of the returned slice and MUST NOT retain it
+// across the unpin. Used by btree.RangeScan's CAT-1 callers per
+// M0091-0002.
+func PageGetItemRawNoCopy(p Page, slot uint16) ([]byte, error) {
+	if slot == 0 {
+		return nil, ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return nil, ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return nil, err
+	}
+	if item.Flags != ItemIDNormal {
+		return nil, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	ln := int(item.Length)
+	if off < 0 || ln < 0 || off+ln > len(p) {
+		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+	}
+	return p[off : off+ln], nil
+}
+
 func readItemID(p Page, idx int) (ItemID, error) {
 	off := SizeOfPageHeaderData + idx*itemIDSize
 	if off < 0 || off+itemIDSize > len(p) {

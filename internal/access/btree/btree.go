@@ -230,6 +230,29 @@ func parseItem(raw []byte) (item, error) {
 	}, nil
 }
 
+// parseItemNoCopy returns an `item` whose `key` field ALIASES `raw`
+// (no allocation). The caller MUST NOT retain key beyond the
+// lifetime of raw. Used by RangeScan (M0091-0002) — its CAT-1
+// callers don't retain key, so we can skip the per-slot
+// allocation that the regular `parseItem` does.
+func parseItemNoCopy(raw []byte) (item, error) {
+	if len(raw) < itemPrefixSize {
+		return item{}, fmt.Errorf("btree: item too short (%d bytes)", len(raw))
+	}
+	keyLen := binary.LittleEndian.Uint16(raw[0:2])
+	if int(keyLen)+itemPrefixSize != len(raw) {
+		return item{}, fmt.Errorf("btree: item length mismatch keyLen=%d total=%d", keyLen, len(raw))
+	}
+	return item{
+		keyLen: keyLen,
+		ptr: storage.ItemPointer{
+			Block:  storage.BlockNumber(binary.LittleEndian.Uint32(raw[2:6])),
+			Offset: binary.LittleEndian.Uint16(raw[6:8]),
+		},
+		key: raw[itemPrefixSize:], // alias — caller must not retain
+	}, nil
+}
+
 // EncodeInt4 is the canonical key encoding for v0 (4-byte big-endian int32).
 // Big-endian preserves numeric order as bytewise lexicographic order.
 func EncodeInt4(key int32) []byte {
@@ -1914,12 +1937,29 @@ func (bt *BTree) Search(key []byte) (storage.ItemPointer, bool, error) {
 // fn returning false stops the scan; the returned error from fn aborts
 // with that error.
 //
+// **CONTRACT (M0091-0002):** the `key []byte` passed to `fn` ALIASES
+// the still-pinned btree leaf page. `fn` MUST NOT:
+//   - retain `key` beyond its return (the page may be unpinned and
+//     reused for a different page after the next call);
+//   - re-enter THIS btree (would deadlock against our held RLock
+//     on the leaf page);
+//   - perform long-running I/O (the RLock blocks btree writers on
+//     this leaf page only; bounded writer-starvation is acceptable
+//     for point lookups / heap-fetch but not for arbitrary I/O).
+//
+// Callers that need to retain `key` clone it explicitly:
+//
+//	keyCopy := append([]byte(nil), key...)
+//
+// All 4 production callers (indexScanOp.Rescan,
+// indexOnlyScanOp.Rescan, upsertOp.probeArbiter, and the non-HOT
+// UPDATE index-probe in operators_storage.go) are CAT-1 per
+// docs/design/0091-0002 — audited 2026-05-11.
+//
 // RangeScan takes no tree-wide lock; each page is read under the
 // buffer pool's per-slot shared content latch. The first leaf is
 // reached via descendToLeaf (which already handles right-link
 // recovery); subsequent leaves are walked rightward via op.Next.
-// fn is invoked while no latches are held so callers may issue
-// further btree operations without deadlocking.
 func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPointer) (bool, error)) error {
 	cur, _, err := bt.descendToLeaf(lo)
 	if err != nil {
@@ -1943,64 +1983,92 @@ func (bt *BTree) RangeScan(lo, hi []byte, fn func(key []byte, ptr storage.ItemPo
 			cur = next
 			continue
 		}
-		// Copy raw page items before releasing the pin so fn may do
-		// further btree operations without deadlocking. Posting items
-		// (M0047-0003) are detected by the BTPostingFlag in keyLen and
-		// expanded to one (key, TID) call per TID in the posting list.
+		// M0091-0002: parse + invoke fn WHILE the pin is held.
+		// Pre-fix this loop copied every slot's raw bytes to a
+		// per-slot []byte ("append([]byte(nil), r...)") so the
+		// pin could be released before fn ran — ~400 allocations
+		// per point-lookup leaf-page visit, driving 13 % of
+		// allocations in the select-only pprof. All current
+		// callers are CAT-1 (see contract above); none retain
+		// key beyond fn, none re-enter the btree.
 		count, countErr := storage.PageLinePointerCount(slot.Page())
-		type rawSlot struct{ raw []byte }
-		rawSlots := make([]rawSlot, 0, count)
+		nextBlk := op.Next
+		stop := false
+		var fnErr error
 		if countErr == nil {
+		slotLoop:
 			for s := uint16(1); s <= uint16(count); s++ {
-				r, rawErr := storage.PageGetItemRaw(slot.Page(), s)
-				if rawErr == nil {
-					rawSlots = append(rawSlots, rawSlot{append([]byte(nil), r...)})
+				// M0091-0002: NoCopy aliases the still-pinned
+				// page; we never retain it past `fn`'s return,
+				// and the pin is held across this whole loop.
+				r, rawErr := storage.PageGetItemRawNoCopy(slot.Page(), s)
+				if rawErr != nil {
+					continue
+				}
+				if isPostingRaw(r) {
+					// Posting items still allocate inside
+					// parsePostingRaw (TID slice + key copy).
+					// Out-of-scope for M0091; pgbench pkey is
+					// non-posting so this branch doesn't fire
+					// in the target workload.
+					key, tids, perr := parsePostingRaw(r)
+					if perr != nil {
+						continue
+					}
+					if lo != nil && CompareKeys(key, lo) < 0 {
+						continue
+					}
+					if hi != nil && CompareKeys(key, hi) > 0 {
+						stop = true
+						break slotLoop
+					}
+					for _, tid := range tids {
+						ok, ferr := fn(key, tid)
+						if ferr != nil {
+							fnErr = ferr
+							stop = true
+							break slotLoop
+						}
+						if !ok {
+							stop = true
+							break slotLoop
+						}
+					}
+				} else {
+					// M0091-0002: parseItemNoCopy aliases the
+					// page; key MUST NOT be retained by fn.
+					it, perr := parseItemNoCopy(r)
+					if perr != nil {
+						continue
+					}
+					if lo != nil && CompareKeys(it.key, lo) < 0 {
+						continue
+					}
+					if hi != nil && CompareKeys(it.key, hi) > 0 {
+						stop = true
+						break slotLoop
+					}
+					ok, ferr := fn(it.key, it.ptr)
+					if ferr != nil {
+						fnErr = ferr
+						stop = true
+						break slotLoop
+					}
+					if !ok {
+						stop = true
+						break slotLoop
+					}
 				}
 			}
 		}
 		bt.unpinR(slot)
-		for _, rs := range rawSlots {
-			if isPostingRaw(rs.raw) {
-				key, tids, perr := parsePostingRaw(rs.raw)
-				if perr != nil {
-					continue
-				}
-				if lo != nil && CompareKeys(key, lo) < 0 {
-					continue
-				}
-				if hi != nil && CompareKeys(key, hi) > 0 {
-					return nil
-				}
-				for _, tid := range tids {
-					ok, ferr := fn(key, tid)
-					if ferr != nil {
-						return ferr
-					}
-					if !ok {
-						return nil
-					}
-				}
-			} else {
-				it, perr := parseItem(rs.raw)
-				if perr != nil {
-					continue
-				}
-				if lo != nil && CompareKeys(it.key, lo) < 0 {
-					continue
-				}
-				if hi != nil && CompareKeys(it.key, hi) > 0 {
-					return nil
-				}
-				ok, ferr := fn(it.key, it.ptr)
-				if ferr != nil {
-					return ferr
-				}
-				if !ok {
-					return nil
-				}
-			}
+		if fnErr != nil {
+			return fnErr
 		}
-		cur = op.Next
+		if stop {
+			return nil
+		}
+		cur = nextBlk
 	}
 	return nil
 }
