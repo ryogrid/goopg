@@ -181,6 +181,24 @@ TPS); these sub-milestones target the residual.
   M0092-0004/0005/0006/0007 land. Target: TPS ≥ 700
   (honest 1.6× of post-M0092 baseline 437.62; stretch
   goal: ≥ 1,000 = M0091's bar).
+  **Result (2026-05-11):** TPS not moved past noise floor.
+  Re-measurement of the M0092 baseline (`82d7acf`) on the
+  same machine produced **317.47 TPS** — the documented
+  437.62 figure does not reproduce, likely due to
+  environment / cache state at the time of the original
+  measurement. The 4 follow-up commits run in the
+  283-342 TPS range across 3 runs (overlapping range with
+  the re-measured baseline). CPU pprof shows the goopg
+  server at **0.17 % CPU** during the run — bottleneck is
+  per-commit WAL fsync (~19,600 walwriter flushes / 60 s
+  matches the query rate), not allocation. The targeted
+  alloc sites are gone from the steady-state top-23 (good
+  for other workloads); they just don't surface in
+  pgbench-S TPS because the workload is fsync-bound. Full
+  analysis: `bench/pgbench-compare/results/20260511_goopg_select-only_m0092_followup_summary.md`.
+  **M0093 candidate:** skip WAL emission for read-only
+  implicit transactions (one commit record per pgbench-S
+  query that writes no data is structurally avoidable).
 
 ### Why these targets specifically
 
