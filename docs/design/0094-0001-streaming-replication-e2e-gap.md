@@ -1,6 +1,6 @@
 # 0094-0001 — Streaming Replication E2E Gap
 
-**Status:** draft
+**Status:** accepted (2026-05-11 — PreCloneHook landed; TestE2E_PhysicalReplication un-skipped)
 **Date:** 2026-05-11
 **Milestone:** M0094-0001
 

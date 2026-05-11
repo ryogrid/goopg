@@ -182,16 +182,15 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
 
 ### Sub-milestones
 
-- [ ] **M0094-0001** — Design doc `0094-0001-streaming-replication-e2e-gap.md`
-      status → `accepted`. Add `PreCloneHook func(*Conn) error` to
-      `replcluster.Options`; call it in `Setup()` after primary start, before
-      standby clone. Audit `internal/wal/recovery.go::ApplyRecord` for silently-
-      skipped record kinds (BtreeInsert, BtreeSplit, HeapVacuum); fix any that
-      are incorrectly skipped. Un-skip `TestE2E_PhysicalReplication` with a hook
-      that creates `repl_t (id int)` before clone, inserts a row on primary, waits,
-      queries standby. All tests pass; `go test ./...` no regressions.
+- [x] **M0094-0001** — Design doc `0094-0001-streaming-replication-e2e-gap.md`
+      status → `accepted` (2026-05-11). Added `PreCloneHook func(*cluster.Cluster) error`
+      to `replcluster.Options`; wired in `Setup()` after primary start, before
+      standby clone. WAL `ApplyRecord` audit: all record kinds already handled
+      (BtreeInsert, BtreeSplit, HeapVacuum all have replay functions — no gaps).
+      Un-skipped `TestE2E_PhysicalReplication` with a hook that creates `repl_t (id int)`
+      before clone, inserts a row on primary, waits, queries standby.
       Key files: `internal/testutil/replcluster/replcluster.go`,
-      `internal/wal/recovery.go`, `internal/testport/e2e_replication_test.go`.
+      `internal/testport/e2e_replication_test.go`.
 
 - [ ] **M0094-0002** — Design doc `0094-0002-logical-apply-delete-update.md`
       status → `accepted`. In `internal/wal/reorder.go::Close()`, fold

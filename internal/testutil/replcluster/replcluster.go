@@ -56,14 +56,20 @@ type Options struct {
 	// single-cluster harness. Defaults match cluster.Options.
 	StartupWait  time.Duration
 	ShutdownWait time.Duration
+	// PreCloneHook is called after the primary starts but before the
+	// standby data directory is cloned. Use it to create tables or
+	// populate data that the standby should inherit via the base copy.
+	// On hook failure Setup returns the error and stops.
+	PreCloneHook func(*cluster.Cluster) error
 }
 
 // ReplCluster is the primary+standby pair handle.
 type ReplCluster struct {
-	Primary  *cluster.Cluster
-	Standby  *cluster.Cluster
-	SlotName string
-	repoRoot string
+	Primary      *cluster.Cluster
+	Standby      *cluster.Cluster
+	SlotName     string
+	repoRoot     string
+	preCloneHook func(*cluster.Cluster) error
 }
 
 // New constructs the pair. Both clusters get their own fresh data
@@ -103,10 +109,11 @@ func New(name string, opts Options) (*ReplCluster, error) {
 		return nil, fmt.Errorf("replcluster: standby: %w", err)
 	}
 	return &ReplCluster{
-		Primary:  primary,
-		Standby:  standby,
-		SlotName: slotName,
-		repoRoot: opts.RepoRoot,
+		Primary:      primary,
+		Standby:      standby,
+		SlotName:     slotName,
+		repoRoot:     opts.RepoRoot,
+		preCloneHook: opts.PreCloneHook,
 	}, nil
 }
 
@@ -135,6 +142,16 @@ func (r *ReplCluster) Setup() error {
 	//    other startup files we want to clone.
 	if err := r.Primary.Start(); err != nil {
 		return fmt.Errorf("replcluster: primary start: %w", err)
+	}
+
+	// 2b. Run the pre-clone hook (if any) while the primary is live.
+	//     Typical use: CREATE TABLE + INSERT before the clone so the
+	//     standby inherits the pages via the base copy.
+	if r.preCloneHook != nil {
+		if err := r.preCloneHook(r.Primary); err != nil {
+			_ = r.Primary.Stop(cluster.ShutdownFast)
+			return fmt.Errorf("replcluster: PreCloneHook: %w", err)
+		}
 	}
 
 	// 3. Stop primary cleanly so the on-disk state is durable, then
