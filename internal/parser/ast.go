@@ -117,6 +117,22 @@ type AnalyzeStmt struct {
 func (s *AnalyzeStmt) Pos() int  { return s.pos }
 func (s *AnalyzeStmt) stmtNode() {}
 
+// ReindexStmt — `REINDEX [(VERBOSE)] [CONCURRENTLY]
+// {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM} [IF EXISTS] name`.
+// M0095-0005: no-op executor stub; parser accepts the full syntax so
+// reindexdb can interact with goopg without syntax errors.
+type ReindexStmt struct {
+	pos         int
+	Verbose     bool
+	Concurrently bool
+	// Object type: one of "INDEX", "TABLE", "DATABASE", "SCHEMA", "SYSTEM".
+	ObjectType  string
+	Name        string // qualified relation / database / schema name
+}
+
+func (s *ReindexStmt) Pos() int  { return s.pos }
+func (s *ReindexStmt) stmtNode() {}
+
 // ExplainFormat selects the rendering format for ExplainStmt
 // output. M0018-0001 introduces the AST shape; the renderer
 // honours TEXT today and JSON in 0018-0002 / 0018-0004.

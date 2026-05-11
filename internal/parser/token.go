@@ -217,6 +217,9 @@ const (
 	KwParallel Keyword = "parallel"
 	KwLateral  Keyword = "lateral"
 	KwAny      Keyword = "any"
+
+	// M0095-0005: REINDEX statement stub.
+	KwReindex Keyword = "reindex"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -355,6 +358,7 @@ var keywords = map[string]Keyword{
 	"parallel":     KwParallel,
 	"lateral":      KwLateral,
 	"any":          KwAny,
+	"reindex":      KwReindex,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

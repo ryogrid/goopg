@@ -332,9 +332,6 @@ func TestPort_Scripts070Dropuser(t *testing.T) {
 // parser+executor (at minimum a no-op stub for DATABASE / TABLE forms) before
 // enabling. Full relfilenode tracking requires storage-layer support.
 func TestPort_Scripts090Reindexdb(t *testing.T) {
-	t.Skip("REINDEX statement not supported in goopg parser/executor; " +
-		"add parser+executor stub for REINDEX before enabling")
-
 	if _, err := exec.LookPath("reindexdb"); err != nil {
 		t.Skip("reindexdb not in PATH")
 	}
@@ -360,9 +357,6 @@ func TestPort_Scripts090Reindexdb(t *testing.T) {
 // Skip: requires REINDEX SQL support (same as 090) plus multi-database
 // awareness for --all.
 func TestPort_Scripts091ReindexdbAll(t *testing.T) {
-	t.Skip("REINDEX statement not supported in goopg parser/executor; " +
-		"also requires multi-database support for --all; enable after 090")
-
 	if _, err := exec.LookPath("reindexdb"); err != nil {
 		t.Skip("reindexdb not in PATH")
 	}

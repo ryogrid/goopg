@@ -259,12 +259,12 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       All three vacuumdb tests pass (100/101/102).
       CSV: D-005a/b/c → port,yes (2026-05-12).
 
-- [ ] **M0095-0005** — Add `REINDEX` parser+executor stub
-      (`REINDEX [CONCURRENTLY] (INDEX|TABLE|DATABASE|SCHEMA) name`).
-      Executor performs a no-op rebuild (accept + return success) sufficient
-      for reindexdb to report exit 0.
-      Unblocks: `TestPort_Scripts090Reindexdb`, `091`.
-      CSV: D-005h → port, D-005i → port.
+- [x] **M0095-0005** — Add REINDEX parser+executor stub:
+      `REINDEX [(VERBOSE)] [CONCURRENTLY] {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM}
+      [IF EXISTS] name`.
+      KwReindex keyword, ReindexStmt AST, parseReindex(), planner Utility node,
+      executor no-op (utilityNoOp fallthrough). Both reindexdb tests pass.
+      CSV: D-005h/i → port,yes (2026-05-12).
 
 - [ ] **M0095-0006** — Add `CREATE ROLE` / `CREATE USER` / `DROP ROLE` /
       `DROP USER` to parser and executor.  Executor writes entries to / removes

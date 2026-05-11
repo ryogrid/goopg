@@ -181,6 +181,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseVacuum()
 	case KwAnalyze, KwAnalyse:
 		return p.parseAnalyze()
+	case KwReindex:
+		return p.parseReindex()
 	case KwShow:
 		return p.parseShow()
 	case KwSet:
@@ -815,6 +817,76 @@ func (p *parser) parseSet() (Stmt, error) {
 	}
 	s.Value = val
 	return s, nil
+}
+
+// parseReindex parses REINDEX statements (M0095-0005).
+//
+// Syntax accepted:
+//
+//	REINDEX [(VERBOSE)] [CONCURRENTLY] {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM}
+//	  [IF EXISTS] name
+//
+// Executor stub: always succeeds without performing any index rebuild.
+func (p *parser) parseReindex() (Stmt, error) {
+	t := p.advance() // consume REINDEX
+	r := &ReindexStmt{pos: t.Pos}
+
+	// Optional parenthesized option list: REINDEX (VERBOSE) ...
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance() // consume (
+		for {
+			if p.acceptKeyword(KwVerbose) {
+				r.Verbose = true
+			} else if p.acceptIdentKeyword("tablespace") {
+				// TABLESPACE option: consume the tablespace name
+				_, _ = p.parseIdent()
+			} else {
+				break
+			}
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after REINDEX options")
+		}
+	}
+
+	// Optional CONCURRENTLY
+	if p.acceptIdentKeyword("concurrently") {
+		r.Concurrently = true
+	}
+
+	// Object type keyword (treated as identifiers to avoid keyword conflicts).
+	switch {
+	case p.acceptKeyword(KwIndex):
+		r.ObjectType = "INDEX"
+	case p.acceptKeyword(KwTable):
+		r.ObjectType = "TABLE"
+	case p.acceptIdentKeyword("database"):
+		r.ObjectType = "DATABASE"
+	case p.acceptIdentKeyword("schema"):
+		r.ObjectType = "SCHEMA"
+	case p.acceptIdentKeyword("system"):
+		r.ObjectType = "SYSTEM"
+	default:
+		return nil, p.errAtCur("expected INDEX, TABLE, DATABASE, SCHEMA, or SYSTEM after REINDEX")
+	}
+
+	// Optional IF EXISTS
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+	}
+
+	// Object name (possibly schema-qualified)
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	r.Name = name.String()
+	return r, nil
 }
 
 // parseReset: RESET name | RESET ALL
