@@ -705,6 +705,53 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				left = &BinaryOp{pos: pos, Op: OpNotLike, Left: left, Right: rhs}
 				continue
 			}
+			// ILIKE / NOT ILIKE (case-insensitive LIKE). M0097-0011.
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwIlike {
+				pos := t.Pos
+				p.advance()
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				left = &BinaryOp{pos: pos, Op: OpILike, Left: left, Right: rhs}
+				continue
+			}
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwIlike {
+				pos := t.Pos
+				p.advance() // NOT
+				p.advance() // ILIKE
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				left = &BinaryOp{pos: pos, Op: OpNotILike, Left: left, Right: rhs}
+				continue
+			}
+			// POSIX regex operators: ~ ~* !~ !~* (M0097-0011).
+			if t := p.cur(); t.Kind == TokenOperator {
+				var op OpCode
+				switch t.Value {
+				case "~":
+					op = OpRegexMatch
+				case "~*":
+					op = OpRegexIMatch
+				case "!~":
+					op = OpRegexNoMatch
+				case "!~*":
+					op = OpRegexINoMatch
+				}
+				if op != OpUnknown {
+					pos := t.Pos
+					p.advance() // consume the operator token
+					rhs, err := p.parseExprPrec(precCompare + 1)
+					if err != nil {
+						return nil, err
+					}
+					left = &BinaryOp{pos: pos, Op: op, Left: left, Right: rhs}
+					continue
+				}
+			}
 			// `expr [NOT] BETWEEN low AND high` desugars to
 			//   `expr >= low AND expr <= high`
 			// (or wrapped in NOT for the inverse). The low and high

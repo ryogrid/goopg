@@ -2,9 +2,14 @@ package executor
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -267,22 +272,34 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 			return Datum{}, err
 		}
 		return NewBoolDatum(cmpResult(op, cmp)), nil
-	case parser.OpLike, parser.OpNotLike:
-		// M0062-followup: accept KindBytes operands as UTF-8 text so a
-		// varchar that arrives as bytes (e.g. via a row-reshaping path
-		// that drops Kind) still evaluates correctly. Mirrors
-		// `compareDatum`'s cross-Kind tolerance and aligns LIKE with
-		// the comparators it sits next to. The error message includes
-		// the actual Datum kinds so any residual non-string-non-bytes
-		// case is diagnosable in one run instead of needing a server
-		// log dive.
+	case parser.OpLike, parser.OpNotLike, parser.OpILike, parser.OpNotILike:
 		ls, lok := datumAsString(left)
 		rs, rok := datumAsString(right)
 		if !lok || !rok {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands (got left.Kind=%d right.Kind=%d)", op, left.Kind, right.Kind)}
 		}
-		matched := matchSQLLike(ls, rs)
-		if op == parser.OpNotLike {
+		var matched bool
+		if op == parser.OpILike || op == parser.OpNotILike {
+			matched = matchSQLLike(strings.ToLower(ls), strings.ToLower(rs))
+		} else {
+			matched = matchSQLLike(ls, rs)
+		}
+		if op == parser.OpNotLike || op == parser.OpNotILike {
+			matched = !matched
+		}
+		return NewBoolDatum(matched), nil
+	case parser.OpRegexMatch, parser.OpRegexIMatch, parser.OpRegexNoMatch, parser.OpRegexINoMatch:
+		// POSIX regex operators. M0097-0011.
+		ls, lok := datumAsString(left)
+		rs, rok := datumAsString(right)
+		if !lok || !rok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires string operands", op)}
+		}
+		matched, err := evalPOSIXRegex(ls, rs, op == parser.OpRegexIMatch || op == parser.OpRegexINoMatch)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "2201B", Pos: pos, Message: fmt.Sprintf("invalid regular expression: %v", err)}
+		}
+		if op == parser.OpRegexNoMatch || op == parser.OpRegexINoMatch {
 			matched = !matched
 		}
 		return NewBoolDatum(matched), nil
@@ -355,6 +372,19 @@ func matchSQLLike(s, pat string) bool {
 		pi++
 	}
 	return pi == len(pat)
+}
+
+// evalPOSIXRegex evaluates a POSIX extended regex match.
+// caseInsensitive applies the (?i) flag. M0097-0011.
+func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
+	if caseInsensitive {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return false, err
+	}
+	return re.MatchString(s), nil
 }
 
 // addTimeInterval applies an interval to a time value. When
@@ -1689,6 +1719,92 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_input_error_info":
 		return NullDatum, nil
 
+	// ── Hash / crypto functions (M0097-0011) ─────────────────────────────
+	case "md5":
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			h := md5.Sum([]byte(v.StringValue()))
+			return NewStringDatum(hex.EncodeToString(h[:])), nil
+		}
+	case "sha256":
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			h := sha256.Sum256([]byte(v.StringValue()))
+			return NewStringDatum(hex.EncodeToString(h[:])), nil
+		}
+	case "sha512":
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			h := sha512.Sum512([]byte(v.StringValue()))
+			return NewStringDatum(hex.EncodeToString(h[:])), nil
+		}
+	case "digest":
+		// digest(text, algorithm) — subset: only 'md5', 'sha256', 'sha512'
+		if len(x.Args) == 2 {
+			s, err1 := evalExpr(x.Args[0], row, ctx)
+			alg, err2 := evalExpr(x.Args[1], row, ctx)
+			if err1 != nil || err2 != nil || s.IsNull() || alg.IsNull() {
+				return NullDatum, nil
+			}
+			switch strings.ToLower(alg.StringValue()) {
+			case "md5":
+				h := md5.Sum([]byte(s.StringValue()))
+				return NewStringDatum(hex.EncodeToString(h[:])), nil
+			case "sha256":
+				h := sha256.Sum256([]byte(s.StringValue()))
+				return NewStringDatum(hex.EncodeToString(h[:])), nil
+			case "sha512":
+				h := sha512.Sum512([]byte(s.StringValue()))
+				return NewStringDatum(hex.EncodeToString(h[:])), nil
+			}
+		}
+		return NullDatum, nil
+
+	// ── POSIX regex functions (M0097-0011) ────────────────────────────────
+	case "regexp_match":
+		// regexp_match(string, pattern [, flags]) → text[]
+		// Returns first match as array or NULL if no match.
+		// Stub: return text[] with full match as first element, or NULL.
+		if len(x.Args) >= 2 {
+			s, e1 := evalExpr(x.Args[0], row, ctx)
+			pat, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil || s.IsNull() || pat.IsNull() {
+				return NullDatum, nil
+			}
+			caseInsensitive := false
+			if len(x.Args) >= 3 {
+				flags, e3 := evalExpr(x.Args[2], row, ctx)
+				if e3 == nil && !flags.IsNull() {
+					caseInsensitive = strings.Contains(flags.StringValue(), "i")
+				}
+			}
+			pattern := pat.StringValue()
+			if caseInsensitive {
+				pattern = "(?i)" + pattern
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return NullDatum, nil
+			}
+			match := re.FindString(s.StringValue())
+			if match == "" && !re.MatchString(s.StringValue()) {
+				return NullDatum, nil
+			}
+			return NewStringDatum("{" + match + "}"), nil
+		}
+	case "regexp_matches":
+		// regexp_matches(string, pattern [, flags]) — SRF, stub returns NULL
+		return NullDatum, nil
+
 	// ── Sequence functions (M0097-0009) ───────────────────────────────────
 	case "nextval":
 		args := make([]Datum, len(x.Args))
@@ -2056,13 +2172,51 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum("\"" + escaped + "\""), nil
 		}
 	case "regexp_replace":
-		// regexp_replace(text, pattern, replacement [, flags]) — best-effort stub
+		// regexp_replace(text, pattern, replacement [, flags]) M0097-0011.
 		if len(x.Args) >= 3 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
-			if e1 != nil || s.IsNull() {
+			pat, e2 := evalExpr(x.Args[1], row, ctx)
+			repl, e3 := evalExpr(x.Args[2], row, ctx)
+			if e1 != nil || e2 != nil || e3 != nil || s.IsNull() || pat.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(s.StringValue()), nil // stub: return input unchanged
+			replaceAll := false
+			caseInsensitive := false
+			if len(x.Args) >= 4 {
+				flags, e4 := evalExpr(x.Args[3], row, ctx)
+				if e4 == nil && !flags.IsNull() {
+					fs := flags.StringValue()
+					replaceAll = strings.Contains(fs, "g")
+					caseInsensitive = strings.Contains(fs, "i")
+				}
+			}
+			pattern := pat.StringValue()
+			if caseInsensitive {
+				pattern = "(?i)" + pattern
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return NewStringDatum(s.StringValue()), nil // invalid pattern: return input
+			}
+			replacement := repl.StringValue()
+			// Convert PostgreSQL \1, \2 backreferences to Go $1, $2.
+			replacement = strings.ReplaceAll(replacement, `\1`, `${1}`)
+			replacement = strings.ReplaceAll(replacement, `\2`, `${2}`)
+			var result string
+			if replaceAll {
+				result = re.ReplaceAllString(s.StringValue(), replacement)
+			} else {
+				// Replace only first occurrence.
+				found := false
+				result = re.ReplaceAllStringFunc(s.StringValue(), func(m string) string {
+					if found {
+						return m
+					}
+					found = true
+					return re.ReplaceAllString(m, replacement)
+				})
+			}
+			return NewStringDatum(result), nil
 		}
 	case "format":
 		// format(fmt, args...) — simplified stub: return format string

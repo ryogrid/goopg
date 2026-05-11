@@ -680,7 +680,7 @@ M0097-0001 wires it up.
       table (returns 0 rows), pg_advisory_lock_shared/try variants. All 10
       target tests complete without hanging (max 0.12s).
 
-- [ ] **M0097-0011** — String functions + regex + misc functions parity.
+- [x] **M0097-0011** — String functions + regex + misc functions parity.
       Target tests: `strings`, `regex`, `md5`, `misc_functions`,
       `misc`.
       Work: string continuation syntax, Unicode escape sequences,

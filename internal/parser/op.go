@@ -46,6 +46,14 @@ const (
 	// Binary pattern
 	OpLike
 	OpNotLike
+	OpILike
+	OpNotILike
+
+	// POSIX regex operators (M0097-0011)
+	OpRegexMatch    // a ~ b   (case-sensitive match)
+	OpRegexIMatch   // a ~* b  (case-insensitive match)
+	OpRegexNoMatch  // a !~ b  (case-sensitive no-match)
+	OpRegexINoMatch // a !~* b (case-insensitive no-match)
 )
 
 // ParseUnaryOp converts the token text the parser emits
@@ -102,6 +110,18 @@ func ParseBinaryOp(s string) OpCode {
 		return OpLike
 	case "NOT LIKE":
 		return OpNotLike
+	case "ILIKE":
+		return OpILike
+	case "NOT ILIKE":
+		return OpNotILike
+	case "~":
+		return OpRegexMatch
+	case "~*":
+		return OpRegexIMatch
+	case "!~":
+		return OpRegexNoMatch
+	case "!~*":
+		return OpRegexINoMatch
 	}
 	return OpUnknown
 }
@@ -151,6 +171,18 @@ func (o OpCode) String() string {
 		return "LIKE"
 	case OpNotLike:
 		return "NOT LIKE"
+	case OpILike:
+		return "ILIKE"
+	case OpNotILike:
+		return "NOT ILIKE"
+	case OpRegexMatch:
+		return "~"
+	case OpRegexIMatch:
+		return "~*"
+	case OpRegexNoMatch:
+		return "!~"
+	case OpRegexINoMatch:
+		return "!~*"
 	}
 	return "<unknown>"
 }

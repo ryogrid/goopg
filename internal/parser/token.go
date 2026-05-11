@@ -124,6 +124,7 @@ const (
 	KwView        Keyword = "view"
 	KwReplace     Keyword = "replace"
 	KwLike        Keyword = "like"
+	KwIlike       Keyword = "ilike"
 	KwBetween     Keyword = "between"
 	// M0008 logical-replication DDL keywords. See
 	// docs/design/0008-0003-publication-subscription-ddl.md.
@@ -332,6 +333,7 @@ var keywords = map[string]Keyword{
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
 	"like":         KwLike,
+	"ilike":        KwIlike,
 	"between":      KwBetween,
 	"publication":  KwPublication,
 	"subscription": KwSubscription,
