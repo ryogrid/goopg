@@ -3235,14 +3235,95 @@ The structural changes still matter for OTHER workloads
 slot contract is tightened; NLI is defensive). They just
 don't move pgbench-c10's TPS needle.
 
-**M0093 candidate** — broadly-distributed allocation
-reduction (protocol layer + plan cache + remaining
-LookupGoroutine sites + ParseHeapTuple aliasing). Required
-to reach M0091's TPS ≥ 1,000 bar.
+**M0092 follow-up landed 2026-05-11** (commits `55f6de0`,
+`a0817bb`, `1d331a1`, `da7224d`, `1916109`): all four
+broadly-distributed allocation cuts (SlotFromRow stack-
+aliasing, protocol DataRow allocation reduction,
+ParseHeapTupleNoCopy + RLock-held-across-decode,
+`track_io_timing` GUC gating 14 I/O hooks) confirmed gone
+from the steady-state top-23 alloc list. **TPS did NOT
+move** past the noise floor: M0092 baseline re-measures at
+317 TPS; M0092 followup runs at 283-342 TPS. CPU pprof
+shows the goopg server at 0.17 % CPU — pgbench-S is NOT
+CPU-bound. Full analysis:
+`bench/pgbench-compare/results/20260511_goopg_select-only_m0092_followup_summary.md`.
+
+The actual bottleneck identified during the M0092 follow-up
+audit: **per-commit WAL fsync for read-only transactions**.
+goopg currently emits an XactCommit WAL record + sync
+fsync for every transaction including pure SELECT, which
+differs from PostgreSQL's lazy-XID model where read-only
+transactions skip `RecordTransactionCommit` entirely. 60-s
+server log shows 19,684 `walwriter flush` lines matching
+the transaction rate. Filed as M0093 below.
 
 Results:
 `bench/pgbench-compare/results/20260511_133003_goopg_select-only_c10_m0092.txt`
-+ `20260511_goopg_select-only_m0092_summary.md`.
++ `20260511_goopg_select-only_m0092_summary.md`
++ `20260511_goopg_select-only_m0092_followup_summary.md`.
+
+## M0093 — Read-only commit skip-WAL (PG-parity) (filed 2026-05-11)
+
+**Background:** M0092 follow-up identified that goopg emits
+a synchronous WAL `XactCommit` record + `FlushUpTo`
+(fsync) for **every** transaction, including read-only
+`SELECT`. This diverges from PostgreSQL's lazy-XID-allocation
+design where read-only transactions never call
+`RecordTransactionCommit` and emit zero WAL on commit. The
+result: pgbench-S `-c 10` is bottlenecked on per-query
+fsync at 282-342 TPS while the goopg server idles at
+0.17 % CPU.
+
+Milestone doc:
+`docs/milestones/0093-read-only-commit-skip-wal-emission.md`.
+
+Design docs:
+- `docs/design/0093-0001-readonly-commit-skip-wal.md`
+  (chosen design: **A — wroteWAL flag on transaction
+  state**; every WAL-Append call site enumerated for the
+  M0093-0002 audit boundary).
+- `docs/design/0093-0002-pgbench-remeasurement-target.md`
+  (re-measurement methodology; target TPS ≥ 1,000 =
+  M0091's bar; secondary target: walwriter flush rate
+  drops from ~19,600 / 60 s to < 100 / 60 s).
+
+### Sub-milestones
+
+- [ ] **M0093-0001** — Author/finalise design doc
+      `0093-0001-readonly-commit-skip-wal.md`. Choose
+      between Design A (`wroteWAL` flag — recommended) and
+      Design B (lazy XID assignment, PG-parity). Enumerate
+      every WAL-Append call site that needs to participate
+      and the transaction-wiring approach. Status: drafted
+      2026-05-11; review + accept.
+
+- [ ] **M0093-0002** — Implementation. Add
+      `mvcc.Manager.NoteWrote(xid)` (Design A) or
+      lazy-allocate XID at first write (Design B). Gate
+      `Manager.finish`'s `xactMarker` invocation on the
+      "wrote WAL" condition. Wire every WAL-Append call
+      site from a transactional context. Unit tests:
+      - `TestReadOnlySelect_NoWALEmitted`
+      - `TestReadWriteInsert_EmitsCommitRecord`
+      - `TestMixedTxn_FirstWriteFlipsFlag`
+      - `TestRollback_ReadOnlyNoAbortRecord`
+      - `TestRollback_AfterWriteEmitsAbortRecord`
+      - `TestOpportunisticPrune_FromSelectFlipsFlag`
+      Crash-recovery integration test confirming no
+      missing-WAL / torn-WAL errors after kill -9 mid-
+      pgbench-S.
+
+- [ ] **M0093-0003** — pgbench select-only re-measurement
+      post-fix. Target: TPS ≥ 1,000 (M0091's acceptance
+      bar). Secondary: walwriter flush rate during a
+      60-s window < 100 (down from ~19,600). Capture
+      pprof. Three back-to-back runs; report median.
+      Method:
+      `docs/design/0093-0002-pgbench-remeasurement-target.md`.
+
+- [ ] **M0093-0004** — pgbench standard / simple-update
+      re-measurement to confirm read-write commit emission
+      is unchanged. No regression vs M0092 baseline.
 
 ### Note on prior `## pgbench select-only @ -c 10` section
 
