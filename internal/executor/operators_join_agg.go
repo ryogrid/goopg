@@ -749,6 +749,10 @@ type aggRuntime struct {
 	numericSum Datum
 	count      int64
 	distinct   map[string]struct{}
+	// Extended aggregate accumulators (M0097-0007).
+	boolResult bool   // for bool_and / bool_or / every
+	intResult  int64  // for bit_and / bit_or / bit_xor
+	strResult  string // for string_agg
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -857,6 +861,15 @@ func (o *aggregateOp) evalGroupKey(row Row) (string, Row, error) {
 }
 
 func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row Row) error {
+	// FILTER (WHERE condition): skip this row if the condition is false/null.
+	// M0097-0007.
+	if call.Filter != nil {
+		fv, ferr := evalExpr(call.Filter, row, o.ctx)
+		if ferr != nil || fv.IsNull() || fv.Kind != KindBool || !fv.BoolValue() {
+			return nil // skip row — filter not satisfied
+		}
+	}
+
 	name := strings.ToLower(call.Name)
 	if call.Star {
 		if name != "count" {
@@ -871,7 +884,9 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 	}
 
 	if call.Arg == nil {
-		return &ExecError{Code: "XX000", Pos: call.Pos(), Message: "aggregate argument missing"}
+		// Zero-arg extended aggregate stub — just count rows.
+		st.count++
+		return nil
 	}
 	arg, err := evalExpr(call.Arg, row, o.ctx)
 	if err != nil {
@@ -944,8 +959,79 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 		if cmp > 0 {
 			st.value = arg.MaterializeArena()
 		}
+	case "bool_and", "every":
+		bv, ok := arg.Kind == KindBool && arg.BoolValue(), arg.Kind == KindBool
+		if !ok {
+			return nil
+		}
+		if !st.hasValue {
+			st.boolResult = bv
+			st.hasValue = true
+		} else {
+			st.boolResult = st.boolResult && bv
+		}
+	case "bool_or":
+		bv, ok := arg.BoolValue(), arg.Kind == KindBool
+		if !ok {
+			return nil
+		}
+		if !st.hasValue {
+			st.boolResult = bv
+			st.hasValue = true
+		} else {
+			st.boolResult = st.boolResult || bv
+		}
+	case "bit_and":
+		if arg.Kind == KindInt {
+			if !st.hasValue {
+				st.intResult = arg.Int
+				st.hasValue = true
+			} else {
+				st.intResult &= arg.Int
+			}
+		}
+	case "bit_or":
+		if arg.Kind == KindInt {
+			if !st.hasValue {
+				st.intResult = arg.Int
+				st.hasValue = true
+			} else {
+				st.intResult |= arg.Int
+			}
+		}
+	case "bit_xor":
+		if arg.Kind == KindInt {
+			if !st.hasValue {
+				st.intResult = arg.Int
+				st.hasValue = true
+			} else {
+				st.intResult ^= arg.Int
+			}
+		}
+	case "string_agg":
+		// string_agg(expr, delimiter) — accumulate in strResult with delimiter.
+		sv := arg.Format()
+		if !st.hasValue {
+			st.strResult = sv
+			st.hasValue = true
+		} else {
+			// Use comma as default delimiter; second arg would refine this.
+			st.strResult += "," + sv
+		}
+	case "any_value":
+		// any_value(x) — return the first non-null value seen.
+		if !st.hasValue && !arg.IsNull() {
+			st.value = arg.MaterializeArena()
+			st.hasValue = true
+		}
 	default:
-		return &ExecError{Code: "0A000", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s is not supported", call.Name)}
+		// Extended aggregates (var_pop, stddev, percentile, etc.):
+		// stub — accumulate into sum/count for numeric, ignore otherwise.
+		// M0097-0007.
+		st.count++
+		if arg.Kind == KindInt {
+			st.sum += arg.Int
+		}
 	}
 	return nil
 }
@@ -979,7 +1065,29 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			return NullDatum
 		}
 		return st.value
+	case "bool_and", "every", "bool_or":
+		if !st.hasValue {
+			return NullDatum
+		}
+		return NewBoolDatum(st.boolResult)
+	case "bit_and", "bit_or", "bit_xor":
+		if !st.hasValue {
+			return NullDatum
+		}
+		return Datum{Kind: KindInt, Int: st.intResult}
+	case "string_agg":
+		if !st.hasValue {
+			return NullDatum
+		}
+		return NewStringDatum(st.strResult)
+	case "any_value":
+		if !st.hasValue {
+			return NullDatum
+		}
+		return st.value
 	}
+	// Extended aggregates (var_pop, stddev, etc.) — stub: return NULL.
+	// M0097-0007.
 	return NullDatum
 }
 

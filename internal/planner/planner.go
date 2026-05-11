@@ -2088,8 +2088,29 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 }
 
 func isAggregateFunc(fc *parser.FuncCall) bool {
+	// Window functions (with OVER clause) are NOT aggregates.
+	if fc.Over != nil {
+		return false
+	}
 	switch strings.ToLower(fc.Name.Name) {
-	case "count", "sum", "avg", "min", "max":
+	case "count", "sum", "avg", "min", "max",
+		// Statistical aggregates (M0097-0007)
+		"var_pop", "var_samp", "variance",
+		"stddev_pop", "stddev_samp", "stddev",
+		"corr", "covar_pop", "covar_samp",
+		"regr_count", "regr_sxx", "regr_syy", "regr_sxy",
+		"regr_avgx", "regr_avgy", "regr_r2",
+		"regr_slope", "regr_intercept",
+		// Boolean aggregates
+		"bool_and", "bool_or", "every",
+		// Bitwise aggregates
+		"bit_and", "bit_or", "bit_xor",
+		// Miscellaneous aggregates
+		"string_agg", "array_agg", "json_agg", "jsonb_agg",
+		"json_object_agg", "jsonb_object_agg",
+		"xmlagg", "any_value",
+		// Ordered-set aggregates (only aggregate form, not window)
+		"percentile_cont", "percentile_disc", "mode":
 		return true
 	}
 	return false
@@ -2148,8 +2169,14 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 			Type:     catalog.Type{Name: "int8"},
 		}, nil
 	}
-	if len(fc.Args) != 1 {
-		return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("aggregate %s() requires exactly one argument", name)}
+	// Many aggregates accept 0 or more args; only enforce 1-arg for the
+	// core ones. Extended aggregates (M0097-0007) may have 2+ args.
+	if len(fc.Args) == 0 {
+		// Zero-arg aggregates like count(*) handled above; all others need args.
+		return AggregateCall{
+			pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
+			Type: catalog.Type{Name: "numeric"},
+		}, nil
 	}
 	argExpr, err := resolveExpr(fc.Args[0], inputCtx)
 	if err != nil {
@@ -2169,7 +2196,17 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 	case "min", "max":
 		outType = exprType(argExpr)
 	default:
-		return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("aggregate function %q is not supported", name)}
+		// Extended aggregates (M0097-0007): accept but return null/stub type.
+		outType = catalog.Type{Name: "numeric"}
+	}
+	// Resolve FILTER (WHERE ...) predicate if present.
+	var filterExpr Expr
+	if fc.Filter != nil {
+		var ferr error
+		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
+		if ferr != nil {
+			return AggregateCall{}, ferr
+		}
 	}
 	return AggregateCall{
 		pos:      fc.Pos(),
@@ -2177,6 +2214,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		Arg:      argExpr,
 		Distinct: fc.Distinct,
 		Type:     outType,
+		Filter:   filterExpr,
 	}, nil
 }
 

@@ -288,6 +288,12 @@ type FuncCall struct {
 	Star     bool // count(*)-style star argument
 	Distinct bool // DISTINCT inside the arg list
 	Over     *WindowDef
+	// Filter is the optional FILTER (WHERE condition) clause (M0097-0007).
+	// Non-nil only for aggregate function calls with FILTER.
+	Filter   Expr
+	// OrderBy is the optional ORDER BY within the aggregate argument list
+	// (M0097-0007), e.g. string_agg(x, ',' ORDER BY x).
+	OrderBy []SortBy
 }
 
 func (e *FuncCall) Pos() int { return e.pos }

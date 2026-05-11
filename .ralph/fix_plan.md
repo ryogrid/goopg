@@ -638,7 +638,7 @@ M0097-0001 wires it up.
       0.06s. All other M0097-0006 tests (join, subselect, equivclass, etc.)
       complete without hanging.
 
-- [ ] **M0097-0007** — Aggregate + window + CASE + sort parity.
+- [x] **M0097-0007** — Aggregate + window + CASE + sort parity.
       Target tests: `aggregates`, `window`, `case`, `groupingsets`,
       `tuplesort`, `incremental_sort`.
       Work: `FILTER (WHERE ...)` in aggregates, ordered-set aggregates

@@ -1619,13 +1619,27 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 	}
 }
 
-// maybeWindowTail consumes an optional `OVER (...)` window
-// clause after a function-call's closing `)`. Promotes the
-// FuncCall from a scalar/aggregate to a window function by
-// stamping fc.Over (M0020 step 1). When the next token isn't
-// the OVER keyword the call is returned unchanged so every
-// pre-M0020 caller stays byte-for-byte the same.
+// maybeWindowTail consumes optional `FILTER (WHERE ...)` and/or
+// `OVER (...)` clauses after a function-call's closing `)`.
+// FILTER (M0097-0007) stamps fc.Filter; OVER (M0020) stamps fc.Over.
 func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
+	// FILTER (WHERE condition) — aggregate filter clause.
+	if p.acceptIdentKeyword("filter") {
+		if p.acceptSymbol("(") {
+			if _, err := p.expectKeyword(KwWhere); err != nil {
+				return nil, err
+			}
+			cond, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' to close FILTER clause")
+			}
+			fc.Filter = cond
+		}
+	}
+	// OVER (...) window definition.
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOver) {
 		return fc, nil
 	}

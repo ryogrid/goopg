@@ -501,6 +501,8 @@ type AggregateCall struct {
 	Star     bool
 	Distinct bool
 	Type     catalog.Type
+	// Filter is the resolved FILTER (WHERE ...) predicate. M0097-0007.
+	Filter Expr
 }
 
 func (a AggregateCall) Pos() int { return a.pos }
