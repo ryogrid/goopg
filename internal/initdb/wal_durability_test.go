@@ -91,6 +91,15 @@ func TestWalCommitRecordOnDisk(t *testing.T) {
 		rt.Close()
 		t.Fatal(err)
 	}
+	// M0093: lazy-XID — the hook only fires when an XID was
+	// assigned. AssignXID directly so this test's commit emits
+	// the expected XactCommit record.
+	if xid, err := rt.TxnMgr.AssignXID(tx); err != nil {
+		rt.Close()
+		t.Fatal(err)
+	} else {
+		tx.XID = xid
+	}
 	// Write a single heap row to give the transaction actual WAL records.
 	rel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
