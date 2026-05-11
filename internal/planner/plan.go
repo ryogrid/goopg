@@ -837,9 +837,10 @@ const (
 )
 
 type Transaction struct {
-	pos  int
-	Verb TransactionVerb
-	Name string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
+	pos            int
+	Verb           TransactionVerb
+	Name           string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
+	IsolationLevel string // for TxBegin: "read committed", "repeatable read", etc.; "" = session default
 }
 
 func (n *Transaction) Pos() int       { return n.pos }

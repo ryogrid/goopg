@@ -462,11 +462,72 @@ func (p *parser) parseCheckpoint() (Stmt, error) {
 	return &CheckpointStmt{pos: t.Pos}, nil
 }
 
-// parseBegin: BEGIN [WORK | TRANSACTION]
+// parseBegin: BEGIN [WORK | TRANSACTION] [transaction_mode ...]
+//
+// Accepted transaction modes (M0096-0002):
+//
+//	ISOLATION LEVEL {READ COMMITTED | READ UNCOMMITTED |
+//	                 REPEATABLE READ | SERIALIZABLE}
+//	READ {ONLY | WRITE}          — accepted, no-op for v0
+//	[NOT] DEFERRABLE             — accepted, no-op for v0
+//
+// Modes may appear in any order and repeat (last ISOLATION LEVEL wins).
 func (p *parser) parseBegin() (Stmt, error) {
 	t := p.advance() // BEGIN
+	s := &BeginStmt{pos: t.Pos}
 	_ = p.acceptKeyword(KwWork) || p.acceptKeyword(KwTransaction)
-	return &BeginStmt{pos: t.Pos}, nil
+	// Optional transaction modes.
+	for {
+		switch {
+		case p.acceptIdentKeyword("isolation"):
+			if !p.acceptIdentKeyword("level") {
+				return nil, p.errAtCur("expected LEVEL after ISOLATION")
+			}
+			level, err := p.parseIsolationLevelName()
+			if err != nil {
+				return nil, err
+			}
+			s.IsolationLevel = level
+		case p.acceptIdentKeyword("read"):
+			// READ ONLY / READ WRITE — accepted, no-op for v0.
+			_ = p.acceptIdentKeyword("only") || p.acceptIdentKeyword("write")
+		case p.acceptKeyword(KwNot):
+			_ = p.acceptIdentKeyword("deferrable")
+		case p.acceptIdentKeyword("deferrable"):
+			// no-op
+		default:
+			goto done
+		}
+	}
+done:
+	return s, nil
+}
+
+// parseIsolationLevelName parses one of the four SQL isolation level names
+// and returns the canonical lowercase form (matching mvcc.ParseIsolationLevel).
+// "read" must have been consumed when this is called from a context where READ
+// precedes COMMITTED/UNCOMMITTED; otherwise parse starts fresh.
+func (p *parser) parseIsolationLevelName() (string, error) {
+	switch {
+	case p.acceptIdentKeyword("read"):
+		switch {
+		case p.acceptIdentKeyword("committed"):
+			return "read committed", nil
+		case p.acceptIdentKeyword("uncommitted"):
+			return "read uncommitted", nil
+		default:
+			return "", p.errAtCur("expected COMMITTED or UNCOMMITTED after READ")
+		}
+	case p.acceptIdentKeyword("repeatable"):
+		if !p.acceptIdentKeyword("read") {
+			return "", p.errAtCur("expected READ after REPEATABLE")
+		}
+		return "repeatable read", nil
+	case p.acceptIdentKeyword("serializable"):
+		return "serializable", nil
+	default:
+		return "", p.errAtCur("expected isolation level name (READ COMMITTED, REPEATABLE READ, SERIALIZABLE, READ UNCOMMITTED)")
+	}
 }
 
 // parseCommit: COMMIT [WORK | TRANSACTION] | END [WORK | TRANSACTION]
@@ -790,10 +851,39 @@ func (p *parser) parseShow() (Stmt, error) {
 func (p *parser) parseSet() (Stmt, error) {
 	t := p.advance()
 	s := &SetStmt{pos: t.Pos}
+	isLocal := false
 	if p.acceptKeyword(KwLocal) {
 		s.Local = true
+		isLocal = true
 	} else {
 		_ = p.acceptKeyword(KwSession)
+	}
+	// SET [LOCAL] TRANSACTION <mode> — intercept before generic GUC path.
+	// M0096-0002: supports ISOLATION LEVEL; other modes accepted as no-op.
+	if p.acceptKeyword(KwTransaction) {
+		st := &SetTransactionStmt{pos: t.Pos, Local: isLocal}
+		for {
+			switch {
+			case p.acceptIdentKeyword("isolation"):
+				if !p.acceptIdentKeyword("level") {
+					return nil, p.errAtCur("expected LEVEL after ISOLATION")
+				}
+				level, err := p.parseIsolationLevelName()
+				if err != nil {
+					return nil, err
+				}
+				st.IsolationLevel = level
+			case p.acceptIdentKeyword("read"):
+				_ = p.acceptIdentKeyword("only") || p.acceptIdentKeyword("write")
+			case p.acceptKeyword(KwNot):
+				_ = p.acceptIdentKeyword("deferrable")
+			case p.acceptIdentKeyword("deferrable"):
+			default:
+				goto setTxDone
+			}
+		}
+	setTxDone:
+		return st, nil
 	}
 	name, err := p.parseGUCName()
 	if err != nil {

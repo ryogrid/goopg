@@ -12,6 +12,9 @@ import (
 // to manage BEGIN/COMMIT/ROLLBACK.
 type Session interface {
 	IsolationLevel() mvcc.IsolationLevel
+	// SetIsolationLevel updates the session-default isolation level.
+	// Used by BEGIN ISOLATION LEVEL and SET TRANSACTION ISOLATION LEVEL.
+	SetIsolationLevel(level mvcc.IsolationLevel) error
 	InExplicitTransaction() bool
 	CurrentTransaction() (mvcc.Transaction, mvcc.Snapshot, bool)
 	BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.Snapshot)

@@ -5,6 +5,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -65,7 +66,19 @@ func (o *transactionOp) execBegin() error {
 		// PostgreSQL treats nested BEGIN as a warning + no-op.
 		return nil
 	}
-	tx, err := o.ctx.TxnMgr.Begin(o.ctx.Session.IsolationLevel())
+	level := o.ctx.Session.IsolationLevel()
+	// BEGIN ISOLATION LEVEL <level>: use the per-statement level instead of
+	// the session default and update the session so subsequent operations in
+	// this transaction use the same level.
+	if o.plan.IsolationLevel != "" {
+		parsed, err := mvcc.ParseIsolationLevel(o.plan.IsolationLevel)
+		if err != nil {
+			return &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
+		_ = o.ctx.Session.SetIsolationLevel(parsed)
+		level = parsed
+	}
+	tx, err := o.ctx.TxnMgr.Begin(level)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -227,4 +240,39 @@ func (o *transactionOp) execRollbackTo() error {
 	}
 	o.ctx.Tx.XID = newSubXid
 	return nil
+}
+
+// setTransactionOp applies a SET [LOCAL] TRANSACTION statement.
+// Currently only ISOLATION LEVEL is acted upon; READ ONLY/WRITE and
+// DEFERRABLE are accepted by the parser but ignored here.
+type setTransactionOp struct {
+	stmt *parser.SetTransactionStmt
+	ctx  *Context
+	done bool
+}
+
+func newSetTransactionOp(s *parser.SetTransactionStmt) *setTransactionOp {
+	return &setTransactionOp{stmt: s}
+}
+
+func (o *setTransactionOp) Schema() planner.Schema { return nil }
+func (o *setTransactionOp) Open(ctx *Context) error { o.ctx = ctx; return nil }
+func (o *setTransactionOp) Close() error            { return nil }
+
+func (o *setTransactionOp) Next() (TupleSlot, error) {
+	if o.done {
+		return nil, EOF
+	}
+	o.done = true
+	if o.stmt.IsolationLevel == "" || o.ctx == nil || o.ctx.Session == nil {
+		return nil, EOF
+	}
+	level, err := mvcc.ParseIsolationLevel(o.stmt.IsolationLevel)
+	if err != nil {
+		return nil, &ExecError{Code: "0A000", Message: err.Error()}
+	}
+	if serr := o.ctx.Session.SetIsolationLevel(level); serr != nil {
+		return nil, &ExecError{Code: "0A000", Message: serr.Error()}
+	}
+	return nil, EOF
 }

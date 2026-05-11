@@ -30,11 +30,30 @@ func (o ObjectName) String() string {
 	return o.Schema + "." + o.Name
 }
 
-// BeginStmt — `BEGIN [WORK | TRANSACTION]`.
-type BeginStmt struct{ pos int }
+// BeginStmt — `BEGIN [WORK | TRANSACTION] [transaction_mode ...]`.
+//
+// IsolationLevel holds the parsed isolation level name (e.g. "read committed",
+// "repeatable read", "serializable", "read uncommitted") when ISOLATION LEVEL
+// was supplied; "" means use the session default.  M0096-0002.
+type BeginStmt struct {
+	pos            int
+	IsolationLevel string // "" = use session default
+}
 
 func (s *BeginStmt) Pos() int  { return s.pos }
 func (s *BeginStmt) stmtNode() {}
+
+// SetTransactionStmt — `SET [LOCAL] TRANSACTION transaction_mode ...`.
+// Currently only parses ISOLATION LEVEL; other modes (READ ONLY / READ WRITE,
+// DEFERRABLE) are accepted syntactically but silently ignored.  M0096-0002.
+type SetTransactionStmt struct {
+	pos            int
+	IsolationLevel string // "" = not specified; set isolation level on session
+	Local          bool
+}
+
+func (s *SetTransactionStmt) Pos() int  { return s.pos }
+func (s *SetTransactionStmt) stmtNode() {}
 
 // CommitStmt — `COMMIT [WORK | TRANSACTION]`. Aliased by `END`.
 type CommitStmt struct{ pos int }

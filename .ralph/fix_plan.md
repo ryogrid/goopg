@@ -333,13 +333,17 @@ alongside the suite.
       SQL features land. Verified: eval-plan-qual and merge-join both t.Skip
       with SQL errors for unsupported syntax (2026-05-12).
 
-- [ ] **M0096-0002** — Extend `parseBegin()` to accept
-      `[WORK | TRANSACTION] [ISOLATION LEVEL {READ COMMITTED |
-      REPEATABLE READ | SERIALIZABLE | READ UNCOMMITTED}]`.
-      Also add `SET TRANSACTION ISOLATION LEVEL <level>` statement.
-      Wire both into the session executor's existing `SetIsolationLevel`.
-      This is a pure parser + thin executor change; it unblocks parsing
-      for all 21 specs.
+- [x] **M0096-0002** — BEGIN ISOLATION LEVEL + SET TRANSACTION ISOLATION LEVEL.
+      Changes: BeginStmt.IsolationLevel string; SetTransactionStmt AST;
+      parseBegin() now parses ISOLATION LEVEL + READ ONLY/WRITE/DEFERRABLE
+      (latter two are no-ops); parseSet() intercepts SET [LOCAL] TRANSACTION
+      ISOLATION LEVEL; planner Transaction.IsolationLevel; execBegin() calls
+      SetIsolationLevel from plan; setTransactionOp calls SetIsolationLevel on
+      session; SetIsolationLevel added to Session interface; mvcc.ParseIsolationLevel
+      maps SERIALIZABLE→RepeatableRead, READ UNCOMMITTED→ReadCommitted.
+      Verification: TestPort_IsolationLockCommittedUpdate now parses BEGIN ISOLATION
+      LEVEL READ COMMITTED successfully (defers due to pg_advisory_lock, not parsing).
+      TestPort_IsolationInsertConflictDoNothing similarly advances past parsing. (2026-05-12).
 
 - [ ] **M0096-0003** — Implement `pg_advisory_lock(key bigint)`,
       `pg_advisory_unlock(key bigint)`, `pg_advisory_unlock_all()`,

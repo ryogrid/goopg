@@ -69,7 +69,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.BeginStmt:
-		return &Transaction{pos: s.Pos(), Verb: TxBegin}, nil
+		return &Transaction{pos: s.Pos(), Verb: TxBegin, IsolationLevel: s.IsolationLevel}, nil
 	case *parser.CommitStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxCommit}, nil
 	case *parser.RollbackStmt:
@@ -83,7 +83,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
-		*parser.ReindexStmt, *parser.ClusterStmt:
+		*parser.ReindexStmt, *parser.ClusterStmt,
+		*parser.SetTransactionStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CheckpointStmt:
