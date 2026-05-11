@@ -418,6 +418,13 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			row = newRow
 		}
 
+		// CHECK constraint enforcement (M0097-0014).
+		if len(o.plan.Table.CheckConstraints) > 0 {
+			if err := checkConstraints(o.ctx, o.plan.Table, row); err != nil {
+				return nil, err
+			}
+		}
+
 		// FK referential integrity check (M0096-0011): verify parent rows exist
 		// before writing.  Uses the plan table's ForeignKeys (parent partition's
 		// FKs apply to routed child inserts too).

@@ -236,6 +236,9 @@ const (
 
 	// M0096-0012: CREATE/DROP TRIGGER.
 	KwTrigger Keyword = "trigger"
+
+	// M0097-0014: CHECK constraints.
+	KwCheck Keyword = "check"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -383,6 +386,7 @@ var keywords = map[string]Keyword{
 	"merge":        KwMerge,
 	"matched":      KwMatched,
 	"trigger":      KwTrigger,
+	"check":        KwCheck,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

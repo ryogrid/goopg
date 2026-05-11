@@ -103,6 +103,7 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwMerge:        KwCatUnreserved,
 	KwMatched:      KwCatUnreserved,
 	KwTrigger:      KwCatUnreserved,
+	KwCheck:        KwCatUnreserved,
 
 	// goopg-specific (no upstream equivalent) — treated as unreserved.
 	KwConstant: KwCatUnreserved,

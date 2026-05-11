@@ -1,5 +1,7 @@
 package executor
 
+// M0097-0014: CHECK constraint enforcement added at the bottom of this file.
+
 // operators_fk.go — FK referential integrity enforcement.
 //
 // M0096-0011: implements REFERENCES … ON DELETE {CASCADE | RESTRICT |
@@ -19,6 +21,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -538,5 +541,61 @@ func datumEquals(a, b Datum) bool {
 		return false
 	}
 	return a.Format() == b.Format()
+}
+
+// checkConstraints evaluates all CHECK constraints on tbl for the given row.
+// Returns SQLSTATE 23514 (check_violation) if any constraint fails. M0097-0014.
+func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
+	if len(tbl.CheckConstraints) == 0 {
+		return nil
+	}
+	for _, exprSQL := range tbl.CheckConstraints {
+		if exprSQL == "" {
+			continue
+		}
+		// Parse the CHECK expression as a SQL expression.
+		fullSQL := "SELECT (" + exprSQL + ")"
+		stmts, err := parser.Parse(fullSQL)
+		if err != nil || len(stmts) == 0 {
+			continue // invalid check expr: skip
+		}
+		plan, err := planner.Plan(stmts[0], ctx.Catalog)
+		if err != nil {
+			continue
+		}
+		op, err := Build(plan)
+		if err != nil {
+			continue
+		}
+		// Build a synthetic slot from the row so the CHECK expression
+		// can reference column values.
+		synthCtx := *ctx
+		synthCtx.OuterRows = append(synthCtx.OuterRows, row)
+		if err := op.Open(&synthCtx); err != nil {
+			op.Close()
+			continue
+		}
+		slot, err2 := op.Next()
+		op.Close()
+		if err2 != nil || slot == nil {
+			continue
+		}
+		sr := slotRow(slot)
+		if len(sr) == 0 {
+			continue
+		}
+		result := sr[0]
+		// NULL check result → pass (SQL NULL is not a constraint failure)
+		if result.IsNull() {
+			continue
+		}
+		if result.Kind == KindBool && !result.BoolValue() {
+			return &ExecError{
+				Code:    "23514",
+				Message: fmt.Sprintf("new row for relation %q violates check constraint", tbl.Name),
+			}
+		}
+	}
+	return nil
 }
 

@@ -98,6 +98,10 @@ type Table struct {
 	// pass has run yet on this table. Mirrors pg_class.relfrozenxid.
 	RelFrozenXID storage.TransactionID
 
+	// CheckConstraints holds the raw SQL expressions for table-level and
+	// column-level CHECK constraints. M0097-0014.
+	CheckConstraints []string
+
 	// IsMatView marks this table as a materialized view. The underlying
 	// SELECT query is stored in View; data is materialized in the heap
 	// (unlike regular views). M0097-0013.

@@ -481,6 +481,92 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, p.errAtCur("expected ')'")
 			}
 			stmt.PrimaryKey = cols
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
+			// Table-level UNIQUE (cols) — accept as no-op for now.
+			p.advance()
+			if p.acceptSymbol("(") {
+				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					p.advance()
+				}
+			}
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
+			// Table-level CHECK (expr) [NOT ENFORCED | ENFORCED]. M0097-0014.
+			p.advance()
+			expr, err := p.parseCheckExpr()
+			if err != nil {
+				return nil, err
+			}
+			stmt.TableChecks = append(stmt.TableChecks, expr)
+			// Accept optional NOT ENFORCED / ENFORCED modifier.
+			if p.acceptKeyword(KwNot) {
+				_ = p.acceptIdentKeyword("enforced")
+			} else {
+				_ = p.acceptIdentKeyword("enforced")
+			}
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
+			// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
+			p.advance() // CONSTRAINT
+			_, _ = p.parseIdent() // constraint name (ignore)
+			switch {
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
+				p.advance()
+				if _, err := p.expectKeyword(KwKey); err != nil {
+					return nil, err
+				}
+				if !p.acceptSymbol("(") {
+					return nil, p.errAtCur("expected '(' after PRIMARY KEY")
+				}
+				cols, err := p.parseColumnNameList()
+				if err != nil {
+					return nil, err
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+				stmt.PrimaryKey = cols
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
+				p.advance()
+				if p.acceptSymbol("(") {
+					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						p.advance()
+					}
+				}
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
+				p.advance()
+				expr, err := p.parseCheckExpr()
+				if err != nil {
+					return nil, err
+				}
+				stmt.TableChecks = append(stmt.TableChecks, expr)
+				if p.acceptKeyword(KwNot) {
+					_ = p.acceptIdentKeyword("enforced")
+				} else {
+					_ = p.acceptIdentKeyword("enforced")
+				}
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
+				// Already handled by FK parsing in parseColumnDef / REFERENCES
+				// at the column level. Table-level FOREIGN KEY is a no-op here.
+				for p.cur().Kind != TokenEOF {
+					t := p.cur()
+					if t.Kind == TokenSymbol && t.Value == ")" {
+						break
+					}
+					if t.Kind == TokenSymbol && t.Value == "," {
+						break
+					}
+					p.advance()
+				}
+			default:
+				// Unknown constraint type: skip to next comma/close-paren.
+				for p.cur().Kind != TokenEOF {
+					t := p.cur()
+					if (t.Kind == TokenSymbol && t.Value == ")") ||
+						(t.Kind == TokenSymbol && t.Value == ",") {
+						break
+					}
+					p.advance()
+				}
+			}
 		} else {
 			col, err := p.parseColumnDef()
 			if err != nil {
@@ -770,6 +856,47 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 			p.advance() // accepted as no-op; index will be created explicitly
+		// CHECK (expr) inline column constraint. M0097-0014.
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
+			p.advance()
+			expr, err := p.parseCheckExpr()
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			col.CheckExpr = expr
+			// Accept optional NOT ENFORCED / ENFORCED.
+			if p.acceptKeyword(KwNot) {
+				_ = p.acceptIdentKeyword("enforced")
+			} else {
+				_ = p.acceptIdentKeyword("enforced")
+			}
+		// CONSTRAINT name CHECK/... column constraint.
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
+			p.advance() // CONSTRAINT
+			_, _ = p.parseIdent() // constraint name
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
+				p.advance()
+				expr, err := p.parseCheckExpr()
+				if err != nil {
+					return ColumnDef{}, err
+				}
+				col.CheckExpr = expr
+				if p.acceptKeyword(KwNot) {
+					_ = p.acceptIdentKeyword("enforced")
+				} else {
+					_ = p.acceptIdentKeyword("enforced")
+				}
+			} else {
+				// Other named constraints: skip to end of constraint.
+				for p.cur().Kind != TokenEOF {
+					t := p.cur()
+					if (t.Kind == TokenSymbol && t.Value == ",") ||
+						(t.Kind == TokenSymbol && t.Value == ")") {
+						break
+					}
+					p.advance()
+				}
+			}
 		default:
 			return col, nil
 		}
@@ -1016,6 +1143,34 @@ func (p *parser) parseDrop() (Stmt, error) {
 		}
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, SEQUENCE, SCHEMA, TYPE, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
+}
+
+// parseCheckExpr parses `( expr )` after CHECK and returns the raw SQL expression
+// reconstructed from tokens. M0097-0014.
+func (p *parser) parseCheckExpr() (string, error) {
+	if !p.acceptSymbol("(") {
+		return "", p.errAtCur("expected '(' after CHECK")
+	}
+	depth := 1
+	var parts []string
+	for depth > 0 && p.cur().Kind != TokenEOF {
+		t := p.cur()
+		if t.Kind == TokenSymbol && t.Value == "(" {
+			depth++
+			parts = append(parts, "(")
+		} else if t.Kind == TokenSymbol && t.Value == ")" {
+			depth--
+			if depth == 0 {
+				p.advance() // consume closing )
+				return strings.Join(parts, " "), nil
+			}
+			parts = append(parts, ")")
+		} else {
+			parts = append(parts, t.Value)
+		}
+		p.advance()
+	}
+	return "", p.errAtCur("unterminated CHECK expression")
 }
 
 // parseCreateTriggerTail picks up after CREATE [CONSTRAINT] TRIGGER.

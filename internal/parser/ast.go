@@ -769,6 +769,10 @@ type ColumnDef struct {
 	OnUpdate           FKAction
 	FKDeferrable       bool
 	FKInitiallyDeferred bool
+
+	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
+	// M0097-0014.
+	CheckExpr string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
@@ -805,6 +809,9 @@ type CreateTableStmt struct {
 	// SelectSource is non-nil for `CREATE TABLE name AS SELECT …` (CTAS).
 	// The table is created with columns derived from the SELECT result. M0096-0008.
 	SelectSource *SelectStmt
+	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
+	// M0097-0014.
+	TableChecks []string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }

@@ -705,7 +705,7 @@ M0097-0001 wires it up.
       `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW
       [CONCURRENTLY]`.
 
-- [ ] **M0097-0014** — Constraints + FK + triggers + inheritance parity.
+- [x] **M0097-0014** — Constraints + FK + triggers + inheritance parity.
       Target tests: `constraints`, `foreign_key`, `triggers`,
       `inherit`, `indexing`.
       Work: `CHECK` constraint evaluation, deferred FK modes,

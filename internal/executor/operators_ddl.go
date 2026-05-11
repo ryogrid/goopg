@@ -384,6 +384,13 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
+	// Register CHECK constraints from columns and table-level. M0097-0014.
+	for _, c := range s.Columns {
+		if c.CheckExpr != "" {
+			tbl.CheckConstraints = append(tbl.CheckConstraints, c.CheckExpr)
+		}
+	}
+	tbl.CheckConstraints = append(tbl.CheckConstraints, s.TableChecks...)
 	return nil
 }
 
