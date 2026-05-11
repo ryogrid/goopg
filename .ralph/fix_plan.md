@@ -620,6 +620,187 @@ M0097-0001 wires it up.
 - Every non-trivial subsystem must land alongside (or just before) a design
   doc under `docs/design/`. The spec treats this as a hard requirement.
 
+## M0098 — pgbench OLTP Performance: 1 500 / 1 500 / 10 000 TPS Targets (filed 2026-05-12)
+
+### Goal
+
+Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_145159.md`
+(`-c 100 -j 100 -T 180 -s 100`, `shared_buffers=2560MB`, `wal_buffers=100MB`,
+`checkpoint_timeout=24h`, `max_wal_size=1TB`):
+
+| Workload | PostgreSQL 18.3 baseline | goopg target |
+|---|---:|---:|
+| Standard (TPC-B) | 5,382 TPS | **≥ 1,500 TPS** |
+| Simple Update (`-N`) | 7,882 TPS | **≥ 1,500 TPS** |
+| Select Only (`-S`) | 38,575 TPS | **≥ 10,000 TPS** |
+
+### Current baseline (latest measurements)
+
+| Workload | -c 100 pre-M0093 | -c 10 post-M0093 | Gap to target |
+|---|---:|---:|---:|
+| Standard | ~70 TPS | ~58 TPS | ~21× |
+| Simple Update | ~95 TPS | ~110 TPS | ~14× |
+| Select Only | ~400 TPS | ~2,740 TPS | unknown at -c 100 |
+
+### Root-cause map
+
+| Bottleneck | Evidence | Workloads affected |
+|---|---|---|
+| **WAL flush serialized per txn** — `FlushUpTo` sends one `opFlush` to the WAL writer serial loop, blocks until one `fdatasync` completes; no batching | avg latency 1,050–1,430 ms at -c 100; WAL writer channel is the throughput ceiling | Standard, Simple Update |
+| **No WAL group commit** — PostgreSQL batches N concurrent flush requests into one `fdatasync` (CommitDelay / CommitSiblings GUC path) | PostgreSQL at -c 100 achieves 7,882 TPS vs goopg's 95 TPS for the same workload | Standard, Simple Update |
+| **Buffer pool global `poolMu`** — single `sync.Mutex` serializes every `Pin`, `Read`, `Unpin` across 100 concurrent goroutines; PostgreSQL uses 128 hash-partitioned LWLocks on `byTag` | `WriteDirtyPages` = 16.67% CPU in m0093 pprof; PostgreSQL's 128-partition design referenced in `about_buffer_management/final/` | All workloads at high concurrency |
+| **No EvalPlanQual** — concurrent UPDATE conflict → SQLSTATE 40001 abort instead of row-recheck; effective transaction rate drops under contention | M0090 summary, M0093 regression check (2 failed at -c 10 standard) | Standard |
+| **No cross-session plan cache** — every query re-parses and re-plans even across 100 identical pgbench connections; `parser.Lex` = 22 % of allocs (88.7 MB / 30 s) in m0092-followup profile | allocs.prof; `practice/go_rdbms_performance_techniques.md` §12 | All workloads |
+| **Allocation hot-paths** — `storage.newArena` 32 %, `parser.Lex` 22 %, `executor.insertOp` 5 %, `wal.encodeRecord` 2 % of allocs; GC scan dominates CPU in `default.pgo` (gcBgMarkWorker, scanobject, pcvalue = top 3) | m0092-followup allocs.prof; default.pgo (308 KB, 480 s mixed TPCH workload) | All workloads |
+| **PGO not activated in production build** — `default.pgo` (308 KB) exists but is not wired into the build pipeline; `go_rdbms_performance_techniques.md` §3 documents 2–10% typical gain | ls default.pgo; practice doc §3 PGO | All workloads |
+| **`GOAMD64` not set** — default `v1` misses AVX2/BMI2 for hash, checksum, sort kernels; `go_rdbms_performance_techniques.md` §3 | practice doc | All workloads |
+
+### Sub-milestones
+
+- [ ] **M0098-0001** — Re-measure at target conditions (`-c 100 -j 100 -T 180
+      -s 100`) on the current post-M0093 binary to establish the precise gap
+      for each workload.  Capture pprof (CPU + allocs + mutex + block) during
+      each run.  Result files go in `bench/pgbench-compare/results/` with the
+      `m0098_baseline` suffix.  This snapshot drives the ROI ordering of
+      subsequent sub-milestones and validates that M0093's read-skip scales
+      to -c 100 for Select Only.
+
+- [ ] **M0098-0002** — **WAL group commit** — the single highest-ROI change
+      for write workloads.
+      Implementation:
+      - Replace the current one-response-channel-per-`FlushUpTo` pattern
+        with a shared flush-queue: callers post a `flushRequest{lsn, done
+        chan struct{}}` to a slice guarded by a mutex, then wait on `done`.
+      - The WAL writer goroutine, upon receiving any `opFlush`, drains the
+        entire pending queue (collecting the maximum LSN), performs one
+        `fdatasync`, then closes all `done` channels in the batch.
+      - Add `commit_delay` (µs) and `commit_siblings` (min active
+        connections) GUC-equivalent runtime knobs (see PostgreSQL
+        `XLogFlush` group-commit path documented in
+        `about_wal/component_wal_writing.md`).
+      - Wire `runtime.LockOSThread()` on the WAL writer goroutine
+        (`go_rdbms_performance_techniques.md` §2) to reduce OS scheduling
+        jitter on the fsync goroutine.
+      Expected: 8–15× TPS improvement for Simple Update; 5–10× for Standard.
+
+- [ ] **M0098-0003** — **Buffer pool 128-partition locking** — removes the
+      global `poolMu` bottleneck for high-concurrency reads and writes.
+      Implementation:
+      - Replace the single `poolMu sync.Mutex` + `byTag map` with
+        128 `bufferPartition` structs, each holding its own `sync.Mutex`
+        and a `map[PageTag]int` sub-table (mirroring PostgreSQL's
+        `BufTableHashPartition` design from
+        `about_buffer_management/final/`).
+      - The partition index is `hash(PageTag) % 128`.
+      - `Pin` / `Unpin` / `Read` / `WriteDirtyPages` victim selection only
+        lock the relevant partition(s).
+      - Per-buffer `contentMu sync.RWMutex` (already present per slot)
+        remains unchanged.
+      Expected: 3–6× TPS improvement for Select Only at -c 100; 1.5–2× for
+      write workloads (buffer lookups inside transactions).
+
+- [ ] **M0098-0004** — **EvalPlanQual (row recheck on concurrent UPDATE)**
+      — eliminates SQLSTATE 40001 aborts caused by xmax conflicts, replacing
+      them with a re-fetch of the latest committed tuple and predicate
+      recheck.
+      Implementation:
+      - When `isConcurrentlyUpdated()` detects an xmax conflict in
+        `updateOp` / `deleteOp`, spin-wait for the conflicting transaction
+        to commit or roll back, then re-read the tuple at the same TID.
+      - Re-evaluate the WHERE predicate against the freshened row; proceed
+        if it still matches, skip if it no longer matches (matches
+        PostgreSQL's `EvalPlanQual` semantics under `READ COMMITTED`).
+      - Bounded retry (max 3 rechecks) to avoid livelock; escalate to
+        40001 only on exhaustion.
+      - Prerequisite for M0096-0004 (isolation-test `eval-plan-qual` spec).
+      Expected: near-zero abort rate for standard workload → 10–20% effective
+      TPS gain on Standard.
+
+- [ ] **M0098-0005** — **Cross-session normalized-query plan cache**
+      — eliminates re-parse + re-plan for identical queries across sessions.
+      Implementation:
+      - Add a server-level `PlanCache` (LRU, bounded by
+        `plan_cache_size` GUC, default 512 entries) keyed by the
+        normalized SQL string (literals replaced with `$N` placeholders).
+      - On `Parse` (extended protocol) or `SimpleQuery`, normalize the text,
+        check the cache, and return the cached plan if present.
+      - Cache entries are invalidated on DDL changes to referenced relations.
+      - Use `sync.Map` (or a sharded `map + sync.RWMutex`) for lock-free
+        read-path (§8 in `go_rdbms_performance_techniques.md`).
+      Expected: 20–40% reduction in per-transaction CPU overhead for
+      repeated-query workloads like pgbench.
+
+- [ ] **M0098-0006** — **Memory allocation hot-path reduction**
+      — cuts GC pressure on the three largest allocation sites.
+
+      (a) **Parser lexer pooling** (`parser.Lex` = 22 % / 88.7 MB per 30 s):
+          Pool token-slice backing arrays with `sync.Pool`; reuse the
+          `parser` struct itself between consecutive queries on the same
+          connection (`go_rdbms_performance_techniques.md` §1).
+
+      (b) **WAL record encode buffer pooling** (`wal.encodeRecord` = 2 %,
+          `wal.encodeRecord`, `wal.EncodePageImage`):
+          Pool `[]byte` encode buffers with `sync.Pool`; pre-size to the
+          99th-percentile record size (≈ 8 KB page image).
+
+      (c) **Executor row pool** (`executor.insertOp.Next` = 5 %,
+          `executor.valuesOp.Next` = 4 %):
+          Pool `Row` / `[]Datum` slices; clear on release
+          (`s = s[:0]`) and return to pool; never allocate inside the
+          per-row `Next()` loop.
+
+      (d) **Arena bump-allocator for per-query lifetime objects**:
+          Allocate planner + executor state from a per-query arena
+          (`go_rdbms_performance_techniques.md` §1 arena pattern);
+          free the arena at query end — zero GC scan cost for those
+          objects.
+
+      Expected: 20–30 % overall allocation reduction; GC mark-worker
+      fraction drops from ~20 % (as seen in `default.pgo`) toward < 5 %.
+
+- [ ] **M0098-0007** — **PGO activation + GOAMD64=v3 build**
+      — low-effort, broadly-applicable speedup.
+
+      (a) **PGO**: wire `default.pgo` into the primary build command
+          (`go build -pgo=./default.pgo ./cmd/goopg`).  Update
+          `Makefile` / `bench/pgbench-compare/run_comparison.sh` to
+          always build with PGO before benchmarking.
+          After M0098-0001–0006 land, collect a fresh `cpu.prof` from
+          a mixed pgbench run and replace `default.pgo` to reflect the
+          new hot paths.
+
+      (b) **GOAMD64=v3**: set `GOAMD64=v3` in the build pipeline to
+          emit AVX2/BMI2/FMA for hash, CRC, sort kernels.
+
+      (c) **Runtime knobs**:
+          - `GOMEMLIMIT` set to 90 % of available RAM (suppress
+            aggressive scavenging; `go_rdbms_performance_techniques.md`
+            §2).
+          - `GOGC=200` to trade some memory for reduced GC frequency
+            during write-heavy benchmarks.
+          - Verify `GOMAXPROCS` matches physical CPUs (container
+            environments may under-report).
+
+      Expected: 3–8 % overall TPS improvement from better inlining + ISA.
+
+- [ ] **M0098-0008** — **Final measurement + iterative gap-close**
+      — confirm targets are met; close any remaining gap with targeted
+      micro-optimisations.
+
+      Steps:
+      1. Run the full `-c 100 -j 100 -T 180 -s 100` suite on the
+         post-M0098-0007 binary; compare against targets.
+      2. Capture pprof (CPU + allocs + mutex + block) for any workload
+         still below target.
+      3. Apply targeted fixes from the hot-path list (lock granularity,
+         protocol I/O vectorisation, `strconv` vs `fmt` in encoding,
+         per-CPU statistics shard, bounds-check elimination in page
+         walks — see `go_rdbms_performance_techniques.md` §§13-14).
+      4. Repeat until all three targets are met and stable across three
+         independent runs (< 5 % run-to-run variance).
+      5. Commit result files and an M0098 summary `.md` to
+         `bench/pgbench-compare/results/`.
+
 ## Maintenance Fixes
 
 - [x] Fix `TestFoundationSeqScanFilterJoin` test 7 stale expectation (2026-05-04).
