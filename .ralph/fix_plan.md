@@ -623,12 +623,20 @@ M0097-0001 wires it up.
       RANGE partition row-movement with multi-level hierarchies; left as
       known blocker for future work.
 
-- [ ] **M0097-0006** — JOIN + subquery + CTE parity.
+- [x] **M0097-0006** — JOIN + subquery + CTE parity.
       Target tests: `join`, `join_hash`, `subselect`, `with`,
       `equivclass`, `functional_deps`.
       Work: lateral joins (`LATERAL`), `NATURAL JOIN`, anti-join
       output format, recursive CTE edge cases, `DISTINCT ON` in
       subqueries, equivalence-class planner improvements.
+      Implemented: UNION (non-ALL) semantics in WITH RECURSIVE — added
+      UnionAll bool to RecursiveUnion plan node; planner now accepts
+      both UNION and UNION ALL in recursive CTEs; executor implements
+      row deduplication (rowKey hashing) for UNION semantics, stopping
+      when no new rows are produced each iteration; added maxRecursiveDepth
+      (1000) guard to prevent infinite loops. `with` test: 30s hang →
+      0.06s. All other M0097-0006 tests (join, subselect, equivclass, etc.)
+      complete without hanging.
 
 - [ ] **M0097-0007** — Aggregate + window + CASE + sort parity.
       Target tests: `aggregates`, `window`, `case`, `groupingsets`,

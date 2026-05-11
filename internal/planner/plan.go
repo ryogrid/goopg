@@ -1024,11 +1024,15 @@ func (n *SetOp) Output() Schema { return n.Left.Output() }
 // RecursiveUnion implements a WITH RECURSIVE fixpoint (M0016-0004).
 // Anchor is the non-recursive initial SELECT; Recursive is the
 // recursive member referencing the CTE name via WorkTableScans.
+// When UnionAll is false, duplicate rows are suppressed at each
+// iteration step (UNION semantics); iteration stops when the new
+// working set contains no rows not already in the output.
 type RecursiveUnion struct {
 	pos       int
 	Anchor    Node
 	Recursive Node
 	schema    Schema
+	UnionAll  bool // true = UNION ALL (append all), false = UNION (dedup)
 }
 
 func (n *RecursiveUnion) Pos() int       { return n.pos }

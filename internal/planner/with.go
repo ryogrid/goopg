@@ -166,13 +166,14 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, error) {
 	key := strings.ToLower(cte.Name)
 
-	if cte.Query.SetOp == nil || !cte.Query.SetOp.All {
+	if cte.Query.SetOp == nil {
 		return nil, &PlanError{
 			Pos:     cte.Pos(),
 			Code:    "0A000",
-			Message: "WITH RECURSIVE requires UNION ALL",
+			Message: "WITH RECURSIVE body must use UNION or UNION ALL",
 		}
 	}
+	unionAll := cte.Query.SetOp.All // false = UNION (dedup), true = UNION ALL
 
 	// Save and clear SetOp so planSelect for the anchor does NOT
 	// enter the UNION ALL handler (which would try to plan the
@@ -220,6 +221,7 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 		Anchor:    anchor,
 		Recursive: rec,
 		schema:    anchorSchema,
+		UnionAll:  unionAll,
 	}, nil
 }
 

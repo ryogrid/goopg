@@ -1,23 +1,40 @@
 package executor
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/planner"
 )
+
+// maxRecursiveDepth is a safety limit to prevent infinite loops in
+// WITH RECURSIVE queries. After this many iterations, execution stops
+// with an error. Matches PostgreSQL's default max_recursion_depth (1000).
+// M0097-0006.
+const maxRecursiveDepth = 1000
 
 // recursiveUnionOp executes a WITH RECURSIVE fixpoint (M0016-0004).
 // It drains the anchor first, then iterates the recursive member with
 // the current working table (set on ctx.WorkTableRows) until no more
 // rows are produced.
+//
+// For UNION semantics (plan.UnionAll==false), duplicate rows are
+// suppressed and iteration stops when no new rows are produced.
+// For UNION ALL semantics, all rows are retained each iteration and
+// iteration stops when the recursive member produces no rows.
+// M0097-0006: added UnionAll/UNION distinction.
 type recursiveUnionOp struct {
 	plan      *planner.RecursiveUnion
 	anchor    Operator
 	recursive Operator
 	working   []Row
 	output    []Row
-	outIdx    int
-	initDone  bool
-	done      bool
-	ctx       *Context
+	// seen tracks rows already in output for UNION (non-ALL) dedup.
+	seen     map[string]bool
+	outIdx   int
+	initDone bool
+	done     bool
+	depth    int // iteration counter for maxRecursiveDepth guard
+	ctx      *Context
 }
 
 func newRecursiveUnionOp(p *planner.RecursiveUnion, anchor, recursive Operator) *recursiveUnionOp {
@@ -38,6 +55,7 @@ func (o *recursiveUnionOp) Open(ctx *Context) error {
 func (o *recursiveUnionOp) Close() error {
 	o.output = nil
 	o.working = nil
+	o.seen = nil
 	o.ctx = nil
 	if o.recursive != nil {
 		_ = o.recursive.Close()
@@ -55,6 +73,9 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 
 	// Phase 1: drain the anchor.
 	if !o.initDone {
+		if !o.plan.UnionAll {
+			o.seen = make(map[string]bool)
+		}
 		for {
 			slot, err := o.anchor.Next()
 			if err == EOF {
@@ -66,6 +87,13 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 			row := slotRow(slot)
 			r := make(Row, len(row))
 			copy(r, row)
+			if !o.plan.UnionAll {
+				key := rowKey(r)
+				if o.seen[key] {
+					continue // skip duplicates in anchor for UNION
+				}
+				o.seen[key] = true
+			}
 			o.working = append(o.working, r)
 			o.output = append(o.output, r)
 		}
@@ -78,9 +106,17 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 			o.done = true
 			return nil, EOF
 		}
+		if o.depth >= maxRecursiveDepth {
+			o.done = true
+			return nil, &ExecError{
+				Code:    "54001",
+				Message: "WITH RECURSIVE exceeded maximum recursion depth " + itoa(maxRecursiveDepth),
+			}
+		}
 
 		// Set the working table so WorkTableScanOp reads from it.
 		o.ctx.WorkTableRows = o.working
+		o.depth++
 
 		// Open and drain the recursive member.
 		if err := o.recursive.Open(o.ctx); err != nil {
@@ -99,6 +135,14 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 			row := slotRow(slot)
 			r := make(Row, len(row))
 			copy(r, row)
+			if !o.plan.UnionAll {
+				// UNION semantics: only keep rows not already seen.
+				key := rowKey(r)
+				if o.seen[key] {
+					continue
+				}
+				o.seen[key] = true
+			}
 			iterRows = append(iterRows, r)
 		}
 		o.recursive.Close()
@@ -114,6 +158,42 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 	row := o.output[o.outIdx]
 	o.outIdx++
 	return asSlot(o.Schema(), row), nil
+}
+
+// rowKey builds a string key for row deduplication. M0097-0006.
+func rowKey(row Row) string {
+	var sb strings.Builder
+	for i, d := range row {
+		if i > 0 {
+			sb.WriteByte('|')
+		}
+		if d.IsNull() {
+			sb.WriteString("<NULL>")
+		} else {
+			sb.WriteString(d.Format())
+		}
+	}
+	return sb.String()
+}
+
+// itoa converts an int to its decimal string representation.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	buf := make([]byte, 0, 12)
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	for n > 0 {
+		buf = append([]byte{byte('0' + n%10)}, buf...)
+		n /= 10
+	}
+	if neg {
+		buf = append([]byte{'-'}, buf...)
+	}
+	return string(buf)
 }
 
 // workTableScanOp reads rows from ctx.WorkTableRows, returning one
