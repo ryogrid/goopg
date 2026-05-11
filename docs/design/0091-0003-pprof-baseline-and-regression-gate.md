@@ -58,6 +58,22 @@ show prominently.
   must stay < 30 %"): manual judgment based on the diff is
   adequate.
 
+## Status — 2026-05-11
+
+**Baseline archived.** The post-M0091 cpu/heap/allocs profiles
+are now at `pprof-data/baseline/select-only-c10/` (local-only;
+`pprof-data/` is gitignored). README inside that directory
+records capture conditions (commit hash, pgbench params,
+goopg postgresql.conf, host). Use `go tool pprof -base ...`
+as documented above for diff visualisation.
+
+The baseline is NOT updated by M0092 (which regressed
+slightly at this workload, see
+`bench/pgbench-compare/results/20260511_goopg_select-only_m0092_summary.md`).
+Future milestones that deliver a measurable improvement
+should refresh the baseline AND update this design doc with
+the new commit hash.
+
 ## File layout
 
 ```

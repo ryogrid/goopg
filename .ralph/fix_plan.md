@@ -3192,18 +3192,57 @@ Milestone doc:
       slot-aliasing in projectOp — filed as **M0092**
       (`docs/milestones/0092-lazy-row-emission-in-scan-and-project.md`).
 
-- [ ] **M0091-0005** — *(defensive, deferred)* pprof-
-      baseline regression gate. Not blocking M0091
-      acceptance; useful when M0092 lands so the
-      regression-free state is pinned for future
-      comparison.
+- [x] **M0091-0005** — pprof baseline archived at
+      `pprof-data/baseline/select-only-c10/` (local-only;
+      `pprof-data/` is gitignored). README documents
+      capture conditions (commit hash 460809c, pgbench
+      params, host). Use `go tool pprof -base` against the
+      baseline for diff visualisation in future
+      regression checks. Design doc
+      `docs/design/0091-0003-pprof-baseline-and-regression-gate.md`
+      updated with the baseline-in-place note.
 
-### Deferred follow-up
+### M0092 outcome — structural changes landed; TPS NOT improved
 
-**M0092** — Lazy row emission in indexScanOp + projectOp.
-Required to close the remaining gap (~510 TPS post-M0091 vs
-the historical ~6 400 TPS baseline).
-`docs/milestones/0092-lazy-row-emission-in-scan-and-project.md`.
+M0092 (`docs/milestones/0092-lazy-row-emission-in-scan-and-project.md`)
+landed in 4 commits on 2026-05-11:
+
+- `57312d5` — 3 design docs.
+- `5211387` — NLI prerequisite: `nestedLoopIndexJoinOp`
+  deep-copies outerRow into `currentOuter`.
+- `dc52f60` — `projectOp.Next` drops per-row `cloneRow`;
+  `MaterializedSlot.Materialize` now always deep-copies.
+- `8f32c07` — `indexScanOp` lazy refactor (TID-list-eager +
+  heap-fetch-lazy; arena field removed).
+
+End-to-end pgbench select-only @ -c 10 -T 180 scale 100:
+
+- post-M0091 (commit 460809c): **510.52 TPS** / 19.6 ms
+- post-M0092 (commit 8f32c07): **437.62 TPS** / 22.8 ms
+  (−14 %)
+
+The structural changes are correct (all tests pass, data
+integrity preserved) but did NOT deliver TPS improvement at
+this workload. Per the post-fix alloc profile, the cloneRow
+path moved into `slot.Materialize` (now always deep-copies)
+rather than being eliminated; rowPool.New stayed at ~35 % of
+allocs. The residual is broadly distributed across small
+sites (SlotFromRow, ParseHeapTuple, PageGetHeapTuple,
+protocol cells slice) + GC at 80 % of CPU.
+
+The structural changes still matter for OTHER workloads
+(wide TPC-H index scans get a memory-footprint reduction;
+slot contract is tightened; NLI is defensive). They just
+don't move pgbench-c10's TPS needle.
+
+**M0093 candidate** — broadly-distributed allocation
+reduction (protocol layer + plan cache + remaining
+LookupGoroutine sites + ParseHeapTuple aliasing). Required
+to reach M0091's TPS ≥ 1,000 bar.
+
+Results:
+`bench/pgbench-compare/results/20260511_133003_goopg_select-only_c10_m0092.txt`
++ `20260511_goopg_select-only_m0092_summary.md`.
 
 ### Note on prior `## pgbench select-only @ -c 10` section
 

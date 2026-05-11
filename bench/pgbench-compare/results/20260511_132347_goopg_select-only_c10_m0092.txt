@@ -1,0 +1,21 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 465.0 tps, lat 21.496 ms stddev 9.367, 0 failed
+progress: 60.0 s, 466.2 tps, lat 21.450 ms stddev 8.994, 0 failed
+progress: 90.0 s, 426.5 tps, lat 23.448 ms stddev 9.912, 0 failed
+progress: 120.0 s, 429.7 tps, lat 23.272 ms stddev 9.951, 0 failed
+progress: 150.0 s, 420.3 tps, lat 23.791 ms stddev 10.145, 0 failed
+progress: 180.0 s, 418.1 tps, lat 23.917 ms stddev 10.132, 0 failed
+transaction type: <builtin: select only>
+scaling factor: 100
+query mode: simple
+number of clients: 10
+number of threads: 10
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 78781
+number of failed transactions: 0 (0.000%)
+latency average = 22.849 ms
+latency stddev = 9.796 ms
+initial connection time = 2.146 ms
+tps = 437.615789 (without initial connection time)

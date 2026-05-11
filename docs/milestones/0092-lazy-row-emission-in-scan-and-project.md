@@ -1,6 +1,11 @@
 # Milestone 0092 — Lazy row emission in indexScanOp + projectOp
 
-**Status:** planned
+**Status:** structural changes landed 2026-05-11 (commits
+57312d5, 5211387, dc52f60, 8f32c07); pgbench-c10 TPS did NOT
+improve — see close-out notes below. M0091's TPS bar (≥ 1,000)
+remains unmet; the bottleneck has shifted to broadly-
+distributed allocations + GC pressure across many small sites
+rather than the cloneRow path that M0092 addressed.
 **Depends on:** M0091 (the M0091 close-out identified this as
 the residual bottleneck after the activity + btree.RangeScan
 fixes landed; pgbench select-only at scale 100 -c 10 -T 180
@@ -119,6 +124,106 @@ bar). Stretch: ≥ 3 000 (historical -c 1 baseline).
 ## Tasks
 
 Tasks will be detailed when this milestone is picked up.
+
+## Outcome (2026-05-11)
+
+### Landed structural changes
+
+- **Commit `57312d5`** — 3 design docs (0092-0001 / -0002 /
+  -0003).
+- **Commit `5211387` (M0092 prerequisite)** —
+  `nestedLoopIndexJoinOp` now deep-copies outerRow into
+  `o.currentOuter` (always-correct change; was an
+  alias-only retention that worked only because upstream
+  producers cloned).
+- **Commit `dc52f60` (M0092-0002)** — dropped per-row
+  `cloneRow(o.out)` in `projectOp.Next`. Changed
+  `MaterializedSlot.Materialize` to ALWAYS deep-copy the
+  row slice (was a no-op fast-path for non-arena rows).
+  Updated two tests (`TestM0069MaterializedSlot`,
+  `TestM0073MaterializeNoArenaIsNoOp →
+  TestM0092MaterializeAlwaysDeepCopies`) for the new
+  contract.
+- **Commit `8f32c07` (M0092-0001)** — `indexScanOp`
+  refactored from eager-materialise-all-rows to
+  TID-list-eager + heap-fetch-lazy. Removed `o.rows []Row`
+  and `o.arena *Arena` fields. Added `o.lastTID` +
+  `o.hasLast` for HOT-resolved currentTID(). Per-Next
+  pattern: Pin → RLock → followHOTChain → RUnlock → Unpin
+  → DecodeRowInto → optional DetoastRow → return slot
+  aliasing scanRow.
+
+### Empirical pgbench result
+
+`pgbench -S -c 10 -j 10 -T 180 -P 30` at scale 100:
+
+| metric | pre-M0091 | post-M0091 | **post-M0092** |
+|---|---:|---:|---:|
+| TPS | 350.89 | **510.52** | **437.62** |
+| latency avg | 28.50 ms | 19.59 ms | 22.85 ms |
+| failed | 0 | 0 | 0 |
+
+Post-M0092 TPS regressed vs post-M0091 (-14 %). The
+structural changes are correct (all unit tests pass, data
+integrity preserved) but did NOT deliver a measurable TPS
+improvement at pgbench -c 10.
+
+### Why the regression / no improvement
+
+Post-M0092 alloc profile
+(`pprof-data/m0092/select-only-c10.allocs.prof`) shows:
+
+- `executor.init.0.func1` (rowPool.New) — 35.28 % of allocs
+  — **essentially unchanged** vs the pre-M0092 34.75 %.
+  The cloneRow path moved from `projectOp.Next` into
+  `slot.Materialize` (which now always deep-copies), so
+  every consumer that calls Materialize allocates a fresh
+  Row. Net allocation rate per query is similar.
+- `storage.PageGetHeapTuple` + `storage.ParseHeapTuple` +
+  `executor.SlotFromRow` — small per-Next allocations that
+  add up under heavy load.
+- GC still ~80 % of CPU.
+
+Conclusion: pgbench-c10's allocation pressure is broadly
+distributed across many small sites, not concentrated in
+the cloneRow path. Eliminating one site doesn't move the
+needle.
+
+### Where the structural changes still matter
+
+The M0092 changes ARE real correctness / future-workload
+improvements:
+
+1. `indexScanOp` lazy means range scans with N matches no
+   longer pre-materialise N Rows — only N ItemPointers
+   (8 bytes each). For wide TPC-H index scans the memory
+   footprint drop is dramatic.
+2. The `MaterializedSlot.Materialize()` contract is now
+   explicit and consistent (always deep-copies). The
+   no-op fast-path hid a subtle producer-buffer-reuse
+   contract that the eager `cloneRow` masked.
+3. `nestedLoopIndexJoinOp.currentOuter` is independent of
+   upstream buffer reuse — defensive against future
+   producer changes.
+
+### Deferred follow-up (M0093 candidate)
+
+For pgbench-c10 to reach TPS ≥ 1,000, the next milestone
+should address the broadly-distributed residual allocations:
+
+- Protocol-layer per-DataRow: `cells := make([][]byte, ncols)`
+  + `[]byte(d.Format())` per column per row.
+- Plan caching for repeated SQL text (pgbench's simple-query
+  protocol parses + plans every query).
+- `SlotFromRow` allocates a `MaterializedSlot` struct per
+  Next; could be pool'd or stack-allocated via in-place
+  update.
+- The 14 client-driven `LookupGoroutine` sites in
+  `internal/initdb/open.go` (Pool/Manager/AIO hooks) still
+  call `runtime.Stack`.
+- The `ParseHeapTuple` per-Next copy could alias the page
+  bytes (similar to the M0091-0002 PageGetItemRawNoCopy
+  pattern) — bigger refactor.
 
 ## Definition of Done (sketch)
 
