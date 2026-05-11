@@ -695,6 +695,18 @@ type ColumnType struct {
 func (c ColumnType) Pos() int { return c.pos }
 
 // ColumnDef is one column declaration in CREATE TABLE.
+// FKAction describes the referential action for ON DELETE / ON UPDATE.
+// M0096-0011.
+type FKAction int
+
+const (
+	FKActionNoAction  FKAction = iota // NO ACTION (default; deferrable)
+	FKActionRestrict                  // RESTRICT (always immediate)
+	FKActionCascade                   // CASCADE
+	FKActionSetNull                   // SET NULL
+	FKActionSetDefault                // SET DEFAULT
+)
+
 type ColumnDef struct {
 	pos     int
 	Name    string
@@ -707,6 +719,15 @@ type ColumnDef struct {
 	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
 	// for a stored generated column. Empty for ordinary columns.
 	GeneratedExpr string
+
+	// FK fields — populated when the column has an inline REFERENCES clause.
+	// M0096-0011.
+	RefTable           ObjectName
+	RefColumns         []string // empty = use parent PK
+	OnDelete           FKAction
+	OnUpdate           FKAction
+	FKDeferrable       bool
+	FKInitiallyDeferred bool
 }
 
 func (c ColumnDef) Pos() int { return c.pos }

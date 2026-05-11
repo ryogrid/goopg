@@ -616,29 +616,48 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				p.advance()
 			}
-		// REFERENCES — accept for FK in column definition (defer enforcement)
+		// REFERENCES — parse FK constraint and populate col FK fields. M0096-0011.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 			p.advance()
-			if _, err := p.parseObjectName(); err != nil {
+			refTable, err := p.parseObjectName()
+			if err != nil {
 				return ColumnDef{}, err
 			}
+			col.RefTable = refTable
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 				p.advance()
-				if _, err := p.parseColumnNameList(); err != nil {
+				refCols, err := p.parseColumnNameList()
+				if err != nil {
 					return ColumnDef{}, err
 				}
 				if !p.acceptSymbol(")") {
 					return ColumnDef{}, p.errAtCur("expected ')'")
 				}
+				col.RefColumns = refCols
 			}
-			// skip ON DELETE/UPDATE clauses
+			// Parse ON DELETE / ON UPDATE clauses.
 			for p.acceptIdentKeyword("on") {
-				_ = p.acceptIdentKeyword("delete") || p.acceptIdentKeyword("update")
-				_ = p.acceptIdentKeyword("cascade") ||
-					p.acceptIdentKeyword("restrict") ||
-					p.acceptIdentKeyword("no") ||
-					p.acceptIdentKeyword("set")
-				_ = p.acceptKeyword(KwNull) || p.acceptKeyword(KwDefault)
+				isDelete := p.acceptIdentKeyword("delete")
+				if !isDelete {
+					_ = p.acceptIdentKeyword("update")
+				}
+				action := parseFKAction(p)
+				if isDelete {
+					col.OnDelete = action
+				} else {
+					col.OnUpdate = action
+				}
+			}
+			// Parse [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+			if p.acceptKeyword(KwNot) {
+				_, _ = p.expectKeyword(KwDeferrable)
+				col.FKDeferrable = false
+			} else if p.acceptKeyword(KwDeferrable) {
+				col.FKDeferrable = true
+				if p.acceptIdentKeyword("initially") {
+					col.FKInitiallyDeferred = p.acceptIdentKeyword("deferred")
+					_ = p.acceptIdentKeyword("immediate")
+				}
 			}
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
@@ -689,6 +708,30 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 		}
 	}
 	return ct, nil
+}
+
+// parseFKAction reads the referential action keyword from the current
+// token position. Used by REFERENCES … ON DELETE / ON UPDATE parsing.
+// M0096-0011.
+func parseFKAction(p *parser) FKAction {
+	if p.acceptIdentKeyword("cascade") {
+		return FKActionCascade
+	}
+	if p.acceptIdentKeyword("restrict") {
+		return FKActionRestrict
+	}
+	if p.acceptIdentKeyword("no") {
+		_ = p.acceptIdentKeyword("action")
+		return FKActionNoAction
+	}
+	if p.acceptIdentKeyword("set") {
+		if p.acceptKeyword(KwNull) {
+			return FKActionSetNull
+		}
+		_ = p.acceptKeyword(KwDefault)
+		return FKActionSetDefault
+	}
+	return FKActionNoAction
 }
 
 // parseWithOptions parses `WITH ( name = value [, …] )`. Values are

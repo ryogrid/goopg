@@ -278,6 +278,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
+	for _, c := range s.Columns {
+		if c.RefTable.Name != "" {
+			tbl.ForeignKeys = append(tbl.ForeignKeys, catalog.ForeignKey{
+				Columns:           []string{c.Name},
+				RefTable:          c.RefTable.Name,
+				RefColumns:        c.RefColumns,
+				OnDelete:          c.OnDelete,
+				OnUpdate:          c.OnUpdate,
+				Deferrable:        c.FKDeferrable,
+				InitiallyDeferred: c.FKInitiallyDeferred,
+			})
+		}
+	}
 	// If PARTITION BY, annotate the table with partition metadata
 	if s.PartitionBy != nil {
 		tbl.PartitionMethod = s.PartitionBy.Method

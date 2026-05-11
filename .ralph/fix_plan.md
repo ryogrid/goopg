@@ -447,10 +447,15 @@ alongside the suite.
       Executor: mergeOp nested-loop match scan + deferred mods + NOT MATCHED INSERT.
       Design doc: 0096-0010-merge-into.md.
 
-- [ ] **M0096-0011** — Implement inline `REFERENCES table (cols)` column
+- [x] **M0096-0011** — Implement inline `REFERENCES table (cols)` column
       constraint and table constraint in `CREATE TABLE` (FK enforcement
       at INSERT/UPDATE/DELETE, deferred FK modes).
-      Unblocks: `partition-key-update-2/3/4`, `fk-snapshot`.
+      Unblocks: `fk-snapshot` (with ON DELETE CASCADE/SET NULL/NO ACTION INITIALLY DEFERRED).
+      Parser: FKAction type + FK fields on ColumnDef; parseFKAction helper.
+      Catalog: ForeignKey struct + ForeignKeys on Table + FindFKsReferencingTable.
+      Executor: checkFKInsert + enforceFKOnDelete (CASCADE/RESTRICT/SET NULL/NO ACTION)
+      + DEFERRABLE INITIALLY DEFERRED queued in BasicSession, checked at execCommit.
+      Design doc: 0096-0011-fk-enforcement.md.
 
 - [ ] **M0096-0012** — Implement `CREATE TRIGGER … FOR EACH ROW EXECUTE
       FUNCTION/PROCEDURE` + PL/pgSQL trigger body execution.

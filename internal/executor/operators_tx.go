@@ -99,6 +99,20 @@ func (o *transactionOp) execCommit() error {
 		// PostgreSQL returns a warning for COMMIT outside tx block.
 		return nil
 	}
+	// Run deferred FK constraint checks (DEFERRABLE INITIALLY DEFERRED).
+	// M0096-0011: check before committing so a violation aborts the transaction.
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
+		checks := sess.TakeDeferredFKChecks()
+		if len(checks) > 0 && o.ctx.Pool != nil {
+			if err := runAllDeferredFKChecks(o.ctx, checks); err != nil {
+				// Rollback the transaction on constraint violation.
+				_ = o.ctx.TxnMgr.Rollback(tx)
+				o.ctx.Session.EndExplicitTransaction()
+				o.clearCtxTransaction()
+				return err
+			}
+		}
+	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}

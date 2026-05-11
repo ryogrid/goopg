@@ -3,10 +3,19 @@ package executor
 import (
 	"fmt"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// DeferredFKCheck records one FK constraint to be verified at COMMIT time.
+// DEFERRABLE INITIALLY DEFERRED constraints queue checks here instead of
+// enforcing immediately. M0096-0011.
+type DeferredFKCheck struct {
+	ChildTableName string
+	FK             catalog.ForeignKey
+}
 
 // Session stores per-connection state the Transaction operator needs
 // to manage BEGIN/COMMIT/ROLLBACK.
@@ -33,14 +42,15 @@ type DDLUndoEntry struct {
 // BasicSession is a minimal Session implementation for the v0
 // executor path.
 type BasicSession struct {
-	isolation     mvcc.IsolationLevel
-	inTx          bool
-	tx            mvcc.Transaction
-	snap          mvcc.Snapshot
-	pendingDDL    []DDLUndoEntry    // DDL creates pending rollback
-	subxactStack  mvcc.SubxactStack // savepoint stack (M0050-0004)
-	currentSubXid storage.TransactionID // 0 = use top-level tx.XID
-	txFailed      bool              // in_failed_sql_transaction (25P02)
+	isolation        mvcc.IsolationLevel
+	inTx             bool
+	tx               mvcc.Transaction
+	snap             mvcc.Snapshot
+	pendingDDL       []DDLUndoEntry    // DDL creates pending rollback
+	subxactStack     mvcc.SubxactStack // savepoint stack (M0050-0004)
+	currentSubXid    storage.TransactionID // 0 = use top-level tx.XID
+	txFailed         bool              // in_failed_sql_transaction (25P02)
+	deferredFKChecks []DeferredFKCheck // INITIALLY DEFERRED FK checks (M0096-0011)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -101,6 +111,29 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
+	s.deferredFKChecks = nil
+}
+
+// AddDeferredFKCheck queues a FK constraint to be checked at COMMIT time.
+// M0096-0011.
+func (s *BasicSession) AddDeferredFKCheck(check DeferredFKCheck) {
+	// Deduplicate: if an identical (ChildTableName, FK.Columns, FK.RefTable)
+	// check is already queued, skip — one full-table scan at COMMIT suffices.
+	for _, existing := range s.deferredFKChecks {
+		if existing.ChildTableName == check.ChildTableName &&
+			existing.FK.RefTable == check.FK.RefTable {
+			return
+		}
+	}
+	s.deferredFKChecks = append(s.deferredFKChecks, check)
+}
+
+// TakeDeferredFKChecks returns and clears the queued deferred FK checks.
+// Called by execCommit before issuing TxnMgr.Commit. M0096-0011.
+func (s *BasicSession) TakeDeferredFKChecks() []DeferredFKCheck {
+	out := s.deferredFKChecks
+	s.deferredFKChecks = nil
+	return out
 }
 
 // EffectiveWriterXID returns the XID to stamp on new heap tuples.

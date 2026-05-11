@@ -98,6 +98,10 @@ type Table struct {
 	// pass has run yet on this table. Mirrors pg_class.relfrozenxid.
 	RelFrozenXID storage.TransactionID
 
+	// ForeignKeys holds FK constraints declared on this table (inline
+	// REFERENCES or ALTER TABLE ADD FOREIGN KEY). M0096-0011.
+	ForeignKeys []ForeignKey
+
 	// ── Partition support (M0096-0007) ────────────────────────────────────
 	//
 	// PartitionKey holds the column names when this is a partitioned table
@@ -112,6 +116,18 @@ type Table struct {
 	// routing and display. For LIST: InValues strings; for RANGE: one
 	// PartitionBound with From/To strings.
 	PartitionBounds []PartitionBound
+}
+
+// ForeignKey describes one referential integrity constraint stored on a
+// child table. M0096-0011.
+type ForeignKey struct {
+	Columns           []string // columns in THIS table
+	RefTable          string   // referenced table name (unschemed)
+	RefColumns        []string // referenced columns (empty = use parent PK)
+	OnDelete          parser.FKAction
+	OnUpdate          parser.FKAction
+	Deferrable        bool
+	InitiallyDeferred bool
 }
 
 // PartitionBound describes the bounds for a single partition child.
@@ -1289,5 +1305,34 @@ func (c *InMemory) AllTables() []*Table {
 		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// FKRef pairs a child table with one of its FK constraints that
+// references a given parent table. M0096-0011.
+type FKRef struct {
+	Child *Table
+	FK    ForeignKey
+}
+
+// FindFKsReferencingTable returns all FKRef entries where FK.RefTable
+// matches the given table name (case-insensitive). Used by the executor
+// to find FK constraints that need enforcement when a parent row is
+// deleted or updated. M0096-0011.
+func (c *InMemory) FindFKsReferencingTable(tableName string) []FKRef {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	name := strings.ToLower(tableName)
+	var out []FKRef
+	for _, t := range c.tables {
+		if t.Virtual {
+			continue
+		}
+		for _, fk := range t.ForeignKeys {
+			if strings.ToLower(fk.RefTable) == name {
+				out = append(out, FKRef{Child: t, FK: fk})
+			}
+		}
+	}
 	return out
 }

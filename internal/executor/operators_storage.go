@@ -383,6 +383,15 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			row[tgtIdx] = src[srcIdx]
 		}
 
+		// FK referential integrity check (M0096-0011): verify parent rows exist
+		// before writing.  Uses the plan table's ForeignKeys (parent partition's
+		// FKs apply to routed child inserts too).
+		if len(o.plan.Table.ForeignKeys) > 0 {
+			if err := checkFKInsert(o.ctx, o.plan.Table, row); err != nil {
+				return nil, err
+			}
+		}
+
 		// Partition routing (M0096-0007): if the target table is partitioned,
 		// route the row to the appropriate partition child.
 		targetRel := rel
@@ -1160,13 +1169,24 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	type victim struct {
 		blk  storage.BlockNumber
 		slot uint16
+		row  Row
 	}
 	var victims []victim
-	if err := o.scanForMatches(rel, cols, func(blk storage.BlockNumber, slot uint16, _ Row) error {
-		victims = append(victims, victim{blk: blk, slot: slot})
+	if err := o.scanForMatches(rel, cols, func(blk storage.BlockNumber, slot uint16, row Row) error {
+		// FK enforcement before building the victim list (M0096-0011).
+		if len(tbl.ForeignKeys) == 0 {
+			// This table has no FKs referencing it (as parent); skip enforcement.
+		}
+		victims = append(victims, victim{blk: blk, slot: slot, row: cloneRow(row)})
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	// Enforce FK constraints on deleted rows (M0096-0011).
+	for _, v := range victims {
+		if err := enforceFKOnDelete(o.ctx, tbl, v.row); err != nil {
+			return nil, err
+		}
 	}
 	for _, v := range victims {
 		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: v.blk})
