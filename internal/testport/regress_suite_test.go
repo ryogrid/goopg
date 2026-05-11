@@ -20,6 +20,7 @@ package testport
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/goopg/goopg/internal/testport/framework"
 	"github.com/goopg/goopg/internal/testutil/cluster"
+	"github.com/goopg/goopg/internal/testutil/util"
 )
 
 // TestPort_RegressSuite runs all pg_regress SQL cases against a live goopg
@@ -46,7 +48,7 @@ func TestPort_RegressSuite(t *testing.T) {
 
 	// Run test_setup.sql to materialise shared fixture tables. Failures
 	// are expected (tablespaces, C extensions) and do not abort the suite.
-	runRegressSetup(t, root, c)
+	runRegressSetup(t, root, psqlBin, c)
 
 	// Discover all SQL/expected pairs.
 	cases, err := framework.DiscoverRegressCases(root)
@@ -59,6 +61,8 @@ func TestPort_RegressSuite(t *testing.T) {
 
 	exec := &ClusterRegressExecutor{
 		Cluster:  c,
+		PsqlBin:  psqlBin,
+		LibDir:   filepath.Join(root, "postgres", "local_install", "lib"),
 		RepoRoot: root,
 	}
 
@@ -182,13 +186,38 @@ var regressExcluded = map[string]string{
 // is the same format pg_regress uses to generate expected .out files.
 type ClusterRegressExecutor struct {
 	Cluster  *cluster.Cluster
+	PsqlBin  string // full path to psql binary (e.g. postgres/local_install/bin/psql)
+	LibDir   string // postgres/local_install/lib — needed for libpq symbol resolution
 	RepoRoot string
+}
+
+// psqlArgs builds the connection-arg slice for psql (host, port, user, database).
+func (e *ClusterRegressExecutor) psqlArgs(extraArgs ...string) []string {
+	addr := e.Cluster.ListenAddr()
+	host, port, _ := net.SplitHostPort(addr)
+	args := []string{"-h", host, "-p", port, "-U", "postgres", "-d", "postgres"}
+	args = append(args, extraArgs...)
+	return args
+}
+
+// psqlEnv returns the environment slice for psql with LD_LIBRARY_PATH set so
+// the in-tree psql binary resolves libpq symbols correctly.
+func (e *ClusterRegressExecutor) psqlEnv() []string {
+	prev := os.Getenv("LD_LIBRARY_PATH")
+	if e.LibDir == "" {
+		return []string{"PGPASSWORD="}
+	}
+	ldPath := e.LibDir
+	if prev != "" {
+		ldPath += ":" + prev
+	}
+	return []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + ldPath}
 }
 
 // ExecuteSQL writes sql to a temporary file and runs it through psql.
 // Returns combined stdout (primary output) on success; on psql non-zero
 // exit the stdout+stderr combination is returned so callers can diff it.
-func (e *ClusterRegressExecutor) ExecuteSQL(ctx context.Context, sql string) (string, error) {
+func (e *ClusterRegressExecutor) ExecuteSQL(_ context.Context, sql string) (string, error) {
 	tmpf, err := os.CreateTemp("", "goopg_regress_*.sql")
 	if err != nil {
 		return "", err
@@ -204,9 +233,19 @@ func (e *ClusterRegressExecutor) ExecuteSQL(ctx context.Context, sql string) (st
 	// -q   quiet (no startup messages)
 	// -a   echo all input to stdout (matches pg_regress output format)
 	// -f   execute file
-	result, err := e.Cluster.PSQL("-X", "-q", "-a", "-f", tmpf.Name())
-	_ = err // psql non-zero exit (e.g. from unsupported SQL) is not fatal;
-	         // the output diff will report "defer".
+	// -c "SET statement_timeout=..." prevents individual statements from hanging.
+	args := e.psqlArgs(
+		"-X", "-q", "-a",
+		"-c", "SET statement_timeout = '5s'",
+		"-f", tmpf.Name(),
+	)
+	result, _ := util.RunCommand(util.CommandSpec{
+		Name:    e.PsqlBin,
+		Args:    args,
+		Dir:     e.RepoRoot,
+		Env:     e.psqlEnv(),
+		Timeout: 30 * time.Second,
+	})
 	return result.Stdout + result.Stderr, nil
 }
 
@@ -214,14 +253,28 @@ func (e *ClusterRegressExecutor) ExecuteSQL(ctx context.Context, sql string) (st
 // the cluster best-effort. Failures (tablespaces, C extensions, COPY from
 // non-existent files) are logged but not fatal — they only cause downstream
 // cases to defer rather than break the suite entirely.
-func runRegressSetup(t *testing.T, root string, c *cluster.Cluster) {
+func runRegressSetup(t *testing.T, root string, psqlBin string, c *cluster.Cluster) {
 	t.Helper()
 	setupPath := filepath.Join(root, "postgres", "src", "test", "regress", "sql", "test_setup.sql")
 	if _, err := os.Stat(setupPath); err != nil {
 		t.Logf("test_setup.sql not found, skipping fixture setup: %v", err)
 		return
 	}
-	result, _ := c.PSQL("-X", "-q", "-a", "-f", setupPath)
+	addr := c.ListenAddr()
+	host, port, _ := net.SplitHostPort(addr)
+	libDir := filepath.Join(root, "postgres", "local_install", "lib")
+	prev := os.Getenv("LD_LIBRARY_PATH")
+	ldPath := libDir
+	if prev != "" {
+		ldPath += ":" + prev
+	}
+	result, _ := util.RunCommand(util.CommandSpec{
+		Name:    psqlBin,
+		Args:    []string{"-h", host, "-p", port, "-U", "postgres", "-d", "postgres", "-X", "-q", "-a", "-f", setupPath},
+		Dir:     root,
+		Env:     []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + ldPath},
+		Timeout: 30 * time.Second,
+	})
 	if result.ExitCode != 0 {
 		t.Logf("test_setup.sql completed with partial failures (expected for C extensions/tablespaces): exit=%d", result.ExitCode)
 	}

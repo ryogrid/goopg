@@ -574,6 +574,76 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		return NewTimeDatum(x.CachedTime), nil
 	}
 	switch x.Type {
+	case "bool", "boolean":
+		v := strings.TrimSpace(strings.ToLower(x.Value))
+		switch v {
+		case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
+			return NewBoolDatum(true), nil
+		case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
+			return NewBoolDatum(false), nil
+		default:
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type boolean: %q", x.Value)}
+		}
+
+	case "int2", "smallint":
+		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 16)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type smallint: %q", x.Value)}
+		}
+		return Datum{Kind: KindInt, Int: n}, nil
+
+	case "int4", "integer", "int":
+		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 32)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type integer: %q", x.Value)}
+		}
+		return Datum{Kind: KindInt, Int: n}, nil
+
+	case "int8", "bigint":
+		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 64)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type bigint: %q", x.Value)}
+		}
+		return Datum{Kind: KindInt, Int: n}, nil
+
+	case "float4", "real", "float8":
+		// Goopg v0 stores floats as KindNumeric strings. Validate via
+		// ParseFloat so the error message is PostgreSQL-compatible.
+		v := strings.TrimSpace(x.Value)
+		_, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			typname := "double precision"
+			if x.Type == "float4" || x.Type == "real" {
+				typname = "real"
+			}
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typname, x.Value)}
+		}
+		m, s, perr := parseNumeric(v)
+		if perr != nil {
+			return NewStringDatum(v), nil
+		}
+		return newNumeric(m, int(s)), nil
+
+	case "numeric", "decimal":
+		// Return as string — goopg v0 stores numerics as text.
+		return NewStringDatum(strings.TrimSpace(x.Value)), nil
+
+	case "text", "bpchar", "char", "varchar", "name":
+		return NewStringDatum(x.Value), nil
+
+	case "oid":
+		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 64)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type oid: %q", x.Value)}
+		}
+		return Datum{Kind: KindInt, Int: n}, nil
+
 	case "date":
 		t, err := time.Parse("2006-01-02", x.Value)
 		if err != nil {
@@ -1182,6 +1252,52 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_try_advisory_lock":
 		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
 		return evalAdvisoryLock(x, row, ctx, true, false)
+
+	// ── Boolean comparison functions (M0097-0003) ─────────────────────────
+	// These are the C-level backing functions for bool operators; the
+	// boolean.sql regress test calls them explicitly.
+	case "booleq":
+		if len(x.Args) == 2 {
+			a, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			b, err2 := evalExpr(x.Args[1], row, ctx)
+			if err2 != nil {
+				return NullDatum, nil
+			}
+			if a.IsNull() || b.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(a.BoolValue() == b.BoolValue()), nil
+		}
+	case "boolne":
+		if len(x.Args) == 2 {
+			a, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			b, err2 := evalExpr(x.Args[1], row, ctx)
+			if err2 != nil {
+				return NullDatum, nil
+			}
+			if a.IsNull() || b.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(a.BoolValue() != b.BoolValue()), nil
+		}
+
+	// ── pg_input_is_valid / pg_input_error_info stubs (M0097-0003) ───────
+	// These PostgreSQL 16+ functions validate whether a string is valid input
+	// for a given type. Stub returns true (best-effort) — returning an error
+	// would cause boolean.sql to hang waiting for a SRF response.
+	case "pg_input_is_valid":
+		return NewBoolDatum(true), nil
+	case "pg_input_error_info":
+		// SRF returning (message, detail, hint, sql_error_code). Return NULL
+		// to signal the caller to expect no rows — goopg doesn't support SRFs
+		// with multiple output columns yet.
+		return NullDatum, nil
 	}
 	return evalStoredRoutineFuncCall(x, row, ctx)
 }

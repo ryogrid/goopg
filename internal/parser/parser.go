@@ -836,6 +836,24 @@ func (p *parser) parseIdent() (Token, error) {
 	return Token{}, p.errAtCur("expected identifier")
 }
 
+// parseColumnAlias is like parseIdent but accepts ANY keyword token
+// as an alias when the caller has already consumed an explicit AS.
+// PostgreSQL allows `SELECT expr AS true`, `SELECT expr AS null`, etc.
+// when the alias is preceded by AS. M0097-0003.
+func (p *parser) parseColumnAlias() (Token, error) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenIdent, TokenQuotedIdent:
+		p.advance()
+		return t, nil
+	case TokenKeyword:
+		// After explicit AS, any keyword is valid as a column alias.
+		p.advance()
+		return t, nil
+	}
+	return Token{}, p.errAtCur("expected column alias after AS")
+}
+
 func identText(t Token) string {
 	// TokenIdent and TokenKeyword carry already-lowercased text;
 	// TokenQuotedIdent preserves its original case.

@@ -299,7 +299,9 @@ func (p *parser) parseTargetEntry() (ResTarget, error) {
 	}
 	rt := ResTarget{pos: pos, Expr: expr}
 	if p.acceptKeyword(KwAs) {
-		alias, err := p.parseIdent()
+		// Use parseColumnAlias (not parseIdent) so reserved keywords
+		// like TRUE, FALSE, NULL are accepted as explicit aliases. M0097-0003.
+		alias, err := p.parseColumnAlias()
 		if err != nil {
 			return ResTarget{}, err
 		}
@@ -1162,7 +1164,14 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 	t := p.cur()
 	name := strings.ToLower(identText(t))
 	switch name {
-	case "date", "timestamp", "timestamptz":
+	case "date", "timestamp", "timestamptz",
+		// Scalar types for `typename 'string'` cast syntax (M0097-0003).
+		"bool", "boolean",
+		"int2", "int4", "int8", "smallint", "integer", "bigint",
+		"float4", "float8", "real",
+		"numeric", "decimal",
+		"text", "varchar", "char", "bpchar",
+		"name", "oid":
 		next := p.peek(1)
 		if next.Kind != TokenStringLit {
 			return nil, false

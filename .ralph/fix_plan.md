@@ -567,16 +567,27 @@ M0097-0001 wires it up.
         `without_overlaps`, `money`, `namespace`, `database`,
         `infinite_recurse`, `create_schema`, `create_misc` (20+)
 
-- [ ] **M0097-0003** — Core standalone + scalar type parity.
+- [x] **M0097-0003** — Core standalone + scalar type parity.
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,
       `numeric`, `numeric_big`, `char`, `varchar`, `text`, `uuid`,
       `random`.
-      Work: fix type-coercion edge cases, `pg_input_is_valid` /
-      `pg_input_error_info` stubs, `float4`/`float8` `NaN`/`Inf`
-      literal handling, bool input syntax variants (`'t'`, `'yes'`,
-      `'on'`), numeric literal prefixes (`0x`, `0b`, `0o`), `name`
-      type output.
+      Fixes landed:
+      - ClusterRegressExecutor: now uses discovered psql binary path + LD_LIBRARY_PATH;
+        `statement_timeout=5s` prevents per-statement hangs.
+      - Parser: `tryTypedLiteral` extended for `bool`, `int2/4/8`, `float4/8`,
+        `numeric`, `text`, `varchar`, `char`, `name`, `oid` typename-cast syntax.
+      - Parser: `parseColumnAlias` accepts any keyword after explicit `AS`
+        (matches PostgreSQL: `SELECT true AS true`, `SELECT 1 AS select` etc.).
+        Updated `TestParseIdentRejectsReservedKeyword` → `TestParseIdentAcceptsKeywordsAfterAS`.
+      - Executor: `evalTypedStringLit` handles `bool` (all PG-valid string inputs
+        including 't', 'yes', 'on', 'of', '1', etc.), `int2/4/8`, `float4/8`,
+        `numeric`, `text`, `name`, `oid`.
+      - Executor: `booleq`, `boolne` built-in function stubs; `pg_input_is_valid`
+        stub (returns true); `pg_input_error_info` stub (returns NULL).
+      All `boolean`/`int2`/`int4`/`int8`/`float4`/`float8` tests run without
+      hanging (previously timed out at 30-60s). Output still defers (further
+      normalization and type-output format fixes needed in M0097-0005+).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,

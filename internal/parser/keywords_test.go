@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -191,21 +190,23 @@ func TestAllKeywordsHaveCategories(t *testing.T) {
 	}
 }
 
-// TestParseIdentRejectsReservedKeyword verifies that the parser returns an
-// error when a reserved keyword appears where an identifier is expected, e.g.
-// as a column alias.
-func TestParseIdentRejectsReservedKeyword(t *testing.T) {
+// TestParseIdentAcceptsKeywordsAfterAS verifies that the parser accepts
+// reserved keywords as column aliases when they follow an explicit AS.
+// PostgreSQL allows `SELECT 1 AS select`, `SELECT true AS true`, etc.
+// M0097-0003: updated to match PostgreSQL's permissive explicit-AS alias rules.
+func TestParseIdentAcceptsKeywordsAfterAS(t *testing.T) {
 	cases := []string{
-		"SELECT 1 AS select",   // reserved keyword as alias
-		"SELECT 1 AS from",     // reserved keyword as alias
-		"SELECT 1 AS where",    // reserved keyword as alias
+		"SELECT 1 AS select",  // PostgreSQL allows any keyword after explicit AS
+		"SELECT 1 AS from",
+		"SELECT 1 AS where",
+		"SELECT true AS true", // boolean literals as aliases (boolean.sql)
+		"SELECT false AS false",
+		"SELECT 1 AS null",
 	}
 	for _, sql := range cases {
 		_, err := Parse(sql)
-		if err == nil {
-			t.Errorf("Parse(%q): expected error for reserved alias, got none", sql)
-		} else if !strings.Contains(err.Error(), "expected") {
-			t.Logf("Parse(%q) error: %v", sql, err) // error form may vary
+		if err != nil {
+			t.Errorf("Parse(%q): unexpected error: %v", sql, err)
 		}
 	}
 }
