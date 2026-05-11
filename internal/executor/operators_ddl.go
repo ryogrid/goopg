@@ -87,6 +87,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropTrigger(s)
 	case *parser.DropCompatStmt:
 		return nil, o.execDropCompat(s)
+	case *parser.CreateSequenceStmt:
+		return nil, o.execCreateSequence(s)
+	case *parser.AlterSequenceStmt:
+		return nil, nil // ALTER SEQUENCE accepted, no-op executor
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -297,6 +301,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				InitiallyDeferred: c.FKInitiallyDeferred,
 			})
 		}
+	}
+	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns.
+	// M0097-0009: creates the sequence so nextval() works for default generation.
+	for _, c := range s.Columns {
+		colTypeLow := strings.ToLower(c.Type.Name)
+		var seqMin, seqMax int64
+		switch colTypeLow {
+		case "serial", "int4", "integer":
+			// serial = int4 range
+			seqMin, seqMax = 1, 2147483647
+		case "bigserial", "int8", "bigint":
+			seqMin, seqMax = 1, 9223372036854775807
+		case "smallserial", "int2", "smallint":
+			seqMin, seqMax = 1, 32767
+		default:
+			continue
+		}
+		if colTypeLow != "serial" && colTypeLow != "bigserial" && colTypeLow != "smallserial" {
+			continue // only register sequences for serial types
+		}
+		seqName := strings.ToLower(s.Name.Name) + "_" + strings.ToLower(c.Name) + "_seq"
+		RegisterSequence(seqName, 1, 1, seqMin, seqMax, false)
 	}
 	// If PARTITION BY, annotate the table with partition metadata
 	if s.PartitionBy != nil {
@@ -1705,6 +1731,46 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 		return &ExecError{Code: "42704", Pos: s.Pos(),
 			Message: fmt.Sprintf("trigger %q for table %q does not exist", s.Name, s.Table.Name)}
 	}
+	return nil
+}
+
+// execCreateSequence registers a new sequence in the process-global registry.
+// M0097-0009.
+func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
+	name := s.Name.String()
+	if LookupSequence(name) != nil && s.IfNotExists {
+		return nil
+	}
+	// Determine defaults based on data type.
+	var minV, maxV int64
+	switch strings.ToLower(s.DataType) {
+	case "smallint", "int2":
+		minV, maxV = -32768, 32767
+	case "integer", "int4", "int":
+		minV, maxV = -2147483648, 2147483647
+	default: // bigint / int8 (default)
+		minV, maxV = -9223372036854775808, 9223372036854775807
+	}
+	// Apply explicit options.
+	if s.MinValue != nil {
+		minV = *s.MinValue
+	}
+	if s.MaxValue != nil {
+		maxV = *s.MaxValue
+	}
+	increment := int64(1)
+	if s.Increment != nil {
+		increment = *s.Increment
+	}
+	start := minV
+	if increment < 0 {
+		start = maxV
+	}
+	if s.Start != nil {
+		start = *s.Start
+	}
+	cycle := s.Cycle
+	RegisterSequence(name, start, increment, minV, maxV, cycle)
 	return nil
 }
 

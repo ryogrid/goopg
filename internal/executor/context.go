@@ -149,6 +149,12 @@ type Context struct {
 	// The server reads this after each statement and emits NoticeResponse
 	// messages to the client. M0097-0008.
 	Notices []string
+
+	// Sequence session state — maps sequence key → last nextval result
+	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
+	CurrSeqVals map[string]int64
+	LastSeqVal  int64
+	LastSeqSet  bool
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

@@ -658,7 +658,7 @@ M0097-0001 wires it up.
       etc. with correct ERROR/NOTICE semantics. All M0097-0008 target tests
       complete without hanging (max 0.92s for alter_table).
 
-- [ ] **M0097-0009** — COPY + sequences + identity + generated columns.
+- [x] **M0097-0009** — COPY + sequences + identity + generated columns.
       Target tests: `copy`, `copy2`, `copydml`, `copyselect`,
       `sequence`, `identity`, `generated_stored`, `generated_virtual`.
       Work: `COPY TO STDOUT` format options, `COPY … WHERE`, sequence

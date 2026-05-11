@@ -857,6 +857,39 @@ const (
 	DropCascade
 )
 
+// CreateSequenceStmt — `CREATE [TEMP] SEQUENCE [IF NOT EXISTS] name
+//   [AS datatype] [INCREMENT [BY] n] [MINVALUE n | NO MINVALUE]
+//   [MAXVALUE n | NO MAXVALUE] [START [WITH] n] [CACHE n]
+//   [NO CYCLE | CYCLE] [OWNED BY column]`. M0097-0009.
+type CreateSequenceStmt struct {
+	pos         int
+	Name        ObjectName
+	IfNotExists bool
+	Temporary   bool
+	DataType    string // "smallint", "integer", "bigint" (default)
+	Increment   *int64
+	MinValue    *int64
+	MaxValue    *int64
+	Start       *int64
+	Cache       *int64
+	Cycle       bool
+	OwnedBy     string // "table.column" or empty
+}
+
+func (s *CreateSequenceStmt) Pos() int  { return s.pos }
+func (s *CreateSequenceStmt) stmtNode() {}
+
+// AlterSequenceStmt — `ALTER SEQUENCE [IF EXISTS] name [option …]`. M0097-0009.
+type AlterSequenceStmt struct {
+	pos      int
+	Name     ObjectName
+	IfExists bool
+	Options  []string // opaque option list; accepted for syntax compatibility
+}
+
+func (s *AlterSequenceStmt) Pos() int  { return s.pos }
+func (s *AlterSequenceStmt) stmtNode() {}
+
 // DropTableStmt — `DROP TABLE [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
 type DropTableStmt struct {
 	pos      int

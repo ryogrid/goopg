@@ -61,7 +61,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateFunctionStmt, *parser.DropFunctionStmt,
 		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
-		*parser.DropCompatStmt:
+		*parser.DropCompatStmt,
+		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,

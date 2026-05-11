@@ -84,6 +84,9 @@ func (p *parser) parseCreate() (Stmt, error) {
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger:
 		p.advance()
 		return p.parseCreateTriggerTail(t.Pos)
+	// CREATE SEQUENCE [IF NOT EXISTS] name [options…] (M0097-0009)
+	case p.acceptIdentKeyword("sequence"):
+		return p.parseCreateSequenceTail(t.Pos, unlogged)
 	// Accept CREATE CONSTRAINT TRIGGER (skip CONSTRAINT keyword then TRIGGER)
 	case p.acceptIdentKeyword("constraint"):
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger {
@@ -927,6 +930,120 @@ func (p *parser) parseDrop() (Stmt, error) {
 
 // parseCreateTriggerTail picks up after CREATE [CONSTRAINT] TRIGGER.
 // Grammar (simplified):
+// parseCreateSequenceTail picks up after CREATE [TEMP] SEQUENCE. M0097-0009.
+func (p *parser) parseCreateSequenceTail(pos int, temp bool) (Stmt, error) {
+	stmt := &CreateSequenceStmt{pos: pos, Temporary: temp}
+	// Optional IF NOT EXISTS.
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwNot); err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+	// Sequence name.
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	// Option loop — consume all recognised options until we hit something else.
+	for {
+		switch {
+		case p.acceptIdentKeyword("as"):
+			// AS datatype
+			dt, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.DataType = identText(dt)
+		case p.acceptIdentKeyword("increment"):
+			_ = p.acceptKeyword(KwBy)
+			val, err := p.parseInt64()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Increment = &val
+		case p.acceptIdentKeyword("minvalue"):
+			val, err := p.parseInt64()
+			if err != nil {
+				return nil, err
+			}
+			stmt.MinValue = &val
+		case p.acceptIdentKeyword("maxvalue"):
+			val, err := p.parseInt64()
+			if err != nil {
+				return nil, err
+			}
+			stmt.MaxValue = &val
+		case p.acceptIdentKeyword("no"):
+			// NO MINVALUE / NO MAXVALUE / NO CYCLE
+			_ = p.acceptIdentKeyword("minvalue") || p.acceptIdentKeyword("maxvalue") || p.acceptIdentKeyword("cycle")
+		case p.acceptIdentKeyword("start"):
+			_ = p.acceptKeyword(KwWith)
+			val, err := p.parseInt64()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Start = &val
+		case p.acceptIdentKeyword("cache"):
+			val, err := p.parseInt64()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Cache = &val
+		case p.acceptIdentKeyword("cycle"):
+			stmt.Cycle = true
+		case p.acceptIdentKeyword("owned"):
+			_ = p.acceptKeyword(KwBy)
+			// Consume table.column or NONE.
+			if p.acceptIdentKeyword("none") {
+				stmt.OwnedBy = ""
+			} else {
+				owner, err := p.parseObjectName()
+				if err != nil {
+					return nil, err
+				}
+				// Optional .col after table name.
+				if p.acceptSymbol(".") {
+					col, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					stmt.OwnedBy = owner.String() + "." + identText(col)
+				} else {
+					stmt.OwnedBy = owner.String()
+				}
+			}
+		default:
+			return stmt, nil
+		}
+	}
+}
+
+// parseInt64 parses a (possibly negative) integer literal. M0097-0009.
+func (p *parser) parseInt64() (int64, error) {
+	neg := p.cur().Kind == TokenSymbol && p.cur().Value == "-"
+	if neg {
+		p.advance()
+	}
+	t := p.cur()
+	if t.Kind != TokenIntLit {
+		return 0, p.errAtCur("expected integer literal")
+	}
+	p.advance()
+	n := int64(0)
+	for _, c := range t.Value {
+		n = n*10 + int64(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
 //   name BEFORE|AFTER|INSTEAD OF event[, ...] ON table
 //   FOR [EACH] {ROW|STATEMENT}
 //   EXECUTE {FUNCTION|PROCEDURE} funcname([]);
@@ -1109,6 +1226,30 @@ func (p *parser) parseAlter() (Stmt, error) {
 	t, err := p.expectKeyword(KwAlter)
 	if err != nil {
 		return nil, err
+	}
+	// ALTER SEQUENCE — consume options as a compat stub. M0097-0009.
+	if p.acceptIdentKeyword("sequence") {
+		stmt := &AlterSequenceStmt{pos: t.Pos}
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			stmt.IfExists = true
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Name = name
+		// Consume options until end of statement (no semicolon, just stop).
+		for p.cur().Kind != TokenEOF {
+			t := p.cur()
+			if t.Kind == TokenSymbol && t.Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
 	}
 	if _, err := p.expectKeyword(KwTable); err != nil {
 		return nil, err

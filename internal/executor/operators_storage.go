@@ -383,6 +383,32 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			row[tgtIdx] = src[srcIdx]
 		}
 
+		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns.
+		// M0097-0009: if a serial column's slot is still NullDatum (not provided
+		// in the INSERT), call nextval on the implicit sequence.
+		for i, col := range cols {
+			if !row[i].IsNull() {
+				continue
+			}
+			seqName := ""
+			switch strings.ToLower(col.Type.Name) {
+			case "serial":
+				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			case "bigserial":
+				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			case "smallserial":
+				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			}
+			if seqName == "" {
+				continue
+			}
+			seqArgs := []Datum{NewStringDatum(seqName)}
+			v, err := evalNextval(seqArgs, o.ctx)
+			if err == nil && !v.IsNull() {
+				row[i] = v
+			}
+		}
+
 		// BEFORE INSERT triggers (M0096-0012).
 		if len(o.plan.Table.Triggers) > 0 {
 			newRow, ok := fireTriggers(o.ctx, o.plan.Table, "before", "insert", nil, row)

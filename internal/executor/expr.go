@@ -1674,6 +1674,57 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_input_error_info":
 		return NullDatum, nil
 
+	// ── Sequence functions (M0097-0009) ───────────────────────────────────
+	case "nextval":
+		args := make([]Datum, len(x.Args))
+		for i, a := range x.Args {
+			v, err := evalExpr(a, row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			args[i] = v
+		}
+		return evalNextval(args, ctx)
+	case "currval":
+		args := make([]Datum, len(x.Args))
+		for i, a := range x.Args {
+			v, err := evalExpr(a, row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			args[i] = v
+		}
+		return evalCurrval(args, ctx)
+	case "setval":
+		args := make([]Datum, len(x.Args))
+		for i, a := range x.Args {
+			v, err := evalExpr(a, row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			args[i] = v
+		}
+		return evalSetval(args, ctx)
+	case "lastval":
+		return evalLastval(ctx)
+	case "pg_get_serial_sequence":
+		// pg_get_serial_sequence(table_name, column_name) → text
+		// Returns the sequence name used for a serial/identity column.
+		// Stub: construct the conventional name table_column_seq. M0097-0009.
+		if len(x.Args) == 2 {
+			tbl, err1 := evalExpr(x.Args[0], row, ctx)
+			col, err2 := evalExpr(x.Args[1], row, ctx)
+			if err1 != nil || err2 != nil || tbl.IsNull() || col.IsNull() {
+				return NullDatum, nil
+			}
+			seqName := fmt.Sprintf("public.%s_%s_seq", tbl.StringValue(), col.StringValue())
+			return NewStringDatum(seqName), nil
+		}
+		return NullDatum, nil
+	case "pg_sequence_parameters":
+		// SRF returning sequence parameters — stub returns NULL.
+		return NullDatum, nil
+
 	// ── String functions (M0097-0005) ─────────────────────────────────────
 	case "repeat":
 		// repeat(text, int) → text
