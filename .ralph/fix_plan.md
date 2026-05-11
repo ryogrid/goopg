@@ -345,14 +345,17 @@ alongside the suite.
       LEVEL READ COMMITTED successfully (defers due to pg_advisory_lock, not parsing).
       TestPort_IsolationInsertConflictDoNothing similarly advances past parsing. (2026-05-12).
 
-- [ ] **M0096-0003** — Implement `pg_advisory_lock(key bigint)`,
-      `pg_advisory_unlock(key bigint)`, `pg_advisory_unlock_all()`,
-      `pg_advisory_xact_lock(classid int, objid int)`,
-      `pg_try_advisory_xact_lock(classid int, objid int)` as built-in
-      functions backed by a session-scoped advisory lock table (in-memory
-      hash-map + global mutex for cross-session blocking).
-      Unblocks: `lock-committed-update`, `lock-committed-keyupdate`
-      (combined with M0096-0002 and M0096-0004).
+- [x] **M0096-0003** — Advisory lock built-in functions implemented.
+      New file `internal/executor/advisory.go`: process-global advisoryManager
+      with channel-based blocking (waiter queues), context cancellation support,
+      release-all on session teardown. Functions added to evalFuncCall():
+      pg_advisory_lock(bigint), pg_advisory_lock(int4,int4),
+      pg_advisory_unlock(bigint/int4,int4), pg_advisory_unlock_all(),
+      pg_advisory_xact_lock(int4,int4) [treated as session-scoped],
+      pg_try_advisory_xact_lock(int4,int4) [non-blocking],
+      pg_try_advisory_lock(bigint) [non-blocking].
+      Verification: lock-committed-update no longer errors on advisory lock;
+      defers on FOR KEY SHARE (M0096-0004) and column naming (2026-05-12).
 
 - [ ] **M0096-0004** — Extend SELECT locking parser for `FOR KEY SHARE`
       and `FOR NO KEY UPDATE`; map both to existing `FOR SHARE` /

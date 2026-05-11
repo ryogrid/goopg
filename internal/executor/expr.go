@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -1124,8 +1125,161 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewStringDatum("postgres"), nil
 	case "current_schema", "current_schemas":
 		return NewStringDatum("public"), nil
+
+	// ── Advisory lock functions (M0096-0003) ──────────────────────────────
+	// All variants block/return immediately depending on lock availability.
+	// pg_advisory_lock / pg_advisory_xact_lock return non-NULL (void-like)
+	// on success so that `IS NOT NULL` predicates in WHERE clauses evaluate
+	// to true (matching PostgreSQL's behaviour for void-returning functions).
+
+	case "pg_advisory_lock":
+		// pg_advisory_lock(bigint) or pg_advisory_lock(int4, int4)
+		return evalAdvisoryLock(x, row, ctx, false, false)
+
+	case "pg_advisory_unlock":
+		// pg_advisory_unlock(bigint) → boolean
+		// pg_advisory_unlock(int4, int4) → boolean
+		return evalAdvisoryUnlock(x, row, ctx)
+
+	case "pg_advisory_unlock_all":
+		// pg_advisory_unlock_all() → void
+		return evalAdvisoryUnlockAll(ctx)
+
+	case "pg_advisory_xact_lock":
+		// pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
+		// Treated as session-scoped for v0; released by pg_advisory_unlock_all.
+		return evalAdvisoryLock(x, row, ctx, false, false)
+
+	case "pg_try_advisory_xact_lock":
+		// pg_try_advisory_xact_lock(int4, int4) → boolean  (non-blocking)
+		return evalAdvisoryLock(x, row, ctx, true, false)
+
+	case "pg_try_advisory_lock":
+		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
+		return evalAdvisoryLock(x, row, ctx, true, false)
 	}
 	return evalStoredRoutineFuncCall(x, row, ctx)
+}
+
+// evalAdvisoryLock implements the blocking and non-blocking advisory-lock
+// acquisition variants.
+//
+//   - tryOnly=true : non-blocking (pg_try_advisory_*); returns true/false.
+//   - tryOnly=false: blocking (pg_advisory_lock, pg_advisory_xact_lock);
+//     blocks until the lock is acquired or ctx is cancelled.
+//
+// Argument forms:
+//
+//	(bigint)        → key = bigint
+//	(int4, int4)    → key = (classid, objid)
+func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, _ bool) (Datum, error) {
+	sess := advisorySessionID(ctx.Session)
+
+	var key advisoryKey
+	switch len(x.Args) {
+	case 1:
+		v, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		n, ok := datumInt64(v)
+		if !ok {
+			return NullDatum, nil
+		}
+		key = bigintToKey(n)
+	case 2:
+		v0, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		v1, err2 := evalExpr(x.Args[1], row, ctx)
+		if err2 != nil {
+			return NullDatum, err2
+		}
+		n0, _ := datumInt64(v0)
+		n1, _ := datumInt64(v1)
+		key = int4ToKey(int32(n0), int32(n1))
+	default:
+		return NullDatum, nil
+	}
+
+	if tryOnly {
+		ok := globalAdvisoryMgr.tryAcquire(key, sess)
+		return NewBoolDatum(ok), nil
+	}
+
+	// Blocking acquire — respects ctx cancellation.
+	qctx := ctx.Ctx
+	if qctx == nil {
+		qctx = context.Background()
+	}
+	if err := globalAdvisoryMgr.acquire(qctx, key, sess); err != nil {
+		// Context cancelled (step timed out or runner aborted).
+		return NullDatum, nil
+	}
+	// Return a non-NULL string so `IS NOT NULL` in WHERE clauses is true.
+	return NewStringDatum(""), nil
+}
+
+// evalAdvisoryUnlock implements pg_advisory_unlock(bigint) and
+// pg_advisory_unlock(int4, int4). Returns true if the lock was held by
+// this session and has been released, false otherwise.
+func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	sess := advisorySessionID(ctx.Session)
+
+	var key advisoryKey
+	switch len(x.Args) {
+	case 1:
+		v, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		n, _ := datumInt64(v)
+		key = bigintToKey(n)
+	case 2:
+		v0, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		v1, err2 := evalExpr(x.Args[1], row, ctx)
+		if err2 != nil {
+			return NullDatum, err2
+		}
+		n0, _ := datumInt64(v0)
+		n1, _ := datumInt64(v1)
+		key = int4ToKey(int32(n0), int32(n1))
+	default:
+		return NewBoolDatum(false), nil
+	}
+
+	ok := globalAdvisoryMgr.release(key, sess)
+	return NewBoolDatum(ok), nil
+}
+
+// evalAdvisoryUnlockAll implements pg_advisory_unlock_all(). Releases every
+// advisory lock held by this session and returns NULL (void-like).
+func evalAdvisoryUnlockAll(ctx *Context) (Datum, error) {
+	if ctx == nil || ctx.Session == nil {
+		return NullDatum, nil
+	}
+	globalAdvisoryMgr.releaseAll(advisorySessionID(ctx.Session))
+	return NullDatum, nil
+}
+
+// datumInt64 extracts an integer value from a Datum. Returns (0, false) if the
+// Datum is not an integer-compatible type.
+func datumInt64(d Datum) (int64, bool) {
+	switch d.Kind {
+	case KindInt:
+		return d.Int, true
+	case KindString:
+		// Some callers pass string representations of integers.
+		n, err := strconv.ParseInt(strings.TrimSpace(d.StringValue()), 10, 64)
+		if err == nil {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 // evalToDate implements PostgreSQL's `to_date(text, text)` for the
