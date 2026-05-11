@@ -413,9 +413,13 @@ func (o *insertOp) Next() (TupleSlot, error) {
 				partTable := routeToPartition(o.plan.Table, row, im)
 				if partTable != nil {
 					targetRel = o.ctx.Catalog.RelFileNode(partTable)
+					// Remap row from parent column order to partition child column order.
+					// Partition children may have columns in a different order (ATTACH
+					// PARTITION allows mismatched column order). M0096-0013.
+					partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
 					// Recompute generated columns using partition child's schema.
-					_ = computeGeneratedColumns(partTable.Columns, row)
-					if err := writeHeapRow(o.ctx, targetRel, partTable.Columns, row); err != nil {
+					_ = computeGeneratedColumns(partTable.Columns, partRow)
+					if err := writeHeapRow(o.ctx, targetRel, partTable.Columns, partRow); err != nil {
 						return nil, err
 					}
 					o.rowsAffected++
@@ -433,6 +437,41 @@ func (o *insertOp) Next() (TupleSlot, error) {
 }
 
 // routeToPartition finds the partition child table that matches the given row
+// remapRowForPartition reorders a row from the parent's column layout to the
+// partition child's column layout. PostgreSQL's ATTACH PARTITION allows the
+// child to have columns in a different order (as long as names and types match).
+// We remap by matching column names. M0096-0013.
+func remapRowForPartition(parentCols, childCols []catalog.Column, row Row) Row {
+	if len(parentCols) == len(childCols) {
+		same := true
+		for i := range childCols {
+			if childCols[i].Name != parentCols[i].Name {
+				same = false
+				break
+			}
+		}
+		if same {
+			return row // fast path: same ordering
+		}
+	}
+	// Build name→value map from parent row.
+	byName := make(map[string]Datum, len(parentCols))
+	for i, c := range parentCols {
+		if i < len(row) {
+			byName[strings.ToLower(c.Name)] = row[i]
+		}
+	}
+	out := make(Row, len(childCols))
+	for i, c := range childCols {
+		if v, ok := byName[strings.ToLower(c.Name)]; ok {
+			out[i] = v
+		} else {
+			out[i] = NullDatum
+		}
+	}
+	return out
+}
+
 // based on the parent's partition key. Returns nil if no partition matches.
 // M0096-0007.
 func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *catalog.Table {
@@ -1031,36 +1070,66 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// loop forever. The two-pass approach trades a bit of memory for
 	// straightforward iteration semantics.
 	type pendingUpdate struct {
+		rel    storage.RelFileNode
 		blk    storage.BlockNumber
 		slot   uint16
+		cols   []catalog.Column // columns of the source relation
 		newRow Row
 	}
-	pending := make([]pendingUpdate, 0, 1) // pre-alloc for common 1-row match
+	pending := make([]pendingUpdate, 0, 1)
 
-	if err := o.scanForMatches(rel, cols, func(blk storage.BlockNumber, slot uint16, row Row) error {
-		newRow := make(Row, len(cols))
-		for i := range cols {
-			if o.plan.Set[i] == nil {
-				newRow[i] = row[i]
-				continue
+	// Scan parent + partition/inheritance children. M0096-0013.
+	updateScanTables := []*catalog.Table{tbl}
+	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
+		updateScanTables = append(updateScanTables, imU.InheritanceChildren(tbl.OID)...)
+	}
+	for _, scanTbl := range updateScanTables {
+		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
+		scanCols := scanTbl.Columns
+		if scanTbl != tbl {
+			if err := o.ctx.acquireRelLock(scanRel, lockmgr.RowExclusiveLock); err != nil {
+				return nil, err
 			}
-			v, err := evalExpr(o.plan.Set[i], row, o.ctx)
-			if err != nil {
-				return err
-			}
-			newRow[i] = v
 		}
-		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
-		_ = computeGeneratedColumns(cols, newRow)
-		pending = append(pending, pendingUpdate{blk: blk, slot: slot, newRow: newRow})
-		return nil
-	}); err != nil {
-		return nil, err
+		captureRel := scanRel
+		captureCols := scanCols
+		if err := scanMatching(o.ctx, scanRel, scanCols, o.pred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+			nCols := len(captureCols)
+			newRow := make(Row, nCols)
+			for i := range captureCols {
+				setIdx := i
+				if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
+					v, err := evalExpr(o.plan.Set[setIdx], row, o.ctx)
+					if err != nil {
+						return err
+					}
+					newRow[i] = v
+				} else {
+					if i < len(row) {
+						newRow[i] = row[i]
+					}
+				}
+			}
+			_ = computeGeneratedColumns(captureCols, newRow)
+			pending = append(pending, pendingUpdate{rel: captureRel, blk: blk, slot: slot, cols: captureCols, newRow: newRow})
+			return nil
+		}); err != nil {
+			return nil, err
+		}
 	}
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
 	for _, pu := range pending {
+		puRel := pu.rel
+		if puRel == (storage.RelFileNode{}) {
+			puRel = rel
+		}
+		puCols := pu.cols
+		if puCols == nil {
+			puCols = cols
+		}
 		used := false
-		if hotEligibleSeq {
+		if hotEligibleSeq && puRel == rel {
 			var err error
 			used, err = tryApplyHOTUpdate(o.ctx, rel, cols, pu.blk, pu.slot, pu.newRow)
 			if err != nil {
@@ -1068,14 +1137,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 		}
 		if !used {
-			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk})
 			if err != nil {
 				return nil, err
 			}
 			s.Lock()
-			// M0090-0002: detect concurrent xmax-stamp under the
-			// exclusive Lock before our own stamp. Capture old tuple
-			// bytes for WAL logical record (M0094-0002).
 			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
 			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
 				s.Unlock()
@@ -1094,22 +1160,28 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if errors.Is(err, storage.ErrUnsupportedItem) {
-					// Concurrent UPDATE/DELETE or opportunistic
-					// prune flipped this slot out of LP_NORMAL
-					// after scan-time. Skip — goopg has no
-					// EvalPlanQual yet, so we drop the row
-					// rather than abort the transaction.
 					continue
 				}
 				return nil, err
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
 				return nil, derr
 			}
-			if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
+			// For partition key UPDATE: route new row to correct partition.
+			targetWriteRel := puRel
+			targetWriteCols := puCols
+			if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
+				destPart := routeToPartition(tbl, pu.newRow, imW)
+				if destPart != nil {
+					targetWriteRel = o.ctx.Catalog.RelFileNode(destPart)
+					targetWriteCols = destPart.Columns
+					_ = computeGeneratedColumns(destPart.Columns, pu.newRow)
+				}
+			}
+			if err := writeHeapRow(o.ctx, targetWriteRel, targetWriteCols, pu.newRow); err != nil {
 				return nil, err
 			}
 		}
@@ -1172,24 +1244,35 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		return nil, err
 	}
 	tbl := o.plan.Table
-	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
 	type victim struct {
+		rel  storage.RelFileNode
 		blk  storage.BlockNumber
 		slot uint16
 		row  Row
 	}
+	// Collect victims from parent + partition/inheritance children. M0096-0013.
 	var victims []victim
-	if err := o.scanForMatches(rel, cols, func(blk storage.BlockNumber, slot uint16, row Row) error {
-		// FK enforcement before building the victim list (M0096-0011).
-		if len(tbl.ForeignKeys) == 0 {
-			// This table has no FKs referencing it (as parent); skip enforcement.
+	scanTables := []*catalog.Table{tbl}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		scanTables = append(scanTables, im.PartitionChildren(tbl.OID)...)
+		scanTables = append(scanTables, im.InheritanceChildren(tbl.OID)...)
+	}
+	for _, scanTbl := range scanTables {
+		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
+		if scanTbl != tbl {
+			if err := o.ctx.acquireRelLock(scanRel, lockmgr.RowExclusiveLock); err != nil {
+				return nil, err
+			}
 		}
-		victims = append(victims, victim{blk: blk, slot: slot, row: cloneRow(row)})
-		return nil
-	}); err != nil {
-		return nil, err
+		captureRel := scanRel // capture for closure
+		if err := scanMatching(o.ctx, scanRel, scanTbl.Columns, o.pred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row)})
+			return nil
+		}); err != nil {
+			return nil, err
+		}
 	}
 	// Fire BEFORE DELETE triggers and enforce FK constraints. M0096-0011/0012.
 	filtered := victims[:0]
@@ -1207,16 +1290,17 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	}
 	victims = filtered
 	for _, v := range victims {
-		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: v.blk})
+		victimRel := v.rel
+		if victimRel == (storage.RelFileNode{}) {
+			victimRel = rel // fallback to parent rel
+		}
+		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: victimRel, Block: v.blk})
 		if err != nil {
 			return nil, err
 		}
 		s.Lock()
 		// M0090-0002: detect concurrent xmax-stamp under the
-		// exclusive Lock before our own stamp. For DELETE, the same
-		// concurrent-update race produces inconsistent xmax state.
-		// Capture old tuple bytes for the WAL logical record at the
-		// same time (needed by logical replication / M0094-0002).
+		// exclusive Lock before our own stamp.
 		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
 		if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
 			s.Unlock()
@@ -1235,16 +1319,11 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if errors.Is(err, storage.ErrUnsupportedItem) {
-				// Concurrent UPDATE/DELETE or opportunistic
-				// prune flipped this slot out of LP_NORMAL
-				// after scan-time. Skip — goopg has no
-				// EvalPlanQual yet, so we drop the row
-				// rather than abort the transaction.
 				continue
 			}
 			return nil, err
 		}
-		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
+		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, victimRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		if derr != nil {

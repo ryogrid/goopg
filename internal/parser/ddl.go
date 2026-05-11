@@ -645,11 +645,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				col.RefColumns = refCols
 			}
-			// Parse ON DELETE / ON UPDATE clauses.
-			for p.acceptIdentKeyword("on") {
-				isDelete := p.acceptIdentKeyword("delete")
+			// Parse ON DELETE / ON UPDATE clauses. ON is KwOn (reserved).
+			for p.acceptKeyword(KwOn) {
+				isDelete := p.acceptKeyword(KwDelete)
 				if !isDelete {
-					_ = p.acceptIdentKeyword("update")
+					_ = p.acceptKeyword(KwUpdate)
 				}
 				action := parseFKAction(p)
 				if isDelete {
@@ -659,6 +659,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 			}
 			// Parse [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+			// Also accept bare INITIALLY DEFERRED (implicit DEFERRABLE).
 			if p.acceptKeyword(KwNot) {
 				_, _ = p.expectKeyword(KwDeferrable)
 				col.FKDeferrable = false
@@ -668,6 +669,10 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 					col.FKInitiallyDeferred = p.acceptIdentKeyword("deferred")
 					_ = p.acceptIdentKeyword("immediate")
 				}
+			} else if p.acceptIdentKeyword("initially") {
+				col.FKDeferrable = true
+				col.FKInitiallyDeferred = p.acceptIdentKeyword("deferred")
+				_ = p.acceptIdentKeyword("immediate")
 			}
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
@@ -722,19 +727,20 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 
 // parseFKAction reads the referential action keyword from the current
 // token position. Used by REFERENCES … ON DELETE / ON UPDATE parsing.
-// M0096-0011.
+// M0096-0011. Note: cascade/restrict/set are registered keywords;
+// "no" and "action" are plain identifiers.
 func parseFKAction(p *parser) FKAction {
-	if p.acceptIdentKeyword("cascade") {
+	if p.acceptKeyword(KwCascade) {
 		return FKActionCascade
 	}
-	if p.acceptIdentKeyword("restrict") {
+	if p.acceptKeyword(KwRestrict) {
 		return FKActionRestrict
 	}
 	if p.acceptIdentKeyword("no") {
 		_ = p.acceptIdentKeyword("action")
 		return FKActionNoAction
 	}
-	if p.acceptIdentKeyword("set") {
+	if p.acceptKeyword(KwSet) {
 		if p.acceptKeyword(KwNull) {
 			return FKActionSetNull
 		}
