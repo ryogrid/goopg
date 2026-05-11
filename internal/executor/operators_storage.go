@@ -74,6 +74,12 @@ type seqScanOp struct {
 	// the boundary must call slot.Materialize() to deep-copy.
 	// (M0073-0004.)
 	arena *Arena
+
+	// M0092-0007: embedded slot reused across every Next() call.
+	// The returned `&o.slot` pointer is stable across calls; its
+	// `row` field is overwritten per emission. Caller must
+	// consume / Materialize before the next Next() invocation.
+	slot MaterializedSlot
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -250,13 +256,15 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				}
 				row = detoasted
 			}
-			// M0071-0015 Stage E: producers always cloneRow.
-			// The slot pipeline's retention boundaries
-			// (sortOp.Open, windowOp.Open, lockRowsOp,
-			// executor.Run) call slot.Materialize() when they
-			// need ownership; consumers that only read within
-			// a single Next can use the slot directly.
-			return asSlot(o.Schema(), cloneRow(row)), nil
+			// M0092-0007: stack-aliased slot reused across
+			// Next() calls; matches the M0092-0002 contract
+			// (consumers materialize at retention boundaries).
+			// scanRow is reused across the per-page tuple
+			// loop; rows that need retention go through
+			// slot.Materialize().
+			o.slot.schema = o.Schema()
+			o.slot.row = row
+			return &o.slot, nil
 		}
 		o.releasePinned()
 		o.curBlock++

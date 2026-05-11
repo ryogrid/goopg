@@ -105,6 +105,12 @@ type indexScanOp struct {
 	// Acquired in openPrep from the rowPool (M0068-0004), released
 	// in Close.
 	scanRow Row
+
+	// M0092-0007: embedded slot reused across every Next() call so
+	// we don't allocate a fresh MaterializedSlot per emission.
+	// The returned `&o.slot` pointer is stable across calls; its
+	// `row` field is overwritten each Next.
+	slot MaterializedSlot
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -296,7 +302,12 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// currentTID() — lockRowsOp stamps the live version.
 		o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
 		o.hasLast = true
-		return asSlot(o.Schema(), row), nil
+		// M0092-0007: stack-aliased slot — reuse o.slot across
+		// every Next() call. Caller must consume / Materialize
+		// before the next Next() invocation.
+		o.slot.schema = o.Schema()
+		o.slot.row = row
+		return &o.slot, nil
 	}
 }
 
