@@ -238,13 +238,18 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       t.Skip blocker (goopg rejects unknown GUCs at startup; function not
       implemented). CSV row WS-002 added; markdown regenerated (2026-05-12).
 
-- [ ] **M0095-0003** — Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
-      as adapted Go tests in
-      `internal/testport/pgbasebackup_port_test.go`.
-      All five skip WAL-streaming / replication features with explicit blocker
-      messages; CLI option-validation sub-cases (e.g., `--help`, wrong-flag
-      error messages) pass.  New CSV rows: BB-010, BB-011, BB-020, BB-030,
-      BB-040.
+- [x] **M0095-0003** — Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
+      as adapted Go tests in `internal/testport/pgbasebackup_port_test.go`.
+      010: --help/--version/options + no-pgdata + --compress=none:1/none+ PASS;
+           backup execution SKIP (physical streaming).
+      011: SKIP entirely (in-place tablespace backup needs BASE_BACKUP protocol).
+      020: --help/--version/options + no-dir + slot-conflict + sync-conflict + compress PASS;
+           WAL streaming SKIP (replication protocol).
+      030: --help/--version/options + no-slot/db/action/file checks PASS;
+           logical streaming SKIP.
+      040: --help/--version/options + no-datadir/publisher/database PASS;
+           subscriber setup SKIP.
+      CSV rows BB-010..040 added; markdown regenerated (2026-05-12).
 
 - [ ] **M0095-0004** — Implement VACUUM parenthesized option syntax
       (`VACUUM (FULL, FREEZE, SKIP_DATABASE_STATS, ...) [table]`) in
