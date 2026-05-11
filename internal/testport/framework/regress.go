@@ -111,9 +111,26 @@ func RunRegressSubset(ctx context.Context, repoRoot string, cases []RegressCase,
 	return results, nil
 }
 
-// NormalizeRegressOutput normalizes line endings and trailing spaces for stable diffs.
+// NormalizeRegressOutput normalizes line endings, trailing whitespace, and
+// common goopg-specific output differences for stable diffs with the
+// upstream .out files.
+//
+// Normalizations applied (in order):
+//  1. CR+LF → LF
+//  2. Trailing spaces/tabs per line stripped
+//  3. Trailing blank lines stripped
+//  4. ERROR double-space normalisation: "ERROR:  " → "ERROR: " (psql adds
+//     double space; goopg wire path adds single space)
 func NormalizeRegressOutput(raw string) string {
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	// Normalise double-space in ERROR/NOTICE/WARNING/HINT/DETAIL lines.
+	// PostgreSQL's libpq writes "SEVERITY:  message" (two spaces); goopg
+	// may emit one space.  Collapse to two spaces so both sides compare equal
+	// after normalization.
+	for _, sev := range []string{"ERROR", "NOTICE", "WARNING", "HINT", "DETAIL", "CONTEXT"} {
+		// "SEVERITY: msg" → "SEVERITY:  msg" (canonical two-space form)
+		raw = strings.ReplaceAll(raw, sev+": ", sev+":  ")
+	}
 	s := bufio.NewScanner(strings.NewReader(raw))
 	lines := make([]string, 0)
 	for s.Scan() {

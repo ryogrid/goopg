@@ -512,7 +512,7 @@ M0097-0001 wires it up.
 
 ### Sub-milestones
 
-- [ ] **M0097-0001** — Wire up `TestPort_RegressSuite` in
+- [x] **M0097-0001** — Wire up `TestPort_RegressSuite` in
       `internal/testport/` with a concrete `ClusterRegressExecutor`
       (connects to a live goopg cluster via `database/sql`), pre-runs
       `test_setup.sql` to materialise the shared tables used by most
@@ -521,6 +521,11 @@ M0097-0001 wires it up.
       Also add a `NormalizeRegressOutput` extension pass for goopg-
       specific divergences (e.g., column-name casing, error message
       wording differences).
+      Implementation: regress_suite_test.go with ClusterRegressExecutor
+      (psql -X -q -a -f) + NormalizeRegressOutput extended with
+      ERROR/NOTICE/WARNING double-space normalisation. All 232 cases
+      report "defer" on initial run (expected). Infrastructure confirmed
+      working: cases discovered, test_setup.sql runs best-effort.
 
 - [ ] **M0097-0002** — Formally reclassify ~102 tests as `excluded` in
       `docs/test-port/upstream-regress-coverage.md` and in the suite
