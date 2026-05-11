@@ -1087,6 +1087,11 @@ func compareEq(a, b Datum) (Datum, error) {
 // to_timestamp(text, fmt) to load TIMESTAMP columns.
 func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	name := strings.ToLower(x.Name)
+	// Strip pg_catalog. prefix for matching — these are schema-qualified
+	// versions of the same built-in functions.
+	if after, ok := strings.CutPrefix(name, "pg_catalog."); ok {
+		name = after
+	}
 	switch name {
 	case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
 		return NewTimeDatum(ctx.Now), nil
@@ -1103,6 +1108,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalSubstr(x, row, ctx)
 	case "date_part":
 		return evalDatePart(x, row, ctx)
+	case "set_config":
+		// set_config(setting_name, new_value, is_local) → text
+		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)
+		// to restrict the search path for security. Accept and return new_value.
+		if len(x.Args) >= 2 {
+			newVal, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, nil
+			}
+			return newVal, nil
+		}
+		return NullDatum, nil
+	case "current_database":
+		return NewStringDatum("postgres"), nil
+	case "current_schema", "current_schemas":
+		return NewStringDatum("public"), nil
 	}
 	return evalStoredRoutineFuncCall(x, row, ctx)
 }

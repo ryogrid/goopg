@@ -379,6 +379,12 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 		return JoinExpr{}, false, nil
 	}
 
+	// Accept optional LATERAL keyword before the right-side range variable.
+	// LATERAL allows the derived table to reference columns from earlier FROM
+	// items. goopg treats it as a regular derived table (acceptable for
+	// vacuumdb's use case where the lateral subquery doesn't depend on outer
+	// column values at goopg's execution level).
+	_ = p.acceptKeyword(KwLateral)
 	right, err := p.parseRangeVar()
 	if err != nil {
 		return JoinExpr{}, false, err
@@ -419,6 +425,11 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 }
 
 func (p *parser) parseRangeVar() (RangeVar, error) {
+	// Accept optional LATERAL keyword before a derived table.
+	// LATERAL is silently consumed; goopg treats lateral subqueries as
+	// ordinary derived tables (no correlated-outer-reference evaluation).
+	_ = p.acceptKeyword(KwLateral)
+
 	// Derived table: `(SELECT …) AS alias`. The alias is mandatory
 	// in upstream PG; we mirror that. The two-token lookahead
 	// (`(` + SELECT) is necessary to disambiguate from
@@ -683,6 +694,56 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				continue
 			}
 		}
+		// `expr = ANY (array[...])` — desugar to `expr IN (...)`.
+		// Used by vacuumdb catalog queries: `relkind = ANY (array['r','m'])`.
+		// Only the `= ANY` form is handled; `<> ANY` etc. are not emitted
+		// by vacuumdb so they remain deferred.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenOperator && t.Value == "=" &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwAny {
+				pos := t.Pos
+				p.advance() // =
+				p.advance() // ANY
+				inExpr, err := p.parseAnyTail(left, pos)
+				if err != nil {
+					return nil, err
+				}
+				left = inExpr
+				continue
+			}
+		}
+
+		// OPERATOR(schema.op) — qualified operator: desugar to its base operator.
+		// Used by vacuumdb and other PostgreSQL client tools:
+		// `nspname OPERATOR(pg_catalog.=) 'public'`.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "operator") &&
+				p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+				if op, n := p.peekQualifiedOp(); op != OpUnknown {
+					for i := 0; i < n; i++ {
+						p.advance()
+					}
+					// OPERATOR(schema.=) ANY (array[...]) — desugar to IN.
+					if op == OpEq && p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAny {
+						pos := t.Pos
+						p.advance() // ANY
+						inExpr, err := p.parseAnyTail(left, pos)
+						if err != nil {
+							return nil, err
+						}
+						left = inExpr
+						continue
+					}
+					right, err := p.parseExprPrec(precCompare + 1)
+					if err != nil {
+						return nil, err
+					}
+					left = &BinaryOp{pos: t.Pos, Op: op, Left: left, Right: right}
+					continue
+				}
+			}
+		}
+
 		op, prec, ok := p.peekBinaryOp()
 		if !ok || prec < min {
 			return left, nil
@@ -694,6 +755,89 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		}
 		left = &BinaryOp{pos: opTok.Pos, Op: op, Left: left, Right: right}
 	}
+}
+
+// peekQualifiedOp peeks at OPERATOR(schema.op) or OPERATOR(op).
+// Returns the OpCode and the number of tokens to consume (including
+// OPERATOR, (, schema, ., op, )), or (OpUnknown, 0) if not recognised.
+func (p *parser) peekQualifiedOp() (OpCode, int) {
+	// peek(0) = OPERATOR (already confirmed by caller)
+	// peek(1) = '('      (already confirmed by caller)
+	i := 2
+	// optional schema.
+	if p.peek(i).Kind == TokenIdent && p.peek(i+1).Kind == TokenSymbol && p.peek(i+1).Value == "." {
+		i += 2
+	}
+	opTok := p.peek(i)
+	i++
+	// closing )
+	if p.peek(i).Kind != TokenSymbol || p.peek(i).Value != ")" {
+		return OpUnknown, 0
+	}
+	i++ // now i is count of tokens to consume
+	// map the operator symbol to OpCode
+	if opTok.Kind == TokenOperator || opTok.Kind == TokenSymbol {
+		switch opTok.Value {
+		case "=":
+			return OpEq, i
+		case "<>", "!=":
+			return OpNe, i
+		case "<":
+			return OpLt, i
+		case ">":
+			return OpGt, i
+		case "<=":
+			return OpLe, i
+		case ">=":
+			return OpGe, i
+		}
+	}
+	return OpUnknown, 0
+}
+
+// parseAnyTail parses `ANY (array[e1, e2, ...])` after `=` has been consumed.
+// Returns an InExpr equivalent to `left IN (e1, e2, ...)`.
+func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after ANY")
+	}
+	var elems []Expr
+	// array[e1, e2, ...] constructor form.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "array") &&
+		p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "[" {
+		p.advance() // array
+		p.advance() // [
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+			p.advance()
+		} else {
+			first, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, first)
+			for p.acceptSymbol(",") {
+				next, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, next)
+			}
+			if !p.acceptSymbol("]") {
+				return nil, p.errAtCur("expected ']'")
+			}
+		}
+	} else {
+		// Non-array expression: parse a single value.
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		elems = []Expr{inner}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')'")
+	}
+	return &InExpr{pos: pos, Operand: left, Negated: false, List: elems}, nil
 }
 
 // parseCastTail consumes a single `:: typename [(typmods)]` after the

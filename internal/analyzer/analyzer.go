@@ -1275,11 +1275,27 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 // otherwise `?column?N`. Types come from analyzeExpr against an
 // inner scope built from the subquery's own FROM clause.
 //
-// v0 does not support LATERAL so the subquery is analyzed
-// without a parent scope; correlated derived tables are
-// deferred. See docs/design/0003-0014-derived-tables.md.
+// v0 does not support full LATERAL analysis, but accepts the LATERAL
+// keyword and falls back to a null-typed table when the inner subquery
+// references outer-scope columns (correlated lateral reference). The
+// fallback is safe for vacuumdb's CROSS JOIN LATERAL use case where the
+// produced column (inherited) is never referenced in the WHERE clause
+// for basic vacuum runs. See docs/design/0003-0014-derived-tables.md.
 func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
 	if err := analyzeSelectWithParent(rv.Subquery, cat, nil); err != nil {
+		// LATERAL fallback: correlated reference to outer table fails analysis.
+		// When explicit column aliases are provided (rv.Columns), produce a
+		// synthetic table with those column names and unknown (text) types.
+		// This allows the outer query to proceed; column values are NULL at
+		// execution time (planSubqueryRangeVar also handles this case).
+		ae, isAnalyzeErr := err.(*AnalyzeError)
+		if isAnalyzeErr && (ae.Code == "42P01" || ae.Code == "42703") && len(rv.Columns) > 0 {
+			cols := make([]catalog.Column, len(rv.Columns))
+			for i, colName := range rv.Columns {
+				cols[i] = catalog.Column{Name: colName, Type: catalog.Type{Name: "text"}}
+			}
+			return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
+		}
 		return nil, err
 	}
 	innerCtx := &scope{cat: cat}

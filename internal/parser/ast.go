@@ -75,22 +75,43 @@ type RollbackToSavepointStmt struct {
 func (s *RollbackToSavepointStmt) Pos() int  { return s.pos }
 func (s *RollbackToSavepointStmt) stmtNode() {}
 
-// VacuumStmt — `VACUUM [VERBOSE] [ANALYZE] [target [, …]]`.
+// VacuumStmt — `VACUUM [(opt [, opt …])] [target [, …]]`.
+// Both legacy syntax (VACUUM [VERBOSE] [ANALYZE] [FULL] [FREEZE] …)
+// and parenthesized syntax (VACUUM (option …) …) are accepted.
+// Most parenthesized-only options are stored but treated as no-ops
+// at execution time; they exist so vacuumdb SQL round-trips without
+// a parser error.
 type VacuumStmt struct {
 	pos     int
+	// Options settable via both legacy and parenthesized syntax.
 	Verbose bool
 	Analyze bool
-	Targets []ObjectName // empty -> all relations
+	Full    bool
+	Freeze  bool
+	// Options only in parenthesized syntax (treated as no-ops at execution).
+	DisablePageSkipping bool
+	NoIndexCleanup      bool
+	ForceIndexCleanup   bool
+	NoTruncate          bool
+	NoProcessMain       bool
+	NoProcessToast      bool
+	SkipDatabaseStats   bool
+	OnlyDatabaseStats   bool
+	SkipLocked          bool
+	ParallelWorkers     int    // -1 = not specified
+	BufferUsageLimit    string // "" = not specified
+	Targets             []ObjectName // empty -> all relations
 }
 
 func (s *VacuumStmt) Pos() int  { return s.pos }
 func (s *VacuumStmt) stmtNode() {}
 
-// AnalyzeStmt — `ANALYZE [VERBOSE] [target [, …]]`.
+// AnalyzeStmt — `ANALYZE [(opt [, opt …])] [target [, …]]`.
 type AnalyzeStmt struct {
-	pos     int
-	Verbose bool
-	Targets []ObjectName
+	pos        int
+	Verbose    bool
+	SkipLocked bool
+	Targets    []ObjectName
 }
 
 func (s *AnalyzeStmt) Pos() int  { return s.pos }

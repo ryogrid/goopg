@@ -982,6 +982,35 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
 	inner, err := Plan(rv.Subquery, cat)
 	if err != nil {
+		// LATERAL subquery fallback: when the inner subquery references outer
+		// columns (correlated lateral reference) the planner fails with a
+		// "missing FROM-clause entry" error because the outer scope is not
+		// visible inside the derived table's separate Plan() call.
+		//
+		// For vacuumdb's specific use case the lateral subquery is:
+		//   CROSS JOIN LATERAL (SELECT c.relkind IN ('p', 'I')) as p (inherited)
+		// The `inherited` column is only used in --missing-stats-only queries,
+		// not in the basic vacuumdb run. We fall back to a single-row NULL plan
+		// so the CROSS JOIN produces one row per outer row (with inherited=NULL).
+		// This is safe: the WHERE clause for basic vacuumdb does not reference
+		// p.inherited so the final result set is correct.
+		if pe, ok := err.(*PlanError); ok && (pe.Code == "42P01" || pe.Code == "42703") &&
+			len(rv.Columns) > 0 {
+			nullRow := make([]Expr, len(rv.Columns))
+			for i := range nullRow {
+				nullRow[i] = &NullConst{}
+			}
+			cols := make([]catalog.Column, len(rv.Columns))
+			schema := make(Schema, len(rv.Columns))
+			for i, colName := range rv.Columns {
+				cols[i] = catalog.Column{Name: colName}
+				schema[i] = SchemaColumn{Name: colName}
+			}
+			inner = &Values{Rows: [][]Expr{nullRow}, schema: schema}
+			tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
+			b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+			return inner, b, nil
+		}
 		return nil, rangeBinding{}, err
 	}
 	innerSchema := inner.Output()

@@ -459,6 +459,10 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "relname", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "relkind", Type: Type{Name: "text"}, Ordinal: 2},
 			{Name: "relnamespace", Type: Type{Name: "text"}, Ordinal: 3},
+			// Additional columns required by vacuumdb catalog query (M0095-0004).
+			{Name: "relpersistence", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "reltoastrelid", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "relpages", Type: Type{Name: "text"}, Ordinal: 6},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -483,12 +487,42 @@ func (c *InMemory) registerSystemTables() {
 				t.Name,
 				t.Name,
 				"r",
-				"pg_catalog",
+				"public",  // relnamespace: public schema OID (returned as name for JOIN)
+				"p",       // relpersistence: permanent
+				"0",       // reltoastrelid: no TOAST table
+				"0",       // relpages: estimated page count (0 = unknown)
 			})
 		}
 		return out
 	}
 	c.tables["pg_catalog.pg_class"] = pgClass
+
+	// pg_namespace — required by vacuumdb's table-discovery catalog query
+	// (M0095-0004). vacuumdb sends:
+	//   SELECT c.relname, ns.nspname
+	//   FROM pg_class c JOIN pg_namespace ns ON c.relnamespace = ns.oid ...
+	// Returns the standard system namespaces. The oid values match upstream
+	// PostgreSQL's well-known OIDs so client tools can join correctly.
+	pgNamespace := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_namespace",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "nspname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "nspowner", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "nspacl", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID:     2615, // upstream's NamespaceRelationId
+		Virtual: true,
+	}
+	pgNamespace.VirtualRows = func() [][]string {
+		return [][]string{
+			{"11", "pg_catalog", "10", ""},
+			{"2200", "public", "10", ""},
+			{"99", "information_schema", "10", ""},
+		}
+	}
+	c.tables["pg_catalog.pg_namespace"] = pgNamespace
 
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
@@ -565,6 +599,9 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "datname", Type: Type{Name: "text"}, Ordinal: 0},
 			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 2},
+			// Additional columns for vacuumdb --all (M0095-0004).
+			{Name: "datallowconn", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 4},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -576,7 +613,13 @@ func (c *InMemory) registerSystemTables() {
 		names := c.ListDatabases()
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
-			out = append(out, []string{n, "10", "6"})
+			out = append(out, []string{
+				n,
+				"10",   // datdba: OID of owner (10 = postgres superuser)
+				"6",    // encoding: 6 = UTF8
+				"true", // datallowconn: allow connections
+				"0",    // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+			})
 		}
 		return out
 	}

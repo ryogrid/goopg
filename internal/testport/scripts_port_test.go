@@ -403,10 +403,6 @@ func TestPort_Scripts091ReindexdbAll(t *testing.T) {
 // and additional pg_class columns for the table-discovery catalog query
 // vacuumdb issues when no --table is specified.
 func TestPort_Scripts100Vacuumdb(t *testing.T) {
-	t.Skip("vacuumdb sends VACUUM (SKIP_DATABASE_STATS, ...) parenthesized syntax " +
-		"not yet supported in goopg parser; extend parseVacuum() for parenthesized " +
-		"options and add pg_catalog.pg_namespace catalog view before enabling")
-
 	if _, err := exec.LookPath("vacuumdb"); err != nil {
 		t.Skip("vacuumdb not in PATH")
 	}
@@ -478,9 +474,6 @@ func TestPort_Scripts100Vacuumdb(t *testing.T) {
 // Skip: requires both VACUUM parenthesized syntax (see 100) and multi-database
 // support (pg_database iteration) for --all.
 func TestPort_Scripts101VacuumdbAll(t *testing.T) {
-	t.Skip("vacuumdb --all requires VACUUM parenthesized syntax + pg_database " +
-		"multi-database support; enable after 100 and after multi-database is implemented")
-
 	if _, err := exec.LookPath("vacuumdb"); err != nil {
 		t.Skip("vacuumdb not in PATH")
 	}
@@ -508,9 +501,6 @@ func TestPort_Scripts101VacuumdbAll(t *testing.T) {
 // Skip: same VACUUM parenthesized syntax blocker as 100. The --analyze-in-stages
 // path also depends on pg_catalog.pg_class query support. Enable after 100.
 func TestPort_Scripts102VacuumdbStages(t *testing.T) {
-	t.Skip("vacuumdb --analyze-in-stages requires VACUUM parenthesized syntax; " +
-		"enable after TestPort_Scripts100Vacuumdb is unblocked")
-
 	if _, err := exec.LookPath("vacuumdb"); err != nil {
 		t.Skip("vacuumdb not in PATH")
 	}

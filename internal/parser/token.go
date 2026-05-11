@@ -211,6 +211,12 @@ const (
 	// M0050-0004: savepoint keywords.
 	KwSavepoint Keyword = "savepoint"
 	KwRelease   Keyword = "release"
+
+	// M0095-0004: VACUUM parenthesized syntax + vacuumdb catalog support.
+	KwFreeze   Keyword = "freeze"
+	KwParallel Keyword = "parallel"
+	KwLateral  Keyword = "lateral"
+	KwAny      Keyword = "any"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -345,6 +351,10 @@ var keywords = map[string]Keyword{
 	"variadic":     KwVariadic,
 	"savepoint":    KwSavepoint,
 	"release":      KwRelease,
+	"freeze":       KwFreeze,
+	"parallel":     KwParallel,
+	"lateral":      KwLateral,
+	"any":          KwAny,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

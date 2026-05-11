@@ -521,18 +521,34 @@ func (p *parser) parseSavepointName() (string, error) {
 	return t.Value, nil
 }
 
-// parseVacuum: VACUUM [VERBOSE] [ANALYZE] [target [, target …]]
+// parseVacuum: VACUUM [(opt [, opt …])] [target [, target …]]
+// Accepts both legacy syntax (VACUUM [VERBOSE] [ANALYZE] [FULL] [FREEZE] …)
+// and PostgreSQL 9.0+ parenthesized syntax (VACUUM (SKIP_DATABASE_STATS, …) …).
 func (p *parser) parseVacuum() (Stmt, error) {
 	t := p.advance()
-	v := &VacuumStmt{pos: t.Pos}
-	for {
-		switch {
-		case p.acceptKeyword(KwVerbose):
-			v.Verbose = true
-		case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
-			v.Analyze = true
-		default:
-			goto targets
+	v := &VacuumStmt{pos: t.Pos, ParallelWorkers: -1}
+
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		// Parenthesized option list.
+		p.advance() // consume (
+		if err := p.parseVacuumOptionList(v); err != nil {
+			return nil, err
+		}
+	} else {
+		// Legacy syntax: VACUUM [VERBOSE] [ANALYZE] [FULL] [FREEZE]
+		for {
+			switch {
+			case p.acceptKeyword(KwVerbose):
+				v.Verbose = true
+			case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
+				v.Analyze = true
+			case p.acceptKeyword(KwFull):
+				v.Full = true
+			case p.acceptKeyword(KwFreeze):
+				v.Freeze = true
+			default:
+				goto targets
+			}
 		}
 	}
 targets:
@@ -547,11 +563,137 @@ targets:
 	return v, nil
 }
 
-// parseAnalyze: ANALYZE [VERBOSE] [target [, target …]]
+// parseVacuumOptionList parses the parenthesized option list for VACUUM.
+// Caller has already consumed the opening '('.
+func (p *parser) parseVacuumOptionList(v *VacuumStmt) error {
+	for {
+		switch {
+		case p.acceptKeyword(KwVerbose):
+			v.Verbose = true
+		case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
+			v.Analyze = true
+		case p.acceptKeyword(KwFull):
+			v.Full = true
+		case p.acceptKeyword(KwFreeze):
+			v.Freeze = true
+		case p.acceptIdentKeyword("disable_page_skipping"):
+			v.DisablePageSkipping = true
+		case p.acceptIdentKeyword("skip_database_stats"):
+			v.SkipDatabaseStats = true
+		case p.acceptIdentKeyword("only_database_stats"):
+			v.OnlyDatabaseStats = true
+		case p.acceptIdentKeyword("skip_locked"):
+			v.SkipLocked = true
+		case p.acceptIdentKeyword("index_cleanup"):
+			// INDEX_CLEANUP { TRUE | FALSE | AUTO }
+			if p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true") {
+				v.ForceIndexCleanup = true
+			} else if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoIndexCleanup = true
+			} else {
+				_ = p.acceptIdentKeyword("auto")
+			}
+		case p.acceptIdentKeyword("truncate"):
+			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoTruncate = true
+			} else {
+				_ = p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true")
+			}
+		case p.acceptIdentKeyword("process_main"):
+			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoProcessMain = true
+			} else {
+				_ = p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true")
+			}
+		case p.acceptIdentKeyword("process_toast"):
+			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoProcessToast = true
+			} else {
+				_ = p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true")
+			}
+		case p.acceptKeyword(KwParallel):
+			n, err := p.parseIntLit()
+			if err != nil {
+				return err
+			}
+			v.ParallelWorkers = int(n)
+		case p.acceptIdentKeyword("buffer_usage_limit"):
+			lit, err := p.parseStrLit()
+			if err != nil {
+				return err
+			}
+			v.BufferUsageLimit = lit
+		default:
+			return p.errAtCur("unrecognised VACUUM option")
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return p.errAtCur("expected ')'")
+	}
+	return nil
+}
+
+// parseIntLit consumes a TokenIntLit and returns its value.
+func (p *parser) parseIntLit() (int64, error) {
+	t := p.cur()
+	if t.Kind != TokenIntLit {
+		return 0, p.errAtCur("expected integer")
+	}
+	p.advance()
+	var n int64
+	for _, ch := range t.Value {
+		if ch < '0' || ch > '9' {
+			return 0, &SyntaxError{Pos: t.Pos, Message: "invalid integer: " + t.Value}
+		}
+		n = n*10 + int64(ch-'0')
+	}
+	return n, nil
+}
+
+// parseStrLit consumes a TokenStringLit and returns its (unquoted) value.
+func (p *parser) parseStrLit() (string, error) {
+	t := p.cur()
+	if t.Kind != TokenStringLit {
+		return "", p.errAtCur("expected string literal")
+	}
+	p.advance()
+	return t.Value, nil
+}
+
+// parseAnalyze: ANALYZE [(opt [, opt …])] [target [, target …]]
+// Accepts both legacy syntax (ANALYZE [VERBOSE] …)
+// and parenthesized syntax (ANALYZE (SKIP_LOCKED, …) …).
 func (p *parser) parseAnalyze() (Stmt, error) {
 	t := p.advance()
 	a := &AnalyzeStmt{pos: t.Pos}
-	if p.acceptKeyword(KwVerbose) {
+
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance() // consume (
+		for {
+			switch {
+			case p.acceptKeyword(KwVerbose):
+				a.Verbose = true
+			case p.acceptIdentKeyword("skip_locked"):
+				a.SkipLocked = true
+			case p.acceptIdentKeyword("buffer_usage_limit"):
+				_, err := p.parseStrLit()
+				if err != nil {
+					return nil, err
+				}
+			default:
+				return nil, p.errAtCur("unrecognised ANALYZE option")
+			}
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+	} else if p.acceptKeyword(KwVerbose) {
 		a.Verbose = true
 	}
 	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {

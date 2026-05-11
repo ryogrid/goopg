@@ -251,14 +251,13 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
            subscriber setup SKIP.
       CSV rows BB-010..040 added; markdown regenerated (2026-05-12).
 
-- [ ] **M0095-0004** — Implement VACUUM parenthesized option syntax
-      (`VACUUM (FULL, FREEZE, SKIP_DATABASE_STATS, ...) [table]`) in
-      `internal/parser/parser.go` + extend `VacuumStmt`.  Also add
-      `pg_catalog.pg_namespace` catalog view required by the table-discovery
-      query vacuumdb issues.
-      Unblocks: `TestPort_Scripts100Vacuumdb`, `101`, `102`.
-      CSV: D-005a → port, D-005b → port, D-005c → port (partial; `--all`
-      multi-DB stays deferred).
+- [x] **M0095-0004** — VACUUM/ANALYZE parenthesized syntax; OPERATOR(schema.op)
+      desugar; LATERAL derived-table analyzer+planner fallback; ANY(array[]) → IN
+      desugar; pg_namespace view; pg_class relpersistence/reltoastrelid/relpages
+      columns; pg_database datallowconn/datconnlimit; set_config() built-in.
+      Design doc: `docs/design/0095-0004-vacuum-parenthesized-syntax.md`.
+      All three vacuumdb tests pass (100/101/102).
+      CSV: D-005a/b/c → port,yes (2026-05-12).
 
 - [ ] **M0095-0005** — Add `REINDEX` parser+executor stub
       (`REINDEX [CONCURRENTLY] (INDEX|TABLE|DATABASE|SCHEMA) name`).
