@@ -180,6 +180,19 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// track_io_timing gates per-I/O activity wait-event hooks
+	// (BufferPin / DataFileRead / Write / Extend / Sync / AIO).
+	// Default `off` mirrors upstream PG. M0092-0005: when off,
+	// the hooks are not installed at all, saving the per-Pin /
+	// per-Read `runtime.Stack` LookupGoroutine call on the hot
+	// read path. See
+	// docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "track_io_timing", Type: TypeBool, BootVal: "off",
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// wal_sender_memory_buffer sizes (in bytes) the in-memory
 	// ring of recent WAL bytes used by walsender's
 	// RecordIterator. 0 disables the ring; >0 mirrors every

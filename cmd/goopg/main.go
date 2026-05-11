@@ -261,6 +261,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		aioMethod := stringGUC(registry, "io_method", "")
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
+		// M0092-0005: gate per-I/O activity hooks on track_io_timing.
+		// PG-default off; flip on via postgresql.conf when wait-event
+		// telemetry is needed.
+		trackIOTiming := boolGUC(registry, "track_io_timing", false)
 		var err error
 		rt, err = initdb.Open(initdb.OpenOptions{
 			DataDir:               *dataDir,
@@ -274,6 +278,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			AIOMethod:             aioMethod,
 			AIOWorkers:            aioWorkers,
 			AIOMaxConcurrency:     aioMax,
+			TrackIOTiming:         trackIOTiming,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
