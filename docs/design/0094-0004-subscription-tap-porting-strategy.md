@@ -1,6 +1,6 @@
 # 0094-0004 — Subscription TAP Test Porting Strategy (D-004 Subset)
 
-**Status:** draft
+**Status:** accepted (2026-05-11 — 3 tests landed in subscription_port_test.go; all pass)
 **Date:** 2026-05-11
 **Milestone:** M0094-0004
 

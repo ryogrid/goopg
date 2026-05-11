@@ -218,14 +218,13 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
       CSV rows R-001/R-013/R-019/R-038/R-039/R-047 already present; markdown regenerated.
       All 6 tests pass.
 
-- [ ] **M0094-0004** — Design doc `0094-0004-subscription-tap-porting-strategy.md`
-      status → `accepted`. Create `internal/testport/subscription_port_test.go`.
-      Port 3 subscription TAP tests:
-      - `TestPort_Subscription001RepChanges` (001_rep_changes.pl)
-      - `TestPort_Subscription004Sync` (004_sync.pl)
-      - `TestPort_Subscription026Stats` (026_stats.pl)
-      Add 3 rows to `docs/test-port/postgres-oracle-port-status.csv`.
-      Regenerate `.md`. All 3 tests pass.
+- [x] **M0094-0004** — Design doc `0094-0004-subscription-tap-porting-strategy.md`
+      status → `accepted` (2026-05-11). Created `internal/testport/subscription_port_test.go`.
+      Ported 3 subscription TAP tests (all adapted to v0 capabilities):
+      - `TestPort_Subscription001RepChanges` — INSERT+DELETE+UPDATE via pgoutput pipeline
+      - `TestPort_Subscription004Sync` — initial COPY batch + streaming handoff, no gaps/duplicates
+      - `TestPort_Subscription026Stats` — pg_stat_subscription received_lsn + receipt time via wal.Subscriber
+      CSV S-001/S-004/S-026 rows already present; markdown regenerated. All 3 tests pass.
 
 - [ ] **M0094-0005** — Verify M0005 and M0008 DoD checklists against current
       codebase. Update `docs/milestones/0005-streaming-replication-support.md`
