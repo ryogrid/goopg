@@ -280,6 +280,13 @@ func (o *lockRowsOp) drainAndStamp() error {
 // without MultiXact infrastructure — transaction-scoped
 // ReleaseAll on commit/abort cleans every holder up.
 func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer) error {
+	// M0093: SELECT FOR UPDATE/SHARE stamps lock-only xmax with the
+	// transaction's XID; materialise it BEFORE acquiring the tuple
+	// lock so the lock holder's identity is the real XID (mismatched
+	// holder identity breaks UPDATE's blocks-on-foreign-lock check).
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
 	// Acquire the tuple-level lock first so a concurrent UPDATE
 	// that races with us can't slip through between the xmax
 	// stamp and the lock registration.

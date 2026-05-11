@@ -597,6 +597,14 @@ func tryApplyHOTUpdate(
 	oldSlot uint16,
 	newRow Row,
 ) (bool, error) {
+	// M0093: materialise the transaction's XID BEFORE the
+	// isConcurrentlyUpdated race check (line 646). Calling it
+	// after would feed XID=0 into the check, letting a foreign
+	// xmax stamp slip through as a false negative (orphan visible
+	// tuples — the M0090 invariant we explicitly guard).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return false, err
+	}
 	body, err := EncodeRow(cols, newRow)
 	if err != nil {
 		return false, &ExecError{Code: "XX000", Message: err.Error()}
@@ -908,6 +916,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
+	// M0093: UPDATE is unconditionally a write — materialise the
+	// transaction's XID before the scan so foreignLockOnly /
+	// isConcurrentlyUpdated / tuple-lock acquisition see the real
+	// XID (zero would cause false-negative race detection and
+	// would mis-classify our own locks as foreign).
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return nil, err
+	}
 	tbl := o.plan.Table
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
@@ -1053,6 +1069,12 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
+	// M0093: DELETE is unconditionally a write — materialise the
+	// transaction's XID before the scan so foreign-lock checks see
+	// the real XID.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return nil, err
+	}
 	tbl := o.plan.Table
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
