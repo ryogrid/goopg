@@ -3067,17 +3067,47 @@ spec).
       lost; UPDATE leaves duplicate visible rows). Those are
       tracked under M0090.
 
-- [ ] **M0090** — pgbench scale-100 MVCC + INSERT bugs.
-      `pgbench_history` heap stays at 0 bytes through a
-      scale-100 standard run despite 12,000+ committed
-      transactions; `pgbench_branches` / `pgbench_tellers`
-      accumulate duplicate visible rows (UPDATE not properly
-      stamping xmax — likely the 18c60d9 / 2c1e18e race-skip
-      policy is too permissive for the UPDATE side). Symptom is
-      pgbench reporting an inflated auto-detected scale post-
-      standard, leading to `short read at block` on subsequent
-      simple-update runs against the same data dir.
+- [x] **M0090** — pgbench scale-100 MVCC + INSERT bugs.
+      Investigation showed the symptom was driven by two
+      distinct bugs; both are now fixed end-to-end:
+
+      - **M0090-0001** (commit `e6778f0`): TRUNCATE / DROP now
+        clear FSM + VM in-memory state. Pre-fix, stale FSM
+        entries pointed INSERTs at non-existent blocks,
+        surfacing as `short read at block`. Design doc:
+        `docs/design/0090-0001-truncate-drops-fsm-vm-entries.md`.
+      - **M0090-0002** (commit `be320c9`): the HOT-update path
+        silently overwrote xmax under concurrent UPDATE,
+        leaving orphan visible tuples (the cause of
+        pgbench_branches drifting to 1,610 visible rows from
+        100). Fixed by detecting the concurrent stamp under
+        the page exclusive Lock and returning SQLSTATE 40001
+        (serialization_failure) so the transaction aborts
+        instead of silently corrupting MVCC. The fix touches
+        all 4 xmax-stamping sites (HOT + 3 non-HOT). Design
+        doc:
+        `docs/design/0090-0002-update-concurrent-xmax-overwrite-fix.md`.
+      - **M0090-0003**: end-to-end pgbench verification at
+        scale 100 (-c 100 -j 100 -T 180) — standard 71.04 TPS
+        / 12 815 txns / 54 failures (0.42 % SQLSTATE 40001,
+        expected); simple-update 83.22 TPS / 15 046 txns /
+        0 failed (no `short read at block`); select-only
+        386.50 TPS / 69 647 txns / 0 failed. Post-run row
+        counts: branches=100 / tellers=1000 (exact, no MVCC
+        drift). Results:
+        `bench/pgbench-compare/results/20260511_goopg_pgbench_m0090_summary.md`.
+
       `docs/milestones/0090-pgbench-scale-100-mvcc-and-insert-bugs.md`.
+
+      **Deferred follow-up** (filed only if pgbench abort rate
+      under heavier contention becomes blocking): **EvalPlanQual**
+      — re-fetch + re-evaluate the latest tuple version when a
+      concurrent xmax stamp is detected, eliminating the 0.42 %
+      serialization-failure abort rate at -c 100. This is NOT
+      blocking M0090 acceptance — the correctness fix is shipped
+      and the abort rate is acceptable. Tracked as a candidate
+      follow-up milestone when the abort rate becomes a
+      bottleneck for a specific workload.
 
 ## Notes
 

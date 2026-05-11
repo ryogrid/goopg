@@ -1,6 +1,8 @@
 # Milestone 0090 — pgbench scale-100 MVCC + INSERT bugs
 
-**Status:** planned
+**Status:** accepted 2026-05-11. Both M0090-0001 + M0090-0002
+landed and verified end-to-end at scale 100. See close-out
+notes below.
 **Depends on:** M0079, M0080, M0088, M0089 (durability boundaries
 all closed first so the scale-100 symptom isolates to the issues
 below, not to a checkpoint/stop durability gap).
@@ -134,6 +136,81 @@ Likely candidates to investigate:
 
 Tasks will be detailed when this milestone is picked up. See the
 fix_plan.md note about the milestone-only convention.
+
+## Outcome (2026-05-11)
+
+### Investigation refinement
+
+The original M0090 doc described "Bug 1" as
+`pgbench_history INSERTs lost at scale 100" (0-byte heap file
+post-restart). Closer investigation showed this was a
+**misattribution**: pgbench's pre-run TRUNCATE step at the
+start of every workload wipes `pgbench_history` to 0 bytes —
+so the empty heap observed "after the standard run" was
+actually the state after the next workload's TRUNCATE step,
+not lost INSERTs.
+
+However, the underlying TRUNCATE / FSM-stale bug is still real
+and reproducible: TRUNCATE leaves the FSM holding entries that
+point to non-existent blocks, so the FIRST INSERT after TRUNCATE
+errors with `ERROR: short read at block`. Fixed under
+M0090-0001.
+
+The actual root cause of the visible pgbench symptom (1,610
+visible rows in `pgbench_branches`) is the concurrent HOT-update
+xmax-overwrite bug detailed in design 0090-0002. Fixed under
+M0090-0002.
+
+### Landed fixes
+
+- **M0090-0001** (commit `e6778f0`): `execTruncate` +
+  `execDropTable` now call `ctx.FSM.DropRelation(rel)` +
+  `ctx.VM.DropRelation(rel)` on the heap rel. Both helpers
+  existed but were never called from these paths. Test:
+  `internal/executor/operators_ddl_truncate_fsm_test.go`.
+
+- **M0090-0002** (commit `be320c9`): added
+  `isConcurrentlyUpdated(h, myXID)` helper +
+  `PageGetHeapTuple`-under-Lock check at the 4 xmax-stamping
+  sites (`tryApplyHOTUpdate`, `updateOp.updateViaIndex` non-
+  HOT branch, `updateOp.Next` seq-scan non-HOT branch,
+  `deleteOp.Next`). When concurrent xmax detected, returns
+  SQLSTATE 40001 (serialization_failure). Tests:
+  `internal/executor/concurrent_update_xmax_test.go`.
+
+### End-to-end pgbench verification at scale 100
+
+Full `init → standard → simple-update → select-only` sequence
+with fresh restart per workload (-c 100 -j 100 -T 180):
+
+| Workload | TPS | OK | Failed | Notes |
+|---|---:|---:|---:|---|
+| standard | 71.04 | 12 815 | 54 (0.42 %) | 54 are SQLSTATE 40001 from M0090-0002 — expected |
+| simple-update | 83.22 | 15 046 | 0 | NO `short read at block`; auto-detected scale=100 ✓ |
+| select-only | 386.50 | 69 647 | 0 | unchanged |
+
+Post-run row counts (re-opened against the patched binary):
+
+| Table | Expected | Observed |
+|---|---:|---:|
+| `pgbench_accounts` | 10 000 000 | 10 000 000 |
+| `pgbench_branches` | 100 | **100** ✅ |
+| `pgbench_tellers` | 1 000 | **1 000** ✅ |
+
+The branches / tellers counts EXACTLY match the init scale —
+no MVCC drift. The M0090-0002 fix landed correctly.
+
+Full results +  trade-off discussion:
+`bench/pgbench-compare/results/20260511_goopg_pgbench_m0090_summary.md`.
+
+### Deferred follow-up
+
+A future EvalPlanQual implementation (re-fetch + re-evaluate
+the latest tuple version under concurrent UPDATE) would reduce
+the 0.42 % serialization-failure abort rate to 0. This is NOT
+blocking M0090 — the abort rate is acceptable and the
+correctness fix is the load-bearing piece. Filed as a candidate
+follow-up if the abort rate becomes a workload bottleneck.
 
 ## Definition of Done (sketch)
 
