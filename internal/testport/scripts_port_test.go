@@ -149,9 +149,6 @@ func TestPort_Scripts011ClusterdbAll(t *testing.T) {
 // Skip: goopg parser does not support CREATE DATABASE. Add
 // CREATE DATABASE to the parser and a stub executor entry before enabling.
 func TestPort_Scripts020Createdb(t *testing.T) {
-	t.Skip("CREATE DATABASE not supported in goopg parser/executor; " +
-		"add parser+executor stub for CREATE DATABASE before enabling")
-
 	if _, err := exec.LookPath("createdb"); err != nil {
 		t.Skip("createdb not in PATH")
 	}
@@ -242,9 +239,6 @@ func TestPort_Scripts040Createuser(t *testing.T) {
 // Skip: goopg parser does not support DROP DATABASE. Also requires CREATE
 // DATABASE to pre-create the target. Add both to parser+executor before enabling.
 func TestPort_Scripts050Dropdb(t *testing.T) {
-	t.Skip("DROP DATABASE not supported in goopg parser/executor; " +
-		"add CREATE DATABASE + DROP DATABASE parser+executor stubs before enabling")
-
 	if _, err := exec.LookPath("dropdb"); err != nil {
 		t.Skip("dropdb not in PATH")
 	}

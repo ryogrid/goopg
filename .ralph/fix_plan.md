@@ -276,15 +276,13 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       TestPort_Scripts070Dropuser PASS.
       CSV: D-005f/g → port,yes (2026-05-12).
 
-- [ ] **M0095-0007** — Add `CREATE DATABASE` / `DROP DATABASE` stubs +
-      `pg_database` catalog table.  Single-database implementation: catalog
-      row stored in memory / persisted in `pg_database` heap file; actual
-      storage namespace is not forked (goopg remains logically single-DB but
-      accepts multi-DB DDL without error).
-      Unblocks: `TestPort_Scripts020Createdb`, `050`.
-      `TestPort_Scripts200Connstr` partial unblock (LATIN1 encoding sub-case
-      stays skipped).
-      CSV: D-005d → port, D-005e → port.
+- [x] **M0095-0007** — Unblock TestPort_Scripts020Createdb and TestPort_Scripts050Dropdb.
+      `tryHandleDatabaseDDL` (M0054-0001, already implemented) handles CREATE
+      DATABASE via catalog.CreateDatabase and DROP DATABASE via DropDatabase
+      (returns ErrDatabaseNotFound for nonexistent DBs). Both tests PASS
+      immediately after removing t.Skip.  D-005l (200_connstr) stays deferred:
+      goopg is UTF8-only; LATIN1 encoding blocker remains.
+      CSV: D-005d/e → port,yes (2026-05-12).
 
 - [ ] **M0095-0008** — Add `CLUSTER` parser+executor stub
       (`CLUSTER [VERBOSE] [table USING index]`; no-op reorder, returns

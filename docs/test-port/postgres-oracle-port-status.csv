@@ -36,8 +36,8 @@ BB-040,postgres/src/bin/pg_basebackup/t/040_pg_createsubscriber.pl,tap,port,yes,
 D-005a,postgres/src/bin/scripts/t/100_vacuumdb.pl,tap,port,yes,Ported as TestPort_Scripts100Vacuumdb in internal/testport/scripts_port_test.go; VACUUM paren syntax + pg_namespace + OPERATOR()/ANY()/LATERAL support (M0095-0004).,-
 D-005b,postgres/src/bin/scripts/t/102_vacuumdb_stages.pl,tap,port,yes,Ported as TestPort_Scripts102VacuumdbStages in internal/testport/scripts_port_test.go; --analyze-in-stages uses ANALYZE paren syntax (M0095-0004).,-
 D-005c,postgres/src/bin/scripts/t/101_vacuumdb_all.pl,tap,port,yes,Ported as TestPort_Scripts101VacuumdbAll in internal/testport/scripts_port_test.go; --all queries pg_database+pg_namespace with LATERAL/OPERATOR/ANY support (M0095-0004).,-
-D-005d,postgres/src/bin/scripts/t/020_createdb.pl,tap,defer,no,Requires CREATE DATABASE parser+executor stub; goopg currently single-database only.,M0060-0003
-D-005e,postgres/src/bin/scripts/t/050_dropdb.pl,tap,defer,no,Requires DROP DATABASE parser+executor stub; depends on CREATE DATABASE (D-005d).,M0060-0003
+D-005d,postgres/src/bin/scripts/t/020_createdb.pl,tap,port,yes,Ported as TestPort_Scripts020Createdb in internal/testport/scripts_port_test.go; CREATE DATABASE via tryHandleDatabaseDDL + catalog.CreateDatabase (M0095-0007).,-
+D-005e,postgres/src/bin/scripts/t/050_dropdb.pl,tap,port,yes,Ported as TestPort_Scripts050Dropdb in internal/testport/scripts_port_test.go; DROP DATABASE checks ErrDatabaseNotFound (M0095-0007).,-
 D-005f,postgres/src/bin/scripts/t/040_createuser.pl,tap,port,yes,Ported as TestPort_Scripts040Createuser in internal/testport/scripts_port_test.go; CREATE ROLE via compat+role-tracking handler (M0095-0006).,-
 D-005g,postgres/src/bin/scripts/t/070_dropuser.pl,tap,port,yes,Ported as TestPort_Scripts070Dropuser in internal/testport/scripts_port_test.go; DROP ROLE checks in-memory role set (M0095-0006).,-
 D-005h,postgres/src/bin/scripts/t/090_reindexdb.pl,tap,port,yes,Ported as TestPort_Scripts090Reindexdb in internal/testport/scripts_port_test.go; REINDEX parser+executor no-op stub (M0095-0005).,-
