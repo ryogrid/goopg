@@ -206,18 +206,17 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
       `TestReorderFoldDeleteInsertToUpdate`, `TestReorderFoldDoesNotFoldDifferentRels`,
       `TestPgoutputUpdateMessageEncoding`, `TestPgoutputDeleteWithOldTupleEmitsO`.
 
-- [ ] **M0094-0003** — Design doc `0094-0003-recovery-tap-porting-strategy.md`
-      status → `accepted`. Create `internal/testport/recovery_port_test.go`.
-      Port 6 recovery TAP tests:
-      - `TestPort_Recovery001StreamRep` (001_stream_rep.pl)
-      - `TestPort_Recovery013CrashRestart` (013_crash_restart.pl)
-      - `TestPort_Recovery019ReplslotLimit` (019_replslot_limit.pl)
-      - `TestPort_Recovery038SaveLogicalSlots` (038_save_logical_slots_shutdown.pl)
-      - `TestPort_Recovery039EndOfWal` (039_end_of_wal.pl)
-      - `TestPort_Recovery047CheckpointPhysicalSlot` (047_checkpoint_physical_slot.pl)
-      Add 6 rows to `docs/test-port/postgres-oracle-port-status.csv`
-      (`status=port, pass_required=yes`). Regenerate `.md` via
-      `go run ./cmd/gen-oracle-port-status`. All 6 tests pass.
+- [x] **M0094-0003** — Design doc `0094-0003-recovery-tap-porting-strategy.md`
+      status → `accepted` (2026-05-11). Created `internal/testport/recovery_port_test.go`.
+      Ported 6 recovery TAP tests (all adapted to v0 capabilities):
+      - `TestPort_Recovery001StreamRep` — walreceiver streaming + walsender presence
+      - `TestPort_Recovery013CrashRestart` — SIGKILL + WAL recovery of committed rows
+      - `TestPort_Recovery019ReplslotLimit` — physical slot creation + pg_replication_slots view
+      - `TestPort_Recovery038SaveLogicalSlots` — logical slot persistence across restart
+      - `TestPort_Recovery039EndOfWal` — WAL segment file creation and checkpoint
+      - `TestPort_Recovery047CheckpointPhysicalSlot` — physical slot in pg_replication_slots after checkpoint
+      CSV rows R-001/R-013/R-019/R-038/R-039/R-047 already present; markdown regenerated.
+      All 6 tests pass.
 
 - [ ] **M0094-0004** — Design doc `0094-0004-subscription-tap-porting-strategy.md`
       status → `accepted`. Create `internal/testport/subscription_port_test.go`.

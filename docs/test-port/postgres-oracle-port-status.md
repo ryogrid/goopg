@@ -11,11 +11,11 @@ Status meanings:
 
 | suite_type | port | defer | excluded |
 | ---------- | ----:| -----:| --------:|
-| isolation | 0 | 1 | 0 |
+| isolation | 1 | 0 | 0 |
 | mixed | 0 | 2 | 0 |
 | modules | 0 | 0 | 1 |
 | regress | 0 | 1 | 0 |
-| tap | 11 | 14 | 1 |
+| tap | 20 | 14 | 1 |
 
 ## Entries
 
@@ -32,9 +32,18 @@ Status meanings:
 | P-009 | `postgres/src/bin/psql/t/010_tab_completion.pl` | tap | port | yes | Adapted and ported as TestPort_Psql010TabCompletionAdapted | `-` |
 | P-010 | `postgres/src/bin/psql/t/020_cancel.pl` | tap | port | yes | Adapted and ported as TestPort_Psql020CancelAdapted | `-` |
 | D-001 | `postgres/src/test/regress` | regress | defer | no | Requires dedicated pg_regress-compatible runner and normalization policy while upstream SQL files remain migration targets. | `M0060-0002` |
-| D-002 | `postgres/src/test/isolation` | isolation | defer | no | Requires deterministic multi-session scheduler and expected-schedule comparator integration. | `M0060-0004` |
-| D-003 | `postgres/src/test/recovery` | tap | defer | no | Recovery TAP scenarios require replication/failover capability growth before pass-required promotion. | `M0060-0005` |
-| D-004 | `postgres/src/test/subscription` | tap | defer | no | Subscription TAP scenarios require logical replication capability growth before pass-required promotion. | `M0060-0005` |
+| D-002 | `postgres/src/test/isolation` | isolation | port | no | IsolationRunner implemented in internal/testport/framework/isolation_runner.go; all 121 specs run via TestPort_IsolationSuite; most defer due to missing SQL features — expected-output comparison drives promotion to pass as features land. | `M0060-0004` |
+| D-003 | `postgres/src/test/recovery` | tap | defer | no | Recovery TAP scenarios; subset ported in M0094 (6 tests); remaining 41 tests deferred pending archiving/PITR/timeline/2PC capability. | `M0094` |
+| D-004 | `postgres/src/test/subscription` | tap | defer | no | Subscription TAP scenarios; subset ported in M0094 (3 tests); remaining 33 tests deferred pending binary-format/streaming/2PC/row-filter capability. | `M0094` |
+| R-001 | `postgres/src/test/recovery/t/001_stream_rep.pl` | tap | port | yes | Ported as TestPort_Recovery001StreamRep in internal/testport/recovery_port_test.go | `-` |
+| R-013 | `postgres/src/test/recovery/t/013_crash_restart.pl` | tap | port | yes | Ported as TestPort_Recovery013CrashRestart in internal/testport/recovery_port_test.go | `-` |
+| R-019 | `postgres/src/test/recovery/t/019_replslot_limit.pl` | tap | port | yes | Ported as TestPort_Recovery019ReplslotLimit in internal/testport/recovery_port_test.go | `-` |
+| R-038 | `postgres/src/test/recovery/t/038_save_logical_slots_shutdown.pl` | tap | port | yes | Ported as TestPort_Recovery038SaveLogicalSlots in internal/testport/recovery_port_test.go | `-` |
+| R-039 | `postgres/src/test/recovery/t/039_end_of_wal.pl` | tap | port | yes | Ported as TestPort_Recovery039EndOfWal in internal/testport/recovery_port_test.go | `-` |
+| R-047 | `postgres/src/test/recovery/t/047_checkpoint_physical_slot.pl` | tap | port | yes | Ported as TestPort_Recovery047CheckpointPhysicalSlot in internal/testport/recovery_port_test.go | `-` |
+| S-001 | `postgres/src/test/subscription/t/001_rep_changes.pl` | tap | port | yes | Ported as TestPort_Subscription001RepChanges in internal/testport/subscription_port_test.go | `-` |
+| S-004 | `postgres/src/test/subscription/t/004_sync.pl` | tap | port | yes | Ported as TestPort_Subscription004Sync in internal/testport/subscription_port_test.go | `-` |
+| S-026 | `postgres/src/test/subscription/t/026_stats.pl` | tap | port | yes | Ported as TestPort_Subscription026Stats in internal/testport/subscription_port_test.go | `-` |
 | P-011 | `postgres/src/bin/scripts/t/080_pg_isready.pl` | tap | port | yes | Ported as TestPort_Scripts080PgIsready in internal/testport/scripts_port_test.go | `-` |
 | D-005a | `postgres/src/bin/scripts/t/100_vacuumdb.pl` | tap | defer | no | Requires VACUUM parenthesized option syntax (VACUUM (FULL/FREEZE/SKIP_DATABASE_STATS/...)) in goopg parser+executor and pg_catalog.pg_namespace catalog view. | `M0060-0003` |
 | D-005b | `postgres/src/bin/scripts/t/102_vacuumdb_stages.pl` | tap | defer | no | Requires same VACUUM parenthesized syntax as D-005a; blocked by same parser gap. | `M0060-0003` |
