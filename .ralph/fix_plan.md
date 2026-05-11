@@ -220,12 +220,15 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
 
 ### Sub-milestones
 
-- [ ] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
+- [x] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
       `pg_walsummary/001` as Go tests in
       `internal/testport/client_tools_port_test.go`.
-      `t.Skip` if binary not in PATH.  `pg_controldata/001` includes cluster
-      init + `pg_controldata <datadir>` output check (adapted from upstream
-      CRC-corruption sub-case).  New CSV rows: C-001, C-002, CD-001, WS-001.
+      Binary discovery: PATH first, then `postgres/local_install/bin`.
+      `pg_controldata/001` adapted: CLI + data-dir error-path pass; checkpoint
+      output check deferred (goopg v0 has no global/pg_control).
+      `pg_checksums/002` adapted: option-validation sub-cases pass; enable/disable
+      deferred (no pg_control).  CSV rows C-001/C-002/CD-001/WS-001 added;
+      markdown regenerated. All 4 tests pass (2026-05-12).
 
 - [ ] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
       as adapted Go test.  WAL summarization (`summarize_wal = on` /
