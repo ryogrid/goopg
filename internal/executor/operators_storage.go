@@ -534,6 +534,43 @@ func markHeapHotUpdateDirty(
 	})
 }
 
+// isConcurrentlyUpdated reports whether the tuple has been updated or
+// deleted by a transaction OTHER than myXID. Used under the page's
+// exclusive Lock by the UPDATE / DELETE / HOT-update paths to detect
+// the concurrent-xmax-stamp race that produces orphan visible tuples
+// in MVCC (M0090-0002).
+//
+// The check is conservative: a lock-only xmax (someone took SELECT
+// FOR UPDATE but did not modify) is NOT treated as a concurrent
+// update — readers see the tuple as live, and a real UPDATE can
+// proceed by re-stamping. Our own xmax from an earlier write in the
+// same transaction is also fine.
+func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID) bool {
+	// "Our own xmax stamp" — re-update in the same transaction is
+	// always legal, regardless of HeapHotUpdated or other bits set
+	// by our prior write.
+	if h.Xmax != storage.InvalidTransactionID && h.Xmax == myXID {
+		return false
+	}
+	// Beyond this point, any xmax/HOT marker is from a DIFFERENT
+	// transaction.
+	if h.Infomask&storage.HeapHotUpdated != 0 {
+		return true
+	}
+	if h.Xmax == storage.InvalidTransactionID {
+		return false
+	}
+	if h.Infomask&storage.HeapXmaxInvalid != 0 {
+		// Xmax is hinted as not-a-deleter; matches the
+		// HeapXmaxInvalid semantics defined in heap.go:64.
+		return false
+	}
+	if storage.IsHeapTupleLockOnly(h.Infomask) {
+		return false
+	}
+	return true
+}
+
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
 // (blk, oldSlot). It:
 //  1. Encodes newRow with HeapOnlyTuple set in the tuple infomask.
@@ -582,6 +619,29 @@ func tryApplyHOTUpdate(
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		return false, nil
+	}
+
+	// M0090-0002: under the exclusive Lock the page is frozen.
+	// Re-read the old tuple and detect whether ANOTHER transaction
+	// has already stamped xmax / set HeapHotUpdated. Without this
+	// check, two concurrent HOT-updates of the same row both call
+	// PageStampHotOldTuple — the second one OVERWRITES the first's
+	// xmax + CTID, orphaning the first's new tuple in a state
+	// where it remains visible under MVCC. The accumulated orphans
+	// are the cause of the pgbench scale-100 1,610-visible-rows
+	// symptom in pgbench_branches.
+	//
+	// goopg has no EvalPlanQual to re-fetch + re-evaluate, so the
+	// correct response is a serialization_failure (SQLSTATE 40001).
+	// The client retries; one transaction wins, the other aborts.
+	if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), oldSlot); gerr == nil &&
+		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID) {
+		s.Unlock()
+		ctx.Pool.Unpin(s)
+		return false, &ExecError{
+			Code:    "40001",
+			Message: "could not serialize access due to concurrent update",
+		}
 	}
 
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
@@ -795,6 +855,18 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return nil, err
 			}
 			s.Lock()
+			// M0090-0002: detect concurrent xmax-stamp under the
+			// exclusive Lock before our own stamp.
+			if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), pu.slot); gerr == nil &&
+				isConcurrentlyUpdated(oldTuple.Header, o.ctx.Tx.XID) {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				return nil, &ExecError{
+					Code:    "40001",
+					Pos:     o.plan.Pos(),
+					Message: "could not serialize access due to concurrent update",
+				}
+			}
 			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
@@ -886,6 +958,18 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 			s.Lock()
+			// M0090-0002: detect concurrent xmax-stamp under the
+			// exclusive Lock before our own stamp.
+			if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), pu.slot); gerr == nil &&
+				isConcurrentlyUpdated(oldTuple.Header, o.ctx.Tx.XID) {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				return nil, &ExecError{
+					Code:    "40001",
+					Pos:     o.plan.Pos(),
+					Message: "could not serialize access due to concurrent update",
+				}
+			}
 			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
@@ -982,6 +1066,19 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 		s.Lock()
+		// M0090-0002: detect concurrent xmax-stamp under the
+		// exclusive Lock before our own stamp. For DELETE, the same
+		// concurrent-update race produces inconsistent xmax state.
+		if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), v.slot); gerr == nil &&
+			isConcurrentlyUpdated(oldTuple.Header, o.ctx.Tx.XID) {
+			s.Unlock()
+			o.ctx.Pool.Unpin(s)
+			return nil, &ExecError{
+				Code:    "40001",
+				Pos:     o.plan.Pos(),
+				Message: "could not serialize access due to concurrent update",
+			}
+		}
 		if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
