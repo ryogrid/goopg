@@ -99,6 +99,24 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			}
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
+		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
+		// actual role tracking so DROP ROLE fails on nonexistent roles.
+		if handled, herr := s.tryHandleRoleDDL(sql); handled {
+			if herr != nil {
+				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+			}
+			norm := normalizeCompatSQL(sql)
+			var tag string
+			if strings.HasPrefix(norm, "create ") {
+				tag = "CREATE ROLE"
+			} else {
+				tag = "DROP ROLE"
+			}
+			if err := w.WriteCommandComplete(tag); err != nil {
+				return err
+			}
+			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		}
 		if tag, ok := compatNoopCommandTag(sql); ok {
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err

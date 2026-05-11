@@ -195,9 +195,6 @@ func TestPort_Scripts020Createdb(t *testing.T) {
 // the parser and a stub executor entry before enabling. Auth integration
 // (WritePGAuth) may be used for actual user creation.
 func TestPort_Scripts040Createuser(t *testing.T) {
-	t.Skip("CREATE ROLE/USER not supported in goopg parser/executor; " +
-		"add parser+executor stub for CREATE ROLE before enabling")
-
 	if _, err := exec.LookPath("createuser"); err != nil {
 		t.Skip("createuser not in PATH")
 	}
@@ -287,9 +284,6 @@ func TestPort_Scripts050Dropdb(t *testing.T) {
 // Skip: goopg parser does not support DROP ROLE/USER. Also requires CREATE ROLE
 // to pre-create the target. Add both to parser+executor before enabling.
 func TestPort_Scripts070Dropuser(t *testing.T) {
-	t.Skip("DROP ROLE/USER not supported in goopg parser/executor; " +
-		"add CREATE ROLE + DROP ROLE parser+executor stubs before enabling")
-
 	if _, err := exec.LookPath("dropuser"); err != nil {
 		t.Skip("dropuser not in PATH")
 	}

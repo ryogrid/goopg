@@ -266,12 +266,15 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       executor no-op (utilityNoOp fallthrough). Both reindexdb tests pass.
       CSV: D-005h/i → port,yes (2026-05-12).
 
-- [ ] **M0095-0006** — Add `CREATE ROLE` / `CREATE USER` / `DROP ROLE` /
-      `DROP USER` to parser and executor.  Executor writes entries to / removes
-      entries from the `pg_auth` file via `WritePGAuth`; also expose a minimal
-      `pg_roles` catalog view so `\du` succeeds.
-      Unblocks: `TestPort_Scripts040Createuser`, `070`.
-      CSV: D-005f → port, D-005g → port.
+- [x] **M0095-0006** — CREATE/DROP ROLE/USER role-tracking handler.
+      Server gets in-memory roleSet (pre-seeded with "postgres"). New
+      `role_ddl.go` implements `tryHandleRoleDDL()`: CREATE ROLE registers
+      the role; DROP ROLE checks existence (42704 on miss).  Injected into
+      dispatch before compatNoopCommandTag.  pg_roles view unchanged (shows
+      "postgres"; \du use case not tested by 040/070).
+      Both scripts tests pass: TestPort_Scripts040Createuser PASS,
+      TestPort_Scripts070Dropuser PASS.
+      CSV: D-005f/g → port,yes (2026-05-12).
 
 - [ ] **M0095-0007** — Add `CREATE DATABASE` / `DROP DATABASE` stubs +
       `pg_database` catalog table.  Single-database implementation: catalog

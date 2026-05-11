@@ -15,7 +15,7 @@ Status meanings:
 | mixed | 0 | 2 | 0 |
 | modules | 0 | 0 | 1 |
 | regress | 0 | 1 | 0 |
-| tap | 35 | 9 | 1 |
+| tap | 37 | 7 | 1 |
 
 ## Entries
 
@@ -60,8 +60,8 @@ Status meanings:
 | D-005c | `postgres/src/bin/scripts/t/101_vacuumdb_all.pl` | tap | port | yes | Ported as TestPort_Scripts101VacuumdbAll in internal/testport/scripts_port_test.go; --all queries pg_database+pg_namespace with LATERAL/OPERATOR/ANY support (M0095-0004). | `-` |
 | D-005d | `postgres/src/bin/scripts/t/020_createdb.pl` | tap | defer | no | Requires CREATE DATABASE parser+executor stub; goopg currently single-database only. | `M0060-0003` |
 | D-005e | `postgres/src/bin/scripts/t/050_dropdb.pl` | tap | defer | no | Requires DROP DATABASE parser+executor stub; depends on CREATE DATABASE (D-005d). | `M0060-0003` |
-| D-005f | `postgres/src/bin/scripts/t/040_createuser.pl` | tap | defer | no | Requires CREATE ROLE/USER parser+executor stub. | `M0060-0003` |
-| D-005g | `postgres/src/bin/scripts/t/070_dropuser.pl` | tap | defer | no | Requires DROP ROLE/USER parser+executor stub; depends on CREATE ROLE (D-005f). | `M0060-0003` |
+| D-005f | `postgres/src/bin/scripts/t/040_createuser.pl` | tap | port | yes | Ported as TestPort_Scripts040Createuser in internal/testport/scripts_port_test.go; CREATE ROLE via compat+role-tracking handler (M0095-0006). | `-` |
+| D-005g | `postgres/src/bin/scripts/t/070_dropuser.pl` | tap | port | yes | Ported as TestPort_Scripts070Dropuser in internal/testport/scripts_port_test.go; DROP ROLE checks in-memory role set (M0095-0006). | `-` |
 | D-005h | `postgres/src/bin/scripts/t/090_reindexdb.pl` | tap | port | yes | Ported as TestPort_Scripts090Reindexdb in internal/testport/scripts_port_test.go; REINDEX parser+executor no-op stub (M0095-0005). | `-` |
 | D-005i | `postgres/src/bin/scripts/t/091_reindexdb_all.pl` | tap | port | yes | Ported as TestPort_Scripts091ReindexdbAll in internal/testport/scripts_port_test.go; uses pg_database query from M0095-0004 (M0095-0005). | `-` |
 | D-005j | `postgres/src/bin/scripts/t/010_clusterdb.pl` | tap | defer | no | Requires CLUSTER parser+executor stub. | `M0060-0003` |
