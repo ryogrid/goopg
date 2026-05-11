@@ -608,9 +608,9 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 
 func lockStrengthFromParser(s parser.LockStrength) LockStrength {
 	switch s {
-	case parser.LockStrengthForUpdate:
+	case parser.LockStrengthForUpdate, parser.LockStrengthForNoKeyUpdate:
 		return LockStrengthForUpdate
-	case parser.LockStrengthForShare:
+	case parser.LockStrengthForShare, parser.LockStrengthForKeyShare:
 		return LockStrengthForShare
 	}
 	return LockStrengthForUpdate
@@ -1541,6 +1541,8 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 			return walkExprForWindows(x.Else, fn)
 		}
 		return nil
+	case *parser.IsNullExpr:
+		return walkExprForWindows(x.Operand, fn)
 	case *parser.InExpr:
 		if err := walkExprForWindows(x.Operand, fn); err != nil {
 			return err
@@ -1681,6 +1683,12 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return planInExpr(x, agg.input)
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, agg.input)
+	case *parser.IsNullExpr:
+		operand, err := resolveExpr(x.Operand, agg.input)
+		if err != nil {
+			return nil, err
+		}
+		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
 		if err != nil {
@@ -1873,6 +1881,12 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return planInExpr(x, win.input)
 		}
 		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, List: list}, nil
+	case *parser.IsNullExpr:
+		operand, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
 	}
 	return resolveExprForWindowInput(e, win.input, win.agg)
 }
@@ -1951,6 +1965,8 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 		}
 		return walkExpr(x.Right, fn)
 	case *parser.UnaryOp:
+		return walkExpr(x.Operand, fn)
+	case *parser.IsNullExpr:
 		return walkExpr(x.Operand, fn)
 	case *parser.FuncCall:
 		if err := fn(x); err != nil {
@@ -2226,7 +2242,7 @@ func isConstantExpr(e Expr) bool {
 	switch x := e.(type) {
 	case *ColumnRef, *OuterColumnRef:
 		return false
-	case *SubqueryExpr, *ExistsExpr, *InExpr:
+	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr:
 		return false
 	case *BinaryOp:
 		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
@@ -3166,6 +3182,12 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// declared target type is preserved on the parser AST for
 		// future loops that wire up real type coercion.
 		return resolveExpr(x.Operand, ctx)
+	case *parser.IsNullExpr:
+		operand, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
 	}
 	return nil, &PlanError{Pos: e.Pos(), Code: "0A000", Message: fmt.Sprintf("unsupported expression %T", e)}
 }

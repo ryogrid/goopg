@@ -140,6 +140,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalBinary(x.Op, left, right, x.Pos())
 	case *planner.FuncCall:
 		return evalFuncCall(x, slotToRow(slot), ctx)
+	case *planner.IsNullExpr:
+		// IS [NOT] NULL never propagates NULL — it always returns a boolean.
+		operand, err := evalExprSlot(x.Operand, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		isNull := operand.IsNull()
+		if x.Negated {
+			return NewBoolDatum(!isNull), nil // IS NOT NULL
+		}
+		return NewBoolDatum(isNull), nil // IS NULL
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
 }
@@ -1173,7 +1184,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 //	(bigint)        → key = bigint
 //	(int4, int4)    → key = (classid, objid)
 func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, _ bool) (Datum, error) {
-	sess := advisorySessionID(ctx.Session)
+	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
 	switch len(x.Args) {
@@ -1225,7 +1236,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 // pg_advisory_unlock(int4, int4). Returns true if the lock was held by
 // this session and has been released, false otherwise.
 func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
-	sess := advisorySessionID(ctx.Session)
+	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
 	switch len(x.Args) {
@@ -1259,10 +1270,10 @@ func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, erro
 // evalAdvisoryUnlockAll implements pg_advisory_unlock_all(). Releases every
 // advisory lock held by this session and returns NULL (void-like).
 func evalAdvisoryUnlockAll(ctx *Context) (Datum, error) {
-	if ctx == nil || ctx.Session == nil {
+	if ctx == nil {
 		return NullDatum, nil
 	}
-	globalAdvisoryMgr.releaseAll(advisorySessionID(ctx.Session))
+	globalAdvisoryMgr.releaseAll(advisorySessionIDFromContext(ctx))
 	return NullDatum, nil
 }
 

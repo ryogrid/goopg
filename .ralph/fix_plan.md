@@ -357,12 +357,17 @@ alongside the suite.
       Verification: lock-committed-update no longer errors on advisory lock;
       defers on FOR KEY SHARE (M0096-0004) and column naming (2026-05-12).
 
-- [ ] **M0096-0004** — Extend SELECT locking parser for `FOR KEY SHARE`
-      and `FOR NO KEY UPDATE`; map both to existing `FOR SHARE` /
-      `FOR UPDATE` semantics in the executor (separate key-level lock
-      modes are out of scope for v0 — syntax parity is the goal).
-      Unblocks: `lock-committed-keyupdate`, `partition-key-update-1–4`
-      (locking path).
+- [x] **M0096-0004** — FOR KEY SHARE / FOR NO KEY UPDATE + IS [NOT] NULL.
+      Parser: LockStrengthForKeyShare/ForNoKeyUpdate constants; parseLockingClause()
+      now handles FOR KEY SHARE and FOR NO KEY UPDATE via lookahead.
+      Planner: lockStrengthFromParser maps ForKeyShare→ForShare, ForNoKeyUpdate→ForUpdate.
+      Also added IS [NOT] NULL: IsNullExpr AST + parser; planner IsNullExpr plan node
+      (resolveExpr, agg, window, constant, walker); executor evalExprSlot case;
+      analyzer exprHasWindowFunc + analyzeExpr cases. Advisory lock session ID fix:
+      advisorySessionIDFromContext uses ctx.BackendID (per-connection) instead of
+      nil Session pointer — cross-session blocking now works with IsolationRunner.
+      Verification: TestPort_IsolationLockCommittedUpdate runs 120s (blocking works,
+      spec defers due to output format + connection timeout across permutations). (2026-05-12).
 
 - [ ] **M0096-0005** — Verify ON CONFLICT executor end-to-end and make
       `insert-conflict-do-update` (×4) and `insert-conflict-do-nothing`

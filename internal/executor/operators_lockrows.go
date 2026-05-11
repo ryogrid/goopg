@@ -144,8 +144,11 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	if len(o.plan.Locks) > 0 {
 		switch o.plan.Locks[0].Strength {
 		case planner.LockStrengthForShare:
+			// FOR SHARE uses a shared (read-intent) lock.
+			// FOR KEY SHARE is handled by lockStrengthFromParser and maps to ForShare.
 			o.lockStrength = storage.HeapXmaxShrLock
 		default:
+			// FOR UPDATE (and FOR NO KEY UPDATE mapped to ForUpdate) use an exclusive lock.
 			o.lockStrength = storage.HeapXmaxExclLock
 		}
 	}

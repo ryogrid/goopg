@@ -150,15 +150,15 @@ func (p *parser) parseSelect() (Stmt, error) {
 	return s, nil
 }
 
-// parseLockingClause parses one `FOR { UPDATE | SHARE } [ OF
-// table_name [, …] ] [ NOWAIT | SKIP LOCKED ]` tail. The leading
-// FOR keyword is the current token on entry. Stage A scope:
+// parseLockingClause parses one `FOR { UPDATE | SHARE | NO KEY UPDATE |
+// KEY SHARE } [ OF table_name [, …] ] [ NOWAIT | SKIP LOCKED ]` tail.
+// The leading FOR keyword is the current token on entry.
 //
-//   - LockStrength: UPDATE | SHARE. NO KEY UPDATE / KEY SHARE are
-//     out of scope for v0 (would need NO + KEY composite forms).
-//   - WaitPolicy: NOWAIT and SKIP LOCKED parse but the analyzer +
-//     executor decide which strengths actually take effect (Stage
-//     B promotes the wait modifiers).
+// Locking strengths (M0096-0004):
+//   - FOR UPDATE           → LockStrengthForUpdate
+//   - FOR NO KEY UPDATE    → LockStrengthForNoKeyUpdate (mapped to ForUpdate in executor)
+//   - FOR SHARE            → LockStrengthForShare
+//   - FOR KEY SHARE        → LockStrengthForKeyShare (mapped to ForShare in executor)
 func (p *parser) parseLockingClause() (*LockingClause, error) {
 	t, err := p.expectKeyword(KwFor)
 	if err != nil {
@@ -168,10 +168,29 @@ func (p *parser) parseLockingClause() (*LockingClause, error) {
 	switch {
 	case p.acceptKeyword(KwUpdate):
 		lc.Strength = LockStrengthForUpdate
+
 	case p.acceptKeyword(KwShare):
 		lc.Strength = LockStrengthForShare
+
+	// FOR KEY SHARE: peek confirms KEY SHARE sequence before consuming.
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwKey &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwShare:
+		p.advance() // KEY
+		p.advance() // SHARE
+		lc.Strength = LockStrengthForKeyShare
+
+	// FOR NO KEY UPDATE: peek confirms NO KEY UPDATE sequence.
+	// "NO" is not a reserved keyword in goopg; it appears as TokenIdent.
+	case (p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "no")) &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwKey &&
+		p.peek(2).Kind == TokenKeyword && p.peek(2).Keyword == KwUpdate:
+		p.advance() // NO
+		p.advance() // KEY
+		p.advance() // UPDATE
+		lc.Strength = LockStrengthForNoKeyUpdate
+
 	default:
-		return nil, p.errAtCur("expected UPDATE or SHARE after FOR")
+		return nil, p.errAtCur("expected UPDATE, SHARE, KEY SHARE, or NO KEY UPDATE after FOR")
 	}
 	if p.acceptKeyword(KwOf) {
 		first, err := p.parseIdent()
@@ -694,6 +713,32 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				continue
 			}
 		}
+		// `expr IS [NOT] NULL` — non-NULL-propagating null test.
+		// Unlike unary NOT, this always returns a boolean: NULL IS NULL = true.
+		// Added M0096-0004 for advisory lock WHERE clauses.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwIs {
+				pos := t.Pos
+				p.advance() // IS
+				negated := false
+				if p.acceptKeyword(KwNot) {
+					negated = true
+				}
+				if p.acceptKeyword(KwNull) {
+					left = &IsNullExpr{pos: pos, Operand: left, Negated: negated}
+					continue
+				}
+				// Not IS NULL / IS NOT NULL — put the parser back
+				// by not consuming further; produce an IS-predicate
+				// error only if we consumed NOT.
+				if negated {
+					return nil, p.errAtCur("expected NULL after IS NOT")
+				}
+				// IS DISTINCT FROM, IS TRUE, etc. — not yet supported;
+				// the caller will see an error on the next token.
+			}
+		}
+
 		// `expr = ANY (array[...])` — desugar to `expr IN (...)`.
 		// Used by vacuumdb catalog queries: `relkind = ANY (array['r','m'])`.
 		// Only the `= ANY` form is handled; `<> ANY` etc. are not emitted

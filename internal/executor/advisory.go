@@ -187,3 +187,21 @@ func advisorySessionID(sess Session) uintptr {
 	}
 	return 0
 }
+
+// advisorySessionIDFromContext returns a stable session identity from an
+// executor Context. When the server wires a per-connection BackendID (the
+// common production path), that is used as the session identifier; this
+// ensures cross-connection lock exclusion works correctly. Falls back to the
+// Session pointer for in-process test paths that use a *BasicSession.
+func advisorySessionIDFromContext(ctx *Context) uintptr {
+	if ctx == nil {
+		return 0
+	}
+	// BackendID is set by the server for every incoming connection and is unique
+	// per connection. Use it as the primary session key.
+	if ctx.BackendID != 0 {
+		return uintptr(ctx.BackendID)
+	}
+	// Fallback: in-process tests wire a *BasicSession but no BackendID.
+	return advisorySessionID(ctx.Session)
+}

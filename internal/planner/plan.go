@@ -176,6 +176,17 @@ type ExistsExpr struct {
 func (e *ExistsExpr) Pos() int { return e.pos }
 func (*ExistsExpr) exprNode()  {}
 
+// IsNullExpr mirrors parser.IsNullExpr after the operand has been planned.
+// Negated=true for IS NOT NULL. Always returns a boolean (never NULL itself).
+type IsNullExpr struct {
+	pos     int
+	Operand Expr
+	Negated bool
+}
+
+func (e *IsNullExpr) Pos() int { return e.pos }
+func (*IsNullExpr) exprNode()  {}
+
 // SubqueryExpr mirrors parser.SubqueryExpr after the inner
 // SELECT has been planned. The executor opens / drains /
 // closes Plan once at evaluation time and returns the single
@@ -686,6 +697,12 @@ const (
 	// LockStrengthForShare — `FOR SHARE`. Read-intent row lock.
 	// Mirrors upstream's LCS_FORSHARE.
 	LockStrengthForShare
+	// LockStrengthForNoKeyUpdate — `FOR NO KEY UPDATE`. Weaker write-intent
+	// lock; v0 maps to ForUpdate (M0096-0004 — key-level modes out of scope).
+	LockStrengthForNoKeyUpdate
+	// LockStrengthForKeyShare — `FOR KEY SHARE`. Weaker read-intent lock;
+	// v0 maps to ForShare (M0096-0004 — key-level modes out of scope).
+	LockStrengthForKeyShare
 )
 
 // LockWaitPolicy enumerates how a row-locking clause should

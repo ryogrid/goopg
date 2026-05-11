@@ -404,6 +404,14 @@ const (
 	// LockStrengthForShare — `FOR SHARE`. Read-intent row lock;
 	// mirrors upstream's LCS_FORSHARE.
 	LockStrengthForShare
+	// LockStrengthForNoKeyUpdate — `FOR NO KEY UPDATE`. Weaker write-intent
+	// lock that skips key columns. v0 maps this to LockStrengthForUpdate
+	// semantics (M0096-0004; separate key-level lock modes are out of scope).
+	LockStrengthForNoKeyUpdate
+	// LockStrengthForKeyShare — `FOR KEY SHARE`. Weaker read-intent lock
+	// covering only key columns. v0 maps this to LockStrengthForShare
+	// semantics (M0096-0004; separate key-level lock modes are out of scope).
+	LockStrengthForKeyShare
 )
 
 // LockWaitPolicy enumerates the wait modifier on a row-locking

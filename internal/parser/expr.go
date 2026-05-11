@@ -120,6 +120,19 @@ type ExistsExpr struct {
 func (e *ExistsExpr) Pos() int { return e.pos }
 func (*ExistsExpr) exprNode()  {}
 
+// IsNullExpr is `expr IS [NOT] NULL`. Unlike a UnaryOp, the result is
+// never NULL — it always returns a boolean. Negated=true for IS NOT NULL.
+// Added M0096-0004 to support `pg_advisory_lock(key) IS NOT NULL` in
+// WHERE clauses used by isolation specs.
+type IsNullExpr struct {
+	pos     int
+	Operand Expr
+	Negated bool // true for IS NOT NULL
+}
+
+func (e *IsNullExpr) Pos() int { return e.pos }
+func (*IsNullExpr) exprNode()  {}
+
 // SubqueryExpr is the v0 scalar-subquery expression: a
 // parenthesised SELECT used in expression position. The
 // executor evaluates it once per Open and binds the single
