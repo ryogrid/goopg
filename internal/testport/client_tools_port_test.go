@@ -3,7 +3,7 @@ package testport
 // Ports of PostgreSQL client-tools TAP tests into Go tests.
 //
 // Tools covered: pg_checksums, pg_controldata, pg_walsummary.
-// Upstream suites: C-001/002, CD-001, WS-001 in
+// Upstream suites: C-001/002, CD-001, WS-001/002 in
 //   docs/test-port/postgres-oracle-port-status.csv.
 // Milestone doc: docs/milestones/0095-client-tools-tap-test-porting.md
 //
@@ -15,6 +15,7 @@ package testport
 // a comment and test the correct error behaviour instead.
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/util"
 )
 
@@ -257,4 +259,75 @@ func TestPort_PgWalsummary001Basic(t *testing.T) {
 		t.Fatalf("expected 'no input files' in output; got stdout=%q stderr=%q",
 			res.Stdout, res.Stderr)
 	}
+}
+
+// TestPort_PgWalsummary002Blocks ports postgres/src/bin/pg_walsummary/t/002_blocks.pl.
+//
+// Upstream tests:
+//   - cluster init with summarize_wal = on
+//   - CREATE TABLE, INSERT, VACUUM FREEZE, CHECKPOINT
+//   - pg_available_wal_summaries() returns summaries after checkpoint
+//   - pg_stat_io shows walsummarizer reads
+//   - pg_walsummary -i <file> reports modified blocks
+//
+// Adapted sub-cases (pass in v0):
+//   - cluster init (without summarize_wal = on — goopg rejects unknown GUCs at startup)
+//   - CREATE TABLE, INSERT rows, VACUUM, CHECKPOINT
+//
+// Deferred (requires WAL summarization not yet implemented in goopg v0):
+//   - summarize_wal GUC
+//   - pg_available_wal_summaries() built-in function
+//   - pg_stat_io walsummarizer backend_type rows
+//   - pg_walsummary -i <summary-file> block-level output
+//
+// Remove the t.Skip call and implement the full test once goopg supports
+// WAL summarization (summarize_wal GUC + pg_available_wal_summaries()).
+func TestPort_PgWalsummary002Blocks(t *testing.T) {
+	// upstream: postgres/src/bin/pg_walsummary/t/002_blocks.pl
+	bin := clientToolBin(t, "pg_walsummary")
+	if bin == "" {
+		t.Skip("pg_walsummary not in PATH or postgres/local_install/bin")
+	}
+
+	// Basic cluster-init + SQL portion.
+	// goopg v0 does not support the summarize_wal GUC so we omit it;
+	// upstream's has_archiving / allows_streaming are also omitted.
+	c := newCluster(t, "walsummary002")
+	if err := c.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// CREATE TABLE and INSERT — adapted: use VALUES instead of generate_series()
+	// (pg_current_wal_insert_lsn and generate_series not implemented in goopg v0).
+	if _, err := c.Query(context.Background(),
+		`CREATE TABLE walsummary_t (a int, b text)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if _, err := c.Query(context.Background(),
+		`INSERT INTO walsummary_t VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')`); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	// VACUUM (FREEZE keyword omitted — not supported in goopg v0 parser).
+	if _, err := c.Query(context.Background(), `VACUUM walsummary_t`); err != nil {
+		t.Fatalf("VACUUM: %v", err)
+	}
+
+	// CHECKPOINT via the goopg control plane.
+	if err := c.Checkpoint(); err != nil {
+		t.Fatalf("CHECKPOINT: %v", err)
+	}
+
+	// WAL summarization sub-cases are deferred: goopg v0 does not implement
+	// summarize_wal, pg_available_wal_summaries(), or walsummarizer process.
+	// The pg_walsummary -i <file> block-output test is therefore also deferred.
+	// Unblock by implementing the WAL summarizer and its pg_available_wal_summaries()
+	// catalog function, then remove this t.Skip.
+	t.Skip("WAL summarization not implemented in goopg v0: " +
+		"summarize_wal GUC, pg_available_wal_summaries(), and pg_stat_io " +
+		"walsummarizer rows are absent; pg_walsummary -i block test deferred")
 }

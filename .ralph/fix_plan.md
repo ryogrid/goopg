@@ -230,11 +230,13 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       deferred (no pg_control).  CSV rows C-001/C-002/CD-001/WS-001 added;
       markdown regenerated. All 4 tests pass (2026-05-12).
 
-- [ ] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
-      as adapted Go test.  WAL summarization (`summarize_wal = on` /
-      `pg_available_wal_summaries()`) not yet implemented → skip with
-      explicit blocker comment; basic cluster-init + SQL portion passes.
-      New CSV row: WS-002.
+- [x] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
+      as adapted Go test in `client_tools_port_test.go`.
+      Basic SQL (CREATE TABLE, INSERT, VACUUM, CHECKPOINT) passes.
+      WAL summarization (summarize_wal GUC, pg_available_wal_summaries(),
+      pg_stat_io walsummarizer rows, pg_walsummary -i) deferred with explicit
+      t.Skip blocker (goopg rejects unknown GUCs at startup; function not
+      implemented). CSV row WS-002 added; markdown regenerated (2026-05-12).
 
 - [ ] **M0095-0003** — Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
       as adapted Go tests in
