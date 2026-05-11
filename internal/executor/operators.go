@@ -91,7 +91,14 @@ func (o *projectOp) Next() (TupleSlot, error) {
 		}
 		o.out[i] = v
 	}
-	return asSlot(o.schema, cloneRow(o.out)), nil
+	// M0092-0002: the returned slot ALIASES o.out, which is
+	// overwritten on the next Next() call. Audited consumers
+	// (filterOp, limitOp, simple/extended-query loops, sortOp,
+	// windowOp, lockRowsOp, joinOp, aggregateOp, recursiveUnionOp,
+	// nestedLoopIndexJoinOp post-prereq) all consume / materialize
+	// before the next Next. See
+	// docs/design/0092-0002-projectop-slot-aliasing.md.
+	return asSlot(o.schema, o.out), nil
 }
 
 // filterOp drops rows where the predicate doesn't evaluate to TRUE.
