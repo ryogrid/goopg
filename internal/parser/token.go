@@ -228,6 +228,10 @@ const (
 	KwPrepare  Keyword = "prepare"
 	KwExecute  Keyword = "execute"
 	KwDeallocate Keyword = "deallocate"
+
+	// M0096-0010: MERGE INTO statement.
+	KwMerge   Keyword = "merge"
+	KwMatched Keyword = "matched"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -371,6 +375,8 @@ var keywords = map[string]Keyword{
 	"prepare":      KwPrepare,
 	"execute":      KwExecute,
 	"deallocate":   KwDeallocate,
+	"merge":        KwMerge,
+	"matched":      KwMatched,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

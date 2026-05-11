@@ -100,6 +100,8 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwPrepare:      KwCatUnreserved,
 	KwExecute:      KwCatUnreserved,
 	KwDeallocate:   KwCatUnreserved,
+	KwMerge:        KwCatUnreserved,
+	KwMatched:      KwCatUnreserved,
 
 	// goopg-specific (no upstream equivalent) — treated as unreserved.
 	KwConstant: KwCatUnreserved,

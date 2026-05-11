@@ -844,6 +844,46 @@ type Delete struct {
 func (n *Delete) Pos() int       { return n.pos }
 func (n *Delete) Output() Schema { return nil }
 
+// ── Merge plan node (M0096-0010) ─────────────────────────────────────────────
+
+// MergeActionKind mirrors parser.MergeActionKind without importing the parser.
+type MergeActionKind int
+
+const (
+	MergeActionUpdate MergeActionKind = iota + 1
+	MergeActionDelete
+	MergeActionInsert
+)
+
+// MergeWhenClause is the planned form of one WHEN arm.
+type MergeWhenClause struct {
+	Matched   bool
+	Condition Expr // nil when no AND condition
+	Action    MergeActionKind
+
+	// UPDATE: parallel to target columns (nil = keep existing).
+	UpdateSet []Expr
+
+	// INSERT: InsertExprs are evaluated against the source row at runtime.
+	// InsertColIdx maps source → target column ordinals (same length).
+	// nil InsertExprs means DEFAULT VALUES.
+	InsertExprs  []Expr
+	InsertColIdx []int
+}
+
+// Merge is the plan node for MERGE INTO target USING source ON cond WHEN ….
+// Source is the planned USING clause. Target is the merge-target table.
+type Merge struct {
+	pos     int
+	Target  *catalog.Table
+	Source  Node            // USING clause scan
+	On      Expr            // join condition (source cols at offset len(Target.Columns))
+	Clauses []*MergeWhenClause
+}
+
+func (n *Merge) Pos() int       { return n.pos }
+func (n *Merge) Output() Schema { return nil }
+
 // DDL — passes the original parser DDL statement through to the
 // executor's DDL path. The planner doesn't decompose DDL further in
 // v0; the catalog is mutated as the executor runs the statement.

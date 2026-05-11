@@ -184,6 +184,47 @@ type DeallocateStmt struct {
 func (s *DeallocateStmt) Pos() int  { return s.pos }
 func (s *DeallocateStmt) stmtNode() {}
 
+// ── MERGE INTO (M0096-0010) ─────────────────────────────────────────────────
+
+// MergeActionKind discriminates the action in a MERGE WHEN clause.
+type MergeActionKind int
+
+const (
+	MergeActionUpdate MergeActionKind = iota + 1
+	MergeActionDelete
+	MergeActionInsert
+)
+
+// MergeWhenClause describes one WHEN MATCHED / WHEN NOT MATCHED arm.
+type MergeWhenClause struct {
+	pos       int
+	Matched   bool            // true = WHEN MATCHED, false = WHEN NOT MATCHED
+	Condition Expr            // optional AND condition; nil when absent
+	Action    MergeActionKind
+
+	// For UPDATE: set assignments and optional WHERE.
+	UpdateAssigns []UpdateAssign
+
+	// For INSERT: column list and value expressions.
+	InsertColumns []string
+	InsertValues  []Expr // nil → DEFAULT VALUES
+}
+
+func (w *MergeWhenClause) Pos() int { return w.pos }
+
+// MergeStmt — `MERGE INTO target USING source ON cond WHEN … THEN …`.
+// M0096-0010.
+type MergeStmt struct {
+	pos     int
+	Target  RangeVar        // merge target table (with optional alias)
+	Source  RangeVar        // USING source (table or subquery, with alias)
+	On      Expr            // join condition
+	Clauses []*MergeWhenClause
+}
+
+func (s *MergeStmt) Pos() int  { return s.pos }
+func (s *MergeStmt) stmtNode() {}
+
 // ClusterStmt — `CLUSTER [VERBOSE] [tablename [USING indexname]]`.
 // M0095-0008: no-op executor stub.  When a table name is provided the
 // executor verifies the table exists; without a table it always succeeds.

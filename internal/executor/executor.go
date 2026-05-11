@@ -169,6 +169,8 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, op), nil
+	case *planner.Merge:
+		return maybeInstrument(p, newMergeOp(p)), nil
 	case *planner.MultiHashJoin:
 		children := make([]Operator, len(p.Tables))
 		for i, tbl := range p.Tables {

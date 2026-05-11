@@ -438,10 +438,14 @@ alongside the suite.
       `SeqScan(parent) UNION ALL SeqScan(c1) UNION ALL …` in `planScanRangeVar`.
       All core unit tests pass.
 
-- [ ] **M0096-0010** — Implement `MERGE INTO target USING source ON cond
+- [x] **M0096-0010** — Implement `MERGE INTO target USING source ON cond
       WHEN MATCHED THEN UPDATE/DELETE WHEN NOT MATCHED THEN INSERT`.
       Unblocks: `merge-update`, `merge-delete`, `merge-insert-update`,
       `merge-match-recheck`, `merge-join` (5 specs).
+      Parser: KwMerge/KwMatched; MergeStmt/MergeWhenClause AST; parseMerge.
+      Planner: Merge plan node; planMerge with merged target+source schema.
+      Executor: mergeOp nested-loop match scan + deferred mods + NOT MATCHED INSERT.
+      Design doc: 0096-0010-merge-into.md.
 
 - [ ] **M0096-0011** — Implement inline `REFERENCES table (cols)` column
       constraint and table constraint in `CREATE TABLE` (FK enforcement

@@ -185,6 +185,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseReindex()
 	case KwCluster:
 		return p.parseCluster()
+	case KwMerge:
+		return p.parseMerge()
 	case KwPrepare:
 		return p.parsePrepare()
 	case KwExecute:
@@ -1107,6 +1109,149 @@ func (p *parser) parseDeallocate() (Stmt, error) {
 		name = identText(nameIdent)
 	}
 	return &DeallocateStmt{pos: t.Pos, Name: name}, nil
+}
+
+// parseMerge parses a MERGE INTO statement (M0096-0010).
+//
+// Syntax:
+//
+//	MERGE INTO target [AS alias]
+//	USING source [AS alias]
+//	ON condition
+//	WHEN MATCHED [AND cond] THEN { UPDATE SET … | DELETE }
+//	WHEN NOT MATCHED [AND cond] THEN INSERT [(cols)] VALUES (…)
+func (p *parser) parseMerge() (Stmt, error) {
+	t := p.advance() // consume MERGE
+	// Optional INTO
+	_ = p.acceptKeyword(KwInto)
+	stmt := &MergeStmt{pos: t.Pos}
+
+	// Target table with optional alias.
+	target, err := p.parseRangeVar()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Target = target
+
+	// USING source
+	if !p.acceptIdentKeyword("using") {
+		return nil, p.errAtCur("expected USING after MERGE INTO target")
+	}
+	source, err := p.parseRangeVar()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Source = source
+
+	// ON condition
+	if _, err := p.expectKeyword(KwOn); err != nil {
+		return nil, err
+	}
+	onCond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	stmt.On = onCond
+
+	// One or more WHEN clauses.
+	for p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhen {
+		clause, err := p.parseMergeWhenClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Clauses = append(stmt.Clauses, clause)
+	}
+	return stmt, nil
+}
+
+// parseMergeWhenClause parses one WHEN [NOT] MATCHED [AND cond] THEN action.
+func (p *parser) parseMergeWhenClause() (*MergeWhenClause, error) {
+	t := p.advance() // WHEN
+	clause := &MergeWhenClause{pos: t.Pos}
+
+	// NOT MATCHED or MATCHED
+	if p.acceptKeyword(KwNot) {
+		clause.Matched = false
+		if _, err := p.expectKeyword(KwMatched); err != nil {
+			return nil, err
+		}
+	} else if p.acceptKeyword(KwMatched) {
+		clause.Matched = true
+	} else {
+		return nil, p.errAtCur("expected MATCHED or NOT MATCHED after WHEN")
+	}
+
+	// Optional AND condition.
+	if p.acceptKeyword(KwAnd) {
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		clause.Condition = cond
+	}
+
+	// THEN
+	if _, err := p.expectKeyword(KwThen); err != nil {
+		return nil, err
+	}
+
+	// Action: UPDATE, DELETE, or INSERT.
+	switch {
+	case p.acceptKeyword(KwUpdate):
+		clause.Action = MergeActionUpdate
+		if _, err := p.expectKeyword(KwSet); err != nil {
+			return nil, err
+		}
+		assigns, err := p.parseAssignList()
+		if err != nil {
+			return nil, err
+		}
+		clause.UpdateAssigns = assigns
+
+	case p.acceptKeyword(KwDelete):
+		clause.Action = MergeActionDelete
+
+	case p.acceptKeyword(KwInsert):
+		clause.Action = MergeActionInsert
+		// Optional column list.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance()
+			cols, err := p.parseColumnNameList()
+			if err != nil {
+				return nil, err
+			}
+			clause.InsertColumns = cols
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')'")
+			}
+		}
+		// VALUES or DEFAULT VALUES.
+		if p.acceptKeyword(KwValues) {
+			if !p.acceptSymbol("(") {
+				return nil, p.errAtCur("expected '('")
+			}
+			vals, err := p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+			clause.InsertValues = vals
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')'")
+			}
+		} else if p.acceptKeyword(KwDefault) {
+			if _, err := p.expectKeyword(KwValues); err != nil {
+				return nil, err
+			}
+			// InsertValues remains nil to signal DEFAULT VALUES.
+		} else {
+			return nil, p.errAtCur("expected VALUES or DEFAULT VALUES after INSERT")
+		}
+
+	default:
+		return nil, p.errAtCur("expected UPDATE, DELETE, or INSERT after THEN")
+	}
+
+	return clause, nil
 }
 
 // parseReset: RESET name | RESET ALL

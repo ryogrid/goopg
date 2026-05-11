@@ -51,6 +51,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 			return nil, toPlanError(err)
 		}
 		return planDelete(s, cat)
+	case *parser.MergeStmt:
+		return planMerge(s, cat)
 
 	case *parser.CreateTableStmt, *parser.DropTableStmt,
 		*parser.CreateIndexStmt, *parser.DropIndexStmt,
@@ -2858,6 +2860,131 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 	return &Delete{pos: s.Pos(), Table: tbl, Child: node}, nil
+}
+
+// planMerge converts a MERGE INTO statement into a Merge plan node.
+// M0096-0010.
+func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
+	if !ok {
+		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01",
+			Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
+	}
+
+	// Plan the USING source.
+	var srcIdx int16 = 2
+	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a merged schema: target columns first, then source columns.
+	targetAlias := s.Target.Alias
+	if targetAlias == "" {
+		targetAlias = tbl.Name
+	}
+	n := len(tbl.Columns)
+	sourceSchema := sourceNode.Output()
+	if sourceSchema == nil && sourceBinding.table != nil {
+		sourceSchema = tableSchemaWithSource(sourceBinding.table, srcIdx)
+	}
+
+	targetBinding := rangeBinding{table: tbl, alias: targetAlias, offset: 0, sourceIdx: 1}
+	sourceBinding.offset = n
+
+	mergedSchema := make(Schema, 0, n+len(sourceSchema))
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 1)...)
+	mergedSchema = append(mergedSchema, sourceSchema...)
+	mergedCtx := newResolveContext([]rangeBinding{targetBinding, sourceBinding}, mergedSchema)
+	mergedCtx.cat = cat
+
+	// Source-only context for NOT MATCHED INSERT VALUES.
+	sourceOnly := newResolveContext([]rangeBinding{{
+		table: sourceBinding.table, alias: sourceBinding.alias,
+		offset: 0, sourceIdx: srcIdx,
+	}}, sourceSchema)
+	sourceOnly.cat = cat
+
+	onExpr, err := resolveExpr(s.On, mergedCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	clauses := make([]*MergeWhenClause, 0, len(s.Clauses))
+	for _, wc := range s.Clauses {
+		pc := &MergeWhenClause{
+			Matched: wc.Matched,
+			Action:  MergeActionKind(wc.Action),
+		}
+		if wc.Condition != nil {
+			cond, err := resolveExpr(wc.Condition, mergedCtx)
+			if err != nil {
+				return nil, err
+			}
+			pc.Condition = cond
+		}
+		switch wc.Action {
+		case parser.MergeActionUpdate:
+			set := make([]Expr, n)
+			for _, a := range wc.UpdateAssigns {
+				col, colOK := cat.LookupColumn(tbl, a.Column)
+				if !colOK {
+					return nil, &PlanError{Pos: a.Pos(), Code: "42703",
+						Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
+				}
+				expr, err := resolveExpr(a.Expr, mergedCtx)
+				if err != nil {
+					return nil, err
+				}
+				set[col.Ordinal] = expr
+			}
+			pc.UpdateSet = set
+		case parser.MergeActionDelete:
+			// nothing extra
+		case parser.MergeActionInsert:
+			ordinals, err := buildInsertColIdx(tbl, wc.InsertColumns, cat)
+			if err != nil {
+				return nil, &PlanError{Pos: wc.Pos(), Code: "42703", Message: err.Error()}
+			}
+			pc.InsertColIdx = ordinals
+			if wc.InsertValues != nil {
+				exprs := make([]Expr, len(wc.InsertValues))
+				for i, ve := range wc.InsertValues {
+					expr, err := resolveExpr(ve, sourceOnly)
+					if err != nil {
+						return nil, err
+					}
+					exprs[i] = expr
+				}
+				pc.InsertExprs = exprs
+			}
+		}
+		clauses = append(clauses, pc)
+	}
+	return &Merge{pos: s.Pos(), Target: tbl, Source: sourceNode, On: onExpr, Clauses: clauses}, nil
+}
+
+// buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.
+// When names is empty, all non-generated columns are returned in declaration order.
+func buildInsertColIdx(tbl *catalog.Table, names []string, cat catalog.Catalog) ([]int, error) {
+	if len(names) == 0 {
+		out := make([]int, 0, len(tbl.Columns))
+		for i, c := range tbl.Columns {
+			if !c.GeneratedAlways {
+				out = append(out, i)
+			}
+		}
+		return out, nil
+	}
+	out := make([]int, 0, len(names))
+	for _, name := range names {
+		col, ok := cat.LookupColumn(tbl, name)
+		if !ok {
+			return nil, fmt.Errorf("column %q of relation %q does not exist", name, tbl.Name)
+		}
+		out = append(out, col.Ordinal)
+	}
+	return out, nil
 }
 
 // resolveTargets expands a parser target list into planner Expr's
