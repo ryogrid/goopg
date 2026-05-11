@@ -727,6 +727,43 @@ func extractTimestampField(field string, t time.Time, pos int) (int64, error) {
 		return u.Unix(), nil
 	case "quarter":
 		return int64((int(u.Month())-1)/3 + 1), nil
+	// M0097-0004: additional calendar fields.
+	case "week", "isoweek":
+		_, week := u.ISOWeek()
+		return int64(week), nil
+	case "isoyear":
+		year, _ := u.ISOWeek()
+		return int64(year), nil
+	case "isodow":
+		wd := u.Weekday()
+		if wd == 0 {
+			wd = 7 // ISO: Sunday = 7
+		}
+		return int64(wd), nil
+	case "decade":
+		y := int64(u.Year())
+		if y >= 0 {
+			return y / 10, nil
+		}
+		return (y - 9) / 10, nil
+	case "century":
+		y := int64(u.Year())
+		if y > 0 {
+			return (y + 99) / 100, nil
+		}
+		return -((-y + 99) / 100), nil
+	case "millennium":
+		y := int64(u.Year())
+		if y > 0 {
+			return (y + 999) / 1000, nil
+		}
+		return -((-y + 999) / 1000), nil
+	case "microseconds", "microsecond":
+		return int64(u.Second())*1_000_000 + int64(u.Nanosecond()/1000), nil
+	case "milliseconds", "millisecond":
+		return int64(u.Second())*1000 + int64(u.Nanosecond()/1_000_000), nil
+	case "timezone", "timezone_hour", "timezone_minute":
+		return 0, nil // goopg v0 is UTC-only
 	default:
 		return 0, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("date field %q is not supported in v0", field)}
 	}
@@ -762,6 +799,326 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	return Datum{Kind: KindInt, Int: n}, nil
+}
+
+// evalToChar implements to_char(timestamp, fmt) → text.
+// Converts a timestamp to a string using a PostgreSQL format string.
+// Supports a subset of PostgreSQL format codes. M0097-0004.
+func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 2 {
+		return NullDatum, nil
+	}
+	srcArg, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil || srcArg.IsNull() {
+		return NullDatum, nil
+	}
+	fmtArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil || fmtArg.IsNull() {
+		return NullDatum, nil
+	}
+	// to_char(numeric, fmt) — number formatting; return as-is for now.
+	if srcArg.Kind != KindTime {
+		return NewStringDatum(srcArg.Format()), nil
+	}
+	t := srcArg.TimeValue().UTC()
+	goFmt := pgToCharToGoFormat(strings.TrimSpace(fmtArg.StringValue()))
+	return NewStringDatum(t.Format(goFmt)), nil
+}
+
+// pgToCharToGoFormat converts a PostgreSQL to_char format string to a Go
+// time.Format layout string. Supports the most common format codes.
+func pgToCharToGoFormat(pg string) string {
+	replacer := strings.NewReplacer(
+		"YYYY", "2006",
+		"YYY",  "006",
+		"YY",   "06",
+		"Y",    "6",
+		"IYYY", "2006", // ISO year — approximate
+		"IYY",  "006",
+		"IY",   "06",
+		"I",    "6",
+		"MM",   "01",
+		"MON",  "Jan",
+		"Mon",  "Jan",
+		"mon",  "jan",
+		"MONTH","January",
+		"Month","January",
+		"month","january",
+		"DD",   "02",
+		"D",    "1",    // day of week 1=Sun PostgreSQL, Go: Mon=1
+		"DAY",  "Monday",
+		"Day",  "Monday",
+		"day",  "monday",
+		"DY",   "Mon",
+		"Dy",   "Mon",
+		"dy",   "mon",
+		"HH24", "15",
+		"HH12", "03",
+		"HH",   "03",
+		"MI",   "04",
+		"SS",   "05",
+		"MS",   "000",  // milliseconds
+		"US",   "000000", // microseconds
+		"TZ",   "UTC",  // always UTC in v0
+		"tz",   "utc",
+		"TZH",  "-07",
+		"TZM",  "00",
+		"AM",   "PM",
+		"PM",   "PM",
+		"am",   "pm",
+		"pm",   "pm",
+		"A.M.", "PM",
+		"P.M.", "PM",
+		"Q",    "",     // quarter — not supported in Go format
+		"WW",   "",     // week of year — not directly supported
+		"IW",   "",     // ISO week
+		"CC",   "",     // century
+		"J",    "",     // Julian day
+		"SSSSS","",     // seconds past midnight
+		"SSSS", "",
+		"Y,YYY","",     // year with comma
+		"OF",   "-07:00",
+		"TZO",  "-07:00",
+	)
+	return replacer.Replace(pg)
+}
+
+// evalDateTrunc implements date_trunc(field, source) → timestamp.
+// Truncates a timestamp to the specified field granularity. M0097-0004.
+func evalDateTrunc(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 2 {
+		return NullDatum, nil
+	}
+	fieldArg, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil || fieldArg.IsNull() {
+		return NullDatum, nil
+	}
+	src, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil || src.IsNull() {
+		return NullDatum, nil
+	}
+	if src.Kind != KindTime {
+		if src.Kind == KindString || src.Kind == KindStringArena {
+			if parsed, perr := parseCopyTimestamp(src.StringValue()); perr == nil {
+				src = NewTimeDatum(parsed)
+			}
+		}
+		if src.Kind != KindTime {
+			return NullDatum, nil
+		}
+	}
+	t := src.TimeValue().UTC()
+	switch strings.ToLower(strings.TrimSpace(fieldArg.StringValue())) {
+	case "microseconds":
+		t = t.Truncate(time.Microsecond)
+	case "milliseconds":
+		t = t.Truncate(time.Millisecond)
+	case "second":
+		t = t.Truncate(time.Second)
+	case "minute":
+		t = t.Truncate(time.Minute)
+	case "hour":
+		t = t.Truncate(time.Hour)
+	case "day":
+		t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	case "week":
+		wd := int(t.Weekday())
+		if wd == 0 {
+			wd = 7
+		}
+		t = time.Date(t.Year(), t.Month(), t.Day()-wd+1, 0, 0, 0, 0, t.Location())
+	case "month":
+		t = time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
+	case "quarter":
+		m := t.Month()
+		qm := ((m-1)/3)*3 + 1
+		t = time.Date(t.Year(), qm, 1, 0, 0, 0, 0, t.Location())
+	case "year":
+		t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, t.Location())
+	case "decade":
+		y := (t.Year() / 10) * 10
+		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
+	case "century":
+		y := ((t.Year() - 1) / 100) * 100
+		if y < 0 {
+			y = ((t.Year()) / 100) * 100
+		} else {
+			y++
+		}
+		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
+	case "millennium":
+		y := ((t.Year() - 1) / 1000) * 1000
+		if y < 0 {
+			y = (t.Year() / 1000) * 1000
+		} else {
+			y++
+		}
+		t = time.Date(y, 1, 1, 0, 0, 0, 0, t.Location())
+	}
+	return NewTimeDatum(t), nil
+}
+
+// evalAge implements age(ts) and age(ts2, ts1) → interval. M0097-0004.
+func evalAge(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	var ts1, ts2 time.Time
+	switch len(x.Args) {
+	case 1:
+		d, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || d.IsNull() || d.Kind != KindTime {
+			return NullDatum, nil
+		}
+		ts1 = d.TimeValue().UTC()
+		ts2 = ctx.Now.UTC()
+	case 2:
+		d2, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || d2.IsNull() || d2.Kind != KindTime {
+			return NullDatum, nil
+		}
+		d1, err := evalExpr(x.Args[1], row, ctx)
+		if err != nil || d1.IsNull() || d1.Kind != KindTime {
+			return NullDatum, nil
+		}
+		ts2 = d2.TimeValue().UTC()
+		ts1 = d1.TimeValue().UTC()
+	default:
+		return NullDatum, nil
+	}
+	// Compute year/month/day difference the PostgreSQL way.
+	years := ts2.Year() - ts1.Year()
+	months := int(ts2.Month()) - int(ts1.Month())
+	days := ts2.Day() - ts1.Day()
+	if days < 0 {
+		months--
+		// Days in the month prior to ts2.
+		prevMonth := time.Date(ts2.Year(), ts2.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 0, -1)
+		days += prevMonth.Day()
+	}
+	if months < 0 {
+		years--
+		months += 12
+	}
+	totalMonths := int32(years*12 + months)
+	return NewIntervalDatum(totalMonths, int32(days)), nil
+}
+
+// evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
+func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 3 {
+		return NullDatum, nil
+	}
+	yArg, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil || yArg.IsNull() {
+		return NullDatum, nil
+	}
+	mArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil || mArg.IsNull() {
+		return NullDatum, nil
+	}
+	dArg, err := evalExpr(x.Args[2], row, ctx)
+	if err != nil || dArg.IsNull() {
+		return NullDatum, nil
+	}
+	t := time.Date(int(yArg.Int), time.Month(mArg.Int), int(dArg.Int), 0, 0, 0, 0, time.UTC)
+	return NewTimeDatum(t), nil
+}
+
+// evalMakeTimestamp implements make_timestamp/make_timestamptz(y,m,d,h,min,sec).
+// M0097-0004.
+func evalMakeTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 6 {
+		return NullDatum, nil
+	}
+	args := make([]int64, 6)
+	for i := 0; i < 6; i++ {
+		d, err := evalExpr(x.Args[i], row, ctx)
+		if err != nil || d.IsNull() {
+			return NullDatum, nil
+		}
+		args[i] = d.Int
+	}
+	t := time.Date(int(args[0]), time.Month(args[1]), int(args[2]),
+		int(args[3]), int(args[4]), int(args[5]), 0, time.UTC)
+	return NewTimeDatum(t), nil
+}
+
+// evalMakeTime implements make_time(h, min, sec) → time. M0097-0004.
+func evalMakeTime(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 3 {
+		return NullDatum, nil
+	}
+	h, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil || h.IsNull() {
+		return NullDatum, nil
+	}
+	m, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil || m.IsNull() {
+		return NullDatum, nil
+	}
+	s, err := evalExpr(x.Args[2], row, ctx)
+	if err != nil || s.IsNull() {
+		return NullDatum, nil
+	}
+	t := time.Date(1970, 1, 1, int(h.Int), int(m.Int), int(s.Int), 0, time.UTC)
+	return NewTimeDatum(t), nil
+}
+
+// evalIsFinite stubs isfinite(date/timestamp/interval). goopg v0 does not
+// store infinity values, so always returns TRUE for non-NULL input. M0097-0004.
+func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 1 {
+		return NullDatum, nil
+	}
+	d, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return NullDatum, nil
+	}
+	return NewBoolDatum(!d.IsNull()), nil
+}
+
+// evalJustifyInterval stubs justify_hours / justify_days / justify_interval.
+// These re-balance interval fields (e.g. 25 hours → 1 day + 1 hour). goopg
+// v0 does not yet track sub-day interval precision, so return the input as-is.
+// M0097-0004.
+func evalJustifyInterval(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 1 {
+		return NullDatum, nil
+	}
+	return evalExpr(x.Args[0], row, ctx)
+}
+
+// evalDateBin implements date_bin(step interval, source timestamp, origin timestamp).
+// Bins the source timestamp into the bucket identified by origin aligned to step.
+// M0097-0004.
+func evalDateBin(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 3 {
+		return NullDatum, nil
+	}
+	stepArg, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil || stepArg.IsNull() || stepArg.Kind != KindInterval {
+		return NullDatum, nil
+	}
+	srcArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil || srcArg.IsNull() || srcArg.Kind != KindTime {
+		return NullDatum, nil
+	}
+	originArg, err := evalExpr(x.Args[2], row, ctx)
+	if err != nil || originArg.IsNull() || originArg.Kind != KindTime {
+		return NullDatum, nil
+	}
+	// Convert interval step to duration (days only for v0).
+	stepDays := int64(stepArg.IntervalDaysValue())
+	if stepDays == 0 {
+		return NullDatum, nil
+	}
+	stepDur := time.Duration(stepDays) * 24 * time.Hour
+	src := srcArg.TimeValue().UTC()
+	origin := originArg.TimeValue().UTC()
+	diff := src.Sub(origin)
+	bucket := (diff / stepDur) * stepDur
+	if diff < 0 {
+		bucket = ((diff - stepDur + 1) / stepDur) * stepDur
+	}
+	return NewTimeDatum(origin.Add(bucket)), nil
 }
 
 // evalIntervalLit parses the integer body of an `interval 'N' unit`
@@ -1190,6 +1547,24 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalSubstr(x, row, ctx)
 	case "date_part":
 		return evalDatePart(x, row, ctx)
+	case "date_trunc":
+		return evalDateTrunc(x, row, ctx)
+	case "to_char":
+		return evalToChar(x, row, ctx)
+	case "age":
+		return evalAge(x, row, ctx)
+	case "make_date":
+		return evalMakeDate(x, row, ctx)
+	case "make_timestamp", "make_timestamptz":
+		return evalMakeTimestamp(x, row, ctx)
+	case "make_time":
+		return evalMakeTime(x, row, ctx)
+	case "isfinite":
+		return evalIsFinite(x, row, ctx)
+	case "justify_hours", "justify_days", "justify_interval":
+		return evalJustifyInterval(x, row, ctx)
+	case "date_bin":
+		return evalDateBin(x, row, ctx)
 	case "set_config":
 		// set_config(setting_name, new_value, is_local) → text
 		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)

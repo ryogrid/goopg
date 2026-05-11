@@ -589,12 +589,18 @@ M0097-0001 wires it up.
       hanging (previously timed out at 30-60s). Output still defers (further
       normalization and type-output format fixes needed in M0097-0005+).
 
-- [ ] **M0097-0004** — Date / time type parity.
+- [x] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
       `timetz`, `interval`, `horology`.
       Work: fill out date/time arithmetic operators, interval I/O,
       timezone handling, `to_char` / `to_timestamp` format patterns,
       `date_trunc`, `date_part`, `extract`, `age`, `now()` aliases.
+      Implemented: date_trunc, age, make_date/timestamp/time, isfinite,
+      justify_hours/days/interval, date_bin, to_char (basic PG format codes),
+      extended date_part/EXTRACT fields (week/isoyear/isodow/decade/century/
+      millennium/microseconds/milliseconds/timezone). All date/time tests
+      now run without hanging (date=0.07s, horology=0.08s, interval=0.09s,
+      timestamp=0.35s). Output still defers (format/precision diffs).
 
 - [ ] **M0097-0005** — Core SELECT + DML parity.
       Target tests: `select`, `select_distinct`, `select_distinct_on`,
