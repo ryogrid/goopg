@@ -378,6 +378,41 @@ func NewToastPointerDatum(p []byte) Datum {
 
 // Format renders the value the way text-mode wire protocol expects.
 // Time values use upstream's `2006-01-02 15:04:05.000000` layout.
+// AppendValueText appends d's text-format wire representation
+// directly to dst and returns the extended slice. The protocol-
+// layer hot path uses this instead of Format() to avoid the
+// `strconv.FormatInt → string → []byte` allocation chain
+// (M0092-0004): KindInt no longer allocates a fresh string per
+// row, and KindString/KindBytes/KindStringArena/KindBytesArena
+// skip the string→[]byte conversion. Behaviour matches Format().
+func (d Datum) AppendValueText(dst []byte) []byte {
+	switch d.Kind {
+	case KindNull:
+		return dst
+	case KindBool:
+		if d.BoolValue() {
+			return append(dst, 't')
+		}
+		return append(dst, 'f')
+	case KindInt:
+		return strconv.AppendInt(dst, d.Int, 10)
+	case KindString:
+		return append(dst, d.Buf...)
+	case KindStringArena:
+		return append(dst, d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))...)
+	case KindBytes:
+		return append(dst, d.Buf...)
+	case KindBytesArena:
+		return append(dst, d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))...)
+	case KindTime:
+		return d.TimeValue().AppendFormat(dst, "2006-01-02 15:04:05.000000")
+	}
+	// Fallback for KindInterval / KindNumeric / unknown kinds —
+	// the slow lane allocates but is off the simple-query
+	// pgbench hot path (which only emits KindInt for abalance).
+	return append(dst, d.Format()...)
+}
+
 func (d Datum) Format() string {
 	switch d.Kind {
 	case KindNull:

@@ -363,15 +363,20 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 		if len(schema) > 0 {
 			row := slot.Row()
-			cells := make([][]byte, len(row))
-			for i, d := range row {
+			// M0092-0004: per-connection scratch buffers back the
+			// wire frame so the simple-query result loop is O(1)
+			// allocation across rows AND statements.
+			cells, valueBuf := w.DataRowScratch(len(row))
+			for _, d := range row {
 				if d.IsNull() {
-					cells[i] = nil
+					cells = append(cells, nil)
 					continue
 				}
-				cells[i] = []byte(d.Format())
+				start := len(valueBuf)
+				valueBuf = d.AppendValueText(valueBuf)
+				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
-			if err := w.WriteDataRow(cells); err != nil {
+			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
 				_ = op.Close()
 				return err
 			}

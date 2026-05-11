@@ -159,6 +159,39 @@ type FrameWriter struct {
 	// wait events (Stage B wait-event taxonomy).
 	OnBeforeWrite func()
 	OnAfterWrite  func()
+
+	// M0092-0004: per-connection scratch buffers for WriteDataRowReuse.
+	// Reused across rows AND across statements on the same connection
+	// (pgbench-style workloads issue many single-row SELECTs in a row).
+	// payloadBuf backs the wire-frame payload; valueBuf holds the
+	// concatenated column wire-text bytes; cells indexes into valueBuf.
+	dataRowPayload []byte
+	dataRowValues  []byte
+	dataRowCells   [][]byte
+}
+
+// DataRowScratch hands the caller the FrameWriter's per-connection
+// scratch buffers for building a DataRow without per-row allocations.
+// Caller must use the returned slices, write the row via
+// PutDataRowScratch, and never retain references past the next
+// PutDataRowScratch call. (M0092-0004.)
+func (fw *FrameWriter) DataRowScratch(ncols int) (cells [][]byte, valueBuf []byte) {
+	cells = fw.dataRowCells[:0]
+	if cap(cells) < ncols {
+		cells = make([][]byte, 0, ncols)
+	}
+	return cells, fw.dataRowValues[:0]
+}
+
+// PutDataRowScratch writes a DataRow built from the scratch returned
+// by DataRowScratch and stashes the (possibly grown) buffers back on
+// the FrameWriter for reuse. (M0092-0004.)
+func (fw *FrameWriter) PutDataRowScratch(cells [][]byte, valueBuf []byte) error {
+	payload, err := fw.WriteDataRowReuse(cells, fw.dataRowPayload)
+	fw.dataRowPayload = payload
+	fw.dataRowValues = valueBuf
+	fw.dataRowCells = cells
+	return err
 }
 
 // NewFrameWriter wraps w with a buffered writer sized for typical message

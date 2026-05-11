@@ -131,7 +131,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 					cells[i] = nil
 					continue
 				}
-				cells[i] = []byte(d.Format())
+				// M0092-0004: AppendValueText skips the
+				// `Format() string → []byte` double-alloc.
+				cells[i] = d.AppendValueText(nil)
 			}
 			res.Rows = append(res.Rows, cells)
 			rowCount++
