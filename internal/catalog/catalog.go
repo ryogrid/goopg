@@ -253,6 +253,10 @@ type InMemory struct {
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
 	partitionChildren map[uint32][]uint32
+
+	// inheritanceChildren maps parent table OID → slice of child OIDs
+	// for table inheritance support (M0096-0009).
+	inheritanceChildren map[uint32][]uint32
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -294,10 +298,41 @@ func NewInMemory() *InMemory {
 		dbOid:             DefaultDBOid,
 		routines:          NewRoutines(),
 		databases:         map[string]bool{"postgres": true},
-		partitionChildren: make(map[uint32][]uint32),
+		partitionChildren:   make(map[uint32][]uint32),
+		inheritanceChildren: make(map[uint32][]uint32),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// RegisterInheritanceChild registers childOID as a child of parentOID for
+// table inheritance. Called when CREATE TABLE c INHERITS (p) executes.
+// M0096-0009.
+func (c *InMemory) RegisterInheritanceChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	c.inheritanceChildren[parentOID] = append(c.inheritanceChildren[parentOID], childOID)
+	c.mu.Unlock()
+}
+
+// InheritanceChildren returns the direct inheritance children of parentOID.
+// Returns nil if the table has no inheritance children. M0096-0009.
+func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	children := c.inheritanceChildren[parentOID]
+	if len(children) == 0 {
+		return nil
+	}
+	out := make([]*Table, 0, len(children))
+	for _, oid := range children {
+		for _, t := range c.tables {
+			if t.OID == oid {
+				out = append(out, t)
+				break
+			}
+		}
+	}
+	return out
 }
 
 // PartitionChildren returns the OIDs of partition children for a partitioned table.

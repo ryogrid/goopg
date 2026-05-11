@@ -975,6 +975,29 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 			}
 		}
 	}
+	// Inheritance-aware scan (M0096-0009): when scanning a table that has
+	// inheritance children, produce a UNION ALL of SeqScans over the parent
+	// AND all children.  Unlike partitioned tables (where the parent has no
+	// rows), an inherited parent may itself contain rows, so the parent scan
+	// is always included first.
+	if im, ok := cat.(*catalog.InMemory); ok {
+		children := im.InheritanceChildren(tbl.OID)
+		if len(children) > 0 {
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
+			var root Node = parentScan
+			for _, child := range children {
+				childSchema := tableSchemaWithSource(b.table, sourceIdx)
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
+				root = &SetOp{
+					pos:   rv.Pos(),
+					Left:  root,
+					Right: childScan,
+					All:   true,
+				}
+			}
+			return root, b, nil
+		}
+	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
 

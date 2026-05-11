@@ -235,19 +235,48 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		return o.execCreateTableAs(s)
 	}
 
-	cols := make([]catalog.Column, len(s.Columns))
-	for i, c := range s.Columns {
-		cols[i] = catalog.Column{
+	// Build the column list, merging inherited columns first (M0096-0009).
+	// For `CREATE TABLE child () INHERITS (parent)`, the child table starts
+	// with all of the parent's columns, then any additional columns defined
+	// in the child's body are appended.
+	var cols []catalog.Column
+	var inheritParents []*catalog.Table // collect for post-creation registration
+	if len(s.Inherits) > 0 {
+		for _, parentName := range s.Inherits {
+			parent, ok := o.ctx.Catalog.LookupTable(parentName)
+			if !ok {
+				// Parent might not exist yet or may be a virtual table; skip silently.
+				continue
+			}
+			inheritParents = append(inheritParents, parent)
+			// Append parent columns (deep copy to avoid aliasing).
+			for _, pc := range parent.Columns {
+				c := pc
+				cols = append(cols, c)
+			}
+		}
+	}
+	// Append any columns explicitly declared in the CREATE TABLE body.
+	for _, c := range s.Columns {
+		cols = append(cols, catalog.Column{
 			Name:            c.Name,
 			Type:            catalog.Type{Name: strings.ToLower(c.Type.Name), Args: append([]int64(nil), c.Type.Args...)},
 			NotNull:         c.NotNull,
 			GeneratedExpr:   c.GeneratedExpr,
 			GeneratedAlways: c.GeneratedAlways,
-		}
+		})
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Register inheritance relationships now that the child OID is known.
+	if len(inheritParents) > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			for _, parent := range inheritParents {
+				im.RegisterInheritanceChild(parent.OID, tbl.OID)
+			}
+		}
 	}
 	// If PARTITION BY, annotate the table with partition metadata
 	if s.PartitionBy != nil {

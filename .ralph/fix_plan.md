@@ -429,10 +429,14 @@ alongside the suite.
       Verification: eval-plan-qual setup now completes (spec times out on blocking
       rather than failing at syntax). All core unit tests PASS.
 
-- [ ] **M0096-0009** — Implement table inheritance
-      (`CREATE TABLE child () INHERITS (parent)`): DDL parsing,
-      catalog inheritance chain, scans that include child tables.
-      Unblocks: `eval-plan-qual`, `eval-plan-qual-trigger`.
+- [x] **M0096-0009** — Table inheritance (`INHERITS`). 2026-05-12.
+      Design doc: `docs/design/0096-0009-table-inheritance.md`.
+      Catalog: `inheritanceChildren` map + `RegisterInheritanceChild` +
+      `InheritanceChildren` helpers.  Executor DDL: column-copy from all
+      parents into child before `CreateTable`, then register child OID with
+      each parent.  Planner: inheritance-aware scan builds
+      `SeqScan(parent) UNION ALL SeqScan(c1) UNION ALL …` in `planScanRangeVar`.
+      All core unit tests pass.
 
 - [ ] **M0096-0010** — Implement `MERGE INTO target USING source ON cond
       WHEN MATCHED THEN UPDATE/DELETE WHEN NOT MATCHED THEN INSERT`.
