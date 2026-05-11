@@ -1269,6 +1269,15 @@ func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
 	var ptr storage.ItemPointer
 
+	// M0093: lazily materialise the transaction's XID before any
+	// xmin stamp. ToastLargeColumnsIfNeeded may itself call
+	// NewHeapTuple for the TOAST chunk relation; doing this at the
+	// top covers both the TOAST writes and the main-heap NewHeapTuple
+	// below.
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return ptr, err
+	}
+
 	// TOAST oversized column values before encoding (M0046-0006).
 	var toastErr error
 	row, toastErr = ToastLargeColumnsIfNeeded(ctx, rel, cols, row)
