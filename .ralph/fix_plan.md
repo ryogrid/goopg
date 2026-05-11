@@ -398,6 +398,219 @@ alongside the suite.
       test functions from M0096-0001, confirm every spec reports `pass`.
       Fix any remaining output-normalization or row-ordering mismatches.
 
+## M0097 — pg_regress Coverage: Feature Parity & Test Pass (filed 2026-05-12)
+
+Goal: Work through all **232** cases in `docs/test-port/upstream-regress-coverage.md`
+(all currently `defer`).  Each case either reaches `port` status (output
+matches expected after normalization) or is formally reclassified as
+`excluded` (out of scope for goopg v0).
+
+**Runner status**: `internal/testport/framework/regress.go` provides
+`DiscoverRegressCases` / `RunRegressSubset` / `NormalizeRegressOutput`
+and the `RegressExecutor` interface, but **no Go test currently calls it**.
+M0097-0001 wires it up.
+
+**Scope split (approximate)**:
+- PASS-target: ~130 tests (core SQL, DML, DDL, types, functions)
+- Excluded: ~102 tests (geometric types, FTS, advanced AM, collation,
+  encoding-specific, FDW, large objects, XML, psql client, row security,
+  parallel, event triggers, network types, catalog sanity checks, complex
+  AM extensions, replication catalog, etc.)
+
+### Sub-milestones
+
+- [ ] **M0097-0001** — Wire up `TestPort_RegressSuite` in
+      `internal/testport/` with a concrete `ClusterRegressExecutor`
+      (connects to a live goopg cluster via `database/sql`), pre-runs
+      `test_setup.sql` to materialise the shared tables used by most
+      cases (`INT2_TBL`, `INT4_TBL`, `FLOAT8_TBL`, etc.), and surfaces
+      per-case pass/defer/excluded results as subtests.
+      Also add a `NormalizeRegressOutput` extension pass for goopg-
+      specific divergences (e.g., column-name casing, error message
+      wording differences).
+
+- [ ] **M0097-0002** — Formally reclassify ~102 tests as `excluded` in
+      `docs/test-port/upstream-regress-coverage.md` and in the suite
+      runner's policy table.  Excluded categories:
+      • Geometric types: `box`, `circle`, `geometry`, `line`, `lseg`,
+        `path`, `point`, `polygon` (8)
+      • Full-text search: `tsdicts`, `tsearch`, `tsrf`, `tstypes` (4)
+      • Advanced AM / exotic index: `brin`, `brin_bloom`, `brin_multi`,
+        `gin`, `gist`, `spgist`, `amutils`, `create_am`,
+        `create_index_spgist` (9)
+      • Collation / encoding: `collate`, `collate.icu.utf8`,
+        `collate.linux.utf8`, `collate.utf8`, `collate.windows.win1252`,
+        `euc_kr`, `encoding`, `unicode`, `copyencoding` (9)
+      • External / infra features: `foreign_data`, `largeobject`,
+        `indirect_toast`, `compression`, `tablespace`, `tablesample`,
+        `async`, `numa`, `object_address`, `maintain_every` (10)
+      • XML / advanced JSON: `xml`, `xmlmap`, `sqljson`,
+        `sqljson_jsontable`, `sqljson_queryfuncs`, `json_encoding`,
+        `jsonpath_encoding` (7)
+      • Security & roles: `rowsecurity`, `privileges`, `security_label`,
+        `init_privs`, `password`, `roleattributes`, `create_role` (7)
+      • Parallel: `select_parallel`, `write_parallel`,
+        `vacuum_parallel` (3)
+      • Event triggers: `event_trigger`, `event_trigger_login` (2)
+      • psql client: `psql`, `psql_crosstab`, `psql_pipeline` (3)
+      • Network types: `inet`, `macaddr`, `macaddr8` (3)
+      • Catalog sanity: `misc_sanity`, `opr_sanity`, `type_sanity`,
+        `oidjoins`, `sanity_check` (5)
+      • Complex AM / type extensions: `create_aggregate`, `create_cast`,
+        `create_operator`, `drop_operator`, `alter_operator`,
+        `alter_generic`, `polymorphism`, `create_type`, `create_misc`,
+        `regproc` (10)
+      • Replication catalog: `publication`, `subscription`,
+        `replica_identity` (3)
+      • C-language functions: `create_function_c` (1)
+      • Misc out-of-scope: `bit`, `bitmapops`, `conversion`, `combocid`,
+        `dependency`, `reloptions`, `hash_func`, `predicate`, `stats`,
+        `stats_ext`, `stats_import`, `typed_table`, `memoize`,
+        `without_overlaps`, `money`, `namespace`, `database`,
+        `infinite_recurse`, `create_schema`, `create_misc` (20+)
+
+- [ ] **M0097-0003** — Core standalone + scalar type parity.
+      Target tests: `boolean`, `comments`, `errors`, `numerology`,
+      `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,
+      `numeric`, `numeric_big`, `char`, `varchar`, `text`, `uuid`,
+      `random`.
+      Work: fix type-coercion edge cases, `pg_input_is_valid` /
+      `pg_input_error_info` stubs, `float4`/`float8` `NaN`/`Inf`
+      literal handling, bool input syntax variants (`'t'`, `'yes'`,
+      `'on'`), numeric literal prefixes (`0x`, `0b`, `0o`), `name`
+      type output.
+
+- [ ] **M0097-0004** — Date / time type parity.
+      Target tests: `date`, `time`, `timestamp`, `timestamptz`,
+      `timetz`, `interval`, `horology`.
+      Work: fill out date/time arithmetic operators, interval I/O,
+      timezone handling, `to_char` / `to_timestamp` format patterns,
+      `date_trunc`, `date_part`, `extract`, `age`, `now()` aliases.
+
+- [ ] **M0097-0005** — Core SELECT + DML parity.
+      Target tests: `select`, `select_distinct`, `select_distinct_on`,
+      `select_having`, `select_implicit`, `select_into`, `insert`,
+      `update`, `delete`, `returning`, `limit`, `union`, `errors`
+      (some overlap with 0003), `explain`, `expressions`.
+      Work: `ORDER BY USING operator` syntax, `SELECT INTO`,
+      `EXCEPT ALL` / `INTERSECT ALL`, `EXPLAIN` output normalization,
+      `expressions` function coverage (overlay, substring variants).
+
+- [ ] **M0097-0006** — JOIN + subquery + CTE parity.
+      Target tests: `join`, `join_hash`, `subselect`, `with`,
+      `equivclass`, `functional_deps`.
+      Work: lateral joins (`LATERAL`), `NATURAL JOIN`, anti-join
+      output format, recursive CTE edge cases, `DISTINCT ON` in
+      subqueries, equivalence-class planner improvements.
+
+- [ ] **M0097-0007** — Aggregate + window + CASE + sort parity.
+      Target tests: `aggregates`, `window`, `case`, `groupingsets`,
+      `tuplesort`, `incremental_sort`.
+      Work: `FILTER (WHERE ...)` in aggregates, ordered-set aggregates
+      (`percentile_cont`, `mode`), `WITHIN GROUP`, window frame
+      `RANGE/GROUPS`, `CASE` with subqueries, `GROUPING SETS` /
+      `ROLLUP` / `CUBE`, sort-key collation output format.
+
+- [ ] **M0097-0008** — Core DDL + index parity.
+      Target tests: `create_table`, `create_table_like`, `create_index`,
+      `alter_table`, `drop_if_exists`, `truncate`, `temp`,
+      `btree_index`, `index_including`, `hash_index`, `reloptions`
+      (partial), `fast_default`.
+      Work: `CREATE TABLE LIKE … INCLUDING ALL`, `CREATE INDEX
+      … INCLUDE (cols)`, `ALTER TABLE … ADD/DROP/ALTER COLUMN` edge
+      cases, `CREATE INDEX CONCURRENTLY` (sync impl), `REINDEX`
+      stub (see M0095-0005), temporary table scoping, `UNLOGGED`
+      table syntax acceptance, `DEFAULT` expression coercion.
+
+- [ ] **M0097-0009** — COPY + sequences + identity + generated columns.
+      Target tests: `copy`, `copy2`, `copydml`, `copyselect`,
+      `sequence`, `identity`, `generated_stored`, `generated_virtual`.
+      Work: `COPY TO STDOUT` format options, `COPY … WHERE`, sequence
+      functions (`nextval`, `currval`, `setval`, `lastval`),
+      `GENERATED ALWAYS AS IDENTITY`, `GENERATED ALWAYS AS (expr)
+      STORED` and `VIRTUAL` column variants.
+
+- [ ] **M0097-0010** — Transactions + PREPARE + locking parity.
+      Target tests: `transactions`, `mvcc`, `lock`, `prepare`,
+      `plancache`, `prepared_xacts`, `portals`, `portals_p2`,
+      `advisory_lock`, `tid`, `tidscan`, `tidrangescan`.
+      Work: `LOCK TABLE` statement, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
+      coverage, `PREPARE` / `EXECUTE` / `DEALLOCATE`, cursor
+      (`DECLARE … CURSOR`, `FETCH`, `MOVE`, `CLOSE`), TID scans
+      (`WHERE ctid = '(0,1)'`), `PREPARE TRANSACTION` syntax acceptance.
+
+- [ ] **M0097-0011** — String functions + regex + misc functions parity.
+      Target tests: `strings`, `regex`, `md5`, `misc_functions`,
+      `misc`.
+      Work: string continuation syntax, Unicode escape sequences,
+      `E'...'` literals, `LIKE`/`ILIKE`/`SIMILAR TO` edge cases,
+      POSIX regex (`~`, `~*`, `!~`, `!~*`), `regexp_*` functions,
+      `overlay()`, `format()`, hash functions (`md5`, `sha256`),
+      `pg_typeof`, `generate_series` overloads.
+
+- [ ] **M0097-0012** — Functions + PL/pgSQL parity.
+      Target tests: `create_function_sql`, `create_procedure`,
+      `plpgsql`, `rangefuncs`, `misc_functions` (overlap with 0011).
+      Work: SQL-language functions with multiple statements, `CALL`
+      for stored procedures, PL/pgSQL `FOR … IN SELECT`, `EXECUTE`
+      dynamic SQL, `RAISE` levels, exception handlers, `RETURNS TABLE`,
+      `RETURNS SETOF`, `RETURN NEXT`.
+
+- [ ] **M0097-0013** — Views + materialized views + rules parity.
+      Target tests: `create_view`, `select_views`, `updatable_views`,
+      `rules`, `matview`.
+      Work: `CREATE OR REPLACE VIEW`, view column aliases, `CHECK
+      OPTION`, updatable view DML routing, `CREATE RULE`,
+      `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW
+      [CONCURRENTLY]`.
+
+- [ ] **M0097-0014** — Constraints + FK + triggers + inheritance parity.
+      Target tests: `constraints`, `foreign_key`, `triggers`,
+      `inherit`, `indexing`.
+      Work: `CHECK` constraint evaluation, deferred FK modes,
+      `ON DELETE CASCADE / SET NULL / SET DEFAULT`, trigger
+      `NEW`/`OLD` records in PL/pgSQL bodies, `AFTER`/`BEFORE`/
+      `INSTEAD OF` trigger types, inheritance scan + INSERT routing,
+      `CREATE TABLE … INHERITS`.
+
+- [ ] **M0097-0015** — Partitioned tables parity.
+      Target tests: `partition_prune`, `partition_join`,
+      `partition_aggregate`, `partition_info`, `hash_part`.
+      Work: `CREATE TABLE … PARTITION BY LIST/RANGE/HASH`,
+      `CREATE TABLE … PARTITION OF … FOR VALUES`, partition pruning
+      in planner, partition-wise aggregation, partition-wise join.
+      (Depends on M0096-0007.)
+
+- [ ] **M0097-0016** — ON CONFLICT + MERGE parity.
+      Target tests: `insert_conflict`, `merge`.
+      Work: `INSERT … ON CONFLICT DO UPDATE` with functional conflict
+      targets (`ON CONFLICT (lower(col))`), `ON CONFLICT ON CONSTRAINT
+      name`, `MERGE` statement (depends on M0096-0010).
+
+- [ ] **M0097-0017** — Extended type parity.
+      Target tests: `arrays`, `json`, `jsonb`, `jsonb_jsonpath`,
+      `jsonpath`, `rangetypes`, `multirangetypes`, `enum`, `domain`,
+      `rowtypes`, `interval` (overlap 0004), `pg_lsn`, `txid`, `xid`.
+      Work: array type I/O + operators (`@>`, `&&`, `||`), JSON
+      operators (`->`, `->>`), `jsonb_path_query*` functions, range
+      type constructors and operators, `CREATE TYPE … AS ENUM`,
+      `CREATE DOMAIN`, composite row type I/O, `pg_lsn` comparison,
+      `txid_current()`.
+
+- [ ] **M0097-0018** — System catalog + GUC + vacuum parity.
+      Target tests: `sysviews`, `dbsize`, `guc`, `reindex_catalog`,
+      `vacuum`, `vacuum_parallel` (excluded), `misc`, `xid`.
+      Work: additional `pg_catalog` views (`pg_tables`,
+      `pg_indexes`, `pg_views`, `information_schema` stubs),
+      `pg_database_size`, `pg_relation_size`, `pg_column_size`,
+      `SET`/`RESET` GUC handling, `VACUUM (FULL, ANALYZE, VERBOSE)`,
+      `REINDEX TABLE` executor stub.
+
+- [ ] **M0097-0019** — Final confirmation: update
+      `docs/test-port/upstream-regress-coverage.md` with final
+      `port` / `excluded` / `defer` status for all 232 cases.
+      Confirm PASS for all non-excluded, non-deferred tests.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
