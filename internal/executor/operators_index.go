@@ -62,6 +62,48 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 	return storage.HeapTuple{}, 0, false
 }
 
+// followHOTChainNoCopy mirrors followHOTChain but uses the no-copy
+// PageGetHeapTupleNoCopy variant. Caller MUST hold the page's
+// content RLock for the lifetime of the returned tuple — the
+// returned tuple.Data aliases the page bytes (M0092-0006).
+func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID) (storage.HeapTuple, uint16, bool) {
+	const maxChain = 64
+	cur := startSlot
+	for i := 0; i < maxChain; i++ {
+		item, err := storage.PageGetItemID(page, cur)
+		if err != nil {
+			return storage.HeapTuple{}, 0, false
+		}
+		if item.Flags == storage.ItemIDRedirect {
+			next := item.Offset
+			if next == cur {
+				return storage.HeapTuple{}, 0, false
+			}
+			cur = next
+			continue
+		}
+		if item.Flags != storage.ItemIDNormal {
+			return storage.HeapTuple{}, 0, false
+		}
+		t, err := storage.PageGetHeapTupleNoCopy(page, cur)
+		if err != nil {
+			return storage.HeapTuple{}, 0, false
+		}
+		if mvcc.TupleVisible(t.Header, snap, xid) {
+			return t, cur, true
+		}
+		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
+			return storage.HeapTuple{}, 0, false
+		}
+		next := t.Header.CTID.Offset
+		if next == cur {
+			return storage.HeapTuple{}, 0, false
+		}
+		cur = next
+	}
+	return storage.HeapTuple{}, 0, false
+}
+
 type indexScanOp struct {
 	plan *planner.IndexScan
 	ctx  *Context
@@ -274,11 +316,17 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		if err != nil {
 			return nil, err
 		}
+		// M0092-0006: hold the RLock across decode so we can use
+		// followHOTChainNoCopy → tuple.Data aliases the page bytes.
+		// The RLock blocks heap writers on this page for the
+		// duration of one tuple decode (~hundreds of ns for int
+		// rows, ~µs for wide rows) — bounded write-starvation,
+		// acceptable per the M0091-0002 audit.
 		slot.RLock()
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
-		slot.RUnlock()
-		o.ctx.Pool.Unpin(slot)
+		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
 		if !found {
+			slot.RUnlock()
+			o.ctx.Pool.Unpin(slot)
 			// Tuple invisible (deleted / not yet committed at snap);
 			// skip this TID and try the next.
 			continue
@@ -286,8 +334,11 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
 			o.scanRow = acquireRow(len(o.plan.Table.Columns))
 		}
-		if err := DecodeRowInto(o.scanRow, o.plan.Table.Columns, tuple.Data); err != nil {
-			return nil, err
+		decErr := DecodeRowInto(o.scanRow, o.plan.Table.Columns, tuple.Data)
+		slot.RUnlock()
+		o.ctx.Pool.Unpin(slot)
+		if decErr != nil {
+			return nil, decErr
 		}
 		row := o.scanRow
 		if needsDetoast(row) {
