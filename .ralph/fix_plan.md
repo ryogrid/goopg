@@ -3046,13 +3046,38 @@ spec).
       SIGKILL repro on 2026-05-11.
       `docs/milestones/0088-wal-torn-tail-recovery.md`.
 
-- [ ] **M0089** — Checkpoint + stop durability + data-file
-      fsync (wire `Manager.Sync` into checkpoint, audit
-      dirty-tracking on extend, implicit shutdown
-      checkpoint). Surfaced by pgbench `standard` →
-      restart → `simple-update` chain on 2026-05-11
-      (post-restart `short read at block`).
+- [x] **M0089** — Checkpoint + stop durability + data-file
+      fsync. All three durability boundaries landed 2026-05-11:
+      - M0089-0001 (5745875): `Manager.SyncAll` wired into
+        `Checkpointer.runCheckpoint` via the new
+        `dataFileSyncer` interface.
+      - M0089-0003 (5745875): implicit `CheckpointNow()` inside
+        `OnStop` so `goopg stop` alone is sufficient.
+      - M0089-0002 (this commit): final synchronous
+        `CheckpointNow()` at the top of `Runtime.Close`. Closes
+        the window between OnStop's checkpoint and process exit
+        (during which `runCancel`'s async propagation lets
+        clients keep committing). Unit-pinned by
+        `internal/initdb/close_checkpoint_test.go`.
       `docs/milestones/0089-checkpoint-stop-durability-and-fsync.md`.
+
+      The scale-100 pgbench symptom that originally drove this
+      milestone PERSISTS after the fix; investigation showed it
+      is caused by separate bugs (history INSERTs at scale 100
+      lost; UPDATE leaves duplicate visible rows). Those are
+      tracked under M0090.
+
+- [ ] **M0090** — pgbench scale-100 MVCC + INSERT bugs.
+      `pgbench_history` heap stays at 0 bytes through a
+      scale-100 standard run despite 12,000+ committed
+      transactions; `pgbench_branches` / `pgbench_tellers`
+      accumulate duplicate visible rows (UPDATE not properly
+      stamping xmax — likely the 18c60d9 / 2c1e18e race-skip
+      policy is too permissive for the UPDATE side). Symptom is
+      pgbench reporting an inflated auto-detected scale post-
+      standard, leading to `short read at block` on subsequent
+      simple-update runs against the same data dir.
+      `docs/milestones/0090-pgbench-scale-100-mvcc-and-insert-bugs.md`.
 
 ## Notes
 

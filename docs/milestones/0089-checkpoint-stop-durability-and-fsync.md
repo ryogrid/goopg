@@ -1,8 +1,11 @@
 # Milestone 0089 — Checkpoint + stop durability + data-file fsync
 
-**Status:** partial — M0089-0001 + M0089-0003 landed
-2026-05-11; M0089-0002 (the load-bearing dirty-tracking-on-extend
-audit) still required.
+**Status:** all three durability hardening pieces landed
+2026-05-11 (M0089-0001 + M0089-0002 + M0089-0003). The
+pgbench scale-100 symptom that originally drove this milestone
+PERSISTS, but post-investigation it is now known to be caused by
+a separate set of bugs (history INSERTs not reaching heap, and
+UPDATE-side MVCC duplicates) tracked under M0090.
 **Depends on:** M0079 (catalog DDL WAL recovery), M0080 (heap WAL
 parity + VM/FSM persistence)
 **Drives:** clean stop+restart durability for write-heavy
@@ -89,9 +92,59 @@ by `Pool.SyncAllDataFiles`).
 `Checkpointer.CheckpointNow()` before `runCancel()`. Users no
 longer need to chain `goopg checkpoint && goopg stop`.
 
-**M0089-0002 (dirty-tracking-on-extend audit)** — STILL REQUIRED.
-Post-fix pgbench re-measurement (2026-05-11 08:35) reproduces
-the bug at scale 100 with `-c 100`:
+**M0089-0002 (final checkpoint in Runtime.Close)** — LANDED in
+the 2026-05-11 retry commit. Added a synchronous
+`Checkpointer.CheckpointNow()` at the very top of
+`Runtime.Close` (`internal/initdb/open.go`). This closes the
+durability window between the M0089-0003 OnStop checkpoint
+(which runs while clients may still be active because
+`runCancel` is asynchronous) and the eventual file-handle
+release. A unit test
+(`internal/initdb/close_checkpoint_test.go::TestRuntimeCloseTriggersFinalCheckpoint`)
+pins the behaviour: a btree entry inserted into a fresh Runtime
+survives `Close` + reopen with no explicit checkpoint by the
+caller. The previous behaviour silently relied on the OS page
+cache to bridge same-host restarts; the final close-checkpoint
+makes the post-stop state fully durable.
+
+The scale-100 pgbench symptom that drove the M0089 milestone is
+**NOT closed by this fix.** Post-fix repro shows the same
+symptom: `pgbench_history` is 0 bytes after a 180s standard run
+(despite 12,841 reported INSERT-bearing transactions), and a
+subsequent simple-update workload — even at `-c 1` —
+immediately errors with `ERROR: short read at block`. Further
+investigation reveals two separate bugs that are out of scope
+for M0089's "durability boundary at stop" theme:
+
+1. **`pgbench_history` INSERTs at scale 100 never reach the
+   heap file.** Scale-5 and scale-10 reproductions work
+   correctly (history grows + persists). At scale 100, the
+   on-disk file size stays at 0 bytes across the whole
+   workload, even though pgbench reports the transactions
+   committed. This is not a fsync issue (fsync of a 0-byte
+   file is still 0 bytes); it is an INSERT-path or
+   `writeHeapRow` routing issue triggered by scale or
+   concurrency, the mechanism of which is undetermined.
+
+2. **UPDATE leaves duplicate visible rows.** After the
+   standard run, `pgbench_branches` reports 1,610 visible
+   rows instead of 100 (scale 100), and `pgbench_tellers`
+   shows similar drift. This indicates UPDATE is not
+   properly stamping xmax / propagating MVCC visibility on
+   the old tuple version. pgbench autodetects "scaling
+   factor: 161" from the inflated count, leading to
+   simple-update sampling `aid` from `[1, 100000*161]` —
+   i.e., past the actual accounts data — which itself
+   contributes to the `short read at block` SELECT errors.
+
+These two bugs are tracked together under **M0090** (see
+`docs/milestones/0090-pgbench-scale-100-mvcc-and-insert-bugs.md`).
+M0089's durability work is complete; the remaining pgbench
+symptom requires M0090 to be picked up.
+Post-fix pgbench re-measurement (2026-05-11 09:53–09:57) STILL
+reproduces the bug at scale 100 with `-c 100`, but the cause is
+NOT a M0089 durability gap — see the M0089-0002 note above and
+M0090 for the actual investigation:
 - standard workload completes (69.48 TPS, 12,628 txns, 0 failed).
 - checkpoint + stop + restart leaves `pgbench_history` at 0 bytes
   and pgbench_accounts inconsistent with its pkey.

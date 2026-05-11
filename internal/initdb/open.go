@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1603,6 +1604,40 @@ func (r *Runtime) SaveFSM() error {
 func (r *Runtime) Close() error {
 	if r == nil {
 		return nil
+	}
+	// M0089-0002: synchronous final checkpoint while all
+	// background goroutines + the buffer pool are still attached.
+	// This is the load-bearing durability boundary: by the time
+	// Runtime.Close is called from main.go's defer, server.Run has
+	// already returned, all client connections are gone, and all
+	// in-flight transactions have committed/aborted. Any dirty
+	// pages remaining in the buffer pool reflect either (a) commits
+	// that landed AFTER the M0089-0003 OnStop checkpoint completed
+	// (the OnStop runCancel is asynchronous — workers can keep
+	// inserting until they observe the cancel), or (b) heap pages
+	// that the bgwriter never had time to flush.
+	//
+	// Without this checkpoint:
+	//  - Pool.Close calls FlushAll which pwrites dirty slots but
+	//    does NOT fsync the data files (M0089-0001's SyncAll is
+	//    wired into Checkpointer.runCheckpoint, not into Pool.Close).
+	//  - main.go persists FSM/VM state to disk AFTER all this,
+	//    capturing in-memory block references for pages whose
+	//    content lives only in the OS page cache. A subsequent
+	//    open finds the FSM pointing at blocks the heap file is
+	//    too short to contain — surfacing as `ERROR: short read
+	//    at block` on the next workload.
+	//
+	// Errors here are logged but do not abort Close — file handles
+	// must still be released so the process can exit cleanly.
+	if r.Checkpointer != nil {
+		if err := r.Checkpointer.CheckpointNow(); err != nil {
+			slog.Default().Warn(
+				"final shutdown checkpoint failed",
+				"err", err,
+				"note", "data files may not be fully durable on disk",
+			)
+		}
 	}
 	// Stop the background page-writer before draining the pool (M0048-0003).
 	if r.bgwriter != nil {
