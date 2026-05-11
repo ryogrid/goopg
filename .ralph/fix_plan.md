@@ -280,6 +280,124 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       Unblocks: `TestPort_Scripts010Clusterdb`, `011`.
       CSV: D-005j → port, D-005k → port.
 
+## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
+
+Goal: Make all 21 READ-COMMITTED-targeted isolation specs listed in
+`docs/test-port/executable-isolation-tests.md` PASS via
+`IsolationRunner.RunAndCompare`.  All 21 currently defer (skip) inside
+`TestPort_IsolationSuite`; they are the strongest proxy for goopg's
+READ COMMITTED correctness story.
+
+**Current blocker map** (21 specs → feature groups):
+
+| Feature gap | Blocks |
+|---|---|
+| `BEGIN [WORK] ISOLATION LEVEL <level>` parser | all 21 (used in every session setup block) |
+| `pg_advisory_lock / unlock / unlock_all / xact_lock / try_xact_lock` | `lock-committed-update`, `lock-committed-keyupdate`, `insert-conflict-specconflict` |
+| `FOR KEY SHARE` / `FOR NO KEY UPDATE` locking syntax | `lock-committed-keyupdate`, `partition-key-update-1–4` |
+| ON CONFLICT executor correctness (parser exists) | `insert-conflict-do-update` (1–4), `insert-conflict-do-nothing` |
+| `CREATE TABLE … PARTITION BY LIST/RANGE` + `PARTITION OF` | `partition-key-update-1–4`, `fk-snapshot`, `merge-*`, `eval-plan-qual` |
+| `GENERATED ALWAYS AS (expr) STORED` columns | `eval-plan-qual` |
+| Table `INHERITS` | `eval-plan-qual`, `eval-plan-qual-trigger` |
+| `MERGE INTO … USING … ON … WHEN MATCHED/NOT MATCHED` | `merge-update/delete/insert-update/match-recheck/join` (5 specs) |
+| Inline `REFERENCES` FK column constraint (CREATE TABLE) | `partition-key-update-2/3/4`, `fk-snapshot` |
+| `CREATE TRIGGER` + PL/pgSQL trigger bodies | `eval-plan-qual-trigger`, `partition-key-update-3/4`, `fk-snapshot` |
+| `DROP INDEX CONCURRENTLY` syntax | `drop-index-concurrently-1` |
+
+Parallel-connection note: `TestPort_IsolationSuite` runs all specs with
+`t.Parallel()` and many concurrently exhaust the server's connection
+limit; dedicated sequential test functions (M0096-0001) are required
+alongside the suite.
+
+### Sub-milestones
+
+- [ ] **M0096-0001** — Add 21 dedicated sequential (non-parallel) Go test
+      functions in `internal/testport/isolation_port_test.go`, one per
+      spec, mirroring `TestPort_IsolationLockCommittedUpdate`.  All start
+      as defer/skip; this anchors observability as features land.
+      Spec list: `eval-plan-qual`, `eval-plan-qual-trigger`,
+      `lock-committed-keyupdate`, `lock-committed-update`,
+      `insert-conflict-do-update` (×4), `insert-conflict-do-nothing`,
+      `insert-conflict-specconflict`, `drop-index-concurrently-1`,
+      `fk-snapshot`, `partition-key-update-1` through `4`,
+      `merge-update`, `merge-delete`, `merge-insert-update`,
+      `merge-match-recheck`, `merge-join`.
+
+- [ ] **M0096-0002** — Extend `parseBegin()` to accept
+      `[WORK | TRANSACTION] [ISOLATION LEVEL {READ COMMITTED |
+      REPEATABLE READ | SERIALIZABLE | READ UNCOMMITTED}]`.
+      Also add `SET TRANSACTION ISOLATION LEVEL <level>` statement.
+      Wire both into the session executor's existing `SetIsolationLevel`.
+      This is a pure parser + thin executor change; it unblocks parsing
+      for all 21 specs.
+
+- [ ] **M0096-0003** — Implement `pg_advisory_lock(key bigint)`,
+      `pg_advisory_unlock(key bigint)`, `pg_advisory_unlock_all()`,
+      `pg_advisory_xact_lock(classid int, objid int)`,
+      `pg_try_advisory_xact_lock(classid int, objid int)` as built-in
+      functions backed by a session-scoped advisory lock table (in-memory
+      hash-map + global mutex for cross-session blocking).
+      Unblocks: `lock-committed-update`, `lock-committed-keyupdate`
+      (combined with M0096-0002 and M0096-0004).
+
+- [ ] **M0096-0004** — Extend SELECT locking parser for `FOR KEY SHARE`
+      and `FOR NO KEY UPDATE`; map both to existing `FOR SHARE` /
+      `FOR UPDATE` semantics in the executor (separate key-level lock
+      modes are out of scope for v0 — syntax parity is the goal).
+      Unblocks: `lock-committed-keyupdate`, `partition-key-update-1–4`
+      (locking path).
+
+- [ ] **M0096-0005** — Verify ON CONFLICT executor end-to-end and make
+      `insert-conflict-do-update` (×4) and `insert-conflict-do-nothing`
+      PASS.  Primary blocker is M0096-0002 (isolation-level BEGIN);
+      secondary: confirm upsert row-wait / blocking detection produces
+      the `<waiting …>` lines matching the expected `.out` files, fix
+      any output-format mismatches in `IsolationRunner`.
+
+- [ ] **M0096-0006** — Accept `DROP INDEX CONCURRENTLY` in the parser
+      (treat as synchronous DROP INDEX; true concurrent protocol is out
+      of scope).  Also verify `PREPARE name AS …` / `EXECUTE name` and
+      `SET enable_seqscan`, and `pg_settings` catalog view work (needed
+      by `drop-index-concurrently-1` setup).
+      Unblocks: `drop-index-concurrently-1`.
+
+- [ ] **M0096-0007** — Implement `CREATE TABLE … PARTITION BY LIST/RANGE`
+      and `CREATE TABLE child PARTITION OF parent FOR VALUES IN/FROM/TO`.
+      Minimum viable: DDL accepted + partition routing on INSERT +
+      partition-aware sequential scan.
+      Unblocks: `partition-key-update-1–4`, and provides the shared
+      prerequisite for `eval-plan-qual`, `fk-snapshot`, and all
+      `merge-*` specs.
+
+- [ ] **M0096-0008** — Implement `GENERATED ALWAYS AS (expr) STORED`
+      column definition: DDL parsing, stored-value computation on
+      INSERT/UPDATE, read-back in scans.
+      Unblocks: `eval-plan-qual` (setup block).
+
+- [ ] **M0096-0009** — Implement table inheritance
+      (`CREATE TABLE child () INHERITS (parent)`): DDL parsing,
+      catalog inheritance chain, scans that include child tables.
+      Unblocks: `eval-plan-qual`, `eval-plan-qual-trigger`.
+
+- [ ] **M0096-0010** — Implement `MERGE INTO target USING source ON cond
+      WHEN MATCHED THEN UPDATE/DELETE WHEN NOT MATCHED THEN INSERT`.
+      Unblocks: `merge-update`, `merge-delete`, `merge-insert-update`,
+      `merge-match-recheck`, `merge-join` (5 specs).
+
+- [ ] **M0096-0011** — Implement inline `REFERENCES table (cols)` column
+      constraint and table constraint in `CREATE TABLE` (FK enforcement
+      at INSERT/UPDATE/DELETE, deferred FK modes).
+      Unblocks: `partition-key-update-2/3/4`, `fk-snapshot`.
+
+- [ ] **M0096-0012** — Implement `CREATE TRIGGER … FOR EACH ROW EXECUTE
+      FUNCTION/PROCEDURE` + PL/pgSQL trigger body execution.
+      Unblocks: `eval-plan-qual-trigger`, `partition-key-update-3/4`,
+      `fk-snapshot`.
+
+- [ ] **M0096-0013** — End-to-end pass confirmation: run all 21 dedicated
+      test functions from M0096-0001, confirm every spec reports `pass`.
+      Fix any remaining output-normalization or row-ordering mismatches.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
