@@ -371,6 +371,10 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 	if len(s.Returning) > 0 {
 		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
 	}
+	// INSERT … SELECT: analyze the SELECT sub-statement and skip VALUES checks.
+	if s.Select != nil {
+		return analyzeSelectWithParent(s.Select, cat, nil)
+	}
 	if len(s.Rows) == 0 {
 		return analyzeError(s.Pos(), "42601", "INSERT requires at least one row")
 	}
@@ -1035,6 +1039,23 @@ func scopeRelMatches(rel scopeRel, table, schema string) bool {
 func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
 	if rv.Subquery != nil {
 		return synthesizeSubqueryTable(cat, rv)
+	}
+	// Table-valued function (M0096-0006): produce a synthetic table.
+	if rv.TableFunc != nil {
+		alias := rv.Alias
+		if alias == "" {
+			alias = rv.TableFunc.Name
+		}
+		colName := alias
+		if len(rv.Columns) > 0 {
+			colName = rv.Columns[0]
+		}
+		return &catalog.Table{
+			Name: alias,
+			Columns: []catalog.Column{
+				{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+			},
+		}, nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !ok {

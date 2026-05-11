@@ -935,7 +935,7 @@ func (o *ddlOp) autoIndexName(tbl *catalog.Table, columns []string, suffix strin
 
 func isInt4Type(name string) bool {
 	switch strings.ToLower(name) {
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial": // serial maps to int4 (M0096-0006)
 		return true
 	default:
 		return false
@@ -944,7 +944,7 @@ func isInt4Type(name string) bool {
 
 func isInt8Type(name string) bool {
 	switch strings.ToLower(name) {
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial": // bigserial maps to int8 (M0096-0006)
 		return true
 	default:
 		return false

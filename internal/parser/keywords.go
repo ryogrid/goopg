@@ -97,6 +97,9 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwParallel:     KwCatUnreserved,
 	KwReindex:      KwCatUnreserved,
 	KwCluster:      KwCatUnreserved,
+	KwPrepare:      KwCatUnreserved,
+	KwExecute:      KwCatUnreserved,
+	KwDeallocate:   KwCatUnreserved,
 
 	// goopg-specific (no upstream equivalent) — treated as unreserved.
 	KwConstant: KwCatUnreserved,

@@ -22,6 +22,8 @@ func Build(plan planner.Node) (Operator, error) {
 	switch p := plan.(type) {
 	case *planner.Values:
 		return maybeInstrument(p, newValuesOp(p)), nil
+	case *planner.GenerateSeries:
+		return maybeInstrument(p, newGenerateSeriesOp(p)), nil
 	case *planner.CTEScan:
 		// CTEScan is a labeling wrap from M0016-0004 — Stage A
 		// inlines the CTE body under the wrap, so executing it

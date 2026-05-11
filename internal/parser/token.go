@@ -223,6 +223,11 @@ const (
 
 	// M0095-0008: CLUSTER statement stub.
 	KwCluster Keyword = "cluster"
+
+	// M0096-0006: PREPARE / EXECUTE statements and DROP INDEX CONCURRENTLY.
+	KwPrepare  Keyword = "prepare"
+	KwExecute  Keyword = "execute"
+	KwDeallocate Keyword = "deallocate"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -363,6 +368,9 @@ var keywords = map[string]Keyword{
 	"any":          KwAny,
 	"reindex":      KwReindex,
 	"cluster":      KwCluster,
+	"prepare":      KwPrepare,
+	"execute":      KwExecute,
+	"deallocate":   KwDeallocate,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

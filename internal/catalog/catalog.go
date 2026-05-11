@@ -687,6 +687,49 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_tables"] = pgTables
+
+	// pg_settings — isolation specs use
+	// `SELECT setting FROM pg_settings WHERE name = 'default_transaction_isolation'`
+	// to detect the effective isolation level. Returns GUC-style rows.
+	// M0096-0006: minimal stub returning only the entries isolation specs query.
+	pgSettings := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_settings",
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "setting", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "unit", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "category", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "short_desc", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "extra_desc", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "context", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "vartype", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "source", Type: Type{Name: "text"}, Ordinal: 8},
+			{Name: "min_val", Type: Type{Name: "text"}, Ordinal: 9},
+			{Name: "max_val", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "enumvals", Type: Type{Name: "text"}, Ordinal: 11},
+			{Name: "boot_val", Type: Type{Name: "text"}, Ordinal: 12},
+			{Name: "reset_val", Type: Type{Name: "text"}, Ordinal: 13},
+			{Name: "sourcefile", Type: Type{Name: "text"}, Ordinal: 14},
+			{Name: "sourceline", Type: Type{Name: "int4"}, Ordinal: 15},
+			{Name: "pending_restart", Type: Type{Name: "bool"}, Ordinal: 16},
+		},
+		OID:     1259200, // synthetic
+		Virtual: true,
+	}
+	pgSettings.VirtualRows = func() [][]string {
+		// Minimal rows for isolation-spec chkiso step.
+		return [][]string{
+			{"default_transaction_isolation", "read committed", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the transaction isolation level of each new transaction.", "",
+				"user", "enum", "default", "", "", "{\"serializable\",\"repeatable read\",\"read committed\",\"read uncommitted\"}",
+				"read committed", "read committed", "", "", "f"},
+			{"enable_seqscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of sequential-scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+		}
+	}
+	c.tables["pg_catalog.pg_settings"] = pgSettings
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/

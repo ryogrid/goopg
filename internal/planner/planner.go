@@ -84,7 +84,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
 		*parser.ReindexStmt, *parser.ClusterStmt,
-		*parser.SetTransactionStmt:
+		*parser.SetTransactionStmt,
+		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CheckpointStmt:
@@ -847,6 +848,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 	if rv.Subquery != nil {
 		return planSubqueryRangeVar(rv, cat, sourceIdx)
 	}
+	if rv.TableFunc != nil {
+		return planTableFuncRangeVar(rv, cat, sourceIdx)
+	}
 	// CTE substitution (M0016-0002): an unschemed name takes the
 	// CTE before falling through to the catalog. CTE names are
 	// unschemed in upstream so `pg_catalog.foo` always hits the
@@ -1050,6 +1054,54 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
 	return inner, b, nil
+}
+
+// planTableFuncRangeVar plans a table-valued function in the FROM clause.
+// Currently only generate_series(start, stop[, step]) is supported.
+func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if !strings.EqualFold(tf.Name, "generate_series") {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
+			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
+	}
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "generate_series requires 2 or 3 arguments"}
+	}
+	ctx := &resolveContext{}
+	start, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	stop, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var step Expr
+	if len(tf.Args) == 3 {
+		step, err = resolveExpr(tf.Args[2], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "generate_series"
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+		},
+	}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int8"}, SourceTableIdx: sourceIdx}}
+	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
 }
 
 func deriveSubqueryTargetName(e parser.Expr) string {
@@ -2452,32 +2504,42 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 			colIndex = append(colIndex, col.Ordinal)
 		}
 	}
-	// Validate row arity and build planner expressions.
-	if len(s.Rows) == 0 {
-		return nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "INSERT requires at least one row"}
-	}
-	rows := make([][]Expr, 0, len(s.Rows))
-	for _, r := range s.Rows {
-		if len(r) != len(colIndex) {
-			return nil, &PlanError{
-				Pos:     s.Pos(),
-				Code:    "42601",
-				Message: fmt.Sprintf("INSERT row has %d values, target expects %d", len(r), len(colIndex)),
-			}
+	// INSERT … SELECT: plan the SELECT and use it as the source.
+	var source Node
+	if s.Select != nil {
+		sel, err := planSelect(s.Select, cat)
+		if err != nil {
+			return nil, err
 		}
-		row := make([]Expr, 0, len(r))
-		ctx := &resolveContext{} // VALUES rows have no input columns
-		for _, e := range r {
-			pe, err := resolveExpr(e, ctx)
-			if err != nil {
-				return nil, err
-			}
-			row = append(row, pe)
+		source = sel
+	} else {
+		// Validate row arity and build planner expressions.
+		if len(s.Rows) == 0 {
+			return nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "INSERT requires at least one row"}
 		}
-		rows = append(rows, row)
+		rows := make([][]Expr, 0, len(s.Rows))
+		for _, r := range s.Rows {
+			if len(r) != len(colIndex) {
+				return nil, &PlanError{
+					Pos:     s.Pos(),
+					Code:    "42601",
+					Message: fmt.Sprintf("INSERT row has %d values, target expects %d", len(r), len(colIndex)),
+				}
+			}
+			row := make([]Expr, 0, len(r))
+			ctx := &resolveContext{} // VALUES rows have no input columns
+			for _, e := range r {
+				pe, err := resolveExpr(e, ctx)
+				if err != nil {
+					return nil, err
+				}
+				row = append(row, pe)
+			}
+			rows = append(rows, row)
+		}
+		source = &Values{pos: s.Pos(), Rows: rows, schema: insertValuesSchema(tbl, colIndex)}
 	}
-	values := &Values{pos: s.Pos(), Rows: rows, schema: insertValuesSchema(tbl, colIndex)}
-	insert := &Insert{pos: s.Pos(), Table: tbl, Source: values, ColumnIndex: colIndex}
+	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex}
 	if s.OnConflict != nil {
 		oc, err := planOnConflict(s.OnConflict, tbl, s.Target.Alias, cat)
 		if err != nil {

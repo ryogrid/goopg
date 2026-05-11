@@ -86,3 +86,40 @@ func (c *connTxState) End() {
 	c.tx = mvcc.Transaction{}
 	c.mu.Unlock()
 }
+
+// preparedStatements stores named prepared SQL statements for this connection.
+// Keyed by statement name; value is the original SQL text.  Used to implement
+// PREPARE name AS … / EXECUTE name (M0096-0006).
+type preparedStatements struct {
+	mu    sync.Mutex
+	stmts map[string]string
+}
+
+func newPreparedStatements() *preparedStatements {
+	return &preparedStatements{stmts: make(map[string]string)}
+}
+
+func (ps *preparedStatements) Store(name, sql string) {
+	ps.mu.Lock()
+	ps.stmts[name] = sql
+	ps.mu.Unlock()
+}
+
+func (ps *preparedStatements) Lookup(name string) (string, bool) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	s, ok := ps.stmts[name]
+	return s, ok
+}
+
+func (ps *preparedStatements) Delete(name string) {
+	ps.mu.Lock()
+	delete(ps.stmts, name)
+	ps.mu.Unlock()
+}
+
+func (ps *preparedStatements) DeleteAll() {
+	ps.mu.Lock()
+	ps.stmts = make(map[string]string)
+	ps.mu.Unlock()
+}

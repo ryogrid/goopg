@@ -509,6 +509,27 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		return RangeVar{}, err
 	}
 	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
+
+	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
+	// Currently recognized: generate_series(start, stop[, step]).
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
+		obj.Schema == "" && strings.EqualFold(obj.Name, "generate_series") {
+		p.advance() // (
+		var args []Expr
+		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
+			a, err := p.parseExprList()
+			if err != nil {
+				return RangeVar{}, err
+			}
+			args = a
+		}
+		if !p.acceptSymbol(")") {
+			return RangeVar{}, p.errAtCur("expected ')' after function arguments")
+		}
+		rv.Name = ""
+		rv.TableFunc = &TableFuncRef{pos: obj.pos, Name: "generate_series", Args: args}
+	}
+
 	// Optional alias: AS ident, or bare ident for the "implicit alias"
 	// shorthand that pgbench uses (`pgbench_accounts a`).
 	if p.acceptKeyword(KwAs) {

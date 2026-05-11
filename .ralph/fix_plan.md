@@ -391,12 +391,20 @@ alongside the suite.
       to connTxState may be incomplete). The insert-conflict-do-update and do-nothing
       specs still defer. Re-open as follow-up if needed.
 
-- [ ] **M0096-0006** — Accept `DROP INDEX CONCURRENTLY` in the parser
-      (treat as synchronous DROP INDEX; true concurrent protocol is out
-      of scope).  Also verify `PREPARE name AS …` / `EXECUTE name` and
-      `SET enable_seqscan`, and `pg_settings` catalog view work (needed
-      by `drop-index-concurrently-1` setup).
-      Unblocks: `drop-index-concurrently-1`.
+- [x] **M0096-0006** — Unblocked `drop-index-concurrently-1` setup (2026-05-12).
+      Features implemented:
+      - INSERT … SELECT: parser (dml.go), analyzer, planner (planInsert routes to planSelect)
+      - generate_series(n,m) FROM clause SRF: TableFuncRef AST, parseRangeVar detection,
+        planTableFuncRangeVar → GenerateSeries plan node, generateSeriesOp executor, 
+        lookupTable/resolveTable analyzer support
+      - DROP INDEX CONCURRENTLY: parser accepts CONCURRENTLY keyword (no-op, same as synchronous)
+      - serial/bigserial column types: mapped to int4/int8 in isInt4Type/isInt8Type
+      - pg_settings virtual catalog view: returns default_transaction_isolation + enable_seqscan rows
+      - PREPARE name AS … / EXECUTE name / DEALLOCATE: parser keywords + AST + per-connection
+        preparedStatements store in conn_tx.go; dispatch handles PREPARE/EXECUTE/DEALLOCATE inline
+      - SET enable_seqscan: already in GUC registry (stub)
+      Verification: TestPort_IsolationDropIndexConcurrently1 now passes setup and runs the permutation
+      (defers on EXPLAIN EXECUTE plan format and other output differences). All core unit tests PASS.
 
 - [ ] **M0096-0007** — Implement `CREATE TABLE … PARTITION BY LIST/RANGE`
       and `CREATE TABLE child PARTITION OF parent FOR VALUES IN/FROM/TO`.

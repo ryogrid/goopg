@@ -665,6 +665,20 @@ type Values struct {
 func (n *Values) Pos() int       { return n.pos }
 func (n *Values) Output() Schema { return n.schema }
 
+// GenerateSeries produces a sequence of integer rows for
+// generate_series(start, stop[, step]) in the FROM clause.
+// M0096-0006.
+type GenerateSeries struct {
+	pos    int
+	Start  Expr
+	Stop   Expr
+	Step   Expr // nil means step=1
+	schema Schema
+}
+
+func (n *GenerateSeries) Pos() int       { return n.pos }
+func (n *GenerateSeries) Output() Schema { return n.schema }
+
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed
 // receive NULL (or their declared default once defaults are wired).

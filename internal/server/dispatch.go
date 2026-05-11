@@ -80,7 +80,7 @@ func maybeForceGCAfterCommit() {
 //
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
-func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState) error {
+func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
@@ -205,6 +205,47 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	}
 
 	for _, stmt := range stmts {
+		// Handle PREPARE / EXECUTE / DEALLOCATE inline (M0096-0006).
+		// These require per-connection state not available in the executor.
+		if ps, ok := stmt.(*parser.PrepareStmt); ok {
+			tag := "PREPARE"
+			if prepStmts != nil && ps.Name != "" {
+				// Store the raw SQL for later EXECUTE.  We reconstruct it
+				// from the original batch since the parsed form may lose
+				// position information for non-SELECT queries.
+				prepStmts.Store(ps.Name, sql)
+			}
+			if err := w.WriteCommandComplete(tag); err != nil {
+				return err
+			}
+			continue
+		}
+		if es, ok := stmt.(*parser.ExecuteStmt); ok {
+			if prepStmts != nil {
+				if prepSQL, found := prepStmts.Lookup(es.Name); found {
+					// Re-dispatch the stored SQL as a fresh query.
+					if err := s.dispatchSimpleQueryViaExecutor(ctx, w, sess, prepSQL, connTx, prepStmts); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", es.Name))
+		}
+		if ds, ok := stmt.(*parser.DeallocateStmt); ok {
+			if prepStmts != nil {
+				if ds.Name == "" {
+					prepStmts.DeleteAll()
+				} else {
+					prepStmts.Delete(ds.Name)
+				}
+			}
+			if err := w.WriteCommandComplete("DEALLOCATE"); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Refresh snapshot per statement for ReadCommitted parity.
 		snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
 		if err != nil {

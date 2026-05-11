@@ -35,7 +35,7 @@ type copyInState struct {
 	mgr      *mvcc.Manager
 }
 
-func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState) (*copyInState, error) {
+func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) (*copyInState, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -46,7 +46,7 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 	}
 	_, matchable, upper, empty := normalizeSimpleQuery(q)
 	if empty || !strings.HasPrefix(upper, "COPY ") {
-		if err := s.handleQuery(ctx, w, sess, payload, connTx); err != nil {
+		if err := s.handleQuery(ctx, w, sess, payload, connTx, prepStmts); err != nil {
 			return nil, err
 		}
 		return nil, nil

@@ -152,6 +152,38 @@ type ReindexStmt struct {
 func (s *ReindexStmt) Pos() int  { return s.pos }
 func (s *ReindexStmt) stmtNode() {}
 
+// PrepareStmt — `PREPARE name [(param_type, …)] AS query`.
+// M0096-0006: executor stores the query text keyed by name for later EXECUTE.
+type PrepareStmt struct {
+	pos   int
+	Name  string
+	Query Stmt // the SELECT/INSERT/UPDATE/DELETE being prepared
+}
+
+func (s *PrepareStmt) Pos() int  { return s.pos }
+func (s *PrepareStmt) stmtNode() {}
+
+// ExecuteStmt — `EXECUTE name [(param, …)]`.
+// M0096-0006: executor retrieves and runs the named prepared statement.
+type ExecuteStmt struct {
+	pos    int
+	Name   string
+	Params []Expr
+}
+
+func (s *ExecuteStmt) Pos() int  { return s.pos }
+func (s *ExecuteStmt) stmtNode() {}
+
+// DeallocateStmt — `DEALLOCATE [PREPARE] name | ALL`.
+// M0096-0006: removes a named prepared statement (or all).
+type DeallocateStmt struct {
+	pos  int
+	Name string // "" means ALL
+}
+
+func (s *DeallocateStmt) Pos() int  { return s.pos }
+func (s *DeallocateStmt) stmtNode() {}
+
 // ClusterStmt — `CLUSTER [VERBOSE] [tablename [USING indexname]]`.
 // M0095-0008: no-op executor stub.  When a table name is provided the
 // executor verifies the table exists; without a table it always succeeds.
@@ -279,13 +311,24 @@ func (r ResTarget) Pos() int { return r.pos }
 // case Name is empty and the parsed inner SELECT lives in
 // Subquery; the alias is required (matches upstream).
 type RangeVar struct {
-	pos      int
-	Schema   string
-	Name     string
-	Alias    string   // empty when no AS clause
-	Columns  []string // optional column-alias list: (SELECT …) AS t (c1, c2)
-	Subquery *SelectStmt
+	pos       int
+	Schema    string
+	Name      string
+	Alias     string   // empty when no AS clause
+	Columns   []string // optional column-alias list: (SELECT …) AS t (c1, c2)
+	Subquery  *SelectStmt
+	TableFunc *TableFuncRef // M0096-0006: table-valued function (e.g. generate_series)
 }
+
+// TableFuncRef is a table-valued function used in the FROM clause.
+// Currently only generate_series(start, stop [, step]) is recognised.
+type TableFuncRef struct {
+	pos  int
+	Name string
+	Args []Expr
+}
+
+func (r TableFuncRef) Pos() int { return r.pos }
 
 func (r RangeVar) Pos() int { return r.pos }
 
@@ -492,7 +535,8 @@ type InsertStmt struct {
 	With       *WithClause
 	Target     RangeVar
 	Columns    []string // empty when no column list — INSERT defaults to declared order
-	Rows       [][]Expr // each row is a parenthesised tuple
+	Rows       [][]Expr // each row is a parenthesised tuple; nil when Select != nil
+	Select     *SelectStmt // INSERT … SELECT support (M0096-0006); nil when Rows != nil
 	OnConflict *OnConflictClause
 	Returning  []ResTarget
 }

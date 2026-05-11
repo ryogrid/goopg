@@ -185,6 +185,12 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseReindex()
 	case KwCluster:
 		return p.parseCluster()
+	case KwPrepare:
+		return p.parsePrepare()
+	case KwExecute:
+		return p.parseExecute()
+	case KwDeallocate:
+		return p.parseDeallocate()
 	case KwShow:
 		return p.parseShow()
 	case KwSet:
@@ -1022,6 +1028,85 @@ func (p *parser) parseCluster() (Stmt, error) {
 	}
 
 	return c, nil
+}
+
+// parsePrepare: PREPARE name [(param_type, …)] AS query (M0096-0006)
+func (p *parser) parsePrepare() (Stmt, error) {
+	t := p.advance() // PREPARE
+	nameIdent, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	name := identText(nameIdent)
+	// Skip optional parameter type list: (type1, type2, …)
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance()
+		depth := 1
+		for depth > 0 && p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				depth++
+			} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				depth--
+			}
+			p.advance()
+		}
+	}
+	// Consume AS
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+		p.advance()
+	} else {
+		// Some clients omit AS, or use different spacing — try to continue.
+	}
+	// Parse the prepared query
+	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
+		return &PrepareStmt{pos: t.Pos, Name: name}, nil
+	}
+	query, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	return &PrepareStmt{pos: t.Pos, Name: name, Query: query}, nil
+}
+
+// parseExecute: EXECUTE name [(param, …)] (M0096-0006)
+func (p *parser) parseExecute() (Stmt, error) {
+	t := p.advance() // EXECUTE
+	nameIdent, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	name := identText(nameIdent)
+	var params []Expr
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance()
+		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
+			params, err = p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+	}
+	return &ExecuteStmt{pos: t.Pos, Name: name, Params: params}, nil
+}
+
+// parseDeallocate: DEALLOCATE [PREPARE] {name | ALL} (M0096-0006)
+func (p *parser) parseDeallocate() (Stmt, error) {
+	t := p.advance() // DEALLOCATE
+	_ = p.acceptKeyword(KwPrepare) // optional PREPARE keyword
+	name := ""
+	if p.acceptKeyword(KwAll) {
+		name = ""
+	} else {
+		nameIdent, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		name = identText(nameIdent)
+	}
+	return &DeallocateStmt{pos: t.Pos, Name: name}, nil
 }
 
 // parseReset: RESET name | RESET ALL

@@ -882,7 +882,8 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // another ReadyForQuery so the client can keep going.
 func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
 	extended := newExtendedState()
-	connTx := &connTxState{} // per-connection explicit transaction state (M0096-0005)
+	connTx := &connTxState{}         // per-connection explicit transaction state (M0096-0005)
+	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
 	var copyIn *copyInState
 	for {
 		if ctx.Err() != nil {
@@ -958,7 +959,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 					break
 				}
 			}
-			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload, connTx)
+			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload, connTx, prepStmts)
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {

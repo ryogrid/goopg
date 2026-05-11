@@ -1,16 +1,14 @@
 package parser
 
-// parseInsert: INSERT INTO target [(col, …)] VALUES (val, …) [, …]
+// parseInsert: INSERT INTO target [(col, …)] {VALUES (val, …) [, …] | SELECT …}
 // [ON CONFLICT …] [RETURNING target_list].
 //
 // pgbench emits:
 //
 //	INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
 //
-// so v0 supports the column list and one or more parenthesised value
-// tuples. INSERT … SELECT is deferred. The optional ON CONFLICT
-// tail (M0017-0001 step 1) parses every upstream shape — the
-// analyzer/planner narrow the supported subset by stage.
+// M0096-0006 adds INSERT … SELECT support.  The optional ON CONFLICT
+// tail (M0017-0001 step 1) parses every upstream shape.
 func (p *parser) parseInsert() (Stmt, error) {
 	t, err := p.expectKeyword(KwInsert)
 	if err != nil {
@@ -34,14 +32,27 @@ func (p *parser) parseInsert() (Stmt, error) {
 			return nil, p.errAtCur("expected ')'")
 		}
 	}
-	if _, err := p.expectKeyword(KwValues); err != nil {
-		return nil, err
+	// INSERT … SELECT or INSERT … VALUES
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+		sel, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if ss, ok := sel.(*SelectStmt); ok {
+			stmt.Select = ss
+		} else {
+			return nil, p.errAtCur("expected SELECT statement")
+		}
+	} else {
+		if _, err := p.expectKeyword(KwValues); err != nil {
+			return nil, err
+		}
+		rows, err := p.parseValuesRows()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Rows = rows
 	}
-	rows, err := p.parseValuesRows()
-	if err != nil {
-		return nil, err
-	}
-	stmt.Rows = rows
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 		oc, err := p.parseOnConflict()
 		if err != nil {
