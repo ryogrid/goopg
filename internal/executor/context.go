@@ -285,3 +285,46 @@ type Checkpointer interface {
 func NewContext() *Context {
 	return &Context{Now: time.Now()}
 }
+
+// MaterializeWriterXID ensures the context's transaction has a real
+// XID assigned. M0093 (PG-parity lazy XID allocation): the manager
+// no longer allocates an XID at Begin time; the first write site
+// must materialise one. Subsequent calls within the same transaction
+// short-circuit because c.Tx.XID is already non-zero.
+//
+// CRITICAL invariant — call this BEFORE any of:
+//
+//   - isConcurrentlyUpdated (M0090 concurrent-xmax race check). Calling
+//     after the check would silently feed it XID=0, producing false
+//     negatives that let orphan visible tuples slip through.
+//   - storage.NewHeapTuple(ctx.Tx.XID, ...) — would stamp xmin = 0
+//     (InvalidTransactionID), making the row invisible to every
+//     reader (treated as "no creator").
+//   - storage.PageSetHeapTupleXmax(p, slot, ctx.Tx.XID) — would
+//     stamp xmax = 0, leaving the old version visible forever.
+//   - storage.PageSetHeapTupleLockOnly(p, slot, ctx.Tx.XID, ...)
+//
+// Read-only paths (scans, snapshot construction, HOT-chain self-
+// visibility) tolerate XID=0 — they consult the snapshot's
+// InProgress list and never match `h.Xmin == 0`.
+//
+// When a *BasicSession is wired and we're at the top level (no
+// open savepoint), the session's cached tx.XID is updated too so
+// later savepoint AllocateSubXid calls see the real parent XID.
+func (c *Context) MaterializeWriterXID() error {
+	if c.TxnMgr == nil {
+		return &ExecError{Code: "XX000", Message: "executor: no TxnMgr in context"}
+	}
+	if c.Tx.XID != storage.InvalidTransactionID {
+		return nil
+	}
+	xid, err := c.TxnMgr.AssignXID(c.Tx)
+	if err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	c.Tx.XID = xid
+	if sess, ok := c.Session.(*BasicSession); ok {
+		sess.OnTopLevelXIDAssigned(xid)
+	}
+	return nil
+}

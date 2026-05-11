@@ -72,6 +72,24 @@ func (s *BasicSession) BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.S
 	s.inTx = true
 }
 
+// OnTopLevelXIDAssigned is invoked by Context.MaterializeWriterXID
+// after the top-level transaction's XID is lazily materialised
+// (M0093 Design B). It keeps the session's cached tx.XID in sync
+// so later savepoint AllocateSubXid calls — which consult
+// EffectiveWriterXID's top-level fallback — see the real parent
+// XID instead of zero. No-op when there's no open explicit
+// transaction or when the cached tx.XID is already set (e.g.
+// inside an active savepoint whose currentSubXid will mask the
+// top-level XID anyway).
+func (s *BasicSession) OnTopLevelXIDAssigned(xid storage.TransactionID) {
+	if !s.inTx {
+		return
+	}
+	if s.tx.XID == storage.InvalidTransactionID {
+		s.tx.XID = xid
+	}
+}
+
 func (s *BasicSession) EndExplicitTransaction() {
 	s.tx = mvcc.Transaction{}
 	s.snap = mvcc.Snapshot{}
