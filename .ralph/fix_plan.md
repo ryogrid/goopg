@@ -201,6 +201,85 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
       M0008: all 8 DoD items met via M0094-0001/0002/0003/0004 work plus prior
       M0008 implementation. Marked `complete`. `make ralph-state-guard` passes.
 
+## M0095 — Client-Tools TAP Test Porting (filed 2026-05-12)
+
+Goal: Port the 27-file client-tools-tap suite to Go and implement the
+missing engine features that currently hold ported scripts tests in a
+`t.Skip` state.  The list spans five tool families:
+
+  • `pg_basebackup` (010–040)  — WAL backup / receive / logical streaming
+  • `pg_checksums`  (001–002)  — online/offline checksum management
+  • `pg_controldata` (001)     — control-file inspection
+  • `pg_ctl`        (001–004)  — **already PASS**; no new work needed
+  • `pg_walsummary` (001–002)  — WAL summary generation
+  • `scripts`       (13 files, 010–200) — client utility commands
+
+`pg_ctl` 001–004 are already ported and PASS (`tap_port_test.go`).
+All 13 scripts tests are already ported but remain `t.Skip` due to
+missing SQL features; sub-milestones 0004–0008 implement those features.
+
+### Sub-milestones
+
+- [ ] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
+      `pg_walsummary/001` as Go tests in
+      `internal/testport/client_tools_port_test.go`.
+      `t.Skip` if binary not in PATH.  `pg_controldata/001` includes cluster
+      init + `pg_controldata <datadir>` output check (adapted from upstream
+      CRC-corruption sub-case).  New CSV rows: C-001, C-002, CD-001, WS-001.
+
+- [ ] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
+      as adapted Go test.  WAL summarization (`summarize_wal = on` /
+      `pg_available_wal_summaries()`) not yet implemented → skip with
+      explicit blocker comment; basic cluster-init + SQL portion passes.
+      New CSV row: WS-002.
+
+- [ ] **M0095-0003** — Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
+      as adapted Go tests in
+      `internal/testport/pgbasebackup_port_test.go`.
+      All five skip WAL-streaming / replication features with explicit blocker
+      messages; CLI option-validation sub-cases (e.g., `--help`, wrong-flag
+      error messages) pass.  New CSV rows: BB-010, BB-011, BB-020, BB-030,
+      BB-040.
+
+- [ ] **M0095-0004** — Implement VACUUM parenthesized option syntax
+      (`VACUUM (FULL, FREEZE, SKIP_DATABASE_STATS, ...) [table]`) in
+      `internal/parser/parser.go` + extend `VacuumStmt`.  Also add
+      `pg_catalog.pg_namespace` catalog view required by the table-discovery
+      query vacuumdb issues.
+      Unblocks: `TestPort_Scripts100Vacuumdb`, `101`, `102`.
+      CSV: D-005a → port, D-005b → port, D-005c → port (partial; `--all`
+      multi-DB stays deferred).
+
+- [ ] **M0095-0005** — Add `REINDEX` parser+executor stub
+      (`REINDEX [CONCURRENTLY] (INDEX|TABLE|DATABASE|SCHEMA) name`).
+      Executor performs a no-op rebuild (accept + return success) sufficient
+      for reindexdb to report exit 0.
+      Unblocks: `TestPort_Scripts090Reindexdb`, `091`.
+      CSV: D-005h → port, D-005i → port.
+
+- [ ] **M0095-0006** — Add `CREATE ROLE` / `CREATE USER` / `DROP ROLE` /
+      `DROP USER` to parser and executor.  Executor writes entries to / removes
+      entries from the `pg_auth` file via `WritePGAuth`; also expose a minimal
+      `pg_roles` catalog view so `\du` succeeds.
+      Unblocks: `TestPort_Scripts040Createuser`, `070`.
+      CSV: D-005f → port, D-005g → port.
+
+- [ ] **M0095-0007** — Add `CREATE DATABASE` / `DROP DATABASE` stubs +
+      `pg_database` catalog table.  Single-database implementation: catalog
+      row stored in memory / persisted in `pg_database` heap file; actual
+      storage namespace is not forked (goopg remains logically single-DB but
+      accepts multi-DB DDL without error).
+      Unblocks: `TestPort_Scripts020Createdb`, `050`.
+      `TestPort_Scripts200Connstr` partial unblock (LATIN1 encoding sub-case
+      stays skipped).
+      CSV: D-005d → port, D-005e → port.
+
+- [ ] **M0095-0008** — Add `CLUSTER` parser+executor stub
+      (`CLUSTER [VERBOSE] [table USING index]`; no-op reorder, returns
+      success).
+      Unblocks: `TestPort_Scripts010Clusterdb`, `011`.
+      CSV: D-005j → port, D-005k → port.
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
