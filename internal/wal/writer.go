@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // groupFlushReq represents a single caller's flush request in the
@@ -33,6 +34,19 @@ type flushGroup struct {
 const (
 	// DefaultSegmentSize matches PostgreSQL's default WAL segment size.
 	DefaultSegmentSize int64 = 16 * 1024 * 1024
+
+	// commitDelayUs is the number of microseconds handleGroupFlush sleeps
+	// after draining the initial batch, to allow more concurrent FlushUpTo
+	// callers to arrive and be served by the same fdatasync.
+	// Mirrors PostgreSQL's commit_delay GUC. 0 disables the delay.
+	// M0099-0003: set to 1 ms to coalesce batches under -c 100 workloads.
+	commitDelayUs = 1000
+
+	// commitSiblings is the minimum number of concurrent waiters required
+	// before commitDelayUs applies. Mirrors PostgreSQL's commit_siblings GUC.
+	// Below this threshold we flush immediately to avoid adding latency to
+	// low-concurrency workloads.
+	commitSiblings = 5
 )
 
 var (
@@ -977,6 +991,12 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 // handleGroupFlush drains the entire pending flush queue, issues one
 // fdatasync for the maximum LSN requested, then notifies all waiters.
 // Called only from the writer goroutine. M0098-0002.
+//
+// M0099-0003: when commitSiblings or more concurrent waiters are already
+// in the queue, sleep commitDelayUs microseconds before flushing so that
+// additional FlushUpTo callers can arrive and be served by the same
+// fdatasync. This mirrors PostgreSQL's commit_delay / commit_siblings
+// semantics and increases the average batch size under high concurrency.
 func (s *state) handleGroupFlush() {
 	if s.fg == nil {
 		return
@@ -987,6 +1007,22 @@ func (s *state) handleGroupFlush() {
 	s.fg.mu.Unlock()
 	if len(queue) == 0 {
 		return
+	}
+	// Batching delay: if enough concurrent waiters are already queued,
+	// sleep briefly to accumulate more callers before the expensive
+	// fdatasync. The sleep runs on the OS-thread-pinned writer goroutine
+	// (runtime.LockOSThread, M0098-0002) so it doesn't thrash the
+	// scheduler.
+	if commitDelayUs > 0 && len(queue) >= commitSiblings {
+		time.Sleep(commitDelayUs * time.Microsecond)
+		// Drain any new arrivals that enqueued during the sleep.
+		s.fg.mu.Lock()
+		extra := s.fg.queue
+		s.fg.queue = nil
+		s.fg.mu.Unlock()
+		if len(extra) > 0 {
+			queue = append(queue, extra...)
+		}
 	}
 	// Find the highest LSN across all requests; one flush satisfies all.
 	var maxLSN uint64

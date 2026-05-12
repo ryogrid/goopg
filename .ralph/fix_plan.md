@@ -1022,10 +1022,15 @@ while preserving the original `-c 100 -j 100` target-condition validation.
       confirmed pre-existing, not introduced by this change.
       Design doc: `docs/design/0099-0001-evictmu-pin-fastpath-deserialization.md`.
 
-- [ ] **M0099-0003** — Improve WAL group-commit batching effectiveness.
-      Add and validate commit-delay based batching controls (with sensible
-      defaults and guardrails) so concurrent commits coalesce into larger flush
-      batches under write-heavy workloads.
+- [x] **M0099-0003** — Improve WAL group-commit batching effectiveness. (2026-05-12)
+      Added commit_delay / commit_siblings batching in handleGroupFlush:
+      - Constants: `commitDelayUs=1000` (1 ms), `commitSiblings=5`
+      - When ≥5 concurrent waiters are queued, sleep 1 ms before fdatasync
+        then re-drain to accumulate all arrivals during sleep into one batch
+      - Mirrors PostgreSQL's commit_delay/commit_siblings semantics
+      - Single-caller path unaffected (threshold not met → no delay)
+      - Added `TestGroupCommitBatchingDelay` regression test; all WAL tests pass with -race
+      Design doc: `docs/design/0099-0002-wal-group-commit-batching-policy.md`.
 
 - [ ] **M0099-0004** — Reduce conflict-abort rate without circular deadlocks.
       Implement deadlock-safe waiting/retry behavior for conflicting updates,
