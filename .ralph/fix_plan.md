@@ -636,32 +636,30 @@ M0097-0001 wires it up.
           type inference extended with isIntegerLikeType + promoteIntType helpers
           so int2*int2 → int2, int2*int4 → int4, int4*int8 → int8.
           This fixes column width alignment for arithmetic expressions on int2 columns.
-      Passing: `comments`. Still deferred: int2 arithmetic overflow detection missing
-      (goopg returns results where PostgreSQL gives "smallint out of range" error),
-      SRF functions (pg_input_error_info), various syntax features.
-      Original action:
-      Target tests: `boolean`, `comments`, `errors`, `numerology`,
-      `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,
-      `numeric`, `numeric_big`, `char`, `varchar`, `text`, `uuid`,
-      `random`.
-      Fixes landed:
-      - ClusterRegressExecutor: now uses discovered psql binary path + LD_LIBRARY_PATH;
-        `statement_timeout=5s` prevents per-statement hangs.
-      - Parser: `tryTypedLiteral` extended for `bool`, `int2/4/8`, `float4/8`,
-        `numeric`, `text`, `varchar`, `char`, `name`, `oid` typename-cast syntax.
-      - Parser: `parseColumnAlias` accepts any keyword after explicit `AS`
-        (matches PostgreSQL: `SELECT true AS true`, `SELECT 1 AS select` etc.).
-        Updated `TestParseIdentRejectsReservedKeyword` → `TestParseIdentAcceptsKeywordsAfterAS`.
-      - Executor: `evalTypedStringLit` handles `bool` (all PG-valid string inputs
-        including 't', 'yes', 'on', 'of', '1', etc.), `int2/4/8`, `float4/8`,
-        `numeric`, `text`, `name`, `oid`.
-      - Executor: `booleq`, `boolne` built-in function stubs; `pg_input_is_valid`
-        stub (returns true); `pg_input_error_info` stub (returns NULL).
-      All `boolean`/`int2`/`int4`/`int8`/`float4`/`float8` tests run without
-      hanging (previously timed out at 30-60s). Output still defers (further
-      normalization and type-output format fixes needed in M0097-0005+).
-      Action: complete scalar output normalization and type-format compatibility
-      to promote deferred cases to port.
+      Loop 7 additions (2026-05-12):
+      20. Bitwise operators: parser lexes &, #, <<, >> as tokens; OpBitAnd/Or/Xor/Not/
+          ShiftLeft/ShiftRight in parser + planner + executor. TABLE shorthand
+          (TABLE tablename → SELECT * FROM tablename). Float4/float8 cast normalizes
+          KindNumeric to strip trailing zeros.
+      21. synthesizeSubqueryTable star expansion: StarExpr in inner SELECT (e.g.
+          TABLE shorthand) now expands to all columns from innerCtx.rels instead of
+          returning "'*' is not allowed here". Column alias count validation also
+          added (fixes TABLE subquery with wrong alias count).
+      22. int4 overflow detection: BinaryOp evaluation checks result fits int4 range
+          [-2147483648, 2147483647] and returns "integer out of range" on overflow.
+          Bitwise ops also set ResultType so overflow fires correctly.
+      23. gcd(a,b) and lcm(a,b) implemented with int4 overflow detection.
+      24. VALUES subquery columns typed as "unknown" (was "text") so arithmetic
+          operations like unary minus pass type checks.
+      25. exprType for gcd/lcm/abs/mod/div returns "int8" for correct psql alignment.
+      26. min_parallel_table_scan_size and min_parallel_index_scan_size GUC stubs.
+      Passing tests (confirmed 2026-05-12): `boolean`, `comments`, `md5`, `int2`,
+      `int4`, `reindex_catalog`.
+      Still deferred: int8 (to_char format, int8→float8), float4/float8 (NaN/Infinity
+      case, out-of-range error codes), numeric, char/varchar (TEMP TABLE shadowing),
+      text, uuid, oid, name, errors, numerology and others.
+      Action: continue fixing remaining scalar type parity issues to promote more
+      tests from defer to port.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
