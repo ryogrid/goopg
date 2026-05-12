@@ -828,13 +828,21 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
 
 ### Sub-milestones
 
-- [ ] **M0098-0001** — Re-measure at target conditions (`-c 100 -j 100 -T 180
-      -s 100`) on the current post-M0093 binary to establish the precise gap
-      for each workload.  Capture pprof (CPU + allocs + mutex + block) during
-      each run.  Result files go in `bench/pgbench-compare/results/` with the
-      `m0098_baseline` suffix.  This snapshot drives the ROI ordering of
-      subsequent sub-milestones and validates that M0093's read-skip scales
-      to -c 100 for Select Only.
+- [x] **M0098-0001** — Re-measure at target conditions.  2026-05-12.
+      Results (post-M0097 binary, -c 100 -j 100 -T 180 -s 100):
+      | Workload | goopg TPS | Target | Gap |
+      |---|---:|---:|---:|
+      | Standard | 229 | 1,500 | 6.5× |
+      | Simple Update | 228 | 1,500 | 6.6× |
+      | Select Only | 6,166 | 10,000 | 1.6× |
+      Key findings:
+      - Select Only: M0093 WAL skip scales to -c 100 (6,166 vs 2,740 at -c 10)
+      - Write workloads: WAL group commit (M0098-0002) is primary bottleneck
+      - heap: storage.newArena 76% = startup slab cost, not per-query
+      - 0.022% standard abort rate from concurrent UPDATE conflicts (EPQ needed)
+      ROI order: WAL group commit > buffer pool 128-partition > EvalPlanQual
+      Files: results/20260511_125043_*.txt + m0098_baseline_*.pprof
+      Summary: results/20260511_125043_m0098_baseline_summary.md
 
 - [ ] **M0098-0002** — **WAL group commit** — the single highest-ROI change
       for write workloads.
