@@ -688,13 +688,18 @@ M0097-0001 wires it up.
       47. encodeValue char(N): bare char = char(1); enforce length, strip trailing spaces.
           Store stripped value (NOT padded) to preserve comparison semantics. DataRow formatter
           in dispatch.go already pads char(N) for wire output display. M0097-0003.
-          Result: varchar 121→60 diff, char 145→68 diff (major improvement).
+      48. normalizeCompatSQL: preserve string literal case so 'A' and 'a' get distinct cache keys.
+          INSERT ('A') was returning 'a' because the plan for ('a') was reused via cache key
+          collision after lowercasing the entire SQL (including string literals).
+      49. pg_input_is_valid/pg_input_error_info: varchar(N)/char(N) length validation.
+      50. TEMP TABLE permanent restore: TempTableShadows in executor.Context (per-connection via
+          connTxState). CREATE TEMP TABLE saves permanent *Table; DROP TABLE restores it via
+          catalog.InMemory.RegisterTable().
       Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
-      `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`.
-      Still deferred: char/varchar (remaining 60/68 diffs: 'A'→'a' case mystery + permanent
-      table not restored after TEMP DROP), int8, float4/float8, name, numerology, others.
-      Action: investigate 'A'→'a' case issue in char/varchar inserts; fix permanent table
-      restoration after TEMP TABLE drop (requires proper session-scoped temp catalog).
+      `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`, `varchar`.
+      Still deferred: char (6 diffs: "char" internal type octal escape '\101'→'A'), int8,
+      float4/float8, name, numerology, others.
+      Action: fix "char" (internal 1-byte type) octal escape handling to flip char test to pass.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
