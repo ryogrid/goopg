@@ -313,7 +313,7 @@ func analyzeLockingClauses(s *parser.SelectStmt, ctx *scope) error {
 	}
 	if len(s.GroupBy) > 0 {
 		return analyzeError(first.Pos(), "0A000",
-			"FOR UPDATE/SHARE is not allowed with GROUP BY clause")
+			"FOR UPDATE is not allowed with GROUP BY clause")
 	}
 	if s.Having != nil {
 		return analyzeError(first.Pos(), "0A000",

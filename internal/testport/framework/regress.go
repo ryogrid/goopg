@@ -276,7 +276,8 @@ func NormalizeRegressOutput(raw string) string {
 		isErrLine := strings.HasPrefix(line, "ERROR:") ||
 			strings.HasPrefix(line, "NOTICE:") ||
 			strings.HasPrefix(line, "HINT:") ||
-			strings.HasPrefix(line, "DETAIL:")
+			strings.HasPrefix(line, "DETAIL:") ||
+			strings.HasPrefix(line, "WARNING:")
 		if isErrLine {
 			errorLines = append(errorLines, line)
 		} else {

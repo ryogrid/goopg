@@ -514,6 +514,14 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				maybeForceGCAfterCommit()
 				// Leave *autoCommitPtr = false so the caller does NOT attempt
 				// a second TxnMgr.Commit on the already-committed transaction.
+			} else {
+				// COMMIT outside an explicit transaction: emit warning.
+				_ = w.WriteNoticeResponse([]protocol.ErrorField{
+					{Code: protocol.FieldSeverity, Value: "WARNING"},
+					{Code: protocol.FieldSeverityNonLocal, Value: "WARNING"},
+					{Code: protocol.FieldSQLState, Value: "25P01"},
+					{Code: protocol.FieldMessage, Value: "there is no transaction in progress"},
+				})
 			}
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxRollback:
@@ -521,6 +529,14 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 				connTx.End()
 				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
+			} else {
+				// ROLLBACK outside an explicit transaction: emit warning.
+				_ = w.WriteNoticeResponse([]protocol.ErrorField{
+					{Code: protocol.FieldSeverity, Value: "WARNING"},
+					{Code: protocol.FieldSeverityNonLocal, Value: "WARNING"},
+					{Code: protocol.FieldSQLState, Value: "25P01"},
+					{Code: protocol.FieldMessage, Value: "there is no transaction in progress"},
+				})
 			}
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		default:

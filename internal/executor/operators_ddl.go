@@ -1624,10 +1624,20 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 			o.ctx.AddNotice(fmt.Sprintf("function %s does not exist, skipping", s.Name.String()))
 			return nil
 		}
-		return &ExecError{Code: "42883", Pos: s.Pos(), Message: err.Error()}
+		// Format to match PostgreSQL: "function name(argtypes) does not exist"
+		funcSig := s.Name.Name
+		if s.Args != nil {
+			var argNames []string
+			for _, a := range s.Args {
+				argNames = append(argNames, strings.ToLower(a.Type.Name))
+			}
+			funcSig += "(" + strings.Join(argNames, ", ") + ")"
+		}
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("function %s does not exist", funcSig)}
 	}
 	if errors.Is(err, catalog.ErrRoutineAmbiguous) {
-		return &ExecError{Code: "42725", Pos: s.Pos(), Message: err.Error()}
+		// Format: "function name \"name\" is not unique"
+		return &ExecError{Code: "42725", Pos: s.Pos(), Message: fmt.Sprintf("function name \"%s\" is not unique", s.Name.Name)}
 	}
 	return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 }
