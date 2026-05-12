@@ -447,14 +447,17 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return v, flowReturn, nil
 
 	case *plpgsql.RaiseStmt:
-		// RAISE NOTICE / WARNING / INFO / LOG / DEBUG: silently discard.
-		// RAISE EXCEPTION / ERROR: surface as an executor error.
-		// M0096-0012.
+		// RAISE EXCEPTION/ERROR: surface as an executor error.
+		// RAISE NOTICE/WARNING/INFO/LOG/DEBUG: queue via context so the server
+		// emits a NoticeResponse before the next CommandComplete. M0096-0012.
 		switch strings.ToLower(s.Level) {
 		case "error", "exception":
-			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: s.Msg}
+			msg := plpgsqlExtractMsgText(s.Msg)
+			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: msg}
 		}
-		// NOTICE and other non-error levels are no-ops in v0.
+		if ctx != nil {
+			ctx.AddNotice(plpgsqlExtractMsgText(s.Msg))
+		}
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.SQLStmt:
@@ -962,6 +965,15 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 		_ = frame.add(d.Name, typ, value)
 	}
 	_, flow, err := executePLpgSQLStmtList(block.Statements, r, frame, child)
+	// Propagate notices accumulated in the trigger child context back to
+	// the outer query context so they are emitted before CommandComplete.
+	// M0096-0012: child.Notices is a separate slice from ctx.Notices because
+	// executePLpgSQLTriggerBody copies ctx by value (*child = *ctx).
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -1107,4 +1119,37 @@ func datumToSQLLiteral(d Datum) string {
 		s := strings.ReplaceAll(d.Format(), "'", "''")
 		return "'" + s + "'"
 	}
+}
+
+// plpgsqlExtractMsgText extracts the displayable message text from a raw
+// RAISE statement Msg field. The Msg field is the source text captured after
+// the level keyword, e.g. `'hello world'` or `'format %', arg`. This
+// function strips the outer single-quote delimiters from the first string
+// literal. Format argument substitution (replacing `%` with actual values)
+// is not yet implemented — the format-template text is returned as-is.
+// M0096-0012.
+func plpgsqlExtractMsgText(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if len(msg) == 0 {
+		return msg
+	}
+	// Strip optional leading single-quoted string: 'text' [, args...]
+	if msg[0] == '\'' {
+		// Find the closing quote, handling escaped ''
+		end := 1
+		for end < len(msg) {
+			if msg[end] == '\'' {
+				if end+1 < len(msg) && msg[end+1] == '\'' {
+					end += 2 // escaped ''
+					continue
+				}
+				break
+			}
+			end++
+		}
+		inner := msg[1:end]
+		// Unescape '' → '
+		return strings.ReplaceAll(inner, "''", "'")
+	}
+	return msg
 }

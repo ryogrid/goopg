@@ -482,19 +482,21 @@ alongside the suite.
       + DEFERRABLE INITIALLY DEFERRED queued in BasicSession, checked at execCommit.
       Design doc: 0096-0011-fk-enforcement.md.
 
-- [ ] **M0096-0012** — Implement `CREATE TRIGGER … FOR EACH ROW EXECUTE
-      FUNCTION/PROCEDURE` + PL/pgSQL trigger body execution.
-      Unblocks: `eval-plan-qual-trigger`, `partition-key-update-4`,
-      `fk-snapshot` (partially — RAISE NOTICE not yet interpolated).
-      Parser: KwTrigger; CreateTriggerStmt/DropTriggerStmt; RETURNS TRIGGER.
-      PL/pgSQL: SQLStmt (embedded SQL with OLD/NEW substitution), RaiseStmt
-      (NOTICE=no-op, ERROR=exception), dotted-assign no-op (OLD.b = ...).
-      Catalog: Trigger struct + Triggers on Table.
-      Executor: execCreateTrigger + BEFORE DELETE/INSERT trigger hooks +
-      executePLpgSQLTriggerBody + substituteTriggerRefs.
-      Design doc: 0096-0012-triggers.md.
-      Action: implement RAISE NOTICE interpolation/output compatibility needed by
-      remaining isolation specs.
+- [x] **M0096-0012** — RAISE NOTICE now emits NoticeResponse to client. (2026-05-12)
+      Two bugs fixed:
+      1. `plpgsql_runtime.go` RaiseStmt handler: NOTICE/WARNING levels were
+         silently discarded (no-op). Fixed to call `ctx.AddNotice(plpgsqlExtractMsgText(s.Msg))`.
+         RAISE EXCEPTION now also strips quotes via `plpgsqlExtractMsgText`.
+      2. `executePLpgSQLTriggerBody` creates a child copy of ctx (`*child = *ctx`).
+         Notices added to `child.Notices` inside the trigger body were never
+         propagated back to the outer `ctx.Notices`. Fixed: notices from `child`
+         are transferred to `ctx` after trigger execution.
+      3. Added `plpgsqlExtractMsgText()` to strip outer single-quote delimiters
+         from the raw RAISE message text (format substitution still deferred).
+      Verified end-to-end: `RAISE NOTICE 'trigger notice'` inside a BEFORE INSERT
+      trigger produces `NOTICE: trigger notice` before `INSERT 0 1` in psql output.
+      All executor tests pass with -race.
+      Design doc: 0096-0012-triggers.md (accepted).
 
 - [ ] **M0096-0013** — End-to-end pass confirmation: run all 21 dedicated
       test functions from M0096-0001, confirm every spec reports `pass`.
