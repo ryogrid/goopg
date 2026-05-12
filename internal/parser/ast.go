@@ -800,6 +800,7 @@ type CreateTableStmt struct {
 	pos         int
 	IfNotExists bool
 	Unlogged    bool
+	Temporary   bool // SET when CREATE TEMP TABLE is used. M0097-0003.
 	Name        ObjectName
 	Columns     []ColumnDef
 	// PrimaryKey holds the column names from a table-level

@@ -22,14 +22,20 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		orReplace = true
 	}
-	// CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE → treat as CREATE TABLE.
-	// M0097-0003: TEMP/TEMPORARY tables are mapped to regular catalog
-	// tables in goopg (no per-session scoping in v0).
+	// CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE → treat as CREATE TABLE but mark as Temporary.
+	// Temporary flag enables shadow-on-conflict behavior in execCreateTable. M0097-0003.
 	_ = p.acceptIdentKeyword("global") || p.acceptIdentKeyword("local")
 	if p.acceptIdentKeyword("temp") || p.acceptIdentKeyword("temporary") {
 		// Consume optional TABLE keyword that follows TEMP/TEMPORARY.
 		p.acceptKeyword(KwTable)
-		return p.parseCreateTableTail(t.Pos, unlogged)
+		s, err := p.parseCreateTableTail(t.Pos, unlogged)
+		if err != nil {
+			return nil, err
+		}
+		if ct, ok := s.(*CreateTableStmt); ok {
+			ct.Temporary = true
+		}
+		return s, nil
 	}
 	switch {
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable:

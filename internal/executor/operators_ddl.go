@@ -248,7 +248,19 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if s.IfNotExists {
 			return nil
 		}
-		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
+		// TEMP TABLE shadows the permanent table: drop it first so the
+		// session uses the new temp schema. PostgreSQL does this with
+		// per-session catalog scoping; goopg v0 approximates by replacing
+		// the catalog entry. M0097-0003.
+		if s.Temporary {
+			// Drop the existing table from the catalog (heap data will be
+			// orphaned but that's acceptable for v0's temp-shadow use-case). M0097-0003.
+			if err := o.ctx.Catalog.DropTable(s.Name); err != nil {
+				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+			}
+		} else {
+			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
+		}
 	}
 
 	// CREATE TABLE child PARTITION OF parent FOR VALUES … (M0096-0007)

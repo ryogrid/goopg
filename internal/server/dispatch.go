@@ -531,18 +531,29 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					continue
 				}
 				start := len(valueBuf)
-				valueBuf = d.AppendValueText(valueBuf)
-				// Pad char(N)/bpchar(N) values to declared width with trailing spaces.
-				// PostgreSQL always returns char(N) padded to N bytes. M0097-0003.
 				if i < len(schema) {
 					sc := schema[i]
-					if (strings.EqualFold(sc.Type.Name, "char") || strings.EqualFold(sc.Type.Name, "bpchar")) &&
-						len(sc.Type.Args) > 0 {
-						width := int(sc.Type.Args[0])
-						for len(valueBuf)-start < width {
-							valueBuf = append(valueBuf, ' ')
+					switch strings.ToLower(sc.Type.Name) {
+					case "float8", "double precision", "double", "float4", "real":
+						// float8/float4 values must display in PostgreSQL's output format:
+						// scientific notation for very large/small values, shortest decimal
+						// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
+						valueBuf = appendFloat8Text(valueBuf, d)
+					case "char", "bpchar":
+						// Pad char(N)/bpchar(N) values to declared width with trailing spaces.
+						// PostgreSQL always returns char(N) padded to N bytes. M0097-0003.
+						valueBuf = d.AppendValueText(valueBuf)
+						if len(sc.Type.Args) > 0 {
+							width := int(sc.Type.Args[0])
+							for len(valueBuf)-start < width {
+								valueBuf = append(valueBuf, ' ')
+							}
 						}
+					default:
+						valueBuf = d.AppendValueText(valueBuf)
 					}
+				} else {
+					valueBuf = d.AppendValueText(valueBuf)
 				}
 				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
@@ -682,6 +693,41 @@ func rowsAffected(op executor.Operator) int64 {
 		return rc.RowsAffected()
 	}
 	return 0
+}
+
+// appendFloat8Text formats a datum for wire output as a float8/float4 value.
+// Uses strconv.FormatFloat so large/small values display in scientific notation
+// (e.g. 1.2345678901234e+200) matching PostgreSQL's float8out behavior. M0097-0003.
+func appendFloat8Text(dst []byte, d executor.Datum) []byte {
+	if d.IsNull() {
+		return dst
+	}
+	// Convert datum to float64.
+	var f float64
+	switch d.Kind {
+	case executor.KindInt:
+		f = float64(d.Int)
+	case executor.KindString, executor.KindStringArena:
+		s := d.StringValue()
+		if parsed, err := strconv.ParseFloat(s, 64); err == nil {
+			f = parsed
+		} else {
+			// NaN / infinity / unparseable — return as-is.
+			return append(dst, s...)
+		}
+	default:
+		// KindNumeric: convert via text representation.
+		s := d.Format()
+		if parsed, err := strconv.ParseFloat(s, 64); err == nil {
+			f = parsed
+		} else {
+			return append(dst, s...)
+		}
+	}
+	// PostgreSQL's float8out uses %.15g (DBL_DIG = 15 significant digits).
+	// This handles: scientific notation for large/tiny values, decimal for normal,
+	// negative zero ("-0"), and avoids spurious scientific notation for integers.
+	return strconv.AppendFloat(dst, f, 'g', 15, 64)
 }
 
 // typeOIDFor maps a goopg type name to a pg_type.oid the wire
