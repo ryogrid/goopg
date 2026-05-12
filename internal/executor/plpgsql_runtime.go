@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -450,13 +451,15 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// RAISE EXCEPTION/ERROR: surface as an executor error.
 		// RAISE NOTICE/WARNING/INFO/LOG/DEBUG: queue via context so the server
 		// emits a NoticeResponse before the next CommandComplete. M0096-0012.
+		raiseMsgEval := func() string {
+			return evalRaiseMsg(s.Msg, frame, ctx)
+		}
 		switch strings.ToLower(s.Level) {
 		case "error", "exception":
-			msg := plpgsqlExtractMsgText(s.Msg)
-			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: msg}
+			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: raiseMsgEval()}
 		}
 		if ctx != nil {
-			ctx.AddNotice(plpgsqlExtractMsgText(s.Msg))
+			ctx.AddNotice(raiseMsgEval())
 		}
 		return Datum{}, flowNone, nil
 
@@ -1128,6 +1131,118 @@ func datumToSQLLiteral(d Datum) string {
 // literal. Format argument substitution (replacing `%` with actual values)
 // is not yet implemented — the format-template text is returned as-is.
 // M0096-0012.
+// evalRaiseMsg evaluates a RAISE statement's message field in the plpgsql context.
+// Handles format args: `'%', expr` → evaluates expr, substitutes into format. M0097-0003.
+func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
+	rawMsg = strings.TrimSpace(rawMsg)
+	if len(rawMsg) == 0 {
+		return rawMsg
+	}
+	// Try to split: 'format_template' , arg1, arg2, ...
+	if rawMsg[0] != '\'' {
+		return rawMsg // no format template
+	}
+	// Find closing quote of format template.
+	end := 1
+	for end < len(rawMsg) {
+		if rawMsg[end] == '\'' {
+			if end+1 < len(rawMsg) && rawMsg[end+1] == '\'' {
+				end += 2
+				continue
+			}
+			break
+		}
+		end++
+	}
+	fmtTemplate := strings.ReplaceAll(rawMsg[1:end], "''", "'")
+	argsText := strings.TrimSpace(rawMsg[end+1:])
+	if argsText == "" || !strings.HasPrefix(argsText, ",") {
+		return fmtTemplate // no args
+	}
+	argsText = strings.TrimSpace(argsText[1:]) // skip comma
+
+	// Evaluate the args expression in the plpgsql frame.
+	// Preprocess: replace variable array subscripts like r[N] with literal values.
+	argsText = substitutePlpgsqlArraySubscripts(argsText, frame)
+
+	// Parse and evaluate the args expression as SQL.
+	argsExpr, err := parser.ParseExpr(argsText)
+	if err != nil {
+		return fmtTemplate // fallback
+	}
+	lowered, err := lowerPLpgSQLExpr(argsExpr, frame)
+	if err != nil {
+		return fmtTemplate
+	}
+	val, err := evalExpr(lowered, frame.values, ctx)
+	if err != nil || val.IsNull() {
+		return fmtTemplate
+	}
+	// Apply format substitution: replace % with the evaluated arg value.
+	argStr := val.StringValue()
+	result := strings.ReplaceAll(fmtTemplate, "%", argStr)
+	return result
+}
+
+// substitutePlpgsqlArraySubscripts replaces `varname[N]` patterns in a SQL expression
+// string with the literal value of that array element from the plpgsql frame. M0097-0003.
+func substitutePlpgsqlArraySubscripts(expr string, frame *plpgsqlFrame) string {
+	// Simple replacement: find patterns matching `ident[number]`
+	result := expr
+	// Look for varname[N] patterns and replace with SQL string literals.
+	i := 0
+	var out strings.Builder
+	for i < len(result) {
+		// Check if we're at the start of an identifier.
+		if isIdentStartByte(result[i]) {
+			j := i
+			for j < len(result) && isIdentContByte(result[j]) {
+				j++
+			}
+			varName := result[i:j]
+			if j < len(result) && result[j] == '[' {
+				// Found varname[...] pattern.
+				k := j + 1
+				numStart := k
+				for k < len(result) && result[k] >= '0' && result[k] <= '9' {
+					k++
+				}
+				if k < len(result) && result[k] == ']' && k > numStart {
+					idxStr := result[numStart:k]
+					idx64, err := strconv.ParseInt(idxStr, 10, 64)
+					if err == nil {
+						// Look up the variable in the frame.
+						if fi, ok := frame.lookup(varName); ok {
+							val := frame.values[fi]
+							if !val.IsNull() {
+								// Parse the array value and get the Nth element (1-indexed).
+								elems := parseTextArray(val.StringValue())
+								idx := int(idx64) - 1 // convert 1-indexed to 0-indexed
+								if idx >= 0 && idx < len(elems) {
+									elem := elems[idx]
+									// Emit as a SQL string literal.
+									escaped := strings.ReplaceAll(elem, "'", "''")
+									out.WriteByte('\'')
+									out.WriteString(escaped)
+									out.WriteByte('\'')
+									i = k + 1 // skip past varname[N]
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+			out.WriteString(varName)
+			i = j
+		} else {
+			out.WriteByte(result[i])
+			i++
+		}
+	}
+	return out.String()
+}
+
 func plpgsqlExtractMsgText(msg string) string {
 	msg = strings.TrimSpace(msg)
 	if len(msg) == 0 {

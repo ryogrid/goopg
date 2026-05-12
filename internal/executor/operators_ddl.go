@@ -14,6 +14,7 @@ import (
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/plpgsql"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -247,16 +248,36 @@ func splitCommaList(s string) []string {
 
 // execDoBlock executes an anonymous PL/pgSQL block (DO $$ ... $$). M0097-0003.
 func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
-	// Create a synthetic routine for the PL/pgSQL runtime.
-	r := &catalog.Routine{
-		Name:     "(anonymous)",
-		Language: s.Language,
-		Body:     s.Body,
+	if strings.ToLower(s.Language) != "plpgsql" {
+		return &ExecError{Code: "0A000", Pos: s.Pos(),
+			Message: fmt.Sprintf("DO block language %q is not supported in v0", s.Language)}
 	}
-	_, err := executePLpgSQLRoutine(r, nil, o.ctx, s.Pos())
+	block, err := plpgsql.Parse(s.Body)
 	if err != nil {
-		return err
+		return &ExecError{Code: "P0000", Pos: s.Pos(),
+			Message: fmt.Sprintf("invalid PL/pgSQL DO body: %v", err)}
 	}
+	r := &catalog.Routine{Name: "(anonymous)", Language: s.Language, Body: s.Body}
+	frame := newPLpgSQLFrame()
+	for _, d := range block.Declarations {
+		typ := catalogTypeFromColumnType(d.Type)
+		value := NullDatum
+		if d.Default != nil {
+			value, err = evalPLpgSQLExpr(d.Default, frame, o.ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if addErr := frame.add(d.Name, typ, value); addErr != nil {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: addErr.Error()}
+		}
+	}
+	// Execute statements directly using the parent context so NOTICEs propagate. M0097-0003.
+	_, flow, execErr := executePLpgSQLStmtList(block.Statements, r, frame, o.ctx)
+	if execErr != nil {
+		return execErr
+	}
+	_ = flow // DO blocks don't return values; any flow is acceptable.
 	return nil
 }
 

@@ -1062,6 +1062,14 @@ func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Consume optional array suffix `[]` — treat `type[]` as the same type
+	// (goopg v0 doesn't implement array types distinctly; the cast is a no-op). M0097-0003.
+	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance() // '['
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+			p.advance() // ']'
+		}
+	}
 	var typmods []int64
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		p.advance()
@@ -1755,6 +1763,13 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		fc.Distinct = true
 	}
 	for {
+		// Named argument: `name => value` — skip the name and use only the value.
+		// PostgreSQL named arguments are positionally mapped for built-ins. M0097-0003.
+		if (p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent) &&
+			p.peek(1).Kind == TokenOperator && p.peek(1).Value == "=>" {
+			p.advance() // skip name
+			p.advance() // skip =>
+		}
 		arg, err := p.parseExpr()
 		if err != nil {
 			return nil, err

@@ -3445,6 +3445,12 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			innerName, _ := targetMeta(cast.Operand, t)
 			return innerName, exprType(e)
 		}
+		// For function-call casts (e.g. parse_ident(...)::name[]), propagate the
+		// function name as the column label (matches PostgreSQL's FigureColname). M0097-0003.
+		if _, isFuncCall := cast.Operand.(*FuncCall); isFuncCall {
+			innerName, _ := targetMeta(cast.Operand, t)
+			return innerName, exprType(e)
+		}
 		if cast.TargetType != "" {
 			// Use PostgreSQL's canonical short type names for column labels.
 			label := castTargetLabel(cast.TargetType)

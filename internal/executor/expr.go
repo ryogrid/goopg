@@ -1047,10 +1047,22 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to bigint"}
 		}
 	case "name":
-		// name type truncates to NAMEDATALEN-1 = 63 bytes. M0097-0003.
+		// name type truncates to NAMEDATALEN-1 = 63 bytes.
+		// For text[] values (e.g. from parse_ident()), truncate each array element. M0097-0003.
 		switch d.Kind {
 		case KindString, KindStringArena:
 			s := d.StringValue()
+			// If the value looks like a PostgreSQL array ({elem1,elem2,...}), process as array.
+			if len(s) > 0 && s[0] == '{' && s[len(s)-1] == '}' {
+				elems := parseTextArray(s)
+				for i, e := range elems {
+					if len(e) > 63 {
+						elems[i] = e[:63]
+					}
+				}
+				return NewStringDatum(formatTextArray(elems)), nil
+			}
+			// Single value: truncate.
 			if len(s) > 63 {
 				s = s[:63]
 			}
@@ -3092,13 +3104,24 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(result), nil
 		}
 	case "format":
-		// format(fmt, args...) — simplified stub: return format string
+		// format(fmt, args...) — implements %s, %I (quote_ident), %L (quote_literal). M0097-0003.
 		if len(x.Args) >= 1 {
 			f, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || f.IsNull() {
 				return NullDatum, nil
 			}
-			return NewStringDatum(f.StringValue()), nil // stub
+			fmtStr := f.StringValue()
+			// Evaluate remaining args.
+			args := make([]Datum, 0, len(x.Args)-1)
+			for _, a := range x.Args[1:] {
+				v, e := evalExpr(a, row, ctx)
+				if e != nil {
+					return Datum{}, e
+				}
+				args = append(args, v)
+			}
+			result := applyPgFormat(fmtStr, args)
+			return NewStringDatum(result), nil
 		}
 
 	// ── Mathematical functions (M0097-0005) ───────────────────────────────
@@ -4071,8 +4094,9 @@ func parseIdentString(input string, strict bool) ([]string, string, string) {
 	i := 0
 	n := len(input)
 	var components []string
+	// PostgreSQL uses "string" (double-quoted, raw bytes) not Go %q (escape codes). M0097-0003.
 	errMsg := func(detail string) ([]string, string, string) {
-		return nil, fmt.Sprintf("string is not a valid identifier: %q", orig), detail
+		return nil, `string is not a valid identifier: "` + orig + `"`, detail
 	}
 
 	for {
@@ -4084,9 +4108,9 @@ func parseIdentString(input string, strict bool) ([]string, string, string) {
 			if len(components) == 0 {
 				return errMsg("")
 			}
-			// After the last dot, empty → error
+			// After the last dot, empty → error. M0097-0003.
 			if len(components) > 0 && strict {
-				return errMsg(`No valid identifier after "."`)
+				return errMsg(`No valid identifier after ".".`)
 			}
 			break
 		}
@@ -4115,7 +4139,16 @@ func parseIdentString(input string, strict bool) ([]string, string, string) {
 				if !strict {
 					break
 				}
-				// Distinguish "before dot" vs regular invalid.
+				// Distinguish "before dot" vs "after dot" vs no-dot. M0097-0003.
+				if input[i] == '.' {
+					// Dot at start of component → nothing valid before this dot.
+					return errMsg(`No valid identifier before ".".`)
+				}
+				if len(components) > 0 {
+					// We consumed a dot and the next component is invalid.
+					return errMsg(`No valid identifier after ".".`)
+				}
+				// No dot involved; just an invalid starting character.
 				return errMsg("")
 			}
 			start := i
@@ -4193,6 +4226,133 @@ func formatTextArray(elems []string) string {
 	}
 	sb.WriteByte('}')
 	return sb.String()
+}
+
+// applyPgFormat implements PostgreSQL's format() function for common specifiers:
+// %s (value as text), %I (quote_ident), %L (quote_literal), %% (literal %). M0097-0003.
+func applyPgFormat(fmtStr string, args []Datum) string {
+	var sb strings.Builder
+	argIdx := 0
+	for i := 0; i < len(fmtStr); i++ {
+		if fmtStr[i] != '%' {
+			sb.WriteByte(fmtStr[i])
+			continue
+		}
+		i++
+		if i >= len(fmtStr) {
+			sb.WriteByte('%')
+			break
+		}
+		switch fmtStr[i] {
+		case '%':
+			sb.WriteByte('%')
+		case 's':
+			if argIdx < len(args) {
+				sb.WriteString(args[argIdx].Format())
+				argIdx++
+			}
+		case 'I':
+			// quote_ident: quote identifier only if necessary.
+			if argIdx < len(args) {
+				ident := args[argIdx].StringValue()
+				argIdx++
+				sb.WriteString(pgQuoteIdent(ident))
+			}
+		case 'L':
+			// quote_literal: always quotes with single quotes.
+			if argIdx < len(args) {
+				lit := args[argIdx].StringValue()
+				argIdx++
+				escaped := strings.ReplaceAll(lit, "'", "''")
+				sb.WriteByte('\'')
+				sb.WriteString(escaped)
+				sb.WriteByte('\'')
+			}
+		default:
+			sb.WriteByte('%')
+			sb.WriteByte(fmtStr[i])
+		}
+	}
+	return sb.String()
+}
+
+// pgQuoteIdent quotes a SQL identifier if necessary (uppercase, spaces, special chars). M0097-0003.
+func pgQuoteIdent(s string) string {
+	if s == "" {
+		return `""`
+	}
+	// Safe unquoted: starts with letter/underscore, contains only letter/digit/underscore,
+	// all lowercase, and is not a reserved word.
+	safe := true
+	for i, c := range s {
+		if i == 0 {
+			if !((c >= 'a' && c <= 'z') || c == '_') {
+				safe = false
+				break
+			}
+		} else {
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+				safe = false
+				break
+			}
+		}
+	}
+	if safe {
+		return s
+	}
+	// Must quote.
+	escaped := strings.ReplaceAll(s, `"`, `""`)
+	return `"` + escaped + `"`
+}
+
+// parseTextArray parses a PostgreSQL text array literal {elem1,"elem2",...}
+// and returns its elements. Used for name[] cast. M0097-0003.
+func parseTextArray(s string) []string {
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return []string{s}
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return nil
+	}
+	var elems []string
+	i := 0
+	for i < len(inner) {
+		if inner[i] == '"' {
+			// Quoted element.
+			i++
+			var sb strings.Builder
+			for i < len(inner) {
+				if inner[i] == '"' {
+					if i+1 < len(inner) && inner[i+1] == '"' {
+						sb.WriteByte('"')
+						i += 2
+					} else {
+						i++
+						break
+					}
+				} else if inner[i] == '\\' && i+1 < len(inner) {
+					sb.WriteByte(inner[i+1])
+					i += 2
+				} else {
+					sb.WriteByte(inner[i])
+					i++
+				}
+			}
+			elems = append(elems, sb.String())
+		} else {
+			// Unquoted element: read until comma or end.
+			start := i
+			for i < len(inner) && inner[i] != ',' {
+				i++
+			}
+			elems = append(elems, inner[start:i])
+		}
+		if i < len(inner) && inner[i] == ',' {
+			i++
+		}
+	}
+	return elems
 }
 
 // charTypeParseOctalEscape handles PostgreSQL's "char" internal single-byte type
