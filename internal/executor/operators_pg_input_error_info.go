@@ -95,6 +95,8 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			sqlCode = "22P02"
 		}
 	case "oid":
+		// For a single oid, PostgreSQL reports the full input string on error.
+		// Use parseIntegerInput which preserves the original value in error messages.
 		n, e := parseIntegerInput(v, "oid", 64)
 		if e != nil {
 			if ee, ok := e.(*ExecError); ok {
@@ -102,7 +104,6 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 				sqlCode = ee.Code
 			}
 		} else {
-			// Wrap negative: PostgreSQL wraps -N to uint32.
 			if n < 0 {
 				n += 4294967296
 			}
@@ -113,10 +114,10 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 		}
 	case "oidvector":
 		// oidvector: space-separated oid values. M0097-0003.
-		errMsg := validateOidVector(v)
+		errMsg, errCode := validateOidVector(v)
 		if errMsg != "" {
 			message = errMsg
-			sqlCode = "22P02"
+			sqlCode = errCode
 		}
 	case "uuid":
 		// uuid: validate format. M0097-0003.
@@ -146,31 +147,58 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	return SlotFromRow(nil, row), nil
 }
 
+// validateOidDecimal parses a single OID string using decimal-only parsing,
+// mimicking PostgreSQL's strtoul(s, &end, 10). Reports the invalid suffix
+// (what "end" points to) in error messages, matching PG's exact output.
+// M0097-0003.
+func validateOidDecimal(v string) (string, string) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return "invalid input syntax for type oid: \"" + v + "\"", "22P02"
+	}
+	// Consume decimal digits only (base 10, like PostgreSQL's strtoul).
+	i := 0
+	var n int64
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		digit := int64(s[i] - '0')
+		// Check for overflow: PostgreSQL reports "out of range" for values > UINT32_MAX.
+		if n > (4294967295-digit)/10 {
+			return "value \"" + s + "\" is out of range for type oid", "22003"
+		}
+		n = n*10 + digit
+		i++
+	}
+	if i == 0 {
+		// No digits parsed at all → invalid syntax; report the full string.
+		return "invalid input syntax for type oid: \"" + v + "\"", "22P02"
+	}
+	suffix := strings.TrimSpace(s[i:])
+	if suffix != "" {
+		// Trailing garbage after valid digits → report the suffix.
+		return "invalid input syntax for type oid: \"" + suffix + "\"", "22P02"
+	}
+	if n > 4294967295 {
+		return "value \"" + s + "\" is out of range for type oid", "22003"
+	}
+	return "", "" // valid
+}
+
 // validateOidVector validates a space-separated list of oid values.
-// Returns errorMessage if invalid, "" if valid. M0097-0003.
-func validateOidVector(v string) string {
+// Returns (errorMessage, sqlCode) if invalid, ("", "") if valid. M0097-0003.
+func validateOidVector(v string) (string, string) {
 	v = strings.TrimSpace(v)
 	if v == "" {
-		return ""
+		return "", ""
 	}
 	parts := strings.Fields(v)
 	for _, p := range parts {
-		n, err := parseIntegerInput(p, "oid", 64)
-		if err != nil {
-			if ee, ok := err.(*ExecError); ok {
-				return ee.Message
-			}
-			return "invalid input syntax for type oid: \"" + p + "\""
-		}
-		// Wrap negative.
-		if n < 0 {
-			n += 4294967296
-		}
-		if n < 0 || n > 4294967295 {
-			return "value \"" + p + "\" is out of range for type oid"
+		// Use decimal-only parsing (like PostgreSQL's oidvectorin). M0097-0003.
+		msg, code := validateOidDecimal(p)
+		if msg != "" {
+			return msg, code
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // validateInt2Vector validates a space-separated list of int2 values.

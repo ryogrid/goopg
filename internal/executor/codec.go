@@ -390,7 +390,7 @@ func coerceStringToInt64(s, typeName string) (int64, error) {
 
 func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 	switch t.Name {
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -411,7 +411,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [4]byte
 		binary.BigEndian.PutUint32(buf[:], uint32(int32(v)))
 		return buf[:], nil
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial":
 		var v int64
 		switch d.Kind {
 		case KindInt:
@@ -525,10 +525,18 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			n = d.Int
 		case KindString, KindStringArena:
 			var err error
-			n, err = strconv.ParseInt(strings.TrimSpace(d.StringValue()), 10, 64)
+			origStr := d.StringValue() // preserve original for error messages
+			rawStr := strings.TrimSpace(origStr)
+			n, err = strconv.ParseInt(rawStr, 10, 64)
 			if err != nil {
+				numErr, isNumErr := err.(*strconv.NumError)
+				if isNumErr && numErr.Err == strconv.ErrRange {
+					// Value is syntactically valid but overflows int64 → out of range.
+					return nil, &ExecError{Code: "22003",
+						Message: fmt.Sprintf("value %q is out of range for type oid", rawStr)}
+				}
 				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type oid: %q", d.StringValue())}
+					Message: fmt.Sprintf("invalid input syntax for type oid: %q", origStr)}
 			}
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as oid", d.Kind)
@@ -541,7 +549,10 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, &ExecError{Code: "22003",
 				Message: fmt.Sprintf("value %d is out of range for type oid", n)}
 		}
-		return encodeVarlen([]byte(strconv.FormatInt(n, 10))), nil
+		// Store as 4-byte big-endian uint32 (same as int4). M0097-0003.
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:], uint32(n))
+		return buf[:], nil
 
 	case "uuid":
 		// Uuid accepts standard/brace/no-hyphen formats; normalizes to lowercase
@@ -691,15 +702,22 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		}
 		v := int16(binary.BigEndian.Uint16(data[:2]))
 		return Datum{Kind: KindInt, Int: int64(v)}, 2, nil
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial":
 		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated int4")
+			return Datum{}, 0, fmt.Errorf("truncated int4/serial")
 		}
 		v := int32(binary.BigEndian.Uint32(data[:4]))
 		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
-	case "int8", "bigint":
+	case "oid":
+		// oid is uint32 stored as 4-byte big-endian. M0097-0003.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated oid")
+		}
+		v := binary.BigEndian.Uint32(data[:4])
+		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
+	case "int8", "bigint", "bigserial":
 		if len(data) < 8 {
-			return Datum{}, 0, fmt.Errorf("truncated int8")
+			return Datum{}, 0, fmt.Errorf("truncated int8/bigserial")
 		}
 		v := int64(binary.BigEndian.Uint64(data[:8]))
 		return Datum{Kind: KindInt, Int: v}, 8, nil
@@ -770,15 +788,22 @@ func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, er
 		}
 		v := int16(binary.BigEndian.Uint16(data[:2]))
 		return Datum{Kind: KindInt, Int: int64(v)}, 2, nil
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial":
 		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated int4")
+			return Datum{}, 0, fmt.Errorf("truncated int4/serial")
 		}
 		v := int32(binary.BigEndian.Uint32(data[:4]))
 		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
-	case "int8", "bigint":
+	case "oid":
+		// oid is uint32 stored as 4-byte big-endian. M0097-0003.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated oid")
+		}
+		v := binary.BigEndian.Uint32(data[:4])
+		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
+	case "int8", "bigint", "bigserial":
 		if len(data) < 8 {
-			return Datum{}, 0, fmt.Errorf("truncated int8")
+			return Datum{}, 0, fmt.Errorf("truncated int8/bigserial")
 		}
 		v := int64(binary.BigEndian.Uint64(data[:8]))
 		return Datum{Kind: KindInt, Int: v}, 8, nil

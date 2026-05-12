@@ -2370,7 +2370,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewBoolDatum(err == nil && n >= 0 && n <= 4294967295), nil
 			case "oidvector":
 				// oidvector: space-separated oid values. M0097-0003.
-				return NewBoolDatum(validateOidVector(v) == ""), nil
+				msg, _ := validateOidVector(v)
+				return NewBoolDatum(msg == ""), nil
 			case "uuid":
 				return NewBoolDatum(isValidUUIDStr(v)), nil
 			case "xid":

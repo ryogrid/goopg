@@ -1605,6 +1605,13 @@ func isComparable(left, right catalog.Type) bool {
 	if (isTextBacked(left) || isStringTypeName(left.Name)) && (isTextBacked(right) || isStringTypeName(right.Name)) {
 		return true
 	}
+	// oid ↔ integer: PostgreSQL has implicit oid↔int4 casts. M0097-0003.
+	if strings.EqualFold(left.Name, "oid") && isNumericTypeName(right.Name) {
+		return true
+	}
+	if isNumericTypeName(left.Name) && strings.EqualFold(right.Name, "oid") {
+		return true
+	}
 	return false
 }
 
