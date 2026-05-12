@@ -653,11 +653,23 @@ M0097-0001 wires it up.
           operations like unary minus pass type checks.
       25. exprType for gcd/lcm/abs/mod/div returns "int8" for correct psql alignment.
       26. min_parallel_table_scan_size and min_parallel_index_scan_size GUC stubs.
-      Passing tests (confirmed 2026-05-12): `boolean`, `comments`, `md5`, `int2`,
-      `int4`, `reindex_catalog`.
+      Loop 8 additions (2026-05-13):
+      27. DELETE alias enforcement: blockOriginalName flag on rangeBinding; planDelete
+          sets it when explicit alias given; resolveColumnRefAt returns PlanError with
+          Hint "Perhaps you meant..."; planner PlanError.Hint field wired to wire protocol.
+      28. SERIAL TypeOID: typeOIDFor handles serial→23, bigserial→20, smallserial→21.
+      29. char_length/length/octet_length return int4 from exprType (right-alignment).
+      30. OID binary storage: encodeValue uses 4-byte big-endian (not varlen-text);
+          decodeValue/decodeValueArena decode "oid" as KindInt; serial/bigserial
+          also get proper binary storage. OID comparisons now use integer semantics.
+      31. OID error codes: 22003 for out-of-range in encodeValue + pg_input_error_info.
+      32. oidvector: validateOidDecimal returns suffix (PG-compatible); 22003/22P02 per kind.
+      33. oid ↔ int comparison: isComparable allows oid vs numeric types.
+      Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`,
+      `int4`, `reindex_catalog`, `delete`, `oid`.
       Still deferred: int8 (to_char format, int8→float8), float4/float8 (NaN/Infinity
       case, out-of-range error codes), numeric, char/varchar (TEMP TABLE shadowing),
-      text, uuid, oid, name, errors, numerology and others.
+      text, uuid, name, errors, numerology and others.
       Action: continue fixing remaining scalar type parity issues to promote more
       tests from defer to port.
 
