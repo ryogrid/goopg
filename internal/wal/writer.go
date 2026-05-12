@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // groupFlushReq represents a single caller's flush request in the
@@ -34,10 +35,16 @@ const (
 	// DefaultSegmentSize matches PostgreSQL's default WAL segment size.
 	DefaultSegmentSize int64 = 16 * 1024 * 1024
 
-	// commitDelayUs / commitSiblings (M0099-0003) were disabled because the
-	// time.Sleep in handleGroupFlush races with concurrent tryAppend callers
-	// that modify s.writePos without appendMu during the sleep window.
-	// See the comment in handleGroupFlush for details.
+	// commitDelayUs is the number of microseconds handleGroupFlush sleeps
+	// after the initial drain to accumulate more concurrent FlushUpTo callers
+	// into the same fdatasync batch. Mirrors PostgreSQL's commit_delay GUC.
+	// Re-enabled after the state.append Path A race was fixed (M0099).
+	commitDelayUs = 1000
+
+	// commitSiblings is the minimum number of concurrent waiters required
+	// before applying the commitDelayUs sleep. Below this threshold we flush
+	// immediately to avoid adding latency to low-concurrency workloads.
+	commitSiblings = 5
 )
 
 var (
@@ -999,14 +1006,22 @@ func (s *state) handleGroupFlush() {
 	if len(queue) == 0 {
 		return
 	}
-	// Batching delay (M0099-0003 DISABLED): the sleep-then-re-drain
-	// design races with concurrent tryAppend callers that modify
-	// s.writePos outside appendMu during the sleep window (state.append
-	// Path A reads s.writePos without appendMu, then sets it back to a
-	// stale value, causing s.writeLSN to be incorrect). The fix requires
-	// making state.append re-read s.writePos under appendMu (Path A),
-	// which is a non-trivial correctness fix deferred to a later loop.
-	// For now, simply drain all currently-queued requestors without sleep.
+	// Batching delay (M0099-0003, re-enabled after Path A race fix M0099):
+	// if commitSiblings or more concurrent waiters are queued, sleep
+	// commitDelayUs so additional callers can arrive and be served by the
+	// same fdatasync. The sleep runs on the OS-thread-pinned writer goroutine
+	// (runtime.LockOSThread, M0098-0002). The state.append Path A race that
+	// previously caused stale writePos under concurrency is now fixed.
+	if commitDelayUs > 0 && len(queue) >= commitSiblings {
+		time.Sleep(commitDelayUs * time.Microsecond)
+		s.fg.mu.Lock()
+		extra := s.fg.queue
+		s.fg.queue = nil
+		s.fg.mu.Unlock()
+		if len(extra) > 0 {
+			queue = append(queue, extra...)
+		}
+	}
 	// Find the highest LSN across all requests; one flush satisfies all.
 	var maxLSN uint64
 	for _, req := range queue {
@@ -1034,39 +1049,62 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 			return 0, 0, err
 		}
 	}
-	writePos := s.writePos
-	// In page-headers mode (M0014-0001 step 2), interleave page
-	// headers into the on-disk byte stream. `stream` is what we
-	// write to disk; `leading` is the byte count of any page
-	// header inserted at the front of `stream` (so startLSN
-	// lands on the first record byte, after the header).
-	stream := record
-	leading := 0
-	if s.pageHeaders {
-		stream, leading = emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
-	}
-	start := uint64(writePos) + uint64(leading) + 1
-	var end uint64
 
 	// Path A: WAL buffer disabled, OR record larger than the
-	// entire buffer. Bypass and write straight to disk —
-	// fragmenting a single record across multiple drains would
-	// complicate the contiguous-stream invariant for no benefit.
-	if s.walBuf == nil || !s.walBuf.canHold(len(stream)) {
-		if err := s.writeAt(writePos, stream); err != nil {
-			return 0, 0, err
-		}
-		// I/O done; now update LSN under appendMu so
-		// concurrent tryAppend callers see consistent state.
+	// entire buffer. Bypass and write straight to disk.
+	//
+	// M0099: The original code read s.writePos before acquiring appendMu,
+	// allowing concurrent tryAppend callers to advance s.writePos in the
+	// window between the read and the appendMu-protected update. Path A
+	// would then clobber s.writePos with a stale value, producing backwards
+	// LSN accounting and eventual FlushUpTo(uint64_max) errors.
+	//
+	// Fix: acquire appendMu first to read the authoritative writePos, then
+	// advance s.writePos as a reservation BEFORE releasing the lock (so
+	// concurrent tryAppend callers write their records AFTER this one),
+	// then do I/O outside the lock, then finalise under appendMu.
+	//
+	// Note: walBuf == nil check must be done before acquiring appendMu
+	// (walBuf is set once at init, immutable thereafter).
+	if s.walBuf == nil || !s.walBuf.canHold(len(record)) {
+		// Re-encode under appendMu so writePos is consistent with stream.
 		s.appendMu.Lock()
-		s.memRing.Append(writePos, stream)
+		writePos := s.writePos // authoritative read
+		stream := record
+		leading := 0
+		if s.pageHeaders {
+			stream, leading = emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
+		}
+		start := uint64(writePos) + uint64(leading) + 1
+		// Reserve the position: advance writePos so concurrent tryAppend
+		// callers write their records after this large record.
 		s.writePos = writePos + int64(len(stream))
-		end = uint64(s.writePos)
-		s.writeLSN = end
-		s.drainedLSN = end
+		end := uint64(s.writePos)
+		s.writeLSN = end // optimistic; rolled back below on I/O error
 		if s.writeLSNMirror != nil {
 			s.writeLSNMirror.Store(end)
 		}
+		s.appendMu.Unlock()
+
+		if err := s.writeAt(writePos, stream); err != nil {
+			// Roll back the reservation on I/O error (rare; WAL errors
+			// are typically fatal, but restore state for callers that
+			// handle errors gracefully).
+			s.appendMu.Lock()
+			if s.writePos == writePos+int64(len(stream)) {
+				s.writePos = writePos
+				s.writeLSN = uint64(writePos)
+				if s.writeLSNMirror != nil {
+					s.writeLSNMirror.Store(s.writeLSN)
+				}
+			}
+			s.appendMu.Unlock()
+			return 0, 0, err
+		}
+
+		s.appendMu.Lock()
+		s.memRing.Append(writePos, stream)
+		s.drainedLSN = end
 		if s.pageHeaders {
 			s.prevRecPtr = start - 1
 		}
@@ -1074,10 +1112,23 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		return start, end, nil
 	}
 
+	// Path B: buffered append. Acquire appendMu first to read writePos
+	// authoritatively (same reason as Path A fix above), then compute
+	// stream layout, drain if needed, and append to walBuf.
+
 	// Path B: buffered append. Serialise buffer access and LSN
 	// update under appendMu so we don't race with tryAppend.
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
+
+	// Re-read writePos under appendMu to get the authoritative position.
+	writePos := s.writePos
+	stream := record
+	leading := 0
+	if s.pageHeaders {
+		stream, leading = emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
+	}
+	start := uint64(writePos) + uint64(leading) + 1
 
 	need := int64(len(stream)) - s.walBuf.free()
 	if need > 0 {
@@ -1091,7 +1142,7 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	// streaming-from-RAM invariant unchanged from M0010-0002.
 	s.memRing.Append(writePos, stream)
 	s.writePos = writePos + int64(len(stream))
-	end = uint64(s.writePos)
+	end := uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {
 		s.writeLSNMirror.Store(end)

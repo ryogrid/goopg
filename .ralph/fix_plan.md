@@ -1022,18 +1022,16 @@ while preserving the original `-c 100 -j 100` target-condition validation.
       confirmed pre-existing, not introduced by this change.
       Design doc: `docs/design/0099-0001-evictmu-pin-fastpath-deserialization.md`.
 
-- [x] **M0099-0003** — WAL group-commit batching: initial commit delay DISABLED. (2026-05-12)
-      The M0099-0003 commit delay (1ms sleep in handleGroupFlush) was found to
-      cause WAL LSN corruption: `state.append` Path A reads `s.writePos` without
-      `appendMu`, then sets it back to a stale value after acquiring the lock.
-      During the 1ms sleep, many concurrent `tryAppend` callers advance `s.writePos`
-      significantly; when `state.append` wakes and writes the stale value, subsequent
-      commits see `FlushUpTo` receiving `endLSN = uint64_max` (= `uint64(stale-1)`
-      due to int64 underflow from the backwards-written position).
-      Action taken: sleep path disabled with in-code comment documenting the race.
-      The proper fix (re-read `s.writePos` under `appendMu` in Path A) is deferred to
-      a dedicated loop. Group commit still works (no sleep, all queued requests
-      coalesced per handleGroupFlush invocation).
+- [x] **M0099-0003** — WAL group-commit batching with commit_delay. (2026-05-12)
+      Initial implementation landed (commitDelayUs=1000, commitSiblings=5).
+      Disabled in the same loop when the state.append Path A race was discovered.
+      Re-enabled in the next loop after Path A race fix (2026-05-12):
+      - `state.append` Path A now reads `s.writePos` under `appendMu` and advances
+        it as a reservation BEFORE releasing the lock, so concurrent `tryAppend`
+        callers write AFTER the large record.
+      - For Path B: `writePos` is now read under the same `appendMu.Lock()` that
+        protects the rest of the buffered-append path (was stale before the fix).
+      - Commit-delay sleep (1ms at ≥5 concurrent waiters) re-enabled in handleGroupFlush.
       All WAL tests pass with -race. Design doc: `docs/design/0099-0002-wal-group-commit-batching-policy.md`.
 
 - [x] **M0099-0004** — Reduce conflict-abort rate; fix aborted-HOT-update 40001 loop. (2026-05-12)
