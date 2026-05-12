@@ -8,23 +8,22 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestConcurrentHOTUpdateDetectsRace pins M0090-0002: a second
-// HOT-update on a slot whose tuple has already been stamped by a
-// committed concurrent UPDATE must FAIL with SQLSTATE 40001
-// (serialization_failure), not silently overwrite the prior stamp.
+// TestConcurrentHOTUpdateDetectsRace pins M0090-0002 + M0098-0004:
+// a second HOT-update on a slot whose tuple has already been stamped
+// by a committed concurrent UPDATE must NOT silently overwrite the
+// prior stamp (the M0090-0002 invariant). With EvalPlanQual (M0098-0004),
+// the conflict causes tryApplyHOTUpdate to return (false, nil) —
+// falling back to the delete+insert path — instead of SQLSTATE 40001.
 //
-// Pre-fix behaviour:
-//   - T1 stamps xmax = T1.xid, CTID = S' on slot S, writes new tuple
-//     at S'. Commits.
+// Pre-M0090-0002 behaviour:
+//   - T1 stamps xmax = T1.xid, CTID = S', writes new tuple at S'. Commits.
 //   - T2 takes Lock, pre-check sees S is LP_NORMAL ✓, writes new
 //     tuple at S''. PageStampHotOldTuple OVERWRITES xmax = T2.xid,
-//     CTID = S'' — clobbering T1's stamp. T1's new tuple at S' is
-//     orphaned but remains visible under MVCC. Result: two visible
-//     rows from one logical row.
+//     CTID = S'' — clobbering T1's stamp. Result: two visible rows.
 //
-// Post-fix: T2 detects the concurrent xmax stamp via
-// `isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID)` and returns
-// SQLSTATE 40001. Only T1's update lands.
+// Post-M0090-0002 + M0098-0004: T2 detects the concurrent xmax stamp
+// and returns (used=false, nil), falling back to delete+insert where
+// the EvalPlanQual wait loop handles the conflict.
 func TestConcurrentHOTUpdateDetectsRace(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
@@ -63,7 +62,8 @@ func TestConcurrentHOTUpdateDetectsRace(t *testing.T) {
 
 	// T2: try to HOT-update the same slot (the index lookup would
 	// still resolve to slot 1 if T2's scan ran before T1 committed,
-	// which is exactly the pgbench race).
+	// which is exactly the pgbench race). With EvalPlanQual (M0098-0004),
+	// conflict causes fallback to delete+insert (used=false, nil error).
 	t2 := beginTxn(t, ctx)
 	ctxT2 := *ctx
 	ctxT2.Tx = t2
@@ -71,15 +71,11 @@ func TestConcurrentHOTUpdateDetectsRace(t *testing.T) {
 	ctxT2.Snap = snap2
 	used2, err2 := tryApplyHOTUpdate(&ctxT2, rel, cols, 0, 1,
 		Row{{Kind: KindInt, Int: 1}, {Kind: KindString, Buf: []byte("t2")}})
-	if err2 == nil {
-		t.Fatalf("T2 tryApplyHOTUpdate: got no error (used=%v); want SQLSTATE 40001", used2)
+	if err2 != nil {
+		t.Errorf("T2 tryApplyHOTUpdate: got error %v; want nil (EPQ fallback)", err2)
 	}
 	if used2 {
-		t.Errorf("T2 returned used=true with err=%v; want used=false on conflict", err2)
-	}
-	ee, ok := err2.(*ExecError)
-	if !ok || ee.Code != "40001" {
-		t.Errorf("T2 err = %v; want *ExecError code=40001", err2)
+		t.Errorf("T2 returned used=true; want used=false on conflict (EPQ fallback)")
 	}
 	_ = ctx.TxnMgr.Rollback(t2)
 }

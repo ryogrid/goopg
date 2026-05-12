@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +15,48 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// maxEPQRetries is the maximum number of EvalPlanQual re-checks before
+// escalating to SQLSTATE 40001. M0098-0004.
+const maxEPQRetries = 3
+
+// epqWait waits for the transaction that stamped xmax to commit or abort,
+// then refreshes the snapshot. Called after detecting a concurrent update
+// to implement PostgreSQL's EvalPlanQual wait phase under READ COMMITTED.
+// M0098-0004.
+func epqWait(ctx *Context, xmax storage.TransactionID) {
+	if ctx.TxnMgr == nil || xmax == storage.InvalidTransactionID {
+		return
+	}
+	qctx := ctx.Ctx
+	if qctx == nil {
+		qctx = context.Background()
+	}
+	_ = ctx.TxnMgr.WaitForXID(qctx, xmax)
+	if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
+		ctx.Snap = snap.Clone()
+	}
+}
+
+// epqRecheckVisible re-reads the tuple at (rel, blk, slot) and reports
+// whether it is still visible under the current snapshot. Returns false if
+// the row was committed by the conflicting transaction (skip the row),
+// true if the conflicting transaction aborted (row is still live, retry).
+// M0098-0004.
+func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) (bool, error) {
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return false, err
+	}
+	s.RLock()
+	tup, gerr := storage.PageGetHeapTuple(s.Page(), slot)
+	s.RUnlock()
+	ctx.Pool.Unpin(s)
+	if gerr != nil {
+		return false, nil // page read error → treat as not visible
+	}
+	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID), nil
+}
 
 var heapExtendLocks sync.Map // map[storage.RelFileNode]*sync.Mutex
 
@@ -812,17 +855,16 @@ func tryApplyHOTUpdate(
 	// are the cause of the pgbench scale-100 1,610-visible-rows
 	// symptom in pgbench_branches.
 	//
-	// goopg has no EvalPlanQual to re-fetch + re-evaluate, so the
-	// correct response is a serialization_failure (SQLSTATE 40001).
-	// The client retries; one transaction wins, the other aborts.
+	// EvalPlanQual (M0098-0004): on concurrent xmax conflict, wait for
+	// the conflicting transaction and fall back to the delete+insert path
+	// so it can re-check visibility.
 	if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), oldSlot); gerr == nil &&
 		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID) {
+		xmax := oldTuple.Header.Xmax
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		return false, &ExecError{
-			Code:    "40001",
-			Message: "could not serialize access due to concurrent update",
-		}
+		epqWait(ctx, xmax)
+		return false, nil // fall back to delete+insert; caller re-checks
 	}
 
 	newSlot, addErr := storage.PageAddHeapTuple(s.Page(), tup)
@@ -1031,54 +1073,71 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return nil, err
 			}
 		}
+		epqSkip := false
 		if !used {
 			// HOT ineligible or page full — fall back to normal delete+insert.
-			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
-			if err != nil {
-				return nil, err
-			}
-			s.Lock()
-			// M0090-0002: detect concurrent xmax-stamp under the
-			// exclusive Lock before our own stamp. Capture old tuple
-			// bytes for WAL logical record (M0094-0002).
-			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
+			// EvalPlanQual retry loop (M0098-0004): retry up to maxEPQRetries
+			// times when a concurrent xmax conflict is detected.
+			for epqRetry := 0; ; epqRetry++ {
+				s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+				if err != nil {
+					return nil, err
+				}
+				s.Lock()
+				// M0090-0002: detect concurrent xmax-stamp under the
+				// exclusive Lock before our own stamp. Capture old tuple
+				// bytes for WAL logical record (M0094-0002).
+				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+				if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
+					xmax := oldTup.Header.Xmax
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					if epqRetry >= maxEPQRetries {
+						return nil, &ExecError{
+							Code:    "40001",
+							Pos:     o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update",
+						}
+					}
+					epqWait(o.ctx, xmax)
+					visible, _ := epqRecheckVisible(o.ctx, rel, pu.blk, pu.slot)
+					if !visible {
+						epqSkip = true // row gone after conflict resolved
+						break
+					}
+					continue // retry: conflict txn aborted, row still alive
+				}
+				var oldTupleBytes []byte
+				if oldGerr == nil {
+					oldTupleBytes, _ = oldTup.MarshalBinary()
+				}
+				if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					if errors.Is(err, storage.ErrUnsupportedItem) {
+						// Concurrent UPDATE/DELETE or opportunistic
+						// prune flipped this slot out of LP_NORMAL
+						// after scan-time. Skip the row.
+						epqSkip = true
+						break
+					}
+					return nil, err
+				}
+				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
-				return nil, &ExecError{
-					Code:    "40001",
-					Pos:     o.plan.Pos(),
-					Message: "could not serialize access due to concurrent update",
+				if derr != nil {
+					return nil, derr
 				}
-			}
-			var oldTupleBytes []byte
-			if oldGerr == nil {
-				oldTupleBytes, _ = oldTup.MarshalBinary()
-			}
-			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
-				s.Unlock()
-				o.ctx.Pool.Unpin(s)
-				if errors.Is(err, storage.ErrUnsupportedItem) {
-					// Concurrent UPDATE/DELETE or opportunistic
-					// prune flipped this slot out of LP_NORMAL
-					// after scan-time. Skip — goopg has no
-					// EvalPlanQual yet, so we drop the row
-					// rather than abort the transaction.
-					continue
+				if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
+					return nil, err
 				}
-				return nil, err
-			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
-			s.Unlock()
-			o.ctx.Pool.Unpin(s)
-			if derr != nil {
-				return nil, derr
-			}
-			if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
-				return nil, err
+				break
 			}
 		}
-		o.rowsAffected++
+		if !epqSkip {
+			o.rowsAffected++
+		}
 	}
 	return nil, EOF
 }
@@ -1180,7 +1239,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 		}
+		epqSkipSeq := false
 		if !used {
+			// EvalPlanQual retry loop (M0098-0004).
+			for epqRetry := 0; ; epqRetry++ {
 			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk})
 			if err != nil {
 				return nil, err
@@ -1188,13 +1250,23 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			s.Lock()
 			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
 			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
+				xmax := oldTup.Header.Xmax
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
-				return nil, &ExecError{
-					Code:    "40001",
-					Pos:     o.plan.Pos(),
-					Message: "could not serialize access due to concurrent update",
+				if epqRetry >= maxEPQRetries {
+					return nil, &ExecError{
+						Code:    "40001",
+						Pos:     o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update",
+					}
 				}
+				epqWait(o.ctx, xmax)
+				visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
+				if !visible {
+					epqSkipSeq = true
+					break
+				}
+				continue
 			}
 			var oldTupleBytes []byte
 			if oldGerr == nil {
@@ -1228,8 +1300,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			if err := writeHeapRow(o.ctx, targetWriteRel, targetWriteCols, pu.newRow); err != nil {
 				return nil, err
 			}
+			break // success — exit epq retry loop
+			} // end epq retry loop
+		} // end if !used
+		if !epqSkipSeq {
+			o.rowsAffected++
 		}
-		o.rowsAffected++
 	}
 	return nil, EOF
 }
@@ -1338,6 +1414,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		if victimRel == (storage.RelFileNode{}) {
 			victimRel = rel // fallback to parent rel
 		}
+		// EvalPlanQual retry loop (M0098-0004): on concurrent xmax conflict,
+		// wait for the conflicting transaction and re-check visibility.
+		epqSkipDel := false
+		for epqRetry := 0; ; epqRetry++ {
 		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: victimRel, Block: v.blk})
 		if err != nil {
 			return nil, err
@@ -1347,13 +1427,23 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		// exclusive Lock before our own stamp.
 		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
 		if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
+			xmax := oldTup.Header.Xmax
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
-			return nil, &ExecError{
-				Code:    "40001",
-				Pos:     o.plan.Pos(),
-				Message: "could not serialize access due to concurrent update",
+			if epqRetry >= maxEPQRetries {
+				return nil, &ExecError{
+					Code:    "40001",
+					Pos:     o.plan.Pos(),
+					Message: "could not serialize access due to concurrent update",
+				}
 			}
+			epqWait(o.ctx, xmax)
+			visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
+			if !visible {
+				epqSkipDel = true
+				break
+			}
+			continue
 		}
 		var oldTupleBytes []byte
 		if oldGerr == nil {
@@ -1363,7 +1453,8 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if errors.Is(err, storage.ErrUnsupportedItem) {
-				continue
+				epqSkipDel = true
+				break
 			}
 			return nil, err
 		}
@@ -1373,7 +1464,11 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		if derr != nil {
 			return nil, derr
 		}
-		o.rowsAffected++
+		break // success — exit epq retry loop
+		} // end epq retry loop
+		if !epqSkipDel {
+			o.rowsAffected++
+		}
 	}
 	return nil, EOF
 }

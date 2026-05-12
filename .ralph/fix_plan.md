@@ -868,22 +868,18 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
       - All storage/initdb/wal/server tests pass with -race detector
       Design doc: docs/design/0098-0003-buffer-pool-128-partition-locking.md
 
-- [ ] **M0098-0004** — **EvalPlanQual (row recheck on concurrent UPDATE)**
-      — eliminates SQLSTATE 40001 aborts caused by xmax conflicts, replacing
-      them with a re-fetch of the latest committed tuple and predicate
-      recheck.
-      Implementation:
-      - When `isConcurrentlyUpdated()` detects an xmax conflict in
-        `updateOp` / `deleteOp`, spin-wait for the conflicting transaction
-        to commit or roll back, then re-read the tuple at the same TID.
-      - Re-evaluate the WHERE predicate against the freshened row; proceed
-        if it still matches, skip if it no longer matches (matches
-        PostgreSQL's `EvalPlanQual` semantics under `READ COMMITTED`).
-      - Bounded retry (max 3 rechecks) to avoid livelock; escalate to
-        40001 only on exhaustion.
-      - Prerequisite for M0096-0004 (isolation-test `eval-plan-qual` spec).
-      Expected: near-zero abort rate for standard workload → 10–20% effective
-      TPS gain on Standard.
+- [x] **M0098-0004** — **EvalPlanQual (row recheck on concurrent UPDATE)**.  2026-05-12.
+      Landed (internal/executor/operators_storage.go):
+      - epqWait(ctx, xmax): WaitForXID + snapshot refresh
+      - epqRecheckVisible(ctx, rel, blk, slot): re-reads tuple, checks TupleVisible
+      - tryApplyHOTUpdate conflict: wait + return (false, nil) to fall back to delete+insert
+      - updateViaIndex conflict: EPQ retry loop (max 3); skip on invisible, retry on visible
+      - updateOp.Next() SeqScan conflict: same EPQ retry loop
+      - deleteOp.Next() conflict: same EPQ retry loop
+      - maxEPQRetries = 3; escalates to 40001 only after exhaustion
+      - Updated TestConcurrentHOTUpdateDetectsRace for new EPQ semantics
+      - All executor/initdb/server -race tests pass
+      Design doc: docs/design/0098-0004-eval-plan-qual.md
 
 - [ ] **M0098-0005** — **Cross-session normalized-query plan cache**
       — eliminates re-parse + re-plan for identical queries across sessions.
