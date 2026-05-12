@@ -677,6 +677,35 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		return Datum{Kind: KindInt, Int: n}, nil
 
+	case "xid":
+		// xid is a 32-bit unsigned transaction ID. Accepts decimal, octal (0NNN), hex (0xNNN).
+		// -1 wraps to 4294967295, matching PostgreSQL behaviour. M0097-0018.
+		v := strings.TrimSpace(x.Value)
+		// Special case: PostgreSQL allows "-1" as 2^32-1 = 4294967295.
+		if v == "-1" {
+			return Datum{Kind: KindInt, Int: int64(uint32(0xffffffff))}, nil
+		}
+		n, err := parseXid(v)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type xid: %q", x.Value)}
+		}
+		return Datum{Kind: KindInt, Int: int64(n)}, nil
+
+	case "xid8":
+		// xid8 is a 64-bit unsigned transaction ID. M0097-0018.
+		v := strings.TrimSpace(x.Value)
+		// Special case: PostgreSQL allows "-1" as 2^64-1 = 18446744073709551615.
+		if v == "-1" {
+			return Datum{Kind: KindInt, Int: -1}, nil // int64(-1) == uint64(0xffffffffffffffff) bitwise
+		}
+		n, err := parseXid8(v)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
+				Message: fmt.Sprintf("invalid input syntax for type xid8: %q", x.Value)}
+		}
+		return Datum{Kind: KindInt, Int: int64(n)}, nil
+
 	case "date":
 		t, err := time.Parse("2006-01-02", x.Value)
 		if err != nil {
@@ -703,6 +732,220 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		// M0097-0017: enum/domain type casts return the string value as-is.
 		return NewStringDatum(x.Value), nil
 	}
+}
+
+// parseXid parses an xid value (unsigned 32-bit). Accepts decimal, octal (0NNN), hex (0xNNN).
+// M0097-0018.
+func parseXid(s string) (uint32, error) {
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		n, err := strconv.ParseUint(s[2:], 16, 32)
+		return uint32(n), err
+	}
+	if len(s) > 1 && s[0] == '0' {
+		n, err := strconv.ParseUint(s[1:], 8, 32)
+		return uint32(n), err
+	}
+	n, err := strconv.ParseUint(s, 10, 32)
+	return uint32(n), err
+}
+
+// parseXid8 parses an xid8 value (unsigned 64-bit). M0097-0018.
+func parseXid8(s string) (uint64, error) {
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		return strconv.ParseUint(s[2:], 16, 64)
+	}
+	return strconv.ParseUint(s, 10, 64)
+}
+
+// parsePgSnapshotValid returns true if s is a valid pg_snapshot literal.
+// Format: xmin:xmax[:xip,...]  M0097-0018.
+func parsePgSnapshotValid(s string) bool {
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	xmin, err1 := strconv.ParseUint(parts[0], 10, 64)
+	xmax, err2 := strconv.ParseUint(parts[1], 10, 64)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	if xmin > xmax {
+		return false
+	}
+	if len(parts) == 3 && parts[2] != "" {
+		for _, xip := range strings.Split(parts[2], ",") {
+			v, err := strconv.ParseUint(xip, 10, 64)
+			if err != nil {
+				return false
+			}
+			if v < xmin || v >= xmax {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// sizePretty formats a byte count as a human-readable size string, matching
+// PostgreSQL's pg_size_pretty() output. Uses 1024-based units. M0097-0018.
+//
+// The unit is chosen by computing the ROUNDED value at each level:
+// if the rounded value >= 10240, promote to the next unit. This matches
+// PostgreSQL's actual behaviour where, e.g., 10485248 → "10 MB" because
+// round(10485248/1024) = 10240 kB ≥ 10240, so it's shown as 10 MB instead.
+func sizePretty(bytes int64) string {
+	neg := bytes < 0
+	if neg {
+		bytes = -bytes
+	}
+	const (
+		kBu = int64(1024)
+		MBu = int64(1024 * 1024)
+		GBu = int64(1024 * 1024 * 1024)
+		TBu = int64(1024 * 1024 * 1024 * 1024)
+		PBu = int64(1024 * 1024 * 1024 * 1024 * 1024)
+	)
+	// halfRound: integer division with round-half-up.
+	halfRound := func(n, unit int64) int64 { return (n + unit/2) / unit }
+	var result string
+	if bytes < 10*kBu {
+		if bytes == 1 {
+			result = "1 byte"
+		} else {
+			result = fmt.Sprintf("%d bytes", bytes)
+		}
+	} else if kbVal := halfRound(bytes, kBu); kbVal < 10240 {
+		result = fmt.Sprintf("%d kB", kbVal)
+	} else if mbVal := halfRound(bytes, MBu); mbVal < 10240 {
+		result = fmt.Sprintf("%d MB", mbVal)
+	} else if gbVal := halfRound(bytes, GBu); gbVal < 10240 {
+		result = fmt.Sprintf("%d GB", gbVal)
+	} else if tbVal := halfRound(bytes, TBu); tbVal < 10240 {
+		result = fmt.Sprintf("%d TB", tbVal)
+	} else {
+		result = fmt.Sprintf("%d PB", halfRound(bytes, PBu))
+	}
+	if neg {
+		return "-" + result
+	}
+	return result
+}
+
+// sizePrettyFloat formats a fractional byte count as a human-readable size string.
+// Used for numeric (non-integer) inputs to pg_size_pretty. M0097-0018.
+func sizePrettyFloat(f float64) string {
+	neg := f < 0
+	if neg {
+		f = -f
+	}
+	var result string
+	const (
+		kB = float64(1024)
+		MB = float64(1024 * 1024)
+		GB = float64(1024 * 1024 * 1024)
+		TB = float64(1024 * 1024 * 1024 * 1024)
+		PB = float64(1024 * 1024 * 1024 * 1024 * 1024)
+	)
+	switch {
+	case f < 10*kB:
+		if f == 1 {
+			result = "1 byte"
+		} else {
+			// Format with decimal point only if fractional.
+			if f == float64(int64(f)) {
+				result = fmt.Sprintf("%d bytes", int64(f))
+			} else {
+				result = fmt.Sprintf("%g bytes", f)
+			}
+		}
+	case f < 10*MB:
+		result = fmt.Sprintf("%d kB", int64(f/kB))
+	case f < 10*GB:
+		result = fmt.Sprintf("%d MB", int64(f/MB))
+	case f < 10*TB:
+		result = fmt.Sprintf("%d GB", int64(f/GB))
+	case f < 10*PB:
+		result = fmt.Sprintf("%d TB", int64(f/TB))
+	default:
+		result = fmt.Sprintf("%d PB", int64(f/PB))
+	}
+	if neg {
+		return "-" + result
+	}
+	return result
+}
+
+// parseSizeBytes parses a human-readable size string into bytes.
+// Supports units: bytes/B, kB, MB, GB, TB, PB (case-insensitive).
+// Also accepts scientific notation (e.g. "1e6 MB"). M0097-0018.
+func parseSizeBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("invalid size: empty string")
+	}
+
+	// Find where the numeric part ends and the unit begins.
+	i := 0
+	// Allow optional leading sign.
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		i++
+	}
+	// Digits, dot, and exponent.
+	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '-' || s[i] == '+') {
+		i++
+	}
+	numStr := strings.TrimSpace(s[:i])
+	unitStr := strings.TrimSpace(s[i:])
+
+	if numStr == "" || numStr == "-" || numStr == "+" {
+		return 0, fmt.Errorf("invalid size: %q", s)
+	}
+
+	// Handle trailing decimal point: "1." → "1.0"
+	if strings.HasSuffix(numStr, ".") {
+		numStr += "0"
+	}
+
+	val, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size: %q", s)
+	}
+
+	// Check for overflow or infinite.
+	if math.IsInf(val, 0) || math.IsNaN(val) {
+		return 0, fmt.Errorf("invalid size: %q", s)
+	}
+
+	var multiplier float64
+	switch strings.ToLower(unitStr) {
+	case "", "b", "byte", "bytes":
+		multiplier = 1
+	case "kb", "kib":
+		multiplier = 1024
+	case "mb", "mib":
+		multiplier = 1024 * 1024
+	case "gb", "gib":
+		multiplier = 1024 * 1024 * 1024
+	case "tb", "tib":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	case "pb", "pib":
+		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("invalid size unit: %q", unitStr)
+	}
+
+	result := val * multiplier
+	if math.IsInf(result, 0) || math.IsNaN(result) {
+		return 0, fmt.Errorf("size out of range: %q", s)
+	}
+	// MaxInt64 as float64 rounds to 9.223372036854776e18; values strictly
+	// greater than that can't fit in int64.
+	const maxInt64Float = float64(1 << 63) // 9.223372036854776e18
+	if result >= maxInt64Float || result < -maxInt64Float {
+		return 0, fmt.Errorf("size out of range: %q", s)
+	}
+	// Truncate toward zero, matching PostgreSQL behaviour (e.g. -.1 kB → -102).
+	return int64(result), nil
 }
 
 // evalExtract implements `EXTRACT(field FROM source)` for the
@@ -1718,8 +1961,114 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// for a given type. Stub returns true (best-effort) — returning an error
 	// would cause boolean.sql to hang waiting for a SRF response.
 	case "pg_input_is_valid":
+		// M0097-0018: enhanced to validate xid/xid8 inputs.
+		if len(x.Args) == 2 {
+			val, _ := evalExpr(x.Args[0], row, ctx)
+			typName, _ := evalExpr(x.Args[1], row, ctx)
+			if val.IsNull() || typName.IsNull() {
+				return NullDatum, nil
+			}
+			v := strings.TrimSpace(val.StringValue())
+			t := strings.ToLower(strings.TrimSpace(typName.StringValue()))
+			switch t {
+			case "xid":
+				_, err := parseXid(v)
+				return NewBoolDatum(err == nil), nil
+			case "xid8":
+				_, err := parseXid8(v)
+				return NewBoolDatum(err == nil), nil
+			case "pg_snapshot":
+				return NewBoolDatum(parsePgSnapshotValid(v)), nil
+			}
+		}
 		return NewBoolDatum(true), nil
 	case "pg_input_error_info":
+		return NullDatum, nil
+
+	// ── Size functions (M0097-0018) ───────────────────────────────────────
+	case "pg_size_pretty":
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			// Accept both integer and numeric (string) types.
+			var byteVal int64
+			var fracBytes float64
+			var hasFrac bool
+			if v.Kind == KindInt {
+				byteVal = v.Int
+			} else {
+				// numeric stored as string
+				s := strings.TrimSpace(v.StringValue())
+				if f, err2 := strconv.ParseFloat(s, 64); err2 == nil {
+					byteVal = int64(f)
+					if f != float64(int64(f)) {
+						hasFrac = true
+						fracBytes = f
+					}
+				} else {
+					return NullDatum, nil
+				}
+			}
+			if hasFrac {
+				return NewStringDatum(sizePrettyFloat(fracBytes)), nil
+			}
+			return NewStringDatum(sizePretty(byteVal)), nil
+		}
+
+	case "pg_size_bytes":
+		if len(x.Args) == 1 {
+			s, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || s.IsNull() {
+				return NullDatum, nil
+			}
+			bytes, err2 := parseSizeBytes(s.StringValue())
+			if err2 != nil {
+				return Datum{}, &ExecError{Code: "22P02", Message: err2.Error()}
+			}
+			return Datum{Kind: KindInt, Int: bytes}, nil
+		}
+
+	case "pg_database_size":
+		// Stub: return 8 MB. M0097-0018.
+		return Datum{Kind: KindInt, Int: 8 * 1024 * 1024}, nil
+
+	case "pg_relation_size", "pg_total_relation_size", "pg_indexes_size":
+		// Stub: return 8 kB. M0097-0018.
+		return Datum{Kind: KindInt, Int: 8 * 1024}, nil
+
+	case "pg_table_size":
+		// Stub: return 8 kB. M0097-0018.
+		return Datum{Kind: KindInt, Int: 8 * 1024}, nil
+
+	// ── xid8 comparison function (M0097-0018) ─────────────────────────────
+	case "xid8cmp":
+		if len(x.Args) == 2 {
+			a, err1 := evalExpr(x.Args[0], row, ctx)
+			b, err2 := evalExpr(x.Args[1], row, ctx)
+			if err1 != nil || err2 != nil || a.IsNull() || b.IsNull() {
+				return NullDatum, nil
+			}
+			var aVal, bVal uint64
+			if a.Kind == KindInt {
+				aVal = uint64(a.Int)
+			} else {
+				aVal, _ = strconv.ParseUint(strings.TrimSpace(a.StringValue()), 10, 64)
+			}
+			if b.Kind == KindInt {
+				bVal = uint64(b.Int)
+			} else {
+				bVal, _ = strconv.ParseUint(strings.TrimSpace(b.StringValue()), 10, 64)
+			}
+			if aVal < bVal {
+				return Datum{Kind: KindInt, Int: -1}, nil
+			}
+			if aVal > bVal {
+				return Datum{Kind: KindInt, Int: 1}, nil
+			}
+			return Datum{Kind: KindInt, Int: 0}, nil
+		}
 		return NullDatum, nil
 
 	// ── Hash / crypto functions (M0097-0011) ─────────────────────────────
