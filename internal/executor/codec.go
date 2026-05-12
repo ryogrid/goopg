@@ -632,6 +632,38 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 		}
+		// varchar(N) and char(N) length enforcement. M0097-0003.
+		tname := strings.ToLower(t.Name)
+		if tname == "varchar" || tname == "character varying" {
+			if len(t.Args) > 0 {
+				n := int(t.Args[0])
+				// Strip trailing spaces: PostgreSQL accepts trailing spaces if the
+				// stripped value fits within N (e.g., 'c     ' → 'c' in varchar(1)).
+				stripped := strings.TrimRight(s, " ")
+				if len(stripped) > n {
+					return nil, &ExecError{Code: "22001",
+						Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
+				}
+				s = stripped
+			}
+		} else if tname == "char" || tname == "bpchar" || tname == "character" {
+			// Bare `char` with no length argument defaults to char(1) in PostgreSQL.
+			n := 1
+			if len(t.Args) > 0 {
+				n = int(t.Args[0])
+			}
+
+			stripped := strings.TrimRight(s, " ")
+			if len(stripped) > n {
+				return nil, &ExecError{Code: "22001",
+					Message: fmt.Sprintf("value too long for type character(%d)", n)}
+			}
+			// Store the stripped value; the DataRow output path re-pads to N
+			// for wire protocol display so psql sees N-width char columns.
+			// We do NOT pad in storage to avoid breaking comparison semantics
+			// (compareDatum uses strings.Compare which is padding-sensitive). M0097-0003.
+			s = stripped
+		}
 		return encodeVarlen([]byte(s)), nil
 	}
 }

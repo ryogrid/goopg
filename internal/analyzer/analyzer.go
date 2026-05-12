@@ -1726,6 +1726,11 @@ func isAssignable(src, dst catalog.Type) bool {
 	if isStringTypeName(src.Name) && isOidOrUUIDTarget(dst.Name) {
 		return true
 	}
+	// PostgreSQL allows integer/numeric values to be inserted into text/varchar
+	// columns via implicit cast. M0097-0003.
+	if isNumericTypeName(src.Name) && isStringTypeName(dst.Name) {
+		return true
+	}
 	return false
 }
 
