@@ -732,6 +732,26 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 		}
 		ns := int64(binary.BigEndian.Uint64(data[:8]))
 		return NewTimeDatum(time.Unix(0, ns).UTC()), 8, nil
+	case "float8", "double precision", "double", "float4", "real":
+		// Stored as varlen text. Decode as KindNumeric for proper numeric sort/comparison.
+		// M0097-0003.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated float")
+		}
+		n := int(binary.BigEndian.Uint32(data[:4]))
+		if 4+n > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated float body")
+		}
+		text := string(data[4 : 4+n])
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
+		}
+		m, s, err := parseNumeric(text)
+		if err == nil {
+			return newNumeric(m, int(s)), 4 + n, nil
+		}
+		// NaN / infinity fall back to string (handled by comparison/display).
+		return NewStringDatum(text), 4 + n, nil
 	case "numeric", "decimal":
 		// Stored as varlen text. Parse into KindNumeric so
 		// arithmetic and comparison can run through the
@@ -818,6 +838,24 @@ func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, er
 		}
 		ns := int64(binary.BigEndian.Uint64(data[:8]))
 		return NewTimeDatum(time.Unix(0, ns).UTC()), 8, nil
+	case "float8", "double precision", "double", "float4", "real":
+		// Same as decodeValue: decode as KindNumeric for proper sort. M0097-0003.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated float")
+		}
+		n := int(binary.BigEndian.Uint32(data[:4]))
+		if 4+n > len(data) {
+			return Datum{}, 0, fmt.Errorf("truncated float body")
+		}
+		text := string(data[4 : 4+n])
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
+		}
+		m, s, err := parseNumeric(text)
+		if err == nil {
+			return newNumeric(m, int(s)), 4 + n, nil
+		}
+		return NewStringDatum(text), 4 + n, nil
 	case "numeric", "decimal":
 		// Numeric stays on the parse path — Datum.Int / Big /
 		// Scale carry the value, no Buf payload to arena.

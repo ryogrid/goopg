@@ -3482,6 +3482,33 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "localtimestamp":
 		return NewTimeDatum(ctx.Now), nil
 	}
+
+	// Function-style type casts: int4(x), float8(x), text(x), etc.
+	// PostgreSQL allows type names as function names for casting. M0097-0003.
+	if len(x.Args) == 1 {
+		typeName := name
+		switch typeName {
+		case "int2", "smallint",
+			"int4", "integer", "int",
+			"int8", "bigint",
+			"float4", "real",
+			"float8", "double precision",
+			"numeric", "decimal",
+			"text", "varchar", "bpchar", "char",
+			"bool", "boolean",
+			"oid", "date", "timestamp", "timestamptz",
+			"time", "timetz", "interval":
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if v.IsNull() {
+				return NullDatum, nil
+			}
+			return evalCast(v, typeName, x.Pos())
+		}
+	}
+
 	return evalStoredRoutineFuncCall(x, row, ctx)
 }
 
