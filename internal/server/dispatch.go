@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"runtime/debug"
@@ -276,6 +277,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			}
 		}
 		if err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached); err != nil {
+			if errors.Is(err, errQueryErrorSent) {
+				// Error + ReadyForQuery already sent to the client (M0097-0003).
+				// Do NOT send another ReadyForQuery — that would produce a double
+				// RFQ that causes psql to print "message type 0x5a arrived from
+				// server while idle". Just return nil so the connection stays alive.
+				return nil
+			}
 			return err
 		}
 	}

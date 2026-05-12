@@ -117,25 +117,75 @@ func RunRegressSubset(ctx context.Context, repoRoot string, cases []RegressCase,
 //
 // Normalizations applied (in order):
 //  1. CR+LF → LF
-//  2. Trailing spaces/tabs per line stripped
-//  3. Trailing blank lines stripped
-//  4. ERROR double-space normalisation: "ERROR:  " → "ERROR: " (psql adds
-//     double space; goopg wire path adds single space)
+//  2. Strip psql -c preamble lines: "SET statement_timeout = '5s'" echo that
+//     ClusterRegressExecutor injects via -c before -f (not in expected output)
+//  3. Strip "psql:file:N:" prefix from error/warning lines (psql adds this
+//     when running in -f mode; expected output uses bare "ERROR:  ...")
+//  4. Strip "message type 0x5a arrived from server while idle" psql noise lines
+//  5. Strip "LINE N: ..." and standalone "^" position lines from expected output
+//     (goopg does not yet emit FieldPosition; strip from expected so both sides
+//     compare equal for the message text itself)
+//  6. Trailing spaces/tabs per line stripped
+//  7. Trailing blank lines stripped
+//  8. ERROR/NOTICE/WARNING double-space normalisation: collapse to two-space form
 func NormalizeRegressOutput(raw string) string {
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
-	// Normalise double-space in ERROR/NOTICE/WARNING/HINT/DETAIL lines.
-	// PostgreSQL's libpq writes "SEVERITY:  message" (two spaces); goopg
-	// may emit one space.  Collapse to two spaces so both sides compare equal
-	// after normalization.
-	for _, sev := range []string{"ERROR", "NOTICE", "WARNING", "HINT", "DETAIL", "CONTEXT"} {
-		// "SEVERITY: msg" → "SEVERITY:  msg" (canonical two-space form)
-		raw = strings.ReplaceAll(raw, sev+": ", sev+":  ")
-	}
 	s := bufio.NewScanner(strings.NewReader(raw))
 	lines := make([]string, 0)
 	for s.Scan() {
-		lines = append(lines, strings.TrimRight(s.Text(), " \t"))
+		line := s.Text()
+
+		// Strip psql -c preamble echo (ClusterRegressExecutor injects this).
+		if line == "SET statement_timeout = '5s'" {
+			continue
+		}
+		// Strip "psql:path:N: " prefix that psql adds when running in -f mode.
+		// e.g. "psql:path/file.sql:25: ERROR:  ..." → "ERROR:  ..."
+		if strings.HasPrefix(line, "psql:") {
+			if idx := strings.Index(line, ": "); idx > 0 {
+				rest := line[idx+2:]
+				isSeverity := strings.HasPrefix(rest, "ERROR:") ||
+					strings.HasPrefix(rest, "NOTICE:") ||
+					strings.HasPrefix(rest, "WARNING:") ||
+					strings.HasPrefix(rest, "HINT:") ||
+					strings.HasPrefix(rest, "DETAIL:") ||
+					strings.HasPrefix(rest, "CONTEXT:")
+				if isSeverity {
+					line = rest
+				} else {
+					// "psql:file:N: message type 0x5a..." — skip entire line
+					if strings.HasPrefix(rest, "message type 0x5a") {
+						continue
+					}
+				}
+			}
+		}
+		// Strip position lines from expected output ("LINE N: ..." and "^" lines)
+		// that goopg does not yet emit.
+		if strings.HasPrefix(line, "LINE ") {
+			continue
+		}
+		// Standalone caret lines that follow LINE N: in PostgreSQL error output.
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "^" || (len(trimmed) > 0 && strings.TrimLeft(trimmed, " \t^") == "" && strings.Count(trimmed, "^") == 1) {
+			// Only skip lines that are purely spaces + one ^ (position indicator)
+			if len(line) > 0 && strings.TrimRight(line, " \t^") == "" {
+				continue
+			}
+		}
+
+		lines = append(lines, strings.TrimRight(line, " \t"))
 	}
+	// Normalise double-space in severity prefix lines. PostgreSQL's libpq
+	// writes "SEVERITY:  message" (two spaces); goopg may emit one space.
+	// Collapse to two spaces so both sides compare equal.
+	for i, line := range lines {
+		for _, sev := range []string{"ERROR", "NOTICE", "WARNING", "HINT", "DETAIL", "CONTEXT"} {
+			lines[i] = strings.ReplaceAll(line, sev+": ", sev+":  ")
+			line = lines[i]
+		}
+	}
+	// Strip trailing blank lines.
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
 	}

@@ -905,7 +905,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 				// stream is re-synchronised. Send a proper error response and
 				// keep the session alive so HammerDB / libpq can retry.
 				logger.Info("oversized client message rejected", "err", err)
-				if werr := s.writeQueryError(w, sqlstate.ProtocolViolation, err.Error()); werr != nil {
+				if werr := s.writeQueryError(w, sqlstate.ProtocolViolation, err.Error()); werr != nil && !errors.Is(werr, errQueryErrorSent) {
 					logger.Info("write error after oversized message", "err", werr)
 					return
 				}
@@ -960,6 +960,10 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 				entry.clearQueryCancel()
 				queryCancel()
 				if err != nil {
+					if errors.Is(err, errQueryErrorSent) {
+						// Error + ReadyForQuery already sent cleanly.
+						break
+					}
 					logger.Info("replication command write error", "err", err)
 					return
 				}
@@ -971,6 +975,11 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {
+				if errors.Is(err, errQueryErrorSent) {
+					// Error + ReadyForQuery already sent cleanly; keep connection.
+					// The client received the error and will send the next Query.
+					break
+				}
 				logger.Info("query write error", "err", err)
 				return
 			}

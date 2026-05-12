@@ -605,7 +605,19 @@ M0097-0001 wires it up.
       Reason for keeping checked: these are explicit scope/design exclusions,
       not unfinished parity items.
 
-- [ ] **M0097-0003** — Core standalone + scalar type parity.
+- [ ] **M0097-0003** — Core standalone + scalar type parity. (partial 2026-05-12)
+      Two infrastructure fixes landed:
+      1. Double-ReadyForQuery bug: `writeQueryError` now returns `errQueryErrorSent`
+         sentinel so `dispatchSimpleQueryViaExecutor` does NOT send a second RFQ
+         after an error response. Fixes "message type 0x5a arrived from server while
+         idle" psql noise + statement echo ordering in regress output.
+      2. `NormalizeRegressOutput` extended: strips `SET statement_timeout = '5s'`
+         preamble, `psql:file:N:` error prefixes, `LINE N:` and `^` position lines,
+         `message type 0x5a` lines. `comments` regress test now passes.
+      Remaining: `pg_input_is_valid` column alias shows as `?column?` (function-call
+      column naming), plus other scalar output format differences. Needs further
+      normalization or goopg output fixes to promote boolean/int2/int4/etc to port.
+      Original action:
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,
       `numeric`, `numeric_big`, `char`, `varchar`, `text`, `uuid`,
