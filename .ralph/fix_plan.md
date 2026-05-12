@@ -881,19 +881,16 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
       - All executor/initdb/server -race tests pass
       Design doc: docs/design/0098-0004-eval-plan-qual.md
 
-- [ ] **M0098-0005** — **Cross-session normalized-query plan cache**
-      — eliminates re-parse + re-plan for identical queries across sessions.
-      Implementation:
-      - Add a server-level `PlanCache` (LRU, bounded by
-        `plan_cache_size` GUC, default 512 entries) keyed by the
-        normalized SQL string (literals replaced with `$N` placeholders).
-      - On `Parse` (extended protocol) or `SimpleQuery`, normalize the text,
-        check the cache, and return the cached plan if present.
-      - Cache entries are invalidated on DDL changes to referenced relations.
-      - Use `sync.Map` (or a sharded `map + sync.RWMutex`) for lock-free
-        read-path (§8 in `go_rdbms_performance_techniques.md`).
-      Expected: 20–40% reduction in per-transaction CPU overhead for
-      repeated-query workloads like pgbench.
+- [x] **M0098-0005** — **Cross-session normalized-query plan cache**.  2026-05-12.
+      Landed (internal/server/plancache.go + dispatch.go + dispatch_extended.go):
+      - planCache: 16-shard FNV-1a, 512 total entries, FIFO eviction
+      - Key: normalizeCompatSQL(sql) (lowercase + whitespace-collapsed)
+      - Simple query path: single-stmt cache lookup before planner.Plan
+      - Extended protocol: cache lookup+store in executeExtendedQueryViaExecutor
+      - DDL invalidates all shards (clears stale catalog references)
+      - planCacheIsCacheable: excludes DDL/Transaction/Copy nodes
+      - Server.pc init when hasStorage(); all server -race tests pass
+      Design doc: docs/design/0098-0005-plan-cache.md
 
 - [x] **M0098-0006** — **Memory allocation hot-path reduction (item a)**.  2026-05-12.
       Landed (commit below):

@@ -46,10 +46,32 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		return nil, &extendedQueryError{Code: sqlstate.SyntaxError, Message: "extended query may contain only one statement"}
 	}
 	stmt := stmts[0]
-	node, err := planner.Plan(stmt, s.cfg.Catalog)
-	if err != nil {
-		code, msg := planErrorFields(err)
-		return nil, &extendedQueryError{Code: code, Message: msg}
+	// M0098-0005: cross-session plan cache for extended protocol.
+	// The same parameterized query is shared across all 100 pgbench
+	// connections — one planning call serves them all.
+	var node planner.Node
+	if s.pc != nil {
+		key := normalizeCompatSQL(query)
+		if cached, ok := s.pc.Get(key); ok {
+			node = cached
+		} else {
+			var perr error
+			node, perr = planner.Plan(stmt, s.cfg.Catalog)
+			if perr != nil {
+				code, msg := planErrorFields(perr)
+				return nil, &extendedQueryError{Code: code, Message: msg}
+			}
+			if planCacheIsCacheable(node) {
+				s.pc.Put(key, node)
+			}
+		}
+	} else {
+		var perr error
+		node, perr = planner.Plan(stmt, s.cfg.Catalog)
+		if perr != nil {
+			code, msg := planErrorFields(perr)
+			return nil, &extendedQueryError{Code: code, Message: msg}
+		}
 	}
 
 	if tx, ok := node.(*planner.Transaction); ok {
@@ -150,6 +172,10 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	res.CommandTag = commandTagFor(node, op, rowCount)
 	if res.CommandTag == "" {
 		res.CommandTag = "OK"
+	}
+	// DDL invalidates the cross-session plan cache. M0098-0005.
+	if _, isDDL := node.(*planner.DDL); isDDL && s.pc != nil {
+		s.pc.Invalidate()
 	}
 	return res, nil
 }

@@ -274,6 +274,10 @@ type Server struct {
 	// in memory only; persistence via pg_auth is deferred.
 	rolesMu sync.RWMutex
 	roles   map[string]struct{}
+
+	// pc is the cross-session normalized-query plan cache. M0098-0005.
+	// nil when the server is in protocol-only mode (no catalog/storage).
+	pc *planCache
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
@@ -286,6 +290,10 @@ func New(cfg Config) *Server {
 		roles:     map[string]struct{}{"postgres": {}},
 	}
 	s.nextPID.Store(0)
+	// Initialize plan cache when storage handles are present (M0098-0005).
+	if cfg.hasStorage() {
+		s.pc = newPlanCache()
+	}
 	return s
 }
 

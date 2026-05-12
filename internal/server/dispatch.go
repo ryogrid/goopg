@@ -253,7 +253,29 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		}
 		ectx.Snap = snap2
 
-		if err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit); err != nil {
+		// M0098-0005: plan cache for single-statement queries (the
+		// common OLTP case). On hit: skip planner.Plan. On miss:
+		// plan, cache, then execute.
+		var precached planner.Node
+		var cacheKey string
+		if s.pc != nil && len(stmts) == 1 {
+			cacheKey = normalizeCompatSQL(sql)
+			if cached, ok := s.pc.Get(cacheKey); ok {
+				precached = cached
+			} else {
+				// Cache miss: plan now so we can store it.
+				freshNode, perr := planner.Plan(stmt, s.cfg.Catalog)
+				if perr != nil {
+					code, msg := planErrorFields(perr)
+					return s.writeQueryError(w, code, msg)
+				}
+				if planCacheIsCacheable(freshNode) {
+					s.pc.Put(cacheKey, freshNode)
+				}
+				precached = freshNode
+			}
+		}
+		if err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached); err != nil {
 			return err
 		}
 	}
@@ -387,11 +409,21 @@ func normalizeCompatSQL(sql string) string {
 // state so BEGIN/COMMIT/ROLLBACK can open/close real TxnMgr transactions.
 // autoCommitPtr, if non-nil, is set to false when a BEGIN starts an
 // explicit transaction (telling the caller not to auto-commit).
-func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool) error {
-	node, err := planner.Plan(stmt, s.cfg.Catalog)
-	if err != nil {
-		code, msg := planErrorFields(err)
-		return s.writeQueryError(w, code, msg)
+// cachedNode, when non-nil, is a pre-validated plan from the cross-session
+// plan cache — planner.Plan is skipped. M0098-0005.
+func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool, cachedNode ...planner.Node) error {
+	var node planner.Node
+	if len(cachedNode) > 0 && cachedNode[0] != nil {
+		node = cachedNode[0]
+	} else {
+		var err error
+		node, err = planner.Plan(stmt, s.cfg.Catalog)
+		if err != nil {
+			code, msg := planErrorFields(err)
+			return s.writeQueryError(w, code, msg)
+		}
+		// Note: plan cache storage happens at the dispatch level (caller
+		// stores if cacheKey was computed). This function only executes.
 	}
 	// Transaction verbs: BEGIN/COMMIT/ROLLBACK require per-connection
 	// explicit transaction management (M0096-0005). BEGIN promotes the
@@ -518,6 +550,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	tag := commandTagFor(node, op, rowCount)
 	if tag == "" {
 		tag = "OK"
+	}
+	// Invalidate plan cache after DDL so stale schema references are
+	// never reused by concurrent sessions. M0098-0005.
+	if _, isDDL := node.(*planner.DDL); isDDL && s.pc != nil {
+		s.pc.Invalidate()
 	}
 	return w.WriteCommandComplete(tag)
 }
