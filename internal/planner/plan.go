@@ -726,6 +726,18 @@ type PgInputErrorInfo struct {
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 
+// ScalarFuncScan returns a single row from a scalar function call used in
+// the FROM clause (e.g. `FROM parse_ident(...) AS a`). The function result
+// is returned as a single column named ColName with type ColType. M0097-0003.
+type ScalarFuncScan struct {
+	pos     int
+	Func    Expr
+	schema  Schema
+}
+
+func (n *ScalarFuncScan) Pos() int       { return n.pos }
+func (n *ScalarFuncScan) Output() Schema { return n.schema }
+
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed
 // receive NULL (or their declared default once defaults are wired).

@@ -2363,6 +2363,30 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewBoolDatum(a.BoolValue() != b.BoolValue()), nil
 		}
 
+	case "array_subscript":
+		// array_subscript(arr text[], idx int) → text
+		// Array element access: arr[idx] (1-based). Used for SQL a[N] syntax. M0097-0003.
+		if len(x.Args) == 2 {
+			arr, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			idxDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() || idxDatum.IsNull() {
+				return NullDatum, nil
+			}
+			n := idxDatum.Int
+			elems := parseTextArray(arr.StringValue())
+			if n < 1 || int(n) > len(elems) {
+				return NullDatum, nil
+			}
+			return NewStringDatum(elems[n-1]), nil
+		}
+		return NullDatum, nil
+
 	case "parse_ident":
 		// parse_ident(str text [, strict boolean = true]) → text[]
 		// Parses a qualified SQL identifier string and returns its components

@@ -884,6 +884,16 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		default:
 			return catalog.Type{Name: "unknown"}, nil
 		}
+	case *parser.ArraySubscriptExpr:
+		// Array element access: expr[index] → element type. For text[] the element is text.
+		// Just analyze sub-expressions and return text (most common case). M0097-0003.
+		if _, err := analyzeExpr(x.Base, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Index, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "text"}, nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}

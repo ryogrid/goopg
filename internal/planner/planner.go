@@ -1249,6 +1249,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_input_error_info") {
 		return planPgInputErrorInfo(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "parse_ident") {
+		return planScalarFuncScan(rv, sourceIdx, "text[]")
+	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
@@ -1289,6 +1292,38 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int8"}, SourceTableIdx: sourceIdx}}
 	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planScalarFuncScan plans a scalar function in FROM clause that returns one
+// row with a single column of the given colType. Used for parse_ident etc.
+func planScalarFuncScan(rv parser.RangeVar, sourceIdx int16, colType string) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = strings.ToLower(tf.Name)
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	ctx := &resolveContext{}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		pa, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, pa)
+	}
+	fc := &FuncCall{pos: tf.Pos(), Name: strings.ToLower(tf.Name), Args: args}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: colType}, SourceTableIdx: sourceIdx}}
+	tbl := &catalog.Table{
+		Name:    alias,
+		Columns: []catalog.Column{{Name: colName, Type: catalog.Type{Name: colType}, Ordinal: 0}},
+	}
+	node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -3942,6 +3977,18 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
+	case *parser.ArraySubscriptExpr:
+		// expr[index] — array element access. Convert to array_subscript(base, index)
+		// so the executor can handle it without a new plan node type. M0097-0003.
+		base, err := resolveExpr(x.Base, ctx)
+		if err != nil {
+			return nil, err
+		}
+		idx, err := resolveExpr(x.Index, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &FuncCall{pos: x.Pos(), Name: "array_subscript", Args: []Expr{base, idx}}, nil
 	}
 	return nil, &PlanError{Pos: e.Pos(), Code: "0A000", Message: fmt.Sprintf("unsupported expression %T", e)}
 }

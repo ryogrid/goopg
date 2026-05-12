@@ -26,6 +26,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newGenerateSeriesOp(p)), nil
 	case *planner.PgInputErrorInfo:
 		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
+	case *planner.ScalarFuncScan:
+		return maybeInstrument(p, newScalarFuncScanOp(p)), nil
 	case *planner.CTEScan:
 		// CTEScan is a labeling wrap from M0016-0004 — Stage A
 		// inlines the CTE body under the wrap, so executing it

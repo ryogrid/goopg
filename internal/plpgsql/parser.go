@@ -819,14 +819,18 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 			consume()
 		}
 	}
-	// Array suffix: text[] — consume '[]' pairs. M0097-0003.
+	// Save endPos before consuming array suffix — the SQL parser doesn't
+	// support `text[]` notation, so we parse the base type only. M0097-0003.
+	baseEndPos := endPos
+	// Array suffix: text[] — consume '[]' pairs from token stream but exclude
+	// from the source fed to the SQL type parser.
 	for p.cur().Kind == parser.TokenSymbol && p.cur().Value == "[" {
-		consume() // '['
+		p.advance() // '['
 		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "]" {
-			consume() // ']'
+			p.advance() // ']'
 		}
 	}
-	src := p.src[startPos:endPos]
+	src := p.src[startPos:baseEndPos]
 	stmts, err := parser.Parse("CREATE TABLE _t (_c " + src + ")")
 	if err != nil {
 		return parser.ColumnType{}, p.errAt(startPos, "type %q: %v", src, err)

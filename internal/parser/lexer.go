@@ -117,6 +117,11 @@ func (l *lexer) next() (Token, error) {
 			l.pos++
 		}
 		text := strings.ToLower(l.src[start:l.pos])
+		// E'...' escape-string literal: single character 'e'/'E' immediately
+		// followed by a single-quote with no whitespace.
+		if (text == "e") && l.pos < len(l.src) && l.src[l.pos] == '\'' {
+			return l.lexEscapeString(start)
+		}
 		if kw, ok := keywords[text]; ok {
 			return Token{Kind: TokenKeyword, Keyword: kw, Value: text, Pos: start}, nil
 		}
@@ -340,6 +345,116 @@ func (l *lexer) next() (Token, error) {
 	}
 
 	return Token{}, l.errf(start, "unexpected character %q", c)
+}
+
+// lexEscapeString handles E'...' escape-string literals. The E/e prefix has
+// already been consumed and l.pos points at the opening single-quote.
+// Supported escape sequences (PostgreSQL-compatible):
+//
+//	\n \t \r \b \f \v  — C-style single-char escapes
+//	\ooo               — octal (1-3 digits)
+//	\xhh               — hex (1-2 digits)
+//	\uXXXX             — Unicode 4-hex-digit codepoint
+//	\UXXXXXXXX         — Unicode 8-hex-digit codepoint
+//	\'                 — literal single-quote
+//	\\                 — literal backslash
+//	''                 — literal single-quote (standard SQL doubling)
+func (l *lexer) lexEscapeString(start int) (Token, error) {
+	l.pos++ // consume opening '\''
+	var b strings.Builder
+	for l.pos < len(l.src) {
+		ch := l.src[l.pos]
+		if ch == '\'' {
+			if l.pos+1 < len(l.src) && l.src[l.pos+1] == '\'' {
+				b.WriteByte('\'')
+				l.pos += 2
+				continue
+			}
+			l.pos++
+			return Token{Kind: TokenStringLit, Value: b.String(), Pos: start}, nil
+		}
+		if ch == '\\' {
+			l.pos++ // consume backslash
+			if l.pos >= len(l.src) {
+				break
+			}
+			esc := l.src[l.pos]
+			l.pos++
+			switch esc {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case 'r':
+				b.WriteByte('\r')
+			case 'b':
+				b.WriteByte('\b')
+			case 'f':
+				b.WriteByte('\f')
+			case 'v':
+				b.WriteByte('\v')
+			case '\'':
+				b.WriteByte('\'')
+			case '\\':
+				b.WriteByte('\\')
+			case 'x', 'X':
+				// Hex: 1-2 digits.
+				val := byte(0)
+				count := 0
+				for count < 2 && l.pos < len(l.src) && isHexDigit(l.src[l.pos]) {
+					val = val*16 + hexVal(l.src[l.pos])
+					l.pos++
+					count++
+				}
+				b.WriteByte(val)
+			case 'u':
+				// Unicode 4-hex-digit.
+				val := rune(0)
+				for i := 0; i < 4 && l.pos < len(l.src) && isHexDigit(l.src[l.pos]); i++ {
+					val = val*16 + rune(hexVal(l.src[l.pos]))
+					l.pos++
+				}
+				b.WriteRune(val)
+			case 'U':
+				// Unicode 8-hex-digit.
+				val := rune(0)
+				for i := 0; i < 8 && l.pos < len(l.src) && isHexDigit(l.src[l.pos]); i++ {
+					val = val*16 + rune(hexVal(l.src[l.pos]))
+					l.pos++
+				}
+				b.WriteRune(val)
+			default:
+				if esc >= '0' && esc <= '7' {
+					// Octal: 1-3 digits.
+					val := int(esc - '0')
+					for i := 0; i < 2 && l.pos < len(l.src) && l.src[l.pos] >= '0' && l.src[l.pos] <= '7'; i++ {
+						val = val*8 + int(l.src[l.pos]-'0')
+						l.pos++
+					}
+					b.WriteByte(byte(val))
+				} else {
+					// Unknown escape: pass through literally (PG compatibility).
+					b.WriteByte('\\')
+					b.WriteByte(esc)
+				}
+			}
+			continue
+		}
+		b.WriteByte(ch)
+		l.pos++
+	}
+	return Token{}, l.errf(start, "unterminated escape string literal")
+}
+
+func hexVal(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
 }
 
 func isIdentStart(c byte) bool {

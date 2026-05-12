@@ -329,3 +329,13 @@ type WindowDef struct {
 
 // Pos returns the position of the leading `OVER` keyword.
 func (w *WindowDef) Pos() int { return w.pos }
+
+// ArraySubscriptExpr is `expr[index]` — array element access.
+type ArraySubscriptExpr struct {
+	pos   int
+	Base  Expr
+	Index Expr
+}
+
+func (e *ArraySubscriptExpr) Pos() int { return e.pos }
+func (*ArraySubscriptExpr) exprNode()  {}

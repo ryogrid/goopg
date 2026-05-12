@@ -720,6 +720,21 @@ M0097-0001 wires it up.
       Still deferred: name (18 diffs: RAISE NOTICE not emitting + length(a[1]) SRF),
       int8, numerology, functional_deps, others.
       Action: debug RAISE NOTICE emission in DO block (trace why ctx.AddNotice not working).
+      Loop 16 additions (2026-05-13):
+      65. E'...' escape string literals in SQL lexer (lexEscapeString): \n \t \r \b \f \v
+          \ooo \xhh \uXXXX \UXXXXXXXX \' \\ and '' doubling.
+      66. plpgsql/parser.go parseTypeRef: fixed text[] array type handling (was including
+          [] in SQL type string, now saves baseEndPos before consuming array suffix).
+      67. SQL array subscript `a[N]`: ArraySubscriptExpr AST node in parser + parseExprPrec
+          postfix handling; resolveExpr converts to array_subscript FuncCall; analyzer
+          analyzeExpr case returns text; executor evalFuncCall("array_subscript") using
+          parseTextArray.
+      68. ScalarFuncScan plan node + operator: FROM parse_ident(...) AS a now works as a
+          single-row table function returning text[] column.
+      69. parse_ident added to FROM-clause SRF whitelist in parser/select.go.
+      name test: 0 diff lines → PASS. Total passing tests: 13 (was 12).
+      Confirmed passing (2026-05-13): boolean, char, comments, delete, int2, int4, md5,
+      name, oid, reindex_catalog, select_having, select_implicit, varchar.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,

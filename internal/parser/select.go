@@ -567,12 +567,12 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
 
 	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
-	// Recognized: generate_series, pg_input_error_info.
+	// Recognized: generate_series, pg_input_error_info, parse_ident.
 	srfFuncName := ""
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" && obj.Schema == "" {
 		lower := strings.ToLower(obj.Name)
 		switch lower {
-		case "generate_series", "pg_input_error_info":
+		case "generate_series", "pg_input_error_info", "parse_ident":
 			srfFuncName = lower
 		}
 	}
@@ -733,6 +733,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				return nil, err
 			}
 			left = cast
+			continue
+		}
+		// `expr[index]` array subscript — handled at the same precedence
+		// level as :: (tighter than binary operators).
+		if t := p.cur(); t.Kind == TokenSymbol && t.Value == "[" {
+			pos := t.Pos
+			p.advance() // consume '['
+			idx, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptSymbol("]") {
+				return nil, p.errAtCur("expected ']' after array subscript")
+			}
+			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: idx}
 			continue
 		}
 		// `expr [NOT] IN (...)` is a postfix-style construct at
