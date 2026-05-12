@@ -154,6 +154,25 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		}
 		return nil, nil
 	case planner.CopyFrom:
+		if plan.Endpoint == planner.CopyEndpointFile {
+			// Server-side COPY FROM 'file': read file directly and insert rows.
+			count, err := executor.RunCopyFromFile(ectx, plan)
+			if err != nil {
+				_ = s.cfg.TxnMgr.Rollback(tx)
+				if wErr := s.writeQueryError(w, execErrCode(err), execErrMsg(err)); wErr != nil {
+					return nil, wErr
+				}
+				return nil, nil
+			}
+			_ = s.cfg.TxnMgr.Commit(tx)
+			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
+				return nil, err
+			}
+			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
 		from, err := executor.NewCopyFromExecutor(ectx, plan)
 		if err != nil {
 			_ = s.cfg.TxnMgr.Rollback(tx)

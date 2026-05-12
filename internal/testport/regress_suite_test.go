@@ -268,18 +268,29 @@ func runRegressSetup(t *testing.T, root string, psqlBin string, c *cluster.Clust
 	if prev != "" {
 		ldPath += ":" + prev
 	}
+	// PG_ABS_SRCDIR enables \getenv abs_srcdir in test_setup.sql to resolve
+	// data file paths (e.g. COPY onek FROM :'filename').
+	absSrcDir := filepath.Join(root, "postgres", "src", "test", "regress")
 	result, _ := util.RunCommand(util.CommandSpec{
 		Name:    psqlBin,
 		Args:    []string{"-h", host, "-p", port, "-U", "postgres", "-d", "postgres", "-X", "-q", "-a", "-f", setupPath},
 		Dir:     root,
-		Env:     []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + ldPath},
-		Timeout: 30 * time.Second,
+		Env:     []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + ldPath, "PG_ABS_SRCDIR=" + absSrcDir},
+		Timeout: 120 * time.Second,
 	})
 	if result.ExitCode != 0 {
 		t.Logf("test_setup.sql completed with partial failures (expected for C extensions/tablespaces): exit=%d", result.ExitCode)
 	}
 	if result.Stderr != "" {
-		t.Logf("test_setup.sql stderr (truncated at 512 bytes):\n%s", truncate(result.Stderr, 512))
+		t.Logf("test_setup.sql stderr (truncated at 2048 bytes):\n%s", truncate(result.Stderr, 2048))
+	}
+	if result.Stdout != "" {
+		// Log last 512 bytes of stdout to see what completed.
+		stdout := result.Stdout
+		if len(stdout) > 512 {
+			stdout = "...(truncated)...\n" + stdout[len(stdout)-512:]
+		}
+		t.Logf("test_setup.sql stdout (last 512 bytes):\n%s", stdout)
 	}
 }
 

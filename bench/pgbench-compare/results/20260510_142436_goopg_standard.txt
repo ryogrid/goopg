@@ -1,0 +1,45 @@
+pgbench (18.3)
+starting vacuum...end.
+pgbench: error: client 5 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=302 flags=0
+pgbench: error: client 57 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=124 flags=0
+pgbench: error: client 88 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=273 flags=0
+pgbench: error: client 79 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=249 flags=0
+pgbench: error: client 99 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=205 flags=0
+pgbench: error: client 82 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=302 flags=0
+pgbench: error: client 32 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=249 flags=0
+pgbench: error: client 86 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=96 flags=0
+pgbench: error: client 1 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=96 flags=0
+pgbench: error: client 83 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=286 flags=0
+pgbench: error: client 91 script 0 aborted in command 8 query 0: ERROR:  storage: unsupported line pointer state: slot=286 flags=0
+progress: 10.0 s, 48.8 tps, lat 1710.553 ms stddev 544.649, 0 failed
+progress: 20.0 s, 64.9 tps, lat 1392.108 ms stddev 236.339, 0 failed
+progress: 30.0 s, 62.9 tps, lat 1408.966 ms stddev 148.070, 0 failed
+progress: 40.0 s, 64.6 tps, lat 1396.682 ms stddev 123.157, 0 failed
+progress: 50.0 s, 65.2 tps, lat 1371.731 ms stddev 104.357, 0 failed
+progress: 60.0 s, 63.1 tps, lat 1400.037 ms stddev 110.091, 0 failed
+progress: 70.0 s, 64.7 tps, lat 1377.743 ms stddev 92.205, 0 failed
+progress: 80.0 s, 64.3 tps, lat 1387.608 ms stddev 122.739, 0 failed
+progress: 90.0 s, 63.7 tps, lat 1405.776 ms stddev 123.630, 0 failed
+progress: 100.0 s, 63.5 tps, lat 1401.013 ms stddev 104.379, 0 failed
+progress: 110.0 s, 63.1 tps, lat 1411.337 ms stddev 95.652, 0 failed
+progress: 120.0 s, 62.4 tps, lat 1424.395 ms stddev 132.121, 0 failed
+progress: 130.0 s, 63.2 tps, lat 1398.245 ms stddev 114.251, 0 failed
+progress: 140.0 s, 63.2 tps, lat 1399.505 ms stddev 108.671, 0 failed
+progress: 150.0 s, 61.1 tps, lat 1449.269 ms stddev 119.368, 0 failed
+progress: 160.0 s, 54.8 tps, lat 1625.926 ms stddev 139.179, 0 failed
+progress: 170.0 s, 53.3 tps, lat 1665.182 ms stddev 124.387, 0 failed
+progress: 180.0 s, 53.7 tps, lat 1680.625 ms stddev 139.276, 0 failed
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 11093
+number of failed transactions: 0 (0.000%)
+latency average = 1452.297 ms
+latency stddev = 202.139 ms
+initial connection time = 68.873 ms
+tps = 61.306044 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.
