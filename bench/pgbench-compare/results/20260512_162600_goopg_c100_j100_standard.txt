@@ -1,0 +1,368 @@
+pgbench (18.3)
+starting vacuum...end.
+pgbench: error: client 7 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 95 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 91 command 4: no results
+pgbench: error: client 13 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 40 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: pgbench: error: client 65 command 4: no results
+error: client 77 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 86 command 4: no results
+pgbench: error: client 37 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 41 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 0 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 57 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 84 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 1 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=2167, kind=commit): wal: requested LSN is beyond written WAL: have 1322685898, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 25 command 4: no results
+pgbench: error: client 68 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 98 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 4 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=3564, kind=commit): wal: requested LSN is beyond written WAL: have 1323174192, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 59 command 4: no results
+pgbench: error: client 32 command 4: no results
+pgbench: error: client 81 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 67 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 73 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 29 command 4: no results
+pgbench: error: client 30 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 93 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=7221, kind=commit): wal: requested LSN is beyond written WAL: have 1324401945, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 51 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 85 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=8622, kind=commit): wal: requested LSN is beyond written WAL: have 1324872269, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 97 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 70 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 87 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 15 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 72 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=12217, kind=commit): wal: requested LSN is beyond written WAL: have 1326097276, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 2 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=12423, kind=commit): wal: requested LSN is beyond written WAL: have 1326155800, need 18446744073709551615
+pgbench: error: client 69 command 4: no results
+pgbench: error: client 39 command 4: no results
+pgbench: error: client 22 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 63 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=15328, kind=commit): wal: requested LSN is beyond written WAL: have 1327135521, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 75 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=15602, kind=commit): wal: requested LSN is beyond written WAL: have 1327224626, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 10 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=16549, kind=commit): wal: requested LSN is beyond written WAL: have 1327537099, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 12 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=16601, kind=commit): wal: requested LSN is beyond written WAL: have 1327565904, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 83 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=17623, kind=commit): wal: requested LSN is beyond written WAL: have 1327907932, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 6 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=18291, kind=commit): wal: requested LSN is beyond written WAL: have 1328130119, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 33 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 49 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 44 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 92 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=23165, kind=commit): wal: requested LSN is beyond written WAL: have 1329784869, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 74 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 53 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 56 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 55 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=24462, kind=commit): wal: requested LSN is beyond written WAL: have 1330220763, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 17 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=24915, kind=commit): wal: requested LSN is beyond written WAL: have 1330366262, need 18446744073709551615
+pgbench: error: client 94 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 96 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=25565, kind=commit): wal: requested LSN is beyond written WAL: have 1330588756, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 42 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 76 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=27640, kind=commit): wal: requested LSN is beyond written WAL: have 1331288719, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 61 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 54 command 4: no results
+pgbench: error: client 11 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 71 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 26 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 79 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=29523, kind=commit): wal: requested LSN is beyond written WAL: have 1331917352, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 28 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 14 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 46 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 52 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=30962, kind=commit): wal: requested LSN is beyond written WAL: have 1332405815, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 60 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 5 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 35 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 21 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 80 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=33515, kind=commit): wal: requested LSN is beyond written WAL: have 1333272222, need 18446744073709551615
+pgbench: error: client 66 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 23 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 31 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 18 command 4: no results
+pgbench: error: client 99 command 4: no results
+pgbench: error: client 45 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 8 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 50 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 34 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 20 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 47 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 88 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=38076, kind=commit): wal: requested LSN is beyond written WAL: have 1334803069, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 64 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=38796, kind=commit): wal: requested LSN is beyond written WAL: have 1335040531, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 27 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=39866, kind=commit): wal: requested LSN is beyond written WAL: have 1335402189, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 62 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=40306, kind=commit): wal: requested LSN is beyond written WAL: have 1335554119, need 18446744073709551615
+pgbench: error: client 38 command 4: no results
+pgbench: error: client 19 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 90 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=40492, kind=commit): wal: requested LSN is beyond written WAL: have 1335611054, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 9 command 4: no results
+pgbench: error: client 89 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=41209, kind=commit): wal: requested LSN is beyond written WAL: have 1335849525, need 18446744073709551615
+pgbench: error: client 48 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 58 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 82 command 4: no results
+message type 0x5a arrived from server while idle
+pgbench: error: client 3 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=42557, kind=commit): wal: requested LSN is beyond written WAL: have 1336307513, need 18446744073709551615
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 36 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 24 script 0 aborted in command 10 query 0: ERROR:  mvcc: xact-marker hook (xid=44926, kind=commit): wal: requested LSN is beyond written WAL: have 1337106483, need 18446744073709551615
+pgbench: error: client 16 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 78 command 4: no results
+pgbench: error: client 43 command 4: no results
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 46119
+number of failed transactions: 302 (0.651%)
+latency average = 104.324 ms
+latency stddev = 66.216 ms
+initial connection time = 42.163 ms
+tps = 447.547799 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.
