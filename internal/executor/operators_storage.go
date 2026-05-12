@@ -1,10 +1,12 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -16,22 +18,91 @@ import (
 )
 
 // maxEPQRetries is the maximum number of EvalPlanQual re-checks before
-// escalating to SQLSTATE 40001. M0098-0004.
-const maxEPQRetries = 3
+// escalating to SQLSTATE 40001. Raised 3→10 in M0099-0004 because the
+// WFG-based epqWait now blocks until the conflicting transaction commits
+// or aborts, so most retries resolve on the first attempt.
+const maxEPQRetries = 10
 
-// epqWait refreshes the snapshot after detecting a concurrent xmax conflict.
-// It does NOT block waiting for the conflicting transaction — doing so would
-// cause circular deadlocks when two transactions each wait for the other
-// (common with shared rows like pgbench's branch). Instead it just takes a
-// fresh READ COMMITTED snapshot so the subsequent epqRecheckVisible sees any
-// recently-committed changes. M0098-0004.
-func epqWait(ctx *Context, _ storage.TransactionID) {
-	if ctx.TxnMgr == nil {
-		return
+// epqWaitTimeout is the maximum time epqWait blocks on WaitForXID.
+// Acts as a safety net: if cycle detection produces a false negative
+// (e.g. transient graph state), the timeout breaks any permanent hang.
+const epqWaitTimeout = 5 * time.Second
+
+// maxWFGHops is the maximum chain length walked during cycle detection.
+// Limits the O(N) scan to a constant bound under adversarial workloads.
+const maxWFGHops = 64
+
+// Process-global wait-for graph for EPQ deadlock detection.
+// Maps waitingXID → blockingXID. Protected by wfgMu. M0099-0004.
+var (
+	wfgMu        sync.Mutex
+	waitForGraph = make(map[storage.TransactionID]storage.TransactionID)
+)
+
+// registerWFGAndCheckCycle adds the edge myXID→blockingXID and walks the
+// graph up to maxWFGHops looking for a cycle (deadlock). Returns true when
+// a cycle is detected; the edge is removed before returning so the caller
+// MUST NOT call deregisterWFG. Returns false when no cycle is found; the
+// caller must call deregisterWFG after the wait completes.
+func registerWFGAndCheckCycle(myXID, blockingXID storage.TransactionID) bool {
+	wfgMu.Lock()
+	defer wfgMu.Unlock()
+	waitForGraph[myXID] = blockingXID
+	cur := blockingXID
+	for i := 0; i < maxWFGHops; i++ {
+		if cur == myXID {
+			delete(waitForGraph, myXID)
+			return true
+		}
+		next, ok := waitForGraph[cur]
+		if !ok {
+			return false
+		}
+		cur = next
 	}
+	return false
+}
+
+// deregisterWFG removes myXID from the wait-for graph after a wait resolves.
+func deregisterWFG(myXID storage.TransactionID) {
+	wfgMu.Lock()
+	delete(waitForGraph, myXID)
+	wfgMu.Unlock()
+}
+
+// epqWait detects deadlocks via the process-global wait-for graph, then
+// blocks until xmax commits or aborts (with a 5 s safety timeout).
+// Returns true if a deadlock cycle is confirmed — caller should immediately
+// escalate to SQLSTATE 40001 without consuming an epqRetry slot.
+// M0098-0004, M0099-0004.
+func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
+	if ctx.TxnMgr == nil || ctx.Tx.XID == storage.InvalidTransactionID {
+		// No manager or no write XID yet — fall back to snapshot refresh only.
+		if ctx.TxnMgr != nil {
+			if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
+				ctx.Snap = snap.Clone()
+			}
+		}
+		return false
+	}
+	if registerWFGAndCheckCycle(ctx.Tx.XID, xmax) {
+		return true
+	}
+	// Block until the conflicting transaction commits or aborts.
+	waitCtx := ctx.Ctx
+	if waitCtx == nil {
+		waitCtx = context.Background()
+	}
+	waitCtx, cancel := context.WithTimeout(waitCtx, epqWaitTimeout)
+	_ = ctx.TxnMgr.WaitForXID(waitCtx, xmax)
+	cancel()
+	deregisterWFG(ctx.Tx.XID)
+	// Refresh snapshot after the wait so subsequent visibility checks see
+	// any changes committed during the blocking window.
 	if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
 		ctx.Snap = snap.Clone()
 	}
+	return false
 }
 
 // epqRecheckVisible re-reads the tuple at (rel, blk, slot) and reports
@@ -851,15 +922,22 @@ func tryApplyHOTUpdate(
 	// are the cause of the pgbench scale-100 1,610-visible-rows
 	// symptom in pgbench_branches.
 	//
-	// EvalPlanQual (M0098-0004): on concurrent xmax conflict, wait for
-	// the conflicting transaction and fall back to the delete+insert path
-	// so it can re-check visibility.
+	// EvalPlanQual (M0098-0004, M0099-0004): on concurrent xmax conflict,
+	// wait for the conflicting transaction (with deadlock detection) and
+	// fall back to the delete+insert path so it can re-check visibility.
 	if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), oldSlot); gerr == nil &&
 		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID) {
 		xmax := oldTuple.Header.Xmax
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		epqWait(ctx, xmax)
+		if epqWait(ctx, xmax) {
+			// Deadlock detected — surface 40001 immediately rather than
+			// looping into the delete+insert EPQ path.
+			return false, &ExecError{
+				Code:    "40001",
+				Message: "could not serialize access due to concurrent update (deadlock)",
+			}
+		}
 		return false, nil // fall back to delete+insert; caller re-checks
 	}
 
@@ -1095,7 +1173,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							Message: "could not serialize access due to concurrent update",
 						}
 					}
-					epqWait(o.ctx, xmax)
+					if epqWait(o.ctx, xmax) {
+						return nil, &ExecError{
+							Code:    "40001",
+							Pos:     o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update (deadlock)",
+						}
+					}
 					visible, _ := epqRecheckVisible(o.ctx, rel, pu.blk, pu.slot)
 					if !visible {
 						epqSkip = true // row gone after conflict resolved
@@ -1256,7 +1340,13 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						Message: "could not serialize access due to concurrent update",
 					}
 				}
-				epqWait(o.ctx, xmax)
+				if epqWait(o.ctx, xmax) {
+					return nil, &ExecError{
+						Code:    "40001",
+						Pos:     o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update (deadlock)",
+					}
+				}
 				visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
 				if !visible {
 					epqSkipSeq = true
@@ -1433,7 +1523,13 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					Message: "could not serialize access due to concurrent update",
 				}
 			}
-			epqWait(o.ctx, xmax)
+			if epqWait(o.ctx, xmax) {
+				return nil, &ExecError{
+					Code:    "40001",
+					Pos:     o.plan.Pos(),
+					Message: "could not serialize access due to concurrent update (deadlock)",
+				}
+			}
 			visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
 			if !visible {
 				epqSkipDel = true

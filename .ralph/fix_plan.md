@@ -1032,10 +1032,22 @@ while preserving the original `-c 100 -j 100` target-condition validation.
       - Added `TestGroupCommitBatchingDelay` regression test; all WAL tests pass with -race
       Design doc: `docs/design/0099-0002-wal-group-commit-batching-policy.md`.
 
-- [ ] **M0099-0004** — Reduce conflict-abort rate without circular deadlocks.
-      Implement deadlock-safe waiting/retry behavior for conflicting updates,
-      with explicit deadlock detection/avoidance policy so 40001 abort rate in
-      standard pgbench workload is materially reduced from M0098 levels.
+- [x] **M0099-0004** — Reduce conflict-abort rate without circular deadlocks. (2026-05-12)
+      Implemented wait-for-graph (WFG) deadlock detection in epqWait:
+      - `waitForGraph map[TransactionID]TransactionID` + `wfgMu sync.Mutex` (global)
+      - `registerWFGAndCheckCycle(myXID, blockingXID)`: adds edge, walks up to 64
+        hops for cycle detection; removes edge and returns true on cycle
+      - `deregisterWFG(myXID)`: removes entry after wait completes
+      - `epqWait` revised: deadlock → return true (immediate 40001), no cycle →
+        `WaitForXID` with 5s context timeout, then snapshot refresh
+      - `maxEPQRetries` raised 3→10 (most retries now resolve via WaitForXID)
+      - All 4 EPQ retry call sites updated to handle deadlock return value
+      - `tryApplyHOTUpdate` deadlock → returns ExecError{40001} directly
+      - `context` and `time` imports added to operators_storage.go
+      - New test file `epq_deadlock_test.go`: TestEPQDeadlockCycleDetected,
+        TestEPQNoDeadlockNoCycle, TestEPQDeadlockThreeNode, TestEPQWFGConcurrentSafety
+      All executor tests pass with -race.
+      Design doc: `docs/design/0099-0003-deadlock-safe-conflict-waiting.md`.
 
 - [ ] **M0099-0005** — Client/thread variation measurements and target check.
       Run full pgbench suite (Standard, `-N`, `-S`) with at least the following
