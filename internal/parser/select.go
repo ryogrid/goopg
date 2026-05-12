@@ -27,13 +27,14 @@ func (p *parser) parseSelect() (Stmt, error) {
 	if p.acceptKeyword(KwDistinct) {
 		s.Distinct = true
 	}
-	// Empty target list: `SELECT FROM <table>` is valid in
-	// upstream PG (returns one zero-column row per source row);
-	// HammerDB writes
-	// `SELECT EXISTS (SELECT FROM pg_tables WHERE …)` with this
-	// shape. Skip the target-list parse when the next token is
-	// FROM and synthesize an empty Targets slice.
-	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) {
+	// Empty target list: `SELECT FROM <table>` is valid in upstream PG
+	// (returns one zero-column row per source row). HammerDB writes
+	// `SELECT EXISTS (SELECT FROM pg_tables WHERE …)` with this shape.
+	// Also `SELECT;` (no targets, no FROM) is allowed — PG returns 1 row.
+	// Skip the target-list parse when the next token is FROM, ';', or EOF.
+	isSemiOrEOF := p.cur().Kind == TokenSymbol && p.cur().Value == ";" ||
+		p.cur().Kind == TokenEOF
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) && !isSemiOrEOF {
 		tgts, err := p.parseTargetList()
 		if err != nil {
 			return nil, err

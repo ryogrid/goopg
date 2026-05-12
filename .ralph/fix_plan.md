@@ -606,17 +606,18 @@ M0097-0001 wires it up.
       not unfinished parity items.
 
 - [ ] **M0097-0003** — Core standalone + scalar type parity. (partial 2026-05-12)
-      Two infrastructure fixes landed:
-      1. Double-ReadyForQuery bug: `writeQueryError` now returns `errQueryErrorSent`
-         sentinel so `dispatchSimpleQueryViaExecutor` does NOT send a second RFQ
-         after an error response. Fixes "message type 0x5a arrived from server while
-         idle" psql noise + statement echo ordering in regress output.
-      2. `NormalizeRegressOutput` extended: strips `SET statement_timeout = '5s'`
-         preamble, `psql:file:N:` error prefixes, `LINE N:` and `^` position lines,
-         `message type 0x5a` lines. `comments` regress test now passes.
-      Remaining: `pg_input_is_valid` column alias shows as `?column?` (function-call
-      column naming), plus other scalar output format differences. Needs further
-      normalization or goopg output fixes to promote boolean/int2/int4/etc to port.
+      Multiple fixes landed:
+      1. Double-ReadyForQuery: `errQueryErrorSent` sentinel fixes duplicate RFQ.
+      2. `NormalizeRegressOutput` extended (SET preamble, psql:file:N:, LINE N:, ^,
+         0x5a lines, blank between -- and (N rows)).
+      3. FuncCall column alias: uses function name instead of `?column?`.
+      4. `pg_input_is_valid('x', 'bool')`: proper bool validation.
+      5. `CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE`: parsed as CREATE TABLE.
+      6. `SELECT;` (empty target list): returns 1 empty row.
+      7. `schema != nil` dispatch: RowDescription sent for 0-column results.
+      Passing: `comments`. Still deferred: `errors` (error msg wording), `boolean`
+      (pg_input_error_info SRF), `varchar`/`char` (varchar length enforcement),
+      others (float/int output format, missing test data).
       Original action:
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,
@@ -834,15 +835,6 @@ M0097-0001 wires it up.
       103 excluded (policy), 129 defer (execution parity still pending).
       Action: keep this open until deferred regress cases are promoted by
       output/behavior parity fixes and pass-required status transitions.
-
-## Notes
-
-- This file is the authoritative TODO list for Ralph. Update it after every
-  meaningful change.
-- Keep work to ONE item per loop. Decompose further if an item is larger
-  than what fits in a single agent invocation.
-- Every non-trivial subsystem must land alongside (or just before) a design
-  doc under `docs/design/`. The spec treats this as a hard requirement.
 
 ## M0098 — pgbench OLTP Performance: 1 500 / 1 500 / 10 000 TPS Targets (filed 2026-05-12)
 
@@ -1107,3 +1099,12 @@ while preserving the original `-c 100 -j 100` target-condition validation.
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
+
+## Notes
+
+- This file is the authoritative TODO list for Ralph. Update it after every
+  meaningful change.
+- Keep work to ONE item per loop. Decompose further if an item is larger
+  than what fits in a single agent invocation.
+- Every non-trivial subsystem must land alongside (or just before) a design
+  doc under `docs/design/`. The spec treats this as a hard requirement.

@@ -185,6 +185,26 @@ func NormalizeRegressOutput(raw string) string {
 			line = lines[i]
 		}
 	}
+	// Collapse blank lines between "^--$" and "(N row(s))" footers.
+	// `SELECT;` (0-column result) in PostgreSQL outputs --\n\n(1 row)
+	// where the blank line is the empty data row. goopg currently outputs
+	// --\n(1 row) without the blank row. Strip the blank line from the
+	// expected side so both sides match.
+	for i := 1; i+1 < len(lines); i++ {
+		if lines[i] == "" && strings.HasPrefix(lines[i-1], "--") {
+			// Check if following non-blank line is a row count footer.
+			j := i + 1
+			for j < len(lines) && lines[j] == "" {
+				j++
+			}
+			if j < len(lines) && strings.HasPrefix(lines[j], "(") &&
+				(strings.Contains(lines[j], "row)") || strings.Contains(lines[j], "rows)")) {
+				// Remove the blank line(s) between -- separator and row footer.
+				lines = append(lines[:i], lines[j:]...)
+				i--
+			}
+		}
+	}
 	// Strip trailing blank lines.
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]

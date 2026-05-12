@@ -214,7 +214,7 @@ func TestParseSelectFunctionCall(t *testing.T) {
 // "missing piece" cases.
 func TestParseSelectSyntaxErrors(t *testing.T) {
 	cases := []string{
-		"SELECT",            // no target
+		// "SELECT" is now valid — returns 1 empty row matching PG behaviour.
 		"SELECT 1 FROM",     // no table after FROM
 		"SELECT 1 WHERE",    // no expression after WHERE
 		"SELECT 1 ORDER BY", // no expression after ORDER BY

@@ -482,15 +482,17 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 
 	// Emit RowDescription for read-shaped plans (those whose Output
 	// schema is non-nil); writing operators (Insert/Update/Delete/
-	// DDL/Transaction) have empty schemas and emit only the command
-	// tag.
+	// DDL/Transaction) return nil from Output() and emit only the
+	// command tag.
 	schema := node.Output()
 	// CALL plans have a dynamic schema that depends on the procedure's
 	// OUT params; the operator reports it after Open.
 	if schema == nil {
 		schema = op.Schema()
 	}
-	if len(schema) > 0 {
+	// Send RowDescription when schema is non-nil (even 0 columns —
+	// e.g. `SELECT;` returns 1 row with 0 columns per PostgreSQL).
+	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
 			fields[i] = protocol.FieldDescription{
@@ -517,7 +519,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			_ = op.Close()
 			return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
 		}
-		if len(schema) > 0 {
+		if schema != nil {
 			row := slot.Row()
 			// M0092-0004: per-connection scratch buffers back the
 			// wire frame so the simple-query result loop is O(1)
