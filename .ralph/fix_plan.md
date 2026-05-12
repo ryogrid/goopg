@@ -722,11 +722,19 @@ M0097-0001 wires it up.
       in planner, partition-wise aggregation, partition-wise join.
       (Depends on M0096-0007.)
 
-- [ ] **M0097-0016** — ON CONFLICT + MERGE parity.
+- [x] **M0097-0016** — ON CONFLICT + MERGE parity.  2026-05-12.
       Target tests: `insert_conflict`, `merge`.
-      Work: `INSERT … ON CONFLICT DO UPDATE` with functional conflict
-      targets (`ON CONFLICT (lower(col))`), `ON CONFLICT ON CONSTRAINT
-      name`, `MERGE` statement (depends on M0096-0010).
+      Landed (commit 944b51e):
+      - encodeArbiterKey: multi-column arbiters (removes 0A000 guard)
+      - parseIndexColumnList: handles expression cols, COLLATE, opclass
+        names, ASC/DESC, NULLS FIRST/LAST, partial-index WHERE, INCLUDE
+      - parseConflictTargetColumnList: handles expression cols, COLLATE,
+        opclass names, partial-index WHERE
+      - MergeActionDoNothing + BySource/ByTarget + MERGE RETURNING (parse)
+      - CompatNoopStmt: GRANT/REVOKE/COMMENT/SECURITY LABEL
+      - SET SESSION AUTHORIZATION: no-op
+      - ALTER TABLE OWNER TO/RENAME TO/DROP COLUMN etc: no-ops
+      - merge_action() stub
 
 - [ ] **M0097-0017** — Extended type parity.
       Target tests: `arrays`, `json`, `jsonb`, `jsonb_jsonpath`,
