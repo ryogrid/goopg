@@ -860,13 +860,27 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					left = &IsNullExpr{pos: pos, Operand: left, Negated: negated}
 					continue
 				}
+				// IS [NOT] TRUE / FALSE / UNKNOWN. M0097-0003.
+				if p.acceptKeyword(KwTrue) {
+					left = &IsBoolExpr{pos: pos, Operand: left, TestTrue: true, Negated: negated}
+					continue
+				}
+				if p.acceptKeyword(KwFalse) {
+					left = &IsBoolExpr{pos: pos, Operand: left, TestFalse: true, Negated: negated}
+					continue
+				}
+				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "unknown") {
+					p.advance()
+					left = &IsBoolExpr{pos: pos, Operand: left, Negated: negated}
+					continue
+				}
 				// Not IS NULL / IS NOT NULL — put the parser back
 				// by not consuming further; produce an IS-predicate
 				// error only if we consumed NOT.
 				if negated {
-					return nil, p.errAtCur("expected NULL after IS NOT")
+					return nil, p.errAtCur("expected NULL, TRUE, FALSE, or UNKNOWN after IS NOT")
 				}
-				// IS DISTINCT FROM, IS TRUE, etc. — not yet supported;
+				// IS DISTINCT FROM, etc. — not yet supported;
 				// the caller will see an error on the next token.
 			}
 		}

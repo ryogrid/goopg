@@ -1766,6 +1766,8 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 		return nil
 	case *parser.IsNullExpr:
 		return walkExprForWindows(x.Operand, fn)
+	case *parser.IsBoolExpr:
+		return walkExprForWindows(x.Operand, fn)
 	case *parser.InExpr:
 		if err := walkExprForWindows(x.Operand, fn); err != nil {
 			return err
@@ -1912,6 +1914,12 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			return nil, err
 		}
 		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
+	case *parser.IsBoolExpr:
+		operand, err := resolveExpr(x.Operand, agg.input)
+		if err != nil {
+			return nil, err
+		}
+		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
 		if err != nil {
@@ -2131,6 +2139,12 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return nil, err
 		}
 		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
+	case *parser.IsBoolExpr:
+		operand, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
 	}
 	return resolveExprForWindowInput(e, win.input, win.agg)
 }
@@ -2211,6 +2225,8 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 	case *parser.UnaryOp:
 		return walkExpr(x.Operand, fn)
 	case *parser.IsNullExpr:
+		return walkExpr(x.Operand, fn)
+	case *parser.IsBoolExpr:
 		return walkExpr(x.Operand, fn)
 	case *parser.FuncCall:
 		if err := fn(x); err != nil {
@@ -2524,7 +2540,7 @@ func isConstantExpr(e Expr) bool {
 	switch x := e.(type) {
 	case *ColumnRef, *OuterColumnRef:
 		return false
-	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr:
+	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr:
 		return false
 	case *BinaryOp:
 		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
@@ -3253,9 +3269,20 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if tsl, ok := e.(*TypedStringLit); ok {
 		return tsl.Type, exprType(e)
 	}
-	// CastExpr `expr::type` or `CAST(expr AS type)`: propagate operand name.
-	// PostgreSQL uses the operand's name (e.g. col::int2 → col name).
+	// CastExpr `expr::type` or `CAST(expr AS type)`: use the type name as the
+	// column label for literal→type casts (e.g. 0::boolean → "bool").
+	// For column-ref casts (e.g. f1::int2), propagate the column's name.
+	// Matches PostgreSQL's FigureColname() logic. M0097-0003.
 	if cast, ok := e.(*CastExpr); ok {
+		if _, isCol := cast.Operand.(*ColumnRef); isCol {
+			innerName, _ := targetMeta(cast.Operand, t)
+			return innerName, exprType(e)
+		}
+		if cast.TargetType != "" {
+			// Use PostgreSQL's canonical short type names for column labels.
+			label := castTargetLabel(cast.TargetType)
+			return label, exprType(e)
+		}
 		innerName, _ := targetMeta(cast.Operand, t)
 		return innerName, exprType(e)
 	}
@@ -3265,6 +3292,26 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 		return fc.Name, exprType(e)
 	}
 	return "?column?", exprType(e)
+}
+
+// castTargetLabel maps a cast target type name to the PostgreSQL column label
+// used for that type when the cast result has no explicit alias. M0097-0003.
+func castTargetLabel(t string) string {
+	switch t {
+	case "boolean":
+		return "bool"
+	case "integer":
+		return "int4"
+	case "bigint":
+		return "int8"
+	case "smallint":
+		return "int2"
+	case "real":
+		return "float4"
+	case "double precision":
+		return "float8"
+	}
+	return t
 }
 
 // exprType returns the planner-level type tag for an expression. v0
@@ -3693,6 +3740,13 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
+	case *parser.IsBoolExpr:
+		// IS [NOT] TRUE/FALSE/UNKNOWN. M0097-0003.
+		operand, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
 	}
 	return nil, &PlanError{Pos: e.Pos(), Code: "0A000", Message: fmt.Sprintf("unsupported expression %T", e)}
 }

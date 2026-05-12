@@ -187,6 +187,19 @@ type IsNullExpr struct {
 func (e *IsNullExpr) Pos() int { return e.pos }
 func (*IsNullExpr) exprNode()  {}
 
+// IsBoolExpr mirrors parser.IsBoolExpr after the operand has been planned.
+// IS [NOT] TRUE/FALSE/UNKNOWN. Always returns boolean. M0097-0003.
+type IsBoolExpr struct {
+	pos       int
+	Operand   Expr
+	TestTrue  bool
+	TestFalse bool
+	Negated   bool
+}
+
+func (e *IsBoolExpr) Pos() int { return e.pos }
+func (*IsBoolExpr) exprNode()  {}
+
 // SubqueryExpr mirrors parser.SubqueryExpr after the inner
 // SELECT has been planned. The executor opens / drains /
 // closes Plan once at evaluation time and returns the single

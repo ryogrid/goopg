@@ -133,6 +133,21 @@ type IsNullExpr struct {
 func (e *IsNullExpr) Pos() int { return e.pos }
 func (*IsNullExpr) exprNode()  {}
 
+// IsBoolExpr is `expr IS [NOT] TRUE/FALSE/UNKNOWN`.
+// Result is always boolean (never NULL). M0097-0003.
+// TestTrue/TestFalse/TestUnknown define what the LHS must equal;
+// Negated inverts the test (IS NOT TRUE, etc.).
+type IsBoolExpr struct {
+	pos       int
+	Operand   Expr
+	TestTrue  bool // target is TRUE
+	TestFalse bool // target is FALSE (if neither TestTrue nor TestFalse: UNKNOWN)
+	Negated   bool
+}
+
+func (e *IsBoolExpr) Pos() int { return e.pos }
+func (*IsBoolExpr) exprNode()  {}
+
 // SubqueryExpr is the v0 scalar-subquery expression: a
 // parenthesised SELECT used in expression position. The
 // executor evaluates it once per Open and binds the single

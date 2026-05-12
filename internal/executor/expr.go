@@ -175,6 +175,27 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return NewBoolDatum(!isNull), nil // IS NOT NULL
 		}
 		return NewBoolDatum(isNull), nil // IS NULL
+	case *planner.IsBoolExpr:
+		// IS [NOT] TRUE/FALSE/UNKNOWN. Always returns boolean. M0097-0003.
+		operand, err := evalExprSlot(x.Operand, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		var result bool
+		if x.TestTrue {
+			// IS TRUE: must be non-null and boolean true
+			result = !operand.IsNull() && operand.Kind == KindBool && operand.Int != 0
+		} else if x.TestFalse {
+			// IS FALSE: must be non-null and boolean false
+			result = !operand.IsNull() && operand.Kind == KindBool && operand.Int == 0
+		} else {
+			// IS UNKNOWN: must be null
+			result = operand.IsNull()
+		}
+		if x.Negated {
+			result = !result
+		}
+		return NewBoolDatum(result), nil
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
 }
