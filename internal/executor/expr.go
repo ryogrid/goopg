@@ -2295,9 +2295,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				_, err := strconv.ParseFloat(v, 64)
 				return NewBoolDatum(err == nil), nil
 			case "oid":
-				// oid is uint32: 0..4294967295. M0097-0003.
+				// oid is uint32: 0..4294967295. Negative wraps around. M0097-0003.
 				n, err := strconv.ParseInt(v, 10, 64)
+				if err == nil && n < 0 {
+					n += 4294967296
+				}
 				return NewBoolDatum(err == nil && n >= 0 && n <= 4294967295), nil
+			case "oidvector":
+				// oidvector: space-separated oid values. M0097-0003.
+				return NewBoolDatum(validateOidVector(v) == ""), nil
 			case "uuid":
 				return NewBoolDatum(isValidUUIDStr(v)), nil
 			case "xid":

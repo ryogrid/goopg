@@ -101,9 +101,22 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 				message = ee.Message
 				sqlCode = ee.Code
 			}
-		} else if n < 0 || n > 4294967295 {
-			message = "value \"" + v + "\" is out of range for type oid"
-			sqlCode = "22003"
+		} else {
+			// Wrap negative: PostgreSQL wraps -N to uint32.
+			if n < 0 {
+				n += 4294967296
+			}
+			if n < 0 || n > 4294967295 {
+				message = "value \"" + v + "\" is out of range for type oid"
+				sqlCode = "22003"
+			}
+		}
+	case "oidvector":
+		// oidvector: space-separated oid values. M0097-0003.
+		errMsg := validateOidVector(v)
+		if errMsg != "" {
+			message = errMsg
+			sqlCode = "22P02"
 		}
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
@@ -125,6 +138,33 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 		NewStringDatum(sqlCode),
 	}
 	return SlotFromRow(nil, row), nil
+}
+
+// validateOidVector validates a space-separated list of oid values.
+// Returns errorMessage if invalid, "" if valid. M0097-0003.
+func validateOidVector(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	parts := strings.Fields(v)
+	for _, p := range parts {
+		n, err := parseIntegerInput(p, "oid", 64)
+		if err != nil {
+			if ee, ok := err.(*ExecError); ok {
+				return ee.Message
+			}
+			return "invalid input syntax for type oid: \"" + p + "\""
+		}
+		// Wrap negative.
+		if n < 0 {
+			n += 4294967296
+		}
+		if n < 0 || n > 4294967295 {
+			return "value \"" + p + "\" is out of range for type oid"
+		}
+	}
+	return ""
 }
 
 // validateInt2Vector validates a space-separated list of int2 values.

@@ -517,24 +517,31 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		binary.BigEndian.PutUint64(buf[:], uint64(d.TimeValue().UnixNano()))
 		return buf[:], nil
 	case "oid":
-		// Oid accepts string values that represent valid 32-bit unsigned integers.
-		// PostgreSQL silently accepts whitespace-trimmed values and validates the
-		// integer range at input time. M0097-0003.
-		var oidStr string
+		// Oid: uint32 (0..4294967295). Negative input is treated as a uint32
+		// wrap-around per PostgreSQL behavior (e.g., -1040 → 4294966256). M0097-0003.
+		var n int64
 		switch d.Kind {
 		case KindInt:
-			oidStr = strconv.FormatInt(d.Int, 10)
+			n = d.Int
 		case KindString, KindStringArena:
-			oidStr = strings.TrimSpace(d.StringValue())
-			// Validate: must be parseable as int64 (PostgreSQL allows -N as uint32 wrap)
-			if _, err := strconv.ParseInt(oidStr, 10, 64); err != nil {
+			var err error
+			n, err = strconv.ParseInt(strings.TrimSpace(d.StringValue()), 10, 64)
+			if err != nil {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type oid: %q", d.StringValue())}
 			}
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as oid", d.Kind)
 		}
-		return encodeVarlen([]byte(oidStr)), nil
+		// Wrap negative values: -N → 2^32 + (-N) for -2^32 < -N < 0.
+		if n < 0 {
+			n += 4294967296
+		}
+		if n < 0 || n > 4294967295 {
+			return nil, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %d is out of range for type oid", n)}
+		}
+		return encodeVarlen([]byte(strconv.FormatInt(n, 10))), nil
 
 	case "uuid":
 		// Uuid accepts string values; validate format at runtime. M0097-0003.
