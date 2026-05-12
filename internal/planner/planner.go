@@ -891,6 +891,17 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 			Message: fmt.Sprintf("relation %q does not exist", rv.Name),
 		}
 	}
+	// Validate column alias count when provided: AS t(c1, c2, ...).
+	// PostgreSQL raises an error if the number of column aliases does not match
+	// the actual table column count. M0097-0003.
+	if len(rv.Columns) > 0 && len(rv.Columns) != len(tbl.Columns) {
+		return nil, rangeBinding{}, &PlanError{
+			Pos:  rv.Pos(),
+			Code: "42P01",
+			Message: fmt.Sprintf("table %q has %d columns available but %d columns specified",
+				rv.Alias, len(tbl.Columns), len(rv.Columns)),
+		}
+	}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
 	ctx := newResolveContext([]rangeBinding{b}, tableSchemaWithSource(tbl, sourceIdx))
 	// View: plan the stored inner SELECT and substitute its
@@ -1035,6 +1046,53 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 	return &Values{pos: pos, Rows: rows, schema: schema}
 }
 
+// planValuesSubquery plans a `(VALUES (r1), (r2), ...) AS alias (col1, col2)`
+// subquery in the FROM clause. The column names come from the alias column list
+// or from synthetic names like "column1", "column2". M0097-0003.
+func planValuesSubquery(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	rows := rv.Subquery.ValuesRows
+	if len(rows) == 0 {
+		return nil, rangeBinding{}, &PlanError{Pos: rv.Pos(), Code: "0A000", Message: "VALUES must have at least one row"}
+	}
+	nCols := len(rows[0])
+	ctx := &resolveContext{} // no column refs allowed in VALUES
+	planRows := make([][]Expr, len(rows))
+	for i, row := range rows {
+		if len(row) != nCols {
+			return nil, rangeBinding{}, &PlanError{Pos: rv.Pos(), Code: "42601",
+				Message: fmt.Sprintf("VALUES row %d has wrong number of columns: expected %d, got %d", i+1, nCols, len(row))}
+		}
+		planRow := make([]Expr, nCols)
+		for j, e := range row {
+			r, err := resolveExpr(e, ctx)
+			if err != nil {
+				return nil, rangeBinding{}, err
+			}
+			planRow[j] = r
+		}
+		planRows[i] = planRow
+	}
+	// Build schema: use column alias list or synthetic names.
+	cols := make([]catalog.Column, nCols)
+	schema := make(Schema, nCols)
+	for i := 0; i < nCols; i++ {
+		var name string
+		if i < len(rv.Columns) && rv.Columns[i] != "" {
+			name = rv.Columns[i]
+		} else {
+			name = fmt.Sprintf("column%d", i+1)
+		}
+		// Type: use the type of the first row's expression.
+		typ := exprType(planRows[0][i])
+		cols[i] = catalog.Column{Name: name, Type: typ}
+		schema[i] = SchemaColumn{Name: name, Type: typ}
+	}
+	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
+	node := &Values{pos: rv.Pos(), Rows: planRows, schema: schema}
+	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 // planSubqueryRangeVar plans a `(SELECT …) AS alias` derived
 // table. The inner SELECT is planned with the same catalog so
 // nested derived tables / view refs / subqueries work; the
@@ -1046,6 +1104,11 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 // the rangeBinding contract that downstream column resolution
 // uses.
 func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
+	// M0097-0003.
+	if len(rv.Subquery.ValuesRows) > 0 {
+		return planValuesSubquery(rv, sourceIdx)
+	}
 	inner, err := Plan(rv.Subquery, cat)
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
@@ -1117,9 +1180,13 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 }
 
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
-// Currently only generate_series(start, stop[, step]) is supported.
+// Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
+// are supported.
 func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
+	if strings.EqualFold(tf.Name, "pg_input_error_info") {
+		return planPgInputErrorInfo(rv, sourceIdx)
+	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
@@ -1160,6 +1227,48 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int8"}, SourceTableIdx: sourceIdx}}
 	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgInputErrorInfo plans SELECT * FROM pg_input_error_info(value, type).
+// Returns a PgInputErrorInfo node with the standard 4-column output schema.
+// M0097-0003.
+func planPgInputErrorInfo(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) != 2 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "pg_input_error_info requires 2 arguments"}
+	}
+	ctx := &resolveContext{}
+	val, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	typ, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_input_error_info"
+	}
+	schema := Schema{
+		SchemaColumn{Name: "message", Type: catalog.Type{Name: "text"}},
+		SchemaColumn{Name: "detail", Type: catalog.Type{Name: "text"}},
+		SchemaColumn{Name: "hint", Type: catalog.Type{Name: "text"}},
+		SchemaColumn{Name: "sql_error_code", Type: catalog.Type{Name: "text"}},
+	}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: "message", Type: catalog.Type{Name: "text"}},
+			{Name: "detail", Type: catalog.Type{Name: "text"}},
+			{Name: "hint", Type: catalog.Type{Name: "text"}},
+			{Name: "sql_error_code", Type: catalog.Type{Name: "text"}},
+		},
+	}
+	node := &PgInputErrorInfo{pos: tf.Pos(), Value: val, Type: typ, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -1323,6 +1432,8 @@ func exprSide(e Expr, leftWidth int) joinSide {
 	case *BinaryOp:
 		return mergeSides(exprSide(x.Left, leftWidth), exprSide(x.Right, leftWidth))
 	case *UnaryOp:
+		return exprSide(x.Operand, leftWidth)
+	case *CastExpr:
 		return exprSide(x.Operand, leftWidth)
 	case *FuncCall:
 		side := sideUnknown
@@ -1839,7 +1950,12 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, nil
+		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
+		switch x.Op {
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+			node.ResultType = exprType(node).Name
+		}
+		return node, nil
 	case *parser.UnaryOp:
 		op, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
@@ -1847,8 +1963,13 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
-		// See resolveExpr: cast is a no-op in v0.
-		return resolveExprAfterAggregate(x.Operand, agg)
+		// M0097-0003: emit CastExpr so the executor can coerce at runtime.
+		operand, err := resolveExprAfterAggregate(x.Operand, agg)
+		if err != nil {
+			return nil, err
+		}
+		typeName := strings.ToLower(x.Type.Name)
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName}, nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
@@ -1915,7 +2036,12 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, nil
+		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
+		switch x.Op {
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+			node.ResultType = exprType(node).Name
+		}
+		return node, nil
 	case *parser.UnaryOp:
 		op, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
@@ -1923,7 +2049,13 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
-		return resolveExprAfterWindow(x.Operand, win)
+		// M0097-0003: emit CastExpr so the executor can coerce at runtime.
+		operand, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		typeName := strings.ToLower(x.Type.Name)
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExprAfterWindow(x.Source, win)
 		if err != nil {
@@ -2397,6 +2529,8 @@ func isConstantExpr(e Expr) bool {
 	case *BinaryOp:
 		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
 	case *UnaryOp:
+		return isConstantExpr(x.Operand)
+	case *CastExpr:
 		return isConstantExpr(x.Operand)
 	case *IntegerConst, *StringConst, *NumericConst,
 		*TypedStringLit, *IntervalLit,
@@ -3103,7 +3237,9 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 
 // targetMeta picks the output name and type for a target. The alias
 // wins; otherwise we use the underlying ColumnRef's name; for function
-// calls we use the function name (matching upstream behaviour); otherwise
+// calls we use the function name (matching upstream behaviour); for
+// TypedStringLit `type 'value'` uses the type name as the column label
+// (matching PostgreSQL's FigureColname() for typed literals); otherwise
 // a synthetic "?column?" matching upstream.
 func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if t.Alias != "" {
@@ -3111,6 +3247,17 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	}
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
+	}
+	// TypedStringLit `int2 'value'`: column name is the type name.
+	// Matches PostgreSQL's FigureColname() for `type 'string'` syntax. M0097-0003.
+	if tsl, ok := e.(*TypedStringLit); ok {
+		return tsl.Type, exprType(e)
+	}
+	// CastExpr `expr::type` or `CAST(expr AS type)`: propagate operand name.
+	// PostgreSQL uses the operand's name (e.g. col::int2 → col name).
+	if cast, ok := e.(*CastExpr); ok {
+		innerName, _ := targetMeta(cast.Operand, t)
+		return innerName, exprType(e)
 	}
 	// Function call: use function name as the implicit column label.
 	// Matches PostgreSQL's FigureColname() logic for FuncCall nodes.
@@ -3142,6 +3289,12 @@ func exprType(e Expr) catalog.Type {
 		// Return it so downstream type inference (BinaryOp etc.) can use it.
 		// M0097-0003.
 		return catalog.Type{Name: x.Type}
+	case *CastExpr:
+		// CastExpr carries the declared target type. M0097-0003.
+		if x.TargetType != "" {
+			return catalog.Type{Name: x.TargetType}
+		}
+		return exprType(x.Operand)
 	case *BinaryOp:
 		// Arithmetic on numeric promotes to numeric. Comparison /
 		// boolean ops return bool. String concat returns text. The
@@ -3498,7 +3651,12 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, nil
+		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
+		switch x.Op {
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+			node.ResultType = exprType(node).Name
+		}
+		return node, nil
 	case *parser.UnaryOp:
 		op, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
@@ -3521,12 +3679,13 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
 	case *parser.CastExpr:
-		// v0 treats `expr::type` as a no-op — the executor doesn't yet
-		// enforce typing, and pgbench's `oid=$1::pg_catalog.regclass`
-		// shape just needs the operand expression to plan. The
-		// declared target type is preserved on the parser AST for
-		// future loops that wire up real type coercion.
-		return resolveExpr(x.Operand, ctx)
+		// M0097-0003: emit CastExpr so the executor can coerce at runtime.
+		operand, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		typeName := strings.ToLower(x.Type.Name)
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
@@ -3742,11 +3901,14 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		return &cl
 	case *BinaryOp:
 		return &BinaryOp{
-			pos:   x.Pos(),
-			Op:    x.Op,
-			Left:  shiftColumnRefsBy(x.Left, delta),
-			Right: shiftColumnRefsBy(x.Right, delta),
+			pos:        x.Pos(),
+			Op:         x.Op,
+			Left:       shiftColumnRefsBy(x.Left, delta),
+			Right:      shiftColumnRefsBy(x.Right, delta),
+			ResultType: x.ResultType,
 		}
+	case *CastExpr:
+		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType}
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftColumnRefsBy(x.Operand, delta)}
 	case *FuncCall:

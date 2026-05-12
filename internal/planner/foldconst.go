@@ -34,7 +34,12 @@ func FoldConstants(e Expr) Expr {
 		if folded := tryFoldBinaryOp(x.pos, x.Op, l, r); folded != nil {
 			return folded
 		}
-		return &BinaryOp{pos: x.pos, Op: x.Op, Left: l, Right: r}
+		return &BinaryOp{pos: x.pos, Op: x.Op, Left: l, Right: r, ResultType: x.ResultType}
+
+	// ── Cast expression ────────────────────────────────────────────────
+	case *CastExpr:
+		operand := FoldConstants(x.Operand)
+		return &CastExpr{pos: x.pos, Operand: operand, TargetType: x.TargetType}
 
 	// ── Unary operator ─────────────────────────────────────────────────
 	case *UnaryOp:
@@ -131,6 +136,15 @@ func foldPlanConstants(node Node) {
 		foldPlanConstants(n.Child)
 	case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *WorkTableScan:
 		// leaf nodes: nothing to fold
+	case *GenerateSeries:
+		n.Start = FoldConstants(n.Start)
+		n.Stop = FoldConstants(n.Stop)
+		if n.Step != nil {
+			n.Step = FoldConstants(n.Step)
+		}
+	case *PgInputErrorInfo:
+		n.Value = FoldConstants(n.Value)
+		n.Type = FoldConstants(n.Type)
 	}
 }
 

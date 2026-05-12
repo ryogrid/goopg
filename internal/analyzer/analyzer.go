@@ -1311,6 +1311,21 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 // produced column (inherited) is never referenced in the WHERE clause
 // for basic vacuum runs. See docs/design/0003-0014-derived-tables.md.
 func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
+	// VALUES subquery: FROM (VALUES (r1), ...) AS t(c1, c2).
+	// The inner SelectStmt has no Targets; build the column list from the
+	// explicit alias list (rv.Columns) or synthetic names. M0097-0003.
+	if len(rv.Subquery.ValuesRows) > 0 {
+		nCols := len(rv.Subquery.ValuesRows[0])
+		cols := make([]catalog.Column, nCols)
+		for i := 0; i < nCols; i++ {
+			name := fmt.Sprintf("column%d", i+1)
+			if i < len(rv.Columns) && rv.Columns[i] != "" {
+				name = rv.Columns[i]
+			}
+			cols[i] = catalog.Column{Name: name, Type: catalog.Type{Name: "text"}}
+		}
+		return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
+	}
 	if err := analyzeSelectWithParent(rv.Subquery, cat, nil); err != nil {
 		// LATERAL fallback: correlated reference to outer table fails analysis.
 		// When explicit column aliases are provided (rv.Columns), produce a

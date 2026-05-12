@@ -299,17 +299,93 @@ func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Aren
 	return nil
 }
 
-// coerceStringToInt64 parses a trimmed string as int64, returning a proper
-// 22P02 ExecError for invalid inputs. Used by encodeValue when a string
-// datum is being stored in an integer column. M0097-0003.
-func coerceStringToInt64(s, typeName string) (int64, error) {
-	s = strings.TrimSpace(s)
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
+// parseIntegerInput parses a string as an integer supporting:
+// - base-0 detection (0b binary, 0o octal, 0x hex, 0 prefix octal not supported by PG — decimal)
+// - underscore separators (1_000 → 1000)
+// - Validates underscore placement: no leading underscore in decimal, no trailing, no consecutive
+// - For non-decimal (0b/0o/0x): leading underscore after prefix is OK (PG allows 0b_10)
+// - Distinguishes syntax errors (22P02) from range errors (22003)
+// M0097-0003.
+func parseIntegerInput(raw, typeName string, bitSize int) (int64, error) {
+	orig := raw
+	s := strings.TrimSpace(raw)
+	if s == "" {
 		return 0, &ExecError{Code: "22P02",
-			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, s)}
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
+	}
+
+	// Detect base prefix.
+	isNonDecimal := false
+	prefix := ""
+	rest := s
+	if len(s) >= 2 && (s[0] == '0') {
+		switch {
+		case s[1] == 'b' || s[1] == 'B':
+			isNonDecimal = true
+			prefix = s[:2]
+			rest = s[2:]
+		case s[1] == 'o' || s[1] == 'O':
+			isNonDecimal = true
+			prefix = s[:2]
+			rest = s[2:]
+		case s[1] == 'x' || s[1] == 'X':
+			isNonDecimal = true
+			prefix = s[:2]
+			rest = s[2:]
+		}
+	}
+	_ = prefix
+
+	// Validate underscore rules.
+	if !isNonDecimal {
+		// Decimal: no leading underscore (after optional sign), no trailing, no consecutive.
+		check := rest
+		if len(check) > 0 && (check[0] == '-' || check[0] == '+') {
+			check = check[1:]
+		}
+		if len(check) > 0 && check[0] == '_' {
+			return 0, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
+		}
+	} else {
+		// Non-decimal: leading underscore after prefix is OK per PG 16.
+		// No trailing underscore, no consecutive __.
+	}
+	if len(s) > 0 && s[len(s)-1] == '_' {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
+	}
+	if strings.Contains(s, "__") {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
+	}
+
+	// Empty after prefix (e.g., "0b") is a syntax error.
+	if isNonDecimal && (rest == "" || rest == "_") {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
+	}
+
+	// Strip underscores for parsing.
+	cleaned := strings.ReplaceAll(s, "_", "")
+	v, err := strconv.ParseInt(cleaned, 0, bitSize)
+	if err != nil {
+		numErr, ok := err.(*strconv.NumError)
+		if ok && numErr.Err == strconv.ErrRange {
+			return 0, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type %s", orig, typeName)}
+		}
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, orig)}
 	}
 	return v, nil
+}
+
+// coerceStringToInt64 parses a trimmed string as int64, returning a proper
+// 22P02/22003 ExecError for invalid inputs. Used by encodeValue when a string
+// datum is being stored in an integer column. M0097-0003.
+func coerceStringToInt64(s, typeName string) (int64, error) {
+	return parseIntegerInput(s, typeName, 64)
 }
 
 func encodeValue(t catalog.Type, d Datum) ([]byte, error) {

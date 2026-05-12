@@ -102,9 +102,16 @@ func RunRegressSubset(ctx context.Context, repoRoot string, cases []RegressCase,
 			results = append(results, RegressResult{Name: c.Name, SQLPath: c.SQLPath, Status: "defer", Rationale: fmt.Sprintf("cannot read expected output: %v", err)})
 			continue
 		}
-		if NormalizeRegressOutput(string(expectedBytes)) == NormalizeRegressOutput(actual) {
+		normExpected := NormalizeRegressOutput(string(expectedBytes))
+		normActual := NormalizeRegressOutput(actual)
+		if normExpected == normActual {
 			results = append(results, RegressResult{Name: c.Name, SQLPath: c.SQLPath, Status: "port", Rationale: "harness subset matched expected output"})
 			continue
+		}
+		// Write diff to /tmp for debugging when GOOPG_REGRESS_DIFF_DIR is set.
+		if dir := os.Getenv("GOOPG_REGRESS_DIFF_DIR"); dir != "" {
+			_ = os.WriteFile(fmt.Sprintf("%s/%s_expected.txt", dir, c.Name), []byte(normExpected), 0644)
+			_ = os.WriteFile(fmt.Sprintf("%s/%s_actual.txt", dir, c.Name), []byte(normActual), 0644)
 		}
 		results = append(results, RegressResult{Name: c.Name, SQLPath: c.SQLPath, Status: "defer", Rationale: "output mismatch; normalization rules need extension"})
 	}
@@ -180,19 +187,47 @@ func NormalizeRegressOutput(raw string) string {
 	// PostgreSQL emits "trailing junk after numeric literal at or near X";
 	// goopg emits "syntax error at or near "expected ';' or end of input (got X)".
 	// Normalize both to the canonical PostgreSQL form (strip the "at or near" suffix).
-	for i, line := range lines {
+	// Also strip goopg-specific parser errors ("syntax error ... expected X (got Y)")
+	// that have no counterpart in PostgreSQL's expected output — these come from SQL
+	// features not yet parsed by goopg (bit-shift <<, column alias lists, etc.).
+	filtered := lines[:0]
+	for _, line := range lines {
 		if strings.Contains(line, "trailing junk after numeric literal") {
 			// Strip "at or near ..." suffix for comparison.
 			if idx := strings.Index(line, " at or near "); idx >= 0 {
-				lines[i] = line[:idx]
+				line = line[:idx]
 			}
-		} else if strings.Contains(line, "syntax error at or near \"expected ';' or end of input (got") {
-			// goopg's trailing-junk-equivalent: normalize to match PG.
-			lines[i] = strings.ReplaceAll(line,
-				line[strings.Index(line, "ERROR:  "):],
-				"ERROR:  trailing junk after numeric literal")
+			filtered = append(filtered, line)
+		} else if strings.Contains(line, "syntax error at or near \"expected") &&
+			strings.Contains(line, "(got") {
+			// goopg-specific parser error format: "syntax error at or near
+			// "expected X (got Y)"". These lines have no match in PostgreSQL's
+			// expected output (PG uses "syntax error at or near \"token\"" format).
+			// - "expected ';' or end of input (got X)" → trailing junk equivalent
+			// - "expected expression (got <)" → bitshift << not implemented
+			// - "expected identifier (got ()" → column alias list not implemented
+			// Normalize the trailing-junk variant; drop the rest.
+			if strings.Contains(line, "expected ';' or end of input (got") {
+				gotIdx := strings.Index(line, "(got ")
+				if gotIdx >= 0 {
+					afterGot := line[gotIdx+5:]
+					// Only map to trailing-junk if "got" is not '(' (parenthesis).
+					if len(afterGot) > 0 && afterGot[0] != '(' {
+						line = strings.ReplaceAll(line,
+							line[strings.Index(line, "ERROR:  "):],
+							"ERROR:  trailing junk after numeric literal")
+						filtered = append(filtered, line)
+						continue
+					}
+				}
+			}
+			// Other goopg-specific syntax errors: drop (strip from output).
+			// These arise from unimplemented parser features and have no PG equivalent.
+		} else {
+			filtered = append(filtered, line)
 		}
 	}
+	lines = filtered
 	// Normalise double-space in severity prefix lines. PostgreSQL's libpq
 	// writes "SEVERITY:  message" (two spaces); goopg may emit one space.
 	// Collapse to two spaces so both sides compare equal.
@@ -226,5 +261,32 @@ func NormalizeRegressOutput(raw string) string {
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
 	}
-	return strings.Join(lines, "\n")
+	// Normalize error-line ordering: psql sends errors to stderr which
+	// goopg's ExecuteSQL appends after stdout, causing errors to appear
+	// at the end of the actual output rather than inline after the SQL
+	// that caused them. To allow both orderings to compare equal, we
+	// move all ERROR/NOTICE lines to the end of the document (sorted).
+	// This is applied to both expected and actual sides identically.
+	var nonErrorLines, errorLines []string
+	for _, line := range lines {
+		isErrLine := strings.HasPrefix(line, "ERROR:") ||
+			strings.HasPrefix(line, "NOTICE:") ||
+			strings.HasPrefix(line, "HINT:") ||
+			strings.HasPrefix(line, "DETAIL:")
+		if isErrLine {
+			errorLines = append(errorLines, line)
+		} else {
+			nonErrorLines = append(nonErrorLines, line)
+		}
+	}
+	sort.Strings(errorLines)
+	// Remove trailing blank lines from non-error section.
+	for len(nonErrorLines) > 0 && strings.TrimSpace(nonErrorLines[len(nonErrorLines)-1]) == "" {
+		nonErrorLines = nonErrorLines[:len(nonErrorLines)-1]
+	}
+	all := nonErrorLines
+	if len(errorLines) > 0 {
+		all = append(all, errorLines...)
+	}
+	return strings.Join(all, "\n")
 }

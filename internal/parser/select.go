@@ -5,6 +5,34 @@ import (
 	"strings"
 )
 
+// parseValuesStmt parses a bare VALUES (row1), (row2), ... statement.
+// Used as a subquery source in FROM clauses: `FROM (VALUES ...) AS t(col)`.
+// M0097-0003.
+func (p *parser) parseValuesStmt() (Stmt, error) {
+	t, err := p.expectKeyword(KwValues)
+	if err != nil {
+		return nil, err
+	}
+	s := &SelectStmt{pos: t.Pos}
+	for {
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' for VALUES row")
+		}
+		row, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after VALUES row")
+		}
+		s.ValuesRows = append(s.ValuesRows, row)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return s, nil
+}
+
 // parseSelect parses a SELECT statement.
 //
 // Grammar (v0):
@@ -19,6 +47,12 @@ import (
 //
 // Planner support for JOIN/group/set semantics lands separately.
 func (p *parser) parseSelect() (Stmt, error) {
+	// A bare VALUES(...) is a valid standalone statement in PostgreSQL.
+	// When used as a subquery (SELECT * FROM (VALUES ...) AS t), the inner
+	// parsing entry point is parseSelect, so we handle VALUES here.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwValues {
+		return p.parseValuesStmt()
+	}
 	t, err := p.expectKeyword(KwSelect)
 	if err != nil {
 		return nil, err
@@ -457,8 +491,9 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	// (`(` + SELECT) is necessary to disambiguate from
 	// `( table_name )` which v0 doesn't currently support but
 	// upstream does.
-	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
-		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwSelect {
+	isSubqueryStart := p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
+		(p.peek(1).Kind == TokenKeyword && (p.peek(1).Keyword == KwSelect || p.peek(1).Keyword == KwValues || p.peek(1).Keyword == KwWith))
+	if isSubqueryStart {
 		pos := p.cur().Pos
 		p.advance() // (
 		inner, err := p.parseSelect()
@@ -514,9 +549,16 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
 
 	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
-	// Currently recognized: generate_series(start, stop[, step]).
-	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
-		obj.Schema == "" && strings.EqualFold(obj.Name, "generate_series") {
+	// Recognized: generate_series, pg_input_error_info.
+	srfFuncName := ""
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" && obj.Schema == "" {
+		lower := strings.ToLower(obj.Name)
+		switch lower {
+		case "generate_series", "pg_input_error_info":
+			srfFuncName = lower
+		}
+	}
+	if srfFuncName != "" {
 		p.advance() // (
 		var args []Expr
 		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
@@ -530,17 +572,36 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 			return RangeVar{}, p.errAtCur("expected ')' after function arguments")
 		}
 		rv.Name = ""
-		rv.TableFunc = &TableFuncRef{pos: obj.pos, Name: "generate_series", Args: args}
+		rv.TableFunc = &TableFuncRef{pos: obj.pos, Name: srfFuncName, Args: args}
 	}
 
-	// Optional alias: AS ident, or bare ident for the "implicit alias"
+	// Optional alias: AS ident [(col, ...)], or bare ident for the "implicit alias"
 	// shorthand that pgbench uses (`pgbench_accounts a`).
+	// The optional column alias list (SELECT ...) AS t(c1, c2) is consumed
+	// and stored in rv.Columns for downstream schema renaming. M0097-0003.
 	if p.acceptKeyword(KwAs) {
 		t, err := p.parseIdent()
 		if err != nil {
 			return RangeVar{}, err
 		}
 		rv.Alias = identText(t)
+		// Optional column alias list: AS t(c1, c2, ...).
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume '('
+			for {
+				colTok, cerr := p.parseIdent()
+				if cerr != nil {
+					return RangeVar{}, cerr
+				}
+				rv.Columns = append(rv.Columns, identText(colTok))
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+			if !p.acceptSymbol(")") {
+				return RangeVar{}, p.errAtCur("expected ')' after column alias list")
+			}
+		}
 		return rv, nil
 	}
 	if isAliasStart(p.cur()) {

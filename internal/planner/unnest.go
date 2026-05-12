@@ -317,6 +317,15 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 				walkExprTree(e, visit)
 			}
 		}
+	case *GenerateSeries:
+		walkExprTree(n.Start, visit)
+		walkExprTree(n.Stop, visit)
+		if n.Step != nil {
+			walkExprTree(n.Step, visit)
+		}
+	case *PgInputErrorInfo:
+		walkExprTree(n.Value, visit)
+		walkExprTree(n.Type, visit)
 	case *MultiHashJoin:
 		for _, tbl := range n.Tables {
 			walkPlanExprs(tbl, visit)
@@ -340,6 +349,8 @@ func walkExprTree(e Expr, visit func(Expr)) {
 		walkExprTree(x.Left, visit)
 		walkExprTree(x.Right, visit)
 	case *UnaryOp:
+		walkExprTree(x.Operand, visit)
+	case *CastExpr:
 		walkExprTree(x.Operand, visit)
 	case *FuncCall:
 		for _, a := range x.Args {
@@ -559,10 +570,11 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 		return &cl
 	case *BinaryOp:
 		return &BinaryOp{
-			pos:   x.Pos(),
-			Op:    x.Op,
-			Left:  cloneExprReplacingOuter(x.Left, replace),
-			Right: cloneExprReplacingOuter(x.Right, replace),
+			pos:        x.Pos(),
+			Op:         x.Op,
+			Left:       cloneExprReplacingOuter(x.Left, replace),
+			Right:      cloneExprReplacingOuter(x.Right, replace),
+			ResultType: x.ResultType,
 		}
 	case *UnaryOp:
 		return &UnaryOp{
@@ -593,6 +605,8 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 			cl.Else = cloneExprReplacingOuter(x.Else, replace)
 		}
 		return &cl
+	case *CastExpr:
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprReplacingOuter(x.Operand, replace), TargetType: x.TargetType}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprReplacingOuter(x.Source, replace)
@@ -622,10 +636,11 @@ func cloneExprSubstituteAggIdx0(e Expr, aggColRef *ColumnRef) Expr {
 		return &cl
 	case *BinaryOp:
 		return &BinaryOp{
-			pos:   x.Pos(),
-			Op:    x.Op,
-			Left:  cloneExprSubstituteAggIdx0(x.Left, aggColRef),
-			Right: cloneExprSubstituteAggIdx0(x.Right, aggColRef),
+			pos:        x.Pos(),
+			Op:         x.Op,
+			Left:       cloneExprSubstituteAggIdx0(x.Left, aggColRef),
+			Right:      cloneExprSubstituteAggIdx0(x.Right, aggColRef),
+			ResultType: x.ResultType,
 		}
 	case *UnaryOp:
 		return &UnaryOp{
@@ -656,6 +671,8 @@ func cloneExprSubstituteAggIdx0(e Expr, aggColRef *ColumnRef) Expr {
 			cl.Else = cloneExprSubstituteAggIdx0(x.Else, aggColRef)
 		}
 		return &cl
+	case *CastExpr:
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef), TargetType: x.TargetType}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprSubstituteAggIdx0(x.Source, aggColRef)

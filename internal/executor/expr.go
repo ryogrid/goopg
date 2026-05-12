@@ -136,6 +136,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, err
 		}
 		return evalUnary(x.Op, operand, x.Pos())
+	case *planner.CastExpr:
+		v, err := evalExprSlot(x.Operand, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		return evalCast(v, x.TargetType, x.Pos())
 	case *planner.BinaryOp:
 		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
@@ -145,7 +151,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
-		return evalBinary(x.Op, left, right, x.Pos())
+		result, err := evalBinary(x.Op, left, right, x.Pos())
+		if err != nil {
+			return Datum{}, err
+		}
+		// Overflow check for int2 arithmetic (M0097-0003).
+		if x.ResultType == "int2" || x.ResultType == "smallint" {
+			if result.Kind == KindInt && (result.Int < -32768 || result.Int > 32767) {
+				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "smallint out of range"}
+			}
+		}
+		return result, nil
 	case *planner.FuncCall:
 		return evalFuncCall(x, slotToRow(slot), ctx)
 	case *planner.IsNullExpr:
@@ -620,26 +636,32 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 
 	case "int2", "smallint":
-		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 16)
+		n, err := parseIntegerInput(x.Value, "smallint", 16)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type smallint: %q", x.Value)}
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
 		}
 		return Datum{Kind: KindInt, Int: n}, nil
 
 	case "int4", "integer", "int":
-		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 32)
+		n, err := parseIntegerInput(x.Value, "integer", 32)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type integer: %q", x.Value)}
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
 		}
 		return Datum{Kind: KindInt, Int: n}, nil
 
 	case "int8", "bigint":
-		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 64)
+		n, err := parseIntegerInput(x.Value, "bigint", 64)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type bigint: %q", x.Value)}
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
 		}
 		return Datum{Kind: KindInt, Int: n}, nil
 
@@ -678,10 +700,17 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		return NewStringDatum(s), nil
 
 	case "oid":
-		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 64)
+		// oid is uint32: 0..4294967295. M0097-0003.
+		n, err := parseIntegerInput(x.Value, "oid", 64)
 		if err != nil {
-			return Datum{}, &ExecError{Code: "22P02", Pos: x.Pos(),
-				Message: fmt.Sprintf("invalid input syntax for type oid: %q", x.Value)}
+			if ee, ok := err.(*ExecError); ok {
+				ee.Pos = x.Pos()
+			}
+			return Datum{}, err
+		}
+		if n < 0 || n > 4294967295 {
+			return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(),
+				Message: fmt.Sprintf("value %q is out of range for type oid", x.Value)}
 		}
 		return Datum{Kind: KindInt, Int: n}, nil
 
@@ -740,6 +769,181 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		// M0097-0017: enum/domain type casts return the string value as-is.
 		return NewStringDatum(x.Value), nil
 	}
+}
+
+// roundNumericToInt rounds a KindNumeric datum to the nearest integer using
+// "round half away from zero" (PostgreSQL's numeric→integer rounding rule).
+// For float→int casts PostgreSQL uses banker's rounding, but since we cannot
+// distinguish the source type from KindNumeric, we use away-from-zero uniformly.
+// M0097-0003.
+func roundNumericToInt(d Datum, pos int) (int64, error) {
+	text := numericText(d)
+	// Parse as float64 for rounding.
+	f, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, &ExecError{Code: "22P02", Pos: pos,
+			Message: fmt.Sprintf("invalid numeric value for integer cast: %s", text)}
+	}
+	// Round half away from zero (arithmetic rounding).
+	var rounded int64
+	if f >= 0 {
+		rounded = int64(f + 0.5)
+	} else {
+		rounded = int64(f - 0.5)
+	}
+	return rounded, nil
+}
+
+// evalCast coerces datum d to the declared SQL type name.
+// Handles: string→bool, bool→text, int→text, int→int2 (range check),
+// string→int2/4/8 (via parseIntegerInput). Pass-through for unknown types.
+// M0097-0003.
+func evalCast(d Datum, targetType string, pos int) (Datum, error) {
+	if d.IsNull() {
+		return NullDatum, nil
+	}
+	switch strings.ToLower(targetType) {
+	case "bool", "boolean":
+		switch d.Kind {
+		case KindBool:
+			return d, nil
+		case KindString, KindStringArena:
+			v := strings.TrimSpace(strings.ToLower(d.StringValue()))
+			switch v {
+			case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
+				return NewBoolDatum(true), nil
+			case "f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
+				return NewBoolDatum(false), nil
+			default:
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type boolean: %q", d.StringValue())}
+			}
+		case KindInt:
+			return NewBoolDatum(d.Int != 0), nil
+		default:
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to bool"}
+		}
+	case "int2", "smallint":
+		switch d.Kind {
+		case KindInt:
+			if d.Int < -32768 || d.Int > 32767 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
+			}
+			return d, nil
+		case KindString, KindStringArena:
+			n, err := parseIntegerInput(d.StringValue(), "smallint", 16)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		case KindNumeric:
+			// Float/numeric → int2: round to nearest even (banker's rounding). M0097-0003.
+			n, err := roundNumericToInt(d, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			if n < -32768 || n > 32767 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		default:
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to smallint"}
+		}
+	case "int4", "integer", "int":
+		switch d.Kind {
+		case KindInt:
+			if d.Int < -2147483648 || d.Int > 2147483647 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
+			}
+			return d, nil
+		case KindString, KindStringArena:
+			n, err := parseIntegerInput(d.StringValue(), "integer", 32)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		case KindNumeric:
+			n, err := roundNumericToInt(d, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			if n < -2147483648 || n > 2147483647 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		default:
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to integer"}
+		}
+	case "int8", "bigint":
+		switch d.Kind {
+		case KindInt:
+			return d, nil
+		case KindString, KindStringArena:
+			n, err := parseIntegerInput(d.StringValue(), "bigint", 64)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		case KindNumeric:
+			n, err := roundNumericToInt(d, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		default:
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to bigint"}
+		}
+	case "text", "varchar", "bpchar", "char":
+		switch d.Kind {
+		case KindBool:
+			if d.BoolValue() {
+				return NewStringDatum("true"), nil
+			}
+			return NewStringDatum("false"), nil
+		case KindInt:
+			return NewStringDatum(strconv.FormatInt(d.Int, 10)), nil
+		case KindString, KindStringArena:
+			return d, nil
+		default:
+			return d, nil
+		}
+	case "float4", "real", "float8", "double precision":
+		// Pass through for now.
+		return d, nil
+	case "oid":
+		switch d.Kind {
+		case KindInt:
+			if d.Int < 0 || d.Int > 4294967295 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "value out of range for type oid"}
+			}
+			return d, nil
+		case KindString, KindStringArena:
+			n, err := parseIntegerInput(d.StringValue(), "oid", 64)
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			if n < 0 || n > 4294967295 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos,
+					Message: fmt.Sprintf("value %q is out of range for type oid", d.StringValue())}
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		default:
+			return d, nil
+		}
+	}
+	return d, nil // pass-through for unknown types
 }
 
 // parseXid parses an xid value (unsigned 32-bit). Accepts decimal, octal (0NNN), hex (0xNNN).
@@ -1982,13 +2186,13 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			case "bool", "boolean":
 				return NewBoolDatum(isValidBoolInput(v)), nil
 			case "int2", "smallint":
-				n, err := strconv.ParseInt(v, 10, 64)
-				return NewBoolDatum(err == nil && n >= -32768 && n <= 32767), nil
+				_, err := parseIntegerInput(v, "smallint", 16)
+				return NewBoolDatum(err == nil), nil
 			case "int4", "integer", "int":
-				n, err := strconv.ParseInt(v, 10, 64)
-				return NewBoolDatum(err == nil && n >= -2147483648 && n <= 2147483647), nil
+				_, err := parseIntegerInput(v, "integer", 32)
+				return NewBoolDatum(err == nil), nil
 			case "int8", "bigint":
-				_, err := strconv.ParseInt(v, 10, 64)
+				_, err := parseIntegerInput(v, "bigint", 64)
 				return NewBoolDatum(err == nil), nil
 			case "float4", "real":
 				_, err := strconv.ParseFloat(v, 32)
@@ -1997,8 +2201,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				_, err := strconv.ParseFloat(v, 64)
 				return NewBoolDatum(err == nil), nil
 			case "oid":
-				_, err := strconv.ParseInt(v, 10, 64)
-				return NewBoolDatum(err == nil), nil
+				// oid is uint32: 0..4294967295. M0097-0003.
+				n, err := strconv.ParseInt(v, 10, 64)
+				return NewBoolDatum(err == nil && n >= 0 && n <= 4294967295), nil
 			case "uuid":
 				return NewBoolDatum(isValidUUIDStr(v)), nil
 			case "xid":

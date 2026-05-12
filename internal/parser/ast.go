@@ -607,6 +607,11 @@ type SelectStmt struct {
 	// every pre-M0021 SELECT — preserves byte-for-byte
 	// invariance across the existing parser/planner test suite.
 	Locking []*LockingClause
+	// ValuesRows is set when this SelectStmt represents a bare
+	// `VALUES (r1), (r2), ...` statement (used as a subquery source
+	// in FROM, e.g. `FROM (VALUES ...) t(col)`). When set, Targets
+	// and From are empty. M0097-0003.
+	ValuesRows [][]Expr
 }
 
 func (s *SelectStmt) Pos() int  { return s.pos }

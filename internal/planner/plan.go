@@ -306,15 +306,32 @@ func (*ParamRef) exprNode()  {}
 //
 // M0073-0003: Op is now parser.OpCode (int8 enum), was
 // string. Mirror of parser.BinaryOp's field type.
+// ResultType is non-empty for arithmetic with typed result (e.g., "int2").
+// M0097-0003.
 type BinaryOp struct {
-	pos   int
-	Op    parser.OpCode
-	Left  Expr
-	Right Expr
+	pos        int
+	Op         parser.OpCode
+	Left       Expr
+	Right      Expr
+	ResultType string // non-empty for arithmetic with typed result (e.g., "int2")
 }
 
 func (e *BinaryOp) Pos() int { return e.pos }
 func (*BinaryOp) exprNode()  {}
+
+// CastExpr preserves the cast target type for type inference and runtime coercion.
+// v0's planner previously discarded cast targets (no-op); CastExpr retains the
+// TargetType so exprType() can return the declared type and the executor can
+// coerce values at runtime (e.g., string→bool, string→int2 with range check).
+// M0097-0003.
+type CastExpr struct {
+	pos        int
+	Operand    Expr
+	TargetType string // normalized lowercase type name (e.g., "int2", "bool")
+}
+
+func (e *CastExpr) Pos() int { return e.pos }
+func (*CastExpr) exprNode()  {}
 
 // UnaryOp — Op Operand.
 //
@@ -680,6 +697,20 @@ type GenerateSeries struct {
 
 func (n *GenerateSeries) Pos() int       { return n.pos }
 func (n *GenerateSeries) Output() Schema { return n.schema }
+
+// PgInputErrorInfo implements pg_input_error_info(value, type) as a
+// set-returning function in the FROM clause. Returns 0 rows if the
+// input is valid, or 1 row with (message, detail, hint, sql_error_code)
+// if it is invalid. M0097-0003.
+type PgInputErrorInfo struct {
+	pos    int
+	Value  Expr
+	Type   Expr
+	schema Schema
+}
+
+func (n *PgInputErrorInfo) Pos() int       { return n.pos }
+func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed
