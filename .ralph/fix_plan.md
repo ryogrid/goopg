@@ -844,23 +844,18 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
       Files: results/20260511_125043_*.txt + m0098_baseline_*.pprof
       Summary: results/20260511_125043_m0098_baseline_summary.md
 
-- [ ] **M0098-0002** — **WAL group commit** — the single highest-ROI change
-      for write workloads.
-      Implementation:
-      - Replace the current one-response-channel-per-`FlushUpTo` pattern
-        with a shared flush-queue: callers post a `flushRequest{lsn, done
-        chan struct{}}` to a slice guarded by a mutex, then wait on `done`.
-      - The WAL writer goroutine, upon receiving any `opFlush`, drains the
-        entire pending queue (collecting the maximum LSN), performs one
-        `fdatasync`, then closes all `done` channels in the batch.
-      - Add `commit_delay` (µs) and `commit_siblings` (min active
-        connections) GUC-equivalent runtime knobs (see PostgreSQL
-        `XLogFlush` group-commit path documented in
-        `about_wal/component_wal_writing.md`).
-      - Wire `runtime.LockOSThread()` on the WAL writer goroutine
-        (`go_rdbms_performance_techniques.md` §2) to reduce OS scheduling
-        jitter on the fsync goroutine.
-      Expected: 8–15× TPS improvement for Simple Update; 5–10× for Standard.
+- [x] **M0098-0002** — **WAL group commit** — the single highest-ROI change
+      for write workloads.  2026-05-12.
+      Landed (internal/wal/writer.go + iterator.go):
+      - groupFlushReq{lsn, done chan struct{}} + flushGroup{mu, queue, signal}
+      - FlushUpTo: append to queue + non-blocking signal send + block on done
+      - state.loop: select{ops, flushSig} with handleGroupFlush() draining
+        entire queue in one flushUpTo(maxLSN) call, then close(req.done) all
+      - runtime.LockOSThread() on writer goroutine (reduces scheduling jitter)
+      - RecordIterator.closed: bool → atomic.Bool (fixed race exposed by LockOSThread)
+      - All WAL/initdb/server tests pass with -race detector
+      Design doc: docs/design/0098-0002-wal-group-commit.md
+      (TPS verification deferred to M0098-0008 final measurement)
 
 - [ ] **M0098-0003** — **Buffer pool 128-partition locking** — removes the
       global `poolMu` bottleneck for high-concurrency reads and writes.

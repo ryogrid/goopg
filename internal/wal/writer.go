@@ -6,10 +6,29 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 )
+
+// groupFlushReq represents a single caller's flush request in the
+// group-commit queue. M0098-0002.
+type groupFlushReq struct {
+	lsn  uint64
+	done chan struct{} // closed by writer goroutine when flush is complete
+	err  error        // set before done is closed
+}
+
+// flushGroup holds the shared queue and signal channel for WAL group
+// commit (M0098-0002). Multiple concurrent FlushUpTo callers append
+// their requests and the writer goroutine drains the entire batch in
+// one fdatasync.
+type flushGroup struct {
+	mu     sync.Mutex
+	queue  []*groupFlushReq
+	signal chan struct{} // capacity-1 channel; non-blocking send triggers writer
+}
 
 const (
 	// DefaultSegmentSize matches PostgreSQL's default WAL segment size.
@@ -272,6 +291,11 @@ type Writer struct {
 	// code can balance every WaitEventStart with a WaitEventEnd.
 	// (M0058-0006.)
 	OnWALSyncDone func()
+
+	// fg is the group-commit queue. FlushUpTo appends to fg.queue
+	// and signals fg.signal; the writer goroutine drains the entire
+	// batch in one fdatasync. M0098-0002.
+	fg *flushGroup
 }
 
 type state struct {
@@ -349,6 +373,9 @@ type state struct {
 	// onWALWrite is an optional hook called before each WAL page
 	// write in writeAt. Set by NewWriter from the Writer's OnWALWrite.
 	onWALWrite func()
+
+	// fg is the group-commit flush queue, shared with Writer. M0098-0002.
+	fg *flushGroup
 }
 
 // walBufferCounters holds the atomic lifetime counters that
@@ -387,6 +414,9 @@ func NewWriter(cfg Config) (*Writer, error) {
 
 	bufCounters := &walBufferCounters{}
 	st.walBufferCounters = bufCounters
+	fg := &flushGroup{
+		signal: make(chan struct{}, 1),
+	}
 	w := &Writer{
 		ops:               make(chan op),
 		done:              make(chan struct{}),
@@ -395,6 +425,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 		walBufferCounters: bufCounters,
 		pageHeaders:       cfg.PageHeaders,
 		segmentSize:       cfg.SegmentSize,
+		fg:                fg,
 	}
 	w.writeLSNAtomic.Store(uint64(st.writePos))
 	st.writeLSNMirror = &w.writeLSNAtomic
@@ -402,6 +433,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 	st.onLoopStart = cfg.OnLoopStart
 	st.onLoopEnd = cfg.OnLoopEnd
 	st.onWALWrite = cfg.OnWALWrite
+	st.fg = fg
 	go st.loop(w.ops, w.done)
 	return w, nil
 }
@@ -566,6 +598,8 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 }
 
 // FlushUpTo persists WAL bytes up to lsn with fdatasync semantics.
+// M0098-0002: group-commit path — multiple concurrent callers are
+// batched into a single fdatasync by the writer goroutine.
 func (w *Writer) FlushUpTo(lsn uint64) error {
 	if lsn == 0 {
 		return nil
@@ -576,11 +610,23 @@ func (w *Writer) FlushUpTo(lsn uint64) error {
 	if w.OnWALSyncDone != nil {
 		defer w.OnWALSyncDone()
 	}
-	resp := make(chan result, 1)
-	if err := w.send(op{kind: opFlush, lsn: lsn, resp: resp}); err != nil {
-		return err
+	req := &groupFlushReq{lsn: lsn, done: make(chan struct{})}
+	w.fg.mu.Lock()
+	w.fg.queue = append(w.fg.queue, req)
+	w.fg.mu.Unlock()
+	// Signal writer goroutine. Non-blocking: if signal is already
+	// pending the writer will pick up our request on the next drain.
+	select {
+	case w.fg.signal <- struct{}{}:
+	default:
 	}
-	return (<-resp).err
+	// Wait for the writer to complete our flush (or the writer to close).
+	select {
+	case <-req.done:
+		return req.err
+	case <-w.done:
+		return ErrClosed
+	}
 }
 
 // RemoveOldSegments unlinks any WAL segment file whose contents end
@@ -865,6 +911,10 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 }
 
 func (s *state) loop(ops <-chan op, done chan<- struct{}) {
+	// Pin this goroutine to its OS thread to eliminate migration
+	// overhead on the fdatasync hot path. M0098-0002.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if s.onLoopStart != nil {
 		s.onLoopStart()
 	}
@@ -872,33 +922,86 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 		defer s.onLoopEnd()
 	}
 	defer close(done)
-	for req := range ops {
-		switch req.kind {
-		case opAppend:
-			start, end, err := s.append(req.payload)
-			req.resp <- result{startLSN: start, endLSN: end, err: err}
-			if err == nil && s.onAppend != nil {
-				s.onAppend()
+	// flushSig is s.fg.signal; using a local avoids a nil-check on
+	// every select iteration when fg is absent (tests that build a
+	// state without a Writer use fg=nil).
+	var flushSig <-chan struct{}
+	if s.fg != nil {
+		flushSig = s.fg.signal
+	}
+	for {
+		select {
+		case req, ok := <-ops:
+			if !ok {
+				return
 			}
-		case opFlush:
-			req.resp <- result{err: s.flushUpTo(req.lsn)}
-		case opRecycle:
-			n, err := s.removeOldSegments(req.lsn)
-			req.resp <- result{removed: n, err: err}
-		case opClose:
-			err := s.close()
-			req.resp <- result{err: err}
-			return
-		case opWALBufStat:
-			snap := walBufStatSnapshot{}
-			if s.walBuf != nil {
-				snap.cap = s.walBuf.cap
-				snap.resident = s.walBuf.resident()
+			switch req.kind {
+			case opAppend:
+				start, end, err := s.append(req.payload)
+				req.resp <- result{startLSN: start, endLSN: end, err: err}
+				if err == nil && s.onAppend != nil {
+					s.onAppend()
+				}
+			case opFlush:
+				// Legacy path kept for backward compatibility.
+				// New code routes through flushSig via FlushUpTo.
+				req.resp <- result{err: s.flushUpTo(req.lsn)}
+			case opRecycle:
+				n, err := s.removeOldSegments(req.lsn)
+				req.resp <- result{removed: n, err: err}
+			case opClose:
+				// Drain any pending group-flush requests before closing.
+				s.handleGroupFlush()
+				err := s.close()
+				req.resp <- result{err: err}
+				return
+			case opWALBufStat:
+				snap := walBufStatSnapshot{}
+				if s.walBuf != nil {
+					snap.cap = s.walBuf.cap
+					snap.resident = s.walBuf.resident()
+				}
+				req.resp <- result{walBufStat: snap}
+			default:
+				req.resp <- result{err: fmt.Errorf("wal: unknown operation %d", req.kind)}
 			}
-			req.resp <- result{walBufStat: snap}
-		default:
-			req.resp <- result{err: fmt.Errorf("wal: unknown operation %d", req.kind)}
+		case _, ok := <-flushSig:
+			if !ok {
+				return
+			}
+			s.handleGroupFlush()
 		}
+	}
+}
+
+// handleGroupFlush drains the entire pending flush queue, issues one
+// fdatasync for the maximum LSN requested, then notifies all waiters.
+// Called only from the writer goroutine. M0098-0002.
+func (s *state) handleGroupFlush() {
+	if s.fg == nil {
+		return
+	}
+	s.fg.mu.Lock()
+	queue := s.fg.queue
+	s.fg.queue = nil
+	s.fg.mu.Unlock()
+	if len(queue) == 0 {
+		return
+	}
+	// Find the highest LSN across all requests; one flush satisfies all.
+	var maxLSN uint64
+	for _, req := range queue {
+		if req.lsn > maxLSN {
+			maxLSN = req.lsn
+		}
+	}
+	err := s.flushUpTo(maxLSN)
+	// Notify all callers. req.err is set before close(req.done) so the
+	// caller's read of req.err after <-req.done is race-free (close is
+	// a happens-before barrier in Go).
+	for _, req := range queue {
+		req.err = err
+		close(req.done)
 	}
 }
 
