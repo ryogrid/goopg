@@ -993,12 +993,18 @@ while preserving the original `-c 100 -j 100` target-condition validation.
 
 ### Sub-milestones
 
-- [ ] **M0099-0001** — Design and benchmark plan for remaining bottlenecks.
-      Produce design/benchmark plan docs for:
-      (a) buffer-pool pin fast-path lock contention (`evictMu`),
-      (b) WAL group commit batching policy (`commit_delay` / siblings behavior),
-      (c) deadlock-safe conflict waiting + 40001 rate reduction strategy.
-      Also define the pgbench measurement matrix and pass/fail criteria.
+- [x] **M0099-0001** — Design and benchmark plan for remaining bottlenecks.
+      Produced 4 design docs (2026-05-12):
+      - `docs/design/0099-0001-evictmu-pin-fastpath-deserialization.md`:
+        atomic Slot.pinCount + CAS victim claim; removes evictMu from Pin hot path.
+      - `docs/design/0099-0002-wal-group-commit-batching-policy.md`:
+        commit_delay_us=1000 + commit_siblings=5 in handleGroupFlush.
+      - `docs/design/0099-0003-deadlock-safe-conflict-waiting.md`:
+        wait-for-graph + 64-hop cycle detection; WaitForXID with 5s timeout;
+        maxEPQRetries raised 3→10.
+      - `docs/design/0099-0004-pgbench-client-thread-matrix-validation.md`:
+        8-config × 3-workload matrix; pass/fail criteria for M0099-0005/0006.
+      All 4 docs indexed in `docs/design/README.md`.
 
 - [ ] **M0099-0002** — Remove `evictMu` from Pin fast path.
       Implement atomic pin-count handling (e.g., `atomic.Int32`) and redesign
