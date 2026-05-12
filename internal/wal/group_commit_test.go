@@ -82,7 +82,7 @@ func TestGroupCommitSingleCaller(t *testing.T) {
 
 // TestGroupCommitBatchingDelay verifies that commitSiblings+1 concurrent
 // callers all complete (the batching delay path is exercised without hang
-// or error). M0099-0003.
+// or error). M0099-0003 (delay disabled but concurrent flush still tested).
 func TestGroupCommitBatchingDelay(t *testing.T) {
 	dir := t.TempDir()
 	w, err := NewWriter(Config{WALDir: dir})
@@ -92,7 +92,7 @@ func TestGroupCommitBatchingDelay(t *testing.T) {
 	defer w.Close()
 
 	// Append enough records so all goroutines have distinct LSNs to flush.
-	const N = commitSiblings + 5 // comfortably above the threshold
+	const N = 10 // comfortably above any threshold
 	lsns := make([]uint64, N)
 	for i := range lsns {
 		_, end, err := w.Append([]byte("batchtest"))

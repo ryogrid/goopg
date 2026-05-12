@@ -117,8 +117,11 @@ func TestSelfUpdateInSameTxnNotBlocked(t *testing.T) {
 
 // TestIsConcurrentlyUpdatedHelper directly unit-tests the helper's
 // classification of every xmax / infomask state we care about.
+// Note: the snapshot parameter is currently ignored by isConcurrentlyUpdated;
+// aborted-xmax disambiguation is handled in the EPQ retry loops.
 func TestIsConcurrentlyUpdatedHelper(t *testing.T) {
 	const myXID storage.TransactionID = 100
+
 	cases := []struct {
 		name string
 		h    storage.HeapTupleHeader
@@ -126,14 +129,14 @@ func TestIsConcurrentlyUpdatedHelper(t *testing.T) {
 	}{
 		{"unset xmax", storage.HeapTupleHeader{Xmax: 0, Infomask: 0}, false},
 		{"xmax=myXID", storage.HeapTupleHeader{Xmax: myXID, Infomask: 0}, false},
-		{"xmax=other live", storage.HeapTupleHeader{Xmax: 50, Infomask: 0}, true},
+		{"xmax=other", storage.HeapTupleHeader{Xmax: 50, Infomask: 0}, true},
 		{"HeapHotUpdated bit set", storage.HeapTupleHeader{Xmax: 50, Infomask: storage.HeapHotUpdated}, true},
 		{"HeapXmaxInvalid bit set with xmax=other", storage.HeapTupleHeader{Xmax: 50, Infomask: storage.HeapXmaxInvalid}, false},
 		{"lock-only xmax (FOR UPDATE)", storage.HeapTupleHeader{Xmax: 50, Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxExclLock}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := isConcurrentlyUpdated(c.h, myXID); got != c.want {
+			if got := isConcurrentlyUpdated(c.h, myXID, nil); got != c.want {
 				t.Errorf("isConcurrentlyUpdated = %v, want %v", got, c.want)
 			}
 		})

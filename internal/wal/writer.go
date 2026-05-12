@@ -10,7 +10,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // groupFlushReq represents a single caller's flush request in the
@@ -35,18 +34,10 @@ const (
 	// DefaultSegmentSize matches PostgreSQL's default WAL segment size.
 	DefaultSegmentSize int64 = 16 * 1024 * 1024
 
-	// commitDelayUs is the number of microseconds handleGroupFlush sleeps
-	// after draining the initial batch, to allow more concurrent FlushUpTo
-	// callers to arrive and be served by the same fdatasync.
-	// Mirrors PostgreSQL's commit_delay GUC. 0 disables the delay.
-	// M0099-0003: set to 1 ms to coalesce batches under -c 100 workloads.
-	commitDelayUs = 1000
-
-	// commitSiblings is the minimum number of concurrent waiters required
-	// before commitDelayUs applies. Mirrors PostgreSQL's commit_siblings GUC.
-	// Below this threshold we flush immediately to avoid adding latency to
-	// low-concurrency workloads.
-	commitSiblings = 5
+	// commitDelayUs / commitSiblings (M0099-0003) were disabled because the
+	// time.Sleep in handleGroupFlush races with concurrent tryAppend callers
+	// that modify s.writePos without appendMu during the sleep window.
+	// See the comment in handleGroupFlush for details.
 )
 
 var (
@@ -1008,22 +999,14 @@ func (s *state) handleGroupFlush() {
 	if len(queue) == 0 {
 		return
 	}
-	// Batching delay: if enough concurrent waiters are already queued,
-	// sleep briefly to accumulate more callers before the expensive
-	// fdatasync. The sleep runs on the OS-thread-pinned writer goroutine
-	// (runtime.LockOSThread, M0098-0002) so it doesn't thrash the
-	// scheduler.
-	if commitDelayUs > 0 && len(queue) >= commitSiblings {
-		time.Sleep(commitDelayUs * time.Microsecond)
-		// Drain any new arrivals that enqueued during the sleep.
-		s.fg.mu.Lock()
-		extra := s.fg.queue
-		s.fg.queue = nil
-		s.fg.mu.Unlock()
-		if len(extra) > 0 {
-			queue = append(queue, extra...)
-		}
-	}
+	// Batching delay (M0099-0003 DISABLED): the sleep-then-re-drain
+	// design races with concurrent tryAppend callers that modify
+	// s.writePos outside appendMu during the sleep window (state.append
+	// Path A reads s.writePos without appendMu, then sets it back to a
+	// stale value, causing s.writeLSN to be incorrect). The fix requires
+	// making state.append re-read s.writePos under appendMu (Path A),
+	// which is a non-trivial correctness fix deferred to a later loop.
+	// For now, simply drain all currently-queued requestors without sleep.
 	// Find the highest LSN across all requests; one flush satisfies all.
 	var maxLSN uint64
 	for _, req := range queue {

@@ -1,12 +1,10 @@
 package executor
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -18,17 +16,10 @@ import (
 )
 
 // maxEPQRetries is the maximum number of EvalPlanQual re-checks before
-// escalating to SQLSTATE 40001. Raised 3→10 in M0099-0004 because the
-// WFG-based epqWait now blocks until the conflicting transaction commits
-// or aborts, so most retries resolve on the first attempt.
-const maxEPQRetries = 10
+// escalating to SQLSTATE 40001. M0098-0004.
+const maxEPQRetries = 3
 
-// epqWaitTimeout is the maximum time epqWait blocks on WaitForXID.
-// Acts as a safety net: if cycle detection produces a false negative
-// (e.g. transient graph state), the timeout breaks any permanent hang.
-const epqWaitTimeout = 5 * time.Second
-
-// maxWFGHops is the maximum chain length walked during cycle detection.
+// maxWFGHops is the maximum chain length walked during WFG cycle detection.
 // Limits the O(N) scan to a constant bound under adversarial workloads.
 const maxWFGHops = 64
 
@@ -41,9 +32,9 @@ var (
 
 // registerWFGAndCheckCycle adds the edge myXID→blockingXID and walks the
 // graph up to maxWFGHops looking for a cycle (deadlock). Returns true when
-// a cycle is detected; the edge is removed before returning so the caller
-// MUST NOT call deregisterWFG. Returns false when no cycle is found; the
-// caller must call deregisterWFG after the wait completes.
+// a cycle is detected; the edge is removed before returning (caller must NOT
+// call deregisterWFG). Returns false when no cycle is found; the caller must
+// call deregisterWFG after the wait completes.
 func registerWFGAndCheckCycle(myXID, blockingXID storage.TransactionID) bool {
 	wfgMu.Lock()
 	defer wfgMu.Unlock()
@@ -63,42 +54,39 @@ func registerWFGAndCheckCycle(myXID, blockingXID storage.TransactionID) bool {
 	return false
 }
 
-// deregisterWFG removes myXID from the wait-for graph after a wait resolves.
+// deregisterWFG removes myXID from the wait-for graph after a snapshot
+// refresh completes.
 func deregisterWFG(myXID storage.TransactionID) {
 	wfgMu.Lock()
 	delete(waitForGraph, myXID)
 	wfgMu.Unlock()
 }
 
-// epqWait detects deadlocks via the process-global wait-for graph, then
-// blocks until xmax commits or aborts (with a 5 s safety timeout).
-// Returns true if a deadlock cycle is confirmed — caller should immediately
-// escalate to SQLSTATE 40001 without consuming an epqRetry slot.
+// epqWait detects deadlock cycles via the wait-for graph (WFG) and refreshes
+// the snapshot. Returns true if a deadlock cycle is confirmed — caller must
+// immediately escalate to SQLSTATE 40001. Returns false otherwise.
+//
+// WFG cycle detection (M0099-0004) provides earlier deadlock identification
+// than the M0098-0004 retry-exhaustion approach: a confirmed 2-node cycle
+// (TX1→TX2, TX2→TX1) yields 40001 immediately for one participant instead
+// of after maxEPQRetries snapshot-refresh rounds.
+//
+// Non-deadlock conflicts fall back to snapshot-refresh-only (same as
+// M0098-0004) — blocking via WaitForXID was removed because it caused
+// pgbench client goroutines to hang past the 180 s measurement window.
 // M0098-0004, M0099-0004.
 func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
-	if ctx.TxnMgr == nil || ctx.Tx.XID == storage.InvalidTransactionID {
-		// No manager or no write XID yet — fall back to snapshot refresh only.
-		if ctx.TxnMgr != nil {
-			if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
-				ctx.Snap = snap.Clone()
-			}
-		}
+	if ctx.TxnMgr == nil {
 		return false
 	}
-	if registerWFGAndCheckCycle(ctx.Tx.XID, xmax) {
-		return true
+	if ctx.Tx.XID != storage.InvalidTransactionID {
+		if registerWFGAndCheckCycle(ctx.Tx.XID, xmax) {
+			return true
+		}
+		defer deregisterWFG(ctx.Tx.XID)
 	}
-	// Block until the conflicting transaction commits or aborts.
-	waitCtx := ctx.Ctx
-	if waitCtx == nil {
-		waitCtx = context.Background()
-	}
-	waitCtx, cancel := context.WithTimeout(waitCtx, epqWaitTimeout)
-	_ = ctx.TxnMgr.WaitForXID(waitCtx, xmax)
-	cancel()
-	deregisterWFG(ctx.Tx.XID)
-	// Refresh snapshot after the wait so subsequent visibility checks see
-	// any changes committed during the blocking window.
+	// Refresh the snapshot so the next epqRecheckVisible call sees any
+	// committed changes from the conflicting transaction.
 	if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
 		ctx.Snap = snap.Clone()
 	}
@@ -823,12 +811,16 @@ func markHeapHotUpdateDirty(
 // the concurrent-xmax-stamp race that produces orphan visible tuples
 // in MVCC (M0090-0002).
 //
-// The check is conservative: a lock-only xmax (someone took SELECT
-// FOR UPDATE but did not modify) is NOT treated as a concurrent
-// update — readers see the tuple as live, and a real UPDATE can
-// proceed by re-stamping. Our own xmax from an earlier write in the
-// same transaction is also fine.
-func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID) bool {
+// snap is the current statement snapshot; it is passed for context but
+// the aborted-xmax disambiguation is handled in the EPQ retry loops
+// (see updateOp, deleteOp): when epqRecheckVisible finds the row still
+// visible AND snap.HasInProgress(xmax) is false, the xmax was aborted,
+// so the loop breaks instead of retrying → avoids permanent 40001 on
+// rolled-back HOT update chains (M0099 fix).
+//
+// A lock-only xmax (SELECT FOR UPDATE) is NOT treated as a concurrent
+// update — the lock holder does not own the row's write intent.
+func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID, _ *mvcc.Snapshot) bool {
 	// "Our own xmax stamp" — re-update in the same transaction is
 	// always legal, regardless of HeapHotUpdated or other bits set
 	// by our prior write.
@@ -926,7 +918,7 @@ func tryApplyHOTUpdate(
 	// wait for the conflicting transaction (with deadlock detection) and
 	// fall back to the delete+insert path so it can re-check visibility.
 	if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), oldSlot); gerr == nil &&
-		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID) {
+		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID, &ctx.Snap) {
 		xmax := oldTuple.Header.Xmax
 		s.Unlock()
 		ctx.Pool.Unpin(s)
@@ -1162,7 +1154,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				// exclusive Lock before our own stamp. Capture old tuple
 				// bytes for WAL logical record (M0094-0002).
 				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-				if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
+				if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
 					xmax := oldTup.Header.Xmax
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
@@ -1182,10 +1174,17 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					}
 					visible, _ := epqRecheckVisible(o.ctx, rel, pu.blk, pu.slot)
 					if !visible {
-						epqSkip = true // row gone after conflict resolved
+						epqSkip = true // row gone — xmax committed, deleted the row
 						break
 					}
-					continue // retry: conflict txn aborted, row still alive
+					// Row still visible. If xmax is no longer in InProgress the
+					// conflicting transaction aborted — break so the outer code
+					// can proceed with the update instead of retrying to 40001.
+					// M0099: fixes permanent 40001 on rolled-back HOT updates.
+					if !o.ctx.Snap.HasInProgress(xmax) {
+						break // xmax aborted; proceed with update
+					}
+					continue // xmax still in-progress; retry
 				}
 				var oldTupleBytes []byte
 				if oldGerr == nil {
@@ -1329,7 +1328,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 			s.Lock()
 			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
+			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
 				xmax := oldTup.Header.Xmax
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
@@ -1352,7 +1351,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					epqSkipSeq = true
 					break
 				}
-				continue
+				// Row visible; if xmax no longer in-progress → it aborted → proceed.
+				if !o.ctx.Snap.HasInProgress(xmax) {
+					break // xmax aborted; proceed with update
+				}
+				continue // xmax still running; retry
 			}
 			var oldTupleBytes []byte
 			if oldGerr == nil {
@@ -1512,7 +1515,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		// M0090-0002: detect concurrent xmax-stamp under the
 		// exclusive Lock before our own stamp.
 		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
-		if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID) {
+		if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
 			xmax := oldTup.Header.Xmax
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
@@ -1535,7 +1538,11 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				epqSkipDel = true
 				break
 			}
-			continue
+			// Row visible; if xmax no longer in-progress → aborted → proceed.
+			if !o.ctx.Snap.HasInProgress(xmax) {
+				break // xmax aborted; proceed with delete
+			}
+			continue // xmax still running; retry
 		}
 		var oldTupleBytes []byte
 		if oldGerr == nil {

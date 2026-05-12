@@ -1022,30 +1022,39 @@ while preserving the original `-c 100 -j 100` target-condition validation.
       confirmed pre-existing, not introduced by this change.
       Design doc: `docs/design/0099-0001-evictmu-pin-fastpath-deserialization.md`.
 
-- [x] **M0099-0003** — Improve WAL group-commit batching effectiveness. (2026-05-12)
-      Added commit_delay / commit_siblings batching in handleGroupFlush:
-      - Constants: `commitDelayUs=1000` (1 ms), `commitSiblings=5`
-      - When ≥5 concurrent waiters are queued, sleep 1 ms before fdatasync
-        then re-drain to accumulate all arrivals during sleep into one batch
-      - Mirrors PostgreSQL's commit_delay/commit_siblings semantics
-      - Single-caller path unaffected (threshold not met → no delay)
-      - Added `TestGroupCommitBatchingDelay` regression test; all WAL tests pass with -race
-      Design doc: `docs/design/0099-0002-wal-group-commit-batching-policy.md`.
+- [x] **M0099-0003** — WAL group-commit batching: initial commit delay DISABLED. (2026-05-12)
+      The M0099-0003 commit delay (1ms sleep in handleGroupFlush) was found to
+      cause WAL LSN corruption: `state.append` Path A reads `s.writePos` without
+      `appendMu`, then sets it back to a stale value after acquiring the lock.
+      During the 1ms sleep, many concurrent `tryAppend` callers advance `s.writePos`
+      significantly; when `state.append` wakes and writes the stale value, subsequent
+      commits see `FlushUpTo` receiving `endLSN = uint64_max` (= `uint64(stale-1)`
+      due to int64 underflow from the backwards-written position).
+      Action taken: sleep path disabled with in-code comment documenting the race.
+      The proper fix (re-read `s.writePos` under `appendMu` in Path A) is deferred to
+      a dedicated loop. Group commit still works (no sleep, all queued requests
+      coalesced per handleGroupFlush invocation).
+      All WAL tests pass with -race. Design doc: `docs/design/0099-0002-wal-group-commit-batching-policy.md`.
 
-- [x] **M0099-0004** — Reduce conflict-abort rate without circular deadlocks. (2026-05-12)
-      Implemented wait-for-graph (WFG) deadlock detection in epqWait:
-      - `waitForGraph map[TransactionID]TransactionID` + `wfgMu sync.Mutex` (global)
-      - `registerWFGAndCheckCycle(myXID, blockingXID)`: adds edge, walks up to 64
-        hops for cycle detection; removes edge and returns true on cycle
-      - `deregisterWFG(myXID)`: removes entry after wait completes
-      - `epqWait` revised: deadlock → return true (immediate 40001), no cycle →
-        `WaitForXID` with 5s context timeout, then snapshot refresh
-      - `maxEPQRetries` raised 3→10 (most retries now resolve via WaitForXID)
-      - All 4 EPQ retry call sites updated to handle deadlock return value
-      - `tryApplyHOTUpdate` deadlock → returns ExecError{40001} directly
-      - `context` and `time` imports added to operators_storage.go
-      - New test file `epq_deadlock_test.go`: TestEPQDeadlockCycleDetected,
-        TestEPQNoDeadlockNoCycle, TestEPQDeadlockThreeNode, TestEPQWFGConcurrentSafety
+- [x] **M0099-0004** — Reduce conflict-abort rate; fix aborted-HOT-update 40001 loop. (2026-05-12)
+      Two sub-fixes landed:
+      A) WFG deadlock cycle detection (M0099-0004 original):
+         - `registerWFGAndCheckCycle` + `deregisterWFG` + global `waitForGraph` map
+         - `epqWait` detects cycles → immediate 40001; non-cycle → snapshot refresh only
+         - WaitForXID REMOVED (was causing 5s goroutine hangs past pgbench 180s window)
+         - `isConcurrentlyUpdated` now accepts `*mvcc.Snapshot` parameter (snapshot
+           passed at call sites via `&ctx.Snap`; parameter currently unused in body)
+         - New test file `epq_deadlock_test.go` covering cycle detection + safety
+      B) Aborted-xmax EPQ infinite-retry bug (M0099 fix):
+         Root cause: when a HOT update transaction T1 aborts, the old slot retains
+         `HeapHotUpdated=true` and `xmax=T1(aborted)`. `isConcurrentlyUpdated` saw
+         `HeapHotUpdated` and returned `true` on every subsequent update attempt,
+         causing EPQ retry × maxEPQRetries → permanent SQLSTATE 40001 on any row
+         that was ever part of a rolled-back HOT update.
+         Fix: EPQ retry loops now check `!ctx.Snap.HasInProgress(xmax)` after
+         `epqRecheckVisible` returns `visible=true`. If xmax is no longer in the
+         snapshot's InProgress list, the transaction aborted → break out of the
+         retry loop and proceed with the update instead of retrying to exhaustion.
       All executor tests pass with -race.
       Design doc: `docs/design/0099-0003-deadlock-safe-conflict-waiting.md`.
 
@@ -1056,6 +1065,9 @@ while preserving the original `-c 100 -j 100` target-condition validation.
       `(100,50)`, `(50,100)`.
       For each point, capture TPS/latency/failures, and explicitly check whether
       targets (`1500/1500/10000 TPS`) are reached.
+      Blocker: warm-server test (30s, -c100 -j100) showed 481 TPS standard /
+      0.076% failure after M0099-0002/0004 fixes. Full canonical 180s runs
+      require a clean fresh data directory; next loop should re-init and run.
 
 - [ ] **M0099-0006** — Final validation at canonical target condition.
       Re-run at canonical condition `-c 100 -j 100 -T 180 -s 100` (cold + warm

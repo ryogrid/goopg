@@ -290,7 +290,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 	}
 	s.Lock()
 	oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), slot)
-	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID) {
+	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap) {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
@@ -321,7 +321,7 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, blk storage.BlockNu
 	}
 	s.Lock()
 	oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), slot)
-	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID) {
+	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap) {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
