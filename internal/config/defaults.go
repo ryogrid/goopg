@@ -330,6 +330,18 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
+		Name: "min_parallel_table_scan_size", Type: TypeInt, Unit: UnitKB, BootVal: "8388608",
+		MinVal: 0, MaxVal: 715827882,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "min_parallel_index_scan_size", Type: TypeInt, Unit: UnitKB, BootVal: "524288",
+		MinVal: 0, MaxVal: 715827882,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
 		Name: "client_min_messages", Type: TypeEnum, BootVal: "notice",
 		EnumOptions: []string{"debug5", "debug4", "debug3", "debug2", "debug1", "log", "notice", "warning", "error"},
 		Context:     ContextUserset,
