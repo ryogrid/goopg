@@ -314,6 +314,26 @@ type InMemory struct {
 	// inheritanceChildren maps parent table OID → slice of child OIDs
 	// for table inheritance support (M0096-0009).
 	inheritanceChildren map[uint32][]uint32
+
+	// enumTypes holds user-defined enum types. M0097-0017.
+	enumTypes map[string]*EnumType
+	// domains holds user-defined domain types. M0097-0017.
+	domains map[string]*Domain
+}
+
+// EnumType holds one user-defined enum type. M0097-0017.
+type EnumType struct {
+	Name   string
+	OID    uint32
+	Values []string // ordered labels; position = sortorder (0-based)
+}
+
+// Domain holds one user-defined domain type. M0097-0017.
+type Domain struct {
+	Name    string
+	OID     uint32
+	Base    Type // resolved base type
+	NotNull bool
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -348,15 +368,17 @@ const DefaultDBOid uint32 = 1
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:            make(map[string]*Table),
-		indexes:           make(map[string]*Index),
-		byTable:           make(map[uint32]map[string]*Index),
-		nextOID:           FirstUserOID,
-		dbOid:             DefaultDBOid,
-		routines:          NewRoutines(),
-		databases:         map[string]bool{"postgres": true},
+		tables:              make(map[string]*Table),
+		indexes:             make(map[string]*Index),
+		byTable:             make(map[uint32]map[string]*Index),
+		nextOID:             FirstUserOID,
+		dbOid:               DefaultDBOid,
+		routines:            NewRoutines(),
+		databases:           map[string]bool{"postgres": true},
 		partitionChildren:   make(map[uint32][]uint32),
 		inheritanceChildren: make(map[uint32][]uint32),
+		enumTypes:           make(map[string]*EnumType),
+		domains:             make(map[string]*Domain),
 	}
 	c.registerSystemTables()
 	return c
@@ -1009,6 +1031,85 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgLocks.VirtualRows = func() [][]string { return nil } // always empty in v0
 	c.tables["pg_catalog.pg_locks"] = pgLocks
+
+	// pg_enum — one row per enum label. M0097-0017.
+	pgEnum := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_enum",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "enumtypid", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "enumsortorder", Type: Type{Name: "numeric"}, Ordinal: 2},
+			{Name: "enumlabel", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID:     2417, // upstream's EnumRelationId
+		Virtual: true,
+	}
+	pgEnum.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var rows [][]string
+		names := make([]string, 0, len(c.enumTypes))
+		for n := range c.enumTypes {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		oid := 20000
+		for _, name := range names {
+			et := c.enumTypes[name]
+			for i, label := range et.Values {
+				rows = append(rows, []string{
+					fmt.Sprintf("%d", oid),
+					et.Name,
+					fmt.Sprintf("%d", i+1),
+					label,
+				})
+				oid++
+			}
+		}
+		return rows
+	}
+	c.tables["pg_catalog.pg_enum"] = pgEnum
+
+	// pg_type — minimal rows for user-defined types (enums + domains). M0097-0017.
+	pgType := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_type",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "typname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "typnamespace", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "typlen", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "typtype", Type: Type{Name: "text"}, Ordinal: 4},
+		},
+		OID:     1247, // upstream's TypeRelationId
+		Virtual: true,
+	}
+	pgType.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var rows [][]string
+		for _, et := range c.enumTypes {
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", et.OID),
+				et.Name,
+				"2200",
+				"-1",
+				"e",
+			})
+		}
+		for _, d := range c.domains {
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", d.OID),
+				d.Name,
+				"2200",
+				"-1",
+				"d",
+			})
+		}
+		return rows
+	}
+	c.tables["pg_catalog.pg_type"] = pgType
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/
@@ -1446,4 +1547,178 @@ func (c *InMemory) FindFKsReferencingTable(tableName string) []FKRef {
 		}
 	}
 	return out
+}
+
+// ── Enum type methods ────────────────────────────────────────────────────────
+
+// RegisterEnum creates a new enum type. Returns an error if the name already
+// exists. M0097-0017.
+func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.enumTypes[k]; exists {
+		return nil, fmt.Errorf("type %q already exists", name)
+	}
+	et := &EnumType{
+		Name:   k,
+		OID:    c.nextOID,
+		Values: append([]string(nil), values...),
+	}
+	c.nextOID++
+	c.enumTypes[k] = et
+	return et, nil
+}
+
+// LookupEnum finds an enum type by name (case-insensitive). M0097-0017.
+func (c *InMemory) LookupEnum(name string) (*EnumType, bool) {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	et, ok := c.enumTypes[k]
+	return et, ok
+}
+
+// AddEnumValue appends a new label to an existing enum. before/after are
+// reference labels (empty = append at end). Returns an error if label already
+// exists unless ifNotExists is true, in which case it is a no-op. M0097-0017.
+func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.enumTypes[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	// Check for duplicate.
+	for _, v := range et.Values {
+		if strings.EqualFold(v, value) {
+			if ifNotExists {
+				return nil
+			}
+			return fmt.Errorf("enum label %q already exists", value)
+		}
+	}
+	switch {
+	case before != "":
+		for i, v := range et.Values {
+			if strings.EqualFold(v, before) {
+				newVals := make([]string, 0, len(et.Values)+1)
+				newVals = append(newVals, et.Values[:i]...)
+				newVals = append(newVals, value)
+				newVals = append(newVals, et.Values[i:]...)
+				et.Values = newVals
+				return nil
+			}
+		}
+		return fmt.Errorf("enum label %q not found", before)
+	case after != "":
+		for i, v := range et.Values {
+			if strings.EqualFold(v, after) {
+				newVals := make([]string, 0, len(et.Values)+1)
+				newVals = append(newVals, et.Values[:i+1]...)
+				newVals = append(newVals, value)
+				newVals = append(newVals, et.Values[i+1:]...)
+				et.Values = newVals
+				return nil
+			}
+		}
+		return fmt.Errorf("enum label %q not found", after)
+	default:
+		et.Values = append(et.Values, value)
+	}
+	return nil
+}
+
+// DropEnum removes an enum type. cascade=true is accepted (stub — does not
+// remove dependent columns). Returns an error if not found. M0097-0017.
+func (c *InMemory) DropEnum(name string, cascade bool) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.enumTypes[k]; !ok {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.enumTypes, k)
+	return nil
+}
+
+// ── Domain type methods ──────────────────────────────────────────────────────
+
+// RegisterDomain creates a new domain type. Returns an error if name already
+// exists. M0097-0017.
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.domains[k]; exists {
+		return nil, fmt.Errorf("type %q already exists", name)
+	}
+	d := &Domain{
+		Name:    k,
+		OID:     c.nextOID,
+		Base:    base,
+		NotNull: notNull,
+	}
+	c.nextOID++
+	c.domains[k] = d
+	return d, nil
+}
+
+// LookupDomain finds a domain by name (case-insensitive). M0097-0017.
+func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	d, ok := c.domains[k]
+	return d, ok
+}
+
+// DropDomain removes a domain. cascade=true is accepted (stub). Returns an
+// error if not found and ifExists is false. M0097-0017.
+func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.domains[k]; !ok {
+		if ifExists {
+			return nil
+		}
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.domains, k)
+	return nil
+}
+
+// ResolveColumnType resolves a column type name through the domain and enum
+// registries to determine the effective storage type. For enums → "text"; for
+// domains → recursively resolves the base type. Returns the input unchanged if
+// no match is found. M0097-0017.
+func (c *InMemory) ResolveColumnType(typeName string) string {
+	k := strings.ToLower(typeName)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Check domain.
+	if d, ok := c.domains[k]; ok {
+		baseName := strings.ToLower(d.Base.Name)
+		// Recurse (without lock reacquire — use direct map lookup).
+		return c.resolveColumnTypeLocked(baseName)
+	}
+	// Check enum.
+	if _, ok := c.enumTypes[k]; ok {
+		return "text"
+	}
+	return typeName
+}
+
+// resolveColumnTypeLocked is the lock-free recursive helper for ResolveColumnType.
+func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
+	k := strings.ToLower(typeName)
+	if d, ok := c.domains[k]; ok {
+		return c.resolveColumnTypeLocked(strings.ToLower(d.Base.Name))
+	}
+	if _, ok := c.enumTypes[k]; ok {
+		return "text"
+	}
+	return typeName
 }

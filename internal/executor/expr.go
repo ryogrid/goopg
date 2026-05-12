@@ -698,8 +698,11 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 			}
 		}
 		return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid timestamp %q", x.Value)}
+	default:
+		// Unknown type — treat as text literal. Covers enum/domain casts in v0.
+		// M0097-0017: enum/domain type casts return the string value as-is.
+		return NewStringDatum(x.Value), nil
 	}
-	return Datum{}, &ExecError{Code: "0A000", Pos: x.Pos(), Message: fmt.Sprintf("typed-string literal with type %q is not supported", x.Type)}
 }
 
 // evalExtract implements `EXTRACT(field FROM source)` for the

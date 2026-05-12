@@ -91,6 +91,12 @@ func (p *parser) parseCreate() (Stmt, error) {
 	case p.acceptIdentKeyword("materialized"):
 		_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
 		return p.parseCreateMatViewTail(t.Pos)
+	// CREATE TYPE name AS ENUM (val1, val2, …) — M0097-0017.
+	case p.acceptIdentKeyword("type"):
+		return p.parseCreateType(t.Pos)
+	// CREATE DOMAIN name [AS] base_type [constraints] — M0097-0017.
+	case p.acceptIdentKeyword("domain"):
+		return p.parseCreateDomain(t.Pos)
 	// Accept CREATE CONSTRAINT TRIGGER (skip CONSTRAINT keyword then TRIGGER)
 	case p.acceptIdentKeyword("constraint"):
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger {
@@ -1281,9 +1287,17 @@ func (p *parser) parseDrop() (Stmt, error) {
 		p.advance()
 		return p.parseDropTriggerTail(t.Pos)
 	}
+	// DROP TYPE [IF EXISTS] name [, …] [CASCADE|RESTRICT] — M0097-0017.
+	if p.acceptIdentKeyword("type") {
+		return p.parseDropType(t.Pos)
+	}
+	// DROP DOMAIN [IF EXISTS] name [, …] [CASCADE|RESTRICT] — M0097-0017.
+	if p.acceptIdentKeyword("domain") {
+		return p.parseDropDomain(t.Pos)
+	}
 	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
 	for _, objType := range []string{
-		"sequence", "schema", "type", "domain",
+		"sequence", "schema",
 		"aggregate", "collation", "operator", "cast",
 		"materialized", "rule", "extension", "server",
 		"language", "access", "event", "transform",
@@ -1661,12 +1675,16 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// ALTER TYPE / VIEW / SCHEMA / INDEX / FUNCTION / PROCEDURE / AGGREGATE /
+	// ALTER TYPE name ADD VALUE … — M0097-0017.
+	if p.acceptIdentKeyword("type") {
+		return p.parseAlterType(t.Pos)
+	}
+	// ALTER VIEW / SCHEMA / INDEX / FUNCTION / PROCEDURE / AGGREGATE /
 	// COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
 	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of
 	// statement and return an empty AlterTableStmt (executor no-ops it).
 	for _, objIdent := range []string{
-		"type", "schema", "view", "index", "function", "procedure",
+		"schema", "view", "index", "function", "procedure",
 		"aggregate", "collation", "domain", "extension", "language",
 		"operator", "publication", "subscription", "system",
 		"materialized",
@@ -1980,6 +1998,279 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.Column = col
 		return act, nil
 	}
+}
+
+// parseCreateType picks up after CREATE TYPE has been detected.
+// Grammar: CREATE TYPE name AS ENUM ('val1' [, 'val2' ...])
+// Non-ENUM forms (composite, range, base) are accepted but ignored as stubs.
+// M0097-0017.
+func (p *parser) parseCreateType(pos int) (Stmt, error) {
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &CreateTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
+	// Look for AS ENUM; anything else is consumed as a stub.
+	if !p.acceptKeyword(KwAs) {
+		// No AS — consume until ';' or EOF (composite-type without AS, or
+		// other non-enum forms). Return a non-enum stub.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
+	if !p.acceptIdentKeyword("enum") {
+		// AS <something-else> — stub: consume remaining tokens.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
+	stmt.IsEnum = true
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after ENUM")
+	}
+	// Parse comma-separated string literals.
+	for {
+		if p.cur().Kind != TokenStringLit {
+			return nil, p.errAtCur("expected string literal in ENUM value list")
+		}
+		stmt.EnumValues = append(stmt.EnumValues, p.cur().Value)
+		p.advance()
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' after ENUM value list")
+	}
+	return stmt, nil
+}
+
+// parseAlterType picks up after ALTER TYPE has been detected.
+// Handles ADD VALUE; all other ALTER TYPE forms are consumed as stubs.
+// M0097-0017.
+func (p *parser) parseAlterType(pos int) (Stmt, error) {
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &AlterTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
+	// ADD VALUE [IF NOT EXISTS] 'val' [BEFORE|AFTER 'ref']
+	if p.acceptIdentKeyword("add") {
+		if !p.acceptIdentKeyword("value") {
+			// consume until ';' or EOF
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return stmt, nil
+		}
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwNot); err != nil {
+				return nil, err
+			}
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			stmt.IfNotExists = true
+		}
+		if p.cur().Kind != TokenStringLit {
+			return nil, p.errAtCur("expected string literal for new enum value")
+		}
+		stmt.AddValue = p.cur().Value
+		p.advance()
+		// Optional BEFORE 'ref' or AFTER 'ref'.
+		switch {
+		case p.acceptIdentKeyword("before"):
+			if p.cur().Kind != TokenStringLit {
+				return nil, p.errAtCur("expected string literal after BEFORE")
+			}
+			stmt.Before = p.cur().Value
+			p.advance()
+		case p.acceptIdentKeyword("after"):
+			if p.cur().Kind != TokenStringLit {
+				return nil, p.errAtCur("expected string literal after AFTER")
+			}
+			stmt.After = p.cur().Value
+			p.advance()
+		}
+		return stmt, nil
+	}
+	// Any other ALTER TYPE variant (RENAME, OWNER TO, etc.) — consume as stub.
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+			break
+		}
+		p.advance()
+	}
+	return stmt, nil
+}
+
+// parseDropType picks up after DROP TYPE has been detected.
+// Grammar: DROP TYPE [IF EXISTS] name [, name ...] [CASCADE|RESTRICT]
+// M0097-0017.
+func (p *parser) parseDropType(pos int) (Stmt, error) {
+	ifExists, names, behavior, err := p.parseDropTail()
+	if err != nil {
+		return nil, err
+	}
+	cascade := behavior == DropCascade
+	return &DropTypeStmt{pos: pos, Names: names, IfExists: ifExists, Cascade: cascade}, nil
+}
+
+// parseCreateDomain picks up after CREATE DOMAIN has been detected.
+// Grammar: CREATE DOMAIN name [AS] base_type [DEFAULT expr] [NOT NULL] [NULL]
+//
+//	[CHECK (expr)] [COLLATE ...] ...
+//
+// M0097-0017.
+func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &CreateDomainStmt{pos: pos, Name: name.Name, Schema: name.Schema}
+	// Optional AS.
+	_ = p.acceptKeyword(KwAs)
+	// Base type name (may be schema-qualified).
+	baseTypeName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.BaseType = baseTypeName.Name
+	if baseTypeName.Schema != "" {
+		stmt.BaseType = baseTypeName.Schema + "." + baseTypeName.Name
+	}
+	// Skip optional type arguments like (5) or (8,2).
+	if p.acceptSymbol("(") {
+		depth := 1
+		for depth > 0 && p.cur().Kind != TokenEOF {
+			t := p.cur()
+			if t.Kind == TokenSymbol && t.Value == "(" {
+				depth++
+			} else if t.Kind == TokenSymbol && t.Value == ")" {
+				depth--
+				if depth == 0 {
+					p.advance()
+					break
+				}
+			}
+			p.advance()
+		}
+	}
+	// Parse constraint list.
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+			break
+		}
+		if p.cur().Kind == TokenKeyword {
+			switch p.cur().Keyword {
+			case KwNot:
+				p.advance()
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				stmt.NotNull = true
+				continue
+			case KwNull:
+				p.advance()
+				stmt.NotNull = false
+				continue
+			case KwDefault:
+				// Skip DEFAULT expression (consume until NOT/NULL/CHECK/CONSTRAINT/COLLATE/';')
+				p.advance()
+				for p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+						break
+					}
+					if p.cur().Kind == TokenKeyword {
+						kw := p.cur().Keyword
+						if kw == KwNot || kw == KwNull || kw == KwCheck || kw == KwConstraint {
+							break
+						}
+					}
+					if p.cur().Kind == TokenIdent {
+						v := strings.ToLower(p.cur().Value)
+						if v == "collate" {
+							break
+						}
+					}
+					p.advance()
+				}
+				continue
+			case KwConstraint:
+				// CONSTRAINT name CHECK (…) — skip constraint name.
+				p.advance()
+				_, _ = p.parseIdent() // constraint name
+				// Fall through to CHECK handling below.
+				if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
+					p.advance()
+					if err := p.skipParenExpr(); err != nil {
+						return nil, err
+					}
+				}
+				continue
+			case KwCheck:
+				p.advance()
+				if err := p.skipParenExpr(); err != nil {
+					return nil, err
+				}
+				continue
+			}
+		}
+		if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "collate" {
+			// COLLATE "C" or similar — skip collation name.
+			p.advance()
+			_, _ = p.parseIdent()
+			continue
+		}
+		// Unknown token at this level — stop constraint parsing.
+		break
+	}
+	return stmt, nil
+}
+
+// skipParenExpr skips a balanced parenthesised expression.
+func (p *parser) skipParenExpr() error {
+	if !p.acceptSymbol("(") {
+		return p.errAtCur("expected '('")
+	}
+	depth := 1
+	for depth > 0 && p.cur().Kind != TokenEOF {
+		t := p.cur()
+		if t.Kind == TokenSymbol && t.Value == "(" {
+			depth++
+		} else if t.Kind == TokenSymbol && t.Value == ")" {
+			depth--
+			if depth == 0 {
+				p.advance()
+				break
+			}
+		}
+		p.advance()
+	}
+	return nil
+}
+
+// parseDropDomain picks up after DROP DOMAIN has been detected.
+// Grammar: DROP DOMAIN [IF EXISTS] name [, name ...] [CASCADE|RESTRICT]
+// M0097-0017.
+func (p *parser) parseDropDomain(pos int) (Stmt, error) {
+	ifExists, names, behavior, err := p.parseDropTail()
+	if err != nil {
+		return nil, err
+	}
+	cascade := behavior == DropCascade
+	return &DropDomainStmt{pos: pos, Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
 // parseTruncate: TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT].

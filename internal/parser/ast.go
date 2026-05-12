@@ -1317,3 +1317,63 @@ type DropProcedureStmt struct {
 
 func (s *DropProcedureStmt) Pos() int  { return s.pos }
 func (s *DropProcedureStmt) stmtNode() {}
+
+// CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …). M0097-0017.
+type CreateTypeStmt struct {
+	pos        int
+	Name       string
+	Schema     string
+	IsEnum     bool
+	EnumValues []string
+}
+
+func (s *CreateTypeStmt) Pos() int  { return s.pos }
+func (s *CreateTypeStmt) stmtNode() {}
+
+// AlterTypeStmt — ALTER TYPE name ADD VALUE [IF NOT EXISTS] val [BEFORE|AFTER ref]. M0097-0017.
+type AlterTypeStmt struct {
+	pos         int
+	Name        string
+	Schema      string
+	AddValue    string
+	IfNotExists bool
+	Before      string // reference value for BEFORE positioning
+	After       string // reference value for AFTER positioning
+}
+
+func (s *AlterTypeStmt) Pos() int  { return s.pos }
+func (s *AlterTypeStmt) stmtNode() {}
+
+// DropTypeStmt — DROP TYPE [IF EXISTS] name [CASCADE|RESTRICT]. M0097-0017.
+type DropTypeStmt struct {
+	pos      int
+	Names    []ObjectName
+	IfExists bool
+	Cascade  bool
+}
+
+func (s *DropTypeStmt) Pos() int  { return s.pos }
+func (s *DropTypeStmt) stmtNode() {}
+
+// CreateDomainStmt — CREATE DOMAIN name [AS] base_type [constraints]. M0097-0017.
+type CreateDomainStmt struct {
+	pos      int
+	Name     string
+	Schema   string
+	BaseType string // base type name
+	NotNull  bool
+}
+
+func (s *CreateDomainStmt) Pos() int  { return s.pos }
+func (s *CreateDomainStmt) stmtNode() {}
+
+// DropDomainStmt — DROP DOMAIN [IF EXISTS] name [CASCADE|RESTRICT]. M0097-0017.
+type DropDomainStmt struct {
+	pos      int
+	Names    []ObjectName
+	IfExists bool
+	Cascade  bool
+}
+
+func (s *DropDomainStmt) Pos() int  { return s.pos }
+func (s *DropDomainStmt) stmtNode() {}

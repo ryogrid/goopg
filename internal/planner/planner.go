@@ -64,7 +64,9 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.DropCompatStmt,
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
-		*parser.CompatNoopStmt:
+		*parser.CompatNoopStmt,
+		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
+		*parser.CreateDomainStmt, *parser.DropDomainStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,

@@ -99,6 +99,16 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execRefreshMatView(s)
 	case *parser.CompatNoopStmt:
 		return nil, nil // GRANT/REVOKE/COMMENT/etc — accepted, no-op. M0097-0016.
+	case *parser.CreateTypeStmt:
+		return nil, o.execCreateType(s)
+	case *parser.AlterTypeStmt:
+		return nil, o.execAlterType(s)
+	case *parser.DropTypeStmt:
+		return nil, o.execDropType(s)
+	case *parser.CreateDomainStmt:
+		return nil, o.execCreateDomain(s)
+	case *parser.DropDomainStmt:
+		return nil, o.execDropDomain(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -276,9 +286,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	// Append any columns explicitly declared in the CREATE TABLE body.
 	for _, c := range s.Columns {
+		typeName := strings.ToLower(c.Type.Name)
+		// Resolve domain/enum types to their storage type. M0097-0017.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+				typeName = resolved
+			}
+		}
 		cols = append(cols, catalog.Column{
 			Name:            c.Name,
-			Type:            catalog.Type{Name: strings.ToLower(c.Type.Name), Args: append([]int64(nil), c.Type.Args...)},
+			Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
 			NotNull:         c.NotNull,
 			GeneratedExpr:   c.GeneratedExpr,
 			GeneratedAlways: c.GeneratedAlways,
@@ -1980,6 +1997,81 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			Code:    "42704",
 			Pos:     s.Pos(),
 			Message: fmt.Sprintf("%s %q does not exist", s.ObjType, s.Names[0].String()),
+		}
+	}
+	return nil
+}
+
+// ── Enum / Domain DDL executors ──────────────────────────────────────────────
+// M0097-0017.
+
+func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
+	if !s.IsEnum {
+		// Composite / range / base types — not yet supported, ignore silently.
+		return nil
+	}
+	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	_, err := cat.RegisterEnum(s.Name, s.EnumValues)
+	if err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
+	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	if s.AddValue == "" {
+		return nil // RENAME VALUE / RENAME TO / OWNER TO — no-op
+	}
+	if err := cat.AddEnumValue(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After); err != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
+	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, name := range s.Names {
+		n := name.Name
+		if err := cat.DropEnum(n, s.Cascade); err != nil {
+			if !s.IfExists {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", n)}
+			}
+		}
+	}
+	return nil
+}
+
+func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
+	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	baseType := catalog.Type{Name: s.BaseType}
+	_, err := cat.RegisterDomain(s.Name, baseType, s.NotNull)
+	if err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
+	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, name := range s.Names {
+		if err := cat.DropDomain(name.Name, s.IfExists, s.Cascade); err != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 		}
 	}
 	return nil
