@@ -19,8 +19,14 @@ func (e *LexError) Error() string {
 // Lex breaks input into tokens, returning a slice that ends with a
 // TokenEOF sentinel. Errors stop scanning.
 func Lex(input string) ([]Token, error) {
+	return lexInto(nil, input)
+}
+
+// lexInto appends tokens for input into dst and returns the result.
+// If dst is non-nil its backing array is reused (pool-friendly). M0098-0006.
+func lexInto(dst []Token, input string) ([]Token, error) {
 	l := &lexer{src: input}
-	var out []Token
+	out := dst
 	for {
 		tok, err := l.next()
 		if err != nil {

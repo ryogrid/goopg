@@ -3,7 +3,25 @@ package parser
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
+
+// tokenSlicePool recycles []Token backing arrays between calls to Parse.
+// Typical pgbench queries produce 10–20 tokens; pre-sizing to 64 avoids
+// any internal re-allocation for all but the most complex statements.
+// M0098-0006.
+var tokenSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]Token, 0, 64)
+		return &s
+	},
+}
+
+// parserPool recycles the 32-byte parser struct (tokens slice header + idx).
+// M0098-0006.
+var parserPool = sync.Pool{
+	New: func() any { return &parser{} },
+}
 
 // SyntaxError is the parser's structured error. Message mirrors
 // upstream's `syntax error at or near "TOKEN"` shape so psql users
@@ -29,27 +47,57 @@ func (e *SyntaxError) Error() string {
 // error so a caller passing `1 + 2; garbage` gets a clean
 // diagnostic.
 func ParseExpr(input string) (Expr, error) {
-	toks, err := Lex(input)
+	// Use pooled token slice to avoid per-call allocation. M0098-0006.
+	sp := tokenSlicePool.Get().(*[]Token)
+	toks, err := lexInto((*sp)[:0], input)
 	if err != nil {
+		*sp = toks
+		tokenSlicePool.Put(sp)
 		return nil, err
 	}
-	p := &parser{tokens: toks}
+	*sp = toks
+
+	p := parserPool.Get().(*parser)
+	p.tokens = toks
+	p.idx = 0
+
 	expr, err := p.parseExpr()
+	// Check trailing tokens BEFORE returning p to pool.
+	var trailingErr error
+	if err == nil && p.cur().Kind != TokenEOF {
+		trailingErr = p.errAtCur("unexpected trailing tokens after expression")
+	}
+	p.tokens = nil
+	parserPool.Put(p)
+	tokenSlicePool.Put(sp)
+
 	if err != nil {
 		return nil, err
 	}
-	if p.cur().Kind != TokenEOF {
-		return nil, p.errAtCur("unexpected trailing tokens after expression")
+	if trailingErr != nil {
+		return nil, trailingErr
 	}
 	return expr, nil
 }
 
 func Parse(input string) ([]Stmt, error) {
-	toks, err := Lex(input)
+	// Use pooled token slice to eliminate per-call []Token allocation.
+	// The token slice backing array is reused across calls; its lifetime
+	// ends when Parse returns (callers receive []Stmt, not []Token).
+	// M0098-0006.
+	sp := tokenSlicePool.Get().(*[]Token)
+	toks, err := lexInto((*sp)[:0], input)
 	if err != nil {
+		*sp = toks
+		tokenSlicePool.Put(sp)
 		return nil, err
 	}
-	p := &parser{tokens: toks}
+	*sp = toks
+
+	p := parserPool.Get().(*parser)
+	p.tokens = toks
+	p.idx = 0
+
 	var out []Stmt
 	for p.cur().Kind != TokenEOF {
 		// Empty statement (just `;`).
@@ -59,6 +107,9 @@ func Parse(input string) ([]Stmt, error) {
 		}
 		stmt, err := p.parseStatement()
 		if err != nil {
+			p.tokens = nil
+			parserPool.Put(p)
+			tokenSlicePool.Put(sp)
 			return nil, err
 		}
 		out = append(out, stmt)
@@ -69,9 +120,16 @@ func Parse(input string) ([]Stmt, error) {
 			continue
 		}
 		if p.cur().Kind != TokenEOF {
-			return nil, p.errAtCur("expected ';' or end of input")
+			err := p.errAtCur("expected ';' or end of input")
+			p.tokens = nil
+			parserPool.Put(p)
+			tokenSlicePool.Put(sp)
+			return nil, err
 		}
 	}
+	p.tokens = nil // clear reference before returning to pool
+	parserPool.Put(p)
+	tokenSlicePool.Put(sp)
 	return out, nil
 }
 

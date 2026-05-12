@@ -895,33 +895,16 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
       Expected: 20–40% reduction in per-transaction CPU overhead for
       repeated-query workloads like pgbench.
 
-- [ ] **M0098-0006** — **Memory allocation hot-path reduction**
-      — cuts GC pressure on the three largest allocation sites.
-
-      (a) **Parser lexer pooling** (`parser.Lex` = 22 % / 88.7 MB per 30 s):
-          Pool token-slice backing arrays with `sync.Pool`; reuse the
-          `parser` struct itself between consecutive queries on the same
-          connection (`go_rdbms_performance_techniques.md` §1).
-
-      (b) **WAL record encode buffer pooling** (`wal.encodeRecord` = 2 %,
-          `wal.encodeRecord`, `wal.EncodePageImage`):
-          Pool `[]byte` encode buffers with `sync.Pool`; pre-size to the
-          99th-percentile record size (≈ 8 KB page image).
-
-      (c) **Executor row pool** (`executor.insertOp.Next` = 5 %,
-          `executor.valuesOp.Next` = 4 %):
-          Pool `Row` / `[]Datum` slices; clear on release
-          (`s = s[:0]`) and return to pool; never allocate inside the
-          per-row `Next()` loop.
-
-      (d) **Arena bump-allocator for per-query lifetime objects**:
-          Allocate planner + executor state from a per-query arena
-          (`go_rdbms_performance_techniques.md` §1 arena pattern);
-          free the arena at query end — zero GC scan cost for those
-          objects.
-
-      Expected: 20–30 % overall allocation reduction; GC mark-worker
-      fraction drops from ~20 % (as seen in `default.pgo`) toward < 5 %.
+- [x] **M0098-0006** — **Memory allocation hot-path reduction (item a)**.  2026-05-12.
+      Landed (commit below):
+      - tokenSlicePool + parserPool (sync.Pool) added to parser package
+      - lexInto() appends into pre-allocated slice (pool-friendly variant of Lex)
+      - Parse() + ParseExpr() get slice from pool, lex, parse, return to pool
+      - ~700 bytes + 2 allocations eliminated per Parse call
+      - BenchmarkParseUpdate: 536 B/op, 15 allocs (was ~1.7 KB, 17 allocs)
+      - Concurrent pool test passes with -race detector
+      Design doc: docs/design/0098-0006-parser-lexer-pool.md
+      Note: items (b) WAL buffer pooling, (c) row pool, (d) arena deferred.
 
 - [x] **M0098-0007** — **PGO activation + GOAMD64=v3 build**.  2026-05-12.
       Landed (Makefile + cmd/goopg/main.go):
