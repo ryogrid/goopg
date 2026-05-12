@@ -53,6 +53,24 @@ func (p *parser) parseSelect() (Stmt, error) {
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwValues {
 		return p.parseValuesStmt()
 	}
+	// TABLE tablename is shorthand for SELECT * FROM tablename. M0097-0003.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable {
+		pos := p.cur().Pos
+		p.advance() // consume TABLE
+		tbl, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		star := &StarExpr{pos: pos}
+		rv := RangeVar{pos: pos, Schema: tbl.Schema, Name: tbl.Name}
+		s := &SelectStmt{
+			pos:      pos,
+			Targets:  []ResTarget{{Expr: star}},
+			From:     []RangeVar{rv},
+			FromExprs: []FromExpr{{pos: pos, Base: rv}},
+		}
+		return s, nil
+	}
 	t, err := p.expectKeyword(KwSelect)
 	if err != nil {
 		return nil, err
@@ -492,7 +510,7 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	// `( table_name )` which v0 doesn't currently support but
 	// upstream does.
 	isSubqueryStart := p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
-		(p.peek(1).Kind == TokenKeyword && (p.peek(1).Keyword == KwSelect || p.peek(1).Keyword == KwValues || p.peek(1).Keyword == KwWith))
+		(p.peek(1).Kind == TokenKeyword && (p.peek(1).Keyword == KwSelect || p.peek(1).Keyword == KwValues || p.peek(1).Keyword == KwWith || p.peek(1).Keyword == KwTable))
 	if isSubqueryStart {
 		pos := p.cur().Pos
 		p.advance() // (
@@ -679,15 +697,19 @@ func (p *parser) parseSortItem() (SortBy, error) {
 // Precedence levels (higher binds tighter), aligned with upstream's
 // gram.y operator precedence.
 const (
-	precOr      = 1
-	precAnd     = 2
-	precNot     = 3
-	precIs      = 4
-	precCompare = 5 // = <> < > <= >=
-	precAddSub  = 6
-	precMulDiv  = 7
-	precConcat  = 8
-	precUnary   = 9
+	precOr         = 1
+	precAnd        = 2
+	precNot        = 3
+	precIs         = 4
+	precCompare    = 5 // = <> < > <= >=
+	precBitOr      = 5 // | (same as compare in PG)
+	precBitXor     = 5 // # (same as compare in PG)
+	precBitAnd     = 6 // & (higher than | in PG)
+	precBitShift   = 6 // << >> (same as & in PG)
+	precAddSub     = 7
+	precMulDiv     = 8
+	precConcat     = 9
+	precUnary      = 10
 )
 
 // parseExpr drives the precedence-climbing loop.
@@ -1140,6 +1162,16 @@ func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 			return OpGe, precCompare, true
 		case "<>", "!=":
 			return OpNe, precCompare, true
+		case "<<":
+			return OpBitShiftLeft, precBitShift, true
+		case ">>":
+			return OpBitShiftRight, precBitShift, true
+		case "&":
+			return OpBitAnd, precBitAnd, true
+		case "|":
+			return OpBitOr, precBitOr, true
+		case "#":
+			return OpBitXor, precBitXor, true
 		}
 	case TokenSymbol:
 		// '*' is also a symbol token (target-list wildcard) — but in

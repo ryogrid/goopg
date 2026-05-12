@@ -314,6 +314,24 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
 		}
 		return NewStringDatum(left.StringValue() + right.StringValue()), nil
+	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
+		// Bitwise operators: require integer operands. M0097-0003.
+		if left.Kind != KindInt || right.Kind != KindInt {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
+		}
+		switch op {
+		case parser.OpBitAnd:
+			return Datum{Kind: KindInt, Int: left.Int & right.Int}, nil
+		case parser.OpBitOr:
+			return Datum{Kind: KindInt, Int: left.Int | right.Int}, nil
+		case parser.OpBitXor:
+			return Datum{Kind: KindInt, Int: left.Int ^ right.Int}, nil
+		case parser.OpBitShiftLeft:
+			return Datum{Kind: KindInt, Int: left.Int << uint(right.Int)}, nil
+		case parser.OpBitShiftRight:
+			return Datum{Kind: KindInt, Int: left.Int >> uint(right.Int)}, nil
+		}
+		return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "unknown bitwise operator"}
 	case parser.OpEq, parser.OpLt, parser.OpGt, parser.OpLe, parser.OpGe, parser.OpNe:
 		cmp, err := compareDatum(left, right, pos)
 		if err != nil {
@@ -1032,7 +1050,25 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return d, nil
 		}
 	case "float4", "real", "float8", "double precision":
-		// Pass through for now.
+		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
+		// PostgreSQL float8out uses printf-style format that removes trailing zeros.
+		if d.Kind == KindNumeric {
+			text := numericText(d)
+			f, err := strconv.ParseFloat(text, 64)
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type float8: %q", text)}
+			}
+			normalized := strconv.FormatFloat(f, 'f', -1, 64)
+			if v, s, ok := parseNumericFast(normalized); ok {
+				return Datum{Kind: KindNumeric, Int: v, Scale: s}, nil
+			}
+			m, s, parseErr := parseNumeric(normalized)
+			if parseErr != nil {
+				return d, nil // unexpected, keep original
+			}
+			return newNumeric(m, int(s)), nil
+		}
 		return d, nil
 	case "oid":
 		switch d.Kind {

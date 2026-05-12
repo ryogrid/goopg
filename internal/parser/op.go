@@ -54,6 +54,14 @@ const (
 	OpRegexIMatch   // a ~* b  (case-insensitive match)
 	OpRegexNoMatch  // a !~ b  (case-sensitive no-match)
 	OpRegexINoMatch // a !~* b (case-insensitive no-match)
+
+	// Bitwise operators (M0097-0003)
+	OpBitAnd       // a & b
+	OpBitOr        // a | b
+	OpBitXor       // a # b   (PostgreSQL uses # for XOR, not ^)
+	OpBitNot       // ~a      (unary bitwise NOT)
+	OpBitShiftLeft  // a << b
+	OpBitShiftRight // a >> b
 )
 
 // ParseUnaryOp converts the token text the parser emits
@@ -122,6 +130,16 @@ func ParseBinaryOp(s string) OpCode {
 		return OpRegexNoMatch
 	case "!~*":
 		return OpRegexINoMatch
+	case "&":
+		return OpBitAnd
+	case "|":
+		return OpBitOr
+	case "#":
+		return OpBitXor
+	case "<<":
+		return OpBitShiftLeft
+	case ">>":
+		return OpBitShiftRight
 	}
 	return OpUnknown
 }
@@ -183,6 +201,18 @@ func (o OpCode) String() string {
 		return "!~"
 	case OpRegexINoMatch:
 		return "!~*"
+	case OpBitAnd:
+		return "&"
+	case OpBitOr:
+		return "|"
+	case OpBitXor:
+		return "#"
+	case OpBitNot:
+		return "~"
+	case OpBitShiftLeft:
+		return "<<"
+	case OpBitShiftRight:
+		return ">>"
 	}
 	return "<unknown>"
 }
