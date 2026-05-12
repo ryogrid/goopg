@@ -682,12 +682,19 @@ M0097-0001 wires it up.
           'g', 15) matching PostgreSQL's float8out for scientific notation + correct integers.
       44. TEMP TABLE shadowing: CREATE TEMP TABLE X when X exists drops permanent X first;
           CreateTableStmt.Temporary bool added to parser AST. varchar: 121→104, char: 145→112.
+      Loop 12 additions (2026-05-13):
+      45. isAssignable: allow numeric→string so integer literals coerce to varchar/char columns.
+      46. encodeValue varchar(N): strip trailing spaces + enforce length (22001 if overflow).
+      47. encodeValue char(N): bare char = char(1); enforce length, strip trailing spaces.
+          Store stripped value (NOT padded) to preserve comparison semantics. DataRow formatter
+          in dispatch.go already pads char(N) for wire output display. M0097-0003.
+          Result: varchar 121→60 diff, char 145→68 diff (major improvement).
       Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
       `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`.
-      Still deferred: int8 (overflow + float8 format), float4/float8 (NaN/Infinity),
-      char/varchar (remaining: length enforcement, 'A' case issue), name, numerology, others.
-      Action: continue fixing remaining scalar type parity issues; next targets are char/varchar
-      length enforcement + 'A' case preservation to flip those tests to pass.
+      Still deferred: char/varchar (remaining 60/68 diffs: 'A'→'a' case mystery + permanent
+      table not restored after TEMP DROP), int8, float4/float8, name, numerology, others.
+      Action: investigate 'A'→'a' case issue in char/varchar inserts; fix permanent table
+      restoration after TEMP TABLE drop (requires proper session-scoped temp catalog).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
