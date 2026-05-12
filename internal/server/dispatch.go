@@ -525,13 +525,25 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			// wire frame so the simple-query result loop is O(1)
 			// allocation across rows AND statements.
 			cells, valueBuf := w.DataRowScratch(len(row))
-			for _, d := range row {
+			for i, d := range row {
 				if d.IsNull() {
 					cells = append(cells, nil)
 					continue
 				}
 				start := len(valueBuf)
 				valueBuf = d.AppendValueText(valueBuf)
+				// Pad char(N)/bpchar(N) values to declared width with trailing spaces.
+				// PostgreSQL always returns char(N) padded to N bytes. M0097-0003.
+				if i < len(schema) {
+					sc := schema[i]
+					if (strings.EqualFold(sc.Type.Name, "char") || strings.EqualFold(sc.Type.Name, "bpchar")) &&
+						len(sc.Type.Args) > 0 {
+						width := int(sc.Type.Args[0])
+						for len(valueBuf)-start < width {
+							valueBuf = append(valueBuf, ' ')
+						}
+					}
+				}
 				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {

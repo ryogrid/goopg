@@ -1528,7 +1528,9 @@ func needsAggregateStage(s *parser.SelectStmt) bool {
 			return true
 		}
 	}
-	if s.Having != nil && exprHasAggregate(s.Having) {
+	if s.Having != nil {
+		// HAVING without aggregates: degenerate aggregate — PostgreSQL still treats
+		// the whole table as a single group (SQL spec §7.11). M0097-0003.
 		return true
 	}
 	for _, sb := range s.OrderBy {
@@ -1822,6 +1824,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		// expression — and the parserExprKey we record below —
 		// matches what the target list and ORDER BY look up.
 		g = resolveOrderBySubstitution(g, s.Targets)
+		// Positional GROUP BY that wasn't substituted → out-of-range position. M0097-0003.
+		if ic, ok := g.(*parser.IntegerConst); ok {
+			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42P10",
+				Message: fmt.Sprintf("GROUP BY position %d is not in select list", ic.Value)}
+		}
 		if exprHasAggregate(g) {
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42803", Message: "aggregate functions are not allowed in GROUP BY"}
 		}
@@ -1890,6 +1897,10 @@ func groupExprName(e Expr) string {
 	if c, ok := e.(*ColumnRef); ok {
 		return c.Name
 	}
+	// FuncCall GROUP BY: use function name as column label (e.g. lower(c) → "lower"). M0097-0003.
+	if f, ok := e.(*FuncCall); ok && f.Name != "" {
+		return f.Name
+	}
 	return "?column?"
 }
 
@@ -1948,10 +1959,26 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		col := resolved.(*ColumnRef)
 		idx, ok := agg.groupByInputCol[col.Index]
 		if !ok {
+			// Include table qualifier in error message (PostgreSQL uses "table.col"). M0097-0003.
+			// Use the resolved ColumnRef's source binding for the table name even when the
+			// parser expression is unqualified (e.g. bare `b` → "test_missing_target.b").
+			colName := col.Name
+			for _, b := range agg.input.bindings {
+				if b.sourceIdx == col.SourceTableIdx {
+					tbl := b.alias
+					if tbl == "" {
+						tbl = b.table.Name
+					}
+					if tbl != "" {
+						colName = tbl + "." + col.Name
+					}
+					break
+				}
+			}
 			return nil, &PlanError{
 				Pos:     x.Pos(),
 				Code:    "42803",
-				Message: fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", x.Column),
+				Message: fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", colName),
 			}
 		}
 		return &ColumnRef{pos: x.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
@@ -2396,7 +2423,9 @@ func parserExprKey(e parser.Expr) string {
 	case *parser.ParamRef:
 		return fmt.Sprintf("p:%d", x.Number)
 	case *parser.ColumnRef:
-		return "c:" + strings.ToLower(x.Schema) + "." + strings.ToLower(x.Table) + "." + strings.ToLower(x.Column)
+		// Use only the column name (not the table/schema qualifier) so that
+		// `lower(c)` and `lower(t.c)` resolve to the same GROUP BY key. M0097-0003.
+		return "c:" + strings.ToLower(x.Column)
 	case *parser.UnaryOp:
 		return "u:" + x.Op.String() + ":" + parserExprKey(x.Operand)
 	case *parser.BinaryOp:
