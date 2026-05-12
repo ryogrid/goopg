@@ -99,6 +99,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execRefreshMatView(s)
 	case *parser.CompatNoopStmt:
 		return nil, nil // GRANT/REVOKE/COMMENT/etc — accepted, no-op. M0097-0016.
+	case *parser.DoStmt:
+		return nil, o.execDoBlock(s)
 	case *parser.CreateTypeStmt:
 		return nil, o.execCreateType(s)
 	case *parser.AlterTypeStmt:
@@ -241,6 +243,21 @@ func splitCommaList(s string) []string {
 	}
 	add(len(s))
 	return out
+}
+
+// execDoBlock executes an anonymous PL/pgSQL block (DO $$ ... $$). M0097-0003.
+func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
+	// Create a synthetic routine for the PL/pgSQL runtime.
+	r := &catalog.Routine{
+		Name:     "(anonymous)",
+		Language: s.Language,
+		Body:     s.Body,
+	}
+	_, err := executePLpgSQLRoutine(r, nil, o.ctx, s.Pos())
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {

@@ -819,6 +819,13 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 			consume()
 		}
 	}
+	// Array suffix: text[] — consume '[]' pairs. M0097-0003.
+	for p.cur().Kind == parser.TokenSymbol && p.cur().Value == "[" {
+		consume() // '['
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "]" {
+			consume() // ']'
+		}
+	}
 	src := p.src[startPos:endPos]
 	stmts, err := parser.Parse("CREATE TABLE _t (_c " + src + ")")
 	if err != nil {

@@ -78,6 +78,10 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		// docs/design/0008-0003-publication-subscription-ddl.md.
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
+	case *parser.DoStmt:
+		// DO $$ body $$ — anonymous PL/pgSQL block. M0097-0003.
+		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
+
 	case *parser.BeginStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxBegin, IsolationLevel: s.IsolationLevel}, nil
 	case *parser.CommitStmt:

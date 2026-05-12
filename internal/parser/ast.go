@@ -1005,6 +1005,16 @@ type DropCompatStmt struct {
 	Behavior DropBehavior
 }
 
+// DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.
+type DoStmt struct {
+	pos      int
+	Language string // "plpgsql" (default)
+	Body     string // the PL/pgSQL block body (dollar-quoted content)
+}
+
+func (s *DoStmt) Pos() int  { return s.pos }
+func (s *DoStmt) stmtNode() {}
+
 // CompatNoopStmt is a compatibility stub for SQL statements that goopg
 // accepts syntactically but does not execute (GRANT, REVOKE, COMMENT ON,
 // SECURITY LABEL, etc.). The executor silently succeeds. M0097-0016.

@@ -287,6 +287,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 	case KwCall:
 		p.advance()
 		return p.parseCallStatement(t.Pos)
+	case KwDo:
+		return p.parseDoBlock()
 	}
 	// Identifier-led statements. M0097-0013.
 identLedStatement:
@@ -572,6 +574,35 @@ func (p *parser) tryReadBoolOptionValue() (val bool, present bool, err error) {
 func (p *parser) parseCheckpoint() (Stmt, error) {
 	t := p.advance()
 	return &CheckpointStmt{pos: t.Pos}, nil
+}
+
+// parseDoBlock: DO [ LANGUAGE lang ] $$ body $$ — anonymous PL/pgSQL block. M0097-0003.
+func (p *parser) parseDoBlock() (Stmt, error) {
+	t := p.advance() // consume DO
+	s := &DoStmt{pos: t.Pos, Language: "plpgsql"}
+	// Optional LANGUAGE clause before or after the body.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "language") {
+		p.advance()
+		lang, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		s.Language = strings.ToLower(identText(lang))
+	}
+	// Body: dollar-quoted string literal.
+	if p.cur().Kind != TokenStringLit {
+		return nil, p.errAtCur("expected dollar-quoted string for DO body")
+	}
+	s.Body = p.cur().Value
+	p.advance()
+	// Optional trailing LANGUAGE clause.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "language") {
+		p.advance()
+		if _, err := p.parseIdent(); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
 }
 
 // parseBegin: BEGIN [WORK | TRANSACTION] [transaction_mode ...]
