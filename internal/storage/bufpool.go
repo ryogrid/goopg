@@ -898,13 +898,29 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		// Fast path: tag is already cached.
 		if idx, ok := part.byTag[tag]; ok {
 			s := p.slots[idx]
+			// M0098-0003 deadlock fix: release part.mu BEFORE acquiring evictMu
+			// to maintain the invariant "evictMu before any partition lock".
+			// Eviction (under evictMu) removes old tags from partition byTag
+			// under oldPart.mu — if we held part.mu while acquiring evictMu
+			// and part == oldPart, we deadlock with the eviction path.
+			//
+			// After releasing part.mu, the slot may be evicted before we
+			// acquire evictMu. We verify s.tag == tag under evictMu; on
+			// mismatch, retry the whole Pin (the page was evicted, will be
+			// reloaded by the cache-miss path).
+			part.mu.Unlock()
 			p.evictMu.Lock()
+			if s.tag != tag {
+				// Slot was evicted between part.mu release and evictMu acquire.
+				// Restart Pin so the miss path reloads the page.
+				p.evictMu.Unlock()
+				return p.Pin(tag)
+			}
 			s.pinCount++
 			if s.usageCount < maxUsageCount {
 				s.usageCount++
 			}
 			p.evictMu.Unlock()
-			part.mu.Unlock()
 			return s, nil
 		}
 
@@ -1054,13 +1070,19 @@ func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
 		return nil, false
 	}
 	s := p.slots[idx]
+	// M0098-0003 deadlock fix: release part.mu before evictMu (same fix as Pin).
+	part.mu.Unlock()
 	p.evictMu.Lock()
+	if s.tag != tag {
+		// Slot evicted between part.mu release and evictMu acquire.
+		p.evictMu.Unlock()
+		return nil, false // not in cache
+	}
 	s.pinCount++
 	if s.usageCount < maxUsageCount {
 		s.usageCount++
 	}
 	p.evictMu.Unlock()
-	part.mu.Unlock()
 	return s, true
 }
 

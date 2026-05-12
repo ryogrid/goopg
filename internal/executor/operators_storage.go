@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -20,19 +19,16 @@ import (
 // escalating to SQLSTATE 40001. M0098-0004.
 const maxEPQRetries = 3
 
-// epqWait waits for the transaction that stamped xmax to commit or abort,
-// then refreshes the snapshot. Called after detecting a concurrent update
-// to implement PostgreSQL's EvalPlanQual wait phase under READ COMMITTED.
-// M0098-0004.
-func epqWait(ctx *Context, xmax storage.TransactionID) {
-	if ctx.TxnMgr == nil || xmax == storage.InvalidTransactionID {
+// epqWait refreshes the snapshot after detecting a concurrent xmax conflict.
+// It does NOT block waiting for the conflicting transaction — doing so would
+// cause circular deadlocks when two transactions each wait for the other
+// (common with shared rows like pgbench's branch). Instead it just takes a
+// fresh READ COMMITTED snapshot so the subsequent epqRecheckVisible sees any
+// recently-committed changes. M0098-0004.
+func epqWait(ctx *Context, _ storage.TransactionID) {
+	if ctx.TxnMgr == nil {
 		return
 	}
-	qctx := ctx.Ctx
-	if qctx == nil {
-		qctx = context.Background()
-	}
-	_ = ctx.TxnMgr.WaitForXID(qctx, xmax)
 	if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
 		ctx.Snap = snap.Clone()
 	}
