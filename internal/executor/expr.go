@@ -141,7 +141,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
-		return evalCast(v, x.TargetType, x.Pos())
+		return evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
 	case *planner.BinaryOp:
 		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
@@ -186,15 +186,26 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 	}
 	switch op {
 	case parser.OpUnaryNeg:
-		if d.Kind != KindInt {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary - requires integer"}
+		switch d.Kind {
+		case KindInt:
+			return Datum{Kind: KindInt, Int: -d.Int}, nil
+		case KindNumeric:
+			// Negate a numeric/float value. M0097-0003.
+			if d.Big != nil {
+				neg := new(big.Int).Neg(d.Big)
+				return Datum{Kind: KindNumeric, Big: neg, Scale: d.Scale}, nil
+			}
+			return Datum{Kind: KindNumeric, Int: -d.Int, Scale: d.Scale}, nil
+		default:
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary - requires integer or numeric"}
 		}
-		return Datum{Kind: KindInt, Int: -d.Int}, nil
 	case parser.OpUnaryPos:
-		if d.Kind != KindInt {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary + requires integer"}
+		switch d.Kind {
+		case KindInt, KindNumeric:
+			return d, nil
+		default:
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator unary + requires integer or numeric"}
 		}
-		return d, nil
 	case parser.OpNot:
 		if d.Kind != KindBool {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator NOT requires boolean"}
@@ -771,20 +782,16 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 	}
 }
 
-// roundNumericToInt rounds a KindNumeric datum to the nearest integer using
-// "round half away from zero" (PostgreSQL's numeric→integer rounding rule).
-// For float→int casts PostgreSQL uses banker's rounding, but since we cannot
-// distinguish the source type from KindNumeric, we use away-from-zero uniformly.
-// M0097-0003.
+// roundNumericToInt rounds a KindNumeric datum using "round half away from zero"
+// (PostgreSQL's numeric→integer rounding rule). M0097-0003.
 func roundNumericToInt(d Datum, pos int) (int64, error) {
 	text := numericText(d)
-	// Parse as float64 for rounding.
 	f, err := strconv.ParseFloat(text, 64)
 	if err != nil {
 		return 0, &ExecError{Code: "22P02", Pos: pos,
 			Message: fmt.Sprintf("invalid numeric value for integer cast: %s", text)}
 	}
-	// Round half away from zero (arithmetic rounding).
+	// Round half away from zero (PostgreSQL's numeric→integer rule).
 	var rounded int64
 	if f >= 0 {
 		rounded = int64(f + 0.5)
@@ -792,6 +799,72 @@ func roundNumericToInt(d Datum, pos int) (int64, error) {
 		rounded = int64(f - 0.5)
 	}
 	return rounded, nil
+}
+
+// roundFloatToInt rounds a KindNumeric datum using banker's rounding
+// (round half to even) — PostgreSQL's float8/float4→integer rule. M0097-0003.
+func roundFloatToInt(d Datum, pos int) (int64, error) {
+	text := numericText(d)
+	f, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, &ExecError{Code: "22P02", Pos: pos,
+			Message: fmt.Sprintf("invalid float value for integer cast: %s", text)}
+	}
+	// Banker's rounding: round half to nearest even.
+	rounded := math.RoundToEven(f)
+	return int64(rounded), nil
+}
+
+// isFloatSourceType reports whether a type name denotes a floating-point type
+// (float4 / float8 / real / double precision). Used to select banker's rounding
+// for float→integer casts. M0097-0003.
+func isFloatSourceType(t string) bool {
+	switch strings.ToLower(t) {
+	case "float4", "float8", "real", "double precision":
+		return true
+	}
+	return false
+}
+
+// evalCastTyped is like evalCast but accepts the source type so it can select
+// the correct rounding mode (banker's for float, away-from-zero for numeric).
+// M0097-0003.
+func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, error) {
+	if sourceType == "" {
+		return evalCast(d, targetType, pos)
+	}
+	// For float8/float4 → integer casts, override the default (away-from-zero)
+	// rounding inside evalCast to use banker's rounding instead.
+	if isFloatSourceType(sourceType) && d.Kind == KindNumeric {
+		intTarget := strings.ToLower(targetType)
+		switch intTarget {
+		case "int2", "smallint":
+			n, err := roundFloatToInt(d, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			if n < -32768 || n > 32767 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		case "int4", "integer", "int":
+			n, err := roundFloatToInt(d, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			if n < -2147483648 || n > 2147483647 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		case "int8", "bigint":
+			n, err := roundFloatToInt(d, pos)
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{Kind: KindInt, Int: n}, nil
+		}
+	}
+	return evalCast(d, targetType, pos)
 }
 
 // evalCast coerces datum d to the declared SQL type name.

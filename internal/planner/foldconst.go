@@ -39,7 +39,7 @@ func FoldConstants(e Expr) Expr {
 	// ── Cast expression ────────────────────────────────────────────────
 	case *CastExpr:
 		operand := FoldConstants(x.Operand)
-		return &CastExpr{pos: x.pos, Operand: operand, TargetType: x.TargetType}
+		return &CastExpr{pos: x.pos, Operand: operand, TargetType: x.TargetType, SourceType: x.SourceType}
 
 	// ── Unary operator ─────────────────────────────────────────────────
 	case *UnaryOp:

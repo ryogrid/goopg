@@ -1969,7 +1969,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			return nil, err
 		}
 		typeName := strings.ToLower(x.Type.Name)
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name}, nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
@@ -2055,7 +2055,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return nil, err
 		}
 		typeName := strings.ToLower(x.Type.Name)
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName}, nil
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExprAfterWindow(x.Source, win)
 		if err != nil {
@@ -3685,7 +3685,8 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		typeName := strings.ToLower(x.Type.Name)
-		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName}, nil
+		srcType := exprType(operand).Name
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
@@ -3908,7 +3909,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			ResultType: x.ResultType,
 		}
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType}
+		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType, SourceType: x.SourceType}
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftColumnRefsBy(x.Operand, delta)}
 	case *FuncCall:
