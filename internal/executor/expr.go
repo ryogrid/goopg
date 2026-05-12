@@ -1045,6 +1045,18 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to bigint"}
 		}
+	case "name":
+		// name type truncates to NAMEDATALEN-1 = 63 bytes. M0097-0003.
+		switch d.Kind {
+		case KindString, KindStringArena:
+			s := d.StringValue()
+			if len(s) > 63 {
+				s = s[:63]
+			}
+			return NewStringDatum(s), nil
+		default:
+			return d, nil
+		}
 	case "text", "varchar", "bpchar", "char":
 		switch d.Kind {
 		case KindBool:

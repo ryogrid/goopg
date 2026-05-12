@@ -319,8 +319,8 @@ func (l *lexer) next() (Token, error) {
 		}
 		return Token{}, l.errf(start, "unexpected character %q", c)
 
-	case c == '<' || c == '>' || c == '=' || c == '!' || c == '+' || c == '-' || c == '/' || c == '%' || c == '|' || c == '&' || c == '#':
-		// Greedy multi-char operator match. M0097-0003: added <<, >>, &, #.
+	case c == '<' || c == '>' || c == '=' || c == '!' || c == '+' || c == '-' || c == '/' || c == '%' || c == '|' || c == '&' || c == '#' || c == '~':
+		// Greedy multi-char operator match. M0097-0003: added <<, >>, &, #, ~.
 		two := ""
 		if l.pos+1 < len(l.src) {
 			two = l.src[l.pos : l.pos+2]

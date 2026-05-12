@@ -2006,6 +2006,16 @@ func evalConstantBool(e Expr) (bool, bool) {
 	return false, false
 }
 
+// isTextLikePlannerType returns true for string-like types that can be compared
+// with name type (implicitly cast to name for truncation). M0097-0003.
+func isTextLikePlannerType(name string) bool {
+	switch strings.ToLower(name) {
+	case "text", "varchar", "char", "bpchar", "character varying", "name", "unknown", "":
+		return true
+	}
+	return false
+}
+
 func groupExprName(e Expr) string {
 	if c, ok := e.(*ColumnRef); ok {
 		return c.Name
@@ -3858,6 +3868,18 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		r, err := resolveExpr(x.Right, ctx)
 		if err != nil {
 			return nil, err
+		}
+		// For comparisons involving a `name` type, coerce the non-name side
+		// to "name" so the executor truncates it to 63 chars (NAMEDATALEN-1),
+		// matching PostgreSQL's namecmp() semantics. M0097-0003.
+		switch x.Op {
+		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+			lt, rt := exprType(l), exprType(r)
+			if strings.EqualFold(lt.Name, "name") && !strings.EqualFold(rt.Name, "name") && isTextLikePlannerType(rt.Name) {
+				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}
+			} else if strings.EqualFold(rt.Name, "name") && !strings.EqualFold(lt.Name, "name") && isTextLikePlannerType(lt.Name) {
+				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "name"}
+			}
 		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
