@@ -536,6 +536,58 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Constant-degenerate-aggregate optimization: when the aggregate has no
+	// GROUP BY, no aggregate calls, all SELECT targets are constants, and the
+	// HAVING is a constant expression, skip the table scan entirely and return
+	// a constant result (0 or 1 rows). This matches PostgreSQL's plan for
+	// SELECT 1 FROM t WHERE expr HAVING 1<2 (comment "not scanning the table").
+	// M0097-0003.
+	if agg != nil && win == nil {
+		// Find the innermost aggregate node (may be wrapped in HAVING Filter).
+		var innerAgg *Aggregate
+		if a, ok := node.(*Aggregate); ok {
+			innerAgg = a
+		} else if f, ok := node.(*Filter); ok {
+			if a, ok2 := f.Child.(*Aggregate); ok2 {
+				innerAgg = a
+			}
+		}
+		if innerAgg != nil && len(innerAgg.GroupExprs) == 0 && len(innerAgg.Aggs) == 0 {
+			allConst := true
+			for _, t := range targets {
+				if !isConstantPlanExpr(t) {
+					allConst = false
+					break
+				}
+			}
+			if allConst {
+				// Evaluate HAVING at plan time.
+				emitRow := true // default: no HAVING → 1 row
+				if s.Having != nil {
+					// Find the HAVING expression from the filter wrapper.
+					var havingExpr Expr
+					if f, ok := node.(*Filter); ok {
+						havingExpr = f.Predicate
+					}
+					if havingExpr != nil && isConstantPlanExpr(havingExpr) {
+						result, ok := evalConstantBool(havingExpr)
+						if ok {
+							emitRow = result
+						}
+					}
+				}
+				if emitRow {
+					// One empty-row source so Project evaluates the constant targets once.
+					emptyRow := make([]Expr, 0)
+					constSource := &Values{pos: s.Pos(), Rows: [][]Expr{emptyRow}, schema: Schema{}}
+					return &Project{pos: s.Pos(), Child: constSource, Targets: targets, schema: schema}, nil
+				}
+				// HAVING is constant-false → 0 rows.
+				emptySource := &Values{pos: s.Pos(), Rows: nil, schema: Schema{}}
+				return &Project{pos: s.Pos(), Child: emptySource, Targets: targets, schema: schema}, nil
+			}
+		}
+	}
 	proj := &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}
 	// Promote to IndexOnlyScan (M0046-0004) only when there are no locking
 	// clauses. FOR UPDATE / FOR SHARE rely on the IndexScan leaf being
@@ -1891,6 +1943,67 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		}
 	}
 	return aggNode, outputCtx, surface, having, nil
+}
+
+// isConstantPlanExpr reports whether e can be evaluated without any row data.
+// Used by the constant-degenerate-aggregate optimization. M0097-0003.
+func isConstantPlanExpr(e Expr) bool {
+	switch x := e.(type) {
+	case *IntegerConst, *NumericConst, *StringConst, *BooleanConst, *NullConst, *TypedStringLit:
+		return true
+	case *BinaryOp:
+		return isConstantPlanExpr(x.Left) && isConstantPlanExpr(x.Right)
+	case *UnaryOp:
+		return isConstantPlanExpr(x.Operand)
+	case *CastExpr:
+		return isConstantPlanExpr(x.Operand)
+	case *IsBoolExpr:
+		return isConstantPlanExpr(x.Operand)
+	case *IsNullExpr:
+		return isConstantPlanExpr(x.Operand)
+	}
+	return false
+}
+
+// evalConstantBool evaluates a constant boolean expression at plan time.
+// Returns (result, ok=true) if evaluation succeeded, (false, false) if not constant. M0097-0003.
+func evalConstantBool(e Expr) (bool, bool) {
+	if b, ok := e.(*BooleanConst); ok {
+		return b.Value, true
+	}
+	if n, ok := e.(*IsNullExpr); ok {
+		if isConstantPlanExpr(n.Operand) {
+			_, isNull := n.Operand.(*NullConst)
+			result := isNull
+			if n.Negated {
+				result = !result
+			}
+			return result, true
+		}
+	}
+	if b, ok := e.(*BinaryOp); ok {
+		// Compare two integer constants at plan time.
+		li, lok := b.Left.(*IntegerConst)
+		ri, rok := b.Right.(*IntegerConst)
+		if lok && rok {
+			l, r := li.Value, ri.Value
+			switch b.Op {
+			case parser.OpLt:
+				return l < r, true
+			case parser.OpLe:
+				return l <= r, true
+			case parser.OpGt:
+				return l > r, true
+			case parser.OpGe:
+				return l >= r, true
+			case parser.OpEq:
+				return l == r, true
+			case parser.OpNe:
+				return l != r, true
+			}
+		}
+	}
+	return false, false
 }
 
 func groupExprName(e Expr) string {
