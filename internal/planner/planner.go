@@ -3409,6 +3409,9 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "text"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
+		case "gcd", "lcm", "abs", "mod", "div":
+			// These return integer; use int8 as generic integer type. M0097-0003.
+			return catalog.Type{Name: "int8"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}
@@ -3700,7 +3703,9 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
 		switch x.Op {
-		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod,
+			parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
+			// Set ResultType for overflow checking in the executor. M0097-0003.
 			node.ResultType = exprType(node).Name
 		}
 		return node, nil

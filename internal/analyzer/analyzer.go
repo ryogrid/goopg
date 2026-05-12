@@ -1330,7 +1330,9 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 			if i < len(rv.Columns) && rv.Columns[i] != "" {
 				name = rv.Columns[i]
 			}
-			cols[i] = catalog.Column{Name: name, Type: catalog.Type{Name: "text"}}
+			// Use "unknown" so that numeric/arithmetic operations on VALUES
+			// columns pass type checking (isNumericLike("unknown") = true). M0097-0003.
+			cols[i] = catalog.Column{Name: name, Type: catalog.Type{Name: "unknown"}}
 		}
 		return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
 	}

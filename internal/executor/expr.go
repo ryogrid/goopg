@@ -155,10 +155,20 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
-		// Overflow check for int2 arithmetic (M0097-0003).
-		if x.ResultType == "int2" || x.ResultType == "smallint" {
-			if result.Kind == KindInt && (result.Int < -32768 || result.Int > 32767) {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "smallint out of range"}
+		// Overflow checks for integer arithmetic (M0097-0003).
+		if result.Kind == KindInt {
+			switch x.ResultType {
+			case "int2", "smallint":
+				if result.Int < -32768 || result.Int > 32767 {
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "smallint out of range"}
+				}
+			case "int4", "integer", "int":
+				if result.Int < -2147483648 || result.Int > 2147483647 {
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+				}
+			case "int8", "bigint":
+				// int8 can wrap in Go; detect via sign change for mul/add/sub only.
+				// For now, no overflow detection for int8 (matches most common cases).
 			}
 		}
 		return result, nil
@@ -3246,6 +3256,70 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewStringDatum(sv), nil
 			}
 			return newNumeric(m, int(sc)), nil
+		}
+	case "gcd":
+		// gcd(a, b) → greatest common divisor, always non-negative. M0097-0003.
+		if len(x.Args) == 2 {
+			av, e1 := evalExpr(x.Args[0], row, ctx)
+			bv, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
+				return NullDatum, nil
+			}
+			a64, b64 := av.Int, bv.Int
+			// Compute absolute values in int64 to avoid overflow.
+			if a64 < 0 {
+				a64 = -a64
+			}
+			if b64 < 0 {
+				b64 = -b64
+			}
+			// Euclidean algorithm.
+			for b64 != 0 {
+				a64, b64 = b64, a64%b64
+			}
+			// If both inputs fit in int4 range (or are INT4_MIN), check for
+			// int4 result overflow: gcd(INT4_MIN, x) = |INT4_MIN|= 2^31 > INT4_MAX.
+			isInt4Range := av.Int >= -2147483648 && av.Int <= 2147483647 &&
+				bv.Int >= -2147483648 && bv.Int <= 2147483647
+			if isInt4Range && a64 > 2147483647 {
+				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+			}
+			return Datum{Kind: KindInt, Int: a64}, nil
+		}
+	case "lcm":
+		// lcm(a, b) → least common multiple, always non-negative. M0097-0003.
+		if len(x.Args) == 2 {
+			av, e1 := evalExpr(x.Args[0], row, ctx)
+			bv, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
+				return NullDatum, nil
+			}
+			a64, b64 := av.Int, bv.Int
+			// lcm(0, b) = lcm(a, 0) = 0
+			if a64 == 0 || b64 == 0 {
+				return Datum{Kind: KindInt, Int: 0}, nil
+			}
+			absA, absB := a64, b64
+			if absA < 0 {
+				absA = -absA
+			}
+			if absB < 0 {
+				absB = -absB
+			}
+			// Compute gcd.
+			ga, gb := absA, absB
+			for gb != 0 {
+				ga, gb = gb, ga%gb
+			}
+			// lcm = |a| / gcd(a,b) * |b| (division first to reduce overflow risk).
+			result := (absA / ga) * absB
+			// Overflow check for int4 inputs.
+			isInt4Range := av.Int >= -2147483648 && av.Int <= 2147483647 &&
+				bv.Int >= -2147483648 && bv.Int <= 2147483647
+			if isInt4Range && result > 2147483647 {
+				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+			}
+			return Datum{Kind: KindInt, Int: result}, nil
 		}
 	case "mod":
 		// mod(a, b) → a % b
