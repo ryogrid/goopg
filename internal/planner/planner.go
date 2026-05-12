@@ -16,6 +16,7 @@ type PlanError struct {
 	Pos     int
 	Code    string
 	Message string
+	Hint    string // optional hint message (emitted as 'H' field in wire protocol)
 }
 
 func (e *PlanError) Error() string {
@@ -169,6 +170,11 @@ type rangeBinding struct {
 	// `<target>.col` accidentally match the excluded side.
 	// Mirrors the analyzer's scopeRel.qualifiedOnly.
 	qualifiedOnly bool
+	// blockOriginalName makes using the underlying table's catalog name
+	// (rather than the alias) a hard error. Set in DELETE when an explicit
+	// alias is provided: "DELETE FROM t AS a WHERE t.col" must fail.
+	// M0097-0003.
+	blockOriginalName bool
 	// sourceIdx is a per-FROM-clause monotonic identifier
 	// (M0071-0009) propagated into SchemaColumn.SourceTableIdx
 	// for every column produced by this binding. Distinct values
@@ -3036,6 +3042,11 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
 	ctx := singleBindingContext(tbl, s.Target.Alias)
+	// When an explicit alias is set, using the original table name in WHERE
+	// must produce the PostgreSQL-specific error. M0097-0003.
+	if s.Target.Alias != "" {
+		ctx.bindings[0].blockOriginalName = true
+	}
 	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
@@ -3412,6 +3423,11 @@ func exprType(e Expr) catalog.Type {
 		case "gcd", "lcm", "abs", "mod", "div":
 			// These return integer; use int8 as generic integer type. M0097-0003.
 			return catalog.Type{Name: "int8"}
+		case "char_length", "character_length", "length", "octet_length",
+			"bit_length", "array_length", "array_upper", "array_lower",
+			"cardinality", "strpos", "position":
+			// String/array length functions return int4. M0097-0003.
+			return catalog.Type{Name: "int4"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}
@@ -3790,15 +3806,26 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
 			if b.qualifiedOnly {
-				// Pseudo-tables (e.g. ON CONFLICT's
-				// `excluded`) reach name resolution only
-				// via their alias. See the matching
-				// analyzer-side comment in analyzer.go.
+				// Pseudo-tables (e.g. ON CONFLICT's `excluded`) reach name
+				// resolution only via their alias.
 				if b.alias != "" && strings.EqualFold(x.Table, b.alias) &&
 					(x.Schema == "" || strings.EqualFold(x.Schema, b.table.Schema)) {
 					matches = append(matches, b)
 				}
 				continue
+			}
+			// When blockOriginalName is set (DELETE FROM t AS a), using the
+			// original table name produces the PostgreSQL-compatible error with
+			// a hint. M0097-0003.
+			if b.blockOriginalName && b.alias != "" &&
+				strings.EqualFold(x.Table, b.table.Name) {
+				return nil, false, &PlanError{
+					Pos:  x.Pos(),
+					Code: "42712",
+					Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q",
+						b.table.Name),
+					Hint: fmt.Sprintf("Perhaps you meant to reference the table alias %q.", b.alias),
+				}
 			}
 			if bindingMatchesRelation(b, x.Table, x.Schema) {
 				matches = append(matches, b)

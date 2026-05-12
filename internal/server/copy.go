@@ -472,6 +472,16 @@ func planErrorFields(err error) (sqlstate.Code, string) {
 	return sqlstate.FeatureNotSupported, err.Error()
 }
 
+// planErrorHintFields returns extra ErrorField(s) for any hint carried
+// by the error. Returns nil when no hint is present. M0097-0003.
+func planErrorHintFields(err error) []protocol.ErrorField {
+	var pe *planner.PlanError
+	if errors.As(err, &pe) && pe.Hint != "" {
+		return []protocol.ErrorField{{Code: protocol.FieldHint, Value: pe.Hint}}
+	}
+	return nil
+}
+
 func execErrCode(err error) sqlstate.Code {
 	var ee *executor.ExecError
 	if errors.As(err, &ee) && ee.Code != "" {

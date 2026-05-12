@@ -268,7 +268,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 				freshNode, perr := planner.Plan(stmt, s.cfg.Catalog)
 				if perr != nil {
 					code, msg := planErrorFields(perr)
-					return s.writeQueryError(w, code, msg)
+					return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
 				}
 				if planCacheIsCacheable(freshNode) {
 					s.pc.Put(cacheKey, freshNode)
@@ -428,7 +428,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		node, err = planner.Plan(stmt, s.cfg.Catalog)
 		if err != nil {
 			code, msg := planErrorFields(err)
-			return s.writeQueryError(w, code, msg)
+			return s.writeQueryError(w, code, msg, planErrorHintFields(err)...)
 		}
 		// Note: plan cache storage happens at the dispatch level (caller
 		// stores if cacheKey was computed). This function only executes.
@@ -677,11 +677,11 @@ func rowsAffected(op executor.Operator) int64 {
 // which is wire-compatible with libpq's text-format reader.
 func typeOIDFor(name string) uint32 {
 	switch strings.ToLower(name) {
-	case "int2", "smallint":
+	case "int2", "smallint", "smallserial":
 		return 21
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial":
 		return 23
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial":
 		return 20
 	case "float4", "real":
 		return 700
