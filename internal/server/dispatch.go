@@ -249,6 +249,47 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			}
 			continue
 		}
+		// DECLARE ... CURSOR FOR select (M0097-0003).
+		if dc, ok := stmt.(*parser.DeclareCursorStmt); ok {
+			if connTx != nil {
+				// Store the cursor's SELECT SQL for later FETCH.
+				// Re-extract the raw SQL for this cursor declaration.
+				// Since we have the parsed query, reconstruct by storing
+				// the original sql text (trimmed to the cursor portion).
+				connTx.cursorDeclare(dc.Name, sql)
+			}
+			if err := w.WriteCommandComplete("DECLARE CURSOR"); err != nil {
+				return err
+			}
+			continue
+		}
+		// FETCH [ALL|n] [FROM|IN] cursor_name (M0097-0003).
+		if fs, ok := stmt.(*parser.FetchStmt); ok {
+			if connTx != nil {
+				if curSQL, found := connTx.cursorLookup(fs.CursorName); found {
+					if err := s.executeFetchAll(ctx, w, ectx, curSQL, fs.CursorName, fs.Count); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			return s.writeQueryError(w, "34000", fmt.Sprintf("cursor \"%s\" does not exist", fs.CursorName))
+		}
+		// CLOSE cursor_name (M0097-0003).
+		if cs, ok := stmt.(*parser.CloseStmt); ok {
+			if connTx != nil {
+				if cs.Name != "" {
+					if _, found := connTx.cursorLookup(cs.Name); !found {
+						return s.writeQueryError(w, "34000", fmt.Sprintf("cursor \"%s\" does not exist", cs.Name))
+					}
+				}
+				connTx.cursorClose(cs.Name)
+			}
+			if err := w.WriteCommandComplete("CLOSE CURSOR"); err != nil {
+				return err
+			}
+			continue
+		}
 
 		// Refresh snapshot per statement for ReadCommitted parity.
 		snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
@@ -849,4 +890,97 @@ func typeOIDFor(name string) uint32 {
 		return 1700
 	}
 	return 25
+}
+
+// executeFetchAll executes a cursor's stored SELECT and emits
+// RowDescription + DataRow* + CommandComplete "FETCH N".
+// cursorName identifies which DECLARE in the stored SQL to use.
+// count < 0 means fetch all rows (used by FETCH ALL).
+func (s *Server) executeFetchAll(_ context.Context, w *protocol.FrameWriter, ectx *executor.Context, cursorSQL string, cursorName string, count int64) error {
+	// Extract the SELECT from the stored cursor SQL, matching by cursor name.
+	// The stored SQL may be the entire query batch containing multiple DECLAREs.
+	stmts, err := parser.Parse(cursorSQL)
+	if err != nil {
+		return s.writeQueryError(w, "26000", fmt.Sprintf("cursor query parse error: %v", err))
+	}
+	var selectStmt parser.Stmt
+	for _, st := range stmts {
+		if dc, ok := st.(*parser.DeclareCursorStmt); ok {
+			if strings.EqualFold(dc.Name, cursorName) {
+				selectStmt = dc.Query
+				break
+			}
+		}
+		if _, ok := st.(*parser.SelectStmt); ok {
+			selectStmt = st
+			break
+		}
+	}
+	if selectStmt == nil {
+		return s.writeQueryError(w, "26000", fmt.Sprintf("cursor \"%s\" query not found", cursorName))
+	}
+
+	node, err := planner.Plan(selectStmt, s.cfg.Catalog)
+	if err != nil {
+		code, msg := planErrorFields(err)
+		return s.writeQueryError(w, code, msg)
+	}
+	op, buildErr := executor.Build(node)
+	if buildErr != nil {
+		return s.writeQueryError(w, execErrCode(buildErr), execErrMsg(buildErr))
+	}
+	if openErr := op.Open(ectx); openErr != nil {
+		_ = op.Close()
+		return s.writeQueryError(w, execErrCode(openErr), execErrMsg(openErr))
+	}
+	defer func() { _ = op.Close() }()
+
+	schema := op.Schema()
+	if schema != nil {
+		fields := make([]protocol.FieldDescription, len(schema))
+		for i, sc := range schema {
+			fields[i] = protocol.FieldDescription{
+				Name:         sc.Name,
+				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeSize:     -1,
+				TypeModifier: -1,
+				Format:       0,
+			}
+		}
+		if err := w.WriteRowDescription(fields); err != nil {
+			return err
+		}
+	}
+
+	var rowCount int64
+	for {
+		if count >= 0 && rowCount >= count {
+			break
+		}
+		slot, nextErr := op.Next()
+		if nextErr == executor.EOF {
+			break
+		}
+		if nextErr != nil {
+			return s.writeQueryError(w, execErrCode(nextErr), execErrMsg(nextErr))
+		}
+		if schema != nil {
+			row := slot.Row()
+			cells, valueBuf := w.DataRowScratch(len(row))
+			for _, d := range row {
+				if d.IsNull() {
+					cells = append(cells, nil)
+					continue
+				}
+				start := len(valueBuf)
+				valueBuf = d.AppendValueText(valueBuf)
+				cells = append(cells, valueBuf[start:len(valueBuf)])
+			}
+			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
+				return err
+			}
+			rowCount++
+		}
+	}
+	return w.WriteCommandComplete(fmt.Sprintf("FETCH %d", rowCount))
 }

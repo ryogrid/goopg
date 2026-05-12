@@ -289,11 +289,17 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseCallStatement(t.Pos)
 	case KwDo:
 		return p.parseDoBlock()
+	case KwDeclare:
+		return p.parseDeclareCursor()
 	}
 	// Identifier-led statements. M0097-0013.
 identLedStatement:
 	if t.Kind == TokenIdent {
 		switch strings.ToLower(t.Value) {
+		case "fetch":
+			return p.parseFetchCursor()
+		case "close":
+			return p.parseCloseCursor()
 		case "refresh":
 			p.advance()
 			return p.parseRefreshMatView(t.Pos)
@@ -1520,4 +1526,108 @@ func (p *parser) parseSetValueAtoms() ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// ── Cursor DDL (M0097-0003) ─────────────────────────────────────────────────
+
+// parseDeclareCursor parses DECLARE name [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
+func (p *parser) parseDeclareCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume DECLARE
+
+	// cursor name (may be an identifier or unreserved keyword)
+	nameToken := p.cur()
+	if nameToken.Kind != TokenIdent && nameToken.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected cursor name after DECLARE")
+	}
+	name := nameToken.Value
+	p.advance()
+
+	// optional SCROLL / NO SCROLL
+	if p.acceptIdentKeyword("no") {
+		p.acceptIdentKeyword("scroll")
+	} else {
+		p.acceptIdentKeyword("scroll")
+	}
+
+	// CURSOR
+	if !p.acceptIdentKeyword("cursor") {
+		return nil, p.errAtCur("expected CURSOR")
+	}
+
+	// optional WITH/WITHOUT HOLD
+	if p.acceptIdentKeyword("with") || p.acceptIdentKeyword("without") {
+		p.acceptIdentKeyword("hold")
+	}
+
+	// FOR
+	if !p.acceptKeyword(KwFor) {
+		return nil, p.errAtCur("expected FOR in DECLARE CURSOR")
+	}
+
+	query, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	return &DeclareCursorStmt{pos: pos, Name: name, Query: query}, nil
+}
+
+// parseFetchCursor parses FETCH [FORWARD|BACKWARD] [ALL|n] [FROM|IN] cursor_name.
+func (p *parser) parseFetchCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "fetch"
+
+	count := int64(-1) // -1 = ALL
+	forward := true
+
+	// optional direction keyword
+	if p.acceptIdentKeyword("forward") {
+		forward = true
+	} else if p.acceptIdentKeyword("backward") || p.acceptIdentKeyword("prior") {
+		forward = false
+	}
+
+	// count: ALL or integer literal
+	if p.acceptKeyword(KwAll) {
+		count = -1
+	} else if p.cur().Kind == TokenIntLit {
+		var err error
+		count, err = p.parseIntLit()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// FROM or IN
+	if !p.acceptKeyword(KwFrom) {
+		p.acceptKeyword(KwIn)
+	}
+
+	// cursor name
+	nameToken := p.cur()
+	if nameToken.Kind != TokenIdent && nameToken.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected cursor name")
+	}
+	cursorName := nameToken.Value
+	p.advance()
+
+	return &FetchStmt{pos: pos, CursorName: cursorName, Count: count, Forward: forward}, nil
+}
+
+// parseCloseCursor parses CLOSE {cursor_name|ALL}.
+func (p *parser) parseCloseCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "close"
+
+	if p.acceptKeyword(KwAll) {
+		return &CloseStmt{pos: pos, Name: ""}, nil
+	}
+
+	nameToken := p.cur()
+	if nameToken.Kind != TokenIdent && nameToken.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected cursor name or ALL")
+	}
+	name := nameToken.Value
+	p.advance()
+	return &CloseStmt{pos: pos, Name: name}, nil
 }

@@ -184,6 +184,39 @@ type DeallocateStmt struct {
 func (s *DeallocateStmt) Pos() int  { return s.pos }
 func (s *DeallocateStmt) stmtNode() {}
 
+// ── CURSOR (M0097-0003) ─────────────────────────────────────────────────────
+
+// DeclareCursorStmt — `DECLARE name [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR query`.
+type DeclareCursorStmt struct {
+	pos   int
+	Name  string
+	Query Stmt // the SELECT
+}
+
+func (s *DeclareCursorStmt) Pos() int  { return s.pos }
+func (s *DeclareCursorStmt) stmtNode() {}
+
+// FetchStmt — `FETCH [FORWARD|BACKWARD] [ALL|n] [FROM|IN] cursor_name`.
+// Count < 0 means ALL (fetch all remaining rows).
+type FetchStmt struct {
+	pos        int
+	CursorName string
+	Count      int64 // < 0 means ALL
+	Forward    bool  // true = FORWARD (default), false = BACKWARD
+}
+
+func (s *FetchStmt) Pos() int  { return s.pos }
+func (s *FetchStmt) stmtNode() {}
+
+// CloseStmt — `CLOSE {cursor_name|ALL}`.
+type CloseStmt struct {
+	pos  int
+	Name string // "" means ALL
+}
+
+func (s *CloseStmt) Pos() int  { return s.pos }
+func (s *CloseStmt) stmtNode() {}
+
 // ── MERGE INTO (M0096-0010) ─────────────────────────────────────────────────
 
 // MergeActionKind discriminates the action in a MERGE WHEN clause.

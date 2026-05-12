@@ -20,6 +20,7 @@ package server
 // is still open at the time the second session tries the same key.
 
 import (
+	"strings"
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -37,6 +38,9 @@ type connTxState struct {
 	// TempTableShadows maps table name → original permanent *catalog.Table.
 	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
 	TempTableShadows map[string]*catalog.Table
+	// Cursors holds open SQL cursors declared by DECLARE ... CURSOR FOR select.
+	// Key = cursor name (case-insensitive), value = SELECT SQL text.
+	Cursors map[string]string
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -126,4 +130,36 @@ func (ps *preparedStatements) DeleteAll() {
 	ps.mu.Lock()
 	ps.stmts = make(map[string]string)
 	ps.mu.Unlock()
+}
+
+// cursorDeclare stores a named cursor's SELECT SQL text.
+func (c *connTxState) cursorDeclare(name, sql string) {
+	c.mu.Lock()
+	if c.Cursors == nil {
+		c.Cursors = make(map[string]string)
+	}
+	c.Cursors[strings.ToLower(name)] = sql
+	c.mu.Unlock()
+}
+
+// cursorLookup returns the SELECT SQL for a named cursor.
+func (c *connTxState) cursorLookup(name string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Cursors == nil {
+		return "", false
+	}
+	sql, ok := c.Cursors[strings.ToLower(name)]
+	return sql, ok
+}
+
+// cursorClose removes a named cursor (or all cursors when name is "").
+func (c *connTxState) cursorClose(name string) {
+	c.mu.Lock()
+	if name == "" {
+		c.Cursors = nil
+	} else if c.Cursors != nil {
+		delete(c.Cursors, strings.ToLower(name))
+	}
+	c.mu.Unlock()
 }
