@@ -1457,6 +1457,7 @@ func (p *parser) parseCreateSequenceTail(pos int, temp bool) (Stmt, error) {
 }
 
 // parseInt64 parses a (possibly negative) integer literal. M0097-0009.
+// M0097-0003: uses parseIntLiteral to support 0b/0o/0x prefixes and _ separators.
 func (p *parser) parseInt64() (int64, error) {
 	neg := p.cur().Kind == TokenSymbol && p.cur().Value == "-"
 	if neg {
@@ -1467,9 +1468,9 @@ func (p *parser) parseInt64() (int64, error) {
 		return 0, p.errAtCur("expected integer literal")
 	}
 	p.advance()
-	n := int64(0)
-	for _, c := range t.Value {
-		n = n*10 + int64(c-'0')
+	n, err := parseIntLiteral(t.Value)
+	if err != nil {
+		return 0, &SyntaxError{Pos: t.Pos, Message: "invalid integer literal: " + t.Value}
 	}
 	if neg {
 		n = -n

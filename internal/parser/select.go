@@ -1120,11 +1120,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 	switch t.Kind {
 	case TokenIntLit:
 		p.advance()
-		v, err := strconv.ParseInt(t.Value, 10, 64)
-		if err != nil {
-			return nil, &SyntaxError{Pos: t.Pos, Message: "invalid integer literal: " + t.Value}
-		}
-		return &IntegerConst{pos: t.Pos, Value: v}, nil
+		return parseIntLiteralExpr(t)
 	case TokenNumericLit:
 		p.advance()
 		return &NumericConst{pos: t.Pos, Value: t.Value}, nil
@@ -1736,4 +1732,58 @@ func (p *parser) parseWindowDef() (*WindowDef, error) {
 		return nil, p.errAtCur("expected ')' after window definition (frame clauses are not supported in v0)")
 	}
 	return wd, nil
+}
+
+// parseIntLiteral converts a TokenIntLit value to int64, handling:
+//   - Binary literals: 0b[01]+ or 0B[01]+
+//   - Octal literals:  0o[0-7]+ or 0O[0-7]+
+//   - Hex literals:    0x[0-9a-fA-F]+ or 0X[0-9a-fA-F]+
+//   - Numeric separators: underscore (_) stripped before parsing
+//   - Plain decimal: base 10
+//
+// M0097-0003: PostgreSQL 16+ numeric literal syntax support.
+func parseIntLiteral(s string) (int64, error) {
+	s = strings.ReplaceAll(s, "_", "") // strip numeric separators
+	if len(s) >= 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b', 'B':
+			return strconv.ParseInt(s[2:], 2, 64)
+		case 'o', 'O':
+			return strconv.ParseInt(s[2:], 8, 64)
+		case 'x', 'X':
+			return strconv.ParseInt(s[2:], 16, 64)
+		}
+	}
+	return strconv.ParseInt(s, 10, 64)
+}
+
+// parseIntLiteralExpr parses a TokenIntLit and returns either IntegerConst
+// (fits int64) or NumericConst (overflow) as PostgreSQL does.
+// M0097-0003.
+func parseIntLiteralExpr(t Token) (Expr, error) {
+	v, err := parseIntLiteral(t.Value)
+	if err == nil {
+		return &IntegerConst{pos: t.Pos, Value: v}, nil
+	}
+	// Overflow — emit as NumericConst preserving the original value.
+	// Strip underscores and prefix for display consistency.
+	s := strings.ReplaceAll(t.Value, "_", "")
+	if len(s) >= 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b', 'B':
+			if u, uerr := strconv.ParseUint(s[2:], 2, 64); uerr == nil {
+				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			}
+		case 'o', 'O':
+			if u, uerr := strconv.ParseUint(s[2:], 8, 64); uerr == nil {
+				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			}
+		case 'x', 'X':
+			if u, uerr := strconv.ParseUint(s[2:], 16, 64); uerr == nil {
+				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			}
+		}
+	}
+	// Decimal overflow — return the string as a numeric literal.
+	return &NumericConst{pos: t.Pos, Value: s}, nil
 }

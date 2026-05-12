@@ -615,9 +615,13 @@ M0097-0001 wires it up.
       5. `CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE`: parsed as CREATE TABLE.
       6. `SELECT;` (empty target list): returns 1 empty row.
       7. `schema != nil` dispatch: RowDescription sent for 0-column results.
-      Passing: `comments`. Still deferred: `errors` (error msg wording), `boolean`
-      (pg_input_error_info SRF), `varchar`/`char` (varchar length enforcement),
-      others (float/int output format, missing test data).
+      Additional fixes (2026-05-12 loop 15):
+      8. Lexer: binary (0b), octal (0o), hex (0x) integer literals; numeric _ separators.
+      9. Parser: `parseIntLiteralExpr` handles overflow via NumericConst fallback.
+      10. Normalization: "trailing junk after numeric literal" wording normalized.
+      Passing: `comments`. Still deferred: `numerology` (DO blocks, shared tables),
+      `errors` (error msg wording), `boolean` (pg_input_error_info SRF),
+      `varchar`/`char` (varchar length enforcement).
       Original action:
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,

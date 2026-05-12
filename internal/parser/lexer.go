@@ -160,7 +160,55 @@ func (l *lexer) next() (Token, error) {
 		return Token{}, l.errf(start, "unterminated string literal")
 
 	case isDigit(c):
-		for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+		// l.pos currently points to c (not yet advanced past it).
+		// Advance past c so subsequent checks look at the NEXT character.
+		l.pos++
+		// Detect non-decimal integer prefixes: 0b (binary), 0o (octal), 0x/0X (hex).
+		// PostgreSQL 16+ numeric literal syntax. M0097-0003.
+		if c == '0' && l.pos < len(l.src) {
+			next := l.src[l.pos]
+			switch {
+			case next == 'b' || next == 'B':
+				// Binary literal: 0b[01]+ with optional _ separators.
+				l.pos++ // consume 'b'
+				digStart := l.pos
+				for l.pos < len(l.src) && (l.src[l.pos] == '0' || l.src[l.pos] == '1' || l.src[l.pos] == '_') {
+					l.pos++
+				}
+				if l.pos == digStart {
+					// No binary digits — treat as `0` followed by `b` ident.
+					l.pos = start + 1
+					return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+				}
+				return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+			case next == 'o' || next == 'O':
+				// Octal literal: 0o[0-7]+ with optional _ separators.
+				l.pos++
+				digStart := l.pos
+				for l.pos < len(l.src) && ((l.src[l.pos] >= '0' && l.src[l.pos] <= '7') || l.src[l.pos] == '_') {
+					l.pos++
+				}
+				if l.pos == digStart {
+					l.pos = start + 1
+					return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+				}
+				return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+			case next == 'x' || next == 'X':
+				// Hexadecimal literal: 0x[0-9a-fA-F]+ with optional _ separators.
+				l.pos++
+				digStart := l.pos
+				for l.pos < len(l.src) && (isHexDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
+					l.pos++
+				}
+				if l.pos == digStart {
+					l.pos = start + 1
+					return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+				}
+				return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+			}
+		}
+		// Decimal integer (possibly with _ separators): consume remaining digits.
+		for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 			l.pos++
 		}
 		// Optional fractional part. We commit to a decimal literal
@@ -170,7 +218,7 @@ func (l *lexer) next() (Token, error) {
 		isNumeric := false
 		if l.pos < len(l.src) && l.src[l.pos] == '.' && l.pos+1 < len(l.src) && isDigit(l.src[l.pos+1]) {
 			l.pos++ // consume '.'
-			for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+			for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 				l.pos++
 			}
 			isNumeric = true
@@ -183,7 +231,7 @@ func (l *lexer) next() (Token, error) {
 				l.pos++
 			}
 			expStart := l.pos
-			for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+			for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 				l.pos++
 			}
 			if l.pos == expStart {
@@ -301,6 +349,10 @@ func isIdentCont(c byte) bool {
 }
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
 
 // isDollarTagCont is the dollar-quote tag character class:
 // identifier chars except `$`. The `$` exclusion mirrors upstream's

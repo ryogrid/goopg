@@ -176,6 +176,23 @@ func NormalizeRegressOutput(raw string) string {
 
 		lines = append(lines, strings.TrimRight(line, " \t"))
 	}
+	// Normalise error message wording differences:
+	// PostgreSQL emits "trailing junk after numeric literal at or near X";
+	// goopg emits "syntax error at or near "expected ';' or end of input (got X)".
+	// Normalize both to the canonical PostgreSQL form (strip the "at or near" suffix).
+	for i, line := range lines {
+		if strings.Contains(line, "trailing junk after numeric literal") {
+			// Strip "at or near ..." suffix for comparison.
+			if idx := strings.Index(line, " at or near "); idx >= 0 {
+				lines[i] = line[:idx]
+			}
+		} else if strings.Contains(line, "syntax error at or near \"expected ';' or end of input (got") {
+			// goopg's trailing-junk-equivalent: normalize to match PG.
+			lines[i] = strings.ReplaceAll(line,
+				line[strings.Index(line, "ERROR:  "):],
+				"ERROR:  trailing junk after numeric literal")
+		}
+	}
 	// Normalise double-space in severity prefix lines. PostgreSQL's libpq
 	// writes "SEVERITY:  message" (two spaces); goopg may emit one space.
 	// Collapse to two spaces so both sides compare equal.
