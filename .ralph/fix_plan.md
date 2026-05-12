@@ -857,21 +857,16 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
       Design doc: docs/design/0098-0002-wal-group-commit.md
       (TPS verification deferred to M0098-0008 final measurement)
 
-- [ ] **M0098-0003** — **Buffer pool 128-partition locking** — removes the
-      global `poolMu` bottleneck for high-concurrency reads and writes.
-      Implementation:
-      - Replace the single `poolMu sync.Mutex` + `byTag map` with
-        128 `bufferPartition` structs, each holding its own `sync.Mutex`
-        and a `map[PageTag]int` sub-table (mirroring PostgreSQL's
-        `BufTableHashPartition` design from
-        `about_buffer_management/final/`).
-      - The partition index is `hash(PageTag) % 128`.
-      - `Pin` / `Unpin` / `Read` / `WriteDirtyPages` victim selection only
-        lock the relevant partition(s).
-      - Per-buffer `contentMu sync.RWMutex` (already present per slot)
-        remains unchanged.
-      Expected: 3–6× TPS improvement for Select Only at -c 100; 1.5–2× for
-      write workloads (buffer lookups inside transactions).
+- [x] **M0098-0003** — **Buffer pool 128-partition locking**.  2026-05-12.
+      Landed (internal/storage/bufpool.go + page.go):
+      - bufferPartition{mu, byTag, ioByTag, ioCond} type; 128 partitions
+      - tagPartition(BufferTag) int — FNV-1a hash & 127
+      - Pool: removed poolMu/byTag/ioByTag/ioCond; added partitions[128] + evictMu
+      - Pin: partition lock for byTag/ioByTag, evictMu for victim selection
+      - Unpin/MarkDirty/evictLocked: evictMu only (pinCount/usageCount/dirty)
+      - InvalidateRel/ResetCheckpointEpoch/WriteDirtyPages: partition-aware
+      - All storage/initdb/wal/server tests pass with -race detector
+      Design doc: docs/design/0098-0003-buffer-pool-128-partition-locking.md
 
 - [ ] **M0098-0004** — **EvalPlanQual (row recheck on concurrent UPDATE)**
       — eliminates SQLSTATE 40001 aborts caused by xmax conflicts, replacing
