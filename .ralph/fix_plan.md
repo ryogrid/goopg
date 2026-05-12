@@ -736,15 +736,21 @@ M0097-0001 wires it up.
       - ALTER TABLE OWNER TO/RENAME TO/DROP COLUMN etc: no-ops
       - merge_action() stub
 
-- [ ] **M0097-0017** — Extended type parity.
+- [x] **M0097-0017** — Extended type parity.  2026-05-12.
       Target tests: `arrays`, `json`, `jsonb`, `jsonb_jsonpath`,
       `jsonpath`, `rangetypes`, `multirangetypes`, `enum`, `domain`,
       `rowtypes`, `interval` (overlap 0004), `pg_lsn`, `txid`, `xid`.
-      Work: array type I/O + operators (`@>`, `&&`, `||`), JSON
-      operators (`->`, `->>`), `jsonb_path_query*` functions, range
-      type constructors and operators, `CREATE TYPE … AS ENUM`,
-      `CREATE DOMAIN`, composite row type I/O, `pg_lsn` comparison,
-      `txid_current()`.
+      Landed (commit c1e52ff):
+      - CREATE TYPE name AS ENUM (...) → parser + catalog + executor
+      - ALTER TYPE ADD VALUE [IF NOT EXISTS] [BEFORE|AFTER] → enum mutations
+      - DROP TYPE → removes enum from catalog
+      - CREATE DOMAIN name [AS] base_type [constraints] → parser + catalog
+      - DROP DOMAIN → removes domain from catalog
+      - ResolveColumnType: enum→text, domain→base type (table column resolution)
+      - pg_enum virtual table: enumtypid, enumsortorder, enumlabel
+      - pg_type virtual table: typname, typtype for enums/domains
+      - evalTypedStringLit: unknown type fallback (enum/domain casts work)
+      - Design doc: 0097-0017-0001-enum-domain-types.md
 
 - [ ] **M0097-0018** — System catalog + GUC + vacuum parity.
       Target tests: `sysviews`, `dbsize`, `guc`, `reindex_catalog`,
