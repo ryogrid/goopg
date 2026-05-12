@@ -3102,14 +3102,20 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 }
 
 // targetMeta picks the output name and type for a target. The alias
-// wins; otherwise we use the underlying ColumnRef's name; otherwise a
-// synthetic "?column?" matching upstream.
+// wins; otherwise we use the underlying ColumnRef's name; for function
+// calls we use the function name (matching upstream behaviour); otherwise
+// a synthetic "?column?" matching upstream.
 func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if t.Alias != "" {
 		return t.Alias, exprType(e)
 	}
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
+	}
+	// Function call: use function name as the implicit column label.
+	// Matches PostgreSQL's FigureColname() logic for FuncCall nodes.
+	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
+		return fc.Name, exprType(e)
 	}
 	return "?column?", exprType(e)
 }

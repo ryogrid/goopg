@@ -1971,6 +1971,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			v := strings.TrimSpace(val.StringValue())
 			t := strings.ToLower(strings.TrimSpace(typName.StringValue()))
 			switch t {
+			case "bool", "boolean":
+				return NewBoolDatum(isValidBoolInput(v)), nil
 			case "xid":
 				_, err := parseXid(v)
 				return NewBoolDatum(err == nil), nil
@@ -3483,4 +3485,15 @@ func subqueryCacheKey(row Row) string {
 // onto a single entry. (M0058-0001.)
 func nonCorrelatedCacheKey(x interface{}) string {
 	return fmt.Sprintf("\x00nc:%p", x)
+}
+
+// isValidBoolInput reports whether v is a valid PostgreSQL boolean literal.
+// Used by pg_input_is_valid('...', 'bool'). Mirrors evalTypedStringLit bool case.
+func isValidBoolInput(v string) bool {
+	switch strings.TrimSpace(strings.ToLower(v)) {
+	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1",
+		"f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0":
+		return true
+	}
+	return false
 }
