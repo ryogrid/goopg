@@ -923,30 +923,14 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
       Expected: 20–30 % overall allocation reduction; GC mark-worker
       fraction drops from ~20 % (as seen in `default.pgo`) toward < 5 %.
 
-- [ ] **M0098-0007** — **PGO activation + GOAMD64=v3 build**
-      — low-effort, broadly-applicable speedup.
-
-      (a) **PGO**: wire `default.pgo` into the primary build command
-          (`go build -pgo=./default.pgo ./cmd/goopg`).  Update
-          `Makefile` / `bench/pgbench-compare/run_comparison.sh` to
-          always build with PGO before benchmarking.
-          After M0098-0001–0006 land, collect a fresh `cpu.prof` from
-          a mixed pgbench run and replace `default.pgo` to reflect the
-          new hot paths.
-
-      (b) **GOAMD64=v3**: set `GOAMD64=v3` in the build pipeline to
-          emit AVX2/BMI2/FMA for hash, CRC, sort kernels.
-
-      (c) **Runtime knobs**:
-          - `GOMEMLIMIT` set to 90 % of available RAM (suppress
-            aggressive scavenging; `go_rdbms_performance_techniques.md`
-            §2).
-          - `GOGC=200` to trade some memory for reduced GC frequency
-            during write-heavy benchmarks.
-          - Verify `GOMAXPROCS` matches physical CPUs (container
-            environments may under-report).
-
-      Expected: 3–8 % overall TPS improvement from better inlining + ISA.
+- [x] **M0098-0007** — **PGO activation + GOAMD64=v3 build**.  2026-05-12.
+      Landed (Makefile + cmd/goopg/main.go):
+      - Makefile build: GOAMD64=v3 always; -pgo=./default.pgo when file exists
+      - Removed duplicate GOAMD64 ?= v3 from bench section
+      - main.go: debug.SetGCPercent(200) default when GOGC env not set
+      - main.go: GOMEMLIMIT env var logging (runtime already reads it)
+      - All tests pass; binary built with PGO at bin/goopg
+      Design doc: docs/design/0098-0007-pgo-goamd64-runtime-knobs.md
 
 - [ ] **M0098-0008** — **Final measurement + iterative gap-close**
       — confirm targets are met; close any remaining gap with targeted

@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -175,6 +176,32 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if v := os.Getenv("GOOPG_DISABLE_NLI"); v == "1" || v == "true" {
 		planner.SetNLIEnabled(false)
 		logger.Info("nestloop index join disabled via env", "var", "GOOPG_DISABLE_NLI")
+	}
+
+	// M0098-0007: GC tuning knobs for OLTP workloads.
+	//
+	// GOGC: default 200 (vs Go runtime default of 100) unless overridden
+	// by the GOGC environment variable. Higher GOGC means GC runs half as
+	// often, trading heap headroom for fewer STW pauses. Under pgbench at
+	// -c 100, GC was ~20% of CPU (M0092 profile); GOGC=200 targets < 10%.
+	//
+	// GOMEMLIMIT: if set in the environment, pass through to the runtime.
+	// Prevents the Go runtime from aggressively scavenging pages the OS
+	// kernel would cache anyway. Operators should set to ~90% of RAM:
+	//   GOMEMLIMIT=7372800000  # 6.9 GiB for an 8 GiB machine
+	//
+	// Both respect the standard Go environment variables (GOGC, GOMEMLIMIT)
+	// set externally — this code only applies the default when the env
+	// var is absent.
+	if os.Getenv("GOGC") == "" {
+		old := debug.SetGCPercent(200)
+		logger.Info("GC tuning applied", "GOGC", 200, "previous", old)
+	}
+	if v := os.Getenv("GOMEMLIMIT"); v != "" {
+		// Go runtime already reads GOMEMLIMIT at startup, but log it
+		// so operators know it was applied.
+		cur := debug.SetMemoryLimit(debug.SetMemoryLimit(1<<63 - 1))
+		logger.Info("GOMEMLIMIT applied", "bytes", cur)
 	}
 
 	// Start pprof HTTP endpoint on 127.0.0.1:6060 for CPU/heap profiling.
