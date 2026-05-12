@@ -185,6 +185,8 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 					case planner.MergeActionDelete:
 						mods = append(mods, pendingMod{blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionDelete})
+					case planner.MergeActionDoNothing:
+						// DO NOTHING — skip this row. M0097-0016.
 					}
 					break // first clause wins
 				}
@@ -208,13 +210,16 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 		o.rowsAffected++
 	}
 
-	// Step 3: WHEN NOT MATCHED INSERT for unmatched source rows.
+	// Step 3: WHEN NOT MATCHED INSERT (or DO NOTHING) for unmatched source rows.
 	for _, sr := range srcRows {
 		if sr.matched {
 			continue
 		}
 		for _, clause := range o.plan.Clauses {
-			if clause.Matched || clause.Action != planner.MergeActionInsert {
+			if clause.Matched {
+				continue
+			}
+			if clause.Action != planner.MergeActionInsert && clause.Action != planner.MergeActionDoNothing {
 				continue
 			}
 			// Evaluate condition against source row only.
@@ -226,6 +231,10 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				if cv.IsNull() || cv.Kind != KindBool || !cv.BoolValue() {
 					continue
 				}
+			}
+			// DO NOTHING — skip this row without inserting. M0097-0016.
+			if clause.Action == planner.MergeActionDoNothing {
+				break // first matching clause wins
 			}
 			row := make(Row, n)
 			if clause.InsertExprs != nil {

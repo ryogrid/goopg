@@ -97,6 +97,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateMatView(s)
 	case *parser.RefreshMatViewStmt:
 		return nil, o.execRefreshMatView(s)
+	case *parser.CompatNoopStmt:
+		return nil, nil // GRANT/REVOKE/COMMENT/etc — accepted, no-op. M0097-0016.
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }

@@ -103,12 +103,20 @@ func (p *parser) parseOnConflict() (*OnConflictClause, error) {
 	switch {
 	case p.acceptSymbol("("):
 		tgtPos := p.cur().Pos
-		cols, err := p.parseColumnNameList()
+		cols, err := p.parseConflictTargetColumnList()
 		if err != nil {
 			return nil, err
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
+		}
+		// Optional WHERE predicate on the conflict target (partial index).
+		// Parse and discard — v0 doesn't filter on partial-index predicates.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {
+			p.advance()
+			if _, werr := p.parseExpr(); werr != nil {
+				return nil, werr
+			}
 		}
 		clause.Target = &OnConflictTarget{pos: tgtPos, Columns: cols}
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn:
@@ -175,6 +183,65 @@ func (p *parser) parseColumnNameList() ([]string, error) {
 		out = append(out, identText(t))
 	}
 	return out, nil
+}
+
+// parseConflictTargetColumnList parses the column list inside ON CONFLICT (…).
+// Unlike parseColumnNameList it handles:
+//   - expression columns: lower(col) — stored as ""
+//   - optional COLLATE "…" or COLLATE ident after each column/expression
+//   - optional opclass name (bare ident) after the collation
+//
+// The stop condition is ')' or a keyword like DO/WHERE.
+func (p *parser) parseConflictTargetColumnList() ([]string, error) {
+	var cols []string
+	for {
+		var colName string
+		// Expression column: ident followed by '(' e.g. lower(fruit)
+		if p.cur().Kind == TokenIdent && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+			// Parse and discard the expression.
+			if _, err := p.parseExpr(); err != nil {
+				return nil, err
+			}
+			colName = ""
+		} else {
+			tok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			colName = identText(tok)
+		}
+
+		// Optional COLLATE "..." or COLLATE ident
+		if p.acceptIdentKeyword("collate") {
+			_ = p.advance()
+		}
+
+		// Optional opclass name (bare ident not followed by '(' and not a
+		// reserved keyword like DO, WHERE, ',', ')')
+		if p.cur().Kind == TokenIdent {
+			next := p.peek(1)
+			if next.Kind != TokenSymbol || (next.Value != "(" ) {
+				// looks like an opclass name — skip it
+				p.advance()
+			}
+		}
+
+		cols = append(cols, colName)
+		if !p.acceptSymbol(",") {
+			break
+		}
+		// Stop if we hit ')' or a keyword (DO/WHERE)
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+			break
+		}
+		if p.cur().Kind == TokenKeyword {
+			kw := p.cur().Keyword
+			if kw == KwDo || kw == KwWhere {
+				break
+			}
+		}
+	}
+	return cols, nil
 }
 
 func (p *parser) parseValuesRows() ([][]Expr, error) {

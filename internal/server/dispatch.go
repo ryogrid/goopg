@@ -347,8 +347,10 @@ func compatNoopCommandTag(sql string) (string, bool) {
 	switch {
 	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
 		return "CREATE ROLE", true
-	case strings.HasPrefix(norm, "grant "):
+	case strings.HasPrefix(norm, "grant "), norm == "grant":
 		return "GRANT", true
+	case strings.HasPrefix(norm, "revoke "), norm == "revoke":
+		return "REVOKE", true
 	case strings.HasPrefix(norm, "create database "):
 		return "CREATE DATABASE", true
 	case strings.HasPrefix(norm, "alter database "):
@@ -361,6 +363,10 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "DROP ROLE", true
 	case strings.HasPrefix(norm, "set constraints "):
 		return "SET CONSTRAINTS", true
+	case strings.HasPrefix(norm, "comment on "):
+		return "COMMENT", true
+	case strings.HasPrefix(norm, "security label "):
+		return "SECURITY LABEL", true
 	}
 	return "", false
 }
@@ -584,6 +590,10 @@ func ddlTag(stmt parser.Stmt) string {
 		return "TRUNCATE TABLE"
 	case *parser.AlterTableStmt:
 		return "ALTER TABLE"
+	}
+	// CompatNoopStmt carries its own tag. M0097-0016.
+	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {
+		return ns.Tag
 	}
 	return "OK"
 }

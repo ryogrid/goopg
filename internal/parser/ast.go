@@ -193,12 +193,18 @@ const (
 	MergeActionUpdate MergeActionKind = iota + 1
 	MergeActionDelete
 	MergeActionInsert
+	// MergeActionDoNothing — WHEN … THEN DO NOTHING. M0097-0016.
+	MergeActionDoNothing
 )
 
 // MergeWhenClause describes one WHEN MATCHED / WHEN NOT MATCHED arm.
 type MergeWhenClause struct {
 	pos       int
 	Matched   bool            // true = WHEN MATCHED, false = WHEN NOT MATCHED
+	// BySource is true for WHEN NOT MATCHED BY SOURCE. M0097-0016.
+	BySource  bool
+	// ByTarget is true for WHEN NOT MATCHED BY TARGET (same as NOT MATCHED). M0097-0016.
+	ByTarget  bool
 	Condition Expr            // optional AND condition; nil when absent
 	Action    MergeActionKind
 
@@ -215,11 +221,14 @@ func (w *MergeWhenClause) Pos() int { return w.pos }
 // MergeStmt — `MERGE INTO target USING source ON cond WHEN … THEN …`.
 // M0096-0010.
 type MergeStmt struct {
-	pos     int
-	Target  RangeVar        // merge target table (with optional alias)
-	Source  RangeVar        // USING source (table or subquery, with alias)
-	On      Expr            // join condition
-	Clauses []*MergeWhenClause
+	pos      int
+	Target   RangeVar        // merge target table (with optional alias)
+	Source   RangeVar        // USING source (table or subquery, with alias)
+	On       Expr            // join condition
+	Clauses  []*MergeWhenClause
+	// Returning holds the RETURNING target list. M0097-0016.
+	// Parsed but not executed (v0 no-op).
+	Returning []ResTarget
 }
 
 func (s *MergeStmt) Pos() int  { return s.pos }
@@ -990,8 +999,19 @@ type DropCompatStmt struct {
 	Behavior DropBehavior
 }
 
+// CompatNoopStmt is a compatibility stub for SQL statements that goopg
+// accepts syntactically but does not execute (GRANT, REVOKE, COMMENT ON,
+// SECURITY LABEL, etc.). The executor silently succeeds. M0097-0016.
+type CompatNoopStmt struct {
+	pos int
+	Tag string // CommandComplete tag, e.g. "GRANT", "REVOKE", "COMMENT"
+}
+
 func (s *DropCompatStmt) Pos() int  { return s.pos }
 func (s *DropCompatStmt) stmtNode() {}
+
+func (s *CompatNoopStmt) Pos() int  { return s.pos }
+func (s *CompatNoopStmt) stmtNode() {}
 
 // CreatePublicationStmt — `CREATE PUBLICATION name [FOR ALL TABLES |
 // FOR TABLE t1 [, t2 ...]] [WITH (k = v, ...)]`. v0 honours

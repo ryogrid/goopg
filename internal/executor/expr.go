@@ -1875,6 +1875,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// satisfies_hash_partition(tableoid, modulus, remainder, val...) → bool
 		// Stub: return false. M0097-0015.
 		return NewBoolDatum(false), nil
+	case "merge_action":
+		// merge_action() → text — returns 'INSERT', 'UPDATE', or 'DELETE' within MERGE RETURNING.
+		// Stub: return NULL (MERGE RETURNING is not yet executed). M0097-0016.
+		return NullDatum, nil
 
 	// ── Function introspection stubs (M0097-0012) ─────────────────────────
 	case "pg_get_functiondef":

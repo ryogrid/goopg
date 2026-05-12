@@ -855,6 +855,8 @@ const (
 	MergeActionUpdate MergeActionKind = iota + 1
 	MergeActionDelete
 	MergeActionInsert
+	// MergeActionDoNothing — WHEN … THEN DO NOTHING. M0097-0016.
+	MergeActionDoNothing
 )
 
 // MergeWhenClause is the planned form of one WHEN arm.

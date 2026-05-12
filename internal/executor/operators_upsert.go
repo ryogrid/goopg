@@ -427,28 +427,25 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 // into the byte form the arbiter btree stores. Returns (nil, nil)
 // when any conflict-key column is NULL — signals "no probe, no
 // maintenance" to the caller (matches upstream's NULL-never-
-// matches semantics for unique-constraint inference). v0 supports
-// only single-column arbiters at the encoding layer
-// (encodeBTreeKeyForColumn handles one column); multi-column
-// support would need a composite encoding the btree currently
-// lacks. Surfaces 0A000 on multi-column arbiters so the failure
-// is loud at the slice's edge.
+// matches semantics for unique-constraint inference). Multi-column
+// arbiters are supported by concatenating per-column encodings.
 func encodeArbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
 	if oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
 		return nil, nil
 	}
-	if len(oc.ArbiterColumns) > 1 {
-		return nil, &ExecError{Code: "0A000", Pos: pos, Message: "multi-column ON CONFLICT arbiters are not supported in v0"}
+	var out []byte
+	for _, ord := range oc.ArbiterColumns {
+		v := row[ord]
+		if v.IsNull() {
+			// NULL never conflicts per upstream semantics.
+			return nil, nil
+		}
+		col := &tbl.Columns[ord]
+		k, ee := encodeBTreeKeyForColumn(v, col, pos)
+		if ee != nil {
+			return nil, ee
+		}
+		out = append(out, k...)
 	}
-	ord := oc.ArbiterColumns[0]
-	v := row[ord]
-	if v.IsNull() {
-		return nil, nil
-	}
-	col := &tbl.Columns[ord]
-	key, ee := encodeBTreeKeyForColumn(v, col, pos)
-	if ee != nil {
-		return nil, ee
-	}
-	return key, nil
+	return out, nil
 }

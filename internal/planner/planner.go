@@ -63,7 +63,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
 		*parser.DropCompatStmt,
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
-		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt:
+		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
+		*parser.CompatNoopStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
@@ -3000,6 +3001,8 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 				}
 				pc.InsertExprs = exprs
 			}
+		case parser.MergeActionDoNothing:
+			// DO NOTHING — no extra fields needed. M0097-0016.
 		}
 		clauses = append(clauses, pc)
 	}

@@ -163,8 +163,11 @@ func (p *parser) acceptIdentKeyword(names ...string) bool {
 // parseStatement dispatches on the leading keyword.
 func (p *parser) parseStatement() (Stmt, error) {
 	t := p.cur()
-	if t.Kind != TokenKeyword {
+	if t.Kind != TokenKeyword && t.Kind != TokenIdent {
 		return nil, p.errAtCur("expected statement")
+	}
+	if t.Kind != TokenKeyword {
+		goto identLedStatement
 	}
 	switch t.Keyword {
 	case KwBegin:
@@ -228,11 +231,46 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseCallStatement(t.Pos)
 	}
 	// Identifier-led statements. M0097-0013.
+identLedStatement:
 	if t.Kind == TokenIdent {
 		switch strings.ToLower(t.Value) {
 		case "refresh":
 			p.advance()
 			return p.parseRefreshMatView(t.Pos)
+		case "grant", "revoke":
+			// GRANT/REVOKE — parse as a no-op CompatNoopStmt.
+			// The server's compatNoopCommandTag already handles these
+			// when they fail the parser; we also accept them here so
+			// they don't bubble up as parse errors when the server is
+			// running multi-statement batches.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value)}, nil
+		case "comment":
+			// COMMENT ON … — parse as a no-op.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: "COMMENT"}, nil
+		case "security":
+			// SECURITY LABEL … — parse as a no-op.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL"}, nil
 		}
 	}
 	return nil, p.errAtCur("unsupported statement")
@@ -889,8 +927,19 @@ func (p *parser) parseSet() (Stmt, error) {
 	if p.acceptKeyword(KwLocal) {
 		s.Local = true
 		isLocal = true
-	} else {
-		_ = p.acceptKeyword(KwSession)
+	} else if p.acceptKeyword(KwSession) {
+		// SET SESSION AUTHORIZATION name — accept as no-op SetStmt.
+		// "authorization" is not a keyword in goopg so it parses as an ident.
+		if p.acceptIdentKeyword("authorization") {
+			// consume the role name (or DEFAULT)
+			if !p.acceptKeyword(KwDefault) {
+				_, _ = p.parseIdent()
+			}
+			s.Name = "session_authorization"
+			s.Default = true
+			return s, nil
+		}
+		// otherwise fall through: SET SESSION TRANSACTION ... handled below
 	}
 	// SET [LOCAL] TRANSACTION <mode> — intercept before generic GUC path.
 	// M0096-0002: supports ISOLATION LEVEL; other modes accepted as no-op.
@@ -1160,7 +1209,7 @@ func (p *parser) parseMerge() (Stmt, error) {
 	stmt.Target = target
 
 	// USING source
-	if !p.acceptIdentKeyword("using") {
+	if !p.acceptKeyword(KwUsing) && !p.acceptIdentKeyword("using") {
 		return nil, p.errAtCur("expected USING after MERGE INTO target")
 	}
 	source, err := p.parseRangeVar()
@@ -1187,19 +1236,38 @@ func (p *parser) parseMerge() (Stmt, error) {
 		}
 		stmt.Clauses = append(stmt.Clauses, clause)
 	}
+	// Optional RETURNING target_list (M0097-0016 — parsed but not executed).
+	if p.acceptKeyword(KwReturning) {
+		ret, err := p.parseTargetList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = ret
+	}
 	return stmt, nil
 }
 
-// parseMergeWhenClause parses one WHEN [NOT] MATCHED [AND cond] THEN action.
+// parseMergeWhenClause parses one WHEN [NOT] MATCHED [BY SOURCE|TARGET] [AND cond] THEN action.
+// M0097-0016 adds DO NOTHING action and BY SOURCE/TARGET modifiers.
 func (p *parser) parseMergeWhenClause() (*MergeWhenClause, error) {
 	t := p.advance() // WHEN
 	clause := &MergeWhenClause{pos: t.Pos}
 
-	// NOT MATCHED or MATCHED
+	// NOT MATCHED [BY SOURCE|TARGET] or MATCHED
 	if p.acceptKeyword(KwNot) {
 		clause.Matched = false
 		if _, err := p.expectKeyword(KwMatched); err != nil {
 			return nil, err
+		}
+		// Optional BY SOURCE or BY TARGET (M0097-0016).
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwBy {
+			p.advance() // consume BY
+			if p.acceptIdentKeyword("source") {
+				clause.BySource = true
+			} else if p.acceptIdentKeyword("target") {
+				clause.ByTarget = true
+			}
+			// If neither, we already consumed BY — that's odd, but be tolerant.
 		}
 	} else if p.acceptKeyword(KwMatched) {
 		clause.Matched = true
@@ -1221,7 +1289,7 @@ func (p *parser) parseMergeWhenClause() (*MergeWhenClause, error) {
 		return nil, err
 	}
 
-	// Action: UPDATE, DELETE, or INSERT.
+	// Action: UPDATE, DELETE, INSERT, or DO NOTHING.
 	switch {
 	case p.acceptKeyword(KwUpdate):
 		clause.Action = MergeActionUpdate
@@ -1273,8 +1341,15 @@ func (p *parser) parseMergeWhenClause() (*MergeWhenClause, error) {
 			return nil, p.errAtCur("expected VALUES or DEFAULT VALUES after INSERT")
 		}
 
+	case p.acceptKeyword(KwDo):
+		// DO NOTHING (M0097-0016).
+		if _, err := p.expectKeyword(KwNothing); err != nil {
+			return nil, err
+		}
+		clause.Action = MergeActionDoNothing
+
 	default:
-		return nil, p.errAtCur("expected UPDATE, DELETE, or INSERT after THEN")
+		return nil, p.errAtCur("expected UPDATE, DELETE, INSERT, or DO NOTHING after THEN")
 	}
 
 	return clause, nil
