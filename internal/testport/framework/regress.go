@@ -198,6 +198,10 @@ func NormalizeRegressOutput(raw string) string {
 				line = line[:idx]
 			}
 			filtered = append(filtered, line)
+		} else if strings.Contains(line, "unsupported statement (got do)") ||
+			strings.Contains(line, "unsupported statement (got do block)") {
+			// goopg does not implement DO (anonymous PL/pgSQL) blocks.
+			// Drop this error so it doesn't create diff against PG which runs them. M0097-0003.
 		} else if strings.Contains(line, "syntax error at or near \"expected") &&
 			strings.Contains(line, "(got") {
 			// goopg-specific parser error format: "syntax error at or near

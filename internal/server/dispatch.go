@@ -531,11 +531,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	}
 	op, err := executor.Build(node)
 	if err != nil {
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 	if err := op.Open(ctx); err != nil {
 		_ = op.Close()
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 
 	// Emit RowDescription for read-shaped plans (those whose Output
@@ -575,7 +575,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 		if err != nil {
 			_ = op.Close()
-			return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+			return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 		}
 		if schema != nil {
 			row := slot.Row()
@@ -623,7 +623,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 	}
 	if err := op.Close(); err != nil {
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 
 	// Emit accumulated NOTICE messages before CommandComplete. M0097-0008.

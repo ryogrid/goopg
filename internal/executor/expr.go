@@ -24,6 +24,7 @@ import (
 type ExecError struct {
 	Code    string
 	Message string
+	Detail  string // optional DETAIL message for wire protocol. M0097-0003.
 	Pos     int
 }
 
@@ -2350,6 +2351,32 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewBoolDatum(a.BoolValue() != b.BoolValue()), nil
 		}
 
+	case "parse_ident":
+		// parse_ident(str text [, strict boolean = true]) → text[]
+		// Parses a qualified SQL identifier string and returns its components
+		// as a text array {comp1,comp2,...}. M0097-0003.
+		if len(x.Args) >= 1 {
+			strDatum, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || strDatum.IsNull() {
+				return NullDatum, nil
+			}
+			strict := true
+			if len(x.Args) >= 2 {
+				strictDatum, err2 := evalExpr(x.Args[1], row, ctx)
+				if err2 == nil && !strictDatum.IsNull() {
+					strict = strictDatum.BoolValue()
+				}
+			}
+			input := strDatum.StringValue()
+			components, msg, detail := parseIdentString(input, strict)
+			if msg != "" {
+				return Datum{}, &ExecError{Code: "42602", Pos: x.Pos(), Message: msg, Detail: detail}
+			}
+			// Format as PostgreSQL text array: {comp1,"comp2",...}
+			return NewStringDatum(formatTextArray(components)), nil
+		}
+		return NullDatum, nil
+
 	// ── pg_input_is_valid / pg_input_error_info stubs (M0097-0003) ───────
 	// These PostgreSQL 16+ functions validate whether a string is valid input
 	// for a given type. Stub returns true (best-effort) — returning an error
@@ -4034,6 +4061,138 @@ func pgInputIsValidTypedLen(v, typStr string) (bool, bool) {
 	}
 	// varchar(N): raw length check (varcharin does not strip trailing spaces).
 	return len(v) <= n, true
+}
+
+// parseIdentString parses a qualified SQL identifier string (like "schema.table")
+// into its components. Returns (components, errMsg, detail). If errMsg != "", an error occurred.
+// Matches PostgreSQL's parse_ident() behavior. M0097-0003.
+func parseIdentString(input string, strict bool) ([]string, string, string) {
+	orig := input
+	i := 0
+	n := len(input)
+	var components []string
+	errMsg := func(detail string) ([]string, string, string) {
+		return nil, fmt.Sprintf("string is not a valid identifier: %q", orig), detail
+	}
+
+	for {
+		// Skip leading whitespace.
+		for i < n && (input[i] == ' ' || input[i] == '\t' || input[i] == '\n' || input[i] == '\r') {
+			i++
+		}
+		if i >= n {
+			if len(components) == 0 {
+				return errMsg("")
+			}
+			// After the last dot, empty → error
+			if len(components) > 0 && strict {
+				return errMsg(`No valid identifier after "."`)
+			}
+			break
+		}
+		if input[i] == '"' {
+			// Quoted identifier: find matching unescaped '"'.
+			i++ // skip opening quote
+			var sb strings.Builder
+			for i < n {
+				if input[i] == '"' {
+					if i+1 < n && input[i+1] == '"' {
+						sb.WriteByte('"')
+						i += 2
+					} else {
+						i++ // skip closing quote
+						break
+					}
+				} else {
+					sb.WriteByte(input[i])
+					i++
+				}
+			}
+			components = append(components, sb.String())
+		} else {
+			// Unquoted identifier: must start with letter or underscore.
+			if !isIdentStartByte(input[i]) {
+				if !strict {
+					break
+				}
+				// Distinguish "before dot" vs regular invalid.
+				return errMsg("")
+			}
+			start := i
+			for i < n && isIdentContByte(input[i]) {
+				i++
+			}
+			ident := strings.ToLower(input[start:i])
+			components = append(components, ident)
+		}
+		// Skip trailing whitespace.
+		for i < n && (input[i] == ' ' || input[i] == '\t' || input[i] == '\n' || input[i] == '\r') {
+			i++
+		}
+		if i >= n {
+			break // end of string, done
+		}
+		if input[i] == '.' {
+			i++ // consume dot, continue to next component
+		} else {
+			// Trailing garbage.
+			if strict {
+				return errMsg("")
+			}
+			break
+		}
+	}
+	if len(components) == 0 {
+		return errMsg("")
+	}
+	return components, "", ""
+}
+
+func isIdentStartByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 128
+}
+
+func isIdentContByte(c byte) bool {
+	return isIdentStartByte(c) || (c >= '0' && c <= '9') || c == '$'
+}
+
+// formatTextArray formats a string slice as a PostgreSQL text array literal:
+// {elem1,"elem with spaces",...}. Elements needing quoting get double-quoted. M0097-0003.
+func formatTextArray(elems []string) string {
+	if len(elems) == 0 {
+		return "{}"
+	}
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
+		needsQuote := len(e) == 0
+		if !needsQuote {
+			for _, c := range e {
+				if c == '"' || c == ',' || c == '{' || c == '}' || c == '\\' || c == ' ' || c == '\t' {
+					needsQuote = true
+					break
+				}
+			}
+		}
+		if needsQuote {
+			sb.WriteByte('"')
+			for _, c := range e {
+				if c == '"' || c == '\\' {
+					sb.WriteByte('\\')
+				}
+				sb.WriteRune(c)
+			}
+			sb.WriteByte('"')
+		} else {
+			sb.WriteString(e)
+		}
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
 
 // charTypeParseOctalEscape handles PostgreSQL's "char" internal single-byte type
