@@ -1055,6 +1055,15 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		case KindInt:
 			return NewStringDatum(strconv.FormatInt(d.Int, 10)), nil
 		case KindString, KindStringArena:
+			s := d.StringValue()
+			// For "char" (internal 1-byte type), interpret backslash-octal escapes
+			// and return the charout display form. PostgreSQL's charin() accepts
+			// \NNN and charout() formats non-printable bytes as \NNN. M0097-0003.
+			if targetType == "char" {
+				if b, ok := charTypeParseOctalEscape(s); ok {
+					return NewStringDatum(charTypeDisplayForm(b)), nil
+				}
+			}
 			return d, nil
 		default:
 			return d, nil
@@ -4013,6 +4022,41 @@ func pgInputIsValidTypedLen(v, typStr string) (bool, bool) {
 	}
 	// varchar(N): raw length check (varcharin does not strip trailing spaces).
 	return len(v) <= n, true
+}
+
+// charTypeParseOctalEscape handles PostgreSQL's "char" internal single-byte type
+// which interprets backslash-octal sequences (\NNN) in string inputs.
+// Returns (byte, true) if the string is a valid \NNN octal escape, else (0, false).
+// M0097-0003.
+func charTypeParseOctalEscape(s string) (byte, bool) {
+	if len(s) != 4 || s[0] != '\\' {
+		return 0, false
+	}
+	d0, d1, d2 := s[1], s[2], s[3]
+	if d0 < '0' || d0 > '7' || d1 < '0' || d1 > '7' || d2 < '0' || d2 > '7' {
+		return 0, false
+	}
+	val := int(d0-'0')*64 + int(d1-'0')*8 + int(d2-'0')
+	if val > 255 {
+		return 0, false
+	}
+	return byte(val), true
+}
+
+// charTypeDisplayForm returns the PostgreSQL charout() display form for a byte value:
+// - Byte 0 → "" (null byte → empty, matching PostgreSQL's chartotext behavior)
+// - Printable ASCII (32-126) → single character
+// - Non-printable → \NNN (3-digit octal escape)
+// M0097-0003.
+func charTypeDisplayForm(b byte) string {
+	if b == 0 {
+		return ""
+	}
+	if b >= 32 && b <= 126 {
+		return string([]byte{b})
+	}
+	// Non-printable: format as \NNN octal.
+	return fmt.Sprintf("\\%03o", b)
 }
 
 func isValidBoolInput(v string) bool {
