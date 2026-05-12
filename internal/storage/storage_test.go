@@ -170,8 +170,8 @@ func TestPoolPinReadsThroughSMGR(t *testing.T) {
 	if s1 != s2 {
 		t.Errorf("second Pin returned different slot")
 	}
-	if s2.pinCount != 2 {
-		t.Errorf("pinCount = %d, want 2", s2.pinCount)
+	if got := s2.pinCount.Load(); got != 2 {
+		t.Errorf("pinCount = %d, want 2", got)
 	}
 	pool.Unpin(s1)
 	pool.Unpin(s2)

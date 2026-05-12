@@ -1006,10 +1006,21 @@ while preserving the original `-c 100 -j 100` target-condition validation.
         8-config × 3-workload matrix; pass/fail criteria for M0099-0005/0006.
       All 4 docs indexed in `docs/design/README.md`.
 
-- [ ] **M0099-0002** — Remove `evictMu` from Pin fast path.
-      Implement atomic pin-count handling (e.g., `atomic.Int32`) and redesign
-      lock ordering so common Pin/TryPin operations avoid global `evictMu`
-      serialization while preserving correctness and deadlock safety.
+- [x] **M0099-0002** — Remove `evictMu` from Pin fast path. (2026-05-12)
+      Implemented atomic pin-count handling and RWMutex for evictMu:
+      - `Slot.pinCount int32` → `atomic.Int32`; `Slot.usageCount uint8` → `atomic.Int32`
+      - `Pool.evictMu sync.Mutex` → `sync.RWMutex`
+      - Pin/TryPin cache-hit path: `evictMu.Lock()` → `evictMu.RLock()` so N
+        concurrent Pins proceed in parallel; atomic Add/Load for pinCount/usageCount
+      - Unpin: lockless `pinCount.Add(-1)` (no evictMu needed since evictLocked
+        checks pinCount under exclusive Lock())
+      - evictLocked, WriteDirtyPages, InvalidateRel: `.Load()` and `.Add()`
+      - All pinCount/usageCount direct assignments → `.Store()`
+      - storage_test.go: `s.pinCount != 2` → `s.pinCount.Load() != 2`
+      All storage tests pass with -race. Two pre-existing races in
+      testutil/cluster and testutil/replcluster (cluster.go:178-190 Cmd.Wait race)
+      confirmed pre-existing, not introduced by this change.
+      Design doc: `docs/design/0099-0001-evictmu-pin-fastpath-deserialization.md`.
 
 - [ ] **M0099-0003** — Improve WAL group-commit batching effectiveness.
       Add and validate commit-delay based batching controls (with sensible

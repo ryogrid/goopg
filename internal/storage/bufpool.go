@@ -29,10 +29,15 @@ type Slot struct {
 	dirty bool
 
 	// pinCount is incremented on Pin, decremented on Unpin.
-	pinCount int32
+	// M0099-0002: atomic so Pin fast path (RLock) can increment without
+	// exclusive evictMu and concurrent Pins on different pages don't
+	// serialise through a single mutex.
+	pinCount atomic.Int32
 
 	// usageCount is the clock-sweep "second chance" counter.
-	usageCount uint8
+	// M0099-0002: atomic so it can be read/updated under RLock alongside
+	// pinCount without a second exclusive acquisition.
+	usageCount atomic.Int32
 
 	// fpiSinceCheckpoint records whether a full-page-image WAL
 	// record has already been emitted for this page in the current
@@ -174,12 +179,20 @@ type Pool struct {
 	// different pages contend on different partitions.
 	partitions [128]bufferPartition
 
-	// evictMu guards the clock-sweep state: clockHand, bgwriterHand,
-	// dirtyVictimCount, totalVictimCount, and per-slot metadata that
-	// evictLocked reads/writes (pinCount, usageCount, valid, dirty, tag).
-	// It does NOT guard the page bytes — those are guarded by Slot.contentMu.
-	// Lock ordering: always acquire evictMu before any partition lock.
-	evictMu   sync.Mutex
+	// evictMu guards clock-sweep state (clockHand, bgwriterHand,
+	// dirtyVictimCount, totalVictimCount) and per-slot metadata that
+	// evictLocked or flush paths write exclusively (valid, dirty, tag,
+	// fpiSinceCheckpoint). It does NOT guard page bytes (Slot.contentMu).
+	//
+	// M0099-0002: promoted to RWMutex. The Pin fast path (cache hit) takes
+	// RLock so N concurrent Pins can proceed in parallel — eviction and flush
+	// take Lock (exclusive) as before. pinCount and usageCount are now
+	// atomic.Int32 so they can be updated under RLock without a second
+	// exclusive acquisition.
+	//
+	// Lock ordering: always acquire evictMu (Lock or RLock) before any
+	// partition lock.
+	evictMu sync.RWMutex
 	clockHand int
 
 	// OnPinWait is an optional hook called when Pool.Pin performs an
@@ -745,7 +758,7 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 				continue
 			}
 			s := p.slots[idx]
-			if s.pinCount > 0 {
+			if s.pinCount.Load() > 0 {
 				continue
 			}
 			s.valid = false
@@ -788,8 +801,8 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	s.valid = false
 	s.dirty = false
 	s.tag = BufferTag{}
-	s.pinCount = 1
-	s.usageCount = 1
+	s.pinCount.Store(1)
+	s.usageCount.Store(1)
 	p.evictMu.Unlock()
 
 	if needFlush {
@@ -798,8 +811,8 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		s.contentMu.Unlock()
 		if flushErr != nil {
 			p.evictMu.Lock()
-			s.pinCount = 0
-			s.usageCount = 0
+			s.pinCount.Store(0)
+			s.usageCount.Store(0)
 			p.evictMu.Unlock()
 			return nil, InvalidBlockNumber, fmt.Errorf("flush victim: %w", flushErr)
 		}
@@ -816,8 +829,8 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		// Roll back the reservation — slot returns to the free
 		// pool with pinCount=0.
 		p.evictMu.Lock()
-		s.pinCount = 0
-		s.usageCount = 0
+		s.pinCount.Store(0)
+		s.usageCount.Store(0)
 		p.evictMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
@@ -825,8 +838,8 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	s.contentMu.Unlock()
 	if err != nil {
 		p.evictMu.Lock()
-		s.pinCount = 0
-		s.usageCount = 0
+		s.pinCount.Store(0)
+		s.usageCount.Store(0)
 		p.evictMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
@@ -851,15 +864,15 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		// to 0 here; the existing slot's pinCount is incremented.
 		existing := p.slots[idx]
 		p.evictMu.Lock()
-		existing.pinCount++
-		if existing.usageCount < maxUsageCount {
-			existing.usageCount++
+		existing.pinCount.Add(1)
+		if existing.usageCount.Load() < maxUsageCount {
+			existing.usageCount.Add(1)
 		}
 		s.tag = BufferTag{}
 		s.valid = false
 		s.dirty = false
-		s.pinCount = 0
-		s.usageCount = 0
+		s.pinCount.Store(0)
+		s.usageCount.Store(0)
 		p.evictMu.Unlock()
 		part.mu.Unlock()
 		return existing, blk, nil
@@ -909,18 +922,22 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 			// mismatch, retry the whole Pin (the page was evicted, will be
 			// reloaded by the cache-miss path).
 			part.mu.Unlock()
-			p.evictMu.Lock()
+			// M0099-0002: RLock allows concurrent cache-hit Pins to proceed
+			// in parallel. eviction (Lock) still serialises with us — it
+			// cannot modify tag/valid while we hold RLock, so the tag check
+			// and pinCount increment are safe without further exclusive locking.
+			p.evictMu.RLock()
 			if s.tag != tag {
-				// Slot was evicted between part.mu release and evictMu acquire.
+				// Slot was evicted between part.mu release and evictMu RLock.
 				// Restart Pin so the miss path reloads the page.
-				p.evictMu.Unlock()
+				p.evictMu.RUnlock()
 				return p.Pin(tag)
 			}
-			s.pinCount++
-			if s.usageCount < maxUsageCount {
-				s.usageCount++
+			s.pinCount.Add(1)
+			if s.usageCount.Load() < maxUsageCount {
+				s.usageCount.Add(1)
 			}
-			p.evictMu.Unlock()
+			p.evictMu.RUnlock()
 			return s, nil
 		}
 
@@ -971,8 +988,8 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	s.valid = false
 	s.dirty = false
 	s.tag = BufferTag{}
-	s.pinCount = 1
-	s.usageCount = 1
+	s.pinCount.Store(1)
+	s.usageCount.Store(1)
 	p.evictMu.Unlock()
 
 	if needFlush {
@@ -981,8 +998,8 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		s.contentMu.Unlock()
 		if flushErr != nil {
 			p.evictMu.Lock()
-			s.pinCount = 0
-			s.usageCount = 0
+			s.pinCount.Store(0)
+			s.usageCount.Store(0)
 			p.evictMu.Unlock()
 			part.mu.Lock()
 			delete(part.ioByTag, tag)
@@ -1017,8 +1034,8 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	if err != nil {
 		p.evictMu.Lock()
 		s.tag = BufferTag{}
-		s.pinCount = 0
-		s.usageCount = 0
+		s.pinCount.Store(0)
+		s.usageCount.Store(0)
 		s.valid = false
 		s.dirty = false
 		p.evictMu.Unlock()
@@ -1030,13 +1047,13 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		// (e.g. via PinNew). Use that slot and release ours.
 		existing := p.slots[idx]
 		p.evictMu.Lock()
-		existing.pinCount++
-		if existing.usageCount < maxUsageCount {
-			existing.usageCount++
+		existing.pinCount.Add(1)
+		if existing.usageCount.Load() < maxUsageCount {
+			existing.usageCount.Add(1)
 		}
 		s.tag = BufferTag{}
-		s.pinCount = 0
-		s.usageCount = 0
+		s.pinCount.Store(0)
+		s.usageCount.Store(0)
 		s.valid = false
 		s.dirty = false
 		p.evictMu.Unlock()
@@ -1070,30 +1087,30 @@ func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
 		return nil, false
 	}
 	s := p.slots[idx]
-	// M0098-0003 deadlock fix: release part.mu before evictMu (same fix as Pin).
+	// M0099-0002: RLock allows concurrent cache-hit TryPins to proceed
+	// in parallel (same rationale as Pin fast path).
 	part.mu.Unlock()
-	p.evictMu.Lock()
+	p.evictMu.RLock()
 	if s.tag != tag {
-		// Slot evicted between part.mu release and evictMu acquire.
-		p.evictMu.Unlock()
+		// Slot evicted between part.mu release and evictMu RLock.
+		p.evictMu.RUnlock()
 		return nil, false // not in cache
 	}
-	s.pinCount++
-	if s.usageCount < maxUsageCount {
-		s.usageCount++
+	s.pinCount.Add(1)
+	if s.usageCount.Load() < maxUsageCount {
+		s.usageCount.Add(1)
 	}
-	p.evictMu.Unlock()
+	p.evictMu.RUnlock()
 	return s, true
 }
 
-// Unpin decrements the slot's pin count.
+// Unpin decrements the slot's pin count. No lock is required because
+// pinCount is atomic and evictLocked checks it under exclusive evictMu.Lock
+// — a decrement from N to N-1 is safe to race with the eviction Lock pass.
 func (p *Pool) Unpin(s *Slot) {
-	p.evictMu.Lock()
-	defer p.evictMu.Unlock()
-	if s.pinCount <= 0 {
+	if s.pinCount.Add(-1) < 0 {
 		panic(fmt.Sprintf("unpin underflow on tag %v", s.tag))
 	}
-	s.pinCount--
 }
 
 // MarkDirty flags the slot as having been mutated. Caller must hold
@@ -1436,11 +1453,11 @@ func (p *Pool) evictLocked() (int, error) {
 		idx := p.clockHand
 		p.clockHand = (p.clockHand + 1) % n
 		s := p.slots[idx]
-		if s.pinCount > 0 {
+		if s.pinCount.Load() > 0 {
 			continue
 		}
-		if s.usageCount > 0 {
-			s.usageCount--
+		if s.usageCount.Load() > 0 {
+			s.usageCount.Add(-1)
 			continue
 		}
 		// Track dirty-victim rate for bgwriter effectiveness (M0048-0003).
@@ -1510,7 +1527,7 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 		idx := (start + i) % n
 		s := p.slots[idx]
 		p.evictMu.Lock()
-		ok := s.valid && s.dirty && s.pinCount == 0
+		ok := s.valid && s.dirty && s.pinCount.Load() == 0
 		var tag BufferTag
 		if ok {
 			tag = s.tag
@@ -1530,7 +1547,7 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 
 		// Re-check under evictMu that the slot is still the same dirty page.
 		p.evictMu.Lock()
-		stillValid := s.valid && s.tag == v.tag && s.dirty && s.pinCount == 0
+		stillValid := s.valid && s.tag == v.tag && s.dirty && s.pinCount.Load() == 0
 		p.evictMu.Unlock()
 
 		if stillValid {
