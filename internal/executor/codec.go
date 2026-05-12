@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -332,6 +333,61 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [8]byte
 		binary.BigEndian.PutUint64(buf[:], uint64(d.TimeValue().UnixNano()))
 		return buf[:], nil
+	case "oid":
+		// Oid accepts string values that represent valid 32-bit unsigned integers.
+		// PostgreSQL silently accepts whitespace-trimmed values and validates the
+		// integer range at input time. M0097-0003.
+		var oidStr string
+		switch d.Kind {
+		case KindInt:
+			oidStr = strconv.FormatInt(d.Int, 10)
+		case KindString, KindStringArena:
+			oidStr = strings.TrimSpace(d.StringValue())
+			// Validate: must be parseable as int64 (PostgreSQL allows -N as uint32 wrap)
+			if _, err := strconv.ParseInt(oidStr, 10, 64); err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type oid: %q", d.StringValue())}
+			}
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as oid", d.Kind)
+		}
+		return encodeVarlen([]byte(oidStr)), nil
+
+	case "uuid":
+		// Uuid accepts string values; validate format at runtime. M0097-0003.
+		var uuidStr string
+		switch d.Kind {
+		case KindString, KindStringArena:
+			uuidStr = strings.TrimSpace(d.StringValue())
+			if !isValidUUIDStr(uuidStr) {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type uuid: %q", d.StringValue())}
+			}
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as uuid", d.Kind)
+		}
+		return encodeVarlen([]byte(uuidStr)), nil
+
+	case "name":
+		// The "name" type silently truncates input to NAMEDATALEN-1 = 63 bytes,
+		// matching PostgreSQL's behaviour (postgres/src/include/pg_config_manual.h).
+		// M0097-0003.
+		var s string
+		switch d.Kind {
+		case KindString, KindStringArena:
+			s = d.StringValue()
+		case KindBytes, KindBytesArena:
+			s = string(d.BytesValue())
+		case KindInt:
+			s = fmt.Sprintf("%d", d.Int)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as name", d.Kind)
+		}
+		if len(s) > 63 {
+			s = s[:63]
+		}
+		return encodeVarlen([]byte(s)), nil
+
 	case "numeric", "decimal":
 		// NUMERIC values flow on the wire as decimal text in the
 		// same varlen frame VARCHAR uses. KindNumeric formats via
@@ -375,6 +431,27 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		return encodeVarlen([]byte(s)), nil
 	}
+}
+
+// isValidUUIDStr reports whether s is a valid UUID string in the
+// standard xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format.
+func isValidUUIDStr(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range []byte(s) {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func encodeVarlen(b []byte) []byte {

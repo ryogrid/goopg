@@ -615,13 +615,17 @@ M0097-0001 wires it up.
       5. `CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE`: parsed as CREATE TABLE.
       6. `SELECT;` (empty target list): returns 1 empty row.
       7. `schema != nil` dispatch: RowDescription sent for 0-column results.
-      Additional fixes (2026-05-12 loop 15):
+      Additional fixes (2026-05-12 loop 15+16):
       8. Lexer: binary (0b), octal (0o), hex (0x) integer literals; numeric _ separators.
       9. Parser: `parseIntLiteralExpr` handles overflow via NumericConst fallback.
       10. Normalization: "trailing junk after numeric literal" wording normalized.
+      11. `name` type: 63-byte truncation in encodeValue and evalTypedStringLit.
+      12. `oid`/`uuid` INSERT: isAssignable allows text→oid/uuid; encodeValue validates
+          string as oid (int64) or uuid format; ExecError propagated correctly from
+          writeHeapRowReturning (no longer wraps in XX000, preserving 22P02 SQLSTATE).
       Passing: `comments`. Still deferred: `numerology` (DO blocks, shared tables),
       `errors` (error msg wording), `boolean` (pg_input_error_info SRF),
-      `varchar`/`char` (varchar length enforcement).
+      `name`/`oid` (comparison semantics), `varchar`/`char` (varchar length enforcement).
       Original action:
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,

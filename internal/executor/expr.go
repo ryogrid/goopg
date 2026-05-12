@@ -666,8 +666,16 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		// Return as string — goopg v0 stores numerics as text.
 		return NewStringDatum(strings.TrimSpace(x.Value)), nil
 
-	case "text", "bpchar", "char", "varchar", "name":
+	case "text", "bpchar", "char", "varchar":
 		return NewStringDatum(x.Value), nil
+
+	case "name":
+		// name type truncates to NAMEDATALEN-1 = 63 bytes. M0097-0003.
+		s := x.Value
+		if len(s) > 63 {
+			s = s[:63]
+		}
+		return NewStringDatum(s), nil
 
 	case "oid":
 		n, err := strconv.ParseInt(strings.TrimSpace(x.Value), 10, 64)

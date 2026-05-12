@@ -1661,6 +1661,22 @@ func isAssignable(src, dst catalog.Type) bool {
 	if isStringTypeName(src.Name) && isExactNumericTextTarget(dst.Name) {
 		return true
 	}
+	// String literals are assignable to oid and uuid columns; the
+	// executor validates the value at runtime and gives a proper
+	// "invalid input syntax" error for malformed inputs. M0097-0003.
+	if isStringTypeName(src.Name) && isOidOrUUIDTarget(dst.Name) {
+		return true
+	}
+	return false
+}
+
+// isOidOrUUIDTarget reports whether dst is a column type whose codec
+// accepts string values by parsing them at runtime (oid, uuid).
+func isOidOrUUIDTarget(name string) bool {
+	switch strings.ToLower(name) {
+	case "oid", "uuid":
+		return true
+	}
 	return false
 }
 

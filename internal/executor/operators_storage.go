@@ -1748,6 +1748,12 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 
 	body, err := EncodeRow(cols, row)
 	if err != nil {
+		// Preserve ExecError (e.g. 22P02 for invalid input syntax) so the
+		// SQLSTATE and message reach the client unchanged. M0097-0003.
+		var ee *ExecError
+		if errors.As(err, &ee) {
+			return ptr, ee
+		}
 		return ptr, &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	tuple := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
