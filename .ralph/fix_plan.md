@@ -142,6 +142,11 @@ shape — no anomaly.
 
 ## M0094 — Replication E2E Completion & TAP Test Porting (D-003 / D-004)
 
+Operational note (2026-05-12):
+- Items that are blocked or can only be partially progressed due to missing goopg support must include blocker resolution within this milestone's scope.
+- For items that can move forward once blockers are resolved, do not mark them complete until the resolution is implemented and re-verified.
+- Only items that are impossible to resolve due to goopg's Go-implementation constraints or explicit design constraints may remain marked complete, and the reason must be documented.
+
 Milestone doc: `docs/milestones/0094-replication-e2e-and-tap-test-porting.md`
 
 Background: M0005 (streaming replication) and M0008 (logical replication) are
@@ -195,13 +200,18 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
       - `TestPort_Subscription026Stats` — pg_stat_subscription received_lsn + receipt time via wal.Subscriber
       CSV S-001/S-004/S-026 rows already present; markdown regenerated. All 3 tests pass.
 
-- [x] **M0094-0005** — Verified M0005 and M0008 DoD checklists (2026-05-11).
-      M0005: 5/6 DoD items met; written_lsn advancement after checkpoint is a
-      pre-existing gap (unrelated to M0094). Marked `complete` with known caveat.
-      M0008: all 8 DoD items met via M0094-0001/0002/0003/0004 work plus prior
-      M0008 implementation. Marked `complete`. `make ralph-state-guard` passes.
+- [ ] **M0094-0005** — Resolve remaining M0005 caveat, then re-verify M0005/M0008 DoD.
+      Open blocker: written_lsn advancement after checkpoint remains unresolved.
+      Action: close the written_lsn checkpoint advancement gap, rerun physical
+      replication and recovery verification, then update M0005 status without caveat.
+      M0008 re-verification remains required after the above fix.
 
 ## M0095 — Client-Tools TAP Test Porting (filed 2026-05-12)
+
+Operational note (2026-05-12):
+- Items that are blocked or can only be partially progressed due to missing goopg support must include blocker resolution within this milestone's scope.
+- For items that can move forward once blockers are resolved, do not mark them complete until the resolution is implemented and re-verified.
+- Only items that are impossible to resolve due to goopg's Go-implementation constraints or explicit design constraints may remain marked complete, and the reason must be documented.
 
 Goal: Port the 27-file client-tools-tap suite to Go and implement the
 missing engine features that currently hold ported scripts tests in a
@@ -220,7 +230,7 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
 
 ### Sub-milestones
 
-- [x] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
+- [ ] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
       `pg_walsummary/001` as Go tests in
       `internal/testport/client_tools_port_test.go`.
       Binary discovery: PATH first, then `postgres/local_install/bin`.
@@ -229,16 +239,20 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       `pg_checksums/002` adapted: option-validation sub-cases pass; enable/disable
       deferred (no pg_control).  CSV rows C-001/C-002/CD-001/WS-001 added;
       markdown regenerated. All 4 tests pass (2026-05-12).
+      Action: implement a goopg-compatible control metadata surface (or equivalent
+      compatibility path) so deferred pg_control-dependent checks can run.
 
-- [x] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
+- [ ] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
       as adapted Go test in `client_tools_port_test.go`.
       Basic SQL (CREATE TABLE, INSERT, VACUUM, CHECKPOINT) passes.
       WAL summarization (summarize_wal GUC, pg_available_wal_summaries(),
       pg_stat_io walsummarizer rows, pg_walsummary -i) deferred with explicit
       t.Skip blocker (goopg rejects unknown GUCs at startup; function not
       implemented). CSV row WS-002 added; markdown regenerated (2026-05-12).
+      Action: add summarize_wal compatibility (GUC + catalog/functions + CLI path)
+      and remove t.Skip blocker.
 
-- [x] **M0095-0003** — Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
+- [ ] **M0095-0003** — Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
       as adapted Go tests in `internal/testport/pgbasebackup_port_test.go`.
       010: --help/--version/options + no-pgdata + --compress=none:1/none+ PASS;
            backup execution SKIP (physical streaming).
@@ -250,6 +264,8 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       040: --help/--version/options + no-datadir/publisher/database PASS;
            subscriber setup SKIP.
       CSV rows BB-010..040 added; markdown regenerated (2026-05-12).
+       Action: implement missing replication/base-backup protocol paths so skipped
+       execution branches can run and be verified.
 
 - [x] **M0095-0004** — VACUUM/ANALYZE parenthesized syntax; OPERATOR(schema.op)
       desugar; LATERAL derived-table analyzer+planner fallback; ANY(array[]) → IN
@@ -282,6 +298,8 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       (returns ErrDatabaseNotFound for nonexistent DBs). Both tests PASS
       immediately after removing t.Skip.  D-005l (200_connstr) stays deferred:
       goopg is UTF8-only; LATIN1 encoding blocker remains.
+      Reason for keeping checked: UTF8-only is an explicit goopg design constraint,
+      so LATIN1 parity is out-of-scope unless that design premise itself changes.
       CSV: D-005d/e → port,yes (2026-05-12).
 
 - [x] **M0095-0008** — CLUSTER parser+executor stub + pg_class relnamespace fix.
@@ -296,6 +314,11 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       CSV: D-005j/k → port,yes (2026-05-12).
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
+
+Operational note (2026-05-12):
+- Items that are blocked or can only be partially progressed due to missing goopg support must include blocker resolution within this milestone's scope.
+- For items that can move forward once blockers are resolved, do not mark them complete until the resolution is implemented and re-verified.
+- Only items that are impossible to resolve due to goopg's Go-implementation constraints or explicit design constraints may remain marked complete, and the reason must be documented.
 
 Goal: Make all 21 READ-COMMITTED-targeted isolation specs listed in
 `docs/test-port/executable-isolation-tests.md` PASS via
@@ -369,7 +392,7 @@ alongside the suite.
       Verification: TestPort_IsolationLockCommittedUpdate runs 120s (blocking works,
       spec defers due to output format + connection timeout across permutations). (2026-05-12).
 
-- [x] **M0096-0005** — ON CONFLICT infrastructure: partial progress (2026-05-12).
+- [ ] **M0096-0005** — ON CONFLICT infrastructure: partial progress (2026-05-12).
       Landed:
       (a) CREATE TABLE now creates primary key btree index for inline `col type
           PRIMARY KEY` and table-level `PRIMARY KEY (cols)` — fixes 42P10 "no
@@ -389,7 +412,9 @@ alongside the suite.
       yet producing <waiting ...> lines. The blocking mechanism is wired but debugging
       of the exact WaitForXID trigger path is needed (XID propagation from ectx.Tx
       to connTxState may be incomplete). The insert-conflict-do-update and do-nothing
-      specs still defer. Re-open as follow-up if needed.
+      specs still defer.
+      Action: complete wait-state propagation and output parity so insert-conflict
+      specs can transition from defer to pass.
 
 - [x] **M0096-0006** — Unblocked `drop-index-concurrently-1` setup (2026-05-12).
       Features implemented:
@@ -457,7 +482,7 @@ alongside the suite.
       + DEFERRABLE INITIALLY DEFERRED queued in BasicSession, checked at execCommit.
       Design doc: 0096-0011-fk-enforcement.md.
 
-- [x] **M0096-0012** — Implement `CREATE TRIGGER … FOR EACH ROW EXECUTE
+- [ ] **M0096-0012** — Implement `CREATE TRIGGER … FOR EACH ROW EXECUTE
       FUNCTION/PROCEDURE` + PL/pgSQL trigger body execution.
       Unblocks: `eval-plan-qual-trigger`, `partition-key-update-4`,
       `fk-snapshot` (partially — RAISE NOTICE not yet interpolated).
@@ -468,8 +493,10 @@ alongside the suite.
       Executor: execCreateTrigger + BEFORE DELETE/INSERT trigger hooks +
       executePLpgSQLTriggerBody + substituteTriggerRefs.
       Design doc: 0096-0012-triggers.md.
+      Action: implement RAISE NOTICE interpolation/output compatibility needed by
+      remaining isolation specs.
 
-- [x] **M0096-0013** — End-to-end pass confirmation: run all 21 dedicated
+- [ ] **M0096-0013** — End-to-end pass confirmation: run all 21 dedicated
       test functions from M0096-0001, confirm every spec reports `pass`.
       Fix any remaining output-normalization or row-ordering mismatches.
 
@@ -490,8 +517,15 @@ alongside the suite.
       - RAISE NOTICE output: trigger functions produce no output (NOTICE is no-op).
       - Column alignment: `---+---` width varies between PostgreSQL and goopg.
       - EvalPlanQual: concurrent UPDATE re-evaluation not implemented.
+      Action: close the above blockers and rerun all 21 dedicated isolation tests
+      until every case reaches pass.
 
 ## M0097 — pg_regress Coverage: Feature Parity & Test Pass (filed 2026-05-12)
+
+Operational note (2026-05-12):
+- Items that are blocked or can only be partially progressed due to missing goopg support must include blocker resolution within this milestone's scope.
+- For items that can move forward once blockers are resolved, do not mark them complete until the resolution is implemented and re-verified.
+- Only items that are impossible to resolve due to goopg's Go-implementation constraints or explicit design constraints may remain marked complete, and the reason must be documented.
 
 Goal: Work through all **232** cases in `docs/test-port/upstream-regress-coverage.md`
 (all currently `defer`).  Each case either reaches `port` status (output
@@ -566,8 +600,10 @@ M0097-0001 wires it up.
         `stats_ext`, `stats_import`, `typed_table`, `memoize`,
         `without_overlaps`, `money`, `namespace`, `database`,
         `infinite_recurse`, `create_schema`, `create_misc` (20+)
+      Reason for keeping checked: these are explicit scope/design exclusions,
+      not unfinished parity items.
 
-- [x] **M0097-0003** — Core standalone + scalar type parity.
+- [ ] **M0097-0003** — Core standalone + scalar type parity.
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,
       `numeric`, `numeric_big`, `char`, `varchar`, `text`, `uuid`,
@@ -588,8 +624,10 @@ M0097-0001 wires it up.
       All `boolean`/`int2`/`int4`/`int8`/`float4`/`float8` tests run without
       hanging (previously timed out at 30-60s). Output still defers (further
       normalization and type-output format fixes needed in M0097-0005+).
+      Action: complete scalar output normalization and type-format compatibility
+      to promote deferred cases to port.
 
-- [x] **M0097-0004** — Date / time type parity.
+- [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
       `timetz`, `interval`, `horology`.
       Work: fill out date/time arithmetic operators, interval I/O,
@@ -601,8 +639,10 @@ M0097-0001 wires it up.
       millennium/microseconds/milliseconds/timezone). All date/time tests
       now run without hanging (date=0.07s, horology=0.08s, interval=0.09s,
       timestamp=0.35s). Output still defers (format/precision diffs).
+      Action: close remaining format/precision diffs and rerun date/time regress
+      cases until defer is removed.
 
-- [x] **M0097-0005** — Core SELECT + DML parity.
+- [ ] **M0097-0005** — Core SELECT + DML parity.
       Target tests: `select`, `select_distinct`, `select_distinct_on`,
       `select_having`, `select_implicit`, `select_into`, `insert`,
       `update`, `delete`, `returning`, `limit`, `union`, `errors`
@@ -622,6 +662,8 @@ M0097-0001 wires it up.
       Known issue: `update` test hangs (30s psql timeout) due to complex
       RANGE partition row-movement with multi-level hierarchies; left as
       known blocker for future work.
+      Action: resolve the RANGE partition row-movement update hang and remove
+      the remaining defer status from core SELECT/DML regress cases.
 
 - [x] **M0097-0006** — JOIN + subquery + CTE parity.
       Target tests: `join`, `join_hash`, `subselect`, `with`,
@@ -772,15 +814,12 @@ M0097-0001 wires it up.
       - pg_settings: updated with 21 enable_* parameters
       - Removed incorrect pg_type virtual table (heap-backed in initdb)
 
-- [x] **M0097-0019** — Final confirmation.  2026-05-12.
+- [ ] **M0097-0019** — Final confirmation.  2026-05-12.
       Regenerated `docs/test-port/upstream-regress-coverage.md` via
-      `go run ./cmd/gen-regress-coverage`. All 232 cases confirmed:
-      103 excluded (policy), 129 defer (execution parity deferred —
-      tests run without hanging, output diverges). No port-status entries
-      exist yet for regress suite (defer→port promotion requires exact
-      output match, deferred to a future milestone). All 41 oracle port
-      tests pass; all unit tests pass (parser/planner/executor/catalog/
-      server/initdb/analyzer). State: clean.
+      `go run ./cmd/gen-regress-coverage`. Current state:
+      103 excluded (policy), 129 defer (execution parity still pending).
+      Action: keep this open until deferred regress cases are promoted by
+      output/behavior parity fixes and pass-required status transitions.
 
 ## Notes
 
@@ -942,6 +981,53 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
          independent runs (< 5 % run-to-run variance).
       5. Commit result files and an M0098 summary `.md` to
          `bench/pgbench-compare/results/`.
+
+## M0099 — M0098 Remaining Work Closure & Target Validation (filed 2026-05-12)
+
+Milestone doc: `docs/milestones/0099-m0098-remaining-work-target-validation.md`
+
+Goal: close all unresolved items listed in
+`bench/pgbench-compare/results/m0098_final_summary.md` (Remaining Work), and
+verify whether TPS targets can be achieved when varying client/thread counts,
+while preserving the original `-c 100 -j 100` target-condition validation.
+
+### Sub-milestones
+
+- [ ] **M0099-0001** — Design and benchmark plan for remaining bottlenecks.
+      Produce design/benchmark plan docs for:
+      (a) buffer-pool pin fast-path lock contention (`evictMu`),
+      (b) WAL group commit batching policy (`commit_delay` / siblings behavior),
+      (c) deadlock-safe conflict waiting + 40001 rate reduction strategy.
+      Also define the pgbench measurement matrix and pass/fail criteria.
+
+- [ ] **M0099-0002** — Remove `evictMu` from Pin fast path.
+      Implement atomic pin-count handling (e.g., `atomic.Int32`) and redesign
+      lock ordering so common Pin/TryPin operations avoid global `evictMu`
+      serialization while preserving correctness and deadlock safety.
+
+- [ ] **M0099-0003** — Improve WAL group-commit batching effectiveness.
+      Add and validate commit-delay based batching controls (with sensible
+      defaults and guardrails) so concurrent commits coalesce into larger flush
+      batches under write-heavy workloads.
+
+- [ ] **M0099-0004** — Reduce conflict-abort rate without circular deadlocks.
+      Implement deadlock-safe waiting/retry behavior for conflicting updates,
+      with explicit deadlock detection/avoidance policy so 40001 abort rate in
+      standard pgbench workload is materially reduced from M0098 levels.
+
+- [ ] **M0099-0005** — Client/thread variation measurements and target check.
+      Run full pgbench suite (Standard, `-N`, `-S`) with at least the following
+      `(clients, threads)` matrix on scale 100:
+      `(10,10)`, `(25,25)`, `(50,50)`, `(100,100)`, `(150,150)`, `(200,200)`,
+      `(100,50)`, `(50,100)`.
+      For each point, capture TPS/latency/failures, and explicitly check whether
+      targets (`1500/1500/10000 TPS`) are reached.
+
+- [ ] **M0099-0006** — Final validation at canonical target condition.
+      Re-run at canonical condition `-c 100 -j 100 -T 180 -s 100` (cold + warm
+      where relevant), confirm final TPS vs targets, archive pprof for any
+      remaining gaps, and publish final summary under
+      `bench/pgbench-compare/results/`.
 
 ## Maintenance Fixes
 
