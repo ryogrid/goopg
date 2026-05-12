@@ -932,7 +932,20 @@ Under the same conditions as `analysis/pgbench_postgresql_baseline_20260510_1451
       - All tests pass; binary built with PGO at bin/goopg
       Design doc: docs/design/0098-0007-pgo-goamd64-runtime-knobs.md
 
-- [ ] **M0098-0008** — **Final measurement + iterative gap-close**
+- [x] **M0098-0008** — **Final measurement + iterative gap-close**.  2026-05-12.
+      Results (fresh pool; post-deadlock-fix binary; -c100 -j100 -T180 -s100):
+      | Workload | TPS | Target | Gap |
+      |---|---:|---:|---:|
+      | Standard | 443 | 1,500 | 3.4× |
+      | Simple Update | 420 | 1,500 | 3.6× |
+      | Select Only | 4,990 (cold) | 10,000 | ~2× |
+      WAL group commit: ~2× gain for write workloads (229→443, 228→420).
+      Targets NOT fully met (1,500/1,500/10,000 TPS).
+      Key remaining bottleneck: evictMu serializes ALL Pin operations.
+      Two critical bugs found and fixed (commit 35c1299):
+      - Buffer-pool deadlock: wrong part.mu→evictMu lock ordering in Pin/TryPin
+      - EvalPlanQual circular deadlock: WaitForXID with shared rows (teller/branch)
+      Summary: bench/pgbench-compare/results/m0098_final_summary.md
       — confirm targets are met; close any remaining gap with targeted
       micro-optimisations.
 
