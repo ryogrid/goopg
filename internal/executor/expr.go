@@ -554,7 +554,18 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		aIsString := a.Kind == KindString || a.Kind == KindStringArena
 		bIsString := b.Kind == KindString || b.Kind == KindStringArena
 		if aIsString && bIsString {
-			return strings.Compare(a.StringValue(), b.StringValue()), nil
+			as, bs := a.StringValue(), b.StringValue()
+			// UUID cross-format comparison: if either looks like a UUID in any format,
+			// normalize both to canonical form so hyphenated matches non-hyphenated. M0097-0003.
+			if isValidUUIDStr(as) || isValidUUIDStr(bs) {
+				if isValidUUIDStr(as) {
+					as = normalizeUUIDStr(as)
+				}
+				if isValidUUIDStr(bs) {
+					bs = normalizeUUIDStr(bs)
+				}
+			}
+			return strings.Compare(as, bs), nil
 		}
 		aIsBytes := a.Kind == KindBytes || a.Kind == KindBytesArena
 		bIsBytes := b.Kind == KindBytes || b.Kind == KindBytesArena
@@ -584,7 +595,17 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		}
 		return 0, nil
 	case KindString, KindStringArena:
-		return strings.Compare(a.StringValue(), b.StringValue()), nil
+		as, bs := a.StringValue(), b.StringValue()
+		// UUID cross-format comparison: normalize both if either is a valid UUID. M0097-0003.
+		if isValidUUIDStr(as) || isValidUUIDStr(bs) {
+			if isValidUUIDStr(as) {
+				as = normalizeUUIDStr(as)
+			}
+			if isValidUUIDStr(bs) {
+				bs = normalizeUUIDStr(bs)
+			}
+		}
+		return strings.Compare(as, bs), nil
 	case KindTime:
 		switch {
 		case a.TimeValue().Before(b.TimeValue()):

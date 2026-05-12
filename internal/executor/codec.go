@@ -544,7 +544,8 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		return encodeVarlen([]byte(strconv.FormatInt(n, 10))), nil
 
 	case "uuid":
-		// Uuid accepts string values; validate format at runtime. M0097-0003.
+		// Uuid accepts standard/brace/no-hyphen formats; normalizes to lowercase
+		// canonical xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx for storage. M0097-0003.
 		var uuidStr string
 		switch d.Kind {
 		case KindString, KindStringArena:
@@ -553,6 +554,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type uuid: %q", d.StringValue())}
 			}
+			uuidStr = normalizeUUIDStr(uuidStr)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as uuid", d.Kind)
 		}
@@ -623,9 +625,25 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 	}
 }
 
-// isValidUUIDStr reports whether s is a valid UUID string in the
-// standard xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format.
+// isValidUUIDStr reports whether s is a valid UUID string in any of
+// PostgreSQL's accepted formats:
+//   - Standard: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars)
+//   - Braces:   {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} (38 chars)
+//   - No-hyphen: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (32 hex chars)
+// M0097-0003.
 func isValidUUIDStr(s string) bool {
+	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
+		s = s[1:37] // strip braces
+	}
+	if len(s) == 32 {
+		// No-hyphen: all must be hex.
+		for _, c := range []byte(s) {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+		return true
+	}
 	if len(s) != 36 {
 		return false
 	}
@@ -642,6 +660,20 @@ func isValidUUIDStr(s string) bool {
 		}
 	}
 	return true
+}
+
+// normalizeUUIDStr converts a UUID in any accepted format to the canonical
+// lowercase xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format. M0097-0003.
+func normalizeUUIDStr(s string) string {
+	s = strings.ToLower(s)
+	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
+		s = s[1:37]
+	}
+	if len(s) == 32 {
+		// No-hyphen: insert hyphens at 8, 12, 16, 20.
+		return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
+	}
+	return s
 }
 
 func encodeVarlen(b []byte) []byte {

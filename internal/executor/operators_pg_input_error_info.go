@@ -118,6 +118,12 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = errMsg
 			sqlCode = "22P02"
 		}
+	case "uuid":
+		// uuid: validate format. M0097-0003.
+		if !isValidUUIDStr(v) {
+			message = "invalid input syntax for type uuid: \"" + v + "\""
+			sqlCode = "22P02"
+		}
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)

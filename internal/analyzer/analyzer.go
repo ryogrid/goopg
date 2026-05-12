@@ -1571,6 +1571,17 @@ func isComparable(left, right catalog.Type) bool {
 	if isTimestampLike(left) && isTimestampLike(right) {
 		return true
 	}
+	// uuid, name, oid and other text-backed types are comparable with text/varchar. M0097-0003.
+	isTextBacked := func(t catalog.Type) bool {
+		switch strings.ToLower(t.Name) {
+		case "uuid", "name", "oid", "oidvector", "int2vector", "pg_lsn":
+			return true
+		}
+		return false
+	}
+	if (isTextBacked(left) || isStringTypeName(left.Name)) && (isTextBacked(right) || isStringTypeName(right.Name)) {
+		return true
+	}
 	return false
 }
 
