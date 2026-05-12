@@ -672,10 +672,16 @@ M0097-0001 wires it up.
       37. resolveExprAfterAggregate(): use source binding for table-qualified error messages.
       38. parserExprKey ColumnRef: strip table/schema qualifier for GROUP BY key matching.
       39. dispatch.go DataRow: pad char(N)/bpchar(N) output to N bytes for correct width.
+      Loop 10 additions (2026-05-13):
+      40. Constant-degenerate-aggregate optimization: SELECT const FROM t WHERE expr
+          HAVING const_true skips table scan (isConstantPlanExpr/evalConstantBool helpers).
+      41. Function-style type casts: int4(x), float8(x), int2(x), text(x) etc. in evalFuncCall.
+      42. float8/float4 decoded as KindNumeric (not KindString) for correct ORDER BY numeric sort.
       Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
-      `reindex_catalog`, `delete`, `oid`, `select_implicit`.
-      Still deferred: select_having (7 diff: WHERE 1/a=1 constant-aggregate optimization),
-      int8, float4/float8 (NaN/Infinity), char/varchar (TEMP TABLE shadowing), others.
+      `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`.
+      Still deferred: int8 (overflow + float8 format), float4/float8 (NaN/Infinity),
+      char/varchar (TEMP TABLE shadowing), name (case comparison), numerology
+      (underscore decimal literals, float scientific notation), others.
       Action: continue fixing remaining scalar type parity issues to promote more
       tests from defer to port.
 
