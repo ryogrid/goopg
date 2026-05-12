@@ -695,11 +695,15 @@ M0097-0001 wires it up.
       50. TEMP TABLE permanent restore: TempTableShadows in executor.Context (per-connection via
           connTxState). CREATE TEMP TABLE saves permanent *Table; DROP TABLE restores it via
           catalog.InMemory.RegisterTable().
+      Loop 13 additions (2026-05-13):
+      51. "char" internal type: charTypeParseOctalEscape + charTypeDisplayForm.
+          char test now passes. Total: 12 tests passing.
+      52. name type comparison: planner truncates to 63 chars when comparing with name columns.
+      53. Tilde '~' lexer fix: POSIX regex queries now work. name: 130→67 diff lines.
       Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
-      `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`, `varchar`.
-      Still deferred: char (6 diffs: "char" internal type octal escape '\101'→'A'), int8,
-      float4/float8, name, numerology, others.
-      Action: fix "char" (internal 1-byte type) octal escape handling to flip char test to pass.
+      `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`, `varchar`, `char`.
+      Still deferred: name (67 diffs: parse_ident not implemented), int8, numerology, others.
+      Action: continue M0097-0003; next: implement parse_ident or fix other close tests.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
