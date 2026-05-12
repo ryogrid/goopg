@@ -1359,19 +1359,40 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 		innerCtx.rels = rels
 	}
 	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
-	for i, tgt := range rv.Subquery.Targets {
+	for _, tgt := range rv.Subquery.Targets {
+		// Star expression in inner SELECT (e.g. TABLE tablename → SELECT * FROM tablename).
+		// Expand to all columns from the inner scope. M0097-0003.
+		if _, ok := tgt.Expr.(*parser.StarExpr); ok {
+			for _, rel := range innerCtx.rels {
+				for _, col := range rel.table.Columns {
+					cols = append(cols, catalog.Column{Name: col.Name, Type: col.Type})
+				}
+			}
+			continue
+		}
 		name := tgt.Alias
 		if name == "" {
 			name = deriveAnalyzerTargetName(tgt.Expr)
 		}
 		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+			name = fmt.Sprintf("?column?%d", len(cols)+1)
 		}
 		typ, err := analyzeExpr(tgt.Expr, innerCtx)
 		if err != nil {
 			return nil, err
 		}
 		cols = append(cols, catalog.Column{Name: name, Type: typ})
+	}
+	// Validate and apply explicit column aliases (rv.Columns). M0097-0003.
+	if len(rv.Columns) > 0 {
+		if len(rv.Columns) != len(cols) {
+			return nil, analyzeError(rv.Pos(), "42P01",
+				fmt.Sprintf("table %q has %d columns available but %d columns specified",
+					rv.Alias, len(cols), len(rv.Columns)))
+		}
+		for i := range cols {
+			cols[i].Name = rv.Columns[i]
+		}
 	}
 	return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
 }
