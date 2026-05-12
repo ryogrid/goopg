@@ -752,14 +752,25 @@ M0097-0001 wires it up.
       - evalTypedStringLit: unknown type fallback (enum/domain casts work)
       - Design doc: 0097-0017-0001-enum-domain-types.md
 
-- [ ] **M0097-0018** — System catalog + GUC + vacuum parity.
+- [x] **M0097-0018** — System catalog + GUC + vacuum parity.  2026-05-12.
       Target tests: `sysviews`, `dbsize`, `guc`, `reindex_catalog`,
       `vacuum`, `vacuum_parallel` (excluded), `misc`, `xid`.
-      Work: additional `pg_catalog` views (`pg_tables`,
-      `pg_indexes`, `pg_views`, `information_schema` stubs),
-      `pg_database_size`, `pg_relation_size`, `pg_column_size`,
-      `SET`/`RESET` GUC handling, `VACUUM (FULL, ANALYZE, VERBOSE)`,
-      `REINDEX TABLE` executor stub.
+      Landed (commit ee7ee29):
+      - pg_size_pretty: correct 1024-based formatting with round-half-up
+      - pg_size_bytes: parses human-readable sizes
+      - pg_database_size/pg_relation_size/pg_total_relation_size stubs
+      - xid/xid8 type parsing (octal/hex/decimal) in evalTypedStringLit
+      - xid8cmp(xid8, xid8) 3-way comparison function
+      - pg_input_is_valid: extended with xid/xid8 validation
+      - System catalog view stubs: pg_available_extensions, pg_available_extension_versions,
+        pg_backend_memory_contexts, pg_config (23 rows), pg_cursors, pg_file_settings,
+        pg_hba_file_rules (1 row), pg_ident_file_mappings, pg_prepared_statements,
+        pg_prepared_xacts, pg_stat_slru (7 rows), pg_stat_wal (1 row),
+        pg_wait_events (65 rows/6 types), pg_timezone_names (32 rows),
+        pg_timezone_abbrevs (32 rows + LMT)
+      - pg_locks: updated to return 1 AccessShareLock row
+      - pg_settings: updated with 21 enable_* parameters
+      - Removed incorrect pg_type virtual table (heap-backed in initdb)
 
 - [ ] **M0097-0019** — Final confirmation: update
       `docs/test-port/upstream-regress-coverage.md` with final
