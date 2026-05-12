@@ -177,6 +177,11 @@ func decodeRowProjectionArena(dst Row, cols []catalog.Column, data []byte, keep 
 // (M0054-0005c-followup.)
 func decodeValueSize(t catalog.Type, data []byte) (int, error) {
 	switch t.Name {
+	case "int2", "smallint":
+		if len(data) < 2 {
+			return 0, fmt.Errorf("truncated int2")
+		}
+		return 2, nil
 	case "int4", "integer", "int":
 		if len(data) < 4 {
 			return 0, fmt.Errorf("truncated int4")
@@ -348,32 +353,29 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		binary.BigEndian.PutUint64(buf[:], uint64(v))
 		return buf[:], nil
 	case "int2", "smallint":
-		// int2 (smallint): range -32768..32767. Stored as varlen text for
-		// v0 codec compatibility; validates at insert time. M0097-0003.
-		var s string
+		// int2 (smallint): stored as 2-byte big-endian int16. M0097-0003.
+		var v int64
 		switch d.Kind {
 		case KindInt:
-			if d.Int < -32768 || d.Int > 32767 {
-				return nil, &ExecError{Code: "22003",
-					Message: fmt.Sprintf("value \"%d\" is out of range for type smallint", d.Int)}
-			}
-			s = strconv.FormatInt(d.Int, 10)
+			v = d.Int
 		case KindString, KindStringArena:
-			raw := strings.TrimSpace(d.StringValue())
-			v, err := strconv.ParseInt(raw, 10, 64)
+			var err error
+			v, err = coerceStringToInt64(d.StringValue(), "smallint")
 			if err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type smallint: %q", d.StringValue())}
+				return nil, err
 			}
-			if v < -32768 || v > 32767 {
-				return nil, &ExecError{Code: "22003",
-					Message: fmt.Sprintf("value \"%s\" is out of range for type smallint", raw)}
-			}
-			s = strconv.FormatInt(v, 10)
+		case KindNumeric:
+			v = d.NumericMantissaValue()
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as smallint", d.Kind)
 		}
-		return encodeVarlen([]byte(s)), nil
+		if v < -32768 || v > 32767 {
+			return nil, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value \"%d\" is out of range for type smallint", v)}
+		}
+		var buf [2]byte
+		binary.BigEndian.PutUint16(buf[:], uint16(int16(v)))
+		return buf[:], nil
 
 	case "float4", "real":
 		// float4 stored as varlen text for v0 compatibility. M0097-0003.
@@ -568,6 +570,12 @@ func encodeVarlen(b []byte) []byte {
 
 func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 	switch t.Name {
+	case "int2", "smallint":
+		if len(data) < 2 {
+			return Datum{}, 0, fmt.Errorf("truncated int2")
+		}
+		v := int16(binary.BigEndian.Uint16(data[:2]))
+		return Datum{Kind: KindInt, Int: int64(v)}, 2, nil
 	case "int4", "integer", "int":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated int4")
@@ -641,6 +649,12 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 // per-page seqScan / per-Rescan indexScan path opts in.
 func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, error) {
 	switch t.Name {
+	case "int2", "smallint":
+		if len(data) < 2 {
+			return Datum{}, 0, fmt.Errorf("truncated int2")
+		}
+		v := int16(binary.BigEndian.Uint16(data[:2]))
+		return Datum{Kind: KindInt, Int: int64(v)}, 2, nil
 	case "int4", "integer", "int":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated int4")
