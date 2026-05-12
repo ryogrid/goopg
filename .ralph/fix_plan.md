@@ -706,11 +706,20 @@ M0097-0001 wires it up.
       56. DO block: DoStmt AST, parseDoBlock() parser, planner routing, execDoBlock() DDL.
           plpgsql/parser.go: array type (text[]) in DECLARE sections.
           Normalizer: drop DO-block-unsupported errors. name: 37 diff lines.
-      Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
-      `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`, `varchar`, `char`.
-      Still deferred: name (37 diffs: format('%I') + r[1] array subscript for DO block NOTICEs),
-      int8, numerology, others.
-      Action: implement format('%I') and plpgsql array subscript to complete name DO block.
+      Loop 15 additions (2026-05-13):
+      57. '=>' named function args parser (fixes parse_ident strict=>false case).
+      58. '::name[]' cast: parser consumes [] suffix; evalCast truncates each array element.
+      59. parseIdentString: raw string format (not %q), correct DETAIL before/after dot.
+      60. format(): proper %I/%L/%s/%% implementation; pgQuoteIdent/parseTextArray helpers.
+      61. evalRaiseMsg(): evaluate RAISE format args with plpgsql var substitution.
+      62. substitutePlpgsqlArraySubscripts(): replace varname[N] with literal values.
+      63. execDoBlock(): direct parent-context execution (NOTICEs propagate).
+      64. targetMeta: FuncCall operand in CastExpr → propagate function name as column.
+      name: 37→18 diff lines. DO block partially working (RAISE NOTICE still not emitting).
+      Passing tests (confirmed 2026-05-13): same 12 tests.
+      Still deferred: name (18 diffs: RAISE NOTICE not emitting + length(a[1]) SRF),
+      int8, numerology, functional_deps, others.
+      Action: debug RAISE NOTICE emission in DO block (trace why ctx.AddNotice not working).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
