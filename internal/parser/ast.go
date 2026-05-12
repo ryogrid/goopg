@@ -825,7 +825,8 @@ type PartitionByClause struct {
 }
 
 // PartitionOfClause describes a PARTITION OF parent FOR VALUES … clause.
-// Only one of InValues, FromValues+ToValues is populated.  M0096-0007.
+// Only one of InValues, FromValues+ToValues, or Modulus+Remainder is populated.
+// M0096-0007; HASH bounds added M0097-0015.
 type PartitionOfClause struct {
 	pos      int
 	Parent   ObjectName
@@ -835,6 +836,10 @@ type PartitionOfClause struct {
 	FromValues []Expr
 	ToValues   []Expr
 	Default    bool // FOR VALUES DEFAULT
+	// HASH partitioning: FOR VALUES WITH (MODULUS n, REMAINDER r)
+	Modulus   int64
+	Remainder int64
+	IsHash    bool
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]

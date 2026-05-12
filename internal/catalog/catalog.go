@@ -171,11 +171,14 @@ type ForeignKey struct {
 // PartitionBound describes the bounds for a single partition child.
 // For LIST partitioning, InValues contains the literal string values.
 // For RANGE partitioning, From and To contain the bound strings ("MINVALUE", "MAXVALUE", or a literal).
-// M0096-0007.
+// For HASH partitioning, Modulus and Remainder specify the hash bucket. M0096-0007; HASH M0097-0015.
 type PartitionBound struct {
-	InValues []string // LIST: values in this partition
-	From     string   // RANGE: lower bound
-	To       string   // RANGE: upper bound
+	InValues  []string // LIST: values in this partition
+	From      string   // RANGE: lower bound
+	To        string   // RANGE: upper bound
+	Modulus   int64    // HASH: modulus
+	Remainder int64    // HASH: remainder (partition index)
+	IsHash    bool     // true for HASH partitions
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -464,6 +467,34 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 				}
 				if keyValue >= from && keyValue < to {
 					return t
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// FindHashPartitionForValue finds the HASH partition child that owns the given
+// key value's hash bucket. Uses a simple FNV-inspired hash. M0097-0015.
+func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Compute a simple hash of the key value.
+	h := uint64(14695981039346656037)
+	for _, b := range []byte(keyValue) {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.IsHash && pb.Modulus > 0 {
+					if int64(h%uint64(pb.Modulus)) == pb.Remainder {
+						return t
+					}
 				}
 			}
 		}

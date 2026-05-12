@@ -486,11 +486,18 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 
 	// Build partition bounds from the FOR VALUES clause.
 	var pb catalog.PartitionBound
-	if len(poc.InValues) > 0 {
+	if poc.IsHash {
+		// HASH partition: MODULUS + REMAINDER. M0097-0015.
+		pb.IsHash = true
+		pb.Modulus = poc.Modulus
+		pb.Remainder = poc.Remainder
+		tbl.PartitionBounds = []catalog.PartitionBound{pb}
+	} else if len(poc.InValues) > 0 {
 		// LIST partition: evaluate each IN value as a string.
 		for _, e := range poc.InValues {
 			pb.InValues = append(pb.InValues, exprToString(e))
 		}
+		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	} else if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
 		// RANGE partition.
 		if len(poc.FromValues) > 0 {
@@ -499,8 +506,6 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		if len(poc.ToValues) > 0 {
 			pb.To = exprToString(poc.ToValues[0])
 		}
-	}
-	if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	}
 
@@ -778,19 +783,26 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			childTbl.PartitionParentOID = tbl.OID
 			childTbl.PartitionMethod = tbl.PartitionMethod
 			childTbl.PartitionKey = tbl.PartitionKey
-			// Build partition bounds.
+			// Build partition bounds. M0097-0015 adds HASH.
 			var pb catalog.PartitionBound
-			for _, e := range poc.InValues {
-				pb.InValues = append(pb.InValues, exprToString(e))
-			}
-			if len(poc.FromValues) > 0 {
-				pb.From = exprToString(poc.FromValues[0])
-			}
-			if len(poc.ToValues) > 0 {
-				pb.To = exprToString(poc.ToValues[0])
-			}
-			if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
+			if poc.IsHash {
+				pb.IsHash = true
+				pb.Modulus = poc.Modulus
+				pb.Remainder = poc.Remainder
 				childTbl.PartitionBounds = []catalog.PartitionBound{pb}
+			} else {
+				for _, e := range poc.InValues {
+					pb.InValues = append(pb.InValues, exprToString(e))
+				}
+				if len(poc.FromValues) > 0 {
+					pb.From = exprToString(poc.FromValues[0])
+				}
+				if len(poc.ToValues) > 0 {
+					pb.To = exprToString(poc.ToValues[0])
+				}
+				if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
+					childTbl.PartitionBounds = []catalog.PartitionBound{pb}
+				}
 			}
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				im.RegisterPartitionChild(tbl.OID, childTbl.OID)

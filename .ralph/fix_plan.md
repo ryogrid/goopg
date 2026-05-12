@@ -714,7 +714,7 @@ M0097-0001 wires it up.
       `INSTEAD OF` trigger types, inheritance scan + INSERT routing,
       `CREATE TABLE … INHERITS`.
 
-- [ ] **M0097-0015** — Partitioned tables parity.
+- [x] **M0097-0015** — Partitioned tables parity.
       Target tests: `partition_prune`, `partition_join`,
       `partition_aggregate`, `partition_info`, `hash_part`.
       Work: `CREATE TABLE … PARTITION BY LIST/RANGE/HASH`,

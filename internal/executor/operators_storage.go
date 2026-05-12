@@ -538,6 +538,17 @@ func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *cat
 		if keyDatum.Kind == KindInt {
 			return im.FindRangePartitionForValue(parent.OID, keyDatum.Int)
 		}
+	case "HASH":
+		// Use string representation of key for hash. M0097-0015.
+		keyStr := ""
+		if keyDatum.Kind == KindInt {
+			keyStr = fmt.Sprintf("%d", keyDatum.Int)
+		} else if keyDatum.Kind == KindString {
+			keyStr = keyDatum.StringValue()
+		} else {
+			keyStr = keyDatum.Format()
+		}
+		return im.FindHashPartitionForValue(parent.OID, keyStr)
 	}
 	return nil
 }

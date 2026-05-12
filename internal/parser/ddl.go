@@ -421,6 +421,36 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')'")
 				}
+			} else if p.acceptKeyword(KwWith) {
+				// HASH partitioning: FOR VALUES WITH (MODULUS n, REMAINDER r). M0097-0015.
+				if !p.acceptSymbol("(") {
+					return nil, p.errAtCur("expected '(' after WITH")
+				}
+				poc.IsHash = true
+				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					if p.acceptIdentKeyword("modulus") {
+						if t := p.cur(); t.Kind == TokenIntLit {
+							p.advance()
+							n := int64(0)
+							for _, c := range t.Value {
+								n = n*10 + int64(c-'0')
+							}
+							poc.Modulus = n
+						}
+					} else if p.acceptIdentKeyword("remainder") {
+						if t := p.cur(); t.Kind == TokenIntLit {
+							p.advance()
+							n := int64(0)
+							for _, c := range t.Value {
+								n = n*10 + int64(c-'0')
+							}
+							poc.Remainder = n
+						}
+					} else {
+						p.advance()
+					}
+					_ = p.acceptSymbol(",")
+				}
 			} else if p.acceptIdentKeyword("from") {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after FROM")
@@ -604,9 +634,21 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after partition method")
 		}
-		keyCols, err := p.parseColumnNameList()
-		if err != nil {
-			return nil, err
+		// Parse column names, skipping optional operator class names. M0097-0015.
+		var keyCols []string
+		for {
+			col, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			keyCols = append(keyCols, identText(col))
+			// Optional operator class name (e.g. part_test_int4_ops) — skip it.
+			if p.cur().Kind == TokenIdent {
+				p.advance() // operator class name
+			}
+			if !p.acceptSymbol(",") {
+				break
+			}
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
@@ -1547,6 +1589,29 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			}
 			if p.acceptKeyword(KwDefault) || p.acceptIdentKeyword("default") {
 				poc.Default = true
+			} else if p.acceptKeyword(KwWith) {
+				// HASH: WITH (MODULUS n, REMAINDER r). M0097-0015.
+				if p.acceptSymbol("(") {
+					poc.IsHash = true
+					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						if p.acceptIdentKeyword("modulus") {
+							if t := p.cur(); t.Kind == TokenIntLit {
+								p.advance()
+								n := int64(0)
+								for _, c := range t.Value { n = n*10 + int64(c-'0') }
+								poc.Modulus = n
+							}
+						} else if p.acceptIdentKeyword("remainder") {
+							if t := p.cur(); t.Kind == TokenIntLit {
+								p.advance()
+								n := int64(0)
+								for _, c := range t.Value { n = n*10 + int64(c-'0') }
+								poc.Remainder = n
+							}
+						} else { p.advance() }
+						_ = p.acceptSymbol(",")
+					}
+				}
 			} else if p.acceptKeyword(KwIn) {
 				if !p.acceptSymbol("(") {
 					return AlterTableAction{}, p.errAtCur("expected '(' after IN")

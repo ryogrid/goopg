@@ -1856,6 +1856,26 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// SRF returning sequence parameters — stub returns NULL.
 		return NullDatum, nil
 
+	// ── Partition metadata functions (M0097-0015) ─────────────────────────
+	case "pg_partition_tree", "pg_partition_ancestors":
+		// SRF returning partition hierarchy — stub returns NULL (no rows). M0097-0015.
+		return NullDatum, nil
+	case "pg_partition_root":
+		// pg_partition_root(relid) → regclass — returns the root of the partition tree.
+		// Stub: return the input itself (assume root). M0097-0015.
+		if len(x.Args) == 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			return v, nil
+		}
+		return NullDatum, nil
+	case "satisfies_hash_partition":
+		// satisfies_hash_partition(tableoid, modulus, remainder, val...) → bool
+		// Stub: return false. M0097-0015.
+		return NewBoolDatum(false), nil
+
 	// ── Function introspection stubs (M0097-0012) ─────────────────────────
 	case "pg_get_functiondef":
 		// pg_get_functiondef(func_oid) → text — returns function DDL.
