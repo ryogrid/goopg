@@ -976,6 +976,8 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 		return ColumnType{}, err
 	}
 	ct := ColumnType{pos: pos, Name: identText(first)}
+
+	// Schema-qualified type: e.g. pg_catalog.int4
 	if p.acceptSymbol(".") {
 		second, err := p.parseIdent()
 		if err != nil {
@@ -983,6 +985,43 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 		}
 		ct.Schema = ct.Name
 		ct.Name = identText(second)
+	} else {
+		// Handle multi-word type names: double precision, character varying,
+		// timestamp/time with/without time zone, bit varying, etc.
+		switch strings.ToLower(ct.Name) {
+		case "double":
+			if p.acceptIdentKeyword("precision") {
+				ct.Name = "float8"
+			}
+		case "character":
+			if p.acceptIdentKeyword("varying") {
+				ct.Name = "varchar"
+			}
+		case "bit":
+			if p.acceptIdentKeyword("varying") {
+				ct.Name = "varbit"
+			}
+		case "timestamp":
+			if p.acceptIdentKeyword("with") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timestamptz"
+			} else if p.acceptIdentKeyword("without") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timestamp"
+			}
+		case "time":
+			if p.acceptIdentKeyword("with") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timetz"
+			} else if p.acceptIdentKeyword("without") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "time"
+			}
+		}
 	}
 	if p.acceptSymbol("(") {
 		for {
