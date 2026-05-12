@@ -4,6 +4,12 @@
 **Depends on:** M0005 (streaming replication), M0008 (logical replication)
 **Blocks:** D-003 (recovery TAP suite), D-004 (subscription TAP suite)
 
+## 運用追記 (2026-05-12)
+
+- blocker の存在や goopg 未対応で途中までしか進められない項目は、blocker 解消までを本マイルストーンの実施範囲に含める。
+- blocker 解消により先に進める項目は、解消実装と再検証が完了するまで完了扱いにしない。
+- goopg の Go 言語実装制約または設計上の制約で解消不可能な項目のみ、理由明記のうえ完了扱いを維持する。
+
 ## Context
 
 Streaming replication (M0005) and logical replication (M0008) are substantially
