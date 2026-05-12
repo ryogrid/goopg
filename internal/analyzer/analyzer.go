@@ -1642,23 +1642,18 @@ func isAssignable(src, dst catalog.Type) bool {
 	if isBooleanTypeName(src.Name) && isBooleanTypeName(dst.Name) {
 		return true
 	}
-	// HammerDB and other tools (DBI / TCL pg_exec) pass every
-	// VALUES literal as a single-quoted string, including for
-	// NUMERIC columns: `INSERT INTO t (n) VALUES ('123')`.
-	// Upstream PG accepts this because bare string literals are
-	// typed `unknown` until inferred at the assignment site;
-	// goopg types them as `text` and instead recovers
-	// compatibility here. The executor's NUMERIC codec already
-	// stores string datums verbatim (see
-	// docs/design/0003-0004-hammerdb-tpch-integration.md), so
-	// the round-trip is lossless.
+	// Upstream PG accepts bare string literals ('123') for any column type
+	// because literals are typed `unknown` until inferred at the assignment
+	// site. goopg types them as `text` and recovers compatibility by
+	// allowing text → numeric, integer, and float column types. The executor
+	// validates and converts the value at runtime, giving a proper
+	// "invalid input syntax" (22P02) error for malformed inputs.
 	//
-	// Scope is intentionally narrow: only NUMERIC / DECIMAL
-	// columns. string→int4/int8 stays an error because the
-	// integer codec can't accept text — the existing analyzer
-	// test pinning `INSERT INTO pgbench_accounts (aid) VALUES
-	// ('x')` as 42804 still passes.
-	if isStringTypeName(src.Name) && isExactNumericTextTarget(dst.Name) {
+	// This enables test_setup.sql INSERTs like:
+	//   INSERT INTO INT2_TBL(f1) VALUES ('1234'), ('-1234');
+	// to populate the shared tables needed by int2/int4/int8/float tests.
+	// M0097-0003.
+	if isStringTypeName(src.Name) && isNumericOrIntegerTarget(dst.Name) {
 		return true
 	}
 	// String literals are assignable to oid and uuid columns; the
@@ -1680,10 +1675,27 @@ func isOidOrUUIDTarget(name string) bool {
 	return false
 }
 
+// isNumericOrIntegerTarget reports whether dst is a numeric, integer,
+// or float column type that can accept string literals at runtime.
+// Used by isAssignable. M0097-0003.
+func isNumericOrIntegerTarget(name string) bool {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal",
+		"int2", "smallint",
+		"int4", "integer", "int",
+		"int8", "bigint",
+		"float4", "real",
+		"float8", "double precision", "double":
+		return true
+	}
+	return false
+}
+
 // isExactNumericTextTarget reports whether dst is a column type
 // whose v0 codec accepts string datums (NUMERIC / DECIMAL). Used
 // by isAssignable to permit the HammerDB-shape INSERT pattern
 // without weakening the assignment check for integer columns.
+// Deprecated: use isNumericOrIntegerTarget which covers more types.
 func isExactNumericTextTarget(name string) bool {
 	switch strings.ToLower(name) {
 	case "numeric", "decimal":

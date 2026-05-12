@@ -620,12 +620,18 @@ M0097-0001 wires it up.
       9. Parser: `parseIntLiteralExpr` handles overflow via NumericConst fallback.
       10. Normalization: "trailing junk after numeric literal" wording normalized.
       11. `name` type: 63-byte truncation in encodeValue and evalTypedStringLit.
-      12. `oid`/`uuid` INSERT: isAssignable allows text→oid/uuid; encodeValue validates
-          string as oid (int64) or uuid format; ExecError propagated correctly from
-          writeHeapRowReturning (no longer wraps in XX000, preserving 22P02 SQLSTATE).
-      Passing: `comments`. Still deferred: `numerology` (DO blocks, shared tables),
-      `errors` (error msg wording), `boolean` (pg_input_error_info SRF),
-      `name`/`oid` (comparison semantics), `varchar`/`char` (varchar length enforcement).
+      12. `oid`/`uuid` INSERT: isAssignable allows text→oid/uuid; encodeValue validates.
+      13. text→int2/int4/int8/float4/float8 coercion in INSERT/UPDATE: isAssignable now
+          allows string → any numeric/integer type (runtime validation via encodeValue).
+          This populates shared tables (INT2_TBL, INT4_TBL, INT8_TBL, FLOAT8_TBL)
+          from test_setup.sql, enabling int2/int4/int8/float4/float8 regress tests.
+      14. int2/smallint encodeValue case: validates range -32768..32767.
+      15. float4/float8 encodeValue cases: validates float syntax.
+      16. TypeOID fixes: int2(21), float4(700), float8(701), oid(26), name(19),
+          uuid(2950), date(1082), time(1083), timetz(1266), interval(1186).
+      17. pg_input_is_valid: extended for int2, int4, int8, float4, float8, oid, uuid.
+      Passing: `comments`. Still deferred: shared tables populated but column alignment
+      and SRF functions (pg_input_error_info) prevent tests from passing.
       Original action:
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,

@@ -294,22 +294,127 @@ func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Aren
 	return nil
 }
 
+// coerceStringToInt64 parses a trimmed string as int64, returning a proper
+// 22P02 ExecError for invalid inputs. Used by encodeValue when a string
+// datum is being stored in an integer column. M0097-0003.
+func coerceStringToInt64(s, typeName string) (int64, error) {
+	s = strings.TrimSpace(s)
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type %s: %q", typeName, s)}
+	}
+	return v, nil
+}
+
 func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 	switch t.Name {
 	case "int4", "integer", "int":
-		if d.Kind != KindInt {
+		var v int64
+		switch d.Kind {
+		case KindInt:
+			v = d.Int
+		case KindString, KindStringArena:
+			var err error
+			v, err = coerceStringToInt64(d.StringValue(), "integer")
+			if err != nil {
+				return nil, err
+			}
+			if v < -2147483648 || v > 2147483647 {
+				return nil, &ExecError{Code: "22003",
+					Message: fmt.Sprintf("value %q is out of range for type integer", strings.TrimSpace(d.StringValue()))}
+			}
+		default:
 			return nil, fmt.Errorf("expected int for %s, got kind %d", t.Name, d.Kind)
 		}
 		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], uint32(int32(d.Int)))
+		binary.BigEndian.PutUint32(buf[:], uint32(int32(v)))
 		return buf[:], nil
 	case "int8", "bigint":
-		if d.Kind != KindInt {
+		var v int64
+		switch d.Kind {
+		case KindInt:
+			v = d.Int
+		case KindString, KindStringArena:
+			var err error
+			v, err = coerceStringToInt64(d.StringValue(), "bigint")
+			if err != nil {
+				return nil, err
+			}
+		default:
 			return nil, fmt.Errorf("expected int for %s, got kind %d", t.Name, d.Kind)
 		}
 		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(d.Int))
+		binary.BigEndian.PutUint64(buf[:], uint64(v))
 		return buf[:], nil
+	case "int2", "smallint":
+		// int2 (smallint): range -32768..32767. Stored as varlen text for
+		// v0 codec compatibility; validates at insert time. M0097-0003.
+		var s string
+		switch d.Kind {
+		case KindInt:
+			if d.Int < -32768 || d.Int > 32767 {
+				return nil, &ExecError{Code: "22003",
+					Message: fmt.Sprintf("value \"%d\" is out of range for type smallint", d.Int)}
+			}
+			s = strconv.FormatInt(d.Int, 10)
+		case KindString, KindStringArena:
+			raw := strings.TrimSpace(d.StringValue())
+			v, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type smallint: %q", d.StringValue())}
+			}
+			if v < -32768 || v > 32767 {
+				return nil, &ExecError{Code: "22003",
+					Message: fmt.Sprintf("value \"%s\" is out of range for type smallint", raw)}
+			}
+			s = strconv.FormatInt(v, 10)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as smallint", d.Kind)
+		}
+		return encodeVarlen([]byte(s)), nil
+
+	case "float4", "real":
+		// float4 stored as varlen text for v0 compatibility. M0097-0003.
+		var s string
+		switch d.Kind {
+		case KindInt:
+			s = strconv.FormatInt(d.Int, 10)
+		case KindString, KindStringArena:
+			raw := strings.TrimSpace(d.StringValue())
+			if _, err := strconv.ParseFloat(raw, 32); err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type real: %q", d.StringValue())}
+			}
+			s = raw
+		case KindNumeric:
+			s = numericText(d)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as real", d.Kind)
+		}
+		return encodeVarlen([]byte(s)), nil
+
+	case "float8", "double precision", "double":
+		// float8 stored as varlen text for v0 compatibility. M0097-0003.
+		var s string
+		switch d.Kind {
+		case KindInt:
+			s = strconv.FormatInt(d.Int, 10)
+		case KindString, KindStringArena:
+			raw := strings.TrimSpace(d.StringValue())
+			if _, err := strconv.ParseFloat(raw, 64); err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", d.StringValue())}
+			}
+			s = raw
+		case KindNumeric:
+			s = numericText(d)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as double precision", d.Kind)
+		}
+		return encodeVarlen([]byte(s)), nil
+
 	case "bool", "boolean":
 		if d.Kind != KindBool {
 			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)

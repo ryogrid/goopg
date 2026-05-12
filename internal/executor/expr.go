@@ -1981,6 +1981,26 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			switch t {
 			case "bool", "boolean":
 				return NewBoolDatum(isValidBoolInput(v)), nil
+			case "int2", "smallint":
+				n, err := strconv.ParseInt(v, 10, 64)
+				return NewBoolDatum(err == nil && n >= -32768 && n <= 32767), nil
+			case "int4", "integer", "int":
+				n, err := strconv.ParseInt(v, 10, 64)
+				return NewBoolDatum(err == nil && n >= -2147483648 && n <= 2147483647), nil
+			case "int8", "bigint":
+				_, err := strconv.ParseInt(v, 10, 64)
+				return NewBoolDatum(err == nil), nil
+			case "float4", "real":
+				_, err := strconv.ParseFloat(v, 32)
+				return NewBoolDatum(err == nil), nil
+			case "float8", "double precision":
+				_, err := strconv.ParseFloat(v, 64)
+				return NewBoolDatum(err == nil), nil
+			case "oid":
+				_, err := strconv.ParseInt(v, 10, 64)
+				return NewBoolDatum(err == nil), nil
+			case "uuid":
+				return NewBoolDatum(isValidUUIDStr(v)), nil
 			case "xid":
 				_, err := parseXid(v)
 				return NewBoolDatum(err == nil), nil

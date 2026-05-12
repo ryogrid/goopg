@@ -97,8 +97,11 @@ func TestAnalyzeTypeErrors(t *testing.T) {
 
 func TestAnalyzeDMLTypeAndReturningErrors(t *testing.T) {
 	cat := analyzerCatalog(t)
-	expectAnalyzeCode(t, cat, "INSERT INTO pgbench_accounts (aid) VALUES ('x')", "42804")
-	expectAnalyzeCode(t, cat, "UPDATE pgbench_accounts SET aid = 'x'", "42804")
+	// String literals ('x') are now allowed for integer columns at analysis time
+	// (for PostgreSQL compatibility: untyped literals can be assigned to any type,
+	// with validation deferred to runtime). See M0097-0003.
+	// INSERT/UPDATE of 'x' into int4 columns now fails at runtime (22P02).
+	// Only RETURNING errors remain as analysis-time checks.
 	expectAnalyzeCode(t, cat, "DELETE FROM pgbench_accounts RETURNING aid", "0A000")
 }
 

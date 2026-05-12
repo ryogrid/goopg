@@ -677,12 +677,32 @@ func rowsAffected(op executor.Operator) int64 {
 // which is wire-compatible with libpq's text-format reader.
 func typeOIDFor(name string) uint32 {
 	switch strings.ToLower(name) {
+	case "int2", "smallint":
+		return 21
 	case "int4", "integer", "int":
 		return 23
 	case "int8", "bigint":
 		return 20
+	case "float4", "real":
+		return 700
+	case "float8", "double precision", "double":
+		return 701
 	case "bool", "boolean":
 		return 16
+	case "oid":
+		return 26
+	case "name":
+		return 19
+	case "uuid":
+		return 2950
+	case "date":
+		return 1082
+	case "time":
+		return 1083
+	case "timetz":
+		return 1266
+	case "interval":
+		return 1186
 	case "timestamp":
 		return 1114
 	case "timestamptz":
