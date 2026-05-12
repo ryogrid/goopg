@@ -361,10 +361,12 @@ func (p *parser) parseTargetEntry() (ResTarget, error) {
 		rt.Alias = identText(alias)
 		return rt, nil
 	}
-	// Implicit alias: a bare identifier or quoted ident immediately
-	// after the expression — but the v0 expression parser already
-	// consumes those into a ColumnRef, so we don't try to peel one
-	// off here. AS is the only path until the analyzer disambiguates.
+	// Implicit alias: a bare identifier or quoted ident after the expression
+	// (e.g. `pg_relation_size('x') size_after`). Only applies when the current
+	// token is NOT a clause-starting keyword or comma. M0097-0003.
+	if cur := p.cur(); isAliasStart(cur) {
+		rt.Alias = identText(p.advance())
+	}
 	return rt, nil
 }
 

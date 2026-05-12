@@ -732,9 +732,16 @@ M0097-0001 wires it up.
       68. ScalarFuncScan plan node + operator: FROM parse_ident(...) AS a now works as a
           single-row table function returning text[] column.
       69. parse_ident added to FROM-clause SRF whitelist in parser/select.go.
-      name test: 0 diff lines → PASS. Total passing tests: 13 (was 12).
+      70. Nested BEGIN...EXCEPTION...END blocks in plpgsql: parseNestedBlock() + KwBegin
+          case in parseStmt() + *plpgsql.Block case in executePLpgSQLStmt.
+      71. RAISE condition_name USING MESSAGE = 'text': parseRaise extracts condition name
+          and message; conditionNameToSQLState() mapping; ExecError.ConditionName field;
+          exceptionHandlerMatches() accepts conditionName variadic + direct name match.
+      72. SELECT implicit column alias: isAliasStart check in parseTargetEntry
+          (e.g. `pg_relation_size('x') size_after`).
+      name test: 0 diff lines → PASS. mvcc test: PASS. Total passing: 14 (was 12).
       Confirmed passing (2026-05-13): boolean, char, comments, delete, int2, int4, md5,
-      name, oid, reindex_catalog, select_having, select_implicit, varchar.
+      name, oid, reindex_catalog, select_having, select_implicit, varchar, mvcc.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,

@@ -220,9 +220,10 @@ func (e *ExceptionBlock) plpgsqlStmtNode() {}
 // silently discarded; ERROR/EXCEPTION surfaces an ExecError.
 // M0096-0012.
 type RaiseStmt struct {
-	pos   int
-	Level string // "notice", "warning", "error"
-	Msg   string // static message text (format substitution deferred)
+	pos           int
+	Level         string // "notice", "warning", "error"
+	Msg           string // static message text (format substitution deferred)
+	ConditionName string // set when RAISE condition_name (not a level keyword)
 }
 
 func (r *RaiseStmt) Pos() int          { return r.pos }

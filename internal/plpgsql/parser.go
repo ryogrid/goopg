@@ -276,6 +276,8 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseWhile()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwFor:
 		return p.parseFor()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwBegin:
+		return p.parseNestedBlock()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwPerform:
 		return p.parsePerform()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExit:
@@ -298,6 +300,25 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseAssign()
 	}
 	return nil, p.errAtCur("unsupported PL/pgSQL statement")
+}
+
+// parseNestedBlock parses a nested `BEGIN [stmts] [EXCEPTION ...] END ;`
+// sub-block statement. Returns a *Block. M0097-0003.
+func (p *bodyParser) parseNestedBlock() (*Block, error) {
+	beginPos := p.advance().Pos // consume BEGIN
+	stmts, excBlock, err := p.parseStmtListWithException(parser.KwEnd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+		return nil, p.errAtCur("expected END to close nested BEGIN block")
+	}
+	p.acceptSymbol(";")
+	block := &Block{pos: beginPos, Statements: stmts}
+	if excBlock != nil {
+		block.Statements = append(stmts, excBlock)
+	}
+	return block, nil
 }
 
 // parseLoop parses `LOOP stmts END LOOP ;`.
@@ -755,25 +776,67 @@ func (p *bodyParser) parseRaise() (*RaiseStmt, error) {
 	pos := p.cur().Pos
 	p.advance() // consume "raise" ident
 	level := "exception"
-	// Optional level keyword.
-	for _, lvl := range []string{"notice", "warning", "info", "log", "debug", "error", "exception"} {
-		if strings.EqualFold(p.cur().Value, lvl) && p.cur().Kind == parser.TokenIdent {
-			level = lvl
+	conditionName := ""
+	// Optional level keyword or condition name.
+	if p.cur().Kind == parser.TokenIdent {
+		val := strings.ToLower(p.cur().Value)
+		isLevel := false
+		for _, lvl := range []string{"notice", "warning", "info", "log", "debug", "error", "exception"} {
+			if val == lvl {
+				isLevel = true
+				level = val
+				p.advance()
+				break
+			}
+		}
+		if !isLevel && val != "" {
+			// Condition name: RAISE condition_name [USING MESSAGE = 'text']
+			conditionName = val
 			p.advance()
-			break
 		}
 	}
-	// Consume everything to `;`.
+	// Consume everything to `;` (captures format string + USING clause).
 	msgStart := p.cur().Pos
 	for p.cur().Kind != parser.TokenEOF {
 		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
 			msg := strings.TrimSpace(p.src[msgStart:p.cur().Pos])
 			p.advance()
-			return &RaiseStmt{pos: pos, Level: level, Msg: msg}, nil
+			// If USING MESSAGE = 'text', extract the message.
+			if conditionName != "" {
+				msg = extractRaiseUsingMessage(msg)
+			}
+			return &RaiseStmt{pos: pos, Level: level, Msg: msg, ConditionName: conditionName}, nil
 		}
 		p.advance()
 	}
 	return nil, p.errAtCur("unterminated RAISE statement")
+}
+
+// extractRaiseUsingMessage extracts the message text from `USING MESSAGE = 'text'`
+// or similar USING clauses in RAISE statements. M0097-0003.
+func extractRaiseUsingMessage(s string) string {
+	s = strings.TrimSpace(s)
+	// Pattern: USING MESSAGE = 'text'
+	lower := strings.ToLower(s)
+	if idx := strings.Index(lower, "using"); idx >= 0 {
+		rest := strings.TrimSpace(s[idx+5:])
+		lowerRest := strings.ToLower(rest)
+		if strings.HasPrefix(lowerRest, "message") {
+			rest = strings.TrimSpace(rest[7:])
+			if strings.HasPrefix(rest, "=") {
+				rest = strings.TrimSpace(rest[1:])
+				if len(rest) >= 2 && rest[0] == '\'' {
+					// Strip surrounding single quotes.
+					end := strings.LastIndexByte(rest, '\'')
+					if end > 0 {
+						return strings.ReplaceAll(rest[1:end], "''", "'")
+					}
+				}
+				return rest
+			}
+		}
+	}
+	return s
 }
 
 // parseTypeRef captures a SQL type spec — `name` or `schema.name`,

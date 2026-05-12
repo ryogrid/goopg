@@ -22,10 +22,11 @@ import (
 // ExecError is the executor's structured error. Code is a SQLSTATE
 // value the wire-protocol path forwards to ErrorResponse.
 type ExecError struct {
-	Code    string
-	Message string
-	Detail  string // optional DETAIL message for wire protocol. M0097-0003.
-	Pos     int
+	Code          string
+	Message       string
+	Detail        string // optional DETAIL message for wire protocol. M0097-0003.
+	Pos           int
+	ConditionName string // set for RAISE condition_name; used for exception matching. M0097-0003.
 }
 
 func (e *ExecError) Error() string {

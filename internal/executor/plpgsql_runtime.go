@@ -454,6 +454,16 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		raiseMsgEval := func() string {
 			return evalRaiseMsg(s.Msg, frame, ctx)
 		}
+		if s.ConditionName != "" {
+			// RAISE condition_name [USING MESSAGE = 'text'] — raise named condition.
+			// Use condition name as error code for exception handler matching. M0097-0003.
+			code := conditionNameToSQLState(s.ConditionName)
+			msg := raiseMsgEval()
+			if msg == "" {
+				msg = s.ConditionName
+			}
+			return Datum{}, flowNone, &ExecError{Code: code, Pos: s.Pos(), Message: msg, ConditionName: s.ConditionName}
+		}
 		switch strings.ToLower(s.Level) {
 		case "error", "exception":
 			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: raiseMsgEval()}
@@ -543,6 +553,25 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		op.Close()
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.Block:
+		// Nested BEGIN...END sub-block. Execute declarations + statements.
+		// Declarations introduce new variables into the frame. M0097-0003.
+		for _, d := range s.Declarations {
+			var val Datum
+			if d.Default != nil {
+				lowered, err := lowerPLpgSQLExpr(d.Default, frame)
+				if err == nil {
+					val, _ = evalExpr(lowered, frame.values, ctx)
+				}
+			}
+			_ = frame.add(strings.ToLower(d.Name), normalizeCatalogType(catalogTypeFromColumnType(d.Type)), val)
+		}
+		_, flow, err := executePLpgSQLStmtList(s.Statements, r, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		return Datum{}, flow, nil
+
 	case *plpgsql.ExceptionBlock:
 		// BEGIN...EXCEPTION...END — try/catch block. M0097-0012.
 		// Execute TryBody; if it errors, try matching handlers.
@@ -550,14 +579,16 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err == nil {
 			return v, flow, nil
 		}
-		// Determine SQLSTATE from error.
+		// Determine SQLSTATE and condition name from error.
 		sqlstate := "XX000"
+		condName := ""
 		if ee, ok := err.(*ExecError); ok {
 			sqlstate = ee.Code
+			condName = ee.ConditionName
 		}
 		// Try each handler.
 		for _, h := range s.Handlers {
-			if exceptionHandlerMatches(h.Conditions, sqlstate) {
+			if exceptionHandlerMatches(h.Conditions, sqlstate, condName) {
 				hv, hflow, herr := executePLpgSQLStmtList(h.Body, r, frame, ctx)
 				if herr != nil {
 					return Datum{}, flowNone, herr
@@ -573,10 +604,57 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 	}
 }
 
+// conditionNameToSQLState maps a PL/pgSQL condition name to a SQLSTATE code.
+// Partial mapping covering common condition names. M0097-0003.
+func conditionNameToSQLState(name string) string {
+	switch strings.ToLower(name) {
+	case "data_corrupted":
+		return "XX001"
+	case "reading_sql_data_not_permitted":
+		return "2F002"
+	case "modifying_sql_data_not_permitted":
+		return "2F003"
+	case "prohibited_sql_statement_attempted":
+		return "2F003"
+	case "division_by_zero":
+		return "22012"
+	case "unique_violation":
+		return "23505"
+	case "foreign_key_violation":
+		return "23503"
+	case "no_data_found":
+		return "P0002"
+	case "too_many_rows":
+		return "P0003"
+	case "syntax_error":
+		return "42601"
+	case "undefined_table":
+		return "42P01"
+	case "not_null_violation":
+		return "23502"
+	case "serialization_failure":
+		return "40001"
+	case "deadlock_detected":
+		return "40P01"
+	case "raise_exception":
+		return "P0001"
+	}
+	return "P0001" // default RAISE exception
+}
+
 // exceptionHandlerMatches reports whether any condition in the handler
-// matches the given SQLSTATE. M0097-0012.
-func exceptionHandlerMatches(conditions []string, sqlstate string) bool {
+// matches the given SQLSTATE or condition name. M0097-0012.
+func exceptionHandlerMatches(conditions []string, sqlstate string, conditionName ...string) bool {
+	raiseCondName := ""
+	if len(conditionName) > 0 {
+		raiseCondName = strings.ToLower(conditionName[0])
+	}
 	for _, cond := range conditions {
+		lower := strings.ToLower(cond)
+		// Direct condition-name match: RAISE reading_sql_data_not_permitted caught by WHEN reading_sql_data_not_permitted.
+		if raiseCondName != "" && lower == raiseCondName {
+			return true
+		}
 		switch strings.ToUpper(cond) {
 		case "OTHERS":
 			return true
@@ -584,7 +662,7 @@ func exceptionHandlerMatches(conditions []string, sqlstate string) bool {
 			return true
 		}
 		// Check common condition names.
-		switch strings.ToLower(cond) {
+		switch lower {
 		case "others", "when others":
 			return true
 		case "division_by_zero":
