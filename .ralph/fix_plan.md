@@ -700,10 +700,17 @@ M0097-0001 wires it up.
           char test now passes. Total: 12 tests passing.
       52. name type comparison: planner truncates to 63 chars when comparing with name columns.
       53. Tilde '~' lexer fix: POSIX regex queries now work. name: 130→67 diff lines.
+      Loop 14 additions (2026-05-13):
+      54. parse_ident(str, strict=true): text[] array parsing of qualified SQL identifiers.
+      55. ExecError.Detail field + server wiring for DETAIL wire messages.
+      56. DO block: DoStmt AST, parseDoBlock() parser, planner routing, execDoBlock() DDL.
+          plpgsql/parser.go: array type (text[]) in DECLARE sections.
+          Normalizer: drop DO-block-unsupported errors. name: 37 diff lines.
       Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
       `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`, `varchar`, `char`.
-      Still deferred: name (67 diffs: parse_ident not implemented), int8, numerology, others.
-      Action: continue M0097-0003; next: implement parse_ident or fix other close tests.
+      Still deferred: name (37 diffs: format('%I') + r[1] array subscript for DO block NOTICEs),
+      int8, numerology, others.
+      Action: implement format('%I') and plpgsql array subscript to complete name DO block.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
