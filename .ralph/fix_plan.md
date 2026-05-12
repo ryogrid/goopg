@@ -677,13 +677,17 @@ M0097-0001 wires it up.
           HAVING const_true skips table scan (isConstantPlanExpr/evalConstantBool helpers).
       41. Function-style type casts: int4(x), float8(x), int2(x), text(x) etc. in evalFuncCall.
       42. float8/float4 decoded as KindNumeric (not KindString) for correct ORDER BY numeric sort.
+      Loop 11 additions (2026-05-13):
+      43. float8/float4 DataRow output: appendFloat8Text uses %.15g (strconv.FormatFloat
+          'g', 15) matching PostgreSQL's float8out for scientific notation + correct integers.
+      44. TEMP TABLE shadowing: CREATE TEMP TABLE X when X exists drops permanent X first;
+          CreateTableStmt.Temporary bool added to parser AST. varchar: 121→104, char: 145→112.
       Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
       `reindex_catalog`, `delete`, `oid`, `select_implicit`, `select_having`.
       Still deferred: int8 (overflow + float8 format), float4/float8 (NaN/Infinity),
-      char/varchar (TEMP TABLE shadowing), name (case comparison), numerology
-      (underscore decimal literals, float scientific notation), others.
-      Action: continue fixing remaining scalar type parity issues to promote more
-      tests from defer to port.
+      char/varchar (remaining: length enforcement, 'A' case issue), name, numerology, others.
+      Action: continue fixing remaining scalar type parity issues; next targets are char/varchar
+      length enforcement + 'A' case preservation to flip those tests to pass.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
