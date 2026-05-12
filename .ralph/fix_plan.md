@@ -630,12 +630,15 @@ M0097-0001 wires it up.
       16. TypeOID fixes: int2(21), float4(700), float8(701), oid(26), name(19),
           uuid(2950), date(1082), time(1083), timetz(1266), interval(1186).
       17. pg_input_is_valid: extended for int2, int4, int8, float4, float8, oid, uuid.
-      18. int2/smallint binary storage: encodeValue stores as 2-byte big-endian (was
-          varlen text); decodeValue/decodeValueArena/decodeValueSize handle int2 as
-          2-byte. This enables arithmetic to work for int2 columns.
-      Passing: `comments`. Still deferred: column width alignment differences (computed
-      expression columns), SRF functions (pg_input_error_info), overflow detection in
-      int2 arithmetic, and various missing operators.
+      18. int2/smallint binary storage: encodeValue stores as 2-byte big-endian.
+      19. Planner type inference: TypedStringLit now returns its declared type in
+          exprType so int2 '2' has type "int2", not "unknown". BinaryOp arithmetic
+          type inference extended with isIntegerLikeType + promoteIntType helpers
+          so int2*int2 → int2, int2*int4 → int4, int4*int8 → int8.
+          This fixes column width alignment for arithmetic expressions on int2 columns.
+      Passing: `comments`. Still deferred: int2 arithmetic overflow detection missing
+      (goopg returns results where PostgreSQL gives "smallint out of range" error),
+      SRF functions (pg_input_error_info), various syntax features.
       Original action:
       Target tests: `boolean`, `comments`, `errors`, `numerology`,
       `name`, `oid`, `int2`, `int4`, `int8`, `float4`, `float8`,

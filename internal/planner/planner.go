@@ -3137,6 +3137,11 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "bool"}
 	case *NullConst:
 		return catalog.Type{Name: "unknown"}
+	case *TypedStringLit:
+		// Typed string literals carry their explicit type (e.g. int2 '2').
+		// Return it so downstream type inference (BinaryOp etc.) can use it.
+		// M0097-0003.
+		return catalog.Type{Name: x.Type}
 	case *BinaryOp:
 		// Arithmetic on numeric promotes to numeric. Comparison /
 		// boolean ops return bool. String concat returns text. The
@@ -3151,8 +3156,13 @@ func exprType(e Expr) catalog.Type {
 			if isNumericTypeName(lt.Name) || isNumericTypeName(rt.Name) {
 				return catalog.Type{Name: "numeric"}
 			}
-			if (lt.Name == "int8" || lt.Name == "int4") && (rt.Name == "int8" || rt.Name == "int4") {
+			if (lt.Name == "int8" || lt.Name == "bigint") && (rt.Name == "int8" || rt.Name == "bigint") {
 				return catalog.Type{Name: "int8"}
+			}
+			if isIntegerLikeType(lt.Name) && isIntegerLikeType(rt.Name) {
+				// int2/int4 arithmetic: follow PostgreSQL promotion rules.
+				// int2 op int2 → int2, int4 op int4 → int4, int2 op int4 → int4.
+				return promoteIntType(lt.Name, rt.Name)
 			}
 			return catalog.Type{Name: "unknown"}
 		case parser.OpConcat:
@@ -3214,6 +3224,40 @@ func isNumericTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// isIntegerLikeType reports whether name is a fixed-width integer type
+// (int2, int4, int8) for the purpose of arithmetic type promotion.
+func isIntegerLikeType(name string) bool {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint":
+		return true
+	}
+	return false
+}
+
+// promoteIntType returns the result type of an arithmetic operation between
+// two integer types, following PostgreSQL's promotion rules:
+// int2 op int2 → int2, int4 op int4 → int4, int2 op int4 → int4.
+// M0097-0003.
+func promoteIntType(a, b string) catalog.Type {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+	aIsSmall := a == "int2" || a == "smallint"
+	bIsSmall := b == "int2" || b == "smallint"
+	aIsInt4 := a == "int4" || a == "integer" || a == "int"
+	bIsInt4 := b == "int4" || b == "integer" || b == "int"
+	aIsInt8 := a == "int8" || a == "bigint"
+	bIsInt8 := b == "int8" || b == "bigint"
+	switch {
+	case aIsInt8 || bIsInt8:
+		return catalog.Type{Name: "int8"}
+	case aIsInt4 || bIsInt4:
+		return catalog.Type{Name: "int4"}
+	case aIsSmall && bIsSmall:
+		return catalog.Type{Name: "int2"}
+	}
+	return catalog.Type{Name: "int4"}
 }
 
 // planSubqueryExpr plans the SELECT inside a parser
