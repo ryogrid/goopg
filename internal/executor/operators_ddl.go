@@ -248,13 +248,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if s.IfNotExists {
 			return nil
 		}
-		// TEMP TABLE shadows the permanent table: drop it first so the
-		// session uses the new temp schema. PostgreSQL does this with
-		// per-session catalog scoping; goopg v0 approximates by replacing
-		// the catalog entry. M0097-0003.
+		// TEMP TABLE shadows the permanent table: save the permanent table for
+		// restoration when the temp table is later dropped. M0097-0003.
 		if s.Temporary {
-			// Drop the existing table from the catalog (heap data will be
-			// orphaned but that's acceptable for v0's temp-shadow use-case). M0097-0003.
+			permTbl, _ := o.ctx.Catalog.LookupTable(s.Name)
+			// Save the permanent table in the context's shadow registry for
+			// restoration when the TEMP table is later dropped. M0097-0003.
+			if o.ctx.TempTableShadows == nil {
+				o.ctx.TempTableShadows = make(map[string]*catalog.Table)
+			}
+			key := strings.ToLower(s.Name.Name)
+			o.ctx.TempTableShadows[key] = permTbl
+			// Drop the existing catalog entry (heap data preserved at old OID).
 			if err := o.ctx.Catalog.DropTable(s.Name); err != nil {
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 			}
@@ -673,6 +678,16 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		rel := o.ctx.Catalog.RelFileNode(tbl)
 		if err := o.ctx.Catalog.DropTable(name); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		}
+		// If this table was shadowing a permanent one, restore it. M0097-0003.
+		if o.ctx.TempTableShadows != nil {
+			key := strings.ToLower(name.Name)
+			if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
+				if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+					im.RegisterTable(permTbl)
+				}
+				delete(o.ctx.TempTableShadows, key)
+			}
 		}
 		o.ctx.Pool.InvalidateRel(rel)
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {

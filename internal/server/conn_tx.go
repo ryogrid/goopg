@@ -22,6 +22,7 @@ package server
 import (
 	"sync"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 )
@@ -33,6 +34,9 @@ type connTxState struct {
 	active      bool
 	tx          mvcc.Transaction
 	sess        *executor.BasicSession // session state, non-nil when active
+	// TempTableShadows maps table name → original permanent *catalog.Table.
+	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
+	TempTableShadows map[string]*catalog.Table
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr

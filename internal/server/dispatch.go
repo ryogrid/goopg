@@ -181,6 +181,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		if sess := connTx.Session(); sess != nil {
 			ectx.Session = sess
 		}
+		// Share the per-connection TEMP TABLE shadow map so it persists
+		// across statements in the same connection. M0097-0003.
+		ectx.TempTableShadows = connTx.TempTableShadows
 	}
 	ectx.Snap = snap
 	ectx.Checkpointer = s.cfg.Checkpointer
@@ -285,6 +288,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 				return nil
 			}
 			return err
+		}
+		// Write back the temp-table shadow map so it persists across statements. M0097-0003.
+		if connTx != nil && ectx.TempTableShadows != nil {
+			connTx.TempTableShadows = ectx.TempTableShadows
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
@@ -406,7 +413,58 @@ func normalizeCompatSQL(sql string) string {
 	for strings.HasSuffix(s, ";") {
 		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
 	}
-	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
+	// Lowercase keywords/identifiers but preserve string literal case.
+	// Lowercasing string literals would cause 'A' and 'a' to map to the
+	// same plan-cache key, returning the wrong cached plan. M0097-0003.
+	return normalizeSQLPreservingLiterals(s)
+}
+
+// normalizeSQLPreservingLiterals lowercases SQL outside string literals
+// and collapses whitespace. String literal contents are preserved verbatim
+// so that INSERT ('A') and INSERT ('a') get distinct cache keys.
+func normalizeSQLPreservingLiterals(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inSingleQuote := false
+	prevWasSpace := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inSingleQuote {
+			// Inside a string literal — preserve case exactly.
+			b.WriteByte(c)
+			if c == '\'' {
+				// Check for doubled single quote (escape).
+				if i+1 < len(s) && s[i+1] == '\'' {
+					b.WriteByte('\'')
+					i++
+				} else {
+					inSingleQuote = false
+				}
+			}
+			prevWasSpace = false
+			continue
+		}
+		if c == '\'' {
+			inSingleQuote = true
+			b.WriteByte(c)
+			prevWasSpace = false
+			continue
+		}
+		// Outside literal: lowercase and collapse whitespace.
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if !prevWasSpace && b.Len() > 0 {
+				b.WriteByte(' ')
+				prevWasSpace = true
+			}
+		} else {
+			if c >= 'A' && c <= 'Z' {
+				c = c + 32 // lowercase ASCII
+			}
+			b.WriteByte(c)
+			prevWasSpace = false
+		}
+	}
+	return strings.TrimRight(b.String(), " ")
 }
 
 // executeOneSimpleStmt plans and runs one statement, emitting the

@@ -2382,6 +2382,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewBoolDatum(err == nil), nil
 			case "pg_snapshot":
 				return NewBoolDatum(parsePgSnapshotValid(v)), nil
+			default:
+				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
+				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
+					return NewBoolDatum(valid), nil
+				}
 			}
 		}
 		return NewBoolDatum(true), nil
@@ -3981,6 +3986,35 @@ func nonCorrelatedCacheKey(x interface{}) string {
 
 // isValidBoolInput reports whether v is a valid PostgreSQL boolean literal.
 // Used by pg_input_is_valid('...', 'bool'). Mirrors evalTypedStringLit bool case.
+// pgInputIsValidTypedLen checks validity for varchar(N)/char(N)/character varying(N)
+// type strings as used in pg_input_is_valid. Returns (valid, handled). M0097-0003.
+func pgInputIsValidTypedLen(v, typStr string) (bool, bool) {
+	// Match "varchar(N)", "character varying(N)", "char(N)" etc.
+	var base string
+	var n int
+	for _, pfx := range []string{"character varying(", "varchar(", "character(", "char(", "bpchar("} {
+		if strings.HasPrefix(typStr, pfx) && strings.HasSuffix(typStr, ")") {
+			mid := typStr[len(pfx) : len(typStr)-1]
+			if parsed, err := strconv.Atoi(mid); err == nil && parsed > 0 {
+				base = pfx[:len(pfx)-1]
+				n = parsed
+				break
+			}
+		}
+	}
+	if n == 0 {
+		return false, false
+	}
+	// PostgreSQL's input functions check raw length (NO trailing space stripping).
+	if strings.Contains(base, "char") && !strings.Contains(base, "varying") {
+		// char(N): fixed-width; check stripped length
+		stripped := strings.TrimRight(v, " ")
+		return len(stripped) <= n, true
+	}
+	// varchar(N): raw length check (varcharin does not strip trailing spaces).
+	return len(v) <= n, true
+}
+
 func isValidBoolInput(v string) bool {
 	switch strings.TrimSpace(strings.ToLower(v)) {
 	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1",

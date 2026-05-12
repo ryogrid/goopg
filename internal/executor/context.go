@@ -155,6 +155,11 @@ type Context struct {
 	CurrSeqVals map[string]int64
 	LastSeqVal  int64
 	LastSeqSet  bool
+
+	// TempTableShadows maps table name → original permanent *catalog.Table for
+	// TEMP TABLE shadowing. Populated by execCreateTable when a TEMP TABLE
+	// shadows a permanent one; used by execDropTable to restore it. M0097-0003.
+	TempTableShadows map[string]*catalog.Table
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

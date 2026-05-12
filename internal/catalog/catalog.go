@@ -1814,6 +1814,19 @@ func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
 	return &t.Columns[len(t.Columns)-1], nil
 }
 
+// RegisterTable re-inserts a previously-dropped table back into the catalog.
+// Used when a TEMP TABLE shadows a permanent table and is then dropped —
+// the permanent table is restored by re-registering its saved *Table. M0097-0003.
+func (c *InMemory) RegisterTable(tbl *Table) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := strings.ToLower(tbl.Name)
+	if tbl.Schema != "" {
+		k = strings.ToLower(tbl.Schema) + "." + k
+	}
+	c.tables[k] = tbl
+}
+
 // DropTable removes a table from the catalog. Returns an error when
 // the name doesn't resolve.
 // CreateView installs a view in the catalog. The view is

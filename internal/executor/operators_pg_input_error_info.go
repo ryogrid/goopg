@@ -7,6 +7,7 @@ package executor
 // M0097-0003.
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -129,7 +130,8 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)
 	default:
-		// Unknown type — treat as valid (0 rows returned).
+		// varchar(N) / character varying(N) / char(N) — length validation. M0097-0003.
+		message, sqlCode = validateTypedLen(v, t)
 	}
 
 	if message == "" {
@@ -149,6 +151,41 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 
 // validateOidDecimal parses a single OID string using decimal-only parsing,
 // mimicking PostgreSQL's strtoul(s, &end, 10). Reports the invalid suffix
+// validateTypedLen validates a string value against a length-constrained type
+// like varchar(N), char(N), character varying(N). Returns (message, code) on
+// error, ("", "") if valid. M0097-0003.
+func validateTypedLen(v, typStr string) (string, string) {
+	for _, pfx := range []string{"character varying(", "varchar("} {
+		if strings.HasPrefix(typStr, pfx) && strings.HasSuffix(typStr, ")") {
+			mid := typStr[len(pfx) : len(typStr)-1]
+			n, err := strconv.Atoi(mid)
+			if err != nil || n <= 0 {
+				return "", ""
+			}
+			// PostgreSQL's varcharin checks raw length (no trailing-space strip).
+			if len(v) > n {
+				return fmt.Sprintf("value too long for type character varying(%d)", n), "22001"
+			}
+			return "", ""
+		}
+	}
+	for _, pfx := range []string{"character(", "char(", "bpchar("} {
+		if strings.HasPrefix(typStr, pfx) && strings.HasSuffix(typStr, ")") {
+			mid := typStr[len(pfx) : len(typStr)-1]
+			n, err := strconv.Atoi(mid)
+			if err != nil || n <= 0 {
+				return "", ""
+			}
+			stripped := strings.TrimRight(v, " ")
+			if len(stripped) > n {
+				return fmt.Sprintf("value too long for type character(%d)", n), "22001"
+			}
+			return "", ""
+		}
+	}
+	return "", ""
+}
+
 // (what "end" points to) in error messages, matching PG's exact output.
 // M0097-0003.
 func validateOidDecimal(v string) (string, string) {
