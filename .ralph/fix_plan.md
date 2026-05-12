@@ -665,11 +665,17 @@ M0097-0001 wires it up.
       31. OID error codes: 22003 for out-of-range in encodeValue + pg_input_error_info.
       32. oidvector: validateOidDecimal returns suffix (PG-compatible); 22003/22P02 per kind.
       33. oid ↔ int comparison: isComparable allows oid vs numeric types.
-      Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`,
-      `int4`, `reindex_catalog`, `delete`, `oid`.
-      Still deferred: int8 (to_char format, int8→float8), float4/float8 (NaN/Infinity
-      case, out-of-range error codes), numeric, char/varchar (TEMP TABLE shadowing),
-      text, uuid, name, errors, numerology and others.
+      Loop 9 additions (2026-05-13):
+      34. groupExprName(): FuncCall → function name (lower(c) GROUP BY → "lower" column).
+      35. needsAggregateStage(): HAVING!=nil always triggers aggregate (degenerate case).
+      36. buildAggregateStage(): positional GROUP BY out of range → "GROUP BY position N".
+      37. resolveExprAfterAggregate(): use source binding for table-qualified error messages.
+      38. parserExprKey ColumnRef: strip table/schema qualifier for GROUP BY key matching.
+      39. dispatch.go DataRow: pad char(N)/bpchar(N) output to N bytes for correct width.
+      Passing tests (confirmed 2026-05-13): `boolean`, `comments`, `md5`, `int2`, `int4`,
+      `reindex_catalog`, `delete`, `oid`, `select_implicit`.
+      Still deferred: select_having (7 diff: WHERE 1/a=1 constant-aggregate optimization),
+      int8, float4/float8 (NaN/Infinity), char/varchar (TEMP TABLE shadowing), others.
       Action: continue fixing remaining scalar type parity issues to promote more
       tests from defer to port.
 
