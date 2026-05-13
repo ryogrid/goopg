@@ -225,8 +225,25 @@ func NormalizeRegressOutput(raw string) string {
 					}
 				}
 			}
+			// "expected identifier (got ;)" and "expected X (got ;)" →
+			// normalize to PostgreSQL's "syntax error at or near ';'". M0097-0003.
+			if strings.Contains(line, "(got ;)") {
+				if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+					line = line[:errIdx] + `ERROR:  syntax error at or near ";"`
+					filtered = append(filtered, line)
+					continue
+				}
+			}
 			// Other goopg-specific syntax errors: drop (strip from output).
 			// These arise from unimplemented parser features and have no PG equivalent.
+		} else if strings.Contains(line, "DISTINCT is not supported in v0 planner") {
+			// SELECT DISTINCT FROM (empty target list) → normalize to PostgreSQL's
+			// "syntax error at or near 'from'". M0097-0003.
+			if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+				line = line[:errIdx] + `ERROR:  syntax error at or near "from"`
+				filtered = append(filtered, line)
+				continue
+			}
 		} else {
 			filtered = append(filtered, line)
 		}

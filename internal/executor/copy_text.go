@@ -381,6 +381,33 @@ func parseTimeString(s string) (time.Time, error) {
 		s = s[:minus]
 	}
 
+	// Pre-process special time strings that Go's time.Parse can't handle:
+	// - Hour=24 (midnight-of-next-day): normalize to a parseable form first.
+	// - Second=60 (leap second): replace with 59 and add 1 sec in post-processing.
+	var origHour int = -1
+	hasLeapSec := false
+	if len(s) >= 2 {
+		if h, err := strconv.Atoi(s[:2]); err == nil && h >= 24 {
+			origHour = h
+			s = "00" + s[2:] // Replace with "00" so time.Parse succeeds
+		}
+	}
+	// Detect ":60" leap-second pattern (HH:MM:60 or HH:MM:60.xxx).
+	if len(s) >= 8 && s[5] == ':' {
+		secStr := s[6:]
+		// Take up to 2 digit characters for the seconds value.
+		end := 0
+		for end < len(secStr) && secStr[end] >= '0' && secStr[end] <= '9' {
+			end++
+		}
+		if end == 2 {
+			if secStr[:2] == "60" {
+				hasLeapSec = true
+				s = s[:6] + "59" + secStr[2:] // replace :60 with :59
+			}
+		}
+	}
+
 	// Try time layouts.
 	layouts := []string{
 		"15:04:05.000000",
@@ -408,16 +435,66 @@ func parseTimeString(s string) (time.Time, error) {
 			Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
 	}
 
-	// Apply AM/PM.
-	if isPM {
-		h := t.Hour()
-		if h < 12 {
-			t = time.Date(t.Year(), t.Month(), t.Day(), h+12, t.Minute(), t.Second(), t.Nanosecond(), t.Location())
+	// Capture the actual parsed components.
+	// If we substituted the hour (for h>=24), use origHour instead.
+	parsedH := t.Hour()
+	if origHour >= 0 {
+		parsedH = origHour
+	}
+
+	// Apply AM/PM to parsedH.
+	if isPM && parsedH < 12 {
+		parsedH += 12
+	}
+
+	h, m, sec, ns := parsedH, t.Minute(), t.Second(), t.Nanosecond()
+
+	// Handle leap second: 23:59:60 → 24:00:00 (or carry).
+	if hasLeapSec {
+		sec = 60
+	}
+	if sec == 60 {
+		sec = 0
+		m++
+		if m == 60 {
+			m = 0
+			h++
 		}
 	}
 
-	// Anchor to epoch date 1970-01-01 UTC.
-	return time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC), nil
+	// Handle extra fractional precision beyond microseconds (6 digits):
+	// Round nanoseconds to nearest microsecond. If rounding causes carry, propagate.
+	if ns%1000 >= 500 {
+		ns = ((ns / 1000) + 1) * 1000
+	} else {
+		ns = (ns / 1000) * 1000
+	}
+	// Carry nanosecond overflow.
+	if ns >= 1_000_000_000 {
+		ns -= 1_000_000_000
+		sec++
+		if sec >= 60 {
+			sec -= 60
+			m++
+			if m >= 60 {
+				m -= 60
+				h++
+			}
+		}
+	}
+
+	// 24:00:00 is a valid time (midnight); h=24 with m=0, s=0, ns=0 is allowed.
+	// h > 24, or h=24 with any m/s/ns > 0 are invalid.
+	if h > 24 || (h == 24 && (m > 0 || sec > 0 || ns > 0)) {
+		return time.Time{}, &ExecError{Code: "22007",
+			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
+	}
+
+	// Anchor to epoch date 1970-01-01 UTC. For h=24, store as next-day midnight.
+	if h == 24 {
+		return time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC), nil
+	}
+	return time.Date(1970, 1, 1, h, m, sec, ns, time.UTC), nil
 }
 
 // parseCopyTimestamp accepts the layouts upstream's COPY TEXT input

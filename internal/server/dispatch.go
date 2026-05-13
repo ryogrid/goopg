@@ -880,6 +880,10 @@ func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
 	m := t.Minute()
 	s := t.Second()
 	ns := t.Nanosecond()
+	// 24:00:00 is stored as 1970-01-02 00:00:00 (next-day midnight).
+	if t.Day() == 2 && t.Month() == 1 && t.Year() == 1970 && h == 0 && m == 0 && s == 0 && ns == 0 {
+		return append(dst, "24:00:00"...)
+	}
 
 	dst = append(dst, byte('0'+h/10), byte('0'+h%10), ':',
 		byte('0'+m/10), byte('0'+m%10), ':',

@@ -2537,6 +2537,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewBoolDatum(err == nil), nil
 			case "pg_snapshot":
 				return NewBoolDatum(parsePgSnapshotValid(v)), nil
+			case "time", "timetz":
+				_, err := parseTimeString(v)
+				return NewBoolDatum(err == nil), nil
+			case "date":
+				_, err := time.Parse("2006-01-02", v)
+				return NewBoolDatum(err == nil), nil
+			case "timestamp", "timestamptz":
+				_, err := parseCopyTimestamp(v)
+				return NewBoolDatum(err == nil), nil
 			default:
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
