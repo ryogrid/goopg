@@ -1674,6 +1674,155 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
       regression suites listed in the milestone DoD and confirm zero
       regressions.
 
+## M0103 — Heterogeneous Logical-Replication + SIGKILL-Failover E2E (filed 2026-05-13)
+
+**【Strong policy — DO NOT BYPASS】**
+Within this milestone, marking any sub-task as DEFERRED is, as a rule, not
+permitted. The two E2E tests are the milestone's reason for existing; leaving
+any required runtime gap (apply-worker launcher, reconnect loop, pgoutput
+interop, logical SyncRep wiring) unimplemented means the tests cannot pass
+and the Definition of Done is unreachable. Escape hatches such as "push it
+to a later milestone" or "skip the sync variant" must not be used. DEFERRED
+is permitted only when **all three** of the following hold simultaneously:
+(a) it is clearly demonstrated that the item is impossible to implement in
+this release due to goopg's Go-implementation constraints or explicit design
+constraints; (b) the reason is documented in the body of the affected
+sub-milestone; and (c) within the same milestone, an alternative path is
+presented that lets the corresponding test subtest reach `pass` (not
+`excluded`).
+
+Operational note (2026-05-13):
+- For items that can only be partially progressed due to an external blocker or missing goopg support, blocker resolution is itself in scope for this milestone.
+- For items that can move forward once a blocker is resolved, do not mark them complete until the resolution is implemented and re-verified.
+
+**Goal.** Deliver two E2E tests that survive a `kill -9` on the
+**logical-replication primary**:
+1. **Scenario A** — PG primary + goopg subscriber
+2. **Scenario B** — goopg primary + PG subscriber
+
+Each scenario runs in `async` (default `synchronous_commit`) and
+`sync_remote_apply` (`synchronous_commit = remote_apply` +
+`synchronous_standby_names = '<subscription_application_name>'`) modes. The
+sync subtest verifies **zero loss** of committed rows; the async subtest
+verifies bounded loss with no silent corruption.
+
+Logical-replication failover differs from physical (M0102): the subscriber
+is always writable, so "promotion" reduces to client redirection via libpq
+multi-host. No TLI bump, no `pg_wal/<NN>.history`, no BASE_BACKUP.
+
+Milestone doc: `docs/milestones/0103-heterogeneous-logical-replication-failover-e2e.md`.
+Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
+
+### Sub-milestones
+
+- [ ] **M0103-0001** — Prerequisite gate.
+      Audit M0101 (PG-compat WAL) and M0102-0005 (`synchronous_standby_names`
+      + SyncRep wait primitive) status. M0103-0007/0008 cannot start until
+      both have landed. The M0103-0002..-0006 development sub-milestones can
+      begin in parallel with M0101/M0102-0005 since their deliverables don't
+      depend on those.
+
+- [ ] **M0103-0002** — Subscriber apply-worker auto-launcher.
+      Design doc: `docs/design/0103-0001-apply-worker-launcher.md`.
+      Sites: new `internal/server/applylauncher.go` (`ApplyLauncher` struct,
+      periodic + Wake-triggered re-scan); `internal/server/server.go`
+      (construct + Start in `Server.Start`); `internal/executor/operators_ddl.go`
+      (call `ApplyLauncher.Wake()` from CREATE/DROP/ALTER SUBSCRIPTION).
+      Mirrors `postgres/src/backend/replication/logical/launcher.c::ApplyLauncherMain`.
+      Verify: race-tested unit test in `internal/server/applylauncher_test.go`;
+      after `CREATE SUBSCRIPTION ... WITH (enabled=true)`, `pg_stat_subscription`
+      shows the subscription active within ≤1 s.
+
+- [ ] **M0103-0003** — Apply-worker reconnect loop with bounded backoff.
+      Design doc: `docs/design/0103-0002-apply-worker-reconnect.md`.
+      Sites: `internal/server/logicalreceiver.go` — refactor `Run` into
+      `Run` (loop) + `runOnce` (existing dial/stream/apply logic); backoff
+      1 s → 30 s cap; `isPermanent(err)` classifier; resume from
+      `confirmed_flush_lsn` on reconnect; ctx-cancel termination. Apply
+      worker updates `applyLSN` on commit; feedback frame reports
+      `flush_lsn = applyLSN`. Verify: race-tested unit
+      `TestLogicalReceiverReconnect` — publisher killed mid-stream, restarted,
+      subscriber reattaches and resumes within ~5 s.
+
+- [ ] **M0103-0004** — pgoutput wire-byte interop verification.
+      Design doc: `docs/design/0103-0003-pgoutput-wire-interop.md`.
+      Sites: new `internal/testport/pgoutput_interop_test.go` with two
+      subtests:
+      (a) `TestPort_PgoutputInteropPGToGoopg` — spawn PG via `pgcluster`,
+      create publication, dial PG's logical-replication wire from goopg
+      via `LogicalReceiver`, decode messages, assert correct apply.
+      (b) `TestPort_PgoutputInteropGoopgToPG` — spawn goopg primary +
+      PG subscriber; `CREATE SUBSCRIPTION` on PG against goopg; verify
+      INSERT/UPDATE/DELETE replicate.
+      Audit + fix divergences in `internal/wal/pgoutput.go`: type-OID
+      mapping (goopg → PG OIDs like INT4OID=23), commit_ts epoch (PG uses
+      2000-01-01 microseconds), tuple text format, replica-identity marker.
+      Verify: both subtests pass.
+
+- [ ] **M0103-0005** — Logical-walsender SyncRep integration.
+      Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`.
+      Sites: `internal/server/logicalwalsender.go` — on 'r' (Standby Status
+      Update) receipt, call `cfg.SyncRep.UpdateStandbyProgress(s.appName,
+      writeLSN, flushLSN, applyLSN)`; plumb `application_name` from session
+      startup parameters. No changes to `internal/wal/syncrep.go` —
+      M0102-0005's primitive is reused. Verify: race-tested unit
+      `TestLogicalSyncRep` — fake `LogicalReceiver` reports lagging
+      apply_lsn; publisher COMMIT blocks; advance apply_lsn; COMMIT
+      unblocks. `application_name` parsing confirmed to reach the walsender.
+
+- [ ] **M0103-0006** — `pubsubcluster` test harness.
+      Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
+      New package `internal/testutil/pubsubcluster/`: `PubSubCluster` struct
+      with `ReplPeer` Publisher + Subscriber (reuses M0102's `ReplPeer`
+      interface); `NewMixed(t, name, opts)` constructor; `Options` with
+      `PublisherKind`, `SubscriberKind`, `SyncMode`, `ApplicationName`,
+      `PublicationName`, `SubscriptionName`; helpers
+      `CreatePublication`, `CreateSubscription`, `WaitForApply`,
+      `SubscriberApplyLSN`. Reuses `pgcluster.Cluster` from M0102.
+      Verify: smoke test spins up both binaries, runs `INSERT` on
+      publisher, observes the row on subscriber within timeout.
+
+- [ ] **M0103-0007** — Scenario A E2E test: PG primary + goopg subscriber.
+      Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
+      File: `internal/testport/e2e_logical_failover_pg_to_goopg_test.go`,
+      `TestE2E_LogicalFailoverPGtoGoopg` with `t.Run("async", …)` /
+      `t.Run("sync_remote_apply", …)`. Flow per subtest: spin up
+      `PubSubCluster` (PG pub, goopg sub) with sync mode per subtest; create
+      publication; create subscription with
+      `application_name=goopg_sub`; run pgbench `pgbench -i -s 1 &&
+      pgbench -c 2 -T 180` on PG with workload-counter polling via
+      `pgbench_history`; wait ~60 s; `kill -9 <pg-pid>` (record
+      `killCommitted`); libpq multi-host client reconnect
+      (`target_session_attrs=read-write`); INSERT on goopg succeeds; verify
+      row count per mode.
+      DoD: sync subtest — `count(*) == killCommitted + 1` (zero loss);
+      async subtest — `count(*) ∈ [killCommitted-asyncLossBound+1,
+      killCommitted+1]` with `asyncLossBound = 50` (documented in design doc).
+
+- [ ] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
+      Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
+      File: `internal/testport/e2e_logical_failover_goopg_to_pg_test.go`,
+      `TestE2E_LogicalFailoverGoopgToPG` with the same two subtests.
+      Symmetric flow: PubSubCluster with goopg pub + PG sub; custom
+      psql-driven INSERT/UPDATE loop on goopg (`runINSERTUPDATELoop`
+      helper, pgbench-on-goopg is out of scope); wait ~60 s; `kill -9
+      <goopg-pid>`; libpq multi-host reconnect; INSERT on PG succeeds;
+      verify per mode (same DoD).
+
+- [ ] **M0103-0009** — Close milestone.
+      Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
+      `e2e-logical-failover-pg-to-goopg-async`,
+      `e2e-logical-failover-pg-to-goopg-sync`,
+      `e2e-logical-failover-goopg-to-pg-async`,
+      `e2e-logical-failover-goopg-to-pg-sync` — all at `status=port`,
+      `pass_required=yes`. Regenerate the `.md` via
+      `go run ./cmd/gen-oracle-port-status`. Flip
+      `docs/milestones/0103-heterogeneous-logical-replication-failover-e2e.md`
+      status to `accepted` and update the `docs/milestones/README.md` index
+      row. Mark all 5 design docs (`0103-0001..-0005`) as `accepted`. Run
+      the regression suites listed in the milestone DoD and confirm zero
+      regressions.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
