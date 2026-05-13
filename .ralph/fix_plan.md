@@ -1420,9 +1420,13 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         - NOTICE propagation: `executePLpgSQLRoutine` now propagates notices from
           child context back to parent (RAISE NOTICE in called functions is visible).
         - IsolationRunner: `writeCompletedStep` helper for consistent pending output.
-        Remaining diff: noisy_oper executes but NOTICE output format differs (expected
-        has `s2: NOTICE: ...` lines that require pq notice capture + EXISTS short-circuit
-        for correct count). goopg EXISTS doesn't short-circuit → too many NOTICEs.
+        Remaining diff: NOTICE lines missing from output. Architecture is in place:
+        - pq.ConnectorWithNoticeHandler at session level captures to sessionNoticeQueue
+        - formatStepOutput writes NOTICEs BEFORE step SQL line (correct ordering)
+        - writeCompletedStep writes NOTICEs BEFORE <... completed> marker
+        - NOTICE propagation: executePLpgSQLRoutine propagates child → parent notices
+        But notices are not appearing in test output (possible goopg trigger/RAISE NOTICE
+        issue or pq timing issue). Needs further investigation.
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
@@ -26,6 +27,8 @@ type stepOutcome struct {
 	rows     [][]string // rows[0] = column names; rows[1:] = data rows
 	colTypes []string   // "numeric" or "text" per column
 	errText  string     // non-empty when execution returned an error
+	notices  []string   // NOTICE messages emitted during execution
+	session  string     // session name for "session: NOTICE:  msg" prefix
 }
 
 // pendingStep tracks a step goroutine that has been submitted but has not yet
@@ -100,6 +103,27 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 	return sb.String(), nil
 }
 
+// sessionNoticeQueue is a thread-safe queue of NOTICE messages for one session.
+type sessionNoticeQueue struct {
+	mu      sync.Mutex
+	notices []string
+}
+
+func (q *sessionNoticeQueue) push(msg string) {
+	q.mu.Lock()
+	q.notices = append(q.notices, msg)
+	q.mu.Unlock()
+}
+
+// drain returns and clears all collected notices.
+func (q *sessionNoticeQueue) drain() []string {
+	q.mu.Lock()
+	n := append([]string(nil), q.notices...)
+	q.notices = q.notices[:0]
+	q.mu.Unlock()
+	return n
+}
+
 // runPermutation executes one permutation using fresh session connections.
 func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string) (string, error) {
 	sessionNames := spec.Sessions
@@ -107,10 +131,38 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		sessionNames = []string{"s1"}
 	}
 
+	// Build a per-session pq connector with a notice handler so NOTICE messages
+	// emitted during step execution are captured. Uses pq.ConnectorWithNoticeHandler
+	// to attach the handler at DB-open time (works regardless of Go version).
+	sessionQueues := make(map[string]*sessionNoticeQueue, len(sessionNames))
+	sessionDBs := make(map[string]*sql.DB, len(sessionNames))
+	for _, sname := range sessionNames {
+		q := &sessionNoticeQueue{}
+		sessionQueues[sname] = q
+		base, err := pq.NewConnector(r.DSN)
+		if err == nil {
+			withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
+				q.push(n.Message)
+			})
+			sessionDBs[sname] = sql.OpenDB(withNotice)
+		} else {
+			// Fallback: use the shared db without notice capture.
+			sessionDBs[sname] = db
+		}
+	}
+	defer func() {
+		for sname, sdb := range sessionDBs {
+			if sdb != db {
+				_ = sdb.Close()
+			}
+			_ = sname
+		}
+	}()
+
 	// Open one dedicated connection per session.
 	conns := make(map[string]*sql.Conn, len(sessionNames))
 	for _, sname := range sessionNames {
-		conn, err := db.Conn(ctx)
+		conn, err := sessionDBs[sname].Conn(ctx)
 		if err != nil {
 			for _, c := range conns {
 				_ = c.Close()
@@ -175,9 +227,10 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		}
 
 		outCh := make(chan stepOutcome, 1)
-		go func(c *sql.Conn, sqlText, sess string, ch chan<- stepOutcome) {
-			ch <- execStep(ctx, c, sqlText, sess)
-		}(conn, step.SQL, step.Session, outCh)
+		q := sessionQueues[step.Session]
+		go func(c *sql.Conn, sqlText, sess string, queue *sessionNoticeQueue, ch chan<- stepOutcome) {
+			ch <- execStepFromQueue(ctx, c, sqlText, sess, queue)
+		}(conn, step.SQL, step.Session, q, outCh)
 
 		select {
 		case outcome := <-outCh:
@@ -220,10 +273,21 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	return sb.String(), nil
 }
 
-// writeCompletedStep writes a blocked step's completed output.
+// writeCompletedStep writes a blocked step's completed output: NOTICEs first
+// (matching PostgreSQL isolationtester's ordering for waiting steps), then
+// the "<... completed>" marker, then result rows.
 func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
+	for _, notice := range o.notices {
+		if o.session != "" {
+			fmt.Fprintf(sb, "%s: NOTICE:  %s\n", o.session, notice)
+		}
+	}
 	fmt.Fprintf(sb, "step %s: <... completed>\n", name)
-	sb.WriteString(formatStepOutput(name, sql, o, true))
+	sb.WriteString(formatStepOutput(name, sql, stepOutcome{
+		rows:     o.rows,
+		colTypes: o.colTypes,
+		errText:  o.errText,
+	}, true))
 }
 
 // drainCompleted checks each pending step non-blockingly; completed results
@@ -258,6 +322,20 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 		}
 	}
 	return remaining
+}
+
+// execStepFromQueue executes sqlText on conn and attaches any NOTICE messages
+// collected in queue (populated by the session's connector notice handler).
+func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session string, queue *sessionNoticeQueue) stepOutcome {
+	if queue != nil {
+		queue.drain() // clear any stale notices from previous steps
+	}
+	o := execStep(ctx, conn, sqlText, "")
+	if queue != nil {
+		o.notices = queue.drain()
+	}
+	o.session = session
+	return o
 }
 
 // execStep executes sqlText on conn and returns the result as a stepOutcome.
@@ -317,6 +395,12 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 	var sb strings.Builder
 
 	if !afterWaiting {
+		// NOTICEs appear BEFORE the step SQL line (matches PostgreSQL isolationtester).
+		for _, notice := range o.notices {
+			if o.session != "" {
+				fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", o.session, notice)
+			}
+		}
 		fmt.Fprintf(&sb, "step %s: %s\n", name, flattenSQL(sqlText))
 	}
 
