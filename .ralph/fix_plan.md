@@ -1413,9 +1413,12 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         `updateViaIndex` paths that were returning 0 rows because the index was empty.
       - RETURNING inline yield: `updateViaIndex`, SeqScan, and `deleteOp.Next()` now
         return the first RETURNING row from inline code; subsequent rows via `o.done` block.
-      eval-plan-qual runs 7.40s, 1143/1494 lines (up from 0). Remaining diffs:
-        - balance2 GENERATED column is NULL (evalGenBinary doesn't handle NUMERIC type)
-        - Some EPQ+rollback permutations show wrong balance (HOT chain + abort interaction)
+      eval-plan-qual runs 7.4-7.9s, 1143/1494 lines. Remaining diffs:
+        - EPQ+rollback: after abort, isConcurrentlyUpdated now returns false for aborted
+          HOT xmax (snap.HasAborted check added). But the update code still skips due to
+          `break` (avoiding infinite-loop risk). The heap row is not updated; balance stays
+          at 600 instead of 1050. (balance2 GENERATED is now correct: NUMERIC arithmetic
+          added to evalGenBinary handles KindNumeric operands)
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait

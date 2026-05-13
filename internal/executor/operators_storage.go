@@ -866,7 +866,7 @@ func markHeapHotUpdateDirty(
 //
 // A lock-only xmax (SELECT FOR UPDATE) is NOT treated as a concurrent
 // update — the lock holder does not own the row's write intent.
-func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID, _ *mvcc.Snapshot) bool {
+func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID, snap *mvcc.Snapshot) bool {
 	// "Our own xmax stamp" — re-update in the same transaction is
 	// always legal, regardless of HeapHotUpdated or other bits set
 	// by our prior write.
@@ -876,6 +876,12 @@ func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionI
 	// Beyond this point, any xmax/HOT marker is from a DIFFERENT
 	// transaction.
 	if h.Infomask&storage.HeapHotUpdated != 0 {
+		// M0100-0005: If the HOT-updating transaction already aborted, the
+		// HeapHotUpdated flag is stale — the row is not actually "concurrently
+		// updated", so proceed directly without EPQ retry.
+		if snap != nil && h.Xmax != storage.InvalidTransactionID && snap.HasAborted(h.Xmax) {
+			return false
+		}
 		return true
 	}
 	if h.Xmax == storage.InvalidTransactionID {

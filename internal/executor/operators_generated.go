@@ -19,6 +19,7 @@ package executor
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -166,6 +167,52 @@ func evalGenBinary(op parser.OpCode, left, right Datum) (Datum, error) {
 			return NewBoolDatum(l >= r), nil
 		}
 	}
+	// KindNumeric arithmetic — handle mixed KindInt/KindNumeric operands.
+	// Coerce KindInt to big.Int (scale 0) so both sides are numeric (M0100-0005).
+	if left.Kind == KindNumeric || right.Kind == KindNumeric {
+		lm, ls := genNumericParts(left)
+		rm, rs := genNumericParts(right)
+		// Align scales for add/sub; for mul/div compute result scale.
+		switch op {
+		case parser.OpAdd, parser.OpSub:
+			// Align to max scale by scaling the smaller-scale operand up.
+			if ls < rs {
+				scale := rs - ls
+				factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+				lm = new(big.Int).Mul(lm, factor)
+				ls = rs
+			} else if rs < ls {
+				scale := ls - rs
+				factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
+				rm = new(big.Int).Mul(rm, factor)
+			}
+			var result big.Int
+			if op == parser.OpAdd {
+				result.Add(lm, rm)
+			} else {
+				result.Sub(lm, rm)
+			}
+			return newNumeric(&result, int(ls)), nil
+		case parser.OpMul:
+			var result big.Int
+			result.Mul(lm, rm)
+			return newNumeric(&result, int(ls+rs)), nil
+		case parser.OpDiv:
+			if rm.Sign() == 0 {
+				return NullDatum, nil
+			}
+			// Integer division at aligned scale.
+			scale := ls - rs
+			if scale < 0 {
+				factor := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-scale)), nil)
+				lm = new(big.Int).Mul(lm, factor)
+				scale = 0
+			}
+			var result big.Int
+			result.Quo(lm, rm)
+			return newNumeric(&result, int(scale)), nil
+		}
+	}
 	// String concatenation
 	if op == parser.OpConcat {
 		ls := datumToString(left)
@@ -173,6 +220,19 @@ func evalGenBinary(op parser.OpCode, left, right Datum) (Datum, error) {
 		return NewStringDatum(ls + rs), nil
 	}
 	return NullDatum, nil
+}
+
+// genNumericParts converts a Datum to (mantissa *big.Int, scale int16) for
+// use in generated-column arithmetic. KindInt is treated as scale-0 numeric.
+func genNumericParts(d Datum) (*big.Int, int16) {
+	switch d.Kind {
+	case KindNumeric:
+		return numericMant(d), d.NumericScaleValue()
+	case KindInt:
+		return big.NewInt(d.Int), 0
+	default:
+		return big.NewInt(0), 0
+	}
 }
 
 func datumToString(d Datum) string {
