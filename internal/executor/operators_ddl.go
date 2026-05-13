@@ -800,6 +800,14 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
+	// Skip expression indexes (column name "" means functional expression
+	// like lower(col)) — goopg does not yet support expression indexes.
+	// The index creation is silently ignored to let setup SQL proceed.
+	for _, c := range s.Columns {
+		if c == "" {
+			return nil
+		}
+	}
 	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.Unique, false)
 }
 

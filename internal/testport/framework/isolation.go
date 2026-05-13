@@ -208,7 +208,10 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 			if _, exists := s.Steps[stepNameParsed]; !exists {
 				s.StepOrder = append(s.StepOrder, stepNameParsed)
 			}
-			s.Steps[stepNameParsed] = IsolationStep{Name: stepNameParsed, Session: session, SQL: strings.TrimSpace(body)}
+			// Use TrimRight (not TrimSpace) to preserve leading indentation
+			// from the spec file — the first content line's leading whitespace
+			// matters for multi-line SQL display in isolationtester format.
+			s.Steps[stepNameParsed] = IsolationStep{Name: stepNameParsed, Session: session, SQL: strings.TrimRight(body, " \t\n\r")}
 			continue
 		}
 

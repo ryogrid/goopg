@@ -283,6 +283,10 @@ func mergeClauseCondMatches(clause *planner.MergeWhenClause, row Row, ctx *Conte
 }
 
 // mergeApplyUpdate stamps xmax on the old tuple and writes a new version.
+// When a concurrent update is detected (RC isolation), it waits for the
+// conflicting transaction to complete (EPQ) and then re-checks the row.
+// If the row is still updatable, the update is applied; otherwise it is
+// skipped (the MERGE WHEN clause no longer matches after the concurrent update).
 func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, blk storage.BlockNumber, slot uint16, newRow Row, pos int) error {
 	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 	if err != nil {
@@ -291,9 +295,37 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 	s.Lock()
 	oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), slot)
 	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap) {
+		xmax := oldTup.Header.Xmax
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
+		// RC mode: wait for the conflicting transaction, then re-check.
+		// RR/SSI: return 40001 immediately (caller handles).
+		if ctx.Tx.Isolation == mvcc.IsolationReadCommitted {
+			if epqWait(ctx, xmax) {
+				return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
+			}
+			// After wait: re-read and check if the row was deleted or updated.
+			s2, err2 := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+			if err2 != nil {
+				return nil // row gone, skip silently
+			}
+			s2.RLock()
+			newTup, terr := storage.PageGetHeapTuple(s2.Page(), slot)
+			s2.RUnlock()
+			ctx.Pool.Unpin(s2)
+			if terr != nil || !mvcc.TupleVisible(newTup.Header, ctx.Snap, ctx.Tx.XID) {
+				return nil // row deleted or invisible, skip this mod
+			}
+			// Row is still visible; re-pin with write lock and proceed.
+			s, err = ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+			if err != nil {
+				return nil
+			}
+			s.Lock()
+			oldTup, oldGerr = storage.PageGetHeapTuple(s.Page(), slot)
+		} else {
+			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
+		}
 	}
 	var oldTupleBytes []byte
 	if oldGerr == nil {
