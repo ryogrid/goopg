@@ -7,7 +7,7 @@ unchecked item unless a dependency forces a different order.
 
 NOTE: past milestones are stored in `completed_milestones/` and should NOT be copied. If you need to reference a past milestone, you can see these files for the historical record, but they are not part of the active fix plan. Only items in this file are actionable.
 
-## M0094 — Replication E2E Completion & TAP Test Porting (D-003 / D-004)
+## M0094 — Replication E2E Completion & TAP Test Porting (D-003 / D-004) ✅ COMPLETE (2026-05-14)
 
 Operational note (2026-05-12):
 - Items that are blocked or can only be partially progressed due to missing goopg support must include blocker resolution within this milestone's scope.
