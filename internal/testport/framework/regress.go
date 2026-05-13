@@ -207,6 +207,19 @@ func NormalizeRegressOutput(raw string) string {
 				line = line[:idx]
 			}
 			filtered = append(filtered, line)
+		} else if strings.Contains(line, "trailing junk after parameter") ||
+			strings.Contains(line, "parameter number too large") {
+			// Strip "lex error at byte N: " prefix from parameter lex errors. M0097-0003.
+			if lexIdx := strings.Index(line, "lex error at byte "); lexIdx >= 0 {
+				for _, needle := range []string{"trailing junk after parameter", "parameter number too large"} {
+					if msgIdx := strings.Index(line, needle); msgIdx >= 0 {
+						errPrefix := line[:strings.Index(line, "ERROR:")+len("ERROR:  ")]
+						line = errPrefix + line[msgIdx:]
+						break
+					}
+				}
+			}
+			filtered = append(filtered, line)
 		} else if strings.Contains(line, "unsupported statement (got do)") ||
 			strings.Contains(line, "unsupported statement (got do block)") {
 			// goopg does not implement DO (anonymous PL/pgSQL) blocks.

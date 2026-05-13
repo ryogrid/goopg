@@ -369,7 +369,21 @@ func (l *lexer) next() (Token, error) {
 		if l.pos == dStart {
 			return Token{}, l.errf(start, "expected digit after '$'")
 		}
-		return Token{Kind: TokenParam, Value: l.src[dStart:l.pos], Pos: start}, nil
+		// Trailing junk after parameter number: "$1a", "$0_1" etc. M0097-0003.
+		if l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+			// Consume the junk identifier chars.
+			for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+				l.pos++
+			}
+			return Token{}, l.errf(start, "trailing junk after parameter at or near %q",
+				"$"+l.src[dStart:l.pos])
+		}
+		// Parameter number overflow check: PostgreSQL supports up to INT_MAX (2147483647).
+		paramStr := l.src[dStart:l.pos]
+		if len(paramStr) > 10 || (len(paramStr) == 10 && paramStr > "2147483647") {
+			return Token{}, l.errf(start, "parameter number too large at or near %q", "$"+paramStr)
+		}
+		return Token{Kind: TokenParam, Value: paramStr, Pos: start}, nil
 
 	case c == ',' || c == ';' || c == '(' || c == ')' || c == '.' || c == '*' || c == '[' || c == ']':
 		if c == '.' && l.peekAt(1) == '.' {
