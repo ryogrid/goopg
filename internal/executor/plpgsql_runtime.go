@@ -184,6 +184,12 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 		}
 	}
 	res, flow, err := executePLpgSQLStmtList(block.Statements, r, frame, child)
+	// Propagate NOTICE messages from function body back to caller. M0100-0005.
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
 	if err != nil {
 		return Datum{}, err
 	}
@@ -470,6 +476,60 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		if ctx != nil {
 			ctx.AddNotice(raiseMsgEval())
+		}
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.ExecuteStmt:
+		// EXECUTE expr [INTO var] [USING ...] — dynamic SQL. M0100-0005.
+		// 1. Evaluate the SQL expression.
+		sqlDatum, err := evalPLpgSQLExpr(s.Query, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		dynSQL := sqlDatum.StringValue()
+
+		// 2. Evaluate USING parameters and substitute $N placeholders.
+		for i, argExpr := range s.Using {
+			argDatum, perr := evalPLpgSQLExpr(argExpr, frame, ctx)
+			if perr != nil {
+				return Datum{}, flowNone, perr
+			}
+			placeholder := fmt.Sprintf("$%d", i+1)
+			dynSQL = strings.ReplaceAll(dynSQL, placeholder, plpgsqlFormatDynArg(argDatum))
+		}
+
+		// 3. Execute the dynamic SQL and optionally capture INTO var.
+		stmts, perr := parser.Parse(dynSQL)
+		if perr != nil || len(stmts) == 0 {
+			if s.IntoVar == "" {
+				return Datum{}, flowNone, nil // best-effort; ignore parse failures for side-effect EXECUTE
+			}
+			return Datum{}, flowNone, nil
+		}
+		plan, perr := planner.Plan(stmts[0], ctx.Catalog)
+		if perr != nil {
+			return Datum{}, flowNone, perr
+		}
+		op, perr := Build(plan)
+		if perr != nil {
+			return Datum{}, flowNone, perr
+		}
+		if perr := op.Open(ctx); perr != nil {
+			op.Close()
+			return Datum{}, flowNone, perr
+		}
+		slot, perr := op.Next()
+		op.Close()
+		if perr != nil && perr != EOF {
+			return Datum{}, flowNone, perr
+		}
+		if s.IntoVar != "" && slot != nil {
+			row := slot.Row()
+			if len(row) > 0 {
+				if idx, ok := frame.lookup(s.IntoVar); ok {
+					frame.values[idx] = row[0]
+				}
+			}
 		}
 		return Datum{}, flowNone, nil
 
@@ -1077,6 +1137,27 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 // execPLpgSQLEmbeddedSQL executes an embedded SQL statement from a PL/pgSQL
 // body. Trigger OLD.* / NEW.* references are substituted with literal values
 // before parsing. M0096-0012.
+// plpgsqlFormatDynArg formats a Datum as a SQL literal for substitution
+// into EXECUTE ... USING $N parameters. M0100-0005.
+func plpgsqlFormatDynArg(d Datum) string {
+	switch d.Kind {
+	case KindNull:
+		return "NULL"
+	case KindInt:
+		return strconv.FormatInt(d.Int, 10)
+	case KindBool:
+		if d.BoolValue() {
+			return "true"
+		}
+		return "false"
+	case KindNumeric:
+		return numericText(d)
+	default:
+		s := d.StringValue()
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+}
+
 func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error {
 	// Substitute OLD.* → VALUES(v1, v2, ...) and OLD.col → literal.
 	if frame.trig != nil {

@@ -164,8 +164,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			if p.session == step.Session {
 				select {
 				case o := <-p.outCh:
-					fmt.Fprintf(&sb, "step %s: <... completed>\n", p.name)
-					sb.WriteString(formatStepOutput(p.name, p.sql, o, true))
+					writeCompletedStep(&sb, p.name, p.sql, o)
 					pending = append(pending[:i], pending[i+1:]...)
 				case <-time.After(drainWindow):
 					fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
@@ -176,9 +175,9 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		}
 
 		outCh := make(chan stepOutcome, 1)
-		go func(c *sql.Conn, sqlText string, ch chan<- stepOutcome) {
-			ch <- execStep(ctx, c, sqlText)
-		}(conn, step.SQL, outCh)
+		go func(c *sql.Conn, sqlText, sess string, ch chan<- stepOutcome) {
+			ch <- execStep(ctx, c, sqlText, sess)
+		}(conn, step.SQL, step.Session, outCh)
 
 		select {
 		case outcome := <-outCh:
@@ -201,8 +200,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		pending = pending[1:]
 		select {
 		case outcome := <-p.outCh:
-			fmt.Fprintf(&sb, "step %s: <... completed>\n", p.name)
-			sb.WriteString(formatStepOutput(p.name, p.sql, outcome, true))
+			writeCompletedStep(&sb, p.name, p.sql, outcome)
 		case <-time.After(drainWindow):
 			fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
 		}
@@ -222,6 +220,12 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	return sb.String(), nil
 }
 
+// writeCompletedStep writes a blocked step's completed output.
+func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
+	fmt.Fprintf(sb, "step %s: <... completed>\n", name)
+	sb.WriteString(formatStepOutput(name, sql, o, true))
+}
+
 // drainCompleted checks each pending step non-blockingly; completed results
 // are appended to sb and removed from the returned slice.
 func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
@@ -229,8 +233,7 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 	for _, p := range pending {
 		select {
 		case o := <-p.outCh:
-			fmt.Fprintf(sb, "step %s: <... completed>\n", p.name)
-			sb.WriteString(formatStepOutput(p.name, p.sql, o, true))
+			writeCompletedStep(sb, p.name, p.sql, o)
 		default:
 			remaining = append(remaining, p)
 		}
@@ -249,8 +252,7 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 	for _, p := range pending {
 		select {
 		case o := <-p.outCh:
-			fmt.Fprintf(sb, "step %s: <... completed>\n", p.name)
-			sb.WriteString(formatStepOutput(p.name, p.sql, o, true))
+			writeCompletedStep(sb, p.name, p.sql, o)
 		case <-time.After(window):
 			remaining = append(remaining, p)
 		}
@@ -259,7 +261,7 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 }
 
 // execStep executes sqlText on conn and returns the result as a stepOutcome.
-func execStep(ctx context.Context, conn *sql.Conn, sqlText string) stepOutcome {
+func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcome {
 	rows, err := conn.QueryContext(ctx, sqlText)
 	if err != nil {
 		return stepOutcome{errText: formatPQError(err)}
@@ -425,7 +427,7 @@ func execConn(ctx context.Context, conn *sql.Conn, sqlText string) error {
 // step header). Used for per-session teardown which appears as raw output in
 // PostgreSQL isolationtester's permutation output.
 func execConnCapture(ctx context.Context, conn *sql.Conn, sqlText string) string {
-	outcome := execStep(ctx, conn, sqlText)
+	outcome := execStep(ctx, conn, sqlText, "")
 	if outcome.errText != "" {
 		return outcome.errText + "\n"
 	}

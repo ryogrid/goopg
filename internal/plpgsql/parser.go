@@ -289,6 +289,9 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		t.Keyword == parser.KwUpdate || t.Keyword == parser.KwDelete ||
 		t.Keyword == parser.KwSelect):
 		return p.parseSQLStmt()
+	// EXECUTE expr [INTO var] [USING expr, ...]. M0100-0005.
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExecute:
+		return p.parseExecute()
 	// RAISE [NOTICE|WARNING|ERROR|EXCEPTION] 'msg'. M0096-0012.
 	case t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "raise"):
 		return p.parseRaise()
@@ -768,6 +771,67 @@ func (p *bodyParser) parseSQLStmt() (*SQLStmt, error) {
 		p.advance()
 	}
 	return nil, p.errAtCur("unterminated embedded SQL statement")
+}
+
+// parseExecute parses `EXECUTE expr [INTO varname] [USING expr, ...] ;`.
+// M0100-0005: PL/pgSQL dynamic SQL.
+func (p *bodyParser) parseExecute() (*ExecuteStmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume EXECUTE keyword
+
+	// Parse the SQL expression (everything up to INTO, USING, or ;)
+	queryExpr, err := p.scanExprTo("EXECUTE query", func(t parser.Token) bool {
+		if t.Kind == parser.TokenSymbol && t.Value == ";" {
+			return true
+		}
+		if t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwInto || t.Keyword == parser.KwUsing) {
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	stmt := &ExecuteStmt{pos: pos, Query: queryExpr}
+
+	// Optional INTO clause
+	if p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwInto {
+		p.advance() // consume INTO
+		varTok := p.advance()
+		if varTok.Kind != parser.TokenIdent {
+			return nil, p.errAt(varTok.Pos, "expected variable name after INTO")
+		}
+		stmt.IntoVar = varTok.Value
+	}
+
+	// Optional USING clause
+	if p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwUsing {
+		p.advance() // consume USING
+		for {
+			argExpr, err := p.scanExprTo("USING argument", func(t parser.Token) bool {
+				if t.Kind == parser.TokenSymbol && (t.Value == "," || t.Value == ";") {
+					return true
+				}
+				return false
+			})
+			if err != nil {
+				return nil, err
+			}
+			stmt.Using = append(stmt.Using, argExpr)
+			if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "," {
+				p.advance() // consume ","
+				continue
+			}
+			break
+		}
+	}
+
+	// Consume the trailing semicolon
+	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+		p.advance()
+	}
+	return stmt, nil
 }
 
 // parseRaise parses `RAISE [level] 'message' [, args...];`. M0096-0012.

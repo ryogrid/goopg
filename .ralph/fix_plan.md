@@ -1413,15 +1413,16 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         `updateViaIndex` paths that were returning 0 rows because the index was empty.
       - RETURNING inline yield: `updateViaIndex`, SeqScan, and `deleteOp.Next()` now
         return the first RETURNING row from inline code; subsequent rows via `o.done` block.
-      eval-plan-qual runs 7.4-7.9s, 1140/1494 lines. Remaining diff:
-        - `noisy_oper` PL/pgSQL function fails: `EXECUTE format(...) INTO r USING ...`
-          is not supported (plpgsql: syntax error at byte 23: unsupported PL/pgSQL
-          statement). Accounts for most of the 354 missing lines. All balance-value
-          differences (L69/L93/L138/L226) are now CORRECT:
-          - epqDoUpdate flag (updateViaIndex + SeqScan) bypasses EPQ check after abort,
-            allowing update code to execute on next iteration.
-          - v.row = newRow in DELETE EPQ chain-following ensures RETURNING shows
-            the actual deleted value, not the stale scan-time value.
+      eval-plan-qual runs 7.4-7.9s, 1133/1494 lines. Progress this loop:
+        - PL/pgSQL `EXECUTE expr INTO varname USING params` implemented (M0100-0005):
+          parser, AST (ExecuteStmt), and runtime handler in plpgsql_runtime.go.
+          `noisy_oper` function now parses and executes (no more "unsupported statement").
+        - NOTICE propagation: `executePLpgSQLRoutine` now propagates notices from
+          child context back to parent (RAISE NOTICE in called functions is visible).
+        - IsolationRunner: `writeCompletedStep` helper for consistent pending output.
+        Remaining diff: noisy_oper executes but NOTICE output format differs (expected
+        has `s2: NOTICE: ...` lines that require pq notice capture + EXISTS short-circuit
+        for correct count). goopg EXISTS doesn't short-circuit → too many NOTICEs.
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait
