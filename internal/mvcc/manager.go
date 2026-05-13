@@ -120,6 +120,34 @@ func (m *Manager) SetNextXID(x storage.TransactionID) {
 	}
 }
 
+// ReplayXactCommit is called by the standby's StreamReplayer when it applies
+// a RecordKindXactCommit from the primary. It advances nextXID past xid so
+// that snapshots taken on the standby see the replayed tuples as committed
+// (xmin < snap.Xmax). Without this call, the snapshot's Xmax equals the
+// committed XID, causing "xid >= Xmax → invisible" for every replayed tuple.
+func (m *Manager) ReplayXactCommit(xid storage.TransactionID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := xid + 1
+	if next > m.nextXID {
+		m.nextXID = next
+	}
+}
+
+// ReplayXactAbort is called by the standby's StreamReplayer when it applies a
+// RecordKindXactAbort from the primary. It advances nextXID past xid (so the
+// aborted transaction is not treated as "future") and records it in abortedXIDs
+// (so its heap tuples remain invisible to queries on the standby).
+func (m *Manager) ReplayXactAbort(xid storage.TransactionID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := xid + 1
+	if next > m.nextXID {
+		m.nextXID = next
+	}
+	m.abortedXIDs = insertSortedXID(m.abortedXIDs, xid)
+}
+
 // NextXID returns the value the next Begin will allocate. Used by
 // the bootstrap path to snapshot transaction state across restarts.
 func (m *Manager) NextXID() storage.TransactionID {

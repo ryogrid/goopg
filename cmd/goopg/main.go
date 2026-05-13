@@ -33,6 +33,7 @@ import (
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/server"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -571,6 +572,20 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 	iterStartLSN := writtenLSN + 1
 	walDir := filepath.Join(rt.DataDir, "pg_wal")
 	sr := wal.NewStreamReplayer(rt.StorageMgr, writtenLSN)
+	// Wire MVCC visibility for hot-standby reads: when the primary
+	// commits a transaction, advance the standby's nextXID past the
+	// committed XID so snapshots taken on the standby see replayed
+	// tuples as committed (xmin < snap.Xmax). Without this hook the
+	// snapshot's Xmax equals the committed XID, making every replayed
+	// tuple invisible ("xid >= Xmax → future").
+	txnMgr := rt.TxnMgr
+	sr.SetXactReplayHook(func(xid storage.TransactionID, committed bool) {
+		if committed {
+			txnMgr.ReplayXactCommit(xid)
+		} else {
+			txnMgr.ReplayXactAbort(xid)
+		}
+	})
 	go func() {
 		defer close(done)
 		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, iterStartLSN)

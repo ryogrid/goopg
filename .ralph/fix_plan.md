@@ -23,7 +23,7 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
 
 ### Sub-milestones
 
-- [ ] **M0094-0005** — Resolve remaining M0005 caveat, then re-verify M0005/M0008 DoD.
+- [x] **M0094-0005** — Resolve remaining M0005 caveat, then re-verify M0005/M0008 DoD.
       PARTIAL PROGRESS 2026-05-14 (loop 1): standby continuous-replay tail-anchor
       off-by-one fixed in cmd/goopg/main.go (`startStandbyReplayer` +
       `startWalreceiver` now anchor at `WrittenLSN()+1`, the next record's first
@@ -45,13 +45,18 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
       `docs/design/0094-0005b-virtual-view-plan-cache-staleness.md`.
       `TestReplicationEndToEnd` — PASS. All affected packages pass:
       planner/executor/server/initdb/wal/testutil regressions all green.
-      Remaining open blocker: `TestE2E_PhysicalReplication` (testport) still
-      fails — but the failure mode has shifted: standby WAL streams + applies
-      records, yet the standby's executor does not see the inserted row via
-      SELECT. That is a SQL-level row-visibility / catalog-vs-storage
-      coherence problem on the standby (standby's executor catalog snapshot,
-      MVCC visibility of replayed tuples, or buffer-pool reload after WAL
-      apply). To be diagnosed in a follow-up loop within M0094-0005 scope.
+      COMPLETE 2026-05-14 (loop 3): standby hot-read MVCC visibility fixed.
+      Root cause: `StreamReplayer` treated `RecordKindXactCommit` as a no-op,
+      so the standby's `mvcc.Manager.nextXID` stayed at the clone-time value.
+      The primary's first post-restart INSERT got XID == nextXID; standby
+      snapshot's `Xmax = nextXID`, and `xmin >= Xmax` made the tuple invisible.
+      Fix: `mvcc.Manager.ReplayXactCommit(xid)` advances nextXID to xid+1;
+      `mvcc.Manager.ReplayXactAbort(xid)` does the same and adds xid to
+      abortedXIDs. `wal.StreamReplayer.SetXactReplayHook` wires the callback;
+      `startStandbyReplayer` installs it. Design:
+      `docs/design/0094-0005c-standby-mvcc-visibility.md`.
+      `TestE2E_PhysicalReplication` — PASS. `TestReplicationEndToEnd` — PASS.
+      All affected packages pass: mvcc/wal/planner/executor/server/initdb.
 
 ## M0095 — Client-Tools TAP Test Porting (filed 2026-05-12)
 
