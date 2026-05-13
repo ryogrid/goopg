@@ -131,7 +131,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 
 func toPlanError(err error) error {
 	if ae, ok := err.(*analyzer.AnalyzeError); ok {
-		return &PlanError{Pos: ae.Pos, Code: ae.Code, Message: ae.Message}
+		return &PlanError{Pos: ae.Pos, Code: ae.Code, Message: ae.Message, Hint: ae.Hint}
 	}
 	return err
 }

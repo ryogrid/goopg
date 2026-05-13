@@ -486,7 +486,7 @@ func parseTimeString(s string) (time.Time, error) {
 	// 24:00:00 is a valid time (midnight); h=24 with m=0, s=0, ns=0 is allowed.
 	// h > 24, or h=24 with any m/s/ns > 0 are invalid.
 	if h > 24 || (h == 24 && (m > 0 || sec > 0 || ns > 0)) {
-		return time.Time{}, &ExecError{Code: "22007",
+		return time.Time{}, &ExecError{Code: "22008",
 			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
 	}
 

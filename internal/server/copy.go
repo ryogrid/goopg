@@ -509,13 +509,20 @@ func execErrCode(err error) sqlstate.Code {
 	return sqlstate.SystemError
 }
 
-// execErrDetailFields returns extra ErrorField(s) for any Detail carried by the error. M0097-0003.
+// execErrDetailFields returns extra ErrorField(s) for any Detail and Hint carried by the error. M0097-0003.
 func execErrDetailFields(err error) []protocol.ErrorField {
 	var ee *executor.ExecError
-	if errors.As(err, &ee) && ee.Detail != "" {
-		return []protocol.ErrorField{{Code: protocol.FieldDetail, Value: ee.Detail}}
+	if !errors.As(err, &ee) {
+		return nil
 	}
-	return nil
+	var fields []protocol.ErrorField
+	if ee.Detail != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: ee.Detail})
+	}
+	if ee.Hint != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldHint, Value: ee.Hint})
+	}
+	return fields
 }
 
 func execErrCodeStr(err error) string { return string(execErrCode(err)) }

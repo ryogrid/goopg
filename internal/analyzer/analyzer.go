@@ -42,6 +42,7 @@ type AnalyzeError struct {
 	Pos     int
 	Code    string
 	Message string
+	Hint    string // optional hint; propagated to PlanError.Hint by toPlanError. M0097-0004.
 }
 
 func (e *AnalyzeError) Error() string {
@@ -53,6 +54,24 @@ func (e *AnalyzeError) Error() string {
 
 func analyzeError(pos int, code, msg string) *AnalyzeError {
 	return &AnalyzeError{Pos: pos, Code: code, Message: msg}
+}
+
+// pgTimeName returns the PostgreSQL display name for a time/timestamp type
+// as used in "operator is not unique" error messages. M0097-0004.
+func pgTimeName(typName string) string {
+	switch strings.ToLower(typName) {
+	case "time":
+		return "time without time zone"
+	case "timetz":
+		return "time with time zone"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "date":
+		return "date"
+	}
+	return typName
 }
 
 type scope struct {
@@ -819,6 +838,19 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				strings.EqualFold(leftTyp.Name, "interval") && isTimestampLike(rightTyp) {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
+			// time + time / timestamp + timestamp → ambiguous operator error
+			// matching PostgreSQL's "operator is not unique" format. M0097-0004.
+			// Note: only trigger when BOTH sides are concrete time/timestamp types
+			// (not "unknown", which covers untyped string literals).
+			if (x.Op == parser.OpAdd || x.Op == parser.OpSub) &&
+				isConcreteTimestampLike(leftTyp) && isConcreteTimestampLike(rightTyp) {
+				lname := pgTimeName(leftTyp.Name)
+				rname := pgTimeName(rightTyp.Name)
+				ae := analyzeError(x.Pos(), "42725",
+					fmt.Sprintf("operator is not unique: %s %s %s", lname, x.Op, rname))
+				ae.Hint = "Could not choose a best candidate operator. You might need to add explicit type casts."
+				return catalog.Type{}, ae
+			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
@@ -1575,6 +1607,18 @@ func isTimestampLike(t catalog.Type) bool {
 	if isUnknownType(t) {
 		return true
 	}
+	switch strings.ToLower(t.Name) {
+	case "timestamp", "timestamptz", "date", "time", "timetz":
+		return true
+	}
+	return false
+}
+
+// isConcreteTimestampLike is like isTimestampLike but returns false for
+// "unknown" type (untyped string literals). Used to avoid false-positive
+// "operator is not unique" errors when a string literal participates in
+// arithmetic. M0097-0004.
+func isConcreteTimestampLike(t catalog.Type) bool {
 	switch strings.ToLower(t.Name) {
 	case "timestamp", "timestamptz", "date", "time", "timetz":
 		return true
