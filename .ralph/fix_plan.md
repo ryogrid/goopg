@@ -808,6 +808,15 @@ M0097-0001 wires it up.
       numerology test: 162 → 130 normalized diff lines.
       delete test: WAL error normalization stabilizes it.
       Still 16 tests passing (delete was intermittently failing due to WAL error).
+      Loop 22 additions (2026-05-13):
+      101. Trailing/double underscore in fractional part and exponent now produce errors.
+      102. Leading underscore in exponent now produces error.
+      103. Trailing dot ("1_000.") and leading dot (".000_005") are valid float literals.
+      104. parseNumeric strips underscores before parsing for underscore-separator support.
+      105. 0b/0o/0x with no digits → "invalid binary/octal/hexadecimal integer" (PG format).
+      106. Normalizer strips "lex error at byte N:" prefix from trailing-junk/invalid errors.
+      107. Normalizer rule for invalid binary/octal/hex integer prefix stripping.
+      numerology test: 162 → 109 → 54 normalized diff lines.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
