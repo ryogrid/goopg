@@ -1222,21 +1222,25 @@ while preserving the original `-c 100 -j 100` target-condition validation.
 
 ## M0100 — RC Isolation Suite: Runtime Correctness Closure & 21-Spec Pass (filed 2026-05-13)
 
-**【強制方針 / Strong policy — DO NOT BYPASS】**
-本マイルストーンでは、サブタスクを DEFERRED として扱うことを原則として認めない。
-ここで列挙された全ての項目は 21 個の RC isolation テストを実際にパスさせるための
-残存ランタイム正当性ギャップであり、いずれかを未実装のまま残すと M0100 の
-Definition of Done を達成できない。「後続マイルストーンに送る」「次ループに回す」
-といった逃げ道は使わないこと。例外として DEFERRED が許容されるのは、
-(a) goopg の Go 実装制約あるいは設計制約により本リリースで実装不可能であることが
-明確に立証され、(b) その理由が当該サブマイルストーンの本文に明記されており、かつ
-(c) 21 テストのうち当該項目がブロックするものを `excluded` ではなく `pass` させる
-ための代替経路が同マイルストーン内で提示されている場合 — の三点を **全て** 満たす
-ときに限る。これに該当しない理由で DEFERRED 化することは許可しない。
+**【Strong policy — DO NOT BYPASS】**
+Within this milestone, marking any sub-task as DEFERRED is, as a rule,
+not permitted. Every item enumerated here is a residual runtime
+correctness gap that must be closed to actually make the 21 RC
+isolation tests pass; leaving any one of them unimplemented makes
+M0100's Definition of Done unreachable. Escape hatches such as "push
+it to the next milestone" or "punt to the next loop" must not be used.
+DEFERRED is permitted only when **all three** of the following hold
+simultaneously: (a) it is clearly demonstrated that the item is
+impossible to implement in this release due to goopg's Go-implementation
+constraints or explicit design constraints; (b) the reason is documented
+in the body of the affected sub-milestone; and (c) within the same
+milestone, an alternative path is presented that lets the corresponding
+test(s) reach `pass` (not `excluded`). Deferring for any reason that
+does not satisfy all three conditions is not allowed.
 
 Operational note (2026-05-13):
-- blocker の存在や goopg 未対応で途中までしか進められない項目は、blocker 解消までを本マイルストーンの実施範囲に含める。
-- blocker 解消により先に進める項目は、解消実装と再検証が完了するまで完了扱いにしない。
+- For items that can only be partially progressed due to an external blocker or missing goopg support, blocker resolution is itself in scope for this milestone.
+- For items that can move forward once a blocker is resolved, do not mark them complete until the resolution is implemented and re-verified.
 
 **Goal.** Make all 21 dedicated `TestPort_Isolation*` test functions
 (added by M0096-0001) report `pass`. The parser/planner/catalog/DDL
