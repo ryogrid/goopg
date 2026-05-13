@@ -25,6 +25,7 @@ type IsolationSpec struct {
 	SessionSetup     map[string]string // per-session setup run before each permutation
 	SessionTeardown  map[string]string // per-session teardown run after each permutation
 	Steps            map[string]IsolationStep
+	StepOrder        []string          // step names in declaration order (for "unused step" warnings)
 	Permutations     [][]string
 }
 
@@ -43,6 +44,7 @@ type IsolationExecutor interface {
 var (
 	reSession      = regexp.MustCompile(`^session\s+("([^"]+)"|(\S+))\s*$`)
 	reStepStart    = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*\{(.*)$`)
+	reStepNoBlock  = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*$`)
 	rePermutation  = regexp.MustCompile(`^permutation\s+(.+)$`)
 	reQuotedTokens = regexp.MustCompile(`"([^"]+)"`)
 )
@@ -93,8 +95,27 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 	ctx := ctxTop
 	currentSession := ""
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	// pendingLine holds a raw line that was read ahead but not yet consumed.
+	pendingLine := ""
+
+	nextLine := func() (string, bool) {
+		if pendingLine != "" {
+			l := pendingLine
+			pendingLine = ""
+			return l, true
+		}
+		if scanner.Scan() {
+			return scanner.Text(), true
+		}
+		return "", false
+	}
+
+	for {
+		rawLine, ok := nextLine()
+		if !ok {
+			break
+		}
+		line := strings.TrimSpace(rawLine)
 		// strip inline comments
 		if idx := strings.Index(line, "#"); idx >= 0 {
 			line = strings.TrimSpace(line[:idx])
@@ -150,22 +171,70 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 			continue
 		}
 
-		// step
+		// step — handles both inline-brace (`step name {`) and next-line brace
+		// (`step name\n{`), and both quoted (`step "name"`) and unquoted names.
+		var stepNameParsed, stepRest string
 		if m := reStepStart.FindStringSubmatch(line); len(m) >= 5 {
-			stepName := m[2]
-			if stepName == "" {
-				stepName = m[3]
+			if m[2] != "" {
+				stepNameParsed = m[2]
+			} else {
+				stepNameParsed = m[3]
 			}
-			rest := m[4]
-			body := readBlock(rest, scanner)
-			session := inferSession(stepName, s.Sessions, currentSession)
-			s.Steps[stepName] = IsolationStep{Name: stepName, Session: session, SQL: strings.TrimSpace(body)}
+			stepRest = m[4]
+		} else if m := reStepNoBlock.FindStringSubmatch(line); len(m) >= 2 {
+			if m[2] != "" {
+				stepNameParsed = m[2]
+			} else {
+				stepNameParsed = m[3]
+			}
+			// Brace is on the next line — advance scanner until we find it.
+			for scanner.Scan() {
+				next := strings.TrimSpace(scanner.Text())
+				if next == "" {
+					continue
+				}
+				if strings.HasPrefix(next, "{") {
+					stepRest = next[1:]
+					break
+				}
+				// Unexpected token — not a step block; skip.
+				stepNameParsed = ""
+				break
+			}
+		}
+		if stepNameParsed != "" {
+			body := readBlock(stepRest, scanner)
+			session := inferSession(stepNameParsed, s.Sessions, currentSession)
+			if _, exists := s.Steps[stepNameParsed]; !exists {
+				s.StepOrder = append(s.StepOrder, stepNameParsed)
+			}
+			s.Steps[stepNameParsed] = IsolationStep{Name: stepNameParsed, Session: session, SQL: strings.TrimSpace(body)}
 			continue
 		}
 
-		// permutation
+		// permutation — may span multiple lines; continuation lines are indented
 		if m := rePermutation.FindStringSubmatch(line); len(m) == 2 {
-			s.Permutations = append(s.Permutations, parsePermutationTokens(m[1]))
+			tokens := parsePermutationTokens(m[1])
+			// Read continuation lines (indented lines with only step names).
+			for {
+				nextRaw, ok2 := nextLine()
+				if !ok2 {
+					break
+				}
+				// Continuation lines start with whitespace in the original file.
+				isIndented := len(nextRaw) > 0 && (nextRaw[0] == ' ' || nextRaw[0] == '\t')
+				stripped := strings.TrimSpace(nextRaw)
+				if idx := strings.Index(stripped, "#"); idx >= 0 {
+					stripped = strings.TrimSpace(stripped[:idx])
+				}
+				if !isIndented || stripped == "" {
+					// Not a continuation — push back and stop.
+					pendingLine = nextRaw
+					break
+				}
+				tokens = append(tokens, parsePermutationTokens(stripped)...)
+			}
+			s.Permutations = append(s.Permutations, tokens)
 			continue
 		}
 	}
@@ -191,13 +260,14 @@ func nextNonEmpty(scanner *bufio.Scanner) string {
 
 // readBlock reads the content inside a { ... } block from the scanner.
 // rest is the text after the opening '{' on the same line.
-// Relative indentation is preserved: the minimum leading-space count
-// across non-empty lines is stripped, matching PostgreSQL isolationtester's
-// display format. M0100-0005.
+// Raw indentation is preserved so that multi-line SQL prints exactly as
+// written in the spec file (matching PostgreSQL isolationtester output).
 func readBlock(rest string, scanner *bufio.Scanner) string {
+	// Single-line: closing brace is on the same line.
 	if idx := strings.Index(rest, "}"); idx >= 0 {
 		return strings.TrimSpace(rest[:idx])
 	}
+	// Multi-line: read lines until closing brace, preserving raw content.
 	var lines []string
 	if t := strings.TrimSpace(rest); t != "" {
 		lines = append(lines, t)
@@ -210,38 +280,12 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 			}
 			break
 		}
-		// Preserve the raw line (with leading spaces) for relative indent.
-		lines = append(lines, next)
+		lines = append(lines, next) // preserve raw line with indentation
 	}
 	if len(lines) == 0 {
 		return ""
 	}
-	// Compute minimum indentation across non-empty non-trimmed lines.
-	minIndent := -1
-	for _, l := range lines {
-		if strings.TrimSpace(l) == "" {
-			continue
-		}
-		n := len(l) - len(strings.TrimLeft(l, " \t"))
-		if minIndent < 0 || n < minIndent {
-			minIndent = n
-		}
-	}
-	if minIndent < 0 {
-		minIndent = 0
-	}
-	var sb strings.Builder
-	for i, l := range lines {
-		if i > 0 {
-			sb.WriteByte('\n')
-		}
-		if len(l) > minIndent {
-			sb.WriteString(l[minIndent:])
-		} else {
-			sb.WriteString(strings.TrimSpace(l))
-		}
-	}
-	return sb.String()
+	return strings.Join(lines, "\n")
 }
 
 // RunIsolationPermutation executes a single permutation sequentially using the

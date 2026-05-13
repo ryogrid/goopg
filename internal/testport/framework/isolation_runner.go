@@ -62,7 +62,22 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		nSessions = 1
 	}
 
+	// Collect all step names referenced by any permutation.
+	usedSteps := make(map[string]bool)
+	for _, perm := range spec.Permutations {
+		for _, sname := range perm {
+			usedSteps[sname] = true
+		}
+	}
+
+	// Print "unused step name: X" for any declared step not in any permutation,
+	// in definition order. Matches PostgreSQL isolationtester.c output. M0100-0005.
 	var sb strings.Builder
+	for _, sname := range spec.StepOrder {
+		if !usedSteps[sname] {
+			fmt.Fprintf(&sb, "unused step name: %s\n", sname)
+		}
+	}
 	fmt.Fprintf(&sb, "Parsed test spec with %d sessions\n", nSessions)
 
 	for i, perm := range spec.Permutations {
@@ -242,7 +257,15 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 		case <-time.After(blockDetectWait):
 			// Step appears blocked; record and continue.
-			fmt.Fprintf(&sb, "step %s: %s <waiting ...>\n", step.Name, flattenSQL(step.SQL))
+			// For single-line SQL: "step name: sql <waiting ...>"
+			// For multi-line SQL:  "step name: \nsql\n <waiting ...>"
+			// (matches PostgreSQL isolationtester output format)
+			flat := flattenSQL(step.SQL)
+			if strings.Contains(flat, "\n") {
+				fmt.Fprintf(&sb, "step %s: %s\n <waiting ...>\n", step.Name, flat)
+			} else {
+				fmt.Fprintf(&sb, "step %s: %s <waiting ...>\n", step.Name, flat)
+			}
 			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh})
 		}
 	}
@@ -546,32 +569,19 @@ func formatPQError(err error) string {
 	return "ERROR:  " + msg
 }
 
-// flattenSQL formats SQL for the step header line. Single-line SQL is
-// returned as-is. Multi-line SQL is formatted with the first SQL line on a
-// new line (so the header prints as "step name: \n    line1\n    line2..."),
-// preserving relative indentation within the body. Matches PostgreSQL
-// isolationtester's output format. M0100-0005.
+// flattenSQL formats SQL for the step header line.
+// Single-line SQL is returned as-is (TrimSpaced).
+// Multi-line SQL is returned as "\n<raw content>" so the step header prints as
+// "step name: \n<raw-content>\n", preserving the original spec file indentation.
+// This matches PostgreSQL isolationtester's output format. M0100-0005.
 func flattenSQL(s string) string {
-	lines := strings.Split(s, "\n")
-	var parts []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) != "" {
-			parts = append(parts, l)
-		}
+	if !strings.Contains(s, "\n") {
+		return strings.TrimSpace(s)
 	}
-	if len(parts) == 0 {
-		return s
-	}
-	if len(parts) == 1 {
-		return strings.TrimSpace(parts[0])
-	}
-	// Multi-line: each line gets 4-space base indent + its preserved indent.
-	var sb strings.Builder
-	for _, l := range parts {
-		sb.WriteString("\n    ")
-		sb.WriteString(l)
-	}
-	return sb.String()
+	// Multi-line: emit a newline then the raw content.
+	// normalizeIsoOutput strips trailing whitespace from each line, so any
+	// trailing space on the "step name: " line is removed automatically.
+	return "\n" + strings.TrimRight(s, " \t\n")
 }
 
 // isNumericType reports whether dbTypeName is a numeric PostgreSQL type.

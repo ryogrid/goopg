@@ -348,6 +348,12 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, i
 // place — visibility filtering at the next probe will skip it
 // because the tuple's xmax now blocks it.
 func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, oldPtr storage.ItemPointer, updated Row) error {
+	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
+	// real delete stamp (not InvalidTransactionID). Without this, the old
+	// tuple's xmax=0 would make it appear still-live to subsequent scans.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
 	pinned, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: oldPtr.Block})
 	if err != nil {
 		return err

@@ -472,7 +472,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 					_ = p.acceptSymbol(",")
 				}
-			} else if p.acceptIdentKeyword("from") {
+			} else if p.acceptKeyword(KwFrom) || p.acceptIdentKeyword("from") {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after FROM")
 				}
@@ -515,7 +515,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		return stmt, nil
 	}
 	for {
-		// Table-level constraint: PRIMARY KEY ( cols ).
+		// Table-level constraint: PRIMARY KEY ( cols ) [INCLUDE ( cols )].
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary {
 			p.advance()
 			if _, err := p.expectKeyword(KwKey); err != nil {
@@ -532,6 +532,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, p.errAtCur("expected ')'")
 			}
 			stmt.PrimaryKey = cols
+			// Optional INCLUDE (col, …) — accept and discard for compat.
+			if p.acceptIdentKeyword("include") {
+				if p.acceptSymbol("(") {
+					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						p.advance()
+					}
+				}
+			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
 			// Table-level UNIQUE (cols) — accept as no-op for now.
 			p.advance()
@@ -575,6 +583,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					return nil, p.errAtCur("expected ')'")
 				}
 				stmt.PrimaryKey = cols
+				// Optional INCLUDE (col, …) — accept and discard for compat.
+				if p.acceptIdentKeyword("include") {
+					if p.acceptSymbol("(") {
+						for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+							p.advance()
+						}
+					}
+				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 				p.advance()
 				if p.acceptSymbol("(") {
@@ -1928,7 +1944,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				if !p.acceptSymbol(")") {
 					return AlterTableAction{}, p.errAtCur("expected ')'")
 				}
-			} else if p.acceptIdentKeyword("from") {
+			} else if p.acceptKeyword(KwFrom) || p.acceptIdentKeyword("from") {
 				if !p.acceptSymbol("(") {
 					return AlterTableAction{}, p.errAtCur("expected '('")
 				}
