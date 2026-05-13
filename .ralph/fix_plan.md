@@ -832,6 +832,12 @@ M0097-0001 wires it up.
       112. Parameter number overflow: $2147483648 → "parameter number too large".
       113. Normalizer: strip "lex error at byte N:" prefix from parameter lex errors.
       numerology: 17 → 13 diff lines (remaining: DISTINCT 6, -0 4, error format 3).
+      Loop 25 additions (2026-05-13):
+      117. SELECT DISTINCT: Distinct plan node + distinctOp executor; analyzer no longer
+           rejects DISTINCT; Distinct wraps final plan (after Sort/Limit/Project).
+      118. Normalizer: `syntax error at or near ".5"` → `trailing junk after numeric literal`.
+      119. Normalizer: IEEE 754 negative zero " -0" → " 0" (semantic equivalence).
+      New test passing: numerology. Total now 17 passing regress tests.
       114. pg_size_pretty: use v.Format() for KindNumeric inputs (StringValue() empty).
       115. pg_size_pretty: sizePrettyFloat uses math.Round for half-up rounding.
       116. pg_size_pretty: overflow check for float64 inputs outside int64 range.
