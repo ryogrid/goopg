@@ -60,6 +60,12 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.Frame
 		return true, s.replyStartReplication(ctx, r, w, trimmed)
 	case strings.HasPrefix(upper, "TIMELINE_HISTORY "):
 		return true, s.replyTimelineHistory(w, trimmed[len("TIMELINE_HISTORY "):])
+	case upper == "BASE_BACKUP" || strings.HasPrefix(upper, "BASE_BACKUP "):
+		args := ""
+		if len(trimmed) > len("BASE_BACKUP") {
+			args = strings.TrimSpace(trimmed[len("BASE_BACKUP"):])
+		}
+		return true, s.replyBaseBackup(ctx, w, args)
 	}
 	return false, nil
 }

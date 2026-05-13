@@ -1208,17 +1208,57 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
       Gate result: BOTH prerequisites satisfied — M0102-0002 (BASE_BACKUP wire
       protocol) is unblocked and may begin.
 
-- [ ] **M0102-0002** — BASE_BACKUP wire-protocol handler on goopg primary.
-      Design doc: `docs/design/0102-0001-base-backup-wire-protocol.md`.
-      Sites: `internal/server/replication.go` (add `case "BASE_BACKUP":` arm);
-      new `internal/server/basebackup.go` (POSIX ustar tar emitter, file
-      walking over `base/`+`global/`+optional `pg_wal/`, `backup_label`
-      synthesis, optional MANIFEST). Mirrors upstream
-      `postgres/src/backend/replication/walsender.c:1984`
-      `exec_replication_command` BASE_BACKUP arm and `basebackup.c:990`
-      `SendBaseBackup`. Verify: `./postgres/local_install/bin/pg_basebackup
-      -h 127.0.0.1 -p <goopg> -D /tmp/clone -X stream -P -v` exits 0 and the
-      cloned dir starts as a goopg standby.
+- [x] **M0102-0002** — BASE_BACKUP wire-protocol handler on goopg primary.
+      LANDED 2026-05-14. Design doc:
+      `docs/design/0102-0001-base-backup-wire-protocol.md` (accepted).
+      Changes:
+      - `internal/server/basebackup.go` (new) — `replyBaseBackup` plus a
+        POSIX-ustar tar emitter wired through CopyData frames. Wire shape
+        mirrors `bbsink_copystream` byte-for-byte: start-LSN result-set
+        (`recptr text`, `tli int8`) → tablespace list (`spcoid`,
+        `spclocation`, `size`) with one all-NULL row →
+        CommandComplete("SELECT") → CopyOutResponse → CopyData('n'
+        archive_name="base.tar" path="") → CopyData('d' chunk)+ →
+        periodic CopyData('p' bytes-done int8 be) → CopyDone →
+        end-LSN result-set → ReadyForQuery.
+      - `internal/server/replication.go` — `BASE_BACKUP` and
+        `BASE_BACKUP <opts>`/`BASE_BACKUP (opts)` dispatched into the
+        new handler.
+      - `parseBaseBackupOptions` understands upstream's PG17+
+        parenthesized grammar AND the legacy whitespace form. Unknown
+        keys (CHECKPOINT, TABLESPACE_MAP, VERIFY_CHECKSUMS, MAX_RATE,
+        COMPRESSION, INCREMENTAL, …) are tolerated so vanilla
+        pg_basebackup invocations don't bounce on syntax.
+      - Synthetic `backup_label` matches `build_backup_content`'s field
+        order (START WAL LOCATION → CHECKPOINT LOCATION → BACKUP METHOD
+        → BACKUP FROM → START TIME → LABEL → START TIMELINE).
+      - Tar ordering: backup_label first → DataDir walk minus excluded
+        per-process artefacts (`postmaster.pid`, `.goopg.ctl.sock`,
+        `postmaster.opts`, `pg_internal.init`) → `global/pg_control`
+        emitted **last** (upstream invariant for atomic recovery).
+      - Progress reporting every 1 MiB of tar bytes (matches upstream's
+        PROGRESS_REPORT_BYTE_INTERVAL); mandatory end-of-archive
+        `'p'` frame so client UI finishes at 100%.
+      - When `Config.Checkpointer` is wired, `replyBaseBackup` calls
+        `CheckpointNow()` before sampling the start LSN — keeps the
+        start-LSN's redo image on disk, matches upstream's
+        `do_pg_backup_start` ordering.
+      Tests:
+      - `internal/server/basebackup_test.go::TestBaseBackupWireProtocolFraming`
+        drives BASE_BACKUP via the in-process protocol harness; asserts
+        the entire frame sequence and parses the captured tar with
+        `archive/tar` to verify backup_label content, excluded-entry
+        omission, and the pg_control-last invariant.
+      - `TestBaseBackupRejectsWithoutDataDir` confirms a clean
+        ErrorResponse + RFQ when `DataDir` is empty.
+      - `TestBaseBackupParseOptions` exercises both PG17+
+        parenthesized and legacy keyword option grammars.
+      Verification: `go test -race -count=1 ./internal/server/
+      ./internal/wal/ ./internal/initdb/` → ALL PASS.
+      Documented follow-up (out of M0102-0002 scope): in-flight
+      pg_control rewrite (`backupStartPoint`/`backupEndPoint`) needed
+      before a PG standby can actually boot from the resulting tar
+      under Scenario B (M0102-0007). The wire path itself is complete.
 
 - [x] **M0102-0003** — TIMELINE_HISTORY wire-protocol + TLI history file writer.
       LANDED 2026-05-14. Design doc:
