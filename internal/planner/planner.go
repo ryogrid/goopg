@@ -3067,6 +3067,16 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 		insert.OnConflict = oc
 	}
+	if len(s.Returning) > 0 {
+		retCtx := singleBindingContext(tbl, s.Target.Alias)
+		retCtx.cat = cat
+		retExprs, retSchema, err := resolveTargets(s.Returning, retCtx)
+		if err != nil {
+			return nil, err
+		}
+		insert.Returning = retExprs
+		insert.ReturningSchema = retSchema
+	}
 	return insert, nil
 }
 

@@ -753,11 +753,13 @@ func (n *ScalarFuncScan) Output() Schema { return n.schema }
 // nil for a plain INSERT — every existing test path keeps that
 // nil-default. Non-nil for the upstream-compatible UPSERT shape.
 type Insert struct {
-	pos         int
-	Table       *catalog.Table
-	Source      Node
-	ColumnIndex []int
-	OnConflict  *OnConflictPlan
+	pos             int
+	Table           *catalog.Table
+	Source          Node
+	ColumnIndex     []int
+	OnConflict      *OnConflictPlan
+	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
+	ReturningSchema Schema // output schema when Returning is non-nil
 }
 
 func (n *Insert) Pos() int       { return n.pos }

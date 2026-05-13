@@ -389,9 +389,6 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 	if err != nil {
 		return err
 	}
-	if len(s.Returning) > 0 {
-		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
-	}
 	// INSERT … SELECT: analyze the SELECT sub-statement and skip VALUES checks.
 	if s.Select != nil {
 		return analyzeSelectWithParent(s.Select, cat, nil)

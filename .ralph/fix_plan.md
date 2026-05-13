@@ -996,6 +996,14 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         - NOTICE propagation: `executePLpgSQLRoutine` now propagates notices from
           child context back to parent (RAISE NOTICE in called functions is visible).
         - IsolationRunner: `writeCompletedStep` helper for consistent pending output.
+        - INSERT RETURNING (M0100-0005, 2026-05-14): Insert plan node gains
+          Returning/ReturningSchema fields; planInsert resolves RETURNING targets via
+          singleBindingContext; analyzer no longer rejects RETURNING; insertOp
+          collects rows in retRows and yields them via Next() so client receives
+          full RowDescription+DataRow. eval-plan-qual-trigger now advances past
+          `INSERT INTO trigtest ... RETURNING *` (was: "0A000 RETURNING is not
+          supported in v0 planner"); remaining diff is trigger BEFORE/AFTER NOTICE
+          emission of OLD/NEW record refs.
         Remaining diff: NOTICE lines missing from output. Architecture is in place:
         - pq.ConnectorWithNoticeHandler at session level captures to sessionNoticeQueue
         - formatStepOutput writes NOTICEs BEFORE step SQL line (correct ordering)

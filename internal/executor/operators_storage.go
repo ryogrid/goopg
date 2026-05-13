@@ -467,6 +467,11 @@ type insertOp struct {
 	child        Operator
 	rowsAffected int64
 	done         bool
+
+	// retRows / retIdx: collected RETURNING rows; iterated via Next()
+	// after all inserts are applied (M0100-0005).
+	retRows []Row
+	retIdx  int
 }
 
 // RowsAffected satisfies executor.RowCounter.
@@ -476,7 +481,27 @@ func newInsertOp(p *planner.Insert, child Operator) *insertOp {
 	return &insertOp{plan: p, child: child}
 }
 
-func (o *insertOp) Schema() planner.Schema { return nil }
+func (o *insertOp) Schema() planner.Schema {
+	if len(o.plan.Returning) > 0 {
+		return o.plan.ReturningSchema
+	}
+	return nil
+}
+
+// appendInsertRetRow evaluates the plan's RETURNING expressions against
+// the just-inserted row (parent column order) and appends the result to
+// o.retRows. No-op when RETURNING is absent. M0100-0005.
+func (o *insertOp) appendInsertRetRow(row Row) {
+	if len(o.plan.Returning) == 0 {
+		return
+	}
+	retRow := make(Row, len(o.plan.Returning))
+	for i, expr := range o.plan.Returning {
+		v, _ := evalExpr(expr, row, o.ctx)
+		retRow[i] = v
+	}
+	o.retRows = append(o.retRows, retRow)
+}
 
 func (o *insertOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -495,11 +520,17 @@ func (o *insertOp) Open(ctx *Context) error {
 
 func (o *insertOp) Close() error { return o.child.Close() }
 
-// Next runs the insert as a one-shot side effect on first call; the
-// wire-protocol path then issues `INSERT N` rather than streaming
-// rows back. RETURNING is deferred — see fix_plan.
+// Next runs the insert as a one-shot side effect on first call. With
+// RETURNING (M0100-0005) the inserted rows are accumulated in o.retRows
+// and streamed out on subsequent calls. Without RETURNING the wire layer
+// issues `INSERT N`.
 func (o *insertOp) Next() (TupleSlot, error) {
 	if o.done {
+		if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
+			row := o.retRows[o.retIdx]
+			o.retIdx++
+			return SlotFromRow(o.plan.ReturningSchema, row), nil
+		}
 		return nil, EOF
 	}
 	o.done = true
@@ -598,6 +629,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 						return nil, werr
 					}
 					maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
+					o.appendInsertRetRow(row)
 					o.rowsAffected++
 					continue
 				}
@@ -609,7 +641,16 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			return nil, werr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
+		o.appendInsertRetRow(row)
 		o.rowsAffected++
+	}
+	// Yield the first RETURNING row inline (subsequent rows come from the
+	// done-branch in Next()). Without RETURNING, return EOF as before so
+	// the wire layer issues `INSERT N`.
+	if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	return nil, EOF
 }
