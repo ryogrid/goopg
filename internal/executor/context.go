@@ -150,6 +150,12 @@ type Context struct {
 	// messages to the client. M0097-0008.
 	Notices []string
 
+	// NoticeFlush, when non-nil, is called for each NOTICE as it is generated
+	// so the server can send it to the client in real-time (before CommandComplete).
+	// This matches PostgreSQL's behavior where NOTICE messages arrive before
+	// any blocking point. M0100-0005.
+	NoticeFlush func(string)
+
 	// Sequence session state — maps sequence key → last nextval result
 	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
 	CurrSeqVals map[string]int64
@@ -163,8 +169,12 @@ type Context struct {
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.
-// Callers: DDL operators that use IF EXISTS on non-existent objects.
+// If NoticeFlush is set, the message is also flushed to the client immediately
+// (matching PostgreSQL's real-time notice delivery). M0100-0005.
 func (c *Context) AddNotice(msg string) {
+	if c.NoticeFlush != nil {
+		c.NoticeFlush(msg)
+	}
 	c.Notices = append(c.Notices, msg)
 }
 

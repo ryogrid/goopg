@@ -148,6 +148,9 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	if ctx != nil {
 		*child = *ctx
 	}
+	// Reset notices so TakeNotices propagates only new ones from this call,
+	// not the parent's accumulated notices. M0100-0005.
+	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	frame := newPLpgSQLFrame()
 	for i, arg := range args {
@@ -475,7 +478,8 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: raiseMsgEval()}
 		}
 		if ctx != nil {
-			ctx.AddNotice(raiseMsgEval())
+			msg := raiseMsgEval()
+			ctx.AddNotice(msg)
 		}
 		return Datum{}, flowNone, nil
 
@@ -519,16 +523,22 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, perr
 		}
 		slot, perr := op.Next()
+		// Copy the INTO result datum before Close() so releaseRow() does not
+		// zero it out underneath us. M0100-0005 fix: slot row is pooled.
+		var intoVal Datum
+		if s.IntoVar != "" && slot != nil && (perr == nil || perr == EOF) {
+			row := slot.Row()
+			if len(row) > 0 {
+				intoVal = row[0]
+			}
+		}
 		op.Close()
 		if perr != nil && perr != EOF {
 			return Datum{}, flowNone, perr
 		}
-		if s.IntoVar != "" && slot != nil {
-			row := slot.Row()
-			if len(row) > 0 {
-				if idx, ok := frame.lookup(s.IntoVar); ok {
-					frame.values[idx] = row[0]
-				}
+		if s.IntoVar != "" {
+			if idx, ok := frame.lookup(s.IntoVar); ok {
+				frame.values[idx] = intoVal
 			}
 		}
 		return Datum{}, flowNone, nil
@@ -1291,13 +1301,13 @@ func datumToSQLLiteral(d Datum) string {
 // is not yet implemented — the format-template text is returned as-is.
 // M0096-0012.
 // evalRaiseMsg evaluates a RAISE statement's message field in the plpgsql context.
-// Handles format args: `'%', expr` → evaluates expr, substitutes into format. M0097-0003.
+// Handles format args: `'fmt %', arg1, arg2` → evaluates each arg, substitutes
+// left-to-right into format (one % per arg; %% → literal %). M0097-0003.
 func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 	rawMsg = strings.TrimSpace(rawMsg)
 	if len(rawMsg) == 0 {
 		return rawMsg
 	}
-	// Try to split: 'format_template' , arg1, arg2, ...
 	if rawMsg[0] != '\'' {
 		return rawMsg // no format template
 	}
@@ -1318,31 +1328,97 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 	if argsText == "" || !strings.HasPrefix(argsText, ",") {
 		return fmtTemplate // no args
 	}
-	argsText = strings.TrimSpace(argsText[1:]) // skip comma
+	argsText = strings.TrimSpace(argsText[1:]) // skip leading comma
 
-	// Evaluate the args expression in the plpgsql frame.
-	// Preprocess: replace variable array subscripts like r[N] with literal values.
-	argsText = substitutePlpgsqlArraySubscripts(argsText, frame)
+	// Split into individual arg expressions on top-level commas.
+	argExprs := splitTopLevelCommas(argsText)
 
-	// Parse and evaluate the args expression as SQL.
-	argsExpr, err := parser.ParseExpr(argsText)
-	if err != nil {
-		return fmtTemplate // fallback
+	// Evaluate each arg expression.
+	argVals := make([]string, 0, len(argExprs))
+	for _, ae := range argExprs {
+		ae = strings.TrimSpace(ae)
+		ae = substitutePlpgsqlArraySubscripts(ae, frame)
+		parsed, err := parser.ParseExpr(ae)
+		if err != nil {
+			argVals = append(argVals, "")
+			continue
+		}
+		lowered, err := lowerPLpgSQLExpr(parsed, frame)
+		if err != nil {
+			argVals = append(argVals, "")
+			continue
+		}
+		val, err := evalExpr(lowered, frame.values, ctx)
+		if err != nil {
+			argVals = append(argVals, "")
+			continue
+		}
+		if val.IsNull() {
+			argVals = append(argVals, "")
+		} else {
+			argVals = append(argVals, val.Format())
+		}
 	}
-	lowered, err := lowerPLpgSQLExpr(argsExpr, frame)
-	if err != nil {
-		return fmtTemplate
+
+	// Substitute: each % (not %%) is replaced by the next arg in order.
+	argIdx := 0
+	var result strings.Builder
+	for i := 0; i < len(fmtTemplate); i++ {
+		if fmtTemplate[i] != '%' {
+			result.WriteByte(fmtTemplate[i])
+			continue
+		}
+		if i+1 < len(fmtTemplate) && fmtTemplate[i+1] == '%' {
+			result.WriteByte('%')
+			i++ // consume second %
+			continue
+		}
+		if argIdx < len(argVals) {
+			result.WriteString(argVals[argIdx])
+			argIdx++
+		} else {
+			result.WriteByte('%') // no more args
+		}
 	}
-	val, err := evalExpr(lowered, frame.values, ctx)
-	if err != nil || val.IsNull() {
-		return fmtTemplate
+	return result.String()
+}
+
+// splitTopLevelCommas splits s on commas not inside parentheses, brackets, or quotes.
+func splitTopLevelCommas(s string) []string {
+	var parts []string
+	depth := 0
+	inSingle := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inSingle {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // escaped ''
+				} else {
+					inSingle = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '(', '[':
+			depth++
+		case ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
 	}
-	// Apply format substitution: replace % with the evaluated arg value.
-	// Use Format() rather than StringValue() so non-string kinds (int, float, etc.)
-	// are converted to their text representation. M0097-0003.
-	argStr := val.Format()
-	result := strings.ReplaceAll(fmtTemplate, "%", argStr)
-	return result
+	parts = append(parts, s[start:])
+	return parts
 }
 
 // substitutePlpgsqlArraySubscripts replaces `varname[N]` patterns in a SQL expression

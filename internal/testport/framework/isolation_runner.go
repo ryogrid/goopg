@@ -394,6 +394,7 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) string {
 	var sb strings.Builder
 
+	isMultiLine := false
 	if !afterWaiting {
 		// NOTICEs appear BEFORE the step SQL line (matches PostgreSQL isolationtester).
 		for _, notice := range o.notices {
@@ -401,7 +402,9 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 				fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", o.session, notice)
 			}
 		}
-		fmt.Fprintf(&sb, "step %s: %s\n", name, flattenSQL(sqlText))
+		flat := flattenSQL(sqlText)
+		isMultiLine = strings.Contains(flat, "\n")
+		fmt.Fprintf(&sb, "step %s: %s\n", name, flat)
 	}
 
 	if o.errText != "" {
@@ -411,6 +414,11 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 	}
 
 	if len(o.rows) == 0 {
+		// Multi-line SQL steps with no result rows get a trailing blank line
+		// matching PostgreSQL isolationtester's output format. M0100-0005.
+		if isMultiLine {
+			sb.WriteString("\n")
+		}
 		return sb.String()
 	}
 
@@ -538,20 +546,32 @@ func formatPQError(err error) string {
 	return "ERROR:  " + msg
 }
 
-// flattenSQL collapses multi-line SQL for use in step header lines.
+// flattenSQL formats SQL for the step header line. Single-line SQL is
+// returned as-is. Multi-line SQL is formatted with the first SQL line on a
+// new line (so the header prints as "step name: \n    line1\n    line2..."),
+// preserving relative indentation within the body. Matches PostgreSQL
+// isolationtester's output format. M0100-0005.
 func flattenSQL(s string) string {
 	lines := strings.Split(s, "\n")
-	parts := make([]string, 0, len(lines))
+	var parts []string
 	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l != "" {
+		if strings.TrimSpace(l) != "" {
 			parts = append(parts, l)
 		}
 	}
-	if len(parts) == 1 {
-		return parts[0]
+	if len(parts) == 0 {
+		return s
 	}
-	return strings.Join(parts, "\n\t")
+	if len(parts) == 1 {
+		return strings.TrimSpace(parts[0])
+	}
+	// Multi-line: each line gets 4-space base indent + its preserved indent.
+	var sb strings.Builder
+	for _, l := range parts {
+		sb.WriteString("\n    ")
+		sb.WriteString(l)
+	}
+	return sb.String()
 }
 
 // isNumericType reports whether dbTypeName is a numeric PostgreSQL type.

@@ -191,34 +191,57 @@ func nextNonEmpty(scanner *bufio.Scanner) string {
 
 // readBlock reads the content inside a { ... } block from the scanner.
 // rest is the text after the opening '{' on the same line.
+// Relative indentation is preserved: the minimum leading-space count
+// across non-empty lines is stripped, matching PostgreSQL isolationtester's
+// display format. M0100-0005.
 func readBlock(rest string, scanner *bufio.Scanner) string {
-	var body strings.Builder
 	if idx := strings.Index(rest, "}"); idx >= 0 {
-		body.WriteString(strings.TrimSpace(rest[:idx]))
-		return body.String()
+		return strings.TrimSpace(rest[:idx])
 	}
-	body.WriteString(strings.TrimSpace(rest))
+	var lines []string
+	if t := strings.TrimSpace(rest); t != "" {
+		lines = append(lines, t)
+	}
 	for scanner.Scan() {
 		next := scanner.Text()
 		if idx := strings.Index(next, "}"); idx >= 0 {
-			part := strings.TrimSpace(next[:idx])
-			if part != "" {
-				if body.Len() > 0 {
-					body.WriteString("\n")
-				}
-				body.WriteString(part)
+			if t := strings.TrimSpace(next[:idx]); t != "" {
+				lines = append(lines, t)
 			}
 			break
 		}
-		part := strings.TrimSpace(next)
-		if part != "" {
-			if body.Len() > 0 {
-				body.WriteString("\n")
-			}
-			body.WriteString(part)
+		// Preserve the raw line (with leading spaces) for relative indent.
+		lines = append(lines, next)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	// Compute minimum indentation across non-empty non-trimmed lines.
+	minIndent := -1
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		n := len(l) - len(strings.TrimLeft(l, " \t"))
+		if minIndent < 0 || n < minIndent {
+			minIndent = n
 		}
 	}
-	return body.String()
+	if minIndent < 0 {
+		minIndent = 0
+	}
+	var sb strings.Builder
+	for i, l := range lines {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		if len(l) > minIndent {
+			sb.WriteString(l[minIndent:])
+		} else {
+			sb.WriteString(strings.TrimSpace(l))
+		}
+	}
+	return sb.String()
 }
 
 // RunIsolationPermutation executes a single permutation sequentially using the

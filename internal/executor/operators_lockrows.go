@@ -82,6 +82,11 @@ type lockRowsOp struct {
 	pending []pendingLockedRow
 	pos     int
 	drained bool
+
+	// maxDrain, when > 0, limits drainAndStamp to at most maxDrain rows.
+	// Used by EXISTS (SELECT ... FOR UPDATE) to stop after the first match
+	// instead of scanning the full inner table. M0100-0005.
+	maxDrain int
 }
 
 type pendingLockedRow struct {
@@ -229,7 +234,12 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 // and emits the row-lock WAL record.
 func (o *lockRowsOp) drainAndStamp() error {
 	o.drained = true
+	hitLimit := false
 	for {
+		if o.maxDrain > 0 && len(o.pending) >= o.maxDrain {
+			hitLimit = true
+			break
+		}
 		slot, err := o.child.Next()
 		if err == EOF {
 			break
@@ -250,6 +260,12 @@ func (o *lockRowsOp) drainAndStamp() error {
 			}
 		}
 		o.pending = append(o.pending, entry)
+	}
+	// When we stopped early (maxDrain limit hit), the child scan still holds
+	// its page RLock. Close the child to release it before the stamp pass
+	// acquires exclusive page locks — otherwise we deadlock. M0100-0005.
+	if hitLimit {
+		_ = o.child.Close()
 	}
 	for i := range o.pending {
 		e := &o.pending[i]

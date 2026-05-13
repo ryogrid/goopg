@@ -150,6 +150,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// Short-circuit: AND returns FALSE immediately when left is FALSE;
+		// OR returns TRUE immediately when left is TRUE. Matches PostgreSQL.
+		if x.Op == parser.OpAnd {
+			if left.Kind == KindBool && !left.BoolValue() {
+				return left, nil // FALSE AND _ = FALSE
+			}
+		} else if x.Op == parser.OpOr {
+			if left.Kind == KindBool && left.BoolValue() {
+				return left, nil // TRUE OR _ = TRUE
+			}
+		}
 		right, err := evalExprSlot(x.Right, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -2203,6 +2214,11 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err
+	}
+	// EXISTS only needs the first row — limit lockRowsOp drain to 1 so
+	// it does not scan the full inner table (matching PostgreSQL). M0100-0005.
+	if lop, ok := op.(*lockRowsOp); ok {
+		lop.maxDrain = 1
 	}
 	if err := op.Open(ctx); err != nil {
 		_ = op.Close()

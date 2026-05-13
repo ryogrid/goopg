@@ -292,6 +292,7 @@ func (o *seqScanOp) Close() error {
 		o.ring = nil
 		o.activePage = nil
 	} else if o.pinned != nil {
+		o.pinned.RUnlock()
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
 		o.activePage = nil
