@@ -1186,7 +1186,7 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
 
 ### Sub-milestones
 
-- [ ] **M0102-0001** — Prerequisite gate.
+- [x] **M0102-0001** — Prerequisite gate.  CLOSED 2026-05-14.
       Audit M0094-0005 (`written_lsn` advancement on standby) and M0101
       (PG-compatible WAL format default-on) status. If either is incomplete,
       M0102 is blocked. M0094-0005 is required for Scenario A (goopg standby
@@ -1194,6 +1194,19 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
       Scenario B (PG walreceiver consuming goopg WAL bytes). This sub-milestone
       itself does no implementation; it is a hard gate that must be checked
       before M0102-0002 can begin.
+      Audit results (2026-05-14):
+      - M0094-0005 closed (loop 3 / fix_plan §M0094-0005) — standby
+        continuous-replay tail anchor, plan-cache staleness, and standby hot-read
+        MVCC visibility all landed. Verification:
+        `go test -count=1 -run "TestE2E_PhysicalReplication|TestReplicationEndToEnd"
+         ./internal/testport/ ./internal/testutil/replcluster/` → both PASS
+        (2.16 s + 1.44 s).
+      - M0101 (M0101-0001..-0005) closed — PG-compatible WAL format default-on,
+        pg_waldump compatibility confirmed. Verification:
+        `go test -count=1 -run TestPort_WALPgWaldump ./internal/testport/` → PASS
+        (0.53 s).
+      Gate result: BOTH prerequisites satisfied — M0102-0002 (BASE_BACKUP wire
+      protocol) is unblocked and may begin.
 
 - [ ] **M0102-0002** — BASE_BACKUP wire-protocol handler on goopg primary.
       Design doc: `docs/design/0102-0001-base-backup-wire-protocol.md`.
