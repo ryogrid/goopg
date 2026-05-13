@@ -592,18 +592,22 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
 					// Recompute generated columns using partition child's schema.
 					_ = computeGeneratedColumns(partTable.Columns, partRow)
-					if err := writeHeapRow(o.ctx, targetRel, partTable.Columns, partRow); err != nil {
-						return nil, err
+					ptr, werr := writeHeapRowReturning(o.ctx, targetRel, partTable.Columns, partRow)
+					if werr != nil {
+						return nil, werr
 					}
+					maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 					o.rowsAffected++
 					continue
 				}
 			}
 			// No matching partition found — write to parent anyway (best effort)
 		}
-		if err := writeHeapRow(o.ctx, targetRel, cols, row); err != nil {
-			return nil, err
+		ptr, werr := writeHeapRowReturning(o.ctx, targetRel, cols, row)
+		if werr != nil {
+			return nil, werr
 		}
+		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
 		o.rowsAffected++
 	}
 	return nil, EOF
@@ -1302,6 +1306,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			o.rowsAffected++
 		}
 	}
+	// M0100-0005: yield first RETURNING row inline; subsequent rows
+	// are iterated by the o.done branch in updateOp.Next().
+	if o.retIdx < len(o.retRows) {
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
+	}
 	return nil, EOF
 }
 
@@ -1514,6 +1525,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
 		}
+	}
+	// M0100-0005: yield first RETURNING row inline.
+	if o.retIdx < len(o.retRows) {
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	return nil, EOF
 }
@@ -1729,6 +1746,12 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			o.rowsAffected++
 		}
 	}
+	// M0100-0005: yield first RETURNING row inline.
+	if o.retIdx < len(o.retRows) {
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
+	}
 	return nil, EOF
 }
 
@@ -1866,6 +1889,64 @@ func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID
 		return h.Xmax
 	}
 	return storage.InvalidTransactionID
+}
+
+// encodeIndexKeyFromCols builds a btree key for an index by looking up
+// each index column by name in cols and encoding the corresponding row value.
+// Returns nil (no error) when any key column is NULL (NULLs don't participate
+// in unique constraints) or when the column is not found. M0100-0005.
+func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row) ([]byte, error) {
+	var out []byte
+	for _, idxColName := range idx.Columns {
+		var col *catalog.Column
+		var colOrd int
+		for i := range cols {
+			if strings.EqualFold(cols[i].Name, idxColName) {
+				col = &cols[i]
+				colOrd = i
+				break
+			}
+		}
+		if col == nil || colOrd >= len(row) {
+			return nil, nil
+		}
+		v := row[colOrd]
+		if v.IsNull() {
+			return nil, nil // NULLs don't participate in unique constraints
+		}
+		keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, keyPart...)
+	}
+	return out, nil
+}
+
+// maintainUniqueIndexesForInsert updates all unique/primary btree indexes
+// on tbl after a heap row has been inserted at ptr. Ensures that subsequent
+// index scans (updateViaIndex, planIndexScanFromWhere) can locate the row.
+// Non-fatal: errors are silently swallowed so a missing or empty index
+// does not prevent the INSERT from completing. M0100-0005.
+func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, ptr storage.ItemPointer) {
+	if ctx.Catalog == nil || ctx.Pool == nil {
+		return
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if !idx.Unique && !idx.Primary {
+			continue
+		}
+		idxRel := ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row)
+		if err != nil || key == nil {
+			continue
+		}
+		_ = tree.Insert(key, ptr)
+	}
 }
 
 // writeHeapRow encodes the row and appends it to the relation. v0

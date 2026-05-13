@@ -1408,10 +1408,14 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         collect RETURNING rows and yield via Next(); analyzer rejections removed.
         TestPort_IsolationInsertConflictDoNothing PASS; unit tests -race clean.
       - WAL ErrLSNNotWritten made non-fatal in xact-marker hook (initdb/open.go).
-        eval-plan-qual now runs all permutations (3.80s); output mismatch is
-        EPQ+RETURNING output differences, not a WAL abort. Remaining blockers:
-        - eval-plan-qual: RETURNING values wrong (0 rows vs expected 1 row) for
-          EPQ UPDATE path; EPQ <waiting...> not produced for some permutations
+      - INSERT now maintains primary key and unique btree indexes (`maintainUniqueIndexesForInsert`
+        + `encodeIndexKeyFromCols` in operators_storage.go). This unblocked all
+        `updateViaIndex` paths that were returning 0 rows because the index was empty.
+      - RETURNING inline yield: `updateViaIndex`, SeqScan, and `deleteOp.Next()` now
+        return the first RETURNING row from inline code; subsequent rows via `o.done` block.
+      eval-plan-qual runs 7.40s, 1143/1494 lines (up from 0). Remaining diffs:
+        - balance2 GENERATED column is NULL (evalGenBinary doesn't handle NUMERIC type)
+        - Some EPQ+rollback permutations show wrong balance (HOT chain + abort interaction)
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait
