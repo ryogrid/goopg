@@ -543,6 +543,10 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 			return newNumeric(m, int(sc))
 		}
 	case KindTime:
+		// Try time-of-day first ("HH:MM:SS") then full timestamp.
+		if t, err := parseTimeString(s); err == nil {
+			return NewTimeDatum(t)
+		}
 		if t, err := parseCopyTimestamp(s); err == nil {
 			return NewTimeDatum(t)
 		}
@@ -834,6 +838,12 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
 		return NewTimeDatum(x.CachedTime), nil
+	case "time", "timetz":
+		ts, err := parseTimeString(x.Value)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
+		}
+		return NewTimeDatum(ts), nil
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
@@ -1138,6 +1148,48 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
+	case "date":
+		// Cast to date: truncate KindTime to midnight UTC, parse strings as dates. M0097-0004.
+		if d.Kind == KindString || d.Kind == KindStringArena {
+			s := d.StringValue()
+			if t, err := parseCopyTimestamp(s); err == nil {
+				t2 := t.UTC()
+				return NewTimeDatum(time.Date(t2.Year(), t2.Month(), t2.Day(), 0, 0, 0, 0, time.UTC)), nil
+			}
+			return Datum{}, &ExecError{Code: "22007", Pos: pos,
+				Message: fmt.Sprintf("invalid input syntax for type date: %q", s)}
+		}
+		if d.Kind == KindTime {
+			t := d.TimeValue().UTC()
+			return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
+		}
+		return d, nil
+	case "time", "timetz":
+		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
+		if d.Kind == KindString || d.Kind == KindStringArena {
+			ts, err := parseTimeString(d.StringValue())
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewTimeDatum(ts), nil
+		}
+		if d.Kind == KindTime {
+			t := d.TimeValue().UTC()
+			// Re-anchor to epoch to strip any date component.
+			return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
+		}
+		return d, nil
+	case "timestamp", "timestamptz":
+		// Cast to timestamp: parse strings, keep KindTime as-is. M0097-0004.
+		if d.Kind == KindString || d.Kind == KindStringArena {
+			ts, err := parseCopyTimestamp(d.StringValue())
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22007", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+			}
+			return NewTimeDatum(ts), nil
+		}
+		return d, nil
 	}
 	return d, nil // pass-through for unknown types
 }
@@ -2222,8 +2274,26 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
 		return NewTimeDatum(ctx.Now), nil
 	case "current_date":
-		t := ctx.Now
-		return NewTimeDatum(t.Truncate(24 * 60 * 60 * 1e9)), nil
+		t := ctx.Now.UTC()
+		return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
+	case "current_time":
+		// Returns time-of-day anchored at epoch, matching parseTimeString convention.
+		// Accepts optional precision arg: current_time(N) truncates microseconds.
+		t := ctx.Now.UTC()
+		ns := t.Nanosecond()
+		if len(x.Args) > 0 {
+			prec, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
+				factor := int64(1)
+				for i := int64(0); i < 6-prec.Int; i++ {
+					factor *= 10
+				}
+				ns = (ns / (int(factor) * 1000)) * (int(factor) * 1000)
+			}
+		}
+		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
+	case "current_catalog":
+		return NewStringDatum("postgres"), nil
 	case "pg_sleep":
 		return evalPgSleep(x, row, ctx)
 	case "to_timestamp":
@@ -3579,7 +3649,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "timeofday":
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":
-		return NewTimeDatum(ctx.Now), nil
+		// Returns time-of-day anchored at epoch (same storage convention as current_time).
+		t := ctx.Now.UTC()
+		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
 	case "localtimestamp":
 		return NewTimeDatum(ctx.Now), nil
 	}

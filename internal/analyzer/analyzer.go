@@ -1561,7 +1561,7 @@ func isTimestampLike(t catalog.Type) bool {
 		return true
 	}
 	switch strings.ToLower(t.Name) {
-	case "timestamp", "timestamptz", "date":
+	case "timestamp", "timestamptz", "date", "time", "timetz":
 		return true
 	}
 	return false
@@ -1602,6 +1602,14 @@ func isComparable(left, right catalog.Type) bool {
 		return true
 	}
 	if isTimestampLike(left) && isTimestampLike(right) {
+		return true
+	}
+	// String literals (text) are comparable with date/time types via implicit cast.
+	// PostgreSQL resolves text→timestamp/date/time at runtime. M0097-0004.
+	if isStringTypeName(left.Name) && isTimestampLike(right) {
+		return true
+	}
+	if isTimestampLike(left) && isStringTypeName(right.Name) {
 		return true
 	}
 	// uuid, name, oid and other text-backed types are comparable with text/varchar. M0097-0003.
@@ -1736,6 +1744,11 @@ func isAssignable(src, dst catalog.Type) bool {
 	if isStringTypeName(src.Name) && isOidOrUUIDTarget(dst.Name) {
 		return true
 	}
+	// String literals assignable to date/time column types; encodeValue
+	// parses and validates the string at runtime. M0097-0004.
+	if isStringTypeName(src.Name) && isDateTimeTarget(dst.Name) {
+		return true
+	}
 	// PostgreSQL allows integer/numeric values to be inserted into text/varchar
 	// columns via implicit cast. M0097-0003.
 	if isNumericTypeName(src.Name) && isStringTypeName(dst.Name) {
@@ -1749,6 +1762,16 @@ func isAssignable(src, dst catalog.Type) bool {
 func isOidOrUUIDTarget(name string) bool {
 	switch strings.ToLower(name) {
 	case "oid", "uuid":
+		return true
+	}
+	return false
+}
+
+// isDateTimeTarget reports whether dst is a date/time column type that
+// accepts string values (parsed by encodeValue at runtime). M0097-0004.
+func isDateTimeTarget(name string) bool {
+	switch strings.ToLower(name) {
+	case "date", "time", "timetz", "timestamp", "timestamptz":
 		return true
 	}
 	return false

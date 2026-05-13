@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
@@ -664,6 +665,28 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 								valueBuf = append(valueBuf, ' ')
 							}
 						}
+					case "date":
+						// Date columns display as YYYY-MM-DD. M0097-0004.
+						if d.Kind == executor.KindTime {
+							valueBuf = d.TimeValue().AppendFormat(valueBuf, "2006-01-02")
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
+					case "time":
+						// Time columns display as HH:MM:SS[.ffffff] with column precision. M0097-0004.
+						if d.Kind == executor.KindTime {
+							valueBuf = appendTimeText(valueBuf, d, sc.Type)
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
+					case "timetz":
+						// Timetz displays as HH:MM:SS[.ffffff]+00. M0097-0004.
+						if d.Kind == executor.KindTime {
+							valueBuf = appendTimeText(valueBuf, d, sc.Type)
+							valueBuf = append(valueBuf, "+00"...)
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
 					default:
 						valueBuf = d.AppendValueText(valueBuf)
 					}
@@ -843,6 +866,52 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	// This handles: scientific notation for large/tiny values, decimal for normal,
 	// negative zero ("-0"), and avoids spurious scientific notation for integers.
 	return strconv.AppendFloat(dst, f, 'g', 15, 64)
+}
+
+// appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's
+// time output format: HH:MM:SS with optional fractional seconds up to the declared precision.
+// Precision 0 → "HH:MM:SS", precision N → "HH:MM:SS.ffffff" (N digits). M0097-0004.
+func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+	if d.IsNull() {
+		return dst
+	}
+	t := d.TimeValue()
+	h := t.Hour()
+	m := t.Minute()
+	s := t.Second()
+	ns := t.Nanosecond()
+
+	dst = append(dst, byte('0'+h/10), byte('0'+h%10), ':',
+		byte('0'+m/10), byte('0'+m%10), ':',
+		byte('0'+s/10), byte('0'+s%10))
+
+	// Fractional seconds — only emit if non-zero or precision requested.
+	prec := 6 // default microseconds
+	if len(typ.Args) > 0 && typ.Args[0] >= 0 {
+		prec = int(typ.Args[0])
+	}
+	if prec > 0 && ns != 0 {
+		// Format up to 6 microsecond digits, then trim to declared precision.
+		micro := ns / 1000
+		frac := make([]byte, 6)
+		for i := 5; i >= 0; i-- {
+			frac[i] = byte('0' + micro%10)
+			micro /= 10
+		}
+		// Trim to declared precision.
+		if prec < 6 {
+			frac = frac[:prec]
+		}
+		// Strip trailing zeros after applying precision.
+		for len(frac) > 0 && frac[len(frac)-1] == '0' {
+			frac = frac[:len(frac)-1]
+		}
+		if len(frac) > 0 {
+			dst = append(dst, '.')
+			dst = append(dst, frac...)
+		}
+	}
+	return dst
 }
 
 // typeOIDFor maps a goopg type name to a pg_type.oid the wire

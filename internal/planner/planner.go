@@ -3499,6 +3499,11 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		return fc.Name, exprType(e)
 	}
+	// CASE expression: PostgreSQL uses "case" as implicit column label.
+	// Matches FigureColname() returning "case" for CaseExpr nodes. M0097-0003.
+	if _, ok := e.(*CaseExpr); ok {
+		return "case", exprType(e)
+	}
 	return "?column?", exprType(e)
 }
 

@@ -197,7 +197,7 @@ func decodeValueSize(t catalog.Type, data []byte) (int, error) {
 			return 0, fmt.Errorf("truncated bool")
 		}
 		return 1, nil
-	case "timestamp", "timestamptz", "date":
+	case "timestamp", "timestamptz", "date", "time", "timetz":
 		if len(data) < 8 {
 			return 0, fmt.Errorf("truncated %s", t.Name)
 		}
@@ -510,6 +510,29 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		// comparison. Wire-format formatting back to the
 		// `YYYY-MM-DD` shape would belong in a dedicated KindDate
 		// carrier, deferred to the type-system milestone.
+		if d.Kind == KindString || d.Kind == KindStringArena {
+			ts, err := parseCopyTimestamp(d.StringValue())
+			if err != nil {
+				return nil, &ExecError{Code: "22007",
+					Message: fmt.Sprintf("invalid input syntax for type %s: %q", t.Name, d.StringValue())}
+			}
+			d = NewTimeDatum(ts)
+		}
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(d.TimeValue().UnixNano()))
+		return buf[:], nil
+	case "time", "timetz":
+		// TIME stores only time-of-day as 8-byte big-endian nanos anchored at epoch.
+		if d.Kind == KindString || d.Kind == KindStringArena {
+			ts, err := parseTimeString(d.StringValue())
+			if err != nil {
+				return nil, err
+			}
+			d = NewTimeDatum(ts)
+		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
@@ -758,7 +781,7 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated bool")
 		}
 		return NewBoolDatum(data[0] != 0), 1, nil
-	case "timestamp", "timestamptz", "date":
+	case "timestamp", "timestamptz", "date", "time", "timetz":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
 		}
@@ -864,7 +887,7 @@ func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, er
 			return Datum{}, 0, fmt.Errorf("truncated bool")
 		}
 		return NewBoolDatum(data[0] != 0), 1, nil
-	case "timestamp", "timestamptz", "date":
+	case "timestamp", "timestamptz", "date", "time", "timetz":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
 		}
