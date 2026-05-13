@@ -154,6 +154,55 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// When the declared result type is float8/float4, perform the arithmetic in
+		// float64 to match PostgreSQL's float8 semantics (approximate, not exact).
+		// This prevents exact big.Int arithmetic from producing 200-digit numbers
+		// when float64 would stay in scientific notation. M0097-0003.
+		if rt := strings.ToLower(x.ResultType); rt == "float8" || rt == "double precision" ||
+			rt == "float4" || rt == "real" || rt == "float" {
+			var lf, rf float64
+			if left.Kind == KindNumeric {
+				lf, _ = strconv.ParseFloat(left.Format(), 64)
+			} else {
+				lf = float64(left.Int)
+			}
+			if right.Kind == KindNumeric {
+				rf, _ = strconv.ParseFloat(right.Format(), 64)
+			} else {
+				rf = float64(right.Int)
+			}
+			var fResult float64
+			switch x.Op {
+			case parser.OpAdd:
+				fResult = lf + rf
+			case parser.OpSub:
+				fResult = lf - rf
+			case parser.OpMul:
+				fResult = lf * rf
+			case parser.OpDiv:
+				if rf == 0 {
+					return Datum{}, &ExecError{Code: "22012", Pos: x.Pos(), Message: "division by zero"}
+				}
+				fResult = lf / rf
+			default:
+				// Fall through to normal evaluation for unsupported ops.
+				goto normalBinaryOp
+			}
+			// Format the float64 result using PostgreSQL's float8out format (%.15g).
+			// Return as a string datum — the dispatch layer's appendFloat8Text will
+			// re-parse it as float64 for proper scientific notation display. M0097-0003.
+			fs := strconv.FormatFloat(fResult, 'g', 15, 64)
+			// For integer-valued results like -1 or 1, parseNumericFast gives the clean
+			// representation (no trailing ".0"). For scientific notation or fractional
+			// values, keep as string for float-format display.
+			if m, s, ok := parseNumericFast(fs); ok {
+				return Datum{Kind: KindNumeric, Int: m, Scale: s}, nil
+			}
+			// Scientific notation or fractional float: keep as string so dispatch
+			// can format it with strconv.FormatFloat rather than big.Int decimal expansion.
+			return NewStringDatum(fs), nil
+		}
+	normalBinaryOp:
 		result, err := evalBinary(x.Op, left, right, x.Pos())
 		if err != nil {
 			return Datum{}, err

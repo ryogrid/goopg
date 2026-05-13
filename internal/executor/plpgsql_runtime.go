@@ -1257,7 +1257,9 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 		return fmtTemplate
 	}
 	// Apply format substitution: replace % with the evaluated arg value.
-	argStr := val.StringValue()
+	// Use Format() rather than StringValue() so non-string kinds (int, float, etc.)
+	// are converted to their text representation. M0097-0003.
+	argStr := val.Format()
 	result := strings.ReplaceAll(fmtTemplate, "%", argStr)
 	return result
 }

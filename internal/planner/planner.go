@@ -3619,6 +3619,20 @@ func exprType(e Expr) catalog.Type {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 			lt := exprType(x.Left)
 			rt := exprType(x.Right)
+			// Float types dominate: float8 > float4 > numeric > int*. M0097-0003.
+			isFloat := func(n string) bool {
+				s := strings.ToLower(n)
+				return s == "float8" || s == "double precision" || s == "double" ||
+					s == "float4" || s == "real" || s == "float"
+			}
+			if isFloat(lt.Name) || isFloat(rt.Name) {
+				// Wider float type wins.
+				if lt.Name == "float8" || lt.Name == "double precision" || lt.Name == "double" ||
+					rt.Name == "float8" || rt.Name == "double precision" || rt.Name == "double" {
+					return catalog.Type{Name: "float8"}
+				}
+				return catalog.Type{Name: "float4"}
+			}
 			if isNumericTypeName(lt.Name) || isNumericTypeName(rt.Name) {
 				return catalog.Type{Name: "numeric"}
 			}
