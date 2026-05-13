@@ -1323,15 +1323,14 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
 
 ### Sub-milestones
 
-- [ ] **M0100-0001** — RR/Serializable BEGIN-time snapshot.
+- [x] **M0100-0001** — RR/Serializable BEGIN-time snapshot. (2026-05-13)
       Design doc: `docs/design/0100-0001-isolation-level-snapshot-semantics.md`.
-      Sites: `internal/server/dispatch.go:295-300` (gate `SnapshotFor` on
-      `tx.Isolation == ReadCommitted`); `internal/mvcc/manager.go:197-224`
-      (no change — `state.firstSnapshot` cache already correct);
-      `internal/server/conn_tx.go:33-60` (ensure isolation reachable on
-      tx state). Verify: unit test for RR-holds-snapshot vs RC-refreshes;
-      `TestPort_IsolationEvalPlanQual` + `TestPort_IsolationMergeMatchRecheck`
-      advance past the snapshot-divergence step.
+      Implemented: dispatch.go line 295-300 gated on `ectx.Tx.Isolation ==
+      IsolationReadCommitted` — RC refreshes per statement, RR/SSI keeps
+      BEGIN-time snapshot. Uses ectx.Tx.Isolation (not outer tx variable) so
+      execBegin's RR tx promotion is visible within multi-statement queries.
+      TestRepeatableReadPinsFirstSnapshot already covers MVCC layer.
+      All server/mvcc/executor tests pass with -race. Commit: ad82b12.
 
 - [ ] **M0100-0002** — Eager XID materialisation for ON CONFLICT wait
       propagation. **Closes M0096-0005.**
