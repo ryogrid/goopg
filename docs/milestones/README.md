@@ -126,3 +126,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0096 | RC isolation-test suite: feature implementation & spec pass | in-progress | `0096-rc-isolation-suite-feature-implementation-and-spec-pass.md` |
 | 0097 | pg_regress coverage: feature parity & test pass | in-progress | `0097-pg-regress-coverage-feature-parity-and-test-pass.md` |
 | 0099 | M0098 remaining-work closure & target validation | planned | `0099-m0098-remaining-work-target-validation.md` |
+| 0100 | RC isolation-test suite: runtime correctness closure & 21-spec pass (closes M0096-0005, M0096-0013) | in-progress | `0100-rc-isolation-runtime-correctness-and-spec-pass.md` |

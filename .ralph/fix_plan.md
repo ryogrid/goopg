@@ -1220,6 +1220,115 @@ while preserving the original `-c 100 -j 100` target-condition validation.
       Failure rate improvement: Standard 2.2% → 0.65% from EPQ aborted-xmax fix.
       Remaining work documented in m0099_matrix_summary.md Remaining Gap Analysis.
 
+## M0100 — RC Isolation Suite: Runtime Correctness Closure & 21-Spec Pass (filed 2026-05-13)
+
+**【強制方針 / Strong policy — DO NOT BYPASS】**
+本マイルストーンでは、サブタスクを DEFERRED として扱うことを原則として認めない。
+ここで列挙された全ての項目は 21 個の RC isolation テストを実際にパスさせるための
+残存ランタイム正当性ギャップであり、いずれかを未実装のまま残すと M0100 の
+Definition of Done を達成できない。「後続マイルストーンに送る」「次ループに回す」
+といった逃げ道は使わないこと。例外として DEFERRED が許容されるのは、
+(a) goopg の Go 実装制約あるいは設計制約により本リリースで実装不可能であることが
+明確に立証され、(b) その理由が当該サブマイルストーンの本文に明記されており、かつ
+(c) 21 テストのうち当該項目がブロックするものを `excluded` ではなく `pass` させる
+ための代替経路が同マイルストーン内で提示されている場合 — の三点を **全て** 満たす
+ときに限る。これに該当しない理由で DEFERRED 化することは許可しない。
+
+Operational note (2026-05-13):
+- blocker の存在や goopg 未対応で途中までしか進められない項目は、blocker 解消までを本マイルストーンの実施範囲に含める。
+- blocker 解消により先に進める項目は、解消実装と再検証が完了するまで完了扱いにしない。
+
+**Goal.** Make all 21 dedicated `TestPort_Isolation*` test functions
+(added by M0096-0001) report `pass`. The parser/planner/catalog/DDL
+surface landed across M0096-0002..-0012; what remains is runtime
+correctness in the dispatcher, MVCC, and heap/DML operator path.
+**Closes M0096-0005 and M0096-0013 via cross-reference at M0100-0005.**
+
+Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-pass.md`.
+
+### Sub-milestones
+
+- [ ] **M0100-0001** — RR/Serializable BEGIN-time snapshot.
+      Design doc: `docs/design/0100-0001-isolation-level-snapshot-semantics.md`.
+      Sites: `internal/server/dispatch.go:295-300` (gate `SnapshotFor` on
+      `tx.Isolation == ReadCommitted`); `internal/mvcc/manager.go:197-224`
+      (no change — `state.firstSnapshot` cache already correct);
+      `internal/server/conn_tx.go:33-60` (ensure isolation reachable on
+      tx state). Verify: unit test for RR-holds-snapshot vs RC-refreshes;
+      `TestPort_IsolationEvalPlanQual` + `TestPort_IsolationMergeMatchRecheck`
+      advance past the snapshot-divergence step.
+
+- [ ] **M0100-0002** — Eager XID materialisation for ON CONFLICT wait
+      propagation. **Closes M0096-0005.**
+      Design doc: `docs/design/0100-0002-eager-xid-materialization-at-begin.md`.
+      Sites: `internal/executor/operators_insert.go` and
+      `internal/executor/operators_upsert.go` — call
+      `ctx.MaterializeWriterXID` before the heap write so concurrent
+      `findInProgressConflict` sees the in-progress xmin; turn
+      `probeArbiterWaiting` into a probe-wait-rescan loop. Preserves
+      M0093's read-only TPS win (no eager XID at BEGIN — only at first
+      write). Verify: at least one of donothing2 / insert2 in
+      `TestPort_IsolationInsertConflictDoUpdate{,2,3,4}`,
+      `TestPort_IsolationInsertConflictDoNothing`, and
+      `TestPort_IsolationInsertConflictSpecconflict` emits `<waiting …>`
+      and the specs reach `pass`; pgbench-S `-c 10 -T 30` ≥ 2,000 TPS.
+
+- [ ] **M0100-0003** — Row-level wait on in-progress xmax for UPDATE/DELETE.
+      Design doc: `docs/design/0100-0003-row-level-wait-on-in-progress-xmax.md`.
+      Sites: `internal/executor/operators_storage.go:78-95` — re-enable
+      blocking `TxnMgr.WaitForXID(ctx.Ctx, xmax)` inside `epqWait` between
+      the WFG cycle check and the snapshot refresh. M0098-0004 introduced
+      the EPQ shape; M0099-0004 removed blocking due to a pgbench
+      goroutine hang. Re-enable safely by: (a) auditing the four `epqWait`
+      call sites (lines 922, 1157, 1331, 1518) to confirm page pins are
+      released before blocking; (b) keeping the WFG cycle short-circuit
+      ahead of the wait; (c) fallback path — session-scoped
+      `goopg.wait_on_xmax` GUC (default off) consumed only by
+      `IsolationRunner`'s connection init — if global re-enable regresses
+      pgbench. Verify: `TestPort_IsolationLockCommittedUpdate`,
+      `…LockCommittedKeyupdate`, `TestPort_IsolationPartitionKeyUpdate{1..4}`
+      reach `pass`; pgbench standard `-c 10 -T 30` no goroutine hang;
+      `go test -race ./internal/executor/...` clean.
+
+- [ ] **M0100-0004** — EvalPlanQual concurrent UPDATE recheck (chain-following).
+      Design doc: `docs/design/0100-0004-evalplanqual-recheck.md`.
+      Depends on M0100-0003. Sites: `internal/executor/operators_storage.go`
+      `epqRecheckVisible` and the UPDATE post-wait path. After
+      `WaitForXID` returns, follow the t_ctid chain to the latest visible
+      version, re-evaluate the UPDATE qual against the new tuple, re-bind
+      SET expressions to the new row, apply the update on the new ctid.
+      This is the chain-following completion that M0098-0004 explicitly
+      deferred. ReadCommitted only; RR raises 40001 at the same site.
+      Verify: `TestPort_IsolationEvalPlanQual`, `…EvalPlanQualTrigger`,
+      `TestPort_IsolationMergeMatchRecheck` reach `pass`.
+
+- [ ] **M0100-0005** — E2E pass confirmation: all 21 dedicated RC isolation
+      tests pass. **Closes M0096-0005 and M0096-0013 via cross-reference.**
+      Run: `go test -v -run TestPort_Isolation -timeout 30m ./internal/testport/`.
+      DoD: every `TestPort_Isolation*` listed in M0096-0001 reports `pass`
+      (none `defer`, none `excluded`). On completion:
+      - Mark M0096-0005 `[x]` with note "closed via M0100-0002".
+      - Mark M0096-0013 `[x]` with note "closed via M0100-0005 — all 21
+        dedicated isolation tests pass."
+      - Flip the 21 specs in `docs/test-port/executable-isolation-tests.md`
+        from `status=defer` to `status=port`, `pass_required=yes`.
+      - Update milestone doc 0100 status to `accepted`; update the
+        `docs/milestones/README.md` index row to `accepted`.
+
+### Stale notes carried from M0096-0013 (do NOT re-implement)
+
+The following two residuals were verified non-gaps during M0100 planning;
+do not modify these sites in M0100. Re-open as new sub-milestones only
+if 21-spec pass surfaces a real divergence:
+
+- RAISE NOTICE from trigger bodies — already correctly merged from child
+  → parent context at `internal/executor/plpgsql_runtime.go:1053-1056`
+  (M0096-0012).
+- `---+---` column alignment width in `pqprintFormat`
+  (`internal/testport/framework/isolation_runner.go:285-355`) — already
+  matches libpq `PQprint` align-mode (`widths[i] = max(header_len,
+  max_data_len)`); no width-derivation bug.
+
 ## Maintenance Fixes
 
 - [x] Fix `TestFoundationSeqScanFilterJoin` test 7 stale expectation (2026-05-04).
