@@ -817,6 +817,16 @@ M0097-0001 wires it up.
       106. Normalizer strips "lex error at byte N:" prefix from trailing-junk/invalid errors.
       107. Normalizer rule for invalid binary/octal/hex integer prefix stripping.
       numerology test: 162 → 109 → 54 normalized diff lines.
+      Loop 23 additions (2026-05-13):
+      108. RAISE NOTICE format substitution: val.Format() instead of val.StringValue()
+           so integer/float loop variables substitute correctly in 'i = %' patterns.
+      109. exprType BinaryOp: float8/float4 operands now return "float8"/"float4" instead
+           of "numeric" (isNumericTypeName caught floats, masking float arithmetic).
+      110. evalExprSlot BinaryOp: ResultType "float8" uses float64 arithmetic + FormatFloat
+           display to avoid exact big.Int decimal expansion of scientific notation values.
+      numerology test: 54 → 39 → 33 (NOTICE) → 17 (float8) normalized diff lines.
+      Still 16 tests passing. Numerology at 17 diffs: blocked on SELECT DISTINCT (6),
+      -0 display (4), parameter error messages (7).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
