@@ -1,6 +1,6 @@
 # 0101-0001 — WAL Page Header Compatibility: Enable PG-Compatible Format by Default
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0101-0001, M0101-0002
 

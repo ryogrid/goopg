@@ -1148,7 +1148,10 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		s.writeLSNMirror.Store(end)
 	}
 	if s.pageHeaders {
-		s.prevRecPtr = start
+		// prevRecPtr tracks the 0-based PostgreSQL RecPtr of this record's
+		// start so the NEXT record's xl_prev field is filled correctly.
+		// start is 1-based (goopg convention), so RecPtr = start - 1.
+		s.prevRecPtr = start - 1
 	}
 	return start, end, nil
 }
@@ -1201,7 +1204,10 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		s.writeLSNMirror.Store(end)
 	}
 	if s.pageHeaders {
-		s.prevRecPtr = start
+		// prevRecPtr tracks the 0-based PostgreSQL RecPtr of this record's
+		// start so the NEXT record's xl_prev field is filled correctly.
+		// start is 1-based (goopg convention), so RecPtr = start - 1.
+		s.prevRecPtr = start - 1
 	}
 	if s.onAppend != nil {
 		s.onAppend()

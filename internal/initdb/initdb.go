@@ -18,6 +18,8 @@
 package initdb
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -28,6 +30,41 @@ import (
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// systemIdentifierFile is the path (relative to the data directory) where
+// the 8-byte cluster system identifier is stored. Matches PostgreSQL's
+// pg_control convention: a random uint64 generated at initdb time that
+// uniquely identifies the cluster. M0101-0001.
+const systemIdentifierFile = "global/system_identifier"
+
+// LoadOrCreateSystemID reads the cluster system identifier from
+// <dataDir>/global/system_identifier. If the file does not exist (e.g. for
+// clusters created by older goopg versions), it generates a new random uint64,
+// persists it, and returns it. This value is embedded in every PG-compatible
+// WAL page header so pg_waldump can cross-check segment consistency.
+func LoadOrCreateSystemID(dataDir string) (uint64, error) {
+	path := filepath.Join(dataDir, systemIdentifierFile)
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if len(data) != 8 {
+			return 0, fmt.Errorf("goopg: system_identifier: unexpected length %d", len(data))
+		}
+		return binary.LittleEndian.Uint64(data), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("goopg: read system_identifier: %w", err)
+	}
+	// Generate a new random system identifier.
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return 0, fmt.Errorf("goopg: generate system_identifier: %w", err)
+	}
+	id := binary.LittleEndian.Uint64(buf[:])
+	if err := os.WriteFile(path, buf[:], 0o600); err != nil {
+		return 0, fmt.Errorf("goopg: write system_identifier: %w", err)
+	}
+	return id, nil
+}
 
 // CatalogVersion is the value written into the data directory's
 // `PG_VERSION` file. It must match the major version goopg reports
@@ -116,6 +153,11 @@ func Init(opts Options) error {
 	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
+	}
+	// Generate and persist the cluster system identifier (M0101-0001).
+	// Used as xlp_sysid in PG-compatible WAL page headers.
+	if _, err := LoadOrCreateSystemID(abs); err != nil {
+		return fmt.Errorf("goopg init: system_identifier: %w", err)
 	}
 	return nil
 }

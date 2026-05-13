@@ -229,12 +229,25 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: wal replay: %w", err)
 	}
 
+	// Load (or generate) the cluster system identifier for WAL page headers.
+	// M0101-0001: enables PG-compatible WAL format so pg_waldump can parse segments.
+	systemID, err := LoadOrCreateSystemID(abs)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: system_identifier: %w", err)
+	}
+
 	walCfg := wal.Config{
 		WALDir:             filepath.Join(abs, "pg_wal"),
 		SegmentSize:        opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
 		Preallocate:        opts.WALInitZero,
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
 		WALBuffers:         opts.WALBuffers,
+		// M0101-0001: emit PG-compatible XLOG page headers so pg_waldump
+		// can parse the WAL segments. SystemID is embedded in every page
+		// header for cross-segment consistency checking.
+		PageHeaders: true,
+		SystemID:    systemID,
 		OnLoopStart: func() {
 			pid := "wal-writer-0"
 			act.Register(&activity.Backend{

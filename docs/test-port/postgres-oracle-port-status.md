@@ -16,6 +16,7 @@ Status meanings:
 | modules | 0 | 0 | 1 |
 | regress | 0 | 1 | 0 |
 | tap | 41 | 3 | 1 |
+| utility | 1 | 0 | 0 |
 
 ## Entries
 
@@ -71,6 +72,7 @@ Status meanings:
 | D-007 | `postgres/contrib` | mixed | defer | no | Contrib migration is staged by dependency class and extension/runtime assumptions. | `M0060-0005` |
 | E-001 | `postgres/src/test/modules/unsafe_tests` | modules | excluded | no | Explicit unsafe suite is outside compatibility scope by policy. | `-` |
 | E-002 | `postgres/src/bin/pg_dump/t` | tap | excluded | no | Client binary behavior depends on utility surfaces intentionally outside current server-focused scope. | `-` |
+| W-001 | `postgres/src/bin/pg_waldump` | utility | port | yes | Ported as TestPort_WALPgWaldumpCompat in internal/testport/wal_pg_waldump_test.go; verifies PG-compatible WAL format (M0101-0001) | `-` |
 
 ## Notes
 
