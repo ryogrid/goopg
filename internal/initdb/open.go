@@ -45,6 +45,14 @@ type Runtime struct {
 	WAL          *wal.Writer
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
+	// SyncRep is the synchronous-replication wait primitive
+	// (M0102-0005). The commit-path xactMarkerLogger uses it to
+	// block COMMIT until configured standbys ack the commit LSN; the
+	// walsender feedback handler calls UpdateStandbyProgress. nil
+	// here would disable sync replication entirely, but Open
+	// constructs one unconditionally — it is a no-op when
+	// `synchronous_standby_names` is empty (upstream's async default).
+	SyncRep        *wal.SyncRep
 	WalSenders     *wal.Senders
 	WalReceivers   *wal.Receivers
 	WalSubscribers *wal.Subscribers
@@ -746,6 +754,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	walSenders := wal.NewSenders()
 	walReceivers := wal.NewReceivers()
 	walSubscribers := wal.NewSubscribers()
+	syncRep := wal.NewSyncRep()
 
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{})
 
@@ -968,6 +977,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		WAL:          walWriter,
 		Checkpointer: cp,
 		Slots:        slotsReg,
+		SyncRep:        syncRep,
 		WalSenders:     walSenders,
 		WalReceivers:   walReceivers,
 		WalSubscribers: walSubscribers,

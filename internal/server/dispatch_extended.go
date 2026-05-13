@@ -110,6 +110,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
 	ectx.PubSub = s.cfg.PubSub
+	ectx.WAL = s.cfg.WAL
+	ectx.SyncRep = s.cfg.SyncRep
+	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
 
 	op, err := executor.Build(node)
 	if err != nil {

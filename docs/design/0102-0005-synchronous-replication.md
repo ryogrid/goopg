@@ -1,7 +1,7 @@
 # 0102-0005 — Synchronous Replication (`synchronous_standby_names` + commit-wait + standby feedback)
 
-**Status:** draft
-**Date:** 2026-05-13
+**Status:** accepted
+**Date:** 2026-05-13 (drafted), 2026-05-14 (accepted)
 **Milestone:** M0102-0005
 **Upstream reference:** `postgres/src/backend/replication/syncrep.c` (`SyncRepWaitForLSN`, `SyncRepReleaseWaiters`), `postgres/src/backend/replication/walsender.c:2721` (sync standby tracking + `WalSndKeepaliveIfNecessary`), `postgres/src/backend/replication/walreceiver.c` (feedback message emission), `postgres/src/include/replication/syncrep.h` (mode constants), `postgres/src/backend/utils/misc/guc_tables.c` (`synchronous_standby_names`, `synchronous_commit` GUC defs).
 
@@ -224,3 +224,75 @@ standby).
   the SyncRep registration. Verify both sides; the goopg walreceiver in
   `cmd/goopg/standby.go` builds the conninfo — add `application_name` if
   missing.
+
+## Implementation log (2026-05-14)
+
+Landed:
+
+- `internal/wal/syncrep.go` — `SyncRep` type with `WaitForLSN`,
+  `UpdateStandbyProgress`, `ForgetStandby`, `SetStandbyNames`,
+  `NeedsWait`. Mode mapping via `ParseSyncCommitLevel`.
+- `internal/wal/syncrep_parse.go` — parser for FIRST/ANY/legacy
+  bare-list grammar.
+- `internal/wal/syncrep_test.go` — race-tested unit suite covering:
+  rule parsing (15 cases incl. malformed); off/empty-rule fast paths;
+  FIRST/ANY semantics; write-vs-flush-vs-apply mode distinction;
+  immediate release; context cancellation; ForgetStandby; concurrent
+  update/wait stress; monotonic-progress invariant; rule-relaxation
+  release.
+- `internal/config/defaults.go` — `synchronous_standby_names` GUC
+  registered (`ContextSigHup`); `synchronous_commit` retyped from bool
+  to string so `remote_apply` etc. parse without a GUC error. Default
+  `on` preserved.
+- `internal/initdb/open.go` — `Runtime.SyncRep` constructed
+  unconditionally; empty-rule default means commits are async until
+  the operator sets the GUC.
+- `internal/server/server.go` (`Config.SyncRep`),
+  `internal/server/replication.go` (walsender forwards each Standby
+  Status Update into `SyncRep.UpdateStandbyProgress`, registers
+  `ApplicationName` on the senderHandle, calls `ForgetStandby` on
+  walsender disconnect), `internal/server/logicalwalsender.go`
+  (logical walsender same dispatch path).
+- `internal/server/walreceiver.go` — `WalReceiverConfig.ApplicationName`
+  forwarded as the `application_name` startup parameter so the primary's
+  SyncRep can match the standby; `ApplyLSNFunc` lets the standby report
+  apply_lsn distinct from received-LSN so `remote_apply` waits see
+  real replay progress instead of receive-only.
+- `internal/executor/context.go` (`SyncRep`, `WAL`, `SyncCommitMode`
+  fields), `internal/executor/operators_tx.go` (`execCommit` calls
+  `SyncRep.WaitForLSN(ctx.Ctx, WrittenLSN, mode)` after a successful
+  `TxnMgr.Commit`).
+- `internal/server/dispatch.go` + `dispatch_extended.go` — populate
+  `ectx.SyncRep`, `ectx.WAL`, and `ectx.SyncCommitMode` (parsed from
+  session-effective `synchronous_commit`) on every dispatch.
+- `cmd/goopg/main.go` — plumb `cfg.SyncRep = rt.SyncRep`; on startup
+  read `synchronous_standby_names` from the GUC and call
+  `SetStandbyNames`. Walreceiver gets `ApplicationName` from
+  `primary_conninfo`'s `application_name=…` token via the new
+  `parsePrimaryConninfoFull` helper.
+
+Deferred (will land with the E2E harness in M0102-0006/0007):
+
+- Per-statement wait-event registration (`activity.WaitSyncRep`) — the
+  constant exists but the executor still binds a single wait window per
+  commit rather than per WaitForLSN sleep cycle. The on-disk pin remains
+  unchanged so a future loop can light up wait_event = "SyncRep" without
+  GUC surface changes.
+- `pg_reload_conf()` re-applying `synchronous_standby_names` at runtime.
+  The reload pipeline already calls back into the registry on SIGHUP;
+  routing the new value into `rt.SyncRep.SetStandbyNames` is a single
+  hook addition once the reload path is exercised by a regression test.
+- Apply-LSN feedback from the standby's StreamReplayer. The walreceiver
+  carries a `ApplyLSNFunc` callback; standby start-up doesn't currently
+  install one (it reuses the received-LSN). The M0102-0006 sync subtest
+  is the first user of real apply-LSN feedback and will wire it.
+
+## Verification
+
+```bash
+go test -race -count=1 -run TestSyncRep ./internal/wal/
+go test -race -count=1 ./internal/wal/ ./internal/server/ ./internal/executor/ \
+  ./internal/mvcc/ ./internal/initdb/ ./internal/config/ ./cmd/goopg/
+```
+
+All green as of 2026-05-14.

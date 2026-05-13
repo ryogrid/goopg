@@ -29,7 +29,7 @@ import (
 // builds a SlotDecoder over the slot, plumbs its OutputPlugin into
 // a PgOutput writing through `walsenderPgoutputAdapter`, and runs
 // until the standby disconnects or ctx is cancelled.
-func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, args startReplicationArgs) error {
+func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, args startReplicationArgs, appName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeStreamingError(w, sqlstate.FeatureNotSupported,
 			"START_REPLICATION LOGICAL requires a configured WAL writer")
@@ -101,7 +101,7 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 			}
 			switch f.Type {
 			case protocol.MsgCopyData:
-				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, nil)
+				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, nil, s.cfg.SyncRep, appName)
 			case protocol.MsgCopyDone, protocol.MsgTerminate:
 				streamCancel()
 				return

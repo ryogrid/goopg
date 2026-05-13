@@ -230,10 +230,30 @@ func BuildDefaultRegistry() *Registry {
 	// faster commits at the cost of losing recent committed transactions
 	// on a server crash (up to wal_writer_delay latency). See
 	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	//
+	// M0102-0005: upstream extends this GUC beyond a plain on/off boolean
+	// to a 5-level enum (off / local / remote_write / on=remote_flush /
+	// remote_apply). goopg accepts the enum spellings via TypeString so a
+	// session can set `SET synchronous_commit = remote_apply` without a
+	// parse error; the actual wait semantics live in
+	// `internal/wal/syncrep.go`. `on` is the boot default, matching upstream.
 	r.MustRegister(NewVariable(Variable{
-		Name: "synchronous_commit", Type: TypeBool, BootVal: "on",
+		Name: "synchronous_commit", Type: TypeString, BootVal: "on",
 		Context: ContextUserset,
 		Scope:   ScopeSession,
+	}))
+
+	// synchronous_standby_names selects which standbys must acknowledge a
+	// COMMIT before the primary releases its waiter. Grammar mirrors
+	// upstream: empty = async (no wait); 'name' or 'a, b' = wait for any
+	// listed (PG-pre-9.6 form, now == FIRST 1); 'FIRST n (a, b, c)' = wait
+	// for the first n in list order; 'ANY n (a, b, c)' = wait for any n
+	// of the listed names. A standby is identified by its
+	// application_name. See docs/design/0102-0005-synchronous-replication.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "synchronous_standby_names", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
 	}))
 
 	// wal_writer_delay sets the period (in milliseconds) of the

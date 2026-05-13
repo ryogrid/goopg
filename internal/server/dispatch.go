@@ -19,6 +19,7 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // queryHeapHighWaterMark is the per-query peak HeapInuse seen at
@@ -197,6 +198,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.PubSub = s.cfg.PubSub
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
+	ectx.WAL = s.cfg.WAL
+	ectx.SyncRep = s.cfg.SyncRep
+	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
 
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {
@@ -397,6 +401,21 @@ func sessionFreezeMinAge(sess *config.SessionRegistry) int64 {
 		return 50_000_000
 	}
 	return v
+}
+
+// sessionSyncCommitMode reads the effective `synchronous_commit` GUC from
+// the session registry and maps it to a SyncRepMode. Empty or unknown values
+// fall back to SyncRepRemoteFlush (treat as "on"), matching upstream.
+// M0102-0005.
+func sessionSyncCommitMode(sess *config.SessionRegistry) wal.SyncRepMode {
+	if sess == nil {
+		return wal.SyncRepRemoteFlush
+	}
+	_, eff, ok := sess.Get("synchronous_commit")
+	if !ok {
+		return wal.SyncRepRemoteFlush
+	}
+	return wal.ParseSyncCommitLevel(strings.ToLower(strings.TrimSpace(eff)))
 }
 
 func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {

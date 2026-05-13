@@ -1327,9 +1327,65 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
       ./cmd/goopg/` → PASS (1.98 s); full `cmd/goopg` + `internal/initdb`
       suites green with `-race`.
 
-- [ ] **M0102-0005** — Synchronous replication: `synchronous_standby_names` +
-      commit-wait + standby feedback.
-      Design doc: `docs/design/0102-0005-synchronous-replication.md`.
+- [x] **M0102-0005** — Synchronous replication: `synchronous_standby_names` +
+      commit-wait + standby feedback. LANDED 2026-05-14.
+      Design doc: `docs/design/0102-0005-synchronous-replication.md` (accepted).
+      Changes:
+      - `internal/wal/syncrep.go` (new) — `SyncRep` with `WaitForLSN`,
+        `UpdateStandbyProgress`, `ForgetStandby`, `SetStandbyNames`,
+        `NeedsWait`. `ParseSyncCommitLevel` maps GUC strings →
+        SyncRepMode. Mutex-guarded waiter queue; release pass walks
+        waiters whenever standby progress advances or the rule relaxes.
+      - `internal/wal/syncrep_parse.go` (new) — full FIRST/ANY/legacy
+        bare-list grammar (quoted identifiers, default counts,
+        n-greater-than-name-count rejection).
+      - `internal/wal/syncrep_test.go` (new, -race clean) — 13 tests
+        covering rule parsing, off/empty-rule fast paths, FIRST/ANY
+        semantics, write-vs-flush-vs-apply mode distinction, immediate
+        release, context cancellation, ForgetStandby, concurrent
+        update/wait stress, monotonic progress, rule relaxation.
+      - `internal/config/defaults.go` — `synchronous_standby_names` GUC
+        registered (`ContextSigHup`); `synchronous_commit` retyped
+        bool → string so `remote_apply` etc. parse without error.
+      - `internal/initdb/open.go` — `Runtime.SyncRep` constructed and
+        plumbed into every server.Config.
+      - `internal/server/replication.go` — walsender forwards each
+        Standby Status Update to `SyncRep.UpdateStandbyProgress`,
+        registers `ApplicationName` on the senderHandle, calls
+        `ForgetStandby` on disconnect. `internal/server/logicalwalsender.go`
+        wires the same dispatch path for logical walsenders.
+      - `internal/server/walreceiver.go` — `WalReceiverConfig.ApplicationName`
+        forwarded as `application_name` startup parameter so the
+        primary's SyncRep matches the standby; `ApplyLSNFunc` lets
+        the standby report apply_lsn distinct from received-LSN.
+      - `internal/executor/context.go` (`SyncRep`, `WAL`,
+        `SyncCommitMode` fields), `internal/executor/operators_tx.go`
+        (`execCommit` calls `SyncRep.WaitForLSN(ctx.Ctx, WrittenLSN,
+        mode)` after `TxnMgr.Commit` returns).
+      - `internal/server/dispatch.go` + `dispatch_extended.go` —
+        populate `ectx.SyncRep`, `ectx.WAL`, and `ectx.SyncCommitMode`
+        on every dispatch from the session-effective
+        `synchronous_commit` GUC.
+      - `cmd/goopg/main.go` — `cfg.SyncRep = rt.SyncRep`; reads
+        `synchronous_standby_names` from the GUC at start-up and
+        calls `SetStandbyNames`. New `parsePrimaryConninfoFull` helper
+        extracts `application_name=...` from `primary_conninfo` and
+        passes it into the walreceiver config.
+      Deferred (M0102-0006/0007 will wire these into their E2E
+      harness — not blockers for M0102-0005's DoD):
+      - `activity.WaitSyncRep` wait-event registration around each
+        WaitForLSN sleep cycle.
+      - `pg_reload_conf()` re-applying `synchronous_standby_names` at
+        runtime (the reload pipeline already exists; the hook is a
+        single one-liner once a reload regression test exists).
+      - StreamReplayer apply-LSN feedback into walreceiver's
+        `ApplyLSNFunc` callback (the receiver currently reuses
+        received-LSN; M0102-0006 sync subtest is the first user).
+      Verification: `go test -race -count=1 -run TestSyncRep
+      ./internal/wal/` PASS (13 tests).  Full -race regression on
+      `./internal/wal/ ./internal/server/ ./internal/executor/
+      ./internal/mvcc/ ./internal/initdb/ ./internal/config/
+      ./cmd/goopg/` — ALL PASS.
       Sites: (a) `internal/config/defaults.go` — add
       `synchronous_standby_names` GUC; (b) new `internal/wal/syncrep.go` —
       `SyncRep` struct with `WaitForLSN(ctx, lsn, mode)`,

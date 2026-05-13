@@ -171,6 +171,14 @@ type Config struct {
 	// docs/design/0005-0001-streaming-replication-architecture.md.
 	Slots *wal.Slots
 
+	// SyncRep is the synchronous-replication wait primitive
+	// (M0102-0005). When non-nil the commit path may call
+	// SyncRep.WaitForLSN(commitLSN, mode) after local flush, and the
+	// walsender feedback handler calls SyncRep.UpdateStandbyProgress
+	// for every Standby Status Update it receives. nil disables sync
+	// replication entirely; goopg in async mode is upstream's default.
+	SyncRep *wal.SyncRep
+
 	// WalSenders, when set, lets each walsender goroutine register
 	// itself so the pg_stat_replication virtual view can render a
 	// live row per active sender. nil makes registration a no-op.
@@ -710,7 +718,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -888,7 +896,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string) {
 	extended := newExtendedState()
 	connTx := &connTxState{}         // per-connection explicit transaction state (M0096-0005)
 	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
@@ -956,7 +964,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 			// falls back to the normal handler so utility commands
 			// like SHOW still work for diagnostics.
 			if isReplication {
-				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload)
+				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload, appName)
 				entry.clearQueryCancel()
 				queryCancel()
 				if err != nil {

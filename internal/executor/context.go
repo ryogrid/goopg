@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // Context carries per-statement runtime state into every operator's
@@ -166,6 +167,25 @@ type Context struct {
 	// TEMP TABLE shadowing. Populated by execCreateTable when a TEMP TABLE
 	// shadows a permanent one; used by execDropTable to restore it. M0097-0003.
 	TempTableShadows map[string]*catalog.Table
+
+	// WAL exposes the cluster's WAL writer so execCommit can read the
+	// WrittenLSN after a local flush to bound the SyncRep wait. nil
+	// disables the bound and the wait reverts to async behaviour
+	// (commit returns immediately). M0102-0005.
+	WAL *wal.Writer
+
+	// SyncRep is the synchronous-replication wait primitive. execCommit
+	// calls SyncRep.WaitForLSN(commitLSN, mode) after local flush when
+	// SyncCommitMode is anything other than SyncRepOff and the configured
+	// `synchronous_standby_names` rule is non-empty. nil disables
+	// sync replication (async — upstream default). M0102-0005.
+	SyncRep *wal.SyncRep
+
+	// SyncCommitMode is the session-effective `synchronous_commit` GUC
+	// level. SyncRepOff means commit returns immediately after local
+	// flush; remote_* levels block until configured standbys ack.
+	// M0102-0005.
+	SyncCommitMode wal.SyncRepMode
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

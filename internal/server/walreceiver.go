@@ -78,6 +78,21 @@ type WalReceiverConfig struct {
 	// pg_stat_wal_receiver.conninfo so operators can see what was
 	// configured. Empty falls back to PrimaryAddr.
 	Conninfo string
+
+	// ApplicationName, when non-empty, is sent as the
+	// `application_name` startup parameter so the primary can
+	// identify this standby for `synchronous_standby_names`
+	// matching (M0102-0005). Empty disables sync-replication
+	// participation — the standby still streams, just async.
+	ApplicationName string
+
+	// ApplyLSNFunc, when non-nil, is consulted by sendStatus to
+	// report the standby's apply LSN. Distinct from the
+	// receive/append LSN: apply lags when a replay backlog exists.
+	// nil falls back to reporting applyLSN (received-LSN) for all
+	// three fields, matching the v0 (sync-replication-disabled)
+	// behaviour.
+	ApplyLSNFunc func() uint64
 }
 
 // WalReceiver is the standby-side replication client. Construct via
@@ -175,6 +190,9 @@ func (r *WalReceiver) handshake() error {
 	params := map[string]string{
 		"user":        r.cfg.User,
 		"replication": "true",
+	}
+	if r.cfg.ApplicationName != "" {
+		params["application_name"] = r.cfg.ApplicationName
 	}
 	if err := r.w.WriteStartupMessage(params); err != nil {
 		return fmt.Errorf("walreceiver: write startup: %w", err)
@@ -349,13 +367,23 @@ func (r *WalReceiver) publishProgress(lsn uint64) {
 }
 
 // sendStatus emits an 'r' standby-status CopyData payload reporting
-// the current apply LSN. WriteLSN / FlushLSN / ApplyLSN are all set
-// to applyLSN — v0's standby has no separate write/flush staging.
+// the current write / flush / apply LSNs. v0's standby still has no
+// separate write/flush staging — write_lsn and flush_lsn both report
+// the received-and-appended position — but apply_lsn is read from
+// ApplyLSNFunc when wired so the primary's SyncRep wait at
+// `synchronous_commit=remote_apply` sees real replay progress
+// instead of treating "received" as "applied". M0102-0005.
 func (r *WalReceiver) sendStatus() error {
 	r.mu.Lock()
-	apply := r.applyLSN
+	received := r.applyLSN
 	r.mu.Unlock()
-	frame := protocol.EncodeStandbyStatusUpdate(apply, apply, apply, time.Now().UTC(), false)
+	apply := received
+	if r.cfg.ApplyLSNFunc != nil {
+		if v := r.cfg.ApplyLSNFunc(); v > 0 {
+			apply = v
+		}
+	}
+	frame := protocol.EncodeStandbyStatusUpdate(received, received, apply, time.Now().UTC(), false)
 	if err := r.w.WriteCopyData(frame); err != nil {
 		return err
 	}

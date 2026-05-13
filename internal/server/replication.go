@@ -42,7 +42,7 @@ import (
 // take it. Errors are write errors on the wire (the connection is
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
-func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, payload []byte) (bool, error) {
+func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, payload []byte, appName string) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -57,7 +57,7 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.Frame
 	case strings.HasPrefix(upper, "DROP_REPLICATION_SLOT "):
 		return true, s.replyDropReplicationSlot(w, trimmed[len("DROP_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "START_REPLICATION"):
-		return true, s.replyStartReplication(ctx, r, w, trimmed)
+		return true, s.replyStartReplication(ctx, r, w, trimmed, appName)
 	case strings.HasPrefix(upper, "TIMELINE_HISTORY "):
 		return true, s.replyTimelineHistory(w, trimmed[len("TIMELINE_HISTORY "):])
 	case upper == "BASE_BACKUP" || strings.HasPrefix(upper, "BASE_BACKUP "):
@@ -264,7 +264,7 @@ func (s *Server) replyDropReplicationSlot(w *protocol.FrameWriter, args string) 
 // arrive. When absent the walsender streams without slot-backed WAL
 // retention — fine for one-shot test traffic, dangerous in
 // production. Upstream behaves identically.
-func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, raw string) error {
+func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, raw string, appName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 			"START_REPLICATION requires a configured WAL writer")
@@ -301,7 +301,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	// pgoutput messages through `'w'` CopyData frames. See
 	// docs/design/0008-0004-apply-worker-and-tablesync.md.
 	if args.Mode == "LOGICAL" {
-		return s.runLogicalWalsender(ctx, r, w, args)
+		return s.runLogicalWalsender(ctx, r, w, args, appName)
 	}
 
 	walDir := s.cfg.WALDirPath
@@ -332,11 +332,19 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	var senderHandle *wal.Sender
 	if s.cfg.WalSenders != nil {
 		senderHandle = s.cfg.WalSenders.Register(wal.SenderState{
-			SlotName:   args.SlotName,
-			ClientAddr: walsenderClientAddr(r),
-			SentLSN:    args.StartLSN,
+			SlotName:        args.SlotName,
+			ClientAddr:      walsenderClientAddr(r),
+			SentLSN:         args.StartLSN,
+			ApplicationName: appName,
 		})
 		defer s.cfg.WalSenders.Unregister(senderHandle)
+	}
+	// M0102-0005: forget the standby's last reported progress when the
+	// connection drops so a disconnected standby no longer counts toward
+	// the FIRST/ANY quorum. Empty appName is harmless (ForgetStandby
+	// removes the "" key, which never matches any rule entry).
+	if s.cfg.SyncRep != nil && appName != "" {
+		defer s.cfg.SyncRep.ForgetStandby(appName)
 	}
 	defer func() {
 		if s.cfg.Logger == nil {
@@ -353,6 +361,11 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 
+	// handleStandbyCopyData also dispatches into SyncRep when configured;
+	// pass appName so the dispatcher can update the per-standby progress
+	// row keyed by application_name.
+	syncRep := s.cfg.SyncRep
+
 	// Receive-side goroutine: consume CopyData / CopyDone frames from
 	// the standby and apply standby-status updates to the slot. The
 	// goroutine ends naturally when the connection closes (ReadFrame
@@ -367,7 +380,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 			}
 			switch f.Type {
 			case protocol.MsgCopyData:
-				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle)
+				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle, syncRep, appName)
 			case protocol.MsgCopyDone:
 				streamCancel()
 				return
@@ -464,7 +477,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 // stream. When a senderHandle is supplied the standby-reported LSNs
 // are also pushed into the observability registry so
 // pg_stat_replication renders write_lsn / flush_lsn / replay_lsn.
-func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHandle *wal.Sender) error {
+func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHandle *wal.Sender, syncRep *wal.SyncRep, appName string) error {
 	parsed, kind, err := protocol.DecodeReplicationMessage(payload)
 	if err != nil {
 		return err
@@ -476,6 +489,12 @@ func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHa
 		}
 		if senderHandle != nil {
 			senderHandle.ApplyStandbyStatus(st.WriteLSN, st.FlushLSN, st.ApplyLSN)
+		}
+		// M0102-0005: feed the SyncRep wait primitive so any commit
+		// blocking on this standby gets released as soon as the
+		// acknowledged LSN reaches the commit target.
+		if syncRep != nil && appName != "" {
+			syncRep.UpdateStandbyProgress(appName, st.WriteLSN, st.FlushLSN, st.ApplyLSN)
 		}
 	}
 	return nil

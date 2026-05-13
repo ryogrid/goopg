@@ -389,6 +389,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
+		cfg.SyncRep = rt.SyncRep
+		// M0102-0005: prime the SyncRep rule from the GUC value so the
+		// first commit on a freshly-started cluster sees the configured
+		// synchronous_standby_names. A parse error is logged but does not
+		// fail startup — upstream-parity: an invalid value disables sync
+		// replication rather than refusing to come up.
+		if names := stringGUC(registry, "synchronous_standby_names", ""); names != "" {
+			if err := rt.SyncRep.SetStandbyNames(names); err != nil {
+				logger.Warn("invalid synchronous_standby_names; disabling sync replication", "err", err)
+			} else {
+				logger.Info("sync replication configured", "synchronous_standby_names", names)
+			}
+		}
 		cfg.WalSenders = rt.WalSenders
 		cfg.WAL = rt.WAL
 		cfg.Activity = rt.Activity
@@ -637,7 +650,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			}
 		}
 	}
-	addr := parsePrimaryConninfo(conninfo)
+	addr, appName := parsePrimaryConninfoFull(conninfo)
 	if addr == "" {
 		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
 		close(done)
@@ -667,8 +680,9 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 				WAL:            rt.WAL,
 				StatusInterval: statusInterval,
 				DialTimeout:    10 * time.Second,
-				Receivers:      rt.WalReceivers,
-				Conninfo:       conninfo,
+				Receivers:       rt.WalReceivers,
+				Conninfo:        conninfo,
+				ApplicationName: appName,
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",
@@ -717,9 +731,20 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 // provided. v0 honours only host + port; user / password / sslmode
 // follow in later loops.
 func parsePrimaryConninfo(conninfo string) string {
+	addr, _ := parsePrimaryConninfoFull(conninfo)
+	return addr
+}
+
+// parsePrimaryConninfoFull extracts host:port and the application_name
+// override (if any) from a libpq-style `key=value [key=value ...]` conninfo
+// string. host:port defaults port to 5432; missing host yields empty addr.
+// application_name is forwarded to the primary in the startup parameters so
+// SyncRep can match the standby against synchronous_standby_names.
+// M0102-0005.
+func parsePrimaryConninfoFull(conninfo string) (addr, appName string) {
 	conninfo = strings.TrimSpace(conninfo)
 	if conninfo == "" {
-		return ""
+		return "", ""
 	}
 	host := ""
 	port := "5432"
@@ -735,12 +760,14 @@ func parsePrimaryConninfo(conninfo string) string {
 			host = v
 		case "port":
 			port = v
+		case "application_name":
+			appName = v
 		}
 	}
 	if host == "" {
-		return ""
+		return "", appName
 	}
-	return host + ":" + port
+	return host + ":" + port, appName
 }
 
 // boolGUC reads a boolean GUC by name, returning fallback when the
