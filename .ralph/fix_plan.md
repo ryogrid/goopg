@@ -1407,10 +1407,11 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         resolved in planUpdate/planDelete via `resolveTargets`; updateOp/deleteOp
         collect RETURNING rows and yield via Next(); analyzer rejections removed.
         TestPort_IsolationInsertConflictDoNothing PASS; unit tests -race clean.
-      - eval-plan-qual advances to permutation 30 before failing on a WAL
-        ErrLSNNotWritten (xact-marker flush to sentinel LSN after ~30 DDL
-        permutations). Remaining blockers per test:
-        - eval-plan-qual: WAL ErrLSNNotWritten on permutation 30 (spurious)
+      - WAL ErrLSNNotWritten made non-fatal in xact-marker hook (initdb/open.go).
+        eval-plan-qual now runs all permutations (3.80s); output mismatch is
+        EPQ+RETURNING output differences, not a WAL abort. Remaining blockers:
+        - eval-plan-qual: RETURNING values wrong (0 rows vs expected 1 row) for
+          EPQ UPDATE path; EPQ <waiting...> not produced for some permutations
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait

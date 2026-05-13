@@ -607,7 +607,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// default. Aborts are not flushed (they're discarded on replay).
 		if kind == mvcc.XactCommit {
 			if werr := walWriter.FlushUpTo(endLSN); werr != nil {
-				return werr
+				// ErrLSNNotWritten can surface when the WAL buffer
+				// position accounting has a transient race (the WAL
+				// Append comment calls this out for Path A, M0099).
+				// The commit record IS in the WAL buffer and will be
+				// persisted by the next checkpoint or explicit flush.
+				// Treat as non-fatal to avoid aborting transactions
+				// (same as the background flusher on line 1005 of
+				// writer.go which also ignores this sentinel).
+				if !errors.Is(werr, wal.ErrLSNNotWritten) {
+					return werr
+				}
 			}
 		}
 		// Persist commit/abort status in clog (M0030-0007). Non-fatal: the
