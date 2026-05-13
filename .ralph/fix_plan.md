@@ -778,6 +778,15 @@ M0097-0001 wires it up.
           matching PostgreSQL; EXTRACT(MILLISECOND FROM TIME '...') → 25575.401.
       functional_deps test: 60 → 25 normalized diff lines. time test: 87 → 74 normalized diff lines.
       Still 15 tests passing (no new PASS but significant diff reduction).
+      Loop 19 additions (2026-05-13):
+      89. targetMeta: EXTRACT expression column label is "extract" (was "?column?").
+      90. ExtractExpr.SourceTypeName: new field in plan.go; propagated through resolveExpr,
+          resolveExprAfterAggregate, resolveExprAfterWindow; foldconst.go FoldConstants
+          now carries it (was the root cause of time-type validation not firing).
+      91. evalExtract: time-only types reject DAY/TIMEZONE/FORTNIGHT with PG-compatible
+          "unit X not supported/recognized for type time without time zone" errors.
+      92. evalDatePart: same fractional-second float handling.
+      time test: 51 → 29 normalized diff lines (remaining: pg_input_error_info table func + operator error message).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
