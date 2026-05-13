@@ -1078,6 +1078,13 @@ func injectTriggerVars(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) {
 	_ = frame.add("tg_op", strType, NewStringDatum(trig.TGOp))
 	_ = frame.add("tg_table_name", strType, NewStringDatum(trig.TGTable))
 	_ = frame.add("tg_relname", strType, NewStringDatum(trig.TGTable))
+	// Inject OLD/NEW as composite-text row variables so RAISE NOTICE '%', OLD works.
+	if trig.OldRow != nil {
+		_ = frame.add("old", strType, NewStringDatum(rowToCompositeText(trig.Cols, trig.OldRow)))
+	}
+	if trig.NewRow != nil {
+		_ = frame.add("new", strType, NewStringDatum(rowToCompositeText(trig.Cols, trig.NewRow)))
+	}
 }
 
 // executePLpgSQLTriggerBody executes a trigger function body with the given
@@ -1504,4 +1511,48 @@ func plpgsqlExtractMsgText(msg string) string {
 		return strings.ReplaceAll(inner, "''", "'")
 	}
 	return msg
+}
+
+// rowToCompositeText formats a row as PostgreSQL composite type text notation:
+// "(val1,val2,...)" with double-quoting for values that contain special characters.
+// Used for RAISE NOTICE '... %', OLD / NEW substitution. M0100-0005.
+func rowToCompositeText(cols []catalog.Column, row Row) string {
+	var sb strings.Builder
+	sb.WriteByte('(')
+	for i, d := range row {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		if i >= len(cols) {
+			break
+		}
+		if d.IsNull() {
+			// NULL renders as empty (no quotes)
+			continue
+		}
+		s := d.Format() // Format() returns correct representation for all kinds (int, float, text)
+		// Quote if the value contains comma, parens, whitespace, double-quote,
+		// backslash, or is empty — matching PostgreSQL's composite output rules.
+		needsQuote := len(s) == 0
+		for _, c := range s {
+			if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
+				needsQuote = true
+				break
+			}
+		}
+		if needsQuote {
+			sb.WriteByte('"')
+			for _, c := range s {
+				if c == '"' || c == '\\' {
+					sb.WriteByte('\\')
+				}
+				sb.WriteRune(c)
+			}
+			sb.WriteByte('"')
+		} else {
+			sb.WriteString(s)
+		}
+	}
+	sb.WriteByte(')')
+	return sb.String()
 }

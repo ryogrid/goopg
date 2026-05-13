@@ -1132,6 +1132,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		blk    storage.BlockNumber
 		slot   uint16
 		newRow Row
+		oldRow Row // for BEFORE UPDATE trigger firing
 	}
 	pending := make([]pendingUpdate, 0, 1) // pre-alloc for common 1-row match
 	heapRel := rel
@@ -1193,6 +1194,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			blk:    ptr.Block,
 			slot:   actualSlot, // use live slot, not the index-pointed slot
 			newRow: newRow,
+			oldRow: cloneRow(row),
 		})
 		return true, nil
 	})
@@ -1202,7 +1204,16 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 
 	// Modification phase: HOT update when eligible, else delete+insert.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
+	idxTbl := o.plan.Table
 	for _, pu := range pending {
+		// Fire BEFORE UPDATE triggers (e.g. RAISE NOTICE) before writing.
+		if len(idxTbl.Triggers) > 0 {
+			retRow, ok := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+			if !ok {
+				continue // RETURN NULL — skip this row
+			}
+			pu.newRow = retRow
+		}
 		used := false
 		if hotEligible {
 			var err error
@@ -1372,6 +1383,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		slot   uint16
 		cols   []catalog.Column // columns of the source relation
 		newRow Row
+		oldRow Row // for BEFORE UPDATE trigger firing
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
@@ -1409,7 +1421,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 			}
 			_ = computeGeneratedColumns(captureCols, newRow)
-			pending = append(pending, pendingUpdate{rel: captureRel, blk: blk, slot: slot, cols: captureCols, newRow: newRow})
+			pending = append(pending, pendingUpdate{rel: captureRel, blk: blk, slot: slot, cols: captureCols, newRow: newRow,
+				oldRow: cloneRow(row)})
 			return nil
 		}); err != nil {
 			return nil, err
@@ -1417,6 +1430,19 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	}
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
 	for _, pu := range pending {
+		// Fire BEFORE UPDATE triggers (e.g. RAISE NOTICE) before writing.
+		scanTblForTrig := tbl
+		if pu.rel != rel && pu.rel != (storage.RelFileNode{}) {
+			// For partition/inheritance children, use the child table's triggers.
+			scanTblForTrig = tbl // parent triggers apply on writes
+		}
+		if len(scanTblForTrig.Triggers) > 0 {
+			retRow, ok := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
+			if !ok {
+				continue // RETURN NULL — skip this row
+			}
+			pu.newRow = retRow
+		}
 		puRel := pu.rel
 		if puRel == (storage.RelFileNode{}) {
 			puRel = rel

@@ -357,6 +357,7 @@ func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session str
 	if queue != nil {
 		o.notices = queue.drain()
 	}
+
 	o.session = session
 	return o
 }
@@ -420,6 +421,7 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 	isMultiLine := false
 	if !afterWaiting {
 		// NOTICEs appear BEFORE the step SQL line (matches PostgreSQL isolationtester).
+
 		for _, notice := range o.notices {
 			if o.session != "" {
 				fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", o.session, notice)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -171,6 +172,13 @@ func (c *Cluster) Start() error {
 	cmd.Dir = c.repoRoot
 	cmd.Stdout = f
 	cmd.Stderr = f
+	// DEBUG: also tee to a fixed log
+	_ = os.MkdirAll("/tmp/goopg_cluster_debug", 0755)
+	debugF, _ := os.OpenFile("/tmp/goopg_cluster_debug/"+c.name+".log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if debugF != nil {
+		cmd.Stdout = io.MultiWriter(f, debugF)
+		cmd.Stderr = io.MultiWriter(f, debugF)
+	}
 	if err := cmd.Start(); err != nil {
 		_ = f.Close()
 		return err
