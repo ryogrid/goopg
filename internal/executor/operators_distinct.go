@@ -40,13 +40,18 @@ func (o *distinctOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		row := cloneRow(slotRow(slot))
-		k := rowKey(row)
+		if slot == nil {
+			continue
+		}
+		row := slot.Row()
+		// Clone the row so we own the data (child slot is reused).
+		ownedRow := cloneRow(row)
+		k := rowKey(ownedRow)
 		if _, dup := seen[k]; dup {
 			continue
 		}
 		seen[k] = struct{}{}
-		o.rows = append(o.rows, row)
+		o.rows = append(o.rows, ownedRow)
 	}
 	return nil
 }
@@ -57,7 +62,11 @@ func (o *distinctOp) Next() (TupleSlot, error) {
 	}
 	row := o.rows[o.idx]
 	o.idx++
-	return asSlot(o.schema, row), nil
+	if row == nil {
+		// Return an empty slot for zero-column rows (SELECT DISTINCT FROM table).
+		return SlotFromRow(o.schema, Row{}), nil
+	}
+	return SlotFromRow(o.schema, row), nil
 }
 
 func (o *distinctOp) Close() error { return o.child.Close() }

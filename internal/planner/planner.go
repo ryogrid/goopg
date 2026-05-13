@@ -284,8 +284,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		return &SetOp{pos: s.Pos(), Left: left, Right: right, All: true}, nil
 	}
-	// s.Distinct is handled by wrapping the final plan with a Distinct node
-	// after all other processing. See the wrapping below. M0097-0005.
+	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
+	// With targets it is handled by wrapping the final plan with a Distinct node.
+	// See the wrapping below. M0097-0005.
+	if s.Distinct && len(s.Targets) == 0 {
+		return nil, &PlanError{
+			Pos:     s.Pos(),
+			Code:    "42601",
+			Message: "syntax error at or near \"from\"",
+		}
+	}
 
 	isSimpleSingle := len(s.From) == 1 && (len(s.FromExprs) == 0 || (len(s.FromExprs) == 1 && len(s.FromExprs[0].Joins) == 0))
 
