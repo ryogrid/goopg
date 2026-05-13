@@ -1215,6 +1215,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			// HOT ineligible or page full — fall back to normal delete+insert.
 			// EvalPlanQual retry loop (M0098-0004): retry up to maxEPQRetries
 			// times when a concurrent xmax conflict is detected.
+			epqDoUpdate := false // set when abort confirmed; bypasses EPQ on next iter
 			for epqRetry := 0; ; epqRetry++ {
 				s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
 				if err != nil {
@@ -1225,7 +1226,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				// exclusive Lock before our own stamp. Capture old tuple
 				// bytes for WAL logical record (M0094-0002).
 				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-				if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+				// M0100-0005: when epqDoUpdate is set (abort confirmed on previous
+				// iteration), skip the EPQ check and fall through to the update code.
+				if !epqDoUpdate && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
 					xmax := oldTup.Header.Xmax
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
@@ -1248,7 +1251,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					if visible {
 						// xmax aborted; row still exists at original slot.
 						if !o.ctx.Snap.HasInProgress(xmax) {
-							break // aborted; proceed with update
+							// M0100-0005: mark as do-update and retry so the
+							// update code (PageSetHeapTupleXmax + writeHeapRow)
+							// executes on the next iteration, bypassing EPQ.
+							epqDoUpdate = true
+							continue
 						}
 						continue // still in-progress; retry
 					}
@@ -1428,6 +1435,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		epqSkipSeq := false
 		if !used {
 			// EvalPlanQual retry loop (M0098-0004).
+			epqDoUpdateSeq := false // abort-confirmed bypass flag
 			for epqRetry := 0; ; epqRetry++ {
 			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk})
 			if err != nil {
@@ -1435,7 +1443,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 			s.Lock()
 			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-			if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+			if !epqDoUpdateSeq && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
 				xmax := oldTup.Header.Xmax
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
@@ -1458,7 +1466,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				if visible {
 					// xmax aborted; row still exists.
 					if !o.ctx.Snap.HasInProgress(xmax) {
-						break // aborted; proceed with update
+						epqDoUpdateSeq = true
+						continue // bypass EPQ on next iter; update code executes
 					}
 					continue // still in-progress; retry
 				}
@@ -1672,6 +1681,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		// EvalPlanQual retry loop (M0098-0004): on concurrent xmax conflict,
 		// wait for the conflicting transaction and re-check visibility.
 		epqSkipDel := false
+		epqDoDelete := false // abort-confirmed bypass flag
 		for epqRetry := 0; ; epqRetry++ {
 		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: victimRel, Block: v.blk})
 		if err != nil {
@@ -1681,7 +1691,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		// M0090-0002: detect concurrent xmax-stamp under the
 		// exclusive Lock before our own stamp.
 		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
-		if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+		if !epqDoDelete && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
 			xmax := oldTup.Header.Xmax
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
@@ -1704,7 +1714,8 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if visible {
 				// xmax aborted; row still exists.
 				if !o.ctx.Snap.HasInProgress(xmax) {
-					break // aborted; proceed with delete
+					epqDoDelete = true
+					continue // bypass EPQ on next iter; delete code executes
 				}
 				continue // still in-progress; retry
 			}
@@ -1718,12 +1729,15 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if victimCols == nil {
 				victimCols = tbl.Columns
 			}
-			newSlot, _, chainFound := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred)
+			newSlot, newRow, chainFound := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred)
 			if !chainFound {
 				epqSkipDel = true
 				break
 			}
 			v.slot = newSlot
+			if newRow != nil {
+				v.row = newRow // update for correct RETURNING after chain-follow
+			}
 			continue // re-run loop to stamp xmax on new slot
 		}
 		var oldTupleBytes []byte
