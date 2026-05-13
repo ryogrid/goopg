@@ -14,8 +14,9 @@ import (
 // oidInt4 / oidText are pg_type.oids pinned to upstream's pg_type.dat
 // entries (postgres/src/include/catalog/pg_type.dat).
 const (
-	oidInt4 = 23
-	oidText = 25
+	oidInt4  = 23
+	oidText  = 25
+	oidBytea = 17
 )
 
 // handleQuery implements the simple Query path. v0 recognises:

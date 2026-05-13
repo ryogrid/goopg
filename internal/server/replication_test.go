@@ -28,6 +28,15 @@ func startReplicationTestServer(t *testing.T) (string, *wal.Slots, func()) {
 // func.
 func startReplicationTestServerFull(t *testing.T) (string, *wal.Slots, *wal.Writer, func()) {
 	t.Helper()
+	addr, slots, writer, _, stop := startReplicationTestServerWithDir(t)
+	return addr, slots, writer, stop
+}
+
+// startReplicationTestServerWithDir is the M0102-0003 variant that
+// also exposes the walDir so TIMELINE_HISTORY tests can seed a
+// `<NN>.history` file in the spot the server reads from.
+func startReplicationTestServerWithDir(t *testing.T) (string, *wal.Slots, *wal.Writer, string, func()) {
+	t.Helper()
 	dataDir := t.TempDir()
 	slots, err := wal.OpenSlots(dataDir)
 	if err != nil {
@@ -63,7 +72,7 @@ func startReplicationTestServerFull(t *testing.T) (string, *wal.Slots, *wal.Writ
 		}
 		_ = walWriter.Close()
 	}
-	return addr, slots, walWriter, stop
+	return addr, slots, walWriter, walDir, stop
 }
 
 // dialReplication completes the startup handshake with replication=true
@@ -369,6 +378,88 @@ func TestReplicationStartReplicationRejectsLogical(t *testing.T) {
 	frames = readUntilReadyForQuery(t, r)
 	if frames[0].Type != protocol.MsgRowDescription {
 		t.Errorf("post-error IDENTIFY_SYSTEM = %c, want T", frames[0].Type)
+	}
+}
+
+
+// TestReplicationTimelineHistoryReturnsFile verifies the
+// M0102-0003 TIMELINE_HISTORY <tli> wire path: the server reads
+// `<WALDirPath>/<tli>.history` and returns a single (filename text,
+// content bytea) row. A request for a TLI without a history file
+// (e.g. TLI=1 on a fresh primary) returns the empty content bytes
+// rather than an error — matching upstream's walreceiver contract.
+func TestReplicationTimelineHistoryReturnsFile(t *testing.T) {
+	addr, _, _, walDir, stop := startReplicationTestServerWithDir(t)
+	defer stop()
+
+	// Seed a TLI=2 history file in the test server's WAL dir.
+	want := []wal.TimelineHistoryEntry{
+		{TLI: 1, SwitchLSN: 0x0000000016000000, Reason: "no recovery target specified"},
+	}
+	if err := wal.WriteHistory(walDir, 2, want); err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, "TIMELINE_HISTORY 2")
+	frames := readUntilReadyForQuery(t, r)
+	if len(frames) != 4 {
+		t.Fatalf("frame count = %d, want 4 (got types %s)", len(frames), replicationFrameTypes(frames))
+	}
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Errorf("frame[0] = %c, want T", frames[0].Type)
+	}
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("frame[1] = %c, want D", frames[1].Type)
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if len(cells) != 2 {
+		t.Fatalf("DataRow columns = %d, want 2", len(cells))
+	}
+	if string(cells[0]) != "00000002.history" {
+		t.Errorf("filename = %q, want 00000002.history", cells[0])
+	}
+	wantBody := "1\t0/16000000\tno recovery target specified\n"
+	if string(cells[1]) != wantBody {
+		t.Errorf("content = %q, want %q", cells[1], wantBody)
+	}
+	if frames[2].Type != protocol.MsgCommandComplete ||
+		!hasCommandTag(frames[2].Payload, "TIMELINE_HISTORY") {
+		t.Errorf("CommandComplete tag mismatch: %q", frames[2].Payload)
+	}
+	if frames[3].Type != protocol.MsgReadyForQuery {
+		t.Errorf("frame[3] = %c, want Z", frames[3].Type)
+	}
+}
+
+// TestReplicationTimelineHistoryMissingReturnsEmptyContent: per the
+// upstream walreceiver contract, requesting a TLI whose .history
+// file does not exist (typically TLI=1 on a primary that has never
+// promoted) returns a row with the synthesised filename and a NULL
+// content bytea, not an error frame.
+func TestReplicationTimelineHistoryMissingReturnsEmptyContent(t *testing.T) {
+	addr, _, _, stop := startReplicationTestServerFull(t)
+	defer stop()
+
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, "TIMELINE_HISTORY 1")
+	frames := readUntilReadyForQuery(t, r)
+	if len(frames) != 4 {
+		t.Fatalf("frame count = %d, want 4 (got types %s)", len(frames), replicationFrameTypes(frames))
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if len(cells) != 2 {
+		t.Fatalf("DataRow columns = %d, want 2", len(cells))
+	}
+	if string(cells[0]) != "00000001.history" {
+		t.Errorf("filename = %q, want 00000001.history", cells[0])
+	}
+	if cells[1] != nil {
+		t.Errorf("content = %q, want NULL for missing TLI", cells[1])
 	}
 }
 

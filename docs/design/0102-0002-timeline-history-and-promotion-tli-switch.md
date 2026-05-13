@@ -1,6 +1,6 @@
 # 0102-0002 — TIMELINE_HISTORY Wire-Protocol + Promotion-Time TLI Switch
 
-**Status:** draft
+**Status:** accepted (2026-05-14)
 **Date:** 2026-05-13
 **Milestone:** M0102-0003
 **Upstream reference:** `postgres/src/backend/access/transam/timeline.c:463` (`writeTimeLineHistoryFile`), `postgres/src/backend/replication/walreceiver.c:760` (writeTimeLineHistoryFile call on standby), `postgres/src/backend/replication/walsender.c` (TIMELINE_HISTORY command handler), `postgres/src/include/access/timeline.h`.
@@ -162,3 +162,41 @@ Unit test: round-trip a 3-timeline history through `WriteHistory`+`ReadHistory`.
   leave the file dangling. M0102 keeps the TLI state in the wal.Config
   passed to the writer; persist it in `global/system_identifier`'s file
   (M0101) or a sibling `global/timeline_id` file.
+
+## Implementation notes (landed 2026-05-14)
+
+- `internal/wal/timeline_history.go` provides `ReadHistory`, `WriteHistory`,
+  `TimelineHistoryFileName`, and the `TimelineHistoryEntry` struct. Atomic
+  writes use `os.WriteFile(.tmp) + os.Rename` and a best-effort directory
+  fsync. Tab-separated `<TLI>\t<X/X>\t<reason>\n` format with comment / blank
+  line tolerance on read.
+- `internal/initdb/timeline.go` adds `LoadOrCreateTimelineID(dataDir)` and
+  `WriteTimelineID(dataDir, tli)` — 4-byte little-endian uint32 in
+  `global/timeline_id`, defaulting to TLI=1 on a fresh cluster. Wired into
+  `internal/initdb/open.go` so the writer's `wal.Config.TimelineID` is
+  seeded from disk on every start.
+- `internal/server/replication.go` adds the `TIMELINE_HISTORY <tli>` command
+  arm and the `oidBytea = 17` constant. Missing files (typically TLI=1)
+  return a row with NULL content, matching the upstream walreceiver
+  contract.
+- `cmd/goopg/standby.go` `finalizePromotion` runs the M0102-0003 sequence:
+  bump TLI from `LoadOrCreateTimelineID`, append a history entry anchored
+  at the replayer's `ApplyLSN` (or `WrittenLSN` if replay never started),
+  write `<newTLI>.history` via `wal.WriteHistory`, then persist newTLI via
+  `WriteTimelineID`. The currently-running WAL writer keeps emitting on
+  the old TLI for the rest of the process lifetime — an in-place
+  `Writer.SetTimelineID()` is a planned follow-up; M0102-0003's verification
+  gate only requires the on-disk artefacts and the wire path.
+- New regression coverage:
+  - `internal/wal/timeline_history_test.go` — round-trip, format pinning,
+    missing-file behaviour, comment/blank-line tolerance.
+  - `internal/initdb/timeline_test.go` — load default, write-then-load.
+  - `cmd/goopg/standby_test.go::TestStandbyControllerPromoteWritesTimelineHistory`
+    — full promote path produces `pg_wal/00000002.history` (line begins with
+    `1\t`) and `global/timeline_id` advances to 2.
+  - `internal/server/replication_test.go::TestReplicationTimelineHistoryReturnsFile`
+    + `…MissingReturnsEmptyContent` — TIMELINE_HISTORY wire shape verified
+    end-to-end against a live `Server` instance.
+
+All affected packages pass with `-race`:
+`go test -race -count=1 ./internal/wal/ ./internal/initdb/ ./internal/server/ ./cmd/goopg/`.

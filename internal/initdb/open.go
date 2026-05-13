@@ -237,6 +237,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: system_identifier: %w", err)
 	}
 
+	// M0102-0003: load (or default-create) the persistent timeline ID.
+	// The TLI is stamped into every WAL page header (xlp_tli) so a
+	// heterogeneous standby reattaching after a goopg promote can
+	// resolve which timeline its replayed bytes belong to.
+	tli, err := LoadOrCreateTimelineID(abs)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: timeline_id: %w", err)
+	}
+
 	walCfg := wal.Config{
 		WALDir:             filepath.Join(abs, "pg_wal"),
 		SegmentSize:        opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize
@@ -248,6 +258,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// header for cross-segment consistency checking.
 		PageHeaders: true,
 		SystemID:    systemID,
+		TimelineID:  tli,
 		OnLoopStart: func() {
 			pid := "wal-writer-0"
 			act.Register(&activity.Backend{

@@ -1,7 +1,7 @@
 # 0102-0004 — `promote.signal` File Watcher (pg_ctl promote Parity)
 
-**Status:** draft
-**Date:** 2026-05-13
+**Status:** accepted
+**Date:** 2026-05-13 (landed 2026-05-14)
 **Milestone:** M0102-0004
 **Upstream reference:** `postgres/src/backend/access/transam/xlogrecovery.c:4475` (`CheckForStandbyTrigger`), `postgres/src/bin/pg_ctl/pg_ctl.c:1186` (`do_promote`), `postgres/src/include/access/xlog.h:314` (`PROMOTE_SIGNAL_FILE` macro).
 

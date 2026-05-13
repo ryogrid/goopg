@@ -23,6 +23,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -55,8 +58,64 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.Frame
 		return true, s.replyDropReplicationSlot(w, trimmed[len("DROP_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "START_REPLICATION"):
 		return true, s.replyStartReplication(ctx, r, w, trimmed)
+	case strings.HasPrefix(upper, "TIMELINE_HISTORY "):
+		return true, s.replyTimelineHistory(w, trimmed[len("TIMELINE_HISTORY "):])
 	}
 	return false, nil
+}
+
+// replyTimelineHistory serves the upstream TIMELINE_HISTORY <tli> command.
+// Argument is a single decimal TLI; the server replies with a 1-row,
+// 2-column result-set (filename text, content bytea) holding the raw
+// `<tli>.history` bytes from `pg_wal/`. A missing file (e.g. TLI=1
+// on a freshly initialised primary) returns an empty content row —
+// upstream's walreceiver treats that as "no history yet" rather than
+// an error. Mirrors `postgres/src/backend/replication/walsender.c`'s
+// SendTimeLineHistory branch.
+func (s *Server) replyTimelineHistory(w *protocol.FrameWriter, args string) error {
+	tok := strings.Fields(strings.TrimSpace(args))
+	if len(tok) == 0 {
+		return s.writeQueryError(w, sqlstate.SyntaxError,
+			"TIMELINE_HISTORY requires a timeline ID")
+	}
+	tli64, err := strconv.ParseUint(tok[0], 10, 32)
+	if err != nil {
+		return s.writeQueryError(w, sqlstate.SyntaxError,
+			fmt.Sprintf("TIMELINE_HISTORY: invalid TLI %q", tok[0]))
+	}
+	tli := uint32(tli64)
+	walDir := s.cfg.WALDirPath
+	if walDir == "" {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			"TIMELINE_HISTORY requires Config.WALDirPath to be set")
+	}
+
+	name := wal.TimelineHistoryFileName(tli)
+	path := filepath.Join(walDir, name)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return s.writeQueryError(w, sqlstate.InternalError, err.Error())
+		}
+		// Upstream parity: TLI without a history file (typically TLI=1)
+		// returns an empty content blob rather than an error.
+		content = nil
+	}
+
+	if err := w.WriteRowDescription([]protocol.FieldDescription{
+		{Name: "filename", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+		{Name: "content", TypeOID: oidBytea, TypeSize: -1, TypeModifier: -1, Format: 0},
+	}); err != nil {
+		return err
+	}
+	row := [][]byte{[]byte(name), content}
+	if err := w.WriteDataRow(row); err != nil {
+		return err
+	}
+	if err := w.WriteCommandComplete("TIMELINE_HISTORY"); err != nil {
+		return err
+	}
+	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
 // replyIdentifySystem emits the four-column / one-row reply upstream's

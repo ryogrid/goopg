@@ -1220,26 +1220,72 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
       -h 127.0.0.1 -p <goopg> -D /tmp/clone -X stream -P -v` exits 0 and the
       cloned dir starts as a goopg standby.
 
-- [ ] **M0102-0003** — TIMELINE_HISTORY wire-protocol + TLI history file writer.
-      Design doc: `docs/design/0102-0002-timeline-history-and-promotion-tli-switch.md`.
-      Sites: new `internal/wal/timeline_history.go` (`ReadHistory`,
-      `WriteHistory`, `TimelineHistoryEntry`); `internal/server/replication.go`
-      adds `case "TIMELINE_HISTORY":`; `cmd/goopg/standby.go` `Promote(ctx)`
-      increments TLI and writes `pg_wal/<NewTLI>.history` before clearing
-      `standby.signal`. Persist TLI in a `global/timeline_id` file (or extend
-      the M0101 `system_identifier` file). Verify: after `goopg promote`, the
-      data dir contains `00000002.history`; `TIMELINE_HISTORY 2` over the
-      replication wire returns the file content.
+- [x] **M0102-0003** — TIMELINE_HISTORY wire-protocol + TLI history file writer.
+      LANDED 2026-05-14. Design doc:
+      `docs/design/0102-0002-timeline-history-and-promotion-tli-switch.md` (accepted).
+      Changes:
+      - `internal/wal/timeline_history.go` — `ReadHistory`, `WriteHistory`,
+        `TimelineHistoryFileName`, `TimelineHistoryEntry`. Atomic write via
+        `.tmp` + rename + best-effort dir fsync. Tab-separated
+        `<TLI>\t<X/X>\t<reason>\n` format; tolerates `#` comments and
+        blank lines on read.
+      - `internal/initdb/timeline.go` — `LoadOrCreateTimelineID(dataDir)`
+        and `WriteTimelineID(dataDir, tli)`; 4-byte little-endian uint32 in
+        `<dataDir>/global/timeline_id`, default 1 on fresh cluster.
+      - `internal/initdb/open.go` — passes `wal.Config{TimelineID: tli}`
+        from `LoadOrCreateTimelineID(abs)` so the writer picks up the
+        persisted TLI on every start.
+      - `internal/server/replication.go` — `TIMELINE_HISTORY <tli>` arm
+        returns a 1-row, 2-column (filename text, content bytea) result.
+        Missing files (typically TLI=1) return NULL content matching the
+        upstream walreceiver contract. New `oidBytea = 17` constant.
+      - `cmd/goopg/standby.go` `finalizePromotion` — bumps TLI, appends
+        a history entry anchored at the replayer's `ApplyLSN` (or
+        `WrittenLSN` if replay never started), writes
+        `pg_wal/<newTLI>.history`, persists newTLI before removing
+        `standby.signal`. The running WAL writer keeps emitting on
+        oldTLI for the rest of the process lifetime — an in-place
+        `Writer.SetTimelineID()` is a documented follow-up; M0102-0003's
+        verification gate only requires the on-disk artefacts and the
+        wire path.
+      Tests:
+      - `internal/wal/timeline_history_test.go` — round-trip, format
+        pinning, missing-file, comment/blank-line tolerance.
+      - `internal/initdb/timeline_test.go` — default + bump round-trip.
+      - `cmd/goopg/standby_test.go::TestStandbyControllerPromoteWritesTimelineHistory`
+        — promote path produces `pg_wal/00000002.history` (line begins
+        with `1\t`) and `global/timeline_id` advances to 2.
+      - `internal/server/replication_test.go` —
+        `TestReplicationTimelineHistoryReturnsFile` and
+        `TestReplicationTimelineHistoryMissingReturnsEmptyContent` verify
+        the wire shape end-to-end against a live `Server`.
+      Verification: `go test -race -count=1 ./internal/wal/
+      ./internal/initdb/ ./internal/server/ ./cmd/goopg/` → ALL PASS.
 
-- [ ] **M0102-0004** — `promote.signal` file watcher (pg_ctl promote parity).
-      Design doc: `docs/design/0102-0004-promotion-trigger-pg-ctl-parity.md`.
-      Site: `cmd/goopg/standby.go` — add `promoteSignalWatcher` goroutine that
-      polls `<datadir>/promote.signal` every 250 ms; on detect, remove the
-      file and call existing `Promote(ctx)`. Reuse `promoteOnce` for
-      idempotency with the control-socket PROMOTE. Verify: `touch
-      <datadir>/promote.signal` against a running standby flips
-      `pg_is_in_recovery()` to `false` within 1 s; `pg_ctl promote -D
-      <goopg-dir>` works.
+- [x] **M0102-0004** — `promote.signal` file watcher (pg_ctl promote parity).
+      Design doc: `docs/design/0102-0004-promotion-trigger-pg-ctl-parity.md` (accepted).
+      LANDED 2026-05-14. Changes:
+      - `internal/initdb/standby.go`: new `PromoteSignalFile = "promote.signal"`
+        (upstream PROMOTE_SIGNAL_FILE parity).
+      - `cmd/goopg/standby.go`: `standbyController` gains `signalCancel` /
+        `signalDone` for the watcher goroutine; `Close()` waits on `signalDone`
+        after cancel. `promoteSignalPollInterval = 250ms`. `promoteSignalWatcher`
+        polls `<DataDir>/promote.signal`; on detect removes file then calls
+        `sc.Promote(ctx)` — `promoteOnce` provides idempotency vs. control-
+        socket PROMOTE. `startStandby` removes any stale `promote.signal`
+        (logged WARN) before launching the watcher, matching upstream
+        `StartupXLOG` init order so a leftover file does not auto-promote
+        the next start.
+      - Tests in `cmd/goopg/standby_test.go`:
+        * `TestStandbyControllerPromoteSignalTriggersPromote` — drops
+          `promote.signal`, waits ≤1.5 s for `sc.promoted` to flip, asserts
+          `rt.Standby == false` and both signal files cleared.
+        * `TestStandbyControllerRemovesStalePromoteSignal` — seeds the file
+          before `startStandby`, asserts synchronous removal and no
+          auto-promote during 600 ms (2.4× poll interval).
+      Verification: `go test -race -run TestStandbyController -count=1
+      ./cmd/goopg/` → PASS (1.98 s); full `cmd/goopg` + `internal/initdb`
+      suites green with `-race`.
 
 - [ ] **M0102-0005** — Synchronous replication: `synchronous_standby_names` +
       commit-wait + standby feedback.

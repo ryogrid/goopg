@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -118,6 +120,105 @@ func TestStandbyControllerPromoteDrainsPendingReplay(t *testing.T) {
 	}
 }
 
+// TestStandbyControllerPromoteSignalTriggersPromote covers M0102-0004.
+// Dropping `promote.signal` into the data directory of a running
+// standby controller must cause the controller to (a) remove the
+// file and (b) call Promote within ~1 second, flipping rt.Standby
+// to false and clearing standby.signal.
+func TestStandbyControllerPromoteSignalTriggersPromote(t *testing.T) {
+	dataDir := initStandbyDir(t)
+
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	if !rt.Standby {
+		t.Fatal("expected Runtime.Standby = true after creating standby.signal")
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sc := startStandby(parent, rt, nil, logger)
+	defer sc.Close()
+
+	// Let the controller install the watcher goroutine.
+	time.Sleep(20 * time.Millisecond)
+
+	promotePath := filepath.Join(dataDir, initdb.PromoteSignalFile)
+	if err := os.WriteFile(promotePath, nil, 0o600); err != nil {
+		t.Fatalf("write promote.signal: %v", err)
+	}
+
+	// Watcher polls at 250ms; allow ~1.5s for detect + Promote. We
+	// observe completion via the atomic `promoted` flag set inside
+	// Promote — race-safe vs. reading `rt.Standby` directly while
+	// the watcher goroutine is still finalising.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if sc.promoted.Load() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !sc.promoted.Load() {
+		t.Fatal("standbyController.promoted still false 1.5s after promote.signal dropped")
+	}
+	// Wait for the watcher goroutine to actually exit so the
+	// finalizePromotion store on rt.Standby happens-before our read.
+	sc.signalCancel()
+	<-sc.signalDone
+	if rt.Standby {
+		t.Error("Runtime.Standby = true after Promote, want false")
+	}
+	if _, err := os.Stat(promotePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("promote.signal still present after Promote (err=%v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, initdb.StandbySignalFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("standby.signal still present after Promote (err=%v)", err)
+	}
+}
+
+// TestStandbyControllerRemovesStalePromoteSignal verifies that a
+// pre-existing promote.signal left over from a previous run is
+// cleared at standby controller startup (and a warning logged),
+// matching upstream's StartupXLOG init order. Without this guard,
+// the watcher would fire on its very first poll and promote a
+// standby the operator never asked to promote.
+func TestStandbyControllerRemovesStalePromoteSignal(t *testing.T) {
+	dataDir := initStandbyDir(t)
+
+	stale := filepath.Join(dataDir, initdb.PromoteSignalFile)
+	if err := os.WriteFile(stale, nil, 0o600); err != nil {
+		t.Fatalf("seed stale promote.signal: %v", err)
+	}
+
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sc := startStandby(parent, rt, nil, logger)
+	defer sc.Close()
+
+	// Stale file must be removed synchronously inside startStandby.
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stale promote.signal not removed (err=%v)", err)
+	}
+
+	// Wait a couple of poll intervals to confirm no auto-promote
+	// happened (rt.Standby should still be true).
+	time.Sleep(600 * time.Millisecond)
+	if !rt.Standby {
+		t.Error("auto-promoted from stale promote.signal; want no promote")
+	}
+}
+
 // initStandbyDir creates a freshly-initialised goopg data directory
 // with `standby.signal` already present, suitable for opening as a
 // standby. Test helpers shared between standby tests live here so
@@ -132,4 +233,61 @@ func initStandbyDir(t *testing.T) string {
 		t.Fatalf("CreateStandbySignal: %v", err)
 	}
 	return dir
+}
+
+
+// TestStandbyControllerPromoteWritesTimelineHistory exercises the
+// M0102-0003 promote path: after a successful promote, the data dir
+// must contain `pg_wal/00000002.history` (one entry referencing the
+// previous TLI=1) and `global/timeline_id` must hold the bumped
+// value (2). A heterogeneous PG standby reattaching after this point
+// resolves the timeline boundary by fetching the .history via
+// TIMELINE_HISTORY 2.
+func TestStandbyControllerPromoteWritesTimelineHistory(t *testing.T) {
+	dataDir := initStandbyDir(t)
+
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+	if !rt.Standby {
+		t.Fatal("expected Runtime.Standby = true after creating standby.signal")
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sc := startStandby(parent, rt, nil, logger)
+	defer sc.Close()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := sc.Promote(context.Background()); err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+
+	historyPath := filepath.Join(dataDir, "pg_wal", "00000002.history")
+	body, err := os.ReadFile(historyPath)
+	if err != nil {
+		t.Fatalf("read history file: %v", err)
+	}
+	if len(body) == 0 {
+		t.Fatal("history file is empty; want one entry for TLI=1")
+	}
+	// The first field of the only line is the previous TLI ("1").
+	if !bytes.HasPrefix(body, []byte("1\t")) {
+		t.Errorf("history file content does not start with TLI=1 line: %q", body)
+	}
+
+	tliBytes, err := os.ReadFile(filepath.Join(dataDir, "global", "timeline_id"))
+	if err != nil {
+		t.Fatalf("read timeline_id: %v", err)
+	}
+	if len(tliBytes) != 4 {
+		t.Fatalf("timeline_id wrong length: got %d, want 4", len(tliBytes))
+	}
+	got := binary.LittleEndian.Uint32(tliBytes)
+	if got != 2 {
+		t.Errorf("persisted TLI = %d, want 2", got)
+	}
 }
