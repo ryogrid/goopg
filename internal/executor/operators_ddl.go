@@ -708,44 +708,67 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("table %q does not exist", name.String())}
 		}
-		idxs := o.ctx.Catalog.IndexesOnTable(tbl)
-		idxRels := make([]storage.RelFileNode, 0, len(idxs))
-		for _, idx := range idxs {
-			idxRels = append(idxRels, o.ctx.Catalog.IndexRelFileNode(idx))
-		}
-		rel := o.ctx.Catalog.RelFileNode(tbl)
-		if err := o.ctx.Catalog.DropTable(name); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
-		}
-		// If this table was shadowing a permanent one, restore it. M0097-0003.
-		if o.ctx.TempTableShadows != nil {
-			key := strings.ToLower(name.Name)
-			if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
-				if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-					im.RegisterTable(permTbl)
+		// Drop dependent tables before dropping the parent:
+		// - Partition children: ALWAYS (they can't exist without the parent).
+		// - Inheritance children: only with CASCADE (M0100-0004).
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			for _, child := range im.PartitionChildren(tbl.OID) {
+				childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+				if err := o.dropTableByRef(childName, child); err != nil {
+					return err
 				}
-				delete(o.ctx.TempTableShadows, key)
+			}
+			if s.Behavior == parser.DropCascade {
+				for _, child := range im.InheritanceChildren(tbl.OID) {
+					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					if err := o.dropTableByRef(childName, child); err != nil {
+						return err
+					}
+				}
 			}
 		}
-		o.ctx.Pool.InvalidateRel(rel)
-		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		if err := o.dropTableByRef(name, tbl); err != nil {
+			return err
 		}
-		// M0090-0001: clear FSM + VM entries for the dropped
-		// heap. Same rationale as execTruncate — without this,
-		// a future CREATE TABLE that lands on the same oid would
-		// inherit stale FSM/VM bits from the dropped relation.
-		if o.ctx.FSM != nil {
-			o.ctx.FSM.DropRelation(rel)
-		}
-		if o.ctx.VM != nil {
-			o.ctx.VM.DropRelation(rel)
-		}
-		for _, idxRel := range idxRels {
-			o.ctx.Pool.InvalidateRel(idxRel)
-			if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// dropTableByRef drops a single table by its catalog.Table reference.
+func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error {
+	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
+	idxRels := make([]storage.RelFileNode, 0, len(idxs))
+	for _, idx := range idxs {
+		idxRels = append(idxRels, o.ctx.Catalog.IndexRelFileNode(idx))
+	}
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	if err := o.ctx.Catalog.DropTable(name); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	// If this table was shadowing a permanent one, restore it. M0097-0003.
+	if o.ctx.TempTableShadows != nil {
+		key := strings.ToLower(name.Name)
+		if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				im.RegisterTable(permTbl)
 			}
+			delete(o.ctx.TempTableShadows, key)
+		}
+	}
+	o.ctx.Pool.InvalidateRel(rel)
+	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idxRel := range idxRels {
+		o.ctx.Pool.InvalidateRel(idxRel)
+		if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
+			return &ExecError{Code: "XX000", Message: err.Error()}
 		}
 	}
 	return nil

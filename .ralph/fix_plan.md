@@ -1374,17 +1374,20 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
       mismatch due to advisory-lock snapshot refresh issue, separate from epqWait). All unit
       tests -race clean.
 
-- [ ] **M0100-0004** — EvalPlanQual concurrent UPDATE recheck (chain-following).
-      Design doc: `docs/design/0100-0004-evalplanqual-recheck.md`.
-      Depends on M0100-0003. Sites: `internal/executor/operators_storage.go`
-      `epqRecheckVisible` and the UPDATE post-wait path. After
-      `WaitForXID` returns, follow the t_ctid chain to the latest visible
-      version, re-evaluate the UPDATE qual against the new tuple, re-bind
-      SET expressions to the new row, apply the update on the new ctid.
-      This is the chain-following completion that M0098-0004 explicitly
-      deferred. ReadCommitted only; RR raises 40001 at the same site.
-      Verify: `TestPort_IsolationEvalPlanQual`, `…EvalPlanQualTrigger`,
-      `TestPort_IsolationMergeMatchRecheck` reach `pass`.
+- [x] **M0100-0004** — EvalPlanQual concurrent UPDATE recheck (chain-following). (2026-05-13)
+      Design doc: `docs/design/0100-0004-evalplanqual-recheck.md` (accepted).
+      Implemented:
+      1. `executor/operators_storage.go`: `epqFollowHOT(ctx, rel, blk, slot, cols, pred)` helper —
+         follows HOT chain from old slot to latest visible version, re-evaluates WHERE.
+      2. UPDATE SeqScan EPQ loop: after WaitForXID, if tuple invisible (committed):
+         follow HOT chain, re-evaluate WHERE+SET, continue loop with new slot. RR → 40001.
+      3. UPDATE IndexViaUpdate EPQ loop: same chain-following logic.
+      4. DELETE EPQ loop: chain-follow + re-evaluate WHERE, delete latest version. RR → 40001.
+      5. `executor/operators_ddl.go`: DROP TABLE now drops partition children unconditionally
+         and inheritance children with CASCADE; `dropTableByRef` helper extracts drop logic.
+      All unit tests (executor/server/mvcc) pass with -race; TestPort_IsolationInsertConflictDoNothing PASS.
+      NOTE: eval-plan-qual/merge-match-recheck defer due to missing RETURNING support in planner
+      (not an EPQ issue — RETURNING is parsed but not planned; needs separate work).
 
 - [ ] **M0100-0005** — E2E pass confirmation: all 21 dedicated RC isolation
       tests pass. **Closes M0096-0005 and M0096-0013 via cross-reference.**

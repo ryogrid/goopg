@@ -1,6 +1,6 @@
 # 0100-0004 — EvalPlanQual Concurrent UPDATE Recheck (ReadCommitted)
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0100-0004
 **Closes:** M0096-0013 (one of the documented remaining blockers)

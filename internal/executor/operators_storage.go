@@ -120,6 +120,41 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID), nil
 }
 
+// epqFollowHOT follows the HOT chain from (rel, blk, slot) to find the
+// latest visible version after a concurrent UPDATE committed (M0100-0004).
+// Re-evaluates pred (WHERE) against the latest tuple; returns the slot,
+// decoded row, and true if a matching version was found. Returns (0, nil,
+// false) when the chain terminates, the tuple is dead, or WHERE fails.
+//
+// Only valid for HOT updates (same-page chain). For cross-page (non-HOT)
+// updates the old tuple has no HeapHotUpdated and followHOTChain returns
+// not-found — the row is skipped (v0 compromise).
+func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16, cols []catalog.Column, pred planner.Expr) (uint16, Row, bool) {
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return 0, nil, false
+	}
+	s.RLock()
+	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID)
+	s.RUnlock()
+	ctx.Pool.Unpin(s)
+	if !found {
+		return 0, nil, false
+	}
+	latestRow, decErr := DecodeRow(cols, latestTup.Data)
+	if decErr != nil {
+		return 0, nil, false
+	}
+	if pred != nil {
+		pv, perr := evalExpr(pred, latestRow, ctx)
+		if perr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
+			return 0, nil, false
+		}
+	}
+	return latestSlot, latestRow, true
+}
+
 var heapExtendLocks sync.Map // map[storage.RelFileNode]*sync.Mutex
 
 func lockHeapExtend(rel storage.RelFileNode) func() {
@@ -1179,19 +1214,41 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							Message: "could not serialize access due to concurrent update (deadlock)",
 						}
 					}
+					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 					visible, _ := epqRecheckVisible(o.ctx, rel, pu.blk, pu.slot)
-					if !visible {
-						epqSkip = true // row gone — xmax committed, deleted the row
+					if visible {
+						// xmax aborted; row still exists at original slot.
+						if !o.ctx.Snap.HasInProgress(xmax) {
+							break // aborted; proceed with update
+						}
+						continue // still in-progress; retry
+					}
+					// Concurrent tx committed — row was updated.
+					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+						return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update"}
+					}
+					// RC: follow HOT chain and re-evaluate WHERE + SET.
+					newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, rel, pu.blk, pu.slot, cols, o.pred)
+					if !chainFound {
+						epqSkip = true
 						break
 					}
-					// Row still visible. If xmax is no longer in InProgress the
-					// conflicting transaction aborted — break so the outer code
-					// can proceed with the update instead of retrying to 40001.
-					// M0099: fixes permanent 40001 on rolled-back HOT updates.
-					if !o.ctx.Snap.HasInProgress(xmax) {
-						break // xmax aborted; proceed with update
+					// Re-bind SET expressions against the latest row.
+					for i := range cols {
+						if i < len(o.plan.Set) && o.plan.Set[i] != nil {
+							v, e := evalExpr(o.plan.Set[i], baseRow, o.ctx)
+							if e != nil {
+								return nil, e
+							}
+							pu.newRow[i] = v
+						} else {
+							pu.newRow[i] = baseRow[i]
+						}
 					}
-					continue // xmax still in-progress; retry
+					_ = computeGeneratedColumns(cols, pu.newRow)
+					pu.slot = newSlot
+					continue // re-run loop to stamp xmax on new slot
 				}
 				var oldTupleBytes []byte
 				if oldGerr == nil {
@@ -1353,16 +1410,44 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						Message: "could not serialize access due to concurrent update (deadlock)",
 					}
 				}
+				// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 				visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
-				if !visible {
+				if visible {
+					// xmax aborted; row still exists.
+					if !o.ctx.Snap.HasInProgress(xmax) {
+						break // aborted; proceed with update
+					}
+					continue // still in-progress; retry
+				}
+				// Concurrent tx committed — row was updated.
+				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update"}
+				}
+				// RC: follow HOT chain and re-evaluate WHERE + SET.
+				newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred)
+				if !chainFound {
 					epqSkipSeq = true
 					break
 				}
-				// Row visible; if xmax no longer in-progress → it aborted → proceed.
-				if !o.ctx.Snap.HasInProgress(xmax) {
-					break // xmax aborted; proceed with update
+				// Re-bind SET expressions against the latest row.
+				for i := range puCols {
+					setIdx := i
+					if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
+						v, e := evalExpr(o.plan.Set[setIdx], baseRow, o.ctx)
+						if e != nil {
+							return nil, e
+						}
+						pu.newRow[i] = v
+					} else {
+						if i < len(baseRow) {
+							pu.newRow[i] = baseRow[i]
+						}
+					}
 				}
-				continue // xmax still running; retry
+				_ = computeGeneratedColumns(puCols, pu.newRow)
+				pu.slot = newSlot
+				continue // re-run loop to stamp xmax on new slot
 			}
 			var oldTupleBytes []byte
 			if oldGerr == nil {
@@ -1467,6 +1552,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		blk  storage.BlockNumber
 		slot uint16
 		row  Row
+		cols []catalog.Column // for EPQ chain-following (M0100-0004)
 	}
 	// Collect victims from parent + partition/inheritance children. M0096-0013.
 	var victims []victim
@@ -1483,8 +1569,9 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			}
 		}
 		captureRel := scanRel // capture for closure
+		captureCols := scanTbl.Columns
 		if err := scanMatching(o.ctx, scanRel, scanTbl.Columns, o.pred, func(blk storage.BlockNumber, slot uint16, row Row) error {
-			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row)})
+			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row), cols: captureCols})
 			return nil
 		}); err != nil {
 			return nil, err
@@ -1540,16 +1627,32 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					Message: "could not serialize access due to concurrent update (deadlock)",
 				}
 			}
+			// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 			visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
-			if !visible {
+			if visible {
+				// xmax aborted; row still exists.
+				if !o.ctx.Snap.HasInProgress(xmax) {
+					break // aborted; proceed with delete
+				}
+				continue // still in-progress; retry
+			}
+			// Concurrent tx committed — row was updated.
+			if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+				return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
+					Message: "could not serialize access due to concurrent update"}
+			}
+			// RC: follow HOT chain and re-evaluate WHERE.
+			victimCols := v.cols
+			if victimCols == nil {
+				victimCols = tbl.Columns
+			}
+			newSlot, _, chainFound := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred)
+			if !chainFound {
 				epqSkipDel = true
 				break
 			}
-			// Row visible; if xmax no longer in-progress → aborted → proceed.
-			if !o.ctx.Snap.HasInProgress(xmax) {
-				break // xmax aborted; proceed with delete
-			}
-			continue // xmax still running; retry
+			v.slot = newSlot
+			continue // re-run loop to stamp xmax on new slot
 		}
 		var oldTupleBytes []byte
 		if oldGerr == nil {
