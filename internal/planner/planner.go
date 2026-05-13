@@ -2678,6 +2678,12 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 	tbl := ctx.bindings[0].table
+	// Partitioned parent tables store no rows themselves; all data is in
+	// partition children. Skip IndexScan and fall through to Filter+UNION ALL
+	// which correctly scans the children via planScanRangeVar. M0100-0005.
+	if len(tbl.PartitionKey) > 0 {
+		return nil, false, nil
+	}
 	b, ok := where.(*parser.BinaryOp)
 	if !ok || b.Op != parser.OpEq {
 		// Not an equality predicate — try range index scan.
@@ -2854,6 +2860,10 @@ func flipRangeOp(op parser.OpCode) parser.OpCode {
 // on a single B-tree-indexed column. Returns (nil, false, nil) when no range
 // index is applicable.
 func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	// Partitioned parent tables store no rows; skip index scan. M0100-0005.
+	if len(tbl.PartitionKey) > 0 {
+		return nil, false, nil
+	}
 	conjuncts := collectAndConjuncts(where)
 
 	var chosenColName string
