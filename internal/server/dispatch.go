@@ -292,12 +292,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			continue
 		}
 
-		// Refresh snapshot per statement for ReadCommitted parity.
-		snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
-		if err != nil {
-			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+		// PG-parity: RC refreshes snapshot per statement; RR/SSI hold the
+		// BEGIN-time snapshot for the whole transaction (M0100-0001).
+		// Use ectx.Tx.Isolation (not the outer tx) so execBegin's
+		// promotion of the implicit RC tx to an explicit RR tx is visible.
+		if ectx.Tx.Isolation == mvcc.IsolationReadCommitted {
+			snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
+			if err != nil {
+				return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+			}
+			ectx.Snap = snap2
 		}
-		ectx.Snap = snap2
 
 		// M0098-0005: plan cache for single-statement queries (the
 		// common OLTP case). On hit: skip planner.Plan. On miss:
