@@ -877,8 +877,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableAttachPartition:
 			// ATTACH PARTITION child FOR VALUES … (M0096-0007)
-			if act.AttachPartitionOf == nil || act.AttachPartitionOf.Default {
-				break // detach or default partition, ignore for now
+			if act.AttachPartitionOf == nil {
+				break
+			}
+			// Handle DEFAULT partition — same as regular partition attachment
+			// for catalog purposes (partition child must be registered so DROP
+			// TABLE parent CASCADE can find and drop it). M0100-0005.
+			if act.AttachPartitionOf.Default {
+				childTbl, ok := o.ctx.Catalog.LookupTable(act.AttachPartitionOf.Parent)
+				if ok {
+					childTbl.PartitionParentOID = tbl.OID
+					if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+						im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+					}
+				}
+				break
 			}
 			poc := act.AttachPartitionOf
 			// poc.Parent contains the child table name here (set in parser).

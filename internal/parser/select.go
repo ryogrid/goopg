@@ -1327,6 +1327,12 @@ func (p *parser) parsePrimary() (Expr, error) {
 		}
 		return p.parseColumnOrCall()
 	}
+	// Unreserved keywords (KwCatUnreserved / KwCatColName) may appear as
+	// column references in expressions. Example: `lower(key)` where `key`
+	// is a column name that happens to be an unreserved SQL keyword.
+	if t.Kind == TokenKeyword && IsColNameKeyword(t.Keyword) {
+		return p.parseColumnOrCall()
+	}
 	return nil, p.errAtCur("expected expression")
 }
 
