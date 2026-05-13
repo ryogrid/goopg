@@ -48,10 +48,17 @@ func ParseIsolationLevel(v string) (IsolationLevel, error) {
 // XIDs strictly below Xmin are treated as completed (committed for v0);
 // XIDs >= Xmax are in the future; in-between XIDs are in-progress iff
 // present in InProgress.
+//
+// Aborted holds XIDs whose transactions were rolled back. A tuple whose
+// xmin is in Aborted is invisible even when xmin < Xmin (without Aborted,
+// goopg v0 would incorrectly treat rolled-back rows as committed once
+// they fall below Xmin). This is a lightweight substitute for a full
+// clog (commit log) — M0100-0002.
 type Snapshot struct {
 	Xmin       storage.TransactionID
 	Xmax       storage.TransactionID
 	InProgress []storage.TransactionID
+	Aborted    []storage.TransactionID
 }
 
 // Clone deep-copies the snapshot so callers can hold it independently
@@ -61,8 +68,10 @@ func (s Snapshot) Clone() Snapshot {
 		Xmin:       s.Xmin,
 		Xmax:       s.Xmax,
 		InProgress: make([]storage.TransactionID, len(s.InProgress)),
+		Aborted:    make([]storage.TransactionID, len(s.Aborted)),
 	}
 	copy(out.InProgress, s.InProgress)
+	copy(out.Aborted, s.Aborted)
 	return out
 }
 
@@ -100,10 +109,34 @@ func (s Snapshot) HasInProgress(xid storage.TransactionID) bool {
 	return idx < n && s.InProgress[idx] == xid
 }
 
+// HasAborted returns true when xid belongs to a rolled-back transaction
+// whose status is tracked in this snapshot's Aborted list (M0100-0002).
+func (s Snapshot) HasAborted(xid storage.TransactionID) bool {
+	n := len(s.Aborted)
+	if n == 0 {
+		return false
+	}
+	if n <= snapshotLinearScanThreshold {
+		for _, a := range s.Aborted {
+			if a == xid {
+				return true
+			}
+		}
+		return false
+	}
+	idx := sort.Search(n, func(i int) bool { return s.Aborted[i] >= xid })
+	return idx < n && s.Aborted[idx] == xid
+}
+
 // SeesCommittedXID reports whether xid is visible as committed to this
 // snapshot under the v0 model.
 func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	// Explicitly-aborted XIDs are never visible, even if they fall below
+	// Xmin (where they'd otherwise be assumed committed). M0100-0002.
+	if s.HasAborted(xid) {
 		return false
 	}
 	if xid < s.Xmin {

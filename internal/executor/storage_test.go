@@ -139,12 +139,9 @@ func TestSeqScanRespectsVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Open a fresh transaction. The aborted insert's xid is now no
-	// longer in the active set; v0's mvcc treats anything not in
-	// InProgress and < Xmax as committed (a known v0 limitation), so
-	// we'd actually see the ghost row. Mark this expectation
-	// explicitly so the test pins current behaviour and tightens once
-	// commit-status tracking lands.
+	// Open a fresh transaction. The aborted insert's xid is now tracked
+	// in the snapshot's Aborted list (M0100-0002), so the ghost row is
+	// correctly invisible (0 rows).
 	tx2, _ := ctx.TxnMgr.Begin(mvcc.IsolationReadCommitted)
 	defer ctx.TxnMgr.Rollback(tx2)
 	snap2, _ := ctx.TxnMgr.SnapshotFor(tx2)
@@ -160,8 +157,8 @@ func TestSeqScanRespectsVisibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("scan returned %d rows; v0 mvcc treats aborts as committed (see comment) — expected 1", len(rows))
+	if len(rows) != 0 {
+		t.Fatalf("scan returned %d rows after rollback; aborted rows must be invisible (M0100-0002)", len(rows))
 	}
 }
 

@@ -3076,10 +3076,10 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		return nil, &PlanError{Pos: oc.Pos(), Code: "XX000", Message: fmt.Sprintf("unexpected ON CONFLICT action %d", oc.Action)}
 	}
 
-	// Arbiter-index selection. For the no-target form (DO NOTHING
-	// only — analyzer rejects DO UPDATE without a target),
-	// ArbiterIndex stays nil; the executor checks every unique
-	// index when the row hits.
+	// Arbiter-index selection. With a target, resolve explicitly.
+	// For the bare DO NOTHING form (no target), fall back to the
+	// primary key index so probeArbiterWaiting can detect
+	// in-progress conflicts (M0100-0002).
 	if oc.Target != nil {
 		idx, ords, err := resolveArbiterIndex(oc.Target, tbl, cat)
 		if err != nil {
@@ -3087,6 +3087,25 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		}
 		out.ArbiterIndex = idx
 		out.ArbiterColumns = ords
+	} else if out.Action == OnConflictActionNothing && cat != nil {
+		// Auto-detect primary key as arbiter for bare ON CONFLICT DO NOTHING.
+		for _, idx := range cat.IndexesOnTable(tbl) {
+			if !idx.Primary {
+				continue
+			}
+			out.ArbiterIndex = idx
+			ords := make([]int, 0, len(idx.Columns))
+			for _, colName := range idx.Columns {
+				for i, col := range tbl.Columns {
+					if strings.EqualFold(col.Name, colName) {
+						ords = append(ords, i)
+						break
+					}
+				}
+			}
+			out.ArbiterColumns = ords
+			break
+		}
 	}
 
 	if out.Action != OnConflictActionUpdate {

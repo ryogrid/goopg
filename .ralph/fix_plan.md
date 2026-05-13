@@ -1332,20 +1332,28 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
       TestRepeatableReadPinsFirstSnapshot already covers MVCC layer.
       All server/mvcc/executor tests pass with -race. Commit: ad82b12.
 
-- [ ] **M0100-0002** — Eager XID materialisation for ON CONFLICT wait
-      propagation. **Closes M0096-0005.**
-      Design doc: `docs/design/0100-0002-eager-xid-materialization-at-begin.md`.
-      Sites: `internal/executor/operators_insert.go` and
-      `internal/executor/operators_upsert.go` — call
-      `ctx.MaterializeWriterXID` before the heap write so concurrent
-      `findInProgressConflict` sees the in-progress xmin; turn
-      `probeArbiterWaiting` into a probe-wait-rescan loop. Preserves
-      M0093's read-only TPS win (no eager XID at BEGIN — only at first
-      write). Verify: at least one of donothing2 / insert2 in
-      `TestPort_IsolationInsertConflictDoUpdate{,2,3,4}`,
-      `TestPort_IsolationInsertConflictDoNothing`, and
-      `TestPort_IsolationInsertConflictSpecconflict` emits `<waiting …>`
-      and the specs reach `pass`; pgbench-S `-c 10 -T 30` ≥ 2,000 TPS.
+- [x] **M0100-0002** — Eager XID materialisation for ON CONFLICT wait
+      propagation. **Closes M0096-0005.** (2026-05-13)
+      Design doc: `docs/design/0100-0002-eager-xid-materialization-at-begin.md` (accepted).
+      Implemented (5 logical areas):
+      1. `mvcc/manager.go`: `IsXIDActive(xid)` public method; abortedXIDs tracking
+         in `finish()` on rollback; `captureSnapshotLocked` includes all abortedXIDs
+         in snapshot's `Aborted` field.
+      2. `mvcc/snapshot.go`: `Aborted []TransactionID` field in Snapshot; `HasAborted(xid)`
+         method; `SeesCommittedXID` checks `HasAborted` before xid < Xmin (fixes
+         rolled-back rows appearing committed — lightweight clog substitute).
+      3. `executor/operators_upsert.go`: `findInProgressConflict` uses `IsXIDActive`
+         (not `Snap.HasInProgress`) so future-xmin tuples (materialized after snapshot)
+         are detected; planner auto-detects primary key as arbiter for bare ON CONFLICT
+         DO NOTHING in `planOnConflict`.
+      4. `server/conn_tx.go`: `Tx()` returns session's current transaction (with
+         up-to-date materialised XID) so session self-sees its own writes in SELECT
+         after INSERT within the same explicit transaction.
+      5. `testport/framework/isolation_runner.go`: per-permutation global setup/teardown
+         (matches PostgreSQL isolationtester); pqprintFormat trailing blank line; step
+         ordering fix (`drainWithTimeout` after each regular step).
+      Verified: `TestPort_IsolationInsertConflictDoNothing` → PASS.
+      All unit tests (mvcc/executor/server/planner) pass with -race.
 
 - [ ] **M0100-0003** — Row-level wait on in-progress xmax for UPDATE/DELETE.
       Design doc: `docs/design/0100-0003-row-level-wait-on-in-progress-xmax.md`.

@@ -80,6 +80,13 @@ type Manager struct {
 	// Used by WaitForXID to block until a specific XID finishes.
 	commitCond *sync.Cond
 
+	// abortedXIDs tracks XIDs whose transactions were rolled back.
+	// Populated by finish() on rollback; included in every snapshot's
+	// Aborted field so rolled-back rows remain invisible even after
+	// their xmin falls below the snapshot's Xmin. This is a lightweight
+	// substitute for a full clog (M0100-0002). Sorted ascending.
+	abortedXIDs []storage.TransactionID
+
 	// subxact tracking (M0050-0002): maps subxact XIDs to their parent
 	// XIDs, and records individually-aborted subxact XIDs. Lazily
 	// initialised on first use. Protected by subxactMu.
@@ -321,6 +328,11 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 			return fmt.Errorf("mvcc: xact-marker hook (xid=%d, kind=%v): %w", state.xid, kind, err)
 		}
 	}
+	// M0100-0002: track rolled-back XIDs so their rows stay invisible
+	// even after the XID falls below future snapshots' Xmin.
+	if kind == XactAbort && state.xid != storage.InvalidTransactionID {
+		m.abortedXIDs = insertSortedXID(m.abortedXIDs, state.xid)
+	}
 	delete(m.active, tx.Handle)
 	// Broadcast to unblock any goroutine waiting in WaitForXID.
 	m.commitCond.Broadcast()
@@ -367,6 +379,20 @@ func (m *Manager) xidInProgress(xid storage.TransactionID) bool {
 		}
 	}
 	return false
+}
+
+// IsXIDActive reports whether xid belongs to a currently-running
+// transaction. Safe to call from any goroutine; acquires m.mu
+// internally. Used by upsertOp.findInProgressConflict to detect
+// heap tuples whose xmin was materialised after the caller's snapshot
+// was captured (M0100-0002).
+func (m *Manager) IsXIDActive(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.xidInProgress(xid)
 }
 
 // XactMarker discriminates the two transaction-end markers fed to
@@ -427,9 +453,33 @@ func (m *Manager) captureSnapshotLocked() Snapshot {
 		xmin = m.nextXID
 	}
 	sort.Slice(inProgress, func(i, j int) bool { return inProgress[i] < inProgress[j] })
+
+	// M0100-0002: include ALL aborted XIDs in the snapshot so rolled-back
+	// rows remain invisible even when their xmin falls below Xmin.
+	// GC is deferred — the set is bounded by the number of rollbacks
+	// during the server's lifetime, which is small in practice.
+	var aborted []storage.TransactionID
+	if len(m.abortedXIDs) > 0 {
+		aborted = make([]storage.TransactionID, len(m.abortedXIDs))
+		copy(aborted, m.abortedXIDs)
+	}
+
 	return Snapshot{
 		Xmin:       xmin,
 		Xmax:       m.nextXID,
 		InProgress: inProgress,
+		Aborted:    aborted,
 	}
+}
+
+// insertSortedXID inserts xid into a sorted slice of XIDs (ascending).
+func insertSortedXID(s []storage.TransactionID, xid storage.TransactionID) []storage.TransactionID {
+	idx := sort.Search(len(s), func(i int) bool { return s[i] >= xid })
+	if idx < len(s) && s[idx] == xid {
+		return s // already present
+	}
+	s = append(s, 0)
+	copy(s[idx+1:], s[idx:])
+	s[idx] = xid
+	return s
 }

@@ -318,7 +318,10 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 			return true, nil
 		}
 		xmin := tuple.Header.Xmin
-		if xmin != storage.InvalidTransactionID && o.ctx.Snap.HasInProgress(xmin) {
+		// Use the live manager active-set (not the snapshot InProgress
+		// list) so we also catch XIDs that were materialised after this
+		// session's snapshot was taken (M0100-0002).
+		if xmin != storage.InvalidTransactionID && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmin) {
 			foundXID = xmin
 			return false, nil // stop scanning
 		}

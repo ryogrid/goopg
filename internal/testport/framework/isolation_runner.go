@@ -43,8 +43,9 @@ type IsolationRunner struct {
 
 // RunSpec runs all permutations and returns output formatted like isolationtester.
 //
-// Global setup runs once before the first permutation; global teardown runs
-// once after the last. Per-session setup runs at the start of every permutation.
+// Matches PostgreSQL isolationtester.c: global setup and teardown run around
+// EVERY permutation (not just once at the start/end). Per-session setup also
+// runs at the start of every permutation.
 func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (string, error) {
 	db, err := sql.Open("postgres", r.DSN)
 	if err != nil {
@@ -60,21 +61,31 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Parsed test spec with %d sessions\n", nSessions)
 
-	// Global setup (runs once before all permutations).
-	if spec.SetupSQL != "" {
-		monitor, err := db.Conn(ctx)
-		if err != nil {
-			return "", fmt.Errorf("open monitor conn for setup: %w", err)
-		}
-		if err := execConn(ctx, monitor, spec.SetupSQL); err != nil {
-			_ = monitor.Close()
-			return "", fmt.Errorf("global setup: %w", err)
-		}
-		_ = monitor.Close()
-	}
-
 	for i, perm := range spec.Permutations {
+		// Global setup runs before each permutation (mirrors isolationtester.c).
+		if spec.SetupSQL != "" {
+			monitor, err := db.Conn(ctx)
+			if err != nil {
+				return "", fmt.Errorf("open monitor conn for setup: %w", err)
+			}
+			if err := execConn(ctx, monitor, spec.SetupSQL); err != nil {
+				_ = monitor.Close()
+				return "", fmt.Errorf("global setup (permutation %d): %w", i, err)
+			}
+			_ = monitor.Close()
+		}
+
 		out, err := r.runPermutation(ctx, db, spec, perm)
+
+		// Global teardown runs after each permutation (mirrors isolationtester.c).
+		if spec.TeardownSQL != "" {
+			monitor, _ := db.Conn(ctx)
+			if monitor != nil {
+				_ = execConn(ctx, monitor, spec.TeardownSQL)
+				_ = monitor.Close()
+			}
+		}
+
 		if err != nil {
 			sb.WriteString("\n")
 			fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
@@ -83,15 +94,6 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		}
 		sb.WriteString("\n")
 		sb.WriteString(out)
-	}
-
-	// Global teardown (runs once after all permutations).
-	if spec.TeardownSQL != "" {
-		monitor, err := db.Conn(ctx)
-		if err == nil {
-			_ = execConn(ctx, monitor, spec.TeardownSQL)
-			_ = monitor.Close()
-		}
 	}
 
 	return sb.String(), nil
@@ -159,9 +161,11 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 		select {
 		case outcome := <-outCh:
-			// Flush any pending steps that completed while we were waiting.
-			pending = drainCompleted(&sb, pending)
+			// Print the current step first, then give pending steps a brief
+			// window to complete (matching PostgreSQL isolationtester order:
+			// unblocked waiting steps appear before the next regular step).
 			sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
+			pending = drainWithTimeout(&sb, pending, 50*time.Millisecond)
 
 		case <-time.After(blockDetectWait):
 			// Step appears blocked; record and continue.
@@ -196,6 +200,26 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 			fmt.Fprintf(sb, "step %s: <... completed>\n", p.name)
 			sb.WriteString(formatStepOutput(p.name, p.sql, o, true))
 		default:
+			remaining = append(remaining, p)
+		}
+	}
+	return remaining
+}
+
+// drainWithTimeout drains pending steps that complete within the given window.
+// After a regular step completes, this lets unblocked waiting steps surface
+// before the next regular step, matching PostgreSQL isolationtester ordering.
+func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Duration) []pendingStep {
+	if len(pending) == 0 {
+		return pending
+	}
+	remaining := pending[:0]
+	for _, p := range pending {
+		select {
+		case o := <-p.outCh:
+			fmt.Fprintf(sb, "step %s: <... completed>\n", p.name)
+			sb.WriteString(formatStepOutput(p.name, p.sql, o, true))
+		case <-time.After(window):
 			remaining = append(remaining, p)
 		}
 	}
@@ -350,6 +374,8 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 	} else {
 		fmt.Fprintf(&sb, "(%d rows)\n", nRows)
 	}
+	// PostgreSQL's PQprint adds a trailing blank line after result sets.
+	sb.WriteString("\n")
 
 	return sb.String()
 }

@@ -1,6 +1,6 @@
 # 0100-0002 — Eager XID Materialisation for ON CONFLICT Wait Propagation
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0100-0002
 **Closes:** M0096-0005 (ON CONFLICT executor correctness — wait-state propagation)
