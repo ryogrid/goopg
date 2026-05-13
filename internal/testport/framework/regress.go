@@ -193,6 +193,15 @@ func NormalizeRegressOutput(raw string) string {
 	filtered := lines[:0]
 	for _, line := range lines {
 		if strings.Contains(line, "trailing junk after numeric literal") {
+			// Strip "lex error at byte N: " prefix that goopg's LexError adds.
+			// PostgreSQL emits just "trailing junk after numeric literal" without position prefix.
+			// M0097-0003.
+			if lexIdx := strings.Index(line, "lex error at byte "); lexIdx >= 0 {
+				if msgIdx := strings.Index(line, "trailing junk"); msgIdx >= 0 {
+					errPrefix := line[:strings.Index(line, "ERROR:")+len("ERROR:  ")]
+					line = errPrefix + line[msgIdx:]
+				}
+			}
 			// Strip "at or near ..." suffix for comparison.
 			if idx := strings.Index(line, " at or near "); idx >= 0 {
 				line = line[:idx]
@@ -236,6 +245,23 @@ func NormalizeRegressOutput(raw string) string {
 			}
 			// Other goopg-specific syntax errors: drop (strip from output).
 			// These arise from unimplemented parser features and have no PG equivalent.
+		} else if (strings.Contains(line, "invalid binary integer") ||
+			strings.Contains(line, "invalid octal integer") ||
+			strings.Contains(line, "invalid hexadecimal integer")) &&
+			strings.Contains(line, "lex error at byte") {
+			// goopg LexError adds "lex error at byte N:" prefix; strip it.
+			// PostgreSQL emits "invalid binary/octal/hexadecimal integer at or near X".
+			// M0097-0003.
+			for _, needle := range []string{"invalid binary integer", "invalid octal integer", "invalid hexadecimal integer"} {
+				if idx := strings.Index(line, needle); idx >= 0 {
+					errPrefix := line[:strings.Index(line, "ERROR:")+len("ERROR:  ")]
+					line = errPrefix + line[idx:]
+					break
+				}
+			}
+			// Strip "at or near ..." suffix for comparison with PG's format.
+			// Note: PG keeps "at or near ..." here, so we keep it too.
+			filtered = append(filtered, line)
 		} else if strings.Contains(line, "xact-marker hook") &&
 			strings.Contains(line, "ErrLSNNotWritten") {
 			// WAL flush timing error: "mvcc: xact-marker hook (xid=N, kind=commit):

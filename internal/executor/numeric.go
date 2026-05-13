@@ -261,6 +261,10 @@ func parseNumeric(text string) (*big.Int, int16, error) {
 	if s == "" {
 		return nil, 0, fmt.Errorf("empty numeric literal")
 	}
+	// Strip numeric separator underscores (PostgreSQL 16+ syntax). M0097-0003.
+	if strings.Contains(s, "_") {
+		s = strings.ReplaceAll(s, "_", "")
+	}
 	neg := false
 	if s[0] == '+' || s[0] == '-' {
 		neg = s[0] == '-'

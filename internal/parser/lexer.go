@@ -180,8 +180,12 @@ func (l *lexer) next() (Token, error) {
 				for l.pos < len(l.src) && (l.src[l.pos] == '0' || l.src[l.pos] == '1' || l.src[l.pos] == '_') {
 					l.pos++
 				}
-				if l.pos == digStart || (l.pos < len(l.src) && isIdentStart(l.src[l.pos])) {
-					// No valid binary digits OR trailing ident → trailing junk.
+				if l.pos == digStart {
+					// No valid binary digits → PG-compatible "invalid binary integer" error.
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "invalid binary integer at or near %q", l.src[start:l.pos])
+				}
+				if l.pos < len(l.src) && isIdentStart(l.src[l.pos]) {
 					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
 					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 				}
@@ -193,7 +197,11 @@ func (l *lexer) next() (Token, error) {
 				for l.pos < len(l.src) && ((l.src[l.pos] >= '0' && l.src[l.pos] <= '7') || l.src[l.pos] == '_') {
 					l.pos++
 				}
-				if l.pos == digStart || (l.pos < len(l.src) && isIdentStart(l.src[l.pos])) {
+				if l.pos == digStart {
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "invalid octal integer at or near %q", l.src[start:l.pos])
+				}
+				if l.pos < len(l.src) && isIdentStart(l.src[l.pos]) {
 					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
 					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 				}
@@ -205,7 +213,11 @@ func (l *lexer) next() (Token, error) {
 				for l.pos < len(l.src) && (isHexDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 					l.pos++
 				}
-				if l.pos == digStart || (l.pos < len(l.src) && isIdentStart(l.src[l.pos])) {
+				if l.pos == digStart {
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "invalid hexadecimal integer at or near %q", l.src[start:l.pos])
+				}
+				if l.pos < len(l.src) && isIdentStart(l.src[l.pos]) {
 					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
 					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 				}
@@ -213,20 +225,59 @@ func (l *lexer) next() (Token, error) {
 			}
 		}
 		// Decimal integer (possibly with _ separators): consume remaining digits.
+		// checkUnderscoreJunk returns true if the consumed range [rStart, rEnd)
+		// contains an invalid underscore pattern: trailing underscore or double underscore.
+		checkUnderscoreJunk := func(rStart, rEnd int) bool {
+			s := l.src[rStart:rEnd]
+			if len(s) == 0 {
+				return false
+			}
+			if s[len(s)-1] == '_' {
+				return true
+			}
+			for i := 1; i < len(s); i++ {
+				if s[i] == '_' && s[i-1] == '_' {
+					return true
+				}
+			}
+			return false
+		}
+		intPartStart := l.pos - 1
 		for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 			l.pos++
 		}
-		// Optional fractional part. We commit to a decimal literal
-		// only when we see digit(s) after the dot; a trailing `.`
-		// followed by an identifier is upstream's qualified-name
-		// form and stays an integer.
+		// Trailing underscore or double underscore in integer part → trailing junk.
+		// e.g. "100_", "100__000" → PostgreSQL errors. M0097-0003.
+		if checkUnderscoreJunk(intPartStart, l.pos) {
+			for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+			return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
+		}
+		// Optional fractional part. We commit to a decimal literal when we see a dot
+		// that is NOT immediately followed by an identifier (qualified-name form `a.b`).
+		// A trailing `.` (e.g. `1000.` or `1_000.`) without following digits or exponent
+		// is a valid float literal in PostgreSQL. M0097-0003.
 		isNumeric := false
-		if l.pos < len(l.src) && l.src[l.pos] == '.' && l.pos+1 < len(l.src) && isDigit(l.src[l.pos+1]) {
-			l.pos++ // consume '.'
-			for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
-				l.pos++
+		if l.pos < len(l.src) && l.src[l.pos] == '.' {
+			nextAfterDot := byte(0)
+			if l.pos+1 < len(l.src) {
+				nextAfterDot = l.src[l.pos+1]
 			}
-			isNumeric = true
+			// Commit to numeric if: next char after '.' is a digit, whitespace, semicolon,
+			// comma, closing paren, end of input, or other non-ident non-dot char.
+			// Do NOT commit if followed by an identifier (qualified name `tbl.col`).
+			if !isIdentStart(nextAfterDot) && nextAfterDot != '.' {
+				l.pos++ // consume '.'
+				fracStart := l.pos
+				for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
+					l.pos++
+				}
+				// Trailing/double underscore in fractional part → error.
+				if checkUnderscoreJunk(fracStart, l.pos) {
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
+				}
+				isNumeric = true
+			}
 		}
 		// Optional exponent: e[+-]?digits
 		if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
@@ -236,6 +287,12 @@ func (l *lexer) next() (Token, error) {
 				l.pos++
 			}
 			expStart := l.pos
+			// Leading underscore in exponent is invalid.
+			if l.pos < len(l.src) && l.src[l.pos] == '_' {
+				// Consume junk identifier chars for better error reporting.
+				for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+				return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
+			}
 			for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 				l.pos++
 			}
@@ -245,6 +302,11 @@ func (l *lexer) next() (Token, error) {
 				// silently consumed.
 				l.pos = save
 			} else {
+				// Trailing/double underscore in exponent → error.
+				if checkUnderscoreJunk(expStart, l.pos) {
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
+				}
 				isNumeric = true
 			}
 		}
@@ -313,6 +375,35 @@ func (l *lexer) next() (Token, error) {
 		if c == '.' && l.peekAt(1) == '.' {
 			l.pos += 2
 			return Token{Kind: TokenOperator, Value: "..", Pos: start}, nil
+		}
+		// Decimal literal starting with '.': e.g. ".5" or ".000_005".
+		// If '.' is followed by a digit, lex as a numeric literal. M0097-0003.
+		if c == '.' && l.pos+1 < len(l.src) && isDigit(l.src[l.pos+1]) {
+			l.pos++ // consume '.'
+			for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
+				l.pos++
+			}
+			// Optional exponent.
+			if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
+				save := l.pos
+				l.pos++
+				if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
+					l.pos++
+				}
+				expStart := l.pos
+				for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
+					l.pos++
+				}
+				if l.pos == expStart {
+					l.pos = save
+				}
+			}
+			// Trailing junk check.
+			if l.pos < len(l.src) && isIdentStart(l.src[l.pos]) {
+				for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+				return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
+			}
+			return Token{Kind: TokenNumericLit, Value: l.src[start:l.pos], Pos: start}, nil
 		}
 		l.pos++
 		return Token{Kind: TokenSymbol, Value: string(c), Pos: start}, nil
