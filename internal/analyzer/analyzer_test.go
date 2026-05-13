@@ -67,11 +67,15 @@ func TestAnalyzeSelectAliasAndQualifiedStar(t *testing.T) {
 func TestAnalyzeRejectUnsupportedSelectFeatures(t *testing.T) {
 	cat := analyzerCatalog(t)
 	cases := []string{
-		"SELECT DISTINCT aid FROM pgbench_accounts",
+		// DISTINCT is now supported (M0097-0005); UNION DISTINCT still not.
 		"SELECT 1 UNION SELECT 2",
 	}
 	for _, sql := range cases {
 		expectAnalyzeCode(t, cat, sql, "0A000")
+	}
+	// Verify DISTINCT is no longer rejected by analyzer.
+	if err := Analyze(parseOne(t, "SELECT DISTINCT aid FROM pgbench_accounts"), cat); err != nil {
+		t.Errorf("SELECT DISTINCT should be supported now, got: %v", err)
 	}
 }
 

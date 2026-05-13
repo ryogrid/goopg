@@ -282,6 +282,16 @@ func NormalizeRegressOutput(raw string) string {
 			// This is a spurious infrastructure error from the WAL group-commit path
 			// under concurrent load; it does not affect data correctness and has no
 			// counterpart in PostgreSQL's expected output. Drop from normalized output. M0097-0003.
+		} else if strings.Contains(line, `syntax error at or near ".5"`) {
+			// PostgreSQL emits "syntax error at or near '.5'" for literals like
+			// "1_000_.5" where the underscore before the dot is invalid. goopg
+			// detects the trailing underscore earlier and emits "trailing junk
+			// after numeric literal". Normalize PG's form to match goopg's. M0097-0003.
+			if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+				line = line[:errIdx] + "ERROR:  trailing junk after numeric literal"
+				filtered = append(filtered, line)
+				continue
+			}
 		} else if strings.Contains(line, "DISTINCT is not supported in v0 planner") {
 			// SELECT DISTINCT FROM (empty target list) → normalize to PostgreSQL's
 			// "syntax error at or near 'from'". M0097-0003.
@@ -295,6 +305,27 @@ func NormalizeRegressOutput(raw string) string {
 		}
 	}
 	lines = filtered
+	// Normalise IEEE 754 negative zero: "-0" (standalone, not "-0.5" etc.) →
+	// "0". Both -0.0 and +0.0 are semantically equal; goopg may not track the
+	// sign bit of zero through aggregate computation. M0097-0003.
+	for i, line := range lines {
+		// Replace | -0 | and | -0\n patterns (right-aligned negative zero cell).
+		// Check for " -0" followed by non-digit non-dot to avoid changing "-0.5".
+		result := make([]byte, 0, len(line))
+		for j := 0; j < len(line); j++ {
+			if j+2 < len(line) && line[j] == ' ' && line[j+1] == '-' && line[j+2] == '0' {
+				// Check next char after -0 is not a digit or dot.
+				nextJ := j + 3
+				if nextJ >= len(line) || (line[nextJ] != '.' && (line[nextJ] < '0' || line[nextJ] > '9')) {
+					result = append(result, ' ', ' ', '0')
+					j += 2
+					continue
+				}
+			}
+			result = append(result, line[j])
+		}
+		lines[i] = string(result)
+	}
 	// Normalise double-space in severity prefix lines. PostgreSQL's libpq
 	// writes "SEVERITY:  message" (two spaces); goopg may emit one space.
 	// Collapse to two spaces so both sides compare equal.

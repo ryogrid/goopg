@@ -1089,6 +1089,18 @@ type SetOp struct {
 func (n *SetOp) Pos() int       { return n.pos }
 func (n *SetOp) Output() Schema { return n.Left.Output() }
 
+// Distinct eliminates duplicate rows from its child, implementing
+// SELECT DISTINCT. Deduplication uses the same rowKey hash as the
+// recursive UNION dedup path. M0097-0005.
+type Distinct struct {
+	pos    int
+	Child  Node
+	schema Schema
+}
+
+func (n *Distinct) Pos() int       { return n.pos }
+func (n *Distinct) Output() Schema { return n.schema }
+
 // RecursiveUnion implements a WITH RECURSIVE fixpoint (M0016-0004).
 // Anchor is the non-recursive initial SELECT; Recursive is the
 // recursive member referencing the CTE name via WorkTableScans.

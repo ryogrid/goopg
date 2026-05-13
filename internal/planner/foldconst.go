@@ -134,6 +134,8 @@ func foldPlanConstants(node Node) {
 		foldPlanConstants(n.Right)
 	case *WindowAgg:
 		foldPlanConstants(n.Child)
+	case *Distinct:
+		foldPlanConstants(n.Child)
 	case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *WorkTableScan:
 		// leaf nodes: nothing to fold
 	case *GenerateSeries:

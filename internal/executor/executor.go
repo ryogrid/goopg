@@ -137,6 +137,12 @@ func Build(plan planner.Node) (Operator, error) {
 			return maybeInstrument(p, newUpsertOp(p, child)), nil
 		}
 		return maybeInstrument(p, newInsertOp(p, child)), nil
+	case *planner.Distinct:
+		child, err := Build(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newDistinctOp(p, child)), nil
 	case *planner.SetOp:
 		left, err := Build(p.Left)
 		if err != nil {

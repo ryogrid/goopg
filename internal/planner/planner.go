@@ -284,13 +284,8 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		return &SetOp{pos: s.Pos(), Left: left, Right: right, All: true}, nil
 	}
-	if s.Distinct {
-		return nil, &PlanError{
-			Pos:     s.Pos(),
-			Code:    "0A000",
-			Message: "DISTINCT is not supported in v0 planner",
-		}
-	}
+	// s.Distinct is handled by wrapping the final plan with a Distinct node
+	// after all other processing. See the wrapping below. M0097-0005.
 
 	isSimpleSingle := len(s.From) == 1 && (len(s.FromExprs) == 0 || (len(s.FromExprs) == 1 && len(s.FromExprs[0].Joins) == 0))
 
@@ -643,6 +638,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
 	foldPlanConstants(out)
+	// SELECT DISTINCT: wrap the full plan with a Distinct node that deduplicates
+	// on the projected output. Applied after sorting so ORDER BY is respected.
+	// M0097-0005.
+	if s.Distinct {
+		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+	}
 	return out, nil
 }
 

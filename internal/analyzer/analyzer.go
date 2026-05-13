@@ -196,9 +196,7 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 // InExpr / ExistsExpr handlers when recursing into inner
 // SELECTs so column refs can resolve against the outer scope.
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
-	if s.Distinct {
-		return analyzeError(s.Pos(), "0A000", "DISTINCT is not supported in v0 planner")
-	}
+	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
 		if s.SetOp.Type != parser.SetOpUnion || !s.SetOp.All {
 			return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
