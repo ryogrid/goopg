@@ -144,8 +144,25 @@ While using PostgreSQL as the oracle, always account for:
 
 ## LSP
 
-`gopls` is the recommended LSP for navigating `goopg`'s own code. Use it for
-"go to definition", references, and rename refactors.
+Use Serena as the first-choice code intelligence layer for Go work in this
+repository. When Serena is connected, prefer Serena symbol tools for
+definition/reference/rename/refactor flows over broad file scanning.
+
+Serena is project-scoped via `.mcp.json` and should start from the local clone
+under `serena/` using:
+
+`uv run --directory /home/ryo/work/goopg/goopg/serena serena start-mcp-server --context=claude-code --project /home/ryo/work/goopg/goopg`
+
+`gopls` is still required as the underlying Go language server for Serena's Go
+support. If missing, install it with:
+
+`go install golang.org/x/tools/gopls@latest`
+
+If Go symbol operations fail:
+1. Verify Serena is connected in Claude (`/mcp`) and reconnect if needed.
+2. Ensure the active Serena project is `/home/ryo/work/goopg/goopg`.
+3. If `gopls` was installed or settings changed, restart Serena (or restart the
+  language server from the client) before retrying.
 
 ## Runtime expectations
 

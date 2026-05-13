@@ -23,7 +23,7 @@ CLAUDE_OUTPUT_FORMAT="json"
 # Tool permissions
 # Comma-separated list of allowed tools
 # Safe git subcommands only - keep this list minimal and avoid destructive commands
-ALLOWED_TOOLS="Write,Read,Edit,Bash(*),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest)"
+ALLOWED_TOOLS="Write,Read,Edit,Bash(*),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest),mcp__serena__*"
 
 # Session management
 SESSION_CONTINUITY=true
