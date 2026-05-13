@@ -124,6 +124,7 @@ const (
 	KwView        Keyword = "view"
 	KwReplace     Keyword = "replace"
 	KwLike        Keyword = "like"
+	KwIlike       Keyword = "ilike"
 	KwBetween     Keyword = "between"
 	// M0008 logical-replication DDL keywords. See
 	// docs/design/0008-0003-publication-subscription-ddl.md.
@@ -211,6 +212,33 @@ const (
 	// M0050-0004: savepoint keywords.
 	KwSavepoint Keyword = "savepoint"
 	KwRelease   Keyword = "release"
+
+	// M0095-0004: VACUUM parenthesized syntax + vacuumdb catalog support.
+	KwFreeze   Keyword = "freeze"
+	KwParallel Keyword = "parallel"
+	KwLateral  Keyword = "lateral"
+	KwAny      Keyword = "any"
+
+	// M0095-0005: REINDEX statement stub.
+	KwReindex Keyword = "reindex"
+
+	// M0095-0008: CLUSTER statement stub.
+	KwCluster Keyword = "cluster"
+
+	// M0096-0006: PREPARE / EXECUTE statements and DROP INDEX CONCURRENTLY.
+	KwPrepare  Keyword = "prepare"
+	KwExecute  Keyword = "execute"
+	KwDeallocate Keyword = "deallocate"
+
+	// M0096-0010: MERGE INTO statement.
+	KwMerge   Keyword = "merge"
+	KwMatched Keyword = "matched"
+
+	// M0096-0012: CREATE/DROP TRIGGER.
+	KwTrigger Keyword = "trigger"
+
+	// M0097-0014: CHECK constraints.
+	KwCheck Keyword = "check"
 )
 
 // keywords lists every keyword v0 recognises. Lookup is via the
@@ -308,6 +336,7 @@ var keywords = map[string]Keyword{
 	"copy":        KwCopy,
 	"checkpoint":  KwCheckpoint,
 	"like":         KwLike,
+	"ilike":        KwIlike,
 	"between":      KwBetween,
 	"publication":  KwPublication,
 	"subscription": KwSubscription,
@@ -345,6 +374,19 @@ var keywords = map[string]Keyword{
 	"variadic":     KwVariadic,
 	"savepoint":    KwSavepoint,
 	"release":      KwRelease,
+	"freeze":       KwFreeze,
+	"parallel":     KwParallel,
+	"lateral":      KwLateral,
+	"any":          KwAny,
+	"reindex":      KwReindex,
+	"cluster":      KwCluster,
+	"prepare":      KwPrepare,
+	"execute":      KwExecute,
+	"deallocate":   KwDeallocate,
+	"merge":        KwMerge,
+	"matched":      KwMatched,
+	"trigger":      KwTrigger,
+	"check":        KwCheck,
 }
 
 // Token is one lexer output. Value is the source bytes (lower-cased

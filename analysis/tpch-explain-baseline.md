@@ -22,10 +22,10 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | region | — |
-| 2 | Seq Scan | nation | — |
+| 2 | Index Scan | nation | idx_nation_regionkey |
 | 3 | Seq Scan | supplier | — |
-| 4 | Index Scan | part | idx_part_size |
-| 5 | Seq Scan | partsupp | — |
+| 4 | Index Scan | partsupp | idx_partsupp_suppkey |
+| 5 | Index Scan | part | idx_part_size |
 | 6 | Seq Scan | region | — |
 | 7 | Seq Scan | nation | — |
 | 8 | Seq Scan | supplier | — |
@@ -56,12 +56,12 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | region | — |
-| 2 | Seq Scan | nation | — |
-| 3 | Seq Scan | supplier | — |
-| 4 | Seq Scan | customer | — |
-| 5 | Index Scan | orders | idx_orders_orderdate |
-| 6 | Seq Scan | lineitem | — |
+| 1 | Index Scan | orders | idx_orders_orderdate |
+| 2 | Index Scan | lineitem | idx_lineitem_orderkey |
+| 3 | Index Scan | supplier | supplier_pk |
+| 4 | Index Scan | customer | customer_pk |
+| 5 | Index Scan | nation | nation_pk |
+| 6 | Seq Scan | region | — |
 
 ### Q6
 
@@ -78,11 +78,11 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | nation | — |
-| 2 | Seq Scan | nation | — |
-| 3 | Seq Scan | supplier | — |
-| 4 | Seq Scan | customer | — |
-| 5 | Seq Scan | orders | — |
-| 6 | Index Scan | lineitem | idx_lineitem_shipdate |
+| 2 | Seq Scan | customer | — |
+| 3 | Seq Scan | orders | — |
+| 4 | Index Scan | lineitem | idx_lineitem_shipdate |
+| 5 | Index Scan | supplier | supplier_pk |
+| 6 | Index Scan | nation | nation_pk |
 
 ### Q8
 
@@ -91,12 +91,12 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | region | — |
-| 2 | Seq Scan | nation | — |
-| 3 | Seq Scan | nation | — |
-| 4 | Seq Scan | supplier | — |
-| 5 | Seq Scan | customer | — |
-| 6 | Index Scan | orders | idx_orders_orderdate |
-| 7 | Seq Scan | lineitem | — |
+| 2 | Index Scan | nation | idx_nation_regionkey |
+| 3 | Index Scan | customer | idx_customer_nationkey |
+| 4 | Index Scan | orders | idx_orders_orderdate |
+| 5 | Index Scan | lineitem | idx_lineitem_orderkey |
+| 6 | Index Scan | supplier | supplier_pk |
+| 7 | Index Scan | nation | nation_pk |
 | 8 | Index Scan | part | idx_part_type |
 
 ### Q9
@@ -105,12 +105,12 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | partsupp | — |
+| 1 | Seq Scan | supplier | — |
 | 2 | Seq Scan | orders | — |
 | 3 | Seq Scan | lineitem | — |
-| 4 | Index Scan | supplier | supplier_pk |
+| 4 | Index Scan | partsupp | idx_partsupp_suppkey |
 | 5 | Index Scan | nation | nation_pk |
-| 6 | Index Scan | part | part_pk |
+| 6 | Seq Scan | part | — |
 
 ### Q10
 
@@ -258,12 +258,12 @@ for an M0054-0003 sub-task investigation.
 
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
-| customer | Q10, Q18, Q22, Q5, Q7, Q8 | Q13, Q3 |
-| lineitem | Q10, Q17, Q18, Q19, Q21, Q4, Q5, Q8, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q21, Q3, Q6, Q7 |
-| nation | Q10, Q11, Q2, Q21, Q5, Q7, Q8 | Q20, Q9 |
+| customer | Q10, Q18, Q22, Q7 | Q13, Q3, Q5, Q8 |
+| lineitem | Q10, Q17, Q18, Q19, Q21, Q4, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q21, Q3, Q5, Q6, Q7, Q8 |
+| nation | Q10, Q11, Q2, Q21, Q7 | Q2, Q20, Q5, Q7, Q8, Q9 |
 | orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q22, Q3, Q4, Q5, Q8 |
-| part | Q20 | Q14, Q16, Q17, Q19, Q2, Q8, Q9 |
-| partsupp | Q11, Q16, Q2, Q20, Q9 | — |
+| part | Q20, Q9 | Q14, Q16, Q17, Q19, Q2, Q8 |
+| partsupp | Q11, Q16, Q2, Q20 | Q2, Q9 |
 | region | Q2, Q5, Q8 | — |
-| supplier | Q11, Q15b, Q2, Q20, Q21, Q5, Q7, Q8 | Q9 |
+| supplier | Q11, Q15b, Q2, Q20, Q21, Q9 | Q5, Q7, Q8 |
 

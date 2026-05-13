@@ -58,7 +58,7 @@ func Classify(d *Decoder, r Record) error {
 		})
 		return nil
 	case RecordKindHeapDelete:
-		rel, blk, slot, xmax, err := DecodeHeapDelete(r.Payload)
+		rel, blk, slot, xmax, oldTuple, err := DecodeHeapDelete(r.Payload)
 		if err != nil {
 			return err
 		}
@@ -71,13 +71,8 @@ func Classify(d *Decoder, r Record) error {
 			Rel:      rel,
 			Block:    blk,
 			LineSlot: slot,
-			// OldTuple is intentionally empty — the v0
-			// HeapDelete record only carries the xmax stamp,
-			// not the pre-delete tuple body. The apply worker
-			// resolves the row by (rel, block, slot) lookup.
+			OldTuple: oldTuple, // nil for legacy records without the extension
 			// FULL replica identity / pre-delete tuple
-			// emission is a follow-up that requires extending
-			// the wire format.
 		})
 		return nil
 	case RecordKindXactCommit:

@@ -1,6 +1,6 @@
 # 0094-0003 — Recovery TAP Test Porting Strategy (D-003 Subset)
 
-**Status:** draft
+**Status:** accepted (2026-05-11 — 6 tests landed in recovery_port_test.go; all pass)
 **Date:** 2026-05-11
 **Milestone:** M0094-0003
 

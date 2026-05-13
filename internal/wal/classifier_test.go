@@ -49,7 +49,7 @@ func TestClassifyHeapDeleteRoutesByXmax(t *testing.T) {
 	d := NewDecoder(p)
 
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 16400}
-	deletePayload := EncodeHeapDelete(rel, 5, 1, 77)
+	deletePayload := EncodeHeapDelete(rel, 5, 1, 77, nil)
 	if err := Classify(d, Record{Payload: deletePayload, EndLSN: 50}); err != nil {
 		t.Fatal(err)
 	}

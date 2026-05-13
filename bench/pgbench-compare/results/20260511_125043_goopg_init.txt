@@ -1,0 +1,33 @@
+pgbench (18.3)
+starting vacuum...pgbench: error: 
+pgbench: detail: (ignoring this error and continuing anyway)
+end.
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+pgbench: error: client 55 command 4: no results
+pgbench: error: client 7 command 4: no results
+pgbench: error: client 74 command 4: no results
+message type 0x5a arrived from server while idle
+message type 0x5a arrived from server while idle
+progress: 30.0 s, 230.3 tps, lat 422.051 ms stddev 128.398, 9 failed
+progress: 60.0 s, 230.8 tps, lat 420.402 ms stddev 133.386, 0 failed
+progress: 90.0 s, 231.5 tps, lat 418.807 ms stddev 137.037, 0 failed
+progress: 120.0 s, 228.2 tps, lat 425.206 ms stddev 137.741, 0 failed
+progress: 150.0 s, 227.9 tps, lat 426.198 ms stddev 140.406, 0 failed
+progress: 180.0 s, 225.7 tps, lat 429.107 ms stddev 142.492, 0 failed
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 41329
+number of failed transactions: 9 (0.022%)
+latency average = 423.615 ms
+latency stddev = 136.623 ms
+initial connection time = 54.058 ms
+tps = 229.157103 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

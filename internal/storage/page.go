@@ -198,3 +198,20 @@ func (h PageHeader) FreeSpace() int {
 	}
 	return upper - lower
 }
+
+// tagPartition returns the partition index (0–127) for a BufferTag.
+// Uses FNV-1a mixing to spread tags across partitions.
+// M0098-0003: 128 partitions replace the single poolMu + byTag.
+func tagPartition(tag BufferTag) int {
+	const fnvPrime = uint64(1099511628211)
+	h := uint64(14695981039346656037)
+	h ^= uint64(tag.Rel.DBOid)
+	h *= fnvPrime
+	h ^= uint64(tag.Rel.RelOid)
+	h *= fnvPrime
+	h ^= uint64(tag.Rel.Fork)
+	h *= fnvPrime
+	h ^= uint64(tag.Block)
+	h *= fnvPrime
+	return int(h & 127)
+}

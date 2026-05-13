@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -300,6 +301,12 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 			return Datum{}, err
 		}
 		return NewTimeDatum(ts), nil
+	case "time", "timetz":
+		ts, err := parseTimeString(string(raw))
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTimeDatum(ts), nil
 	case "numeric", "decimal":
 		text := string(raw)
 		// M0058-0003: int64 fast path for integer-valued NUMERIC. The
@@ -321,6 +328,173 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 		// text / varchar / char / unknown — keep as String.
 		return NewStringDatum(string(raw)), nil
 	}
+}
+
+// parseTimeString parses a PostgreSQL time string (HH:MM, HH:MM:SS, HH:MM:SS.ffffff)
+// into a time.Time anchored at 1970-01-01 UTC. Timezone designators like " PST", " EDT",
+// " AM", " PM" are accepted and handled. Full timestamp strings (with date) strip the
+// date component to return just the time portion. Timezone-name-only strings like
+// "15:36:39 America/New_York" are rejected with an error.
+func parseTimeString(s string) (time.Time, error) {
+	orig := s
+	s = strings.TrimSpace(s)
+
+	// Full timestamp with date prefix: strip date, keep time part.
+	// e.g. "2003-03-07 15:36:39 America/New_York" → "15:36:39"
+	// PostgreSQL accepts timezone names in full timestamp→time casts (strips them).
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		// Extract time portion after the date (YYYY-MM-DD ).
+		rest := strings.TrimSpace(s[10:])
+		// Strip any timezone suffix (abbreviation, offset, or named zone like America/New_York).
+		if idx := strings.Index(rest, " "); idx >= 0 {
+			rest = rest[:idx]
+		}
+		s = rest
+	}
+
+	// Detect and reject named timezone in bare time strings (e.g. "15:36:39 America/New_York").
+	if idx := strings.Index(s, " "); idx >= 0 {
+		tz := s[idx+1:]
+		if strings.Contains(tz, "/") {
+			return time.Time{}, &ExecError{Code: "22007",
+				Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
+		}
+	}
+
+	// Strip AM/PM suffix.
+	upper := strings.ToUpper(s)
+	isPM := false
+	if strings.HasSuffix(upper, " PM") {
+		isPM = true
+		s = strings.TrimSpace(s[:len(s)-3])
+	} else if strings.HasSuffix(upper, " AM") {
+		s = strings.TrimSpace(s[:len(s)-3])
+	}
+
+	// Strip timezone abbreviation suffix (e.g. " PST", " EDT", "+05", "+05:30").
+	// Only strip if it's after the time portion.
+	if idx := strings.LastIndex(s, " "); idx >= 0 {
+		s = s[:idx]
+	} else if plus := strings.LastIndex(s, "+"); plus > 2 {
+		s = s[:plus]
+	} else if minus := strings.LastIndex(s, "-"); minus > 2 {
+		s = s[:minus]
+	}
+
+	// Pre-process special time strings that Go's time.Parse can't handle:
+	// - Hour=24 (midnight-of-next-day): normalize to a parseable form first.
+	// - Second=60 (leap second): replace with 59 and add 1 sec in post-processing.
+	var origHour int = -1
+	hasLeapSec := false
+	if len(s) >= 2 {
+		if h, err := strconv.Atoi(s[:2]); err == nil && h >= 24 {
+			origHour = h
+			s = "00" + s[2:] // Replace with "00" so time.Parse succeeds
+		}
+	}
+	// Detect ":60" leap-second pattern (HH:MM:60 or HH:MM:60.xxx).
+	if len(s) >= 8 && s[5] == ':' {
+		secStr := s[6:]
+		// Take up to 2 digit characters for the seconds value.
+		end := 0
+		for end < len(secStr) && secStr[end] >= '0' && secStr[end] <= '9' {
+			end++
+		}
+		if end == 2 {
+			if secStr[:2] == "60" {
+				hasLeapSec = true
+				s = s[:6] + "59" + secStr[2:] // replace :60 with :59
+			}
+		}
+	}
+
+	// Try time layouts.
+	layouts := []string{
+		"15:04:05.000000",
+		"15:04:05.99999",
+		"15:04:05.9999",
+		"15:04:05.999",
+		"15:04:05.99",
+		"15:04:05.9",
+		"15:04:05",
+		"15:04",
+	}
+	var t time.Time
+	var parseErr error
+	for _, layout := range layouts {
+		if parsed, err := time.Parse(layout, s); err == nil {
+			t = parsed
+			parseErr = nil
+			break
+		} else {
+			parseErr = err
+		}
+	}
+	if parseErr != nil {
+		return time.Time{}, &ExecError{Code: "22007",
+			Message: fmt.Sprintf("invalid input syntax for type time: %q", orig)}
+	}
+
+	// Capture the actual parsed components.
+	// If we substituted the hour (for h>=24), use origHour instead.
+	parsedH := t.Hour()
+	if origHour >= 0 {
+		parsedH = origHour
+	}
+
+	// Apply AM/PM to parsedH.
+	if isPM && parsedH < 12 {
+		parsedH += 12
+	}
+
+	h, m, sec, ns := parsedH, t.Minute(), t.Second(), t.Nanosecond()
+
+	// Handle leap second: 23:59:60 → 24:00:00 (or carry).
+	if hasLeapSec {
+		sec = 60
+	}
+	if sec == 60 {
+		sec = 0
+		m++
+		if m == 60 {
+			m = 0
+			h++
+		}
+	}
+
+	// Handle extra fractional precision beyond microseconds (6 digits):
+	// Round nanoseconds to nearest microsecond. If rounding causes carry, propagate.
+	if ns%1000 >= 500 {
+		ns = ((ns / 1000) + 1) * 1000
+	} else {
+		ns = (ns / 1000) * 1000
+	}
+	// Carry nanosecond overflow.
+	if ns >= 1_000_000_000 {
+		ns -= 1_000_000_000
+		sec++
+		if sec >= 60 {
+			sec -= 60
+			m++
+			if m >= 60 {
+				m -= 60
+				h++
+			}
+		}
+	}
+
+	// 24:00:00 is a valid time (midnight); h=24 with m=0, s=0, ns=0 is allowed.
+	// h > 24, or h=24 with any m/s/ns > 0 are invalid.
+	if h > 24 || (h == 24 && (m > 0 || sec > 0 || ns > 0)) {
+		return time.Time{}, &ExecError{Code: "22008",
+			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
+	}
+
+	// Anchor to epoch date 1970-01-01 UTC. For h=24, store as next-day midnight.
+	if h == 24 {
+		return time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC), nil
+	}
+	return time.Date(1970, 1, 1, h, m, sec, ns, time.UTC), nil
 }
 
 // parseCopyTimestamp accepts the layouts upstream's COPY TEXT input

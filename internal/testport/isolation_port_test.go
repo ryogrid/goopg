@@ -124,6 +124,217 @@ func runIsoSpec(t *testing.T, root string, c *cluster.Cluster, specRelPath strin
 	}
 }
 
+// ── M0096-0001 dedicated sequential isolation tests ──────────────────────────
+//
+// One function per spec from the 21-spec RC isolation target list.
+// All start as defer/skip — they anchor observability so that as features
+// land (M0096-0002 through M0096-0013) test promotion from t.Skip → PASS is
+// immediately visible without having to run the full IsolationSuite.
+//
+// Pattern: each function creates a fresh cluster, runs RunAndCompare via
+// runIsoSpec, and t.Skip("deferred: ...") until the spec fully matches.
+// No t.Parallel() — these are explicitly sequential.
+
+// TestPort_IsolationEvalPlanQual exercises the eval-plan-qual spec.
+// Requires: BEGIN ISOLATION LEVEL, GENERATED ALWAYS AS, CREATE TABLE INHERITS.
+func TestPort_IsolationEvalPlanQual(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_eval_plan_qual")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual.spec")
+}
+
+// TestPort_IsolationEvalPlanQualTrigger exercises the eval-plan-qual-trigger spec.
+// Requires: BEGIN ISOLATION LEVEL, CREATE TRIGGER, CREATE TABLE INHERITS.
+func TestPort_IsolationEvalPlanQualTrigger(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_eval_pq_trig")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec")
+}
+
+// TestPort_IsolationLockCommittedKeyupdate exercises the lock-committed-keyupdate spec.
+// Requires: BEGIN ISOLATION LEVEL, FOR KEY SHARE / FOR NO KEY UPDATE.
+func TestPort_IsolationLockCommittedKeyupdate(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_lock_keyupdate")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-committed-keyupdate.spec")
+}
+
+// TestPort_IsolationInsertConflictDoUpdate exercises the insert-conflict-do-update spec.
+// Requires: BEGIN ISOLATION LEVEL, ON CONFLICT DO UPDATE executor correctness.
+func TestPort_IsolationInsertConflictDoUpdate(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_icd_update")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update.spec")
+}
+
+// TestPort_IsolationInsertConflictDoUpdate2 exercises the insert-conflict-do-update-2 spec.
+// Requires: BEGIN ISOLATION LEVEL, ON CONFLICT DO UPDATE executor correctness.
+func TestPort_IsolationInsertConflictDoUpdate2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_icd_update2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec")
+}
+
+// TestPort_IsolationInsertConflictDoUpdate3 exercises the insert-conflict-do-update-3 spec.
+// Requires: BEGIN ISOLATION LEVEL, ON CONFLICT DO UPDATE executor correctness.
+func TestPort_IsolationInsertConflictDoUpdate3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_icd_update3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec")
+}
+
+// TestPort_IsolationInsertConflictDoUpdate4 exercises the insert-conflict-do-update-4 spec.
+// Requires: BEGIN ISOLATION LEVEL, ON CONFLICT DO UPDATE executor correctness.
+func TestPort_IsolationInsertConflictDoUpdate4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_icd_update4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec")
+}
+
+// TestPort_IsolationInsertConflictDoNothing exercises the insert-conflict-do-nothing spec.
+// Requires: BEGIN ISOLATION LEVEL, ON CONFLICT DO NOTHING.
+func TestPort_IsolationInsertConflictDoNothing(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_icd_nothing")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-nothing.spec")
+}
+
+// TestPort_IsolationInsertConflictSpecconflict exercises the insert-conflict-specconflict spec.
+// Requires: BEGIN ISOLATION LEVEL, pg_advisory_xact_lock, ON CONFLICT DO UPDATE.
+func TestPort_IsolationInsertConflictSpecconflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_icd_specconf")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-specconflict.spec")
+}
+
+// TestPort_IsolationDropIndexConcurrently1 exercises the drop-index-concurrently-1 spec.
+// Requires: BEGIN ISOLATION LEVEL, DROP INDEX CONCURRENTLY.
+func TestPort_IsolationDropIndexConcurrently1(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_drop_idx_cc")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/drop-index-concurrently-1.spec")
+}
+
+// TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
+// Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
+func TestPort_IsolationFkSnapshot(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_snapshot")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/fk-snapshot.spec")
+}
+
+// TestPort_IsolationPartitionKeyUpdate1 exercises the partition-key-update-1 spec.
+// Requires: BEGIN ISOLATION LEVEL, CREATE TABLE PARTITION BY, FOR KEY SHARE.
+func TestPort_IsolationPartitionKeyUpdate1(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_part_ku1")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partition-key-update-1.spec")
+}
+
+// TestPort_IsolationPartitionKeyUpdate2 exercises the partition-key-update-2 spec.
+// Requires: BEGIN ISOLATION LEVEL, CREATE TABLE PARTITION BY, REFERENCES (FK).
+func TestPort_IsolationPartitionKeyUpdate2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_part_ku2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partition-key-update-2.spec")
+}
+
+// TestPort_IsolationPartitionKeyUpdate3 exercises the partition-key-update-3 spec.
+// Requires: BEGIN ISOLATION LEVEL, CREATE TABLE PARTITION BY, REFERENCES (FK), CREATE TRIGGER.
+func TestPort_IsolationPartitionKeyUpdate3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_part_ku3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partition-key-update-3.spec")
+}
+
+// TestPort_IsolationPartitionKeyUpdate4 exercises the partition-key-update-4 spec.
+// Requires: BEGIN ISOLATION LEVEL, CREATE TABLE PARTITION BY, REFERENCES (FK), CREATE TRIGGER.
+func TestPort_IsolationPartitionKeyUpdate4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_part_ku4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partition-key-update-4.spec")
+}
+
+// TestPort_IsolationMergeUpdate exercises the merge-update spec.
+// Requires: BEGIN ISOLATION LEVEL, MERGE INTO … WHEN MATCHED THEN UPDATE.
+func TestPort_IsolationMergeUpdate(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_merge_update")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-update.spec")
+}
+
+// TestPort_IsolationMergeDelete exercises the merge-delete spec.
+// Requires: BEGIN ISOLATION LEVEL, MERGE INTO … WHEN MATCHED THEN DELETE.
+func TestPort_IsolationMergeDelete(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_merge_delete")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-delete.spec")
+}
+
+// TestPort_IsolationMergeInsertUpdate exercises the merge-insert-update spec.
+// Requires: BEGIN ISOLATION LEVEL, MERGE INTO … WHEN NOT MATCHED THEN INSERT / WHEN MATCHED THEN UPDATE.
+func TestPort_IsolationMergeInsertUpdate(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_merge_ins_upd")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-insert-update.spec")
+}
+
+// TestPort_IsolationMergeMatchRecheck exercises the merge-match-recheck spec.
+// Requires: BEGIN ISOLATION LEVEL, MERGE INTO with multiple WHEN clauses.
+func TestPort_IsolationMergeMatchRecheck(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_merge_recheck")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-match-recheck.spec")
+}
+
+// TestPort_IsolationMergeJoin exercises the merge-join spec.
+// Requires: BEGIN ISOLATION LEVEL, MERGE INTO with JOIN source.
+func TestPort_IsolationMergeJoin(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_merge_join")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-join.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

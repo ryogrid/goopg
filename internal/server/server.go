@@ -268,6 +268,16 @@ type Server struct {
 	// when DataDir is unset (in-process tests).
 	controlListener *control.Listener
 	controlPath     string
+
+	// rolesMu guards the in-memory role set used by CREATE/DROP ROLE.
+	// Pre-populated with "postgres" on construction. Roles are tracked
+	// in memory only; persistence via pg_auth is deferred.
+	rolesMu sync.RWMutex
+	roles   map[string]struct{}
+
+	// pc is the cross-session normalized-query plan cache. M0098-0005.
+	// nil when the server is in protocol-only mode (no catalog/storage).
+	pc *planCache
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
@@ -277,8 +287,13 @@ func New(cfg Config) *Server {
 		cfg:       cfg,
 		ready:     make(chan struct{}),
 		cancelReg: newCancelRegistry(),
+		roles:     map[string]struct{}{"postgres": {}},
 	}
 	s.nextPID.Store(0)
+	// Initialize plan cache when storage handles are present (M0098-0005).
+	if cfg.hasStorage() {
+		s.pc = newPlanCache()
+	}
 	return s
 }
 
@@ -293,6 +308,48 @@ func (s *Server) Addr() *net.TCPAddr { return s.addr.Load() }
 func (s *Server) Ready() <-chan struct{} { return s.ready }
 
 // Run binds the listener and serves connections until ctx is cancelled or
+// registerRole adds a role to the in-memory role set.
+// If the role already exists this is a no-op (idempotent).
+func (s *Server) registerRole(name string) {
+	s.rolesMu.Lock()
+	s.roles[name] = struct{}{}
+	s.rolesMu.Unlock()
+}
+
+// unregisterRole removes a role from the in-memory role set.
+// Returns an error if the role does not exist and ifExists is false.
+func (s *Server) unregisterRole(name string, ifExists bool) error {
+	s.rolesMu.Lock()
+	defer s.rolesMu.Unlock()
+	if _, ok := s.roles[name]; !ok {
+		if ifExists {
+			return nil
+		}
+		return fmt.Errorf("role %q does not exist", name)
+	}
+	delete(s.roles, name)
+	return nil
+}
+
+// roleExists reports whether a role is in the in-memory set.
+func (s *Server) roleExists(name string) bool {
+	s.rolesMu.RLock()
+	_, ok := s.roles[name]
+	s.rolesMu.RUnlock()
+	return ok
+}
+
+// allRoles returns a snapshot of all role names in the set.
+func (s *Server) allRoles() []string {
+	s.rolesMu.RLock()
+	defer s.rolesMu.RUnlock()
+	out := make([]string, 0, len(s.roles))
+	for name := range s.roles {
+		out = append(out, name)
+	}
+	return out
+}
+
 // a non-recoverable Accept error occurs. It returns nil on a clean shutdown
 // (ctx cancelled), or the underlying error otherwise.
 func (s *Server) Run(ctx context.Context) error {
@@ -833,6 +890,8 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // another ReadyForQuery so the client can keep going.
 func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
 	extended := newExtendedState()
+	connTx := &connTxState{}         // per-connection explicit transaction state (M0096-0005)
+	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
 	var copyIn *copyInState
 	for {
 		if ctx.Err() != nil {
@@ -846,7 +905,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 				// stream is re-synchronised. Send a proper error response and
 				// keep the session alive so HammerDB / libpq can retry.
 				logger.Info("oversized client message rejected", "err", err)
-				if werr := s.writeQueryError(w, sqlstate.ProtocolViolation, err.Error()); werr != nil {
+				if werr := s.writeQueryError(w, sqlstate.ProtocolViolation, err.Error()); werr != nil && !errors.Is(werr, errQueryErrorSent) {
 					logger.Info("write error after oversized message", "err", werr)
 					return
 				}
@@ -901,6 +960,10 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 				entry.clearQueryCancel()
 				queryCancel()
 				if err != nil {
+					if errors.Is(err, errQueryErrorSent) {
+						// Error + ReadyForQuery already sent cleanly.
+						break
+					}
 					logger.Info("replication command write error", "err", err)
 					return
 				}
@@ -908,10 +971,15 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 					break
 				}
 			}
-			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload)
+			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload, connTx, prepStmts)
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {
+				if errors.Is(err, errQueryErrorSent) {
+					// Error + ReadyForQuery already sent cleanly; keep connection.
+					// The client received the error and will send the next Query.
+					break
+				}
 				logger.Info("query write error", "err", err)
 				return
 			}

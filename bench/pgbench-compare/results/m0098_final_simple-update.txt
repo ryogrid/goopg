@@ -1,0 +1,100 @@
+pgbench (18.3)
+starting vacuum...pgbench: error: 
+pgbench: detail: (ignoring this error and continuing anyway)
+end.
+message type 0x5a arrived from server while idle
+pgbench: error: client 7 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=17064, kind=commit): wal: requested LSN is beyond written WAL: have 1327755744, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 44 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=19062, kind=commit): wal: requested LSN is beyond written WAL: have 1328428696, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 45 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=20994, kind=commit): wal: requested LSN is beyond written WAL: have 1329078611, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 69 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=25563, kind=commit): wal: requested LSN is beyond written WAL: have 1330609811, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 15 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=26761, kind=commit): wal: requested LSN is beyond written WAL: have 1331010802, need 18446744073709551615
+progress: 30.0 s, 446.6 tps, lat 217.755 ms stddev 54.065, 0 failed
+message type 0x5a arrived from server while idle
+pgbench: error: client 13 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=30530, kind=commit): wal: requested LSN is beyond written WAL: have 1332286068, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 86 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=31078, kind=commit): wal: requested LSN is beyond written WAL: have 1332464449, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 22 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=34585, kind=commit): wal: requested LSN is beyond written WAL: have 1333652154, need 18446744073709551615
+pgbench: error: client 6 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=38135, kind=commit): wal: requested LSN is beyond written WAL: have 1334846442, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 96 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=39636, kind=commit): wal: requested LSN is beyond written WAL: have 1335336257, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 50 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=39903, kind=commit): wal: requested LSN is beyond written WAL: have 1335433013, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 61 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=40355, kind=commit): wal: requested LSN is beyond written WAL: have 1335578428, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 59 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=40511, kind=commit): wal: requested LSN is beyond written WAL: have 1335644673, need 18446744073709551615
+progress: 60.0 s, 441.4 tps, lat 209.261 ms stddev 49.701, 0 failed
+message type 0x5a arrived from server while idle
+pgbench: error: client 42 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=45422, kind=commit): wal: requested LSN is beyond written WAL: have 1337287643, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 65 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=46487, kind=commit): wal: requested LSN is beyond written WAL: have 1337656922, need 18446744073709551615
+pgbench: error: client 0 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=49175, kind=commit): wal: requested LSN is beyond written WAL: have 1338552215, need 18446744073709551615
+pgbench: error: client 40 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=53161, kind=commit): wal: requested LSN is beyond written WAL: have 1339891400, need 18446744073709551615
+pgbench: error: client 48 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=53251, kind=commit): wal: requested LSN is beyond written WAL: have 1339920716, need 18446744073709551615
+pgbench: error: client 41 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=53964, kind=commit): wal: requested LSN is beyond written WAL: have 1340157642, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 1 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=54690, kind=commit): wal: requested LSN is beyond written WAL: have 1340396415, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 63 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=56456, kind=commit): wal: requested LSN is beyond written WAL: have 1340999588, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 46 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=56542, kind=commit): wal: requested LSN is beyond written WAL: have 1341027267, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 8 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=56848, kind=commit): wal: requested LSN is beyond written WAL: have 1341123369, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 34 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=56994, kind=commit): wal: requested LSN is beyond written WAL: have 1341179695, need 18446744073709551615
+pgbench: error: client 18 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=62364, kind=commit): wal: requested LSN is beyond written WAL: have 1342976720, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 11 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=62516, kind=commit): wal: requested LSN is beyond written WAL: have 1343030619, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 29 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=63136, kind=commit): wal: requested LSN is beyond written WAL: have 1343244285, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 97 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=64882, kind=commit): wal: requested LSN is beyond written WAL: have 1343827385, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 37 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=65722, kind=commit): wal: requested LSN is beyond written WAL: have 1344103286, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 36 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=65826, kind=commit): wal: requested LSN is beyond written WAL: have 1344153316, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 74 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=67689, kind=commit): wal: requested LSN is beyond written WAL: have 1344766316, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 80 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=71501, kind=commit): wal: requested LSN is beyond written WAL: have 1346051976, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 28 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=72120, kind=commit): wal: requested LSN is beyond written WAL: have 1346255352, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 52 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=72209, kind=commit): wal: requested LSN is beyond written WAL: have 1346282372, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 39 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=72353, kind=commit): wal: requested LSN is beyond written WAL: have 1346345331, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 47 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=74716, kind=commit): wal: requested LSN is beyond written WAL: have 1347121048, need 18446744073709551615
+pgbench: error: client 67 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=76113, kind=commit): wal: requested LSN is beyond written WAL: have 1347593011, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 9 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=76188, kind=commit): wal: requested LSN is beyond written WAL: have 1347619148, need 18446744073709551615
+pgbench: error: client 23 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=77970, kind=commit): wal: requested LSN is beyond written WAL: have 1348205296, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 64 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=81101, kind=commit): wal: requested LSN is beyond written WAL: have 1349265595, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 27 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=82929, kind=commit): wal: requested LSN is beyond written WAL: have 1349881679, need 18446744073709551615
+pgbench: error: client 35 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=84718, kind=commit): wal: requested LSN is beyond written WAL: have 1350482833, need 18446744073709551615
+pgbench: error: client 95 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=88551, kind=commit): wal: requested LSN is beyond written WAL: have 1351766054, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 53 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=88635, kind=commit): wal: requested LSN is beyond written WAL: have 1351800676, need 18446744073709551615
+message type 0x5a arrived from server while idle
+pgbench: error: client 94 script 0 aborted in command 8 query 0: ERROR:  mvcc: xact-marker hook (xid=90015, kind=commit): wal: requested LSN is beyond written WAL: have 1352265293, need 18446744073709551615
+transaction type: <builtin: simple update>
+scaling factor: 100
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 75584
+number of failed transactions: 1 (0.001%)
+latency average = 188.412 ms
+latency stddev = 50.007 ms
+initial connection time = 39.843 ms
+tps = 419.682415 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

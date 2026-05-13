@@ -42,6 +42,8 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 	if _, err := p.expectKeyword(KwReturns); err != nil {
 		return nil, err
 	}
+	// Accept optional SETOF modifier (set-returning functions). M0096-0007.
+	_ = p.acceptIdentKeyword("setof")
 	retType, err := p.parseColumnType()
 	if err != nil {
 		return nil, err
@@ -108,18 +110,39 @@ func (p *parser) parseLanguageName() (string, error) {
 	return "", p.errAtCur("expected language name after LANGUAGE")
 }
 
-// parseFunctionBody requires a dollar-quoted string literal — the
-// only body form Stage A accepts. A plain single-quoted string is
-// upstream-legal but is fragile (every internal quote needs
-// escaping) and almost nobody writes it; rejecting it here surfaces
-// a clean diagnostic now and keeps the parser surface narrow.
+// parseFunctionBody accepts either a dollar-quoted string literal or
+// a SQL-standard `BEGIN ATOMIC stmts; END` body. M0097-0012.
 func (p *parser) parseFunctionBody() (string, error) {
 	t := p.cur()
-	if t.Kind != TokenStringLit {
-		return "", p.errAtCur("expected $$body$$ for function body")
+	if t.Kind == TokenStringLit {
+		p.advance()
+		return t.Value, nil
 	}
-	p.advance()
-	return t.Value, nil
+	// SQL-standard body: BEGIN ATOMIC ... END
+	if t.Kind == TokenKeyword && t.Keyword == KwBegin {
+		// Collect token values between BEGIN ATOMIC and the matching END.
+		p.advance() // BEGIN
+		_ = p.acceptIdentKeyword("atomic")
+		var parts []string
+		depth := 1
+		for depth > 0 && p.cur().Kind != TokenEOF {
+			ct := p.cur()
+			if ct.Kind == TokenKeyword && ct.Keyword == KwBegin {
+				depth++
+			} else if ct.Kind == TokenKeyword && ct.Keyword == KwEnd {
+				depth--
+				if depth == 0 {
+					p.advance() // END
+					p.acceptSymbol(";")
+					return strings.Join(parts, " "), nil
+				}
+			}
+			parts = append(parts, ct.Value)
+			p.advance()
+		}
+		return "", p.errAtCur("unterminated BEGIN ATOMIC body")
+	}
+	return "", p.errAtCur("expected $$body$$ or BEGIN ATOMIC for function body")
 }
 
 // parseFunctionArgList parses an optional `( arg [, ...] )` list.

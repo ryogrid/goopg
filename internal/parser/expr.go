@@ -120,6 +120,34 @@ type ExistsExpr struct {
 func (e *ExistsExpr) Pos() int { return e.pos }
 func (*ExistsExpr) exprNode()  {}
 
+// IsNullExpr is `expr IS [NOT] NULL`. Unlike a UnaryOp, the result is
+// never NULL — it always returns a boolean. Negated=true for IS NOT NULL.
+// Added M0096-0004 to support `pg_advisory_lock(key) IS NOT NULL` in
+// WHERE clauses used by isolation specs.
+type IsNullExpr struct {
+	pos     int
+	Operand Expr
+	Negated bool // true for IS NOT NULL
+}
+
+func (e *IsNullExpr) Pos() int { return e.pos }
+func (*IsNullExpr) exprNode()  {}
+
+// IsBoolExpr is `expr IS [NOT] TRUE/FALSE/UNKNOWN`.
+// Result is always boolean (never NULL). M0097-0003.
+// TestTrue/TestFalse/TestUnknown define what the LHS must equal;
+// Negated inverts the test (IS NOT TRUE, etc.).
+type IsBoolExpr struct {
+	pos       int
+	Operand   Expr
+	TestTrue  bool // target is TRUE
+	TestFalse bool // target is FALSE (if neither TestTrue nor TestFalse: UNKNOWN)
+	Negated   bool
+}
+
+func (e *IsBoolExpr) Pos() int { return e.pos }
+func (*IsBoolExpr) exprNode()  {}
+
 // SubqueryExpr is the v0 scalar-subquery expression: a
 // parenthesised SELECT used in expression position. The
 // executor evaluates it once per Open and binds the single
@@ -275,6 +303,12 @@ type FuncCall struct {
 	Star     bool // count(*)-style star argument
 	Distinct bool // DISTINCT inside the arg list
 	Over     *WindowDef
+	// Filter is the optional FILTER (WHERE condition) clause (M0097-0007).
+	// Non-nil only for aggregate function calls with FILTER.
+	Filter   Expr
+	// OrderBy is the optional ORDER BY within the aggregate argument list
+	// (M0097-0007), e.g. string_agg(x, ',' ORDER BY x).
+	OrderBy []SortBy
 }
 
 func (e *FuncCall) Pos() int { return e.pos }
@@ -295,3 +329,13 @@ type WindowDef struct {
 
 // Pos returns the position of the leading `OVER` keyword.
 func (w *WindowDef) Pos() int { return w.pos }
+
+// ArraySubscriptExpr is `expr[index]` — array element access.
+type ArraySubscriptExpr struct {
+	pos   int
+	Base  Expr
+	Index Expr
+}
+
+func (e *ArraySubscriptExpr) Pos() int { return e.pos }
+func (*ArraySubscriptExpr) exprNode()  {}

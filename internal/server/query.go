@@ -29,7 +29,7 @@ const (
 // Everything else still returns a feature-not-supported ErrorResponse.
 // Each statement is terminated with ReadyForQuery('I') so the client
 // can keep going.
-func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) error {
+func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) error {
 	q, err := extractCString(payload)
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -45,6 +45,14 @@ func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess 
 
 	matchable := strings.TrimRight(trimmed, ";")
 	matchable = strings.TrimSpace(matchable)
+
+	// Multi-statement queries (internal ';' after stripping trailing ones)
+	// must go through the parser-based executor so each statement is parsed
+	// and executed individually. The string-matching path below only handles
+	// single statements correctly.
+	if strings.ContainsRune(matchable, ';') && s.cfg.hasStorage() {
+		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed, connTx, prepStmts)
+	}
 
 	if strings.EqualFold(matchable, "SELECT 1") {
 		return s.respondSelectOne(w)
@@ -82,7 +90,7 @@ func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess 
 	}
 
 	if s.cfg.hasStorage() {
-		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed)
+		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed, connTx, prepStmts)
 	}
 
 	return s.writeQueryError(w, sqlstate.FeatureNotSupported,
@@ -209,10 +217,22 @@ func (s *Server) respondSelectOne(w *protocol.FrameWriter) error {
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
+// errQueryErrorSent is a sentinel returned by writeQueryError when the
+// ErrorResponse + ReadyForQuery pair was successfully written to the client.
+// Callers that loop over statements (e.g. dispatchSimpleQueryViaExecutor)
+// MUST check for this sentinel and NOT send an additional ReadyForQuery.
+// The runPostStartupLoop MUST treat this as a "keep-going" signal (the
+// client received a clean error response and is ready for the next query).
+var errQueryErrorSent = errors.New("server: error response sent to client")
+
 // writeQueryError emits an ErrorResponse with the given SQLSTATE plus a
 // trailing ReadyForQuery, matching how upstream finishes a failed simple
 // Query (the parse error is reported and the connection stays open).
 // extra fields (e.g. FieldPosition) are appended after the standard set.
+//
+// Returns errQueryErrorSent (not nil) on success so that callers in a
+// multi-statement loop can detect the error-and-stop condition without
+// sending a duplicate ReadyForQuery (M0097-0003 normalization fix).
 func (s *Server) writeQueryError(w *protocol.FrameWriter, code sqlstate.Code, msg string, extra ...protocol.ErrorField) error {
 	fields := []protocol.ErrorField{
 		{Code: protocol.FieldSeverity, Value: "ERROR"},
@@ -225,7 +245,10 @@ func (s *Server) writeQueryError(w *protocol.FrameWriter, code sqlstate.Code, ms
 	if err := w.WriteErrorResponse(fields); err != nil {
 		return err
 	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+		return err
+	}
+	return errQueryErrorSent
 }
 
 // extractCString returns the C string at the start of buf (everything up to

@@ -306,7 +306,7 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 
 	for i, c := range cols {
 		if i > 0 {
-			sb.WriteString(" | ")
+			sb.WriteString("|")
 		}
 		w := widths[i]
 		if i < len(colTypes) && colTypes[i] == "numeric" {
@@ -319,7 +319,7 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 
 	for i := range cols {
 		if i > 0 {
-			sb.WriteString("-+-")
+			sb.WriteString("+")
 		}
 		sb.WriteString(strings.Repeat("-", widths[i]))
 	}
@@ -328,7 +328,7 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 	for _, row := range data {
 		for i := 0; i < n; i++ {
 			if i > 0 {
-				sb.WriteString(" | ")
+				sb.WriteString("|")
 			}
 			v := ""
 			if i < len(row) {

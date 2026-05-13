@@ -30,11 +30,30 @@ func (o ObjectName) String() string {
 	return o.Schema + "." + o.Name
 }
 
-// BeginStmt — `BEGIN [WORK | TRANSACTION]`.
-type BeginStmt struct{ pos int }
+// BeginStmt — `BEGIN [WORK | TRANSACTION] [transaction_mode ...]`.
+//
+// IsolationLevel holds the parsed isolation level name (e.g. "read committed",
+// "repeatable read", "serializable", "read uncommitted") when ISOLATION LEVEL
+// was supplied; "" means use the session default.  M0096-0002.
+type BeginStmt struct {
+	pos            int
+	IsolationLevel string // "" = use session default
+}
 
 func (s *BeginStmt) Pos() int  { return s.pos }
 func (s *BeginStmt) stmtNode() {}
+
+// SetTransactionStmt — `SET [LOCAL] TRANSACTION transaction_mode ...`.
+// Currently only parses ISOLATION LEVEL; other modes (READ ONLY / READ WRITE,
+// DEFERRABLE) are accepted syntactically but silently ignored.  M0096-0002.
+type SetTransactionStmt struct {
+	pos            int
+	IsolationLevel string // "" = not specified; set isolation level on session
+	Local          bool
+}
+
+func (s *SetTransactionStmt) Pos() int  { return s.pos }
+func (s *SetTransactionStmt) stmtNode() {}
 
 // CommitStmt — `COMMIT [WORK | TRANSACTION]`. Aliased by `END`.
 type CommitStmt struct{ pos int }
@@ -75,26 +94,232 @@ type RollbackToSavepointStmt struct {
 func (s *RollbackToSavepointStmt) Pos() int  { return s.pos }
 func (s *RollbackToSavepointStmt) stmtNode() {}
 
-// VacuumStmt — `VACUUM [VERBOSE] [ANALYZE] [target [, …]]`.
+// VacuumStmt — `VACUUM [(opt [, opt …])] [target [, …]]`.
+// Both legacy syntax (VACUUM [VERBOSE] [ANALYZE] [FULL] [FREEZE] …)
+// and parenthesized syntax (VACUUM (option …) …) are accepted.
+// Most parenthesized-only options are stored but treated as no-ops
+// at execution time; they exist so vacuumdb SQL round-trips without
+// a parser error.
 type VacuumStmt struct {
 	pos     int
+	// Options settable via both legacy and parenthesized syntax.
 	Verbose bool
 	Analyze bool
-	Targets []ObjectName // empty -> all relations
+	Full    bool
+	Freeze  bool
+	// Options only in parenthesized syntax (treated as no-ops at execution).
+	DisablePageSkipping bool
+	NoIndexCleanup      bool
+	ForceIndexCleanup   bool
+	NoTruncate          bool
+	NoProcessMain       bool
+	NoProcessToast      bool
+	SkipDatabaseStats   bool
+	OnlyDatabaseStats   bool
+	SkipLocked          bool
+	ParallelWorkers     int    // -1 = not specified
+	BufferUsageLimit    string // "" = not specified
+	Targets             []ObjectName // empty -> all relations
 }
 
 func (s *VacuumStmt) Pos() int  { return s.pos }
 func (s *VacuumStmt) stmtNode() {}
 
-// AnalyzeStmt — `ANALYZE [VERBOSE] [target [, …]]`.
+// AnalyzeStmt — `ANALYZE [(opt [, opt …])] [target [, …]]`.
 type AnalyzeStmt struct {
-	pos     int
-	Verbose bool
-	Targets []ObjectName
+	pos        int
+	Verbose    bool
+	SkipLocked bool
+	Targets    []ObjectName
 }
 
 func (s *AnalyzeStmt) Pos() int  { return s.pos }
 func (s *AnalyzeStmt) stmtNode() {}
+
+// ReindexStmt — `REINDEX [(VERBOSE)] [CONCURRENTLY]
+// {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM} [IF EXISTS] name`.
+// M0095-0005: no-op executor stub; parser accepts the full syntax so
+// reindexdb can interact with goopg without syntax errors.
+type ReindexStmt struct {
+	pos         int
+	Verbose     bool
+	Concurrently bool
+	// Object type: one of "INDEX", "TABLE", "DATABASE", "SCHEMA", "SYSTEM".
+	ObjectType  string
+	Name        string // qualified relation / database / schema name
+}
+
+func (s *ReindexStmt) Pos() int  { return s.pos }
+func (s *ReindexStmt) stmtNode() {}
+
+// PrepareStmt — `PREPARE name [(param_type, …)] AS query`.
+// M0096-0006: executor stores the query text keyed by name for later EXECUTE.
+type PrepareStmt struct {
+	pos   int
+	Name  string
+	Query Stmt // the SELECT/INSERT/UPDATE/DELETE being prepared
+}
+
+func (s *PrepareStmt) Pos() int  { return s.pos }
+func (s *PrepareStmt) stmtNode() {}
+
+// ExecuteStmt — `EXECUTE name [(param, …)]`.
+// M0096-0006: executor retrieves and runs the named prepared statement.
+type ExecuteStmt struct {
+	pos    int
+	Name   string
+	Params []Expr
+}
+
+func (s *ExecuteStmt) Pos() int  { return s.pos }
+func (s *ExecuteStmt) stmtNode() {}
+
+// DeallocateStmt — `DEALLOCATE [PREPARE] name | ALL`.
+// M0096-0006: removes a named prepared statement (or all).
+type DeallocateStmt struct {
+	pos  int
+	Name string // "" means ALL
+}
+
+func (s *DeallocateStmt) Pos() int  { return s.pos }
+func (s *DeallocateStmt) stmtNode() {}
+
+// ── CURSOR (M0097-0003) ─────────────────────────────────────────────────────
+
+// DeclareCursorStmt — `DECLARE name [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR query`.
+type DeclareCursorStmt struct {
+	pos   int
+	Name  string
+	Query Stmt // the SELECT
+}
+
+func (s *DeclareCursorStmt) Pos() int  { return s.pos }
+func (s *DeclareCursorStmt) stmtNode() {}
+
+// FetchStmt — `FETCH [FORWARD|BACKWARD] [ALL|n] [FROM|IN] cursor_name`.
+// Count < 0 means ALL (fetch all remaining rows).
+type FetchStmt struct {
+	pos        int
+	CursorName string
+	Count      int64 // < 0 means ALL
+	Forward    bool  // true = FORWARD (default), false = BACKWARD
+}
+
+func (s *FetchStmt) Pos() int  { return s.pos }
+func (s *FetchStmt) stmtNode() {}
+
+// CloseStmt — `CLOSE {cursor_name|ALL}`.
+type CloseStmt struct {
+	pos  int
+	Name string // "" means ALL
+}
+
+func (s *CloseStmt) Pos() int  { return s.pos }
+func (s *CloseStmt) stmtNode() {}
+
+// ── MERGE INTO (M0096-0010) ─────────────────────────────────────────────────
+
+// MergeActionKind discriminates the action in a MERGE WHEN clause.
+type MergeActionKind int
+
+const (
+	MergeActionUpdate MergeActionKind = iota + 1
+	MergeActionDelete
+	MergeActionInsert
+	// MergeActionDoNothing — WHEN … THEN DO NOTHING. M0097-0016.
+	MergeActionDoNothing
+)
+
+// MergeWhenClause describes one WHEN MATCHED / WHEN NOT MATCHED arm.
+type MergeWhenClause struct {
+	pos       int
+	Matched   bool            // true = WHEN MATCHED, false = WHEN NOT MATCHED
+	// BySource is true for WHEN NOT MATCHED BY SOURCE. M0097-0016.
+	BySource  bool
+	// ByTarget is true for WHEN NOT MATCHED BY TARGET (same as NOT MATCHED). M0097-0016.
+	ByTarget  bool
+	Condition Expr            // optional AND condition; nil when absent
+	Action    MergeActionKind
+
+	// For UPDATE: set assignments and optional WHERE.
+	UpdateAssigns []UpdateAssign
+
+	// For INSERT: column list and value expressions.
+	InsertColumns []string
+	InsertValues  []Expr // nil → DEFAULT VALUES
+}
+
+func (w *MergeWhenClause) Pos() int { return w.pos }
+
+// MergeStmt — `MERGE INTO target USING source ON cond WHEN … THEN …`.
+// M0096-0010.
+type MergeStmt struct {
+	pos      int
+	Target   RangeVar        // merge target table (with optional alias)
+	Source   RangeVar        // USING source (table or subquery, with alias)
+	On       Expr            // join condition
+	Clauses  []*MergeWhenClause
+	// Returning holds the RETURNING target list. M0097-0016.
+	// Parsed but not executed (v0 no-op).
+	Returning []ResTarget
+}
+
+func (s *MergeStmt) Pos() int  { return s.pos }
+func (s *MergeStmt) stmtNode() {}
+
+// TriggerEvent discriminates BEFORE/AFTER and INSERT/UPDATE/DELETE.
+// M0096-0012.
+type TriggerTiming int
+
+const (
+	TriggerBefore TriggerTiming = iota + 1
+	TriggerAfter
+	TriggerInsteadOf
+)
+
+// CreateTriggerStmt — `CREATE [CONSTRAINT] TRIGGER name
+//   BEFORE|AFTER|INSTEAD OF {INSERT|UPDATE|DELETE[, ...]}
+//   ON table FOR [EACH] {ROW|STATEMENT}
+//   EXECUTE {FUNCTION|PROCEDURE} funcname()`.
+// M0096-0012.
+type CreateTriggerStmt struct {
+	pos      int
+	Name     string
+	Table    ObjectName
+	Timing   TriggerTiming
+	Events   []string // "insert", "update", "delete"
+	ForEachRow bool   // true = ROW, false = STATEMENT
+	FuncName ObjectName
+	// IfNotExists: PostgreSQL 14+ only, not supported yet.
+}
+
+func (s *CreateTriggerStmt) Pos() int  { return s.pos }
+func (s *CreateTriggerStmt) stmtNode() {}
+
+// DropTriggerStmt — `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+// M0096-0012.
+type DropTriggerStmt struct {
+	pos      int
+	Name     string
+	Table    ObjectName
+	IfExists bool
+}
+
+func (s *DropTriggerStmt) Pos() int  { return s.pos }
+func (s *DropTriggerStmt) stmtNode() {}
+
+// ClusterStmt — `CLUSTER [VERBOSE] [tablename [USING indexname]]`.
+// M0095-0008: no-op executor stub.  When a table name is provided the
+// executor verifies the table exists; without a table it always succeeds.
+type ClusterStmt struct {
+	pos        int
+	Verbose    bool
+	Target     *ObjectName // nil when CLUSTER is called with no table
+	IndexName  string      // optional USING clause
+}
+
+func (s *ClusterStmt) Pos() int  { return s.pos }
+func (s *ClusterStmt) stmtNode() {}
 
 // ExplainFormat selects the rendering format for ExplainStmt
 // output. M0018-0001 introduces the AST shape; the renderer
@@ -210,13 +435,24 @@ func (r ResTarget) Pos() int { return r.pos }
 // case Name is empty and the parsed inner SELECT lives in
 // Subquery; the alias is required (matches upstream).
 type RangeVar struct {
-	pos      int
-	Schema   string
-	Name     string
-	Alias    string   // empty when no AS clause
-	Columns  []string // optional column-alias list: (SELECT …) AS t (c1, c2)
-	Subquery *SelectStmt
+	pos       int
+	Schema    string
+	Name      string
+	Alias     string   // empty when no AS clause
+	Columns   []string // optional column-alias list: (SELECT …) AS t (c1, c2)
+	Subquery  *SelectStmt
+	TableFunc *TableFuncRef // M0096-0006: table-valued function (e.g. generate_series)
 }
+
+// TableFuncRef is a table-valued function used in the FROM clause.
+// Currently only generate_series(start, stop [, step]) is recognised.
+type TableFuncRef struct {
+	pos  int
+	Name string
+	Args []Expr
+}
+
+func (r TableFuncRef) Pos() int { return r.pos }
 
 func (r RangeVar) Pos() int { return r.pos }
 
@@ -335,6 +571,14 @@ const (
 	// LockStrengthForShare — `FOR SHARE`. Read-intent row lock;
 	// mirrors upstream's LCS_FORSHARE.
 	LockStrengthForShare
+	// LockStrengthForNoKeyUpdate — `FOR NO KEY UPDATE`. Weaker write-intent
+	// lock that skips key columns. v0 maps this to LockStrengthForUpdate
+	// semantics (M0096-0004; separate key-level lock modes are out of scope).
+	LockStrengthForNoKeyUpdate
+	// LockStrengthForKeyShare — `FOR KEY SHARE`. Weaker read-intent lock
+	// covering only key columns. v0 maps this to LockStrengthForShare
+	// semantics (M0096-0004; separate key-level lock modes are out of scope).
+	LockStrengthForKeyShare
 )
 
 // LockWaitPolicy enumerates the wait modifier on a row-locking
@@ -396,6 +640,11 @@ type SelectStmt struct {
 	// every pre-M0021 SELECT — preserves byte-for-byte
 	// invariance across the existing parser/planner test suite.
 	Locking []*LockingClause
+	// ValuesRows is set when this SelectStmt represents a bare
+	// `VALUES (r1), (r2), ...` statement (used as a subquery source
+	// in FROM, e.g. `FROM (VALUES ...) t(col)`). When set, Targets
+	// and From are empty. M0097-0003.
+	ValuesRows [][]Expr
 }
 
 func (s *SelectStmt) Pos() int  { return s.pos }
@@ -415,7 +664,8 @@ type InsertStmt struct {
 	With       *WithClause
 	Target     RangeVar
 	Columns    []string // empty when no column list — INSERT defaults to declared order
-	Rows       [][]Expr // each row is a parenthesised tuple
+	Rows       [][]Expr // each row is a parenthesised tuple; nil when Select != nil
+	Select     *SelectStmt // INSERT … SELECT support (M0096-0006); nil when Rows != nil
 	OnConflict *OnConflictClause
 	Returning  []ResTarget
 }
@@ -533,12 +783,43 @@ type ColumnType struct {
 func (c ColumnType) Pos() int { return c.pos }
 
 // ColumnDef is one column declaration in CREATE TABLE.
+// FKAction describes the referential action for ON DELETE / ON UPDATE.
+// M0096-0011.
+type FKAction int
+
+const (
+	FKActionNoAction  FKAction = iota // NO ACTION (default; deferrable)
+	FKActionRestrict                  // RESTRICT (always immediate)
+	FKActionCascade                   // CASCADE
+	FKActionSetNull                   // SET NULL
+	FKActionSetDefault                // SET DEFAULT
+)
+
 type ColumnDef struct {
 	pos     int
 	Name    string
 	Type    ColumnType
 	NotNull bool
 	Primary bool // inline `PRIMARY KEY` constraint
+	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
+	// M0096-0008.
+	GeneratedAlways bool
+	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
+	// for a stored generated column. Empty for ordinary columns.
+	GeneratedExpr string
+
+	// FK fields — populated when the column has an inline REFERENCES clause.
+	// M0096-0011.
+	RefTable           ObjectName
+	RefColumns         []string // empty = use parent PK
+	OnDelete           FKAction
+	OnUpdate           FKAction
+	FKDeferrable       bool
+	FKInitiallyDeferred bool
+
+	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
+	// M0097-0014.
+	CheckExpr string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
@@ -552,6 +833,7 @@ type CreateTableStmt struct {
 	pos         int
 	IfNotExists bool
 	Unlogged    bool
+	Temporary   bool // SET when CREATE TEMP TABLE is used. M0097-0003.
 	Name        ObjectName
 	Columns     []ColumnDef
 	// PrimaryKey holds the column names from a table-level
@@ -562,10 +844,51 @@ type CreateTableStmt struct {
 	// as a string→string map; the analyzer interprets known options
 	// (fillfactor, autovacuum_*, …) and rejects the rest.
 	With map[string]string
+	// PartitionBy is non-nil when `PARTITION BY {LIST|RANGE|HASH} (col, …)` is present.
+	// M0096-0007.
+	PartitionBy *PartitionByClause
+	// PartitionOf is non-nil for `CREATE TABLE child PARTITION OF parent FOR VALUES …`.
+	// M0096-0007.
+	PartitionOf *PartitionOfClause
+	// Inherits lists the parent table names from `INHERITS (parent, …)`.
+	// M0096-0009 will use these; for now the field is populated so the
+	// syntax is accepted and the executor can create the child table.
+	Inherits []ObjectName
+	// SelectSource is non-nil for `CREATE TABLE name AS SELECT …` (CTAS).
+	// The table is created with columns derived from the SELECT result. M0096-0008.
+	SelectSource *SelectStmt
+	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
+	// M0097-0014.
+	TableChecks []string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }
 func (s *CreateTableStmt) stmtNode() {}
+
+// PartitionByClause describes a PARTITION BY … clause.  M0096-0007.
+type PartitionByClause struct {
+	pos     int
+	Method  string   // "LIST", "RANGE", or "HASH"
+	KeyCols []string // partition key column names
+}
+
+// PartitionOfClause describes a PARTITION OF parent FOR VALUES … clause.
+// Only one of InValues, FromValues+ToValues, or Modulus+Remainder is populated.
+// M0096-0007; HASH bounds added M0097-0015.
+type PartitionOfClause struct {
+	pos      int
+	Parent   ObjectName
+	// LIST partitioning: FOR VALUES IN (v1, v2, …)
+	InValues []Expr
+	// RANGE partitioning: FOR VALUES FROM (lo) TO (hi)
+	FromValues []Expr
+	ToValues   []Expr
+	Default    bool // FOR VALUES DEFAULT
+	// HASH partitioning: FOR VALUES WITH (MODULUS n, REMAINDER r)
+	Modulus   int64
+	Remainder int64
+	IsHash    bool
+}
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
 //
@@ -593,6 +916,39 @@ const (
 	DropDefault DropBehavior = iota // RESTRICT (the default)
 	DropCascade
 )
+
+// CreateSequenceStmt — `CREATE [TEMP] SEQUENCE [IF NOT EXISTS] name
+//   [AS datatype] [INCREMENT [BY] n] [MINVALUE n | NO MINVALUE]
+//   [MAXVALUE n | NO MAXVALUE] [START [WITH] n] [CACHE n]
+//   [NO CYCLE | CYCLE] [OWNED BY column]`. M0097-0009.
+type CreateSequenceStmt struct {
+	pos         int
+	Name        ObjectName
+	IfNotExists bool
+	Temporary   bool
+	DataType    string // "smallint", "integer", "bigint" (default)
+	Increment   *int64
+	MinValue    *int64
+	MaxValue    *int64
+	Start       *int64
+	Cache       *int64
+	Cycle       bool
+	OwnedBy     string // "table.column" or empty
+}
+
+func (s *CreateSequenceStmt) Pos() int  { return s.pos }
+func (s *CreateSequenceStmt) stmtNode() {}
+
+// AlterSequenceStmt — `ALTER SEQUENCE [IF EXISTS] name [option …]`. M0097-0009.
+type AlterSequenceStmt struct {
+	pos      int
+	Name     ObjectName
+	IfExists bool
+	Options  []string // opaque option list; accepted for syntax compatibility
+}
+
+func (s *AlterSequenceStmt) Pos() int  { return s.pos }
+func (s *AlterSequenceStmt) stmtNode() {}
 
 // DropTableStmt — `DROP TABLE [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
 type DropTableStmt struct {
@@ -644,6 +1000,67 @@ type DropViewStmt struct {
 
 func (s *DropViewStmt) Pos() int  { return s.pos }
 func (s *DropViewStmt) stmtNode() {}
+
+// CreateMatViewStmt — `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS
+// query [WITH NO DATA]`. M0097-0013.
+type CreateMatViewStmt struct {
+	pos         int
+	Name        ObjectName
+	Query       *SelectStmt
+	WithNoData  bool
+	IfNotExists bool
+}
+
+func (s *CreateMatViewStmt) Pos() int  { return s.pos }
+func (s *CreateMatViewStmt) stmtNode() {}
+
+// RefreshMatViewStmt — `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name
+// [WITH [NO] DATA]`. M0097-0013.
+type RefreshMatViewStmt struct {
+	pos         int
+	Name        ObjectName
+	Concurrently bool
+	WithNoData  bool
+}
+
+func (s *RefreshMatViewStmt) Pos() int  { return s.pos }
+func (s *RefreshMatViewStmt) stmtNode() {}
+
+// DropCompatStmt is a compatibility stub for DROP statements whose object
+// types are not fully implemented in goopg v0 (SEQUENCE, SCHEMA, TYPE,
+// DOMAIN, AGGREGATE, COLLATION, etc.). The executor handles IF EXISTS by
+// emitting a NOTICE and silently succeeds for the rest. M0097-0008.
+type DropCompatStmt struct {
+	pos      int
+	ObjType  string // "sequence", "schema", "type", "domain", etc.
+	IfExists bool
+	Names    []ObjectName
+	Behavior DropBehavior
+}
+
+// DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.
+type DoStmt struct {
+	pos      int
+	Language string // "plpgsql" (default)
+	Body     string // the PL/pgSQL block body (dollar-quoted content)
+}
+
+func (s *DoStmt) Pos() int  { return s.pos }
+func (s *DoStmt) stmtNode() {}
+
+// CompatNoopStmt is a compatibility stub for SQL statements that goopg
+// accepts syntactically but does not execute (GRANT, REVOKE, COMMENT ON,
+// SECURITY LABEL, etc.). The executor silently succeeds. M0097-0016.
+type CompatNoopStmt struct {
+	pos int
+	Tag string // CommandComplete tag, e.g. "GRANT", "REVOKE", "COMMENT"
+}
+
+func (s *DropCompatStmt) Pos() int  { return s.pos }
+func (s *DropCompatStmt) stmtNode() {}
+
+func (s *CompatNoopStmt) Pos() int  { return s.pos }
+func (s *CompatNoopStmt) stmtNode() {}
 
 // CreatePublicationStmt — `CREATE PUBLICATION name [FOR ALL TABLES |
 // FOR TABLE t1 [, t2 ...]] [WITH (k = v, ...)]`. v0 honours
@@ -718,6 +1135,9 @@ const (
 	// the constraint subsystem lands. See
 	// docs/design/0003-0004-hammerdb-tpch-integration.md.
 	AlterTableAddForeignKey
+	// AlterTableAttachPartition — `ATTACH PARTITION child FOR VALUES …`.
+	// Registers an existing table as a partition of the parent. M0096-0007.
+	AlterTableAttachPartition
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -736,6 +1156,10 @@ type AlterTableAction struct {
 	RefTable   ObjectName
 	RefColumns []string
 	Deferrable bool // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
+
+	// AttachPartitionOf is populated for AlterTableAttachPartition.
+	// It holds the child table name and partition bounds. M0096-0007.
+	AttachPartitionOf *PartitionOfClause
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
@@ -942,3 +1366,63 @@ type DropProcedureStmt struct {
 
 func (s *DropProcedureStmt) Pos() int  { return s.pos }
 func (s *DropProcedureStmt) stmtNode() {}
+
+// CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …). M0097-0017.
+type CreateTypeStmt struct {
+	pos        int
+	Name       string
+	Schema     string
+	IsEnum     bool
+	EnumValues []string
+}
+
+func (s *CreateTypeStmt) Pos() int  { return s.pos }
+func (s *CreateTypeStmt) stmtNode() {}
+
+// AlterTypeStmt — ALTER TYPE name ADD VALUE [IF NOT EXISTS] val [BEFORE|AFTER ref]. M0097-0017.
+type AlterTypeStmt struct {
+	pos         int
+	Name        string
+	Schema      string
+	AddValue    string
+	IfNotExists bool
+	Before      string // reference value for BEFORE positioning
+	After       string // reference value for AFTER positioning
+}
+
+func (s *AlterTypeStmt) Pos() int  { return s.pos }
+func (s *AlterTypeStmt) stmtNode() {}
+
+// DropTypeStmt — DROP TYPE [IF EXISTS] name [CASCADE|RESTRICT]. M0097-0017.
+type DropTypeStmt struct {
+	pos      int
+	Names    []ObjectName
+	IfExists bool
+	Cascade  bool
+}
+
+func (s *DropTypeStmt) Pos() int  { return s.pos }
+func (s *DropTypeStmt) stmtNode() {}
+
+// CreateDomainStmt — CREATE DOMAIN name [AS] base_type [constraints]. M0097-0017.
+type CreateDomainStmt struct {
+	pos      int
+	Name     string
+	Schema   string
+	BaseType string // base type name
+	NotNull  bool
+}
+
+func (s *CreateDomainStmt) Pos() int  { return s.pos }
+func (s *CreateDomainStmt) stmtNode() {}
+
+// DropDomainStmt — DROP DOMAIN [IF EXISTS] name [CASCADE|RESTRICT]. M0097-0017.
+type DropDomainStmt struct {
+	pos      int
+	Names    []ObjectName
+	IfExists bool
+	Cascade  bool
+}
+
+func (s *DropDomainStmt) Pos() int  { return s.pos }
+func (s *DropDomainStmt) stmtNode() {}

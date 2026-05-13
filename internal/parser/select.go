@@ -5,6 +5,34 @@ import (
 	"strings"
 )
 
+// parseValuesStmt parses a bare VALUES (row1), (row2), ... statement.
+// Used as a subquery source in FROM clauses: `FROM (VALUES ...) AS t(col)`.
+// M0097-0003.
+func (p *parser) parseValuesStmt() (Stmt, error) {
+	t, err := p.expectKeyword(KwValues)
+	if err != nil {
+		return nil, err
+	}
+	s := &SelectStmt{pos: t.Pos}
+	for {
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' for VALUES row")
+		}
+		row, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after VALUES row")
+		}
+		s.ValuesRows = append(s.ValuesRows, row)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return s, nil
+}
+
 // parseSelect parses a SELECT statement.
 //
 // Grammar (v0):
@@ -19,6 +47,30 @@ import (
 //
 // Planner support for JOIN/group/set semantics lands separately.
 func (p *parser) parseSelect() (Stmt, error) {
+	// A bare VALUES(...) is a valid standalone statement in PostgreSQL.
+	// When used as a subquery (SELECT * FROM (VALUES ...) AS t), the inner
+	// parsing entry point is parseSelect, so we handle VALUES here.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwValues {
+		return p.parseValuesStmt()
+	}
+	// TABLE tablename is shorthand for SELECT * FROM tablename. M0097-0003.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable {
+		pos := p.cur().Pos
+		p.advance() // consume TABLE
+		tbl, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		star := &StarExpr{pos: pos}
+		rv := RangeVar{pos: pos, Schema: tbl.Schema, Name: tbl.Name}
+		s := &SelectStmt{
+			pos:      pos,
+			Targets:  []ResTarget{{Expr: star}},
+			From:     []RangeVar{rv},
+			FromExprs: []FromExpr{{pos: pos, Base: rv}},
+		}
+		return s, nil
+	}
 	t, err := p.expectKeyword(KwSelect)
 	if err != nil {
 		return nil, err
@@ -27,13 +79,14 @@ func (p *parser) parseSelect() (Stmt, error) {
 	if p.acceptKeyword(KwDistinct) {
 		s.Distinct = true
 	}
-	// Empty target list: `SELECT FROM <table>` is valid in
-	// upstream PG (returns one zero-column row per source row);
-	// HammerDB writes
-	// `SELECT EXISTS (SELECT FROM pg_tables WHERE …)` with this
-	// shape. Skip the target-list parse when the next token is
-	// FROM and synthesize an empty Targets slice.
-	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) {
+	// Empty target list: `SELECT FROM <table>` is valid in upstream PG
+	// (returns one zero-column row per source row). HammerDB writes
+	// `SELECT EXISTS (SELECT FROM pg_tables WHERE …)` with this shape.
+	// Also `SELECT;` (no targets, no FROM) is allowed — PG returns 1 row.
+	// Skip the target-list parse when the next token is FROM, ';', or EOF.
+	isSemiOrEOF := p.cur().Kind == TokenSymbol && p.cur().Value == ";" ||
+		p.cur().Kind == TokenEOF
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) && !isSemiOrEOF {
 		tgts, err := p.parseTargetList()
 		if err != nil {
 			return nil, err
@@ -150,15 +203,15 @@ func (p *parser) parseSelect() (Stmt, error) {
 	return s, nil
 }
 
-// parseLockingClause parses one `FOR { UPDATE | SHARE } [ OF
-// table_name [, …] ] [ NOWAIT | SKIP LOCKED ]` tail. The leading
-// FOR keyword is the current token on entry. Stage A scope:
+// parseLockingClause parses one `FOR { UPDATE | SHARE | NO KEY UPDATE |
+// KEY SHARE } [ OF table_name [, …] ] [ NOWAIT | SKIP LOCKED ]` tail.
+// The leading FOR keyword is the current token on entry.
 //
-//   - LockStrength: UPDATE | SHARE. NO KEY UPDATE / KEY SHARE are
-//     out of scope for v0 (would need NO + KEY composite forms).
-//   - WaitPolicy: NOWAIT and SKIP LOCKED parse but the analyzer +
-//     executor decide which strengths actually take effect (Stage
-//     B promotes the wait modifiers).
+// Locking strengths (M0096-0004):
+//   - FOR UPDATE           → LockStrengthForUpdate
+//   - FOR NO KEY UPDATE    → LockStrengthForNoKeyUpdate (mapped to ForUpdate in executor)
+//   - FOR SHARE            → LockStrengthForShare
+//   - FOR KEY SHARE        → LockStrengthForKeyShare (mapped to ForShare in executor)
 func (p *parser) parseLockingClause() (*LockingClause, error) {
 	t, err := p.expectKeyword(KwFor)
 	if err != nil {
@@ -168,10 +221,29 @@ func (p *parser) parseLockingClause() (*LockingClause, error) {
 	switch {
 	case p.acceptKeyword(KwUpdate):
 		lc.Strength = LockStrengthForUpdate
+
 	case p.acceptKeyword(KwShare):
 		lc.Strength = LockStrengthForShare
+
+	// FOR KEY SHARE: peek confirms KEY SHARE sequence before consuming.
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwKey &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwShare:
+		p.advance() // KEY
+		p.advance() // SHARE
+		lc.Strength = LockStrengthForKeyShare
+
+	// FOR NO KEY UPDATE: peek confirms NO KEY UPDATE sequence.
+	// "NO" is not a reserved keyword in goopg; it appears as TokenIdent.
+	case (p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "no")) &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwKey &&
+		p.peek(2).Kind == TokenKeyword && p.peek(2).Keyword == KwUpdate:
+		p.advance() // NO
+		p.advance() // KEY
+		p.advance() // UPDATE
+		lc.Strength = LockStrengthForNoKeyUpdate
+
 	default:
-		return nil, p.errAtCur("expected UPDATE or SHARE after FOR")
+		return nil, p.errAtCur("expected UPDATE, SHARE, KEY SHARE, or NO KEY UPDATE after FOR")
 	}
 	if p.acceptKeyword(KwOf) {
 		first, err := p.parseIdent()
@@ -280,17 +352,21 @@ func (p *parser) parseTargetEntry() (ResTarget, error) {
 	}
 	rt := ResTarget{pos: pos, Expr: expr}
 	if p.acceptKeyword(KwAs) {
-		alias, err := p.parseIdent()
+		// Use parseColumnAlias (not parseIdent) so reserved keywords
+		// like TRUE, FALSE, NULL are accepted as explicit aliases. M0097-0003.
+		alias, err := p.parseColumnAlias()
 		if err != nil {
 			return ResTarget{}, err
 		}
 		rt.Alias = identText(alias)
 		return rt, nil
 	}
-	// Implicit alias: a bare identifier or quoted ident immediately
-	// after the expression — but the v0 expression parser already
-	// consumes those into a ColumnRef, so we don't try to peel one
-	// off here. AS is the only path until the analyzer disambiguates.
+	// Implicit alias: a bare identifier or quoted ident after the expression
+	// (e.g. `pg_relation_size('x') size_after`). Only applies when the current
+	// token is NOT a clause-starting keyword or comma. M0097-0003.
+	if cur := p.cur(); isAliasStart(cur) {
+		rt.Alias = identText(p.advance())
+	}
 	return rt, nil
 }
 
@@ -379,6 +455,12 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 		return JoinExpr{}, false, nil
 	}
 
+	// Accept optional LATERAL keyword before the right-side range variable.
+	// LATERAL allows the derived table to reference columns from earlier FROM
+	// items. goopg treats it as a regular derived table (acceptable for
+	// vacuumdb's use case where the lateral subquery doesn't depend on outer
+	// column values at goopg's execution level).
+	_ = p.acceptKeyword(KwLateral)
 	right, err := p.parseRangeVar()
 	if err != nil {
 		return JoinExpr{}, false, err
@@ -419,13 +501,19 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 }
 
 func (p *parser) parseRangeVar() (RangeVar, error) {
+	// Accept optional LATERAL keyword before a derived table.
+	// LATERAL is silently consumed; goopg treats lateral subqueries as
+	// ordinary derived tables (no correlated-outer-reference evaluation).
+	_ = p.acceptKeyword(KwLateral)
+
 	// Derived table: `(SELECT …) AS alias`. The alias is mandatory
 	// in upstream PG; we mirror that. The two-token lookahead
 	// (`(` + SELECT) is necessary to disambiguate from
 	// `( table_name )` which v0 doesn't currently support but
 	// upstream does.
-	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
-		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwSelect {
+	isSubqueryStart := p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
+		(p.peek(1).Kind == TokenKeyword && (p.peek(1).Keyword == KwSelect || p.peek(1).Keyword == KwValues || p.peek(1).Keyword == KwWith || p.peek(1).Keyword == KwTable))
+	if isSubqueryStart {
 		pos := p.cur().Pos
 		p.advance() // (
 		inner, err := p.parseSelect()
@@ -479,14 +567,61 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		return RangeVar{}, err
 	}
 	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
-	// Optional alias: AS ident, or bare ident for the "implicit alias"
+
+	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
+	// Recognized: generate_series, pg_input_error_info, parse_ident.
+	srfFuncName := ""
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" && obj.Schema == "" {
+		lower := strings.ToLower(obj.Name)
+		switch lower {
+		case "generate_series", "pg_input_error_info", "parse_ident":
+			srfFuncName = lower
+		}
+	}
+	if srfFuncName != "" {
+		p.advance() // (
+		var args []Expr
+		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
+			a, err := p.parseExprList()
+			if err != nil {
+				return RangeVar{}, err
+			}
+			args = a
+		}
+		if !p.acceptSymbol(")") {
+			return RangeVar{}, p.errAtCur("expected ')' after function arguments")
+		}
+		rv.Name = ""
+		rv.TableFunc = &TableFuncRef{pos: obj.pos, Name: srfFuncName, Args: args}
+	}
+
+	// Optional alias: AS ident [(col, ...)], or bare ident for the "implicit alias"
 	// shorthand that pgbench uses (`pgbench_accounts a`).
+	// The optional column alias list (SELECT ...) AS t(c1, c2) is consumed
+	// and stored in rv.Columns for downstream schema renaming. M0097-0003.
 	if p.acceptKeyword(KwAs) {
 		t, err := p.parseIdent()
 		if err != nil {
 			return RangeVar{}, err
 		}
 		rv.Alias = identText(t)
+		// Optional column alias list: AS t(c1, c2, ...).
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume '('
+			for {
+				colTok, cerr := p.parseIdent()
+				if cerr != nil {
+					return RangeVar{}, cerr
+				}
+				rv.Columns = append(rv.Columns, identText(colTok))
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+			if !p.acceptSymbol(")") {
+				return RangeVar{}, p.errAtCur("expected ')' after column alias list")
+			}
+		}
 		return rv, nil
 	}
 	if isAliasStart(p.cur()) {
@@ -564,15 +699,19 @@ func (p *parser) parseSortItem() (SortBy, error) {
 // Precedence levels (higher binds tighter), aligned with upstream's
 // gram.y operator precedence.
 const (
-	precOr      = 1
-	precAnd     = 2
-	precNot     = 3
-	precIs      = 4
-	precCompare = 5 // = <> < > <= >=
-	precAddSub  = 6
-	precMulDiv  = 7
-	precConcat  = 8
-	precUnary   = 9
+	precOr         = 1
+	precAnd        = 2
+	precNot        = 3
+	precIs         = 4
+	precCompare    = 5 // = <> < > <= >=
+	precBitOr      = 5 // | (same as compare in PG)
+	precBitXor     = 5 // # (same as compare in PG)
+	precBitAnd     = 6 // & (higher than | in PG)
+	precBitShift   = 6 // << >> (same as & in PG)
+	precAddSub     = 7
+	precMulDiv     = 8
+	precConcat     = 9
+	precUnary      = 10
 )
 
 // parseExpr drives the precedence-climbing loop.
@@ -596,6 +735,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				return nil, err
 			}
 			left = cast
+			continue
+		}
+		// `expr[index]` array subscript — handled at the same precedence
+		// level as :: (tighter than binary operators).
+		if t := p.cur(); t.Kind == TokenSymbol && t.Value == "[" {
+			pos := t.Pos
+			p.advance() // consume '['
+			idx, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptSymbol("]") {
+				return nil, p.errAtCur("expected ']' after array subscript")
+			}
+			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: idx}
 			continue
 		}
 		// `expr [NOT] IN (...)` is a postfix-style construct at
@@ -652,6 +806,53 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				left = &BinaryOp{pos: pos, Op: OpNotLike, Left: left, Right: rhs}
 				continue
 			}
+			// ILIKE / NOT ILIKE (case-insensitive LIKE). M0097-0011.
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwIlike {
+				pos := t.Pos
+				p.advance()
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				left = &BinaryOp{pos: pos, Op: OpILike, Left: left, Right: rhs}
+				continue
+			}
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwNot &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwIlike {
+				pos := t.Pos
+				p.advance() // NOT
+				p.advance() // ILIKE
+				rhs, err := p.parseExprPrec(precCompare + 1)
+				if err != nil {
+					return nil, err
+				}
+				left = &BinaryOp{pos: pos, Op: OpNotILike, Left: left, Right: rhs}
+				continue
+			}
+			// POSIX regex operators: ~ ~* !~ !~* (M0097-0011).
+			if t := p.cur(); t.Kind == TokenOperator {
+				var op OpCode
+				switch t.Value {
+				case "~":
+					op = OpRegexMatch
+				case "~*":
+					op = OpRegexIMatch
+				case "!~":
+					op = OpRegexNoMatch
+				case "!~*":
+					op = OpRegexINoMatch
+				}
+				if op != OpUnknown {
+					pos := t.Pos
+					p.advance() // consume the operator token
+					rhs, err := p.parseExprPrec(precCompare + 1)
+					if err != nil {
+						return nil, err
+					}
+					left = &BinaryOp{pos: pos, Op: op, Left: left, Right: rhs}
+					continue
+				}
+			}
 			// `expr [NOT] BETWEEN low AND high` desugars to
 			//   `expr >= low AND expr <= high`
 			// (or wrapped in NOT for the inverse). The low and high
@@ -683,6 +884,96 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				continue
 			}
 		}
+		// `expr IS [NOT] NULL` — non-NULL-propagating null test.
+		// Unlike unary NOT, this always returns a boolean: NULL IS NULL = true.
+		// Added M0096-0004 for advisory lock WHERE clauses.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwIs {
+				pos := t.Pos
+				p.advance() // IS
+				negated := false
+				if p.acceptKeyword(KwNot) {
+					negated = true
+				}
+				if p.acceptKeyword(KwNull) {
+					left = &IsNullExpr{pos: pos, Operand: left, Negated: negated}
+					continue
+				}
+				// IS [NOT] TRUE / FALSE / UNKNOWN. M0097-0003.
+				if p.acceptKeyword(KwTrue) {
+					left = &IsBoolExpr{pos: pos, Operand: left, TestTrue: true, Negated: negated}
+					continue
+				}
+				if p.acceptKeyword(KwFalse) {
+					left = &IsBoolExpr{pos: pos, Operand: left, TestFalse: true, Negated: negated}
+					continue
+				}
+				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "unknown") {
+					p.advance()
+					left = &IsBoolExpr{pos: pos, Operand: left, Negated: negated}
+					continue
+				}
+				// Not IS NULL / IS NOT NULL — put the parser back
+				// by not consuming further; produce an IS-predicate
+				// error only if we consumed NOT.
+				if negated {
+					return nil, p.errAtCur("expected NULL, TRUE, FALSE, or UNKNOWN after IS NOT")
+				}
+				// IS DISTINCT FROM, etc. — not yet supported;
+				// the caller will see an error on the next token.
+			}
+		}
+
+		// `expr = ANY (array[...])` — desugar to `expr IN (...)`.
+		// Used by vacuumdb catalog queries: `relkind = ANY (array['r','m'])`.
+		// Only the `= ANY` form is handled; `<> ANY` etc. are not emitted
+		// by vacuumdb so they remain deferred.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenOperator && t.Value == "=" &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwAny {
+				pos := t.Pos
+				p.advance() // =
+				p.advance() // ANY
+				inExpr, err := p.parseAnyTail(left, pos)
+				if err != nil {
+					return nil, err
+				}
+				left = inExpr
+				continue
+			}
+		}
+
+		// OPERATOR(schema.op) — qualified operator: desugar to its base operator.
+		// Used by vacuumdb and other PostgreSQL client tools:
+		// `nspname OPERATOR(pg_catalog.=) 'public'`.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "operator") &&
+				p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+				if op, n := p.peekQualifiedOp(); op != OpUnknown {
+					for i := 0; i < n; i++ {
+						p.advance()
+					}
+					// OPERATOR(schema.=) ANY (array[...]) — desugar to IN.
+					if op == OpEq && p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAny {
+						pos := t.Pos
+						p.advance() // ANY
+						inExpr, err := p.parseAnyTail(left, pos)
+						if err != nil {
+							return nil, err
+						}
+						left = inExpr
+						continue
+					}
+					right, err := p.parseExprPrec(precCompare + 1)
+					if err != nil {
+						return nil, err
+					}
+					left = &BinaryOp{pos: t.Pos, Op: op, Left: left, Right: right}
+					continue
+				}
+			}
+		}
+
 		op, prec, ok := p.peekBinaryOp()
 		if !ok || prec < min {
 			return left, nil
@@ -696,6 +987,89 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 	}
 }
 
+// peekQualifiedOp peeks at OPERATOR(schema.op) or OPERATOR(op).
+// Returns the OpCode and the number of tokens to consume (including
+// OPERATOR, (, schema, ., op, )), or (OpUnknown, 0) if not recognised.
+func (p *parser) peekQualifiedOp() (OpCode, int) {
+	// peek(0) = OPERATOR (already confirmed by caller)
+	// peek(1) = '('      (already confirmed by caller)
+	i := 2
+	// optional schema.
+	if p.peek(i).Kind == TokenIdent && p.peek(i+1).Kind == TokenSymbol && p.peek(i+1).Value == "." {
+		i += 2
+	}
+	opTok := p.peek(i)
+	i++
+	// closing )
+	if p.peek(i).Kind != TokenSymbol || p.peek(i).Value != ")" {
+		return OpUnknown, 0
+	}
+	i++ // now i is count of tokens to consume
+	// map the operator symbol to OpCode
+	if opTok.Kind == TokenOperator || opTok.Kind == TokenSymbol {
+		switch opTok.Value {
+		case "=":
+			return OpEq, i
+		case "<>", "!=":
+			return OpNe, i
+		case "<":
+			return OpLt, i
+		case ">":
+			return OpGt, i
+		case "<=":
+			return OpLe, i
+		case ">=":
+			return OpGe, i
+		}
+	}
+	return OpUnknown, 0
+}
+
+// parseAnyTail parses `ANY (array[e1, e2, ...])` after `=` has been consumed.
+// Returns an InExpr equivalent to `left IN (e1, e2, ...)`.
+func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after ANY")
+	}
+	var elems []Expr
+	// array[e1, e2, ...] constructor form.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "array") &&
+		p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "[" {
+		p.advance() // array
+		p.advance() // [
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+			p.advance()
+		} else {
+			first, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, first)
+			for p.acceptSymbol(",") {
+				next, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, next)
+			}
+			if !p.acceptSymbol("]") {
+				return nil, p.errAtCur("expected ']'")
+			}
+		}
+	} else {
+		// Non-array expression: parse a single value.
+		inner, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		elems = []Expr{inner}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')'")
+	}
+	return &InExpr{pos: pos, Operand: left, Negated: false, List: elems}, nil
+}
+
 // parseCastTail consumes a single `:: typename [(typmods)]` after the
 // caller has already produced the operand expression. Returns the
 // CastExpr; the caller chains by re-checking for `::` after.
@@ -704,6 +1078,14 @@ func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 	name, err := p.parseTypeNameAfterCast()
 	if err != nil {
 		return nil, err
+	}
+	// Consume optional array suffix `[]` — treat `type[]` as the same type
+	// (goopg v0 doesn't implement array types distinctly; the cast is a no-op). M0097-0003.
+	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance() // '['
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+			p.advance() // ']'
+		}
 	}
 	var typmods []int64
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
@@ -805,6 +1187,16 @@ func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 			return OpGe, precCompare, true
 		case "<>", "!=":
 			return OpNe, precCompare, true
+		case "<<":
+			return OpBitShiftLeft, precBitShift, true
+		case ">>":
+			return OpBitShiftRight, precBitShift, true
+		case "&":
+			return OpBitAnd, precBitAnd, true
+		case "|":
+			return OpBitOr, precBitOr, true
+		case "#":
+			return OpBitXor, precBitXor, true
 		}
 	case TokenSymbol:
 		// '*' is also a symbol token (target-list wildcard) — but in
@@ -860,11 +1252,7 @@ func (p *parser) parsePrimary() (Expr, error) {
 	switch t.Kind {
 	case TokenIntLit:
 		p.advance()
-		v, err := strconv.ParseInt(t.Value, 10, 64)
-		if err != nil {
-			return nil, &SyntaxError{Pos: t.Pos, Message: "invalid integer literal: " + t.Value}
-		}
-		return &IntegerConst{pos: t.Pos, Value: v}, nil
+		return parseIntLiteralExpr(t)
 	case TokenNumericLit:
 		p.advance()
 		return &NumericConst{pos: t.Pos, Value: t.Value}, nil
@@ -952,7 +1340,14 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 	t := p.cur()
 	name := strings.ToLower(identText(t))
 	switch name {
-	case "date", "timestamp", "timestamptz":
+	case "date", "timestamp", "timestamptz", "time", "timetz",
+		// Scalar types for `typename 'string'` cast syntax (M0097-0003).
+		"bool", "boolean",
+		"int2", "int4", "int8", "smallint", "integer", "bigint",
+		"float4", "float8", "real",
+		"numeric", "decimal",
+		"text", "varchar", "char", "bpchar",
+		"name", "oid":
 		next := p.peek(1)
 		if next.Kind != TokenStringLit {
 			return nil, false
@@ -1385,6 +1780,13 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		fc.Distinct = true
 	}
 	for {
+		// Named argument: `name => value` — skip the name and use only the value.
+		// PostgreSQL named arguments are positionally mapped for built-ins. M0097-0003.
+		if (p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent) &&
+			p.peek(1).Kind == TokenOperator && p.peek(1).Value == "=>" {
+			p.advance() // skip name
+			p.advance() // skip =>
+		}
 		arg, err := p.parseExpr()
 		if err != nil {
 			return nil, err
@@ -1400,13 +1802,27 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 	}
 }
 
-// maybeWindowTail consumes an optional `OVER (...)` window
-// clause after a function-call's closing `)`. Promotes the
-// FuncCall from a scalar/aggregate to a window function by
-// stamping fc.Over (M0020 step 1). When the next token isn't
-// the OVER keyword the call is returned unchanged so every
-// pre-M0020 caller stays byte-for-byte the same.
+// maybeWindowTail consumes optional `FILTER (WHERE ...)` and/or
+// `OVER (...)` clauses after a function-call's closing `)`.
+// FILTER (M0097-0007) stamps fc.Filter; OVER (M0020) stamps fc.Over.
 func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
+	// FILTER (WHERE condition) — aggregate filter clause.
+	if p.acceptIdentKeyword("filter") {
+		if p.acceptSymbol("(") {
+			if _, err := p.expectKeyword(KwWhere); err != nil {
+				return nil, err
+			}
+			cond, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' to close FILTER clause")
+			}
+			fc.Filter = cond
+		}
+	}
+	// OVER (...) window definition.
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOver) {
 		return fc, nil
 	}
@@ -1455,4 +1871,58 @@ func (p *parser) parseWindowDef() (*WindowDef, error) {
 		return nil, p.errAtCur("expected ')' after window definition (frame clauses are not supported in v0)")
 	}
 	return wd, nil
+}
+
+// parseIntLiteral converts a TokenIntLit value to int64, handling:
+//   - Binary literals: 0b[01]+ or 0B[01]+
+//   - Octal literals:  0o[0-7]+ or 0O[0-7]+
+//   - Hex literals:    0x[0-9a-fA-F]+ or 0X[0-9a-fA-F]+
+//   - Numeric separators: underscore (_) stripped before parsing
+//   - Plain decimal: base 10
+//
+// M0097-0003: PostgreSQL 16+ numeric literal syntax support.
+func parseIntLiteral(s string) (int64, error) {
+	s = strings.ReplaceAll(s, "_", "") // strip numeric separators
+	if len(s) >= 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b', 'B':
+			return strconv.ParseInt(s[2:], 2, 64)
+		case 'o', 'O':
+			return strconv.ParseInt(s[2:], 8, 64)
+		case 'x', 'X':
+			return strconv.ParseInt(s[2:], 16, 64)
+		}
+	}
+	return strconv.ParseInt(s, 10, 64)
+}
+
+// parseIntLiteralExpr parses a TokenIntLit and returns either IntegerConst
+// (fits int64) or NumericConst (overflow) as PostgreSQL does.
+// M0097-0003.
+func parseIntLiteralExpr(t Token) (Expr, error) {
+	v, err := parseIntLiteral(t.Value)
+	if err == nil {
+		return &IntegerConst{pos: t.Pos, Value: v}, nil
+	}
+	// Overflow — emit as NumericConst preserving the original value.
+	// Strip underscores and prefix for display consistency.
+	s := strings.ReplaceAll(t.Value, "_", "")
+	if len(s) >= 2 && s[0] == '0' {
+		switch s[1] {
+		case 'b', 'B':
+			if u, uerr := strconv.ParseUint(s[2:], 2, 64); uerr == nil {
+				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			}
+		case 'o', 'O':
+			if u, uerr := strconv.ParseUint(s[2:], 8, 64); uerr == nil {
+				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			}
+		case 'x', 'X':
+			if u, uerr := strconv.ParseUint(s[2:], 16, 64); uerr == nil {
+				return &NumericConst{pos: t.Pos, Value: strconv.FormatUint(u, 10)}, nil
+			}
+		}
+	}
+	// Decimal overflow — return the string as a numeric literal.
+	return &NumericConst{pos: t.Pos, Value: s}, nil
 }

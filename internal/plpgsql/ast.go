@@ -133,6 +133,18 @@ type ForStmt struct {
 func (f *ForStmt) Pos() int         { return f.pos }
 func (f *ForStmt) plpgsqlStmtNode() {}
 
+// ForSelectStmt is `FOR rec IN query LOOP stmts END LOOP;`.
+// M0097-0012: query cursor loop over a SQL SELECT result.
+type ForSelectStmt struct {
+	pos  int
+	Var  string // record variable name
+	SQL  string // raw SQL text of the SELECT query
+	Body []Stmt
+}
+
+func (f *ForSelectStmt) Pos() int         { return f.pos }
+func (f *ForSelectStmt) plpgsqlStmtNode() {}
+
 // ExitStmt is `EXIT [ WHEN condition ];`. Stage A 4d only
 // supports exiting the innermost loop.
 type ExitStmt struct {
@@ -172,3 +184,47 @@ type ReturnStmt struct {
 
 func (r *ReturnStmt) Pos() int          { return r.pos }
 func (r *ReturnStmt) plpgsqlStmtNode() {}
+
+// SQLStmt is an embedded SQL DML/query statement in a PL/pgSQL body.
+// The raw SQL text is stored verbatim; at execution time the executor
+// substitutes OLD.* / NEW.* references with the trigger context rows,
+// then plans and executes via the normal SQL path. M0096-0012.
+type SQLStmt struct {
+	pos  int
+	SQL  string // raw SQL text (untransformed)
+}
+
+func (s *SQLStmt) Pos() int          { return s.pos }
+func (s *SQLStmt) plpgsqlStmtNode() {}
+
+// ExceptionHandler is one WHEN clause in an EXCEPTION block.
+// Conditions are SQLSTATE codes or condition names. M0097-0012.
+type ExceptionHandler struct {
+	Conditions []string
+	Body       []Stmt
+}
+
+// ExceptionBlock wraps a BEGIN...EXCEPTION...END section.
+// TryBody is the protected statement list. M0097-0012.
+type ExceptionBlock struct {
+	pos      int
+	TryBody  []Stmt
+	Handlers []*ExceptionHandler
+}
+
+func (e *ExceptionBlock) Pos() int         { return e.pos }
+func (e *ExceptionBlock) plpgsqlStmtNode() {}
+
+// RaiseStmt is `RAISE [level] 'message'`. Level is "notice",
+// "warning", "exception" / "error" (default). NOTICE and WARNING are
+// silently discarded; ERROR/EXCEPTION surfaces an ExecError.
+// M0096-0012.
+type RaiseStmt struct {
+	pos           int
+	Level         string // "notice", "warning", "error"
+	Msg           string // static message text (format substitution deferred)
+	ConditionName string // set when RAISE condition_name (not a level keyword)
+}
+
+func (r *RaiseStmt) Pos() int          { return r.pos }
+func (r *RaiseStmt) plpgsqlStmtNode() {}

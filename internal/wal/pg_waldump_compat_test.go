@@ -103,7 +103,7 @@ func TestPGWaldumpParsesEmittedWAL(t *testing.T) {
 	records := [][]byte{
 		EncodeCheckpoint(),
 		EncodeHeapInsert(rel, 0, 1, tupBytes),
-		EncodeHeapDelete(rel, 0, 1, storage.TransactionID(42)),
+		EncodeHeapDelete(rel, 0, 1, storage.TransactionID(42), nil),
 		EncodeXactCommit(storage.TransactionID(42)),
 		pagePayload,
 	}

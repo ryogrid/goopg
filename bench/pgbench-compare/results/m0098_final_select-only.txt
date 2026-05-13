@@ -1,0 +1,23 @@
+pgbench (18.3)
+starting vacuum...pgbench: error: 
+pgbench: detail: (ignoring this error and continuing anyway)
+end.
+progress: 30.0 s, 4970.6 tps, lat 20.091 ms stddev 12.600, 0 failed
+progress: 60.0 s, 4993.2 tps, lat 20.024 ms stddev 12.677, 0 failed
+progress: 90.0 s, 4985.6 tps, lat 20.053 ms stddev 12.680, 0 failed
+progress: 120.0 s, 4988.5 tps, lat 20.050 ms stddev 12.645, 0 failed
+progress: 150.0 s, 4994.4 tps, lat 20.021 ms stddev 12.704, 0 failed
+progress: 180.0 s, 5002.7 tps, lat 19.988 ms stddev 12.742, 0 failed
+transaction type: <builtin: select only>
+scaling factor: 100
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 898119
+number of failed transactions: 0 (0.000%)
+latency average = 20.038 ms
+latency stddev = 12.675 ms
+initial connection time = 36.798 ms
+tps = 4989.876615 (without initial connection time)

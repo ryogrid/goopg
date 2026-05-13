@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"runtime/debug"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
@@ -80,7 +82,7 @@ func maybeForceGCAfterCommit() {
 //
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
-func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string) error {
+func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
@@ -94,6 +96,24 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
 			}
 			tag := databaseDDLCommandTag(sql)
+			if err := w.WriteCommandComplete(tag); err != nil {
+				return err
+			}
+			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		}
+		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
+		// actual role tracking so DROP ROLE fails on nonexistent roles.
+		if handled, herr := s.tryHandleRoleDDL(sql); handled {
+			if herr != nil {
+				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+			}
+			norm := normalizeCompatSQL(sql)
+			var tag string
+			if strings.HasPrefix(norm, "create ") {
+				tag = "CREATE ROLE"
+			} else {
+				tag = "DROP ROLE"
+			}
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
@@ -114,12 +134,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	}
-	// Begin one statement-level transaction per Query message and
-	// commit at the end. v0 doesn't yet plumb session-level
-	// BEGIN/COMMIT into the wire layer.
-	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
-	if err != nil {
-		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+	// Session-level explicit transaction support (M0096-0005):
+	// When the client has issued BEGIN, reuse the open TxnMgr transaction
+	// rather than starting a fresh auto-commit one.  Each statement-level
+	// dispatch that is NOT inside an explicit transaction still auto-commits.
+	var tx mvcc.Transaction
+	autoCommit := true
+	if connTx != nil && connTx.InExplicit() {
+		tx = connTx.Tx()
+		autoCommit = false
+	} else {
+		var err error
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+		if err != nil {
+			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+		}
 	}
 	// Each Query message gets a fresh BackendID for the lock
 	// manager; the youngest-backend victim policy from M0012-0002
@@ -127,7 +156,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	backendID := lockmgr.BackendID(s.nextBackendID.Add(1))
 	commit := false
 	defer func() {
-		if !commit {
+		if autoCommit && !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
 		}
 		// Always drop locks at txn end so a leftover holder
@@ -147,6 +176,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.Catalog = s.cfg.Catalog
 	ectx.TxnMgr = s.cfg.TxnMgr
 	ectx.Tx = tx
+	// Wire the per-connection session into the executor so advisory locks
+	// and other session-scoped state are properly tracked.
+	if connTx != nil {
+		if sess := connTx.Session(); sess != nil {
+			ectx.Session = sess
+		}
+		// Share the per-connection TEMP TABLE shadow map so it persists
+		// across statements in the same connection. M0097-0003.
+		ectx.TempTableShadows = connTx.TempTableShadows
+	}
 	ectx.Snap = snap
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
@@ -171,6 +210,88 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	}
 
 	for _, stmt := range stmts {
+		// Handle PREPARE / EXECUTE / DEALLOCATE inline (M0096-0006).
+		// These require per-connection state not available in the executor.
+		if ps, ok := stmt.(*parser.PrepareStmt); ok {
+			tag := "PREPARE"
+			if prepStmts != nil && ps.Name != "" {
+				// Store the raw SQL for later EXECUTE.  We reconstruct it
+				// from the original batch since the parsed form may lose
+				// position information for non-SELECT queries.
+				prepStmts.Store(ps.Name, sql)
+			}
+			if err := w.WriteCommandComplete(tag); err != nil {
+				return err
+			}
+			continue
+		}
+		if es, ok := stmt.(*parser.ExecuteStmt); ok {
+			if prepStmts != nil {
+				if prepSQL, found := prepStmts.Lookup(es.Name); found {
+					// Re-dispatch the stored SQL as a fresh query.
+					if err := s.dispatchSimpleQueryViaExecutor(ctx, w, sess, prepSQL, connTx, prepStmts); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", es.Name))
+		}
+		if ds, ok := stmt.(*parser.DeallocateStmt); ok {
+			if prepStmts != nil {
+				if ds.Name == "" {
+					prepStmts.DeleteAll()
+				} else {
+					prepStmts.Delete(ds.Name)
+				}
+			}
+			if err := w.WriteCommandComplete("DEALLOCATE"); err != nil {
+				return err
+			}
+			continue
+		}
+		// DECLARE ... CURSOR FOR select (M0097-0003).
+		if dc, ok := stmt.(*parser.DeclareCursorStmt); ok {
+			if connTx != nil {
+				// Store the cursor's SELECT SQL for later FETCH.
+				// Re-extract the raw SQL for this cursor declaration.
+				// Since we have the parsed query, reconstruct by storing
+				// the original sql text (trimmed to the cursor portion).
+				connTx.cursorDeclare(dc.Name, sql)
+			}
+			if err := w.WriteCommandComplete("DECLARE CURSOR"); err != nil {
+				return err
+			}
+			continue
+		}
+		// FETCH [ALL|n] [FROM|IN] cursor_name (M0097-0003).
+		if fs, ok := stmt.(*parser.FetchStmt); ok {
+			if connTx != nil {
+				if curSQL, found := connTx.cursorLookup(fs.CursorName); found {
+					if err := s.executeFetchAll(ctx, w, ectx, curSQL, fs.CursorName, fs.Count); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			return s.writeQueryError(w, "34000", fmt.Sprintf("cursor \"%s\" does not exist", fs.CursorName))
+		}
+		// CLOSE cursor_name (M0097-0003).
+		if cs, ok := stmt.(*parser.CloseStmt); ok {
+			if connTx != nil {
+				if cs.Name != "" {
+					if _, found := connTx.cursorLookup(cs.Name); !found {
+						return s.writeQueryError(w, "34000", fmt.Sprintf("cursor \"%s\" does not exist", cs.Name))
+					}
+				}
+				connTx.cursorClose(cs.Name)
+			}
+			if err := w.WriteCommandComplete("CLOSE CURSOR"); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// Refresh snapshot per statement for ReadCommitted parity.
 		snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
 		if err != nil {
@@ -178,8 +299,41 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		}
 		ectx.Snap = snap2
 
-		if err := s.executeOneSimpleStmt(w, ectx, stmt); err != nil {
+		// M0098-0005: plan cache for single-statement queries (the
+		// common OLTP case). On hit: skip planner.Plan. On miss:
+		// plan, cache, then execute.
+		var precached planner.Node
+		var cacheKey string
+		if s.pc != nil && len(stmts) == 1 {
+			cacheKey = normalizeCompatSQL(sql)
+			if cached, ok := s.pc.Get(cacheKey); ok {
+				precached = cached
+			} else {
+				// Cache miss: plan now so we can store it.
+				freshNode, perr := planner.Plan(stmt, s.cfg.Catalog)
+				if perr != nil {
+					code, msg := planErrorFields(perr)
+					return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
+				}
+				if planCacheIsCacheable(freshNode) {
+					s.pc.Put(cacheKey, freshNode)
+				}
+				precached = freshNode
+			}
+		}
+		if err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached); err != nil {
+			if errors.Is(err, errQueryErrorSent) {
+				// Error + ReadyForQuery already sent to the client (M0097-0003).
+				// Do NOT send another ReadyForQuery — that would produce a double
+				// RFQ that causes psql to print "message type 0x5a arrived from
+				// server while idle". Just return nil so the connection stays alive.
+				return nil
+			}
 			return err
+		}
+		// Write back the temp-table shadow map so it persists across statements. M0097-0003.
+		if connTx != nil && ectx.TempTableShadows != nil {
+			connTx.TempTableShadows = ectx.TempTableShadows
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
@@ -188,11 +342,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			reg.UpdateState(pid, "idle", "")
 		}
 	}
-	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
-		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+	if autoCommit {
+		if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+		}
+		commit = true
+		maybeForceGCAfterCommit()
 	}
-	commit = true
-	maybeForceGCAfterCommit()
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
@@ -270,8 +426,10 @@ func compatNoopCommandTag(sql string) (string, bool) {
 	switch {
 	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
 		return "CREATE ROLE", true
-	case strings.HasPrefix(norm, "grant "):
+	case strings.HasPrefix(norm, "grant "), norm == "grant":
 		return "GRANT", true
+	case strings.HasPrefix(norm, "revoke "), norm == "revoke":
+		return "REVOKE", true
 	case strings.HasPrefix(norm, "create database "):
 		return "CREATE DATABASE", true
 	case strings.HasPrefix(norm, "alter database "):
@@ -284,6 +442,10 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "DROP ROLE", true
 	case strings.HasPrefix(norm, "set constraints "):
 		return "SET CONSTRAINTS", true
+	case strings.HasPrefix(norm, "comment on "):
+		return "COMMENT", true
+	case strings.HasPrefix(norm, "security label "):
+		return "SECURITY LABEL", true
 	}
 	return "", false
 }
@@ -293,48 +455,160 @@ func normalizeCompatSQL(sql string) string {
 	for strings.HasSuffix(s, ";") {
 		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
 	}
-	return strings.Join(strings.Fields(strings.ToLower(s)), " ")
+	// Lowercase keywords/identifiers but preserve string literal case.
+	// Lowercasing string literals would cause 'A' and 'a' to map to the
+	// same plan-cache key, returning the wrong cached plan. M0097-0003.
+	return normalizeSQLPreservingLiterals(s)
+}
+
+// normalizeSQLPreservingLiterals lowercases SQL outside string literals
+// and collapses whitespace. String literal contents are preserved verbatim
+// so that INSERT ('A') and INSERT ('a') get distinct cache keys.
+func normalizeSQLPreservingLiterals(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inSingleQuote := false
+	prevWasSpace := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inSingleQuote {
+			// Inside a string literal — preserve case exactly.
+			b.WriteByte(c)
+			if c == '\'' {
+				// Check for doubled single quote (escape).
+				if i+1 < len(s) && s[i+1] == '\'' {
+					b.WriteByte('\'')
+					i++
+				} else {
+					inSingleQuote = false
+				}
+			}
+			prevWasSpace = false
+			continue
+		}
+		if c == '\'' {
+			inSingleQuote = true
+			b.WriteByte(c)
+			prevWasSpace = false
+			continue
+		}
+		// Outside literal: lowercase and collapse whitespace.
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			if !prevWasSpace && b.Len() > 0 {
+				b.WriteByte(' ')
+				prevWasSpace = true
+			}
+		} else {
+			if c >= 'A' && c <= 'Z' {
+				c = c + 32 // lowercase ASCII
+			}
+			b.WriteByte(c)
+			prevWasSpace = false
+		}
+	}
+	return strings.TrimRight(b.String(), " ")
 }
 
 // executeOneSimpleStmt plans and runs one statement, emitting the
 // per-statement wire messages but NOT ReadyForQuery (the caller
 // terminates the batch).
-func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt) error {
-	node, err := planner.Plan(stmt, s.cfg.Catalog)
-	if err != nil {
-		code, msg := planErrorFields(err)
-		return s.writeQueryError(w, code, msg)
+//
+// connTx, if non-nil, tracks the per-connection explicit transaction
+// state so BEGIN/COMMIT/ROLLBACK can open/close real TxnMgr transactions.
+// autoCommitPtr, if non-nil, is set to false when a BEGIN starts an
+// explicit transaction (telling the caller not to auto-commit).
+// cachedNode, when non-nil, is a pre-validated plan from the cross-session
+// plan cache — planner.Plan is skipped. M0098-0005.
+func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool, cachedNode ...planner.Node) error {
+	var node planner.Node
+	if len(cachedNode) > 0 && cachedNode[0] != nil {
+		node = cachedNode[0]
+	} else {
+		var err error
+		node, err = planner.Plan(stmt, s.cfg.Catalog)
+		if err != nil {
+			code, msg := planErrorFields(err)
+			return s.writeQueryError(w, code, msg, planErrorHintFields(err)...)
+		}
+		// Note: plan cache storage happens at the dispatch level (caller
+		// stores if cacheKey was computed). This function only executes.
 	}
-	// Transaction verbs are no-ops at the wire layer for v0: every
-	// simple-query Query message already runs inside a per-batch
-	// ReadCommitted transaction (see dispatchSimpleQueryViaExecutor).
-	// Pgbench -i's BEGIN ... COMMIT envelope around the COPY/ALTER
-	// block needs to succeed without erroring; full session-tx
-	// semantics (multi-batch atomicity, savepoints) wait for the
-	// session-state plumbing in a follow-up loop.
-	if tx, ok := node.(*planner.Transaction); ok {
-		return w.WriteCommandComplete(transactionTag(tx.Verb))
+	// Transaction verbs: BEGIN/COMMIT/ROLLBACK require per-connection
+	// explicit transaction management (M0096-0005). BEGIN promotes the
+	// current auto-commit transaction into a persistent explicit one;
+	// COMMIT/ROLLBACK finalise it and release the session-level state.
+	if txNode, ok := node.(*planner.Transaction); ok {
+		switch txNode.Verb {
+		case planner.TxBegin:
+			if connTx != nil && !connTx.InExplicit() && autoCommitPtr != nil {
+				// Promote the current auto-commit transaction to explicit.
+				*autoCommitPtr = false
+				connTx.Begin(ctx.Tx)
+			}
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		case planner.TxCommit:
+			if connTx != nil && connTx.InExplicit() {
+				if err := s.cfg.TxnMgr.Commit(connTx.Tx()); err != nil {
+					connTx.End()
+					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+				}
+				connTx.End()
+				maybeForceGCAfterCommit()
+				// Leave *autoCommitPtr = false so the caller does NOT attempt
+				// a second TxnMgr.Commit on the already-committed transaction.
+			} else {
+				// COMMIT outside an explicit transaction: emit warning.
+				_ = w.WriteNoticeResponse([]protocol.ErrorField{
+					{Code: protocol.FieldSeverity, Value: "WARNING"},
+					{Code: protocol.FieldSeverityNonLocal, Value: "WARNING"},
+					{Code: protocol.FieldSQLState, Value: "25P01"},
+					{Code: protocol.FieldMessage, Value: "there is no transaction in progress"},
+				})
+			}
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		case planner.TxRollback:
+			if connTx != nil && connTx.InExplicit() {
+				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+				connTx.End()
+				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
+			} else {
+				// ROLLBACK outside an explicit transaction: emit warning.
+				_ = w.WriteNoticeResponse([]protocol.ErrorField{
+					{Code: protocol.FieldSeverity, Value: "WARNING"},
+					{Code: protocol.FieldSeverityNonLocal, Value: "WARNING"},
+					{Code: protocol.FieldSQLState, Value: "25P01"},
+					{Code: protocol.FieldMessage, Value: "there is no transaction in progress"},
+				})
+			}
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		default:
+			// Other verbs (SAVEPOINT, ROLLBACK TO, RELEASE) pass through
+			// the existing logic.
+			return w.WriteCommandComplete(transactionTag(txNode.Verb))
+		}
 	}
 	op, err := executor.Build(node)
 	if err != nil {
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 	if err := op.Open(ctx); err != nil {
 		_ = op.Close()
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 
 	// Emit RowDescription for read-shaped plans (those whose Output
 	// schema is non-nil); writing operators (Insert/Update/Delete/
-	// DDL/Transaction) have empty schemas and emit only the command
-	// tag.
+	// DDL/Transaction) return nil from Output() and emit only the
+	// command tag.
 	schema := node.Output()
 	// CALL plans have a dynamic schema that depends on the procedure's
 	// OUT params; the operator reports it after Open.
 	if schema == nil {
 		schema = op.Schema()
 	}
-	if len(schema) > 0 {
+	// Send RowDescription when schema is non-nil (even 0 columns —
+	// e.g. `SELECT;` returns 1 row with 0 columns per PostgreSQL).
+	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
 			fields[i] = protocol.FieldDescription{
@@ -359,21 +633,66 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 		if err != nil {
 			_ = op.Close()
-			return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+			return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 		}
-		if len(schema) > 0 {
+		if schema != nil {
 			row := slot.Row()
 			// M0092-0004: per-connection scratch buffers back the
 			// wire frame so the simple-query result loop is O(1)
 			// allocation across rows AND statements.
 			cells, valueBuf := w.DataRowScratch(len(row))
-			for _, d := range row {
+			for i, d := range row {
 				if d.IsNull() {
 					cells = append(cells, nil)
 					continue
 				}
 				start := len(valueBuf)
-				valueBuf = d.AppendValueText(valueBuf)
+				if i < len(schema) {
+					sc := schema[i]
+					switch strings.ToLower(sc.Type.Name) {
+					case "float8", "double precision", "double", "float4", "real":
+						// float8/float4 values must display in PostgreSQL's output format:
+						// scientific notation for very large/small values, shortest decimal
+						// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
+						valueBuf = appendFloat8Text(valueBuf, d)
+					case "char", "bpchar":
+						// Pad char(N)/bpchar(N) values to declared width with trailing spaces.
+						// PostgreSQL always returns char(N) padded to N bytes. M0097-0003.
+						valueBuf = d.AppendValueText(valueBuf)
+						if len(sc.Type.Args) > 0 {
+							width := int(sc.Type.Args[0])
+							for len(valueBuf)-start < width {
+								valueBuf = append(valueBuf, ' ')
+							}
+						}
+					case "date":
+						// Date columns display as YYYY-MM-DD. M0097-0004.
+						if d.Kind == executor.KindTime {
+							valueBuf = d.TimeValue().AppendFormat(valueBuf, "2006-01-02")
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
+					case "time":
+						// Time columns display as HH:MM:SS[.ffffff] with column precision. M0097-0004.
+						if d.Kind == executor.KindTime {
+							valueBuf = appendTimeText(valueBuf, d, sc.Type)
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
+					case "timetz":
+						// Timetz displays as HH:MM:SS[.ffffff]+00. M0097-0004.
+						if d.Kind == executor.KindTime {
+							valueBuf = appendTimeText(valueBuf, d, sc.Type)
+							valueBuf = append(valueBuf, "+00"...)
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
+					default:
+						valueBuf = d.AppendValueText(valueBuf)
+					}
+				} else {
+					valueBuf = d.AppendValueText(valueBuf)
+				}
 				cells = append(cells, valueBuf[start:len(valueBuf)])
 			}
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
@@ -384,12 +703,29 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 	}
 	if err := op.Close(); err != nil {
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
+	}
+
+	// Emit accumulated NOTICE messages before CommandComplete. M0097-0008.
+	for _, msg := range ctx.TakeNotices() {
+		if nerr := w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "NOTICE"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: protocol.FieldSQLState, Value: "00000"},
+			{Code: protocol.FieldMessage, Value: msg},
+		}); nerr != nil {
+			return nerr
+		}
 	}
 
 	tag := commandTagFor(node, op, rowCount)
 	if tag == "" {
 		tag = "OK"
+	}
+	// Invalidate plan cache after DDL so stale schema references are
+	// never reused by concurrent sessions. M0098-0005.
+	if _, isDDL := node.(*planner.DDL); isDDL && s.pc != nil {
+		s.pc.Invalidate()
 	}
 	return w.WriteCommandComplete(tag)
 }
@@ -462,6 +798,20 @@ func ddlTag(stmt parser.Stmt) string {
 		return "TRUNCATE TABLE"
 	case *parser.AlterTableStmt:
 		return "ALTER TABLE"
+	case *parser.CreateTypeStmt:
+		return "CREATE TYPE"
+	case *parser.AlterTypeStmt:
+		return "ALTER TYPE"
+	case *parser.DropTypeStmt:
+		return "DROP TYPE"
+	case *parser.CreateDomainStmt:
+		return "CREATE DOMAIN"
+	case *parser.DropDomainStmt:
+		return "DROP DOMAIN"
+	}
+	// CompatNoopStmt carries its own tag. M0097-0016.
+	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {
+		return ns.Tag
 	}
 	return "OK"
 }
@@ -483,17 +833,122 @@ func rowsAffected(op executor.Operator) int64 {
 	return 0
 }
 
+// appendFloat8Text formats a datum for wire output as a float8/float4 value.
+// Uses strconv.FormatFloat so large/small values display in scientific notation
+// (e.g. 1.2345678901234e+200) matching PostgreSQL's float8out behavior. M0097-0003.
+func appendFloat8Text(dst []byte, d executor.Datum) []byte {
+	if d.IsNull() {
+		return dst
+	}
+	// Convert datum to float64.
+	var f float64
+	switch d.Kind {
+	case executor.KindInt:
+		f = float64(d.Int)
+	case executor.KindString, executor.KindStringArena:
+		s := d.StringValue()
+		if parsed, err := strconv.ParseFloat(s, 64); err == nil {
+			f = parsed
+		} else {
+			// NaN / infinity / unparseable — return as-is.
+			return append(dst, s...)
+		}
+	default:
+		// KindNumeric: convert via text representation.
+		s := d.Format()
+		if parsed, err := strconv.ParseFloat(s, 64); err == nil {
+			f = parsed
+		} else {
+			return append(dst, s...)
+		}
+	}
+	// PostgreSQL's float8out uses %.15g (DBL_DIG = 15 significant digits).
+	// This handles: scientific notation for large/tiny values, decimal for normal,
+	// negative zero ("-0"), and avoids spurious scientific notation for integers.
+	return strconv.AppendFloat(dst, f, 'g', 15, 64)
+}
+
+// appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's
+// time output format: HH:MM:SS with optional fractional seconds up to the declared precision.
+// Precision 0 → "HH:MM:SS", precision N → "HH:MM:SS.ffffff" (N digits). M0097-0004.
+func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+	if d.IsNull() {
+		return dst
+	}
+	t := d.TimeValue()
+	h := t.Hour()
+	m := t.Minute()
+	s := t.Second()
+	ns := t.Nanosecond()
+	// 24:00:00 is stored as 1970-01-02 00:00:00 (next-day midnight).
+	if t.Day() == 2 && t.Month() == 1 && t.Year() == 1970 && h == 0 && m == 0 && s == 0 && ns == 0 {
+		return append(dst, "24:00:00"...)
+	}
+
+	dst = append(dst, byte('0'+h/10), byte('0'+h%10), ':',
+		byte('0'+m/10), byte('0'+m%10), ':',
+		byte('0'+s/10), byte('0'+s%10))
+
+	// Fractional seconds — only emit if non-zero or precision requested.
+	prec := 6 // default microseconds
+	if len(typ.Args) > 0 && typ.Args[0] >= 0 {
+		prec = int(typ.Args[0])
+	}
+	if prec > 0 && ns != 0 {
+		// Format up to 6 microsecond digits, then trim to declared precision.
+		micro := ns / 1000
+		frac := make([]byte, 6)
+		for i := 5; i >= 0; i-- {
+			frac[i] = byte('0' + micro%10)
+			micro /= 10
+		}
+		// Trim to declared precision.
+		if prec < 6 {
+			frac = frac[:prec]
+		}
+		// Strip trailing zeros after applying precision.
+		for len(frac) > 0 && frac[len(frac)-1] == '0' {
+			frac = frac[:len(frac)-1]
+		}
+		if len(frac) > 0 {
+			dst = append(dst, '.')
+			dst = append(dst, frac...)
+		}
+	}
+	return dst
+}
+
 // typeOIDFor maps a goopg type name to a pg_type.oid the wire
 // protocol can advertise. Unknown types fall back to text (25),
 // which is wire-compatible with libpq's text-format reader.
 func typeOIDFor(name string) uint32 {
 	switch strings.ToLower(name) {
-	case "int4", "integer", "int":
+	case "int2", "smallint", "smallserial":
+		return 21
+	case "int4", "integer", "int", "serial":
 		return 23
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial":
 		return 20
+	case "float4", "real":
+		return 700
+	case "float8", "double precision", "double":
+		return 701
 	case "bool", "boolean":
 		return 16
+	case "oid":
+		return 26
+	case "name":
+		return 19
+	case "uuid":
+		return 2950
+	case "date":
+		return 1082
+	case "time":
+		return 1083
+	case "timetz":
+		return 1266
+	case "interval":
+		return 1186
 	case "timestamp":
 		return 1114
 	case "timestamptz":
@@ -508,4 +963,97 @@ func typeOIDFor(name string) uint32 {
 		return 1700
 	}
 	return 25
+}
+
+// executeFetchAll executes a cursor's stored SELECT and emits
+// RowDescription + DataRow* + CommandComplete "FETCH N".
+// cursorName identifies which DECLARE in the stored SQL to use.
+// count < 0 means fetch all rows (used by FETCH ALL).
+func (s *Server) executeFetchAll(_ context.Context, w *protocol.FrameWriter, ectx *executor.Context, cursorSQL string, cursorName string, count int64) error {
+	// Extract the SELECT from the stored cursor SQL, matching by cursor name.
+	// The stored SQL may be the entire query batch containing multiple DECLAREs.
+	stmts, err := parser.Parse(cursorSQL)
+	if err != nil {
+		return s.writeQueryError(w, "26000", fmt.Sprintf("cursor query parse error: %v", err))
+	}
+	var selectStmt parser.Stmt
+	for _, st := range stmts {
+		if dc, ok := st.(*parser.DeclareCursorStmt); ok {
+			if strings.EqualFold(dc.Name, cursorName) {
+				selectStmt = dc.Query
+				break
+			}
+		}
+		if _, ok := st.(*parser.SelectStmt); ok {
+			selectStmt = st
+			break
+		}
+	}
+	if selectStmt == nil {
+		return s.writeQueryError(w, "26000", fmt.Sprintf("cursor \"%s\" query not found", cursorName))
+	}
+
+	node, err := planner.Plan(selectStmt, s.cfg.Catalog)
+	if err != nil {
+		code, msg := planErrorFields(err)
+		return s.writeQueryError(w, code, msg)
+	}
+	op, buildErr := executor.Build(node)
+	if buildErr != nil {
+		return s.writeQueryError(w, execErrCode(buildErr), execErrMsg(buildErr))
+	}
+	if openErr := op.Open(ectx); openErr != nil {
+		_ = op.Close()
+		return s.writeQueryError(w, execErrCode(openErr), execErrMsg(openErr))
+	}
+	defer func() { _ = op.Close() }()
+
+	schema := op.Schema()
+	if schema != nil {
+		fields := make([]protocol.FieldDescription, len(schema))
+		for i, sc := range schema {
+			fields[i] = protocol.FieldDescription{
+				Name:         sc.Name,
+				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeSize:     -1,
+				TypeModifier: -1,
+				Format:       0,
+			}
+		}
+		if err := w.WriteRowDescription(fields); err != nil {
+			return err
+		}
+	}
+
+	var rowCount int64
+	for {
+		if count >= 0 && rowCount >= count {
+			break
+		}
+		slot, nextErr := op.Next()
+		if nextErr == executor.EOF {
+			break
+		}
+		if nextErr != nil {
+			return s.writeQueryError(w, execErrCode(nextErr), execErrMsg(nextErr))
+		}
+		if schema != nil {
+			row := slot.Row()
+			cells, valueBuf := w.DataRowScratch(len(row))
+			for _, d := range row {
+				if d.IsNull() {
+					cells = append(cells, nil)
+					continue
+				}
+				start := len(valueBuf)
+				valueBuf = d.AppendValueText(valueBuf)
+				cells = append(cells, valueBuf[start:len(valueBuf)])
+			}
+			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
+				return err
+			}
+			rowCount++
+		}
+	}
+	return w.WriteCommandComplete(fmt.Sprintf("FETCH %d", rowCount))
 }

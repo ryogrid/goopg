@@ -60,9 +60,18 @@ help:
 	@echo "  PSQL_DBNAME=$(PSQL_DBNAME)"
 	@echo "  PSQL_USER=$(PSQL_USER)"
 
+# M0098-0007: default build uses GOAMD64=v3 and PGO (when default.pgo
+# exists) so every binary — development and benchmark — benefits from
+# the same optimisation tier. Override with GOAMD64=v1 for portability.
+GOAMD64 ?= v3
+
 build:
 	@mkdir -p "$(REPO_ROOT)/bin"
-	go build -o "$(GOOPG_BIN)" ./cmd/goopg
+	@if [ -f "$(REPO_ROOT)/default.pgo" ]; then \
+		GOAMD64=$(GOAMD64) go build -pgo="$(REPO_ROOT)/default.pgo" -o "$(GOOPG_BIN)" ./cmd/goopg; \
+	else \
+		GOAMD64=$(GOAMD64) go build -o "$(GOOPG_BIN)" ./cmd/goopg; \
+	fi
 
 init: build
 	@mkdir -p "$(dir $(DATA_DIR))"
@@ -157,8 +166,6 @@ ralph-state-guard:
 # in another terminal first; this target captures while the
 # tpch-runner is driving load.
 # ---------------------------------------------------------------
-
-GOAMD64 ?= v3
 
 bench-build:
 	@mkdir -p "$(REPO_ROOT)/tmp"

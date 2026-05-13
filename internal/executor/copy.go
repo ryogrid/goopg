@@ -1,7 +1,10 @@
 package executor
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -293,4 +296,47 @@ func rejectFileEndpoint(plan *planner.Copy) error {
 		return &ExecError{Code: "0A000", Pos: plan.Pos(), Message: "COPY to/from PROGRAM is not supported"}
 	}
 	return nil
+}
+
+// RunCopyFromFile implements server-side COPY table FROM 'filepath'.
+// It opens the file, reads tab-delimited text rows, and inserts them
+// using the same CopyFromExecutor path as COPY FROM STDIN.
+// The file must use PostgreSQL's COPY TEXT format (tab-separated, \N for NULL).
+func RunCopyFromFile(ctx *Context, plan *planner.Copy) (int64, error) {
+	if plan.Endpoint != planner.CopyEndpointFile || plan.Filename == "" {
+		return 0, &ExecError{Code: "XX000", Message: "RunCopyFromFile: not a file endpoint"}
+	}
+	if plan.Table == nil {
+		return 0, &ExecError{Code: "0A000", Pos: plan.Pos(), Message: "COPY FROM requires a target table"}
+	}
+	f, err := os.Open(plan.Filename)
+	if err != nil {
+		return 0, &ExecError{Code: "58P01", Pos: plan.Pos(),
+			Message: fmt.Sprintf("could not open file \"%s\" for reading: %s", plan.Filename, err)}
+	}
+	defer f.Close()
+
+	// Build a CopyFromExecutor directly (bypassing rejectFileEndpoint).
+	fe := &CopyFromExecutor{
+		ctx:  ctx,
+		plan: plan,
+		cols: plan.Table.Columns,
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if bytes.Equal(line, []byte(`\.`)) {
+			break
+		}
+		if err := fe.PushLine(line); err != nil {
+			return fe.rowsIn, err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fe.rowsIn, &ExecError{Code: "58030", Pos: plan.Pos(),
+			Message: fmt.Sprintf("error reading COPY file: %v", err)}
+	}
+	return fe.rowsIn, nil
 }

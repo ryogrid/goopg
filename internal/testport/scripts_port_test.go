@@ -67,9 +67,6 @@ func TestPort_Scripts080PgIsready(t *testing.T) {
 // Skip: goopg parser does not support the CLUSTER statement. Implement
 // CLUSTER in parser+executor (at minimum a no-op stub) and remove this skip.
 func TestPort_Scripts010Clusterdb(t *testing.T) {
-	t.Skip("CLUSTER statement not supported in goopg parser/executor; " +
-		"add parser+executor stub for CLUSTER before enabling")
-
 	if _, err := exec.LookPath("clusterdb"); err != nil {
 		t.Skip("clusterdb not in PATH")
 	}
@@ -117,9 +114,6 @@ func TestPort_Scripts010Clusterdb(t *testing.T) {
 //
 // Skip: requires CLUSTER SQL support (same as 010) and multi-database awareness.
 func TestPort_Scripts011ClusterdbAll(t *testing.T) {
-	t.Skip("CLUSTER statement not supported in goopg parser/executor; " +
-		"add parser+executor stub for CLUSTER before enabling")
-
 	if _, err := exec.LookPath("clusterdb"); err != nil {
 		t.Skip("clusterdb not in PATH")
 	}
@@ -149,9 +143,6 @@ func TestPort_Scripts011ClusterdbAll(t *testing.T) {
 // Skip: goopg parser does not support CREATE DATABASE. Add
 // CREATE DATABASE to the parser and a stub executor entry before enabling.
 func TestPort_Scripts020Createdb(t *testing.T) {
-	t.Skip("CREATE DATABASE not supported in goopg parser/executor; " +
-		"add parser+executor stub for CREATE DATABASE before enabling")
-
 	if _, err := exec.LookPath("createdb"); err != nil {
 		t.Skip("createdb not in PATH")
 	}
@@ -195,9 +186,6 @@ func TestPort_Scripts020Createdb(t *testing.T) {
 // the parser and a stub executor entry before enabling. Auth integration
 // (WritePGAuth) may be used for actual user creation.
 func TestPort_Scripts040Createuser(t *testing.T) {
-	t.Skip("CREATE ROLE/USER not supported in goopg parser/executor; " +
-		"add parser+executor stub for CREATE ROLE before enabling")
-
 	if _, err := exec.LookPath("createuser"); err != nil {
 		t.Skip("createuser not in PATH")
 	}
@@ -245,9 +233,6 @@ func TestPort_Scripts040Createuser(t *testing.T) {
 // Skip: goopg parser does not support DROP DATABASE. Also requires CREATE
 // DATABASE to pre-create the target. Add both to parser+executor before enabling.
 func TestPort_Scripts050Dropdb(t *testing.T) {
-	t.Skip("DROP DATABASE not supported in goopg parser/executor; " +
-		"add CREATE DATABASE + DROP DATABASE parser+executor stubs before enabling")
-
 	if _, err := exec.LookPath("dropdb"); err != nil {
 		t.Skip("dropdb not in PATH")
 	}
@@ -287,9 +272,6 @@ func TestPort_Scripts050Dropdb(t *testing.T) {
 // Skip: goopg parser does not support DROP ROLE/USER. Also requires CREATE ROLE
 // to pre-create the target. Add both to parser+executor before enabling.
 func TestPort_Scripts070Dropuser(t *testing.T) {
-	t.Skip("DROP ROLE/USER not supported in goopg parser/executor; " +
-		"add CREATE ROLE + DROP ROLE parser+executor stubs before enabling")
-
 	if _, err := exec.LookPath("dropuser"); err != nil {
 		t.Skip("dropuser not in PATH")
 	}
@@ -332,9 +314,6 @@ func TestPort_Scripts070Dropuser(t *testing.T) {
 // parser+executor (at minimum a no-op stub for DATABASE / TABLE forms) before
 // enabling. Full relfilenode tracking requires storage-layer support.
 func TestPort_Scripts090Reindexdb(t *testing.T) {
-	t.Skip("REINDEX statement not supported in goopg parser/executor; " +
-		"add parser+executor stub for REINDEX before enabling")
-
 	if _, err := exec.LookPath("reindexdb"); err != nil {
 		t.Skip("reindexdb not in PATH")
 	}
@@ -360,9 +339,6 @@ func TestPort_Scripts090Reindexdb(t *testing.T) {
 // Skip: requires REINDEX SQL support (same as 090) plus multi-database
 // awareness for --all.
 func TestPort_Scripts091ReindexdbAll(t *testing.T) {
-	t.Skip("REINDEX statement not supported in goopg parser/executor; " +
-		"also requires multi-database support for --all; enable after 090")
-
 	if _, err := exec.LookPath("reindexdb"); err != nil {
 		t.Skip("reindexdb not in PATH")
 	}
@@ -403,10 +379,6 @@ func TestPort_Scripts091ReindexdbAll(t *testing.T) {
 // and additional pg_class columns for the table-discovery catalog query
 // vacuumdb issues when no --table is specified.
 func TestPort_Scripts100Vacuumdb(t *testing.T) {
-	t.Skip("vacuumdb sends VACUUM (SKIP_DATABASE_STATS, ...) parenthesized syntax " +
-		"not yet supported in goopg parser; extend parseVacuum() for parenthesized " +
-		"options and add pg_catalog.pg_namespace catalog view before enabling")
-
 	if _, err := exec.LookPath("vacuumdb"); err != nil {
 		t.Skip("vacuumdb not in PATH")
 	}
@@ -478,9 +450,6 @@ func TestPort_Scripts100Vacuumdb(t *testing.T) {
 // Skip: requires both VACUUM parenthesized syntax (see 100) and multi-database
 // support (pg_database iteration) for --all.
 func TestPort_Scripts101VacuumdbAll(t *testing.T) {
-	t.Skip("vacuumdb --all requires VACUUM parenthesized syntax + pg_database " +
-		"multi-database support; enable after 100 and after multi-database is implemented")
-
 	if _, err := exec.LookPath("vacuumdb"); err != nil {
 		t.Skip("vacuumdb not in PATH")
 	}
@@ -508,9 +477,6 @@ func TestPort_Scripts101VacuumdbAll(t *testing.T) {
 // Skip: same VACUUM parenthesized syntax blocker as 100. The --analyze-in-stages
 // path also depends on pg_catalog.pg_class query support. Enable after 100.
 func TestPort_Scripts102VacuumdbStages(t *testing.T) {
-	t.Skip("vacuumdb --analyze-in-stages requires VACUUM parenthesized syntax; " +
-		"enable after TestPort_Scripts100Vacuumdb is unblocked")
-
 	if _, err := exec.LookPath("vacuumdb"); err != nil {
 		t.Skip("vacuumdb not in PATH")
 	}

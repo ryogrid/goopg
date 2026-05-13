@@ -92,6 +92,18 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwUnlogged:     KwCatUnreserved,
 	KwProcedure:    KwCatUnreserved,
 	KwCall:         KwCatUnreserved,
+	KwFreeze:       KwCatUnreserved,
+	KwAny:          KwCatUnreserved,
+	KwParallel:     KwCatUnreserved,
+	KwReindex:      KwCatUnreserved,
+	KwCluster:      KwCatUnreserved,
+	KwPrepare:      KwCatUnreserved,
+	KwExecute:      KwCatUnreserved,
+	KwDeallocate:   KwCatUnreserved,
+	KwMerge:        KwCatUnreserved,
+	KwMatched:      KwCatUnreserved,
+	KwTrigger:      KwCatUnreserved,
+	KwCheck:        KwCatUnreserved,
 
 	// goopg-specific (no upstream equivalent) — treated as unreserved.
 	KwConstant: KwCatUnreserved,
@@ -124,6 +136,8 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwOuter:   KwCatTypeFunc,
 	KwIs:      KwCatTypeFunc,
 	KwLike:    KwCatTypeFunc,
+	KwIlike:   KwCatTypeFunc,
+	KwLateral: KwCatTypeFunc,
 
 	// ── reserved ────────────────────────────────────────────────────────
 	// Explicitly listed for documentation; the map fallback would handle them

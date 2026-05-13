@@ -131,9 +131,12 @@ func (*IntervalLit) exprNode()  {}
 // ExtractExpr mirrors parser.ExtractExpr. Field is the
 // lower-cased calendar component the executor switches on.
 type ExtractExpr struct {
-	pos    int
-	Field  string
-	Source Expr
+	pos            int
+	Field          string
+	Source         Expr
+	// SourceTypeName carries the declared type of Source (e.g. "time", "timestamp").
+	// The executor uses it to reject fields that are invalid for time-only types. M0097-0004.
+	SourceTypeName string
 }
 
 func (e *ExtractExpr) Pos() int { return e.pos }
@@ -175,6 +178,30 @@ type ExistsExpr struct {
 
 func (e *ExistsExpr) Pos() int { return e.pos }
 func (*ExistsExpr) exprNode()  {}
+
+// IsNullExpr mirrors parser.IsNullExpr after the operand has been planned.
+// Negated=true for IS NOT NULL. Always returns a boolean (never NULL itself).
+type IsNullExpr struct {
+	pos     int
+	Operand Expr
+	Negated bool
+}
+
+func (e *IsNullExpr) Pos() int { return e.pos }
+func (*IsNullExpr) exprNode()  {}
+
+// IsBoolExpr mirrors parser.IsBoolExpr after the operand has been planned.
+// IS [NOT] TRUE/FALSE/UNKNOWN. Always returns boolean. M0097-0003.
+type IsBoolExpr struct {
+	pos       int
+	Operand   Expr
+	TestTrue  bool
+	TestFalse bool
+	Negated   bool
+}
+
+func (e *IsBoolExpr) Pos() int { return e.pos }
+func (*IsBoolExpr) exprNode()  {}
 
 // SubqueryExpr mirrors parser.SubqueryExpr after the inner
 // SELECT has been planned. The executor opens / drains /
@@ -295,15 +322,33 @@ func (*ParamRef) exprNode()  {}
 //
 // M0073-0003: Op is now parser.OpCode (int8 enum), was
 // string. Mirror of parser.BinaryOp's field type.
+// ResultType is non-empty for arithmetic with typed result (e.g., "int2").
+// M0097-0003.
 type BinaryOp struct {
-	pos   int
-	Op    parser.OpCode
-	Left  Expr
-	Right Expr
+	pos        int
+	Op         parser.OpCode
+	Left       Expr
+	Right      Expr
+	ResultType string // non-empty for arithmetic with typed result (e.g., "int2")
 }
 
 func (e *BinaryOp) Pos() int { return e.pos }
 func (*BinaryOp) exprNode()  {}
+
+// CastExpr preserves the cast target type for type inference and runtime coercion.
+// v0's planner previously discarded cast targets (no-op); CastExpr retains the
+// TargetType so exprType() can return the declared type and the executor can
+// coerce values at runtime (e.g., string→bool, string→int2 with range check).
+// M0097-0003.
+type CastExpr struct {
+	pos        int
+	Operand    Expr
+	TargetType string // normalized lowercase type name (e.g., "int2", "bool")
+	SourceType string // operand's declared type — used by executor to pick rounding mode. M0097-0003.
+}
+
+func (e *CastExpr) Pos() int { return e.pos }
+func (*CastExpr) exprNode()  {}
 
 // UnaryOp — Op Operand.
 //
@@ -490,18 +535,24 @@ type AggregateCall struct {
 	Star     bool
 	Distinct bool
 	Type     catalog.Type
+	// Filter is the resolved FILTER (WHERE ...) predicate. M0097-0007.
+	Filter Expr
 }
 
 func (a AggregateCall) Pos() int { return a.pos }
 
 // Aggregate groups rows by GroupExprs and computes Aggs.
-// Output columns are [group exprs..., aggregate calls...].
+// Output columns are [group exprs..., aggregate calls..., passthrough cols...].
+// Passthrough holds expressions for columns that are functionally determined
+// by the GROUP BY key (e.g. non-key cols when GROUP BY covers a primary key).
+// The executor evaluates them from the first row of each group. M0097-0003.
 type Aggregate struct {
-	pos        int
-	Child      Node
-	GroupExprs []Expr
-	Aggs       []AggregateCall
-	schema     Schema
+	pos         int
+	Child       Node
+	GroupExprs  []Expr
+	Aggs        []AggregateCall
+	Passthrough []Expr
+	schema      Schema
 }
 
 func (n *Aggregate) Pos() int       { return n.pos }
@@ -654,6 +705,46 @@ type Values struct {
 func (n *Values) Pos() int       { return n.pos }
 func (n *Values) Output() Schema { return n.schema }
 
+// GenerateSeries produces a sequence of integer rows for
+// generate_series(start, stop[, step]) in the FROM clause.
+// M0096-0006.
+type GenerateSeries struct {
+	pos    int
+	Start  Expr
+	Stop   Expr
+	Step   Expr // nil means step=1
+	schema Schema
+}
+
+func (n *GenerateSeries) Pos() int       { return n.pos }
+func (n *GenerateSeries) Output() Schema { return n.schema }
+
+// PgInputErrorInfo implements pg_input_error_info(value, type) as a
+// set-returning function in the FROM clause. Returns 0 rows if the
+// input is valid, or 1 row with (message, detail, hint, sql_error_code)
+// if it is invalid. M0097-0003.
+type PgInputErrorInfo struct {
+	pos    int
+	Value  Expr
+	Type   Expr
+	schema Schema
+}
+
+func (n *PgInputErrorInfo) Pos() int       { return n.pos }
+func (n *PgInputErrorInfo) Output() Schema { return n.schema }
+
+// ScalarFuncScan returns a single row from a scalar function call used in
+// the FROM clause (e.g. `FROM parse_ident(...) AS a`). The function result
+// is returned as a single column named ColName with type ColType. M0097-0003.
+type ScalarFuncScan struct {
+	pos     int
+	Func    Expr
+	schema  Schema
+}
+
+func (n *ScalarFuncScan) Pos() int       { return n.pos }
+func (n *ScalarFuncScan) Output() Schema { return n.schema }
+
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed
 // receive NULL (or their declared default once defaults are wired).
@@ -686,6 +777,12 @@ const (
 	// LockStrengthForShare — `FOR SHARE`. Read-intent row lock.
 	// Mirrors upstream's LCS_FORSHARE.
 	LockStrengthForShare
+	// LockStrengthForNoKeyUpdate — `FOR NO KEY UPDATE`. Weaker write-intent
+	// lock; v0 maps to ForUpdate (M0096-0004 — key-level modes out of scope).
+	LockStrengthForNoKeyUpdate
+	// LockStrengthForKeyShare — `FOR KEY SHARE`. Weaker read-intent lock;
+	// v0 maps to ForShare (M0096-0004 — key-level modes out of scope).
+	LockStrengthForKeyShare
 )
 
 // LockWaitPolicy enumerates how a row-locking clause should
@@ -813,6 +910,48 @@ type Delete struct {
 func (n *Delete) Pos() int       { return n.pos }
 func (n *Delete) Output() Schema { return nil }
 
+// ── Merge plan node (M0096-0010) ─────────────────────────────────────────────
+
+// MergeActionKind mirrors parser.MergeActionKind without importing the parser.
+type MergeActionKind int
+
+const (
+	MergeActionUpdate MergeActionKind = iota + 1
+	MergeActionDelete
+	MergeActionInsert
+	// MergeActionDoNothing — WHEN … THEN DO NOTHING. M0097-0016.
+	MergeActionDoNothing
+)
+
+// MergeWhenClause is the planned form of one WHEN arm.
+type MergeWhenClause struct {
+	Matched   bool
+	Condition Expr // nil when no AND condition
+	Action    MergeActionKind
+
+	// UPDATE: parallel to target columns (nil = keep existing).
+	UpdateSet []Expr
+
+	// INSERT: InsertExprs are evaluated against the source row at runtime.
+	// InsertColIdx maps source → target column ordinals (same length).
+	// nil InsertExprs means DEFAULT VALUES.
+	InsertExprs  []Expr
+	InsertColIdx []int
+}
+
+// Merge is the plan node for MERGE INTO target USING source ON cond WHEN ….
+// Source is the planned USING clause. Target is the merge-target table.
+type Merge struct {
+	pos     int
+	Target  *catalog.Table
+	Source  Node            // USING clause scan
+	On      Expr            // join condition (source cols at offset len(Target.Columns))
+	Clauses []*MergeWhenClause
+}
+
+func (n *Merge) Pos() int       { return n.pos }
+func (n *Merge) Output() Schema { return nil }
+
 // DDL — passes the original parser DDL statement through to the
 // executor's DDL path. The planner doesn't decompose DDL further in
 // v0; the catalog is mutated as the executor runs the statement.
@@ -837,9 +976,10 @@ const (
 )
 
 type Transaction struct {
-	pos  int
-	Verb TransactionVerb
-	Name string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
+	pos            int
+	Verb           TransactionVerb
+	Name           string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
+	IsolationLevel string // for TxBegin: "read committed", "repeatable read", etc.; "" = session default
 }
 
 func (n *Transaction) Pos() int       { return n.pos }
@@ -949,14 +1089,30 @@ type SetOp struct {
 func (n *SetOp) Pos() int       { return n.pos }
 func (n *SetOp) Output() Schema { return n.Left.Output() }
 
+// Distinct eliminates duplicate rows from its child, implementing
+// SELECT DISTINCT. Deduplication uses the same rowKey hash as the
+// recursive UNION dedup path. M0097-0005.
+type Distinct struct {
+	pos    int
+	Child  Node
+	schema Schema
+}
+
+func (n *Distinct) Pos() int       { return n.pos }
+func (n *Distinct) Output() Schema { return n.schema }
+
 // RecursiveUnion implements a WITH RECURSIVE fixpoint (M0016-0004).
 // Anchor is the non-recursive initial SELECT; Recursive is the
 // recursive member referencing the CTE name via WorkTableScans.
+// When UnionAll is false, duplicate rows are suppressed at each
+// iteration step (UNION semantics); iteration stops when the new
+// working set contains no rows not already in the output.
 type RecursiveUnion struct {
 	pos       int
 	Anchor    Node
 	Recursive Node
 	schema    Schema
+	UnionAll  bool // true = UNION ALL (append all), false = UNION (dedup)
 }
 
 func (n *RecursiveUnion) Pos() int       { return n.pos }

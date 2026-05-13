@@ -3,7 +3,25 @@ package parser
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
+
+// tokenSlicePool recycles []Token backing arrays between calls to Parse.
+// Typical pgbench queries produce 10–20 tokens; pre-sizing to 64 avoids
+// any internal re-allocation for all but the most complex statements.
+// M0098-0006.
+var tokenSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]Token, 0, 64)
+		return &s
+	},
+}
+
+// parserPool recycles the 32-byte parser struct (tokens slice header + idx).
+// M0098-0006.
+var parserPool = sync.Pool{
+	New: func() any { return &parser{} },
+}
 
 // SyntaxError is the parser's structured error. Message mirrors
 // upstream's `syntax error at or near "TOKEN"` shape so psql users
@@ -29,27 +47,57 @@ func (e *SyntaxError) Error() string {
 // error so a caller passing `1 + 2; garbage` gets a clean
 // diagnostic.
 func ParseExpr(input string) (Expr, error) {
-	toks, err := Lex(input)
+	// Use pooled token slice to avoid per-call allocation. M0098-0006.
+	sp := tokenSlicePool.Get().(*[]Token)
+	toks, err := lexInto((*sp)[:0], input)
 	if err != nil {
+		*sp = toks
+		tokenSlicePool.Put(sp)
 		return nil, err
 	}
-	p := &parser{tokens: toks}
+	*sp = toks
+
+	p := parserPool.Get().(*parser)
+	p.tokens = toks
+	p.idx = 0
+
 	expr, err := p.parseExpr()
+	// Check trailing tokens BEFORE returning p to pool.
+	var trailingErr error
+	if err == nil && p.cur().Kind != TokenEOF {
+		trailingErr = p.errAtCur("unexpected trailing tokens after expression")
+	}
+	p.tokens = nil
+	parserPool.Put(p)
+	tokenSlicePool.Put(sp)
+
 	if err != nil {
 		return nil, err
 	}
-	if p.cur().Kind != TokenEOF {
-		return nil, p.errAtCur("unexpected trailing tokens after expression")
+	if trailingErr != nil {
+		return nil, trailingErr
 	}
 	return expr, nil
 }
 
 func Parse(input string) ([]Stmt, error) {
-	toks, err := Lex(input)
+	// Use pooled token slice to eliminate per-call []Token allocation.
+	// The token slice backing array is reused across calls; its lifetime
+	// ends when Parse returns (callers receive []Stmt, not []Token).
+	// M0098-0006.
+	sp := tokenSlicePool.Get().(*[]Token)
+	toks, err := lexInto((*sp)[:0], input)
 	if err != nil {
+		*sp = toks
+		tokenSlicePool.Put(sp)
 		return nil, err
 	}
-	p := &parser{tokens: toks}
+	*sp = toks
+
+	p := parserPool.Get().(*parser)
+	p.tokens = toks
+	p.idx = 0
+
 	var out []Stmt
 	for p.cur().Kind != TokenEOF {
 		// Empty statement (just `;`).
@@ -59,6 +107,9 @@ func Parse(input string) ([]Stmt, error) {
 		}
 		stmt, err := p.parseStatement()
 		if err != nil {
+			p.tokens = nil
+			parserPool.Put(p)
+			tokenSlicePool.Put(sp)
 			return nil, err
 		}
 		out = append(out, stmt)
@@ -69,9 +120,16 @@ func Parse(input string) ([]Stmt, error) {
 			continue
 		}
 		if p.cur().Kind != TokenEOF {
-			return nil, p.errAtCur("expected ';' or end of input")
+			err := p.errAtCur("expected ';' or end of input")
+			p.tokens = nil
+			parserPool.Put(p)
+			tokenSlicePool.Put(sp)
+			return nil, err
 		}
 	}
+	p.tokens = nil // clear reference before returning to pool
+	parserPool.Put(p)
+	tokenSlicePool.Put(sp)
 	return out, nil
 }
 
@@ -163,8 +221,11 @@ func (p *parser) acceptIdentKeyword(names ...string) bool {
 // parseStatement dispatches on the leading keyword.
 func (p *parser) parseStatement() (Stmt, error) {
 	t := p.cur()
-	if t.Kind != TokenKeyword {
+	if t.Kind != TokenKeyword && t.Kind != TokenIdent {
 		return nil, p.errAtCur("expected statement")
+	}
+	if t.Kind != TokenKeyword {
+		goto identLedStatement
 	}
 	switch t.Keyword {
 	case KwBegin:
@@ -181,6 +242,18 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseVacuum()
 	case KwAnalyze, KwAnalyse:
 		return p.parseAnalyze()
+	case KwReindex:
+		return p.parseReindex()
+	case KwCluster:
+		return p.parseCluster()
+	case KwMerge:
+		return p.parseMerge()
+	case KwPrepare:
+		return p.parsePrepare()
+	case KwExecute:
+		return p.parseExecute()
+	case KwDeallocate:
+		return p.parseDeallocate()
 	case KwShow:
 		return p.parseShow()
 	case KwSet:
@@ -214,6 +287,57 @@ func (p *parser) parseStatement() (Stmt, error) {
 	case KwCall:
 		p.advance()
 		return p.parseCallStatement(t.Pos)
+	case KwDo:
+		return p.parseDoBlock()
+	case KwDeclare:
+		return p.parseDeclareCursor()
+	}
+	// Identifier-led statements. M0097-0013.
+identLedStatement:
+	if t.Kind == TokenIdent {
+		switch strings.ToLower(t.Value) {
+		case "fetch":
+			return p.parseFetchCursor()
+		case "close":
+			return p.parseCloseCursor()
+		case "refresh":
+			p.advance()
+			return p.parseRefreshMatView(t.Pos)
+		case "grant", "revoke":
+			// GRANT/REVOKE — parse as a no-op CompatNoopStmt.
+			// The server's compatNoopCommandTag already handles these
+			// when they fail the parser; we also accept them here so
+			// they don't bubble up as parse errors when the server is
+			// running multi-statement batches.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value)}, nil
+		case "comment":
+			// COMMENT ON … — parse as a no-op.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: "COMMENT"}, nil
+		case "security":
+			// SECURITY LABEL … — parse as a no-op.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL"}, nil
+		}
 	}
 	return nil, p.errAtCur("unsupported statement")
 }
@@ -458,11 +582,101 @@ func (p *parser) parseCheckpoint() (Stmt, error) {
 	return &CheckpointStmt{pos: t.Pos}, nil
 }
 
-// parseBegin: BEGIN [WORK | TRANSACTION]
+// parseDoBlock: DO [ LANGUAGE lang ] $$ body $$ — anonymous PL/pgSQL block. M0097-0003.
+func (p *parser) parseDoBlock() (Stmt, error) {
+	t := p.advance() // consume DO
+	s := &DoStmt{pos: t.Pos, Language: "plpgsql"}
+	// Optional LANGUAGE clause before or after the body.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "language") {
+		p.advance()
+		lang, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		s.Language = strings.ToLower(identText(lang))
+	}
+	// Body: dollar-quoted string literal.
+	if p.cur().Kind != TokenStringLit {
+		return nil, p.errAtCur("expected dollar-quoted string for DO body")
+	}
+	s.Body = p.cur().Value
+	p.advance()
+	// Optional trailing LANGUAGE clause.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "language") {
+		p.advance()
+		if _, err := p.parseIdent(); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
+}
+
+// parseBegin: BEGIN [WORK | TRANSACTION] [transaction_mode ...]
+//
+// Accepted transaction modes (M0096-0002):
+//
+//	ISOLATION LEVEL {READ COMMITTED | READ UNCOMMITTED |
+//	                 REPEATABLE READ | SERIALIZABLE}
+//	READ {ONLY | WRITE}          — accepted, no-op for v0
+//	[NOT] DEFERRABLE             — accepted, no-op for v0
+//
+// Modes may appear in any order and repeat (last ISOLATION LEVEL wins).
 func (p *parser) parseBegin() (Stmt, error) {
 	t := p.advance() // BEGIN
+	s := &BeginStmt{pos: t.Pos}
 	_ = p.acceptKeyword(KwWork) || p.acceptKeyword(KwTransaction)
-	return &BeginStmt{pos: t.Pos}, nil
+	// Optional transaction modes.
+	for {
+		switch {
+		case p.acceptIdentKeyword("isolation"):
+			if !p.acceptIdentKeyword("level") {
+				return nil, p.errAtCur("expected LEVEL after ISOLATION")
+			}
+			level, err := p.parseIsolationLevelName()
+			if err != nil {
+				return nil, err
+			}
+			s.IsolationLevel = level
+		case p.acceptIdentKeyword("read"):
+			// READ ONLY / READ WRITE — accepted, no-op for v0.
+			_ = p.acceptIdentKeyword("only") || p.acceptIdentKeyword("write")
+		case p.acceptKeyword(KwNot):
+			_ = p.acceptIdentKeyword("deferrable")
+		case p.acceptIdentKeyword("deferrable"):
+			// no-op
+		default:
+			goto done
+		}
+	}
+done:
+	return s, nil
+}
+
+// parseIsolationLevelName parses one of the four SQL isolation level names
+// and returns the canonical lowercase form (matching mvcc.ParseIsolationLevel).
+// "read" must have been consumed when this is called from a context where READ
+// precedes COMMITTED/UNCOMMITTED; otherwise parse starts fresh.
+func (p *parser) parseIsolationLevelName() (string, error) {
+	switch {
+	case p.acceptIdentKeyword("read"):
+		switch {
+		case p.acceptIdentKeyword("committed"):
+			return "read committed", nil
+		case p.acceptIdentKeyword("uncommitted"):
+			return "read uncommitted", nil
+		default:
+			return "", p.errAtCur("expected COMMITTED or UNCOMMITTED after READ")
+		}
+	case p.acceptIdentKeyword("repeatable"):
+		if !p.acceptIdentKeyword("read") {
+			return "", p.errAtCur("expected READ after REPEATABLE")
+		}
+		return "repeatable read", nil
+	case p.acceptIdentKeyword("serializable"):
+		return "serializable", nil
+	default:
+		return "", p.errAtCur("expected isolation level name (READ COMMITTED, REPEATABLE READ, SERIALIZABLE, READ UNCOMMITTED)")
+	}
 }
 
 // parseCommit: COMMIT [WORK | TRANSACTION] | END [WORK | TRANSACTION]
@@ -521,18 +735,34 @@ func (p *parser) parseSavepointName() (string, error) {
 	return t.Value, nil
 }
 
-// parseVacuum: VACUUM [VERBOSE] [ANALYZE] [target [, target …]]
+// parseVacuum: VACUUM [(opt [, opt …])] [target [, target …]]
+// Accepts both legacy syntax (VACUUM [VERBOSE] [ANALYZE] [FULL] [FREEZE] …)
+// and PostgreSQL 9.0+ parenthesized syntax (VACUUM (SKIP_DATABASE_STATS, …) …).
 func (p *parser) parseVacuum() (Stmt, error) {
 	t := p.advance()
-	v := &VacuumStmt{pos: t.Pos}
-	for {
-		switch {
-		case p.acceptKeyword(KwVerbose):
-			v.Verbose = true
-		case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
-			v.Analyze = true
-		default:
-			goto targets
+	v := &VacuumStmt{pos: t.Pos, ParallelWorkers: -1}
+
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		// Parenthesized option list.
+		p.advance() // consume (
+		if err := p.parseVacuumOptionList(v); err != nil {
+			return nil, err
+		}
+	} else {
+		// Legacy syntax: VACUUM [VERBOSE] [ANALYZE] [FULL] [FREEZE]
+		for {
+			switch {
+			case p.acceptKeyword(KwVerbose):
+				v.Verbose = true
+			case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
+				v.Analyze = true
+			case p.acceptKeyword(KwFull):
+				v.Full = true
+			case p.acceptKeyword(KwFreeze):
+				v.Freeze = true
+			default:
+				goto targets
+			}
 		}
 	}
 targets:
@@ -547,11 +777,137 @@ targets:
 	return v, nil
 }
 
-// parseAnalyze: ANALYZE [VERBOSE] [target [, target …]]
+// parseVacuumOptionList parses the parenthesized option list for VACUUM.
+// Caller has already consumed the opening '('.
+func (p *parser) parseVacuumOptionList(v *VacuumStmt) error {
+	for {
+		switch {
+		case p.acceptKeyword(KwVerbose):
+			v.Verbose = true
+		case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
+			v.Analyze = true
+		case p.acceptKeyword(KwFull):
+			v.Full = true
+		case p.acceptKeyword(KwFreeze):
+			v.Freeze = true
+		case p.acceptIdentKeyword("disable_page_skipping"):
+			v.DisablePageSkipping = true
+		case p.acceptIdentKeyword("skip_database_stats"):
+			v.SkipDatabaseStats = true
+		case p.acceptIdentKeyword("only_database_stats"):
+			v.OnlyDatabaseStats = true
+		case p.acceptIdentKeyword("skip_locked"):
+			v.SkipLocked = true
+		case p.acceptIdentKeyword("index_cleanup"):
+			// INDEX_CLEANUP { TRUE | FALSE | AUTO }
+			if p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true") {
+				v.ForceIndexCleanup = true
+			} else if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoIndexCleanup = true
+			} else {
+				_ = p.acceptIdentKeyword("auto")
+			}
+		case p.acceptIdentKeyword("truncate"):
+			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoTruncate = true
+			} else {
+				_ = p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true")
+			}
+		case p.acceptIdentKeyword("process_main"):
+			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoProcessMain = true
+			} else {
+				_ = p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true")
+			}
+		case p.acceptIdentKeyword("process_toast"):
+			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
+				v.NoProcessToast = true
+			} else {
+				_ = p.acceptKeyword(KwTrue) || p.acceptIdentKeyword("true")
+			}
+		case p.acceptKeyword(KwParallel):
+			n, err := p.parseIntLit()
+			if err != nil {
+				return err
+			}
+			v.ParallelWorkers = int(n)
+		case p.acceptIdentKeyword("buffer_usage_limit"):
+			lit, err := p.parseStrLit()
+			if err != nil {
+				return err
+			}
+			v.BufferUsageLimit = lit
+		default:
+			return p.errAtCur("unrecognised VACUUM option")
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return p.errAtCur("expected ')'")
+	}
+	return nil
+}
+
+// parseIntLit consumes a TokenIntLit and returns its value.
+func (p *parser) parseIntLit() (int64, error) {
+	t := p.cur()
+	if t.Kind != TokenIntLit {
+		return 0, p.errAtCur("expected integer")
+	}
+	p.advance()
+	var n int64
+	for _, ch := range t.Value {
+		if ch < '0' || ch > '9' {
+			return 0, &SyntaxError{Pos: t.Pos, Message: "invalid integer: " + t.Value}
+		}
+		n = n*10 + int64(ch-'0')
+	}
+	return n, nil
+}
+
+// parseStrLit consumes a TokenStringLit and returns its (unquoted) value.
+func (p *parser) parseStrLit() (string, error) {
+	t := p.cur()
+	if t.Kind != TokenStringLit {
+		return "", p.errAtCur("expected string literal")
+	}
+	p.advance()
+	return t.Value, nil
+}
+
+// parseAnalyze: ANALYZE [(opt [, opt …])] [target [, target …]]
+// Accepts both legacy syntax (ANALYZE [VERBOSE] …)
+// and parenthesized syntax (ANALYZE (SKIP_LOCKED, …) …).
 func (p *parser) parseAnalyze() (Stmt, error) {
 	t := p.advance()
 	a := &AnalyzeStmt{pos: t.Pos}
-	if p.acceptKeyword(KwVerbose) {
+
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance() // consume (
+		for {
+			switch {
+			case p.acceptKeyword(KwVerbose):
+				a.Verbose = true
+			case p.acceptIdentKeyword("skip_locked"):
+				a.SkipLocked = true
+			case p.acceptIdentKeyword("buffer_usage_limit"):
+				_, err := p.parseStrLit()
+				if err != nil {
+					return nil, err
+				}
+			default:
+				return nil, p.errAtCur("unrecognised ANALYZE option")
+			}
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+	} else if p.acceptKeyword(KwVerbose) {
 		a.Verbose = true
 	}
 	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
@@ -621,6 +977,24 @@ func (p *parser) parseIdent() (Token, error) {
 	return Token{}, p.errAtCur("expected identifier")
 }
 
+// parseColumnAlias is like parseIdent but accepts ANY keyword token
+// as an alias when the caller has already consumed an explicit AS.
+// PostgreSQL allows `SELECT expr AS true`, `SELECT expr AS null`, etc.
+// when the alias is preceded by AS. M0097-0003.
+func (p *parser) parseColumnAlias() (Token, error) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenIdent, TokenQuotedIdent:
+		p.advance()
+		return t, nil
+	case TokenKeyword:
+		// After explicit AS, any keyword is valid as a column alias.
+		p.advance()
+		return t, nil
+	}
+	return Token{}, p.errAtCur("expected column alias after AS")
+}
+
 func identText(t Token) string {
 	// TokenIdent and TokenKeyword carry already-lowercased text;
 	// TokenQuotedIdent preserves its original case.
@@ -644,10 +1018,50 @@ func (p *parser) parseShow() (Stmt, error) {
 func (p *parser) parseSet() (Stmt, error) {
 	t := p.advance()
 	s := &SetStmt{pos: t.Pos}
+	isLocal := false
 	if p.acceptKeyword(KwLocal) {
 		s.Local = true
-	} else {
-		_ = p.acceptKeyword(KwSession)
+		isLocal = true
+	} else if p.acceptKeyword(KwSession) {
+		// SET SESSION AUTHORIZATION name — accept as no-op SetStmt.
+		// "authorization" is not a keyword in goopg so it parses as an ident.
+		if p.acceptIdentKeyword("authorization") {
+			// consume the role name (or DEFAULT)
+			if !p.acceptKeyword(KwDefault) {
+				_, _ = p.parseIdent()
+			}
+			s.Name = "session_authorization"
+			s.Default = true
+			return s, nil
+		}
+		// otherwise fall through: SET SESSION TRANSACTION ... handled below
+	}
+	// SET [LOCAL] TRANSACTION <mode> — intercept before generic GUC path.
+	// M0096-0002: supports ISOLATION LEVEL; other modes accepted as no-op.
+	if p.acceptKeyword(KwTransaction) {
+		st := &SetTransactionStmt{pos: t.Pos, Local: isLocal}
+		for {
+			switch {
+			case p.acceptIdentKeyword("isolation"):
+				if !p.acceptIdentKeyword("level") {
+					return nil, p.errAtCur("expected LEVEL after ISOLATION")
+				}
+				level, err := p.parseIsolationLevelName()
+				if err != nil {
+					return nil, err
+				}
+				st.IsolationLevel = level
+			case p.acceptIdentKeyword("read"):
+				_ = p.acceptIdentKeyword("only") || p.acceptIdentKeyword("write")
+			case p.acceptKeyword(KwNot):
+				_ = p.acceptIdentKeyword("deferrable")
+			case p.acceptIdentKeyword("deferrable"):
+			default:
+				goto setTxDone
+			}
+		}
+	setTxDone:
+		return st, nil
 	}
 	name, err := p.parseGUCName()
 	if err != nil {
@@ -673,6 +1087,367 @@ func (p *parser) parseSet() (Stmt, error) {
 	}
 	s.Value = val
 	return s, nil
+}
+
+// parseReindex parses REINDEX statements (M0095-0005).
+//
+// Syntax accepted:
+//
+//	REINDEX [(VERBOSE)] [CONCURRENTLY] {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM}
+//	  [IF EXISTS] name
+//
+// Executor stub: always succeeds without performing any index rebuild.
+func (p *parser) parseReindex() (Stmt, error) {
+	t := p.advance() // consume REINDEX
+	r := &ReindexStmt{pos: t.Pos}
+
+	// Optional parenthesized option list: REINDEX (VERBOSE) ...
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance() // consume (
+		for {
+			if p.acceptKeyword(KwVerbose) {
+				r.Verbose = true
+			} else if p.acceptIdentKeyword("tablespace") {
+				// TABLESPACE option: consume the tablespace name
+				_, _ = p.parseIdent()
+			} else {
+				break
+			}
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after REINDEX options")
+		}
+	}
+
+	// Optional CONCURRENTLY
+	if p.acceptIdentKeyword("concurrently") {
+		r.Concurrently = true
+	}
+
+	// Object type keyword (treated as identifiers to avoid keyword conflicts).
+	switch {
+	case p.acceptKeyword(KwIndex):
+		r.ObjectType = "INDEX"
+	case p.acceptKeyword(KwTable):
+		r.ObjectType = "TABLE"
+	case p.acceptIdentKeyword("database"):
+		r.ObjectType = "DATABASE"
+	case p.acceptIdentKeyword("schema"):
+		r.ObjectType = "SCHEMA"
+	case p.acceptIdentKeyword("system"):
+		r.ObjectType = "SYSTEM"
+	default:
+		return nil, p.errAtCur("expected INDEX, TABLE, DATABASE, SCHEMA, or SYSTEM after REINDEX")
+	}
+
+	// Optional IF EXISTS
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+	}
+
+	// Object name (possibly schema-qualified)
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	r.Name = name.String()
+	return r, nil
+}
+
+// parseCluster parses CLUSTER statements (M0095-0008).
+//
+// Syntax accepted:
+//
+//	CLUSTER [VERBOSE]
+//	CLUSTER [VERBOSE] tablename [USING indexname]
+//
+// Executor stub: CLUSTER without a table always succeeds.
+// CLUSTER with a table succeeds when the table exists, errors otherwise.
+func (p *parser) parseCluster() (Stmt, error) {
+	t := p.advance() // consume CLUSTER
+	c := &ClusterStmt{pos: t.Pos}
+
+	// Optional VERBOSE.
+	if p.acceptKeyword(KwVerbose) {
+		c.Verbose = true
+	}
+
+	// If the next token starts a statement terminator or is EOF, no table.
+	if p.cur().Kind == TokenEOF ||
+		(p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
+		return c, nil
+	}
+
+	// Parse table name (possibly schema-qualified).
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	c.Target = &name
+
+	// Optional USING indexname.
+	if p.acceptKeyword(KwUsing) {
+		idx, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		c.IndexName = identText(idx)
+	}
+
+	return c, nil
+}
+
+// parsePrepare: PREPARE name [(param_type, …)] AS query (M0096-0006)
+func (p *parser) parsePrepare() (Stmt, error) {
+	t := p.advance() // PREPARE
+	nameIdent, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	name := identText(nameIdent)
+	// Skip optional parameter type list: (type1, type2, …)
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance()
+		depth := 1
+		for depth > 0 && p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				depth++
+			} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				depth--
+			}
+			p.advance()
+		}
+	}
+	// Consume AS
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+		p.advance()
+	} else {
+		// Some clients omit AS, or use different spacing — try to continue.
+	}
+	// Parse the prepared query
+	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
+		return &PrepareStmt{pos: t.Pos, Name: name}, nil
+	}
+	query, err := p.parseStatement()
+	if err != nil {
+		return nil, err
+	}
+	return &PrepareStmt{pos: t.Pos, Name: name, Query: query}, nil
+}
+
+// parseExecute: EXECUTE name [(param, …)] (M0096-0006)
+func (p *parser) parseExecute() (Stmt, error) {
+	t := p.advance() // EXECUTE
+	nameIdent, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	name := identText(nameIdent)
+	var params []Expr
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance()
+		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
+			params, err = p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+	}
+	return &ExecuteStmt{pos: t.Pos, Name: name, Params: params}, nil
+}
+
+// parseDeallocate: DEALLOCATE [PREPARE] {name | ALL} (M0096-0006)
+func (p *parser) parseDeallocate() (Stmt, error) {
+	t := p.advance() // DEALLOCATE
+	_ = p.acceptKeyword(KwPrepare) // optional PREPARE keyword
+	name := ""
+	if p.acceptKeyword(KwAll) {
+		name = ""
+	} else {
+		nameIdent, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		name = identText(nameIdent)
+	}
+	return &DeallocateStmt{pos: t.Pos, Name: name}, nil
+}
+
+// parseMerge parses a MERGE INTO statement (M0096-0010).
+//
+// Syntax:
+//
+//	MERGE INTO target [AS alias]
+//	USING source [AS alias]
+//	ON condition
+//	WHEN MATCHED [AND cond] THEN { UPDATE SET … | DELETE }
+//	WHEN NOT MATCHED [AND cond] THEN INSERT [(cols)] VALUES (…)
+func (p *parser) parseMerge() (Stmt, error) {
+	t := p.advance() // consume MERGE
+	// Optional INTO
+	_ = p.acceptKeyword(KwInto)
+	stmt := &MergeStmt{pos: t.Pos}
+
+	// Target table with optional alias.
+	target, err := p.parseRangeVar()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Target = target
+
+	// USING source
+	if !p.acceptKeyword(KwUsing) && !p.acceptIdentKeyword("using") {
+		return nil, p.errAtCur("expected USING after MERGE INTO target")
+	}
+	source, err := p.parseRangeVar()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Source = source
+
+	// ON condition
+	if _, err := p.expectKeyword(KwOn); err != nil {
+		return nil, err
+	}
+	onCond, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	stmt.On = onCond
+
+	// One or more WHEN clauses.
+	for p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhen {
+		clause, err := p.parseMergeWhenClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Clauses = append(stmt.Clauses, clause)
+	}
+	// Optional RETURNING target_list (M0097-0016 — parsed but not executed).
+	if p.acceptKeyword(KwReturning) {
+		ret, err := p.parseTargetList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = ret
+	}
+	return stmt, nil
+}
+
+// parseMergeWhenClause parses one WHEN [NOT] MATCHED [BY SOURCE|TARGET] [AND cond] THEN action.
+// M0097-0016 adds DO NOTHING action and BY SOURCE/TARGET modifiers.
+func (p *parser) parseMergeWhenClause() (*MergeWhenClause, error) {
+	t := p.advance() // WHEN
+	clause := &MergeWhenClause{pos: t.Pos}
+
+	// NOT MATCHED [BY SOURCE|TARGET] or MATCHED
+	if p.acceptKeyword(KwNot) {
+		clause.Matched = false
+		if _, err := p.expectKeyword(KwMatched); err != nil {
+			return nil, err
+		}
+		// Optional BY SOURCE or BY TARGET (M0097-0016).
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwBy {
+			p.advance() // consume BY
+			if p.acceptIdentKeyword("source") {
+				clause.BySource = true
+			} else if p.acceptIdentKeyword("target") {
+				clause.ByTarget = true
+			}
+			// If neither, we already consumed BY — that's odd, but be tolerant.
+		}
+	} else if p.acceptKeyword(KwMatched) {
+		clause.Matched = true
+	} else {
+		return nil, p.errAtCur("expected MATCHED or NOT MATCHED after WHEN")
+	}
+
+	// Optional AND condition.
+	if p.acceptKeyword(KwAnd) {
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		clause.Condition = cond
+	}
+
+	// THEN
+	if _, err := p.expectKeyword(KwThen); err != nil {
+		return nil, err
+	}
+
+	// Action: UPDATE, DELETE, INSERT, or DO NOTHING.
+	switch {
+	case p.acceptKeyword(KwUpdate):
+		clause.Action = MergeActionUpdate
+		if _, err := p.expectKeyword(KwSet); err != nil {
+			return nil, err
+		}
+		assigns, err := p.parseAssignList()
+		if err != nil {
+			return nil, err
+		}
+		clause.UpdateAssigns = assigns
+
+	case p.acceptKeyword(KwDelete):
+		clause.Action = MergeActionDelete
+
+	case p.acceptKeyword(KwInsert):
+		clause.Action = MergeActionInsert
+		// Optional column list.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance()
+			cols, err := p.parseColumnNameList()
+			if err != nil {
+				return nil, err
+			}
+			clause.InsertColumns = cols
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')'")
+			}
+		}
+		// VALUES or DEFAULT VALUES.
+		if p.acceptKeyword(KwValues) {
+			if !p.acceptSymbol("(") {
+				return nil, p.errAtCur("expected '('")
+			}
+			vals, err := p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+			clause.InsertValues = vals
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')'")
+			}
+		} else if p.acceptKeyword(KwDefault) {
+			if _, err := p.expectKeyword(KwValues); err != nil {
+				return nil, err
+			}
+			// InsertValues remains nil to signal DEFAULT VALUES.
+		} else {
+			return nil, p.errAtCur("expected VALUES or DEFAULT VALUES after INSERT")
+		}
+
+	case p.acceptKeyword(KwDo):
+		// DO NOTHING (M0097-0016).
+		if _, err := p.expectKeyword(KwNothing); err != nil {
+			return nil, err
+		}
+		clause.Action = MergeActionDoNothing
+
+	default:
+		return nil, p.errAtCur("expected UPDATE, DELETE, INSERT, or DO NOTHING after THEN")
+	}
+
+	return clause, nil
 }
 
 // parseReset: RESET name | RESET ALL
@@ -751,4 +1526,108 @@ func (p *parser) parseSetValueAtoms() ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// ── Cursor DDL (M0097-0003) ─────────────────────────────────────────────────
+
+// parseDeclareCursor parses DECLARE name [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
+func (p *parser) parseDeclareCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume DECLARE
+
+	// cursor name (may be an identifier or unreserved keyword)
+	nameToken := p.cur()
+	if nameToken.Kind != TokenIdent && nameToken.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected cursor name after DECLARE")
+	}
+	name := nameToken.Value
+	p.advance()
+
+	// optional SCROLL / NO SCROLL
+	if p.acceptIdentKeyword("no") {
+		p.acceptIdentKeyword("scroll")
+	} else {
+		p.acceptIdentKeyword("scroll")
+	}
+
+	// CURSOR
+	if !p.acceptIdentKeyword("cursor") {
+		return nil, p.errAtCur("expected CURSOR")
+	}
+
+	// optional WITH/WITHOUT HOLD
+	if p.acceptIdentKeyword("with") || p.acceptIdentKeyword("without") {
+		p.acceptIdentKeyword("hold")
+	}
+
+	// FOR
+	if !p.acceptKeyword(KwFor) {
+		return nil, p.errAtCur("expected FOR in DECLARE CURSOR")
+	}
+
+	query, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	return &DeclareCursorStmt{pos: pos, Name: name, Query: query}, nil
+}
+
+// parseFetchCursor parses FETCH [FORWARD|BACKWARD] [ALL|n] [FROM|IN] cursor_name.
+func (p *parser) parseFetchCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "fetch"
+
+	count := int64(-1) // -1 = ALL
+	forward := true
+
+	// optional direction keyword
+	if p.acceptIdentKeyword("forward") {
+		forward = true
+	} else if p.acceptIdentKeyword("backward") || p.acceptIdentKeyword("prior") {
+		forward = false
+	}
+
+	// count: ALL or integer literal
+	if p.acceptKeyword(KwAll) {
+		count = -1
+	} else if p.cur().Kind == TokenIntLit {
+		var err error
+		count, err = p.parseIntLit()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// FROM or IN
+	if !p.acceptKeyword(KwFrom) {
+		p.acceptKeyword(KwIn)
+	}
+
+	// cursor name
+	nameToken := p.cur()
+	if nameToken.Kind != TokenIdent && nameToken.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected cursor name")
+	}
+	cursorName := nameToken.Value
+	p.advance()
+
+	return &FetchStmt{pos: pos, CursorName: cursorName, Count: count, Forward: forward}, nil
+}
+
+// parseCloseCursor parses CLOSE {cursor_name|ALL}.
+func (p *parser) parseCloseCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "close"
+
+	if p.acceptKeyword(KwAll) {
+		return &CloseStmt{pos: pos, Name: ""}, nil
+	}
+
+	nameToken := p.cur()
+	if nameToken.Kind != TokenIdent && nameToken.Kind != TokenKeyword {
+		return nil, p.errAtCur("expected cursor name or ALL")
+	}
+	name := nameToken.Value
+	p.advance()
+	return &CloseStmt{pos: pos, Name: name}, nil
 }

@@ -117,6 +117,11 @@ func (rb *ReorderBuffer) Append(xid storage.TransactionID, c Change) {
 // `commitLSN` is recorded by the caller's output plugin path; the
 // reorder buffer doesn't store it.
 //
+// Consecutive (ChangeDelete, ChangeInsert) pairs for the same
+// relation are folded into a single ChangeUpdate so the output
+// plugin emits a `U` message instead of separate `D` + `I` —
+// matching the upstream pgoutput behaviour for UPDATE (M0094-0002).
+//
 // Commit on an xid the buffer has never seen returns nil/0/false —
 // distinguishes "empty xact" (which v0 doesn't model, since the
 // first Append sets up the entry) from "unknown xid".
@@ -126,7 +131,38 @@ func (rb *ReorderBuffer) Commit(xid storage.TransactionID) ([]Change, uint64, bo
 		return nil, 0, false
 	}
 	delete(rb.txns, xid)
-	return t.changes, t.beginLSN, true
+	return foldChanges(t.changes), t.beginLSN, true
+}
+
+// foldChanges collapses consecutive (Delete, Insert) pairs on the
+// same relation into a single Update change. This converts the
+// executor's "DELETE old + INSERT new" UPDATE representation into
+// the unified ChangeUpdate that pgoutput's `U` message requires.
+func foldChanges(in []Change) []Change {
+	if len(in) < 2 {
+		return in
+	}
+	out := make([]Change, 0, len(in))
+	for i := 0; i < len(in); i++ {
+		if i+1 < len(in) &&
+			in[i].Kind == ChangeDelete &&
+			in[i+1].Kind == ChangeInsert &&
+			in[i].Rel == in[i+1].Rel {
+			out = append(out, Change{
+				Kind:     ChangeUpdate,
+				LSN:      in[i+1].LSN,
+				Rel:      in[i].Rel,
+				Block:    in[i+1].Block,
+				LineSlot: in[i+1].LineSlot,
+				OldTuple: in[i].OldTuple,
+				NewTuple: in[i+1].NewTuple,
+			})
+			i++ // consume the Insert too
+			continue
+		}
+		out = append(out, in[i])
+	}
+	return out
 }
 
 // Abort drops the queued changes for `xid` without emitting them.

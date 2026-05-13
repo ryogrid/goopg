@@ -22,6 +22,12 @@ func Build(plan planner.Node) (Operator, error) {
 	switch p := plan.(type) {
 	case *planner.Values:
 		return maybeInstrument(p, newValuesOp(p)), nil
+	case *planner.GenerateSeries:
+		return maybeInstrument(p, newGenerateSeriesOp(p)), nil
+	case *planner.PgInputErrorInfo:
+		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
+	case *planner.ScalarFuncScan:
+		return maybeInstrument(p, newScalarFuncScanOp(p)), nil
 	case *planner.CTEScan:
 		// CTEScan is a labeling wrap from M0016-0004 — Stage A
 		// inlines the CTE body under the wrap, so executing it
@@ -131,6 +137,12 @@ func Build(plan planner.Node) (Operator, error) {
 			return maybeInstrument(p, newUpsertOp(p, child)), nil
 		}
 		return maybeInstrument(p, newInsertOp(p, child)), nil
+	case *planner.Distinct:
+		child, err := Build(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newDistinctOp(p, child)), nil
 	case *planner.SetOp:
 		left, err := Build(p.Left)
 		if err != nil {
@@ -167,6 +179,8 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, op), nil
+	case *planner.Merge:
+		return maybeInstrument(p, newMergeOp(p)), nil
 	case *planner.MultiHashJoin:
 		children := make([]Operator, len(p.Tables))
 		for i, tbl := range p.Tables {
@@ -195,6 +209,12 @@ func Build(plan planner.Node) (Operator, error) {
 		}
 		if as, ok := p.Stmt.(*parser.AnalyzeStmt); ok {
 			return newAnalyzeOp(as), nil
+		}
+		if cs, ok := p.Stmt.(*parser.ClusterStmt); ok {
+			return newClusterOp(cs), nil
+		}
+		if st, ok := p.Stmt.(*parser.SetTransactionStmt); ok {
+			return newSetTransactionOp(st), nil
 		}
 		return newUtilityNoOp(p), nil
 	case *planner.Copy:

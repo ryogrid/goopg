@@ -122,11 +122,16 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 		startPos = beginTok.Pos
 	}
 	block := &Block{pos: startPos, Declarations: decls}
-	stmts, err := p.parseStmtList(parser.KwEnd)
+	// parseStmtList terminates at END or at "exception" identifier.
+	stmts, excBlock, err := p.parseStmtListWithException(parser.KwEnd)
 	if err != nil {
 		return nil, err
 	}
-	block.Statements = stmts
+	if excBlock != nil {
+		block.Statements = append(stmts, excBlock)
+	} else {
+		block.Statements = stmts
+	}
 	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
 		return nil, err
 	}
@@ -137,6 +142,99 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 		return nil, p.errAtCur("unexpected tokens after END")
 	}
 	return block, nil
+}
+
+// parseStmtListWithException parses statements until END or EXCEPTION.
+// If EXCEPTION is found, parses the handler blocks and returns them
+// as an *ExceptionBlock alongside the main statements. M0097-0012.
+func (p *bodyParser) parseStmtListWithException(terminators ...parser.Keyword) ([]Stmt, *ExceptionBlock, error) {
+	var stmts []Stmt
+Loop:
+	for {
+		t := p.cur()
+		if t.Kind == parser.TokenEOF {
+			return nil, nil, p.errAtCur("unexpected EOF (expected END)")
+		}
+		if t.Kind == parser.TokenKeyword {
+			for _, term := range terminators {
+				if t.Keyword == term {
+					break Loop
+				}
+			}
+		}
+		// Check for EXCEPTION (identifier).
+		if t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "exception") {
+			excBlock, err := p.parseExceptionBlock()
+			if err != nil {
+				return stmts, nil, err
+			}
+			return stmts, excBlock, nil
+		}
+		stmt, err := p.parseStmt()
+		if err != nil {
+			return nil, nil, err
+		}
+		stmts = append(stmts, stmt)
+	}
+	return stmts, nil, nil
+}
+
+// parseExceptionBlock parses EXCEPTION WHEN ... THEN ... (END handled by caller).
+// M0097-0012.
+func (p *bodyParser) parseExceptionBlock() (*ExceptionBlock, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "exception"
+	excBlk := &ExceptionBlock{pos: pos}
+	for {
+		t := p.cur()
+		// Stop at END (the caller will consume it).
+		if t.Kind == parser.TokenKeyword && t.Keyword == parser.KwEnd {
+			break
+		}
+		if t.Kind == parser.TokenEOF {
+			break
+		}
+		// Parse WHEN conditions THEN stmts.
+		if !(t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "when")) &&
+			!(t.Kind == parser.TokenKeyword && t.Keyword == parser.KwWhen) {
+			break
+		}
+		p.advance() // consume WHEN
+		// Collect condition names until THEN.
+		var conditions []string
+		for {
+			ct := p.cur()
+			if ct.Kind == parser.TokenKeyword && ct.Keyword == parser.KwThen {
+				p.advance()
+				break
+			}
+			if ct.Kind == parser.TokenEOF {
+				break
+			}
+			if ct.Kind == parser.TokenIdent || ct.Kind == parser.TokenKeyword {
+				if !strings.EqualFold(ct.Value, "or") {
+					conditions = append(conditions, ct.Value)
+				}
+			}
+			p.advance()
+		}
+		// Parse handler body until next WHEN or END.
+		handlerStmts, _, err := p.parseStmtListWithException(parser.KwEnd)
+		if err != nil {
+			return nil, err
+		}
+		// Check if stopped at WHEN (not END).
+		if ht := p.cur(); ht.Kind == parser.TokenKeyword && ht.Keyword == parser.KwEnd {
+			excBlk.Handlers = append(excBlk.Handlers, &ExceptionHandler{
+				Conditions: conditions, Body: handlerStmts,
+			})
+			break
+		}
+		excBlk.Handlers = append(excBlk.Handlers, &ExceptionHandler{
+			Conditions: conditions, Body: handlerStmts,
+		})
+	}
+	return excBlk, nil
 }
 
 // parseStmtList parses zero-or-more statements terminated by one
@@ -178,22 +276,49 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseWhile()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwFor:
 		return p.parseFor()
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwBegin:
+		return p.parseNestedBlock()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwPerform:
 		return p.parsePerform()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExit:
 		return p.parseExit()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:
 		return p.parseContinue()
+	// SQL DML statements embedded in PL/pgSQL body. M0096-0012.
+	case t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwInsert ||
+		t.Keyword == parser.KwUpdate || t.Keyword == parser.KwDelete ||
+		t.Keyword == parser.KwSelect):
+		return p.parseSQLStmt()
+	// RAISE [NOTICE|WARNING|ERROR|EXCEPTION] 'msg'. M0096-0012.
+	case t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "raise"):
+		return p.parseRaise()
 	case t.Kind == parser.TokenIdent:
-		// Stage A 4b: bare identifier at statement start is the
-		// assignment shape `target := value;`. Other identifier-
-		// led statements (PERFORM, label-prefixed loops) arrive
-		// in later slices and surface a specific Stage-A
-		// diagnostic from the assignment-parser when the `:=`
-		// isn't there.
+		// Stage A 4b: bare identifier at statement start.
+		// Handle: ident := value (assignment)
+		// Handle: ident.field = value (record field, treated as no-op expr for trigger OLD)
+		// Handle: ident.field.* (expansion — treated as SQL stmt)
 		return p.parseAssign()
 	}
-	return nil, p.errAtCur("unsupported PL/pgSQL statement (Stage A 4d accepts RETURN, assignment, IF, LOOP, and EXIT only)")
+	return nil, p.errAtCur("unsupported PL/pgSQL statement")
+}
+
+// parseNestedBlock parses a nested `BEGIN [stmts] [EXCEPTION ...] END ;`
+// sub-block statement. Returns a *Block. M0097-0003.
+func (p *bodyParser) parseNestedBlock() (*Block, error) {
+	beginPos := p.advance().Pos // consume BEGIN
+	stmts, excBlock, err := p.parseStmtListWithException(parser.KwEnd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+		return nil, p.errAtCur("expected END to close nested BEGIN block")
+	}
+	p.acceptSymbol(";")
+	block := &Block{pos: beginPos, Statements: stmts}
+	if excBlock != nil {
+		block.Statements = append(stmts, excBlock)
+	}
+	return block, nil
 }
 
 // parseLoop parses `LOOP stmts END LOOP ;`.
@@ -245,8 +370,9 @@ func (p *bodyParser) parseWhile() (*WhileStmt, error) {
 	return &WhileStmt{pos: whileTok.Pos, Cond: cond, Body: body}, nil
 }
 
-// parseFor parses `FOR var IN [REVERSE] lower..upper [BY step] LOOP stmts END LOOP ;`.
-func (p *bodyParser) parseFor() (*ForStmt, error) {
+// parseFor parses FOR loops: integer-range (`FOR var IN low..high`)
+// or query-based (`FOR rec IN SELECT ...`). M0097-0012 extended.
+func (p *bodyParser) parseFor() (Stmt, error) {
 	forTok, err := p.expectKeyword(parser.KwFor)
 	if err != nil {
 		return nil, err
@@ -259,6 +385,63 @@ func (p *bodyParser) parseFor() (*ForStmt, error) {
 		return nil, err
 	}
 	isReverse := p.acceptKeyword(parser.KwReverse)
+
+	// Determine if this is a query-based FOR (starts with SELECT, EXECUTE,
+	// or a subquery parenthesis) or an integer-range FOR (contains ..).
+	// Peek ahead: if the first real token is SELECT/EXECUTE/( it's a query FOR.
+	isQueryFor := false
+	if !isReverse {
+		t := p.cur()
+		if t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwSelect ||
+			t.Keyword == parser.KwInsert || t.Keyword == parser.KwUpdate ||
+			t.Keyword == parser.KwDelete || t.Keyword == parser.KwWith ||
+			t.Keyword == parser.KwExecute) {
+			isQueryFor = true
+		} else if t.Kind == parser.TokenSymbol && t.Value == "(" {
+			isQueryFor = true
+		}
+	}
+
+	if isQueryFor {
+		// FOR rec IN query LOOP stmts END LOOP;  M0097-0012.
+		sqlStart := p.cur().Pos
+		depth := 0
+		for p.cur().Kind != parser.TokenEOF {
+			t := p.cur()
+			if t.Kind == parser.TokenSymbol && t.Value == "(" {
+				depth++
+			} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
+				depth--
+			} else if t.Kind == parser.TokenKeyword && t.Keyword == parser.KwLoop && depth == 0 {
+				break
+			}
+			p.advance()
+		}
+		sqlEnd := p.cur().Pos
+		sqlText := strings.TrimSpace(p.src[sqlStart:sqlEnd])
+		p.advance() // LOOP
+		body, err := p.parseStmtList(parser.KwEnd)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(parser.KwEnd); err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(parser.KwLoop); err != nil {
+			return nil, p.errAtCur("expected END LOOP to close FOR statement")
+		}
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate FOR statement")
+		}
+		return &ForSelectStmt{
+			pos:  forTok.Pos,
+			Var:  varName,
+			SQL:  sqlText,
+			Body: body,
+		}, nil
+	}
+
+	// Integer-range FOR: FOR var IN [REVERSE] lower..upper [BY step] LOOP.
 	lower, err := p.scanExprTo("lower bound", func(t parser.Token) bool {
 		return t.Kind == parser.TokenOperator && t.Value == ".."
 	})
@@ -517,15 +700,27 @@ func (p *bodyParser) parseDeclaration() (*Declaration, error) {
 	return d, nil
 }
 
-// parseAssign parses `target := value ;`. The target is a bare
-// identifier (Stage A 4b scope — no record-field or array-element
-// assignment yet).
+// parseAssign parses `target := value;` or `target = value;`.
+// Also handles `ident.field = expr;` (trigger OLD/NEW field write — treated
+// as a no-op expression statement, since OLD is immutable). M0096-0012.
 func (p *bodyParser) parseAssign() (*AssignStmt, error) {
 	nameTok := p.advance()
-	if p.cur().Kind != parser.TokenOperator || p.cur().Value != ":=" {
-		return nil, p.errAtCur("expected ':=' after %q (Stage A 4b only supports RETURN and assignment)", nameTok.Value)
+	// Handle dotted target: `ident.field ...` — consume the dot and field,
+	// then treat the whole expression up to `;` as a no-op (field assignment
+	// to trigger records is silently dropped; OLD is immutable in PG too).
+	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "." {
+		return p.parseDottedExprStmt(nameTok.Pos)
 	}
-	p.advance() // :=
+	isAssign := false
+	if p.cur().Kind == parser.TokenOperator && p.cur().Value == ":=" {
+		isAssign = true
+	} else if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "=" {
+		isAssign = true
+	}
+	if !isAssign {
+		return nil, p.errAtCur("expected ':=' or '=' after %q", nameTok.Value)
+	}
+	p.advance() // := or =
 	expr, err := p.scanExprToSemicolon("assignment value")
 	if err != nil {
 		return nil, err
@@ -534,6 +729,114 @@ func (p *bodyParser) parseAssign() (*AssignStmt, error) {
 		return nil, p.errAtCur("expected ';' to terminate assignment")
 	}
 	return &AssignStmt{pos: nameTok.Pos, Target: nameTok.Value, Value: expr}, nil
+}
+
+// parseDottedExprStmt parses `ident.field [= expr] ;` as a no-op.
+// Used for trigger OLD.b = ... patterns that are valid PL/pgSQL syntax
+// but have no effect (OLD is immutable). M0096-0012.
+func (p *bodyParser) parseDottedExprStmt(pos int) (*AssignStmt, error) {
+	// Consume everything up to `;`.
+	for p.cur().Kind != parser.TokenEOF {
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+			p.advance()
+			break
+		}
+		p.advance()
+	}
+	// Return a no-op assign: `_plpgsql_noop := 0` (the target never exists in frame).
+	// The executor silently ignores assignment to unknown variables when noop is set.
+	return &AssignStmt{pos: pos, Target: "_plpgsql_noop", Value: &parser.IntegerConst{}}, nil
+}
+
+// parseSQLStmt captures an embedded SQL statement (INSERT / UPDATE / DELETE /
+// SELECT) up to the trailing `;` and stores it verbatim. M0096-0012.
+func (p *bodyParser) parseSQLStmt() (*SQLStmt, error) {
+	startPos := p.cur().Pos
+	depth := 0
+	for p.cur().Kind != parser.TokenEOF {
+		t := p.cur()
+		if t.Kind == parser.TokenSymbol && t.Value == "(" {
+			depth++
+		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
+			depth--
+		} else if t.Kind == parser.TokenSymbol && t.Value == ";" && depth == 0 {
+			endPos := t.Pos
+			p.advance() // consume `;`
+			sql := strings.TrimSpace(p.src[startPos:endPos])
+			return &SQLStmt{pos: startPos, SQL: sql}, nil
+		}
+		p.advance()
+	}
+	return nil, p.errAtCur("unterminated embedded SQL statement")
+}
+
+// parseRaise parses `RAISE [level] 'message' [, args...];`. M0096-0012.
+// Level defaults to "exception" when omitted.
+func (p *bodyParser) parseRaise() (*RaiseStmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "raise" ident
+	level := "exception"
+	conditionName := ""
+	// Optional level keyword or condition name.
+	if p.cur().Kind == parser.TokenIdent {
+		val := strings.ToLower(p.cur().Value)
+		isLevel := false
+		for _, lvl := range []string{"notice", "warning", "info", "log", "debug", "error", "exception"} {
+			if val == lvl {
+				isLevel = true
+				level = val
+				p.advance()
+				break
+			}
+		}
+		if !isLevel && val != "" {
+			// Condition name: RAISE condition_name [USING MESSAGE = 'text']
+			conditionName = val
+			p.advance()
+		}
+	}
+	// Consume everything to `;` (captures format string + USING clause).
+	msgStart := p.cur().Pos
+	for p.cur().Kind != parser.TokenEOF {
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+			msg := strings.TrimSpace(p.src[msgStart:p.cur().Pos])
+			p.advance()
+			// If USING MESSAGE = 'text', extract the message.
+			if conditionName != "" {
+				msg = extractRaiseUsingMessage(msg)
+			}
+			return &RaiseStmt{pos: pos, Level: level, Msg: msg, ConditionName: conditionName}, nil
+		}
+		p.advance()
+	}
+	return nil, p.errAtCur("unterminated RAISE statement")
+}
+
+// extractRaiseUsingMessage extracts the message text from `USING MESSAGE = 'text'`
+// or similar USING clauses in RAISE statements. M0097-0003.
+func extractRaiseUsingMessage(s string) string {
+	s = strings.TrimSpace(s)
+	// Pattern: USING MESSAGE = 'text'
+	lower := strings.ToLower(s)
+	if idx := strings.Index(lower, "using"); idx >= 0 {
+		rest := strings.TrimSpace(s[idx+5:])
+		lowerRest := strings.ToLower(rest)
+		if strings.HasPrefix(lowerRest, "message") {
+			rest = strings.TrimSpace(rest[7:])
+			if strings.HasPrefix(rest, "=") {
+				rest = strings.TrimSpace(rest[1:])
+				if len(rest) >= 2 && rest[0] == '\'' {
+					// Strip surrounding single quotes.
+					end := strings.LastIndexByte(rest, '\'')
+					if end > 0 {
+						return strings.ReplaceAll(rest[1:end], "''", "'")
+					}
+				}
+				return rest
+			}
+		}
+	}
+	return s
 }
 
 // parseTypeRef captures a SQL type spec — `name` or `schema.name`,
@@ -579,7 +882,18 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 			consume()
 		}
 	}
-	src := p.src[startPos:endPos]
+	// Save endPos before consuming array suffix — the SQL parser doesn't
+	// support `text[]` notation, so we parse the base type only. M0097-0003.
+	baseEndPos := endPos
+	// Array suffix: text[] — consume '[]' pairs from token stream but exclude
+	// from the source fed to the SQL type parser.
+	for p.cur().Kind == parser.TokenSymbol && p.cur().Value == "[" {
+		p.advance() // '['
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "]" {
+			p.advance() // ']'
+		}
+	}
+	src := p.src[startPos:baseEndPos]
 	stmts, err := parser.Parse("CREATE TABLE _t (_c " + src + ")")
 	if err != nil {
 		return parser.ColumnType{}, p.errAt(startPos, "type %q: %v", src, err)

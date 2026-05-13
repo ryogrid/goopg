@@ -16,6 +16,7 @@ type PlanError struct {
 	Pos     int
 	Code    string
 	Message string
+	Hint    string // optional hint message (emitted as 'H' field in wire protocol)
 }
 
 func (e *PlanError) Error() string {
@@ -51,13 +52,22 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 			return nil, toPlanError(err)
 		}
 		return planDelete(s, cat)
+	case *parser.MergeStmt:
+		return planMerge(s, cat)
 
 	case *parser.CreateTableStmt, *parser.DropTableStmt,
 		*parser.CreateIndexStmt, *parser.DropIndexStmt,
 		*parser.CreateViewStmt, *parser.DropViewStmt,
 		*parser.TruncateStmt, *parser.AlterTableStmt,
 		*parser.CreateFunctionStmt, *parser.DropFunctionStmt,
-		*parser.CreateProcedureStmt, *parser.DropProcedureStmt:
+		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
+		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
+		*parser.DropCompatStmt,
+		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
+		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
+		*parser.CompatNoopStmt,
+		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
+		*parser.CreateDomainStmt, *parser.DropDomainStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
@@ -68,8 +78,12 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		// docs/design/0008-0003-publication-subscription-ddl.md.
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
+	case *parser.DoStmt:
+		// DO $$ body $$ — anonymous PL/pgSQL block. M0097-0003.
+		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
+
 	case *parser.BeginStmt:
-		return &Transaction{pos: s.Pos(), Verb: TxBegin}, nil
+		return &Transaction{pos: s.Pos(), Verb: TxBegin, IsolationLevel: s.IsolationLevel}, nil
 	case *parser.CommitStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxCommit}, nil
 	case *parser.RollbackStmt:
@@ -82,7 +96,10 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &Transaction{pos: s.Pos(), Verb: TxRollbackTo, Name: s.Name}, nil
 
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
-		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt:
+		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
+		*parser.ReindexStmt, *parser.ClusterStmt,
+		*parser.SetTransactionStmt,
+		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CheckpointStmt:
@@ -114,7 +131,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 
 func toPlanError(err error) error {
 	if ae, ok := err.(*analyzer.AnalyzeError); ok {
-		return &PlanError{Pos: ae.Pos, Code: ae.Code, Message: ae.Message}
+		return &PlanError{Pos: ae.Pos, Code: ae.Code, Message: ae.Message, Hint: ae.Hint}
 	}
 	return err
 }
@@ -157,6 +174,16 @@ type rangeBinding struct {
 	// `<target>.col` accidentally match the excluded side.
 	// Mirrors the analyzer's scopeRel.qualifiedOnly.
 	qualifiedOnly bool
+	// blockOriginalName makes using the underlying table's catalog name
+	// (rather than the alias) a hard error. Set in DELETE when an explicit
+	// alias is provided: "DELETE FROM t AS a WHERE t.col" must fail.
+	// M0097-0003.
+	blockOriginalName bool
+	// usingHidden lists column names that are hidden from unqualified lookup
+	// because they were supplied in a JOIN USING clause and the left table's
+	// column is the canonical reference. Prevents "column is ambiguous" errors
+	// when both join sides have the same column name. M0097-0003.
+	usingHidden []string
 	// sourceIdx is a per-FROM-clause monotonic identifier
 	// (M0071-0009) propagated into SchemaColumn.SourceTableIdx
 	// for every column produced by this binding. Distinct values
@@ -257,13 +284,8 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		return &SetOp{pos: s.Pos(), Left: left, Right: right, All: true}, nil
 	}
-	if s.Distinct {
-		return nil, &PlanError{
-			Pos:     s.Pos(),
-			Code:    "0A000",
-			Message: "DISTINCT is not supported in v0 planner",
-		}
-	}
+	// s.Distinct is handled by wrapping the final plan with a Distinct node
+	// after all other processing. See the wrapping below. M0097-0005.
 
 	isSimpleSingle := len(s.From) == 1 && (len(s.FromExprs) == 0 || (len(s.FromExprs) == 1 && len(s.FromExprs[0].Joins) == 0))
 
@@ -518,6 +540,58 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Constant-degenerate-aggregate optimization: when the aggregate has no
+	// GROUP BY, no aggregate calls, all SELECT targets are constants, and the
+	// HAVING is a constant expression, skip the table scan entirely and return
+	// a constant result (0 or 1 rows). This matches PostgreSQL's plan for
+	// SELECT 1 FROM t WHERE expr HAVING 1<2 (comment "not scanning the table").
+	// M0097-0003.
+	if agg != nil && win == nil {
+		// Find the innermost aggregate node (may be wrapped in HAVING Filter).
+		var innerAgg *Aggregate
+		if a, ok := node.(*Aggregate); ok {
+			innerAgg = a
+		} else if f, ok := node.(*Filter); ok {
+			if a, ok2 := f.Child.(*Aggregate); ok2 {
+				innerAgg = a
+			}
+		}
+		if innerAgg != nil && len(innerAgg.GroupExprs) == 0 && len(innerAgg.Aggs) == 0 {
+			allConst := true
+			for _, t := range targets {
+				if !isConstantPlanExpr(t) {
+					allConst = false
+					break
+				}
+			}
+			if allConst {
+				// Evaluate HAVING at plan time.
+				emitRow := true // default: no HAVING → 1 row
+				if s.Having != nil {
+					// Find the HAVING expression from the filter wrapper.
+					var havingExpr Expr
+					if f, ok := node.(*Filter); ok {
+						havingExpr = f.Predicate
+					}
+					if havingExpr != nil && isConstantPlanExpr(havingExpr) {
+						result, ok := evalConstantBool(havingExpr)
+						if ok {
+							emitRow = result
+						}
+					}
+				}
+				if emitRow {
+					// One empty-row source so Project evaluates the constant targets once.
+					emptyRow := make([]Expr, 0)
+					constSource := &Values{pos: s.Pos(), Rows: [][]Expr{emptyRow}, schema: Schema{}}
+					return &Project{pos: s.Pos(), Child: constSource, Targets: targets, schema: schema}, nil
+				}
+				// HAVING is constant-false → 0 rows.
+				emptySource := &Values{pos: s.Pos(), Rows: nil, schema: Schema{}}
+				return &Project{pos: s.Pos(), Child: emptySource, Targets: targets, schema: schema}, nil
+			}
+		}
+	}
 	proj := &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}
 	// Promote to IndexOnlyScan (M0046-0004) only when there are no locking
 	// clauses. FOR UPDATE / FOR SHARE rely on the IndexScan leaf being
@@ -564,6 +638,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
 	foldPlanConstants(out)
+	// SELECT DISTINCT: wrap the full plan with a Distinct node that deduplicates
+	// on the projected output. Applied after sorting so ORDER BY is respected.
+	// M0097-0005.
+	if s.Distinct {
+		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+	}
 	return out, nil
 }
 
@@ -606,9 +686,9 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 
 func lockStrengthFromParser(s parser.LockStrength) LockStrength {
 	switch s {
-	case parser.LockStrengthForUpdate:
+	case parser.LockStrengthForUpdate, parser.LockStrengthForNoKeyUpdate:
 		return LockStrengthForUpdate
-	case parser.LockStrengthForShare:
+	case parser.LockStrengthForShare, parser.LockStrengthForKeyShare:
 		return LockStrengthForShare
 	}
 	return LockStrengthForUpdate
@@ -729,11 +809,27 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 		*nextSourceIdx++
 		rightBinding.offset = len(leftCtx.schema)
+		// For JOIN USING / NATURAL JOIN, collect the shared column names so we
+		// can hide them from unqualified lookup in the MERGED context (preventing
+		// "column is ambiguous"). We do NOT set usingHidden on rightBinding itself
+		// because rightCtx (used by buildUsingPredicate) still needs to resolve
+		// those column names against the right table. M0097-0003.
+		usingCols := j.Using
+		if j.Natural {
+			usingCols = naturalJoinColumns(leftCtx, newResolveContext([]rangeBinding{rightBinding}, rightNode.Output()))
+		}
 
 		rightCtx := newResolveContext([]rangeBinding{rightBinding}, appendSchema(leftCtx.schema, rightNode.Output()))
+		// Build a separate right binding for the merged context with usingHidden set.
+		// This hides the right-side copy of USING columns from unqualified lookup
+		// while rightCtx (above) retains full access for the join predicate.
+		mergedRightBinding := rightBinding
+		if len(usingCols) > 0 {
+			mergedRightBinding.usingHidden = append([]string(nil), usingCols...)
+		}
 		mergedBindings := make([]rangeBinding, 0, len(leftCtx.bindings)+1)
 		mergedBindings = append(mergedBindings, leftCtx.bindings...)
-		mergedBindings = append(mergedBindings, rightBinding)
+		mergedBindings = append(mergedBindings, mergedRightBinding)
 		mergedSchema := appendSchema(leftCtx.schema, rightNode.Output())
 		mergedCtx := newResolveContext(mergedBindings, mergedSchema)
 
@@ -845,6 +941,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 	if rv.Subquery != nil {
 		return planSubqueryRangeVar(rv, cat, sourceIdx)
 	}
+	if rv.TableFunc != nil {
+		return planTableFuncRangeVar(rv, cat, sourceIdx)
+	}
 	// CTE substitution (M0016-0002): an unschemed name takes the
 	// CTE before falling through to the catalog. CTE names are
 	// unschemed in upstream so `pg_catalog.foo` always hits the
@@ -874,6 +973,17 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 			Pos:     rv.Pos(),
 			Code:    "42P01",
 			Message: fmt.Sprintf("relation %q does not exist", rv.Name),
+		}
+	}
+	// Validate column alias count when provided: AS t(c1, c2, ...).
+	// PostgreSQL raises an error if the number of column aliases does not match
+	// the actual table column count. M0097-0003.
+	if len(rv.Columns) > 0 && len(rv.Columns) != len(tbl.Columns) {
+		return nil, rangeBinding{}, &PlanError{
+			Pos:  rv.Pos(),
+			Code: "42P01",
+			Message: fmt.Sprintf("table %q has %d columns available but %d columns specified",
+				rv.Alias, len(tbl.Columns), len(rv.Columns)),
 		}
 	}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
@@ -941,6 +1051,57 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 	if tbl.Virtual {
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
 	}
+	// Partition-aware scan (M0096-0007): when scanning a partitioned table,
+	// produce a union of SeqScans over all partition children.
+	if len(tbl.PartitionKey) > 0 {
+		if im, ok := cat.(*catalog.InMemory); ok {
+			children := im.PartitionChildren(tbl.OID)
+			if len(children) > 0 {
+				// Build a UNION ALL of SeqScans over all children.
+				var root Node
+				for _, child := range children {
+					childSchema := tableSchemaWithSource(b.table, sourceIdx)
+					childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
+					if root == nil {
+						root = childScan
+					} else {
+						root = &SetOp{
+							pos:   rv.Pos(),
+							Left:  root,
+							Right: childScan,
+							All:   true,
+						}
+					}
+				}
+				if root != nil {
+					return root, b, nil
+				}
+			}
+		}
+	}
+	// Inheritance-aware scan (M0096-0009): when scanning a table that has
+	// inheritance children, produce a UNION ALL of SeqScans over the parent
+	// AND all children.  Unlike partitioned tables (where the parent has no
+	// rows), an inherited parent may itself contain rows, so the parent scan
+	// is always included first.
+	if im, ok := cat.(*catalog.InMemory); ok {
+		children := im.InheritanceChildren(tbl.OID)
+		if len(children) > 0 {
+			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
+			var root Node = parentScan
+			for _, child := range children {
+				childSchema := tableSchemaWithSource(b.table, sourceIdx)
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
+				root = &SetOp{
+					pos:   rv.Pos(),
+					Left:  root,
+					Right: childScan,
+					All:   true,
+				}
+			}
+			return root, b, nil
+		}
+	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
 }
 
@@ -969,6 +1130,53 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 	return &Values{pos: pos, Rows: rows, schema: schema}
 }
 
+// planValuesSubquery plans a `(VALUES (r1), (r2), ...) AS alias (col1, col2)`
+// subquery in the FROM clause. The column names come from the alias column list
+// or from synthetic names like "column1", "column2". M0097-0003.
+func planValuesSubquery(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	rows := rv.Subquery.ValuesRows
+	if len(rows) == 0 {
+		return nil, rangeBinding{}, &PlanError{Pos: rv.Pos(), Code: "0A000", Message: "VALUES must have at least one row"}
+	}
+	nCols := len(rows[0])
+	ctx := &resolveContext{} // no column refs allowed in VALUES
+	planRows := make([][]Expr, len(rows))
+	for i, row := range rows {
+		if len(row) != nCols {
+			return nil, rangeBinding{}, &PlanError{Pos: rv.Pos(), Code: "42601",
+				Message: fmt.Sprintf("VALUES row %d has wrong number of columns: expected %d, got %d", i+1, nCols, len(row))}
+		}
+		planRow := make([]Expr, nCols)
+		for j, e := range row {
+			r, err := resolveExpr(e, ctx)
+			if err != nil {
+				return nil, rangeBinding{}, err
+			}
+			planRow[j] = r
+		}
+		planRows[i] = planRow
+	}
+	// Build schema: use column alias list or synthetic names.
+	cols := make([]catalog.Column, nCols)
+	schema := make(Schema, nCols)
+	for i := 0; i < nCols; i++ {
+		var name string
+		if i < len(rv.Columns) && rv.Columns[i] != "" {
+			name = rv.Columns[i]
+		} else {
+			name = fmt.Sprintf("column%d", i+1)
+		}
+		// Type: use the type of the first row's expression.
+		typ := exprType(planRows[0][i])
+		cols[i] = catalog.Column{Name: name, Type: typ}
+		schema[i] = SchemaColumn{Name: name, Type: typ}
+	}
+	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
+	node := &Values{pos: rv.Pos(), Rows: planRows, schema: schema}
+	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 // planSubqueryRangeVar plans a `(SELECT …) AS alias` derived
 // table. The inner SELECT is planned with the same catalog so
 // nested derived tables / view refs / subqueries work; the
@@ -980,8 +1188,42 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 // the rangeBinding contract that downstream column resolution
 // uses.
 func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
+	// M0097-0003.
+	if len(rv.Subquery.ValuesRows) > 0 {
+		return planValuesSubquery(rv, sourceIdx)
+	}
 	inner, err := Plan(rv.Subquery, cat)
 	if err != nil {
+		// LATERAL subquery fallback: when the inner subquery references outer
+		// columns (correlated lateral reference) the planner fails with a
+		// "missing FROM-clause entry" error because the outer scope is not
+		// visible inside the derived table's separate Plan() call.
+		//
+		// For vacuumdb's specific use case the lateral subquery is:
+		//   CROSS JOIN LATERAL (SELECT c.relkind IN ('p', 'I')) as p (inherited)
+		// The `inherited` column is only used in --missing-stats-only queries,
+		// not in the basic vacuumdb run. We fall back to a single-row NULL plan
+		// so the CROSS JOIN produces one row per outer row (with inherited=NULL).
+		// This is safe: the WHERE clause for basic vacuumdb does not reference
+		// p.inherited so the final result set is correct.
+		if pe, ok := err.(*PlanError); ok && (pe.Code == "42P01" || pe.Code == "42703") &&
+			len(rv.Columns) > 0 {
+			nullRow := make([]Expr, len(rv.Columns))
+			for i := range nullRow {
+				nullRow[i] = &NullConst{}
+			}
+			cols := make([]catalog.Column, len(rv.Columns))
+			schema := make(Schema, len(rv.Columns))
+			for i, colName := range rv.Columns {
+				cols[i] = catalog.Column{Name: colName}
+				schema[i] = SchemaColumn{Name: colName}
+			}
+			inner = &Values{Rows: [][]Expr{nullRow}, schema: schema}
+			tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
+			b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
+			return inner, b, nil
+		}
 		return nil, rangeBinding{}, err
 	}
 	innerSchema := inner.Output()
@@ -1019,6 +1261,135 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
 	return inner, b, nil
+}
+
+// planTableFuncRangeVar plans a table-valued function in the FROM clause.
+// Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
+// are supported.
+func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if strings.EqualFold(tf.Name, "pg_input_error_info") {
+		return planPgInputErrorInfo(rv, sourceIdx)
+	}
+	if strings.EqualFold(tf.Name, "parse_ident") {
+		return planScalarFuncScan(rv, sourceIdx, "text[]")
+	}
+	if !strings.EqualFold(tf.Name, "generate_series") {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
+			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
+	}
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "generate_series requires 2 or 3 arguments"}
+	}
+	ctx := &resolveContext{}
+	start, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	stop, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var step Expr
+	if len(tf.Args) == 3 {
+		step, err = resolveExpr(tf.Args[2], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "generate_series"
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+		},
+	}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int8"}, SourceTableIdx: sourceIdx}}
+	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planScalarFuncScan plans a scalar function in FROM clause that returns one
+// row with a single column of the given colType. Used for parse_ident etc.
+func planScalarFuncScan(rv parser.RangeVar, sourceIdx int16, colType string) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = strings.ToLower(tf.Name)
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	ctx := &resolveContext{}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		pa, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, pa)
+	}
+	fc := &FuncCall{pos: tf.Pos(), Name: strings.ToLower(tf.Name), Args: args}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: colType}, SourceTableIdx: sourceIdx}}
+	tbl := &catalog.Table{
+		Name:    alias,
+		Columns: []catalog.Column{{Name: colName, Type: catalog.Type{Name: colType}, Ordinal: 0}},
+	}
+	node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgInputErrorInfo plans SELECT * FROM pg_input_error_info(value, type).
+// Returns a PgInputErrorInfo node with the standard 4-column output schema.
+// M0097-0003.
+func planPgInputErrorInfo(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) != 2 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "pg_input_error_info requires 2 arguments"}
+	}
+	ctx := &resolveContext{}
+	val, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	typ, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_input_error_info"
+	}
+	schema := Schema{
+		SchemaColumn{Name: "message", Type: catalog.Type{Name: "text"}},
+		SchemaColumn{Name: "detail", Type: catalog.Type{Name: "text"}},
+		SchemaColumn{Name: "hint", Type: catalog.Type{Name: "text"}},
+		SchemaColumn{Name: "sql_error_code", Type: catalog.Type{Name: "text"}},
+	}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: "message", Type: catalog.Type{Name: "text"}},
+			{Name: "detail", Type: catalog.Type{Name: "text"}},
+			{Name: "hint", Type: catalog.Type{Name: "text"}},
+			{Name: "sql_error_code", Type: catalog.Type{Name: "text"}},
+		},
+	}
+	node := &PgInputErrorInfo{pos: tf.Pos(), Value: val, Type: typ, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
 }
 
 func deriveSubqueryTargetName(e parser.Expr) string {
@@ -1181,6 +1552,8 @@ func exprSide(e Expr, leftWidth int) joinSide {
 		return mergeSides(exprSide(x.Left, leftWidth), exprSide(x.Right, leftWidth))
 	case *UnaryOp:
 		return exprSide(x.Operand, leftWidth)
+	case *CastExpr:
+		return exprSide(x.Operand, leftWidth)
 	case *FuncCall:
 		side := sideUnknown
 		for _, a := range x.Args {
@@ -1245,6 +1618,12 @@ type aggregateSurface struct {
 	groupByExpr     map[string]int
 	groupByInputCol map[int]int
 	aggregateByKey  map[string]aggregateBinding
+	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
+	// when functionally-determined passthrough columns are discovered.
+	node *Aggregate
+	// funcDepCols maps input column index → output schema index for columns
+	// that are functionally determined by the GROUP BY key. M0097-0003.
+	funcDepCols map[int]int
 }
 
 type windowBinding struct {
@@ -1268,7 +1647,9 @@ func needsAggregateStage(s *parser.SelectStmt) bool {
 			return true
 		}
 	}
-	if s.Having != nil && exprHasAggregate(s.Having) {
+	if s.Having != nil {
+		// HAVING without aggregates: degenerate aggregate — PostgreSQL still treats
+		// the whole table as a single group (SQL spec §7.11). M0097-0003.
 		return true
 	}
 	for _, sb := range s.OrderBy {
@@ -1510,6 +1891,10 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 			return walkExprForWindows(x.Else, fn)
 		}
 		return nil
+	case *parser.IsNullExpr:
+		return walkExprForWindows(x.Operand, fn)
+	case *parser.IsBoolExpr:
+		return walkExprForWindows(x.Operand, fn)
 	case *parser.InExpr:
 		if err := walkExprForWindows(x.Operand, fn); err != nil {
 			return err
@@ -1558,6 +1943,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		// expression — and the parserExprKey we record below —
 		// matches what the target list and ORDER BY look up.
 		g = resolveOrderBySubstitution(g, s.Targets)
+		// Positional GROUP BY that wasn't substituted → out-of-range position. M0097-0003.
+		if ic, ok := g.(*parser.IntegerConst); ok {
+			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42P10",
+				Message: fmt.Sprintf("GROUP BY position %d is not in select list", ic.Value)}
+		}
 		if exprHasAggregate(g) {
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42803", Message: "aggregate functions are not allowed in GROUP BY"}
 		}
@@ -1610,6 +2000,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		groupByExpr:     groupByExpr,
 		groupByInputCol: groupByInputCol,
 		aggregateByKey:  aggByKey,
+		node:            aggNode,
+		funcDepCols:     map[int]int{},
 	}
 
 	var having Expr
@@ -1622,9 +2014,84 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	return aggNode, outputCtx, surface, having, nil
 }
 
+// isConstantPlanExpr reports whether e can be evaluated without any row data.
+// Used by the constant-degenerate-aggregate optimization. M0097-0003.
+func isConstantPlanExpr(e Expr) bool {
+	switch x := e.(type) {
+	case *IntegerConst, *NumericConst, *StringConst, *BooleanConst, *NullConst, *TypedStringLit:
+		return true
+	case *BinaryOp:
+		return isConstantPlanExpr(x.Left) && isConstantPlanExpr(x.Right)
+	case *UnaryOp:
+		return isConstantPlanExpr(x.Operand)
+	case *CastExpr:
+		return isConstantPlanExpr(x.Operand)
+	case *IsBoolExpr:
+		return isConstantPlanExpr(x.Operand)
+	case *IsNullExpr:
+		return isConstantPlanExpr(x.Operand)
+	}
+	return false
+}
+
+// evalConstantBool evaluates a constant boolean expression at plan time.
+// Returns (result, ok=true) if evaluation succeeded, (false, false) if not constant. M0097-0003.
+func evalConstantBool(e Expr) (bool, bool) {
+	if b, ok := e.(*BooleanConst); ok {
+		return b.Value, true
+	}
+	if n, ok := e.(*IsNullExpr); ok {
+		if isConstantPlanExpr(n.Operand) {
+			_, isNull := n.Operand.(*NullConst)
+			result := isNull
+			if n.Negated {
+				result = !result
+			}
+			return result, true
+		}
+	}
+	if b, ok := e.(*BinaryOp); ok {
+		// Compare two integer constants at plan time.
+		li, lok := b.Left.(*IntegerConst)
+		ri, rok := b.Right.(*IntegerConst)
+		if lok && rok {
+			l, r := li.Value, ri.Value
+			switch b.Op {
+			case parser.OpLt:
+				return l < r, true
+			case parser.OpLe:
+				return l <= r, true
+			case parser.OpGt:
+				return l > r, true
+			case parser.OpGe:
+				return l >= r, true
+			case parser.OpEq:
+				return l == r, true
+			case parser.OpNe:
+				return l != r, true
+			}
+		}
+	}
+	return false, false
+}
+
+// isTextLikePlannerType returns true for string-like types that can be compared
+// with name type (implicitly cast to name for truncation). M0097-0003.
+func isTextLikePlannerType(name string) bool {
+	switch strings.ToLower(name) {
+	case "text", "varchar", "char", "bpchar", "character varying", "name", "unknown", "":
+		return true
+	}
+	return false
+}
+
 func groupExprName(e Expr) string {
 	if c, ok := e.(*ColumnRef); ok {
 		return c.Name
+	}
+	// FuncCall GROUP BY: use function name as column label (e.g. lower(c) → "lower"). M0097-0003.
+	if f, ok := e.(*FuncCall); ok && f.Name != "" {
+		return f.Name
 	}
 	return "?column?"
 }
@@ -1650,12 +2117,24 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return planInExpr(x, agg.input)
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, agg.input)
+	case *parser.IsNullExpr:
+		operand, err := resolveExpr(x.Operand, agg.input)
+		if err != nil {
+			return nil, err
+		}
+		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
+	case *parser.IsBoolExpr:
+		operand, err := resolveExpr(x.Operand, agg.input)
+		if err != nil {
+			return nil, err
+		}
+		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
 		if err != nil {
 			return nil, err
 		}
-		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src}, nil
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src, SourceTypeName: exprType(src).Name}, nil
 	case *parser.NullConst:
 		return &NullConst{pos: x.Pos()}, nil
 	case *parser.BooleanConst:
@@ -1672,10 +2151,45 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		col := resolved.(*ColumnRef)
 		idx, ok := agg.groupByInputCol[col.Index]
 		if !ok {
+			// Check if this column is functionally determined by the GROUP BY key.
+			// PostgreSQL SQL92 extension: when GROUP BY covers a primary key of some
+			// table, all other columns of that table are functionally determined and
+			// may appear in SELECT without being in GROUP BY or an aggregate. M0097-0003.
+			if outIdx, alreadyAdded := agg.funcDepCols[col.Index]; alreadyAdded {
+				return &ColumnRef{pos: x.Pos(), Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}, nil
+			}
+			if isColumnFunctionallyDetermined(col, agg) {
+				// Lazily add this column as a passthrough in the Aggregate node.
+				// The executor evaluates Passthrough expressions from the first row
+				// of each group and appends them to the output row.
+				outIdx := len(agg.node.schema)
+				sc := SchemaColumn{Name: col.Name, Type: col.Type, SourceTableIdx: col.SourceTableIdx}
+				agg.node.schema = append(agg.node.schema, sc)
+				agg.output.schema = append(agg.output.schema, sc)
+				// Passthrough expression references the child/input ColumnRef.
+				agg.node.Passthrough = append(agg.node.Passthrough, col)
+				agg.funcDepCols[col.Index] = outIdx
+				return &ColumnRef{pos: x.Pos(), Index: outIdx, Name: sc.Name, Type: sc.Type}, nil
+			}
+
+			// Include table qualifier in error message (PostgreSQL uses "table.col"). M0097-0003.
+			colName := col.Name
+			for _, b := range agg.input.bindings {
+				if b.sourceIdx == col.SourceTableIdx {
+					tbl := b.alias
+					if tbl == "" {
+						tbl = b.table.Name
+					}
+					if tbl != "" {
+						colName = tbl + "." + col.Name
+					}
+					break
+				}
+			}
 			return nil, &PlanError{
 				Pos:     x.Pos(),
 				Code:    "42803",
-				Message: fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", x.Column),
+				Message: fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", colName),
 			}
 		}
 		return &ColumnRef{pos: x.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
@@ -1688,7 +2202,12 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, nil
+		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
+		switch x.Op {
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+			node.ResultType = exprType(node).Name
+		}
+		return node, nil
 	case *parser.UnaryOp:
 		op, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
@@ -1696,8 +2215,13 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
-		// See resolveExpr: cast is a no-op in v0.
-		return resolveExprAfterAggregate(x.Operand, agg)
+		// M0097-0003: emit CastExpr so the executor can coerce at runtime.
+		operand, err := resolveExprAfterAggregate(x.Operand, agg)
+		if err != nil {
+			return nil, err
+		}
+		typeName := strings.ToLower(x.Type.Name)
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name}, nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
@@ -1764,7 +2288,12 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, nil
+		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
+		switch x.Op {
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
+			node.ResultType = exprType(node).Name
+		}
+		return node, nil
 	case *parser.UnaryOp:
 		op, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
@@ -1772,13 +2301,19 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.CastExpr:
-		return resolveExprAfterWindow(x.Operand, win)
+		// M0097-0003: emit CastExpr so the executor can coerce at runtime.
+		operand, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		typeName := strings.ToLower(x.Type.Name)
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExprAfterWindow(x.Source, win)
 		if err != nil {
 			return nil, err
 		}
-		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src}, nil
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src, SourceTypeName: exprType(src).Name}, nil
 	case *parser.CaseExpr:
 		out := &CaseExpr{pos: x.Pos()}
 		if x.Operand != nil {
@@ -1842,6 +2377,18 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return planInExpr(x, win.input)
 		}
 		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, List: list}, nil
+	case *parser.IsNullExpr:
+		operand, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
+	case *parser.IsBoolExpr:
+		operand, err := resolveExprAfterWindow(x.Operand, win)
+		if err != nil {
+			return nil, err
+		}
+		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
 	}
 	return resolveExprForWindowInput(e, win.input, win.agg)
 }
@@ -1921,6 +2468,10 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 		return walkExpr(x.Right, fn)
 	case *parser.UnaryOp:
 		return walkExpr(x.Operand, fn)
+	case *parser.IsNullExpr:
+		return walkExpr(x.Operand, fn)
+	case *parser.IsBoolExpr:
+		return walkExpr(x.Operand, fn)
 	case *parser.FuncCall:
 		if err := fn(x); err != nil {
 			return err
@@ -1935,8 +2486,29 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 }
 
 func isAggregateFunc(fc *parser.FuncCall) bool {
+	// Window functions (with OVER clause) are NOT aggregates.
+	if fc.Over != nil {
+		return false
+	}
 	switch strings.ToLower(fc.Name.Name) {
-	case "count", "sum", "avg", "min", "max":
+	case "count", "sum", "avg", "min", "max",
+		// Statistical aggregates (M0097-0007)
+		"var_pop", "var_samp", "variance",
+		"stddev_pop", "stddev_samp", "stddev",
+		"corr", "covar_pop", "covar_samp",
+		"regr_count", "regr_sxx", "regr_syy", "regr_sxy",
+		"regr_avgx", "regr_avgy", "regr_r2",
+		"regr_slope", "regr_intercept",
+		// Boolean aggregates
+		"bool_and", "bool_or", "every",
+		// Bitwise aggregates
+		"bit_and", "bit_or", "bit_xor",
+		// Miscellaneous aggregates
+		"string_agg", "array_agg", "json_agg", "jsonb_agg",
+		"json_object_agg", "jsonb_object_agg",
+		"xmlagg", "any_value",
+		// Ordered-set aggregates (only aggregate form, not window)
+		"percentile_cont", "percentile_disc", "mode":
 		return true
 	}
 	return false
@@ -1995,8 +2567,14 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 			Type:     catalog.Type{Name: "int8"},
 		}, nil
 	}
-	if len(fc.Args) != 1 {
-		return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("aggregate %s() requires exactly one argument", name)}
+	// Many aggregates accept 0 or more args; only enforce 1-arg for the
+	// core ones. Extended aggregates (M0097-0007) may have 2+ args.
+	if len(fc.Args) == 0 {
+		// Zero-arg aggregates like count(*) handled above; all others need args.
+		return AggregateCall{
+			pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
+			Type: catalog.Type{Name: "numeric"},
+		}, nil
 	}
 	argExpr, err := resolveExpr(fc.Args[0], inputCtx)
 	if err != nil {
@@ -2016,7 +2594,17 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 	case "min", "max":
 		outType = exprType(argExpr)
 	default:
-		return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("aggregate function %q is not supported", name)}
+		// Extended aggregates (M0097-0007): accept but return null/stub type.
+		outType = catalog.Type{Name: "numeric"}
+	}
+	// Resolve FILTER (WHERE ...) predicate if present.
+	var filterExpr Expr
+	if fc.Filter != nil {
+		var ferr error
+		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
+		if ferr != nil {
+			return AggregateCall{}, ferr
+		}
 	}
 	return AggregateCall{
 		pos:      fc.Pos(),
@@ -2024,6 +2612,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		Arg:      argExpr,
 		Distinct: fc.Distinct,
 		Type:     outType,
+		Filter:   filterExpr,
 	}, nil
 }
 
@@ -2045,7 +2634,9 @@ func parserExprKey(e parser.Expr) string {
 	case *parser.ParamRef:
 		return fmt.Sprintf("p:%d", x.Number)
 	case *parser.ColumnRef:
-		return "c:" + strings.ToLower(x.Schema) + "." + strings.ToLower(x.Table) + "." + strings.ToLower(x.Column)
+		// Use only the column name (not the table/schema qualifier) so that
+		// `lower(c)` and `lower(t.c)` resolve to the same GROUP BY key. M0097-0003.
+		return "c:" + strings.ToLower(x.Column)
 	case *parser.UnaryOp:
 		return "u:" + x.Op.String() + ":" + parserExprKey(x.Operand)
 	case *parser.BinaryOp:
@@ -2195,11 +2786,13 @@ func isConstantExpr(e Expr) bool {
 	switch x := e.(type) {
 	case *ColumnRef, *OuterColumnRef:
 		return false
-	case *SubqueryExpr, *ExistsExpr, *InExpr:
+	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr:
 		return false
 	case *BinaryOp:
 		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
 	case *UnaryOp:
+		return isConstantExpr(x.Operand)
+	case *CastExpr:
 		return isConstantExpr(x.Operand)
 	case *IntegerConst, *StringConst, *NumericConst,
 		*TypedStringLit, *IntervalLit,
@@ -2385,11 +2978,19 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 	// Map source-row column index -> target table column ordinal.
+	// Generated columns are excluded from the mapping when no explicit
+	// column list is provided — they are computed by the executor. M0096-0008.
 	var colIndex []int
 	if len(s.Columns) == 0 {
-		colIndex = make([]int, len(tbl.Columns))
-		for i := range tbl.Columns {
-			colIndex[i] = i
+		colIndex = make([]int, 0, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			if col.GeneratedAlways {
+				continue // skip generated columns; executor fills them in
+			}
+			colIndex = append(colIndex, i)
+		}
+		if len(colIndex) == len(tbl.Columns) {
+			// No generated columns — keep original 1:1 mapping for compatibility.
 		}
 	} else {
 		colIndex = make([]int, 0, len(s.Columns))
@@ -2405,32 +3006,42 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 			colIndex = append(colIndex, col.Ordinal)
 		}
 	}
-	// Validate row arity and build planner expressions.
-	if len(s.Rows) == 0 {
-		return nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "INSERT requires at least one row"}
-	}
-	rows := make([][]Expr, 0, len(s.Rows))
-	for _, r := range s.Rows {
-		if len(r) != len(colIndex) {
-			return nil, &PlanError{
-				Pos:     s.Pos(),
-				Code:    "42601",
-				Message: fmt.Sprintf("INSERT row has %d values, target expects %d", len(r), len(colIndex)),
-			}
+	// INSERT … SELECT: plan the SELECT and use it as the source.
+	var source Node
+	if s.Select != nil {
+		sel, err := planSelect(s.Select, cat)
+		if err != nil {
+			return nil, err
 		}
-		row := make([]Expr, 0, len(r))
-		ctx := &resolveContext{} // VALUES rows have no input columns
-		for _, e := range r {
-			pe, err := resolveExpr(e, ctx)
-			if err != nil {
-				return nil, err
-			}
-			row = append(row, pe)
+		source = sel
+	} else {
+		// Validate row arity and build planner expressions.
+		if len(s.Rows) == 0 {
+			return nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "INSERT requires at least one row"}
 		}
-		rows = append(rows, row)
+		rows := make([][]Expr, 0, len(s.Rows))
+		for _, r := range s.Rows {
+			if len(r) != len(colIndex) {
+				return nil, &PlanError{
+					Pos:     s.Pos(),
+					Code:    "42601",
+					Message: fmt.Sprintf("INSERT row has %d values, target expects %d", len(r), len(colIndex)),
+				}
+			}
+			row := make([]Expr, 0, len(r))
+			ctx := &resolveContext{} // VALUES rows have no input columns
+			for _, e := range r {
+				pe, err := resolveExpr(e, ctx)
+				if err != nil {
+					return nil, err
+				}
+				row = append(row, pe)
+			}
+			rows = append(rows, row)
+		}
+		source = &Values{pos: s.Pos(), Rows: rows, schema: insertValuesSchema(tbl, colIndex)}
 	}
-	values := &Values{pos: s.Pos(), Rows: rows, schema: insertValuesSchema(tbl, colIndex)}
-	insert := &Insert{pos: s.Pos(), Table: tbl, Source: values, ColumnIndex: colIndex}
+	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex}
 	if s.OnConflict != nil {
 		oc, err := planOnConflict(s.OnConflict, tbl, s.Target.Alias, cat)
 		if err != nil {
@@ -2671,6 +3282,11 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
 	ctx := singleBindingContext(tbl, s.Target.Alias)
+	// When an explicit alias is set, using the original table name in WHERE
+	// must produce the PostgreSQL-specific error. M0097-0003.
+	if s.Target.Alias != "" {
+		ctx.bindings[0].blockOriginalName = true
+	}
 	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
@@ -2690,6 +3306,133 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 	return &Delete{pos: s.Pos(), Table: tbl, Child: node}, nil
+}
+
+// planMerge converts a MERGE INTO statement into a Merge plan node.
+// M0096-0010.
+func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
+	if !ok {
+		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01",
+			Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
+	}
+
+	// Plan the USING source.
+	var srcIdx int16 = 2
+	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build a merged schema: target columns first, then source columns.
+	targetAlias := s.Target.Alias
+	if targetAlias == "" {
+		targetAlias = tbl.Name
+	}
+	n := len(tbl.Columns)
+	sourceSchema := sourceNode.Output()
+	if sourceSchema == nil && sourceBinding.table != nil {
+		sourceSchema = tableSchemaWithSource(sourceBinding.table, srcIdx)
+	}
+
+	targetBinding := rangeBinding{table: tbl, alias: targetAlias, offset: 0, sourceIdx: 1}
+	sourceBinding.offset = n
+
+	mergedSchema := make(Schema, 0, n+len(sourceSchema))
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 1)...)
+	mergedSchema = append(mergedSchema, sourceSchema...)
+	mergedCtx := newResolveContext([]rangeBinding{targetBinding, sourceBinding}, mergedSchema)
+	mergedCtx.cat = cat
+
+	// Source-only context for NOT MATCHED INSERT VALUES.
+	sourceOnly := newResolveContext([]rangeBinding{{
+		table: sourceBinding.table, alias: sourceBinding.alias,
+		offset: 0, sourceIdx: srcIdx,
+	}}, sourceSchema)
+	sourceOnly.cat = cat
+
+	onExpr, err := resolveExpr(s.On, mergedCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	clauses := make([]*MergeWhenClause, 0, len(s.Clauses))
+	for _, wc := range s.Clauses {
+		pc := &MergeWhenClause{
+			Matched: wc.Matched,
+			Action:  MergeActionKind(wc.Action),
+		}
+		if wc.Condition != nil {
+			cond, err := resolveExpr(wc.Condition, mergedCtx)
+			if err != nil {
+				return nil, err
+			}
+			pc.Condition = cond
+		}
+		switch wc.Action {
+		case parser.MergeActionUpdate:
+			set := make([]Expr, n)
+			for _, a := range wc.UpdateAssigns {
+				col, colOK := cat.LookupColumn(tbl, a.Column)
+				if !colOK {
+					return nil, &PlanError{Pos: a.Pos(), Code: "42703",
+						Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
+				}
+				expr, err := resolveExpr(a.Expr, mergedCtx)
+				if err != nil {
+					return nil, err
+				}
+				set[col.Ordinal] = expr
+			}
+			pc.UpdateSet = set
+		case parser.MergeActionDelete:
+			// nothing extra
+		case parser.MergeActionInsert:
+			ordinals, err := buildInsertColIdx(tbl, wc.InsertColumns, cat)
+			if err != nil {
+				return nil, &PlanError{Pos: wc.Pos(), Code: "42703", Message: err.Error()}
+			}
+			pc.InsertColIdx = ordinals
+			if wc.InsertValues != nil {
+				exprs := make([]Expr, len(wc.InsertValues))
+				for i, ve := range wc.InsertValues {
+					expr, err := resolveExpr(ve, sourceOnly)
+					if err != nil {
+						return nil, err
+					}
+					exprs[i] = expr
+				}
+				pc.InsertExprs = exprs
+			}
+		case parser.MergeActionDoNothing:
+			// DO NOTHING — no extra fields needed. M0097-0016.
+		}
+		clauses = append(clauses, pc)
+	}
+	return &Merge{pos: s.Pos(), Target: tbl, Source: sourceNode, On: onExpr, Clauses: clauses}, nil
+}
+
+// buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.
+// When names is empty, all non-generated columns are returned in declaration order.
+func buildInsertColIdx(tbl *catalog.Table, names []string, cat catalog.Catalog) ([]int, error) {
+	if len(names) == 0 {
+		out := make([]int, 0, len(tbl.Columns))
+		for i, c := range tbl.Columns {
+			if !c.GeneratedAlways {
+				out = append(out, i)
+			}
+		}
+		return out, nil
+	}
+	out := make([]int, 0, len(names))
+	for _, name := range names {
+		col, ok := cat.LookupColumn(tbl, name)
+		if !ok {
+			return nil, fmt.Errorf("column %q of relation %q does not exist", name, tbl.Name)
+		}
+		out = append(out, col.Ordinal)
+	}
+	return out, nil
 }
 
 // resolveTargets expands a parser target list into planner Expr's
@@ -2760,8 +3503,11 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 }
 
 // targetMeta picks the output name and type for a target. The alias
-// wins; otherwise we use the underlying ColumnRef's name; otherwise a
-// synthetic "?column?" matching upstream.
+// wins; otherwise we use the underlying ColumnRef's name; for function
+// calls we use the function name (matching upstream behaviour); for
+// TypedStringLit `type 'value'` uses the type name as the column label
+// (matching PostgreSQL's FigureColname() for typed literals); otherwise
+// a synthetic "?column?" matching upstream.
 func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if t.Alias != "" {
 		return t.Alias, exprType(e)
@@ -2769,7 +3515,70 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
 	}
+	// TypedStringLit `int2 'value'`: column name is the type name.
+	// Matches PostgreSQL's FigureColname() for `type 'string'` syntax. M0097-0003.
+	if tsl, ok := e.(*TypedStringLit); ok {
+		return tsl.Type, exprType(e)
+	}
+	// CastExpr `expr::type` or `CAST(expr AS type)`: use the type name as the
+	// column label for literal→type casts (e.g. 0::boolean → "bool").
+	// For column-ref casts (e.g. f1::int2), propagate the column's name.
+	// Matches PostgreSQL's FigureColname() logic. M0097-0003.
+	if cast, ok := e.(*CastExpr); ok {
+		if _, isCol := cast.Operand.(*ColumnRef); isCol {
+			innerName, _ := targetMeta(cast.Operand, t)
+			return innerName, exprType(e)
+		}
+		// For function-call casts (e.g. parse_ident(...)::name[]), propagate the
+		// function name as the column label (matches PostgreSQL's FigureColname). M0097-0003.
+		if _, isFuncCall := cast.Operand.(*FuncCall); isFuncCall {
+			innerName, _ := targetMeta(cast.Operand, t)
+			return innerName, exprType(e)
+		}
+		if cast.TargetType != "" {
+			// Use PostgreSQL's canonical short type names for column labels.
+			label := castTargetLabel(cast.TargetType)
+			return label, exprType(e)
+		}
+		innerName, _ := targetMeta(cast.Operand, t)
+		return innerName, exprType(e)
+	}
+	// Function call: use function name as the implicit column label.
+	// Matches PostgreSQL's FigureColname() logic for FuncCall nodes.
+	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
+		return fc.Name, exprType(e)
+	}
+	// CASE expression: PostgreSQL uses "case" as implicit column label.
+	// Matches FigureColname() returning "case" for CaseExpr nodes. M0097-0003.
+	if _, ok := e.(*CaseExpr); ok {
+		return "case", exprType(e)
+	}
+	// EXTRACT expression: PostgreSQL uses "extract" as the implicit column label.
+	// Matches FigureColname() for ExtractExpr nodes. M0097-0004.
+	if _, ok := e.(*ExtractExpr); ok {
+		return "extract", exprType(e)
+	}
 	return "?column?", exprType(e)
+}
+
+// castTargetLabel maps a cast target type name to the PostgreSQL column label
+// used for that type when the cast result has no explicit alias. M0097-0003.
+func castTargetLabel(t string) string {
+	switch t {
+	case "boolean":
+		return "bool"
+	case "integer":
+		return "int4"
+	case "bigint":
+		return "int8"
+	case "smallint":
+		return "int2"
+	case "real":
+		return "float4"
+	case "double precision":
+		return "float8"
+	}
+	return t
 }
 
 // exprType returns the planner-level type tag for an expression. v0
@@ -2789,6 +3598,17 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "bool"}
 	case *NullConst:
 		return catalog.Type{Name: "unknown"}
+	case *TypedStringLit:
+		// Typed string literals carry their explicit type (e.g. int2 '2').
+		// Return it so downstream type inference (BinaryOp etc.) can use it.
+		// M0097-0003.
+		return catalog.Type{Name: x.Type}
+	case *CastExpr:
+		// CastExpr carries the declared target type. M0097-0003.
+		if x.TargetType != "" {
+			return catalog.Type{Name: x.TargetType}
+		}
+		return exprType(x.Operand)
 	case *BinaryOp:
 		// Arithmetic on numeric promotes to numeric. Comparison /
 		// boolean ops return bool. String concat returns text. The
@@ -2800,11 +3620,30 @@ func exprType(e Expr) catalog.Type {
 		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod:
 			lt := exprType(x.Left)
 			rt := exprType(x.Right)
+			// Float types dominate: float8 > float4 > numeric > int*. M0097-0003.
+			isFloat := func(n string) bool {
+				s := strings.ToLower(n)
+				return s == "float8" || s == "double precision" || s == "double" ||
+					s == "float4" || s == "real" || s == "float"
+			}
+			if isFloat(lt.Name) || isFloat(rt.Name) {
+				// Wider float type wins.
+				if lt.Name == "float8" || lt.Name == "double precision" || lt.Name == "double" ||
+					rt.Name == "float8" || rt.Name == "double precision" || rt.Name == "double" {
+					return catalog.Type{Name: "float8"}
+				}
+				return catalog.Type{Name: "float4"}
+			}
 			if isNumericTypeName(lt.Name) || isNumericTypeName(rt.Name) {
 				return catalog.Type{Name: "numeric"}
 			}
-			if (lt.Name == "int8" || lt.Name == "int4") && (rt.Name == "int8" || rt.Name == "int4") {
+			if (lt.Name == "int8" || lt.Name == "bigint") && (rt.Name == "int8" || rt.Name == "bigint") {
 				return catalog.Type{Name: "int8"}
+			}
+			if isIntegerLikeType(lt.Name) && isIntegerLikeType(rt.Name) {
+				// int2/int4 arithmetic: follow PostgreSQL promotion rules.
+				// int2 op int2 → int2, int4 op int4 → int4, int2 op int4 → int4.
+				return promoteIntType(lt.Name, rt.Name)
 			}
 			return catalog.Type{Name: "unknown"}
 		case parser.OpConcat:
@@ -2851,6 +3690,14 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "text"}
 		case "date_part":
 			return catalog.Type{Name: "int8"}
+		case "gcd", "lcm", "abs", "mod", "div":
+			// These return integer; use int8 as generic integer type. M0097-0003.
+			return catalog.Type{Name: "int8"}
+		case "char_length", "character_length", "length", "octet_length",
+			"bit_length", "array_length", "array_upper", "array_lower",
+			"cardinality", "strpos", "position":
+			// String/array length functions return int4. M0097-0003.
+			return catalog.Type{Name: "int4"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}
@@ -2866,6 +3713,40 @@ func isNumericTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// isIntegerLikeType reports whether name is a fixed-width integer type
+// (int2, int4, int8) for the purpose of arithmetic type promotion.
+func isIntegerLikeType(name string) bool {
+	switch strings.ToLower(name) {
+	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint":
+		return true
+	}
+	return false
+}
+
+// promoteIntType returns the result type of an arithmetic operation between
+// two integer types, following PostgreSQL's promotion rules:
+// int2 op int2 → int2, int4 op int4 → int4, int2 op int4 → int4.
+// M0097-0003.
+func promoteIntType(a, b string) catalog.Type {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+	aIsSmall := a == "int2" || a == "smallint"
+	bIsSmall := b == "int2" || b == "smallint"
+	aIsInt4 := a == "int4" || a == "integer" || a == "int"
+	bIsInt4 := b == "int4" || b == "integer" || b == "int"
+	aIsInt8 := a == "int8" || a == "bigint"
+	bIsInt8 := b == "int8" || b == "bigint"
+	switch {
+	case aIsInt8 || bIsInt8:
+		return catalog.Type{Name: "int8"}
+	case aIsInt4 || bIsInt4:
+		return catalog.Type{Name: "int4"}
+	case aIsSmall && bIsSmall:
+		return catalog.Type{Name: "int2"}
+	}
+	return catalog.Type{Name: "int4"}
 }
 
 // planSubqueryExpr plans the SELECT inside a parser
@@ -3086,7 +3967,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src}, nil
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src, SourceTypeName: exprType(src).Name}, nil
 	case *parser.NullConst:
 		return &NullConst{pos: x.Pos()}, nil
 	case *parser.BooleanConst:
@@ -3106,7 +3987,26 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}, nil
+		// For comparisons involving a `name` type, coerce the non-name side
+		// to "name" so the executor truncates it to 63 chars (NAMEDATALEN-1),
+		// matching PostgreSQL's namecmp() semantics. M0097-0003.
+		switch x.Op {
+		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+			lt, rt := exprType(l), exprType(r)
+			if strings.EqualFold(lt.Name, "name") && !strings.EqualFold(rt.Name, "name") && isTextLikePlannerType(rt.Name) {
+				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}
+			} else if strings.EqualFold(rt.Name, "name") && !strings.EqualFold(lt.Name, "name") && isTextLikePlannerType(lt.Name) {
+				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "name"}
+			}
+		}
+		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
+		switch x.Op {
+		case parser.OpAdd, parser.OpSub, parser.OpMul, parser.OpDiv, parser.OpMod,
+			parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
+			// Set ResultType for overflow checking in the executor. M0097-0003.
+			node.ResultType = exprType(node).Name
+		}
+		return node, nil
 	case *parser.UnaryOp:
 		op, err := resolveExpr(x.Operand, ctx)
 		if err != nil {
@@ -3129,12 +4029,39 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
 	case *parser.CastExpr:
-		// v0 treats `expr::type` as a no-op — the executor doesn't yet
-		// enforce typing, and pgbench's `oid=$1::pg_catalog.regclass`
-		// shape just needs the operand expression to plan. The
-		// declared target type is preserved on the parser AST for
-		// future loops that wire up real type coercion.
-		return resolveExpr(x.Operand, ctx)
+		// M0097-0003: emit CastExpr so the executor can coerce at runtime.
+		operand, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		typeName := strings.ToLower(x.Type.Name)
+		srcType := exprType(operand).Name
+		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType}, nil
+	case *parser.IsNullExpr:
+		operand, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &IsNullExpr{pos: x.Pos(), Operand: operand, Negated: x.Negated}, nil
+	case *parser.IsBoolExpr:
+		// IS [NOT] TRUE/FALSE/UNKNOWN. M0097-0003.
+		operand, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
+	case *parser.ArraySubscriptExpr:
+		// expr[index] — array element access. Convert to array_subscript(base, index)
+		// so the executor can handle it without a new plan node type. M0097-0003.
+		base, err := resolveExpr(x.Base, ctx)
+		if err != nil {
+			return nil, err
+		}
+		idx, err := resolveExpr(x.Index, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &FuncCall{pos: x.Pos(), Name: "array_subscript", Args: []Expr{base, idx}}, nil
 	}
 	return nil, &PlanError{Pos: e.Pos(), Code: "0A000", Message: fmt.Sprintf("unsupported expression %T", e)}
 }
@@ -3173,15 +4100,26 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
 			if b.qualifiedOnly {
-				// Pseudo-tables (e.g. ON CONFLICT's
-				// `excluded`) reach name resolution only
-				// via their alias. See the matching
-				// analyzer-side comment in analyzer.go.
+				// Pseudo-tables (e.g. ON CONFLICT's `excluded`) reach name
+				// resolution only via their alias.
 				if b.alias != "" && strings.EqualFold(x.Table, b.alias) &&
 					(x.Schema == "" || strings.EqualFold(x.Schema, b.table.Schema)) {
 					matches = append(matches, b)
 				}
 				continue
+			}
+			// When blockOriginalName is set (DELETE FROM t AS a), using the
+			// original table name produces the PostgreSQL-compatible error with
+			// a hint. M0097-0003.
+			if b.blockOriginalName && b.alias != "" &&
+				strings.EqualFold(x.Table, b.table.Name) {
+				return nil, false, &PlanError{
+					Pos:  x.Pos(),
+					Code: "42712",
+					Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q",
+						b.table.Name),
+					Hint: fmt.Sprintf("Perhaps you meant to reference the table alias %q.", b.alias),
+				}
 			}
 			if bindingMatchesRelation(b, x.Table, x.Schema) {
 				matches = append(matches, b)
@@ -3218,6 +4156,18 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		}
 		for i, c := range b.table.Columns {
 			if !strings.EqualFold(c.Name, x.Column) {
+				continue
+			}
+			// Skip USING-hidden columns (right side of JOIN USING):
+			// the left table's column is the canonical one. M0097-0003.
+			hidden := false
+			for _, uh := range b.usingHidden {
+				if strings.EqualFold(uh, c.Name) {
+					hidden = true
+					break
+				}
+			}
+			if hidden {
 				continue
 			}
 			idx := b.offset + i
@@ -3344,11 +4294,14 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		return &cl
 	case *BinaryOp:
 		return &BinaryOp{
-			pos:   x.Pos(),
-			Op:    x.Op,
-			Left:  shiftColumnRefsBy(x.Left, delta),
-			Right: shiftColumnRefsBy(x.Right, delta),
+			pos:        x.Pos(),
+			Op:         x.Op,
+			Left:       shiftColumnRefsBy(x.Left, delta),
+			Right:      shiftColumnRefsBy(x.Right, delta),
+			ResultType: x.ResultType,
 		}
+	case *CastExpr:
+		return &CastExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TargetType: x.TargetType, SourceType: x.SourceType}
 	case *UnaryOp:
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: shiftColumnRefsBy(x.Operand, delta)}
 	case *FuncCall:
@@ -3376,4 +4329,60 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 	default:
 		return e
 	}
+}
+
+// isColumnFunctionallyDetermined reports whether col is functionally determined
+// by the aggregate's GROUP BY key via a primary key or unique-not-null index.
+//
+// PostgreSQL SQL92 extension: if all columns of a PK/unique-not-null index on
+// col's source table appear in the GROUP BY clause, then every other column of
+// that table is uniquely determined within each group and may appear in SELECT
+// without being in GROUP BY or an aggregate function. M0097-0003.
+func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool {
+	if agg.input.cat == nil || col.SourceTableIdx == 0 {
+		return false
+	}
+	// Find the source table for this column.
+	var srcTable *catalog.Table
+	for _, b := range agg.input.bindings {
+		if b.sourceIdx == col.SourceTableIdx {
+			srcTable = b.table
+			break
+		}
+	}
+	if srcTable == nil {
+		return false
+	}
+	// Get all indexes on the source table.
+	idxs := agg.input.cat.IndexesOnTable(srcTable)
+	// Build a map from column name → input schema index for this table.
+	colByName := map[string]int{}
+	for i, sc := range agg.input.schema {
+		if sc.SourceTableIdx == col.SourceTableIdx {
+			colByName[sc.Name] = i
+		}
+	}
+	// Check each primary key or unique index.
+	for _, idx := range idxs {
+		if !idx.Primary && !idx.Unique {
+			continue
+		}
+		// Verify that all index columns are in the GROUP BY.
+		allCovered := true
+		for _, idxCol := range idx.Columns {
+			inputIdx, found := colByName[idxCol]
+			if !found {
+				allCovered = false
+				break
+			}
+			if _, inGroupBy := agg.groupByInputCol[inputIdx]; !inGroupBy {
+				allCovered = false
+				break
+			}
+		}
+		if allCovered {
+			return true
+		}
+	}
+	return false
 }

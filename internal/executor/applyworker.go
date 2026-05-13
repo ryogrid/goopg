@@ -11,16 +11,13 @@
 //     caches the remote relation descriptor and resolves a local
 //     `*catalog.Table` once; Insert encodes the row and writes
 //     it via the same storage path the executor's INSERT uses
-//     (`writeHeapRow`); Commit closes the txn and returns the
-//     remote commit LSN so the caller can advance
-//     `confirmed_flush_lsn`.
+//     (`writeHeapRow`); Delete scans the relation and stamps
+//     xmax on the matching row (M0094-0002); Update finds the
+//     old row and replaces with the new (M0094-0002); Commit
+//     closes the txn and returns the remote commit LSN.
 //
 // What's deferred:
 //
-//   - DELETE / UPDATE row resolution — v0 pgoutput's `D`/`U`
-//     don't carry a usable pre-image yet; the apply worker
-//     no-ops on them (logs only) until the wire-format
-//     extension lands.
 //   - TCP transport that produces the message stream — tests
 //     drive `ApplyMessage` directly today; the next M0008 loop
 //     wires this through libpq START_REPLICATION.
@@ -173,6 +170,8 @@ func (w *ApplyWorker) ApplyMessage(m *wal.DecodedMessage) (uint64, error) {
 		err = w.applyInsert(m)
 	case 'D':
 		err = w.applyDelete(m)
+	case 'U':
+		err = w.applyUpdate(m)
 	case 'C':
 		commitLSN = m.CommitLSN
 		err = w.applyCommit(m)
@@ -268,14 +267,193 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 	return nil
 }
 
-func (w *ApplyWorker) applyDelete(_ *wal.DecodedMessage) error {
-	// v0 pgoutput emits DELETE with an empty K body (no
-	// pre-image). The apply worker needs (rel, block, slot) or
-	// the key-tuple bytes to find the row to stamp xmax on;
-	// neither is on the wire today. Treat as a no-op until the
-	// wire-format extension lands. See
-	// docs/design/0008-0004-apply-worker-and-tablesync.md.
+func (w *ApplyWorker) applyDelete(m *wal.DecodedMessage) error {
+	if !w.inXact {
+		return errors.New("applyworker: DELETE outside transaction")
+	}
+	r, ok := w.relations[m.RelOID]
+	if !ok {
+		return fmt.Errorf("applyworker: DELETE for unknown rel_oid %d (no R message seen)", m.RelOID)
+	}
+	if r.local == nil {
+		return fmt.Errorf("applyworker: DELETE for relation %s.%s has no local table",
+			r.remote.Schema, r.remote.Name)
+	}
+	// Empty old-tuple means we have no key to find the row — skip.
+	if len(m.OldTuple) == 0 {
+		return nil
+	}
+	keyRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+	if err != nil {
+		return fmt.Errorf("applyworker: decode delete old-tuple for %q: %w", r.local.Name, err)
+	}
+	ctx := w.applyContext()
+	rel := w.cat.RelFileNode(r.local)
+	return applyDeleteByKey(ctx, rel, r.local.Columns, keyRow)
+}
+
+func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
+	if !w.inXact {
+		return errors.New("applyworker: UPDATE outside transaction")
+	}
+	r, ok := w.relations[m.RelOID]
+	if !ok {
+		return fmt.Errorf("applyworker: UPDATE for unknown rel_oid %d (no R message seen)", m.RelOID)
+	}
+	if r.local == nil {
+		return fmt.Errorf("applyworker: UPDATE for relation %s.%s has no local table",
+			r.remote.Schema, r.remote.Name)
+	}
+	if len(m.OldTuple) == 0 {
+		return nil
+	}
+	oldKeyRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+	if err != nil {
+		return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
+	}
+	newRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	if err != nil {
+		return fmt.Errorf("applyworker: decode update new-tuple for %q: %w", r.local.Name, err)
+	}
+	ctx := w.applyContext()
+	rel := w.cat.RelFileNode(r.local)
+	return applyUpdateByKey(ctx, rel, r.local.Columns, oldKeyRow, newRow)
+}
+
+// applyContext builds a minimal executor Context for apply-worker
+// storage operations. Pool, Catalog, TxnMgr, Tx, and Snap are set.
+// The XID is materialised eagerly so xmax stamps are never written
+// as InvalidTransactionID (0) — which would be invisible to future
+// readers because Xmax=0 means "no deleter".
+func (w *ApplyWorker) applyContext() *Context {
+	ctx := NewContext()
+	ctx.Pool = w.pool
+	ctx.Catalog = w.cat
+	ctx.TxnMgr = w.txnMgr
+	ctx.Tx = w.currentTx
+	if err := ctx.MaterializeWriterXID(); err == nil && ctx.Tx.XID != w.currentTx.XID {
+		// Sync the newly materialized XID back to the apply worker's
+		// transaction so subsequent Commit calls use the right XID state.
+		w.currentTx.XID = ctx.Tx.XID
+	}
+	snap, _ := w.txnMgr.SnapshotFor(w.currentTx)
+	ctx.Snap = snap
+	return ctx
+}
+
+// applyDeleteByKey scans rel for a visible tuple whose decoded columns
+// match keyRow (equality on all non-null key columns) and stamps xmax
+// on each match. Designed for the apply worker's DELETE path.
+func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row) error {
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return err
+	}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return err
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			return err
+		}
+		type match struct{ slot uint16 }
+		var matches []match
+		scanRow := make(Row, len(cols))
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			tup, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				continue
+			}
+			if err := DecodeRowInto(scanRow, cols, tup.Data); err != nil {
+				continue
+			}
+			if rowMatchesKey(scanRow, keyRow) {
+				matches = append(matches, match{slot: slot})
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		for _, m := range matches {
+			sw, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+			if err != nil {
+				return err
+			}
+			sw.Lock()
+			oldTup, _ := storage.PageGetHeapTuple(sw.Page(), m.slot)
+			var oldBytes []byte
+			oldBytes, _ = oldTup.MarshalBinary()
+			if err := storage.PageSetHeapTupleXmax(sw.Page(), m.slot, ctx.Tx.XID); err == nil {
+				_ = markHeapDeleteDirty(ctx.Pool, sw, rel, blk, m.slot, ctx.Tx.XID, oldBytes)
+			}
+			sw.Unlock()
+			ctx.Pool.Unpin(sw)
+		}
+	}
 	return nil
+}
+
+// applyUpdateByKey finds the row matching oldKeyRow in rel, deletes it,
+// then inserts newRow — implementing a logical UPDATE for the apply worker.
+func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, oldKeyRow, newRow Row) error {
+	if err := applyDeleteByKey(ctx, rel, cols, oldKeyRow); err != nil {
+		return err
+	}
+	return writeHeapRow(ctx, rel, cols, newRow)
+}
+
+// rowMatchesKey returns true when every non-null datum in keyRow equals
+// the corresponding datum in row. Null datums in keyRow are skipped
+// (treated as "don't care").
+func rowMatchesKey(row, keyRow Row) bool {
+	for i, k := range keyRow {
+		if i >= len(row) {
+			return false
+		}
+		if k.IsNull() {
+			continue
+		}
+		if !applyDatumEqual(row[i], k) {
+			return false
+		}
+	}
+	return true
+}
+
+// applyDatumEqual compares two Datums for equality by kind and value.
+// Used only by the apply worker's key-matching scan.
+func applyDatumEqual(a, b Datum) bool {
+	if a.Kind != b.Kind {
+		if (a.Kind == KindString || a.Kind == KindStringArena) &&
+			(b.Kind == KindString || b.Kind == KindStringArena) {
+			return a.StringValue() == b.StringValue()
+		}
+		return false
+	}
+	switch a.Kind {
+	case KindNull:
+		return true
+	case KindInt:
+		return a.Int == b.Int
+	case KindBool:
+		return a.BoolValue() == b.BoolValue()
+	case KindString, KindStringArena:
+		return a.StringValue() == b.StringValue()
+	}
+	return false
 }
 
 func (w *ApplyWorker) applyCommit(m *wal.DecodedMessage) error {

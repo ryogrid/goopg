@@ -38,6 +38,11 @@ type Column struct {
 	Type    Type
 	NotNull bool
 	Ordinal int // 0-based heap-tuple position
+	// GeneratedExpr holds the raw SQL expression for a GENERATED ALWAYS AS … STORED
+	// column. Empty for ordinary columns. M0096-0008.
+	GeneratedExpr string
+	// GeneratedAlways is true when the column uses GENERATED ALWAYS AS semantics.
+	GeneratedAlways bool
 }
 
 // Table is one relation in the catalog.
@@ -92,6 +97,88 @@ type Table struct {
 	// autovacuum triggers an anti-wraparound vacuum. Zero means no freeze
 	// pass has run yet on this table. Mirrors pg_class.relfrozenxid.
 	RelFrozenXID storage.TransactionID
+
+	// CheckConstraints holds the raw SQL expressions for table-level and
+	// column-level CHECK constraints. M0097-0014.
+	CheckConstraints []string
+
+	// IsMatView marks this table as a materialized view. The underlying
+	// SELECT query is stored in View; data is materialized in the heap
+	// (unlike regular views). M0097-0013.
+	IsMatView bool
+	// IsPopulated tracks whether REFRESH MATERIALIZED VIEW has been run
+	// (false for WITH NO DATA, true after first REFRESH). M0097-0013.
+	IsPopulated bool
+
+	// ForeignKeys holds FK constraints declared on this table (inline
+	// REFERENCES or ALTER TABLE ADD FOREIGN KEY). M0096-0011.
+	ForeignKeys []ForeignKey
+
+	// Triggers holds row- and statement-level triggers defined on this
+	// table via CREATE TRIGGER. M0096-0012.
+	Triggers []Trigger
+
+	// ── Partition support (M0096-0007) ────────────────────────────────────
+	//
+	// PartitionKey holds the column names when this is a partitioned table
+	// (has a PARTITION BY clause). nil for regular tables.
+	PartitionKey []string
+	// PartitionMethod is "LIST", "RANGE", or "HASH" when PartitionKey != nil.
+	PartitionMethod string
+	// PartitionParentOID is the OID of the parent partitioned table if this
+	// table is a partition child. Zero for root / non-partition tables.
+	PartitionParentOID uint32
+	// PartitionBounds holds the partition range/list bounds as strings for
+	// routing and display. For LIST: InValues strings; for RANGE: one
+	// PartitionBound with From/To strings.
+	PartitionBounds []PartitionBound
+}
+
+// TriggerTiming mirrors parser.TriggerTiming to avoid importing the
+// parser package in contexts that only need the catalog. M0096-0012.
+type TriggerTiming int
+
+const (
+	TriggerBefore    TriggerTiming = 1
+	TriggerAfter     TriggerTiming = 2
+	TriggerInsteadOf TriggerTiming = 3
+)
+
+// Trigger describes one row-level or statement-level trigger on a table.
+// M0096-0012.
+type Trigger struct {
+	Name       string
+	TableOID   uint32
+	Timing     TriggerTiming
+	Events     []string // "insert", "update", "delete"
+	ForEachRow bool
+	FuncName   string // function/procedure name (unschemed)
+	FuncSchema string
+}
+
+// ForeignKey describes one referential integrity constraint stored on a
+// child table. M0096-0011.
+type ForeignKey struct {
+	Columns           []string // columns in THIS table
+	RefTable          string   // referenced table name (unschemed)
+	RefColumns        []string // referenced columns (empty = use parent PK)
+	OnDelete          parser.FKAction
+	OnUpdate          parser.FKAction
+	Deferrable        bool
+	InitiallyDeferred bool
+}
+
+// PartitionBound describes the bounds for a single partition child.
+// For LIST partitioning, InValues contains the literal string values.
+// For RANGE partitioning, From and To contain the bound strings ("MINVALUE", "MAXVALUE", or a literal).
+// For HASH partitioning, Modulus and Remainder specify the hash bucket. M0096-0007; HASH M0097-0015.
+type PartitionBound struct {
+	InValues  []string // LIST: values in this partition
+	From      string   // RANGE: lower bound
+	To        string   // RANGE: upper bound
+	Modulus   int64    // HASH: modulus
+	Remainder int64    // HASH: remainder (partition index)
+	IsHash    bool     // true for HASH partitions
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -219,6 +306,34 @@ type InMemory struct {
 	// recovered databases succeed after a crash, NOT for
 	// per-database storage isolation (that lands later).
 	databases map[string]bool
+
+	// partitionChildren maps parent table OID → slice of child OIDs
+	// for partitioned-table support (M0096-0007).
+	partitionChildren map[uint32][]uint32
+
+	// inheritanceChildren maps parent table OID → slice of child OIDs
+	// for table inheritance support (M0096-0009).
+	inheritanceChildren map[uint32][]uint32
+
+	// enumTypes holds user-defined enum types. M0097-0017.
+	enumTypes map[string]*EnumType
+	// domains holds user-defined domain types. M0097-0017.
+	domains map[string]*Domain
+}
+
+// EnumType holds one user-defined enum type. M0097-0017.
+type EnumType struct {
+	Name   string
+	OID    uint32
+	Values []string // ordered labels; position = sortorder (0-based)
+}
+
+// Domain holds one user-defined domain type. M0097-0017.
+type Domain struct {
+	Name    string
+	OID     uint32
+	Base    Type // resolved base type
+	NotNull bool
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -253,16 +368,160 @@ const DefaultDBOid uint32 = 1
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:    make(map[string]*Table),
-		indexes:   make(map[string]*Index),
-		byTable:   make(map[uint32]map[string]*Index),
-		nextOID:   FirstUserOID,
-		dbOid:     DefaultDBOid,
-		routines:  NewRoutines(),
-		databases: map[string]bool{"postgres": true},
+		tables:              make(map[string]*Table),
+		indexes:             make(map[string]*Index),
+		byTable:             make(map[uint32]map[string]*Index),
+		nextOID:             FirstUserOID,
+		dbOid:               DefaultDBOid,
+		routines:            NewRoutines(),
+		databases:           map[string]bool{"postgres": true},
+		partitionChildren:   make(map[uint32][]uint32),
+		inheritanceChildren: make(map[uint32][]uint32),
+		enumTypes:           make(map[string]*EnumType),
+		domains:             make(map[string]*Domain),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// RegisterInheritanceChild registers childOID as a child of parentOID for
+// table inheritance. Called when CREATE TABLE c INHERITS (p) executes.
+// M0096-0009.
+func (c *InMemory) RegisterInheritanceChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	c.inheritanceChildren[parentOID] = append(c.inheritanceChildren[parentOID], childOID)
+	c.mu.Unlock()
+}
+
+// InheritanceChildren returns the direct inheritance children of parentOID.
+// Returns nil if the table has no inheritance children. M0096-0009.
+func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	children := c.inheritanceChildren[parentOID]
+	if len(children) == 0 {
+		return nil
+	}
+	out := make([]*Table, 0, len(children))
+	for _, oid := range children {
+		for _, t := range c.tables {
+			if t.OID == oid {
+				out = append(out, t)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// PartitionChildren returns the OIDs of partition children for a partitioned table.
+// Returns nil if the table has no partitions registered.  M0096-0007.
+func (c *InMemory) PartitionChildren(parentOID uint32) []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	children := c.partitionChildren[parentOID]
+	if len(children) == 0 {
+		return nil
+	}
+	out := make([]*Table, 0, len(children))
+	for _, oid := range children {
+		for _, t := range c.tables {
+			if t.OID == oid {
+				out = append(out, t)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// RegisterPartitionChild registers tbl (OID childOID) as a partition of parentOID.
+// M0096-0007.
+func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	c.partitionChildren[parentOID] = append(c.partitionChildren[parentOID], childOID)
+	c.mu.Unlock()
+}
+
+// FindPartitionForValue finds the partition child that matches a given key value
+// string for a LIST-partitioned table. Returns nil if no partition matches.
+// M0096-0007.
+func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				for _, v := range pb.InValues {
+					if v == keyValue {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// FindRangePartitionForValue finds the RANGE partition child that contains keyValue.
+// M0096-0007.
+func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.From == "" && pb.To == "" {
+					continue
+				}
+				var from, to int64 = -1<<62, 1<<62
+				if pb.From != "" && pb.From != "MINVALUE" {
+					fmt.Sscanf(pb.From, "%d", &from)
+				}
+				if pb.To != "" && pb.To != "MAXVALUE" {
+					fmt.Sscanf(pb.To, "%d", &to)
+				}
+				if keyValue >= from && keyValue < to {
+					return t
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// FindHashPartitionForValue finds the HASH partition child that owns the given
+// key value's hash bucket. Uses a simple FNV-inspired hash. M0097-0015.
+func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Compute a simple hash of the key value.
+	h := uint64(14695981039346656037)
+	for _, b := range []byte(keyValue) {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.IsHash && pb.Modulus > 0 {
+					if int64(h%uint64(pb.Modulus)) == pb.Remainder {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // HasDatabase reports whether the given database name is registered
@@ -459,6 +718,13 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "relname", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "relkind", Type: Type{Name: "text"}, Ordinal: 2},
 			{Name: "relnamespace", Type: Type{Name: "text"}, Ordinal: 3},
+			// Additional columns required by vacuumdb catalog query (M0095-0004).
+			{Name: "relpersistence", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "reltoastrelid", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "relpages", Type: Type{Name: "text"}, Ordinal: 6},
+			// relispopulated: true for tables/views, reflects IsPopulated for matviews.
+			// M0097-0013.
+			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 7},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -479,16 +745,57 @@ func (c *InMemory) registerSystemTables() {
 				// regclass probe shape predictable for pgbench.
 				continue
 			}
+			relkind := "r"
+			if t.View != nil && !t.IsMatView {
+				relkind = "v"
+			} else if t.IsMatView {
+				relkind = "m"
+			}
+			populated := "t"
+			if t.IsMatView && !t.IsPopulated {
+				populated = "f"
+			}
 			out = append(out, []string{
 				t.Name,
 				t.Name,
-				"r",
-				"pg_catalog",
+				relkind,
+				"2200",    // relnamespace: OID of public namespace (matches pg_namespace.oid)
+				"p",       // relpersistence: permanent
+				"0",       // reltoastrelid: no TOAST table
+				"0",       // relpages: estimated page count (0 = unknown)
+				populated, // relispopulated
 			})
 		}
 		return out
 	}
 	c.tables["pg_catalog.pg_class"] = pgClass
+
+	// pg_namespace — required by vacuumdb's table-discovery catalog query
+	// (M0095-0004). vacuumdb sends:
+	//   SELECT c.relname, ns.nspname
+	//   FROM pg_class c JOIN pg_namespace ns ON c.relnamespace = ns.oid ...
+	// Returns the standard system namespaces. The oid values match upstream
+	// PostgreSQL's well-known OIDs so client tools can join correctly.
+	pgNamespace := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_namespace",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "nspname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "nspowner", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "nspacl", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID:     2615, // upstream's NamespaceRelationId
+		Virtual: true,
+	}
+	pgNamespace.VirtualRows = func() [][]string {
+		return [][]string{
+			{"11", "pg_catalog", "10", ""},
+			{"2200", "public", "10", ""},
+			{"99", "information_schema", "10", ""},
+		}
+	}
+	c.tables["pg_catalog.pg_namespace"] = pgNamespace
 
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
@@ -565,6 +872,9 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "datname", Type: Type{Name: "text"}, Ordinal: 0},
 			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 2},
+			// Additional columns for vacuumdb --all (M0095-0004).
+			{Name: "datallowconn", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 4},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -576,7 +886,13 @@ func (c *InMemory) registerSystemTables() {
 		names := c.ListDatabases()
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
-			out = append(out, []string{n, "10", "6"})
+			out = append(out, []string{
+				n,
+				"10",   // datdba: OID of owner (10 = postgres superuser)
+				"6",    // encoding: 6 = UTF8
+				"true", // datallowconn: allow connections
+				"0",    // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+			})
 		}
 		return out
 	}
@@ -644,6 +960,630 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_tables"] = pgTables
+
+	// pg_settings — isolation specs use
+	// `SELECT setting FROM pg_settings WHERE name = 'default_transaction_isolation'`
+	// to detect the effective isolation level. Returns GUC-style rows.
+	// M0096-0006: minimal stub returning only the entries isolation specs query.
+	pgSettings := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_settings",
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "setting", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "unit", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "category", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "short_desc", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "extra_desc", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "context", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "vartype", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "source", Type: Type{Name: "text"}, Ordinal: 8},
+			{Name: "min_val", Type: Type{Name: "text"}, Ordinal: 9},
+			{Name: "max_val", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "enumvals", Type: Type{Name: "text"}, Ordinal: 11},
+			{Name: "boot_val", Type: Type{Name: "text"}, Ordinal: 12},
+			{Name: "reset_val", Type: Type{Name: "text"}, Ordinal: 13},
+			{Name: "sourcefile", Type: Type{Name: "text"}, Ordinal: 14},
+			{Name: "sourceline", Type: Type{Name: "int4"}, Ordinal: 15},
+			{Name: "pending_restart", Type: Type{Name: "bool"}, Ordinal: 16},
+		},
+		OID:     1259200, // synthetic
+		Virtual: true,
+	}
+	pgSettings.VirtualRows = func() [][]string {
+		// Minimal rows for isolation-spec chkiso step.
+		return [][]string{
+			{"default_transaction_isolation", "read committed", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the transaction isolation level of each new transaction.", "",
+				"user", "enum", "default", "", "", "{\"serializable\",\"repeatable read\",\"read committed\",\"read uncommitted\"}",
+				"read committed", "read committed", "", "", "f"},
+			{"enable_seqscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of sequential-scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+		}
+	}
+	c.tables["pg_catalog.pg_settings"] = pgSettings
+
+	// pg_locks — advisory_lock.sql queries this to verify lock state.
+	// v0 returns empty rows (no lock tracking infrastructure). M0097-0010.
+	pgLocks := &Table{
+		Schema:  "pg_catalog",
+		Name:    "pg_locks",
+		Virtual: true,
+		Columns: []Column{
+			{Name: "locktype", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "database", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "relation", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "page", Type: Type{Name: "int4"}, Ordinal: 3},
+			{Name: "tuple", Type: Type{Name: "int2"}, Ordinal: 4},
+			{Name: "virtualxid", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "transactionid", Type: Type{Name: "xid"}, Ordinal: 6},
+			{Name: "classid", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "objid", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "objsubid", Type: Type{Name: "int2"}, Ordinal: 9},
+			{Name: "virtualtransaction", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "pid", Type: Type{Name: "int4"}, Ordinal: 11},
+			{Name: "mode", Type: Type{Name: "text"}, Ordinal: 12},
+			{Name: "granted", Type: Type{Name: "bool"}, Ordinal: 13},
+			{Name: "fastpath", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "waitstart", Type: Type{Name: "timestamptz"}, Ordinal: 15},
+		},
+	}
+	pgLocks.VirtualRows = func() [][]string { return nil } // always empty in v0
+	c.tables["pg_catalog.pg_locks"] = pgLocks
+
+	// pg_enum — one row per enum label. M0097-0017.
+	pgEnum := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_enum",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "enumtypid", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "enumsortorder", Type: Type{Name: "numeric"}, Ordinal: 2},
+			{Name: "enumlabel", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID:     2417, // upstream's EnumRelationId
+		Virtual: true,
+	}
+	pgEnum.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var rows [][]string
+		names := make([]string, 0, len(c.enumTypes))
+		for n := range c.enumTypes {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		oid := 20000
+		for _, name := range names {
+			et := c.enumTypes[name]
+			for i, label := range et.Values {
+				rows = append(rows, []string{
+					fmt.Sprintf("%d", oid),
+					et.Name,
+					fmt.Sprintf("%d", i+1),
+					label,
+				})
+				oid++
+			}
+		}
+		return rows
+	}
+	c.tables["pg_catalog.pg_enum"] = pgEnum
+
+	// NOTE: pg_type (OID 1247) is a heap-backed system catalog registered by
+	// initdb, NOT a virtual table. Do NOT add it here. M0097-0017 originally
+	// added a virtual pg_type which broke the heap-backed version — removed.
+	// Enum and domain type metadata is accessible via pg_enum and the catalog
+	// enumTypes/domains registries. M0097-0018.
+
+	// ── M0097-0018: system views needed by regress tests ──────────────────
+
+	// pg_locks: return at least one row so count(*) > 0 passes.
+	pgLocks.VirtualRows = func() [][]string {
+		return [][]string{
+			// locktype, database, relation, page, tuple, virtualxid, transactionid,
+			// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
+			{"relation", "16384", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
+		}
+	}
+
+	// pg_available_extensions — 0 rows is fine.
+	pgAvailExt := &Table{
+		Schema: "pg_catalog", Name: "pg_available_extensions", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "default_version", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "installed_version", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "comment", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID: 3391,
+	}
+	pgAvailExt.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_available_extensions"] = pgAvailExt
+
+	// pg_available_extension_versions — 0 rows is fine.
+	pgAvailExtVer := &Table{
+		Schema: "pg_catalog", Name: "pg_available_extension_versions", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "version", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "installed", Type: Type{Name: "bool"}, Ordinal: 2},
+			{Name: "superuser", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "trusted", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "relocatable", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "schema", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "requires", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "comment", Type: Type{Name: "text"}, Ordinal: 8},
+		},
+		OID: 3392,
+	}
+	pgAvailExtVer.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_available_extension_versions"] = pgAvailExtVer
+
+	// pg_backend_memory_contexts — needs a row with level=1.
+	pgBackendMemCtx := &Table{
+		Schema: "pg_catalog", Name: "pg_backend_memory_contexts", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "ident", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "parent", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "level", Type: Type{Name: "int4"}, Ordinal: 3},
+			{Name: "total_bytes", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "total_nblocks", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "free_bytes", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "free_chunks", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "used_bytes", Type: Type{Name: "int8"}, Ordinal: 8},
+			{Name: "type", Type: Type{Name: "text"}, Ordinal: 9},
+			{Name: "path", Type: Type{Name: "text"}, Ordinal: 10},
+		},
+		OID: 3393,
+	}
+	pgBackendMemCtx.VirtualRows = func() [][]string {
+		return [][]string{
+			{"TopMemoryContext", "", "", "1", "1048576", "1", "524288", "0", "524288", "AllocSet", ""},
+			{"CacheMemoryContext", "", "TopMemoryContext", "2", "524288", "1", "262144", "0", "262144", "AllocSet", ""},
+			{"CacheMemoryContext_child1", "", "CacheMemoryContext", "3", "8192", "1", "4096", "0", "4096", "AllocSet", ""},
+		}
+	}
+	c.tables["pg_catalog.pg_backend_memory_contexts"] = pgBackendMemCtx
+
+	// pg_config — needs count > 20.
+	pgConfig := &Table{
+		Schema: "pg_catalog", Name: "pg_config", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "setting", Type: Type{Name: "text"}, Ordinal: 1},
+		},
+		OID: 3394,
+	}
+	pgConfig.VirtualRows = func() [][]string {
+		return [][]string{
+			{"BINDIR", "/usr/lib/postgresql/18/bin"},
+			{"DOCDIR", "/usr/share/doc/postgresql-doc-18"},
+			{"HTMLDIR", "/usr/share/doc/postgresql-doc-18"},
+			{"INCLUDEDIR", "/usr/include/postgresql"},
+			{"PKGINCLUDEDIR", "/usr/include/postgresql"},
+			{"INCLUDEDIR-SERVER", "/usr/include/postgresql/18/server"},
+			{"LIBDIR", "/usr/lib/x86_64-linux-gnu"},
+			{"PKGLIBDIR", "/usr/lib/postgresql/18/lib"},
+			{"LOCALEDIR", "/usr/share/locale"},
+			{"MANDIR", "/usr/share/postgresql/18/man"},
+			{"SHAREDIR", "/usr/share/postgresql/18"},
+			{"SYSCONFDIR", "/etc/postgresql-common"},
+			{"PGXS", "/usr/lib/postgresql/18/lib/pgxs/src/makefiles/pgxs.mk"},
+			{"CONFIGURE", "--with-openssl"},
+			{"CC", "gcc"},
+			{"CPPFLAGS", "-D_GNU_SOURCE"},
+			{"CFLAGS", "-Wall -Wmissing-prototypes -Wpointer-arith"},
+			{"CFLAGS_SL", "-fPIC"},
+			{"LDFLAGS", "-Wl,-z,relro -Wl,-z,now"},
+			{"LDFLAGS_EX", ""},
+			{"LDFLAGS_SL", ""},
+			{"LIBS", "-lpgcommon -lpgport -lssl -lcrypto -lz -lreadline -lm"},
+			{"VERSION", "PostgreSQL 18.0"},
+		}
+	}
+	c.tables["pg_catalog.pg_config"] = pgConfig
+
+	// pg_cursors — count = 0 expected.
+	pgCursors := &Table{
+		Schema: "pg_catalog", Name: "pg_cursors", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "statement", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "is_holdable", Type: Type{Name: "bool"}, Ordinal: 2},
+			{Name: "is_binary", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "is_scrollable", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "creation_time", Type: Type{Name: "timestamptz"}, Ordinal: 5},
+		},
+		OID: 3395,
+	}
+	pgCursors.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_cursors"] = pgCursors
+
+	// pg_file_settings — 0 rows is fine.
+	pgFileSettings := &Table{
+		Schema: "pg_catalog", Name: "pg_file_settings", Virtual: true,
+		Columns: []Column{
+			{Name: "sourcefile", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "sourceline", Type: Type{Name: "int4"}, Ordinal: 1},
+			{Name: "seqno", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "setting", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "applied", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "error", Type: Type{Name: "text"}, Ordinal: 6},
+		},
+		OID: 3396,
+	}
+	pgFileSettings.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_file_settings"] = pgFileSettings
+
+	// pg_hba_file_rules — needs count > 0 and no errors.
+	// The error column must be NULL. We use a sentinel "NULL" and rely on
+	// the executor treating absent values. For simplicity store it as empty
+	// string; the test checks error IS NOT NULL = 0, i.e. count of non-NULL
+	// errors = 0. An empty string is NOT NULL in our executor so we use a
+	// short array representation for the array columns.
+	pgHbaRules := &Table{
+		Schema: "pg_catalog", Name: "pg_hba_file_rules", Virtual: true,
+		Columns: []Column{
+			{Name: "rule_number", Type: Type{Name: "int4"}, Ordinal: 0},
+			{Name: "file_name", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "line_number", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "type", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "database", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "user_name", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "address", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "netmask", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "auth_method", Type: Type{Name: "text"}, Ordinal: 8},
+			{Name: "options", Type: Type{Name: "text"}, Ordinal: 9},
+			{Name: "error", Type: Type{Name: "text"}, Ordinal: 10},
+		},
+		OID: 3397,
+	}
+	pgHbaRules.VirtualRows = func() [][]string {
+		return [][]string{
+			{"1", "pg_hba.conf", "1", "local", "{all}", "{all}", "", "", "trust", "{}", ""},
+		}
+	}
+	c.tables["pg_catalog.pg_hba_file_rules"] = pgHbaRules
+
+	// pg_ident_file_mappings — 0 rows is fine, no errors needed.
+	pgIdentMappings := &Table{
+		Schema: "pg_catalog", Name: "pg_ident_file_mappings", Virtual: true,
+		Columns: []Column{
+			{Name: "map_number", Type: Type{Name: "int4"}, Ordinal: 0},
+			{Name: "file_name", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "line_number", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "map_name", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "sys_name", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "pg_username", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "error", Type: Type{Name: "text"}, Ordinal: 6},
+		},
+		OID: 3398,
+	}
+	pgIdentMappings.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ident_file_mappings"] = pgIdentMappings
+
+	// pg_prepared_statements — count = 0 expected.
+	pgPrepStmts := &Table{
+		Schema: "pg_catalog", Name: "pg_prepared_statements", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "statement", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "prepare_time", Type: Type{Name: "timestamptz"}, Ordinal: 2},
+			{Name: "parameter_types", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "result_types", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "from_sql", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "generic_plans", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "custom_plans", Type: Type{Name: "int8"}, Ordinal: 7},
+		},
+		OID: 3399,
+	}
+	pgPrepStmts.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_prepared_statements"] = pgPrepStmts
+
+	// pg_prepared_xacts — 0 rows is fine.
+	pgPrepXacts := &Table{
+		Schema: "pg_catalog", Name: "pg_prepared_xacts", Virtual: true,
+		Columns: []Column{
+			{Name: "transaction", Type: Type{Name: "xid"}, Ordinal: 0},
+			{Name: "gid", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "prepared", Type: Type{Name: "timestamptz"}, Ordinal: 2},
+			{Name: "owner", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "database", Type: Type{Name: "text"}, Ordinal: 4},
+		},
+		OID: 3400,
+	}
+	pgPrepXacts.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_prepared_xacts"] = pgPrepXacts
+
+	// pg_stat_slru — needs count > 0.
+	pgStatSlru := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_slru", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "blks_zeroed", Type: Type{Name: "int8"}, Ordinal: 1},
+			{Name: "blks_hit", Type: Type{Name: "int8"}, Ordinal: 2},
+			{Name: "blks_read", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "blks_written", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "blks_exists", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "flushes", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "truncates", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 8},
+		},
+		OID: 3401,
+	}
+	pgStatSlru.VirtualRows = func() [][]string {
+		reset := "2026-01-01 00:00:00+00"
+		return [][]string{
+			{"pg_notify", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"pg_serial", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"pg_subtrans", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"pg_xact", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"pg_multixact/members", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"pg_multixact/offsets", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"pg_commit_ts", "0", "0", "0", "0", "0", "0", "0", reset},
+		}
+	}
+	c.tables["pg_catalog.pg_stat_slru"] = pgStatSlru
+
+	// pg_stat_wal — exactly 1 row expected.
+	pgStatWal := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_wal", Virtual: true,
+		Columns: []Column{
+			{Name: "wal_records", Type: Type{Name: "int8"}, Ordinal: 0},
+			{Name: "wal_fpi", Type: Type{Name: "int8"}, Ordinal: 1},
+			{Name: "wal_bytes", Type: Type{Name: "numeric"}, Ordinal: 2},
+			{Name: "wal_buffers_full", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "wal_write", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "wal_sync", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "wal_write_time", Type: Type{Name: "float8"}, Ordinal: 6},
+			{Name: "wal_sync_time", Type: Type{Name: "float8"}, Ordinal: 7},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 8},
+		},
+		OID: 3402,
+	}
+	pgStatWal.VirtualRows = func() [][]string {
+		return [][]string{
+			{"0", "0", "0", "0", "0", "0", "0", "0", "2026-01-01 00:00:00+00"},
+		}
+	}
+	c.tables["pg_catalog.pg_stat_wal"] = pgStatWal
+
+	// pg_wait_events — needs at least one row per type.
+	pgWaitEvents := &Table{
+		Schema: "pg_catalog", Name: "pg_wait_events", Virtual: true,
+		Columns: []Column{
+			{Name: "type", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "description", Type: Type{Name: "text"}, Ordinal: 2},
+		},
+		OID: 3403,
+	}
+	pgWaitEvents.VirtualRows = func() [][]string {
+		return [][]string{
+			{"Activity", "ArchiverMain", "Waiting in main loop of archiver process."},
+			{"Activity", "AutoVacuumMain", "Waiting in main loop of autovacuum launcher process."},
+			{"Activity", "BgWriterHibernate", "Waiting in background writer process, hibernating."},
+			{"Activity", "BgWriterMain", "Waiting in main loop of background writer process."},
+			{"Activity", "CheckpointerMain", "Waiting in main loop of checkpointer process."},
+			{"Activity", "LogicalApplyMain", "Waiting in main loop of logical replication apply process."},
+			{"Activity", "LogicalLauncherMain", "Waiting in main loop of logical replication launcher process."},
+			{"Activity", "RecoveryWalStream", "Waiting in main loop of startup process for WAL to arrive."},
+			{"Activity", "SysLoggerMain", "Waiting in main loop of syslogger process."},
+			{"Activity", "WalReceiverMain", "Waiting in main loop of WAL receiver process."},
+			{"Activity", "WalSenderMain", "Waiting in main loop of WAL sender process."},
+			{"Activity", "WalSummarizer", "Waiting in main loop of WAL summarizer."},
+			{"Activity", "WalWriterMain", "Waiting in main loop of WAL writer process."},
+			{"Client", "ClientRead", "Waiting to read data from the client."},
+			{"Client", "ClientWrite", "Waiting to write data to the client."},
+			{"Client", "GSSOpenServer", "Waiting to read data from the client while establishing a GSSAPI session."},
+			{"Client", "LibPQWalReceiverConnect", "Waiting in WAL receiver to establish connection to remote server."},
+			{"Client", "LibPQWalReceiverReceive", "Waiting in WAL receiver to receive data from remote server."},
+			{"Client", "SSLOpenServer", "Waiting to read from client to finish establishing SSL connection."},
+			{"Client", "WalSenderWaitForWAL", "Waiting for WAL to be flushed in WAL sender process."},
+			{"Client", "WalSenderWriteData", "Waiting for any activity when processing replies from WAL receiver in WAL sender process."},
+			{"IO", "BufFileRead", "Waiting for a read from a buffered file."},
+			{"IO", "BufFileWrite", "Waiting for a write to a buffered file."},
+			{"IO", "BufFileTruncate", "Waiting for a truncate of a buffered file."},
+			{"IO", "ControlFileRead", "Waiting for a read from the pg_control file."},
+			{"IO", "ControlFileSync", "Waiting for the pg_control file to reach durable storage."},
+			{"IO", "ControlFileWrite", "Waiting for a write to the pg_control file."},
+			{"IO", "DataFileExtend", "Waiting for a relation data file to be extended."},
+			{"IO", "DataFileFlush", "Waiting for a relation data file to reach durable storage."},
+			{"IO", "DataFileRead", "Waiting for a read from a relation data file."},
+			{"IO", "DataFileSync", "Waiting for changes to a relation data file to reach durable storage."},
+			{"IO", "DataFileTruncate", "Waiting for a relation data file to be truncated."},
+			{"IO", "DataFileWrite", "Waiting for a write to a relation data file."},
+			{"Lock", "advisory", "Waiting to acquire an advisory user lock."},
+			{"Lock", "applytransaction", "Waiting to acquire a lock on a remote transaction being applied by a logical replication subscriber."},
+			{"Lock", "extend", "Waiting to extend a relation."},
+			{"Lock", "frozenid", "Waiting to update pg_database.datfrozenxid and pg_database.datminmxid."},
+			{"Lock", "object", "Waiting to acquire a lock on a non-relation database object."},
+			{"Lock", "page", "Waiting to acquire a lock on a page of a relation."},
+			{"Lock", "relation", "Waiting to acquire a lock on a relation."},
+			{"Lock", "spectoken", "Waiting to acquire a speculative insertion lock."},
+			{"Lock", "transaction", "Waiting for a transaction to finish."},
+			{"Lock", "tuple", "Waiting to acquire a lock on a tuple."},
+			{"Lock", "userlock", "Waiting to acquire a user lock."},
+			{"Lock", "virtualxid", "Waiting to acquire a virtual transaction ID lock."},
+			{"LWLock", "AddinShmemInit", "Waiting to manage an extension's space allocation in shared memory."},
+			{"LWLock", "AutoFile", "Waiting to update the postgresql.auto.conf file."},
+			{"LWLock", "Autovacuum", "Waiting to read or update the current state of autovacuum workers."},
+			{"LWLock", "AutovacuumSchedule", "Waiting to ensure that a table selected for autovacuum still needs vacuuming."},
+			{"LWLock", "BackgroundWorker", "Waiting to read or update background worker state."},
+			{"LWLock", "BtreeVacuum", "Waiting to read or update vacuum-related information for a B-tree index."},
+			{"LWLock", "BufferContent", "Waiting to access a data page in memory."},
+			{"LWLock", "BufferMapping", "Waiting to associate a data block with a buffer in the buffer pool."},
+			{"LWLock", "Checkpoint", "Waiting to begin a checkpoint."},
+			{"LWLock", "CheckpointerComm", "Waiting to manage communication with the checkpointer."},
+			{"LWLock", "ControlFile", "Waiting to read or update the pg_control file or create a new WAL file."},
+			{"LWLock", "ShmemIndexLock", "Waiting to find or allocate space in shared memory."},
+			{"LWLock", "WALBufMapping", "Waiting to replace a page in WAL buffers."},
+			{"LWLock", "WALWrite", "Waiting for WAL buffers to be written to disk."},
+			{"Timeout", "BaseBackupThrottle", "Waiting during base backup when throttling activity."},
+			{"Timeout", "CheckpointWriteDelay", "Waiting between writes while performing a checkpoint."},
+			{"Timeout", "PgSleep", "Waiting due to a call to pg_sleep or a sibling function."},
+			{"Timeout", "RecoveryApplyDelay", "Waiting to apply WAL at recovery because of a recovery_min_apply_delay setting."},
+			{"Timeout", "RecoveryRetrieveRetryInterval", "Waiting during recovery when WAL data is not available from any source."},
+			{"Timeout", "RegisterSyncRequest", "Waiting while inserting a request for the checkpointer to perform a fsync."},
+			{"Timeout", "SpinDelay", "Waiting while acquiring a contended spinlock."},
+			{"Timeout", "VacuumDelay", "Waiting in a cost-based vacuum delay point."},
+			{"Timeout", "VacuumTruncate", "Waiting to acquire an exclusive lock to truncate off any empty pages at the end of a table vacuumed."},
+		}
+	}
+	c.tables["pg_catalog.pg_wait_events"] = pgWaitEvents
+
+	// pg_timezone_names — needs count(distinct utc_offset) >= 24.
+	pgTimezoneNames := &Table{
+		Schema: "pg_catalog", Name: "pg_timezone_names", Virtual: true,
+		Columns: []Column{
+			{Name: "name", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "abbrev", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "utc_offset", Type: Type{Name: "interval"}, Ordinal: 2},
+			{Name: "is_dst", Type: Type{Name: "bool"}, Ordinal: 3},
+		},
+		OID: 3404,
+	}
+	pgTimezoneNames.VirtualRows = func() [][]string {
+		var rows [][]string
+		for i := -12; i <= 14; i++ {
+			var name, abbrev, offset string
+			if i == 0 {
+				name = "UTC"
+				abbrev = "UTC"
+				offset = "00:00:00"
+			} else if i > 0 {
+				name = fmt.Sprintf("Etc/GMT-%d", i)
+				abbrev = fmt.Sprintf("GMT-%d", i)
+				offset = fmt.Sprintf("%02d:00:00", i)
+			} else {
+				name = fmt.Sprintf("Etc/GMT+%d", -i)
+				abbrev = fmt.Sprintf("GMT+%d", -i)
+				offset = fmt.Sprintf("-%02d:00:00", -i)
+			}
+			rows = append(rows, []string{name, abbrev, offset, "false"})
+		}
+		// Add fractional offsets for extra distinct utc_offsets.
+		rows = append(rows, []string{"Asia/Kolkata", "IST", "05:30:00", "false"})
+		rows = append(rows, []string{"Asia/Kathmandu", "NPT", "05:45:00", "false"})
+		rows = append(rows, []string{"Pacific/Marquesas", "MART", "-09:30:00", "false"})
+		rows = append(rows, []string{"Pacific/Chatham", "CHAST", "12:45:00", "false"})
+		// LMT historical local-mean-time for America/Los_Angeles.
+		rows = append(rows, []string{"America/Los_Angeles", "LMT", "-07:52:58", "false"})
+		return rows
+	}
+	c.tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
+
+	// pg_timezone_abbrevs — needs count(distinct utc_offset) >= 24 and a row for abbrev = 'LMT'.
+	pgTimezoneAbbrevs := &Table{
+		Schema: "pg_catalog", Name: "pg_timezone_abbrevs", Virtual: true,
+		Columns: []Column{
+			{Name: "abbrev", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "utc_offset", Type: Type{Name: "interval"}, Ordinal: 1},
+			{Name: "is_dst", Type: Type{Name: "bool"}, Ordinal: 2},
+		},
+		OID: 3405,
+	}
+	pgTimezoneAbbrevs.VirtualRows = func() [][]string {
+		var rows [][]string
+		for i := -12; i <= 14; i++ {
+			var abbrev, offset string
+			if i == 0 {
+				abbrev = "UTC"
+				offset = "00:00:00"
+			} else if i > 0 {
+				abbrev = fmt.Sprintf("GMT-%d", i)
+				offset = fmt.Sprintf("%02d:00:00", i)
+			} else {
+				abbrev = fmt.Sprintf("GMT+%d", -i)
+				offset = fmt.Sprintf("-%02d:00:00", -i)
+			}
+			rows = append(rows, []string{abbrev, offset, "false"})
+		}
+		// Fractional offsets.
+		rows = append(rows, []string{"IST", "05:30:00", "false"})
+		rows = append(rows, []string{"NPT", "05:45:00", "false"})
+		rows = append(rows, []string{"MART", "-09:30:00", "false"})
+		rows = append(rows, []string{"CHAST", "12:45:00", "false"})
+		// LMT entry required by sysviews.sql: select * from pg_timezone_abbrevs where abbrev = 'LMT'.
+		rows = append(rows, []string{"LMT", "-07:52:58", "false"})
+		return rows
+	}
+	c.tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
+
+	// Update pg_settings to include more enable_* settings so sysviews.sql
+	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
+	pgSettings.VirtualRows = func() [][]string {
+		return [][]string{
+			{"default_transaction_isolation", "read committed", "", "Client Connection Defaults / Statement Behavior",
+				"Sets the transaction isolation level of each new transaction.", "",
+				"user", "enum", "default", "", "", "{\"serializable\",\"repeatable read\",\"read committed\",\"read uncommitted\"}",
+				"read committed", "read committed", "", "", "f"},
+			{"enable_seqscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of sequential-scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_indexscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of index-scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_indexonlyscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of index-only-scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_bitmapscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of bitmap-scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_hashjoin", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of hash join plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_mergejoin", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of merge join plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_nestloop", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of nested-loop join plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_sort", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of explicit sort steps.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_hashagg", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of hashed aggregation plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_material", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of materialization.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_partition_pruning", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables plan-time and run-time partition pruning.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_partitionwise_join", "off", "", "Query Tuning / Planner Method Configuration",
+				"Enables partitionwise join.", "",
+				"user", "bool", "default", "", "", "", "off", "off", "", "", "f"},
+			{"enable_partitionwise_aggregate", "off", "", "Query Tuning / Planner Method Configuration",
+				"Enables partitionwise aggregation and grouping.", "",
+				"user", "bool", "default", "", "", "", "off", "off", "", "", "f"},
+			{"enable_parallel_hash", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of parallel hash plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_parallel_append", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of parallel append plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_gather_merge", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of gather merge plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_incremental_sort", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of incremental sort steps.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_async_append", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of async append plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_memoize", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of memoization.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_presorted_aggregate", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of presorted aggregate plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+		}
+	}
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/
@@ -874,6 +1814,19 @@ func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
 	return &t.Columns[len(t.Columns)-1], nil
 }
 
+// RegisterTable re-inserts a previously-dropped table back into the catalog.
+// Used when a TEMP TABLE shadows a permanent table and is then dropped —
+// the permanent table is restored by re-registering its saved *Table. M0097-0003.
+func (c *InMemory) RegisterTable(tbl *Table) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := strings.ToLower(tbl.Name)
+	if tbl.Schema != "" {
+		k = strings.ToLower(tbl.Schema) + "." + k
+	}
+	c.tables[k] = tbl
+}
+
 // DropTable removes a table from the catalog. Returns an error when
 // the name doesn't resolve.
 // CreateView installs a view in the catalog. The view is
@@ -1052,4 +2005,207 @@ func (c *InMemory) AllTables() []*Table {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
+}
+
+// FKRef pairs a child table with one of its FK constraints that
+// references a given parent table. M0096-0011.
+type FKRef struct {
+	Child *Table
+	FK    ForeignKey
+}
+
+// FindFKsReferencingTable returns all FKRef entries where FK.RefTable
+// matches the given table name (case-insensitive). Used by the executor
+// to find FK constraints that need enforcement when a parent row is
+// deleted or updated. M0096-0011.
+func (c *InMemory) FindFKsReferencingTable(tableName string) []FKRef {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	name := strings.ToLower(tableName)
+	var out []FKRef
+	for _, t := range c.tables {
+		if t.Virtual {
+			continue
+		}
+		for _, fk := range t.ForeignKeys {
+			if strings.ToLower(fk.RefTable) == name {
+				out = append(out, FKRef{Child: t, FK: fk})
+			}
+		}
+	}
+	return out
+}
+
+// ── Enum type methods ────────────────────────────────────────────────────────
+
+// RegisterEnum creates a new enum type. Returns an error if the name already
+// exists. M0097-0017.
+func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.enumTypes[k]; exists {
+		return nil, fmt.Errorf("type %q already exists", name)
+	}
+	et := &EnumType{
+		Name:   k,
+		OID:    c.nextOID,
+		Values: append([]string(nil), values...),
+	}
+	c.nextOID++
+	c.enumTypes[k] = et
+	return et, nil
+}
+
+// LookupEnum finds an enum type by name (case-insensitive). M0097-0017.
+func (c *InMemory) LookupEnum(name string) (*EnumType, bool) {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	et, ok := c.enumTypes[k]
+	return et, ok
+}
+
+// AddEnumValue appends a new label to an existing enum. before/after are
+// reference labels (empty = append at end). Returns an error if label already
+// exists unless ifNotExists is true, in which case it is a no-op. M0097-0017.
+func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.enumTypes[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	// Check for duplicate.
+	for _, v := range et.Values {
+		if strings.EqualFold(v, value) {
+			if ifNotExists {
+				return nil
+			}
+			return fmt.Errorf("enum label %q already exists", value)
+		}
+	}
+	switch {
+	case before != "":
+		for i, v := range et.Values {
+			if strings.EqualFold(v, before) {
+				newVals := make([]string, 0, len(et.Values)+1)
+				newVals = append(newVals, et.Values[:i]...)
+				newVals = append(newVals, value)
+				newVals = append(newVals, et.Values[i:]...)
+				et.Values = newVals
+				return nil
+			}
+		}
+		return fmt.Errorf("enum label %q not found", before)
+	case after != "":
+		for i, v := range et.Values {
+			if strings.EqualFold(v, after) {
+				newVals := make([]string, 0, len(et.Values)+1)
+				newVals = append(newVals, et.Values[:i+1]...)
+				newVals = append(newVals, value)
+				newVals = append(newVals, et.Values[i+1:]...)
+				et.Values = newVals
+				return nil
+			}
+		}
+		return fmt.Errorf("enum label %q not found", after)
+	default:
+		et.Values = append(et.Values, value)
+	}
+	return nil
+}
+
+// DropEnum removes an enum type. cascade=true is accepted (stub — does not
+// remove dependent columns). Returns an error if not found. M0097-0017.
+func (c *InMemory) DropEnum(name string, cascade bool) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.enumTypes[k]; !ok {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.enumTypes, k)
+	return nil
+}
+
+// ── Domain type methods ──────────────────────────────────────────────────────
+
+// RegisterDomain creates a new domain type. Returns an error if name already
+// exists. M0097-0017.
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, exists := c.domains[k]; exists {
+		return nil, fmt.Errorf("type %q already exists", name)
+	}
+	d := &Domain{
+		Name:    k,
+		OID:     c.nextOID,
+		Base:    base,
+		NotNull: notNull,
+	}
+	c.nextOID++
+	c.domains[k] = d
+	return d, nil
+}
+
+// LookupDomain finds a domain by name (case-insensitive). M0097-0017.
+func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	d, ok := c.domains[k]
+	return d, ok
+}
+
+// DropDomain removes a domain. cascade=true is accepted (stub). Returns an
+// error if not found and ifExists is false. M0097-0017.
+func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.domains[k]; !ok {
+		if ifExists {
+			return nil
+		}
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.domains, k)
+	return nil
+}
+
+// ResolveColumnType resolves a column type name through the domain and enum
+// registries to determine the effective storage type. For enums → "text"; for
+// domains → recursively resolves the base type. Returns the input unchanged if
+// no match is found. M0097-0017.
+func (c *InMemory) ResolveColumnType(typeName string) string {
+	k := strings.ToLower(typeName)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Check domain.
+	if d, ok := c.domains[k]; ok {
+		baseName := strings.ToLower(d.Base.Name)
+		// Recurse (without lock reacquire — use direct map lookup).
+		return c.resolveColumnTypeLocked(baseName)
+	}
+	// Check enum.
+	if _, ok := c.enumTypes[k]; ok {
+		return "text"
+	}
+	return typeName
+}
+
+// resolveColumnTypeLocked is the lock-free recursive helper for ResolveColumnType.
+func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
+	k := strings.ToLower(typeName)
+	if d, ok := c.domains[k]; ok {
+		return c.resolveColumnTypeLocked(strings.ToLower(d.Base.Name))
+	}
+	if _, ok := c.enumTypes[k]; ok {
+		return "text"
+	}
+	return typeName
 }

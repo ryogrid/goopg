@@ -1550,6 +1550,8 @@ func remapByPosMap(e *Expr, posMap func(int) int) {
 		}
 	case *ExtractExpr:
 		remapByPosMap(&x.Source, posMap)
+	case *CastExpr:
+		remapByPosMap(&x.Operand, posMap)
 	case *InExpr:
 		// Remap the probe operand; do NOT remap the inner Plan (already remapped).
 		remapByPosMap(&x.Operand, posMap)

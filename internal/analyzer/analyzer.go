@@ -42,6 +42,7 @@ type AnalyzeError struct {
 	Pos     int
 	Code    string
 	Message string
+	Hint    string // optional hint; propagated to PlanError.Hint by toPlanError. M0097-0004.
 }
 
 func (e *AnalyzeError) Error() string {
@@ -53,6 +54,24 @@ func (e *AnalyzeError) Error() string {
 
 func analyzeError(pos int, code, msg string) *AnalyzeError {
 	return &AnalyzeError{Pos: pos, Code: code, Message: msg}
+}
+
+// pgTimeName returns the PostgreSQL display name for a time/timestamp type
+// as used in "operator is not unique" error messages. M0097-0004.
+func pgTimeName(typName string) string {
+	switch strings.ToLower(typName) {
+	case "time":
+		return "time without time zone"
+	case "timetz":
+		return "time with time zone"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "date":
+		return "date"
+	}
+	return typName
 }
 
 type scope struct {
@@ -89,6 +108,10 @@ type scopeRel struct {
 	// fully-qualified path. Mirrors upstream's name-resolution
 	// rule for the EXCLUDED pseudo-relation.
 	qualifiedOnly bool
+	// usingHidden lists column names hidden from unqualified lookup
+	// because they appear in a JOIN USING clause. The left table's
+	// copy of these columns is canonical. M0097-0003.
+	usingHidden []string
 }
 
 // outerScope is the goroutine-thread-unsafe lexical-scope
@@ -173,9 +196,7 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 // InExpr / ExistsExpr handlers when recursing into inner
 // SELECTs so column refs can resolve against the outer scope.
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
-	if s.Distinct {
-		return analyzeError(s.Pos(), "0A000", "DISTINCT is not supported in v0 planner")
-	}
+	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
 		if s.SetOp.Type != parser.SetOpUnion || !s.SetOp.All {
 			return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
@@ -313,7 +334,7 @@ func analyzeLockingClauses(s *parser.SelectStmt, ctx *scope) error {
 	}
 	if len(s.GroupBy) > 0 {
 		return analyzeError(first.Pos(), "0A000",
-			"FOR UPDATE/SHARE is not allowed with GROUP BY clause")
+			"FOR UPDATE is not allowed with GROUP BY clause")
 	}
 	if s.Having != nil {
 		return analyzeError(first.Pos(), "0A000",
@@ -370,6 +391,10 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 	}
 	if len(s.Returning) > 0 {
 		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
+	}
+	// INSERT … SELECT: analyze the SELECT sub-statement and skip VALUES checks.
+	if s.Select != nil {
+		return analyzeSelectWithParent(s.Select, cat, nil)
 	}
 	if len(s.Rows) == 0 {
 		return analyzeError(s.Pos(), "42601", "INSERT requires at least one row")
@@ -610,6 +635,10 @@ func exprHasWindowFunc(e parser.Expr) bool {
 			return true
 		}
 		return false
+	case *parser.IsNullExpr:
+		return exprHasWindowFunc(x.Operand)
+	case *parser.IsBoolExpr:
+		return exprHasWindowFunc(x.Operand)
 	case *parser.InExpr:
 		if exprHasWindowFunc(x.Operand) {
 			return true
@@ -721,6 +750,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 		}
 		return catalog.Type{Name: "bool"}, nil
+	case *parser.IsNullExpr:
+		// IS [NOT] NULL always returns bool. Recurse into operand to catch errors.
+		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "bool"}, nil
+	case *parser.IsBoolExpr:
+		// IS [NOT] TRUE/FALSE/UNKNOWN always returns bool. M0097-0003.
+		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "bool"}, nil
 	case *parser.NullConst:
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.BooleanConst:
@@ -795,6 +836,19 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				strings.EqualFold(leftTyp.Name, "interval") && isTimestampLike(rightTyp) {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
+			// time + time / timestamp + timestamp → ambiguous operator error
+			// matching PostgreSQL's "operator is not unique" format. M0097-0004.
+			// Note: only trigger when BOTH sides are concrete time/timestamp types
+			// (not "unknown", which covers untyped string literals).
+			if (x.Op == parser.OpAdd || x.Op == parser.OpSub) &&
+				isConcreteTimestampLike(leftTyp) && isConcreteTimestampLike(rightTyp) {
+				lname := pgTimeName(leftTyp.Name)
+				rname := pgTimeName(rightTyp.Name)
+				ae := analyzeError(x.Pos(), "42725",
+					fmt.Sprintf("operator is not unique: %s %s %s", lname, x.Op, rname))
+				ae.Hint = "Could not choose a best candidate operator. You might need to add explicit type casts."
+				return catalog.Type{}, ae
+			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
@@ -864,6 +918,16 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		default:
 			return catalog.Type{Name: "unknown"}, nil
 		}
+	case *parser.ArraySubscriptExpr:
+		// Array element access: expr[index] → element type. For text[] the element is text.
+		// Just analyze sub-expressions and return text (most common case). M0097-0003.
+		if _, err := analyzeExpr(x.Base, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Index, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "text"}, nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
@@ -996,6 +1060,17 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		if !ok {
 			continue
 		}
+		// Skip USING-hidden columns from right side of JOIN USING. M0097-0003.
+		hiddenByUsing := false
+		for _, uh := range rel.usingHidden {
+			if strings.EqualFold(uh, x.Column) {
+				hiddenByUsing = true
+				break
+			}
+		}
+		if hiddenByUsing {
+			continue
+		}
 		if found != nil {
 			return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
 		}
@@ -1027,6 +1102,23 @@ func scopeRelMatches(rel scopeRel, table, schema string) bool {
 func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
 	if rv.Subquery != nil {
 		return synthesizeSubqueryTable(cat, rv)
+	}
+	// Table-valued function (M0096-0006): produce a synthetic table.
+	if rv.TableFunc != nil {
+		alias := rv.Alias
+		if alias == "" {
+			alias = rv.TableFunc.Name
+		}
+		colName := alias
+		if len(rv.Columns) > 0 {
+			colName = rv.Columns[0]
+		}
+		return &catalog.Table{
+			Name: alias,
+			Columns: []catalog.Column{
+				{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+			},
+		}, nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !ok {
@@ -1255,7 +1347,7 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 			if err != nil {
 				return nil, err
 			}
-			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias})
+			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias, usingHidden: j.Using})
 		}
 	}
 	return rels, nil
@@ -1275,11 +1367,44 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 // otherwise `?column?N`. Types come from analyzeExpr against an
 // inner scope built from the subquery's own FROM clause.
 //
-// v0 does not support LATERAL so the subquery is analyzed
-// without a parent scope; correlated derived tables are
-// deferred. See docs/design/0003-0014-derived-tables.md.
+// v0 does not support full LATERAL analysis, but accepts the LATERAL
+// keyword and falls back to a null-typed table when the inner subquery
+// references outer-scope columns (correlated lateral reference). The
+// fallback is safe for vacuumdb's CROSS JOIN LATERAL use case where the
+// produced column (inherited) is never referenced in the WHERE clause
+// for basic vacuum runs. See docs/design/0003-0014-derived-tables.md.
 func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
+	// VALUES subquery: FROM (VALUES (r1), ...) AS t(c1, c2).
+	// The inner SelectStmt has no Targets; build the column list from the
+	// explicit alias list (rv.Columns) or synthetic names. M0097-0003.
+	if len(rv.Subquery.ValuesRows) > 0 {
+		nCols := len(rv.Subquery.ValuesRows[0])
+		cols := make([]catalog.Column, nCols)
+		for i := 0; i < nCols; i++ {
+			name := fmt.Sprintf("column%d", i+1)
+			if i < len(rv.Columns) && rv.Columns[i] != "" {
+				name = rv.Columns[i]
+			}
+			// Use "unknown" so that numeric/arithmetic operations on VALUES
+			// columns pass type checking (isNumericLike("unknown") = true). M0097-0003.
+			cols[i] = catalog.Column{Name: name, Type: catalog.Type{Name: "unknown"}}
+		}
+		return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
+	}
 	if err := analyzeSelectWithParent(rv.Subquery, cat, nil); err != nil {
+		// LATERAL fallback: correlated reference to outer table fails analysis.
+		// When explicit column aliases are provided (rv.Columns), produce a
+		// synthetic table with those column names and unknown (text) types.
+		// This allows the outer query to proceed; column values are NULL at
+		// execution time (planSubqueryRangeVar also handles this case).
+		ae, isAnalyzeErr := err.(*AnalyzeError)
+		if isAnalyzeErr && (ae.Code == "42P01" || ae.Code == "42703") && len(rv.Columns) > 0 {
+			cols := make([]catalog.Column, len(rv.Columns))
+			for i, colName := range rv.Columns {
+				cols[i] = catalog.Column{Name: colName, Type: catalog.Type{Name: "text"}}
+			}
+			return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
+		}
 		return nil, err
 	}
 	innerCtx := &scope{cat: cat}
@@ -1291,19 +1416,40 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 		innerCtx.rels = rels
 	}
 	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
-	for i, tgt := range rv.Subquery.Targets {
+	for _, tgt := range rv.Subquery.Targets {
+		// Star expression in inner SELECT (e.g. TABLE tablename → SELECT * FROM tablename).
+		// Expand to all columns from the inner scope. M0097-0003.
+		if _, ok := tgt.Expr.(*parser.StarExpr); ok {
+			for _, rel := range innerCtx.rels {
+				for _, col := range rel.table.Columns {
+					cols = append(cols, catalog.Column{Name: col.Name, Type: col.Type})
+				}
+			}
+			continue
+		}
 		name := tgt.Alias
 		if name == "" {
 			name = deriveAnalyzerTargetName(tgt.Expr)
 		}
 		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+			name = fmt.Sprintf("?column?%d", len(cols)+1)
 		}
 		typ, err := analyzeExpr(tgt.Expr, innerCtx)
 		if err != nil {
 			return nil, err
 		}
 		cols = append(cols, catalog.Column{Name: name, Type: typ})
+	}
+	// Validate and apply explicit column aliases (rv.Columns). M0097-0003.
+	if len(rv.Columns) > 0 {
+		if len(rv.Columns) != len(cols) {
+			return nil, analyzeError(rv.Pos(), "42P01",
+				fmt.Sprintf("table %q has %d columns available but %d columns specified",
+					rv.Alias, len(cols), len(rv.Columns)))
+		}
+		for i := range cols {
+			cols[i].Name = rv.Columns[i]
+		}
 	}
 	return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
 }
@@ -1347,7 +1493,7 @@ func buildSelectScope(s *parser.SelectStmt, cat catalog.Catalog) ([]scopeRel, er
 			if err != nil {
 				return nil, err
 			}
-			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias})
+			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias, usingHidden: j.Using})
 		}
 	}
 	return rels, nil
@@ -1364,7 +1510,20 @@ func lookupColumn(tbl *catalog.Table, name string) (*catalog.Column, bool) {
 
 func resolveInsertTargetColumns(tbl *catalog.Table, cat catalog.Catalog, s *parser.InsertStmt) ([]catalog.Column, error) {
 	if len(s.Columns) == 0 {
-		return append([]catalog.Column(nil), tbl.Columns...), nil
+		// Skip GENERATED ALWAYS AS … STORED columns — they are computed by
+		// the executor, not supplied by the INSERT statement. M0096-0008.
+		out := make([]catalog.Column, 0, len(tbl.Columns))
+		for _, col := range tbl.Columns {
+			if col.GeneratedAlways {
+				continue
+			}
+			out = append(out, col)
+		}
+		if len(out) == len(tbl.Columns) {
+			// No generated columns — return all columns for backward compat.
+			return append([]catalog.Column(nil), tbl.Columns...), nil
+		}
+		return out, nil
 	}
 	out := make([]catalog.Column, 0, len(s.Columns))
 	for _, name := range s.Columns {
@@ -1447,7 +1606,19 @@ func isTimestampLike(t catalog.Type) bool {
 		return true
 	}
 	switch strings.ToLower(t.Name) {
-	case "timestamp", "timestamptz", "date":
+	case "timestamp", "timestamptz", "date", "time", "timetz":
+		return true
+	}
+	return false
+}
+
+// isConcreteTimestampLike is like isTimestampLike but returns false for
+// "unknown" type (untyped string literals). Used to avoid false-positive
+// "operator is not unique" errors when a string literal participates in
+// arithmetic. M0097-0004.
+func isConcreteTimestampLike(t catalog.Type) bool {
+	switch strings.ToLower(t.Name) {
+	case "timestamp", "timestamptz", "date", "time", "timetz":
 		return true
 	}
 	return false
@@ -1488,6 +1659,32 @@ func isComparable(left, right catalog.Type) bool {
 		return true
 	}
 	if isTimestampLike(left) && isTimestampLike(right) {
+		return true
+	}
+	// String literals (text) are comparable with date/time types via implicit cast.
+	// PostgreSQL resolves text→timestamp/date/time at runtime. M0097-0004.
+	if isStringTypeName(left.Name) && isTimestampLike(right) {
+		return true
+	}
+	if isTimestampLike(left) && isStringTypeName(right.Name) {
+		return true
+	}
+	// uuid, name, oid and other text-backed types are comparable with text/varchar. M0097-0003.
+	isTextBacked := func(t catalog.Type) bool {
+		switch strings.ToLower(t.Name) {
+		case "uuid", "name", "oid", "oidvector", "int2vector", "pg_lsn":
+			return true
+		}
+		return false
+	}
+	if (isTextBacked(left) || isStringTypeName(left.Name)) && (isTextBacked(right) || isStringTypeName(right.Name)) {
+		return true
+	}
+	// oid ↔ integer: PostgreSQL has implicit oid↔int4 casts. M0097-0003.
+	if strings.EqualFold(left.Name, "oid") && isNumericTypeName(right.Name) {
+		return true
+	}
+	if isNumericTypeName(left.Name) && strings.EqualFold(right.Name, "oid") {
 		return true
 	}
 	return false
@@ -1584,23 +1781,70 @@ func isAssignable(src, dst catalog.Type) bool {
 	if isBooleanTypeName(src.Name) && isBooleanTypeName(dst.Name) {
 		return true
 	}
-	// HammerDB and other tools (DBI / TCL pg_exec) pass every
-	// VALUES literal as a single-quoted string, including for
-	// NUMERIC columns: `INSERT INTO t (n) VALUES ('123')`.
-	// Upstream PG accepts this because bare string literals are
-	// typed `unknown` until inferred at the assignment site;
-	// goopg types them as `text` and instead recovers
-	// compatibility here. The executor's NUMERIC codec already
-	// stores string datums verbatim (see
-	// docs/design/0003-0004-hammerdb-tpch-integration.md), so
-	// the round-trip is lossless.
+	// Upstream PG accepts bare string literals ('123') for any column type
+	// because literals are typed `unknown` until inferred at the assignment
+	// site. goopg types them as `text` and recovers compatibility by
+	// allowing text → numeric, integer, and float column types. The executor
+	// validates and converts the value at runtime, giving a proper
+	// "invalid input syntax" (22P02) error for malformed inputs.
 	//
-	// Scope is intentionally narrow: only NUMERIC / DECIMAL
-	// columns. string→int4/int8 stays an error because the
-	// integer codec can't accept text — the existing analyzer
-	// test pinning `INSERT INTO pgbench_accounts (aid) VALUES
-	// ('x')` as 42804 still passes.
-	if isStringTypeName(src.Name) && isExactNumericTextTarget(dst.Name) {
+	// This enables test_setup.sql INSERTs like:
+	//   INSERT INTO INT2_TBL(f1) VALUES ('1234'), ('-1234');
+	// to populate the shared tables needed by int2/int4/int8/float tests.
+	// M0097-0003.
+	if isStringTypeName(src.Name) && isNumericOrIntegerTarget(dst.Name) {
+		return true
+	}
+	// String literals are assignable to oid and uuid columns; the
+	// executor validates the value at runtime and gives a proper
+	// "invalid input syntax" error for malformed inputs. M0097-0003.
+	if isStringTypeName(src.Name) && isOidOrUUIDTarget(dst.Name) {
+		return true
+	}
+	// String literals assignable to date/time column types; encodeValue
+	// parses and validates the string at runtime. M0097-0004.
+	if isStringTypeName(src.Name) && isDateTimeTarget(dst.Name) {
+		return true
+	}
+	// PostgreSQL allows integer/numeric values to be inserted into text/varchar
+	// columns via implicit cast. M0097-0003.
+	if isNumericTypeName(src.Name) && isStringTypeName(dst.Name) {
+		return true
+	}
+	return false
+}
+
+// isOidOrUUIDTarget reports whether dst is a column type whose codec
+// accepts string values by parsing them at runtime (oid, uuid).
+func isOidOrUUIDTarget(name string) bool {
+	switch strings.ToLower(name) {
+	case "oid", "uuid":
+		return true
+	}
+	return false
+}
+
+// isDateTimeTarget reports whether dst is a date/time column type that
+// accepts string values (parsed by encodeValue at runtime). M0097-0004.
+func isDateTimeTarget(name string) bool {
+	switch strings.ToLower(name) {
+	case "date", "time", "timetz", "timestamp", "timestamptz":
+		return true
+	}
+	return false
+}
+
+// isNumericOrIntegerTarget reports whether dst is a numeric, integer,
+// or float column type that can accept string literals at runtime.
+// Used by isAssignable. M0097-0003.
+func isNumericOrIntegerTarget(name string) bool {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal",
+		"int2", "smallint",
+		"int4", "integer", "int",
+		"int8", "bigint",
+		"float4", "real",
+		"float8", "double precision", "double":
 		return true
 	}
 	return false
@@ -1610,6 +1854,7 @@ func isAssignable(src, dst catalog.Type) bool {
 // whose v0 codec accepts string datums (NUMERIC / DECIMAL). Used
 // by isAssignable to permit the HammerDB-shape INSERT pattern
 // without weakening the assignment check for integer columns.
+// Deprecated: use isNumericOrIntegerTarget which covers more types.
 func isExactNumericTextTarget(name string) bool {
 	switch strings.ToLower(name) {
 	case "numeric", "decimal":

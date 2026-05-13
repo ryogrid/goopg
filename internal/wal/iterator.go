@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 )
 
 // RecordIterator walks the WAL stream forward from a starting LSN.
@@ -38,7 +39,10 @@ type RecordIterator struct {
 	segSize int64
 	wake    chan struct{}
 	pos     int64 // 0-based byte offset corresponding to the LSN cursor
-	closed  bool
+	// closed is an atomic flag so Close (e.g. called by walsender
+	// teardown) and Next (running in a separate goroutine) don't race.
+	// M0098-0002 exposed this via LockOSThread scheduling change.
+	closed atomic.Bool
 	// pageHeaders mirrors Writer.PageHeadersEnabled() at iterator
 	// construction time. When true, the cursor walks page-header
 	// bytes transparently: at every page boundary the iterator
@@ -81,10 +85,9 @@ func NewRecordIterator(w *Writer, walDir string, segSize int64, startLSN uint64)
 // Close releases the iterator's subscription. Safe to call multiple
 // times. After Close, Next returns io.EOF.
 func (it *RecordIterator) Close() error {
-	if it.closed {
-		return nil
+	if !it.closed.CompareAndSwap(false, true) {
+		return nil // already closed
 	}
-	it.closed = true
 	it.writer.Unsubscribe(it.wake)
 	return nil
 }
@@ -94,7 +97,7 @@ func (it *RecordIterator) Close() error {
 // io.EOF is returned only after Close. Other errors are wrapped
 // `ErrCorruptRecord` from the segment decoder.
 func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
-	if it.closed {
+	if it.closed.Load() {
 		return Record{}, io.EOF
 	}
 	for {

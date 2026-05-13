@@ -214,7 +214,7 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	case RecordKindHeapInsert:
 		return RmgrHeap, xlogInfoDefault, 0
 	case RecordKindHeapDelete:
-		_, _, _, xmax, err := DecodeHeapDelete(payload)
+		_, _, _, xmax, _, err := DecodeHeapDelete(payload)
 		if err == nil {
 			return RmgrHeap, xlogInfoDelete, uint32(xmax)
 		}

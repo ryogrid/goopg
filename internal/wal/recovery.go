@@ -810,9 +810,11 @@ func DecodeHeapInsert(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 }
 
 // EncodeHeapDelete encodes one logical heap-delete (xmax stamp)
-// redo record.
-func EncodeHeapDelete(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID) []byte {
-	out := make([]byte, heapDeleteSize)
+// redo record. oldTuple, when non-nil, is appended after the
+// fixed 20-byte header so the logical decoder can reconstruct the
+// pre-delete row for logical replication.
+func EncodeHeapDelete(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte) []byte {
+	out := make([]byte, heapDeleteSize+len(oldTuple))
 	out[0] = RecordKindHeapDelete
 	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
 	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
@@ -820,13 +822,18 @@ func EncodeHeapDelete(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot
 	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
 	binary.LittleEndian.PutUint16(out[14:16], lineSlot)
 	binary.LittleEndian.PutUint32(out[16:20], uint32(xmax))
+	if len(oldTuple) > 0 {
+		copy(out[heapDeleteSize:], oldTuple)
+	}
 	return out
 }
 
-// DecodeHeapDelete decodes a HeapDelete record payload.
-func DecodeHeapDelete(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, err error) {
-	if len(payload) != heapDeleteSize {
-		err = fmt.Errorf("wal: invalid heap-delete payload len %d (want %d)", len(payload), heapDeleteSize)
+// DecodeHeapDelete decodes a HeapDelete record payload. oldTuple is
+// non-nil only when the record was encoded with an old-tuple extension
+// (payload length > heapDeleteSize); legacy 20-byte records return nil.
+func DecodeHeapDelete(payload []byte) (rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, xmax storage.TransactionID, oldTuple []byte, err error) {
+	if len(payload) < heapDeleteSize {
+		err = fmt.Errorf("wal: heap-delete payload too short: %d (min %d)", len(payload), heapDeleteSize)
 		return
 	}
 	if payload[0] != RecordKindHeapDelete {
@@ -841,6 +848,10 @@ func DecodeHeapDelete(payload []byte) (rel storage.RelFileNode, blk storage.Bloc
 	blk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
 	lineSlot = binary.LittleEndian.Uint16(payload[14:16])
 	xmax = storage.TransactionID(binary.LittleEndian.Uint32(payload[16:20]))
+	if len(payload) > heapDeleteSize {
+		oldTuple = make([]byte, len(payload)-heapDeleteSize)
+		copy(oldTuple, payload[heapDeleteSize:])
+	}
 	return
 }
 
@@ -2433,7 +2444,7 @@ func replayHeapLock(mgr *storage.Manager, r Record) error {
 // page must already exist (HeapInsert or an earlier mutation
 // produced it). Idempotent via pd_lsn.
 func replayHeapDelete(mgr *storage.Manager, r Record) error {
-	rel, blk, lineSlot, xmax, err := DecodeHeapDelete(r.Payload)
+	rel, blk, lineSlot, xmax, _, err := DecodeHeapDelete(r.Payload)
 	if err != nil {
 		return err
 	}

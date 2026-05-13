@@ -35,7 +35,7 @@ type copyInState struct {
 	mgr      *mvcc.Manager
 }
 
-func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte) (*copyInState, error) {
+func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) (*copyInState, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -46,7 +46,7 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 	}
 	_, matchable, upper, empty := normalizeSimpleQuery(q)
 	if empty || !strings.HasPrefix(upper, "COPY ") {
-		if err := s.handleQuery(ctx, w, sess, payload); err != nil {
+		if err := s.handleQuery(ctx, w, sess, payload, connTx, prepStmts); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -154,6 +154,25 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		}
 		return nil, nil
 	case planner.CopyFrom:
+		if plan.Endpoint == planner.CopyEndpointFile {
+			// Server-side COPY FROM 'file': read file directly and insert rows.
+			count, err := executor.RunCopyFromFile(ectx, plan)
+			if err != nil {
+				_ = s.cfg.TxnMgr.Rollback(tx)
+				if wErr := s.writeQueryError(w, execErrCode(err), execErrMsg(err)); wErr != nil {
+					return nil, wErr
+				}
+				return nil, nil
+			}
+			_ = s.cfg.TxnMgr.Commit(tx)
+			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
+				return nil, err
+			}
+			if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
 		from, err := executor.NewCopyFromExecutor(ectx, plan)
 		if err != nil {
 			_ = s.cfg.TxnMgr.Rollback(tx)
@@ -472,12 +491,38 @@ func planErrorFields(err error) (sqlstate.Code, string) {
 	return sqlstate.FeatureNotSupported, err.Error()
 }
 
+// planErrorHintFields returns extra ErrorField(s) for any hint carried
+// by the error. Returns nil when no hint is present. M0097-0003.
+func planErrorHintFields(err error) []protocol.ErrorField {
+	var pe *planner.PlanError
+	if errors.As(err, &pe) && pe.Hint != "" {
+		return []protocol.ErrorField{{Code: protocol.FieldHint, Value: pe.Hint}}
+	}
+	return nil
+}
+
 func execErrCode(err error) sqlstate.Code {
 	var ee *executor.ExecError
 	if errors.As(err, &ee) && ee.Code != "" {
 		return sqlstate.Code(ee.Code)
 	}
 	return sqlstate.SystemError
+}
+
+// execErrDetailFields returns extra ErrorField(s) for any Detail and Hint carried by the error. M0097-0003.
+func execErrDetailFields(err error) []protocol.ErrorField {
+	var ee *executor.ExecError
+	if !errors.As(err, &ee) {
+		return nil
+	}
+	var fields []protocol.ErrorField
+	if ee.Detail != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: ee.Detail})
+	}
+	if ee.Hint != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldHint, Value: ee.Hint})
+	}
+	return fields
 }
 
 func execErrCodeStr(err error) string { return string(execErrCode(err)) }
