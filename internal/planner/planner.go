@@ -1135,7 +1135,10 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 			rows[i] = cells
 		}
 	}
-	return &Values{pos: pos, Rows: rows, schema: schema}
+	// VirtualSource is preserved so the executor can re-materialise
+	// rows at run time (the plan cache may otherwise serve a stale
+	// snapshot — see M0094-0005).
+	return &Values{pos: pos, Rows: rows, schema: schema, VirtualSource: tbl}
 }
 
 // planValuesSubquery plans a `(VALUES (r1), (r2), ...) AS alias (col1, col2)`

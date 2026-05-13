@@ -695,11 +695,18 @@ type Limit struct {
 func (n *Limit) Pos() int       { return n.pos }
 func (n *Limit) Output() Schema { return n.Child.Output() }
 
-// Values — produces literal rows for INSERT.
+// Values — produces literal rows for INSERT, or rematerialises a
+// virtual catalog table's current row set at execute time when
+// VirtualSource is non-nil. The Rows slice is the snapshot captured
+// at plan time; when VirtualSource is set, the executor refreshes it
+// by calling VirtualSource.VirtualRows() on Open so the cross-session
+// plan cache cannot serve a stale snapshot of a dynamic view
+// (M0094-0005).
 type Values struct {
-	pos    int
-	Rows   [][]Expr
-	schema Schema
+	pos           int
+	Rows          [][]Expr
+	schema        Schema
+	VirtualSource *catalog.Table
 }
 
 func (n *Values) Pos() int       { return n.pos }

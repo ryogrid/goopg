@@ -24,21 +24,34 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
 ### Sub-milestones
 
 - [ ] **M0094-0005** — Resolve remaining M0005 caveat, then re-verify M0005/M0008 DoD.
-      PARTIAL PROGRESS 2026-05-14: standby continuous-replay tail-anchor off-by-one
-      fixed in cmd/goopg/main.go (`startStandbyReplayer` + `startWalreceiver` now
-      anchor at `WrittenLSN()+1`, the next record's first byte LSN, instead of
-      `WrittenLSN()` which placed the iterator inside the last record and crashed
-      the replayer with "bad xlog total length 0" on every standby boot).
-      Regression test: `TestRecordIteratorAnchorAtTailBlocks` in
-      internal/wal/iterator_test.go. Design doc:
+      PARTIAL PROGRESS 2026-05-14 (loop 1): standby continuous-replay tail-anchor
+      off-by-one fixed in cmd/goopg/main.go (`startStandbyReplayer` +
+      `startWalreceiver` now anchor at `WrittenLSN()+1`, the next record's first
+      byte LSN, instead of `WrittenLSN()` which placed the iterator inside the
+      last record and crashed the replayer with "bad xlog total length 0" on
+      every standby boot). Regression test:
+      `TestRecordIteratorAnchorAtTailBlocks`. Design:
       `docs/design/0094-0005-standby-iterator-tail-anchor.md`.
-      Existing recovery tests still pass (Recovery001/013/019/047, KillKillRecovery).
-      Remaining open blocker: primary's `WrittenLSN()` does not advance after an
-      INSERT-via-lib/pq or after a `CHECKPOINT` RPC in the replcluster setup,
-      so `TestE2E_PhysicalReplication` and `TestReplicationEndToEnd` still
-      time out (now waiting at the correctly-anchored tail rather than crashing).
-      That is a separate WAL-emit / WAL-visibility bug on the primary side and
-      is the actual gating issue for M0005/M0008 DoD re-verification.
+      PROGRESS 2026-05-14 (loop 2): the apparent "primary `WrittenLSN()` does
+      not advance" symptom was actually a plan-cache staleness bug — the
+      planner materialised `VirtualRows()` into `Values.Rows` at plan time,
+      and the server-wide planCache served the frozen rows on every later
+      query, so `pg_stat_wal_receiver.written_lsn` looked stuck even though
+      the standby's walreceiver was appending and `SetReceivedLSN()` was
+      bumping the registry. Fix: `planner.Values` gains
+      `VirtualSource *catalog.Table`; `executor.valuesOp` re-materialises
+      rows on Open via `rematerialiseVirtualRows`. INSERT-side `Values` is
+      untouched (no VirtualSource). Design:
+      `docs/design/0094-0005b-virtual-view-plan-cache-staleness.md`.
+      `TestReplicationEndToEnd` — PASS. All affected packages pass:
+      planner/executor/server/initdb/wal/testutil regressions all green.
+      Remaining open blocker: `TestE2E_PhysicalReplication` (testport) still
+      fails — but the failure mode has shifted: standby WAL streams + applies
+      records, yet the standby's executor does not see the inserted row via
+      SELECT. That is a SQL-level row-visibility / catalog-vs-storage
+      coherence problem on the standby (standby's executor catalog snapshot,
+      MVCC visibility of replayed tuples, or buffer-pool reload after WAL
+      apply). To be diagnosed in a follow-up loop within M0094-0005 scope.
 
 ## M0095 — Client-Tools TAP Test Porting (filed 2026-05-12)
 

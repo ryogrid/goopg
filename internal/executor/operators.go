@@ -12,7 +12,16 @@ import (
 // valuesOp emits a fixed sequence of rows produced from literal
 // expressions. SELECT 1 plans into a Project over a one-row Values
 // with an empty input row.
+//
+// When the underlying plan node carries a VirtualSource (i.e. the
+// query reads from a goopg virtual catalog view like pg_stat_wal_receiver),
+// rows are refreshed at Open time by calling VirtualRows() on the
+// source table. This prevents the cross-session plan cache from
+// serving a stale snapshot — without it, the second and later queries
+// against a dynamic view would see the row materialised when the plan
+// was first cached. See M0094-0005.
 type valuesOp struct {
+	plan   *planner.Values
 	rows   [][]planner.Expr
 	idx    int
 	ctx    *Context
@@ -20,10 +29,40 @@ type valuesOp struct {
 }
 
 func newValuesOp(plan *planner.Values) *valuesOp {
-	return &valuesOp{rows: plan.Rows, schema: plan.Output()}
+	return &valuesOp{plan: plan, rows: plan.Rows, schema: plan.Output()}
 }
 
-func (o *valuesOp) Open(ctx *Context) error { o.ctx = ctx; o.idx = 0; return nil }
+// rematerialiseVirtualRows rebuilds the row expressions for a Values
+// node whose source is a virtual catalog table. The text payload
+// returned by tbl.VirtualRows() is wrapped in StringConst expressions
+// matching what the planner produces in buildVirtualValues; the
+// returned slice replaces o.rows for this Open cycle.
+func rematerialiseVirtualRows(plan *planner.Values) [][]planner.Expr {
+	tbl := plan.VirtualSource
+	raw := tbl.VirtualRows()
+	out := make([][]planner.Expr, len(raw))
+	for i, r := range raw {
+		cells := make([]planner.Expr, len(tbl.Columns))
+		for j := range tbl.Columns {
+			if j < len(r) {
+				cells[j] = &planner.StringConst{Value: r[j]}
+			} else {
+				cells[j] = &planner.NullConst{}
+			}
+		}
+		out[i] = cells
+	}
+	return out
+}
+
+func (o *valuesOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	o.idx = 0
+	if o.plan != nil && o.plan.VirtualSource != nil && o.plan.VirtualSource.VirtualRows != nil {
+		o.rows = rematerialiseVirtualRows(o.plan)
+	}
+	return nil
+}
 func (o *valuesOp) Schema() planner.Schema  { return o.schema }
 func (o *valuesOp) Close() error            { return nil }
 
