@@ -827,6 +827,15 @@ M0097-0001 wires it up.
       numerology test: 54 → 39 → 33 (NOTICE) → 17 (float8) normalized diff lines.
       Still 16 tests passing. Numerology at 17 diffs: blocked on SELECT DISTINCT (6),
       -0 display (4), parameter error messages (7).
+      Loop 24 additions (2026-05-13):
+      111. Parameter trailing junk detection: $1a / $0_1 → "trailing junk after parameter".
+      112. Parameter number overflow: $2147483648 → "parameter number too large".
+      113. Normalizer: strip "lex error at byte N:" prefix from parameter lex errors.
+      numerology: 17 → 13 diff lines (remaining: DISTINCT 6, -0 4, error format 3).
+      114. pg_size_pretty: use v.Format() for KindNumeric inputs (StringValue() empty).
+      115. pg_size_pretty: sizePrettyFloat uses math.Round for half-up rounding.
+      116. pg_size_pretty: overflow check for float64 inputs outside int64 range.
+      dbsize: 142 → 128 diff lines (still far from passing; complex formatting issues remain).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
