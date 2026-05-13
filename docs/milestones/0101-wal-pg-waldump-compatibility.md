@@ -1,6 +1,6 @@
 # Milestone 0101 — WAL pg_waldump Compatibility: PG-Compatible Format by Default
 
-**Status:** planned
+**Status:** accepted
 **Filed:** 2026-05-13
 **Implements:** M0014 (PostgreSQL-Compatible WAL On-Disk Format) — focused specifically on pg_waldump parseability as the acceptance gate
 **Reference plan:** `.ralph/fix_plan.md` (M0101 section)

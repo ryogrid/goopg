@@ -1476,7 +1476,7 @@ Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
       `go run ./cmd/gen-oracle-port-status`.
       Verify: `go test -v -run TestPort_WALPgWaldump ./internal/testport/` passes.
 
-- [ ] **M0101-0004** — Crash-recovery regression check with PG-compatible WAL.
+- [x] **M0101-0004** — Crash-recovery regression check with PG-compatible WAL.
       Confirm that WAL replay (`ReplayFromDirWithMgr`) correctly handles
       PG-compatible-format segments (i.e., `RecordIterator` with `pageHeaders=true`
       properly skips page headers and decodes records). Run the existing crash-
@@ -1486,7 +1486,7 @@ Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
       Verify: `go test -race -run TestCrashRecovery ./internal/...` (or equivalent)
       passes with the PG-compatible format active.
 
-- [ ] **M0101-0005** — Update milestone status and close.
+- [x] **M0101-0005** — Update milestone status and close.
       Update `docs/milestones/0014-wal-compatibility-with-pg.md` status note:
       add "M0101 implemented the default-on activation; full Rmgr payload
       mapping and recovery/streaming integration remain planned in M0014."
