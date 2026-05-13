@@ -24,10 +24,21 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
 ### Sub-milestones
 
 - [ ] **M0094-0005** — Resolve remaining M0005 caveat, then re-verify M0005/M0008 DoD.
-      Open blocker: written_lsn advancement after checkpoint remains unresolved.
-      Action: close the written_lsn checkpoint advancement gap, rerun physical
-      replication and recovery verification, then update M0005 status without caveat.
-      M0008 re-verification remains required after the above fix.
+      PARTIAL PROGRESS 2026-05-14: standby continuous-replay tail-anchor off-by-one
+      fixed in cmd/goopg/main.go (`startStandbyReplayer` + `startWalreceiver` now
+      anchor at `WrittenLSN()+1`, the next record's first byte LSN, instead of
+      `WrittenLSN()` which placed the iterator inside the last record and crashed
+      the replayer with "bad xlog total length 0" on every standby boot).
+      Regression test: `TestRecordIteratorAnchorAtTailBlocks` in
+      internal/wal/iterator_test.go. Design doc:
+      `docs/design/0094-0005-standby-iterator-tail-anchor.md`.
+      Existing recovery tests still pass (Recovery001/013/019/047, KillKillRecovery).
+      Remaining open blocker: primary's `WrittenLSN()` does not advance after an
+      INSERT-via-lib/pq or after a `CHECKPOINT` RPC in the replcluster setup,
+      so `TestE2E_PhysicalReplication` and `TestReplicationEndToEnd` still
+      time out (now waiting at the correctly-anchored tail rather than crashing).
+      That is a separate WAL-emit / WAL-visibility bug on the primary side and
+      is the actual gating issue for M0005/M0008 DoD re-verification.
 
 ## M0095 — Client-Tools TAP Test Porting (filed 2026-05-12)
 

@@ -562,19 +562,25 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 // supplied context is cancelled (clean shutdown) or the writer
 // closes (process tear-down).
 func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) *wal.StreamReplayer {
-	baseLSN := rt.WAL.WrittenLSN()
+	// WrittenLSN() is the LSN of the last byte already written. The
+	// iterator's startLSN argument is the LSN of the next record's
+	// first byte (= writer's "tail" position). Anchoring at WrittenLSN
+	// itself would try to read a record header starting at the last
+	// written byte and fail with "bad xlog total length 0".
+	writtenLSN := rt.WAL.WrittenLSN()
+	iterStartLSN := writtenLSN + 1
 	walDir := filepath.Join(rt.DataDir, "pg_wal")
-	sr := wal.NewStreamReplayer(rt.StorageMgr, baseLSN)
+	sr := wal.NewStreamReplayer(rt.StorageMgr, writtenLSN)
 	go func() {
 		defer close(done)
-		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, baseLSN)
+		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, iterStartLSN)
 		if err != nil {
 			logger.Error("standby replay: iterator init failed", "err", err)
 			return
 		}
 		defer func() { _ = iter.Close() }()
 		logger.Info("standby mode: starting continuous WAL replay",
-			"start_lsn", baseLSN)
+			"start_lsn", iterStartLSN)
 		if err := sr.Run(ctx, iter); err != nil {
 			logger.Error("standby replay: stopped on error",
 				"event", wal.EventStandbyReplayError,
@@ -633,11 +639,16 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			if ctx.Err() != nil {
 				return
 			}
+			// StartLSN is the LSN of the next record's first byte —
+			// i.e., WrittenLSN+1 (one past the last byte already in
+			// our local WAL). Sending WrittenLSN itself would make the
+			// primary's iterator anchor inside the last-applied record
+			// and stream garbage.
 			rec, err := server.DialWalReceiver(ctx, server.WalReceiverConfig{
 				PrimaryAddr:    addr,
 				User:           "postgres",
 				SlotName:       slotName,
-				StartLSN:       rt.WAL.WrittenLSN(),
+				StartLSN:       rt.WAL.WrittenLSN() + 1,
 				WAL:            rt.WAL,
 				StatusInterval: statusInterval,
 				DialTimeout:    10 * time.Second,
@@ -665,7 +676,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			logger.Info("walreceiver connected",
 				"event", wal.EventWalreceiverConnected,
 				"primary", addr, "slot", slotName,
-				"start_lsn", rt.WAL.WrittenLSN())
+				"start_lsn", rt.WAL.WrittenLSN()+1)
 			runErr := rec.Run(ctx)
 			lastApplied := rec.ApplyLSN()
 			_ = rec.Close()

@@ -174,3 +174,56 @@ func TestRecordIteratorStartLSNSkipsExisting(t *testing.T) {
 		t.Errorf("payload = %q, want c", rec.Payload)
 	}
 }
+
+// TestRecordIteratorAnchorAtTailBlocks pins the convention used by the
+// standby replayer and walreceiver in cmd/goopg: when starting at
+// "tail = next record after the last byte already written," the
+// caller passes startLSN = WrittenLSN()+1. The iterator must block
+// (not error) because pos lands exactly at the offset just past the
+// last written byte, with no half-record straddling the boundary.
+//
+// Regression guard: a previous bug anchored at WrittenLSN() itself
+// (pos = LSN of the last byte already in a complete record), which
+// caused readOneAt to try to decode a header starting in the middle
+// of the last record and fail with "bad xlog total length 0" — the
+// standby replayer crashed on every boot.
+func TestRecordIteratorAnchorAtTailBlocks(t *testing.T) {
+	w, dir := newTestWriter(t)
+	// Plant a real record so WrittenLSN() points at the end of a
+	// committed record, not at offset 0 (where startLSN==0 has its
+	// special-case semantics).
+	if _, _, err := w.Append([]byte("anchor")); err != nil {
+		t.Fatal(err)
+	}
+	tail := w.WrittenLSN()
+
+	it, err := NewRecordIterator(w, dir, 4096, tail+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+
+	// The iterator should be blocked at the tail. Use a short
+	// context to confirm "blocks rather than errors": ctx cancel
+	// (not corrupt-record) is the expected exit.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = it.Next(ctx)
+	if err != context.DeadlineExceeded {
+		t.Fatalf("Next at tail = %v, want context.DeadlineExceeded (block-then-cancel)", err)
+	}
+
+	// Now append a new record and confirm a fresh Next picks it up.
+	if _, _, err := w.Append([]byte("postanchor")); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	rec, err := it.Next(ctx2)
+	if err != nil {
+		t.Fatalf("Next after append: %v", err)
+	}
+	if string(rec.Payload) != "postanchor" {
+		t.Errorf("payload = %q, want postanchor", rec.Payload)
+	}
+}

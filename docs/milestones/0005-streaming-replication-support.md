@@ -14,10 +14,14 @@
    persisted, and visible in `pg_replication_slots` after restart
    (`TestPort_Recovery019ReplslotLimit`, `TestPort_Recovery047CheckpointPhysicalSlot`).
 4. ⚠️ Primary writes visible on standby: `TestE2E_PhysicalReplication`
-   times out — `written_lsn` does not advance after primary CHECKPOINT.
-   Pre-existing regression unrelated to M0094; walreceiver connection
-   works but WAL replay end-to-end has a known gap. Accepted as a
-   known limitation of the v0 physical-replay path.
+   times out. Standby's continuous-replay anchor was off by one
+   (M0094-0005, 2026-05-14, design doc
+   `docs/design/0094-0005-standby-iterator-tail-anchor.md`) — fixed,
+   replayer no longer crashes at boot. The remaining gap is on the
+   PRIMARY: `WrittenLSN()` does not advance after an INSERT-via-lib/pq
+   or after a CHECKPOINT RPC in the replcluster setup, so no records
+   reach the (now-correctly-anchored) iterator. Tracking under
+   M0094-0005's remaining open work.
 5. ✅ Replication health inspectable: `pg_stat_replication`,
    `pg_stat_wal_receiver`, `pg_replication_slots` all queryable.
 6. ✅ All required design docs merged with status `accepted`
