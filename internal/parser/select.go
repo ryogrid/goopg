@@ -1340,7 +1340,7 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 	t := p.cur()
 	name := strings.ToLower(identText(t))
 	switch name {
-	case "date", "timestamp", "timestamptz",
+	case "date", "timestamp", "timestamptz", "time", "timetz",
 		// Scalar types for `typename 'string'` cast syntax (M0097-0003).
 		"bool", "boolean",
 		"int2", "int4", "int8", "smallint", "integer", "bigint",

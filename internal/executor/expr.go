@@ -1408,11 +1408,30 @@ func parseSizeBytes(s string) (int64, error) {
 	return int64(result), nil
 }
 
+// newNumericFromFloat converts a float64 to a KindNumeric Datum for
+// EXTRACT/date_part fractional-second results. Uses up to 6 decimal places.
+func newNumericFromFloat(f float64) Datum {
+	s := strconv.FormatFloat(f, 'f', 6, 64)
+	// Strip trailing zeros after decimal point.
+	if idx := strings.Index(s, "."); idx >= 0 {
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimRight(s, ".")
+	}
+	if v, scale, ok := parseNumericFast(s); ok {
+		return Datum{Kind: KindNumeric, Int: v, Scale: scale}
+	}
+	m, scale, err := parseNumeric(s)
+	if err != nil {
+		return NewStringDatum(s)
+	}
+	return newNumeric(m, int(scale))
+}
+
 // evalExtract implements `EXTRACT(field FROM source)` for the
 // timestamp-component fields TPC-H Q7/Q8/Q9 use (year), plus
 // the obvious neighbours (month, day, hour, minute, dow, doy,
-// epoch). Returns int8; fractional-second fields wait on the
-// type system.
+// epoch). Returns int8 for most fields; float8 for fractional-second
+// fields (second, millisecond, epoch). M0097-0004.
 func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	src, err := evalExpr(x.Source, row, ctx)
 	if err != nil {
@@ -1433,7 +1452,24 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("EXTRACT(%s FROM …) requires timestamp/date input", x.Field)}
 	}
-	n, err := extractTimestampField(x.Field, src.TimeValue(), x.Pos())
+	// Fractional-second fields return float8 (numeric) in PostgreSQL.
+	u := src.TimeValue().UTC()
+	field := strings.ToLower(strings.TrimSpace(x.Field))
+	switch field {
+	case "second", "seconds":
+		// Fractional seconds: integer part + microseconds/1e6.
+		f := float64(u.Second()) + float64(u.Nanosecond())/1e9
+		return newNumericFromFloat(f), nil
+	case "milliseconds", "millisecond":
+		// Fractional milliseconds: seconds*1000 + microseconds/1000.
+		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
+		return newNumericFromFloat(f), nil
+	case "epoch":
+		// Epoch for time-of-day: seconds since midnight (fractional).
+		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
+		return newNumericFromFloat(f), nil
+	}
+	n, err := extractTimestampField(x.Field, u, x.Pos())
 	if err != nil {
 		return Datum{}, err
 	}
@@ -1533,7 +1569,21 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.Kind != KindTime {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "date_part second argument must be timestamp/date"}
 	}
-	n, err := extractTimestampField(fieldArg.StringValue(), src.TimeValue(), x.Pos())
+	// Fractional-second fields return float8 (numeric), like evalExtract. M0097-0004.
+	u := src.TimeValue().UTC()
+	field := strings.ToLower(strings.TrimSpace(fieldArg.StringValue()))
+	switch field {
+	case "second", "seconds":
+		f := float64(u.Second()) + float64(u.Nanosecond())/1e9
+		return newNumericFromFloat(f), nil
+	case "milliseconds", "millisecond":
+		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
+		return newNumericFromFloat(f), nil
+	case "epoch":
+		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
+		return newNumericFromFloat(f), nil
+	}
+	n, err := extractTimestampField(field, u, x.Pos())
 	if err != nil {
 		return Datum{}, err
 	}
