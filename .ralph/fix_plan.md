@@ -1401,6 +1401,19 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         from `status=defer` to `status=port`, `pass_required=yes`.
       - Update milestone doc 0100 status to `accepted`; update the
         `docs/milestones/README.md` index row to `accepted`.
+      Partial progress (2026-05-13):
+      - RETURNING support (M0100-0005 prerequisite, landed same loop):
+        Added `Returning`/`ReturningSchema` fields to Update/Delete plan nodes;
+        resolved in planUpdate/planDelete via `resolveTargets`; updateOp/deleteOp
+        collect RETURNING rows and yield via Next(); analyzer rejections removed.
+        TestPort_IsolationInsertConflictDoNothing PASS; unit tests -race clean.
+      - eval-plan-qual advances to permutation 30 before failing on a WAL
+        ErrLSNNotWritten (xact-marker flush to sentinel LSN after ~30 DDL
+        permutations). Remaining blockers per test:
+        - eval-plan-qual: WAL ErrLSNNotWritten on permutation 30 (spurious)
+        - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
+        - Most partition-key-update-*: triggers + FK syntax
+        - lock-committed-update: advisory lock snapshot not refreshed after wait
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

@@ -1036,6 +1036,11 @@ type updateOp struct {
 	// instead of the full SeqScan path (O(n)). Set by newUpdateOp
 	// when the planner produced an IndexScan.
 	idxScan *planner.IndexScan
+
+	// retRows / retIdx: collected RETURNING rows; iterated via Next()
+	// after all updates are applied (M0100-0005).
+	retRows []Row
+	retIdx  int
 }
 
 // RowsAffected satisfies executor.RowCounter.
@@ -1049,7 +1054,21 @@ func newUpdateOp(p *planner.Update) (*updateOp, error) {
 	return &updateOp{plan: p, scan: scan, pred: pred, idxScan: idxScan}, nil
 }
 
-func (o *updateOp) Schema() planner.Schema { return nil }
+func (o *updateOp) Schema() planner.Schema { return o.plan.ReturningSchema }
+
+// appendUpdateRetRow evaluates the plan's RETURNING expressions against
+// newRow and appends the result to o.retRows. No-op when RETURNING is absent.
+func (o *updateOp) appendUpdateRetRow(newRow Row) {
+	if len(o.plan.Returning) == 0 {
+		return
+	}
+	retRow := make(Row, len(o.plan.Returning))
+	for i, expr := range o.plan.Returning {
+		v, _ := evalExpr(expr, newRow, o.ctx)
+		retRow[i] = v
+	}
+	o.retRows = append(o.retRows, retRow)
+}
 
 func (o *updateOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -1279,6 +1298,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 		}
 		if !epqSkip {
+			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
 		}
 	}
@@ -1287,7 +1307,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 
 func (o *updateOp) Next() (TupleSlot, error) {
 	if o.done {
-		return nil, EOF
+		// Subsequent calls: iterate through RETURNING rows (M0100-0005).
+		if o.retIdx >= len(o.retRows) {
+			return nil, EOF
+		}
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	o.done = true
 	// M0093: UPDATE is unconditionally a write — materialise the
@@ -1485,6 +1511,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			} // end epq retry loop
 		} // end if !used
 		if !epqSkipSeq {
+			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
 		}
 	}
@@ -1501,6 +1528,8 @@ type deleteOp struct {
 	rowsAffected int64
 	done         bool
 	idxScan      *planner.IndexScan
+	retRows      []Row
+	retIdx       int
 }
 
 // RowsAffected satisfies executor.RowCounter.
@@ -1514,7 +1543,21 @@ func newDeleteOp(p *planner.Delete) (*deleteOp, error) {
 	return &deleteOp{plan: p, scan: scan, pred: pred, idxScan: idxScan}, nil
 }
 
-func (o *deleteOp) Schema() planner.Schema { return nil }
+func (o *deleteOp) Schema() planner.Schema { return o.plan.ReturningSchema }
+
+// appendDeleteRetRow evaluates RETURNING expressions against the old row
+// (before deletion) and appends to o.retRows (M0100-0005).
+func (o *deleteOp) appendDeleteRetRow(oldRow Row) {
+	if len(o.plan.Returning) == 0 {
+		return
+	}
+	retRow := make(Row, len(o.plan.Returning))
+	for i, expr := range o.plan.Returning {
+		v, _ := evalExpr(expr, oldRow, o.ctx)
+		retRow[i] = v
+	}
+	o.retRows = append(o.retRows, retRow)
+}
 
 func (o *deleteOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -1535,7 +1578,13 @@ func (o *deleteOp) Close() error { return nil }
 
 func (o *deleteOp) Next() (TupleSlot, error) {
 	if o.done {
-		return nil, EOF
+		// Subsequent calls: iterate RETURNING rows (M0100-0005).
+		if o.retIdx >= len(o.retRows) {
+			return nil, EOF
+		}
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	o.done = true
 	// M0093: DELETE is unconditionally a write — materialise the
@@ -1676,6 +1725,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
+			o.appendDeleteRetRow(v.row)
 			o.rowsAffected++
 		}
 	}

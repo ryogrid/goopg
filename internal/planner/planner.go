@@ -3295,7 +3295,16 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		}
 		set[col.Ordinal] = expr
 	}
-	return &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}, nil
+	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}
+	if len(s.Returning) > 0 {
+		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
+		if err != nil {
+			return nil, err
+		}
+		upd.Returning = retExprs
+		upd.ReturningSchema = retSchema
+	}
+	return upd, nil
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
@@ -3332,7 +3341,16 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 		}
 	}
-	return &Delete{pos: s.Pos(), Table: tbl, Child: node}, nil
+	del := &Delete{pos: s.Pos(), Table: tbl, Child: node}
+	if len(s.Returning) > 0 {
+		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
+		if err != nil {
+			return nil, err
+		}
+		del.Returning = retExprs
+		del.ReturningSchema = retSchema
+	}
+	return del, nil
 }
 
 // planMerge converts a MERGE INTO statement into a Merge plan node.

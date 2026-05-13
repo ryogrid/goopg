@@ -538,9 +538,6 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 	if err != nil {
 		return err
 	}
-	if len(s.Returning) > 0 {
-		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
-	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	if s.With != nil {
 		if err := analyzeWith(s.With, ctx); err != nil {
@@ -570,9 +567,6 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 	tbl, err := lookupTable(cat, s.Target)
 	if err != nil {
 		return err
-	}
-	if len(s.Returning) > 0 {
-		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	if s.With != nil {

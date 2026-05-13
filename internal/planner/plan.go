@@ -890,25 +890,29 @@ type OnConflictPlan struct {
 // existing value alone; non-nil entries are evaluated against the
 // child's rows.
 type Update struct {
-	pos   int
-	Table *catalog.Table
-	Child Node
-	Set   []Expr // len == len(Table.Columns)
+	pos             int
+	Table           *catalog.Table
+	Child           Node
+	Set             []Expr // len == len(Table.Columns)
+	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
+	ReturningSchema Schema // output schema when Returning is non-nil
 }
 
 func (n *Update) Pos() int       { return n.pos }
-func (n *Update) Output() Schema { return nil }
+func (n *Update) Output() Schema { return n.ReturningSchema }
 
 // Delete — marks the visible rows of Table that survive the child's
 // filter as dead.
 type Delete struct {
-	pos   int
-	Table *catalog.Table
-	Child Node
+	pos             int
+	Table           *catalog.Table
+	Child           Node
+	Returning       []Expr
+	ReturningSchema Schema
 }
 
 func (n *Delete) Pos() int       { return n.pos }
-func (n *Delete) Output() Schema { return nil }
+func (n *Delete) Output() Schema { return n.ReturningSchema }
 
 // ── Merge plan node (M0096-0010) ─────────────────────────────────────────────
 
