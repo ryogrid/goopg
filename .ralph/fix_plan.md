@@ -763,6 +763,21 @@ M0097-0001 wires it up.
       New test passing: portals_p2. Total passing: 15.
       time test: still deferring (87 diff lines after normalization; remaining: pg_input_error_info
       table function, EXTRACT from time, time arithmetic not yet passing).
+      Loop 18 additions (2026-05-13):
+      84. GROUP BY functional dependency: Aggregate.Passthrough field + isColumnFunctionallyDetermined
+          planner helper; aggregateOp evaluates passthrough cols from first row of each group.
+          SELECT id,keywords FROM t GROUP BY id now works when id is PK.
+      85. CONSTRAINT name PRIMARY KEY parser fix: parseColumnDef handles inline
+          CONSTRAINT foo PRIMARY KEY correctly (was silently skipping, no PK index created).
+      86. JOIN USING ambiguity fix (analyzer + planner): scopeRel.usingHidden / rangeBinding.usingHidden
+          hide right-side USING cols from unqualified lookup; separate mergedRightBinding preserves
+          rightCtx access for predicate. Fixes ambiguous product_id in USING joins.
+      87. TIME 'val' typed literal: added "time"/"timetz" to parseTypedAtom so EXTRACT(field FROM TIME 'val')
+          and other usages work correctly.
+      88. EXTRACT/date_part fractional precision: second/milliseconds/epoch return float8 (KindNumeric)
+          matching PostgreSQL; EXTRACT(MILLISECOND FROM TIME '...') → 25575.401.
+      functional_deps test: 60 → 25 normalized diff lines. time test: 87 → 74 normalized diff lines.
+      Still 15 tests passing (no new PASS but significant diff reduction).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
