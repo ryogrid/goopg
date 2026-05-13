@@ -798,6 +798,16 @@ M0097-0001 wires it up.
           with HINT "Could not choose a best candidate operator."
       98. ExecError.Hint field added for future use.
       New test passing: time. Total now 16 passing regress tests.
+      Loop 21 additions (2026-05-13):
+      99. Normalizer: drop "mvcc: xact-marker hook ... ErrLSNNotWritten" errors
+          (spurious WAL flush timing error with no PostgreSQL equivalent).
+      100. Lexer: trailing junk after numeric literal — if ident char immediately
+           follows integer/decimal/hex/binary/octal literal, produce lex error
+           "trailing junk after numeric literal at or near X". Matches PostgreSQL.
+           Also handles 0b/0o/0x with no valid digits or with trailing ident chars.
+      numerology test: 162 → 130 normalized diff lines.
+      delete test: WAL error normalization stabilizes it.
+      Still 16 tests passing (delete was intermittently failing due to WAL error).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
