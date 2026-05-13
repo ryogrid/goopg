@@ -1436,7 +1436,7 @@ Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
 
 ### Sub-milestones
 
-- [ ] **M0101-0001** — Enable `PageHeaders = true` by default.
+- [x] **M0101-0001** — Enable `PageHeaders = true` by default.
       Design doc: `docs/design/0101-0001-wal-page-header-compat-default.md`.
       Site: `internal/initdb/open.go:232` — add `PageHeaders: true` to `walCfg`.
       Also add `loadOrCreateSystemID(dir string) (uint64, error)` helper that
@@ -1450,7 +1450,7 @@ Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
       `./postgres/local_install/bin/pg_waldump <segment>` exits 0;
       `go test ./internal/wal/... ./internal/initdb/...` passes.
 
-- [ ] **M0101-0002** — Verify long page header field values against pg_waldump.
+- [x] **M0101-0002** — Verify long page header field values against pg_waldump.
       No code change expected; this is a verification sub-milestone.
       Start a goopg cluster with the M0101-0001 fix, run a small workload,
       stop cleanly, then manually verify each field of the first segment's long
@@ -1464,7 +1464,7 @@ Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
       Run `pg_waldump --stats <segment>` and confirm at least one Rmgr line
       is printed.
 
-- [ ] **M0101-0003** — Add `TestPort_WALPgWaldumpCompat` oracle test.
+- [x] **M0101-0003** — Add `TestPort_WALPgWaldumpCompat` oracle test.
       Design doc: `docs/design/0101-0002-wal-pg-waldump-validation-test.md`.
       File: `internal/testport/wal_pg_waldump_test.go`.
       Test flow: start cluster → workload (CREATE TABLE + INSERT 100 rows +
