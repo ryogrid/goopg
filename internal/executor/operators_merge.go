@@ -32,6 +32,8 @@ type mergeOp struct {
 // mergePendingMod records a single MERGE modification to apply after the
 // target scan completes. srcRow is kept for EPQ re-evaluation. M0100-0005.
 type mergePendingMod struct {
+	rel    storage.RelFileNode // actual relfilenode to write to (child for partitioned)
+	tblRef *catalog.Table      // actual table metadata (child for partitioned)
 	blk    storage.BlockNumber
 	slot   uint16
 	action planner.MergeActionKind
@@ -110,14 +112,38 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 	}
 
 	// Step 2: scan target, apply WHEN MATCHED clauses.
+	// For partitioned tables, scan all partition children (the parent has no rows). M0100-0005.
 	var mods []mergePendingMod
 
-	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	// For partitioned tables, scan only the children (parent has no rows).
+	// For non-partitioned tables, scan only the parent. M0100-0005.
+	scanTables := []*catalog.Table{tbl}
+	if len(tbl.PartitionKey) > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			children := im.PartitionChildren(tbl.OID)
+			if len(children) > 0 {
+				scanTables = children // replace parent with children
+			}
+		}
+	}
+
+	for _, scanTbl := range scanTables {
+		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
+		// Lock child partitions (parent already locked above).
+		if scanTbl != tbl {
+			if err := o.ctx.acquireRelLock(scanRel, lockmgr.RowExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = o.plan.Pos()
+				}
+				return nil, err
+			}
+		}
+	nBlocks, err := o.ctx.Pool.NBlocks(scanRel)
 	if err != nil {
 		return nil, err
 	}
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
-		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: scanRel, Block: blk})
 		if err != nil {
 			return nil, err
 		}
@@ -151,7 +177,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
 				continue
 			}
-			tgtRow, err := DecodeRow(tbl.Columns, tuple.Data)
+			tgtRow, err := DecodeRow(scanTbl.Columns, tuple.Data)
 			if err != nil {
 				continue
 			}
@@ -194,12 +220,12 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 							}
 							newRow[i] = val
 						}
-						_ = computeGeneratedColumns(tbl.Columns, newRow)
-						mods = append(mods, mergePendingMod{blk: blk, slot: vt.slotIdx,
+						_ = computeGeneratedColumns(scanTbl.Columns, newRow)
+						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionUpdate, newRow: newRow,
 							srcRow: cloneRow(srcRows[si].row), tgtRow: cloneRow(vt.tgtRow)})
 					case planner.MergeActionDelete:
-						mods = append(mods, mergePendingMod{blk: blk, slot: vt.slotIdx,
+						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionDelete, srcRow: cloneRow(srcRows[si].row),
 							tgtRow: cloneRow(vt.tgtRow)})
 					case planner.MergeActionDoNothing:
@@ -210,11 +236,20 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				break // first source match wins
 			}
 		}
-	}
+	} // end for blk
+	} // end for scanTbl
 
 	// Apply pending modifications (with EPQ retry loop for concurrent updates).
 	for _, mod := range mods {
-		applied, err := o.applyMod(rel, tbl, n, mod)
+		modTbl := mod.tblRef
+		if modTbl == nil {
+			modTbl = tbl
+		}
+		modRel := mod.rel
+		if modRel == (storage.RelFileNode{}) {
+			modRel = rel
+		}
+		applied, err := o.applyMod(modRel, modTbl, n, mod)
 		if err != nil {
 			return nil, err
 		}
@@ -280,29 +315,14 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 // conditions no longer match), (false, err) on fatal error.
 func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, mod mergePendingMod) (applied bool, _ error) {
 	for {
-		// Fire BEFORE UPDATE/DELETE triggers before the actual write.
-		if len(tbl.Triggers) > 0 {
-			switch mod.action {
-			case planner.MergeActionUpdate:
-				retRow, ok := fireTriggers(o.ctx, tbl, "before", "update", mod.tgtRow, mod.newRow)
-				if !ok {
-					return false, nil // RETURN NULL — skip row
-				}
-				mod.newRow = retRow
-			case planner.MergeActionDelete:
-				_, ok := fireTriggers(o.ctx, tbl, "before", "delete", mod.tgtRow, nil)
-				if !ok {
-					return false, nil // RETURN NULL — skip row
-				}
-			}
-		}
-
+		// Triggers are fired inside mergeApplyUpdate/Delete after EPQ resolves,
+		// so they fire exactly once per successful write. M0100-0005.
 		var err error
 		switch mod.action {
 		case planner.MergeActionUpdate:
-			err = mergeApplyUpdate(o.ctx, rel, nil, tbl.Columns, mod.blk, mod.slot, mod.newRow, mod.tgtRow, o.plan.Pos())
+			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, mod.newRow, mod.tgtRow, o.plan.Pos())
 		case planner.MergeActionDelete:
-			err = mergeApplyDelete(o.ctx, rel, nil, tbl.Columns, mod.blk, mod.slot, mod.tgtRow, o.plan.Pos())
+			err = mergeApplyDelete(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, mod.tgtRow, o.plan.Pos())
 		default:
 			return false, nil
 		}
@@ -358,7 +378,7 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		if !reMatched {
 			return false, nil // no clause matched after EPQ re-eval
 		}
-		// Loop back to retry with updated slot/newRow. Trigger fires again at top.
+		// Loop back to retry with updated slot/newRow. mergeApplyUpdate/Delete fires trigger.
 	}
 }
 
