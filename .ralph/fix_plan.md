@@ -1385,6 +1385,82 @@ if 21-spec pass surfaces a real divergence:
       all declared `package main`, causing "main redeclared" errors. Added
       `//go:build ignore` to each. (Note: tmp/ is in .gitignore; change is local.)
 
+## M0101 — WAL pg_waldump Compatibility: PG-Compatible Format by Default (filed 2026-05-13)
+
+**Policy: No DEFERRED unless (a) Go/design constraint makes it impossible, (b) reason
+is documented in-body, and (c) an alternative pass-path is provided. All items are
+required for the Definition of Done.**
+
+**Context.** All goopg clusters currently write WAL in the **legacy flat format**
+(magic `0x200E`). `pg_waldump` rejects them immediately with "invalid WAL segment
+size". Root cause confirmed by hex inspection of `/tmp/ralph_regress_data/pg_wal/`:
+`Config.PageHeaders` defaults to `false`. The PG-compatible path (magic `0xD118`,
+`XLP_LONG_HEADER`, `xlp_seg_size = 16MiB`) is **fully implemented** in
+`internal/wal/` (M0014-0003); it is only inactive because it is never switched on.
+Field offsets and Rmgr IDs match PostgreSQL exactly — no format work needed.
+
+Milestone doc: `docs/milestones/0101-wal-pg-waldump-compatibility.md`.
+Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
+
+### Sub-milestones
+
+- [ ] **M0101-0001** — Enable `PageHeaders = true` by default.
+      Design doc: `docs/design/0101-0001-wal-page-header-compat-default.md`.
+      Site: `internal/initdb/open.go:232` — add `PageHeaders: true` to `walCfg`.
+      Also add `loadOrCreateSystemID(dir string) (uint64, error)` helper that
+      reads `<datadir>/global/system_identifier` (8-byte binary file) on restart
+      or generates+persists a random `uint64` on first run; pass result as
+      `SystemID` in `walCfg`. `TimelineID` does not need explicit setting —
+      `writer.go:205-206` auto-sets it to 1 when `PageHeaders=true` and
+      `TimelineID==0`.
+      Verify: hex dump of a newly created WAL segment shows bytes 0-1 = `18 d1`
+      (magic 0xD118 LE) and bytes 2-3 = `02 00` (`XLP_LONG_HEADER` flag set);
+      `./postgres/local_install/bin/pg_waldump <segment>` exits 0;
+      `go test ./internal/wal/... ./internal/initdb/...` passes.
+
+- [ ] **M0101-0002** — Verify long page header field values against pg_waldump.
+      No code change expected; this is a verification sub-milestone.
+      Start a goopg cluster with the M0101-0001 fix, run a small workload,
+      stop cleanly, then manually verify each field of the first segment's long
+      page header matches expected values:
+      - `xlp_magic` = `0xD118` (offset 0-1)
+      - `xlp_info` has bit `0x0002` set (offset 2-3)
+      - `xlp_tli` = 1 (offset 4-7)
+      - `xlp_seg_size` = 16,777,216 = `0x01000000` (offset 32-35)
+      - `xlp_xlog_blcksz` = 8192 = `0x00002000` (offset 36-39)
+      If any value is wrong, fix the encoding and update the design doc.
+      Run `pg_waldump --stats <segment>` and confirm at least one Rmgr line
+      is printed.
+
+- [ ] **M0101-0003** — Add `TestPort_WALPgWaldumpCompat` oracle test.
+      Design doc: `docs/design/0101-0002-wal-pg-waldump-validation-test.md`.
+      File: `internal/testport/wal_pg_waldump_test.go`.
+      Test flow: start cluster → workload (CREATE TABLE + INSERT 100 rows +
+      CHECKPOINT) → stop → enumerate `pg_wal/` segments → for each, run
+      `./postgres/local_install/bin/pg_waldump --quiet <seg>` → assert exit 0.
+      Skip if `pg_waldump` binary not found. Add `wal-pg-waldump-compat` entry
+      to `docs/test-port/postgres-oracle-port-status.csv` (`status=port`,
+      `pass_required=yes`); regenerate `.md` via
+      `go run ./cmd/gen-oracle-port-status`.
+      Verify: `go test -v -run TestPort_WALPgWaldump ./internal/testport/` passes.
+
+- [ ] **M0101-0004** — Crash-recovery regression check with PG-compatible WAL.
+      Confirm that WAL replay (`ReplayFromDirWithMgr`) correctly handles
+      PG-compatible-format segments (i.e., `RecordIterator` with `pageHeaders=true`
+      properly skips page headers and decodes records). Run the existing crash-
+      recovery tests with a freshly created PG-compatible-format cluster.
+      Document any failures and fix them. No new code expected if the `pageHeaders`
+      path in the reader already works; this sub-milestone is the verification gate.
+      Verify: `go test -race -run TestCrashRecovery ./internal/...` (or equivalent)
+      passes with the PG-compatible format active.
+
+- [ ] **M0101-0005** — Update milestone status and close.
+      Update `docs/milestones/0014-wal-compatibility-with-pg.md` status note:
+      add "M0101 implemented the default-on activation; full Rmgr payload
+      mapping and recovery/streaming integration remain planned in M0014."
+      Update `docs/milestones/0101-wal-pg-waldump-compatibility.md` status to
+      `accepted`. Update `docs/milestones/README.md` index row for 0101.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
