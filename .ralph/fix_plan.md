@@ -838,6 +838,13 @@ M0097-0001 wires it up.
       118. Normalizer: `syntax error at or near ".5"` → `trailing junk after numeric literal`.
       119. Normalizer: IEEE 754 negative zero " -0" → " 0" (semantic equivalence).
       New test passing: numerology. Total now 17 passing regress tests.
+      Loop 26 (crash fix) additions (2026-05-13):
+      120. distinctOp crash fix: nil slot guard + use slot.Row() directly; avoids
+           nil pointer dereference when empty-schema rows are processed.
+      121. SELECT DISTINCT empty target list: planner rejects with "syntax error at
+           or near 'from'" matching PostgreSQL (before: server crash; after: proper error).
+      errors: 325 (crashed) → 60 (crash fixed, back to pre-DISTINCT baseline).
+      Still 17 tests passing.
       114. pg_size_pretty: use v.Format() for KindNumeric inputs (StringValue() empty).
       115. pg_size_pretty: sizePrettyFloat uses math.Round for half-up rounding.
       116. pg_size_pretty: overflow check for float64 inputs outside int64 range.
