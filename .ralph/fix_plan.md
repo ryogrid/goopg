@@ -1534,6 +1534,146 @@ Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
       Update `docs/milestones/0101-wal-pg-waldump-compatibility.md` status to
       `accepted`. Update `docs/milestones/README.md` index row for 0101.
 
+## M0102 — Heterogeneous Streaming-Replication + SIGKILL-Failover E2E (filed 2026-05-13)
+
+**【Strong policy — DO NOT BYPASS】**
+Within this milestone, marking any sub-task as DEFERRED is, as a rule, not
+permitted. The two E2E tests are the milestone's reason for existing; leaving
+any required runtime gap (BASE_BACKUP, TIMELINE_HISTORY, sync replication
+wait, promote signal) unimplemented means the tests cannot pass and the
+Definition of Done is unreachable. Escape hatches such as "push it to a later
+milestone" or "skip the sync variant" must not be used. DEFERRED is permitted
+only when **all three** of the following hold simultaneously: (a) it is
+clearly demonstrated that the item is impossible to implement in this release
+due to goopg's Go-implementation constraints or explicit design constraints;
+(b) the reason is documented in the body of the affected sub-milestone; and
+(c) within the same milestone, an alternative path is presented that lets the
+corresponding test subtest reach `pass` (not `excluded`).
+
+Operational note (2026-05-13):
+- For items that can only be partially progressed due to an external blocker or missing goopg support, blocker resolution is itself in scope for this milestone.
+- For items that can move forward once a blocker is resolved, do not mark them complete until the resolution is implemented and re-verified.
+
+**Goal.** Deliver two E2E tests that survive a `kill -9` on the primary:
+1. **Scenario A** — PG primary + goopg standby
+2. **Scenario B** — goopg primary + PG standby
+
+Each scenario runs in two modes: `async` (default `synchronous_commit`) and
+`sync_remote_apply` (`synchronous_commit = remote_apply`). The sync subtest
+must verify **zero loss** of committed rows after failover.
+
+Milestone doc: `docs/milestones/0102-heterogeneous-replication-failover-e2e.md`.
+Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
+
+### Sub-milestones
+
+- [ ] **M0102-0001** — Prerequisite gate.
+      Audit M0094-0005 (`written_lsn` advancement on standby) and M0101
+      (PG-compatible WAL format default-on) status. If either is incomplete,
+      M0102 is blocked. M0094-0005 is required for Scenario A (goopg standby
+      replaying PG WAL with correct LSN reporting). M0101 is required for
+      Scenario B (PG walreceiver consuming goopg WAL bytes). This sub-milestone
+      itself does no implementation; it is a hard gate that must be checked
+      before M0102-0002 can begin.
+
+- [ ] **M0102-0002** — BASE_BACKUP wire-protocol handler on goopg primary.
+      Design doc: `docs/design/0102-0001-base-backup-wire-protocol.md`.
+      Sites: `internal/server/replication.go` (add `case "BASE_BACKUP":` arm);
+      new `internal/server/basebackup.go` (POSIX ustar tar emitter, file
+      walking over `base/`+`global/`+optional `pg_wal/`, `backup_label`
+      synthesis, optional MANIFEST). Mirrors upstream
+      `postgres/src/backend/replication/walsender.c:1984`
+      `exec_replication_command` BASE_BACKUP arm and `basebackup.c:990`
+      `SendBaseBackup`. Verify: `./postgres/local_install/bin/pg_basebackup
+      -h 127.0.0.1 -p <goopg> -D /tmp/clone -X stream -P -v` exits 0 and the
+      cloned dir starts as a goopg standby.
+
+- [ ] **M0102-0003** — TIMELINE_HISTORY wire-protocol + TLI history file writer.
+      Design doc: `docs/design/0102-0002-timeline-history-and-promotion-tli-switch.md`.
+      Sites: new `internal/wal/timeline_history.go` (`ReadHistory`,
+      `WriteHistory`, `TimelineHistoryEntry`); `internal/server/replication.go`
+      adds `case "TIMELINE_HISTORY":`; `cmd/goopg/standby.go` `Promote(ctx)`
+      increments TLI and writes `pg_wal/<NewTLI>.history` before clearing
+      `standby.signal`. Persist TLI in a `global/timeline_id` file (or extend
+      the M0101 `system_identifier` file). Verify: after `goopg promote`, the
+      data dir contains `00000002.history`; `TIMELINE_HISTORY 2` over the
+      replication wire returns the file content.
+
+- [ ] **M0102-0004** — `promote.signal` file watcher (pg_ctl promote parity).
+      Design doc: `docs/design/0102-0004-promotion-trigger-pg-ctl-parity.md`.
+      Site: `cmd/goopg/standby.go` — add `promoteSignalWatcher` goroutine that
+      polls `<datadir>/promote.signal` every 250 ms; on detect, remove the
+      file and call existing `Promote(ctx)`. Reuse `promoteOnce` for
+      idempotency with the control-socket PROMOTE. Verify: `touch
+      <datadir>/promote.signal` against a running standby flips
+      `pg_is_in_recovery()` to `false` within 1 s; `pg_ctl promote -D
+      <goopg-dir>` works.
+
+- [ ] **M0102-0005** — Synchronous replication: `synchronous_standby_names` +
+      commit-wait + standby feedback.
+      Design doc: `docs/design/0102-0005-synchronous-replication.md`.
+      Sites: (a) `internal/config/defaults.go` — add
+      `synchronous_standby_names` GUC; (b) new `internal/wal/syncrep.go` —
+      `SyncRep` struct with `WaitForLSN(ctx, lsn, mode)`,
+      `UpdateStandbyProgress(appName, write, flush, apply)`, `ReleaseWaiters`,
+      modelled on `postgres/src/backend/replication/syncrep.c`; (c)
+      `internal/executor/operators_tx.go` (or commit-emit site) — call
+      `WaitForLSN` after local flush in the COMMIT path when the GUC is set
+      and the level is `remote_*`; (d) `internal/server/replication.go`
+      walsender loop — dispatch Standby Status Update messages into
+      `UpdateStandbyProgress`; (e) `internal/server/walreceiver.go` — confirm
+      / extend periodic Standby Status Update emission, using actual
+      replayed-LSN for apply_lsn. Wire `WaitSyncRep` wait-event constant at
+      `internal/activity/activity.go:70`. Verify: unit test
+      `internal/wal/syncrep_test.go` (race-tested): commit blocks until
+      simulated standby reports apply_lsn ≥ commit_lsn; cancellation of ctx
+      returns immediately. E2E: a focused test where the standby is killed
+      while the primary's commit holds `remote_apply` — commit must block
+      until the standby reattaches.
+
+- [ ] **M0102-0006** — Scenario A E2E test: PG primary + goopg standby.
+      Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
+      File: `internal/testport/e2e_failover_pg_to_goopg_test.go`. Two
+      subtests via `t.Run("async", …)` / `t.Run("sync_remote_apply", …)`.
+      Flow per subtest: start PG primary via new `internal/testutil/pgcluster/`
+      package wrapping `pg_ctl` (configured with
+      `synchronous_standby_names='goopg_standby' + synchronous_commit=
+      remote_apply` for the sync variant); start pgbench workload `pgbench -i
+      -s 1 && pgbench -c 2 -T 180` in background; `pg_basebackup -h <pg>
+      -D <goopg-dir> -X stream -S goopg_standby`; start goopg as standby with
+      `application_name=goopg_standby` in `primary_conninfo`; wait for
+      `pg_last_wal_replay_lsn()` to catch up; `kill -9 <pg-pid>`; touch
+      `<goopg-dir>/promote.signal` (or call `goopg promote`); reconnect
+      pgbench client via libpq multi-host
+      `host=<pg>,<goopg> target_session_attrs=read-write`; assert a new
+      INSERT succeeds on goopg. Verify: sync subtest's post-promotion
+      `count(*)` strictly equals workload's committed-INSERT counter at kill
+      time; async subtest's count is within the documented bound.
+
+- [ ] **M0102-0007** — Scenario B E2E test: goopg primary + PG standby.
+      Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
+      File: `internal/testport/e2e_failover_goopg_to_pg_test.go`. Same two
+      subtests. Symmetric flow with the dual-binary harness: start goopg
+      primary (with `synchronous_standby_names='pg_standby' +
+      synchronous_commit=remote_apply` for sync); `pg_basebackup -h <goopg>
+      -D <pg-dir> -X stream -S pg_standby` (requires M0102-0002 BASE_BACKUP);
+      start PG standby via `pgcluster`; run a custom psql-driven INSERT+UPDATE
+      loop (pgbench-on-goopg is out of scope); `kill -9 <goopg-pid>`;
+      `pg_ctl promote -D <pg-dir>`; reconnect client via libpq multi-host;
+      assert new INSERT succeeds on PG. Same per-subtest DoD as M0102-0006.
+
+- [ ] **M0102-0008** — Close milestone.
+      Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
+      `e2e-failover-pg-to-goopg-async`, `e2e-failover-pg-to-goopg-sync`,
+      `e2e-failover-goopg-to-pg-async`, `e2e-failover-goopg-to-pg-sync` — all
+      at `status=port`, `pass_required=yes`. Regenerate the `.md` via
+      `go run ./cmd/gen-oracle-port-status`. Flip
+      `docs/milestones/0102-heterogeneous-replication-failover-e2e.md` status
+      to `accepted` and update the `docs/milestones/README.md` index row.
+      Mark all 5 design docs (`0102-0001..-0005`) as `accepted`. Run the
+      regression suites listed in the milestone DoD and confirm zero
+      regressions.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
