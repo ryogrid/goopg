@@ -787,6 +787,17 @@ M0097-0001 wires it up.
           "unit X not supported/recognized for type time without time zone" errors.
       92. evalDatePart: same fractional-second float handling.
       time test: 51 → 29 normalized diff lines (remaining: pg_input_error_info table func + operator error message).
+      Loop 20 additions (2026-05-13):
+      93. pg_input_error_info: added time/timetz validation via parseTimeString().
+      94. Out-of-range time error code: changed 22007 → 22008 for out-of-range (h>24).
+      95. AnalyzeError.Hint field: propagated through toPlanError → PlanError.Hint;
+          execErrDetailFields now also emits FieldHint.
+      96. isConcreteTimestampLike(): excludes "unknown" to avoid false-positive operator
+          errors on untyped string literals.
+      97. time+time operator error: "operator is not unique: time without time zone + ..."
+          with HINT "Could not choose a best candidate operator."
+      98. ExecError.Hint field added for future use.
+      New test passing: time. Total now 16 passing regress tests.
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
