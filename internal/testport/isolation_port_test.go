@@ -107,7 +107,9 @@ func runIsoSpec(t *testing.T, root string, c *cluster.Cluster, specRelPath strin
 	dsn := buildDSN(t, c)
 	runner := &framework.IsolationRunner{DSN: dsn}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// 10-minute timeout: specs with 24+ permutations each requiring per-
+	// permutation DDL setup/teardown can exceed 2 minutes on goopg.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	result := runner.RunAndCompare(ctx, root, specRelPath)

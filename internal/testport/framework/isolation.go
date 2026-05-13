@@ -18,13 +18,14 @@ type IsolationStep struct {
 }
 
 type IsolationSpec struct {
-	Path         string
-	Sessions     []string
-	SetupSQL     string            // global setup run before each permutation
-	TeardownSQL  string            // global teardown run after all permutations
-	SessionSetup map[string]string // per-session setup run before each permutation
-	Steps        map[string]IsolationStep
-	Permutations [][]string
+	Path             string
+	Sessions         []string
+	SetupSQL         string            // global setup run before each permutation
+	TeardownSQL      string            // global teardown run after each permutation
+	SessionSetup     map[string]string // per-session setup run before each permutation
+	SessionTeardown  map[string]string // per-session teardown run after each permutation
+	Steps            map[string]IsolationStep
+	Permutations     [][]string
 }
 
 type IsolationStepResult struct {
@@ -82,9 +83,10 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 	defer f.Close()
 
 	s := IsolationSpec{
-		Path:         filepath.ToSlash(path),
-		Steps:        map[string]IsolationStep{},
-		SessionSetup: map[string]string{},
+		Path:            filepath.ToSlash(path),
+		Steps:           map[string]IsolationStep{},
+		SessionSetup:    map[string]string{},
+		SessionTeardown: map[string]string{},
 	}
 
 	scanner := bufio.NewScanner(f)
@@ -139,7 +141,11 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 			}
 			if strings.HasPrefix(rest, "{") {
 				body := readBlock(rest[1:], scanner)
-				s.TeardownSQL = body
+				if ctx == ctxSession && currentSession != "" {
+					s.SessionTeardown[currentSession] = body
+				} else {
+					s.TeardownSQL = body
+				}
 			}
 			continue
 		}

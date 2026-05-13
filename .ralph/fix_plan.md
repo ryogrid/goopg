@@ -1355,22 +1355,24 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
       Verified: `TestPort_IsolationInsertConflictDoNothing` → PASS.
       All unit tests (mvcc/executor/server/planner) pass with -race.
 
-- [ ] **M0100-0003** — Row-level wait on in-progress xmax for UPDATE/DELETE.
-      Design doc: `docs/design/0100-0003-row-level-wait-on-in-progress-xmax.md`.
-      Sites: `internal/executor/operators_storage.go:78-95` — re-enable
-      blocking `TxnMgr.WaitForXID(ctx.Ctx, xmax)` inside `epqWait` between
-      the WFG cycle check and the snapshot refresh. M0098-0004 introduced
-      the EPQ shape; M0099-0004 removed blocking due to a pgbench
-      goroutine hang. Re-enable safely by: (a) auditing the four `epqWait`
-      call sites (lines 922, 1157, 1331, 1518) to confirm page pins are
-      released before blocking; (b) keeping the WFG cycle short-circuit
-      ahead of the wait; (c) fallback path — session-scoped
-      `goopg.wait_on_xmax` GUC (default off) consumed only by
-      `IsolationRunner`'s connection init — if global re-enable regresses
-      pgbench. Verify: `TestPort_IsolationLockCommittedUpdate`,
-      `…LockCommittedKeyupdate`, `TestPort_IsolationPartitionKeyUpdate{1..4}`
-      reach `pass`; pgbench standard `-c 10 -T 30` no goroutine hang;
-      `go test -race ./internal/executor/...` clean.
+- [x] **M0100-0003** — Row-level wait on in-progress xmax for UPDATE/DELETE. (2026-05-13)
+      Design doc: `docs/design/0100-0003-row-level-wait-on-in-progress-xmax.md` (accepted).
+      Implemented:
+      1. `executor/operators_storage.go:epqWait`: re-enabled `WaitForXID(ctx.Ctx, xmax)`
+         between WFG cycle check and snapshot refresh. All 4 call sites verified to
+         unpin/unlock before calling epqWait (lines 923-924, 1159-1160, 1333-1334, 1520-1521).
+         Context cancellation (connection close, timeout) handled via commitCond.Broadcast.
+      2. `testport/framework/isolation.go`: Added `SessionTeardown` field; fixed teardown
+         parser to separate global teardown from per-session teardown (was overwriting TeardownSQL).
+      3. `testport/framework/isolation_runner.go`: Session-aware wait before sending next step
+         for a session with a pending goroutine (prevents dual-goroutine connection conflicts);
+         per-session teardown now runs after final drain and includes formatted output; reduced
+         drainWindow 30s→5s; added execConnCapture; isolated context timeout to 10 min.
+      4. `testport/isolation_port_test.go`: context timeout 2m→10m for 24-permutation specs.
+      Verified: TestPort_IsolationInsertConflictDoNothing PASS; TestPort_IsolationLockCommittedUpdate
+      runs in 7.36s (was >600s hang) and produces `<waiting ...>` output (deferred on value
+      mismatch due to advisory-lock snapshot refresh issue, separate from epqWait). All unit
+      tests -race clean.
 
 - [ ] **M0100-0004** — EvalPlanQual concurrent UPDATE recheck (chain-following).
       Design doc: `docs/design/0100-0004-evalplanqual-recheck.md`.

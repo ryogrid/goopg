@@ -62,19 +62,18 @@ func deregisterWFG(myXID storage.TransactionID) {
 	wfgMu.Unlock()
 }
 
-// epqWait detects deadlock cycles via the wait-for graph (WFG) and refreshes
-// the snapshot. Returns true if a deadlock cycle is confirmed — caller must
-// immediately escalate to SQLSTATE 40001. Returns false otherwise.
+// epqWait detects deadlock cycles via the wait-for graph (WFG), blocks on
+// the holder XID, then refreshes the snapshot. Returns true if a deadlock
+// cycle is confirmed — caller must immediately escalate to SQLSTATE 40001.
+// Returns false otherwise (caller retries via the EPQ loop).
 //
-// WFG cycle detection (M0099-0004) provides earlier deadlock identification
-// than the M0098-0004 retry-exhaustion approach: a confirmed 2-node cycle
-// (TX1→TX2, TX2→TX1) yields 40001 immediately for one participant instead
-// of after maxEPQRetries snapshot-refresh rounds.
-//
-// Non-deadlock conflicts fall back to snapshot-refresh-only (same as
-// M0098-0004) — blocking via WaitForXID was removed because it caused
-// pgbench client goroutines to hang past the 180 s measurement window.
-// M0098-0004, M0099-0004.
+// WFG cycle detection (M0099-0004) provides earlier deadlock identification:
+// a confirmed 2-node cycle (TX1→TX2, TX2→TX1) yields 40001 immediately for
+// one participant. WaitForXID blocks until the holder commits or aborts —
+// all callers release page pins before reaching here, so no pin-hold
+// deadlock is possible. Context cancellation (connection close, query
+// timeout) is propagated via commitCond.Broadcast inside WaitForXID.
+// M0098-0004, M0099-0004, M0100-0003.
 func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
 	if ctx.TxnMgr == nil {
 		return false
@@ -84,6 +83,14 @@ func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
 			return true
 		}
 		defer deregisterWFG(ctx.Tx.XID)
+	}
+	// PG parity: block until the holder transaction commits or aborts.
+	// All four call sites release page pins before reaching here
+	// (verified at lines 923-924, 1159-1160, 1333-1334, 1520-1521).
+	if ctx.Ctx != nil {
+		// Ignore cancellation errors — treat as a non-deadlock signal
+		// and fall through to the snapshot refresh + caller retry.
+		_ = ctx.TxnMgr.WaitForXID(ctx.Ctx, xmax)
 	}
 	// Refresh the snapshot so the next epqRecheckVisible call sees any
 	// committed changes from the conflicting transaction.

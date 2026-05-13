@@ -18,7 +18,7 @@ const (
 	blockDetectWait = 300 * time.Millisecond
 	// drainWindow is how long we wait for a pending (blocked) step to
 	// unblock after all steps in a permutation have been submitted.
-	drainWindow = 30 * time.Second
+	drainWindow = 5 * time.Second
 )
 
 // stepOutcome is the result of executing one step in a goroutine.
@@ -31,9 +31,10 @@ type stepOutcome struct {
 // pendingStep tracks a step goroutine that has been submitted but has not yet
 // completed (i.e., is blocked on a lock).
 type pendingStep struct {
-	name  string
-	sql   string
-	outCh chan stepOutcome
+	name    string
+	sql     string
+	session string // which session this step belongs to
+	outCh   chan stepOutcome
 }
 
 // IsolationRunner executes an IsolationSpec against a live database.
@@ -154,6 +155,26 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			}
 		}
 
+		// PostgreSQL isolationtester.c: if this session has a pending
+		// (blocked) step, wait for it to complete before sending the next
+		// step to the same session. Each session connection can only
+		// process one query at a time; running a second query on a busy
+		// connection would block indefinitely.
+		for i, p := range pending {
+			if p.session == step.Session {
+				select {
+				case o := <-p.outCh:
+					fmt.Fprintf(&sb, "step %s: <... completed>\n", p.name)
+					sb.WriteString(formatStepOutput(p.name, p.sql, o, true))
+					pending = append(pending[:i], pending[i+1:]...)
+				case <-time.After(drainWindow):
+					fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
+					pending = append(pending[:i], pending[i+1:]...)
+				}
+				break
+			}
+		}
+
 		outCh := make(chan stepOutcome, 1)
 		go func(c *sql.Conn, sqlText string, ch chan<- stepOutcome) {
 			ch <- execStep(ctx, c, sqlText)
@@ -170,7 +191,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		case <-time.After(blockDetectWait):
 			// Step appears blocked; record and continue.
 			fmt.Fprintf(&sb, "step %s: %s <waiting ...>\n", step.Name, flattenSQL(step.SQL))
-			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, outCh: outCh})
+			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh})
 		}
 	}
 
@@ -184,6 +205,17 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			sb.WriteString(formatStepOutput(p.name, p.sql, outcome, true))
 		case <-time.After(drainWindow):
 			fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
+		}
+	}
+
+	// Per-session teardown: run on session connections and include output in
+	// the permutation result (matches PostgreSQL isolationtester.c output format).
+	for _, sname := range sessionNames {
+		if tdSQL, ok := spec.SessionTeardown[sname]; ok && tdSQL != "" {
+			if c, ok2 := conns[sname]; ok2 {
+				out := execConnCapture(ctx, c, tdSQL)
+				sb.WriteString(out)
+			}
 		}
 	}
 
@@ -387,6 +419,25 @@ func execConn(ctx context.Context, conn *sql.Conn, sqlText string) error {
 		return err
 	}
 	return rows.Close()
+}
+
+// execConnCapture runs sqlText and returns the formatted result set (without a
+// step header). Used for per-session teardown which appears as raw output in
+// PostgreSQL isolationtester's permutation output.
+func execConnCapture(ctx context.Context, conn *sql.Conn, sqlText string) string {
+	outcome := execStep(ctx, conn, sqlText)
+	if outcome.errText != "" {
+		return outcome.errText + "\n"
+	}
+	if len(outcome.rows) == 0 {
+		return ""
+	}
+	cols := outcome.rows[0]
+	data := outcome.rows[1:]
+	if len(cols) == 0 {
+		return ""
+	}
+	return pqprintFormat(cols, data, outcome.colTypes)
 }
 
 // formatPQError formats a database error as isolationtester would print it.
