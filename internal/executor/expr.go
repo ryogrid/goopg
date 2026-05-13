@@ -1356,6 +1356,9 @@ func sizePrettyFloat(f float64) string {
 		TB = float64(1024 * 1024 * 1024 * 1024)
 		PB = float64(1024 * 1024 * 1024 * 1024 * 1024)
 	)
+	// halfRoundF: round float64 to nearest integer (round half up), matching
+	// PostgreSQL's integer halfRound for consistent kB/MB/etc display. M0097-0018.
+	halfRoundF := func(n, unit float64) int64 { return int64(math.Round(n / unit)) }
 	switch {
 	case f < 10*kB:
 		if f == 1 {
@@ -1369,15 +1372,15 @@ func sizePrettyFloat(f float64) string {
 			}
 		}
 	case f < 10*MB:
-		result = fmt.Sprintf("%d kB", int64(f/kB))
+		result = fmt.Sprintf("%d kB", halfRoundF(f, kB))
 	case f < 10*GB:
-		result = fmt.Sprintf("%d MB", int64(f/MB))
+		result = fmt.Sprintf("%d MB", halfRoundF(f, MB))
 	case f < 10*TB:
-		result = fmt.Sprintf("%d GB", int64(f/GB))
+		result = fmt.Sprintf("%d GB", halfRoundF(f, GB))
 	case f < 10*PB:
-		result = fmt.Sprintf("%d TB", int64(f/TB))
+		result = fmt.Sprintf("%d TB", halfRoundF(f, TB))
 	default:
-		result = fmt.Sprintf("%d PB", int64(f/PB))
+		result = fmt.Sprintf("%d PB", halfRoundF(f, PB))
 	}
 	if neg {
 		return "-" + result
@@ -2690,20 +2693,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
-			// Accept both integer and numeric (string) types.
+			// Accept both integer and numeric (string/KindNumeric) types.
 			var byteVal int64
 			var fracBytes float64
 			var hasFrac bool
 			if v.Kind == KindInt {
 				byteVal = v.Int
 			} else {
-				// numeric stored as string
-				s := strings.TrimSpace(v.StringValue())
+				// Use Format() for KindNumeric (works for all non-string kinds).
+				// StringValue() only works for KindString/KindStringArena. M0097-0018.
+				s := strings.TrimSpace(v.Format())
 				if f, err2 := strconv.ParseFloat(s, 64); err2 == nil {
-					byteVal = int64(f)
-					if f != float64(int64(f)) {
+					if f != float64(int64(f)) || f < -9223372036854775808.0 || f > 9223372036854775807.0 {
 						hasFrac = true
 						fracBytes = f
+					} else {
+						byteVal = int64(f)
 					}
 				} else {
 					return NullDatum, nil
