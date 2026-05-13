@@ -156,8 +156,15 @@ func Init(opts Options) error {
 	}
 	// Generate and persist the cluster system identifier (M0101-0001).
 	// Used as xlp_sysid in PG-compatible WAL page headers.
-	if _, err := LoadOrCreateSystemID(abs); err != nil {
+	sysID, err := LoadOrCreateSystemID(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: system_identifier: %w", err)
+	}
+	// Write the PG-compatible pg_control file so pg_controldata,
+	// pg_checksums, and other client tools can inspect the cluster
+	// (M0095-0001).
+	if err := writePgControl(abs, sysID); err != nil {
+		return fmt.Errorf("goopg init: pg_control: %w", err)
 	}
 	return nil
 }

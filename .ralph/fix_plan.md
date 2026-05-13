@@ -82,17 +82,23 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
 
 ### Sub-milestones
 
-- [ ] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
+- [x] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
       `pg_walsummary/001` as Go tests in
       `internal/testport/client_tools_port_test.go`.
       Binary discovery: PATH first, then `postgres/local_install/bin`.
-      `pg_controldata/001` adapted: CLI + data-dir error-path pass; checkpoint
-      output check deferred (goopg v0 has no global/pg_control).
-      `pg_checksums/002` adapted: option-validation sub-cases pass; enable/disable
-      deferred (no pg_control).  CSV rows C-001/C-002/CD-001/WS-001 added;
-      markdown regenerated. All 4 tests pass (2026-05-12).
-      Action: implement a goopg-compatible control metadata surface (or equivalent
-      compatibility path) so deferred pg_control-dependent checks can run.
+      Closed 2026-05-14: `internal/initdb/pgcontrol.go` writes a PG18-format
+      `global/pg_control` (296-byte ControlFileData + zero padding to 8192 B,
+      CRC32C Castagnoli, system_identifier + cluster parameters; checkpoint
+      fields zero pending live-update path) during initdb, right after the
+      cluster system identifier is persisted. `pg_controldata` against a
+      goopg cluster now exits 0 and prints full upstream output (no version,
+      CRC, or alignment warnings). `TestPort_PgControldata001` upgraded to
+      the upstream positive-output check (`exit==0 && stdout contains
+      "checkpoint"`). `pg_checksums` enable/disable still deferred — needs
+      page-level checksum support over every relfile, which is out of
+      M0095 scope. CSV rows C-002 and CD-001 updated to reflect new state;
+      `docs/test-port/postgres-oracle-port-status.md` regenerated.
+      Design doc: `docs/design/0095-0001-pg-control-file.md`.
 
 - [ ] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
       as adapted Go test in `client_tools_port_test.go`.

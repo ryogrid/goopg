@@ -10,9 +10,9 @@ package testport
 // Binary discovery: PATH first, then postgres/local_install/bin as fallback.
 // All tests call t.Skip if the binary is not available.
 //
-// pg_controldata and pg_checksums require a global/pg_control file which
-// goopg v0 does not write during init. Affected sub-cases note this with
-// a comment and test the correct error behaviour instead.
+// pg_controldata and pg_checksums require a global/pg_control file.
+// Goopg writes a PG-compatible pg_control during initdb (M0095-0001),
+// so the full output check is active.
 
 import (
 	"context"
@@ -140,12 +140,13 @@ func TestPort_PgChecksums002Actions(t *testing.T) {
 //
 // Adapted:
 //   - CLI validation sub-cases pass unchanged.
-//   - Data-directory sub-case: goopg v0 does not write global/pg_control during
-//     init, so pg_controldata exits non-zero with a "could not open" error.
-//     The test asserts that the failure is a pg_control-access error (not a crash),
-//     which is the expected v0 behaviour.  Remove the conditional and assert
-//     qr/checkpoint/ output once goopg writes global/pg_control.
-//   - CRC-corruption sub-case: deferred (requires a valid pg_control to corrupt).
+//   - Data-directory sub-case: goopg now writes a PG-compatible global/pg_control
+//     during initdb (M0095-0001), so the test asserts pg_controldata exits 0 and
+//     prints upstream-shape output (contains "checkpoint" label).
+//   - CRC-corruption sub-case: still deferred — pg_controldata only warns on a
+//     bad CRC and still exits 0, so a positive-output corruption check would
+//     duplicate the success path. Promote once goopg's pg_control reflects
+//     live checkpoint state and the corruption check has a meaningful signal.
 func TestPort_PgControldata001(t *testing.T) {
 	// upstream: postgres/src/bin/pg_controldata/t/001_pg_controldata.pl
 	bin := clientToolBin(t, "pg_controldata")
@@ -183,32 +184,20 @@ func TestPort_PgControldata001(t *testing.T) {
 	}
 
 	// cluster init + pg_controldata <datadir>.
-	// Adapted from upstream output-check and CRC-corruption sub-case.
-	//
-	// goopg v0 does not write global/pg_control, so pg_controldata exits non-zero.
-	// We verify the error is a pg_control-related file-access error (not a crash
-	// or an unrelated error), confirming correct tool behaviour against a v0 data dir.
-	// When goopg writes global/pg_control, replace the else-branch with:
-	//   if !strings.Contains(res.Stdout, "checkpoint") { t.Fatalf(...) }
+	// goopg writes a PG-compatible global/pg_control during initdb (M0095-0001),
+	// so pg_controldata must exit 0 and print upstream-shape output containing
+	// the "checkpoint" label.
 	c := newCluster(t, "pgcontroldata001")
 	if err := c.Init(); err != nil {
 		t.Fatal(err)
 	}
 	res = runTool(t, bin, c.DataDir())
-	if res.ExitCode == 0 {
-		// pg_control present (future-proof path): check basic output.
-		if !strings.Contains(res.Stdout, "checkpoint") {
-			t.Fatalf("pg_controldata output missing 'checkpoint'; stdout=%q", res.Stdout)
-		}
-	} else {
-		// goopg v0: no pg_control; expect a file-access error mentioning pg_control.
-		combined := res.Stdout + res.Stderr
-		if !strings.Contains(combined, "pg_control") &&
-			!strings.Contains(combined, "open") &&
-			!strings.Contains(combined, "No such file") {
-			t.Fatalf("expected pg_control file-access error; stderr=%q stdout=%q",
-				res.Stderr, res.Stdout)
-		}
+	if res.ExitCode != 0 {
+		t.Fatalf("pg_controldata <datadir> exit=%d stderr=%q stdout=%q",
+			res.ExitCode, res.Stderr, res.Stdout)
+	}
+	if !strings.Contains(res.Stdout, "checkpoint") {
+		t.Fatalf("pg_controldata output missing 'checkpoint'; stdout=%q", res.Stdout)
 	}
 }
 
