@@ -180,10 +180,10 @@ func (l *lexer) next() (Token, error) {
 				for l.pos < len(l.src) && (l.src[l.pos] == '0' || l.src[l.pos] == '1' || l.src[l.pos] == '_') {
 					l.pos++
 				}
-				if l.pos == digStart {
-					// No binary digits — treat as `0` followed by `b` ident.
-					l.pos = start + 1
-					return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+				if l.pos == digStart || (l.pos < len(l.src) && isIdentStart(l.src[l.pos])) {
+					// No valid binary digits OR trailing ident → trailing junk.
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 				}
 				return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
 			case next == 'o' || next == 'O':
@@ -193,9 +193,9 @@ func (l *lexer) next() (Token, error) {
 				for l.pos < len(l.src) && ((l.src[l.pos] >= '0' && l.src[l.pos] <= '7') || l.src[l.pos] == '_') {
 					l.pos++
 				}
-				if l.pos == digStart {
-					l.pos = start + 1
-					return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+				if l.pos == digStart || (l.pos < len(l.src) && isIdentStart(l.src[l.pos])) {
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 				}
 				return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
 			case next == 'x' || next == 'X':
@@ -205,9 +205,9 @@ func (l *lexer) next() (Token, error) {
 				for l.pos < len(l.src) && (isHexDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 					l.pos++
 				}
-				if l.pos == digStart {
-					l.pos = start + 1
-					return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
+				if l.pos == digStart || (l.pos < len(l.src) && isIdentStart(l.src[l.pos])) {
+					for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) { l.pos++ }
+					return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 				}
 				return Token{Kind: TokenIntLit, Value: l.src[start:l.pos], Pos: start}, nil
 			}
@@ -247,6 +247,17 @@ func (l *lexer) next() (Token, error) {
 			} else {
 				isNumeric = true
 			}
+		}
+		// PostgreSQL error: "trailing junk after numeric literal" when the
+		// literal is immediately followed by an identifier character (e.g.
+		// "123abc", "0.0e1a"). Return a lex error so the parser reports
+		// the correct error message. M0097-0003.
+		if l.pos < len(l.src) && isIdentStart(l.src[l.pos]) {
+			// Consume the junk to include it in the error token value.
+			for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+				l.pos++
+			}
+			return Token{}, l.errf(start, "trailing junk after numeric literal at or near %q", l.src[start:l.pos])
 		}
 		if isNumeric {
 			return Token{Kind: TokenNumericLit, Value: l.src[start:l.pos], Pos: start}, nil
