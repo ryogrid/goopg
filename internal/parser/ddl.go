@@ -933,11 +933,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
-		// CONSTRAINT name CHECK/... column constraint.
+		// CONSTRAINT name CHECK/PRIMARY KEY/UNIQUE/... column constraint.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
 			p.advance() // CONSTRAINT
 			_, _ = p.parseIdent() // constraint name
-			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
+			switch {
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 				p.advance()
 				expr, err := p.parseCheckExpr()
 				if err != nil {
@@ -949,7 +950,22 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
-			} else {
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
+				// CONSTRAINT name PRIMARY KEY
+				p.advance()
+				if _, err := p.expectKeyword(KwKey); err != nil {
+					return ColumnDef{}, err
+				}
+				col.Primary = true
+				col.NotNull = true
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
+				// CONSTRAINT name UNIQUE — absorb keyword (no Unique field on ColumnDef)
+				p.advance()
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
+				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
+				// Fall through to FK parsing path by continuing the outer loop.
+				continue
+			default:
 				// Other named constraints: skip to end of constraint.
 				for p.cur().Kind != TokenEOF {
 					t := p.cur()

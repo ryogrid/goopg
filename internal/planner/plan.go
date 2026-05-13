@@ -539,13 +539,17 @@ type AggregateCall struct {
 func (a AggregateCall) Pos() int { return a.pos }
 
 // Aggregate groups rows by GroupExprs and computes Aggs.
-// Output columns are [group exprs..., aggregate calls...].
+// Output columns are [group exprs..., aggregate calls..., passthrough cols...].
+// Passthrough holds expressions for columns that are functionally determined
+// by the GROUP BY key (e.g. non-key cols when GROUP BY covers a primary key).
+// The executor evaluates them from the first row of each group. M0097-0003.
 type Aggregate struct {
-	pos        int
-	Child      Node
-	GroupExprs []Expr
-	Aggs       []AggregateCall
-	schema     Schema
+	pos         int
+	Child       Node
+	GroupExprs  []Expr
+	Aggs        []AggregateCall
+	Passthrough []Expr
+	schema      Schema
 }
 
 func (n *Aggregate) Pos() int       { return n.pos }

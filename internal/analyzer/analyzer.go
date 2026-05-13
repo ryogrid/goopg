@@ -89,6 +89,10 @@ type scopeRel struct {
 	// fully-qualified path. Mirrors upstream's name-resolution
 	// rule for the EXCLUDED pseudo-relation.
 	qualifiedOnly bool
+	// usingHidden lists column names hidden from unqualified lookup
+	// because they appear in a JOIN USING clause. The left table's
+	// copy of these columns is canonical. M0097-0003.
+	usingHidden []string
 }
 
 // outerScope is the goroutine-thread-unsafe lexical-scope
@@ -1026,6 +1030,17 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		if !ok {
 			continue
 		}
+		// Skip USING-hidden columns from right side of JOIN USING. M0097-0003.
+		hiddenByUsing := false
+		for _, uh := range rel.usingHidden {
+			if strings.EqualFold(uh, x.Column) {
+				hiddenByUsing = true
+				break
+			}
+		}
+		if hiddenByUsing {
+			continue
+		}
 		if found != nil {
 			return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
 		}
@@ -1302,7 +1317,7 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 			if err != nil {
 				return nil, err
 			}
-			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias})
+			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias, usingHidden: j.Using})
 		}
 	}
 	return rels, nil
@@ -1448,7 +1463,7 @@ func buildSelectScope(s *parser.SelectStmt, cat catalog.Catalog) ([]scopeRel, er
 			if err != nil {
 				return nil, err
 			}
-			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias})
+			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias, usingHidden: j.Using})
 		}
 	}
 	return rels, nil

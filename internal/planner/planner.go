@@ -179,6 +179,11 @@ type rangeBinding struct {
 	// alias is provided: "DELETE FROM t AS a WHERE t.col" must fail.
 	// M0097-0003.
 	blockOriginalName bool
+	// usingHidden lists column names that are hidden from unqualified lookup
+	// because they were supplied in a JOIN USING clause and the left table's
+	// column is the canonical reference. Prevents "column is ambiguous" errors
+	// when both join sides have the same column name. M0097-0003.
+	usingHidden []string
 	// sourceIdx is a per-FROM-clause monotonic identifier
 	// (M0071-0009) propagated into SchemaColumn.SourceTableIdx
 	// for every column produced by this binding. Distinct values
@@ -803,11 +808,27 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		}
 		*nextSourceIdx++
 		rightBinding.offset = len(leftCtx.schema)
+		// For JOIN USING / NATURAL JOIN, collect the shared column names so we
+		// can hide them from unqualified lookup in the MERGED context (preventing
+		// "column is ambiguous"). We do NOT set usingHidden on rightBinding itself
+		// because rightCtx (used by buildUsingPredicate) still needs to resolve
+		// those column names against the right table. M0097-0003.
+		usingCols := j.Using
+		if j.Natural {
+			usingCols = naturalJoinColumns(leftCtx, newResolveContext([]rangeBinding{rightBinding}, rightNode.Output()))
+		}
 
 		rightCtx := newResolveContext([]rangeBinding{rightBinding}, appendSchema(leftCtx.schema, rightNode.Output()))
+		// Build a separate right binding for the merged context with usingHidden set.
+		// This hides the right-side copy of USING columns from unqualified lookup
+		// while rightCtx (above) retains full access for the join predicate.
+		mergedRightBinding := rightBinding
+		if len(usingCols) > 0 {
+			mergedRightBinding.usingHidden = append([]string(nil), usingCols...)
+		}
 		mergedBindings := make([]rangeBinding, 0, len(leftCtx.bindings)+1)
 		mergedBindings = append(mergedBindings, leftCtx.bindings...)
-		mergedBindings = append(mergedBindings, rightBinding)
+		mergedBindings = append(mergedBindings, mergedRightBinding)
 		mergedSchema := appendSchema(leftCtx.schema, rightNode.Output())
 		mergedCtx := newResolveContext(mergedBindings, mergedSchema)
 
@@ -1596,6 +1617,12 @@ type aggregateSurface struct {
 	groupByExpr     map[string]int
 	groupByInputCol map[int]int
 	aggregateByKey  map[string]aggregateBinding
+	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
+	// when functionally-determined passthrough columns are discovered.
+	node *Aggregate
+	// funcDepCols maps input column index → output schema index for columns
+	// that are functionally determined by the GROUP BY key. M0097-0003.
+	funcDepCols map[int]int
 }
 
 type windowBinding struct {
@@ -1972,6 +1999,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		groupByExpr:     groupByExpr,
 		groupByInputCol: groupByInputCol,
 		aggregateByKey:  aggByKey,
+		node:            aggNode,
+		funcDepCols:     map[int]int{},
 	}
 
 	var having Expr
@@ -2121,9 +2150,28 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		col := resolved.(*ColumnRef)
 		idx, ok := agg.groupByInputCol[col.Index]
 		if !ok {
+			// Check if this column is functionally determined by the GROUP BY key.
+			// PostgreSQL SQL92 extension: when GROUP BY covers a primary key of some
+			// table, all other columns of that table are functionally determined and
+			// may appear in SELECT without being in GROUP BY or an aggregate. M0097-0003.
+			if outIdx, alreadyAdded := agg.funcDepCols[col.Index]; alreadyAdded {
+				return &ColumnRef{pos: x.Pos(), Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}, nil
+			}
+			if isColumnFunctionallyDetermined(col, agg) {
+				// Lazily add this column as a passthrough in the Aggregate node.
+				// The executor evaluates Passthrough expressions from the first row
+				// of each group and appends them to the output row.
+				outIdx := len(agg.node.schema)
+				sc := SchemaColumn{Name: col.Name, Type: col.Type, SourceTableIdx: col.SourceTableIdx}
+				agg.node.schema = append(agg.node.schema, sc)
+				agg.output.schema = append(agg.output.schema, sc)
+				// Passthrough expression references the child/input ColumnRef.
+				agg.node.Passthrough = append(agg.node.Passthrough, col)
+				agg.funcDepCols[col.Index] = outIdx
+				return &ColumnRef{pos: x.Pos(), Index: outIdx, Name: sc.Name, Type: sc.Type}, nil
+			}
+
 			// Include table qualifier in error message (PostgreSQL uses "table.col"). M0097-0003.
-			// Use the resolved ColumnRef's source binding for the table name even when the
-			// parser expression is unqualified (e.g. bare `b` → "test_missing_target.b").
 			colName := col.Name
 			for _, b := range agg.input.bindings {
 				if b.sourceIdx == col.SourceTableIdx {
@@ -4090,6 +4138,18 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			if !strings.EqualFold(c.Name, x.Column) {
 				continue
 			}
+			// Skip USING-hidden columns (right side of JOIN USING):
+			// the left table's column is the canonical one. M0097-0003.
+			hidden := false
+			for _, uh := range b.usingHidden {
+				if strings.EqualFold(uh, c.Name) {
+					hidden = true
+					break
+				}
+			}
+			if hidden {
+				continue
+			}
 			idx := b.offset + i
 			if found != nil {
 				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
@@ -4249,4 +4309,60 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 	default:
 		return e
 	}
+}
+
+// isColumnFunctionallyDetermined reports whether col is functionally determined
+// by the aggregate's GROUP BY key via a primary key or unique-not-null index.
+//
+// PostgreSQL SQL92 extension: if all columns of a PK/unique-not-null index on
+// col's source table appear in the GROUP BY clause, then every other column of
+// that table is uniquely determined within each group and may appear in SELECT
+// without being in GROUP BY or an aggregate function. M0097-0003.
+func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool {
+	if agg.input.cat == nil || col.SourceTableIdx == 0 {
+		return false
+	}
+	// Find the source table for this column.
+	var srcTable *catalog.Table
+	for _, b := range agg.input.bindings {
+		if b.sourceIdx == col.SourceTableIdx {
+			srcTable = b.table
+			break
+		}
+	}
+	if srcTable == nil {
+		return false
+	}
+	// Get all indexes on the source table.
+	idxs := agg.input.cat.IndexesOnTable(srcTable)
+	// Build a map from column name → input schema index for this table.
+	colByName := map[string]int{}
+	for i, sc := range agg.input.schema {
+		if sc.SourceTableIdx == col.SourceTableIdx {
+			colByName[sc.Name] = i
+		}
+	}
+	// Check each primary key or unique index.
+	for _, idx := range idxs {
+		if !idx.Primary && !idx.Unique {
+			continue
+		}
+		// Verify that all index columns are in the GROUP BY.
+		allCovered := true
+		for _, idxCol := range idx.Columns {
+			inputIdx, found := colByName[idxCol]
+			if !found {
+				allCovered = false
+				break
+			}
+			if _, inGroupBy := agg.groupByInputCol[inputIdx]; !inGroupBy {
+				allCovered = false
+				break
+			}
+		}
+		if allCovered {
+			return true
+		}
+	}
+	return false
 }

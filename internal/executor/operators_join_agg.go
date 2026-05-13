@@ -766,15 +766,20 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	type groupRuntime struct {
-		groupValues Row
-		aggs        []aggRuntime
+		groupValues      Row
+		passthroughVals  Row // values of functionally-determined passthrough columns
+		aggs             []aggRuntime
 	}
 
 	groups := map[string]*groupRuntime{}
 	order := make([]string, 0)
 
 	if len(o.plan.GroupExprs) == 0 {
-		groups["__all__"] = &groupRuntime{groupValues: nil, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+		var ptVals Row
+		if len(o.plan.Passthrough) > 0 {
+			ptVals = make(Row, len(o.plan.Passthrough))
+		}
+		groups["__all__"] = &groupRuntime{groupValues: nil, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
 		order = append(order, "__all__")
 	}
 
@@ -799,7 +804,20 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 		gr, ok := groups[key]
 		if !ok {
-			gr = &groupRuntime{groupValues: groupValues, aggs: make([]aggRuntime, len(o.plan.Aggs))}
+			// Evaluate passthrough (functionally-determined) columns from the first row.
+			var ptVals Row
+			if len(o.plan.Passthrough) > 0 {
+				ptVals = make(Row, len(o.plan.Passthrough))
+				for i, expr := range o.plan.Passthrough {
+					v, err := evalExpr(expr, row, ctx)
+					if err != nil {
+						ptVals[i] = NullDatum
+					} else {
+						ptVals[i] = v
+					}
+				}
+			}
+			gr = &groupRuntime{groupValues: groupValues, passthroughVals: ptVals, aggs: make([]aggRuntime, len(o.plan.Aggs))}
 			groups[key] = gr
 			order = append(order, key)
 		}
@@ -826,11 +844,12 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		if gr == nil {
 			continue
 		}
-		out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs))
+		out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs)+len(gr.passthroughVals))
 		out = append(out, gr.groupValues...)
 		for i, call := range o.plan.Aggs {
 			out = append(out, o.finishAgg(gr.aggs[i], call))
 		}
+		out = append(out, gr.passthroughVals...)
 		o.rows = append(o.rows, out)
 	}
 	return nil
