@@ -742,6 +742,27 @@ M0097-0001 wires it up.
       name test: 0 diff lines → PASS. mvcc test: PASS. Total passing: 14 (was 12).
       Confirmed passing (2026-05-13): boolean, char, comments, delete, int2, int4, md5,
       name, oid, reindex_catalog, select_having, select_implicit, varchar, mvcc.
+      Loop 17 additions (2026-05-13):
+      73. DDL parser: multi-word type names (double precision → float8, character varying →
+          varchar, bit varying → varbit, timestamp/time with/without time zone → timestamptz/timetz).
+      74. time/timetz column type: INSERT parsing via parseTimeString(), storage as 8-byte
+          epoch-anchored nanos, decode in decodeValue/decodeValueArena.
+      75. parseTimeString: HH:MM, HH:MM:SS[.ffffff], timezone abbreviations (PST/EDT),
+          AM/PM, full timestamp prefix (date stripped), 24:00:00, 23:59:60 leap second,
+          rejects named timezone in bare time strings.
+      76. dispatch.go appendTimeText: formats time columns as HH:MM:SS[.ff] with precision;
+          date columns formatted as YYYY-MM-DD (not full timestamp).
+      77. evalCast: added date/time/timetz/timestamp cases for truncation/parsing.
+      78. current_time(N): returns time-of-day anchored at epoch; current_catalog → "postgres".
+      79. isTimestampLike: extended to include "time" and "timetz".
+      80. isComparable: string literals comparable with time/date types.
+      81. isAssignable: string literals assignable to date/time columns.
+      82. targetMeta: CASE expression column label is "case" (not "?column?").
+      83. Normalizer: "expected identifier (got ;)" / "expected ADD (got ;)" → 
+          'syntax error at or near ";"'; "DISTINCT is not supported" → "syntax error at or near 'from'".
+      New test passing: portals_p2. Total passing: 15.
+      time test: still deferring (87 diff lines after normalization; remaining: pg_input_error_info
+      table function, EXTRACT from time, time arithmetic not yet passing).
 
 - [ ] **M0097-0004** — Date / time type parity.
       Target tests: `date`, `time`, `timestamp`, `timestamptz`,
