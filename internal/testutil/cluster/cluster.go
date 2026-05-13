@@ -183,9 +183,11 @@ func (c *Cluster) Start() error {
 		_ = f.Close()
 		return err
 	}
+	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
 		_ = f.Close()
+		close(exited)
 	}()
 	c.cmd = cmd
 
@@ -195,8 +197,10 @@ func (c *Cluster) Start() error {
 		if err == nil && status == 0 {
 			return nil
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		select {
+		case <-exited:
 			return fmt.Errorf("start failed; process exited early (see %s)", c.logPath)
+		default:
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
