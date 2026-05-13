@@ -131,9 +131,12 @@ func (*IntervalLit) exprNode()  {}
 // ExtractExpr mirrors parser.ExtractExpr. Field is the
 // lower-cased calendar component the executor switches on.
 type ExtractExpr struct {
-	pos    int
-	Field  string
-	Source Expr
+	pos            int
+	Field          string
+	Source         Expr
+	// SourceTypeName carries the declared type of Source (e.g. "time", "timestamp").
+	// The executor uses it to reject fields that are invalid for time-only types. M0097-0004.
+	SourceTypeName string
 }
 
 func (e *ExtractExpr) Pos() int { return e.pos }

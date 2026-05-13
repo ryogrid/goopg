@@ -2133,7 +2133,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if err != nil {
 			return nil, err
 		}
-		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src}, nil
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src, SourceTypeName: exprType(src).Name}, nil
 	case *parser.NullConst:
 		return &NullConst{pos: x.Pos()}, nil
 	case *parser.BooleanConst:
@@ -2312,7 +2312,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src}, nil
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src, SourceTypeName: exprType(src).Name}, nil
 	case *parser.CaseExpr:
 		out := &CaseExpr{pos: x.Pos()}
 		if x.Operand != nil {
@@ -3552,6 +3552,11 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if _, ok := e.(*CaseExpr); ok {
 		return "case", exprType(e)
 	}
+	// EXTRACT expression: PostgreSQL uses "extract" as the implicit column label.
+	// Matches FigureColname() for ExtractExpr nodes. M0097-0004.
+	if _, ok := e.(*ExtractExpr); ok {
+		return "extract", exprType(e)
+	}
 	return "?column?", exprType(e)
 }
 
@@ -3947,7 +3952,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src}, nil
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: src, SourceTypeName: exprType(src).Name}, nil
 	case *parser.NullConst:
 		return &NullConst{pos: x.Pos()}, nil
 	case *parser.BooleanConst:

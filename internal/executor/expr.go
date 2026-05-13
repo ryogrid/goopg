@@ -1455,19 +1455,45 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 	// Fractional-second fields return float8 (numeric) in PostgreSQL.
 	u := src.TimeValue().UTC()
 	field := strings.ToLower(strings.TrimSpace(x.Field))
+	// For time-of-day source types, validate and handle allowed fields only. M0097-0004.
+	srcType := strings.ToLower(x.SourceTypeName)
+	isTimeOnly := srcType == "time" || srcType == "timetz"
 	switch field {
 	case "second", "seconds":
-		// Fractional seconds: integer part + microseconds/1e6.
 		f := float64(u.Second()) + float64(u.Nanosecond())/1e9
 		return newNumericFromFloat(f), nil
 	case "milliseconds", "millisecond":
-		// Fractional milliseconds: seconds*1000 + microseconds/1000.
 		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
 		return newNumericFromFloat(f), nil
 	case "epoch":
-		// Epoch for time-of-day: seconds since midnight (fractional).
 		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
 		return newNumericFromFloat(f), nil
+	case "timezone", "timezone_hour", "timezone_minute":
+		if isTimeOnly {
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
+		}
+		return Datum{Kind: KindInt, Int: 0}, nil // UTC only
+	}
+	// For time-of-day types, reject date-specific fields with PG-compatible errors. M0097-0004.
+	if isTimeOnly {
+		switch field {
+		case "hour", "minute", "microseconds", "microsecond":
+			// allowed for time types (handled by extractTimestampField below)
+		default:
+			// Check if it's a known-but-unsupported date field or completely unknown.
+			knownDateFields := map[string]bool{
+				"year": true, "month": true, "day": true, "decade": true,
+				"century": true, "millennium": true, "week": true, "isoweek": true,
+				"isoyear": true, "isodow": true, "dow": true, "doy": true, "quarter": true,
+			}
+			if knownDateFields[field] {
+				return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+					Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
+			}
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("unit %q not recognized for type time without time zone", field)}
+		}
 	}
 	n, err := extractTimestampField(x.Field, u, x.Pos())
 	if err != nil {

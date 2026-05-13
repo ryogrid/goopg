@@ -55,7 +55,7 @@ func FoldConstants(e Expr) Expr {
 
 	// ── Expressions with sub-expressions: recurse ──────────────────────
 	case *ExtractExpr:
-		return &ExtractExpr{pos: x.pos, Field: x.Field, Source: FoldConstants(x.Source)}
+		return &ExtractExpr{pos: x.pos, Field: x.Field, Source: FoldConstants(x.Source), SourceTypeName: x.SourceTypeName}
 
 	case *InExpr:
 		folded := make([]Expr, len(x.List))
