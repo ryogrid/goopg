@@ -1,6 +1,6 @@
 # 0103-0002 — Apply-Worker Reconnect Loop with Bounded Backoff
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0103-0003
 **Upstream reference:** `postgres/src/backend/replication/logical/worker.c::ApplyWorkerMain` (line 4818+), `postgres/src/backend/replication/logical/launcher.c::ApplyLauncherWakeup`, `postgres/src/backend/replication/libpqwalreceiver/libpqwalreceiver.c::libpqrcv_connect` (retry semantics on failure).

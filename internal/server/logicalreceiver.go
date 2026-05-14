@@ -18,7 +18,9 @@
 //     the apply worker has applied, advancing the slot on the
 //     publisher.
 //
-// See docs/design/0008-0004-apply-worker-and-tablesync.md.
+// See docs/design/0008-0004-apply-worker-and-tablesync.md and
+// docs/design/0103-0002-apply-worker-reconnect.md (Run's reconnect
+// loop and bounded backoff).
 
 package server
 
@@ -27,14 +29,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/wal"
+)
+
+// Default reconnect parameters. Picked to match upstream's
+// `wal_retrieve_retry_interval` (PG hard-codes a 10 s wait); the
+// exponential variant gives a quicker first reconnect for transient
+// blips while still capping at a humane upper bound.
+const (
+	defaultInitialBackoff = 1 * time.Second
+	defaultMaxBackoff     = 30 * time.Second
 )
 
 // LogicalReceiverConfig parameterises a single subscriber session.
@@ -77,38 +90,62 @@ type LogicalReceiverConfig struct {
 	// DialTimeout caps the TCP dial + startup handshake. Zero
 	// falls back to 10s.
 	DialTimeout time.Duration
+
+	// InitialBackoff is the wait after the first reconnect-eligible
+	// failure; each subsequent transient failure doubles it up to
+	// MaxBackoff. Zero falls back to 1s.
+	InitialBackoff time.Duration
+
+	// MaxBackoff caps the per-retry sleep regardless of how many
+	// consecutive failures occur. Zero falls back to 30s.
+	MaxBackoff time.Duration
+
+	// Dialer is an injectable hook used by the reconnect loop on
+	// every (re)connect. Defaults to a net.Dialer bound by
+	// DialTimeout. Test code overrides this to avoid binding real
+	// TCP ports.
+	Dialer func(ctx context.Context) (net.Conn, error)
 }
 
 // LogicalReceiver is the subscriber-side replication client.
+//
+// One LogicalReceiver instance corresponds to one logical slot. Its
+// Run method drives a reconnect loop: each iteration dials the
+// publisher, performs the v3 handshake, issues
+// `START_REPLICATION SLOT … LOGICAL <applyLSN>`, and streams
+// pgoutput messages into the apply worker until the link breaks.
+// On a transient disconnect the loop sleeps with bounded
+// exponential backoff and reconnects, resuming from the apply
+// worker's last successfully committed LSN so no row is replayed
+// twice.
 type LogicalReceiver struct {
-	cfg    LogicalReceiverConfig
+	cfg LogicalReceiverConfig
+
+	// applyLSN is updated atomically by the apply pipeline on
+	// every Commit and read by the reconnect loop to set the
+	// next START_REPLICATION resume point and by the standby-
+	// status frame to advance the publisher slot's
+	// confirmed_flush_lsn.
+	applyLSN atomic.Uint64
+
+	// mu guards the per-iteration connection state and the
+	// terminal-close flag.
+	mu     sync.Mutex
 	conn   net.Conn
 	r      *protocol.FrameReader
 	w      *protocol.FrameWriter
-	mu     sync.Mutex
-	closed bool
-
-	// applyLSN is the highest commit LSN the apply worker has
-	// successfully committed. Reported back to the publisher in
-	// standby-status frames so the slot's `confirmed_flush_lsn`
-	// advances.
-	applyLSN uint64
+	closed bool // permanent close via Close()
 }
 
-// DialLogicalReceiver opens the TCP connection, performs the v3
-// startup with `replication=database`, then issues
-// `START_REPLICATION SLOT name LOGICAL …`. The returned receiver
-// is ready for `Run`.
-func DialLogicalReceiver(ctx context.Context, cfg LogicalReceiverConfig) (*LogicalReceiver, error) {
-	if cfg.PrimaryAddr == "" {
-		return nil, errors.New("logicalreceiver: PrimaryAddr is required")
-	}
-	if cfg.SlotName == "" {
-		return nil, errors.New("logicalreceiver: SlotName is required")
-	}
-	if cfg.Apply == nil {
-		return nil, errors.New("logicalreceiver: Apply is required")
-	}
+// errLogicalReceiverClosed is returned (and treated as permanent)
+// when a runOnce attempt races with Close().
+var errLogicalReceiverClosed = errors.New("logicalreceiver: closed")
+
+// NewLogicalReceiver builds a receiver without performing any
+// network I/O. The first dial happens inside Run. Use this entry
+// when the caller wants the reconnect loop to own the entire
+// connection lifecycle (the M0103 apply-worker launcher path).
+func NewLogicalReceiver(cfg LogicalReceiverConfig) *LogicalReceiver {
 	if cfg.ProtoVersion == 0 {
 		cfg.ProtoVersion = 1
 	}
@@ -118,27 +155,87 @@ func DialLogicalReceiver(ctx context.Context, cfg LogicalReceiverConfig) (*Logic
 	if cfg.DialTimeout == 0 {
 		cfg.DialTimeout = 10 * time.Second
 	}
+	if cfg.InitialBackoff == 0 {
+		cfg.InitialBackoff = defaultInitialBackoff
+	}
+	if cfg.MaxBackoff == 0 {
+		cfg.MaxBackoff = defaultMaxBackoff
+	}
+	rec := &LogicalReceiver{cfg: cfg}
+	if cfg.StartLSN > 0 {
+		rec.applyLSN.Store(cfg.StartLSN)
+	}
+	return rec
+}
 
-	dialer := net.Dialer{Timeout: cfg.DialTimeout}
-	conn, err := dialer.DialContext(ctx, "tcp", cfg.PrimaryAddr)
-	if err != nil {
-		return nil, fmt.Errorf("logicalreceiver: dial %s: %w", cfg.PrimaryAddr, err)
+// DialLogicalReceiver builds a receiver and performs the initial
+// dial+handshake+START_REPLICATION synchronously. Retained for
+// callers that want to surface the very first dial error to the
+// operator before launching the long-lived Run loop. Run still
+// owns subsequent reconnects.
+func DialLogicalReceiver(ctx context.Context, cfg LogicalReceiverConfig) (*LogicalReceiver, error) {
+	if cfg.PrimaryAddr == "" && cfg.Dialer == nil {
+		return nil, errors.New("logicalreceiver: PrimaryAddr or Dialer is required")
 	}
-	rec := &LogicalReceiver{
-		cfg:  cfg,
-		conn: conn,
-		r:    protocol.NewFrameReader(conn),
-		w:    protocol.NewFrameWriter(conn),
+	if cfg.SlotName == "" {
+		return nil, errors.New("logicalreceiver: SlotName is required")
 	}
-	if err := rec.handshake(); err != nil {
-		_ = conn.Close()
-		return nil, err
+	if cfg.Apply == nil {
+		return nil, errors.New("logicalreceiver: Apply is required")
 	}
-	if err := rec.startStreaming(); err != nil {
-		_ = conn.Close()
+	rec := NewLogicalReceiver(cfg)
+	if err := rec.dial(ctx); err != nil {
 		return nil, err
 	}
 	return rec, nil
+}
+
+// dial opens a fresh connection and walks through the v3 startup
+// and START_REPLICATION handshakes. The resulting r.conn / r.r /
+// r.w are owned by the current iteration of Run.
+func (r *LogicalReceiver) dial(ctx context.Context) error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return errLogicalReceiverClosed
+	}
+	r.mu.Unlock()
+
+	var (
+		conn net.Conn
+		err  error
+	)
+	if r.cfg.Dialer != nil {
+		conn, err = r.cfg.Dialer(ctx)
+	} else {
+		dialer := net.Dialer{Timeout: r.cfg.DialTimeout}
+		conn, err = dialer.DialContext(ctx, "tcp", r.cfg.PrimaryAddr)
+	}
+	if err != nil {
+		return fmt.Errorf("logicalreceiver: dial %s: %w", r.cfg.PrimaryAddr, err)
+	}
+
+	fr := protocol.NewFrameReader(conn)
+	fw := protocol.NewFrameWriter(conn)
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		_ = conn.Close()
+		return errLogicalReceiverClosed
+	}
+	r.conn, r.r, r.w = conn, fr, fw
+	r.mu.Unlock()
+
+	if err := r.handshake(); err != nil {
+		r.closeConn()
+		return err
+	}
+	if err := r.startStreaming(); err != nil {
+		r.closeConn()
+		return err
+	}
+	return nil
 }
 
 // handshake performs the v3 startup with `replication=database`
@@ -151,6 +248,9 @@ func (r *LogicalReceiver) handshake() error {
 	}
 	if err := r.w.WriteStartupMessage(params); err != nil {
 		return fmt.Errorf("logicalreceiver: write startup: %w", err)
+	}
+	if err := r.w.Flush(); err != nil {
+		return fmt.Errorf("logicalreceiver: flush startup: %w", err)
 	}
 	for {
 		f, err := r.r.ReadFrame()
@@ -169,9 +269,15 @@ func (r *LogicalReceiver) handshake() error {
 
 // startStreaming sends START_REPLICATION SLOT … LOGICAL with the
 // proto-version + publication-names options block and waits for
-// CopyBoth.
+// CopyBoth. The start LSN is the apply worker's last commit
+// (atomic) — falling back to the configured StartLSN on the very
+// first iteration before any commit has been applied.
 func (r *LogicalReceiver) startStreaming() error {
-	cmd := buildStartLogicalReplicationCommand(r.cfg.SlotName, r.cfg.StartLSN, r.cfg.ProtoVersion, r.cfg.Publications)
+	start := r.applyLSN.Load()
+	if start == 0 {
+		start = r.cfg.StartLSN
+	}
+	cmd := buildStartLogicalReplicationCommand(r.cfg.SlotName, start, r.cfg.ProtoVersion, r.cfg.Publications)
 	if err := r.w.WriteQuery(cmd); err != nil {
 		return fmt.Errorf("logicalreceiver: write START_REPLICATION: %w", err)
 	}
@@ -193,27 +299,125 @@ func (r *LogicalReceiver) startStreaming() error {
 	}
 }
 
-// Run drives the receive loop until ctx is cancelled or the
-// link breaks.
+// Run drives the receive loop in a reconnect-aware outer loop.
+// Each iteration dials the publisher, drives the frame loop until
+// the link breaks, then either retries with bounded exponential
+// backoff (on a transient error) or returns (on a permanent error
+// or ctx cancellation).
+//
+// On every iteration boundary the apply worker is force-rolled-
+// back to discard any partial transaction so the next iteration
+// starts from a clean slate; the apply worker itself persists
+// across iterations and its applyLSN drives the resume position.
 func (r *LogicalReceiver) Run(ctx context.Context) error {
+	backoff := r.cfg.InitialBackoff
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Reuse a pre-dialed connection (the DialLogicalReceiver
+		// path) for the first iteration only. All subsequent
+		// iterations dial via runOnce.
+		r.mu.Lock()
+		preDialed := r.conn != nil && !r.closed
+		r.mu.Unlock()
+
+		var iterErr error
+		if preDialed {
+			iterErr = r.streamFrames(ctx)
+		} else {
+			iterErr = r.runOnce(ctx)
+		}
+
+		// Per-iteration teardown: close socket + roll back any
+		// half-applied transaction. The apply worker survives.
+		r.closeConn()
+		r.cfg.Apply.SafeRollback()
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(iterErr, errLogicalReceiverClosed) {
+			return nil
+		}
+		if iterErr == nil || errors.Is(iterErr, io.EOF) {
+			// Clean EOF: publisher sent CopyDone or socket
+			// closed cleanly. Reset backoff and reconnect
+			// immediately — the publisher likely just
+			// rotated; the slot still has WAL queued.
+			backoff = r.cfg.InitialBackoff
+			continue
+		}
+		if isPermanent(iterErr) {
+			return iterErr
+		}
+
+		// Transient — sleep with ±20% jitter, then retry.
+		jitter := time.Duration(0)
+		if j := int64(backoff / 5); j > 0 {
+			jitter = time.Duration(rand.Int63n(j))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff + jitter):
+		}
+		backoff = nextBackoff(backoff, r.cfg.MaxBackoff)
+	}
+}
+
+// runOnce performs one connect → handshake → stream cycle. Errors
+// returned by runOnce are classified by isPermanent in Run.
+func (r *LogicalReceiver) runOnce(ctx context.Context) error {
+	if err := r.dial(ctx); err != nil {
+		return err
+	}
+	return r.streamFrames(ctx)
+}
+
+// streamFrames is the inner receive loop: read frames from r.r
+// until ctx is cancelled or the link breaks. Pulled out of Run so
+// the pre-dialed (DialLogicalReceiver) and reconnect-loop paths
+// share the same frame-handling logic.
+func (r *LogicalReceiver) streamFrames(ctx context.Context) error {
+	// Snapshot the per-iteration reader under the mutex so the
+	// reader goroutine doesn't race with closeConn() / Close()
+	// which both nil out r.r and r.w. The reader still observes
+	// the right peer because closing the conn breaks ReadFrame
+	// with an error, terminating the goroutine cleanly.
+	r.mu.Lock()
+	fr := r.r
+	r.mu.Unlock()
+	if fr == nil {
+		return errLogicalReceiverClosed
+	}
+
 	statusTicker := time.NewTicker(r.cfg.StatusInterval)
 	defer statusTicker.Stop()
 
 	frames := make(chan protocol.Frame, 4)
 	errCh := make(chan error, 1)
+	readerCtx, cancelReader := context.WithCancel(ctx)
+	defer cancelReader()
+
 	go func() {
 		defer close(frames)
 		for {
-			f, err := r.r.ReadFrame()
+			f, err := fr.ReadFrame()
 			if err != nil {
-				errCh <- err
+				select {
+				case errCh <- err:
+				case <-readerCtx.Done():
+				}
 				return
 			}
 			payload := make([]byte, len(f.Payload))
 			copy(payload, f.Payload)
 			select {
 			case frames <- protocol.Frame{Type: f.Type, Payload: payload}:
-			case <-ctx.Done():
+			case <-readerCtx.Done():
 				return
 			}
 		}
@@ -222,28 +426,24 @@ func (r *LogicalReceiver) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			_ = r.Close()
-			return nil
+			return ctx.Err()
 		case err := <-errCh:
-			_ = r.Close()
 			if errors.Is(err, io.EOF) {
-				return nil
+				return io.EOF
 			}
 			return err
 		case f, ok := <-frames:
 			if !ok {
-				return nil
+				return io.EOF
 			}
 			if err := r.handleFrame(f); err != nil {
-				_ = r.Close()
 				if errors.Is(err, io.EOF) {
-					return nil
+					return io.EOF
 				}
 				return err
 			}
 		case <-statusTicker.C:
 			if err := r.sendStatus(); err != nil {
-				_ = r.Close()
 				return err
 			}
 		}
@@ -287,15 +487,20 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 			return fmt.Errorf("logicalreceiver: apply pgoutput kind=%q: %w",
 				decoded.Kind, err)
 		}
-		// Advance applyLSN on every commit so the next
-		// standby-status frame moves the slot's
-		// confirmed_flush_lsn forward.
+		// Advance applyLSN monotonically on every commit so the
+		// next standby-status frame moves the slot's
+		// confirmed_flush_lsn forward and a reconnect resumes
+		// at exactly the right byte.
 		if commitLSN > 0 {
-			r.mu.Lock()
-			if commitLSN > r.applyLSN {
-				r.applyLSN = commitLSN
+			for {
+				cur := r.applyLSN.Load()
+				if commitLSN <= cur {
+					break
+				}
+				if r.applyLSN.CompareAndSwap(cur, commitLSN) {
+					break
+				}
 			}
-			r.mu.Unlock()
 		}
 	case protocol.ReplMsgKeepalive:
 		ka := parsed.(*protocol.KeepaliveMessage)
@@ -307,25 +512,50 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 }
 
 func (r *LogicalReceiver) sendStatus() error {
-	r.mu.Lock()
-	apply := r.applyLSN
-	r.mu.Unlock()
+	apply := r.applyLSN.Load()
+	// Report flush_lsn = applyLSN so the publisher's SyncRep wait
+	// queue (M0102-0005 primitive, wired in M0103-0005) can
+	// release waiters once the subscriber confirms apply.
 	frame := protocol.EncodeStandbyStatusUpdate(apply, apply, apply, time.Now().UTC(), false)
-	if err := r.w.WriteCopyData(frame); err != nil {
+	r.mu.Lock()
+	w := r.w
+	r.mu.Unlock()
+	if w == nil {
+		return errLogicalReceiverClosed
+	}
+	if err := w.WriteCopyData(frame); err != nil {
 		return err
 	}
-	return r.w.Flush()
+	return w.Flush()
 }
 
 // ApplyLSN returns the last commit LSN the apply worker has
 // committed locally. Useful for tests + observability.
 func (r *LogicalReceiver) ApplyLSN() uint64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.applyLSN
+	return r.applyLSN.Load()
 }
 
-// Close terminates the connection. Idempotent.
+// closeConn closes the active connection (if any) and clears the
+// per-iteration r/w handles. Safe to call from any goroutine and
+// idempotent within a single iteration. The terminal `closed`
+// flag is left untouched so the reconnect loop can decide whether
+// to redial.
+func (r *LogicalReceiver) closeConn() {
+	r.mu.Lock()
+	conn := r.conn
+	r.conn = nil
+	r.r = nil
+	r.w = nil
+	r.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// Close terminates the receiver permanently. After Close returns,
+// any in-flight Run loop will observe ctx cancellation or
+// errLogicalReceiverClosed on its next dial attempt and exit.
+// Idempotent.
 func (r *LogicalReceiver) Close() error {
 	r.mu.Lock()
 	if r.closed {
@@ -333,9 +563,63 @@ func (r *LogicalReceiver) Close() error {
 		return nil
 	}
 	r.closed = true
+	conn := r.conn
+	r.conn = nil
+	r.r = nil
+	r.w = nil
 	r.mu.Unlock()
 	r.cfg.Apply.SafeRollback()
-	return r.conn.Close()
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
+}
+
+// nextBackoff doubles the current delay up to the cap.
+func nextBackoff(cur, max time.Duration) time.Duration {
+	n := cur * 2
+	if n > max || n <= 0 {
+		return max
+	}
+	return n
+}
+
+// isPermanent classifies a runOnce error: permanent errors abort
+// the reconnect loop, transient errors trigger a backoff retry.
+//
+// Permanent conditions: server-side rejection of START_REPLICATION
+// (e.g. slot doesn't exist), apply-pipeline errors that wouldn't
+// be helped by a fresh connection (decode failures, schema
+// divergence), and the terminal-close sentinel.
+//
+// Everything else — TCP resets, dial timeouts, mid-stream io.EOF
+// before CopyDone — is treated as transient.
+func isPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errLogicalReceiverClosed) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// Caller observes ctx.Err() directly; treat as
+		// "stop the loop" here so we never spin.
+		return true
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "START_REPLICATION rejected"):
+		return true
+	case strings.Contains(msg, "server rejected startup"):
+		return true
+	case strings.Contains(msg, "pgoutput decode"):
+		return true
+	case strings.Contains(msg, "apply pgoutput"):
+		return true
+	case strings.Contains(msg, "decode replication message"):
+		return true
+	}
+	return false
 }
 
 // buildStartLogicalReplicationCommand renders the wire-level

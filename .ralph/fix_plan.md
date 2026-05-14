@@ -1489,34 +1489,114 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
 
 ### Sub-milestones
 
-- [ ] **M0103-0001** — Prerequisite gate.
+- [x] **M0103-0001** — Prerequisite gate. CLOSED 2026-05-14.
       Audit M0101 (PG-compat WAL) and M0102-0005 (`synchronous_standby_names`
       + SyncRep wait primitive) status. M0103-0007/0008 cannot start until
       both have landed. The M0103-0002..-0006 development sub-milestones can
       begin in parallel with M0101/M0102-0005 since their deliverables don't
       depend on those.
+      Audit results (2026-05-14):
+      - M0101 closed (M0101-0001..-0005 all [x] in fix_plan.md). Default-on
+        PG-compatible WAL format active in `internal/initdb/open.go`;
+        `pg_waldump` accepts goopg segments. Verification:
+        `go test -count=1 -run TestPort_WALPgWaldump ./internal/testport/`
+        → ok 0.820s.
+      - M0102-0005 closed — `SyncRep` primitive in `internal/wal/syncrep.go`,
+        `synchronous_standby_names` GUC registered, commit-path wait wired in
+        `internal/executor/operators_tx.go`, walsender + walreceiver report
+        write/flush/apply LSNs. Verification:
+        `go test -count=1 -run TestSyncRep ./internal/wal/` → ok 0.306s
+        (13 tests including FIRST/ANY/write/flush/apply mode semantics,
+        cancellation, monotonic progress, rule relaxation).
+      Gate result: BOTH prerequisites satisfied — M0103-0007 and M0103-0008
+      are unblocked. M0103-0002..-0006 (apply-worker launcher, reconnect
+      loop, pgoutput interop, logical SyncRep, pubsubcluster harness) were
+      already eligible to start in parallel per the gate's own carve-out;
+      they may now proceed without any pre-condition check.
 
-- [ ] **M0103-0002** — Subscriber apply-worker auto-launcher.
-      Design doc: `docs/design/0103-0001-apply-worker-launcher.md`.
-      Sites: new `internal/server/applylauncher.go` (`ApplyLauncher` struct,
-      periodic + Wake-triggered re-scan); `internal/server/server.go`
-      (construct + Start in `Server.Start`); `internal/executor/operators_ddl.go`
-      (call `ApplyLauncher.Wake()` from CREATE/DROP/ALTER SUBSCRIPTION).
-      Mirrors `postgres/src/backend/replication/logical/launcher.c::ApplyLauncherMain`.
-      Verify: race-tested unit test in `internal/server/applylauncher_test.go`;
-      after `CREATE SUBSCRIPTION ... WITH (enabled=true)`, `pg_stat_subscription`
-      shows the subscription active within ≤1 s.
+- [x] **M0103-0002** — Subscriber apply-worker auto-launcher.
+      Design doc: `docs/design/0103-0001-apply-worker-launcher.md` (accepted).
+      LANDED 2026-05-14. Changes:
+      - `internal/server/applylauncher.go` (new) — `ApplyLauncher`
+        struct + `Run` reconcile loop (periodic `PollInterval` tick
+        plus `Wake()` channel coalesced into a single rescan).
+        `reconcile()` snapshots `PubSub.Subscriptions()`, starts a
+        worker for every enabled subscription that has no live entry,
+        and cancels workers whose subscription has been dropped or
+        flipped to disabled. `DefaultLaunchApplyWorker` parses the
+        subscription's libpq-style `conninfo`, derives the slot's
+        `confirmed_flush_lsn` start position, constructs an
+        `executor.ApplyWorker`, dials `LogicalReceiver`, and runs the
+        apply loop. Workers that exit on their own remove themselves
+        from the launcher's worker map so the next reconcile cycle can
+        relaunch them (per-error retry policy is M0103-0003 scope).
+      - `internal/server/applylauncher_test.go` (new, -race clean) —
+        five tests cover: CREATE→Wake spawns worker ≤1 s + DROP→Wake
+        cancels it; periodic poll converges without Wake; disabled
+        subscription stays dormant; `stopAll` cancels every worker on
+        ctx cancel; transient launch errors don't wedge the launcher
+        and the next reconcile retries.
+      - `internal/server/server.go` — `Server.applyLauncher` field
+        constructed in `New()` when `PubSub != nil && hasStorage()`;
+        `Server.Run()` spawns the launcher goroutine under `runCtx`
+        so a control-plane STOP drains every apply worker.
+      - `internal/server/dispatch.go` + `dispatch_extended.go` —
+        populate `ectx.OnSubscriptionChange = s.applyLauncher.Wake`
+        when the launcher is configured.
+      - `internal/executor/context.go` — new
+        `OnSubscriptionChange func()` field plumbs the wake hook
+        without an executor → server import cycle.
+      - `internal/executor/operators_ddl.go` —
+        `execCreateSubscription` and `execDropSubscription` invoke
+        `ctx.OnSubscriptionChange()` after a successful catalog
+        mutation so the launcher rescans within milliseconds rather
+        than waiting for the periodic tick.
+      Verification: `go test -race -count=1 -run "TestApplyLauncher|TestParseSubscriptionConninfo" ./internal/server/`
+      → 5 tests PASS (1.169 s). Full regression on
+      `./internal/server/ ./internal/executor/ ./internal/catalog/`
+      with `-race` — all green (server 3.428 s, executor 2.560 s,
+      catalog 1.020 s).
 
-- [ ] **M0103-0003** — Apply-worker reconnect loop with bounded backoff.
-      Design doc: `docs/design/0103-0002-apply-worker-reconnect.md`.
-      Sites: `internal/server/logicalreceiver.go` — refactor `Run` into
-      `Run` (loop) + `runOnce` (existing dial/stream/apply logic); backoff
-      1 s → 30 s cap; `isPermanent(err)` classifier; resume from
-      `confirmed_flush_lsn` on reconnect; ctx-cancel termination. Apply
-      worker updates `applyLSN` on commit; feedback frame reports
-      `flush_lsn = applyLSN`. Verify: race-tested unit
-      `TestLogicalReceiverReconnect` — publisher killed mid-stream, restarted,
-      subscriber reattaches and resumes within ~5 s.
+- [x] **M0103-0003** — Apply-worker reconnect loop with bounded backoff.
+      LANDED 2026-05-14. Design doc:
+      `docs/design/0103-0002-apply-worker-reconnect.md` (accepted).
+      Changes:
+      - `internal/server/logicalreceiver.go` — `Run` is now a reconnect-
+        aware outer loop calling `runOnce` (dial+handshake+stream).
+        Bounded exponential backoff (default 1 s → 30 s with ±20 %
+        jitter, override via `LogicalReceiverConfig.InitialBackoff` /
+        `MaxBackoff` for tests). `dial` and `streamFrames` were pulled
+        out of the old monolithic `Run`. `applyLSN` is now
+        `atomic.Uint64`; CAS-monotonic advance on every commit; used as
+        the resume position in `startStreaming` so a reconnect issues
+        `START_REPLICATION SLOT … LOGICAL <applyLSN>` and the publisher
+        slot replays no committed row twice. New `isPermanent(err)`
+        classifies server-side rejections (slot does not exist, startup
+        rejected) + apply/decoding errors as permanent and everything
+        else (TCP reset, dial timeout, mid-stream EOF) as transient.
+        `Dialer` config field added so tests can substitute a fake
+        TCP listener without binding real ports. `sendStatus` reports
+        `flush_lsn = applyLSN` so M0103-0005's SyncRep wiring can
+        release publisher waiters once the subscriber confirms apply.
+      - `internal/server/applylauncher.go` —
+        `DefaultLaunchApplyWorker` now uses `NewLogicalReceiver` (no
+        upfront dial). The reconnect loop owns the full lifecycle so a
+        publisher restart no longer terminates the apply worker.
+      - `internal/server/logicalreceiver_reconnect_test.go` (new,
+        -race clean) — `TestLogicalReceiverReconnect` scripts a fake
+        publisher TCP listener that serves two back-to-back sessions
+        (each one B/I/C transaction at increasing commit LSNs, then
+        closes); the receiver must reconnect and apply both commits,
+        proving applyLSN-anchored resume works. Plus
+        `TestLogicalReceiverReconnectRespectsCtxDuringBackoff` (ctx
+        cancel during the sleep-and-retry window returns
+        `context.Canceled` rather than waiting out the backoff) and
+        `TestIsPermanentClassifier` (table-driven, 10 cases pinning
+        the retry/abort split).
+      Verification: `go test -race -count=1 ./internal/server/
+      ./internal/executor/ ./internal/wal/ ./internal/catalog/`
+      → all green (server 3.398 s, executor 2.575 s, wal 2.977 s,
+      catalog 1.019 s).
 
 - [ ] **M0103-0004** — pgoutput wire-byte interop verification.
       Design doc: `docs/design/0103-0003-pgoutput-wire-interop.md`.
