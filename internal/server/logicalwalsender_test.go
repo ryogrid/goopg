@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
@@ -252,5 +254,107 @@ func TestSplitPublicationNamesTrimsAndDropsEmpty(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("got[%d]=%q want %q", i, got[i], want[i])
 		}
+	}
+}
+
+
+// TestLogicalSyncRepDispatchUnblocksOnApplyCatchup is the M0103-0005
+// integration test for the logical walsender → SyncRep wait queue.
+//
+// It pins the round-trip the real publisher takes: the subscriber emits
+// a Standby Status Update CopyData frame on the START_REPLICATION
+// LOGICAL stream, the walsender's receive-side goroutine calls
+// handleStandbyCopyData, that dispatcher decodes the 'r' message and
+// feeds SyncRep.UpdateStandbyProgress keyed on the application_name
+// from the START_REPLICATION handshake. A publisher COMMIT blocked on
+// remote_apply must release as soon as the subscriber's apply_lsn
+// crosses the commit target.
+//
+// Race-tested: run with `-race`. The test fans out two goroutines
+// (waiter + feeder) that share the SyncRep instance.
+func TestLogicalSyncRepDispatchUnblocksOnApplyCatchup(t *testing.T) {
+	t.Parallel()
+
+	syncRep := wal.NewSyncRep()
+	if err := syncRep.SetStandbyNames("goopg_sub"); err != nil {
+		t.Fatalf("SetStandbyNames: %v", err)
+	}
+
+	s := &Server{cfg: Config{SyncRep: syncRep}}
+
+	const commitLSN uint64 = 0x1000
+
+	// Initial subscriber report: write/flush ahead, apply still behind.
+	// This is what an apply worker that has buffered the txn but not yet
+	// committed locally looks like.
+	lagPayload := protocol.EncodeStandbyStatusUpdate(
+		commitLSN+0x100, commitLSN+0x100, commitLSN-1,
+		time.Unix(0, 0).UTC(), false,
+	)
+	if err := s.handleStandbyCopyData("", lagPayload, nil, syncRep, "goopg_sub"); err != nil {
+		t.Fatalf("dispatch lag report: %v", err)
+	}
+	write, flush, apply := syncRep.StandbyProgress("goopg_sub")
+	if write != commitLSN+0x100 || flush != commitLSN+0x100 || apply != commitLSN-1 {
+		t.Fatalf("lag progress: write=%x flush=%x apply=%x want %x/%x/%x",
+			write, flush, apply,
+			commitLSN+0x100, commitLSN+0x100, commitLSN-1)
+	}
+
+	// Start a publisher-side COMMIT waiter on remote_apply.
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- syncRep.WaitForLSN(waitCtx, commitLSN, wal.SyncRepRemoteApply)
+	}()
+
+	// The waiter must still be blocked: apply < commitLSN.
+	select {
+	case err := <-done:
+		t.Fatalf("WaitForLSN released early (apply=%x < target=%x): %v", apply, commitLSN, err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Subscriber now reports apply at the commit target — this is the
+	// post-apply ack and should release the COMMIT.
+	catchupPayload := protocol.EncodeStandbyStatusUpdate(
+		commitLSN+0x100, commitLSN+0x100, commitLSN,
+		time.Unix(0, 0).UTC(), false,
+	)
+	if err := s.handleStandbyCopyData("", catchupPayload, nil, syncRep, "goopg_sub"); err != nil {
+		t.Fatalf("dispatch catchup report: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForLSN: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForLSN did not release after apply_lsn caught up via logical-walsender dispatch")
+	}
+}
+
+// TestLogicalSyncRepDispatchEmptyAppNameIsNoop pins the safety
+// invariant that a START_REPLICATION LOGICAL connection without an
+// `application_name` startup parameter does NOT pollute the SyncRep
+// registry with an empty-string entry. Otherwise a stray
+// SetStandbyNames('"".*') or a default rule could accidentally match.
+func TestLogicalSyncRepDispatchEmptyAppNameIsNoop(t *testing.T) {
+	t.Parallel()
+
+	syncRep := wal.NewSyncRep()
+	s := &Server{cfg: Config{SyncRep: syncRep}}
+
+	payload := protocol.EncodeStandbyStatusUpdate(0x500, 0x500, 0x500,
+		time.Unix(0, 0).UTC(), false)
+	if err := s.handleStandbyCopyData("", payload, nil, syncRep, ""); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	write, flush, apply := syncRep.StandbyProgress("")
+	if write != 0 || flush != 0 || apply != 0 {
+		t.Fatalf("empty appName progress was recorded: write=%x flush=%x apply=%x",
+			write, flush, apply)
 	}
 }

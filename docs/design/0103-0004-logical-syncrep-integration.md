@@ -1,7 +1,7 @@
 # 0103-0004 — Logical Walsender → SyncRep Wait Queue Integration
 
-**Status:** draft
-**Date:** 2026-05-13
+**Status:** accepted
+**Date:** 2026-05-13 (drafted), 2026-05-14 (accepted)
 **Milestone:** M0103-0005
 **Depends on:** M0102-0005 (`internal/wal/syncrep.go` SyncRep wait primitive).
 **Upstream reference:** `postgres/src/backend/replication/walsender.c::ProcessStandbyReplyMessage` + `ProcessStandbyMessage` (consumes 'r' feedback), `postgres/src/backend/replication/syncrep.c::SyncRepGetSyncStandbys` (matches `application_name` against `synchronous_standby_names`), `postgres/src/backend/replication/syncrep.c::SyncRepWakeQueue` (releases waiters).
@@ -105,11 +105,16 @@ releases when `applyLSN ≥ commitLSN`.
 
 | File | Change |
 |---|---|
-| `internal/server/logicalwalsender.go` | Dispatch 'r' message to `SyncRep.UpdateStandbyProgress`; plumb `application_name` from session |
-| `internal/server/session.go` | Confirm `application_name` is parsed at startup and reachable from the walsender |
-| `internal/wal/syncrep_test.go` | New: logical-walsender variant — fake `LogicalReceiver` reports lagging apply_lsn; publisher COMMIT blocks; advance apply_lsn; COMMIT unblocks |
+| `internal/server/logicalwalsender.go` | Adds `defer SyncRep.ForgetStandby(appName)` so a disconnected subscriber stops counting toward FIRST/ANY quorum. The receive-side goroutine already forwarded standby-status frames into `handleStandbyCopyData` with `(syncRep, appName)`, which decodes the 'r' message and calls `SyncRep.UpdateStandbyProgress`; no additional dispatch wiring was needed. |
+| `internal/server/server.go` | No change — `application_name` is already parsed at startup, threaded through `runPostStartupLoop` → `handleReplicationCommand` → `replyStartReplication` → `runLogicalWalsender`. |
+| `internal/server/logicalwalsender_test.go` | New `TestLogicalSyncRepDispatchUnblocksOnApplyCatchup`: subscriber emits a real `EncodeStandbyStatusUpdate` payload through `handleStandbyCopyData`; a `WaitForLSN(commitLSN, RemoteApply)` goroutine stays blocked while `apply_lsn < commitLSN` and releases on the catchup report. Plus `TestLogicalSyncRepDispatchEmptyAppNameIsNoop` pinning that an empty `appName` does not pollute the registry. |
 
-No changes to `internal/wal/syncrep.go` (M0102-0005 covers the primitive).
+No changes to `internal/wal/syncrep.go` (M0102-0005 covers the primitive). No
+duplicate test added to `internal/wal/syncrep_test.go` — the existing
+`TestSyncRepModeDistinguishesWriteFlushApply` already pins the primitive's
+remote-apply semantics; what M0103-0005 actually needs is the
+dispatcher-path test that proves the logical walsender wires the
+appName through, hence its placement in `logicalwalsender_test.go`.
 
 ## Verification
 

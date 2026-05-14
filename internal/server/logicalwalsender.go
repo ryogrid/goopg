@@ -53,6 +53,15 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 		segSize = wal.DefaultSegmentSize
 	}
 
+	// M0103-0005: forget the subscriber's last reported progress when the
+	// connection drops so a disconnected subscriber no longer counts toward
+	// the FIRST/ANY quorum. Mirrors the physical-walsender path in
+	// replyStartReplication. Empty appName is harmless (ForgetStandby
+	// removes the "" key, which never matches any rule entry).
+	if s.cfg.SyncRep != nil && appName != "" {
+		defer s.cfg.SyncRep.ForgetStandby(appName)
+	}
+
 	// Snapshot the catalog at session start so the pgoutput
 	// stream resolves relations against a stable shape; mirrors
 	// what the apply worker expects.
@@ -88,6 +97,13 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	// path also advances it on each commit; the standby-status
 	// path mirrors what walreceiver/PHYSICAL slots do so the
 	// subscriber ack drives retention.
+	//
+	// M0103-0005: handleStandbyCopyData also dispatches the parsed
+	// progress into SyncRep when configured; the appName carried
+	// through from the START_REPLICATION handshake keys each
+	// per-subscriber row in the wait registry, so a publisher
+	// COMMIT blocking on synchronous_standby_names = '<appName>'
+	// releases as soon as the subscriber reports apply ≥ commit LSN.
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 

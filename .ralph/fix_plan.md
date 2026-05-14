@@ -1664,16 +1664,41 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       ./internal/executor/ ./internal/catalog/` → all pass (wal 3.035 s,
       server 3.605 s, executor 2.621 s, catalog 1.021 s).
 
-- [ ] **M0103-0005** — Logical-walsender SyncRep integration.
-      Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`.
-      Sites: `internal/server/logicalwalsender.go` — on 'r' (Standby Status
-      Update) receipt, call `cfg.SyncRep.UpdateStandbyProgress(s.appName,
-      writeLSN, flushLSN, applyLSN)`; plumb `application_name` from session
-      startup parameters. No changes to `internal/wal/syncrep.go` —
-      M0102-0005's primitive is reused. Verify: race-tested unit
-      `TestLogicalSyncRep` — fake `LogicalReceiver` reports lagging
-      apply_lsn; publisher COMMIT blocks; advance apply_lsn; COMMIT
-      unblocks. `application_name` parsing confirmed to reach the walsender.
+- [x] **M0103-0005** — Logical-walsender SyncRep integration.
+      Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`
+      (accepted).
+      COMPLETE 2026-05-14: audit showed the 'r'-message dispatch was
+      already wired (`internal/server/logicalwalsender.go::runLogicalWalsender`
+      forwards every standby-status frame into `handleStandbyCopyData`,
+      which decodes via `protocol.DecodeReplicationMessage` and calls
+      `SyncRep.UpdateStandbyProgress(appName, write, flush, apply)`).
+      `appName` is plumbed from the StartupMessage's `application_name`
+      through `runPostStartupLoop → handleReplicationCommand →
+      replyStartReplication → runLogicalWalsender`. The missing piece
+      was the cleanup symmetry with the physical path: a `defer
+      SyncRep.ForgetStandby(appName)` was added to `runLogicalWalsender`
+      so a disconnected subscriber stops counting toward the FIRST/ANY
+      quorum (parity with the existing physical-walsender defer in
+      `replyStartReplication`).
+      Verification:
+      - New `TestLogicalSyncRepDispatchUnblocksOnApplyCatchup` in
+        `internal/server/logicalwalsender_test.go` builds a real
+        `EncodeStandbyStatusUpdate` payload, feeds it through
+        `handleStandbyCopyData` with `appName="goopg_sub"` and
+        `syncRep` configured for that name + `SyncRepRemoteApply`, and
+        proves `WaitForLSN(commitLSN, RemoteApply)` stays blocked while
+        `apply_lsn < commitLSN` then releases on the catchup report.
+      - New `TestLogicalSyncRepDispatchEmptyAppNameIsNoop` pins the
+        empty-`appName` safety invariant (no registry pollution).
+      - `go test -race -count=1 -timeout 180s ./internal/server/
+        ./internal/wal/ ./internal/executor/ ./internal/catalog/` →
+        all green (server 3.504 s, wal 3.079 s, executor 2.594 s,
+        catalog 1.020 s).
+      No new SyncRep primitive added; M0102-0005's
+      `wal.SyncRep.WaitForLSN` already handles publisher-side blocking.
+      The existing `internal/wal/syncrep_test.go::TestSyncRepModeDistinguishesWriteFlushApply`
+      already pins the RemoteApply primitive's semantics; the new
+      tests focus on the dispatcher-path wiring that M0103-0005 owns.
 
 - [ ] **M0103-0006** — `pubsubcluster` test harness.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
