@@ -862,6 +862,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
 			// Recompute generated columns using partition child's schema.
 			_ = computeGeneratedColumns(partTable.Columns, partRow)
+			if uerr := checkUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, o.plan.Pos()); uerr != nil {
+				return nil, uerr
+			}
 			ptr, werr := writeHeapRowReturning(o.ctx, targetRel, partTable.Columns, partRow)
 			if werr != nil {
 				return nil, werr
@@ -877,6 +880,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			continue
 		}
 		// No matching partition found (or non-partitioned) — write to parent.
+		if uerr := checkUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, o.plan.Pos()); uerr != nil {
+			return nil, uerr
+		}
 		ptr, werr := writeHeapRowReturning(o.ctx, targetRel, cols, row)
 		if werr != nil {
 			return nil, werr
@@ -2342,6 +2348,129 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		}
 		_ = tree.Insert(key, ptr)
 	}
+}
+
+
+// checkUniqueIndexesForInsert enforces unique-constraint violations at INSERT
+// time. For each unique/primary btree index on `tbl`, it computes the
+// candidate key from `row` and probes the index for a matching live entry.
+// A "live" match is a heap tuple whose xmin is committed (or in-progress in
+// another session — handled below) and whose xmax is invalid, aborted, or
+// in-progress in another session. If found, returns 23505 with an upstream-
+// shaped MESSAGE; otherwise returns nil. The plain INSERT path calls this
+// before writing the heap tuple. The upsertOp / ON CONFLICT path bypasses
+// this check because it has already routed conflicts through its arbiter
+// detector. Apply-worker insertions bypass it too because logical
+// replication delivers committed-on-publisher rows that the subscriber's
+// heap may not see yet (skip-on-duplicate is the right behaviour there).
+//
+// The visibility check is conservative: any tuple whose xmin is the current
+// session OR is committed/in-progress in another session counts as a
+// conflict. Aborted-xmin tuples and committed-then-deleted tuples (xmax
+// committed) do not collide. This matches the upstream "the new tuple
+// would create a duplicate" diagnostic emitted at INSERT time, while
+// avoiding the full XID-wait dance (deferred to a later milestone).
+func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, pos int) error {
+	if ctx.Catalog == nil || ctx.Pool == nil {
+		return nil
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if !idx.Unique && !idx.Primary {
+			continue
+		}
+		idxRel := ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row)
+		if err != nil || key == nil {
+			continue
+		}
+		var conflict bool
+		_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+			slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+			if perr != nil {
+				return true, nil
+			}
+			slot.RLock()
+			tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+			slot.RUnlock()
+			ctx.Pool.Unpin(slot)
+			if terr != nil {
+				return true, nil
+			}
+			if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+				conflict = true
+				return false, nil
+			}
+			return true, nil
+		})
+		if conflict {
+			return &ExecError{
+				Code: "23505",
+				Pos:  pos,
+				Message: fmt.Sprintf(
+					"duplicate key value violates unique constraint %q",
+					idx.Name,
+				),
+			}
+		}
+	}
+	return nil
+}
+
+// isLiveForUniqueCheck decides whether a tuple with the given xmin/xmax
+// should be considered a live duplicate for INSERT-time uniqueness
+// enforcement. Mirrors the conservative reading described on
+// `checkUniqueIndexesForInsert`.
+// isLiveForUniqueCheck decides whether a tuple with the given xmin/xmax
+// should be considered a live duplicate for INSERT-time uniqueness
+// enforcement. Mirrors the conservative reading described on
+// `checkUniqueIndexesForInsert`.
+func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
+	if xmin == storage.InvalidTransactionID {
+		return false
+	}
+	xminLive := false
+	if ctx.TxnMgr != nil {
+		switch {
+		case ctx.TxnMgr.IsXIDActive(xmin):
+			xminLive = true
+		case ctx.Snap.SeesCommittedXID(xmin):
+			xminLive = true
+		case ctx.Snap.HasAborted(xmin):
+			xminLive = false
+		default:
+			// Unknown xmin (committed before snapshot start, or a
+			// session-self insert that has not yet been added to the
+			// snapshot) — treat as live so we err on the side of
+			// rejecting the duplicate.
+			xminLive = true
+		}
+	} else {
+		xminLive = true
+	}
+	if !xminLive {
+		return false
+	}
+	if xmax == storage.InvalidTransactionID {
+		return true
+	}
+	if ctx.TxnMgr != nil {
+		if ctx.TxnMgr.IsXIDActive(xmax) {
+			// Concurrent delete — still considered live until that
+			// xact commits.
+			return true
+		}
+		if ctx.Snap.HasAborted(xmax) {
+			return true
+		}
+	}
+	// xmax appears committed → tuple was deleted by a committed xact;
+	// not a live duplicate.
+	return false
 }
 
 // writeHeapRow encodes the row and appends it to the relation. v0

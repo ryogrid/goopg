@@ -1522,6 +1522,46 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `InsertConflictDoUpdate`, `LockCommittedUpdate` unchanged.
           Design:
           `docs/design/0100-0005q-fk-check-wait-moved-partition.md`.
+        - Runtime unique-constraint violation on plain INSERT
+          (M0100-0005r, 2026-05-15 loop 34).
+          `internal/executor/operators_storage.go` introduces
+          `checkUniqueIndexesForInsert` (probes every unique/primary
+          btree on `tbl` for matching live tuples via `RangeScan` +
+          heap-tuple visibility classification) and
+          `isLiveForUniqueCheck` (xmin/xmax → live? per a conservative
+          subset of upstream's `HeapTupleSatisfiesDirty`: same-xact +
+          another-active xact + `Snap.SeesCommittedXID` count as live;
+          `Snap.HasAborted` xmin and committed-then-deleted xmax do
+          not). Wired into `insertOp.Next` BEFORE
+          `writeHeapRowReturning` in BOTH the partition-routed branch
+          (`if isPartitioned && routedPart != nil`) and the
+          non-partitioned branch (`else`); on conflict raises
+          `ExecError{Code: "23505", Message: "duplicate key value
+          violates unique constraint %q"}` matching upstream
+          `_bt_check_unique`.  `maintainUniqueIndexesForInsert` is
+          unchanged so apply-worker re-applications stay
+          skip-on-duplicate (preserves the M0103-0007 rung-1
+          fresh-session visibility invariant).  `upsertOp` path is
+          also unaffected because ON CONFLICT routes through
+          `probeArbiterWaiting` first and never reaches the new
+          check.  Closes the L34/L36 `ERROR:  duplicate key value
+          violates unique constraint "test_pkey"` line of
+          `read-write-unique.spec` (M0100-0005's 21-test pass goal);
+          remaining diffs in that spec are SERIALIZABLE first-read
+          snapshot timing and SSI predicate-lock waits, both
+          separate scope.  Regression pins:
+          `TestInsertRuntimeUniqueViolationRaises23505` and
+          `TestInsertRuntimeUniqueViolationAllowsAfterRolledBackInsert`
+          in `internal/executor/insert_unique_constraint_test.go`.
+          `go test -count=1 -race ./internal/executor/
+          ./internal/server/ ./internal/mvcc/ ./internal/planner/
+          ./internal/parser/ ./internal/analyzer/ ./internal/storage/
+          ./internal/wal/ ./internal/initdb/ ./internal/access/btree/`
+          PASS; adjacent isolation tests
+          `LockCommittedUpdate`, `InsertConflictDoUpdate`,
+          `InsertConflictDoNothing`, `PartitionKeyUpdate1` unchanged
+          (4/4 still PASS). Design:
+          `docs/design/0100-0005r-insert-runtime-unique-constraint.md`.
         - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
           `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
           the row's source `*catalog.Table` through pending records
