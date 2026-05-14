@@ -1556,10 +1556,59 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
         landed deliverables. Snapshot semantics intentionally unchanged
         in this slice — SSI conflict tracking is staged for M0104-0002..0006.
 
-- [ ] **M0104-0002**
+- [x] **M0104-0002**
       - Summary: Serializable transaction-state lifecycle.
-      - Introduce per-transaction SSI registration/cleanup state and wire it to
-        transaction begin/commit/abort boundaries.
+      - Landed 2026-05-14:
+        (a) `mvcc.SerializableXact` introduced in `internal/mvcc/ssi.go`
+            as the goopg analogue of PostgreSQL's `SERIALIZABLEXACT`
+            (`src/include/storage/predicate_internals.h`). Lifecycle
+            fields (`Handle`, `XID`, `FinishedAt`, `Doomed`,
+            `IsActive`) plus declared-but-empty slots
+            (`inConflicts`, `outConflicts`, `predicateLocks`) so
+            M0104-0003..0005 can fill them in without changing the
+            lifecycle API or callers that already register/observe
+            `SerializableXact`.
+        (b) `mvcc.Manager` embeds a new `ssiState` registry
+            (handle-keyed `map[TxnHandle]*SerializableXact`) plus a
+            monotonic `CommitSeqNo` allocator. The map is lazily
+            initialised (`sync.Once`) so REPEATABLE READ / READ
+            COMMITTED workloads pay no SSI footprint. Access is
+            funnelled through `Manager.SerializableXact` and
+            `Manager.SerializableXactCount`; both take `Manager.mu`
+            internally to share ordering with snapshot acquisition
+            and AssignXID.
+        (c) `Manager.Begin` registers a fresh `SerializableXact`
+            when `iso == IsolationSerializable`; RC/RR Begin paths
+            short-circuit the registration to keep the registry
+            empty for those workloads.
+        (d) `Manager.AssignXID` stamps the newly allocated
+            top-level XID onto `SerializableXact.XID` so the
+            M0104-0004/0005 conflict-detection paths can look up
+            `SerializableXact` objects by writer XID after the
+            lazy-allocation point.
+        (e) `Manager.finish` releases the `SerializableXact` on
+            both commit and abort, assigning a dense,
+            monotonically-increasing `CommitSeqNo` to `FinishedAt`.
+            The released pointer remains observable (its fields
+            stay populated) so logging / future conflict-graph
+            walkers can inspect post-finish state, but it is
+            detached from the registry. RC/RR finish paths
+            short-circuit the release.
+      - Regression pins (`internal/mvcc/ssi_test.go`):
+        `TestSerializableXact_BeginRegistersAndCommitReleases`
+        (register-on-Begin + release-on-Commit + FinishedAt
+        stamping), `TestSerializableXact_RollbackAlsoReleases`
+        (cleanup runs on abort too — no SSI leak),
+        `TestSerializableXact_AssignXIDStampsTopXid` (top-level
+        XID stamping for the lazy-allocation point),
+        `TestSerializableXact_NotRegisteredForRCorRR` (empty
+        registry for non-SERIALIZABLE workloads — cost +
+        correctness), `TestSerializableXact_CommitSeqNoMonotonic`
+        (dense, monotonically-increasing CommitSeqNo allocation
+        that M0104-0006's dangerous-structure check relies on).
+      - Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
+        §"M0104-0002 status" updated with the landed deliverables;
+        README index row mirrored.
 
 - [ ] **M0104-0003**
       - Summary: Predicate-lock substrate (SIREAD).

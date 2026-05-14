@@ -91,6 +91,11 @@ type Manager struct {
 	// XIDs, and records individually-aborted subxact XIDs. Lazily
 	// initialised on first use. Protected by subxactMu.
 	subxactFields
+
+	// ssiState is the SERIALIZABLE-transaction bookkeeping registry
+	// (M0104-0002). Lazily initialised when the first serializable
+	// transaction Begins; protected by Manager.mu. See ssi.go.
+	ssiState ssiState
 }
 
 // NewManager returns a fresh manager whose first assigned xid is 3,
@@ -186,6 +191,14 @@ func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
 		xid:          storage.InvalidTransactionID,
 		snapshotXmin: ^storage.TransactionID(0), // sentinel: no snapshot yet
 	}
+	// M0104-0002: allocate per-txn SSI bookkeeping for SERIALIZABLE
+	// transactions. RC/RR never register; the registry stays nil
+	// for those workloads. Subsequent slices (predicate locks,
+	// rw-conflict tracking, pre-commit failure) attach to the
+	// SerializableXact returned here.
+	if iso == IsolationSerializable {
+		m.registerSerializableLocked(handle)
+	}
 	return Transaction{Handle: handle, XID: storage.InvalidTransactionID, Isolation: iso}, nil
 }
 
@@ -220,6 +233,16 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 	}
 	state.xid = m.nextXID
 	m.nextXID++
+	// M0104-0002: stamp the new top-level XID onto the SSI
+	// bookkeeping object so future slices that key conflict
+	// records by XID can find the SerializableXact. Read-only
+	// SERIALIZABLE transactions never reach this branch and keep
+	// SerializableXact.XID == InvalidTransactionID.
+	if state.isolation == IsolationSerializable && m.ssiState.xacts != nil {
+		if sx, ok := m.ssiState.xacts[tx.Handle]; ok {
+			sx.XID = state.xid
+		}
+	}
 	return state.xid, nil
 }
 
@@ -365,6 +388,13 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	// even after the XID falls below future snapshots' Xmin.
 	if kind == XactAbort && state.xid != storage.InvalidTransactionID {
 		m.abortedXIDs = insertSortedXID(m.abortedXIDs, state.xid)
+	}
+	// M0104-0002: release SSI bookkeeping for SERIALIZABLE
+	// transactions (commit or abort). Stamps FinishedAt with the
+	// next CommitSeqNo and deletes the entry from the registry.
+	// RC/RR transactions skip this branch.
+	if state.isolation == IsolationSerializable {
+		m.releaseSerializableLocked(tx.Handle)
 	}
 	delete(m.active, tx.Handle)
 	// Broadcast to unblock any goroutine waiting in WaitForXID.
