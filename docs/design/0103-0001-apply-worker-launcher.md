@@ -1,7 +1,7 @@
 # 0103-0001 — Subscriber Apply-Worker Auto-Launcher
 
-**Status:** draft
-**Date:** 2026-05-13
+**Status:** accepted
+**Date:** 2026-05-13 (drafted), 2026-05-14 (accepted)
 **Milestone:** M0103-0002
 **Upstream reference:** `postgres/src/backend/replication/logical/launcher.c` (`ApplyLauncherMain`, `logicalrep_worker_launch`, `ApplyLauncherWakeup`), `postgres/src/include/replication/worker_internal.h`, `postgres/src/backend/catalog/pg_subscription.c` (catalog access).
 

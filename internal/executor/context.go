@@ -186,6 +186,14 @@ type Context struct {
 	// flush; remote_* levels block until configured standbys ack.
 	// M0102-0005.
 	SyncCommitMode wal.SyncRepMode
+
+	// OnSubscriptionChange is invoked after a successful
+	// CREATE / DROP SUBSCRIPTION (and, when it lands, ALTER
+	// SUBSCRIPTION). The server wires this to ApplyLauncher.Wake so
+	// the launcher rescans within milliseconds rather than waiting
+	// for its periodic poll. nil disables the wakeup (the launcher
+	// still converges via the timer). M0103-0002.
+	OnSubscriptionChange func()
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

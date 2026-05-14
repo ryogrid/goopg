@@ -286,6 +286,11 @@ type Server struct {
 	// pc is the cross-session normalized-query plan cache. M0098-0005.
 	// nil when the server is in protocol-only mode (no catalog/storage).
 	pc *planCache
+
+	// applyLauncher is the logical-replication subscription
+	// auto-launcher (M0103-0002). nil when PubSub is unconfigured.
+	// Constructed in New, started in Run, drained on Run exit.
+	applyLauncher *ApplyLauncher
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
@@ -302,8 +307,27 @@ func New(cfg Config) *Server {
 	if cfg.hasStorage() {
 		s.pc = newPlanCache()
 	}
+	// Build the apply-worker launcher when logical replication is
+	// wired (PubSub + storage handles). Server.Run starts it so its
+	// lifetime matches the listener's. M0103-0002.
+	if cfg.PubSub != nil && cfg.hasStorage() {
+		s.applyLauncher = NewApplyLauncher(ApplyLauncherConfig{
+			PubSub:  cfg.PubSub,
+			Catalog: cfg.Catalog,
+			Pool:    cfg.Pool,
+			TxnMgr:  cfg.TxnMgr,
+			Slots:   cfg.Slots,
+			Logger:  cfg.Logger,
+		})
+	}
 	return s
 }
+
+// ApplyLauncher exposes the logical-replication subscription
+// auto-launcher attached to this Server. Returns nil when PubSub or
+// storage is unconfigured. Test-only accessor; production code paths
+// use the wake hook plumbed through executor.Context.
+func (s *Server) ApplyLauncher() *ApplyLauncher { return s.applyLauncher }
 
 // Addr returns the listen address (resolved port if the config used :0).
 // Returns nil before Run has bound the listener; callers in tests should
@@ -391,6 +415,13 @@ func (s *Server) Run(ctx context.Context) error {
 		<-runCtx.Done()
 		s.closeOnce.Do(func() { _ = ln.Close() })
 	}()
+
+	// Start the apply-worker auto-launcher if logical replication
+	// is wired. M0103-0002. Lifetime is bound to runCtx so a STOP
+	// from the control plane drains every in-flight apply worker.
+	if s.applyLauncher != nil {
+		go s.applyLauncher.Run(runCtx)
+	}
 
 	// Start the autovacuum launcher if configured.
 	if s.cfg.AutovacuumLauncher != nil {

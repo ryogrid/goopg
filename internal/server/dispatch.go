@@ -201,6 +201,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.WAL = s.cfg.WAL
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
+	if s.applyLauncher != nil {
+		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+	}
 
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {

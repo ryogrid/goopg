@@ -113,6 +113,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.WAL = s.cfg.WAL
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
+	if s.applyLauncher != nil {
+		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+	}
 
 	op, err := executor.Build(node)
 	if err != nil {

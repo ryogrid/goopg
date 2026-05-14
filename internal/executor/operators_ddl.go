@@ -183,6 +183,9 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if _, err := o.ctx.PubSub.CreateSubscription(s.Name, s.Conninfo, s.Publications, slotName, enabled); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
+	}
 	return nil
 }
 
@@ -195,6 +198,9 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
 	}
 	return nil
 }
