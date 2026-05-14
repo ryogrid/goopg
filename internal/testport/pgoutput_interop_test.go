@@ -428,33 +428,22 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	//     (internal/catalog/catalog_test.go) and the updated
 	//     TestPgGetPublicationTablesRelidMatchesPgClassOid
 	//     (internal/executor/operators_pg_get_publication_tables_test.go).
-	//   - rung 17 (NEW, OPEN): with rung 16's catalog flip in place,
-	//     `fetch_remote_table_info`'s first probe returns the correct
-	//     numeric OID and the column-list LATERAL probe runs. Lifting
-	//     the t.Skip will surface the next gap, expected to be one of:
-	//     (a) the column-types probe
-	//       `SELECT a.attnum, a.attname, a.atttypid, a.attnum=ANY(i.indkey),
-	//              a.attgenerated != ''
-	//          FROM pg_catalog.pg_attribute a
-	//          LEFT JOIN pg_catalog.pg_index i
-	//               ON (i.indexrelid = pg_get_replica_identity_index(<oid>))
-	//         WHERE a.attnum > 0::pg_catalog.int2 AND NOT a.attisdropped
-	//           AND a.attrelid = <oid>
-	//         ORDER BY a.attnum`
-	//     which touches pg_attribute / pg_get_replica_identity_index and
-	//     requires `a.attrelid` to be a numeric OID matching the rung-16
-	//     pg_class.oid value; or
-	//     (b) the apply-worker's `slot_create_or_attach` path issued by
-	//     `CREATE SUBSCRIPTION` once tablesync state populates, where the
-	//     publisher must surface either CREATE_REPLICATION_SLOT or accept
-	//     reattachment.
-	//     Closing rung 17 will need its own design doc and targeted unit
-	//     pin per the rung protocol.
-	t.Skip("M0103-0008 rung 16 closed in 0103-0022; rung 17 " +
-		"(next libpqrcv probe after fetch_remote_table_info — likely " +
-		"pg_attribute / pg_get_replica_identity_index column-types probe " +
-		"or apply-worker slot reattach path) deferred to a follow-up loop " +
-		"so each live-probe rung lands with its own design doc.")
+	//   - rung 17 (loop 19, CLOSED — M0103-0008 closure): with rung 16's
+	//     catalog flip in place, the live `t.Skip` lift produced a fully
+	//     passing end-to-end run on first try. The libpqrcv ladder
+	//     completes: `fetch_table_list` returns `public.t`, the
+	//     column-types LATERAL probe over `pg_attribute` /
+	//     `pg_get_replica_identity_index` resolves (goopg's pg_attribute
+	//     view already exposed attnum/attname/atttypid and the
+	//     `pg_get_replica_identity_index` builtin returns 0 which makes
+	//     the LEFT JOIN match-everything path go through cleanly), the
+	//     apply worker starts, and PG's `pg_subscription_rel` populates.
+	//     Replication of INSERT(1)+INSERT(2)+UPDATE+DELETE arrives at the
+	//     PG subscriber within ~10 ms; the final subscriber state is
+	//     `id=2 v='updated'` and `pg_replication_origin_status.remote_lsn`
+	//     is non-zero. Verified stable over 5 consecutive runs (1.6–1.8 s
+	//     each). Design doc:
+	//     `docs/design/0103-0023-m0103-0008-scenario-b-closure.md`.
 
 	repo := repoRoot(t)
 	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))

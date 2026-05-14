@@ -1835,7 +1835,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       async subtest — `count(*) ∈ [killCommitted-asyncLossBound+1,
       killCommitted+1]` with `asyncLossBound = 50` (documented in design doc).
 
-- [ ] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
+- [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
       File: `internal/testport/e2e_logical_failover_goopg_to_pg_test.go`,
       `TestE2E_LogicalFailoverGoopgToPG` with the same two subtests.
@@ -2763,6 +2763,54 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       likely the pg_attribute / pg_get_replica_identity_index
       column-types query) per the rung protocol so the next loop
       resumes from the exact failing surface.
+      CLOSED 2026-05-14 (loop 19): M0103-0008 SCENARIO B PASSES
+      END-TO-END. Design doc:
+      `docs/design/0103-0023-m0103-0008-scenario-b-closure.md`
+      (accepted). Lifting the `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` produced a fully green
+      run on first try — no rung-17 work was needed. The
+      hypothesised pg_attribute / pg_get_replica_identity_index
+      column-types probe was already satisfied: goopg's virtual
+      `pg_attribute` view exposes attnum/attname/atttypid/
+      attisdropped/attgenerated, and the
+      `pg_get_replica_identity_index(oid)` builtin returns 0
+      (InvalidOid) — equivalent to upstream's REPLICA IDENTITY
+      DEFAULT semantics, so the LEFT JOIN drops all rows and the
+      outer `attnum = ANY(i.indkey)` evaluates as false. Rung 16's
+      `pg_class.oid` numeric flip + `relreplident` column was the
+      keystone — every subsequent probe in the libpqrcv ladder
+      pivots off that one column shape.
+      Observed end-to-end behaviour:
+      - libpqrcv ladder runs cleanly: `fetch_table_list` returns
+        `(public, t, NULL)`, `fetch_remote_table_info` returns
+        `relreplident='d'` + numeric `pg_class.oid`, column-types
+        LATERAL probe resolves.
+      - Apply worker launches and `pg_subscription_rel` populates
+        with exactly one row for `public.t`.
+      - Publisher's `INSERT(1,'hello')` + `INSERT(2,'world')` +
+        `UPDATE … SET v='updated' WHERE id=2` + `DELETE WHERE
+        id=1` replicate within ~10 ms; subscriber final state is
+        `(id=2, v='updated')`; `pg_replication_origin_status.
+        remote_lsn` advances to a non-zero LSN
+        (observed `0/A638` in one run).
+      Changes in loop 19:
+      - `internal/testport/pgoutput_interop_test.go`:
+        dropped the `t.Skip` guard and replaced the rung-17-OPEN
+        comment with a rung-17-CLOSED closure pointer at the new
+        design doc.
+      Verification (loop 19): `go test -count=1 -timeout 60s
+      -run TestPort_PgoutputInteropGoopgToPG ./internal/testport/`
+      → PASS, 5/5 consecutive runs at 1.6–1.8 s each (full PG
+      cluster bring-up, initdb, pg_ctl start, CREATE
+      SUBSCRIPTION, WAL stream, apply, tear-down). Broader sweep:
+      `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/ ./internal/storage/` → all green
+      (recorded at commit time).
+      With M0103-0008 closed, the only remaining sub-milestone in
+      M0103 is M0103-0009 (close milestone — CSV row additions
+      and inventory bump).
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
