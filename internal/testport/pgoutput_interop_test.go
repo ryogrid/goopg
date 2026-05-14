@@ -1636,6 +1636,129 @@ func TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "note IS NULL", 0, 5*time.Second)
 }
 
+// TestPort_PgoutputInteropPGToGoopgPgbenchInsert pins M0103-0007
+// rung 20 (`docs/design/0103-0043-m0103-0007-rung-20-pgbench-pg-to-goopg.md`):
+// the upstream `pgbench` binary drives an INSERT-only workload against
+// the PG publisher and every row must surface on the goopg subscriber
+// through the pgoutput pipeline. Replaces the rungs 1–19 `psql -c`
+// loops with a `-c N -t M` pgbench run — the same workload driver the
+// Scenario A DoD calls for (`pgbench -i -s 1 && pgbench -c 2 -T 180`),
+// scoped here to an INSERT-only custom script so the rung 1's apply-
+// worker INSERT path is what is being measured, not pgbench's
+// `tpcb-like` UPDATE schedule (those are pinned across rungs 2–11).
+//
+// Workload: 2 clients × 25 transactions × 1 INSERT each (50 rows
+// total). The script uses pgbench's `\set rid random(1, 10^9)` plus
+// `:client_id` (built-in 0..N-1) so each INSERT carries a unique PK
+// with negligible collision probability (P(collision) < 10⁻⁹ × 50).
+//
+// Fresh `database/sql` per assertion through `WaitForRow` exercises
+// the same dispatcher MVCC view rungs 1–19 use. Three assertions
+// fail-fast distinct regressions: total count != 50 catches a
+// workload that fired but lost rows in pgoutput; per-client-id counts
+// of 0 catches a pgbench launch that pinned every txn to client_id=0
+// (or only one client connected); the row-count pin against
+// `client_id IN (0,1)` catches stray rows from a leaked previous test.
+func TestPort_PgoutputInteropPGToGoopgPgbenchInsert(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	// Refuse to run without the in-tree pgbench. The standard PATH
+	// pgbench may not match the local libpq, so we explicitly require
+	// the local_install build that pgcluster.Cluster's env() sets
+	// LD_LIBRARY_PATH for.
+	pgbenchBin := filepath.Join(repo, "postgres", "local_install", "bin", "pgbench")
+	if st, err := os.Stat(pgbenchBin); err != nil || !st.Mode().IsRegular() {
+		t.Skipf("pgbench not present at %s", pgbenchBin)
+	}
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-pgb-ins")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_pgb_ins"
+	psc := pubsubcluster.NewMixed(t, "pg2g_pgb_ins", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Pre-create matching schema on both ends. INSERT-only workload, so
+	// REPLICA IDENTITY DEFAULT (the PK) is sufficient; goopg's CREATE
+	// SUBSCRIPTION does not auto-create slots so the publisher slot is
+	// minted up front.
+	psc.Publisher.Exec(t, "CREATE TABLE public.bench_log (id bigint PRIMARY KEY, client_id int NOT NULL)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.bench_log (id bigint PRIMARY KEY, client_id int NOT NULL)")
+	psc.CreatePublication(t, "bench_log")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Write the custom pgbench script. `\set rid random(1, 10^9)` mints
+	// a unique-with-overwhelming-probability PK; :client_id is
+	// pgbench's built-in 0..nclients-1 index.
+	scriptPath := filepath.Join(t.TempDir(), "bench_insert.sql")
+	scriptBody := "\\set rid random(1, 1000000000)\n" +
+		"INSERT INTO public.bench_log (id, client_id) VALUES (:rid, :client_id);\n"
+	if err := os.WriteFile(scriptPath, []byte(scriptBody), 0o644); err != nil {
+		t.Fatalf("write pgbench script: %v", err)
+	}
+
+	// 2 clients × 25 transactions = 50 rows. `--no-vacuum` because no
+	// vacuum target exists; `-f` overrides the default tpcb-like.
+	out := psc.Publisher.Pgbench(t,
+		"--no-vacuum",
+		"-c", "2",
+		"-j", "2",
+		"-t", "25",
+		"-f", scriptPath,
+	)
+	if !strings.Contains(out, "tps") {
+		t.Logf("pgbench output:\n%s", out)
+	}
+
+	// Convergence: exactly 50 rows across both clients within 60 s.
+	psc.WaitForRow(t, "public.bench_log", "1=1", 50, 60*time.Second)
+
+	// Per-client progress: each client_id contributed strictly between
+	// 1 and 49 rows. pgbench's round-robin client dispatch doesn't
+	// guarantee a perfect 25/25 split (system scheduler decides) but
+	// both clients MUST contribute or the harness is broken.
+	c0 := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.bench_log WHERE client_id = 0")
+	c1 := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.bench_log WHERE client_id = 1")
+	if c0 == "0" {
+		t.Fatalf("subscriber saw 0 rows for client_id=0 (got c0=%s c1=%s) — pgbench client 0 did not fire", c0, c1)
+	}
+	if c1 == "0" {
+		t.Fatalf("subscriber saw 0 rows for client_id=1 (got c0=%s c1=%s) — pgbench client 1 did not fire", c0, c1)
+	}
+
+	// Negative pin: no stray rows outside the 0/1 client range.
+	psc.WaitForRow(t, "public.bench_log", "client_id NOT IN (0, 1)", 0, 5*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

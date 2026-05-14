@@ -2917,6 +2917,79 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         proto_version=2 streaming subxacts, kill -9 + libpq
         multi-host reconnect plumbing on the client side,
         column-ref-typed `nextval` args.
+      - PARTIAL PROGRESS 2026-05-14 (rung 20): pgbench-driven
+        publisher workload replaces the rungs 1–19 hand-coded
+        `psql -c "INSERT ..."` loops. Design doc:
+        `docs/design/0103-0043-m0103-0007-rung-20-pgbench-pg-to-goopg.md`
+        (accepted). The "pgbench against PG publisher" deferred
+        item lands in two pieces: a new `pgcluster.Cluster.Pgbench`
+        helper that mirrors `(*goopg cluster.Cluster).PGbench`, and
+        a live E2E test that uses it to drive an INSERT-only
+        custom-script workload from a PG publisher into a goopg
+        subscriber. Full standard-schema replication
+        (`pgbench -i -s 1 && pgbench -c 2 -T 180`) and the kill -9
+        + libpq multi-host reconnect plumbing remain deferred.
+      - Changes:
+      - `internal/testutil/pgcluster/cluster.go::Pgbench(t,
+        args ...)` returns combined stdout+stderr; fails the test
+        on non-zero exit. Standard `-h/-p/-U <database>`
+        connection flags are prepended; `LD_LIBRARY_PATH` is
+        inherited from `Cluster.env()` so the in-tree
+        `local_install/lib` libpq resolves without per-test
+        boilerplate (the legacy `TestE2E_PgbenchWorkload` had to
+        os.Setenv this explicitly).
+      - `internal/testutil/pubsubcluster/cluster.go::ReplPeer`
+        gains `Pgbench(t, args ...) string` so either side of the
+        pair is runnable. `peers.go`'s `pgPeer.Pgbench` delegates
+        to `pgcluster.Cluster.Pgbench`; `goopgPeer.Pgbench` wraps
+        the existing goopg `(*cluster.Cluster).PGbench` (which
+        returns `util.CommandResult`) and fails the test on
+        non-zero exit code or non-nil error.
+      - The workload table is `bench_log (id bigint PRIMARY KEY,
+        client_id int NOT NULL)` — INSERT-only, so REPLICA
+        IDENTITY DEFAULT (the PK) is sufficient. Pre-creation on
+        both ends follows every other rung's contract (goopg's
+        CREATE SUBSCRIPTION does not auto-create slots). pgbench
+        custom script: `\set rid random(1, 1000000000)` mints a
+        unique-with-overwhelming-probability PK; `:client_id` is
+        pgbench's built-in 0..nclients-1 index. The script
+        bypasses the standard `tpcb-like` schedule entirely —
+        rung 20's purpose is to validate the pgbench *driver*
+        path, not re-pin apply paths already covered by rungs
+        2–11.
+      - Pinned by `TestPort_PgoutputInteropPGToGoopgPgbenchInsert`
+        (`internal/testport/pgoutput_interop_test.go`). Workload:
+        `pgbench --no-vacuum -c 2 -j 2 -t 25 -f <script>` — 50
+        INSERTs across two concurrent clients. Three assertions
+        fail-fast distinct regressions: total `count(*) = 50`
+        catches replication loss; per-client
+        `count(*) WHERE client_id IN (0, 1) > 0` catches a
+        workload that fired but only ran on one client (pgbench
+        startup error that pinned `:client_id` to 0); negative
+        pin `client_id NOT IN (0, 1)` (expect 0) catches stray
+        rows from leaked previous tests. baseDir + slot name
+        kept short (`pg2g-pgb-ins` / `pg2g_pgb_ins`) so the
+        cluster's Unix control-socket path stays under the
+        108-byte sockaddr limit on Linux — the first run with
+        longer names tripped `bind: invalid argument` on
+        `.goopg.ctl.sock`.
+      - Verification (rung 20):
+        `go test -count=1 -timeout 180s -run
+        TestPort_PgoutputInteropPGToGoopgPgbenchInsert
+        ./internal/testport/` → PASS (~1.9 s); all 16
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~26.0 s); race-tested regression on
+        `./internal/executor/ ./internal/wal/
+        ./internal/catalog/ ./internal/testutil/pubsubcluster/
+        ./internal/testutil/pgcluster/` → all green (executor
+        2.774 s, wal 3.129 s, catalog 1.029 s, pubsubcluster
+        5.055 s, pgcluster 2.416 s).
+      - Next rungs (deferred within M0103-0007): pgbench
+        standard schema replication (`-i -s 1` + `tpcb-like`
+        UPDATE-heavy workload), kill -9 plumbing on
+        `pgcluster.Cluster` + libpq multi-host reconnect on the
+        client side, proto_version=2 streaming subxacts,
+        column-ref-typed `nextval` args.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

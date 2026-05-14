@@ -79,6 +79,12 @@ type ReplPeer interface {
 	Stop() error
 	Exec(t *testing.T, sql string)
 	QueryScalar(t *testing.T, sql string) string
+	// Pgbench runs the cluster-local pgbench binary with the supplied
+	// args appended after the standard connection flags
+	// (`-h/-p/-U <database>`). Returns combined stdout+stderr; fails
+	// the test on non-zero exit. M0103-0007 rung 20 uses this to
+	// drive a pgbench-shape workload from either side of the pair.
+	Pgbench(t *testing.T, args ...string) string
 }
 
 // Options configures the pair.

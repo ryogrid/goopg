@@ -309,6 +309,29 @@ func (c *Cluster) QueryScalar(t *testing.T, sqlText string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// Pgbench runs the upstream pgbench binary against this cluster and
+// returns combined stdout+stderr on success. Args are appended after
+// the standard connection flags (-h/-p/-U <database>). Fails the test
+// if pgbench exits non-zero. M0103-0007 rung 20 uses this helper to
+// drive a pgbench-shape workload against a PG publisher with a goopg
+// subscriber; the standard `-h/-p/-U <database>` shape matches the
+// goopg analogue at internal/testutil/cluster/cluster.go::PGbench so
+// the two binaries are interchangeable in PubSubCluster tests.
+func (c *Cluster) Pgbench(t *testing.T, args ...string) string {
+	t.Helper()
+	full := append([]string{
+		"-h", c.Host(), "-p", fmt.Sprintf("%d", c.Port()),
+		"-U", c.user, c.database,
+	}, args...)
+	cmd := exec.Command(filepath.Join(c.bin, "pgbench"), full...)
+	cmd.Env = c.env()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pgcluster: pgbench %v: %v\n%s", args, err, out)
+	}
+	return string(out)
+}
+
 // OpenDB returns a `database/sql` handle. Caller closes.
 func (c *Cluster) OpenDB() (*sql.DB, error) {
 	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable",

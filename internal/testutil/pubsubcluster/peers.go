@@ -46,6 +46,18 @@ func (g *goopgPeer) Exec(t *testing.T, sql string) {
 		t.Fatalf("goopg exec %q: %v", sql, err)
 	}
 }
+func (g *goopgPeer) Pgbench(t *testing.T, args ...string) string {
+	t.Helper()
+	res, err := g.c.PGbench(args...)
+	if err != nil {
+		t.Fatalf("goopg pgbench %v: %v\n%s\n%s", args, err, res.Stdout, res.Stderr)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("goopg pgbench %v: exit=%d\n%s\n%s", args, res.ExitCode, res.Stdout, res.Stderr)
+	}
+	return res.Stdout + res.Stderr
+}
+
 func (g *goopgPeer) QueryScalar(t *testing.T, sql string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -75,6 +87,9 @@ func (p *pgPeer) Start() error                                { return p.c.Start
 func (p *pgPeer) Stop() error                                 { return p.c.Stop() }
 func (p *pgPeer) Exec(t *testing.T, sql string)               { p.c.Exec(t, sql) }
 func (p *pgPeer) QueryScalar(t *testing.T, sql string) string { return p.c.QueryScalar(t, sql) }
+func (p *pgPeer) Pgbench(t *testing.T, args ...string) string {
+	return p.c.Pgbench(t, args...)
+}
 
 func splitHostPort(addr string) (string, string, error) {
 	idx := strings.LastIndex(addr, ":")
