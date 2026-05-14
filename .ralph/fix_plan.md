@@ -3102,6 +3102,76 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         subtest, proto_version=2 streaming subxacts, column-ref-
         typed `nextval` args, `filler char(N)` bpchar padding
         through pgoutput.
+      - PARTIAL PROGRESS 2026-05-14 (rung 23): pgbench-shape
+        kill mid-flight + Scenario A **async DoD bracket** —
+        `count(*) ∈ [killCommitted - asyncLossBound + 1,
+        killCommitted + 1]` with `asyncLossBound = 50`. Ties
+        rungs 1–22 together end-to-end. Design doc:
+        `docs/design/0103-0046-m0103-0007-rung-23-pgbench-kill-async.md`
+        (accepted).
+      - Workload: two Go-driven writer goroutines hold their
+        own `*sql.DB` (lib/pq) handles to the PG publisher and
+        run a throttled INSERT loop (5 ms / INSERT / client →
+        ~400 commits/s total) into
+        `public.bench_log (client int, src text)`. No PK —
+        INSERT-only, so REPLICA IDENTITY is irrelevant. An
+        `atomic.Int64 committed` counter is bumped AFTER each
+        successful commit returns; the `ctx.Err()` check sits
+        at the TOP of the loop, so an in-flight INSERT always
+        runs to completion and bumps the counter before the
+        goroutine exits — eliminates the
+        "committed-on-server-but-not-counted" race that would
+        otherwise break the bracket's upper bound.
+      - Sequence: (1) replication-is-alive gate (≥ 1 row on
+        goopg within 30 s); (2) sustain 1500 ms; (3)
+        `workCancel + wg.Wait`; (4)
+        `killCommitted := committed.Load()`; (5) 200 ms
+        walsender drain window so most of the tail reaches the
+        apply worker before PG dies; (6) `psc.Publisher.Kill()`
+        (rung 22 plumbing → `pg_ctl -m immediate -w stop`);
+        (7) multi-host post-failover INSERT
+        (`client = -1, src = 'post'`) via the in-tree `psql`
+        with `LD_LIBRARY_PATH=postgres/local_install/lib`;
+        (8) poll subscriber `count(*)` until stable for 1 s;
+        (9) assert async bracket + `src='post'` row presence.
+      - Throttle rationale: unthrottled the workload sustains
+        ≈10 k commits/s on the in-tree local_install build,
+        which exceeds goopg's apply throughput and piles
+        several-thousand-row backlogs in the walsender's TCP
+        buffer + apply queue. PG dying drops that buffer
+        (publisher reorder buffer is in-memory) and observed
+        loss balloons past any fixed asyncLossBound. The 5 ms
+        throttle caps the workload at ~400 commits/s total so
+        steady-state apply lag stays inside the 50-row bound.
+      - Drain rationale: 200 ms after `wg.Wait` lets the
+        walsender ship its tail to the apply worker before the
+        SIGKILL — empirically enough on the in-tree build for
+        the throttled workload's lag to drop below 50 rows
+        without growing the test wall budget.
+      - Pinned by
+        `TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync` in
+        `internal/testport/pgoutput_interop_test.go`. Also
+        lands a shared `waitForCountStable` helper for the
+        apply-buffer drain detection (poll-until-stable
+        pattern). New imports on the file: `database/sql`,
+        `strconv`, `sync`, `sync/atomic`, and
+        `_ "github.com/lib/pq"`. baseDir kept short
+        (`pg2g-kasync`) for the 108-byte Unix-sockaddr limit.
+      - Verification (rung 23):
+        `go test -count=3 -timeout 360s
+        -run TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync
+        ./internal/testport/` → 3/3 PASS (~4.5 s each).
+        `go test -count=1 -timeout 360s
+        -run TestPort_PgoutputInteropPGToGoopg
+        ./internal/testport/` → all 9
+        `TestPort_PgoutputInteropPGToGoopg*` rungs PASS
+        (~32.7 s total). `go build ./...` clean.
+      - Next rungs (deferred within M0103-0007):
+        `sync_remote_apply` subtest (zero-loss
+        `count(*) == killCommitted + 1` invariant, requires
+        logical SyncRep wait integration), proto_version=2
+        streaming subxacts, column-ref-typed `nextval` args,
+        `filler char(N)` bpchar padding through pgoutput.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

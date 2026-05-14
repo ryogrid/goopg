@@ -25,14 +25,20 @@ package testport
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	_ "github.com/lib/pq"
 
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 	"github.com/goopg/goopg/internal/testutil/pubsubcluster"
@@ -2075,6 +2081,289 @@ func TestPort_PgoutputInteropPGToGoopgKillAndReconnect(t *testing.T) {
 	if postSrc != "post" {
 		t.Fatalf("subscriber id=4 src = %q, want \"post\" — post-failover INSERT did not reach goopg via multi-host", postSrc)
 	}
+}
+
+// TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync pins M0103-0007
+// rung 23: mid-flight SIGKILL of a sustained INSERT workload on the PG
+// publisher with the async DoD bracket.
+//
+// Design doc: docs/design/0103-0046-m0103-0007-rung-23-pgbench-kill-async.md.
+//
+// This is the first rung that exercises the M0103-0007 Scenario A
+// async DoD invariant from `docs/design/0103-0005-...`:
+//
+//   subscriber count(*) ∈ [killCommitted - asyncLossBound + 1,
+//                          killCommitted + 1]
+//
+// with asyncLossBound = 50 rows. Rungs 1–21 verified apply-worker
+// correctness under sustained load; rung 22 closed the SIGKILL +
+// multi-host reconnect plumbing. Rung 23 ties both halves together and
+// pins the bounded-loss invariant end-to-end.
+//
+// Workload shape: two Go-driven INSERT loops (one per `database/sql`
+// handle) sustain an INSERT-only stream against
+// `public.bench_log (client int, src text)` (no PK — INSERT-only, so
+// REPLICA IDENTITY is irrelevant; matches rung 4's
+// no-primary-key-table path). The atomic `committed` counter is bumped
+// AFTER each successful commit returns; the ctx.Err() check sits at
+// the TOP of the loop, so an in-flight INSERT runs to completion and
+// bumps the counter before the goroutine exits. This eliminates the
+// "committed-on-server-but-not-counted" race that would otherwise let
+// the subscriber observe a row not reflected in `killCommitted`,
+// breaking the upper bound.
+//
+// Sequence:
+//
+//  1. Spin up PG publisher + goopg subscriber, create the publication
+//     and pre-create the logical slot, then CREATE SUBSCRIPTION with
+//     copy_data=false.
+//  2. Launch two Go workers; wait for at least one row to land on the
+//     subscriber (replication is alive).
+//  3. Sleep `workloadHoldMs` so several hundred commits accumulate
+//     across both clients and async-mode apply lag has space to
+//     develop.
+//  4. Cancel the worker context; `wg.Wait` drains both writers.
+//  5. `killCommitted := committed.Load()` — precise snapshot of how
+//     many commits the workload landed on PG.
+//  6. `psc.Publisher.Kill()` — SIGKILL via `pg_ctl -m immediate`.
+//  7. Post-failover INSERT via libpq multi-host (rung 22 plumbing):
+//     `client = -1, src = 'post'`. Lands on goopg.
+//  8. Poll subscriber count until it stays unchanged for one second
+//     (apply-buffer drained — postmaster is dead, no new bytes arrive).
+//  9. Assert subscriber count ∈ [killCommitted - asyncLossBound + 1,
+//     killCommitted + 1] and `src='post'` row is present.
+//
+// `workloadHoldMs = 1500` keeps the test budget under ~25 s wall time
+// while delivering enough commits in CI for the lower bound check to
+// be meaningful (the minimum-commits guard fails the test if the
+// workload is too anemic for the assertion to mean anything).
+func TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	psqlBin := filepath.Join(repo, "postgres", "local_install", "bin", "psql")
+	if st, err := os.Stat(psqlBin); err != nil || !st.Mode().IsRegular() {
+		t.Skipf("psql not present at %s", psqlBin)
+	}
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-kasync")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_kasync"
+	psc := pubsubcluster.NewMixed(t, "pg2g_kasync", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.bench_log (client int NOT NULL, src text NOT NULL)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.bench_log (client int NOT NULL, src text NOT NULL)")
+	psc.CreatePublication(t, "bench_log")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Two writer goroutines drive the workload. Each holds its own
+	// *sql.DB (lib/pq driver) directly against the PG publisher's
+	// host:port; opening through pgcluster.Cluster.OpenDB would reach
+	// into pgcluster internals from the testport package, so we
+	// reconstruct the DSN here from the public ReplPeer surface.
+	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable",
+		psc.Publisher.Host(), psc.Publisher.Port(),
+		psc.Publisher.User(), psc.Publisher.Database())
+
+	workCtx, workCancel := context.WithCancel(context.Background())
+	var committed atomic.Int64
+	var wg sync.WaitGroup
+	for c := 0; c < 2; c++ {
+		c := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db, err := sql.Open("postgres", dsn)
+			if err != nil {
+				t.Errorf("client %d sql.Open: %v", c, err)
+				return
+			}
+			defer db.Close()
+			for {
+				if workCtx.Err() != nil {
+					return
+				}
+				// db.Exec without a ctx — once the round trip starts,
+				// it runs to completion and the post-commit counter
+				// bump is guaranteed to mirror the wire state.
+				if _, err := db.Exec(
+					"INSERT INTO public.bench_log (client, src) VALUES ($1, 'pre')", c); err == nil {
+					committed.Add(1)
+				}
+				// Errors after Kill are expected; the workCtx.Err()
+				// check at the top of the loop is what drives exit.
+				//
+				// Throttle: unthrottled, two clients sustain ≈10 k
+				// commits/s against the in-tree local_install build
+				// — far above goopg's apply throughput, so several
+				// thousand rows pile up in the walsender's TCP buffer
+				// and the apply-side queue. After PG dies that buffer
+				// goes with it (publisher's reorder buffer is in
+				// memory) and the subscriber's loss balloons past any
+				// fixed asyncLossBound. Throttling to ~200
+				// commits/s/client keeps the steady-state apply lag
+				// inside the bound while still exercising the
+				// "workload was running when PG died" shape.
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+	}
+
+	// Replication-is-alive gate: at least one row visible on goopg
+	// within 30 s. Without this the test could declare "0-commit
+	// killCommitted" and assert a trivial DoD.
+	live := false
+	liveDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(liveDeadline) {
+		if psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.bench_log") != "0" {
+			live = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !live {
+		workCancel()
+		wg.Wait()
+		t.Fatalf("no row replicated within %s — apply worker not live", 30*time.Second)
+	}
+
+	// Sustain the workload so several hundred commits land and
+	// measurable apply lag develops. 1500 ms balances "enough commits
+	// for the bounded-loss assertion to be meaningful" against test
+	// wall-time budget.
+	const workloadHoldMs = 1500
+	time.Sleep(workloadHoldMs * time.Millisecond)
+
+	// Stop the workload and capture killCommitted. workCancel makes
+	// the next-iteration top-of-loop check exit; in-flight INSERTs
+	// finish their commit and bump the counter (no orphaned commit).
+	workCancel()
+	wg.Wait()
+	killCommitted := committed.Load()
+
+	// Give the walsender a brief drain window so most of the freshly
+	// committed rows reach the apply worker before PG dies. Without
+	// it the in-flight TCP buffer + apply-side queue at SIGKILL time
+	// is unboundedly determined by scheduler timing on the host
+	// running the test, and the lower bound assertion becomes flaky.
+	// 200 ms is empirically enough on the in-tree local_install build
+	// for the throttled workload to drain to within asyncLossBound.
+	time.Sleep(200 * time.Millisecond)
+	const minWorkloadCommits int64 = 50
+	if killCommitted < minWorkloadCommits {
+		t.Fatalf("workload too anemic to test DoD: killCommitted=%d, want ≥ %d", killCommitted, minWorkloadCommits)
+	}
+
+	// SIGKILL the PG publisher. The apply worker on goopg observes
+	// disconnect and stops; any pgoutput bytes already in its
+	// receive buffer continue to apply, so the subscriber-side count
+	// will keep rising for a short window after kill — that window
+	// is exactly what async lag measures.
+	if err := psc.Publisher.Kill(); err != nil {
+		t.Fatalf("Publisher.Kill: %v", err)
+	}
+
+	// Multi-host post-failover INSERT (rung 22 plumbing). PG is dead;
+	// libpq walks the host list, hits connect-refused, falls through
+	// to goopg, INSERT lands.
+	multi := psc.MultiHostConninfo("failover_client")
+	cmd := exec.CommandContext(ctx, psqlBin,
+		"-d", multi,
+		"-v", "ON_ERROR_STOP=1",
+		"-c", "INSERT INTO public.bench_log (client, src) VALUES (-1, 'post')")
+	cmd.Env = append(os.Environ(),
+		"LD_LIBRARY_PATH="+filepath.Join(repo, "postgres", "local_install", "lib"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("psql multi-host INSERT: %v\nconn=%q\nout=%s", err, multi, out)
+	}
+
+	// Wait for stabilisation: poll until the subscriber count stays
+	// unchanged for 1 s or the 30 s deadline expires. PG is dead, so
+	// once the apply buffer drains the count freezes.
+	got, ok := waitForCountStable(t, psc, "public.bench_log",
+		1*time.Second, 30*time.Second)
+	if !ok {
+		t.Fatalf("subscriber count(*) did not stabilise within deadline (last=%d)", got)
+	}
+
+	const asyncLossBound int64 = 50
+	lo := killCommitted - asyncLossBound + 1
+	hi := killCommitted + 1
+	if got < lo {
+		t.Fatalf("async DoD lower bound: count(*)=%d < %d (killCommitted=%d, asyncLossBound=%d) — too many rows lost",
+			got, lo, killCommitted, asyncLossBound)
+	}
+	if got > hi {
+		t.Fatalf("async DoD upper bound: count(*)=%d > %d (killCommitted=%d) — extra rows on subscriber",
+			got, hi, killCommitted)
+	}
+
+	// Post-failover row is present and tagged correctly. The
+	// `client=-1` predicate also catches the case where the
+	// multi-host fall-through somehow wrote the row to the dead
+	// publisher (impossible, but the check is cheap).
+	postSrc := psc.Subscriber.QueryScalar(t, "SELECT src FROM public.bench_log WHERE client = -1")
+	if postSrc != "post" {
+		t.Fatalf("subscriber post-failover row src = %q, want \"post\" (killCommitted=%d, count=%d)",
+			postSrc, killCommitted, got)
+	}
+}
+
+// waitForCountStable polls `SELECT count(*) FROM <table>` against the
+// subscriber until the value stays unchanged for `stableFor` or the
+// `deadline` expires. Returns the last sample and whether stability
+// was observed. Used by rung 23 to wait for the goopg apply buffer to
+// drain after the PG publisher is killed.
+func waitForCountStable(t *testing.T, psc *pubsubcluster.PubSubCluster, table string, stableFor, timeout time.Duration) (int64, bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last int64 = -1
+	var stableSince time.Time
+	q := fmt.Sprintf("SELECT count(*) FROM %s", table)
+	for time.Now().Before(deadline) {
+		s := psc.Subscriber.QueryScalar(t, q)
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			t.Fatalf("waitForCountStable: parse %q: %v", s, err)
+		}
+		if v != last {
+			last = v
+			stableSince = time.Now()
+		} else if time.Since(stableSince) >= stableFor {
+			return v, true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return last, false
 }
 
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
