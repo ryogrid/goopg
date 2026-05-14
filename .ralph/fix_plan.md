@@ -1660,7 +1660,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         → all green (server 3.398 s, executor 2.575 s, wal 2.977 s,
         catalog 1.019 s).
 
-- [ ] **M0103-0004**
+- [x] **M0103-0004**
       - Summary: pgoutput wire-byte interop verification.
       - Design doc: `docs/design/0103-0003-pgoutput-wire-interop.md`.
       - Sites: new `internal/testport/pgoutput_interop_test.go` with two
@@ -1767,6 +1767,21 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         subtest (a) PASS, subtest (b) SKIP (gap 2).
       - Design doc updated: `docs/design/0103-0003-pgoutput-wire-interop.md`
         § "Subtest (b)" rewritten with Gap 1 + Gap 2 analysis.
+      - COMPLETE 2026-05-14 (loop 4 — closure): M0103-0008's closure
+        (rung 16 catalog `pg_class.oid` numeric flip + `relreplident`
+        column, plus the broader 17-rung probe-survival ladder) closed
+        Gap 2 (VARIADIC parser, `pg_get_publication_tables` SRF, derived-
+        subquery composite expansion, LATERAL pg_catalog-qualified SRF
+        dispatch, slot-options list, logical-walsender keepalive, …).
+        Subtest (b) `TestPort_PgoutputInteropGoopgToPG` is now a live
+        wrapper — no `t.Skip` outside short-mode — that drives the four-
+        statement INSERT/INSERT/UPDATE/DELETE round-trip end-to-end and
+        asserts final state (`id=2 v='updated'`, `id=1` deleted,
+        `count(*) == 1`). Verification carried by M0103-0008's 5/5
+        consecutive-runs evidence (~1.6–1.8 s each); no production code
+        change in this closure loop. Design doc
+        `docs/design/0103-0003-pgoutput-wire-interop.md` status flipped
+        to `accepted` with a Closure section; README row updated.
 
 - [x] **M0103-0005**
       - Summary: Logical-walsender SyncRep integration.

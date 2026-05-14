@@ -1,7 +1,7 @@
 # 0103-0003 — pgoutput Wire-Byte Interoperability (PG ↔ goopg, Both Directions)
 
-**Status:** partial — subtest (a) landed 2026-05-14 loop 1; encoder + slot-creation prerequisites for subtest (b) landed 2026-05-14 loop 2; subtest (b) bring-up harness pending (M0103-0006)
-**Date:** 2026-05-13 (initial), 2026-05-14 (partial impl)
+**Status:** accepted — subtest (a) landed 2026-05-14 loop 1; encoder + slot-creation prerequisites for subtest (b) landed 2026-05-14 loop 2; subtest (b) collapsed to a live wrapper after M0103-0008 closure (2026-05-14 — `TestPort_PgoutputInteropGoopgToPG` runs end-to-end, no `t.Skip` outside short-mode).
+**Date:** 2026-05-13 (initial), 2026-05-14 (partial impl), 2026-05-14 (closure)
 **Milestone:** M0103-0004
 **Upstream reference:** `postgres/src/backend/replication/pgoutput/pgoutput.c` (`pgoutput_change`, `pgoutput_begin`, `pgoutput_commit`, `pgoutput_message`), `postgres/src/backend/replication/logical/proto.c` (`logicalrep_write_insert`, `logicalrep_write_update`, `logicalrep_write_delete`, `logicalrep_write_rel`, `logicalrep_read_*`), `postgres/src/include/replication/logicalproto.h` (message format constants).
 
@@ -293,3 +293,30 @@ closure under the `t.Skip` for traceability).
 - **Hand-rolled replication protocol parsing in test (a)**. Use `pgconn`
   from `github.com/jackc/pgx/v5` (already in `go.mod`) — it has
   `Frontend.Receive` that returns typed messages. Avoid raw `net.Conn`.
+
+## Closure (2026-05-14)
+
+M0103-0004 is now fully resolved. Subtest (b) (Gap 2 from the loop-3
+analysis above) was deferred to M0103-0008 because the publisher-side
+libpqrcv probe surface — `VARIADIC` parser, `pg_get_publication_tables`
+SRF, derived-subquery composite expansion, LATERAL pg_catalog-qualified
+SRF dispatch, `pg_class.relnatts`, `relreplident`, slot-options list
+parsing, logical-walsender keepalive, etc. — is exactly the surface
+that M0103-0008 (Scenario B: goopg primary + PG subscriber) drives end
+to end. The 17-rung probe-survival ladder under M0103-0008 closed every
+gap on that surface (see `docs/design/0103-0023-m0103-0008-scenario-b-closure.md`),
+and the live `TestPort_PgoutputInteropGoopgToPG`
+(`internal/testport/pgoutput_interop_test.go:193`) now runs the four-
+statement INSERT/INSERT/UPDATE/DELETE round-trip against a goopg
+publisher + PG subscriber, asserting final state (`id=2 v='updated'`,
+`id=1` deleted) and `count(*) == 1` — no `t.Skip` outside the standard
+`testing.Short()` short-mode gate. Subtest (a) is unchanged
+(`TestPort_PgoutputInteropPGToGoopg`, byte-level wire decode against
+upstream PG via `pg_logical_slot_get_binary_changes`).
+
+Verification (live runs covered by M0103-0008 closure, 2026-05-14):
+`go test -count=1 -timeout 240s -run TestPort_PgoutputInterop ./internal/testport/`
+exercises both subtests; subtest (b) had passed five consecutive runs
+at 1.6–1.8 s each on its closure loop. No production code change in
+this closure loop — M0103-0008's keystone fixes (rung 16 `pg_class.oid`
+numeric flip + `relreplident` column) supplied the missing pieces.
