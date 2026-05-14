@@ -523,6 +523,78 @@ func TestReplicationTimelineHistoryMissingReturnsEmptyContent(t *testing.T) {
 	}
 }
 
+
+// TestReplicationFallthroughQueryNotCancelled regresses a bug where
+// replication-mode connections falling through to the regular SQL
+// dispatcher (for queries like libpqrcv's pg_publication probes that
+// PG's CREATE SUBSCRIPTION issues before START_REPLICATION) received
+// an immediate SQLSTATE 57014 ("canceling statement due to user
+// request") because `runPostStartupLoop` was cancelling the per-query
+// context before it ever reached `handleQueryOrCopy`.
+//
+// The repro: send a plain SQL query on a `replication=true`
+// connection. With the bug, the response carried 57014; with the
+// fix, it carries whatever SQLSTATE the SQL path naturally produces
+// (e.g. an unknown-relation error). What matters is that 57014 is
+// NOT served, because that was the goopg-side symptom that broke
+// PG's CREATE SUBSCRIPTION bring-up in the M0103-0004(b) interop
+// test.
+func TestReplicationFallthroughQueryNotCancelled(t *testing.T) {
+	addr, _, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	// A plain SELECT — the bare test server has no catalog wired, so
+	// the SQL path produces some kind of error (relation/schema does
+	// not exist, or feature_not_supported). Either way, the
+	// per-query context must still be live so the response is the
+	// SQL path's natural error rather than the cancellation
+	// shortcut.
+	sendQuery(t, w, "SELECT pubname FROM pg_catalog.pg_publication WHERE pubname IN ('p')")
+	frames := readUntilReadyForQuery(t, r)
+	if len(frames) == 0 {
+		t.Fatalf("no frames received")
+	}
+	if frames[0].Type != protocol.MsgErrorResponse {
+		// Unlikely on the bare server, but if the SQL path ever
+		// grows pg_publication support without the catalog we'd
+		// land on a RowDescription. Either way, 57014 must not
+		// appear.
+		return
+	}
+	// Decode the error fields and assert the SQLSTATE is not 57014.
+	fields := decodeErrorFields(frames[0].Payload)
+	if got := fields["C"]; got == "57014" {
+		t.Fatalf("replication-mode SQL fallthrough returned SQLSTATE 57014 (canceling statement); the per-query context was cancelled before dispatch. Full error: %v", fields)
+	}
+}
+
+// decodeErrorFields walks an ErrorResponse payload and returns the
+// per-field map. Each field is a one-byte type code followed by a
+// NUL-terminated value; the message ends with a zero byte for the
+// type code.
+func decodeErrorFields(payload []byte) map[string]string {
+	out := map[string]string{}
+	i := 0
+	for i < len(payload) {
+		code := payload[i]
+		i++
+		if code == 0 {
+			break
+		}
+		start := i
+		for i < len(payload) && payload[i] != 0 {
+			i++
+		}
+		out[string(code)] = string(payload[start:i])
+		if i < len(payload) {
+			i++ // skip terminator
+		}
+	}
+	return out
+}
+
 func replicationFrameTypes(frames []protocol.Frame) string {
 	out := make([]byte, len(frames))
 	for i, f := range frames {

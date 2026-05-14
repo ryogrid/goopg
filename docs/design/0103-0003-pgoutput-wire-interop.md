@@ -221,21 +221,63 @@ by `TestReplicationCreateLogicalSlot` and
 
 ### Subtest (b) — `TestPort_PgoutputInteropGoopgToPG` — **STILL SKIPPED**
 
-With (i) and (ii) above resolved, the remaining blocker is the
-bring-up harness:
+`pubsubcluster` (M0103-0006) landed and the harness is wired up.
+Running the test against goopg-pub + PG-sub uncovered two further
+publisher-side gaps that PG's CREATE SUBSCRIPTION drives through
+libpqrcv *before* it ever reaches START_REPLICATION:
 
-- A test step that spawns a real PG subscriber, runs
-  `CREATE SUBSCRIPTION sub_a CONNECTION '<goopg-conninfo>'
-  PUBLICATION p` against the goopg primary, waits for the subscriber
-  to apply a known INSERT/UPDATE/DELETE pattern, and polls the
-  subscriber's `t` table for rows.
+#### Gap 1 — per-query context premature cancellation — **FIXED 2026-05-14**
 
-This harness is the same one needed by M0103-0007/0008's failover
-tests and is therefore being landed alongside `pubsubcluster`
-(M0103-0006) rather than duplicated inline here. Once
-`pubsubcluster` exists, subtest (b) becomes a thin wrapper that
-exercises the publisher path and confirms PG decodes goopg's
-emitted bytes end-to-end.
+`internal/server/server.go::runPostStartupLoop` constructs a
+per-query context (`queryCtx`) on every `MsgQuery`. On
+replication-mode connections the code branched into
+`handleReplicationCommand` and — regardless of outcome — called
+`queryCancel()` *before* falling through to the regular SQL path
+(`handleQueryOrCopy`). Result: PG's libpqrcv probes
+(`SELECT pubname FROM pg_catalog.pg_publication WHERE pubname IN
+(…)`) entered the SQL executor with an already-cancelled context;
+`internal/executor/context.go::acquireRelLock` saw
+`context.Canceled` mid-lock-wait and returned SQLSTATE 57014
+("canceling statement due to user request"). PG surfaced this back
+to the user as "could not receive list of publications from the
+publisher: ERROR: canceling statement due to user request".
+
+Fix: defer the `clearQueryCancel()` / `queryCancel()` pair until
+after the replication-command dispatcher decides it cannot handle
+the frame, so the SQL fall-through sees the live `queryCtx`.
+Pinned by
+`internal/server/replication_test.go::TestReplicationFallthroughQueryNotCancelled`,
+which asserts that a SQL query on a `replication=true` connection
+returns a non-57014 error (i.e. the SQL path's natural error
+rather than the cancellation shortcut).
+
+#### Gap 2 — parser lacks `VARIADIC` keyword — **OPEN, scope of M0103-0008**
+
+With Gap 1 closed, the next libpqrcv probe — `fetch_table_list`
+— is the one that fails. PG18 sends a query of the form:
+
+```sql
+SELECT DISTINCT … FROM pg_publication p
+  JOIN (SELECT (pg_get_publication_tables(VARIADIC array_agg(p.pubname::text))).*
+        FROM pg_publication p WHERE p.pubname IN ('p')) GPT
+  …
+```
+
+goopg's parser rejects `VARIADIC` with
+`syntax error at or near "expected expression (got variadic)"`,
+which surfaces back to PG as
+"could not receive list of replicated tables from the publisher".
+Closing this requires parser-side VARIADIC support plus a working
+`pg_get_publication_tables` function (the virtual view
+`pg_publication_tables` already exists). That work is the natural
+scope of M0103-0008's Scenario B (goopg primary + PG subscriber)
+— same publisher-side surface, same failure mode — so subtest
+(b) defers there rather than being implemented twice.
+
+Once M0103-0008 lands the probe-survival fix, subtest (b)
+collapses to the thin wrapper already coded in
+`internal/testport/pgoutput_interop_test.go` (preserved as a
+closure under the `t.Skip` for traceability).
 
 ## Risks
 

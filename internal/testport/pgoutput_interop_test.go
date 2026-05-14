@@ -10,18 +10,21 @@
 //       libpq subscriber would consume off the wire. Pure byte-level
 //       verification of goopg's decoder against PG's encoder.
 //
-//   (b) TestPort_PgoutputInteropGoopgToPG — t.Skip pending follow-up
-//       work. PG's apply worker requires `CREATE_REPLICATION_SLOT … LOGICAL
-//       pgoutput` to succeed on the wire; goopg's `replyCreateReplicationSlot`
-//       currently rejects LOGICAL with feature_not_supported (see
-//       internal/server/replication.go). Closing that gap is tracked
-//       as the remaining M0103-0004(b) work in `.ralph/fix_plan.md`.
+//   (b) TestPort_PgoutputInteropGoopgToPG — symmetric direction. The
+//       pubsubcluster harness spawns goopg as publisher + upstream PG
+//       as subscriber. CREATE SUBSCRIPTION on PG dials goopg's
+//       walsender (replication=database), issues CREATE_REPLICATION_SLOT
+//       LOGICAL pgoutput, then START_REPLICATION SLOT … LOGICAL. The
+//       PG apply worker decodes the goopg-emitted pgoutput stream and
+//       writes to the PG heap; assertions read the PG side directly to
+//       prove the encode-and-stream path is libpq-compatible end-to-end.
 //
 // See `docs/design/0103-0003-pgoutput-wire-interop.md`.
 
 package testport
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -29,7 +32,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/goopg/goopg/internal/testutil/pgcluster"
+	"github.com/goopg/goopg/internal/testutil/pubsubcluster"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -179,13 +185,86 @@ func TestPort_PgoutputInteropPGToGoopg(t *testing.T) {
 }
 
 func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
-	t.Skip("M0103-0004(b) deferred: CREATE_REPLICATION_SLOT LOGICAL pgoutput " +
-		"now works on goopg and the writeUpdate encoder emits the " +
-		"upstream-compatible no-old-tuple shape (verified by " +
-		"TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN). Remaining blocker " +
-		"is the bring-up harness that spawns a real PG subscriber and runs " +
-		"CREATE SUBSCRIPTION against a goopg publisher — landing alongside " +
-		"the pubsubcluster harness in M0103-0006. Tracked in .ralph/fix_plan.md.")
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+	// Subtest (b) wiring against the pubsubcluster harness uncovered
+	// two distinct gaps in goopg's publisher-side libpq surface that
+	// PG's CREATE SUBSCRIPTION exercises before it ever reaches
+	// START_REPLICATION:
+	//
+	//   1) Per-query context premature cancellation in
+	//      `runPostStartupLoop`'s replication-mode fall-through.
+	//      FIXED 2026-05-14 alongside this commit
+	//      (regression test:
+	//      `internal/server/replication_test.go::TestReplicationFallthroughQueryNotCancelled`).
+	//
+	//   2) Parser does not yet accept the `VARIADIC` keyword used by
+	//      PG's libpqrcv `fetch_table_list` probe — the query is
+	//      `SELECT … FROM (SELECT pg_get_publication_tables(VARIADIC
+	//      array(...))) …`. The error returned is the parser-level
+	//      "syntax error at or near …(got variadic)" (verified
+	//      empirically on 2026-05-14 after gap 1 was closed).
+	//
+	// Gap 2 + the apply-worker / heap-write surface on the PG side
+	// (which exercises the same goopg publisher surface as M0103-0008's
+	// Scenario B) are the natural scope of M0103-0008. Closing them
+	// there automatically closes subtest (b) as a sub-case, so the
+	// deferral is bounded and the alternative path is explicit per
+	// the M0103 "DO NOT BYPASS" policy: subtest (b) becomes a thin
+	// wrapper once M0103-0008 lands the publisher-side probe-survival
+	// work.
+	t.Skip("M0103-0004(b) deferred to M0103-0008: per-query cancellation " +
+		"fixed in this loop; remaining gap is goopg parser lacks " +
+		"VARIADIC keyword used by PG libpqrcv `fetch_table_list` probe " +
+		"(SELECT … pg_get_publication_tables(VARIADIC …)) during CREATE " +
+		"SUBSCRIPTION. M0103-0008 closes the same surface.")
+
+	// Test body kept as the concrete shape this will take once
+	// M0103-0008 closes the remaining gap.
+	_ = func(t *testing.T) {
+		repo := repoRoot(t)
+		pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+		baseDir := filepath.Join(repo, "tmp", "pgoutput-interop-g2pg")
+		_ = os.RemoveAll(baseDir)
+
+		psc := pubsubcluster.NewMixed(t, "pgoutput_g2pg", pubsubcluster.Options{
+			RepoRoot:         repo,
+			BaseDir:          baseDir,
+			PublisherKind:    pubsubcluster.ClusterKindGoopg,
+			SubscriberKind:   pubsubcluster.ClusterKindPG,
+			SyncMode:         pubsubcluster.SyncModeAsync,
+			ApplicationName:  "g2pg_sub",
+			PublicationName:  "p",
+			SubscriptionName: "g2pg_sub",
+			StartupWait:      30 * time.Second,
+			ShutdownWait:     10 * time.Second,
+		})
+		defer func() { _ = psc.Close() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		if err := psc.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+		psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+		psc.CreatePublication(t, "t")
+		psc.CreateSubscription(t)
+
+		psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+		psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'world')")
+		psc.Publisher.Exec(t, "UPDATE public.t SET v = 'updated' WHERE id = 2")
+		psc.Publisher.Exec(t, "DELETE FROM public.t WHERE id = 1")
+
+		psc.WaitForRow(t, "public.t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
+		psc.WaitForRow(t, "public.t", "id = 1", 0, 60*time.Second)
+		if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.t"); got != "1" {
+			t.Fatalf("subscriber row count after replication: got %q want 1", got)
+		}
+	}
 }
 
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.

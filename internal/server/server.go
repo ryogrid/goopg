@@ -996,9 +996,9 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 			// like SHOW still work for diagnostics.
 			if isReplication {
 				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload, appName)
-				entry.clearQueryCancel()
-				queryCancel()
 				if err != nil {
+					entry.clearQueryCancel()
+					queryCancel()
 					if errors.Is(err, errQueryErrorSent) {
 						// Error + ReadyForQuery already sent cleanly.
 						break
@@ -1007,8 +1007,16 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 					return
 				}
 				if handled {
+					entry.clearQueryCancel()
+					queryCancel()
 					break
 				}
+				// Fall through to the regular SQL path with the live
+				// queryCtx still intact — PG's libpqrcv issues plain
+				// SELECTs (pg_publication probes during CREATE
+				// SUBSCRIPTION) on the same replication=database
+				// connection and the cancellation must not fire until
+				// handleQueryOrCopy completes.
 			}
 			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload, connTx, prepStmts)
 			entry.clearQueryCancel()

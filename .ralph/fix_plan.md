@@ -1663,6 +1663,47 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       -timeout 300s ./internal/wal/ ./internal/server/
       ./internal/executor/ ./internal/catalog/` → all pass (wal 3.035 s,
       server 3.605 s, executor 2.621 s, catalog 1.021 s).
+      PARTIAL PROGRESS 2026-05-14 (loop 3): subtest (b) wired against
+      the `pubsubcluster` harness (M0103-0006) which uncovered two
+      further publisher-side gaps that PG's CREATE SUBSCRIPTION drives
+      through libpqrcv *before* it reaches START_REPLICATION.
+      Gap 1 (FIXED this loop): `runPostStartupLoop`
+      (`internal/server/server.go`) cancelled the per-query context
+      (`queryCtx`) on replication-mode connections *before* falling
+      through to the regular SQL path, so PG's libpqrcv
+      `SELECT pubname FROM pg_catalog.pg_publication WHERE pubname IN
+      (…)` probe entered the executor with an already-cancelled
+      context and `acquireRelLock` returned SQLSTATE 57014
+      ("canceling statement due to user request"). Fix: defer the
+      `clearQueryCancel()`/`queryCancel()` pair until after the
+      replication-command dispatcher decides not to handle the frame,
+      so the SQL fall-through sees a live `queryCtx`. Pinned by
+      `internal/server/replication_test.go::TestReplicationFallthroughQueryNotCancelled`.
+      Gap 2 (DEFERRED to M0103-0008): with Gap 1 closed, the next
+      libpqrcv probe `fetch_table_list` sends
+      `… pg_get_publication_tables(VARIADIC array_agg(p.pubname::text)) …`;
+      goopg's parser rejects `VARIADIC` with `syntax error at or near
+      "expected expression (got variadic)"`. Closing this requires
+      parser-side VARIADIC support plus a working
+      `pg_get_publication_tables` function (the `pg_publication_tables`
+      virtual view already exists). That work is M0103-0008's natural
+      scope (Scenario B: goopg primary + PG subscriber — same
+      publisher-side surface, same failure mode); subtest (b)
+      collapses to a thin wrapper once M0103-0008 lands the
+      probe-survival fix. The full test body is preserved as a
+      closure under the updated `t.Skip` in
+      `internal/testport/pgoutput_interop_test.go` for traceability.
+      Verification (loop 3): `go test -count=1 -timeout 120s -run
+      "TestReplicationFallthroughQueryNotCancelled|TestReplicationCreateLogicalSlot|TestReplicationIdentifySystem|TestReplicationCreateAndDropSlot|TestReplicationSlotInvalidName"
+      -v ./internal/server/` → all PASS. `go test -race -count=1
+      -timeout 300s ./internal/server/ ./internal/wal/
+      ./internal/executor/ ./internal/catalog/` → all green
+      (server 3.723 s, wal 3.227 s, executor 2.712 s, catalog
+      1.021 s). `go test -count=1 -timeout 240s -run
+      TestPort_PgoutputInterop -v ./internal/testport/` →
+      subtest (a) PASS, subtest (b) SKIP (gap 2).
+      Design doc updated: `docs/design/0103-0003-pgoutput-wire-interop.md`
+      § "Subtest (b)" rewritten with Gap 1 + Gap 2 analysis.
 
 - [x] **M0103-0005** — Logical-walsender SyncRep integration.
       Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`
