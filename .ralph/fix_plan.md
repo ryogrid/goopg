@@ -2032,6 +2032,47 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       pgbench against PG publisher with `pgbench_history`
       polling, kill -9 + libpq multi-host reconnect plumbing on
       the client side.
+      PARTIAL PROGRESS 2026-05-14 (rung 6): multi-DML single
+      transaction shape. Design doc:
+      `docs/design/0103-0029-m0103-0007-rung-6-pg-to-goopg-multi-dml-xact.md`
+      (accepted). Rungs 1–5 ran every publisher DML in its own
+      autocommit xact (one pgoutput `B…C` per statement); rung 6
+      scales vertically — one explicit `BEGIN; INSERT x3; UPDATE;
+      DELETE; COMMIT;` block on the publisher, one pgoutput xact
+      on the wire, one `txnMgr.Begin/Commit` pair on the
+      subscriber. The correctness property pinned is **own-xact
+      write visibility**: subsequent UPDATE/DELETE handlers must
+      locate rows the earlier INSERTs in the same pgoutput xact
+      wrote with `xmin == currentTx.XID`.
+      `mvcc.TupleVisibleSubxact`
+      (`internal/mvcc/subxact_visibility.go:131-159`)
+      short-circuits on `isCurrentTxXID(h.Xmin, currentXID, r)`
+      before consulting the snapshot, so `applyDeleteByKey` and
+      `applyScanFirstMatch`'s heap scans see same-xact tuples and
+      the post-commit subscriber state reflects the net effect of
+      all 5 DML statements atomically. No code change was needed
+      — the machinery landed across rungs 1–5 and the broader
+      MVCC effort already supports the shape; the new
+      `TestPort_PgoutputInteropPGToGoopgMultiDMLXact` asserts it
+      end-to-end via fresh `database/sql` sessions (PK IndexScan
+      path): `count(*) = 2`, `id=1 v='one'`, `id=2 v='two-prime'`
+      (INSERT-then-UPDATE in same xact), `id=3` → 0
+      (INSERT-then-DELETE in same xact). Each assertion
+      fail-fasts on a distinct potential regression (no-op
+      DELETE leaves count=3; no-op UPDATE leaves stray
+      `(2,'two')` row; etc.). Verification (rung 6):
+      `go test -count=1 -timeout 180s
+      -run TestPort_PgoutputInteropPGToGoopgMultiDMLXact
+      ./internal/testport/` → PASS (~1.7 s); all 6
+      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+      (~10.1 s); race-tested regression on
+      `./internal/executor/ ./internal/wal/ ./internal/server/
+      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+      → all green. Next rungs (deferred within M0103-0007):
+      SAVEPOINT/ROLLBACK TO subxacts, pgbench against PG
+      publisher with `pgbench_history` polling, DDL replication
+      shapes, kill -9 + libpq multi-host reconnect plumbing on
+      the client side.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

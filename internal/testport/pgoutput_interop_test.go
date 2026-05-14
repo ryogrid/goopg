@@ -835,6 +835,103 @@ func TestPort_PgoutputInteropPGToGoopgUnchangedToast(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "id = 1 AND substr(payload, 1, 1) = 'X'", 1, 30*time.Second)
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgMultiDMLXact pins rung 6 of
+// M0103-0007: PG-publisher → goopg-subscriber multi-DML single
+// transaction. A single explicit BEGIN/...COMMIT block on the publisher
+// produces one pgoutput xact (one B, multiple I/U/D, one C). The apply
+// worker opens one TxnMgr transaction at B, replays every change
+// against it, and commits at C. UPDATE/DELETE statements inside the
+// xact must see rows inserted earlier in the same xact — that's the
+// "own-xact write visibility" property carried by
+// mvcc.TupleVisibleSubxact's currentXID short-circuit.
+//
+// Design doc: docs/design/0103-0029-m0103-0007-rung-6-pg-to-goopg-multi-dml-xact.md.
+func TestPort_PgoutputInteropPGToGoopgMultiDMLXact(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-mxact")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_mxact"
+	psc := pubsubcluster.NewMixed(t, "pg2g_mxact", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// One explicit BEGIN/COMMIT block — psql -c sends the whole string
+	// as one simple-query, so PostgreSQL groups every statement into a
+	// single transaction. pgoutput emits one B / I / I / I / U / D / C
+	// sequence anchored at one XID; the apply worker replays them
+	// inside one TxnMgr transaction. The UPDATE on id=2 and the DELETE
+	// on id=3 must locate rows the earlier INSERTs wrote within the
+	// same xact (xmin == currentTx.XID), exercising
+	// mvcc.TupleVisibleSubxact's own-xact short-circuit.
+	psc.Publisher.Exec(t, `
+BEGIN;
+INSERT INTO public.t VALUES (1, 'one');
+INSERT INTO public.t VALUES (2, 'two');
+INSERT INTO public.t VALUES (3, 'three');
+UPDATE public.t SET v = 'two-prime' WHERE id = 2;
+DELETE FROM public.t WHERE id = 3;
+COMMIT;`)
+
+	// All assertions use fresh database/sql sessions (WaitForRow opens
+	// a new conn each call), so each query traverses the goopg PK
+	// IndexScan path against committed state.
+
+	// Total surviving row count fail-fasts the "DELETE didn't see own
+	// INSERT" regression: a no-op delete would leave count=3.
+	psc.WaitForRow(t, "public.t", "1=1", 2, 60*time.Second)
+
+	// Untouched INSERT survives unchanged.
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'one'", 1, 30*time.Second)
+
+	// INSERT-then-UPDATE within same xact: UPDATE must locate the
+	// previously-inserted heap tuple via own-xact write visibility,
+	// xmax it, and install the new tuple with v='two-prime'.
+	psc.WaitForRow(t, "public.t", "id = 2 AND v = 'two-prime'", 1, 30*time.Second)
+
+	// INSERT-then-DELETE within same xact: DELETE must locate the
+	// previously-inserted heap tuple via own-xact write visibility
+	// and xmax it. Post-commit, both xmin and xmax are committed →
+	// invisible. The PK IndexScan re-fetches the heap and MVCC drops
+	// the tuple, matching the rung-1/rung-2 "IndexScan tolerates
+	// orphan PK entries" caveat.
+	psc.WaitForRow(t, "public.t", "id = 3", 0, 30*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"
