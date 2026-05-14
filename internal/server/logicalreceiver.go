@@ -502,6 +502,7 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 		// next standby-status frame moves the slot's
 		// confirmed_flush_lsn forward and a reconnect resumes
 		// at exactly the right byte.
+		advanced := false
 		if commitLSN > 0 {
 			for {
 				cur := r.applyLSN.Load()
@@ -509,9 +510,22 @@ func (r *LogicalReceiver) handleCopyData(payload []byte) error {
 					break
 				}
 				if r.applyLSN.CompareAndSwap(cur, commitLSN) {
+					advanced = true
 					break
 				}
 			}
+		}
+		// Eagerly push a standby-status frame on commit so the
+		// publisher's pg_stat_replication.{flush_lsn,replay_lsn}
+		// reflects the freshly applied LSN within one RTT. Without
+		// this the apply confirmation only reaches the publisher on
+		// the next StatusInterval tick (default 10 s), which makes
+		// any sync-rep-shaped invariant (M0103-0007 rung 26) slow
+		// to converge. Send-error is swallowed: the next ticker tick
+		// retries, and the receiver's reconnect loop will surface
+		// hard link failures via the read side.
+		if advanced {
+			_ = r.sendStatus()
 		}
 	case protocol.ReplMsgKeepalive:
 		ka := parsed.(*protocol.KeepaliveMessage)

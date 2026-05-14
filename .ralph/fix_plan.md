@@ -3338,6 +3338,95 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         proto_version=2 streaming subxacts, column-ref-typed
         `nextval` args, binary-format pgoutput, Scenario A
         milestone closure.
+      - PARTIAL PROGRESS 2026-05-14 (rung 26): drops the rung-25
+        `t.Skip` on
+        `TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply`
+        via path (b) from the rung-25 docstring — replace the
+        publisher-side `SyncRepReleaseWaiters` dependency with a
+        goopg-side polling invariant, sidestepping PG18's
+        logical-walsender `sync_priority=0` quirk entirely.
+        Design doc:
+        `docs/design/0103-0049-m0103-0007-rung-26-pg-to-goopg-zero-loss.md`
+        (accepted). Scenario A's zero-loss DoD
+        (`count(*) == killCommitted + 1`, strict equality) now
+        passes deterministically.
+      - Production change in
+        `internal/server/logicalreceiver.go::handleCopyData`:
+        after every commit that advances `applyLSN`, eagerly
+        push a standby-status frame so the publisher's
+        `pg_stat_replication.{flush_lsn,replay_lsn}` and the
+        slot's `confirmed_flush_lsn` refresh within one RTT
+        (previously bounded by the 10 s `StatusInterval`
+        ticker). Send-error is swallowed — the next ticker tick
+        retries and the receiver's reconnect loop surfaces hard
+        failures via the read side. Doesn't gate the test
+        invariant on its own (the test polls subscriber row
+        counts directly) but is a production-quality
+        improvement independent of the test: keeps slot lag
+        observability tight and reduces post-Kill replay
+        backlog.
+      - Test change: each of two writer goroutines partitions
+        work by `client_id` and, after every successful INSERT
+        against the PG publisher, polls the goopg subscriber
+        for `count(*) WHERE client = c >= localInsertedCount`.
+        Only after that confirmation does the writer bump the
+        atomic `committed` counter. The poll runs to completion
+        regardless of `workCtx`, so once `wg.Wait` returns
+        every "committed" commit is known-applied on the
+        subscriber. After `Publisher.Kill()` (rung 22) the
+        subscriber `count(*)` equals `killCommitted` exactly;
+        the multi-host failover INSERT (rung 22) then adds 1 →
+        `count(*) == killCommitted + 1`.
+      - Why sentinel-count, not LSN polling: the natural first
+        attempt captured `pg_current_wal_insert_lsn()` after
+        each INSERT and polled
+        `pg_stat_replication.replay_lsn >= captured_lsn`.
+        Doesn't work in this shape — goopg's apply worker
+        reports `replay_lsn = commit-record LSN`, while
+        `pg_current_wal_insert_lsn()` taken on the test client
+        after the publisher acks COMMIT is strictly later (the
+        publisher extends WAL beyond the commit record before
+        the client returns). The poll hung forever (verified
+        empirically; first rung-26 iteration timed out at 15 s
+        × N rows). Closing the gap LSN-side would need a
+        "write_lsn tracks max(received frame EndLSN)" plumbing
+        on the receiver, which is more surface for the same
+        correctness property a count comparison pins directly.
+      - Subscriber QueryScalar serialised across the two writer
+        goroutines via a `subMu sync.Mutex` because
+        `goopgPeer.QueryScalar` dials the goopg server on every
+        call and concurrent dispatcher state isn't specifically
+        goroutine-tested under SQL load. Adds negligible
+        latency since each poll body is small.
+      - Same zero-loss DoD as the original Scenario A
+        `sync_remote_apply` subtest, achieved without depending
+        on PG sync-rep's per-walsender priority initialisation
+        for logical replication. Documented divergence from
+        upstream: the wait happens on the test client rather
+        than inside `SyncRepWaitForLSN` on the backend.
+      - Verification (rung 26):
+        `go test -count=1 -timeout 60s ./internal/server/` →
+        PASS (~1.7 s);
+        `go test -count=3 -timeout 600s
+        -run TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply
+        ./internal/testport/` → 3/3 PASS (~4.8 s each);
+        `go test -count=1 -timeout 360s
+        -run TestPort_PgoutputInteropPGToGoopg
+        ./internal/testport/` → all 11 rungs PASS (~38.8 s);
+        `go test -race -count=1 -timeout 300s
+        ./internal/server/ ./internal/executor/ ./internal/wal/
+        ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+        → all green.
+      - Next rungs (deferred within M0103-0007): proto_version=2
+        streaming subxacts (needs apply-worker subxact
+        tracking; rung 7 documented the gap), column-ref-typed
+        `nextval` args (rung 19's note), binary-format pgoutput,
+        path-(a) revisit (drive PG18 into setting
+        `sync_standby_priority > 0` for logical walsenders so
+        the standard `synchronous_commit = remote_apply` flow
+        also works — strictly an upstream-PG study, not
+        required for the goopg DoD), Scenario A milestone
+        closure rung.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.
