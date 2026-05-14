@@ -233,6 +233,29 @@ func newResolveContext(bindings []rangeBinding, schema Schema) *resolveContext {
 	return ctx
 }
 
+// mergeResolveContexts concatenates outer and inner into a single ctx
+// whose bindings/schema are outer-then-inner. Used to thread LATERAL
+// FROM bindings into a JOIN's right side: the right SRF arg must see
+// the cross-FROM-item siblings (outer) *and* the same FROM item's
+// left side of the JOIN (inner). Either side may be nil. M0103-0008.
+func mergeResolveContexts(outer, inner *resolveContext) *resolveContext {
+	if outer == nil {
+		return inner
+	}
+	if inner == nil {
+		return outer
+	}
+	bindings := make([]rangeBinding, 0, len(outer.bindings)+len(inner.bindings))
+	bindings = append(bindings, outer.bindings...)
+	shift := len(outer.schema)
+	for _, b := range inner.bindings {
+		b.offset += shift
+		bindings = append(bindings, b)
+	}
+	schema := appendSchema(outer.schema, inner.schema)
+	return newResolveContext(bindings, schema)
+}
+
 func singleBindingContext(table *catalog.Table, alias string) *resolveContext {
 	// Single-binding scope (INSERT/UPDATE/DELETE/COPY targets,
 	// view substitution helpers): SourceTableIdx 1 because the
@@ -332,7 +355,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// dispatch live in one place. SourceTableIdx 1 — only
 		// one binding ever in this branch (0 is the
 		// "unknown / derived" sentinel).
-		nrv, b, err := planScanRangeVar(rv, cat, 1)
+		nrv, b, err := planScanRangeVar(rv, cat, 1, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -816,7 +839,14 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
 	for _, item := range s.FromExprs {
-		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx)
+		// LATERAL semantics for FROM-clause SRFs (M0103-0008):
+		// the partial FROM-list context is threaded down so each
+		// item's SRF args see siblings to its left.
+		var lateralCtx *resolveContext
+		if len(bindings) > 0 {
+			lateralCtx = newResolveContext(bindings, root.Output())
+		}
+		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -853,7 +883,15 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
 	for _, rv := range from {
-		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx)
+		// LATERAL semantics for FROM-clause SRFs (M0103-0008): pass
+		// the accumulated bindings/schema as the resolution scope so
+		// `pg_get_publication_tables(p.pubname)` resolves p.pubname
+		// against earlier FROM items. nil for the first item.
+		var lateralCtx *resolveContext
+		if len(bindings) > 0 {
+			lateralCtx = newResolveContext(bindings, root.Output())
+		}
+		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx, lateralCtx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -879,15 +917,19 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	return root, newResolveContext(bindings, root.Output()), nil
 }
 
-func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16) (Node, []rangeBinding, error) {
-	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx)
+func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext) (Node, []rangeBinding, error) {
+	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx)
 	if err != nil {
 		return nil, nil, err
 	}
 	*nextSourceIdx++
 	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output())
 	for _, j := range item.Joins {
-		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx)
+		// LATERAL on the right side of a JOIN can reference the
+		// left side. Merge the outer lateralCtx with the current
+		// leftCtx so SRF args on the right see both. M0103-0008.
+		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
+		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1021,12 +1063,12 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	return leftNode, leftCtx.bindings, nil
 }
 
-func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	if rv.Subquery != nil {
 		return planSubqueryRangeVar(rv, cat, sourceIdx)
 	}
 	if rv.TableFunc != nil {
-		return planTableFuncRangeVar(rv, cat, sourceIdx)
+		return planTableFuncRangeVar(rv, cat, sourceIdx, lateralCtx)
 	}
 	// CTE substitution (M0016-0002): an unschemed name takes the
 	// CTE before falling through to the catalog. CTE names are
@@ -1382,7 +1424,7 @@ func projectSetCompositeSchema(name string) Schema {
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
 // Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
 // are supported.
-func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if strings.EqualFold(tf.Name, "pg_input_error_info") {
 		return planPgInputErrorInfo(rv, sourceIdx)
@@ -1391,7 +1433,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return planScalarFuncScan(rv, sourceIdx, "text[]")
 	}
 	if strings.EqualFold(tf.Name, "pg_get_publication_tables") {
-		return planPgGetPublicationTables(rv, sourceIdx)
+		return planPgGetPublicationTables(rv, sourceIdx, lateralCtx)
 	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
@@ -1518,9 +1560,12 @@ func planPgInputErrorInfo(rv parser.RangeVar, sourceIdx int16) (Node, rangeBindi
 // the VARIADIC marker is recorded at parse time but ignored here — the runtime
 // operator accepts either a text[] (the VARIADIC spread shape) or any number
 // of plain text arguments. M0103-0008 probe-survival.
-func planPgGetPublicationTables(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+func planPgGetPublicationTables(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
-	ctx := &resolveContext{}
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
 	args := make([]Expr, 0, len(tf.Args))
 	for _, a := range tf.Args {
 		resolved, err := resolveExpr(a, ctx)
@@ -3540,7 +3585,7 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 
 	// Plan the USING source.
 	var srcIdx int16 = 2
-	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx)
+	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil)
 	if err != nil {
 		return nil, err
 	}

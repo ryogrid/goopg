@@ -723,3 +723,37 @@ func TestPlanResolutionErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestPlanLateralSrfArgResolvesAgainstLeftFromItem pins the LATERAL
+// FROM-clause SRF resolution path (M0103-0008). The libpqrcv
+// column-list probe ships
+//
+//	SELECT ... FROM pg_publication p,
+//	  LATERAL pg_get_publication_tables(p.pubname) gpt,
+//	  pg_class c WHERE gpt.relid = ... AND c.oid = gpt.relid
+//
+// against the goopg publisher during CREATE SUBSCRIPTION. The SRF arg
+// `p.pubname` is an outer column reference from the FROM list's left
+// sibling — the planner threads the partial FROM context as a LATERAL
+// scope so the arg resolves and `gpt.attrs` (the SRF's static column)
+// is reachable at the top-level target list.
+func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "pg_publication"}, []catalog.Column{
+		{Name: "pubname", Type: catalog.Type{Name: "text"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT gpt.attrs FROM pg_publication p, LATERAL pg_get_publication_tables(p.pubname) gpt`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	out := plan.Output()
+	if len(out) != 1 {
+		t.Fatalf("output cols = %d, want 1", len(out))
+	}
+	if got := out[0].Name; got != "attrs" {
+		t.Errorf("output col name = %q, want %q", got, "attrs")
+	}
+}

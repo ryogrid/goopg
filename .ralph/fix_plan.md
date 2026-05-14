@@ -2038,6 +2038,62 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       step is to drop the `t.Skip` on
       `TestPort_PgoutputInteropGoopgToPG` and confirm the live
       probe sequence runs end-to-end against a goopg publisher.
+      PARTIAL PROGRESS 2026-05-14 (loop 6): dropped the `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` and exercised the live
+      libpqrcv ladder against a goopg publisher. The relation-list
+      probe (rungs 1–5) now passes end-to-end. PG's apply launcher
+      then ships its column-list probe:
+      `SELECT DISTINCT (CASE WHEN (array_length(gpt.attrs, 1) =
+      c.relnatts) THEN NULL ELSE gpt.attrs END) FROM pg_publication
+      p, LATERAL pg_get_publication_tables(p.pubname) gpt, pg_class
+      c WHERE gpt.relid = <oid> AND c.oid = gpt.relid AND p.pubname
+      IN (…)`. goopg rejected the probe with `ERROR: column "attrs"
+      does not exist` because the planner built a fresh empty
+      `resolveContext` for FROM-clause SRF arg resolution — so
+      `p.pubname` (an outer column ref from the left FROM sibling)
+      could not resolve. Rung 6 (planner side) closed in this loop;
+      executor side stays deferred inside M0103-0008.
+      Design doc:
+      `docs/design/0103-0010-lateral-from-srf-arg-resolution.md`.
+      Changes:
+      - `internal/planner/planner.go`: `planScanRangeVar`,
+        `planTableFuncRangeVar`, and `planPgGetPublicationTables`
+        gain a `lateralCtx *resolveContext` parameter. nil from
+        non-FROM call sites (INSERT/MERGE source paths) preserves
+        prior semantics. `planPgGetPublicationTables` resolves each
+        SRF argument against `lateralCtx` when non-nil instead of
+        `&resolveContext{}`.
+      - `planFromRangeVars` (legacy comma-FROM) and `planFromClause`
+        (FromExpr/Join path) build the accumulated
+        `*resolveContext` per FROM iteration and thread it in;
+        first item gets nil. `planFromItem` accepts and forwards
+        `lateralCtx`. JOIN right-hand sides merge outer lateralCtx
+        with the same item's left context via a new
+        `mergeResolveContexts(outer, inner)` helper.
+      Tests:
+      - `internal/planner/planner_test.go::
+        TestPlanLateralSrfArgResolvesAgainstLeftFromItem` — parses
+        and plans the canonical libpqrcv shape against an in-memory
+        catalog with a `pg_publication(pubname text)` stand-in;
+        pins single-column output named `attrs`.
+      Verification (loop 6): `go test -count=1 -timeout 180s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` — all green; planner regression test
+      added.
+      Remaining for full rung-6 survival (next sub-step):
+      executor-side outer-row-driven SRF evaluation. The cross-FROM
+      Join currently opens its right child once with a nil outer
+      slot, so the SRF's `ColumnRef("pubname")` evaluates against a
+      nil tuple at runtime (`XX000: column ref pubname/0 on nil
+      slot`). Closing requires either a NestedLoop-with-parameter-
+      binding variant for FROM-clause SRFs (the principled fix —
+      generalises the existing `nestedLoopIndexJoinOp::BindOuter`
+      slot-binding pattern) or an inline rewrite that materialises
+      the SRF over the outer table at plan time. The `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` was restored with rung-6
+      diagnosis quoted verbatim so the next loop can resume from
+      the exact failing surface.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

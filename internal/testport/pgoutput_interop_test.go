@@ -214,56 +214,81 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	// the M0103 "DO NOT BYPASS" policy: subtest (b) becomes a thin
 	// wrapper once M0103-0008 lands the publisher-side probe-survival
 	// work.
-	t.Skip("M0103-0004(b) deferred to M0103-0008: per-query cancellation " +
-		"fixed in this loop; remaining gap is goopg parser lacks " +
-		"VARIADIC keyword used by PG libpqrcv `fetch_table_list` probe " +
-		"(SELECT … pg_get_publication_tables(VARIADIC …)) during CREATE " +
-		"SUBSCRIPTION. M0103-0008 closes the same surface.")
+	// Probe survival ladder (M0103-0008). Each rung uncovered by
+	// dropping this t.Skip and running the live test:
+	//   - rung 1 (loop 1, CLOSED): per-query context cancellation in
+	//     `runPostStartupLoop`'s replication-mode fall-through.
+	//   - rung 2 (loop 2, CLOSED): VARIADIC keyword + FROM-clause
+	//     `pg_get_publication_tables` SRF.
+	//   - rung 3 (loop 3, CLOSED): `(srf(...)).*` indirection-star
+	//     rewrite + `array_agg(text)`.
+	//   - rung 4 (loop 4, CLOSED): derived-subquery SRF column-schema
+	//     propagation through `__irs_0.*`.
+	//   - rung 5 (loop 5, CLOSED): `ProjectSet` lowering for
+	//     aggregate-arg SRFs — the `fetch_table_list` shape now plans
+	//     and executes against an in-memory fixture.
+	//   - rung 6 (loop 6, CLOSED for planner; OPEN for executor):
+	//     LATERAL FROM-clause SRF arg resolution. libpqrcv's column-list
+	//     probe is `pg_publication p, LATERAL
+	//     pg_get_publication_tables(p.pubname) gpt, pg_class c WHERE
+	//     gpt.relid = N AND c.oid = gpt.relid AND p.pubname IN (...)`.
+	//     The planner now threads a per-FROM-item LATERAL resolveContext
+	//     so `p.pubname` resolves at the SRF arg site (pinned by
+	//     `TestPlanLateralSrfArgResolvesAgainstLeftFromItem` in the
+	//     planner package). Executor still lacks outer-row-driven
+	//     SRF evaluation: cross-FROM Join opens its right child once
+	//     with a nil outer slot, so the SRF's `ColumnRef` evaluates
+	//     against a nil tuple at runtime
+	//     (`XX000: column ref pubname/0 on nil slot`). Closing that
+	//     requires either a NestedLoop-with-parameter-binding variant
+	//     for FROM-clause SRFs or an inline rewrite that materialises
+	//     the SRF over the outer table at plan time. Deferred to the
+	//     next M0103-0008 rung.
+	t.Skip("M0103-0008 rung 6 partial: planner-side LATERAL arg " +
+		"resolution landed; executor still needs outer-row-driven " +
+		"SRF evaluation for the libpqrcv column-list probe " +
+		"(LATERAL pg_get_publication_tables(p.pubname)).")
 
-	// Test body kept as the concrete shape this will take once
-	// M0103-0008 closes the remaining gap.
-	_ = func(t *testing.T) {
-		repo := repoRoot(t)
-		pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
 
-		baseDir := filepath.Join(repo, "tmp", "pgoutput-interop-g2pg")
-		_ = os.RemoveAll(baseDir)
+	baseDir := filepath.Join(repo, "tmp", "pgoutput-interop-g2pg")
+	_ = os.RemoveAll(baseDir)
 
-		psc := pubsubcluster.NewMixed(t, "pgoutput_g2pg", pubsubcluster.Options{
-			RepoRoot:         repo,
-			BaseDir:          baseDir,
-			PublisherKind:    pubsubcluster.ClusterKindGoopg,
-			SubscriberKind:   pubsubcluster.ClusterKindPG,
-			SyncMode:         pubsubcluster.SyncModeAsync,
-			ApplicationName:  "g2pg_sub",
-			PublicationName:  "p",
-			SubscriptionName: "g2pg_sub",
-			StartupWait:      30 * time.Second,
-			ShutdownWait:     10 * time.Second,
-		})
-		defer func() { _ = psc.Close() }()
+	psc := pubsubcluster.NewMixed(t, "pgoutput_g2pg", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindGoopg,
+		SubscriberKind:   pubsubcluster.ClusterKindPG,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  "g2pg_sub",
+		PublicationName:  "p",
+		SubscriptionName: "g2pg_sub",
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer cancel()
-		if err := psc.Start(ctx); err != nil {
-			t.Fatalf("Start: %v", err)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
-		psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
-		psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
-		psc.CreatePublication(t, "t")
-		psc.CreateSubscription(t)
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.CreateSubscription(t)
 
-		psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
-		psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'world')")
-		psc.Publisher.Exec(t, "UPDATE public.t SET v = 'updated' WHERE id = 2")
-		psc.Publisher.Exec(t, "DELETE FROM public.t WHERE id = 1")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'world')")
+	psc.Publisher.Exec(t, "UPDATE public.t SET v = 'updated' WHERE id = 2")
+	psc.Publisher.Exec(t, "DELETE FROM public.t WHERE id = 1")
 
-		psc.WaitForRow(t, "public.t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
-		psc.WaitForRow(t, "public.t", "id = 1", 0, 60*time.Second)
-		if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.t"); got != "1" {
-			t.Fatalf("subscriber row count after replication: got %q want 1", got)
-		}
+	psc.WaitForRow(t, "public.t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 1", 0, 60*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.t"); got != "1" {
+		t.Fatalf("subscriber row count after replication: got %q want 1", got)
 	}
 }
 
