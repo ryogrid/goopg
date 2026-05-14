@@ -1038,6 +1038,136 @@ COMMIT;`)
 	psc.WaitForRow(t, "public.t", "id = 4 AND v = 'four'", 1, 30*time.Second)
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgMultiTable pins rung 8 of
+// M0103-0007: PG-publisher → goopg-subscriber multi-table interleaved
+// DML. All prior rungs (1–7) used a single published table; this rung
+// publishes two tables with different column shapes and verifies that
+// interleaved INSERT/UPDATE/DELETE against both inside one top-level
+// transaction lands at the correct per-table state on the subscriber.
+//
+// The load-bearing property is the multi-relation dispatch contract:
+// the apply worker's relation cache must hold both Relation messages
+// live across the B...C block, every change must route to the matching
+// catalog.Table on the subscriber, and per-table primary-key index
+// maintenance (maintainUniqueIndexesForInsert) must run against the
+// right table so subsequent fresh-session PK IndexScans find each row.
+//
+// Cross-relation dispatch leaks, stale-relation overwrites after the
+// second 'R' frame, and column-index drift between the wire tuple and
+// the subscriber's catalog.Table.Columns are all caught by the per-
+// table count + identity assertions below.
+//
+// Design doc: docs/design/0103-0031-m0103-0007-rung-8-pg-to-goopg-multi-table.md.
+func TestPort_PgoutputInteropPGToGoopgMultiTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-multi")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_multi"
+	psc := pubsubcluster.NewMixed(t, "pg2g_multi", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Two tables with deliberately different column shapes:
+	//   users:  2 cols (id int PK, name text)
+	//   orders: 3 cols (id int PK, user_id int, amount int)
+	// Column-index drift between the wire tuple and the subscriber's
+	// catalog.Table.Columns would either surface as a parse error
+	// (text into int4) or as the per-row identity assertions failing.
+	psc.Publisher.Exec(t, "CREATE TABLE public.users  (id int PRIMARY KEY, name text)")
+	psc.Publisher.Exec(t, "CREATE TABLE public.orders (id int PRIMARY KEY, user_id int, amount int)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.users  (id int PRIMARY KEY, name text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.orders (id int PRIMARY KEY, user_id int, amount int)")
+	psc.CreatePublication(t, "users", "orders")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Single top-level transaction interleaving DML against both
+	// tables. The publisher's reorder buffer emits frames in arrival
+	// order; on the wire this becomes:
+	//   B, R(users), I(users), R(orders), I(orders), I(users),
+	//   I(orders), I(orders), U(orders), U(users), D(users),
+	//   D(orders), C.
+	// The apply worker's relation cache must keep both R entries
+	// live and dispatch each change to the matching catalog.Table.
+	psc.Publisher.Exec(t, `
+BEGIN;
+INSERT INTO public.users  VALUES (1, 'alice');
+INSERT INTO public.orders VALUES (10, 1, 100);
+INSERT INTO public.users  VALUES (2, 'bob');
+INSERT INTO public.orders VALUES (11, 2, 200);
+INSERT INTO public.orders VALUES (12, 1, 50);
+UPDATE public.orders SET amount = 99 WHERE id = 10;
+UPDATE public.users  SET name = 'alice-updated' WHERE id = 1;
+DELETE FROM public.users  WHERE id = 2;
+DELETE FROM public.orders WHERE id = 11;
+COMMIT;`)
+
+	// Second autocommit phase: verify post-xact multi-relation routing
+	// still works (each statement is its own B...C block on the wire).
+	psc.Publisher.Exec(t, "INSERT INTO public.users  VALUES (3, 'carol')")
+	psc.Publisher.Exec(t, "INSERT INTO public.orders VALUES (13, 3, 75)")
+
+	// All assertions use fresh database/sql sessions (WaitForRow opens
+	// a new conn per call) so each query traverses the goopg PK
+	// IndexScan path against committed state.
+
+	// Per-table count fail-fasts a cross-relation dispatch leak:
+	//   - users at 3 would mean 'bob' (id=2) wasn't deleted, or an
+	//     orders row was misrouted into users.
+	//   - users at 1 would mean 'carol' (id=3) was routed to orders
+	//     instead of users.
+	psc.WaitForRow(t, "public.users", "1=1", 2, 60*time.Second)
+	psc.WaitForRow(t, "public.orders", "1=1", 3, 60*time.Second)
+
+	// users state: top-level INSERT + same-xact UPDATE both survive,
+	// the matching DELETE of id=2 fired, and the post-xact id=3
+	// autocommit INSERT lands. Identity check on id=1 catches:
+	//   - missing UPDATE (would leave name='alice')
+	//   - wrong-relation UPDATE (would leave name='alice')
+	psc.WaitForRow(t, "public.users", "id = 1 AND name = 'alice-updated'", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.users", "id = 2", 0, 30*time.Second)
+	psc.WaitForRow(t, "public.users", "id = 3 AND name = 'carol'", 1, 30*time.Second)
+
+	// orders state: id=10 INSERT followed by same-xact UPDATE to
+	// amount=99; id=12 untouched in xact at amount=50; id=13 added
+	// post-xact at amount=75. id=11 deleted. Identity check on id=10
+	// fail-fasts an UPDATE-routing bug — if the orders UPDATE leaked
+	// into users (or vice versa), id=10's amount would stay 100.
+	psc.WaitForRow(t, "public.orders", "id = 10 AND user_id = 1 AND amount = 99", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.orders", "id = 11", 0, 30*time.Second)
+	psc.WaitForRow(t, "public.orders", "id = 12 AND user_id = 1 AND amount = 50", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.orders", "id = 13 AND user_id = 3 AND amount = 75", 1, 30*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

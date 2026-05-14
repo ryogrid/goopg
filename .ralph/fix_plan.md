@@ -2115,6 +2115,63 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       polling, DDL replication shapes, proto_version=2 streaming
       subxacts, kill -9 + libpq multi-host reconnect plumbing on
       the client side.
+      PARTIAL PROGRESS 2026-05-14 (rung 8): multi-table
+      interleaved DML shape. Design doc:
+      `docs/design/0103-0031-m0103-0007-rung-8-pg-to-goopg-multi-table.md`
+      (accepted). All prior rungs (1–7) used a single published
+      table `public.t (id int PRIMARY KEY, v text)`; the apply
+      worker's relation cache only ever held one entry and the
+      per-relation dispatch path was untested at that level.
+      Rung 8 publishes two tables with deliberately different
+      column shapes — `public.users (id int PRIMARY KEY, name
+      text)` (2 cols) and `public.orders (id int PRIMARY KEY,
+      user_id int, amount int)` (3 cols) — and interleaves
+      INSERT/UPDATE/DELETE against both inside one top-level
+      xact plus a follow-up autocommit phase. The load-bearing
+      property pinned is the **multi-relation dispatch
+      contract**: the apply worker's relation cache must keep
+      both `R` messages live across the `B…C` block, every
+      change must route to the matching `*catalog.Table` on the
+      subscriber, and per-table primary-key index maintenance
+      (`maintainUniqueIndexesForInsert`) must run against the
+      right table so subsequent fresh-session PK IndexScans find
+      each row. Column-index drift between the wire tuple and
+      the subscriber's `catalog.Table.Columns` would surface
+      either as a parse error (text into int4 at the same
+      ordinal across tables) or as the per-row identity
+      assertions failing. Workload (single `Exec`, one libpq
+      simple-query): `BEGIN; INSERT users(1,alice); INSERT
+      orders(10,1,100); INSERT users(2,bob); INSERT
+      orders(11,2,200); INSERT orders(12,1,50); UPDATE orders
+      SET amount=99 WHERE id=10; UPDATE users SET
+      name='alice-updated' WHERE id=1; DELETE users WHERE id=2;
+      DELETE orders WHERE id=11; COMMIT;` then two autocommit
+      INSERTs (`users(3,carol)`, `orders(13,3,75)`). Expected:
+      `count(users)=2` with `id=1 name='alice-updated'` +
+      `id=3 name='carol'`; `count(orders)=3` with `id=10
+      user_id=1 amount=99` + `id=12 user_id=1 amount=50` +
+      `id=13 user_id=3 amount=75`. Each assertion uses a fresh
+      `database/sql` session through goopg's PK IndexScan;
+      per-table count assertion catches cross-relation dispatch
+      leaks (would yield 3+0 or 1+4 etc); per-id identity
+      assertions catch UPDATE-routing bugs. No code change
+      needed — rungs 1–7's machinery already covered both
+      `applyRelation` map keying and per-table
+      `*catalog.Table` resolution. Pinned by
+      `TestPort_PgoutputInteropPGToGoopgMultiTable` in
+      `internal/testport/pgoutput_interop_test.go`.
+      Verification (rung 8): `go test -count=1 -timeout 120s
+      -run TestPort_PgoutputInteropPGToGoopgMultiTable
+      ./internal/testport/` → PASS (~1.7 s); all 8
+      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+      (~13.4 s); race-tested regression on
+      `./internal/executor/ ./internal/wal/ ./internal/server/
+      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+      → all green. Next rungs (deferred within M0103-0007):
+      pgbench against PG publisher with `pgbench_history`
+      polling, DDL replication shapes, proto_version=2 streaming
+      subxacts, kill -9 + libpq multi-host reconnect plumbing on
+      the client side.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
