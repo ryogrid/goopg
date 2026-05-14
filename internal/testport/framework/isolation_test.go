@@ -169,13 +169,15 @@ func TestParseIsolationSpecClosingBraceOnOwnLine(t *testing.T) {
 		t.Fatalf("step q not parsed; have %v", parsed.StepOrder)
 	}
 	// When `{` is on its own line (brace-at-EOL layout), the SQL begins on
-	// the next line, so the parsed SQL keeps a leading `\n`.  This lets the
-	// runner's `step %s: %s` format produce `step q: \n  SELECT 1;\n
-	// SELECT 2;`, matching upstream isolationtester's verbatim echo (e.g.
-	// insert-conflict-do-update-3 expected output `step insert1: \n    WITH
-	// t AS (\n        INSERT INTO ...`).  The trailing `}` line is dropped
-	// because nothing precedes the brace.
-	want := "\n  SELECT 1;\n  SELECT 2;"
+	// the next line, so the parsed SQL keeps a leading `\n`.  When `}` is
+	// on its own line too, the SQL ends with a trailing `\n`.  This lets
+	// the runner's `step %s: %s <waiting ...>\n` format render
+	// `<waiting ...>` on its own line with a single leading space —
+	// matching upstream isolationtester's verbatim echo for
+	// `}`-on-own-line specs (e.g. merge-match-recheck expected output
+	// where `\tUPDATE SET ...;\n <waiting ...>\n` appears).  The trailing
+	// `}` line itself is dropped because nothing precedes the brace.
+	want := "\n  SELECT 1;\n  SELECT 2;\n"
 	if got.SQL != want {
 		t.Fatalf("SQL mismatch:\n got: %q\nwant: %q", got.SQL, want)
 	}
@@ -252,6 +254,19 @@ func TestFormatWaitingStepHeader(t *testing.T) {
 			step: "insert1",
 			sql:  "\n    WITH t AS (\n        INSERT INTO colors VALUES(1, 'Red'))\n    SELECT * FROM colors;",
 			want: "step insert1: \n    WITH t AS (\n        INSERT INTO colors VALUES(1, 'Red'))\n    SELECT * FROM colors; <waiting ...>\n",
+		},
+		{
+			// merge-match-recheck shape: `{` at EOL AND `}` on its own
+			// line.  The parser emits a SQL string that both starts and
+			// ends with `\n`, so `<waiting ...>` appears on its own line
+			// with the single leading space from the format string —
+			// matching upstream isolationtester (e.g.
+			// `expected/merge-match-recheck.out:14` shape
+			// `\tUPDATE SET ...;\n <waiting ...>\n`).
+			name: "brace_at_eol_close_own_line",
+			step: "merge_status",
+			sql:  "\n  MERGE INTO target t\n\tUPDATE SET status = 's4';\n",
+			want: "step merge_status: \n  MERGE INTO target t\n\tUPDATE SET status = 's4';\n <waiting ...>\n",
 		},
 	}
 	for _, tc := range cases {

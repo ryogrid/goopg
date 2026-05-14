@@ -1172,6 +1172,21 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         already covered by `normalizeIsoOutput`'s TrimRight (PQprint pads
         the rightmost column with trailing spaces; the normalizer strips
         them on both sides of the diff).
+        - Trailing-`\n` preservation for brace-on-own-line specs (M0100-0005d,
+        2026-05-15): `readBlock` now appends `\n` to the body when the
+        closing `}` sits on its own line, mirroring upstream
+        `specscanner.l`'s `{space}` = `[ \t\r\f]` (newlines are captured
+        verbatim).  Step assignment drops the `TrimRight`.  With the
+        trailing `\n`, the runner's `step %s: %s <waiting ...>\n` format
+        renders `<waiting ...>` on its own line with a single leading
+        space — the `merge-match-recheck.out` shape (`UPDATE SET ...;\n
+        <waiting ...>\n`).  Inline closing-brace specs unchanged.
+        Regression: new `TestFormatWaitingStepHeader/brace_at_eol_close_own_line`
+        case; updated `TestParseIsolationSpecClosingBraceOnOwnLine`.
+        Design: `docs/design/0100-0005d-isolation-spec-trailing-newline.md`.
+        Output-format diffs from this layout removed from 21-test
+        target; remaining diffs are real-feature gaps (MERGE matched-AND
+        recheck, partition row-movement error, etc.).
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait

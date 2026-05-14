@@ -208,10 +208,13 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 			if _, exists := s.Steps[stepNameParsed]; !exists {
 				s.StepOrder = append(s.StepOrder, stepNameParsed)
 			}
-			// Use TrimRight (not TrimSpace) to preserve leading indentation
-			// from the spec file — the first content line's leading whitespace
-			// matters for multi-line SQL display in isolationtester format.
-			s.Steps[stepNameParsed] = IsolationStep{Name: stepNameParsed, Session: session, SQL: strings.TrimRight(body, " \t\n\r")}
+			// Preserve the verbatim block body. Leading whitespace on
+			// the first content line (and leading `\n` for brace-at-EOL
+			// layouts) is significant for multi-line SQL display; a
+			// trailing `\n` (when `}` sits on its own line) is significant
+			// so a follow-on `<waiting ...>` suffix appears on a fresh
+			// line. See readBlock for the format-parity rationale.
+			s.Steps[stepNameParsed] = IsolationStep{Name: stepNameParsed, Session: session, SQL: body}
 			continue
 		}
 
@@ -271,22 +274,29 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 		return strings.TrimSpace(rest[:idx])
 	}
 	// Multi-line: read lines until closing brace.
-	// - First segment (the same line as the opening '{'): TrimSpace, since
-	//   the space after '{' is just a separator before the SQL starts.
-	//   If the opening `{` sits at end-of-line (rest is empty/whitespace),
-	//   prepend a leading `\n` to the joined result so the runner's
-	//   `step %s: %s` format prints `step name: \n<body>`, matching
-	//   upstream isolationtester's verbatim echo of `{\n<body>\n}` (e.g.
-	//   insert-conflict-do-update-3 expected output line 5).
-	// - Continuation lines: preserve raw indentation, because upstream
-	//   isolationtester echoes step SQL verbatim — `step name: <line1>\n
-	//   <leading spaces><line2>\n ...` — and the leading whitespace is
-	//   significant for output parity.
-	// - Closing-brace line: preserve leading whitespace on any content
-	//   before '}'; strip everything from '}' onward and trim trailing
-	//   whitespace. A line that is *just* whitespace before '}' (i.e. the
-	//   closing brace sits on its own line) is dropped.
+	//
+	// Upstream isolationtester (`specscanner.l`, rules for `{`/`}` with
+	// `{space}*` = `[ \t\r\f]*`) captures everything between the opening
+	// brace and the next horizontal-whitespace-before-`}` verbatim, INCLUDING
+	// embedded newlines. Trailing horizontal whitespace immediately before
+	// `}` is eaten, but a `\n` right before `}` is preserved in the buffer.
+	//
+	// Concretely:
+	//   - Opening `{` at end-of-line: the first byte of the body is `\n`,
+	//     which makes the runner's `step name: %s` format render as
+	//     `step name: \n<body>` (i.e. body starts on the next line).
+	//   - Closing `}` on its own line (or after only horizontal whitespace
+	//     on that line): the body ends with `\n`, which makes the runner's
+	//     `step name: %s <waiting ...>` format render with `<waiting ...>`
+	//     on a fresh line (with a single leading space from the format
+	//     string). This is the merge-match-recheck shape — see
+	//     `postgres/src/test/isolation/expected/merge-match-recheck.out`.
+	//   - Closing `}` on the same line as the last SQL content (e.g.
+	//     `INSERT ... }`) does NOT carry a trailing `\n`, so `<waiting ...>`
+	//     stays on the same line as the last SQL line. This is the
+	//     insert-conflict-do-update-4 shape.
 	openedOnEOL := strings.TrimSpace(rest) == ""
+	closedOnOwnLine := false
 	var lines []string
 	if t := strings.TrimSpace(rest); t != "" {
 		lines = append(lines, t)
@@ -297,6 +307,8 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 			line := strings.TrimRight(next[:idx], " \t")
 			if strings.TrimSpace(line) != "" {
 				lines = append(lines, line)
+			} else {
+				closedOnOwnLine = true
 			}
 			break
 		}
@@ -308,6 +320,9 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 	joined := strings.Join(lines, "\n")
 	if openedOnEOL {
 		joined = "\n" + joined
+	}
+	if closedOnOwnLine {
+		joined = joined + "\n"
 	}
 	return joined
 }
