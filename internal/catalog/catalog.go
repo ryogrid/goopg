@@ -705,24 +705,25 @@ func (c *InMemory) ListDatabases() []string {
 func (c *InMemory) Routines() *Routines { return c.routines }
 
 // registerSystemTables installs the minimal pg_catalog v0 needs:
-// pg_class with one row per user table. The OID column is text-typed
-// because regclass casts are no-ops in v0 — pgbench's
-// `oid=$1::pg_catalog.regclass` ends up comparing the bound text
-// parameter (the table name) against pg_class.oid, so storing the
-// relname there makes the equality match.
+// pg_class with one row per user table. The OID column is emitted
+// as the table's numeric OID (decimal text wire format under type
+// OID 26) so libpqrcv can decode it via DatumGetObjectId — required
+// by CREATE SUBSCRIPTION's fetch_remote_table_info probe (M0103-0008
+// rung 16). The regclass cast handles the legacy "name as OID"
+// shape by resolving the bound text parameter through the catalog.
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_class",
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
 			{Name: "relname", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "relkind", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "relnamespace", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
 			// Additional columns required by vacuumdb catalog query (M0095-0004).
 			{Name: "relpersistence", Type: Type{Name: "text"}, Ordinal: 4},
-			{Name: "reltoastrelid", Type: Type{Name: "text"}, Ordinal: 5},
-			{Name: "relpages", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 6},
 			// relispopulated: true for tables/views, reflects IsPopulated for matviews.
 			// M0097-0013.
 			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 7},
@@ -731,6 +732,11 @@ func (c *InMemory) registerSystemTables() {
 			//   `… (array_length(gpt.attrs,1) = c.relnatts) … FROM pg_class c …`
 			// where `gpt = pg_get_publication_tables(...)`.
 			{Name: "relnatts", Type: Type{Name: "int4"}, Ordinal: 8},
+			// relreplident: replica identity setting. Required by PG's
+			// CREATE SUBSCRIPTION tablesync probe (M0103-0008 rung 16):
+			//   `SELECT c.oid, c.relreplident, c.relkind FROM pg_class c …`
+			// 'd' = REPLICA_IDENTITY_DEFAULT (PG default for tables).
+			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 9},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -762,15 +768,16 @@ func (c *InMemory) registerSystemTables() {
 				populated = "f"
 			}
 			out = append(out, []string{
-				t.Name,
-				t.Name,
-				relkind,
-				"2200",                              // relnamespace: OID of public namespace (matches pg_namespace.oid)
-				"p",                                 // relpersistence: permanent
-				"0",                                 // reltoastrelid: no TOAST table
-				"0",                                 // relpages: estimated page count (0 = unknown)
-				populated,                           // relispopulated
-				strconv.Itoa(len(t.Columns)),        // relnatts: number of user columns
+				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
+				t.Name,                       // relname
+				relkind,                      // relkind
+				"2200",                       // relnamespace: OID of public namespace
+				"p",                          // relpersistence: permanent
+				"0",                          // reltoastrelid: no TOAST table
+				"0",                          // relpages: estimated page count
+				populated,                    // relispopulated
+				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
+				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
 			})
 		}
 		return out

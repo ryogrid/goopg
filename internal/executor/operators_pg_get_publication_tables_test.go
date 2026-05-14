@@ -5,6 +5,7 @@ package executor
 // fetch_table_list probe-survival. M0103-0008.
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -400,6 +401,27 @@ func TestLateralPgGetPublicationTablesUnknownYieldsZero(t *testing.T) {
 // the same shape. Before the fix, relid was a numeric OID (e.g. 16384) and
 // the comparison `"16384" = "t"` silently produced zero rows, leaving
 // `pg_subscription_rel` empty and the apply worker skipping every change.
+// TestPgGetPublicationTablesRelidMatchesPgClassOid pins rung 16 of
+// M0103-0008: gpt.relid must compare equal to pg_class.oid so that PG's
+// CREATE SUBSCRIPTION fetch_table_list join — `JOIN ... AS gpt ON
+// gpt.relid = c.oid` — produces a non-empty result set. Rung 15 had
+// both sides emit the relation NAME as text (matching the legacy v0
+// pg_class.oid text shape); rung 16 flips both sides to the table's
+// numeric OID because libpqrcv's fetch_remote_table_info wire-decodes
+// pg_class.oid via DatumGetObjectId — text "items" parses as uint32
+// → 0 and lrel->remoteid then misses every downstream column-list
+// LATERAL probe.
+// TestPgGetPublicationTablesRelidMatchesPgClassOid pins rung 16 of
+// M0103-0008: gpt.relid must compare equal to pg_class.oid so that PG's
+// CREATE SUBSCRIPTION fetch_table_list join — `JOIN ... AS gpt ON
+// gpt.relid = c.oid` — produces a non-empty result set. Rung 15 had
+// both sides emit the relation NAME as text (matching the legacy v0
+// pg_class.oid text shape); rung 16 flips both sides to the table's
+// numeric OID (KindString decimal text) because libpqrcv's
+// fetch_remote_table_info wire-decodes pg_class.oid via
+// DatumGetObjectId — text "items" parses as uint32 → 0 and
+// lrel->remoteid then misses every downstream column-list LATERAL
+// probe.
 func TestPgGetPublicationTablesRelidMatchesPgClassOid(t *testing.T) {
 	ctx, _, cleanup := newStorageFixture(t)
 	defer cleanup()
@@ -408,6 +430,15 @@ func TestPgGetPublicationTablesRelidMatchesPgClassOid(t *testing.T) {
 	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
 		t.Fatal(err)
 	}
+
+	// Lookup the registered table so the assertion compares against the
+	// real numeric OID rather than a literal that drifts as the catalog
+	// is restructured.
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	if !ok || tbl == nil {
+		t.Fatalf("items table not found in catalog")
+	}
+	wantOID := strconv.Itoa(int(tbl.OID))
 
 	// Direct shape: SRF on the inside, pg_class on the outside, JOIN on
 	// the gpt.relid = c.oid equality. The PG18 fetch_table_list also
@@ -428,10 +459,10 @@ func TestPgGetPublicationTablesRelidMatchesPgClassOid(t *testing.T) {
 		t.Fatalf("rows[0].relname = %q, want \"items\"", got)
 	}
 	if rows[0][1].IsNull() {
-		t.Fatalf("rows[0].relid is NULL, want \"items\" (matching pg_class.oid)")
+		t.Fatalf("rows[0].relid is NULL, want %q (table OID)", wantOID)
 	}
-	if got := rows[0][1].StringValue(); got != "items" {
-		t.Fatalf("rows[0].relid = %q, want \"items\" (matching pg_class.oid)", got)
+	if got := rows[0][1].StringValue(); got != wantOID {
+		t.Fatalf("rows[0].relid = %q, want %q (numeric OID, M0103-0008 rung 16)", got, wantOID)
 	}
 }
 

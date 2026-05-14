@@ -2986,11 +2986,28 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_proc":
 		return NullDatum, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
-		// Type cast functions — return the argument as-is (stub).
-		if len(x.Args) == 1 {
-			return evalExpr(x.Args[0], row, ctx)
+		// Type cast functions. For regclass specifically, resolve a
+		// text relation name to the table's numeric OID via the
+		// catalog (matches PG semantics post M0103-0008 rung 16,
+		// after pg_class.oid was flipped from text-name to numeric).
+		// Numeric inputs pass through. Other reg* casts remain
+		// stubs returning the argument as-is.
+		if len(x.Args) != 1 {
+			return NullDatum, nil
 		}
-		return NullDatum, nil
+		v, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || v.IsNull() {
+			return v, err
+		}
+		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+			s := v.StringValue()
+			schema, rel := splitQualifiedTable(s)
+			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel})
+			if ok && tbl != nil {
+				return NewIntDatum(int64(tbl.OID)), nil
+			}
+		}
+		return v, nil
 
 	// ── String functions (M0097-0005) ─────────────────────────────────────
 	case "repeat":

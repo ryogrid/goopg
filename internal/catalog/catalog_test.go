@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -217,6 +218,94 @@ func TestPgClassExposesRelNatts(t *testing.T) {
 	}
 	if row[natts.Ordinal] != "2" {
 		t.Errorf("pg_class.t.relnatts=%q want %q (user column count)", row[natts.Ordinal], "2")
+	}
+}
+
+
+// TestPgClassExposesRelReplident pins rung 16 of M0103-0008: the
+// pg_catalog.pg_class virtual view must expose a `relreplident`
+// column populated as 'd' (REPLICA_IDENTITY_DEFAULT). CREATE
+// SUBSCRIPTION's `fetch_remote_table_info` first probe selects
+// `c.oid, c.relreplident, c.relkind`; without this column the
+// query failed with 42703 ("column does not exist") before any
+// further publisher-side correctness work could be exercised.
+func TestPgClassExposesRelReplident(t *testing.T) {
+	c := NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pgClass, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok {
+		t.Fatal("pg_catalog.pg_class missing")
+	}
+
+	var ri *Column
+	for i := range pgClass.Columns {
+		if pgClass.Columns[i].Name == "relreplident" {
+			ri = &pgClass.Columns[i]
+			break
+		}
+	}
+	if ri == nil {
+		t.Fatal("pg_class.relreplident column not declared")
+	}
+	if ri.Type.Name != "char" {
+		t.Errorf("pg_class.relreplident type=%q want char", ri.Type.Name)
+	}
+
+	rows := pgClass.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("pg_class rows=%d want 1", len(rows))
+	}
+	if rows[0][ri.Ordinal] != "d" {
+		t.Errorf("pg_class.t.relreplident=%q want %q (REPLICA_IDENTITY_DEFAULT)", rows[0][ri.Ordinal], "d")
+	}
+}
+
+// TestPgClassOidIsNumericOID pins rung 16 of M0103-0008: pg_class.oid
+// must emit the table's numeric OID (as decimal text) so libpqrcv can
+// decode it via DatumGetObjectId. Pre-rung-16 the column stored the
+// relation name; PG's `lrel->remoteid = DatumGetObjectId(c.oid)` then
+// parsed "t" as uint32 → 0 and every downstream column-list LATERAL
+// probe matched zero rows, leaving the apply worker dormant.
+func TestPgClassOidIsNumericOID(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "t"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pgClass, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok {
+		t.Fatal("pg_catalog.pg_class missing")
+	}
+
+	var oidCol *Column
+	for i := range pgClass.Columns {
+		if pgClass.Columns[i].Name == "oid" {
+			oidCol = &pgClass.Columns[i]
+			break
+		}
+	}
+	if oidCol == nil {
+		t.Fatal("pg_class.oid column not declared")
+	}
+	if oidCol.Type.Name != "oid" {
+		t.Errorf("pg_class.oid type=%q want oid", oidCol.Type.Name)
+	}
+
+	rows := pgClass.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("pg_class rows=%d want 1", len(rows))
+	}
+	want := strconv.Itoa(int(tbl.OID))
+	if got := rows[0][oidCol.Ordinal]; got != want {
+		t.Errorf("pg_class.t.oid=%q want %q (numeric OID, M0103-0008 rung 16)", got, want)
 	}
 }
 

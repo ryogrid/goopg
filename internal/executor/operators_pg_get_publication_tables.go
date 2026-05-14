@@ -12,6 +12,7 @@ package executor
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -104,22 +105,31 @@ func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) 
 		}
 		tables := publicationTablesForCtx(ctx, pub)
 		for _, t := range tables {
-			// M0103-0008 rung 15: emit relid as the relation NAME so the
-			// JOIN `gpt.relid = c.oid` in CREATE SUBSCRIPTION's
-			// `fetch_table_list` matches goopg's `pg_class.oid` column —
-			// which v0 also stores as the relation name (see
-			// `catalog.go::registerSystemTables` and the design note at
-			// `catalog.go:707-712`: "regclass casts are no-ops in v0").
-			// Emitting the numeric `t.OID` made the join silently produce
-			// zero rows because `compareDatum(KindInt, KindString)` falls
-			// back to `Format()`-based string compare, which compares
-			// e.g. `"16384"` vs `"t"` and never matches. NULL is reserved
-			// for the corner case of an unresolved table (Name == "").
+			// M0103-0008 rung 16: emit relid as the table's numeric OID
+			// in decimal-text form (KindString). Two requirements have to
+			// hold simultaneously:
+			//
+			//   (a) the wire emit must be a decimal-text OID literal so
+			//       libpqrcv's `DatumGetObjectId(c.oid)` decodes a real
+			//       numeric OID instead of parsing "t" as uint32 → 0 and
+			//       silently sinking every column-list LATERAL probe;
+			//
+			//   (b) the internal JOIN `gpt.relid = c.oid` against the
+			//       virtual `pg_catalog.pg_class.oid` cell (which always
+			//       arrives KindString through buildVirtualValues) must
+			//       still match — and the hash-join key path
+			//       (`datumKey` in operators_join_agg.go) keys
+			//       KindString as `"s:16384"` but KindInt as
+			//       `"m:16384:0"`, so a KindInt/KindString mix would miss.
+			//
+			// Emitting decimal-text KindString satisfies both: wire-text
+			// OID for (a), KindString-equal hash key for (b). NULL is
+			// reserved for the unresolved-table corner case (t.OID == 0).
 			var relidDatum Datum
-			if t.Name == "" {
+			if t.OID == 0 {
 				relidDatum = NullDatum
 			} else {
-				relidDatum = NewStringDatum(t.Name)
+				relidDatum = NewStringDatum(strconv.Itoa(int(t.OID)))
 			}
 			rows = append(rows, Row{
 				relidDatum,

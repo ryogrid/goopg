@@ -2705,6 +2705,64 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       query then matches zero rows) is quoted verbatim in the
       `t.Skip` message so the next loop resumes from the exact
       surface.
+      PARTIAL PROGRESS 2026-05-14 (loop 18): closed rung 16 —
+      `pg_class.oid` numeric OID + `relreplident` column. Design
+      doc: `docs/design/0103-0022-pg-class-oid-numeric-and-relreplident.md`
+      (accepted).
+      Diagnosis: rung 15's text-name pg_class.oid convention made
+      libpqrcv's `lrel->remoteid = DatumGetObjectId(c.oid)` parse
+      "t" as uint32 → 0, sinking every subsequent column-list
+      LATERAL probe. Additionally `fetch_remote_table_info`'s
+      first sub-query selects `c.relreplident` which goopg's
+      virtual pg_class did not expose — the probe would have
+      failed with 42703 even before reaching the OID-decode path.
+      Changes:
+      - `internal/catalog/catalog.go::registerSystemTables`:
+        pg_class.oid column type `text` → `oid`, value emits
+        `strconv.Itoa(int(t.OID))` instead of `t.Name`. New
+        `relreplident char` column at ordinal 9, populated with
+        `"d"` (REPLICA_IDENTITY_DEFAULT). Cosmetic type-string
+        cleanup on `relnamespace`/`reltoastrelid` (`text` → `oid`)
+        and `relpages` (`text` → `int4`); the populated values
+        were already decimal text so no value-shape change.
+      - `internal/executor/operators_pg_get_publication_tables.go::
+        buildPgGetPublicationTablesRows`: relid now emits
+        `NewStringDatum(strconv.Itoa(int(t.OID)))` — both the
+        wire-text OID requirement AND the hash-join key parity
+        with pg_class.oid (`datumKey` keys KindString as
+        `"s:16384"` but KindInt as `"m:16384:0"`, so a
+        KindString/KindInt mix would miss). `t.OID == 0` still
+        maps to NullDatum.
+      - `internal/executor/expr.go`: `regclass` cast resolves a
+        text relation name to the numeric OID via
+        `ctx.Catalog.LookupTable` so pgbench-style
+        `oid=$1::regclass` shapes keep resolving correctly after
+        the v0 text-name flip. Numeric inputs pass through;
+        other `reg*` casts are unchanged stubs.
+      Tests:
+      - `internal/catalog/catalog_test.go::TestPgClassExposesRelReplident`
+        — pins column existence, declared type `char`, and
+        populated cell `"d"`.
+      - `internal/catalog/catalog_test.go::TestPgClassOidIsNumericOID`
+        — pins column type `oid` and cell value equals
+        `strconv.Itoa(t.OID)`.
+      - `internal/executor/operators_pg_get_publication_tables_test.go::
+        TestPgGetPublicationTablesRelidMatchesPgClassOid` —
+        updated from rung-15's text-name assertion to rung-16's
+        numeric-OID assertion (`rows[0][1].StringValue() ==
+        strconv.Itoa(int(tbl.OID))`).
+      Verification (loop 18): `go test -count=1 -timeout 300s
+      ./internal/catalog/ ./internal/executor/ ./internal/planner/
+      ./internal/analyzer/ ./internal/server/ ./internal/parser/
+      ./internal/wal/ ./internal/storage/` → all green.
+      `TestSlotDecoderRunDrivesPluginThroughCommit` is a known
+      pre-existing 2 s timing-sensitive flake (passes solo on
+      retry, also flakes on master); not introduced by this loop.
+      The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` was
+      updated with the rung-17 surface (next libpqrcv probe is
+      likely the pg_attribute / pg_get_replica_identity_index
+      column-types query) per the rung protocol so the next loop
+      resumes from the exact failing surface.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
