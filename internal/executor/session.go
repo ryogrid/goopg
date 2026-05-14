@@ -61,7 +61,9 @@ func NewBasicSession() *BasicSession {
 
 // SetIsolationLevel updates the default isolation level used by BEGIN.
 func (s *BasicSession) SetIsolationLevel(level mvcc.IsolationLevel) error {
-	if level != mvcc.IsolationReadCommitted && level != mvcc.IsolationRepeatableRead {
+	switch level {
+	case mvcc.IsolationReadCommitted, mvcc.IsolationRepeatableRead, mvcc.IsolationSerializable:
+	default:
 		return fmt.Errorf("executor: unsupported isolation level %v", level)
 	}
 	s.isolation = level

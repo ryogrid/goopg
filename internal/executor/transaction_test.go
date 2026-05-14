@@ -155,6 +155,32 @@ func TestTransactionBeginUsesSessionIsolation(t *testing.T) {
 	}
 }
 
+// TestTransactionBeginSerializableSession pins M0104-0001: a session
+// configured to SERIALIZABLE acquires a Transaction whose Isolation tag
+// is IsolationSerializable, not IsolationRepeatableRead. Downstream SSI
+// hooks (M0104-0002+) branch on this tag, so it must round-trip through
+// the executor BEGIN path.
+func TestTransactionBeginSerializableSession(t *testing.T) {
+	ctx := NewContext()
+	ctx.TxnMgr = mvcc.NewManager()
+	sess := NewBasicSession()
+	if err := sess.SetIsolationLevel(mvcc.IsolationSerializable); err != nil {
+		t.Fatal(err)
+	}
+	ctx.Session = sess
+
+	if err := runTransactionStmt(t, ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	tx, _, ok := sess.CurrentTransaction()
+	if !ok {
+		t.Fatal("expected active transaction after BEGIN")
+	}
+	if tx.Isolation != mvcc.IsolationSerializable {
+		t.Fatalf("tx isolation=%v want=%v", tx.Isolation, mvcc.IsolationSerializable)
+	}
+}
+
 func TestTransactionRequiresContextHooks(t *testing.T) {
 	ctx := NewContext()
 	ctx.TxnMgr = mvcc.NewManager()

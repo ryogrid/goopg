@@ -172,7 +172,9 @@ const xidMaxSafe = ^storage.TransactionID(0) - xidStopAge
 // to materialise one. Returns a Transaction with Handle != 0 and
 // XID == storage.InvalidTransactionID.
 func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
-	if iso != IsolationReadCommitted && iso != IsolationRepeatableRead {
+	switch iso {
+	case IsolationReadCommitted, IsolationRepeatableRead, IsolationSerializable:
+	default:
 		return Transaction{}, fmt.Errorf("mvcc: unsupported isolation level %v", iso)
 	}
 	m.mu.Lock()
@@ -246,7 +248,10 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 			state.snapshotXmin = s.Xmin
 		}
 		return s, nil
-	case IsolationRepeatableRead:
+	case IsolationRepeatableRead, IsolationSerializable:
+		// SERIALIZABLE shares snapshot acquisition with RR pending the
+		// predicate-lock substrate (M0104-0003); conflict detection
+		// will overlay on top of the pinned snapshot, not replace it.
 		if state.firstSnapshot == nil {
 			s := m.captureSnapshotLocked()
 			state.firstSnapshot = &s

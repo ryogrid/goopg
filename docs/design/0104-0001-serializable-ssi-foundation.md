@@ -1,6 +1,6 @@
 # 0104-0001 — Serializable (SSI) Foundation and GUC Parity
 
-**Status:** draft
+**Status:** in-progress (M0104-0001 landed 2026-05-14)
 **Date:** 2026-05-14
 **Milestone:** M0104
 **Tracks:** `.ralph/fix_plan.md` M0104-0001..M0104-0006
@@ -65,6 +65,41 @@ with SQLSTATE `40001`.
 - Preserve PostgreSQL GUC names and accepted textual values.
 - Stop mapping `serializable` to `IsolationRepeatableRead` in mvcc parsing.
 - Route SERIALIZABLE transactions through SSI registration/cleanup hooks.
+
+**M0104-0001 status (landed 2026-05-14):**
+
+- `mvcc.IsolationSerializable` added as a distinct enum constant; the
+  `(IsolationLevel).String()` round-trip now emits `"serializable"` rather
+  than `"repeatable read"` for SERIALIZABLE transactions.
+- `mvcc.ParseIsolationLevel("serializable")` returns
+  `IsolationSerializable` (no longer aliased to `IsolationRepeatableRead`).
+  Upstream weakening of READ UNCOMMITTED → READ COMMITTED is preserved.
+- `mvcc.Manager.Begin` accepts the new enum and stamps it onto the
+  returned `Transaction.Isolation`, so the SSI-aware code paths (M0104-0002+)
+  can branch on a single source of truth.
+- `mvcc.Manager.SnapshotFor` reuses the REPEATABLE READ pinned-snapshot
+  branch for `IsolationSerializable` deliberately: this is the SI
+  half of SSI; the predicate-lock / rw-edge overlay will be added on
+  top in M0104-0003..0005 without changing the snapshot acquisition
+  contract.
+- `executor.BasicSession.SetIsolationLevel` accepts
+  `IsolationSerializable`, so the BEGIN ISOLATION LEVEL / SET TRANSACTION
+  ISOLATION LEVEL plan paths round-trip the new tag onto the open
+  transaction.
+- `default_transaction_isolation` and `transaction_isolation` GUCs
+  already accepted `"serializable"` in `internal/config/defaults.go`
+  (PG enum parity, EnumOptions); no GUC-layer change was required.
+
+Regression coverage:
+
+- `internal/mvcc/manager_test.go::TestParseIsolationLevel` asserts the new
+  parse result.
+- `internal/mvcc/manager_test.go::TestSerializableDistinctFromRepeatableRead`
+  pins enum distinctness, `String()` parity, `Begin` acceptance, and the
+  RR-style pinned snapshot semantics for the first slice.
+- `internal/executor/transaction_test.go::TestTransactionBeginSerializableSession`
+  pins the executor BEGIN path tagging the active transaction with
+  `IsolationSerializable`.
 
 ### 2. Serializable transaction state
 

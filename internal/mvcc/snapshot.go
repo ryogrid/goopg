@@ -15,6 +15,12 @@ type IsolationLevel int
 const (
 	IsolationReadCommitted IsolationLevel = iota
 	IsolationRepeatableRead
+	// IsolationSerializable marks transactions that must satisfy
+	// PostgreSQL SERIALIZABLE semantics. M0104-0001 surfaces the level
+	// as a distinct enum value so downstream SSI hooks (M0104-0002+)
+	// can branch on it; snapshot acquisition currently matches
+	// REPEATABLE READ until the predicate-lock substrate lands.
+	IsolationSerializable
 )
 
 func (l IsolationLevel) String() string {
@@ -23,21 +29,27 @@ func (l IsolationLevel) String() string {
 		return "read committed"
 	case IsolationRepeatableRead:
 		return "repeatable read"
+	case IsolationSerializable:
+		return "serializable"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(l))
 	}
 }
 
-// ParseIsolationLevel accepts PostgreSQL-style names. For v0 we map
-// READ UNCOMMITTED to READ COMMITTED and SERIALIZABLE to the same
-// snapshot behavior as REPEATABLE READ.
+// ParseIsolationLevel accepts PostgreSQL-style names.
+//
+// READ UNCOMMITTED is folded to READ COMMITTED (upstream parity: weakest
+// isolation level we honor). SERIALIZABLE returns IsolationSerializable so
+// SSI-aware code paths (M0104) can distinguish it from REPEATABLE READ.
 func ParseIsolationLevel(v string) (IsolationLevel, error) {
 	key := strings.ToLower(strings.TrimSpace(v))
 	switch key {
 	case "read uncommitted", "read committed":
 		return IsolationReadCommitted, nil
-	case "repeatable read", "serializable":
+	case "repeatable read":
 		return IsolationRepeatableRead, nil
+	case "serializable":
+		return IsolationSerializable, nil
 	default:
 		return 0, fmt.Errorf("mvcc: unsupported isolation level %q", v)
 	}

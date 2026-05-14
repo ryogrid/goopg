@@ -16,7 +16,8 @@ func TestParseIsolationLevel(t *testing.T) {
 		{in: "read committed", want: IsolationReadCommitted},
 		{in: "READ UNCOMMITTED", want: IsolationReadCommitted},
 		{in: "repeatable read", want: IsolationRepeatableRead},
-		{in: "serializable", want: IsolationRepeatableRead},
+		{in: "serializable", want: IsolationSerializable},
+		{in: "SERIALIZABLE", want: IsolationSerializable},
 	}
 	for _, tc := range tests {
 		got, err := ParseIsolationLevel(tc.in)
@@ -118,6 +119,59 @@ func TestRepeatableReadPinsFirstSnapshot(t *testing.T) {
 
 	if err := m.Commit(txC); err != nil {
 		t.Fatal(err)
+	}
+	if err := m.Commit(txA); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSerializableDistinctFromRepeatableRead pins the M0104-0001
+// contract: ParseIsolationLevel returns a distinct enum value for
+// "serializable" so SSI-aware code can branch on it, but Begin must
+// accept it and snapshot acquisition currently matches REPEATABLE
+// READ semantics (one pinned snapshot for the lifetime of the txn).
+func TestSerializableDistinctFromRepeatableRead(t *testing.T) {
+	if IsolationSerializable == IsolationRepeatableRead {
+		t.Fatal("IsolationSerializable must be distinct from IsolationRepeatableRead")
+	}
+	if got := IsolationSerializable.String(); got != "serializable" {
+		t.Fatalf("IsolationSerializable.String()=%q want %q", got, "serializable")
+	}
+
+	m := NewManager()
+	txA, err := m.Begin(IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txA.Isolation != IsolationSerializable {
+		t.Fatalf("Transaction.Isolation=%v want %v", txA.Isolation, IsolationSerializable)
+	}
+	txB, err := m.Begin(IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xidB, err := m.AssignXID(txB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txB.XID = xidB
+
+	s1, err := m.SnapshotFor(txA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s1.HasInProgress(txB.XID) {
+		t.Fatalf("serializable snapshot did not include xid=%d", txB.XID)
+	}
+	if err := m.Commit(txB); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := m.SnapshotFor(txA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(s1, s2) {
+		t.Fatalf("serializable snapshot must pin (RR-like) for M0104-0001\nfirst=%+v\nnext=%+v", s1, s2)
 	}
 	if err := m.Commit(txA); err != nil {
 		t.Fatal(err)
