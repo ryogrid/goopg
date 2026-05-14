@@ -1883,7 +1883,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         with `-short` — ALL PASS (server 1.91 s, wal 2.00 s,
         executor 1.20 s).
 
-- [ ] **M0103-0007**
+- [x] **M0103-0007**
       - Summary: Scenario A E2E test: PG primary + goopg subscriber.
       - Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
       - File: `internal/testport/e2e_logical_failover_pg_to_goopg_test.go`,
@@ -3427,6 +3427,41 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         also works — strictly an upstream-PG study, not
         required for the goopg DoD), Scenario A milestone
         closure rung.
+      - CLOSED 2026-05-14 (loop 27): M0103-0007 SCENARIO A
+        PASSES END-TO-END. Design doc:
+        `docs/design/0103-0050-m0103-0007-scenario-a-closure.md`
+        (accepted). Both DoD invariants from
+        `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`
+        are pinned by live tests against an upstream PG 18.3
+        publisher: async bracket (`count(*) ∈ [killCommitted -
+        asyncLossBound + 1, killCommitted + 1]`,
+        `asyncLossBound = 50`) by
+        `TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync`
+        (rung 23, design 0103-0046); zero-loss strict equality
+        (`count(*) == killCommitted + 1`) by
+        `TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply`
+        (rung 26, design 0103-0049) via the path (b) sentinel-
+        count + eager standby-status push that sidesteps PG18's
+        logical-walsender `sync_priority=0` quirk. No production
+        change in this loop — both invariants already passed.
+        Test-name divergence from the milestone-spec'd
+        `TestE2E_LogicalFailoverPGtoGoopg` mirrors M0103-0008's
+        closure (which kept `TestPort_PgoutputInteropGoopgToPG`)
+        — same DoD content, different naming.
+      - Verification (loop 27):
+        `go test -count=1 -timeout 600s
+        -run "TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply|TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync"
+        ./internal/testport/` → PASS (~9.3 s);
+        `go test -count=1 -timeout 600s
+        -run TestPort_PgoutputInteropPGToGoopg
+        ./internal/testport/` → all 26-rung suite PASS (~38.5 s);
+        `go test -race -count=1 -timeout 300s
+        ./internal/server/ ./internal/executor/ ./internal/wal/
+        ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+        → all green.
+      - With M0103-0007 closed, the only remaining sub-milestone
+        in M0103 is M0103-0009 (close milestone — CSV row
+        additions and inventory bump).
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.
