@@ -114,6 +114,19 @@ func (o *transactionOp) execCommit() error {
 			}
 		}
 	}
+	// M0104-0007: SSI pre-commit dangerous-structure check for SERIALIZABLE.
+	// Runs BEFORE TxnMgr.Commit so a detected rw-cycle can be translated to
+	// SQLSTATE 40001 and rolled back here without burning a commit record.
+	// Helper returns nil for RC/RR and write-less SERIALIZABLE xacts.
+	if ssiErr := ssiPreCommitCheck(o.ctx, tx); ssiErr != nil {
+		_ = o.ctx.TxnMgr.Rollback(tx)
+		o.ctx.Session.EndExplicitTransaction()
+		o.clearCtxTransaction()
+		if ee, ok := ssiErr.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return ssiErr
+	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}

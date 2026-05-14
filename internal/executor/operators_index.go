@@ -353,6 +353,11 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// currentTID() — lockRowsOp stamps the live version.
 		o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}
 		o.hasLast = true
+		// M0104-0007: SSI read-path hook on the HOT-resolved live slot.
+		// Helper short-circuits for RC/RR; for SERIALIZABLE this installs a
+		// tuple-grain predicate lock and an rw-conflict edge to the writer
+		// identified by the visible tuple's xmin.
+		ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin)
 		// M0092-0007: stack-aliased slot — reuse o.slot across
 		// every Next() call. Caller must consume / Materialize
 		// before the next Next() invocation.

@@ -372,6 +372,12 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
 				continue
 			}
+			// M0104-0007: SSI read-path hook. Tuple is visible to this
+			// reader — install a tuple-grain SIREAD predicate lock and an
+			// rw-conflict edge to the producing writer (xmin). Helper
+			// short-circuits to a single inline check for RC/RR readers.
+			// curSlot was already advanced past the just-fetched slot.
+			ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin)
 			// M0054-0005a: decode into the reusable o.scanRow
 			// buffer. M0073-0004: route varchar / char / text /
 			// bytea payload through the per-page arena so per-
@@ -654,6 +660,11 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					if werr != nil {
 						return nil, werr
 					}
+					// M0104-0007: SSI write-path hook on the newly inserted
+					// tuple's (block, slot). Conflict-in installs an rw-edge
+					// against any concurrent SERIALIZABLE reader that holds a
+					// covering predicate lock (page or relation grain).
+					ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
 					maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 					o.appendInsertRetRow(row)
 					o.rowsAffected++
@@ -666,6 +677,8 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		if werr != nil {
 			return nil, werr
 		}
+		// M0104-0007: SSI write-path hook for the non-partitioned insert path.
+		ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
 		o.appendInsertRetRow(row)
 		o.rowsAffected++
@@ -1633,6 +1646,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			} // end epq retry loop
 		} // end if !used
 		if !epqSkipSeq {
+			// M0104-0007: SSI write-path hook on the prior live slot of the
+			// updated tuple. Covers both HOT-update (in-place new version,
+			// xmax stamped on old) and non-HOT (xmax stamp + writeHeapRow)
+			// paths — the rw-conflict target is the SLOT that any concurrent
+			// SERIALIZABLE reader would have predicate-locked.
+			ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot)
 			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
 		}
@@ -1858,6 +1877,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
+			// M0104-0007: SSI write-path hook on the deleted tuple's slot.
+			// The rw-conflict target is the slot a concurrent SERIALIZABLE
+			// reader would have predicate-locked before the xmax stamp.
+			ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot)
 			o.appendDeleteRetRow(v.row)
 			o.rowsAffected++
 		}

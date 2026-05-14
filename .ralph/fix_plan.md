@@ -1815,16 +1815,79 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
         optimisation skipped — conservative absence is only false
         positives); 2PC PREPARE TRANSACTION interactions.
 
-- [ ] **M0104-0007**
-      - Summary: Oracle isolation-test promotion for SSI coverage.
-      - Promote applicable deferred D-002 serializable/predicate specs to
-        pass-required and verify stable passing in `internal/testport`.
+- [x] **M0104-0007**
+      - Summary: Executor-side SSI hook wiring.
+      - Closed 2026-05-14: `internal/executor/ssi.go` introduces three helpers
+        (`ssiActive`, `ssiRecordTupleRead`, `ssiRecordTupleWrite`,
+        `ssiPreCommitCheck`) each guarded by an inline isolation-level test
+        so RC/RR readers/writers/commits short-circuit before any
+        `mvcc.Manager` call. Read-path helper calls
+        `Manager.AcquirePredicateLock(handle, TupleLockTag(...))` then
+        `Manager.CheckForSerializableConflictOut(handle, writerXmin)`.
+        Write-path helper calls
+        `Manager.CheckForSerializableConflictIn(handle, TupleLockTag(...))`.
+        Both filter `block == InvalidBlockNumber || slot == 0` before
+        `mvcc.TupleLockTag` (which panics on those invariants by design)
+        to absorb the slot-0 edge case `seqScanOp` surfaces via
+        `curSlot - 1`. `ssiPreCommitCheck` wraps
+        `mvcc.SerializationFailureError` as
+        `*ExecError{Code: "40001"}` with the upstream "could not
+        serialize access due to read/write dependencies among
+        transactions" prefix so the wire layer surfaces SQLSTATE 40001.
+        Wiring sites — read path: `seqScanOp.Next` post-visibility before
+        decode (uses `curSlot-1`); `indexScanOp.Next` post-HOT-resolution
+        after page RLock release (target = `actualSlot`, not the index-
+        pointed slot). Write path: `insertOp.Next` for both non-
+        partitioned and partition-routed paths after
+        `writeHeapRowReturning` returns the new tuple's `ItemPointer`;
+        `updateOp.Next` at a single post-EPQ-loop site so HOT and non-HOT
+        both fire with the converged `pu.slot` (the rw-conflict target
+        a concurrent SERIALIZABLE reader would have predicate-locked);
+        `deleteOp.Next` after the `epqSkipDel` filter so concurrent-abort
+        victims do not register a phantom rw-edge. Commit path:
+        `transactionOp.execCommit` runs `ssiPreCommitCheck` AFTER the
+        deferred-FK check and BEFORE `TxnMgr.Commit`; on detection it
+        drives `TxnMgr.Rollback` + `Session.EndExplicitTransaction` +
+        `clearCtxTransaction` before returning the 40001 `ExecError`,
+        so the session exits the explicit-tx state with rollback
+        semantics and no commit record is burned.
+      - Regression pins (`internal/executor/ssi_test.go`):
+        `TestSSI_RecordTupleRead_NoOpForRC`,
+        `TestSSI_RecordTupleRead_NoOpForRR`,
+        `TestSSI_RecordTupleRead_AcquiresPredicateLockForSerializable`
+        (read-path acquire + peer SERIALIZABLE write through write-path
+        helper → R→W edge installed end-to-end via the executor helpers),
+        `TestSSI_RecordTupleRead_InvalidTagFiltered`
+        (`InvalidBlockNumber` / slot==0 absorbed before `TupleLockTag`
+        would panic), `TestSSI_RecordTupleRead_ZeroHandleSkipped`
+        (Handle==0 short-circuits even when isolation is SERIALIZABLE),
+        `TestSSI_ExecCommit_ReturnsSerializationFailureWhenDoomed`
+        (`BEGIN SERIALIZABLE` + `MarkDoomedForTest` + `COMMIT` →
+        `ExecError{Code:"40001"}` + session cleared + `ActiveCount==0`),
+        `TestSSI_ExecCommit_NoOpForRC`,
+        `TestSSI_ExecCommit_HappyPathForSerializable` (no false positive
+        on isolated SERIALIZABLE). Design doc:
+        `docs/design/0104-0007-executor-ssi-wiring.md`. Out of scope for
+        this slice (staged for M0104-0008/beyond): non-user-facing
+        visibility-check sites (FK / DDL / ANALYZE / MERGE / ON CONFLICT
+        / apply-worker / TOAST); index-target predicate locks for btree
+        range-boundary phantom detection; oracle isolation-test
+        promotion (multi-session SQL-driven write-skew tests own the
+        D-002 harness and ship as M0104-0008); upstream's
+        `OnConflict_CheckForSerializationFailure` per-edge synchronous
+        check (the polarity-agnostic `registerRWConflictLocked` helper is
+        the natural injection point if latency-sensitive workloads need
+        the earlier abort).
 
 - [ ] **M0104-0008**
-      - Summary: Milestone closeout.
-      - Update milestone/design statuses and index rows, run required regression
-        gates, and close M0104 only after SERIALIZABLE anomaly-prevention DoD is
-        evidenced.
+      - Summary: Oracle isolation-test promotion for SSI coverage +
+        milestone closeout.
+      - Promote applicable deferred D-002 serializable/predicate specs to
+        pass-required and verify stable passing in `internal/testport`
+        (multi-session SQL-driven write-skew tests exercise the
+        M0104-0007 executor wiring end-to-end). Then update milestone /
+        design statuses and index rows and close M0104 once the
+        SERIALIZABLE anomaly-prevention DoD is evidenced.
 
 ## Completed
 
