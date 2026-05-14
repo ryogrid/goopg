@@ -90,3 +90,23 @@ func TestDiscoverIsolationSpecs(t *testing.T) {
 		t.Fatalf("paths=%d want 2", len(paths))
 	}
 }
+
+// TestNormalizeBoolWireText pins the lib/pq Go-bool → wire-text reversal that
+// keeps IsolationRunner output byte-identical to upstream PostgreSQL's
+// PQprint format for BOOL columns. M0100-0005.
+func TestNormalizeBoolWireText(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"true", "t"},
+		{"false", "f"},
+		{"t", "t"},   // already in wire form (defensive)
+		{"f", "f"},   // already in wire form (defensive)
+		{"", ""},     // NULL sentinel — caller already checked .Valid
+		{"True", "True"}, // pq always lowercases Go bool — anything else is opaque text
+	}
+	for _, c := range cases {
+		got := normalizeBoolWireText(c.in)
+		if got != c.want {
+			t.Errorf("normalizeBoolWireText(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

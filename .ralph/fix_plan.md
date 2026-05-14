@@ -1118,8 +1118,21 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         - formatStepOutput writes NOTICEs BEFORE step SQL line (correct ordering)
         - writeCompletedStep writes NOTICEs BEFORE <... completed> marker
         - NOTICE propagation: executePLpgSQLRoutine propagates child → parent notices
-        But notices are not appearing in test output (possible goopg trigger/RAISE NOTICE
-        issue or pq timing issue). Needs further investigation.
+        Server-side trigger NOTICE emission works end-to-end (confirmed via
+        `internal/server/notice_test.go` — all 7 patterns including
+        TestNoticeSeparateConnectionsIsolationMimic and TestNoticeSpecSetupSQL
+        pass). Pending NOTICE diffs on isolation suites are caused by the
+        IsolationRunner's wait-state plumbing for `<waiting ...>` interleaving,
+        not by trigger emission itself.
+        - BOOL wire-text reversal (M0100-0005a, 2026-05-14): IsolationRunner
+        now reverses lib/pq's bool decode so SELECT-ed `boolean` columns render
+        as `t`/`f` (matching upstream PQprint) instead of `true`/`false`.
+        Server-side wire format was already correct — fix is harness-only at
+        `internal/testport/framework/isolation_runner.go::normalizeBoolWireText`.
+        Removes BOOL diffs from insert-conflict-do-update-3 and any spec
+        SELECTing bool columns. Regression pinned by
+        `TestNormalizeBoolWireText`. Design:
+        `docs/design/0100-0005a-isolation-runner-bool-wire-text-reversal.md`.
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait

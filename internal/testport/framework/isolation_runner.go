@@ -402,10 +402,17 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 
 	colTypes, _ := rows.ColumnTypes()
 	numericCols := make([]string, len(cols))
+	boolCols := make([]bool, len(cols))
 	for i := range cols {
 		numericCols[i] = "text"
-		if i < len(colTypes) && isNumericType(colTypes[i].DatabaseTypeName()) {
-			numericCols[i] = "numeric"
+		if i < len(colTypes) {
+			dbType := colTypes[i].DatabaseTypeName()
+			if isNumericType(dbType) {
+				numericCols[i] = "numeric"
+			}
+			if dbType == "BOOL" {
+				boolCols[i] = true
+			}
 		}
 	}
 
@@ -428,6 +435,9 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 		for i, v := range vals {
 			if v.Valid {
 				row[i] = v.String
+				if boolCols[i] {
+					row[i] = normalizeBoolWireText(row[i])
+				}
 			}
 		}
 		result.rows = append(result.rows, row)
@@ -609,6 +619,26 @@ func flattenSQL(s string) string {
 	// normalizeIsoOutput strips trailing whitespace from each line, so any
 	// trailing space on the "step name: " line is removed automatically.
 	return "\n" + strings.TrimRight(s, " \t\n")
+}
+
+// normalizeBoolWireText converts lib/pq's "true"/"false" rendering back to
+// PostgreSQL's standard wire-text "t"/"f". M0100-0005.
+//
+// Why: lib/pq decodes BOOL wire bytes ("t"/"f") into Go bool, which
+// database/sql then renders as "true"/"false" via convertAssign. Upstream
+// PostgreSQL isolationtester (libpq PQprint) prints the raw wire bytes,
+// so it sees "t"/"f". Reversing pq's automatic decode keeps the
+// IsolationRunner output byte-identical to upstream's expected files for
+// specs that select BOOL columns (e.g. insert-conflict-do-update-3's
+// `is_active boolean`).
+func normalizeBoolWireText(s string) string {
+	switch s {
+	case "true":
+		return "t"
+	case "false":
+		return "f"
+	}
+	return s
 }
 
 // isNumericType reports whether dbTypeName is a numeric PostgreSQL type.
