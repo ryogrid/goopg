@@ -1630,26 +1630,39 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       directly). The previous goopg decoder required `'K'` or `'O'`
       after rel_oid and rejected such messages. `wal.DecodeMessage`
       now treats the K/O block as optional and accepts both shapes.
-      Encoder symmetry NOT yet fixed: `pgoutput.go::writeUpdate` /
-      `writeDelete` still emit `'K' | natts=0` when no old tuple is
-      provided — a malformed `'K'` per upstream proto.c. This
-      surfaces only on the goopg-publisher path (subtest b) and is
-      tracked as part of the deferred work below.
-      Subtest (b) is `t.Skip` pending: (i)
-      `replyCreateReplicationSlot` accepting `LOGICAL pgoutput`
-      (currently returns `feature_not_supported`); (ii) the
-      writeUpdate/writeDelete encoder fix to omit the K/O marker when
-      no old tuple exists; (iii) a small bring-up harness that
-      spawns a real PG subscriber and runs `CREATE SUBSCRIPTION`
-      against goopg.
-      Verification: `go test -count=1 -timeout 120s
+      Encoder symmetry FIXED 2026-05-14 loop 2: `pgoutput.go::writeUpdate`
+      no longer emits the malformed `'K' | natts=0` placeholder. When no
+      old tuple exists (REPLICA IDENTITY DEFAULT, no key column modified),
+      the encoder now emits `'U' rel_oid 'N' new_tuple` directly, matching
+      `proto.c::logicalrep_write_update` byte-for-byte. Pinned by
+      `TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN` in
+      `internal/wal/pgoutput_test.go`. `writeDelete`'s K-fallback is
+      retained as a defensive guard (DELETE always carries a key tuple
+      in well-formed callers; the guard avoids a panic without obscuring
+      a real bug from a PG subscriber).
+      CREATE_REPLICATION_SLOT LOGICAL pgoutput FIXED 2026-05-14 loop 2:
+      `replyCreateReplicationSlot` (`internal/server/replication.go`) now
+      parses the upstream grammar `[TEMPORARY] LOGICAL output_plugin
+      [EXPORT_SNAPSHOT|NOEXPORT_SNAPSHOT|USE_SNAPSHOT] [TWO_PHASE]`,
+      creates a `wal.SlotLogical` slot, and returns the four-column reply
+      with `output_plugin = "pgoutput"`. Only `pgoutput` is accepted; other
+      plugin names land with `feature_not_supported`. Pinned by
+      `TestReplicationCreateLogicalSlot` /
+      `TestReplicationCreateLogicalSlotRejectsUnknownPlugin` in
+      `internal/server/replication_test.go`.
+      Subtest (b) is still `t.Skip`, now pending only (iii): a bring-up
+      harness that spawns a real PG subscriber and runs `CREATE
+      SUBSCRIPTION` against goopg. That harness is the same one needed
+      by M0103-0007/0008 and will land alongside `pubsubcluster`
+      (M0103-0006); subtest (b) becomes a thin wrapper once that lands.
+      Verification (2026-05-14 loop 2): `go test -count=1 -timeout 120s
       -run TestPort_PgoutputInterop -v ./internal/testport/` →
       `TestPort_PgoutputInteropPGToGoopg` PASS,
-      `TestPort_PgoutputInteropGoopgToPG` SKIP. Regression coverage
-      green: `go test -count=1 -race -timeout 120s ./internal/wal/
-      ./internal/server/ ./internal/executor/ ./internal/catalog/`
-      → all pass (wal 2.981 s, server 3.440 s, executor 2.545 s,
-      catalog 1.019 s).
+      `TestPort_PgoutputInteropGoopgToPG` SKIP (waiting on M0103-0006
+      harness). Regression coverage green: `go test -count=1 -race
+      -timeout 300s ./internal/wal/ ./internal/server/
+      ./internal/executor/ ./internal/catalog/` → all pass (wal 3.035 s,
+      server 3.605 s, executor 2.621 s, catalog 1.021 s).
 
 - [ ] **M0103-0005** — Logical-walsender SyncRep integration.
       Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`.

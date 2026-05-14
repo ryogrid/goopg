@@ -179,9 +179,13 @@ func TestPort_PgoutputInteropPGToGoopg(t *testing.T) {
 }
 
 func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
-	t.Skip("M0103-0004(b) deferred: requires CREATE_REPLICATION_SLOT LOGICAL " +
-		"wire support on goopg (replyCreateReplicationSlot currently rejects " +
-		"LOGICAL with feature_not_supported). Tracked in .ralph/fix_plan.md.")
+	t.Skip("M0103-0004(b) deferred: CREATE_REPLICATION_SLOT LOGICAL pgoutput " +
+		"now works on goopg and the writeUpdate encoder emits the " +
+		"upstream-compatible no-old-tuple shape (verified by " +
+		"TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN). Remaining blocker " +
+		"is the bring-up harness that spawns a real PG subscriber and runs " +
+		"CREATE SUBSCRIPTION against a goopg publisher — landing alongside " +
+		"the pubsubcluster harness in M0103-0006. Tracked in .ralph/fix_plan.md.")
 }
 
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.

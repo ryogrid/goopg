@@ -225,6 +225,66 @@ func TestReplicationCreateAndDropSlot(t *testing.T) {
 	}
 }
 
+
+// TestReplicationCreateLogicalSlot covers CREATE_REPLICATION_SLOT
+// name LOGICAL pgoutput (M0103-0004): a libpq subscriber sends this
+// immediately after the startup handshake when CREATE SUBSCRIPTION
+// runs against goopg-as-publisher. The reply must include the
+// `output_plugin` column populated with "pgoutput" (PHYSICAL returns
+// NULL there); `snapshot_name` is NULL in v0.
+func TestReplicationCreateLogicalSlot(t *testing.T) {
+	addr, slots, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT sub_a LOGICAL pgoutput NOEXPORT_SNAPSHOT`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("CREATE_REPLICATION_SLOT first frame = %c, want T", frames[0].Type)
+	}
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("CREATE_REPLICATION_SLOT second frame = %c, want D", frames[1].Type)
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if len(cells) != 4 {
+		t.Fatalf("LOGICAL CREATE row col count = %d, want 4", len(cells))
+	}
+	if string(cells[0]) != "sub_a" {
+		t.Errorf("slot_name = %q, want sub_a", cells[0])
+	}
+	if cells[2] != nil {
+		t.Errorf("snapshot_name = %q, want NULL (v0 has no snapshot exporter)", cells[2])
+	}
+	if string(cells[3]) != "pgoutput" {
+		t.Errorf("output_plugin = %q, want pgoutput", cells[3])
+	}
+	// Backing store must show a LOGICAL slot.
+	slot, err := slots.Get("sub_a")
+	if err != nil {
+		t.Fatalf("slots.Get(sub_a): %v", err)
+	}
+	if slot.Kind != wal.SlotLogical {
+		t.Errorf("slot.Kind = %v, want SlotLogical", slot.Kind)
+	}
+}
+
+// TestReplicationCreateLogicalSlotRejectsUnknownPlugin: only `pgoutput`
+// is accepted; other plugin names land with feature_not_supported so
+// the libpq client gets a deterministic error rather than a hang.
+func TestReplicationCreateLogicalSlotRejectsUnknownPlugin(t *testing.T) {
+	addr, _, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT sub_b LOGICAL test_decoding`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgErrorResponse {
+		t.Fatalf("unknown plugin first frame = %c, want E", frames[0].Type)
+	}
+}
+
 // TestReplicationSlotInvalidName: server must reject CREATE with a
 // non-conforming name via ErrorResponse, then continue serving.
 func TestReplicationSlotInvalidName(t *testing.T) {

@@ -183,23 +183,85 @@ func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string
 			"CREATE_REPLICATION_SLOT requires a slot name and a kind")
 	}
 	name := unquoteIdent(tokens[0])
-	kind := strings.ToUpper(tokens[1])
-	if kind != "PHYSICAL" {
-		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
-			fmt.Sprintf("CREATE_REPLICATION_SLOT %s is not supported in v0 (PHYSICAL only)", kind))
+
+	// Upstream grammar:
+	//   CREATE_REPLICATION_SLOT slot_name [TEMPORARY]
+	//     { PHYSICAL [RESERVE_WAL]
+	//     | LOGICAL output_plugin
+	//         [EXPORT_SNAPSHOT|NOEXPORT_SNAPSHOT|USE_SNAPSHOT] [TWO_PHASE] }
+	//
+	// v0 accepts TEMPORARY (slot lifetime is process-bound regardless;
+	// the keyword is acknowledged but does not currently auto-drop on
+	// disconnect — that is a documented follow-up). RESERVE_WAL is
+	// accepted as a no-op. The snapshot option (when present) is
+	// acknowledged but `snapshot_name` is always returned NULL since
+	// goopg does not yet ship a snapshot exporter.
+	idx := 1
+	if strings.EqualFold(tokens[idx], "TEMPORARY") {
+		idx++
+		if idx >= len(tokens) {
+			return s.writeQueryError(w, sqlstate.SyntaxError,
+				"CREATE_REPLICATION_SLOT TEMPORARY requires PHYSICAL or LOGICAL")
+		}
 	}
+	kind := strings.ToUpper(tokens[idx])
+	idx++
+
+	var slotKind wal.SlotKind
+	var plugin string
+	switch kind {
+	case "PHYSICAL":
+		slotKind = wal.SlotPhysical
+		// Tolerate trailing RESERVE_WAL (no-op).
+		for idx < len(tokens) {
+			if !strings.EqualFold(tokens[idx], "RESERVE_WAL") {
+				return s.writeQueryError(w, sqlstate.SyntaxError,
+					fmt.Sprintf("unexpected token %q after PHYSICAL", tokens[idx]))
+			}
+			idx++
+		}
+	case "LOGICAL":
+		slotKind = wal.SlotLogical
+		if idx >= len(tokens) {
+			return s.writeQueryError(w, sqlstate.SyntaxError,
+				"CREATE_REPLICATION_SLOT LOGICAL requires an output plugin name")
+		}
+		plugin = unquoteIdent(tokens[idx])
+		idx++
+		if !strings.EqualFold(plugin, "pgoutput") {
+			return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+				fmt.Sprintf("logical output plugin %q is not supported (pgoutput only)", plugin))
+		}
+		// Trailing options: EXPORT_SNAPSHOT | NOEXPORT_SNAPSHOT |
+		// USE_SNAPSHOT | TWO_PHASE. All accepted as no-ops in v0;
+		// snapshot_name is returned NULL.
+		for idx < len(tokens) {
+			opt := strings.ToUpper(tokens[idx])
+			switch opt {
+			case "EXPORT_SNAPSHOT", "NOEXPORT_SNAPSHOT", "USE_SNAPSHOT", "TWO_PHASE":
+				idx++
+			default:
+				return s.writeQueryError(w, sqlstate.SyntaxError,
+					fmt.Sprintf("unexpected token %q after LOGICAL pgoutput", tokens[idx]))
+			}
+		}
+	default:
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			fmt.Sprintf("CREATE_REPLICATION_SLOT %s is not supported (PHYSICAL or LOGICAL pgoutput)", kind))
+	}
+
 	var startLSN uint64
 	if s.cfg.WAL != nil {
 		startLSN = s.cfg.WAL.WrittenLSN()
 	}
-	slot, err := s.cfg.Slots.Create(name, wal.SlotPhysical, startLSN)
+	slot, err := s.cfg.Slots.Create(name, slotKind, startLSN)
 	if err != nil {
 		return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
 	}
 	// Upstream replies with (slot_name, consistent_point, snapshot_name,
 	// output_plugin). For PHYSICAL, snapshot_name and output_plugin
-	// are NULL; consistent_point is the LSN at which the slot was
-	// reserved.
+	// are NULL. For LOGICAL, snapshot_name is NULL in v0 and
+	// output_plugin echoes the requested plugin.
 	if err := w.WriteRowDescription([]protocol.FieldDescription{
 		{Name: "slot_name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
 		{Name: "consistent_point", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
@@ -208,11 +270,15 @@ func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string
 	}); err != nil {
 		return err
 	}
+	var pluginCol []byte
+	if slotKind == wal.SlotLogical {
+		pluginCol = []byte(plugin)
+	}
 	row := [][]byte{
 		[]byte(slot.Name),
 		[]byte(formatLSN(slot.RestartLSN)),
 		nil,
-		nil,
+		pluginCol,
 	}
 	if err := w.WriteDataRow(row); err != nil {
 		return err

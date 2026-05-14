@@ -1,6 +1,6 @@
 # 0103-0003 — pgoutput Wire-Byte Interoperability (PG ↔ goopg, Both Directions)
 
-**Status:** partial — subtest (a) landed 2026-05-14; subtest (b) deferred
+**Status:** partial — subtest (a) landed 2026-05-14 loop 1; encoder + slot-creation prerequisites for subtest (b) landed 2026-05-14 loop 2; subtest (b) bring-up harness pending (M0103-0006)
 **Date:** 2026-05-13 (initial), 2026-05-14 (partial impl)
 **Milestone:** M0103-0004
 **Upstream reference:** `postgres/src/backend/replication/pgoutput/pgoutput.c` (`pgoutput_change`, `pgoutput_begin`, `pgoutput_commit`, `pgoutput_message`), `postgres/src/backend/replication/logical/proto.c` (`logicalrep_write_insert`, `logicalrep_write_update`, `logicalrep_write_delete`, `logicalrep_write_rel`, `logicalrep_read_*`), `postgres/src/include/replication/logicalproto.h` (message format constants).
@@ -180,37 +180,62 @@ with `"update old-tuple type=%q want K or O"`. Fixed in
 `internal/wal/pgoutput_decoder.go::DecodeMessage` by treating the
 `'K'`|`'O' + old_tuple` block as optional.
 
-### Encoder asymmetry NOT yet fixed (blocks subtest b)
+### Encoder asymmetry — **FIXED 2026-05-14 loop 2**
 
-`internal/wal/pgoutput.go::writeUpdate` and `writeDelete` still emit
-`'K' | uint16(0)` when no old tuple is provided. Per upstream
+`internal/wal/pgoutput.go::writeUpdate` previously emitted
+`'K' | uint16(0)` when no old tuple was provided. Per upstream
 `proto.c::logicalrep_write_update`, the K/O marker must be **omitted
 entirely** when no old tuple exists — emitting `'K'` with a zero-attr
-tuple is protocol-illegal and PG's apply worker will reject it. Fix
-required when subtest (b) is implemented: in writeUpdate, skip the
-K/O block when `oldTuple == nil`; in writeDelete, fall back to a
-synthetic K-tuple with key-column metadata (or just always require
-an oldTuple, since logical DELETE always has at least the key).
+tuple is protocol-illegal and PG's apply worker rejects it because
+the tuple's `ncols` field must equal the relation's declared column
+count, not 0. Fixed by skipping the K/O block when `oldTuple == nil`
+and emitting `'U' rel_oid 'N' new_tuple` directly. Pinned by
+`TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN` in
+`internal/wal/pgoutput_test.go`.
 
-### Subtest (b) — `TestPort_PgoutputInteropGoopgToPG` — **SKIPPED**
+`writeDelete`'s zero-attr K fallback remains as a defensive guard,
+not as a normal path: in well-formed DML the caller always provides a
+key tuple (REPLICA IDENTITY DEFAULT/INDEX) or the full row (REPLICA
+IDENTITY FULL). The guard avoids a server-side panic if a caller ever
+violates that contract; a real PG subscriber would reject the
+resulting message, which is the desired loud failure. A follow-up
+loop may upgrade the guard to a hard error once every caller path is
+audited.
 
-Three prerequisites stand between the current state and a passing
-subtest (b):
+### CREATE_REPLICATION_SLOT LOGICAL pgoutput — **FIXED 2026-05-14 loop 2**
 
-1. Wire support for `CREATE_REPLICATION_SLOT … LOGICAL pgoutput`.
-   `internal/server/replication.go::replyCreateReplicationSlot`
-   currently rejects every non-PHYSICAL kind with
-   `feature_not_supported`. Must call `wal.Slots.CreateLogical`,
-   plumb the `pgoutput` plugin name through, and return the
-   four-column reply (slot_name, consistent_point, snapshot_name,
-   output_plugin) with output_plugin populated.
-2. The writeUpdate/writeDelete encoder fix above.
-3. A small harness step that runs `CREATE SUBSCRIPTION` from a real
-   PG subscriber against the goopg primary and polls the
-   subscriber's `t` table for rows.
+`internal/server/replication.go::replyCreateReplicationSlot` now
+parses the upstream grammar
+`CREATE_REPLICATION_SLOT slot_name [TEMPORARY] LOGICAL output_plugin
+[EXPORT_SNAPSHOT|NOEXPORT_SNAPSHOT|USE_SNAPSHOT] [TWO_PHASE]`, calls
+`Slots.Create(name, wal.SlotLogical, currentLSN)`, and returns the
+four-column reply (`slot_name`, `consistent_point`, `snapshot_name`
+NULL, `output_plugin` = "pgoutput"). Only `pgoutput` is accepted as
+the plugin — other plugin names land with `feature_not_supported`.
+The TEMPORARY and snapshot keywords are syntactically accepted but
+not semantically distinguished in v0 (TEMPORARY does not yet auto-
+drop on disconnect; snapshot exporting is not implemented). Pinned
+by `TestReplicationCreateLogicalSlot` and
+`TestReplicationCreateLogicalSlotRejectsUnknownPlugin` in
+`internal/server/replication_test.go`.
 
-These are tracked as the residual M0103-0004(b) work in
-`.ralph/fix_plan.md` and will land in a follow-up loop.
+### Subtest (b) — `TestPort_PgoutputInteropGoopgToPG` — **STILL SKIPPED**
+
+With (i) and (ii) above resolved, the remaining blocker is the
+bring-up harness:
+
+- A test step that spawns a real PG subscriber, runs
+  `CREATE SUBSCRIPTION sub_a CONNECTION '<goopg-conninfo>'
+  PUBLICATION p` against the goopg primary, waits for the subscriber
+  to apply a known INSERT/UPDATE/DELETE pattern, and polls the
+  subscriber's `t` table for rows.
+
+This harness is the same one needed by M0103-0007/0008's failover
+tests and is therefore being landed alongside `pubsubcluster`
+(M0103-0006) rather than duplicated inline here. Once
+`pubsubcluster` exists, subtest (b) becomes a thin wrapper that
+exercises the publisher path and confirms PG decodes goopg's
+emitted bytes end-to-end.
 
 ## Risks
 
