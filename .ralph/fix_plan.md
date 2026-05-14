@@ -1562,6 +1562,37 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `InsertConflictDoNothing`, `PartitionKeyUpdate1` unchanged
           (4/4 still PASS). Design:
           `docs/design/0100-0005r-insert-runtime-unique-constraint.md`.
+        - INSERT … ON CONFLICT waits for in-flight xmax on a visible match
+          (M0100-0005s, 2026-05-15 loop 35). `internal/executor/operators_upsert.go`
+          `findInProgressConflict` is extended to also surface
+          visible-being-deleted tuples (xmin settled — committed-to-snapshot
+          or our own xact — AND xmax non-lock-only, non-self, still active
+          in the live txn manager). `probeArbiterWaiting` is reordered so the
+          in-progress check runs BEFORE the visible-probe; a visible-but-
+          being-deleted match no longer short-circuits as a settled conflict
+          (which previously made `INSERT … ON CONFLICT DO NOTHING` return
+          immediately and silently skip the insert even though upstream's
+          `_bt_check_unique` would have waited on the in-flight xmax). The
+          reorder is benign for the already-passing paths: settled conflicts
+          still flow through `probeArbiter` for the final decision, and
+          in-flight insert detection (Case 1, in-flight xmin) is unchanged.
+          Closes the missing `<waiting ...>` line on the
+          `partition-key-update-2.spec` family; full close of that spec
+          additionally requires `upsertOp` partition routing (separate scope
+          — the parent's arbiter index isn't sufficient for partitioned
+          tables). Regression pin:
+          `TestUpsertDoNothing_WaitsForInFlightDelete` in
+          `internal/server/upsert_waits_inflight_xmax_test.go` (s2 INSERT
+          asserted to block ≥250 ms on s1's in-flight DELETE, then complete
+          within 5 s of s1 COMMIT, with fresh-conn SELECT showing exactly
+          `(1,'new')`).  `go test -count=1 -race ./internal/executor/
+          ./internal/storage/ ./internal/server/ ./internal/mvcc/
+          ./internal/planner/ ./internal/parser/ ./internal/analyzer/
+          ./internal/wal/` PASS; adjacent isolation tests
+          `LockCommittedUpdate`, `InsertConflictDoUpdate`,
+          `InsertConflictDoNothing`, `PartitionKeyUpdate1` unchanged
+          (4/4 still PASS). Design:
+          `docs/design/0100-0005s-upsert-waits-inflight-xmax.md`.
         - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
           `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
           the row's source `*catalog.Table` through pending records

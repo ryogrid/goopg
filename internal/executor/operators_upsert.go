@@ -263,17 +263,14 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 // concurrent isolation tests.
 func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.ItemPointer, Row, bool, error) {
 	for {
-		ptr, row, found, err := o.probeArbiter(rel, cols, inserted)
-		if err != nil || found {
-			return ptr, row, found, err
-		}
-		// No visible conflict. Check for in-progress tuples that
-		// could become conflicts once the other transaction finishes.
+		// First look for an in-progress transaction that could change
+		// the probe outcome (in-flight insert with our key, or
+		// in-flight delete of a visible match). If one exists, wait
+		// for it to settle and re-probe under a fresh snapshot.
 		inProgressXID, hasInProgress := o.findInProgressConflict(rel, cols, inserted)
 		if !hasInProgress {
-			return storage.ItemPointer{}, nil, false, nil
+			return o.probeArbiter(rel, cols, inserted)
 		}
-		// Wait for the in-progress transaction to complete.
 		qctx := o.ctx.Ctx
 		if qctx == nil {
 			qctx = context.Background()
@@ -284,7 +281,6 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 				return storage.ItemPointer{}, nil, false, nil
 			}
 		}
-		// After the other transaction ended, refresh the snapshot and re-probe.
 		if o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
 			if snap, serr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); serr == nil {
 				o.ctx.Snap = snap.Clone()
@@ -304,6 +300,7 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 	if err != nil || key == nil {
 		return 0, false
 	}
+	selfXID := o.ctx.Tx.XID
 	var foundXID storage.TransactionID
 	_ = o.arbiterTree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
@@ -318,12 +315,27 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 			return true, nil
 		}
 		xmin := tuple.Header.Xmin
-		// Use the live manager active-set (not the snapshot InProgress
-		// list) so we also catch XIDs that were materialised after this
-		// session's snapshot was taken (M0100-0002).
-		if xmin != storage.InvalidTransactionID && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmin) {
+		xmax := tuple.Header.Xmax
+		// Case 1: in-flight insert (xmin still active, not us). Use the live
+		// manager active-set (not the snapshot InProgress list) so we also
+		// catch XIDs that were materialised after this session's snapshot
+		// was taken (M0100-0002).
+		if xmin != storage.InvalidTransactionID && xmin != selfXID && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmin) {
 			foundXID = xmin
-			return false, nil // stop scanning
+			return false, nil
+		}
+		// Case 2: visible-being-deleted. The tuple's xmin is already settled
+		// from this snapshot's view (committed or our own xact), and xmax is
+		// a non-lock-only in-flight non-self xact — i.e. someone is in the
+		// middle of deleting (or cross-partition-moving) what would otherwise
+		// be a real arbiter conflict. Upstream `_bt_check_unique` waits on
+		// this xmax to determine whether the apparent conflict survives.
+		if xmax != storage.InvalidTransactionID && xmax != selfXID && !storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+			xminSettled := xmin == selfXID || (o.ctx.Snap.SeesCommittedXID(xmin))
+			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+				foundXID = xmax
+				return false, nil
+			}
 		}
 		return true, nil
 	})
