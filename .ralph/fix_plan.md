@@ -3232,12 +3232,112 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         ./internal/testport/` → all 10
         `TestPort_PgoutputInteropPGToGoopg*` rungs PASS
         (~33.9 s total). `go build ./...` clean.
-      - Next rungs (deferred within M0103-0007):
-        `sync_remote_apply` subtest (zero-loss
-        `count(*) == killCommitted + 1` invariant, requires
-        logical SyncRep wait integration), proto_version=2
-        streaming subxacts, column-ref-typed `nextval` args,
-        binary-format pgoutput.
+      - PARTIAL PROGRESS 2026-05-14 (rung 25): apply-worker
+        `application_name` plumbing for sync rep + Scenario A
+        `sync_remote_apply` skeleton. Lands the load-bearing
+        goopg-side infrastructure needed for PG's
+        `synchronous_standby_names = '<sub>'` rule to recognise
+        the apply worker by name; the live E2E for the zero-loss
+        DoD is currently `t.Skip` because of an upstream-PG18
+        sync-rep priority puzzle (see deferred-within-scope
+        note). Design doc:
+        `docs/design/0103-0048-m0103-0007-rung-25-pgbench-kill-sync-remote-apply.md`
+        (accepted, partial).
+      - Changes:
+        - `internal/server/logicalreceiver.go::LogicalReceiverConfig`
+          gains an `ApplicationName string` field. When
+          non-empty, `LogicalReceiver.handshake` sends it as the
+          `application_name` startup parameter so the publisher's
+          `pg_stat_replication` row and any matching
+          `synchronous_standby_names` rule see this apply worker
+          under its subscription-configured name. Empty value
+          preserves pre-M0103-0005 behaviour.
+        - `internal/server/applylauncher.go::DefaultLaunchApplyWorker`
+          populates the new field. The previous
+          `_ = appName // SyncRep wiring lands in M0103-0005`
+          placeholder is gone. New helper
+          `resolveApplyWorkerApplicationName(parsedAppName,
+          subName)`: explicit `application_name=<value>` from the
+          subscription's `Conninfo` wins; fall back to the
+          subscription name itself (mirrors upstream libpqrcv's
+          `walrcv_application_name`).
+        - `internal/testutil/pubsubcluster/cluster.go::SyncModeRemoteApply`
+          previously injected BOTH `synchronous_standby_names =
+          '<app>'` AND `synchronous_commit = remote_apply` into
+          the publisher's `postgresql.conf` at cluster init.
+          That deadlocks the harness: PG's default
+          `synchronous_commit = on` is effectively `remote_flush`
+          whenever `synchronous_standby_names` is non-empty, so
+          the very first DDL commit (CREATE TABLE / CREATE
+          PUBLICATION) waits for an apply confirmation from a
+          standby that has not yet been created. Rung 25 splits
+          the injection: now writes
+          `synchronous_standby_names = '<app>'` +
+          `synchronous_commit = local` (the latter short-circuits
+          the sync wait at the cluster level). Tests that want
+          sync semantics opt every commit into the wait
+          per-session via `SET synchronous_commit = remote_apply`
+          AFTER the apply worker is connected.
+      - Pins:
+        - `TestResolveApplyWorkerApplicationName` (4 fallback
+          cases) and
+          `TestLogicalReceiverConfigCarriesApplicationName`
+          (round-trips the new field through `NewLogicalReceiver`
+          so a future refactor that drops the wiring fails
+          loudly) in
+          `internal/server/applylauncher_test.go`.
+        - `TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply`
+          in `internal/testport/pgoutput_interop_test.go` —
+          carries the full Scenario A sync-subtest sequence
+          (publisher + subscriber bring-up, sync-state wait,
+          sustained workload under per-session remote_apply,
+          mid-flight SIGKILL, multi-host fall-through INSERT,
+          count-stabilisation poll, strict-equality assertion).
+          Currently `t.Skip` with the verbatim PG18 diagnosis
+          quoted in its docstring so the next rung can resume
+          from the exact failing surface.
+      - Deferred-within-scope (the rung-26 surface):
+        Repeated runs of the live E2E (under multiple
+        `synchronous_standby_names` shapes: bare identifier,
+        `FIRST 1 (name)`, `*` wildcard) consistently produce
+        `pg_stat_replication.sync_priority=0 /
+        sync_state=async` for goopg's logical-replication
+        walsender despite GUC=`pg2g_ksync` (or `'*'`),
+        `state=streaming`, `application_name` matching by
+        `pg_strcasecmp`, `pg_is_in_recovery()=false`, and
+        `pg_terminate_backend()`-triggered reconnects all
+        reproducing the priority-0 state. Per PG18's
+        `SyncRepGetCandidateStandbys` line 798 a priority-0
+        walsender is skipped from the candidate list, so
+        `SyncRepReleaseWaiters` never fires and any session-
+        level `remote_apply` commit hangs indefinitely. Most
+        likely cause: per-process `SyncRepConfig` lifecycle
+        quirk for logical walsenders. Closing requires either
+        (a) understanding PG18's `SyncRepConfig` ordering well
+        enough to drive `SyncRepInitConfig` into setting
+        `MyWalSnd->sync_standby_priority > 0` (principled fix),
+        or (b) replacing the publisher-side
+        `SyncRepReleaseWaiters` dependency with a goopg-side
+        polling invariant on `pg_stat_replication.apply_lsn ≥
+        commit_lsn` after each writer-goroutine INSERT returns
+        (natural fallback). Both paths preserve the "zero loss
+        at SIGKILL" outcome.
+      - Verification (rung 25):
+        `go test -count=1 -timeout 60s -run "TestResolveApplyWorkerApplicationName|TestLogicalReceiverConfigCarriesApplicationName|TestParseSubscriptionConninfo" -v ./internal/server/`
+        → PASS (3/3 in 0.006 s).
+        `go test -count=1 -timeout 300s ./internal/server/ ./internal/testutil/pubsubcluster/ ./internal/executor/ ./internal/wal/ ./internal/catalog/`
+        → all green (server 1.839 s, pubsubcluster 4.462 s,
+        executor 1.201 s, wal 1.950 s, catalog 0.005 s). Race-
+        tested on server + pubsubcluster → green (3.487 s,
+        4.694 s). All 10 `TestPort_PgoutputInteropPGToGoopg*`
+        rungs (1–24) still PASS together (~33.6 s).
+        `go build ./...` clean.
+      - Next rungs (deferred within M0103-0007): rung 26 closes
+        the PG18 sync-rep priority puzzle (path (a) or (b)
+        above) and flips the live E2E to a positive assertion;
+        proto_version=2 streaming subxacts, column-ref-typed
+        `nextval` args, binary-format pgoutput, Scenario A
+        milestone closure.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

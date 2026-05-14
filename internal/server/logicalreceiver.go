@@ -59,6 +59,14 @@ type LogicalReceiverConfig struct {
 	// connections still authenticate; v0 ships trust by default.
 	User string
 
+	// ApplicationName, when non-empty, is sent as the
+	// `application_name` startup parameter so the publisher's
+	// pg_stat_replication row and any matching
+	// synchronous_standby_names rule see this apply worker under
+	// its subscription-configured name. Empty means "no
+	// application_name parameter", matching pre-M0103-0005 behaviour.
+	ApplicationName string
+
 	// SlotName names the logical replication slot to acquire.
 	// The slot must already exist on the publisher (M0008 /
 	// 0008-0001 loop 1's `Slots.CreateLogical`).
@@ -245,6 +253,9 @@ func (r *LogicalReceiver) handshake() error {
 	params := map[string]string{
 		"user":        r.cfg.User,
 		"replication": "database",
+	}
+	if r.cfg.ApplicationName != "" {
+		params["application_name"] = r.cfg.ApplicationName
 	}
 	if err := r.w.WriteStartupMessage(params); err != nil {
 		return fmt.Errorf("logicalreceiver: write startup: %w", err)

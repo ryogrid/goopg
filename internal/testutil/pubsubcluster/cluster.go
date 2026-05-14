@@ -152,13 +152,31 @@ func NewMixed(t *testing.T, name string, opts Options) *PubSubCluster {
 
 	psc := &PubSubCluster{name: name, opts: opts}
 
-	// Publisher: must allow logical decoding + the
-	// synchronous_standby_names rule when the sync subtest runs.
+	// Publisher: must allow logical decoding + name the apply worker as
+	// a sync-eligible standby when the sync subtest runs. Two subtle
+	// points:
+	//
+	//   1. PG's default `synchronous_commit = on` is effectively
+	//      `remote_flush` whenever `synchronous_standby_names` is
+	//      non-empty: every commit waits for the named standby to
+	//      flush. That deadlocks the harness's first DDL transaction
+	//      (CREATE TABLE / CREATE PUBLICATION) against a standby that
+	//      has not yet been created. So we pin
+	//      `synchronous_commit = local` at the cluster level — DDL
+	//      runs without sync wait, sync_state still flips to 'sync'
+	//      once the apply worker connects with the matching
+	//      application_name.
+	//   2. Tests that want sync-wait semantics MUST opt in per-session
+	//      via `SET synchronous_commit = remote_apply` (or
+	//      remote_write) AFTER the apply worker is connected and
+	//      sync_state has flipped. The harness deliberately does not
+	//      paint that on the cluster as a default to keep the
+	//      "publisher up, no standby yet" window non-deadlocking.
 	pubExtra := []string{}
 	if opts.SyncMode == SyncModeRemoteApply {
 		pubExtra = append(pubExtra,
 			fmt.Sprintf("synchronous_standby_names = '%s'", opts.ApplicationName),
-			"synchronous_commit = remote_apply",
+			"synchronous_commit = local",
 		)
 	}
 	pub, err := newPeer(t, name+"-pub", baseDir, opts.PublisherKind, opts, pubExtra, true /*publisher*/)

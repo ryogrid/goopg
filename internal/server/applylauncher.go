@@ -261,7 +261,7 @@ func DefaultLaunchApplyWorker(ctx context.Context, cfg ApplyLauncherConfig, sub 
 	if addr == "" {
 		return fmt.Errorf("apply worker %q: conninfo has no host:port", sub.Name)
 	}
-	_ = appName // SyncRep wiring lands in M0103-0005.
+	appName = resolveApplyWorkerApplicationName(appName, sub.Name)
 
 	apply := executor.NewApplyWorker(cfg.Catalog, cfg.Pool, cfg.TxnMgr)
 	apply.SetSubscriptionContext(cfg.PubSub, sub.Name)
@@ -283,15 +283,32 @@ func DefaultLaunchApplyWorker(ctx context.Context, cfg ApplyLauncherConfig, sub 
 	// lifecycle so a publisher restart or transient network blip
 	// no longer terminates the apply worker (M0103-0003).
 	rec := NewLogicalReceiver(LogicalReceiverConfig{
-		PrimaryAddr:  addr,
-		User:         cfg.User,
-		SlotName:     slotName,
-		Publications: sub.Publications,
-		StartLSN:     startLSN,
-		Apply:        apply,
+		PrimaryAddr:     addr,
+		User:            cfg.User,
+		ApplicationName: appName,
+		SlotName:        slotName,
+		Publications:    sub.Publications,
+		StartLSN:        startLSN,
+		Apply:           apply,
 	})
 	defer apply.SafeRollback()
 	return rec.Run(ctx)
+}
+
+// resolveApplyWorkerApplicationName picks the application_name the
+// apply worker should advertise in its libpq startup packet. The
+// conninfo's explicit `application_name=...` wins; otherwise we fall
+// back to the subscription name itself. Empty subscription names yield
+// an empty string — callers may treat that as "no application_name
+// parameter sent". Mirrors upstream libpqrcv's
+// `walrcv_application_name` semantics so PG's `pg_stat_replication`
+// keys on a stable, predictable identifier and any
+// `synchronous_standby_names = '<sub>'` rule matches by default.
+func resolveApplyWorkerApplicationName(parsedAppName, subName string) string {
+	if parsedAppName != "" {
+		return parsedAppName
+	}
+	return subName
 }
 
 // parseSubscriptionConninfo extracts host:port and the application_name

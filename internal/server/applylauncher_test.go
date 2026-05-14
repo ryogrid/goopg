@@ -298,6 +298,57 @@ func TestParseSubscriptionConninfo(t *testing.T) {
 	}
 }
 
+// TestResolveApplyWorkerApplicationName pins the appName fallback used
+// by DefaultLaunchApplyWorker: explicit `application_name=` in the
+// conninfo wins; otherwise the subscription name fills in. Empty both
+// yields empty (caller treats that as "no application_name parameter
+// sent"). Closes the rung-25 wiring so a subscriber's logical apply
+// worker reaches PG keyed under a stable identifier — load-bearing for
+// any future sync-rep rule of the form
+// `synchronous_standby_names = '<sub>'`.
+func TestResolveApplyWorkerApplicationName(t *testing.T) {
+	cases := []struct {
+		parsed string
+		sub    string
+		want   string
+	}{
+		{"", "", ""},
+		{"", "my_sub", "my_sub"},
+		{"override", "my_sub", "override"},
+		{"override", "", "override"},
+	}
+	for _, c := range cases {
+		got := resolveApplyWorkerApplicationName(c.parsed, c.sub)
+		if got != c.want {
+			t.Errorf("resolve(%q, %q) = %q want %q", c.parsed, c.sub, got, c.want)
+		}
+	}
+}
+
+// TestLogicalReceiverConfigCarriesApplicationName guards the
+// LogicalReceiverConfig.ApplicationName field that
+// DefaultLaunchApplyWorker now populates. Without this field, the apply
+// worker's libpq startup packet would omit `application_name=`, PG's
+// pg_stat_replication would key on an empty name, and any
+// `synchronous_standby_names = '<sub>'` rule on the publisher would
+// never match. Pin is a value-roundtrip via NewLogicalReceiver so a
+// future refactor that drops the wiring fails loudly.
+func TestLogicalReceiverConfigCarriesApplicationName(t *testing.T) {
+	cfg := LogicalReceiverConfig{
+		PrimaryAddr:     "127.0.0.1:5432",
+		User:            "postgres",
+		ApplicationName: "my_sub",
+		SlotName:        "my_sub",
+	}
+	r := NewLogicalReceiver(cfg)
+	if r == nil {
+		t.Fatal("NewLogicalReceiver returned nil")
+	}
+	if got := r.cfg.ApplicationName; got != "my_sub" {
+		t.Errorf("LogicalReceiver.cfg.ApplicationName = %q, want %q", got, "my_sub")
+	}
+}
+
 // waitFor polls `cond` at 10 ms intervals until it returns true or the
 // deadline elapses. Returns whether the condition fired.
 func waitFor(t *testing.T, d time.Duration, cond func() bool) bool {

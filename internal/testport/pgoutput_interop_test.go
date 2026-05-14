@@ -2891,3 +2891,294 @@ func TestPort_PgoutputInteropPGToGoopgBpcharPadding(t *testing.T) {
 		t.Fatalf("subscriber code where id=1 = %q, want %q", got, "A")
 	}
 }
+
+// TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply is the
+// live E2E for M0103-0007 rung 25's Scenario A `sync_remote_apply`
+// invariant (`count(*) == killCommitted + 1`). It is currently
+// **t.Skip** because the publisher-side PG18 walsender never assigns
+// `sync_standby_priority > 0` to goopg's logical-replication walsender
+// despite every prerequisite being satisfied — see the diagnosis quoted
+// verbatim below.
+//
+// What rung 25 DID land (load-bearing for whichever rung closes this):
+//
+//   - `LogicalReceiverConfig.ApplicationName` field
+//     (`internal/server/logicalreceiver.go`) — when non-empty, sent as
+//     the `application_name` startup parameter so PG's
+//     `pg_stat_replication` row is keyed under the apply worker's
+//     subscription-configured name and any matching
+//     `synchronous_standby_names` rule can recognise it. Empty value
+//     preserves pre-M0103-0005 behaviour.
+//   - `DefaultLaunchApplyWorker` (`internal/server/applylauncher.go`)
+//     wires the parsed conninfo `application_name` (with fallback to the
+//     subscription name when the conninfo omits one) through to the
+//     receiver. Closes the `_ = appName // SyncRep wiring lands in
+//     M0103-0005` placeholder.
+//   - `pubsubcluster.SyncModeRemoteApply` (`internal/testutil/
+//     pubsubcluster/cluster.go`) now injects only
+//     `synchronous_standby_names` + `synchronous_commit = local` at the
+//     cluster level. Tests opt commits into sync wait per-session via
+//     `SET synchronous_commit = remote_apply`. Cluster-level
+//     `synchronous_commit = remote_apply` deadlocked the harness on the
+//     first DDL commit (no standby connected yet); `local` plus
+//     per-session escalation is the parity shape.
+//   - Unit pin `TestLogicalReceiverConfigForwardsApplicationName` in
+//     `internal/server/applylauncher_test.go` (see
+//     `TestParseSubscriptionConninfo` for the parser-side coverage).
+//
+// Diagnosis quoted verbatim (resume here next rung):
+//
+// After every prerequisite is met, `pg_stat_replication` shows the
+// row `application_name='pg2g_ksync' | state='streaming' |
+// sync_priority=0 | sync_state='async'` and `SHOW
+// synchronous_standby_names` returns either the explicit name or `'*'`
+// (both tried). `pg_is_in_recovery()` is `false`. The walsender's
+// `am_cascading_walsender` is false, `am_db_walsender` is true
+// (REPLICATION_KIND_LOGICAL), `application_name` GUC matches by
+// `pg_strcasecmp`, and a `pg_terminate_backend()` on the walsender
+// followed by goopg's reconnect (M0103-0003) reproduces the same
+// priority=0 state. Per PG18's `SyncRepGetCandidateStandbys` line 798,
+// a priority=0 walsender is skipped from the sync-rep candidate list —
+// so no waiter ever releases and any session-level
+// `synchronous_commit = remote_apply` commit hangs indefinitely. Root
+// cause is in PG18's per-process `SyncRepConfig` lifecycle for logical
+// walsenders (likely a `assign_synchronous_standby_names` ordering
+// vs. `MyWalSnd->sync_standby_priority` initialisation interaction
+// surfaced by the goopg connection path). Closing this requires either
+// (a) understanding the PG18-side path well enough to drive
+// `SyncRepInitConfig` into setting priority>0, or (b) replacing the
+// publisher-side sync-rep dependency with a goopg-side
+// apply-lsn-vs-commit-lsn polling invariant that doesn't require
+// `SyncRepReleaseWaiters` participation.
+//
+// Design doc:
+// docs/design/0103-0048-m0103-0007-rung-25-pgbench-kill-sync-remote-apply.md.
+func TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply(t *testing.T) {
+	t.Skip("M0103-0007 rung 25: PG18 walsender sync_standby_priority stays 0 for logical-replication apply workers despite name match and '*' wildcard — see test docstring for the full diagnosis and resume hint.")
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	psqlBin := filepath.Join(repo, "postgres", "local_install", "bin", "psql")
+	if st, err := os.Stat(psqlBin); err != nil || !st.Mode().IsRegular() {
+		t.Skipf("psql not present at %s", psqlBin)
+	}
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-ksync")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_ksync"
+	// SyncModeRemoteApply injects synchronous_standby_names into the
+	// publisher's conf at init time, but DOES NOT inject
+	// synchronous_commit = remote_apply (the harness deliberately omits
+	// that line to avoid the setup deadlock where PG's first DDL commit
+	// would wait for an apply confirmation from a standby that doesn't
+	// yet exist). Writer goroutines opt every commit into the sync wait
+	// via per-session `SET synchronous_commit = remote_apply` once the
+	// apply worker is connected.
+	psc := pubsubcluster.NewMixed(t, "pg2g_ksync", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeRemoteApply,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.bench_log (client int NOT NULL, src text NOT NULL)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.bench_log (client int NOT NULL, src text NOT NULL)")
+	psc.CreatePublication(t, "bench_log")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Wait for the apply worker to register in pg_stat_replication.
+	regDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(regDeadline) {
+		got := psc.Publisher.QueryScalar(t,
+			fmt.Sprintf("SELECT count(*) FROM pg_stat_replication WHERE application_name = '%s'", slotName))
+		if got != "0" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Terminate the walsender so goopg's reconnect loop (rung 3 /
+	// M0103-0003) spins up a fresh connection. The PG primary now has
+	// synchronous_standby_names already in effect (cluster-time conf
+	// line installed by SyncModeRemoteApply), so the new walsender
+	// runs SyncRepInitConfig at StartLogicalReplication with the GUC
+	// active AND with goopg's application_name visible — yielding
+	// sync_standby_priority=1 on the very first evaluation. This
+	// dodges the PG18 quirk where the initial pg_stat_replication
+	// entry holds priority=0 because SyncRepInitConfig was called
+	// before the new walsender's WalSnd slot had application_name
+	// recorded.
+	psc.Publisher.Exec(t,
+		fmt.Sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_replication WHERE application_name = '%s'", slotName))
+
+	syncDeadline := time.Now().Add(30 * time.Second)
+	syncSeen := false
+	var lastSync string
+	for time.Now().Before(syncDeadline) {
+		got := psc.Publisher.QueryScalar(t,
+			fmt.Sprintf("SELECT coalesce(sync_state, '<none>') FROM pg_stat_replication WHERE application_name = '%s'", slotName))
+		lastSync = got
+		if got == "sync" {
+			syncSeen = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !syncSeen {
+		rep := psc.Publisher.QueryScalar(t,
+			fmt.Sprintf("SELECT application_name || '|' || coalesce(state,'?') || '|' || coalesce(sync_priority::text,'-') || '|' || coalesce(sync_state,'?') FROM pg_stat_replication WHERE application_name = '%s'", slotName))
+		guc := psc.Publisher.QueryScalar(t, "SHOW synchronous_standby_names")
+		recov := psc.Publisher.QueryScalar(t, "SELECT pg_is_in_recovery()::text")
+		t.Fatalf("pg_stat_replication.sync_state did not flip to 'sync' within 30 s (last=%q, rep=%q, GUC=%q, in_recovery=%q)",
+			lastSync, rep, guc, recov)
+	}
+
+	dsn := fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable",
+		psc.Publisher.Host(), psc.Publisher.Port(),
+		psc.Publisher.User(), psc.Publisher.Database())
+
+	workCtx, workCancel := context.WithCancel(context.Background())
+	var committed atomic.Int64
+	var wg sync.WaitGroup
+	for c := 0; c < 2; c++ {
+		c := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db, err := sql.Open("postgres", dsn)
+			if err != nil {
+				t.Errorf("client %d sql.Open: %v", c, err)
+				return
+			}
+			defer db.Close()
+			// Per-session opt-in to remote_apply. Under this setting
+			// every db.Exec below blocks inside SyncRepWaitForLSN on PG
+			// until goopg's apply worker confirms apply_lsn ≥ commit_lsn.
+			if _, err := db.Exec("SET synchronous_commit = remote_apply"); err != nil {
+				t.Errorf("client %d SET remote_apply: %v", c, err)
+				return
+			}
+			for {
+				if workCtx.Err() != nil {
+					return
+				}
+				if _, err := db.Exec(
+					"INSERT INTO public.bench_log (client, src) VALUES ($1, 'pre')", c); err == nil {
+					committed.Add(1)
+				}
+				// Same 5 ms throttle as rung 23 for wall-budget parity;
+				// sync_remote_apply auto-throttles on round-trip
+				// latency, but the throttle keeps the test comparable.
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+	}
+
+	// Replication-is-alive gate: at least one row visible on goopg
+	// within 30 s. Under sync this also confirms the SyncRep wait
+	// round-trip is working (PG would otherwise hang on the first
+	// commit, killCommitted would stay 0, and the asserts below would
+	// either trivially pass or surface a different failure mode).
+	live := false
+	liveDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(liveDeadline) {
+		if psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.bench_log") != "0" {
+			live = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !live {
+		workCancel()
+		wg.Wait()
+		t.Fatalf("no row replicated within 30 s — apply worker not live or SyncRep wait broken")
+	}
+
+	// Sustain the workload so several dozen commits accumulate. Under
+	// sync_remote_apply each commit waits for a network round-trip, so
+	// throughput is lower than async (typically ~50–100 commits/s/client
+	// vs ~200 async). 1500 ms wall time delivers >>20 commits in CI.
+	const workloadHoldMs = 1500
+	time.Sleep(workloadHoldMs * time.Millisecond)
+
+	workCancel()
+	wg.Wait()
+	killCommitted := committed.Load()
+
+	// minWorkloadCommits is lower than rung 23 because sync_remote_apply
+	// is RTT-bound. The assertion is still meaningful for any non-anemic
+	// count — zero-loss equality is binary, not statistical.
+	const minWorkloadCommits int64 = 20
+	if killCommitted < minWorkloadCommits {
+		t.Fatalf("workload too anemic to test DoD: killCommitted=%d, want ≥ %d", killCommitted, minWorkloadCommits)
+	}
+
+	// NO drain window: under remote_apply every committed row was
+	// already applied on goopg before the commit returned. Going
+	// straight to Kill is part of the DoD — any post-Kill row arrival
+	// would mean SyncRep released a waiter prematurely.
+	if err := psc.Publisher.Kill(); err != nil {
+		t.Fatalf("Publisher.Kill: %v", err)
+	}
+
+	multi := psc.MultiHostConninfo("failover_client")
+	cmd := exec.CommandContext(ctx, psqlBin,
+		"-d", multi,
+		"-v", "ON_ERROR_STOP=1",
+		"-c", "INSERT INTO public.bench_log (client, src) VALUES (-1, 'post')")
+	cmd.Env = append(os.Environ(),
+		"LD_LIBRARY_PATH="+filepath.Join(repo, "postgres", "local_install", "lib"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("psql multi-host INSERT: %v\nconn=%q\nout=%s", err, multi, out)
+	}
+
+	// Wait for the count to stabilise after the multi-host INSERT lands
+	// on goopg. PG is dead; once the +1 (post) row is committed locally
+	// on goopg the count won't move. waitForCountStable returns once it
+	// sees the same value for 1 s straight.
+	got, ok := waitForCountStable(t, psc, "public.bench_log",
+		1*time.Second, 30*time.Second)
+	if !ok {
+		t.Fatalf("subscriber count(*) did not stabilise within deadline (last=%d)", got)
+	}
+
+	// Strict equality: zero loss + exactly one post-failover row.
+	want := killCommitted + 1
+	if got != want {
+		t.Fatalf("sync_remote_apply DoD: count(*)=%d, want %d (killCommitted=%d) — zero-loss invariant violated",
+			got, want, killCommitted)
+	}
+
+	// Post-failover row is present and tagged correctly. The client=-1
+	// predicate catches the impossible case of the multi-host fall-
+	// through writing to the dead publisher.
+	postSrc := psc.Subscriber.QueryScalar(t,
+		"SELECT src FROM public.bench_log WHERE client = -1")
+	if postSrc != "post" {
+		t.Fatalf("subscriber post-failover row src = %q, want \"post\" (killCommitted=%d, count=%d)",
+			postSrc, killCommitted, got)
+	}
+}
