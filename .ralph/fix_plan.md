@@ -2377,6 +2377,88 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       Begin/Commit emission for xacts with zero in-publication
       changes, catalog-snapshot timing for relations created after
       slot creation.
+      PARTIAL PROGRESS 2026-05-14 (loop 12): closed rung 11 —
+      `publication_names` quoted-identifier unquoting. Design doc:
+      `docs/design/0103-0016-publication-names-splitidentifier.md`
+      (accepted).
+      Diagnosis: dropping the `t.Skip` after rung 10 produced the
+      same observable failure mode (apply worker connects, no rows
+      replicate). Diagnostic logging added to
+      `buildPublicationFilter`, `runLogicalWalsender` (filter
+      contents), and `PgOutput.Change` revealed that the filter
+      was being built with `pubNames = [`"p"`]` — the publication
+      name itself carried embedded double-quotes.
+      `PubSub.LookupPublication(`"p"`)` returned `ok=false` because
+      the registry key is `p`, so the resulting filter had
+      `byTable = map[]` and `allTablesAllowed = {false,false,false}`,
+      and every decoded change was silently rejected. libpq's
+      logical-replication client emits
+      `START_REPLICATION SLOT "g2pg_sub" LOGICAL 0/<lsn>
+      (proto_version '4', publication_names '"p"')` — each name
+      inside `publication_names` is wrapped in double-quotes so
+      names containing commas remain safe to split. Upstream
+      PG's pgoutput parses the option via
+      `SplitIdentifierString(rawstring, ',', ...)` (varlena.c),
+      which strips the surrounding `"..."` and lowercases unquoted
+      identifiers. goopg's `splitPublicationNames` shortcut to
+      `strings.Split(raw, ',')` + `TrimSpace`, keeping the quotes
+      verbatim.
+      Changes:
+      - `internal/server/logicalwalsender.go::splitPublicationNames`:
+        rewritten as a rune-walk that mirrors
+        `SplitIdentifierString`'s semantics — on a leading `"`,
+        reads a quoted identifier with `""` collapsing into `"`
+        and the next bare `"` as terminator; otherwise reads an
+        unquoted identifier until separator/whitespace and
+        `strings.ToLower`s it. Whitespace around each entry is
+        tolerated; lenient on consecutive `,,` so the legacy
+        permissive behaviour (the existing
+        `TestSplitPublicationNamesTrimsAndDropsEmpty` test
+        contract) stays intact; returns `nil` on unterminated
+        quote or junk-after-identifier so the caller stays on the
+        "no publication matched ⇒ empty filter" path. New helper
+        `unicodeIsSpace` mirrors PG's `scanner_isspace`.
+      Tests (in
+      `internal/server/logicalwalsender_test.go`):
+      - `TestSplitPublicationNamesQuotedIdentifiers` (11
+        sub-cases): single quoted name, multiple quoted names,
+        doubled-quote escape `""` → `"`, unquoted lowercased,
+        unquoted-multi case lowering, quoted case preserved,
+        whitespace tolerance, empty input, all-whitespace input,
+        trailing comma allowed, mixed quoted+unquoted.
+      - `TestSplitPublicationNamesSyntaxErrorsReturnNil`: pins
+        the `nil` fallback for unterminated quote and
+        junk-after-identifier shapes.
+      - `TestSplitPublicationNamesTrimsAndDropsEmpty` (existing):
+        unchanged — verifies the legacy permissive contract still
+        holds for the lenient `,,` path.
+      Verification (loop 12): `go test -race -count=1 -timeout
+      300s ./internal/parser/ ./internal/planner/
+      ./internal/analyzer/ ./internal/executor/ ./internal/server/
+      ./internal/wal/ ./internal/catalog/` → all green (parser
+      1.060 s, planner 1.077 s, analyzer 1.041 s, executor
+      2.632 s, server 3.526 s, wal 3.049 s, catalog 1.021 s).
+      Live-probe run (with `t.Skip` removed for diagnosis only)
+      confirmed the failure mode shifted observably: Insert
+      (kind=4) and Delete (kind=6) records now flow through
+      `pgoutput.Change` and reach the apply worker; UPDATE
+      (`RecordKindHeapHotUpdate` kind=13) and the first INSERT
+      into a freshly-allocated heap page (emitted as
+      `RecordKindPageImage` kind=1 + `RecordKindBtreeInsert`
+      kind=5) are still silently dropped because
+      `internal/wal/classifier.go::Classify` has no cases for
+      those record kinds. The `t.Skip` was restored with the
+      rung-11 closure note and the rung-12 diagnosis quoted
+      verbatim, so the next loop can resume from the exact
+      failing surface.
+      Next sub-step (rung 12): extend `SlotDecoder.Classify` to
+      decode `RecordKindHeapHotUpdate` / `RecordKindHeapUpdate`
+      into `ChangeUpdate` events (with OldTuple where the
+      record carries one) and `RecordKindPageImage` into
+      synthesised `ChangeInsert` events per slot of the page
+      image — or change the executor's first-INSERT-into-fresh-
+      page emission path to write a plain `RecordKindHeapInsert`
+      so the classifier sees the same shape upstream PG produces.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

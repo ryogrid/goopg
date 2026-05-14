@@ -312,9 +312,44 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	//     step; the rung-10 fix will land with its own design doc.
 	// t.Skip restored — rung 10 deferred to its own M0103-0008 loop so
 	// each rung lands with its own design doc + targeted pin.
-	t.Skip("M0103-0008 rung 9 closed in 0103-0014; rung 10 (pgoutput " +
-		"emission for goopg-publisher DML) deferred to a follow-up loop " +
-		"so each live-probe rung lands with its own design doc.")
+	//   - rung 11 (NEW, CLOSED): publication_names quoted-identifier
+	//     unquoting (PG SplitIdentifierString-equivalent). libpqwalreceiver
+	//     sends `publication_names '"p"'` (each name wrapped in
+	//     double-quotes to keep names with commas safe). goopg's
+	//     `splitPublicationNames` used `strings.Split(raw, ",")` +
+	//     `TrimSpace`, so the lookup key became literal `"p"` (with
+	//     quotes), missing the stored publication entry — every
+	//     decoded change was rejected by `publicationFilter.Allows`
+	//     with `byTable=map[]` and `allTablesAllowed={false,false,false}`.
+	//     Closed by porting `SplitIdentifierString(rawstring, ',', …)`
+	//     semantics (doubled `""` collapses, unquoted identifiers
+	//     are downcased to match `downcase_truncate_identifier`).
+	//     Design: `docs/design/0103-0016-publication-names-splitidentifier.md`.
+	//     Pinned by `TestSplitPublicationNamesQuotedIdentifiers` in
+	//     `internal/server/replication_test.go` (or
+	//     `internal/server/logicalwalsender_test.go`).
+	//   - rung 12 (NEW, OPEN): logical-decoding classifier coverage
+	//     for `RecordKindHeapHotUpdate` (13) and `RecordKindPageImage`
+	//     (1). With rung 11 closed, the live probe's Insert (kind=4)
+	//     and Delete (kind=6) records flow through `pgoutput.Change`
+	//     and reach the apply worker; UPDATE records (`kind=13`,
+	//     `HeapHotUpdate`) and the first INSERT into a freshly-
+	//     allocated page (emitted as `PageImage` kind=1 + `BtreeInsert`
+	//     kind=5 by the heap-writer) are silently dropped because
+	//     `Classify` has no case for either kind. The test still
+	//     fails because the apply worker never sees the UPDATE that
+	//     would set `v='updated'`. Closing rung 12 requires either:
+	//     (a) extending `Classify` to decode `HeapHotUpdate` /
+	//     `HeapUpdate` and `PageImage` into `ChangeUpdate` /
+	//     `ChangeInsert` events; or (b) changing the executor's
+	//     page-image emission path so a first INSERT into a new page
+	//     produces a plain `HeapInsert` record (matching upstream's
+	//     pre-image behaviour). The classifier-side fix is the
+	//     principled match for upstream's `DecodeHeap2*` family.
+	t.Skip("M0103-0008 rung 11 closed in 0103-0016; rung 12 (logical " +
+		"decoder coverage for HeapHotUpdate / PageImage record kinds) " +
+		"deferred to a follow-up loop so each live-probe rung lands " +
+		"with its own design doc.")
 
 	repo := repoRoot(t)
 	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))

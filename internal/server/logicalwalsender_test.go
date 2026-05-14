@@ -339,6 +339,68 @@ func TestSplitPublicationNamesTrimsAndDropsEmpty(t *testing.T) {
 	}
 }
 
+// TestSplitPublicationNamesQuotedIdentifiers pins the
+// `SplitIdentifierString`-equivalent semantics 0103-0016 adds for
+// the libpq logical-replication wire shape `publication_names '"p"'`.
+// Each name inside the option value is double-quote-wrapped so
+// names containing commas remain safe to split; without quoted-
+// identifier unquoting the lookup keys never matched the stored
+// publication names and every decoded change was silently
+// rejected (rung 11 of M0103-0008).
+func TestSplitPublicationNamesQuotedIdentifiers(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{name: "single quoted", raw: `"p"`, want: []string{"p"}},
+		{name: "multiple quoted", raw: `"p","q"`, want: []string{"p", "q"}},
+		{name: "doubled-quote escape", raw: `"a""b"`, want: []string{`a"b`}},
+		{name: "unquoted lowercased", raw: `Foo`, want: []string{"foo"}},
+		{name: "unquoted preserves case after lowering", raw: `FOO,BAR`, want: []string{"foo", "bar"}},
+		{name: "quoted preserves case", raw: `"Foo"`, want: []string{"Foo"}},
+		{name: "whitespace tolerance",
+			raw:  `  "p"  ,  "q"  `,
+			want: []string{"p", "q"}},
+		{name: "empty input", raw: ``, want: nil},
+		{name: "all whitespace", raw: `   `, want: nil},
+		{name: "trailing comma allowed", raw: `"p",`, want: []string{"p"}},
+		{name: "mixed quoted and unquoted", raw: `"p",q`, want: []string{"p", "q"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitPublicationNames(tc.raw)
+			if len(got) != len(tc.want) {
+				t.Fatalf("len(splitPublicationNames(%q)) = %d, want %d (%v)",
+					tc.raw, len(got), len(tc.want), got)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("splitPublicationNames(%q)[%d] = %q, want %q",
+						tc.raw, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSplitPublicationNamesSyntaxErrorsReturnNil pins the explicit
+// "return nil on syntax error" contract callers rely on to fall back
+// to the v0 "no filter ⇒ pass everything" behaviour (see
+// 0103-0016). Upstream rejects malformed `publication_names` at
+// SUBSCRIPTION DDL time, well before the wire-level slot is started.
+func TestSplitPublicationNamesSyntaxErrorsReturnNil(t *testing.T) {
+	cases := []string{
+		`"unterminated`,
+		`"p" junk`,
+	}
+	for _, raw := range cases {
+		if got := splitPublicationNames(raw); got != nil {
+			t.Errorf("splitPublicationNames(%q) = %v, want nil", raw, got)
+		}
+	}
+}
+
 
 // TestLogicalSyncRepDispatchUnblocksOnApplyCatchup is the M0103-0005
 // integration test for the logical walsender → SyncRep wait queue.
