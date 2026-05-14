@@ -262,9 +262,18 @@ func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string
 		}
 	}
 
+	// Slot RestartLSN is the LSN at which the consumer will resume
+	// reading WAL — the *first byte of the next record*, not the
+	// last byte of the current one. WrittenLSN() returns the last
+	// appended byte's LSN, so the next record begins at +1. Without
+	// the +1, NewRecordIterator's `pos = startLSN-1` would land on
+	// the last byte of the previous record and the very first
+	// readOneAt() would decode garbage (e.g., rmid=240 from random
+	// payload bytes). Same off-by-one M0094-0005 fixed for
+	// startStandbyReplayer / startWalreceiver.
 	var startLSN uint64
 	if s.cfg.WAL != nil {
-		startLSN = s.cfg.WAL.WrittenLSN()
+		startLSN = s.cfg.WAL.WrittenLSN() + 1
 	}
 	slot, err := s.cfg.Slots.Create(name, slotKind, startLSN)
 	if err != nil {

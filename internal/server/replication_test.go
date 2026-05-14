@@ -310,6 +310,47 @@ func TestReplicationCreateLogicalSlotWithOptionsList(t *testing.T) {
 	}
 }
 
+
+// TestReplicationCreateLogicalSlotRestartLSNIsNextRecord pins the
+// M0103-0008 rung-9 off-by-one fix. Slot RestartLSN must be set to
+// `WrittenLSN()+1` — the LSN of the first byte of the *next* record —
+// not `WrittenLSN()` (the last byte of the previous record). Without
+// the +1, the slot decoder's iterator (`pos = startLSN-1`) lands inside
+// the previous record and the very first readOneAt() decodes garbage
+// bytes as a record header, returning errors like "unknown rmid=240".
+// Same off-by-one M0094-0005 fixed for startStandbyReplayer.
+func TestReplicationCreateLogicalSlotRestartLSNIsNextRecord(t *testing.T) {
+	addr, slots, writer, stop := startReplicationTestServerFull(t)
+	defer stop()
+
+	// Append a record so WrittenLSN advances past 0 and the +1
+	// vs no-+1 distinction is observable. Without prior WAL the
+	// off-by-one wouldn't be visible (both 0 and 1 land at the
+	// start of the stream).
+	if _, _, err := writer.Append([]byte("seed-record")); err != nil {
+		t.Fatalf("seed wal append: %v", err)
+	}
+	wrote := writer.WrittenLSN()
+	if wrote == 0 {
+		t.Fatal("seed record did not advance WrittenLSN")
+	}
+
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "rung9_slot" LOGICAL pgoutput (SNAPSHOT 'nothing')`)
+	_ = readUntilReadyForQuery(t, r)
+
+	slot, err := slots.Get("rung9_slot")
+	if err != nil {
+		t.Fatalf("slots.Get: %v", err)
+	}
+	want := wrote + 1
+	if slot.RestartLSN != want {
+		t.Errorf("slot.RestartLSN = %d, want %d (= WrittenLSN+1, the next-record start LSN)",
+			slot.RestartLSN, want)
+	}
+}
+
 // TestReplicationCreateLogicalSlotOptionsListMultiple — the parser must
 // handle comma-separated option lists and reject unknown options with a
 // syntax error so future probe rungs surface loudly.

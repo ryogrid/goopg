@@ -265,26 +265,56 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	//     Pinned by `TestReplicationCreateLogicalSlotWithOptionsList`
 	//     and `TestReplicationCreateLogicalSlotOptionsListMultiple` in
 	//     `internal/server/replication_test.go`.
-	//   - rung 9 (NEW, OPEN): subscriber apply path stalls — with
-	//     rung 8 closed, `CREATE SUBSCRIPTION g2pg_sub … PUBLICATION p
-	//     WITH (enabled = true, copy_data = false)` against a goopg
-	//     publisher succeeds, but the live interop test then times out
-	//     waiting 60 s for the post-INSERT row count to reach 1 on the
-	//     PG subscriber. The next probe rung is somewhere in the
-	//     START_REPLICATION / pgoutput-emit / standby-status loop —
-	//     either the walsender is not relaying the publication's
-	//     changes, or pgoutput's begin/relation/insert frames aren't
-	//     reaching the subscriber's apply worker, or the subscriber is
-	//     issuing another diagnostic query that fails silently and
-	//     pauses the worker. Need to capture both goopg-publisher and
-	//     PG-subscriber logs from a fresh run, identify which probe or
-	//     stream message fails, and land a targeted fix with its own
-	//     design doc (0103-0014).
-	// t.Skip restored — rung 9 deferred to its own M0103-0008 loop so
+	//   - rung 9 (loop 10, CLOSED): logical walsender stream stability.
+	//     Two distinct bugs were keeping the rung-9 surface broken in
+	//     concert. (a) `replyCreateReplicationSlot` set
+	//     `slot.RestartLSN = WrittenLSN()` (last appended byte's LSN)
+	//     instead of `WrittenLSN()+1` (the next record's first-byte
+	//     LSN). `NewRecordIterator`'s `pos = startLSN-1` then landed
+	//     inside the previous record, and the very first `readOneAt`
+	//     decoded garbage payload bytes as an XLogRecord header,
+	//     reporting `wal: invalid record header: unknown rmid=240`
+	//     (the rmid byte is just whatever random payload happens to
+	//     sit at offset 17 from the misaligned position). dec.Run
+	//     returned the error and the walsender idled until PG's
+	//     `wal_receiver_timeout` fired. Same off-by-one M0094-0005
+	//     fixed for `startStandbyReplayer`/`startWalreceiver`. (b)
+	//     `runLogicalWalsender` had no keepalive emission, so even if
+	//     the decoder had stayed alive, the next 60 s of quiet WAL
+	//     would re-trip `wal_receiver_timeout`. The physical-walsender
+	//     path in `replyStartReplication` runs a 10 s `time.Ticker`
+	//     emitting `protocol.EncodeKeepalive` frames; the LOGICAL path
+	//     was missing the symmetric loop. Closed by adding
+	//     `walsenderPgoutputAdapter.WriteKeepalive(sendTime)` (shares
+	//     the adapter's write mutex so the `'k'` frame never
+	//     interleaves with an in-flight `'w'` frame; advertises
+	//     `walEnd = last-emitted synthetic LSN`) plus a keepalive
+	//     goroutine in `runLogicalWalsender` matching the physical
+	//     cadence. Design:
+	//     `docs/design/0103-0014-logical-walsender-keepalive-and-slot-restart-lsn-fix.md`.
+	//     Pinned by `TestReplicationCreateLogicalSlotRestartLSNIsNextRecord`,
+	//     `TestWalsenderPgoutputAdapterKeepalive`, and
+	//     `TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite` in
+	//     `internal/server/`.
+	//   - rung 10 (NEW, OPEN): pgoutput emission for goopg-publisher
+	//     DML. With rungs 1–9 closed, the live interop test's failure
+	//     mode shifts from "60 s timeout error" to "stable
+	//     connection, no DML rows propagate" — the apply worker
+	//     stays connected past 60 s (no timeout), the decoder runs
+	//     without errors, but no `'w'` frame carrying pgoutput
+	//     Begin/Relation/Insert reaches the subscriber. Candidate
+	//     causes: publication-filter rejection (the
+	//     `buildPublicationFilter` may not match `public.t`
+	//     registered via the harness), missing Begin/Commit emission
+	//     for in-snapshot transactions, or the catalog snapshot
+	//     taken at session start not seeing the published table
+	//     because of catalog timing. Each is a separate diagnostic
+	//     step; the rung-10 fix will land with its own design doc.
+	// t.Skip restored — rung 10 deferred to its own M0103-0008 loop so
 	// each rung lands with its own design doc + targeted pin.
-	t.Skip("M0103-0008 rung 8 closed in 0103-0013; subscriber apply path " +
-		"stall (rung 9) deferred to a follow-up loop so the next live-probe " +
-		"rung can land with its own design doc.")
+	t.Skip("M0103-0008 rung 9 closed in 0103-0014; rung 10 (pgoutput " +
+		"emission for goopg-publisher DML) deferred to a follow-up loop " +
+		"so each live-probe rung lands with its own design doc.")
 
 	repo := repoRoot(t)
 	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))

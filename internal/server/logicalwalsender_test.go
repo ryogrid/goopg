@@ -132,6 +132,88 @@ func TestWalsenderPgoutputAdapterWrapsAsCopyData(t *testing.T) {
 	}
 }
 
+// TestWalsenderPgoutputAdapterKeepalive pins the rung-9 fix
+// (M0103-0008): the LOGICAL walsender path must emit periodic
+// keepalive frames so PG's apply worker doesn't trip
+// `wal_receiver_timeout` (default 60 s) during quiet periods. The
+// adapter's WriteKeepalive method must wrap the keepalive in the same
+// `'w'`-style CopyData frame the standby's libpqrcv consumes and
+// advertise walEnd = last-emitted synthetic LSN.
+func TestWalsenderPgoutputAdapterKeepalive(t *testing.T) {
+	var buf bytes.Buffer
+	fw := protocol.NewFrameWriter(&buf)
+
+	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 200}
+	// Ship a regular message first so nextLSN advances.
+	if _, err := a.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	wantEnd := uint64(200 + len("data") - 1)
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	if err := a.WriteKeepalive(now); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := protocol.NewFrameReader(&buf)
+	// Skip the data frame.
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	kf, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kf.Type != protocol.MsgCopyData {
+		t.Fatalf("keepalive frame Type=%q want CopyData", kf.Type)
+	}
+	parsed, kind, err := protocol.DecodeReplicationMessage(kf.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != protocol.ReplMsgKeepalive {
+		t.Fatalf("inner kind=%q want k", kind)
+	}
+	k := parsed.(*protocol.KeepaliveMessage)
+	if k.WALEnd != wantEnd {
+		t.Errorf("WALEnd=%d want %d (last-emitted synthetic LSN)", k.WALEnd, wantEnd)
+	}
+	if k.ReplyRequested {
+		t.Errorf("ReplyRequested=true want false (idle keepalive)")
+	}
+}
+
+// TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite pins the
+// no-messages-yet behaviour: an adapter with nextLSN=0 must still
+// emit a well-formed keepalive without underflowing walEnd.
+func TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite(t *testing.T) {
+	var buf bytes.Buffer
+	fw := protocol.NewFrameWriter(&buf)
+	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 0}
+
+	if err := a.WriteKeepalive(time.Unix(1_700_000_000, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := protocol.NewFrameReader(&buf)
+	kf, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, kind, err := protocol.DecodeReplicationMessage(kf.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != protocol.ReplMsgKeepalive {
+		t.Fatalf("inner kind=%q want k", kind)
+	}
+	k := parsed.(*protocol.KeepaliveMessage)
+	if k.WALEnd != 0 {
+		t.Errorf("WALEnd=%d want 0 (no underflow on empty adapter)", k.WALEnd)
+	}
+}
+
 // TestPublicationFilterAllowsByTable: a publication that names
 // "items" admits every change for items (subject to publish
 // flags) and rejects every change for other tables.

@@ -2255,16 +2255,77 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       the `t.Skip` removed confirmed slot creation now succeeds; the
       test then times out at 60 s waiting for the post-INSERT row
       count to reach 1 on the PG subscriber — rung 9, deferred.
-      Next sub-step (rung 9): subscriber apply path stall after
-      `CREATE SUBSCRIPTION`. With rung 8 closed, the subscription is
-      created successfully but the apply worker fails to materialise
-      the publisher's INSERT/UPDATE traffic within 60 s. The break
-      is somewhere in START_REPLICATION / pgoutput stream emission /
-      standby-status loop / subscriber-side post-CREATE diagnostic
-      query. Need a fresh interop run with both publisher and
-      subscriber logs captured to identify which probe or stream
-      message fails, then land a targeted fix with its own design
-      doc (`0103-0014`).
+      PARTIAL PROGRESS 2026-05-14 (loop 10): closed rung 9 — logical
+      walsender stream stability. Design doc:
+      `docs/design/0103-0014-logical-walsender-keepalive-and-slot-restart-lsn-fix.md`
+      (accepted).
+      Diagnosis: dropping the `t.Skip` revealed TWO concurrent bugs.
+      Adding short-lived diagnostic logging into `runLogicalWalsender`'s
+      `dec.Run` goroutine surfaced
+      `wal: slot "g2pg_sub" decoder iterator: wal: invalid record
+      header: unknown rmid=240`. The iterator's very first
+      `readOneAt(pos)` was decoding garbage as an XLogRecord header.
+      Even after fixing that the next quiet 60 s window would re-trip
+      `wal_receiver_timeout` because the LOGICAL walsender had no
+      keepalive emission — the physical path runs a 10 s ticker,
+      `runLogicalWalsender` did not.
+      Changes:
+      - `internal/server/replication.go::replyCreateReplicationSlot`:
+        `slot.RestartLSN` now anchors at `s.cfg.WAL.WrittenLSN() + 1`
+        (next record's first-byte LSN), not `WrittenLSN()` (last byte
+        of the previous record). `NewRecordIterator`'s `pos =
+        startLSN-1` then lands at the first byte of the next record
+        rather than inside the previous one. Same off-by-one
+        M0094-0005 fixed for `startStandbyReplayer` /
+        `startWalreceiver`; physical replication previously hid the
+        bug because `replyStartReplication` reads from
+        `args.StartLSN` (client-supplied, already next-byte-aligned
+        by libpqrcv) rather than `slot.RestartLSN`. LOGICAL is the
+        first consumer that reads the stored slot anchor.
+      - `internal/server/logicalwalsender.go`: new method
+        `walsenderPgoutputAdapter.WriteKeepalive(sendTime time.Time)
+        error` takes the adapter's mutex (so `'k'` frames never
+        interleave with in-flight `'w'` frames), advertises
+        `walEnd = nextLSN - 1` (underflow-safe when no frame has
+        shipped), encodes `protocol.EncodeKeepalive(walEnd, sendTime,
+        false)`, wraps it as a CopyData frame. New keepalive
+        goroutine in `runLogicalWalsender` fires every 10 s, watches
+        `streamCtx.Done()` for shutdown, propagates write errors via
+        `streamCancel`. Main `select` drains `keepaliveDone` after
+        `receiveDone` so connection-close ordering is symmetric with
+        the physical path.
+      Tests:
+      - `internal/server/replication_test.go::TestReplicationCreateLogicalSlotRestartLSNIsNextRecord`
+        — appends a record so `WrittenLSN()` is non-zero, creates a
+        logical slot via the wire protocol, asserts `slot.RestartLSN
+        == WrittenLSN()+1`.
+      - `internal/server/logicalwalsender_test.go::TestWalsenderPgoutputAdapterKeepalive`
+        — pins `WriteKeepalive` emits a parseable `'k'` frame with
+        `WALEnd = last-emitted synthetic LSN` and
+        `ReplyRequested=false`.
+      - `TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite` —
+        pins the no-messages-yet underflow guard (adapter with
+        `nextLSN=0` still emits a well-formed keepalive with
+        `WALEnd=0`).
+      Verification (loop 10): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green. Manual live-probe run with
+      the `t.Skip` removed confirms the failure mode has changed
+      observably: PG's apply worker no longer fires
+      `wal_receiver_timeout` at exactly 60 s — the connection stays
+      alive past the 67 s mark until test shutdown ("terminating
+      logical replication worker due to administrator command"). The
+      `t.Skip` was restored with the rung-10 diagnosis quoted
+      verbatim.
+      Next sub-step (rung 10): pgoutput emission for goopg-publisher
+      DML. Connection is now stable but PG sees zero rows from the
+      publisher's `INSERT/INSERT/UPDATE/DELETE` — the SlotDecoder
+      runs without errors, the iterator blocks at tail, but no `'w'`
+      frame carrying pgoutput Begin/Relation/Insert is shipped to
+      the subscriber. Candidate causes: publication-filter
+      rejection, missing Begin/Commit emission for in-snapshot
+      transactions, or catalog snapshot timing.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

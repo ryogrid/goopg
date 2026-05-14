@@ -128,14 +128,43 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	runErr := make(chan error, 1)
 	go func() { runErr <- dec.Run(streamCtx) }()
 
+	// Periodic keepalive emission. Without it, PG's apply worker
+	// terminates the connection after `wal_receiver_timeout` (default
+	// 60 s) when no pgoutput frame has crossed the wire — which is the
+	// common case during a quiet workload. The physical walsender path
+	// in replyStartReplication runs the same 10 s cadence; the LOGICAL
+	// path needs symmetric behaviour. The keepalive's walEnd advertises
+	// the adapter's last-emitted synthetic LSN so the subscriber's
+	// progress reporting matches the byte-stream LSNs it has seen.
+	const keepaliveInterval = 10 * time.Second
+	keepaliveDone := make(chan struct{})
+	go func() {
+		defer close(keepaliveDone)
+		ticker := time.NewTicker(keepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case <-ticker.C:
+				if err := adapter.WriteKeepalive(time.Now().UTC()); err != nil {
+					streamCancel()
+					return
+				}
+			}
+		}
+	}()
+
 	select {
 	case <-streamCtx.Done():
 		<-receiveDone
 		<-runErr
+		<-keepaliveDone
 		return nil
 	case err := <-runErr:
 		streamCancel()
 		<-receiveDone
+		<-keepaliveDone
 		if errors.Is(err, context.Canceled) || errors.Is(err, wal.ErrClosed) {
 			return nil
 		}
@@ -177,6 +206,29 @@ func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("walsender pgoutput flush: %w", err)
 	}
 	return len(p), nil
+}
+
+// WriteKeepalive emits a primary-keepalive (`'k'`) frame through the
+// same FrameWriter the pgoutput Write path uses, sharing the adapter's
+// mutex so the bytes never interleave with an in-flight `'w'` frame.
+// walEnd is advertised as the last-emitted synthetic LSN; subscribers
+// use it only as a status anchor (they ack against received-LSN, not
+// walEnd) so a never-advanced value is safe on a quiet publisher.
+func (a *walsenderPgoutputAdapter) WriteKeepalive(sendTime time.Time) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	walEnd := a.nextLSN
+	if walEnd > 0 {
+		walEnd--
+	}
+	frame := protocol.EncodeKeepalive(walEnd, sendTime, false)
+	if err := a.w.WriteCopyData(frame); err != nil {
+		return fmt.Errorf("walsender pgoutput keepalive write: %w", err)
+	}
+	if err := a.w.Flush(); err != nil {
+		return fmt.Errorf("walsender pgoutput keepalive flush: %w", err)
+	}
+	return nil
 }
 
 // guard the unused-import warning in some build configurations.
