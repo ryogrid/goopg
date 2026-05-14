@@ -45,6 +45,36 @@ func computeGeneratedColumns(cols []catalog.Column, row Row) error {
 	return nil
 }
 
+// applyDefaultsForMissing fills in column slots flagged missing[i]=true with
+// the value of the column's DEFAULT expression. Slots whose column has no
+// DEFAULT stay at their incoming value (typically NullDatum from the
+// pgoutput decoder). Used by the apply worker when a subscriber-side table
+// has columns the publisher does not (M0103-0007 rung 13). Mirrors the
+// upstream slot_fill_defaults() helper in
+// src/backend/replication/logical/worker.c.
+//
+// The evaluator is intentionally the same lightweight evalGenExpr used for
+// GENERATED ALWAYS columns: literals, NULL, bool, CAST passthrough, simple
+// arithmetic, and column refs (resolved against the row being built). That
+// covers the DEFAULT shapes pgoutput-replicated test fixtures actually use;
+// expressions evalGenExpr can't handle leave the slot unchanged so a
+// NOT NULL violation surfaces loudly rather than silently NULL-ing a row.
+func applyDefaultsForMissing(cols []catalog.Column, row Row, missing []bool) {
+	for i, m := range missing {
+		if !m {
+			continue
+		}
+		if i >= len(cols) || cols[i].DefaultExpr == nil {
+			continue
+		}
+		val, err := evalGenExpr(cols[i].DefaultExpr, cols, row)
+		if err != nil {
+			continue
+		}
+		row[i] = val
+	}
+}
+
 // evalGeneratedExpr parses a raw SQL expression string and evaluates it
 // against the current row.  Column references are resolved by name against
 // the provided cols slice.

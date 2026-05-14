@@ -44,6 +44,12 @@ type Column struct {
 	GeneratedExpr string
 	// GeneratedAlways is true when the column uses GENERATED ALWAYS AS semantics.
 	GeneratedAlways bool
+	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
+	// CREATE TABLE provided one. nil for columns without a DEFAULT. The
+	// apply worker evaluates this when filling subscriber-extra columns at
+	// INSERT time so logical replication preserves DEFAULT semantics across
+	// schema-extended subscribers (M0103-0007 rung 13).
+	DefaultExpr parser.Expr
 }
 
 // Table is one relation in the catalog.

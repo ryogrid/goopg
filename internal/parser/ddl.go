@@ -865,25 +865,17 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if p.acceptIdentKeyword("options") {
 				// Re-enter constraint parsing for the column override.
 			}
-		// DEFAULT clause — skip for generated columns context
+		// DEFAULT clause — capture the expression AST so the apply worker
+		// can evaluate it when filling subscriber-extra columns at
+		// INSERT time (M0103-0007 rung 13). Generated columns don't
+		// take DEFAULT; the GENERATED ALWAYS arm above runs first.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault:
 			p.advance()
-			// Skip the default expression (consume tokens until ',', ')', or ';')
-			depth := 0
-			for p.cur().Kind != TokenEOF {
-				t := p.cur()
-				if t.Kind == TokenSymbol && t.Value == "(" {
-					depth++
-				} else if t.Kind == TokenSymbol && t.Value == ")" {
-					if depth == 0 {
-						break
-					}
-					depth--
-				} else if t.Kind == TokenSymbol && (t.Value == "," || t.Value == ";") && depth == 0 {
-					break
-				}
-				p.advance()
+			expr, err := p.parseExpr()
+			if err != nil {
+				return ColumnDef{}, err
 			}
+			col.DefaultExpr = expr
 		// REFERENCES — parse FK constraint and populate col FK fields. M0096-0011.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 			p.advance()

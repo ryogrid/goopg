@@ -1217,3 +1217,55 @@ func TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS(t *testing.T) {
 	}
 	_ = subTbl // silence unused if scan removed
 }
+
+// TestApplyDefaultsForMissingFillsSlots pins M0103-0007 rung 13's helper.
+// Subscriber-extra columns flagged missing[i]=true should be filled by
+// evaluating the column's DefaultExpr; columns without a DEFAULT stay at
+// their incoming value (typically NullDatum from the pgoutput decoder).
+func TestApplyDefaultsForMissingFillsSlots(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+		// Subscriber-extra: has a DEFAULT we'll evaluate.
+		{Name: "note", Type: catalog.Type{Name: "text"},
+			DefaultExpr: &parser.StringConst{Value: "kept"}},
+		// Subscriber-extra: NO DEFAULT — stays NullDatum.
+		{Name: "n", Type: catalog.Type{Name: "int4"}},
+	}
+	row := Row{NewIntDatum(1), NewStringDatum("hello"), NullDatum, NullDatum}
+	missing := []bool{false, false, true, true}
+
+	applyDefaultsForMissing(cols, row, missing)
+
+	if row[0].Int != 1 {
+		t.Errorf("row[0] mutated: got %v want 1", row[0])
+	}
+	if string(row[1].Buf) != "hello" {
+		t.Errorf("row[1] mutated: got %q want \"hello\"", row[1].Buf)
+	}
+	if string(row[2].Buf) != "kept" {
+		t.Errorf("row[2] not filled: got %v want \"kept\"", row[2])
+	}
+	if !row[3].IsNull() {
+		t.Errorf("row[3] (no DEFAULT) should stay NullDatum, got %v", row[3])
+	}
+}
+
+// TestApplyDefaultsForMissingIgnoresFalseMask: a slot that is NOT missing
+// is NEVER overwritten, even when the column carries a DEFAULT (the
+// publisher's value wins).
+func TestApplyDefaultsForMissingIgnoresFalseMask(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "text"},
+			DefaultExpr: &parser.StringConst{Value: "DEFAULT-VALUE"}},
+	}
+	row := Row{NewIntDatum(1), NewStringDatum("publisher-value")}
+	missing := []bool{false, false}
+
+	applyDefaultsForMissing(cols, row, missing)
+
+	if string(row[1].Buf) != "publisher-value" {
+		t.Errorf("row[1] overwritten despite missing[1]=false: got %q", row[1].Buf)
+	}
+}

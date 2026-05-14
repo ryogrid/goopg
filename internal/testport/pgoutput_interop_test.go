@@ -1545,6 +1545,97 @@ func TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "k = 2 AND v = 'b'", 0, 5*time.Second)
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault pins M0103-0007
+// rung 13: when the goopg subscriber declares an extra column the PG
+// publisher never mentions in its Relation message AND that column has a
+// CREATE TABLE DEFAULT, the apply worker must evaluate the DEFAULT at
+// INSERT time so the subscriber row carries the configured default value.
+// Mirrors upstream's slot_fill_defaults() in
+// src/backend/replication/logical/worker.c.
+//
+// Workload: publisher INSERTs (1,'hello') and (2,'world'); subscriber
+// schema has an extra `note text DEFAULT 'auto'`. The replicated rows
+// must arrive on goopg with note='auto', not note=NULL.
+//
+// Before rung 13: subscriber rows had note=NULL (silent NULL-fill);
+// applications relying on DEFAULT for subscriber-side bookkeeping
+// columns would see all NULLs. After rung 13: the DefaultExpr captured
+// at CREATE TABLE time is evaluated through evalGenExpr and lands in
+// the heap.
+//
+// Negative pin: a separate column without a DEFAULT stays NULL — proves
+// the helper only fires when DefaultExpr is non-nil and doesn't blanket
+// every missing slot with a placeholder.
+//
+// Design doc:
+// docs/design/0103-0036-m0103-0007-rung-13-pg-to-goopg-subscriber-extra-default.md.
+func TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-extradefault")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_extradefault"
+	psc := pubsubcluster.NewMixed(t, "pg2g_extradefault", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Publisher schema: (id, v). Subscriber schema adds two extra columns:
+	//   note text DEFAULT 'auto'  — must be filled to 'auto' on apply
+	//   bare text                 — no DEFAULT, must stay NULL on apply
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t,
+		"CREATE TABLE public.t (id int PRIMARY KEY, v text, note text DEFAULT 'auto', bare text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'world')")
+
+	// Both rows must arrive with note='auto'. Without the rung-13 fix,
+	// note would be NULL and the WaitForRow would time out at 30 s.
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'hello' AND note = 'auto'", 1, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 2 AND v = 'world' AND note = 'auto'", 1, 30*time.Second)
+
+	// Negative pin: bare has no DEFAULT, stays NULL. Catches a regression
+	// where applyDefaultsForMissing started overwriting every missing slot
+	// instead of only those whose column carries DefaultExpr.
+	psc.WaitForRow(t, "public.t", "bare IS NULL", 2, 5*time.Second)
+
+	// Row-count pin: exactly the two publisher rows, no duplicates or
+	// silently-NULL'd extras.
+	psc.WaitForRow(t, "public.t", "1=1", 2, 5*time.Second)
+	psc.WaitForRow(t, "public.t", "note IS NULL", 0, 5*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

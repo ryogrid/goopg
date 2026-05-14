@@ -808,6 +808,11 @@ type ColumnDef struct {
 	// for a stored generated column. Empty for ordinary columns.
 	GeneratedExpr string
 
+	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
+	// one was given (`col INT DEFAULT 0`). nil for columns without a DEFAULT.
+	// M0103-0007 rung 13.
+	DefaultExpr Expr
+
 	// FK fields — populated when the column has an inline REFERENCES clause.
 	// M0096-0011.
 	RefTable           ObjectName

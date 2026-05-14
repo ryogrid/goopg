@@ -1,6 +1,9 @@
 package parser
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // TestParseCreateTablePgbench: the four CREATE TABLE statements
 // pgbench -i issues round-trip through the parser. Pins type
@@ -168,4 +171,55 @@ func TestParseDDLSyntaxErrors(t *testing.T) {
 			t.Errorf("Parse(%q) err type=%T", in, err)
 		}
 	}
+}
+
+// TestParseCreateTableDefaultExpr pins M0103-0007 rung 13's parser surface:
+// CREATE TABLE column DEFAULT clauses must capture an AST so the apply
+// worker can evaluate them when filling subscriber-extra columns at INSERT
+// time. Prior to rung 13 the DEFAULT clause was tokenized-and-dropped.
+func TestParseCreateTableDefaultExpr(t *testing.T) {
+	cases := []struct {
+		in       string
+		colName  string
+		wantKind string // type-of-AST tag for the captured expression
+	}{
+		{"CREATE TABLE t (id int, note text DEFAULT 'unknown')", "note", "*parser.StringConst"},
+		{"CREATE TABLE t (id int, counter int DEFAULT 0)", "counter", "*parser.IntegerConst"},
+		{"CREATE TABLE t (id int, flag boolean DEFAULT TRUE)", "flag", "*parser.BooleanConst"},
+		{"CREATE TABLE t (id int, n int DEFAULT NULL)", "n", "*parser.NullConst"},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct, ok := stmts[0].(*CreateTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): not a CreateTableStmt", c.in)
+		}
+		var col *ColumnDef
+		for i := range ct.Columns {
+			if ct.Columns[i].Name == c.colName {
+				col = &ct.Columns[i]
+				break
+			}
+		}
+		if col == nil {
+			t.Fatalf("Parse(%q): column %q not found", c.in, c.colName)
+		}
+		if col.DefaultExpr == nil {
+			t.Fatalf("Parse(%q): DefaultExpr nil, want %s", c.in, c.wantKind)
+		}
+		got := typeOf(col.DefaultExpr)
+		if got != c.wantKind {
+			t.Errorf("Parse(%q): DefaultExpr type=%s want %s", c.in, got, c.wantKind)
+		}
+	}
+}
+
+func typeOf(v interface{}) string {
+	if v == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%T", v)
 }

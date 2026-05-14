@@ -248,7 +248,7 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 			return nil
 		}
 	}
-	row, unchanged, _, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	row, unchanged, missing, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode insert tuple for %q: %w", r.local.Name, err)
 	}
@@ -261,10 +261,15 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 				r.local.Name, i)
 		}
 	}
-	// Subscriber-extra columns (missing[i]=true) are NOT errors on INSERT:
-	// they remain NullDatum in the heap row. Full DEFAULT-expression
-	// evaluation for those positions is deferred to a later rung
-	// (M0103-0007 rung 11 — see docs/design/0103-0034).
+	// Subscriber-extra columns (missing[i]=true): evaluate the column's
+	// DEFAULT clause so logical replication preserves CREATE TABLE
+	// DEFAULT semantics across schema-extended subscribers. Mirrors
+	// upstream's slot_fill_defaults() in
+	// src/backend/replication/logical/worker.c. Columns with no DEFAULT
+	// stay NullDatum (matches PG's behaviour when NOT NULL is absent;
+	// a NOT NULL column without DEFAULT will fail the heap write).
+	// M0103-0007 rung 13 — see docs/design/0103-0036.
+	applyDefaultsForMissing(r.local.Columns, row, missing)
 
 	// writeHeapRow expects a Context carrying Pool / Tx. Build
 	// a minimal one — the apply worker doesn't have a session

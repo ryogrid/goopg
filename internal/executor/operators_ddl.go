@@ -375,6 +375,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			NotNull:         c.NotNull,
 			GeneratedExpr:   c.GeneratedExpr,
 			GeneratedAlways: c.GeneratedAlways,
+			DefaultExpr:     c.DefaultExpr,
 		})
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)

@@ -2500,6 +2500,88 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       subxacts, kill -9 + libpq multi-host reconnect plumbing on
       the client side, DEFAULT-expression evaluation for
       subscriber-extra INSERTs.
+      - PARTIAL PROGRESS 2026-05-14 (rung 13): subscriber-extra
+        column DEFAULT evaluation at INSERT time. Design doc:
+        `docs/design/0103-0036-m0103-0007-rung-13-pg-to-goopg-subscriber-extra-default.md`
+        (accepted). Rung 11 preserved subscriber-only column
+        values across replicated UPDATEs by copying from the
+        matched heap row; the symmetric INSERT case was deferred —
+        every replicated INSERT silently installed `NullDatum`
+        into every column the publisher's Relation message did
+        not claim, including columns with a CREATE TABLE DEFAULT.
+        Mirrors upstream's `slot_fill_defaults()` in
+        `src/backend/replication/logical/worker.c`.
+      - Fix split across parser + catalog + executor:
+      - `internal/parser/ast.go::ColumnDef` gains
+        `DefaultExpr Expr`; `internal/parser/ddl.go`'s
+        `parseColumnDef` now invokes `p.parseExpr()` for the
+        DEFAULT clause (was consume-and-discard) and stores the
+        AST. Direct AST storage avoids the token→text→AST
+        round-trip — `strings.Join` loses string-literal quoting
+        so `DEFAULT 'literal'` would otherwise become the bare
+        ident `literal` on re-parse.
+      - `internal/catalog/catalog.go::Column` gains
+        `DefaultExpr parser.Expr` (the catalog already imports
+        `internal/parser` for `View *parser.SelectStmt`, no new
+        dependency).
+      - `internal/executor/operators_ddl.go::execCreateTable`
+        propagates `c.DefaultExpr` from the parser AST to the
+        new catalog field at table creation time.
+      - `internal/executor/operators_generated.go` gains
+        `applyDefaultsForMissing(cols, row, missing)` — reuses
+        the existing lightweight `evalGenExpr` AST walker
+        (already used for GENERATED ALWAYS) to fill every slot
+        where `missing[i]=true` AND `cols[i].DefaultExpr != nil`.
+        Slots without a DEFAULT stay NullDatum; expressions
+        `evalGenExpr` can't handle (e.g. `DEFAULT now()`) leave
+        the slot unchanged so NOT NULL violations surface
+        loudly instead of silently NULL-ing the row.
+      - `internal/executor/applyworker.go::applyInsert` retains
+        the `missing` mask from `decodePgoutputTupleAsRow`
+        (previously discarded with `_`) and calls
+        `applyDefaultsForMissing(r.local.Columns, row, missing)`
+        before the heap write. The rung-11 UPDATE path is
+        untouched — UPDATE should never re-evaluate DEFAULTs.
+      - Pinned by parser test
+        `TestParseCreateTableDefaultExpr` in
+        `internal/parser/ddl_test.go` (four DEFAULT shapes:
+        string literal, integer, boolean, NULL — asserts the
+        captured AST node type matches each); unit tests
+        `TestApplyDefaultsForMissingFillsSlots` (two missing
+        slots, one with DefaultExpr, one without — only the
+        former is filled) and
+        `TestApplyDefaultsForMissingIgnoresFalseMask`
+        (regression guard: column with DefaultExpr but
+        `missing[i]=false` must not be overwritten) in
+        `internal/executor/applyworker_test.go`; and the live
+        E2E `TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault`
+        (`internal/testport/pgoutput_interop_test.go`):
+        publisher `(id int PK, v text)` + subscriber
+        `(id int PK, v text, note text DEFAULT 'auto', bare text)`;
+        publisher INSERTs two rows; assertions via fresh
+        `database/sql` sessions: both rows arrive with
+        `note='auto'` (load-bearing), both rows have
+        `bare IS NULL` (negative pin — DEFAULT-less columns
+        stay NULL), `count(*) = 2`, no spurious extras.
+      - Verification (rung 13):
+        `go test -count=1 -timeout 60s -run TestParseCreateTableDefaultExpr ./internal/parser/`
+        → PASS (~0.01 s);
+        `go test -count=1 -timeout 60s -run TestApplyDefaultsForMissing ./internal/executor/`
+        → PASS (~0.002 s);
+        `go test -count=1 -timeout 180s -run TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault ./internal/testport/`
+        → PASS (~2.0 s); all 12
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~23.7 s); regression sweep on
+        `./internal/parser/ ./internal/catalog/ ./internal/executor/`
+        → all green. Next rungs (deferred within M0103-0007):
+        pgbench against PG publisher with `pgbench_history`
+        polling, proto_version=2 streaming subxacts, kill -9 +
+        libpq multi-host reconnect plumbing on the client side,
+        DEFAULT-expression evaluation in the regular dispatcher
+        INSERT path (orthogonal to logical replication parity
+        but unblocked by the parser/catalog work landed here),
+        richer DEFAULT evaluator (function calls, sequences)
+        when a fixture surfaces a need.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.
