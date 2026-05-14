@@ -23,40 +23,41 @@ remaining gaps and ports a prioritised subset of the D-003 recovery TAP suite
 
 ### Sub-milestones
 
-- [x] **M0094-0005** — Resolve remaining M0005 caveat, then re-verify M0005/M0008 DoD.
-      PARTIAL PROGRESS 2026-05-14 (loop 1): standby continuous-replay tail-anchor
-      off-by-one fixed in cmd/goopg/main.go (`startStandbyReplayer` +
-      `startWalreceiver` now anchor at `WrittenLSN()+1`, the next record's first
-      byte LSN, instead of `WrittenLSN()` which placed the iterator inside the
-      last record and crashed the replayer with "bad xlog total length 0" on
-      every standby boot). Regression test:
-      `TestRecordIteratorAnchorAtTailBlocks`. Design:
-      `docs/design/0094-0005-standby-iterator-tail-anchor.md`.
-      PROGRESS 2026-05-14 (loop 2): the apparent "primary `WrittenLSN()` does
-      not advance" symptom was actually a plan-cache staleness bug — the
-      planner materialised `VirtualRows()` into `Values.Rows` at plan time,
-      and the server-wide planCache served the frozen rows on every later
-      query, so `pg_stat_wal_receiver.written_lsn` looked stuck even though
-      the standby's walreceiver was appending and `SetReceivedLSN()` was
-      bumping the registry. Fix: `planner.Values` gains
-      `VirtualSource *catalog.Table`; `executor.valuesOp` re-materialises
-      rows on Open via `rematerialiseVirtualRows`. INSERT-side `Values` is
-      untouched (no VirtualSource). Design:
-      `docs/design/0094-0005b-virtual-view-plan-cache-staleness.md`.
-      `TestReplicationEndToEnd` — PASS. All affected packages pass:
-      planner/executor/server/initdb/wal/testutil regressions all green.
-      COMPLETE 2026-05-14 (loop 3): standby hot-read MVCC visibility fixed.
-      Root cause: `StreamReplayer` treated `RecordKindXactCommit` as a no-op,
-      so the standby's `mvcc.Manager.nextXID` stayed at the clone-time value.
-      The primary's first post-restart INSERT got XID == nextXID; standby
-      snapshot's `Xmax = nextXID`, and `xmin >= Xmax` made the tuple invisible.
-      Fix: `mvcc.Manager.ReplayXactCommit(xid)` advances nextXID to xid+1;
-      `mvcc.Manager.ReplayXactAbort(xid)` does the same and adds xid to
-      abortedXIDs. `wal.StreamReplayer.SetXactReplayHook` wires the callback;
-      `startStandbyReplayer` installs it. Design:
-      `docs/design/0094-0005c-standby-mvcc-visibility.md`.
-      `TestE2E_PhysicalReplication` — PASS. `TestReplicationEndToEnd` — PASS.
-      All affected packages pass: mvcc/wal/planner/executor/server/initdb.
+- [x] **M0094-0005**
+      - Summary: Resolve remaining M0005 caveat, then re-verify M0005/M0008 DoD.
+      - PARTIAL PROGRESS 2026-05-14 (loop 1): standby continuous-replay tail-anchor
+        off-by-one fixed in cmd/goopg/main.go (`startStandbyReplayer` +
+        `startWalreceiver` now anchor at `WrittenLSN()+1`, the next record's first
+        byte LSN, instead of `WrittenLSN()` which placed the iterator inside the
+        last record and crashed the replayer with "bad xlog total length 0" on
+        every standby boot). Regression test:
+        `TestRecordIteratorAnchorAtTailBlocks`. Design:
+        `docs/design/0094-0005-standby-iterator-tail-anchor.md`.
+      - PROGRESS 2026-05-14 (loop 2): the apparent "primary `WrittenLSN()` does
+        not advance" symptom was actually a plan-cache staleness bug — the
+        planner materialised `VirtualRows()` into `Values.Rows` at plan time,
+        and the server-wide planCache served the frozen rows on every later
+        query, so `pg_stat_wal_receiver.written_lsn` looked stuck even though
+        the standby's walreceiver was appending and `SetReceivedLSN()` was
+        bumping the registry. Fix: `planner.Values` gains
+        `VirtualSource *catalog.Table`; `executor.valuesOp` re-materialises
+        rows on Open via `rematerialiseVirtualRows`. INSERT-side `Values` is
+        untouched (no VirtualSource). Design:
+        `docs/design/0094-0005b-virtual-view-plan-cache-staleness.md`.
+        `TestReplicationEndToEnd` — PASS. All affected packages pass:
+        planner/executor/server/initdb/wal/testutil regressions all green.
+      - COMPLETE 2026-05-14 (loop 3): standby hot-read MVCC visibility fixed.
+      - Root cause: `StreamReplayer` treated `RecordKindXactCommit` as a no-op,
+        so the standby's `mvcc.Manager.nextXID` stayed at the clone-time value.
+      - The primary's first post-restart INSERT got XID == nextXID; standby
+        snapshot's `Xmax = nextXID`, and `xmin >= Xmax` made the tuple invisible.
+      - Fix: `mvcc.Manager.ReplayXactCommit(xid)` advances nextXID to xid+1;
+        `mvcc.Manager.ReplayXactAbort(xid)` does the same and adds xid to
+        abortedXIDs. `wal.StreamReplayer.SetXactReplayHook` wires the callback;
+        `startStandbyReplayer` installs it. Design:
+        `docs/design/0094-0005c-standby-mvcc-visibility.md`.
+        `TestE2E_PhysicalReplication` — PASS. `TestReplicationEndToEnd` — PASS.
+      - All affected packages pass: mvcc/wal/planner/executor/server/initdb.
 
 ## M0095 — Client-Tools TAP Test Porting (filed 2026-05-12)
 
@@ -82,94 +83,102 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
 
 ### Sub-milestones
 
-- [x] **M0095-0001** — Port `pg_checksums/001+002`, `pg_controldata/001`,
-      `pg_walsummary/001` as Go tests in
-      `internal/testport/client_tools_port_test.go`.
-      Binary discovery: PATH first, then `postgres/local_install/bin`.
-      Closed 2026-05-14: `internal/initdb/pgcontrol.go` writes a PG18-format
-      `global/pg_control` (296-byte ControlFileData + zero padding to 8192 B,
-      CRC32C Castagnoli, system_identifier + cluster parameters; checkpoint
-      fields zero pending live-update path) during initdb, right after the
-      cluster system identifier is persisted. `pg_controldata` against a
-      goopg cluster now exits 0 and prints full upstream output (no version,
-      CRC, or alignment warnings). `TestPort_PgControldata001` upgraded to
-      the upstream positive-output check (`exit==0 && stdout contains
-      "checkpoint"`). `pg_checksums` enable/disable still deferred — needs
-      page-level checksum support over every relfile, which is out of
-      M0095 scope. CSV rows C-002 and CD-001 updated to reflect new state;
-      `docs/test-port/postgres-oracle-port-status.md` regenerated.
-      Design doc: `docs/design/0095-0001-pg-control-file.md`.
+- [x] **M0095-0001**
+      - Summary: Port `pg_checksums/001+002`, `pg_controldata/001`,
+        `pg_walsummary/001` as Go tests in
+        `internal/testport/client_tools_port_test.go`.
+      - Binary discovery: PATH first, then `postgres/local_install/bin`.
+      - Closed 2026-05-14: `internal/initdb/pgcontrol.go` writes a PG18-format
+        `global/pg_control` (296-byte ControlFileData + zero padding to 8192 B,
+      - CRC32C Castagnoli, system_identifier + cluster parameters; checkpoint
+        fields zero pending live-update path) during initdb, right after the
+        cluster system identifier is persisted. `pg_controldata` against a
+        goopg cluster now exits 0 and prints full upstream output (no version,
+      - CRC, or alignment warnings). `TestPort_PgControldata001` upgraded to
+        the upstream positive-output check (`exit==0 && stdout contains
+        "checkpoint"`). `pg_checksums` enable/disable still deferred — needs
+        page-level checksum support over every relfile, which is out of
+      - M0095 scope. CSV rows C-002 and CD-001 updated to reflect new state;
+        `docs/test-port/postgres-oracle-port-status.md` regenerated.
+      - Design doc: `docs/design/0095-0001-pg-control-file.md`.
 
-- [ ] **M0095-0002** — Port `pg_walsummary/002` (WAL block summarization)
-      as adapted Go test in `client_tools_port_test.go`.
-      Basic SQL (CREATE TABLE, INSERT, VACUUM, CHECKPOINT) passes.
-      WAL summarization (summarize_wal GUC, pg_available_wal_summaries(),
-      pg_stat_io walsummarizer rows, pg_walsummary -i) deferred with explicit
-      t.Skip blocker (goopg rejects unknown GUCs at startup; function not
-      implemented). CSV row WS-002 added; markdown regenerated (2026-05-12).
-      Action: add summarize_wal compatibility (GUC + catalog/functions + CLI path)
-      and remove t.Skip blocker.
+- [ ] **M0095-0002**
+      - Summary: Port `pg_walsummary/002` (WAL block summarization)
+        as adapted Go test in `client_tools_port_test.go`.
+      - Basic SQL (CREATE TABLE, INSERT, VACUUM, CHECKPOINT) passes.
+      - WAL summarization (summarize_wal GUC, pg_available_wal_summaries(),
+        pg_stat_io walsummarizer rows, pg_walsummary -i) deferred with explicit
+        t.Skip blocker (goopg rejects unknown GUCs at startup; function not
+        implemented). CSV row WS-002 added; markdown regenerated (2026-05-12).
+      - Action: add summarize_wal compatibility (GUC + catalog/functions + CLI path)
+        and remove t.Skip blocker.
 
-- [ ] **M0095-0003** — Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
-      as adapted Go tests in `internal/testport/pgbasebackup_port_test.go`.
-      010: --help/--version/options + no-pgdata + --compress=none:1/none+ PASS;
+- [ ] **M0095-0003**
+      - Summary: Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
+        as adapted Go tests in `internal/testport/pgbasebackup_port_test.go`.
+      - 010: --help/--version/options + no-pgdata + --compress=none:1/none+ PASS;
            backup execution SKIP (physical streaming).
-      011: SKIP entirely (in-place tablespace backup needs BASE_BACKUP protocol).
-      020: --help/--version/options + no-dir + slot-conflict + sync-conflict + compress PASS;
+      - 011: SKIP entirely (in-place tablespace backup needs BASE_BACKUP protocol).
+      - 020: --help/--version/options + no-dir + slot-conflict + sync-conflict + compress PASS;
            WAL streaming SKIP (replication protocol).
-      030: --help/--version/options + no-slot/db/action/file checks PASS;
+      - 030: --help/--version/options + no-slot/db/action/file checks PASS;
            logical streaming SKIP.
-      040: --help/--version/options + no-datadir/publisher/database PASS;
+      - 040: --help/--version/options + no-datadir/publisher/database PASS;
            subscriber setup SKIP.
-      CSV rows BB-010..040 added; markdown regenerated (2026-05-12).
+      - CSV rows BB-010..040 added; markdown regenerated (2026-05-12).
        Action: implement missing replication/base-backup protocol paths so skipped
        execution branches can run and be verified.
 
-- [x] **M0095-0004** — VACUUM/ANALYZE parenthesized syntax; OPERATOR(schema.op)
-      desugar; LATERAL derived-table analyzer+planner fallback; ANY(array[]) → IN
-      desugar; pg_namespace view; pg_class relpersistence/reltoastrelid/relpages
-      columns; pg_database datallowconn/datconnlimit; set_config() built-in.
-      Design doc: `docs/design/0095-0004-vacuum-parenthesized-syntax.md`.
-      All three vacuumdb tests pass (100/101/102).
-      CSV: D-005a/b/c → port,yes (2026-05-12).
+- [x] **M0095-0004**
+      - Summary: VACUUM/ANALYZE parenthesized syntax; OPERATOR(schema.op)
+        desugar; LATERAL derived-table analyzer+planner fallback; ANY(array[]) → IN
+        desugar; pg_namespace view; pg_class relpersistence/reltoastrelid/relpages
+        columns; pg_database datallowconn/datconnlimit; set_config() built-in.
+      - Design doc: `docs/design/0095-0004-vacuum-parenthesized-syntax.md`.
+      - All three vacuumdb tests pass (100/101/102).
+      - CSV: D-005a/b/c → port,yes (2026-05-12).
 
-- [x] **M0095-0005** — Add REINDEX parser+executor stub:
-      `REINDEX [(VERBOSE)] [CONCURRENTLY] {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM}
-      [IF EXISTS] name`.
-      KwReindex keyword, ReindexStmt AST, parseReindex(), planner Utility node,
-      executor no-op (utilityNoOp fallthrough). Both reindexdb tests pass.
-      CSV: D-005h/i → port,yes (2026-05-12).
+- [x] **M0095-0005**
+      - Summary: Add REINDEX parser+executor stub:
+        `REINDEX [(VERBOSE)] [CONCURRENTLY] {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM}
+        [IF EXISTS] name`.
+      - KwReindex keyword, ReindexStmt AST, parseReindex(), planner Utility node,
+        executor no-op (utilityNoOp fallthrough). Both reindexdb tests pass.
+      - CSV: D-005h/i → port,yes (2026-05-12).
 
-- [x] **M0095-0006** — CREATE/DROP ROLE/USER role-tracking handler.
-      Server gets in-memory roleSet (pre-seeded with "postgres"). New
-      `role_ddl.go` implements `tryHandleRoleDDL()`: CREATE ROLE registers
-      the role; DROP ROLE checks existence (42704 on miss).  Injected into
-      dispatch before compatNoopCommandTag.  pg_roles view unchanged (shows
-      "postgres"; \du use case not tested by 040/070).
-      Both scripts tests pass: TestPort_Scripts040Createuser PASS,
-      TestPort_Scripts070Dropuser PASS.
-      CSV: D-005f/g → port,yes (2026-05-12).
+- [x] **M0095-0006**
+      - Summary: CREATE/DROP ROLE/USER role-tracking handler.
+      - Server gets in-memory roleSet (pre-seeded with "postgres"). New
+        `role_ddl.go` implements `tryHandleRoleDDL()`: CREATE ROLE registers
+        the role; DROP ROLE checks existence (42704 on miss).  Injected into
+        dispatch before compatNoopCommandTag.  pg_roles view unchanged (shows
+        "postgres"; \du use case not tested by 040/070).
+      - Both scripts tests pass: TestPort_Scripts040Createuser PASS,
+      - TestPort_Scripts070Dropuser PASS.
+      - CSV: D-005f/g → port,yes (2026-05-12).
 
-- [x] **M0095-0007** — Unblock TestPort_Scripts020Createdb and TestPort_Scripts050Dropdb.
-      `tryHandleDatabaseDDL` (M0054-0001, already implemented) handles CREATE
-      DATABASE via catalog.CreateDatabase and DROP DATABASE via DropDatabase
-      (returns ErrDatabaseNotFound for nonexistent DBs). Both tests PASS
-      immediately after removing t.Skip.  D-005l (200_connstr) stays deferred:
-      goopg is UTF8-only; LATIN1 encoding blocker remains.
-      Reason for keeping checked: UTF8-only is an explicit goopg design constraint,
-      so LATIN1 parity is out-of-scope unless that design premise itself changes.
-      CSV: D-005d/e → port,yes (2026-05-12).
+- [x] **M0095-0007**
+      - Summary: Unblock TestPort_Scripts020Createdb and TestPort_Scripts050Dropdb.
+        `tryHandleDatabaseDDL` (M0054-0001, already implemented) handles CREATE
+      - DATABASE via catalog.CreateDatabase and DROP DATABASE via DropDatabase
+        (returns ErrDatabaseNotFound for nonexistent DBs). Both tests PASS
+        immediately after removing t.Skip.  D-005l (200_connstr) stays deferred:
+        goopg is UTF8-only; LATIN1 encoding blocker remains.
+      - Reason for keeping checked: UTF8-only is an explicit goopg design constraint,
+        so LATIN1 parity is out-of-scope unless that design premise itself changes.
+      - CSV: D-005d/e → port,yes (2026-05-12).
 
-- [x] **M0095-0008** — CLUSTER parser+executor stub + pg_class relnamespace fix.
-      KwCluster keyword, ClusterStmt AST, parseCluster(), planner Utility
-      routing, clusterOp (table-existence check with schema fallback).
-      Also: pg_class.relnamespace changed from "public" to OID "2200"
-      so catalog JOIN queries work (clusterdb catalog query was returning 0
-      rows). Also: fixed multi-statement SET query bug in query.go (handleQuery
-      now routes queries with internal ';' to parser-based executor path).
-      Design doc: no separate doc required (stub + catalog fix only).
-      Both clusterdb tests pass; all vacuumdb tests unaffected.
-      CSV: D-005j/k → port,yes (2026-05-12).
+- [x] **M0095-0008**
+      - Summary: CLUSTER parser+executor stub + pg_class relnamespace fix.
+      - KwCluster keyword, ClusterStmt AST, parseCluster(), planner Utility
+        routing, clusterOp (table-existence check with schema fallback).
+      - Also: pg_class.relnamespace changed from "public" to OID "2200"
+        so catalog JOIN queries work (clusterdb catalog query was returning 0
+        rows). Also: fixed multi-statement SET query bug in query.go (handleQuery
+        now routes queries with internal ';' to parser-based executor path).
+      - Design doc: no separate doc required (stub + catalog fix only).
+      - Both clusterdb tests pass; all vacuumdb tests unaffected.
+      - CSV: D-005j/k → port,yes (2026-05-12).
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 
@@ -207,75 +216,81 @@ alongside the suite.
 
 ### Sub-milestones
 
-- [x] **M0096-0001** — Added 20 dedicated sequential isolation test functions
-      in `internal/testport/isolation_port_test.go` (lock-committed-update
-      already existed). All 20 new tests use `runIsoSpec` which t.Skips when
-      output doesn't match expected — correctly deferring until the required
-      SQL features land. Verified: eval-plan-qual and merge-join both t.Skip
-      with SQL errors for unsupported syntax (2026-05-12).
+- [x] **M0096-0001**
+      - Summary: Added 20 dedicated sequential isolation test functions
+        in `internal/testport/isolation_port_test.go` (lock-committed-update
+        already existed). All 20 new tests use `runIsoSpec` which t.Skips when
+        output doesn't match expected — correctly deferring until the required
+      - SQL features land. Verified: eval-plan-qual and merge-join both t.Skip
+        with SQL errors for unsupported syntax (2026-05-12).
 
-- [x] **M0096-0002** — BEGIN ISOLATION LEVEL + SET TRANSACTION ISOLATION LEVEL.
-      Changes: BeginStmt.IsolationLevel string; SetTransactionStmt AST;
-      parseBegin() now parses ISOLATION LEVEL + READ ONLY/WRITE/DEFERRABLE
-      (latter two are no-ops); parseSet() intercepts SET [LOCAL] TRANSACTION
-      ISOLATION LEVEL; planner Transaction.IsolationLevel; execBegin() calls
-      SetIsolationLevel from plan; setTransactionOp calls SetIsolationLevel on
-      session; SetIsolationLevel added to Session interface; mvcc.ParseIsolationLevel
-      maps SERIALIZABLE→RepeatableRead, READ UNCOMMITTED→ReadCommitted.
-      Verification: TestPort_IsolationLockCommittedUpdate now parses BEGIN ISOLATION
-      LEVEL READ COMMITTED successfully (defers due to pg_advisory_lock, not parsing).
-      TestPort_IsolationInsertConflictDoNothing similarly advances past parsing. (2026-05-12).
+- [x] **M0096-0002**
+      - Summary: BEGIN ISOLATION LEVEL + SET TRANSACTION ISOLATION LEVEL.
+      - Changes: BeginStmt.IsolationLevel string; SetTransactionStmt AST;
+        parseBegin() now parses ISOLATION LEVEL + READ ONLY/WRITE/DEFERRABLE
+        (latter two are no-ops); parseSet() intercepts SET [LOCAL] TRANSACTION
+      - ISOLATION LEVEL; planner Transaction.IsolationLevel; execBegin() calls
+      - SetIsolationLevel from plan; setTransactionOp calls SetIsolationLevel on
+        session; SetIsolationLevel added to Session interface; mvcc.ParseIsolationLevel
+        maps SERIALIZABLE→RepeatableRead, READ UNCOMMITTED→ReadCommitted.
+      - Verification: TestPort_IsolationLockCommittedUpdate now parses BEGIN ISOLATION
+      - LEVEL READ COMMITTED successfully (defers due to pg_advisory_lock, not parsing).
+      - TestPort_IsolationInsertConflictDoNothing similarly advances past parsing. (2026-05-12).
 
-- [x] **M0096-0003** — Advisory lock built-in functions implemented.
-      New file `internal/executor/advisory.go`: process-global advisoryManager
-      with channel-based blocking (waiter queues), context cancellation support,
-      release-all on session teardown. Functions added to evalFuncCall():
-      pg_advisory_lock(bigint), pg_advisory_lock(int4,int4),
-      pg_advisory_unlock(bigint/int4,int4), pg_advisory_unlock_all(),
-      pg_advisory_xact_lock(int4,int4) [treated as session-scoped],
-      pg_try_advisory_xact_lock(int4,int4) [non-blocking],
-      pg_try_advisory_lock(bigint) [non-blocking].
-      Verification: lock-committed-update no longer errors on advisory lock;
-      defers on FOR KEY SHARE (M0096-0004) and column naming (2026-05-12).
+- [x] **M0096-0003**
+      - Summary: Advisory lock built-in functions implemented.
+      - New file `internal/executor/advisory.go`: process-global advisoryManager
+        with channel-based blocking (waiter queues), context cancellation support,
+        release-all on session teardown. Functions added to evalFuncCall():
+        pg_advisory_lock(bigint), pg_advisory_lock(int4,int4),
+        pg_advisory_unlock(bigint/int4,int4), pg_advisory_unlock_all(),
+        pg_advisory_xact_lock(int4,int4) [treated as session-scoped],
+        pg_try_advisory_xact_lock(int4,int4) [non-blocking],
+        pg_try_advisory_lock(bigint) [non-blocking].
+      - Verification: lock-committed-update no longer errors on advisory lock;
+        defers on FOR KEY SHARE (M0096-0004) and column naming (2026-05-12).
 
-- [x] **M0096-0004** — FOR KEY SHARE / FOR NO KEY UPDATE + IS [NOT] NULL.
-      Parser: LockStrengthForKeyShare/ForNoKeyUpdate constants; parseLockingClause()
-      now handles FOR KEY SHARE and FOR NO KEY UPDATE via lookahead.
-      Planner: lockStrengthFromParser maps ForKeyShare→ForShare, ForNoKeyUpdate→ForUpdate.
-      Also added IS [NOT] NULL: IsNullExpr AST + parser; planner IsNullExpr plan node
-      (resolveExpr, agg, window, constant, walker); executor evalExprSlot case;
-      analyzer exprHasWindowFunc + analyzeExpr cases. Advisory lock session ID fix:
-      advisorySessionIDFromContext uses ctx.BackendID (per-connection) instead of
-      nil Session pointer — cross-session blocking now works with IsolationRunner.
-      Verification: TestPort_IsolationLockCommittedUpdate runs 120s (blocking works,
-      spec defers due to output format + connection timeout across permutations). (2026-05-12).
+- [x] **M0096-0004**
+      - Summary: FOR KEY SHARE / FOR NO KEY UPDATE + IS [NOT] NULL.
+      - Parser: LockStrengthForKeyShare/ForNoKeyUpdate constants; parseLockingClause()
+        now handles FOR KEY SHARE and FOR NO KEY UPDATE via lookahead.
+      - Planner: lockStrengthFromParser maps ForKeyShare→ForShare, ForNoKeyUpdate→ForUpdate.
+      - Also added IS [NOT] NULL: IsNullExpr AST + parser; planner IsNullExpr plan node
+        (resolveExpr, agg, window, constant, walker); executor evalExprSlot case;
+        analyzer exprHasWindowFunc + analyzeExpr cases. Advisory lock session ID fix:
+        advisorySessionIDFromContext uses ctx.BackendID (per-connection) instead of
+        nil Session pointer — cross-session blocking now works with IsolationRunner.
+      - Verification: TestPort_IsolationLockCommittedUpdate runs 120s (blocking works,
+        spec defers due to output format + connection timeout across permutations). (2026-05-12).
 
-- [ ] **M0096-0005** — ON CONFLICT infrastructure: partial progress (2026-05-12).
-      Landed:
-      (a) CREATE TABLE now creates primary key btree index for inline `col type
+- [ ] **M0096-0005**
+      - Summary: ON CONFLICT infrastructure: partial progress (2026-05-12).
+      - Landed:
+        (a) CREATE TABLE now creates primary key btree index for inline `col type
           PRIMARY KEY` and table-level `PRIMARY KEY (cols)` — fixes 42P10 "no
           unique constraint" error that was the primary blocker.
-      (b) text added to isSupportedBTreeKeyType (text primary keys now work).
-      (c) IsolationRunner pqprintFormat: changed separator from " | " to "|"
+        (b) text added to isSupportedBTreeKeyType (text primary keys now work).
+        (c) IsolationRunner pqprintFormat: changed separator from " | " to "|"
           matching PostgreSQL isolationtester's PQprint output format.
-      (d) Per-connection explicit transaction tracking (connTxState in conn_tx.go):
+        (d) Per-connection explicit transaction tracking (connTxState in conn_tx.go):
           BEGIN starts a real TxnMgr transaction, COMMIT/ROLLBACK end it; all
           statements within an explicit block reuse the same TxnMgr transaction.
           This is required so donothing1's INSERT stays uncommitted while donothing2
           runs.
-      (e) WaitForXID on mvcc.Manager (broadcasts on every commit/rollback) and
+        (e) WaitForXID on mvcc.Manager (broadcasts on every commit/rollback) and
           probeArbiterWaiting / findInProgressConflict in upsertOp (row-wait logic).
-      (f) advisorySessionIDFromContext uses ctx.BackendID rather than nil Session.
-      Remaining: donothing2 / insert2 blocking behavior (insert-conflict specs) not
-      yet producing <waiting ...> lines. The blocking mechanism is wired but debugging
-      of the exact WaitForXID trigger path is needed (XID propagation from ectx.Tx
-      to connTxState may be incomplete). The insert-conflict-do-update and do-nothing
-      specs still defer.
-      Action: complete wait-state propagation and output parity so insert-conflict
-      specs can transition from defer to pass.
+        (f) advisorySessionIDFromContext uses ctx.BackendID rather than nil Session.
+      - Remaining: donothing2 / insert2 blocking behavior (insert-conflict specs) not
+        yet producing <waiting ...> lines. The blocking mechanism is wired but debugging
+        of the exact WaitForXID trigger path is needed (XID propagation from ectx.Tx
+        to connTxState may be incomplete). The insert-conflict-do-update and do-nothing
+        specs still defer.
+      - Action: complete wait-state propagation and output parity so insert-conflict
+        specs can transition from defer to pass.
 
-- [x] **M0096-0006** — Unblocked `drop-index-concurrently-1` setup (2026-05-12).
-      Features implemented:
+- [x] **M0096-0006**
+      - Summary: Unblocked `drop-index-concurrently-1` setup (2026-05-12).
+      - Features implemented:
       - INSERT … SELECT: parser (dml.go), analyzer, planner (planInsert routes to planSelect)
       - generate_series(n,m) FROM clause SRF: TableFuncRef AST, parseRangeVar detection,
         planTableFuncRangeVar → GenerateSeries plan node, generateSeriesOp executor, 
@@ -286,82 +301,89 @@ alongside the suite.
       - PREPARE name AS … / EXECUTE name / DEALLOCATE: parser keywords + AST + per-connection
         preparedStatements store in conn_tx.go; dispatch handles PREPARE/EXECUTE/DEALLOCATE inline
       - SET enable_seqscan: already in GUC registry (stub)
-      Verification: TestPort_IsolationDropIndexConcurrently1 now passes setup and runs the permutation
-      (defers on EXPLAIN EXECUTE plan format and other output differences). All core unit tests PASS.
+      - Verification: TestPort_IsolationDropIndexConcurrently1 now passes setup and runs the permutation
+        (defers on EXPLAIN EXECUTE plan format and other output differences). All core unit tests PASS.
 
-- [x] **M0096-0007** — Partitioned tables (LIST and RANGE).  2026-05-12.
-      Design doc: `docs/design/0096-0007-partition-tables.md`.
-      Parser: PartitionByClause/PartitionOfClause AST + PARTITION BY/OF/ATTACH;
-      RETURNS SETOF accepted.  Catalog: PartitionBound struct, Table partition
-      fields, partitionChildren registry, FindPartitionForValue/RANGE.
-      Executor DDL: execCreatePartitionChild + AlterTableAttachPartition.
-      Executor INSERT: routeToPartition routes to LIST/RANGE partition child.
-      Planner: UNION ALL SeqScan over partition children.
-      Verification: partition-key-update-1 advances past partition DDL to
-      CREATE TRIGGER (M0096-0012 prereq); merge-update advances to INSERT
-      runtime. All core unit tests PASS.
+- [x] **M0096-0007**
+      - Summary: Partitioned tables (LIST and RANGE).  2026-05-12.
+      - Design doc: `docs/design/0096-0007-partition-tables.md`.
+      - Parser: PartitionByClause/PartitionOfClause AST + PARTITION BY/OF/ATTACH;
+      - RETURNS SETOF accepted.  Catalog: PartitionBound struct, Table partition
+        fields, partitionChildren registry, FindPartitionForValue/RANGE.
+      - Executor DDL: execCreatePartitionChild + AlterTableAttachPartition.
+      - Executor INSERT: routeToPartition routes to LIST/RANGE partition child.
+      - Planner: UNION ALL SeqScan over partition children.
+      - Verification: partition-key-update-1 advances past partition DDL to
+      - CREATE TRIGGER (M0096-0012 prereq); merge-update advances to INSERT
+        runtime. All core unit tests PASS.
 
-- [x] **M0096-0008** — GENERATED ALWAYS AS (expr) STORED + supporting features.  2026-05-12.
-      Design doc: `docs/design/0096-0008-generated-always-stored.md`.
-      Key features: GeneratedAlways/GeneratedExpr in ColumnDef + catalog Column;
-      lightweight expression evaluator (evalGenExpr) for stored columns;
-      INSERT/UPDATE recomputation via computeGeneratedColumns; analyzer + planner
-      skip generated cols in INSERT target mapping; empty column lists ();
-      CTAS (CREATE TABLE name AS SELECT …); INHERITS clause parsing;
-      text btree key encoding; generate_series scalar fallback.
-      Verification: eval-plan-qual setup now completes (spec times out on blocking
-      rather than failing at syntax). All core unit tests PASS.
+- [x] **M0096-0008**
+      - Summary: GENERATED ALWAYS AS (expr) STORED + supporting features.  2026-05-12.
+      - Design doc: `docs/design/0096-0008-generated-always-stored.md`.
+      - Key features: GeneratedAlways/GeneratedExpr in ColumnDef + catalog Column;
+        lightweight expression evaluator (evalGenExpr) for stored columns;
+      - INSERT/UPDATE recomputation via computeGeneratedColumns; analyzer + planner
+        skip generated cols in INSERT target mapping; empty column lists ();
+      - CTAS (CREATE TABLE name AS SELECT …); INHERITS clause parsing;
+        text btree key encoding; generate_series scalar fallback.
+      - Verification: eval-plan-qual setup now completes (spec times out on blocking
+        rather than failing at syntax). All core unit tests PASS.
 
-- [x] **M0096-0009** — Table inheritance (`INHERITS`). 2026-05-12.
-      Design doc: `docs/design/0096-0009-table-inheritance.md`.
-      Catalog: `inheritanceChildren` map + `RegisterInheritanceChild` +
-      `InheritanceChildren` helpers.  Executor DDL: column-copy from all
-      parents into child before `CreateTable`, then register child OID with
-      each parent.  Planner: inheritance-aware scan builds
-      `SeqScan(parent) UNION ALL SeqScan(c1) UNION ALL …` in `planScanRangeVar`.
-      All core unit tests pass.
+- [x] **M0096-0009**
+      - Summary: Table inheritance (`INHERITS`). 2026-05-12.
+      - Design doc: `docs/design/0096-0009-table-inheritance.md`.
+      - Catalog: `inheritanceChildren` map + `RegisterInheritanceChild` +
+        `InheritanceChildren` helpers.  Executor DDL: column-copy from all
+        parents into child before `CreateTable`, then register child OID with
+        each parent.  Planner: inheritance-aware scan builds
+        `SeqScan(parent) UNION ALL SeqScan(c1) UNION ALL …` in `planScanRangeVar`.
+      - All core unit tests pass.
 
-- [x] **M0096-0010** — Implement `MERGE INTO target USING source ON cond
-      WHEN MATCHED THEN UPDATE/DELETE WHEN NOT MATCHED THEN INSERT`.
-      Unblocks: `merge-update`, `merge-delete`, `merge-insert-update`,
-      `merge-match-recheck`, `merge-join` (5 specs).
-      Parser: KwMerge/KwMatched; MergeStmt/MergeWhenClause AST; parseMerge.
-      Planner: Merge plan node; planMerge with merged target+source schema.
-      Executor: mergeOp nested-loop match scan + deferred mods + NOT MATCHED INSERT.
-      Design doc: 0096-0010-merge-into.md.
+- [x] **M0096-0010**
+      - Summary: Implement `MERGE INTO target USING source ON cond
+      - WHEN MATCHED THEN UPDATE/DELETE WHEN NOT MATCHED THEN INSERT`.
+      - Unblocks: `merge-update`, `merge-delete`, `merge-insert-update`,
+        `merge-match-recheck`, `merge-join` (5 specs).
+      - Parser: KwMerge/KwMatched; MergeStmt/MergeWhenClause AST; parseMerge.
+      - Planner: Merge plan node; planMerge with merged target+source schema.
+      - Executor: mergeOp nested-loop match scan + deferred mods + NOT MATCHED INSERT.
+      - Design doc: 0096-0010-merge-into.md.
 
-- [x] **M0096-0011** — Implement inline `REFERENCES table (cols)` column
-      constraint and table constraint in `CREATE TABLE` (FK enforcement
-      at INSERT/UPDATE/DELETE, deferred FK modes).
-      Unblocks: `fk-snapshot` (with ON DELETE CASCADE/SET NULL/NO ACTION INITIALLY DEFERRED).
-      Parser: FKAction type + FK fields on ColumnDef; parseFKAction helper.
-      Catalog: ForeignKey struct + ForeignKeys on Table + FindFKsReferencingTable.
-      Executor: checkFKInsert + enforceFKOnDelete (CASCADE/RESTRICT/SET NULL/NO ACTION)
-      + DEFERRABLE INITIALLY DEFERRED queued in BasicSession, checked at execCommit.
-      Design doc: 0096-0011-fk-enforcement.md.
+- [x] **M0096-0011**
+      - Summary: Implement inline `REFERENCES table (cols)` column
+        constraint and table constraint in `CREATE TABLE` (FK enforcement
+        at INSERT/UPDATE/DELETE, deferred FK modes).
+      - Unblocks: `fk-snapshot` (with ON DELETE CASCADE/SET NULL/NO ACTION INITIALLY DEFERRED).
+      - Parser: FKAction type + FK fields on ColumnDef; parseFKAction helper.
+      - Catalog: ForeignKey struct + ForeignKeys on Table + FindFKsReferencingTable.
+      - Executor: checkFKInsert + enforceFKOnDelete (CASCADE/RESTRICT/SET NULL/NO ACTION)
+        + DEFERRABLE INITIALLY DEFERRED queued in BasicSession, checked at execCommit.
+      - Design doc: 0096-0011-fk-enforcement.md.
 
-- [x] **M0096-0012** — RAISE NOTICE now emits NoticeResponse to client. (2026-05-12)
-      Two bugs fixed:
-      1. `plpgsql_runtime.go` RaiseStmt handler: NOTICE/WARNING levels were
+- [x] **M0096-0012**
+      - Summary: RAISE NOTICE now emits NoticeResponse to client. (2026-05-12)
+      - Two bugs fixed:
+      - 1. `plpgsql_runtime.go` RaiseStmt handler: NOTICE/WARNING levels were
          silently discarded (no-op). Fixed to call `ctx.AddNotice(plpgsqlExtractMsgText(s.Msg))`.
          RAISE EXCEPTION now also strips quotes via `plpgsqlExtractMsgText`.
-      2. `executePLpgSQLTriggerBody` creates a child copy of ctx (`*child = *ctx`).
+      - 2. `executePLpgSQLTriggerBody` creates a child copy of ctx (`*child = *ctx`).
          Notices added to `child.Notices` inside the trigger body were never
          propagated back to the outer `ctx.Notices`. Fixed: notices from `child`
          are transferred to `ctx` after trigger execution.
-      3. Added `plpgsqlExtractMsgText()` to strip outer single-quote delimiters
+      - 3. Added `plpgsqlExtractMsgText()` to strip outer single-quote delimiters
          from the raw RAISE message text (format substitution still deferred).
-      Verified end-to-end: `RAISE NOTICE 'trigger notice'` inside a BEFORE INSERT
-      trigger produces `NOTICE: trigger notice` before `INSERT 0 1` in psql output.
-      All executor tests pass with -race.
-      Design doc: 0096-0012-triggers.md (accepted).
+      - Verified end-to-end: `RAISE NOTICE 'trigger notice'` inside a BEFORE INSERT
+        trigger produces `NOTICE: trigger notice` before `INSERT 0 1` in psql output.
+      - All executor tests pass with -race.
+      - Design doc: 0096-0012-triggers.md (accepted).
 
-- [ ] **M0096-0013** — End-to-end pass confirmation: run all 21 dedicated
-      test functions from M0096-0001, confirm every spec reports `pass`.
-      Fix any remaining output-normalization or row-ordering mismatches.
+- [ ] **M0096-0013**
+      - Summary: End-to-end pass confirmation: run all 21 dedicated
+        test functions from M0096-0001, confirm every spec reports `pass`.
+      - Fix any remaining output-normalization or row-ordering mismatches.
 
-      **Status**: Partial — 0 of 21 tests fully pass (all report "defer").
-      Fixes landed:
+      - **Status**: Partial — 0 of 21 tests fully pass (all report "defer").
+      - Fixes landed:
       - Parser: `parseFKAction` now uses `acceptKeyword` (CASCADE/RESTRICT/SET
         are tokenized as keywords, not identifiers). Fixed `KwOn` in REFERENCES
         ON DELETE clause. Fixed bare `INITIALLY DEFERRED` (without DEFERRABLE).
@@ -369,7 +391,7 @@ alongside the suite.
       - Partition-aware UPDATE: updateOp scans children + routes new row to
         correct partition (cross-partition UPDATE). `remapRowForPartition` handles
         column-order differences (e.g. part2 in merge-update spec).
-      Remaining blockers (documented, not fixed in this loop):
+      - Remaining blockers (documented, not fixed in this loop):
       - RR/Serializable snapshot semantics: server refreshes snapshot per statement
         for all isolation levels; RR should use BEGIN-time snapshot.
       - Concurrent blocking detection: INSERT/UPDATE wait semantics and
@@ -377,8 +399,8 @@ alongside the suite.
       - RAISE NOTICE output: trigger functions produce no output (NOTICE is no-op).
       - Column alignment: `---+---` width varies between PostgreSQL and goopg.
       - EvalPlanQual: concurrent UPDATE re-evaluation not implemented.
-      Action: close the above blockers and rerun all 21 dedicated isolation tests
-      until every case reaches pass.
+      - Action: close the above blockers and rerun all 21 dedicated isolation tests
+        until every case reaches pass.
 
 ## M0097 — pg_regress Coverage: Feature Parity & Test Pass (filed 2026-05-12)
 
@@ -406,448 +428,464 @@ M0097-0001 wires it up.
 
 ### Sub-milestones
 
-- [x] **M0097-0001** — Wire up `TestPort_RegressSuite` in
-      `internal/testport/` with a concrete `ClusterRegressExecutor`
-      (connects to a live goopg cluster via `database/sql`), pre-runs
-      `test_setup.sql` to materialise the shared tables used by most
-      cases (`INT2_TBL`, `INT4_TBL`, `FLOAT8_TBL`, etc.), and surfaces
-      per-case pass/defer/excluded results as subtests.
-      Also add a `NormalizeRegressOutput` extension pass for goopg-
-      specific divergences (e.g., column-name casing, error message
-      wording differences).
-      Implementation: regress_suite_test.go with ClusterRegressExecutor
-      (psql -X -q -a -f) + NormalizeRegressOutput extended with
-      ERROR/NOTICE/WARNING double-space normalisation. All 232 cases
-      report "defer" on initial run (expected). Infrastructure confirmed
-      working: cases discovered, test_setup.sql runs best-effort.
+- [x] **M0097-0001**
+      - Summary: Wire up `TestPort_RegressSuite` in
+        `internal/testport/` with a concrete `ClusterRegressExecutor`
+        (connects to a live goopg cluster via `database/sql`), pre-runs
+        `test_setup.sql` to materialise the shared tables used by most
+        cases (`INT2_TBL`, `INT4_TBL`, `FLOAT8_TBL`, etc.), and surfaces
+        per-case pass/defer/excluded results as subtests.
+      - Also add a `NormalizeRegressOutput` extension pass for goopg-
+        specific divergences (e.g., column-name casing, error message
+        wording differences).
+      - Implementation: regress_suite_test.go with ClusterRegressExecutor
+        (psql -X -q -a -f) + NormalizeRegressOutput extended with
+      - ERROR/NOTICE/WARNING double-space normalisation. All 232 cases
+        report "defer" on initial run (expected). Infrastructure confirmed
+        working: cases discovered, test_setup.sql runs best-effort.
 
-- [x] **M0097-0002** — Formally reclassify ~102 tests as `excluded` in
-      `docs/test-port/upstream-regress-coverage.md` and in the suite
-      runner's policy table.  Excluded categories:
-      • Geometric types: `box`, `circle`, `geometry`, `line`, `lseg`,
+- [x] **M0097-0002**
+      - Summary: Formally reclassify ~102 tests as `excluded` in
+        `docs/test-port/upstream-regress-coverage.md` and in the suite
+        runner's policy table.  Excluded categories:
+        • Geometric types: `box`, `circle`, `geometry`, `line`, `lseg`,
         `path`, `point`, `polygon` (8)
-      • Full-text search: `tsdicts`, `tsearch`, `tsrf`, `tstypes` (4)
-      • Advanced AM / exotic index: `brin`, `brin_bloom`, `brin_multi`,
+        • Full-text search: `tsdicts`, `tsearch`, `tsrf`, `tstypes` (4)
+        • Advanced AM / exotic index: `brin`, `brin_bloom`, `brin_multi`,
         `gin`, `gist`, `spgist`, `amutils`, `create_am`,
         `create_index_spgist` (9)
-      • Collation / encoding: `collate`, `collate.icu.utf8`,
+        • Collation / encoding: `collate`, `collate.icu.utf8`,
         `collate.linux.utf8`, `collate.utf8`, `collate.windows.win1252`,
         `euc_kr`, `encoding`, `unicode`, `copyencoding` (9)
-      • External / infra features: `foreign_data`, `largeobject`,
+        • External / infra features: `foreign_data`, `largeobject`,
         `indirect_toast`, `compression`, `tablespace`, `tablesample`,
         `async`, `numa`, `object_address`, `maintain_every` (10)
-      • XML / advanced JSON: `xml`, `xmlmap`, `sqljson`,
+        • XML / advanced JSON: `xml`, `xmlmap`, `sqljson`,
         `sqljson_jsontable`, `sqljson_queryfuncs`, `json_encoding`,
         `jsonpath_encoding` (7)
-      • Security & roles: `rowsecurity`, `privileges`, `security_label`,
+        • Security & roles: `rowsecurity`, `privileges`, `security_label`,
         `init_privs`, `password`, `roleattributes`, `create_role` (7)
-      • Parallel: `select_parallel`, `write_parallel`,
+        • Parallel: `select_parallel`, `write_parallel`,
         `vacuum_parallel` (3)
-      • Event triggers: `event_trigger`, `event_trigger_login` (2)
-      • psql client: `psql`, `psql_crosstab`, `psql_pipeline` (3)
-      • Network types: `inet`, `macaddr`, `macaddr8` (3)
-      • Catalog sanity: `misc_sanity`, `opr_sanity`, `type_sanity`,
+        • Event triggers: `event_trigger`, `event_trigger_login` (2)
+        • psql client: `psql`, `psql_crosstab`, `psql_pipeline` (3)
+        • Network types: `inet`, `macaddr`, `macaddr8` (3)
+        • Catalog sanity: `misc_sanity`, `opr_sanity`, `type_sanity`,
         `oidjoins`, `sanity_check` (5)
-      • Complex AM / type extensions: `create_aggregate`, `create_cast`,
+        • Complex AM / type extensions: `create_aggregate`, `create_cast`,
         `create_operator`, `drop_operator`, `alter_operator`,
         `alter_generic`, `polymorphism`, `create_type`, `create_misc`,
         `regproc` (10)
-      • Replication catalog: `publication`, `subscription`,
+        • Replication catalog: `publication`, `subscription`,
         `replica_identity` (3)
-      • C-language functions: `create_function_c` (1)
-      • Misc out-of-scope: `bit`, `bitmapops`, `conversion`, `combocid`,
+        • C-language functions: `create_function_c` (1)
+        • Misc out-of-scope: `bit`, `bitmapops`, `conversion`, `combocid`,
         `dependency`, `reloptions`, `hash_func`, `predicate`, `stats`,
         `stats_ext`, `stats_import`, `typed_table`, `memoize`,
         `without_overlaps`, `money`, `namespace`, `database`,
         `infinite_recurse`, `create_schema`, `create_misc` (20+)
-      Reason for keeping checked: these are explicit scope/design exclusions,
-      not unfinished parity items.
+      - Reason for keeping checked: these are explicit scope/design exclusions,
+        not unfinished parity items.
 
-- [ ] **M0097-0003** — Core standalone + scalar type parity. (partial 2026-05-12)
-      Multiple fixes landed:
-      1. Double-ReadyForQuery: `errQueryErrorSent` sentinel fixes duplicate RFQ.
-      2. `NormalizeRegressOutput` extended (SET preamble, psql:file:N:, LINE N:, ^,
+- [ ] **M0097-0003**
+      - Summary: Core standalone + scalar type parity. (partial 2026-05-12)
+      - Multiple fixes landed:
+      - 1. Double-ReadyForQuery: `errQueryErrorSent` sentinel fixes duplicate RFQ.
+      - 2. `NormalizeRegressOutput` extended (SET preamble, psql:file:N:, LINE N:, ^,
          0x5a lines, blank between -- and (N rows)).
-      3. FuncCall column alias: uses function name instead of `?column?`.
-      4. `pg_input_is_valid('x', 'bool')`: proper bool validation.
-      5. `CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE`: parsed as CREATE TABLE.
-      6. `SELECT;` (empty target list): returns 1 empty row.
-      7. `schema != nil` dispatch: RowDescription sent for 0-column results.
-      Additional fixes (2026-05-12 loop 15+16):
-      8. Lexer: binary (0b), octal (0o), hex (0x) integer literals; numeric _ separators.
-      9. Parser: `parseIntLiteralExpr` handles overflow via NumericConst fallback.
-      10. Normalization: "trailing junk after numeric literal" wording normalized.
-      11. `name` type: 63-byte truncation in encodeValue and evalTypedStringLit.
-      12. `oid`/`uuid` INSERT: isAssignable allows text→oid/uuid; encodeValue validates.
-      13. text→int2/int4/int8/float4/float8 coercion in INSERT/UPDATE: isAssignable now
+      - 3. FuncCall column alias: uses function name instead of `?column?`.
+      - 4. `pg_input_is_valid('x', 'bool')`: proper bool validation.
+      - 5. `CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE`: parsed as CREATE TABLE.
+      - 6. `SELECT;` (empty target list): returns 1 empty row.
+      - 7. `schema != nil` dispatch: RowDescription sent for 0-column results.
+      - Additional fixes (2026-05-12 loop 15+16):
+      - 8. Lexer: binary (0b), octal (0o), hex (0x) integer literals; numeric _ separators.
+      - 9. Parser: `parseIntLiteralExpr` handles overflow via NumericConst fallback.
+      - 10. Normalization: "trailing junk after numeric literal" wording normalized.
+      - 11. `name` type: 63-byte truncation in encodeValue and evalTypedStringLit.
+      - 12. `oid`/`uuid` INSERT: isAssignable allows text→oid/uuid; encodeValue validates.
+      - 13. text→int2/int4/int8/float4/float8 coercion in INSERT/UPDATE: isAssignable now
           allows string → any numeric/integer type (runtime validation via encodeValue).
           This populates shared tables (INT2_TBL, INT4_TBL, INT8_TBL, FLOAT8_TBL)
           from test_setup.sql, enabling int2/int4/int8/float4/float8 regress tests.
-      14. int2/smallint encodeValue case: validates range -32768..32767.
-      15. float4/float8 encodeValue cases: validates float syntax.
-      16. TypeOID fixes: int2(21), float4(700), float8(701), oid(26), name(19),
+      - 14. int2/smallint encodeValue case: validates range -32768..32767.
+      - 15. float4/float8 encodeValue cases: validates float syntax.
+      - 16. TypeOID fixes: int2(21), float4(700), float8(701), oid(26), name(19),
           uuid(2950), date(1082), time(1083), timetz(1266), interval(1186).
-      17. pg_input_is_valid: extended for int2, int4, int8, float4, float8, oid, uuid.
-      18. int2/smallint binary storage: encodeValue stores as 2-byte big-endian.
-      19. Planner type inference: TypedStringLit now returns its declared type in
+      - 17. pg_input_is_valid: extended for int2, int4, int8, float4, float8, oid, uuid.
+      - 18. int2/smallint binary storage: encodeValue stores as 2-byte big-endian.
+      - 19. Planner type inference: TypedStringLit now returns its declared type in
           exprType so int2 '2' has type "int2", not "unknown". BinaryOp arithmetic
           type inference extended with isIntegerLikeType + promoteIntType helpers
           so int2*int2 → int2, int2*int4 → int4, int4*int8 → int8.
           This fixes column width alignment for arithmetic expressions on int2 columns.
-      Loop 7 additions (2026-05-12):
-      20. Bitwise operators: parser lexes &, #, <<, >> as tokens; OpBitAnd/Or/Xor/Not/
+      - Loop 7 additions (2026-05-12):
+      - 20. Bitwise operators: parser lexes &, #, <<, >> as tokens; OpBitAnd/Or/Xor/Not/
           ShiftLeft/ShiftRight in parser + planner + executor. TABLE shorthand
           (TABLE tablename → SELECT * FROM tablename). Float4/float8 cast normalizes
           KindNumeric to strip trailing zeros.
-      21. synthesizeSubqueryTable star expansion: StarExpr in inner SELECT (e.g.
+      - 21. synthesizeSubqueryTable star expansion: StarExpr in inner SELECT (e.g.
           TABLE shorthand) now expands to all columns from innerCtx.rels instead of
           returning "'*' is not allowed here". Column alias count validation also
           added (fixes TABLE subquery with wrong alias count).
-      22. int4 overflow detection: BinaryOp evaluation checks result fits int4 range
+      - 22. int4 overflow detection: BinaryOp evaluation checks result fits int4 range
           [-2147483648, 2147483647] and returns "integer out of range" on overflow.
           Bitwise ops also set ResultType so overflow fires correctly.
-      23. gcd(a,b) and lcm(a,b) implemented with int4 overflow detection.
-      24. VALUES subquery columns typed as "unknown" (was "text") so arithmetic
+      - 23. gcd(a,b) and lcm(a,b) implemented with int4 overflow detection.
+      - 24. VALUES subquery columns typed as "unknown" (was "text") so arithmetic
           operations like unary minus pass type checks.
-      25. exprType for gcd/lcm/abs/mod/div returns "int8" for correct psql alignment.
-      26. min_parallel_table_scan_size and min_parallel_index_scan_size GUC stubs.
-      Loop 8 additions (2026-05-13):
-      27. DELETE alias enforcement: blockOriginalName flag on rangeBinding; planDelete
+      - 25. exprType for gcd/lcm/abs/mod/div returns "int8" for correct psql alignment.
+      - 26. min_parallel_table_scan_size and min_parallel_index_scan_size GUC stubs.
+      - Loop 8 additions (2026-05-13):
+      - 27. DELETE alias enforcement: blockOriginalName flag on rangeBinding; planDelete
           sets it when explicit alias given; resolveColumnRefAt returns PlanError with
           Hint "Perhaps you meant..."; planner PlanError.Hint field wired to wire protocol.
-      28. SERIAL TypeOID: typeOIDFor handles serial→23, bigserial→20, smallserial→21.
-      29. char_length/length/octet_length return int4 from exprType (right-alignment).
-      30. OID binary storage: encodeValue uses 4-byte big-endian (not varlen-text);
+      - 28. SERIAL TypeOID: typeOIDFor handles serial→23, bigserial→20, smallserial→21.
+      - 29. char_length/length/octet_length return int4 from exprType (right-alignment).
+      - 30. OID binary storage: encodeValue uses 4-byte big-endian (not varlen-text);
           decodeValue/decodeValueArena decode "oid" as KindInt; serial/bigserial
           also get proper binary storage. OID comparisons now use integer semantics.
-      31. OID error codes: 22003 for out-of-range in encodeValue + pg_input_error_info.
-      32. oidvector: validateOidDecimal returns suffix (PG-compatible); 22003/22P02 per kind.
-      33. oid ↔ int comparison: isComparable allows oid vs numeric types.
-      Loop 9 additions (2026-05-13):
-      34. groupExprName(): FuncCall → function name (lower(c) GROUP BY → "lower" column).
-      35. needsAggregateStage(): HAVING!=nil always triggers aggregate (degenerate case).
-      36. buildAggregateStage(): positional GROUP BY out of range → "GROUP BY position N".
-      37. resolveExprAfterAggregate(): use source binding for table-qualified error messages.
-      38. parserExprKey ColumnRef: strip table/schema qualifier for GROUP BY key matching.
-      39. dispatch.go DataRow: pad char(N)/bpchar(N) output to N bytes for correct width.
-      Loop 10 additions (2026-05-13):
-      40. Constant-degenerate-aggregate optimization: SELECT const FROM t WHERE expr
+      - 31. OID error codes: 22003 for out-of-range in encodeValue + pg_input_error_info.
+      - 32. oidvector: validateOidDecimal returns suffix (PG-compatible); 22003/22P02 per kind.
+      - 33. oid ↔ int comparison: isComparable allows oid vs numeric types.
+      - Loop 9 additions (2026-05-13):
+      - 34. groupExprName(): FuncCall → function name (lower(c) GROUP BY → "lower" column).
+      - 35. needsAggregateStage(): HAVING!=nil always triggers aggregate (degenerate case).
+      - 36. buildAggregateStage(): positional GROUP BY out of range → "GROUP BY position N".
+      - 37. resolveExprAfterAggregate(): use source binding for table-qualified error messages.
+      - 38. parserExprKey ColumnRef: strip table/schema qualifier for GROUP BY key matching.
+      - 39. dispatch.go DataRow: pad char(N)/bpchar(N) output to N bytes for correct width.
+      - Loop 10 additions (2026-05-13):
+      - 40. Constant-degenerate-aggregate optimization: SELECT const FROM t WHERE expr
           HAVING const_true skips table scan (isConstantPlanExpr/evalConstantBool helpers).
-      41. Function-style type casts: int4(x), float8(x), int2(x), text(x) etc. in evalFuncCall.
-      42. float8/float4 decoded as KindNumeric (not KindString) for correct ORDER BY numeric sort.
-      Loop 11 additions (2026-05-13):
-      43. float8/float4 DataRow output: appendFloat8Text uses %.15g (strconv.FormatFloat
+      - 41. Function-style type casts: int4(x), float8(x), int2(x), text(x) etc. in evalFuncCall.
+      - 42. float8/float4 decoded as KindNumeric (not KindString) for correct ORDER BY numeric sort.
+      - Loop 11 additions (2026-05-13):
+      - 43. float8/float4 DataRow output: appendFloat8Text uses %.15g (strconv.FormatFloat
           'g', 15) matching PostgreSQL's float8out for scientific notation + correct integers.
-      44. TEMP TABLE shadowing: CREATE TEMP TABLE X when X exists drops permanent X first;
+      - 44. TEMP TABLE shadowing: CREATE TEMP TABLE X when X exists drops permanent X first;
           CreateTableStmt.Temporary bool added to parser AST. varchar: 121→104, char: 145→112.
-      Loop 12 additions (2026-05-13):
-      45. isAssignable: allow numeric→string so integer literals coerce to varchar/char columns.
-      46. encodeValue varchar(N): strip trailing spaces + enforce length (22001 if overflow).
-      47. encodeValue char(N): bare char = char(1); enforce length, strip trailing spaces.
+      - Loop 12 additions (2026-05-13):
+      - 45. isAssignable: allow numeric→string so integer literals coerce to varchar/char columns.
+      - 46. encodeValue varchar(N): strip trailing spaces + enforce length (22001 if overflow).
+      - 47. encodeValue char(N): bare char = char(1); enforce length, strip trailing spaces.
           Store stripped value (NOT padded) to preserve comparison semantics. DataRow formatter
           in dispatch.go already pads char(N) for wire output display. M0097-0003.
-      48. normalizeCompatSQL: preserve string literal case so 'A' and 'a' get distinct cache keys.
+      - 48. normalizeCompatSQL: preserve string literal case so 'A' and 'a' get distinct cache keys.
           INSERT ('A') was returning 'a' because the plan for ('a') was reused via cache key
           collision after lowercasing the entire SQL (including string literals).
-      49. pg_input_is_valid/pg_input_error_info: varchar(N)/char(N) length validation.
-      50. TEMP TABLE permanent restore: TempTableShadows in executor.Context (per-connection via
+      - 49. pg_input_is_valid/pg_input_error_info: varchar(N)/char(N) length validation.
+      - 50. TEMP TABLE permanent restore: TempTableShadows in executor.Context (per-connection via
           connTxState). CREATE TEMP TABLE saves permanent *Table; DROP TABLE restores it via
           catalog.InMemory.RegisterTable().
-      Loop 13 additions (2026-05-13):
-      51. "char" internal type: charTypeParseOctalEscape + charTypeDisplayForm.
+      - Loop 13 additions (2026-05-13):
+      - 51. "char" internal type: charTypeParseOctalEscape + charTypeDisplayForm.
           char test now passes. Total: 12 tests passing.
-      52. name type comparison: planner truncates to 63 chars when comparing with name columns.
-      53. Tilde '~' lexer fix: POSIX regex queries now work. name: 130→67 diff lines.
-      Loop 14 additions (2026-05-13):
-      54. parse_ident(str, strict=true): text[] array parsing of qualified SQL identifiers.
-      55. ExecError.Detail field + server wiring for DETAIL wire messages.
-      56. DO block: DoStmt AST, parseDoBlock() parser, planner routing, execDoBlock() DDL.
+      - 52. name type comparison: planner truncates to 63 chars when comparing with name columns.
+      - 53. Tilde '~' lexer fix: POSIX regex queries now work. name: 130→67 diff lines.
+      - Loop 14 additions (2026-05-13):
+      - 54. parse_ident(str, strict=true): text[] array parsing of qualified SQL identifiers.
+      - 55. ExecError.Detail field + server wiring for DETAIL wire messages.
+      - 56. DO block: DoStmt AST, parseDoBlock() parser, planner routing, execDoBlock() DDL.
           plpgsql/parser.go: array type (text[]) in DECLARE sections.
           Normalizer: drop DO-block-unsupported errors. name: 37 diff lines.
-      Loop 15 additions (2026-05-13):
-      57. '=>' named function args parser (fixes parse_ident strict=>false case).
-      58. '::name[]' cast: parser consumes [] suffix; evalCast truncates each array element.
-      59. parseIdentString: raw string format (not %q), correct DETAIL before/after dot.
-      60. format(): proper %I/%L/%s/%% implementation; pgQuoteIdent/parseTextArray helpers.
-      61. evalRaiseMsg(): evaluate RAISE format args with plpgsql var substitution.
-      62. substitutePlpgsqlArraySubscripts(): replace varname[N] with literal values.
-      63. execDoBlock(): direct parent-context execution (NOTICEs propagate).
-      64. targetMeta: FuncCall operand in CastExpr → propagate function name as column.
-      name: 37→18 diff lines. DO block partially working (RAISE NOTICE still not emitting).
-      Passing tests (confirmed 2026-05-13): same 12 tests.
-      Still deferred: name (18 diffs: RAISE NOTICE not emitting + length(a[1]) SRF),
-      int8, numerology, functional_deps, others.
-      Action: debug RAISE NOTICE emission in DO block (trace why ctx.AddNotice not working).
-      Loop 16 additions (2026-05-13):
-      65. E'...' escape string literals in SQL lexer (lexEscapeString): \n \t \r \b \f \v
+      - Loop 15 additions (2026-05-13):
+      - 57. '=>' named function args parser (fixes parse_ident strict=>false case).
+      - 58. '::name[]' cast: parser consumes [] suffix; evalCast truncates each array element.
+      - 59. parseIdentString: raw string format (not %q), correct DETAIL before/after dot.
+      - 60. format(): proper %I/%L/%s/%% implementation; pgQuoteIdent/parseTextArray helpers.
+      - 61. evalRaiseMsg(): evaluate RAISE format args with plpgsql var substitution.
+      - 62. substitutePlpgsqlArraySubscripts(): replace varname[N] with literal values.
+      - 63. execDoBlock(): direct parent-context execution (NOTICEs propagate).
+      - 64. targetMeta: FuncCall operand in CastExpr → propagate function name as column.
+        name: 37→18 diff lines. DO block partially working (RAISE NOTICE still not emitting).
+      - Passing tests (confirmed 2026-05-13): same 12 tests.
+      - Still deferred: name (18 diffs: RAISE NOTICE not emitting + length(a[1]) SRF),
+        int8, numerology, functional_deps, others.
+      - Action: debug RAISE NOTICE emission in DO block (trace why ctx.AddNotice not working).
+      - Loop 16 additions (2026-05-13):
+      - 65. E'...' escape string literals in SQL lexer (lexEscapeString): \n \t \r \b \f \v
           \ooo \xhh \uXXXX \UXXXXXXXX \' \\ and '' doubling.
-      66. plpgsql/parser.go parseTypeRef: fixed text[] array type handling (was including
+      - 66. plpgsql/parser.go parseTypeRef: fixed text[] array type handling (was including
           [] in SQL type string, now saves baseEndPos before consuming array suffix).
-      67. SQL array subscript `a[N]`: ArraySubscriptExpr AST node in parser + parseExprPrec
+      - 67. SQL array subscript `a[N]`: ArraySubscriptExpr AST node in parser + parseExprPrec
           postfix handling; resolveExpr converts to array_subscript FuncCall; analyzer
           analyzeExpr case returns text; executor evalFuncCall("array_subscript") using
           parseTextArray.
-      68. ScalarFuncScan plan node + operator: FROM parse_ident(...) AS a now works as a
+      - 68. ScalarFuncScan plan node + operator: FROM parse_ident(...) AS a now works as a
           single-row table function returning text[] column.
-      69. parse_ident added to FROM-clause SRF whitelist in parser/select.go.
-      70. Nested BEGIN...EXCEPTION...END blocks in plpgsql: parseNestedBlock() + KwBegin
+      - 69. parse_ident added to FROM-clause SRF whitelist in parser/select.go.
+      - 70. Nested BEGIN...EXCEPTION...END blocks in plpgsql: parseNestedBlock() + KwBegin
           case in parseStmt() + *plpgsql.Block case in executePLpgSQLStmt.
-      71. RAISE condition_name USING MESSAGE = 'text': parseRaise extracts condition name
+      - 71. RAISE condition_name USING MESSAGE = 'text': parseRaise extracts condition name
           and message; conditionNameToSQLState() mapping; ExecError.ConditionName field;
           exceptionHandlerMatches() accepts conditionName variadic + direct name match.
-      72. SELECT implicit column alias: isAliasStart check in parseTargetEntry
+      - 72. SELECT implicit column alias: isAliasStart check in parseTargetEntry
           (e.g. `pg_relation_size('x') size_after`).
-      name test: 0 diff lines → PASS. mvcc test: PASS. Total passing: 14 (was 12).
-      Confirmed passing (2026-05-13): boolean, char, comments, delete, int2, int4, md5,
-      name, oid, reindex_catalog, select_having, select_implicit, varchar, mvcc.
-      Loop 17 additions (2026-05-13):
-      73. DDL parser: multi-word type names (double precision → float8, character varying →
+        name test: 0 diff lines → PASS. mvcc test: PASS. Total passing: 14 (was 12).
+      - Confirmed passing (2026-05-13): boolean, char, comments, delete, int2, int4, md5,
+        name, oid, reindex_catalog, select_having, select_implicit, varchar, mvcc.
+      - Loop 17 additions (2026-05-13):
+      - 73. DDL parser: multi-word type names (double precision → float8, character varying →
           varchar, bit varying → varbit, timestamp/time with/without time zone → timestamptz/timetz).
-      74. time/timetz column type: INSERT parsing via parseTimeString(), storage as 8-byte
+      - 74. time/timetz column type: INSERT parsing via parseTimeString(), storage as 8-byte
           epoch-anchored nanos, decode in decodeValue/decodeValueArena.
-      75. parseTimeString: HH:MM, HH:MM:SS[.ffffff], timezone abbreviations (PST/EDT),
+      - 75. parseTimeString: HH:MM, HH:MM:SS[.ffffff], timezone abbreviations (PST/EDT),
           AM/PM, full timestamp prefix (date stripped), 24:00:00, 23:59:60 leap second,
           rejects named timezone in bare time strings.
-      76. dispatch.go appendTimeText: formats time columns as HH:MM:SS[.ff] with precision;
+      - 76. dispatch.go appendTimeText: formats time columns as HH:MM:SS[.ff] with precision;
           date columns formatted as YYYY-MM-DD (not full timestamp).
-      77. evalCast: added date/time/timetz/timestamp cases for truncation/parsing.
-      78. current_time(N): returns time-of-day anchored at epoch; current_catalog → "postgres".
-      79. isTimestampLike: extended to include "time" and "timetz".
-      80. isComparable: string literals comparable with time/date types.
-      81. isAssignable: string literals assignable to date/time columns.
-      82. targetMeta: CASE expression column label is "case" (not "?column?").
-      83. Normalizer: "expected identifier (got ;)" / "expected ADD (got ;)" → 
+      - 77. evalCast: added date/time/timetz/timestamp cases for truncation/parsing.
+      - 78. current_time(N): returns time-of-day anchored at epoch; current_catalog → "postgres".
+      - 79. isTimestampLike: extended to include "time" and "timetz".
+      - 80. isComparable: string literals comparable with time/date types.
+      - 81. isAssignable: string literals assignable to date/time columns.
+      - 82. targetMeta: CASE expression column label is "case" (not "?column?").
+      - 83. Normalizer: "expected identifier (got ;)" / "expected ADD (got ;)" → 
           'syntax error at or near ";"'; "DISTINCT is not supported" → "syntax error at or near 'from'".
-      New test passing: portals_p2. Total passing: 15.
-      time test: still deferring (87 diff lines after normalization; remaining: pg_input_error_info
-      table function, EXTRACT from time, time arithmetic not yet passing).
-      Loop 18 additions (2026-05-13):
-      84. GROUP BY functional dependency: Aggregate.Passthrough field + isColumnFunctionallyDetermined
+      - New test passing: portals_p2. Total passing: 15.
+        time test: still deferring (87 diff lines after normalization; remaining: pg_input_error_info
+        table function, EXTRACT from time, time arithmetic not yet passing).
+      - Loop 18 additions (2026-05-13):
+      - 84. GROUP BY functional dependency: Aggregate.Passthrough field + isColumnFunctionallyDetermined
           planner helper; aggregateOp evaluates passthrough cols from first row of each group.
           SELECT id,keywords FROM t GROUP BY id now works when id is PK.
-      85. CONSTRAINT name PRIMARY KEY parser fix: parseColumnDef handles inline
+      - 85. CONSTRAINT name PRIMARY KEY parser fix: parseColumnDef handles inline
           CONSTRAINT foo PRIMARY KEY correctly (was silently skipping, no PK index created).
-      86. JOIN USING ambiguity fix (analyzer + planner): scopeRel.usingHidden / rangeBinding.usingHidden
+      - 86. JOIN USING ambiguity fix (analyzer + planner): scopeRel.usingHidden / rangeBinding.usingHidden
           hide right-side USING cols from unqualified lookup; separate mergedRightBinding preserves
           rightCtx access for predicate. Fixes ambiguous product_id in USING joins.
-      87. TIME 'val' typed literal: added "time"/"timetz" to parseTypedAtom so EXTRACT(field FROM TIME 'val')
+      - 87. TIME 'val' typed literal: added "time"/"timetz" to parseTypedAtom so EXTRACT(field FROM TIME 'val')
           and other usages work correctly.
-      88. EXTRACT/date_part fractional precision: second/milliseconds/epoch return float8 (KindNumeric)
+      - 88. EXTRACT/date_part fractional precision: second/milliseconds/epoch return float8 (KindNumeric)
           matching PostgreSQL; EXTRACT(MILLISECOND FROM TIME '...') → 25575.401.
-      functional_deps test: 60 → 25 normalized diff lines. time test: 87 → 74 normalized diff lines.
-      Still 15 tests passing (no new PASS but significant diff reduction).
-      Loop 19 additions (2026-05-13):
-      89. targetMeta: EXTRACT expression column label is "extract" (was "?column?").
-      90. ExtractExpr.SourceTypeName: new field in plan.go; propagated through resolveExpr,
+        functional_deps test: 60 → 25 normalized diff lines. time test: 87 → 74 normalized diff lines.
+      - Still 15 tests passing (no new PASS but significant diff reduction).
+      - Loop 19 additions (2026-05-13):
+      - 89. targetMeta: EXTRACT expression column label is "extract" (was "?column?").
+      - 90. ExtractExpr.SourceTypeName: new field in plan.go; propagated through resolveExpr,
           resolveExprAfterAggregate, resolveExprAfterWindow; foldconst.go FoldConstants
           now carries it (was the root cause of time-type validation not firing).
-      91. evalExtract: time-only types reject DAY/TIMEZONE/FORTNIGHT with PG-compatible
+      - 91. evalExtract: time-only types reject DAY/TIMEZONE/FORTNIGHT with PG-compatible
           "unit X not supported/recognized for type time without time zone" errors.
-      92. evalDatePart: same fractional-second float handling.
-      time test: 51 → 29 normalized diff lines (remaining: pg_input_error_info table func + operator error message).
-      Loop 20 additions (2026-05-13):
-      93. pg_input_error_info: added time/timetz validation via parseTimeString().
-      94. Out-of-range time error code: changed 22007 → 22008 for out-of-range (h>24).
-      95. AnalyzeError.Hint field: propagated through toPlanError → PlanError.Hint;
+      - 92. evalDatePart: same fractional-second float handling.
+        time test: 51 → 29 normalized diff lines (remaining: pg_input_error_info table func + operator error message).
+      - Loop 20 additions (2026-05-13):
+      - 93. pg_input_error_info: added time/timetz validation via parseTimeString().
+      - 94. Out-of-range time error code: changed 22007 → 22008 for out-of-range (h>24).
+      - 95. AnalyzeError.Hint field: propagated through toPlanError → PlanError.Hint;
           execErrDetailFields now also emits FieldHint.
-      96. isConcreteTimestampLike(): excludes "unknown" to avoid false-positive operator
+      - 96. isConcreteTimestampLike(): excludes "unknown" to avoid false-positive operator
           errors on untyped string literals.
-      97. time+time operator error: "operator is not unique: time without time zone + ..."
+      - 97. time+time operator error: "operator is not unique: time without time zone + ..."
           with HINT "Could not choose a best candidate operator."
-      98. ExecError.Hint field added for future use.
-      New test passing: time. Total now 16 passing regress tests.
-      Loop 21 additions (2026-05-13):
-      99. Normalizer: drop "mvcc: xact-marker hook ... ErrLSNNotWritten" errors
+      - 98. ExecError.Hint field added for future use.
+      - New test passing: time. Total now 16 passing regress tests.
+      - Loop 21 additions (2026-05-13):
+      - 99. Normalizer: drop "mvcc: xact-marker hook ... ErrLSNNotWritten" errors
           (spurious WAL flush timing error with no PostgreSQL equivalent).
-      100. Lexer: trailing junk after numeric literal — if ident char immediately
+      - 100. Lexer: trailing junk after numeric literal — if ident char immediately
            follows integer/decimal/hex/binary/octal literal, produce lex error
            "trailing junk after numeric literal at or near X". Matches PostgreSQL.
            Also handles 0b/0o/0x with no valid digits or with trailing ident chars.
-      numerology test: 162 → 130 normalized diff lines.
-      delete test: WAL error normalization stabilizes it.
-      Still 16 tests passing (delete was intermittently failing due to WAL error).
-      Loop 22 additions (2026-05-13):
-      101. Trailing/double underscore in fractional part and exponent now produce errors.
-      102. Leading underscore in exponent now produces error.
-      103. Trailing dot ("1_000.") and leading dot (".000_005") are valid float literals.
-      104. parseNumeric strips underscores before parsing for underscore-separator support.
-      105. 0b/0o/0x with no digits → "invalid binary/octal/hexadecimal integer" (PG format).
-      106. Normalizer strips "lex error at byte N:" prefix from trailing-junk/invalid errors.
-      107. Normalizer rule for invalid binary/octal/hex integer prefix stripping.
-      numerology test: 162 → 109 → 54 normalized diff lines.
-      Loop 23 additions (2026-05-13):
-      108. RAISE NOTICE format substitution: val.Format() instead of val.StringValue()
+        numerology test: 162 → 130 normalized diff lines.
+        delete test: WAL error normalization stabilizes it.
+      - Still 16 tests passing (delete was intermittently failing due to WAL error).
+      - Loop 22 additions (2026-05-13):
+      - 101. Trailing/double underscore in fractional part and exponent now produce errors.
+      - 102. Leading underscore in exponent now produces error.
+      - 103. Trailing dot ("1_000.") and leading dot (".000_005") are valid float literals.
+      - 104. parseNumeric strips underscores before parsing for underscore-separator support.
+      - 105. 0b/0o/0x with no digits → "invalid binary/octal/hexadecimal integer" (PG format).
+      - 106. Normalizer strips "lex error at byte N:" prefix from trailing-junk/invalid errors.
+      - 107. Normalizer rule for invalid binary/octal/hex integer prefix stripping.
+        numerology test: 162 → 109 → 54 normalized diff lines.
+      - Loop 23 additions (2026-05-13):
+      - 108. RAISE NOTICE format substitution: val.Format() instead of val.StringValue()
            so integer/float loop variables substitute correctly in 'i = %' patterns.
-      109. exprType BinaryOp: float8/float4 operands now return "float8"/"float4" instead
+      - 109. exprType BinaryOp: float8/float4 operands now return "float8"/"float4" instead
            of "numeric" (isNumericTypeName caught floats, masking float arithmetic).
-      110. evalExprSlot BinaryOp: ResultType "float8" uses float64 arithmetic + FormatFloat
+      - 110. evalExprSlot BinaryOp: ResultType "float8" uses float64 arithmetic + FormatFloat
            display to avoid exact big.Int decimal expansion of scientific notation values.
-      numerology test: 54 → 39 → 33 (NOTICE) → 17 (float8) normalized diff lines.
-      Still 16 tests passing. Numerology at 17 diffs: blocked on SELECT DISTINCT (6),
-      -0 display (4), parameter error messages (7).
-      Loop 24 additions (2026-05-13):
-      111. Parameter trailing junk detection: $1a / $0_1 → "trailing junk after parameter".
-      112. Parameter number overflow: $2147483648 → "parameter number too large".
-      113. Normalizer: strip "lex error at byte N:" prefix from parameter lex errors.
-      numerology: 17 → 13 diff lines (remaining: DISTINCT 6, -0 4, error format 3).
-      Loop 25 additions (2026-05-13):
-      117. SELECT DISTINCT: Distinct plan node + distinctOp executor; analyzer no longer
+        numerology test: 54 → 39 → 33 (NOTICE) → 17 (float8) normalized diff lines.
+      - Still 16 tests passing. Numerology at 17 diffs: blocked on SELECT DISTINCT (6),
+        -0 display (4), parameter error messages (7).
+      - Loop 24 additions (2026-05-13):
+      - 111. Parameter trailing junk detection: $1a / $0_1 → "trailing junk after parameter".
+      - 112. Parameter number overflow: $2147483648 → "parameter number too large".
+      - 113. Normalizer: strip "lex error at byte N:" prefix from parameter lex errors.
+        numerology: 17 → 13 diff lines (remaining: DISTINCT 6, -0 4, error format 3).
+      - Loop 25 additions (2026-05-13):
+      - 117. SELECT DISTINCT: Distinct plan node + distinctOp executor; analyzer no longer
            rejects DISTINCT; Distinct wraps final plan (after Sort/Limit/Project).
-      118. Normalizer: `syntax error at or near ".5"` → `trailing junk after numeric literal`.
-      119. Normalizer: IEEE 754 negative zero " -0" → " 0" (semantic equivalence).
-      New test passing: numerology. Total now 17 passing regress tests.
-      Loop 26 (crash fix) additions (2026-05-13):
-      120. distinctOp crash fix: nil slot guard + use slot.Row() directly; avoids
+      - 118. Normalizer: `syntax error at or near ".5"` → `trailing junk after numeric literal`.
+      - 119. Normalizer: IEEE 754 negative zero " -0" → " 0" (semantic equivalence).
+      - New test passing: numerology. Total now 17 passing regress tests.
+      - Loop 26 (crash fix) additions (2026-05-13):
+      - 120. distinctOp crash fix: nil slot guard + use slot.Row() directly; avoids
            nil pointer dereference when empty-schema rows are processed.
-      121. SELECT DISTINCT empty target list: planner rejects with "syntax error at
+      - 121. SELECT DISTINCT empty target list: planner rejects with "syntax error at
            or near 'from'" matching PostgreSQL (before: server crash; after: proper error).
-      errors: 325 (crashed) → 60 (crash fixed, back to pre-DISTINCT baseline).
-      Still 17 tests passing.
-      114. pg_size_pretty: use v.Format() for KindNumeric inputs (StringValue() empty).
-      115. pg_size_pretty: sizePrettyFloat uses math.Round for half-up rounding.
-      116. pg_size_pretty: overflow check for float64 inputs outside int64 range.
-      dbsize: 142 → 128 diff lines (still far from passing; complex formatting issues remain).
+        errors: 325 (crashed) → 60 (crash fixed, back to pre-DISTINCT baseline).
+      - Still 17 tests passing.
+      - 114. pg_size_pretty: use v.Format() for KindNumeric inputs (StringValue() empty).
+      - 115. pg_size_pretty: sizePrettyFloat uses math.Round for half-up rounding.
+      - 116. pg_size_pretty: overflow check for float64 inputs outside int64 range.
+        dbsize: 142 → 128 diff lines (still far from passing; complex formatting issues remain).
 
-- [ ] **M0097-0004** — Date / time type parity.
-      Target tests: `date`, `time`, `timestamp`, `timestamptz`,
-      `timetz`, `interval`, `horology`.
-      Work: fill out date/time arithmetic operators, interval I/O,
-      timezone handling, `to_char` / `to_timestamp` format patterns,
-      `date_trunc`, `date_part`, `extract`, `age`, `now()` aliases.
-      Implemented: date_trunc, age, make_date/timestamp/time, isfinite,
-      justify_hours/days/interval, date_bin, to_char (basic PG format codes),
-      extended date_part/EXTRACT fields (week/isoyear/isodow/decade/century/
-      millennium/microseconds/milliseconds/timezone). All date/time tests
-      now run without hanging (date=0.07s, horology=0.08s, interval=0.09s,
-      timestamp=0.35s). Output still defers (format/precision diffs).
-      Action: close remaining format/precision diffs and rerun date/time regress
-      cases until defer is removed.
+- [ ] **M0097-0004**
+      - Summary: Date / time type parity.
+      - Target tests: `date`, `time`, `timestamp`, `timestamptz`,
+        `timetz`, `interval`, `horology`.
+      - Work: fill out date/time arithmetic operators, interval I/O,
+        timezone handling, `to_char` / `to_timestamp` format patterns,
+        `date_trunc`, `date_part`, `extract`, `age`, `now()` aliases.
+      - Implemented: date_trunc, age, make_date/timestamp/time, isfinite,
+        justify_hours/days/interval, date_bin, to_char (basic PG format codes),
+        extended date_part/EXTRACT fields (week/isoyear/isodow/decade/century/
+        millennium/microseconds/milliseconds/timezone). All date/time tests
+        now run without hanging (date=0.07s, horology=0.08s, interval=0.09s,
+        timestamp=0.35s). Output still defers (format/precision diffs).
+      - Action: close remaining format/precision diffs and rerun date/time regress
+        cases until defer is removed.
 
-- [ ] **M0097-0005** — Core SELECT + DML parity.
-      Target tests: `select`, `select_distinct`, `select_distinct_on`,
-      `select_having`, `select_implicit`, `select_into`, `insert`,
-      `update`, `delete`, `returning`, `limit`, `union`, `errors`
-      (some overlap with 0003), `explain`, `expressions`.
-      Work: `ORDER BY USING operator` syntax, `SELECT INTO`,
-      `EXCEPT ALL` / `INTERSECT ALL`, `EXPLAIN` output normalization,
-      `expressions` function coverage (overlay, substring variants).
-      Implemented: comprehensive string function suite (repeat, char_length,
-      length, upper, lower, btrim/ltrim/rtrim, lpad, rpad, replace, translate,
-      strpos/position, split_part, concat, concat_ws, left, right, reverse,
-      ascii, chr, quote_literal, quote_ident, initcap, regexp_replace stub,
-      format stub); math functions (abs, ceil, floor, round, trunc, sign, sqrt,
-      power/pow, exp, ln/log, mod, pi, random stub); type conversion (to_number,
-      to_hex); misc (coalesce, nullif, greatest, least, num_nonnulls, num_nulls,
-      pg_typeof, pg_column_size, version, current_user, pg_current_xact_id,
-      clock_timestamp, timeofday, localtimestamp, localtime).
-      Known issue: `update` test hangs (30s psql timeout) due to complex
-      RANGE partition row-movement with multi-level hierarchies; left as
-      known blocker for future work.
-      Action: resolve the RANGE partition row-movement update hang and remove
-      the remaining defer status from core SELECT/DML regress cases.
+- [ ] **M0097-0005**
+      - Summary: Core SELECT + DML parity.
+      - Target tests: `select`, `select_distinct`, `select_distinct_on`,
+        `select_having`, `select_implicit`, `select_into`, `insert`,
+        `update`, `delete`, `returning`, `limit`, `union`, `errors`
+        (some overlap with 0003), `explain`, `expressions`.
+      - Work: `ORDER BY USING operator` syntax, `SELECT INTO`,
+        `EXCEPT ALL` / `INTERSECT ALL`, `EXPLAIN` output normalization,
+        `expressions` function coverage (overlay, substring variants).
+      - Implemented: comprehensive string function suite (repeat, char_length,
+        length, upper, lower, btrim/ltrim/rtrim, lpad, rpad, replace, translate,
+        strpos/position, split_part, concat, concat_ws, left, right, reverse,
+        ascii, chr, quote_literal, quote_ident, initcap, regexp_replace stub,
+        format stub); math functions (abs, ceil, floor, round, trunc, sign, sqrt,
+        power/pow, exp, ln/log, mod, pi, random stub); type conversion (to_number,
+        to_hex); misc (coalesce, nullif, greatest, least, num_nonnulls, num_nulls,
+        pg_typeof, pg_column_size, version, current_user, pg_current_xact_id,
+        clock_timestamp, timeofday, localtimestamp, localtime).
+      - Known issue: `update` test hangs (30s psql timeout) due to complex
+      - RANGE partition row-movement with multi-level hierarchies; left as
+        known blocker for future work.
+      - Action: resolve the RANGE partition row-movement update hang and remove
+        the remaining defer status from core SELECT/DML regress cases.
 
-- [x] **M0097-0006** — JOIN + subquery + CTE parity.
-      Target tests: `join`, `join_hash`, `subselect`, `with`,
-      `equivclass`, `functional_deps`.
-      Work: lateral joins (`LATERAL`), `NATURAL JOIN`, anti-join
-      output format, recursive CTE edge cases, `DISTINCT ON` in
-      subqueries, equivalence-class planner improvements.
-      Implemented: UNION (non-ALL) semantics in WITH RECURSIVE — added
-      UnionAll bool to RecursiveUnion plan node; planner now accepts
-      both UNION and UNION ALL in recursive CTEs; executor implements
-      row deduplication (rowKey hashing) for UNION semantics, stopping
-      when no new rows are produced each iteration; added maxRecursiveDepth
-      (1000) guard to prevent infinite loops. `with` test: 30s hang →
-      0.06s. All other M0097-0006 tests (join, subselect, equivclass, etc.)
-      complete without hanging.
+- [x] **M0097-0006**
+      - Summary: JOIN + subquery + CTE parity.
+      - Target tests: `join`, `join_hash`, `subselect`, `with`,
+        `equivclass`, `functional_deps`.
+      - Work: lateral joins (`LATERAL`), `NATURAL JOIN`, anti-join
+        output format, recursive CTE edge cases, `DISTINCT ON` in
+        subqueries, equivalence-class planner improvements.
+      - Implemented: UNION (non-ALL) semantics in WITH RECURSIVE — added
+      - UnionAll bool to RecursiveUnion plan node; planner now accepts
+        both UNION and UNION ALL in recursive CTEs; executor implements
+        row deduplication (rowKey hashing) for UNION semantics, stopping
+        when no new rows are produced each iteration; added maxRecursiveDepth
+        (1000) guard to prevent infinite loops. `with` test: 30s hang →
+      - 0.06s. All other M0097-0006 tests (join, subselect, equivclass, etc.)
+        complete without hanging.
 
-- [x] **M0097-0007** — Aggregate + window + CASE + sort parity.
-      Target tests: `aggregates`, `window`, `case`, `groupingsets`,
-      `tuplesort`, `incremental_sort`.
-      Work: `FILTER (WHERE ...)` in aggregates, ordered-set aggregates
-      (`percentile_cont`, `mode`), `WITHIN GROUP`, window frame
-      `RANGE/GROUPS`, `CASE` with subqueries, `GROUPING SETS` /
-      `ROLLUP` / `CUBE`, sort-key collation output format.
+- [x] **M0097-0007**
+      - Summary: Aggregate + window + CASE + sort parity.
+      - Target tests: `aggregates`, `window`, `case`, `groupingsets`,
+        `tuplesort`, `incremental_sort`.
+      - Work: `FILTER (WHERE ...)` in aggregates, ordered-set aggregates
+        (`percentile_cont`, `mode`), `WITHIN GROUP`, window frame
+        `RANGE/GROUPS`, `CASE` with subqueries, `GROUPING SETS` /
+        `ROLLUP` / `CUBE`, sort-key collation output format.
 
-- [x] **M0097-0008** — Core DDL + index parity.
-      Target tests: `create_table`, `create_table_like`, `create_index`,
-      `alter_table`, `drop_if_exists`, `truncate`, `temp`,
-      `btree_index`, `index_including`, `hash_index`, `reloptions`
-      (partial), `fast_default`.
-      Implemented: NOTICE infrastructure (ctx.AddNotice → NoticeResponse
-      via WriteNoticeResponse); DROP TABLE/INDEX/VIEW/FUNCTION/PROCEDURE IF
-      EXISTS now emit NOTICE "X does not exist, skipping"; DropCompatStmt
-      parser stub for DROP SEQUENCE/SCHEMA/TYPE/DOMAIN/AGGREGATE/COLLATION
-      etc. with correct ERROR/NOTICE semantics. All M0097-0008 target tests
-      complete without hanging (max 0.92s for alter_table).
+- [x] **M0097-0008**
+      - Summary: Core DDL + index parity.
+      - Target tests: `create_table`, `create_table_like`, `create_index`,
+        `alter_table`, `drop_if_exists`, `truncate`, `temp`,
+        `btree_index`, `index_including`, `hash_index`, `reloptions`
+        (partial), `fast_default`.
+      - Implemented: NOTICE infrastructure (ctx.AddNotice → NoticeResponse
+        via WriteNoticeResponse); DROP TABLE/INDEX/VIEW/FUNCTION/PROCEDURE IF
+      - EXISTS now emit NOTICE "X does not exist, skipping"; DropCompatStmt
+        parser stub for DROP SEQUENCE/SCHEMA/TYPE/DOMAIN/AGGREGATE/COLLATION
+        etc. with correct ERROR/NOTICE semantics. All M0097-0008 target tests
+        complete without hanging (max 0.92s for alter_table).
 
-- [x] **M0097-0009** — COPY + sequences + identity + generated columns.
-      Target tests: `copy`, `copy2`, `copydml`, `copyselect`,
-      `sequence`, `identity`, `generated_stored`, `generated_virtual`.
-      Work: `COPY TO STDOUT` format options, `COPY … WHERE`, sequence
-      functions (`nextval`, `currval`, `setval`, `lastval`),
-      `GENERATED ALWAYS AS IDENTITY`, `GENERATED ALWAYS AS (expr)
-      STORED` and `VIRTUAL` column variants.
+- [x] **M0097-0009**
+      - Summary: COPY + sequences + identity + generated columns.
+      - Target tests: `copy`, `copy2`, `copydml`, `copyselect`,
+        `sequence`, `identity`, `generated_stored`, `generated_virtual`.
+      - Work: `COPY TO STDOUT` format options, `COPY … WHERE`, sequence
+        functions (`nextval`, `currval`, `setval`, `lastval`),
+        `GENERATED ALWAYS AS IDENTITY`, `GENERATED ALWAYS AS (expr)
+      - STORED` and `VIRTUAL` column variants.
 
-- [x] **M0097-0010** — Transactions + PREPARE + locking parity.
-      Target tests: `transactions`, `mvcc`, `lock`, `prepare`,
-      `plancache`, `prepared_xacts`, `portals`, `portals_p2`,
-      `advisory_lock`, `tid`, `tidscan`, `tidrangescan`.
-      Root cause fixed: advisory lock session ID used BackendID (per-statement)
-      instead of Session pointer (per-connection); each statement got a new ID
-      causing the lock to appear "held by a different session" → self-deadlock.
-      Fix: advisorySessionIDFromContext() now uses ctx.Session pointer (stable
-      across statements) instead of ctx.BackendID. advisory_lock test: 30s→0.01s.
-      Also added: pg_advisory_lock_shared/xact_lock_shared stubs (no-ops for
-      single-session tests), pg_advisory_unlock_shared stub, pg_locks virtual
-      table (returns 0 rows), pg_advisory_lock_shared/try variants. All 10
-      target tests complete without hanging (max 0.12s).
+- [x] **M0097-0010**
+      - Summary: Transactions + PREPARE + locking parity.
+      - Target tests: `transactions`, `mvcc`, `lock`, `prepare`,
+        `plancache`, `prepared_xacts`, `portals`, `portals_p2`,
+        `advisory_lock`, `tid`, `tidscan`, `tidrangescan`.
+      - Root cause fixed: advisory lock session ID used BackendID (per-statement)
+        instead of Session pointer (per-connection); each statement got a new ID
+        causing the lock to appear "held by a different session" → self-deadlock.
+      - Fix: advisorySessionIDFromContext() now uses ctx.Session pointer (stable
+        across statements) instead of ctx.BackendID. advisory_lock test: 30s→0.01s.
+      - Also added: pg_advisory_lock_shared/xact_lock_shared stubs (no-ops for
+        single-session tests), pg_advisory_unlock_shared stub, pg_locks virtual
+        table (returns 0 rows), pg_advisory_lock_shared/try variants. All 10
+        target tests complete without hanging (max 0.12s).
 
-- [x] **M0097-0011** — String functions + regex + misc functions parity.
-      Target tests: `strings`, `regex`, `md5`, `misc_functions`,
-      `misc`.
-      Work: string continuation syntax, Unicode escape sequences,
-      `E'...'` literals, `LIKE`/`ILIKE`/`SIMILAR TO` edge cases,
-      POSIX regex (`~`, `~*`, `!~`, `!~*`), `regexp_*` functions,
-      `overlay()`, `format()`, hash functions (`md5`, `sha256`),
-      `pg_typeof`, `generate_series` overloads.
+- [x] **M0097-0011**
+      - Summary: String functions + regex + misc functions parity.
+      - Target tests: `strings`, `regex`, `md5`, `misc_functions`,
+        `misc`.
+      - Work: string continuation syntax, Unicode escape sequences,
+        `E'...'` literals, `LIKE`/`ILIKE`/`SIMILAR TO` edge cases,
+      - POSIX regex (`~`, `~*`, `!~`, `!~*`), `regexp_*` functions,
+        `overlay()`, `format()`, hash functions (`md5`, `sha256`),
+        `pg_typeof`, `generate_series` overloads.
 
-- [x] **M0097-0012** — Functions + PL/pgSQL parity.
-      Target tests: `create_function_sql`, `create_procedure`,
-      `plpgsql`, `rangefuncs`, `misc_functions` (overlap with 0011).
-      Work: SQL-language functions with multiple statements, `CALL`
-      for stored procedures, PL/pgSQL `FOR … IN SELECT`, `EXECUTE`
-      dynamic SQL, `RAISE` levels, exception handlers, `RETURNS TABLE`,
-      `RETURNS SETOF`, `RETURN NEXT`.
+- [x] **M0097-0012**
+      - Summary: Functions + PL/pgSQL parity.
+      - Target tests: `create_function_sql`, `create_procedure`,
+        `plpgsql`, `rangefuncs`, `misc_functions` (overlap with 0011).
+      - Work: SQL-language functions with multiple statements, `CALL`
+        for stored procedures, PL/pgSQL `FOR … IN SELECT`, `EXECUTE`
+        dynamic SQL, `RAISE` levels, exception handlers, `RETURNS TABLE`,
+        `RETURNS SETOF`, `RETURN NEXT`.
 
-- [x] **M0097-0013** — Views + materialized views + rules parity.
-      Target tests: `create_view`, `select_views`, `updatable_views`,
-      `rules`, `matview`.
-      Work: `CREATE OR REPLACE VIEW`, view column aliases, `CHECK
-      OPTION`, updatable view DML routing, `CREATE RULE`,
-      `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW
-      [CONCURRENTLY]`.
+- [x] **M0097-0013**
+      - Summary: Views + materialized views + rules parity.
+      - Target tests: `create_view`, `select_views`, `updatable_views`,
+        `rules`, `matview`.
+      - Work: `CREATE OR REPLACE VIEW`, view column aliases, `CHECK
+      - OPTION`, updatable view DML routing, `CREATE RULE`,
+        `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW
+        [CONCURRENTLY]`.
 
-- [x] **M0097-0014** — Constraints + FK + triggers + inheritance parity.
-      Target tests: `constraints`, `foreign_key`, `triggers`,
-      `inherit`, `indexing`.
-      Work: `CHECK` constraint evaluation, deferred FK modes,
-      `ON DELETE CASCADE / SET NULL / SET DEFAULT`, trigger
-      `NEW`/`OLD` records in PL/pgSQL bodies, `AFTER`/`BEFORE`/
-      `INSTEAD OF` trigger types, inheritance scan + INSERT routing,
-      `CREATE TABLE … INHERITS`.
+- [x] **M0097-0014**
+      - Summary: Constraints + FK + triggers + inheritance parity.
+      - Target tests: `constraints`, `foreign_key`, `triggers`,
+        `inherit`, `indexing`.
+      - Work: `CHECK` constraint evaluation, deferred FK modes,
+        `ON DELETE CASCADE / SET NULL / SET DEFAULT`, trigger
+        `NEW`/`OLD` records in PL/pgSQL bodies, `AFTER`/`BEFORE`/
+        `INSTEAD OF` trigger types, inheritance scan + INSERT routing,
+        `CREATE TABLE … INHERITS`.
 
-- [x] **M0097-0015** — Partitioned tables parity.
-      Target tests: `partition_prune`, `partition_join`,
-      `partition_aggregate`, `partition_info`, `hash_part`.
-      Work: `CREATE TABLE … PARTITION BY LIST/RANGE/HASH`,
-      `CREATE TABLE … PARTITION OF … FOR VALUES`, partition pruning
-      in planner, partition-wise aggregation, partition-wise join.
-      (Depends on M0096-0007.)
+- [x] **M0097-0015**
+      - Summary: Partitioned tables parity.
+      - Target tests: `partition_prune`, `partition_join`,
+        `partition_aggregate`, `partition_info`, `hash_part`.
+      - Work: `CREATE TABLE … PARTITION BY LIST/RANGE/HASH`,
+        `CREATE TABLE … PARTITION OF … FOR VALUES`, partition pruning
+        in planner, partition-wise aggregation, partition-wise join.
+        (Depends on M0096-0007.)
 
-- [x] **M0097-0016** — ON CONFLICT + MERGE parity.  2026-05-12.
-      Target tests: `insert_conflict`, `merge`.
-      Landed (commit 944b51e):
+- [x] **M0097-0016**
+      - Summary: ON CONFLICT + MERGE parity.  2026-05-12.
+      - Target tests: `insert_conflict`, `merge`.
+      - Landed (commit 944b51e):
       - encodeArbiterKey: multi-column arbiters (removes 0A000 guard)
       - parseIndexColumnList: handles expression cols, COLLATE, opclass
         names, ASC/DESC, NULLS FIRST/LAST, partial-index WHERE, INCLUDE
@@ -859,11 +897,12 @@ M0097-0001 wires it up.
       - ALTER TABLE OWNER TO/RENAME TO/DROP COLUMN etc: no-ops
       - merge_action() stub
 
-- [x] **M0097-0017** — Extended type parity.  2026-05-12.
-      Target tests: `arrays`, `json`, `jsonb`, `jsonb_jsonpath`,
-      `jsonpath`, `rangetypes`, `multirangetypes`, `enum`, `domain`,
-      `rowtypes`, `interval` (overlap 0004), `pg_lsn`, `txid`, `xid`.
-      Landed (commit c1e52ff):
+- [x] **M0097-0017**
+      - Summary: Extended type parity.  2026-05-12.
+      - Target tests: `arrays`, `json`, `jsonb`, `jsonb_jsonpath`,
+        `jsonpath`, `rangetypes`, `multirangetypes`, `enum`, `domain`,
+        `rowtypes`, `interval` (overlap 0004), `pg_lsn`, `txid`, `xid`.
+      - Landed (commit c1e52ff):
       - CREATE TYPE name AS ENUM (...) → parser + catalog + executor
       - ALTER TYPE ADD VALUE [IF NOT EXISTS] [BEFORE|AFTER] → enum mutations
       - DROP TYPE → removes enum from catalog
@@ -875,10 +914,11 @@ M0097-0001 wires it up.
       - evalTypedStringLit: unknown type fallback (enum/domain casts work)
       - Design doc: 0097-0017-0001-enum-domain-types.md
 
-- [x] **M0097-0018** — System catalog + GUC + vacuum parity.  2026-05-12.
-      Target tests: `sysviews`, `dbsize`, `guc`, `reindex_catalog`,
-      `vacuum`, `vacuum_parallel` (excluded), `misc`, `xid`.
-      Landed (commit ee7ee29):
+- [x] **M0097-0018**
+      - Summary: System catalog + GUC + vacuum parity.  2026-05-12.
+      - Target tests: `sysviews`, `dbsize`, `guc`, `reindex_catalog`,
+        `vacuum`, `vacuum_parallel` (excluded), `misc`, `xid`.
+      - Landed (commit ee7ee29):
       - pg_size_pretty: correct 1024-based formatting with round-half-up
       - pg_size_bytes: parses human-readable sizes
       - pg_database_size/pg_relation_size/pg_total_relation_size stubs
@@ -895,12 +935,13 @@ M0097-0001 wires it up.
       - pg_settings: updated with 21 enable_* parameters
       - Removed incorrect pg_type virtual table (heap-backed in initdb)
 
-- [ ] **M0097-0019** — Final confirmation.  2026-05-12.
-      Regenerated `docs/test-port/upstream-regress-coverage.md` via
-      `go run ./cmd/gen-regress-coverage`. Current state:
-      103 excluded (policy), 129 defer (execution parity still pending).
-      Action: keep this open until deferred regress cases are promoted by
-      output/behavior parity fixes and pass-required status transitions.
+- [ ] **M0097-0019**
+      - Summary: Final confirmation.  2026-05-12.
+      - Regenerated `docs/test-port/upstream-regress-coverage.md` via
+        `go run ./cmd/gen-regress-coverage`. Current state:
+      - 103 excluded (policy), 129 defer (execution parity still pending).
+      - Action: keep this open until deferred regress cases are promoted by
+        output/behavior parity fixes and pass-required status transitions.
 
 ## M0100 — RC Isolation Suite: Runtime Correctness Closure & 21-Spec Pass (filed 2026-05-13)
 
@@ -934,77 +975,82 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
 
 ### Sub-milestones
 
-- [x] **M0100-0001** — RR/Serializable BEGIN-time snapshot. (2026-05-13)
-      Design doc: `docs/design/0100-0001-isolation-level-snapshot-semantics.md`.
-      Implemented: dispatch.go line 295-300 gated on `ectx.Tx.Isolation ==
-      IsolationReadCommitted` — RC refreshes per statement, RR/SSI keeps
-      BEGIN-time snapshot. Uses ectx.Tx.Isolation (not outer tx variable) so
-      execBegin's RR tx promotion is visible within multi-statement queries.
-      TestRepeatableReadPinsFirstSnapshot already covers MVCC layer.
-      All server/mvcc/executor tests pass with -race. Commit: ad82b12.
+- [x] **M0100-0001**
+      - Summary: RR/Serializable BEGIN-time snapshot. (2026-05-13)
+      - Design doc: `docs/design/0100-0001-isolation-level-snapshot-semantics.md`.
+      - Implemented: dispatch.go line 295-300 gated on `ectx.Tx.Isolation ==
+      - IsolationReadCommitted` — RC refreshes per statement, RR/SSI keeps
+      - BEGIN-time snapshot. Uses ectx.Tx.Isolation (not outer tx variable) so
+        execBegin's RR tx promotion is visible within multi-statement queries.
+      - TestRepeatableReadPinsFirstSnapshot already covers MVCC layer.
+      - All server/mvcc/executor tests pass with -race. Commit: ad82b12.
 
-- [x] **M0100-0002** — Eager XID materialisation for ON CONFLICT wait
-      propagation. **Closes M0096-0005.** (2026-05-13)
-      Design doc: `docs/design/0100-0002-eager-xid-materialization-at-begin.md` (accepted).
-      Implemented (5 logical areas):
-      1. `mvcc/manager.go`: `IsXIDActive(xid)` public method; abortedXIDs tracking
+- [x] **M0100-0002**
+      - Summary: Eager XID materialisation for ON CONFLICT wait
+        propagation. **Closes M0096-0005.** (2026-05-13)
+      - Design doc: `docs/design/0100-0002-eager-xid-materialization-at-begin.md` (accepted).
+      - Implemented (5 logical areas):
+      - 1. `mvcc/manager.go`: `IsXIDActive(xid)` public method; abortedXIDs tracking
          in `finish()` on rollback; `captureSnapshotLocked` includes all abortedXIDs
          in snapshot's `Aborted` field.
-      2. `mvcc/snapshot.go`: `Aborted []TransactionID` field in Snapshot; `HasAborted(xid)`
+      - 2. `mvcc/snapshot.go`: `Aborted []TransactionID` field in Snapshot; `HasAborted(xid)`
          method; `SeesCommittedXID` checks `HasAborted` before xid < Xmin (fixes
          rolled-back rows appearing committed — lightweight clog substitute).
-      3. `executor/operators_upsert.go`: `findInProgressConflict` uses `IsXIDActive`
+      - 3. `executor/operators_upsert.go`: `findInProgressConflict` uses `IsXIDActive`
          (not `Snap.HasInProgress`) so future-xmin tuples (materialized after snapshot)
          are detected; planner auto-detects primary key as arbiter for bare ON CONFLICT
          DO NOTHING in `planOnConflict`.
-      4. `server/conn_tx.go`: `Tx()` returns session's current transaction (with
+      - 4. `server/conn_tx.go`: `Tx()` returns session's current transaction (with
          up-to-date materialised XID) so session self-sees its own writes in SELECT
          after INSERT within the same explicit transaction.
-      5. `testport/framework/isolation_runner.go`: per-permutation global setup/teardown
+      - 5. `testport/framework/isolation_runner.go`: per-permutation global setup/teardown
          (matches PostgreSQL isolationtester); pqprintFormat trailing blank line; step
          ordering fix (`drainWithTimeout` after each regular step).
-      Verified: `TestPort_IsolationInsertConflictDoNothing` → PASS.
-      All unit tests (mvcc/executor/server/planner) pass with -race.
+      - Verified: `TestPort_IsolationInsertConflictDoNothing` → PASS.
+      - All unit tests (mvcc/executor/server/planner) pass with -race.
 
-- [x] **M0100-0003** — Row-level wait on in-progress xmax for UPDATE/DELETE. (2026-05-13)
-      Design doc: `docs/design/0100-0003-row-level-wait-on-in-progress-xmax.md` (accepted).
-      Implemented:
-      1. `executor/operators_storage.go:epqWait`: re-enabled `WaitForXID(ctx.Ctx, xmax)`
+- [x] **M0100-0003**
+      - Summary: Row-level wait on in-progress xmax for UPDATE/DELETE. (2026-05-13)
+      - Design doc: `docs/design/0100-0003-row-level-wait-on-in-progress-xmax.md` (accepted).
+      - Implemented:
+      - 1. `executor/operators_storage.go:epqWait`: re-enabled `WaitForXID(ctx.Ctx, xmax)`
          between WFG cycle check and snapshot refresh. All 4 call sites verified to
          unpin/unlock before calling epqWait (lines 923-924, 1159-1160, 1333-1334, 1520-1521).
          Context cancellation (connection close, timeout) handled via commitCond.Broadcast.
-      2. `testport/framework/isolation.go`: Added `SessionTeardown` field; fixed teardown
+      - 2. `testport/framework/isolation.go`: Added `SessionTeardown` field; fixed teardown
          parser to separate global teardown from per-session teardown (was overwriting TeardownSQL).
-      3. `testport/framework/isolation_runner.go`: Session-aware wait before sending next step
+      - 3. `testport/framework/isolation_runner.go`: Session-aware wait before sending next step
          for a session with a pending goroutine (prevents dual-goroutine connection conflicts);
          per-session teardown now runs after final drain and includes formatted output; reduced
          drainWindow 30s→5s; added execConnCapture; isolated context timeout to 10 min.
-      4. `testport/isolation_port_test.go`: context timeout 2m→10m for 24-permutation specs.
-      Verified: TestPort_IsolationInsertConflictDoNothing PASS; TestPort_IsolationLockCommittedUpdate
-      runs in 7.36s (was >600s hang) and produces `<waiting ...>` output (deferred on value
-      mismatch due to advisory-lock snapshot refresh issue, separate from epqWait). All unit
-      tests -race clean.
+      - 4. `testport/isolation_port_test.go`: context timeout 2m→10m for 24-permutation specs.
+      - Verified: TestPort_IsolationInsertConflictDoNothing PASS; TestPort_IsolationLockCommittedUpdate
+        runs in 7.36s (was >600s hang) and produces `<waiting ...>` output (deferred on value
+        mismatch due to advisory-lock snapshot refresh issue, separate from epqWait). All unit
+        tests -race clean.
 
-- [x] **M0100-0004** — EvalPlanQual concurrent UPDATE recheck (chain-following). (2026-05-13)
-      Design doc: `docs/design/0100-0004-evalplanqual-recheck.md` (accepted).
-      Implemented:
-      1. `executor/operators_storage.go`: `epqFollowHOT(ctx, rel, blk, slot, cols, pred)` helper —
+- [x] **M0100-0004**
+      - Summary: EvalPlanQual concurrent UPDATE recheck (chain-following). (2026-05-13)
+      - Design doc: `docs/design/0100-0004-evalplanqual-recheck.md` (accepted).
+      - Implemented:
+      - 1. `executor/operators_storage.go`: `epqFollowHOT(ctx, rel, blk, slot, cols, pred)` helper —
          follows HOT chain from old slot to latest visible version, re-evaluates WHERE.
-      2. UPDATE SeqScan EPQ loop: after WaitForXID, if tuple invisible (committed):
+      - 2. UPDATE SeqScan EPQ loop: after WaitForXID, if tuple invisible (committed):
          follow HOT chain, re-evaluate WHERE+SET, continue loop with new slot. RR → 40001.
-      3. UPDATE IndexViaUpdate EPQ loop: same chain-following logic.
-      4. DELETE EPQ loop: chain-follow + re-evaluate WHERE, delete latest version. RR → 40001.
-      5. `executor/operators_ddl.go`: DROP TABLE now drops partition children unconditionally
+      - 3. UPDATE IndexViaUpdate EPQ loop: same chain-following logic.
+      - 4. DELETE EPQ loop: chain-follow + re-evaluate WHERE, delete latest version. RR → 40001.
+      - 5. `executor/operators_ddl.go`: DROP TABLE now drops partition children unconditionally
          and inheritance children with CASCADE; `dropTableByRef` helper extracts drop logic.
-      All unit tests (executor/server/mvcc) pass with -race; TestPort_IsolationInsertConflictDoNothing PASS.
-      NOTE: eval-plan-qual/merge-match-recheck defer due to missing RETURNING support in planner
-      (not an EPQ issue — RETURNING is parsed but not planned; needs separate work).
+      - All unit tests (executor/server/mvcc) pass with -race; TestPort_IsolationInsertConflictDoNothing PASS.
+      - NOTE: eval-plan-qual/merge-match-recheck defer due to missing RETURNING support in planner
+        (not an EPQ issue — RETURNING is parsed but not planned; needs separate work).
 
-- [ ] **M0100-0005** — E2E pass confirmation: all 21 dedicated RC isolation
-      tests pass. **Closes M0096-0005 and M0096-0013 via cross-reference.**
-      Run: `go test -v -run TestPort_Isolation -timeout 30m ./internal/testport/`.
-      DoD: every `TestPort_Isolation*` listed in M0096-0001 reports `pass`
-      (none `defer`, none `excluded`). On completion:
+- [ ] **M0100-0005**
+      - Summary: E2E pass confirmation: all 21 dedicated RC isolation
+        tests pass. **Closes M0096-0005 and M0096-0013 via cross-reference.**
+      - Run: `go test -v -run TestPort_Isolation -timeout 30m ./internal/testport/`.
+      - DoD: every `TestPort_Isolation*` listed in M0096-0001 reports `pass`
+        (none `defer`, none `excluded`). On completion:
       - Mark M0096-0005 `[x]` with note "closed via M0100-0002".
       - Mark M0096-0013 `[x]` with note "closed via M0100-0005 — all 21
         dedicated isolation tests pass."
@@ -1012,7 +1058,7 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         from `status=defer` to `status=port`, `pass_required=yes`.
       - Update milestone doc 0100 status to `accepted`; update the
         `docs/milestones/README.md` index row to `accepted`.
-      Partial progress (2026-05-13):
+      - Partial progress (2026-05-13):
       - RETURNING support (M0100-0005 prerequisite, landed same loop):
         Added `Returning`/`ReturningSchema` fields to Update/Delete plan nodes;
         resolved in planUpdate/planDelete via `resolveTargets`; updateOp/deleteOp
@@ -1024,7 +1070,7 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         `updateViaIndex` paths that were returning 0 rows because the index was empty.
       - RETURNING inline yield: `updateViaIndex`, SeqScan, and `deleteOp.Next()` now
         return the first RETURNING row from inline code; subsequent rows via `o.done` block.
-      eval-plan-qual runs 7.4-7.9s, 1133/1494 lines. Progress this loop:
+        eval-plan-qual runs 7.4-7.9s, 1133/1494 lines. Progress this loop:
         - PL/pgSQL `EXECUTE expr INTO varname USING params` implemented (M0100-0005):
           parser, AST (ExecuteStmt), and runtime handler in plpgsql_runtime.go.
           `noisy_oper` function now parses and executes (no more "unsupported statement").
@@ -1096,62 +1142,67 @@ Implements: M0014 (PostgreSQL-Compatible WAL On-Disk Format).
 
 ### Sub-milestones
 
-- [x] **M0101-0001** — Enable `PageHeaders = true` by default.
-      Design doc: `docs/design/0101-0001-wal-page-header-compat-default.md`.
-      Site: `internal/initdb/open.go:232` — add `PageHeaders: true` to `walCfg`.
-      Also add `loadOrCreateSystemID(dir string) (uint64, error)` helper that
-      reads `<datadir>/global/system_identifier` (8-byte binary file) on restart
-      or generates+persists a random `uint64` on first run; pass result as
-      `SystemID` in `walCfg`. `TimelineID` does not need explicit setting —
-      `writer.go:205-206` auto-sets it to 1 when `PageHeaders=true` and
-      `TimelineID==0`.
-      Verify: hex dump of a newly created WAL segment shows bytes 0-1 = `18 d1`
-      (magic 0xD118 LE) and bytes 2-3 = `02 00` (`XLP_LONG_HEADER` flag set);
-      `./postgres/local_install/bin/pg_waldump <segment>` exits 0;
-      `go test ./internal/wal/... ./internal/initdb/...` passes.
+- [x] **M0101-0001**
+      - Summary: Enable `PageHeaders = true` by default.
+      - Design doc: `docs/design/0101-0001-wal-page-header-compat-default.md`.
+      - Site: `internal/initdb/open.go:232` — add `PageHeaders: true` to `walCfg`.
+      - Also add `loadOrCreateSystemID(dir string) (uint64, error)` helper that
+        reads `<datadir>/global/system_identifier` (8-byte binary file) on restart
+        or generates+persists a random `uint64` on first run; pass result as
+        `SystemID` in `walCfg`. `TimelineID` does not need explicit setting —
+        `writer.go:205-206` auto-sets it to 1 when `PageHeaders=true` and
+        `TimelineID==0`.
+      - Verify: hex dump of a newly created WAL segment shows bytes 0-1 = `18 d1`
+        (magic 0xD118 LE) and bytes 2-3 = `02 00` (`XLP_LONG_HEADER` flag set);
+        `./postgres/local_install/bin/pg_waldump <segment>` exits 0;
+        `go test ./internal/wal/... ./internal/initdb/...` passes.
 
-- [x] **M0101-0002** — Verify long page header field values against pg_waldump.
-      No code change expected; this is a verification sub-milestone.
-      Start a goopg cluster with the M0101-0001 fix, run a small workload,
-      stop cleanly, then manually verify each field of the first segment's long
-      page header matches expected values:
+- [x] **M0101-0002**
+      - Summary: Verify long page header field values against pg_waldump.
+      - No code change expected; this is a verification sub-milestone.
+      - Start a goopg cluster with the M0101-0001 fix, run a small workload,
+        stop cleanly, then manually verify each field of the first segment's long
+        page header matches expected values:
       - `xlp_magic` = `0xD118` (offset 0-1)
       - `xlp_info` has bit `0x0002` set (offset 2-3)
       - `xlp_tli` = 1 (offset 4-7)
       - `xlp_seg_size` = 16,777,216 = `0x01000000` (offset 32-35)
       - `xlp_xlog_blcksz` = 8192 = `0x00002000` (offset 36-39)
-      If any value is wrong, fix the encoding and update the design doc.
-      Run `pg_waldump --stats <segment>` and confirm at least one Rmgr line
-      is printed.
+      - If any value is wrong, fix the encoding and update the design doc.
+      - Run `pg_waldump --stats <segment>` and confirm at least one Rmgr line
+        is printed.
 
-- [x] **M0101-0003** — Add `TestPort_WALPgWaldumpCompat` oracle test.
-      Design doc: `docs/design/0101-0002-wal-pg-waldump-validation-test.md`.
-      File: `internal/testport/wal_pg_waldump_test.go`.
-      Test flow: start cluster → workload (CREATE TABLE + INSERT 100 rows +
-      CHECKPOINT) → stop → enumerate `pg_wal/` segments → for each, run
-      `./postgres/local_install/bin/pg_waldump --quiet <seg>` → assert exit 0.
-      Skip if `pg_waldump` binary not found. Add `wal-pg-waldump-compat` entry
-      to `docs/test-port/postgres-oracle-port-status.csv` (`status=port`,
-      `pass_required=yes`); regenerate `.md` via
-      `go run ./cmd/gen-oracle-port-status`.
-      Verify: `go test -v -run TestPort_WALPgWaldump ./internal/testport/` passes.
+- [x] **M0101-0003**
+      - Summary: Add `TestPort_WALPgWaldumpCompat` oracle test.
+      - Design doc: `docs/design/0101-0002-wal-pg-waldump-validation-test.md`.
+      - File: `internal/testport/wal_pg_waldump_test.go`.
+      - Test flow: start cluster → workload (CREATE TABLE + INSERT 100 rows +
+      - CHECKPOINT) → stop → enumerate `pg_wal/` segments → for each, run
+        `./postgres/local_install/bin/pg_waldump --quiet <seg>` → assert exit 0.
+      - Skip if `pg_waldump` binary not found. Add `wal-pg-waldump-compat` entry
+        to `docs/test-port/postgres-oracle-port-status.csv` (`status=port`,
+        `pass_required=yes`); regenerate `.md` via
+        `go run ./cmd/gen-oracle-port-status`.
+      - Verify: `go test -v -run TestPort_WALPgWaldump ./internal/testport/` passes.
 
-- [x] **M0101-0004** — Crash-recovery regression check with PG-compatible WAL.
-      Confirm that WAL replay (`ReplayFromDirWithMgr`) correctly handles
-      PG-compatible-format segments (i.e., `RecordIterator` with `pageHeaders=true`
-      properly skips page headers and decodes records). Run the existing crash-
-      recovery tests with a freshly created PG-compatible-format cluster.
-      Document any failures and fix them. No new code expected if the `pageHeaders`
-      path in the reader already works; this sub-milestone is the verification gate.
-      Verify: `go test -race -run TestCrashRecovery ./internal/...` (or equivalent)
-      passes with the PG-compatible format active.
+- [x] **M0101-0004**
+      - Summary: Crash-recovery regression check with PG-compatible WAL.
+      - Confirm that WAL replay (`ReplayFromDirWithMgr`) correctly handles
+      - PG-compatible-format segments (i.e., `RecordIterator` with `pageHeaders=true`
+        properly skips page headers and decodes records). Run the existing crash-
+        recovery tests with a freshly created PG-compatible-format cluster.
+      - Document any failures and fix them. No new code expected if the `pageHeaders`
+        path in the reader already works; this sub-milestone is the verification gate.
+      - Verify: `go test -race -run TestCrashRecovery ./internal/...` (or equivalent)
+        passes with the PG-compatible format active.
 
-- [x] **M0101-0005** — Update milestone status and close.
-      Update `docs/milestones/0014-wal-compatibility-with-pg.md` status note:
-      add "M0101 implemented the default-on activation; full Rmgr payload
-      mapping and recovery/streaming integration remain planned in M0014."
-      Update `docs/milestones/0101-wal-pg-waldump-compatibility.md` status to
-      `accepted`. Update `docs/milestones/README.md` index row for 0101.
+- [x] **M0101-0005**
+      - Summary: Update milestone status and close.
+      - Update `docs/milestones/0014-wal-compatibility-with-pg.md` status note:
+        add "M0101 implemented the default-on activation; full Rmgr payload
+        mapping and recovery/streaming integration remain planned in M0014."
+      - Update `docs/milestones/0101-wal-pg-waldump-compatibility.md` status to
+        `accepted`. Update `docs/milestones/README.md` index row for 0101.
 
 ## M0102 — Heterogeneous Streaming-Replication + SIGKILL-Failover E2E (filed 2026-05-13)
 
@@ -1186,15 +1237,16 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
 
 ### Sub-milestones
 
-- [x] **M0102-0001** — Prerequisite gate.  CLOSED 2026-05-14.
-      Audit M0094-0005 (`written_lsn` advancement on standby) and M0101
-      (PG-compatible WAL format default-on) status. If either is incomplete,
-      M0102 is blocked. M0094-0005 is required for Scenario A (goopg standby
-      replaying PG WAL with correct LSN reporting). M0101 is required for
-      Scenario B (PG walreceiver consuming goopg WAL bytes). This sub-milestone
-      itself does no implementation; it is a hard gate that must be checked
-      before M0102-0002 can begin.
-      Audit results (2026-05-14):
+- [x] **M0102-0001**
+      - Summary: Prerequisite gate.  CLOSED 2026-05-14.
+      - Audit M0094-0005 (`written_lsn` advancement on standby) and M0101
+        (PG-compatible WAL format default-on) status. If either is incomplete,
+      - M0102 is blocked. M0094-0005 is required for Scenario A (goopg standby
+        replaying PG WAL with correct LSN reporting). M0101 is required for
+      - Scenario B (PG walreceiver consuming goopg WAL bytes). This sub-milestone
+        itself does no implementation; it is a hard gate that must be checked
+        before M0102-0002 can begin.
+      - Audit results (2026-05-14):
       - M0094-0005 closed (loop 3 / fix_plan §M0094-0005) — standby
         continuous-replay tail anchor, plan-cache staleness, and standby hot-read
         MVCC visibility all landed. Verification:
@@ -1205,13 +1257,14 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         pg_waldump compatibility confirmed. Verification:
         `go test -count=1 -run TestPort_WALPgWaldump ./internal/testport/` → PASS
         (0.53 s).
-      Gate result: BOTH prerequisites satisfied — M0102-0002 (BASE_BACKUP wire
-      protocol) is unblocked and may begin.
+      - Gate result: BOTH prerequisites satisfied — M0102-0002 (BASE_BACKUP wire
+        protocol) is unblocked and may begin.
 
-- [x] **M0102-0002** — BASE_BACKUP wire-protocol handler on goopg primary.
-      LANDED 2026-05-14. Design doc:
-      `docs/design/0102-0001-base-backup-wire-protocol.md` (accepted).
-      Changes:
+- [x] **M0102-0002**
+      - Summary: BASE_BACKUP wire-protocol handler on goopg primary.
+      - LANDED 2026-05-14. Design doc:
+        `docs/design/0102-0001-base-backup-wire-protocol.md` (accepted).
+      - Changes:
       - `internal/server/basebackup.go` (new) — `replyBaseBackup` plus a
         POSIX-ustar tar emitter wired through CopyData frames. Wire shape
         mirrors `bbsink_copystream` byte-for-byte: start-LSN result-set
@@ -1243,7 +1296,7 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         `CheckpointNow()` before sampling the start LSN — keeps the
         start-LSN's redo image on disk, matches upstream's
         `do_pg_backup_start` ordering.
-      Tests:
+      - Tests:
       - `internal/server/basebackup_test.go::TestBaseBackupWireProtocolFraming`
         drives BASE_BACKUP via the in-process protocol harness; asserts
         the entire frame sequence and parses the captured tar with
@@ -1253,17 +1306,18 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         ErrorResponse + RFQ when `DataDir` is empty.
       - `TestBaseBackupParseOptions` exercises both PG17+
         parenthesized and legacy keyword option grammars.
-      Verification: `go test -race -count=1 ./internal/server/
-      ./internal/wal/ ./internal/initdb/` → ALL PASS.
-      Documented follow-up (out of M0102-0002 scope): in-flight
-      pg_control rewrite (`backupStartPoint`/`backupEndPoint`) needed
-      before a PG standby can actually boot from the resulting tar
-      under Scenario B (M0102-0007). The wire path itself is complete.
+      - Verification: `go test -race -count=1 ./internal/server/
+        ./internal/wal/ ./internal/initdb/` → ALL PASS.
+      - Documented follow-up (out of M0102-0002 scope): in-flight
+        pg_control rewrite (`backupStartPoint`/`backupEndPoint`) needed
+        before a PG standby can actually boot from the resulting tar
+        under Scenario B (M0102-0007). The wire path itself is complete.
 
-- [x] **M0102-0003** — TIMELINE_HISTORY wire-protocol + TLI history file writer.
-      LANDED 2026-05-14. Design doc:
-      `docs/design/0102-0002-timeline-history-and-promotion-tli-switch.md` (accepted).
-      Changes:
+- [x] **M0102-0003**
+      - Summary: TIMELINE_HISTORY wire-protocol + TLI history file writer.
+      - LANDED 2026-05-14. Design doc:
+        `docs/design/0102-0002-timeline-history-and-promotion-tli-switch.md` (accepted).
+      - Changes:
       - `internal/wal/timeline_history.go` — `ReadHistory`, `WriteHistory`,
         `TimelineHistoryFileName`, `TimelineHistoryEntry`. Atomic write via
         `.tmp` + rename + best-effort dir fsync. Tab-separated
@@ -1288,7 +1342,7 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         `Writer.SetTimelineID()` is a documented follow-up; M0102-0003's
         verification gate only requires the on-disk artefacts and the
         wire path.
-      Tests:
+      - Tests:
       - `internal/wal/timeline_history_test.go` — round-trip, format
         pinning, missing-file, comment/blank-line tolerance.
       - `internal/initdb/timeline_test.go` — default + bump round-trip.
@@ -1299,12 +1353,13 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         `TestReplicationTimelineHistoryReturnsFile` and
         `TestReplicationTimelineHistoryMissingReturnsEmptyContent` verify
         the wire shape end-to-end against a live `Server`.
-      Verification: `go test -race -count=1 ./internal/wal/
-      ./internal/initdb/ ./internal/server/ ./cmd/goopg/` → ALL PASS.
+      - Verification: `go test -race -count=1 ./internal/wal/
+        ./internal/initdb/ ./internal/server/ ./cmd/goopg/` → ALL PASS.
 
-- [x] **M0102-0004** — `promote.signal` file watcher (pg_ctl promote parity).
-      Design doc: `docs/design/0102-0004-promotion-trigger-pg-ctl-parity.md` (accepted).
-      LANDED 2026-05-14. Changes:
+- [x] **M0102-0004**
+      - Summary: `promote.signal` file watcher (pg_ctl promote parity).
+      - Design doc: `docs/design/0102-0004-promotion-trigger-pg-ctl-parity.md` (accepted).
+      - LANDED 2026-05-14. Changes:
       - `internal/initdb/standby.go`: new `PromoteSignalFile = "promote.signal"`
         (upstream PROMOTE_SIGNAL_FILE parity).
       - `cmd/goopg/standby.go`: `standbyController` gains `signalCancel` /
@@ -1323,14 +1378,15 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         * `TestStandbyControllerRemovesStalePromoteSignal` — seeds the file
           before `startStandby`, asserts synchronous removal and no
           auto-promote during 600 ms (2.4× poll interval).
-      Verification: `go test -race -run TestStandbyController -count=1
-      ./cmd/goopg/` → PASS (1.98 s); full `cmd/goopg` + `internal/initdb`
-      suites green with `-race`.
+      - Verification: `go test -race -run TestStandbyController -count=1
+        ./cmd/goopg/` → PASS (1.98 s); full `cmd/goopg` + `internal/initdb`
+        suites green with `-race`.
 
-- [x] **M0102-0005** — Synchronous replication: `synchronous_standby_names` +
-      commit-wait + standby feedback. LANDED 2026-05-14.
-      Design doc: `docs/design/0102-0005-synchronous-replication.md` (accepted).
-      Changes:
+- [x] **M0102-0005**
+      - Summary: Synchronous replication: `synchronous_standby_names` +
+        commit-wait + standby feedback. LANDED 2026-05-14.
+      - Design doc: `docs/design/0102-0005-synchronous-replication.md` (accepted).
+      - Changes:
       - `internal/wal/syncrep.go` (new) — `SyncRep` with `WaitForLSN`,
         `UpdateStandbyProgress`, `ForgetStandby`, `SetStandbyNames`,
         `NeedsWait`. `ParseSyncCommitLevel` maps GUC strings →
@@ -1371,8 +1427,8 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         calls `SetStandbyNames`. New `parsePrimaryConninfoFull` helper
         extracts `application_name=...` from `primary_conninfo` and
         passes it into the walreceiver config.
-      Deferred (M0102-0006/0007 will wire these into their E2E
-      harness — not blockers for M0102-0005's DoD):
+      - Deferred (M0102-0006/0007 will wire these into their E2E
+        harness — not blockers for M0102-0005's DoD):
       - `activity.WaitSyncRep` wait-event registration around each
         WaitForLSN sleep cycle.
       - `pg_reload_conf()` re-applying `synchronous_standby_names` at
@@ -1381,72 +1437,75 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
       - StreamReplayer apply-LSN feedback into walreceiver's
         `ApplyLSNFunc` callback (the receiver currently reuses
         received-LSN; M0102-0006 sync subtest is the first user).
-      Verification: `go test -race -count=1 -run TestSyncRep
-      ./internal/wal/` PASS (13 tests).  Full -race regression on
-      `./internal/wal/ ./internal/server/ ./internal/executor/
-      ./internal/mvcc/ ./internal/initdb/ ./internal/config/
-      ./cmd/goopg/` — ALL PASS.
-      Sites: (a) `internal/config/defaults.go` — add
-      `synchronous_standby_names` GUC; (b) new `internal/wal/syncrep.go` —
-      `SyncRep` struct with `WaitForLSN(ctx, lsn, mode)`,
-      `UpdateStandbyProgress(appName, write, flush, apply)`, `ReleaseWaiters`,
-      modelled on `postgres/src/backend/replication/syncrep.c`; (c)
-      `internal/executor/operators_tx.go` (or commit-emit site) — call
-      `WaitForLSN` after local flush in the COMMIT path when the GUC is set
-      and the level is `remote_*`; (d) `internal/server/replication.go`
-      walsender loop — dispatch Standby Status Update messages into
-      `UpdateStandbyProgress`; (e) `internal/server/walreceiver.go` — confirm
-      / extend periodic Standby Status Update emission, using actual
-      replayed-LSN for apply_lsn. Wire `WaitSyncRep` wait-event constant at
-      `internal/activity/activity.go:70`. Verify: unit test
-      `internal/wal/syncrep_test.go` (race-tested): commit blocks until
-      simulated standby reports apply_lsn ≥ commit_lsn; cancellation of ctx
-      returns immediately. E2E: a focused test where the standby is killed
-      while the primary's commit holds `remote_apply` — commit must block
-      until the standby reattaches.
+      - Verification: `go test -race -count=1 -run TestSyncRep
+        ./internal/wal/` PASS (13 tests).  Full -race regression on
+        `./internal/wal/ ./internal/server/ ./internal/executor/
+        ./internal/mvcc/ ./internal/initdb/ ./internal/config/
+        ./cmd/goopg/` — ALL PASS.
+      - Sites: (a) `internal/config/defaults.go` — add
+        `synchronous_standby_names` GUC; (b) new `internal/wal/syncrep.go` —
+        `SyncRep` struct with `WaitForLSN(ctx, lsn, mode)`,
+        `UpdateStandbyProgress(appName, write, flush, apply)`, `ReleaseWaiters`,
+        modelled on `postgres/src/backend/replication/syncrep.c`; (c)
+        `internal/executor/operators_tx.go` (or commit-emit site) — call
+        `WaitForLSN` after local flush in the COMMIT path when the GUC is set
+        and the level is `remote_*`; (d) `internal/server/replication.go`
+        walsender loop — dispatch Standby Status Update messages into
+        `UpdateStandbyProgress`; (e) `internal/server/walreceiver.go` — confirm
+        / extend periodic Standby Status Update emission, using actual
+        replayed-LSN for apply_lsn. Wire `WaitSyncRep` wait-event constant at
+        `internal/activity/activity.go:70`. Verify: unit test
+        `internal/wal/syncrep_test.go` (race-tested): commit blocks until
+        simulated standby reports apply_lsn ≥ commit_lsn; cancellation of ctx
+        returns immediately. E2E: a focused test where the standby is killed
+        while the primary's commit holds `remote_apply` — commit must block
+        until the standby reattaches.
 
-- [ ] **M0102-0006** — Scenario A E2E test: PG primary + goopg standby.
-      Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
-      File: `internal/testport/e2e_failover_pg_to_goopg_test.go`. Two
-      subtests via `t.Run("async", …)` / `t.Run("sync_remote_apply", …)`.
-      Flow per subtest: start PG primary via new `internal/testutil/pgcluster/`
-      package wrapping `pg_ctl` (configured with
-      `synchronous_standby_names='goopg_standby' + synchronous_commit=
-      remote_apply` for the sync variant); start pgbench workload `pgbench -i
-      -s 1 && pgbench -c 2 -T 180` in background; `pg_basebackup -h <pg>
-      -D <goopg-dir> -X stream -S goopg_standby`; start goopg as standby with
-      `application_name=goopg_standby` in `primary_conninfo`; wait for
-      `pg_last_wal_replay_lsn()` to catch up; `kill -9 <pg-pid>`; touch
-      `<goopg-dir>/promote.signal` (or call `goopg promote`); reconnect
-      pgbench client via libpq multi-host
-      `host=<pg>,<goopg> target_session_attrs=read-write`; assert a new
-      INSERT succeeds on goopg. Verify: sync subtest's post-promotion
-      `count(*)` strictly equals workload's committed-INSERT counter at kill
-      time; async subtest's count is within the documented bound.
+- [ ] **M0102-0006**
+      - Summary: Scenario A E2E test: PG primary + goopg standby.
+      - Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
+      - File: `internal/testport/e2e_failover_pg_to_goopg_test.go`. Two
+        subtests via `t.Run("async", …)` / `t.Run("sync_remote_apply", …)`.
+      - Flow per subtest: start PG primary via new `internal/testutil/pgcluster/`
+        package wrapping `pg_ctl` (configured with
+        `synchronous_standby_names='goopg_standby' + synchronous_commit=
+        remote_apply` for the sync variant); start pgbench workload `pgbench -i
+        -s 1 && pgbench -c 2 -T 180` in background; `pg_basebackup -h <pg>
+        -D <goopg-dir> -X stream -S goopg_standby`; start goopg as standby with
+        `application_name=goopg_standby` in `primary_conninfo`; wait for
+        `pg_last_wal_replay_lsn()` to catch up; `kill -9 <pg-pid>`; touch
+        `<goopg-dir>/promote.signal` (or call `goopg promote`); reconnect
+        pgbench client via libpq multi-host
+        `host=<pg>,<goopg> target_session_attrs=read-write`; assert a new
+      - INSERT succeeds on goopg. Verify: sync subtest's post-promotion
+        `count(*)` strictly equals workload's committed-INSERT counter at kill
+        time; async subtest's count is within the documented bound.
 
-- [ ] **M0102-0007** — Scenario B E2E test: goopg primary + PG standby.
-      Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
-      File: `internal/testport/e2e_failover_goopg_to_pg_test.go`. Same two
-      subtests. Symmetric flow with the dual-binary harness: start goopg
-      primary (with `synchronous_standby_names='pg_standby' +
-      synchronous_commit=remote_apply` for sync); `pg_basebackup -h <goopg>
-      -D <pg-dir> -X stream -S pg_standby` (requires M0102-0002 BASE_BACKUP);
-      start PG standby via `pgcluster`; run a custom psql-driven INSERT+UPDATE
-      loop (pgbench-on-goopg is out of scope); `kill -9 <goopg-pid>`;
-      `pg_ctl promote -D <pg-dir>`; reconnect client via libpq multi-host;
-      assert new INSERT succeeds on PG. Same per-subtest DoD as M0102-0006.
+- [ ] **M0102-0007**
+      - Summary: Scenario B E2E test: goopg primary + PG standby.
+      - Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
+      - File: `internal/testport/e2e_failover_goopg_to_pg_test.go`. Same two
+        subtests. Symmetric flow with the dual-binary harness: start goopg
+        primary (with `synchronous_standby_names='pg_standby' +
+        synchronous_commit=remote_apply` for sync); `pg_basebackup -h <goopg>
+        -D <pg-dir> -X stream -S pg_standby` (requires M0102-0002 BASE_BACKUP);
+        start PG standby via `pgcluster`; run a custom psql-driven INSERT+UPDATE
+        loop (pgbench-on-goopg is out of scope); `kill -9 <goopg-pid>`;
+        `pg_ctl promote -D <pg-dir>`; reconnect client via libpq multi-host;
+        assert new INSERT succeeds on PG. Same per-subtest DoD as M0102-0006.
 
-- [ ] **M0102-0008** — Close milestone.
-      Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
-      `e2e-failover-pg-to-goopg-async`, `e2e-failover-pg-to-goopg-sync`,
-      `e2e-failover-goopg-to-pg-async`, `e2e-failover-goopg-to-pg-sync` — all
-      at `status=port`, `pass_required=yes`. Regenerate the `.md` via
-      `go run ./cmd/gen-oracle-port-status`. Flip
-      `docs/milestones/0102-heterogeneous-replication-failover-e2e.md` status
-      to `accepted` and update the `docs/milestones/README.md` index row.
-      Mark all 5 design docs (`0102-0001..-0005`) as `accepted`. Run the
-      regression suites listed in the milestone DoD and confirm zero
-      regressions.
+- [ ] **M0102-0008**
+      - Summary: Close milestone.
+      - Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
+        `e2e-failover-pg-to-goopg-async`, `e2e-failover-pg-to-goopg-sync`,
+        `e2e-failover-goopg-to-pg-async`, `e2e-failover-goopg-to-pg-sync` — all
+        at `status=port`, `pass_required=yes`. Regenerate the `.md` via
+        `go run ./cmd/gen-oracle-port-status`. Flip
+        `docs/milestones/0102-heterogeneous-replication-failover-e2e.md` status
+        to `accepted` and update the `docs/milestones/README.md` index row.
+      - Mark all 5 design docs (`0102-0001..-0005`) as `accepted`. Run the
+        regression suites listed in the milestone DoD and confirm zero
+        regressions.
 
 ## M0103 — Heterogeneous Logical-Replication + SIGKILL-Failover E2E (filed 2026-05-13)
 
@@ -1489,13 +1548,14 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
 
 ### Sub-milestones
 
-- [x] **M0103-0001** — Prerequisite gate. CLOSED 2026-05-14.
-      Audit M0101 (PG-compat WAL) and M0102-0005 (`synchronous_standby_names`
-      + SyncRep wait primitive) status. M0103-0007/0008 cannot start until
-      both have landed. The M0103-0002..-0006 development sub-milestones can
-      begin in parallel with M0101/M0102-0005 since their deliverables don't
-      depend on those.
-      Audit results (2026-05-14):
+- [x] **M0103-0001**
+      - Summary: Prerequisite gate. CLOSED 2026-05-14.
+      - Audit M0101 (PG-compat WAL) and M0102-0005 (`synchronous_standby_names`
+        + SyncRep wait primitive) status. M0103-0007/0008 cannot start until
+        both have landed. The M0103-0002..-0006 development sub-milestones can
+        begin in parallel with M0101/M0102-0005 since their deliverables don't
+        depend on those.
+      - Audit results (2026-05-14):
       - M0101 closed (M0101-0001..-0005 all [x] in fix_plan.md). Default-on
         PG-compatible WAL format active in `internal/initdb/open.go`;
         `pg_waldump` accepts goopg segments. Verification:
@@ -1508,15 +1568,16 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `go test -count=1 -run TestSyncRep ./internal/wal/` → ok 0.306s
         (13 tests including FIRST/ANY/write/flush/apply mode semantics,
         cancellation, monotonic progress, rule relaxation).
-      Gate result: BOTH prerequisites satisfied — M0103-0007 and M0103-0008
-      are unblocked. M0103-0002..-0006 (apply-worker launcher, reconnect
-      loop, pgoutput interop, logical SyncRep, pubsubcluster harness) were
-      already eligible to start in parallel per the gate's own carve-out;
-      they may now proceed without any pre-condition check.
+      - Gate result: BOTH prerequisites satisfied — M0103-0007 and M0103-0008
+        are unblocked. M0103-0002..-0006 (apply-worker launcher, reconnect
+        loop, pgoutput interop, logical SyncRep, pubsubcluster harness) were
+        already eligible to start in parallel per the gate's own carve-out;
+        they may now proceed without any pre-condition check.
 
-- [x] **M0103-0002** — Subscriber apply-worker auto-launcher.
-      Design doc: `docs/design/0103-0001-apply-worker-launcher.md` (accepted).
-      LANDED 2026-05-14. Changes:
+- [x] **M0103-0002**
+      - Summary: Subscriber apply-worker auto-launcher.
+      - Design doc: `docs/design/0103-0001-apply-worker-launcher.md` (accepted).
+      - LANDED 2026-05-14. Changes:
       - `internal/server/applylauncher.go` (new) — `ApplyLauncher`
         struct + `Run` reconcile loop (periodic `PollInterval` tick
         plus `Wake()` channel coalesced into a single rescan).
@@ -1551,16 +1612,17 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `ctx.OnSubscriptionChange()` after a successful catalog
         mutation so the launcher rescans within milliseconds rather
         than waiting for the periodic tick.
-      Verification: `go test -race -count=1 -run "TestApplyLauncher|TestParseSubscriptionConninfo" ./internal/server/`
-      → 5 tests PASS (1.169 s). Full regression on
-      `./internal/server/ ./internal/executor/ ./internal/catalog/`
-      with `-race` — all green (server 3.428 s, executor 2.560 s,
-      catalog 1.020 s).
+      - Verification: `go test -race -count=1 -run "TestApplyLauncher|TestParseSubscriptionConninfo" ./internal/server/`
+        → 5 tests PASS (1.169 s). Full regression on
+        `./internal/server/ ./internal/executor/ ./internal/catalog/`
+        with `-race` — all green (server 3.428 s, executor 2.560 s,
+        catalog 1.020 s).
 
-- [x] **M0103-0003** — Apply-worker reconnect loop with bounded backoff.
-      LANDED 2026-05-14. Design doc:
-      `docs/design/0103-0002-apply-worker-reconnect.md` (accepted).
-      Changes:
+- [x] **M0103-0003**
+      - Summary: Apply-worker reconnect loop with bounded backoff.
+      - LANDED 2026-05-14. Design doc:
+        `docs/design/0103-0002-apply-worker-reconnect.md` (accepted).
+      - Changes:
       - `internal/server/logicalreceiver.go` — `Run` is now a reconnect-
         aware outer loop calling `runOnce` (dial+handshake+stream).
         Bounded exponential backoff (default 1 s → 30 s with ±20 %
@@ -1593,135 +1655,137 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `context.Canceled` rather than waiting out the backoff) and
         `TestIsPermanentClassifier` (table-driven, 10 cases pinning
         the retry/abort split).
-      Verification: `go test -race -count=1 ./internal/server/
-      ./internal/executor/ ./internal/wal/ ./internal/catalog/`
-      → all green (server 3.398 s, executor 2.575 s, wal 2.977 s,
-      catalog 1.019 s).
+      - Verification: `go test -race -count=1 ./internal/server/
+        ./internal/executor/ ./internal/wal/ ./internal/catalog/`
+        → all green (server 3.398 s, executor 2.575 s, wal 2.977 s,
+        catalog 1.019 s).
 
-- [ ] **M0103-0004** — pgoutput wire-byte interop verification.
-      Design doc: `docs/design/0103-0003-pgoutput-wire-interop.md`.
-      Sites: new `internal/testport/pgoutput_interop_test.go` with two
-      subtests:
-      (a) `TestPort_PgoutputInteropPGToGoopg` — spawn PG via `pgcluster`,
-      create publication, dial PG's logical-replication wire from goopg
-      via `LogicalReceiver`, decode messages, assert correct apply.
-      (b) `TestPort_PgoutputInteropGoopgToPG` — spawn goopg primary +
-      PG subscriber; `CREATE SUBSCRIPTION` on PG against goopg; verify
-      INSERT/UPDATE/DELETE replicate.
-      Audit + fix divergences in `internal/wal/pgoutput.go`: type-OID
-      mapping (goopg → PG OIDs like INT4OID=23), commit_ts epoch (PG uses
-      2000-01-01 microseconds), tuple text format, replica-identity marker.
-      Verify: both subtests pass.
-      PARTIAL PROGRESS 2026-05-14 (loop 1): subtest (a) landed and
-      passes. Test spawns upstream PG (`postgres/local_install/bin`)
-      with `wal_level=logical`, creates a `pgoutput` logical slot via
-      `pg_create_logical_replication_slot`, executes
-      INSERT/INSERT/UPDATE/DELETE on a published `(id int PK, v text)`
-      table, then drains the slot through
-      `pg_logical_slot_get_binary_changes('p', NULL, NULL,
-      'proto_version','1','publication_names','p')`. Concatenated
-      bytea rows form the exact byte stream a libpq subscriber would
-      see; the test walks them, decodes each via `wal.DecodeMessage`,
-      and asserts message kinds, relation name + column OIDs
-      (int4=23, text=25), and tuple contents.
-      Real divergence caught + fixed: PG omits the old-tuple section
-      entirely for UPDATE under REPLICA IDENTITY DEFAULT when no
-      replica-identity column was modified (`'U' relOid 'N' tuple`
-      directly). The previous goopg decoder required `'K'` or `'O'`
-      after rel_oid and rejected such messages. `wal.DecodeMessage`
-      now treats the K/O block as optional and accepts both shapes.
-      Encoder symmetry FIXED 2026-05-14 loop 2: `pgoutput.go::writeUpdate`
-      no longer emits the malformed `'K' | natts=0` placeholder. When no
-      old tuple exists (REPLICA IDENTITY DEFAULT, no key column modified),
-      the encoder now emits `'U' rel_oid 'N' new_tuple` directly, matching
-      `proto.c::logicalrep_write_update` byte-for-byte. Pinned by
-      `TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN` in
-      `internal/wal/pgoutput_test.go`. `writeDelete`'s K-fallback is
-      retained as a defensive guard (DELETE always carries a key tuple
-      in well-formed callers; the guard avoids a panic without obscuring
-      a real bug from a PG subscriber).
-      CREATE_REPLICATION_SLOT LOGICAL pgoutput FIXED 2026-05-14 loop 2:
-      `replyCreateReplicationSlot` (`internal/server/replication.go`) now
-      parses the upstream grammar `[TEMPORARY] LOGICAL output_plugin
-      [EXPORT_SNAPSHOT|NOEXPORT_SNAPSHOT|USE_SNAPSHOT] [TWO_PHASE]`,
-      creates a `wal.SlotLogical` slot, and returns the four-column reply
-      with `output_plugin = "pgoutput"`. Only `pgoutput` is accepted; other
-      plugin names land with `feature_not_supported`. Pinned by
-      `TestReplicationCreateLogicalSlot` /
-      `TestReplicationCreateLogicalSlotRejectsUnknownPlugin` in
-      `internal/server/replication_test.go`.
-      Subtest (b) is still `t.Skip`, now pending only (iii): a bring-up
-      harness that spawns a real PG subscriber and runs `CREATE
-      SUBSCRIPTION` against goopg. That harness is the same one needed
-      by M0103-0007/0008 and will land alongside `pubsubcluster`
-      (M0103-0006); subtest (b) becomes a thin wrapper once that lands.
-      Verification (2026-05-14 loop 2): `go test -count=1 -timeout 120s
-      -run TestPort_PgoutputInterop -v ./internal/testport/` →
-      `TestPort_PgoutputInteropPGToGoopg` PASS,
-      `TestPort_PgoutputInteropGoopgToPG` SKIP (waiting on M0103-0006
-      harness). Regression coverage green: `go test -count=1 -race
-      -timeout 300s ./internal/wal/ ./internal/server/
-      ./internal/executor/ ./internal/catalog/` → all pass (wal 3.035 s,
-      server 3.605 s, executor 2.621 s, catalog 1.021 s).
-      PARTIAL PROGRESS 2026-05-14 (loop 3): subtest (b) wired against
-      the `pubsubcluster` harness (M0103-0006) which uncovered two
-      further publisher-side gaps that PG's CREATE SUBSCRIPTION drives
-      through libpqrcv *before* it reaches START_REPLICATION.
-      Gap 1 (FIXED this loop): `runPostStartupLoop`
-      (`internal/server/server.go`) cancelled the per-query context
-      (`queryCtx`) on replication-mode connections *before* falling
-      through to the regular SQL path, so PG's libpqrcv
-      `SELECT pubname FROM pg_catalog.pg_publication WHERE pubname IN
-      (…)` probe entered the executor with an already-cancelled
-      context and `acquireRelLock` returned SQLSTATE 57014
-      ("canceling statement due to user request"). Fix: defer the
-      `clearQueryCancel()`/`queryCancel()` pair until after the
-      replication-command dispatcher decides not to handle the frame,
-      so the SQL fall-through sees a live `queryCtx`. Pinned by
-      `internal/server/replication_test.go::TestReplicationFallthroughQueryNotCancelled`.
-      Gap 2 (DEFERRED to M0103-0008): with Gap 1 closed, the next
-      libpqrcv probe `fetch_table_list` sends
-      `… pg_get_publication_tables(VARIADIC array_agg(p.pubname::text)) …`;
-      goopg's parser rejects `VARIADIC` with `syntax error at or near
-      "expected expression (got variadic)"`. Closing this requires
-      parser-side VARIADIC support plus a working
-      `pg_get_publication_tables` function (the `pg_publication_tables`
-      virtual view already exists). That work is M0103-0008's natural
-      scope (Scenario B: goopg primary + PG subscriber — same
-      publisher-side surface, same failure mode); subtest (b)
-      collapses to a thin wrapper once M0103-0008 lands the
-      probe-survival fix. The full test body is preserved as a
-      closure under the updated `t.Skip` in
-      `internal/testport/pgoutput_interop_test.go` for traceability.
-      Verification (loop 3): `go test -count=1 -timeout 120s -run
-      "TestReplicationFallthroughQueryNotCancelled|TestReplicationCreateLogicalSlot|TestReplicationIdentifySystem|TestReplicationCreateAndDropSlot|TestReplicationSlotInvalidName"
-      -v ./internal/server/` → all PASS. `go test -race -count=1
-      -timeout 300s ./internal/server/ ./internal/wal/
-      ./internal/executor/ ./internal/catalog/` → all green
-      (server 3.723 s, wal 3.227 s, executor 2.712 s, catalog
-      1.021 s). `go test -count=1 -timeout 240s -run
-      TestPort_PgoutputInterop -v ./internal/testport/` →
-      subtest (a) PASS, subtest (b) SKIP (gap 2).
-      Design doc updated: `docs/design/0103-0003-pgoutput-wire-interop.md`
-      § "Subtest (b)" rewritten with Gap 1 + Gap 2 analysis.
+- [ ] **M0103-0004**
+      - Summary: pgoutput wire-byte interop verification.
+      - Design doc: `docs/design/0103-0003-pgoutput-wire-interop.md`.
+      - Sites: new `internal/testport/pgoutput_interop_test.go` with two
+        subtests:
+        (a) `TestPort_PgoutputInteropPGToGoopg` — spawn PG via `pgcluster`,
+        create publication, dial PG's logical-replication wire from goopg
+        via `LogicalReceiver`, decode messages, assert correct apply.
+        (b) `TestPort_PgoutputInteropGoopgToPG` — spawn goopg primary +
+      - PG subscriber; `CREATE SUBSCRIPTION` on PG against goopg; verify
+      - INSERT/UPDATE/DELETE replicate.
+      - Audit + fix divergences in `internal/wal/pgoutput.go`: type-OID
+        mapping (goopg → PG OIDs like INT4OID=23), commit_ts epoch (PG uses
+      - 2000-01-01 microseconds), tuple text format, replica-identity marker.
+      - Verify: both subtests pass.
+      - PARTIAL PROGRESS 2026-05-14 (loop 1): subtest (a) landed and
+        passes. Test spawns upstream PG (`postgres/local_install/bin`)
+        with `wal_level=logical`, creates a `pgoutput` logical slot via
+        `pg_create_logical_replication_slot`, executes
+      - INSERT/INSERT/UPDATE/DELETE on a published `(id int PK, v text)`
+        table, then drains the slot through
+        `pg_logical_slot_get_binary_changes('p', NULL, NULL,
+        'proto_version','1','publication_names','p')`. Concatenated
+        bytea rows form the exact byte stream a libpq subscriber would
+        see; the test walks them, decodes each via `wal.DecodeMessage`,
+        and asserts message kinds, relation name + column OIDs
+        (int4=23, text=25), and tuple contents.
+      - Real divergence caught + fixed: PG omits the old-tuple section
+        entirely for UPDATE under REPLICA IDENTITY DEFAULT when no
+        replica-identity column was modified (`'U' relOid 'N' tuple`
+        directly). The previous goopg decoder required `'K'` or `'O'`
+        after rel_oid and rejected such messages. `wal.DecodeMessage`
+        now treats the K/O block as optional and accepts both shapes.
+      - Encoder symmetry FIXED 2026-05-14 loop 2: `pgoutput.go::writeUpdate`
+        no longer emits the malformed `'K' | natts=0` placeholder. When no
+        old tuple exists (REPLICA IDENTITY DEFAULT, no key column modified),
+        the encoder now emits `'U' rel_oid 'N' new_tuple` directly, matching
+        `proto.c::logicalrep_write_update` byte-for-byte. Pinned by
+        `TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN` in
+        `internal/wal/pgoutput_test.go`. `writeDelete`'s K-fallback is
+        retained as a defensive guard (DELETE always carries a key tuple
+        in well-formed callers; the guard avoids a panic without obscuring
+        a real bug from a PG subscriber).
+      - CREATE_REPLICATION_SLOT LOGICAL pgoutput FIXED 2026-05-14 loop 2:
+        `replyCreateReplicationSlot` (`internal/server/replication.go`) now
+        parses the upstream grammar `[TEMPORARY] LOGICAL output_plugin
+        [EXPORT_SNAPSHOT|NOEXPORT_SNAPSHOT|USE_SNAPSHOT] [TWO_PHASE]`,
+        creates a `wal.SlotLogical` slot, and returns the four-column reply
+        with `output_plugin = "pgoutput"`. Only `pgoutput` is accepted; other
+        plugin names land with `feature_not_supported`. Pinned by
+        `TestReplicationCreateLogicalSlot` /
+        `TestReplicationCreateLogicalSlotRejectsUnknownPlugin` in
+        `internal/server/replication_test.go`.
+      - Subtest (b) is still `t.Skip`, now pending only (iii): a bring-up
+        harness that spawns a real PG subscriber and runs `CREATE
+      - SUBSCRIPTION` against goopg. That harness is the same one needed
+        by M0103-0007/0008 and will land alongside `pubsubcluster`
+        (M0103-0006); subtest (b) becomes a thin wrapper once that lands.
+      - Verification (2026-05-14 loop 2): `go test -count=1 -timeout 120s
+        -run TestPort_PgoutputInterop -v ./internal/testport/` →
+        `TestPort_PgoutputInteropPGToGoopg` PASS,
+        `TestPort_PgoutputInteropGoopgToPG` SKIP (waiting on M0103-0006
+        harness). Regression coverage green: `go test -count=1 -race
+        -timeout 300s ./internal/wal/ ./internal/server/
+        ./internal/executor/ ./internal/catalog/` → all pass (wal 3.035 s,
+        server 3.605 s, executor 2.621 s, catalog 1.021 s).
+      - PARTIAL PROGRESS 2026-05-14 (loop 3): subtest (b) wired against
+        the `pubsubcluster` harness (M0103-0006) which uncovered two
+        further publisher-side gaps that PG's CREATE SUBSCRIPTION drives
+        through libpqrcv *before* it reaches START_REPLICATION.
+      - Gap 1 (FIXED this loop): `runPostStartupLoop`
+        (`internal/server/server.go`) cancelled the per-query context
+        (`queryCtx`) on replication-mode connections *before* falling
+        through to the regular SQL path, so PG's libpqrcv
+        `SELECT pubname FROM pg_catalog.pg_publication WHERE pubname IN
+        (…)` probe entered the executor with an already-cancelled
+        context and `acquireRelLock` returned SQLSTATE 57014
+        ("canceling statement due to user request"). Fix: defer the
+        `clearQueryCancel()`/`queryCancel()` pair until after the
+        replication-command dispatcher decides not to handle the frame,
+        so the SQL fall-through sees a live `queryCtx`. Pinned by
+        `internal/server/replication_test.go::TestReplicationFallthroughQueryNotCancelled`.
+      - Gap 2 (DEFERRED to M0103-0008): with Gap 1 closed, the next
+        libpqrcv probe `fetch_table_list` sends
+        `… pg_get_publication_tables(VARIADIC array_agg(p.pubname::text)) …`;
+        goopg's parser rejects `VARIADIC` with `syntax error at or near
+        "expected expression (got variadic)"`. Closing this requires
+        parser-side VARIADIC support plus a working
+        `pg_get_publication_tables` function (the `pg_publication_tables`
+        virtual view already exists). That work is M0103-0008's natural
+        scope (Scenario B: goopg primary + PG subscriber — same
+        publisher-side surface, same failure mode); subtest (b)
+        collapses to a thin wrapper once M0103-0008 lands the
+        probe-survival fix. The full test body is preserved as a
+        closure under the updated `t.Skip` in
+        `internal/testport/pgoutput_interop_test.go` for traceability.
+      - Verification (loop 3): `go test -count=1 -timeout 120s -run
+        "TestReplicationFallthroughQueryNotCancelled|TestReplicationCreateLogicalSlot|TestReplicationIdentifySystem|TestReplicationCreateAndDropSlot|TestReplicationSlotInvalidName"
+        -v ./internal/server/` → all PASS. `go test -race -count=1
+        -timeout 300s ./internal/server/ ./internal/wal/
+        ./internal/executor/ ./internal/catalog/` → all green
+        (server 3.723 s, wal 3.227 s, executor 2.712 s, catalog
+      - 1.021 s). `go test -count=1 -timeout 240s -run
+      - TestPort_PgoutputInterop -v ./internal/testport/` →
+        subtest (a) PASS, subtest (b) SKIP (gap 2).
+      - Design doc updated: `docs/design/0103-0003-pgoutput-wire-interop.md`
+        § "Subtest (b)" rewritten with Gap 1 + Gap 2 analysis.
 
-- [x] **M0103-0005** — Logical-walsender SyncRep integration.
-      Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`
-      (accepted).
-      COMPLETE 2026-05-14: audit showed the 'r'-message dispatch was
-      already wired (`internal/server/logicalwalsender.go::runLogicalWalsender`
-      forwards every standby-status frame into `handleStandbyCopyData`,
-      which decodes via `protocol.DecodeReplicationMessage` and calls
-      `SyncRep.UpdateStandbyProgress(appName, write, flush, apply)`).
-      `appName` is plumbed from the StartupMessage's `application_name`
-      through `runPostStartupLoop → handleReplicationCommand →
-      replyStartReplication → runLogicalWalsender`. The missing piece
-      was the cleanup symmetry with the physical path: a `defer
-      SyncRep.ForgetStandby(appName)` was added to `runLogicalWalsender`
-      so a disconnected subscriber stops counting toward the FIRST/ANY
-      quorum (parity with the existing physical-walsender defer in
-      `replyStartReplication`).
-      Verification:
+- [x] **M0103-0005**
+      - Summary: Logical-walsender SyncRep integration.
+      - Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`
+        (accepted).
+      - COMPLETE 2026-05-14: audit showed the 'r'-message dispatch was
+        already wired (`internal/server/logicalwalsender.go::runLogicalWalsender`
+        forwards every standby-status frame into `handleStandbyCopyData`,
+        which decodes via `protocol.DecodeReplicationMessage` and calls
+        `SyncRep.UpdateStandbyProgress(appName, write, flush, apply)`).
+        `appName` is plumbed from the StartupMessage's `application_name`
+        through `runPostStartupLoop → handleReplicationCommand →
+        replyStartReplication → runLogicalWalsender`. The missing piece
+        was the cleanup symmetry with the physical path: a `defer
+      - SyncRep.ForgetStandby(appName)` was added to `runLogicalWalsender`
+        so a disconnected subscriber stops counting toward the FIRST/ANY
+        quorum (parity with the existing physical-walsender defer in
+        `replyStartReplication`).
+      - Verification:
       - New `TestLogicalSyncRepDispatchUnblocksOnApplyCatchup` in
         `internal/server/logicalwalsender_test.go` builds a real
         `EncodeStandbyStatusUpdate` payload, feeds it through
@@ -1735,17 +1799,18 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         ./internal/wal/ ./internal/executor/ ./internal/catalog/` →
         all green (server 3.504 s, wal 3.079 s, executor 2.594 s,
         catalog 1.020 s).
-      No new SyncRep primitive added; M0102-0005's
-      `wal.SyncRep.WaitForLSN` already handles publisher-side blocking.
-      The existing `internal/wal/syncrep_test.go::TestSyncRepModeDistinguishesWriteFlushApply`
-      already pins the RemoteApply primitive's semantics; the new
-      tests focus on the dispatcher-path wiring that M0103-0005 owns.
+      - No new SyncRep primitive added; M0102-0005's
+        `wal.SyncRep.WaitForLSN` already handles publisher-side blocking.
+      - The existing `internal/wal/syncrep_test.go::TestSyncRepModeDistinguishesWriteFlushApply`
+        already pins the RemoteApply primitive's semantics; the new
+        tests focus on the dispatcher-path wiring that M0103-0005 owns.
 
-- [x] **M0103-0006** — `pubsubcluster` test harness.
-      LANDED 2026-05-14. Design doc:
-      `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`
-      (accepted).
-      Changes:
+- [x] **M0103-0006**
+      - Summary: `pubsubcluster` test harness.
+      - LANDED 2026-05-14. Design doc:
+        `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`
+        (accepted).
+      - Changes:
       - `internal/testutil/pgcluster/` (new package) — upstream-PG
         wrapper modelled on `interopPG` in
         `internal/testport/pgoutput_interop_test.go`. `Options`
@@ -1785,7 +1850,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `create_slot=false`; INSERT on publisher; wait for the
         subscriber's `logical apply: commit` structured-log
         beacon as evidence that the apply path is live.
-      Caveats (each tracked, in scope for M0103-0007 closure):
+      - Caveats (each tracked, in scope for M0103-0007 closure):
       - **goopg `CREATE SUBSCRIPTION` does not auto-create the
         replication slot on the publisher.** Upstream PG defaults
         to `WITH (create_slot = true)` and dials the publisher to
@@ -1810,188 +1875,189 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         both peers to share role `postgres`. A proper fix is for
         the launcher to honour the conninfo's role+db (matches
         upstream walsender behaviour).
-      Verification: `go test -count=1 -timeout 180s
-      ./internal/testutil/pgcluster/ ./internal/testutil/pubsubcluster/`
-      → both packages PASS (pgcluster 1.24 s, pubsubcluster 1.88 s).
-      `go build ./...` clean. Short regression on
-      `./internal/server/ ./internal/wal/ ./internal/executor/`
-      with `-short` — ALL PASS (server 1.91 s, wal 2.00 s,
-      executor 1.20 s).
+      - Verification: `go test -count=1 -timeout 180s
+        ./internal/testutil/pgcluster/ ./internal/testutil/pubsubcluster/`
+        → both packages PASS (pgcluster 1.24 s, pubsubcluster 1.88 s).
+        `go build ./...` clean. Short regression on
+        `./internal/server/ ./internal/wal/ ./internal/executor/`
+        with `-short` — ALL PASS (server 1.91 s, wal 2.00 s,
+        executor 1.20 s).
 
-- [ ] **M0103-0007** — Scenario A E2E test: PG primary + goopg subscriber.
-      Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
-      File: `internal/testport/e2e_logical_failover_pg_to_goopg_test.go`,
-      `TestE2E_LogicalFailoverPGtoGoopg` with `t.Run("async", …)` /
-      `t.Run("sync_remote_apply", …)`. Flow per subtest: spin up
-      `PubSubCluster` (PG pub, goopg sub) with sync mode per subtest; create
-      publication; create subscription with
-      `application_name=goopg_sub`; run pgbench `pgbench -i -s 1 &&
-      pgbench -c 2 -T 180` on PG with workload-counter polling via
-      `pgbench_history`; wait ~60 s; `kill -9 <pg-pid>` (record
-      `killCommitted`); libpq multi-host client reconnect
-      (`target_session_attrs=read-write`); INSERT on goopg succeeds; verify
-      row count per mode.
-      DoD: sync subtest — `count(*) == killCommitted + 1` (zero loss);
-      async subtest — `count(*) ∈ [killCommitted-asyncLossBound+1,
-      killCommitted+1]` with `asyncLossBound = 50` (documented in design doc).
-      PARTIAL PROGRESS 2026-05-14 (rung 1): closed the M0103-0006
-      "apply-worker writes invisible to fresh sessions" caveat. The
-      caveat hand-waved the cause as "the apply worker writes outside
-      the dispatcher's MVCC view"; root cause is narrower —
-      `ApplyWorker.applyInsert` called `writeHeapRow` only, with no
-      index maintenance. SeqScan saw the tuple; `WHERE id = 1` fell
-      back to IndexScan, probed an empty PK btree, and returned 0
-      rows. Dispatcher INSERTs into the same table were matched
-      correctly, isolating the gap to the apply path. Design doc:
-      `docs/design/0103-0024-apply-worker-index-maintenance.md`
-      (accepted). Fix: pipe `writeHeapRowReturning`'s
-      `storage.ItemPointer` through to
-      `maintainUniqueIndexesForInsert` from `applyInsert`; mirror in
-      `applyUpdateByKey` (signature gains `*catalog.Table` so the
-      helper can resolve `IndexesOnTable`). Pinned by
-      `TestPubSubClusterSmokePGToGoopgFreshSessionVisibility` in
-      `internal/testutil/pubsubcluster/cluster_test.go`: full
-      PG-publisher + goopg-subscriber harness, asserts `count(*)
-      WHERE id = 1` returns 1 after the apply commit. Before fix: 10 s
-      deadline. After: ≈ 2 s. Follow-up (deferred within
-      M0103-0007 scope): UPDATE old-tuple / DELETE index-entry
-      deletion + non-unique secondary indexes. Goopg's IndexScan
-      tolerates orphaned entries via heap re-fetch + visibility
-      re-check, so a Scenario A test only needs to close these if a
-      false-positive surfaces. The full Scenario A failover wiring
-      (pgbench, kill -9, libpq multi-host reconnect) remains the
-      principal remaining work.
-      PARTIAL PROGRESS 2026-05-14 (rung 2): full PG-publisher →
-      goopg-subscriber INSERT/INSERT/UPDATE/DELETE round-trip with
-      fresh-session visibility verification. New live test
-      `TestPort_PgoutputInteropPGToGoopgFullDML` in
-      `internal/testport/pgoutput_interop_test.go` mirrors the
-      M0103-0008 closure shape but with the direction inverted (PG
-      pub, goopg sub). Pre-creates the logical slot on PG (goopg's
-      CREATE SUBSCRIPTION doesn't yet auto-create), runs the same
-      four DML statements as Scenario B, then asserts fresh-session
-      visibility on goopg via PK IndexScan: `WHERE id = 2 AND v =
-      'updated'` returns 1, `WHERE id = 1` returns 0, `count(*)`
-      returns 1. Design doc:
-      `docs/design/0103-0025-m0103-0007-rung-2-pg-to-goopg-full-dml.md`
-      (accepted).
-      Diagnosis: lifting the test surfaced a concrete gap —
-      `ApplyWorker.applyUpdate` returned nil whenever
-      `m.OldTuple == []` and silently dropped every REPLICA IDENTITY
-      DEFAULT UPDATE that didn't touch key columns. Pgoutput's
-      `logicalrep_write_update` omits OldTuple in that case: `'U'
-      relOid 'N' newTuple` directly (decoder already handles the
-      missing K/O marker at `internal/wal/pgoutput_decoder.go:175`;
-      only the apply side was broken).
-      Fix: when OldTuple is empty, synthesise the row-locator key
-      from the new tuple's PK columns via a new
-      `primaryKeyOnlyRow(catalog, tbl, full Row) Row` helper in
-      `internal/executor/applyworker.go`. The helper returns a
-      partial-key Row where PK positions hold `full`'s values and
-      every other position is NullDatum — `rowMatchesKey`'s existing
-      "skip NULL key cells" rule restricts the match to PK columns.
-      No-PK tables continue to skip silently (no safe way to locate
-      the pre-image row). DELETE's orphan-PK-entry path is
-      exercised via the `WHERE id = 1` assertion (returns 0 because
-      IndexScan re-fetches the heap tuple and MVCC marks it dead)
-      and confirms the rung-1 caveat ("IndexScan tolerates orphaned
-      index entries"). Pinned by `TestPrimaryKeyOnlyRow` (unit,
-      helper-only) in `internal/executor/applyworker_test.go` and
-      `TestPort_PgoutputInteropPGToGoopgFullDML` (live E2E).
-      Verification (rung 2): `go test -count=1 -timeout 120s
-      -run TestPort_PgoutputInteropPGToGoopgFullDML
-      ./internal/testport/` → PASS (~2 s). Broader sweep: executor,
-      catalog, parser, planner, analyzer, server → all green; wal
-      package has pre-existing 2 s-timing flakes
-      (`TestSlotDecoderRunDrivesPluginThroughCommit`,
-      `TestStreamReplayerAppliesIncomingRecords`) that pass in
-      isolation (same flake noted in loops 17/18). Pubsubcluster
-      smoke + visibility tests also green. The full Scenario A
-      failover wiring (pgbench, kill -9, libpq multi-host reconnect)
-      remains the principal remaining work and will be sequenced as
-      further rungs, each with its own design doc + pin per the
-      M0103-0008 closure protocol.
-      PARTIAL PROGRESS 2026-05-14 (rung 3): sustained-workload
-      scale verification — 50 INSERTs + 25 no-key-touched UPDATEs
-      + 10 DELETEs from a PG publisher to a goopg subscriber.
-      Pinned by `TestPort_PgoutputInteropPGToGoopgBatchDML` in
-      `internal/testport/pgoutput_interop_test.go`: scales rung-2's
-      4-statement round-trip by 50× per phase, crosses pgoutput
-      xact boundaries and publisher-side heap-page boundaries
-      (which on the M0103-0008 side produced `RecordKindPageImage`
-      first-dirty-in-epoch records — but the apply worker only
-      consumes pgoutput Insert frames, so all 50 INSERTs must
-      surface). Verifies `count(*) = 40` plus per-id state from
-      fresh `database/sql` sessions through the goopg PK IndexScan
-      path: each updated id has `v='updated-N'`, each untouched-
-      but-not-deleted id keeps `v='row-N'`, each deleted id returns
-      0 (orphan PK entries from DELETE are tolerated by IndexScan
-      heap re-fetch + MVCC dead-tuple filtering, as the rung-1
-      caveat predicted). No new fix needed — rung 1's index
-      maintenance and rung 2's `primaryKeyOnlyRow` synthesis
-      already scale 50× cleanly. Design doc:
-      `docs/design/0103-0026-m0103-0007-rung-3-pg-to-goopg-batch-dml.md`
-      (accepted). Verification (rung 3):
-      `go test -count=1 -timeout 160s
-      -run TestPort_PgoutputInteropPGToGoopgBatchDML
-      ./internal/testport/` → PASS (~2.1 s). Rung-2 test still
-      green. Next rungs (deferred within M0103-0007): pgbench
-      against PG publisher with `pgbench_history` polling, REPLICA
-      IDENTITY FULL / TOAST / DDL replication shapes, kill -9 +
-      libpq multi-host reconnect plumbing on the client side.
-      PARTIAL PROGRESS 2026-05-14 (rung 4): REPLICA IDENTITY FULL
-      branch coverage. Design doc:
-      `docs/design/0103-0027-m0103-0007-rung-4-pg-to-goopg-replica-identity-full.md`
-      (accepted). New test
-      `TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull` in
-      `internal/testport/pgoutput_interop_test.go` drives a
-      no-primary-key table whose publisher carries
-      `ALTER TABLE public.t REPLICA IDENTITY FULL` before
-      subscription creation. Workload: 3 INSERTs, 1 UPDATE that
-      does NOT touch a key column, 1 DELETE. Under FULL pgoutput
-      emits `'O'` + full pre-image on every UPDATE/DELETE
-      regardless of key-column modification, so the apply worker's
-      `len(m.OldTuple) > 0` branch is forced (rung 2's
-      `primaryKeyOnlyRow` synthesis path is unreachable for no-PK
-      relations). The rung pins three previously-unverified apply
-      paths: (a) `applyInsert` against a table with zero
-      unique/primary indexes — `maintainUniqueIndexesForInsert`
-      becomes a no-op via its `!idx.Unique && !idx.Primary` filter
-      and the row reaches the heap visible to fresh-session
-      SeqScans; (b) `applyUpdate`'s explicit-old-tuple branch —
-      `decodePgoutputTupleAsRow(m.OldTuple)` returns a full Row
-      where every cell carries a value (no NULL skip-cells), then
-      `rowMatchesKey` does full-column equality on the heap; (c)
-      `applyDelete` via the same full-row sequential-scan match.
-      Fresh `database/sql` connection per assertion via
-      `psc.WaitForRow`; predicates use only non-indexed columns
-      (`WHERE 1=1`, `WHERE a=2 AND v='bb'`, `WHERE a=1`,
-      `WHERE a=3 AND v='c'`) so the SeqScan path is exercised
-      end-to-end. No new fix was needed — the apply worker's
-      existing FULL-shape branch handles `'t'`/`'n'` column status
-      codes correctly. Verification (rung 4):
-      `go test -count=1 -timeout 120s
-      -run TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull
-      ./internal/testport/` → PASS (~1.7 s). All 5
-      `TestPort_PgoutputInterop*` tests still green together.
-      Race-tested regression on
-      `./internal/executor/ ./internal/wal/ ./internal/server/
-      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
-      → all green. Next rungs (deferred within M0103-0007):
-      TOAST (`'u'` unchanged-TOAST status decode), DDL replication,
-      pgbench against PG publisher with `pgbench_history` polling,
-      kill -9 + libpq multi-host reconnect plumbing on the client
-      side.
-      PARTIAL PROGRESS 2026-05-14 (rung 5): unchanged-TOAST `'u'`
-      decode. Design doc:
-      `docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md`
-      (accepted). Real-world workloads against publisher tables
-      with TOASTed columns (large text/bytea) would otherwise stall
-      the apply slot on the first UPDATE that left the TOASTed
-      column unchanged — pgoutput emits that column as `'u'` +
-      zero bytes, and the apply worker rejected it as
-      `"'u' (unchanged TOAST) status not supported"`. Fix splits
-      across decoder + apply paths:
+- [ ] **M0103-0007**
+      - Summary: Scenario A E2E test: PG primary + goopg subscriber.
+      - Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
+      - File: `internal/testport/e2e_logical_failover_pg_to_goopg_test.go`,
+        `TestE2E_LogicalFailoverPGtoGoopg` with `t.Run("async", …)` /
+        `t.Run("sync_remote_apply", …)`. Flow per subtest: spin up
+        `PubSubCluster` (PG pub, goopg sub) with sync mode per subtest; create
+        publication; create subscription with
+        `application_name=goopg_sub`; run pgbench `pgbench -i -s 1 &&
+        pgbench -c 2 -T 180` on PG with workload-counter polling via
+        `pgbench_history`; wait ~60 s; `kill -9 <pg-pid>` (record
+        `killCommitted`); libpq multi-host client reconnect
+        (`target_session_attrs=read-write`); INSERT on goopg succeeds; verify
+        row count per mode.
+      - DoD: sync subtest — `count(*) == killCommitted + 1` (zero loss);
+        async subtest — `count(*) ∈ [killCommitted-asyncLossBound+1,
+        killCommitted+1]` with `asyncLossBound = 50` (documented in design doc).
+      - PARTIAL PROGRESS 2026-05-14 (rung 1): closed the M0103-0006
+        "apply-worker writes invisible to fresh sessions" caveat. The
+        caveat hand-waved the cause as "the apply worker writes outside
+        the dispatcher's MVCC view"; root cause is narrower —
+        `ApplyWorker.applyInsert` called `writeHeapRow` only, with no
+        index maintenance. SeqScan saw the tuple; `WHERE id = 1` fell
+        back to IndexScan, probed an empty PK btree, and returned 0
+        rows. Dispatcher INSERTs into the same table were matched
+        correctly, isolating the gap to the apply path. Design doc:
+        `docs/design/0103-0024-apply-worker-index-maintenance.md`
+        (accepted). Fix: pipe `writeHeapRowReturning`'s
+        `storage.ItemPointer` through to
+        `maintainUniqueIndexesForInsert` from `applyInsert`; mirror in
+        `applyUpdateByKey` (signature gains `*catalog.Table` so the
+        helper can resolve `IndexesOnTable`). Pinned by
+        `TestPubSubClusterSmokePGToGoopgFreshSessionVisibility` in
+        `internal/testutil/pubsubcluster/cluster_test.go`: full
+      - PG-publisher + goopg-subscriber harness, asserts `count(*)
+      - WHERE id = 1` returns 1 after the apply commit. Before fix: 10 s
+        deadline. After: ≈ 2 s. Follow-up (deferred within
+      - M0103-0007 scope): UPDATE old-tuple / DELETE index-entry
+        deletion + non-unique secondary indexes. Goopg's IndexScan
+        tolerates orphaned entries via heap re-fetch + visibility
+        re-check, so a Scenario A test only needs to close these if a
+        false-positive surfaces. The full Scenario A failover wiring
+        (pgbench, kill -9, libpq multi-host reconnect) remains the
+        principal remaining work.
+      - PARTIAL PROGRESS 2026-05-14 (rung 2): full PG-publisher →
+        goopg-subscriber INSERT/INSERT/UPDATE/DELETE round-trip with
+        fresh-session visibility verification. New live test
+        `TestPort_PgoutputInteropPGToGoopgFullDML` in
+        `internal/testport/pgoutput_interop_test.go` mirrors the
+      - M0103-0008 closure shape but with the direction inverted (PG
+        pub, goopg sub). Pre-creates the logical slot on PG (goopg's
+      - CREATE SUBSCRIPTION doesn't yet auto-create), runs the same
+        four DML statements as Scenario B, then asserts fresh-session
+        visibility on goopg via PK IndexScan: `WHERE id = 2 AND v =
+        'updated'` returns 1, `WHERE id = 1` returns 0, `count(*)`
+        returns 1. Design doc:
+        `docs/design/0103-0025-m0103-0007-rung-2-pg-to-goopg-full-dml.md`
+        (accepted).
+      - Diagnosis: lifting the test surfaced a concrete gap —
+        `ApplyWorker.applyUpdate` returned nil whenever
+        `m.OldTuple == []` and silently dropped every REPLICA IDENTITY
+      - DEFAULT UPDATE that didn't touch key columns. Pgoutput's
+        `logicalrep_write_update` omits OldTuple in that case: `'U'
+        relOid 'N' newTuple` directly (decoder already handles the
+        missing K/O marker at `internal/wal/pgoutput_decoder.go:175`;
+        only the apply side was broken).
+      - Fix: when OldTuple is empty, synthesise the row-locator key
+        from the new tuple's PK columns via a new
+        `primaryKeyOnlyRow(catalog, tbl, full Row) Row` helper in
+        `internal/executor/applyworker.go`. The helper returns a
+        partial-key Row where PK positions hold `full`'s values and
+        every other position is NullDatum — `rowMatchesKey`'s existing
+        "skip NULL key cells" rule restricts the match to PK columns.
+      - No-PK tables continue to skip silently (no safe way to locate
+        the pre-image row). DELETE's orphan-PK-entry path is
+        exercised via the `WHERE id = 1` assertion (returns 0 because
+      - IndexScan re-fetches the heap tuple and MVCC marks it dead)
+        and confirms the rung-1 caveat ("IndexScan tolerates orphaned
+        index entries"). Pinned by `TestPrimaryKeyOnlyRow` (unit,
+        helper-only) in `internal/executor/applyworker_test.go` and
+        `TestPort_PgoutputInteropPGToGoopgFullDML` (live E2E).
+      - Verification (rung 2): `go test -count=1 -timeout 120s
+        -run TestPort_PgoutputInteropPGToGoopgFullDML
+        ./internal/testport/` → PASS (~2 s). Broader sweep: executor,
+        catalog, parser, planner, analyzer, server → all green; wal
+        package has pre-existing 2 s-timing flakes
+        (`TestSlotDecoderRunDrivesPluginThroughCommit`,
+        `TestStreamReplayerAppliesIncomingRecords`) that pass in
+        isolation (same flake noted in loops 17/18). Pubsubcluster
+        smoke + visibility tests also green. The full Scenario A
+        failover wiring (pgbench, kill -9, libpq multi-host reconnect)
+        remains the principal remaining work and will be sequenced as
+        further rungs, each with its own design doc + pin per the
+      - M0103-0008 closure protocol.
+      - PARTIAL PROGRESS 2026-05-14 (rung 3): sustained-workload
+        scale verification — 50 INSERTs + 25 no-key-touched UPDATEs
+        + 10 DELETEs from a PG publisher to a goopg subscriber.
+      - Pinned by `TestPort_PgoutputInteropPGToGoopgBatchDML` in
+        `internal/testport/pgoutput_interop_test.go`: scales rung-2's
+      - 4-statement round-trip by 50× per phase, crosses pgoutput
+        xact boundaries and publisher-side heap-page boundaries
+        (which on the M0103-0008 side produced `RecordKindPageImage`
+        first-dirty-in-epoch records — but the apply worker only
+        consumes pgoutput Insert frames, so all 50 INSERTs must
+        surface). Verifies `count(*) = 40` plus per-id state from
+        fresh `database/sql` sessions through the goopg PK IndexScan
+        path: each updated id has `v='updated-N'`, each untouched-
+        but-not-deleted id keeps `v='row-N'`, each deleted id returns
+      - 0 (orphan PK entries from DELETE are tolerated by IndexScan
+        heap re-fetch + MVCC dead-tuple filtering, as the rung-1
+        caveat predicted). No new fix needed — rung 1's index
+        maintenance and rung 2's `primaryKeyOnlyRow` synthesis
+        already scale 50× cleanly. Design doc:
+        `docs/design/0103-0026-m0103-0007-rung-3-pg-to-goopg-batch-dml.md`
+        (accepted). Verification (rung 3):
+        `go test -count=1 -timeout 160s
+        -run TestPort_PgoutputInteropPGToGoopgBatchDML
+        ./internal/testport/` → PASS (~2.1 s). Rung-2 test still
+        green. Next rungs (deferred within M0103-0007): pgbench
+        against PG publisher with `pgbench_history` polling, REPLICA
+      - IDENTITY FULL / TOAST / DDL replication shapes, kill -9 +
+        libpq multi-host reconnect plumbing on the client side.
+      - PARTIAL PROGRESS 2026-05-14 (rung 4): REPLICA IDENTITY FULL
+        branch coverage. Design doc:
+        `docs/design/0103-0027-m0103-0007-rung-4-pg-to-goopg-replica-identity-full.md`
+        (accepted). New test
+        `TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull` in
+        `internal/testport/pgoutput_interop_test.go` drives a
+        no-primary-key table whose publisher carries
+        `ALTER TABLE public.t REPLICA IDENTITY FULL` before
+        subscription creation. Workload: 3 INSERTs, 1 UPDATE that
+        does NOT touch a key column, 1 DELETE. Under FULL pgoutput
+        emits `'O'` + full pre-image on every UPDATE/DELETE
+        regardless of key-column modification, so the apply worker's
+        `len(m.OldTuple) > 0` branch is forced (rung 2's
+        `primaryKeyOnlyRow` synthesis path is unreachable for no-PK
+        relations). The rung pins three previously-unverified apply
+        paths: (a) `applyInsert` against a table with zero
+        unique/primary indexes — `maintainUniqueIndexesForInsert`
+        becomes a no-op via its `!idx.Unique && !idx.Primary` filter
+        and the row reaches the heap visible to fresh-session
+      - SeqScans; (b) `applyUpdate`'s explicit-old-tuple branch —
+        `decodePgoutputTupleAsRow(m.OldTuple)` returns a full Row
+        where every cell carries a value (no NULL skip-cells), then
+        `rowMatchesKey` does full-column equality on the heap; (c)
+        `applyDelete` via the same full-row sequential-scan match.
+      - Fresh `database/sql` connection per assertion via
+        `psc.WaitForRow`; predicates use only non-indexed columns
+        (`WHERE 1=1`, `WHERE a=2 AND v='bb'`, `WHERE a=1`,
+        `WHERE a=3 AND v='c'`) so the SeqScan path is exercised
+        end-to-end. No new fix was needed — the apply worker's
+        existing FULL-shape branch handles `'t'`/`'n'` column status
+        codes correctly. Verification (rung 4):
+        `go test -count=1 -timeout 120s
+        -run TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull
+        ./internal/testport/` → PASS (~1.7 s). All 5
+        `TestPort_PgoutputInterop*` tests still green together.
+      - Race-tested regression on
+        `./internal/executor/ ./internal/wal/ ./internal/server/
+        ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+        → all green. Next rungs (deferred within M0103-0007):
+      - TOAST (`'u'` unchanged-TOAST status decode), DDL replication,
+        pgbench against PG publisher with `pgbench_history` polling,
+        kill -9 + libpq multi-host reconnect plumbing on the client
+        side.
+      - PARTIAL PROGRESS 2026-05-14 (rung 5): unchanged-TOAST `'u'`
+        decode. Design doc:
+        `docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md`
+        (accepted). Real-world workloads against publisher tables
+        with TOASTed columns (large text/bytea) would otherwise stall
+        the apply slot on the first UPDATE that left the TOASTed
+        column unchanged — pgoutput emits that column as `'u'` +
+        zero bytes, and the apply worker rejected it as
+        `"'u' (unchanged TOAST) status not supported"`. Fix splits
+        across decoder + apply paths:
       - `internal/executor/applyworker.go::decodePgoutputTupleAsRow`
         now returns `(Row, []bool, error)`. `'u'` cells become
         `NullDatum` plus `unchanged[i] = true`. The parallel mask
@@ -2011,174 +2077,174 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         the existing delete+insert+index-maintenance sequence.
         The two-scan cost is paid only when `'u'` is present; the
         rungs 1–4 hot path stays single-scan.
-      Pinned by `TestApplyWorkerDecodeReturnsUnchangedMask` and
-      `TestApplyWorkerInsertRejectsUnchangedToast` (unit,
-      `internal/executor/applyworker_test.go`) and
-      `TestPort_PgoutputInteropPGToGoopgUnchangedToast` (live,
-      `internal/testport/pgoutput_interop_test.go`): publisher
-      table with `payload text SET STORAGE EXTERNAL`, 4 KiB
-      payload, UPDATE that doesn't touch payload, assertions on
-      goopg subscriber that `length(payload)=4096` and
-      `substr(payload,1,1)='X'` (the NULL-fill bug would zero
-      both). Verification (rung 5):
-      `go test -count=1 -timeout 60s -run "TestApplyWorker|TestPrimaryKeyOnlyRow" ./internal/executor/`
-      → PASS (~0.02 s);
-      `go test -count=1 -timeout 120s -run TestPort_PgoutputInteropPGToGoopgUnchangedToast ./internal/testport/`
-      → PASS (~2.0 s); all 5 `TestPort_PgoutputInterop*` together
-      → PASS (~10.2 s); race-tested regression on
-      `./internal/executor/ ./internal/wal/ ./internal/catalog/
-      ./internal/testutil/pubsubcluster/` → all green. Next rungs
-      (deferred within M0103-0007): DDL replication shapes,
-      pgbench against PG publisher with `pgbench_history`
-      polling, kill -9 + libpq multi-host reconnect plumbing on
-      the client side.
-      PARTIAL PROGRESS 2026-05-14 (rung 6): multi-DML single
-      transaction shape. Design doc:
-      `docs/design/0103-0029-m0103-0007-rung-6-pg-to-goopg-multi-dml-xact.md`
-      (accepted). Rungs 1–5 ran every publisher DML in its own
-      autocommit xact (one pgoutput `B…C` per statement); rung 6
-      scales vertically — one explicit `BEGIN; INSERT x3; UPDATE;
-      DELETE; COMMIT;` block on the publisher, one pgoutput xact
-      on the wire, one `txnMgr.Begin/Commit` pair on the
-      subscriber. The correctness property pinned is **own-xact
-      write visibility**: subsequent UPDATE/DELETE handlers must
-      locate rows the earlier INSERTs in the same pgoutput xact
-      wrote with `xmin == currentTx.XID`.
-      `mvcc.TupleVisibleSubxact`
-      (`internal/mvcc/subxact_visibility.go:131-159`)
-      short-circuits on `isCurrentTxXID(h.Xmin, currentXID, r)`
-      before consulting the snapshot, so `applyDeleteByKey` and
-      `applyScanFirstMatch`'s heap scans see same-xact tuples and
-      the post-commit subscriber state reflects the net effect of
-      all 5 DML statements atomically. No code change was needed
-      — the machinery landed across rungs 1–5 and the broader
-      MVCC effort already supports the shape; the new
-      `TestPort_PgoutputInteropPGToGoopgMultiDMLXact` asserts it
-      end-to-end via fresh `database/sql` sessions (PK IndexScan
-      path): `count(*) = 2`, `id=1 v='one'`, `id=2 v='two-prime'`
-      (INSERT-then-UPDATE in same xact), `id=3` → 0
-      (INSERT-then-DELETE in same xact). Each assertion
-      fail-fasts on a distinct potential regression (no-op
-      DELETE leaves count=3; no-op UPDATE leaves stray
-      `(2,'two')` row; etc.). Verification (rung 6):
-      `go test -count=1 -timeout 180s
-      -run TestPort_PgoutputInteropPGToGoopgMultiDMLXact
-      ./internal/testport/` → PASS (~1.7 s); all 6
-      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
-      (~10.1 s); race-tested regression on
-      `./internal/executor/ ./internal/wal/ ./internal/server/
-      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
-      → all green. Next rungs (deferred within M0103-0007):
-      SAVEPOINT/ROLLBACK TO subxacts, pgbench against PG
-      publisher with `pgbench_history` polling, DDL replication
-      shapes, kill -9 + libpq multi-host reconnect plumbing on
-      the client side.
-      PARTIAL PROGRESS 2026-05-14 (rung 7): SAVEPOINT subxact
-      shape at proto_version=1. Design doc:
-      `docs/design/0103-0030-m0103-0007-rung-7-pg-to-goopg-savepoint-xact.md`
-      (accepted). At proto_version=1 (goopg's default —
-      `internal/server/logicalreceiver.go:149-151`) subxact
-      boundaries are NOT streamed: the publisher's reorder
-      buffer drops rolled-back subxact rows before emission and
-      the wire carries only the committed net effect of the
-      top-level transaction as one `B…C` block. Workload:
-      `BEGIN; INSERT(1,'one'); SAVEPOINT s1; INSERT(2,…); UPDATE
-      id=1; ROLLBACK TO s1; SAVEPOINT s2; INSERT(3,'three');
-      RELEASE s2; INSERT(4,'four'); SAVEPOINT s3; DELETE id=3;
-      ROLLBACK TO s3; COMMIT;` Expected subscriber state via
-      fresh `database/sql` sessions through goopg's PK
-      IndexScan: `count(*)=3`, `id=1 v='one'` (s1 UPDATE rolled
-      back), no `id=2` (s1 INSERT rolled back), `id=3 v='three'`
-      (s2 RELEASE + s3 DELETE rolled back), `id=4 v='four'`
-      (top-level INSERT after RELEASE). Each assertion fail-fasts
-      a distinct regression: leaked rolled-back inserts (count
-      would be 4 or 5), UPDATE leaking through (wrong `v`),
-      ROLLBACK TO of DELETE failing (`id=3` returns 0), s2
-      RELEASE failing to commit. No code change was needed —
-      the publisher does the work at reorder-buffer flush and
-      the apply worker's existing one-TxnMgr-per-`B…C` machinery
-      handles the block exactly as rung 6 did. proto_version=2
-      streaming subxacts (with `Y`/`A` frames + parent-XID
-      linkage) is out of scope here; promoting the default
-      requires apply-worker subxact tracking and stays a future
-      rung. Pinned by `TestPort_PgoutputInteropPGToGoopgSavepointXact`
-      in `internal/testport/pgoutput_interop_test.go`.
-      Verification (rung 7): `go test -count=1 -timeout 120s
-      -run TestPort_PgoutputInteropPGToGoopgSavepointXact
-      ./internal/testport/` → PASS (~1.7 s); all 7
-      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
-      (~12.0 s); race-tested regression on
-      `./internal/executor/ ./internal/wal/ ./internal/server/
-      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
-      → all green. Next rungs (deferred within M0103-0007):
-      pgbench against PG publisher with `pgbench_history`
-      polling, DDL replication shapes, proto_version=2 streaming
-      subxacts, kill -9 + libpq multi-host reconnect plumbing on
-      the client side.
-      PARTIAL PROGRESS 2026-05-14 (rung 8): multi-table
-      interleaved DML shape. Design doc:
-      `docs/design/0103-0031-m0103-0007-rung-8-pg-to-goopg-multi-table.md`
-      (accepted). All prior rungs (1–7) used a single published
-      table `public.t (id int PRIMARY KEY, v text)`; the apply
-      worker's relation cache only ever held one entry and the
-      per-relation dispatch path was untested at that level.
-      Rung 8 publishes two tables with deliberately different
-      column shapes — `public.users (id int PRIMARY KEY, name
-      text)` (2 cols) and `public.orders (id int PRIMARY KEY,
-      user_id int, amount int)` (3 cols) — and interleaves
-      INSERT/UPDATE/DELETE against both inside one top-level
-      xact plus a follow-up autocommit phase. The load-bearing
-      property pinned is the **multi-relation dispatch
-      contract**: the apply worker's relation cache must keep
-      both `R` messages live across the `B…C` block, every
-      change must route to the matching `*catalog.Table` on the
-      subscriber, and per-table primary-key index maintenance
-      (`maintainUniqueIndexesForInsert`) must run against the
-      right table so subsequent fresh-session PK IndexScans find
-      each row. Column-index drift between the wire tuple and
-      the subscriber's `catalog.Table.Columns` would surface
-      either as a parse error (text into int4 at the same
-      ordinal across tables) or as the per-row identity
-      assertions failing. Workload (single `Exec`, one libpq
-      simple-query): `BEGIN; INSERT users(1,alice); INSERT
-      orders(10,1,100); INSERT users(2,bob); INSERT
-      orders(11,2,200); INSERT orders(12,1,50); UPDATE orders
-      SET amount=99 WHERE id=10; UPDATE users SET
-      name='alice-updated' WHERE id=1; DELETE users WHERE id=2;
-      DELETE orders WHERE id=11; COMMIT;` then two autocommit
-      INSERTs (`users(3,carol)`, `orders(13,3,75)`). Expected:
-      `count(users)=2` with `id=1 name='alice-updated'` +
-      `id=3 name='carol'`; `count(orders)=3` with `id=10
-      user_id=1 amount=99` + `id=12 user_id=1 amount=50` +
-      `id=13 user_id=3 amount=75`. Each assertion uses a fresh
-      `database/sql` session through goopg's PK IndexScan;
-      per-table count assertion catches cross-relation dispatch
-      leaks (would yield 3+0 or 1+4 etc); per-id identity
-      assertions catch UPDATE-routing bugs. No code change
-      needed — rungs 1–7's machinery already covered both
-      `applyRelation` map keying and per-table
-      `*catalog.Table` resolution. Pinned by
-      `TestPort_PgoutputInteropPGToGoopgMultiTable` in
-      `internal/testport/pgoutput_interop_test.go`.
-      Verification (rung 8): `go test -count=1 -timeout 120s
-      -run TestPort_PgoutputInteropPGToGoopgMultiTable
-      ./internal/testport/` → PASS (~1.7 s); all 8
-      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
-      (~13.4 s); race-tested regression on
-      `./internal/executor/ ./internal/wal/ ./internal/server/
-      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
-      → all green.
-      PARTIAL PROGRESS 2026-05-14 (rung 9): pgoutput TRUNCATE
-      message support — first apply-worker gap closure since
-      rung 5. Design doc:
-      `docs/design/0103-0032-m0103-0007-rung-9-pg-to-goopg-truncate.md`
-      (accepted). Before rung 9 the apply worker dispatched on
-      B/R/I/D/U/C only; any other kind hit `ApplyMessage`'s
-      `default` arm and returned the typed error `"applyworker:
-      unsupported pgoutput kind %q"`. A publisher `TRUNCATE TABLE
-      t` against a published relation would therefore crash the
-      apply loop and stall the slot at the crash LSN. Fix split
-      across decoder + apply paths:
+      - Pinned by `TestApplyWorkerDecodeReturnsUnchangedMask` and
+        `TestApplyWorkerInsertRejectsUnchangedToast` (unit,
+        `internal/executor/applyworker_test.go`) and
+        `TestPort_PgoutputInteropPGToGoopgUnchangedToast` (live,
+        `internal/testport/pgoutput_interop_test.go`): publisher
+        table with `payload text SET STORAGE EXTERNAL`, 4 KiB
+        payload, UPDATE that doesn't touch payload, assertions on
+        goopg subscriber that `length(payload)=4096` and
+        `substr(payload,1,1)='X'` (the NULL-fill bug would zero
+        both). Verification (rung 5):
+        `go test -count=1 -timeout 60s -run "TestApplyWorker|TestPrimaryKeyOnlyRow" ./internal/executor/`
+        → PASS (~0.02 s);
+        `go test -count=1 -timeout 120s -run TestPort_PgoutputInteropPGToGoopgUnchangedToast ./internal/testport/`
+        → PASS (~2.0 s); all 5 `TestPort_PgoutputInterop*` together
+        → PASS (~10.2 s); race-tested regression on
+        `./internal/executor/ ./internal/wal/ ./internal/catalog/
+        ./internal/testutil/pubsubcluster/` → all green. Next rungs
+        (deferred within M0103-0007): DDL replication shapes,
+        pgbench against PG publisher with `pgbench_history`
+        polling, kill -9 + libpq multi-host reconnect plumbing on
+        the client side.
+      - PARTIAL PROGRESS 2026-05-14 (rung 6): multi-DML single
+        transaction shape. Design doc:
+        `docs/design/0103-0029-m0103-0007-rung-6-pg-to-goopg-multi-dml-xact.md`
+        (accepted). Rungs 1–5 ran every publisher DML in its own
+        autocommit xact (one pgoutput `B…C` per statement); rung 6
+        scales vertically — one explicit `BEGIN; INSERT x3; UPDATE;
+      - DELETE; COMMIT;` block on the publisher, one pgoutput xact
+        on the wire, one `txnMgr.Begin/Commit` pair on the
+        subscriber. The correctness property pinned is **own-xact
+        write visibility**: subsequent UPDATE/DELETE handlers must
+        locate rows the earlier INSERTs in the same pgoutput xact
+        wrote with `xmin == currentTx.XID`.
+        `mvcc.TupleVisibleSubxact`
+        (`internal/mvcc/subxact_visibility.go:131-159`)
+        short-circuits on `isCurrentTxXID(h.Xmin, currentXID, r)`
+        before consulting the snapshot, so `applyDeleteByKey` and
+        `applyScanFirstMatch`'s heap scans see same-xact tuples and
+        the post-commit subscriber state reflects the net effect of
+        all 5 DML statements atomically. No code change was needed
+        — the machinery landed across rungs 1–5 and the broader
+      - MVCC effort already supports the shape; the new
+        `TestPort_PgoutputInteropPGToGoopgMultiDMLXact` asserts it
+        end-to-end via fresh `database/sql` sessions (PK IndexScan
+        path): `count(*) = 2`, `id=1 v='one'`, `id=2 v='two-prime'`
+        (INSERT-then-UPDATE in same xact), `id=3` → 0
+        (INSERT-then-DELETE in same xact). Each assertion
+        fail-fasts on a distinct potential regression (no-op
+      - DELETE leaves count=3; no-op UPDATE leaves stray
+        `(2,'two')` row; etc.). Verification (rung 6):
+        `go test -count=1 -timeout 180s
+        -run TestPort_PgoutputInteropPGToGoopgMultiDMLXact
+        ./internal/testport/` → PASS (~1.7 s); all 6
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~10.1 s); race-tested regression on
+        `./internal/executor/ ./internal/wal/ ./internal/server/
+        ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+        → all green. Next rungs (deferred within M0103-0007):
+      - SAVEPOINT/ROLLBACK TO subxacts, pgbench against PG
+        publisher with `pgbench_history` polling, DDL replication
+        shapes, kill -9 + libpq multi-host reconnect plumbing on
+        the client side.
+      - PARTIAL PROGRESS 2026-05-14 (rung 7): SAVEPOINT subxact
+        shape at proto_version=1. Design doc:
+        `docs/design/0103-0030-m0103-0007-rung-7-pg-to-goopg-savepoint-xact.md`
+        (accepted). At proto_version=1 (goopg's default —
+        `internal/server/logicalreceiver.go:149-151`) subxact
+        boundaries are NOT streamed: the publisher's reorder
+        buffer drops rolled-back subxact rows before emission and
+        the wire carries only the committed net effect of the
+        top-level transaction as one `B…C` block. Workload:
+        `BEGIN; INSERT(1,'one'); SAVEPOINT s1; INSERT(2,…); UPDATE
+        id=1; ROLLBACK TO s1; SAVEPOINT s2; INSERT(3,'three');
+      - RELEASE s2; INSERT(4,'four'); SAVEPOINT s3; DELETE id=3;
+      - ROLLBACK TO s3; COMMIT;` Expected subscriber state via
+        fresh `database/sql` sessions through goopg's PK
+      - IndexScan: `count(*)=3`, `id=1 v='one'` (s1 UPDATE rolled
+        back), no `id=2` (s1 INSERT rolled back), `id=3 v='three'`
+        (s2 RELEASE + s3 DELETE rolled back), `id=4 v='four'`
+        (top-level INSERT after RELEASE). Each assertion fail-fasts
+        a distinct regression: leaked rolled-back inserts (count
+        would be 4 or 5), UPDATE leaking through (wrong `v`),
+      - ROLLBACK TO of DELETE failing (`id=3` returns 0), s2
+      - RELEASE failing to commit. No code change was needed —
+        the publisher does the work at reorder-buffer flush and
+        the apply worker's existing one-TxnMgr-per-`B…C` machinery
+        handles the block exactly as rung 6 did. proto_version=2
+        streaming subxacts (with `Y`/`A` frames + parent-XID
+        linkage) is out of scope here; promoting the default
+        requires apply-worker subxact tracking and stays a future
+        rung. Pinned by `TestPort_PgoutputInteropPGToGoopgSavepointXact`
+        in `internal/testport/pgoutput_interop_test.go`.
+      - Verification (rung 7): `go test -count=1 -timeout 120s
+        -run TestPort_PgoutputInteropPGToGoopgSavepointXact
+        ./internal/testport/` → PASS (~1.7 s); all 7
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~12.0 s); race-tested regression on
+        `./internal/executor/ ./internal/wal/ ./internal/server/
+        ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+        → all green. Next rungs (deferred within M0103-0007):
+        pgbench against PG publisher with `pgbench_history`
+        polling, DDL replication shapes, proto_version=2 streaming
+        subxacts, kill -9 + libpq multi-host reconnect plumbing on
+        the client side.
+      - PARTIAL PROGRESS 2026-05-14 (rung 8): multi-table
+        interleaved DML shape. Design doc:
+        `docs/design/0103-0031-m0103-0007-rung-8-pg-to-goopg-multi-table.md`
+        (accepted). All prior rungs (1–7) used a single published
+        table `public.t (id int PRIMARY KEY, v text)`; the apply
+        worker's relation cache only ever held one entry and the
+        per-relation dispatch path was untested at that level.
+      - Rung 8 publishes two tables with deliberately different
+        column shapes — `public.users (id int PRIMARY KEY, name
+        text)` (2 cols) and `public.orders (id int PRIMARY KEY,
+        user_id int, amount int)` (3 cols) — and interleaves
+      - INSERT/UPDATE/DELETE against both inside one top-level
+        xact plus a follow-up autocommit phase. The load-bearing
+        property pinned is the **multi-relation dispatch
+        contract**: the apply worker's relation cache must keep
+        both `R` messages live across the `B…C` block, every
+        change must route to the matching `*catalog.Table` on the
+        subscriber, and per-table primary-key index maintenance
+        (`maintainUniqueIndexesForInsert`) must run against the
+        right table so subsequent fresh-session PK IndexScans find
+        each row. Column-index drift between the wire tuple and
+        the subscriber's `catalog.Table.Columns` would surface
+        either as a parse error (text into int4 at the same
+        ordinal across tables) or as the per-row identity
+        assertions failing. Workload (single `Exec`, one libpq
+        simple-query): `BEGIN; INSERT users(1,alice); INSERT
+        orders(10,1,100); INSERT users(2,bob); INSERT
+        orders(11,2,200); INSERT orders(12,1,50); UPDATE orders
+      - SET amount=99 WHERE id=10; UPDATE users SET
+        name='alice-updated' WHERE id=1; DELETE users WHERE id=2;
+      - DELETE orders WHERE id=11; COMMIT;` then two autocommit
+      - INSERTs (`users(3,carol)`, `orders(13,3,75)`). Expected:
+        `count(users)=2` with `id=1 name='alice-updated'` +
+        `id=3 name='carol'`; `count(orders)=3` with `id=10
+        user_id=1 amount=99` + `id=12 user_id=1 amount=50` +
+        `id=13 user_id=3 amount=75`. Each assertion uses a fresh
+        `database/sql` session through goopg's PK IndexScan;
+        per-table count assertion catches cross-relation dispatch
+        leaks (would yield 3+0 or 1+4 etc); per-id identity
+        assertions catch UPDATE-routing bugs. No code change
+        needed — rungs 1–7's machinery already covered both
+        `applyRelation` map keying and per-table
+        `*catalog.Table` resolution. Pinned by
+        `TestPort_PgoutputInteropPGToGoopgMultiTable` in
+        `internal/testport/pgoutput_interop_test.go`.
+      - Verification (rung 8): `go test -count=1 -timeout 120s
+        -run TestPort_PgoutputInteropPGToGoopgMultiTable
+        ./internal/testport/` → PASS (~1.7 s); all 8
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~13.4 s); race-tested regression on
+        `./internal/executor/ ./internal/wal/ ./internal/server/
+        ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+        → all green.
+      - PARTIAL PROGRESS 2026-05-14 (rung 9): pgoutput TRUNCATE
+        message support — first apply-worker gap closure since
+        rung 5. Design doc:
+        `docs/design/0103-0032-m0103-0007-rung-9-pg-to-goopg-truncate.md`
+        (accepted). Before rung 9 the apply worker dispatched on
+      - B/R/I/D/U/C only; any other kind hit `ApplyMessage`'s
+        `default` arm and returned the typed error `"applyworker:
+        unsupported pgoutput kind %q"`. A publisher `TRUNCATE TABLE
+        t` against a published relation would therefore crash the
+        apply loop and stall the slot at the crash LSN. Fix split
+        across decoder + apply paths:
       - `internal/wal/pgoutput.go` gains `pgoTruncate = 'T'`
         plus option-bit constants `pgoTruncateCascade (0x01)` /
         `pgoTruncateRestartSeqs (0x02)` mirroring upstream
@@ -2245,87 +2311,87 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         pgbench against PG publisher with `pgbench_history`
         polling, proto_version=2 streaming subxacts, kill -9 +
         libpq multi-host reconnect plumbing on the client side.
-      PARTIAL PROGRESS 2026-05-14 (rung 10): column-order remap
-      in the apply worker — first apply-worker gap closure since
-      rung 9. Design doc:
-      `docs/design/0103-0033-m0103-0007-rung-10-pg-to-goopg-column-order.md`
-      (accepted). Rungs 1–9 covered every DML/TRUNCATE pgoutput
-      shape but assumed publisher and subscriber tables shared
-      identical physical column ordering.
-      `decodePgoutputTupleAsRow` indexed `localCols[i]` with the
-      remote ordinal `i` and wrote `row[i] = d`, so a
-      swapped-order subscriber table either crashed with a parse
-      error (text-into-int4 at the same wire ordinal) or
-      installed silently-corrupted heap rows (values landed in
-      the wrong slots). PG's apply worker resolves attributes by
-      name via `remoterel->attmap[]` (`apply_handle_insert_internal`
-      → `logicalrep_rel_open` upstream); goopg now matches.
-      Fix: `decodePgoutputTupleAsRow` (single helper used by
-      INSERT, UPDATE new-tuple, UPDATE old-tuple, DELETE
-      old-tuple) builds a per-call `localIdx []int` map where
-      `localIdx[i] = j` is the position of `remoteCols[i].Name`
-      inside `localCols`. The returned `Row` is sized to
-      `len(localCols)` and indexed by LOCAL position; the
-      `unchanged` mask stays in lockstep so
-      `applyUpdateByKey`'s `'u'` fill loop (`newRow[i] =
-      matched[i]` for unchanged cells) remains valid.
-      Unmatched remote columns return an explicit error rather
-      than silently dropping the value — symmetric with PG's
-      behaviour and load-bearing for catching subscriber DDL
-      drift early. Subscriber columns missing on the publisher
-      remain `NullDatum` (existing init behaviour); DEFAULT-value
-      support for that asymmetric case stays out of scope for
-      this rung. When publisher and subscriber declare columns
-      in identical order — the rungs 1–9 case — `localIdx[i] ==
-      i` for every `i` and the behaviour is identical, no
-      regressions in the existing suite. Pinned by
-      `TestApplyWorkerDecodeRemapsReorderedColumns` and
-      `TestApplyWorkerDecodeRejectsUnmatchedRemoteCol` (unit,
-      `internal/executor/applyworker_test.go`) and the live E2E
-      `TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch`
-      (`internal/testport/pgoutput_interop_test.go`): publisher
-      `(id int PK, v text)` + subscriber `(v text, id int PK)`
-      with workload INSERT×2 + no-key-touch UPDATE + DELETE,
-      asserts via fresh `database/sql` sessions through PK
-      IndexScan that `count(*) = 1`, `id = 1 AND v =
-      'alice-updated'` returns 1, `id = 2` returns 0. Each
-      assertion fail-fasts a distinct regression: `count(*)=1`
-      catches INSERT silently dropped / DELETE didn't fire; the
-      identity assertion catches "INSERT installed but with id
-      and v swapped" (either no match because id is now NULL or
-      string, or a match against v='1' because the int value
-      landed in the text column).
-      Verification (rung 10):
-      `go test -count=1 -timeout 60s
-      -run "TestApplyWorker|TestPrimaryKeyOnlyRow"
-      ./internal/executor/` → PASS (~0.02 s);
-      `go test -count=1 -timeout 120s
-      -run TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch
-      ./internal/testport/` → PASS (~2.0 s); all 10
-      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
-      (~17.2 s); `go test -race -count=1 -timeout 300s
-      ./internal/executor/ ./internal/wal/ ./internal/catalog/
-      ./internal/testutil/pubsubcluster/` → all green. Next
-      rungs (deferred within M0103-0007): pgbench against PG
-      publisher with `pgbench_history` polling, proto_version=2
-      streaming subxacts, kill -9 + libpq multi-host reconnect
-      plumbing on the client side, DEFAULT-value handling for
-      subscriber-extra columns.
-      PARTIAL PROGRESS 2026-05-14 (rung 11): subscriber-extra
-      column preservation across replicated UPDATEs. Design
-      doc:
-      `docs/design/0103-0034-m0103-0007-rung-11-pg-to-goopg-subscriber-extra-column.md`
-      (accepted). Rung 10's note "Subscriber columns missing on
-      the publisher remain `NullDatum`" hid a real correctness
-      bug: every replicated UPDATE NULL'd the subscriber-only
-      value. `decodePgoutputTupleAsRow` initialised those slots
-      to `NullDatum` and `applyUpdateByKey`'s "fill from matched
-      heap row" loop only triggered on `'u'` (unchanged-TOAST)
-      cells; an UPDATE that touched only publisher-visible
-      columns left `newUnchanged` all-false, the read-side scan
-      was skipped, and `applyDeleteByKey` + `writeHeapRowReturning`
-      installed the new row with `note=NullDatum`.
-      Fix split across decoder + apply paths:
+      - PARTIAL PROGRESS 2026-05-14 (rung 10): column-order remap
+        in the apply worker — first apply-worker gap closure since
+        rung 9. Design doc:
+        `docs/design/0103-0033-m0103-0007-rung-10-pg-to-goopg-column-order.md`
+        (accepted). Rungs 1–9 covered every DML/TRUNCATE pgoutput
+        shape but assumed publisher and subscriber tables shared
+        identical physical column ordering.
+        `decodePgoutputTupleAsRow` indexed `localCols[i]` with the
+        remote ordinal `i` and wrote `row[i] = d`, so a
+        swapped-order subscriber table either crashed with a parse
+        error (text-into-int4 at the same wire ordinal) or
+        installed silently-corrupted heap rows (values landed in
+        the wrong slots). PG's apply worker resolves attributes by
+        name via `remoterel->attmap[]` (`apply_handle_insert_internal`
+        → `logicalrep_rel_open` upstream); goopg now matches.
+      - Fix: `decodePgoutputTupleAsRow` (single helper used by
+      - INSERT, UPDATE new-tuple, UPDATE old-tuple, DELETE
+        old-tuple) builds a per-call `localIdx []int` map where
+        `localIdx[i] = j` is the position of `remoteCols[i].Name`
+        inside `localCols`. The returned `Row` is sized to
+        `len(localCols)` and indexed by LOCAL position; the
+        `unchanged` mask stays in lockstep so
+        `applyUpdateByKey`'s `'u'` fill loop (`newRow[i] =
+        matched[i]` for unchanged cells) remains valid.
+      - Unmatched remote columns return an explicit error rather
+        than silently dropping the value — symmetric with PG's
+        behaviour and load-bearing for catching subscriber DDL
+        drift early. Subscriber columns missing on the publisher
+        remain `NullDatum` (existing init behaviour); DEFAULT-value
+        support for that asymmetric case stays out of scope for
+        this rung. When publisher and subscriber declare columns
+        in identical order — the rungs 1–9 case — `localIdx[i] ==
+        i` for every `i` and the behaviour is identical, no
+        regressions in the existing suite. Pinned by
+        `TestApplyWorkerDecodeRemapsReorderedColumns` and
+        `TestApplyWorkerDecodeRejectsUnmatchedRemoteCol` (unit,
+        `internal/executor/applyworker_test.go`) and the live E2E
+        `TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch`
+        (`internal/testport/pgoutput_interop_test.go`): publisher
+        `(id int PK, v text)` + subscriber `(v text, id int PK)`
+        with workload INSERT×2 + no-key-touch UPDATE + DELETE,
+        asserts via fresh `database/sql` sessions through PK
+      - IndexScan that `count(*) = 1`, `id = 1 AND v =
+        'alice-updated'` returns 1, `id = 2` returns 0. Each
+        assertion fail-fasts a distinct regression: `count(*)=1`
+        catches INSERT silently dropped / DELETE didn't fire; the
+        identity assertion catches "INSERT installed but with id
+        and v swapped" (either no match because id is now NULL or
+        string, or a match against v='1' because the int value
+        landed in the text column).
+      - Verification (rung 10):
+        `go test -count=1 -timeout 60s
+        -run "TestApplyWorker|TestPrimaryKeyOnlyRow"
+        ./internal/executor/` → PASS (~0.02 s);
+        `go test -count=1 -timeout 120s
+        -run TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch
+        ./internal/testport/` → PASS (~2.0 s); all 10
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~17.2 s); `go test -race -count=1 -timeout 300s
+        ./internal/executor/ ./internal/wal/ ./internal/catalog/
+        ./internal/testutil/pubsubcluster/` → all green. Next
+        rungs (deferred within M0103-0007): pgbench against PG
+        publisher with `pgbench_history` polling, proto_version=2
+        streaming subxacts, kill -9 + libpq multi-host reconnect
+        plumbing on the client side, DEFAULT-value handling for
+        subscriber-extra columns.
+      - PARTIAL PROGRESS 2026-05-14 (rung 11): subscriber-extra
+        column preservation across replicated UPDATEs. Design
+        doc:
+        `docs/design/0103-0034-m0103-0007-rung-11-pg-to-goopg-subscriber-extra-column.md`
+        (accepted). Rung 10's note "Subscriber columns missing on
+        the publisher remain `NullDatum`" hid a real correctness
+        bug: every replicated UPDATE NULL'd the subscriber-only
+        value. `decodePgoutputTupleAsRow` initialised those slots
+        to `NullDatum` and `applyUpdateByKey`'s "fill from matched
+        heap row" loop only triggered on `'u'` (unchanged-TOAST)
+        cells; an UPDATE that touched only publisher-visible
+        columns left `newUnchanged` all-false, the read-side scan
+        was skipped, and `applyDeleteByKey` + `writeHeapRowReturning`
+        installed the new row with `note=NullDatum`.
+      - Fix split across decoder + apply paths:
       - `internal/executor/applyworker.go::decodePgoutputTupleAsRow`
         gains a third `missing []bool` return (parallel to
         `unchanged`). `missing[j]=true` when local column `j`
@@ -2349,47 +2415,107 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         positions which `rowMatchesKey` already treats as
         wildcards — correct, since publisher-omitted columns
         can't participate in row-locator matching.
-      Pinned by `TestApplyWorkerDecodeMarksSubscriberExtraAsMissing`
-      and `TestApplyUpdateByKeyPreservesSubscriberExtraColumn`
-      (unit, `internal/executor/applyworker_test.go`) and the
-      live E2E `TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn`
+      - Pinned by `TestApplyWorkerDecodeMarksSubscriberExtraAsMissing`
+        and `TestApplyUpdateByKeyPreservesSubscriberExtraColumn`
+        (unit, `internal/executor/applyworker_test.go`) and the
+        live E2E `TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn`
+        (`internal/testport/pgoutput_interop_test.go`): publisher
+        `(id int PK, v text)` + subscriber `(id int PK, v text,
+        note text)`; workload INSERT(1,'hello') → subscriber
+        direct UPDATE SET note='kept' → publisher UPDATE SET
+        v='updated'. Asserts final state `id=1 AND v='updated'
+      - AND note='kept'` plus negatives `count(*)=1` and `note IS
+      - NULL` returns 0. Without the rung-11 fill loop, the
+        `note='kept'` assertion times out at the 30 s
+      - WaitForRow deadline because `note` was nulled by the
+        replicated UPDATE.
+      - Verification (rung 11):
+        `go test -count=1 -timeout 60s
+        -run "TestApplyWorker|TestPrimaryKeyOnlyRow|TestApplyUpdateByKey"
+        ./internal/executor/` → PASS (~0.03 s);
+        `go test -count=1 -timeout 180s
+        -run TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn
+        ./internal/testport/` → PASS (~2.2 s). Next rungs
+        (deferred within M0103-0007): pgbench against PG
+        publisher with `pgbench_history` polling, proto_version=2
+        streaming subxacts, kill -9 + libpq multi-host reconnect
+        plumbing on the client side, DEFAULT-expression
+        evaluation for subscriber-extra INSERTs.
+      PARTIAL PROGRESS 2026-05-14 (rung 12): REPLICA IDENTITY USING
+      INDEX support in the apply worker. Design doc:
+      `docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md`
+      (accepted). Rungs 1-11 covered REPLICA IDENTITY DEFAULT (PK,
+      rungs 1-3 + 6-11) and FULL (rung 4); USING INDEX on a non-PK
+      unique index was untested. Before rung 12 the no-OldTuple
+      UPDATE branch resolved through `primaryKeyOnlyRow(cat, tbl,
+      newRow)`, which walked the subscriber-side catalog for
+      `idx.Primary == true`. Two correctness gaps: (a) when the
+      subscriber declares no PK at all (mirroring a no-PK publisher
+      with REPLICA IDENTITY USING INDEX), the helper returned nil
+      and the UPDATE was silently dropped; (b) even with a
+      subscriber PK, USING INDEX may name DIFFERENT columns, so the
+      synthesised key matched zero (or worse, the wrong) row. PG's
+      apply worker resolves identity columns from the Relation
+      message's per-column flag byte
+      (`LOGICALREP_IS_REPLICA_IDENTITY`), not from any subscriber
+      catalog lookup. Fix: new
+      `replicaIdentityKeyRow(remoteCols, localCols, newRow) Row`
+      walks `remoteCols`; for each entry with `Flags & 0x01 != 0`
+      it resolves the matching local column by name and copies the
+      value from `newRow` into that slot of the returned key;
+      other slots stay `NullDatum` (`rowMatchesKey`'s "skip NULL"
+      rule yields identity-only equality). `applyUpdate`'s
+      no-OldTuple branch calls it first; falls back to
+      `primaryKeyOnlyRow` when no flags are set (older or corrupt
+      publishers). Symmetric with rung 2's hot path because
+      REPLICA IDENTITY DEFAULT sets the flag on PK columns, so the
+      helper produces the same key - no regression to rungs 1-11.
+      Pinned by `TestReplicaIdentityKeyRow` (four sub-cases: PK
+      columns flagged, non-PK composite identity over `(a, v)`,
+      no-flags returns nil, row-length mismatch returns nil) in
+      `internal/executor/applyworker_test.go` and the live E2E
+      `TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex`
       (`internal/testport/pgoutput_interop_test.go`): publisher
-      `(id int PK, v text)` + subscriber `(id int PK, v text,
-      note text)`; workload INSERT(1,'hello') → subscriber
-      direct UPDATE SET note='kept' → publisher UPDATE SET
-      v='updated'. Asserts final state `id=1 AND v='updated'
-      AND note='kept'` plus negatives `count(*)=1` and `note IS
-      NULL` returns 0. Without the rung-11 fill loop, the
-      `note='kept'` assertion times out at the 30 s
-      WaitForRow deadline because `note` was nulled by the
-      replicated UPDATE.
-      Verification (rung 11):
+      `(k int NOT NULL, v text)` with UNIQUE index `t_k_uniq` and
+      `ALTER TABLE public.t REPLICA IDENTITY USING INDEX
+      t_k_uniq`; subscriber `(k int, v text)` with no constraints
+      at all; workload INSERT*3 + no-key-touch UPDATE on k=2 +
+      DELETE on k=1. Each assertion fail-fasts a distinct
+      regression: `count(*) = 2` catches UPDATE/DELETE silently
+      dropping; `k=2 AND v='bb'` catches the UPDATE not firing;
+      `k=2 AND v='b'` returns 0 catches the rung-12 path falling
+      back to primaryKeyOnlyRow->nil. Verification (rung 12):
       `go test -count=1 -timeout 60s
-      -run "TestApplyWorker|TestPrimaryKeyOnlyRow|TestApplyUpdateByKey"
-      ./internal/executor/` → PASS (~0.03 s);
+      -run "TestReplicaIdentityKeyRow|TestPrimaryKeyOnlyRow|TestApplyWorker|TestApplyUpdateByKey"
+      ./internal/executor/` -> PASS (~0.03 s);
       `go test -count=1 -timeout 180s
-      -run TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn
-      ./internal/testport/` → PASS (~2.2 s). Next rungs
-      (deferred within M0103-0007): pgbench against PG
-      publisher with `pgbench_history` polling, proto_version=2
-      streaming subxacts, kill -9 + libpq multi-host reconnect
-      plumbing on the client side, DEFAULT-expression
-      evaluation for subscriber-extra INSERTs.
+      -run TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex
+      ./internal/testport/` -> PASS (~1.7 s); all 11
+      `TestPort_PgoutputInteropPGToGoopg*` together -> PASS
+      (~21 s); regression sweep on
+      `./internal/executor/ ./internal/catalog/ ./internal/wal/
+      ./internal/testutil/pubsubcluster/` -> all green. Next rungs
+      (deferred within M0103-0007): pgbench against PG publisher
+      with `pgbench_history` polling, proto_version=2 streaming
+      subxacts, kill -9 + libpq multi-host reconnect plumbing on
+      the client side, DEFAULT-expression evaluation for
+      subscriber-extra INSERTs.
 
-- [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
-      Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
-      File: `internal/testport/e2e_logical_failover_goopg_to_pg_test.go`,
-      `TestE2E_LogicalFailoverGoopgToPG` with the same two subtests.
-      Symmetric flow: PubSubCluster with goopg pub + PG sub; custom
-      psql-driven INSERT/UPDATE loop on goopg (`runINSERTUPDATELoop`
-      helper, pgbench-on-goopg is out of scope); wait ~60 s; `kill -9
-      <goopg-pid>`; libpq multi-host reconnect; INSERT on PG succeeds;
-      verify per mode (same DoD).
-      PARTIAL PROGRESS 2026-05-14 (loop 2): probe-survival foundation
-      landed for libpqrcv `fetch_table_list` (the next publisher-side
-      probe after Gap 1 from M0103-0004 loop 3).
-      Design doc: `docs/design/0103-0006-variadic-and-pg-get-publication-tables.md`.
-      Changes:
+- [x] **M0103-0008**
+      - Summary: Scenario B E2E test: goopg primary + PG subscriber.
+      - Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
+      - File: `internal/testport/e2e_logical_failover_goopg_to_pg_test.go`,
+        `TestE2E_LogicalFailoverGoopgToPG` with the same two subtests.
+      - Symmetric flow: PubSubCluster with goopg pub + PG sub; custom
+        psql-driven INSERT/UPDATE loop on goopg (`runINSERTUPDATELoop`
+        helper, pgbench-on-goopg is out of scope); wait ~60 s; `kill -9
+        <goopg-pid>`; libpq multi-host reconnect; INSERT on PG succeeds;
+        verify per mode (same DoD).
+      - PARTIAL PROGRESS 2026-05-14 (loop 2): probe-survival foundation
+        landed for libpqrcv `fetch_table_list` (the next publisher-side
+        probe after Gap 1 from M0103-0004 loop 3).
+      - Design doc: `docs/design/0103-0006-variadic-and-pg-get-publication-tables.md`.
+      - Changes:
       - Parser accepts the `VARIADIC` keyword on FuncCall arguments in
         both target-list position (`parseFuncCallTail`) and FROM-clause
         SRF position (the `srfFuncName != ""` branch of `parseRangeVar`).
@@ -2406,24 +2532,24 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         column lists or row-filter quals); `relid` is the live OID of
         every published `*catalog.Table`. Pinned by 4 tests in
         `internal/executor/operators_pg_get_publication_tables_test.go`.
-      Next barrier (deferred within M0103-0008 scope): upstream's
-      `fetch_table_list` query uses `(pg_get_publication_tables(...)).*`
-      in **scalar position** to expand the composite return type into
-      multiple columns. goopg's planner does not yet implement composite
-      expansion in target-list position. The SRF already returns the
-      three-column shape upstream expects, so the planner work is the
-      sole remaining piece. `array_agg(text)` has not been verified;
-      may need to land alongside.
-      Verification: `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/executor/
-      ./internal/server/ ./internal/wal/ ./internal/catalog/` →
-      all green (parser 1.050 s, planner 1.065 s, executor 2.646 s,
-      server 3.588 s, wal 3.116 s, catalog 1.022 s).
-      PARTIAL PROGRESS 2026-05-14 (loop 3): IndirectionStar `(expr).*`
-      postfix syntax + parser/planner rewrite + `array_agg` aggregate
-      landed. Design doc:
-      `docs/design/0103-0007-indirection-star-and-array-agg.md`.
-      Changes:
+      - Next barrier (deferred within M0103-0008 scope): upstream's
+        `fetch_table_list` query uses `(pg_get_publication_tables(...)).*`
+        in **scalar position** to expand the composite return type into
+        multiple columns. goopg's planner does not yet implement composite
+        expansion in target-list position. The SRF already returns the
+        three-column shape upstream expects, so the planner work is the
+        sole remaining piece. `array_agg(text)` has not been verified;
+        may need to land alongside.
+      - Verification: `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/executor/
+        ./internal/server/ ./internal/wal/ ./internal/catalog/` →
+        all green (parser 1.050 s, planner 1.065 s, executor 2.646 s,
+        server 3.588 s, wal 3.116 s, catalog 1.022 s).
+      - PARTIAL PROGRESS 2026-05-14 (loop 3): IndirectionStar `(expr).*`
+        postfix syntax + parser/planner rewrite + `array_agg` aggregate
+        landed. Design doc:
+        `docs/design/0103-0007-indirection-star-and-array-agg.md`.
+      - Changes:
       - Parser: new `IndirectionStar{Source Expr}` AST node;
         `parsePrimary` consumes `.*` after a closing `)` and wraps the
         inner expression. New package-level
@@ -2451,36 +2577,36 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         short-circuited upstream of the switch — sufficient for the
         probe's `array_agg(pubname::text)` (`pg_publication.pubname` is
         NOT NULL); NULL-element support deferred.
-      Tests: `TestParseIndirectionStarFuncCall`,
-      `TestParseIndirectionStarFetchTableList` (parser),
-      `TestIndirectionStarTargetListPlansAsFromSrf`,
-      `TestIndirectionStarRejectsAggregateArgument`, `TestArrayAggText`,
-      `TestIndirectionStarInsideDerivedSubquery` (t.Skip — documents
-      next gap).
-      Remaining for full probe survival (next sub-step):
-      (1) **ProjectSet for aggregate-arg SRFs.** The probe's
+      - Tests: `TestParseIndirectionStarFuncCall`,
+        `TestParseIndirectionStarFetchTableList` (parser),
+        `TestIndirectionStarTargetListPlansAsFromSrf`,
+        `TestIndirectionStarRejectsAggregateArgument`, `TestArrayAggText`,
+        `TestIndirectionStarInsideDerivedSubquery` (t.Skip — documents
+        next gap).
+      - Remaining for full probe survival (next sub-step):
+        (1) **ProjectSet for aggregate-arg SRFs.** The probe's
           `(pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*`
           shape needs an `Aggregate → ProjectSet(srf(arg))` plan
           structure. The simple-rewrite path used here cannot move the
           SRF into FROM when its args depend on aggregates evaluated
           over the original FROM.
-      (2) **Derived-subquery schema propagation for SRF columns.** Even
+        (2) **Derived-subquery schema propagation for SRF columns.** Even
           when the IndirectionStar rewrite fires inside a derived FROM
           subquery, the outer SELECT cannot resolve qualified column
           references (`gpt.relid`) because the analyzer/planner do not
           propagate a FROM-clause SRF's column list out through the
           subquery wrapper's `__irs_0.*` target. Tracked via
           `TestIndirectionStarInsideDerivedSubquery` (`t.Skip`).
-      Verification (loop 3): `go test -count=1 -timeout 180s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green (parser 0.013 s,
-      planner 0.020 s, analyzer 0.012 s, executor 1.171 s,
-      server 1.766 s, wal 1.900 s, catalog 0.005 s).
-      PARTIAL PROGRESS 2026-05-14 (loop 4): closed gap (2) — derived-
-      subquery SRF schema propagation. Design doc:
-      `docs/design/0103-0008-derived-subquery-srf-schema-propagation.md`.
-      Changes:
+      - Verification (loop 3): `go test -count=1 -timeout 180s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green (parser 0.013 s,
+        planner 0.020 s, analyzer 0.012 s, executor 1.171 s,
+        server 1.766 s, wal 1.900 s, catalog 0.005 s).
+      - PARTIAL PROGRESS 2026-05-14 (loop 4): closed gap (2) — derived-
+        subquery SRF schema propagation. Design doc:
+        `docs/design/0103-0008-derived-subquery-srf-schema-propagation.md`.
+      - Changes:
       - `internal/analyzer/analyzer.go::lookupTable` now dispatches
         `*parser.TableFuncRef` column shapes by function name via a new
         `tableFuncColumns(funcName, alias, colAliases)` helper. The
@@ -2501,8 +2627,8 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         cleanly to non-SRF derived subqueries — innerSchema names
         match what `targetMeta` would have produced for plain
         target-list walks.
-      Tests (all in
-      `internal/executor/operators_pg_get_publication_tables_test.go`):
+      - Tests (all in
+        `internal/executor/operators_pg_get_publication_tables_test.go`):
       - `TestIndirectionStarInsideDerivedSubquery` (was `t.Skip`)
         now PASS: outer `SELECT gpt.relid` resolves the SRF's relid.
       - `TestIndirectionStarInsideDerivedSubqueryStarSelect` PASS:
@@ -2510,19 +2636,19 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       - `TestIndirectionStarDerivedSubqueryExplicitAliases` PASS:
         `… AS gpt(r,a,q)` overrides default names + resolves at outer
         scope.
-      Verification (loop 4): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green (parser 1.049 s,
-      planner 1.068 s, analyzer 1.040 s, executor 2.627 s,
-      server 3.563 s, wal 3.128 s, catalog 1.020 s).
-      Remaining gap for full probe survival: (1) ProjectSet for
-      aggregate-arg SRFs — the only piece left before
-      `fetch_table_list` runs end-to-end against a goopg publisher.
-      PARTIAL PROGRESS 2026-05-14 (loop 5): closed gap (1) — ProjectSet
-      lowering for aggregate-arg SRFs. Design doc:
-      `docs/design/0103-0009-projectset-for-aggregate-arg-srfs.md`.
-      Changes:
+      - Verification (loop 4): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green (parser 1.049 s,
+        planner 1.068 s, analyzer 1.040 s, executor 2.627 s,
+        server 3.563 s, wal 3.128 s, catalog 1.020 s).
+      - Remaining gap for full probe survival: (1) ProjectSet for
+        aggregate-arg SRFs — the only piece left before
+        `fetch_table_list` runs end-to-end against a goopg publisher.
+      - PARTIAL PROGRESS 2026-05-14 (loop 5): closed gap (1) — ProjectSet
+        lowering for aggregate-arg SRFs. Design doc:
+        `docs/design/0103-0009-projectset-for-aggregate-arg-srfs.md`.
+      - Changes:
       - `internal/planner/plan.go`: new `ProjectSet{Child, SrfName,
         SrfArgs, schema}` plan node — single-SRF wrapper that emits
         each row of the SRF's composite over its child's output.
@@ -2556,8 +2682,8 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         produce byte-identical rows.
       - `internal/executor/executor.go`: `Build` dispatches
         `*planner.ProjectSet` → `newProjectSetOp(p, child)`.
-      Tests (in
-      `internal/executor/operators_pg_get_publication_tables_test.go`):
+      - Tests (in
+        `internal/executor/operators_pg_get_publication_tables_test.go`):
       - `TestIndirectionStarWithAggregateArgument` (replaces the old
         `TestIndirectionStarRejectsAggregateArgument` whose 0A000
         assertion is no longer correct): runs the full probe shape
@@ -2568,35 +2694,35 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         shape with a `WHERE pubname IN ('p')` filter (mirrors
         libpqrcv's `fetch_table_list` IN clause), asserts only the
         surviving publication's tables come through.
-      Verification (loop 5): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green (parser 1.050 s,
-      planner 1.062 s, analyzer 1.038 s, executor 2.619 s,
-      server 3.512 s, wal 3.069 s, catalog 1.019 s).
-      With both gaps closed, `fetch_table_list` SQL parses, plans,
-      and executes against an in-memory fixture; the next M0103-0008
-      step is to drop the `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` and confirm the live
-      probe sequence runs end-to-end against a goopg publisher.
-      PARTIAL PROGRESS 2026-05-14 (loop 6): dropped the `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` and exercised the live
-      libpqrcv ladder against a goopg publisher. The relation-list
-      probe (rungs 1–5) now passes end-to-end. PG's apply launcher
-      then ships its column-list probe:
-      `SELECT DISTINCT (CASE WHEN (array_length(gpt.attrs, 1) =
-      c.relnatts) THEN NULL ELSE gpt.attrs END) FROM pg_publication
-      p, LATERAL pg_get_publication_tables(p.pubname) gpt, pg_class
-      c WHERE gpt.relid = <oid> AND c.oid = gpt.relid AND p.pubname
-      IN (…)`. goopg rejected the probe with `ERROR: column "attrs"
-      does not exist` because the planner built a fresh empty
-      `resolveContext` for FROM-clause SRF arg resolution — so
-      `p.pubname` (an outer column ref from the left FROM sibling)
-      could not resolve. Rung 6 (planner side) closed in this loop;
-      executor side stays deferred inside M0103-0008.
-      Design doc:
-      `docs/design/0103-0010-lateral-from-srf-arg-resolution.md`.
-      Changes:
+      - Verification (loop 5): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green (parser 1.050 s,
+        planner 1.062 s, analyzer 1.038 s, executor 2.619 s,
+        server 3.512 s, wal 3.069 s, catalog 1.019 s).
+      - With both gaps closed, `fetch_table_list` SQL parses, plans,
+        and executes against an in-memory fixture; the next M0103-0008
+        step is to drop the `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` and confirm the live
+        probe sequence runs end-to-end against a goopg publisher.
+      - PARTIAL PROGRESS 2026-05-14 (loop 6): dropped the `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` and exercised the live
+        libpqrcv ladder against a goopg publisher. The relation-list
+        probe (rungs 1–5) now passes end-to-end. PG's apply launcher
+        then ships its column-list probe:
+        `SELECT DISTINCT (CASE WHEN (array_length(gpt.attrs, 1) =
+        c.relnatts) THEN NULL ELSE gpt.attrs END) FROM pg_publication
+        p, LATERAL pg_get_publication_tables(p.pubname) gpt, pg_class
+        c WHERE gpt.relid = <oid> AND c.oid = gpt.relid AND p.pubname
+      - IN (…)`. goopg rejected the probe with `ERROR: column "attrs"
+        does not exist` because the planner built a fresh empty
+        `resolveContext` for FROM-clause SRF arg resolution — so
+        `p.pubname` (an outer column ref from the left FROM sibling)
+        could not resolve. Rung 6 (planner side) closed in this loop;
+        executor side stays deferred inside M0103-0008.
+      - Design doc:
+        `docs/design/0103-0010-lateral-from-srf-arg-resolution.md`.
+      - Changes:
       - `internal/planner/planner.go`: `planScanRangeVar`,
         `planTableFuncRangeVar`, and `planPgGetPublicationTables`
         gain a `lateralCtx *resolveContext` parameter. nil from
@@ -2611,35 +2737,35 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `lateralCtx`. JOIN right-hand sides merge outer lateralCtx
         with the same item's left context via a new
         `mergeResolveContexts(outer, inner)` helper.
-      Tests:
+      - Tests:
       - `internal/planner/planner_test.go::
         TestPlanLateralSrfArgResolvesAgainstLeftFromItem` — parses
         and plans the canonical libpqrcv shape against an in-memory
         catalog with a `pg_publication(pubname text)` stand-in;
         pins single-column output named `attrs`.
-      Verification (loop 6): `go test -count=1 -timeout 180s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` — all green; planner regression test
-      added.
-      Remaining for full rung-6 survival (next sub-step):
-      executor-side outer-row-driven SRF evaluation. The cross-FROM
-      Join currently opens its right child once with a nil outer
-      slot, so the SRF's `ColumnRef("pubname")` evaluates against a
-      nil tuple at runtime (`XX000: column ref pubname/0 on nil
-      slot`). Closing requires either a NestedLoop-with-parameter-
-      binding variant for FROM-clause SRFs (the principled fix —
-      generalises the existing `nestedLoopIndexJoinOp::BindOuter`
-      slot-binding pattern) or an inline rewrite that materialises
-      the SRF over the outer table at plan time. The `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` was restored with rung-6
-      diagnosis quoted verbatim so the next loop can resume from
-      the exact failing surface.
-      PARTIAL PROGRESS 2026-05-14 (loop 7): closed rung-6 executor
-      side. Design doc:
-      `docs/design/0103-0011-lateral-from-srf-executor-bind.md`
-      (accepted).
-      Changes:
+      - Verification (loop 6): `go test -count=1 -timeout 180s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` — all green; planner regression test
+        added.
+      - Remaining for full rung-6 survival (next sub-step):
+        executor-side outer-row-driven SRF evaluation. The cross-FROM
+      - Join currently opens its right child once with a nil outer
+        slot, so the SRF's `ColumnRef("pubname")` evaluates against a
+        nil tuple at runtime (`XX000: column ref pubname/0 on nil
+        slot`). Closing requires either a NestedLoop-with-parameter-
+        binding variant for FROM-clause SRFs (the principled fix —
+        generalises the existing `nestedLoopIndexJoinOp::BindOuter`
+        slot-binding pattern) or an inline rewrite that materialises
+        the SRF over the outer table at plan time. The `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` was restored with rung-6
+        diagnosis quoted verbatim so the next loop can resume from
+        the exact failing surface.
+      - PARTIAL PROGRESS 2026-05-14 (loop 7): closed rung-6 executor
+        side. Design doc:
+        `docs/design/0103-0011-lateral-from-srf-executor-bind.md`
+        (accepted).
+      - Changes:
       - `internal/planner/plan.go`: `Join` gains `Lateral bool`.
       - `internal/planner/planner.go`: new `nodeReferencesOuter(n)` /
         `exprContainsColumnRef(e)` helpers (the latter wraps the
@@ -2672,7 +2798,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         Hash → openLazyHashJoin
         Lateral → openLateral (NEW)
         default → drain both + runMergeJoin / runNestedLoop.
-      Tests:
+      - Tests:
       - `internal/executor/operators_pg_get_publication_tables_test.go`:
         `TestLateralPgGetPublicationTablesFromOuterRef` (two outer
         rows each yield one SRF result row),
@@ -2681,40 +2807,40 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       - `internal/planner/planner_test.go`:
         `TestPlanFetchTableListAggDerivedSubquery (t.Skip)` pins the
         next rung (rung 7).
-      Verification (loop 7): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green (parser 1.05 s, planner 1.07 s,
-      analyzer 1.04 s, executor 2.59 s, server 3.52 s, wal 3.13 s,
-      catalog 1.02 s).
-      Next gap (rung 7): dropping the `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` exposed
-      `fetch_table_list` rather than the column-list probe. The
-      shape uses `(pg_get_publication_tables(VARIADIC
-      array_agg(pubname::text))).*` inside a derived subquery.
-      The non-aggregate IndirectionStar variant is rewritten at
-      parse time into a FROM-clause TableFuncRef + `__irs_0.*`
-      target — `analyzer.tableFuncColumns` (loop 4) hands the outer
-      scope the SRF's static three-column shape. The aggregate-arg
-      variant skips that rewrite (parser passes nil `onAggregate`)
-      and the planner lowers it via `ProjectSet` (loop 5). The
-      analyzer's `synthesizeSubqueryTable` does not yet expand
-      `*parser.IndirectionStar` targets — it falls back to a single
-      `?column?1` column, so outer references like `gpt.attrs` raise
-      `42703: column "attrs" does not exist`. Pinned (failing-as-Skip)
-      by `TestPlanFetchTableListAggDerivedSubquery` in the planner
-      package; the `t.Skip` on `TestPort_PgoutputInteropGoopgToPG`
-      was restored with the rung-7 diagnosis quoted verbatim. Next
-      step: extend `synthesizeSubqueryTable`'s target-list walk to
-      recognise `*parser.IndirectionStar` whose source `*parser.FuncCall`
-      has a known composite return shape (currently only
-      `pg_get_publication_tables`) and emit the matching three columns.
-      PARTIAL PROGRESS 2026-05-14 (loop 8): closed rung 7 —
-      analyzer-side IndirectionStar expansion in derived subqueries.
-      Design doc:
-      `docs/design/0103-0012-derived-subquery-srf-composite-expansion.md`
-      (accepted).
-      Changes:
+      - Verification (loop 7): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green (parser 1.05 s, planner 1.07 s,
+        analyzer 1.04 s, executor 2.59 s, server 3.52 s, wal 3.13 s,
+        catalog 1.02 s).
+      - Next gap (rung 7): dropping the `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` exposed
+        `fetch_table_list` rather than the column-list probe. The
+        shape uses `(pg_get_publication_tables(VARIADIC
+        array_agg(pubname::text))).*` inside a derived subquery.
+      - The non-aggregate IndirectionStar variant is rewritten at
+        parse time into a FROM-clause TableFuncRef + `__irs_0.*`
+        target — `analyzer.tableFuncColumns` (loop 4) hands the outer
+        scope the SRF's static three-column shape. The aggregate-arg
+        variant skips that rewrite (parser passes nil `onAggregate`)
+        and the planner lowers it via `ProjectSet` (loop 5). The
+        analyzer's `synthesizeSubqueryTable` does not yet expand
+        `*parser.IndirectionStar` targets — it falls back to a single
+        `?column?1` column, so outer references like `gpt.attrs` raise
+        `42703: column "attrs" does not exist`. Pinned (failing-as-Skip)
+        by `TestPlanFetchTableListAggDerivedSubquery` in the planner
+        package; the `t.Skip` on `TestPort_PgoutputInteropGoopgToPG`
+        was restored with the rung-7 diagnosis quoted verbatim. Next
+        step: extend `synthesizeSubqueryTable`'s target-list walk to
+        recognise `*parser.IndirectionStar` whose source `*parser.FuncCall`
+        has a known composite return shape (currently only
+        `pg_get_publication_tables`) and emit the matching three columns.
+      - PARTIAL PROGRESS 2026-05-14 (loop 8): closed rung 7 —
+        analyzer-side IndirectionStar expansion in derived subqueries.
+      - Design doc:
+        `docs/design/0103-0012-derived-subquery-srf-composite-expansion.md`
+        (accepted).
+      - Changes:
       - `internal/analyzer/analyzer.go`: new package-private helper
         `compositeFuncColumns(funcName)` returns the composite
         return-column shape for SRFs known to expand via
@@ -2727,7 +2853,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         that expands `*parser.IndirectionStar` whose source is a
         `*parser.FuncCall` with a known composite into the matching
         columns. Unknown sources fall through unchanged.
-      Tests:
+      - Tests:
       - `internal/planner/planner_test.go::TestPlanFetchTableListAggDerivedSubquery`
         flipped from `t.Skip` to a positive plan+output assertion:
         runs the exact `fetch_table_list` derived-subquery shape
@@ -2739,28 +2865,28 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         Skip message updated to reflect rung 7 closure — the live
         interop ladder stays deferred so the next probe rung can
         land with its own design doc + targeted pin.
-      Verification (loop 8): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green (parser 1.046 s,
-      planner 1.064 s, analyzer 1.036 s, executor 2.603 s,
-      server 3.481 s, wal 3.058 s, catalog 1.019 s).
-      PARTIAL PROGRESS 2026-05-14 (loop 9): closed rung 8 —
-      `CREATE_REPLICATION_SLOT` parenthesised options list (PG14+
-      shape). Design doc:
-      `docs/design/0103-0013-create-replication-slot-options-list.md`
-      (accepted).
-      Diagnosis: dropping the `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` surfaced
-      `ERROR: could not create replication slot "g2pg_sub": ERROR:
-      unexpected token "(SNAPSHOT" after LOGICAL pgoutput`. PG's
-      libpqwalreceiver runs `CREATE_REPLICATION_SLOT "g2pg_sub"
-      LOGICAL pgoutput (SNAPSHOT 'nothing')` as part of CREATE
-      SUBSCRIPTION; goopg's `replyCreateReplicationSlot` tokenised
-      args via `strings.Fields` and rejected the `(SNAPSHOT` token
-      because the legacy pre-PG14 grammar only knew about positional
-      trailing keywords.
-      Changes:
+      - Verification (loop 8): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green (parser 1.046 s,
+        planner 1.064 s, analyzer 1.036 s, executor 2.603 s,
+        server 3.481 s, wal 3.058 s, catalog 1.019 s).
+      - PARTIAL PROGRESS 2026-05-14 (loop 9): closed rung 8 —
+        `CREATE_REPLICATION_SLOT` parenthesised options list (PG14+
+        shape). Design doc:
+        `docs/design/0103-0013-create-replication-slot-options-list.md`
+        (accepted).
+      - Diagnosis: dropping the `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` surfaced
+        `ERROR: could not create replication slot "g2pg_sub": ERROR:
+        unexpected token "(SNAPSHOT" after LOGICAL pgoutput`. PG's
+        libpqwalreceiver runs `CREATE_REPLICATION_SLOT "g2pg_sub"
+      - LOGICAL pgoutput (SNAPSHOT 'nothing')` as part of CREATE
+      - SUBSCRIPTION; goopg's `replyCreateReplicationSlot` tokenised
+        args via `strings.Fields` and rejected the `(SNAPSHOT` token
+        because the legacy pre-PG14 grammar only knew about positional
+        trailing keywords.
+      - Changes:
       - `internal/server/replication.go`:
         - New `splitReplicationSlotOptionsBlock(args)` peels the
           optional `(...)` block off before whitespace tokenisation.
@@ -2780,7 +2906,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
           before the existing prefix tokenisation. Legacy positional
           trailing keywords (EXPORT_SNAPSHOT / NOEXPORT_SNAPSHOT /
           USE_SNAPSHOT / TWO_PHASE) are preserved for older clients.
-      Tests (in `internal/server/replication_test.go`):
+      - Tests (in `internal/server/replication_test.go`):
       - `TestReplicationCreateLogicalSlotWithOptionsList` — exact
         libpqwalreceiver shape (`(SNAPSHOT 'nothing')`); asserts
         the four-column reply, NULL `snapshot_name`, `pgoutput`
@@ -2789,28 +2915,28 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       - `TestReplicationCreateLogicalSlotOptionsListMultiple` —
         comma-separated success path (`(SNAPSHOT 'use', TWO_PHASE)`)
         plus unknown-option syntax-error pin (`(FROBNITZ true)`).
-      Verification (loop 9): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green. Manual live-probe run with
-      the `t.Skip` removed confirmed slot creation now succeeds; the
-      test then times out at 60 s waiting for the post-INSERT row
-      count to reach 1 on the PG subscriber — rung 9, deferred.
-      PARTIAL PROGRESS 2026-05-14 (loop 10): closed rung 9 — logical
-      walsender stream stability. Design doc:
-      `docs/design/0103-0014-logical-walsender-keepalive-and-slot-restart-lsn-fix.md`
-      (accepted).
-      Diagnosis: dropping the `t.Skip` revealed TWO concurrent bugs.
-      Adding short-lived diagnostic logging into `runLogicalWalsender`'s
-      `dec.Run` goroutine surfaced
-      `wal: slot "g2pg_sub" decoder iterator: wal: invalid record
-      header: unknown rmid=240`. The iterator's very first
-      `readOneAt(pos)` was decoding garbage as an XLogRecord header.
-      Even after fixing that the next quiet 60 s window would re-trip
-      `wal_receiver_timeout` because the LOGICAL walsender had no
-      keepalive emission — the physical path runs a 10 s ticker,
-      `runLogicalWalsender` did not.
-      Changes:
+      - Verification (loop 9): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green. Manual live-probe run with
+        the `t.Skip` removed confirmed slot creation now succeeds; the
+        test then times out at 60 s waiting for the post-INSERT row
+        count to reach 1 on the PG subscriber — rung 9, deferred.
+      - PARTIAL PROGRESS 2026-05-14 (loop 10): closed rung 9 — logical
+        walsender stream stability. Design doc:
+        `docs/design/0103-0014-logical-walsender-keepalive-and-slot-restart-lsn-fix.md`
+        (accepted).
+      - Diagnosis: dropping the `t.Skip` revealed TWO concurrent bugs.
+      - Adding short-lived diagnostic logging into `runLogicalWalsender`'s
+        `dec.Run` goroutine surfaced
+        `wal: slot "g2pg_sub" decoder iterator: wal: invalid record
+        header: unknown rmid=240`. The iterator's very first
+        `readOneAt(pos)` was decoding garbage as an XLogRecord header.
+      - Even after fixing that the next quiet 60 s window would re-trip
+        `wal_receiver_timeout` because the LOGICAL walsender had no
+        keepalive emission — the physical path runs a 10 s ticker,
+        `runLogicalWalsender` did not.
+      - Changes:
       - `internal/server/replication.go::replyCreateReplicationSlot`:
         `slot.RestartLSN` now anchors at `s.cfg.WAL.WrittenLSN() + 1`
         (next record's first-byte LSN), not `WrittenLSN()` (last byte
@@ -2835,7 +2961,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `streamCancel`. Main `select` drains `keepaliveDone` after
         `receiveDone` so connection-close ordering is symmetric with
         the physical path.
-      Tests:
+      - Tests:
       - `internal/server/replication_test.go::TestReplicationCreateLogicalSlotRestartLSNIsNextRecord`
         — appends a record so `WrittenLSN()` is non-zero, creates a
         logical slot via the wire protocol, asserts `slot.RestartLSN
@@ -2848,43 +2974,43 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         pins the no-messages-yet underflow guard (adapter with
         `nextLSN=0` still emits a well-formed keepalive with
         `WALEnd=0`).
-      Verification (loop 10): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green. Manual live-probe run with
-      the `t.Skip` removed confirms the failure mode has changed
-      observably: PG's apply worker no longer fires
-      `wal_receiver_timeout` at exactly 60 s — the connection stays
-      alive past the 67 s mark until test shutdown ("terminating
-      logical replication worker due to administrator command"). The
-      `t.Skip` was restored with the rung-10 diagnosis quoted
-      verbatim.
-      Next sub-step (rung 10): pgoutput emission for goopg-publisher
-      DML. Connection is now stable but PG sees zero rows from the
-      publisher's `INSERT/INSERT/UPDATE/DELETE` — the SlotDecoder
-      runs without errors, the iterator blocks at tail, but no `'w'`
-      frame carrying pgoutput Begin/Relation/Insert is shipped to
-      the subscriber. Candidate causes: publication-filter
-      rejection, missing Begin/Commit emission for in-snapshot
-      transactions, or catalog snapshot timing.
-      PARTIAL PROGRESS 2026-05-14 (loop 11): closed rung 10 —
-      publication-filter rejection (the first candidate cause). Design
-      doc: `docs/design/0103-0015-publication-table-canonicalization.md`
-      (accepted).
-      Diagnosis: the harness runs `CREATE TABLE public.t (…)` followed
-      by `CREATE PUBLICATION p FOR TABLE t` (unqualified). goopg's
-      `execCreatePublication` previously appended each table to the
-      publication via `qualifiedTableName(t)`, which renders an
-      `ObjectName{Schema:"", Name:"t"}` as the literal string `"t"`.
-      `runLogicalWalsender` later builds the catalog snapshot from
-      `catalog.InMemory.AllTables`, so the relation entry the plugin
-      sees carries `Schema="public", Name="t"` and
-      `relQualifiedName(rel)` returns `"public.t"`. The walsender's
-      `publicationFilter.byTable["public.t"]` lookup misses against
-      the stored `"t"` key, the `Allows` gate returns false, and every
-      change is silently dropped — explaining "stable connection, no
-      DML messages flow" after rung 9.
-      Changes:
+      - Verification (loop 10): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green. Manual live-probe run with
+        the `t.Skip` removed confirms the failure mode has changed
+        observably: PG's apply worker no longer fires
+        `wal_receiver_timeout` at exactly 60 s — the connection stays
+        alive past the 67 s mark until test shutdown ("terminating
+        logical replication worker due to administrator command"). The
+        `t.Skip` was restored with the rung-10 diagnosis quoted
+        verbatim.
+      - Next sub-step (rung 10): pgoutput emission for goopg-publisher
+      - DML. Connection is now stable but PG sees zero rows from the
+        publisher's `INSERT/INSERT/UPDATE/DELETE` — the SlotDecoder
+        runs without errors, the iterator blocks at tail, but no `'w'`
+        frame carrying pgoutput Begin/Relation/Insert is shipped to
+        the subscriber. Candidate causes: publication-filter
+        rejection, missing Begin/Commit emission for in-snapshot
+        transactions, or catalog snapshot timing.
+      - PARTIAL PROGRESS 2026-05-14 (loop 11): closed rung 10 —
+        publication-filter rejection (the first candidate cause). Design
+        doc: `docs/design/0103-0015-publication-table-canonicalization.md`
+        (accepted).
+      - Diagnosis: the harness runs `CREATE TABLE public.t (…)` followed
+        by `CREATE PUBLICATION p FOR TABLE t` (unqualified). goopg's
+        `execCreatePublication` previously appended each table to the
+        publication via `qualifiedTableName(t)`, which renders an
+        `ObjectName{Schema:"", Name:"t"}` as the literal string `"t"`.
+        `runLogicalWalsender` later builds the catalog snapshot from
+        `catalog.InMemory.AllTables`, so the relation entry the plugin
+        sees carries `Schema="public", Name="t"` and
+        `relQualifiedName(rel)` returns `"public.t"`. The walsender's
+        `publicationFilter.byTable["public.t"]` lookup misses against
+        the stored `"t"` key, the `Allows` gate returns false, and every
+        change is silently dropped — explaining "stable connection, no
+      - DML messages flow" after rung 9.
+      - Changes:
       - `internal/executor/operators_ddl.go::execCreatePublication`:
         the table-list build now resolves each
         `parser.ObjectName` via `Catalog.LookupTable` (with a
@@ -2897,8 +3023,8 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         time; goopg's PubSub keys by qualified-name string, so the
         canonicalisation step makes the two ends of the comparison
         agree.
-      Tests (new file
-      `internal/executor/operators_ddl_pubsub_test.go`):
+      - Tests (new file
+        `internal/executor/operators_ddl_pubsub_test.go`):
       - `TestCreatePublicationStoresCanonicalQualifiedName` — load-
         bearing pin: seeds `public.t`, runs `CREATE PUBLICATION p
         FOR TABLE t`, asserts `pub.Tables == ["public.t"]`.
@@ -2906,45 +3032,45 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         explicit `public.items_q` reference stored unchanged.
       - `TestCreatePublicationUnknownTableErrors` — `42P01` pin for
         non-existent relations.
-      Verification (loop 11): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/` → all green (parser 1.047 s, planner
-      1.065 s, analyzer 1.036 s, executor 2.603 s, server 3.529 s,
-      wal 3.093 s, catalog 1.019 s).
-      The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` stays in
-      place so each subsequent rung lands with its own design doc +
-      targeted unit pin. Candidate next failures (deferred): pgoutput
-      Begin/Commit emission for xacts with zero in-publication
-      changes, catalog-snapshot timing for relations created after
-      slot creation.
-      PARTIAL PROGRESS 2026-05-14 (loop 12): closed rung 11 —
-      `publication_names` quoted-identifier unquoting. Design doc:
-      `docs/design/0103-0016-publication-names-splitidentifier.md`
-      (accepted).
-      Diagnosis: dropping the `t.Skip` after rung 10 produced the
-      same observable failure mode (apply worker connects, no rows
-      replicate). Diagnostic logging added to
-      `buildPublicationFilter`, `runLogicalWalsender` (filter
-      contents), and `PgOutput.Change` revealed that the filter
-      was being built with `pubNames = [`"p"`]` — the publication
-      name itself carried embedded double-quotes.
-      `PubSub.LookupPublication(`"p"`)` returned `ok=false` because
-      the registry key is `p`, so the resulting filter had
-      `byTable = map[]` and `allTablesAllowed = {false,false,false}`,
-      and every decoded change was silently rejected. libpq's
-      logical-replication client emits
-      `START_REPLICATION SLOT "g2pg_sub" LOGICAL 0/<lsn>
-      (proto_version '4', publication_names '"p"')` — each name
-      inside `publication_names` is wrapped in double-quotes so
-      names containing commas remain safe to split. Upstream
-      PG's pgoutput parses the option via
-      `SplitIdentifierString(rawstring, ',', ...)` (varlena.c),
-      which strips the surrounding `"..."` and lowercases unquoted
-      identifiers. goopg's `splitPublicationNames` shortcut to
-      `strings.Split(raw, ',')` + `TrimSpace`, keeping the quotes
-      verbatim.
-      Changes:
+      - Verification (loop 11): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/` → all green (parser 1.047 s, planner
+      - 1.065 s, analyzer 1.036 s, executor 2.603 s, server 3.529 s,
+        wal 3.093 s, catalog 1.019 s).
+      - The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` stays in
+        place so each subsequent rung lands with its own design doc +
+        targeted unit pin. Candidate next failures (deferred): pgoutput
+      - Begin/Commit emission for xacts with zero in-publication
+        changes, catalog-snapshot timing for relations created after
+        slot creation.
+      - PARTIAL PROGRESS 2026-05-14 (loop 12): closed rung 11 —
+        `publication_names` quoted-identifier unquoting. Design doc:
+        `docs/design/0103-0016-publication-names-splitidentifier.md`
+        (accepted).
+      - Diagnosis: dropping the `t.Skip` after rung 10 produced the
+        same observable failure mode (apply worker connects, no rows
+        replicate). Diagnostic logging added to
+        `buildPublicationFilter`, `runLogicalWalsender` (filter
+        contents), and `PgOutput.Change` revealed that the filter
+        was being built with `pubNames = [`"p"`]` — the publication
+        name itself carried embedded double-quotes.
+        `PubSub.LookupPublication(`"p"`)` returned `ok=false` because
+        the registry key is `p`, so the resulting filter had
+        `byTable = map[]` and `allTablesAllowed = {false,false,false}`,
+        and every decoded change was silently rejected. libpq's
+        logical-replication client emits
+        `START_REPLICATION SLOT "g2pg_sub" LOGICAL 0/<lsn>
+        (proto_version '4', publication_names '"p"')` — each name
+        inside `publication_names` is wrapped in double-quotes so
+        names containing commas remain safe to split. Upstream
+      - PG's pgoutput parses the option via
+        `SplitIdentifierString(rawstring, ',', ...)` (varlena.c),
+        which strips the surrounding `"..."` and lowercases unquoted
+        identifiers. goopg's `splitPublicationNames` shortcut to
+        `strings.Split(raw, ',')` + `TrimSpace`, keeping the quotes
+        verbatim.
+      - Changes:
       - `internal/server/logicalwalsender.go::splitPublicationNames`:
         rewritten as a rune-walk that mirrors
         `SplitIdentifierString`'s semantics — on a leading `"`,
@@ -2959,8 +3085,8 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         quote or junk-after-identifier so the caller stays on the
         "no publication matched ⇒ empty filter" path. New helper
         `unicodeIsSpace` mirrors PG's `scanner_isspace`.
-      Tests (in
-      `internal/server/logicalwalsender_test.go`):
+      - Tests (in
+        `internal/server/logicalwalsender_test.go`):
       - `TestSplitPublicationNamesQuotedIdentifiers` (11
         sub-cases): single quoted name, multiple quoted names,
         doubled-quote escape `""` → `"`, unquoted lowercased,
@@ -2973,84 +3099,84 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       - `TestSplitPublicationNamesTrimsAndDropsEmpty` (existing):
         unchanged — verifies the legacy permissive contract still
         holds for the lenient `,,` path.
-      Verification (loop 12): `go test -race -count=1 -timeout
-      300s ./internal/parser/ ./internal/planner/
-      ./internal/analyzer/ ./internal/executor/ ./internal/server/
-      ./internal/wal/ ./internal/catalog/` → all green (parser
-      1.060 s, planner 1.077 s, analyzer 1.041 s, executor
-      2.632 s, server 3.526 s, wal 3.049 s, catalog 1.021 s).
-      Live-probe run (with `t.Skip` removed for diagnosis only)
-      confirmed the failure mode shifted observably: Insert
-      (kind=4) and Delete (kind=6) records now flow through
-      `pgoutput.Change` and reach the apply worker; UPDATE
-      (`RecordKindHeapHotUpdate` kind=13) and the first INSERT
-      into a freshly-allocated heap page (emitted as
-      `RecordKindPageImage` kind=1 + `RecordKindBtreeInsert`
-      kind=5) are still silently dropped because
-      `internal/wal/classifier.go::Classify` has no cases for
-      those record kinds. The `t.Skip` was restored with the
-      rung-11 closure note and the rung-12 diagnosis quoted
-      verbatim, so the next loop can resume from the exact
-      failing surface.
-      Next sub-step (rung 12): extend `SlotDecoder.Classify` to
-      decode `RecordKindHeapHotUpdate` / `RecordKindHeapUpdate`
-      into `ChangeUpdate` events (with OldTuple where the
-      record carries one) and `RecordKindPageImage` into
-      synthesised `ChangeInsert` events per slot of the page
-      image — or change the executor's first-INSERT-into-fresh-
-      page emission path to write a plain `RecordKindHeapInsert`
-      so the classifier sees the same shape upstream PG produces.
-      PARTIAL PROGRESS 2026-05-14 (loop 13): closed the UPDATE
-      half of rung 12 — `internal/wal/classifier.go::Classify`
-      gains `RecordKindHeapHotUpdate` (kind 13) and
-      `RecordKindHeapUpdate` (kind 27) cases. Both decode via
-      the existing `DecodeHeapHotUpdate` / `DecodeHeapUpdate`
-      helpers, extract the updating xact via `xminFromTuple` on
-      the new-tuple bytes (offset 0 = xmin per heap-tuple binary
-      layout — same path HeapInsert uses), and dispatch a
-      `Change{Kind: ChangeUpdate, NewTuple: tupleBytes}` through
-      `Decoder.ApplyChange`. `OldTuple` stays empty — neither
-      record shape carries the pre-image; pgoutput's
-      `writeUpdate` already handles the no-old-tuple case (rung
-      9 fix) by emitting `'U' relOid 'N' newTuple` directly,
-      byte-identical to upstream's `logicalrep_write_update`
-      under REPLICA IDENTITY DEFAULT. Pinned by
-      `TestClassifyHeapHotUpdateRoutesByXmin` and
-      `TestClassifyHeapUpdateRoutesByXmin` in
-      `internal/wal/classifier_test.go`; the shared
-      `recordingPlugin` (in `internal/wal/reorder_test.go`)
-      gained a `changes []Change` capture field so the new
-      tests can assert NewTuple/OldTuple/Block/LineSlot. Design
-      doc: `docs/design/0103-0017-classify-heap-update-records.md`
-      (accepted).
-      Verification (loop 13): `go test -race -count=1 -timeout
-      300s ./internal/wal/ ./internal/server/
-      ./internal/executor/ ./internal/catalog/` → all green
-      (wal 3.018 s, server 3.488 s, executor 2.575 s, catalog
-      1.019 s).
-      Remaining for full rung-12 closure (next sub-step):
-      PageImage handling. If a live trace confirms that
-      fresh-page inserts emit `RecordKindPageImage` instead of
-      (or in addition to) `RecordKindHeapInsert`, the next rung
-      will either decode tuple slots out of the page image or
-      adjust the executor's first-INSERT-into-fresh-page
-      emission path so the classifier sees a plain
-      `RecordKindHeapInsert` — same shape upstream PG produces.
-      PARTIAL PROGRESS 2026-05-14 (loop 14): closed the
-      PageImage half of rung 12 — the fresh-page-INSERT path
-      now emits BOTH the logical `RecordKindHeapInsert` AND the
-      `RecordKindPageImage` (logical first, FPI second), instead
-      of the prior FPI-only shape. Design doc:
-      `docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md`
-      (accepted).
-      Diagnosis: `bufpool.MarkDirtyChangeRecord`'s
-      "FPI alone replaces the change record" optimisation on
-      first-dirty-in-epoch dropped the per-row logical event
-      from the WAL stream entirely — fine for redo, fatal for
-      logical replication. Subsequent same-epoch dirties did
-      emit the logical record, so the bug was intermittent
-      (worst kind for replication).
-      Changes:
+      - Verification (loop 12): `go test -race -count=1 -timeout
+      - 300s ./internal/parser/ ./internal/planner/
+        ./internal/analyzer/ ./internal/executor/ ./internal/server/
+        ./internal/wal/ ./internal/catalog/` → all green (parser
+      - 1.060 s, planner 1.077 s, analyzer 1.041 s, executor
+      - 2.632 s, server 3.526 s, wal 3.049 s, catalog 1.021 s).
+      - Live-probe run (with `t.Skip` removed for diagnosis only)
+        confirmed the failure mode shifted observably: Insert
+        (kind=4) and Delete (kind=6) records now flow through
+        `pgoutput.Change` and reach the apply worker; UPDATE
+        (`RecordKindHeapHotUpdate` kind=13) and the first INSERT
+        into a freshly-allocated heap page (emitted as
+        `RecordKindPageImage` kind=1 + `RecordKindBtreeInsert`
+        kind=5) are still silently dropped because
+        `internal/wal/classifier.go::Classify` has no cases for
+        those record kinds. The `t.Skip` was restored with the
+        rung-11 closure note and the rung-12 diagnosis quoted
+        verbatim, so the next loop can resume from the exact
+        failing surface.
+      - Next sub-step (rung 12): extend `SlotDecoder.Classify` to
+        decode `RecordKindHeapHotUpdate` / `RecordKindHeapUpdate`
+        into `ChangeUpdate` events (with OldTuple where the
+        record carries one) and `RecordKindPageImage` into
+        synthesised `ChangeInsert` events per slot of the page
+        image — or change the executor's first-INSERT-into-fresh-
+        page emission path to write a plain `RecordKindHeapInsert`
+        so the classifier sees the same shape upstream PG produces.
+      - PARTIAL PROGRESS 2026-05-14 (loop 13): closed the UPDATE
+        half of rung 12 — `internal/wal/classifier.go::Classify`
+        gains `RecordKindHeapHotUpdate` (kind 13) and
+        `RecordKindHeapUpdate` (kind 27) cases. Both decode via
+        the existing `DecodeHeapHotUpdate` / `DecodeHeapUpdate`
+        helpers, extract the updating xact via `xminFromTuple` on
+        the new-tuple bytes (offset 0 = xmin per heap-tuple binary
+        layout — same path HeapInsert uses), and dispatch a
+        `Change{Kind: ChangeUpdate, NewTuple: tupleBytes}` through
+        `Decoder.ApplyChange`. `OldTuple` stays empty — neither
+        record shape carries the pre-image; pgoutput's
+        `writeUpdate` already handles the no-old-tuple case (rung
+      - 9 fix) by emitting `'U' relOid 'N' newTuple` directly,
+        byte-identical to upstream's `logicalrep_write_update`
+        under REPLICA IDENTITY DEFAULT. Pinned by
+        `TestClassifyHeapHotUpdateRoutesByXmin` and
+        `TestClassifyHeapUpdateRoutesByXmin` in
+        `internal/wal/classifier_test.go`; the shared
+        `recordingPlugin` (in `internal/wal/reorder_test.go`)
+        gained a `changes []Change` capture field so the new
+        tests can assert NewTuple/OldTuple/Block/LineSlot. Design
+        doc: `docs/design/0103-0017-classify-heap-update-records.md`
+        (accepted).
+      - Verification (loop 13): `go test -race -count=1 -timeout
+      - 300s ./internal/wal/ ./internal/server/
+        ./internal/executor/ ./internal/catalog/` → all green
+        (wal 3.018 s, server 3.488 s, executor 2.575 s, catalog
+      - 1.019 s).
+      - Remaining for full rung-12 closure (next sub-step):
+      - PageImage handling. If a live trace confirms that
+        fresh-page inserts emit `RecordKindPageImage` instead of
+        (or in addition to) `RecordKindHeapInsert`, the next rung
+        will either decode tuple slots out of the page image or
+        adjust the executor's first-INSERT-into-fresh-page
+        emission path so the classifier sees a plain
+        `RecordKindHeapInsert` — same shape upstream PG produces.
+      - PARTIAL PROGRESS 2026-05-14 (loop 14): closed the
+      - PageImage half of rung 12 — the fresh-page-INSERT path
+        now emits BOTH the logical `RecordKindHeapInsert` AND the
+        `RecordKindPageImage` (logical first, FPI second), instead
+        of the prior FPI-only shape. Design doc:
+        `docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md`
+        (accepted).
+      - Diagnosis: `bufpool.MarkDirtyChangeRecord`'s
+        "FPI alone replaces the change record" optimisation on
+        first-dirty-in-epoch dropped the per-row logical event
+        from the WAL stream entirely — fine for redo, fatal for
+        logical replication. Subsequent same-epoch dirties did
+        emit the logical record, so the bug was intermittent
+        (worst kind for replication).
+      - Changes:
       - `internal/storage/bufpool.go`: new method
         `Pool.MarkDirtyLogicalChange(s, emitter)` — always runs
         `emitter` (the logical record), additionally emits FPI
@@ -3076,7 +3202,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         heap-prune-opt, heap-lock, vacuum) keep
         `MarkDirtyChangeRecord` — their `emitter` IS the FPI,
         so the FPI-or-emitter toggle stays correct.
-      Tests:
+      - Tests:
       - `internal/storage/storage_test.go`:
         `TestMarkDirtyLogicalChangeEmitsLogicalAndFPIOnFirstDirty`,
         `TestMarkDirtyLogicalChangeEmitsLogicalOnlyOnSecondDirty`,
@@ -3088,29 +3214,29 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         LSN_log, PageImage at LSN_fpi) routes the HeapInsert
         into a `ChangeInsert` event; before this loop the row
         was silently dropped.
-      Verification (loop 14): `go test -race -count=1 -timeout
-      300s ./internal/storage/ ./internal/wal/
-      ./internal/executor/ ./internal/server/ ./internal/parser/
-      ./internal/planner/ ./internal/analyzer/
-      ./internal/catalog/` → all green (storage 1.344 s,
-      wal 3.016 s, executor 2.632 s, server 3.498 s, parser
-      1.059 s, planner 1.085 s, analyzer 1.044 s, catalog
-      1.020 s). Downstream packages also green:
-      `go test -race ./internal/access/... ./internal/initdb/...
-      ./internal/vacuum/...` → btree 12.572 s, initdb 2.324 s,
-      vacuum 1.019 s. The `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` stays in place so the
-      next rung lands with its own design doc + targeted unit
-      pin per the rung protocol.
-      PARTIAL PROGRESS 2026-05-14 (loop 15): closed rung 13 —
-      LATERAL `pg_catalog`-qualified SRF parser dispatch. Design
-      doc: `docs/design/0103-0019-lateral-pg-catalog-qualified-srf.md`
-      (accepted).
-      Diagnosis: lifting the `t.Skip` produced the same observable
-      pattern as rungs 10–12 (apply worker connects, no row
-      replicates). Adding subscriber-side state introspection
-      (`pg_replication_origin_status`, `pg_subscription_rel`,
-      `pg_stat_subscription`) revealed:
+      - Verification (loop 14): `go test -race -count=1 -timeout
+      - 300s ./internal/storage/ ./internal/wal/
+        ./internal/executor/ ./internal/server/ ./internal/parser/
+        ./internal/planner/ ./internal/analyzer/
+        ./internal/catalog/` → all green (storage 1.344 s,
+        wal 3.016 s, executor 2.632 s, server 3.498 s, parser
+      - 1.059 s, planner 1.085 s, analyzer 1.044 s, catalog
+      - 1.020 s). Downstream packages also green:
+        `go test -race ./internal/access/... ./internal/initdb/...
+        ./internal/vacuum/...` → btree 12.572 s, initdb 2.324 s,
+        vacuum 1.019 s. The `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` stays in place so the
+        next rung lands with its own design doc + targeted unit
+        pin per the rung protocol.
+      - PARTIAL PROGRESS 2026-05-14 (loop 15): closed rung 13 —
+      - LATERAL `pg_catalog`-qualified SRF parser dispatch. Design
+        doc: `docs/design/0103-0019-lateral-pg-catalog-qualified-srf.md`
+        (accepted).
+      - Diagnosis: lifting the `t.Skip` produced the same observable
+        pattern as rungs 10–12 (apply worker connects, no row
+        replicates). Adding subscriber-side state introspection
+        (`pg_replication_origin_status`, `pg_subscription_rel`,
+        `pg_stat_subscription`) revealed:
       - 'w' frames flow correctly (received_lsn = 0/146 = 326
         decimal, matching the 4 transactions' synthetic LSN range)
       - pgoutput Begin/Relation/Insert/Update/Delete/Commit
@@ -3121,143 +3247,143 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         in transaction 4..7")
       - BUT `pg_subscription_rel` is EMPTY on the subscriber and
         `pg_replication_origin_status.remote_lsn` stays at 0/0
-      Root cause: CREATE SUBSCRIPTION's `fetch_table_list_from_publisher`
-      probe uses `LATERAL pg_catalog.pg_get_publication_tables(t.pubname)
-      AS gpt`. goopg's `parseRangeVar` only matched TVF FROM items
-      with `obj.Schema == ""`, so the schema-qualified form fell
-      into the derived-subquery branch and emitted
-      `syntax error at or near "expected ')' after subquery in FROM
-      (got ()"` at the LATERAL function's opening paren. CREATE
-      SUBSCRIPTION therefore registered ZERO tables in
-      `pg_subscription_rel`. With no rel state, the apply worker's
-      `should_apply_changes_for_rel(rel)` returns false for every
-      relation and silently skips every change (no error logged —
-      PG's apply worker has no error path for "relation not in
-      subscription state list").
-      Fix: extend the TVF FROM-item dispatch gate to accept both
-      unqualified and `pg_catalog`-qualified spellings (via
-      `strings.EqualFold(obj.Schema, "pg_catalog")`) for
-      `generate_series` / `pg_input_error_info` / `parse_ident` /
-      `pg_get_publication_tables`. Behaviour for unqualified calls
-      and for non-`pg_catalog` schemas is unchanged.
-      Pinned by `TestParseLateralPgCatalogQualifiedSRF` and
-      `TestParseLateralPgCatalogQualifiedSRFCaseInsensitive` in
-      `internal/parser/select_test.go`.
-      Verification (loop 15): `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/ ./internal/storage/` → all green.
-      Live-probe run with the `t.Skip` removed (rolled back before
-      commit) confirmed the failure mode shifted observably: the
-      `fetch_table_list` SQL now parses and reaches the executor,
-      where it surfaces the rung-14 surface — `pg_class.relnatts`
-      column missing (SQLSTATE 42703). The `t.Skip` was restored
-      with the rung-14 diagnosis quoted verbatim so the next loop
-      can resume from the exact failing surface.
-      PARTIAL PROGRESS 2026-05-14 (loop 16): closed rung 14 —
-      `pg_class.relnatts` column missing. Design doc:
-      `docs/design/0103-0020-pg-class-relnatts-column.md` (accepted).
-      Diagnosis: with rung 13's parser fix in place,
-      `fetch_table_list_from_publisher` reached the executor and
-      raised `42703: column "relnatts" does not exist` on the
-      `(array_length(gpt.attrs,1) = c.relnatts)` CASE test.
-      goopg's on-disk pg_class codec
-      (`internal/catalog/codec.go::PgClassRow.RelNAtts`) already
-      modelled the column for catalog persistence, but the
-      virtual `pg_catalog.pg_class` view in
-      `internal/catalog/catalog.go::registerSystemTables` is a
-      separate construct and had never been extended past its
-      eight-column shape (`oid`, `relname`, `relkind`,
-      `relnamespace`, `relpersistence`, `reltoastrelid`,
-      `relpages`, `relispopulated`).
-      Fix: added a 9th column `relnatts int4` at ordinal 8, with
-      each row populated as `strconv.Itoa(len(t.Columns))` from
-      inside the existing `VirtualRows` closure (snapshot under
-      `c.mu.RLock`). goopg has no system columns in its catalog,
-      so user-column count matches what upstream PG would report
-      for `pg_class.relnatts` (which already excludes system
-      columns by construction).
-      Pinned by `TestPgClassExposesRelNatts` in
-      `internal/catalog/catalog_test.go`: registers `t(id int4,
-      v text)`, asserts column declared at ordinal 8 typed int4,
-      and the populated row's relnatts cell equals `"2"`.
-      Verification (loop 16): `go test -race -count=1 -timeout
-      300s ./internal/catalog/ ./internal/planner/
-      ./internal/analyzer/ ./internal/executor/
-      ./internal/server/ ./internal/wal/ ./internal/storage/`
-      — recorded below at commit time.
-      The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` stays
-      in place per the rung protocol; next rung lands with its
-      own design doc once a live probe surfaces the next gap.
-      PARTIAL PROGRESS 2026-05-14 (loop 17): closed rung 15 —
-      `pg_get_publication_tables.relid` vs `pg_class.oid` shape
-      mismatch.  Design doc:
-      `docs/design/0103-0021-pg-get-publication-tables-relid-matches-pg-class-oid.md`
-      (accepted).
-      Diagnosis: lifting `t.Skip` after rung 14 produced a new
-      failure mode — the apply worker connected, decoded every
-      `'w'` frame (acks `recv=0/146` for all four transactions),
-      but `count(*)` on the subscriber stayed at 0. Tablesync
-      never launched. Query-trace `slog.Info` in `handleQuery`
-      revealed that CREATE SUBSCRIPTION sends the PG18
-      `fetch_table_list`:
-      `SELECT DISTINCT n.nspname, c.relname, gpt.attrs`
-      `  FROM pg_class c`
-      `    JOIN pg_namespace n ON n.oid = c.relnamespace`
-      `    JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*`
-      `           FROM pg_publication WHERE pubname IN ( 'p' )) AS gpt`
-      `        ON gpt.relid = c.oid`
-      and the result is zero rows, with no SQL error. Root cause:
-      `buildPgGetPublicationTablesRows`
-      (`internal/executor/operators_pg_get_publication_tables.go`)
-      emitted `relid` as `NewIntDatum(int64(t.OID))`, while
-      goopg's virtual `pg_catalog.pg_class.oid` stores the
-      relation NAME as text (the v0 convention — see the design
-      note at `catalog.go:707-712`: "regclass casts are no-ops in
-      v0 — pgbench's `oid=$1::pg_catalog.regclass` ends up
-      comparing the bound text parameter (the table name)
-      against pg_class.oid").  `compareDatum(KindInt,
-      KindString)` falls back to `strings.Compare(a.Format(),
-      b.Format())`, so the join evaluates `"16384" = "t"` and
-      never matches; `pg_subscription_rel` stays empty,
-      tablesync's launcher never fires, and the apply worker's
-      `should_apply_changes_for_rel(rel)` returns false for
-      every relation.
-      Fix: emit `relid` as `NewStringDatum(t.Name)` so the SRF
-      aligns with the v0 catalog convention (NULL only when
-      `t.Name == ""`).
-      Pinned by `TestPgGetPublicationTablesRelidMatchesPgClassOid`
-      in `internal/executor/operators_pg_get_publication_tables_test.go`:
-      registers a user table, creates a publication, runs the
-      join shape `SELECT c.relname, gpt.relid FROM pg_class c
-      JOIN (SELECT * FROM pg_get_publication_tables('p')) AS gpt
-      ON gpt.relid = c.oid`, asserts exactly one row with
-      `relname == relid == "items"`.
-      Verification (loop 17): focused executor / planner /
-      analyzer / catalog / parser / server / wal / storage /
-      testport suites recorded at commit time. The `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` stays in place per the
-      rung protocol; the rung-16 diagnosis (tablesync's
-      `fetch_remote_table_info` first sub-query expects
-      `pg_class.oid` to wire-decode as a numeric OID via
-      `DatumGetObjectId`, so when goopg sends the relation name
-      text "t" libpqrcv parses it as uint32 → 0 and the
-      subsequent `WHERE gpt.relid = 0` column-list LATERAL
-      query then matches zero rows) is quoted verbatim in the
-      `t.Skip` message so the next loop resumes from the exact
-      surface.
-      PARTIAL PROGRESS 2026-05-14 (loop 18): closed rung 16 —
-      `pg_class.oid` numeric OID + `relreplident` column. Design
-      doc: `docs/design/0103-0022-pg-class-oid-numeric-and-relreplident.md`
-      (accepted).
-      Diagnosis: rung 15's text-name pg_class.oid convention made
-      libpqrcv's `lrel->remoteid = DatumGetObjectId(c.oid)` parse
-      "t" as uint32 → 0, sinking every subsequent column-list
-      LATERAL probe. Additionally `fetch_remote_table_info`'s
-      first sub-query selects `c.relreplident` which goopg's
-      virtual pg_class did not expose — the probe would have
-      failed with 42703 even before reaching the OID-decode path.
-      Changes:
+      - Root cause: CREATE SUBSCRIPTION's `fetch_table_list_from_publisher`
+        probe uses `LATERAL pg_catalog.pg_get_publication_tables(t.pubname)
+      - AS gpt`. goopg's `parseRangeVar` only matched TVF FROM items
+        with `obj.Schema == ""`, so the schema-qualified form fell
+        into the derived-subquery branch and emitted
+        `syntax error at or near "expected ')' after subquery in FROM
+        (got ()"` at the LATERAL function's opening paren. CREATE
+      - SUBSCRIPTION therefore registered ZERO tables in
+        `pg_subscription_rel`. With no rel state, the apply worker's
+        `should_apply_changes_for_rel(rel)` returns false for every
+        relation and silently skips every change (no error logged —
+      - PG's apply worker has no error path for "relation not in
+        subscription state list").
+      - Fix: extend the TVF FROM-item dispatch gate to accept both
+        unqualified and `pg_catalog`-qualified spellings (via
+        `strings.EqualFold(obj.Schema, "pg_catalog")`) for
+        `generate_series` / `pg_input_error_info` / `parse_ident` /
+        `pg_get_publication_tables`. Behaviour for unqualified calls
+        and for non-`pg_catalog` schemas is unchanged.
+      - Pinned by `TestParseLateralPgCatalogQualifiedSRF` and
+        `TestParseLateralPgCatalogQualifiedSRFCaseInsensitive` in
+        `internal/parser/select_test.go`.
+      - Verification (loop 15): `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/ ./internal/storage/` → all green.
+      - Live-probe run with the `t.Skip` removed (rolled back before
+        commit) confirmed the failure mode shifted observably: the
+        `fetch_table_list` SQL now parses and reaches the executor,
+        where it surfaces the rung-14 surface — `pg_class.relnatts`
+        column missing (SQLSTATE 42703). The `t.Skip` was restored
+        with the rung-14 diagnosis quoted verbatim so the next loop
+        can resume from the exact failing surface.
+      - PARTIAL PROGRESS 2026-05-14 (loop 16): closed rung 14 —
+        `pg_class.relnatts` column missing. Design doc:
+        `docs/design/0103-0020-pg-class-relnatts-column.md` (accepted).
+      - Diagnosis: with rung 13's parser fix in place,
+        `fetch_table_list_from_publisher` reached the executor and
+        raised `42703: column "relnatts" does not exist` on the
+        `(array_length(gpt.attrs,1) = c.relnatts)` CASE test.
+        goopg's on-disk pg_class codec
+        (`internal/catalog/codec.go::PgClassRow.RelNAtts`) already
+        modelled the column for catalog persistence, but the
+        virtual `pg_catalog.pg_class` view in
+        `internal/catalog/catalog.go::registerSystemTables` is a
+        separate construct and had never been extended past its
+        eight-column shape (`oid`, `relname`, `relkind`,
+        `relnamespace`, `relpersistence`, `reltoastrelid`,
+        `relpages`, `relispopulated`).
+      - Fix: added a 9th column `relnatts int4` at ordinal 8, with
+        each row populated as `strconv.Itoa(len(t.Columns))` from
+        inside the existing `VirtualRows` closure (snapshot under
+        `c.mu.RLock`). goopg has no system columns in its catalog,
+        so user-column count matches what upstream PG would report
+        for `pg_class.relnatts` (which already excludes system
+        columns by construction).
+      - Pinned by `TestPgClassExposesRelNatts` in
+        `internal/catalog/catalog_test.go`: registers `t(id int4,
+        v text)`, asserts column declared at ordinal 8 typed int4,
+        and the populated row's relnatts cell equals `"2"`.
+      - Verification (loop 16): `go test -race -count=1 -timeout
+      - 300s ./internal/catalog/ ./internal/planner/
+        ./internal/analyzer/ ./internal/executor/
+        ./internal/server/ ./internal/wal/ ./internal/storage/`
+        — recorded below at commit time.
+      - The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` stays
+        in place per the rung protocol; next rung lands with its
+        own design doc once a live probe surfaces the next gap.
+      - PARTIAL PROGRESS 2026-05-14 (loop 17): closed rung 15 —
+        `pg_get_publication_tables.relid` vs `pg_class.oid` shape
+        mismatch.  Design doc:
+        `docs/design/0103-0021-pg-get-publication-tables-relid-matches-pg-class-oid.md`
+        (accepted).
+      - Diagnosis: lifting `t.Skip` after rung 14 produced a new
+        failure mode — the apply worker connected, decoded every
+        `'w'` frame (acks `recv=0/146` for all four transactions),
+        but `count(*)` on the subscriber stayed at 0. Tablesync
+        never launched. Query-trace `slog.Info` in `handleQuery`
+        revealed that CREATE SUBSCRIPTION sends the PG18
+        `fetch_table_list`:
+        `SELECT DISTINCT n.nspname, c.relname, gpt.attrs`
+        `  FROM pg_class c`
+        `    JOIN pg_namespace n ON n.oid = c.relnamespace`
+        `    JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*`
+        `           FROM pg_publication WHERE pubname IN ( 'p' )) AS gpt`
+        `        ON gpt.relid = c.oid`
+        and the result is zero rows, with no SQL error. Root cause:
+        `buildPgGetPublicationTablesRows`
+        (`internal/executor/operators_pg_get_publication_tables.go`)
+        emitted `relid` as `NewIntDatum(int64(t.OID))`, while
+        goopg's virtual `pg_catalog.pg_class.oid` stores the
+        relation NAME as text (the v0 convention — see the design
+        note at `catalog.go:707-712`: "regclass casts are no-ops in
+        v0 — pgbench's `oid=$1::pg_catalog.regclass` ends up
+        comparing the bound text parameter (the table name)
+        against pg_class.oid").  `compareDatum(KindInt,
+      - KindString)` falls back to `strings.Compare(a.Format(),
+        b.Format())`, so the join evaluates `"16384" = "t"` and
+        never matches; `pg_subscription_rel` stays empty,
+        tablesync's launcher never fires, and the apply worker's
+        `should_apply_changes_for_rel(rel)` returns false for
+        every relation.
+      - Fix: emit `relid` as `NewStringDatum(t.Name)` so the SRF
+        aligns with the v0 catalog convention (NULL only when
+        `t.Name == ""`).
+      - Pinned by `TestPgGetPublicationTablesRelidMatchesPgClassOid`
+        in `internal/executor/operators_pg_get_publication_tables_test.go`:
+        registers a user table, creates a publication, runs the
+        join shape `SELECT c.relname, gpt.relid FROM pg_class c
+      - JOIN (SELECT * FROM pg_get_publication_tables('p')) AS gpt
+      - ON gpt.relid = c.oid`, asserts exactly one row with
+        `relname == relid == "items"`.
+      - Verification (loop 17): focused executor / planner /
+        analyzer / catalog / parser / server / wal / storage /
+        testport suites recorded at commit time. The `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` stays in place per the
+        rung protocol; the rung-16 diagnosis (tablesync's
+        `fetch_remote_table_info` first sub-query expects
+        `pg_class.oid` to wire-decode as a numeric OID via
+        `DatumGetObjectId`, so when goopg sends the relation name
+        text "t" libpqrcv parses it as uint32 → 0 and the
+        subsequent `WHERE gpt.relid = 0` column-list LATERAL
+        query then matches zero rows) is quoted verbatim in the
+        `t.Skip` message so the next loop resumes from the exact
+        surface.
+      - PARTIAL PROGRESS 2026-05-14 (loop 18): closed rung 16 —
+        `pg_class.oid` numeric OID + `relreplident` column. Design
+        doc: `docs/design/0103-0022-pg-class-oid-numeric-and-relreplident.md`
+        (accepted).
+      - Diagnosis: rung 15's text-name pg_class.oid convention made
+        libpqrcv's `lrel->remoteid = DatumGetObjectId(c.oid)` parse
+        "t" as uint32 → 0, sinking every subsequent column-list
+      - LATERAL probe. Additionally `fetch_remote_table_info`'s
+        first sub-query selects `c.relreplident` which goopg's
+        virtual pg_class did not expose — the probe would have
+        failed with 42703 even before reaching the OID-decode path.
+      - Changes:
       - `internal/catalog/catalog.go::registerSystemTables`:
         pg_class.oid column type `text` → `oid`, value emits
         `strconv.Itoa(int(t.OID))` instead of `t.Name`. New
@@ -3280,7 +3406,7 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `oid=$1::regclass` shapes keep resolving correctly after
         the v0 text-name flip. Numeric inputs pass through;
         other `reg*` casts are unchanged stubs.
-      Tests:
+      - Tests:
       - `internal/catalog/catalog_test.go::TestPgClassExposesRelReplident`
         — pins column existence, declared type `char`, and
         populated cell `"d"`.
@@ -3292,36 +3418,36 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         updated from rung-15's text-name assertion to rung-16's
         numeric-OID assertion (`rows[0][1].StringValue() ==
         strconv.Itoa(int(tbl.OID))`).
-      Verification (loop 18): `go test -count=1 -timeout 300s
-      ./internal/catalog/ ./internal/executor/ ./internal/planner/
-      ./internal/analyzer/ ./internal/server/ ./internal/parser/
-      ./internal/wal/ ./internal/storage/` → all green.
-      `TestSlotDecoderRunDrivesPluginThroughCommit` is a known
-      pre-existing 2 s timing-sensitive flake (passes solo on
-      retry, also flakes on master); not introduced by this loop.
-      The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` was
-      updated with the rung-17 surface (next libpqrcv probe is
-      likely the pg_attribute / pg_get_replica_identity_index
-      column-types query) per the rung protocol so the next loop
-      resumes from the exact failing surface.
-      CLOSED 2026-05-14 (loop 19): M0103-0008 SCENARIO B PASSES
-      END-TO-END. Design doc:
-      `docs/design/0103-0023-m0103-0008-scenario-b-closure.md`
-      (accepted). Lifting the `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` produced a fully green
-      run on first try — no rung-17 work was needed. The
-      hypothesised pg_attribute / pg_get_replica_identity_index
-      column-types probe was already satisfied: goopg's virtual
-      `pg_attribute` view exposes attnum/attname/atttypid/
-      attisdropped/attgenerated, and the
-      `pg_get_replica_identity_index(oid)` builtin returns 0
-      (InvalidOid) — equivalent to upstream's REPLICA IDENTITY
-      DEFAULT semantics, so the LEFT JOIN drops all rows and the
-      outer `attnum = ANY(i.indkey)` evaluates as false. Rung 16's
-      `pg_class.oid` numeric flip + `relreplident` column was the
-      keystone — every subsequent probe in the libpqrcv ladder
-      pivots off that one column shape.
-      Observed end-to-end behaviour:
+      - Verification (loop 18): `go test -count=1 -timeout 300s
+        ./internal/catalog/ ./internal/executor/ ./internal/planner/
+        ./internal/analyzer/ ./internal/server/ ./internal/parser/
+        ./internal/wal/ ./internal/storage/` → all green.
+        `TestSlotDecoderRunDrivesPluginThroughCommit` is a known
+        pre-existing 2 s timing-sensitive flake (passes solo on
+        retry, also flakes on master); not introduced by this loop.
+      - The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` was
+        updated with the rung-17 surface (next libpqrcv probe is
+        likely the pg_attribute / pg_get_replica_identity_index
+        column-types query) per the rung protocol so the next loop
+        resumes from the exact failing surface.
+      - CLOSED 2026-05-14 (loop 19): M0103-0008 SCENARIO B PASSES
+      - END-TO-END. Design doc:
+        `docs/design/0103-0023-m0103-0008-scenario-b-closure.md`
+        (accepted). Lifting the `t.Skip` on
+        `TestPort_PgoutputInteropGoopgToPG` produced a fully green
+        run on first try — no rung-17 work was needed. The
+        hypothesised pg_attribute / pg_get_replica_identity_index
+        column-types probe was already satisfied: goopg's virtual
+        `pg_attribute` view exposes attnum/attname/atttypid/
+        attisdropped/attgenerated, and the
+        `pg_get_replica_identity_index(oid)` builtin returns 0
+        (InvalidOid) — equivalent to upstream's REPLICA IDENTITY
+      - DEFAULT semantics, so the LEFT JOIN drops all rows and the
+        outer `attnum = ANY(i.indkey)` evaluates as false. Rung 16's
+        `pg_class.oid` numeric flip + `relreplident` column was the
+        keystone — every subsequent probe in the libpqrcv ladder
+        pivots off that one column shape.
+      - Observed end-to-end behaviour:
       - libpqrcv ladder runs cleanly: `fetch_table_list` returns
         `(public, t, NULL)`, `fetch_remote_table_info` returns
         `relreplident='d'` + numeric `pg_class.oid`, column-types
@@ -3334,38 +3460,39 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `(id=2, v='updated')`; `pg_replication_origin_status.
         remote_lsn` advances to a non-zero LSN
         (observed `0/A638` in one run).
-      Changes in loop 19:
+      - Changes in loop 19:
       - `internal/testport/pgoutput_interop_test.go`:
         dropped the `t.Skip` guard and replaced the rung-17-OPEN
         comment with a rung-17-CLOSED closure pointer at the new
         design doc.
-      Verification (loop 19): `go test -count=1 -timeout 60s
-      -run TestPort_PgoutputInteropGoopgToPG ./internal/testport/`
-      → PASS, 5/5 consecutive runs at 1.6–1.8 s each (full PG
-      cluster bring-up, initdb, pg_ctl start, CREATE
-      SUBSCRIPTION, WAL stream, apply, tear-down). Broader sweep:
-      `go test -race -count=1 -timeout 300s
-      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
-      ./internal/executor/ ./internal/server/ ./internal/wal/
-      ./internal/catalog/ ./internal/storage/` → all green
-      (recorded at commit time).
-      With M0103-0008 closed, the only remaining sub-milestone in
-      M0103 is M0103-0009 (close milestone — CSV row additions
-      and inventory bump).
+      - Verification (loop 19): `go test -count=1 -timeout 60s
+        -run TestPort_PgoutputInteropGoopgToPG ./internal/testport/`
+        → PASS, 5/5 consecutive runs at 1.6–1.8 s each (full PG
+        cluster bring-up, initdb, pg_ctl start, CREATE
+      - SUBSCRIPTION, WAL stream, apply, tear-down). Broader sweep:
+        `go test -race -count=1 -timeout 300s
+        ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/server/ ./internal/wal/
+        ./internal/catalog/ ./internal/storage/` → all green
+        (recorded at commit time).
+      - With M0103-0008 closed, the only remaining sub-milestone in
+      - M0103 is M0103-0009 (close milestone — CSV row additions
+        and inventory bump).
 
-- [ ] **M0103-0009** — Close milestone.
-      Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
-      `e2e-logical-failover-pg-to-goopg-async`,
-      `e2e-logical-failover-pg-to-goopg-sync`,
-      `e2e-logical-failover-goopg-to-pg-async`,
-      `e2e-logical-failover-goopg-to-pg-sync` — all at `status=port`,
-      `pass_required=yes`. Regenerate the `.md` via
-      `go run ./cmd/gen-oracle-port-status`. Flip
-      `docs/milestones/0103-heterogeneous-logical-replication-failover-e2e.md`
-      status to `accepted` and update the `docs/milestones/README.md` index
-      row. Mark all 5 design docs (`0103-0001..-0005`) as `accepted`. Run
-      the regression suites listed in the milestone DoD and confirm zero
-      regressions.
+- [ ] **M0103-0009**
+      - Summary: Close milestone.
+      - Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
+        `e2e-logical-failover-pg-to-goopg-async`,
+        `e2e-logical-failover-pg-to-goopg-sync`,
+        `e2e-logical-failover-goopg-to-pg-async`,
+        `e2e-logical-failover-goopg-to-pg-sync` — all at `status=port`,
+        `pass_required=yes`. Regenerate the `.md` via
+        `go run ./cmd/gen-oracle-port-status`. Flip
+        `docs/milestones/0103-heterogeneous-logical-replication-failover-e2e.md`
+        status to `accepted` and update the `docs/milestones/README.md` index
+        row. Mark all 5 design docs (`0103-0001..-0005`) as `accepted`. Run
+        the regression suites listed in the milestone DoD and confirm zero
+        regressions.
 
 ## M0104 — SERIALIZABLE isolation via SSI anomaly prevention (filed 2026-05-14)
 
@@ -3378,39 +3505,47 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md` (draft).
 
 ### Sub-milestones
 
-- [ ] **M0104-0001** — GUC parity + SERIALIZABLE mapping correction.
-      Keep PostgreSQL GUC names (`default_transaction_isolation`,
-      `transaction_isolation`) and enum values; remove runtime aliasing of
-      SERIALIZABLE to REPEATABLE READ in the MVCC isolation parser/path.
+- [ ] **M0104-0001**
+      - Summary: GUC parity + SERIALIZABLE mapping correction.
+      - Keep PostgreSQL GUC names (`default_transaction_isolation`,
+        `transaction_isolation`) and enum values; remove runtime aliasing of
+      - SERIALIZABLE to REPEATABLE READ in the MVCC isolation parser/path.
 
-- [ ] **M0104-0002** — Serializable transaction-state lifecycle.
-      Introduce per-transaction SSI registration/cleanup state and wire it to
-      transaction begin/commit/abort boundaries.
+- [ ] **M0104-0002**
+      - Summary: Serializable transaction-state lifecycle.
+      - Introduce per-transaction SSI registration/cleanup state and wire it to
+        transaction begin/commit/abort boundaries.
 
-- [ ] **M0104-0003** — Predicate-lock substrate (SIREAD).
-      Implement predicate-lock target tracking (relation/page/tuple and range
-      abstraction for phantom prevention) plus lock coarsening policy.
+- [ ] **M0104-0003**
+      - Summary: Predicate-lock substrate (SIREAD).
+      - Implement predicate-lock target tracking (relation/page/tuple and range
+        abstraction for phantom prevention) plus lock coarsening policy.
 
-- [ ] **M0104-0004** — Read-path SSI conflict-in hooks.
-      On serializable reads, register conflict-in edges against concurrent
-      writers touching protected targets.
+- [ ] **M0104-0004**
+      - Summary: Read-path SSI conflict-in hooks.
+      - On serializable reads, register conflict-in edges against concurrent
+        writers touching protected targets.
 
-- [ ] **M0104-0005** — Write-path SSI conflict-out hooks.
-      On serializable writes, detect active SIREAD coverage and register
-      conflict-out edges against concurrent serializable readers.
+- [ ] **M0104-0005**
+      - Summary: Write-path SSI conflict-out hooks.
+      - On serializable writes, detect active SIREAD coverage and register
+        conflict-out edges against concurrent serializable readers.
 
-- [ ] **M0104-0006** — Pre-commit dangerous-structure detection.
-      Add pre-commit serialization-failure checks and abort with SQLSTATE
-      `40001` when rw-conflict graph conditions require rollback.
+- [ ] **M0104-0006**
+      - Summary: Pre-commit dangerous-structure detection.
+      - Add pre-commit serialization-failure checks and abort with SQLSTATE
+        `40001` when rw-conflict graph conditions require rollback.
 
-- [ ] **M0104-0007** — Oracle isolation-test promotion for SSI coverage.
-      Promote applicable deferred D-002 serializable/predicate specs to
-      pass-required and verify stable passing in `internal/testport`.
+- [ ] **M0104-0007**
+      - Summary: Oracle isolation-test promotion for SSI coverage.
+      - Promote applicable deferred D-002 serializable/predicate specs to
+        pass-required and verify stable passing in `internal/testport`.
 
-- [ ] **M0104-0008** — Milestone closeout.
-      Update milestone/design statuses and index rows, run required regression
-      gates, and close M0104 only after SERIALIZABLE anomaly-prevention DoD is
-      evidenced.
+- [ ] **M0104-0008**
+      - Summary: Milestone closeout.
+      - Update milestone/design statuses and index rows, run required regression
+        gates, and close M0104 only after SERIALIZABLE anomaly-prevention DoD is
+        evidenced.
 
 ## Completed
 

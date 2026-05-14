@@ -1443,6 +1443,108 @@ func TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "note IS NULL", 0, 5*time.Second)
 }
 
+// TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex pins
+// rung 12 of M0103-0007: the apply-worker's no-OldTuple key-synthesis
+// path when REPLICA IDENTITY USING INDEX names a NON-PRIMARY unique
+// index as the row-locator. Under DEFAULT the rung-2 `primaryKeyOnlyRow`
+// fallback resolves correctly because the identity columns ARE the PK;
+// under USING INDEX the publisher and subscriber may not share a PK at
+// all, so the apply worker must read the per-column identity flags
+// (LOGICALREP_IS_REPLICA_IDENTITY, bit 0 of DecodedAttr.Flags) from the
+// Relation message instead.
+//
+// Workload: publisher has table `t (k int, v text)` with no PK but a
+// UNIQUE index `t_k_uniq (k)`; `ALTER TABLE t REPLICA IDENTITY USING
+// INDEX t_k_uniq`. Subscriber declares the same columns with no
+// constraints. Three INSERTs, one UPDATE that does NOT touch `k` (so
+// pgoutput omits OldTuple — the rung-12 path), one DELETE keyed on `k`.
+//
+// Assertions through fresh `database/sql` sessions verify:
+//   - All three inserts replicate.
+//   - The UPDATE locates row k=2 by the identity-column key and updates v.
+//   - The DELETE removes the right row.
+//
+// Without rung 12 the UPDATE would silently drop (the rung-2 fallback
+// returns nil because the subscriber has no PK).
+//
+// Design doc: docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md.
+func TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-rid-idx")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_rid_idx"
+	psc := pubsubcluster.NewMixed(t, "pg2g_ridx", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90 * time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Publisher: no PRIMARY KEY; a unique index on `k` only; REPLICA
+	// IDENTITY pointed at that non-PK index. Subscriber: same columns
+	// with NO constraints at all — exercises the case where the
+	// subscriber can't fall back to a local PK.
+	// `k` must be NOT NULL — upstream rejects USING INDEX on an index
+	// whose columns are nullable (the unique guarantee doesn't include
+	// NULL keys, so it can't identify a row).
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (k int NOT NULL, v text)")
+	psc.Publisher.Exec(t, "CREATE UNIQUE INDEX t_k_uniq ON public.t (k)")
+	psc.Publisher.Exec(t, "ALTER TABLE public.t REPLICA IDENTITY USING INDEX t_k_uniq")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (k int, v text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'a')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'b')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (3, 'c')")
+	// UPDATE does NOT touch identity column `k`. pgoutput therefore
+	// omits OldTuple; the apply worker must synthesise the key from
+	// newRow using the Relation-message identity flag on `k`.
+	psc.Publisher.Exec(t, "UPDATE public.t SET v = 'bb' WHERE k = 2")
+	// DELETE keyed on identity column; pgoutput emits 'K' + key-only
+	// old tuple, which the existing applyDelete path handles
+	// regardless of which index backs the identity.
+	psc.Publisher.Exec(t, "DELETE FROM public.t WHERE k = 1")
+
+	// Fresh `database/sql` sessions for every assertion. Subscriber
+	// has no PK and no unique index, so every probe goes through
+	// SeqScan with predicate equality on `k`.
+	psc.WaitForRow(t, "public.t", "1=1", 2, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "k = 2 AND v = 'bb'", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "k = 1", 0, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "k = 3 AND v = 'c'", 1, 30*time.Second)
+	// Negative pin: the UPDATE didn't silently drop into a stale
+	// 'b' row (would happen if rung-12 wasn't wired and applyUpdate
+	// fell back to primaryKeyOnlyRow → nil → silent skip).
+	psc.WaitForRow(t, "public.t", "k = 2 AND v = 'b'", 0, 5*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

@@ -354,12 +354,22 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 			return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
 		}
 	} else {
-		oldKeyRow = primaryKeyOnlyRow(w.cat, r.local, newRow)
+		// Rung 12: prefer the wire's per-column identity flags
+		// (LOGICALREP_IS_REPLICA_IDENTITY, bit 0 of DecodedAttr.Flags)
+		// so REPLICA IDENTITY USING INDEX on a non-PK unique index
+		// resolves correctly even when the subscriber declares no PK.
+		// Falls back to the subscriber-side PK lookup when the stream
+		// carries no identity hints (older or corrupt publishers).
+		oldKeyRow = replicaIdentityKeyRow(r.remote.Columns, r.local.Columns, newRow)
 		if oldKeyRow == nil {
-			// No primary key — there's no safe way to locate
-			// the pre-image row from a no-old-tuple UPDATE.
-			// Same conservative behaviour the prior path took
-			// for any empty OldTuple, just made explicit.
+			oldKeyRow = primaryKeyOnlyRow(w.cat, r.local, newRow)
+		}
+		if oldKeyRow == nil {
+			// No identity hint AND no subscriber PK — there's no
+			// safe way to locate the pre-image row from a
+			// no-old-tuple UPDATE. Same conservative behaviour
+			// the prior path took for any empty OldTuple, just
+			// made explicit.
 			return nil
 		}
 	}
@@ -666,6 +676,53 @@ func primaryKeyOnlyRow(cat catalog.Catalog, tbl *catalog.Table, full Row) Row {
 				break
 			}
 		}
+	}
+	return key
+}
+
+// replicaIdentityKeyRow synthesises a row-locator key from `newRow` using
+// the publisher's per-column identity flags carried on each Relation-message
+// attribute. It is the rung-12 (M0103-0007) replacement for `primaryKeyOnlyRow`
+// in `applyUpdate`'s no-OldTuple branch: where `primaryKeyOnlyRow` looked up
+// the subscriber-side PRIMARY KEY columns, this helper consults the wire's
+// `LOGICALREP_IS_REPLICA_IDENTITY` bit (Flags & 0x01) so REPLICA IDENTITY
+// USING INDEX — where the publisher's identity columns belong to a non-PK
+// unique index — resolves correctly even when the subscriber declares no PK
+// at all.
+//
+// Mirrors upstream PG: `logicalrep_write_attrs` sets the bit on each column
+// covered by the active REPLICA IDENTITY (PK for DEFAULT, all columns for
+// FULL, the chosen unique-index columns for USING INDEX, none for NOTHING).
+// `rowMatchesKey` ignores NullDatum cells, so the returned partial-key Row
+// matches the heap by exactly the columns the publisher named.
+//
+// Returns nil when no remote column carries the identity flag — older or
+// corrupt streams without identity hints fall back to `primaryKeyOnlyRow` in
+// `applyUpdate`. Design doc:
+// docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md.
+func replicaIdentityKeyRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, newRow Row) Row {
+	if len(newRow) != len(localCols) {
+		return nil
+	}
+	key := make(Row, len(localCols))
+	for i := range key {
+		key[i] = NullDatum
+	}
+	any := false
+	for _, rc := range remoteCols {
+		if rc.Flags&0x01 == 0 {
+			continue
+		}
+		for j, lc := range localCols {
+			if lc.Name == rc.Name {
+				key[j] = newRow[j]
+				any = true
+				break
+			}
+		}
+	}
+	if !any {
+		return nil
 	}
 	return key
 }

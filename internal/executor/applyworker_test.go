@@ -158,6 +158,95 @@ func TestPrimaryKeyOnlyRow(t *testing.T) {
 	}
 }
 
+// TestReplicaIdentityKeyRow pins the rung-12 (M0103-0007) helper that
+// supersedes `primaryKeyOnlyRow` in `applyUpdate`'s no-OldTuple branch.
+// `replicaIdentityKeyRow` consults the publisher's per-column identity
+// flags (`Flags & 0x01 == LOGICALREP_IS_REPLICA_IDENTITY`) rather than
+// the subscriber-side catalog, so REPLICA IDENTITY USING INDEX on a
+// non-PK unique index resolves to the right row-locator key regardless
+// of whether the subscriber declares a PK.
+//
+// Design doc:
+// docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md.
+func TestReplicaIdentityKeyRow(t *testing.T) {
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+	}
+	newRow := Row{NewIntDatum(7), NewIntDatum(42), NewStringDatum("alpha")}
+
+	t.Run("pk_columns_flagged", func(t *testing.T) {
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x01}, // PK column
+			{Name: "a", TypeOID: 23, Flags: 0x00},
+			{Name: "v", TypeOID: 25, Flags: 0x00},
+		}
+		key := replicaIdentityKeyRow(remoteCols, localCols, newRow)
+		if key == nil {
+			t.Fatal("got nil, want non-nil key (PK flag set)")
+		}
+		if key[0].Int != 7 {
+			t.Errorf("key[0].Int = %d want 7 (id)", key[0].Int)
+		}
+		if !key[1].IsNull() {
+			t.Errorf("key[1] = %v want NullDatum (a is non-identity)", key[1])
+		}
+		if !key[2].IsNull() {
+			t.Errorf("key[2] = %v want NullDatum (v is non-identity)", key[2])
+		}
+	})
+
+	t.Run("non_pk_unique_index_columns_flagged", func(t *testing.T) {
+		// REPLICA IDENTITY USING INDEX on a composite unique (a, v).
+		// `id` is NOT flagged — even if the subscriber declares it as
+		// PRIMARY KEY, the key row must restrict to (a, v).
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x00},
+			{Name: "a", TypeOID: 23, Flags: 0x01},
+			{Name: "v", TypeOID: 25, Flags: 0x01},
+		}
+		key := replicaIdentityKeyRow(remoteCols, localCols, newRow)
+		if key == nil {
+			t.Fatal("got nil, want non-nil key (non-PK identity flags set)")
+		}
+		if !key[0].IsNull() {
+			t.Errorf("key[0] = %v want NullDatum (id is non-identity in USING INDEX)", key[0])
+		}
+		if key[1].Int != 42 {
+			t.Errorf("key[1].Int = %d want 42 (a is identity)", key[1].Int)
+		}
+		if key[2].StringValue() != "alpha" {
+			t.Errorf("key[2] = %q want \"alpha\" (v is identity)", key[2].StringValue())
+		}
+	})
+
+	t.Run("no_flags_returns_nil", func(t *testing.T) {
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x00},
+			{Name: "a", TypeOID: 23, Flags: 0x00},
+			{Name: "v", TypeOID: 25, Flags: 0x00},
+		}
+		// All-zero Flags is the "REPLICA IDENTITY NOTHING" / corrupt
+		// stream case; applyUpdate falls back to primaryKeyOnlyRow.
+		if got := replicaIdentityKeyRow(remoteCols, localCols, newRow); got != nil {
+			t.Errorf("no-flags case: got %v want nil", got)
+		}
+	})
+
+	t.Run("row_length_mismatch_returns_nil", func(t *testing.T) {
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x01},
+		}
+		// newRow shorter than localCols — defensive guard against
+		// callers passing partially-built rows.
+		short := Row{NewIntDatum(7)}
+		if got := replicaIdentityKeyRow(remoteCols, localCols, short); got != nil {
+			t.Errorf("row-length mismatch: got %v want nil", got)
+		}
+	})
+}
+
 // TestApplyWorkerDecodeReturnsUnchangedMask pins the rung-5 contract:
 // `decodePgoutputTupleAsRow` accepts the upstream `'u'` (unchanged
 // TOAST) per-column status code, returns NullDatum for that slot, and
