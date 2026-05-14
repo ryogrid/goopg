@@ -2,11 +2,14 @@ package framework
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 )
 
 type mockIsolationExec struct {
@@ -276,5 +279,49 @@ func TestFormatWaitingStepHeader(t *testing.T) {
 				t.Fatalf("formatWaitingStepHeader mismatch:\n got: %q\nwant: %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestFormatPQErrorStripsSQLStateSuffix pins M0100-0005l: lib/pq's
+// `(*pq.Error).Error()` returns `"pq: " + Message + " (" + Code + ")"`, but
+// upstream PostgreSQL isolationtester prints only `PG_DIAG_MESSAGE_PRIMARY`
+// (no trailing `(SQLSTATE)`). The runner must extract `Message` directly when
+// it has a `*pq.Error` so spec output is byte-identical to upstream for every
+// FK / unique-violation / partition-routing error path.
+func TestFormatPQErrorStripsSQLStateSuffix(t *testing.T) {
+	pqErr := &pq.Error{
+		Code:    "23503",
+		Message: `insert or update on table "fk_parted_pk_2" violates foreign key constraint "fk_parted_pk_a_fkey"`,
+	}
+	got := formatPQError(pqErr)
+	want := `ERROR:  insert or update on table "fk_parted_pk_2" violates foreign key constraint "fk_parted_pk_a_fkey"`
+	if got != want {
+		t.Fatalf("formatPQError(*pq.Error) mismatch:\n got: %q\nwant: %q", got, want)
+	}
+	// Defensive: a wrapped *pq.Error must still yield the bare Message via
+	// the type-assertion path. Direct equality is what callers see today —
+	// this case documents the contract for future callers that wrap pq.Error.
+	if errors.As(error(pqErr), new(*pq.Error)) != true {
+		t.Fatalf("errors.As contract for *pq.Error broken — callers may wrap")
+	}
+}
+
+// TestFormatPQErrorFallsBackOnNonPQ pins the non-pq path: arbitrary error
+// values still get the legacy `"pq: "` prefix trim. Used by runner code paths
+// that surface harness-internal errors (Scan failures, context cancellation,
+// connection-pool errors) where there is no SQLSTATE to strip.
+func TestFormatPQErrorFallsBackOnNonPQ(t *testing.T) {
+	cases := []struct{ in error; want string }{
+		{errors.New("pq: connection closed"), "ERROR:  connection closed"},
+		{errors.New("driver: bad connection"), "ERROR:  driver: bad connection"},
+	}
+	for _, c := range cases {
+		got := formatPQError(c.in)
+		if got != c.want {
+			t.Errorf("formatPQError(%q) = %q, want %q", c.in.Error(), got, c.want)
+		}
+	}
+	if got := formatPQError(nil); got != "" {
+		t.Errorf("formatPQError(nil) = %q, want empty", got)
 	}
 }

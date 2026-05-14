@@ -1411,6 +1411,42 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/ ./internal/planner/ ./internal/parser/
           ./internal/analyzer/` PASS.  Design:
           `docs/design/0100-0005k-fk-violation-error-shape.md`.
+        - IsolationRunner strips lib/pq `(SQLSTATE)` suffix
+          (M0100-0005l, 2026-05-15 loop 28).  `formatPQError`
+          (`internal/testport/framework/isolation_runner.go`) now
+          detects `*pq.Error` and emits `pqErr.Message` directly.
+          lib/pq v1.12.3 `(*Error).Error()` returns `"pq: " +
+          Message + " (" + Code + ")"` (`error.go:177-195`);
+          upstream PostgreSQL isolationtester prints only
+          `PG_DIAG_MESSAGE_PRIMARY`, so every FK / unique-violation
+          / partition-routing error line in the 21-spec target was
+          carrying an extraneous trailing ` (<code>)`.  fk-snapshot
+          L21 actual went from
+          `ERROR:  insert or update on table "fk_parted_pk"
+          violates foreign key constraint "fk_parted_pk_a_fkey"
+          (23503)` to `ERROR:  insert or update on table
+          "fk_parted_pk" violates foreign key constraint
+          "fk_parted_pk_a_fkey"` post-fix — byte-identical to
+          upstream apart from the still-known partition-routed
+          name (`fk_parted_pk_2`, tracked under M0100-0005k
+          follow-up).  Non-pq errors fall back to the legacy
+          `"pq: "` trim path for harness-internal failures (Scan,
+          context cancellation).  Wire-layer
+          `writeQueryError` (`internal/server/query.go:237`) was
+          already correct (Message and SQLSTATE on separate
+          ErrorResponse fields); the fault was lib/pq's
+          stringifier.  Regression pins:
+          `TestFormatPQErrorStripsSQLStateSuffix` (byte-equal
+          against the upstream fk-snapshot L21 shape +
+          `errors.As` contract documentation),
+          `TestFormatPQErrorFallsBackOnNonPQ` (non-pq path with
+          and without the legacy `"pq: "` prefix + nil-error
+          sentinel) in
+          `internal/testport/framework/isolation_test.go`.
+          `go test -race ./internal/testport/framework/
+          ./internal/executor/ ./internal/server/` PASS.
+          Design:
+          `docs/design/0100-0005l-formatpqerror-strip-sqlstate-suffix.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

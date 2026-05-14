@@ -606,9 +606,20 @@ func execConnCapture(ctx context.Context, conn *sql.Conn, sqlText string) string
 }
 
 // formatPQError formats a database error as isolationtester would print it.
+//
+// lib/pq's `(*pq.Error).Error()` returns `"pq: " + Message + " (" + Code + ")"`
+// (vendored v1.12.3, error.go:177-195). Upstream PostgreSQL isolationtester
+// prints only the libpq `PG_DIAG_MESSAGE_PRIMARY` field — there is no trailing
+// `(SQLSTATE)` decoration. M0100-0005l: extract `Message` directly when err is
+// a `*pq.Error` so the harness emits byte-identical output to upstream for
+// every spec that surfaces an error (fk-snapshot L21, partition-key-update,
+// etc.). Non-pq errors fall back to the legacy `"pq: "` trim path.
 func formatPQError(err error) string {
 	if err == nil {
 		return ""
+	}
+	if pqErr, ok := err.(*pq.Error); ok {
+		return "ERROR:  " + pqErr.Message
 	}
 	msg := err.Error()
 	if strings.HasPrefix(msg, "pq: ") {
