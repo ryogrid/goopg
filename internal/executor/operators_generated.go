@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -156,8 +157,38 @@ func evalGenExpr(e parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
 		}
 		return operand, nil
 
+	case *parser.FuncCall:
+		return evalGenFuncCall(x)
+
 	}
 
+	return NullDatum, nil
+}
+
+// evalGenFuncCall evaluates the zero-arg time functions that the catalog
+// DEFAULT-eval slow path supports (M0103-0007 rung 18). Calls with
+// arguments, a star arg, or a schema qualifier other than pg_catalog
+// fall through to NullDatum so unknown shapes leave the slot untouched
+// (matching the rest of evalGenExpr's silent-passthrough contract).
+//
+// Wall-clock is read per call rather than threaded through ctx.Now —
+// see docs/design/0103-0041 for the bounded-skew rationale.
+func evalGenFuncCall(x *parser.FuncCall) (Datum, error) {
+	if len(x.Args) != 0 || x.Star {
+		return NullDatum, nil
+	}
+	if x.Name.Schema != "" && x.Name.Schema != "pg_catalog" {
+		return NullDatum, nil
+	}
+	now := time.Now().UTC()
+	switch strings.ToLower(x.Name.Name) {
+	case "now", "current_timestamp",
+		"transaction_timestamp", "statement_timestamp":
+		return NewTimeDatum(now), nil
+	case "current_date":
+		return NewTimeDatum(time.Date(now.Year(), now.Month(), now.Day(),
+			0, 0, 0, 0, time.UTC)), nil
+	}
 	return NullDatum, nil
 }
 

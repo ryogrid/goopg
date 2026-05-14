@@ -2,6 +2,7 @@ package executor
 
 import (
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -347,6 +348,159 @@ func TestInsertDoesNotOverrideExplicitColumnDefault(t *testing.T) {
 	}
 	if got := rows[0][1].StringValue(); got != "explicit" {
 		t.Errorf("note: got %q want %q — explicit value must beat DEFAULT", got, "explicit")
+	}
+}
+
+
+// TestInsertFillsMissingColumnDefaultCurrentTimestamp pins M0103-0007 rung 18:
+// a CREATE TABLE DEFAULT of current_timestamp (parser shape: *parser.FuncCall
+// with Name.Name=="current_timestamp", zero Args) must evaluate to wall-clock
+// at INSERT time and store a non-NULL KindTime Datum on every row that
+// omitted the column. Bounded-skew window guards both correctness (the slot
+// didn't get a fixed sentinel or init()-time clock) and order (the helper
+// ran before the heap write, not after).
+func TestInsertFillsMissingColumnDefaultCurrentTimestamp(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	cim := cat.(*catalog.InMemory)
+	// DEFAULT current_timestamp — parser emits FuncCall with no Args.
+	defExpr := &parser.FuncCall{
+		Name: parser.ObjectName{Name: "current_timestamp"},
+	}
+	if _, err := cim.CreateTable(parser.ObjectName{Name: "audit_ts"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "created_at", Type: catalog.Type{Name: "timestamptz"},
+			DefaultExpr: defExpr},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "audit_ts"})
+
+	insertPlan := &planner.Insert{
+		Table: tbl,
+		Source: &planner.Values{
+			Rows: [][]planner.Expr{
+				{&planner.IntegerConst{Value: 1}},
+			},
+		},
+		// INSERT INTO audit_ts (id) VALUES (1) — created_at omitted, DEFAULT fires.
+		ColumnIndex: []int{0},
+	}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	before := time.Now().UTC()
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+	after := time.Now().UTC()
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("scan returned %d rows want 1", len(rows))
+	}
+	got := rows[0]
+	if got[1].IsNull() {
+		t.Fatalf("created_at: got NULL — DEFAULT current_timestamp not evaluated")
+	}
+	if got[1].Kind != KindTime {
+		t.Fatalf("created_at.Kind: got %v want KindTime", got[1].Kind)
+	}
+	gotTime := got[1].TimeValue()
+	// Allow 1 ms slop on each side for clock-resolution differences between
+	// the pre-Open before-stamp and the actual evalGenFuncCall call site.
+	loBound := before.Add(-1 * time.Millisecond)
+	hiBound := after.Add(1 * time.Millisecond)
+	if gotTime.Before(loBound) || gotTime.After(hiBound) {
+		t.Errorf("created_at: got %v, want in [%v, %v]", gotTime, loBound, hiBound)
+	}
+}
+
+// TestInsertFillsMissingColumnDefaultCurrentDate pins M0103-0007 rung 18:
+// DEFAULT current_date evaluates to today at midnight UTC. The
+// midnight-truncation pin catches an accidental fallthrough to the
+// current_timestamp arm.
+func TestInsertFillsMissingColumnDefaultCurrentDate(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	cim := cat.(*catalog.InMemory)
+	defExpr := &parser.FuncCall{
+		Name: parser.ObjectName{Name: "current_date"},
+	}
+	if _, err := cim.CreateTable(parser.ObjectName{Name: "audit_date"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "ymd", Type: catalog.Type{Name: "date"},
+			DefaultExpr: defExpr},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "audit_date"})
+
+	insertPlan := &planner.Insert{
+		Table: tbl,
+		Source: &planner.Values{
+			Rows: [][]planner.Expr{
+				{&planner.IntegerConst{Value: 1}},
+			},
+		},
+		ColumnIndex: []int{0},
+	}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := time.Now().UTC()
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("scan returned %d rows want 1", len(rows))
+	}
+	got := rows[0][1]
+	if got.IsNull() {
+		t.Fatalf("ymd: got NULL — DEFAULT current_date not evaluated")
+	}
+	if got.Kind != KindTime {
+		t.Fatalf("ymd.Kind: got %v want KindTime", got.Kind)
+	}
+	gotTime := got.TimeValue()
+	if gotTime.Hour() != 0 || gotTime.Minute() != 0 || gotTime.Second() != 0 || gotTime.Nanosecond() != 0 {
+		t.Errorf("ymd: got %v want midnight-truncated", gotTime)
+	}
+	if gotTime.Year() != expected.Year() || gotTime.Month() != expected.Month() || gotTime.Day() != expected.Day() {
+		t.Errorf("ymd: got date %d-%02d-%02d want %d-%02d-%02d",
+			gotTime.Year(), gotTime.Month(), gotTime.Day(),
+			expected.Year(), expected.Month(), expected.Day())
 	}
 }
 

@@ -2781,6 +2781,82 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         ./internal/analyzer/ ./internal/executor/ ./internal/catalog/
         ./internal/server/ ./internal/wal/` → all green
         (executor 1.176 s, server 1.792 s, wal 1.893 s).
+      - PARTIAL PROGRESS 2026-05-14 (rung 18): zero-arg time
+        functions in DEFAULT expressions — the smallest fixture-
+        surfacing subset of the deferred "richer DEFAULT
+        evaluator" item. Design doc:
+        `docs/design/0103-0041-m0103-0007-rung-18-default-time-funcs.md`
+        (accepted). Before this rung a column declared `DEFAULT
+        now()` or `DEFAULT current_timestamp` silently stored
+        NULL: rungs 13/14's `applyDefaultsForMissing` called
+        `evalGenExpr` which had no `*parser.FuncCall` case, so
+        FuncCall nodes fell through to `return NullDatum, nil`.
+        Apply-worker and dispatcher INSERT paths both leaked the
+        gap — pgoutput-replicated rows that the subscriber
+        extended with `created_at timestamptz DEFAULT now()`
+        landed NULL, and `INSERT INTO t (id) VALUES (1)` against
+        the same shape on goopg's own dispatcher path landed
+        NULL too.
+      - Fix is a single edit point: `internal/executor/operators_generated.go`
+        gains a `*parser.FuncCall` case in `evalGenExpr` that
+        delegates to a new helper `evalGenFuncCall`. The helper
+        short-circuits to `NullDatum` for any of (args != 0,
+        Star=true, schema other than empty/`pg_catalog`), then
+        matches a small zero-arg whitelist (`now`,
+        `current_timestamp`, `transaction_timestamp`,
+        `statement_timestamp` → `NewTimeDatum(time.Now().UTC())`;
+        `current_date` → midnight-truncated). Unknown niladic
+        functions stay at NullDatum so the rest of evalGenExpr's
+        silent-passthrough contract is preserved — a column
+        whose DEFAULT is unevaluable surfaces as a NOT NULL
+        violation rather than a silent overwrite.
+      - Why `time.Now()` is read per call rather than threaded
+        through `ctx.Now`: `evalGenExpr` runs from two callers
+        (apply worker + dispatcher `insertOp`) plus the
+        GENERATED-ALWAYS path, and a signature change would
+        touch all three. Wall-clock skew between rows of a
+        single multi-row INSERT is bounded by microseconds on
+        commodity hardware, well below the second-or-coarser
+        granularity any audit-column fixture asserts on; rung
+        18's pin uses a bounded `[before, after]` window so the
+        contract stays load-bearing. Documented divergence from
+        upstream's statement-scoped `statement_timestamp`.
+      - SERIAL / sequences unchanged: nil `DefaultExpr` for
+        SERIAL declarations keeps `insertOp.Next`'s SERIAL
+        `nextval` block (rung 14 hot path) authoritative.
+        Sequence-backed `DEFAULT nextval('s')` is explicitly
+        out of scope for this rung — separate rung, needs
+        sequence registry plumbing through the DEFAULT-eval
+        slow path. Generated columns get the time-function
+        upgrade for free since `computeGeneratedColumns` shares
+        `evalGenExpr`, but no test pin is added for that side
+        effect (it's a free upgrade, not a load-bearing claim).
+      - Pinned by `TestInsertFillsMissingColumnDefaultCurrentTimestamp`
+        and `TestInsertFillsMissingColumnDefaultCurrentDate`
+        in `internal/executor/storage_test.go`. The timestamp
+        test brackets `Build`+`Open`+`Next` with `time.Now().UTC()`
+        and asserts the persisted slot's `TimeValue()` falls
+        inside the bracketed window (with a 1 ms slop for
+        clock-resolution differences) — guards both correctness
+        (no fixed sentinel / no init-time clock) and order (the
+        helper ran before the heap write, not after). The
+        date test asserts the slot is midnight-truncated and
+        year/month/day match wall-clock — catches an accidental
+        fallthrough to the `current_timestamp` arm.
+      - Verification (rung 18):
+        `go test -count=1 -timeout 60s -run "TestInsertFillsMissingColumnDefaultCurrent" ./internal/executor/`
+        → PASS (~0.006 s, both subtests);
+        rung-13/14 regression sweep
+        `go test -count=1 -timeout 60s -run "TestApplyDefaultsForMissing|TestInsertFillsMissingColumnDefault|TestInsertDoesNotOverrideExplicitColumnDefault" ./internal/executor/`
+        → PASS (~0.016 s); broader sweep
+        `go test -count=1 -timeout 300s ./internal/executor/ ./internal/planner/ ./internal/parser/ ./internal/analyzer/ ./internal/catalog/`
+        → all green (executor 1.143 s).
+      - Next rungs (deferred within M0103-0007): pgbench against
+        PG publisher with `pgbench_history` polling,
+        proto_version=2 streaming subxacts, kill -9 + libpq
+        multi-host reconnect plumbing on the client side,
+        sequence DEFAULTs (`DEFAULT nextval('seq')`) when a
+        fixture surfaces a need.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.
