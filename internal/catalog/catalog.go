@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -725,6 +726,11 @@ func (c *InMemory) registerSystemTables() {
 			// relispopulated: true for tables/views, reflects IsPopulated for matviews.
 			// M0097-0013.
 			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 7},
+			// relnatts: number of user columns. Required by PG's
+			// CREATE SUBSCRIPTION column-list probe (M0103-0008 rung 14):
+			//   `… (array_length(gpt.attrs,1) = c.relnatts) … FROM pg_class c …`
+			// where `gpt = pg_get_publication_tables(...)`.
+			{Name: "relnatts", Type: Type{Name: "int4"}, Ordinal: 8},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -759,11 +765,12 @@ func (c *InMemory) registerSystemTables() {
 				t.Name,
 				t.Name,
 				relkind,
-				"2200",    // relnamespace: OID of public namespace (matches pg_namespace.oid)
-				"p",       // relpersistence: permanent
-				"0",       // reltoastrelid: no TOAST table
-				"0",       // relpages: estimated page count (0 = unknown)
-				populated, // relispopulated
+				"2200",                              // relnamespace: OID of public namespace (matches pg_namespace.oid)
+				"p",                                 // relpersistence: permanent
+				"0",                                 // reltoastrelid: no TOAST table
+				"0",                                 // relpages: estimated page count (0 = unknown)
+				populated,                           // relispopulated
+				strconv.Itoa(len(t.Columns)),        // relnatts: number of user columns
 			})
 		}
 		return out

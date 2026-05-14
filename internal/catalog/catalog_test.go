@@ -164,6 +164,62 @@ func TestPgCatalogBootstrapViews(t *testing.T) {
 	}
 }
 
+
+// TestPgClassExposesRelNatts pins the M0103-0008 rung-14 surface:
+// PG's CREATE SUBSCRIPTION column-list probe runs
+//
+//	… WHEN (array_length(gpt.attrs,1) = c.relnatts) … FROM pg_class c
+//
+// against the publisher. Before rung 14 goopg's pg_class virtual
+// view omitted `relnatts`, so the probe failed with SQLSTATE 42703
+// ("column \"relnatts\" does not exist") and CREATE SUBSCRIPTION
+// registered zero relations in pg_subscription_rel — every change
+// then silently skipped on the subscriber.
+//
+// Pin: relnatts is present at ordinal 8, typed int4, and populated
+// with the table's user-column count (no system columns — goopg
+// has no rowid/ctid in its catalog).
+func TestPgClassExposesRelNatts(t *testing.T) {
+	c := NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+		{Name: "v", Type: Type{Name: "text"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pgClass, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok {
+		t.Fatal("pg_catalog.pg_class missing")
+	}
+
+	var natts *Column
+	for i := range pgClass.Columns {
+		if pgClass.Columns[i].Name == "relnatts" {
+			natts = &pgClass.Columns[i]
+			break
+		}
+	}
+	if natts == nil {
+		t.Fatal("pg_class.relnatts column not declared")
+	}
+	if natts.Type.Name != "int4" {
+		t.Errorf("pg_class.relnatts type=%q want int4", natts.Type.Name)
+	}
+
+	rows := pgClass.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("pg_class rows=%d want 1 (the user 't' table)", len(rows))
+	}
+	row := rows[0]
+	if len(row) != len(pgClass.Columns) {
+		t.Fatalf("pg_class row width=%d want %d (one cell per column)", len(row), len(pgClass.Columns))
+	}
+	if row[natts.Ordinal] != "2" {
+		t.Errorf("pg_class.t.relnatts=%q want %q (user column count)", row[natts.Ordinal], "2")
+	}
+}
+
 // TestPgIndexesView pins the pg_catalog.pg_indexes virtual
 // view that HammerDB's checkschema queries. Each index on a
 // non-virtual table should produce one row with

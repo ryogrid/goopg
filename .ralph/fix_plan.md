@@ -2613,6 +2613,41 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       column missing (SQLSTATE 42703). The `t.Skip` was restored
       with the rung-14 diagnosis quoted verbatim so the next loop
       can resume from the exact failing surface.
+      PARTIAL PROGRESS 2026-05-14 (loop 16): closed rung 14 —
+      `pg_class.relnatts` column missing. Design doc:
+      `docs/design/0103-0020-pg-class-relnatts-column.md` (accepted).
+      Diagnosis: with rung 13's parser fix in place,
+      `fetch_table_list_from_publisher` reached the executor and
+      raised `42703: column "relnatts" does not exist` on the
+      `(array_length(gpt.attrs,1) = c.relnatts)` CASE test.
+      goopg's on-disk pg_class codec
+      (`internal/catalog/codec.go::PgClassRow.RelNAtts`) already
+      modelled the column for catalog persistence, but the
+      virtual `pg_catalog.pg_class` view in
+      `internal/catalog/catalog.go::registerSystemTables` is a
+      separate construct and had never been extended past its
+      eight-column shape (`oid`, `relname`, `relkind`,
+      `relnamespace`, `relpersistence`, `reltoastrelid`,
+      `relpages`, `relispopulated`).
+      Fix: added a 9th column `relnatts int4` at ordinal 8, with
+      each row populated as `strconv.Itoa(len(t.Columns))` from
+      inside the existing `VirtualRows` closure (snapshot under
+      `c.mu.RLock`). goopg has no system columns in its catalog,
+      so user-column count matches what upstream PG would report
+      for `pg_class.relnatts` (which already excludes system
+      columns by construction).
+      Pinned by `TestPgClassExposesRelNatts` in
+      `internal/catalog/catalog_test.go`: registers `t(id int4,
+      v text)`, asserts column declared at ordinal 8 typed int4,
+      and the populated row's relnatts cell equals `"2"`.
+      Verification (loop 16): `go test -race -count=1 -timeout
+      300s ./internal/catalog/ ./internal/planner/
+      ./internal/analyzer/ ./internal/executor/
+      ./internal/server/ ./internal/wal/ ./internal/storage/`
+      — recorded below at commit time.
+      The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` stays
+      in place per the rung protocol; next rung lands with its
+      own design doc once a live probe surfaces the next gap.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
