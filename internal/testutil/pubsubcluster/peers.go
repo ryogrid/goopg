@@ -38,6 +38,7 @@ func (g *goopgPeer) Conninfo(applicationName string) string {
 }
 func (g *goopgPeer) Start() error { return g.c.Start() }
 func (g *goopgPeer) Stop() error  { return g.c.Stop(cluster.ShutdownFast) }
+func (g *goopgPeer) Kill() error  { return g.c.Kill() }
 func (g *goopgPeer) Exec(t *testing.T, sql string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -85,6 +86,7 @@ func (p *pgPeer) Database() string                            { return p.c.Datab
 func (p *pgPeer) Conninfo(applicationName string) string      { return p.c.Conninfo(applicationName) }
 func (p *pgPeer) Start() error                                { return p.c.Start() }
 func (p *pgPeer) Stop() error                                 { return p.c.Stop() }
+func (p *pgPeer) Kill() error                                 { return p.c.Kill() }
 func (p *pgPeer) Exec(t *testing.T, sql string)               { p.c.Exec(t, sql) }
 func (p *pgPeer) QueryScalar(t *testing.T, sql string) string { return p.c.QueryScalar(t, sql) }
 func (p *pgPeer) Pgbench(t *testing.T, args ...string) string {

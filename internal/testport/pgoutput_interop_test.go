@@ -488,7 +488,6 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	}
 }
 
-
 // TestPort_PgoutputInteropPGToGoopgFullDML is the symmetric counterpart
 // to TestPort_PgoutputInteropGoopgToPG: PG publishes, goopg subscribes,
 // and the test drives the same four-statement
@@ -835,7 +834,6 @@ func TestPort_PgoutputInteropPGToGoopgUnchangedToast(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "id = 1 AND substr(payload, 1, 1) = 'X'", 1, 30*time.Second)
 }
 
-
 // TestPort_PgoutputInteropPGToGoopgMultiDMLXact pins rung 6 of
 // M0103-0007: PG-publisher → goopg-subscriber multi-DML single
 // transaction. A single explicit BEGIN/...COMMIT block on the publisher
@@ -1038,7 +1036,6 @@ COMMIT;`)
 	psc.WaitForRow(t, "public.t", "id = 4 AND v = 'four'", 1, 30*time.Second)
 }
 
-
 // TestPort_PgoutputInteropPGToGoopgMultiTable pins rung 8 of
 // M0103-0007: PG-publisher → goopg-subscriber multi-table interleaved
 // DML. All prior rungs (1–7) used a single published table; this rung
@@ -1168,7 +1165,6 @@ COMMIT;`)
 	psc.WaitForRow(t, "public.orders", "id = 13 AND user_id = 3 AND amount = 75", 1, 30*time.Second)
 }
 
-
 // TestPort_PgoutputInteropPGToGoopgTruncate pins M0103-0007 rung 9:
 // the apply worker handles pgoutput 'T' (TRUNCATE) frames end-to-end
 // against a real upstream PG publisher. Before rung 9 the apply
@@ -1180,9 +1176,9 @@ COMMIT;`)
 //
 // Workload — three phases against a published `public.t (id int
 // PRIMARY KEY, v text)`:
-//   1. INSERT (1,'a'), (2,'b'), (3,'c')
-//   2. TRUNCATE TABLE public.t
-//   3. INSERT (10,'x'), (11,'y')
+//  1. INSERT (1,'a'), (2,'b'), (3,'c')
+//  2. TRUNCATE TABLE public.t
+//  3. INSERT (10,'x'), (11,'y')
 //
 // Expected subscriber state after apply convergence: exactly two
 // rows, `(10,'x')` and `(11,'y')`. Each assertion goes through a
@@ -1266,7 +1262,6 @@ func TestPort_PgoutputInteropPGToGoopgTruncate(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "id = 10 AND v = 'x'", 1, 30*time.Second)
 	psc.WaitForRow(t, "public.t", "id = 11 AND v = 'y'", 1, 30*time.Second)
 }
-
 
 // TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch pins M0103-0007
 // rung 10: the apply worker must map remote pgoutput columns onto the
@@ -1363,7 +1358,6 @@ func TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'alice-updated'", 1, 30*time.Second)
 	psc.WaitForRow(t, "public.t", "id = 2", 0, 30*time.Second)
 }
-
 
 // TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn pins M0103-0007
 // rung 11: the goopg subscriber declares an extra `note` column the PG
@@ -1494,7 +1488,7 @@ func TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex(t *testing.T) {
 	})
 	defer func() { _ = psc.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := psc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1544,7 +1538,6 @@ func TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex(t *testing.T) {
 	// fell back to primaryKeyOnlyRow → nil → silent skip).
 	psc.WaitForRow(t, "public.t", "k = 2 AND v = 'b'", 0, 5*time.Second)
 }
-
 
 // TestPort_PgoutputInteropPGToGoopgSubscriberExtraDefault pins M0103-0007
 // rung 13: when the goopg subscriber declares an extra column the PG
@@ -1759,7 +1752,6 @@ func TestPort_PgoutputInteropPGToGoopgPgbenchInsert(t *testing.T) {
 	psc.WaitForRow(t, "public.bench_log", "client_id NOT IN (0, 1)", 0, 5*time.Second)
 }
 
-
 // TestPort_PgoutputInteropPGToGoopgPgbenchTpcb pins M0103-0007 rung 21
 // (`docs/design/0103-0044-m0103-0007-rung-21-pgbench-tpcb-pg-to-goopg.md`):
 // the upstream `pgbench` binary drives a tpcb-like UPDATE-heavy workload
@@ -1967,6 +1959,121 @@ func TestPort_PgoutputInteropPGToGoopgPgbenchTpcb(t *testing.T) {
 	}
 	if pubBB != pubDelta {
 		t.Fatalf("publisher-side tpcb-like invariant broken: sum(bbalance)=%s vs sum(delta)=%s", pubBB, pubDelta)
+	}
+}
+
+// TestPort_PgoutputInteropPGToGoopgKillAndReconnect pins M0103-0007
+// rung 22: SIGKILL of the PG publisher + libpq multi-host reconnect.
+//
+// Design doc: docs/design/0103-0045-m0103-0007-rung-22-kill-and-reconnect.md.
+//
+// Flow:
+//  1. Spin up a PG publisher + goopg subscriber pair.
+//  2. INSERT three pre-failover rows on PG; CREATE PUBLICATION; pre-
+//     create the logical slot; CREATE SUBSCRIPTION on goopg with
+//     copy_data=false. Wait for all three rows to land on the subscriber.
+//  3. `psc.Publisher.Kill()` — SIGKILL of the PG postmaster.
+//  4. Run `psql -d "host=<pg>,<goopg> port=<pp>,<gp> ..."` to INSERT one
+//     post-failover row. libpq walks the host list in order: PG is dead
+//     (connect-refused), so libpq falls through to goopg and the INSERT
+//     lands on the (always-writable) subscriber.
+//  5. Assert `count(*) = 4` on the goopg subscriber via the harness's
+//     Go-driver QueryScalar — verifies that (a) the in-tree libpq's
+//     multi-host fall-through worked, (b) the surviving subscriber
+//     accepted the write.
+//
+// Scope is strictly the multi-host reconnect plumbing — the Scenario A
+// DoD's full `pgbench -c 2 -T 180` workload + zero-loss invariant
+// stays in later rungs.
+func TestPort_PgoutputInteropPGToGoopgKillAndReconnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	psqlBin := filepath.Join(repo, "postgres", "local_install", "bin", "psql")
+	if st, err := os.Stat(psqlBin); err != nil || !st.Mode().IsRegular() {
+		t.Skipf("psql not present at %s", psqlBin)
+	}
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-kill")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_kill"
+	psc := pubsubcluster.NewMixed(t, "pg2g_kill", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.failover_log (id int PRIMARY KEY, src text NOT NULL)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.failover_log (id int PRIMARY KEY, src text NOT NULL)")
+	psc.CreatePublication(t, "failover_log")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Pre-failover writes from the PG publisher. Three rows so a
+	// silent drop of any one stands out from the post-failover row.
+	psc.Publisher.Exec(t, "INSERT INTO public.failover_log VALUES (1, 'pre')")
+	psc.Publisher.Exec(t, "INSERT INTO public.failover_log VALUES (2, 'pre')")
+	psc.Publisher.Exec(t, "INSERT INTO public.failover_log VALUES (3, 'pre')")
+
+	// Wait for replication to finish so the SIGKILL doesn't race the
+	// pgoutput tail. Bounded; the four-row invariant below catches a
+	// stuck apply worker independently.
+	psc.WaitForRow(t, "public.failover_log", "src = 'pre'", 3, 60*time.Second)
+
+	// SIGKILL the PG publisher. Subsequent psql connect attempts to
+	// the publisher port get "connection refused" (postmaster gone,
+	// no listener inherited).
+	if err := psc.Publisher.Kill(); err != nil {
+		t.Fatalf("Publisher.Kill: %v", err)
+	}
+
+	// libpq multi-host conninfo: PG first, goopg second. libpq tries
+	// each host in order; PG's connect-refused immediately falls
+	// through to goopg, where the INSERT lands.
+	multi := psc.MultiHostConninfo("failover_client")
+	cmd := exec.CommandContext(ctx, psqlBin,
+		"-d", multi,
+		"-v", "ON_ERROR_STOP=1",
+		"-c", "INSERT INTO public.failover_log VALUES (4, 'post')")
+	cmd.Env = append(os.Environ(),
+		"LD_LIBRARY_PATH="+filepath.Join(repo, "postgres", "local_install", "lib"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("psql multi-host INSERT: %v\nconn=%q\nout=%s", err, multi, out)
+	}
+
+	// Surviving subscriber sees all four rows: three replicated
+	// pre-kill, one written directly via the multi-host fall-through.
+	got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.failover_log")
+	if got != "4" {
+		t.Fatalf("subscriber count(*) = %s, want 4 (pre-failover rows + post-failover direct INSERT)", got)
+	}
+	postSrc := psc.Subscriber.QueryScalar(t, "SELECT src FROM public.failover_log WHERE id = 4")
+	if postSrc != "post" {
+		t.Fatalf("subscriber id=4 src = %q, want \"post\" — post-failover INSERT did not reach goopg via multi-host", postSrc)
 	}
 }
 

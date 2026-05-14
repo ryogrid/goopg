@@ -3056,6 +3056,52 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         reconnect on the client side, proto_version=2 streaming
         subxacts, column-ref-typed `nextval` args, `filler
         char(N)` bpchar padding through pgoutput.
+      - PARTIAL PROGRESS 2026-05-14 (rung 22): SIGKILL + libpq
+        multi-host reconnect (PG → goopg). Design doc:
+        `docs/design/0103-0045-m0103-0007-rung-22-kill-and-reconnect.md`
+        (accepted). Closes the client-redirection plumbing that
+        both Scenario A subtests pivot on; the apply-worker
+        correctness story was already pinned by rungs 1–21.
+      - Changes:
+      - `internal/testutil/pubsubcluster/cluster.go`: `ReplPeer`
+        gains `Kill() error`; new
+        `PubSubCluster.MultiHostConninfo(applicationName)` helper
+        returns the libpq-style `host=<pub>,<sub>
+        port=<pp>,<gp> user=<u> dbname=<db>
+        [application_name=<an>]` shape (PG18 libpq-connect
+        §32.1.1) with the publisher listed first so libpq walks
+        the host list in order after `Publisher.Kill()`.
+      - `internal/testutil/pubsubcluster/peers.go`:
+        `pgPeer.Kill()` delegates to the existing
+        `pgcluster.Cluster.Kill()` (`pg_ctl -m immediate -w
+        stop`, upstream's documented postmaster-SIGKILL
+        equivalent); `goopgPeer.Kill()` delegates to
+        `cluster.Cluster.Kill()` (direct SIGKILL of the goopg
+        process via `c.cmd.Process.Kill()`).
+      - Pinned by `TestPort_PgoutputInteropPGToGoopgKillAndReconnect`
+        in `internal/testport/pgoutput_interop_test.go`: PG
+        publisher INSERTs three pre-failover rows
+        (`src='pre'`); `psc.WaitForRow` confirms replication to
+        the goopg subscriber; `psc.Publisher.Kill()` SIGKILLs
+        the PG postmaster; `psql -d <multi-host-conninfo> -c
+        "INSERT ... (4, 'post')"` runs against the libpq-built
+        in-tree binary (`LD_LIBRARY_PATH` -> `postgres/local_install/lib`)
+        and falls through the dead PG to the surviving goopg
+        subscriber; `count(*) = 4` + `id=4 src='post'` checks
+        catch both a silent multi-host fall-through failure and
+        a wrong-side write. baseDir kept short (`pg2g-kill`)
+        for the 108-byte Unix-sockaddr limit.
+      - Verification (rung 22):
+        `go test -count=1 -timeout 180s -run
+        TestPort_PgoutputInteropPGToGoopgKillAndReconnect
+        ./internal/testport/` → PASS (~1.7 s, first run).
+        `go build ./...` clean.
+      - Next rungs (deferred within M0103-0007): pgbench-driven
+        workload with mid-kill committed-row counter + bounded-
+        loss / zero-loss DoD invariants, `sync_remote_apply`
+        subtest, proto_version=2 streaming subxacts, column-ref-
+        typed `nextval` args, `filler char(N)` bpchar padding
+        through pgoutput.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

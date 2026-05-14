@@ -77,6 +77,12 @@ type ReplPeer interface {
 	Conninfo(applicationName string) string
 	Start() error
 	Stop() error
+	// Kill terminates the cluster's underlying postmaster (or goopg
+	// server) with SIGKILL — the upstream equivalent of an unclean
+	// crash. The peer is left in the "not running" state; subsequent
+	// Stop() calls are no-ops. Used by M0103-0007 rung 22 to verify
+	// libpq multi-host reconnect against a dead publisher.
+	Kill() error
 	Exec(t *testing.T, sql string)
 	QueryScalar(t *testing.T, sql string) string
 	// Pgbench runs the cluster-local pgbench binary with the supplied
@@ -259,6 +265,26 @@ func (p *PubSubCluster) CreateSubscription(t *testing.T) {
 		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION %s WITH (enabled = true, copy_data = false)",
 		p.opts.SubscriptionName, conn, p.opts.PublicationName)
 	p.Subscriber.Exec(t, sql)
+}
+
+// MultiHostConninfo returns a libpq-style conninfo string listing the
+// publisher and subscriber hosts/ports comma-separated. libpq tries each
+// in order on connect, so after `Publisher.Kill()` a client invoked
+// with this conninfo will fall through the dead publisher and land on
+// the (always-writable) subscriber. Mirrors PG18's documented
+// "multi-host conninfo" shape from §32.1.1 of libpq-connect.
+//
+// Used by M0103-0007 rung 22 to verify libpq multi-host reconnect
+// against a SIGKILLed publisher.
+func (p *PubSubCluster) MultiHostConninfo(applicationName string) string {
+	conn := fmt.Sprintf("host=%s,%s port=%d,%d user=%s dbname=%s",
+		p.Publisher.Host(), p.Subscriber.Host(),
+		p.Publisher.Port(), p.Subscriber.Port(),
+		p.Publisher.User(), p.Publisher.Database())
+	if strings.TrimSpace(applicationName) != "" {
+		conn += " application_name=" + applicationName
+	}
+	return conn
 }
 
 // WaitForRow polls the subscriber until `SELECT count(*) FROM table
