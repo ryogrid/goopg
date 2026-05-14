@@ -44,6 +44,16 @@ const (
 	pgoInsert   = 'I'
 	pgoDelete   = 'D'
 	pgoUpdate   = 'U'
+	pgoTruncate = 'T'
+)
+
+// pgoutput TRUNCATE option-bit constants. Mirror upstream's
+// `TRUNCATE_CASCADE` / `TRUNCATE_RESTART_SEQS` in
+// postgres/src/include/replication/logicalproto.h. The byte is a
+// bitmask: bit 0 = CASCADE, bit 1 = RESTART IDENTITY.
+const (
+	pgoTruncateCascade        byte = 0x01
+	pgoTruncateRestartSeqs    byte = 0x02
 )
 
 // pgoutput tuple-column status bytes. Mirror upstream's

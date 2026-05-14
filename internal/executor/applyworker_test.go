@@ -260,6 +260,127 @@ func TestApplyWorkerInsertRejectsUnchangedToast(t *testing.T) {
 	}
 }
 
+
+// TestApplyWorkerTruncate pins M0103-0007 rung 9: the apply worker
+// handles pgoutput 'T' (TRUNCATE) frames by stamping xmax on every
+// visible tuple in each named relation, transactional with the
+// surrounding apply xact. After Begin → Relation → Insert(x2) →
+// Truncate → Commit, a fresh-snapshot SeqScan must observe zero
+// rows.
+//
+// The 'T' message is synthesised directly because goopg's PgOutput
+// encoder does not (yet) emit TRUNCATE; we only consume the wire
+// shape on the apply side.
+func TestApplyWorkerTruncate(t *testing.T) {
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	rel := subCat.RelFileNode(subTbl)
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'B', XID: 100, CommitLSN: 0xD00D,
+	}); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'R',
+		Relation: &wal.DecodedRelation{
+			// Schema left empty to match the fixture's unqualified
+			// table — LookupTable falls back to the default schema
+			// when Schema is "".
+			OID: rel.RelOid, Name: "items",
+			Columns: []wal.DecodedAttr{
+				{Name: "id", TypeOID: 23},
+				{Name: "label", TypeOID: 25},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Relation: %v", err)
+	}
+	for _, pair := range [][2]string{{"1", "alpha"}, {"2", "beta"}} {
+		if _, err := w.ApplyMessage(&wal.DecodedMessage{
+			Kind: 'I', RelOID: rel.RelOid,
+			NewTuple: []wal.DecodedColumn{
+				{Status: 't', Bytes: []byte(pair[0])},
+				{Status: 't', Bytes: []byte(pair[1])},
+			},
+		}); err != nil {
+			t.Fatalf("Insert(%s): %v", pair[0], err)
+		}
+	}
+
+	// TRUNCATE message naming the same relation. CASCADE bit set
+	// to exercise the option-byte plumbing (the apply worker
+	// records the option but takes no extra action — CASCADE
+	// resolution happens publisher-side).
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind:           'T',
+		TruncateRels:   []uint32{rel.RelOid},
+		TruncateOption: 0x01,
+	}); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'C', CommitLSN: 0xD00D, EndLSN: 0xD00D,
+	}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Fresh snapshot — the just-committed xact's xmax stamps
+	// must mark both rows dead.
+	tx, _ := subCtx.TxnMgr.Begin(0)
+	defer subCtx.TxnMgr.Rollback(tx)
+	snap2, _ := subCtx.TxnMgr.SnapshotFor(tx)
+	scanCtx := NewContext()
+	scanCtx.Pool = subCtx.Pool
+	scanCtx.Catalog = subCat
+	scanCtx.TxnMgr = subCtx.TxnMgr
+	scanCtx.Tx = tx
+	scanCtx.Snap = snap2
+	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatalf("scan open: %v", err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatalf("drainScan: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("post-TRUNCATE scan returned %d rows want 0", len(rows))
+	}
+}
+
+// TestApplyWorkerTruncateUnknownRelOid pins the apply-time rejection
+// path: a 'T' message naming an OID for which no prior 'R' was seen
+// must error instead of silently no-oping. This is the same policy
+// applyDelete / applyUpdate take and protects against
+// publisher/subscriber catalog drift hiding a data-loss outcome.
+func TestApplyWorkerTruncateUnknownRelOid(t *testing.T) {
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'B', XID: 101, CommitLSN: 0xBEEF,
+	}); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	// No 'R' for OID 99999 — the TRUNCATE handler must reject.
+	_, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind:         'T',
+		TruncateRels: []uint32{99999},
+	})
+	if err == nil {
+		t.Errorf("expected error for unknown rel_oid, got nil")
+	}
+}
+
 // TestApplyWorkerCommitOutsideXactIsNoop pins the tolerant
 // behaviour: a `C` with no preceding `B` doesn't crash. v0
 // pgoutput emits commit-only sequences only when every change

@@ -40,6 +40,15 @@ type DecodedMessage struct {
 	RelOID   uint32
 	NewTuple []DecodedColumn // populated for 'I'
 	OldTuple []DecodedColumn // populated for 'D' / 'U'
+
+	// Truncate fields — populated for kind == 'T'. TruncateRels
+	// holds the publisher OIDs of every relation in the TRUNCATE
+	// statement (a single TRUNCATE may target many tables);
+	// TruncateOption is the upstream option-bit byte (bit 0
+	// CASCADE, bit 1 RESTART IDENTITY) — the apply worker uses
+	// this to mirror upstream's `apply_handle_truncate` policy.
+	TruncateRels   []uint32
+	TruncateOption byte
 }
 
 // DecodedRelation is the parsed `R` message body.
@@ -202,6 +211,32 @@ func DecodeMessage(payload []byte) (*DecodedMessage, error) {
 		out.RelOID = oid
 		out.OldTuple = oldCols
 		out.NewTuple = newCols
+		return out, nil
+	case pgoTruncate:
+		// 'T' | nrelids(4) | option_bits(1) | relids(4*nrelids)
+		// See upstream `logicalrep_write_truncate` in proto.c.
+		// nrelids must be > 0 in well-formed messages (the publisher
+		// only emits 'T' when at least one published relation is
+		// affected) but the apply worker tolerates an empty list as
+		// a no-op rather than rejecting the frame.
+		nrelids, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		option, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		rels := make([]uint32, 0, nrelids)
+		for i := uint32(0); i < nrelids; i++ {
+			rel, err := r.u32()
+			if err != nil {
+				return nil, err
+			}
+			rels = append(rels, rel)
+		}
+		out.TruncateRels = rels
+		out.TruncateOption = option
 		return out, nil
 	}
 	return nil, fmt.Errorf("pgoutput: unknown message kind %q", kind)

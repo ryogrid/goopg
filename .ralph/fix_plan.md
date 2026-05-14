@@ -2167,11 +2167,84 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       (~13.4 s); race-tested regression on
       `./internal/executor/ ./internal/wal/ ./internal/server/
       ./internal/catalog/ ./internal/testutil/pubsubcluster/`
-      → all green. Next rungs (deferred within M0103-0007):
-      pgbench against PG publisher with `pgbench_history`
-      polling, DDL replication shapes, proto_version=2 streaming
-      subxacts, kill -9 + libpq multi-host reconnect plumbing on
-      the client side.
+      → all green.
+      PARTIAL PROGRESS 2026-05-14 (rung 9): pgoutput TRUNCATE
+      message support — first apply-worker gap closure since
+      rung 5. Design doc:
+      `docs/design/0103-0032-m0103-0007-rung-9-pg-to-goopg-truncate.md`
+      (accepted). Before rung 9 the apply worker dispatched on
+      B/R/I/D/U/C only; any other kind hit `ApplyMessage`'s
+      `default` arm and returned the typed error `"applyworker:
+      unsupported pgoutput kind %q"`. A publisher `TRUNCATE TABLE
+      t` against a published relation would therefore crash the
+      apply loop and stall the slot at the crash LSN. Fix split
+      across decoder + apply paths:
+      - `internal/wal/pgoutput.go` gains `pgoTruncate = 'T'`
+        plus option-bit constants `pgoTruncateCascade (0x01)` /
+        `pgoTruncateRestartSeqs (0x02)` mirroring upstream
+        `TRUNCATE_CASCADE` / `TRUNCATE_RESTART_SEQS`.
+      - `internal/wal/pgoutput_decoder.go::DecodeMessage` gains
+        a `case pgoTruncate` arm parsing `'T' | nrelids(4 BE) |
+        option_bits(1) | relid_i(4 BE)…` into two new
+        `DecodedMessage` fields: `TruncateRels []uint32` and
+        `TruncateOption byte`.
+      - `ApplyWorker.ApplyMessage` gains a `case 'T'` branch
+        routing to a new `applyTruncate` method that walks the
+        relid list, resolves each via the existing `w.relations`
+        cache (same map the I/D/U paths consult), and calls the
+        existing `truncateRelation` primitive in
+        `internal/executor/operators_ddl.go:1964` which stamps
+        `xmax = currentTx.XID` on every visible tuple in the
+        heap. Work is transactional with the surrounding apply
+        xact, symmetric with `applyDeleteByKey`. Soft-truncate
+        (no physical file shrink) is intentional:
+        `Pool.Manager().TruncateRelation` is non-transactional
+        and would diverge subscriber durability from publisher
+        xact rollback semantics. Unknown-relid rejection mirrors
+        `applyDelete`/`applyUpdate` — a `'T'` for an OID with no
+        prior `'R'` returns an error rather than silently
+        no-op'ing, surfacing catalog drift through
+        `event=apply_error, kind=T`. Both option bits are
+        publisher-side decisions (CASCADE expansion already
+        populates the relid list; RESTART IDENTITY is a no-op on
+        goopg's apply path with no replicated sequence state)
+        but the byte is recorded on `DecodedMessage` for future
+        rungs. Pinned by `TestPgoutputDecoderTruncateMessage`
+        (4 sub-tests in `internal/wal/pgoutput_decoder_test.go`),
+        `TestApplyWorkerTruncate` +
+        `TestApplyWorkerTruncateUnknownRelOid` (unit,
+        `internal/executor/applyworker_test.go`), and the live
+        E2E `TestPort_PgoutputInteropPGToGoopgTruncate`
+        (`internal/testport/pgoutput_interop_test.go`) which
+        publishes INSERT×3 → TRUNCATE → INSERT×2 and asserts
+        via fresh `database/sql` sessions through the goopg PK
+        IndexScan path that `count(*) = 2`, `WHERE id IN
+        (1,2,3)` returns 0, and the two post-truncate rows
+        survive with their identity (`id=10 v='x'`,
+        `id=11 v='y'`). Each assertion fail-fasts a distinct
+        regression: `count(*)=2` catches TRUNCATE no-op (3 or 5
+        rows); the IN-clause assertion catches TRUNCATE that
+        fires but leaves pre-truncate rows visible; per-id
+        identity catches TRUNCATE wiping post-truncate
+        inserts. Verification (rung 9):
+        `go test -count=1 -timeout 60s
+        -run "TestPgoutputDecoderTruncateMessage"
+        ./internal/wal/` → PASS (~0.003 s);
+        `go test -count=1 -timeout 60s
+        -run "TestApplyWorkerTruncate|TestApplyWorkerTruncateUnknownRelOid"
+        ./internal/executor/` → PASS (~0.02 s);
+        `go test -count=1 -timeout 120s
+        -run TestPort_PgoutputInteropPGToGoopgTruncate
+        ./internal/testport/` → PASS (~2.0 s); all 9
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~15.4 s); regression on
+        `./internal/executor/ ./internal/server/` → green;
+        race-tested on
+        `./internal/catalog/ ./internal/testutil/pubsubcluster/`
+        → green. Next rungs (deferred within M0103-0007):
+        pgbench against PG publisher with `pgbench_history`
+        polling, proto_version=2 streaming subxacts, kill -9 +
+        libpq multi-host reconnect plumbing on the client side.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

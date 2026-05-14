@@ -172,6 +172,8 @@ func (w *ApplyWorker) ApplyMessage(m *wal.DecodedMessage) (uint64, error) {
 		err = w.applyDelete(m)
 	case 'U':
 		err = w.applyUpdate(m)
+	case 'T':
+		err = w.applyTruncate(m)
 	case 'C':
 		commitLSN = m.CommitLSN
 		err = w.applyCommit(m)
@@ -356,6 +358,50 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
 	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged)
+}
+
+// applyTruncate handles pgoutput 'T' frames. The publisher emits one
+// 'T' message per TRUNCATE statement, listing every relation in the
+// statement (CASCADE expansion is performed publisher-side so the
+// relid list already includes the transitive closure of foreign-key
+// targets). On the subscriber we treat TRUNCATE as a bulk DELETE:
+// for each relid we look up the local table via the relation cache
+// and stamp xmax on every visible tuple in the heap so subsequent
+// MVCC scans see them as dead. The work happens inside the open
+// apply transaction so a rollback before COMMIT discards the marks
+// alongside any other apply changes — symmetric with applyDelete.
+//
+// RESTART IDENTITY (bit 1 of TruncateOption) and CASCADE (bit 0)
+// are honoured at the publisher: bit 0 was already used to decide
+// which relids to ship, and goopg's apply path has no sequence
+// state to reset. We record the option for diagnostics but take no
+// extra action.
+//
+// Unknown relids (no prior 'R' message) are an apply error — same
+// policy as applyDelete / applyUpdate: a TRUNCATE for a relation
+// goopg never saw a relation descriptor for points at a publisher /
+// subscriber catalog drift the operator must investigate, not a
+// silent data-loss outcome.
+func (w *ApplyWorker) applyTruncate(m *wal.DecodedMessage) error {
+	if !w.inXact {
+		return errors.New("applyworker: TRUNCATE outside transaction")
+	}
+	ctx := w.applyContext()
+	for _, oid := range m.TruncateRels {
+		r, ok := w.relations[oid]
+		if !ok {
+			return fmt.Errorf("applyworker: TRUNCATE for unknown rel_oid %d (no R message seen)", oid)
+		}
+		if r.local == nil {
+			return fmt.Errorf("applyworker: TRUNCATE for relation %s.%s has no local table",
+				r.remote.Schema, r.remote.Name)
+		}
+		rel := w.cat.RelFileNode(r.local)
+		if err := truncateRelation(ctx, rel); err != nil {
+			return fmt.Errorf("applyworker: truncate %q: %w", r.local.Name, err)
+		}
+	}
+	return nil
 }
 
 // applyContext builds a minimal executor Context for apply-worker

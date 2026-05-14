@@ -1168,6 +1168,105 @@ COMMIT;`)
 	psc.WaitForRow(t, "public.orders", "id = 13 AND user_id = 3 AND amount = 75", 1, 30*time.Second)
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgTruncate pins M0103-0007 rung 9:
+// the apply worker handles pgoutput 'T' (TRUNCATE) frames end-to-end
+// against a real upstream PG publisher. Before rung 9 the apply
+// worker dispatched only on B/R/I/D/U/C, so a publisher TRUNCATE
+// crashed the slot with `unsupported pgoutput kind "T"`. Rung 9 adds
+// the decoder case + apply-side `applyTruncate` that stamps xmax on
+// every visible tuple in each named relation, transactional with the
+// surrounding pgoutput xact.
+//
+// Workload — three phases against a published `public.t (id int
+// PRIMARY KEY, v text)`:
+//   1. INSERT (1,'a'), (2,'b'), (3,'c')
+//   2. TRUNCATE TABLE public.t
+//   3. INSERT (10,'x'), (11,'y')
+//
+// Expected subscriber state after apply convergence: exactly two
+// rows, `(10,'x')` and `(11,'y')`. Each assertion goes through a
+// fresh `database/sql` session via `psc.WaitForRow`, so the goopg
+// PK IndexScan path is exercised (TRUNCATE must also leave the
+// btree consistent with the heap — IndexScan tolerates orphaned
+// entries via heap re-fetch + MVCC dead-tuple filtering, so a stale
+// index entry pointing at a now-dead tuple does not produce a
+// false positive). Fail-fasts:
+//   - `count(*)=2` catches TRUNCATE no-op (would yield 3 or 5).
+//   - `WHERE id IN (1,2,3)` returning 0 catches the inverse
+//     (TRUNCATE that fired but somehow left pre-truncate rows
+//     visible).
+//   - per-id identity catches TRUNCATE wiping post-truncate inserts.
+func TestPort_PgoutputInteropPGToGoopgTruncate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-truncate")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_truncate"
+	psc := pubsubcluster.NewMixed(t, "pg2g_truncate", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Phase 1 — three pre-truncate INSERTs. Each is its own
+	// autocommit B...C block on the wire.
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'a')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'b')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (3, 'c')")
+
+	// Wait for the three rows before issuing the TRUNCATE so the
+	// assertion below can tell apart "TRUNCATE didn't fire" from
+	// "TRUNCATE ran but pre-truncate INSERTs hadn't applied yet".
+	psc.WaitForRow(t, "public.t", "1=1", 3, 30*time.Second)
+
+	// Phase 2 — TRUNCATE. Publisher emits one B...T...C block.
+	psc.Publisher.Exec(t, "TRUNCATE TABLE public.t")
+
+	// Phase 3 — two post-truncate INSERTs.
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (10, 'x')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (11, 'y')")
+
+	// Apply convergence — subscriber must see exactly the two
+	// post-truncate rows. count(*)=2 fail-fasts TRUNCATE no-op
+	// (3 or 5 rows) and silent data loss (0 or 1 rows).
+	psc.WaitForRow(t, "public.t", "1=1", 2, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "id IN (1, 2, 3)", 0, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 10 AND v = 'x'", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 11 AND v = 'y'", 1, 30*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"
