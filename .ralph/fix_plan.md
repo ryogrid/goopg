@@ -1486,6 +1486,42 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/ ./internal/parser/ ./internal/planner/
           ./internal/analyzer/` PASS.  Design:
           `docs/design/0100-0005p-plpgsql-new-field-assignment.md`.
+        - FK INSERT waits for in-flight xmax + surfaces cross-partition
+          moves (M0100-0005q, 2026-05-15 loop 33).  `internal/executor/
+          operators_fk.go` adds `scanRelForFKMatch` (a wait-aware variant
+          of `scanRelForMatch`: a matching parent row whose xmax is an
+          in-flight non-self xact is surfaced as `pending`, not `found`)
+          and `scanTableForMatchFKWait` (wait+retry loop with
+          `WaitForXID(pending.xid)`, snapshot refresh, abort-suppression
+          via `Snap.HasAborted`, sentinel check on the recorded slot).
+          `assertParentExists` routes through the new function; DELETE
+          paths (`assertNoChildRows`, `fullTableFKCheck`) unchanged.
+          New helper `internal/executor/operators_storage.go::
+          epqChainCheckMovedPartition` walks the UPDATE chain via
+          `t_ctid` (64-hop cap) and falls back to a relation scan for
+          any tuple stamped with the SAME xmax as the recorded slot
+          carrying the moved-partition sentinel — required because
+          goopg's non-HOT UPDATE path (`PageSetHeapTupleXmax` +
+          `writeHeapRow`) does NOT update the old tuple's `t_ctid`, so
+          `s1u3npc; s1u3pc` chains the sentinel onto an intermediate
+          slot that the chain walk alone cannot reach.  Fallback is
+          xmax-filtered to reject sentinels from unrelated committed
+          xacts.  Closes the range-parted leg of
+          `partition-key-update-1.spec` (6 permutations);
+          `TestPort_IsolationPartitionKeyUpdate1` flips from
+          `SKIP (deferred)` to `PASS` end-to-end.  Regression pins:
+          `TestEpqChainCheckMovedPartitionDirectSentinel`,
+          `TestEpqChainCheckMovedPartitionViaFallbackScan`,
+          `TestEpqChainCheckMovedPartitionNoSentinel`,
+          `TestEpqChainCheckMovedPartitionFallbackIgnoresUnrelatedSentinel`
+          in `internal/executor/operators_fk_wait_test.go`.
+          `go test -race ./internal/executor/ ./internal/storage/
+          ./internal/server/ ./internal/mvcc/ ./internal/planner/
+          ./internal/parser/ ./internal/analyzer/` PASS; adjacent
+          isolation tests `InsertConflictDoNothing`,
+          `InsertConflictDoUpdate`, `LockCommittedUpdate` unchanged.
+          Design:
+          `docs/design/0100-0005q-fk-check-wait-moved-partition.md`.
         - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
           `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
           the row's source `*catalog.Table` through pending records

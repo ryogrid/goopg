@@ -15,6 +15,7 @@ package executor
 //   execCommit     → runAllDeferredFKChecks
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -210,7 +211,11 @@ func assertParentExists(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *cata
 	if len(refCols) == 0 {
 		refCols = pkColumns(parentTbl)
 	}
-	found, err := scanTableForMatch(ctx, parentTbl, refCols, vals)
+	// FK INSERT check uses the wait-aware scan: when a matching parent row's
+	// xmax is in-flight, block until that updater commits or aborts, then
+	// either re-scan or surface a moved-partition error (M0100-0005q). This
+	// mirrors PostgreSQL's RI_FKey_check SELECT FOR KEY SHARE semantics.
+	found, err := scanTableForMatchFKWait(ctx, parentTbl, refCols, vals, 0)
 	if err != nil {
 		return err
 	}
@@ -528,6 +533,179 @@ func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals [
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
+	}
+	return false, nil
+}
+
+// fkPendingRef carries identity of a matched-but-blocked FK parent row so
+// the wait+retry loop in scanTableForMatchFKWait can (a) wait on the updater
+// XID and (b) detect the moved-to-another-partition sentinel on the same slot
+// after the updater commits.  M0100-0005q.
+type fkPendingRef struct {
+	xid  storage.TransactionID
+	rel  storage.RelFileNode
+	blk  storage.BlockNumber
+	slot uint16
+}
+
+// scanRelForFKMatch is scanRelForMatch with one extra outcome: it surfaces the
+// (xid, rel, blk, slot) of the first matched parent row whose xmax is in-flight
+// (a non-self transaction in the live active set, ignoring lock-only xmax).
+//
+// Returns:
+//   - (true, nil, err): a "clean" matching row (xmax invalid / committed / aborted
+//     / lock-only) was found — the FK check passes immediately, no wait required.
+//   - (false, &p, nil): no clean match; the matching row's xmax is an in-flight
+//     non-self updater — caller must wait, then either re-scan or raise the
+//     moved-partition error if the recorded slot now carries the sentinel.
+//   - (false, nil, nil): no matching row found — FK violation; caller emits 23503.
+//
+// Why prefer clean matches: PostgreSQL's RI_FKey_check uses SELECT FOR KEY
+// SHARE, which serialises only against actual key-changing UPDATEs.  If any
+// visible matching row has no in-flight updater, it satisfies the FK
+// immediately without serialising.  When all matching rows are being updated,
+// the lock waits for the updater, mirroring our wait+retry loop.
+func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, *fkPendingRef, error) {
+	rel := ctx.Catalog.RelFileNode(tbl)
+	cols := tbl.Columns
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return false, nil, nil
+	}
+	var pending *fkPendingRef
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return false, nil, err
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			return false, nil, err
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tuple, err := storage.PageGetHeapTuple(page, slotIdx)
+			if err != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				continue
+			}
+			row, err := DecodeRow(cols, tuple.Data)
+			if err != nil {
+				continue
+			}
+			if !fkRowMatches(cols, colNames, row, vals) {
+				continue
+			}
+			// Matched.  Decide whether to wait on the updater.
+			xmax := tuple.Header.Xmax
+			isLockOnly := storage.IsHeapTupleLockOnly(tuple.Header.Infomask)
+			if xmax == storage.InvalidTransactionID || isLockOnly ||
+				xmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(xmax) {
+				// Clean match: no in-flight non-self updater.
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return true, nil, nil
+			}
+			// Pending: record only the first encountered.
+			if pending == nil {
+				pending = &fkPendingRef{xid: xmax, rel: rel, blk: blk, slot: slotIdx}
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+	}
+	return false, pending, nil
+}
+
+// scanTableForMatchFKWait performs scanTableForMatch with row-level wait
+// semantics for FK enforcement (M0100-0005q).  When the scan finds a matching
+// parent row whose xmax is from an in-flight non-self transaction, it waits
+// for that transaction to commit or abort, then either:
+//   - raises 0A000 "tuple to be locked was already moved to another partition
+//     due to concurrent update" when the updater committed a cross-partition
+//     UPDATE and stamped the moved-partition sentinel on the old slot, or
+//   - refreshes the snapshot and re-scans (covers updater abort and
+//     same-partition UPDATEs that may or may not preserve the FK key).
+//
+// pos is the AST position used for the 0A000 error.  Pass 0 if unavailable.
+func scanTableForMatchFKWait(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum, pos int) (bool, error) {
+	// Defensive iteration cap: the wait loop terminates whenever the
+	// updater commits / aborts, and a series of cross-partition UPDATEs
+	// would chain into separate xmax stamps.  In practice 2 iterations
+	// suffice (initial scan + post-wait re-scan); cap at 8 to bound
+	// pathological chains without hanging.
+	for iter := 0; iter < 8; iter++ {
+		// Scan parent.
+		found, pending, err := scanRelForFKMatch(ctx, tbl, colNames, vals)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
+		}
+		// Then partition/inheritance children — return on first clean match,
+		// accumulate the first pending xmax we see.
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			children := append([]*catalog.Table(nil), im.InheritanceChildren(tbl.OID)...)
+			children = append(children, im.PartitionChildren(tbl.OID)...)
+			for _, child := range children {
+				cfound, cpending, cerr := scanRelForFKMatch(ctx, child, colNames, vals)
+				if cerr != nil {
+					return false, cerr
+				}
+				if cfound {
+					return true, nil
+				}
+				if pending == nil && cpending != nil {
+					pending = cpending
+				}
+			}
+		}
+		if pending == nil {
+			return false, nil
+		}
+		// Wait for the in-flight updater.
+		qctx := ctx.Ctx
+		if qctx == nil {
+			qctx = context.Background()
+		}
+		if ctx.TxnMgr != nil {
+			if werr := ctx.TxnMgr.WaitForXID(qctx, pending.xid); werr != nil {
+				// ctx cancelled (connection close, query timeout) — surface
+				// "not found" so the caller emits 23503; the outer dispatcher
+				// will translate the ctx-error wrapping.
+				return false, nil
+			}
+		}
+		// Refresh the snapshot so the next scan iteration sees the updater's
+		// committed changes (or skips its aborted ones).  Done BEFORE the
+		// move-sentinel check because we need snapshot.HasAborted to filter
+		// out aborted updaters — sentinel bytes are stamped at UPDATE-time,
+		// not commit-time, so they persist across ROLLBACK and would
+		// otherwise produce a spurious 0A000.
+		if ctx.TxnMgr != nil {
+			if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
+				ctx.Snap = snap.Clone()
+			}
+		}
+		// Cross-partition move detection: only when the updater committed.
+		// Walk the UPDATE chain (not just the recorded slot) because a row
+		// updated multiple times in the same xact only carries the sentinel
+		// on the final in-xact version's t_ctid.  M0100-0005n / M0100-0005q.
+		if !ctx.Snap.HasAborted(pending.xid) &&
+			epqChainCheckMovedPartition(ctx, pending.rel, pending.blk, pending.slot) {
+			return false, errMovedToAnotherPartition(pos)
+		}
 	}
 	return false, nil
 }

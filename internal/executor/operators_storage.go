@@ -181,6 +181,116 @@ func epqSlotMovedToAnotherPartition(ctx *Context, rel storage.RelFileNode,
 	return storage.IsMovedToAnotherPartition(tup.Header.CTID)
 }
 
+// epqChainCheckMovedPartition walks the UPDATE chain starting at (rel, blk,
+// slot) via t_ctid and reports whether any tuple in the chain carries the
+// moved-to-another-partition sentinel.  Unlike `epqSlotMovedToAnotherPartition`
+// (single-slot check), this follows the chain across pages — required when a
+// row was updated multiple times in the same xact and only the LAST in-xact
+// version's t_ctid was stamped with the sentinel.  Example: s1 does UPDATE
+// SET b='X' WHERE a=7 (stamps xmax + ctid→new on the original), THEN UPDATE
+// SET a=11 WHERE a=7 (stamps xmax + ctid=MovedPartitions on the second
+// version).  A caller that recorded the original slot must follow the chain
+// to discover the sentinel.
+//
+// Termination: stops at a self-CTID (latest version), an invalid offset, the
+// sentinel itself, or after maxChain steps (defensive).
+func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
+	blk storage.BlockNumber, slot uint16) bool {
+	// Strategy 1 (fast path): walk the t_ctid chain.  PG always updates the
+	// old tuple's t_ctid to point to the new version on UPDATE; HOT
+	// in-partition updates in goopg do too (PageStampHotOldTuple).
+	const maxChain = 64
+	curBlk, curSlot := blk, slot
+	for i := 0; i < maxChain; i++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
+		if err != nil {
+			break
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), curSlot)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if gerr != nil {
+			break
+		}
+		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+			return true
+		}
+		ctid := tup.Header.CTID
+		if ctid.Block == curBlk && ctid.Offset == curSlot {
+			break // latest version
+		}
+		if ctid.Offset == 0 {
+			break
+		}
+		curBlk = ctid.Block
+		curSlot = ctid.Offset
+	}
+	// Strategy 2 (fallback): non-HOT UPDATEs in goopg currently do NOT
+	// update the old tuple's t_ctid to point to the new version
+	// (PageSetHeapTupleXmax stamps xmax only).  If the chain walk above
+	// terminated without crossing into a newer version, scan the relation
+	// for a sentinel-stamped tuple stamped by the same xact as the original
+	// slot's xmax — this is the tuple that was the SOURCE of a cross-
+	// partition UPDATE within the same xact chain.
+	srcXmax := storage.InvalidTransactionID
+	{
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err == nil {
+			s.RLock()
+			tup, gerr := storage.PageGetHeapTuple(s.Page(), slot)
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			if gerr == nil {
+				srcXmax = tup.Header.Xmax
+			}
+		}
+	}
+	if srcXmax == storage.InvalidTransactionID {
+		return false
+	}
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return false
+	}
+	for b := storage.BlockNumber(0); b < nBlocks; b++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: b})
+		if err != nil {
+			continue
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tup, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if tup.Header.Xmax != srcXmax {
+				continue
+			}
+			if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return true
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+	}
+	return false
+}
+
 // errMovedToAnotherPartition is the canonical PG error raised when EPQ
 // rechecks (UPDATE/DELETE/SELECT FOR UPDATE/triggers/lockRows) walk to a
 // tuple that has been cross-partition UPDATEd by a concurrent committed
