@@ -2326,6 +2326,57 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       the subscriber. Candidate causes: publication-filter
       rejection, missing Begin/Commit emission for in-snapshot
       transactions, or catalog snapshot timing.
+      PARTIAL PROGRESS 2026-05-14 (loop 11): closed rung 10 —
+      publication-filter rejection (the first candidate cause). Design
+      doc: `docs/design/0103-0015-publication-table-canonicalization.md`
+      (accepted).
+      Diagnosis: the harness runs `CREATE TABLE public.t (…)` followed
+      by `CREATE PUBLICATION p FOR TABLE t` (unqualified). goopg's
+      `execCreatePublication` previously appended each table to the
+      publication via `qualifiedTableName(t)`, which renders an
+      `ObjectName{Schema:"", Name:"t"}` as the literal string `"t"`.
+      `runLogicalWalsender` later builds the catalog snapshot from
+      `catalog.InMemory.AllTables`, so the relation entry the plugin
+      sees carries `Schema="public", Name="t"` and
+      `relQualifiedName(rel)` returns `"public.t"`. The walsender's
+      `publicationFilter.byTable["public.t"]` lookup misses against
+      the stored `"t"` key, the `Allows` gate returns false, and every
+      change is silently dropped — explaining "stable connection, no
+      DML messages flow" after rung 9.
+      Changes:
+      - `internal/executor/operators_ddl.go::execCreatePublication`:
+        the table-list build now resolves each
+        `parser.ObjectName` via `Catalog.LookupTable` (with a
+        `Schema=""` → `Schema="public"` fallback that mirrors PG's
+        default search-path) and appends `tbl.QualifiedName()`. Non-
+        existent tables now raise `42P01: relation … does not exist`
+        at DDL time instead of producing dead publication rows that
+        will never match any decoded change. Upstream PG stores
+        `pg_publication_rel.prrelid` (OID) at CREATE PUBLICATION
+        time; goopg's PubSub keys by qualified-name string, so the
+        canonicalisation step makes the two ends of the comparison
+        agree.
+      Tests (new file
+      `internal/executor/operators_ddl_pubsub_test.go`):
+      - `TestCreatePublicationStoresCanonicalQualifiedName` — load-
+        bearing pin: seeds `public.t`, runs `CREATE PUBLICATION p
+        FOR TABLE t`, asserts `pub.Tables == ["public.t"]`.
+      - `TestCreatePublicationExplicitSchemaName` — round-trip pin:
+        explicit `public.items_q` reference stored unchanged.
+      - `TestCreatePublicationUnknownTableErrors` — `42P01` pin for
+        non-existent relations.
+      Verification (loop 11): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green (parser 1.047 s, planner
+      1.065 s, analyzer 1.036 s, executor 2.603 s, server 3.529 s,
+      wal 3.093 s, catalog 1.019 s).
+      The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` stays in
+      place so each subsequent rung lands with its own design doc +
+      targeted unit pin. Candidate next failures (deferred): pgoutput
+      Begin/Commit emission for xacts with zero in-publication
+      changes, catalog-snapshot timing for relations created after
+      slot creation.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

@@ -148,9 +148,24 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 			}
 		}
 	}
+	// Canonicalise each table reference to the qualified form the
+	// walsender's publication filter compares against
+	// (`wal.RelationDef.Schema + "." + Name`). Upstream PG resolves
+	// the OID at DDL time and stores `pg_publication_rel.prrelid`;
+	// goopg's PubSub keys by string, so the qualified name produced
+	// here must match what `relQualifiedName` (server) returns at
+	// decode time. Unqualified names fall back to `public` to mirror
+	// PG's default search_path. See 0103-0015.
 	tables := make([]string, 0, len(s.Tables))
 	for _, t := range s.Tables {
-		tables = append(tables, qualifiedTableName(t))
+		tbl, ok := o.ctx.Catalog.LookupTable(t)
+		if !ok && t.Schema == "" {
+			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: t.Name})
+		}
+		if !ok {
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", qualifiedTableName(t))}
+		}
+		tables = append(tables, tbl.QualifiedName())
 	}
 	if _, err := o.ctx.PubSub.CreatePublication(s.Name, tables, opts); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
