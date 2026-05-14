@@ -1726,6 +1726,52 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `LockCommittedUpdate`, `PartitionKeyUpdate1`,
           `PartitionKeyUpdate2` unchanged (5/5 still PASS).  Design:
           `docs/design/0100-0005v-isolation-spec-multi-line-permutation.md`.
+        - Parent DELETE waits for in-flight child INSERT; RR/Ser raises
+          40001 (M0100-0005w, 2026-05-15 loop 38).
+          `internal/executor/operators_fk.go` adds
+          `detectInFlightChildInsert` (scans the referencing child
+          relation plus its inheritance / partition children for the
+          first row whose FK columns match the deleted parent and whose
+          xmin is an in-flight non-self xact still active in the
+          TxnMgr — the mirror of M0100-0005q's xmax-watch helper) and
+          `fkChildWaitForInFlightInsert` (bounded wait+retry loop:
+          `WaitForXID` blocks on the inserter, then under RR/Ser
+          returns `ExecError{Code:"40001", Message:"could not serialize
+          access due to concurrent update"}` when the inserter
+          committed; under RC refreshes the snapshot via
+          `SnapshotFor(ctx.Tx)` and loops so the caller's downstream
+          scans process the now-visible child row normally).
+          `enforceFKOnDelete` invokes the wait at the top of each
+          per-FK iteration, gated so DEFERRABLE INITIALLY DEFERRED FK
+          checks (which run at COMMIT time, when no concurrent inserter
+          against us can still be in-flight) bypass it.  Without this,
+          CASCADE / SET NULL scans filtered out the in-flight child via
+          `mvcc.TupleVisibleSubxact` and the parent DELETE completed
+          silently — `fk-snapshot.spec`'s L72 / L76 permutations
+          (`s2ip2 s1brr s1ifp2 s2brr s2dp2 s1c s2c` CASCADE and the
+          SET NULL twin) lost both the `<waiting ...>` line AND the
+          40001 line that upstream's RI_FKey_*_del crosscheck snapshot
+          emits.  `internal/mvcc/manager.go` adds public
+          `HasAbortedXID(xid)` (locked binary search over
+          `m.abortedXIDs`) because RR snapshots are frozen at BEGIN and
+          their `Aborted` slice cannot reflect aborts that happened
+          after — post-`WaitForXID` we need a fresh definitive answer
+          to "did this xact commit or abort?" to pick between 40001 and
+          a re-scan.  Closes both remaining permutations of
+          `fk-snapshot.spec`; `TestPort_IsolationFkSnapshot` flips from
+          `defer` (4 of 7 green) to PASS (all 7 green) end-to-end.
+          Regression pins: `TestManagerHasAbortedXID`
+          (`internal/mvcc/has_aborted_xid_test.go`),
+          `TestFKDelete_RR_RaisesSerializationOnConcurrentChildInsert`
+          and `TestFKDelete_RC_CompletesAfterConcurrentChildInsertCommit`
+          (`internal/server/fk_delete_waits_inflight_child_insert_test.go`).
+          `go test -count=1 -race -timeout 240s ./internal/executor/
+          ./internal/storage/ ./internal/mvcc/ ./internal/server/` PASS;
+          adjacent isolation tests `InsertConflictDoNothing`,
+          `InsertConflictDoUpdate`, `LockCommittedUpdate`,
+          `PartitionKeyUpdate1`, `PartitionKeyUpdate2` unchanged (5/5
+          still PASS).  Design:
+          `docs/design/0100-0005w-fk-on-delete-waits-inflight-child-insert.md`.
         - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
           `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
           the row's source `*catalog.Table` through pending records

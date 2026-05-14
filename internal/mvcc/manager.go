@@ -482,6 +482,29 @@ func (m *Manager) IsXIDActive(xid storage.TransactionID) bool {
 	return m.xidInProgress(xid)
 }
 
+
+// HasAbortedXID reports whether xid is recorded in the manager's aborted
+// set (transactions that ran Rollback). Lives next to IsXIDActive because
+// callers typically pair the two: WaitForXID returns once the xact is
+// settled, and the caller then asks "did it commit or abort?" — committed
+// is "not active AND not aborted"; aborted is HasAbortedXID. Used by the
+// FK-on-delete wait path to translate "in-flight child INSERT settled" into
+// the correct post-wait action: commit → raise 40001 in RR/Serializable,
+// abort → no FK conflict.
+func (m *Manager) HasAbortedXID(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := len(m.abortedXIDs)
+	if n == 0 {
+		return false
+	}
+	idx := sort.Search(n, func(i int) bool { return m.abortedXIDs[i] >= xid })
+	return idx < n && m.abortedXIDs[idx] == xid
+}
+
 // XactMarker discriminates the two transaction-end markers fed to
 // the M0008 logical decoder via SetXactMarkerLogger. Mirrors the
 // upstream xact-end records.

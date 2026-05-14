@@ -76,6 +76,19 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 			continue
 		}
 		fk := ref.FK
+		// M0100-0005w: wait on any concurrent xact that has inserted a
+		// referencing row into the child table that our snapshot cannot
+		// see.  Surfaces 40001 under RR/Serializable (mirrors upstream's
+		// RI_FKey_*_del crosscheck-snapshot serialization error) and
+		// refreshes the snapshot under RC so the scans below process the
+		// now-committed row normally.  Deferred FK checks (NO ACTION
+		// INITIALLY DEFERRED) skip this because they run at COMMIT time
+		// when no concurrent inserter can still be in-flight against us.
+		if !(fk.Deferrable && fk.InitiallyDeferred && ctx.Session != nil && ctx.Session.InExplicitTransaction()) {
+			if err := fkChildWaitForInFlightInsert(ctx, ref.Child, fk.Columns, vals); err != nil {
+				return err
+			}
+		}
 		switch fk.OnDelete {
 		case parser.FKActionCascade:
 			if err := fkCascadeDelete(ctx, ref.Child, fk, vals); err != nil {
@@ -708,6 +721,141 @@ func scanTableForMatchFKWait(ctx *Context, tbl *catalog.Table, colNames []string
 		}
 	}
 	return false, nil
+}
+
+
+// detectInFlightChildInsert scans childTbl (plus its partition / inheritance
+// children) for the first row whose FK columns match vals AND whose xmin is
+// an in-flight non-self transaction.  Returns (xid, true) when such a row is
+// found, or (0, false) otherwise.
+//
+// "In-flight" here means: xmin is recorded as in-progress in our snapshot
+// (so the inserter started before us OR materialised its xid into the active
+// set at any point we still observe) AND the inserter is still active in the
+// txn manager.  Subxacts roll up to their top-level via SubxactResolver — we
+// pin to the simpler top-level check here because FK enforcement always sees
+// the top-level xid stamped on the heap row by the inserter.  This match
+// criterion mirrors the upstream RI_FKey_*_del trigger's "did a concurrent
+// transaction insert a referencing row I cannot see in my snapshot?" probe.
+//
+// Used by fkChildWaitForInFlightInsert (M0100-0005w): when a parent DELETE
+// would touch (CASCADE / SET NULL) or guard against (NO ACTION / RESTRICT)
+// child rows that a concurrent INSERT made invisible to our snapshot, block
+// on the inserter, then surface 40001 in RR/Serializable.
+func detectInFlightChildInsert(ctx *Context, childTbl *catalog.Table, fkCols []string, vals []Datum) (storage.TransactionID, bool) {
+	tables := []*catalog.Table{childTbl}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		tables = append(tables, im.InheritanceChildren(childTbl.OID)...)
+		tables = append(tables, im.PartitionChildren(childTbl.OID)...)
+	}
+	for _, t := range tables {
+		rel := ctx.Catalog.RelFileNode(t)
+		cols := t.Columns
+		nBlocks, err := ctx.Pool.NBlocks(rel)
+		if err != nil {
+			continue
+		}
+		for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+			s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+			if err != nil {
+				continue
+			}
+			s.RLock()
+			page := s.Page()
+			if storage.IsNew(page) {
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				continue
+			}
+			count, err := storage.PageLinePointerCount(page)
+			if err != nil {
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				continue
+			}
+			for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+				tuple, err := storage.PageGetHeapTuple(page, slotIdx)
+				if err != nil {
+					continue
+				}
+				xmin := tuple.Header.Xmin
+				if xmin == storage.InvalidTransactionID || xmin == ctx.Tx.XID {
+					continue
+				}
+				if !ctx.Snap.HasInProgress(xmin) {
+					continue
+				}
+				if ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(xmin) {
+					continue
+				}
+				row, derr := DecodeRow(cols, tuple.Data)
+				if derr != nil {
+					continue
+				}
+				if fkRowMatches(cols, fkCols, row, vals) {
+					s.RUnlock()
+					ctx.Pool.Unpin(s)
+					return xmin, true
+				}
+			}
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+		}
+	}
+	return 0, false
+}
+
+// fkChildWaitForInFlightInsert is the wait+retry wrapper around
+// detectInFlightChildInsert (M0100-0005w).  When a concurrent xact has
+// inserted a referencing row that our snapshot cannot see, this function
+// blocks on the inserter and then surfaces 40001 under RR/Serializable
+// (matching upstream's RI_FKey_*_del crosscheck-snapshot serialization
+// error).  Under RC, the snapshot is refreshed and the caller is expected
+// to proceed with its scan — the now-committed child row will be visible
+// and processed normally by CASCADE / SET NULL / RESTRICT / NO ACTION.
+//
+// Iteration cap (8) bounds pathological chains where multiple short xacts
+// keep inserting referencing rows; in practice 1-2 iterations are enough.
+func fkChildWaitForInFlightInsert(ctx *Context, childTbl *catalog.Table, fkCols []string, vals []Datum) error {
+	for iter := 0; iter < 8; iter++ {
+		xid, found := detectInFlightChildInsert(ctx, childTbl, fkCols, vals)
+		if !found {
+			return nil
+		}
+		qctx := ctx.Ctx
+		if qctx == nil {
+			qctx = context.Background()
+		}
+		if ctx.TxnMgr != nil {
+			if werr := ctx.TxnMgr.WaitForXID(qctx, xid); werr != nil {
+				// ctx cancelled (connection close, query timeout) — surface
+				// no error; the outer dispatch translates ctx cancellation.
+				return nil
+			}
+		}
+		// RR / Serializable: if the inserter committed, the FK enforcement
+		// would touch a row that didn't exist in our snapshot — that's
+		// the upstream "concurrent update" serialization break.  Match
+		// the wire shape ExecError emits for plain DML EPQ retries.
+		if ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+			if ctx.TxnMgr != nil && !ctx.TxnMgr.HasAbortedXID(xid) {
+				return &ExecError{
+					Code:    "40001",
+					Message: "could not serialize access due to concurrent update",
+				}
+			}
+		}
+		// RC: refresh snapshot so the next iteration (and the caller's
+		// own scans) see the committed insert.  Loop in case another
+		// concurrent xact slipped in a fresh in-flight INSERT while we
+		// were waiting.
+		if ctx.TxnMgr != nil {
+			if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
+				ctx.Snap = snap.Clone()
+			}
+		}
+	}
+	return nil
 }
 
 // fkColValues extracts the FK column values from a row, returning
