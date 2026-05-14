@@ -290,9 +290,9 @@ alongside the suite.
       - Verification: TestPort_IsolationLockCommittedUpdate runs 120s (blocking works,
         spec defers due to output format + connection timeout across permutations). (2026-05-12).
 
-- [ ] **M0096-0005**
-      - Summary: ON CONFLICT infrastructure: partial progress (2026-05-12).
-      - Landed:
+- [x] **M0096-0005**
+      - Summary: ON CONFLICT infrastructure. CLOSED 2026-05-14 via M0100-0002.
+      - Landed (originally 2026-05-12):
         (a) CREATE TABLE now creates primary key btree index for inline `col type
         PRIMARY KEY` and table-level `PRIMARY KEY (cols)` — fixes 42P10 "no
         unique constraint" error that was the primary blocker.
@@ -307,13 +307,14 @@ alongside the suite.
         (e) WaitForXID on mvcc.Manager (broadcasts on every commit/rollback) and
         probeArbiterWaiting / findInProgressConflict in upsertOp (row-wait logic).
         (f) advisorySessionIDFromContext uses ctx.BackendID rather than nil Session.
-      - Remaining: donothing2 / insert2 blocking behavior (insert-conflict specs) not
-        yet producing <waiting ...> lines. The blocking mechanism is wired but debugging
-        of the exact WaitForXID trigger path is needed (XID propagation from ectx.Tx
-        to connTxState may be incomplete). The insert-conflict-do-update and do-nothing
-        specs still defer.
-      - Action: complete wait-state propagation and output parity so insert-conflict
-        specs can transition from defer to pass.
+      - Closure cross-reference: M0100-0002 (eager XID materialisation at BEGIN)
+        completed wait-state propagation and snapshot-correctness for the
+        insert-conflict family. Verified 2026-05-14:
+        `TestPort_IsolationInsertConflictDoNothing` PASS and
+        `TestPort_IsolationInsertConflictDoUpdate` PASS — the two explicit M0096-0005
+        targets. The remaining `insert-conflict-do-update-{2,3,4}` variants are
+        tracked under M0100-0005's 21-spec pass goal (output-format and partition
+        row-movement work, not the ON CONFLICT runtime touched here).
 
 - [x] **M0096-0006**
       - Summary: Unblocked `drop-index-concurrently-1` setup (2026-05-12).
