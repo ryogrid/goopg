@@ -2444,8 +2444,12 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 		return false
 	}
 	xminLive := false
+	selfXID := ctx.Tx.XID
 	if ctx.TxnMgr != nil {
 		switch {
+		case selfXID != storage.InvalidTransactionID && xmin == selfXID:
+			// Inserted by our own xact in this transaction — live.
+			xminLive = true
 		case ctx.TxnMgr.IsXIDActive(xmin):
 			xminLive = true
 		case ctx.Snap.SeesCommittedXID(xmin):
@@ -2468,10 +2472,17 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 	if xmax == storage.InvalidTransactionID {
 		return true
 	}
+	// Deletion by our own xact (DELETE then INSERT in the same transaction
+	// must succeed).  Without this short-circuit, an in-progress self-xmax
+	// would be classified as "still live", and the follow-up INSERT would
+	// raise 23505 against the row we just deleted.
+	if selfXID != storage.InvalidTransactionID && xmax == selfXID {
+		return false
+	}
 	if ctx.TxnMgr != nil {
 		if ctx.TxnMgr.IsXIDActive(xmax) {
-			// Concurrent delete — still considered live until that
-			// xact commits.
+			// Concurrent delete by a different live xact — still
+			// considered live until that xact commits.
 			return true
 		}
 		if ctx.Snap.HasAborted(xmax) {

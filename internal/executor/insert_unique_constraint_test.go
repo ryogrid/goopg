@@ -140,3 +140,66 @@ func TestInsertRuntimeUniqueViolationAllowsAfterRolledBackInsert(t *testing.T) {
 		t.Fatalf("unrelated key check should not error: %v", err)
 	}
 }
+
+
+// TestIsLiveForUniqueCheck_SelfXactDeleteIsDead pins the
+// "DELETE then INSERT same key in the same transaction" semantics
+// expected by `fk-snapshot.spec`'s `s1brr s1dfp s1ifp1 s1c s1sfn`
+// permutation (and the RC analogue).  Without the self-xid xmax
+// short-circuit, `isLiveForUniqueCheck` saw `xmax = ctx.Tx.XID`,
+// `IsXIDActive(xmax) == true`, and returned "live" — so the follow-up
+// INSERT raised SQLSTATE 23505 against the row it had just deleted.
+//
+// The assertion runs the helper directly with a synthesised
+// `(xmin, xmax)` pair: xmin = a separate committed xact, xmax = the
+// session's own active xid.  Returning `false` means "not a live
+// duplicate", which is what the INSERT path wants to hear.
+func TestIsLiveForUniqueCheck_SelfXactDeleteIsDead(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	// xmin = some prior committed xact (older than the snapshot we hold).
+	priorTx, err := ctx.TxnMgr.Begin(ctx.Tx.Isolation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorXID, err := ctx.TxnMgr.AssignXID(priorTx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.TxnMgr.Commit(priorTx); err != nil {
+		t.Fatal(err)
+	}
+
+	// xmax = our own session's xid (the deleter).
+	selfXID, err := ctx.TxnMgr.AssignXID(ctx.Tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.Tx.XID = selfXID
+
+	// Refresh snapshot so the prior xact is visible as committed.
+	snap, err := ctx.TxnMgr.SnapshotFor(ctx.Tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.Snap = snap
+
+	if got := isLiveForUniqueCheck(ctx, priorXID, selfXID); got {
+		t.Fatalf("isLiveForUniqueCheck(xmin=prior-committed, xmax=self) = true; want false (own-xact delete is not a live duplicate)")
+	}
+
+	// Sanity: a tuple deleted by a *different* live xact remains a live
+	// duplicate (concurrent delete that has not yet committed).
+	otherTx, err := ctx.TxnMgr.Begin(ctx.Tx.Isolation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherXID, err := ctx.TxnMgr.AssignXID(otherTx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := isLiveForUniqueCheck(ctx, priorXID, otherXID); !got {
+		t.Fatalf("isLiveForUniqueCheck(xmin=prior-committed, xmax=other-active) = false; want true (concurrent delete, not yet committed)")
+	}
+}

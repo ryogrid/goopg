@@ -325,3 +325,55 @@ func TestFormatPQErrorFallsBackOnNonPQ(t *testing.T) {
 		t.Errorf("formatPQError(nil) = %q, want empty", got)
 	}
 }
+
+// TestParseIsolationSpecMultiLinePermutation pins the multi-line
+// `permutation` keyword syntax: the keyword may sit on a bare line with
+// indented step-name tokens on the following lines, including '#'-only
+// comment lines interspersed between tokens. This is the layout used by
+// insert-conflict-specconflict.spec to annotate the controller-lock dance.
+// Before this fix, the parser required `permutation <tokens>` to fit on a
+// single line, so every step in that spec became "unused step name".
+func TestParseIsolationSpecMultiLinePermutation(t *testing.T) {
+	spec := "session \"s1\"\n" +
+		"step \"a\" { SELECT 1; }\n" +
+		"step \"b\" { SELECT 2; }\n" +
+		"step \"c\" { SELECT 3; }\n" +
+		"permutation\n" +
+		"   # leading comment, indented\n" +
+		"   a\n" +
+		"   # mid-block comment, indented\n" +
+		"   b c\n" +
+		"\n" + // blank line terminates the block
+		"permutation \"a\" \"c\"\n" // back to single-line form on a new block
+	path := filepath.Join(t.TempDir(), "multi.spec")
+	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIsolationSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Permutations) != 2 {
+		t.Fatalf("Permutations len = %d (%v), want 2", len(parsed.Permutations), parsed.Permutations)
+	}
+	want0 := []string{"a", "b", "c"}
+	if !equalSlices(parsed.Permutations[0], want0) {
+		t.Errorf("Permutations[0] = %v, want %v", parsed.Permutations[0], want0)
+	}
+	want1 := []string{"a", "c"}
+	if !equalSlices(parsed.Permutations[1], want1) {
+		t.Errorf("Permutations[1] = %v, want %v", parsed.Permutations[1], want1)
+	}
+}
+
+func equalSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

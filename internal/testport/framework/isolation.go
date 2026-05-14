@@ -45,7 +45,7 @@ var (
 	reSession      = regexp.MustCompile(`^session\s+("([^"]+)"|(\S+))\s*$`)
 	reStepStart    = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*\{(.*)$`)
 	reStepNoBlock  = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*$`)
-	rePermutation  = regexp.MustCompile(`^permutation\s+(.+)$`)
+	rePermutation  = regexp.MustCompile(`^permutation(?:\s+(.+))?$`)
 	reQuotedTokens = regexp.MustCompile(`"([^"]+)"`)
 )
 
@@ -233,10 +233,19 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 				if idx := strings.Index(stripped, "#"); idx >= 0 {
 					stripped = strings.TrimSpace(stripped[:idx])
 				}
-				if !isIndented || stripped == "" {
-					// Not a continuation — push back and stop.
+				if !isIndented {
+					// Not a continuation — push back and stop. Blank
+					// (zero-length) lines are also non-indented; they
+					// terminate the permutation block.
 					pendingLine = nextRaw
 					break
+				}
+				if stripped == "" {
+					// Indented comment-only line inside a multi-line
+					// permutation block — skip and keep reading. Upstream
+					// specs (e.g. insert-conflict-specconflict.spec) embed
+					// explanatory '#' comments between continuation tokens.
+					continue
 				}
 				tokens = append(tokens, parsePermutationTokens(stripped)...)
 			}

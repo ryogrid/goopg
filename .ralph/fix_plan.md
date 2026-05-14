@@ -1651,6 +1651,81 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `InsertConflictDoNothing`, `PartitionKeyUpdate1` unchanged
           (4/4 still PASS).  Design:
           `docs/design/0100-0005t-upsert-partition-routing-and-leaf-arbiter.md`.
+        - `isLiveForUniqueCheck` honours self-xact xmax (M0100-0005u,
+          2026-05-15 loop 37). `internal/executor/operators_storage.go::isLiveForUniqueCheck`
+          short-circuits `xmax == ctx.Tx.XID` to "dead" before the
+          `IsXIDActive(xmax)` arm, mirroring upstream
+          `HeapTupleSatisfiesDirty`'s self-xact xmax handling. The xmin
+          arm gets a parallel self-xid → live guard. Without this,
+          M0100-0005r's runtime unique check classified a row deleted
+          earlier in the same transaction as a "still-live duplicate"
+          because `IsXIDActive(self) == true`, raising 23505 on
+          `DELETE FROM t WHERE k=K; INSERT INTO t VALUES(K);` shapes —
+          the `s1brr s1dfp s1ifp1 s1c s1sfn` and `s1brc s1dfp s1ifp1 s1c
+          s1sfn` permutations of `fk-snapshot.spec` (M0100-0005's 21-test
+          pass goal). Pinned by `TestIsLiveForUniqueCheck_SelfXactDeleteIsDead`
+          in `internal/executor/insert_unique_constraint_test.go` (table-driven
+          two-arm: `(xmin=committed-prior, xmax=self-xid)` → dead;
+          `(xmin=committed-prior, xmax=other-active-xid)` → live, so
+          M0100-0005r's concurrent-delete semantics do not regress).
+          `TestPort_IsolationFkSnapshot` advances past the L106/L114
+          spurious 23505 lines (the first 4 permutations now run clean);
+          the remaining diffs are concurrent-FK `<waiting ...>` and the
+          RR `40001` "could not serialize access due to concurrent
+          update" — both standalone follow-ups out of M0100-0005u
+          scope. `go test -count=1 -race -timeout 240s
+          ./internal/executor/ ./internal/storage/ ./internal/server/
+          ./internal/mvcc/` PASS; adjacent isolation tests
+          `InsertConflictDoNothing`, `InsertConflictDoUpdate`,
+          `LockCommittedUpdate`, `PartitionKeyUpdate1`,
+          `PartitionKeyUpdate2` unchanged (5/5 still PASS). Design:
+          `docs/design/0100-0005u-isLiveForUniqueCheck-self-xact-delete.md`.
+        - Multi-line `permutation` keyword in isolation spec parser
+          (M0100-0005v, 2026-05-15 loop 37).
+          `internal/testport/framework/isolation.go::ParseIsolationSpec`
+          previously required the `permutation` keyword and at least one
+          step-name token to fit on a single line — the regex
+          `^permutation\s+(.+)$` rejected the bare-keyword form used by
+          `insert-conflict-specconflict.spec`:
+          ```
+          permutation
+             # acquire a number of locks ...
+             controller_locks
+             controller_show
+             s1_upsert s2_upsert
+             ...
+          ```
+          The bare `permutation` line failed the regex, no permutation was
+          registered, and every declared step surfaced as
+          `unused step name: <step>` — masking every real diagnostic for
+          the speculative-insert lock dance.  A secondary defect compounded
+          the problem: the continuation reader broke out as soon as it saw
+          an indented line whose stripped-comment content was empty, so a
+          comment-only continuation line truncated the block at the first
+          annotation.  Fix: (a) regex relaxed to
+          `^permutation(?:\s+(.+))?$` (bare keyword matches with empty
+          group; `permutationxyz` still fails because the word must end at
+          whitespace or end-of-line); (b) the continuation reader splits
+          the previously-combined break condition into two arms — non-
+          indented lines push back and terminate the block (blank-line
+          terminator semantics preserved), indented-but-empty-after-
+          comment-strip lines are skipped with `continue` so embedded `#`
+          comments do not truncate.  Closes the parser-side block on
+          `TestPort_IsolationInsertConflictSpecconflict` (every step
+          previously surfaced as `unused step name`); spec now advances
+          past parse and surfaces the next real engine gap (CREATE FUNCTION
+          attribute-after-body grammar — `IMMUTABLE` keyword before the
+          `AS $$body$$` clause; separate scope).  Regression pin:
+          `TestParseIsolationSpecMultiLinePermutation` in
+          `internal/testport/framework/isolation_test.go` covers bare
+          keyword + leading `#`-only comment + mid-block `#`-only comment
+          + blank-line terminator + coexistence with follow-on single-line
+          `permutation "a" "c"` form.  `go test -count=1 -race
+          ./internal/testport/framework/` PASS; adjacent isolation tests
+          `InsertConflictDoNothing`, `InsertConflictDoUpdate`,
+          `LockCommittedUpdate`, `PartitionKeyUpdate1`,
+          `PartitionKeyUpdate2` unchanged (5/5 still PASS).  Design:
+          `docs/design/0100-0005v-isolation-spec-multi-line-permutation.md`.
         - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
           `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
           the row's source `*catalog.Table` through pending records
