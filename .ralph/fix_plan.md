@@ -1939,6 +1939,49 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       against PG publisher with `pgbench_history` polling, REPLICA
       IDENTITY FULL / TOAST / DDL replication shapes, kill -9 +
       libpq multi-host reconnect plumbing on the client side.
+      PARTIAL PROGRESS 2026-05-14 (rung 4): REPLICA IDENTITY FULL
+      branch coverage. Design doc:
+      `docs/design/0103-0027-m0103-0007-rung-4-pg-to-goopg-replica-identity-full.md`
+      (accepted). New test
+      `TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull` in
+      `internal/testport/pgoutput_interop_test.go` drives a
+      no-primary-key table whose publisher carries
+      `ALTER TABLE public.t REPLICA IDENTITY FULL` before
+      subscription creation. Workload: 3 INSERTs, 1 UPDATE that
+      does NOT touch a key column, 1 DELETE. Under FULL pgoutput
+      emits `'O'` + full pre-image on every UPDATE/DELETE
+      regardless of key-column modification, so the apply worker's
+      `len(m.OldTuple) > 0` branch is forced (rung 2's
+      `primaryKeyOnlyRow` synthesis path is unreachable for no-PK
+      relations). The rung pins three previously-unverified apply
+      paths: (a) `applyInsert` against a table with zero
+      unique/primary indexes — `maintainUniqueIndexesForInsert`
+      becomes a no-op via its `!idx.Unique && !idx.Primary` filter
+      and the row reaches the heap visible to fresh-session
+      SeqScans; (b) `applyUpdate`'s explicit-old-tuple branch —
+      `decodePgoutputTupleAsRow(m.OldTuple)` returns a full Row
+      where every cell carries a value (no NULL skip-cells), then
+      `rowMatchesKey` does full-column equality on the heap; (c)
+      `applyDelete` via the same full-row sequential-scan match.
+      Fresh `database/sql` connection per assertion via
+      `psc.WaitForRow`; predicates use only non-indexed columns
+      (`WHERE 1=1`, `WHERE a=2 AND v='bb'`, `WHERE a=1`,
+      `WHERE a=3 AND v='c'`) so the SeqScan path is exercised
+      end-to-end. No new fix was needed — the apply worker's
+      existing FULL-shape branch handles `'t'`/`'n'` column status
+      codes correctly. Verification (rung 4):
+      `go test -count=1 -timeout 120s
+      -run TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull
+      ./internal/testport/` → PASS (~1.7 s). All 5
+      `TestPort_PgoutputInterop*` tests still green together.
+      Race-tested regression on
+      `./internal/executor/ ./internal/wal/ ./internal/server/
+      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+      → all green. Next rungs (deferred within M0103-0007):
+      TOAST (`'u'` unchanged-TOAST status decode), DDL replication,
+      pgbench against PG publisher with `pgbench_history` polling,
+      kill -9 + libpq multi-host reconnect plumbing on the client
+      side.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

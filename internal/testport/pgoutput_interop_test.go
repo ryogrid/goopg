@@ -681,6 +681,83 @@ func TestPort_PgoutputInteropPGToGoopgBatchDML(t *testing.T) {
 	}
 }
 
+// TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull exercises the
+// PG-publisher → goopg-subscriber apply path under REPLICA IDENTITY
+// FULL on a table without a primary key. The previous rungs covered
+// REPLICA IDENTITY DEFAULT (pgoutput omits the old-tuple section or
+// emits a 'K' key-only block); this rung pins the 'O' full-pre-image
+// branch in `wal.DecodeMessage` and `ApplyWorker.applyUpdate` /
+// `applyDelete`. Without a PK the rung-2 `primaryKeyOnlyRow`
+// synthesis path is unreachable, so every UPDATE/DELETE must travel
+// through `decodePgoutputTupleAsRow(m.OldTuple)` + the full-row
+// equality match in `rowMatchesKey`.
+//
+// Design doc: docs/design/0103-0027-m0103-0007-rung-4-pg-to-goopg-replica-identity-full.md.
+func TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-rid-full")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_rid_full"
+	psc := pubsubcluster.NewMixed(t, "pg2g_ridfull", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// No PRIMARY KEY — REPLICA IDENTITY FULL is the only way for a
+	// no-PK table to publish UPDATE/DELETE under upstream's rules.
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (a int, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (a int, v text)")
+	psc.Publisher.Exec(t, "ALTER TABLE public.t REPLICA IDENTITY FULL")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'a')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'b')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (3, 'c')")
+	// UPDATE doesn't touch a key column; under REPLICA IDENTITY FULL
+	// pgoutput emits 'O' + full pre-image regardless. Exercises the
+	// `len(m.OldTuple) > 0` branch in applyUpdate.
+	psc.Publisher.Exec(t, "UPDATE public.t SET v = 'bb' WHERE a = 2")
+	// DELETE under FULL carries 'O' + full pre-image too; rowMatchesKey
+	// must do a full-row sequential-scan match (no PK index).
+	psc.Publisher.Exec(t, "DELETE FROM public.t WHERE a = 1")
+
+	// Fresh sessions throughout. Predicates use only non-indexed
+	// columns so the SeqScan path is exercised (no PK to fall back on).
+	psc.WaitForRow(t, "public.t", "1=1", 2, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "a = 2 AND v = 'bb'", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "a = 1", 0, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "a = 3 AND v = 'c'", 1, 30*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"
