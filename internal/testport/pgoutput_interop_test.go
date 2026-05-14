@@ -571,6 +571,116 @@ func TestPort_PgoutputInteropPGToGoopgFullDML(t *testing.T) {
 	}
 }
 
+// TestPort_PgoutputInteropPGToGoopgBatchDML extends the rung-2 single-
+// row round-trip into a sustained-workload pattern: 50 INSERTs followed
+// by 25 UPDATEs over the same PK range and 10 DELETEs of distinct
+// rows, all on a PG publisher with a goopg subscriber. It exercises
+// the same apply-worker DML paths under load — many rows per pgoutput
+// session, many fresh heap pages, multiple xact boundaries — and pins
+// fresh-session visibility of every surviving row via the goopg PK
+// IndexScan path. This is the next rung toward the M0103-0007 DoD
+// (pgbench-shape sustained workload on PG, replicating into goopg);
+// the kill -9 + libpq multi-host reconnect plumbing remains future
+// work.
+//
+// Design doc: docs/design/0103-0026-m0103-0007-rung-3-pg-to-goopg-batch-dml.md.
+func TestPort_PgoutputInteropPGToGoopgBatchDML(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pgoutput-interop-pg2g-batchdml")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_batch_dml"
+	psc := pubsubcluster.NewMixed(t, "pgoutput_pg2g_batchdml", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Phase 1: 50 single-row INSERTs (ids 1..50). Each is its own xact,
+	// so the apply worker sees 50 distinct Begin/Insert/Commit triples.
+	const inserted = 50
+	for i := 1; i <= inserted; i++ {
+		psc.Publisher.Exec(t, fmt.Sprintf(
+			"INSERT INTO public.t VALUES (%d, 'row-%d')", i, i))
+	}
+
+	// Phase 2: 25 UPDATEs over ids 1..25, no key column touched — the
+	// rung-2 no-old-tuple path. Each rewrites v to a distinctive marker.
+	const updated = 25
+	for i := 1; i <= updated; i++ {
+		psc.Publisher.Exec(t, fmt.Sprintf(
+			"UPDATE public.t SET v = 'updated-%d' WHERE id = %d", i, i))
+	}
+
+	// Phase 3: 10 DELETEs of ids 41..50 — the highest range, distinct
+	// from the UPDATE range, exercises the DELETE path against rows
+	// that have only ever seen the INSERT side.
+	const deleted = 10
+	for i := inserted - deleted + 1; i <= inserted; i++ {
+		psc.Publisher.Exec(t, fmt.Sprintf(
+			"DELETE FROM public.t WHERE id = %d", i))
+	}
+
+	surviving := inserted - deleted
+	psc.WaitForRow(t, "public.t", "1=1", surviving, 90*time.Second)
+
+	// Updated rows should carry the rewritten marker, fresh-session via
+	// PK IndexScan.
+	for i := 1; i <= updated; i++ {
+		psc.WaitForRow(t,
+			"public.t",
+			fmt.Sprintf("id = %d AND v = 'updated-%d'", i, i),
+			1, 30*time.Second)
+	}
+	// Non-updated, non-deleted rows keep their original v.
+	for i := updated + 1; i <= inserted-deleted; i++ {
+		psc.WaitForRow(t,
+			"public.t",
+			fmt.Sprintf("id = %d AND v = 'row-%d'", i, i),
+			1, 30*time.Second)
+	}
+	// Deleted rows are gone (heap re-fetch + MVCC dead-tuple filtering
+	// drops the orphan PK entry — same path the rung-1/rung-2 caveats
+	// rely on).
+	for i := inserted - deleted + 1; i <= inserted; i++ {
+		psc.WaitForRow(t,
+			"public.t",
+			fmt.Sprintf("id = %d", i),
+			0, 30*time.Second)
+	}
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

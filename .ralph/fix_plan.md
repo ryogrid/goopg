@@ -1911,6 +1911,34 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       remains the principal remaining work and will be sequenced as
       further rungs, each with its own design doc + pin per the
       M0103-0008 closure protocol.
+      PARTIAL PROGRESS 2026-05-14 (rung 3): sustained-workload
+      scale verification — 50 INSERTs + 25 no-key-touched UPDATEs
+      + 10 DELETEs from a PG publisher to a goopg subscriber.
+      Pinned by `TestPort_PgoutputInteropPGToGoopgBatchDML` in
+      `internal/testport/pgoutput_interop_test.go`: scales rung-2's
+      4-statement round-trip by 50× per phase, crosses pgoutput
+      xact boundaries and publisher-side heap-page boundaries
+      (which on the M0103-0008 side produced `RecordKindPageImage`
+      first-dirty-in-epoch records — but the apply worker only
+      consumes pgoutput Insert frames, so all 50 INSERTs must
+      surface). Verifies `count(*) = 40` plus per-id state from
+      fresh `database/sql` sessions through the goopg PK IndexScan
+      path: each updated id has `v='updated-N'`, each untouched-
+      but-not-deleted id keeps `v='row-N'`, each deleted id returns
+      0 (orphan PK entries from DELETE are tolerated by IndexScan
+      heap re-fetch + MVCC dead-tuple filtering, as the rung-1
+      caveat predicted). No new fix needed — rung 1's index
+      maintenance and rung 2's `primaryKeyOnlyRow` synthesis
+      already scale 50× cleanly. Design doc:
+      `docs/design/0103-0026-m0103-0007-rung-3-pg-to-goopg-batch-dml.md`
+      (accepted). Verification (rung 3):
+      `go test -count=1 -timeout 160s
+      -run TestPort_PgoutputInteropPGToGoopgBatchDML
+      ./internal/testport/` → PASS (~2.1 s). Rung-2 test still
+      green. Next rungs (deferred within M0103-0007): pgbench
+      against PG publisher with `pgbench_history` polling, REPLICA
+      IDENTITY FULL / TOAST / DDL replication shapes, kill -9 +
+      libpq multi-host reconnect plumbing on the client side.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
