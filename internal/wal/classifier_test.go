@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
 
@@ -62,6 +63,109 @@ func TestClassifyHeapDeleteRoutesByXmax(t *testing.T) {
 	want := []string{"Begin", "Change", "Commit"}
 	if !reflect.DeepEqual(p.calls, want) {
 		t.Errorf("plugin calls=%v want %v", p.calls, want)
+	}
+}
+
+
+// TestClassifyHeapHotUpdateRoutesByXmin: a HeapHotUpdate record's
+// new-tuple body carries xmin = updating-xact. Classifier must
+// dispatch a ChangeUpdate under that xid with NewTuple set and
+// OldTuple empty (the record shape carries no pre-image).
+func TestClassifyHeapHotUpdateRoutesByXmin(t *testing.T) {
+	p := &recordingPlugin{}
+	d := NewDecoder(p)
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 16400}
+	newBody := []byte("after-update")
+	tuple, err := storage.NewHeapTuple(55, 0, newBody).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := EncodeHeapHotUpdate(rel, 7, 3, 55, tuple)
+	if err := Classify(d, Record{Payload: payload, EndLSN: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if d.Active() != 1 {
+		t.Fatalf("Active=%d want 1 (xid 55)", d.Active())
+	}
+
+	if err := Classify(d, Record{Payload: EncodeXactCommit(55), EndLSN: 200}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Begin", "Change", "Commit"}
+	if !reflect.DeepEqual(p.calls, want) {
+		t.Errorf("plugin calls=%v want %v", p.calls, want)
+	}
+	if len(p.changes) != 1 {
+		t.Fatalf("changes=%d want 1", len(p.changes))
+	}
+	got := p.changes[0]
+	if got.Kind != ChangeUpdate {
+		t.Errorf("Kind=%v want ChangeUpdate", got.Kind)
+	}
+	if !bytes.Equal(got.NewTuple, tuple) {
+		t.Errorf("NewTuple mismatch: got %x want %x", got.NewTuple, tuple)
+	}
+	if len(got.OldTuple) != 0 {
+		t.Errorf("OldTuple=%x want empty (HOT update carries no pre-image)", got.OldTuple)
+	}
+	if got.Block != 7 || got.LineSlot != 3 {
+		t.Errorf("Block=%d LineSlot=%d want 7/3", got.Block, got.LineSlot)
+	}
+}
+
+// TestClassifyHeapUpdateRoutesByXmin: same shape for the non-HOT
+// HeapUpdate record. xid still comes from the new tuple's xmin;
+// Block/LineSlot pin the post-update location so the apply worker
+// can correlate against later events.
+func TestClassifyHeapUpdateRoutesByXmin(t *testing.T) {
+	p := &recordingPlugin{}
+	d := NewDecoder(p)
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 16401}
+	newBody := []byte("after-non-hot-update")
+	tuple, err := storage.NewHeapTuple(66, 0, newBody).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := EncodeHeapUpdate(HeapUpdatePayload{
+		Rel:         rel,
+		OldBlk:      4,
+		OldLineSlot: 9,
+		Xmax:        66,
+		NewBlk:      5,
+		NewLineSlot: 1,
+		Tuple:       tuple,
+	})
+	if err := Classify(d, Record{Payload: payload, EndLSN: 300}); err != nil {
+		t.Fatal(err)
+	}
+	if d.Active() != 1 {
+		t.Fatalf("Active=%d want 1 (xid 66)", d.Active())
+	}
+
+	if err := Classify(d, Record{Payload: EncodeXactCommit(66), EndLSN: 400}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Begin", "Change", "Commit"}
+	if !reflect.DeepEqual(p.calls, want) {
+		t.Errorf("plugin calls=%v want %v", p.calls, want)
+	}
+	if len(p.changes) != 1 {
+		t.Fatalf("changes=%d want 1", len(p.changes))
+	}
+	got := p.changes[0]
+	if got.Kind != ChangeUpdate {
+		t.Errorf("Kind=%v want ChangeUpdate", got.Kind)
+	}
+	if !bytes.Equal(got.NewTuple, tuple) {
+		t.Errorf("NewTuple mismatch: got %x want %x", got.NewTuple, tuple)
+	}
+	if len(got.OldTuple) != 0 {
+		t.Errorf("OldTuple=%x want empty (non-FULL replica identity)", got.OldTuple)
+	}
+	if got.Block != 5 || got.LineSlot != 1 {
+		t.Errorf("Block=%d LineSlot=%d want 5/1 (post-update location)", got.Block, got.LineSlot)
 	}
 }
 

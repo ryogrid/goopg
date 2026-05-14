@@ -117,9 +117,13 @@ func TestReorderBufferRejectsInvalidXID(t *testing.T) {
 }
 
 // recordingPlugin captures the call sequence for decoder tests.
+// Tests that need the actual Change bodies (e.g. to assert
+// NewTuple/OldTuple after the classifier rewrites a HOT-update
+// record) inspect `changes`.
 type recordingPlugin struct {
-	calls []string
-	err   error // injected to check error propagation
+	calls   []string
+	changes []Change
+	err     error // injected to check error propagation
 }
 
 func (p *recordingPlugin) Begin(xid storage.TransactionID, lsn uint64) error {
@@ -129,6 +133,7 @@ func (p *recordingPlugin) Begin(xid storage.TransactionID, lsn uint64) error {
 
 func (p *recordingPlugin) Change(c Change) error {
 	p.calls = append(p.calls, "Change")
+	p.changes = append(p.changes, c)
 	return p.err
 }
 

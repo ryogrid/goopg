@@ -2459,6 +2459,42 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       image — or change the executor's first-INSERT-into-fresh-
       page emission path to write a plain `RecordKindHeapInsert`
       so the classifier sees the same shape upstream PG produces.
+      PARTIAL PROGRESS 2026-05-14 (loop 13): closed the UPDATE
+      half of rung 12 — `internal/wal/classifier.go::Classify`
+      gains `RecordKindHeapHotUpdate` (kind 13) and
+      `RecordKindHeapUpdate` (kind 27) cases. Both decode via
+      the existing `DecodeHeapHotUpdate` / `DecodeHeapUpdate`
+      helpers, extract the updating xact via `xminFromTuple` on
+      the new-tuple bytes (offset 0 = xmin per heap-tuple binary
+      layout — same path HeapInsert uses), and dispatch a
+      `Change{Kind: ChangeUpdate, NewTuple: tupleBytes}` through
+      `Decoder.ApplyChange`. `OldTuple` stays empty — neither
+      record shape carries the pre-image; pgoutput's
+      `writeUpdate` already handles the no-old-tuple case (rung
+      9 fix) by emitting `'U' relOid 'N' newTuple` directly,
+      byte-identical to upstream's `logicalrep_write_update`
+      under REPLICA IDENTITY DEFAULT. Pinned by
+      `TestClassifyHeapHotUpdateRoutesByXmin` and
+      `TestClassifyHeapUpdateRoutesByXmin` in
+      `internal/wal/classifier_test.go`; the shared
+      `recordingPlugin` (in `internal/wal/reorder_test.go`)
+      gained a `changes []Change` capture field so the new
+      tests can assert NewTuple/OldTuple/Block/LineSlot. Design
+      doc: `docs/design/0103-0017-classify-heap-update-records.md`
+      (accepted).
+      Verification (loop 13): `go test -race -count=1 -timeout
+      300s ./internal/wal/ ./internal/server/
+      ./internal/executor/ ./internal/catalog/` → all green
+      (wal 3.018 s, server 3.488 s, executor 2.575 s, catalog
+      1.019 s).
+      Remaining for full rung-12 closure (next sub-step):
+      PageImage handling. If a live trace confirms that
+      fresh-page inserts emit `RecordKindPageImage` instead of
+      (or in addition to) `RecordKindHeapInsert`, the next rung
+      will either decode tuple slots out of the page image or
+      adjust the executor's first-INSERT-into-fresh-page
+      emission path so the classifier sees a plain
+      `RecordKindHeapInsert` — same shape upstream PG produces.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
