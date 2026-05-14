@@ -888,7 +888,9 @@ func markHeapHotUpdateDirty(
 		pool.MarkDirty(slot)
 		return nil
 	}
-	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+	// MarkDirtyLogicalChange — see markHeapInsertDirty for the
+	// rationale.
+	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
 		return logHot(rel, blk, oldLineSlot, xmax, tupleBytes)
 	})
 }
@@ -2241,7 +2243,13 @@ func markHeapInsertDirty(
 		pool.MarkDirty(slot)
 		return nil
 	}
-	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+	// MarkDirtyLogicalChange (not MarkDirtyChangeRecord): the logical
+	// HeapInsert record MUST always be emitted so the M0008 logical
+	// decoder sees the per-row change. MarkDirtyChangeRecord would
+	// suppress the logical record on first-dirty-in-epoch in favour
+	// of a bare PageImage — fine for redo, fatal for logical
+	// replication. See docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md.
+	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
 		return logHeap(rel, blk, lineSlot, tupleBytes)
 	})
 }
@@ -2263,7 +2271,9 @@ func markHeapDeleteDirty(
 		pool.MarkDirty(slot)
 		return nil
 	}
-	return pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+	// MarkDirtyLogicalChange — see markHeapInsertDirty for the
+	// rationale.
+	return pool.MarkDirtyLogicalChange(slot, func() (storage.LSN, error) {
 		return logDel(rel, blk, lineSlot, xmax, oldTuple)
 	})
 }

@@ -2495,6 +2495,72 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       adjust the executor's first-INSERT-into-fresh-page
       emission path so the classifier sees a plain
       `RecordKindHeapInsert` — same shape upstream PG produces.
+      PARTIAL PROGRESS 2026-05-14 (loop 14): closed the
+      PageImage half of rung 12 — the fresh-page-INSERT path
+      now emits BOTH the logical `RecordKindHeapInsert` AND the
+      `RecordKindPageImage` (logical first, FPI second), instead
+      of the prior FPI-only shape. Design doc:
+      `docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md`
+      (accepted).
+      Diagnosis: `bufpool.MarkDirtyChangeRecord`'s
+      "FPI alone replaces the change record" optimisation on
+      first-dirty-in-epoch dropped the per-row logical event
+      from the WAL stream entirely — fine for redo, fatal for
+      logical replication. Subsequent same-epoch dirties did
+      emit the logical record, so the bug was intermittent
+      (worst kind for replication).
+      Changes:
+      - `internal/storage/bufpool.go`: new method
+        `Pool.MarkDirtyLogicalChange(s, emitter)` — always runs
+        `emitter` (the logical record), additionally emits FPI
+        BEFORE the logical record on first-dirty-in-epoch. The
+        order matters: replay applies logical first against the
+        prior epoch's state (`pd_lsn` short-circuit + tuple-slot
+        idempotency both work), then PageImage at the higher
+        LSN overwrites with the authoritative bytes. Reverse
+        order would slot-drift in `replayHeapInsert`.
+        Wait — the design doc and code are "logical first then
+        FPI" (FPI gets the higher LSN). Replay sees logical at
+        the lower LSN first, applies cleanly to the prior page
+        state; PageImage at the higher LSN then writes the
+        post-mutation bytes idempotently. The text in this
+        bullet had the order wrong; the code is correct.
+      - `internal/executor/operators_storage.go`:
+        `markHeapInsertDirty`, `markHeapDeleteDirty`,
+        `markHeapHotUpdateDirty` re-routed from
+        `MarkDirtyChangeRecord` to `MarkDirtyLogicalChange`
+        with inline `// see design 0103-0018` pointers. Every
+        INSERT / DELETE / HOT-UPDATE site now goes through the
+        new path. Other callers (B-tree split / metapage,
+        heap-prune-opt, heap-lock, vacuum) keep
+        `MarkDirtyChangeRecord` — their `emitter` IS the FPI,
+        so the FPI-or-emitter toggle stays correct.
+      Tests:
+      - `internal/storage/storage_test.go`:
+        `TestMarkDirtyLogicalChangeEmitsLogicalAndFPIOnFirstDirty`,
+        `TestMarkDirtyLogicalChangeEmitsLogicalOnlyOnSecondDirty`,
+        `TestMarkDirtyLogicalChangeWithoutFPIHookEmitsLogicalOnly`,
+        `TestMarkDirtyLogicalChangeRequiresEmitter`.
+      - `internal/wal/classifier_test.go`:
+        `TestClassifyHeapInsertAfterPageImageStillEmitsChange`
+        — pins that the new emission shape (HeapInsert at
+        LSN_log, PageImage at LSN_fpi) routes the HeapInsert
+        into a `ChangeInsert` event; before this loop the row
+        was silently dropped.
+      Verification (loop 14): `go test -race -count=1 -timeout
+      300s ./internal/storage/ ./internal/wal/
+      ./internal/executor/ ./internal/server/ ./internal/parser/
+      ./internal/planner/ ./internal/analyzer/
+      ./internal/catalog/` → all green (storage 1.344 s,
+      wal 3.016 s, executor 2.632 s, server 3.498 s, parser
+      1.059 s, planner 1.085 s, analyzer 1.044 s, catalog
+      1.020 s). Downstream packages also green:
+      `go test -race ./internal/access/... ./internal/initdb/...
+      ./internal/vacuum/...` → btree 12.572 s, initdb 2.324 s,
+      vacuum 1.019 s. The `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` stays in place so the
+      next rung lands with its own design doc + targeted unit
+      pin per the rung protocol.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

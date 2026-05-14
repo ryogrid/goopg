@@ -1223,6 +1223,70 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 	return nil
 }
 
+// MarkDirtyLogicalChange is the logical-decoding-aware variant of
+// MarkDirtyChangeRecord. The caller's `emitter` is ALWAYS run, so
+// the WAL stream always carries the logical change record — this
+// is what the M0008 logical-decoding pipeline classifies into
+// per-row Insert/Update/Delete events. On first-dirty-in-epoch a
+// full-page image is ALSO emitted, BEFORE the logical record (lower
+// LSN), preserving upstream PG's "FPI then change records" replay
+// invariant for torn-page protection. pd_lsn is stamped from the
+// logical record's LSN so per-page idempotency continues to work.
+//
+// Use this instead of MarkDirtyChangeRecord on heap mutation paths
+// (HeapInsert/HeapDelete/HeapHotUpdate). MarkDirtyChangeRecord's
+// "FPI alone replaces the change record" optimisation silently
+// drops the logical event from the decoder's view — fine for redo,
+// fatal for logical replication.
+//
+// Caller must hold s.contentMu exclusive (the page bytes that will
+// be snapshotted into the FPI must not move under us).
+func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) error {
+	if emitter == nil {
+		return fmt.Errorf("MarkDirtyLogicalChange: emitter required")
+	}
+	p.evictMu.Lock()
+	needFPI := !s.fpiSinceCheckpoint
+	tag := s.tag
+	p.evictMu.Unlock()
+
+	// Emit the logical record FIRST so on physical replay it lands
+	// against the page's prior state (blank-after-extend, or the
+	// previous epoch's tail). The page mutation already happened
+	// in-memory before this call; the in-memory pd_lsn updates to
+	// the record's end LSN so any subsequent FPI snapshot below
+	// captures the same pd_lsn the standby will arrive at after
+	// applying the logical record.
+	lsn, err := emitter()
+	if err != nil {
+		return err
+	}
+	MustHeader(s.page).SetLSN(lsn)
+
+	// On first-dirty-in-epoch, also emit the FPI for torn-page
+	// protection. The FPI lands at a HIGHER LSN than the logical
+	// record above, so per-page replay sees them in order:
+	//   1. logical record at LSN_log → modifies the page from the
+	//      prior epoch's state into the post-mutation state.
+	//   2. PageImage at LSN_fpi (> LSN_log) → overwrites with the
+	//      authoritative bytes (idempotent against step 1).
+	if needFPI && p.logFPI != nil && p.fullPageWrites.Load() {
+		pageCopy := make(Page, BlockSize)
+		copy(pageCopy, s.page)
+		fpiLSN, fpiErr := p.logFPI(tag.Rel, tag.Block, pageCopy)
+		if fpiErr != nil {
+			return fpiErr
+		}
+		MustHeader(s.page).SetLSN(fpiLSN)
+	}
+
+	p.evictMu.Lock()
+	s.dirty = true
+	s.fpiSinceCheckpoint = true
+	p.evictMu.Unlock()
+	return nil
+}
+
 // maybeEmitFPI runs the FPI side-effect of MarkDirty for the
 // first mutation in each checkpoint epoch. Caller must hold
 // Slot.contentMu exclusive so the page bytes are stable.

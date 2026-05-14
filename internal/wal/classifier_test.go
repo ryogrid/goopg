@@ -255,6 +255,62 @@ func TestClassifySkipsNonTxRecords(t *testing.T) {
 	}
 }
 
+
+// TestClassifyHeapInsertAfterPageImageStillEmitsChange pins the
+// design 0103-0018 contract from the classifier side: a WAL stream
+// that contains the new "logical first, FPI second" emission shape
+// (HeapInsert at LSN_log, PageImage at LSN_fpi > LSN_log) must
+// route the HeapInsert into a ChangeInsert event. Before 0103-0018
+// the executor's first-dirty-in-epoch path emitted PageImage alone
+// and the per-row Insert event was silently dropped — see the rung
+// 12 second-half diagnosis in M0103-0008.
+func TestClassifyHeapInsertAfterPageImageStillEmitsChange(t *testing.T) {
+	p := &recordingPlugin{}
+	d := NewDecoder(p)
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 16410}
+	tuple, err := storage.NewHeapTuple(77, 0, []byte("row")).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// New emission shape: logical record at LSN_log, FPI at LSN_fpi.
+	insertPayload := EncodeHeapInsert(rel, 0, 1, tuple)
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		t.Fatal(err)
+	}
+	fpiPayload, err := EncodePageImage(rel, 0, page)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range []Record{
+		{Payload: insertPayload, EndLSN: 100},
+		{Payload: fpiPayload, EndLSN: 200},
+	} {
+		if err := Classify(d, r); err != nil {
+			t.Fatalf("classify kind=%d: %v", r.Payload[0], err)
+		}
+	}
+	if d.Active() != 1 {
+		t.Fatalf("Active=%d want 1 (xid 77 buffered)", d.Active())
+	}
+
+	if err := Classify(d, Record{Payload: EncodeXactCommit(77), EndLSN: 300}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Begin", "Change", "Commit"}
+	if !reflect.DeepEqual(p.calls, want) {
+		t.Errorf("plugin calls=%v want %v", p.calls, want)
+	}
+	if len(p.changes) != 1 || p.changes[0].Kind != ChangeInsert {
+		t.Errorf("changes=%+v, want one ChangeInsert", p.changes)
+	}
+	if p.changes[0].Block != 0 || p.changes[0].LineSlot != 1 {
+		t.Errorf("change rel/block/slot mismatch: %+v", p.changes[0])
+	}
+}
+
 // TestEncodeDecodeXactMarker pins the round-trip for the new
 // commit / abort markers.
 func TestEncodeDecodeXactMarker(t *testing.T) {

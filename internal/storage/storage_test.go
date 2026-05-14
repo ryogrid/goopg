@@ -494,6 +494,211 @@ func TestPoolFPISkippedWhenDisabled(t *testing.T) {
 	}
 }
 
+
+// TestMarkDirtyLogicalChangeEmitsLogicalAndFPIOnFirstDirty pins the
+// design 0103-0018 contract: heap mutation paths emit the logical
+// record FIRST and the FPI SECOND on first-dirty-in-epoch. Both
+// records appear in WAL order, and the in-memory page's pd_lsn is
+// stamped from the FPI's LSN (the most-recently-emitted record).
+func TestMarkDirtyLogicalChangeEmitsLogicalAndFPIOnFirstDirty(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	type emit struct {
+		kind string // "logical" | "fpi"
+		lsn  LSN
+	}
+	var emits []emit
+	var nextLSN LSN = 100
+
+	logFPI := func(_ RelFileNode, _ BlockNumber, _ Page) (LSN, error) {
+		nextLSN++
+		emits = append(emits, emit{kind: "fpi", lsn: nextLSN})
+		return nextLSN, nil
+	}
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots:          1,
+		LogPageImage:   logFPI,
+		FullPageWrites: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 700, Fork: MainFork}
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Unpin(s)
+
+	s.Lock()
+	s.Page()[400] = 0xAB
+	emitter := func() (LSN, error) {
+		nextLSN++
+		emits = append(emits, emit{kind: "logical", lsn: nextLSN})
+		return nextLSN, nil
+	}
+	if err := pool.MarkDirtyLogicalChange(s, emitter); err != nil {
+		s.Unlock()
+		t.Fatalf("MarkDirtyLogicalChange: %v", err)
+	}
+	pdLSN := MustHeader(s.Page()).LSN()
+	s.Unlock()
+
+	if len(emits) != 2 {
+		t.Fatalf("emits = %+v, want 2 (logical + fpi)", emits)
+	}
+	if emits[0].kind != "logical" {
+		t.Errorf("first emit kind = %q, want %q (logical must be first)", emits[0].kind, "logical")
+	}
+	if emits[1].kind != "fpi" {
+		t.Errorf("second emit kind = %q, want %q (fpi must be second)", emits[1].kind, "fpi")
+	}
+	if emits[1].lsn <= emits[0].lsn {
+		t.Errorf("fpi lsn %d not > logical lsn %d", emits[1].lsn, emits[0].lsn)
+	}
+	if pdLSN != emits[1].lsn {
+		t.Errorf("pd_lsn = %d, want %d (fpi lsn — most recent record)", pdLSN, emits[1].lsn)
+	}
+}
+
+// TestMarkDirtyLogicalChangeEmitsLogicalOnlyOnSecondDirty pins that
+// once the page has been FPI'd in the current epoch, subsequent
+// MarkDirtyLogicalChange calls emit ONLY the logical record (no
+// extra FPI). Mirrors the second-and-later dirty contract from
+// MarkDirtyChangeRecord.
+func TestMarkDirtyLogicalChangeEmitsLogicalOnlyOnSecondDirty(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	var fpiCalls, logicalCalls int
+	var nextLSN LSN = 200
+	logFPI := func(_ RelFileNode, _ BlockNumber, _ Page) (LSN, error) {
+		fpiCalls++
+		nextLSN++
+		return nextLSN, nil
+	}
+	emitter := func() (LSN, error) {
+		logicalCalls++
+		nextLSN++
+		return nextLSN, nil
+	}
+
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots:          1,
+		LogPageImage:   logFPI,
+		FullPageWrites: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 701, Fork: MainFork}
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Unpin(s)
+
+	for i := 0; i < 3; i++ {
+		s.Lock()
+		s.Page()[500+i] = byte(i + 1)
+		if err := pool.MarkDirtyLogicalChange(s, emitter); err != nil {
+			s.Unlock()
+			t.Fatalf("dirty %d: %v", i, err)
+		}
+		s.Unlock()
+	}
+
+	if fpiCalls != 1 {
+		t.Errorf("fpi calls = %d, want 1 (only first dirty in epoch)", fpiCalls)
+	}
+	if logicalCalls != 3 {
+		t.Errorf("logical calls = %d, want 3 (one per dirty)", logicalCalls)
+	}
+}
+
+// TestMarkDirtyLogicalChangeWithoutFPIHookEmitsLogicalOnly pins
+// that the no-FPI-hook path (or full_page_writes=off) emits only
+// the logical record — never a phantom FPI through some other
+// callback path.
+func TestMarkDirtyLogicalChangeWithoutFPIHookEmitsLogicalOnly(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	var logicalCalls int
+	emitter := func() (LSN, error) {
+		logicalCalls++
+		return LSN(50 + logicalCalls), nil
+	}
+
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots:          1,
+		FullPageWrites: false, // no FPI even though hook is unset
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 702, Fork: MainFork}
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Unpin(s)
+
+	s.Lock()
+	s.Page()[600] = 0xCD
+	if err := pool.MarkDirtyLogicalChange(s, emitter); err != nil {
+		s.Unlock()
+		t.Fatalf("MarkDirtyLogicalChange: %v", err)
+	}
+	pdLSN := MustHeader(s.Page()).LSN()
+	s.Unlock()
+
+	if logicalCalls != 1 {
+		t.Errorf("logical calls = %d, want 1", logicalCalls)
+	}
+	if pdLSN != LSN(51) {
+		t.Errorf("pd_lsn = %d, want 51 (the only emitted record's lsn)", pdLSN)
+	}
+}
+
+// TestMarkDirtyLogicalChangeRequiresEmitter pins that calling with
+// a nil emitter is a programming error (mirrors
+// MarkDirtyChangeRecord's same-shape guard for second-dirty).
+func TestMarkDirtyLogicalChangeRequiresEmitter(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 703, Fork: MainFork}
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Unpin(s)
+
+	s.Lock()
+	defer s.Unlock()
+	if err := pool.MarkDirtyLogicalChange(s, nil); err == nil {
+		t.Errorf("MarkDirtyLogicalChange(nil emitter) returned nil err, want error")
+	}
+}
+
 func TestPoolEvictionReturnsWALFlushError(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(ManagerConfig{DataDir: dir})
