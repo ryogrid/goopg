@@ -537,6 +537,22 @@ func (o *insertOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
 	isPartitioned := len(o.plan.Table.PartitionKey) > 0
+	// insertMissing[i]=true for every target column the source row does
+	// not provide. Computed once per Open since ColumnIndex is immutable
+	// across rows; applyDefaultsForMissing reads it to evaluate per-column
+	// DEFAULT expressions (rung 14). Generated and SERIAL columns are
+	// marked missing too, but applyDefaultsForMissing leaves them alone
+	// (DefaultExpr is nil for those) so the existing computeGeneratedColumns
+	// / nextval paths below stay authoritative.
+	insertMissing := make([]bool, len(cols))
+	for i := range insertMissing {
+		insertMissing[i] = true
+	}
+	for _, tgtIdx := range o.plan.ColumnIndex {
+		if tgtIdx >= 0 && tgtIdx < len(insertMissing) {
+			insertMissing[tgtIdx] = false
+		}
+	}
 	for {
 		srcSlot, err := o.child.Next()
 		if err == EOF {
@@ -554,6 +570,16 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			row[tgtIdx] = src[srcIdx]
 		}
+
+		// M0103-0007 rung 14: fill DEFAULT expressions for any target column
+		// the INSERT did not provide a value for. An explicit column list
+		// like `INSERT INTO t (a, b) VALUES (...)` leaves columns not in the
+		// list unmapped; PostgreSQL fills those with the column's DEFAULT
+		// (or NULL when there is no DEFAULT) BEFORE SERIAL auto-generation
+		// runs, mirroring upstream ExecInitStoredGenerated/ExecComputeStoredGenerated
+		// ordering. The same helper rung 13 uses on the apply path applies
+		// here: missing[i]=true for every column NOT in plan.ColumnIndex.
+		applyDefaultsForMissing(cols, row, insertMissing)
 
 		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns.
 		// M0097-0009: if a serial column's slot is still NullDatum (not provided

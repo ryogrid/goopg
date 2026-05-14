@@ -2573,15 +2573,68 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `TestPort_PgoutputInteropPGToGoopg*` together → PASS
         (~23.7 s); regression sweep on
         `./internal/parser/ ./internal/catalog/ ./internal/executor/`
+        → all green.
+      - PARTIAL PROGRESS 2026-05-14 (rung 14): DEFAULT-expression
+        evaluation in the regular dispatcher INSERT path. Design
+        doc:
+        `docs/design/0103-0037-m0103-0007-rung-14-dispatcher-insert-default.md`
+        (accepted). Rung 13's note "DEFAULT-expression evaluation in
+        the regular dispatcher INSERT path (orthogonal to logical
+        replication parity but unblocked by the parser/catalog work
+        landed here)" pointed at a real correctness gap in goopg's
+        own INSERT path: `INSERT INTO t (id, label) VALUES (...)`
+        against a table with `note text DEFAULT 'auto'` silently
+        installed `note=NullDatum` because `insertOp.Next` initialised
+        every unmapped slot to NullDatum and never evaluated the
+        column's DEFAULT clause.
+      - Fix in `internal/executor/operators_storage.go::insertOp.Next`:
+        compute `insertMissing []bool` ONCE before the per-row loop
+        (`plan.ColumnIndex` is immutable across rows so the mask is
+        invariant), with `insertMissing[i]=true` for every target
+        column NOT in `o.plan.ColumnIndex`. Inside the loop, AFTER
+        the existing source-fill reorder and BEFORE the SERIAL
+        `nextval` block, call rung 13's existing
+        `applyDefaultsForMissing(cols, row, insertMissing)`. The
+        helper's invariants give the rest for free: never overwrite
+        `missing[i]=false` slots (explicit value wins over DEFAULT);
+        skip columns without `DefaultExpr` (no DEFAULT ⇒ stays
+        NullDatum); leave non-evaluable expressions alone so NOT NULL
+        violations surface loudly instead of silently NULL-ing the
+        row.
+      - SERIAL columns keep working: parser does not assign DEFAULT to
+        SERIAL declarations, so `DefaultExpr` is nil for them and the
+        existing SERIAL block (which fires only when `row[i].IsNull()`)
+        stays authoritative. Generated columns similarly inherit
+        their existing path — `applyDefaultsForMissing` runs BEFORE
+        `computeGeneratedColumns`, but generated columns also have
+        nil `DefaultExpr` so they pass through untouched.
+      - Order of operations inside `insertOp.Next` after this rung:
+        source-fill → DEFAULT-fill (rung 14) → SERIAL nextval →
+        BEFORE INSERT triggers → CHECK → FK → computeGeneratedColumns
+        → heap write + index maintenance. Matches upstream's
+        slot-init ordering.
+      - Pinned by `TestInsertFillsMissingColumnDefault` (table
+        `(id int NOT NULL, label text, note text DEFAULT 'auto', bare
+        text)`, INSERT with `ColumnIndex=[0,1]`, asserts `note='auto'`,
+        `bare IS NULL`, `id=1 label='one'`, `count(*)=1`; each
+        assertion fail-fasts a distinct regression) and
+        `TestInsertDoesNotOverrideExplicitColumnDefault` (negative
+        pin: explicit value `'explicit'` for a column with `DEFAULT
+        'auto'` survives — explicit-value-beats-DEFAULT semantics)
+        in `internal/executor/storage_test.go`.
+      - Verification (rung 14):
+        `go test -count=1 -timeout 60s -run "TestInsertFillsMissingColumnDefault|TestInsertDoesNotOverrideExplicitColumnDefault" ./internal/executor/`
+        → PASS (~0.01 s);
+        `go test -count=1 -timeout 180s -run TestPort_PgoutputInteropPGToGoopg ./internal/testport/`
+        → all 12 rung-1–13 tests still PASS (~23.2 s);
+        `go test -race -count=1 -timeout 180s ./internal/executor/ ./internal/planner/ ./internal/parser/ ./internal/catalog/`
         → all green. Next rungs (deferred within M0103-0007):
-        pgbench against PG publisher with `pgbench_history`
-        polling, proto_version=2 streaming subxacts, kill -9 +
-        libpq multi-host reconnect plumbing on the client side,
-        DEFAULT-expression evaluation in the regular dispatcher
-        INSERT path (orthogonal to logical replication parity
-        but unblocked by the parser/catalog work landed here),
-        richer DEFAULT evaluator (function calls, sequences)
-        when a fixture surfaces a need.
+        pgbench against PG publisher with `pgbench_history` polling,
+        proto_version=2 streaming subxacts, kill -9 + libpq
+        multi-host reconnect plumbing on the client side, `INSERT
+        … VALUES (DEFAULT, …)` parser support (orthogonal to
+        M0103-0007), richer DEFAULT evaluator (function calls,
+        sequences) when a fixture surfaces a need.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

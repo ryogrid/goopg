@@ -207,6 +207,149 @@ func TestInsertExtendsRelation(t *testing.T) {
 	}
 }
 
+// TestInsertFillsMissingColumnDefault pins M0103-0007 rung 14: a regular
+// dispatcher INSERT that omits a column from the explicit column list
+// must fill the omitted column with its CREATE TABLE DEFAULT expression
+// before writing to the heap, mirroring upstream's ExecComputeStoredGenerated
+// pre-insert pass and matching the apply worker's rung-13 behavior. The
+// fixture builds a table (id, label, note) where `note` carries a string
+// literal DEFAULT, runs INSERT with ColumnIndex=[0,1] (the SOURCE row
+// supplies only id and label), and asserts the persisted row carries
+// the DEFAULT value in the note slot.
+//
+// Each assertion fail-fasts a distinct regression: row-count = 1 catches
+// the INSERT not firing; note == "auto" catches the DEFAULT-fill loop
+// not running; not-NULL check on note catches the rung-13 helper being
+// called with the wrong missing mask (every slot false ⇒ no fills).
+func TestInsertFillsMissingColumnDefault(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	// Register a second table with a DEFAULT on the omitted column.
+	cim := cat.(*catalog.InMemory)
+	if _, err := cim.CreateTable(parser.ObjectName{Name: "withdefault"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "label", Type: catalog.Type{Name: "text"}},
+		// note carries a DEFAULT that must be evaluated when the column
+		// is omitted from the INSERT's column list.
+		{Name: "note", Type: catalog.Type{Name: "text"},
+			DefaultExpr: &parser.StringConst{Value: "auto"}},
+		// bare has no DEFAULT — must stay NullDatum.
+		{Name: "bare", Type: catalog.Type{Name: "text"}},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "withdefault"})
+
+	insertPlan := &planner.Insert{
+		Table: tbl,
+		Source: &planner.Values{
+			Rows: [][]planner.Expr{
+				{&planner.IntegerConst{Value: 1}, &planner.StringConst{Value: "one"}},
+			},
+		},
+		// INSERT INTO withdefault (id, label) VALUES (1, 'one') — note and
+		// bare are absent from the source row.
+		ColumnIndex: []int{0, 1},
+	}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	if io := op.(*insertOp); io.RowsAffected() != 1 {
+		t.Errorf("RowsAffected=%d want 1", io.RowsAffected())
+	}
+	if err := op.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("scan returned %d rows want 1", len(rows))
+	}
+	got := rows[0]
+	if got[0].Int != 1 {
+		t.Errorf("id: got %v want 1", got[0].Int)
+	}
+	if got[1].StringValue() != "one" {
+		t.Errorf("label: got %q want %q", got[1].StringValue(), "one")
+	}
+	if got[2].IsNull() {
+		t.Errorf("note: got NULL want %q — DEFAULT not filled", "auto")
+	} else if got[2].StringValue() != "auto" {
+		t.Errorf("note: got %q want %q", got[2].StringValue(), "auto")
+	}
+	if !got[3].IsNull() {
+		t.Errorf("bare: got %v want NULL — column without DEFAULT must stay NULL", got[3])
+	}
+}
+
+// TestInsertDoesNotOverrideExplicitColumnDefault pins the negative case:
+// when an INSERT explicitly supplies a value for a column that also
+// carries a CREATE TABLE DEFAULT, the explicit value wins (the DEFAULT
+// is NOT applied). missing[i]=false for that column ⇒ applyDefaultsForMissing
+// must skip it. Without this guard, INSERT INTO t (id, note) VALUES
+// (1, 'explicit') would silently overwrite 'explicit' with 'auto'.
+func TestInsertDoesNotOverrideExplicitColumnDefault(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	cim := cat.(*catalog.InMemory)
+	if _, err := cim.CreateTable(parser.ObjectName{Name: "withdefault2"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "note", Type: catalog.Type{Name: "text"},
+			DefaultExpr: &parser.StringConst{Value: "auto"}},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "withdefault2"})
+
+	insertPlan := &planner.Insert{
+		Table: tbl,
+		Source: &planner.Values{
+			Rows: [][]planner.Expr{
+				{&planner.IntegerConst{Value: 1}, &planner.StringConst{Value: "explicit"}},
+			},
+		},
+		// INSERT INTO withdefault2 (id, note) VALUES (1, 'explicit') — both
+		// columns are claimed, so the DEFAULT must NOT override.
+		ColumnIndex: []int{0, 1},
+	}
+	op, _ := Build(insertPlan)
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	_ = scan.Open(ctx)
+	defer scan.Close()
+	rows, _ := drainScan(scan)
+	if len(rows) != 1 {
+		t.Fatalf("scan returned %d rows want 1", len(rows))
+	}
+	if got := rows[0][1].StringValue(); got != "explicit" {
+		t.Errorf("note: got %q want %q — explicit value must beat DEFAULT", got, "explicit")
+	}
+}
+
 func drainScan(op Operator) ([]Row, error) {
 	var out []Row
 	for {
