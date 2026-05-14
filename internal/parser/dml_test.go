@@ -267,3 +267,56 @@ func TestParseUpdateSetRejectsBareDefaultInExpression(t *testing.T) {
 		t.Fatal("expected syntax error, got nil")
 	}
 }
+
+
+// TestParseInsertDefaultValues: rung 17 — `INSERT INTO t DEFAULT VALUES`
+// parses as an InsertStmt with DefaultValues=true, empty Rows, and no
+// SELECT. The planner expands it into a row of DefaultMarkers sized to
+// the target's insertable columns.
+func TestParseInsertDefaultValues(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t DEFAULT VALUES")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, ok := stmts[0].(*InsertStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if !ins.DefaultValues {
+		t.Errorf("DefaultValues=false want true")
+	}
+	if len(ins.Rows) != 0 {
+		t.Errorf("Rows len=%d want 0", len(ins.Rows))
+	}
+	if ins.Select != nil {
+		t.Errorf("Select set unexpectedly")
+	}
+	if len(ins.Columns) != 0 {
+		t.Errorf("Columns set unexpectedly: %v", ins.Columns)
+	}
+}
+
+// TestParseInsertDefaultValuesWithReturning: rung 17 — RETURNING after
+// DEFAULT VALUES is parsed normally.
+func TestParseInsertDefaultValuesWithReturning(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t DEFAULT VALUES RETURNING id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins := stmts[0].(*InsertStmt)
+	if !ins.DefaultValues {
+		t.Errorf("DefaultValues=false want true")
+	}
+	if len(ins.Returning) != 1 {
+		t.Errorf("Returning len=%d want 1", len(ins.Returning))
+	}
+}
+
+// TestParseInsertDefaultValuesRejectsExtraValues: rung 17 — DEFAULT
+// must be followed by VALUES; any other token raises a syntax error.
+func TestParseInsertDefaultValuesRejectsExtraValues(t *testing.T) {
+	_, err := Parse("INSERT INTO t DEFAULT (1)")
+	if err == nil {
+		t.Fatal("expected syntax error, got nil")
+	}
+}

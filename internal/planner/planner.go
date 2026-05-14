@@ -3249,7 +3249,10 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 // target table can't be resolved (planInsert raises the canonical
 // 42P01 error later).
 func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) error {
-	if s.Select != nil || len(s.Rows) == 0 {
+	if s.Select != nil {
+		return nil
+	}
+	if !s.DefaultValues && len(s.Rows) == 0 {
 		return nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
@@ -3278,6 +3281,18 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 			}
 			colIndex = append(colIndex, col.Ordinal)
 		}
+	}
+	// M0103-0007 rung 17: expand `INSERT … DEFAULT VALUES` into a
+	// single row of DefaultMarkers sized to colIndex so the existing
+	// substitution loop below handles it uniformly with the explicit
+	// VALUES (DEFAULT, …, DEFAULT) shape.
+	if s.DefaultValues {
+		row := make([]parser.Expr, len(colIndex))
+		for i := range row {
+			row[i] = &parser.DefaultMarker{}
+		}
+		s.Rows = [][]parser.Expr{row}
+		s.DefaultValues = false
 	}
 	for _, r := range s.Rows {
 		if len(r) != len(colIndex) {

@@ -2730,8 +2730,57 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         proto_version=2 streaming subxacts, kill -9 + libpq
         multi-host reconnect plumbing on the client side, richer
         DEFAULT evaluator (function calls, sequences) when a fixture
-        surfaces a need, `INSERT INTO t DEFAULT VALUES` all-defaults
-        form.
+        surfaces a need.
+      - PARTIAL PROGRESS 2026-05-14 (rung 17): `INSERT INTO t DEFAULT
+        VALUES` all-defaults parser + planner support. Design doc:
+        `docs/design/0103-0040-m0103-0007-rung-17-insert-default-values.md`
+        (accepted). Before this rung the standard-SQL all-defaults
+        form raised a parser error because `parseInsert` only knew
+        about `VALUES`/`SELECT` after the optional column list.
+      - Fix split across parser + planner (reuses rung 15's
+        `*parser.DefaultMarker` sentinel — no new AST type):
+      - `internal/parser/ast.go::InsertStmt` gains a single
+        `DefaultValues bool` field. Mutually exclusive with `Rows`
+        / `Select`.
+      - `internal/parser/dml.go::parseInsert` peeks for
+        `TokenKeyword`/`KwDefault` after the optional column list,
+        consumes it, then `expectKeyword(KwValues)` and sets
+        `stmt.DefaultValues = true`. Any non-VALUES token after
+        DEFAULT raises the standard "expected VALUES" syntax error
+        (pinned by `TestParseInsertDefaultValuesRejectsExtraValues`).
+      - `internal/planner/planner.go::rewriteInsertDefaultMarkers`
+        learns one extra step. When `s.DefaultValues` is true the
+        rewrite computes `colIndex` exactly as planInsert would (skip
+        `GeneratedAlways` columns when no explicit column list is
+        given), synthesises `s.Rows = [[DefaultMarker, ...]]` sized
+        to `len(colIndex)`, clears `s.DefaultValues`, then falls
+        through to the existing per-cell substitution loop. After
+        rewrite the analyzer, `planInsert`, and the executor see a
+        shape byte-identical to an explicit
+        `VALUES (DEFAULT, DEFAULT, ...)` list — no new downstream
+        code path. Missing-table case: `cat.LookupTable` returns
+        false ⇒ rewrite no-ops and the analyzer's `lookupTable`
+        raises the canonical 42P01 first.
+      - SERIAL columns retain their existing path — `DefaultExpr` is
+        nil for SERIAL declarations, so the rewrite emits `NullConst`,
+        and `insertOp.Next`'s SERIAL `nextval` block (rung 14 hot
+        path) picks them up because the cell evaluates to `NullDatum`.
+      - Pinned by `TestParseInsertDefaultValues`,
+        `TestParseInsertDefaultValuesWithReturning`,
+        `TestParseInsertDefaultValuesRejectsExtraValues`
+        (`internal/parser/dml_test.go`) and
+        `TestPlanInsertDefaultValuesExpandsToColumnDefaults`,
+        `TestPlanInsertDefaultValuesSkipsGeneratedColumns`
+        (`internal/planner/planner_test.go`). The planner test
+        also asserts `ColumnIndex` covers all non-generated columns
+        and excludes generated columns from the expansion.
+      - Verification (rung 17):
+        `go test -count=1 -timeout 60s -run "TestParseInsertDefaultValues|TestPlanInsertDefaultValues" ./internal/parser/ ./internal/planner/`
+        → PASS (~0.004 s each);
+        broader regression on `./internal/parser/ ./internal/planner/
+        ./internal/analyzer/ ./internal/executor/ ./internal/catalog/
+        ./internal/server/ ./internal/wal/` → all green
+        (executor 1.176 s, server 1.792 s, wal 1.893 s).
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

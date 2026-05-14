@@ -765,6 +765,83 @@ func TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
 	}
 }
 
+
+// TestPlanInsertDefaultValuesExpandsToColumnDefaults: rung 17 — the
+// all-defaults `INSERT INTO t DEFAULT VALUES` form is expanded by
+// rewriteInsertDefaultMarkers into a single VALUES row whose cells
+// are each the corresponding column's DefaultExpr (or NULL for
+// columns without a DEFAULT). Generated columns are skipped (same
+// rule planInsert uses for the implicit-column-list case).
+func TestPlanInsertDefaultValuesExpandsToColumnDefaults(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: 7}},
+		{Name: "note", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: "auto"}},
+		{Name: "bare", Type: catalog.Type{Name: "text"}}, // no DEFAULT
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t DEFAULT VALUES"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins, ok := node.(*Insert)
+	if !ok {
+		t.Fatalf("got %T", node)
+	}
+	values, ok := ins.Source.(*Values)
+	if !ok {
+		t.Fatalf("ins.Source=%T", ins.Source)
+	}
+	if len(values.Rows) != 1 || len(values.Rows[0]) != 3 {
+		t.Fatalf("values shape=%v", values.Rows)
+	}
+	// Cell 0: id's IntegerConst DEFAULT.
+	if ic, ok := values.Rows[0][0].(*IntegerConst); !ok || ic.Value != 7 {
+		t.Errorf("row[0][0]=%v want IntegerConst{Value: 7}", values.Rows[0][0])
+	}
+	// Cell 1: note's StringConst DEFAULT.
+	if sc, ok := values.Rows[0][1].(*StringConst); !ok || sc.Value != "auto" {
+		t.Errorf("row[0][1]=%v want StringConst{Value: \"auto\"}", values.Rows[0][1])
+	}
+	// Cell 2: bare has no DefaultExpr → substituted as NullConst.
+	if _, ok := values.Rows[0][2].(*NullConst); !ok {
+		t.Errorf("row[0][2]=%T want *NullConst", values.Rows[0][2])
+	}
+	// ColumnIndex covers all three columns in declared order (no
+	// generated columns in this fixture).
+	if got, want := ins.ColumnIndex, []int{0, 1, 2}; len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("ColumnIndex=%v want %v", got, want)
+	}
+}
+
+// TestPlanInsertDefaultValuesSkipsGeneratedColumns: rung 17 — generated
+// columns are excluded from the expansion, matching planInsert's
+// implicit-column-list rule. The Insert's source then has arity one
+// less than len(tbl.Columns); the executor populates the generated
+// column via computeGeneratedColumns.
+func TestPlanInsertDefaultValuesSkipsGeneratedColumns(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: 1}},
+		{Name: "g", Type: catalog.Type{Name: "int4"}, GeneratedAlways: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t DEFAULT VALUES"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	values := ins.Source.(*Values)
+	if len(values.Rows[0]) != 1 {
+		t.Fatalf("expansion size=%d want 1 (generated col excluded)", len(values.Rows[0]))
+	}
+	if len(ins.ColumnIndex) != 1 || ins.ColumnIndex[0] != 0 {
+		t.Errorf("ColumnIndex=%v want [0]", ins.ColumnIndex)
+	}
+}
+
 // TestPlanUpdate: pgbench's abalance UPDATE plans into
 // Update(Filter(SeqScan)) with Set[2] populated.
 func TestPlanUpdate(t *testing.T) {

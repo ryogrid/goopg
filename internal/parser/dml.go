@@ -32,7 +32,7 @@ func (p *parser) parseInsert() (Stmt, error) {
 			return nil, p.errAtCur("expected ')'")
 		}
 	}
-	// INSERT … SELECT or INSERT … VALUES
+	// INSERT … SELECT | INSERT … VALUES | INSERT … DEFAULT VALUES
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
 		sel, err := p.parseSelect()
 		if err != nil {
@@ -43,6 +43,19 @@ func (p *parser) parseInsert() (Stmt, error) {
 		} else {
 			return nil, p.errAtCur("expected SELECT statement")
 		}
+	} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+		// M0103-0007 rung 17: `INSERT INTO t DEFAULT VALUES` — the
+		// all-defaults form. The keyword pair is parsed here; the
+		// planner's rewriteInsertDefaultMarkers expands it into a
+		// single row of DefaultMarkers sized to the table's insertable
+		// columns. A column list before DEFAULT VALUES is rejected by
+		// upstream PG, but we silently accept it for forward-compat —
+		// the planner will arity-check after expansion.
+		p.advance() // consume DEFAULT
+		if _, err := p.expectKeyword(KwValues); err != nil {
+			return nil, err
+		}
+		stmt.DefaultValues = true
 	} else {
 		if _, err := p.expectKeyword(KwValues); err != nil {
 			return nil, err
