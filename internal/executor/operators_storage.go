@@ -679,50 +679,56 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			}
 		}
 
-		// FK referential integrity check (M0096-0011): verify parent rows exist
-		// before writing.  Uses the plan table's ForeignKeys (parent partition's
-		// FKs apply to routed child inserts too).
-		if len(o.plan.Table.ForeignKeys) > 0 {
-			if err := checkFKInsert(o.ctx, o.plan.Table, row); err != nil {
-				return nil, err
-			}
-		}
-
 		// Partition routing (M0096-0007): if the target table is partitioned,
-		// route the row to the appropriate partition child.
+		// route the row to the appropriate partition child BEFORE the FK check
+		// so that violation MESSAGEs name the leaf partition (matches upstream
+		// PG; M0100-0005m).  Parent's FK definitions apply to routed inserts.
 		targetRel := rel
 		// Compute generated columns (GENERATED ALWAYS AS … STORED) before writing.
 		// M0096-0008.
 		_ = computeGeneratedColumns(cols, row)
 
+		var routedPart *catalog.Table
 		if isPartitioned {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				partTable := routeToPartition(o.plan.Table, row, im)
-				if partTable != nil {
-					targetRel = o.ctx.Catalog.RelFileNode(partTable)
-					// Remap row from parent column order to partition child column order.
-					// Partition children may have columns in a different order (ATTACH
-					// PARTITION allows mismatched column order). M0096-0013.
-					partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
-					// Recompute generated columns using partition child's schema.
-					_ = computeGeneratedColumns(partTable.Columns, partRow)
-					ptr, werr := writeHeapRowReturning(o.ctx, targetRel, partTable.Columns, partRow)
-					if werr != nil {
-						return nil, werr
-					}
-					// M0104-0007: SSI write-path hook on the newly inserted
-					// tuple's (block, slot). Conflict-in installs an rw-edge
-					// against any concurrent SERIALIZABLE reader that holds a
-					// covering predicate lock (page or relation grain).
-					ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
-					maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
-					o.appendInsertRetRow(row)
-					o.rowsAffected++
-					continue
-				}
+				routedPart = routeToPartition(o.plan.Table, row, im)
 			}
-			// No matching partition found — write to parent anyway (best effort)
 		}
+
+		// FK referential integrity check (M0096-0011): verify parent rows exist
+		// before writing.  Uses the plan table's ForeignKeys (parent partition's
+		// FKs apply to routed child inserts too).  reportTbl = routedPart so
+		// the MESSAGE names the leaf partition when partition-routed.
+		if len(o.plan.Table.ForeignKeys) > 0 {
+			if err := checkFKInsert(o.ctx, o.plan.Table, routedPart, row); err != nil {
+				return nil, err
+			}
+		}
+
+		if isPartitioned && routedPart != nil {
+			partTable := routedPart
+			targetRel = o.ctx.Catalog.RelFileNode(partTable)
+			// Remap row from parent column order to partition child column order.
+			// Partition children may have columns in a different order (ATTACH
+			// PARTITION allows mismatched column order). M0096-0013.
+			partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
+			// Recompute generated columns using partition child's schema.
+			_ = computeGeneratedColumns(partTable.Columns, partRow)
+			ptr, werr := writeHeapRowReturning(o.ctx, targetRel, partTable.Columns, partRow)
+			if werr != nil {
+				return nil, werr
+			}
+			// M0104-0007: SSI write-path hook on the newly inserted
+			// tuple's (block, slot). Conflict-in installs an rw-edge
+			// against any concurrent SERIALIZABLE reader that holds a
+			// covering predicate lock (page or relation grain).
+			ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
+			maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
+			o.appendInsertRetRow(row)
+			o.rowsAffected++
+			continue
+		}
+		// No matching partition found (or non-partitioned) — write to parent.
 		ptr, werr := writeHeapRowReturning(o.ctx, targetRel, cols, row)
 		if werr != nil {
 			return nil, werr

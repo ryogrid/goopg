@@ -79,3 +79,24 @@ func TestFKViolationMessageMatchesPGShape(t *testing.T) {
 	}
 }
 
+// TestFKViolationPartitionRoutedShape pins the dual-source shape used when
+// an INSERT into a partitioned parent routes to a leaf partition and that
+// leaf's FK check fails: the MESSAGE names the routed leaf
+// (`fk_parted_pk_2`), while the constraint name inherits from the
+// partitioned parent (`fk_parted_pk_a_fkey`).  This is the L21 expected
+// shape in `postgres/src/test/isolation/expected/fk-snapshot.out`.
+// Composes the two halves the way assertParentExists does — pinning the
+// helper composition without standing up a full executor harness.
+// Regression for M0100-0005m (fk-snapshot L21 partition-routed name).
+func TestFKViolationPartitionRoutedShape(t *testing.T) {
+	parent := &catalog.Table{Name: "fk_parted_pk"}
+	leaf := &catalog.Table{Name: "fk_parted_pk_2"}
+	fk := catalog.ForeignKey{Columns: []string{"a"}, RefTable: "pk_noparted"}
+	msg := fmt.Sprintf("insert or update on table %q violates foreign key constraint %q",
+		leaf.Name, fkConstraintName(parent, fk))
+	want := `insert or update on table "fk_parted_pk_2" violates foreign key constraint "fk_parted_pk_a_fkey"`
+	if msg != want {
+		t.Fatalf("partition-routed message = %q,\nwant                       %q", msg, want)
+	}
+}
+

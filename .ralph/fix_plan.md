@@ -1411,6 +1411,33 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/ ./internal/planner/ ./internal/parser/
           ./internal/analyzer/` PASS.  Design:
           `docs/design/0100-0005k-fk-violation-error-shape.md`.
+        - FK violation MESSAGE names routed leaf partition
+          (M0100-0005m, 2026-05-15 loop 29).
+          `insertOp.Next` (`internal/executor/operators_storage.go`)
+          hoists `routeToPartition` above the FK check and threads
+          the routed leaf as a separate `reportTbl` parameter into
+          `checkFKInsert` / `assertParentExists`
+          (`internal/executor/operators_fk.go`).  `fkOwnerTbl` (the
+          partitioned parent — `o.plan.Table`) still provides
+          `ForeignKeys` and feeds `fkConstraintName`, so the
+          constraint name correctly inherits from the parent
+          (`fk_parted_pk_a_fkey`); `reportTbl` (the leaf —
+          `routedPart`) supplies the MESSAGE's table name slot
+          (`fk_parted_pk_2`).  `reportTbl==nil` falls back to
+          `fkOwnerTbl` so the non-partitioned call site is
+          unchanged.  Closes the L21 partition-routed name diff in
+          `fk-snapshot.spec` (carried as M0100-0005k follow-up).
+          Remaining `fk-snapshot` diffs are real-feature gaps
+          (DELETE-on-PK wait state and REPEATABLE READ serialise-
+          access error), tracked separately.  Regression pin:
+          `TestFKViolationPartitionRoutedShape` in
+          `internal/executor/operators_fk_test.go` (composes the
+          dual-source MESSAGE / DETAIL pair the way
+          `assertParentExists` does).  `go test -race
+          ./internal/executor/ ./internal/server/
+          ./internal/planner/ ./internal/parser/
+          ./internal/analyzer/` PASS.  Design:
+          `docs/design/0100-0005m-fk-violation-partition-routed-name.md`.
         - IsolationRunner strips lib/pq `(SQLSTATE)` suffix
           (M0100-0005l, 2026-05-15 loop 28).  `formatPQError`
           (`internal/testport/framework/isolation_runner.go`) now
