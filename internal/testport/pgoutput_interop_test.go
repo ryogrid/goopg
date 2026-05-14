@@ -346,10 +346,47 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	//     produces a plain `HeapInsert` record (matching upstream's
 	//     pre-image behaviour). The classifier-side fix is the
 	//     principled match for upstream's `DecodeHeap2*` family.
-	t.Skip("M0103-0008 rung 11 closed in 0103-0016; rung 12 (logical " +
-		"decoder coverage for HeapHotUpdate / PageImage record kinds) " +
-		"deferred to a follow-up loop so each live-probe rung lands " +
-		"with its own design doc.")
+	//   - rung 13 (NEW, CLOSED): LATERAL pg_catalog-qualified SRF
+	//     parser dispatch.  PG's CREATE SUBSCRIPTION runs
+	//     `fetch_table_list_from_publisher` to learn which tables a
+	//     publication covers; the probe shape is
+	//     `FROM pg_catalog.pg_publication_tables t JOIN pg_catalog.pg_class c
+	//      ON (c.oid = ...), LATERAL pg_catalog.pg_get_publication_tables(t.pubname) AS gpt`.
+	//     goopg's `parseRangeVar` only recognised SRFs by their
+	//     unqualified name (`obj.Schema == ""` gate), so the
+	//     `pg_catalog.pg_get_publication_tables(...)` form fell into the
+	//     derived-subquery branch and choked with "expected ')' after
+	//     subquery in FROM (got ()" at the LATERAL function's opening
+	//     paren. CREATE SUBSCRIPTION caught the parse error, registered
+	//     ZERO tables in `pg_subscription_rel`, and the apply worker
+	//     thereafter silently skipped every Insert/Update/Delete via
+	//     `should_apply_changes_for_rel` → false (no rel state → never
+	//     READY → not applied). Net symptom: 'w' frames flow,
+	//     CONTEXT lines for INSERT/COMMIT appear in the apply worker's
+	//     debug log, but `pg_replication_origin_status.remote_lsn` stays
+	//     at 0/0 and `count(*)` on the subscriber stays at 0.
+	//     Closed by extending `parseRangeVar`'s SRF dispatch to accept
+	//     both unqualified and `pg_catalog`-qualified shapes for
+	//     `generate_series` / `pg_input_error_info` / `parse_ident` /
+	//     `pg_get_publication_tables`. Design:
+	//     `docs/design/0103-0019-lateral-pg-catalog-qualified-srf.md`.
+	//     Pinned by `TestParseLateralPgCatalogQualifiedSRF` in
+	//     `internal/parser/select_test.go`.
+	//   - rung 14 (NEW, OPEN): `pg_class.relnatts` column missing.
+	//     With rung 13 closed, the live probe's parse succeeds and
+	//     `fetch_table_list_from_publisher` reaches execution, but
+	//     goopg's `pg_class` virtual table does not expose `relnatts`
+	//     (number of attributes per relation). The CASE expression
+	//     `array_length(gpt.attrs, 1) = c.relnatts` therefore raises
+	//     SQLSTATE 42703 `column "relnatts" does not exist`, the
+	//     CREATE SUBSCRIPTION still registers ZERO tables, and the
+	//     apply worker still silently skips every change. Closing
+	//     requires adding `relnatts int2` to goopg's `pg_class`
+	//     virtual view (column count derivable from
+	//     `*catalog.Table.Columns`).
+	t.Skip("M0103-0008 rung 13 closed in 0103-0019; rung 14 " +
+		"(pg_class.relnatts column missing) deferred to a follow-up " +
+		"loop so each live-probe rung lands with its own design doc.")
 
 	repo := repoRoot(t)
 	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))

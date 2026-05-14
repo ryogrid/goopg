@@ -239,6 +239,69 @@ func TestParseFuncCallVariadicArgument(t *testing.T) {
 }
 
 
+// TestParseLateralPgCatalogQualifiedSRF pins M0103-0008 rung 13: the
+// parser's FROM-clause TVF dispatch must accept both unqualified and
+// `pg_catalog`-qualified spellings of the v0 SRF whitelist. Without
+// this, PG's `fetch_table_list_from_publisher` probe (which uses
+// `LATERAL pg_catalog.pg_get_publication_tables(...)`) hits
+// "expected ')' after subquery in FROM (got ()" at the function's
+// opening paren and CREATE SUBSCRIPTION registers zero tables in
+// `pg_subscription_rel`, which causes the apply worker to silently
+// skip every Insert/Update/Delete via `should_apply_changes_for_rel`.
+// See docs/design/0103-0019-lateral-pg-catalog-qualified-srf.md.
+func TestParseLateralPgCatalogQualifiedSRF(t *testing.T) {
+	// Canonical libpqwalreceiver shape: cross-FROM with LATERAL +
+	// schema-qualified SRF. The arg references the left FROM item's
+	// column so the planner threads the lateralCtx through (closed
+	// in rung 6/7). The parser side only needs to accept the
+	// pg_catalog.<name>(...) spelling as an SRF instead of falling
+	// into the derived-subquery branch.
+	stmts, err := Parse(`SELECT gpt.relid FROM pg_publication t, LATERAL pg_catalog.pg_get_publication_tables(t.pubname) AS gpt`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel, ok := stmts[0].(*SelectStmt)
+	if !ok {
+		t.Fatalf("expected *SelectStmt, got %T", stmts[0])
+	}
+	if len(sel.From) != 2 {
+		t.Fatalf("expected 2 FROM items (t, gpt), got %d", len(sel.From))
+	}
+	// The lateral SRF should land as a RangeVar whose TableFunc is
+	// the `pg_get_publication_tables` SRF — the `pg_catalog.` prefix
+	// is discarded once dispatch fires.
+	gpt := sel.From[1]
+	if gpt.TableFunc == nil {
+		t.Fatalf("expected From[1] to be a TableFuncRef, got Schema=%q Name=%q Subquery=%v",
+			gpt.Schema, gpt.Name, gpt.Subquery != nil)
+	}
+	if gpt.TableFunc.Name != "pg_get_publication_tables" {
+		t.Fatalf("From[1].TableFunc.Name = %q, want pg_get_publication_tables",
+			gpt.TableFunc.Name)
+	}
+	if gpt.Alias != "gpt" {
+		t.Fatalf("From[1].Alias = %q, want gpt", gpt.Alias)
+	}
+}
+
+// TestParseLateralPgCatalogQualifiedSRFCaseInsensitive checks that
+// the `pg_catalog` schema-qualifier match is case-insensitive (the
+// upstream probe always uses lowercase, but goopg's identifier
+// downcasing happens earlier; this test pins the EqualFold guard
+// against accidental tightening).
+func TestParseLateralPgCatalogQualifiedSRFCaseInsensitive(t *testing.T) {
+	stmts, err := Parse(`SELECT 1 FROM pg_publication t, LATERAL PG_CATALOG.pg_get_publication_tables(t.pubname) AS gpt`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	gpt := sel.From[1]
+	if gpt.TableFunc == nil || gpt.TableFunc.Name != "pg_get_publication_tables" {
+		t.Fatalf("PG_CATALOG-prefix did not dispatch SRF; From[1].TableFunc=%v", gpt.TableFunc)
+	}
+}
+
+
 // TestParseIndirectionStarFuncCall — `(srf(args)).*` in target list emits
 // an IndirectionStar AST node wrapping the inner FuncCall. M0103-0008
 // probe-survival foundation.

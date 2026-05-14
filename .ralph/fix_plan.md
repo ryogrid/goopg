@@ -2561,6 +2561,58 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       `TestPort_PgoutputInteropGoopgToPG` stays in place so the
       next rung lands with its own design doc + targeted unit
       pin per the rung protocol.
+      PARTIAL PROGRESS 2026-05-14 (loop 15): closed rung 13 —
+      LATERAL `pg_catalog`-qualified SRF parser dispatch. Design
+      doc: `docs/design/0103-0019-lateral-pg-catalog-qualified-srf.md`
+      (accepted).
+      Diagnosis: lifting the `t.Skip` produced the same observable
+      pattern as rungs 10–12 (apply worker connects, no row
+      replicates). Adding subscriber-side state introspection
+      (`pg_replication_origin_status`, `pg_subscription_rel`,
+      `pg_stat_subscription`) revealed:
+      - 'w' frames flow correctly (received_lsn = 0/146 = 326
+        decimal, matching the 4 transactions' synthetic LSN range)
+      - pgoutput Begin/Relation/Insert/Update/Delete/Commit
+        sequences emit byte-perfect (decoded hex verified against
+        upstream's `logicalrep_write_*` formats)
+      - PG's apply worker DOES receive every message (debug5
+        CONTEXT lines confirm "during message type INSERT/COMMIT
+        in transaction 4..7")
+      - BUT `pg_subscription_rel` is EMPTY on the subscriber and
+        `pg_replication_origin_status.remote_lsn` stays at 0/0
+      Root cause: CREATE SUBSCRIPTION's `fetch_table_list_from_publisher`
+      probe uses `LATERAL pg_catalog.pg_get_publication_tables(t.pubname)
+      AS gpt`. goopg's `parseRangeVar` only matched TVF FROM items
+      with `obj.Schema == ""`, so the schema-qualified form fell
+      into the derived-subquery branch and emitted
+      `syntax error at or near "expected ')' after subquery in FROM
+      (got ()"` at the LATERAL function's opening paren. CREATE
+      SUBSCRIPTION therefore registered ZERO tables in
+      `pg_subscription_rel`. With no rel state, the apply worker's
+      `should_apply_changes_for_rel(rel)` returns false for every
+      relation and silently skips every change (no error logged —
+      PG's apply worker has no error path for "relation not in
+      subscription state list").
+      Fix: extend the TVF FROM-item dispatch gate to accept both
+      unqualified and `pg_catalog`-qualified spellings (via
+      `strings.EqualFold(obj.Schema, "pg_catalog")`) for
+      `generate_series` / `pg_input_error_info` / `parse_ident` /
+      `pg_get_publication_tables`. Behaviour for unqualified calls
+      and for non-`pg_catalog` schemas is unchanged.
+      Pinned by `TestParseLateralPgCatalogQualifiedSRF` and
+      `TestParseLateralPgCatalogQualifiedSRFCaseInsensitive` in
+      `internal/parser/select_test.go`.
+      Verification (loop 15): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/ ./internal/storage/` → all green.
+      Live-probe run with the `t.Skip` removed (rolled back before
+      commit) confirmed the failure mode shifted observably: the
+      `fetch_table_list` SQL now parses and reaches the executor,
+      where it surfaces the rung-14 surface — `pg_class.relnatts`
+      column missing (SQLSTATE 42703). The `t.Skip` was restored
+      with the rung-14 diagnosis quoted verbatim so the next loop
+      can resume from the exact failing surface.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

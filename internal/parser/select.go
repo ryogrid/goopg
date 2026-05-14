@@ -685,8 +685,18 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
 	// Recognized: generate_series, pg_input_error_info, parse_ident,
 	// pg_get_publication_tables (M0103-0008).
+	//
+	// Accept both unqualified (`pg_get_publication_tables(...)`) and
+	// `pg_catalog`-qualified (`pg_catalog.pg_get_publication_tables(...)`)
+	// shapes. libpqwalreceiver's `fetch_table_list` probe issued by
+	// PG's CREATE SUBSCRIPTION uses the schema-qualified form inside a
+	// LATERAL FROM clause; without this dispatch the parser falls
+	// through to the derived-subquery branch and chokes on the `(` after
+	// the function name with "expected ')' after subquery in FROM
+	// (got ()". See M0103-0008 rung 13 / docs/design/0103-0019-*.
 	srfFuncName := ""
-	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" && obj.Schema == "" {
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
+		(obj.Schema == "" || strings.EqualFold(obj.Schema, "pg_catalog")) {
 		lower := strings.ToLower(obj.Name)
 		switch lower {
 		case "generate_series", "pg_input_error_info", "parse_ident",
