@@ -161,9 +161,14 @@ func (m *Manager) releaseSerializableLocked(handle TxnHandle) *SerializableXact 
 
 	sx.FinishedAt = m.ssiState.nextCommitSeqNo
 	m.ssiState.nextCommitSeqNo++
-	// M0104-0004+ will null out edge slices here when peers point
-	// back; for now they are always nil, so an unconditional clear
-	// is fine.
+	// M0104-0004: scrub references to the dying SerializableXact
+	// from every peer's in/out-conflict slices before clearing its
+	// own. Without this step, surviving peers retain dangling
+	// pointers to a SerializableXact that is no longer in
+	// ssiState.xacts, breaking the M0104-0006 dangerous-structure
+	// walker and leaking memory through the retained slice
+	// references.
+	removeSerializableXactFromPeersLocked(sx)
 	sx.inConflicts = nil
 	sx.outConflicts = nil
 	delete(m.ssiState.xacts, handle)

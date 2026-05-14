@@ -1681,10 +1681,31 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
         floor).
       - Design doc: `docs/design/0104-0003-predicate-lock-substrate.md`.
 
-- [ ] **M0104-0004**
+- [x] **M0104-0004**
       - Summary: Read-path SSI conflict-in hooks.
       - On serializable reads, register conflict-in edges against concurrent
         writers touching protected targets.
+      - Closed 2026-05-14: `Manager.CheckForSerializableConflictOut`
+        (`internal/mvcc/ssi_conflict.go`) installs R→W rw-conflict edges in
+        both directions (`reader.outConflicts += writer`,
+        `writer.inConflicts += reader`) when a SERIALIZABLE reader observes
+        a tuple written by another live SERIALIZABLE writer. Idempotent on
+        repeat calls (deduped via O(out-degree) scan); no-op for RC/RR
+        readers/writers, reserved XIDs (Invalid/Bootstrap/Frozen), self-XID,
+        and finished writers (retention deferred to M0104-0006).
+        `releaseSerializableLocked` now calls
+        `removeSerializableXactFromPeersLocked` before nulling its own
+        slices so surviving peers never retain dangling pointers — this
+        invariant is load-bearing for M0104-0006's dangerous-structure
+        walker. Diagnostic helpers `OutConflictCount`, `InConflictCount`,
+        `HasRWConflict` expose slice state for tests. Polarity-agnostic
+        helper `registerRWConflictLocked` will be reused by M0104-0005's
+        write-path hook with reversed discovery polarity but the same R→W
+        edge orientation. 11 regression pins in
+        `internal/mvcc/ssi_conflict_test.go` cover happy path, idempotency,
+        every no-op case, peer-edge scrub on commit + abort, and
+        multi-peer distinct-edge accounting. Design doc:
+        `docs/design/0104-0004-ssi-conflict-out-hook.md`.
 
 - [ ] **M0104-0005**
       - Summary: Write-path SSI conflict-out hooks.
