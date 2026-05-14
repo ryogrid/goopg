@@ -156,22 +156,74 @@ func TestIndirectionStarTargetListPlansAsFromSrf(t *testing.T) {
 // a clean PG-compatible error for the libpqrcv-probe shape
 // `(srf(array_agg(...))).*` (aggregate-in-SRF-args). Full support requires
 // a ProjectSet-style plan node; tracked as the next M0103-0008 sub-step.
-func TestIndirectionStarRejectsAggregateArgument(t *testing.T) {
+// TestIndirectionStarWithAggregateArgument pins the libpqrcv-probe shape
+// `(pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*`. The
+// planner lowers this into `Aggregate → ProjectSet(srf(...))` where the
+// SRF's argument is a ColumnRef into the aggregate's `array_agg` output
+// (M0103-0008 final sub-step). The executor evaluates the SRF once per
+// child row and spreads its three-column composite. We use a regular
+// table named `pg_publication` (with a `pubname` column) as a stand-in
+// for the catalog view — the planner shape is identical and the table
+// fixture exercises the lowering end-to-end.
+func TestIndirectionStarWithAggregateArgument(t *testing.T) {
 	ctx, _, cleanup := newStorageFixture(t)
 	defer cleanup()
 	ctx.PubSub = catalog.NewPubSub()
 
-	stmts, err := parser.Parse("SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* FROM pg_publication")
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatal(err)
 	}
-	_, err = planner.Plan(stmts[0], ctx.Catalog)
-	if err == nil {
-		t.Fatalf("expected planner error for aggregate-in-SRF-args, got nil")
+	if err := runDDL(t, ctx, "CREATE TABLE pg_publication (pubname text)"); err != nil {
+		t.Fatal(err)
 	}
-	// PlanError stringifies with the message; spot-check the wording.
-	if msg := err.Error(); !contains(msg, "aggregate") {
-		t.Fatalf("error message %q does not mention 'aggregate'", msg)
+	if err := runDDL(t, ctx, "INSERT INTO pg_publication VALUES ('p')"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := runQueryRows(t, ctx, "SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* FROM pg_publication")
+	if len(rows) != 1 {
+		t.Fatalf("row count = %d, want 1", len(rows))
+	}
+	if len(rows[0]) != 3 {
+		t.Fatalf("column count = %d, want 3 (relid/attrs/qual)", len(rows[0]))
+	}
+	if rows[0][0].IsNull() {
+		t.Fatalf("relid is NULL, want a non-zero OID")
+	}
+}
+
+
+// TestIndirectionStarWithAggregateArgumentAndWhere pins the full libpqrcv
+// probe shape: the SRF call sits over an aggregate that itself filters
+// the source rows via a WHERE clause. Two publications exist (`p` and `q`)
+// but only `p` survives the IN filter; the SRF must be called with a
+// 1-element text[] and emit one row per (publication, table) pair. M0103-0008.
+func TestIndirectionStarWithAggregateArgumentAndWhere(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE PUBLICATION q FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE pg_publication (pubname text)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO pg_publication VALUES ('p'), ('q')"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := runQueryRows(t, ctx,
+		"SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* "+
+			"FROM pg_publication WHERE pubname IN ('p')")
+	if len(rows) != 1 {
+		t.Fatalf("row count = %d, want 1 (only publication 'p' survives WHERE)", len(rows))
+	}
+	if len(rows[0]) != 3 {
+		t.Fatalf("column count = %d, want 3 (relid/attrs/qual)", len(rows[0]))
 	}
 }
 

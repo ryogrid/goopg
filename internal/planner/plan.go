@@ -752,6 +752,28 @@ type PgGetPublicationTables struct {
 	schema Schema
 }
 
+
+// ProjectSet evaluates a single set-returning function call per Child row
+// and emits each row of its composite result as one output row.
+//
+// Currently implemented only for `pg_get_publication_tables`; SrfArgs are
+// resolved Exprs whose ColumnRefs index into Child.Output(), so an
+// `Aggregate → ProjectSet(srf(<agg-output-col>))` plan can spread the
+// SRF's expansion of an aggregated text[] back over multiple rows.
+//
+// The output schema is the SRF's expanded composite (relid, attrs, qual
+// for pg_get_publication_tables). M0103-0008 final sub-step.
+type ProjectSet struct {
+	pos     int
+	Child   Node
+	SrfName string
+	SrfArgs []Expr
+	schema  Schema
+}
+
+func (n *ProjectSet) Pos() int       { return n.pos }
+func (n *ProjectSet) Output() Schema { return n.schema }
+
 func (n *PgGetPublicationTables) Pos() int       { return n.pos }
 func (n *PgGetPublicationTables) Output() Schema { return n.schema }
 

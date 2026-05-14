@@ -1978,6 +1978,66 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       Remaining gap for full probe survival: (1) ProjectSet for
       aggregate-arg SRFs — the only piece left before
       `fetch_table_list` runs end-to-end against a goopg publisher.
+      PARTIAL PROGRESS 2026-05-14 (loop 5): closed gap (1) — ProjectSet
+      lowering for aggregate-arg SRFs. Design doc:
+      `docs/design/0103-0009-projectset-for-aggregate-arg-srfs.md`.
+      Changes:
+      - `internal/planner/plan.go`: new `ProjectSet{Child, SrfName,
+        SrfArgs, schema}` plan node — single-SRF wrapper that emits
+        each row of the SRF's composite over its child's output.
+      - `internal/planner/planner.go`: `rewriteIndirectionStarTargets`
+        no longer raises `0A000` for aggregate-arg cases (passes nil
+        `onAggregate` to the parser helper). After `buildAggregateStage`
+        in `planSelect`, the planner walks the target list looking for
+        a `*parser.IndirectionStar` whose source `*parser.FuncCall` has
+        a supported composite (currently only
+        `pg_get_publication_tables`); each arg is resolved through
+        `resolveExprAfterAggregate` so aggregate calls become
+        `ColumnRef`s into the Aggregate output, then wraps the node
+        with a `ProjectSet`. `ctx`/`agg` are reset so downstream
+        branches (ORDER BY, LIMIT, target list) hit the non-aggregate
+        path; the wrapping `Project` becomes a per-column identity
+        passthrough over the ProjectSet's expanded composite. New
+        helper `projectSetCompositeSchema(name)` returns the expanded
+        schema for supported SRFs.
+      - `internal/executor/operators_project_set.go` (new): `projectSetOp`
+        opens its child, drains every row, evaluates the SRF args
+        against each row, and dispatches on `SrfName` to the shared
+        row-builder. All SRF rows are buffered; `Next` yields one at
+        a time. The probe-shape Aggregate emits one row, so buffering
+        cost is trivial.
+      - `internal/executor/operators_pg_get_publication_tables.go`:
+        extracted the row-build path into package-level
+        `buildPgGetPublicationTablesRows(ctx, []Datum)` and
+        `publicationTablesForCtx(ctx, *Publication)`; the FROM-clause
+        operator's `Open` evaluates its argument expressions to
+        `Datum`s then delegates to the same builder, so both paths
+        produce byte-identical rows.
+      - `internal/executor/executor.go`: `Build` dispatches
+        `*planner.ProjectSet` → `newProjectSetOp(p, child)`.
+      Tests (in
+      `internal/executor/operators_pg_get_publication_tables_test.go`):
+      - `TestIndirectionStarWithAggregateArgument` (replaces the old
+        `TestIndirectionStarRejectsAggregateArgument` whose 0A000
+        assertion is no longer correct): runs the full probe shape
+        `(pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*
+        FROM pg_publication`, asserts a single 3-column row with
+        non-NULL relid.
+      - `TestIndirectionStarWithAggregateArgumentAndWhere`: same
+        shape with a `WHERE pubname IN ('p')` filter (mirrors
+        libpqrcv's `fetch_table_list` IN clause), asserts only the
+        surviving publication's tables come through.
+      Verification (loop 5): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green (parser 1.050 s,
+      planner 1.062 s, analyzer 1.038 s, executor 2.619 s,
+      server 3.512 s, wal 3.069 s, catalog 1.019 s).
+      With both gaps closed, `fetch_table_list` SQL parses, plans,
+      and executes against an in-memory fixture; the next M0103-0008
+      step is to drop the `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` and confirm the live
+      probe sequence runs end-to-end against a goopg publisher.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

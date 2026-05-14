@@ -494,6 +494,56 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	// M0103-0008 final sub-step: lower target-list IndirectionStar with
+	// aggregate args (e.g. `(srf(array_agg(...))).*`) into a ProjectSet
+	// wrapper sitting above the Aggregate node. The libpqrcv
+	// `fetch_table_list` probe against a goopg publisher hits exactly
+	// this shape.
+	var ps *ProjectSet
+	if agg != nil {
+		for _, t := range s.Targets {
+			is, ok := t.Expr.(*parser.IndirectionStar)
+			if !ok {
+				continue
+			}
+			fc, ok := is.Source.(*parser.FuncCall)
+			if !ok {
+				return nil, &PlanError{Pos: is.Pos(), Code: "0A000",
+					Message: "(expr).* requires a function-call source"}
+			}
+			compName := strings.ToLower(fc.Name.Name)
+			compSchema := projectSetCompositeSchema(compName)
+			if compSchema == nil {
+				return nil, &PlanError{Pos: fc.Pos(), Code: "0A000",
+					Message: fmt.Sprintf("set-returning function %q is not supported in ProjectSet", compName)}
+			}
+			args := make([]Expr, 0, len(fc.Args))
+			for _, a := range fc.Args {
+				pa, err := resolveExprAfterAggregate(a, agg)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, pa)
+			}
+			ps = &ProjectSet{
+				pos:     is.Pos(),
+				Child:   node,
+				SrfName: compName,
+				SrfArgs: args,
+				schema:  compSchema,
+			}
+			node = ps
+			// Downstream resolution (ORDER BY, LIMIT, target list)
+			// reads from the ProjectSet's expanded output, not the
+			// aggregate. Reset ctx + agg so the existing branches
+			// hit the non-aggregate path.
+			ctx = newResolveContext(nil, ps.Output())
+			ctx.cat = cat
+			agg = nil
+			break
+		}
+	}
+
 	var win *windowSurface
 	if needsWindowStage(s) {
 		var err error
@@ -554,7 +604,17 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		targets []Expr
 		schema  Schema
 	)
-	if win != nil {
+	if ps != nil {
+		// Identity passthrough over the ProjectSet's expanded composite.
+		// The IndirectionStar in s.Targets is consumed by the ProjectSet;
+		// the wrapping Project becomes a no-op identity that surfaces the
+		// expanded columns.
+		schema = ps.Output()
+		targets = make([]Expr, len(schema))
+		for i, sc := range schema {
+			targets[i] = &ColumnRef{pos: ps.pos, Index: i, Name: sc.Name, Type: sc.Type}
+		}
+	} else if win != nil {
 		targets, schema, err = resolveTargetsAfterWindow(s.Targets, win)
 	} else if agg == nil {
 		targets, schema, err = resolveTargets(s.Targets, ctx)
@@ -1294,10 +1354,29 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 // uses planner-side aggregate semantics) is surfaced here as a clean
 // PlanError.
 func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
-	return parser.RewriteIndirectionStarTargets(s, func(pos int) error {
-		return &PlanError{Pos: pos, Code: "0A000",
-			Message: "set-returning function with aggregate argument (e.g. (srf(array_agg(...))).*) requires ProjectSet support — not yet implemented (M0103-0008 next sub-step)"}
-	})
+	// Pass nil for onAggregate so aggregate-arg IndirectionStars stay in place;
+	// planSelect detects and lowers them into ProjectSet (M0103-0008 final
+	// sub-step). Non-aggregate IndirectionStars are still rewritten into
+	// FROM-clause SRF references.
+	return parser.RewriteIndirectionStarTargets(s, nil)
+}
+
+
+// projectSetCompositeSchema returns the expanded composite-row schema for a
+// supported set-returning function. nil means the SRF cannot be lowered into
+// ProjectSet from a `(srf(<agg>)).*` shape — currently only
+// pg_get_publication_tables is supported, matching the libpqrcv
+// fetch_table_list probe shape. M0103-0008.
+func projectSetCompositeSchema(name string) Schema {
+	switch name {
+	case "pg_get_publication_tables":
+		return Schema{
+			SchemaColumn{Name: "relid", Type: catalog.Type{Name: "oid"}},
+			SchemaColumn{Name: "attrs", Type: catalog.Type{Name: "text"}},
+			SchemaColumn{Name: "qual", Type: catalog.Type{Name: "text"}},
+		}
+	}
+	return nil
 }
 
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.

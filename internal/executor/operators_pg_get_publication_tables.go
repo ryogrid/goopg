@@ -36,37 +36,23 @@ func (o *pgGetPublicationTablesOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.rows = nil
 	o.pos = 0
-	// Resolve the publication-name filter set from the argument list.
-	want, all, err := o.resolvePublicationFilter()
+	// Evaluate every argument expression to a Datum, then delegate to the
+	// shared row-builder. ProjectSet (M0103-0008 final sub-step) reuses the
+	// same builder once the publisher's libpqrcv probe has materialised the
+	// aggregated text[] of publication names.
+	args := make([]Datum, 0, len(o.plan.Args))
+	for _, a := range o.plan.Args {
+		d, err := evalExpr(a, nil, ctx)
+		if err != nil {
+			return err
+		}
+		args = append(args, d)
+	}
+	rows, err := buildPgGetPublicationTablesRows(ctx, args)
 	if err != nil {
 		return err
 	}
-	if o.ctx.PubSub == nil {
-		return nil
-	}
-	pubs := o.ctx.PubSub.Publications()
-	for _, pub := range pubs {
-		if !all {
-			if _, ok := want[pub.Name]; !ok {
-				continue
-			}
-		}
-		tables := o.publicationTables(pub)
-		for _, t := range tables {
-			oid := t.OID
-			var relidDatum Datum
-			if oid == 0 {
-				relidDatum = NullDatum
-			} else {
-				relidDatum = NewIntDatum(int64(oid))
-			}
-			o.rows = append(o.rows, Row{
-				relidDatum,
-				NullDatum, // attrs (column list — goopg does not model column lists yet)
-				NullDatum, // qual (row filter — same)
-			})
-		}
-	}
+	o.rows = rows
 	return nil
 }
 
@@ -81,22 +67,52 @@ func (o *pgGetPublicationTablesOp) Next() (TupleSlot, error) {
 	return SlotFromRow(nil, row), nil
 }
 
-// resolvePublicationFilter evaluates every argument and flattens the result
-// into a set of publication names. NULL arguments are skipped. A bare empty
-// argument list returns (nil, true) — meaning "no filter, accept all". The
-// VARIADIC marker is implicit at this layer: an argument that evaluates to a
-// text[] is spread element-by-element, and a scalar text argument is taken as
-// a single name.
-func (o *pgGetPublicationTablesOp) resolvePublicationFilter() (map[string]struct{}, bool, error) {
-	if len(o.plan.Args) == 0 {
-		return nil, true, nil
+// buildPgGetPublicationTablesRows is the shared row-builder reused by both
+// the FROM-clause SRF operator and ProjectSet's per-input-row evaluator
+// (M0103-0008). args carries the already-evaluated argument Datums; an
+// empty list returns every (publication, table) pair the registry holds.
+func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) {
+	want, all := resolvePublicationFilterFromDatums(args)
+	if ctx.PubSub == nil {
+		return nil, nil
+	}
+	pubs := ctx.PubSub.Publications()
+	rows := make([]Row, 0)
+	for _, pub := range pubs {
+		if !all {
+			if _, ok := want[pub.Name]; !ok {
+				continue
+			}
+		}
+		tables := publicationTablesForCtx(ctx, pub)
+		for _, t := range tables {
+			oid := t.OID
+			var relidDatum Datum
+			if oid == 0 {
+				relidDatum = NullDatum
+			} else {
+				relidDatum = NewIntDatum(int64(oid))
+			}
+			rows = append(rows, Row{
+				relidDatum,
+				NullDatum, // attrs (column list — not modeled)
+				NullDatum, // qual (row filter — not modeled)
+			})
+		}
+	}
+	return rows, nil
+}
+
+// resolvePublicationFilterFromDatums flattens every argument Datum into a
+// publication-name set. NULL Datums are skipped. An empty argument list
+// signals "no filter, accept all". Datums whose StringValue is a
+// brace-wrapped text-array are spread element-by-element.
+func resolvePublicationFilterFromDatums(args []Datum) (map[string]struct{}, bool) {
+	if len(args) == 0 {
+		return nil, true
 	}
 	want := make(map[string]struct{})
-	for _, a := range o.plan.Args {
-		d, err := evalExpr(a, nil, o.ctx)
-		if err != nil {
-			return nil, false, err
-		}
+	for _, d := range args {
 		if d.IsNull() {
 			continue
 		}
@@ -107,7 +123,7 @@ func (o *pgGetPublicationTablesOp) resolvePublicationFilter() (map[string]struct
 			}
 		}
 	}
-	return want, false, nil
+	return want, false
 }
 
 // flattenTextArg decodes a Datum produced by a publication-name argument into
@@ -125,18 +141,18 @@ func flattenTextArg(d Datum) []string {
 	return []string{s}
 }
 
-// publicationTables resolves the set of tables a Publication advertises.
+// publicationTablesForCtx resolves the set of tables a Publication advertises.
 // AllTables expands to every base table in the catalog; otherwise the
 // per-publication Tables list (qualified names) is resolved against the
 // catalog so the returned *Table carries the live OID. Schema-only entries
 // that no longer exist are silently skipped to mirror upstream's behaviour
 // against a dropped table.
-func (o *pgGetPublicationTablesOp) publicationTables(pub *catalog.Publication) []*catalog.Table {
-	if o.ctx.Catalog == nil {
+func publicationTablesForCtx(ctx *Context, pub *catalog.Publication) []*catalog.Table {
+	if ctx.Catalog == nil {
 		return nil
 	}
 	if pub.AllTables {
-		if in, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		if in, ok := ctx.Catalog.(*catalog.InMemory); ok {
 			out := in.AllTables()
 			sort.Slice(out, func(i, j int) bool {
 				if out[i].Schema != out[j].Schema {
@@ -151,7 +167,7 @@ func (o *pgGetPublicationTablesOp) publicationTables(pub *catalog.Publication) [
 	out := make([]*catalog.Table, 0, len(pub.Tables))
 	for _, qname := range pub.Tables {
 		schema, name := splitQualifiedTable(qname)
-		t, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: name})
+		t, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: name})
 		if !ok {
 			continue
 		}
