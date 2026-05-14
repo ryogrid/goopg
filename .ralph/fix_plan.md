@@ -1447,6 +1447,45 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/ ./internal/mvcc/ ./internal/planner/
           ./internal/parser/` PASS.  Design:
           `docs/design/0100-0005n-cross-partition-update-moved-tuple-error.md`.
+        - PL/pgSQL `NEW.<col>` assignment now actually mutates the
+          trigger row (M0100-0005p, 2026-05-15 loop 32).
+          `internal/plpgsql/parser.go::parseDottedExprStmt` previously
+          treated EVERY `<ident>.<field> [:= | =] <expr>` as a
+          `_plpgsql_noop` — `OLD.*` truly is immutable but `NEW.*` is
+          mutable in BEFORE triggers, so the parser silently dropped
+          `NEW.a := 2`.  Fix: dotted parser now detects `NEW`-prefix
+          and emits a real `AssignStmt{Target: "_new_<field>"}` (the
+          same slot `injectTriggerVars` populates); `OLD.*` keeps the
+          noop semantics; tokenisation uses `TokenOperator` for both
+          `:=` and `=` (the prior `TokenSymbol == "="` arm in
+          `parseAssign` never matched — lexer puts `=` on the operator
+          track at `internal/parser/lexer.go:443`).  Companion runtime
+          fix in `internal/executor/plpgsql_runtime.go::executePLpgSQLTriggerBody`:
+          when the trigger returns `NEW` (explicit `flowReturnTriggerNew`
+          or default for non-DELETE), `rebuildNewRowFromFrame(frame, trig)`
+          reconstructs the returned `Row` from the frame's `_new_<col>`
+          slots so partition routing observes the trigger's mutation.
+          Without either half, `pu.newRow` reached `routeToPartition`
+          unchanged, `destRel == puRel` was true, `isCrossPartitionMove`
+          stayed false, and the M0100-0005n EPQ check on concurrent
+          updaters had nothing to detect on the old slot.  Closes all
+          three `footrg` blocked permutations of
+          `partition-key-update-1.spec` — diff floor drops from L55 to
+          L72 (next gap: `s2i: INSERT INTO bar VALUES(7);` FK lookup
+          against `foo_range_parted1` doesn't wait for s1's in-flight
+          cross-partition UPDATE — FK-check side of moved-partition
+          wiring, separate scope).  Regression pins:
+          `TestParseTriggerNewFieldAssignColonEquals`,
+          `TestParseTriggerNewFieldAssignBareEquals`,
+          `TestParseTriggerOldFieldAssignStaysNoop` in
+          `internal/plpgsql/parser_test.go`; end-to-end
+          `TestTriggerDrivenPartitionKeyRewriteMovesRowAcrossPartitions`
+          in `internal/server/notice_test.go` (pre-fix: footrg_mv1=1
+          footrg_mv2=0; post-fix: footrg_mv1=0 footrg_mv2=1).
+          `go test -count=1 ./internal/plpgsql/ ./internal/executor/
+          ./internal/server/ ./internal/parser/ ./internal/planner/
+          ./internal/analyzer/` PASS.  Design:
+          `docs/design/0100-0005p-plpgsql-new-field-assignment.md`.
         - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
           `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
           the row's source `*catalog.Table` through pending records

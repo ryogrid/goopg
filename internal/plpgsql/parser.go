@@ -704,15 +704,15 @@ func (p *bodyParser) parseDeclaration() (*Declaration, error) {
 }
 
 // parseAssign parses `target := value;` or `target = value;`.
-// Also handles `ident.field = expr;` (trigger OLD/NEW field write — treated
-// as a no-op expression statement, since OLD is immutable). M0096-0012.
+// Also handles `ident.field = expr;` — for `NEW.field` this is a real
+// assignment to the trigger's new-row column (BEFORE triggers in PG can
+// rewrite NEW.*); for `OLD.field` it is a no-op (OLD is immutable).
+// M0096-0012; NEW-write path added M0100-0005p.
 func (p *bodyParser) parseAssign() (*AssignStmt, error) {
 	nameTok := p.advance()
-	// Handle dotted target: `ident.field ...` — consume the dot and field,
-	// then treat the whole expression up to `;` as a no-op (field assignment
-	// to trigger records is silently dropped; OLD is immutable in PG too).
+	// Handle dotted target: `ident.field ...`.
 	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "." {
-		return p.parseDottedExprStmt(nameTok.Pos)
+		return p.parseDottedExprStmt(nameTok)
 	}
 	isAssign := false
 	if p.cur().Kind == parser.TokenOperator && p.cur().Value == ":=" {
@@ -734,11 +734,51 @@ func (p *bodyParser) parseAssign() (*AssignStmt, error) {
 	return &AssignStmt{pos: nameTok.Pos, Target: nameTok.Value, Value: expr}, nil
 }
 
-// parseDottedExprStmt parses `ident.field [= expr] ;` as a no-op.
-// Used for trigger OLD.b = ... patterns that are valid PL/pgSQL syntax
-// but have no effect (OLD is immutable). M0096-0012.
-func (p *bodyParser) parseDottedExprStmt(pos int) (*AssignStmt, error) {
-	// Consume everything up to `;`.
+// parseDottedExprStmt parses `ident.field [= expr] ;`.
+// For `NEW.field := expr` in trigger context this produces a real
+// assignment that targets the injected `_new_<field>` frame variable
+// (BEFORE triggers in PG can rewrite NEW.*). For `OLD.field = ...` and
+// any other prefix it is a no-op (OLD is immutable; record types are not
+// supported in v0). M0096-0012; NEW-write path added M0100-0005p.
+func (p *bodyParser) parseDottedExprStmt(nameTok parser.Token) (*AssignStmt, error) {
+	pos := nameTok.Pos
+	prefix := strings.ToLower(nameTok.Value)
+	// Consume the '.' then the field identifier.
+	p.advance() // '.'
+	if p.cur().Kind != parser.TokenIdent {
+		// Malformed — consume to ';' and return a no-op so the rest of
+		// the body parses.
+		for p.cur().Kind != parser.TokenEOF {
+			if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+				p.advance()
+				break
+			}
+			p.advance()
+		}
+		return &AssignStmt{pos: pos, Target: "_plpgsql_noop", Value: &parser.IntegerConst{}}, nil
+	}
+	field := p.advance().Value
+	// `NEW.<field> := <expr>` or `NEW.<field> = <expr>` — capture the
+	// RHS expression so the assignment actually fires at runtime.
+	// Both `:=` and `=` are tokenised as TokenOperator by the SQL lexer
+	// (see internal/parser/lexer.go).
+	isAssign := false
+	if p.cur().Kind == parser.TokenOperator && (p.cur().Value == ":=" || p.cur().Value == "=") {
+		isAssign = true
+	}
+	if isAssign && prefix == "new" {
+		p.advance() // := or =
+		expr, err := p.scanExprToSemicolon("assignment value")
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate assignment")
+		}
+		return &AssignStmt{pos: pos, Target: "_new_" + strings.ToLower(field), Value: expr}, nil
+	}
+	// OLD.* / unrelated dotted refs / non-assign expressions: swallow to
+	// ';' and emit the noop sentinel — preserves the M0096-0012 behaviour.
 	for p.cur().Kind != parser.TokenEOF {
 		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
 			p.advance()
@@ -746,8 +786,6 @@ func (p *bodyParser) parseDottedExprStmt(pos int) (*AssignStmt, error) {
 		}
 		p.advance()
 	}
-	// Return a no-op assign: `_plpgsql_noop := 0` (the target never exists in frame).
-	// The executor silently ignores assignment to unknown variables when noop is set.
 	return &AssignStmt{pos: pos, Target: "_plpgsql_noop", Value: &parser.IntegerConst{}}, nil
 }
 

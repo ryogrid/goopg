@@ -351,6 +351,85 @@ func TestPartitionChildTriggerFiresOnParentDelete(t *testing.T) {
 	}
 }
 
+// TestTriggerDrivenPartitionKeyRewriteMovesRowAcrossPartitions
+// (M0100-0005p) verifies that when a BEFORE UPDATE trigger on a leaf
+// partition rewrites the partition-key column (NEW.a := 2), the
+// resulting row is routed to the destination partition AND the source
+// slot in the old partition is no longer visible to subsequent reads.
+// This is the precondition for the moved-partition concurrency error
+// (partition-key-update-1.spec); without it, the M0100-0005n EPQ check
+// has nothing to detect on the old slot.
+func TestTriggerDrivenPartitionKeyRewriteMovesRowAcrossPartitions(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	colonIdx := strings.LastIndex(addr, ":")
+	if colonIdx < 0 {
+		t.Fatalf("addr: %s", addr)
+	}
+	host, port := addr[:colonIdx], addr[colonIdx+1:]
+	dsn := "host=" + host + " port=" + port + " user=postgres dbname=postgres sslmode=disable"
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Skipf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, q := range []string{
+		`CREATE TABLE footrg_mv (a int, b text) PARTITION BY LIST(a)`,
+		`CREATE TABLE footrg_mv1 PARTITION OF footrg_mv FOR VALUES IN (1)`,
+		`CREATE TABLE footrg_mv2 PARTITION OF footrg_mv FOR VALUES IN (2)`,
+		`INSERT INTO footrg_mv VALUES (1, 'ABC')`,
+		`CREATE FUNCTION footrg_mv_trig_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.a = 2; RETURN NEW; END $$`,
+		`CREATE TRIGGER footrg_mv_trig BEFORE UPDATE ON footrg_mv1 FOR EACH ROW EXECUTE FUNCTION footrg_mv_trig_fn()`,
+	} {
+		rows, err := conn.QueryContext(ctx, q)
+		if err != nil {
+			t.Skipf("setup %q: %v", q, err)
+		}
+		rows.Close()
+	}
+
+	if _, err := conn.ExecContext(ctx, `UPDATE footrg_mv SET b = 'XYZ' WHERE a = 1`); err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+
+	// Row should now live in footrg_mv2 with a=2.
+	var got2 int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM footrg_mv2`).Scan(&got2); err != nil {
+		t.Fatalf("count footrg_mv2: %v", err)
+	}
+	if got2 != 1 {
+		t.Errorf("footrg_mv2 row count = %d, want 1 (trigger should have routed the row to a=2 partition)", got2)
+	}
+
+	// Source partition should no longer hold the row.
+	var got1 int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM footrg_mv1`).Scan(&got1); err != nil {
+		t.Fatalf("count footrg_mv1: %v", err)
+	}
+	if got1 != 0 {
+		t.Errorf("footrg_mv1 row count = %d, want 0 (old slot must be invisible after cross-partition move)", got1)
+	}
+
+	// Parent should still report exactly 1 row.
+	var gotP int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM footrg_mv`).Scan(&gotP); err != nil {
+		t.Fatalf("count footrg_mv: %v", err)
+	}
+	if gotP != 1 {
+		t.Errorf("footrg_mv (parent) row count = %d, want 1", gotP)
+	}
+}
+
 // TestNoticeCaptureUpdateTriggerExplicitTx tests BEFORE UPDATE trigger NOTICE
 // within an explicit transaction (BEGIN), matching the isolation test scenario.
 func TestNoticeCaptureUpdateTriggerExplicitTx(t *testing.T) {

@@ -399,3 +399,64 @@ func TestParseLexErrorWrapped(t *testing.T) {
 		t.Errorf("err = %T, want errors.As *SyntaxError", err)
 	}
 }
+
+// TestParseTriggerNewFieldAssignColonEquals and the `=` variant verify
+// that `NEW.<col> := <expr>;` / `NEW.<col> = <expr>;` produce a real
+// AssignStmt whose Target is the injected `_new_<col>` frame slot —
+// the path partition-key-update-1.spec's
+// `func_footrg_mod_a` ("NEW.a = 2;") depends on for cross-partition
+// re-routing. Pre-M0100-0005p these were silently swallowed as
+// `_plpgsql_noop`, so the trigger ran but never modified the new row.
+func TestParseTriggerNewFieldAssignColonEquals(t *testing.T) {
+	blk, err := Parse("BEGIN NEW.a := 2; RETURN NEW; END")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(blk.Statements) != 2 {
+		t.Fatalf("Statements len = %d, want 2", len(blk.Statements))
+	}
+	a, ok := blk.Statements[0].(*AssignStmt)
+	if !ok {
+		t.Fatalf("Statements[0] = %T, want *AssignStmt", blk.Statements[0])
+	}
+	if a.Target != "_new_a" {
+		t.Errorf("Target = %q, want %q (NEW.a must lower to the _new_a frame slot)", a.Target, "_new_a")
+	}
+	if _, ok := a.Value.(*parser.IntegerConst); !ok {
+		t.Errorf("Value = %T, want *parser.IntegerConst", a.Value)
+	}
+}
+
+func TestParseTriggerNewFieldAssignBareEquals(t *testing.T) {
+	// upstream PG accepts both `:=` and `=` for PL/pgSQL field
+	// assignment; the spec script uses `NEW.a = 2;` (bare `=`).
+	blk, err := Parse("BEGIN NEW.a = 2; RETURN NEW; END")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	a, ok := blk.Statements[0].(*AssignStmt)
+	if !ok {
+		t.Fatalf("Statements[0] = %T, want *AssignStmt", blk.Statements[0])
+	}
+	if a.Target != "_new_a" {
+		t.Errorf("Target = %q, want %q", a.Target, "_new_a")
+	}
+}
+
+// TestParseTriggerOldFieldAssignStaysNoop pins that OLD.* writes are
+// still discarded (OLD is immutable in upstream PG; in v0 we drop the
+// statement rather than raise an error so existing trigger bodies that
+// touch OLD.* compile cleanly).
+func TestParseTriggerOldFieldAssignStaysNoop(t *testing.T) {
+	blk, err := Parse("BEGIN OLD.a = 99; RETURN NEW; END")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	a, ok := blk.Statements[0].(*AssignStmt)
+	if !ok {
+		t.Fatalf("Statements[0] = %T, want *AssignStmt", blk.Statements[0])
+	}
+	if a.Target != "_plpgsql_noop" {
+		t.Errorf("Target = %q, want %q (OLD writes must stay no-op)", a.Target, "_plpgsql_noop")
+	}
+}

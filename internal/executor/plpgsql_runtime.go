@@ -1139,7 +1139,7 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	case flowReturnTriggerOld:
 		return trig.OldRow, true, nil
 	case flowReturnTriggerNew:
-		return trig.NewRow, true, nil
+		return rebuildNewRowFromFrame(frame, trig), true, nil
 	case flowReturnTriggerNull:
 		return nil, true, nil // NULL = skip the row
 	default:
@@ -1147,8 +1147,32 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 		if strings.ToLower(trig.TGOp) == "delete" {
 			return trig.OldRow, true, nil
 		}
-		return trig.NewRow, true, nil
+		return rebuildNewRowFromFrame(frame, trig), true, nil
 	}
+}
+
+// rebuildNewRowFromFrame reconstructs the trigger's NEW row from the
+// frame's `_new_<colname>` slots after the trigger body has run.
+// BEFORE triggers in PG can rewrite NEW.* (e.g. partition-key-update-1's
+// `func_footrg_mod_a` does `NEW.a := 2`); without rebuilding the row
+// from the frame, those rewrites would never reach the downstream
+// partition routing / heap-write code. M0100-0005p.
+func rebuildNewRowFromFrame(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) Row {
+	if trig == nil || trig.NewRow == nil {
+		return nil
+	}
+	out := make(Row, len(trig.NewRow))
+	copy(out, trig.NewRow)
+	for i, col := range trig.Cols {
+		idx, ok := frame.lookup("_new_" + strings.ToLower(col.Name))
+		if !ok {
+			continue
+		}
+		if i < len(out) {
+			out[i] = frame.values[idx]
+		}
+	}
+	return out
 }
 
 // execPLpgSQLEmbeddedSQL executes an embedded SQL statement from a PL/pgSQL
