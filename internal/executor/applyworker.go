@@ -261,9 +261,17 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 	ctx.Tx = w.currentTx
 
 	rel := w.cat.RelFileNode(r.local)
-	if err := writeHeapRow(ctx, rel, r.local.Columns, row); err != nil {
+	ptr, err := writeHeapRowReturning(ctx, rel, r.local.Columns, row)
+	if err != nil {
 		return fmt.Errorf("applyworker: writeHeapRow %q: %w", r.local.Name, err)
 	}
+	// Maintain unique/primary-key indexes so fresh-session queries
+	// using equality predicates on indexed columns find the row.
+	// Without this, the dispatcher's IndexScan returns 0 rows even
+	// though SeqScan still sees the tuple — the M0103-0007 rung-1
+	// fresh-session visibility gap surfaced in
+	// `TestPubSubClusterSmokePGToGoopgFreshSessionVisibility`.
+	maintainUniqueIndexesForInsert(ctx, r.local, r.local.Columns, row, ptr)
 	return nil
 }
 
@@ -317,7 +325,7 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
-	return applyUpdateByKey(ctx, rel, r.local.Columns, oldKeyRow, newRow)
+	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow)
 }
 
 // applyContext builds a minimal executor Context for apply-worker
@@ -408,11 +416,20 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 
 // applyUpdateByKey finds the row matching oldKeyRow in rel, deletes it,
 // then inserts newRow — implementing a logical UPDATE for the apply worker.
-func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, oldKeyRow, newRow Row) error {
+func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row) error {
 	if err := applyDeleteByKey(ctx, rel, cols, oldKeyRow); err != nil {
 		return err
 	}
-	return writeHeapRow(ctx, rel, cols, newRow)
+	ptr, err := writeHeapRowReturning(ctx, rel, cols, newRow)
+	if err != nil {
+		return err
+	}
+	// Re-add to unique/primary-key indexes so post-UPDATE
+	// equality probes find the new row (matches applyInsert).
+	if tbl != nil {
+		maintainUniqueIndexesForInsert(ctx, tbl, cols, newRow, ptr)
+	}
+	return nil
 }
 
 // rowMatchesKey returns true when every non-null datum in keyRow equals

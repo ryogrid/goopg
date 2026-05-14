@@ -87,13 +87,70 @@ func TestPubSubClusterSmokePGToGoopg(t *testing.T) {
 	// least one commit from the publisher. This is the harness's
 	// minimum-viable evidence that both binaries handshook,
 	// publication/subscription was issued correctly, and the apply
-	// path is live. Verifying post-apply row visibility through a
-	// fresh SQL session is a separate goopg gap (the apply worker
-	// writes outside the dispatcher's MVCC view); that work is
-	// tracked under M0103-0007's Scenario A invariants.
+	// path is live.
 	waitForApplyCommitLog(t,
 		filepath.Join(repo, "tmp", "pubsubcluster-smoke-pg2g", "smoke_pg2g-sub", "cluster.log"),
 		30*time.Second)
+}
+
+// TestPubSubClusterSmokePGToGoopgFreshSessionVisibility is the
+// M0103-0007 rung-1 pin: a row applied by the subscriber's apply
+// worker must be visible to a fresh `database/sql` SELECT against
+// the subscriber. The M0103-0006 caveat noted the disk file under
+// `base/1/<oid>` carried the tuple but `SELECT count(*)` from a new
+// session returned 0; closing M0103-0007's Scenario A requires that
+// invariant to hold.
+func TestPubSubClusterSmokePGToGoopgFreshSessionVisibility(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping fresh-session-visibility smoke test in short mode")
+	}
+	repo := repoRoot(t)
+	baseDir := filepath.Join(repo, "tmp", "pubsubcluster-vis-pg2g")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "vis_sub"
+	psc := NewMixed(t, "vis_pg2g", Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    ClusterKindPG,
+		SubscriberKind:   ClusterKindGoopg,
+		SyncMode:         SyncModeAsync,
+		ApplicationName:  "vis_sub",
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(psc.opts.ApplicationName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION %s WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		psc.opts.SubscriptionName, conn, psc.opts.PublicationName, slotName))
+
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+	waitForApplyCommitLog(t,
+		filepath.Join(repo, "tmp", "pubsubcluster-vis-pg2g", "vis_pg2g-sub", "cluster.log"),
+		30*time.Second)
+
+	// Fresh `database/sql` session — Cluster.Query opens a new
+	// connection per call. The equality predicate on the PK column
+	// `id = 1` exercises the IndexScan path: before the rung-1 fix
+	// (`maintainUniqueIndexesForInsert` in applyInsert) the row was
+	// only reachable via SeqScan, so `WHERE id = 1` returned 0
+	// rows even though `SELECT id FROM public.t` showed it as 1.
+	psc.WaitForRow(t, "public.t", "id = 1", 1, 10*time.Second)
 }
 
 // waitForApplyCommitLog polls a goopg cluster log file until at least

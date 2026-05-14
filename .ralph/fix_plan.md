@@ -1834,6 +1834,33 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       DoD: sync subtest — `count(*) == killCommitted + 1` (zero loss);
       async subtest — `count(*) ∈ [killCommitted-asyncLossBound+1,
       killCommitted+1]` with `asyncLossBound = 50` (documented in design doc).
+      PARTIAL PROGRESS 2026-05-14 (rung 1): closed the M0103-0006
+      "apply-worker writes invisible to fresh sessions" caveat. The
+      caveat hand-waved the cause as "the apply worker writes outside
+      the dispatcher's MVCC view"; root cause is narrower —
+      `ApplyWorker.applyInsert` called `writeHeapRow` only, with no
+      index maintenance. SeqScan saw the tuple; `WHERE id = 1` fell
+      back to IndexScan, probed an empty PK btree, and returned 0
+      rows. Dispatcher INSERTs into the same table were matched
+      correctly, isolating the gap to the apply path. Design doc:
+      `docs/design/0103-0024-apply-worker-index-maintenance.md`
+      (accepted). Fix: pipe `writeHeapRowReturning`'s
+      `storage.ItemPointer` through to
+      `maintainUniqueIndexesForInsert` from `applyInsert`; mirror in
+      `applyUpdateByKey` (signature gains `*catalog.Table` so the
+      helper can resolve `IndexesOnTable`). Pinned by
+      `TestPubSubClusterSmokePGToGoopgFreshSessionVisibility` in
+      `internal/testutil/pubsubcluster/cluster_test.go`: full
+      PG-publisher + goopg-subscriber harness, asserts `count(*)
+      WHERE id = 1` returns 1 after the apply commit. Before fix: 10 s
+      deadline. After: ≈ 2 s. Follow-up (deferred within
+      M0103-0007 scope): UPDATE old-tuple / DELETE index-entry
+      deletion + non-unique secondary indexes. Goopg's IndexScan
+      tolerates orphaned entries via heap re-fetch + visibility
+      re-check, so a Scenario A test only needs to close these if a
+      false-positive surfaces. The full Scenario A failover wiring
+      (pgbench, kill -9, libpq multi-host reconnect) remains the
+      principal remaining work.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
