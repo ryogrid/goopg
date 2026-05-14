@@ -1982,6 +1982,56 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       pgbench against PG publisher with `pgbench_history` polling,
       kill -9 + libpq multi-host reconnect plumbing on the client
       side.
+      PARTIAL PROGRESS 2026-05-14 (rung 5): unchanged-TOAST `'u'`
+      decode. Design doc:
+      `docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md`
+      (accepted). Real-world workloads against publisher tables
+      with TOASTed columns (large text/bytea) would otherwise stall
+      the apply slot on the first UPDATE that left the TOASTed
+      column unchanged — pgoutput emits that column as `'u'` +
+      zero bytes, and the apply worker rejected it as
+      `"'u' (unchanged TOAST) status not supported"`. Fix splits
+      across decoder + apply paths:
+      - `internal/executor/applyworker.go::decodePgoutputTupleAsRow`
+        now returns `(Row, []bool, error)`. `'u'` cells become
+        `NullDatum` plus `unchanged[i] = true`. The parallel mask
+        is what callers use to fill the slot from the matched heap
+        row; for OldTuple / DELETE-key callers that discard the
+        mask, the NullDatum + `rowMatchesKey`'s existing "skip
+        NULL key cells" rule yields wildcard-matching semantics —
+        exactly what FULL replica identity with unchanged TOAST
+        needs.
+      - `applyInsert` defensively rejects `'u'` (pgoutput's encoder
+        never emits it on INSERT — no pre-image to inherit from).
+      - `applyUpdate` threads the mask into a new parameter on
+        `applyUpdateByKey`. When any cell is unchanged, a new
+        read-only `applyScanFirstMatch` walks `rel`, returns the
+        first row matching `oldKeyRow`, and the apply path copies
+        its values into the corresponding `newRow` slots before
+        the existing delete+insert+index-maintenance sequence.
+        The two-scan cost is paid only when `'u'` is present; the
+        rungs 1–4 hot path stays single-scan.
+      Pinned by `TestApplyWorkerDecodeReturnsUnchangedMask` and
+      `TestApplyWorkerInsertRejectsUnchangedToast` (unit,
+      `internal/executor/applyworker_test.go`) and
+      `TestPort_PgoutputInteropPGToGoopgUnchangedToast` (live,
+      `internal/testport/pgoutput_interop_test.go`): publisher
+      table with `payload text SET STORAGE EXTERNAL`, 4 KiB
+      payload, UPDATE that doesn't touch payload, assertions on
+      goopg subscriber that `length(payload)=4096` and
+      `substr(payload,1,1)='X'` (the NULL-fill bug would zero
+      both). Verification (rung 5):
+      `go test -count=1 -timeout 60s -run "TestApplyWorker|TestPrimaryKeyOnlyRow" ./internal/executor/`
+      → PASS (~0.02 s);
+      `go test -count=1 -timeout 120s -run TestPort_PgoutputInteropPGToGoopgUnchangedToast ./internal/testport/`
+      → PASS (~2.0 s); all 5 `TestPort_PgoutputInterop*` together
+      → PASS (~10.2 s); race-tested regression on
+      `./internal/executor/ ./internal/wal/ ./internal/catalog/
+      ./internal/testutil/pubsubcluster/` → all green. Next rungs
+      (deferred within M0103-0007): DDL replication shapes,
+      pgbench against PG publisher with `pgbench_history`
+      polling, kill -9 + libpq multi-host reconnect plumbing on
+      the client side.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

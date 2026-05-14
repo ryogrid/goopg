@@ -156,6 +156,110 @@ func TestPrimaryKeyOnlyRow(t *testing.T) {
 	}
 }
 
+// TestApplyWorkerDecodeReturnsUnchangedMask pins the rung-5 contract:
+// `decodePgoutputTupleAsRow` accepts the upstream `'u'` (unchanged
+// TOAST) per-column status code, returns NullDatum for that slot, and
+// reports the slot in the parallel `unchanged` mask so a downstream
+// UPDATE apply can fill the cell from the matched heap row before
+// insert. The earlier rungs only exercised `'t'` and `'n'`.
+//
+// Design doc: docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md.
+func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},      // int4
+		{Name: "name", TypeOID: 25},    // text
+		{Name: "payload", TypeOID: 25}, // text
+	}
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "name", Type: catalog.Type{Name: "text"}},
+		{Name: "payload", Type: catalog.Type{Name: "text"}},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("42")},
+		{Status: 'n', Bytes: nil},
+		{Status: 'u', Bytes: nil},
+	}
+	row, unchanged, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row) != 3 || len(unchanged) != 3 {
+		t.Fatalf("row=%d unchanged=%d want both 3", len(row), len(unchanged))
+	}
+	if row[0].Int != 42 {
+		t.Errorf("row[0].Int=%d want 42", row[0].Int)
+	}
+	if !row[1].IsNull() {
+		t.Errorf("row[1] should be NullDatum (status 'n'), got %v", row[1])
+	}
+	if !row[2].IsNull() {
+		t.Errorf("row[2] should be NullDatum (status 'u'), got %v", row[2])
+	}
+	if got := []bool{unchanged[0], unchanged[1], unchanged[2]}; got[0] || got[1] || !got[2] {
+		t.Errorf("unchanged=%v want [false false true]", got)
+	}
+
+	// Unknown status still errors.
+	tupBad := []wal.DecodedColumn{
+		{Status: 'x', Bytes: nil},
+	}
+	if _, _, err := decodePgoutputTupleAsRow(remoteCols[:1], localCols[:1], tupBad); err == nil {
+		t.Errorf("unknown status: expected error, got nil")
+	}
+}
+
+// TestApplyWorkerInsertRejectsUnchangedToast pins the defensive
+// rejection at the INSERT path. pgoutput's encoder never emits 'u'
+// for INSERT (there is no pre-image to inherit from); a corrupt
+// stream that did so must not silently install a NULL.
+//
+// Design doc: docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md.
+func TestApplyWorkerInsertRejectsUnchangedToast(t *testing.T) {
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	rel := subCat.RelFileNode(subTbl)
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+
+	// Drive Begin → Relation → Insert directly via synthesized
+	// DecodedMessage values; no wire-encoder helper required.
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'B', XID: 99, CommitLSN: 0xBEEF,
+	}); err != nil {
+		t.Fatalf("Begin apply: %v", err)
+	}
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'R',
+		Relation: &wal.DecodedRelation{
+			OID:    rel.RelOid,
+			Schema: "public",
+			Name:   "items",
+			Columns: []wal.DecodedAttr{
+				{Name: "id", TypeOID: 23},
+				{Name: "label", TypeOID: 25},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Relation apply: %v", err)
+	}
+	// INSERT with a 'u' cell — encoder would never emit this; we
+	// build it by hand to confirm the apply-side defensive check.
+	insertMsg := &wal.DecodedMessage{
+		Kind:   'I',
+		RelOID: rel.RelOid,
+		NewTuple: []wal.DecodedColumn{
+			{Status: 't', Bytes: []byte("1")},
+			{Status: 'u', Bytes: nil},
+		},
+	}
+	if _, err := w.ApplyMessage(insertMsg); err == nil {
+		t.Errorf("expected INSERT-with-'u' to be rejected, got nil error")
+	}
+}
+
 // TestApplyWorkerCommitOutsideXactIsNoop pins the tolerant
 // behaviour: a `C` with no preceding `B` doesn't crash. v0
 // pgoutput emits commit-only sequences only when every change

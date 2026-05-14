@@ -246,9 +246,18 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 			return nil
 		}
 	}
-	row, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	row, unchanged, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode insert tuple for %q: %w", r.local.Name, err)
+	}
+	// Defensive: pgoutput's encoder never emits 'u' for an INSERT
+	// (there is no pre-image heap row to inherit from). A corrupt
+	// stream that did so would silently install NULL — refuse here.
+	for i, u := range unchanged {
+		if u {
+			return fmt.Errorf("applyworker: INSERT new-tuple for %q col %d: 'u' (unchanged TOAST) status not valid on INSERT",
+				r.local.Name, i)
+		}
 	}
 
 	// writeHeapRow expects a Context carrying Pool / Tx. Build
@@ -291,7 +300,7 @@ func (w *ApplyWorker) applyDelete(m *wal.DecodedMessage) error {
 	if len(m.OldTuple) == 0 {
 		return nil
 	}
-	keyRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+	keyRow, _, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode delete old-tuple for %q: %w", r.local.Name, err)
 	}
@@ -312,7 +321,7 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 		return fmt.Errorf("applyworker: UPDATE for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
 	}
-	newRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	newRow, newUnchanged, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode update new-tuple for %q: %w", r.local.Name, err)
 	}
@@ -327,7 +336,10 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 	// pre-image row.
 	var oldKeyRow Row
 	if len(m.OldTuple) > 0 {
-		oldKeyRow, err = decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+		// 'u' cells in OldTuple become NullDatum which
+		// rowMatchesKey treats as wildcards — correct, since
+		// the publisher didn't tell us the pre-image value.
+		oldKeyRow, _, err = decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
 		if err != nil {
 			return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
 		}
@@ -343,7 +355,7 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
-	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow)
+	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged)
 }
 
 // applyContext builds a minimal executor Context for apply-worker
@@ -434,7 +446,37 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 
 // applyUpdateByKey finds the row matching oldKeyRow in rel, deletes it,
 // then inserts newRow — implementing a logical UPDATE for the apply worker.
-func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row) error {
+// When newUnchanged has any true entries (a 'u' / unchanged-TOAST cell in
+// the publisher's NewTuple), a read-only first scan finds the matched
+// heap row and copies its values into newRow for each unchanged slot
+// before the delete+insert phase. The two-scan cost is paid only when
+// 'u' is present — the all-'t'/'n' hot path stays single-scan.
+func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row, newUnchanged []bool) error {
+	needFill := false
+	for _, u := range newUnchanged {
+		if u {
+			needFill = true
+			break
+		}
+	}
+	if needFill {
+		matched, err := applyScanFirstMatch(ctx, rel, cols, oldKeyRow)
+		if err != nil {
+			return err
+		}
+		if matched != nil {
+			for i, u := range newUnchanged {
+				if u && i < len(matched) && i < len(newRow) {
+					newRow[i] = matched[i]
+				}
+			}
+		}
+		// If matched == nil, the 'u' slots remain NullDatum. The
+		// subsequent applyDeleteByKey is a no-op (nothing to xmax),
+		// but writeHeapRowReturning still installs newRow — that
+		// preserves the pre-existing "no-match UPDATE installs a row"
+		// behaviour rather than fixing it here.
+	}
 	if err := applyDeleteByKey(ctx, rel, cols, oldKeyRow); err != nil {
 		return err
 	}
@@ -448,6 +490,59 @@ func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		maintainUniqueIndexesForInsert(ctx, tbl, cols, newRow, ptr)
 	}
 	return nil
+}
+
+// applyScanFirstMatch returns a copy of the first visible heap row
+// in rel whose decoded columns match keyRow under rowMatchesKey, or
+// (nil, nil) when no row matches. Used by applyUpdateByKey to source
+// the values for 'u' unchanged-TOAST cells in the publisher's NewTuple.
+// Pure read-only — never stamps xmax or marks pages dirty.
+func applyScanFirstMatch(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row) (Row, error) {
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return nil, err
+	}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return nil, err
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			return nil, err
+		}
+		scanRow := make(Row, len(cols))
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			tup, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				continue
+			}
+			if err := DecodeRowInto(scanRow, cols, tup.Data); err != nil {
+				continue
+			}
+			if rowMatchesKey(scanRow, keyRow) {
+				out := append(Row(nil), scanRow...)
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return out, nil
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+	}
+	return nil, nil
 }
 
 // rowMatchesKey returns true when every non-null datum in keyRow equals
@@ -591,16 +686,23 @@ func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
 // decodePgoutputTupleAsRow parses each pgoutput text-format
 // column value to a Datum compatible with the local table's
 // column type. Status 'n' becomes NullDatum; status 't' is
-// parsed per type ('u' / unchanged TOAST is rejected — v0's
-// encoder doesn't emit it).
-func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, tup []wal.DecodedColumn) (Row, error) {
+// parsed per type; status 'u' (unchanged TOAST) becomes
+// NullDatum with the corresponding `unchanged` slot set to
+// true so a downstream UPDATE apply can fill the cell from
+// the matched heap row before insert. Callers that don't
+// expect 'u' (INSERT, DELETE-key, OldTuple key match) can
+// ignore the mask — the NullDatum + rowMatchesKey's
+// "skip NULL key cells" semantics yield correct behaviour
+// for OldTuple/key-row use cases.
+func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, tup []wal.DecodedColumn) (Row, []bool, error) {
 	if len(tup) != len(remoteCols) {
-		return nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
+		return nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
 	}
 	if len(localCols) < len(remoteCols) {
-		return nil, fmt.Errorf("local table has %d cols, remote sent %d", len(localCols), len(remoteCols))
+		return nil, nil, fmt.Errorf("local table has %d cols, remote sent %d", len(localCols), len(remoteCols))
 	}
 	row := make(Row, len(localCols))
+	unchanged := make([]bool, len(localCols))
 	for i := range row {
 		row[i] = NullDatum
 	}
@@ -612,16 +714,17 @@ func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.
 		case 't':
 			d, err := parsePgoutputText(local.Type, col.Bytes)
 			if err != nil {
-				return nil, fmt.Errorf("col %q: %w", local.Name, err)
+				return nil, nil, fmt.Errorf("col %q: %w", local.Name, err)
 			}
 			row[i] = d
 		case 'u':
-			return nil, fmt.Errorf("col %q: 'u' (unchanged TOAST) status not supported", local.Name)
+			row[i] = NullDatum
+			unchanged[i] = true
 		default:
-			return nil, fmt.Errorf("col %q: unknown status %q", local.Name, col.Status)
+			return nil, nil, fmt.Errorf("col %q: unknown status %q", local.Name, col.Status)
 		}
 	}
-	return row, nil
+	return row, unchanged, nil
 }
 
 // parsePgoutputText converts upstream's canonical text format

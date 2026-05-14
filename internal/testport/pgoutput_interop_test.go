@@ -758,6 +758,83 @@ func TestPort_PgoutputInteropPGToGoopgReplicaIdentityFull(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "a = 3 AND v = 'c'", 1, 30*time.Second)
 }
 
+// TestPort_PgoutputInteropPGToGoopgUnchangedToast pins rung 5 of
+// M0103-0007: the apply-worker's handling of pgoutput's `'u'`
+// (unchanged TOAST) per-column status. The publisher's column has
+// EXTERNAL storage so every UPDATE that doesn't touch it surfaces
+// as `'U' relOid 'N' (t,t,u)` on the wire. The subscriber must
+// preserve the existing heap value for the `'u'` slot rather than
+// installing NULL.
+//
+// Design doc: docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md.
+func TestPort_PgoutputInteropPGToGoopgUnchangedToast(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-toast-u")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_toast_u"
+	psc := pubsubcluster.NewMixed(t, "pg2g_toastu", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// `payload` SET STORAGE EXTERNAL forces the column out-of-line into
+	// the TOAST relation. Any UPDATE that doesn't modify it will surface
+	// as `'u'` on the wire, not as an inline `'t'`-typed payload.
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, name text, payload text)")
+	psc.Publisher.Exec(t, "ALTER TABLE public.t ALTER COLUMN payload SET STORAGE EXTERNAL")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, name text, payload text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// 4 KiB payload — well past the upstream TOAST threshold (~2 KB)
+	// so the value goes out-of-line and pgoutput will short-circuit
+	// the column on any update that doesn't touch it.
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'alpha', repeat('X', 4096))")
+	// UPDATE only the `name` column. Replication wire shape:
+	// `'U' relOid 'N' (t,t,u)`. The apply worker must read the
+	// existing heap row, copy `payload` from it into the new row,
+	// then delete+insert.
+	psc.Publisher.Exec(t, "UPDATE public.t SET name = 'alpha-updated' WHERE id = 1")
+
+	// Fresh `database/sql` sessions throughout; the IndexScan path
+	// is exercised through the PK predicate.
+	psc.WaitForRow(t, "public.t", "id = 1", 1, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 1 AND name = 'alpha-updated'", 1, 30*time.Second)
+	// TOAST preservation: length and first-character checks both
+	// fail-fast on the NULL-fill bug a missing 'u' code path would
+	// introduce, and on the wrong-cell bug a misaligned mask would.
+	psc.WaitForRow(t, "public.t", "id = 1 AND length(payload) = 4096", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 1 AND substr(payload, 1, 1) = 'X'", 1, 30*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"
