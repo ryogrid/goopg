@@ -158,36 +158,84 @@ func evalGenExpr(e parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
 		return operand, nil
 
 	case *parser.FuncCall:
-		return evalGenFuncCall(x)
+		return evalGenFuncCall(x, cols, row)
 
 	}
 
 	return NullDatum, nil
 }
 
-// evalGenFuncCall evaluates the zero-arg time functions that the catalog
-// DEFAULT-eval slow path supports (M0103-0007 rung 18). Calls with
-// arguments, a star arg, or a schema qualifier other than pg_catalog
-// fall through to NullDatum so unknown shapes leave the slot untouched
-// (matching the rest of evalGenExpr's silent-passthrough contract).
+// evalGenFuncCall evaluates the small whitelist of functions the catalog
+// DEFAULT-eval slow path supports:
+//
+//   - zero-arg time functions (M0103-0007 rung 18): now, current_timestamp,
+//     transaction_timestamp, statement_timestamp, current_date.
+//   - sequence advancement (M0103-0007 rung 19): nextval('seq_name') with
+//     exactly one textual argument. The arg is evaluated through evalGenExpr
+//     so cast wrappers (e.g. 'public.foo_seq'::regclass) and column-ref
+//     spellings degrade cleanly to NullDatum when the slow path cannot
+//     resolve them, instead of panicking or returning a sentinel int.
+//
+// Star args, schema qualifiers other than pg_catalog, and any unknown
+// shape fall through to NullDatum so unknown DEFAULTs leave the slot
+// untouched — matching the rest of evalGenExpr's silent-passthrough
+// contract. A column whose DEFAULT is unevaluable surfaces as a NOT NULL
+// violation downstream rather than silently overwriting with NULL.
 //
 // Wall-clock is read per call rather than threaded through ctx.Now —
 // see docs/design/0103-0041 for the bounded-skew rationale.
-func evalGenFuncCall(x *parser.FuncCall) (Datum, error) {
-	if len(x.Args) != 0 || x.Star {
+//
+// nextval uses the process-global seqRegistry directly (no Context),
+// so this path is safe from both the apply worker (no ctx available)
+// and the dispatcher INSERT path. ctx.LastSeqVal / ctx.CurrSeqVals are
+// session-scoped and intentionally NOT touched here — DEFAULT-eval is
+// not a place where SQL-level currval/lastval should observe a side
+// effect. See docs/design/0103-0042 for the divergence rationale.
+func evalGenFuncCall(x *parser.FuncCall, cols []catalog.Column, row Row) (Datum, error) {
+	if x.Star {
 		return NullDatum, nil
 	}
 	if x.Name.Schema != "" && x.Name.Schema != "pg_catalog" {
 		return NullDatum, nil
 	}
-	now := time.Now().UTC()
-	switch strings.ToLower(x.Name.Name) {
-	case "now", "current_timestamp",
-		"transaction_timestamp", "statement_timestamp":
-		return NewTimeDatum(now), nil
-	case "current_date":
-		return NewTimeDatum(time.Date(now.Year(), now.Month(), now.Day(),
-			0, 0, 0, 0, time.UTC)), nil
+	fn := strings.ToLower(x.Name.Name)
+	if len(x.Args) == 0 {
+		now := time.Now().UTC()
+		switch fn {
+		case "now", "current_timestamp",
+			"transaction_timestamp", "statement_timestamp":
+			return NewTimeDatum(now), nil
+		case "current_date":
+			return NewTimeDatum(time.Date(now.Year(), now.Month(), now.Day(),
+				0, 0, 0, 0, time.UTC)), nil
+		}
+		return NullDatum, nil
+	}
+	if fn == "nextval" && len(x.Args) == 1 {
+		argVal, err := evalGenExpr(x.Args[0], cols, row)
+		if err != nil || argVal.Kind != KindString {
+			return NullDatum, nil
+		}
+		name := argVal.StringValue()
+		if name == "" {
+			return NullDatum, nil
+		}
+		s := LookupSequence(name)
+		if s == nil {
+			// Mirror evalNextval's auto-create-with-defaults behaviour
+			// so apply-worker-replicated rows whose SERIAL sequence was
+			// created on the publisher (but not yet registered on this
+			// subscriber) still advance deterministically. Defaults are
+			// the PG-compatible (start=1, increment=1, min=1, max=int64
+			// max, cycle=false).
+			RegisterSequence(name, 1, 1, 1, 9223372036854775807, false)
+			s = LookupSequence(name)
+		}
+		v, err := s.nextVal()
+		if err != nil {
+			return NullDatum, nil
+		}
+		return NewIntDatum(v), nil
 	}
 	return NullDatum, nil
 }

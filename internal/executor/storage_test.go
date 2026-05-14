@@ -504,6 +504,161 @@ func TestInsertFillsMissingColumnDefaultCurrentDate(t *testing.T) {
 	}
 }
 
+// TestInsertFillsMissingColumnDefaultNextval pins M0103-0007 rung 19:
+// a CREATE TABLE DEFAULT of nextval('seq_name') (parser shape:
+// *parser.FuncCall with Name.Name=="nextval" and one StringConst arg)
+// must evaluate against the process-global sequence registry at INSERT
+// time and store a non-NULL KindInt Datum holding the advanced value
+// on every row that omitted the column. Two consecutive INSERTs pin
+// monotonic advance (catches an accidental fixed-sentinel or
+// auto-create-without-advance fallthrough).
+func TestInsertFillsMissingColumnDefaultNextval(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	// Pre-register the sequence so the test does not depend on
+	// auto-create — that path is exercised by the symmetric
+	// auto-create test below.
+	const seqName = "test_default_nextval_seq"
+	RegisterSequence(seqName, 1, 1, 1, 9223372036854775807, false)
+	defer DropSequence(seqName)
+
+	cim := cat.(*catalog.InMemory)
+	defExpr := &parser.FuncCall{
+		Name: parser.ObjectName{Name: "nextval"},
+		Args: []parser.Expr{&parser.StringConst{Value: seqName}},
+	}
+	if _, err := cim.CreateTable(parser.ObjectName{Name: "audit_seq"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int8"},
+			DefaultExpr: defExpr},
+		{Name: "v", Type: catalog.Type{Name: "text"}, NotNull: true},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "audit_seq"})
+
+	// Two INSERTs that each omit the DEFAULT column; expected ids are 1, 2.
+	for i := 0; i < 2; i++ {
+		insertPlan := &planner.Insert{
+			Table: tbl,
+			Source: &planner.Values{
+				Rows: [][]planner.Expr{
+					{&planner.StringConst{Value: "row"}},
+				},
+			},
+			ColumnIndex: []int{1},
+		}
+		op, err := Build(insertPlan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := op.Next(); err != EOF {
+			t.Fatalf("Insert.Next iter %d: %v", i, err)
+		}
+		_ = op.Close()
+	}
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("scan returned %d rows want 2", len(rows))
+	}
+	for i, want := range []int64{1, 2} {
+		got := rows[i][0]
+		if got.IsNull() {
+			t.Fatalf("row %d id: got NULL — DEFAULT nextval not evaluated", i)
+		}
+		if got.Kind != KindInt {
+			t.Fatalf("row %d id.Kind: got %v want KindInt", i, got.Kind)
+		}
+		if got.Int != want {
+			t.Errorf("row %d id: got %d want %d", i, got.Int, want)
+		}
+	}
+}
+
+// TestInsertFillsMissingColumnDefaultNextvalAutoCreates pins rung-19
+// auto-create behaviour: an UNregistered sequence name in DEFAULT
+// nextval() is auto-registered with the PG-default shape (start=1,
+// increment=1) and the first INSERT returns 1. Without auto-create,
+// the slow path would have returned NullDatum and the test row would
+// land with id=NULL.
+func TestInsertFillsMissingColumnDefaultNextvalAutoCreates(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	const seqName = "test_default_nextval_autocreate_seq"
+	// Defensive: clear any prior state if a previous test left it
+	// behind. We do NOT pre-register — the point of this test is
+	// the auto-create path.
+	DropSequence(seqName)
+	defer DropSequence(seqName)
+
+	cim := cat.(*catalog.InMemory)
+	defExpr := &parser.FuncCall{
+		Name: parser.ObjectName{Name: "nextval"},
+		Args: []parser.Expr{&parser.StringConst{Value: seqName}},
+	}
+	if _, err := cim.CreateTable(parser.ObjectName{Name: "audit_seq_auto"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int8"}, DefaultExpr: defExpr},
+		{Name: "v", Type: catalog.Type{Name: "text"}, NotNull: true},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "audit_seq_auto"})
+
+	insertPlan := &planner.Insert{
+		Table: tbl,
+		Source: &planner.Values{
+			Rows: [][]planner.Expr{
+				{&planner.StringConst{Value: "row"}},
+			},
+		},
+		ColumnIndex: []int{1},
+	}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("scan returned %d rows want 1", len(rows))
+	}
+	got := rows[0][0]
+	if got.IsNull() {
+		t.Fatalf("id: got NULL — auto-create did not register sequence")
+	}
+	if got.Kind != KindInt || got.Int != 1 {
+		t.Errorf("id: got %v want KindInt 1", got)
+	}
+}
+
 func drainScan(op Operator) ([]Row, error) {
 	var out []Row
 	for {

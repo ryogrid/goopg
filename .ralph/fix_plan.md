@@ -2851,12 +2851,72 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         → PASS (~0.016 s); broader sweep
         `go test -count=1 -timeout 300s ./internal/executor/ ./internal/planner/ ./internal/parser/ ./internal/analyzer/ ./internal/catalog/`
         → all green (executor 1.143 s).
+      - PARTIAL PROGRESS 2026-05-14 (rung 19): sequence DEFAULTs
+        (`DEFAULT nextval('seq')`) wired into the catalog DE
+        slow path. Design doc:
+        `docs/design/0103-0042-m0103-0007-rung-19-default-nextval.md`
+        (accepted). Before this rung a column declared
+        `DEFAULT nextval('foo_seq')` silently stored NULL on
+        both the apply-worker and dispatcher INSERT paths
+        because `evalGenFuncCall` (added in rung 18) honoured
+        only zero-arg shapes — one-arg `nextval('seq')`
+        FuncCalls fell through to `NullDatum`.
+      - Fix is a single edit point: `evalGenFuncCall` in
+        `internal/executor/operators_generated.go` gains a
+        `fn == "nextval" && len(x.Args) == 1` branch. The arg
+        is evaluated through `evalGenExpr` itself so cast
+        wrappers (`'public.foo_seq'::regclass`) and unsupported
+        shapes degrade cleanly. Looks up the sequence in the
+        process-global `seqRegistry`; auto-registers with the
+        PG-default shape (`start=1, increment=1, min=1,
+        max=9223372036854775807, cycle=false`) when missing —
+        mirroring `evalNextval`'s behaviour so apply-worker
+        replays of rows produced by a publisher-side SERIAL
+        whose `CREATE SEQUENCE` has not yet been mirrored
+        locally still land with non-NULL ids. Returns
+        `NewIntDatum(seqState.nextVal())`. Star args,
+        non-`pg_catalog` schemas, non-string arg types, and
+        overflow/cycle errors all fall through to NullDatum so
+        unevaluable DEFAULTs surface as NOT NULL violations
+        loudly. Function signature gains `cols []catalog.Column,
+        row Row` so the recursion compiles; zero-arg behaviour
+        (rung 18) is byte-equivalent.
+      - Why no `ctx.LastSeqVal` / `ctx.CurrSeqVals` updates:
+        `evalGenFuncCall` has no `*Context` parameter by design
+        (its two callers — apply worker + dispatcher INSERT —
+        have asymmetric Context availability). More importantly,
+        a DEFAULT-eval side-channel updating session-scoped
+        `currval`/`lastval` would silently break the
+        `currval(seq)` SQL invariant (must error when the
+        session has never directly called `nextval`). Process-
+        global `seqRegistry.nextVal()` does NOT touch ctx —
+        keeping the slow-path side-effect strictly to sequence
+        advance. SERIAL hot path unchanged: SERIAL columns'
+        `DefaultExpr` is nil so they keep taking
+        `insertOp.Next`'s SERIAL `nextval` block (rung 14).
+      - Pinned by `TestInsertFillsMissingColumnDefaultNextval`
+        (pre-registers sequence, two consecutive INSERTs that
+        omit the DEFAULT column land with monotonic ids 1, 2 —
+        catches fixed-sentinel / no-op fallthrough regressions)
+        and `TestInsertFillsMissingColumnDefaultNextvalAutoCreates`
+        (un-registers sequence first, first INSERT still
+        yields id=1 via the auto-create branch) in
+        `internal/executor/storage_test.go`.
+      - Verification (rung 19):
+        `go test -count=1 -timeout 60s -run "TestInsertFillsMissingColumnDefaultNextval|TestInsertFillsMissingColumnDefaultCurrent|TestApplyDefaultsForMissing|TestInsertDoesNotOverrideExplicitColumnDefault" ./internal/executor/`
+        → PASS (~0.019 s); broader sweep
+        `go test -count=1 -timeout 300s ./internal/executor/
+        ./internal/planner/ ./internal/analyzer/
+        ./internal/catalog/ ./internal/parser/
+        ./internal/server/ ./internal/wal/` → all green
+        (executor 1.194 s, planner 0.021 s, analyzer 0.014 s,
+        catalog 0.005 s, parser 0.015 s, server 1.770 s,
+        wal 1.943 s).
       - Next rungs (deferred within M0103-0007): pgbench against
         PG publisher with `pgbench_history` polling,
         proto_version=2 streaming subxacts, kill -9 + libpq
         multi-host reconnect plumbing on the client side,
-        sequence DEFAULTs (`DEFAULT nextval('seq')`) when a
-        fixture surfaces a need.
+        column-ref-typed `nextval` args.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.
