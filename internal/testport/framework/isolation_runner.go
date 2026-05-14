@@ -274,15 +274,15 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 					fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", step.Session, notice)
 				}
 			}
-			// For single-line SQL: "step name: sql <waiting ...>"
-			// For multi-line SQL:  "step name: \nsql\n <waiting ...>"
-			// (matches PostgreSQL isolationtester output format)
-			flat := flattenSQL(step.SQL)
-			if strings.Contains(flat, "\n") {
-				fmt.Fprintf(&sb, "step %s: %s\n <waiting ...>\n", step.Name, flat)
-			} else {
-				fmt.Fprintf(&sb, "step %s: %s <waiting ...>\n", step.Name, flat)
-			}
+			// Upstream isolationtester echoes step SQL verbatim and appends
+			// the wait marker once, with a single space separator:
+			//   step name: <raw SQL> <waiting ...>
+			// Multi-line SQL keeps the marker on the SQL's final line
+			// (matches insert-conflict-do-update-4 expected output line 11).
+			// Brace-at-EOL specs (insert-conflict-do-update-3) carry a
+			// leading newline in step.SQL, which renders as `step name: \n
+			// <body> <waiting ...>` — same single format.
+			sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
 			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q})
 		}
 	}
@@ -450,21 +450,37 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 
 // formatStepOutput renders the output for a step.
 // If afterWaiting is true the "step name: SQL" header was already written.
+// formatStepOutput renders the output for a step.
+// If afterWaiting is true the "step name: SQL" header was already written.
+// formatWaitingStepHeader renders the line emitted when a step is detected
+// as blocked, mirroring upstream isolationtester's verbatim echo:
+//
+//	step <name>: <raw SQL> <waiting ...>\n
+//
+// The SQL is appended raw — multi-line SQL keeps the trailing `<waiting ...>`
+// on the same physical line as its final spec-file line (see
+// insert-conflict-do-update-4 expected output line 11).  Brace-at-EOL specs
+// (e.g. insert-conflict-do-update-3) carry a leading newline in `sql`, which
+// renders as `step name: \n<body> <waiting ...>` — same single format.
+func formatWaitingStepHeader(name, sql string) string {
+	return fmt.Sprintf("step %s: %s <waiting ...>\n", name, sql)
+}
+
 func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) string {
 	var sb strings.Builder
 
-	isMultiLine := false
 	if !afterWaiting {
 		// NOTICEs appear BEFORE the step SQL line (matches PostgreSQL isolationtester).
-
 		for _, notice := range o.notices {
 			if o.session != "" {
 				fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", o.session, notice)
 			}
 		}
-		flat := flattenSQL(sqlText)
-		isMultiLine = strings.Contains(flat, "\n")
-		fmt.Fprintf(&sb, "step %s: %s\n", name, flat)
+		// Upstream isolationtester echoes step SQL verbatim after `step
+		// name: `, preserving the raw block content (including any leading
+		// newline introduced by a brace-at-EOL `{` layout, and any
+		// continuation-line indentation).
+		fmt.Fprintf(&sb, "step %s: %s\n", name, sqlText)
 	}
 
 	if o.errText != "" {
@@ -474,11 +490,6 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 	}
 
 	if len(o.rows) == 0 {
-		// Multi-line SQL steps with no result rows get a trailing blank line
-		// matching PostgreSQL isolationtester's output format. M0100-0005.
-		if isMultiLine {
-			sb.WriteString("\n")
-		}
 		return sb.String()
 	}
 
@@ -604,21 +615,6 @@ func formatPQError(err error) string {
 		msg = strings.TrimPrefix(msg, "pq: ")
 	}
 	return "ERROR:  " + msg
-}
-
-// flattenSQL formats SQL for the step header line.
-// Single-line SQL is returned as-is (TrimSpaced).
-// Multi-line SQL is returned as "\n<raw content>" so the step header prints as
-// "step name: \n<raw-content>\n", preserving the original spec file indentation.
-// This matches PostgreSQL isolationtester's output format. M0100-0005.
-func flattenSQL(s string) string {
-	if !strings.Contains(s, "\n") {
-		return strings.TrimSpace(s)
-	}
-	// Multi-line: emit a newline then the raw content.
-	// normalizeIsoOutput strips trailing whitespace from each line, so any
-	// trailing space on the "step name: " line is removed automatically.
-	return "\n" + strings.TrimRight(s, " \t\n")
 }
 
 // normalizeBoolWireText converts lib/pq's "true"/"false" rendering back to

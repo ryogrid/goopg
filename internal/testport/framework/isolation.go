@@ -273,6 +273,11 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 	// Multi-line: read lines until closing brace.
 	// - First segment (the same line as the opening '{'): TrimSpace, since
 	//   the space after '{' is just a separator before the SQL starts.
+	//   If the opening `{` sits at end-of-line (rest is empty/whitespace),
+	//   prepend a leading `\n` to the joined result so the runner's
+	//   `step %s: %s` format prints `step name: \n<body>`, matching
+	//   upstream isolationtester's verbatim echo of `{\n<body>\n}` (e.g.
+	//   insert-conflict-do-update-3 expected output line 5).
 	// - Continuation lines: preserve raw indentation, because upstream
 	//   isolationtester echoes step SQL verbatim — `step name: <line1>\n
 	//   <leading spaces><line2>\n ...` — and the leading whitespace is
@@ -281,6 +286,7 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 	//   before '}'; strip everything from '}' onward and trim trailing
 	//   whitespace. A line that is *just* whitespace before '}' (i.e. the
 	//   closing brace sits on its own line) is dropped.
+	openedOnEOL := strings.TrimSpace(rest) == ""
 	var lines []string
 	if t := strings.TrimSpace(rest); t != "" {
 		lines = append(lines, t)
@@ -299,7 +305,11 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	return strings.Join(lines, "\n")
+	joined := strings.Join(lines, "\n")
+	if openedOnEOL {
+		joined = "\n" + joined
+	}
+	return joined
 }
 
 // RunIsolationPermutation executes a single permutation sequentially using the

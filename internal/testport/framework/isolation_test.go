@@ -168,15 +168,98 @@ func TestParseIsolationSpecClosingBraceOnOwnLine(t *testing.T) {
 	if !ok {
 		t.Fatalf("step q not parsed; have %v", parsed.StepOrder)
 	}
-	// When `{` is on its own line, every content line — including the
-	// first — comes through the scanner and preserves its leading
-	// indentation.  Upstream isolationtester's expected/<spec>.out
-	// shows the same shape (e.g. insert-conflict-do-update-3's
-	// `step insert1: \n    WITH t AS (\n        INSERT INTO ...`).
-	// The trailing `}` line is dropped because nothing precedes the
-	// brace.
-	want := "  SELECT 1;\n  SELECT 2;"
+	// When `{` is on its own line (brace-at-EOL layout), the SQL begins on
+	// the next line, so the parsed SQL keeps a leading `\n`.  This lets the
+	// runner's `step %s: %s` format produce `step q: \n  SELECT 1;\n
+	// SELECT 2;`, matching upstream isolationtester's verbatim echo (e.g.
+	// insert-conflict-do-update-3 expected output `step insert1: \n    WITH
+	// t AS (\n        INSERT INTO ...`).  The trailing `}` line is dropped
+	// because nothing precedes the brace.
+	want := "\n  SELECT 1;\n  SELECT 2;"
 	if got.SQL != want {
 		t.Fatalf("SQL mismatch:\n got: %q\nwant: %q", got.SQL, want)
+	}
+}
+
+
+// TestFormatStepOutputMultiLineInlinesFirstLine pins upstream isolationtester's
+// verbatim echo: when SQL is multi-line and the spec used the inline-brace
+// layout (`step name { first\n  second; }`), the first SQL line sits on the
+// `step <name>:` header line (no leading newline), and continuation lines
+// follow with their indentation preserved.  Brace-at-EOL layout carries a
+// leading newline in step.SQL, which renders as `step name: \n<body>`.
+func TestFormatStepOutputMultiLineInlinesFirstLine(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			name: "inline_brace_multi_line",
+			sql:  "INSERT INTO upsert VALUES (1, 11, 111)\n                  ON CONFLICT (i) DO UPDATE SET k = EXCLUDED.k;",
+			want: "step insert1: INSERT INTO upsert VALUES (1, 11, 111)\n                  ON CONFLICT (i) DO UPDATE SET k = EXCLUDED.k;\n",
+		},
+		{
+			name: "brace_at_eol_multi_line",
+			sql:  "\n    WITH t AS (\n        INSERT INTO colors VALUES(1, 'Red'))\n    SELECT * FROM colors;",
+			want: "step insert1: \n    WITH t AS (\n        INSERT INTO colors VALUES(1, 'Red'))\n    SELECT * FROM colors;\n",
+		},
+		{
+			name: "single_line",
+			sql:  "SELECT 1;",
+			want: "step q: SELECT 1;\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stepName := "insert1"
+			if tc.name == "single_line" {
+				stepName = "q"
+			}
+			got := formatStepOutput(stepName, tc.sql, stepOutcome{}, false)
+			if got != tc.want {
+				t.Fatalf("formatStepOutput mismatch:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatWaitingStepHeader pins the `<waiting ...>` suffix placement:
+// upstream isolationtester appends ` <waiting ...>` to the SQL's final line
+// (insert-conflict-do-update-4 expected output line 11), not on its own
+// continuation line.  Multi-line and single-line SQL share the single format.
+func TestFormatWaitingStepHeader(t *testing.T) {
+	cases := []struct {
+		name string
+		step string
+		sql  string
+		want string
+	}{
+		{
+			name: "single_line",
+			step: "insert1",
+			sql:  "INSERT INTO upsert VALUES (1);",
+			want: "step insert1: INSERT INTO upsert VALUES (1); <waiting ...>\n",
+		},
+		{
+			name: "inline_brace_multi_line",
+			step: "insert1",
+			sql:  "INSERT INTO upsert VALUES (1, 11, 111)\n                  ON CONFLICT (i) DO UPDATE SET k = EXCLUDED.k;",
+			want: "step insert1: INSERT INTO upsert VALUES (1, 11, 111)\n                  ON CONFLICT (i) DO UPDATE SET k = EXCLUDED.k; <waiting ...>\n",
+		},
+		{
+			name: "brace_at_eol_multi_line",
+			step: "insert1",
+			sql:  "\n    WITH t AS (\n        INSERT INTO colors VALUES(1, 'Red'))\n    SELECT * FROM colors;",
+			want: "step insert1: \n    WITH t AS (\n        INSERT INTO colors VALUES(1, 'Red'))\n    SELECT * FROM colors; <waiting ...>\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatWaitingStepHeader(tc.step, tc.sql)
+			if got != tc.want {
+				t.Fatalf("formatWaitingStepHeader mismatch:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
 	}
 }

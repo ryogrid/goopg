@@ -1149,6 +1149,29 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         family flips to pass: first-line inlining in `step <name>:` header,
         `<waiting …>` suffix placement on multi-line SQL, column-width
         trailing-pad parity.
+        - First-line inlining + `<waiting …>` suffix (M0100-0005c, 2026-05-15):
+        IsolationRunner now emits `step <name>: <raw-SQL>` (and
+        `step <name>: <raw-SQL> <waiting ...>` for the blocked-step variant)
+        as a single verbatim echo, matching upstream isolationtester.
+        Inline-brace specs (insert-conflict-do-update-4) render the first
+        SQL line on the `step <name>:` header line; brace-at-EOL specs
+        (insert-conflict-do-update-3) carry a leading `\n` in
+        `IsolationStep.SQL` (introduced parser-side in `readBlock` when
+        the opening `{` sits at end-of-line) so the same single format
+        renders as `step <name>: \n<body>` for that layout — and as
+        `step <name>: \n<body> <waiting ...>` when blocked.  The previous
+        `step <name>: \n<sql>\n <waiting ...>` (waiting marker on its own
+        line) and the `flattenSQL` helper are removed.  Regression pins:
+        `TestFormatStepOutputMultiLineInlinesFirstLine` (3 cases — inline-
+        brace multi-line, brace-at-EOL multi-line, single-line) and
+        `TestFormatWaitingStepHeader` (3 cases — same shapes with the
+        `<waiting ...>` suffix) in
+        `internal/testport/framework/isolation_test.go`; existing
+        `TestParseIsolationSpecClosingBraceOnOwnLine` updated to reflect
+        the leading-`\n` semantics.  Column-width trailing-pad parity is
+        already covered by `normalizeIsoOutput`'s TrimRight (PQprint pads
+        the rightmost column with trailing spaces; the normalizer strips
+        them on both sides of the diff).
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait
