@@ -1104,27 +1104,77 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 		return synthesizeSubqueryTable(cat, rv)
 	}
 	// Table-valued function (M0096-0006): produce a synthetic table.
+	// The planner is the source of truth for SRF return shapes; this
+	// analyzer-side helper mirrors the planner's per-function dispatch
+	// (see planTableFuncRangeVar in internal/planner/planner.go) so a
+	// derived subquery wrapping an SRF — e.g.
+	// `( SELECT (pg_get_publication_tables('p')).* ) AS gpt` —
+	// surfaces the real column list (relid/attrs/qual) to the outer
+	// scope rather than the generate_series-shaped single-int8-column
+	// default. M0103-0008 (IndirectionStar derived-subquery propagation).
 	if rv.TableFunc != nil {
 		alias := rv.Alias
 		if alias == "" {
 			alias = rv.TableFunc.Name
 		}
-		colName := alias
-		if len(rv.Columns) > 0 {
-			colName = rv.Columns[0]
-		}
-		return &catalog.Table{
-			Name: alias,
-			Columns: []catalog.Column{
-				{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
-			},
-		}, nil
+		cols := tableFuncColumns(rv.TableFunc.Name, alias, rv.Columns)
+		return &catalog.Table{Name: alias, Columns: cols}, nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !ok {
 		return nil, analyzeError(rv.Pos(), "42P01", fmt.Sprintf("relation %q does not exist", rv.Name))
 	}
 	return tbl, nil
+}
+
+// tableFuncColumns returns the column list for a FROM-clause table-valued
+// function. Mirrors the planner's planTableFuncRangeVar dispatch so the
+// analyzer's synthesizeSubqueryTable can hand the outer scope the same
+// column list the planner will produce at execution time. Unknown
+// functions fall back to a single column named after the alias (the
+// pre-M0103-0008 behaviour, sufficient for generate_series).
+func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Column {
+	switch strings.ToLower(funcName) {
+	case "pg_get_publication_tables":
+		names := []string{"relid", "attrs", "qual"}
+		types := []string{"oid", "text", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_input_error_info":
+		names := []string{"message", "detail", "hint", "sql_error_code"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: "text"}, Ordinal: i}
+		}
+		return cols
+	case "parse_ident":
+		colName := alias
+		if len(colAliases) > 0 && colAliases[0] != "" {
+			colName = colAliases[0]
+		}
+		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "text[]"}, Ordinal: 0}}
+	default:
+		// generate_series and unknown SRFs: 1 int8 column named after
+		// the alias. Preserves pre-M0103-0008 behaviour.
+		colName := alias
+		if len(colAliases) > 0 && colAliases[0] != "" {
+			colName = colAliases[0]
+		}
+		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0}}
+	}
 }
 
 // resolveTable is the scope-aware variant of lookupTable used by

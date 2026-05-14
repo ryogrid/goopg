@@ -1254,28 +1254,25 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		return nil, rangeBinding{}, err
 	}
 	innerSchema := inner.Output()
-	// Use explicit column-alias list when provided: (SELECT …) AS t (c1, c2).
-	// This overrides the target-list aliases from the inner SELECT.
-	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
-	schema := make(Schema, 0, len(rv.Subquery.Targets))
-	for i, tgt := range rv.Subquery.Targets {
-		var name string
+	// Use the inner plan's output schema as the source of truth for the
+	// derived table's columns: it already accounts for star-expansion
+	// (e.g. an inner `SELECT __irs_0.*` over a FROM-clause SRF expands
+	// into one schema entry per SRF return column), which a target-list
+	// walk would miss because the target list still holds the single
+	// StarExpr. M0103-0008 (IndirectionStar derived-subquery propagation).
+	// Explicit column-alias list (SELECT …) AS t (c1, c2) overrides the
+	// inner schema's names.
+	cols := make([]catalog.Column, 0, len(innerSchema))
+	schema := make(Schema, 0, len(innerSchema))
+	for i, sc := range innerSchema {
+		name := sc.Name
 		if i < len(rv.Columns) && rv.Columns[i] != "" {
-			name = rv.Columns[i] // explicit column alias from (SELECT …) AS t (col_alias)
-		} else {
-			name = tgt.Alias
-			if name == "" {
-				name = deriveSubqueryTargetName(tgt.Expr)
-			}
-			if name == "" {
-				name = fmt.Sprintf("?column?%d", i+1)
-			}
+			name = rv.Columns[i]
 		}
-		var typ catalog.Type
-		if i < len(innerSchema) {
-			typ = innerSchema[i].Type
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
 		}
-		cols = append(cols, catalog.Column{Name: name, Type: typ})
+		cols = append(cols, catalog.Column{Name: name, Type: sc.Type})
 		// Subquery columns are derived (an inner SELECT's
 		// computed targets); they have no base-table identity at
 		// the outer scope. The binding's sourceIdx still gets the
@@ -1283,7 +1280,7 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// references can be disambiguated against sibling
 		// bindings, but the columns themselves stay at 0
 		// (Go zero-value = unknown).
-		schema = append(schema, SchemaColumn{Name: name, Type: typ})
+		schema = append(schema, SchemaColumn{Name: name, Type: sc.Type})
 	}
 	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}

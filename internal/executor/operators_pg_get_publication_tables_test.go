@@ -206,17 +206,11 @@ func TestArrayAggText(t *testing.T) {
 // entry for every nested SELECT). The probe's actual shape uses
 // `array_agg(pubname::text)` in the SRF arg list — covered by the
 // separate aggregate-rejection test. Here we use a constant arg so the
-// non-aggregate fast path exercises end-to-end. M0103-0008.
-// TestIndirectionStarInsideDerivedSubquery documents the next M0103-0008
-// gap: even though the IndirectionStar rewrite already fires inside a
-// derived-table subquery (verified by inspecting the parse tree), the
-// outer SELECT cannot resolve `gpt.relid` because the planner does not
-// yet propagate a FROM-clause SRF's column list out through a derived
-// subquery's `__irs_0.*` target. Closing this gap is the next sub-step,
-// alongside ProjectSet for the aggregate-arg shape. Kept as t.Skip so
-// the assertion captures the expected end-state without failing CI.
+// non-aggregate fast path exercises end-to-end. The outer SELECT must
+// resolve `gpt.relid` against the SRF's `relid` column, which requires
+// the derived subquery to propagate the SRF's three-column schema (not
+// just the single StarExpr target). M0103-0008.
 func TestIndirectionStarInsideDerivedSubquery(t *testing.T) {
-	t.Skip("derived-subquery schema propagation for (srf).*-rewritten targets is the next M0103-0008 sub-step")
 	ctx, _, cleanup := newStorageFixture(t)
 	defer cleanup()
 	ctx.PubSub = catalog.NewPubSub()
@@ -230,6 +224,47 @@ func TestIndirectionStarInsideDerivedSubquery(t *testing.T) {
 	}
 	if rows[0][0].IsNull() {
 		t.Fatalf("relid is NULL, want a non-zero OID")
+	}
+}
+
+// TestIndirectionStarInsideDerivedSubqueryStarSelect pins that the
+// outer SELECT can read every SRF column through the derived-subquery
+// wrapper, not just one named column. M0103-0008.
+func TestIndirectionStarInsideDerivedSubqueryStarSelect(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+	rows := runQueryRows(t, ctx, `SELECT * FROM ( SELECT (pg_get_publication_tables('p')).* ) AS gpt`)
+	if len(rows) != 1 {
+		t.Fatalf("row count = %d, want 1", len(rows))
+	}
+	if len(rows[0]) != 3 {
+		t.Fatalf("column count = %d, want 3 (relid/attrs/qual)", len(rows[0]))
+	}
+}
+
+// TestIndirectionStarDerivedSubqueryExplicitAliases pins that explicit
+// column aliases on the derived table — `… AS gpt (r, a, q)` — override
+// the SRF's default column names and remain resolvable at the outer
+// scope. M0103-0008.
+func TestIndirectionStarDerivedSubqueryExplicitAliases(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+	rows := runQueryRows(t, ctx, `SELECT gpt.r FROM ( SELECT (pg_get_publication_tables('p')).* ) AS gpt (r, a, q)`)
+	if len(rows) != 1 {
+		t.Fatalf("row count = %d, want 1", len(rows))
+	}
+	if rows[0][0].IsNull() {
+		t.Fatalf("r (aliased relid) is NULL, want a non-zero OID")
 	}
 }
 

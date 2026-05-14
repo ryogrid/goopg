@@ -1936,6 +1936,48 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       ./internal/catalog/` → all green (parser 0.013 s,
       planner 0.020 s, analyzer 0.012 s, executor 1.171 s,
       server 1.766 s, wal 1.900 s, catalog 0.005 s).
+      PARTIAL PROGRESS 2026-05-14 (loop 4): closed gap (2) — derived-
+      subquery SRF schema propagation. Design doc:
+      `docs/design/0103-0008-derived-subquery-srf-schema-propagation.md`.
+      Changes:
+      - `internal/analyzer/analyzer.go::lookupTable` now dispatches
+        `*parser.TableFuncRef` column shapes by function name via a new
+        `tableFuncColumns(funcName, alias, colAliases)` helper. The
+        helper mirrors the planner's `planTableFuncRangeVar` dispatch
+        for `pg_get_publication_tables` (relid oid, attrs text, qual
+        text), `pg_input_error_info` (4× text), `parse_ident`
+        (text[]), and falls back to the previous generate_series
+        single-int8-column shape for unknown SRFs. The analyzer's
+        synthesizeSubqueryTable now sees the same column list the
+        planner will produce at execution time.
+      - `internal/planner/planner.go::planSubqueryRangeVar` rebuilt
+        on top of `inner.Output()` rather than the inner SELECT's
+        target list. The inner Plan already expanded star targets
+        into individual SchemaColumn entries with correct names (via
+        `expandStarTarget` + `targetMeta`); the derived table simply
+        projects that schema, applying explicit
+        `(SELECT …) AS t(c1, c2)` aliases positionally. Generalises
+        cleanly to non-SRF derived subqueries — innerSchema names
+        match what `targetMeta` would have produced for plain
+        target-list walks.
+      Tests (all in
+      `internal/executor/operators_pg_get_publication_tables_test.go`):
+      - `TestIndirectionStarInsideDerivedSubquery` (was `t.Skip`)
+        now PASS: outer `SELECT gpt.relid` resolves the SRF's relid.
+      - `TestIndirectionStarInsideDerivedSubqueryStarSelect` PASS:
+        outer `SELECT *` returns 3 columns (relid/attrs/qual).
+      - `TestIndirectionStarDerivedSubqueryExplicitAliases` PASS:
+        `… AS gpt(r,a,q)` overrides default names + resolves at outer
+        scope.
+      Verification (loop 4): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green (parser 1.049 s,
+      planner 1.068 s, analyzer 1.040 s, executor 2.627 s,
+      server 3.563 s, wal 3.128 s, catalog 1.020 s).
+      Remaining gap for full probe survival: (1) ProjectSet for
+      aggregate-arg SRFs — the only piece left before
+      `fetch_table_list` runs end-to-end against a goopg publisher.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
