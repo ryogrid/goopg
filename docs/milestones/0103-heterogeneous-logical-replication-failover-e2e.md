@@ -1,7 +1,8 @@
 # Milestone 0103 — Heterogeneous Logical-Replication + SIGKILL-Failover E2E (PG↔goopg, sync + async)
 
-**Status:** planned
+**Status:** accepted
 **Filed:** 2026-05-13
+**Accepted:** 2026-05-14
 **Depends on:** M0008 (logical replication, complete), M0094-0002 (UPDATE apply via key-tuple, complete), M0101 (PG-compatible WAL on-disk format), M0102-0005 (synchronous_standby_names + SyncRep wait primitive)
 **Companion to:** M0102 (physical-replication failover E2E)
 **Reference plan:** `.ralph/fix_plan.md` (M0103 section)

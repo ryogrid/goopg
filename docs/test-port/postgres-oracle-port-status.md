@@ -15,7 +15,7 @@ Status meanings:
 | mixed | 0 | 2 | 0 |
 | modules | 0 | 0 | 1 |
 | regress | 0 | 1 | 0 |
-| tap | 41 | 3 | 1 |
+| tap | 45 | 3 | 1 |
 | utility | 1 | 0 | 0 |
 
 ## Entries
@@ -73,6 +73,10 @@ Status meanings:
 | E-001 | `postgres/src/test/modules/unsafe_tests` | modules | excluded | no | Explicit unsafe suite is outside compatibility scope by policy. | `-` |
 | E-002 | `postgres/src/bin/pg_dump/t` | tap | excluded | no | Client binary behavior depends on utility surfaces intentionally outside current server-focused scope. | `-` |
 | W-001 | `postgres/src/bin/pg_waldump` | utility | port | yes | Ported as TestPort_WALPgWaldumpCompat in internal/testport/wal_pg_waldump_test.go; verifies PG-compatible WAL format (M0101-0001) | `-` |
+| e2e-logical-failover-pg-to-goopg-async | `postgres/src/test/subscription` | tap | port | yes | Scenario A async: pinned by TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync in internal/testport/pgoutput_interop_test.go (M0103-0007 rung 23; design 0103-0046) | `-` |
+| e2e-logical-failover-pg-to-goopg-sync | `postgres/src/test/subscription` | tap | port | yes | Scenario A sync_remote_apply: pinned by TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply in internal/testport/pgoutput_interop_test.go (M0103-0007 rung 26; design 0103-0049) | `-` |
+| e2e-logical-failover-goopg-to-pg-async | `postgres/src/test/subscription` | tap | port | yes | Scenario B async: pinned by TestPort_PgoutputInteropGoopgToPG live wrapper in internal/testport/pgoutput_interop_test.go (M0103-0008 loop 19 closure; design 0103-0023) | `-` |
+| e2e-logical-failover-goopg-to-pg-sync | `postgres/src/test/subscription` | tap | port | yes | Scenario B sync_remote_apply: pinned by TestPort_PgoutputInteropGoopgToPG live wrapper in internal/testport/pgoutput_interop_test.go (M0103-0008 loop 19 closure; design 0103-0023) | `-` |
 
 ## Notes
 

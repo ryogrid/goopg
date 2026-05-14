@@ -4456,20 +4456,29 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         M0103 is M0103-0009 (close milestone — CSV row additions
         and inventory bump).
 
-- [ ] **M0103-0009**
-      - Summary: Close milestone.
-      - Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
-        `e2e-logical-failover-pg-to-goopg-async`,
-        `e2e-logical-failover-pg-to-goopg-sync`,
-        `e2e-logical-failover-goopg-to-pg-async`,
-        `e2e-logical-failover-goopg-to-pg-sync` — all at `status=port`,
-        `pass_required=yes`. Regenerate the `.md` via
-        `go run ./cmd/gen-oracle-port-status`. Flip
-        `docs/milestones/0103-heterogeneous-logical-replication-failover-e2e.md`
-        status to `accepted` and update the `docs/milestones/README.md` index
-        row. Mark all 5 design docs (`0103-0001..-0005`) as `accepted`. Run
-        the regression suites listed in the milestone DoD and confirm zero
-        regressions.
+- [x] **M0103-0009**
+      - Summary: Close milestone. CLOSED 2026-05-14.
+      - Added four rows to `docs/test-port/postgres-oracle-port-status.csv`:
+        `e2e-logical-failover-pg-to-goopg-async` →
+        `TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync` (M0103-0007 rung 23,
+        design 0103-0046);
+        `e2e-logical-failover-pg-to-goopg-sync` →
+        `TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply`
+        (M0103-0007 rung 26, design 0103-0049);
+        `e2e-logical-failover-goopg-to-pg-async` /
+        `e2e-logical-failover-goopg-to-pg-sync` →
+        `TestPort_PgoutputInteropGoopgToPG` live wrapper (M0103-0008 loop 19
+        closure, design 0103-0023). All at `status=port`, `pass_required=yes`,
+        `suite_type=tap`, `upstream_path=postgres/src/test/subscription`.
+      - Regenerated `docs/test-port/postgres-oracle-port-status.md` via
+        `go run ./cmd/gen-oracle-port-status` — clean (validator green).
+      - Milestone doc `docs/milestones/0103-heterogeneous-logical-replication-failover-e2e.md`
+        status flipped from `planned` → `accepted` (+ `Accepted: 2026-05-14`);
+        `docs/milestones/README.md` index row 0103 flipped to `accepted`.
+      - All 5 design docs `0103-0001..0005` confirmed already `accepted`
+        (no further edit needed — verified on disk).
+      - Regression sweep + ralph-state-guard executed before this loop's
+        status block — see RECOMMENDATION line for executed gates.
 
 ## M0104 — SERIALIZABLE isolation via SSI anomaly prevention (filed 2026-05-14)
 
