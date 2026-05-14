@@ -226,3 +226,88 @@ func TestPageSetHeapTupleLockOnlyInvalidSlot(t *testing.T) {
 		t.Errorf("slot 99 err = %v, want ErrInvalidSlot", err)
 	}
 }
+
+// TestPageSetHeapTupleMovedPartition pins the storage primitive added
+// for cross-partition UPDATE (M0100-0005n): stamping the
+// moved-to-another-partition sentinel sets xmax, writes
+// (InvalidBlockNumber, MovedPartitionsOffsetNumber) into t_ctid, and
+// clears any HEAP_XMAX_LOCK_ONLY / lock-strength bits a prior
+// SELECT FOR UPDATE may have stamped.  EPQ retries that observe this
+// sentinel after the writer commits must raise the upstream
+// `tuple to be locked was already moved to another partition due to
+// concurrent update` error instead of silently skipping the row.
+func TestPageSetHeapTupleMovedPartition(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	tuple := NewHeapTuple(TransactionID(100), InvalidTransactionID, []byte("moved"))
+	// Pre-set a stale lock-only stamp; the moved-partition stamp must clear it.
+	tuple.Header.Infomask = HeapXmaxLockOnly | HeapXmaxExclLock
+	slot, err := PageAddHeapTuple(p, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleMovedPartition(p, slot, TransactionID(42)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PageGetHeapTuple(p, slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Header.Xmax != TransactionID(42) {
+		t.Errorf("Xmax = %d, want 42", got.Header.Xmax)
+	}
+	if got.Header.CTID.Block != InvalidBlockNumber {
+		t.Errorf("CTID.Block = %d, want InvalidBlockNumber", got.Header.CTID.Block)
+	}
+	if got.Header.CTID.Offset != MovedPartitionsOffsetNumber {
+		t.Errorf("CTID.Offset = %#x, want %#x", got.Header.CTID.Offset, MovedPartitionsOffsetNumber)
+	}
+	if !IsMovedToAnotherPartition(got.Header.CTID) {
+		t.Errorf("IsMovedToAnotherPartition(%+v) = false, want true", got.Header.CTID)
+	}
+	if got.Header.Infomask&HeapXmaxLockOnly != 0 {
+		t.Errorf("Infomask = %#x, HeapXmaxLockOnly should have been cleared", got.Header.Infomask)
+	}
+	if got.Header.Infomask&HeapXmaxLockMask != 0 {
+		t.Errorf("Infomask = %#x, lock-strength bits should have been cleared", got.Header.Infomask)
+	}
+}
+
+// TestPageSetHeapTupleMovedPartitionInvalidSlot — out-of-range slot
+// numbers fall through to ErrInvalidSlot like the sibling helpers.
+func TestPageSetHeapTupleMovedPartitionInvalidSlot(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleMovedPartition(p, 0, TransactionID(7)); !errors.Is(err, ErrInvalidSlot) {
+		t.Errorf("slot 0 err = %v, want ErrInvalidSlot", err)
+	}
+	if err := PageSetHeapTupleMovedPartition(p, 99, TransactionID(7)); !errors.Is(err, ErrInvalidSlot) {
+		t.Errorf("slot 99 err = %v, want ErrInvalidSlot", err)
+	}
+}
+
+// TestIsMovedToAnotherPartitionNegatives — the predicate must reject
+// "normal" CTIDs (any block≠Invalid or offset≠sentinel) so that
+// regular HOT chain pointers and zeroed CTIDs aren't misread as
+// partition-move tombstones.
+func TestIsMovedToAnotherPartitionNegatives(t *testing.T) {
+	cases := []ItemPointer{
+		{Block: 0, Offset: 1},                                // ordinary heap pointer
+		{Block: InvalidBlockNumber, Offset: 0},               // zeroed CTID (fresh tuple)
+		{Block: 0, Offset: MovedPartitionsOffsetNumber},      // sentinel offset but real block
+		{Block: InvalidBlockNumber, Offset: 1},               // invalid block but normal offset
+	}
+	for _, c := range cases {
+		if IsMovedToAnotherPartition(c) {
+			t.Errorf("IsMovedToAnotherPartition(%+v) = true, want false", c)
+		}
+	}
+	moved := ItemPointer{Block: InvalidBlockNumber, Offset: MovedPartitionsOffsetNumber}
+	if !IsMovedToAnotherPartition(moved) {
+		t.Errorf("IsMovedToAnotherPartition(%+v) = false, want true", moved)
+	}
+}

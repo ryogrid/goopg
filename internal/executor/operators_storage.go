@@ -155,6 +155,44 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 	return latestSlot, latestRow, true
 }
 
+// epqSlotMovedToAnotherPartition reports whether the tuple at
+// (rel, blk, slot) carries the upstream "moved to another partition"
+// sentinel in its t_ctid (block=Invalid, offset=MovedPartitionsOffsetNumber).
+// EPQ retries (UPDATE/DELETE/LockRows) consult this after detecting that
+// the original tuple's xmax committed and `epqFollowHOT` returned
+// not-found — if the sentinel is set, the row was UPDATEd into a different
+// partition relation, and the caller must raise the upstream
+// `tuple to be locked was already moved to another partition due to
+// concurrent update` error instead of silently skipping the row.
+// Returns false on any read error (caller falls back to skip).
+func epqSlotMovedToAnotherPartition(ctx *Context, rel storage.RelFileNode,
+	blk storage.BlockNumber, slot uint16) bool {
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return false
+	}
+	s.RLock()
+	tup, gerr := storage.PageGetHeapTuple(s.Page(), slot)
+	s.RUnlock()
+	ctx.Pool.Unpin(s)
+	if gerr != nil {
+		return false
+	}
+	return storage.IsMovedToAnotherPartition(tup.Header.CTID)
+}
+
+// errMovedToAnotherPartition is the canonical PG error raised when EPQ
+// rechecks (UPDATE/DELETE/SELECT FOR UPDATE/triggers/lockRows) walk to a
+// tuple that has been cross-partition UPDATEd by a concurrent committed
+// transaction. SQLSTATE 0A000 matches upstream `errcode_for_partition`.
+func errMovedToAnotherPartition(pos int) *ExecError {
+	return &ExecError{
+		Code:    "0A000",
+		Pos:     pos,
+		Message: "tuple to be locked was already moved to another partition due to concurrent update",
+	}
+}
+
 var heapExtendLocks sync.Map // map[storage.RelFileNode]*sync.Mutex
 
 func lockHeapExtend(rel storage.RelFileNode) func() {
@@ -1415,6 +1453,14 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							Message: "could not serialize access due to concurrent update"}
 					}
 					// RC: follow HOT chain and re-evaluate WHERE + SET.
+					// Before deciding the chain terminated, check the
+					// moved-to-another-partition sentinel on the old slot —
+					// cross-partition UPDATEs leave no HOT chain because the
+					// new version lives in a different relation. PG raises a
+					// distinct error in that case.
+					if epqSlotMovedToAnotherPartition(o.ctx, rel, pu.blk, pu.slot) {
+						return nil, errMovedToAnotherPartition(o.plan.Pos())
+					}
 					newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, rel, pu.blk, pu.slot, cols, o.pred)
 					if !chainFound {
 						epqSkip = true
@@ -1642,6 +1688,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						Message: "could not serialize access due to concurrent update"}
 				}
 				// RC: follow HOT chain and re-evaluate WHERE + SET.
+				// Cross-partition UPDATE sentinel check (see comment in the
+				// idxScan EPQ branch).
+				if epqSlotMovedToAnotherPartition(o.ctx, puRel, pu.blk, pu.slot) {
+					return nil, errMovedToAnotherPartition(o.plan.Pos())
+				}
 				newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred)
 				if !chainFound {
 					epqSkipSeq = true
@@ -1670,30 +1721,43 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			if oldGerr == nil {
 				oldTupleBytes, _ = oldTup.MarshalBinary()
 			}
-			if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+			// For partition key UPDATE: route new row to correct partition.
+			// Compute the destination FIRST so we know whether to stamp
+			// the moved-partition sentinel on the old slot.
+			targetWriteRel := puRel
+			targetWriteCols := puCols
+			isCrossPartitionMove := false
+			if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
+				destPart := routeToPartition(tbl, pu.newRow, imW)
+				if destPart != nil {
+					destRel := o.ctx.Catalog.RelFileNode(destPart)
+					if destRel != puRel {
+						isCrossPartitionMove = true
+					}
+					targetWriteRel = destRel
+					targetWriteCols = destPart.Columns
+					_ = computeGeneratedColumns(destPart.Columns, pu.newRow)
+				}
+			}
+			var stampErr error
+			if isCrossPartitionMove {
+				stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+			} else {
+				stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+			}
+			if stampErr != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
-				if errors.Is(err, storage.ErrUnsupportedItem) {
+				if errors.Is(stampErr, storage.ErrUnsupportedItem) {
 					continue
 				}
-				return nil, err
+				return nil, stampErr
 			}
 			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
 				return nil, derr
-			}
-			// For partition key UPDATE: route new row to correct partition.
-			targetWriteRel := puRel
-			targetWriteCols := puCols
-			if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
-				destPart := routeToPartition(tbl, pu.newRow, imW)
-				if destPart != nil {
-					targetWriteRel = o.ctx.Catalog.RelFileNode(destPart)
-					targetWriteCols = destPart.Columns
-					_ = computeGeneratedColumns(destPart.Columns, pu.newRow)
-				}
 			}
 			if err := writeHeapRow(o.ctx, targetWriteRel, targetWriteCols, pu.newRow); err != nil {
 				return nil, err
@@ -1896,6 +1960,13 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					Message: "could not serialize access due to concurrent update"}
 			}
 			// RC: follow HOT chain and re-evaluate WHERE.
+			// Cross-partition UPDATE sentinel check: if the victim row was
+			// moved to a different partition by a concurrent committed UPDATE,
+			// raise the upstream "moved to another partition" error rather
+			// than silently skipping the row.
+			if epqSlotMovedToAnotherPartition(o.ctx, victimRel, v.blk, v.slot) {
+				return nil, errMovedToAnotherPartition(o.plan.Pos())
+			}
 			victimCols := v.cols
 			if victimCols == nil {
 				victimCols = tbl.Columns

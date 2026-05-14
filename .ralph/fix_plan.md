@@ -1411,6 +1411,42 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/ ./internal/planner/ ./internal/parser/
           ./internal/analyzer/` PASS.  Design:
           `docs/design/0100-0005k-fk-violation-error-shape.md`.
+        - Cross-partition UPDATE moved-tuple EPQ error
+          (M0100-0005n, 2026-05-15 loop 30).
+          New storage primitive `PageSetHeapTupleMovedPartition`
+          (`internal/storage/heap.go`) stamps the upstream sentinel
+          `(InvalidBlockNumber, MovedPartitionsOffsetNumber=0xFFFD)`
+          into `t_ctid` alongside the xmax stamp on the old slot of
+          a cross-partition UPDATE — companion to `PageSetHeapTupleXmax`
+          for the move case.  `IsMovedToAnotherPartition(ItemPointer)`
+          identifies the sentinel.  In `operators_storage.go`, both
+          the SeqScan and idxScan UPDATE paths now compute
+          `routeToPartition` BEFORE the xmax stamp; when
+          `destRel != puRel` they call the new helper instead.
+          Three EPQ retry sites (`updateOp.updateViaIndex`, the
+          SeqScan body of `updateOp.Next`, and `deleteOp.Next`)
+          now call `epqSlotMovedToAnotherPartition` immediately
+          before `epqFollowHOT` in the RC branch; on hit they
+          raise `errMovedToAnotherPartition` (SQLSTATE `0A000`,
+          MESSAGE `tuple to be locked was already moved to another
+          partition due to concurrent update`) instead of falling
+          through to `epqSkip=true`.  Closes the L31/L41 ERROR-line
+          diffs for `partition-key-update-1.spec` non-trigger
+          permutations on `foo`.  Trigger-driven `footrg`
+          permutations remain deferred — the partition-child
+          trigger lookup is a separate follow-up
+          (`fireTriggers` is invoked with the parent table only).
+          Regression pins:
+          `TestPageSetHeapTupleMovedPartition`,
+          `TestPageSetHeapTupleMovedPartitionInvalidSlot`,
+          `TestIsMovedToAnotherPartitionNegatives` (storage layer);
+          `TestEPQSlotMovedToAnotherPartitionDetectsSentinel`,
+          `TestEPQSlotMovedToAnotherPartitionRejectsPlainXmax`,
+          `TestErrMovedToAnotherPartitionShape` (executor EPQ).
+          `go test -race ./internal/executor/ ./internal/storage/
+          ./internal/server/ ./internal/mvcc/ ./internal/planner/
+          ./internal/parser/` PASS.  Design:
+          `docs/design/0100-0005n-cross-partition-update-moved-tuple-error.md`.
         - FK violation MESSAGE names routed leaf partition
           (M0100-0005m, 2026-05-15 loop 29).
           `insertOp.Next` (`internal/executor/operators_storage.go`)

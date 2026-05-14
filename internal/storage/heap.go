@@ -96,10 +96,28 @@ func IsHeapTupleLockOnly(infomask uint16) bool {
 	return infomask&HeapXmaxLockOnly != 0
 }
 
+// MovedPartitionsOffsetNumber is the special t_ctid.ip_posid value
+// PostgreSQL stamps on a tuple whose UPDATE moved the row to a
+// different partition (the old version's CTID can't point to the new
+// version because it lives in another relation entirely). Combined
+// with InvalidBlockNumber it marks a "moved to another partition"
+// tombstone; EPQ retries that follow xmax to this sentinel must raise
+// `tuple to be locked was already moved to another partition due to
+// concurrent update`. Mirrors upstream's `MovedPartitionsOffsetNumber`
+// (`postgres/src/include/storage/itemptr.h`).
+const MovedPartitionsOffsetNumber uint16 = 0xFFFD
+
 // ItemPointer identifies a tuple location (block, line-pointer slot).
 type ItemPointer struct {
 	Block  BlockNumber
 	Offset uint16
+}
+
+// IsMovedToAnotherPartition reports whether `ctid` carries the
+// upstream "moved to another partition" sentinel (block ==
+// InvalidBlockNumber, offset == MovedPartitionsOffsetNumber).
+func IsMovedToAnotherPartition(ctid ItemPointer) bool {
+	return ctid.Block == InvalidBlockNumber && ctid.Offset == MovedPartitionsOffsetNumber
 }
 
 // HeapTupleHeader is the fixed tuple header subset used in milestone 5.
@@ -724,6 +742,56 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid so opportunistic pruning knows when
 	// this page first became prunable (M0046-0002).
+	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(xmax))
+	}
+	return nil
+}
+
+// PageSetHeapTupleMovedPartition stamps xmax on the tuple at
+// `slot` and writes the upstream "moved to another partition"
+// sentinel (block=InvalidBlockNumber, offset=MovedPartitionsOffsetNumber)
+// into its t_ctid. Used by cross-partition UPDATE: the old version is
+// deleted in the source partition and the new version lives in a
+// different relation entirely, so the CTID can't carry a successor
+// pointer. EPQ retries that hit this sentinel raise the upstream
+// `tuple to be locked was already moved to another partition due to
+// concurrent update` error rather than silently skipping the row.
+//
+// Like PageSetHeapTupleXmax it clears HeapXmaxLockOnly/Mask bits so
+// readers see the xmax as a real delete (not a lingering row lock).
+// Returns ErrUnsupportedItem if the slot isn't LP_NORMAL,
+// ErrInvalidSlot for out-of-range slot numbers.
+func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	// t_ctid sits at off+12 (block, 4 bytes) and off+16 (offset, 2 bytes).
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(InvalidBlockNumber))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], MovedPartitionsOffsetNumber)
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
 		MustHeader(p).SetPruneXID(uint32(xmax))
 	}
