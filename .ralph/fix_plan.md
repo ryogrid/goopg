@@ -1190,6 +1190,50 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait
+        - Investigation note (2026-05-15 loop 20): a single-shot run of
+          `TestPort_IsolationLockCommittedUpdate|TestPort_IsolationMergeMatchRecheck|TestPort_IsolationPartitionKeyUpdate1`
+          with `-timeout 300s` deadlocked at the 5-minute mark.  Goroutine
+          dump shows two `runPermutation.func4` goroutines blocked inside
+          `lib/pq.(*conn).simpleQuery` on the same connection — one is in
+          `recvMessage` (waiting for server reply on a lock-related query)
+          and the other is queued behind `database/sql.withLock` for the
+          same `*sql.Conn`.  Root cause is most likely server-side: the s2
+          SELECT issued under FOR KEY SHARE never returns even after s1
+          commits + releases its advisory lock.  Worth investigating either
+          (a) advisory-lock release isn't waking the s2 waiter, or
+          (b) the row-level FOR KEY SHARE wait isn't being woken when s1
+          commits the UPDATE.  Reproduce: `go test -timeout 60s -run
+          TestPort_IsolationLockCommittedUpdate ./internal/testport/`.
+        - Lock-committed-update deadlock RESOLVED (M0100-0005e, 2026-05-15
+          loop 21).  Root cause was option (c) not in the loop-20
+          hypothesis: `seqScanOp` held the page RLock for the full
+          per-page iteration (acquired in `seqScanOp.Next` →
+          `slot.RLock()`, released in `releasePinned`).  When s2's WHERE
+          clause `pg_advisory_lock(K)` blocked, the RLock stayed held and
+          blocked s1's UPDATE on the same page (page WLock).  s1's COMMIT
+          + UNLOCK queued behind the stalled UPDATE on s1's connection,
+          so s1 could never release the advisory lock — deadlock cycle:
+          s2.seqScan-RLock → s1.UPDATE-WLock → s1.UNLOCK-queued →
+          s2.WHERE-blocked.  Fix: page RLock is now scoped per tuple
+          inside `seqScanOp.Next` — acquired briefly around
+          `PageGetHeapTuple` + `DecodeRowIntoArena` + `DetoastRow` +
+          `cloneRowOwned`, released BEFORE the slot is yielded.  Pin is
+          retained between yields so the page is not evicted.
+          `cloneRowOwned` deep-copies arena-backed string/bytes Datums
+          into owned `[]byte` so the yielded slot is safe to read after
+          the page becomes writable.  `releasePinned` drops the RLock
+          acquisition.  All 24 permutations of
+          `TestPort_IsolationLockCommittedUpdate` now run end-to-end in
+          ~7.5 s (was: 5-minute timeout).  Output diff drops from full-
+          spec divergence to a single follow-up: an unrelated dead-tuple
+          visibility bug in s1hint (SELECT after committed UPDATE on the
+          same session) — both old + new heap versions surface where PG
+          shows only the new one.  That follow-up is a separate
+          read-after-commit visibility bug, not a lock-scoping bug.
+          `go test -race ./internal/executor/ ./internal/storage/
+          ./internal/server/` PASS post-fix; existing isolation-test
+          SKIPs (FkSnapshot, others) unchanged — no regression.  Design:
+          `docs/design/0100-0005e-seqscan-page-rlock-per-tuple.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

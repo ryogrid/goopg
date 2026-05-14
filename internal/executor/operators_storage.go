@@ -336,12 +336,18 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				if err != nil {
 					return nil, err
 				}
-				// Hold the page's read lock for the lifetime of our
-				// iteration over its line pointers so writers
-				// (PageAddHeapTuple / PageSetHeapTupleXmax) can't tear
-				// the bytes we're decoding. RUnlock fires from
-				// releasePinned.
-				slot.RLock()
+				// Pin only — the page RLock is now scoped per tuple
+				// decode (see inner loop). Holding the RLock across
+				// full-page iteration would block concurrent writers
+				// for the duration of any blocking parent (e.g.
+				// SELECT FOR KEY SHARE whose WHERE clause calls
+				// pg_advisory_lock()), creating cross-session
+				// deadlocks. M0100-0005 lock-committed-update fix:
+				// release the RLock immediately after each tuple is
+				// materialised so writers on the same page can
+				// proceed while the parent operator processes the
+				// yielded slot. Page eviction is still prevented by
+				// the pin alone.
 				o.pinned = slot
 				o.activePage = slot.Page()
 			}
@@ -351,7 +357,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				o.curBlock++
 				continue
 			}
+			// Brief RLock around the line-pointer count read; the
+			// count is captured into o.slotMax so the per-tuple loop
+			// can iterate without holding the RLock between yields.
+			if o.pinned != nil {
+				o.pinned.RLock()
+			}
 			count, err := storage.PageLinePointerCount(page)
+			if o.pinned != nil {
+				o.pinned.RUnlock()
+			}
 			if err != nil {
 				o.releasePinned()
 				return nil, err
@@ -361,15 +376,31 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 		}
 		for int(o.curSlot) <= o.slotMax {
 			page := o.activePage
+			// Brief RLock around tuple decode + arena copy. After
+			// release, parent operators (filterOp / lockRowsOp /
+			// projectOp) can run user-defined predicates that block
+			// on advisory or row-level locks without pinning the
+			// page in shared mode — a critical correctness property
+			// for SELECT … FOR KEY SHARE on a row whose UPDATE is
+			// in flight on the same page.
+			if o.pinned != nil {
+				o.pinned.RLock()
+			}
 			tuple, err := storage.PageGetHeapTuple(page, o.curSlot)
 			o.curSlot++
 			if err != nil {
+				if o.pinned != nil {
+					o.pinned.RUnlock()
+				}
 				// Corrupt or unsupported tuples are silently
 				// skipped — scanning should not fail on
 				// partial page writes or WAL-replay debris.
 				continue
 			}
 			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+				if o.pinned != nil {
+					o.pinned.RUnlock()
+				}
 				continue
 			}
 			// M0104-0007: SSI read-path hook. Tuple is visible to this
@@ -390,6 +421,9 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				o.scanRow = acquireRow(len(o.cols))
 			}
 			if err := DecodeRowIntoArena(o.scanRow, o.cols, tuple.Data, o.arena); err != nil {
+				if o.pinned != nil {
+					o.pinned.RUnlock()
+				}
 				continue
 			}
 			row := o.scanRow
@@ -400,9 +434,22 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if needsDetoast(row) {
 				detoasted, err := DetoastRow(o.ctx, rel, o.cols, row)
 				if err != nil {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
 					continue // skip undetoastable tuple
 				}
 				row = detoasted
+			}
+			// M0100-0005 lock-committed-update fix: materialize the
+			// row (deep-copy arena-backed Datums into owned bytes)
+			// BEFORE releasing the page RLock. The yielded slot
+			// must be safe to read after the page becomes writable
+			// to other sessions; a concurrent UPDATE could otherwise
+			// tear the bytes the parent is decoding.
+			row = cloneRowOwned(row)
+			if o.pinned != nil {
+				o.pinned.RUnlock()
 			}
 			// M0092-0007: stack-aliased slot reused across
 			// Next() calls; matches the M0092-0002 contract
@@ -457,7 +504,10 @@ func (o *seqScanOp) releasePinned() {
 		o.ring.ReleasePage()
 		o.activePage = nil
 	} else if o.pinned != nil {
-		o.pinned.RUnlock()
+		// M0100-0005: page RLock is now scoped per tuple inside
+		// Next() (acquired before PageGetHeapTuple, released
+		// before yielding the slot). When releasePinned runs we
+		// hold only the pin — drop it.
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
 		o.activePage = nil
