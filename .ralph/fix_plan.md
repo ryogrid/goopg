@@ -2441,65 +2441,65 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         streaming subxacts, kill -9 + libpq multi-host reconnect
         plumbing on the client side, DEFAULT-expression
         evaluation for subscriber-extra INSERTs.
-      PARTIAL PROGRESS 2026-05-14 (rung 12): REPLICA IDENTITY USING
-      INDEX support in the apply worker. Design doc:
-      `docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md`
-      (accepted). Rungs 1-11 covered REPLICA IDENTITY DEFAULT (PK,
-      rungs 1-3 + 6-11) and FULL (rung 4); USING INDEX on a non-PK
-      unique index was untested. Before rung 12 the no-OldTuple
-      UPDATE branch resolved through `primaryKeyOnlyRow(cat, tbl,
-      newRow)`, which walked the subscriber-side catalog for
-      `idx.Primary == true`. Two correctness gaps: (a) when the
-      subscriber declares no PK at all (mirroring a no-PK publisher
-      with REPLICA IDENTITY USING INDEX), the helper returned nil
-      and the UPDATE was silently dropped; (b) even with a
-      subscriber PK, USING INDEX may name DIFFERENT columns, so the
-      synthesised key matched zero (or worse, the wrong) row. PG's
-      apply worker resolves identity columns from the Relation
-      message's per-column flag byte
-      (`LOGICALREP_IS_REPLICA_IDENTITY`), not from any subscriber
-      catalog lookup. Fix: new
-      `replicaIdentityKeyRow(remoteCols, localCols, newRow) Row`
-      walks `remoteCols`; for each entry with `Flags & 0x01 != 0`
-      it resolves the matching local column by name and copies the
-      value from `newRow` into that slot of the returned key;
-      other slots stay `NullDatum` (`rowMatchesKey`'s "skip NULL"
-      rule yields identity-only equality). `applyUpdate`'s
-      no-OldTuple branch calls it first; falls back to
-      `primaryKeyOnlyRow` when no flags are set (older or corrupt
-      publishers). Symmetric with rung 2's hot path because
-      REPLICA IDENTITY DEFAULT sets the flag on PK columns, so the
-      helper produces the same key - no regression to rungs 1-11.
-      Pinned by `TestReplicaIdentityKeyRow` (four sub-cases: PK
-      columns flagged, non-PK composite identity over `(a, v)`,
-      no-flags returns nil, row-length mismatch returns nil) in
-      `internal/executor/applyworker_test.go` and the live E2E
-      `TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex`
-      (`internal/testport/pgoutput_interop_test.go`): publisher
-      `(k int NOT NULL, v text)` with UNIQUE index `t_k_uniq` and
-      `ALTER TABLE public.t REPLICA IDENTITY USING INDEX
-      t_k_uniq`; subscriber `(k int, v text)` with no constraints
-      at all; workload INSERT*3 + no-key-touch UPDATE on k=2 +
-      DELETE on k=1. Each assertion fail-fasts a distinct
-      regression: `count(*) = 2` catches UPDATE/DELETE silently
-      dropping; `k=2 AND v='bb'` catches the UPDATE not firing;
-      `k=2 AND v='b'` returns 0 catches the rung-12 path falling
-      back to primaryKeyOnlyRow->nil. Verification (rung 12):
-      `go test -count=1 -timeout 60s
-      -run "TestReplicaIdentityKeyRow|TestPrimaryKeyOnlyRow|TestApplyWorker|TestApplyUpdateByKey"
-      ./internal/executor/` -> PASS (~0.03 s);
-      `go test -count=1 -timeout 180s
-      -run TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex
-      ./internal/testport/` -> PASS (~1.7 s); all 11
-      `TestPort_PgoutputInteropPGToGoopg*` together -> PASS
-      (~21 s); regression sweep on
-      `./internal/executor/ ./internal/catalog/ ./internal/wal/
-      ./internal/testutil/pubsubcluster/` -> all green. Next rungs
-      (deferred within M0103-0007): pgbench against PG publisher
-      with `pgbench_history` polling, proto_version=2 streaming
-      subxacts, kill -9 + libpq multi-host reconnect plumbing on
-      the client side, DEFAULT-expression evaluation for
-      subscriber-extra INSERTs.
+      - PARTIAL PROGRESS 2026-05-14 (rung 12): REPLICA IDENTITY USING
+        INDEX support in the apply worker. Design doc:
+        `docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md`
+        (accepted). Rungs 1-11 covered REPLICA IDENTITY DEFAULT (PK,
+        rungs 1-3 + 6-11) and FULL (rung 4); USING INDEX on a non-PK
+        unique index was untested. Before rung 12 the no-OldTuple
+        UPDATE branch resolved through `primaryKeyOnlyRow(cat, tbl,
+        newRow)`, which walked the subscriber-side catalog for
+        `idx.Primary == true`. Two correctness gaps: (a) when the
+        subscriber declares no PK at all (mirroring a no-PK publisher
+        with REPLICA IDENTITY USING INDEX), the helper returned nil
+        and the UPDATE was silently dropped; (b) even with a
+        subscriber PK, USING INDEX may name DIFFERENT columns, so the
+        synthesised key matched zero (or worse, the wrong) row. PG's
+        apply worker resolves identity columns from the Relation
+        message's per-column flag byte
+        (`LOGICALREP_IS_REPLICA_IDENTITY`), not from any subscriber
+        catalog lookup. Fix: new
+        `replicaIdentityKeyRow(remoteCols, localCols, newRow) Row`
+        walks `remoteCols`; for each entry with `Flags & 0x01 != 0`
+        it resolves the matching local column by name and copies the
+        value from `newRow` into that slot of the returned key;
+        other slots stay `NullDatum` (`rowMatchesKey`'s "skip NULL"
+        rule yields identity-only equality). `applyUpdate`'s
+        no-OldTuple branch calls it first; falls back to
+        `primaryKeyOnlyRow` when no flags are set (older or corrupt
+        publishers). Symmetric with rung 2's hot path because
+        REPLICA IDENTITY DEFAULT sets the flag on PK columns, so the
+        helper produces the same key - no regression to rungs 1-11.
+        Pinned by `TestReplicaIdentityKeyRow` (four sub-cases: PK
+        columns flagged, non-PK composite identity over `(a, v)`,
+        no-flags returns nil, row-length mismatch returns nil) in
+        `internal/executor/applyworker_test.go` and the live E2E
+        `TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex`
+        (`internal/testport/pgoutput_interop_test.go`): publisher
+        `(k int NOT NULL, v text)` with UNIQUE index `t_k_uniq` and
+        `ALTER TABLE public.t REPLICA IDENTITY USING INDEX
+        t_k_uniq`; subscriber `(k int, v text)` with no constraints
+        at all; workload INSERT*3 + no-key-touch UPDATE on k=2 +
+        DELETE on k=1. Each assertion fail-fasts a distinct
+        regression: `count(*) = 2` catches UPDATE/DELETE silently
+        dropping; `k=2 AND v='bb'` catches the UPDATE not firing;
+        `k=2 AND v='b'` returns 0 catches the rung-12 path falling
+        back to primaryKeyOnlyRow->nil. Verification (rung 12):
+        `go test -count=1 -timeout 60s
+        -run "TestReplicaIdentityKeyRow|TestPrimaryKeyOnlyRow|TestApplyWorker|TestApplyUpdateByKey"
+        ./internal/executor/` -> PASS (~0.03 s);
+        `go test -count=1 -timeout 180s
+        -run TestPort_PgoutputInteropPGToGoopgReplicaIdentityUsingIndex
+        ./internal/testport/` -> PASS (~1.7 s); all 11
+        `TestPort_PgoutputInteropPGToGoopg*` together -> PASS
+        (~21 s); regression sweep on
+        `./internal/executor/ ./internal/catalog/ ./internal/wal/
+        ./internal/testutil/pubsubcluster/` -> all green. Next rungs
+        (deferred within M0103-0007): pgbench against PG publisher
+        with `pgbench_history` polling, proto_version=2 streaming
+        subxacts, kill -9 + libpq multi-host reconnect plumbing on
+        the client side, DEFAULT-expression evaluation for
+        subscriber-extra INSERTs.
       - PARTIAL PROGRESS 2026-05-14 (rung 13): subscriber-extra
         column DEFAULT evaluation at INSERT time. Design doc:
         `docs/design/0103-0036-m0103-0007-rung-13-pg-to-goopg-subscriber-extra-default.md`
