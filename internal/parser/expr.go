@@ -198,6 +198,17 @@ func (*CaseExpr) exprNode()  {}
 // NullConst is the SQL NULL literal.
 type NullConst struct{ pos int }
 
+// DefaultMarker is the row-cell sentinel for `INSERT … VALUES (…,
+// DEFAULT, …)`. It is produced by parseValuesRow when a cell is the
+// bare DEFAULT keyword; the planner's planInsert substitutes it for
+// the target column's catalog DefaultExpr (or NullConst when the
+// column has no DEFAULT). Mirrors upstream's rewriteValuesRTE pass —
+// it never reaches the executor.
+type DefaultMarker struct{ pos int }
+
+func (e *DefaultMarker) Pos() int { return e.pos }
+func (*DefaultMarker) exprNode()  {}
+
 func (e *NullConst) Pos() int { return e.pos }
 func (*NullConst) exprNode()  {}
 

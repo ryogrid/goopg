@@ -265,14 +265,25 @@ func (p *parser) parseValuesRow() ([]Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
+	parseCell := func() (Expr, error) {
+		// rung 15 (M0103-0007): bare DEFAULT keyword in a VALUES row.
+		// Substituted by planInsert with the target column's catalog
+		// DefaultExpr (or NULL) — never reaches the executor.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+			t := p.cur()
+			p.advance()
+			return &DefaultMarker{pos: t.Pos}, nil
+		}
+		return p.parseExpr()
+	}
 	var row []Expr
-	first, err := p.parseExpr()
+	first, err := parseCell()
 	if err != nil {
 		return nil, err
 	}
 	row = append(row, first)
 	for p.acceptSymbol(",") {
-		next, err := p.parseExpr()
+		next, err := parseCell()
 		if err != nil {
 			return nil, err
 		}

@@ -633,6 +633,75 @@ func TestPlanInsertResolvesColumns(t *testing.T) {
 	}
 }
 
+
+// TestPlanInsertValuesDefaultSubstitutesColumnDefault: rung 15 — a bare
+// DEFAULT cell in a VALUES row is substituted at plan time by the
+// target column's catalog DefaultExpr. The executor never observes a
+// DefaultMarker, so a Values row that parsed as `(1, DEFAULT)` against
+// `(id int, note text DEFAULT 'auto')` plans into a row whose second
+// cell evaluates to the literal `'auto'`.
+func TestPlanInsertValuesDefaultSubstitutesColumnDefault(t *testing.T) {
+	c := catalog.NewInMemory()
+	// DefaultExpr on the catalog column models what execCreateTable
+	// would have populated from `CREATE TABLE t (id int, note text
+	// DEFAULT 'auto')`.
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "note", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: "auto"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t (id, note) VALUES (1, DEFAULT)"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins, ok := node.(*Insert)
+	if !ok {
+		t.Fatalf("got %T", node)
+	}
+	values, ok := ins.Source.(*Values)
+	if !ok {
+		t.Fatalf("ins.Source=%T", ins.Source)
+	}
+	if len(values.Rows) != 1 || len(values.Rows[0]) != 2 {
+		t.Fatalf("values shape=%v", values.Rows)
+	}
+	// Cell 0: explicit integer.
+	if _, ok := values.Rows[0][0].(*IntegerConst); !ok {
+		t.Errorf("row[0][0]=%T want *IntegerConst", values.Rows[0][0])
+	}
+	// Cell 1: substituted from column's DefaultExpr — a planner StringConst
+	// resolved from the catalog's parser.StringConst.
+	sc, ok := values.Rows[0][1].(*StringConst)
+	if !ok {
+		t.Fatalf("row[0][1]=%T want *StringConst (the substituted DEFAULT)", values.Rows[0][1])
+	}
+	if sc.Value != "auto" {
+		t.Errorf("row[0][1].Value=%q want %q", sc.Value, "auto")
+	}
+}
+
+// TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull: rung 15 —
+// DEFAULT against a column without a DefaultExpr plans to NULL (matches
+// upstream PG: DEFAULT for a column with no default is NULL).
+func TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "bare", Type: catalog.Type{Name: "text"}}, // no DefaultExpr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t (id, bare) VALUES (1, DEFAULT)"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	values := node.(*Insert).Source.(*Values)
+	if _, ok := values.Rows[0][1].(*NullConst); !ok {
+		t.Errorf("row[0][1]=%T want *NullConst", values.Rows[0][1])
+	}
+}
+
 // TestPlanUpdate: pgbench's abalance UPDATE plans into
 // Update(Filter(SeqScan)) with Set[2] populated.
 func TestPlanUpdate(t *testing.T) {

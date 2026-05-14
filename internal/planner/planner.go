@@ -46,6 +46,14 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		}
 		return planSelect(s, cat)
 	case *parser.InsertStmt:
+		// M0103-0007 rung 15: substitute bare DEFAULT cells in VALUES rows
+		// with the target column's catalog DefaultExpr (or NULL) before the
+		// analyzer runs — the analyzer has no DefaultMarker handler and the
+		// substituted expression flows through cleanly. Mirrors upstream's
+		// rewriteValuesRTE pass.
+		if err := rewriteInsertDefaultMarkers(s, cat); err != nil {
+			return nil, err
+		}
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
@@ -3223,6 +3231,70 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		schema:  ctx.schema,
 	}
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
+}
+
+// rewriteInsertDefaultMarkers substitutes `*parser.DefaultMarker` cells
+// in an INSERT's VALUES rows with the target column's catalog
+// `DefaultExpr` (or `*parser.NullConst` when the column has no
+// DEFAULT). Runs in Plan() BEFORE the analyzer so the analyzer never
+// observes the marker — mirrors upstream's rewriteValuesRTE pass.
+// Silently no-ops for INSERT…SELECT (s.Select != nil) and when the
+// target table can't be resolved (planInsert raises the canonical
+// 42P01 error later).
+func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) error {
+	if s.Select != nil || len(s.Rows) == 0 {
+		return nil
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
+	if !ok {
+		return nil
+	}
+	// Per-cell target column ordinal: mirrors planInsert's colIndex
+	// derivation so DEFAULT substitution sees the same mapping the
+	// planner will use.
+	var colIndex []int
+	if len(s.Columns) == 0 {
+		colIndex = make([]int, 0, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			if col.GeneratedAlways {
+				continue
+			}
+			colIndex = append(colIndex, i)
+		}
+	} else {
+		colIndex = make([]int, 0, len(s.Columns))
+		for _, name := range s.Columns {
+			col, ok := cat.LookupColumn(tbl, name)
+			if !ok {
+				// planInsert raises 42703; let it own the error.
+				return nil
+			}
+			colIndex = append(colIndex, col.Ordinal)
+		}
+	}
+	for _, r := range s.Rows {
+		if len(r) != len(colIndex) {
+			// planInsert raises the arity error; skip rewriting and let
+			// it surface uniformly.
+			return nil
+		}
+		for i, e := range r {
+			if _, ok := e.(*parser.DefaultMarker); !ok {
+				continue
+			}
+			tgt := colIndex[i]
+			if tgt < 0 || tgt >= len(tbl.Columns) {
+				r[i] = &parser.NullConst{}
+				continue
+			}
+			if def := tbl.Columns[tgt].DefaultExpr; def != nil {
+				r[i] = def
+			} else {
+				r[i] = &parser.NullConst{}
+			}
+		}
+	}
+	return nil
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {

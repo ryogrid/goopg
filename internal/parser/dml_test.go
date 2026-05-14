@@ -153,3 +153,60 @@ func TestParseDMLSyntaxErrors(t *testing.T) {
 		}
 	}
 }
+
+
+// TestParseInsertValuesAcceptsDefaultKeyword: rung 15 — VALUES rows
+// accept the bare DEFAULT keyword. The cell becomes a *DefaultMarker
+// AST node; planInsert substitutes the column's catalog DefaultExpr
+// (or NULL) before resolveExpr runs.
+func TestParseInsertValuesAcceptsDefaultKeyword(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t (a, b) VALUES (1, DEFAULT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, ok := stmts[0].(*InsertStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(ins.Rows) != 1 || len(ins.Rows[0]) != 2 {
+		t.Fatalf("rows shape=%v", ins.Rows)
+	}
+	if _, ok := ins.Rows[0][0].(*IntegerConst); !ok {
+		t.Errorf("row[0][0]=%T want *IntegerConst", ins.Rows[0][0])
+	}
+	if _, ok := ins.Rows[0][1].(*DefaultMarker); !ok {
+		t.Errorf("row[0][1]=%T want *DefaultMarker", ins.Rows[0][1])
+	}
+}
+
+// TestParseInsertValuesDefaultInMultipleRows: rung 15 — DEFAULT works
+// across multiple rows and at any cell position.
+func TestParseInsertValuesDefaultInMultipleRows(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t (a, b, c) VALUES (DEFAULT, 2, 'x'), (1, DEFAULT, DEFAULT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins := stmts[0].(*InsertStmt)
+	if len(ins.Rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(ins.Rows))
+	}
+	if _, ok := ins.Rows[0][0].(*DefaultMarker); !ok {
+		t.Errorf("row[0][0]=%T", ins.Rows[0][0])
+	}
+	if _, ok := ins.Rows[1][1].(*DefaultMarker); !ok {
+		t.Errorf("row[1][1]=%T", ins.Rows[1][1])
+	}
+	if _, ok := ins.Rows[1][2].(*DefaultMarker); !ok {
+		t.Errorf("row[1][2]=%T", ins.Rows[1][2])
+	}
+}
+
+// TestParseInsertValuesRejectsBareDefaultInExpression: rung 15 — DEFAULT
+// is only accepted as a complete cell, not as a sub-expression. Matches
+// upstream PG behaviour.
+func TestParseInsertValuesRejectsBareDefaultInExpression(t *testing.T) {
+	_, err := Parse("INSERT INTO t (a) VALUES (DEFAULT + 1)")
+	if err == nil {
+		t.Fatal("expected syntax error, got nil")
+	}
+}
