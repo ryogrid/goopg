@@ -619,9 +619,33 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// Create primary key index if parent has one (inherit constraint).
-	if len(parent.PartitionKey) > 0 {
-		// No automatic PK on partition children by default in v0.
+	// Inherit parent's primary key / unique indexes onto the partition
+	// child (M0100-0005t).  Without these, INSERTs that route to a leaf
+	// never populate any unique index (the parent's index has no entries
+	// because writes go to leaves; the leaf had no indexes pre-fix), so
+	// upsertOp's arbiter probe and insertOp's runtime unique-constraint
+	// check both miss live duplicates on partitioned tables.  We mirror
+	// upstream PG's behaviour of materialising a matching index on each
+	// child partition.  Naming uses the standard auto-generated form
+	// (`<child>_pkey` for PRIMARY, `<child>_<col>_key` for UNIQUE) so
+	// adjacency between catalog/btree state and pg_class is predictable.
+	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent) {
+		if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
+			continue
+		}
+		var childIdxName parser.ObjectName
+		if parentIdx.Primary {
+			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
+		} else {
+			suffix := "_key"
+			if len(parentIdx.Columns) == 1 {
+				suffix = "_" + parentIdx.Columns[0] + "_key"
+			}
+			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
+		}
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, parentIdx.Unique, parentIdx.Primary); err != nil {
+			return err
+		}
 	}
 	return nil
 }

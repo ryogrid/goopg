@@ -1593,6 +1593,64 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `InsertConflictDoNothing`, `PartitionKeyUpdate1` unchanged
           (4/4 still PASS). Design:
           `docs/design/0100-0005s-upsert-waits-inflight-xmax.md`.
+        - Partition-aware INSERT … ON CONFLICT + per-leaf arbiter
+          inheritance (M0100-0005t, 2026-05-15 loop 36).  Three coupled
+          edits close `partition-key-update-2.spec`:
+          (a) `internal/executor/operators_ddl.go::execCreatePartitionChild`
+          now inherits the parent's PRIMARY KEY / UNIQUE B-tree indexes
+          onto each newly-created partition child via the existing
+          `createBTreeIndex` helper (names: `<child>_pkey` for PRIMARY,
+          `<child>_<col>_key` for single-col UNIQUE, `<child>_key` for
+          multi-col UNIQUE).  Previously partition children carried no
+          indexes, so the parent's index was empty (writes route to
+          leaves and maintain *leaf* indexes) and arbiter probes
+          missed every live duplicate.
+          (b) `internal/executor/operators_storage.go` cross-partition
+          UPDATE write path now switches to `writeHeapRowReturning` and
+          calls `maintainUniqueIndexesForInsert(ctx, destPart,
+          destPart.Columns, newRow, newPtr)` after the moved tuple is
+          written.  Hoists `destPart` out of the partition-routing
+          block so it is visible after the write.  Without this,
+          a cross-partition UPDATE left the destination leaf's PK
+          index without an entry for the moved tuple, so any later
+          ON CONFLICT (or unique-constraint check) on the destination
+          partition missed the row.
+          (c) `internal/executor/operators_upsert.go::upsertOp` gains
+          a `leafTrees map[uint32]*btree.BTree` cache and two new
+          helpers (`routeAndOpenLeaf` + `resolveLeafArbiter`).  `Next()`
+          detects `len(o.plan.Table.PartitionKey) > 0`, routes each
+          inserted row via `routeToPartition`, resolves the leaf's
+          unique/primary index whose column list matches the parent's
+          planner-resolved `OnConflict.ArbiterIndex`, opens & caches
+          its btree, and swaps `o.arbiterTree` to it before calling
+          `probeArbiterWaiting`, `applyInsert`, and `applyUpdate` —
+          all of which now operate on the leaf's rel/cols/tree.
+          `encodeArbiterKey` is unchanged: parent column ordinals are
+          valid against the leaf because `execCreatePartitionChild`
+          copies parent columns verbatim, so the encoded key matches
+          the leaf-index entries produced by `maintainUniqueIndexesForInsert`.
+          Routing failures raise `23514` ("no partition of relation %q
+          found for row").  Non-partitioned targets bypass the new code
+          path entirely.  ATTACH PARTITION with column reorder is
+          documented as a known gap (not yet plumbed through
+          `upsertOp`); all M0100-0005 21-spec targets use `PARTITION OF`
+          which copies columns verbatim, so this is non-blocking.
+          Regression pins:
+          `TestPort_IsolationPartitionKeyUpdate2` (full PASS, was SKIP)
+          and `TestUpsertPartitioned_RoutesToLeafAndProbesLeafArbiter`
+          in `internal/server/upsert_partition_routing_test.go`
+          (three-step scenario: conflicting INSERT on existing key
+          skipped, routed INSERT into second partition written, second
+          duplicate on the second partition skipped — row count
+          asserted at 2).  `go test -race -count=1 ./internal/executor/
+          ./internal/storage/ ./internal/server/ ./internal/mvcc/
+          ./internal/planner/ ./internal/parser/ ./internal/analyzer/
+          ./internal/wal/ ./internal/initdb/ ./internal/catalog/
+          ./internal/access/btree/` PASS; adjacent
+          `LockCommittedUpdate`, `InsertConflictDoUpdate`,
+          `InsertConflictDoNothing`, `PartitionKeyUpdate1` unchanged
+          (4/4 still PASS).  Design:
+          `docs/design/0100-0005t-upsert-partition-routing-and-leaf-arbiter.md`.
         - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
           `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
           the row's source `*catalog.Table` through pending records

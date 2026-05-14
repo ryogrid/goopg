@@ -1845,9 +1845,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			// the moved-partition sentinel on the old slot.
 			targetWriteRel := puRel
 			targetWriteCols := puCols
+			var destPart *catalog.Table
 			isCrossPartitionMove := false
 			if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
-				destPart := routeToPartition(tbl, pu.newRow, imW)
+				destPart = routeToPartition(tbl, pu.newRow, imW)
 				if destPart != nil {
 					destRel := o.ctx.Catalog.RelFileNode(destPart)
 					if destRel != puRel {
@@ -1878,8 +1879,17 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			if derr != nil {
 				return nil, derr
 			}
-			if err := writeHeapRow(o.ctx, targetWriteRel, targetWriteCols, pu.newRow); err != nil {
-				return nil, err
+			// M0100-0005t: capture the new ItemPointer so we can maintain the
+			// destination partition's unique/PK indexes after a cross-partition
+			// (or in-place partition) UPDATE.  Without this, ON CONFLICT
+			// arbiters and the runtime unique-constraint check both miss the
+			// freshly-moved row on the destination leaf.
+			newPtr, werr := writeHeapRowReturning(o.ctx, targetWriteRel, targetWriteCols, pu.newRow)
+			if werr != nil {
+				return nil, werr
+			}
+			if destPart != nil {
+				maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
 			}
 			break // success — exit epq retry loop
 			} // end epq retry loop

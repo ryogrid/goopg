@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -66,8 +67,14 @@ type upsertOp struct {
 	// arbiterTree is opened lazily on first conflict probe (or
 	// first row insert when ArbiterIndex != nil) and kept across
 	// the statement for cheap reuse. nil when ArbiterIndex is nil
-	// (the bare DO NOTHING form).
+	// (the bare DO NOTHING form). For partitioned targets, this
+	// is swapped per-row to point at the routed leaf partition's
+	// matching arbiter index (M0100-0005t).
 	arbiterTree *btree.BTree
+	// leafTrees caches per-leaf-partition arbiter btree handles so
+	// multi-row UPSERTs over the same partition reuse a single
+	// open tree.  Keyed by leaf table OID.  M0100-0005t.
+	leafTrees map[uint32]*btree.BTree
 }
 
 // RowsAffected satisfies executor.RowCounter — for UPSERT, the
@@ -138,8 +145,10 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
-	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
-	cols := o.plan.Table.Columns
+	parentRel := o.ctx.Catalog.RelFileNode(o.plan.Table)
+	parentCols := o.plan.Table.Columns
+	parentTree := o.arbiterTree
+	isPartitioned := len(o.plan.Table.PartitionKey) > 0
 	for {
 		srcSlot, err := o.child.Next()
 		if err == EOF {
@@ -150,12 +159,35 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		}
 		src := slotRow(srcSlot)
 		// Reorder source row → target column order via plan.ColumnIndex.
-		inserted := make(Row, len(cols))
-		for i := range cols {
+		inserted := make(Row, len(parentCols))
+		for i := range parentCols {
 			inserted[i] = NullDatum
 		}
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			inserted[tgtIdx] = src[srcIdx]
+		}
+
+		// M0100-0005t: partition routing for INSERT … ON CONFLICT.  When
+		// the target is partitioned, route the row to a leaf and swap
+		// the arbiter tree to the leaf's matching unique/PK index.  The
+		// parent's arbiter index is empty (writes go to leaves), so
+		// probing it would miss every live duplicate.
+		rel := parentRel
+		cols := parentCols
+		writeTbl := o.plan.Table
+		if isPartitioned {
+			leaf, leafTree, ferr := o.routeAndOpenLeaf(inserted)
+			if ferr != nil {
+				return nil, ferr
+			}
+			if leaf == nil {
+				return nil, &ExecError{Code: "23514", Pos: o.plan.Pos(),
+					Message: fmt.Sprintf("no partition of relation %q found for row", o.plan.Table.Name)}
+			}
+			rel = o.ctx.Catalog.RelFileNode(leaf)
+			cols = leaf.Columns
+			writeTbl = leaf
+			o.arbiterTree = leafTree
 		}
 
 		conflictPtr, conflictRow, conflicted, err := o.probeArbiterWaiting(rel, cols, inserted)
@@ -167,6 +199,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 			o.rowsAffected++
+			_ = writeTbl
 			continue
 		}
 		switch o.plan.OnConflict.Action {
@@ -188,7 +221,78 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("unexpected OnConflictAction %d", o.plan.OnConflict.Action)}
 		}
 	}
+	// Restore parent's tree handle so Close() releases a stable resource.
+	o.arbiterTree = parentTree
 	return nil, EOF
+}
+
+// routeAndOpenLeaf finds the partition leaf that the row maps to and
+// returns the leaf table plus a cached btree handle for the leaf's
+// arbiter index (the unique/primary index whose column list matches
+// o.plan.OnConflict.ArbiterIndex).  Returns (nil, nil, nil) when the
+// row does not map to any partition.  M0100-0005t.
+func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree, error) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil, nil, nil
+	}
+	leaf := routeToPartition(o.plan.Table, inserted, im)
+	if leaf == nil {
+		return nil, nil, nil
+	}
+	if o.leafTrees == nil {
+		o.leafTrees = make(map[uint32]*btree.BTree)
+	}
+	if tree, hit := o.leafTrees[leaf.OID]; hit {
+		return leaf, tree, nil
+	}
+	leafIdx := o.resolveLeafArbiter(leaf)
+	if leafIdx == nil {
+		// No matching arbiter on the leaf — leave tree nil so probe
+		// short-circuits as "no entries"; applyInsert falls through
+		// to writeHeapRowReturning + index maintenance no-op.
+		o.leafTrees[leaf.OID] = nil
+		return leaf, nil, nil
+	}
+	idxRel := o.ctx.Catalog.IndexRelFileNode(leafIdx)
+	tree, err := btree.Open(o.ctx.Pool, idxRel)
+	if err != nil {
+		return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+	}
+	o.leafTrees[leaf.OID] = tree
+	return leaf, tree, nil
+}
+
+// resolveLeafArbiter finds the leaf-partition index whose column list
+// (and primary/unique flag) matches the parent's planner-resolved
+// arbiter index.  M0100-0005t.
+func (o *upsertOp) resolveLeafArbiter(leaf *catalog.Table) *catalog.Index {
+	parentIdx := o.plan.OnConflict.ArbiterIndex
+	if parentIdx == nil || o.ctx.Catalog == nil {
+		return nil
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(leaf) {
+		if parentIdx.Primary && !idx.Primary {
+			continue
+		}
+		if !parentIdx.Primary && !idx.Unique {
+			continue
+		}
+		if len(idx.Columns) != len(parentIdx.Columns) {
+			continue
+		}
+		ok := true
+		for i := range idx.Columns {
+			if !strings.EqualFold(idx.Columns[i], parentIdx.Columns[i]) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return idx
+		}
+	}
+	return nil
 }
 
 // probeArbiter looks up the inserted row's conflict key in the
