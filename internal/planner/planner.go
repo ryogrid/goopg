@@ -59,6 +59,13 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		}
 		return planInsert(s, cat)
 	case *parser.UpdateStmt:
+		// M0103-0007 rung 16: substitute bare DEFAULT cells on the RHS of
+		// SET assignments with the target column's catalog DefaultExpr (or
+		// NULL) before the analyzer runs — symmetric to rung 15's INSERT
+		// VALUES handling.
+		if err := rewriteUpdateDefaultMarkers(s, cat); err != nil {
+			return nil, err
+		}
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
@@ -3292,6 +3299,43 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 			} else {
 				r[i] = &parser.NullConst{}
 			}
+		}
+	}
+	return nil
+}
+
+
+// rewriteUpdateDefaultMarkers substitutes `*parser.DefaultMarker`
+// expressions on the RHS of UPDATE SET assignments with the target
+// column's catalog DefaultExpr (or *parser.NullConst when the column
+// has no DEFAULT). Mirrors rung 15's rewriteInsertDefaultMarkers — the
+// analyzer never observes the sentinel because the substitution runs
+// before analyzer.Analyze. M0103-0007 rung 16.
+func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) error {
+	if len(s.Set) == 0 {
+		return nil
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
+	if !ok {
+		// planUpdate will raise the missing-relation error; leave the
+		// marker in place so the error surfaces uniformly.
+		return nil
+	}
+	for i := range s.Set {
+		if _, ok := s.Set[i].Expr.(*parser.DefaultMarker); !ok {
+			continue
+		}
+		col, ok := cat.LookupColumn(tbl, s.Set[i].Column)
+		if !ok {
+			// planUpdate / analyzer will raise 42703 for unknown
+			// columns; leave the marker so the error path stays
+			// uniform.
+			return nil
+		}
+		if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
+			s.Set[i].Expr = def
+		} else {
+			s.Set[i].Expr = &parser.NullConst{}
 		}
 	}
 	return nil

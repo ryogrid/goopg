@@ -702,6 +702,69 @@ func TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
 	}
 }
 
+
+// TestPlanUpdateSetDefaultSubstitutesColumnDefault: rung 16 — a bare
+// DEFAULT on the RHS of an UPDATE SET assignment is substituted at plan
+// time by the target column's catalog DefaultExpr. The executor never
+// observes a DefaultMarker; the resolved Set slot at the column's
+// ordinal holds the substituted constant. Symmetric with rung 15.
+func TestPlanUpdateSetDefaultSubstitutesColumnDefault(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "note", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: "auto"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "UPDATE t SET note = DEFAULT WHERE id = 1"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	upd, ok := node.(*Update)
+	if !ok {
+		t.Fatalf("got %T", node)
+	}
+	if len(upd.Set) != 2 {
+		t.Fatalf("Set len=%d want 2", len(upd.Set))
+	}
+	// Set[0] (id) should be untouched (nil — UPDATE preserves the row's
+	// existing value for columns not named in SET).
+	if upd.Set[0] != nil {
+		t.Errorf("Set[0]=%T want nil", upd.Set[0])
+	}
+	// Set[1] (note) is the substituted DEFAULT — a planner StringConst
+	// resolved from the catalog's parser.StringConst.
+	sc, ok := upd.Set[1].(*StringConst)
+	if !ok {
+		t.Fatalf("Set[1]=%T want *StringConst (the substituted DEFAULT)", upd.Set[1])
+	}
+	if sc.Value != "auto" {
+		t.Errorf("Set[1].Value=%q want %q", sc.Value, "auto")
+	}
+}
+
+// TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull: rung 16 —
+// DEFAULT against a column without a DefaultExpr plans to NULL. Mirrors
+// upstream PG semantics ("DEFAULT for a column with no default is
+// NULL") and rung 15's INSERT VALUES path.
+func TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "bare", Type: catalog.Type{Name: "text"}}, // no DefaultExpr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "UPDATE t SET bare = DEFAULT WHERE id = 1"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	upd := node.(*Update)
+	if _, ok := upd.Set[1].(*NullConst); !ok {
+		t.Errorf("Set[1]=%T want *NullConst", upd.Set[1])
+	}
+}
+
 // TestPlanUpdate: pgbench's abalance UPDATE plans into
 // Update(Filter(SeqScan)) with Set[2] populated.
 func TestPlanUpdate(t *testing.T) {

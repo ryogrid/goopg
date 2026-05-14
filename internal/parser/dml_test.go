@@ -210,3 +210,60 @@ func TestParseInsertValuesRejectsBareDefaultInExpression(t *testing.T) {
 		t.Fatal("expected syntax error, got nil")
 	}
 }
+
+
+// TestParseUpdateSetDefaultKeyword: rung 16 — the bare DEFAULT keyword
+// is accepted on the RHS of an UPDATE SET assignment and parsed as a
+// *DefaultMarker sentinel. Plan() substitutes the marker with the
+// column's catalog DefaultExpr (or NULL) before the analyzer runs.
+func TestParseUpdateSetDefaultKeyword(t *testing.T) {
+	stmts, err := Parse("UPDATE t SET v = DEFAULT WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd, ok := stmts[0].(*UpdateStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(upd.Set) != 1 {
+		t.Fatalf("set len=%d want 1", len(upd.Set))
+	}
+	if upd.Set[0].Column != "v" {
+		t.Errorf("set[0].Column=%q want v", upd.Set[0].Column)
+	}
+	if _, ok := upd.Set[0].Expr.(*DefaultMarker); !ok {
+		t.Errorf("set[0].Expr=%T want *DefaultMarker", upd.Set[0].Expr)
+	}
+}
+
+// TestParseUpdateSetDefaultMultiAssign: rung 16 — DEFAULT on a subset
+// of comma-separated SET pairs, with plain expressions in the others.
+func TestParseUpdateSetDefaultMultiAssign(t *testing.T) {
+	stmts, err := Parse("UPDATE t SET v = DEFAULT, n = 42, w = DEFAULT WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd := stmts[0].(*UpdateStmt)
+	if len(upd.Set) != 3 {
+		t.Fatalf("set len=%d want 3", len(upd.Set))
+	}
+	if _, ok := upd.Set[0].Expr.(*DefaultMarker); !ok {
+		t.Errorf("set[0].Expr=%T want *DefaultMarker", upd.Set[0].Expr)
+	}
+	if _, ok := upd.Set[1].Expr.(*IntegerConst); !ok {
+		t.Errorf("set[1].Expr=%T want *IntegerConst", upd.Set[1].Expr)
+	}
+	if _, ok := upd.Set[2].Expr.(*DefaultMarker); !ok {
+		t.Errorf("set[2].Expr=%T want *DefaultMarker", upd.Set[2].Expr)
+	}
+}
+
+// TestParseUpdateSetRejectsBareDefaultInExpression: rung 16 — DEFAULT
+// is accepted only as a complete RHS, not as a sub-expression. Matches
+// upstream PG behaviour and rung 15's INSERT VALUES symmetry.
+func TestParseUpdateSetRejectsBareDefaultInExpression(t *testing.T) {
+	_, err := Parse("UPDATE t SET v = DEFAULT + 1 WHERE id = 1")
+	if err == nil {
+		t.Fatal("expected syntax error, got nil")
+	}
+}

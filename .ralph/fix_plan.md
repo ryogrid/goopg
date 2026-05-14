@@ -2628,13 +2628,110 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `go test -count=1 -timeout 180s -run TestPort_PgoutputInteropPGToGoopg ./internal/testport/`
         → all 12 rung-1–13 tests still PASS (~23.2 s);
         `go test -race -count=1 -timeout 180s ./internal/executor/ ./internal/planner/ ./internal/parser/ ./internal/catalog/`
-        → all green. Next rungs (deferred within M0103-0007):
+        → all green.
+      - PARTIAL PROGRESS 2026-05-14 (rung 15): `INSERT … VALUES
+        (DEFAULT, …)` parser + planner support — the symmetric
+        companion to rung 14's dispatcher DEFAULT-fill. Design doc:
+        `docs/design/0103-0038-m0103-0007-rung-15-insert-default-marker.md`
+        (accepted). Before this rung `INSERT INTO t (a, b) VALUES
+        (1, DEFAULT)` raised a syntax error because `parseValuesRow`
+        called `parseExpr` directly and `KwDefault` is reserved.
+      - Fix split across parser + planner:
+      - `internal/parser/expr.go::DefaultMarker` (new) — zero-field
+        sentinel AST node satisfying `Expr`. Only legal inside an
+        `INSERT … VALUES` row; reaching the planner anywhere else
+        would surface as a `PlanError` because no other resolver
+        knows about it.
+      - `internal/parser/dml.go::parseValuesRow` peeks for
+        `TokenKeyword`/`KwDefault` before each cell and emits
+        `&DefaultMarker{pos: …}` when matched; otherwise falls
+        back to `p.parseExpr()`. Parse-only — no analyzer/scope
+        work, no `exprNode()` interactions beyond satisfying the
+        `Expr` interface.
+      - `internal/planner/planner.go::rewriteInsertDefaultMarkers`
+        (new) walks each VALUES row, maps row position → target
+        column ordinal via the same logic `planInsert` uses, and
+        substitutes each `*DefaultMarker` with the column's catalog
+        `DefaultExpr` (or `*parser.NullConst` when the column has
+        no DEFAULT). `Plan()` calls it for `*parser.InsertStmt`
+        BEFORE `analyzer.Analyze`, so the analyzer/executor never
+        observe the marker. Mirrors upstream's `rewriteValuesRTE`.
+      - SERIAL columns retain their existing nil `DefaultExpr` →
+        `NullConst` path → `insertOp.Next`'s SERIAL `nextval` block
+        (rung 14 hot path) picks them up.
+      - Pinned by `TestParseInsertValuesAcceptsDefaultKeyword`,
+        `TestParseInsertValuesDefaultInMultipleRows`,
+        `TestParseInsertValuesRejectsBareDefaultInExpression`
+        (`internal/parser/dml_test.go`) and
+        `TestPlanInsertValuesDefaultSubstitutesColumnDefault`,
+        `TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull`
+        (`internal/planner/planner_test.go`).
+      - Verification (rung 15):
+        `go test -count=1 -timeout 60s -run "TestParseInsertValues" ./internal/parser/`
+        → PASS;
+        `go test -count=1 -timeout 60s -run "TestPlanInsertValuesDefault" ./internal/planner/`
+        → PASS;
+        `go test -count=1 -timeout 180s -run "TestPort_PgoutputInteropPGToGoopg" ./internal/testport/`
+        → all 12 still PASS (~23 s);
+        `go test -race -count=1 -timeout 300s ./internal/{parser,planner,analyzer,executor,catalog}/`
+        → all green.
+      - PARTIAL PROGRESS 2026-05-14 (rung 16): `UPDATE … SET col =
+        DEFAULT` parser + planner support — the symmetric companion
+        to rung 15's INSERT VALUES handling. Design doc:
+        `docs/design/0103-0039-m0103-0007-rung-16-update-default-marker.md`
+        (accepted). Before this rung `UPDATE t SET v = DEFAULT
+        WHERE id = 1` raised a syntax error because `parseAssign`
+        called `parseExpr` directly and `KwDefault` is reserved
+        with no expression-level production.
+      - Fix split across parser + planner (reuses rung 15's
+        `*parser.DefaultMarker` sentinel — no new AST node):
+      - `internal/parser/dml.go::parseAssign` peeks for
+        `TokenKeyword`/`KwDefault` after the `=` operator and
+        emits `UpdateAssign{Expr: &DefaultMarker{pos: …}}`. Falls
+        back to `p.parseExpr()` otherwise. The marker is only
+        accepted as a complete RHS — `UPDATE t SET v = DEFAULT +
+        1` still raises a syntax error because `parseExpr` (which
+        would consume the `+`) is never reached when DEFAULT is
+        matched. Matches upstream PG behaviour.
+      - `internal/planner/planner.go::rewriteUpdateDefaultMarkers`
+        (new) walks `s.Set`, looks up the catalog table by
+        `s.Target`, and for each assignment whose `Expr` is a
+        `*DefaultMarker` substitutes the column's catalog
+        `DefaultExpr` (or `*parser.NullConst` when the column has
+        no DEFAULT). `Plan()` calls it for `*parser.UpdateStmt`
+        BEFORE `analyzer.Analyze`, so the analyzer never observes
+        the sentinel; the substituted expression flows through
+        `analyzer.Analyze` → `planUpdate`'s existing
+        `resolveExpr(a.Expr, ctx)` path unchanged. Mirrors
+        upstream's `rewriteTargetListUD`.
+      - Missing-table and unknown-column cases leave the marker in
+        place so `planUpdate`'s existing `42P01` / `42703` error
+        path stays uniform with the non-DEFAULT shape.
+      - Pinned by `TestParseUpdateSetDefaultKeyword`,
+        `TestParseUpdateSetDefaultMultiAssign`,
+        `TestParseUpdateSetRejectsBareDefaultInExpression`
+        (`internal/parser/dml_test.go`) and
+        `TestPlanUpdateSetDefaultSubstitutesColumnDefault`,
+        `TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull`
+        (`internal/planner/planner_test.go`). The planner test
+        also asserts the column ordinal that was NOT named in
+        SET stays `nil` (UPDATE preserves the existing row value
+        for unmentioned columns — explicit-value-beats-DEFAULT
+        semantics still hold in the marker substitution path).
+      - Verification (rung 16):
+        `go test -count=1 -timeout 60s -run "TestParseUpdateSetDefault|TestParseUpdateSetRejects" ./internal/parser/`
+        → PASS (~0.004 s);
+        `go test -count=1 -timeout 60s -run "TestPlanUpdateSetDefault" ./internal/planner/`
+        → PASS (~0.002 s); regression sweep on
+        `./internal/parser/ ./internal/planner/ ./internal/analyzer/
+        ./internal/executor/ ./internal/catalog/` → all green.
+      - Next rungs (deferred within M0103-0007):
         pgbench against PG publisher with `pgbench_history` polling,
         proto_version=2 streaming subxacts, kill -9 + libpq
-        multi-host reconnect plumbing on the client side, `INSERT
-        … VALUES (DEFAULT, …)` parser support (orthogonal to
-        M0103-0007), richer DEFAULT evaluator (function calls,
-        sequences) when a fixture surfaces a need.
+        multi-host reconnect plumbing on the client side, richer
+        DEFAULT evaluator (function calls, sequences) when a fixture
+        surfaces a need, `INSERT INTO t DEFAULT VALUES` all-defaults
+        form.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

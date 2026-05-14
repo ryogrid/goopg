@@ -363,6 +363,15 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 		return UpdateAssign{}, p.errAtCur("expected '='")
 	}
 	p.advance()
+	// rung 16 (M0103-0007): bare DEFAULT keyword on the RHS of an UPDATE
+	// SET assignment. Substituted by Plan() with the target column's
+	// catalog DefaultExpr (or NULL) before the analyzer runs — never
+	// reaches the executor. Mirrors rung 15's INSERT VALUES handling.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+		t := p.cur()
+		p.advance()
+		return UpdateAssign{pos: pos, Column: identText(col), Expr: &DefaultMarker{pos: t.Pos}}, nil
+	}
 	expr, err := p.parseExpr()
 	if err != nil {
 		return UpdateAssign{}, err
