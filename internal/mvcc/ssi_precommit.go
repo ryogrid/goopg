@@ -1,0 +1,193 @@
+package mvcc
+
+import (
+	"errors"
+	"fmt"
+)
+
+// SerializationFailureSQLState is the SQLSTATE for serialization failure
+// (`ERRCODE_T_R_SERIALIZATION_FAILURE`). PostgreSQL raises this when SSI
+// detects a dangerous rw-conflict structure that cannot be allowed to
+// commit. goopg returns it through SerializationFailureError so the
+// executor wrapper can surface SQLSTATE 40001 to the client.
+const SerializationFailureSQLState = "40001"
+
+// SerializationFailureError is returned by PreCommitCheckForSerializationFailure
+// when a SERIALIZABLE transaction must abort to prevent a dangerous
+// structure in the rw-conflict graph from materialising into an
+// anomaly. It mirrors PostgreSQL's `ereport(ERROR, ERRCODE_T_R_SERIALIZATION_FAILURE,
+// ...)` in `predicate.c`.
+//
+// Callers in the executor recognise this error type, perform Rollback,
+// and surface the SQLSTATE to the wire protocol.
+type SerializationFailureError struct {
+	// Reason is the upstream-style "Reason code" detail string. The
+	// PostgreSQL message uses fixed phrases per detection site; goopg
+	// reuses those phrases so test scaffolding written against upstream
+	// errordetail can recognise the goopg variant verbatim.
+	Reason string
+}
+
+func (e *SerializationFailureError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("could not serialize access due to read/write dependencies among transactions (%s)", e.Reason)
+}
+
+// SQLSTATE returns the SQLSTATE code carried by this error. Provided so
+// the executor's error-conversion layer can detect the typed error via
+// a public method without type-asserting through the mvcc package.
+func (e *SerializationFailureError) SQLSTATE() string {
+	return SerializationFailureSQLState
+}
+
+// IsSerializationFailure reports whether err is (or wraps) a
+// SerializationFailureError. Convenience wrapper so callers in
+// executor/protocol layers do not need to import the typed pointer
+// directly.
+func IsSerializationFailure(err error) bool {
+	var sfe *SerializationFailureError
+	return errors.As(err, &sfe)
+}
+
+// PreCommitCheckForSerializationFailure is the goopg analogue of
+// PostgreSQL's `PreCommit_CheckForSerializationFailure`
+// (`postgres/src/backend/storage/lmgr/predicate.c`). It runs the
+// dangerous-structure scan over the rw-conflict graph reachable from
+// the committing SERIALIZABLE transaction, and returns a typed
+// *SerializationFailureError if the commit must be rejected with
+// SQLSTATE 40001.
+//
+// Algorithm (mirrors upstream):
+//
+//  1. If the committing xact has been doomed (by an earlier peer's
+//     dangerous-structure detection or a future on-conflict check),
+//     fail immediately with reason "Canceled on identification as a
+//     pivot, during commit attempt".
+//
+//  2. Otherwise, walk my `inConflicts` slice. Each entry is a pivot
+//     candidate — the structure is `Tin -> Tpivot -> Me`, my
+//     `inConflicts` are pivots that read what I wrote.
+//
+//     - Skip pivots that are already finished (`FinishedAt != 0`) or
+//     doomed: they cannot create a new anomaly.
+//
+//     - Walk the pivot's `inConflicts` for a `Tin` candidate. If
+//     `Tin == me` (the 2-cycle case — write-skew) or `Tin` is still
+//     in-flight (the 3-cycle case — generic dangerous structure),
+//     doom the pivot in place. The pivot will fail at its own
+//     pre-commit attempt with SQLSTATE 40001.
+//
+//  3. The committing xact then proceeds; the caller calls finish()
+//     which scrubs the dying xact's edges from every peer.
+//
+// The check is a no-op for RC/RR transactions (not registered in
+// `ssiState.xacts`) and for read-only SERIALIZABLE transactions whose
+// graph contains no edges. The first-slice substrate does not yet
+// retain finished-but-conflict-relevant xacts past their FinishedAt
+// stamping; that retention work is in scope for the post-commit half
+// of M0104-0006 but the pre-commit check below is correct under both
+// the current release-on-finish policy and the future deferred-cleanup
+// policy because the dangerous-structure scan runs WHILE the
+// committing xact is still in `ssiState.xacts` and BEFORE its peers
+// are scrubbed — exactly the window upstream uses.
+//
+// Safe for concurrent use; takes m.mu internally.
+func (m *Manager) PreCommitCheckForSerializationFailure(handle TxnHandle) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.preCommitCheckForSerializationFailureLocked(handle)
+}
+
+func (m *Manager) preCommitCheckForSerializationFailureLocked(handle TxnHandle) error {
+	if m.ssiState.xacts == nil {
+		return nil
+	}
+	me, ok := m.ssiState.xacts[handle]
+	if !ok || me == nil {
+		// Not a SERIALIZABLE xact (RC/RR). Nothing to check.
+		return nil
+	}
+	if me.Doomed {
+		return &SerializationFailureError{
+			Reason: "Canceled on identification as a pivot, during commit attempt",
+		}
+	}
+	for _, pivot := range me.inConflicts {
+		if pivot == nil {
+			continue
+		}
+		if pivot.FinishedAt != InvalidCommitSeqNo {
+			// Pivot already finished — its eventual outcome is fixed.
+			// Mirrors the `!SxactIsCommitted(pivot)` upstream gate.
+			continue
+		}
+		if pivot.Doomed {
+			// Already targeted by an earlier scan — no need to walk again.
+			continue
+		}
+		for _, tin := range pivot.inConflicts {
+			if tin == nil {
+				continue
+			}
+			if tin == me {
+				// The 2-cycle case: write-skew between me and the pivot.
+				// `farConflict->sxactOut == MySerializableXact` upstream.
+				pivot.Doomed = true
+				break
+			}
+			if tin.FinishedAt == InvalidCommitSeqNo && !tin.Doomed {
+				// The 3-cycle case: Tin is still in-flight, not doomed.
+				// `!SxactIsCommitted(t0) && !SxactIsDoomed(t0)` upstream.
+				// goopg does not yet model READ ONLY transactions
+				// distinctly, so the upstream READ ONLY optimisation
+				// (skip Tin if read-only and overlaps writer) is
+				// conservatively absent — false positives, never
+				// false negatives.
+				pivot.Doomed = true
+				break
+			}
+		}
+	}
+	return nil
+}
+
+// MarkDoomedForTest is a test-only mutator that sets the Doomed flag
+// on the SerializableXact for handle. Mirrors PostgreSQL's
+// `SXACT_FLAG_DOOMED` so we can exercise the "self is already doomed"
+// branch of PreCommitCheckForSerializationFailure without driving a
+// full dangerous-structure scan.
+//
+// Returns true if the flag was set, false if the handle is not
+// registered. Not exported under a non-test name because production
+// callers must reach the Doomed bit through the pre-commit scan.
+func (m *Manager) MarkDoomedForTest(handle TxnHandle) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ssiState.xacts == nil {
+		return false
+	}
+	sx, ok := m.ssiState.xacts[handle]
+	if !ok || sx == nil {
+		return false
+	}
+	sx.Doomed = true
+	return true
+}
+
+// IsDoomedForTest reports whether the SerializableXact for handle has
+// been doomed. Test-only diagnostic; production callers must consult
+// the pre-commit scan's return value rather than this flag directly.
+func (m *Manager) IsDoomedForTest(handle TxnHandle) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ssiState.xacts == nil {
+		return false
+	}
+	sx, ok := m.ssiState.xacts[handle]
+	if !ok || sx == nil {
+		return false
+	}
+	return sx.Doomed
+}

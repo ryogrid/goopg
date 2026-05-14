@@ -381,6 +381,24 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	if state.isolation != tx.Isolation {
 		return fmt.Errorf("mvcc: transaction isolation mismatch handle=%d", tx.Handle)
 	}
+	// M0104-0006: run the pre-commit dangerous-structure scan before
+	// any side effects. On detection, return a typed
+	// *SerializationFailureError so the executor can surface
+	// SQLSTATE 40001 and call Rollback to perform the actual
+	// cleanup. The transaction remains in m.active until the caller
+	// rolls back, mirroring upstream's `ereport(ERROR, ...)` flow
+	// out of `PreCommit_CheckForSerializationFailure`.
+	//
+	// Pre-commit also runs the doom-the-pivot scan that may transition
+	// peers into the doomed state; this MUST happen while the
+	// committing xact is still addressable through ssiState.xacts and
+	// BEFORE releaseSerializableLocked scrubs its edges from peers,
+	// because the scan walks `me.inConflicts -> pivot.inConflicts`.
+	if state.isolation == IsolationSerializable && kind == XactCommit {
+		if err := m.preCommitCheckForSerializationFailureLocked(tx.Handle); err != nil {
+			return err
+		}
+	}
 	// M0093: invoke the xactMarker hook only when the transaction
 	// was assigned a real XID. Read-only commits skip the hook
 	// entirely — no WAL XactCommit record, no fsync, no clog

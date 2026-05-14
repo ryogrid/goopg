@@ -1753,10 +1753,67 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
         `_PeerEdgesScrubbedOnReaderCommit`.
         Design doc: `docs/design/0104-0005-ssi-conflict-in-hook.md`.
 
-- [ ] **M0104-0006**
+- [x] **M0104-0006**
       - Summary: Pre-commit dangerous-structure detection.
-      - Add pre-commit serialization-failure checks and abort with SQLSTATE
-        `40001` when rw-conflict graph conditions require rollback.
+      - Closed 2026-05-14: `Manager.PreCommitCheckForSerializationFailure`
+        (`internal/mvcc/ssi_precommit.go`) is the goopg analogue of
+        PostgreSQL's `PreCommit_CheckForSerializationFailure`
+        (`postgres/src/backend/storage/lmgr/predicate.c`). Walks the
+        rw-conflict graph reachable from the committing SERIALIZABLE
+        transaction: if `me.Doomed` is set, return
+        `*SerializationFailureError` (SQLSTATE 40001, reason "Canceled
+        on identification as a pivot, during commit attempt");
+        otherwise walk `me.inConflicts` for each pivot, walk pivot's
+        `inConflicts` for each Tin candidate, and set `pivot.Doomed =
+        true` when (Tin == me) — the 2-cycle write-skew case — or
+        when (Tin is in-flight and not doomed) — the 3-cycle generic
+        dangerous structure case. The committing xact itself is never
+        doomed by its own scan (mirrors upstream's "letting it commit
+        ensures progress" policy). Hook fires from `Manager.finish` at
+        the top of the SERIALIZABLE + XactCommit branch, BEFORE the
+        WAL xact-marker hook, BEFORE `releaseSerializableLocked`,
+        BEFORE `delete(m.active, handle)` — on detection the
+        transaction stays in `m.active` and the caller MUST invoke
+        `Manager.Rollback(tx)` to drive the actual abort. New typed
+        error `mvcc.SerializationFailureError` (`Reason string`,
+        `Error()`, `SQLSTATE()` returning `"40001"`) + convenience
+        predicate `mvcc.IsSerializationFailure(err)`. Test-only
+        mutators `Manager.MarkDoomedForTest` / `Manager.IsDoomedForTest`
+        expose the internal Doomed bit; production callers must reach
+        the bit through the pre-commit scan. Zero footprint for RC/RR
+        (never registered in `ssiState.xacts` — single map probe
+        exits) and read-only SERIALIZABLE workloads (empty inConflicts
+        slice — outer for-loop iterates zero times). 8 regression
+        pins in `internal/mvcc/ssi_precommit_test.go`:
+        `TestPreCommitCheck_NoOpForRC`,
+        `_NoOpForReadOnlySerializable`,
+        `_AlreadyDoomedReturns40001`,
+        `_WriteSkewDoomsPivot` (canonical 2-cycle via write-path hook
+        end-to-end through Manager.finish — pins the M0104 DoD
+        anomaly pattern at the mvcc layer),
+        `_ThreeNodeCycleDoomsPivot`, `_LinearChainIsSafe`,
+        `_FinishedPivotIgnored`, `_IdempotentDoomedPivot`.
+        Design doc:
+        `docs/design/0104-0006-precommit-dangerous-structure-detection.md`.
+        Out of scope for this slice (staged for M0104-0007/beyond):
+        executor read/write-path call-site wiring for
+        `Manager.CheckForSerializableConflictOut` /
+        `Manager.CheckForSerializableConflictIn`; executor-level
+        `*SerializationFailureError` → `ExecError{Code: "40001"}`
+        conversion in `execCommit`; upstream's
+        `OnConflict_CheckForSerializationFailure` per-edge synchronous
+        check (pre-commit scan is sufficient for the M0104 DoD; the
+        per-edge variant is a pure addition that the polarity-agnostic
+        `registerRWConflictLocked` helper is the natural injection
+        point for, with `SerializationFailureError.Reason` already
+        future-proofed for the upstream "Canceled on conflict out to
+        pivot %u" phrasing); post-commit retention so committed xacts
+        stay conflict-relevant past `FinishedAt` (current substrate
+        scrubs at finish; scan is correct because it runs WHILE the
+        committing xact is still addressable and BEFORE peer-scrub);
+        READ ONLY distinct lifecycle (upstream's READ-ONLY-Tin
+        optimisation skipped — conservative absence is only false
+        positives); 2PC PREPARE TRANSACTION interactions.
 
 - [ ] **M0104-0007**
       - Summary: Oracle isolation-test promotion for SSI coverage.
