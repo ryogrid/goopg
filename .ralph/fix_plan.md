@@ -2648,6 +2648,63 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       The `t.Skip` on `TestPort_PgoutputInteropGoopgToPG` stays
       in place per the rung protocol; next rung lands with its
       own design doc once a live probe surfaces the next gap.
+      PARTIAL PROGRESS 2026-05-14 (loop 17): closed rung 15 —
+      `pg_get_publication_tables.relid` vs `pg_class.oid` shape
+      mismatch.  Design doc:
+      `docs/design/0103-0021-pg-get-publication-tables-relid-matches-pg-class-oid.md`
+      (accepted).
+      Diagnosis: lifting `t.Skip` after rung 14 produced a new
+      failure mode — the apply worker connected, decoded every
+      `'w'` frame (acks `recv=0/146` for all four transactions),
+      but `count(*)` on the subscriber stayed at 0. Tablesync
+      never launched. Query-trace `slog.Info` in `handleQuery`
+      revealed that CREATE SUBSCRIPTION sends the PG18
+      `fetch_table_list`:
+      `SELECT DISTINCT n.nspname, c.relname, gpt.attrs`
+      `  FROM pg_class c`
+      `    JOIN pg_namespace n ON n.oid = c.relnamespace`
+      `    JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*`
+      `           FROM pg_publication WHERE pubname IN ( 'p' )) AS gpt`
+      `        ON gpt.relid = c.oid`
+      and the result is zero rows, with no SQL error. Root cause:
+      `buildPgGetPublicationTablesRows`
+      (`internal/executor/operators_pg_get_publication_tables.go`)
+      emitted `relid` as `NewIntDatum(int64(t.OID))`, while
+      goopg's virtual `pg_catalog.pg_class.oid` stores the
+      relation NAME as text (the v0 convention — see the design
+      note at `catalog.go:707-712`: "regclass casts are no-ops in
+      v0 — pgbench's `oid=$1::pg_catalog.regclass` ends up
+      comparing the bound text parameter (the table name)
+      against pg_class.oid").  `compareDatum(KindInt,
+      KindString)` falls back to `strings.Compare(a.Format(),
+      b.Format())`, so the join evaluates `"16384" = "t"` and
+      never matches; `pg_subscription_rel` stays empty,
+      tablesync's launcher never fires, and the apply worker's
+      `should_apply_changes_for_rel(rel)` returns false for
+      every relation.
+      Fix: emit `relid` as `NewStringDatum(t.Name)` so the SRF
+      aligns with the v0 catalog convention (NULL only when
+      `t.Name == ""`).
+      Pinned by `TestPgGetPublicationTablesRelidMatchesPgClassOid`
+      in `internal/executor/operators_pg_get_publication_tables_test.go`:
+      registers a user table, creates a publication, runs the
+      join shape `SELECT c.relname, gpt.relid FROM pg_class c
+      JOIN (SELECT * FROM pg_get_publication_tables('p')) AS gpt
+      ON gpt.relid = c.oid`, asserts exactly one row with
+      `relname == relid == "items"`.
+      Verification (loop 17): focused executor / planner /
+      analyzer / catalog / parser / server / wal / storage /
+      testport suites recorded at commit time. The `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` stays in place per the
+      rung protocol; the rung-16 diagnosis (tablesync's
+      `fetch_remote_table_info` first sub-query expects
+      `pg_class.oid` to wire-decode as a numeric OID via
+      `DatumGetObjectId`, so when goopg sends the relation name
+      text "t" libpqrcv parses it as uint32 → 0 and the
+      subsequent `WHERE gpt.relid = 0` column-list LATERAL
+      query then matches zero rows) is quoted verbatim in the
+      `t.Skip` message so the next loop resumes from the exact
+      surface.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

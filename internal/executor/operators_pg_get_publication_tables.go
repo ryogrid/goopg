@@ -104,12 +104,22 @@ func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) 
 		}
 		tables := publicationTablesForCtx(ctx, pub)
 		for _, t := range tables {
-			oid := t.OID
+			// M0103-0008 rung 15: emit relid as the relation NAME so the
+			// JOIN `gpt.relid = c.oid` in CREATE SUBSCRIPTION's
+			// `fetch_table_list` matches goopg's `pg_class.oid` column —
+			// which v0 also stores as the relation name (see
+			// `catalog.go::registerSystemTables` and the design note at
+			// `catalog.go:707-712`: "regclass casts are no-ops in v0").
+			// Emitting the numeric `t.OID` made the join silently produce
+			// zero rows because `compareDatum(KindInt, KindString)` falls
+			// back to `Format()`-based string compare, which compares
+			// e.g. `"16384"` vs `"t"` and never matches. NULL is reserved
+			// for the corner case of an unresolved table (Name == "").
 			var relidDatum Datum
-			if oid == 0 {
+			if t.Name == "" {
 				relidDatum = NullDatum
 			} else {
-				relidDatum = NewIntDatum(int64(oid))
+				relidDatum = NewStringDatum(t.Name)
 			}
 			rows = append(rows, Row{
 				relidDatum,

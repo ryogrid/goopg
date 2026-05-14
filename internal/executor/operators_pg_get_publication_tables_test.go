@@ -391,6 +391,50 @@ func TestLateralPgGetPublicationTablesUnknownYieldsZero(t *testing.T) {
 
 // contains is a 1-line strings.Contains shim local to this file to avoid
 // dragging in strings just for one assertion.
+// TestPgGetPublicationTablesRelidMatchesPgClassOid pins rung 15 of
+// M0103-0008: gpt.relid must compare equal to pg_class.oid so that PG's
+// CREATE SUBSCRIPTION fetch_table_list join — `JOIN ... AS gpt ON
+// gpt.relid = c.oid` — produces a non-empty result set. v0's pg_class.oid
+// stores the relation NAME as text (regclass cast is a no-op for pgbench
+// compatibility); pg_get_publication_tables must therefore emit relid in
+// the same shape. Before the fix, relid was a numeric OID (e.g. 16384) and
+// the comparison `"16384" = "t"` silently produced zero rows, leaving
+// `pg_subscription_rel` empty and the apply worker skipping every change.
+func TestPgGetPublicationTablesRelidMatchesPgClassOid(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Direct shape: SRF on the inside, pg_class on the outside, JOIN on
+	// the gpt.relid = c.oid equality. The PG18 fetch_table_list also
+	// joins pg_namespace and an aggregate subquery, but the minimum
+	// pre-condition under test is that gpt.relid compares equal to
+	// pg_class.oid for the same user table.
+	rows := runQueryRows(t, ctx,
+		"SELECT c.relname, gpt.relid FROM pg_class c "+
+			"JOIN ( SELECT * FROM pg_get_publication_tables('p') ) AS gpt "+
+			"ON gpt.relid = c.oid")
+	if len(rows) != 1 {
+		t.Fatalf("join row count = %d, want 1 (single published table)", len(rows))
+	}
+	if rows[0][0].IsNull() {
+		t.Fatalf("rows[0].relname is NULL, want \"items\"")
+	}
+	if got := rows[0][0].StringValue(); got != "items" {
+		t.Fatalf("rows[0].relname = %q, want \"items\"", got)
+	}
+	if rows[0][1].IsNull() {
+		t.Fatalf("rows[0].relid is NULL, want \"items\" (matching pg_class.oid)")
+	}
+	if got := rows[0][1].StringValue(); got != "items" {
+		t.Fatalf("rows[0].relid = %q, want \"items\" (matching pg_class.oid)", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

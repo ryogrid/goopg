@@ -372,21 +372,81 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	//     `docs/design/0103-0019-lateral-pg-catalog-qualified-srf.md`.
 	//     Pinned by `TestParseLateralPgCatalogQualifiedSRF` in
 	//     `internal/parser/select_test.go`.
-	//   - rung 14 (NEW, OPEN): `pg_class.relnatts` column missing.
-	//     With rung 13 closed, the live probe's parse succeeds and
-	//     `fetch_table_list_from_publisher` reaches execution, but
-	//     goopg's `pg_class` virtual table does not expose `relnatts`
-	//     (number of attributes per relation). The CASE expression
-	//     `array_length(gpt.attrs, 1) = c.relnatts` therefore raises
-	//     SQLSTATE 42703 `column "relnatts" does not exist`, the
-	//     CREATE SUBSCRIPTION still registers ZERO tables, and the
-	//     apply worker still silently skips every change. Closing
-	//     requires adding `relnatts int2` to goopg's `pg_class`
-	//     virtual view (column count derivable from
-	//     `*catalog.Table.Columns`).
-	t.Skip("M0103-0008 rung 13 closed in 0103-0019; rung 14 " +
-		"(pg_class.relnatts column missing) deferred to a follow-up " +
-		"loop so each live-probe rung lands with its own design doc.")
+	//   - rung 14 (loop 16, CLOSED): `pg_class.relnatts` column missing.
+	//     With rung 13 closed, the live probe's parse succeeded and
+	//     reached execution, but goopg's `pg_class` virtual table did
+	//     not expose `relnatts`. The CASE expression
+	//     `array_length(gpt.attrs, 1) = c.relnatts` therefore raised
+	//     SQLSTATE 42703 `column "relnatts" does not exist`. Closed
+	//     by adding a 9th column `relnatts int4` at ordinal 8 to the
+	//     virtual `pg_catalog.pg_class` view, populated as
+	//     `len(t.Columns)` per row (user-column count, since v0 has
+	//     no system columns). Design:
+	//     `docs/design/0103-0020-pg-class-relnatts-column.md`. Pinned
+	//     by `TestPgClassExposesRelNatts` in
+	//     `internal/catalog/catalog_test.go`.
+	//   - rung 15 (loop 17, CLOSED): `pg_get_publication_tables.relid`
+	//     vs `pg_class.oid` shape mismatch.  Lifting the `t.Skip`
+	//     after rung 14 produced a new failure mode: the apply worker
+	//     connected, decoded every `'w'` frame (acks `recv=0/146`
+	//     for all four transactions), but `count(*)` on the subscriber
+	//     stayed at 0. Query-trace logging in `handleQuery` showed
+	//     that CREATE SUBSCRIPTION sent the PG18 `fetch_table_list`
+	//     query
+	//       `SELECT DISTINCT n.nspname, c.relname, gpt.attrs
+	//          FROM pg_class c
+	//            JOIN pg_namespace n ON n.oid = c.relnamespace
+	//            JOIN ( SELECT (pg_get_publication_tables(
+	//                              VARIADIC array_agg(pubname::text))).*
+	//                   FROM pg_publication
+	//                   WHERE pubname IN ( 'p' )) AS gpt
+	//                ON gpt.relid = c.oid`
+	//     and the result was zero rows (no SQL error). Root cause:
+	//     `buildPgGetPublicationTablesRows` emitted `relid` as
+	//     `NewIntDatum(int64(t.OID))`, while goopg's virtual
+	//     `pg_catalog.pg_class.oid` stores the relation NAME as text
+	//     (the v0 "regclass cast is a no-op" convention — see
+	//     `catalog.go:707-712`). `compareDatum(KindInt, KindString)`
+	//     falls back to `strings.Compare(a.Format(), b.Format())`, so
+	//     the join evaluated `"16384" = "t"` and never matched.
+	//     `pg_subscription_rel` stayed empty, tablesync never
+	//     launched, and the apply worker's
+	//     `should_apply_changes_for_rel` returned false for every
+	//     relation.  Closed by emitting `relid` as
+	//     `NewStringDatum(t.Name)` so the SRF matches the established
+	//     `pg_class.oid` shape. Design:
+	//     `docs/design/0103-0021-pg-get-publication-tables-relid-matches-pg-class-oid.md`.
+	//     Pinned by `TestPgGetPublicationTablesRelidMatchesPgClassOid`
+	//     in
+	//     `internal/executor/operators_pg_get_publication_tables_test.go`.
+	//   - rung 16 (NEW, OPEN): tablesync's `fetch_remote_table_info`
+	//     first sub-query expects `pg_class.oid` to wire-decode as
+	//     a numeric OID, not a relation name. After rung 15 closes,
+	//     `pg_subscription_rel` is populated and the tablesync worker
+	//     launches; its first probe is
+	//       `SELECT c.oid, c.relreplident, c.relkind
+	//          FROM pg_catalog.pg_class c
+	//          INNER JOIN pg_catalog.pg_namespace n
+	//                ON (c.relnamespace = n.oid)
+	//         WHERE n.nspname = 'public' AND c.relname = 't'`
+	//     with `tableRow[] = {OIDOID, CHAROID, CHAROID}`. goopg sends
+	//     `c.oid` as the relation name text (the v0 convention),
+	//     libpqrcv decodes it via `DatumGetObjectId` (it parses "t"
+	//     as a uint32 → 0), so `lrel->remoteid` becomes 0 and the
+	//     subsequent `WHERE gpt.relid = 0 AND c.oid = gpt.relid`
+	//     column-list query returns zero rows. Closing rung 16 needs
+	//     either (a) a per-row coercion path so `pg_class.oid` wire-
+	//     serialises as the table's numeric OID when the client
+	//     decodes it as OID, while still comparing as text in joins,
+	//     or (b) flipping the v0 convention to store numeric OIDs in
+	//     `pg_class.oid` AND making the `::regclass` cast resolve
+	//     names. (a) is local; (b) is a catalog-OID consistency pass.
+	t.Skip("M0103-0008 rung 15 closed in 0103-0021; rung 16 " +
+		"(tablesync's fetch_remote_table_info wire-decodes pg_class.oid " +
+		"as numeric — `lrel->remoteid` parses the relation name text as " +
+		"uint32 and gets 0, so the column-list LATERAL query then matches " +
+		"zero rows) deferred to a follow-up loop so each live-probe rung " +
+		"lands with its own design doc.")
 
 	repo := repoRoot(t)
 	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
