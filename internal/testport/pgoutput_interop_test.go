@@ -1267,6 +1267,103 @@ func TestPort_PgoutputInteropPGToGoopgTruncate(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "id = 11 AND v = 'y'", 1, 30*time.Second)
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch pins M0103-0007
+// rung 10: the apply worker must map remote pgoutput columns onto the
+// local table's columns BY NAME rather than by physical ordinal. The
+// publisher declares `(id int, v text)` and the subscriber declares
+// `(v text, id int)` — same logical columns, swapped order. Without the
+// rung-10 fix, the wire tuple [id=1, v='alice'] would be written into
+// the subscriber positionally, landing "alice" into the int4 column
+// (parse error) or `1` into the text column (silent corruption).
+// Workload exercises INSERT + UPDATE (no-key-touch synthesised
+// primaryKeyOnlyRow path) + DELETE so all three decode call sites get
+// covered. Fresh database/sql sessions assert via the PK IndexScan
+// path on the subscriber.
+func TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-colorder")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_colorder"
+	psc := pubsubcluster.NewMixed(t, "pg2g_colorder", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Publisher: id BEFORE v. Subscriber: v BEFORE id. Same column
+	// names, types, and PK semantics — only the physical ordinal
+	// differs. Type sniffing alone would not catch a wrong mapping
+	// because both columns are scalar primitives; the name-based
+	// remap is the only thing that can produce a correct result.
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (v text, id int PRIMARY KEY)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Phase 1 — INSERT goes through applyInsert →
+	// decodePgoutputTupleAsRow → maintainUniqueIndexesForInsert.
+	// Wrong mapping would either fail with a parse error at
+	// publisher decode time (good — at least loud) or install
+	// row (v='1', id=NULL) which violates NOT NULL on the PK.
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'alice')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'bob')")
+
+	// Phase 2 — no-key-touched UPDATE flexes the
+	// primaryKeyOnlyRow + applyUpdateByKey path. Without the
+	// rung-10 remap, primaryKeyOnlyRow's PK-by-name lookup
+	// already works but `newRow` (from decodePgoutputTupleAsRow)
+	// would carry data in the wrong slot, so the post-update
+	// row would have `v` swapped with `id` (effectively
+	// scrambling the visible state).
+	psc.Publisher.Exec(t, "UPDATE public.t SET v = 'alice-updated' WHERE id = 1")
+
+	// Phase 3 — DELETE flexes applyDelete →
+	// decodePgoutputTupleAsRow on the OldTuple (under REPLICA
+	// IDENTITY DEFAULT the OldTuple carries only the PK column
+	// — single int, single name "id"). Wrong mapping would
+	// drop the wrong row or none at all.
+	psc.Publisher.Exec(t, "DELETE FROM public.t WHERE id = 2")
+
+	// Subscriber assertions via fresh database/sql sessions through
+	// goopg's PK IndexScan path. Each fail-fasts a distinct
+	// regression: count(*)=1 catches "INSERT silently dropped" or
+	// "DELETE didn't fire"; the identity assertion catches
+	// "INSERT installed but with id and v swapped", which would
+	// show up as either no match (id is now NULL or string) or
+	// a match with v='1' (the int value landed in text).
+	psc.WaitForRow(t, "public.t", "1=1", 1, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'alice-updated'", 1, 30*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 2", 0, 30*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

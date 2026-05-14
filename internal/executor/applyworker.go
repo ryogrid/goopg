@@ -744,8 +744,26 @@ func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.
 	if len(tup) != len(remoteCols) {
 		return nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
 	}
-	if len(localCols) < len(remoteCols) {
-		return nil, nil, fmt.Errorf("local table has %d cols, remote sent %d", len(localCols), len(remoteCols))
+	// Build remote-ordinal → local-ordinal map by column name. PG's
+	// apply worker resolves attributes by name (not by position) so
+	// that subscriber DDL can carry the columns in a different order
+	// or add extra columns the publisher doesn't have. Both sides
+	// emit catalog-normalised lowercase names — for unquoted DDL the
+	// names match directly; quoted-identifier mismatches surface as
+	// the explicit error below.
+	localIdx := make([]int, len(remoteCols))
+	for i, rc := range remoteCols {
+		found := -1
+		for j, lc := range localCols {
+			if lc.Name == rc.Name {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			return nil, nil, fmt.Errorf("remote col %q has no matching local column", rc.Name)
+		}
+		localIdx[i] = found
 	}
 	row := make(Row, len(localCols))
 	unchanged := make([]bool, len(localCols))
@@ -753,19 +771,20 @@ func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.
 		row[i] = NullDatum
 	}
 	for i, col := range tup {
-		local := localCols[i]
+		j := localIdx[i]
+		local := localCols[j]
 		switch col.Status {
 		case 'n':
-			row[i] = NullDatum
+			row[j] = NullDatum
 		case 't':
 			d, err := parsePgoutputText(local.Type, col.Bytes)
 			if err != nil {
 				return nil, nil, fmt.Errorf("col %q: %w", local.Name, err)
 			}
-			row[i] = d
+			row[j] = d
 		case 'u':
-			row[i] = NullDatum
-			unchanged[i] = true
+			row[j] = NullDatum
+			unchanged[j] = true
 		default:
 			return nil, nil, fmt.Errorf("col %q: unknown status %q", local.Name, col.Status)
 		}

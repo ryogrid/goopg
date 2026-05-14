@@ -2245,6 +2245,72 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         pgbench against PG publisher with `pgbench_history`
         polling, proto_version=2 streaming subxacts, kill -9 +
         libpq multi-host reconnect plumbing on the client side.
+      PARTIAL PROGRESS 2026-05-14 (rung 10): column-order remap
+      in the apply worker — first apply-worker gap closure since
+      rung 9. Design doc:
+      `docs/design/0103-0033-m0103-0007-rung-10-pg-to-goopg-column-order.md`
+      (accepted). Rungs 1–9 covered every DML/TRUNCATE pgoutput
+      shape but assumed publisher and subscriber tables shared
+      identical physical column ordering.
+      `decodePgoutputTupleAsRow` indexed `localCols[i]` with the
+      remote ordinal `i` and wrote `row[i] = d`, so a
+      swapped-order subscriber table either crashed with a parse
+      error (text-into-int4 at the same wire ordinal) or
+      installed silently-corrupted heap rows (values landed in
+      the wrong slots). PG's apply worker resolves attributes by
+      name via `remoterel->attmap[]` (`apply_handle_insert_internal`
+      → `logicalrep_rel_open` upstream); goopg now matches.
+      Fix: `decodePgoutputTupleAsRow` (single helper used by
+      INSERT, UPDATE new-tuple, UPDATE old-tuple, DELETE
+      old-tuple) builds a per-call `localIdx []int` map where
+      `localIdx[i] = j` is the position of `remoteCols[i].Name`
+      inside `localCols`. The returned `Row` is sized to
+      `len(localCols)` and indexed by LOCAL position; the
+      `unchanged` mask stays in lockstep so
+      `applyUpdateByKey`'s `'u'` fill loop (`newRow[i] =
+      matched[i]` for unchanged cells) remains valid.
+      Unmatched remote columns return an explicit error rather
+      than silently dropping the value — symmetric with PG's
+      behaviour and load-bearing for catching subscriber DDL
+      drift early. Subscriber columns missing on the publisher
+      remain `NullDatum` (existing init behaviour); DEFAULT-value
+      support for that asymmetric case stays out of scope for
+      this rung. When publisher and subscriber declare columns
+      in identical order — the rungs 1–9 case — `localIdx[i] ==
+      i` for every `i` and the behaviour is identical, no
+      regressions in the existing suite. Pinned by
+      `TestApplyWorkerDecodeRemapsReorderedColumns` and
+      `TestApplyWorkerDecodeRejectsUnmatchedRemoteCol` (unit,
+      `internal/executor/applyworker_test.go`) and the live E2E
+      `TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch`
+      (`internal/testport/pgoutput_interop_test.go`): publisher
+      `(id int PK, v text)` + subscriber `(v text, id int PK)`
+      with workload INSERT×2 + no-key-touch UPDATE + DELETE,
+      asserts via fresh `database/sql` sessions through PK
+      IndexScan that `count(*) = 1`, `id = 1 AND v =
+      'alice-updated'` returns 1, `id = 2` returns 0. Each
+      assertion fail-fasts a distinct regression: `count(*)=1`
+      catches INSERT silently dropped / DELETE didn't fire; the
+      identity assertion catches "INSERT installed but with id
+      and v swapped" (either no match because id is now NULL or
+      string, or a match against v='1' because the int value
+      landed in the text column).
+      Verification (rung 10):
+      `go test -count=1 -timeout 60s
+      -run "TestApplyWorker|TestPrimaryKeyOnlyRow"
+      ./internal/executor/` → PASS (~0.02 s);
+      `go test -count=1 -timeout 120s
+      -run TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch
+      ./internal/testport/` → PASS (~2.0 s); all 10
+      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+      (~17.2 s); `go test -race -count=1 -timeout 300s
+      ./internal/executor/ ./internal/wal/ ./internal/catalog/
+      ./internal/testutil/pubsubcluster/` → all green. Next
+      rungs (deferred within M0103-0007): pgbench against PG
+      publisher with `pgbench_history` polling, proto_version=2
+      streaming subxacts, kill -9 + libpq multi-host reconnect
+      plumbing on the client side, DEFAULT-value handling for
+      subscriber-extra columns.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

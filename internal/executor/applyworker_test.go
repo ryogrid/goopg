@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -206,6 +207,70 @@ func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
 	}
 	if _, _, err := decodePgoutputTupleAsRow(remoteCols[:1], localCols[:1], tupBad); err == nil {
 		t.Errorf("unknown status: expected error, got nil")
+	}
+}
+
+
+// TestApplyWorkerDecodeRemapsReorderedColumns pins M0103-0007 rung 10:
+// when publisher and subscriber declare the same columns in a different
+// physical order, decodePgoutputTupleAsRow must look up local positions
+// by name (matching PG's apply worker behaviour) rather than blindly
+// copying remote ordinal i → local ordinal i. Without the fix the int4
+// 'id' value would land in the local text 'v' slot and parsePgoutputText
+// would parse "alice" as int4, returning an error.
+func TestApplyWorkerDecodeRemapsReorderedColumns(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},
+		{Name: "v", TypeOID: 25},
+	}
+	// Local table declares v BEFORE id — different physical order.
+	localCols := []catalog.Column{
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("7")},
+		{Status: 't', Bytes: []byte("alice")},
+	}
+	row, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row) != 2 {
+		t.Fatalf("row len=%d want 2", len(row))
+	}
+	// Row is indexed by LOCAL position: row[0] holds v (text "alice"),
+	// row[1] holds id (int 7).
+	if row[0].IsNull() || string(row[0].Buf) != "alice" {
+		t.Errorf("row[0] (local v) = %#v, want text \"alice\"", row[0])
+	}
+	if row[1].Int != 7 {
+		t.Errorf("row[1] (local id) = %#v, want int 7", row[1])
+	}
+}
+
+// TestApplyWorkerDecodeRejectsUnmatchedRemoteCol guards the symmetric
+// error path: if the publisher carries a column the subscriber's table
+// doesn't have, the decoder must refuse rather than silently dropping
+// the wire byte. PG's apply worker raises the same error condition.
+func TestApplyWorkerDecodeRejectsUnmatchedRemoteCol(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},
+		{Name: "extra_on_publisher", TypeOID: 25},
+	}
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("1")},
+		{Status: 't', Bytes: []byte("x")},
+	}
+	_, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err == nil {
+		t.Fatalf("expected error for unmatched remote col, got nil")
+	}
+	if !strings.Contains(err.Error(), "extra_on_publisher") {
+		t.Errorf("error %q must mention the unmatched col name", err.Error())
 	}
 }
 
