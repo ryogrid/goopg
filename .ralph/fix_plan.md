@@ -1844,6 +1844,98 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       helper, pgbench-on-goopg is out of scope); wait ~60 s; `kill -9
       <goopg-pid>`; libpq multi-host reconnect; INSERT on PG succeeds;
       verify per mode (same DoD).
+      PARTIAL PROGRESS 2026-05-14 (loop 2): probe-survival foundation
+      landed for libpqrcv `fetch_table_list` (the next publisher-side
+      probe after Gap 1 from M0103-0004 loop 3).
+      Design doc: `docs/design/0103-0006-variadic-and-pg-get-publication-tables.md`.
+      Changes:
+      - Parser accepts the `VARIADIC` keyword on FuncCall arguments in
+        both target-list position (`parseFuncCallTail`) and FROM-clause
+        SRF position (the `srfFuncName != ""` branch of `parseRangeVar`).
+        Implemented as a per-argument no-op marker recorded in a new
+        `FuncCall.Variadic []bool` slice parallel to `Args`. Pinned by
+        `TestParseFuncCallVariadicArgument` and `TestParseFuncCallVariadicMixed`
+        in `internal/parser/select_test.go`.
+      - `pg_get_publication_tables(VARIADIC text[])` registered as a
+        FROM-clause SRF returning `(relid oid, attrs text, qual text)`.
+        New plan node `planner.PgGetPublicationTables`; new operator
+        `executor.pgGetPublicationTablesOp` driven by `*catalog.PubSub`
+        + `*catalog.InMemory.AllTables` (type-asserted) for `AllTables`
+        publications. `attrs`/`qual` always NULL (goopg does not model
+        column lists or row-filter quals); `relid` is the live OID of
+        every published `*catalog.Table`. Pinned by 4 tests in
+        `internal/executor/operators_pg_get_publication_tables_test.go`.
+      Next barrier (deferred within M0103-0008 scope): upstream's
+      `fetch_table_list` query uses `(pg_get_publication_tables(...)).*`
+      in **scalar position** to expand the composite return type into
+      multiple columns. goopg's planner does not yet implement composite
+      expansion in target-list position. The SRF already returns the
+      three-column shape upstream expects, so the planner work is the
+      sole remaining piece. `array_agg(text)` has not been verified;
+      may need to land alongside.
+      Verification: `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/executor/
+      ./internal/server/ ./internal/wal/ ./internal/catalog/` →
+      all green (parser 1.050 s, planner 1.065 s, executor 2.646 s,
+      server 3.588 s, wal 3.116 s, catalog 1.022 s).
+      PARTIAL PROGRESS 2026-05-14 (loop 3): IndirectionStar `(expr).*`
+      postfix syntax + parser/planner rewrite + `array_agg` aggregate
+      landed. Design doc:
+      `docs/design/0103-0007-indirection-star-and-array-agg.md`.
+      Changes:
+      - Parser: new `IndirectionStar{Source Expr}` AST node;
+        `parsePrimary` consumes `.*` after a closing `)` and wraps the
+        inner expression. New package-level
+        `RewriteIndirectionStarTargets(s, onAggregate)` walks a
+        SelectStmt's target list and rewrites every
+        `IndirectionStar{Source: *FuncCall}` into a FROM-clause SRF
+        reference (synthetic `__irs_N` alias). `parseSelect` invokes the
+        rewrite as its final step so nested SELECTs (subqueries inside
+        derived FROM items, subquery expressions, UNION branches) all
+        get rewritten too. Aggregate-arg cases (the actual probe shape)
+        are left in place at parse time.
+      - Planner: `Plan()` re-runs the same helper with a non-nil
+        `onAggregate` callback that emits a PG-compatible `0A000`
+        PlanError for aggregate-arg shapes. `planSelect` re-invokes it
+        for nested paths that bypass `Plan()`. `walkExpr` learnt the
+        `*parser.IndirectionStar` case.
+      - Analyzer: `analyzeExpr` accepts `*parser.IndirectionStar` as a
+        passthrough returning the synthetic `record` type so the
+        planner's PlanError (not the analyzer's generic
+        "unsupported expression") surfaces.
+      - Executor: `aggRuntime` gained `arrayElems []string` +
+        `arrayElemNull []bool`; `applyAgg` / `finishAgg` implement
+        `array_agg` properly via the existing `formatTextArray` helper
+        (PG text-array literal `{a,b,c}`). NULL elements remain
+        short-circuited upstream of the switch — sufficient for the
+        probe's `array_agg(pubname::text)` (`pg_publication.pubname` is
+        NOT NULL); NULL-element support deferred.
+      Tests: `TestParseIndirectionStarFuncCall`,
+      `TestParseIndirectionStarFetchTableList` (parser),
+      `TestIndirectionStarTargetListPlansAsFromSrf`,
+      `TestIndirectionStarRejectsAggregateArgument`, `TestArrayAggText`,
+      `TestIndirectionStarInsideDerivedSubquery` (t.Skip — documents
+      next gap).
+      Remaining for full probe survival (next sub-step):
+      (1) **ProjectSet for aggregate-arg SRFs.** The probe's
+          `(pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*`
+          shape needs an `Aggregate → ProjectSet(srf(arg))` plan
+          structure. The simple-rewrite path used here cannot move the
+          SRF into FROM when its args depend on aggregates evaluated
+          over the original FROM.
+      (2) **Derived-subquery schema propagation for SRF columns.** Even
+          when the IndirectionStar rewrite fires inside a derived FROM
+          subquery, the outer SELECT cannot resolve qualified column
+          references (`gpt.relid`) because the analyzer/planner do not
+          propagate a FROM-clause SRF's column list out through the
+          subquery wrapper's `__irs_0.*` target. Tracked via
+          `TestIndirectionStarInsideDerivedSubquery` (`t.Skip`).
+      Verification (loop 3): `go test -count=1 -timeout 180s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green (parser 0.013 s,
+      planner 0.020 s, analyzer 0.012 s, executor 1.171 s,
+      server 1.766 s, wal 1.900 s, catalog 0.005 s).
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

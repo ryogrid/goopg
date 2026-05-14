@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -200,7 +201,120 @@ func (p *parser) parseSelect() (Stmt, error) {
 		}
 		s.Locking = append(s.Locking, lc)
 	}
+	if err := RewriteIndirectionStarTargets(s, nil); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// RewriteIndirectionStarTargets scans the SELECT's target list for
+// `(srf(...)).*` IndirectionStar nodes and rewrites them in-place into a
+// FROM-clause set-returning function reference: the SRF is appended to
+// s.From under a synthetic alias `__irs_N` and the target becomes
+// qualified `__irs_N.*`. The optional `onAggregate` callback fires when
+// any SRF argument contains an aggregate function call — this is the
+// libpqrcv `fetch_table_list` probe shape and needs ProjectSet-style
+// composite-expansion support in the planner (not yet implemented). When
+// nil, aggregate-arg cases return a generic SyntaxError; the planner
+// supplies an onAggregate that builds a PG-compatible PlanError instead.
+// M0103-0008 probe-survival.
+func RewriteIndirectionStarTargets(s *SelectStmt, onAggregate func(pos int) error) error {
+	for i := range s.Targets {
+		is, ok := s.Targets[i].Expr.(*IndirectionStar)
+		if !ok {
+			continue
+		}
+		fc, ok := is.Source.(*FuncCall)
+		if !ok {
+			return &SyntaxError{Pos: is.Pos(),
+				Message: "(expr).* requires a function-call source"}
+		}
+		hasAgg := false
+		for _, a := range fc.Args {
+			if exprContainsAggregateCall(a) {
+				hasAgg = true
+				break
+			}
+		}
+		if hasAgg {
+			// Aggregate-in-args is the libpqrcv probe shape and
+			// requires ProjectSet support in the planner. The
+			// parser leaves IndirectionStar in place when called
+			// without an onAggregate (e.g. by parseSelect's
+			// post-pass): downstream layers may still need to see
+			// the AST. The planner supplies a non-nil onAggregate
+			// so its own pre-analyzer call surfaces a clean
+			// PG-compatible error.
+			if onAggregate != nil {
+				return onAggregate(is.Pos())
+			}
+			continue
+		}
+		alias := fmt.Sprintf("__irs_%d", i)
+		rv := RangeVar{
+			Alias: alias,
+			TableFunc: &TableFuncRef{
+				Name: fc.Name.String(),
+				Args: fc.Args,
+			},
+		}
+		s.From = append(s.From, rv)
+		if len(s.FromExprs) > 0 {
+			s.FromExprs = append(s.FromExprs, FromExpr{Base: rv})
+		}
+		s.Targets[i].Expr = &StarExpr{Table: alias}
+	}
+	return nil
+}
+
+// exprContainsAggregateCall walks e looking for a FuncCall whose name
+// matches one of PostgreSQL's standard aggregate functions. The list
+// mirrors planner.isAggregateFunc — kept local to the parser to keep
+// the rewrite layer self-contained (the parser does not otherwise know
+// "aggregate" as a category).
+func exprContainsAggregateCall(e Expr) bool {
+	switch x := e.(type) {
+	case *FuncCall:
+		if x.Over == nil && isParserAggregateName(x.Name.Name) {
+			return true
+		}
+		for _, a := range x.Args {
+			if exprContainsAggregateCall(a) {
+				return true
+			}
+		}
+	case *BinaryOp:
+		return exprContainsAggregateCall(x.Left) || exprContainsAggregateCall(x.Right)
+	case *UnaryOp:
+		return exprContainsAggregateCall(x.Operand)
+	case *CastExpr:
+		return exprContainsAggregateCall(x.Operand)
+	case *IsNullExpr:
+		return exprContainsAggregateCall(x.Operand)
+	case *IsBoolExpr:
+		return exprContainsAggregateCall(x.Operand)
+	case *IndirectionStar:
+		return exprContainsAggregateCall(x.Source)
+	}
+	return false
+}
+
+func isParserAggregateName(name string) bool {
+	switch strings.ToLower(name) {
+	case "count", "sum", "avg", "min", "max",
+		"var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev",
+		"corr", "covar_pop", "covar_samp",
+		"regr_count", "regr_sxx", "regr_syy", "regr_sxy",
+		"regr_avgx", "regr_avgy", "regr_r2", "regr_slope", "regr_intercept",
+		"bool_and", "bool_or", "every",
+		"bit_and", "bit_or", "bit_xor",
+		"string_agg", "array_agg", "json_agg", "jsonb_agg",
+		"json_object_agg", "jsonb_object_agg",
+		"xmlagg", "any_value",
+		"percentile_cont", "percentile_disc", "mode":
+		return true
+	}
+	return false
 }
 
 // parseLockingClause parses one `FOR { UPDATE | SHARE | NO KEY UPDATE |
@@ -569,12 +683,14 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
 
 	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
-	// Recognized: generate_series, pg_input_error_info, parse_ident.
+	// Recognized: generate_series, pg_input_error_info, parse_ident,
+	// pg_get_publication_tables (M0103-0008).
 	srfFuncName := ""
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" && obj.Schema == "" {
 		lower := strings.ToLower(obj.Name)
 		switch lower {
-		case "generate_series", "pg_input_error_info", "parse_ident":
+		case "generate_series", "pg_input_error_info", "parse_ident",
+			"pg_get_publication_tables":
 			srfFuncName = lower
 		}
 	}
@@ -582,11 +698,23 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		p.advance() // (
 		var args []Expr
 		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
-			a, err := p.parseExprList()
-			if err != nil {
-				return RangeVar{}, err
+			for {
+				// Accept (and ignore) a leading VARIADIC marker on this argument.
+				// libpqrcv's fetch_table_list probe emits the shape
+				// `pg_get_publication_tables(VARIADIC array_agg(...))` against a
+				// publisher (M0103-0008). The runtime operator already handles
+				// either spread or scalar shapes; the parser just needs to
+				// consume the keyword.
+				_ = p.acceptKeyword(KwVariadic)
+				e, err := p.parseExpr()
+				if err != nil {
+					return RangeVar{}, err
+				}
+				args = append(args, e)
+				if !p.acceptSymbol(",") {
+					break
+				}
 			}
-			args = a
 		}
 		if !p.acceptSymbol(")") {
 			return RangeVar{}, p.errAtCur("expected ')' after function arguments")
@@ -1295,6 +1423,17 @@ func (p *parser) parsePrimary() (Expr, error) {
 			if !p.acceptSymbol(")") {
 				return nil, p.errAtCur("expected ')'")
 			}
+			// `(expr).*` — composite-record star expansion. Upstream's
+			// libpqrcv `fetch_table_list` emits this shape against an
+			// SRF returning a composite type. Recognised here so the
+			// planner can route into a set-expanding plan. M0103-0008.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+				if nxt := p.peek(1); nxt.Kind == TokenSymbol && nxt.Value == "*" {
+					p.advance() // consume `.`
+					p.advance() // consume `*`
+					return &IndirectionStar{pos: t.Pos, Source: inner}, nil
+				}
+			}
 			return inner, nil
 		}
 	case TokenKeyword:
@@ -1793,11 +1932,19 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 			p.advance() // skip name
 			p.advance() // skip =>
 		}
+		// VARIADIC marker — used by libpqrcv fetch_table_list against
+		// `pg_get_publication_tables(VARIADIC array_agg(...))` (M0103-0008
+		// probe-survival). We record the flag in parallel to fc.Args; the
+		// argument itself is still parsed as a regular expression (the array
+		// passes through unchanged, which is exactly the spread-equivalent
+		// shape variadic-callees expect).
+		variadic := p.acceptKeyword(KwVariadic)
 		arg, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
 		fc.Args = append(fc.Args, arg)
+		fc.Variadic = append(fc.Variadic, variadic)
 		if p.acceptSymbol(",") {
 			continue
 		}

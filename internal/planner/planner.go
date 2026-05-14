@@ -33,6 +33,14 @@ func (e *PlanError) Error() string {
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
+		// Rewrite `(srf(...)).*` target-list indirection-stars into
+		// FROM-clause SRF references before the analyzer runs. The
+		// analyzer has no IndirectionStar handler — moving the
+		// rewrite here keeps the downstream pipeline free of the new
+		// AST node. M0103-0008 probe-survival.
+		if err := rewriteIndirectionStarTargets(s); err != nil {
+			return nil, err
+		}
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
@@ -251,6 +259,14 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 }
 
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	// M0103-0008: indirection-star rewrite runs at Plan() entry
+	// before the analyzer; nested-SELECT planning paths (subqueries,
+	// UNION branches) call planSelect directly without going through
+	// Plan, so we re-run the rewrite here as an idempotent pass.
+	if err := rewriteIndirectionStarTargets(s); err != nil {
+		return nil, err
+	}
+
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
@@ -1274,6 +1290,19 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	return inner, b, nil
 }
 
+// rewriteIndirectionStarTargets is a thin adapter that delegates to the
+// parser-level rewrite helper. M0103-0008 probe-survival: the rewrite
+// lives in the parser so every parsed SelectStmt (including nested
+// subqueries) gets the rewrite, while the aggregate-arg rejection (which
+// uses planner-side aggregate semantics) is surfaced here as a clean
+// PlanError.
+func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
+	return parser.RewriteIndirectionStarTargets(s, func(pos int) error {
+		return &PlanError{Pos: pos, Code: "0A000",
+			Message: "set-returning function with aggregate argument (e.g. (srf(array_agg(...))).*) requires ProjectSet support — not yet implemented (M0103-0008 next sub-step)"}
+	})
+}
+
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
 // Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
 // are supported.
@@ -1284,6 +1313,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "parse_ident") {
 		return planScalarFuncScan(rv, sourceIdx, "text[]")
+	}
+	if strings.EqualFold(tf.Name, "pg_get_publication_tables") {
+		return planPgGetPublicationTables(rv, sourceIdx)
 	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
@@ -1399,6 +1431,49 @@ func planPgInputErrorInfo(rv parser.RangeVar, sourceIdx int16) (Node, rangeBindi
 		},
 	}
 	node := &PgInputErrorInfo{pos: tf.Pos(), Value: val, Type: typ, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+
+// planPgGetPublicationTables routes a FROM-clause invocation of
+// `pg_get_publication_tables(VARIADIC text[])` into a `PgGetPublicationTables`
+// plan node. The publication-name argument is resolved as a regular expression;
+// the VARIADIC marker is recorded at parse time but ignored here — the runtime
+// operator accepts either a text[] (the VARIADIC spread shape) or any number
+// of plain text arguments. M0103-0008 probe-survival.
+func planPgGetPublicationTables(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := &resolveContext{}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		resolved, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, resolved)
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_publication_tables"
+	}
+	colNames := []string{"relid", "attrs", "qual"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"oid", "text", "text"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgGetPublicationTables{pos: tf.Pos(), Args: args, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -2492,6 +2567,8 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 				return err
 			}
 		}
+	case *parser.IndirectionStar:
+		return walkExpr(x.Source, fn)
 	}
 	return nil
 }

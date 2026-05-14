@@ -210,6 +210,112 @@ func TestParseSelectFunctionCall(t *testing.T) {
 	}
 }
 
+
+// TestParseFuncCallVariadicArgument pins parser acceptance of the VARIADIC
+// keyword as a prefix on a function-call argument. libpqrcv's
+// fetch_table_list probe emits this shape against
+// `pg_get_publication_tables`; the previous parser rejected it with a
+// "syntax error at or near 'variadic'" before reaching the planner.
+// M0103-0008.
+func TestParseFuncCallVariadicArgument(t *testing.T) {
+	stmts, err := Parse("SELECT pg_get_publication_tables(VARIADIC array_agg(x))")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := stmts[0].(*SelectStmt)
+	fc, ok := s.Targets[0].Expr.(*FuncCall)
+	if !ok {
+		t.Fatalf("expected FuncCall, got %T", s.Targets[0].Expr)
+	}
+	if fc.Name.Name != "pg_get_publication_tables" {
+		t.Fatalf("function name = %q, want pg_get_publication_tables", fc.Name.Name)
+	}
+	if len(fc.Args) != 1 || len(fc.Variadic) != 1 {
+		t.Fatalf("args=%d variadic=%d, want 1/1", len(fc.Args), len(fc.Variadic))
+	}
+	if !fc.Variadic[0] {
+		t.Fatalf("expected VARIADIC flag on arg 0, got false")
+	}
+}
+
+
+// TestParseIndirectionStarFuncCall — `(srf(args)).*` in target list emits
+// an IndirectionStar AST node wrapping the inner FuncCall. M0103-0008
+// probe-survival foundation.
+func TestParseIndirectionStarFuncCall(t *testing.T) {
+	// parseSelect runs RewriteIndirectionStarTargets at the end of the
+	// parse so non-aggregate (srf(consts)).* shapes are turned into a
+	// FROM-clause SRF reference plus a qualified `__irs_0.*` target.
+	// The IndirectionStar AST node only persists in the parse tree
+	// when the SRF arguments contain aggregates (aggregate-arg path is
+	// rejected by the planner pending ProjectSet support).
+	stmts, err := Parse("SELECT (pg_get_publication_tables('p')).*")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := stmts[0].(*SelectStmt)
+	star, ok := s.Targets[0].Expr.(*StarExpr)
+	if !ok {
+		t.Fatalf("after rewrite, target = %T, want *StarExpr", s.Targets[0].Expr)
+	}
+	if star.Table != "__irs_0" {
+		t.Fatalf("after rewrite, target qualifier = %q, want __irs_0", star.Table)
+	}
+	if len(s.From) != 1 {
+		t.Fatalf("after rewrite, len(From) = %d, want 1", len(s.From))
+	}
+	tf := s.From[0].TableFunc
+	if tf == nil {
+		t.Fatalf("after rewrite, From[0].TableFunc is nil")
+	}
+	if tf.Name != "pg_get_publication_tables" {
+		t.Fatalf("rewritten SRF name = %q", tf.Name)
+	}
+	if s.From[0].Alias != "__irs_0" {
+		t.Fatalf("rewritten SRF alias = %q, want __irs_0", s.From[0].Alias)
+	}
+}
+
+// TestParseIndirectionStarFetchTableList — pins parse of the upstream
+// libpqrcv fetch_table_list shape end-to-end (subquery with VARIADIC
+// array_agg + composite expansion). M0103-0008 probe-survival.
+func TestParseIndirectionStarFetchTableList(t *testing.T) {
+	q := `SELECT DISTINCT n.nspname, c.relname, gpt.attrs
+  FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*
+           FROM pg_publication
+           WHERE pubname IN ('p') ) AS gpt
+    ON gpt.relid = c.oid`
+	if _, err := Parse(q); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+}
+
+// TestParseFuncCallVariadicMixed pins parser acceptance of VARIADIC on the
+// trailing argument of a multi-argument call. Non-VARIADIC arguments must
+// retain Variadic[i]=false.
+func TestParseFuncCallVariadicMixed(t *testing.T) {
+	stmts, err := Parse("SELECT f(1, VARIADIC x)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := stmts[0].(*SelectStmt)
+	fc, ok := s.Targets[0].Expr.(*FuncCall)
+	if !ok {
+		t.Fatalf("expected FuncCall, got %T", s.Targets[0].Expr)
+	}
+	if len(fc.Args) != 2 || len(fc.Variadic) != 2 {
+		t.Fatalf("args=%d variadic=%d, want 2/2", len(fc.Args), len(fc.Variadic))
+	}
+	if fc.Variadic[0] {
+		t.Fatalf("arg 0 unexpectedly marked VARIADIC")
+	}
+	if !fc.Variadic[1] {
+		t.Fatalf("arg 1 expected VARIADIC, got false")
+	}
+}
+
 // TestParseSelectSyntaxErrors pins error positions for the canonical
 // "missing piece" cases.
 func TestParseSelectSyntaxErrors(t *testing.T) {

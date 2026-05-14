@@ -737,6 +737,24 @@ type PgInputErrorInfo struct {
 	schema Schema
 }
 
+
+// PgGetPublicationTables implements pg_get_publication_tables(VARIADIC text[])
+// as a FROM-clause SRF. It walks the PubSub registry, filtering by the supplied
+// publication-name list, and returns one row per (publication, table) pair.
+// Used by libpqrcv's CREATE SUBSCRIPTION fetch_table_list probe (M0103-0008
+// probe-survival). Composite-expansion of `(srf()).*` in scalar position is
+// out of scope for this loop; callers must invoke this function from the FROM
+// clause. The output schema mirrors upstream's return type as closely as
+// possible without composite-type support: `(relid oid, attrs text, qual text)`.
+type PgGetPublicationTables struct {
+	pos    int
+	Args   []Expr // raw VARIADIC argument list (text[] or text values)
+	schema Schema
+}
+
+func (n *PgGetPublicationTables) Pos() int       { return n.pos }
+func (n *PgGetPublicationTables) Output() Schema { return n.schema }
+
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 

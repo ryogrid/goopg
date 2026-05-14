@@ -753,6 +753,15 @@ type aggRuntime struct {
 	boolResult bool   // for bool_and / bool_or / every
 	intResult  int64  // for bit_and / bit_or / bit_xor
 	strResult  string // for string_agg
+	// arrayElems holds the accumulated element format-strings for
+	// array_agg(expr); arrayElemNull[i] marks element i as NULL
+	// (reserved — current applyAgg skips NULL inputs, so this is
+	// always all-false in practice). finishAgg emits the standard
+	// `{e1,e2}` text-array literal via formatTextArray, which the
+	// libpqrcv `fetch_table_list` probe pipes back into
+	// pg_get_publication_tables. M0103-0008 probe-survival.
+	arrayElems    []string
+	arrayElemNull []bool
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1037,6 +1046,21 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			// Use comma as default delimiter; second arg would refine this.
 			st.strResult += "," + sv
 		}
+	case "array_agg":
+		// array_agg(expr) — accumulate per-row elements. NULLs are
+		// permitted as array elements upstream, but the IsNull early-
+		// return above already skipped them; that matches goopg's
+		// existing aggregate convention (count/sum/etc. all skip NULL
+		// inputs) and is sufficient for the M0103-0008 probe query
+		// where the input column (pg_publication.pubname) is NOT NULL.
+		// Elements are stored as their Format() string; finishAgg
+		// wraps them in PG's text-array literal syntax. Numeric kinds
+		// (int, numeric, oid) and string kinds (text, char, varchar)
+		// all round-trip through Format() identically to how a SELECT
+		// would print them.
+		st.arrayElems = append(st.arrayElems, arg.Format())
+		st.arrayElemNull = append(st.arrayElemNull, false)
+		st.hasValue = true
 	case "any_value":
 		// any_value(x) — return the first non-null value seen.
 		if !st.hasValue && !arg.IsNull() {
@@ -1099,6 +1123,15 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			return NullDatum
 		}
 		return NewStringDatum(st.strResult)
+	case "array_agg":
+		if !st.hasValue {
+			return NullDatum
+		}
+		// NULL elements are not currently distinguished — applyAgg's
+		// IsNull early-return drops them. Suffices for the M0103-0008
+		// probe (pg_publication.pubname is NOT NULL); proper NULL-
+		// element support is deferred.
+		return NewStringDatum(formatTextArray(st.arrayElems))
 	case "any_value":
 		if !st.hasValue {
 			return NullDatum

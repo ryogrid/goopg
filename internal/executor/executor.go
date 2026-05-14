@@ -26,6 +26,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newGenerateSeriesOp(p)), nil
 	case *planner.PgInputErrorInfo:
 		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
+	case *planner.PgGetPublicationTables:
+		return maybeInstrument(p, newPgGetPublicationTablesOp(p)), nil
 	case *planner.ScalarFuncScan:
 		return maybeInstrument(p, newScalarFuncScanOp(p)), nil
 	case *planner.CTEScan:

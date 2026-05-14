@@ -147,6 +147,10 @@ func foldPlanConstants(node Node) {
 	case *PgInputErrorInfo:
 		n.Value = FoldConstants(n.Value)
 		n.Type = FoldConstants(n.Type)
+	case *PgGetPublicationTables:
+		for i := range n.Args {
+			n.Args[i] = FoldConstants(n.Args[i])
+		}
 	}
 }
 

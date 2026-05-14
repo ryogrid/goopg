@@ -919,6 +919,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "text"}, nil
+	case *parser.IndirectionStar:
+		// `(expr).*` — record/composite star expansion. The planner
+		// rewrites this into a FROM-clause SRF; the analyzer only
+		// needs to type-walk the source so downstream errors surface
+		// here. Returns a synthetic "record" type. M0103-0008.
+		if _, err := analyzeExpr(x.Source, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "record"}, nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
