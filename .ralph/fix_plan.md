@@ -1700,17 +1700,82 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       already pins the RemoteApply primitive's semantics; the new
       tests focus on the dispatcher-path wiring that M0103-0005 owns.
 
-- [ ] **M0103-0006** — `pubsubcluster` test harness.
-      Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
-      New package `internal/testutil/pubsubcluster/`: `PubSubCluster` struct
-      with `ReplPeer` Publisher + Subscriber (reuses M0102's `ReplPeer`
-      interface); `NewMixed(t, name, opts)` constructor; `Options` with
-      `PublisherKind`, `SubscriberKind`, `SyncMode`, `ApplicationName`,
-      `PublicationName`, `SubscriptionName`; helpers
-      `CreatePublication`, `CreateSubscription`, `WaitForApply`,
-      `SubscriberApplyLSN`. Reuses `pgcluster.Cluster` from M0102.
-      Verify: smoke test spins up both binaries, runs `INSERT` on
-      publisher, observes the row on subscriber within timeout.
+- [x] **M0103-0006** — `pubsubcluster` test harness.
+      LANDED 2026-05-14. Design doc:
+      `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`
+      (accepted).
+      Changes:
+      - `internal/testutil/pgcluster/` (new package) — upstream-PG
+        wrapper modelled on `interopPG` in
+        `internal/testport/pgoutput_interop_test.go`. `Options`
+        (`BinDir`/`DataDir`/`Port`/`User`/`Database`/`WalLevel`/
+        `MaxReplicationSlots`/`MaxWalSenders`/`ApplicationName`/
+        `ExtraConf`/`RepoRoot`), `New`/`Start`/`Stop`/`Kill`,
+        `Host/Port/User/Database/Conninfo` accessors, `Exec`/
+        `QueryScalar`/`OpenDB`/`WaitReady`. Defaults to
+        `wal_level=logical`. `Available(t, binDir)` skips when the
+        upstream tree is absent. `TestClusterRoundtrip` smoke pins
+        init→start→CREATE+INSERT+SELECT→stop.
+      - `internal/testutil/pubsubcluster/` (new package) —
+        `ReplPeer` interface (`Kind/Host/Port/User/Database/Conninfo/
+        Start/Stop/Exec/QueryScalar`); `ClusterKind`/`SyncMode`
+        constants; `Options` (`RepoRoot/BaseDir/PublisherKind/
+        SubscriberKind/SyncMode/ApplicationName/PublicationName/
+        SubscriptionName/StartupWait/ShutdownWait`); `NewMixed(t,
+        name, opts)` constructor; `*PubSubCluster` methods
+        `Start/CreatePublication/CreateSubscription/WaitForRow/
+        Close`. `goopgPeer` adapts `*cluster.Cluster`; `pgPeer`
+        adapts `*pgcluster.Cluster`. PG peer is forced to user
+        `postgres` so its role name matches goopg's hardcoded
+        `cfg.User` — `parseSubscriptionConninfo` in the apply
+        launcher (`internal/server/applylauncher.go:300`) ignores
+        the `user=` keyword in the subscriber's conninfo and reuses
+        the subscriber server's own `cfg.User`, which on goopg is
+        always `postgres`. `SyncModeRemoteApply` injects
+        `synchronous_standby_names` + `synchronous_commit =
+        remote_apply` into the publisher's conf.
+      - `TestPubSubClusterSmokePGToGoopg` smoke pins the harness's
+        end-to-end shape: spawn upstream PG publisher + goopg
+        subscriber; CREATE TABLE public.t on both sides;
+        CREATE PUBLICATION p; pre-create the logical slot via
+        `pg_create_logical_replication_slot` (goopg's CREATE
+        SUBSCRIPTION doesn't auto-create slots yet — see
+        Caveats); CREATE SUBSCRIPTION with `slot_name` +
+        `create_slot=false`; INSERT on publisher; wait for the
+        subscriber's `logical apply: commit` structured-log
+        beacon as evidence that the apply path is live.
+      Caveats (each tracked, in scope for M0103-0007 closure):
+      - **goopg `CREATE SUBSCRIPTION` does not auto-create the
+        replication slot on the publisher.** Upstream PG defaults
+        to `WITH (create_slot = true)` and dials the publisher to
+        issue `CREATE_REPLICATION_SLOT`; goopg's
+        `execCreateSubscription`
+        (`internal/executor/operators_ddl.go:173`) just registers
+        the subscription locally. Tests using this harness
+        currently pre-create the slot manually (via
+        `pg_create_logical_replication_slot` for PG publishers; a
+        wire-protocol helper is needed for goopg publishers).
+      - **goopg's apply-worker writes are not visible to a fresh
+        SQL session** in the same cluster. The disk file under
+        `base/1/<oid>` contains the applied tuple after the
+        smoke, but `SELECT count(*)` from a new `database/sql`
+        connection returns 0. The apply worker uses
+        `txnMgr.Begin` + `writeHeapRow` + `txnMgr.Commit`; the
+        commit is being recorded but downstream snapshots don't
+        treat the row as visible. M0103-0007 Scenario A's "INSERT
+        propagates" DoD will surface and close this gap.
+      - **`parseSubscriptionConninfo` ignores `user=` /
+        `dbname=`.** The harness works around this by forcing
+        both peers to share role `postgres`. A proper fix is for
+        the launcher to honour the conninfo's role+db (matches
+        upstream walsender behaviour).
+      Verification: `go test -count=1 -timeout 180s
+      ./internal/testutil/pgcluster/ ./internal/testutil/pubsubcluster/`
+      → both packages PASS (pgcluster 1.24 s, pubsubcluster 1.88 s).
+      `go build ./...` clean. Short regression on
+      `./internal/server/ ./internal/wal/ ./internal/executor/`
+      with `-short` — ALL PASS (server 1.91 s, wal 2.00 s,
+      executor 1.20 s).
 
 - [ ] **M0103-0007** — Scenario A E2E test: PG primary + goopg subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

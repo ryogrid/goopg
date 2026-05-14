@@ -1,6 +1,6 @@
 # 0103-0005 — Heterogeneous Logical-Failover E2E Harness
 
-**Status:** draft
+**Status:** accepted (M0103-0006 implementation landed 2026-05-14)
 **Date:** 2026-05-13
 **Milestone:** M0103-0006, M0103-0007, M0103-0008
 **Upstream reference:** `postgres/src/interfaces/libpq/fe-connect.c:1990` (`target_session_attrs` validation), `postgres/src/bin/pg_ctl/pg_ctl.c:1186` (`do_promote` — for reference; logical replication doesn't use it), `postgres/src/backend/replication/logical/launcher.c` (subscriber-side process lifecycle reference).
