@@ -217,6 +217,43 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	}
 
 	for _, stmt := range stmts {
+		// EXPLAIN EXECUTE <name> (M0100-0005h): the planner wraps an
+		// `ExecuteStmt` Inner as a `Utility` node and EXPLAIN renders
+		// it as the placeholder `Utility *parser.ExecuteStmt`.  PG
+		// instead expands the prepared statement and renders its
+		// actual plan tree.  We replay that here by looking up the
+		// stored PREPARE SQL, re-parsing it, and substituting the
+		// prepared `Query` Stmt for the `ExecuteStmt` before the rest
+		// of the loop falls into `planner.Plan(stmt, …)`.  The
+		// re-parse is cheap for the EXPLAIN-only path and keeps the
+		// registry interface (raw-SQL store/lookup) unchanged.
+		//
+		// `rewroteExplainExecute` disables the plan cache for this
+		// statement so a later re-PREPARE of the same name (which
+		// does not invalidate the cache) cannot serve the stale plan.
+		rewroteExplainExecute := false
+		if es, ok := stmt.(*parser.ExplainStmt); ok {
+			if ex, exok := es.Inner.(*parser.ExecuteStmt); exok {
+				if prepStmts == nil {
+					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", ex.Name))
+				}
+				prepSQL, found := prepStmts.Lookup(ex.Name)
+				if !found {
+					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", ex.Name))
+				}
+				prepParsed, perr := parser.Parse(prepSQL)
+				if perr != nil || len(prepParsed) == 0 {
+					return s.writeQueryError(w, sqlstate.SyntaxError, "could not parse prepared statement for EXPLAIN")
+				}
+				ps, ok := prepParsed[0].(*parser.PrepareStmt)
+				if !ok || ps.Query == nil {
+					return s.writeQueryError(w, sqlstate.SystemError, fmt.Sprintf("prepared statement %q has no body", ex.Name))
+				}
+				es.Inner = ps.Query
+				rewroteExplainExecute = true
+				// fall through to executeOneSimpleStmt below
+			}
+		}
 		// Handle PREPARE / EXECUTE / DEALLOCATE inline (M0096-0006).
 		// These require per-connection state not available in the executor.
 		if ps, ok := stmt.(*parser.PrepareStmt); ok {
@@ -316,7 +353,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 {
+		if s.pc != nil && len(stmts) == 1 && !rewroteExplainExecute {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached

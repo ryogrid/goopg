@@ -1293,6 +1293,36 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/initdb/ ./internal/parser/ ./internal/planner/
           ./internal/analyzer/` PASS.  Design:
           `docs/design/0100-0005g-decode-value-size-serial-types.md`.
+        - EXPLAIN EXECUTE renders prepared plan (M0100-0005h,
+          2026-05-15 loop 24).  `EXPLAIN (COSTS OFF) EXECUTE
+          <name>` previously rendered the placeholder
+          `Utility *parser.ExecuteStmt` because the planner wraps
+          an unresolved `ExecuteStmt` in a `Utility` node.  Fix:
+          `internal/server/dispatch.go` looks up the prepared
+          statement at the top of the per-statement loop in
+          `dispatchSimpleQueryViaExecutor`, re-parses its stored
+          SQL, and substitutes `PrepareStmt.Query` for the
+          `ExplainStmt.Inner` before `planner.Plan` runs.  The
+          rewritten statement bypasses the plan cache
+          (`rewroteExplainExecute` gate) so a later
+          `DEALLOCATE`+`PREPARE` of the same name cannot serve a
+          stale plan — `DEALLOCATE` does not invalidate the cache
+          (only DDL does).  Unknown names and stored entries that
+          are not `PrepareStmt`s surface as standard errors
+          (`26000` for missing names).  Regression pins:
+          `TestExplainExecuteRendersPreparedPlan` (verifies the
+          rendered plan contains `Seq Scan on items` and never
+          the substrings `Utility` / `ExecuteStmt`) and
+          `TestExplainExecuteUnknownPreparedReports26000` in
+          `internal/server/explain_execute_test.go`.  Affected
+          isolation spec advances past
+          `EXPLAIN (COSTS OFF) EXECUTE`; remaining diffs are
+          generic `COSTS OFF` formatter parity (Projection
+          wrapper, `Sort Key:` / `Index Cond:` detail,
+          `(rows=N)` suffix) — separate scope.  `go test -race
+          ./internal/server/ ./internal/executor/
+          ./internal/planner/ ./internal/parser/` PASS.  Design:
+          `docs/design/0100-0005h-explain-execute-prepared-rewrite.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
