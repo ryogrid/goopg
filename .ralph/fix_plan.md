@@ -2663,6 +2663,51 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       the regression suites listed in the milestone DoD and confirm zero
       regressions.
 
+## M0104 — SERIALIZABLE isolation via SSI anomaly prevention (filed 2026-05-14)
+
+**Goal.** When `default_transaction_isolation` / `transaction_isolation` is
+set to `serializable`, goopg must prevent serialization anomalies via SSI,
+instead of aliasing SERIALIZABLE to REPEATABLE READ behavior.
+
+Milestone doc: `docs/milestones/0104-serializable-ssi-anomaly-prevention.md`.
+Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md` (draft).
+
+### Sub-milestones
+
+- [ ] **M0104-0001** — GUC parity + SERIALIZABLE mapping correction.
+      Keep PostgreSQL GUC names (`default_transaction_isolation`,
+      `transaction_isolation`) and enum values; remove runtime aliasing of
+      SERIALIZABLE to REPEATABLE READ in the MVCC isolation parser/path.
+
+- [ ] **M0104-0002** — Serializable transaction-state lifecycle.
+      Introduce per-transaction SSI registration/cleanup state and wire it to
+      transaction begin/commit/abort boundaries.
+
+- [ ] **M0104-0003** — Predicate-lock substrate (SIREAD).
+      Implement predicate-lock target tracking (relation/page/tuple and range
+      abstraction for phantom prevention) plus lock coarsening policy.
+
+- [ ] **M0104-0004** — Read-path SSI conflict-in hooks.
+      On serializable reads, register conflict-in edges against concurrent
+      writers touching protected targets.
+
+- [ ] **M0104-0005** — Write-path SSI conflict-out hooks.
+      On serializable writes, detect active SIREAD coverage and register
+      conflict-out edges against concurrent serializable readers.
+
+- [ ] **M0104-0006** — Pre-commit dangerous-structure detection.
+      Add pre-commit serialization-failure checks and abort with SQLSTATE
+      `40001` when rw-conflict graph conditions require rollback.
+
+- [ ] **M0104-0007** — Oracle isolation-test promotion for SSI coverage.
+      Promote applicable deferred D-002 serializable/predicate specs to
+      pass-required and verify stable passing in `internal/testport`.
+
+- [ ] **M0104-0008** — Milestone closeout.
+      Update milestone/design statuses and index rows, run required regression
+      gates, and close M0104 only after SERIALIZABLE anomaly-prevention DoD is
+      evidenced.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
