@@ -1364,6 +1364,85 @@ func TestPort_PgoutputInteropPGToGoopgColumnOrderMismatch(t *testing.T) {
 	psc.WaitForRow(t, "public.t", "id = 2", 0, 30*time.Second)
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn pins M0103-0007
+// rung 11: the goopg subscriber declares an extra `note` column the PG
+// publisher never describes in its Relation message. On INSERT the column
+// stays NULL on the subscriber (existing behaviour); the subscriber then
+// directly UPDATEs the row to populate `note`. A subsequent UPDATE on the
+// publisher must NOT erase the subscriber-only value — the apply worker
+// has to fill the missing slot from the matched heap row before the
+// delete+insert that backs the logical UPDATE.
+//
+// Design doc: docs/design/0103-0034-m0103-0007-rung-11-pg-to-goopg-subscriber-extra-column.md.
+func TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-extracol")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_extracol"
+	psc := pubsubcluster.NewMixed(t, "pg2g_extracol", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Publisher has (id, v); subscriber adds a nullable `note` column.
+	// The subscriber-only column must survive replicated UPDATEs.
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text, note text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Phase 1: publisher INSERT replicates with note=NULL.
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'hello' AND note IS NULL", 1, 60*time.Second)
+
+	// Phase 2: subscriber writes the subscriber-only value directly.
+	psc.Subscriber.Exec(t, "UPDATE public.t SET note = 'kept' WHERE id = 1")
+	psc.WaitForRow(t, "public.t", "id = 1 AND note = 'kept'", 1, 10*time.Second)
+
+	// Phase 3 — the load-bearing check. Publisher UPDATE touches only
+	// `v`; under the rung-11 fix the apply worker fills `note` from
+	// the matched heap row before the delete+insert that backs the
+	// logical UPDATE. Without the fix, `note` would be NULL'd because
+	// the publisher's Relation message never mentions it and the
+	// decoder leaves the local slot at NullDatum.
+	psc.Publisher.Exec(t, "UPDATE public.t SET v = 'updated' WHERE id = 1")
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'updated' AND note = 'kept'", 1, 30*time.Second)
+
+	// Negative pin: no spurious second row, and the NULL-note state
+	// did not survive (which would mean the UPDATE didn't fire).
+	psc.WaitForRow(t, "public.t", "1=1", 1, 5*time.Second)
+	psc.WaitForRow(t, "public.t", "note IS NULL", 0, 5*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

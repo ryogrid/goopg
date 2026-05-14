@@ -2311,6 +2311,70 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       streaming subxacts, kill -9 + libpq multi-host reconnect
       plumbing on the client side, DEFAULT-value handling for
       subscriber-extra columns.
+      PARTIAL PROGRESS 2026-05-14 (rung 11): subscriber-extra
+      column preservation across replicated UPDATEs. Design
+      doc:
+      `docs/design/0103-0034-m0103-0007-rung-11-pg-to-goopg-subscriber-extra-column.md`
+      (accepted). Rung 10's note "Subscriber columns missing on
+      the publisher remain `NullDatum`" hid a real correctness
+      bug: every replicated UPDATE NULL'd the subscriber-only
+      value. `decodePgoutputTupleAsRow` initialised those slots
+      to `NullDatum` and `applyUpdateByKey`'s "fill from matched
+      heap row" loop only triggered on `'u'` (unchanged-TOAST)
+      cells; an UPDATE that touched only publisher-visible
+      columns left `newUnchanged` all-false, the read-side scan
+      was skipped, and `applyDeleteByKey` + `writeHeapRowReturning`
+      installed the new row with `note=NullDatum`.
+      Fix split across decoder + apply paths:
+      - `internal/executor/applyworker.go::decodePgoutputTupleAsRow`
+        gains a third `missing []bool` return (parallel to
+        `unchanged`). `missing[j]=true` when local column `j`
+        was not claimed by any remote attribute. Mirrors
+        upstream `slot_modify_data`'s "carry over old value
+        for columns not present in remote tuple" rule.
+      - `applyUpdateByKey` accepts a new `newMissing []bool`
+        parameter and merges it with `newUnchanged` into the
+        existing fill-from-matched scan: when EITHER mask has
+        any true cell, `applyScanFirstMatch` locates the heap
+        row and copies its value into `newRow` for both `'u'`
+        cells and subscriber-extra cells before the
+        delete+insert phase. The rungs-1–10 hot path (all-`'t'`
+        new tuples with no subscriber-extra columns) stays
+        single-scan.
+      - `applyInsert` ignores `missing[]` — subscriber-extra
+        slots stay `NullDatum` (DEFAULT-expression evaluation
+        is a future rung); the `'u'`-on-INSERT defensive check
+        keeps firing only on `unchanged[i]`. `applyDelete`'s
+        decoded key row carries `NullDatum` for missing
+        positions which `rowMatchesKey` already treats as
+        wildcards — correct, since publisher-omitted columns
+        can't participate in row-locator matching.
+      Pinned by `TestApplyWorkerDecodeMarksSubscriberExtraAsMissing`
+      and `TestApplyUpdateByKeyPreservesSubscriberExtraColumn`
+      (unit, `internal/executor/applyworker_test.go`) and the
+      live E2E `TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn`
+      (`internal/testport/pgoutput_interop_test.go`): publisher
+      `(id int PK, v text)` + subscriber `(id int PK, v text,
+      note text)`; workload INSERT(1,'hello') → subscriber
+      direct UPDATE SET note='kept' → publisher UPDATE SET
+      v='updated'. Asserts final state `id=1 AND v='updated'
+      AND note='kept'` plus negatives `count(*)=1` and `note IS
+      NULL` returns 0. Without the rung-11 fill loop, the
+      `note='kept'` assertion times out at the 30 s
+      WaitForRow deadline because `note` was nulled by the
+      replicated UPDATE.
+      Verification (rung 11):
+      `go test -count=1 -timeout 60s
+      -run "TestApplyWorker|TestPrimaryKeyOnlyRow|TestApplyUpdateByKey"
+      ./internal/executor/` → PASS (~0.03 s);
+      `go test -count=1 -timeout 180s
+      -run TestPort_PgoutputInteropPGToGoopgSubscriberExtraColumn
+      ./internal/testport/` → PASS (~2.2 s). Next rungs
+      (deferred within M0103-0007): pgbench against PG
+      publisher with `pgbench_history` polling, proto_version=2
+      streaming subxacts, kill -9 + libpq multi-host reconnect
+      plumbing on the client side, DEFAULT-expression
+      evaluation for subscriber-extra INSERTs.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

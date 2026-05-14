@@ -248,7 +248,7 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 			return nil
 		}
 	}
-	row, unchanged, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	row, unchanged, _, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode insert tuple for %q: %w", r.local.Name, err)
 	}
@@ -261,6 +261,10 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 				r.local.Name, i)
 		}
 	}
+	// Subscriber-extra columns (missing[i]=true) are NOT errors on INSERT:
+	// they remain NullDatum in the heap row. Full DEFAULT-expression
+	// evaluation for those positions is deferred to a later rung
+	// (M0103-0007 rung 11 — see docs/design/0103-0034).
 
 	// writeHeapRow expects a Context carrying Pool / Tx. Build
 	// a minimal one — the apply worker doesn't have a session
@@ -302,7 +306,7 @@ func (w *ApplyWorker) applyDelete(m *wal.DecodedMessage) error {
 	if len(m.OldTuple) == 0 {
 		return nil
 	}
-	keyRow, _, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+	keyRow, _, _, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode delete old-tuple for %q: %w", r.local.Name, err)
 	}
@@ -323,7 +327,7 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 		return fmt.Errorf("applyworker: UPDATE for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
 	}
-	newRow, newUnchanged, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	newRow, newUnchanged, newMissing, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode update new-tuple for %q: %w", r.local.Name, err)
 	}
@@ -341,7 +345,11 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 		// 'u' cells in OldTuple become NullDatum which
 		// rowMatchesKey treats as wildcards — correct, since
 		// the publisher didn't tell us the pre-image value.
-		oldKeyRow, _, err = decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+		// missing[] cells (subscriber-extra columns) likewise
+		// become NullDatum wildcards in the key — those columns
+		// never exist on the publisher side so they can't
+		// participate in row-locator matching.
+		oldKeyRow, _, _, err = decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
 		if err != nil {
 			return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
 		}
@@ -357,7 +365,7 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
-	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged)
+	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged, newMissing)
 }
 
 // applyTruncate handles pgoutput 'T' frames. The publisher emits one
@@ -497,12 +505,28 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 // heap row and copies its values into newRow for each unchanged slot
 // before the delete+insert phase. The two-scan cost is paid only when
 // 'u' is present — the all-'t'/'n' hot path stays single-scan.
-func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row, newUnchanged []bool) error {
+func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row, newUnchanged, newMissing []bool) error {
+	// needFill picks up two distinct cases that share the same remedy
+	// (overwrite the slot from the matched existing heap row):
+	//   - newUnchanged[i]: publisher emitted 'u' (unchanged TOAST) for
+	//     remote column i; the pre-image value lives in our heap and
+	//     must survive the delete+insert.
+	//   - newMissing[i]: column i exists on the subscriber but not on
+	//     the publisher (subscriber-extra). Without the fill, every
+	//     replicated UPDATE would NULL the subscriber-only value.
 	needFill := false
 	for _, u := range newUnchanged {
 		if u {
 			needFill = true
 			break
+		}
+	}
+	if !needFill {
+		for _, m := range newMissing {
+			if m {
+				needFill = true
+				break
+			}
 		}
 	}
 	if needFill {
@@ -511,14 +535,24 @@ func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 			return err
 		}
 		if matched != nil {
-			for i, u := range newUnchanged {
-				if u && i < len(matched) && i < len(newRow) {
+			for i := range newRow {
+				if i >= len(matched) {
+					break
+				}
+				take := false
+				if i < len(newUnchanged) && newUnchanged[i] {
+					take = true
+				}
+				if i < len(newMissing) && newMissing[i] {
+					take = true
+				}
+				if take {
 					newRow[i] = matched[i]
 				}
 			}
 		}
-		// If matched == nil, the 'u' slots remain NullDatum. The
-		// subsequent applyDeleteByKey is a no-op (nothing to xmax),
+		// If matched == nil, the 'u' / missing slots remain NullDatum.
+		// The subsequent applyDeleteByKey is a no-op (nothing to xmax),
 		// but writeHeapRowReturning still installs newRow — that
 		// preserves the pre-existing "no-match UPDATE installs a row"
 		// behaviour rather than fixing it here.
@@ -740,9 +774,9 @@ func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
 // ignore the mask — the NullDatum + rowMatchesKey's
 // "skip NULL key cells" semantics yield correct behaviour
 // for OldTuple/key-row use cases.
-func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, tup []wal.DecodedColumn) (Row, []bool, error) {
+func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, tup []wal.DecodedColumn) (Row, []bool, []bool, error) {
 	if len(tup) != len(remoteCols) {
-		return nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
+		return nil, nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
 	}
 	// Build remote-ordinal → local-ordinal map by column name. PG's
 	// apply worker resolves attributes by name (not by position) so
@@ -750,8 +784,11 @@ func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.
 	// or add extra columns the publisher doesn't have. Both sides
 	// emit catalog-normalised lowercase names — for unquoted DDL the
 	// names match directly; quoted-identifier mismatches surface as
-	// the explicit error below.
+	// the explicit error below. claimed[j] tracks which local columns
+	// were referenced by some remote attribute; the unclaimed positions
+	// are subscriber-extra (M0103-0007 rung 11).
 	localIdx := make([]int, len(remoteCols))
+	claimed := make([]bool, len(localCols))
 	for i, rc := range remoteCols {
 		found := -1
 		for j, lc := range localCols {
@@ -761,14 +798,27 @@ func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.
 			}
 		}
 		if found < 0 {
-			return nil, nil, fmt.Errorf("remote col %q has no matching local column", rc.Name)
+			return nil, nil, nil, fmt.Errorf("remote col %q has no matching local column", rc.Name)
 		}
 		localIdx[i] = found
+		claimed[found] = true
 	}
 	row := make(Row, len(localCols))
 	unchanged := make([]bool, len(localCols))
+	missing := make([]bool, len(localCols))
 	for i := range row {
 		row[i] = NullDatum
+	}
+	// Subscriber-extra columns: local positions with no claiming remote
+	// attribute. Stay NullDatum in the returned row; missing[j]=true so
+	// applyUpdateByKey can fill from the matched existing heap row
+	// (preserving the subscriber-only value across replicated UPDATEs),
+	// and the INSERT path leaves them NullDatum (full DEFAULT-expression
+	// evaluation is deferred to a later rung).
+	for j, c := range claimed {
+		if !c {
+			missing[j] = true
+		}
 	}
 	for i, col := range tup {
 		j := localIdx[i]
@@ -779,17 +829,17 @@ func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.
 		case 't':
 			d, err := parsePgoutputText(local.Type, col.Bytes)
 			if err != nil {
-				return nil, nil, fmt.Errorf("col %q: %w", local.Name, err)
+				return nil, nil, nil, fmt.Errorf("col %q: %w", local.Name, err)
 			}
 			row[j] = d
 		case 'u':
 			row[j] = NullDatum
 			unchanged[j] = true
 		default:
-			return nil, nil, fmt.Errorf("col %q: unknown status %q", local.Name, col.Status)
+			return nil, nil, nil, fmt.Errorf("col %q: unknown status %q", local.Name, col.Status)
 		}
 	}
-	return row, unchanged, nil
+	return row, unchanged, missing, nil
 }
 
 // parsePgoutputText converts upstream's canonical text format

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -181,12 +182,12 @@ func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
 		{Status: 'n', Bytes: nil},
 		{Status: 'u', Bytes: nil},
 	}
-	row, unchanged, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	row, unchanged, missing, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(row) != 3 || len(unchanged) != 3 {
-		t.Fatalf("row=%d unchanged=%d want both 3", len(row), len(unchanged))
+	if len(row) != 3 || len(unchanged) != 3 || len(missing) != 3 {
+		t.Fatalf("row=%d unchanged=%d missing=%d want all 3", len(row), len(unchanged), len(missing))
 	}
 	if row[0].Int != 42 {
 		t.Errorf("row[0].Int=%d want 42", row[0].Int)
@@ -200,12 +201,18 @@ func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
 	if got := []bool{unchanged[0], unchanged[1], unchanged[2]}; got[0] || got[1] || !got[2] {
 		t.Errorf("unchanged=%v want [false false true]", got)
 	}
+	// Every local column was claimed by a remote attribute, so
+	// missing[] is all-false. The subscriber-extra case is exercised
+	// by TestApplyWorkerDecodeMarksSubscriberExtraAsMissing below.
+	if missing[0] || missing[1] || missing[2] {
+		t.Errorf("missing=%v want [false false false]", missing)
+	}
 
 	// Unknown status still errors.
 	tupBad := []wal.DecodedColumn{
 		{Status: 'x', Bytes: nil},
 	}
-	if _, _, err := decodePgoutputTupleAsRow(remoteCols[:1], localCols[:1], tupBad); err == nil {
+	if _, _, _, err := decodePgoutputTupleAsRow(remoteCols[:1], localCols[:1], tupBad); err == nil {
 		t.Errorf("unknown status: expected error, got nil")
 	}
 }
@@ -232,7 +239,7 @@ func TestApplyWorkerDecodeRemapsReorderedColumns(t *testing.T) {
 		{Status: 't', Bytes: []byte("7")},
 		{Status: 't', Bytes: []byte("alice")},
 	}
-	row, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	row, _, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -265,12 +272,184 @@ func TestApplyWorkerDecodeRejectsUnmatchedRemoteCol(t *testing.T) {
 		{Status: 't', Bytes: []byte("1")},
 		{Status: 't', Bytes: []byte("x")},
 	}
-	_, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	_, _, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
 	if err == nil {
 		t.Fatalf("expected error for unmatched remote col, got nil")
 	}
 	if !strings.Contains(err.Error(), "extra_on_publisher") {
 		t.Errorf("error %q must mention the unmatched col name", err.Error())
+	}
+}
+
+
+// TestApplyWorkerDecodeMarksSubscriberExtraAsMissing pins M0103-0007 rung 11:
+// when the subscriber declares a column the publisher does not include in its
+// Relation message, the decoder must mark that local position as missing[]
+// (and leave the row cell NullDatum). applyUpdateByKey uses the mask to
+// preserve the subscriber-only value across replicated UPDATEs.
+func TestApplyWorkerDecodeMarksSubscriberExtraAsMissing(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},
+		{Name: "v", TypeOID: 25},
+	}
+	// Subscriber declares an extra `note` column the publisher knows
+	// nothing about.
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+		{Name: "note", Type: catalog.Type{Name: "text"}},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("1")},
+		{Status: 't', Bytes: []byte("hello")},
+	}
+	row, unchanged, missing, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row) != 3 || len(unchanged) != 3 || len(missing) != 3 {
+		t.Fatalf("row=%d unchanged=%d missing=%d want all 3", len(row), len(unchanged), len(missing))
+	}
+	if row[0].Int != 1 {
+		t.Errorf("row[0].Int=%d want 1", row[0].Int)
+	}
+	if string(row[1].Buf) != "hello" {
+		t.Errorf("row[1] = %q want \"hello\"", string(row[1].Buf))
+	}
+	if !row[2].IsNull() {
+		t.Errorf("row[2] (subscriber-extra note) should be NullDatum, got %v", row[2])
+	}
+	if unchanged[0] || unchanged[1] || unchanged[2] {
+		t.Errorf("unchanged=%v want all-false (no 'u' status cells)", unchanged)
+	}
+	if missing[0] || missing[1] {
+		t.Errorf("missing[0]/[1] should be false (claimed by remote), got missing=%v", missing)
+	}
+	if !missing[2] {
+		t.Errorf("missing[2] (subscriber-extra note) should be true, got missing=%v", missing)
+	}
+}
+
+// TestApplyUpdateByKeyPreservesSubscriberExtraColumn pins M0103-0007 rung 11
+// end-to-end against the executor's heap path: a row with a subscriber-only
+// column populated, then a publisher UPDATE arrives carrying only the
+// publisher-known columns. applyUpdateByKey must scan for the matched row,
+// copy the subscriber-only value into newRow before delete+insert, and the
+// post-update heap state must preserve the subscriber-only value.
+func TestApplyUpdateByKeyPreservesSubscriberExtraColumn(t *testing.T) {
+	// Build a subscriber-side storage fixture and create a table whose
+	// shape includes a subscriber-only `note` column the publisher will
+	// never describe in its Relation message.
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 16})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	// Cleanup order matters: Pool.Close flushes dirty pages through the
+	// Manager, so it must run BEFORE Manager.Close (deferred LIFO).
+	t.Cleanup(func() {
+		_ = pool.Close()
+		_ = mgr.Close()
+	})
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true, Ordinal: 0},
+		{Name: "v", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+		{Name: "note", Type: catalog.Type{Name: "text"}, Ordinal: 2},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	mgrMVCC := mvcc.NewManager()
+
+	// Seed an initial row with all three columns populated (id=1, v="hello",
+	// note="kept"). This is the pre-image the publisher UPDATE will replace.
+	seedTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("begin seed: %v", err)
+	}
+	ctx := NewContext()
+	ctx.Pool = pool
+	ctx.Catalog = cat
+	ctx.TxnMgr = mgrMVCC
+	ctx.Tx = seedTx
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		t.Fatalf("materialize seed xid: %v", err)
+	}
+	rel := cat.RelFileNode(tbl)
+	seed := Row{NewIntDatum(1), NewStringDatum("hello"), NewStringDatum("kept")}
+	if _, err := writeHeapRowReturning(ctx, rel, tbl.Columns, seed); err != nil {
+		t.Fatalf("seed writeHeapRow: %v", err)
+	}
+	if err := mgrMVCC.Commit(seedTx); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	// Apply path: publisher knows (id, v) only. newRow has the new v at
+	// position 1 and NullDatum at note's local position; newMissing[2]
+	// flags note as a subscriber-extra column that must survive the UPDATE.
+	applyTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("begin apply: %v", err)
+	}
+	ctx2 := NewContext()
+	ctx2.Pool = pool
+	ctx2.Catalog = cat
+	ctx2.TxnMgr = mgrMVCC
+	ctx2.Tx = applyTx
+	if err := ctx2.MaterializeWriterXID(); err != nil {
+		t.Fatalf("materialize apply xid: %v", err)
+	}
+	snap, _ := mgrMVCC.SnapshotFor(ctx2.Tx)
+	ctx2.Snap = snap
+
+	oldKey := Row{NewIntDatum(1), NullDatum, NullDatum}
+	newRow := Row{NewIntDatum(1), NewStringDatum("updated"), NullDatum}
+	newUnchanged := []bool{false, false, false}
+	newMissing := []bool{false, false, true}
+
+	if err := applyUpdateByKey(ctx2, rel, tbl, tbl.Columns, oldKey, newRow, newUnchanged, newMissing); err != nil {
+		t.Fatalf("applyUpdateByKey: %v", err)
+	}
+	if err := mgrMVCC.Commit(applyTx); err != nil {
+		t.Fatalf("commit apply: %v", err)
+	}
+
+	// Inspect via a fresh read-only transaction.
+	readTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("begin read: %v", err)
+	}
+	defer mgrMVCC.Rollback(readTx)
+	rsnap, _ := mgrMVCC.SnapshotFor(readTx)
+	scanCtx := NewContext()
+	scanCtx.Pool = pool
+	scanCtx.Catalog = cat
+	scanCtx.TxnMgr = mgrMVCC
+	scanCtx.Tx = readTx
+	scanCtx.Snap = rsnap
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatalf("seqscan open: %v", err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("visible rows=%d want 1: %#v", len(rows), rows)
+	}
+	r := rows[0]
+	if r[0].Int != 1 {
+		t.Errorf("row id=%d want 1", r[0].Int)
+	}
+	if r[1].StringValue() != "updated" {
+		t.Errorf("row v=%q want \"updated\"", r[1].StringValue())
+	}
+	if r[2].StringValue() != "kept" {
+		t.Errorf("row note=%q want \"kept\" (subscriber-only column must survive UPDATE)", r[2].StringValue())
 	}
 }
 
