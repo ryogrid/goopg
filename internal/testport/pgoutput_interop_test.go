@@ -932,6 +932,112 @@ COMMIT;`)
 	psc.WaitForRow(t, "public.t", "id = 3", 0, 30*time.Second)
 }
 
+// TestPort_PgoutputInteropPGToGoopgSavepointXact pins rung 7 of
+// M0103-0007: PG-publisher → goopg-subscriber SAVEPOINT subxacts at
+// proto_version=1. Subxact boundaries are NOT streamed at v1; the
+// publisher's reorder buffer filters rolled-back subxact rows before
+// emission, so the subscriber sees only the committed net effect of
+// the top-level transaction. This rung verifies that contract end-to-
+// end: a SAVEPOINT-heavy workload with both ROLLBACK TO and RELEASE
+// frames produces exactly the expected post-commit state.
+//
+// Design doc: docs/design/0103-0030-m0103-0007-rung-7-pg-to-goopg-savepoint-xact.md.
+func TestPort_PgoutputInteropPGToGoopgSavepointXact(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-svp")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_svp"
+	psc := pubsubcluster.NewMixed(t, "pg2g_svp", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// One top-level transaction containing three SAVEPOINTs:
+	//   - s1: INSERT(2,'two-rolled') + UPDATE id=1 → rolled back
+	//   - s2: INSERT(3,'three') → released (merged into parent)
+	//   - s3: DELETE id=3 → rolled back (restores id=3)
+	// At proto_version=1 the publisher's reorder buffer drops rolled-
+	// back subxact rows before emission; the wire carries exactly:
+	//   B, I(1,'one'), I(3,'three'), I(4,'four'), C.
+	// The apply worker replays them inside a single TxnMgr xact.
+	psc.Publisher.Exec(t, `
+BEGIN;
+INSERT INTO public.t VALUES (1, 'one');
+SAVEPOINT s1;
+INSERT INTO public.t VALUES (2, 'two-rolled');
+UPDATE public.t SET v = 'one-rolled' WHERE id = 1;
+ROLLBACK TO SAVEPOINT s1;
+SAVEPOINT s2;
+INSERT INTO public.t VALUES (3, 'three');
+RELEASE SAVEPOINT s2;
+INSERT INTO public.t VALUES (4, 'four');
+SAVEPOINT s3;
+DELETE FROM public.t WHERE id = 3;
+ROLLBACK TO SAVEPOINT s3;
+COMMIT;`)
+
+	// All assertions use fresh database/sql sessions (WaitForRow opens
+	// a new conn each call), so each query traverses the goopg PK
+	// IndexScan path against committed state.
+
+	// Total surviving row count fail-fasts the "publisher leaked
+	// rolled-back inserts" regression (would yield 4 or 5) or the
+	// "apply re-applied a rolled-back DELETE" regression (would
+	// yield 2).
+	psc.WaitForRow(t, "public.t", "1=1", 3, 60*time.Second)
+
+	// Top-level INSERT survived; the s1 UPDATE that would have rewritten
+	// v='one-rolled' was rolled back.
+	psc.WaitForRow(t, "public.t", "id = 1 AND v = 'one'", 1, 30*time.Second)
+
+	// s1 INSERT was rolled back — id=2 must not exist.
+	psc.WaitForRow(t, "public.t", "id = 2", 0, 30*time.Second)
+
+	// s2 RELEASE merged the INSERT into the parent xact; s3 ROLLBACK TO
+	// restored the row by aborting the DELETE. Either failure mode
+	// (release leaked → no row; rollback failed → 0 visible) shows up
+	// here.
+	psc.WaitForRow(t, "public.t", "id = 3 AND v = 'three'", 1, 30*time.Second)
+
+	// Top-level INSERT after the s2 RELEASE survives unchanged. Catches
+	// the post-RELEASE accidentally tying to an aborted subxact at the
+	// publisher.
+	psc.WaitForRow(t, "public.t", "id = 4 AND v = 'four'", 1, 30*time.Second)
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

@@ -2073,6 +2073,48 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       publisher with `pgbench_history` polling, DDL replication
       shapes, kill -9 + libpq multi-host reconnect plumbing on
       the client side.
+      PARTIAL PROGRESS 2026-05-14 (rung 7): SAVEPOINT subxact
+      shape at proto_version=1. Design doc:
+      `docs/design/0103-0030-m0103-0007-rung-7-pg-to-goopg-savepoint-xact.md`
+      (accepted). At proto_version=1 (goopg's default —
+      `internal/server/logicalreceiver.go:149-151`) subxact
+      boundaries are NOT streamed: the publisher's reorder
+      buffer drops rolled-back subxact rows before emission and
+      the wire carries only the committed net effect of the
+      top-level transaction as one `B…C` block. Workload:
+      `BEGIN; INSERT(1,'one'); SAVEPOINT s1; INSERT(2,…); UPDATE
+      id=1; ROLLBACK TO s1; SAVEPOINT s2; INSERT(3,'three');
+      RELEASE s2; INSERT(4,'four'); SAVEPOINT s3; DELETE id=3;
+      ROLLBACK TO s3; COMMIT;` Expected subscriber state via
+      fresh `database/sql` sessions through goopg's PK
+      IndexScan: `count(*)=3`, `id=1 v='one'` (s1 UPDATE rolled
+      back), no `id=2` (s1 INSERT rolled back), `id=3 v='three'`
+      (s2 RELEASE + s3 DELETE rolled back), `id=4 v='four'`
+      (top-level INSERT after RELEASE). Each assertion fail-fasts
+      a distinct regression: leaked rolled-back inserts (count
+      would be 4 or 5), UPDATE leaking through (wrong `v`),
+      ROLLBACK TO of DELETE failing (`id=3` returns 0), s2
+      RELEASE failing to commit. No code change was needed —
+      the publisher does the work at reorder-buffer flush and
+      the apply worker's existing one-TxnMgr-per-`B…C` machinery
+      handles the block exactly as rung 6 did. proto_version=2
+      streaming subxacts (with `Y`/`A` frames + parent-XID
+      linkage) is out of scope here; promoting the default
+      requires apply-worker subxact tracking and stays a future
+      rung. Pinned by `TestPort_PgoutputInteropPGToGoopgSavepointXact`
+      in `internal/testport/pgoutput_interop_test.go`.
+      Verification (rung 7): `go test -count=1 -timeout 120s
+      -run TestPort_PgoutputInteropPGToGoopgSavepointXact
+      ./internal/testport/` → PASS (~1.7 s); all 7
+      `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+      (~12.0 s); race-tested regression on
+      `./internal/executor/ ./internal/wal/ ./internal/server/
+      ./internal/catalog/ ./internal/testutil/pubsubcluster/`
+      → all green. Next rungs (deferred within M0103-0007):
+      pgbench against PG publisher with `pgbench_history`
+      polling, DDL replication shapes, proto_version=2 streaming
+      subxacts, kill -9 + libpq multi-host reconnect plumbing on
+      the client side.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.
