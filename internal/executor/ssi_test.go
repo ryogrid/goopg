@@ -56,7 +56,7 @@ func TestSSI_RecordTupleRead_NoOpForRC(t *testing.T) {
 	ctx.TxnMgr = mgr
 	ctx.Tx = tx
 
-	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, ssiWriterXID)
+	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, ssiWriterXID, storage.InvalidTransactionID)
 
 	// RC xacts never enter ssiState.xacts so the lookup returns nil; this
 	// is the cheapest possible evidence of "zero footprint".
@@ -80,7 +80,7 @@ func TestSSI_RecordTupleRead_NoOpForRR(t *testing.T) {
 	ctx.TxnMgr = mgr
 	ctx.Tx = tx
 
-	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, ssiWriterXID)
+	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, ssiWriterXID, storage.InvalidTransactionID)
 	ssiRecordTupleWrite(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot)
 
 	if got := mgr.SerializableXact(tx.Handle); got != nil {
@@ -109,7 +109,7 @@ func TestSSI_RecordTupleRead_AcquiresPredicateLockForSerializable(t *testing.T) 
 	// xid==0 (mirrors upstream's invalid-XID short-circuit) so this test
 	// isolates the AcquirePredicateLock side-effect from the conflict-out
 	// side-effect.
-	ssiRecordTupleRead(rctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, storage.InvalidTransactionID)
+	ssiRecordTupleRead(rctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, storage.InvalidTransactionID, storage.InvalidTransactionID)
 
 	writer, err := mgr.Begin(mvcc.IsolationSerializable)
 	if err != nil {
@@ -150,8 +150,8 @@ func TestSSI_RecordTupleRead_InvalidTagFiltered(t *testing.T) {
 
 	// Both invalid inputs would panic inside mvcc.TupleLockTag; the helper
 	// must filter before reaching it. Test passes when no panic surfaces.
-	ssiRecordTupleRead(ctx, ssiTestRel(), storage.InvalidBlockNumber, ssiTestSlot, ssiWriterXID)
-	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, 0, ssiWriterXID)
+	ssiRecordTupleRead(ctx, ssiTestRel(), storage.InvalidBlockNumber, ssiTestSlot, ssiWriterXID, storage.InvalidTransactionID)
+	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, 0, ssiWriterXID, storage.InvalidTransactionID)
 	ssiRecordTupleWrite(ctx, ssiTestRel(), storage.InvalidBlockNumber, ssiTestSlot)
 	ssiRecordTupleWrite(ctx, ssiTestRel(), ssiTestBlock, 0)
 }
@@ -264,7 +264,7 @@ func TestSSI_RecordTupleRead_ZeroHandleSkipped(t *testing.T) {
 	ctx.TxnMgr = mvcc.NewManager()
 	ctx.Tx = mvcc.Transaction{Isolation: mvcc.IsolationSerializable, Handle: 0}
 
-	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, ssiWriterXID)
+	ssiRecordTupleRead(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot, ssiWriterXID, storage.InvalidTransactionID)
 	ssiRecordTupleWrite(ctx, ssiTestRel(), ssiTestBlock, ssiTestSlot)
 	// No panic, no allocation in ssiState — guard ssiActive is doing its job.
 }

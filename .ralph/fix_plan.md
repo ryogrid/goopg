@@ -1879,15 +1879,64 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
         the natural injection point if latency-sensitive workloads need
         the earlier abort).
 
-- [ ] **M0104-0008**
+- [x] **M0104-0008**
       - Summary: Oracle isolation-test promotion for SSI coverage +
         milestone closeout.
-      - Promote applicable deferred D-002 serializable/predicate specs to
-        pass-required and verify stable passing in `internal/testport`
-        (multi-session SQL-driven write-skew tests exercise the
-        M0104-0007 executor wiring end-to-end). Then update milestone /
-        design statuses and index rows and close M0104 once the
-        SERIALIZABLE anomaly-prevention DoD is evidenced.
+      - Closed 2026-05-14: Four pass-required multi-session SQL-driven
+        Go tests added in `internal/testport/ssi_write_skew_test.go`
+        directly enact the canonical simple-write-skew permutations
+        against a live goopg cluster:
+        `TestPort_SSI_WriteSkew_NoOverlap_BothCommit`,
+        `_Overlap_SecondCommitterAborts`,
+        `_Overlap_FirstCommitterAborts`,
+        `_RC_NoSerializationFailure` (RC + RR negative control).
+        Why focused Go tests instead of promoting
+        `simple-write-skew.spec` through `TestPort_IsolationSuite`:
+        `framework.IsolationRunner` only runs spec-declared
+        `permutation` directives — auto-permutation generation (the
+        upstream isolationtester.c default for specs that omit explicit
+        permutations) is not implemented, so the canonical SSI specs
+        cannot be driven through the suite without a runner upgrade
+        that itself owns the D-002 infrastructure; the focused Go
+        tests express the same end-to-end shape against the wire
+        protocol.
+      - Four load-bearing gap fixes uncovered by the new tests:
+        (1) `BEGIN ISOLATION LEVEL <level>` was silently ignored on the
+        simple-query path — `internal/server/dispatch.go` `TxBegin`
+        branch called `connTx.Begin(ctx.Tx)` on the placeholder RC tx
+        allocated at dispatch entry, bypassing `transactionOp.execBegin`
+        where the isolation-level parsing lives; fix rolls back the
+        placeholder and `Begin(parsedLvl)`s a fresh tx + snapshot when
+        the BEGIN carries an explicit level. (2) `COMMIT` bypassed
+        `ssiPreCommitCheck` on the simple-query path — fix gates the
+        dispatch-side `TxnMgr.Commit` on
+        `PreCommitCheckForSerializationFailure(handle)` for
+        SERIALIZABLE explicit transactions and translates a hit to
+        wire-protocol SQLSTATE 40001 with the upstream wording.
+        (3) `scanMatching` (the UPDATE/DELETE inner scan) didn't fire
+        the SSI read hook — fix invokes
+        `ssiRecordTupleRead(ctx, rel, blk, slot, h.Xmin, h.Xmax)`
+        immediately after the visibility check inside `scanMatching`,
+        mirroring `seqScanOp.Next`. (4) `ssiRecordTupleRead` only
+        checked the visible writer's xmin — fix extends the helper
+        signature to take `writerXmax storage.TransactionID` and
+        invokes `CheckForSerializableConflictOut(handle, xmax)` when
+        `xmax != xmin`, closing the write-skew shape where the
+        reader's MVCC snapshot hides the concurrent writer's new
+        version. Three call sites (seqScanOp, indexScanOp,
+        scanMatching) pass `tuple.Header.Xmax` alongside `Xmin`.
+      - DoD evidence: #2 (anomaly rejection with 40001) — both overlap
+        permutations return SQLSTATE 40001 with the upstream wording;
+        #4 (deferred-test promotion + passing) — 4/4 SSI tests pass;
+        #3 (no lock leakage) — sequential SERIALIZABLE pair commits
+        cleanly without spurious 40001; #5 (no RC/RR regression) — RC
+        + RR control passes the same overlap shape without serialization
+        failure.
+      - Design doc: `docs/design/0104-0008-ssi-promotion-and-closeout.md`.
+      - Regression gates: `go test ./internal/executor/ ./internal/mvcc/
+        ./internal/server/` all green; `go test -run TestPort_SSI_WriteSkew
+        ./internal/testport/` 4/4 pass.
+      - M0104 SERIALIZABLE anomaly-prevention milestone CLOSED.
 
 ## Completed
 

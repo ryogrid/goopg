@@ -377,7 +377,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// rw-conflict edge to the producing writer (xmin). Helper
 			// short-circuits to a single inline check for RC/RR readers.
 			// curSlot was already advanced past the just-fetched slot.
-			ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin)
+			ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax)
 			// M0054-0005a: decode into the reusable o.scanRow
 			// buffer. M0073-0004: route varchar / char / text /
 			// bytea payload through the per-page arena so per-
@@ -1969,6 +1969,14 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
 				continue
 			}
+			// M0104-0008: SSI read-path hook for the UPDATE / DELETE
+			// scanMatching loop (mirrors the seqScanOp.Next site). A
+			// SERIALIZABLE writer that reads a tuple here must install
+			// a SIREAD predicate lock so concurrent peers detect the
+			// rw-conflict, and must check conflict-out against both
+			// xmin (visible writer) and xmax (concurrent overwriter
+			// hidden by snapshot).
+			ssiRecordTupleRead(ctx, rel, blk, slot, tuple.Header.Xmin, tuple.Header.Xmax)
 			if err := DecodeRowInto(scanRow, cols, tuple.Data); err != nil {
 				s.RUnlock()
 				ctx.Pool.Unpin(s)

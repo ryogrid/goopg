@@ -357,7 +357,7 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// Helper short-circuits for RC/RR; for SERIALIZABLE this installs a
 		// tuple-grain predicate lock and an rw-conflict edge to the writer
 		// identified by the visible tuple's xmin.
-		ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin)
+		ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax)
 		// M0092-0007: stack-aliased slot — reuse o.slot across
 		// every Next() call. Caller must consume / Materialize
 		// before the next Next() invocation.

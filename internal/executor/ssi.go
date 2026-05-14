@@ -31,7 +31,7 @@ func ssiActive(ctx *Context) bool {
 // self xids and for RC/RR readers, so callers do not need to filter further.
 // Block/slot sanity gating mirrors mvcc.TupleLockTag's invariants — calling
 // it with InvalidBlockNumber or slot==0 panics, so we filter here.
-func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.BlockNumber, slot uint16, writerXmin storage.TransactionID) {
+func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.BlockNumber, slot uint16, writerXmin, writerXmax storage.TransactionID) {
 	if !ssiActive(ctx) {
 		return
 	}
@@ -40,7 +40,21 @@ func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.Blo
 	}
 	tag := mvcc.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+	// Conflict-out against the inserter — handles the reader-after-write
+	// shape (reader observes a concurrent SERIALIZABLE writer's new
+	// tuple version directly).
 	ctx.TxnMgr.CheckForSerializableConflictOut(ctx.Tx.Handle, writerXmin)
+	// M0104-0008: conflict-out against the deleter/updater. When the
+	// reader's snapshot hides a concurrent SERIALIZABLE writer's NEWER
+	// version of this tuple, the visible OLD version still carries the
+	// concurrent writer's XID in its xmax slot. Reading it must install
+	// the reader→writer rw-edge so write-skew (e.g. simple-write-skew
+	// spec) closes the 2-cycle at pre-commit. The Manager filters
+	// InvalidXID / Bootstrap / Frozen and elides the self-modify case,
+	// so an unconditional second check is safe when xmax != xmin.
+	if writerXmax != writerXmin {
+		ctx.TxnMgr.CheckForSerializableConflictOut(ctx.Tx.Handle, writerXmax)
+	}
 }
 
 // ssiRecordTupleWrite is the executor-side hook for SERIALIZABLE writes.

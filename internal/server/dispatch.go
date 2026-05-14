@@ -570,12 +570,58 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			if connTx != nil && !connTx.InExplicit() && autoCommitPtr != nil {
 				// Promote the current auto-commit transaction to explicit.
 				*autoCommitPtr = false
+				// M0104-0008: honour `BEGIN ISOLATION LEVEL <level>`. The
+				// auto-commit tx allocated at dispatch entry was created at
+				// the session default (typically READ COMMITTED); when the
+				// BEGIN carries an explicit isolation level we must replace
+				// it with a fresh tx at the requested level so SSI hooks
+				// (`ssiActive` predicates on `tx.Isolation`) fire correctly
+				// for the remainder of the explicit block.
+				if txNode.IsolationLevel != "" {
+					parsedLvl, perr := mvcc.ParseIsolationLevel(txNode.IsolationLevel)
+					if perr != nil {
+						return s.writeQueryError(w, sqlstate.SyntaxError, perr.Error())
+					}
+					if parsedLvl != ctx.Tx.Isolation {
+						// Roll back the placeholder auto-commit tx so it does
+						// not consume an XID / leak SSI bookkeeping.
+						_ = s.cfg.TxnMgr.Rollback(ctx.Tx)
+						newTx, berr := s.cfg.TxnMgr.Begin(parsedLvl)
+						if berr != nil {
+							return s.writeQueryError(w, sqlstate.SystemError, berr.Error())
+						}
+						snap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+						if serr != nil {
+							_ = s.cfg.TxnMgr.Rollback(newTx)
+							return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
+						}
+						ctx.Tx = newTx
+						ctx.Snap = snap
+					}
+				}
 				connTx.Begin(ctx.Tx)
 			}
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxCommit:
 			if connTx != nil && connTx.InExplicit() {
-				if err := s.cfg.TxnMgr.Commit(connTx.Tx()); err != nil {
+				explicitTx := connTx.Tx()
+				// M0104-0008: SSI pre-commit dangerous-structure check.
+				// The executor's transactionOp.execCommit invokes this for
+				// COMMIT routed through the executor; the simple-query
+				// dispatch bypasses execCommit and goes straight to
+				// TxnMgr.Commit, so the check must be re-invoked here for
+				// `BEGIN ISOLATION LEVEL SERIALIZABLE ... COMMIT` to abort
+				// with SQLSTATE 40001 when a dangerous rw-structure is
+				// detected. Returns nil for RC/RR / write-less SERIALIZABLE.
+				if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
+					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
+						_ = s.cfg.TxnMgr.Rollback(explicitTx)
+						connTx.End()
+						return s.writeQueryError(w, "40001",
+							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
+					}
+				}
+				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					connTx.End()
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}
