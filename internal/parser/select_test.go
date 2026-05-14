@@ -302,6 +302,54 @@ func TestParseLateralPgCatalogQualifiedSRFCaseInsensitive(t *testing.T) {
 }
 
 
+// TestParseRangeVarBareAliasWithColumnList pins the
+// `tablename alias (col1, col2, ...)` shape — column-alias list
+// after a bare (no-AS) alias.  Used by upstream's MERGE JOIN
+// isolation spec for `INSERT INTO src SELECT x, x*10 FROM
+// generate_series(1,3) g(x);` and by the long-tail of regression
+// tests that omit AS.
+func TestParseRangeVarBareAliasWithColumnList(t *testing.T) {
+	stmts, err := Parse(`SELECT g.x FROM generate_series(1,3) g(x)`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	if len(sel.From) != 1 {
+		t.Fatalf("expected 1 FROM item, got %d", len(sel.From))
+	}
+	rv := sel.From[0]
+	if rv.TableFunc == nil || rv.TableFunc.Name != "generate_series" {
+		t.Fatalf("expected generate_series TableFunc, got %+v", rv)
+	}
+	if rv.Alias != "g" {
+		t.Fatalf("Alias=%q, want g", rv.Alias)
+	}
+	if len(rv.Columns) != 1 || rv.Columns[0] != "x" {
+		t.Fatalf("Columns=%v, want [x]", rv.Columns)
+	}
+}
+
+// TestParseRangeVarBareAliasMultiColumnList covers a multi-column
+// alias list on a bare alias (no AS keyword).
+func TestParseRangeVarBareAliasMultiColumnList(t *testing.T) {
+	stmts, err := Parse(`SELECT t.a, t.b FROM mytable t (a, b)`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	rv := sel.From[0]
+	if rv.Name != "mytable" {
+		t.Fatalf("Name=%q, want mytable", rv.Name)
+	}
+	if rv.Alias != "t" {
+		t.Fatalf("Alias=%q, want t", rv.Alias)
+	}
+	if len(rv.Columns) != 2 || rv.Columns[0] != "a" || rv.Columns[1] != "b" {
+		t.Fatalf("Columns=%v, want [a b]", rv.Columns)
+	}
+}
+
+
 // TestParseIndirectionStarFuncCall — `(srf(args)).*` in target list emits
 // an IndirectionStar AST node wrapping the inner FuncCall. M0103-0008
 // probe-survival foundation.

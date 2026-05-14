@@ -765,6 +765,27 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	if isAliasStart(p.cur()) {
 		t := p.advance()
 		rv.Alias = identText(t)
+		// Optional column alias list after a bare (no-AS) alias:
+		// `tbl alias (c1, c2, ...)` — used by table-function refs
+		// like `generate_series(1,3) g(x)` and the implicit-alias
+		// shorthand for ordinary tables.  Mirrors the AS-branch
+		// list parser above.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume '('
+			for {
+				colTok, cerr := p.parseIdent()
+				if cerr != nil {
+					return RangeVar{}, cerr
+				}
+				rv.Columns = append(rv.Columns, identText(colTok))
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+			if !p.acceptSymbol(")") {
+				return RangeVar{}, p.errAtCur("expected ')' after column alias list")
+			}
+		}
 	}
 	return rv, nil
 }

@@ -1355,6 +1355,32 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/ ./internal/executor/
           ./internal/planner/ ./internal/parser/` PASS.  Design:
           `docs/design/0100-0005h-explain-execute-prepared-rewrite.md`.
+        - RangeVar bare-alias column list (M0100-0005j,
+          2026-05-15 loop 26).  `parser.parseRangeVar`
+          (`internal/parser/select.go`) bare-alias fall-through
+          branch now consumes the optional `(c1, c2, ...)`
+          column-alias list, mirroring the AS-branch.  Was the
+          hard-fail for the `merge-join` isolation spec, whose
+          global setup uses
+          `INSERT INTO src SELECT x, x*10 FROM generate_series(1,3)
+          g(x);` — every permutation aborted at parse time with
+          `42601` "expected ';' or end of input (got ()".  Fix is
+          a single insert in `parseRangeVar`'s bare-alias branch:
+          after consuming the alias identifier, peek for `(`, then
+          read the comma-separated identifier list into
+          `rv.Columns`, matching the AS-branch logic.  No AST
+          changes — `RangeVar.Columns` already exists and is
+          consumed downstream.  Pinned by
+          `TestParseRangeVarBareAliasWithColumnList` (the SRF
+          shape from merge-join) and
+          `TestParseRangeVarBareAliasMultiColumnList` in
+          `internal/parser/select_test.go`.  `merge-join` global
+          setup now parses on every permutation; remaining
+          divergence is real MERGE / EXPLAIN / EPQ-recheck output
+          gaps tracked separately in the 21-spec pass goal.
+          `go test ./internal/parser/ ./internal/planner/
+          ./internal/analyzer/ ./internal/executor/` PASS.
+          Design: `docs/design/0100-0005j-rangevar-bare-alias-column-list.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
