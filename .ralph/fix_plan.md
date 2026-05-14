@@ -1257,6 +1257,42 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/executor/ ./internal/storage/ ./internal/server/
           ./internal/mvcc/` PASS.  Design:
           `docs/design/0100-0005f-lockrows-preserve-real-xmax.md`.
+        - drop-index-concurrently-1 global-setup unblock
+          (M0100-0005g, 2026-05-15 loop 23).  `CREATE INDEX
+          test_dc_data ON test_dc(data)` failed with
+          `column "data" is null and cannot be indexed (42804)`
+          for every spec whose table had a leading `serial` column
+          and the index built on a non-leading int column — the
+          drop-index-concurrently-1 spec being the first to hit it.
+          Root cause: `decodeValueSize` in
+          `internal/executor/codec.go` had no `serial` / `bigserial`
+          alias on its int4 / int8 arms, so the projection-skip
+          path that `collectBTreeEntries` takes for non-key columns
+          fell through to the varlen default, read the int4-encoded
+          SERIAL value's bytes as a 4-byte length prefix, and
+          advanced the offset by `4 + N` (where `N` was the stored
+          id).  The subsequent column's flag byte was misread, the
+          column was decoded as NULL, and the bulk btree build
+          rejected the row.  The encoder side (`encodeValue`) and
+          the full-decode path (`decodeValue`, `decodeValueArena`)
+          already had the `serial` / `bigserial` aliases — only
+          the size-scan path was missing them.  `smallserial` is
+          intentionally not added: `encodeValue` has no `int2`
+          aliasing arm for it either, so encoder + decoder are
+          symmetric for `smallserial` via the varlen default.
+          Regression pin:
+          `TestDecodeRowProjectionSkipsSerialColumn`
+          (table-driven `serial` + `bigserial`) in
+          `internal/executor/codec_projection_serial_test.go`.
+          `TestPort_IsolationDropIndexConcurrently1` global setup
+          now succeeds; the spec advances past CREATE INDEX and
+          defers on an `EXPLAIN (COSTS OFF) EXECUTE` parity issue
+          (utility-statement plan rendering — separate scope).
+          `go test -race ./internal/executor/ ./internal/storage/
+          ./internal/server/ ./internal/mvcc/ ./internal/wal/
+          ./internal/initdb/ ./internal/parser/ ./internal/planner/
+          ./internal/analyzer/` PASS.  Design:
+          `docs/design/0100-0005g-decode-value-size-serial-types.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

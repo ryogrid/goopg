@@ -182,14 +182,14 @@ func decodeValueSize(t catalog.Type, data []byte) (int, error) {
 			return 0, fmt.Errorf("truncated int2")
 		}
 		return 2, nil
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial":
 		if len(data) < 4 {
-			return 0, fmt.Errorf("truncated int4")
+			return 0, fmt.Errorf("truncated int4/serial")
 		}
 		return 4, nil
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial":
 		if len(data) < 8 {
-			return 0, fmt.Errorf("truncated int8")
+			return 0, fmt.Errorf("truncated int8/bigserial")
 		}
 		return 8, nil
 	case "bool", "boolean":
