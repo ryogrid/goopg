@@ -1447,6 +1447,28 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/ ./internal/mvcc/ ./internal/planner/
           ./internal/parser/` PASS.  Design:
           `docs/design/0100-0005n-cross-partition-update-moved-tuple-error.md`.
+        - Partition-child trigger firing (M0100-0005o, 2026-05-15 loop 31).
+          `updateOp.Next` SeqScan path and `deleteOp.Next` now thread
+          the row's source `*catalog.Table` through pending records
+          (new `scanTbl` field on `pendingUpdate` and `victim` in
+          `internal/executor/operators_storage.go`) and fire BEFORE
+          UPDATE / BEFORE DELETE triggers from that table instead of
+          the partitioned parent.  Previously `scanTblForTrig := tbl`
+          unconditionally used the parent — `partition-key-update-1.spec`
+          defines `footrg_mod_a` on the leaf partition `footrg1`
+          (`NEW.a = 2`, rewriting the partition key), and an UPDATE
+          targeting `footrg` never fired it.  FK enforcement on DELETE
+          (`enforceFKOnDelete(ctx, tbl, ...)`) intentionally still uses
+          the parent because FK metadata is anchored there.  The
+          IndexScan path (`updateViaIndex`) is unchanged — it scans a
+          single relation today; the parent-indexed partitioned case
+          can reuse the same pattern later.  Regression pins:
+          `TestPartitionChildTriggerFiresOnParentUpdate` and
+          `TestPartitionChildTriggerFiresOnParentDelete` in
+          `internal/server/notice_test.go` (both fail without the fix,
+          PASS with it).  `go test -race -count=1 ./internal/executor/
+          ./internal/server/` PASS.  Design:
+          `docs/design/0100-0005o-partition-child-trigger-firing.md`.
         - FK violation MESSAGE names routed leaf partition
           (M0100-0005m, 2026-05-15 loop 29).
           `insertOp.Next` (`internal/executor/operators_storage.go`)

@@ -207,6 +207,150 @@ func TestNoticeCaptureUpdateTrigger(t *testing.T) {
 	}
 }
 
+
+// TestPartitionChildTriggerFiresOnParentUpdate (M0100-0005o) verifies that
+// when a BEFORE UPDATE trigger is defined on a partition child but the UPDATE
+// statement targets the partitioned parent, the child's trigger still fires
+// for rows that route to that child. partition-key-update-1.spec depends on
+// this — `footrg_mod_a` is defined on `footrg1` (the leaf partition), and the
+// `footrg` UPDATE must observe the trigger's NEW.a rewrite.
+func TestPartitionChildTriggerFiresOnParentUpdate(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	colonIdx := strings.LastIndex(addr, ":")
+	if colonIdx < 0 {
+		t.Fatalf("addr: %s", addr)
+	}
+	host, port := addr[:colonIdx], addr[colonIdx+1:]
+	dsn := "host=" + host + " port=" + port + " user=postgres dbname=postgres sslmode=disable"
+
+	base, err := pq.NewConnector(dsn)
+	if err != nil {
+		t.Skipf("pq.NewConnector: %v", err)
+	}
+	var noticeMu sync.Mutex
+	var notices []string
+	withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
+		noticeMu.Lock()
+		notices = append(notices, n.Message)
+		noticeMu.Unlock()
+	})
+	db := sql.OpenDB(withNotice)
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, q := range []string{
+		`CREATE TABLE footrg_part (a int, b text) PARTITION BY LIST(a)`,
+		`CREATE TABLE footrg_part1 PARTITION OF footrg_part FOR VALUES IN (1)`,
+		`CREATE TABLE footrg_part2 PARTITION OF footrg_part FOR VALUES IN (2)`,
+		`INSERT INTO footrg_part VALUES (1, 'ABC')`,
+		`CREATE FUNCTION footrg_part_trig_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'before-update child'; RETURN NEW; END $$`,
+		`CREATE TRIGGER footrg_part_trig BEFORE UPDATE ON footrg_part1 FOR EACH ROW EXECUTE FUNCTION footrg_part_trig_fn()`,
+	} {
+		rows, err := conn.QueryContext(ctx, q)
+		if err != nil {
+			t.Skipf("setup %q: %v", q, err)
+		}
+		rows.Close()
+	}
+
+	noticeMu.Lock()
+	notices = nil
+	noticeMu.Unlock()
+
+	// Issue the UPDATE against the partitioned PARENT. The matching row lives
+	// in footrg_part1; the partition-child trigger must observe it.
+	rows, err := conn.QueryContext(ctx, `UPDATE footrg_part SET b = 'EFG' WHERE a = 1`)
+	if err != nil {
+		t.Fatalf("UPDATE on partitioned parent: %v", err)
+	}
+	rows.Close()
+
+	noticeMu.Lock()
+	got := append([]string(nil), notices...)
+	noticeMu.Unlock()
+	t.Logf("notices: %v", got)
+	if len(got) == 0 {
+		t.Fatal("partition-child BEFORE UPDATE trigger did not fire on UPDATE of partitioned parent (M0100-0005o regression)")
+	}
+}
+
+// TestPartitionChildTriggerFiresOnParentDelete (M0100-0005o) mirror of the
+// UPDATE case for the DELETE path — DELETE FROM partitioned-parent must
+// trigger the child's BEFORE DELETE trigger for rows routed to the child.
+func TestPartitionChildTriggerFiresOnParentDelete(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	colonIdx := strings.LastIndex(addr, ":")
+	if colonIdx < 0 {
+		t.Fatalf("addr: %s", addr)
+	}
+	host, port := addr[:colonIdx], addr[colonIdx+1:]
+	dsn := "host=" + host + " port=" + port + " user=postgres dbname=postgres sslmode=disable"
+
+	base, err := pq.NewConnector(dsn)
+	if err != nil {
+		t.Skipf("pq.NewConnector: %v", err)
+	}
+	var noticeMu sync.Mutex
+	var notices []string
+	withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
+		noticeMu.Lock()
+		notices = append(notices, n.Message)
+		noticeMu.Unlock()
+	})
+	db := sql.OpenDB(withNotice)
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, q := range []string{
+		`CREATE TABLE footrg_del (a int, b text) PARTITION BY LIST(a)`,
+		`CREATE TABLE footrg_del1 PARTITION OF footrg_del FOR VALUES IN (1)`,
+		`CREATE TABLE footrg_del2 PARTITION OF footrg_del FOR VALUES IN (2)`,
+		`INSERT INTO footrg_del VALUES (1, 'ABC')`,
+		`CREATE FUNCTION footrg_del_trig_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE NOTICE 'before-delete child'; RETURN OLD; END $$`,
+		`CREATE TRIGGER footrg_del_trig BEFORE DELETE ON footrg_del1 FOR EACH ROW EXECUTE FUNCTION footrg_del_trig_fn()`,
+	} {
+		rows, err := conn.QueryContext(ctx, q)
+		if err != nil {
+			t.Skipf("setup %q: %v", q, err)
+		}
+		rows.Close()
+	}
+
+	noticeMu.Lock()
+	notices = nil
+	noticeMu.Unlock()
+
+	rows, err := conn.QueryContext(ctx, `DELETE FROM footrg_del WHERE a = 1`)
+	if err != nil {
+		t.Fatalf("DELETE on partitioned parent: %v", err)
+	}
+	rows.Close()
+
+	noticeMu.Lock()
+	got := append([]string(nil), notices...)
+	noticeMu.Unlock()
+	t.Logf("notices: %v", got)
+	if len(got) == 0 {
+		t.Fatal("partition-child BEFORE DELETE trigger did not fire on DELETE from partitioned parent (M0100-0005o regression)")
+	}
+}
+
 // TestNoticeCaptureUpdateTriggerExplicitTx tests BEFORE UPDATE trigger NOTICE
 // within an explicit transaction (BEGIN), matching the isolation test scenario.
 func TestNoticeCaptureUpdateTriggerExplicitTx(t *testing.T) {

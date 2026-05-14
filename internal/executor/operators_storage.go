@@ -1562,12 +1562,13 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// loop forever. The two-pass approach trades a bit of memory for
 	// straightforward iteration semantics.
 	type pendingUpdate struct {
-		rel    storage.RelFileNode
-		blk    storage.BlockNumber
-		slot   uint16
-		cols   []catalog.Column // columns of the source relation
-		newRow Row
-		oldRow Row // for BEFORE UPDATE trigger firing
+		rel     storage.RelFileNode
+		blk     storage.BlockNumber
+		slot    uint16
+		cols    []catalog.Column // columns of the source relation
+		newRow  Row
+		oldRow  Row              // for BEFORE UPDATE trigger firing
+		scanTbl *catalog.Table   // table the row came from (M0100-0005o: partition-child triggers)
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
@@ -1606,7 +1607,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 			_ = computeGeneratedColumns(captureCols, newRow)
 			pending = append(pending, pendingUpdate{rel: captureRel, blk: blk, slot: slot, cols: captureCols, newRow: newRow,
-				oldRow: cloneRow(row)})
+				oldRow: cloneRow(row), scanTbl: scanTbl})
 			return nil
 		}); err != nil {
 			return nil, err
@@ -1615,10 +1616,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
 	for _, pu := range pending {
 		// Fire BEFORE UPDATE triggers (e.g. RAISE NOTICE) before writing.
-		scanTblForTrig := tbl
-		if pu.rel != rel && pu.rel != (storage.RelFileNode{}) {
-			// For partition/inheritance children, use the child table's triggers.
-			scanTblForTrig = tbl // parent triggers apply on writes
+		// M0100-0005o: when the row came from a partition/inheritance child,
+		// fire that child's triggers — partition-key-update-1.spec defines
+		// `footrg_mod_a` on `footrg1`, not on the parent `footrg`.
+		scanTblForTrig := pu.scanTbl
+		if scanTblForTrig == nil {
+			scanTblForTrig = tbl
 		}
 		if len(scanTblForTrig.Triggers) > 0 {
 			retRow, ok := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
@@ -1864,11 +1867,12 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
 	type victim struct {
-		rel  storage.RelFileNode
-		blk  storage.BlockNumber
-		slot uint16
-		row  Row
-		cols []catalog.Column // for EPQ chain-following (M0100-0004)
+		rel     storage.RelFileNode
+		blk     storage.BlockNumber
+		slot    uint16
+		row     Row
+		cols    []catalog.Column // for EPQ chain-following (M0100-0004)
+		scanTbl *catalog.Table   // table the row came from (M0100-0005o: partition-child triggers)
 	}
 	// Collect victims from parent + partition/inheritance children. M0096-0013.
 	var victims []victim
@@ -1886,18 +1890,25 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		}
 		captureRel := scanRel // capture for closure
 		captureCols := scanTbl.Columns
+		captureTbl := scanTbl
 		if err := scanMatching(o.ctx, scanRel, scanTbl.Columns, o.pred, func(blk storage.BlockNumber, slot uint16, row Row) error {
-			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row), cols: captureCols})
+			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row), cols: captureCols, scanTbl: captureTbl})
 			return nil
 		}); err != nil {
 			return nil, err
 		}
 	}
 	// Fire BEFORE DELETE triggers and enforce FK constraints. M0096-0011/0012.
+	// M0100-0005o: triggers may be defined on a partition/inheritance child
+	// rather than the parent; fire the source-relation's triggers.
 	filtered := victims[:0]
 	for _, v := range victims {
-		if len(tbl.Triggers) > 0 {
-			_, ok := fireTriggers(o.ctx, tbl, "before", "delete", v.row, nil)
+		trigTbl := v.scanTbl
+		if trigTbl == nil {
+			trigTbl = tbl
+		}
+		if len(trigTbl.Triggers) > 0 {
+			_, ok := fireTriggers(o.ctx, trigTbl, "before", "delete", v.row, nil)
 			if !ok {
 				continue // trigger returned NULL — skip deletion
 			}
