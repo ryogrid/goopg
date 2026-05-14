@@ -165,30 +165,35 @@ func DecodeMessage(payload []byte) (*DecodedMessage, error) {
 		out.OldTuple = cols
 		return out, nil
 	case pgoUpdate:
-		// 'U' | rel_oid(4) | old_tuple_type(1) | OldTupleData | 'N' | NewTupleData
+		// 'U' | rel_oid(4) | ['K'|'O' + OldTupleData]? | 'N' | NewTupleData
+		//
+		// Upstream omits the old-tuple section entirely when the
+		// row's REPLICA IDENTITY is DEFAULT and no replica-identity
+		// columns were changed by the update (logicalrep_write_update
+		// in proto.c: writes 'O' only for REPLICA IDENTITY FULL, 'K'
+		// only when key columns were modified, neither otherwise).
+		// In that case the byte after rel_oid is 'N' directly.
 		oid, err := r.u32()
 		if err != nil {
 			return nil, err
 		}
-		oldAction, err := r.u8()
+		marker, err := r.u8()
 		if err != nil {
 			return nil, err
 		}
 		var oldCols []DecodedColumn
-		if oldAction == 'K' || oldAction == 'O' {
+		if marker == 'K' || marker == 'O' {
 			oldCols, err = decodeTupleBody(r)
 			if err != nil {
 				return nil, err
 			}
-		} else {
-			return nil, fmt.Errorf("pgoutput: update old-tuple type=%q want K or O", oldAction)
+			marker, err = r.u8()
+			if err != nil {
+				return nil, err
+			}
 		}
-		newAction, err := r.u8()
-		if err != nil {
-			return nil, err
-		}
-		if newAction != 'N' {
-			return nil, fmt.Errorf("pgoutput: update new-tuple type=%q want N", newAction)
+		if marker != 'N' {
+			return nil, fmt.Errorf("pgoutput: update new-tuple type=%q want N (after optional K/O)", marker)
 		}
 		newCols, err := decodeTupleBody(r)
 		if err != nil {

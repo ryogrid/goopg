@@ -1,7 +1,7 @@
 # 0103-0003 — pgoutput Wire-Byte Interoperability (PG ↔ goopg, Both Directions)
 
-**Status:** draft
-**Date:** 2026-05-13
+**Status:** partial — subtest (a) landed 2026-05-14; subtest (b) deferred
+**Date:** 2026-05-13 (initial), 2026-05-14 (partial impl)
 **Milestone:** M0103-0004
 **Upstream reference:** `postgres/src/backend/replication/pgoutput/pgoutput.c` (`pgoutput_change`, `pgoutput_begin`, `pgoutput_commit`, `pgoutput_message`), `postgres/src/backend/replication/logical/proto.c` (`logicalrep_write_insert`, `logicalrep_write_update`, `logicalrep_write_delete`, `logicalrep_write_rel`, `logicalrep_read_*`), `postgres/src/include/replication/logicalproto.h` (message format constants).
 
@@ -137,6 +137,80 @@ go test -v -run TestPort_PgoutputInterop -timeout 5m ./internal/testport/
 
 Both subtests must pass. On failure, the test output points at the exact
 message type and byte offset of the divergence.
+
+## Implementation status (2026-05-14, loop 1)
+
+### Subtest (a) — `TestPort_PgoutputInteropPGToGoopg` — **PASS**
+
+Implemented in `internal/testport/pgoutput_interop_test.go`. Rather
+than running `pg_recvlogical` and parsing a captured file (which would
+require careful handling of the tool's exit-on-endpos semantics and
+file-buffer flush window), the test drives an in-database equivalent:
+
+  1. Spawn upstream PG (binaries under `postgres/local_install/bin`)
+     with `wal_level = logical`. The harness skips cleanly when those
+     binaries are missing.
+  2. Execute `CREATE TABLE t (id int PRIMARY KEY, v text)` +
+     `CREATE PUBLICATION p FOR ALL TABLES`.
+  3. Pre-create a `pgoutput` logical slot with
+     `pg_create_logical_replication_slot('goopg_interop', 'pgoutput')`.
+  4. Execute INSERT/INSERT/UPDATE/DELETE — four separate transactions
+     so the slot captures four Begin/Commit pairs.
+  5. Drain via `pg_logical_slot_get_binary_changes('goopg_interop',
+     NULL, NULL, 'proto_version', '1', 'publication_names', 'p')`.
+     Each row in the result is one pgoutput message; concatenating
+     them gives the exact byte stream a libpq subscriber would see.
+  6. Walk the byte blob with a per-kind length-aware splitter, route
+     each message through `wal.DecodeMessage`, and assert: kind
+     counts (1+ Begin / 1+ Commit / 1+ Relation / 2 Insert / 1 Update
+     / 1 Delete), relation name (`t`), column count (2), column type
+     OIDs (int4=23, text=25), and tuple contents (`(1,hello)`,
+     `(2,world)`, `(2,updated)`, delete-old-tuple `(1,<null>)` — the
+     last NULL reflects REPLICA IDENTITY DEFAULT's K-marker shape
+     where non-key columns are omitted).
+
+### Divergence found + fixed
+
+PG omits the entire old-tuple section in `'U'` messages when REPLICA
+IDENTITY is DEFAULT and the update did not touch a replica-identity
+column. The upstream wire bytes go directly from `'U' rel_oid` to
+`'N' tuple` — no `'K'` or `'O'` marker, no empty tuple. The goopg
+decoder previously required `'K'` or `'O'` and rejected such messages
+with `"update old-tuple type=%q want K or O"`. Fixed in
+`internal/wal/pgoutput_decoder.go::DecodeMessage` by treating the
+`'K'`|`'O' + old_tuple` block as optional.
+
+### Encoder asymmetry NOT yet fixed (blocks subtest b)
+
+`internal/wal/pgoutput.go::writeUpdate` and `writeDelete` still emit
+`'K' | uint16(0)` when no old tuple is provided. Per upstream
+`proto.c::logicalrep_write_update`, the K/O marker must be **omitted
+entirely** when no old tuple exists — emitting `'K'` with a zero-attr
+tuple is protocol-illegal and PG's apply worker will reject it. Fix
+required when subtest (b) is implemented: in writeUpdate, skip the
+K/O block when `oldTuple == nil`; in writeDelete, fall back to a
+synthetic K-tuple with key-column metadata (or just always require
+an oldTuple, since logical DELETE always has at least the key).
+
+### Subtest (b) — `TestPort_PgoutputInteropGoopgToPG` — **SKIPPED**
+
+Three prerequisites stand between the current state and a passing
+subtest (b):
+
+1. Wire support for `CREATE_REPLICATION_SLOT … LOGICAL pgoutput`.
+   `internal/server/replication.go::replyCreateReplicationSlot`
+   currently rejects every non-PHYSICAL kind with
+   `feature_not_supported`. Must call `wal.Slots.CreateLogical`,
+   plumb the `pgoutput` plugin name through, and return the
+   four-column reply (slot_name, consistent_point, snapshot_name,
+   output_plugin) with output_plugin populated.
+2. The writeUpdate/writeDelete encoder fix above.
+3. A small harness step that runs `CREATE SUBSCRIPTION` from a real
+   PG subscriber against the goopg primary and polls the
+   subscriber's `t` table for rows.
+
+These are tracked as the residual M0103-0004(b) work in
+`.ralph/fix_plan.md` and will land in a follow-up loop.
 
 ## Risks
 

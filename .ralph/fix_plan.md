@@ -1612,6 +1612,44 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       mapping (goopg → PG OIDs like INT4OID=23), commit_ts epoch (PG uses
       2000-01-01 microseconds), tuple text format, replica-identity marker.
       Verify: both subtests pass.
+      PARTIAL PROGRESS 2026-05-14 (loop 1): subtest (a) landed and
+      passes. Test spawns upstream PG (`postgres/local_install/bin`)
+      with `wal_level=logical`, creates a `pgoutput` logical slot via
+      `pg_create_logical_replication_slot`, executes
+      INSERT/INSERT/UPDATE/DELETE on a published `(id int PK, v text)`
+      table, then drains the slot through
+      `pg_logical_slot_get_binary_changes('p', NULL, NULL,
+      'proto_version','1','publication_names','p')`. Concatenated
+      bytea rows form the exact byte stream a libpq subscriber would
+      see; the test walks them, decodes each via `wal.DecodeMessage`,
+      and asserts message kinds, relation name + column OIDs
+      (int4=23, text=25), and tuple contents.
+      Real divergence caught + fixed: PG omits the old-tuple section
+      entirely for UPDATE under REPLICA IDENTITY DEFAULT when no
+      replica-identity column was modified (`'U' relOid 'N' tuple`
+      directly). The previous goopg decoder required `'K'` or `'O'`
+      after rel_oid and rejected such messages. `wal.DecodeMessage`
+      now treats the K/O block as optional and accepts both shapes.
+      Encoder symmetry NOT yet fixed: `pgoutput.go::writeUpdate` /
+      `writeDelete` still emit `'K' | natts=0` when no old tuple is
+      provided — a malformed `'K'` per upstream proto.c. This
+      surfaces only on the goopg-publisher path (subtest b) and is
+      tracked as part of the deferred work below.
+      Subtest (b) is `t.Skip` pending: (i)
+      `replyCreateReplicationSlot` accepting `LOGICAL pgoutput`
+      (currently returns `feature_not_supported`); (ii) the
+      writeUpdate/writeDelete encoder fix to omit the K/O marker when
+      no old tuple exists; (iii) a small bring-up harness that
+      spawns a real PG subscriber and runs `CREATE SUBSCRIPTION`
+      against goopg.
+      Verification: `go test -count=1 -timeout 120s
+      -run TestPort_PgoutputInterop -v ./internal/testport/` →
+      `TestPort_PgoutputInteropPGToGoopg` PASS,
+      `TestPort_PgoutputInteropGoopgToPG` SKIP. Regression coverage
+      green: `go test -count=1 -race -timeout 120s ./internal/wal/
+      ./internal/server/ ./internal/executor/ ./internal/catalog/`
+      → all pass (wal 2.981 s, server 3.440 s, executor 2.545 s,
+      catalog 1.019 s).
 
 - [ ] **M0103-0005** — Logical-walsender SyncRep integration.
       Design doc: `docs/design/0103-0004-logical-syncrep-integration.md`.
