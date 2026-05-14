@@ -1610,10 +1610,76 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
         §"M0104-0002 status" updated with the landed deliverables;
         README index row mirrored.
 
-- [ ] **M0104-0003**
+- [x] **M0104-0003**
       - Summary: Predicate-lock substrate (SIREAD).
-      - Implement predicate-lock target tracking (relation/page/tuple and range
-        abstraction for phantom prevention) plus lock coarsening policy.
+      - Landed 2026-05-14:
+        (a) `mvcc.PredicateLockTag` introduced in `internal/mvcc/predlock.go`
+            as the goopg analogue of PostgreSQL's `PREDICATELOCKTARGETTAG`
+            (`src/include/storage/predicate_internals.h`) — four-field
+            `(DB, Rel, Page, Offset)` struct with granularity (relation / page
+            / tuple / invalid) encoded in sentinel fields
+            (`Page == InvalidBlockNumber` ⇒ relation, `Offset == 0` ⇒ page,
+            otherwise tuple). Constructors `RelationLockTag` / `PageLockTag` /
+            `TupleLockTag` panic on invalid inputs so callers commit to a
+            granularity at construction.
+        (b) `PredicateLockTag.Covers(other)` captures the implicit-coverage
+            hierarchy with O(1) short-circuit on `(DB, Rel)` mismatch.
+            Coverage drives idempotent Acquire (no-op if a coarser lock
+            already covers the new tag) and coarsening pruning.
+        (c) `SerializableXact.predicateLocks` flips from a forward-declared
+            empty `[]predicateLockRef` to `map[PredicateLockTag]struct{}` —
+            set semantics give O(holdings) coverage checks and coarsening
+            pruning without slice reshuffling. Nil until first acquire so
+            M0104-0002's zero-cost RC/RR contract is preserved.
+        (d) `Manager.predicateLocks` (`predicateLocksRegistry`) is the
+            global inverted index `targets map[PredicateLockTag]*predicateLockTarget`
+            (target → holder set of `SerializableXact` handles) that
+            M0104-0005's conflict-out hook will walk. Empty target slots
+            are evicted on the last holder release so the global map size
+            tracks live (target, holder) pairs exactly.
+        (e) `Manager.AcquirePredicateLock(handle, tag)` is the single entry
+            point: reject invalid tag, no-op for non-SERIALIZABLE handles
+            (RC/RR/finished xacts pass silently), idempotent under existing
+            coarser coverage, prune every owned tag the new tag covers,
+            install the new tag in both maps, then run the coarsening
+            cascade.
+        (f) `coarsenAfterAcquireLocked` runs three stages finest-first —
+            per-page (tuple count on the same page > `PerPage` → page-level
+            promotion), per-relation (page count on the same rel >
+            `PerRelation` → relation-level promotion), per-xact ceiling
+            (total holdings > `PerXact` → promote the busiest `(db, rel)`
+            footprint, tie-breaker `(db, rel)` ascending for deterministic
+            test behaviour under randomised map iteration).
+        (g) `Manager.releasePredicateLocksLocked(handle)` is called from
+            `releaseSerializableLocked` *before* `FinishedAt` is stamped —
+            the `SerializableXact` is still addressable via the registry
+            while the release runs.
+        (h) GUC parity: `max_predicate_locks_per_xact` (BootVal=64 range=
+            [10, 1<<30] ContextPostmaster), `max_predicate_locks_per_relation`
+            (BootVal=-2 range=[-1<<30, 1<<30] ContextSigHup),
+            `max_predicate_locks_per_page` (BootVal=2 range=[0, 1<<16]
+            ContextSigHup) registered in `internal/config/defaults.go`.
+            PG's `-N` shorthand for per-relation is surfaced verbatim;
+            server-side bridge into `Manager.SetPredicateLockLimits`
+            (lands when M0104-0004 wires the read-path hook through the
+            executor) is the only resolver into positive thresholds.
+      - Regression pins (`internal/mvcc/predlock_test.go`):
+        `TestPredicateLockTag_Granularity`,
+        `TestPredicateLockTag_Covers`,
+        `TestPredicateLock_AcquireOnlyForSerializable`,
+        `TestPredicateLock_AcquireAndReleaseOnCommit` (table-driven over
+        commit + rollback), `TestPredicateLock_IdempotentUnderCoarserOwnership`,
+        `TestPredicateLock_AcquireCoarserPrunesFiner`,
+        `TestPredicateLock_PerPageCoarsening`,
+        `TestPredicateLock_PerRelationCoarsening`,
+        `TestPredicateLock_PerXactOverflowCoarsens`,
+        `TestPredicateLock_GlobalTargetHoldersTrackMultipleXacts`,
+        `TestPredicateLock_InvalidTagRejected`,
+        `TestPredicateLock_LimitsRoundTrip`;
+        plus `internal/config/guc_test.go::TestPredicateLockGUCDefaults`
+        (boot values 64 / -2 / 2 + range gates including PG's `per_xact >= 10`
+        floor).
+      - Design doc: `docs/design/0104-0003-predicate-lock-substrate.md`.
 
 - [ ] **M0104-0004**
       - Summary: Read-path SSI conflict-in hooks.

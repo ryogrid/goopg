@@ -91,6 +91,35 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextUserset,
 		Scope:       ScopeSession | ScopeTransaction,
 	}))
+	// SSI predicate-lock sizing (M0104-0003). Names, defaults, and
+	// ranges mirror postgres/src/backend/utils/misc/guc_tables.c so
+	// existing tooling (postgresql.conf templates, parameter probes,
+	// pgbench setups) keeps working unchanged.
+	//
+	// Upstream encodes the per-relation default as -2 (and per-xact-
+	// coarsened-from-per-relation as a negative fraction). goopg
+	// surfaces the GUC values verbatim here so the server-side
+	// bridge into `mvcc.Manager.SetPredicateLockLimits` is the
+	// only place that resolves the negative shorthand into positive
+	// coarsening thresholds.
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_predicate_locks_per_xact", Type: TypeInt, BootVal: "64",
+		MinVal: 10, MaxVal: 1 << 30,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_predicate_locks_per_relation", Type: TypeInt, BootVal: "-2",
+		MinVal: -1 << 30, MaxVal: 1 << 30,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_predicate_locks_per_page", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: 1 << 16,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 
 	// connection-level GUCs that goopg actually honours today.
 	r.MustRegister(NewVariable(Variable{

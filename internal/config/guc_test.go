@@ -233,3 +233,59 @@ func TestCheckpointGUCDefaults(t *testing.T) {
 		t.Errorf("checkpoint_timeout after 5min set: Display=%q want 300", v.Display())
 	}
 }
+
+
+// TestPredicateLockGUCDefaults pins the M0104-0003 SSI predicate-lock
+// sizing GUCs. Names, default boot values, and ranges follow
+// `postgres/src/backend/utils/misc/guc_tables.c` so existing tooling
+// (postgresql.conf templates, parameter probes, pgbench setups) keeps
+// behaving the same against goopg as against upstream.
+//
+// The `-2` default for `max_predicate_locks_per_relation` is the
+// upstream shorthand "use per_xact / 2 as the per-relation
+// threshold"; the GUC layer surfaces the negative value verbatim and
+// the server-side bridge into `mvcc.Manager.SetPredicateLockLimits`
+// is the only place that resolves it into positives. A regression
+// that rejected `-2` here would break parity with every
+// postgresql.conf in the wild.
+func TestPredicateLockGUCDefaults(t *testing.T) {
+	r := BuildDefaultRegistry()
+
+	cases := []struct {
+		name    string
+		bootVal string
+	}{
+		{"max_predicate_locks_per_xact", "64"},
+		{"max_predicate_locks_per_relation", "-2"},
+		{"max_predicate_locks_per_page", "2"},
+	}
+	for _, c := range cases {
+		v, ok := r.Get(c.name)
+		if !ok {
+			t.Errorf("%s: not registered", c.name)
+			continue
+		}
+		if v.BootVal != c.bootVal {
+			t.Errorf("%s: BootVal=%q want %q", c.name, v.BootVal, c.bootVal)
+		}
+		if v.Display() != c.bootVal {
+			t.Errorf("%s: Display=%q want %q", c.name, v.Display(), c.bootVal)
+		}
+	}
+
+	// max_predicate_locks_per_xact rejects values below the upstream
+	// floor of 10 — a single predicate-lock entry per xact is too few
+	// to make coarsening meaningful.
+	if err := r.Set("max_predicate_locks_per_xact", "5", SourceConfigFile); err == nil {
+		t.Error("expected max_predicate_locks_per_xact=5 to be rejected (< 10)")
+	}
+	// max_predicate_locks_per_relation accepts the negative shorthand.
+	if err := r.Set("max_predicate_locks_per_relation", "-4", SourceConfigFile); err != nil {
+		t.Errorf("max_predicate_locks_per_relation=-4: %v", err)
+	}
+	// max_predicate_locks_per_page rejects negatives — the page-level
+	// threshold has no negative-shorthand semantic upstream.
+	if err := r.Set("max_predicate_locks_per_page", "-1", SourceConfigFile); err == nil {
+		t.Error("expected max_predicate_locks_per_page=-1 to be rejected (must be >= 0)")
+	}
+}

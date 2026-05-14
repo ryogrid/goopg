@@ -96,6 +96,12 @@ type Manager struct {
 	// (M0104-0002). Lazily initialised when the first serializable
 	// transaction Begins; protected by Manager.mu. See ssi.go.
 	ssiState ssiState
+
+	// predicateLocks is the SIREAD predicate-lock registry
+	// (M0104-0003). Lazy-initialised on first AcquirePredicateLock;
+	// protected by Manager.mu. RC/RR workloads never allocate it.
+	// See predlock.go.
+	predicateLocks predicateLocksRegistry
 }
 
 // NewManager returns a fresh manager whose first assigned xid is 3,

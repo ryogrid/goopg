@@ -75,19 +75,18 @@ type SerializableXact struct {
 	inConflicts  []*SerializableXact
 	outConflicts []*SerializableXact
 
-	// predicateLocks is the list of SIREAD predicate-lock targets
-	// owned by this transaction (M0104-0003 will populate). The
-	// lifecycle slice declares the slot but never appends; cleanup
-	// on finish() releases it.
-	predicateLocks []predicateLockRef
+	// predicateLocks is the set of SIREAD predicate-lock targets
+	// owned by this transaction. M0104-0003 populates it via
+	// Manager.AcquirePredicateLock; entries are pruned in place when
+	// coarsening promotes finer locks. Stored as a set (not a slice)
+	// so coverage checks and de-duplication on acquire are O(1) per
+	// owned tag, and so detachPredicateLockLocked can remove a tag in
+	// place during release/coarsening without slice reshuffling. The
+	// map is nil for read-only-on-this-target xacts so RC/RR /
+	// non-SERIALIZABLE workloads pay no allocation; first acquire
+	// initialises it.
+	predicateLocks map[PredicateLockTag]struct{}
 }
-
-// predicateLockRef is an opaque forward declaration for the
-// predicate-lock target type that M0104-0003 will define. We expose
-// it as an unexported type with no fields so the SerializableXact
-// struct shape is stable across slices: M0104-0003 can fill in the
-// concrete fields without changing SerializableXact's public surface.
-type predicateLockRef struct{}
 
 // IsActive reports whether the SerializableXact is still in-flight.
 // Returns true while the owning transaction is in Manager.active,
@@ -152,14 +151,21 @@ func (m *Manager) releaseSerializableLocked(handle TxnHandle) *SerializableXact 
 	if !ok {
 		return nil
 	}
+	// M0104-0003: release predicate locks before stamping FinishedAt
+	// so the global target map (m.predicateLocks.targets) is cleared
+	// of this xact's entries while the SerializableXact is still
+	// addressable through the registry. releasePredicateLocksLocked
+	// also nulls sx.predicateLocks once it's done so the released
+	// pointer no longer holds references to global state.
+	m.releasePredicateLocksLocked(handle)
+
 	sx.FinishedAt = m.ssiState.nextCommitSeqNo
 	m.ssiState.nextCommitSeqNo++
-	// M0104-0003+ will null out edge slices here when peers point
+	// M0104-0004+ will null out edge slices here when peers point
 	// back; for now they are always nil, so an unconditional clear
 	// is fine.
 	sx.inConflicts = nil
 	sx.outConflicts = nil
-	sx.predicateLocks = nil
 	delete(m.ssiState.xacts, handle)
 	return sx
 }
