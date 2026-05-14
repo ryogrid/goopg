@@ -3172,6 +3172,72 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         logical SyncRep wait integration), proto_version=2
         streaming subxacts, column-ref-typed `nextval` args,
         `filler char(N)` bpchar padding through pgoutput.
+      - PARTIAL PROGRESS 2026-05-14 (rung 24): `filler char(N)`
+        bpchar padding through pgoutput (PG → goopg). Pins that
+        pgoutput correctly replicates fixed-length blank-padded
+        `char(N)`/`bpchar(N)` column values end-to-end through
+        rungs 1–23's apply path. Rungs 1–23 only exercised
+        variable-length text (`text`, `varchar`); `char(N)` is
+        a separate codec path on both ends: publisher's pgoutput
+        emits bpchar as N-byte text padded with trailing spaces
+        (standard `bpcharout`), apply-worker's
+        `parsePgoutputText` falls through to
+        `NewStringDatum(s)` (variable-length fallback — no
+        bpchar branch needed because the storage encoder
+        handles it), `internal/executor/codec.go::encodeAttr`'s
+        bpchar branch right-strips trailing spaces before
+        writing the heap tuple (keeps storage compact +
+        `compareDatum`'s padding-insensitive bpchar equality
+        intact), and `internal/server/dispatch.go` re-pads to
+        declared width N on the DataRow wire so SELECTs over
+        goopg match PG's bpchar output shape. **No goopg code
+        change required** — the rung pins that all three
+        pieces compose correctly. Design doc:
+        `docs/design/0103-0047-m0103-0007-rung-24-bpchar-padding.md`
+        (accepted).
+      - Fixture:
+        `CREATE TABLE public.bpchar_log (id int PRIMARY KEY,
+        code char(1) NOT NULL, filler char(20))` on both sides.
+        `code char(1) NOT NULL` exercises the bare-`char`
+        defaults-to-`char(1)` path; the NOT NULL guards
+        against a silent regression that lands everything as
+        NULL. `filler char(20)` is nullable so the rung pins
+        the bpchar-NULL pgoutput path too.
+      - Workload: four INSERTs (`'A'/'ab'`, `'B'/'X'`,
+        `'C'/'twenty char filler'`, `'D'/NULL`) + an UPDATE on
+        id=1 (`SET filler='new'`) to exercise the UPDATE apply
+        path with a bpchar new value (rung 21 territory +
+        bpchar). REPLICA IDENTITY DEFAULT (PK on `id`) lets
+        the apply worker locate the existing row.
+      - Assertions on subscriber: `count(*) = 4`,
+        `count(filler) = 3` (NULL bpchar made it through),
+        `length(filler) = 3 where id=1` (UPDATE replaced),
+        `length(filler) = 1 where id=2` (minimum),
+        `length(filler) = 18 where id=3` (under-N),
+        `filler IS NULL where id=4`, `code = 'A' where id=1`.
+        `length()` over the stripped storage form catches the
+        codec failing to strip pad bytes (would observe
+        `length = 20`), pgoutput sending a wrong bpchar
+        shape, or the apply worker storing wire bytes literally.
+      - Pinned by `TestPort_PgoutputInteropPGToGoopgBpcharPadding`
+        in `internal/testport/pgoutput_interop_test.go`.
+        baseDir kept short (`pg2g-bpchar`) for the 108-byte
+        Unix-sockaddr limit.
+      - Verification (rung 24):
+        `go test -count=1 -timeout 180s
+        -run TestPort_PgoutputInteropPGToGoopgBpcharPadding
+        ./internal/testport/` → PASS (~1.75 s).
+        `go test -count=1 -timeout 360s
+        -run TestPort_PgoutputInteropPGToGoopg
+        ./internal/testport/` → all 10
+        `TestPort_PgoutputInteropPGToGoopg*` rungs PASS
+        (~33.9 s total). `go build ./...` clean.
+      - Next rungs (deferred within M0103-0007):
+        `sync_remote_apply` subtest (zero-loss
+        `count(*) == killCommitted + 1` invariant, requires
+        logical SyncRep wait integration), proto_version=2
+        streaming subxacts, column-ref-typed `nextval` args,
+        binary-format pgoutput.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.

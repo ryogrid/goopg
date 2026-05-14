@@ -2774,3 +2774,120 @@ func hexNibble(c byte) int {
 	}
 	return -1
 }
+
+// TestPort_PgoutputInteropPGToGoopgBpcharPadding pins M0103-0007
+// rung 24: `filler char(N)` bpchar padding through pgoutput. Rungs 1–23
+// only exercised variable-length text (text, varchar) column types;
+// char(N) is a separate codec path on both ends. Publisher's pgoutput
+// emits bpchar values as N-byte text padded with trailing spaces (the
+// standard bpcharout function); apply-worker's parsePgoutputText falls
+// through to NewStringDatum(s) — no bpchar branch needed because the
+// storage encoder strips trailing spaces in
+// internal/executor/codec.go::encodeAttr's bpchar branch, keeping
+// storage compact and compareDatum's padding-insensitive bpchar
+// equality intact; dispatch re-pads to declared width N on the
+// DataRow wire so SELECTs over goopg match PG's bpchar output shape.
+//
+// Design doc: docs/design/0103-0047-m0103-0007-rung-24-bpchar-padding.md.
+func TestPort_PgoutputInteropPGToGoopgBpcharPadding(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-bpchar")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_bpchar"
+	psc := pubsubcluster.NewMixed(t, "pg2g_bpchar", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// `code char(1) NOT NULL` exercises the bare-char defaults-to-char(1)
+	// path; the NOT NULL guards against a silent regression that lands
+	// everything as NULL. `filler char(20)` is nullable so the rung also
+	// pins the bpchar-NULL path through pgoutput.
+	schemaSQL := "CREATE TABLE public.bpchar_log (id int PRIMARY KEY, code char(1) NOT NULL, filler char(20))"
+	psc.Publisher.Exec(t, schemaSQL)
+	psc.Subscriber.Exec(t, schemaSQL)
+
+	psc.CreatePublication(t, "bpchar_log")
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Four INSERTs exercise distinct bpchar shapes:
+	//   id=1: short value 'ab', PG pads to 20 on the wire, codec strips on store.
+	//   id=2: minimum-length value 'X'.
+	//   id=3: 18-char value (just under N).
+	//   id=4: NULL filler — pgoutput sends 'n' status byte instead of 't'.
+	psc.Publisher.Exec(t, "INSERT INTO public.bpchar_log VALUES (1, 'A', 'ab')")
+	psc.Publisher.Exec(t, "INSERT INTO public.bpchar_log VALUES (2, 'B', 'X')")
+	psc.Publisher.Exec(t, "INSERT INTO public.bpchar_log VALUES (3, 'C', 'twenty char filler')")
+	psc.Publisher.Exec(t, "INSERT INTO public.bpchar_log (id, code) VALUES (4, 'D')")
+
+	// UPDATE the bpchar column on id=1 — exercises the UPDATE apply path
+	// for a non-key bpchar column (REPLICA IDENTITY DEFAULT uses the PK).
+	psc.Publisher.Exec(t, "UPDATE public.bpchar_log SET filler = 'new' WHERE id = 1")
+
+	// Wait for all four rows to land. Bounded; the per-row assertions
+	// below catch a stuck apply worker independently.
+	psc.WaitForRow(t, "public.bpchar_log", "id IN (1, 2, 3, 4)", 4, 60*time.Second)
+
+	// count(*) = 4: all four INSERTs landed.
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.bpchar_log"); got != "4" {
+		t.Fatalf("subscriber count(*) = %s, want 4", got)
+	}
+	// count(filler) = 3: NULL bpchar at id=4 came through as NULL.
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(filler) FROM public.bpchar_log"); got != "3" {
+		t.Fatalf("subscriber count(filler) = %s, want 3 (id=4 should be NULL)", got)
+	}
+	// length(filler) over the stripped storage form catches the codec
+	// failing to strip trailing pad bytes (would observe length = 20).
+	checks := []struct {
+		id      int
+		wantLen string
+	}{
+		{1, "3"},  // UPDATE replaced 'ab' with 'new'
+		{2, "1"},  // minimum-length value
+		{3, "18"}, // under-N value 'twenty char filler' is exactly 18 chars
+	}
+	for _, c := range checks {
+		got := psc.Subscriber.QueryScalar(t,
+			fmt.Sprintf("SELECT length(filler) FROM public.bpchar_log WHERE id = %d", c.id))
+		if got != c.wantLen {
+			t.Fatalf("subscriber length(filler) where id=%d = %s, want %s", c.id, got, c.wantLen)
+		}
+	}
+	// NULL preservation: filler IS NULL at id=4.
+	if got := psc.Subscriber.QueryScalar(t,
+		"SELECT filler IS NULL FROM public.bpchar_log WHERE id = 4"); got != "t" {
+		t.Fatalf("subscriber filler IS NULL where id=4 = %s, want t", got)
+	}
+	// char(1) NOT NULL roundtrip: code = 'A' where id=1.
+	if got := psc.Subscriber.QueryScalar(t,
+		"SELECT code FROM public.bpchar_log WHERE id = 1"); got != "A" {
+		t.Fatalf("subscriber code where id=1 = %q, want %q", got, "A")
+	}
+}
