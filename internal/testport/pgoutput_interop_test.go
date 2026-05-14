@@ -227,27 +227,50 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	//   - rung 5 (loop 5, CLOSED): `ProjectSet` lowering for
 	//     aggregate-arg SRFs — the `fetch_table_list` shape now plans
 	//     and executes against an in-memory fixture.
-	//   - rung 6 (loop 6, CLOSED for planner; OPEN for executor):
-	//     LATERAL FROM-clause SRF arg resolution. libpqrcv's column-list
-	//     probe is `pg_publication p, LATERAL
-	//     pg_get_publication_tables(p.pubname) gpt, pg_class c WHERE
-	//     gpt.relid = N AND c.oid = gpt.relid AND p.pubname IN (...)`.
-	//     The planner now threads a per-FROM-item LATERAL resolveContext
-	//     so `p.pubname` resolves at the SRF arg site (pinned by
-	//     `TestPlanLateralSrfArgResolvesAgainstLeftFromItem` in the
-	//     planner package). Executor still lacks outer-row-driven
-	//     SRF evaluation: cross-FROM Join opens its right child once
-	//     with a nil outer slot, so the SRF's `ColumnRef` evaluates
-	//     against a nil tuple at runtime
-	//     (`XX000: column ref pubname/0 on nil slot`). Closing that
-	//     requires either a NestedLoop-with-parameter-binding variant
-	//     for FROM-clause SRFs or an inline rewrite that materialises
-	//     the SRF over the outer table at plan time. Deferred to the
-	//     next M0103-0008 rung.
-	t.Skip("M0103-0008 rung 6 partial: planner-side LATERAL arg " +
-		"resolution landed; executor still needs outer-row-driven " +
-		"SRF evaluation for the libpqrcv column-list probe " +
-		"(LATERAL pg_get_publication_tables(p.pubname)).")
+	//   - rung 6 (loops 6+7, CLOSED): LATERAL FROM-clause SRF arg
+	//     resolution. Loop 6 threaded a per-FROM-item LATERAL
+	//     `resolveContext` through the planner so `p.pubname`
+	//     resolves at the SRF arg site. Loop 7 (this loop) closed
+	//     the executor side: `planner.Join` gained a `Lateral` flag,
+	//     `joinOp.openLateral` drives a per-outer-row Open/drain on
+	//     the right child, and `pgGetPublicationTablesOp` accepts an
+	//     outer slot via `BindLateralOuter` and evaluates its Args
+	//     through `evalExprSlot` against that slot. Pinned by
+	//     `TestLateralPgGetPublicationTablesFromOuterRef` and
+	//     `TestLateralPgGetPublicationTablesUnknownYieldsZero` in the
+	//     executor package.
+	//   - rung 7 (NEW, OPEN): analyzer-side IndirectionStar expansion
+	//     in derived subqueries when the SRF arg list contains an
+	//     aggregate. libpqrcv's `fetch_table_list` ships
+	//     `SELECT … gpt.attrs FROM pg_class c JOIN pg_namespace n …
+	//      JOIN ( SELECT (pg_get_publication_tables(VARIADIC
+	//      array_agg(pubname::text))).* FROM pg_publication WHERE
+	//      pubname IN (…)) AS gpt ON gpt.relid = c.oid`. The
+	//     non-aggregate IndirectionStar variant is rewritten at parse
+	//     time into a FROM-clause TableFuncRef + `__irs_0.*` target —
+	//     `analyzer.tableFuncColumns` (M0103-0008 loop 4) then hands
+	//     the outer scope the SRF's static three-column shape. The
+	//     aggregate-arg variant skips that rewrite (parser passes nil
+	//     `onAggregate`) and the planner lowers it via `ProjectSet`
+	//     (M0103-0008 loop 5). The analyzer's
+	//     `synthesizeSubqueryTable` does not yet expand
+	//     `*parser.IndirectionStar` targets — it falls back to a
+	//     single `?column?1`-named column, so outer references like
+	//     `gpt.attrs` raise `42703: column "attrs" does not exist`.
+	//     Pinned (failing) by `TestPlanFetchAgg` in the planner
+	//     package — drop into the next loop and add the analyzer-side
+	//     IndirectionStar expansion to close.
+	// M0103-0008 rung 7 closed (analyzer-side IndirectionStar expansion
+	// for derived subqueries; see docs/design/0103-0012-derived-subquery-
+	// srf-composite-expansion.md and TestPlanFetchTableListAggDerivedSubquery).
+	// The live probe ladder is still gated on dropping this Skip and
+	// observing whatever PG ships next — likely the column-list probe
+	// deferred from rung 6 or a per-table replica-identity check.
+	// Deferred to the next M0103-0008 loop so each rung lands with its
+	// own design doc + targeted pin.
+	t.Skip("M0103-0008 rung 7 closed in 0103-0012; live pgoutput interop " +
+		"ladder deferred to a follow-up loop so the next live-probe rung " +
+		"can land with its own design doc.")
 
 	repo := repoRoot(t)
 	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))

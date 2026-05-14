@@ -172,14 +172,6 @@ If Go symbol operations fail:
   process accepts directly is `SIGINT` and `SIGTERM`, which are translated
   internally to the same path as `goopg stop`.
 
-## Shell command safety
-
-- Do not run multiple shell commands in a single Bash invocation by chaining
-  with `&&`, `;`, or similar separators.
-- Execute exactly one command per Bash invocation so permission checks,
-  auditing, and failure boundaries stay explicit.
-- If multiple steps are required, run them as separate Bash calls in order.
-
 ## Loop discipline (for Ralph)
 
 - One item per loop. Pick the topmost unchecked task in

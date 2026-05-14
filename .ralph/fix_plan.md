@@ -2094,6 +2094,122 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       `TestPort_PgoutputInteropGoopgToPG` was restored with rung-6
       diagnosis quoted verbatim so the next loop can resume from
       the exact failing surface.
+      PARTIAL PROGRESS 2026-05-14 (loop 7): closed rung-6 executor
+      side. Design doc:
+      `docs/design/0103-0011-lateral-from-srf-executor-bind.md`
+      (accepted).
+      Changes:
+      - `internal/planner/plan.go`: `Join` gains `Lateral bool`.
+      - `internal/planner/planner.go`: new `nodeReferencesOuter(n)` /
+        `exprContainsColumnRef(e)` helpers (the latter wraps the
+        package's existing `walkExprTree`). `planFromRangeVars`,
+        `planFromClause`, and `planFromItem` set `Lateral` on the
+        `*Join` they build whenever the right child is a
+        `*PgGetPublicationTables` whose Args contain a `ColumnRef`
+        (i.e., it actually used the lateralCtx). Conservative —
+        non-LATERAL right children retain the materialise-both-sides
+        default.
+      - `internal/executor/operators_pg_get_publication_tables.go`:
+        `pgGetPublicationTablesOp` gains an `outerSlot SlotView` field
+        plus a `BindLateralOuter(slot SlotView)` method. Open() now
+        evaluates each arg via `evalExprSlot(a, o.outerSlot, ctx)`
+        instead of `evalExpr(a, nil, ctx)` so a `*ColumnRef` resolves
+        through the bound outer row. nil outerSlot preserves the
+        original "args must be self-contained" semantics.
+      - `internal/executor/operators_join_agg.go`: new
+        `lateralBindable` interface + `joinOp.openLateral` path.
+        Drains the left, binds a reusable `*MaterializedSlot` over
+        the left's schema on the right via `BindLateralOuter`, then
+        per-outer-row overwrites the bound slot's row, calls
+        `right.Open(ctx)` (so arg evaluation sees the new outer),
+        drains the right, evaluates the join predicate, and appends
+        concatenated rows to `o.rows`. Closes the right between
+        iterations. LEFT join semantics: zero SRF rows for an outer
+        emit a null-padded outer row. CROSS/INNER drop unmatched.
+        Open dispatch order:
+        Semi/Anti → openLazyHashJoin
+        Hash → openLazyHashJoin
+        Lateral → openLateral (NEW)
+        default → drain both + runMergeJoin / runNestedLoop.
+      Tests:
+      - `internal/executor/operators_pg_get_publication_tables_test.go`:
+        `TestLateralPgGetPublicationTablesFromOuterRef` (two outer
+        rows each yield one SRF result row),
+        `TestLateralPgGetPublicationTablesUnknownYieldsZero` (outer
+        row whose pubname doesn't match drops out).
+      - `internal/planner/planner_test.go`:
+        `TestPlanFetchTableListAggDerivedSubquery (t.Skip)` pins the
+        next rung (rung 7).
+      Verification (loop 7): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green (parser 1.05 s, planner 1.07 s,
+      analyzer 1.04 s, executor 2.59 s, server 3.52 s, wal 3.13 s,
+      catalog 1.02 s).
+      Next gap (rung 7): dropping the `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` exposed
+      `fetch_table_list` rather than the column-list probe. The
+      shape uses `(pg_get_publication_tables(VARIADIC
+      array_agg(pubname::text))).*` inside a derived subquery.
+      The non-aggregate IndirectionStar variant is rewritten at
+      parse time into a FROM-clause TableFuncRef + `__irs_0.*`
+      target — `analyzer.tableFuncColumns` (loop 4) hands the outer
+      scope the SRF's static three-column shape. The aggregate-arg
+      variant skips that rewrite (parser passes nil `onAggregate`)
+      and the planner lowers it via `ProjectSet` (loop 5). The
+      analyzer's `synthesizeSubqueryTable` does not yet expand
+      `*parser.IndirectionStar` targets — it falls back to a single
+      `?column?1` column, so outer references like `gpt.attrs` raise
+      `42703: column "attrs" does not exist`. Pinned (failing-as-Skip)
+      by `TestPlanFetchTableListAggDerivedSubquery` in the planner
+      package; the `t.Skip` on `TestPort_PgoutputInteropGoopgToPG`
+      was restored with the rung-7 diagnosis quoted verbatim. Next
+      step: extend `synthesizeSubqueryTable`'s target-list walk to
+      recognise `*parser.IndirectionStar` whose source `*parser.FuncCall`
+      has a known composite return shape (currently only
+      `pg_get_publication_tables`) and emit the matching three columns.
+      PARTIAL PROGRESS 2026-05-14 (loop 8): closed rung 7 —
+      analyzer-side IndirectionStar expansion in derived subqueries.
+      Design doc:
+      `docs/design/0103-0012-derived-subquery-srf-composite-expansion.md`
+      (accepted).
+      Changes:
+      - `internal/analyzer/analyzer.go`: new package-private helper
+        `compositeFuncColumns(funcName)` returns the composite
+        return-column shape for SRFs known to expand via
+        `(srf(...)).*` in target-list position. Mirrors
+        `planner.projectSetCompositeSchema`; only
+        `pg_get_publication_tables` is recognised (relid oid,
+        attrs text, qual text). `synthesizeSubqueryTable`'s
+        inner-target walk gained a new branch between the
+        `*parser.StarExpr` case and the generic `analyzeExpr` path
+        that expands `*parser.IndirectionStar` whose source is a
+        `*parser.FuncCall` with a known composite into the matching
+        columns. Unknown sources fall through unchanged.
+      Tests:
+      - `internal/planner/planner_test.go::TestPlanFetchTableListAggDerivedSubquery`
+        flipped from `t.Skip` to a positive plan+output assertion:
+        runs the exact `fetch_table_list` derived-subquery shape
+        against an in-memory `pg_publication` and asserts the outer
+        `SELECT gpt.attrs` resolves to a single output column named
+        `attrs`. Without the analyzer fix, this Plan() raises
+        `42703: column "attrs" does not exist`.
+      - `internal/testport/pgoutput_interop_test.go::TestPort_PgoutputInteropGoopgToPG`
+        Skip message updated to reflect rung 7 closure — the live
+        interop ladder stays deferred so the next probe rung can
+        land with its own design doc + targeted pin.
+      Verification (loop 8): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green (parser 1.046 s,
+      planner 1.064 s, analyzer 1.036 s, executor 2.603 s,
+      server 3.481 s, wal 3.058 s, catalog 1.019 s).
+      Next sub-step: drop the `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` and observe whatever
+      live probe PG's apply launcher ships after `fetch_table_list`
+      — most likely the column-list probe deferred from rung 6 or a
+      per-table replica-identity check. Each new rung lands with
+      its own design doc.
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

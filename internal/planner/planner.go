@@ -862,11 +862,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 			shifted[i].offset += shift
 		}
 		root = &Join{
-			pos:    item.Pos(),
-			Type:   JoinTypeCross,
-			Left:   root,
-			Right:  itemNode,
-			schema: appendSchema(root.Output(), itemNode.Output()),
+			pos:     item.Pos(),
+			Type:    JoinTypeCross,
+			Left:    root,
+			Right:   itemNode,
+			schema:  appendSchema(root.Output(), itemNode.Output()),
+			Lateral: nodeReferencesOuter(itemNode),
 		}
 		bindings = append(bindings, shifted...)
 	}
@@ -903,11 +904,12 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 		}
 		b.offset += len(root.Output())
 		root = &Join{
-			pos:    rv.Pos(),
-			Type:   JoinTypeCross,
-			Left:   root,
-			Right:  n,
-			schema: appendSchema(root.Output(), n.Output()),
+			pos:     rv.Pos(),
+			Type:    JoinTypeCross,
+			Left:    root,
+			Right:   n,
+			schema:  appendSchema(root.Output(), n.Output()),
+			Lateral: nodeReferencesOuter(n),
 		}
 		bindings = append(bindings, b)
 	}
@@ -915,6 +917,46 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 		return nil, nil, &PlanError{Pos: 0, Code: "42601", Message: "SELECT FROM requires at least one relation"}
 	}
 	return root, newResolveContext(bindings, root.Output()), nil
+}
+
+
+// nodeReferencesOuter reports whether the planned right-side FROM item
+// resolved any expression against the lateral outer context — i.e. the
+// item's evaluation depends on the row produced by the left siblings.
+// The executor uses this to switch the wrapping Join to its per-outer-
+// row lateral driver instead of the materialise-both-sides default.
+//
+// Today only the pg_get_publication_tables FROM-clause SRF gets routed
+// through `lateralCtx`, so the only positive case is a
+// *PgGetPublicationTables whose argument list contains a *ColumnRef.
+// Generic LATERAL subqueries / table funcs would extend this helper
+// with their own walker.
+func nodeReferencesOuter(n Node) bool {
+	switch x := n.(type) {
+	case *PgGetPublicationTables:
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func exprContainsColumnRef(e Expr) bool {
+	if e == nil {
+		return false
+	}
+	found := false
+	walkExprTree(e, func(node Expr) {
+		if found {
+			return
+		}
+		if _, ok := node.(*ColumnRef); ok {
+			found = true
+		}
+	})
+	return found
 }
 
 func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext) (Node, []rangeBinding, error) {
@@ -1019,6 +1061,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			Right:     rightNode,
 			Predicate: pred,
 			schema:    mergedSchema,
+			Lateral:   nodeReferencesOuter(rightNode),
 		}
 		// Pick a specialised equality join algorithm when the
 		// predicate decomposes into disjoint-side keys:

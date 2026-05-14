@@ -512,17 +512,23 @@ const (
 // their keys and merges the two ordered streams, preserving
 // RIGHT/FULL outer-row semantics.
 type Join struct {
-	pos       int
-	Type      JoinType
-	Algo      JoinAlgo
-	Left      Node
-	Right     Node
-	Predicate Expr
-	LeftKey   Expr // populated when Algo == JoinAlgoHash
-	RightKey  Expr
-	BuildLeft bool // hash join: build on left input instead of right
-	schema    Schema
-}
+		pos       int
+		Type      JoinType
+		Algo      JoinAlgo
+		Left      Node
+		Right     Node
+		Predicate Expr
+		LeftKey   Expr // populated when Algo == JoinAlgoHash
+		RightKey  Expr
+		BuildLeft bool // hash join: build on left input instead of right
+		// Lateral marks the right child as referencing the left
+		// child's columns through a FROM-clause LATERAL SRF (M0103-0008).
+		// The executor must drive the right per-outer-row, binding the
+		// left row as the lateral outer slot (BindLateralOuter contract)
+		// instead of materialising both sides up front.
+		Lateral bool
+		schema  Schema
+	}
 
 func (n *Join) Pos() int       { return n.pos }
 func (n *Join) Output() Schema { return n.schema }

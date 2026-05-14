@@ -1177,6 +1177,25 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 	}
 }
 
+// compositeFuncColumns returns the composite return-column shape for a
+// SRF that is known to expand into multiple columns via `(srf(...)).*`
+// in target-list position. Returns nil for SRFs without a composite
+// return type (the caller falls back to the generic analyzeExpr path).
+// Mirrors planner.projectSetCompositeSchema so the analyzer's
+// derived-subquery synthesis sees the same columns the planner will
+// produce at execution time. M0103-0008 rung 7.
+func compositeFuncColumns(funcName string) []catalog.Column {
+	switch strings.ToLower(funcName) {
+	case "pg_get_publication_tables":
+		return []catalog.Column{
+			{Name: "relid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+			{Name: "attrs", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+			{Name: "qual", Type: catalog.Type{Name: "text"}, Ordinal: 2},
+		}
+	}
+	return nil
+}
+
 // resolveTable is the scope-aware variant of lookupTable used by
 // FROM-clause resolution. It walks the scope chain head-first
 // looking for a matching CTE name (so an inner WITH shadows an
@@ -1476,6 +1495,23 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 				}
 			}
 			continue
+		}
+		// `(srf(...)).*` inside a derived subquery — expand to the SRF's
+		// composite columns so outer-scope references resolve. Mirrors
+		// the planner's ProjectSet lowering
+		// (planner.projectSetCompositeSchema). Currently only
+		// pg_get_publication_tables is recognised as composite; other
+		// IndirectionStar sources fall through to the generic
+		// analyzeExpr path. M0103-0008 rung 7.
+		if is, ok := tgt.Expr.(*parser.IndirectionStar); ok {
+			if fc, ok2 := is.Source.(*parser.FuncCall); ok2 {
+				if comp := compositeFuncColumns(fc.Name.Name); comp != nil {
+					for _, c := range comp {
+						cols = append(cols, catalog.Column{Name: c.Name, Type: c.Type})
+					}
+					continue
+				}
+			}
 		}
 		name := tgt.Alias
 		if name == "" {

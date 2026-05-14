@@ -24,6 +24,14 @@ type pgGetPublicationTablesOp struct {
 	ctx  *Context
 	rows []Row
 	pos  int
+
+	// outerSlot carries the lateral outer row when the op sits on
+	// the right of a `Join.Lateral == true` (M0103-0008 rung 6).
+	// Bound by the parent joinOp via BindLateralOuter before each
+	// per-outer-row Open. nil means "no lateral binding" — Args
+	// must reduce to constants in that case (the original
+	// non-lateral SRF entry path).
+	outerSlot SlotView
 }
 
 func newPgGetPublicationTablesOp(p *planner.PgGetPublicationTables) *pgGetPublicationTablesOp {
@@ -39,10 +47,13 @@ func (o *pgGetPublicationTablesOp) Open(ctx *Context) error {
 	// Evaluate every argument expression to a Datum, then delegate to the
 	// shared row-builder. ProjectSet (M0103-0008 final sub-step) reuses the
 	// same builder once the publisher's libpqrcv probe has materialised the
-	// aggregated text[] of publication names.
+	// aggregated text[] of publication names. The outerSlot is non-nil only
+	// when a parent Join.Lateral has bound an outer row (M0103-0008 rung 6);
+	// passing it through evalExprSlot lets ColumnRefs into the outer FROM
+	// sibling resolve.
 	args := make([]Datum, 0, len(o.plan.Args))
 	for _, a := range o.plan.Args {
-		d, err := evalExpr(a, nil, ctx)
+		d, err := evalExprSlot(a, o.outerSlot, ctx)
 		if err != nil {
 			return err
 		}
@@ -57,6 +68,13 @@ func (o *pgGetPublicationTablesOp) Open(ctx *Context) error {
 }
 
 func (o *pgGetPublicationTablesOp) Close() error { return nil }
+
+// BindLateralOuter binds the outer row's slot for lateral arg
+// evaluation. Called by joinOp before each per-outer-row Open when
+// `plan.Lateral == true`. Passing nil clears the binding.
+func (o *pgGetPublicationTablesOp) BindLateralOuter(slot SlotView) {
+	o.outerSlot = slot
+}
 
 func (o *pgGetPublicationTablesOp) Next() (TupleSlot, error) {
 	if o.pos >= len(o.rows) {

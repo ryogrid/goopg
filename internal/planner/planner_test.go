@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -755,5 +756,51 @@ func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
 	}
 	if got := out[0].Name; got != "attrs" {
 		t.Errorf("output col name = %q, want %q", got, "attrs")
+	}
+}
+
+
+// TestPlanFetchTableListAggDerivedSubquery pins the M0103-0008 rung-7
+// gap surfaced by dropping the t.Skip on
+// `internal/testport/pgoutput_interop_test.go::TestPort_PgoutputInteropGoopgToPG`.
+//
+// libpqrcv's `fetch_table_list` ships the same SRF call wrapped in a
+// derived subquery whose argument list is an aggregate:
+//
+//	SELECT … gpt.attrs FROM …
+//	  JOIN ( SELECT (pg_get_publication_tables(VARIADIC
+//	         array_agg(pubname::text))).*
+//	         FROM pg_publication WHERE pubname IN (…)) AS gpt …
+//
+// The non-aggregate IndirectionStar variant is rewritten at parse time
+// into a FROM-clause TableFuncRef + `__irs_0.*` target — the analyzer's
+// `tableFuncColumns` (loop 4) hands the outer scope the SRF's static
+// three-column shape and outer references resolve. The aggregate-arg
+// variant skips the parse-time rewrite (parser passes nil
+// `onAggregate`) and the planner lowers it via `ProjectSet` (loop 5).
+// `synthesizeSubqueryTable` does not yet expand `*parser.IndirectionStar`
+// targets — it falls back to `?column?1` so outer references like
+// `gpt.attrs` raise `42703: column "attrs" does not exist`.
+//
+// The Skip stays until the analyzer expansion lands; flip it to a
+// positive plan-and-output assertion in the next M0103-0008 loop.
+func TestPlanFetchTableListAggDerivedSubquery(t *testing.T) {
+	// M0103-0008 rung 7: synthesizeSubqueryTable expands
+	// `(srf(<agg>)).*` derived-subquery targets so outer references like
+	// `gpt.attrs` resolve.
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "pg_publication"}, []catalog.Column{
+		{Name: "pubname", Type: catalog.Type{Name: "text"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT gpt.attrs FROM ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* FROM pg_publication WHERE pubname IN ('p')) AS gpt`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	out := plan.Output()
+	if len(out) != 1 || !strings.EqualFold(out[0].Name, "attrs") {
+		t.Fatalf("expected single output column 'attrs', got %+v", out)
 	}
 }

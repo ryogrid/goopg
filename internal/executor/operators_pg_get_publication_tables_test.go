@@ -320,6 +320,75 @@ func TestIndirectionStarDerivedSubqueryExplicitAliases(t *testing.T) {
 	}
 }
 
+// TestLateralPgGetPublicationTablesFromOuterRef pins the rung-6 executor
+// path: a `LATERAL pg_get_publication_tables(p.pubname)` FROM-list item
+// must evaluate its argument against the per-row outer slot bound by
+// the parent Join.Lateral. Two outer rows (`p`, `q`) must each yield one
+// SRF result row whose `relid` is non-NULL. Before the BindLateralOuter
+// + openLateral fix the operator evaluated `p.pubname` against a nil
+// slot and raised `XX000: column ref pubname/0 on nil slot`.
+// M0103-0008 rung 6.
+func TestLateralPgGetPublicationTablesFromOuterRef(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE PUBLICATION q FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+	// Stand-in for the catalog view: a regular table with a `pubname`
+	// column. Two rows so the lateral path runs the SRF twice and we
+	// confirm the per-outer-row binding is fresh each iteration.
+	if err := runDDL(t, ctx, "CREATE TABLE pg_publication (pubname text)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO pg_publication VALUES ('p'), ('q')"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := runQueryRows(t, ctx,
+		"SELECT gpt.relid FROM pg_publication p, "+
+			"LATERAL pg_get_publication_tables(p.pubname) gpt")
+	if len(rows) != 2 {
+		t.Fatalf("row count = %d, want 2 (one SRF result per outer row)", len(rows))
+	}
+	for i, r := range rows {
+		if r[0].IsNull() {
+			t.Fatalf("rows[%d].relid is NULL, want a non-zero OID", i)
+		}
+	}
+}
+
+// TestLateralPgGetPublicationTablesUnknownYieldsZero pins LEFT-vs-CROSS
+// behaviour: when the outer row produces an SRF result for one publication
+// but the other publication name is not registered, the CROSS-join shape
+// drops the unmatched outer row entirely. M0103-0008 rung 6.
+func TestLateralPgGetPublicationTablesUnknownYieldsZero(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE TABLE pg_publication (pubname text)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO pg_publication VALUES ('p'), ('nope')"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := runQueryRows(t, ctx,
+		"SELECT gpt.relid FROM pg_publication p, "+
+			"LATERAL pg_get_publication_tables(p.pubname) gpt")
+	if len(rows) != 1 {
+		t.Fatalf("row count = %d, want 1 (only 'p' resolves to a publication)", len(rows))
+	}
+}
+
 // contains is a 1-line strings.Contains shim local to this file to avoid
 // dragging in strings just for one assertion.
 func contains(s, sub string) bool {
