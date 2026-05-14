@@ -117,7 +117,7 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       - Summary: Port `pg_basebackup/010`, `011`, `020`, `030`, `040`
         as adapted Go tests in `internal/testport/pgbasebackup_port_test.go`.
       - 010: --help/--version/options + no-pgdata + --compress=none:1/none+ PASS;
-        backup execution SKIP (physical streaming).
+        backup execution PASS (2026-05-14, see below).
       - 011: SKIP entirely (in-place tablespace backup needs BASE_BACKUP protocol).
       - 020: --help/--version/options + no-dir + slot-conflict + sync-conflict + compress PASS;
         WAL streaming SKIP (replication protocol).
@@ -126,8 +126,35 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       - 040: --help/--version/options + no-datadir/publisher/database PASS;
         subscriber setup SKIP.
       - CSV rows BB-010..040 added; markdown regenerated (2026-05-12).
-      - Action: implement missing replication/base-backup protocol paths so skipped
-        execution branches can run and be verified.
+      - PROGRESS 2026-05-14: pg_basebackup `-X none --no-manifest --no-sync` now
+        clones a live goopg primary end-to-end. New
+        `TestPort_PgBasebackup010BackupExecution` drives the real
+        `postgres/local_install/bin/pg_basebackup` binary against a fresh cluster
+        and verifies extracted `backup_label`, `global/pg_control`, and
+        `PG_VERSION`. Four discrete gaps closed (`docs/design/0095-0003-pg-basebackup-execution.md`):
+        (a) `data_directory_mode` GUC (`internal/config/defaults.go`, BootVal=448 = 0o700)
+            — `pg_basebackup` issues `SHOW data_directory_mode` early in its
+            handshake and crashed with `unrecognized configuration parameter`.
+        (b) `summarize_wal` GUC (BootVal=off, ContextSigHup) — same handshake
+            wave; full WAL summarizer subsystem remains M0095-0002 scope.
+        (c) `wal_segment_size` GUC as pre-formatted string `"16MB"` — naive
+            `Type=TypeInt, Unit=UnitBytes` canonicalised to raw bytes
+            `"16777216"` which pg_basebackup's `sscanf("%d%s")` rejected with
+            "WAL segment size could not be parsed".
+        (d) Trailing `CommandComplete("BASE_BACKUP")` in
+            `internal/server/basebackup.go` — matches upstream's
+            `EndReplicationCommand` wrap (`postgres/src/backend/tcop/dest.c:205`).
+            Without it pg_basebackup's final `PQgetResult` returns NULL and
+            surfaces as `"final receive failed: "` (empty error).
+            `TestBaseBackupWireProtocolFraming` trailer assertion updated from
+            4 frames (T/D/C/Z) to 5 frames (T/D/C/C/Z).
+      - Verified: `go test -race ./internal/wal/ ./internal/mvcc/
+        ./internal/executor/ ./internal/server/ ./internal/initdb/
+        ./internal/config/` all green.
+      - Action: extend coverage to `-X stream` once START_REPLICATION + walsender
+        loop parity lands; add `--manifest` parity via `bbsink_manifest`
+        emulation; M0095-0003 011/020 backup-execution branches and M0095-0003
+        WAL streaming/recvlogical still require the same dependencies.
 
 - [x] **M0095-0004**
       - Summary: VACUUM/ANALYZE parenthesized syntax; OPERATOR(schema.op)

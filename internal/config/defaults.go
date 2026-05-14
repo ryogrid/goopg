@@ -528,6 +528,46 @@ func BuildDefaultRegistry() *Registry {
 	// ranges, and defaults mirror upstream's
 	// postgres/src/backend/utils/misc/guc_tables.c entries.
 
+	// data_directory_mode is reported by upstream as the permission
+	// mask of the data directory; pg_basebackup issues `SHOW
+	// data_directory_mode` early in its replication handshake to
+	// preserve permissions on the cloned cluster. v0 always uses
+	// 0700 (group read/write disallowed); see upstream guc_tables.c
+	// "data_directory_mode" entry.
+	// wal_segment_size reports the WAL segment size the primary
+	// writes. pg_basebackup issues `SHOW wal_segment_size` to size
+	// its WAL streaming buffers and align the backup stream with
+	// segment boundaries; upstream's parser (sscanf "%d%s") expects
+	// the value to carry a unit suffix ("16MB"), so we report it as
+	// a pre-formatted string. goopg v0 always uses 16 MiB segments
+	// (wal.DefaultSegmentSize); see upstream guc_tables.c
+	// "wal_segment_size".
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_segment_size", Type: TypeString, BootVal: "16MB",
+		Context: ContextInternal,
+		Flags:   FlagDisallowInFile,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "data_directory_mode", Type: TypeInt, BootVal: "448",
+		MinVal:  0,
+		MaxVal:  511,
+		Context: ContextInternal,
+		Flags:   FlagDisallowInFile,
+		Scope:   ScopeServer,
+	}))
+
+	// summarize_wal toggles the WAL-summarizer background worker (PG17+).
+	// pg_basebackup issues `SHOW summarize_wal` during option negotiation
+	// to decide whether incremental backups are available; goopg v0 has
+	// no summarizer so the value is always off. Full implementation
+	// tracked in M0095-0002.
+	r.MustRegister(NewVariable(Variable{
+		Name: "summarize_wal", Type: TypeBool, BootVal: "off",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+
 	// Primary-side: how many concurrent replication connections /
 	// slots / how long the walsender waits for client status
 	// updates before giving up. v0 honours these by configuration

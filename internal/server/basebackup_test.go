@@ -202,17 +202,24 @@ func TestBaseBackupWireProtocolFraming(t *testing.T) {
 		t.Errorf("no 'p' progress frames received (want >= 1 at end-of-archive)")
 	}
 
-	// ---- trailing end-LSN result-set + ReadyForQuery ----
+	// ---- trailer: end-LSN result-set, BASE_BACKUP CommandComplete, ReadyForQuery.
+	// Upstream emits T/D/C for the stop-LSN row (SendXlogRecPtrResult)
+	// then walsender wraps the command with EndReplicationCommand
+	// (dest.c) producing a trailing CommandComplete("BASE_BACKUP")
+	// before ReadyForQuery. pg_basebackup line 2199 reads that final
+	// 'C' as PGRES_COMMAND_OK; missing it surfaces as
+	// "final receive failed: " (empty error).
 	tail := frames[copyDoneIdx+1:]
-	if len(tail) != 4 {
-		t.Fatalf("trailer frame count = %d, want 4 (got types=%s)",
+	if len(tail) != 5 {
+		t.Fatalf("trailer frame count = %d, want 5 (got types=%s)",
 			len(tail), replicationFrameTypes(tail))
 	}
 	if tail[0].Type != protocol.MsgRowDescription ||
 		tail[1].Type != protocol.MsgDataRow ||
 		tail[2].Type != protocol.MsgCommandComplete ||
-		tail[3].Type != protocol.MsgReadyForQuery {
-		t.Errorf("trailer types = %s, want T/D/C/Z", replicationFrameTypes(tail))
+		tail[3].Type != protocol.MsgCommandComplete ||
+		tail[4].Type != protocol.MsgReadyForQuery {
+		t.Errorf("trailer types = %s, want T/D/C/C/Z", replicationFrameTypes(tail))
 	}
 
 	// ---- tar contents: backup_label present, pg_control LAST,

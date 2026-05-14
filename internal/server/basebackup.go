@@ -185,6 +185,17 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	if err := writeRecPtrResult(w, stopLSN, startTLI); err != nil {
 		return err
 	}
+	// EndReplicationCommand parity: upstream walsender wraps every
+	// replication verb with a trailing `CommandComplete(<tag>)` via
+	// `EndReplicationCommand` (postgres/src/backend/tcop/dest.c). For
+	// BASE_BACKUP pg_basebackup reads this frame at line 2199 of
+	// pg_basebackup.c and asserts PGRES_COMMAND_OK; omitting it
+	// surfaces as "final receive failed: " (empty error) once the
+	// stop-LSN row has been parsed because libpq returns NULL on the
+	// next PQgetResult.
+	if err := w.WriteCommandComplete("BASE_BACKUP"); err != nil {
+		return err
+	}
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
