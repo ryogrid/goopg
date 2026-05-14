@@ -1293,6 +1293,38 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/initdb/ ./internal/parser/ ./internal/planner/
           ./internal/analyzer/` PASS.  Design:
           `docs/design/0100-0005g-decode-value-size-serial-types.md`.
+        - EXPLAIN (COSTS OFF) formatter parity (M0100-0005i,
+          2026-05-15 loop 25).  `internal/executor/operators_explain.go`
+          gains a `*Filtered` driver for both `walkPlan` and
+          `walkPlanAnalyze` that (a) skips `Project` wrappers
+          unconditionally — PG has no "Projection" plan node —
+          and (b) folds `Filter` wrappers into the next scan,
+          carrying the predicate via a new `attachedFilter` param
+          and rendering it as a `Filter:` detail line.  PG-style
+          detail lines `Sort Key: <expr_csv>` / `Index Cond:
+          (<col> = <key>)` / `Filter: (<pred>)` are now emitted
+          under their owning node, indented to the content
+          column +2 (matching upstream PG).  `(rows=N)` is gated
+          on `opts.Costs` so `EXPLAIN (COSTS OFF)` renders bare
+          labels.  A new `formatExprPG` renders expressions in
+          PG-EXPLAIN style (column names, infix operators,
+          quoted string literals, casts inlined, `$N` for
+          params).  Regression pins:
+          `TestExplainCostsOffSuppressesRowsSuffix`,
+          `TestExplainCostsOnAnalyzeIncludesActualRows`,
+          `TestExplainSuppressesProjectionWrapper`,
+          `TestExplainEmitsFilterDetailUnderSeqScan`,
+          `TestExplainEmitsSortKeyDetail`,
+          `TestExplainEmitsIndexCondDetail` in
+          `internal/executor/explain_costs_off_test.go`.
+          `drop-index-concurrently-1` EXPLAIN output is now
+          byte-identical apart from constant-sort-key
+          elimination (`Sort Key: id, data` vs `Sort Key: id`)
+          and seqscan/indexscan plan choice — both real planner
+          gaps unrelated to formatter parity.  `go test -race
+          ./internal/executor/ ./internal/server/
+          ./internal/planner/ ./internal/parser/` PASS.  Design:
+          `docs/design/0100-0005i-explain-costs-off-formatter-parity.md`.
         - EXPLAIN EXECUTE renders prepared plan (M0100-0005h,
           2026-05-15 loop 24).  `EXPLAIN (COSTS OFF) EXECUTE
           <name>` previously rendered the placeholder
