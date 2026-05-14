@@ -1234,6 +1234,29 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/server/` PASS post-fix; existing isolation-test
           SKIPs (FkSnapshot, others) unchanged — no regression.  Design:
           `docs/design/0100-0005e-seqscan-page-rlock-per-tuple.md`.
+        - lock-committed-update s1hint dead-tuple residual RESOLVED
+          (M0100-0005f, 2026-05-15 loop 22).  The 3-line diff captured
+          at the close of M0100-0005e (`+1|one` + `(2 rows)` instead of
+          `(1 row)` for s1hint after committed UPDATE) was caused by
+          `lockRowsOp.stampLock` → `PageSetHeapTupleLockOnly`
+          unconditionally overwriting `t_xmax` when s2's FOR KEY SHARE
+          stamped a row whose UPDATE by s1 was still in flight.  The
+          updater's deletion stamp was erased; after s1 committed, the
+          `HEAP_XMAX_LOCK_ONLY` short-circuit in `mvcc.TupleVisible`
+          treated the dead old version as live.  Without MultiXact
+          (deferred), the safe v0 fix is to *not* overwrite a real
+          (non-lock-only, foreign-XID) xmax: skip the page-level stamp
+          + WAL emit at the executor layer; the lockmgr tuple-tag lock
+          (already acquired via `acquireTupleLock`) preserves
+          row-locking semantics for our holder.  Regression pinned by
+          `TestForKeyShare_PreservesRealUpdaterXmax` in
+          `internal/server/lockrows_preserve_real_xmax_test.go`
+          (verified to FAIL without the fix, PASS with it) and by
+          `TestPort_IsolationLockCommittedUpdate` (24 permutations,
+          full PASS — diff goes to zero).  `go test -race
+          ./internal/executor/ ./internal/storage/ ./internal/server/
+          ./internal/mvcc/` PASS.  Design:
+          `docs/design/0100-0005f-lockrows-preserve-real-xmax.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
