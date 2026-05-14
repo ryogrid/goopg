@@ -110,3 +110,73 @@ func TestNormalizeBoolWireText(t *testing.T) {
 		}
 	}
 }
+
+
+// TestParseIsolationSpecPreservesContinuationIndent pins M0100-0005b:
+// upstream isolationtester echoes multi-line step SQL verbatim, with the
+// first line concatenated to "step name: " and continuation lines
+// preserving their leading whitespace.  Before M0100-0005b, readBlock
+// applied TrimSpace to the line that contained the closing '}', which
+// erased the continuation indentation that isolationtester (and the
+// expected/<spec>.out file) rely on.  This regression locks in the
+// fix: leading whitespace on the closing-brace line is kept; only the
+// '}' itself and trailing whitespace are stripped.
+func TestParseIsolationSpecPreservesContinuationIndent(t *testing.T) {
+	spec := "session \"s1\"\n" +
+		"step \"insert1\"    { INSERT INTO upsert VALUES (1, 11, 111)\n" +
+		"                  ON CONFLICT (i) DO UPDATE SET k = EXCLUDED.k; }\n" +
+		"permutation \"insert1\"\n"
+	path := filepath.Join(t.TempDir(), "indent.spec")
+	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIsolationSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := parsed.Steps["insert1"]
+	if !ok {
+		t.Fatalf("step insert1 not parsed; have %v", parsed.StepOrder)
+	}
+	want := "INSERT INTO upsert VALUES (1, 11, 111)\n" +
+		"                  ON CONFLICT (i) DO UPDATE SET k = EXCLUDED.k;"
+	if got.SQL != want {
+		t.Fatalf("SQL mismatch:\n got: %q\nwant: %q", got.SQL, want)
+	}
+}
+
+// TestParseIsolationSpecClosingBraceOnOwnLine ensures that when '}' is
+// on its own line (no SQL content before it), the closing-brace line
+// is not appended as a stray whitespace-only continuation line.  This
+// is the common style in most upstream specs.
+func TestParseIsolationSpecClosingBraceOnOwnLine(t *testing.T) {
+	spec := "session \"s1\"\n" +
+		"step \"q\" {\n" +
+		"  SELECT 1;\n" +
+		"  SELECT 2;\n" +
+		"}\n" +
+		"permutation \"q\"\n"
+	path := filepath.Join(t.TempDir(), "ownline.spec")
+	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIsolationSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := parsed.Steps["q"]
+	if !ok {
+		t.Fatalf("step q not parsed; have %v", parsed.StepOrder)
+	}
+	// When `{` is on its own line, every content line — including the
+	// first — comes through the scanner and preserves its leading
+	// indentation.  Upstream isolationtester's expected/<spec>.out
+	// shows the same shape (e.g. insert-conflict-do-update-3's
+	// `step insert1: \n    WITH t AS (\n        INSERT INTO ...`).
+	// The trailing `}` line is dropped because nothing precedes the
+	// brace.
+	want := "  SELECT 1;\n  SELECT 2;"
+	if got.SQL != want {
+		t.Fatalf("SQL mismatch:\n got: %q\nwant: %q", got.SQL, want)
+	}
+}

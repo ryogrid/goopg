@@ -270,7 +270,17 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 	if idx := strings.Index(rest, "}"); idx >= 0 {
 		return strings.TrimSpace(rest[:idx])
 	}
-	// Multi-line: read lines until closing brace, preserving raw content.
+	// Multi-line: read lines until closing brace.
+	// - First segment (the same line as the opening '{'): TrimSpace, since
+	//   the space after '{' is just a separator before the SQL starts.
+	// - Continuation lines: preserve raw indentation, because upstream
+	//   isolationtester echoes step SQL verbatim — `step name: <line1>\n
+	//   <leading spaces><line2>\n ...` — and the leading whitespace is
+	//   significant for output parity.
+	// - Closing-brace line: preserve leading whitespace on any content
+	//   before '}'; strip everything from '}' onward and trim trailing
+	//   whitespace. A line that is *just* whitespace before '}' (i.e. the
+	//   closing brace sits on its own line) is dropped.
 	var lines []string
 	if t := strings.TrimSpace(rest); t != "" {
 		lines = append(lines, t)
@@ -278,8 +288,9 @@ func readBlock(rest string, scanner *bufio.Scanner) string {
 	for scanner.Scan() {
 		next := scanner.Text()
 		if idx := strings.Index(next, "}"); idx >= 0 {
-			if t := strings.TrimSpace(next[:idx]); t != "" {
-				lines = append(lines, t)
+			line := strings.TrimRight(next[:idx], " \t")
+			if strings.TrimSpace(line) != "" {
+				lines = append(lines, line)
 			}
 			break
 		}

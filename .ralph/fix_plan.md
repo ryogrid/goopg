@@ -1133,6 +1133,22 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         SELECTing bool columns. Regression pinned by
         `TestNormalizeBoolWireText`. Design:
         `docs/design/0100-0005a-isolation-runner-bool-wire-text-reversal.md`.
+        - Continuation-indent preservation (M0100-0005b, 2026-05-15):
+        `internal/testport/framework/isolation.go::readBlock` no longer
+        TrimSpaces the line that bears the closing `}`.  Leading whitespace
+        on inline-brace continuation lines (e.g. `INSERT ...\n
+                          ON CONFLICT (i) DO UPDATE ... }` from
+        insert-conflict-do-update-4) now survives parsing, matching
+        upstream isolationtester's verbatim echo into `expected/<spec>.out`.
+        Brace-on-own-line specs unchanged.  Regression pins:
+        `TestParseIsolationSpecPreservesContinuationIndent` and
+        `TestParseIsolationSpecClosingBraceOnOwnLine` in
+        `internal/testport/framework/isolation_test.go`.  Design:
+        `docs/design/0100-0005b-isolation-spec-continuation-indent.md`.
+        Output-side parity still needed before insert-conflict-do-update-4
+        family flips to pass: first-line inlining in `step <name>:` header,
+        `<waiting …>` suffix placement on multi-line SQL, column-width
+        trailing-pad parity.
         - merge-match-recheck: range partition syntax (FOR VALUES FROM ... TO ...)
         - Most partition-key-update-*: triggers + FK syntax
         - lock-committed-update: advisory lock snapshot not refreshed after wait
