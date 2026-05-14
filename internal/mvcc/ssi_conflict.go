@@ -192,6 +192,121 @@ func (m *Manager) InConflictCount(handle TxnHandle) int {
 	return len(sx.inConflicts)
 }
 
+// CheckForSerializableConflictIn is the write-path SSI hook: when a
+// SERIALIZABLE writer modifies a target identified by tag, this records
+// an rw-conflict edge R → W for every SERIALIZABLE reader that holds a
+// SIREAD predicate-lock covering the target. The edge orientation
+// matches the read-path hook (`reader.outConflicts += writer`,
+// `writer.inConflicts += reader`); only the discovery polarity differs
+// — the write-path walks the predicate-lock holder set instead of
+// looking up the writer by xmin/xmax.
+//
+// The call is the goopg analogue of PostgreSQL's
+// `CheckForSerializableConflictIn` in
+// `postgres/src/backend/storage/lmgr/predicate.c`. Coverage discovery
+// matches upstream's "walk upward" pattern: holders on the exact tag,
+// plus holders on any ancestor tag that covers it (page covers tuple,
+// relation covers page and tuple). The substrate's covering map
+// (`PredicateLockTag.Covers`) defines the hierarchy; the hook does not
+// re-derive coverage rules.
+//
+// The call is a no-op (returns false) when:
+//
+//   - tag is invalid (Rel == 0);
+//   - writerHandle is not a SERIALIZABLE in-flight xact (RC/RR or
+//     already finished — RC/RR cannot participate in SSI cycles, and
+//     finished writers are scrubbed of their edges at release);
+//   - no holder is found on the exact or any covering tag (a frequent
+//     hot-path case — most writes touch tags no concurrent reader
+//     covers).
+//
+// Returns true iff at least one new edge was installed; existing edges
+// (idempotent calls and self-references) do not count toward the
+// return value. Per-holder duplicate checks are O(out-degree of the
+// reader), bounded by the small number of concurrent SERIALIZABLE
+// writers in practice.
+func (m *Manager) CheckForSerializableConflictIn(writerHandle TxnHandle, tag PredicateLockTag) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.checkForSerializableConflictInLocked(writerHandle, tag)
+}
+
+func (m *Manager) checkForSerializableConflictInLocked(writerHandle TxnHandle, tag PredicateLockTag) bool {
+	if tag.Granularity() == InvalidPredicateGranularity {
+		return false
+	}
+	if m.ssiState.xacts == nil {
+		return false
+	}
+	writer, ok := m.ssiState.xacts[writerHandle]
+	if !ok || writer == nil {
+		return false
+	}
+	if m.predicateLocks.targets == nil {
+		return false
+	}
+	installed := false
+	for _, ancestor := range coveringPredicateLockTags(tag) {
+		tgt, ok := m.predicateLocks.targets[ancestor]
+		if !ok {
+			continue
+		}
+		for holder := range tgt.holders {
+			if holder == writerHandle {
+				// A SERIALIZABLE xact may legitimately hold a SIREAD on
+				// a target it then writes; that is not a conflict with
+				// itself.
+				continue
+			}
+			reader, ok := m.ssiState.xacts[holder]
+			if !ok || reader == nil {
+				// Defensive: the holder slot should never outlive the
+				// SerializableXact in ssiState.xacts because
+				// releaseSerializableLocked drops predicate locks
+				// before clearing the registry entry.
+				continue
+			}
+			if registerRWConflictLocked(reader, writer) {
+				installed = true
+			}
+		}
+	}
+	return installed
+}
+
+// coveringPredicateLockTags returns tag itself plus every coarser
+// ancestor that, by the substrate's coverage hierarchy, would also
+// imply SIREAD on tag. The list is the upward walk
+// `tuple → page → relation`; finer descendants are deliberately not
+// included because a writer touching a coarser target than the reader
+// owns is conceptually rare in goopg's heap workload (writes are
+// tuple-level), and PostgreSQL's `CheckForSerializableConflictIn`
+// follows the same upward-only pattern via `GetParentPredicateLockTag`.
+//
+// Output ordering is finest-first; callers iterate the slice
+// linearly so the iteration order is observable in tests but never
+// load-bearing for correctness — `registerRWConflictLocked` is
+// idempotent.
+func coveringPredicateLockTags(tag PredicateLockTag) []PredicateLockTag {
+	switch tag.Granularity() {
+	case TupleGranularity:
+		return []PredicateLockTag{
+			tag,
+			PageLockTag(tag.DB, tag.Rel, tag.Page),
+			RelationLockTag(tag.DB, tag.Rel),
+		}
+	case PageGranularity:
+		return []PredicateLockTag{
+			tag,
+			RelationLockTag(tag.DB, tag.Rel),
+		}
+	case RelationGranularity:
+		return []PredicateLockTag{tag}
+	default:
+		return nil
+	}
+}
+
 // HasRWConflict reports whether an rw-conflict edge from → to has
 // been recorded. Diagnostic helper used by tests; production callers
 // should not consult this number directly (use the conflict-graph

@@ -1707,10 +1707,51 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
         multi-peer distinct-edge accounting. Design doc:
         `docs/design/0104-0004-ssi-conflict-out-hook.md`.
 
-- [ ] **M0104-0005**
-      - Summary: Write-path SSI conflict-out hooks.
+- [x] **M0104-0005**
+      - Summary: Write-path SSI conflict-in hook.
       - On serializable writes, detect active SIREAD coverage and register
-        conflict-out edges against concurrent serializable readers.
+        rw-conflict edges against concurrent serializable readers.
+      - Closed 2026-05-14: `Manager.CheckForSerializableConflictIn`
+        (`internal/mvcc/ssi_conflict.go`) is the goopg analogue of
+        PostgreSQL's `CheckForSerializableConflictIn`. When a SERIALIZABLE
+        writer modifies the target identified by `tag`, the hook walks the
+        predicate-lock holder set on the exact tag plus every covering
+        ancestor (`coveringPredicateLockTags`: `tuple → page → relation`,
+        `page → relation`, `relation → relation`) and installs an
+        rw-conflict edge `R → W` for each holder ≠ writer via the
+        polarity-agnostic `registerRWConflictLocked` helper M0104-0004
+        introduced. Same edge orientation, same idempotence semantics,
+        same in/outConflicts slices — the M0104-0006 dangerous-structure
+        walker sees a single graph regardless of which side discovered
+        the conflict first. Returns true iff at least one new edge was
+        installed; idempotent on repeat calls and self-references (a
+        SERIALIZABLE xact may legitimately read a tuple before writing
+        it). No-op (returns false) for: invalid tag, writer not in
+        `ssiState.xacts` (RC/RR/finished), `predicateLocks.targets ==
+        nil` (zero acquisitions ever — single map-nil short-circuit
+        keeps the cost zero for SERIALIZABLE workloads that have not
+        read anything), or no covering holder (the most common hot-path
+        case). Self-conflict guarded by `holder == writerHandle` inside
+        the loop (writer-side discovery is by handle, not XID, distinct
+        from the read-path's `reader.XID == writerXID` guard). No new
+        lifecycle code: M0104-0004's
+        `removeSerializableXactFromPeersLocked` invariant in
+        `releaseSerializableLocked` covers write-path-installed edges
+        too because both sides use the same in/outConflicts slices —
+        `TestCheckForSerializableConflictIn_PeerEdgesScrubbedOnReaderCommit`
+        pins this from the symmetric angle. 13 regression pins in
+        `internal/mvcc/ssi_conflict_test.go`:
+        `TestCheckForSerializableConflictIn_RegistersEdgeForExactSIREADHolder`,
+        `_IdempotentEdgeInstall`,
+        `_FiresOnPageLockHoldingForTupleWrite`,
+        `_FiresOnRelationLockHoldingForTupleWrite`,
+        `_NoOpForFinerDescendantHolder`,
+        `_NoOpForDifferentRelation`, `_NoOpForRCWriter`,
+        `_NoOpForSelfHolder`, `_NoOpForInvalidTag`,
+        `_NoOpForUnknownWriter`, `_NoHoldersIsSilentNoOp`,
+        `_MultipleReadersDistinctEdges`,
+        `_PeerEdgesScrubbedOnReaderCommit`.
+        Design doc: `docs/design/0104-0005-ssi-conflict-in-hook.md`.
 
 - [ ] **M0104-0006**
       - Summary: Pre-commit dangerous-structure detection.
