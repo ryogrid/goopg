@@ -115,6 +115,47 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	}
 }
 
+
+// TestPrimaryKeyOnlyRow pins the partial-key helper that applyUpdate
+// falls back on when pgoutput omits OldTuple (REPLICA IDENTITY DEFAULT
+// + key columns unchanged): the synthesised key row carries PK column
+// values from `full`, with NullDatum in every non-PK position so
+// rowMatchesKey ignores non-PK cells.
+//
+// Design doc: docs/design/0103-0025-m0103-0007-rung-2-pg-to-goopg-full-dml.md.
+func TestPrimaryKeyOnlyRow(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No PK yet → helper returns nil so callers fall back to
+	// "cannot synthesise a key, skip the UPDATE".
+	if got := primaryKeyOnlyRow(cat, tbl, Row{NewIntDatum(7), NewStringDatum("alpha")}); got != nil {
+		t.Errorf("no-PK case: got %v want nil", got)
+	}
+
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "t_pkey"}, tbl,
+		[]string{"id"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+
+	key := primaryKeyOnlyRow(cat, tbl, Row{NewIntDatum(7), NewStringDatum("alpha")})
+	if key == nil {
+		t.Fatal("PK present: got nil key")
+	}
+	if got := key[0].Int; got != 7 {
+		t.Errorf("key[0].Int = %d want 7", got)
+	}
+	if !key[1].IsNull() {
+		t.Errorf("key[1] = %v want NullDatum (non-PK position must be NULL)", key[1])
+	}
+}
+
 // TestApplyWorkerCommitOutsideXactIsNoop pins the tolerant
 // behaviour: a `C` with no preceding `B` doesn't crash. v0
 // pgoutput emits commit-only sequences only when every change

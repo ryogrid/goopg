@@ -312,16 +312,34 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 		return fmt.Errorf("applyworker: UPDATE for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
 	}
-	if len(m.OldTuple) == 0 {
-		return nil
-	}
-	oldKeyRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
-	if err != nil {
-		return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
-	}
 	newRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode update new-tuple for %q: %w", r.local.Name, err)
+	}
+
+	// Build the row-locator key. Under REPLICA IDENTITY DEFAULT
+	// pgoutput omits OldTuple entirely when no key columns
+	// changed (see `logicalrep_write_update` in upstream proto.c):
+	// the byte after rel_oid is 'N' directly, so the decoder
+	// leaves OldTuple empty. In that case we synthesise the
+	// key from the new tuple's PK columns — the key didn't
+	// change by definition, so newRow's PK values name the
+	// pre-image row.
+	var oldKeyRow Row
+	if len(m.OldTuple) > 0 {
+		oldKeyRow, err = decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+		if err != nil {
+			return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
+		}
+	} else {
+		oldKeyRow = primaryKeyOnlyRow(w.cat, r.local, newRow)
+		if oldKeyRow == nil {
+			// No primary key — there's no safe way to locate
+			// the pre-image row from a no-old-tuple UPDATE.
+			// Same conservative behaviour the prior path took
+			// for any empty OldTuple, just made explicit.
+			return nil
+		}
 	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
@@ -435,6 +453,48 @@ func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 // rowMatchesKey returns true when every non-null datum in keyRow equals
 // the corresponding datum in row. Null datums in keyRow are skipped
 // (treated as "don't care").
+// primaryKeyOnlyRow returns a partial-key Row aligned with tbl's
+// columns: positions belonging to the primary-key index hold their
+// value from `full`; every other position is NullDatum. rowMatchesKey
+// treats NullDatum cells as "don't care", so the result is a valid
+// row-locator key for `applyUpdateByKey` / `applyDeleteByKey`. Returns
+// nil when the table has no primary key — callers should treat that
+// as "cannot synthesise a key" rather than "no PK columns matter".
+//
+// Used by applyUpdate when pgoutput omits OldTuple (REPLICA IDENTITY
+// DEFAULT + key columns unchanged), where the new tuple's PK values
+// also name the pre-image row.
+func primaryKeyOnlyRow(cat catalog.Catalog, tbl *catalog.Table, full Row) Row {
+	if cat == nil || tbl == nil {
+		return nil
+	}
+	var pkCols []string
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if idx.Primary {
+			pkCols = idx.Columns
+			break
+		}
+	}
+	if len(pkCols) == 0 {
+		return nil
+	}
+	key := make(Row, len(full))
+	for i := range key {
+		key[i] = NullDatum
+	}
+	for _, pkName := range pkCols {
+		for i, col := range tbl.Columns {
+			if col.Name == pkName {
+				if i < len(full) {
+					key[i] = full[i]
+				}
+				break
+			}
+		}
+	}
+	return key
+}
+
 func rowMatchesKey(row, keyRow Row) bool {
 	for i, k := range keyRow {
 		if i >= len(row) {

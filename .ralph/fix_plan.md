@@ -1861,6 +1861,56 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       false-positive surfaces. The full Scenario A failover wiring
       (pgbench, kill -9, libpq multi-host reconnect) remains the
       principal remaining work.
+      PARTIAL PROGRESS 2026-05-14 (rung 2): full PG-publisher →
+      goopg-subscriber INSERT/INSERT/UPDATE/DELETE round-trip with
+      fresh-session visibility verification. New live test
+      `TestPort_PgoutputInteropPGToGoopgFullDML` in
+      `internal/testport/pgoutput_interop_test.go` mirrors the
+      M0103-0008 closure shape but with the direction inverted (PG
+      pub, goopg sub). Pre-creates the logical slot on PG (goopg's
+      CREATE SUBSCRIPTION doesn't yet auto-create), runs the same
+      four DML statements as Scenario B, then asserts fresh-session
+      visibility on goopg via PK IndexScan: `WHERE id = 2 AND v =
+      'updated'` returns 1, `WHERE id = 1` returns 0, `count(*)`
+      returns 1. Design doc:
+      `docs/design/0103-0025-m0103-0007-rung-2-pg-to-goopg-full-dml.md`
+      (accepted).
+      Diagnosis: lifting the test surfaced a concrete gap —
+      `ApplyWorker.applyUpdate` returned nil whenever
+      `m.OldTuple == []` and silently dropped every REPLICA IDENTITY
+      DEFAULT UPDATE that didn't touch key columns. Pgoutput's
+      `logicalrep_write_update` omits OldTuple in that case: `'U'
+      relOid 'N' newTuple` directly (decoder already handles the
+      missing K/O marker at `internal/wal/pgoutput_decoder.go:175`;
+      only the apply side was broken).
+      Fix: when OldTuple is empty, synthesise the row-locator key
+      from the new tuple's PK columns via a new
+      `primaryKeyOnlyRow(catalog, tbl, full Row) Row` helper in
+      `internal/executor/applyworker.go`. The helper returns a
+      partial-key Row where PK positions hold `full`'s values and
+      every other position is NullDatum — `rowMatchesKey`'s existing
+      "skip NULL key cells" rule restricts the match to PK columns.
+      No-PK tables continue to skip silently (no safe way to locate
+      the pre-image row). DELETE's orphan-PK-entry path is
+      exercised via the `WHERE id = 1` assertion (returns 0 because
+      IndexScan re-fetches the heap tuple and MVCC marks it dead)
+      and confirms the rung-1 caveat ("IndexScan tolerates orphaned
+      index entries"). Pinned by `TestPrimaryKeyOnlyRow` (unit,
+      helper-only) in `internal/executor/applyworker_test.go` and
+      `TestPort_PgoutputInteropPGToGoopgFullDML` (live E2E).
+      Verification (rung 2): `go test -count=1 -timeout 120s
+      -run TestPort_PgoutputInteropPGToGoopgFullDML
+      ./internal/testport/` → PASS (~2 s). Broader sweep: executor,
+      catalog, parser, planner, analyzer, server → all green; wal
+      package has pre-existing 2 s-timing flakes
+      (`TestSlotDecoderRunDrivesPluginThroughCommit`,
+      `TestStreamReplayerAppliesIncomingRecords`) that pass in
+      isolation (same flake noted in loops 17/18). Pubsubcluster
+      smoke + visibility tests also green. The full Scenario A
+      failover wiring (pgbench, kill -9, libpq multi-host reconnect)
+      remains the principal remaining work and will be sequenced as
+      further rungs, each with its own design doc + pin per the
+      M0103-0008 closure protocol.
 
 - [x] **M0103-0008** — Scenario B E2E test: goopg primary + PG subscriber.
       Design doc: `docs/design/0103-0005-heterogeneous-logical-failover-e2e-harness.md`.

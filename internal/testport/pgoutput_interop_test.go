@@ -488,6 +488,89 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	}
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgFullDML is the symmetric counterpart
+// to TestPort_PgoutputInteropGoopgToPG: PG publishes, goopg subscribes,
+// and the test drives the same four-statement
+// INSERT/INSERT/UPDATE/DELETE round-trip used to close M0103-0008 — but
+// in the PG→goopg direction (Scenario A). It exercises the apply-worker
+// DML paths (`applyInsert` / `applyUpdate` / `applyDelete`) end-to-end
+// and verifies fresh-session visibility against goopg's IndexScan path,
+// pinning the rung-1 (M0103-0024) caveat that orphan PK entries left
+// behind by UPDATE/DELETE are tolerated via heap re-fetch + MVCC
+// re-visibility-check.
+//
+// Design doc: docs/design/0103-0025-m0103-0007-rung-2-pg-to-goopg-full-dml.md.
+func TestPort_PgoutputInteropPGToGoopgFullDML(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	baseDir := filepath.Join(repo, "tmp", "pgoutput-interop-pg2g-fulldml")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_full_dml"
+	psc := pubsubcluster.NewMixed(t, "pgoutput_pg2g_fulldml", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Schema on both ends. goopg has no COPY-into-subscription path; the
+	// local relation must exist before CREATE SUBSCRIPTION so the apply
+	// worker has a target for the decoded Insert/Update/Delete events.
+	psc.Publisher.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.Subscriber.Exec(t, "CREATE TABLE public.t (id int PRIMARY KEY, v text)")
+	psc.CreatePublication(t, "t")
+
+	// Pre-create the logical slot on the PG publisher. goopg's CREATE
+	// SUBSCRIPTION does not yet dial the publisher to issue
+	// CREATE_REPLICATION_SLOT (M0103 follow-up), so the slot must exist
+	// before CREATE SUBSCRIPTION runs.
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (1, 'hello')")
+	psc.Publisher.Exec(t, "INSERT INTO public.t VALUES (2, 'world')")
+	psc.Publisher.Exec(t, "UPDATE public.t SET v = 'updated' WHERE id = 2")
+	psc.Publisher.Exec(t, "DELETE FROM public.t WHERE id = 1")
+
+	// Each WaitForRow opens a fresh database/sql connection. The
+	// equality predicate exercises the PK IndexScan path — the same
+	// path the rung-1 (0103-0024) fix made apply-worker INSERTs visible
+	// to.  UPDATE's PK entry is added on the new tuple by
+	// applyUpdateByKey; DELETE leaves the PK entry orphaned, and
+	// IndexScan's heap re-fetch + MVCC re-visibility-check filters the
+	// dead tuple.
+	psc.WaitForRow(t, "public.t", "id = 2 AND v = 'updated'", 1, 60*time.Second)
+	psc.WaitForRow(t, "public.t", "id = 1", 0, 60*time.Second)
+	if got := psc.Subscriber.QueryScalar(t, "SELECT count(*) FROM public.t"); got != "1" {
+		t.Fatalf("subscriber row count after replication: got %q want 1", got)
+	}
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"
