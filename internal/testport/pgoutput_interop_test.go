@@ -1759,6 +1759,217 @@ func TestPort_PgoutputInteropPGToGoopgPgbenchInsert(t *testing.T) {
 	psc.WaitForRow(t, "public.bench_log", "client_id NOT IN (0, 1)", 0, 5*time.Second)
 }
 
+
+// TestPort_PgoutputInteropPGToGoopgPgbenchTpcb pins M0103-0007 rung 21
+// (`docs/design/0103-0044-m0103-0007-rung-21-pgbench-tpcb-pg-to-goopg.md`):
+// the upstream `pgbench` binary drives a tpcb-like UPDATE-heavy workload
+// against the PG publisher and every replicated row+aggregate matches on
+// the goopg subscriber. Rung 20 closed the pgbench *driver* path with an
+// INSERT-only custom script; rung 21 brings that driver onto the
+// load-bearing tpcb-like script — the same shape the M0103-0007
+// Scenario A DoD calls for (`pgbench -i -s 1 && pgbench -c 2 -T 180`),
+// scoped down so each test loop completes in seconds instead of minutes.
+//
+// Why scaled-down standard schema: a full `pgbench -i -s 1` writes 100K
+// accounts twice (publisher + subscriber, since goopg's CREATE
+// SUBSCRIPTION does not copy_data) and adds ≈30 s per loop. The new
+// surface here is the apply worker's UPDATE / no-key-touched-UPDATE /
+// REPLICA-IDENTITY-DEFAULT-PK convergence under the tpcb-like
+// concurrent workload, not pgbench's own initial-load path. So the
+// pgbench standard tables (`pgbench_accounts/branches/tellers/history`)
+// are minted manually with the same shape (sans the unused `filler`
+// columns) and seeded to balance=0 — exactly the post-`pgbench -i`
+// state pgbench would produce for `-s 1`, scaled to 100/10/1
+// accounts/tellers/branches.
+//
+// Workload: `pgbench --no-vacuum -c 2 -j 2 -t 20 -f <tpcb_scaled.sql>`
+// runs the upstream tpcb-like sequence — UPDATE accounts, SELECT
+// abalance, UPDATE tellers, UPDATE branches, INSERT history — for 40
+// transactions across 2 clients. Each transaction touches one row in
+// each of the 3 balance tables with the same `:delta`, so the
+// invariant `sum(history.delta) == sum(abalance) == sum(tbalance) ==
+// sum(bbalance)` must hold on each side after convergence.
+//
+// Three convergence assertions catch distinct regressions:
+//   - `count(*) = 40` on `pgbench_history` after a 90 s deadline catches
+//     a lost INSERT (rung 1's index-maintenance / rung 2's
+//     `primaryKeyOnlyRow` failing under sustained load).
+//   - `sum(delta)` / `sum(abalance)` / `sum(tbalance)` / `sum(bbalance)`
+//     equality between publisher and subscriber catches a wrong-row
+//     UPDATE — pgoutput's `'U' relOid 'N' newTuple` for non-key-touched
+//     UPDATEs depends on `primaryKeyOnlyRow` synthesising the PK key
+//     from the new tuple; a regression there would land deltas on the
+//     wrong row and drift one or more aggregate.
+//   - Per-side tpcb-like invariant (`sum(abalance) == sum(delta)`) fails
+//     fast on a broken workload (e.g., pgbench launched but only ran
+//     one of the three UPDATEs), keeping the test independent of the
+//     publisher's pgbench correctness.
+func TestPort_PgoutputInteropPGToGoopgPgbenchTpcb(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	repo := repoRoot(t)
+	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
+
+	pgbenchBin := filepath.Join(repo, "postgres", "local_install", "bin", "pgbench")
+	if st, err := os.Stat(pgbenchBin); err != nil || !st.Mode().IsRegular() {
+		t.Skipf("pgbench not present at %s", pgbenchBin)
+	}
+
+	baseDir := filepath.Join(repo, "tmp", "pg2g-pgb-tpc")
+	_ = os.RemoveAll(baseDir)
+
+	slotName := "pg2g_pgb_tpc"
+	psc := pubsubcluster.NewMixed(t, "pg2g_pgb_tpc", pubsubcluster.Options{
+		RepoRoot:         repo,
+		BaseDir:          baseDir,
+		PublisherKind:    pubsubcluster.ClusterKindPG,
+		SubscriberKind:   pubsubcluster.ClusterKindGoopg,
+		SyncMode:         pubsubcluster.SyncModeAsync,
+		ApplicationName:  slotName,
+		PublicationName:  "p",
+		SubscriptionName: slotName,
+		StartupWait:      30 * time.Second,
+		ShutdownWait:     10 * time.Second,
+	})
+	defer func() { _ = psc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := psc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Scaled-down standard pgbench schema. `filler` columns dropped:
+	// tpcb-like never references them, and `char(N)` padding through
+	// pgoutput is out of rung 21's UPDATE-apply scope.
+	schemaSQL := []string{
+		"CREATE TABLE public.pgbench_branches (bid int PRIMARY KEY, bbalance int NOT NULL)",
+		"CREATE TABLE public.pgbench_tellers  (tid int PRIMARY KEY, bid int, tbalance int NOT NULL)",
+		"CREATE TABLE public.pgbench_accounts (aid int PRIMARY KEY, bid int, abalance int NOT NULL)",
+		"CREATE TABLE public.pgbench_history  (tid int, bid int, aid int, delta int, mtime timestamp)",
+	}
+	for _, s := range schemaSQL {
+		psc.Publisher.Exec(t, s)
+		psc.Subscriber.Exec(t, s)
+	}
+
+	// Seed matched zero balances on both ends. tpcb-like only increments
+	// balances by :delta — identical starting state plus matched UPDATEs
+	// guarantees convergence to identical aggregates.
+	seedBranches := "INSERT INTO public.pgbench_branches (bid, bbalance) VALUES (1, 0)"
+	psc.Publisher.Exec(t, seedBranches)
+	psc.Subscriber.Exec(t, seedBranches)
+
+	var tellerVals, accountVals []string
+	for tid := 1; tid <= 10; tid++ {
+		tellerVals = append(tellerVals, fmt.Sprintf("(%d, 1, 0)", tid))
+	}
+	for aid := 1; aid <= 100; aid++ {
+		accountVals = append(accountVals, fmt.Sprintf("(%d, 1, 0)", aid))
+	}
+	seedTellers := "INSERT INTO public.pgbench_tellers (tid, bid, tbalance) VALUES " + strings.Join(tellerVals, ", ")
+	seedAccounts := "INSERT INTO public.pgbench_accounts (aid, bid, abalance) VALUES " + strings.Join(accountVals, ", ")
+	psc.Publisher.Exec(t, seedTellers)
+	psc.Subscriber.Exec(t, seedTellers)
+	psc.Publisher.Exec(t, seedAccounts)
+	psc.Subscriber.Exec(t, seedAccounts)
+
+	psc.CreatePublication(t, "pgbench_branches", "pgbench_tellers", "pgbench_accounts", "pgbench_history")
+
+	psc.Publisher.Exec(t, fmt.Sprintf(
+		"SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", slotName))
+	conn := psc.Publisher.Conninfo(slotName)
+	psc.Subscriber.Exec(t, fmt.Sprintf(
+		"CREATE SUBSCRIPTION %s CONNECTION '%s' PUBLICATION p WITH (enabled = true, copy_data = false, slot_name = '%s', create_slot = false)",
+		slotName, conn, slotName))
+
+	// Scaled-down tpcb-like (100 accounts, 10 tellers, 1 branch). Mirrors
+	// upstream pgbench's built-in tpcb-like exactly, just with smaller
+	// id ranges. `\set bid 1` skips pgbench's `:scale`-based branch
+	// formula because our scale is fixed at 1.
+	scriptPath := filepath.Join(t.TempDir(), "tpcb_scaled.sql")
+	scriptBody := "\\set aid random(1, 100)\n" +
+		"\\set tid random(1, 10)\n" +
+		"\\set bid 1\n" +
+		"\\set delta random(-5000, 5000)\n" +
+		"BEGIN;\n" +
+		"UPDATE public.pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;\n" +
+		"SELECT abalance FROM public.pgbench_accounts WHERE aid = :aid;\n" +
+		"UPDATE public.pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;\n" +
+		"UPDATE public.pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;\n" +
+		"INSERT INTO public.pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);\n" +
+		"END;\n"
+	if err := os.WriteFile(scriptPath, []byte(scriptBody), 0o644); err != nil {
+		t.Fatalf("write pgbench script: %v", err)
+	}
+
+	// 2 clients × 20 transactions = 40 history rows.
+	out := psc.Publisher.Pgbench(t,
+		"--no-vacuum",
+		"-c", "2",
+		"-j", "2",
+		"-t", "20",
+		"-f", scriptPath,
+	)
+	if !strings.Contains(out, "tps") {
+		t.Logf("pgbench output:\n%s", out)
+	}
+
+	// History convergence fail-fasts a lost INSERT under sustained load.
+	psc.WaitForRow(t, "public.pgbench_history", "1=1", 40, 90*time.Second)
+
+	// Aggregate convergence. Publisher values are read once after the
+	// workload completes; subscriber values are polled until they match
+	// or a 60 s deadline expires (apply-worker lag is bounded).
+	pubDelta := psc.Publisher.QueryScalar(t, "SELECT coalesce(sum(delta), 0) FROM public.pgbench_history")
+	pubAB := psc.Publisher.QueryScalar(t, "SELECT coalesce(sum(abalance), 0) FROM public.pgbench_accounts")
+	pubTB := psc.Publisher.QueryScalar(t, "SELECT coalesce(sum(tbalance), 0) FROM public.pgbench_tellers")
+	pubBB := psc.Publisher.QueryScalar(t, "SELECT coalesce(sum(bbalance), 0) FROM public.pgbench_branches")
+
+	var subDelta, subAB, subTB, subBB string
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		subDelta = psc.Subscriber.QueryScalar(t, "SELECT coalesce(sum(delta), 0) FROM public.pgbench_history")
+		subAB = psc.Subscriber.QueryScalar(t, "SELECT coalesce(sum(abalance), 0) FROM public.pgbench_accounts")
+		subTB = psc.Subscriber.QueryScalar(t, "SELECT coalesce(sum(tbalance), 0) FROM public.pgbench_tellers")
+		subBB = psc.Subscriber.QueryScalar(t, "SELECT coalesce(sum(bbalance), 0) FROM public.pgbench_branches")
+		if subDelta == pubDelta && subAB == pubAB && subTB == pubTB && subBB == pubBB {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if subDelta != pubDelta {
+		t.Fatalf("pgbench_history sum(delta) mismatch: pub=%q sub=%q", pubDelta, subDelta)
+	}
+	if subAB != pubAB {
+		t.Fatalf("pgbench_accounts sum(abalance) mismatch: pub=%q sub=%q (history delta=%s) — wrong-row UPDATE apply", pubAB, subAB, pubDelta)
+	}
+	if subTB != pubTB {
+		t.Fatalf("pgbench_tellers sum(tbalance) mismatch: pub=%q sub=%q (history delta=%s) — wrong-row UPDATE apply", pubTB, subTB, pubDelta)
+	}
+	if subBB != pubBB {
+		t.Fatalf("pgbench_branches sum(bbalance) mismatch: pub=%q sub=%q (history delta=%s) — wrong-row UPDATE apply", pubBB, subBB, pubDelta)
+	}
+
+	// tpcb-like invariant: every transaction adds the same :delta to one
+	// row in accounts, tellers, branches plus an INSERT into history. So
+	// sum(history.delta) == sum(abalance) - 0 holds on each side. This
+	// pins the workload itself: if pgbench dropped one of the three
+	// UPDATEs the invariant would fail before any replication question
+	// is asked.
+	if pubAB != pubDelta {
+		t.Fatalf("publisher-side tpcb-like invariant broken: sum(abalance)=%s vs sum(delta)=%s", pubAB, pubDelta)
+	}
+	if pubTB != pubDelta {
+		t.Fatalf("publisher-side tpcb-like invariant broken: sum(tbalance)=%s vs sum(delta)=%s", pubTB, pubDelta)
+	}
+	if pubBB != pubDelta {
+		t.Fatalf("publisher-side tpcb-like invariant broken: sum(bbalance)=%s vs sum(delta)=%s", pubBB, pubDelta)
+	}
+}
+
 // containsTuple looks for an "(a,b)"-shaped summary inside a list.
 func containsTuple(have []string, want ...string) bool {
 	needle := "(" + strings.Join(want, ",") + ")"

@@ -2990,6 +2990,72 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
         `pgcluster.Cluster` + libpq multi-host reconnect on the
         client side, proto_version=2 streaming subxacts,
         column-ref-typed `nextval` args.
+      - PARTIAL PROGRESS 2026-05-14 (rung 21): pgbench tpcb-like
+        UPDATE-heavy workload landed on top of rung 20's pgbench
+        driver. The load-bearing shape the Scenario A DoD calls
+        for (`pgbench -i -s 1 && pgbench -c 2 -T 180`) now runs
+        end-to-end, scoped down so each loop completes in ~2 s.
+        Design doc:
+        `docs/design/0103-0044-m0103-0007-rung-21-pgbench-tpcb-pg-to-goopg.md`
+        (accepted). The "pgbench standard schema replication"
+        deferred item closes here.
+      - Why scaled-down standard schema instead of full
+        `pgbench -i -s 1`: goopg's CREATE SUBSCRIPTION does not
+        copy_data, so the subscriber would need an independent
+        `pgbench -i -s 1` run (≈30 s/loop). The new surface at
+        rung 21 is the apply worker's UPDATE / no-key-touched
+        UPDATE / REPLICA-IDENTITY-DEFAULT-PK convergence under
+        sustained, concurrent load — not pgbench's own
+        initial-load path. Manual schema + balance-0 seed matches
+        the post-`pgbench -i` state exactly while keeping
+        per-loop cost low.
+      - Changes: pinned by
+        `TestPort_PgoutputInteropPGToGoopgPgbenchTpcb` in
+        `internal/testport/pgoutput_interop_test.go`. Four
+        manually-created tables (`pgbench_branches` (1 row),
+        `pgbench_tellers` (10 rows), `pgbench_accounts` (100
+        rows), `pgbench_history` (empty)) match upstream
+        pgbench's standard shape sans the unused `filler char(N)`
+        columns (out of UPDATE-apply scope). Workload is
+        upstream's tpcb-like sequence — UPDATE accounts, SELECT
+        abalance, UPDATE tellers, UPDATE branches, INSERT
+        history — driven by
+        `pgbench -c 2 -j 2 -t 20 --no-vacuum -f <tpcb_scaled.sql>`
+        for 40 transactions / 40 history rows across 2 clients.
+        The custom script substitutes `:scale=1` (single branch)
+        and scales down id ranges to `random(1, 100)` / `random
+        (1, 10)`.
+      - Three orthogonal convergence assertions: (1) `count(*) =
+        40` on `pgbench_history` within 90 s catches a lost
+        INSERT (rung 1's index maintenance or rung 2's
+        `primaryKeyOnlyRow` regressing); (2) cross-side
+        aggregate equality for `sum(delta)`, `sum(abalance)`,
+        `sum(tbalance)`, `sum(bbalance)` polled for ≤60 s
+        catches a wrong-row UPDATE apply — pgoutput emits
+        `'U' relOid 'N' newTuple` (OldTuple omitted) for
+        non-key-touched UPDATEs because the PK didn't change,
+        so the apply path depends on `primaryKeyOnlyRow`
+        synthesising the row-locator key from the new tuple's
+        PK columns; a regression there lands `:delta` on the
+        wrong row and one or more aggregate drifts; (3)
+        publisher-side tpcb-like invariant
+        `sum(abalance) == sum(tbalance) == sum(bbalance) ==
+        sum(delta)` pins the workload itself before any
+        replication question is asked.
+      - baseDir + slot name kept short (`pg2g-pgb-tpc` /
+        `pg2g_pgb_tpc`) for the 108-byte Linux Unix-sockaddr
+        limit, same constraint as rung 20.
+      - Verification (rung 21):
+        `go test -count=1 -timeout 180s -run
+        TestPort_PgoutputInteropPGToGoopgPgbenchTpcb
+        ./internal/testport/` → PASS (~2.0 s); all 17
+        `TestPort_PgoutputInteropPGToGoopg*` together → PASS
+        (~26.5 s); no regression.
+      - Next rungs (deferred within M0103-0007): kill -9
+        plumbing on `pgcluster.Cluster` + libpq multi-host
+        reconnect on the client side, proto_version=2 streaming
+        subxacts, column-ref-typed `nextval` args, `filler
+        char(N)` bpchar padding through pgoutput.
 
 - [x] **M0103-0008**
       - Summary: Scenario B E2E test: goopg primary + PG subscriber.
