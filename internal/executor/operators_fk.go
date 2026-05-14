@@ -42,7 +42,7 @@ func checkFKInsert(ctx *Context, tbl *catalog.Table, row Row) error {
 				continue
 			}
 		}
-		if err := assertParentExists(ctx, fk, vals); err != nil {
+		if err := assertParentExists(ctx, tbl, fk, vals); err != nil {
 			return err
 		}
 	}
@@ -167,7 +167,7 @@ func fullTableFKCheck(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignK
 			if allNull {
 				continue
 			}
-			if err := assertParentExists(ctx, fk, vals); err != nil {
+			if err := assertParentExists(ctx, childTbl, fk, vals); err != nil {
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return err
@@ -181,7 +181,11 @@ func fullTableFKCheck(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignK
 
 // assertParentExists verifies that the parent table (fk.RefTable) contains a
 // row whose reference columns match vals. Returns 23503 if not found.
-func assertParentExists(ctx *Context, fk catalog.ForeignKey, vals []Datum) error {
+// childTbl is the table where the FK is declared (the one being INSERTed into
+// or UPDATEd) — its name is reported in the error message to match upstream
+// PostgreSQL's `insert or update on table %q violates foreign key constraint
+// %q` format.
+func assertParentExists(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, vals []Datum) error {
 	im, ok := ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -200,13 +204,53 @@ func assertParentExists(ctx *Context, fk catalog.ForeignKey, vals []Datum) error
 		return err
 	}
 	if !found {
+		childName := ""
+		if childTbl != nil {
+			childName = childTbl.Name
+		}
 		return &ExecError{
-			Code:    "23503",
-			Message: fmt.Sprintf("insert or update on table %q violates foreign key constraint: key (%s) not present in table %q",
-				"", strings.Join(fk.Columns, ", "), fk.RefTable),
+			Code: "23503",
+			Message: fmt.Sprintf("insert or update on table %q violates foreign key constraint %q",
+				childName, fkConstraintName(childTbl, fk)),
+			Detail: fmt.Sprintf("Key (%s)=(%s) is not present in table %q.",
+				strings.Join(fk.Columns, ", "), fkValsForDetail(vals), fk.RefTable),
 		}
 	}
 	return nil
+}
+
+// fkConstraintName synthesises the auto-generated PG constraint name
+// `<table>_<col>_fkey` when the catalog has no explicit name. The
+// referencing table's name is used (not the referenced table) — matches
+// upstream's ChooseConstraintName for inline `col REFERENCES ...`
+// declarations.
+func fkConstraintName(childTbl *catalog.Table, fk catalog.ForeignKey) string {
+	tbl := ""
+	if childTbl != nil {
+		tbl = childTbl.Name
+	}
+	col := ""
+	if len(fk.Columns) > 0 {
+		col = fk.Columns[0]
+	}
+	return fmt.Sprintf("%s_%s_fkey", tbl, col)
+}
+
+// fkValsForDetail renders FK column values for the PostgreSQL-style DETAIL
+// line `Key (col)=(val) is not present in table "<parent>".`
+func fkValsForDetail(vals []Datum) string {
+	var sb strings.Builder
+	for i, v := range vals {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		if v.IsNull() {
+			sb.WriteString("null")
+			continue
+		}
+		sb.WriteString(v.Format())
+	}
+	return sb.String()
 }
 
 // assertNoChildRows verifies that no child rows reference the given parent
