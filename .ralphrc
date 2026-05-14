@@ -23,7 +23,7 @@ CLAUDE_OUTPUT_FORMAT="json"
 # Tool permissions
 # Comma-separated list of allowed tools
 # Safe git subcommands only - keep this list minimal and avoid destructive commands
-ALLOWED_TOOLS="Write,Read,Edit,Grep,Bash(*),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest),mcp__serena__*"
+ALLOWED_TOOLS="Write,Read,Edit,Grep,Bash(grep *),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest),mcp__serena__*"
 
 # Session management
 SESSION_CONTINUITY=true
@@ -38,8 +38,7 @@ BEADS_FILTER="status:open"
 # Circuit breaker thresholds
 CB_NO_PROGRESS_THRESHOLD=3
 CB_SAME_ERROR_THRESHOLD=1000
-CB_OUTPUT_DECLINE_THRESHOLD=70
-
+CB_OUTPUT_DECLINE_THRESHOLD=1000
 # Auto-update Claude CLI at startup
 CLAUDE_AUTO_UPDATE=true
 

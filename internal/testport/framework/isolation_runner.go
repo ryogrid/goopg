@@ -38,6 +38,7 @@ type pendingStep struct {
 	sql     string
 	session string // which session this step belongs to
 	outCh   chan stepOutcome
+	queue   *sessionNoticeQueue // nil for non-blocking steps; set for blocked steps
 }
 
 // IsolationRunner executes an IsolationSpec against a live database.
@@ -231,6 +232,9 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			if p.session == step.Session {
 				select {
 				case o := <-p.outCh:
+					if p.queue != nil {
+						o.notices = p.queue.drain()
+					}
 					writeCompletedStep(&sb, p.name, p.sql, o)
 					pending = append(pending[:i], pending[i+1:]...)
 				case <-time.After(drainWindow):
@@ -249,6 +253,10 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 		select {
 		case outcome := <-outCh:
+			// Drain notices generated during this non-blocking step.
+			if q != nil {
+				outcome.notices = q.drain()
+			}
 			// Print the current step first, then give pending steps a brief
 			// window to complete (matching PostgreSQL isolationtester order:
 			// unblocked waiting steps appear before the next regular step).
@@ -256,7 +264,16 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			pending = drainWithTimeout(&sb, pending, 50*time.Millisecond)
 
 		case <-time.After(blockDetectWait):
-			// Step appears blocked; record and continue.
+			// Step appears blocked.  Drain notices that arrived before the
+			// row-level wait (e.g. from RAISE NOTICE in PL/pgSQL predicates
+			// evaluated before the blocking point). These must appear BEFORE
+			// the "step name: sql <waiting ...>" line, matching PostgreSQL
+			// isolationtester's output format.
+			if q != nil {
+				for _, notice := range q.drain() {
+					fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", step.Session, notice)
+				}
+			}
 			// For single-line SQL: "step name: sql <waiting ...>"
 			// For multi-line SQL:  "step name: \nsql\n <waiting ...>"
 			// (matches PostgreSQL isolationtester output format)
@@ -266,7 +283,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			} else {
 				fmt.Fprintf(&sb, "step %s: %s <waiting ...>\n", step.Name, flat)
 			}
-			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh})
+			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q})
 		}
 	}
 
@@ -276,6 +293,9 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		pending = pending[1:]
 		select {
 		case outcome := <-p.outCh:
+			if p.queue != nil {
+				outcome.notices = p.queue.drain()
+			}
 			writeCompletedStep(&sb, p.name, p.sql, outcome)
 		case <-time.After(drainWindow):
 			fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
@@ -320,6 +340,9 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 	for _, p := range pending {
 		select {
 		case o := <-p.outCh:
+			if p.queue != nil {
+				o.notices = p.queue.drain()
+			}
 			writeCompletedStep(sb, p.name, p.sql, o)
 		default:
 			remaining = append(remaining, p)
@@ -339,6 +362,9 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 	for _, p := range pending {
 		select {
 		case o := <-p.outCh:
+			if p.queue != nil {
+				o.notices = p.queue.drain()
+			}
 			writeCompletedStep(sb, p.name, p.sql, o)
 		case <-time.After(window):
 			remaining = append(remaining, p)
@@ -354,10 +380,9 @@ func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session str
 		queue.drain() // clear any stale notices from previous steps
 	}
 	o := execStep(ctx, conn, sqlText, "")
-	if queue != nil {
-		o.notices = queue.drain()
-	}
-
+	// Notices are drained by the main goroutine so that pre-wait notices
+	// (generated before a row-level wait) and post-wait notices (from EPQ
+	// recheck) can be printed at the correct positions in the output.
 	o.session = session
 	return o
 }
