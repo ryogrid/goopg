@@ -2204,12 +2204,67 @@ Depends on: M0008 (complete), M0094-0002 (complete), M0101, M0102-0005.
       ./internal/catalog/` → all green (parser 1.046 s,
       planner 1.064 s, analyzer 1.036 s, executor 2.603 s,
       server 3.481 s, wal 3.058 s, catalog 1.019 s).
-      Next sub-step: drop the `t.Skip` on
-      `TestPort_PgoutputInteropGoopgToPG` and observe whatever
-      live probe PG's apply launcher ships after `fetch_table_list`
-      — most likely the column-list probe deferred from rung 6 or a
-      per-table replica-identity check. Each new rung lands with
-      its own design doc.
+      PARTIAL PROGRESS 2026-05-14 (loop 9): closed rung 8 —
+      `CREATE_REPLICATION_SLOT` parenthesised options list (PG14+
+      shape). Design doc:
+      `docs/design/0103-0013-create-replication-slot-options-list.md`
+      (accepted).
+      Diagnosis: dropping the `t.Skip` on
+      `TestPort_PgoutputInteropGoopgToPG` surfaced
+      `ERROR: could not create replication slot "g2pg_sub": ERROR:
+      unexpected token "(SNAPSHOT" after LOGICAL pgoutput`. PG's
+      libpqwalreceiver runs `CREATE_REPLICATION_SLOT "g2pg_sub"
+      LOGICAL pgoutput (SNAPSHOT 'nothing')` as part of CREATE
+      SUBSCRIPTION; goopg's `replyCreateReplicationSlot` tokenised
+      args via `strings.Fields` and rejected the `(SNAPSHOT` token
+      because the legacy pre-PG14 grammar only knew about positional
+      trailing keywords.
+      Changes:
+      - `internal/server/replication.go`:
+        - New `splitReplicationSlotOptionsBlock(args)` peels the
+          optional `(...)` block off before whitespace tokenisation.
+          Paren-depth-aware + single-quote-aware (handles
+          SQL-doubled `''` escapes); errors on unmatched/missing
+          paren, unterminated string, or trailing tokens past `)`.
+        - New `parseReplicationSlotOptions(raw, kind)` parses the
+          comma-separated option list via the existing
+          `splitStartReplicationOptionList`. Recognises
+          `SNAPSHOT 'export'|'use'|'nothing'`, `TWO_PHASE`,
+          `RESERVE_WAL` (PHYSICAL only), `FAILOVER` (LOGICAL only)
+          as no-ops in v0; rejects unknown options with a syntax
+          error so future probe rungs surface loudly. Kind-vs-option
+          cross-checks mirror upstream's
+          `parse_create_replication_slot_options`.
+        - `replyCreateReplicationSlot` wires the new helpers in
+          before the existing prefix tokenisation. Legacy positional
+          trailing keywords (EXPORT_SNAPSHOT / NOEXPORT_SNAPSHOT /
+          USE_SNAPSHOT / TWO_PHASE) are preserved for older clients.
+      Tests (in `internal/server/replication_test.go`):
+      - `TestReplicationCreateLogicalSlotWithOptionsList` — exact
+        libpqwalreceiver shape (`(SNAPSHOT 'nothing')`); asserts
+        the four-column reply, NULL `snapshot_name`, `pgoutput`
+        `output_plugin`, and that the slot is stored as
+        `wal.SlotLogical`.
+      - `TestReplicationCreateLogicalSlotOptionsListMultiple` —
+        comma-separated success path (`(SNAPSHOT 'use', TWO_PHASE)`)
+        plus unknown-option syntax-error pin (`(FROBNITZ true)`).
+      Verification (loop 9): `go test -race -count=1 -timeout 300s
+      ./internal/parser/ ./internal/planner/ ./internal/analyzer/
+      ./internal/executor/ ./internal/server/ ./internal/wal/
+      ./internal/catalog/` → all green. Manual live-probe run with
+      the `t.Skip` removed confirmed slot creation now succeeds; the
+      test then times out at 60 s waiting for the post-INSERT row
+      count to reach 1 on the PG subscriber — rung 9, deferred.
+      Next sub-step (rung 9): subscriber apply path stall after
+      `CREATE SUBSCRIPTION`. With rung 8 closed, the subscription is
+      created successfully but the apply worker fails to materialise
+      the publisher's INSERT/UPDATE traffic within 60 s. The break
+      is somewhere in START_REPLICATION / pgoutput stream emission /
+      standby-status loop / subscriber-side post-CREATE diagnostic
+      query. Need a fresh interop run with both publisher and
+      subscriber logs captured to identify which probe or stream
+      message fails, then land a targeted fix with its own design
+      doc (`0103-0014`).
 
 - [ ] **M0103-0009** — Close milestone.
       Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:

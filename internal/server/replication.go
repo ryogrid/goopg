@@ -169,33 +169,40 @@ func (s *Server) replyIdentifySystem(w *protocol.FrameWriter) error {
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
-// replyCreateReplicationSlot parses `name PHYSICAL [...]` (the v0
-// subset) and creates a slot. Other variants (LOGICAL, EXPORT_SNAPSHOT,
-// RESERVE_WAL options) return feature_not_supported.
+// replyCreateReplicationSlot parses the upstream CREATE_REPLICATION_SLOT
+// grammar and creates a slot. The v0 subset acknowledges:
+//
+//	CREATE_REPLICATION_SLOT slot_name [TEMPORARY]
+//	  { PHYSICAL | LOGICAL output_plugin }
+//	  [ ( option [value] [, ...] ) ]
+//
+// Legacy positional trailing keywords (EXPORT_SNAPSHOT, NOEXPORT_SNAPSHOT,
+// USE_SNAPSHOT, TWO_PHASE, RESERVE_WAL) are still accepted for
+// backwards-compatibility. The parenthesised options list is the
+// PG14+ shape libpqwalreceiver uses: SNAPSHOT 'export'|'use'|'nothing',
+// TWO_PHASE [bool], RESERVE_WAL [bool], FAILOVER [bool]. All known
+// options are no-ops in v0 because goopg does not yet ship a snapshot
+// exporter; snapshot_name is always returned NULL.
 func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string) error {
 	if s.cfg.Slots == nil {
 		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 			"replication slots are not configured on this server")
 	}
-	tokens := strings.Fields(args)
+	// Split off any trailing parenthesised options list before
+	// whitespace-tokenising the rest. The options block is parsed
+	// separately because its values can be single-quoted strings
+	// containing whitespace.
+	prefix, optsBlock, hasOpts, err := splitReplicationSlotOptionsBlock(args)
+	if err != nil {
+		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+	}
+	tokens := strings.Fields(prefix)
 	if len(tokens) < 2 {
 		return s.writeQueryError(w, sqlstate.SyntaxError,
 			"CREATE_REPLICATION_SLOT requires a slot name and a kind")
 	}
 	name := unquoteIdent(tokens[0])
 
-	// Upstream grammar:
-	//   CREATE_REPLICATION_SLOT slot_name [TEMPORARY]
-	//     { PHYSICAL [RESERVE_WAL]
-	//     | LOGICAL output_plugin
-	//         [EXPORT_SNAPSHOT|NOEXPORT_SNAPSHOT|USE_SNAPSHOT] [TWO_PHASE] }
-	//
-	// v0 accepts TEMPORARY (slot lifetime is process-bound regardless;
-	// the keyword is acknowledged but does not currently auto-drop on
-	// disconnect — that is a documented follow-up). RESERVE_WAL is
-	// accepted as a no-op. The snapshot option (when present) is
-	// acknowledged but `snapshot_name` is always returned NULL since
-	// goopg does not yet ship a snapshot exporter.
 	idx := 1
 	if strings.EqualFold(tokens[idx], "TEMPORARY") {
 		idx++
@@ -232,9 +239,8 @@ func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string
 			return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 				fmt.Sprintf("logical output plugin %q is not supported (pgoutput only)", plugin))
 		}
-		// Trailing options: EXPORT_SNAPSHOT | NOEXPORT_SNAPSHOT |
-		// USE_SNAPSHOT | TWO_PHASE. All accepted as no-ops in v0;
-		// snapshot_name is returned NULL.
+		// Legacy positional trailing keywords (pre-PG14 grammar):
+		// EXPORT_SNAPSHOT | NOEXPORT_SNAPSHOT | USE_SNAPSHOT | TWO_PHASE.
 		for idx < len(tokens) {
 			opt := strings.ToUpper(tokens[idx])
 			switch opt {
@@ -248,6 +254,12 @@ func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string
 	default:
 		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 			fmt.Sprintf("CREATE_REPLICATION_SLOT %s is not supported (PHYSICAL or LOGICAL pgoutput)", kind))
+	}
+
+	if hasOpts {
+		if err := parseReplicationSlotOptions(optsBlock, slotKind); err != nil {
+			return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+		}
 	}
 
 	var startLSN uint64
@@ -722,6 +734,129 @@ func splitStartReplicationOptionList(raw string) []string {
 	}
 	out = append(out, raw[start:])
 	return out
+}
+
+// splitReplicationSlotOptionsBlock locates an optional trailing
+// parenthesised options list in a CREATE_REPLICATION_SLOT args string.
+// Returns the prefix (everything before the `(`), the content between
+// the parens (excluding the parens themselves), and whether an options
+// list was present. The opening paren must appear outside any
+// single-quoted string and only after the slot-kind keywords (the
+// prefix tokens never contain `(` or `'` so the scan can be linear).
+// An unbalanced or mid-string paren returns an error.
+func splitReplicationSlotOptionsBlock(args string) (prefix, opts string, has bool, err error) {
+	depth := 0
+	inQuote := false
+	openIdx := -1
+	for i := 0; i < len(args); i++ {
+		c := args[i]
+		switch c {
+		case '\'':
+			if !inQuote {
+				inQuote = true
+			} else if i+1 < len(args) && args[i+1] == '\'' {
+				// SQL doubled single-quote escape inside a string.
+				i++
+			} else {
+				inQuote = false
+			}
+		case '(':
+			if inQuote {
+				continue
+			}
+			if depth == 0 {
+				openIdx = i
+			}
+			depth++
+		case ')':
+			if inQuote {
+				continue
+			}
+			if depth == 0 {
+				return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: unmatched ')' in options")
+			}
+			depth--
+			if depth == 0 {
+				tail := strings.TrimSpace(args[i+1:])
+				if tail != "" {
+					return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: unexpected trailing tokens %q after options", tail)
+				}
+				return strings.TrimSpace(args[:openIdx]), args[openIdx+1 : i], true, nil
+			}
+		}
+	}
+	if depth != 0 {
+		return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: options list missing closing ')'")
+	}
+	if inQuote {
+		return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: unterminated single-quoted string")
+	}
+	return args, "", false, nil
+}
+
+// parseReplicationSlotOptions parses the comma-separated option list
+// from the parenthesised form of CREATE_REPLICATION_SLOT (PG14+ shape):
+//
+//	(option [value] [, ...])
+//
+// Each option is a single keyword followed optionally by a value. The
+// value can be a single-quoted string, an unquoted identifier
+// (typically `true`/`false`), or an integer. Recognised options:
+//
+//	SNAPSHOT { 'export' | 'use' | 'nothing' } — snapshot disposition.
+//	  goopg has no snapshot exporter yet, so all three values are
+//	  no-ops and snapshot_name is returned NULL regardless.
+//	TWO_PHASE [ boolean ]   — two-phase commit decoding (no-op).
+//	RESERVE_WAL [ boolean ] — PHYSICAL only (no-op).
+//	FAILOVER [ boolean ]    — PG17+ failover slots (no-op).
+//
+// Unknown options return a syntax error so future probe rungs surface
+// loudly. RESERVE_WAL is rejected on LOGICAL slots and FAILOVER on
+// PHYSICAL — both match upstream's parse_create_replication_slot.
+func parseReplicationSlotOptions(raw string, kind wal.SlotKind) error {
+	parts := splitStartReplicationOptionList(raw)
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Split into name + optional value. The name is a single
+		// keyword (no whitespace, no quotes); the value, if present,
+		// follows after whitespace.
+		name := p
+		val := ""
+		if i := strings.IndexAny(p, " \t"); i >= 0 {
+			name = strings.TrimSpace(p[:i])
+			val = strings.TrimSpace(p[i+1:])
+		}
+		key := strings.ToUpper(name)
+		switch key {
+		case "SNAPSHOT":
+			if val == "" {
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: SNAPSHOT requires a value")
+			}
+			v := strings.ToLower(strings.Trim(val, "'"))
+			switch v {
+			case "export", "use", "nothing":
+				// no-op
+			default:
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: SNAPSHOT %q not recognised (export|use|nothing)", v)
+			}
+		case "TWO_PHASE":
+			// boolean or no value (presence implies true) — no-op.
+		case "RESERVE_WAL":
+			if kind == wal.SlotLogical {
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: RESERVE_WAL is not valid for LOGICAL slots")
+			}
+		case "FAILOVER":
+			if kind == wal.SlotPhysical {
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: FAILOVER is not valid for PHYSICAL slots")
+			}
+		default:
+			return fmt.Errorf("CREATE_REPLICATION_SLOT: unrecognised option %q", name)
+		}
+	}
+	return nil
 }
 
 // parseLSN parses upstream's `X/X` hex notation back into a uint64.

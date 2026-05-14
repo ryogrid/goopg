@@ -269,6 +269,73 @@ func TestReplicationCreateLogicalSlot(t *testing.T) {
 	}
 }
 
+// TestReplicationCreateLogicalSlotWithOptionsList covers the PG14+
+// CREATE_REPLICATION_SLOT shape libpqwalreceiver uses today:
+//
+//	CREATE_REPLICATION_SLOT "<name>" LOGICAL pgoutput (SNAPSHOT 'nothing')
+//
+// Before M0103-0008 rung 8 the server tokenised args via strings.Fields
+// and rejected the parenthesised options list with
+// `unexpected token "(SNAPSHOT" after LOGICAL pgoutput`, which broke
+// CREATE SUBSCRIPTION against a goopg publisher (see
+// docs/design/0103-0013-create-replication-slot-options-list.md).
+// The fix splits off the `(...)` block before whitespace-tokenising
+// and acknowledges all known options as no-ops.
+func TestReplicationCreateLogicalSlotWithOptionsList(t *testing.T) {
+	addr, slots, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "sub_paren" LOGICAL pgoutput (SNAPSHOT 'nothing')`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("CREATE_REPLICATION_SLOT first frame = %c, want T", frames[0].Type)
+	}
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("CREATE_REPLICATION_SLOT second frame = %c, want D", frames[1].Type)
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if string(cells[0]) != "sub_paren" {
+		t.Errorf("slot_name = %q, want sub_paren", cells[0])
+	}
+	if cells[2] != nil {
+		t.Errorf("snapshot_name = %q, want NULL (SNAPSHOT 'nothing' is no-op in v0)", cells[2])
+	}
+	if string(cells[3]) != "pgoutput" {
+		t.Errorf("output_plugin = %q, want pgoutput", cells[3])
+	}
+	if slot, err := slots.Get("sub_paren"); err != nil || slot.Kind != wal.SlotLogical {
+		t.Fatalf("slot lookup: err=%v kind=%v", err, slot.Kind)
+	}
+}
+
+// TestReplicationCreateLogicalSlotOptionsListMultiple — the parser must
+// handle comma-separated option lists and reject unknown options with a
+// syntax error so future probe rungs surface loudly.
+func TestReplicationCreateLogicalSlotOptionsListMultiple(t *testing.T) {
+	addr, _, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	// Multi-option success path: SNAPSHOT + TWO_PHASE are both no-ops
+	// but the parser must accept the combination.
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "sub_multi" LOGICAL pgoutput (SNAPSHOT 'use', TWO_PHASE)`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("multi-option first frame = %c, want T", frames[0].Type)
+	}
+
+	// Unknown option must error so unimplemented probe rungs surface
+	// instead of being silently dropped.
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "sub_bad" LOGICAL pgoutput (FROBNITZ true)`)
+	frames = readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgErrorResponse {
+		t.Fatalf("unknown option first frame = %c, want E", frames[0].Type)
+	}
+}
+
 // TestReplicationCreateLogicalSlotRejectsUnknownPlugin: only `pgoutput`
 // is accepted; other plugin names land with feature_not_supported so
 // the libpq client gets a deterministic error rather than a hang.

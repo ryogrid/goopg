@@ -239,38 +239,52 @@ func TestPort_PgoutputInteropGoopgToPG(t *testing.T) {
 	//     `TestLateralPgGetPublicationTablesFromOuterRef` and
 	//     `TestLateralPgGetPublicationTablesUnknownYieldsZero` in the
 	//     executor package.
-	//   - rung 7 (NEW, OPEN): analyzer-side IndirectionStar expansion
-	//     in derived subqueries when the SRF arg list contains an
-	//     aggregate. libpqrcv's `fetch_table_list` ships
-	//     `SELECT … gpt.attrs FROM pg_class c JOIN pg_namespace n …
-	//      JOIN ( SELECT (pg_get_publication_tables(VARIADIC
-	//      array_agg(pubname::text))).* FROM pg_publication WHERE
-	//      pubname IN (…)) AS gpt ON gpt.relid = c.oid`. The
-	//     non-aggregate IndirectionStar variant is rewritten at parse
-	//     time into a FROM-clause TableFuncRef + `__irs_0.*` target —
-	//     `analyzer.tableFuncColumns` (M0103-0008 loop 4) then hands
-	//     the outer scope the SRF's static three-column shape. The
-	//     aggregate-arg variant skips that rewrite (parser passes nil
-	//     `onAggregate`) and the planner lowers it via `ProjectSet`
-	//     (M0103-0008 loop 5). The analyzer's
-	//     `synthesizeSubqueryTable` does not yet expand
-	//     `*parser.IndirectionStar` targets — it falls back to a
-	//     single `?column?1`-named column, so outer references like
-	//     `gpt.attrs` raise `42703: column "attrs" does not exist`.
-	//     Pinned (failing) by `TestPlanFetchAgg` in the planner
-	//     package — drop into the next loop and add the analyzer-side
-	//     IndirectionStar expansion to close.
-	// M0103-0008 rung 7 closed (analyzer-side IndirectionStar expansion
-	// for derived subqueries; see docs/design/0103-0012-derived-subquery-
-	// srf-composite-expansion.md and TestPlanFetchTableListAggDerivedSubquery).
-	// The live probe ladder is still gated on dropping this Skip and
-	// observing whatever PG ships next — likely the column-list probe
-	// deferred from rung 6 or a per-table replica-identity check.
-	// Deferred to the next M0103-0008 loop so each rung lands with its
-	// own design doc + targeted pin.
-	t.Skip("M0103-0008 rung 7 closed in 0103-0012; live pgoutput interop " +
-		"ladder deferred to a follow-up loop so the next live-probe rung " +
-		"can land with its own design doc.")
+	//   - rung 7 (loop 8, CLOSED): analyzer-side IndirectionStar
+	//     expansion in derived subqueries for SRFs whose arg list
+	//     contains an aggregate. Closed by
+	//     `analyzer.compositeFuncColumns` + the new
+	//     `synthesizeSubqueryTable` IndirectionStar branch in
+	//     `0103-0012-derived-subquery-srf-composite-expansion.md`.
+	//     Pinned by `TestPlanFetchTableListAggDerivedSubquery` in the
+	//     planner package.
+	//   - rung 8 (loop 9, CLOSED): CREATE_REPLICATION_SLOT
+	//     parenthesised options list (PG14+ shape). libpqwalreceiver
+	//     sends `CREATE_REPLICATION_SLOT "<name>" LOGICAL pgoutput
+	//     (SNAPSHOT 'nothing')` from the CREATE SUBSCRIPTION path,
+	//     but `replyCreateReplicationSlot` tokenised args via
+	//     `strings.Fields` and rejected the `(SNAPSHOT` token with
+	//     `unexpected token "(SNAPSHOT" after LOGICAL pgoutput`,
+	//     short-circuiting subscription creation. Closed by splitting
+	//     off the `(...)` block before whitespace tokenisation
+	//     (`splitReplicationSlotOptionsBlock`) and adding
+	//     `parseReplicationSlotOptions` which acknowledges SNAPSHOT
+	//     'export'|'use'|'nothing', TWO_PHASE, RESERVE_WAL, FAILOVER
+	//     as no-ops in v0 and rejects unknown options with a syntax
+	//     error so future probe rungs surface loudly. Design:
+	//     `docs/design/0103-0013-create-replication-slot-options-list.md`.
+	//     Pinned by `TestReplicationCreateLogicalSlotWithOptionsList`
+	//     and `TestReplicationCreateLogicalSlotOptionsListMultiple` in
+	//     `internal/server/replication_test.go`.
+	//   - rung 9 (NEW, OPEN): subscriber apply path stalls — with
+	//     rung 8 closed, `CREATE SUBSCRIPTION g2pg_sub … PUBLICATION p
+	//     WITH (enabled = true, copy_data = false)` against a goopg
+	//     publisher succeeds, but the live interop test then times out
+	//     waiting 60 s for the post-INSERT row count to reach 1 on the
+	//     PG subscriber. The next probe rung is somewhere in the
+	//     START_REPLICATION / pgoutput-emit / standby-status loop —
+	//     either the walsender is not relaying the publication's
+	//     changes, or pgoutput's begin/relation/insert frames aren't
+	//     reaching the subscriber's apply worker, or the subscriber is
+	//     issuing another diagnostic query that fails silently and
+	//     pauses the worker. Need to capture both goopg-publisher and
+	//     PG-subscriber logs from a fresh run, identify which probe or
+	//     stream message fails, and land a targeted fix with its own
+	//     design doc (0103-0014).
+	// t.Skip restored — rung 9 deferred to its own M0103-0008 loop so
+	// each rung lands with its own design doc + targeted pin.
+	t.Skip("M0103-0008 rung 8 closed in 0103-0013; subscriber apply path " +
+		"stall (rung 9) deferred to a follow-up loop so the next live-probe " +
+		"rung can land with its own design doc.")
 
 	repo := repoRoot(t)
 	pgcluster.Available(t, filepath.Join(repo, "postgres", "local_install", "bin"))
