@@ -1,187 +1,187 @@
 suite_id,kind,item_path,source_pattern,status,rationale
-regress-sql,regress,postgres/src/test/regress/sql/advisory_lock.sql,postgres/src/test/regress/sql/advisory_lock.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/aggregates.sql,postgres/src/test/regress/sql/aggregates.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/advisory_lock.sql,postgres/src/test/regress/sql/advisory_lock.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/aggregates.sql,postgres/src/test/regress/sql/aggregates.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/alter_generic.sql,postgres/src/test/regress/sql/alter_generic.sql,excluded,ALTER on generic objects; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/alter_operator.sql,postgres/src/test/regress/sql/alter_operator.sql,excluded,ALTER OPERATOR; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/alter_table.sql,postgres/src/test/regress/sql/alter_table.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/alter_table.sql,postgres/src/test/regress/sql/alter_table.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/amutils.sql,postgres/src/test/regress/sql/amutils.sql,excluded,Access method utilities; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/arrays.sql,postgres/src/test/regress/sql/arrays.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/arrays.sql,postgres/src/test/regress/sql/arrays.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/async.sql,postgres/src/test/regress/sql/async.sql,excluded,LISTEN/NOTIFY async; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/bit.sql,postgres/src/test/regress/sql/bit.sql,excluded,Bit string type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/bitmapops.sql,postgres/src/test/regress/sql/bitmapops.sql,excluded,Bitmap operations; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/boolean.sql,postgres/src/test/regress/sql/boolean.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/boolean.sql,postgres/src/test/regress/sql/boolean.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/box.sql,postgres/src/test/regress/sql/box.sql,excluded,Geometric type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/brin.sql,postgres/src/test/regress/sql/brin.sql,excluded,BRIN index; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/brin_bloom.sql,postgres/src/test/regress/sql/brin_bloom.sql,excluded,BRIN bloom index; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/brin_multi.sql,postgres/src/test/regress/sql/brin_multi.sql,excluded,BRIN multi-range index; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/btree_index.sql,postgres/src/test/regress/sql/btree_index.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/case.sql,postgres/src/test/regress/sql/case.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/char.sql,postgres/src/test/regress/sql/char.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/btree_index.sql,postgres/src/test/regress/sql/btree_index.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/case.sql,postgres/src/test/regress/sql/case.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/char.sql,postgres/src/test/regress/sql/char.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/circle.sql,postgres/src/test/regress/sql/circle.sql,excluded,Geometric type; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/cluster.sql,postgres/src/test/regress/sql/cluster.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/cluster.sql,postgres/src/test/regress/sql/cluster.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/collate.icu.utf8.sql,postgres/src/test/regress/sql/collate.icu.utf8.sql,excluded,ICU collation; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/collate.linux.utf8.sql,postgres/src/test/regress/sql/collate.linux.utf8.sql,excluded,Linux collation; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/collate.sql,postgres/src/test/regress/sql/collate.sql,excluded,Collation; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/collate.utf8.sql,postgres/src/test/regress/sql/collate.utf8.sql,excluded,UTF-8 collation; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/collate.windows.win1252.sql,postgres/src/test/regress/sql/collate.windows.win1252.sql,excluded,Windows collation; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/combocid.sql,postgres/src/test/regress/sql/combocid.sql,excluded,Combo CID; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/comments.sql,postgres/src/test/regress/sql/comments.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/comments.sql,postgres/src/test/regress/sql/comments.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/compression.sql,postgres/src/test/regress/sql/compression.sql,excluded,Table compression; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/constraints.sql,postgres/src/test/regress/sql/constraints.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/constraints.sql,postgres/src/test/regress/sql/constraints.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/conversion.sql,postgres/src/test/regress/sql/conversion.sql,excluded,Encoding conversion; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/copy.sql,postgres/src/test/regress/sql/copy.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/copy2.sql,postgres/src/test/regress/sql/copy2.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/copydml.sql,postgres/src/test/regress/sql/copydml.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/copy.sql,postgres/src/test/regress/sql/copy.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/copy2.sql,postgres/src/test/regress/sql/copy2.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/copydml.sql,postgres/src/test/regress/sql/copydml.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/copyencoding.sql,postgres/src/test/regress/sql/copyencoding.sql,excluded,COPY encoding; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/copyselect.sql,postgres/src/test/regress/sql/copyselect.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/copyselect.sql,postgres/src/test/regress/sql/copyselect.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/create_aggregate.sql,postgres/src/test/regress/sql/create_aggregate.sql,excluded,CREATE AGGREGATE; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/create_am.sql,postgres/src/test/regress/sql/create_am.sql,excluded,CREATE ACCESS METHOD; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/create_cast.sql,postgres/src/test/regress/sql/create_cast.sql,excluded,CREATE CAST; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/create_function_c.sql,postgres/src/test/regress/sql/create_function_c.sql,excluded,C-language functions; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/create_function_sql.sql,postgres/src/test/regress/sql/create_function_sql.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/create_index.sql,postgres/src/test/regress/sql/create_index.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/create_function_sql.sql,postgres/src/test/regress/sql/create_function_sql.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/create_index.sql,postgres/src/test/regress/sql/create_index.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/create_index_spgist.sql,postgres/src/test/regress/sql/create_index_spgist.sql,excluded,SP-GiST index; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/create_misc.sql,postgres/src/test/regress/sql/create_misc.sql,excluded,CREATE miscellaneous; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/create_operator.sql,postgres/src/test/regress/sql/create_operator.sql,excluded,CREATE OPERATOR; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/create_procedure.sql,postgres/src/test/regress/sql/create_procedure.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/create_procedure.sql,postgres/src/test/regress/sql/create_procedure.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/create_role.sql,postgres/src/test/regress/sql/create_role.sql,excluded,CREATE ROLE; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/create_schema.sql,postgres/src/test/regress/sql/create_schema.sql,excluded,CREATE SCHEMA; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/create_table.sql,postgres/src/test/regress/sql/create_table.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/create_table_like.sql,postgres/src/test/regress/sql/create_table_like.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/create_table.sql,postgres/src/test/regress/sql/create_table.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/create_table_like.sql,postgres/src/test/regress/sql/create_table_like.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/create_type.sql,postgres/src/test/regress/sql/create_type.sql,excluded,CREATE TYPE; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/create_view.sql,postgres/src/test/regress/sql/create_view.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/create_view.sql,postgres/src/test/regress/sql/create_view.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/database.sql,postgres/src/test/regress/sql/database.sql,excluded,DATABASE DDL; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/date.sql,postgres/src/test/regress/sql/date.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/dbsize.sql,postgres/src/test/regress/sql/dbsize.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/delete.sql,postgres/src/test/regress/sql/delete.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/date.sql,postgres/src/test/regress/sql/date.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/dbsize.sql,postgres/src/test/regress/sql/dbsize.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/delete.sql,postgres/src/test/regress/sql/delete.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/dependency.sql,postgres/src/test/regress/sql/dependency.sql,excluded,Object dependency tracking; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/domain.sql,postgres/src/test/regress/sql/domain.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/drop_if_exists.sql,postgres/src/test/regress/sql/drop_if_exists.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/domain.sql,postgres/src/test/regress/sql/domain.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/drop_if_exists.sql,postgres/src/test/regress/sql/drop_if_exists.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/drop_operator.sql,postgres/src/test/regress/sql/drop_operator.sql,excluded,DROP OPERATOR; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/encoding.sql,postgres/src/test/regress/sql/encoding.sql,excluded,Server encoding; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/enum.sql,postgres/src/test/regress/sql/enum.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/equivclass.sql,postgres/src/test/regress/sql/equivclass.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/errors.sql,postgres/src/test/regress/sql/errors.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/enum.sql,postgres/src/test/regress/sql/enum.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/equivclass.sql,postgres/src/test/regress/sql/equivclass.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/errors.sql,postgres/src/test/regress/sql/errors.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/euc_kr.sql,postgres/src/test/regress/sql/euc_kr.sql,excluded,EUC-KR encoding; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/event_trigger.sql,postgres/src/test/regress/sql/event_trigger.sql,excluded,Event triggers; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/event_trigger_login.sql,postgres/src/test/regress/sql/event_trigger_login.sql,excluded,Login event trigger; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/explain.sql,postgres/src/test/regress/sql/explain.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/expressions.sql,postgres/src/test/regress/sql/expressions.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/fast_default.sql,postgres/src/test/regress/sql/fast_default.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/float4.sql,postgres/src/test/regress/sql/float4.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/float8.sql,postgres/src/test/regress/sql/float8.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/explain.sql,postgres/src/test/regress/sql/explain.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/expressions.sql,postgres/src/test/regress/sql/expressions.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/fast_default.sql,postgres/src/test/regress/sql/fast_default.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/float4.sql,postgres/src/test/regress/sql/float4.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/float8.sql,postgres/src/test/regress/sql/float8.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/foreign_data.sql,postgres/src/test/regress/sql/foreign_data.sql,excluded,Foreign data wrapper; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/foreign_key.sql,postgres/src/test/regress/sql/foreign_key.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/functional_deps.sql,postgres/src/test/regress/sql/functional_deps.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/generated_stored.sql,postgres/src/test/regress/sql/generated_stored.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/generated_virtual.sql,postgres/src/test/regress/sql/generated_virtual.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/foreign_key.sql,postgres/src/test/regress/sql/foreign_key.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/functional_deps.sql,postgres/src/test/regress/sql/functional_deps.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/generated_stored.sql,postgres/src/test/regress/sql/generated_stored.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/generated_virtual.sql,postgres/src/test/regress/sql/generated_virtual.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/geometry.sql,postgres/src/test/regress/sql/geometry.sql,excluded,Geometric type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/gin.sql,postgres/src/test/regress/sql/gin.sql,excluded,GIN index; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/gist.sql,postgres/src/test/regress/sql/gist.sql,excluded,GiST index; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/groupingsets.sql,postgres/src/test/regress/sql/groupingsets.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/guc.sql,postgres/src/test/regress/sql/guc.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/groupingsets.sql,postgres/src/test/regress/sql/groupingsets.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/guc.sql,postgres/src/test/regress/sql/guc.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/hash_func.sql,postgres/src/test/regress/sql/hash_func.sql,excluded,Hash function catalog; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/hash_index.sql,postgres/src/test/regress/sql/hash_index.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/hash_part.sql,postgres/src/test/regress/sql/hash_part.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/horology.sql,postgres/src/test/regress/sql/horology.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/identity.sql,postgres/src/test/regress/sql/identity.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/incremental_sort.sql,postgres/src/test/regress/sql/incremental_sort.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/index_including.sql,postgres/src/test/regress/sql/index_including.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/index_including_gist.sql,postgres/src/test/regress/sql/index_including_gist.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/indexing.sql,postgres/src/test/regress/sql/indexing.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/hash_index.sql,postgres/src/test/regress/sql/hash_index.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/hash_part.sql,postgres/src/test/regress/sql/hash_part.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/horology.sql,postgres/src/test/regress/sql/horology.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/identity.sql,postgres/src/test/regress/sql/identity.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/incremental_sort.sql,postgres/src/test/regress/sql/incremental_sort.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/index_including.sql,postgres/src/test/regress/sql/index_including.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/index_including_gist.sql,postgres/src/test/regress/sql/index_including_gist.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/indexing.sql,postgres/src/test/regress/sql/indexing.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/indirect_toast.sql,postgres/src/test/regress/sql/indirect_toast.sql,excluded,Indirect TOAST; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/inet.sql,postgres/src/test/regress/sql/inet.sql,excluded,Network address types; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/infinite_recurse.sql,postgres/src/test/regress/sql/infinite_recurse.sql,excluded,Stack-depth exceeded error; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/inherit.sql,postgres/src/test/regress/sql/inherit.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/inherit.sql,postgres/src/test/regress/sql/inherit.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/init_privs.sql,postgres/src/test/regress/sql/init_privs.sql,excluded,Initial privileges; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/insert.sql,postgres/src/test/regress/sql/insert.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/insert_conflict.sql,postgres/src/test/regress/sql/insert_conflict.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/int2.sql,postgres/src/test/regress/sql/int2.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/int4.sql,postgres/src/test/regress/sql/int4.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/int8.sql,postgres/src/test/regress/sql/int8.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/interval.sql,postgres/src/test/regress/sql/interval.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/join.sql,postgres/src/test/regress/sql/join.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/join_hash.sql,postgres/src/test/regress/sql/join_hash.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/json.sql,postgres/src/test/regress/sql/json.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/insert.sql,postgres/src/test/regress/sql/insert.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/insert_conflict.sql,postgres/src/test/regress/sql/insert_conflict.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/int2.sql,postgres/src/test/regress/sql/int2.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/int4.sql,postgres/src/test/regress/sql/int4.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/int8.sql,postgres/src/test/regress/sql/int8.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/interval.sql,postgres/src/test/regress/sql/interval.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/join.sql,postgres/src/test/regress/sql/join.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/join_hash.sql,postgres/src/test/regress/sql/join_hash.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/json.sql,postgres/src/test/regress/sql/json.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/json_encoding.sql,postgres/src/test/regress/sql/json_encoding.sql,excluded,JSON encoding; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/jsonb.sql,postgres/src/test/regress/sql/jsonb.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/jsonb_jsonpath.sql,postgres/src/test/regress/sql/jsonb_jsonpath.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/jsonpath.sql,postgres/src/test/regress/sql/jsonpath.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/jsonb.sql,postgres/src/test/regress/sql/jsonb.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/jsonb_jsonpath.sql,postgres/src/test/regress/sql/jsonb_jsonpath.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/jsonpath.sql,postgres/src/test/regress/sql/jsonpath.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/jsonpath_encoding.sql,postgres/src/test/regress/sql/jsonpath_encoding.sql,excluded,JSONPath encoding; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/largeobject.sql,postgres/src/test/regress/sql/largeobject.sql,excluded,Large object; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/limit.sql,postgres/src/test/regress/sql/limit.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/limit.sql,postgres/src/test/regress/sql/limit.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/line.sql,postgres/src/test/regress/sql/line.sql,excluded,Geometric type; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/lock.sql,postgres/src/test/regress/sql/lock.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/lock.sql,postgres/src/test/regress/sql/lock.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/lseg.sql,postgres/src/test/regress/sql/lseg.sql,excluded,Geometric type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/macaddr.sql,postgres/src/test/regress/sql/macaddr.sql,excluded,MAC address type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/macaddr8.sql,postgres/src/test/regress/sql/macaddr8.sql,excluded,MAC address (EUI-64) type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/maintain_every.sql,postgres/src/test/regress/sql/maintain_every.sql,excluded,Background maintenance; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/matview.sql,postgres/src/test/regress/sql/matview.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/md5.sql,postgres/src/test/regress/sql/md5.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/matview.sql,postgres/src/test/regress/sql/matview.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/md5.sql,postgres/src/test/regress/sql/md5.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/memoize.sql,postgres/src/test/regress/sql/memoize.sql,excluded,Memoize node; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/merge.sql,postgres/src/test/regress/sql/merge.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/misc.sql,postgres/src/test/regress/sql/misc.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/misc_functions.sql,postgres/src/test/regress/sql/misc_functions.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/merge.sql,postgres/src/test/regress/sql/merge.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/misc.sql,postgres/src/test/regress/sql/misc.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/misc_functions.sql,postgres/src/test/regress/sql/misc_functions.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/misc_sanity.sql,postgres/src/test/regress/sql/misc_sanity.sql,excluded,Catalog sanity; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/money.sql,postgres/src/test/regress/sql/money.sql,excluded,Money type; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/multirangetypes.sql,postgres/src/test/regress/sql/multirangetypes.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/mvcc.sql,postgres/src/test/regress/sql/mvcc.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/name.sql,postgres/src/test/regress/sql/name.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/multirangetypes.sql,postgres/src/test/regress/sql/multirangetypes.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/mvcc.sql,postgres/src/test/regress/sql/mvcc.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/name.sql,postgres/src/test/regress/sql/name.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/namespace.sql,postgres/src/test/regress/sql/namespace.sql,excluded,pg_namespace catalog; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/numa.sql,postgres/src/test/regress/sql/numa.sql,excluded,NUMA topology; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/numeric.sql,postgres/src/test/regress/sql/numeric.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/numeric_big.sql,postgres/src/test/regress/sql/numeric_big.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/numerology.sql,postgres/src/test/regress/sql/numerology.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/numeric.sql,postgres/src/test/regress/sql/numeric.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/numeric_big.sql,postgres/src/test/regress/sql/numeric_big.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/numerology.sql,postgres/src/test/regress/sql/numerology.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/object_address.sql,postgres/src/test/regress/sql/object_address.sql,excluded,Object address; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/oid.sql,postgres/src/test/regress/sql/oid.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/oid.sql,postgres/src/test/regress/sql/oid.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/oidjoins.sql,postgres/src/test/regress/sql/oidjoins.sql,excluded,OID join sanity; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/opr_sanity.sql,postgres/src/test/regress/sql/opr_sanity.sql,excluded,Operator sanity; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/partition_aggregate.sql,postgres/src/test/regress/sql/partition_aggregate.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/partition_info.sql,postgres/src/test/regress/sql/partition_info.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/partition_join.sql,postgres/src/test/regress/sql/partition_join.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/partition_prune.sql,postgres/src/test/regress/sql/partition_prune.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/partition_aggregate.sql,postgres/src/test/regress/sql/partition_aggregate.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/partition_info.sql,postgres/src/test/regress/sql/partition_info.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/partition_join.sql,postgres/src/test/regress/sql/partition_join.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/partition_prune.sql,postgres/src/test/regress/sql/partition_prune.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/password.sql,postgres/src/test/regress/sql/password.sql,excluded,Password authentication; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/path.sql,postgres/src/test/regress/sql/path.sql,excluded,Geometric type; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/pg_lsn.sql,postgres/src/test/regress/sql/pg_lsn.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/plancache.sql,postgres/src/test/regress/sql/plancache.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/plpgsql.sql,postgres/src/test/regress/sql/plpgsql.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/pg_lsn.sql,postgres/src/test/regress/sql/pg_lsn.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/plancache.sql,postgres/src/test/regress/sql/plancache.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/plpgsql.sql,postgres/src/test/regress/sql/plpgsql.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/point.sql,postgres/src/test/regress/sql/point.sql,excluded,Geometric type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/polygon.sql,postgres/src/test/regress/sql/polygon.sql,excluded,Geometric type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/polymorphism.sql,postgres/src/test/regress/sql/polymorphism.sql,excluded,Polymorphic functions; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/portals.sql,postgres/src/test/regress/sql/portals.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/portals_p2.sql,postgres/src/test/regress/sql/portals_p2.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/portals.sql,postgres/src/test/regress/sql/portals.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/portals_p2.sql,postgres/src/test/regress/sql/portals_p2.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/predicate.sql,postgres/src/test/regress/sql/predicate.sql,excluded,Predicate locking / serializable; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/prepare.sql,postgres/src/test/regress/sql/prepare.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/prepared_xacts.sql,postgres/src/test/regress/sql/prepared_xacts.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/prepare.sql,postgres/src/test/regress/sql/prepare.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/prepared_xacts.sql,postgres/src/test/regress/sql/prepared_xacts.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/privileges.sql,postgres/src/test/regress/sql/privileges.sql,excluded,Access privileges; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/psql.sql,postgres/src/test/regress/sql/psql.sql,excluded,psql client; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/psql_crosstab.sql,postgres/src/test/regress/sql/psql_crosstab.sql,excluded,psql crosstab; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/psql_pipeline.sql,postgres/src/test/regress/sql/psql_pipeline.sql,excluded,psql pipeline; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/publication.sql,postgres/src/test/regress/sql/publication.sql,excluded,Publication; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/random.sql,postgres/src/test/regress/sql/random.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/rangefuncs.sql,postgres/src/test/regress/sql/rangefuncs.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/rangetypes.sql,postgres/src/test/regress/sql/rangetypes.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/regex.sql,postgres/src/test/regress/sql/regex.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/random.sql,postgres/src/test/regress/sql/random.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/rangefuncs.sql,postgres/src/test/regress/sql/rangefuncs.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/rangetypes.sql,postgres/src/test/regress/sql/rangetypes.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/regex.sql,postgres/src/test/regress/sql/regex.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/regproc.sql,postgres/src/test/regress/sql/regproc.sql,excluded,Procedural catalog; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,postgres/src/test/regress/sql/reindex_catalog.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/reindex_catalog.sql,postgres/src/test/regress/sql/reindex_catalog.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/reloptions.sql,postgres/src/test/regress/sql/reloptions.sql,excluded,Table/index reloptions; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/replica_identity.sql,postgres/src/test/regress/sql/replica_identity.sql,excluded,Replica identity; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/returning.sql,postgres/src/test/regress/sql/returning.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/returning.sql,postgres/src/test/regress/sql/returning.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/roleattributes.sql,postgres/src/test/regress/sql/roleattributes.sql,excluded,Role attributes; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/rowsecurity.sql,postgres/src/test/regress/sql/rowsecurity.sql,excluded,Row security; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/rowtypes.sql,postgres/src/test/regress/sql/rowtypes.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/rules.sql,postgres/src/test/regress/sql/rules.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/rowtypes.sql,postgres/src/test/regress/sql/rowtypes.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/rules.sql,postgres/src/test/regress/sql/rules.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/sanity_check.sql,postgres/src/test/regress/sql/sanity_check.sql,excluded,Catalog sanity check; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/security_label.sql,postgres/src/test/regress/sql/security_label.sql,excluded,Security labels; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/select.sql,postgres/src/test/regress/sql/select.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/select_distinct.sql,postgres/src/test/regress/sql/select_distinct.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/select_distinct_on.sql,postgres/src/test/regress/sql/select_distinct_on.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/select_having.sql,postgres/src/test/regress/sql/select_having.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/select_implicit.sql,postgres/src/test/regress/sql/select_implicit.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/select_into.sql,postgres/src/test/regress/sql/select_into.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/select.sql,postgres/src/test/regress/sql/select.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/select_distinct.sql,postgres/src/test/regress/sql/select_distinct.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/select_distinct_on.sql,postgres/src/test/regress/sql/select_distinct_on.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/select_having.sql,postgres/src/test/regress/sql/select_having.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/select_implicit.sql,postgres/src/test/regress/sql/select_implicit.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/select_into.sql,postgres/src/test/regress/sql/select_into.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/select_parallel.sql,postgres/src/test/regress/sql/select_parallel.sql,excluded,Parallel query; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/select_views.sql,postgres/src/test/regress/sql/select_views.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/sequence.sql,postgres/src/test/regress/sql/sequence.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/select_views.sql,postgres/src/test/regress/sql/select_views.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/sequence.sql,postgres/src/test/regress/sql/sequence.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/spgist.sql,postgres/src/test/regress/sql/spgist.sql,excluded,SP-GiST index; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/sqljson.sql,postgres/src/test/regress/sql/sqljson.sql,excluded,SQL/JSON; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/sqljson_jsontable.sql,postgres/src/test/regress/sql/sqljson_jsontable.sql,excluded,SQL/JSON JSON_TABLE; out of scope for goopg v0.
@@ -189,46 +189,46 @@ regress-sql,regress,postgres/src/test/regress/sql/sqljson_queryfuncs.sql,postgre
 regress-sql,regress,postgres/src/test/regress/sql/stats.sql,postgres/src/test/regress/sql/stats.sql,excluded,Extended statistics; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/stats_ext.sql,postgres/src/test/regress/sql/stats_ext.sql,excluded,Extended statistics expressions; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/stats_import.sql,postgres/src/test/regress/sql/stats_import.sql,excluded,pg_restore statistics; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/strings.sql,postgres/src/test/regress/sql/strings.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/strings.sql,postgres/src/test/regress/sql/strings.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/subscription.sql,postgres/src/test/regress/sql/subscription.sql,excluded,Subscription; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/subselect.sql,postgres/src/test/regress/sql/subselect.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/sysviews.sql,postgres/src/test/regress/sql/sysviews.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/subselect.sql,postgres/src/test/regress/sql/subselect.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/sysviews.sql,postgres/src/test/regress/sql/sysviews.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/tablesample.sql,postgres/src/test/regress/sql/tablesample.sql,excluded,TABLESAMPLE; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/tablespace.sql,postgres/src/test/regress/sql/tablespace.sql,excluded,Tablespace; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/temp.sql,postgres/src/test/regress/sql/temp.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/test_setup.sql,postgres/src/test/regress/sql/test_setup.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/text.sql,postgres/src/test/regress/sql/text.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/tid.sql,postgres/src/test/regress/sql/tid.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/tidrangescan.sql,postgres/src/test/regress/sql/tidrangescan.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/tidscan.sql,postgres/src/test/regress/sql/tidscan.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/time.sql,postgres/src/test/regress/sql/time.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,postgres/src/test/regress/sql/timestamp.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,postgres/src/test/regress/sql/timestamptz.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/timetz.sql,postgres/src/test/regress/sql/timetz.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,postgres/src/test/regress/sql/transactions.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/triggers.sql,postgres/src/test/regress/sql/triggers.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/truncate.sql,postgres/src/test/regress/sql/truncate.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/temp.sql,postgres/src/test/regress/sql/temp.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/test_setup.sql,postgres/src/test/regress/sql/test_setup.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/text.sql,postgres/src/test/regress/sql/text.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/tid.sql,postgres/src/test/regress/sql/tid.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/tidrangescan.sql,postgres/src/test/regress/sql/tidrangescan.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/tidscan.sql,postgres/src/test/regress/sql/tidscan.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/time.sql,postgres/src/test/regress/sql/time.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,postgres/src/test/regress/sql/timestamp.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,postgres/src/test/regress/sql/timestamptz.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/timetz.sql,postgres/src/test/regress/sql/timetz.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,postgres/src/test/regress/sql/transactions.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/triggers.sql,postgres/src/test/regress/sql/triggers.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/truncate.sql,postgres/src/test/regress/sql/truncate.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/tsdicts.sql,postgres/src/test/regress/sql/tsdicts.sql,excluded,Full-text search dictionaries; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/tsearch.sql,postgres/src/test/regress/sql/tsearch.sql,excluded,Full-text search; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/tsrf.sql,postgres/src/test/regress/sql/tsrf.sql,excluded,Full-text search returning-functions; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/tstypes.sql,postgres/src/test/regress/sql/tstypes.sql,excluded,Full-text search types; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/tuplesort.sql,postgres/src/test/regress/sql/tuplesort.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/txid.sql,postgres/src/test/regress/sql/txid.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/tuplesort.sql,postgres/src/test/regress/sql/tuplesort.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/txid.sql,postgres/src/test/regress/sql/txid.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/type_sanity.sql,postgres/src/test/regress/sql/type_sanity.sql,excluded,Type sanity; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/typed_table.sql,postgres/src/test/regress/sql/typed_table.sql,excluded,Typed tables (OF type); out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/unicode.sql,postgres/src/test/regress/sql/unicode.sql,excluded,Unicode semantics; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/union.sql,postgres/src/test/regress/sql/union.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/updatable_views.sql,postgres/src/test/regress/sql/updatable_views.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/update.sql,postgres/src/test/regress/sql/update.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/uuid.sql,postgres/src/test/regress/sql/uuid.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/vacuum.sql,postgres/src/test/regress/sql/vacuum.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/union.sql,postgres/src/test/regress/sql/union.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/updatable_views.sql,postgres/src/test/regress/sql/updatable_views.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/update.sql,postgres/src/test/regress/sql/update.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/uuid.sql,postgres/src/test/regress/sql/uuid.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/vacuum.sql,postgres/src/test/regress/sql/vacuum.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/vacuum_parallel.sql,postgres/src/test/regress/sql/vacuum_parallel.sql,excluded,Parallel VACUUM; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/varchar.sql,postgres/src/test/regress/sql/varchar.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/window.sql,postgres/src/test/regress/sql/window.sql,not-tried,
-regress-sql,regress,postgres/src/test/regress/sql/with.sql,postgres/src/test/regress/sql/with.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/varchar.sql,postgres/src/test/regress/sql/varchar.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/window.sql,postgres/src/test/regress/sql/window.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/with.sql,postgres/src/test/regress/sql/with.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/without_overlaps.sql,postgres/src/test/regress/sql/without_overlaps.sql,excluded,WITHOUT OVERLAPS temporal key; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/write_parallel.sql,postgres/src/test/regress/sql/write_parallel.sql,excluded,Parallel write; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/xid.sql,postgres/src/test/regress/sql/xid.sql,not-tried,
+regress-sql,regress,postgres/src/test/regress/sql/xid.sql,postgres/src/test/regress/sql/xid.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/xml.sql,postgres/src/test/regress/sql/xml.sql,excluded,XML type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/xmlmap.sql,postgres/src/test/regress/sql/xmlmap.sql,excluded,XML mapping; out of scope for goopg v0.
 regress-expected,regress,postgres/src/test/regress/expected/advisory_lock.out,postgres/src/test/regress/expected/advisory_lock.out,not-tried,
