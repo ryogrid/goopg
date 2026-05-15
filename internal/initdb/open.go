@@ -1039,7 +1039,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				case <-ticker.C:
 					// Drain and sync any buffered WAL. Fast no-op when
 					// nothing was written since the last flush.
-					_ = walWriter.FlushUpTo(^uint64(0))
+					_ = walWriter.FlushUpTo(walWriter.WrittenLSN())
 				case <-stop:
 					return
 				}
