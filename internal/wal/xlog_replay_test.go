@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"encoding/binary"
 	"strings"
 	"testing"
 
@@ -57,6 +58,50 @@ func TestApplyRecordReplaysDecodedXLogHeapInsert(t *testing.T) {
 	}
 	if string(tup.Data) != "hello" {
 		t.Fatalf("tuple data = %q, want %q", tup.Data, "hello")
+	}
+}
+
+func TestApplyRecordReplaysDecodedXLogHeapInsertStripsZeroTuplePrefix(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 908, Fork: storage.MainFork}
+	attrBytes := append(testPhysicalPGInt4(-999), testPhysicalPGShortText("bootstrap")...)
+	rec := Record{
+		StartLSN: 1,
+		EndLSN:   100,
+		XLog: &XLogDecodedRecord{
+			Header:   XLogRecord{Rmid: RmgrHeap, Info: xlogHeapInsert | xlogHeapInit, XID: 42},
+			MainData: testXLogHeapInsertMainData(1),
+			Blocks: []XLogBlockRef{{
+				ID:       0,
+				Rel:      rel,
+				Block:    0,
+				WillInit: true,
+				Data:     testXLogHeapInsertTupleDataWithPrefix(storage.DefaultHeapTupleHoff, []byte{0}, attrBytes),
+			}},
+		},
+	}
+
+	applied, err := ApplyRecord(mgr, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("ApplyRecord applied=false, want true")
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 0, page); err != nil {
+		t.Fatal(err)
+	}
+	tup, err := storage.PageGetHeapTuple(page, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(tup.Data) != string(attrBytes) {
+		t.Fatalf("tuple data = %x, want %x", tup.Data, attrBytes)
 	}
 }
 
@@ -307,9 +352,31 @@ func testXLogHeapInsertMainData(offnum uint16) []byte {
 }
 
 func testXLogHeapInsertTupleData(hoff uint8, tupleData []byte) []byte {
-	buf := make([]byte, sizeOfXLogHeapHeaderData+len(tupleData))
+	prefixLen := int(hoff) - storage.SizeOfHeapTupleHeaderData
+	if prefixLen < 0 {
+		prefixLen = 0
+	}
+	return testXLogHeapInsertTupleDataWithPrefix(hoff, make([]byte, prefixLen), tupleData)
+}
+
+func testXLogHeapInsertTupleDataWithPrefix(hoff uint8, prefix, tupleData []byte) []byte {
+	buf := make([]byte, sizeOfXLogHeapHeaderData+len(prefix)+len(tupleData))
 	buf[4] = hoff
-	copy(buf[sizeOfXLogHeapHeaderData:], tupleData)
+	copy(buf[sizeOfXLogHeapHeaderData:], prefix)
+	copy(buf[sizeOfXLogHeapHeaderData+len(prefix):], tupleData)
+	return buf
+}
+
+func testPhysicalPGInt4(v int32) []byte {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, uint32(v))
+	return buf
+}
+
+func testPhysicalPGShortText(s string) []byte {
+	buf := make([]byte, 1+len(s))
+	buf[0] = byte((len(s)+1)<<1 | 0x01)
+	copy(buf[1:], s)
 	return buf
 }
 

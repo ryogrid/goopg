@@ -2214,6 +2214,20 @@ func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, of
 	if len(block.Data) < sizeOfXLogHeapHeaderData {
 		return nil, fmt.Errorf("wal: invalid xlog heap-insert block-data len %d (want >= %d)", len(block.Data), sizeOfXLogHeapHeaderData)
 	}
+	hoff := block.Data[4]
+	tupleData := append([]byte(nil), block.Data[sizeOfXLogHeapHeaderData:]...)
+	prefixLen := int(hoff) - storage.SizeOfHeapTupleHeaderData
+	if prefixLen > 0 {
+		if prefixLen > len(tupleData) {
+			return nil, fmt.Errorf("wal: xlog heap-insert tuple prefix len %d exceeds payload len %d", prefixLen, len(tupleData))
+		}
+		for _, b := range tupleData[:prefixLen] {
+			if b != 0 {
+				return nil, fmt.Errorf("wal: xlog heap-insert tuple prefix len %d not yet supported", prefixLen)
+			}
+		}
+		tupleData = tupleData[prefixLen:]
+	}
 	tuple := storage.HeapTuple{
 		Header: storage.HeapTupleHeader{
 			Xmin:      xid,
@@ -2222,9 +2236,9 @@ func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, of
 			CTID:      storage.ItemPointer{Block: block.Block, Offset: offnum},
 			Infomask2: binary.LittleEndian.Uint16(block.Data[0:2]),
 			Infomask:  binary.LittleEndian.Uint16(block.Data[2:4]),
-			Hoff:      block.Data[4],
+			Hoff:      hoff,
 		},
-		Data: append([]byte(nil), block.Data[sizeOfXLogHeapHeaderData:]...),
+		Data: tupleData,
 	}
 	return tuple.MarshalBinary()
 }

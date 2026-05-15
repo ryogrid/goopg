@@ -3,6 +3,7 @@ package testport
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,7 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/pgcluster"
 	"github.com/goopg/goopg/internal/wal"
@@ -427,10 +431,114 @@ func benchLogDiagnostics(c *cluster.Cluster, query string) string {
 	} else if len(rows) > 0 {
 		parts = append(parts, fmt.Sprintf(" wal_receiver=%v", rows))
 	}
+	if heapDiag := benchLogHeapFileDiagnostics(c); heapDiag != "" {
+		parts = append(parts, " "+heapDiag)
+	}
 	if tail := clusterLogTail(c.LogPath(), 12); tail != "" {
 		parts = append(parts, fmt.Sprintf(" log_tail=%q", tail))
 	}
 	return strings.Join(parts, "")
+}
+
+func benchLogHeapFileDiagnostics(c *cluster.Cluster) string {
+	ctx := context.Background()
+	relSource := "relfilenode"
+	relRows, err := c.Query(ctx,
+		"SELECT relfilenode FROM pg_catalog.pg_class WHERE relname = 'bench_log'")
+	if err != nil {
+		relSource = "oid"
+		relRows, err = c.Query(ctx,
+			"SELECT oid FROM pg_catalog.pg_class WHERE relname = 'bench_log'")
+		if err != nil {
+			return fmt.Sprintf("heap_file_rel_err=%v", err)
+		}
+	}
+	if len(relRows) == 0 || len(relRows[0]) == 0 {
+		return "heap_file_rel_missing"
+	}
+	relfilenode := strings.TrimSpace(relRows[0][0])
+	if relfilenode == "" || relfilenode == "0" {
+		return fmt.Sprintf("heap_file=unavailable(source=%s rel=%s)", relSource, relfilenode)
+	}
+	matches, err := filepath.Glob(filepath.Join(c.DataDir(), "base", "*", relfilenode))
+	if err != nil {
+		return fmt.Sprintf("heap_file_glob_err=%v", err)
+	}
+	if len(matches) == 0 {
+		return fmt.Sprintf("heap_file(source=%s) rel=%s missing", relSource, relfilenode)
+	}
+	parts := make([]string, 0, len(matches))
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("%s stat_err=%v", path, err))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s size=%d %s", path, info.Size(), describeHeapPage(path)))
+	}
+	return fmt.Sprintf("heap_file(source=%s)=[%s]", relSource, strings.Join(parts, ", "))
+}
+
+func describeHeapPage(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("page0_read_err=%v", err)
+	}
+	if len(raw) < storage.BlockSize {
+		return fmt.Sprintf("page0_short=%d", len(raw))
+	}
+	page := storage.Page(raw[:storage.BlockSize])
+	hdr, err := storage.Header(page)
+	if err != nil {
+		return fmt.Sprintf("page0_header_err=%v", err)
+	}
+	lpCount, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		return fmt.Sprintf("page0_lower=%d upper=%d lp_err=%v", hdr.Lower(), hdr.Upper(), err)
+	}
+	parts := []string{
+		fmt.Sprintf("page0_lower=%d", hdr.Lower()),
+		fmt.Sprintf("upper=%d", hdr.Upper()),
+		fmt.Sprintf("lsn=%d", hdr.LSN()),
+		fmt.Sprintf("lp_count=%d", lpCount),
+	}
+	for slot := uint16(1); slot <= uint16(lpCount) && slot <= 2; slot++ {
+		item, err := storage.PageGetItemID(page, slot)
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("slot%d_err=%v", slot, err))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("slot%d_flags=%d", slot, item.Flags))
+		parts = append(parts, fmt.Sprintf("slot%d_len=%d", slot, item.Length))
+		if item.Flags != storage.ItemIDNormal {
+			continue
+		}
+		tuple, err := storage.PageGetHeapTuple(page, slot)
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("slot%d_tuple_err=%v", slot, err))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("slot%d_xmin=%d", slot, tuple.Header.Xmin))
+		parts = append(parts, fmt.Sprintf("slot%d_xmax=%d", slot, tuple.Header.Xmax))
+		parts = append(parts, fmt.Sprintf("slot%d_hoff=%d", slot, tuple.Header.Hoff))
+		parts = append(parts, fmt.Sprintf("slot%d_infomask=%#x", slot, tuple.Header.Infomask))
+		parts = append(parts, fmt.Sprintf("slot%d_infomask2=%#x", slot, tuple.Header.Infomask2))
+		parts = append(parts, fmt.Sprintf("slot%d_raw=%s", slot, hex.EncodeToString(tuple.Data)))
+		parts = append(parts, fmt.Sprintf("slot%d_decode=%s", slot, decodeBenchLogTuple(tuple.Data)))
+	}
+	return strings.Join(parts, " ")
+}
+
+func decodeBenchLogTuple(data []byte) string {
+	cols := []catalog.Column{
+		{Name: "client", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "src", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	}
+	row := make(executor.Row, len(cols))
+	if err := executor.DecodeRowInto(row, cols, data); err != nil {
+		return fmt.Sprintf("err=%v", err)
+	}
+	return fmt.Sprintf("ok(client=%d,src=%q)", row[0].Int, row[1].StringValue())
 }
 
 func clusterLogTail(path string, maxLines int) string {
