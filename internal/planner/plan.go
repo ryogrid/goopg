@@ -59,6 +59,23 @@ type IntegerConst struct {
 func (e *IntegerConst) Pos() int { return e.pos }
 func (*IntegerConst) exprNode()  {}
 
+// TableOidExpr is the per-binding `tableoid` system column for a
+// non-partitioned base relation. resolveColumnRefAt synthesises this
+// when the binding is bound to a single concrete table whose OID is
+// known at plan time (i.e. the `tableoid::regclass` value is a
+// constant). Partition-aware unions instead emit a real per-leaf
+// `tableoid` column via the per-leaf Project wrapping (see
+// planFromTable's partition arm + rangeBinding.tableOidColIdx) so the
+// outer `tableoid` reference becomes an ordinary ColumnRef into the
+// trailing slot. (M0100-0005y)
+type TableOidExpr struct {
+	pos      int
+	TableOID uint32
+}
+
+func (e *TableOidExpr) Pos() int { return e.pos }
+func (*TableOidExpr) exprNode()  {}
+
 // StringConst — string literal.
 type StringConst struct {
 	pos   int

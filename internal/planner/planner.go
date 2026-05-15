@@ -216,6 +216,17 @@ type rangeBinding struct {
 	// assigned" (CTE / subquery-only / ON CONFLICT excluded) and
 	// falls back to Name-only matching in downstream rebinds.
 	sourceIdx int16
+	// tableOidColIdx, when > 0, holds the relative offset within
+	// this binding's row of the synthetic `tableoid` column. Set
+	// by the planner-side per-leaf Project wrapping in partition
+	// (and inheritance) unions to len(b.table.Columns), so a
+	// partitioned-table query like `SELECT tableoid::regclass FROM
+	// foo` reports the actual leaf relname (e.g. `foo2`). Zero
+	// means "not present"; resolveColumnRefAt then synthesises a
+	// constant `&TableOidExpr{TableOID: b.table.OID}` for the
+	// `tableoid` reference instead — correct for non-partitioned
+	// base relations. M0100-0005y.
+	tableOidColIdx int
 }
 
 func tableSchema(t *catalog.Table) Schema {
@@ -227,6 +238,27 @@ func tableSchema(t *catalog.Table) Schema {
 }
 
 // tableSchemaWithSource (M0071-0009) is tableSchema's variant
+
+// wrapWithTableoid wraps `child` in a Project that copies the child's
+// schema 1:1 and adds a trailing `tableoid` column populated with the
+// constant `oid` of `tableOID`. Used by the per-leaf SeqScan wrapping
+// in partition (and inheritance) unions so a `tableoid::regclass`
+// reference reports the actual leaf relname (e.g. `foo2` rather than
+// the partitioned-parent `foo`). The binding's `tableOidColIdx` is set
+// to len(b.table.Columns) at the call site so resolveColumnRefAt
+// resolves `tableoid` to the trailing slot. M0100-0005y.
+func wrapWithTableoid(child Node, tableOID uint32, sourceIdx int16, pos int) Node {
+	in := child.Output()
+	targets := make([]Expr, len(in)+1)
+	for i, c := range in {
+		targets[i] = &ColumnRef{pos: pos, Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+	}
+	targets[len(in)] = &IntegerConst{pos: pos, Value: int64(tableOID)}
+	out := make(Schema, len(in)+1)
+	copy(out, in)
+	out[len(in)] = SchemaColumn{Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: sourceIdx}
+	return &Project{pos: pos, Child: child, Targets: targets, schema: out}
+}
 // that stamps each produced SchemaColumn with the given
 // SourceTableIdx. Callers building rangeBindings thread their
 // per-FROM monotonic source identifier in here; legacy callers
@@ -1242,22 +1274,28 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			children := im.PartitionChildren(tbl.OID)
 			if len(children) > 0 {
 				// Build a UNION ALL of SeqScans over all children.
+				// Per-leaf wrap with a Project that adds `tableoid`
+				// as the trailing slot so a `tableoid::regclass`
+				// reference reports the actual leaf relname (M0100-0005y).
 				var root Node
 				for _, child := range children {
 					childSchema := tableSchemaWithSource(b.table, sourceIdx)
 					childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
+					wrapped := wrapWithTableoid(childScan, child.OID, sourceIdx, rv.Pos())
 					if root == nil {
-						root = childScan
+						root = wrapped
 					} else {
 						root = &SetOp{
 							pos:   rv.Pos(),
 							Left:  root,
-							Right: childScan,
+							Right: wrapped,
 							All:   true,
 						}
 					}
 				}
 				if root != nil {
+					b.tableOidColIdx = len(b.table.Columns)
+					ctx.schema = root.Output()
 					return root, b, nil
 				}
 			}
@@ -3969,6 +4007,14 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			innerName, _ := targetMeta(cast.Operand, t)
 			return innerName, exprType(e)
 		}
+		// `tableoid::regclass` from a non-partitioned base relation
+		// resolves to TableOidExpr; preserve the system-column label so
+		// `SELECT tableoid::regclass FROM t` reports the column name as
+		// `tableoid` (matches PG `FigureColname` for system columns).
+		// M0100-0005y.
+		if _, isTOID := cast.Operand.(*TableOidExpr); isTOID {
+			return "tableoid", exprType(e)
+		}
 		// For function-call casts (e.g. parse_ident(...)::name[]), propagate the
 		// function name as the column label (matches PostgreSQL's FigureColname). M0097-0003.
 		if _, isFuncCall := cast.Operand.(*FuncCall); isFuncCall {
@@ -4032,6 +4078,8 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "numeric"}
 	case *IntegerConst:
 		return catalog.Type{Name: "int8"}
+	case *TableOidExpr:
+		return catalog.Type{Name: "oid"}
 	case *StringConst:
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
@@ -4582,6 +4630,10 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 				return &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}, true, nil
 			}
 		}
+		// `<rel>.tableoid` system-column resolution. M0100-0005y.
+		if strings.EqualFold(x.Column, "tableoid") {
+			return resolveTableoidForBinding(b, level, x.Pos()), true, nil
+		}
 		// The qualifier matched a binding at this level but the
 		// column didn't — that's a hard error (no point walking
 		// up; an outer-scope `t.c` for a different `t` would be
@@ -4595,6 +4647,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			continue
 		}
 		for i, c := range b.table.Columns {
+
 			if !strings.EqualFold(c.Name, x.Column) {
 				continue
 			}
@@ -4621,10 +4674,51 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			}
 		}
 	}
+	// Unqualified `tableoid` system-column resolution. PG raises
+	// "column reference is ambiguous" when more than one binding
+	// could supply it; for a single-binding scope it resolves to
+	// that binding's `tableoid`. M0100-0005y.
+	if found == nil && strings.EqualFold(x.Column, "tableoid") {
+		var matchB *rangeBinding
+		for i := range ctx.bindings {
+			if ctx.bindings[i].qualifiedOnly {
+				continue
+			}
+			if matchB != nil {
+				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
+			}
+			matchB = &ctx.bindings[i]
+		}
+		if matchB != nil {
+			return resolveTableoidForBinding(*matchB, level, x.Pos()), true, nil
+		}
+	}
 	if found != nil {
 		return found, true, nil
 	}
 	return nil, false, nil
+}
+
+// resolveTableoidForBinding builds the planner expression for a
+// `tableoid` reference against a single binding. When the binding
+// carries a per-leaf `tableoid` slot (set by the partition / inheritance
+// union wrapper in planFromTable), the result is an ordinary
+// (Outer)ColumnRef into that slot — so partitioned-table queries report
+// the actual leaf relname (e.g. `foo2`) rather than the parent. For a
+// non-partitioned base relation the binding's table OID is fixed at
+// plan time, so the result is a constant TableOidExpr; the executor
+// (evalExprSlot) emits an `oid` Datum and a downstream
+// `tableoid::regclass` cast (evalCast → "regclass" arm) renders it as
+// the table's relname. M0100-0005y.
+func resolveTableoidForBinding(b rangeBinding, level, pos int) Expr {
+	if b.tableOidColIdx > 0 {
+		idx := b.offset + b.tableOidColIdx
+		if level == 0 {
+			return &ColumnRef{pos: pos, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
+		}
+		return &OuterColumnRef{pos: pos, Level: level, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
+	}
+	return &TableOidExpr{pos: pos, TableOID: b.table.OID}
 }
 
 func bindingMatchesRelation(b rangeBinding, table, schema string) bool {

@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -115,6 +116,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalExtract(x, slotToRow(slot), ctx)
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
+	case *planner.TableOidExpr:
+		// `tableoid` system column for a non-partitioned base
+		// relation: the binding's table OID is fixed at plan time
+		// (resolveTableoidForBinding). Partitioned bindings instead
+		// resolve through a real ColumnRef into the per-leaf
+		// `tableoid` slot added by the partition-union wrapper.
+		// M0100-0005y.
+		return Datum{Kind: KindInt, Int: int64(x.TableOID)}, nil
 	case *planner.NumericConst:
 		m, s, err := parseNumeric(x.Value)
 		if err != nil {
@@ -143,6 +152,19 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		v, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
+		}
+		// `<oid>::regclass` renders as the relation name (matches PG's
+		// regclassout). Used for the `tableoid` system column —
+		// `tableoid::regclass` resolves the `oid` operand against the
+		// catalog and returns the qualified relname. Unknown OIDs and
+		// non-InMemory catalogs fall through to evalCastTyped (which
+		// returns the integer as-is). M0100-0005y.
+		if v.Kind == KindInt && strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
+					return NewStringDatum(tbl.Name), nil
+				}
+			}
 		}
 		return evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
 	case *planner.BinaryOp:
@@ -1209,6 +1231,27 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
+	case "regclass":
+		// `oid::regclass` renders as the relation name (matches PG's
+		// regclassout). The catalog lookup happens at evalFuncCall's
+		// `regclass` arm for string→OID; here we cover the
+		// CastExpr path used by `tableoid::regclass` for the
+		// `tableoid` system column. KindInt input is the OID; we
+		// resolve via the executor's catalog (see CastExpr eval-site
+		// note below) and emit the qualified relname as a string.
+		// String input (e.g. `'pg_class'::regclass`) is delegated to
+		// the function-call path which already handles it.
+		// M0100-0005y.
+		if d.Kind == KindInt {
+			// The catalog isn't reachable from evalCast's signature;
+			// stash the OID as KindRegClass so the wire formatter (or
+			// upstream evalCastTyped wrapper) can render it. Until
+			// formatter support lands, return the raw integer — the
+			// CastExpr operand path in evalExprSlot will route through
+			// evalRegclassCast for the tableoid OID lookup.
+			return d, nil
+		}
+		return d, nil
 	case "date":
 		// Cast to date: truncate KindTime to midnight UTC, parse strings as dates. M0097-0004.
 		if d.Kind == KindString || d.Kind == KindStringArena {

@@ -1046,6 +1046,10 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		}
 		col, ok := lookupColumn(matches[0].table, x.Column)
 		if !ok {
+			// `<rel>.tableoid` system-column resolution. M0100-0005y.
+			if strings.EqualFold(x.Column, "tableoid") {
+				return catalog.Type{Name: "oid"}, true, nil
+			}
 			return catalog.Type{}, false, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 		}
 		return col.Type, true, nil
@@ -1078,6 +1082,25 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		found = &t
 	}
 	if found == nil {
+		// Unqualified `tableoid` system column. PG raises ambiguous
+		// when more than one binding could supply it; for a single
+		// non-qualified rel we resolve it to that binding's tableoid.
+		// M0100-0005y.
+		if strings.EqualFold(x.Column, "tableoid") {
+			var match *scopeRel
+			for i := range ctx.rels {
+				if ctx.rels[i].qualifiedOnly {
+					continue
+				}
+				if match != nil {
+					return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+				}
+				match = &ctx.rels[i]
+			}
+			if match != nil {
+				return catalog.Type{Name: "oid"}, true, nil
+			}
+		}
 		return catalog.Type{}, false, nil
 	}
 	return *found, true, nil

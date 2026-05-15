@@ -681,6 +681,15 @@ func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
 	return nil, false
 }
 
+// LookupTableByOID is the read-locked public accessor for tableByOID.
+// Used by the executor to render `oid::regclass` for the `tableoid`
+// system column (M0100-0005y) and similar OID-back-to-name lookups.
+func (c *InMemory) LookupTableByOID(oid uint32) (*Table, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tableByOID(oid)
+}
+
 // advanceNextOIDLocked nudges nextOID past `oid` so subsequent
 // allocations don't collide with the recovered identifier.
 // Caller must hold c.mu.

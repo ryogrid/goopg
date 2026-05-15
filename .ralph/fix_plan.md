@@ -1904,6 +1904,49 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `PartitionKeyUpdate2`, `WaitsForInFlightDelete` (M0100-0005s
           server-layer pin) unchanged (all still PASS).  Design:
           `docs/design/0100-0005x-upsert-dirty-probe-and-rr-serialization-raise.md`.
+        - `tableoid` system column (M0100-0005y, 2026-05-15 loop 40).
+          `rangeBinding` gains a `tableOidColIdx int` field and a new
+          `TableOidExpr` plan expression carries the binding's table
+          OID for non-partitioned bases. `resolveColumnRefAt` (planner)
+          and `resolveColumnRefTypeAt` (analyzer) recognise the
+          `tableoid` system column case-insensitively at both qualified
+          (`<rel>.tableoid`) and unqualified positions; multi-binding
+          unqualified references surface 42702 ("ambiguous"). Partition
+          unions in `planFromTable` now wrap each leaf SeqScan in a
+          Project (`wrapWithTableoid`) that adds a trailing `tableoid`
+          column populated with the leaf's OID — so
+          `SELECT tableoid::regclass, * FROM <partitioned> ORDER BY a`
+          reports each row's actual leaf relname (e.g. `foo2`) rather
+          than the partitioned-parent. The binding's `tableOidColIdx`
+          is set to `len(b.table.Columns)` and `ctx.schema` is widened
+          to the union's N+1 output. `expandStarTarget` continues to
+          iterate `b.table.Columns` so `*` stays at N columns —
+          `tableoid` is reachable only by name (matches PG's system-
+          column semantics). The executor's `*planner.CastExpr` arm
+          gains an `oid::regclass` short-circuit that calls the new
+          `(*catalog.InMemory).LookupTableByOID` accessor and emits
+          the relname as a `KindString` Datum (matches PG's
+          `regclassout`). Drive-by fix: `seqScanOp.Close` no longer
+          calls `o.pinned.RUnlock()` — the M0100-0005e change moved
+          page RLock acquisition inside `Next()` so Close-time RUnlock
+          is a double-release that the runtime catches with `sync:
+          RUnlock of unlocked RWMutex` and fatal-panics the
+          connection; the new `LIMIT 1` test surfaced this. Closes
+          the L13 (and downstream) `column "tableoid" does not exist`
+          line on `partition-key-update-4.spec`; remaining diffs in
+          that spec are real cross-partition UPDATE EPQ-recheck
+          engine bugs (the SET expression is not re-evaluated against
+          the EPQ-refetched row) — separate scope.  Regression pins:
+          `TestTableoidRegclass_NonPartitioned` and
+          `TestTableoidRegclass_Partitioned` in
+          `internal/server/tableoid_test.go`.  `go test -count=1
+          -race -timeout 280s ./internal/executor/ ./internal/storage/
+          ./internal/server/ ./internal/mvcc/ ./internal/wal/` PASS;
+          adjacent isolation tests `LockCommittedUpdate`,
+          `InsertConflictDoUpdate`, `InsertConflictDoNothing`,
+          `FkSnapshot`, `PartitionKeyUpdate{1,2,3}` unchanged (all
+          still PASS).  Design:
+          `docs/design/0100-0005y-tableoid-system-column.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

@@ -440,7 +440,14 @@ func (o *seqScanOp) Close() error {
 		o.ring = nil
 		o.activePage = nil
 	} else if o.pinned != nil {
-		o.pinned.RUnlock()
+		// M0100-0005e: page RLock is now scoped per tuple inside
+		// Next() (acquired before PageGetHeapTuple, released before
+		// yielding the slot). At Close-time we hold only the pin
+		// — drop it. A double-RUnlock here surfaces as
+		// `sync: RUnlock of unlocked RWMutex` for any consumer
+		// (e.g. Limit, top-N Sort, or any client that closes
+		// before exhausting the scan). M0100-0005y caught this
+		// via `SELECT tableoid::regclass FROM t LIMIT 1`.
 		o.ctx.Pool.Unpin(o.pinned)
 		o.pinned = nil
 		o.activePage = nil
