@@ -1043,12 +1043,15 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	}
 	s.contentMu.Unlock()
 
-	// Re-lock partition to publish (or handle concurrent publish).
-	// Remove from ioByTag and wake waiters regardless of success or
-	// failure so they can either pick up the cached page or retry.
+	// Re-lock partition to remove ioByTag and wake waiters.
+	// M0099-0004: Release part.mu before acquiring evictMu to
+	// respect lock ordering (evictMu before partition lock).
+	// Holding part.mu while waiting for evictMu can deadlock
+	// with the Pin→evictMu→oldPart.mu path above.
 	part.mu.Lock()
 	delete(part.ioByTag, tag)
 	part.ioCond.Broadcast()
+	part.mu.Unlock()
 
 	if err != nil {
 		p.evictMu.Lock()
@@ -1058,14 +1061,19 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		s.valid = false
 		s.dirty = false
 		p.evictMu.Unlock()
-		part.mu.Unlock()
 		return nil, err
 	}
+
+	p.evictMu.Lock()
+
+	// Re-check for duplicate publish. Another goroutine may have
+	// published the same tag after we released part.mu above.
+	part.mu.Lock()
 	if idx, ok := part.byTag[tag]; ok {
+		part.mu.Unlock()
 		// Another goroutine published this tag while we were reading
 		// (e.g. via PinNew). Use that slot and release ours.
 		existing := p.slots[idx]
-		p.evictMu.Lock()
 		existing.pinCount.Add(1)
 		if existing.usageCount.Load() < maxUsageCount {
 			existing.usageCount.Add(1)
@@ -1076,14 +1084,14 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		s.valid = false
 		s.dirty = false
 		p.evictMu.Unlock()
-		part.mu.Unlock()
 		return existing, nil
 	}
-	p.evictMu.Lock()
+
 	s.tag = tag
 	s.valid = true
 	s.dirty = false
 	p.evictMu.Unlock()
+
 	part.byTag[tag] = slotIdx
 	part.mu.Unlock()
 	return s, nil
