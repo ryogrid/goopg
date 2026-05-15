@@ -26,8 +26,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
@@ -509,9 +509,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			if act := rt.Activity; act != nil {
 				cpPID := "cp-0"
 				act.Register(&activity.Backend{
-					PID:         cpPID,
-					BackendType: "checkpointer",
-					State:       "active",
+					PID:          cpPID,
+					BackendType:  "checkpointer",
+					State:        "active",
 					BackendStart: time.Now().UTC().Format(time.RFC3339Nano),
 				})
 				activity.RegisterCurrentGoroutine(act, cpPID)
@@ -633,7 +633,7 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 // is logged and the function returns without spawning — useful for
 // integration tests that exercise the standby-mode boot path
 // without an actual primary.
-func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *config.Registry, logger *slog.Logger) {
+func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *config.Registry, logger *slog.Logger, applyLSNFunc func() uint64) {
 	conninfo := ""
 	slotName := ""
 	statusInterval := 10 * time.Second
@@ -650,11 +650,14 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			}
 		}
 	}
-	addr, appName := parsePrimaryConninfoFull(conninfo)
+	addr, appName, user := parsePrimaryConninfoFull(conninfo)
 	if addr == "" {
 		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
 		close(done)
 		return
+	}
+	if user == "" {
+		user = "postgres"
 	}
 	logger.Info("standby mode: starting walreceiver",
 		"primary", addr, "slot", slotName, "status_interval", statusInterval)
@@ -673,16 +676,17 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			// primary's iterator anchor inside the last-applied record
 			// and stream garbage.
 			rec, err := server.DialWalReceiver(ctx, server.WalReceiverConfig{
-				PrimaryAddr:    addr,
-				User:           "postgres",
-				SlotName:       slotName,
-				StartLSN:       rt.WAL.WrittenLSN() + 1,
-				WAL:            rt.WAL,
-				StatusInterval: statusInterval,
-				DialTimeout:    10 * time.Second,
+				PrimaryAddr:     addr,
+				User:            user,
+				SlotName:        slotName,
+				StartLSN:        rt.WAL.WrittenLSN() + 1,
+				WAL:             rt.WAL,
+				StatusInterval:  statusInterval,
+				DialTimeout:     10 * time.Second,
 				Receivers:       rt.WalReceivers,
 				Conninfo:        conninfo,
 				ApplicationName: appName,
+				ApplyLSNFunc:    applyLSNFunc,
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",
@@ -731,20 +735,20 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 // provided. v0 honours only host + port; user / password / sslmode
 // follow in later loops.
 func parsePrimaryConninfo(conninfo string) string {
-	addr, _ := parsePrimaryConninfoFull(conninfo)
+	addr, _, _ := parsePrimaryConninfoFull(conninfo)
 	return addr
 }
 
-// parsePrimaryConninfoFull extracts host:port and the application_name
+// parsePrimaryConninfoFull extracts host:port, application_name, and user
 // override (if any) from a libpq-style `key=value [key=value ...]` conninfo
 // string. host:port defaults port to 5432; missing host yields empty addr.
 // application_name is forwarded to the primary in the startup parameters so
 // SyncRep can match the standby against synchronous_standby_names.
 // M0102-0005.
-func parsePrimaryConninfoFull(conninfo string) (addr, appName string) {
+func parsePrimaryConninfoFull(conninfo string) (addr, appName, user string) {
 	conninfo = strings.TrimSpace(conninfo)
 	if conninfo == "" {
-		return "", ""
+		return "", "", ""
 	}
 	host := ""
 	port := "5432"
@@ -762,12 +766,14 @@ func parsePrimaryConninfoFull(conninfo string) (addr, appName string) {
 			port = v
 		case "application_name":
 			appName = v
+		case "user":
+			user = v
 		}
 	}
 	if host == "" {
-		return "", appName
+		return "", appName, user
 	}
-	return host + ":" + port, appName
+	return host + ":" + port, appName, user
 }
 
 // boolGUC reads a boolean GUC by name, returning fallback when the

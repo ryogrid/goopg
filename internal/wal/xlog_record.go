@@ -53,10 +53,11 @@ const (
 	RmgrXLog    Rmgr = 0 // RM_XLOG_ID — checkpoints, EOL markers, switch
 	RmgrXact    Rmgr = 1 // RM_XACT_ID — commit / abort
 	RmgrStorage Rmgr = 2 // RM_SMGR_ID — relation create / truncate
-	// 3..8 reserved (CLOG, Database, Tablespace, MultiXact, RelMap, Standby).
-	RmgrHeap2 Rmgr = 9  // RM_HEAP2_ID — heap multi-insert / vacuum
-	RmgrHeap  Rmgr = 10 // RM_HEAP_ID  — heap insert / delete / update
-	RmgrBtree Rmgr = 11 // RM_BTREE_ID — btree insert / split
+	// 3..7 reserved (CLOG, Database, Tablespace, MultiXact, RelMap).
+	RmgrStandby Rmgr = 8  // RM_STANDBY_ID — RUNNING_XACTS snapshot markers
+	RmgrHeap2   Rmgr = 9  // RM_HEAP2_ID   — heap multi-insert / vacuum
+	RmgrHeap    Rmgr = 10 // RM_HEAP_ID    — heap insert / delete / update
+	RmgrBtree   Rmgr = 11 // RM_BTREE_ID   — btree insert / split
 
 	// MaxKnownRmgr bounds the IDs goopg defines symbolic names for
 	// in this slice. Values higher than this aren't *invalid* (a

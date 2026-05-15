@@ -255,6 +255,16 @@ func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Aren
 }
 
 func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+	if err := decodeGoopgRowIntoArena(dst, cols, data, arena); err == nil {
+		return nil
+	} else if err := decodePhysicalPGRowIntoArena(dst, cols, data, arena); err == nil {
+		return nil
+	} else {
+		return err
+	}
+}
+
+func decodeGoopgRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
@@ -297,6 +307,128 @@ func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Aren
 		off += n
 	}
 	return nil
+}
+
+func decodePhysicalPGRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+	off := 0
+	for i, c := range cols {
+		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
+		if off > len(data) {
+			return fmt.Errorf("DecodePhysicalPGRow: %s: truncated at offset %d", c.Name, off)
+		}
+		v, n, err := decodePhysicalPGValueArena(c.Type, data[off:], arena)
+		if err != nil {
+			return fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
+		}
+		dst[i] = v
+		off += n
+	}
+	for _, b := range data[off:] {
+		if b != 0 {
+			return fmt.Errorf("DecodePhysicalPGRow: trailing bytes")
+		}
+	}
+	return nil
+}
+
+func alignPhysicalPGOffset(off, align int) int {
+	if align <= 1 {
+		return off
+	}
+	mask := align - 1
+	return (off + mask) &^ mask
+}
+
+func physicalPGTypeAlign(t catalog.Type) int {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean":
+		return 1
+	case "int2", "smallint":
+		return 2
+	case "int4", "integer", "int", "serial", "oid", "float4", "real", "date":
+		return 4
+	case "int8", "bigint", "bigserial", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
+		return 8
+	default:
+		return 4
+	}
+}
+
+func decodePhysicalPGValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, error) {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean":
+		if len(data) < 1 {
+			return Datum{}, 0, fmt.Errorf("truncated bool")
+		}
+		return NewBoolDatum(data[0] != 0), 1, nil
+	case "int2", "smallint":
+		if len(data) < 2 {
+			return Datum{}, 0, fmt.Errorf("truncated int2")
+		}
+		return NewIntDatum(int64(int16(binary.LittleEndian.Uint16(data[:2])))), 2, nil
+	case "int4", "integer", "int", "serial":
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated int4")
+		}
+		return NewIntDatum(int64(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
+	case "oid":
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated oid")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		if arena != nil {
+			buf, offset := arena.Allocate(len(payload))
+			copy(buf, payload)
+			return newStringArenaDatum(arena, offset, len(payload)), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
+	case "bytea":
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		if arena != nil {
+			buf, offset := arena.Allocate(len(payload))
+			copy(buf, payload)
+			return newBytesArenaDatum(arena, offset, len(payload)), n, nil
+		}
+		return NewBytesDatum(append([]byte(nil), payload...)), n, nil
+	default:
+		return Datum{}, 0, fmt.Errorf("unsupported PostgreSQL physical type %q", t.Name)
+	}
+}
+
+func decodePhysicalPGVarlena(data []byte) ([]byte, int, error) {
+	if len(data) == 0 {
+		return nil, 0, fmt.Errorf("truncated varlena")
+	}
+	header := data[0]
+	if header&0x01 == 0x01 {
+		if header == 0x01 {
+			return nil, 0, fmt.Errorf("external varlena not supported")
+		}
+		total := int(header >> 1)
+		if total < 1 || total > len(data) {
+			return nil, 0, fmt.Errorf("truncated short varlena")
+		}
+		return data[1:total], total, nil
+	}
+	if len(data) < 4 {
+		return nil, 0, fmt.Errorf("truncated 4-byte varlena header")
+	}
+	if header&0x03 == 0x02 {
+		return nil, 0, fmt.Errorf("compressed varlena not supported")
+	}
+	total := int(binary.LittleEndian.Uint32(data[:4]) >> 2)
+	if total < 4 || total > len(data) {
+		return nil, 0, fmt.Errorf("truncated 4-byte varlena")
+	}
+	return data[4:total], total, nil
 }
 
 // parseIntegerInput parses a string as an integer supporting:
@@ -696,6 +828,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 //   - Standard: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars)
 //   - Braces:   {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} (38 chars)
 //   - No-hyphen: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (32 hex chars)
+//
 // M0097-0003.
 func isValidUUIDStr(s string) bool {
 	if len(s) == 38 && s[0] == '{' && s[37] == '}' {

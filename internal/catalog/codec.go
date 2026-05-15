@@ -18,9 +18,30 @@
 package catalog
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"strings"
+)
+
+const (
+	pgNameDataLen            = 64
+	pgClassFixedPartSize     = 144
+	pgAttributeFixedPartSize = 100
+	pgClassOffOID            = 0
+	pgClassOffRelName        = 4
+	pgClassOffRelNamespace   = 68
+	pgClassOffRelFileNode    = 88
+	pgClassOffRelIsShared    = 117
+	pgClassOffRelPersistence = 118
+	pgClassOffRelKind        = 119
+	pgClassOffRelNAtts       = 120
+	pgAttributeOffRelID      = 0
+	pgAttributeOffName       = 4
+	pgAttributeOffTypID      = 68
+	pgAttributeOffNum        = 74
+	pgAttributeOffNotNull    = 86
+	pgAttributeOffIsDropped  = 91
 )
 
 // Namespace OIDs — matching upstream's bootstrap constants.
@@ -222,6 +243,49 @@ func DecodePGClassRow(data []byte) (PGClassRow, error) {
 	return r, nil
 }
 
+// DecodePGClassPhysicalRow parses the fixed-layout PostgreSQL heap tuple data
+// for pg_class. Only the non-null fixed fields needed by loadUserTablesFromHeap
+// are decoded.
+func DecodePGClassPhysicalRow(data []byte) (PGClassRow, error) {
+	var r PGClassRow
+	if len(data) < pgClassFixedPartSize {
+		return r, fmt.Errorf("pg_class physical row too short: len=%d", len(data))
+	}
+	relName := decodePGName(data[pgClassOffRelName : pgClassOffRelName+pgNameDataLen])
+	if relName == "" {
+		return r, fmt.Errorf("pg_class.relname: empty")
+	}
+	relIsShared, err := decodePGBool(data[pgClassOffRelIsShared], "pg_class.relisshared")
+	if err != nil {
+		return r, err
+	}
+	relPersistence := string([]byte{data[pgClassOffRelPersistence]})
+	if relPersistence != "p" && relPersistence != "u" && relPersistence != "t" {
+		return r, fmt.Errorf("pg_class.relpersistence: invalid %q", relPersistence)
+	}
+	relKind := string([]byte{data[pgClassOffRelKind]})
+	switch relKind {
+	case "r", "i", "S", "t", "v", "m", "c", "f", "p", "I":
+	default:
+		return r, fmt.Errorf("pg_class.relkind: invalid %q", relKind)
+	}
+	relNAtts := int32(int16(binary.LittleEndian.Uint16(data[pgClassOffRelNAtts : pgClassOffRelNAtts+2])))
+	if relNAtts < 0 {
+		return r, fmt.Errorf("pg_class.relnatts: invalid %d", relNAtts)
+	}
+	r = PGClassRow{
+		OID:            binary.LittleEndian.Uint32(data[pgClassOffOID : pgClassOffOID+4]),
+		RelName:        relName,
+		RelNamespace:   binary.LittleEndian.Uint32(data[pgClassOffRelNamespace : pgClassOffRelNamespace+4]),
+		RelKind:        relKind,
+		RelNAtts:       relNAtts,
+		RelFileNode:    binary.LittleEndian.Uint32(data[pgClassOffRelFileNode : pgClassOffRelFileNode+4]),
+		RelPersistence: relPersistence,
+		RelIsShared:    relIsShared,
+	}
+	return r, nil
+}
+
 // DecodePGAttributeRow parses the binary data produced by EncodePGAttributeRow.
 func DecodePGAttributeRow(data []byte) (PGAttributeRow, error) {
 	var r PGAttributeRow
@@ -261,6 +325,44 @@ func DecodePGAttributeRow(data []byte) (PGAttributeRow, error) {
 		return r, fmt.Errorf("pg_attribute.attisdropped: %w", err)
 	}
 
+	return r, nil
+}
+
+// DecodePGAttributePhysicalRow parses the fixed-layout PostgreSQL heap tuple
+// data for pg_attribute. Only the fixed fields needed to recover user columns
+// are decoded.
+func DecodePGAttributePhysicalRow(data []byte) (PGAttributeRow, error) {
+	var r PGAttributeRow
+	if len(data) < pgAttributeFixedPartSize {
+		return r, fmt.Errorf("pg_attribute physical row too short: len=%d", len(data))
+	}
+	attName := decodePGName(data[pgAttributeOffName : pgAttributeOffName+pgNameDataLen])
+	if attName == "" {
+		return r, fmt.Errorf("pg_attribute.attname: empty")
+	}
+	attNotNull, err := decodePGBool(data[pgAttributeOffNotNull], "pg_attribute.attnotnull")
+	if err != nil {
+		return r, err
+	}
+	attIsDropped, err := decodePGBool(data[pgAttributeOffIsDropped], "pg_attribute.attisdropped")
+	if err != nil {
+		return r, err
+	}
+	attNum := int32(int16(binary.LittleEndian.Uint16(data[pgAttributeOffNum : pgAttributeOffNum+2])))
+	if attNum == 0 {
+		return r, fmt.Errorf("pg_attribute.attnum: invalid 0")
+	}
+	r = PGAttributeRow{
+		AttRelID:     binary.LittleEndian.Uint32(data[pgAttributeOffRelID : pgAttributeOffRelID+4]),
+		AttName:      attName,
+		AttTypID:     binary.LittleEndian.Uint32(data[pgAttributeOffTypID : pgAttributeOffTypID+4]),
+		AttNum:       attNum,
+		AttNotNull:   attNotNull,
+		AttIsDropped: attIsDropped,
+	}
+	if !r.AttIsDropped && r.AttTypID == 0 {
+		return r, fmt.Errorf("pg_attribute.atttypid: invalid 0")
+	}
 	return r, nil
 }
 
@@ -393,6 +495,25 @@ func nextVarlen(data []byte, off int) (string, int, error) {
 	}
 	s := string(data[off : off+sz])
 	return s, off + sz, nil
+}
+
+func decodePGName(raw []byte) string {
+	end := bytes.IndexByte(raw, 0)
+	if end < 0 {
+		end = len(raw)
+	}
+	return string(raw[:end])
+}
+
+func decodePGBool(v byte, field string) (bool, error) {
+	switch v {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s: invalid bool %d", field, v)
+	}
 }
 
 // TypeNameToOID maps a goopg type name string to its canonical pg_type OID.

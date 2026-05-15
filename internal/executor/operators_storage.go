@@ -1957,6 +1957,13 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 				}
 				_ = computeGeneratedColumns(puCols, pu.newRow)
+				// M0100-0005aa: refresh OLD with the EPQ-refetched row so any
+				// BEFORE DELETE trigger fired later (cross-partition move) sees
+				// the concurrent updater's changes — partition-key-update-4.spec
+				// perm 2's BEFORE DELETE trigger reads OLD.b and inserts it into
+				// triglog; without the refresh OLD still reflects the row as it
+				// looked at scan-time, before s2's update2.
+				pu.oldRow = cloneRow(baseRow)
 				pu.blk = newBlk
 				pu.slot = newSlot
 				continue // re-run loop to stamp xmax on new slot
@@ -1982,6 +1989,23 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					targetWriteRel = destRel
 					targetWriteCols = destPart.Columns
 					_ = computeGeneratedColumns(destPart.Columns, pu.newRow)
+				}
+			}
+			// M0100-0005aa: cross-partition UPDATE = DELETE + INSERT internally,
+			// so BEFORE DELETE triggers on the source partition must fire
+			// (matches upstream ExecCrossPartitionUpdate -> ExecDelete).
+			// partition-key-update-4.spec perm 2 has a BEFORE DELETE on the
+			// source leaf footrg1 that records OLD into triglog.  Fires AFTER
+			// the EPQ refetch so OLD reflects the concurrent updater's
+			// committed changes.
+			if isCrossPartitionMove && pu.scanTbl != nil && len(pu.scanTbl.Triggers) > 0 {
+				_, ok := fireTriggers(o.ctx, pu.scanTbl, "before", "delete", pu.oldRow, nil)
+				if !ok {
+					// RETURN NULL — suppress the row.
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					epqSkipSeq = true
+					break
 				}
 			}
 			var stampErr error

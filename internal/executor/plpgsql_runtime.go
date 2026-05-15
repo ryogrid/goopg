@@ -231,8 +231,8 @@ func executePLpgSQLStmtList(stmts []plpgsql.Stmt, r *catalog.Routine, frame *plp
 func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFrame, ctx *Context) (Datum, controlFlow, error) {
 	switch s := stmt.(type) {
 	case *plpgsql.AssignStmt:
-		// _plpgsql_noop is the silent discard target for trigger OLD.b = ...
-		// expressions. M0096-0012.
+		// _plpgsql_noop is the silent discard target for unrecognised
+		// dotted-expression statements. M0096-0012.
 		if s.Target == "_plpgsql_noop" {
 			return Datum{}, flowNone, nil
 		}
@@ -249,6 +249,28 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, err
 		}
 		frame.values[idx] = v
+		// Propagate OLD.<col>/NEW.<col> writes back to the trigger row so
+		// embedded SQL (substituteTriggerRefs in execPLpgSQLEmbeddedSQL)
+		// observes the mutation within the trigger body. M0100-0005aa.
+		if frame.trig != nil {
+			if strings.HasPrefix(s.Target, "_old_") && frame.trig.OldRow != nil {
+				col := s.Target[len("_old_"):]
+				for i, c := range frame.trig.Cols {
+					if strings.ToLower(c.Name) == col && i < len(frame.trig.OldRow) {
+						frame.trig.OldRow[i] = v
+						break
+					}
+				}
+			} else if strings.HasPrefix(s.Target, "_new_") && frame.trig.NewRow != nil {
+				col := s.Target[len("_new_"):]
+				for i, c := range frame.trig.Cols {
+					if strings.ToLower(c.Name) == col && i < len(frame.trig.NewRow) {
+						frame.trig.NewRow[i] = v
+						break
+					}
+				}
+			}
+		}
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.IfStmt:

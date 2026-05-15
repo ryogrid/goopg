@@ -1,8 +1,10 @@
 package wal
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -16,7 +18,7 @@ func TestApplyRecordReplaysDecodedXLogHeapInsert(t *testing.T) {
 		StartLSN: 1,
 		EndLSN:   100,
 		XLog: &XLogDecodedRecord{
-			Header: XLogRecord{Rmid: RmgrHeap, Info: xlogHeapInsert | xlogHeapInit, XID: 42},
+			Header:   XLogRecord{Rmid: RmgrHeap, Info: xlogHeapInsert | xlogHeapInit, XID: 42},
 			MainData: testXLogHeapInsertMainData(1),
 			Blocks: []XLogBlockRef{{
 				ID:       0,
@@ -116,6 +118,149 @@ func TestApplyRecordRestoresDecodedXLogBlockImage(t *testing.T) {
 	}
 	if string(tupOut.Data) != "from-image" {
 		t.Fatalf("tuple data = %q, want %q", tupOut.Data, "from-image")
+	}
+}
+
+func TestApplyRecordRecognizesDecodedXLogStandbyRunningXacts(t *testing.T) {
+	rec := Record{
+		StartLSN: 11,
+		EndLSN:   22,
+		XLog: &XLogDecodedRecord{
+			Header: XLogRecord{Rmid: RmgrStandby, Info: xlogStandbyRunningXacts},
+		},
+	}
+
+	applied, err := ApplyRecord(nil, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("ApplyRecord applied=true, want false")
+	}
+}
+
+func TestApplyRecordRejectsUnknownDecodedXLogStandbyRecord(t *testing.T) {
+	rec := Record{
+		StartLSN: 33,
+		EndLSN:   44,
+		XLog: &XLogDecodedRecord{
+			Header: XLogRecord{Rmid: RmgrStandby, Info: 0x20},
+		},
+	}
+
+	applied, err := ApplyRecord(nil, rec)
+	if err == nil {
+		t.Fatal("ApplyRecord err=nil, want unsupported standby opcode error")
+	}
+	if applied {
+		t.Fatal("ApplyRecord applied=true, want false")
+	}
+	if !strings.Contains(err.Error(), "rmid=8 info=0x20") {
+		t.Fatalf("err = %v, want standby rmgr/opcode context", err)
+	}
+}
+
+func TestApplyRecordPrefersDecodedXLogForUnknownPayloadKind(t *testing.T) {
+	rec := Record{
+		StartLSN: 55,
+		EndLSN:   66,
+		Payload:  []byte{0x00, 0x11, 0x22, 0x33},
+		XLog: &XLogDecodedRecord{
+			Header: XLogRecord{Rmid: RmgrXLog, Info: xlogInfoDefault},
+		},
+	}
+
+	applied, err := ApplyRecord(nil, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("ApplyRecord applied=true, want false")
+	}
+}
+
+func TestDecodedXLogHeapInsertVisibleThroughPreloadedBufferPoolAfterCommit(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	mgr.OnBlockWritten = func(rel storage.RelFileNode, blk storage.BlockNumber) {
+		pool.InvalidateBlock(storage.BufferTag{Rel: rel, Block: blk})
+	}
+	txnMgr := mvcc.NewManager()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 907, Fork: storage.MainFork}
+	empty := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(empty); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := mgr.Extend(rel, empty); err != nil {
+		t.Fatal(err)
+	} else if got != 0 {
+		t.Fatalf("Extend block = %d, want 0", got)
+	}
+
+	preloaded, err := pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(preloaded)
+
+	rec := Record{
+		StartLSN: 1,
+		EndLSN:   100,
+		XLog: &XLogDecodedRecord{
+			Header:   XLogRecord{Rmid: RmgrHeap, Info: xlogHeapInsert | xlogHeapInit, XID: 42},
+			MainData: testXLogHeapInsertMainData(1),
+			Blocks: []XLogBlockRef{{
+				ID:       0,
+				Rel:      rel,
+				Block:    0,
+				WillInit: true,
+				Data:     testXLogHeapInsertTupleData(storage.DefaultHeapTupleHoff, []byte("hello")),
+			}},
+		},
+	}
+
+	applied, err := ApplyRecord(mgr, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("ApplyRecord applied=false, want true")
+	}
+	txnMgr.ReplayXactCommit(42)
+
+	tx, err := txnMgr.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txnMgr.Rollback(tx)
+	snap, err := txnMgr.SnapshotFor(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Unpin(slot)
+	slot.RLock()
+	defer slot.RUnlock()
+	tup, err := storage.PageGetHeapTuple(slot.Page(), 1)
+	if err != nil {
+		t.Fatalf("PageGetHeapTuple: %v", err)
+	}
+	if !mvcc.TupleVisible(tup.Header, snap, tx.XID) {
+		t.Fatalf("tuple header=%+v not visible through preloaded buffer-pool page", tup.Header)
+	}
+	if string(tup.Data) != "hello" {
+		t.Fatalf("tuple data = %q, want %q", tup.Data, "hello")
 	}
 }
 

@@ -235,6 +235,38 @@ func initStandbyDir(t *testing.T) string {
 	return dir
 }
 
+func TestStandbyApplyLSNFuncNil(t *testing.T) {
+	if fn := standbyApplyLSNFunc(nil); fn != nil {
+		t.Fatal("standbyApplyLSNFunc(nil) returned non-nil closure")
+	}
+}
+
+func TestStandbyApplyLSNFuncUsesReplayer(t *testing.T) {
+	dataDir := initStandbyDir(t)
+
+	rt, err := initdb.Open(initdb.OpenOptions{DataDir: dataDir, PoolSlots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	replayer := startStandbyReplayer(ctx, done, rt, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	fn := standbyApplyLSNFunc(replayer)
+	if fn == nil {
+		t.Fatal("standbyApplyLSNFunc(replayer) returned nil")
+	}
+	if got, want := fn(), replayer.ApplyLSN(); got != want {
+		t.Fatalf("ApplyLSN closure = %d, want %d", got, want)
+	}
+}
 
 // TestStandbyControllerPromoteWritesTimelineHistory exercises the
 // M0102-0003 promote path: after a successful promote, the data dir

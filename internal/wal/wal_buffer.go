@@ -92,7 +92,7 @@ func (b *walBuffer) readForDrain(n int64) (a, c []byte) {
 	if first >= n {
 		return b.buf[off : off+n], nil
 	}
-	return b.buf[off : b.cap], b.buf[0 : n-first]
+	return b.buf[off:b.cap], b.buf[0 : n-first]
 }
 
 // advanceHead is called after readForDrain's bytes have been
@@ -108,4 +108,26 @@ func (b *walBuffer) advanceHead(n int64) {
 		k := (b.head - b.base) / b.cap
 		b.base += k * b.cap
 	}
+}
+
+// readAt copies up to len(out) bytes starting at absolute byte position pos
+// from the resident [head, tail) range and returns the number of bytes copied.
+// Caller is responsible for synchronization.
+func (b *walBuffer) readAt(pos int64, out []byte) int {
+	if b == nil || len(out) == 0 || pos < b.head || pos >= b.tail {
+		return 0
+	}
+	avail := int(b.tail - pos)
+	if avail > len(out) {
+		avail = len(out)
+	}
+	off := (pos - b.base) % b.cap
+	first := b.cap - off
+	if first >= int64(avail) {
+		copy(out[:avail], b.buf[off:off+int64(avail)])
+	} else {
+		copy(out[:first], b.buf[off:b.cap])
+		copy(out[first:avail], b.buf[:int64(avail)-first])
+	}
+	return avail
 }

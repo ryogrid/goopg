@@ -192,7 +192,7 @@ type Pool struct {
 	//
 	// Lock ordering: always acquire evictMu (Lock or RLock) before any
 	// partition lock.
-	evictMu sync.RWMutex
+	evictMu   sync.RWMutex
 	clockHand int
 
 	// OnPinWait is an optional hook called when Pool.Pin performs an
@@ -492,27 +492,27 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logger = slog.Default()
 	}
 	p := &Pool{
-		mgr:            mgr,
-		arena:          a,
-		slots:          make([]*Slot, cfg.Slots),
-		wal:            cfg.WAL,
-		logFPI:         cfg.LogPageImage,
-		logBtreeSplit:  cfg.LogBtreeSplit,
-		logHeapInsert:  cfg.LogHeapInsert,
-		logBtreeInsert: cfg.LogBtreeInsert,
-		logHeapDelete:    cfg.LogHeapDelete,
-		logHeapLock:      cfg.LogHeapLock,
-		logHeapVacuum:    cfg.LogHeapVacuum,
+		mgr:                      mgr,
+		arena:                    a,
+		slots:                    make([]*Slot, cfg.Slots),
+		wal:                      cfg.WAL,
+		logFPI:                   cfg.LogPageImage,
+		logBtreeSplit:            cfg.LogBtreeSplit,
+		logHeapInsert:            cfg.LogHeapInsert,
+		logBtreeInsert:           cfg.LogBtreeInsert,
+		logHeapDelete:            cfg.LogHeapDelete,
+		logHeapLock:              cfg.LogHeapLock,
+		logHeapVacuum:            cfg.LogHeapVacuum,
 		logBtreeVacuum:           cfg.LogBtreeVacuum,
 		logBtreeUnlinkPage:       cfg.LogBtreeUnlinkPage,
 		logBtreeNewRoot:          cfg.LogBtreeNewRoot,
 		logBtreeMarkPageHalfDead: cfg.LogBtreeMarkPageHalfDead,
 		logHeapFreeze:            cfg.LogHeapFreeze,
-		logHeapHotUpdate: cfg.LogHeapHotUpdate,
-		logHeapPruneOpt:  cfg.LogHeapPruneOpt,
-		logSmgrCreate:    cfg.LogSmgrCreate,
-		logChangeRecord:  cfg.LogChangeRecord,
-		logger:         logger,
+		logHeapHotUpdate:         cfg.LogHeapHotUpdate,
+		logHeapPruneOpt:          cfg.LogHeapPruneOpt,
+		logSmgrCreate:            cfg.LogSmgrCreate,
+		logChangeRecord:          cfg.LogChangeRecord,
+		logger:                   logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
 	// M0098-0003: initialize 128 partitions.
@@ -767,6 +767,25 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 		}
 		part.mu.Unlock()
 	}
+}
+
+func (p *Pool) InvalidateBlock(tag BufferTag) {
+	p.evictMu.Lock()
+	defer p.evictMu.Unlock()
+	part := &p.partitions[tagPartition(tag)]
+	part.mu.Lock()
+	defer part.mu.Unlock()
+	idx, ok := part.byTag[tag]
+	if !ok {
+		return
+	}
+	s := p.slots[idx]
+	if s.pinCount.Load() > 0 {
+		return
+	}
+	s.valid = false
+	s.dirty = false
+	delete(part.byTag, tag)
 }
 
 // ErrNoBuffer is returned when every slot is pinned and the clock

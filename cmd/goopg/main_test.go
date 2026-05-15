@@ -146,3 +146,28 @@ func TestPoolSlotsFromGUC_NilRegistry(t *testing.T) {
 		t.Errorf("nil registry: got %d, want 0 (Open uses default)", got)
 	}
 }
+
+func TestParsePrimaryConninfoFull(t *testing.T) {
+	addr, appName, user := parsePrimaryConninfoFull(
+		"host=127.0.0.1 port=5544 user=ryo dbname=postgres application_name=standby_a")
+	if addr != "127.0.0.1:5544" {
+		t.Fatalf("addr = %q, want 127.0.0.1:5544", addr)
+	}
+	if appName != "standby_a" {
+		t.Fatalf("appName = %q, want standby_a", appName)
+	}
+	if user != "ryo" {
+		t.Fatalf("user = %q, want ryo", user)
+	}
+
+	addr, appName, user = parsePrimaryConninfoFull("host=127.0.0.1 application_name=standby_b")
+	if addr != "127.0.0.1:5432" {
+		t.Fatalf("default-port addr = %q, want 127.0.0.1:5432", addr)
+	}
+	if appName != "standby_b" {
+		t.Fatalf("default-port appName = %q, want standby_b", appName)
+	}
+	if user != "" {
+		t.Fatalf("default-port user = %q, want empty", user)
+	}
+}

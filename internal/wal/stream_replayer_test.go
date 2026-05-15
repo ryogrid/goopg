@@ -220,3 +220,179 @@ func TestStreamReplayerRunReturnsOnContextCancel(t *testing.T) {
 		t.Fatal("Run did not return within 1s of cancel")
 	}
 }
+
+func TestStreamReplayerAppliesIncomingRawPGWALBytes(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{
+		WALDir:             walDir,
+		SegmentSize:        DefaultSegmentSize,
+		PageHeaders:        true,
+		SystemID:           1,
+		TimelineID:         1,
+		WALBuffers:         256,
+		SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 123, RelOid: 456, Fork: storage.MainFork}
+	for i := 0; i <= 7; i++ {
+		page := make(storage.Page, storage.BlockSize)
+		if err := storage.InitPage(page); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatalf("Extend block %d: %v", i, err)
+		}
+	}
+
+	iter, err := NewRecordIterator(w, walDir, DefaultSegmentSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer iter.Close()
+
+	sr := NewStreamReplayer(mgr, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- sr.Run(ctx, iter) }()
+
+	recordBytes, _, _ := encodeTestPGHeapInsertRecord(t)
+	stream := append(buildTestLongPageHeader(t), recordBytes...)
+	_, end, err := w.AppendRaw(stream)
+	if err != nil {
+		t.Fatalf("AppendRaw: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && sr.ApplyLSN() < end {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sr.ApplyLSN() != end {
+		select {
+		case err := <-runErr:
+			t.Fatalf("ApplyLSN = %d, want %d (Run err=%v)", sr.ApplyLSN(), end, err)
+		default:
+			t.Fatalf("ApplyLSN = %d, want %d", sr.ApplyLSN(), end)
+		}
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 7, page); err != nil {
+		t.Fatal(err)
+	}
+	got, err := storage.PageGetHeapTuple(page, 1)
+	if err != nil {
+		t.Fatalf("PageGetHeapTuple: %v", err)
+	}
+	if got.Header.Xmin != 42 {
+		t.Fatalf("xmin = %d, want 42", got.Header.Xmin)
+	}
+	if string(got.Data) != "val" {
+		t.Fatalf("tuple data = %q, want %q", got.Data, "val")
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("Run err=%v", err)
+	}
+}
+
+func TestStreamReplayerWaitsForCompleteRawPGWALRecord(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{
+		WALDir:             walDir,
+		SegmentSize:        DefaultSegmentSize,
+		PageHeaders:        true,
+		SystemID:           1,
+		TimelineID:         1,
+		WALBuffers:         256,
+		SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 123, RelOid: 456, Fork: storage.MainFork}
+	for i := 0; i <= 7; i++ {
+		page := make(storage.Page, storage.BlockSize)
+		if err := storage.InitPage(page); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mgr.Extend(rel, page); err != nil {
+			t.Fatalf("Extend block %d: %v", i, err)
+		}
+	}
+
+	iter, err := NewRecordIterator(w, walDir, DefaultSegmentSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer iter.Close()
+
+	sr := NewStreamReplayer(mgr, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- sr.Run(ctx, iter) }()
+
+	recordBytes, _, _ := encodeTestPGHeapInsertRecord(t)
+	stream := append(buildTestLongPageHeader(t), recordBytes...)
+	split := len(stream) / 2
+	if _, _, err := w.AppendRaw(stream[:split]); err != nil {
+		t.Fatalf("AppendRaw first half: %v", err)
+	}
+	select {
+	case err := <-runErr:
+		t.Fatalf("Run exited before full record arrived: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	_, end, err := w.AppendRaw(stream[split:])
+	if err != nil {
+		t.Fatalf("AppendRaw second half: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && sr.ApplyLSN() < end {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sr.ApplyLSN() != end {
+		select {
+		case err := <-runErr:
+			t.Fatalf("ApplyLSN = %d, want %d (Run err=%v)", sr.ApplyLSN(), end, err)
+		default:
+			t.Fatalf("ApplyLSN = %d, want %d", sr.ApplyLSN(), end)
+		}
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := mgr.ReadBlock(rel, 7, page); err != nil {
+		t.Fatal(err)
+	}
+	got, err := storage.PageGetHeapTuple(page, 1)
+	if err != nil {
+		t.Fatalf("PageGetHeapTuple: %v", err)
+	}
+	if string(got.Data) != "val" {
+		t.Fatalf("tuple data = %q, want %q", got.Data, "val")
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("Run err=%v", err)
+	}
+}

@@ -1,6 +1,8 @@
 package initdb
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,13 +34,13 @@ const CatalogSnapshotFile = "global/pg_catalog.json"
 // production entry point that constructs the four together against
 // a real data directory.
 type Runtime struct {
-	StorageMgr   *storage.Manager
-	Pool         *storage.Pool
-	TxnMgr       *mvcc.Manager
-	Catalog      catalog.Catalog
+	StorageMgr *storage.Manager
+	Pool       *storage.Pool
+	TxnMgr     *mvcc.Manager
+	Catalog    catalog.Catalog
 	// FSM is the in-memory free-space map (M0046-0003). VACUUM updates
 	// it; INSERT consults it before extending the relation.
-	FSM          *storage.FSM
+	FSM *storage.FSM
 	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
 	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
 	VM           *storage.VisibilityMap
@@ -396,7 +398,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			LeftSibNewNext:   req.LeftSibNewNext,
 			HasRightSib:      req.HasRightSib,
 			RightSibBlk:      req.RightSibBlk,
-			RightSibNewPrev: req.RightSibNewPrev,
+			RightSibNewPrev:  req.RightSibNewPrev,
 			HasParent:        req.HasParent,
 			ParentBlk:        req.ParentBlk,
 			ParentRemoveSlot: req.ParentRemoveSlot,
@@ -500,30 +502,33 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	pool, err := storage.NewPool(mgr, storage.PoolConfig{
-		Slots:          slots,
-		WAL:            walWriter,
-		LogPageImage:   logFPI,
-		LogBtreeSplit:  logBtreeSplit,
-		LogHeapInsert:  logHeapInsert,
-		LogBtreeInsert: logBtreeInsert,
-		LogHeapDelete:    logHeapDelete,
-		LogHeapVacuum:    logHeapVacuum,
+		Slots:                    slots,
+		WAL:                      walWriter,
+		LogPageImage:             logFPI,
+		LogBtreeSplit:            logBtreeSplit,
+		LogHeapInsert:            logHeapInsert,
+		LogBtreeInsert:           logBtreeInsert,
+		LogHeapDelete:            logHeapDelete,
+		LogHeapVacuum:            logHeapVacuum,
 		LogBtreeVacuum:           logBtreeVacuum,
 		LogBtreeUnlinkPage:       logBtreeUnlinkPage,
 		LogBtreeNewRoot:          logBtreeNewRoot,
 		LogBtreeMarkPageHalfDead: logBtreeMarkPageHalfDead,
 		LogHeapFreeze:            logHeapFreeze,
-		LogHeapLock:      logHeapLock,
-		LogHeapHotUpdate: logHeapHotUpdate,
-		LogHeapPruneOpt:  logHeapPruneOpt,
-		LogSmgrCreate:    logSmgrCreate,
-		LogChangeRecord:  logChangeRecord,
-		FullPageWrites: true,
+		LogHeapLock:              logHeapLock,
+		LogHeapHotUpdate:         logHeapHotUpdate,
+		LogHeapPruneOpt:          logHeapPruneOpt,
+		LogSmgrCreate:            logSmgrCreate,
+		LogChangeRecord:          logChangeRecord,
+		FullPageWrites:           true,
 	})
 	if err != nil {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: bufpool: %w", err)
+	}
+	mgr.OnBlockWritten = func(rel storage.RelFileNode, blk storage.BlockNumber) {
+		pool.InvalidateBlock(storage.BufferTag{Rel: rel, Block: blk})
 	}
 	// M0092-0005: BufferPin wait-event hook gated by
 	// TrackIOTiming. Default off — saves the per-Pin
@@ -655,6 +660,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	cat.SetDBOID(detectCatalogDBOID(abs))
 	// Upgrade path: if the clog is empty (old cluster started before M0030-0007
 	// landed), initialize all prior XIDs as committed so loadUserTablesFromHeap
 	// doesn't reject their rows.
@@ -970,13 +976,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	rt := &Runtime{
-		StorageMgr:   mgr,
-		Pool:         pool,
-		TxnMgr:       txnMgr,
-		Catalog:      cat,
-		WAL:          walWriter,
-		Checkpointer: cp,
-		Slots:        slotsReg,
+		StorageMgr:     mgr,
+		Pool:           pool,
+		TxnMgr:         txnMgr,
+		Catalog:        cat,
+		WAL:            walWriter,
+		Checkpointer:   cp,
+		Slots:          slotsReg,
 		SyncRep:        syncRep,
 		WalSenders:     walSenders,
 		WalReceivers:   walReceivers,
@@ -1232,7 +1238,7 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *wal.Checkpointer) e
 // heap relfile.  The rows are visible to all sessions because they
 // were written with xmin=BootstrapTransactionID (1).
 func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
-	base := filepath.Join(dataDir, "base", fmt.Sprint(catalog.DefaultDBOid))
+	base := filepath.Join(dataDir, "base", fmt.Sprint(cat.DBOID()))
 
 	// pg_type (OID 1247) — built-in type catalog.
 	pgTypeFile := filepath.Join(base, fmt.Sprint(catalog.TypeRelationId))
@@ -1281,7 +1287,7 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 // via TryRegisterUserTable's idempotency.
 func maybeMigrateCatalogToHeap(mgr *storage.Manager, cat *catalog.InMemory) error {
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  cat.DBOID(),
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -1347,10 +1353,10 @@ func maybeMigrateCatalogToHeap(mgr *storage.Manager, cat *catalog.InMemory) erro
 
 		for _, col := range tbl.Columns {
 			attrData := catalog.EncodePGAttributeRow(catalog.PGAttributeRow{
-				AttRelID:  tbl.OID,
-				AttName:   col.Name,
-				AttTypID:  catalog.TypeNameToOID(col.Type.Name),
-				AttNum:    int32(col.Ordinal + 1),
+				AttRelID:   tbl.OID,
+				AttName:    col.Name,
+				AttTypID:   catalog.TypeNameToOID(col.Type.Name),
+				AttNum:     int32(col.Ordinal + 1),
 				AttNotNull: col.NotNull,
 			})
 			attrTuples = append(attrTuples, storage.NewHeapTuple(xid, storage.InvalidTransactionID, attrData))
@@ -1364,7 +1370,7 @@ func maybeMigrateCatalogToHeap(mgr *storage.Manager, cat *catalog.InMemory) erro
 
 	// Write pg_attribute rows.
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  cat.DBOID(),
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -1444,7 +1450,7 @@ func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []s
 // are skipped via TryRegisterUserTable's exists-check).
 func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  cat.DBOID(),
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -1456,7 +1462,11 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 	page := make(storage.Page, storage.BlockSize)
 
 	// Pass 1: collect user table rows from pg_class.
-	var userTableRows []catalog.PGClassRow
+	type recoveredPGClassRow struct {
+		row      catalog.PGClassRow
+		physical bool
+	}
+	var userTableRows []recoveredPGClassRow
 	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
 		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
 			return fmt.Errorf("loadUserTablesFromHeap: read pg_class blk %d: %w", blk, err)
@@ -1476,16 +1486,24 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			if ht.Header.Xmax != storage.InvalidTransactionID {
 				continue // deleted
 			}
-			// Skip rows from uncommitted or crashed transactions (M0030-0007).
-			if clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
-				continue
-			}
+			physicalRow := false
 			row, err := catalog.DecodePGClassRow(ht.Data)
 			if err != nil {
+				row, err = catalog.DecodePGClassPhysicalRow(ht.Data)
+				if err != nil {
+					continue
+				}
+				physicalRow = true
+			}
+			// Skip rows from uncommitted or crashed goopg transactions
+			// (M0030-0007). Physical PostgreSQL basebackup tuples come
+			// from a consistent snapshot, so their xmin does not exist in
+			// goopg's local clog and must not be filtered here.
+			if !physicalRow && clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
 				continue
 			}
 			if row.RelKind == "r" && row.OID >= catalog.FirstUserOID {
-				userTableRows = append(userTableRows, row)
+				userTableRows = append(userTableRows, recoveredPGClassRow{row: row, physical: physicalRow})
 			}
 		}
 	}
@@ -1495,7 +1513,7 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 
 	// Pass 2: collect pg_attribute rows for user tables.
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  cat.DBOID(),
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
@@ -1526,16 +1544,20 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			}
 			row, err := catalog.DecodePGAttributeRow(ht.Data)
 			if err != nil {
-				continue
+				row, err = catalog.DecodePGAttributePhysicalRow(ht.Data)
+				if err != nil {
+					continue
+				}
 			}
-			if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID {
+			if !row.AttIsDropped && row.AttRelID >= catalog.FirstUserOID && row.AttNum > 0 {
 				attrByRelOID[row.AttRelID] = append(attrByRelOID[row.AttRelID], row)
 			}
 		}
 	}
 
 	// Pass 3: register each user table with its heap-recovered column definitions.
-	for _, tr := range userTableRows {
+	for _, recovered := range userTableRows {
+		tr := recovered.row
 		attrRows := attrByRelOID[tr.OID]
 		sort.Slice(attrRows, func(i, j int) bool {
 			return attrRows[i].AttNum < attrRows[j].AttNum
@@ -1554,6 +1576,8 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		schema := ""
 		if tr.RelNamespace == catalog.PGCatalogNamespaceOID {
 			schema = "pg_catalog"
+		} else if recovered.physical && tr.RelNamespace == catalog.PublicNamespaceOID {
+			schema = "public"
 		}
 
 		tbl := &catalog.Table{
@@ -1561,6 +1585,9 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			Name:    tr.RelName,
 			Columns: cols,
 			OID:     tr.OID,
+		}
+		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
+			tbl.RelFileNodeOID = tr.RelFileNode
 		}
 		if err := cat.TryRegisterUserTable(tbl); err != nil {
 			return fmt.Errorf("loadUserTablesFromHeap: register %q: %w", tr.RelName, err)
@@ -1599,6 +1626,62 @@ func loadCatalogSnapshot(dir string, cat *catalog.InMemory, txnMgr *mvcc.Manager
 		txnMgr.SetNextXID(storage.TransactionID(snap.NextXID))
 	}
 	return nil
+}
+
+func detectCatalogDBOID(dataDir string) uint32 {
+	const postgresDatabaseOID = 1262
+	path := filepath.Join(dataDir, "global", fmt.Sprint(postgresDatabaseOID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return catalog.DefaultDBOid
+	}
+	for off := 0; off+storage.BlockSize <= len(data); off += storage.BlockSize {
+		page := storage.Page(data[off : off+storage.BlockSize])
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID {
+				continue
+			}
+			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			dbOid, name, err := decodePGDatabasePhysicalRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if name == "postgres" {
+				return dbOid
+			}
+		}
+	}
+	return catalog.DefaultDBOid
+}
+
+func decodePGDatabasePhysicalRow(data []byte) (uint32, string, error) {
+	const (
+		pgNameDataLen    = 64
+		pgDatabaseMinLen = 4 + pgNameDataLen
+	)
+	if len(data) < pgDatabaseMinLen {
+		return 0, "", fmt.Errorf("pg_database physical row too short: len=%d", len(data))
+	}
+	nameBytes := data[4 : 4+pgNameDataLen]
+	end := bytes.IndexByte(nameBytes, 0)
+	if end < 0 {
+		end = len(nameBytes)
+	}
+	name := string(nameBytes[:end])
+	if name == "" {
+		return 0, "", fmt.Errorf("pg_database.datname: empty")
+	}
+	return binary.LittleEndian.Uint32(data[0:4]), name, nil
 }
 
 // SaveCatalog writes the in-memory catalog to disk so a subsequent

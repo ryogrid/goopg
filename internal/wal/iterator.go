@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -50,6 +51,8 @@ type RecordIterator struct {
 	// can span page boundaries (the next page's header sits between
 	// fragments). See M0014-0001 step 2.
 	pageHeaders bool
+	lastWaitPos int64
+	lastWaitEnd uint64
 }
 
 // NewRecordIterator constructs a streaming iterator anchored at
@@ -79,6 +82,8 @@ func NewRecordIterator(w *Writer, walDir string, segSize int64, startLSN uint64)
 		wake:        wake,
 		pos:         pos,
 		pageHeaders: w.PageHeadersEnabled(),
+		lastWaitPos: -1,
+		lastWaitEnd: 0,
 	}, nil
 }
 
@@ -109,12 +114,28 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 		// transparent skip on the read side mirrors the
 		// transparent insertion on the writer side.
 		if it.pageHeaders {
-			for it.pos < int64(written) && it.pos%XLOGBlockSize == 0 {
-				hsize := int64(pageHeaderSizeAt(it.pos, it.segSize))
-				if it.pos+hsize > int64(written) {
+			for {
+				advanced := false
+				for it.pos < int64(written) && it.pos%XLOGBlockSize == 0 {
+					hsize := int64(pageHeaderSizeAt(it.pos, it.segSize))
+					if it.pos+hsize > int64(written) {
+						break
+					}
+					it.pos += hsize
+					advanced = true
+				}
+				pad, err := it.zeroPagePaddingAdvance(int64(written))
+				if err != nil {
+					return Record{}, err
+				}
+				if pad > 0 {
+					it.pos += pad
+					advanced = true
+					continue
+				}
+				if !advanced {
 					break
 				}
-				it.pos += hsize
 			}
 		}
 		// `written` is the LSN of the last byte appended; the next
@@ -124,8 +145,76 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 		if int64(written) > it.pos {
 			rec, n, err := it.readOneAt(it.pos)
 			if err != nil {
+				if errors.Is(err, ErrLSNNotWritten) {
+					if it.pos != it.lastWaitPos || written != it.lastWaitEnd {
+						attrs := []any{
+							"pos", it.pos,
+							"written", written,
+							"drained", it.writer.DrainedLSN(),
+							"page_off", it.pos % XLOGBlockSize,
+						}
+						if it.pageHeaders && it.pos%XLOGBlockSize != 0 {
+							pageStart := it.pos - (it.pos % XLOGBlockSize)
+							hsize := pageHeaderSizeAt(pageStart, it.segSize)
+							if headerBytes, hdrErr := it.readBytesAt(pageStart, hsize); hdrErr == nil {
+								attrs = append(attrs, "page_header_raw", fmt.Sprintf("%x", headerBytes))
+								if hsize == SizeOfXLogLongPHD {
+									if hdr, decErr := DecodeXLogLongPageHeader(headerBytes); decErr == nil {
+										attrs = append(attrs,
+											"page_header_info", hdr.Std.Info,
+											"page_header_rem_len", hdr.Std.RemLen)
+									} else {
+										attrs = append(attrs, "page_header_decode_err", decErr.Error())
+									}
+								} else if hdr, decErr := DecodeXLogPageHeader(headerBytes); decErr == nil {
+									attrs = append(attrs,
+										"page_header_info", hdr.Info,
+										"page_header_rem_len", hdr.RemLen)
+								} else {
+									attrs = append(attrs, "page_header_decode_err", decErr.Error())
+								}
+							} else {
+								attrs = append(attrs, "page_header_read_err", hdrErr.Error())
+							}
+							pageAvail64 := int64(written) - pageStart
+							if pageAvail64 > XLOGBlockSize {
+								pageAvail64 = XLOGBlockSize
+							}
+							pageAvail := int(pageAvail64)
+							if pageAvail > 0 {
+								if pageBytes, pageErr := it.readBytesAt(pageStart, pageAvail); pageErr == nil {
+									firstNonZero := -1
+									for idx, b := range pageBytes {
+										if b != 0 {
+											firstNonZero = idx
+											break
+										}
+									}
+									attrs = append(attrs,
+										"page_avail", pageAvail,
+										"page_first_nonzero_off", firstNonZero)
+								} else {
+									attrs = append(attrs, "page_scan_err", pageErr.Error())
+								}
+							}
+						}
+						slog.Info("wal iterator waiting for more bytes", attrs...)
+						it.lastWaitPos = it.pos
+						it.lastWaitEnd = written
+					}
+					select {
+					case <-it.wake:
+						continue
+					case <-ctx.Done():
+						return Record{}, ctx.Err()
+					case <-it.writer.done:
+						return Record{}, ErrClosed
+					}
+				}
 				return Record{}, err
 			}
+			it.lastWaitPos = -1
+			it.lastWaitEnd = 0
 			it.pos += int64(n)
 			return rec, nil
 		}
@@ -140,6 +229,29 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 			return Record{}, ErrClosed
 		}
 	}
+}
+
+func (it *RecordIterator) zeroPagePaddingAdvance(written int64) (int64, error) {
+	if !it.pageHeaders || it.pos >= written || it.pos%XLOGBlockSize == 0 {
+		return 0, nil
+	}
+	remain := XLOGBlockSize - int(it.pos%XLOGBlockSize)
+	if remain <= 0 || it.pos+int64(remain) > written {
+		return 0, nil
+	}
+	buf, err := it.readBytesAt(it.pos, remain)
+	if err != nil {
+		if errors.Is(err, ErrLSNNotWritten) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	for _, b := range buf {
+		if b != 0 {
+			return 0, nil
+		}
+	}
+	return int64(remain), nil
 }
 
 // readOneAt opens the segment containing pos, reads one record
@@ -165,9 +277,12 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		if err != nil {
 			return Record{}, 0, err
 		}
+		if isZeroBytes(headerBytes) {
+			return Record{}, 0, ErrLSNNotWritten
+		}
 		total := int(h.TotLen)
 		if total < xlogRecordHeaderSize {
-			return Record{}, 0, fmt.Errorf("%w: bad xlog total length %d", ErrCorruptRecord, total)
+			return Record{}, 0, fmt.Errorf("%w: bad xlog total length %d at pos=%d page_off=%d header=%x", ErrCorruptRecord, total, pos, pos%XLOGBlockSize, headerBytes)
 		}
 		// Read MAXALIGN(total) physical bytes to also pick up the
 		// trailing zero pad — the upstream record alignment.
@@ -178,7 +293,28 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		}
 		decoded, err := decodeRecordXLogDetailed(body)
 		if err != nil {
-			return Record{}, 0, err
+			msg := fmt.Sprintf("wal: decode xlog record at pos=%d page_off=%d", pos, pos%XLOGBlockSize)
+			if pos%XLOGBlockSize != 0 {
+				pageStart := pos - (pos % XLOGBlockSize)
+				hsize := pageHeaderSizeAt(pageStart, it.segSize)
+				if headerBytes, hdrErr := it.readBytesAt(pageStart, hsize); hdrErr == nil {
+					msg += fmt.Sprintf(" page_header_raw=%x", headerBytes)
+					if hsize == SizeOfXLogLongPHD {
+						if hdr, decErr := DecodeXLogLongPageHeader(headerBytes); decErr == nil {
+							msg += fmt.Sprintf(" page_header_info=%d page_header_rem_len=%d", hdr.Std.Info, hdr.Std.RemLen)
+						} else {
+							msg += fmt.Sprintf(" page_header_decode_err=%q", decErr)
+						}
+					} else if hdr, decErr := DecodeXLogPageHeader(headerBytes); decErr == nil {
+						msg += fmt.Sprintf(" page_header_info=%d page_header_rem_len=%d", hdr.Info, hdr.RemLen)
+					} else {
+						msg += fmt.Sprintf(" page_header_decode_err=%q", decErr)
+					}
+				} else {
+					msg += fmt.Sprintf(" page_header_read_err=%q", hdrErr)
+				}
+			}
+			return Record{}, 0, fmt.Errorf("%s: %w", msg, err)
 		}
 		if decoded.Consumed != len(body) {
 			return Record{}, 0, fmt.Errorf("wal: iterator xlog size mismatch: %d vs %d", decoded.Consumed, len(body))
@@ -264,6 +400,13 @@ func (it *RecordIterator) readRecordBytesAt(pos int64, n int) ([]byte, int, erro
 // per-segment pread loop. Hit/miss counters live on the ring and
 // surface via the writer's observability accessors.
 func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
+	if pos < 0 {
+		return nil, ErrLSNNotWritten
+	}
+	tail := int64(it.writer.WrittenLSN())
+	if pos+int64(n) > tail {
+		return nil, ErrLSNNotWritten
+	}
 	out := make([]byte, n)
 	if ring := it.writer.MemRing(); ring != nil {
 		if got, ok := ring.ReadAt(pos, out); ok && got == n {
@@ -272,11 +415,23 @@ func (it *RecordIterator) readBytesAt(pos int64, n int) ([]byte, error) {
 	}
 	read := 0
 	for read < n {
-		segNo := uint64((pos + int64(read)) / it.segSize)
-		segOff := (pos + int64(read)) % it.segSize
+		cur := pos + int64(read)
+		if copied := it.writer.readBufferedAt(cur, out[read:]); copied > 0 {
+			read += copied
+			continue
+		}
+		drained := int64(it.writer.DrainedLSN())
+		if cur >= drained {
+			return nil, ErrLSNNotWritten
+		}
+		segNo := uint64(cur / it.segSize)
+		segOff := cur % it.segSize
 		want := int(it.segSize - segOff)
 		if want > n-read {
 			want = n - read
+		}
+		if max := int(drained - cur); want > max {
+			want = max
 		}
 		buf, err := readSegmentSlice(it.walDir, segNo, segOff, want)
 		if err != nil {

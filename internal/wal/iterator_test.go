@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"context"
 	"path/filepath"
 	"sync"
@@ -225,5 +226,175 @@ func TestRecordIteratorAnchorAtTailBlocks(t *testing.T) {
 	}
 	if string(rec.Payload) != "postanchor" {
 		t.Errorf("payload = %q, want postanchor", rec.Payload)
+	}
+}
+
+func TestRecordIteratorReadsPGRecordAfterPagePadding(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	w, err := NewWriter(Config{
+		WALDir:             dir,
+		SegmentSize:        DefaultSegmentSize,
+		PageHeaders:        true,
+		SystemID:           1,
+		TimelineID:         1,
+		WALBuffers:         256,
+		SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	first, _, err := encodeRecordXLog([]byte("first"), 0)
+	if err != nil {
+		t.Fatalf("encode first: %v", err)
+	}
+	second, _, err := encodeRecordXLog([]byte("second"), 0)
+	if err != nil {
+		t.Fatalf("encode second: %v", err)
+	}
+	stream := append([]byte(nil), buildTestLongPageHeader(t)...)
+	stream = append(stream, first...)
+	padLen := XLOGBlockSize - len(stream)
+	if padLen <= 0 {
+		t.Fatalf("unexpected padLen=%d", padLen)
+	}
+	stream = append(stream, make([]byte, padLen)...)
+	stream = append(stream, buildPageHeader(XLOGBlockSize, DefaultSegmentSize, 1, 1, false, 0)...)
+	stream = append(stream, second...)
+	if _, _, err := w.AppendRaw(stream); err != nil {
+		t.Fatalf("AppendRaw: %v", err)
+	}
+
+	it, err := NewRecordIterator(w, dir, DefaultSegmentSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	rec1, err := it.Next(ctx)
+	if err != nil {
+		t.Fatalf("first Next: %v", err)
+	}
+	if string(rec1.Payload) != "first" {
+		t.Fatalf("first payload = %q, want first", rec1.Payload)
+	}
+	if it.pos != int64(rec1.EndLSN) {
+		t.Fatalf("iterator pos after first record = %d, want %d", it.pos, rec1.EndLSN)
+	}
+	written := int64(w.WrittenLSN())
+	pad, err := it.zeroPagePaddingAdvance(written)
+	if err != nil {
+		t.Fatalf("zeroPagePaddingAdvance: %v", err)
+	}
+	if want := int64(XLOGBlockSize - int(rec1.EndLSN%XLOGBlockSize)); pad != want {
+		t.Fatalf("zeroPagePaddingAdvance = %d, want %d", pad, want)
+	}
+	it.pos += pad
+	if it.pos%XLOGBlockSize != 0 {
+		t.Fatalf("iterator pos after padding skip = %d, want page boundary", it.pos)
+	}
+	hsize := int64(pageHeaderSizeAt(it.pos, DefaultSegmentSize))
+	it.pos += hsize
+	headerBytes, _, err := it.readRecordBytesAt(it.pos, xlogRecordHeaderSize)
+	if err != nil {
+		t.Fatalf("readRecordBytesAt second header: %v", err)
+	}
+	if !bytes.Equal(headerBytes, second[:xlogRecordHeaderSize]) {
+		t.Fatalf("second header bytes = %x, want %x at pos=%d written=%d", headerBytes, second[:xlogRecordHeaderSize], it.pos, w.WrittenLSN())
+	}
+	rec2, _, err := it.readOneAt(it.pos)
+	if err != nil {
+		t.Fatalf("readOneAt second record: %v", err)
+	}
+	if string(rec2.Payload) != "second" {
+		t.Fatalf("second payload = %q, want second", rec2.Payload)
+	}
+}
+
+func TestRecordIteratorReadsPGRecordAfterDirectThenBufferedRawAppend(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "wal")
+	w, err := NewWriter(Config{
+		WALDir:             dir,
+		SegmentSize:        DefaultSegmentSize,
+		PageHeaders:        true,
+		SystemID:           1,
+		TimelineID:         1,
+		WALBuffers:         256,
+		SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	defer w.Close()
+
+	first, _, err := encodeRecordXLog([]byte("first"), 0)
+	if err != nil {
+		t.Fatalf("encode first: %v", err)
+	}
+	second, _, err := encodeRecordXLog([]byte("second"), 0)
+	if err != nil {
+		t.Fatalf("encode second: %v", err)
+	}
+	firstChunk := append([]byte(nil), buildTestLongPageHeader(t)...)
+	firstChunk = append(firstChunk, first...)
+	padLen := XLOGBlockSize - len(firstChunk)
+	if padLen <= 0 {
+		t.Fatalf("unexpected padLen=%d", padLen)
+	}
+	firstChunk = append(firstChunk, make([]byte, padLen)...)
+	firstChunk = append(firstChunk, buildPageHeader(XLOGBlockSize, DefaultSegmentSize, 1, 1, false, 0)...)
+	if _, _, err := w.AppendRaw(firstChunk); err != nil {
+		t.Fatalf("AppendRaw first chunk: %v", err)
+	}
+	if _, _, err := w.AppendRaw(second); err != nil {
+		t.Fatalf("AppendRaw second chunk: %v", err)
+	}
+
+	it, err := NewRecordIterator(w, dir, DefaultSegmentSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	rec1, err := it.Next(ctx)
+	if err != nil {
+		t.Fatalf("first Next: %v", err)
+	}
+	if string(rec1.Payload) != "first" {
+		t.Fatalf("first payload = %q, want first", rec1.Payload)
+	}
+	if it.pos != int64(rec1.EndLSN) {
+		t.Fatalf("iterator pos after first record = %d, want %d", it.pos, rec1.EndLSN)
+	}
+	written := int64(w.WrittenLSN())
+	pad, err := it.zeroPagePaddingAdvance(written)
+	if err != nil {
+		t.Fatalf("zeroPagePaddingAdvance: %v", err)
+	}
+	if want := int64(XLOGBlockSize - int(rec1.EndLSN%XLOGBlockSize)); pad != want {
+		t.Fatalf("zeroPagePaddingAdvance = %d, want %d", pad, want)
+	}
+	it.pos += pad
+	hsize := int64(pageHeaderSizeAt(it.pos, DefaultSegmentSize))
+	it.pos += hsize
+	headerBytes, _, err := it.readRecordBytesAt(it.pos, xlogRecordHeaderSize)
+	if err != nil {
+		t.Fatalf("readRecordBytesAt second header: %v", err)
+	}
+	if !bytes.Equal(headerBytes, second[:xlogRecordHeaderSize]) {
+		t.Fatalf("second header bytes = %x, want %x at pos=%d written=%d drained=%d",
+			headerBytes, second[:xlogRecordHeaderSize], it.pos, w.WrittenLSN(), w.DrainedLSN())
+	}
+	rec2, _, err := it.readOneAt(it.pos)
+	if err != nil {
+		t.Fatalf("readOneAt second record: %v", err)
+	}
+	if string(rec2.Payload) != "second" {
+		t.Fatalf("second payload = %q, want second", rec2.Payload)
 	}
 }

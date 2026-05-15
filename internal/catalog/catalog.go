@@ -58,6 +58,10 @@ type Table struct {
 	Name    string
 	Columns []Column
 	OID     uint32
+	// RelFileNodeOID overrides the on-disk relfile identity when it differs
+	// from the catalog OID. PostgreSQL physical backups use relfilenode for
+	// storage paths; when zero, goopg falls back to OID (its native layout).
+	RelFileNodeOID uint32
 
 	// Virtual marks tables that don't live on the heap. The planner
 	// short-circuits SeqScan into a materialised Values node by
@@ -78,8 +82,8 @@ type Table struct {
 	// INSERT/UPDATE/DELETE against a view will surface as a
 	// planner error because the substituted plan isn't a heap
 	// scan.
-	View               *parser.SelectStmt
-	ViewColumnAliases  []string
+	View              *parser.SelectStmt
+	ViewColumnAliases []string
 
 	// Stats holds the most recent ANALYZE output for this
 	// table. nil before ANALYZE has run; the planner treats nil
@@ -287,9 +291,11 @@ type Catalog interface {
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
 //
-// OIDs are assigned sequentially starting at FirstUserOID. The DBOid
-// field on the produced RelFileNode is fixed at DefaultDBOid for v0
-// — the multi-database layer arrives with milestone 7.
+// OIDs are assigned sequentially starting at FirstUserOID. The dbOid
+// field on produced RelFileNodes defaults to DefaultDBOid for v0, but
+// startup may override it when importing a physical PostgreSQL backup
+// whose active database lives under a different base/<oid> directory.
+// Full multi-database storage routing still arrives with milestone 7.
 type InMemory struct {
 	mu      sync.RWMutex
 	tables  map[string]*Table
@@ -391,6 +397,26 @@ func NewInMemory() *InMemory {
 	return c
 }
 
+// SetDBOID overrides the database OID used for RelFileNode generation.
+// v0 still exposes a single logical database; this hook exists so
+// physical PostgreSQL backups whose active database is not base/1 can be
+// queried without rewriting relfilenode paths on disk.
+func (c *InMemory) SetDBOID(dbOid uint32) {
+	if dbOid == 0 {
+		return
+	}
+	c.mu.Lock()
+	c.dbOid = dbOid
+	c.mu.Unlock()
+}
+
+// DBOID returns the catalog's current storage database OID.
+func (c *InMemory) DBOID() uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dbOid
+}
+
 // RegisterInheritanceChild registers childOID as a child of parentOID for
 // table inheritance. Called when CREATE TABLE c INHERITS (p) executes.
 // M0096-0009.
@@ -487,7 +513,7 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 				if pb.From == "" && pb.To == "" {
 					continue
 				}
-				var from, to int64 = -1<<62, 1<<62
+				var from, to int64 = -1 << 62, 1 << 62
 				if pb.From != "" && pb.From != "MINVALUE" {
 					fmt.Sscanf(pb.From, "%d", &from)
 				}
@@ -1739,6 +1765,9 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 		return t, true
 	}
 	if name.Schema == "" {
+		if t, ok := c.tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
+			return t, true
+		}
 		if t, ok := c.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
 			return t, true
 		}
@@ -2004,7 +2033,11 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return storage.RelFileNode{DBOid: c.dbOid, RelOid: table.OID, Fork: storage.MainFork}
+	relOID := table.OID
+	if table.RelFileNodeOID != 0 {
+		relOID = table.RelFileNodeOID
+	}
+	return storage.RelFileNode{DBOid: c.dbOid, RelOid: relOID, Fork: storage.MainFork}
 }
 
 // IndexRelFileNode returns the storage manager identity for an index.

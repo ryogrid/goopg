@@ -447,8 +447,13 @@ func TestParseTriggerNewFieldAssignBareEquals(t *testing.T) {
 // still discarded (OLD is immutable in upstream PG; in v0 we drop the
 // statement rather than raise an error so existing trigger bodies that
 // touch OLD.* compile cleanly).
-func TestParseTriggerOldFieldAssignStaysNoop(t *testing.T) {
-	blk, err := Parse("BEGIN OLD.a = 99; RETURN NEW; END")
+// TestParseTriggerOldFieldAssign verifies OLD.<col> := expr produces a real
+// AssignStmt targeting the `_old_<col>` frame slot.  Cross-partition UPDATEs
+// fire BEFORE DELETE triggers (M0100-0005aa) whose bodies legitimately mutate
+// OLD before referencing it in embedded SQL — partition-key-update-4.spec's
+// `OLD.b = OLD.b || ' trigger'; INSERT INTO triglog select OLD.*` shape.
+func TestParseTriggerOldFieldAssign(t *testing.T) {
+	blk, err := Parse("BEGIN OLD.a = 99; RETURN OLD; END")
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -456,7 +461,7 @@ func TestParseTriggerOldFieldAssignStaysNoop(t *testing.T) {
 	if !ok {
 		t.Fatalf("Statements[0] = %T, want *AssignStmt", blk.Statements[0])
 	}
-	if a.Target != "_plpgsql_noop" {
-		t.Errorf("Target = %q, want %q (OLD writes must stay no-op)", a.Target, "_plpgsql_noop")
+	if a.Target != "_old_a" {
+		t.Errorf("Target = %q, want %q", a.Target, "_old_a")
 	}
 }

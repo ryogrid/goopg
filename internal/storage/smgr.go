@@ -99,6 +99,10 @@ type Manager struct {
 	OnWriteDone  func()
 	OnExtendDone func()
 	OnSyncDone   func()
+
+	// OnBlockWritten invalidates any external page cache that shadows
+	// data-file writes done directly through smgr (for example WAL replay).
+	OnBlockWritten func(rel RelFileNode, blk BlockNumber)
 }
 
 // ManagerConfig controls how files are opened.
@@ -106,7 +110,6 @@ type ManagerConfig struct {
 	// DataDir is the root data directory. Files live at
 	// <DataDir>/base/<dbOid>/<relOid>[<fork-suffix>].
 	DataDir string
-
 }
 
 // NewManager constructs an empty Manager. Files open lazily on first
@@ -284,7 +287,13 @@ func (m *Manager) WriteBlock(rel RelFileNode, blk BlockNumber, buf []byte) error
 	if err != nil {
 		return err
 	}
-	return f.writeBlock(blk, buf)
+	if err := f.writeBlock(blk, buf); err != nil {
+		return err
+	}
+	if m.OnBlockWritten != nil {
+		m.OnBlockWritten(rel, blk)
+	}
+	return nil
 }
 
 // Extend appends buf as a new block at the end of rel and returns the

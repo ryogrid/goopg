@@ -12,12 +12,13 @@ const (
 	xlrBlockIDOrigin    byte = 253
 	xlrBlockIDTopLevelX byte = 252
 
-	xlogHeapInsert uint8 = 0x00
-	xlogHeapOpMask uint8 = 0x70
-	xlogHeapInit   uint8 = 0x80
-	xlogXactCommit uint8 = 0x00
-	xlogXactAbort  uint8 = 0x20
-	xlogXactOpMask uint8 = 0x70
+	xlogHeapInsert          uint8 = 0x00
+	xlogHeapOpMask          uint8 = 0x70
+	xlogHeapInit            uint8 = 0x80
+	xlogXactCommit          uint8 = 0x00
+	xlogXactAbort           uint8 = 0x20
+	xlogXactOpMask          uint8 = 0x70
+	xlogStandbyRunningXacts uint8 = 0x10
 
 	bkpBlockForkMask byte = 0x0F
 	bkpBlockHasImage byte = 0x10
@@ -58,7 +59,7 @@ type XLogBlockRef struct {
 type XLogDecodedRecord struct {
 	Header       XLogRecord
 	RecordOrigin uint16
-	TopLevelXID uint32
+	TopLevelXID  uint32
 	MainData     []byte
 	Blocks       []XLogBlockRef
 }
@@ -68,6 +69,14 @@ type decodedXLogRecord struct {
 	Payload  []byte
 	XLog     *XLogDecodedRecord
 	Consumed int
+}
+
+type xlogBlockMeta struct {
+	ref        XLogBlockRef
+	dataLen    int
+	imgLen     int
+	holeOffset int
+	bimgInfo   byte
 }
 
 func decodeRecordXLogDetailed(stream []byte) (decodedXLogRecord, error) {
@@ -101,48 +110,50 @@ func parseXLogRecordData(header XLogRecord, wrapped []byte) (decodedXLogRecord, 
 	decoded := decodedXLogRecord{Header: header}
 	xlogRecord := &XLogDecodedRecord{Header: header}
 	var (
-		off       int
-		lastRel   storage.RelFileNode
-		haveRel   bool
-		mainData  []byte
+		off         int
+		lastRel     storage.RelFileNode
+		haveRel     bool
+		mainDataLen int
+		blocks      []xlogBlockMeta
 	)
-	for off < len(wrapped) {
+	datatotal := 0
+headerLoop:
+	for len(wrapped)-off > datatotal {
 		switch id := wrapped[off]; {
 		case id <= xlrMaxBlockID:
-			blk, n, rel, ok, err := decodeXLogBlockRef(wrapped[off:], lastRel, haveRel)
+			blk, n, rel, ok, err := decodeXLogBlockRefHeader(wrapped[off:], lastRel, haveRel)
 			if err != nil {
 				return decodedXLogRecord{}, err
 			}
-			xlogRecord.Blocks = append(xlogRecord.Blocks, blk)
+			blocks = append(blocks, blk)
 			off += n
 			lastRel = rel
 			haveRel = ok
+			datatotal += blk.dataLen + blk.imgLen
 		case id == xlrBlockIDDataShort:
-			if len(mainData) != 0 {
+			if mainDataLen != 0 {
 				return decodedXLogRecord{}, fmt.Errorf("%w: duplicate main-data chunk", ErrCorruptRecord)
 			}
 			if off+2 > len(wrapped) {
 				return decodedXLogRecord{}, fmt.Errorf("%w: truncated short xlog data header", ErrCorruptRecord)
 			}
 			n := int(wrapped[off+1])
-			if off+2+n > len(wrapped) {
-				return decodedXLogRecord{}, fmt.Errorf("%w: bad short xlog main-data length %d", ErrCorruptRecord, n)
-			}
-			mainData = cloneXLogBytes(wrapped[off+2 : off+2+n])
-			off += 2 + n
+			mainDataLen = n
+			datatotal += n
+			off += 2
+			break headerLoop
 		case id == xlrBlockIDDataLong:
-			if len(mainData) != 0 {
+			if mainDataLen != 0 {
 				return decodedXLogRecord{}, fmt.Errorf("%w: duplicate main-data chunk", ErrCorruptRecord)
 			}
 			if off+5 > len(wrapped) {
 				return decodedXLogRecord{}, fmt.Errorf("%w: truncated long xlog data header", ErrCorruptRecord)
 			}
 			n := int(binary.LittleEndian.Uint32(wrapped[off+1 : off+5]))
-			if off+5+n > len(wrapped) {
-				return decodedXLogRecord{}, fmt.Errorf("%w: bad long xlog main-data length %d", ErrCorruptRecord, n)
-			}
-			mainData = cloneXLogBytes(wrapped[off+5 : off+5+n])
-			off += 5 + n
+			mainDataLen = n
+			datatotal += n
+			off += 5
+			break headerLoop
 		case id == xlrBlockIDOrigin:
 			if off+3 > len(wrapped) {
 				return decodedXLogRecord{}, fmt.Errorf("%w: truncated origin chunk", ErrCorruptRecord)
@@ -159,10 +170,47 @@ func parseXLogRecordData(header XLogRecord, wrapped []byte) (decodedXLogRecord, 
 			return decodedXLogRecord{}, fmt.Errorf("%w: unsupported xlog chunk tag 0x%02x", ErrCorruptRecord, id)
 		}
 	}
-	xlogRecord.MainData = mainData
+	if len(wrapped)-off != datatotal {
+		return decodedXLogRecord{}, fmt.Errorf("%w: xlog data section size mismatch headers=%d payload=%d expected=%d", ErrCorruptRecord, off, len(wrapped)-off, datatotal)
+	}
+	payloadOff := off
+	xlogRecord.Blocks = make([]XLogBlockRef, 0, len(blocks))
+	for _, blk := range blocks {
+		if blk.imgLen > 0 {
+			if payloadOff+blk.imgLen > len(wrapped) {
+				return decodedXLogRecord{}, fmt.Errorf("%w: truncated block image payload", ErrCorruptRecord)
+			}
+			img, err := decodeXLogBlockImage(wrapped[payloadOff:payloadOff+blk.imgLen], blk.holeOffset, blk.imgLen, blk.bimgInfo)
+			if err != nil {
+				return decodedXLogRecord{}, err
+			}
+			blk.ref.HasImage = true
+			blk.ref.ImageApply = blk.bimgInfo&bkpImageApply != 0
+			blk.ref.Image = img
+			payloadOff += blk.imgLen
+		}
+		if blk.dataLen > 0 {
+			if payloadOff+blk.dataLen > len(wrapped) {
+				return decodedXLogRecord{}, fmt.Errorf("%w: truncated block data", ErrCorruptRecord)
+			}
+			blk.ref.Data = cloneXLogBytes(wrapped[payloadOff : payloadOff+blk.dataLen])
+			payloadOff += blk.dataLen
+		}
+		xlogRecord.Blocks = append(xlogRecord.Blocks, blk.ref)
+	}
+	if mainDataLen > 0 {
+		if payloadOff+mainDataLen > len(wrapped) {
+			return decodedXLogRecord{}, fmt.Errorf("%w: truncated main-data payload", ErrCorruptRecord)
+		}
+		xlogRecord.MainData = cloneXLogBytes(wrapped[payloadOff : payloadOff+mainDataLen])
+		payloadOff += mainDataLen
+	}
+	if payloadOff != len(wrapped) {
+		return decodedXLogRecord{}, fmt.Errorf("%w: trailing xlog payload bytes %d", ErrCorruptRecord, len(wrapped)-payloadOff)
+	}
 	decoded.XLog = xlogRecord
-	if len(xlogRecord.Blocks) == 0 && xlogRecord.RecordOrigin == 0 && xlogRecord.TopLevelXID == 0 && nativeHeaderMatchesMainData(header, mainData) {
-		decoded.Payload = mainData
+	if len(xlogRecord.Blocks) == 0 && xlogRecord.RecordOrigin == 0 && xlogRecord.TopLevelXID == 0 && nativeHeaderMatchesMainData(header, xlogRecord.MainData) {
+		decoded.Payload = xlogRecord.MainData
 		return decoded, nil
 	}
 	return decoded, nil
@@ -176,74 +224,58 @@ func nativeHeaderMatchesMainData(header XLogRecord, mainData []byte) bool {
 	return header.Rmid == rmid && header.Info == info && header.XID == xid
 }
 
-func decodeXLogBlockRef(src []byte, lastRel storage.RelFileNode, haveRel bool) (XLogBlockRef, int, storage.RelFileNode, bool, error) {
+func decodeXLogBlockRefHeader(src []byte, lastRel storage.RelFileNode, haveRel bool) (xlogBlockMeta, int, storage.RelFileNode, bool, error) {
 	if len(src) < sizeOfXLogRecordBlockHeader {
-		return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block header", ErrCorruptRecord)
+		return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block header", ErrCorruptRecord)
 	}
-	ref := XLogBlockRef{ID: src[0]}
+	meta := xlogBlockMeta{ref: XLogBlockRef{ID: src[0]}}
 	forkFlags := src[1]
-	dataLen := int(binary.LittleEndian.Uint16(src[2:4]))
+	meta.dataLen = int(binary.LittleEndian.Uint16(src[2:4]))
 	off := sizeOfXLogRecordBlockHeader
+	if forkFlags&bkpBlockHasImage != 0 {
+		if off+sizeOfXLogRecordBlockImageHeader > len(src) {
+			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block image header", ErrCorruptRecord)
+		}
+		meta.imgLen = int(binary.LittleEndian.Uint16(src[off : off+2]))
+		meta.holeOffset = int(binary.LittleEndian.Uint16(src[off+2 : off+4]))
+		meta.bimgInfo = src[off+4]
+		off += sizeOfXLogRecordBlockImageHeader
+		if meta.bimgInfo&bkpImageCompressMS != 0 {
+			if off+sizeOfXLogRecordBlockCompressHead > len(src) {
+				return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block image compression header", ErrCorruptRecord)
+			}
+			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("wal: compressed PostgreSQL backup block images are not supported yet")
+		}
+	}
 	if forkFlags&bkpBlockSameRel != 0 {
 		if !haveRel {
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: SAME_REL without previous locator", ErrCorruptRecord)
+			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: SAME_REL without previous locator", ErrCorruptRecord)
 		}
-		ref.Rel = lastRel
+		meta.ref.Rel = lastRel
 	} else {
 		if off+sizeOfRelFileLocator > len(src) {
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated relfilelocator", ErrCorruptRecord)
+			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated relfilelocator", ErrCorruptRecord)
 		}
 		spcOID := binary.LittleEndian.Uint32(src[off : off+4])
 		if spcOID != 0 && spcOID != pgDefaultTableSpaceOID {
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("wal: unsupported PostgreSQL tablespace OID %d", spcOID)
+			return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf(
+				"wal: unsupported PostgreSQL tablespace OID %d locator=%x fork_flags=0x%02x data_len=%d",
+				spcOID, src[off:off+sizeOfRelFileLocator], forkFlags, meta.dataLen)
 		}
-		ref.Rel = storage.RelFileNode{
+		meta.ref.Rel = storage.RelFileNode{
 			DBOid:  binary.LittleEndian.Uint32(src[off+4 : off+8]),
 			RelOid: binary.LittleEndian.Uint32(src[off+8 : off+12]),
 		}
 		off += sizeOfRelFileLocator
 	}
-	ref.Rel.Fork = storage.ForkNumber(forkFlags & bkpBlockForkMask)
+	meta.ref.Rel.Fork = storage.ForkNumber(forkFlags & bkpBlockForkMask)
 	if off+4 > len(src) {
-		return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block number", ErrCorruptRecord)
+		return xlogBlockMeta{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block number", ErrCorruptRecord)
 	}
-	ref.Block = storage.BlockNumber(binary.LittleEndian.Uint32(src[off : off+4]))
+	meta.ref.Block = storage.BlockNumber(binary.LittleEndian.Uint32(src[off : off+4]))
 	off += 4
-	ref.WillInit = forkFlags&bkpBlockWillInit != 0
-	if forkFlags&bkpBlockHasImage != 0 {
-		if off+sizeOfXLogRecordBlockImageHeader > len(src) {
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block image header", ErrCorruptRecord)
-		}
-		imgLen := int(binary.LittleEndian.Uint16(src[off : off+2]))
-		holeOffset := int(binary.LittleEndian.Uint16(src[off+2 : off+4]))
-		bimgInfo := src[off+4]
-		off += sizeOfXLogRecordBlockImageHeader
-		if bimgInfo&bkpImageCompressMS != 0 {
-			if off+sizeOfXLogRecordBlockCompressHead > len(src) {
-				return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block image compression header", ErrCorruptRecord)
-			}
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("wal: compressed PostgreSQL backup block images are not supported yet")
-		}
-		if off+imgLen > len(src) {
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block image payload", ErrCorruptRecord)
-		}
-		img, err := decodeXLogBlockImage(src[off:off+imgLen], holeOffset, imgLen, bimgInfo)
-		if err != nil {
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, err
-		}
-		ref.HasImage = true
-		ref.ImageApply = bimgInfo&bkpImageApply != 0
-		ref.Image = img
-		off += imgLen
-	}
-	if forkFlags&bkpBlockHasData != 0 {
-		if off+dataLen > len(src) {
-			return XLogBlockRef{}, 0, storage.RelFileNode{}, false, fmt.Errorf("%w: truncated block data", ErrCorruptRecord)
-		}
-		ref.Data = cloneXLogBytes(src[off : off+dataLen])
-		off += dataLen
-	}
-	return ref, off, ref.Rel, true, nil
+	meta.ref.WillInit = forkFlags&bkpBlockWillInit != 0
+	return meta, off, meta.ref.Rel, true, nil
 }
 
 func decodeXLogBlockImage(src []byte, holeOffset, imgLen int, bimgInfo byte) (storage.Page, error) {

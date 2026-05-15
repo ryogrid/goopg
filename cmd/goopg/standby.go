@@ -45,7 +45,6 @@ const drainPollInterval = 10 * time.Millisecond
 // hanging the operator's `goopg promote` indefinitely.
 const drainTimeout = 5 * time.Second
 
-
 // promoteSignalPollInterval is how often the standby checks for the
 // presence of `<datadir>/promote.signal`. 250 ms matches PG's
 // `min_recovery_apply_delay` granularity; faster is wasted poll
@@ -96,8 +95,8 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *config.R
 	rplDone := make(chan struct{})
 	sigDone := make(chan struct{})
 
-	startWalreceiver(rcvCtx, rcvDone, rt, registry, logger)
 	replayer := startStandbyReplayer(rplCtx, rplDone, rt, logger)
+	startWalreceiver(rcvCtx, rcvDone, rt, registry, logger, standbyApplyLSNFunc(replayer))
 
 	sc := &standbyController{
 		rt:             rt,
@@ -125,6 +124,13 @@ func startStandby(parent context.Context, rt *initdb.Runtime, registry *config.R
 	}
 	go sc.promoteSignalWatcher(sigCtx)
 	return sc
+}
+
+func standbyApplyLSNFunc(replayer *wal.StreamReplayer) func() uint64 {
+	if replayer == nil {
+		return nil
+	}
+	return replayer.ApplyLSN
 }
 
 // Promote is the OnPromote handler. The sequence:
@@ -303,7 +309,6 @@ func (sc *standbyController) Close() {
 		<-sc.signalDone
 	}
 }
-
 
 // promoteSignalWatcher polls for `<DataDir>/promote.signal` at
 // promoteSignalPollInterval and triggers Promote(ctx) when the file

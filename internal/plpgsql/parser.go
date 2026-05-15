@@ -758,15 +758,18 @@ func (p *bodyParser) parseDottedExprStmt(nameTok parser.Token) (*AssignStmt, err
 		return &AssignStmt{pos: pos, Target: "_plpgsql_noop", Value: &parser.IntegerConst{}}, nil
 	}
 	field := p.advance().Value
-	// `NEW.<field> := <expr>` or `NEW.<field> = <expr>` — capture the
-	// RHS expression so the assignment actually fires at runtime.
-	// Both `:=` and `=` are tokenised as TokenOperator by the SQL lexer
-	// (see internal/parser/lexer.go).
+	// `NEW.<field> := <expr>` / `OLD.<field> := <expr>` (or `=` form) —
+	// capture the RHS expression so the assignment actually fires at
+	// runtime. NEW.<col> mutation feeds INSERT/UPDATE row routing (see
+	// M0100-0005p); OLD.<col> mutation feeds BEFORE DELETE trigger bodies
+	// that subsequently read OLD.* in embedded SQL (M0100-0005aa,
+	// partition-key-update-4.spec).  Both `:=` and `=` are tokenised as
+	// TokenOperator by the SQL lexer (see internal/parser/lexer.go).
 	isAssign := false
 	if p.cur().Kind == parser.TokenOperator && (p.cur().Value == ":=" || p.cur().Value == "=") {
 		isAssign = true
 	}
-	if isAssign && prefix == "new" {
+	if isAssign && (prefix == "new" || prefix == "old") {
 		p.advance() // := or =
 		expr, err := p.scanExprToSemicolon("assignment value")
 		if err != nil {
@@ -775,10 +778,10 @@ func (p *bodyParser) parseDottedExprStmt(nameTok parser.Token) (*AssignStmt, err
 		if !p.acceptSymbol(";") {
 			return nil, p.errAtCur("expected ';' to terminate assignment")
 		}
-		return &AssignStmt{pos: pos, Target: "_new_" + strings.ToLower(field), Value: expr}, nil
+		return &AssignStmt{pos: pos, Target: "_" + prefix + "_" + strings.ToLower(field), Value: expr}, nil
 	}
-	// OLD.* / unrelated dotted refs / non-assign expressions: swallow to
-	// ';' and emit the noop sentinel — preserves the M0096-0012 behaviour.
+	// Unrelated dotted refs / non-assign expressions: swallow to ';' and
+	// emit the noop sentinel — preserves the M0096-0012 behaviour.
 	for p.cur().Kind != parser.TokenEOF {
 		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
 			p.advance()

@@ -947,8 +947,9 @@ const heapPruneOptHdrSize = 18
 //   - unused: slot numbers marked ItemIDUnused (HOT-only and standalone dead).
 //
 // Format:
-//   kind(1) | rel(9) | blk(4) | nRedirects(2) | nUnused(2) |
-//   redirects[nRedirects*4] | unusedSlots[nUnused*2]
+//
+//	kind(1) | rel(9) | blk(4) | nRedirects(2) | nUnused(2) |
+//	redirects[nRedirects*4] | unusedSlots[nUnused*2]
 func EncodeHeapPruneOpt(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) []byte {
 	sz := heapPruneOptHdrSize + 4*len(redirects) + 2*len(unused)
 	out := make([]byte, sz)
@@ -1354,9 +1355,9 @@ func DecodeBtreeNewRoot(payload []byte) (BtreeNewRootPayload, error) {
 // BtreeMarkHalfDeadPayload mirrors `EncodeBtreeMarkPageHalfDead`'s
 // on-wire fields. (M0079-0003.)
 type BtreeMarkHalfDeadPayload struct {
-	Rel         storage.RelFileNode
-	LeafBlk     storage.BlockNumber
-	FlagsAfter  uint16
+	Rel        storage.RelFileNode
+	LeafBlk    storage.BlockNumber
+	FlagsAfter uint16
 }
 
 // EncodeBtreeMarkPageHalfDead encodes the M0079-0003 leaf-only
@@ -1670,9 +1671,9 @@ func DecodeBtreeReusePage(payload []byte) (BtreeReusePagePayload, error) {
 // BtreeMetaCleanupPayload mirrors the M0080-0004 metapage
 // cleanup-XID record fields.
 type BtreeMetaCleanupPayload struct {
-	Rel                          storage.RelFileNode
-	NumHeapTuples                int64
-	LastCleanupNumDeletedTuples  int64
+	Rel                         storage.RelFileNode
+	NumHeapTuples               int64
+	LastCleanupNumDeletedTuples int64
 }
 
 // EncodeBtreeMetaCleanup encodes the M0080-0004 metapage
@@ -1861,8 +1862,13 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 // crashed before the storage write is re-attempted on restart, and
 // one that finished both is silently skipped.
 func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
-	if len(r.Payload) == 0 && r.XLog != nil {
-		return replayDecodedXLogRecord(mgr, r)
+	if r.XLog != nil {
+		if len(r.Payload) == 0 {
+			return replayDecodedXLogRecord(mgr, r)
+		}
+		if !nativeApplyRecordKindKnown(r.Payload[0]) {
+			return replayDecodedXLogRecord(mgr, r)
+		}
 	}
 	if len(r.Payload) == 0 {
 		return false, errors.New("wal: empty record payload")
@@ -2008,6 +2014,45 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 	}
 }
 
+func nativeApplyRecordKindKnown(kind byte) bool {
+	switch kind {
+	case RecordKindPageImage,
+		RecordKindBtreeSplit,
+		RecordKindHeapInsert,
+		RecordKindBtreeInsert,
+		RecordKindHeapDelete,
+		RecordKindHeapLock,
+		RecordKindHeapVacuum,
+		RecordKindBtreeVacuum,
+		RecordKindBtreeUnlinkPage,
+		RecordKindBtreeNewRoot,
+		RecordKindBtreeMarkPageHalfDead,
+		RecordKindHeapFreeze,
+		RecordKindHeapUpdate,
+		RecordKindHeapMultiInsert,
+		RecordKindHeapVisible,
+		RecordKindBtreeReusePage,
+		RecordKindBtreeMetaCleanup,
+		RecordKindCheckpoint,
+		RecordKindXactCommit,
+		RecordKindXactAbort,
+		RecordKindCreateDatabase,
+		RecordKindDropDatabase,
+		RecordKindCreateIndex,
+		RecordKindDropIndex,
+		RecordKindXactAssignment,
+		RecordKindXactRollbackTo,
+		RecordKindXactSubAbort,
+		RecordKindHeapHotUpdate,
+		RecordKindHeapPruneOpt,
+		RecordKindSmgrCreate,
+		RecordKindSmgrTruncate:
+		return true
+	default:
+		return false
+	}
+}
+
 func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 	xlog := r.XLog
 	if xlog == nil {
@@ -2019,6 +2064,17 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 	case RmgrXact:
 		switch xlog.Header.Info & xlogXactOpMask {
 		case xlogXactCommit, xlogXactAbort:
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrStandby:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogStandbyRunningXacts:
+			// RUNNING_XACTS seeds standby snapshot/conflict state upstream.
+			// goopg's replay path has no consumer for that metadata yet, so
+			// treat the record as a recognised no-op and keep failing closed
+			// on any other Standby opcode.
 			return false, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)

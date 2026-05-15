@@ -1994,6 +1994,82 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `PartitionKeyUpdate{1,2,3}` unchanged (all still PASS).
           Design:
           `docs/design/0100-0005z-non-hot-update-ctid-link-and-epq-chain.md`.
+        - Cross-partition UPDATE fires BEFORE DELETE on source partition
+          (M0100-0005aa, 2026-05-15 loop 42).  Three coupled edits close
+          the final permutation of `partition-key-update-4.spec` (perm 2,
+          `s1b s2b s2ut1 s1ut s2c s1c s1st s1stl`):
+          (a) `internal/executor/operators_storage.go::updateOp.Next`
+          SeqScan branch, right after `routeToPartition` computes
+          `isCrossPartitionMove` and before the moved-partition xmax
+          stamp on the old slot, now invokes
+          `fireTriggers(o.ctx, pu.scanTbl, "before", "delete",
+          pu.oldRow, nil)` against the source leaf — mirrors upstream
+          `ExecCrossPartitionUpdate -> ExecDelete` which fires BEFORE
+          DELETE on the source before issuing the INSERT on the
+          destination.  RETURN NULL (`!ok`) honours upstream's
+          suppress-the-delete semantics by setting `epqSkipSeq = true`
+          and breaking out of the EPQ retry loop with locks released.
+          The trigger fires AFTER the EPQ refetch so `pu.oldRow`
+          reflects the concurrent updater's committed changes — the
+          spec comment "trigger is not run *before* the row is
+          refetched by EvalPlanQual" enforced here.
+          (b) The EPQ retry path, right after re-binding SET against
+          `baseRow` and calling `computeGeneratedColumns(puCols,
+          pu.newRow)`, now also runs
+          `pu.oldRow = cloneRow(baseRow)` so the trigger sees the
+          refetched row.  Without this, `OLD.b` would still hold the
+          scan-time `'ABC'` rather than s2's `'ABC update2'`.
+          (c) `internal/plpgsql/parser.go::parseDottedExprStmt` now
+          emits a real `AssignStmt{Target: "_old_<field>"}` for
+          `OLD.<field> := <expr>` (and bare `=` form) — reversing the
+          M0100-0005p no-op semantics for OLD writes.  Within a trigger
+          body OLD is conceptually mutable (the mutation does not
+          change what is being deleted; it only changes what subsequent
+          expressions and embedded SQL inside the trigger body observe
+          via OLD).  partition-key-update-4.spec depends on this:
+          `OLD.b = OLD.b || ' trigger'; INSERT INTO triglog select OLD.*`.
+          `internal/executor/plpgsql_runtime.go::executePLpgSQLStmt`
+          AssignStmt case now propagates writes whose `Target` starts
+          with `_old_` or `_new_` back to `frame.trig.OldRow[i]` /
+          `frame.trig.NewRow[i]` — the slice that
+          `substituteTriggerRefs` (called by
+          `execPLpgSQLEmbeddedSQL`) reads from when substituting
+          `OLD.*` / `OLD.<col>` / `NEW.*` / `NEW.<col>` references in
+          embedded SQL.  Without the propagation the frame slot is
+          updated but the embedded INSERT continues to see the
+          unmutated row.  The NEW-side propagation is a no-op
+          observable behaviour today (M0100-0005p's
+          `rebuildNewRowFromFrame` re-reads the frame at end-of-
+          trigger) but keeps the slots consistent for any embedded SQL
+          that references `NEW.*` mid-body.
+          Closes `partition-key-update-4.spec` perm 2 (and perm 4 by
+          symmetry — same trigger machinery, same row-suppression
+          path).  `TestPort_IsolationPartitionKeyUpdate4` flips from
+          `defer` (perm-2 only diff: `(0 rows)` vs
+          `1|ABC update2 trigger` / `(1 row)`) to PASS.  Regression
+          pins: `TestParseTriggerOldFieldAssign` (renamed from
+          `TestParseTriggerOldFieldAssignStaysNoop`, which enshrined
+          the prior no-op behaviour) in
+          `internal/plpgsql/parser_test.go`;
+          `TestCrossPartitionUpdateFiresBeforeDeleteOnSourcePartition`
+          in `internal/server/notice_test.go` (end-to-end: cross-
+          partition UPDATE moves (1,'ABC'); BEFORE DELETE on source
+          leaf fires; trigger mutates `OLD.b = OLD.b || ' trigger'`
+          and embedded INSERT writes `(1, 'ABC trigger')` into the log
+          table; source partition empty, destination holding moved
+          row).  `go test -count=1 -race -timeout 280s
+          ./internal/executor/ ./internal/plpgsql/ ./internal/server/
+          ./internal/storage/ ./internal/mvcc/ ./internal/wal/
+          ./internal/parser/ ./internal/planner/ ./internal/analyzer/`
+          PASS; adjacent isolation tests `LockCommittedUpdate`,
+          `InsertConflictDoUpdate`, `InsertConflictDoNothing`,
+          `FkSnapshot`, `PartitionKeyUpdate{1,2,3,4}` all PASS (no
+          regression in the 21-spec target).  Known follow-up:
+          `updateViaIndex` cross-partition routing (when it grows
+          partition awareness) will need the same trigger fire-site;
+          AFTER DELETE triggers and statement-level triggers are
+          separate scope.  Design:
+          `docs/design/0100-0005aa-cross-partition-update-before-delete-trigger.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

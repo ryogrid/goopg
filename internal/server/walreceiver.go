@@ -1,15 +1,16 @@
 // Standby-side walreceiver: connects to a primary, opens a
 // replication-mode session, issues START_REPLICATION, and persists
-// each received WAL record into the local WAL writer.
+// each received WAL byte stream into the local WAL writer.
 //
 // The walreceiver is the standby's mirror of the primary's walsender.
 // It speaks the same v3 wire protocol via internal/protocol's
 // FrameReader/Writer — no third-party libpq dependency. WAL records
-// arriving as `'w'` CopyData payloads are unwrapped and re-Append'd
-// into the local writer; framing identity is preserved because the
-// walsender forwards record payloads (not their on-wire frames) and
-// our local writer re-encodes with the same `len|crc|payload`
-// layout.
+// arriving as `'w'` CopyData payloads are unwrapped and written into
+// the local writer. PostgreSQL physical replication forwards raw WAL
+// stream bytes, including page headers and record framing, so those
+// chunks must be preserved verbatim. goopg's native walsender still
+// forwards decoded record payloads, so the standby re-encodes those
+// through the normal Append path.
 //
 // Status updates on the back-channel: every
 // `wal_receiver_status_interval` (default 10s, mirroring upstream)
@@ -25,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -332,7 +334,37 @@ func (r *WalReceiver) handleCopyData(payload []byte) error {
 			r.publishProgress(m.EndLSN)
 			return nil
 		}
-		_, end, err := r.cfg.WAL.Append(m.WALBytes)
+		appendVerbatim := m.EndLSN > m.StartLSN && uint64(len(m.WALBytes)) == m.EndLSN-m.StartLSN
+		var end uint64
+		if appendVerbatim {
+			expectedStart := r.cfg.WAL.WrittenLSN()
+			payload := m.WALBytes
+			if m.StartLSN != 0 && m.StartLSN != expectedStart {
+				slog.Info("walreceiver WALData start mismatch",
+					"start_lsn", m.StartLSN,
+					"end_lsn", m.EndLSN,
+					"expected_start_lsn", expectedStart,
+					"bytes", len(m.WALBytes))
+				switch {
+				case m.StartLSN < expectedStart:
+					trim := expectedStart - m.StartLSN
+					if trim >= uint64(len(payload)) {
+						end = r.cfg.WAL.WrittenLSN()
+						break
+					}
+					payload = payload[int(trim):]
+				case m.StartLSN > expectedStart:
+					return fmt.Errorf("walreceiver: raw WAL gap: start_lsn=%d expected_start_lsn=%d end_lsn=%d", m.StartLSN, expectedStart, m.EndLSN)
+				}
+			}
+			if end == 0 && len(payload) > 0 {
+				_, end, err = r.cfg.WAL.AppendRaw(payload)
+			} else if end == 0 {
+				end = r.cfg.WAL.WrittenLSN()
+			}
+		} else {
+			_, end, err = r.cfg.WAL.Append(m.WALBytes)
+		}
 		if err != nil {
 			return fmt.Errorf("walreceiver: append local WAL: %w", err)
 		}

@@ -430,6 +430,89 @@ func TestTriggerDrivenPartitionKeyRewriteMovesRowAcrossPartitions(t *testing.T) 
 	}
 }
 
+
+// TestCrossPartitionUpdateFiresBeforeDeleteOnSourcePartition pins
+// M0100-0005aa: a cross-partition UPDATE (DELETE+INSERT internally) must
+// fire any BEFORE DELETE row trigger defined on the source leaf
+// partition, mirroring upstream ExecCrossPartitionUpdate.  The trigger
+// body legitimately mutates OLD and reads it back via embedded SQL —
+// partition-key-update-4.spec's `OLD.b = OLD.b || ' trigger'; INSERT
+// INTO triglog select OLD.*` shape.
+func TestCrossPartitionUpdateFiresBeforeDeleteOnSourcePartition(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	colonIdx := strings.LastIndex(addr, ":")
+	if colonIdx < 0 {
+		t.Fatalf("addr: %s", addr)
+	}
+	host, port := addr[:colonIdx], addr[colonIdx+1:]
+	dsn := "host=" + host + " port=" + port + " user=postgres dbname=postgres sslmode=disable"
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Skipf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, q := range []string{
+		`CREATE TABLE xpd_foo (a int, b text) PARTITION BY LIST(a)`,
+		`CREATE TABLE xpd_foo1 PARTITION OF xpd_foo FOR VALUES IN (1)`,
+		`CREATE TABLE xpd_foo2 PARTITION OF xpd_foo FOR VALUES IN (2)`,
+		`CREATE TABLE xpd_triglog (a int, b text)`,
+		`INSERT INTO xpd_foo VALUES (1, 'ABC')`,
+		`CREATE FUNCTION xpd_trig_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+		   BEGIN
+		     OLD.b = OLD.b || ' trigger';
+		     INSERT INTO xpd_triglog select OLD.*;
+		     RETURN OLD;
+		   END $$`,
+		`CREATE TRIGGER xpd_trig BEFORE DELETE ON xpd_foo1 FOR EACH ROW EXECUTE FUNCTION xpd_trig_fn()`,
+	} {
+		rows, err := conn.QueryContext(ctx, q)
+		if err != nil {
+			t.Fatalf("setup %q: %v", q, err)
+		}
+		rows.Close()
+	}
+
+	// Cross-partition UPDATE moves (1,'ABC') from xpd_foo1 to xpd_foo2.
+	// BEFORE DELETE on xpd_foo1 must fire and insert (1,'ABC trigger')
+	// into xpd_triglog.
+	if _, err := conn.ExecContext(ctx, `UPDATE xpd_foo SET a = 2, b = b || ' update1' WHERE b like '%ABC%'`); err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+
+	var logA int
+	var logB string
+	if err := conn.QueryRowContext(ctx, `SELECT a, b FROM xpd_triglog`).Scan(&logA, &logB); err != nil {
+		t.Fatalf("scan triglog: %v", err)
+	}
+	if logA != 1 || logB != "ABC trigger" {
+		t.Errorf("triglog row = (%d, %q), want (1, %q) — BEFORE DELETE trigger did not fire or OLD mutation did not propagate to embedded INSERT",
+			logA, logB, "ABC trigger")
+	}
+
+	// Source partition empty, destination has the moved row.
+	var cnt1, cnt2 int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM xpd_foo1`).Scan(&cnt1); err != nil {
+		t.Fatalf("count foo1: %v", err)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM xpd_foo2`).Scan(&cnt2); err != nil {
+		t.Fatalf("count foo2: %v", err)
+	}
+	if cnt1 != 0 || cnt2 != 1 {
+		t.Errorf("partition counts: foo1=%d foo2=%d, want 0 and 1", cnt1, cnt2)
+	}
+}
+
 // TestNoticeCaptureUpdateTriggerExplicitTx tests BEFORE UPDATE trigger NOTICE
 // within an explicit transaction (BEGIN), matching the isolation test scenario.
 func TestNoticeCaptureUpdateTriggerExplicitTx(t *testing.T) {

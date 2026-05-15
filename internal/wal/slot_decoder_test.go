@@ -67,7 +67,12 @@ func TestSlotDecoderRunDrivesPluginThroughCommit(t *testing.T) {
 
 	// Wait for the plugin to observe the commit.
 	if err := plugin.waitFor(2*time.Second, func() bool { return plugin.commitCount() >= 1 }); err != nil {
-		t.Fatalf("plugin commit not observed: %v", err)
+		select {
+		case runErr := <-runErr:
+			t.Fatalf("plugin commit not observed: %v (Run err=%v)", err, runErr)
+		default:
+			t.Fatalf("plugin commit not observed: %v", err)
+		}
 	}
 
 	// Cancel the loop and confirm clean shutdown.
