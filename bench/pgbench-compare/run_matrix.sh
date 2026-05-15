@@ -74,6 +74,12 @@ init_goopg() {
     mkdir -p "$(dirname "$GOOPG_DATA_DIR")"
     log "Initializing goopg data directory at $GOOPG_DATA_DIR"
     "$GOOPG_BIN" init -D "$GOOPG_DATA_DIR"
+
+    cat >> "$GOOPG_DATA_DIR/postgresql.conf" <<EOF
+
+# pgbench matrix settings
+max_connections = 200
+EOF
 }
 
 port_in_use() {
