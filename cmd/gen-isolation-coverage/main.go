@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,10 +13,73 @@ import (
 	"github.com/goopg/goopg/internal/testport/framework"
 )
 
+type specMeta struct {
+	status    string
+	rationale string
+}
+
+// loadCSV parses the inventory CSV and returns a map of item_path → specMeta
+// for rows where kind == "isolation".
+func loadCSV(csvPath string) (map[string]specMeta, error) {
+	f, err := os.Open(csvPath)
+	if err != nil {
+		return nil, fmt.Errorf("open csv %q: %w", csvPath, err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	header, err := r.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read csv header: %w", err)
+	}
+
+	colIndex := func(name string) int {
+		for i, h := range header {
+			if h == name {
+				return i
+			}
+		}
+		return -1
+	}
+
+	kindIdx := colIndex("kind")
+	itemPathIdx := colIndex("item_path")
+	statusIdx := colIndex("status")
+	rationaleIdx := colIndex("rationale")
+
+	if kindIdx < 0 || itemPathIdx < 0 || statusIdx < 0 {
+		return nil, fmt.Errorf("csv missing required columns (kind, item_path, status)")
+	}
+
+	out := make(map[string]specMeta)
+	for {
+		row, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read csv row: %w", err)
+		}
+		if kindIdx >= len(row) || row[kindIdx] != "isolation" {
+			continue
+		}
+		if itemPathIdx >= len(row) {
+			continue
+		}
+		meta := specMeta{status: row[statusIdx]}
+		if rationaleIdx >= 0 && rationaleIdx < len(row) {
+			meta.rationale = row[rationaleIdx]
+		}
+		out[row[itemPathIdx]] = meta
+	}
+	return out, nil
+}
+
 func main() {
 	var (
 		repoRoot = flag.String("repo-root", ".", "path to repository root")
 		outPath  = flag.String("out", "docs/test-port/upstream-isolation-coverage.md", "output markdown path")
+		csvPath  = flag.String("csv", "docs/test-port/postgres-oracle-target-inventory.csv", "path to inventory CSV")
 	)
 	flag.Parse()
 
@@ -27,6 +92,11 @@ func main() {
 		fail("discover isolation specs", err)
 	}
 
+	inventory, err := loadCSV(*csvPath)
+	if err != nil {
+		fail("load inventory csv", err)
+	}
+
 	if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil {
 		fail("mkdir output dir", err)
 	}
@@ -35,6 +105,8 @@ func main() {
 		fail("create output", err)
 	}
 	defer f.Close()
+
+	const defaultRationale = "Deterministic scheduler foundation available; execution parity deferred to staged migration."
 
 	fmt.Fprintln(f, "# Upstream isolation Spec Coverage Classification")
 	fmt.Fprintln(f)
@@ -49,8 +121,17 @@ func main() {
 	fmt.Fprintln(f, "| ---- | ------ | --------- |")
 	for _, p := range paths {
 		name := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
-		rationale := "Deterministic scheduler foundation available; execution parity deferred to staged migration."
-		fmt.Fprintf(f, "| `%s` | defer | %s (case `%s`) |\n", p, rationale, name)
+		status := "defer"
+		rationale := defaultRationale
+		if meta, ok := inventory[p]; ok {
+			if meta.status != "" {
+				status = meta.status
+			}
+			if meta.rationale != "" {
+				rationale = meta.rationale
+			}
+		}
+		fmt.Fprintf(f, "| `%s` | %s | %s (case `%s`) |\n", p, status, rationale, name)
 	}
 }
 
