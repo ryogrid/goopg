@@ -79,6 +79,7 @@ init_goopg() {
 
 # pgbench matrix settings
 max_connections = 200
+shared_buffers = 2560MB
 EOF
 }
 
