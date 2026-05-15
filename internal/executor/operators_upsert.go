@@ -341,7 +341,18 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 			}
 			return false, err
 		}
-		if !mvcc.TupleVisible(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID) {
+		// M0100-0005x: upstream `_bt_check_unique` probes with
+		// HeapTupleSatisfiesDirty, which sees committed-after-snapshot
+		// commits and aborted deletes.  isLiveForUniqueCheck implements
+		// that subset: xmin live iff not aborted (committed-after counts
+		// as live); xmax dead iff committed (regardless of whether our
+		// frozen RR snapshot still thinks the deleter is in-progress).
+		// This is required so a wait-then-recheck on Case 2 (in-flight
+		// delete that commits during wait) clears the apparent conflict
+		// and lets the INSERT proceed — partition-key-update-3.spec
+		// permutations 1/5.  TupleVisible would still report the dead
+		// row as visible under RR's frozen snapshot.
+		if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 			return true, nil
 		}
 		row, err := DecodeRow(cols, tuple.Data)
@@ -371,7 +382,7 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 		// the probe outcome (in-flight insert with our key, or
 		// in-flight delete of a visible match). If one exists, wait
 		// for it to settle and re-probe under a fresh snapshot.
-		inProgressXID, hasInProgress := o.findInProgressConflict(rel, cols, inserted)
+		inProgressXID, isInFlightInsert, hasInProgress := o.findInProgressConflict(rel, cols, inserted)
 		if !hasInProgress {
 			return o.probeArbiter(rel, cols, inserted)
 		}
@@ -385,6 +396,23 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 				return storage.ItemPointer{}, nil, false, nil
 			}
 		}
+		// M0100-0005x: under RR / SERIALIZABLE, if the in-flight conflict
+		// was an INSERT (Case 1 — xmin in-progress) and the inserter
+		// committed, the resulting unique conflict is invisible to our
+		// frozen snapshot.  Upstream `_bt_check_unique` (via DirtySnapshot)
+		// sees the row and aborts the inserter with 40001 rather than
+		// silently proceeding with a duplicate or silently skipping.
+		// Case 2 (in-flight delete on a visible row) does NOT raise —
+		// the deletion clears the apparent conflict, INSERT proceeds.
+		if isInFlightInsert && o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+			if o.ctx.TxnMgr != nil && !o.ctx.TxnMgr.HasAbortedXID(inProgressXID) {
+				return storage.ItemPointer{}, nil, false, &ExecError{
+					Code:    "40001",
+					Pos:     o.plan.Pos(),
+					Message: "could not serialize access due to concurrent update",
+				}
+			}
+		}
 		if o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
 			if snap, serr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); serr == nil {
 				o.ctx.Snap = snap.Clone()
@@ -396,16 +424,19 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 // findInProgressConflict scans the arbiter index for a tuple whose xmin
 // is from a currently in-progress transaction (not yet committed/aborted).
 // Returns the in-progress XID and true if found; (0, false) otherwise.
-func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.TransactionID, bool) {
+func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (xid storage.TransactionID, isInFlightInsert bool, found bool) {
 	if o.arbiterTree == nil || o.ctx == nil {
-		return 0, false
+		return 0, false, false
 	}
 	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil || key == nil {
-		return 0, false
+		return 0, false, false
 	}
 	selfXID := o.ctx.Tx.XID
-	var foundXID storage.TransactionID
+	var (
+		foundXID storage.TransactionID
+		case1    bool
+	)
 	_ = o.arbiterTree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 		if err != nil {
@@ -426,6 +457,7 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 		// was taken (M0100-0002).
 		if xmin != storage.InvalidTransactionID && xmin != selfXID && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmin) {
 			foundXID = xmin
+			case1 = true
 			return false, nil
 		}
 		// Case 2: visible-being-deleted. The tuple's xmin is already settled
@@ -438,12 +470,13 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 			xminSettled := xmin == selfXID || (o.ctx.Snap.SeesCommittedXID(xmin))
 			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
 				foundXID = xmax
+				case1 = false
 				return false, nil
 			}
 		}
 		return true, nil
 	})
-	return foundXID, foundXID != 0
+	return foundXID, case1, foundXID != 0
 }
 
 // applyInsert is the no-conflict happy path. Writes the heap row

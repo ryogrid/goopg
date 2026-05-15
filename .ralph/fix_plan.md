@@ -1857,6 +1857,53 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/executor/ ./internal/server/` PASS.
           Design:
           `docs/design/0100-0005l-formatpqerror-strip-sqlstate-suffix.md`.
+        - Upsert dirty-snapshot probe + RR/SER 40001 raise on in-flight
+          insert commit (M0100-0005x, 2026-05-15 loop 39).  Three coupled
+          edits in `internal/executor/operators_upsert.go` close
+          `partition-key-update-3.spec`:
+          (a) `findInProgressConflict` signature widens to
+          `(xid, isInFlightInsert bool, found bool)` so the caller can
+          distinguish Case 1 (xmin in-flight insert) from Case 2
+          (visible-being-deleted, xmax in-flight).
+          (b) `probeArbiterWaiting` raises `40001 could not serialize
+          access due to concurrent update` when the waited-on xact was
+          Case 1, our isolation is RR or SERIALIZABLE, and the xact
+          committed (per `TxnMgr.HasAbortedXID`) — the M0100-0005w
+          pattern applied to the upsert path.  Mirrors upstream
+          `_bt_check_unique`'s serialization break for unique conflicts
+          whose xmin is later than our snapshot.  Case 2 commit does
+          NOT raise: the deletion clears the apparent conflict and the
+          INSERT proceeds (matches upstream INSERT path; the deleter,
+          not the inserter, is the one whose write-write conflict
+          surfaces).  RC always loops without raising.
+          (c) `probeArbiter` switches from `mvcc.TupleVisible` to
+          `isLiveForUniqueCheck` (the DirtySnapshot subset from
+          M0100-0005r) so a Case 2 post-wait re-probe correctly
+          classifies the just-deleted row as dead under RR's frozen
+          snapshot.  `mvcc.TupleVisible` would still report the dead
+          row as live (the deleter sits on the snapshot's InProgress
+          list) and the apparent conflict would survive, silently
+          skipping the INSERT under DO NOTHING — the failure mode
+          captured at the close of M0100-0005t for permutations 1/5 of
+          `partition-key-update-3.spec`.  Closes
+          `TestPort_IsolationPartitionKeyUpdate3` end-to-end (all 8
+          permutations: 4 RR + 4 SER, both `s2donothing`-first and
+          `s3donothing`-first paths) — flips from SKIP (deferred) to
+          PASS.  Regression pins:
+          `TestUpsertDoNothing_RR_RaisesSerializationOnInFlightInsertCommit`
+          and `TestUpsertDoNothing_RC_DoesNotRaiseSerializationOnInFlightInsertCommit`
+          in `internal/server/upsert_rr_inflight_insert_test.go`
+          (s1 in-flight INSERT, s2 ON CONFLICT DO NOTHING blocked
+          ≥ 250 ms, RR variant surfaces 40001 within 5 s of s1 commit,
+          RC variant silently DO NOTHINGs and final row matches s1's
+          value).  `go test -count=1 -race -timeout 240s
+          ./internal/executor/ ./internal/storage/ ./internal/server/
+          ./internal/mvcc/ ./internal/wal/` PASS; adjacent isolation
+          tests `LockCommittedUpdate`, `InsertConflictDoUpdate`,
+          `InsertConflictDoNothing`, `FkSnapshot`, `PartitionKeyUpdate1`,
+          `PartitionKeyUpdate2`, `WaitsForInFlightDelete` (M0100-0005s
+          server-layer pin) unchanged (all still PASS).  Design:
+          `docs/design/0100-0005x-upsert-dirty-probe-and-rr-serialization-raise.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
