@@ -275,6 +275,58 @@ func TestPageSetHeapTupleMovedPartition(t *testing.T) {
 	}
 }
 
+
+// TestPageSetHeapTupleCtid verifies that PageSetHeapTupleCtid updates only
+// the t_ctid field of an existing tuple — used by non-HOT cross-page UPDATE
+// to link the old version to its successor (M0100-0005z).
+func TestPageSetHeapTupleCtid(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	tuple := NewHeapTuple(TransactionID(100), TransactionID(200), []byte("old-version"))
+	tuple.Header.Infomask = HeapXmaxLockOnly // pre-set; must NOT be cleared by ctid-only update.
+	slot, err := PageAddHeapTuple(p, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ItemPointer{Block: 7, Offset: 13}
+	if err := PageSetHeapTupleCtid(p, slot, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PageGetHeapTuple(p, slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Header.CTID != want {
+		t.Errorf("CTID = %+v, want %+v", got.Header.CTID, want)
+	}
+	if got.Header.Xmin != TransactionID(100) {
+		t.Errorf("Xmin = %d, want 100 (xmin must be untouched)", got.Header.Xmin)
+	}
+	if got.Header.Xmax != TransactionID(200) {
+		t.Errorf("Xmax = %d, want 200 (xmax must be untouched)", got.Header.Xmax)
+	}
+	if got.Header.Infomask&HeapXmaxLockOnly == 0 {
+		t.Errorf("Infomask = %#x, HeapXmaxLockOnly was cleared (must remain)", got.Header.Infomask)
+	}
+}
+
+// TestPageSetHeapTupleCtidInvalidSlot verifies the helper rejects bogus slots
+// rather than corrupting page state.
+func TestPageSetHeapTupleCtidInvalidSlot(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleCtid(p, 0, ItemPointer{Block: 1, Offset: 1}); !errors.Is(err, ErrInvalidSlot) {
+		t.Errorf("slot=0: err = %v, want ErrInvalidSlot", err)
+	}
+	if err := PageSetHeapTupleCtid(p, 99, ItemPointer{Block: 1, Offset: 1}); !errors.Is(err, ErrInvalidSlot) {
+		t.Errorf("slot=99 (unallocated): err = %v, want ErrInvalidSlot", err)
+	}
+}
+
 // TestPageSetHeapTupleMovedPartitionInvalidSlot — out-of-range slot
 // numbers fall through to ErrInvalidSlot like the sibling helpers.
 func TestPageSetHeapTupleMovedPartitionInvalidSlot(t *testing.T) {

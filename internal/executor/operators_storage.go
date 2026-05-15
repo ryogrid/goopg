@@ -291,6 +291,98 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 	return false
 }
 
+
+// epqFollowChain walks the cross-page t_ctid chain starting at (rel, blk,
+// slot) to find the latest tuple version that is visible to ctx.Snap and
+// matches pred. Used as a fallback when epqFollowHOT (HOT same-page chain)
+// returns not-found because the concurrent UPDATE was non-HOT and therefore
+// links via raw t_ctid rather than the HeapHotUpdated bit (M0100-0005z).
+//
+// Returns (newBlk, newSlot, row, true) when a matching version is found,
+// or (0, 0, nil, false) when the chain terminates (sentinel, self-CTID,
+// invalid offset, or chain depth exceeded) without finding a visible match.
+//
+// Predicate is evaluated only at the chain tail (the latest version); upstream
+// EPQ semantics: if the latest visible version still matches WHERE, the
+// updater proceeds against it; otherwise the row is skipped.
+func epqFollowChain(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16, cols []catalog.Column, pred planner.Expr) (storage.BlockNumber, uint16, Row, bool) {
+	const maxChain = 64
+	curBlk, curSlot := blk, slot
+	for i := 0; i < maxChain; i++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
+		if err != nil {
+			return 0, 0, nil, false
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), curSlot)
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if gerr != nil {
+			return 0, 0, nil, false
+		}
+		// Sentinel: row was moved to another partition — caller should
+		// have already detected via epqSlotMovedToAnotherPartition or
+		// epqChainCheckMovedPartition; treat as chain end here.
+		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
+			return 0, 0, nil, false
+		}
+		ctid := tup.Header.CTID
+		// Chain terminates when CTID is invalid (no successor stamped) or
+		// points at self (latest version sentinel). At the tail, evaluate
+		// visibility + predicate against this tuple.
+		atTail := ctid.Block == storage.InvalidBlockNumber || ctid.Offset == 0 ||
+			(ctid.Block == curBlk && ctid.Offset == curSlot)
+		if atTail {
+			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID) {
+				return 0, 0, nil, false
+			}
+			row, decErr := DecodeRow(cols, tup.Data)
+			if decErr != nil {
+				return 0, 0, nil, false
+			}
+			if pred != nil {
+				pv, perr := evalExpr(pred, row, ctx)
+				if perr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
+					return 0, 0, nil, false
+				}
+			}
+			return curBlk, curSlot, row, true
+		}
+		// Follow the link to the next version.
+		curBlk = ctid.Block
+		curSlot = ctid.Offset
+	}
+	return 0, 0, nil, false
+}
+
+// stampOldCtid updates the t_ctid field of the tuple at (rel, blk, slot)
+// to point at newPtr. Called after a non-HOT cross-page UPDATE writes the
+// new tuple version, so that EPQ chain followers (epqFollowChain) can
+// locate the latest version. Visibility (xmin/xmax) is untouched.
+//
+// Errors that would corrupt the page are returned to the caller; transient
+// "slot already overwritten" cases (ErrUnsupportedItem) are swallowed since
+// the chain link is best-effort.
+func stampOldCtid(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16, newPtr storage.ItemPointer) error {
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return err
+	}
+	s.Lock()
+	cerr := storage.PageSetHeapTupleCtid(s.Page(), slot, newPtr)
+	s.Unlock()
+	ctx.Pool.Unpin(s)
+	if cerr != nil {
+		if errors.Is(cerr, storage.ErrUnsupportedItem) || errors.Is(cerr, storage.ErrInvalidSlot) {
+			return nil
+		}
+		return cerr
+	}
+	return nil
+}
+
 // errMovedToAnotherPartition is the canonical PG error raised when EPQ
 // rechecks (UPDATE/DELETE/SELECT FOR UPDATE/triggers/lockRows) walk to a
 // tuple that has been cross-partition UPDATEd by a concurrent committed
@@ -1584,7 +1676,15 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					if epqSlotMovedToAnotherPartition(o.ctx, rel, pu.blk, pu.slot) {
 						return nil, errMovedToAnotherPartition(o.plan.Pos())
 					}
+					newBlk := pu.blk
 					newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, rel, pu.blk, pu.slot, cols, o.pred)
+					if !chainFound {
+						// Non-HOT cross-page chain (M0100-0005z): fall back
+						// to raw t_ctid chain walk.
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, rel, pu.blk, pu.slot, cols, o.pred); cFound {
+							newBlk, newSlot, baseRow, chainFound = cBlk, cSlot, cRow, true
+						}
+					}
 					if !chainFound {
 						epqSkip = true
 						break
@@ -1602,6 +1702,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						}
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
+					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
 				}
@@ -1627,8 +1728,14 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if derr != nil {
 					return nil, derr
 				}
-				if err := writeHeapRow(o.ctx, rel, cols, pu.newRow); err != nil {
-					return nil, err
+				newPtr, werr := writeHeapRowReturning(o.ctx, rel, cols, pu.newRow)
+				if werr != nil {
+					return nil, werr
+				}
+				// M0100-0005z: link old tuple to new version via t_ctid for
+				// EPQ chain followers.
+				if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
+					return nil, cerr
 				}
 				break
 			}
@@ -1819,7 +1926,17 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				if epqSlotMovedToAnotherPartition(o.ctx, puRel, pu.blk, pu.slot) {
 					return nil, errMovedToAnotherPartition(o.plan.Pos())
 				}
+				newBlk := pu.blk
 				newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred)
+				if !chainFound {
+					// Non-HOT cross-page chain (M0100-0005z): updates that
+					// land on a different page leave no HeapHotUpdated bit;
+					// followHOTChain terminates immediately. Walk the raw
+					// t_ctid chain instead.
+					if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred); cFound {
+						newBlk, newSlot, baseRow, chainFound = cBlk, cSlot, cRow, true
+					}
+				}
 				if !chainFound {
 					epqSkipSeq = true
 					break
@@ -1840,6 +1957,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 				}
 				_ = computeGeneratedColumns(puCols, pu.newRow)
+				pu.blk = newBlk
 				pu.slot = newSlot
 				continue // re-run loop to stamp xmax on new slot
 			}
@@ -1897,6 +2015,16 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 			if destPart != nil {
 				maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
+			}
+			// M0100-0005z: link the old tuple to the new version via t_ctid
+			// for in-place (non-cross-partition) updates so EPQ chain
+			// followers can locate the latest version. Cross-partition
+			// moves stamp a sentinel into t_ctid above and must not be
+			// overwritten here.
+			if !isCrossPartitionMove {
+				if cerr := stampOldCtid(o.ctx, puRel, pu.blk, pu.slot, newPtr); cerr != nil {
+					return nil, cerr
+				}
 			}
 			break // success — exit epq retry loop
 			} // end epq retry loop
@@ -2115,11 +2243,19 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if victimCols == nil {
 				victimCols = tbl.Columns
 			}
+			newBlk := v.blk
 			newSlot, newRow, chainFound := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred)
+			if !chainFound {
+				// Non-HOT cross-page chain (M0100-0005z).
+				if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred); cFound {
+					newBlk, newSlot, newRow, chainFound = cBlk, cSlot, cRow, true
+				}
+			}
 			if !chainFound {
 				epqSkipDel = true
 				break
 			}
+			v.blk = newBlk
 			v.slot = newSlot
 			if newRow != nil {
 				v.row = newRow // update for correct RETURNING after chain-follow

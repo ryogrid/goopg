@@ -798,6 +798,42 @@ func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) err
 	return nil
 }
 
+
+// PageSetHeapTupleCtid overwrites only the t_ctid field of the heap tuple
+// at the given 1-based slot. Used by non-HOT cross-page UPDATE: after the
+// new tuple version is written elsewhere (different page or a different
+// relfile entirely), the old tuple's t_ctid is updated to point at the
+// successor so that EvalPlanQual chain followers can locate the latest
+// version. Visibility (xmin/xmax) is untouched. Caller must hold the
+// page write lock.
+func PageSetHeapTupleCtid(p Page, slot uint16, ctid ItemPointer) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+18 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(ctid.Block))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], ctid.Offset)
+	return nil
+}
+
 // PageSetHeapTupleLockOnly stamps xmax + sets the
 // HEAP_XMAX_LOCK_ONLY and lock-strength infomask bits on the heap
 // tuple at the given 1-based slot. Companion to PageSetHeapTupleXmax

@@ -1947,6 +1947,53 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `FkSnapshot`, `PartitionKeyUpdate{1,2,3}` unchanged (all
           still PASS).  Design:
           `docs/design/0100-0005y-tableoid-system-column.md`.
+        - Non-HOT UPDATE t_ctid link + cross-page EPQ chain follower
+          (M0100-0005z, 2026-05-15 loop 41).
+          New `internal/storage/heap.go::PageSetHeapTupleCtid` overwrites
+          only the `t_ctid` bytes on an existing tuple — visibility
+          (`xmin`/`xmax`/`infomask`) is untouched. New executor helpers
+          `epqFollowChain` (raw cross-page t_ctid walk; tail-only
+          predicate eval like upstream `heap_get_latest_tid`) and
+          `stampOldCtid` in `internal/executor/operators_storage.go`.
+          SeqScan + IndexScan UPDATE paths now (a) call
+          `stampOldCtid(puRel, oldBlk, oldSlot, newPtr)` after every
+          non-cross-partition `writeHeapRowReturning` so the old tuple's
+          CTID points at the successor, and (b) fall back to
+          `epqFollowChain` when `epqFollowHOT` returns not-found —
+          `followHOTChain` requires the `HeapHotUpdated` infomask bit,
+          which goopg's non-HOT UPDATE path never sets, so a concurrent
+          in-place UPDATE that lands on a different page would terminate
+          chain follow at the first hop and the EPQ retry would silently
+          skip the in-flight UPDATE. The DELETE EPQ branch gets the same
+          fallback. Both UPDATE EPQ branches now thread `(blk, slot)`
+          (previously only `slot` was carried, breaking as soon as the
+          chain crossed pages). The IndexScan UPDATE path's terminal
+          `writeHeapRow` is promoted to `writeHeapRowReturning` so the
+          new `ItemPointer` is available for the link stamp. Closes
+          `partition-key-update-4.spec` permutation 1 — was: silently
+          skipped UPDATE → final row `foo1|1|ABC update2`; now:
+          `foo2|2|ABC update2 update1` matching upstream. Permutations 2
+          and 4 (footrg trigger variants) remain `defer` because
+          cross-partition UPDATE in goopg fires only `before update`
+          triggers on the source partition; upstream additionally fires
+          `before delete` (cross-partition UPDATE = DELETE+INSERT
+          internally). That follow-up is separate scope. Regression
+          pins: `TestPageSetHeapTupleCtid` and
+          `TestPageSetHeapTupleCtidInvalidSlot` in
+          `internal/storage/heap_test.go`;
+          `TestCrossPartitionUpdate_EPQReevaluatesSetAfterConcurrentInPlace`
+          in `internal/server/cross_partition_update_epq_test.go`
+          (pre-fix: `final row = "xpu_foo1 1 ABC update2"`, post-fix:
+          `"xpu_foo2 2 ABC update2 update1"`). `go test -count=1 -race
+          -timeout 240s ./internal/executor/ ./internal/storage/
+          ./internal/server/ ./internal/mvcc/ ./internal/wal/
+          ./internal/planner/ ./internal/parser/ ./internal/analyzer/
+          ./internal/access/btree/` PASS; adjacent isolation tests
+          `LockCommittedUpdate`, `InsertConflictDoUpdate`,
+          `InsertConflictDoNothing`, `FkSnapshot`,
+          `PartitionKeyUpdate{1,2,3}` unchanged (all still PASS).
+          Design:
+          `docs/design/0100-0005z-non-hot-update-ctid-link-and-epq-chain.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
