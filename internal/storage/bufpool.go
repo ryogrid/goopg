@@ -807,22 +807,23 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	needFlush := s.valid && s.dirty
 	oldTag := s.tag
 
-	if !needFlush {
-		// Remove from old partition byTag while holding evictMu.
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
-	}
-
 	// M0056-0001: reserve the slot BEFORE releasing evictMu so a
-	// concurrent Pin's evictLocked skips it.
+	// concurrent Pin's evictLocked skips it.  M0099-0004: partition
+	// cleanup (oldPart.mu) happens after releasing evictMu to avoid
+	// holding evictMu while waiting for a contended partition lock.
 	s.valid = false
 	s.dirty = false
 	s.tag = BufferTag{}
 	s.pinCount.Store(1)
 	s.usageCount.Store(1)
 	p.evictMu.Unlock()
+
+	if !needFlush {
+		oldPart := &p.partitions[tagPartition(oldTag)]
+		oldPart.mu.Lock()
+		delete(oldPart.byTag, oldTag)
+		oldPart.mu.Unlock()
+	}
 
 	if needFlush {
 		s.contentMu.Lock()
@@ -995,21 +996,24 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	needFlush := s.valid && s.dirty
 	oldTag := s.tag
 
-	if !needFlush {
-		// Remove from old partition byTag while holding evictMu.
-		// Lock ordering: evictMu (held) → old partition lock.
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
-	}
-	// Reserve this slot while I/O runs outside evictMu.
+	// Reserve the slot before releasing evictMu so evictLocked skips it.
+	// M0099-0004: partition cleanup (oldPart.mu) now happens AFTER
+	// releasing evictMu to avoid holding evictMu while waiting for a
+	// contended partition lock.  Reservation makes the slot invisible
+	// to evictLocked; the old tag will be removed from byTag below.
 	s.valid = false
 	s.dirty = false
 	s.tag = BufferTag{}
 	s.pinCount.Store(1)
 	s.usageCount.Store(1)
 	p.evictMu.Unlock()
+
+	if !needFlush {
+		oldPart := &p.partitions[tagPartition(oldTag)]
+		oldPart.mu.Lock()
+		delete(oldPart.byTag, oldTag)
+		oldPart.mu.Unlock()
+	}
 
 	if needFlush {
 		s.contentMu.Lock()
