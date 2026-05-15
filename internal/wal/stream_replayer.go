@@ -128,16 +128,9 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		// visibility). The hook is called outside the replayer's mutex
 		// because the mvcc.Manager has its own lock; holding both would
 		// risk a deadlock with concurrent snapshot takers.
-		if sr.onXactReplay != nil && len(rec.Payload) > 0 {
-			switch rec.Payload[0] {
-			case RecordKindXactCommit:
-				if xid, err := DecodeXactMarker(rec.Payload); err == nil {
-					sr.onXactReplay(xid, true)
-				}
-			case RecordKindXactAbort:
-				if xid, err := DecodeXactMarker(rec.Payload); err == nil {
-					sr.onXactReplay(xid, false)
-				}
+		if sr.onXactReplay != nil {
+			if xid, committed, ok := replayedXactInfo(rec); ok {
+				sr.onXactReplay(xid, committed)
 			}
 		}
 		sr.mu.Lock()
@@ -149,5 +142,29 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 			sr.applyLSN = rec.EndLSN
 		}
 		sr.mu.Unlock()
+	}
+}
+
+func replayedXactInfo(rec Record) (storage.TransactionID, bool, bool) {
+	if len(rec.Payload) > 0 {
+		switch rec.Payload[0] {
+		case RecordKindXactCommit:
+			xid, err := DecodeXactMarker(rec.Payload)
+			return xid, true, err == nil
+		case RecordKindXactAbort:
+			xid, err := DecodeXactMarker(rec.Payload)
+			return xid, false, err == nil
+		}
+	}
+	if rec.XLog == nil || rec.XLog.Header.Rmid != RmgrXact {
+		return 0, false, false
+	}
+	switch rec.XLog.Header.Info & xlogXactOpMask {
+	case xlogXactCommit:
+		return storage.TransactionID(rec.XLog.Header.XID), true, true
+	case xlogXactAbort:
+		return storage.TransactionID(rec.XLog.Header.XID), false, true
+	default:
+		return 0, false, false
 	}
 }

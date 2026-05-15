@@ -176,16 +176,16 @@ func (it *RecordIterator) readOneAt(pos int64) (Record, int, error) {
 		if err != nil {
 			return Record{}, 0, err
 		}
-		payload, n, err := decodeRecordXLog(body)
+		decoded, err := decodeRecordXLogDetailed(body)
 		if err != nil {
 			return Record{}, 0, err
 		}
-		if n != len(body) {
-			return Record{}, 0, fmt.Errorf("wal: iterator xlog size mismatch: %d vs %d", n, len(body))
+		if decoded.Consumed != len(body) {
+			return Record{}, 0, fmt.Errorf("wal: iterator xlog size mismatch: %d vs %d", decoded.Consumed, len(body))
 		}
 		startLSN := uint64(pos) + 1
 		endLSN := uint64(pos) + uint64(advance)
-		return Record{StartLSN: startLSN, EndLSN: endLSN, Payload: payload}, advance, nil
+		return Record{StartLSN: startLSN, EndLSN: endLSN, Payload: decoded.Payload, XLog: decoded.XLog}, advance, nil
 	}
 
 	header, _, err := it.readRecordBytesAt(pos, recordHeaderSize)

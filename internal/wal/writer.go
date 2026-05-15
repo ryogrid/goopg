@@ -911,7 +911,8 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 			// consume a partially-written record.
 			return int64(off), lastRecPtr, nil
 		}
-		if _, n, err := decodeRecordXLog(fullBytes); err != nil || n != len(fullBytes) {
+		decoded, err := decodeRecordXLogDetailed(fullBytes)
+		if err != nil || decoded.Consumed != len(fullBytes) {
 			// Corrupt record in the last segment —
 			// treat as EOS (unclean shutdown).
 			return int64(off), lastRecPtr, nil

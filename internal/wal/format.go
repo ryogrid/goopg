@@ -278,33 +278,14 @@ func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
 }
 
 func decodeRecordXLog(stream []byte) ([]byte, int, error) {
-	if len(stream) < xlogRecordHeaderSize {
-		return nil, 0, fmt.Errorf("%w: truncated xlog record header", ErrCorruptRecord)
-	}
-	header, err := DecodeXLogRecordHeader(stream[:xlogRecordHeaderSize])
+	decoded, err := decodeRecordXLogDetailed(stream)
 	if err != nil {
 		return nil, 0, err
 	}
-	total := int(header.TotLen)
-	if total < xlogRecordHeaderSize || total > len(stream) {
-		return nil, 0, fmt.Errorf("%w: bad xlog total length %d", ErrCorruptRecord, total)
+	if decoded.Payload == nil {
+		return nil, decoded.Consumed, fmt.Errorf("%w: record carries structured xlog fragments", ErrCorruptRecord)
 	}
-	wrapped := stream[xlogRecordHeaderSize:total]
-	if err := VerifyXLogRecordCRC(stream[:xlogRecordHeaderSize], wrapped, header.CRC); err != nil {
-		return nil, 0, err
-	}
-	payload, err := unwrapXLogMainData(wrapped)
-	if err != nil {
-		return nil, 0, err
-	}
-	// Skip MAXALIGN trailing pad bytes so callers advance to the
-	// next record header. The pad is always zero-filled by the
-	// encoder.
-	consumed := maxAlignXLog(total)
-	if consumed > len(stream) {
-		consumed = len(stream)
-	}
-	return payload, consumed, nil
+	return decoded.Payload, decoded.Consumed, nil
 }
 
 func formatSegmentName(segNo uint64) string {

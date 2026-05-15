@@ -1861,6 +1861,9 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 // crashed before the storage write is re-attempted on restart, and
 // one that finished both is silently skipped.
 func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
+	if len(r.Payload) == 0 && r.XLog != nil {
+		return replayDecodedXLogRecord(mgr, r)
+	}
 	if len(r.Payload) == 0 {
 		return false, errors.New("wal: empty record payload")
 	}
@@ -2003,6 +2006,171 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 	default:
 		return false, fmt.Errorf("unsupported kind %d", r.Payload[0])
 	}
+}
+
+func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
+	xlog := r.XLog
+	if xlog == nil {
+		return false, errors.New("wal: empty decoded xlog record")
+	}
+	switch xlog.Header.Rmid {
+	case RmgrXLog:
+		return false, nil
+	case RmgrXact:
+		switch xlog.Header.Info & xlogXactOpMask {
+		case xlogXactCommit, xlogXactAbort:
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrHeap:
+		switch xlog.Header.Info & xlogHeapOpMask {
+		case xlogHeapInsert:
+			if err := replayDecodedXLogHeapInsert(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	default:
+		return false, unsupportedDecodedXLogRecord(r)
+	}
+}
+
+func unsupportedDecodedXLogRecord(r Record) error {
+	if r.XLog == nil {
+		return errors.New("wal: empty decoded xlog record")
+	}
+	return fmt.Errorf("wal: unsupported xlog record rmid=%d info=0x%02x lsn[%d,%d]",
+		r.XLog.Header.Rmid,
+		r.XLog.Header.Info&XLRRmgrInfoMask,
+		r.StartLSN,
+		r.EndLSN,
+	)
+}
+
+func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-insert missing block 0")
+	}
+	if block.Rel.Fork != storage.MainFork {
+		return fmt.Errorf("wal: xlog heap-insert fork=%d, want main fork", block.Rel.Fork)
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	offnum, err := decodeXLogHeapInsertMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	tupleRaw, err := decodeXLogHeapInsertTuple(block, storage.TransactionID(xlog.Header.XID), offnum)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	switch {
+	case block.Block < nblocks:
+		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+			return err
+		}
+		if !storage.IsNew(page) && storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+			return nil
+		}
+		if block.WillInit || xlog.Header.Info&xlogHeapInit != 0 || storage.IsNew(page) {
+			if err := storage.InitPage(page); err != nil {
+				return err
+			}
+		}
+	case block.Block == nblocks:
+		if err := storage.InitPage(page); err != nil {
+			return err
+		}
+		got, err := mgr.Extend(block.Rel, page)
+		if err != nil {
+			return err
+		}
+		if got != block.Block {
+			return fmt.Errorf("wal: xlog heap-insert extend returned block %d, want %d", got, block.Block)
+		}
+	default:
+		return fmt.Errorf("wal: xlog heap-insert replay gap block=%d nblocks=%d", block.Block, nblocks)
+	}
+	got, err := storage.PageInsertItemRawAt(page, offnum, tupleRaw)
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-insert apply: %w", err)
+	}
+	if got != offnum {
+		return fmt.Errorf("wal: xlog heap-insert replay slot drift: got %d, want %d (block %d)", got, offnum, block.Block)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+func xlogBlockRefByID(xlog *XLogDecodedRecord, id byte) (XLogBlockRef, bool) {
+	if xlog == nil {
+		return XLogBlockRef{}, false
+	}
+	for _, block := range xlog.Blocks {
+		if block.ID == id {
+			return block, true
+		}
+	}
+	return XLogBlockRef{}, false
+}
+
+func restoreDecodedXLogBlockImage(mgr *storage.Manager, block XLogBlockRef, lsn storage.LSN) error {
+	if len(block.Image) != storage.BlockSize {
+		return fmt.Errorf("wal: xlog block image is %d bytes, want %d", len(block.Image), storage.BlockSize)
+	}
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	if block.Block < nblocks {
+		existing := make(storage.Page, storage.BlockSize)
+		if err := mgr.ReadBlock(block.Rel, block.Block, existing); err != nil {
+			return err
+		}
+		if !storage.IsNew(existing) && storage.MustHeader(existing).LSN() >= lsn {
+			return nil
+		}
+	}
+	page := make(storage.Page, storage.BlockSize)
+	copy(page, block.Image)
+	storage.MustHeader(page).SetLSN(lsn)
+	return writeBlockOrExtend(mgr, block.Rel, block.Block, page)
+}
+
+func decodeXLogHeapInsertMainData(mainData []byte) (uint16, error) {
+	if len(mainData) < sizeOfXLogHeapInsertData {
+		return 0, fmt.Errorf("wal: invalid xlog heap-insert main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapInsertData)
+	}
+	return binary.LittleEndian.Uint16(mainData[0:2]), nil
+}
+
+func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, offnum uint16) ([]byte, error) {
+	if len(block.Data) < sizeOfXLogHeapHeaderData {
+		return nil, fmt.Errorf("wal: invalid xlog heap-insert block-data len %d (want >= %d)", len(block.Data), sizeOfXLogHeapHeaderData)
+	}
+	tuple := storage.HeapTuple{
+		Header: storage.HeapTupleHeader{
+			Xmin:      xid,
+			Xmax:      storage.InvalidTransactionID,
+			Xvac:      storage.InvalidTransactionID,
+			CTID:      storage.ItemPointer{Block: block.Block, Offset: offnum},
+			Infomask2: binary.LittleEndian.Uint16(block.Data[0:2]),
+			Infomask:  binary.LittleEndian.Uint16(block.Data[2:4]),
+			Hoff:      block.Data[4],
+		},
+		Data: append([]byte(nil), block.Data[sizeOfXLogHeapHeaderData:]...),
+	}
+	return tuple.MarshalBinary()
 }
 
 // ReplayFromDir reads records from <dataDir>/pg_wal and replays them.
