@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,16 +18,84 @@ type row struct {
 	Rationale string
 }
 
+type specMeta struct {
+	status    string
+	rationale string
+}
+
+// loadCSV parses the inventory CSV and returns a map of item_path → specMeta
+// for rows where kind == "tap".
+func loadCSV(csvPath string) (map[string]specMeta, error) {
+	f, err := os.Open(csvPath)
+	if err != nil {
+		return nil, fmt.Errorf("open csv %q: %w", csvPath, err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	header, err := r.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read csv header: %w", err)
+	}
+
+	colIndex := func(name string) int {
+		for i, h := range header {
+			if h == name {
+				return i
+			}
+		}
+		return -1
+	}
+
+	kindIdx := colIndex("kind")
+	itemPathIdx := colIndex("item_path")
+	statusIdx := colIndex("status")
+	rationaleIdx := colIndex("rationale")
+
+	if itemPathIdx < 0 || statusIdx < 0 {
+		return nil, fmt.Errorf("csv missing required columns (item_path, status)")
+	}
+
+	out := make(map[string]specMeta)
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read csv row: %w", err)
+		}
+		if kindIdx >= 0 && kindIdx < len(rec) && rec[kindIdx] != "tap" {
+			continue
+		}
+		if itemPathIdx >= len(rec) {
+			continue
+		}
+		meta := specMeta{status: rec[statusIdx]}
+		if rationaleIdx >= 0 && rationaleIdx < len(rec) {
+			meta.rationale = rec[rationaleIdx]
+		}
+		out[rec[itemPathIdx]] = meta
+	}
+	return out, nil
+}
+
 func main() {
 	var (
 		repoRoot = flag.String("repo-root", ".", "path to goopg repository root")
 		outPath  = flag.String("out", "docs/test-port/upstream-tap-coverage.md", "output markdown path")
+		csvPath  = flag.String("csv", "docs/test-port/postgres-oracle-target-inventory.csv", "path to inventory CSV")
 	)
 	flag.Parse()
 
 	root, err := filepath.Abs(*repoRoot)
 	if err != nil {
 		fail("resolve repo root", err)
+	}
+
+	inventory, err := loadCSV(*csvPath)
+	if err != nil {
+		fail("load inventory csv", err)
 	}
 
 	paths, err := collect(root)
@@ -35,6 +105,12 @@ func main() {
 	rows := make([]row, 0, len(paths))
 	for _, p := range paths {
 		status, why := classify(p)
+		if meta, ok := inventory[p]; ok && meta.status != "" {
+			status = meta.status
+			if meta.rationale != "" {
+				why = meta.rationale
+			}
+		}
 		rows = append(rows, row{Path: p, Status: status, Rationale: why})
 	}
 

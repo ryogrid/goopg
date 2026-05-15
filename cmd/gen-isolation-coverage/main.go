@@ -106,7 +106,7 @@ func main() {
 	}
 	defer f.Close()
 
-	const defaultRationale = "Deterministic scheduler foundation available; execution parity deferred to staged migration."
+	const defaultRationale = "Not yet attempted; execution parity deferred to staged porting."
 
 	fmt.Fprintln(f, "# Upstream isolation Spec Coverage Classification")
 	fmt.Fprintln(f)
@@ -114,14 +114,15 @@ func main() {
 	fmt.Fprintf(f, "Generated at: %s\n\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintf(f, "Total discovered specs: **%d**\n\n", len(paths))
 	fmt.Fprintln(f, "Status policy for this phase:")
-	fmt.Fprintln(f, "- `defer`: scheduler/parity not pass-required yet.")
-	fmt.Fprintln(f, "- `port`: used after a spec is wired and validated end-to-end.")
+	fmt.Fprintln(f, "- `not-tried`: spec has not yet been executed against goopg.")
+	fmt.Fprintln(f, "- `failed`: spec has been run but output does not match expected.")
+	fmt.Fprintln(f, "- `pass`: spec output matches the isolation test expected result.")
 	fmt.Fprintln(f)
 	fmt.Fprintln(f, "| spec | status | rationale |")
 	fmt.Fprintln(f, "| ---- | ------ | --------- |")
 	for _, p := range paths {
 		name := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
-		status := "defer"
+		status := "not-tried"
 		rationale := defaultRationale
 		if meta, ok := inventory[p]; ok {
 			if meta.status != "" {
