@@ -1404,7 +1404,7 @@ func tryApplyHOTUpdate(
 	if err := storage.PageStampHotOldTuple(s.Page(), oldSlot, ctx.Tx.XID, blk, newSlot); err != nil {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if errors.Is(err, storage.ErrUnsupportedItem) {
+		if errors.Is(err, storage.ErrUnsupportedItem) || errors.Is(err, storage.ErrInvalidSlot) {
 			// PagePruneOpt above (page-full fallback) can invalidate
 			// the old slot in a tight window between our pre-check
 			// and this stamp. Caller treats (false, nil) as "skip
@@ -1710,10 +1710,19 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if oldGerr == nil {
 					oldTupleBytes, _ = oldTup.MarshalBinary()
 				}
+				if oldGerr != nil {
+					// PageGetHeapTuple failed for this slot
+					// (e.g. concurrent prune / page compaction
+					// invalidated it after scan-time). Skip.
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					epqSkip = true
+					break
+				}
 				if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					if errors.Is(err, storage.ErrUnsupportedItem) {
+					if errors.Is(err, storage.ErrUnsupportedItem) || errors.Is(err, storage.ErrInvalidSlot) {
 						// Concurrent UPDATE/DELETE or opportunistic
 						// prune flipped this slot out of LP_NORMAL
 						// after scan-time. Skip the row.
@@ -2390,7 +2399,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 		for slot := uint16(1); slot <= uint16(count); slot++ {
 			tuple, err := storage.PageGetHeapTuple(page, slot)
 			if err != nil {
-				if errors.Is(err, storage.ErrUnsupportedItem) {
+				if errors.Is(err, storage.ErrUnsupportedItem) || errors.Is(err, storage.ErrInvalidSlot) {
 					continue
 				}
 				s.RUnlock()
