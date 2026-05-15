@@ -52,7 +52,8 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 	if len(entries) == 0 {
 		rootSlot, rootBlk, err := pool.PinNew(rel)
 		if err != nil {
-			metaSlot.Unlock(); pool.Unpin(metaSlot)
+			metaSlot.Unlock()
+			pool.Unpin(metaSlot)
 			return nil, err
 		}
 		rootSlot.Lock()
@@ -63,9 +64,11 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 		writeMeta(metaSlot.Page(), BTreeMeta{Magic: btreeMagic, Version: btreeVersion,
 			Root: rootBlk, Level: 0, FastRoot: rootBlk, FastLevel: 0})
 		_ = bt.markDirtyWithPageRecord(rootSlot, rootBlk)
-		rootSlot.Unlock(); pool.Unpin(rootSlot)
+		rootSlot.Unlock()
+		pool.Unpin(rootSlot)
 		_ = bt.markDirtyWithPageRecord(metaSlot, MetaBlock)
-		metaSlot.Unlock(); pool.Unpin(metaSlot)
+		metaSlot.Unlock()
+		pool.Unpin(metaSlot)
 		return bt, nil
 	}
 
@@ -79,7 +82,8 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 	leafRaws := itemsToRawItems(items)
 	leafLinks, err := bt.buildLevelRaw(leafRaws, BTLeaf, 0)
 	if err != nil {
-		metaSlot.Unlock(); pool.Unpin(metaSlot)
+		metaSlot.Unlock()
+		pool.Unpin(metaSlot)
 		return nil, err
 	}
 	rootBlk := leafLinks[0].blk
@@ -91,7 +95,8 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 			internalItems := linksToInternalItems(upLinks)
 			upLinks, err = bt.buildLevel(internalItems, 0, level)
 			if err != nil {
-				metaSlot.Unlock(); pool.Unpin(metaSlot)
+				metaSlot.Unlock()
+				pool.Unpin(metaSlot)
 				return nil, err
 			}
 			level++
@@ -101,7 +106,8 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 	}
 	rootSlot2, err := bt.pinW(rootBlk)
 	if err != nil {
-		metaSlot.Unlock(); pool.Unpin(metaSlot)
+		metaSlot.Unlock()
+		pool.Unpin(metaSlot)
 		return nil, err
 	}
 	rootOp := readOpaque(rootSlot2.Page())
@@ -112,13 +118,26 @@ func BulkCreateNoDedup(pool *storage.Pool, rel storage.RelFileNode, entries []Bu
 	writeMeta(metaSlot.Page(), BTreeMeta{Magic: btreeMagic, Version: btreeVersion,
 		Root: rootBlk, Level: rootLevel, FastRoot: rootBlk, FastLevel: rootLevel})
 	_ = bt.markDirtyWithPageRecord(metaSlot, MetaBlock)
-	metaSlot.Unlock(); pool.Unpin(metaSlot)
+	metaSlot.Unlock()
+	pool.Unpin(metaSlot)
 	return bt, nil
 }
 
 // BulkCreateWithOptions is BulkCreate with explicit Options.
 func BulkCreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, entries []BulkEntry, opts Options) (*BTree, error) {
 	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
+
+	// Ensure the relation file starts at block 0.  A previous failed
+	// bulk build or WAL replay (recovery after a crash that left WAL
+	// records without a committed catalog entry) can leave the
+	// relation file with nblocks > 0 and a stale Manager.files
+	// cache entry, causing PinNew to return a non-zero block.
+	// Truncating + invalidating guarantees a clean slate.
+	mgr := pool.Manager()
+	if err := mgr.TruncateRelation(rel); err != nil {
+		return nil, fmt.Errorf("btree bulk: truncate relation: %w", err)
+	}
+	pool.InvalidateRel(rel)
 
 	// Block 0: metapage (identical layout to Create).
 	metaSlot, metaBlk, err := pool.PinNew(rel)
