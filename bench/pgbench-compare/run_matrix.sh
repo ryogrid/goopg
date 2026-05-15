@@ -16,22 +16,68 @@ PG_LIB_DIR="$REPO_ROOT/postgres/local_install/lib"
 export PATH="$PG_BIN_DIR:$PATH"
 export LD_LIBRARY_PATH="$PG_LIB_DIR:$LD_LIBRARY_PATH"
 
-GOOPG_PORT=5433
-GOOPG_DATA_DIR="$REPO_ROOT/bench/pgbench-compare/goopg-data"
+GOOPG_PORT="${PGBENCH_GOOPG_PORT:-5433}"
+BENCH_DATA_ROOT="${PGBENCH_DATA_ROOT:-$REPO_ROOT/tmp/pgbench-compare}"
+GOOPG_DATA_DIR="$BENCH_DATA_ROOT/goopg-data"
 GOOPG_BIN="$REPO_ROOT/bin/goopg"
-SCALE_FACTOR=100
-DURATION=180
+GOOPG_STARTUP_TIMEOUT_SEC="${PGBENCH_GOOPG_STARTUP_TIMEOUT_SEC:-60}"
+GOOPG_STARTUP_POLL_COUNT="${PGBENCH_GOOPG_STARTUP_POLL_COUNT:-$((GOOPG_STARTUP_TIMEOUT_SEC * 5))}"
+SCALE_FACTOR="${PGBENCH_SCALE_FACTOR:-100}"
+DURATION="${PGBENCH_DURATION:-180}"
 RESULTS_DIR="$REPO_ROOT/bench/pgbench-compare/results"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 CANONICAL_ONLY="${1:-}"
 
 mkdir -p "$RESULTS_DIR"
+mkdir -p "$BENCH_DATA_ROOT"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+require_tool() {
+    local path=$1
+    local hint=$2
+    if [ ! -x "$path" ]; then
+        log "ERROR: required tool not found: $path" >&2
+        log "$hint" >&2
+        exit 1
+    fi
+}
+
+ensure_prerequisites() {
+    require_tool "$GOOPG_BIN" "Run 'make build' first."
+    require_tool "$PG_BIN_DIR/psql" "Build the postgres/ submodule with --prefix=\$PWD/local_install and run make install."
+    require_tool "$PG_BIN_DIR/pgbench" "Build the postgres/ submodule with --prefix=\$PWD/local_install and run make install."
+}
+
+is_valid_goopg_cluster() {
+    [ -f "$1/PG_VERSION" ] && [ -d "$1/base" ] && [ -d "$1/global" ] && [ -d "$1/pg_wal" ]
+}
+
+ensure_clean_goopg_cluster_dir() {
+    if [ ! -e "$GOOPG_DATA_DIR" ]; then
+        return 0
+    fi
+    if is_valid_goopg_cluster "$GOOPG_DATA_DIR"; then
+        return 0
+    fi
+    log "goopg data directory at $GOOPG_DATA_DIR is incomplete or stale; recreating it"
+    rm -rf "$GOOPG_DATA_DIR"
+}
+
+init_goopg() {
+    ensure_clean_goopg_cluster_dir
+    if is_valid_goopg_cluster "$GOOPG_DATA_DIR"; then
+        log "Using existing goopg data directory at $GOOPG_DATA_DIR"
+        return 0
+    fi
+    mkdir -p "$(dirname "$GOOPG_DATA_DIR")"
+    log "Initializing goopg data directory at $GOOPG_DATA_DIR"
+    "$GOOPG_BIN" init -D "$GOOPG_DATA_DIR"
+}
+
 port_in_use() {
-    ss -tuln 2>/dev/null | grep -q ":$1 "
+    netstat -tuln 2>/dev/null | grep -q ":$1 " || ss -tuln 2>/dev/null | grep -q ":$1 "
 }
 
 stop_goopg() {
@@ -52,7 +98,7 @@ start_goopg_cold() {
     log "Starting goopg (cold pool) on port $GOOPG_PORT..."
     GOGC=200 nohup "$GOOPG_BIN" start -D "$GOOPG_DATA_DIR" --listen "127.0.0.1:$GOOPG_PORT" \
         > "$GOOPG_DATA_DIR/server.log" 2>&1 &
-    for i in $(seq 1 100); do
+    for i in $(seq 1 "$GOOPG_STARTUP_POLL_COUNT"); do
         if psql -h 127.0.0.1 -p "$GOOPG_PORT" -U postgres -d postgres \
                 -c "SELECT 1" >/dev/null 2>&1; then
             log "goopg ready on port $GOOPG_PORT"
@@ -60,8 +106,32 @@ start_goopg_cold() {
         fi
         sleep 0.2
     done
-    log "ERROR: goopg failed to start" >&2
+    if psql -h 127.0.0.1 -p "$GOOPG_PORT" -U postgres -d postgres \
+            -c "SELECT 1" >/dev/null 2>&1; then
+        log "goopg ready on port $GOOPG_PORT"
+        return 0
+    fi
+    log "ERROR: goopg failed to start within ${GOOPG_STARTUP_TIMEOUT_SEC}s" >&2
+    if [ -f "$GOOPG_DATA_DIR/server.log" ]; then
+        tail -20 "$GOOPG_DATA_DIR/server.log" >&2
+    fi
     exit 1
+}
+
+ensure_pgbench_data() {
+    if psql -h 127.0.0.1 -p "$GOOPG_PORT" -U postgres -d postgres -c "\dt pgbench_accounts" 2>/dev/null | grep -q pgbench_accounts; then
+        log "pgbench data already initialized"
+        return 0
+    fi
+
+    log "Initializing pgbench data for goopg (scale factor: $SCALE_FACTOR)"
+    pgbench -h 127.0.0.1 -p "$GOOPG_PORT" -U postgres -i -s "$SCALE_FACTOR" postgres
+}
+
+ensure_goopg_ready() {
+    init_goopg
+    start_goopg_cold
+    ensure_pgbench_data
 }
 
 run_pgbench() {
@@ -96,7 +166,8 @@ echo "========================================================"
 
 log "=== Phase 1: Canonical (100,100) — cold pool ==="
 
-start_goopg_cold
+ensure_prerequisites
+ensure_goopg_ready
 TPS_STD=$(run_pgbench 100 100 "standard" "" "cold")
 
 start_goopg_cold

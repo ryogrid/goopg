@@ -13,15 +13,16 @@ export PATH="$PG_BIN_DIR:$PATH"
 export LD_LIBRARY_PATH="$PG_LIB_DIR:$LD_LIBRARY_PATH"
 
 # Configuration
-GOOPG_PORT=5433
-POSTGRES_PORT=5434
-GOOPG_DATA_DIR="$REPO_ROOT/bench/pgbench-compare/goopg-data"
-POSTGRES_DATA_DIR="$REPO_ROOT/bench/pgbench-compare/postgres-data"
+GOOPG_PORT="${PGBENCH_GOOPG_PORT:-5433}"
+POSTGRES_PORT="${PGBENCH_POSTGRES_PORT:-5434}"
+BENCH_DATA_ROOT="${PGBENCH_DATA_ROOT:-$REPO_ROOT/tmp/pgbench-compare}"
+GOOPG_DATA_DIR="$BENCH_DATA_ROOT/goopg-data"
+POSTGRES_DATA_DIR="$BENCH_DATA_ROOT/postgres-data"
 GOOPG_BIN="$REPO_ROOT/bin/goopg"
-SCALE_FACTOR=100
-CLIENTS=100
-THREADS=100
-DURATION=180  # 3 minutes
+SCALE_FACTOR="${PGBENCH_SCALE_FACTOR:-100}"
+CLIENTS="${PGBENCH_CLIENTS:-100}"
+THREADS="${PGBENCH_THREADS:-100}"
+DURATION="${PGBENCH_DURATION:-180}"  # 3 minutes by default
 RESULTS_DIR="$REPO_ROOT/bench/pgbench-compare/results"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -33,6 +34,47 @@ CHECKPOINT_TIMEOUT="24h"
 MAX_WAL_SIZE="1024GB"  # 1TB
 
 mkdir -p "$RESULTS_DIR"
+mkdir -p "$BENCH_DATA_ROOT"
+
+require_tool() {
+    local path=$1
+    local hint=$2
+    if [ ! -x "$path" ]; then
+        echo "ERROR: required tool not found: $path" >&2
+        echo "$hint" >&2
+        exit 1
+    fi
+}
+
+ensure_prerequisites() {
+    require_tool "$GOOPG_BIN" "Run 'make build' first, or invoke this script via 'make pgbench-compare'."
+    require_tool "$PG_BIN_DIR/initdb" "Build the postgres/ submodule with --prefix=\$PWD/local_install and run make install."
+    require_tool "$PG_BIN_DIR/pg_ctl" "Build the postgres/ submodule with --prefix=\$PWD/local_install and run make install."
+    require_tool "$PG_BIN_DIR/psql" "Build the postgres/ submodule with --prefix=\$PWD/local_install and run make install."
+    require_tool "$PG_BIN_DIR/pgbench" "Build the postgres/ submodule with --prefix=\$PWD/local_install and run make install."
+}
+
+is_valid_goopg_cluster() {
+    [ -f "$1/PG_VERSION" ] && [ -d "$1/base" ] && [ -d "$1/global" ] && [ -d "$1/pg_wal" ]
+}
+
+is_valid_postgres_cluster() {
+    [ -f "$1/PG_VERSION" ] && [ -f "$1/postgresql.conf" ] && [ -d "$1/base" ] && [ -d "$1/global" ]
+}
+
+ensure_clean_cluster_dir() {
+    local dir=$1
+    local kind=$2
+    local validator=$3
+    if [ ! -e "$dir" ]; then
+        return 0
+    fi
+    if "$validator" "$dir"; then
+        return 0
+    fi
+    echo "$kind data directory at $dir is incomplete or stale; recreating it"
+    rm -rf "$dir"
+}
 
 echo "==================================================================="
 echo "pgbench Performance Comparison: goopg vs PostgreSQL"
@@ -41,11 +83,12 @@ echo "Configuration:"
 echo "  Scale factor: $SCALE_FACTOR"
 echo "  Clients: $CLIENTS"
 echo "  Threads: $THREADS"
-echo "  Duration: ${DURATION}s (3 minutes)"
+echo "  Duration: ${DURATION}s"
 echo "  shared_buffers: $SHARED_BUFFERS"
 echo "  wal_buffers: 100MB (goopg: $WAL_BUFFERS_BYTES bytes, PostgreSQL: $WAL_BUFFERS_MB)"
 echo "  checkpoint_timeout: $CHECKPOINT_TIMEOUT"
 echo "  max_wal_size: $MAX_WAL_SIZE"
+echo "  data root: $BENCH_DATA_ROOT"
 echo "==================================================================="
 
 # Function to check if port is in use
@@ -58,18 +101,13 @@ init_goopg() {
     echo ""
     echo "--- Initializing goopg ---"
 
-    if [ -d "$GOOPG_DATA_DIR" ]; then
-        echo "goopg data directory already exists at $GOOPG_DATA_DIR"
-        read -p "Remove and recreate? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            rm -rf "$GOOPG_DATA_DIR"
-        else
-            echo "Using existing data directory"
-            return 0
-        fi
+    ensure_clean_cluster_dir "$GOOPG_DATA_DIR" "goopg" is_valid_goopg_cluster
+    if is_valid_goopg_cluster "$GOOPG_DATA_DIR"; then
+        echo "Using existing goopg data directory at $GOOPG_DATA_DIR"
+        return 0
     fi
 
+    mkdir -p "$(dirname "$GOOPG_DATA_DIR")"
     "$GOOPG_BIN" init -D "$GOOPG_DATA_DIR"
 
     # Configure goopg (note: wal_buffers requires bytes, no unit suffix)
@@ -91,18 +129,13 @@ init_postgres() {
     echo ""
     echo "--- Initializing PostgreSQL ---"
 
-    if [ -d "$POSTGRES_DATA_DIR" ]; then
-        echo "PostgreSQL data directory already exists at $POSTGRES_DATA_DIR"
-        read -p "Remove and recreate? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            rm -rf "$POSTGRES_DATA_DIR"
-        else
-            echo "Using existing data directory"
-            return 0
-        fi
+    ensure_clean_cluster_dir "$POSTGRES_DATA_DIR" "PostgreSQL" is_valid_postgres_cluster
+    if is_valid_postgres_cluster "$POSTGRES_DATA_DIR"; then
+        echo "Using existing PostgreSQL data directory at $POSTGRES_DATA_DIR"
+        return 0
     fi
 
+    mkdir -p "$(dirname "$POSTGRES_DATA_DIR")"
     "$PG_BIN_DIR/initdb" -D "$POSTGRES_DATA_DIR" -U postgres --no-locale --encoding=UTF8
 
     # Configure PostgreSQL
@@ -224,8 +257,10 @@ run_pgbench_test() {
 
 # Main execution flow
 
+ensure_prerequisites
+
 # Check if servers need initialization
-if [ ! -d "$GOOPG_DATA_DIR" ] || [ ! -d "$POSTGRES_DATA_DIR" ]; then
+if ! is_valid_goopg_cluster "$GOOPG_DATA_DIR" || ! is_valid_postgres_cluster "$POSTGRES_DATA_DIR"; then
     init_goopg
     init_postgres
 

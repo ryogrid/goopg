@@ -63,6 +63,48 @@ func TestTableoidRegclass_NonPartitioned(t *testing.T) {
 	}
 }
 
+// TestRegclassCast_ParamLookup pins the pgbench catalog probe shape:
+// `SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::pg_catalog.regclass`.
+// Pre-fix, the CastExpr path left text input unchanged, so the WHERE clause
+// compared pg_class.oid against the relation name and returned zero rows.
+func TestRegclassCast_ParamLookup(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	colonIdx := strings.LastIndex(addr, ":")
+	if colonIdx < 0 {
+		t.Fatalf("addr: %s", addr)
+	}
+	host, port := addr[:colonIdx], addr[colonIdx+1:]
+	dsn := "host=" + host + " port=" + port + " user=postgres dbname=postgres sslmode=disable"
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS pgbench_branches`,
+		`CREATE TABLE pgbench_branches (bid int)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("setup %q: %v", q, err)
+		}
+	}
+
+	var relkind string
+	if err := db.QueryRowContext(ctx,
+		`SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::pg_catalog.regclass`,
+		"pgbench_branches").Scan(&relkind); err != nil {
+		t.Fatalf("pgbench relkind probe: %v", err)
+	}
+	if relkind != "r" {
+		t.Fatalf("relkind=%q want %q", relkind, "r")
+	}
+}
+
 // TestTableoidRegclass_Partitioned pins the per-leaf partition union
 // wrapping (planFromTable's partition arm calling wrapWithTableoid)
 // plus the rangeBinding.tableOidColIdx accounting that makes

@@ -153,16 +153,23 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
-		// `<oid>::regclass` renders as the relation name (matches PG's
-		// regclassout). Used for the `tableoid` system column —
-		// `tableoid::regclass` resolves the `oid` operand against the
-		// catalog and returns the qualified relname. Unknown OIDs and
-		// non-InMemory catalogs fall through to evalCastTyped (which
-		// returns the integer as-is). M0100-0005y.
-		if v.Kind == KindInt && strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
-			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-				if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
-					return NewStringDatum(tbl.Name), nil
+		// `::regclass` is catalog-aware in both directions:
+		//   - `<oid>::regclass` renders as the relation name (PG's regclassout)
+		//   - `<text>::regclass` resolves the relation name to its numeric OID
+		// The latter is the exact pgbench probe shape:
+		//   `... WHERE oid = $1::pg_catalog.regclass`.
+		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
+			switch v.Kind {
+			case KindInt:
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
+						return NewStringDatum(tbl.Name), nil
+					}
+				}
+			case KindString, KindStringArena:
+				schema, rel := splitQualifiedTable(v.StringValue())
+				if tbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}); found && tbl != nil {
+					return NewIntDatum(int64(tbl.OID)), nil
 				}
 			}
 		}
@@ -365,12 +372,12 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// scale-aligning helpers.  Also try to parse string
 		// operands as numeric (columns loaded via INSERT may be
 		// stored as strings before the type system enforces types).
-		if (left.Kind == KindString || left.Kind == KindStringArena) {
+		if left.Kind == KindString || left.Kind == KindStringArena {
 			if m, s, err := parseNumeric(left.StringValue()); err == nil {
 				left = newNumeric(m, int(s))
 			}
 		}
-		if (right.Kind == KindString || right.Kind == KindStringArena) {
+		if right.Kind == KindString || right.Kind == KindStringArena {
 			if m, s, err := parseNumeric(right.StringValue()); err == nil {
 				right = newNumeric(m, int(s))
 			}
@@ -1752,55 +1759,55 @@ func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 func pgToCharToGoFormat(pg string) string {
 	replacer := strings.NewReplacer(
 		"YYYY", "2006",
-		"YYY",  "006",
-		"YY",   "06",
-		"Y",    "6",
+		"YYY", "006",
+		"YY", "06",
+		"Y", "6",
 		"IYYY", "2006", // ISO year — approximate
-		"IYY",  "006",
-		"IY",   "06",
-		"I",    "6",
-		"MM",   "01",
-		"MON",  "Jan",
-		"Mon",  "Jan",
-		"mon",  "jan",
-		"MONTH","January",
-		"Month","January",
-		"month","january",
-		"DD",   "02",
-		"D",    "1",    // day of week 1=Sun PostgreSQL, Go: Mon=1
-		"DAY",  "Monday",
-		"Day",  "Monday",
-		"day",  "monday",
-		"DY",   "Mon",
-		"Dy",   "Mon",
-		"dy",   "mon",
+		"IYY", "006",
+		"IY", "06",
+		"I", "6",
+		"MM", "01",
+		"MON", "Jan",
+		"Mon", "Jan",
+		"mon", "jan",
+		"MONTH", "January",
+		"Month", "January",
+		"month", "january",
+		"DD", "02",
+		"D", "1", // day of week 1=Sun PostgreSQL, Go: Mon=1
+		"DAY", "Monday",
+		"Day", "Monday",
+		"day", "monday",
+		"DY", "Mon",
+		"Dy", "Mon",
+		"dy", "mon",
 		"HH24", "15",
 		"HH12", "03",
-		"HH",   "03",
-		"MI",   "04",
-		"SS",   "05",
-		"MS",   "000",  // milliseconds
-		"US",   "000000", // microseconds
-		"TZ",   "UTC",  // always UTC in v0
-		"tz",   "utc",
-		"TZH",  "-07",
-		"TZM",  "00",
-		"AM",   "PM",
-		"PM",   "PM",
-		"am",   "pm",
-		"pm",   "pm",
+		"HH", "03",
+		"MI", "04",
+		"SS", "05",
+		"MS", "000", // milliseconds
+		"US", "000000", // microseconds
+		"TZ", "UTC", // always UTC in v0
+		"tz", "utc",
+		"TZH", "-07",
+		"TZM", "00",
+		"AM", "PM",
+		"PM", "PM",
+		"am", "pm",
+		"pm", "pm",
 		"A.M.", "PM",
 		"P.M.", "PM",
-		"Q",    "",     // quarter — not supported in Go format
-		"WW",   "",     // week of year — not directly supported
-		"IW",   "",     // ISO week
-		"CC",   "",     // century
-		"J",    "",     // Julian day
-		"SSSSS","",     // seconds past midnight
+		"Q", "", // quarter — not supported in Go format
+		"WW", "", // week of year — not directly supported
+		"IW", "", // ISO week
+		"CC", "", // century
+		"J", "", // Julian day
+		"SSSSS", "", // seconds past midnight
 		"SSSS", "",
-		"Y,YYY","",     // year with comma
-		"OF",   "-07:00",
-		"TZO",  "-07:00",
+		"Y,YYY", "", // year with comma
+		"OF", "-07:00",
+		"TZO", "-07:00",
 	)
 	return replacer.Replace(pg)
 }
