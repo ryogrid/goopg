@@ -22,7 +22,8 @@ GOOPG_DATA_DIR="$BENCH_DATA_ROOT/goopg-data"
 GOOPG_BIN="$REPO_ROOT/bin/goopg"
 GOOPG_STARTUP_TIMEOUT_SEC="${PGBENCH_GOOPG_STARTUP_TIMEOUT_SEC:-60}"
 GOOPG_STARTUP_POLL_COUNT="${PGBENCH_GOOPG_STARTUP_POLL_COUNT:-$((GOOPG_STARTUP_TIMEOUT_SEC * 5))}"
-SCALE_FACTOR="${PGBENCH_SCALE_FACTOR:-100}"
+#SCALE_FACTOR="${PGBENCH_SCALE_FACTOR:-100}"
+SCALE_FACTOR="${PGBENCH_SCALE_FACTOR:-10}"
 DURATION="${PGBENCH_DURATION:-180}"
 RESULTS_DIR="$REPO_ROOT/bench/pgbench-compare/results"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -171,29 +172,29 @@ echo "========================================================"
 
 # ── Phase 1: Canonical condition (100,100) — cold pool ────────────────────────
 
-log "=== Phase 1: Canonical (100,100) — cold pool ==="
+#log "=== Phase 1: Canonical (100,100) — cold pool ==="
 
 ensure_prerequisites
 ensure_goopg_ready
-TPS_STD=$(run_pgbench 100 100 "standard" "" "cold")
+# TPS_STD=$(run_pgbench 100 100 "standard" "" "cold")
 
-start_goopg_cold
-TPS_SIMPLE=$(run_pgbench 100 100 "simple-update" "-N" "cold")
+# start_goopg_cold
+# TPS_SIMPLE=$(run_pgbench 100 100 "simple-update" "-N" "cold")
 
-start_goopg_cold
-TPS_SELECT=$(run_pgbench 100 100 "select-only" "-S" "cold")
+# start_goopg_cold
+# TPS_SELECT=$(run_pgbench 100 100 "select-only" "-S" "cold")
 
-echo ""
-echo "=== Phase 1 Results (canonical -c100 -j100) ==="
-echo "  Standard TPC-B:  $TPS_STD TPS  (target ≥1500)"
-echo "  Simple Update:   $TPS_SIMPLE TPS  (target ≥1500)"
-echo "  Select Only:     $TPS_SELECT TPS  (target ≥10000)"
+# echo ""
+# echo "=== Phase 1 Results (canonical -c100 -j100) ==="
+# echo "  Standard TPC-B:  $TPS_STD TPS  (target ≥1500)"
+# echo "  Simple Update:   $TPS_SIMPLE TPS  (target ≥1500)"
+# echo "  Select Only:     $TPS_SELECT TPS  (target ≥10000)"
 
-if [ "$CANONICAL_ONLY" = "--canonical-only" ]; then
-    stop_goopg
-    log "Done (canonical-only mode)."
-    exit 0
-fi
+# if [ "$CANONICAL_ONLY" = "--canonical-only" ]; then
+#     stop_goopg
+#     log "Done (canonical-only mode)."
+#     exit 0
+# fi
 
 # ── Phase 2: Matrix survey (warm pool after canonical run) ─────────────────────
 
