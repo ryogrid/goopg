@@ -126,6 +126,14 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	if s.cfg.WAL != nil {
 		startLSN = s.cfg.WAL.WrittenLSN()
 	}
+
+	// M0102-0007: after the forced checkpoint, patch pg_control on disk
+	// with the checkpoint REDO location so the resulting backup's
+	// global/pg_control carries a valid checkpoint — PostgreSQL
+	// standbys reject pg_control with a zero redo point.
+	if startLSN > 0 {
+		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, startLSN)
+	}
 	startTLI, err := initdb.LoadOrCreateTimelineID(s.cfg.DataDir)
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.InternalError,

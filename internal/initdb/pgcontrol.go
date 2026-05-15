@@ -61,6 +61,46 @@ func writePgControl(dataDir string, systemID uint64) error {
 	return nil
 }
 
+// dbStateInProduction mirrors PostgreSQL's DB_IN_PRODUCTION enum value (6).
+// DB_STARTUP=0, DB_SHUTDOWNED=1, DB_SHUTDOWNED_IN_RECOVERY=2,
+// DB_SHUTDOWNING=3, DB_IN_CRASH_RECOVERY=4, DB_IN_ARCHIVE_RECOVERY=5,
+// DB_IN_PRODUCTION=6.
+const dbStateInProduction = 6
+
+// UpdateControlCheckpoint overwrites the checkpoint-related fields in the
+// on-disk pg_control file. Used by BASE_BACKUP after a forced checkpoint so
+// a PostgreSQL standby booted from the backup sees a valid REDO location.
+func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
+	path := filepath.Join(dataDir, pgControlFile)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("update pg_control: %w", err)
+	}
+	if len(body) < pgControlCRCOffset+4 {
+		return fmt.Errorf("update pg_control: file too short (%d bytes)", len(body))
+	}
+	le := binary.LittleEndian
+	now := time.Now()
+
+	// state → DB_IN_PRODUCTION (taken from a running server)
+	le.PutUint32(body[16:], dbStateInProduction)
+	// time → now
+	le.PutUint64(body[24:], uint64(now.Unix()))
+	// checkPoint (XLogRecPtr, offset 32) → redoLSN
+	le.PutUint64(body[32:], redoLSN)
+	// checkPointCopy.redo (offset 40, first 8 bytes of CheckPoint)
+	le.PutUint64(body[40:], redoLSN)
+
+	// Recompose CRC over bytes [0, pgControlCRCOffset)
+	crc := crc32.Checksum(body[:pgControlCRCOffset], crcCastagnoliTable)
+	le.PutUint32(body[pgControlCRCOffset:], crc)
+
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		return fmt.Errorf("update pg_control: write: %w", err)
+	}
+	return nil
+}
+
 // buildPgControl renders a PG-compatible pg_control file image with
 // the given system identifier and timestamp. The payload is 8192 bytes
 // total; the first 296 bytes are the ControlFileData struct, the rest

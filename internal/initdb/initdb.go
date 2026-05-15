@@ -80,6 +80,18 @@ var Subdirs = []string{
 	"global",
 	"pg_wal",
 	"pg_xact",
+	// PG-required directories so pg_basebackup clones and pg_ctl start
+	// against an imported backup succeed (M0102-0007).
+	"pg_commit_ts",
+	"pg_dynshmem",
+	"pg_logical",
+	"pg_notify",
+	"pg_replslot",
+	"pg_serial",
+	"pg_snapshots",
+	"pg_stat",
+	"pg_stat_tmp",
+	"pg_tblspc",
 }
 
 // Files lists the regular files goopg init writes alongside the
