@@ -55,6 +55,15 @@ type RecordIterator struct {
 	lastWaitEnd uint64
 }
 
+// RawChunk is one contiguous slice of the physical WAL byte stream.
+// StartLSN / EndLSN use PostgreSQL's 0-based byte positions so a
+// physical-replication peer can write the bytes verbatim.
+type RawChunk struct {
+	StartLSN uint64
+	EndLSN   uint64
+	Payload  []byte
+}
+
 // NewRecordIterator constructs a streaming iterator anchored at
 // startLSN. startLSN must be a record-boundary LSN (the
 // `start_lsn` of a record previously emitted by the writer); 0 is
@@ -227,6 +236,58 @@ func (it *RecordIterator) Next(ctx context.Context) (Record, error) {
 			return Record{}, ctx.Err()
 		case <-it.writer.done:
 			return Record{}, ErrClosed
+		}
+	}
+}
+
+// NextRaw returns the next contiguous physical WAL byte chunk starting at the
+// iterator's current byte position. Unlike Next, it preserves page headers and
+// zero padding so PostgreSQL-compatible peers can persist the bytes verbatim.
+func (it *RecordIterator) NextRaw(ctx context.Context, maxBytes int) (RawChunk, error) {
+	if it.closed.Load() {
+		return RawChunk{}, io.EOF
+	}
+	if maxBytes <= 0 {
+		maxBytes = XLOGBlockSize
+	}
+	for {
+		written := it.writer.WrittenLSN()
+		if int64(written) > it.pos {
+			want := int64(written) - it.pos
+			if want > int64(maxBytes) {
+				want = int64(maxBytes)
+			}
+			buf, err := it.readBytesAt(it.pos, int(want))
+			if err != nil {
+				if errors.Is(err, ErrLSNNotWritten) {
+					select {
+					case <-it.wake:
+						continue
+					case <-ctx.Done():
+						return RawChunk{}, ctx.Err()
+					case <-it.writer.done:
+						return RawChunk{}, ErrClosed
+					}
+				}
+				return RawChunk{}, err
+			}
+			chunk := RawChunk{
+				StartLSN: uint64(it.pos),
+				EndLSN:   uint64(it.pos) + uint64(len(buf)),
+				Payload:  buf,
+			}
+			it.lastWaitPos = -1
+			it.lastWaitEnd = 0
+			it.pos += int64(len(buf))
+			return chunk, nil
+		}
+		select {
+		case <-it.wake:
+			continue
+		case <-ctx.Done():
+			return RawChunk{}, ctx.Err()
+		case <-it.writer.done:
+			return RawChunk{}, ErrClosed
 		}
 	}
 }

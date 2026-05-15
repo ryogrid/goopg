@@ -74,6 +74,17 @@ func TestE2E_FailoverPGtoGoopg(t *testing.T) {
 			exact:            true,
 			workloadDeadline: 30 * time.Second,
 		},
+		{
+			name:              "sync_on",
+			sessionSyncCommit: "on",
+			primaryExtraConf: []string{
+				"synchronous_standby_names = 'goopg_standby'",
+				"synchronous_commit = 'local'",
+			},
+			minCommits:       3,
+			exact:            true,
+			workloadDeadline: 30 * time.Second,
+		},
 	}
 
 	for _, mode := range modes {

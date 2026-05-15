@@ -53,8 +53,8 @@ type Options struct {
 	WalLevel string
 	// MaxReplicationSlots / MaxWalSenders / MaxLogicalReplicationWorkers
 	// — defaults to 4 each. Override for tests with denser fan-out.
-	MaxReplicationSlots         int
-	MaxWalSenders               int
+	MaxReplicationSlots          int
+	MaxWalSenders                int
 	MaxLogicalReplicationWorkers int
 	// ApplicationName is published as `application_name` in the
 	// startup packet. Optional.
@@ -98,6 +98,30 @@ func Available(t *testing.T, binDir string) {
 // New constructs a cluster but does not bring it up. Caller invokes
 // Init then Start; Close tears down.
 func New(name string, opts Options) (*Cluster, error) {
+	c, err := newClusterHandle(name, opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.runInitdb(); err != nil {
+		return nil, err
+	}
+	if err := c.appendConf(opts); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// OpenExisting constructs a cluster handle rooted at an already-existing
+// upstream-PG data directory (for example one produced by pg_basebackup).
+// Unlike New, it does not run initdb or append any config.
+func OpenExisting(name string, opts Options) (*Cluster, error) {
+	if strings.TrimSpace(opts.DataDir) == "" {
+		return nil, errors.New("pgcluster: DataDir is required")
+	}
+	return newClusterHandle(name, opts)
+}
+
+func newClusterHandle(name string, opts Options) (*Cluster, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, errors.New("pgcluster: name is required")
 	}
@@ -148,12 +172,6 @@ func New(name string, opts Options) (*Cluster, error) {
 		user:     user,
 		database: db,
 		libDir:   filepath.Join(filepath.Dir(bin), "lib"),
-	}
-	if err := c.runInitdb(); err != nil {
-		return nil, err
-	}
-	if err := c.appendConf(opts); err != nil {
-		return nil, err
 	}
 	return c, nil
 }
@@ -248,6 +266,18 @@ func (c *Cluster) Kill() error {
 	c.started = false
 	if err != nil {
 		return fmt.Errorf("pgcluster: pg_ctl immediate stop: %v\n%s", err, out)
+	}
+	return nil
+}
+
+// Promote promotes a running standby via `pg_ctl promote -w`.
+func (c *Cluster) Promote() error {
+	cmd := exec.Command(filepath.Join(c.bin, "pg_ctl"),
+		"-D", c.dataDir, "-w", "promote")
+	cmd.Env = c.env()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("pgcluster: pg_ctl promote: %v\n%s", err, out)
 	}
 	return nil
 }

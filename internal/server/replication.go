@@ -129,10 +129,10 @@ func (s *Server) replyTimelineHistory(w *protocol.FrameWriter, args string) erro
 // follow upstream so a libpq client (and the future goopg-side
 // walreceiver) parse it transparently:
 //
-//   systemid  : text   — pg_control identifier
-//   timeline  : int4   — current timeline; v0 is single-timeline
-//   xlogpos   : text   — current write LSN as `X/X` hex pair
-//   dbname    : text   — empty for physical replication
+//	systemid  : text   — pg_control identifier
+//	timeline  : int4   — current timeline; v0 is single-timeline
+//	xlogpos   : text   — current write LSN as `X/X` hex pair
+//	dbname    : text   — empty for physical replication
 func (s *Server) replyIdentifySystem(w *protocol.FrameWriter) error {
 	systemID := s.cfg.SystemID
 	if systemID == "" {
@@ -481,24 +481,24 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		}
 	}()
 
-	// Send-side loop: forward each WAL record as a 'w' WAL-data frame,
-	// emit periodic keepalives so the standby can advance its
+	// Send-side loop: forward contiguous raw WAL chunks as 'w'
+	// WAL-data frames, emit periodic keepalives so the standby can advance its
 	// progress reporting even when the primary is idle.
 	const keepaliveInterval = 10 * time.Second
 	keepaliveTimer := time.NewTimer(keepaliveInterval)
 	defer keepaliveTimer.Stop()
 
-	recCh := make(chan wal.Record, 1)
+	chunkCh := make(chan wal.RawChunk, 1)
 	recErrCh := make(chan error, 1)
 	go func() {
 		for {
-			rec, err := it.Next(streamCtx)
+			chunk, err := it.NextRaw(streamCtx, wal.XLOGBlockSize)
 			if err != nil {
 				recErrCh <- err
 				return
 			}
 			select {
-			case recCh <- rec:
+			case chunkCh <- chunk:
 			case <-streamCtx.Done():
 				recErrCh <- streamCtx.Err()
 				return
@@ -513,8 +513,8 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 			return nil
 		case <-receiveDone:
 			return nil
-		case rec := <-recCh:
-			frame := protocol.EncodeWALData(rec.StartLSN, rec.EndLSN, time.Now().UTC(), rec.Payload)
+		case chunk := <-chunkCh:
+			frame := protocol.EncodeWALData(chunk.StartLSN, chunk.EndLSN, time.Now().UTC(), chunk.Payload)
 			if err := w.WriteCopyData(frame); err != nil {
 				streamCancel()
 				return err
@@ -524,7 +524,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 				return err
 			}
 			if senderHandle != nil {
-				senderHandle.SetSentLSN(rec.EndLSN)
+				senderHandle.SetSentLSN(chunk.EndLSN)
 			}
 			// Reset the keepalive timer — fresh WAL implies the
 			// standby has just heard from us.
@@ -659,6 +659,7 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 	if len(tokens) == 0 {
 		return startReplicationArgs{}, errors.New("START_REPLICATION: missing PHYSICAL/LOGICAL keyword")
 	}
+	modeKeywordPresent := true
 	switch {
 	case strings.EqualFold(tokens[0], "PHYSICAL"):
 		out.Mode = "PHYSICAL"
@@ -667,10 +668,15 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 		if out.SlotName == "" {
 			return startReplicationArgs{}, errors.New("START_REPLICATION LOGICAL requires SLOT name")
 		}
+	case isLSNToken(tokens[0]):
+		out.Mode = "PHYSICAL"
+		modeKeywordPresent = false
 	default:
 		return startReplicationArgs{}, fmt.Errorf("START_REPLICATION: unknown mode %q", tokens[0])
 	}
-	tokens = tokens[1:]
+	if modeKeywordPresent {
+		tokens = tokens[1:]
+	}
 	if len(tokens) == 0 {
 		return startReplicationArgs{}, errors.New("START_REPLICATION: missing start LSN")
 	}
@@ -695,6 +701,11 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 		out.Options = opts
 	}
 	return out, nil
+}
+
+func isLSNToken(token string) bool {
+	_, err := parseLSN(token)
+	return err == nil
 }
 
 // parseStartReplicationOptions parses libpq's pgoutput-style

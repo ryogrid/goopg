@@ -2436,7 +2436,7 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         while the primary's commit holds `remote_apply` — commit must block
         until the standby reattaches.
 
-- [ ] **M0102-0006**
+- [x] **M0102-0006**
       - Summary: Scenario A E2E test: PG primary + goopg standby.
       - Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
       - File: `internal/testport/e2e_failover_pg_to_goopg_test.go`. Two
@@ -2455,6 +2455,23 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         INSERT succeeds on goopg. Verify: sync subtest's post-promotion
         `count(*)` strictly equals workload's committed-INSERT counter at kill
         time; async subtest's count is within the documented bound.
+      - COMPLETE 2026-05-15: Scenario A's remaining blocker was PostgreSQL
+        heap-insert tuple replay on the goopg standby. The standby had the row
+        on disk and replayed the commit XID, but goopg copied the zero-filled
+        bytes between the fixed 23-byte tuple header and `t_hoff` into the
+        attribute payload, so seq-scan silently skipped the tuple with
+        `DecodePhysicalPGRow: src: truncated short varlena`.
+      - Fix: `internal/wal/recovery.go` now strips the all-zero prefix implied
+        by `t_hoff` in `decodeXLogHeapInsertTuple` before constructing the
+        `storage.HeapTuple`. Regression coverage added in
+        `internal/wal/xlog_replay_test.go`
+        (`TestApplyRecordReplaysDecodedXLogHeapInsertStripsZeroTuplePrefix`).
+      - Validation 2026-05-15: focused WAL replay tests passed, then the full
+        heterogeneous target passed for
+        `TestE2E_FailoverPGtoGoopg/async` and
+        `TestE2E_FailoverPGtoGoopg/sync_remote_apply`. An additional
+        `sync_on` sibling scenario was added in the same file and also passes;
+        that is extra coverage beyond the original two-subtest DoD.
 
 - [ ] **M0102-0007**
       - Summary: Scenario B E2E test: goopg primary + PG standby.
@@ -2468,6 +2485,24 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         loop (pgbench-on-goopg is out of scope); `kill -9 <goopg-pid>`;
         `pg_ctl promote -D <pg-dir>`; reconnect client via libpq multi-host;
         assert new INSERT succeeds on PG. Same per-subtest DoD as M0102-0006.
+      - IN PROGRESS 2026-05-15: the first minimal async probe now exists in
+        `internal/testport/e2e_failover_goopg_to_pg_test.go`, and
+        `internal/testutil/pgcluster/cluster.go` now has `OpenExisting(...)`
+        and `Promote()` so a PostgreSQL standby can be booted from a
+        `pg_basebackup`-produced data directory instead of only from `initdb`.
+      - First blockers found while bringing up the async probe:
+        (1) goopg does not expose SQL `pg_create_physical_replication_slot()`;
+        the test now pre-creates the physical slot offline via `wal.OpenSlots`.
+        (2) goopg's replication parser rejected upstream physical
+        `START_REPLICATION 0/0` syntax with the optional `PHYSICAL` keyword
+        omitted; `parseStartReplicationArgs` now accepts that upstream form.
+      - Current status: Scenario B is still NOT green. `pg_basebackup -X stream`
+        exposed a sender-side physical-WAL interoperability gap, so the tree
+        now contains an in-progress raw-WAL sender path (`internal/wal/iterator.go`
+        `NextRaw`, plus physical walsender changes). There is still no passing
+        end-to-end validation for `TestE2E_FailoverGoopgToPG/async`, and the
+        sync sibling has not been attempted yet. Treat M0102-0007 as the active
+        open task.
 
 - [ ] **M0102-0008**
       - Summary: Close milestone.

@@ -74,6 +74,35 @@ func TestParseStartReplicationArgsPhysicalStillWorks(t *testing.T) {
 	}
 }
 
+func TestParseStartReplicationArgsPhysicalKeywordOptional(t *testing.T) {
+	args, err := parseStartReplicationArgs(`START_REPLICATION SLOT primary 1/2 TIMELINE 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Mode != "PHYSICAL" {
+		t.Errorf("Mode=%q", args.Mode)
+	}
+	if args.SlotName != "primary" {
+		t.Errorf("SlotName=%q", args.SlotName)
+	}
+	if args.StartLSN != (uint64(1)<<32)|2 {
+		t.Errorf("StartLSN=%x", args.StartLSN)
+	}
+	if args.Timeline != 1 {
+		t.Errorf("Timeline=%d", args.Timeline)
+	}
+	args, err = parseStartReplicationArgs(`START_REPLICATION 0/0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Mode != "PHYSICAL" {
+		t.Errorf("Mode=%q", args.Mode)
+	}
+	if args.StartLSN != 0 {
+		t.Errorf("StartLSN=%x", args.StartLSN)
+	}
+}
+
 // TestWalsenderPgoutputAdapterWrapsAsCopyData pins the wire-
 // format invariant: every Write call from a PgOutput plugin
 // becomes one `'w'` CopyData frame on the wire, with monotonic
@@ -400,7 +429,6 @@ func TestSplitPublicationNamesSyntaxErrorsReturnNil(t *testing.T) {
 		}
 	}
 }
-
 
 // TestLogicalSyncRepDispatchUnblocksOnApplyCatchup is the M0103-0005
 // integration test for the logical walsender → SyncRep wait queue.

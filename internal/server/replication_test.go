@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -225,7 +226,6 @@ func TestReplicationCreateAndDropSlot(t *testing.T) {
 	}
 }
 
-
 // TestReplicationCreateLogicalSlot covers CREATE_REPLICATION_SLOT
 // name LOGICAL pgoutput (M0103-0004): a libpq subscriber sends this
 // immediately after the startup handshake when CREATE SUBSCRIPTION
@@ -309,7 +309,6 @@ func TestReplicationCreateLogicalSlotWithOptionsList(t *testing.T) {
 		t.Fatalf("slot lookup: err=%v kind=%v", err, slot.Kind)
 	}
 }
-
 
 // TestReplicationCreateLogicalSlotRestartLSNIsNextRecord pins the
 // M0103-0008 rung-9 off-by-one fix. Slot RestartLSN must be set to
@@ -516,12 +515,13 @@ func TestReplicationStartReplicationStreamsRecord(t *testing.T) {
 			continue
 		}
 		m := parsed.(*protocol.WALDataMessage)
-		if string(m.WALBytes) != string(want) {
-			t.Fatalf("WAL-data payload = %q, want %q", m.WALBytes, want)
+		if !bytes.Contains(m.WALBytes, want) {
+			t.Fatalf("WAL-data payload missing appended record: got=%x want_substr=%x", m.WALBytes, want)
 		}
-		// StartLSN / EndLSN must match what the writer reported.
-		if m.StartLSN == 0 || m.EndLSN <= m.StartLSN {
-			t.Errorf("LSN range = (%d, %d), want non-trivial", m.StartLSN, m.EndLSN)
+		// Physical streaming now forwards raw WAL bytes, so a stream that
+		// starts at 0/0 must begin at segment offset 0.
+		if m.StartLSN != 0 || m.EndLSN <= m.StartLSN {
+			t.Errorf("LSN range = (%d, %d), want start 0 and non-trivial end", m.StartLSN, m.EndLSN)
 		}
 		return
 	}
@@ -548,7 +548,6 @@ func TestReplicationStartReplicationRejectsLogical(t *testing.T) {
 		t.Errorf("post-error IDENTIFY_SYSTEM = %c, want T", frames[0].Type)
 	}
 }
-
 
 // TestReplicationTimelineHistoryReturnsFile verifies the
 // M0102-0003 TIMELINE_HISTORY <tli> wire path: the server reads
@@ -630,7 +629,6 @@ func TestReplicationTimelineHistoryMissingReturnsEmptyContent(t *testing.T) {
 		t.Errorf("content = %q, want NULL for missing TLI", cells[1])
 	}
 }
-
 
 // TestReplicationFallthroughQueryNotCancelled regresses a bug where
 // replication-mode connections falling through to the regular SQL
