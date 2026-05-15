@@ -517,9 +517,9 @@ isolation-specs,isolation,postgres/src/test/isolation/specs/detach-partition-con
 isolation-specs,isolation,postgres/src/test/isolation/specs/detach-partition-concurrently-2.spec,postgres/src/test/isolation/specs/detach-partition-concurrently-2.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/detach-partition-concurrently-3.spec,postgres/src/test/isolation/specs/detach-partition-concurrently-3.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/detach-partition-concurrently-4.spec,postgres/src/test/isolation/specs/detach-partition-concurrently-4.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/drop-index-concurrently-1.spec,postgres/src/test/isolation/specs/drop-index-concurrently-1.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec,postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/eval-plan-qual.spec,postgres/src/test/isolation/specs/eval-plan-qual.spec,not-tried,
+isolation-specs,isolation,postgres/src/test/isolation/specs/drop-index-concurrently-1.spec,postgres/src/test/isolation/specs/drop-index-concurrently-1.spec,failed,Attempted via TestPort_IsolationDropIndexConcurrently1; defers on EXPLAIN EXECUTE plan format parity — M0100-0005g/i
+isolation-specs,isolation,postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec,postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec,failed,Attempted via TestPort_IsolationEvalPlanQualTrigger; fails on NOTICE emission and trigger output diffs — M0100-0005 scope
+isolation-specs,isolation,postgres/src/test/isolation/specs/eval-plan-qual.spec,postgres/src/test/isolation/specs/eval-plan-qual.spec,failed,Attempted via TestPort_IsolationEvalPlanQual; partial match (1133/1494 lines); defers on RETURNING support in planner — M0100-0005 scope
 isolation-specs,isolation,postgres/src/test/isolation/specs/fk-contention.spec,postgres/src/test/isolation/specs/fk-contention.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/fk-deadlock.spec,postgres/src/test/isolation/specs/fk-deadlock.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/fk-deadlock2.spec,postgres/src/test/isolation/specs/fk-deadlock2.spec,not-tried,
@@ -534,24 +534,24 @@ isolation-specs,isolation,postgres/src/test/isolation/specs/inherit-temp.spec,po
 isolation-specs,isolation,postgres/src/test/isolation/specs/inplace-inval.spec,postgres/src/test/isolation/specs/inplace-inval.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-nothing-2.spec,postgres/src/test/isolation/specs/insert-conflict-do-nothing-2.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-nothing.spec,postgres/src/test/isolation/specs/insert-conflict-do-nothing.spec,pass,TestPort_IsolationInsertConflictDoNothing PASS (M0100-0002: eager XID materialisation + IsolationRunner global teardown).
-isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec,postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec,postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec,postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec,not-tried,
+isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec,postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec,failed,Attempted via TestPort_IsolationInsertConflictDoUpdate2; remaining output diffs after M0100-0005 format fixes — M0100-0005 scope
+isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec,postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec,failed,Attempted via TestPort_IsolationInsertConflictDoUpdate3; remaining output diffs after M0100-0005 format fixes — M0100-0005 scope
+isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec,postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec,failed,Attempted via TestPort_IsolationInsertConflictDoUpdate4; remaining output diffs after M0100-0005 format fixes — M0100-0005 scope
 isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-do-update.spec,postgres/src/test/isolation/specs/insert-conflict-do-update.spec,pass,TestPort_IsolationInsertConflictDoUpdate PASS (M0096-0005 + M0100-0002 cross-reference).
-isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-specconflict.spec,postgres/src/test/isolation/specs/insert-conflict-specconflict.spec,not-tried,
+isolation-specs,isolation,postgres/src/test/isolation/specs/insert-conflict-specconflict.spec,postgres/src/test/isolation/specs/insert-conflict-specconflict.spec,failed,Attempted via TestPort_IsolationInsertConflictSpecconflict; output diverges from expected — M0100-0005 scope
 isolation-specs,isolation,postgres/src/test/isolation/specs/intra-grant-inplace-db.spec,postgres/src/test/isolation/specs/intra-grant-inplace-db.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/intra-grant-inplace.spec,postgres/src/test/isolation/specs/intra-grant-inplace.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/lock-committed-keyupdate.spec,postgres/src/test/isolation/specs/lock-committed-keyupdate.spec,not-tried,
+isolation-specs,isolation,postgres/src/test/isolation/specs/lock-committed-keyupdate.spec,postgres/src/test/isolation/specs/lock-committed-keyupdate.spec,failed,Attempted via TestPort_IsolationLockCommittedKeyupdate; output diverges from expected — M0100-0005 scope
 isolation-specs,isolation,postgres/src/test/isolation/specs/lock-committed-update.spec,postgres/src/test/isolation/specs/lock-committed-update.spec,pass,TestPort_IsolationLockCommittedUpdate PASS — all 24 permutations (M0100-0005e seqScanOp page-RLock per-tuple; M0100-0005f stampLock preserves real updater xmax).
 isolation-specs,isolation,postgres/src/test/isolation/specs/lock-nowait.spec,postgres/src/test/isolation/specs/lock-nowait.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/lock-update-delete.spec,postgres/src/test/isolation/specs/lock-update-delete.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/lock-update-traversal.spec,postgres/src/test/isolation/specs/lock-update-traversal.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/matview-write-skew.spec,postgres/src/test/isolation/specs/matview-write-skew.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/merge-delete.spec,postgres/src/test/isolation/specs/merge-delete.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/merge-insert-update.spec,postgres/src/test/isolation/specs/merge-insert-update.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/merge-join.spec,postgres/src/test/isolation/specs/merge-join.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/merge-match-recheck.spec,postgres/src/test/isolation/specs/merge-match-recheck.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/merge-update.spec,postgres/src/test/isolation/specs/merge-update.spec,not-tried,
+isolation-specs,isolation,postgres/src/test/isolation/specs/merge-delete.spec,postgres/src/test/isolation/specs/merge-delete.spec,failed,Attempted via TestPort_IsolationMergeDelete; output diverges at MERGE implementation gaps — M0100-0005 scope
+isolation-specs,isolation,postgres/src/test/isolation/specs/merge-insert-update.spec,postgres/src/test/isolation/specs/merge-insert-update.spec,failed,Attempted via TestPort_IsolationMergeInsertUpdate; output diverges at MERGE implementation gaps — M0100-0005 scope
+isolation-specs,isolation,postgres/src/test/isolation/specs/merge-join.spec,postgres/src/test/isolation/specs/merge-join.spec,failed,Attempted via TestPort_IsolationMergeJoin; parse issue fixed (M0100-0005j) but output diverges at MERGE+join gaps
+isolation-specs,isolation,postgres/src/test/isolation/specs/merge-match-recheck.spec,postgres/src/test/isolation/specs/merge-match-recheck.spec,failed,Attempted via TestPort_IsolationMergeMatchRecheck; defers on RETURNING support in planner — M0100-0005 scope
+isolation-specs,isolation,postgres/src/test/isolation/specs/merge-update.spec,postgres/src/test/isolation/specs/merge-update.spec,failed,Attempted via TestPort_IsolationMergeUpdate; output diverges at MERGE/RETURNING/EPQ recheck gaps — M0100-0005 scope
 isolation-specs,isolation,postgres/src/test/isolation/specs/multiple-cic.spec,postgres/src/test/isolation/specs/multiple-cic.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/multiple-row-versions.spec,postgres/src/test/isolation/specs/multiple-row-versions.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/multixact-no-deadlock.spec,postgres/src/test/isolation/specs/multixact-no-deadlock.spec,not-tried,
@@ -583,7 +583,7 @@ isolation-specs,isolation,postgres/src/test/isolation/specs/read-only-anomaly.sp
 isolation-specs,isolation,postgres/src/test/isolation/specs/read-write-unique-2.spec,postgres/src/test/isolation/specs/read-write-unique-2.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/read-write-unique-3.spec,postgres/src/test/isolation/specs/read-write-unique-3.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/read-write-unique-4.spec,postgres/src/test/isolation/specs/read-write-unique-4.spec,not-tried,
-isolation-specs,isolation,postgres/src/test/isolation/specs/read-write-unique.spec,postgres/src/test/isolation/specs/read-write-unique.spec,not-tried,
+isolation-specs,isolation,postgres/src/test/isolation/specs/read-write-unique.spec,postgres/src/test/isolation/specs/read-write-unique.spec,failed,Attempted via TestPort_IsolationReadWriteUnique; remaining diffs are SERIALIZABLE snapshot timing and SSI predicate-lock waits — out of RC scope
 isolation-specs,isolation,postgres/src/test/isolation/specs/receipt-report.spec,postgres/src/test/isolation/specs/receipt-report.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/referential-integrity.spec,postgres/src/test/isolation/specs/referential-integrity.spec,not-tried,
 isolation-specs,isolation,postgres/src/test/isolation/specs/reindex-concurrently-toast.spec,postgres/src/test/isolation/specs/reindex-concurrently-toast.spec,not-tried,
