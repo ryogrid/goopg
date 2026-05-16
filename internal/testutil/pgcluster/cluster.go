@@ -236,7 +236,8 @@ func (c *Cluster) Start() error {
 		"start")
 	cmd.Env = c.env()
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("pgcluster: pg_ctl start: %v\n%s", err, out)
+		logContent, _ := os.ReadFile(c.logPath)
+		return fmt.Errorf("pgcluster: pg_ctl start: %v\n%s\n--- PG log ---\n%s", err, out, string(logContent))
 	}
 	c.started = true
 	return nil
