@@ -98,7 +98,13 @@ func emitWithPageHeaders(record []byte, realRecLen int, startPos int64, segSize 
 			// record header; undercounting (without padding)
 			// makes PG read padding as a record header and
 			// raise "invalid record length".
-			remaining := uint32(len(record) - consumed)
+			// PG's CopyXLogRecordToWAL computes xlp_rem_len as
+			// (xl_tot_len - written), which is the UNPADDED
+			// remaining bytes. realRecLen is goopg's xl_tot_len
+			// (without MAXALIGN pad). Using len(record) which
+			// includes padding causes PG to report
+			// "invalid contrecord length".
+			remaining := uint32(realRecLen - consumed)
 			hdr := buildPageHeader(pos, segSize, sysID, tli, true, remaining)
 			out = append(out, hdr...)
 			pos += int64(len(hdr))
