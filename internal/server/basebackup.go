@@ -122,27 +122,32 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		}
 	}
 
-	startLSN := uint64(0)
-	if s.cfg.WAL != nil {
-		startLSN = s.cfg.WAL.WrittenLSN()
+	// Fetch the checkpoint REDO LSN. This is the point from which WAL
+	// replay must begin for a consistent backup — pg_basebackup uses
+	// it as the START_REPLICATION start position. Fall back to
+	// WrittenLSN() if the checkpointer hasn't recorded a REDO yet
+	// (e.g. no prior checkpoint).
+	// goopg uses 1-based LSNs internally; PG expects 0-based in
+	// pg_control and backup_label — subtract 1 for those artefacts.
+	redoLSN := uint64(0)
+	if s.cfg.Checkpointer != nil {
+		redoLSN = s.cfg.Checkpointer.CheckpointRedoLSN()
 	}
+	if redoLSN == 0 && s.cfg.WAL != nil {
+		redoLSN = s.cfg.WAL.WrittenLSN()
+	}
+
+	// startLSN is the WAL-range bookend pg_basebackup sends back as
+	// the START_REPLICATION position. Must be the checkpoint REDO
+	// LSN (not WrittenLSN) so the WAL sender streams from the
+	// consistency point, covering every record between the checkpoint
+	// and the backup end. M0105-0007.
+	startLSN := redoLSN
 
 	// M0102-0007: after the forced checkpoint, patch pg_control on disk
 	// with the checkpoint REDO location so the resulting backup's
 	// global/pg_control carries a valid checkpoint — PostgreSQL
 	// standbys reject pg_control with a zero redo point.
-	// Use the checkpointer's stored REDO LSN (start of the checkpoint
-	// record) for pg_control and backup_label.
-	// goopg uses 1-based LSNs; PG expects 0-based — subtract 1.
-	redoLSN := startLSN
-	if s.cfg.Checkpointer != nil {
-		if r := s.cfg.Checkpointer.CheckpointRedoLSN(); r > 0 {
-			redoLSN = r
-		}
-	}
-	// 0-based redo LSN for PG-facing artefacts (pg_control, backup_label).
-	// Result sets continue to use startLSN (WrittenLSN, 1-based) — that is
-	// the WAL-range bookend upstream pg_basebackup expects for START_REPLICATION.
 	baseLSN0 := uint64(0)
 	if redoLSN > 0 {
 		baseLSN0 = redoLSN - 1
