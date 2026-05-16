@@ -176,6 +176,14 @@ func Init(opts Options) error {
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
+	// M0105-0007: create zero-filled placeholder pages in SLRU
+	// directories so pg_basebackup includes them in the backup.
+	// pg_basebackup skips empty directories; PG standby startup
+	// requires pg_subtrans/, pg_multixact/members/,
+	// pg_multixact/offsets/ to exist.
+	if err := bootstrapSLRUPlaceholders(abs); err != nil {
+		return fmt.Errorf("goopg init: slru placeholders: %w", err)
+	}
 	// Generate and persist the cluster system identifier (M0101-0001).
 	// Used as xlp_sysid in PG-compatible WAL page headers.
 	sysID, err := LoadOrCreateSystemID(abs)
@@ -187,6 +195,29 @@ func Init(opts Options) error {
 	// (M0095-0001).
 	if err := writePgControl(abs, sysID); err != nil {
 		return fmt.Errorf("goopg init: pg_control: %w", err)
+	}
+	return nil
+}
+
+// bootstrapSLRUPlaceholders writes zero-filled 8 KiB placeholder pages
+// into pg_subtrans/ and pg_multixact/ sub-directories so pg_basebackup
+// includes them in the backup. pg_basebackup skips empty directories;
+// PG standby startup requires these directories to exist (StartupSUBTRANS,
+// StartupMultiXact).
+//
+// Mirrors PostgreSQL's SLRU behaviour: a freshly-initialised page is a
+// single BLCKSZ-length blob of zero bytes.
+func bootstrapSLRUPlaceholders(dataDir string) error {
+	zeroPage := make([]byte, storage.BlockSize)
+	for _, relPath := range []string{
+		"pg_subtrans/0000",
+		"pg_multixact/members/0000",
+		"pg_multixact/offsets/0000",
+	} {
+		path := filepath.Join(dataDir, relPath)
+		if err := os.WriteFile(path, zeroPage, 0o600); err != nil {
+			return err
+		}
 	}
 	return nil
 }

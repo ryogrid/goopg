@@ -218,51 +218,16 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 88 {
 		return RmgrXLog, xlogCheckpointOnline, 0
 	}
-	kind := payload[0]
-	switch kind {
-	case RecordKindPageImage:
-		return RmgrXLog, xlogInfoDefault, 0
-	case RecordKindCheckpoint:
-		// Legacy 1-byte format: use xlogInfoDefault so PG
-		// skips it during recovery. Only the 88-byte
-		// CheckPoint format (handled above) signals
-		// XLOG_CHECKPOINT_ONLINE to PG.
-		return RmgrXLog, xlogInfoDefault, 0
-	case RecordKindHeapInsert:
-		return RmgrHeap, xlogInfoDefault, 0
-	case RecordKindHeapDelete:
-		_, _, _, xmax, _, err := DecodeHeapDelete(payload)
-		if err == nil {
-			return RmgrHeap, xlogInfoDelete, uint32(xmax)
-		}
-		return RmgrHeap, xlogInfoDelete, 0
-	case RecordKindHeapLock:
-		_, _, _, xmax, _, err := DecodeHeapLock(payload)
-		if err == nil {
-			return RmgrHeap, xlogInfoLock, uint32(xmax)
-		}
-		return RmgrHeap, xlogInfoLock, 0
-	case RecordKindHeapVacuum:
-		return RmgrHeap2, xlogInfoVacuum, 0
-	case RecordKindBtreeInsert:
-		return RmgrBtree, xlogInfoDefault, 0
-	case RecordKindBtreeSplit:
-		return RmgrBtree, xlogInfoSplit, 0
-	case RecordKindXactCommit:
-		xid, err := DecodeXactMarker(payload)
-		if err == nil {
-			return RmgrXact, xlogInfoDefault, uint32(xid)
-		}
-		return RmgrXact, xlogInfoDefault, 0
-	case RecordKindXactAbort:
-		xid, err := DecodeXactMarker(payload)
-		if err == nil {
-			return RmgrXact, xlogInfoAbort, uint32(xid)
-		}
-		return RmgrXact, xlogInfoAbort, 0
-	default:
-		return RmgrXLog, xlogInfoDefault, 0
-	}
+	// M0105-0007: route ALL goopg-internal records through RmgrXLog
+	// with an unknown info byte (0xF0) so PG's xlog_redo safely skips
+	// them during recovery. PG's resource-manager dispatch only
+	// recognizes RmgrXLog with known info values; unknown values fall
+	// through without action. Previously records used RmgrHeap /
+	// RmgrBtree / RmgrXact which caused PG to attempt decoding the
+	// goopg-internal payload as a PG record, resulting in a segfault.
+	// Goopg's own recovery is unaffected — it reads the payload data
+	// directly and dispatches on the record-kind byte.
+	return RmgrXLog, xlogInfoDefault, 0
 }
 
 // encodeRecordXLog returns the on-disk XLogRecord stream
