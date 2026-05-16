@@ -117,8 +117,16 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 	// after the first WAL record (the checkpoint) has been replayed.
 	le.PutUint64(body[136:], 1)
 	le.PutUint32(body[144:], 1) // minRecoveryPointTLI
-
-	// Recompose CRC over bytes [0, pgControlCRCOffset)
+	// backupEndPoint → redo LSN. read_backup_label sets
+	// backupEndRequired=true, which blocks reachedConsistency in
+	// CheckRecoveryConsistency. PG clears backupEndRequired only via
+	// ReachedEndOfBackup(), which requires backupEndPoint (non-zero)
+	// <= lastReplayedEndRecPtr. Set to the REDO LSN so the condition
+	// is satisfied immediately after checkpoint replay.
+	le.PutUint64(body[160:], lsn0)
+	// backupEndRequired → false. Even if the control file has this as
+	// true, read_backup_label overrides it. Left as false (zero) so
+	// the initial state is clean. We clear it via backupEndPoint above.
 	crc := crc32.Checksum(body[:pgControlCRCOffset], crcCastagnoliTable)
 	le.PutUint32(body[pgControlCRCOffset:], crc)
 

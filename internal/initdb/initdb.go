@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -123,6 +124,7 @@ func SampleFiles() []FileSpec {
 		{Path: "postgresql.conf", Build: defaultPostgresqlConf, Mode: 0o600},
 		{Path: "pg_hba.conf", Build: defaultPgHBAConf, Mode: 0o600},
 		{Path: "pg_ident.conf", Build: defaultPgIdentConf, Mode: 0o600},
+		{Path: "global/pg_filenode.map", Build: defaultRelMapFile, Mode: 0o600},
 	}
 }
 
@@ -174,6 +176,16 @@ func Init(opts Options) error {
 	if err := bootstrapSystemCatalogs(abs); err != nil {
 		return fmt.Errorf("goopg init: system catalogs: %w", err)
 	}
+	// M0105: create empty placeholder relfiles for PG shared catalogs.
+	// PG backends open these files during startup (e.g. pg_authid,
+	// pg_database). Without them, PG FATALs with "could not open file".
+	if err := bootstrapSharedCatalogPlaceholders(abs); err != nil {
+		return fmt.Errorf("goopg init: shared catalog placeholders: %w", err)
+	}
+	// Overwrite pg_authid placeholder with a minimal "postgres" superuser row.
+	if err := bootstrapPostgresRole(abs); err != nil {
+		return fmt.Errorf("goopg init: postgres role: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -221,6 +233,86 @@ func bootstrapSLRUPlaceholders(dataDir string) error {
 		}
 	}
 	return nil
+}
+
+// bootstrapSharedCatalogPlaceholders creates empty 8 KiB pages for PG
+// shared system catalogs under `global/`. PG backends open these relfiles
+// during startup (via the relation map) before the catalogs are fully
+// bootstrapped. Without the files, PG FATALs with "could not open file".
+func bootstrapSharedCatalogPlaceholders(dataDir string) error {
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	sharedOIDs := []uint32{
+		1260, // pg_authid
+		1261, // pg_auth_members
+		1262, // pg_database
+		1213, // pg_tablespace
+		1214, // pg_shdepend
+		3592, // pg_shdescription
+		6000, // pg_replication_origin
+		6100, // pg_subscription
+		6243, // pg_parameter_acl
+	}
+	for _, oid := range sharedOIDs {
+		path := filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10))
+		if err := os.WriteFile(path, page, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// bootstrapPostgresRole writes a minimal pg_authid tuple for the
+// "postgres" superuser so PG standby accepts connections. The tuple
+// uses PG's native heap-tuple encoding (not goopg's internal format).
+func bootstrapPostgresRole(dataDir string) error {
+	// pg_authid columns in PG native format:
+	//   oid (Oid, 4) | rolname (NameData, 64) | rolsuper (bool, 1) | ...
+	// We write a minimal tuple with just the role name and superuser flag.
+	// Offsets verified against postgres/src/include/catalog/pg_authid.h.
+	payload := make([]byte, 80)
+	// rolname at offset 0: set to "postgres\0"
+	copy(payload[0:9], "postgres\x00")
+	// rolsuper at offset 64 (after NameData): set to true
+	payload[64] = 1
+	// rolcreaterole at offset 65: set to true
+	payload[65] = 1
+	// rolinherit at offset 66: set to true
+	payload[66] = 1
+	// rolcanlogin at offset 67: set to true
+	payload[67] = 1
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	tuple := storage.NewHeapTuple(
+		storage.TransactionID(1),            // bootstrap xmin
+		storage.InvalidTransactionID,         // xmax
+		payload,
+	)
+	if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+		return err
+	}
+	// Also add a role matching the OS user ($USER) so psql connects
+	// without needing -U.
+	osUser := os.Getenv("USER")
+	if osUser != "" && osUser != "postgres" {
+		payload2 := make([]byte, 80)
+		copy(payload2[0:], osUser+"\x00")
+		payload2[64] = 1 // rolsuper
+		payload2[65] = 1 // rolcreaterole
+		payload2[66] = 1 // rolinherit
+		payload2[67] = 1 // rolcanlogin
+		tuple2 := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload2)
+		if _, err := storage.PageAddHeapTuple(page, tuple2); err != nil {
+			return err
+		}
+	}
+	path := filepath.Join(dataDir, "global", "1260") // pg_authid OID
+	return os.WriteFile(path, page, 0o600)
 }
 
 // bootstrapCLog creates the initial commit log at <dataDir>/global/pg_xact and
@@ -343,6 +435,49 @@ func defaultPostgresqlConf() []byte {
 #DateStyle = 'ISO, MDY'
 #TimeZone = 'UTC'
 `)
+}
+
+func defaultRelMapFile() []byte {
+	// RelMapFile layout (PG src/backend/utils/cache/relmapper.c):
+	//   int32 magic (4 bytes) = RELMAPPER_FILEMAGIC (0x592717)
+	//   int32 num_mappings (4 bytes)
+	//   RelMapping mappings[64] (512 bytes, 8 bytes each: Oid + RelFileNumber)
+	//   pg_crc32c crc (4 bytes) at offset 520
+	//
+	// PG requires mappings for shared system catalogs accessed before
+	// pg_class is available. We include pg_database (1262) and
+	// pg_authid (1260) with standard filenumbers matching their OIDs.
+	const (
+		relFileSize   = 524
+		relMagic      = 0x592717
+		relCRCCOffset = 520
+	)
+	out := make([]byte, relFileSize)
+	binary.LittleEndian.PutUint32(out[0:4], relMagic)
+
+	// Shared-catalog entries (PG BKI_SHARED_RELATION catalogs).
+	// PG backends look up these OIDs via RelationMapOidToFilenumber
+	// before pg_class is available. All use same filenumber = OID.
+	mappings := [][2]uint32{
+		{1262, 1262}, // pg_database
+		{1260, 1260}, // pg_authid
+		{1261, 1261}, // pg_auth_members
+		{1213, 1213}, // pg_tablespace
+		{1214, 1214}, // pg_shdepend
+		{3592, 3592}, // pg_shdescription
+		{6000, 6000}, // pg_replication_origin
+		{6100, 6100}, // pg_subscription
+		{6243, 6243}, // pg_parameter_acl
+	}
+	binary.LittleEndian.PutUint32(out[4:8], uint32(len(mappings)))
+	for i, m := range mappings {
+		off := 8 + i*8
+		binary.LittleEndian.PutUint32(out[off:off+4], m[0])
+		binary.LittleEndian.PutUint32(out[off+4:off+8], m[1])
+	}
+	crc := crc32.Checksum(out[:relCRCCOffset], crcCastagnoliTable)
+	binary.LittleEndian.PutUint32(out[relCRCCOffset:], crc)
+	return out
 }
 
 func defaultPgIdentConf() []byte {
