@@ -518,6 +518,27 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	if err := os.WriteFile(filepath.Join(dbDir, "pg_filenode.map"), localRelMap, 0o600); err != nil {
 		return err
 	}
+	// Critical index placeholder pages — PG backends PANIC if these
+	// files don't exist (load_critical_index in relcache.c).
+	btreePage := makeBtreeRootPage()
+	for _, oid := range []uint32{
+		// Local critical indexes
+		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680, 2682,
+		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2704, 3085, 3164,
+	} {
+		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+			return err
+		}
+	}
+	// Shared critical indexes (under global/)
+	for _, oid := range []uint32{
+		2671, 2672, 2676, 2677, 2695, 3593,
+	} {
+		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+			return err
+		}
+	}
 	path := filepath.Join(dataDir, "global", "1262") // pg_database OID
 	return os.WriteFile(path, page, 0o600)
 }
