@@ -3060,6 +3060,21 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         enabling PM_HOT_STANDBY and allowing pg_ctl -w to succeed.
       - File: `internal/wal/format.go`
 
+- [ ] **M0105-0010**
+      - Summary: Encode tuple data in PG-native physical format on disk.
+      - PG standby reaches PM_HOT_STANDBY and accepts connections, but
+        authentication fails because pg_authid rows use goopg's internal
+        encoding (per-column flag byte), which PG can't decode. Fix:
+        change EncodeRow to produce PG-native physical tuple format
+        (null bitmap, aligned fixed-length columns, varlena headers).
+        The decoder already supports both formats; only the encoder
+        needs to change. Catalog bootstrap functions (EncodePGTypeRow
+        etc.) must also produce PG-compatible data.
+        - Verify all tests pass (`go test ./...`)
+        - Verify E2E test progresses past authentication
+      - Files: `internal/executor/codec.go`, `internal/catalog/codec.go`,
+        `internal/initdb/initdb.go`
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).

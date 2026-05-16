@@ -54,6 +54,158 @@ func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
 	return out, nil
 }
 
+// EncodeRowPG encodes a row in PG-native physical tuple format
+// (M0105-0010). Used for catalog pages that PG must read directly,
+// such as pg_authid. The format mirrors PostgreSQL's heap tuple
+// layout: null bitmap + aligned per-type values in little-endian.
+//
+// Most goopg code should continue using EncodeRow (goopg-internal
+// format) for backward compatibility.
+func EncodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
+	if len(cols) != len(row) {
+		return nil, fmt.Errorf("EncodeRowPG: %d cols vs %d datums", len(cols), len(row))
+	}
+	return encodeRowPG(cols, row)
+}
+
+// encodeRowPG encodes a row in PG-native physical tuple format.
+func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
+	numCols := len(cols)
+	nullBitmapLen := (numCols + 7) / 8
+	nullBitmap := make([]byte, nullBitmapLen)
+	for i, d := range row {
+		if d.IsNull() {
+			nullBitmap[i/8] |= 1 << (i % 8)
+		}
+	}
+	out := make([]byte, 0, 256)
+	out = append(out, nullBitmap...)
+	off := nullBitmapLen
+	for i, c := range cols {
+		d := row[i]
+		if d.IsNull() {
+			continue
+		}
+		if d.Kind == KindToastPointer {
+			// TOAST pointer: 12 bytes at current offset.
+			off = alignPhysicalPGOffset(off, 4)
+			for len(out) < off+12 {
+				out = append(out, 0)
+			}
+			copy(out[off:off+12], d.BytesValue())
+			off += 12
+			continue
+		}
+		align := physicalPGTypeAlign(c.Type)
+		off = alignPhysicalPGOffset(off, align)
+		buf, err := encodeValuePG(c.Type, d)
+		if err != nil {
+			return nil, err
+		}
+		// Grow output to fit aligned offset + value.
+		for len(out) < off+len(buf) {
+			out = append(out, 0)
+		}
+		copy(out[off:off+len(buf)], buf)
+		off += len(buf)
+	}
+	return out, nil
+}
+
+// encodeValuePG encodes a single datum in PG-native format.
+func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean":
+		if d.Kind != KindBool {
+			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
+		}
+		if d.BoolValue() {
+			return []byte{1}, nil
+		}
+		return []byte{0}, nil
+	case "int2", "smallint":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		v := int16(d.Int)
+		var buf [2]byte
+		binary.LittleEndian.PutUint16(buf[:], uint16(v))
+		return buf[:], nil
+	case "int4", "integer", "int", "serial":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		v := int32(d.Int)
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], uint32(v))
+		return buf[:], nil
+	case "int8", "bigint", "bigserial":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(d.Int))
+		return buf[:], nil
+	case "oid":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], uint32(d.Int))
+		return buf[:], nil
+	case "timestamp", "timestamptz":
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		t := d.TimeValue()
+		// PG epoch: 2000-01-01 UTC, in microseconds
+		// goopg stores UnixNano internally; we encode PG-compatible
+		// microseconds since PG epoch.
+		micros := t.UnixMicro() - pgEpochUnixMicros
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(micros))
+		return buf[:], nil
+	case "date":
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		// PG date: days since 2000-01-01 (Julian-style)
+		t := d.TimeValue()
+		micros := t.UnixMicro() - pgEpochUnixMicros
+		days := int32(micros / (24 * 3600 * 1000000))
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], uint32(days))
+		return buf[:], nil
+	case "name":
+		// PG NameData: fixed 64 bytes, '\0' padded
+		s := d.StringValue()
+		buf := make([]byte, 64)
+		copy(buf, s)
+		return buf, nil
+	default:
+		// text, varchar, char, bpchar, unknown, numeric, etc.
+		// Use PG varlena format: 1-byte header for short strings,
+		// 4-byte header for longer ones.
+		s := d.StringValue()
+		if len(s) < 128 {
+			// 1-byte header: total = (len << 1) | 1
+			buf := make([]byte, 1+len(s))
+			buf[0] = byte(len(s)<<1) | 1
+			copy(buf[1:], s)
+			return buf, nil
+		}
+		// 4-byte header: total = (len << 2) (no flags set)
+		buf := make([]byte, 4+len(s))
+		binary.BigEndian.PutUint32(buf[0:4], uint32(len(s))<<2)
+		copy(buf[4:], s)
+		return buf, nil
+	}
+}
+
+// pgEpochUnixMicros is 2000-01-01 UTC in Unix microseconds (used by
+// the PG timestamp encoding).
+var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
+
 // DecodeRow inverts EncodeRow.
 func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 	row := make(Row, len(cols))
@@ -255,6 +407,8 @@ func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Aren
 }
 
 func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+	// Try goopg legacy format first (backward compatible).
+	// Fall back to PG-native physical format for M0105-0010 encoded data.
 	if err := decodeGoopgRowIntoArena(dst, cols, data, arena); err == nil {
 		return nil
 	} else if err := decodePhysicalPGRowIntoArena(dst, cols, data, arena); err == nil {

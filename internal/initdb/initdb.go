@@ -26,8 +26,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -268,45 +270,63 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 // "postgres" superuser so PG standby accepts connections. The tuple
 // uses PG's native heap-tuple encoding (not goopg's internal format).
 func bootstrapPostgresRole(dataDir string) error {
-	// pg_authid columns in PG native format:
-	//   oid (Oid, 4) | rolname (NameData, 64) | rolsuper (bool, 1) | ...
-	// We write a minimal tuple with just the role name and superuser flag.
-	// Offsets verified against postgres/src/include/catalog/pg_authid.h.
-	payload := make([]byte, 80)
-	// rolname at offset 0: set to "postgres\0"
-	copy(payload[0:9], "postgres\x00")
-	// rolsuper at offset 64 (after NameData): set to true
-	payload[64] = 1
-	// rolcreaterole at offset 65: set to true
-	payload[65] = 1
-	// rolinherit at offset 66: set to true
-	payload[66] = 1
-	// rolcanlogin at offset 67: set to true
-	payload[67] = 1
+	// pg_authid columns (postgres/src/include/catalog/pg_authid.h)
+	cols := []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+		{Name: "rolname", Type: catalog.Type{Name: "name"}, Ordinal: 1},
+		{Name: "rolsuper", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
+		{Name: "rolinherit", Type: catalog.Type{Name: "bool"}, Ordinal: 3},
+		{Name: "rolcreaterole", Type: catalog.Type{Name: "bool"}, Ordinal: 4},
+		{Name: "rolcreatedb", Type: catalog.Type{Name: "bool"}, Ordinal: 5},
+		{Name: "rolcanlogin", Type: catalog.Type{Name: "bool"}, Ordinal: 6},
+		{Name: "rolreplication", Type: catalog.Type{Name: "bool"}, Ordinal: 7},
+		{Name: "rolbypassrls", Type: catalog.Type{Name: "bool"}, Ordinal: 8},
+		{Name: "rolconnlimit", Type: catalog.Type{Name: "int4"}, Ordinal: 9},
+		{Name: "rolpassword", Type: catalog.Type{Name: "text"}, Ordinal: 10},
+		{Name: "rolvaliduntil", Type: catalog.Type{Name: "timestamptz"}, Ordinal: 11},
+	}
+	buildRow := func(rolname string) executor.Row {
+		return executor.Row{
+			executor.NewIntDatum(10),          // oid (bootstrap superuser)
+			executor.NewStringDatum(rolname),  // rolname
+			executor.NewBoolDatum(true),       // rolsuper
+			executor.NewBoolDatum(true),       // rolinherit
+			executor.NewBoolDatum(true),       // rolcreaterole
+			executor.NewBoolDatum(false),      // rolcreatedb
+			executor.NewBoolDatum(true),       // rolcanlogin
+			executor.NewBoolDatum(true),       // rolreplication
+			executor.NewBoolDatum(true),       // rolbypassrls
+			executor.NewIntDatum(-1),          // rolconnlimit
+			executor.NewStringDatum(""),       // rolpassword (empty, not null)
+			executor.NewTimeDatum(time.Unix(0, 0).UTC()), // rolvaliduntil (epoch, not null)
+		}
+	}
 
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
 		return err
 	}
-	tuple := storage.NewHeapTuple(
-		storage.TransactionID(1),            // bootstrap xmin
-		storage.InvalidTransactionID,         // xmax
-		payload,
-	)
+	// Add "postgres" role.
+	row := buildRow("postgres")
+	payload, err := executor.EncodeRowPG(cols, row)
+	if err != nil {
+		return fmt.Errorf("encode postgres role: %w", err)
+	}
+	tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+	tuple.Header.SetNatts(len(cols))
 	if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
 		return err
 	}
-	// Also add a role matching the OS user ($USER) so psql connects
-	// without needing -U.
+	// Add OS user role.
 	osUser := os.Getenv("USER")
 	if osUser != "" && osUser != "postgres" {
-		payload2 := make([]byte, 80)
-		copy(payload2[0:], osUser+"\x00")
-		payload2[64] = 1 // rolsuper
-		payload2[65] = 1 // rolcreaterole
-		payload2[66] = 1 // rolinherit
-		payload2[67] = 1 // rolcanlogin
+		row2 := buildRow(osUser)
+		payload2, err := executor.EncodeRowPG(cols, row2)
+		if err != nil {
+			return fmt.Errorf("encode %s role: %w", osUser, err)
+		}
 		tuple2 := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload2)
+		tuple2.Header.SetNatts(len(cols))
 		if _, err := storage.PageAddHeapTuple(page, tuple2); err != nil {
 			return err
 		}

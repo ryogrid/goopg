@@ -87,6 +87,16 @@ const (
 	// inserted as the successor in a HOT update chain and has no direct
 	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000).
 	HeapOnlyTuple uint16 = 0x8000
+
+	// HEAP_HASNULL indicates the tuple contains NULL values (null bitmap
+	// present in t_hoff). Mirrors PG's HEAP_HASNULL (0x0001).
+	HeapHasNull uint16 = 0x0001
+	// HEAP_HASVARWIDTH indicates the tuple has variable-width columns.
+	// Mirrors PG's HEAP_HASVARWIDTH (0x0002).
+	HeapHasVarWidth uint16 = 0x0002
+	// HEAP_NATTS_MASK is the bit mask for number of attributes in
+	// t_infomask2 (bits 0-10). Mirrors PG's HEAP_NATTS_MASK (0x07FF).
+	HeapNattsMask uint16 = 0x07FF
 )
 
 // IsHeapTupleLockOnly reports whether `infomask` indicates the
@@ -139,6 +149,13 @@ type HeapTuple struct {
 }
 
 // NewHeapTuple constructs a tuple with v0 defaults.
+// SetNatts sets t_infomask2 to the given number of attributes,
+// mirroring PG's HeapTupleHeaderSetNatts. Caller must also set
+// HeapHasNull in infomask if the null bitmap is present.
+func (h *HeapTupleHeader) SetNatts(natts int) {
+	h.Infomask2 = (h.Infomask2 &^ HeapNattsMask) | (uint16(natts) & HeapNattsMask)
+}
+
 func NewHeapTuple(xmin, xmax TransactionID, data []byte) HeapTuple {
 	out := make([]byte, len(data))
 	copy(out, data)
