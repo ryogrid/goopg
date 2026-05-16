@@ -117,6 +117,15 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if err := standby.Start(); err != nil {
 		t.Fatalf("standby.Start: %v", err)
 	}
+	// M0105: immediately insert a bootstrap row so the goopg primary
+	// generates new WAL. Without this the standby's startup process is
+	// stuck at end-of-WAL with no new records to replay, so
+	// CheckRecoveryConsistency never advances reachedConsistency.
+	if err := runSQLSimple(t, primary,
+		"INSERT INTO public.bench_log (client, src) VALUES (-999, 'bootstrap')"); err != nil {
+		t.Fatalf("bootstrap insert on goopg primary: %v", err)
+	}
+
 	readyCtx, readyCancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer readyCancel()
 	if err := standby.WaitReady(readyCtx, 90*time.Second); err != nil {
@@ -124,11 +133,6 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	}
 
 	waitForPhysicalStreamingGoopgToPG(t, primary, standby, slotName, mode.exact, 45*time.Second)
-
-	if err := runSQLSimple(t, primary,
-		"INSERT INTO public.bench_log (client, src) VALUES (-999, 'bootstrap')"); err != nil {
-		t.Fatalf("bootstrap insert on goopg primary: %v", err)
-	}
 	waitForPGCount(t, standby,
 		"SELECT count(*) FROM public.bench_log WHERE client = -999",
 		1, 30*time.Second)
