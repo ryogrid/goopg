@@ -510,8 +510,16 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		select {
 		case <-streamCtx.Done():
 			<-receiveDone
+			// M0105-0007: properly terminate the CopyBoth stream
+			// so pg_basebackup transitions back to command mode.
+			_ = w.WriteCopyDone()
+			_ = w.WriteCommandComplete("START_REPLICATION")
+			_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
 			return nil
 		case <-receiveDone:
+			_ = w.WriteCopyDone()
+			_ = w.WriteCommandComplete("START_REPLICATION")
+			_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
 			return nil
 		case chunk := <-chunkCh:
 			frame := protocol.EncodeWALData(chunk.StartLSN, chunk.EndLSN, time.Now().UTC(), chunk.Payload)
@@ -549,6 +557,9 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		case err := <-recErrCh:
 			if errors.Is(err, context.Canceled) || errors.Is(err, wal.ErrClosed) {
 				<-receiveDone
+				_ = w.WriteCopyDone()
+				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
 				return nil
 			}
 			streamCancel()
