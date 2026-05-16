@@ -122,6 +122,7 @@ func SampleFiles() []FileSpec {
 		{Path: "PG_VERSION", Build: func() []byte { return []byte(CatalogVersion + "\n") }, Mode: 0o600},
 		{Path: "postgresql.conf", Build: defaultPostgresqlConf, Mode: 0o600},
 		{Path: "pg_hba.conf", Build: defaultPgHBAConf, Mode: 0o600},
+		{Path: "pg_ident.conf", Build: defaultPgIdentConf, Mode: 0o600},
 	}
 }
 
@@ -341,6 +342,14 @@ func defaultPostgresqlConf() []byte {
 # the startup ParameterStatus block.
 #DateStyle = 'ISO, MDY'
 #TimeZone = 'UTC'
+`)
+}
+
+func defaultPgIdentConf() []byte {
+	return []byte(`# PostgreSQL User Name Maps
+# This file maps system user names to PostgreSQL user names.
+# Format:
+#   MAPNAME  SYSTEM-USERNAME  PG-USERNAME
 `)
 }
 

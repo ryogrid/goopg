@@ -106,6 +106,10 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 	le.PutUint64(body[40:], lsn0)
 	// checkPointCopy.ThisTimeLineID → 1
 	le.PutUint32(body[48:], 1)
+	// checkPointCopy.PrevTimeLineID → 1 (match PG-generated backups)
+	le.PutUint32(body[52:], 1)
+	// checkPointCopy.fullPageWrites → on (1) at offset 56
+	body[56] = 1
 	// minRecoveryPoint → redoLSN (0-based); PG requires a non-zero
 	// value to enter archive recovery (StartupXLOG checks
 	// ControlFile->minRecoveryPoint != InvalidXLogRecPtr).
