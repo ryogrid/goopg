@@ -449,6 +449,21 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	if _, err := storage.PageAddHeapTuple(page, tuple2); err != nil {
 		return err
 	}
+	// Also create index placeholders in base/1/ (goopg's default
+	// database). PG's load_critical_index may hardcode dbNode=1
+	// for nailed relations.
+	base1Dir := filepath.Join(dataDir, "base", "1")
+	btreePage := makeBtreeRootPage()
+	for _, oid := range []uint32{
+		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680, 2682,
+		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2704, 3085, 3164,
+	} {
+		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+			return err
+		}
+	}
+
 	// Create the database directory with PG_VERSION and copies of
 	// the default database catalog files (from base/1/).
 	dbDir := filepath.Join(dataDir, "base", "5")
@@ -458,7 +473,6 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	if err := os.WriteFile(filepath.Join(dbDir, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
 		return err
 	}
-	base1Dir := filepath.Join(dataDir, "base", "1")
 	entries, _ := os.ReadDir(base1Dir)
 	for _, e := range entries {
 		src := filepath.Join(base1Dir, e.Name())
@@ -520,7 +534,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	}
 	// Critical index placeholder pages — PG backends PANIC if these
 	// files don't exist (load_critical_index in relcache.c).
-	btreePage := makeBtreeRootPage()
+	btreePage = makeBtreeRootPage()
 	for _, oid := range []uint32{
 		// Local critical indexes
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680, 2682,
@@ -531,9 +545,16 @@ func bootstrapPostgresDatabase(dataDir string) error {
 			return err
 		}
 	}
-	// Shared critical indexes (under global/)
+	// Shared critical indexes (under global/).
+	// Also write local indexes to global/ as fallback — PG's
+	// formrdesc may use InvalidOid for dbNode on nailed
+	// relations, causing lookups in global/ instead of base/<dboid>/.
 	for _, oid := range []uint32{
 		2671, 2672, 2676, 2677, 2695, 3593,
+		// Also copy all local critical indexes to global/
+		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680, 2682,
+		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2704, 3085, 3164,
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
