@@ -202,6 +202,11 @@ func Init(opts Options) error {
 	if err := bootstrapSLRUPlaceholders(abs); err != nil {
 		return fmt.Errorf("goopg init: slru placeholders: %w", err)
 	}
+	// M0106: generate PG-compatible relcache init files so PG backends
+	// can start from a goopg backup without PANIC on critical indexes.
+	if err := bootstrapRelcacheInitFiles(abs); err != nil {
+		return fmt.Errorf("goopg init: relcache init files: %w", err)
+	}
 	// Generate and persist the cluster system identifier (M0101-0001).
 	// Used as xlp_sysid in PG-compatible WAL page headers.
 	sysID, err := LoadOrCreateSystemID(abs)

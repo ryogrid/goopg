@@ -94,7 +94,6 @@ var baseBackupExcluded = map[string]struct{}{
 	"postmaster.pid":   {},
 	".goopg.ctl.sock":  {},
 	"postmaster.opts":  {},
-	"pg_internal.init": {},
 }
 
 // replyBaseBackup is the top-level handler invoked from
