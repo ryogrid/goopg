@@ -3035,6 +3035,17 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         this, the E2E async test times out at 15 minutes.
       - File: `internal/server/replication.go`, `internal/wal/`
 
+- [ ] **M0105-0008**
+      - Summary: Complete goopg→PG E2E failover test run.
+      - After M0105-0007 WAL sender fix, run `TestE2E_FailoverGoopgToPG`
+        through to completion:
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run TestE2E_FailoverGoopgToPG -timeout 15m ./internal/testport/`
+        Both `async` and `sync_remote_apply` subtests must pass:
+        pg_basebackup completes, PG standby starts, WAL streams, data
+        replicates, SIGKILL + promote works, post-failover INSERT succeeds,
+        zero-loss invariant holds for sync mode.
+      - Depends on: M0105-0007
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
