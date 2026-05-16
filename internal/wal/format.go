@@ -23,12 +23,16 @@ const (
 )
 
 const (
-	xlogInfoDefault uint8 = 0xF0
-	xlogInfoDelete  uint8 = 0x10
-	xlogInfoSplit   uint8 = 0x20
-	xlogInfoAbort   uint8 = 0x20
-	xlogInfoVacuum  uint8 = 0x10
-	xlogInfoLock    uint8 = 0x20
+	xlogInfoDefault  uint8 = 0xF0
+	xlogInfoDelete   uint8 = 0x10
+	xlogInfoSplit    uint8 = 0x20
+	xlogInfoAbort    uint8 = 0x20
+	xlogInfoVacuum   uint8 = 0x10
+	xlogInfoLock     uint8 = 0x20
+	// M0102-0007: PG-compatible xl_info values for checkpoint
+	// records so a PG standby can recognise them during recovery.
+	xlogCheckpointOnline   uint8 = 0x10 // XLOG_CHECKPOINT_ONLINE
+	xlogCheckpointShutdown uint8 = 0x00 // XLOG_CHECKPOINT_SHUTDOWN
 )
 
 var (
@@ -207,9 +211,22 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
 	}
+	// M0102-0007: PG-compatible checkpoint record (88-byte CheckPoint struct).
+	// Goopg's record-kind byte (0x02=RecordKindCheckpoint) would map to an
+	// implausible redo LSN (<256 bytes), so this path takes priority over the
+	// legacy kind-byte dispatch.
+	if len(payload) == 88 {
+		return RmgrXLog, xlogCheckpointOnline, 0
+	}
 	kind := payload[0]
 	switch kind {
-	case RecordKindPageImage, RecordKindCheckpoint:
+	case RecordKindPageImage:
+		return RmgrXLog, xlogInfoDefault, 0
+	case RecordKindCheckpoint:
+		// Legacy 1-byte format: use xlogInfoDefault so PG
+		// skips it during recovery. Only the 88-byte
+		// CheckPoint format (handled above) signals
+		// XLOG_CHECKPOINT_ONLINE to PG.
 		return RmgrXLog, xlogInfoDefault, 0
 	case RecordKindHeapInsert:
 		return RmgrHeap, xlogInfoDefault, 0

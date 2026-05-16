@@ -92,6 +92,9 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 	le.PutUint64(body[32:], lsn0)
 	// checkPointCopy.redo (offset 40, first 8 bytes of CheckPoint)
 	le.PutUint64(body[40:], lsn0)
+	// checkPointCopy.ThisTimeLineID (offset 48, TimeLineID): PG
+	// compares this against WAL page header xlp_tli; must be non-zero.
+	le.PutUint32(body[48:], 1)
 
 	// Recompose CRC over bytes [0, pgControlCRCOffset)
 	crc := crc32.Checksum(body[:pgControlCRCOffset], crcCastagnoliTable)

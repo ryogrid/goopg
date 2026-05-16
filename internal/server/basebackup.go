@@ -140,16 +140,12 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 			redoLSN = r
 		}
 	}
-	// DEBUG M0102-0007
-	if s.cfg.Logger != nil {
-		s.cfg.Logger.Info("BASE_BACKUP redoLSN debug", "startLSN", startLSN, "checkpointerRedoLSN", func() uint64 {
-			if s.cfg.Checkpointer != nil {
-				return s.cfg.Checkpointer.CheckpointRedoLSN()
-			}
-			return 0
-		}(), "finalRedoLSN", redoLSN)
-	}
+	// 0-based redo LSN for PG-facing artefacts (pg_control, backup_label).
+	// Result sets continue to use startLSN (WrittenLSN, 1-based) — that is
+	// the WAL-range bookend upstream pg_basebackup expects for START_REPLICATION.
+	baseLSN0 := uint64(0)
 	if redoLSN > 0 {
+		baseLSN0 = redoLSN - 1
 		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, redoLSN)
 	}
 	startTLI, err := initdb.LoadOrCreateTimelineID(s.cfg.DataDir)
@@ -190,7 +186,7 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		nextProgressMark: baseBackupProgressInterval,
 		ctx:              ctx,
 	}
-	if err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, startLSN, startTLI, segSize); err != nil {
+	if err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, startTLI, segSize); err != nil {
 		return s.writeStreamingError(w, sqlstate.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
 	}
@@ -376,16 +372,15 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 			pgControlPath = path
 			return nil
 		}
-		entries = append(entries, entry{abs: path, rel: rel, info: info, isFile: !info.IsDir()})
-		// M0102-0007: also emit a PG-compatible WAL filename when the
-		// source file is a goopg-format WAL segment in pg_wal/.
-		// goopg names WAL as %024X (timeline 0); PG expects
-		// %08X%08X%08X (tli+log+seg).  Produce both so the PG
-		// standby finds a file matching its timeline.
-		if segno, ok := parseGoopgWalName(filepath.Base(rel)); ok && filepath.Dir(rel) == "pg_wal" {
-			pgName := wal.XLogFileName(tli, segno, segSize)
-			entries = append(entries, entry{abs: path, rel: filepath.Join("pg_wal", pgName), info: info, isFile: true})
+		// M0102-0007: exclude goopg slot directory tree (JSON
+		// format) from the backup — PG expects binary state files
+		// with a magic number and panics on parse or missing files.
+		// We emit an empty pg_replslot/ directory later so PG
+		// doesn't complain about a missing directory.
+		if rel == "pg_replslot" || strings.HasPrefix(rel, "pg_replslot/") {
+			return filepath.SkipDir
 		}
+		entries = append(entries, entry{abs: path, rel: rel, info: info, isFile: !info.IsDir()})
 		return nil
 	})
 	if err != nil {
@@ -411,7 +406,14 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 		}
 	}
 
-	// 3. pg_control last (upstream invariant for atomic recovery).
+	// 3. Synthetic empty pg_replslot/ — PG requires this directory
+	// to exist even if there are no local replication slots.
+	// goopg's slot files are JSON, excluded above (M0102-0007).
+	if err := writeTarDir(tw, "pg_replslot/", time.Now(), 0o700); err != nil {
+		return err
+	}
+
+	// 4. pg_control last (upstream invariant for atomic recovery).
 	if pgControlPath != "" {
 		data, err := os.ReadFile(pgControlPath)
 		if err != nil {

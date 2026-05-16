@@ -76,6 +76,10 @@ type CheckpointerConfig struct {
 	// always run at IMMEDIATE speed and ignore this knob.
 	CompletionTarget float64
 	Logger           *slog.Logger
+	// SegmentSize is the WAL segment size (default 16 MiB). Only used
+	// by EncodeCheckpointCompat to compute the correct first-page
+	// header size when encoding a PG-compatible checkpoint record.
+	SegmentSize int64
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -319,7 +323,26 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		}
 	}
 	c.writeTimeMs.Add(uint64(time.Since(flushStart).Milliseconds()))
-	startLSN, endLSN, err := c.wal.Append(EncodeCheckpoint())
+	// M0102-0007: pre-compute the 0-based redo LSN so the
+	// PG-compatible checkpoint record carries the correct
+	// checkPoint.redo — PG's xlogreader validates it.
+	pos := int64(uint64(0))
+	if vr, ok := c.wal.(volumeReporter); ok {
+		pos = int64(vr.WrittenLSN())
+	}
+	segSize := c.cfg.SegmentSize
+	if segSize <= 0 {
+		segSize = DefaultSegmentSize
+	}
+	leading := 0
+	if pos%XLOGBlockSize == 0 {
+		leading = SizeOfXLogShortPHD
+		if segSize > 0 && pos%segSize == 0 {
+			leading = SizeOfXLogLongPHD
+		}
+	}
+	redoLSN0 := uint64(pos + int64(leading))
+	startLSN, endLSN, err := c.wal.Append(EncodeCheckpointCompat(redoLSN0, 1))
 	if err != nil {
 		return fmt.Errorf("append checkpoint marker: %w", err)
 	}

@@ -762,7 +762,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	walSubscribers := wal.NewSubscribers()
 	syncRep := wal.NewSyncRep()
 
-	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{})
+	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
+		SegmentSize: walCfg.SegmentSize,
+	})
 
 	// Surface the M0002 checkpointer counters as the
 	// pg_stat_checkpointer virtual table so operators can observe

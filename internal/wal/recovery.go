@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/storage"
@@ -753,6 +754,60 @@ type ReplayStats struct {
 // EncodeCheckpoint encodes a checkpoint marker record payload.
 func EncodeCheckpoint() []byte {
 	return []byte{RecordKindCheckpoint}
+}
+
+// EncodeCheckpointCompat encodes a PG-compatible CheckPoint struct
+// for emission as an XLogRecord payload. The resulting record will be
+// classified as RmgrXLog + XLOG_CHECKPOINT_ONLINE so a PG standby can
+// recognise it during recovery (M0102-0007).
+//
+// redoLSN0 is the 0-based byte position of the first byte of the
+// checkpoint record in the WAL stream. It must match the record's
+// actual start position exactly — PG's xlogreader validates
+// checkPoint.redo against ReadRecPtr.
+func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
+	// Encode a minimal PG18 CheckPoint struct.
+	// Field layout (mirrors src/include/catalog/pg_control.h):
+	//   redo           XLogRecPtr  8  (offset 0)
+	//   ThisTimeLineID TimeLineID  4  (offset 8)
+	//   PrevTimeLineID TimeLineID  4  (offset 12)
+	//   fullPageWrites bool       1  (offset 16)
+	//   [pad]                     3  (offset 17)
+	//   wal_level      int        4  (offset 20)
+	//   nextXid        FullTxnId  8  (offset 24)
+	//   nextOid        Oid        4  (offset 32)
+	//   nextMulti      MultiXact  4  (offset 36)
+	//   nextMultiOff   MultiXOff  4  (offset 40)
+	//   oldestXid      TxnId      4  (offset 44)
+	//   oldestXidDB    Oid        4  (offset 48)
+	//   oldestMulti    MultiXact  4  (offset 52)
+	//   oldestMultiDB  Oid        4  (offset 56)
+	//   time           pg_time_t  8  (offset 60)
+	//   oldestCommitTsXid TxnId   4  (offset 68)
+	//   newestCommitTsXid TxnId   4  (offset 72)
+	//   oldestActiveXid TxnId     4  (offset 76)
+	// Total: 88 bytes (PG18 sizeof(CheckPoint); PG validates
+	// xl_tot_len >= SizeOfXLogRecord + sizeof(CheckPoint))
+	const checkPointSize = 88
+	payload := make([]byte, checkPointSize)
+	le := binary.LittleEndian
+	now := time.Now()
+
+	le.PutUint64(payload[0:8], redoLSN0)           // redo
+	le.PutUint32(payload[8:12], tli)               // ThisTimeLineID
+	le.PutUint32(payload[20:24], 1)                // wal_level (replica)
+	le.PutUint64(payload[24:32], 3)                // nextXid (>= FirstNormalTxnId)
+	le.PutUint32(payload[32:36], 16384)            // nextOid
+	le.PutUint32(payload[36:40], 1)                // nextMulti
+	le.PutUint32(payload[44:48], 3)                // oldestXid
+	le.PutUint32(payload[52:56], 1)                // oldestMulti
+	le.PutUint64(payload[60:68], uint64(now.Unix())) // time
+	// Fill tail bytes (68-87) with 3 so PG sees valid TxIds
+	for i := 68; i < checkPointSize; i++ {
+		payload[i] = 3
+	}
+
+	return payload
 }
 
 // EncodePageImage encodes one full-page image record payload.

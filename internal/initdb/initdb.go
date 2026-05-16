@@ -92,6 +92,7 @@ var Subdirs = []string{
 	"pg_stat",
 	"pg_stat_tmp",
 	"pg_tblspc",
+	"pg_twophase",
 }
 
 // Files lists the regular files goopg init writes alongside the
