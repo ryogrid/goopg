@@ -76,12 +76,12 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	{3592, "pg_shseclabel", 4065, 'r', 6, true, pgShseclabelAttrs()},
 	{6100, "pg_subscription", 6101, 'r', 9, true, pgSubscriptionAttrs()},
 }, []idxSpec{
-	{2671, "pg_database_datname_index", 1},
-	{2672, "pg_database_oid_index", 1},
-	{2676, "pg_authid_rolname_index", 1},
-	{2677, "pg_authid_oid_index", 1},
-	{2695, "pg_auth_members_member_role_index", 1},
-	{3593, "pg_shseclabel_object_index", 1},
+	{2671, "pg_database_datname_index"},
+	{2672, "pg_database_oid_index"},
+	{2676, "pg_authid_rolname_index"},
+	{2677, "pg_authid_oid_index"},
+	{2695, "pg_auth_members_member_role_index"},
+	{3593, "pg_shseclabel_object_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).
@@ -107,23 +107,23 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{2609, "pg_description", 83, 'r', 5, false, pgDescriptionAttrs()},
 	{2608, "pg_depend", 83, 'r', 8, false, pgDependAttrs()},
 }, []idxSpec{
-	{2703, "pg_type_oid_index", 1},
-	{2704, "pg_type_typname_nsp_index", 1},
-	{2658, "pg_attribute_relid_attnam_index", 1},
-	{2659, "pg_attribute_relid_attnum_index", 1},
-	{2662, "pg_class_oid_index", 1},
-	{2663, "pg_class_relname_nsp_index", 1},
-	{2690, "pg_proc_oid_index", 1},
-	{2691, "pg_proc_proname_args_nsp_index", 1},
-	{2679, "pg_index_indrelid_index", 1},
-	{2687, "pg_opclass_oid_index", 1},
-	{2655, "pg_amproc_oid_index", 1},
-	{2693, "pg_rewrite_rel_rulename_index", 1},
-	{2701, "pg_trigger_tgrelid_tgname_index", 1},
-	{2667, "pg_constraint_oid_index", 1},
-	{2688, "pg_operator_oid_index", 1},
-	{2680, "pg_inherits_relid_seqno_index", 1},
-	{2654, "pg_amop_opr_fam_index", 1},
+	{2703, "pg_type_oid_index"},
+	{2704, "pg_type_typname_nsp_index"},
+	{2658, "pg_attribute_relid_attnam_index"},
+	{2659, "pg_attribute_relid_attnum_index"},
+	{2662, "pg_class_oid_index"},
+	{2663, "pg_class_relname_nsp_index"},
+	{2690, "pg_proc_oid_index"},
+	{2691, "pg_proc_proname_args_nsp_index"},
+	{2679, "pg_index_indrelid_index"},
+	{2687, "pg_opclass_oid_index"},
+	{2655, "pg_amproc_oid_index"},
+	{2693, "pg_rewrite_rel_rulename_index"},
+	{2701, "pg_trigger_tgrelid_tgname_index"},
+	{2667, "pg_constraint_oid_index"},
+	{2688, "pg_operator_oid_index"},
+	{2680, "pg_inherits_relid_seqno_index"},
+	{2654, "pg_amop_opr_fam_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -135,16 +135,17 @@ func indexNailed(oid uint32, name string, natts int16) nailedRel {
 }
 
 type idxSpec struct {
-	OID   uint32
-	Name  string
-	Natts int16
+	OID     uint32
+	Name    string
 }
 
 func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 	var out []nailedRel
 	out = append(out, heaps...)
 	for _, idx := range idxs {
-		out = append(out, indexNailed(idx.OID, idx.Name, idx.Natts))
+		// Index Natts = 2 for btree (pg_class_oid_index has key cols: oid).
+		// Most critical indexes are unique btree with 1-2 key columns.
+		out = append(out, indexNailed(idx.OID, idx.Name, 2))
 	}
 	return out
 }
