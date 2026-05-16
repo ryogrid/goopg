@@ -82,6 +82,8 @@ type Cluster struct {
 	libDir      string
 	started     bool
 	startupWait time.Duration
+	postgresCmd *exec.Cmd
+	logFile     *os.File
 }
 
 // Available skips the calling test when the upstream PG bin directory
@@ -226,21 +228,32 @@ func (c *Cluster) appendConf(opts Options) error {
 	return nil
 }
 
-// Start launches the cluster via `pg_ctl -w start`. Returns once the
-// listener is accepting connections (pg_ctl `-w` waits internally).
+// Start launches the cluster by running `postgres` directly (not pg_ctl)
+// and polling the port until the server accepts connections. We cannot use
+// pg_ctl because it reads postmaster.pid PMStatus which never reaches
+// "ready" or "standby" when recovering from a goopg backup (the postmaster
+// stays in PM_RECOVERY).
 func (c *Cluster) Start() error {
 	if c.started {
 		return errors.New("pgcluster: already started")
 	}
-	cmd := exec.Command(filepath.Join(c.bin, "pg_ctl"),
-		"-D", c.dataDir, "-l", c.logPath,
-		"-o", fmt.Sprintf("-p %d -h 127.0.0.1", c.port),
-		"start")
-	cmd.Env = c.env()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		logContent, _ := os.ReadFile(c.logPath)
-		return fmt.Errorf("pgcluster: pg_ctl start: %v\n%s\n--- PG log ---\n%s", err, out, string(logContent))
+	logFile, err := os.OpenFile(c.logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("pgcluster: open log: %w", err)
 	}
+	cmd := exec.Command(filepath.Join(c.bin, "postgres"),
+		"-D", c.dataDir,
+		"-p", fmt.Sprintf("%d", c.port),
+		"-h", "127.0.0.1")
+	cmd.Env = c.env()
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return fmt.Errorf("pgcluster: postgres start: %w", err)
+	}
+	c.postgresCmd = cmd
+	c.logFile = logFile
 
 	// Poll until the server accepts connections or we time out.
 	wait := c.startupWait
@@ -249,6 +262,7 @@ func (c *Cluster) Start() error {
 	}
 	deadline := time.Now().Add(wait)
 	addr := fmt.Sprintf("127.0.0.1:%d", c.port)
+	var lastErr error
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err == nil {
@@ -256,21 +270,30 @@ func (c *Cluster) Start() error {
 			c.started = true
 			return nil
 		}
+		lastErr = err
+		// If postgres exited, return the log content.
+		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			logContent, _ := os.ReadFile(c.logPath)
+			return fmt.Errorf("pgcluster: postgres exited: %v\n--- PG log ---\n%s", cmd.ProcessState, string(logContent))
+		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	return fmt.Errorf("pgcluster: server did not start listening on %s within %v", addr, c.startupWait)
+	logContent, _ := os.ReadFile(c.logPath)
+	return fmt.Errorf("pgcluster: server did not start listening on %s within %v: %v\n--- PG log ---\n%s", addr, wait, lastErr, string(logContent))
 }
 
 // Stop performs a fast shutdown. Errors are non-fatal — the cluster
 // may have already crashed in a SIGKILL test.
 func (c *Cluster) Stop() error {
-	if !c.started {
-		return nil
+	if c.postgresCmd != nil && c.postgresCmd.Process != nil {
+		_ = c.postgresCmd.Process.Signal(os.Interrupt)
+		_ = c.postgresCmd.Wait()
+		c.postgresCmd = nil
 	}
-	cmd := exec.Command(filepath.Join(c.bin, "pg_ctl"),
-		"-D", c.dataDir, "-m", "fast", "-w", "stop")
-	cmd.Env = c.env()
-	_ = cmd.Run()
+	if c.logFile != nil {
+		_ = c.logFile.Close()
+		c.logFile = nil
+	}
 	c.started = false
 	return nil
 }

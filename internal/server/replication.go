@@ -457,6 +457,12 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	// the standby and apply standby-status updates to the slot. The
 	// goroutine ends naturally when the connection closes (ReadFrame
 	// returns an error) or the streaming context is cancelled.
+	// clientSentCopyDone tracks whether the client gracefully ended
+	// the stream (e.g. pg_basebackup sending CopyDone); the send loop
+	// responds with its own CopyDone+CommandComplete+ReadyForQuery.
+	// For continuous streaming (PG standby), the client never sends
+	// CopyDone, so no response is sent and the stream stays open.
+	clientSentCopyDone := false
 	receiveDone := make(chan struct{})
 	go func() {
 		defer close(receiveDone)
@@ -469,6 +475,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 			case protocol.MsgCopyData:
 				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle, syncRep, appName)
 			case protocol.MsgCopyDone:
+				clientSentCopyDone = true
 				streamCancel()
 				return
 			case protocol.MsgTerminate:
@@ -510,16 +517,18 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		select {
 		case <-streamCtx.Done():
 			<-receiveDone
-			// M0105-0007: properly terminate the CopyBoth stream
-			// so pg_basebackup transitions back to command mode.
-			_ = w.WriteCopyDone()
-			_ = w.WriteCommandComplete("START_REPLICATION")
-			_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+			if clientSentCopyDone {
+				_ = w.WriteCopyDone()
+				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+			}
 			return nil
 		case <-receiveDone:
-			_ = w.WriteCopyDone()
-			_ = w.WriteCommandComplete("START_REPLICATION")
-			_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+			if clientSentCopyDone {
+				_ = w.WriteCopyDone()
+				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+			}
 			return nil
 		case chunk := <-chunkCh:
 			frame := protocol.EncodeWALData(chunk.StartLSN, chunk.EndLSN, time.Now().UTC(), chunk.Payload)
@@ -557,9 +566,11 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		case err := <-recErrCh:
 			if errors.Is(err, context.Canceled) || errors.Is(err, wal.ErrClosed) {
 				<-receiveDone
-				_ = w.WriteCopyDone()
-				_ = w.WriteCommandComplete("START_REPLICATION")
-				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+				if clientSentCopyDone {
+					_ = w.WriteCopyDone()
+					_ = w.WriteCommandComplete("START_REPLICATION")
+					_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+				}
 				return nil
 			}
 			streamCancel()
