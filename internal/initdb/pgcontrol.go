@@ -110,10 +110,14 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 	le.PutUint32(body[52:], 1)
 	// checkPointCopy.fullPageWrites → on (1) at offset 56
 	body[56] = 1
-	// minRecoveryPoint → redoLSN (0-based); PG requires a non-zero
-	// value to enter archive recovery (StartupXLOG checks
-	// ControlFile->minRecoveryPoint != InvalidXLogRecPtr).
-	le.PutUint64(body[136:], lsn0)
+	// minRecoveryPoint → set to 0 (InvalidXLogRecPtr), matching PG's
+	// own pg_basebackup behaviour. A non-zero value triggers archive
+	// recovery, which changes CheckRecoveryConsistency's code path.
+	// PG's pg_basebackup leaves minRecoveryPoint=0/0 so the standby
+	// enters crash recovery first, replays all local WAL, then
+	// switches to archive recovery — this path reaches PM_HOT_STANDBY
+	// successfully.
+	le.PutUint64(body[136:], 0)
 	le.PutUint32(body[144:], 1) // minRecoveryPointTLI
 
 	// Recompose CRC over bytes [0, pgControlCRCOffset)

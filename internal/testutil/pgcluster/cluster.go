@@ -72,15 +72,16 @@ type Options struct {
 
 // Cluster is a running upstream-PG instance.
 type Cluster struct {
-	name     string
-	bin      string
-	dataDir  string
-	logPath  string
-	port     int
-	user     string
-	database string
-	libDir   string
-	started  bool
+	name        string
+	bin         string
+	dataDir     string
+	logPath     string
+	port        int
+	user        string
+	database    string
+	libDir      string
+	started     bool
+	startupWait time.Duration
 }
 
 // Available skips the calling test when the upstream PG bin directory
@@ -164,14 +165,15 @@ func newClusterHandle(name string, opts Options) (*Cluster, error) {
 		db = "postgres"
 	}
 	c := &Cluster{
-		name:     name,
-		bin:      bin,
-		dataDir:  dataDir,
-		logPath:  logPath,
-		port:     port,
-		user:     user,
-		database: db,
-		libDir:   filepath.Join(filepath.Dir(bin), "lib"),
+		name:        name,
+		bin:         bin,
+		dataDir:     dataDir,
+		logPath:     logPath,
+		port:        port,
+		user:        user,
+		database:    db,
+		libDir:      filepath.Join(filepath.Dir(bin), "lib"),
+		startupWait: opts.StartupWait,
 	}
 	return c, nil
 }
@@ -231,7 +233,7 @@ func (c *Cluster) Start() error {
 		return errors.New("pgcluster: already started")
 	}
 	cmd := exec.Command(filepath.Join(c.bin, "pg_ctl"),
-		"-D", c.dataDir, "-l", c.logPath, "-w", "-t", "120",
+		"-D", c.dataDir, "-l", c.logPath,
 		"-o", fmt.Sprintf("-p %d -h 127.0.0.1", c.port),
 		"start")
 	cmd.Env = c.env()
@@ -239,8 +241,24 @@ func (c *Cluster) Start() error {
 		logContent, _ := os.ReadFile(c.logPath)
 		return fmt.Errorf("pgcluster: pg_ctl start: %v\n%s\n--- PG log ---\n%s", err, out, string(logContent))
 	}
-	c.started = true
-	return nil
+
+	// Poll until the server accepts connections or we time out.
+	wait := c.startupWait
+	if wait == 0 {
+		wait = 45 * time.Second
+	}
+	deadline := time.Now().Add(wait)
+	addr := fmt.Sprintf("127.0.0.1:%d", c.port)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			conn.Close()
+			c.started = true
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("pgcluster: server did not start listening on %s within %v", addr, c.startupWait)
 }
 
 // Stop performs a fast shutdown. Errors are non-fatal — the cluster
