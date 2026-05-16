@@ -766,8 +766,8 @@ func EncodeCheckpoint() []byte {
 // actual start position exactly — PG's xlogreader validates
 // checkPoint.redo against ReadRecPtr.
 func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
-	// Encode a minimal PG18 CheckPoint struct.
-	// Field layout (mirrors src/include/catalog/pg_control.h):
+	// Encode a minimal PG18 CheckPoint struct (sizeof=88).
+	// Offsets verified against compiled PG18 binary (DWARF):
 	//   redo           XLogRecPtr  8  (offset 0)
 	//   ThisTimeLineID TimeLineID  4  (offset 8)
 	//   PrevTimeLineID TimeLineID  4  (offset 12)
@@ -782,12 +782,12 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
 	//   oldestXidDB    Oid        4  (offset 48)
 	//   oldestMulti    MultiXact  4  (offset 52)
 	//   oldestMultiDB  Oid        4  (offset 56)
-	//   time           pg_time_t  8  (offset 60)
-	//   oldestCommitTsXid TxnId   4  (offset 68)
-	//   newestCommitTsXid TxnId   4  (offset 72)
-	//   oldestActiveXid TxnId     4  (offset 76)
-	// Total: 88 bytes (PG18 sizeof(CheckPoint); PG validates
-	// xl_tot_len >= SizeOfXLogRecord + sizeof(CheckPoint))
+	//   [pad 4]                   —  (offset 60; pg_time_t alignment)
+	//   time           pg_time_t  8  (offset 64)
+	//   oldestCommitTsXid TxnId   4  (offset 72)
+	//   newestCommitTsXid TxnId   4  (offset 76)
+	//   oldestActiveXid TxnId     4  (offset 80)
+	//   [trailing pad 4]          —  (offset 84; struct 8-byte align)
 	const checkPointSize = 88
 	payload := make([]byte, checkPointSize)
 	le := binary.LittleEndian
@@ -801,12 +801,16 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
 	le.PutUint32(payload[36:40], 1)                // nextMulti
 	le.PutUint32(payload[44:48], 3)                // oldestXid
 	le.PutUint32(payload[52:56], 1)                // oldestMulti
-	le.PutUint64(payload[60:68], uint64(now.Unix())) // time
-	le.PutUint32(payload[68:72], 3)                  // oldestCommitTsXid
-	le.PutUint32(payload[72:76], 3)                  // newestCommitTsXid
-	le.PutUint32(payload[76:80], 3)                  // oldestActiveXid
-	// Pad remaining bytes (80-87) to zero — sizeof(CheckPoint) is 80
-	// in PG18, goopg reserves 88 for safety.
+	// time (pg_time_t=int64, 8-byte aligned → starts at offset 64)
+	le.PutUint64(payload[64:72], uint64(now.Unix())) // time
+	// After time (offset 72): oldestCommitTsXid, newestCommitTsXid,
+	// oldestActiveXid. Each is TransactionId (uint32, 4 bytes).
+	// NOTE: pg_time_t alignment forces 4-byte pad before time, pushing
+	// offsets: time=64, oldestCommitTsXid=72, newestCommitTsXid=76,
+	// oldestActiveXid=80, sizeof(CheckPoint)=88.
+	le.PutUint32(payload[72:76], 3) // oldestCommitTsXid
+	le.PutUint32(payload[76:80], 3) // newestCommitTsXid
+	le.PutUint32(payload[80:84], 3) // oldestActiveXid
 
 	return payload
 }

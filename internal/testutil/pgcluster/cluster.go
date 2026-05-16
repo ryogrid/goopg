@@ -231,7 +231,7 @@ func (c *Cluster) Start() error {
 		return errors.New("pgcluster: already started")
 	}
 	cmd := exec.Command(filepath.Join(c.bin, "pg_ctl"),
-		"-D", c.dataDir, "-l", c.logPath, "-w",
+		"-D", c.dataDir, "-l", c.logPath, "-w", "-t", "120",
 		"-o", fmt.Sprintf("-p %d -h 127.0.0.1", c.port),
 		"start")
 	cmd.Env = c.env()

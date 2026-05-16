@@ -84,17 +84,34 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 	// goopg uses 1-based LSNs internally; PG expects 0-based.
 	lsn0 := redoLSN - 1
 
+	// ControlFileData layout (PG18, sizeof=296):
+	//   offset 16: state (uint32)
+	//   offset 24: time (pg_time_t, int64)
+	//   offset 32: checkPoint (XLogRecPtr, 8 bytes)
+	//   offset 40: prevCheckPoint (XLogRecPtr, 8 bytes)
+	//   offset 48: checkPointCopy (CheckPoint, 88 bytes)
+	//     → offset 48: checkPointCopy.redo (XLogRecPtr, 8)
+	//     → offset 56: checkPointCopy.ThisTimeLineID (uint32)
+	//   offset 168: minRecoveryPoint (XLogRecPtr, 8 bytes)
+	//   offset 176: minRecoveryPointTLI (TimeLineID, 4 bytes)
+
 	// state → DB_IN_PRODUCTION (taken from a running server)
 	le.PutUint32(body[16:], dbStateInProduction)
 	// time → now
 	le.PutUint64(body[24:], uint64(now.Unix()))
-	// checkPoint (XLogRecPtr, offset 32) → redoLSN (0-based)
+	// checkPoint → redoLSN (0-based)
 	le.PutUint64(body[32:], lsn0)
-	// checkPointCopy.redo (offset 40, first 8 bytes of CheckPoint)
+	// prevCheckPoint → redoLSN (0-based)
 	le.PutUint64(body[40:], lsn0)
-	// checkPointCopy.ThisTimeLineID (offset 48, TimeLineID): PG
-	// compares this against WAL page header xlp_tli; must be non-zero.
-	le.PutUint32(body[48:], 1)
+	// checkPointCopy.redo → redoLSN (0-based)
+	le.PutUint64(body[48:], lsn0)
+	// checkPointCopy.ThisTimeLineID → 1
+	le.PutUint32(body[56:], 1)
+	// minRecoveryPoint → redoLSN (0-based); PG requires a non-zero
+	// value to enter archive recovery (StartupXLOG checks
+	// ControlFile->minRecoveryPoint != InvalidXLogRecPtr).
+	le.PutUint64(body[168:], lsn0)
+	le.PutUint32(body[176:], 1) // minRecoveryPointTLI
 
 	// Recompose CRC over bytes [0, pgControlCRCOffset)
 	crc := crc32.Checksum(body[:pgControlCRCOffset], crcCastagnoliTable)
