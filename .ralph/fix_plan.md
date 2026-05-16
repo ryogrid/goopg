@@ -3046,6 +3046,20 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         zero-loss invariant holds for sync mode.
       - Depends on: M0105-0007
 
+- [ ] **M0105-0009**
+      - Summary: Fix PG standby hot standby readiness (pg_ctl timeout).
+      - PG standby reaches "entering standby mode" and streams WAL,
+        but `standbyState` never becomes `STANDBY_SNAPSHOT_READY`.
+        Root cause: goopg's checkpoint uses `XLOG_CHECKPOINT_ONLINE`
+        (info=0x10), which does NOT trigger `ProcArrayApplyRecoveryInfo()`.
+        PG needs either `XLOG_CHECKPOINT_SHUTDOWN` (0x00) or a
+        `XLOG_RUNNING_XACTS` record to advance standbyState. Fix:
+        change goopg's checkpoint classification to use
+        `xlogCheckpointShutdown` so PG constructs a synthetic
+        RunningTransactionsData and transitions to STANDBY_SNAPSHOT_READY,
+        enabling PM_HOT_STANDBY and allowing pg_ctl -w to succeed.
+      - File: `internal/wal/format.go`
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).

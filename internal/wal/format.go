@@ -216,7 +216,15 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	// implausible redo LSN (<256 bytes), so this path takes priority over the
 	// legacy kind-byte dispatch.
 	if len(payload) == 88 {
-		return RmgrXLog, xlogCheckpointOnline, 0
+		// M0105-0009: use XLOG_CHECKPOINT_SHUTDOWN (0x00) instead of
+		// ONLINE (0x10). PG's xlog_redo for shutdown checkpoints calls
+		// ProcArrayApplyRecoveryInfo() which constructs synthetic
+		// RunningTransactionsData and transitions standbyState to
+		// STANDBY_SNAPSHOT_READY. This enables CheckRecoveryConsistency
+		// to send PMSIGNAL_BEGIN_HOT_STANDBY, allowing the postmaster
+		// to enter PM_HOT_STANDBY. Without this, pg_ctl -w never sees
+		// the server as ready.
+		return RmgrXLog, xlogCheckpointShutdown, 0
 	}
 	// M0105-0007: route ALL goopg-internal records through RmgrXLog
 	// with an unknown info byte (0xF0) so PG's xlog_redo safely skips
