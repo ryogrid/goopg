@@ -3022,7 +3022,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         to `accepted`. Confirm no regressions: `go test ./internal/storage/
         ./internal/wal/ ./internal/server/ ./internal/initdb/` all green.
 
-- [ ] **M0105-0007**
+- [x] **M0105-0007**
       - Summary: Fix WAL sender stall during `pg_basebackup -X stream`.
       - E2E test revealed that `pg_basebackup -X stream` hangs on the
         `START_REPLICATION` connection: goopg's WAL sender accepts the
@@ -3044,9 +3044,9 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         pg_basebackup completes, PG standby starts, WAL streams, data
         replicates, SIGKILL + promote works, post-failover INSERT succeeds,
         zero-loss invariant holds for sync mode.
-      - Depends on: M0105-0007
+      - Depends on: M0105-0007, M0105-0009
 
-- [ ] **M0105-0009**
+- [x] **M0105-0009**
       - Summary: Fix PG standby hot standby readiness (pg_ctl timeout).
       - PG standby reaches "entering standby mode" and streams WAL,
         but `standbyState` never becomes `STANDBY_SNAPSHOT_READY`.
