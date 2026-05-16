@@ -34,6 +34,11 @@ func TestInitLaysOutDirectoryStructure(t *testing.T) {
 			t.Errorf("%q mode=%o want 0700", sub, st.Mode().Perm())
 		}
 	}
+	// pg_subtrans is critical for PG standby startup (M0105-0004).
+	// StartupSUBTRANS() accesses this directory; without it the PG process crashes.
+	if _, err := os.Stat(filepath.Join(dir, "pg_subtrans")); err != nil {
+		t.Errorf("missing CRITICAL subdir pg_subtrans: %v", err)
+	}
 	// base/<DBOid> for the default database.
 	if _, err := os.Stat(filepath.Join(dir, "base", "1")); err != nil {
 		t.Errorf("missing base/1: %v", err)

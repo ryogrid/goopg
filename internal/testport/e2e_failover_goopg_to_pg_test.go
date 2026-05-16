@@ -48,6 +48,17 @@ func TestE2E_FailoverGoopgToPG(t *testing.T) {
 			asyncLossBound:   20,
 			workloadDeadline: 20 * time.Second,
 		},
+		{
+			name:              "sync_remote_apply",
+			sessionSyncCommit: "remote_apply",
+			primaryExtraConf: []string{
+				"synchronous_standby_names = 'pg_standby'",
+				"synchronous_commit = 'local'",
+			},
+			minCommits:       3,
+			exact:            true,
+			workloadDeadline: 30 * time.Second,
+		},
 	}
 
 	for _, mode := range modes {

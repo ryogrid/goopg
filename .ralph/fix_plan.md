@@ -2967,7 +2967,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
 
 ### Sub-milestones
 
-- [ ] **M0105-0001**
+- [x] **M0105-0001**
       - Summary: PageHeaderData format audit + alignment.
       - Verify `pd_lsn`, `pd_checksum`, `pd_flags`, `pd_lower`, `pd_upper`,
         `pd_special`, `pd_pagesize_version`, `pd_prune_xid` encoding against
@@ -2977,7 +2977,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         the correct initial header bytes. Add cross-check unit tests.
       - File: `internal/storage/page.go`, `internal/storage/page_test.go`
 
-- [ ] **M0105-0002**
+- [x] **M0105-0002**
       - Summary: ItemIdData alignment verification.
       - Verify the 32-bit packed ItemIdData encoding (`lp_off:15, lp_flags:2,
         lp_len:15`) matches PG18 `itemid.h`. Confirm `LP_UNUSED=0`,
@@ -2985,7 +2985,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         Add cross-check unit tests against known PG byte patterns.
       - File: `internal/storage/heap.go` (ItemID/unpackItemID), `internal/storage/heap_test.go`
 
-- [ ] **M0105-0003**
+- [x] **M0105-0003**
       - Summary: HeapTupleHeaderData alignment verification.
       - Audit every byte of goopg's tuple header (`MarshalBinary` / `ParseHeapTuple`)
         against PG18's `HeapTupleHeaderData` (`htup_details.h`). Verify xmin/xmax/
@@ -2995,7 +2995,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         Confirm `infomask`/`infomask2` bit definitions match PG18.
       - File: `internal/storage/heap.go`, `internal/storage/heap_test.go`
 
-- [ ] **M0105-0004**
+- [x] **M0105-0004**
       - Summary: Catalog bootstrap page compatibility.
       - Ensure `bootstrapSystemCatalogs` and `bootstrapCLog` produce pages that
         PG can iterate. After M0105-0001..0003 fixes, test PG standby startup
@@ -3004,7 +3004,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         column offset mismatch in `pg_attribute`) and apply targeted fixes.
       - File: `internal/initdb/initdb.go`
 
-- [ ] **M0105-0005**
+- [x] **M0105-0005**
       - Summary: Re-verify M0102-0007 Scenario B E2E test.
       - After format fixes, run `TestE2E_FailoverGoopgToPG` and confirm the
         async subtest passes: goopg primary starts, pg_basebackup succeeds,
@@ -3013,7 +3013,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         `sync_remote_apply` sibling subtest.
       - File: `internal/testport/e2e_failover_goopg_to_pg_test.go`
 
-- [ ] **M0105-0006**
+- [x] **M0105-0006**
       - Summary: Close milestone.
       - Update `docs/test-port/postgres-oracle-port-status.csv` with E2E
         failover rows at `status=port`, `pass_required=yes`. Regenerate

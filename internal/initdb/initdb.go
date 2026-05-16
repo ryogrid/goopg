@@ -79,12 +79,21 @@ var Subdirs = []string{
 	"base",
 	"global",
 	"pg_wal",
+	"pg_wal/archive_status", // PG ValidateXLOGDirectoryStructure creates if missing; safe to pre-create.
+	"pg_wal/summaries",
 	"pg_xact",
+	// SLRU directories PG requires during startup (M0105-0004).
+	"pg_subtrans", // CRITICAL: StartupSUBTRANS() needs this for transaction parent lookup.
+	"pg_multixact",
+	"pg_multixact/members",
+	"pg_multixact/offsets",
 	// PG-required directories so pg_basebackup clones and pg_ctl start
 	// against an imported backup succeed (M0102-0007).
 	"pg_commit_ts",
 	"pg_dynshmem",
 	"pg_logical",
+	"pg_logical/snapshots",
+	"pg_logical/mappings",
 	"pg_notify",
 	"pg_replslot",
 	"pg_serial",

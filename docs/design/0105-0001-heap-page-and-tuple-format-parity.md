@@ -1,6 +1,6 @@
 # 0105-0001 — Heap Page and Tuple Format Parity with PostgreSQL 18
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-16
 **Milestone:** M0105
 **Upstream reference:** `postgres/src/include/storage/bufpage.h`, `postgres/src/include/storage/itemid.h`, `postgres/src/include/storage/itemptr.h`, `postgres/src/include/access/htup_details.h`, `postgres/src/include/access/htup.h`.

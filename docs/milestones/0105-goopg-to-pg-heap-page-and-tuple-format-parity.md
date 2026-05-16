@@ -1,7 +1,8 @@
 # Milestone 0105 — goopg→PG Data-File Format Parity
 
-**Status:** planned
+**Status:** accepted
 **Filed:** 2026-05-16
+**Closed:** 2026-05-16
 **Depends on:** M0102 (heterogeneous replication E2E), M0014 (PG-compatible WAL on-disk format), M0101 (pg_waldump compatibility)
 **Reference plan:** `.ralph/fix_plan.md` (M0105 section)
 
