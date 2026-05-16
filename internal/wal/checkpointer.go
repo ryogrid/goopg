@@ -105,6 +105,7 @@ type Checkpointer struct {
 	retainer Retainer
 
 	lastCheckpointLSN atomic.Uint64
+	lastCheckpointRedoLSN atomic.Uint64
 
 	// Aggregate counters surfaced through pg_stat_checkpointer.
 	// Mirror the upstream PG 18 view's counter shape:
@@ -156,6 +157,19 @@ func NewCheckpointer(flusher DirtyPageFlusher, wal checkpointWAL, cfg Checkpoint
 // LastCheckpointLSN returns the most recent successful checkpoint marker LSN.
 func (c *Checkpointer) LastCheckpointLSN() uint64 {
 	return c.lastCheckpointLSN.Load()
+}
+
+// LastCheckpointRedoLSN returns the REDO LSN (start byte of the checkpoint
+// record) for the most recent successful checkpoint. This is the position
+// from which crash recovery must replay. Exported for BASE_BACKUP's
+// pg_control update path (M0102-0007).
+func (c *Checkpointer) LastCheckpointRedoLSN() uint64 {
+	return c.lastCheckpointRedoLSN.Load()
+}
+
+// CheckpointRedoLSN is the executor.Checkpointer interface method.
+func (c *Checkpointer) CheckpointRedoLSN() uint64 {
+	return c.lastCheckpointRedoLSN.Load()
 }
 
 // SetInterval updates the periodic checkpoint cadence. Call before
@@ -305,13 +319,16 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		}
 	}
 	c.writeTimeMs.Add(uint64(time.Since(flushStart).Milliseconds()))
-	_, endLSN, err := c.wal.Append(EncodeCheckpoint())
+	startLSN, endLSN, err := c.wal.Append(EncodeCheckpoint())
 	if err != nil {
 		return fmt.Errorf("append checkpoint marker: %w", err)
 	}
 	if err := c.wal.FlushUpTo(endLSN); err != nil {
 		return fmt.Errorf("flush checkpoint marker up to lsn %d: %w", endLSN, err)
 	}
+	// M0102-0007: store REDO LSN (start of checkpoint record) for
+	// BASE_BACKUP so pg_control carries a valid redo point.
+	c.lastCheckpointRedoLSN.Store(startLSN)
 	c.lastCheckpointLSN.Store(endLSN)
 	if spread {
 		c.numTimed.Add(1)

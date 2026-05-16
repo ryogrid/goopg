@@ -346,6 +346,7 @@ func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) 
 // server.Config; production servers use a *wal.Checkpointer.
 type Checkpointer interface {
 	CheckpointNow() error
+	CheckpointRedoLSN() uint64
 }
 
 // NewContext builds a Context with sensible defaults: a fresh

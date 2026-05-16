@@ -131,8 +131,26 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	// with the checkpoint REDO location so the resulting backup's
 	// global/pg_control carries a valid checkpoint — PostgreSQL
 	// standbys reject pg_control with a zero redo point.
-	if startLSN > 0 {
-		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, startLSN)
+	// Use the checkpointer's stored REDO LSN (start of the checkpoint
+	// record) for pg_control and backup_label.
+	// goopg uses 1-based LSNs; PG expects 0-based — subtract 1.
+	redoLSN := startLSN
+	if s.cfg.Checkpointer != nil {
+		if r := s.cfg.Checkpointer.CheckpointRedoLSN(); r > 0 {
+			redoLSN = r
+		}
+	}
+	// DEBUG M0102-0007
+	if s.cfg.Logger != nil {
+		s.cfg.Logger.Info("BASE_BACKUP redoLSN debug", "startLSN", startLSN, "checkpointerRedoLSN", func() uint64 {
+			if s.cfg.Checkpointer != nil {
+				return s.cfg.Checkpointer.CheckpointRedoLSN()
+			}
+			return 0
+		}(), "finalRedoLSN", redoLSN)
+	}
+	if redoLSN > 0 {
+		_ = initdb.UpdateControlCheckpoint(s.cfg.DataDir, redoLSN)
 	}
 	startTLI, err := initdb.LoadOrCreateTimelineID(s.cfg.DataDir)
 	if err != nil {
@@ -359,6 +377,15 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 			return nil
 		}
 		entries = append(entries, entry{abs: path, rel: rel, info: info, isFile: !info.IsDir()})
+		// M0102-0007: also emit a PG-compatible WAL filename when the
+		// source file is a goopg-format WAL segment in pg_wal/.
+		// goopg names WAL as %024X (timeline 0); PG expects
+		// %08X%08X%08X (tli+log+seg).  Produce both so the PG
+		// standby finds a file matching its timeline.
+		if segno, ok := parseGoopgWalName(filepath.Base(rel)); ok && filepath.Dir(rel) == "pg_wal" {
+			pgName := wal.XLogFileName(tli, segno, segSize)
+			entries = append(entries, entry{abs: path, rel: filepath.Join("pg_wal", pgName), info: info, isFile: true})
+		}
 		return nil
 	})
 	if err != nil {
@@ -629,4 +656,18 @@ func tokenizeLegacyOptions(raw string) []string {
 	}
 	flush()
 	return out
+}
+
+// parseGoopgWalName parses a goopg-format WAL segment filename
+// (%024X segno) and returns the segment number. ok=false for
+// non-WAL or invalid names.
+func parseGoopgWalName(name string) (segno uint64, ok bool) {
+	if len(name) != 24 {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(name, 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }

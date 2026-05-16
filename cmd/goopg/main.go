@@ -389,6 +389,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
+		// M0102-0007: report the cluster's real system_identifier in
+		// IDENTIFY_SYSTEM so a PG standby's walreceiver can verify
+		// the primary's identity against its own pg_control.
+		if sysID, err := initdb.LoadOrCreateSystemID(*dataDir); err == nil {
+			cfg.SystemID = fmt.Sprintf("%d", sysID)
+		}
 		cfg.SyncRep = rt.SyncRep
 		// M0102-0005: prime the SyncRep rule from the GUC value so the
 		// first commit on a freshly-started cluster sees the configured

@@ -81,15 +81,17 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 	}
 	le := binary.LittleEndian
 	now := time.Now()
+	// goopg uses 1-based LSNs internally; PG expects 0-based.
+	lsn0 := redoLSN - 1
 
 	// state → DB_IN_PRODUCTION (taken from a running server)
 	le.PutUint32(body[16:], dbStateInProduction)
 	// time → now
 	le.PutUint64(body[24:], uint64(now.Unix()))
-	// checkPoint (XLogRecPtr, offset 32) → redoLSN
-	le.PutUint64(body[32:], redoLSN)
+	// checkPoint (XLogRecPtr, offset 32) → redoLSN (0-based)
+	le.PutUint64(body[32:], lsn0)
 	// checkPointCopy.redo (offset 40, first 8 bytes of CheckPoint)
-	le.PutUint64(body[40:], redoLSN)
+	le.PutUint64(body[40:], lsn0)
 
 	// Recompose CRC over bytes [0, pgControlCRCOffset)
 	crc := crc32.Checksum(body[:pgControlCRCOffset], crcCastagnoliTable)

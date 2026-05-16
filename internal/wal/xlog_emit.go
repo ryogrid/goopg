@@ -93,12 +93,12 @@ func emitWithPageHeaders(record []byte, realRecLen int, startPos int64, segSize 
 		// next page.
 		if consumed < len(record) && pos%XLOGBlockSize == 0 {
 			// xlp_rem_len upstream-semantic: bytes-still-to-go
-			// of the *actual* record (xl_tot_len), not the
-			// MAXALIGN trailing pad.
-			remaining := uint32(0)
-			if consumed < realRecLen {
-				remaining = uint32(realRecLen - consumed)
-			}
+			// of the record INCLUDING MAXALIGN trailing pad.
+			// PG's XLogReader uses RemLen to skip to the next
+			// record header; undercounting (without padding)
+			// makes PG read padding as a record header and
+			// raise "invalid record length".
+			remaining := uint32(len(record) - consumed)
 			hdr := buildPageHeader(pos, segSize, sysID, tli, true, remaining)
 			out = append(out, hdr...)
 			pos += int64(len(hdr))
