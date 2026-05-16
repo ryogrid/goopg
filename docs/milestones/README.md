@@ -131,4 +131,5 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0102 | Heterogeneous streaming-replication + SIGKILL-failover E2E (PG↔goopg, sync + async) | planned | `0102-heterogeneous-replication-failover-e2e.md` |
 | 0103 | Heterogeneous logical-replication + SIGKILL-failover E2E (PG↔goopg, sync + async) | accepted | `0103-heterogeneous-logical-replication-failover-e2e.md` |
 | 0104 | SERIALIZABLE isolation via SSI anomaly prevention | planned | `0104-serializable-ssi-anomaly-prevention.md` |
-| 0105 | goopg→PG data-file format parity (heap page, tuple header, catalog) | planned | `0105-goopg-to-pg-heap-page-and-tuple-format-parity.md` |
+| 0105 | goopg→PG data-file format parity (heap page, tuple header, catalog) | accepted | `0105-goopg-to-pg-heap-page-and-tuple-format-parity.md` |
+| 0106 | PG relcache init file compatibility (backend startup from goopg backup) | planned | `0106-pg-relcache-init-file-compat.md` |

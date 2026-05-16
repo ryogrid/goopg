@@ -3079,6 +3079,81 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
 
 - [x] Project initialization (Ralph harness wired up).
 
+## M0106 — PG Relcache Init File Compatibility (filed 2026-05-17)
+
+Operational note (2026-05-17):
+- This milestone is a follow-up blocker from M0105-0010: PG standby
+  reaches PM_HOT_STANDBY but backends PANIC because critical system
+  indexes can't be opened. PG's `load_relcache_init_file()` requires
+  binary init files created during bootstrap. Without these,
+  `RelationIdGetRelation()` fails for all nailed indexes.
+- Items must NOT be deferred — without the init files, no PG backend
+  can start from a goopg backup.
+
+Goal: Generate PG-compatible relcache init files (`global/pg_internal.init`
+and `base/<dboid>/pg_internal.init`) during goopg init so PG backends
+can start from a goopg-produced backup.
+
+Milestone doc: `docs/milestones/0106-pg-relcache-init-file-compat.md`
+Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
+
+### Sub-milestones
+
+- [ ] **M0106-0001**
+      - Summary: Extract PG struct sizes and offsets.
+      - Determine sizeof(RelationData), sizeof(FormData_pg_class),
+        sizeof(FormData_pg_attribute), ATTRIBUTE_FIXED_PART_SIZE from
+        the compiled PG18 binary (DWARF or build a probe program).
+        These values must match exactly for the init file to load.
+        Also extract nailed index lists (global + local) from PG18
+        source code.
+      - File: `internal/initdb/relcache_init_offsets.go` (new)
+
+- [ ] **M0106-0002**
+      - Summary: Encode FormData_pg_class and FormData_pg_attribute.
+      - Build PG-native binary encoders for the pg_class and pg_attribute
+        tuple forms. Each nailed relation needs a valid Form_pg_class
+        (relname, reltype, relnatts, relkind, etc.) and Form_pg_attribute
+        array (attname, atttypid, attnum, attlen, attalign, etc.) matching
+        PG18 definitions. Use PG-native encoding (LE, PG type alignment).
+      - File: `internal/initdb/relcache_init_encode.go` (new)
+
+- [ ] **M0106-0003**
+      - Summary: Build RelationData blob encoder.
+      - Encode the PG RelationData struct as a binary blob with correct
+        field offsets. Key fields: rd_id, rd_node, rd_rel (will be
+        overwritten by loader), rd_att (will be rebuilt). Most fields
+        are zeroed by the loader. The sizeof must match PG18 exactly.
+      - File: `internal/initdb/relcache_init_encode.go`
+
+- [ ] **M0106-0004**
+      - Summary: Generate relcache init file writer.
+      - Implement `writeRelcacheInitFile(shared bool, relations []NailedRel)`
+        that produces the binary file in PG's `RELCACHE_INIT_FILEMAGIC`
+        format. Handle both shared (global/) and local (base/<dboid>/)
+        variants.
+      - File: `internal/initdb/relcache_init.go` (new)
+
+- [ ] **M0106-0005**
+      - Summary: Integrate into goopg initdb.
+      - Call the init file generation during `goopg init` after catalog
+        bootstrap. Write `global/pg_internal.init` and
+        `base/1/pg_internal.init`.
+      - Verify files exist with correct magic number and non-zero length.
+      - File: `internal/initdb/initdb.go`
+
+- [ ] **M0106-0006**
+      - Summary: Re-verify E2E test.
+      - Run `TestE2E_FailoverGoopgToPG/async` — verify:
+        pg_basebackup completes, PG standby starts, backends don't PANIC,
+        `SELECT 1` succeeds, WAL streams, data replicates, failover works.
+      - File: `internal/testport/e2e_failover_goopg_to_pg_test.go`
+
+- [ ] **M0106-0007**
+      - Summary: Close milestone.
+      - Update milestone doc to accepted. Update design doc to accepted.
+        Run regression suite. Mark all tasks [x].
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
