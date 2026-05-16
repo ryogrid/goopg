@@ -802,10 +802,11 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
 	le.PutUint32(payload[44:48], 3)                // oldestXid
 	le.PutUint32(payload[52:56], 1)                // oldestMulti
 	le.PutUint64(payload[60:68], uint64(now.Unix())) // time
-	// Fill tail bytes (68-87) with 3 so PG sees valid TxIds
-	for i := 68; i < checkPointSize; i++ {
-		payload[i] = 3
-	}
+	le.PutUint32(payload[68:72], 3)                  // oldestCommitTsXid
+	le.PutUint32(payload[72:76], 3)                  // newestCommitTsXid
+	le.PutUint32(payload[76:80], 3)                  // oldestActiveXid
+	// Pad remaining bytes (80-87) to zero — sizeof(CheckPoint) is 80
+	// in PG18, goopg reserves 88 for safety.
 
 	return payload
 }
