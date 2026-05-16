@@ -2946,7 +2946,81 @@ Design doc: `docs/design/0104-0001-serializable-ssi-foundation.md`
       - Regression gates: `go test ./internal/executor/ ./internal/mvcc/
         ./internal/server/` all green; `go test -run TestPort_SSI_WriteSkew
         ./internal/testport/` 4/4 pass.
-      - M0104 SERIALIZABLE anomaly-prevention milestone CLOSED.
+       - M0104 SERIALIZABLE anomaly-prevention milestone CLOSED.
+
+## M0105 — goopg→PG Data-File Format Parity (filed 2026-05-16)
+
+Operational note (2026-05-16):
+- This milestone is the next-order blocker for M0102-0007 (Scenario B: goopg
+  primary → PG standby). Wire-level and checkpoint-encoding interop is complete;
+  the PG standby reaches "entering standby mode" but crashes on goopg's
+  catalog/heap page format.
+- Items must NOT be deferred — data-file format parity is the whole point
+  of this milestone. Without it, M0102-0007 cannot pass.
+
+Goal: Make goopg's on-disk heap page header, line-pointer encoding, and heap
+tuple header byte-compatible with PostgreSQL 18 so a PG standby can read
+goopg-produced data files and complete startup.
+
+Milestone doc: `docs/milestones/0105-goopg-to-pg-heap-page-and-tuple-format-parity.md`
+Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
+
+### Sub-milestones
+
+- [ ] **M0105-0001**
+      - Summary: PageHeaderData format audit + alignment.
+      - Verify `pd_lsn`, `pd_checksum`, `pd_flags`, `pd_lower`, `pd_upper`,
+        `pd_special`, `pd_pagesize_version`, `pd_prune_xid` encoding against
+        PG18 (`postgres/src/include/storage/bufpage.h`). Fix `pd_pagesize_version`
+        packed value if needed. Confirm `pd_flags` bit definitions (`PD_HAS_FREE_LINES`,
+        `PD_PAGE_FULL`, `PD_ALL_VISIBLE`) match PG18. Verify `PageInit` writes
+        the correct initial header bytes. Add cross-check unit tests.
+      - File: `internal/storage/page.go`, `internal/storage/page_test.go`
+
+- [ ] **M0105-0002**
+      - Summary: ItemIdData alignment verification.
+      - Verify the 32-bit packed ItemIdData encoding (`lp_off:15, lp_flags:2,
+        lp_len:15`) matches PG18 `itemid.h`. Confirm `LP_UNUSED=0`,
+        `LP_NORMAL=1`, `LP_REDIRECT=2`, `LP_DEAD=3` values are identical.
+        Add cross-check unit tests against known PG byte patterns.
+      - File: `internal/storage/heap.go` (ItemID/unpackItemID), `internal/storage/heap_test.go`
+
+- [ ] **M0105-0003**
+      - Summary: HeapTupleHeaderData alignment verification.
+      - Audit every byte of goopg's tuple header (`MarshalBinary` / `ParseHeapTuple`)
+        against PG18's `HeapTupleHeaderData` (`htup_details.h`). Verify xmin/xmax/
+        xvac/ctid/infomask2/infomask/hoff are at the correct offsets. Confirm
+        `DefaultHeapTupleHoff=24` is correct for tuples with no null bitmap and
+        no OID. Verify null bitmap encoding matches PG's `bits8[]` convention.
+        Confirm `infomask`/`infomask2` bit definitions match PG18.
+      - File: `internal/storage/heap.go`, `internal/storage/heap_test.go`
+
+- [ ] **M0105-0004**
+      - Summary: Catalog bootstrap page compatibility.
+      - Ensure `bootstrapSystemCatalogs` and `bootstrapCLog` produce pages that
+        PG can iterate. After M0105-0001..0003 fixes, test PG standby startup
+        from a goopg backup. If PG still crashes on catalog pages, triage the
+        specific crash site (likely a missing `pg_subtrans` directory or a
+        column offset mismatch in `pg_attribute`) and apply targeted fixes.
+      - File: `internal/initdb/initdb.go`
+
+- [ ] **M0105-0005**
+      - Summary: Re-verify M0102-0007 Scenario B E2E test.
+      - After format fixes, run `TestE2E_FailoverGoopgToPG` and confirm the
+        async subtest passes: goopg primary starts, pg_basebackup succeeds,
+        PG standby starts, WAL streams, data replicates, SIGKILL + promote
+        works, post-failover INSERT succeeds. Add and pass the
+        `sync_remote_apply` sibling subtest.
+      - File: `internal/testport/e2e_failover_goopg_to_pg_test.go`
+
+- [ ] **M0105-0006**
+      - Summary: Close milestone.
+      - Update `docs/test-port/postgres-oracle-port-status.csv` with E2E
+        failover rows at `status=port`, `pass_required=yes`. Regenerate
+        `.md` via `go run ./cmd/gen-oracle-port-status`. Flip milestone
+        doc status to `accepted`. Update `docs/design/0105-0001-*.md`
+        to `accepted`. Confirm no regressions: `go test ./internal/storage/
+        ./internal/wal/ ./internal/server/ ./internal/initdb/` all green.
 
 ## Completed
 

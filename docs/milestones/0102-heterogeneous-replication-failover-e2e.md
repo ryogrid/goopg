@@ -1,8 +1,8 @@
 # Milestone 0102 — Heterogeneous Streaming-Replication + SIGKILL-Failover E2E (PG↔goopg, sync + async)
 
-**Status:** planned
+**Status:** in-progress
 **Filed:** 2026-05-13
-**Depends on:** M0005 (streaming replication), M0094 (replication E2E foundation), M0094-0005 (`written_lsn` advancement on standby), M0101 (PG-compatible WAL on-disk format)
+**Depends on:** M0005 (streaming replication), M0094 (replication E2E foundation), M0101 (PG-compatible WAL on-disk format), **M0105 (goopg→PG data-file format parity — required for Scenario B)**
 **Reference plan:** `.ralph/fix_plan.md` (M0102 section)
 
 ## Operational policy (2026-05-13)
