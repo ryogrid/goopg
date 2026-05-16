@@ -188,6 +188,9 @@ func Init(opts Options) error {
 	if err := bootstrapPostgresRole(abs); err != nil {
 		return fmt.Errorf("goopg init: postgres role: %w", err)
 	}
+	if err := bootstrapPostgresDatabase(abs); err != nil {
+		return fmt.Errorf("goopg init: postgres database: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -242,11 +245,13 @@ func bootstrapSLRUPlaceholders(dataDir string) error {
 // during startup (via the relation map) before the catalogs are fully
 // bootstrapped. Without the files, PG FATALs with "could not open file".
 func bootstrapSharedCatalogPlaceholders(dataDir string) error {
-	page := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(page); err != nil {
+	heapPage := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(heapPage); err != nil {
 		return err
 	}
-	sharedOIDs := []uint32{
+
+	// Shared catalog heap tables
+	heapOIDs := []uint32{
 		1260, // pg_authid
 		1261, // pg_auth_members
 		1262, // pg_database
@@ -257,13 +262,51 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 		6100, // pg_subscription
 		6243, // pg_parameter_acl
 	}
-	for _, oid := range sharedOIDs {
+	for _, oid := range heapOIDs {
 		path := filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10))
-		if err := os.WriteFile(path, page, 0o600); err != nil {
+		if err := os.WriteFile(path, heapPage, 0o600); err != nil {
 			return err
 		}
 	}
+	// NOTE: NOT creating critical index pages. If the index files
+	// exist, PG uses index scans (returning empty) and never falls
+	// back to sequential scan of the heap. Without index files,
+	// PG's IndexScanOK() returns false for auth/database lookups
+	// (!criticalSharedRelcachesBuilt), forcing a seq scan.
 	return nil
+}
+
+// makeBtreeRootPage creates an empty btree root page that PG can
+// open without crashing. B-tree pages use pd_special for the
+// BTPageOpaqueData struct. An empty root/leaf page has btpo_flags =
+// BTP_LEAF | BTP_ROOT.
+func makeBtreeRootPage() []byte {
+	// BTPageOpaqueData: btpo_prev(4) + btpo_next(4) + btpo_level(4) +
+	// btpo_flags(2) + btpo_cycleid(2) = 16 bytes
+	const btreeOpaqueSize = 16
+	const btpLeaf = 1
+	const btpRoot = 2
+
+	page := make([]byte, storage.BlockSize)
+	// Standard page header (like InitPage)
+	for i := range page {
+		page[i] = 0
+	}
+	h := storage.MustHeader(storage.Page(page))
+	h.SetLower(storage.SizeOfPageHeaderData)
+	h.SetSpecial(uint16(storage.BlockSize - btreeOpaqueSize))
+	h.SetUpper(uint16(storage.BlockSize - btreeOpaqueSize))
+	h.SetPagesizeVersion(storage.BlockSize | 4) // pgPageLayoutVersion
+
+	// Initialize BTPageOpaqueData at the end of the page
+	le := binary.LittleEndian
+	off := storage.BlockSize - btreeOpaqueSize
+	le.PutUint32(page[off:off+4], 0)    // btpo_prev = P_NONE
+	le.PutUint32(page[off+4:off+8], 0)  // btpo_next = P_NONE
+	le.PutUint32(page[off+8:off+12], 0) // btpo_level = 0 (leaf)
+	le.PutUint16(page[off+12:off+14], btpLeaf|btpRoot) // flags
+	le.PutUint16(page[off+14:off+16], 0) // btpo_cycleid = 0
+	return page
 }
 
 // bootstrapPostgresRole writes a minimal pg_authid tuple for the
@@ -332,6 +375,150 @@ func bootstrapPostgresRole(dataDir string) error {
 		}
 	}
 	path := filepath.Join(dataDir, "global", "1260") // pg_authid OID
+	return os.WriteFile(path, page, 0o600)
+}
+
+// bootstrapPostgresDatabase writes a minimal pg_database tuple for the
+// template1 database so PG can look up database names during connection.
+func bootstrapPostgresDatabase(dataDir string) error {
+	// pg_database columns (postgres/src/include/catalog/pg_database.h):
+	// oid(4), datname(64), datdba(4), encoding(4), datlocprovider(1),
+	// datistemplate(1), datallowconn(1), datconnlimit(4), datfrozenxid(4),
+	// datminmxid(4), dattablespace(4), datcollate(64), datctype(64),
+	// daticulocale(text), datcollversion(text), datacl(aclitem[])
+	cols := []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+		{Name: "datname", Type: catalog.Type{Name: "name"}, Ordinal: 1},
+		{Name: "datdba", Type: catalog.Type{Name: "oid"}, Ordinal: 2},
+		{Name: "encoding", Type: catalog.Type{Name: "int4"}, Ordinal: 3},
+		{Name: "datlocprovider", Type: catalog.Type{Name: "char"}, Ordinal: 4},
+		{Name: "datistemplate", Type: catalog.Type{Name: "bool"}, Ordinal: 5},
+		{Name: "datallowconn", Type: catalog.Type{Name: "bool"}, Ordinal: 6},
+		{Name: "datconnlimit", Type: catalog.Type{Name: "int4"}, Ordinal: 7},
+		{Name: "datfrozenxid", Type: catalog.Type{Name: "xid"}, Ordinal: 8},
+		{Name: "datminmxid", Type: catalog.Type{Name: "xid"}, Ordinal: 9},
+		{Name: "dattablespace", Type: catalog.Type{Name: "oid"}, Ordinal: 10},
+		{Name: "datcollate", Type: catalog.Type{Name: "name"}, Ordinal: 11},
+		{Name: "datctype", Type: catalog.Type{Name: "name"}, Ordinal: 12},
+		{Name: "daticulocale", Type: catalog.Type{Name: "text"}, Ordinal: 13},
+		{Name: "datcollversion", Type: catalog.Type{Name: "text"}, Ordinal: 14},
+		{Name: "datacl", Type: catalog.Type{Name: "text"}, Ordinal: 15},
+	}
+	row := executor.Row{
+		executor.NewIntDatum(1),             // oid = template1
+		executor.NewStringDatum("template1"), // datname
+		executor.NewIntDatum(10),             // datdba = bootstrap superuser
+		executor.NewIntDatum(6),              // encoding = PG_UTF8
+		executor.NewStringDatum("c"),         // datlocprovider = libc
+		executor.NewBoolDatum(false),         // datistemplate
+		executor.NewBoolDatum(true),          // datallowconn
+		executor.NewIntDatum(-1),             // datconnlimit
+		executor.NewIntDatum(3),              // datfrozenxid
+		executor.NewIntDatum(1),              // datminmxid
+		executor.NewIntDatum(1663),           // dattablespace = pg_default
+		executor.NewStringDatum("C"),          // datcollate
+		executor.NewStringDatum("C"),          // datctype
+		executor.NewStringDatum(""),           // daticulocale (empty, not null)
+		executor.NewStringDatum(""),           // datcollversion (empty, not null)
+		executor.NewStringDatum(""),           // datacl (empty, not null)
+	}
+	payload, err := executor.EncodeRowPG(cols, row)
+	if err != nil {
+		return err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+	tuple.Header.SetNatts(len(cols))
+	if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+		return err
+	}
+	// Also add "postgres" database (default connection target).
+	row2 := make(executor.Row, len(row))
+	copy(row2, row)
+	row2[0] = executor.NewIntDatum(5)             // oid = 5
+	row2[1] = executor.NewStringDatum("postgres") // datname
+	payload2, err := executor.EncodeRowPG(cols, row2)
+	if err != nil {
+		return err
+	}
+	tuple2 := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload2)
+	tuple2.Header.SetNatts(len(cols))
+	if _, err := storage.PageAddHeapTuple(page, tuple2); err != nil {
+		return err
+	}
+	// Create the database directory with PG_VERSION and copies of
+	// the default database catalog files (from base/1/).
+	dbDir := filepath.Join(dataDir, "base", "5")
+	if err := os.MkdirAll(dbDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dbDir, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		return err
+	}
+	base1Dir := filepath.Join(dataDir, "base", "1")
+	entries, _ := os.ReadDir(base1Dir)
+	for _, e := range entries {
+		src := filepath.Join(base1Dir, e.Name())
+		dst := filepath.Join(dbDir, e.Name())
+		data, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(dst, data, 0o600); err != nil {
+			return err
+		}
+	}
+	// Local pg_filenode.map with critical local catalog entries.
+	// All standard PG local catalogs (OID == filenumber by default).
+	localRelMap := makeRelMapFile([][2]uint32{
+		{1247, 1247}, // pg_type
+		{1249, 1249}, // pg_attribute
+		{1255, 1255}, // pg_proc
+		{1259, 1259}, // pg_class
+		{2600, 2600}, // pg_aggregate
+		{2601, 2601}, // pg_am
+		{2602, 2602}, // pg_amop
+		{2603, 2603}, // pg_amproc
+		{2604, 2604}, // pg_attrdef
+		{2605, 2605}, // pg_cast
+		{2606, 2606}, // pg_constraint
+		{2607, 2607}, // pg_conversion
+		{2608, 2608}, // pg_depend
+		{2609, 2609}, // pg_description
+		{2610, 2610}, // pg_index
+		{2611, 2611}, // pg_inherits
+		{2612, 2612}, // pg_language
+		{2613, 2613}, // pg_largeobject
+		{2614, 2614}, // pg_largeobject_metadata
+		{2615, 2615}, // pg_namespace
+		{2616, 2616}, // pg_opclass
+		{2617, 2617}, // pg_operator
+		{2618, 2618}, // pg_rewrite
+		{2619, 2619}, // pg_statistic
+		{2620, 2620}, // pg_trigger
+		{3381, 3381}, // pg_statistic_ext
+		{3596, 3596}, // pg_seclabel
+		{3764, 3764}, // pg_ts_config
+		{3765, 3765}, // pg_ts_config_map
+		{3766, 3766}, // pg_ts_dict
+		{3767, 3767}, // pg_ts_parser
+		{3768, 3768}, // pg_ts_template
+		{4044, 4044}, // pg_event_trigger
+		{6003, 6003}, // pg_publication
+		{6101, 6101}, // pg_publication_rel
+		{6102, 6102}, // pg_sequence
+		{6137, 6137}, // pg_transform
+		{6239, 6239}, // pg_authid (shared but also local copy sometimes)
+		{6245, 6245}, // pg_statistic_ext_data
+		{9400, 9400}, // pg_db_role_setting (shared but may need local mapping)
+	})
+	if err := os.WriteFile(filepath.Join(dbDir, "pg_filenode.map"), localRelMap, 0o600); err != nil {
+		return err
+	}
+	path := filepath.Join(dataDir, "global", "1262") // pg_database OID
 	return os.WriteFile(path, page, 0o600)
 }
 
@@ -457,16 +644,12 @@ func defaultPostgresqlConf() []byte {
 `)
 }
 
-func defaultRelMapFile() []byte {
+func makeRelMapFile(mappings [][2]uint32) []byte {
 	// RelMapFile layout (PG src/backend/utils/cache/relmapper.c):
 	//   int32 magic (4 bytes) = RELMAPPER_FILEMAGIC (0x592717)
 	//   int32 num_mappings (4 bytes)
 	//   RelMapping mappings[64] (512 bytes, 8 bytes each: Oid + RelFileNumber)
 	//   pg_crc32c crc (4 bytes) at offset 520
-	//
-	// PG requires mappings for shared system catalogs accessed before
-	// pg_class is available. We include pg_database (1262) and
-	// pg_authid (1260) with standard filenumbers matching their OIDs.
 	const (
 		relFileSize   = 524
 		relMagic      = 0x592717
@@ -474,21 +657,6 @@ func defaultRelMapFile() []byte {
 	)
 	out := make([]byte, relFileSize)
 	binary.LittleEndian.PutUint32(out[0:4], relMagic)
-
-	// Shared-catalog entries (PG BKI_SHARED_RELATION catalogs).
-	// PG backends look up these OIDs via RelationMapOidToFilenumber
-	// before pg_class is available. All use same filenumber = OID.
-	mappings := [][2]uint32{
-		{1262, 1262}, // pg_database
-		{1260, 1260}, // pg_authid
-		{1261, 1261}, // pg_auth_members
-		{1213, 1213}, // pg_tablespace
-		{1214, 1214}, // pg_shdepend
-		{3592, 3592}, // pg_shdescription
-		{6000, 6000}, // pg_replication_origin
-		{6100, 6100}, // pg_subscription
-		{6243, 6243}, // pg_parameter_acl
-	}
 	binary.LittleEndian.PutUint32(out[4:8], uint32(len(mappings)))
 	for i, m := range mappings {
 		off := 8 + i*8
@@ -498,6 +666,20 @@ func defaultRelMapFile() []byte {
 	crc := crc32.Checksum(out[:relCRCCOffset], crcCastagnoliTable)
 	binary.LittleEndian.PutUint32(out[relCRCCOffset:], crc)
 	return out
+}
+
+func defaultRelMapFile() []byte {
+	return makeRelMapFile([][2]uint32{
+		{1262, 1262}, // pg_database
+		{1260, 1260}, // pg_authid
+		{1261, 1261}, // pg_auth_members
+		{1213, 1213}, // pg_tablespace
+		{1214, 1214}, // pg_shdepend
+		{3592, 3592}, // pg_shdescription
+		{6000, 6000}, // pg_replication_origin
+		{6100, 6100}, // pg_subscription
+		{6243, 6243}, // pg_parameter_acl
+	})
 }
 
 func defaultPgIdentConf() []byte {

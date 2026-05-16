@@ -69,25 +69,40 @@ func EncodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 }
 
 // encodeRowPG encodes a row in PG-native physical tuple format.
+// PG's heap_fill_tuple omits the null bitmap when all columns are
+// non-null. When nulls are present, the bitmap is at the start of
+// the data area with each null column's bit set to 1.
 func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 	numCols := len(cols)
-	nullBitmapLen := (numCols + 7) / 8
-	nullBitmap := make([]byte, nullBitmapLen)
-	for i, d := range row {
+	hasNull := false
+	for _, d := range row {
 		if d.IsNull() {
-			nullBitmap[i/8] |= 1 << (i % 8)
+			hasNull = true
+			break
 		}
 	}
-	out := make([]byte, 0, 256)
-	out = append(out, nullBitmap...)
-	off := nullBitmapLen
+	var out []byte
+	off := 0
+	if hasNull {
+		nullBitmapLen := (numCols + 7) / 8
+		nullBitmap := make([]byte, nullBitmapLen)
+		for i, d := range row {
+			if d.IsNull() {
+				nullBitmap[i/8] |= 1 << (i % 8)
+			}
+		}
+		out = make([]byte, 0, 256)
+		out = append(out, nullBitmap...)
+		off = nullBitmapLen
+	} else {
+		out = make([]byte, 0, 256)
+	}
 	for i, c := range cols {
 		d := row[i]
 		if d.IsNull() {
 			continue
 		}
 		if d.Kind == KindToastPointer {
-			// TOAST pointer: 12 bytes at current offset.
 			off = alignPhysicalPGOffset(off, 4)
 			for len(out) < off+12 {
 				out = append(out, 0)
@@ -102,7 +117,6 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Grow output to fit aligned offset + value.
 		for len(out) < off+len(buf) {
 			out = append(out, 0)
 		}
