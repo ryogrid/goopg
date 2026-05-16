@@ -3022,6 +3022,19 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         to `accepted`. Confirm no regressions: `go test ./internal/storage/
         ./internal/wal/ ./internal/server/ ./internal/initdb/` all green.
 
+- [ ] **M0105-0007**
+      - Summary: Fix WAL sender stall during `pg_basebackup -X stream`.
+      - E2E test revealed that `pg_basebackup -X stream` hangs on the
+        `START_REPLICATION` connection: goopg's WAL sender accepts the
+        replication connection but never streams WAL data or keepalive
+        messages, causing pg_basebackup to block in `do_select` forever.
+        Root cause likely in `internal/server/replication.go` or the WAL
+        sender goroutine: after `START_REPLICATION` with a physical slot,
+        the sender must stream WAL from the requested LSN through
+        CopyData frames, sending keepalive messages when idle. Without
+        this, the E2E async test times out at 15 minutes.
+      - File: `internal/server/replication.go`, `internal/wal/`
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
