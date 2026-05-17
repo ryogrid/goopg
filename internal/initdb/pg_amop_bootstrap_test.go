@@ -106,6 +106,9 @@ func TestPgAmopInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 		{1994, 19, [5]uint32{660, 661, 93, 663, 662}, "name"},
 		{2095, 25, [5]uint32{2314, 2315, 98, 2317, 2318}, "text_pattern"},
 		{424, 16, [5]uint32{58, 1694, 91, 1695, 59}, "bool"},
+		{429, 18, [5]uint32{631, 632, 92, 634, 633}, "char"},
+		{1991, 30, [5]uint32{645, 647, 649, 648, 646}, "oidvector"},
+		{2097, 1042, [5]uint32{2326, 2327, 1054, 2329, 2330}, "bpchar_pattern"},
 	}
 	for _, w := range want {
 		for i := 0; i < 5; i++ {
@@ -118,6 +121,10 @@ func TestPgAmopInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 				t.Errorf("%s strategy %d: opr=%d, want %d", w.label, i+1, got.Operator, w.ops[i])
 			}
 		}
+	}
+	// Total row count = 11 families × 5 strategies = 55.
+	if got, want := len(entries), 55; got != want {
+		t.Errorf("entry count: got %d, want %d", got, want)
 	}
 }
 

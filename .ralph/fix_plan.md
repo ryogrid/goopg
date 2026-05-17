@@ -2609,11 +2609,30 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
         PASS. Design:
         `docs/design/0106-0010-step3c-pg-amop-amproc-bootstrap.md`.
-      - Step 3d (still open): cross-type amop/amproc rows + fix
-        Step 3b's wrong opfamily OIDs for bpchar_pattern_ops
-        (should be 2097), char_ops (synthetic family needed),
-        oidvector_ops (synthetic family needed); then add amop /
-        amproc rows for those four opclasses.
+      - Step 3d LANDED 2026-05-17. `internal/initdb/initdb.go::
+        pgOpclassInitialEntries` corrects three wrong opcfamily OIDs
+        assigned by Step 3b: char_ops(1985) 1994→429 (btree/char_ops);
+        oidvector_ops(1987) 1989→1991 (btree/oidvector_ops);
+        bpchar_pattern_ops(4219) 426→2097 (BPCHAR_PATTERN_BTREE_FAM_OID).
+        `pgAmopInitialEntries` gains three `add()` calls — 15 new strategy
+        rows (char/18 family 429 ops [631,632,92,634,633]; oidvector/30
+        family 1991 ops [645,647,649,648,646]; bpchar/1042 family 2097 ops
+        [2326,2327,1054,2329,2330]); slice capacity bumped 40→55.
+        `pgAmprocInitialEntries` gains 3 default cmp procs — btcharcmp
+        (358) family 429, btoidvectorcmp (404) family 1991,
+        btbpchar_pattern_cmp (2180) family 2097; total 8→11. Regression
+        pins: `TestPgOpclassInitialEntriesCoverNailedIndexNeeds` now
+        pins canonical `opcfamily` per OID;
+        `TestPgAmopInitialEntriesCoverPinnedOpclasses` extended with the
+        three new families + len==55 check; same for amproc with
+        len==11. Verified: `go test -count=1 -run 'TestPgAmop|TestPgAmproc|TestPgOpclass'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS; baseline-diff stash confirms the 14
+        pre-existing initdb failures are unchanged. Design:
+        `docs/design/0106-0010-step3d-pg-amop-amproc-pinned-opfamily-fix.md`.
+        Still open: cross-type amop/amproc rows (lefttype != righttype),
+        sortsupport (amprocnum=2) / equalimage (amprocnum=4) procs.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,

@@ -90,6 +90,9 @@ func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 		{1994, 19, 359, "btnamecmp"},
 		{2095, 25, 2166, "bttext_pattern_cmp"},
 		{424, 16, 1693, "btboolcmp"},
+		{429, 18, 358, "btcharcmp"},
+		{1991, 30, 404, "btoidvectorcmp"},
+		{2097, 1042, 2180, "btbpchar_pattern_cmp"},
 	}
 	for _, w := range want {
 		got, ok := byKey[key{w.family, w.lefttype, w.lefttype, 1}]
@@ -100,6 +103,10 @@ func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 		if got.Proc != w.proc {
 			t.Errorf("%s: proc=%d, want %d", w.label, got.Proc, w.proc)
 		}
+	}
+	// One row per pinned default opclass family/type.
+	if got, want := len(entries), 11; got != want {
+		t.Errorf("entry count: got %d, want %d", got, want)
 	}
 }
 

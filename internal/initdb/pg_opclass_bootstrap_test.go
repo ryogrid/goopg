@@ -116,6 +116,35 @@ func TestPgOpclassInitialEntriesCoverNailedIndexNeeds(t *testing.T) {
 	if got, ok := byOID[1986]; ok && got.KeyType != 2275 {
 		t.Errorf("name_ops opckeytype: got %d, want 2275 (cstring)", got.KeyType)
 	}
+	// Canonical opfamily OIDs from pg_opfamily.dat. Step 3b set
+	// three of these wrong; Step 3d corrected them — pin so a
+	// future regression is caught immediately.
+	wantFamily := map[uint32]struct {
+		family uint32
+		label  string
+	}{
+		1978: {1976, "int4_ops → INTEGER_BTREE_FAM_OID"},
+		1979: {1976, "int2_ops → INTEGER_BTREE_FAM_OID"},
+		3124: {1976, "int8_ops → INTEGER_BTREE_FAM_OID"},
+		1981: {1989, "oid_ops → OID_BTREE_FAM_OID"},
+		3126: {1994, "text_ops → TEXT_BTREE_FAM_OID"},
+		1986: {1994, "name_ops → TEXT_BTREE_FAM_OID (shared)"},
+		4217: {2095, "text_pattern_ops → TEXT_PATTERN_BTREE_FAM_OID"},
+		4218: {2095, "varchar_pattern_ops → TEXT_PATTERN_BTREE_FAM_OID (shared)"},
+		4219: {2097, "bpchar_pattern_ops → BPCHAR_PATTERN_BTREE_FAM_OID"},
+		1985: {429, "char_ops → btree/char_ops"},
+		1987: {1991, "oidvector_ops → btree/oidvector_ops"},
+		1984: {424, "bool_ops → BOOL_BTREE_FAM_OID"},
+	}
+	for oid, want := range wantFamily {
+		got, ok := byOID[oid]
+		if !ok {
+			continue
+		}
+		if got.Family != want.family {
+			t.Errorf("OID %d (%s): opcfamily=%d, want %d", oid, want.label, got.Family, want.family)
+		}
+	}
 }
 
 // TestBootstrapPgOpclassTuplesWritesRowsToBase1And5 verifies the

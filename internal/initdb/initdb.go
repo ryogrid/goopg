@@ -911,16 +911,25 @@ func pgOpclassInitialEntries() []pgOpclassEntry {
 		famOID      uint32 = 1989 // OID_BTREE_FAM_OID
 		famText     uint32 = 1994 // TEXT_BTREE_FAM_OID
 		famTextPat  uint32 = 2095 // TEXT_PATTERN_BTREE_FAM_OID
-		famBpchar   uint32 = 426  // BPCHAR_BTREE_FAM_OID
+		// Canonical opfamily OIDs sourced from pg_opfamily.dat for the
+		// three pinned opclasses below. Step 3b mistakenly reused
+		// neighbouring families (famText for char_ops, famOID for
+		// oidvector_ops, BPCHAR_BTREE for bpchar_pattern_ops) —
+		// corrected here so pg_amop lookups under the right family
+		// resolve.
+		famCharBtree          uint32 = 429  // btree/char_ops
+		famOidvectorBtree     uint32 = 1991 // btree/oidvector_ops
+		famBpcharPatternBtree uint32 = 2097 // BPCHAR_PATTERN_BTREE_FAM_OID
+		famBool               uint32 = 424  // BOOL_BTREE_FAM_OID
 	)
 	// Synthetic OIDs for opclasses with no hardcoded OID in
 	// pg_opclass_d.h. Chosen below FirstGenbkiObjectId (10000) so
 	// they don't collide with user-assigned OIDs.
 	const (
-		nameBtreeOps     uint32 = 1986
-		charBtreeOps     uint32 = 1985
+		nameBtreeOps      uint32 = 1986
+		charBtreeOps      uint32 = 1985
 		oidvectorBtreeOps uint32 = 1987
-		boolBtreeOps     uint32 = 1984
+		boolBtreeOps      uint32 = 1984
 	)
 	return []pgOpclassEntry{
 		// Hardcoded OIDs from pg_opclass_d.h.
@@ -931,15 +940,15 @@ func pgOpclassInitialEntries() []pgOpclassEntry {
 		{3126, amBtree, "text_ops", nsPGCatalog, ownerSuper, famText, 25, true, 0},
 		{4217, amBtree, "text_pattern_ops", nsPGCatalog, ownerSuper, famTextPat, 25, false, 0},
 		{4218, amBtree, "varchar_pattern_ops", nsPGCatalog, ownerSuper, famTextPat, 25, false, 0},
-		{4219, amBtree, "bpchar_pattern_ops", nsPGCatalog, ownerSuper, famBpchar, 1042, false, 0},
+		{4219, amBtree, "bpchar_pattern_ops", nsPGCatalog, ownerSuper, famBpcharPatternBtree, 1042, false, 0},
 		// Dynamically-assigned OIDs we pin so nailed-index
 		// indclass references can point at them.
 		// name_ops keys are stored as cstring (2275) for index
 		// space — see pg_opclass.dat comment.
 		{nameBtreeOps, amBtree, "name_ops", nsPGCatalog, ownerSuper, famText, 19, true, 2275},
-		{charBtreeOps, amBtree, "char_ops", nsPGCatalog, ownerSuper, famText, 18, true, 0},
-		{oidvectorBtreeOps, amBtree, "oidvector_ops", nsPGCatalog, ownerSuper, famOID, 30, true, 0},
-		{boolBtreeOps, amBtree, "bool_ops", nsPGCatalog, ownerSuper, 424 /* BOOL_BTREE_FAM_OID */, 16, true, 0},
+		{charBtreeOps, amBtree, "char_ops", nsPGCatalog, ownerSuper, famCharBtree, 18, true, 0},
+		{oidvectorBtreeOps, amBtree, "oidvector_ops", nsPGCatalog, ownerSuper, famOidvectorBtree, 30, true, 0},
+		{boolBtreeOps, amBtree, "bool_ops", nsPGCatalog, ownerSuper, famBool, 16, true, 0},
 	}
 }
 
@@ -1019,19 +1028,22 @@ func pgAmopColDefs() []catalog.Column {
 // OID column merely identifies the row in pg_amop_oid_index.
 func pgAmopInitialEntries() []pgAmopEntry {
 	const (
-		amBtree         uint32 = 403
-		famInteger      uint32 = 1976
-		famOID          uint32 = 1989
-		famText         uint32 = 1994
-		famTextPattern  uint32 = 2095
-		famBool         uint32 = 424
-		purposeSearch   byte   = 's'
+		amBtree               uint32 = 403
+		famInteger            uint32 = 1976
+		famOID                uint32 = 1989
+		famText               uint32 = 1994
+		famTextPattern        uint32 = 2095
+		famBool               uint32 = 424
+		famCharBtree          uint32 = 429
+		famOidvectorBtree     uint32 = 1991
+		famBpcharPatternBtree uint32 = 2097
+		purposeSearch         byte   = 's'
 	)
 	// Synthetic OIDs for the amop rows themselves. PG normally
 	// assigns these at initdb time; we pin contiguous ranges so
 	// the pg_amop_oid_index can later be heap-rebuilt.
 	const baseOID uint32 = 7000
-	out := make([]pgAmopEntry, 0, 40)
+	out := make([]pgAmopEntry, 0, 55)
 	add := func(family, lefttype uint32, ops [5]uint32) {
 		for i := 0; i < 5; i++ {
 			out = append(out, pgAmopEntry{
@@ -1063,6 +1075,12 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	add(famTextPattern, 25, [5]uint32{2314, 2315, 98, 2317, 2318})
 	// bool — 58 <, 1694 <=, 91 =, 1695 >=, 59 >.
 	add(famBool, 16, [5]uint32{58, 1694, 91, 1695, 59})
+	// char — pg_operator.dat 631 <, 632 <=, 92 =, 634 >=, 633 >.
+	add(famCharBtree, 18, [5]uint32{631, 632, 92, 634, 633})
+	// oidvector — 645 <, 647 <=, 649 =, 648 >=, 646 >.
+	add(famOidvectorBtree, 30, [5]uint32{645, 647, 649, 648, 646})
+	// bpchar pattern — 2326 ~<~, 2327 ~<=~, 1054 =, 2329 ~>=~, 2330 ~>~.
+	add(famBpcharPatternBtree, 1042, [5]uint32{2326, 2327, 1054, 2329, 2330})
 	return out
 }
 
@@ -1142,11 +1160,14 @@ func pgAmprocColDefs() []catalog.Column {
 // to its comparison function.
 func pgAmprocInitialEntries() []pgAmprocEntry {
 	const (
-		famInteger     uint32 = 1976
-		famOID         uint32 = 1989
-		famText        uint32 = 1994
-		famTextPattern uint32 = 2095
-		famBool        uint32 = 424
+		famInteger            uint32 = 1976
+		famOID                uint32 = 1989
+		famText               uint32 = 1994
+		famTextPattern        uint32 = 2095
+		famBool               uint32 = 424
+		famCharBtree          uint32 = 429
+		famOidvectorBtree     uint32 = 1991
+		famBpcharPatternBtree uint32 = 2097
 	)
 	const baseOID uint32 = 7100
 	out := []pgAmprocEntry{
@@ -1164,6 +1185,12 @@ func pgAmprocInitialEntries() []pgAmprocEntry {
 		{0, famTextPattern, 25, 25, 1, 2166}, // bttext_pattern_cmp
 		// btree bool_ops default cmp.
 		{0, famBool, 16, 16, 1, 1693}, // btboolcmp
+		// btree char_ops default cmp.
+		{0, famCharBtree, 18, 18, 1, 358}, // btcharcmp
+		// btree oidvector_ops default cmp.
+		{0, famOidvectorBtree, 30, 30, 1, 404}, // btoidvectorcmp
+		// btree bpchar_pattern_ops default cmp.
+		{0, famBpcharPatternBtree, 1042, 1042, 1, 2180}, // btbpchar_pattern_cmp
 	}
 	for i := range out {
 		out[i].OID = baseOID + uint32(i)
