@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -333,31 +334,60 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 // BTPageOpaqueData struct. An empty root/leaf page has btpo_flags =
 // BTP_LEAF | BTP_ROOT.
 func makeBtreeRootPage() []byte {
-	// BTPageOpaqueData: btpo_prev(4) + btpo_next(4) + btpo_level(4) +
-	// btpo_flags(2) + btpo_cycleid(2) = 16 bytes
-	const btreeOpaqueSize = 16
-	const btpLeaf = 1
-	const btpRoot = 2
+	// BTPageOpaqueData layout (16 bytes, end of page):
+	//   btpo_prev(4) + btpo_next(4) + btpo_level(4) + btpo_flags(2) +
+	//   btpo_cycleid(2).
+	// BTMetaPageData layout (sizeof == 48 with trailing pad to 8-byte
+	// alignment) mirroring postgres/src/include/access/nbtree.h:
+	//   btm_magic        uint32   @ 0
+	//   btm_version      uint32   @ 4
+	//   btm_root         uint32   @ 8
+	//   btm_level        uint32   @ 12
+	//   btm_fastroot     uint32   @ 16
+	//   btm_fastlevel    uint32   @ 20
+	//   btm_last_cleanup_num_delpages uint32 @ 24
+	//   (4 bytes padding for float8 alignment)
+	//   btm_last_cleanup_num_heap_tuples float8 @ 32  (= -1.0)
+	//   btm_allequalimage bool @ 40
+	//   (7 bytes trailing pad to sizeof multiple of 8)
+	// The on-disk image must satisfy PG's `_bt_getmeta` sanity check:
+	// P_ISMETA(opaque) && metad->btm_magic == BTREE_MAGIC. Block 0 of
+	// every nailed index file is consumed by this metapage; btm_root =
+	// P_NONE (0) declares the index empty so PG's `_bt_getroot` returns
+	// no rows on read-only paths and would lazily allocate a real root
+	// on the first write. For bootstrap snapshots that matches behavior
+	// of an index that has never had a tuple inserted.
+	const (
+		btreeOpaqueSize      = 16
+		sizeofBTMetaPageData = 48
+		btpMeta              = 1 << 3   // BTP_META
+		btreeMagic           = 0x053162 // BTREE_MAGIC
+		btreeVersion         = 4        // BTREE_VERSION
+	)
 
 	page := make([]byte, storage.BlockSize)
-	// Standard page header (like InitPage)
-	for i := range page {
-		page[i] = 0
-	}
 	h := storage.MustHeader(storage.Page(page))
-	h.SetLower(storage.SizeOfPageHeaderData)
-	h.SetSpecial(uint16(storage.BlockSize - btreeOpaqueSize))
+	// pd_lower points just past the BTMetaPageData payload, matching
+	// upstream `_bt_initmetapage` so xlog page-image compression keeps
+	// the metadata bytes (see postgres/src/backend/access/nbtree/nbtpage.c:94).
+	h.SetLower(uint16(storage.SizeOfPageHeaderData + sizeofBTMetaPageData))
 	h.SetUpper(uint16(storage.BlockSize - btreeOpaqueSize))
-	h.SetPagesizeVersion(storage.BlockSize | 4) // pgPageLayoutVersion
+	h.SetSpecial(uint16(storage.BlockSize - btreeOpaqueSize))
+	h.SetPagesizeVersion(storage.BlockSize | 4) // pgPageLayoutVersion = 4
 
-	// Initialize BTPageOpaqueData at the end of the page
 	le := binary.LittleEndian
+	base := storage.SizeOfPageHeaderData
+	le.PutUint32(page[base+0:base+4], btreeMagic)
+	le.PutUint32(page[base+4:base+8], btreeVersion)
+	// btm_root, btm_level, btm_fastroot, btm_fastlevel,
+	// btm_last_cleanup_num_delpages already zero.
+	// btm_last_cleanup_num_heap_tuples = -1.0 (canonical sentinel).
+	le.PutUint64(page[base+32:base+40], math.Float64bits(-1.0))
+	// btm_allequalimage = false (zero); trailing pad already zero.
+
+	// BTPageOpaqueData at end of page; only btpo_flags is nonzero.
 	off := storage.BlockSize - btreeOpaqueSize
-	le.PutUint32(page[off:off+4], 0)    // btpo_prev = P_NONE
-	le.PutUint32(page[off+4:off+8], 0)  // btpo_next = P_NONE
-	le.PutUint32(page[off+8:off+12], 0) // btpo_level = 0 (leaf)
-	le.PutUint16(page[off+12:off+14], btpLeaf|btpRoot) // flags
-	le.PutUint16(page[off+14:off+16], 0) // btpo_cycleid = 0
+	le.PutUint16(page[off+12:off+14], btpMeta)
 	return page
 }
 

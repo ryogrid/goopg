@@ -2878,6 +2878,58 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
         PASS. Design:
         `docs/design/0106-0010-step3j-relnatts-indnatts-alignment.md`.
+      - Step 3k LANDED 2026-05-17. Closes the FATAL
+        `index "pg_opclass_oid_index" is not a btree` PG-standby boot
+        blocker that surfaced after Step 3j. Root cause:
+        `internal/initdb/initdb.go::makeBtreeRootPage` was emitting a
+        `BTP_LEAF|BTP_ROOT` page with no `BTMetaPageData` at block 0
+        of every nailed-index file. PG's
+        `postgres/src/backend/access/nbtree/nbtpage.c::_bt_getmeta`
+        (line 152) FATALs unless block 0 is a metapage carrying
+        `BTREE_MAGIC` and `BTP_META` in `btpo_flags`. Earlier steps
+        (3a–3j) hit different FATALs first, so the latent
+        index-format bug surfaced only after Step 3j cleared the
+        last relcache consistency check.
+        Fix: `makeBtreeRootPage` rewritten to mirror upstream
+        `_bt_initmetapage`. New `math` import; function now writes
+        `btm_magic = 0x053162`, `btm_version = 4`, `btm_root =
+        P_NONE` (empty-index sentinel), `btm_fastroot = P_NONE`,
+        `btm_last_cleanup_num_heap_tuples = -1.0` (via
+        `math.Float64bits`), `btm_allequalimage = false`, `pd_lower
+        = SizeOfPageHeaderData + sizeof(BTMetaPageData)` so xlog
+        page-image compression preserves the metadata bytes
+        (matches nbtpage.c:94), and `btpo_flags = BTP_META` at end
+        of page. Both call sites in `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/` index seeds for 23 + 6
+        OIDs) now produce PG-conformant empty btree files.
+        Regression pin: `TestMakeBtreeRootPageMatchesPGMetapage` in
+        `internal/initdb/btree_metapage_test.go` asserts every
+        load-bearing on-disk field (`BTREE_MAGIC`, `BTREE_VERSION`,
+        `P_NONE` for both root and fastroot, `-1.0` heap-tuples
+        sentinel, `BTP_META` opaque flag, `pd_lower` past metadata,
+        all other opaque fields zero) so a future refactor cannot
+        silently regress the layout.
+        Verified: `go test -count=1 -run
+        TestMakeBtreeRootPageMatchesPGMetapage ./internal/initdb/`
+        PASS; `go test -count=1 ./internal/initdb/` — the 14
+        pre-existing baseline failures (M0106-0012 + bootstrapped
+        pg_class/pg_attribute readability + migration/recovery
+        suites) confirmed unchanged via stash-baseline diff
+        (`internal/initdb/initdb.go` stashed, new test file moved
+        aside, identical 14-failure list reproduced); `go test
+        -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. `GOOPG_RUN_BLOCKED_M0102_E2E=1` E2E re-run
+        (`TestE2E_FailoverGoopgToPG/async`) advances past the
+        "is not a btree" FATAL to the next blocker (Step 3l):
+        `FATAL: could not find tuple for opclass 1986` from
+        `LookupOpclassInfo`
+        (`postgres/src/backend/utils/cache/relcache.c:1766`). The
+        empty btree returns zero rows for the `name_ops` opclass
+        index scan; the next fix requires populating each nailed
+        index with real btree index tuples pointing at the
+        bootstrapped heap rows — substantial scope of its own.
+        Design: `docs/design/0106-0010-step3k-btree-metapage-encoding.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/storage/heap.go`,
@@ -2889,7 +2941,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_amop_bootstrap_test.go`,
         `internal/initdb/pg_amproc_bootstrap_test.go`,
         `internal/initdb/pg_index_bootstrap_test.go`,
-        `internal/initdb/pg_index_relnatts_test.go`
+        `internal/initdb/pg_index_relnatts_test.go`,
+        `internal/initdb/btree_metapage_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
@@ -2912,6 +2965,13 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
       - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.
       - Survery failure reason and fix. This test become failing after modifications
         related catalog bootstrap.
+
+ - [ ] **M0106-0013**
+      - Summary: Make goopg use control files same as PostgreSQL
+      - goopg currently uses original control file format like JSON and control file
+        persistence logic is not same as PostgreSQL. Usage of control file is also not same as PostgreSQL. This task is to make goopg use control files same as PostgreSQL and goopg's
+        durability guarantees should be same as PostgreSQL's durability guarantees after this task is done. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
+      - Files: `internal/storage/`, `internal/server/`
 
 ## Completed
 
