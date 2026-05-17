@@ -147,6 +147,14 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{2684, "pg_namespace_nspname_index"},
 	{2685, "pg_namespace_oid_index"},
 	{2654, "pg_amop_opr_fam_index"},
+	// M0106-0010 Step 3x: pg_aggregate_fnoid_index. PG18
+	// `postgres/src/include/catalog/pg_aggregate.h:113` declares
+	// `AggregateFnoidIndexId = 2650`. RelationInitIndexAccessInfo's
+	// `relnatts == indnatts` check (relcache.c:1492) requires this
+	// entry to flow through flattenRels → pgIndexNattsByOID so the
+	// nailed pg_class row's relnatts matches the pg_index row's
+	// indnatts == 1.
+	{2650, "pg_aggregate_fnoid_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

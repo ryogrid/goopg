@@ -49,6 +49,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2684: {2},        // pg_namespace_nspname_index : btree(nspname name_ops)            ← Step 3t
 		2685: {1},        // pg_namespace_oid_index     : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3t
 		2654: {7, 6, 2},  // pg_amop_opr_fam_index : btree(amopopr, amoppurpose, amopfamily)
+		2650: {1},        // pg_aggregate_fnoid_index : btree(aggfnoid oid_ops) UNIQUE PRIMARY ← Step 3x
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

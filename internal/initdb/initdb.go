@@ -677,6 +677,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	base1Dir := filepath.Join(dataDir, "base", "1")
 	btreePage := makeBtreeRootPage()
 	for _, oid := range []uint32{
+		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -759,6 +760,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	btreePage = makeBtreeRootPage()
 	for _, oid := range []uint32{
 		// Local critical indexes
+		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -774,6 +776,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	for _, oid := range []uint32{
 		2671, 2672, 2676, 2677, 2695, 3593,
 		// Also copy all local critical indexes to global/
+		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -1684,6 +1687,15 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// amoppurpose char_ops, amopfamily oid_ops). amoppurpose is
 		// pg_amop attnum 6 (char), amopopr is attnum 7, amopfamily attnum 2.
 		entry(2654, 2602, []int16{7, 6, 2}, []uint32{oidOps, charOps, oidOps}, []uint32{0, 0, 0}, true, false),         // pg_amop_opr_fam_index
+		// M0106-0010 Step 3x: pg_aggregate_fnoid_index (OID 2650).
+		// postgres/src/include/catalog/pg_aggregate.h:113 —
+		//   DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650,
+		//     AggregateFnoidIndexId, pg_aggregate,
+		//     btree(aggfnoid oid_ops));
+		//   MAKE_SYSCACHE(AGGFNOID, pg_aggregate_fnoid_index, 16);
+		// `aggfnoid` is regproc type but the index uses oid_ops, not
+		// regproc_ops. Indexes pg_aggregate (OID 2600) on attnum 1.
+		entry(2650, 2600, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_aggregate_fnoid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

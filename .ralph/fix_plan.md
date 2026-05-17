@@ -3677,10 +3677,71 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650, …)`),
         Step 3x territory.
         Design: `docs/design/0106-0010-step3w-pg-aggregate-nailed-rel.md`.
-      - Next blocker (Step 3x): add `pg_aggregate_fnoid_index` (OID
-        2650) to `pgIndexInitialEntries` and `nailedLocalRels`.
-        Single-column oid-keyed UNIQUE PRIMARY index on `aggfnoid`
-        (attnum 1).
+      - Step 3x LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2650` PG-standby boot blocker
+        that surfaced after Step 3w added pg_aggregate (OID 2600) to
+        `nailedLocalRels`. Authoritative source
+        `postgres/src/include/catalog/pg_aggregate.h:113`:
+        `DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650,
+        AggregateFnoidIndexId, pg_aggregate, btree(aggfnoid oid_ops));
+        MAKE_SYSCACHE(AGGFNOID, pg_aggregate_fnoid_index, 16);`.
+        Pure catalog-seed addition (no encoder/builder/Init change):
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(2650, 2600, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` — `aggfnoid` is regproc type but the canonical
+        index uses `oid_ops`, not `regproc_ops`.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2650, "pg_aggregate_fnoid_index"}`; `flattenRels`
+        consults `pgIndexNattsByOID()` (returns 1 for OID 2650), so the
+        nailed rel carries `RelKind='i', RelNatts=1` and
+        `RelationInitIndexAccessInfo`'s `relnatts == indnatts` check
+        passes.
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain `2650, // pg_aggregate_fnoid_index
+        (Step 3x)` — the placeholder is a valid empty PG18 btree
+        metapage (Step 3k's `makeBtreeRootPage` writes
+        `btm_root = P_NONE`), correct because `pg_aggregate` itself is
+        empty (no aggregate functions are bootstrapped).
+        The seed threads automatically through the existing flow:
+        `bootstrapPgClassTuples` → `bootstrapPgAttributeTuples` →
+        `bootstrapPgIndexTuples` (writes Form_pg_index row, captures
+        TID in `pgIndexTIDs` map) → `bootstrapPgIndexIndexrelidIndex`
+        (adds leaf to populated 2-page btree at file 2679) →
+        `bootstrapPgClassOidIndex` (adds leaf at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (adds composite-key leaf
+        at file 2659).
+        Regression pins:
+        `TestPgAggregateFnoidIndexSeededFromInitialEntries` (asserts
+        `(IndRelid=2600, IndKey=[1], IsUnique=true, IsPrimary=true)`)
+        and `TestNailedLocalRelsContainsPgAggregateFnoidIndex` (asserts
+        `RelName="pg_aggregate_fnoid_index", RelKind='i', RelNatts=1`)
+        in `internal/initdb/pg_aggregate_fnoid_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds `2650: {1}`
+        to the authoritative map (strict count guard forces future
+        additions to update); `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2650 so the populated 2679 btree must include
+        this OID's leaf.
+        Verified: `go test -count=1 -run
+        'TestPgAggregateFnoidIndex|TestNailedLocalRelsContainsPgAggregateFnoidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestNailedLocalRelsContainsPgAggregate'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3w (`TestMigration*`, `TestCreate*`,
+        `TestBootstrappedPG*`, `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3x-pg-aggregate-fnoid-index.md`.
+      - Next blocker (Step 3y): capture next FATAL via
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        E2E re-run. Candidates per the empty-heap inventory in
+        `bootstrapMappedLocalCatalogHeaps`: pg_attrdef=2604, pg_cast=2605,
+        pg_conversion=2607 (in nailedLocalRels), or unmapped catalogs.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3707,7 +3768,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_attribute_null_attoptions_test.go`,
         `internal/initdb/pg_aggregate_nailed_test.go`,
         `internal/initdb/pg_mapped_local_catalog_heap_test.go`,
-        `docs/design/0106-0010-step3w-pg-aggregate-nailed-rel.md`
+        `docs/design/0106-0010-step3w-pg-aggregate-nailed-rel.md`,
+        `internal/initdb/pg_aggregate_fnoid_index_test.go`,
+        `docs/design/0106-0010-step3x-pg-aggregate-fnoid-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
