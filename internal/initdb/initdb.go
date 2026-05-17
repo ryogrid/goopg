@@ -1123,9 +1123,12 @@ func bootstrapPgAmopTuples(dataDir string) error {
 
 // pgAmprocEntry mirrors one row of PG18's pg_amproc.dat — see
 // `postgres/src/include/catalog/pg_amproc.dat` and the
-// `FormData_pg_amproc` struct in `pg_amproc.h`. goopg only seeds
-// the default support function 1 (cmp) for each pinned btree
-// opclass; sortsupport / in_range / equalimage are out of scope.
+// `FormData_pg_amproc` struct in `pg_amproc.h`. goopg seeds the
+// default cmp (amprocnum=1), sortsupport (amprocnum=2) and
+// equalimage (amprocnum=4) support functions for the pinned
+// btree opclasses; cross-type rows (lefttype != righttype),
+// in_range (amprocnum=3) and skipsupport (amprocnum=6) remain
+// out of scope.
 type pgAmprocEntry struct {
 	OID            uint32 // amproc OID
 	Family         uint32 // amprocfamily — pg_opfamily OID
@@ -1149,15 +1152,27 @@ func pgAmprocColDefs() []catalog.Column {
 	}
 }
 
-// pgAmprocInitialEntries returns the canonical btree comparison
-// support function for each pinned default opclass. Proc OIDs are
-// from `postgres/src/include/catalog/pg_proc.dat`.
+// pgAmprocInitialEntries returns the canonical btree support
+// function rows for each pinned default opclass. Proc OIDs are
+// from `postgres/src/include/catalog/pg_proc.dat` and the
+// (family,type,num) keys are sourced from `pg_amproc.dat`.
 //
 // PG's RelationInitIndexAccessInfo → LookupOpclassInfo scans
 // pg_amproc for (opcfamily, opcintype, opcintype) and stores the
 // support proc OIDs into the relcache opclass entry. Without
-// these rows the standby panics the first time an index dispatches
-// to its comparison function.
+// the cmp rows the standby panics the first time an index
+// dispatches to its comparison function; sortsupport/equalimage
+// are not strictly required at boot but their absence forces PG
+// to fall back to the slow cmp-only path and disables btree
+// page deduplication respectively, so we seed them too for
+// runtime parity with a real PG cluster started from this
+// data directory.
+//
+// Layout per family (lefttype = righttype = opcintype):
+//
+//   - amprocnum=1 → cmp        (always present)
+//   - amprocnum=2 → sortsupport (where PG18 ships one)
+//   - amprocnum=4 → equalimage  (always present in PG18)
 func pgAmprocInitialEntries() []pgAmprocEntry {
 	const (
 		famInteger            uint32 = 1976
@@ -1168,29 +1183,51 @@ func pgAmprocInitialEntries() []pgAmprocEntry {
 		famCharBtree          uint32 = 429
 		famOidvectorBtree     uint32 = 1991
 		famBpcharPatternBtree uint32 = 2097
+		// pg_proc OIDs for equalimage support procs (pg_proc.dat).
+		btequalimageOID       uint32 = 5051 // generic image-equality
+		btvarstrequalimageOID uint32 = 5050 // text / name / varchar
 	)
 	const baseOID uint32 = 7100
 	out := []pgAmprocEntry{
-		// btree integer_ops default cmp procs.
-		{0, famInteger, 23, 23, 1, 351}, // btint4cmp
-		{0, famInteger, 21, 21, 1, 350}, // btint2cmp
-		{0, famInteger, 20, 20, 1, 842}, // btint8cmp
-		// btree oid_ops default cmp.
-		{0, famOID, 26, 26, 1, 356}, // btoidcmp
-		// btree text_ops default cmp procs (text and name share family).
-		{0, famText, 25, 25, 1, 360}, // bttextcmp
-		{0, famText, 19, 19, 1, 359}, // btnamecmp
-		// btree text_pattern_ops default cmp (text_pattern_ops and
-		// varchar_pattern_ops share the same family/lefttype/righttype).
-		{0, famTextPattern, 25, 25, 1, 2166}, // bttext_pattern_cmp
-		// btree bool_ops default cmp.
-		{0, famBool, 16, 16, 1, 1693}, // btboolcmp
-		// btree char_ops default cmp.
-		{0, famCharBtree, 18, 18, 1, 358}, // btcharcmp
-		// btree oidvector_ops default cmp.
-		{0, famOidvectorBtree, 30, 30, 1, 404}, // btoidvectorcmp
-		// btree bpchar_pattern_ops default cmp.
-		{0, famBpcharPatternBtree, 1042, 1042, 1, 2180}, // btbpchar_pattern_cmp
+		// integer_ops — cmp + sortsupport + equalimage per type.
+		{0, famInteger, 23, 23, 1, 351},                // btint4cmp
+		{0, famInteger, 21, 21, 1, 350},                // btint2cmp
+		{0, famInteger, 20, 20, 1, 842},                // btint8cmp
+		{0, famInteger, 23, 23, 2, 3130},               // btint4sortsupport
+		{0, famInteger, 21, 21, 2, 3129},               // btint2sortsupport
+		{0, famInteger, 20, 20, 2, 3131},               // btint8sortsupport
+		{0, famInteger, 23, 23, 4, btequalimageOID},    // int4
+		{0, famInteger, 21, 21, 4, btequalimageOID},    // int2
+		{0, famInteger, 20, 20, 4, btequalimageOID},    // int8
+		// oid_ops — cmp + sortsupport + equalimage.
+		{0, famOID, 26, 26, 1, 356},                    // btoidcmp
+		{0, famOID, 26, 26, 2, 3134},                   // btoidsortsupport
+		{0, famOID, 26, 26, 4, btequalimageOID},
+		// text_ops — text and name share the family. PG seeds
+		// sortsupport + varstr equalimage for both.
+		{0, famText, 25, 25, 1, 360},                   // bttextcmp
+		{0, famText, 19, 19, 1, 359},                   // btnamecmp
+		{0, famText, 25, 25, 2, 3255},                  // bttextsortsupport
+		{0, famText, 19, 19, 2, 3135},                  // btnamesortsupport
+		{0, famText, 25, 25, 4, btvarstrequalimageOID}, // text
+		{0, famText, 19, 19, 4, btvarstrequalimageOID}, // name
+		// text_pattern_ops — sortsupport + generic equalimage.
+		{0, famTextPattern, 25, 25, 1, 2166},           // bttext_pattern_cmp
+		{0, famTextPattern, 25, 25, 2, 3332},           // bttext_pattern_sortsupport
+		{0, famTextPattern, 25, 25, 4, btequalimageOID},
+		// bool_ops — cmp + equalimage (no sortsupport in PG18).
+		{0, famBool, 16, 16, 1, 1693},                  // btboolcmp
+		{0, famBool, 16, 16, 4, btequalimageOID},
+		// char_ops — cmp + equalimage (no sortsupport in PG18).
+		{0, famCharBtree, 18, 18, 1, 358},              // btcharcmp
+		{0, famCharBtree, 18, 18, 4, btequalimageOID},
+		// oidvector_ops — cmp + equalimage (no sortsupport in PG18).
+		{0, famOidvectorBtree, 30, 30, 1, 404},         // btoidvectorcmp
+		{0, famOidvectorBtree, 30, 30, 4, btequalimageOID},
+		// bpchar_pattern_ops — cmp + sortsupport + equalimage.
+		{0, famBpcharPatternBtree, 1042, 1042, 1, 2180},          // btbpchar_pattern_cmp
+		{0, famBpcharPatternBtree, 1042, 1042, 2, 3333},          // btbpchar_pattern_sortsupport
+		{0, famBpcharPatternBtree, 1042, 1042, 4, btequalimageOID},
 	}
 	for i := range out {
 		out[i].OID = baseOID + uint32(i)

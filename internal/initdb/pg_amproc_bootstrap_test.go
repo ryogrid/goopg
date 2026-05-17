@@ -55,7 +55,9 @@ func TestPgAmprocRowInt4CmpMatchesFormPgAmproc(t *testing.T) {
 
 // TestPgAmprocInitialEntriesCoverPinnedOpclasses asserts every
 // pinned default opclass has its canonical comparison support
-// function 1 wired to a real pg_proc.dat OID.
+// function 1 wired to a real pg_proc.dat OID. amprocnum is
+// restricted to the three PG18 btree support categories goopg
+// seeds at bootstrap: 1 (cmp), 2 (sortsupport), 4 (equalimage).
 func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 	entries := pgAmprocInitialEntries()
 	type key struct {
@@ -66,8 +68,10 @@ func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 	}
 	byKey := make(map[key]pgAmprocEntry, len(entries))
 	for _, e := range entries {
-		if e.Num != 1 {
-			t.Errorf("entry %+v: only support proc 1 (cmp) is seeded", e)
+		switch e.Num {
+		case 1, 2, 4:
+		default:
+			t.Errorf("entry %+v: only amprocnum 1/2/4 are seeded", e)
 		}
 		k := key{e.Family, e.LeftType, e.RightType, e.Num}
 		if _, dup := byKey[k]; dup {
@@ -104,9 +108,80 @@ func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 			t.Errorf("%s: proc=%d, want %d", w.label, got.Proc, w.proc)
 		}
 	}
-	// One row per pinned default opclass family/type.
-	if got, want := len(entries), 11; got != want {
+	// 11 cmp + 8 sortsupport (no sortsupport for bool/char/oidvector)
+	// + 11 equalimage = 30 rows.
+	if got, want := len(entries), 30; got != want {
 		t.Errorf("entry count: got %d, want %d", got, want)
+	}
+}
+
+// TestPgAmprocInitialEntriesCoverSortsupportAndEqualimage pins
+// every PG18 default-type sortsupport (amprocnum=2) and
+// equalimage (amprocnum=4) row that ships in pg_amproc.dat for
+// the pinned btree opclass families. The OIDs come from
+// pg_proc.dat (btintNsortsupport, btoidsortsupport,
+// bttextsortsupport, btnamesortsupport,
+// bttext_pattern_sortsupport, btbpchar_pattern_sortsupport,
+// btequalimage, btvarstrequalimage). Without these rows PG's
+// LookupOpclassInfo would fall back to the slow cmp-only sort
+// path and disable btree page deduplication for any index whose
+// opclass goopg pinned at bootstrap.
+func TestPgAmprocInitialEntriesCoverSortsupportAndEqualimage(t *testing.T) {
+	entries := pgAmprocInitialEntries()
+	type key struct {
+		family    uint32
+		lefttype  uint32
+		righttype uint32
+		num       int16
+	}
+	byKey := make(map[key]pgAmprocEntry, len(entries))
+	for _, e := range entries {
+		byKey[key{e.Family, e.LeftType, e.RightType, e.Num}] = e
+	}
+
+	type want struct {
+		family   uint32
+		lefttype uint32
+		num      int16
+		proc     uint32
+		label    string
+	}
+	wants := []want{
+		// sortsupport (amprocnum=2) — only for families where PG
+		// ships a sortsupport proc in pg_amproc.dat.
+		{1976, 21, 2, 3129, "btint2sortsupport"},
+		{1976, 23, 2, 3130, "btint4sortsupport"},
+		{1976, 20, 2, 3131, "btint8sortsupport"},
+		{1989, 26, 2, 3134, "btoidsortsupport"},
+		{1994, 25, 2, 3255, "bttextsortsupport"},
+		{1994, 19, 2, 3135, "btnamesortsupport"},
+		{2095, 25, 2, 3332, "bttext_pattern_sortsupport"},
+		{2097, 1042, 2, 3333, "btbpchar_pattern_sortsupport"},
+		// equalimage (amprocnum=4) — one per pinned default
+		// opclass. text/name use btvarstrequalimage (5050); every
+		// other type uses the generic btequalimage (5051).
+		{1976, 21, 4, 5051, "int2 btequalimage"},
+		{1976, 23, 4, 5051, "int4 btequalimage"},
+		{1976, 20, 4, 5051, "int8 btequalimage"},
+		{1989, 26, 4, 5051, "oid btequalimage"},
+		{1994, 25, 4, 5050, "text btvarstrequalimage"},
+		{1994, 19, 4, 5050, "name btvarstrequalimage"},
+		{2095, 25, 4, 5051, "text_pattern btequalimage"},
+		{424, 16, 4, 5051, "bool btequalimage"},
+		{429, 18, 4, 5051, "char btequalimage"},
+		{1991, 30, 4, 5051, "oidvector btequalimage"},
+		{2097, 1042, 4, 5051, "bpchar_pattern btequalimage"},
+	}
+	for _, w := range wants {
+		got, ok := byKey[key{w.family, w.lefttype, w.lefttype, w.num}]
+		if !ok {
+			t.Errorf("%s: missing entry for family=%d lefttype=%d num=%d",
+				w.label, w.family, w.lefttype, w.num)
+			continue
+		}
+		if got.Proc != w.proc {
+			t.Errorf("%s: proc=%d, want %d", w.label, got.Proc, w.proc)
+		}
 	}
 }
 

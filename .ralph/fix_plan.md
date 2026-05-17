@@ -2633,6 +2633,37 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `docs/design/0106-0010-step3d-pg-amop-amproc-pinned-opfamily-fix.md`.
         Still open: cross-type amop/amproc rows (lefttype != righttype),
         sortsupport (amprocnum=2) / equalimage (amprocnum=4) procs.
+      - Step 3e LANDED 2026-05-17. `internal/initdb/initdb.go::
+        pgAmprocInitialEntries` extended from 11 cmp rows to 30 — adds
+        8 sortsupport (amprocnum=2) rows where PG18 ships a sortsupport
+        proc (int2/int4/int8/oid/text/name/text_pattern/bpchar_pattern;
+        bool/char/oidvector have no sortsupport upstream) and 11
+        equalimage (amprocnum=4) rows — one per pinned default opclass.
+        Proc OIDs sourced from `pg_proc.dat`: 3129 btint2sortsupport,
+        3130 btint4sortsupport, 3131 btint8sortsupport, 3134
+        btoidsortsupport, 3255 bttextsortsupport, 3135 btnamesortsupport,
+        3332 bttext_pattern_sortsupport, 3333 btbpchar_pattern_sortsupport,
+        5051 btequalimage (generic), 5050 btvarstrequalimage (text/name).
+        Without these rows, a PG standby booted from goopg loses
+        fast-path sortsupport (cmp-only sort fallback for ORDER BY) and
+        disables btree page deduplication for any index whose opclass
+        goopg pinned. Test pin
+        `TestPgAmprocInitialEntriesCoverPinnedOpclasses` relaxes its
+        `amprocnum ∈ {1}` guard to `{1,2,4}` and bumps entry count
+        11→30; new pin
+        `TestPgAmprocInitialEntriesCoverSortsupportAndEqualimage`
+        covers every (family, lefttype, num) → proc OID. Verified:
+        `go test -count=1 -run TestPgAmproc ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS;
+        baseline-stash confirms the two pre-existing
+        `TestBootstrappedPGClass/PGAttributeRowsReadable` failures
+        and `TestSynchronousCommitFlushesByDefault` are unchanged.
+        Design: `docs/design/0106-0010-step3e-pg-amproc-sortsupport-equalimage.md`.
+        Still open: cross-type amop/amproc rows (e.g. name×text);
+        `in_range` (amprocnum=3) and `skipsupport` (amprocnum=6) procs;
+        seeding the new sortsupport/equalimage helper procs into
+        pg_proc (not load-bearing for standby boot).
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,
