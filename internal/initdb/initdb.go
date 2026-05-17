@@ -1471,14 +1471,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2676, 1260, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),  // pg_authid_rolname_index
 		entry(2677, 1260, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),             // pg_authid_oid_index
 		entry(2695, 1261, []int16{3, 2, 4}, []uint32{oidOps, oidOps, oidOps}, []uint32{0, 0, 0}, true, false), // pg_auth_members_member_role_index
-		entry(3593, 3592, []int16{3, 2, 5}, []uint32{oidOps, oidOps, textOps}, []uint32{0, 0, cCollation}, true, true), // pg_shseclabel_object_index
+		// pg_shseclabel columns (PG18, pg_shseclabel.h): 1=objoid, 2=classoid,
+		// 3=provider, 4=label. Index = btree(objoid, classoid, provider text_ops).
+		entry(3593, 3592, []int16{1, 2, 3}, []uint32{oidOps, oidOps, textOps}, []uint32{0, 0, cCollation}, true, true), // pg_shseclabel_object_index
 	}
 	// Local-catalog index rows mirroring nailedLocalRels.
 	local := []pgIndexEntry{
 		entry(2703, 1247, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_type_oid_index
 		entry(2704, 1247, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_type_typname_nsp_index
 		entry(2658, 1249, []int16{1, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_attribute_relid_attnam_index
-		entry(2659, 1249, []int16{1, 6}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, true),                        // pg_attribute_relid_attnum_index
+		// pg_attribute columns (PG18, pg_attribute.h): 1=attrelid, 2=attname,
+		// 3=atttypid, 4=attlen, 5=attnum, ... Earlier goopg pinned
+		// attnum at heap col 6 (legacy PG11/12 layout); PG18 sets
+		// Anum_pg_attribute_attnum = 5, so the index must point at col 5.
+		entry(2659, 1249, []int16{1, 5}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, true),                        // pg_attribute_relid_attnum_index
 		entry(2662, 1259, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_class_oid_index
 		entry(2663, 1259, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_class_relname_nsp_index
 		entry(2690, 1255, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_proc_oid_index
@@ -1492,8 +1498,12 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// amproclefttype, amprocrighttype, amprocnum), not the oid index;
 		// the label in nailedLocalRels is historical.
 		entry(2655, 2603, []int16{2, 3, 4, 5}, []uint32{oidOps, oidOps, oidOps, int2Ops}, []uint32{0, 0, 0, 0}, true, false), // pg_amproc_fam_proc_index
-		entry(2693, 2618, []int16{2, 7}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_rewrite_rel_rulename_index
-		entry(2701, 2620, []int16{2, 3}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_trigger_tgrelid_tgname_index
+		// pg_rewrite columns (PG18, pg_rewrite.h): 1=oid, 2=rulename,
+		// 3=ev_class. Index = btree(ev_class oid_ops, rulename name_ops).
+		entry(2693, 2618, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_rewrite_rel_rulename_index
+		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
+		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
+		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_trigger_tgrelid_tgname_index
 		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_constraint_oid_index
 		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_operator_oid_index
 		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                        // pg_inherits_relid_seqno_index
