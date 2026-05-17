@@ -695,6 +695,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
+		3502, // pg_enum_oid_index (Step 3ao)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -792,6 +793,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
+		3502, // pg_enum_oid_index (Step 3ao)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -822,6 +824,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
+		3502, // pg_enum_oid_index (Step 3ao)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -1886,6 +1889,23 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// Step 3ak nailed rel). Companion to OID 827 (Step 3al composite
 		// UNIQUE non-PKEY backing the DEFACLROLENSPOBJ syscache).
 		entry(828, 826, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_default_acl_oid_index
+		// M0106-0010 Step 3ao: pg_enum_oid_index (OID 3502).
+		// postgres/src/include/catalog/pg_enum.h:47 —
+		//   DECLARE_UNIQUE_INDEX_PKEY(pg_enum_oid_index, 3502,
+		//     EnumOidIndexId, pg_enum, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(ENUMOID, pg_enum_oid_index, 8);
+		// pg_enum attnums (pg_enum_d.h): 1=oid. UNIQUE PRIMARY KEY
+		// (DECLARE_UNIQUE_INDEX_PKEY) over pg_enum heap OID 3501
+		// (Step 3an nailed rel). Single oid_ops key, no collation.
+		// Same single-column oid PKEY pattern as pg_cast_oid_index
+		// (2660, Step 3ab), pg_collation_oid_index (3085, Step 3af),
+		// pg_conversion_oid_index (2670, Step 3ai),
+		// pg_default_acl_oid_index (828, Step 3am), and
+		// pg_opclass_oid_index (2687, Step 3l). Companion indexes 3503
+		// (pg_enum_typid_label_index UNIQUE composite name_ops) and 3534
+		// (pg_enum_typid_sortorder_index UNIQUE composite float4_ops)
+		// are deferred to Steps 3ap/3aq.
+		entry(3502, 3501, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_enum_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
