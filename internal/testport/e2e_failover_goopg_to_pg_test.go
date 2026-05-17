@@ -131,6 +131,10 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	defer readyCancel()
 	if err := standby.WaitReady(readyCtx, 90*time.Second); err != nil {
 		t.Logf("standby.WaitReady: %v (continuing anyway)", err)
+		pgLogPath := filepath.Join(filepath.Dir(standbyDir), "pg.log")
+		if pgLog, rerr := os.ReadFile(pgLogPath); rerr == nil {
+			t.Logf("PG standby log:\n%s", string(pgLog))
+		}
 	}
 
 	waitForPhysicalStreamingGoopgToPG(t, primary, standby, slotName, mode.exact, 45*time.Second)

@@ -217,16 +217,10 @@ If Go symbol operations fail:
 
 ## Vanilla PG Compatibility (ABSOLUTE)
 
-The postgres source tree at `./postgres/` is a **read-only reference oracle**.
-**NEVER modify PG source code** to make replication or any other integration
-work with goopg. Not even "one-line fixes" or "harmless changes."
+The entire purpose is compativility with a **vanilla, unmodified PostgreSQL**.
+If something doesn't work, the fix belongs in **goopg**, not in PG.
 
-The entire purpose of M0105/M0106 is that a **vanilla, unmodified PostgreSQL**
-binary bootstrapped from a goopg basebackup must start, stream WAL, and serve
-read-only queries. If something doesn't work, the fix belongs in **goopg**,
-not in PG.
-
-Permitted PG interactions:
+**Permitted PG interactions**:
 - Adding `elog(DEBUG1, ...)` calls for diagnostic purposes (must be reverted
   after the investigation concludes).
 - Reading PG source code to understand wire format, catalog layout, and
