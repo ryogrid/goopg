@@ -192,6 +192,15 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=2 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check.
 	{2661, "pg_cast_source_target_index"},
+	// M0106-0010 Step 3ad: pg_opclass_am_name_nsp_index. PG18
+	// `postgres/src/include/catalog/pg_opclass.h:85` declares
+	// `OpclassAmNameNspIndexId = 2686` as UNIQUE (not PRIMARY) on
+	// btree(opcmethod oid_ops, opcname name_ops, opcnamespace oid_ops).
+	// Without this entry RelationIdGetRelation(2686) FATALs because no
+	// pg_class row gets seeded; flattenRels derives RelNatts=3 via
+	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+	// relnatts/indnatts check (relcache.c:1492).
+	{2686, "pg_opclass_am_name_nsp_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

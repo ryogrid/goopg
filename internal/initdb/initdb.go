@@ -683,7 +683,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667, 2678, 2679, 2680, 2682,
-		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2684, 2685,
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
@@ -770,7 +772,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667, 2678, 2679, 2680, 2682,
-		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2684, 2685,
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
@@ -792,7 +796,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667, 2678, 2679, 2680, 2682,
-		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2684, 2685,
+		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
+		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
@@ -1746,6 +1752,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// attnum 3 casttarget). UNIQUE but NOT PRIMARY KEY
 		// (DECLARE_UNIQUE_INDEX, not _PKEY variant).
 		entry(2661, 2605, []int16{2, 3}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_cast_source_target_index
+		// M0106-0010 Step 3ad: pg_opclass_am_name_nsp_index (OID 2686).
+		// postgres/src/include/catalog/pg_opclass.h:85 —
+		//   DECLARE_UNIQUE_INDEX(pg_opclass_am_name_nsp_index, 2686,
+		//     OpclassAmNameNspIndexId, pg_opclass,
+		//     btree(opcmethod oid_ops, opcname name_ops, opcnamespace oid_ops));
+		//   MAKE_SYSCACHE(CLAAMNAMENSP, pg_opclass_am_name_nsp_index, 8);
+		// pg_opclass attnums (pg_opclass_d.h): 2=opcmethod, 3=opcname,
+		// 4=opcnamespace. UNIQUE but NOT primary (DECLARE_UNIQUE_INDEX,
+		// not the _PKEY variant — PKEY is 2687 = pg_opclass_oid_index).
+		// `opcname` is a `name` type column whose btree opclass uses C
+		// collation (C_COLLATION_OID=950) — same convention as
+		// pg_database_datname_index (2671) and pg_namespace_nspname_index
+		// (2684).
+		entry(2686, 2616, []int16{2, 3, 4}, []uint32{oidOps, nameOps, oidOps}, []uint32{0, cCollation, 0}, true, false), // pg_opclass_am_name_nsp_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
