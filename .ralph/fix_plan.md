@@ -3179,37 +3179,43 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
       - Files: `internal/initdb/initdb.go`, `internal/initdb/relcache_init.go`,
         `internal/executor/codec.go`
 
-- [ ] **M0106-0009**
+- [x] **M0106-0009**
       - Summary: Fix varlena assertion in pg_class heap tuples.
-      - Blocked by: M0106-0008 (bootstrap code written, assertion remains).
-      - Root cause hypothesis: PG's `nocachegetattr` slow path hits
-        `att_addlength_pointer` for `attnum=32` (relacl, attlen=-1). The
-        macro's `VARSIZE_ANY(attptr)` either reads an invalid varlena header
-        byte or the `off` pointer is misaligned relative to our encoding.
-        Debug log confirms `i=31 attlen=-1 attnum=32 natts=34` right before
-        the assertion.
-      - Step 1: Write a Go unit test that encodes a pg_class tuple and dumps
-        the byte at offset 144 (where relacl starts) — should be `0x01`.
-      - Step 2: If encoding is correct, the mismatch is in alignment
-        computation between PG's slow path and our TupleDesc/encoding.
-        Consider setting `relacl`/`reloptions`/`relpartbound` as SQL NULL
-        (requires null bitmap support in `EncodeRowPG`) to make PG skip
-        the slow path entirely.
-      - Design doc: `docs/design/0106-0002-pg-class-tuple-bootstrap.md`
-      - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`
+      - COMPLETE 2026-05-17: nocachegetattr slow-path assertion RESOLVED.
+      - Root cause: `encodeValuePG` encoded data length (not total size) in
+        the 1-byte varlena header. For empty string, header was `0x01` which
+        PG's LE `VARATT_IS_1B_E` matches as external/expanded datum, causing
+        `VARSIZE_EXTERNAL` to assert. PG's `SET_VARSIZE_1B` (LE) encodes
+        TOTAL size as `(total << 1) | 0x01`. For empty: `(1 << 1) | 0x01 =
+        0x03`. Verified at byte-offset 144 in encoded tuple.
+      - Also fixed: 4-byte varlena header was BigEndian, now LittleEndian
+        matching PG18 LE convention.
+      - SQL NULL approach (NullDatum) abandoned: null bitmap shifts tuple data,
+        breaking GETSTRUCT (PG casts raw bytes as FormData_pg_class*).
+      - New blocker surfaced: `deconstruct_array` assertion
+        (`ARR_ELEMTYPE(array) == elmtype` at arrayfuncs.c:3644). PG's
+        `DatumGetArrayTypeP` casts stored text `{}` as binary `ArrayType*`.
+        Fix needs proper binary ArrayType encoding or array access bypass.
+        Tracked in M0106-0010.
+      - Files: `internal/executor/codec.go`
 
 - [ ] **M0106-0010**
-      - Summary: Bootstrap pg_am and related catalog tuples.
-      - Blocked by: M0106-0009 (varlena assertion must be fixed first).
-      - After the assertion is fixed, `SearchSysCache1(AMOID, 403)` during
-        `RelationInitIndexAccessInfo` will return NULL because pg_am heap
-        is empty (btree root page, no tuples).
-      - Write btree AM tuple (OID 403, amname="btree", amhandler=330,
-        amtype='i') into `base/1/2601` / `base/5/2601`.
-      - May also need pg_opclass (OID 3122 for int4_ops), pg_amop, and
-        pg_amproc tuples depending on how far `RelationInitIndexAccessInfo`
-        probes after finding the AM.
-      - Files: `internal/initdb/initdb.go`
+      - Summary: Resolve array assertion and bootstrap pg_am(+related) tuples.
+      - M0106-0009 resolved the nocachegetattr assertion, but surfaced a new
+        blocker: `deconstruct_array` assertion (`ARR_ELEMTYPE`, arrayfuncs.c)
+        because PG casts stored varlena text `{}` as binary `ArrayType*`.
+      - Step 1: Fix array assertion. Options:
+        (a) Encode proper binary empty `ArrayType` for relacl/reloptions
+            (varlena hdr + ndim=0 + flags=0 + elemtype OID, ~16 bytes).
+        (b) Remove varlena columns from TupleDesc AND heap tuple, force
+            slow path via alternative mechanism (e.g. HEAP_HASNULL with a
+            trailing null column after the fixed part).
+      - Step 2: After array assertion is fixed, `SearchSysCache1(AMOID, 403)`
+        during `RelationInitIndexAccessInfo` will fail because pg_am heap is
+        empty. Write btree AM tuple (OID 403, amname="btree", amhandler=330,
+        amtype='i') into `base/1/2601` / `base/5/2601`. May also need
+        pg_opclass/pg_amop/pg_amproc tuples.
+      - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
