@@ -2664,13 +2664,52 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `in_range` (amprocnum=3) and `skipsupport` (amprocnum=6) procs;
         seeding the new sortsupport/equalimage helper procs into
         pg_proc (not load-bearing for standby boot).
+      - Step 3f LANDED 2026-05-17. Re-running
+        `TestE2E_FailoverGoopgToPG/async` after Step 3e surfaced a
+        new blocker: every PG backend FATAL'd with
+        `could not open file "base/5/2610"` (pg_index). goopg's
+        bootstrap had mapped OID 2610 in `pg_filenode.map` but never
+        wrote the heap file to disk, so `RelationOpenSmgr → mdopen
+        → BasicOpenFile` during nailed-index initialisation
+        crashed before any tuple lookup. New
+        `bootstrapPgIndexTuples` + `pgIndexMinimalColDefs` in
+        `internal/initdb/initdb.go` call
+        `writeMultiPageHeapRows(dataDir, "2610", cols, nil)` to
+        write an `InitPage`'d but empty heap page to
+        `base/{1,5}/2610` (writeMultiPageHeapRows mirrors both
+        directories unconditionally). The bootstrap is wired into
+        `Init` right after `bootstrapPgAmprocTuples`. Regression
+        pins: `TestBootstrapPgIndexTuplesWritesEmptyPageToBase1And5`
+        (asserts file exists, length == BlockSize, not all-zero so
+        InitPage actually ran) and
+        `TestPgIndexMinimalColDefsMatchesRelcacheAttrs` (guards
+        the 4-column schema agreement with
+        `relcache_init.go::pgIndexAttrs` so Step 3g's expansion
+        must update both in lockstep) in
+        `internal/initdb/pg_index_bootstrap_test.go`. Verified:
+        `go test -count=1 ./internal/initdb/ ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS except the pre-existing
+        `TestSynchronousCommitFlushesByDefault` (M0106-0012,
+        baseline-stash confirmed). E2E re-run advances to the
+        expected next blocker — `FATAL: cache lookup failed for
+        index 2662` (pg_class_oid_index) — which Step 3g closes
+        by encoding actual `Form_pg_index` rows for every nailed
+        index. Design:
+        `docs/design/0106-0010-step3f-pg-index-empty-page.md`.
+        Step 3g scope (next loop): `int2vector` codec support;
+        21-column `Form_pg_index` encoder; per-index initial
+        entries for every nailed local + shared index; expand
+        `pgIndexAttrs()` 4 → 21 and `nailedLocalRels` `relnatts`
+        4 → 21 in lockstep.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,
         `internal/initdb/pg_proc_bootstrap_test.go`,
         `internal/initdb/pg_opclass_bootstrap_test.go`,
         `internal/initdb/pg_amop_bootstrap_test.go`,
-        `internal/initdb/pg_amproc_bootstrap_test.go`
+        `internal/initdb/pg_amproc_bootstrap_test.go`,
+        `internal/initdb/pg_index_bootstrap_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -229,6 +229,15 @@ func Init(opts Options) error {
 	if err := bootstrapPgAmprocTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_amproc tuples: %w", err)
 	}
+	// M0106-0010 step 3f: write an empty pg_index heap page so PG's
+	// RelationOpenSmgr → mdopen during nailed-index initialisation
+	// finds base/{1,5}/2610 on disk. The previous E2E run failed with
+	// "FATAL: could not open file base/5/2610". A heap-initialised
+	// page with zero tuples is the minimum that satisfies BasicOpenFile;
+	// per-index rows come in the next step.
+	if err := bootstrapPgIndexTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_index tuples: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -1262,6 +1271,39 @@ func bootstrapPgAmprocTuples(dataDir string) error {
 		rows = append(rows, pgAmprocRow(e))
 	}
 	return writeMultiPageHeapRows(dataDir, "2603", cols, rows)
+}
+
+// pgIndexMinimalColDefs returns the 4-column minimal pg_index shape
+// that matches the current `pgIndexAttrs()` declaration in
+// `relcache_init.go`. The full PG18 FormData_pg_index has 21 columns
+// (10 bool flags, int2vector indkey, oidvector indcollation /
+// indclass, int2vector indoption, pg_node_tree indexprs / indpred);
+// the per-index row encoder lands in a follow-up step. For now we
+// only need an empty-page file on disk so PG's
+// `RelationOpenSmgr → mdopen` during standby start-up's nailed-index
+// initialisation can `BasicOpenFile("base/<dboid>/2610")` without
+// FATAL'ing.
+func pgIndexMinimalColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "indexrelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "indrelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "indnatts", Type: catalog.Type{Name: "int2"}},
+		{Name: "indislive", Type: catalog.Type{Name: "bool"}},
+	}
+}
+
+// bootstrapPgIndexTuples writes an empty pg_index heap page to
+// base/{1,5}/2610. M0106-0010 step 3f: the previous E2E run hit
+// "FATAL: could not open file base/5/2610" because the file did not
+// exist on disk — pg_index is a per-database local catalog and PG's
+// nailed-index initialisation opens it via mdopen → BasicOpenFile.
+// Step 3f writes an initialised but empty heap page so the open
+// succeeds; the next step seeds one Form_pg_index tuple per nailed
+// index so RelationInitIndexAccessInfo can resolve indclass /
+// indcollation / indkey for every critical index.
+func bootstrapPgIndexTuples(dataDir string) error {
+	cols := pgIndexMinimalColDefs()
+	return writeMultiPageHeapRows(dataDir, "2610", cols, nil)
 }
 
 // pgClassColDefs returns pg_class column descriptors matching PG18's
