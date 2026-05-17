@@ -4088,15 +4088,84 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3ad-pg-opclass-am-name-nsp-index.md`.
-      - Next blocker (Step 3ae): expected next E2E re-run will surface
-        a different local/shared catalog OID. pg_opclass's two canonical
-        indexes are now both seeded (2686 + 2687) so no further
-        pg_opclass FATAL is expected. Candidates include pg_constraint
-        sibling indexes (2664/2665/2666/2667/9162), pg_conversion family
-        (2668/2669/2670), pg_attrdef family (2656/2657), pg_depend family
-        (2673/2674), or the pg_operator companion oprname index (2689).
-        Pivot to whichever OID surfaces; the catalog-seed pattern is
-        identical.
+      - Step 3ae LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3164` PG-standby boot blocker
+        that surfaced after Step 3ad. OID 3164 is
+        `pg_collation_name_enc_nsp_index` per
+        `postgres/src/include/catalog/pg_collation.h:62`:
+        `DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164,
+        CollationNameEncNspIndexId, pg_collation,
+        btree(collname name_ops, collencoding int4_ops,
+              collnamespace oid_ops));
+        MAKE_SYSCACHE(COLLNAMEENCNSP, pg_collation_name_enc_nsp_index, 8)`.
+        Pure catalog-seed addition mirroring Step 3ad's pattern; no
+        encoder, builder, or `Init` flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(3164, 3456, []int16{2,7,3},
+        []uint32{nameOps,int4Ops,oidOps},
+        []uint32{cCollation,0,0}, true, false)`. UNIQUE but NOT primary
+        (DECLARE_UNIQUE_INDEX, not _PKEY which is 3085). pg_collation
+        attnums (pg_collation_d.h): 2=collname, 7=collencoding,
+        3=collnamespace. `collname` is a `name` column whose btree
+        opclass uses C collation (C_COLLATION_OID=950), same convention
+        as 2671/2684/2686. First use of `int4Ops` (OID 1978) in the
+        index seed list.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{3164, "pg_collation_name_enc_nsp_index"}`; `flattenRels`
+        derives `RelKind='i', RelNatts=3` via `pgIndexNattsByOID` so
+        `RelationInitIndexAccessInfo`'s `relnatts == indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        already include 3164 from an earlier sweep — no edit needed.
+        Step-3k empty btree placeholder is sufficient because
+        pg_collation is currently unpopulated (no collation rows are
+        bootstrapped) so a zero-row 3-column-composite-key lookup is
+        the expected outcome.
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` (3 indexKeyAttrs rows) →
+        `bootstrapPgIndexTuples` (writes Form_pg_index row with
+        indnatts=3 + captures TID in `pgIndexTIDs[3164]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (3 composite-key leaves
+        at 2659).
+        Regression pins:
+        `TestPgCollationNameEncNspIndexSeededFromInitialEntries`
+        (asserts `(IndRelid=3456, IndKey=[2,7,3], IsUnique=true,
+        IsPrimary=false, IndCollation=[950,0,0])`) and
+        `TestNailedLocalRelsContainsPgCollationNameEncNspIndex`
+        (asserts `RelName="pg_collation_name_enc_nsp_index",
+        RelKind='i', RelNatts=3`) in
+        `internal/initdb/pg_collation_name_enc_nsp_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds
+        `3164: {2,7,3}` (strict count guard auto-rejects future
+        additions without map updates);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3164 so the populated 2679 btree must carry this
+        leaf.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgCollationNameEncNspIndex|TestNailedLocalRelsContainsPgCollationNameEncNspIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestPgOpclassAmNameNspIndex|TestPgCastSourceTargetIndex|TestPgCastOidIndex|TestPgAggregateFnoidIndex|TestPgAmopFamStrat'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ad
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`.
+      - Next blocker (Step 3af): expected next E2E re-run will surface
+        a different local/shared catalog OID. Candidates include
+        pg_collation's companion oid index (3085), pg_constraint
+        sibling indexes (2664/2665/2666), pg_conversion family
+        (2668/2669/2670), pg_attrdef family (2656/2657), or pg_depend
+        family (2673/2674). Pivot to whichever OID surfaces; the
+        catalog-seed pattern is identical.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4137,7 +4206,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_cast_source_target_index_test.go`,
         `docs/design/0106-0010-step3ac-pg-cast-source-target-index.md`,
         `internal/initdb/pg_opclass_am_name_nsp_index_test.go`,
-        `docs/design/0106-0010-step3ad-pg-opclass-am-name-nsp-index.md`
+        `docs/design/0106-0010-step3ad-pg-opclass-am-name-nsp-index.md`,
+        `internal/initdb/pg_collation_name_enc_nsp_index_test.go`,
+        `docs/design/0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

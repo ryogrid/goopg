@@ -1766,6 +1766,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_database_datname_index (2671) and pg_namespace_nspname_index
 		// (2684).
 		entry(2686, 2616, []int16{2, 3, 4}, []uint32{oidOps, nameOps, oidOps}, []uint32{0, cCollation, 0}, true, false), // pg_opclass_am_name_nsp_index
+		// M0106-0010 Step 3ae: pg_collation_name_enc_nsp_index (OID 3164).
+		// postgres/src/include/catalog/pg_collation.h:62 —
+		//   DECLARE_UNIQUE_INDEX(pg_collation_name_enc_nsp_index, 3164,
+		//     CollationNameEncNspIndexId, pg_collation,
+		//     btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops));
+		//   MAKE_SYSCACHE(COLLNAMEENCNSP, pg_collation_name_enc_nsp_index, 8);
+		// pg_collation attnums (pg_collation_d.h): 2=collname, 7=collencoding,
+		// 3=collnamespace. UNIQUE but NOT primary (DECLARE_UNIQUE_INDEX, not
+		// the _PKEY variant — PKEY is 3085 = pg_collation_oid_index). `collname`
+		// is a `name` type column whose btree opclass uses C collation
+		// (C_COLLATION_OID=950) — same convention as pg_database_datname_index
+		// (2671), pg_namespace_nspname_index (2684), and
+		// pg_opclass_am_name_nsp_index (2686).
+		entry(3164, 3456, []int16{2, 7, 3}, []uint32{nameOps, int4Ops, oidOps}, []uint32{cCollation, 0, 0}, true, false), // pg_collation_name_enc_nsp_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
