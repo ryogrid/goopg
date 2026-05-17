@@ -248,19 +248,23 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	default:
 		// text, varchar, char, bpchar, unknown, numeric, etc.
-		// Use PG varlena format: 1-byte header for short strings,
-		// 4-byte header for longer ones.
+		// Use PG varlena format (LE): 1-byte header for short
+		// values, 4-byte header for longer ones.
+		// PG's SET_VARSIZE_1B encodes TOTAL size (data+header),
+		// not just data length. BIT 0 = 1 for 1-byte header.
 		s := d.StringValue()
-		if len(s) < 128 {
-			// 1-byte header: total = (len << 1) | 1
-			buf := make([]byte, 1+len(s))
-			buf[0] = byte(len(s)<<1) | 1
+		total := len(s) + 1 // data + 1-byte header
+		if total <= 127 {   // 1-byte header: 7 bits for size (max 127)
+			buf := make([]byte, total)
+			buf[0] = byte(total<<1) | 1
 			copy(buf[1:], s)
 			return buf, nil
 		}
-		// 4-byte header: total = (len << 2) (no flags set)
-		buf := make([]byte, 4+len(s))
-		binary.BigEndian.PutUint32(buf[0:4], uint32(len(s))<<2)
+		// 4-byte header (LE): bits 0-1 = 10, total size in upper
+		// 30 bits. Uses LittleEndian, not BigEndian.
+		total = len(s) + 4 // data + 4-byte header
+		buf := make([]byte, total)
+		binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
 		copy(buf[4:], s)
 		return buf, nil
 	}
