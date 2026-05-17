@@ -210,6 +210,14 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
 	{3164, "pg_collation_name_enc_nsp_index"},
+	// M0106-0010 Step 3af: pg_collation_oid_index. PG18
+	// `postgres/src/include/catalog/pg_collation.h:63` declares
+	// `CollationOidIndexId = 3085` as UNIQUE PRIMARY on btree(oid oid_ops).
+	// Without this entry RelationIdGetRelation(3085) FATALs because no
+	// pg_class row gets seeded; flattenRels derives RelNatts=1 via
+	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+	// relnatts/indnatts check (relcache.c:1492).
+	{3085, "pg_collation_oid_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

@@ -1780,6 +1780,17 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// (2671), pg_namespace_nspname_index (2684), and
 		// pg_opclass_am_name_nsp_index (2686).
 		entry(3164, 3456, []int16{2, 7, 3}, []uint32{nameOps, int4Ops, oidOps}, []uint32{cCollation, 0, 0}, true, false), // pg_collation_name_enc_nsp_index
+		// M0106-0010 Step 3af: pg_collation_oid_index (OID 3085).
+		// postgres/src/include/catalog/pg_collation.h:63 —
+		//   DECLARE_UNIQUE_INDEX_PKEY(pg_collation_oid_index, 3085,
+		//     CollationOidIndexId, pg_collation, btree(oid oid_ops));
+		// pg_collation attnums (pg_collation_d.h): 1=oid. UNIQUE PRIMARY
+		// (DECLARE_UNIQUE_INDEX_PKEY) — companion to 3164 (the non-PKEY
+		// composite seeded by Step 3ae). Single oid_ops key, no
+		// collation. Same single-column oid PKEY pattern as
+		// pg_cast_oid_index (2660, Step 3ab) and pg_opclass_oid_index
+		// (2687, Step 3l).
+		entry(3085, 3456, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_collation_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

@@ -4159,13 +4159,80 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`.
-      - Next blocker (Step 3af): expected next E2E re-run will surface
-        a different local/shared catalog OID. Candidates include
-        pg_collation's companion oid index (3085), pg_constraint
-        sibling indexes (2664/2665/2666), pg_conversion family
-        (2668/2669/2670), pg_attrdef family (2656/2657), or pg_depend
-        family (2673/2674). Pivot to whichever OID surfaces; the
-        catalog-seed pattern is identical.
+      - Step 3af LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3085` PG-standby boot blocker
+        that surfaced after Step 3ae. OID 3085 is
+        `pg_collation_oid_index` per
+        `postgres/src/include/catalog/pg_collation.h:63`:
+        `DECLARE_UNIQUE_INDEX_PKEY(pg_collation_oid_index, 3085,
+        CollationOidIndexId, pg_collation, btree(oid oid_ops))`.
+        Pure catalog-seed addition mirroring Step 3ae; companion to
+        3164 — 3085 is the PRIMARY KEY variant, 3164 the composite
+        UNIQUE non-PKEY.  Same single-column oid PKEY pattern as
+        `pg_cast_oid_index` (2660, Step 3ab) and
+        `pg_opclass_oid_index` (2687, Step 3l).
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(3085, 3456, []int16{1}, []uint32{oidOps},
+        []uint32{0}, true, true)`. UNIQUE PRIMARY (single oid_ops
+        key, no collation).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{3085, "pg_collation_oid_index"}`; `flattenRels` derives
+        `RelKind='i', RelNatts=1` via `pgIndexNattsByOID` so
+        `RelationInitIndexAccessInfo`'s `relnatts == indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        already include 3085 from an earlier sweep — no edit needed.
+        Step-3k empty btree placeholder is sufficient because
+        pg_collation is currently unpopulated.
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` (1 indexKeyAttrs row) →
+        `bootstrapPgIndexTuples` (writes Form_pg_index row with
+        indnatts=1 + captures TID in `pgIndexTIDs[3085]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (1 composite-key leaf
+        at 2659).
+        Regression pins:
+        `TestPgCollationOidIndexSeededFromInitialEntries`
+        (asserts `(IndRelid=3456, IndKey=[1], IsUnique=true,
+        IsPrimary=true, IndCollation=[0])`) and
+        `TestNailedLocalRelsContainsPgCollationOidIndex`
+        (asserts `RelName="pg_collation_oid_index", RelKind='i',
+        RelNatts=1`) in
+        `internal/initdb/pg_collation_oid_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds `3085: {1}`
+        (strict count guard auto-rejects future additions without map
+        updates);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3085 so the populated 2679 btree must carry this
+        leaf.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgCollationOidIndex|TestNailedLocalRelsContainsPgCollationOidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestPgCollationNameEncNspIndex'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ae
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` advances past the
+        `could not open relation with OID 3085` FATAL to the next
+        blocker: `FATAL: could not open relation with OID 2607` =
+        `pg_class_tblspc_relfilenode_index` (Step 3ag).
+        Design: `docs/design/0106-0010-step3af-pg-collation-oid-index.md`.
+      - Next blocker (Step 3ag): OID 2607 =
+        `pg_class_tblspc_relfilenode_index` per
+        `postgres/src/include/catalog/pg_class.h`. Composite index
+        on `(reltablespace, relfilenode)`. The catalog-seed pattern
+        is identical to Steps 3ab/3ac/3ad/3ae/3af; the new wrinkle
+        is two oid_ops keys on existing pg_class attnums.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4208,7 +4275,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_opclass_am_name_nsp_index_test.go`,
         `docs/design/0106-0010-step3ad-pg-opclass-am-name-nsp-index.md`,
         `internal/initdb/pg_collation_name_enc_nsp_index_test.go`,
-        `docs/design/0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`
+        `docs/design/0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`,
+        `internal/initdb/pg_collation_oid_index_test.go`,
+        `docs/design/0106-0010-step3af-pg-collation-oid-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
