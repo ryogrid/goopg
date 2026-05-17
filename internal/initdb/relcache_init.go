@@ -133,6 +133,13 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_aggregate is not formrdesc'd (no
 	// `AggregateRelation_Rowtype_Id` constant in PG18 headers).
 	{2600, "pg_aggregate", 83, 'r', 22, false, pgAggregateAttrs()},
+	// M0106-0010 step 3aa: pg_cast is opened during early backend
+	// startup by `find_coercion_pathway` / `parse_coerce` and FATALs
+	// with `could not open relation with OID 2605` if no pg_class row
+	// is seeded. RelType=83 is safe because pg_cast is not formrdesc'd
+	// (no `CastRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_cast.h` (PG18).
+	{2605, "pg_cast", 83, 'r', 6, false, pgCastAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -892,6 +899,23 @@ func pgAggregateAttrs() []nailedAttr {
 		{Name: "aggmtransspace", TypeOID: 23, Num: 20, Len: 4, NotNull: true},
 		{Name: "agginitval", TypeOID: 25, Num: 21, Len: -1},                  // text (nullable)
 		{Name: "aggminitval", TypeOID: 25, Num: 22, Len: -1},                 // text (nullable)
+	}
+}
+
+// pgCastAttrs defines the 6-column PG18 pg_cast schema. PG
+// `RelationBuildDesc(2605) → ScanPgRelation(2605)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row
+// gets seeded and PG FATALs with `could not open relation with OID
+// 2605`. Sourced verbatim from `postgres/src/include/catalog/pg_cast.h`
+// and `pg_cast_d.h` (Anum_pg_cast_* 1–6). M0106-0010 step 3aa.
+func pgCastAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},         // oid
+		{Name: "castsource", TypeOID: 26, Num: 2, Len: 4, NotNull: true},  // oid → pg_type
+		{Name: "casttarget", TypeOID: 26, Num: 3, Len: 4, NotNull: true},  // oid → pg_type
+		{Name: "castfunc", TypeOID: 26, Num: 4, Len: 4, NotNull: true},    // oid → pg_proc (0 = binary)
+		{Name: "castcontext", TypeOID: 18, Num: 5, Len: 1, NotNull: true}, // char (i/a/e)
+		{Name: "castmethod", TypeOID: 18, Num: 6, Len: 1, NotNull: true},  // char (f/b/i)
 	}
 }
 

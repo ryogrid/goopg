@@ -3847,11 +3847,65 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `postgres/src/include/catalog/pg_cast_d.h:23`) — Step 3aa
         territory.
         Design: `docs/design/0106-0010-step3z-pg-auth-members-role-member-index.md`.
-      - Next blocker (Step 3aa): OID 2605 = `pg_cast` heap relation
-        (NOT an index). Will require nailing the heap via
-        `nailedLocalRels` (sibling pattern: pg_aggregate step 3w),
-        plus its companion indexes (2660 `pg_cast_oid_index`, 2661
-        `pg_cast_source_target_index` per `pg_cast_d.h`).
+      - Step 3aa LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2605` PG-standby boot blocker
+        that surfaced after Step 3z. OID 2605 is `pg_cast` per
+        `postgres/src/include/catalog/pg_cast_d.h:23`
+        (`#define CastRelationId 2605`). Pure catalog-seed addition
+        mirroring Step 3w (pg_aggregate); no encoder, builder, or
+        `Init` flow change. Schema sourced from
+        `postgres/src/include/catalog/pg_cast.h` — 6 columns total:
+        oid (26), castsource (26), casttarget (26), castfunc (26),
+        castcontext (18=char), castmethod (18=char), all NotNull.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgCastAttrs()` returning the 6-column nailedAttr slice.
+        (b) `nailedLocalRels` gains
+        `{2605, "pg_cast", 83, 'r', 6, false, pgCastAttrs()}`
+        immediately after the Step 3w pg_aggregate entry. RelType=83
+        is safe — pg_cast is not formrdesc'd (no
+        `CastRelation_Rowtype_Id` constant in PG18 headers), so Step
+        3v's `relation->rd_att->tdtypeid == relp->reltype` Phase3
+        assertion does not fire. The empty 8 KiB
+        `InitPage`-stamped heap at `base/{1,5}/2605` is already
+        written by Step 3w's `bootstrapMappedLocalCatalogHeaps`. The
+        single nailedLocalRels entry threads automatically through
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples
+        → bootstrapPgClassOidIndex` (leaf for 2605 at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (6 composite-key
+        leaves at file 2659) and `writeRelcacheInitFile` emits a
+        `Form_pg_class` + 6 `Form_pg_attribute` blob group.
+        Companion indexes 2660 (`pg_cast_oid_index` UNIQUE PRIMARY KEY
+        on oid) and 2661 (`pg_cast_source_target_index` UNIQUE on
+        (castsource, casttarget)) intentionally deferred to Step
+        3ab/3ac to keep the single-OID rhythm of Steps 3w → 3x → 3y →
+        3z.
+        Regression pin: `TestNailedLocalRelsContainsPgCast` in
+        `internal/initdb/pg_cast_nailed_test.go` asserts every
+        `(Name, TypeOID, Num, Len, NotNull)` against
+        `pg_cast_d.h` authoritative definitions and prevents silent
+        re-emergence of the FATAL.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgCast|TestNailedLocalRelsContainsPgAggregate|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3z
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3aa-pg-cast-nailed-rel.md`.
+      - Next blocker (Step 3ab): expected to surface on the next
+        E2E re-run as `could not open relation with OID 2660`
+        (`pg_cast_oid_index`) or `OID 2661`
+        (`pg_cast_source_target_index`). Both have empty Step-3k
+        placeholder relfiles already; Step 3ab follows the established
+        Step 3x/3y/3z pattern (entry in `pgIndexInitialEntries` +
+        `nailedLocalRels` idxSpec).
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3884,7 +3938,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_amop_fam_strat_index_test.go`,
         `docs/design/0106-0010-step3y-pg-amop-fam-strat-index.md`,
         `internal/initdb/pg_auth_members_role_member_index_test.go`,
-        `docs/design/0106-0010-step3z-pg-auth-members-role-member-index.md`
+        `docs/design/0106-0010-step3z-pg-auth-members-role-member-index.md`,
+        `internal/initdb/pg_cast_nailed_test.go`,
+        `docs/design/0106-0010-step3aa-pg-cast-nailed-rel.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
