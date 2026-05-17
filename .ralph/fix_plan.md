@@ -4479,11 +4479,84 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3aj-pg-conversion-name-nsp-index.md`.
-      - Next blocker (Step 3ak): with the pg_conversion family
-        (2607 + 2668/2669/2670) now complete, the next E2E re-run is
-        expected to surface a different `pg_*_index` OID flagged by
-        `RelationCacheInitializePhase3`'s nailed-index walk. Same
-        single-OID catalog-seed-addition pattern applies.
+      - Step 3ak LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 826` PG-standby boot blocker
+        that surfaced after Step 3aj completed the pg_conversion family.
+        OID 826 is `pg_default_acl` per
+        `postgres/src/include/catalog/pg_default_acl.h:30`
+        (`CATALOG(pg_default_acl,826,DefaultAclRelationId)`). The
+        relation is opened during backend `InitPostgres` via the
+        standard catcache path; without a pg_class row,
+        `RelationBuildDesc(826) → ScanPgRelation(826)` returns NULL and
+        the load_relation_oid PANIC at
+        `postgres/src/backend/access/common/relation.c:61` FATALs every
+        forked backend. Pure catalog-seed addition mirroring Steps 3w
+        (pg_aggregate=2600), 3aa (pg_cast=2605), and 3ag
+        (pg_conversion=2607); no encoder, builder, or `Init` flow change.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgDefaultAclAttrs()` returning the 5-column PG18 schema
+        sourced verbatim from `pg_default_acl.h` /
+        `pg_default_acl_d.h`: oid (26/4), defaclrole (26/4),
+        defaclnamespace (26/4), defaclobjtype (18/1 char), defaclacl
+        (1034/-1 aclitem[]) — all NotNull. The trailing varlena column
+        carries `BKI_FORCE_NOT_NULL` in the upstream header; goopg's
+        varlena encoder is not exercised because the heap is
+        unpopulated at boot.
+        (b) `nailedLocalRels` gains
+        `{826, "pg_default_acl", 83, 'r', 5, false, pgDefaultAclAttrs()}`
+        immediately after the Step 3ag pg_conversion entry. `RelType=83`
+        is safe — pg_default_acl is not formrdesc'd (no
+        `DefaultAclRelation_Rowtype_Id` constant in PG18 headers), so
+        Step 3v's `relation->rd_att->tdtypeid == relp->reltype` Phase3
+        assertion does not fire.
+        (c) `internal/initdb/initdb.go::localRelMap` gains
+        `{826, 826}` so PG's relfilenode mapper resolves OID 826 to a
+        backing file.
+        (d) `internal/initdb/initdb.go::bootstrapMappedLocalCatalogHeaps`
+        OID list gains `826` so an `InitPage`-stamped 8 KiB heap exists
+        at `base/{1,5}/826`.
+        The single nailedLocalRels entry threads automatically through
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples
+        → bootstrapPgClassOidIndex` (leaf for 826 at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (5 composite-key leaves
+        at file 2659) and `writeRelcacheInitFile` emits a
+        `Form_pg_class` + 5 `Form_pg_attribute` blob group. Companion
+        indexes 827 (`pg_default_acl_role_nsp_obj_index`, UNIQUE
+        non-PKEY composite, backs CONDEFROLENSPOBJ syscache) and 828
+        (`pg_default_acl_oid_index`, UNIQUE PRIMARY KEY) intentionally
+        deferred to Step 3al/3am to preserve the single-OID rhythm of
+        Steps 3w → 3x → 3y → … (also the empty btree placeholders
+        already exist; the FATAL is at the OPEN-relation step).
+        Regression pin: `TestNailedLocalRelsContainsPgDefaultAcl` in
+        `internal/initdb/pg_default_acl_nailed_test.go` asserts
+        `(RelName="pg_default_acl", RelKind='r', RelNatts=5,
+        len(Attrs)=5)` and pins every `(Name, TypeOID, Num, Len,
+        NotNull)` against `pg_default_acl_d.h` authoritative
+        definitions. Existing pin extended:
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        gains `826` so the placeholder list cannot silently drop
+        pg_default_acl.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgDefaultAcl|TestNailedLocalRelsContainsPgConversion|TestNailedLocalRelsContainsPgCast|TestNailedLocalRelsContainsPgAggregate|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestPgClassOidIndexHasSingleKeyColumn|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3aj (`TestMigration*`, `TestCreate*`,
+        `TestBootstrappedPG*`, `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3ak-pg-default-acl-nailed-rel.md`.
+      - Next blocker (Step 3al): with pg_default_acl (OID 826) now
+        opened cleanly, the next E2E re-run is expected to surface
+        either OID 827/828 (pg_default_acl companion indexes) or a
+        different `pg_*` OID flagged by `RelationCacheInitializePhase3`'s
+        nailed-rel walk. Same single-OID catalog-seed-addition pattern
+        applies.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4537,7 +4610,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_conversion_oid_index_test.go`,
         `docs/design/0106-0010-step3ai-pg-conversion-oid-index.md`,
         `internal/initdb/pg_conversion_name_nsp_index_test.go`,
-        `docs/design/0106-0010-step3aj-pg-conversion-name-nsp-index.md`
+        `docs/design/0106-0010-step3aj-pg-conversion-name-nsp-index.md`,
+        `internal/initdb/pg_default_acl_nailed_test.go`,
+        `docs/design/0106-0010-step3ak-pg-default-acl-nailed-rel.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

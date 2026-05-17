@@ -423,6 +423,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 	oids := []uint32{
 		// 1247 pg_type is bootstrapped by bootstrapSystemCatalogs in
 		// goopg's internal row format — do NOT overwrite it.
+		826,  // pg_default_acl (M0106-0010 step 3ak)
 		2600, // pg_aggregate
 		2604, // pg_attrdef
 		2605, // pg_cast
@@ -721,6 +722,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	// Local pg_filenode.map with critical local catalog entries.
 	// All standard PG local catalogs (OID == filenumber by default).
 	localRelMap := makeRelMapFile([][2]uint32{
+		{826, 826},   // pg_default_acl (M0106-0010 step 3ak)
 		{1247, 1247}, // pg_type
 		{1249, 1249}, // pg_attribute
 		{1255, 1255}, // pg_proc

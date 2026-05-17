@@ -149,6 +149,15 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// `ConversionRelation_Rowtype_Id` constant in PG18 headers).
 	// Schema per `postgres/src/include/catalog/pg_conversion.h` (PG18).
 	{2607, "pg_conversion", 83, 'r', 8, false, pgConversionAttrs()},
+	// M0106-0010 step 3ak: pg_default_acl is opened during PG-standby
+	// boot once Steps 3w/3aa/3ag/etc. cleared every prior catalog
+	// FATAL. Without a pg_class row, `RelationBuildDesc(826) →
+	// ScanPgRelation(826)` returns NULL and the backend FATALs with
+	// `could not open relation with OID 826`. RelType=83 is safe
+	// because pg_default_acl is not formrdesc'd (no
+	// `DefaultAclRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_default_acl.h` (PG18).
+	{826, "pg_default_acl", 83, 'r', 5, false, pgDefaultAclAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1018,6 +1027,27 @@ func pgConversionAttrs() []nailedAttr {
 		{Name: "contoencoding", TypeOID: 23, Num: 6, Len: 4, NotNull: true},   // int4
 		{Name: "conproc", TypeOID: 24, Num: 7, Len: 4, NotNull: true},         // regproc → pg_proc
 		{Name: "condefault", TypeOID: 16, Num: 8, Len: 1, NotNull: true},      // bool
+	}
+}
+
+// pgDefaultAclAttrs defines the 5-column PG18 pg_default_acl schema.
+// PG `RelationBuildDesc(826) → ScanPgRelation(826)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row
+// gets seeded and PG FATALs with `could not open relation with OID
+// 826`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_default_acl.h` and
+// `pg_default_acl_d.h` (Anum_pg_default_acl_* 1–5). M0106-0010 step 3ak.
+// The trailing `defaclacl` column is `aclitem[]` (TypeOID 1034) which is
+// varlena (Len=-1); BKI_FORCE_NOT_NULL in the upstream header keeps
+// NotNull=true. The heap is currently empty (no default ACL rows are
+// bootstrapped), so the varlena encoder is not exercised at boot time.
+func pgDefaultAclAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},              // oid
+		{Name: "defaclrole", TypeOID: 26, Num: 2, Len: 4, NotNull: true},       // oid → pg_authid
+		{Name: "defaclnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},  // oid → pg_namespace (0 = all)
+		{Name: "defaclobjtype", TypeOID: 18, Num: 4, Len: 1, NotNull: true},    // char (DEFACLOBJ_*)
+		{Name: "defaclacl", TypeOID: 1034, Num: 5, Len: -1, NotNull: true},     // aclitem[] (BKI_FORCE_NOT_NULL)
 	}
 }
 
