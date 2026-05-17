@@ -702,6 +702,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3467, // pg_event_trigger_evtname_index (Step 3as)
 		3468, // pg_event_trigger_oid_index (Step 3at)
 		3080, // pg_extension_oid_index (Step 3ax)
+		3081, // pg_extension_name_index (Step 3ay)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -806,6 +807,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3467, // pg_event_trigger_evtname_index (Step 3as)
 		3468, // pg_event_trigger_oid_index (Step 3at)
 		3080, // pg_extension_oid_index (Step 3ax)
+		3081, // pg_extension_name_index (Step 3ay)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -842,6 +844,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3467, // pg_event_trigger_evtname_index (Step 3as)
 		3468, // pg_event_trigger_oid_index (Step 3at)
 		3080, // pg_extension_oid_index (Step 3ax)
+		3081, // pg_extension_name_index (Step 3ay)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2003,6 +2006,19 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_opclass_oid_index (2687, Step 3l). Companion to OID 3081
 		// (pg_extension_name_index, UNIQUE non-PKEY) — Step 3ay.
 		entry(3080, 3079, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_extension_oid_index
+		// M0106-0010 Step 3ay: pg_extension_name_index.
+		//   postgres/src/include/catalog/pg_extension.h:57
+		//     DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081,
+		//       ExtensionNameIndexId, pg_extension, btree(extname name_ops));
+		//   MAKE_SYSCACHE(EXTENSIONNAME, pg_extension_name_index, 2);
+		// pg_extension attnums (pg_extension_d.h): 2=extname.
+		// UNIQUE non-PRIMARY (DECLARE_UNIQUE_INDEX) over pg_extension
+		// heap OID 3079 (Step 3aw nailed rel). Single name_ops key with
+		// C_COLLATION_OID = 950 — same single-column name PKEY-less
+		// pattern as pg_event_trigger_evtname_index (3467, Step 3as) and
+		// pg_namespace_nspname_index (2684, Step 3t). Companion to OID
+		// 3080 (pg_extension_oid_index, UNIQUE PKEY) seeded in Step 3ax.
+		entry(3081, 3079, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_extension_name_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

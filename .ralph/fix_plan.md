@@ -5313,6 +5313,63 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         on `extname name_ops`, backing
         `MAKE_SYSCACHE(EXTENSIONNAME, …)`) deferred to Step 3ay.
         Design: `docs/design/0106-0010-step3ax-pg-extension-oid-index.md`.
+      - Step 3ay LANDED 2026-05-18. Closes the anticipated FATAL
+        `could not open relation with OID 3081` PG-standby boot blocker
+        that surfaces after Step 3ax seeded the companion oid PKEY index
+        (OID 3080). OID 3081 is `pg_extension_name_index` per
+        `postgres/src/include/catalog/pg_extension.h:57`
+        (`DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081,
+        ExtensionNameIndexId, pg_extension, btree(extname name_ops))`).
+        Backs `MAKE_SYSCACHE(EXTENSIONNAME, pg_extension_name_index, 2)`.
+        Pure catalog-seed addition mirroring the single-column `name_ops`
+        UNIQUE non-PKEY pattern of Steps 3as
+        (pg_event_trigger_evtname_index 3467) and 3t
+        (pg_namespace_nspname_index 2684); no encoder/builder/Init flow
+        change:
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(3081, 3079, []int16{2}, []uint32{nameOps},
+        []uint32{cCollation}, true, false)` — UNIQUE (non-PRIMARY) single
+        `name_ops` key over pg_extension heap OID 3079 (Step 3aw nailed
+        rel); `name_ops` carries C_COLLATION_OID = 950 same as Steps
+        3t/3as.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{3081, "pg_extension_name_index"}`; `flattenRels`+
+        `pgIndexNattsByOID` derives `RelKind='i', RelNatts=1` so the
+        `relnatts==indnatts` check (relcache.c:1492) passes.
+        (c) Three empty-placeholder OID lists in
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `3081, // pg_extension_name_index (Step 3ay)`. Step-3k
+        empty-btree placeholder is sufficient because pg_extension is
+        currently unpopulated — any
+        `SearchSysCache1(EXTENSIONNAME, …)` probe correctly returns no
+        row.
+        The seed threads automatically through the existing flow:
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples →
+        bootstrapPgIndexTuples (captures TID) →
+        bootstrapPgIndexIndexrelidIndex (adds leaf at 2679) →
+        bootstrapPgClassOidIndex (adds leaf at 2662) →
+        bootstrapPgAttributeRelidAttnumIndex (composite leaf at 2659)`.
+        Regression pins:
+        `TestPgExtensionNameIndexSeededFromInitialEntries` (pins
+        `(IndRelid=3079, IndKey=[2], IsUnique=true, IsPrimary=false,
+        IndCollation=[950])`) and
+        `TestNailedLocalRelsContainsPgExtensionNameIndex` (pins
+        `RelName, RelKind='i', RelNatts=1`) in
+        `internal/initdb/pg_extension_name_index_test.go`.
+        Existing pins extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18`
+        adds `3081: {2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3081.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgExtensionNameIndex|TestNailedLocalRelsContainsPgExtensionNameIndex|TestPgExtensionOidIndex|TestNailedLocalRelsContainsPgExtensionOidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgExtension'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3ax (no new regressions);
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        Step 3ay closes Step 3aw's deferred companion OID list — both
+        pg_extension indexes (3080 oid + 3081 name) are now seeded.
+        Design: `docs/design/0106-0010-step3ay-pg-extension-name-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

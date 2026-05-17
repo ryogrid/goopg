@@ -68,6 +68,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		3467: {2},         // pg_event_trigger_evtname_index : btree(evtname name_ops) UNIQUE ← Step 3as
 		3468: {1},         // pg_event_trigger_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3at
 		3080: {1},         // pg_extension_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ax
+		3081: {2},         // pg_extension_name_index : btree(extname name_ops) UNIQUE ← Step 3ay
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {
