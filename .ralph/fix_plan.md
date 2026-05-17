@@ -5062,6 +5062,49 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         3079 added to `bootstrapMappedLocalCatalogHeaps` OID list +
         `localRelMap`, companion indexes 3080 / 3081 in subsequent steps).
         Design: `docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md`.
+      - PROGRESS 2026-05-18 (Step 3av landed): multi-leaf btree bulk-load
+        builder `pgBuildBtreeBulkLoad(sortedTuples [][]byte, nkeyatts uint16)`
+        added in `internal/initdb/btree_index_bootstrap.go`. Fast path
+        (≤ 407 fixed-size tuples) is byte-identical to the legacy
+        `pgBuildBtreeMetapageWithRoot(1, 0) ‖ pgBuildBtreeLeafRootPage(tuples)`
+        sequence — pinned across 0/1/12/407 inputs by
+        `TestPgBuildBtreeBulkLoadSingleLeafByteIdenticalToLegacy`, so the
+        three other legacy callers (pg_opclass_oid_index,
+        pg_class_oid_index, pg_index_indexrelid_index) stay on the legacy
+        pair without regression risk. Slow path (> 407) emits PG18
+        nbtsort format: metapage at block 0, N BTP_LEAF leaves at blocks
+        1..N with `btpo_prev`/`btpo_next` sibling links and P_HIKEY at
+        slot 1 on every non-rightmost leaf (rightmost slid left per
+        `_bt_slideleft`), root at block N+1 with `BTP_ROOT` +
+        `btpo_level=1` + N downlinks. Leftmost downlink is the 8-byte
+        zero-attribute "minus infinity" pivot (`pgBuildBtreeMinusInfinityDownlink`,
+        mirrors nbtsort.c:1001–1008); later downlinks
+        (`pgBuildBtreeInternalDownlink`) copy each leaf's first data
+        tuple with `INDEX_ALT_TID_MASK = 0x2000` set in `t_info`,
+        `ip_blkid` = child block (struct-order `bi_hi`/`bi_lo` halves —
+        same trap as Step 3s closed for heap TIDs), `ip_posid` =
+        `nkeyatts & BT_OFFSET_MASK = 0x0FFF` per `BTreeTupleSetDownLink`
+        / `BTreeTupleSetNAtts` (nbtree.h:563/603). New pin
+        `TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18` covers a
+        500-tuple input: file size = 4 blocks, every metapage field,
+        both leaves' opaque area + items + P_HIKEY copy invariant,
+        root opaque + both downlinks' offset/length/`ip_blkid`/
+        `ip_posid`/`t_info`/key bytes. `bootstrapPgAttributeRelidAttnumIndex`
+        (OID 2659) is the only caller migrated this step
+        (`nkeyatts = 2` for the oid_int2 composite key). Verified:
+        `go test -count=1 ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS; every legacy btree test PASS (byte
+        equivalence confirms the migration is risk-free for sub-407
+        inputs). Wider initdb-package failures
+        (`TestSynchronousCommitFlushesByDefault`,
+        `TestMigrationFromLegacyJSONCluster`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`, …) are
+        pre-existing on origin/HEAD before this change — confirmed via
+        `git stash` baseline run, not caused by Step 3av. With this
+        landed, the pg_extension seed (Step 3aw — original Step 3au
+        intent renumbered) is a pure catalog-seed change with no
+        further btree work.
+        Design: `docs/design/0106-0010-step3av-multi-leaf-btree-bulk-load.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -5136,7 +5179,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `docs/design/0106-0010-step3as-pg-event-trigger-evtname-index.md`,
         `internal/initdb/pg_event_trigger_oid_index_test.go`,
         `docs/design/0106-0010-step3at-pg-event-trigger-oid-index.md`,
-        `docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md`
+        `docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md`,
+        `docs/design/0106-0010-step3av-multi-leaf-btree-bulk-load.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

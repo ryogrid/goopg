@@ -43,6 +43,30 @@ const (
 
 	// Size of the special area at the end of every btree page.
 	sizeOfBTPageOpaque = 16
+
+	// indexAltTIDMask is the t_info flag PG sets on every BTREE v4 pivot
+	// tuple (downlinks and leaf high keys). Mirrors INDEX_ALT_TID_MASK =
+	// INDEX_AM_RESERVED_BIT (0x2000) per nbtree.h:460.
+	indexAltTIDMask uint16 = 0x2000
+
+	// btOffsetMask is the low-12-bit mask used to encode key-attribute
+	// count in a pivot tuple's ip_posid. Mirrors BT_OFFSET_MASK = 0x0FFF
+	// per nbtree.h:463.
+	btOffsetMask uint16 = 0x0FFF
+
+	// pNone is the "no sibling / no parent" block-number sentinel
+	// (P_NONE = InvalidBlockNumber = 0xFFFFFFFF in PG).
+	pNone uint32 = 0xFFFFFFFF
+
+	// Bulk-load packing parameters for fixed 16-byte composite-key index
+	// tuples (the size emitted by pgBuildIndexTupleOidKey and
+	// pgBuildIndexTupleOidInt2Key). Every line pointer takes 4 bytes, so
+	// each tuple consumes 20 bytes of the 8152-byte per-page payload
+	// (BlockSize − SizeOfPageHeaderData − sizeOfBTPageOpaque = 8152).
+	fixedIndexTupleSize          = 16
+	leafPayloadBytes             = storage.BlockSize - storage.SizeOfPageHeaderData - sizeOfBTPageOpaque
+	maxTuplesPerSingleLeafRoot   = leafPayloadBytes / (fixedIndexTupleSize + 4) // 407 for 16-byte tuples
+	maxTuplesPerNonRightmostLeaf = (leafPayloadBytes - (fixedIndexTupleSize + 4)) / (fixedIndexTupleSize + 4)
 )
 
 // pgBuildIndexTupleOidKey constructs an 8+4-byte=12-byte IndexTuple,
@@ -152,6 +176,276 @@ func pgBuildBtreeLeafRootPage(sortedTuples [][]byte) ([]byte, error) {
 	off := storage.BlockSize - sizeOfBTPageOpaque
 	binary.LittleEndian.PutUint16(page[off+12:off+14], btpLeaf|btpRoot)
 	return page, nil
+}
+
+// pgBuildBtreeBulkLoad packs sortedTuples into a complete on-disk btree
+// file ready to be written verbatim under base/{1,5}/<oid> and
+// global/<oid>. Output layout depends on input size:
+//
+//   - len(sortedTuples) ≤ maxTuplesPerSingleLeafRoot (407 for 16-byte
+//     fixed-size tuples): metapage at block 0 + leaf-root at block 1.
+//     The bytes are identical to the legacy
+//     `pgBuildBtreeMetapageWithRoot(1,0) || pgBuildBtreeLeafRootPage(tuples)`
+//     pair so this is a transparent drop-in for every existing caller.
+//   - len(sortedTuples) > maxTuplesPerSingleLeafRoot: PG18 nbtsort bulk-load
+//     format — metapage at block 0, N leaf pages at blocks 1..N with
+//     `BTP_LEAF` flag + `btpo_prev`/`btpo_next` sibling links + `P_HIKEY`
+//     at item slot 1 on every non-rightmost leaf (rightmost is slid left
+//     per `_bt_slideleft`), and the root at block N+1 with `BTP_ROOT` +
+//     `btpo_level=1` + N downlinks (leftmost = 8-byte zero-attribute
+//     "minus infinity" pivot per `nbtsort.c:1001-1008`; later downlinks
+//     each copy the corresponding leaf's first key with INDEX_ALT_TID_MASK
+//     set and `ip_blkid` = child block per `BTreeTupleSetDownLink` and
+//     `BTreeTupleSetNAtts`).
+//
+// Authoritative PG18 sources:
+//
+//	postgres/src/backend/access/nbtree/nbtsort.c (`_bt_buildadd`,
+//	`_bt_uppershutdown`, `_bt_slideleft`)
+//	postgres/src/include/access/nbtree.h (`BTPageOpaqueData`, `BTP_LEAF`,
+//	`BTP_ROOT`, `INDEX_ALT_TID_MASK`, `BT_OFFSET_MASK`, `P_HIKEY`,
+//	`BTreeTupleSetDownLink`, `BTreeTupleSetNAtts`)
+//
+// nkeyatts encodes how many key attributes each leaf tuple carries (1 for
+// pure-oid keys, 2 for the oid_int2 composite). It is written into the
+// `ip_posid` field of every non-leftmost internal downlink so PG's
+// `BTreeTupleGetNAtts` returns the correct value during descent. Pure
+// fast-path (single-leaf-root) output does not depend on nkeyatts.
+func pgBuildBtreeBulkLoad(sortedTuples [][]byte, nkeyatts uint16) ([]byte, error) {
+	for i, t := range sortedTuples {
+		if len(t) != fixedIndexTupleSize {
+			return nil, fmt.Errorf("pgBuildBtreeBulkLoad: tuple %d size=%d, want %d (only fixed 16-byte tuples supported)",
+				i, len(t), fixedIndexTupleSize)
+		}
+	}
+
+	if len(sortedTuples) <= maxTuplesPerSingleLeafRoot {
+		leaf, err := pgBuildBtreeLeafRootPage(sortedTuples)
+		if err != nil {
+			return nil, fmt.Errorf("bulk-load leaf-root: %w", err)
+		}
+		meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+		out := make([]byte, 0, 2*storage.BlockSize)
+		out = append(out, meta...)
+		out = append(out, leaf...)
+		return out, nil
+	}
+
+	// Partition into leaf groups: every non-rightmost leaf reserves space
+	// for a P_HIKEY (16-byte tuple + 4-byte ItemId).
+	var leafGroups [][][]byte
+	pos := 0
+	for pos < len(sortedTuples) {
+		remaining := len(sortedTuples) - pos
+		if remaining <= maxTuplesPerSingleLeafRoot {
+			leafGroups = append(leafGroups, sortedTuples[pos:])
+			break
+		}
+		end := pos + maxTuplesPerNonRightmostLeaf
+		leafGroups = append(leafGroups, sortedTuples[pos:end])
+		pos = end
+	}
+	nLeaves := len(leafGroups)
+
+	// Build leaves at blocks 1..nLeaves.
+	leaves := make([][]byte, nLeaves)
+	for li, group := range leafGroups {
+		isRightmost := li == nLeaves-1
+		prevBlock := uint32(pNone)
+		nextBlock := uint32(pNone)
+		if li > 0 {
+			prevBlock = uint32(li) // previous leaf block (li is 0-based, leaves start at block 1, so prev = li)
+		}
+		if !isRightmost {
+			nextBlock = uint32(li + 2) // next leaf block (li+1 in 0-based, +1 for 1-based block)
+		}
+		// Non-rightmost leaves get a P_HIKEY = copy of last data tuple in
+		// this leaf (no truncation: 16-byte composite keys are atomic).
+		var highKey []byte
+		if !isRightmost {
+			highKey = group[len(group)-1]
+		}
+		page, err := pgBuildBtreeLeafPage(group, highKey, prevBlock, nextBlock)
+		if err != nil {
+			return nil, fmt.Errorf("leaf %d: %w", li, err)
+		}
+		leaves[li] = page
+	}
+
+	// Build root at block nLeaves+1 with one downlink per leaf.
+	downlinks := make([][]byte, nLeaves)
+	downlinks[0] = pgBuildBtreeMinusInfinityDownlink(1 /* child block */)
+	for li := 1; li < nLeaves; li++ {
+		childBlock := uint32(li + 1)
+		downlinks[li] = pgBuildBtreeInternalDownlink(leafGroups[li][0], childBlock, nkeyatts)
+	}
+	rootPage, err := pgBuildBtreeInternalRootPage(downlinks)
+	if err != nil {
+		return nil, fmt.Errorf("root: %w", err)
+	}
+
+	// Metapage points at the root and declares the new tree height.
+	rootBlock := uint32(nLeaves + 1)
+	meta := pgBuildBtreeMetapageWithRoot(rootBlock, 1 /* root is level 1 */)
+
+	out := make([]byte, 0, (nLeaves+2)*storage.BlockSize)
+	out = append(out, meta...)
+	for _, leaf := range leaves {
+		out = append(out, leaf...)
+	}
+	out = append(out, rootPage...)
+	return out, nil
+}
+
+// pgBuildBtreeLeafPage assembles one 8 KiB BTP_LEAF page with the given
+// sibling links. When highKey is non-nil, it is written into item slot 1
+// (P_HIKEY) and the data tuples occupy slots 2..N+1; when nil, the page
+// is rightmost on its level and data tuples occupy slots 1..N (mirroring
+// `_bt_slideleft` in nbtsort.c).
+//
+// All tuples must be the fixed 16-byte size produced by
+// pgBuildIndexTupleOidKey / pgBuildIndexTupleOidInt2Key — this is enforced
+// by the bulk-load caller.
+func pgBuildBtreeLeafPage(sortedTuples [][]byte, highKey []byte, prev, next uint32) ([]byte, error) {
+	page := make([]byte, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return nil, err
+	}
+	h := storage.MustHeader(storage.Page(page))
+	h.SetSpecial(uint16(storage.BlockSize - sizeOfBTPageOpaque))
+
+	upper := storage.BlockSize - sizeOfBTPageOpaque
+	lower := storage.SizeOfPageHeaderData
+
+	writeItem := func(tuple []byte) error {
+		if len(tuple)%8 != 0 {
+			return fmt.Errorf("tuple not MAXALIGN'd: len=%d", len(tuple))
+		}
+		newUpper := upper - len(tuple)
+		if newUpper-lower < 4 {
+			return fmt.Errorf("btree leaf overflow inserting tuple at lower=%d", lower)
+		}
+		copy(page[newUpper:upper], tuple)
+		raw := uint32(uint16(newUpper)&0x7FFF) |
+			(uint32(uint8(storage.ItemIDNormal)&0x3) << 15) |
+			(uint32(uint16(len(tuple))&0x7FFF) << 17)
+		binary.LittleEndian.PutUint32(page[lower:lower+4], raw)
+		lower += 4
+		upper = newUpper
+		return nil
+	}
+
+	if highKey != nil {
+		if err := writeItem(highKey); err != nil {
+			return nil, fmt.Errorf("P_HIKEY: %w", err)
+		}
+	}
+	for i, t := range sortedTuples {
+		if err := writeItem(t); err != nil {
+			return nil, fmt.Errorf("data tuple %d: %w", i, err)
+		}
+	}
+	h.SetLower(uint16(lower))
+	h.SetUpper(uint16(upper))
+
+	// BTPageOpaqueData: btpo_prev | btpo_next | btpo_level=0 | btpo_flags=BTP_LEAF.
+	off := storage.BlockSize - sizeOfBTPageOpaque
+	le := binary.LittleEndian
+	le.PutUint32(page[off+0:off+4], prev)
+	le.PutUint32(page[off+4:off+8], next)
+	le.PutUint32(page[off+8:off+12], 0) // btpo_level
+	le.PutUint16(page[off+12:off+14], btpLeaf)
+	// btpo_cycleid at off+14..16 stays zero.
+	return page, nil
+}
+
+// pgBuildBtreeInternalRootPage assembles one 8 KiB BTP_ROOT internal page
+// carrying the supplied downlinks at slots 1..N. The root is always
+// rightmost on its level, so there is no P_HIKEY (mirroring
+// `_bt_slideleft` in nbtsort.c).
+func pgBuildBtreeInternalRootPage(downlinks [][]byte) ([]byte, error) {
+	page := make([]byte, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return nil, err
+	}
+	h := storage.MustHeader(storage.Page(page))
+	h.SetSpecial(uint16(storage.BlockSize - sizeOfBTPageOpaque))
+
+	upper := storage.BlockSize - sizeOfBTPageOpaque
+	lower := storage.SizeOfPageHeaderData
+	for i, dl := range downlinks {
+		if len(dl)%8 != 0 {
+			return nil, fmt.Errorf("downlink %d not MAXALIGN'd: len=%d", i, len(dl))
+		}
+		newUpper := upper - len(dl)
+		if newUpper-lower < 4 {
+			return nil, fmt.Errorf("btree root overflow inserting downlink %d", i)
+		}
+		copy(page[newUpper:upper], dl)
+		raw := uint32(uint16(newUpper)&0x7FFF) |
+			(uint32(uint8(storage.ItemIDNormal)&0x3) << 15) |
+			(uint32(uint16(len(dl))&0x7FFF) << 17)
+		binary.LittleEndian.PutUint32(page[lower:lower+4], raw)
+		lower += 4
+		upper = newUpper
+	}
+	h.SetLower(uint16(lower))
+	h.SetUpper(uint16(upper))
+
+	off := storage.BlockSize - sizeOfBTPageOpaque
+	le := binary.LittleEndian
+	le.PutUint32(page[off+0:off+4], uint32(pNone))
+	le.PutUint32(page[off+4:off+8], uint32(pNone))
+	le.PutUint32(page[off+8:off+12], 1) // btpo_level = 1 (root above the leaves)
+	le.PutUint16(page[off+12:off+14], btpRoot)
+	return page, nil
+}
+
+// pgBuildBtreeMinusInfinityDownlink builds the leftmost downlink tuple
+// in any internal level: an 8-byte IndexTupleData header with zero key
+// attributes, `INDEX_ALT_TID_MASK` set (required on BTREE v4 pivots),
+// and `ip_blkid` pointing at the target child block. Mirrors
+// nbtsort.c:1001-1008 (`palloc0(sizeof(IndexTupleData))` +
+// `BTreeTupleSetNAtts(lowkey, 0, false)`).
+func pgBuildBtreeMinusInfinityDownlink(childBlock uint32) []byte {
+	out := make([]byte, sizeOfIndexTupleData) // 8 bytes
+	le := binary.LittleEndian
+	// ip_blkid = (bi_hi, bi_lo) struct-order halves, NOT a single LE uint32.
+	le.PutUint16(out[0:2], uint16(childBlock>>16))
+	le.PutUint16(out[2:4], uint16(childBlock&0xFFFF))
+	// ip_posid = nkeyatts & BT_OFFSET_MASK = 0 (minus infinity has zero keys).
+	le.PutUint16(out[4:6], 0)
+	// t_info: lower 13 bits = tuple size; INDEX_ALT_TID_MASK flag (= 0x2000).
+	le.PutUint16(out[6:8], uint16(sizeOfIndexTupleData)|indexAltTIDMask)
+	return out
+}
+
+// pgBuildBtreeInternalDownlink builds a non-leftmost downlink tuple: a
+// full copy of the child page's first data tuple (PG's bulk-load copies
+// the leaf's `btps_lowkey` upward when finishing a leaf, see
+// `nbtsort.c:960 _bt_buildadd(wstate, state->btps_next, state->btps_lowkey,…)`),
+// with the heap-TID `ip_blkid` overwritten to the child block, `ip_posid`
+// set to `nkeyatts & BT_OFFSET_MASK`, and `INDEX_ALT_TID_MASK` set in
+// `t_info` (required on BTREE v4 pivots — see `BTreeTupleSetNAtts` in
+// nbtree.h).
+//
+// dataTuple must be the leaf's first data tuple verbatim (16 bytes).
+func pgBuildBtreeInternalDownlink(dataTuple []byte, childBlock uint32, nkeyatts uint16) []byte {
+	out := make([]byte, len(dataTuple))
+	copy(out, dataTuple)
+	le := binary.LittleEndian
+	// Overwrite ip_blkid with child block (struct-order bi_hi/bi_lo).
+	le.PutUint16(out[0:2], uint16(childBlock>>16))
+	le.PutUint16(out[2:4], uint16(childBlock&0xFFFF))
+	// ip_posid encodes nkeyatts in the low 12 bits (BT_OFFSET_MASK = 0x0FFF).
+	le.PutUint16(out[4:6], nkeyatts&btOffsetMask)
+	// Preserve the tuple's existing data layout; flip on INDEX_ALT_TID_MASK
+	// while keeping the size bits intact. t_info size bits cover the whole
+	// 16-byte tuple already (set by the data-tuple builder), so we OR in
+	// the pivot flag without touching the low 13 bits.
+	tinfo := le.Uint16(out[6:8])
+	le.PutUint16(out[6:8], tinfo|indexAltTIDMask)
+	return out
 }
 
 // pgBuildBtreeMetapageWithRoot mirrors makeBtreeRootPage but takes a
@@ -395,15 +689,16 @@ func bootstrapPgAttributeRelidAttnumIndex(dataDir string, tids map[pgAttrTIDKey]
 	for i, e := range entries {
 		tuples[i] = pgBuildIndexTupleOidInt2Key(e.block, e.off, e.attrelid, e.attnum)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	// Bulk-load builder: byte-identical to the legacy meta+leaf-root pair
+	// for sub-407 inputs; emits a 2-level btree (meta + N leaves + root)
+	// once the input crosses the single-leaf cap, unblocking pg_extension
+	// and any future nailed rel that pushes this index past one page. See
+	// docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md.
+	// nkeyatts = 2 because the index is composite (attrelid oid, attnum int2).
+	file, err := pgBuildBtreeBulkLoad(tuples, 2)
 	if err != nil {
-		return fmt.Errorf("pg_attribute_relid_attnum_index leaf: %w", err)
+		return fmt.Errorf("pg_attribute_relid_attnum_index bulk-load: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
 
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),

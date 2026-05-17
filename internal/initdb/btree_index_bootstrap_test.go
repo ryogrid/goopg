@@ -546,3 +546,260 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 		}
 	}
 }
+
+
+// TestPgBuildBtreeBulkLoadSingleLeafByteIdenticalToLegacy pins the
+// drop-in guarantee from Step 3av: for any input that fits in one leaf
+// (≤ 407 fixed-size tuples), pgBuildBtreeBulkLoad emits exactly the same
+// bytes as the legacy `pgBuildBtreeMetapageWithRoot(1, 0) +
+// pgBuildBtreeLeafRootPage(tuples)` pair. Callers can migrate
+// transparently without changing any on-disk artifacts. The byte
+// equivalence is what protects every existing index seeded via the
+// legacy path (pg_opclass_oid_index, pg_class_oid_index,
+// pg_index_indexrelid_index, and pg_attribute_relid_attnum_index when
+// sub-407) from regression when the multi-leaf path is added.
+func TestPgBuildBtreeBulkLoadSingleLeafByteIdenticalToLegacy(t *testing.T) {
+	cases := []struct {
+		name string
+		n    int
+	}{
+		{"empty", 0},
+		{"single", 1},
+		{"twelve_pgopclass", 12},
+		{"max_single_leaf_407", 407},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tuples := make([][]byte, c.n)
+			for i := range tuples {
+				tuples[i] = pgBuildIndexTupleOidInt2Key(uint32(i+1), uint16(i+1), uint32(i+1), int16(i%32+1))
+			}
+			gotBulk, err := pgBuildBtreeBulkLoad(tuples, 2)
+			if err != nil {
+				t.Fatalf("pgBuildBtreeBulkLoad: %v", err)
+			}
+			leaf, err := pgBuildBtreeLeafRootPage(tuples)
+			if err != nil {
+				t.Fatalf("pgBuildBtreeLeafRootPage: %v", err)
+			}
+			meta := pgBuildBtreeMetapageWithRoot(1, 0)
+			wantLegacy := append(meta, leaf...)
+			if len(gotBulk) != len(wantLegacy) {
+				t.Fatalf("len: bulk=%d, legacy=%d", len(gotBulk), len(wantLegacy))
+			}
+			for i := range gotBulk {
+				if gotBulk[i] != wantLegacy[i] {
+					t.Fatalf("byte %d (block=%d, off=%d): bulk=%#x, legacy=%#x",
+						i, i/storage.BlockSize, i%storage.BlockSize,
+						gotBulk[i], wantLegacy[i])
+				}
+			}
+		})
+	}
+}
+
+// TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18 pins the on-disk
+// layout for an input that overflows a single leaf — exactly the
+// scenario that blocks the pg_extension nailed-rel seed
+// (407 existing pg_attribute_relid_attnum_index entries + 8 from
+// pg_extension = 415 tuples). Asserts each on-disk invariant PG18's
+// `_bt_getroot` → `_bt_search` → `_bt_binsrch` descent relies on:
+//
+//   - file size = (1 metapage + N leaves + 1 root) × BlockSize
+//   - metapage `btm_root = N+1`, `btm_level = 1`,
+//     `btm_fastroot = N+1`, `btm_fastlevel = 1`
+//   - leaf 1: `btpo_prev = P_NONE`, `btpo_next = 2`, level 0, BTP_LEAF;
+//     P_HIKEY at slot 1 = copy of leaf 1's last data tuple
+//   - leaf 2: `btpo_prev = 1`, `btpo_next = P_NONE`, level 0, BTP_LEAF;
+//     no high key (rightmost — slid left per `_bt_slideleft`)
+//   - root (block N+1): `btpo_flags = BTP_ROOT`, level 1, 2 downlinks
+//     - downlink 1 = zero-attribute minus-infinity pivot (8 bytes,
+//       INDEX_ALT_TID_MASK set, `ip_blkid` = 1, `ip_posid` = 0)
+//     - downlink 2 = leaf 2's first key, 16 bytes, INDEX_ALT_TID_MASK
+//       set, `ip_blkid` = 2, `ip_posid` = nkeyatts(2)
+func TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18(t *testing.T) {
+	const nTuples = 500
+	tuples := make([][]byte, nTuples)
+	for i := range tuples {
+		tuples[i] = pgBuildIndexTupleOidInt2Key(uint32(i+1), uint16(i+1), uint32(i+1), int16(i%32+1))
+	}
+	out, err := pgBuildBtreeBulkLoad(tuples, 2)
+	if err != nil {
+		t.Fatalf("pgBuildBtreeBulkLoad: %v", err)
+	}
+	// 500 tuples > 407 cap: 406 on leaf 1 (with P_HIKEY) + 94 on leaf 2
+	// (rightmost). 1 meta + 2 leaves + 1 root = 4 blocks.
+	wantBlocks := 4
+	if len(out) != wantBlocks*storage.BlockSize {
+		t.Fatalf("file size = %d, want %d (%d blocks)", len(out), wantBlocks*storage.BlockSize, wantBlocks)
+	}
+
+	le := binary.LittleEndian
+
+	// ─── Metapage at block 0 ───────────────────────────────────────────
+	base := storage.SizeOfPageHeaderData
+	if got := le.Uint32(out[base+8 : base+12]); got != 3 {
+		t.Errorf("metapage btm_root = %d, want 3 (= N leaves + 1)", got)
+	}
+	if got := le.Uint32(out[base+12 : base+16]); got != 1 {
+		t.Errorf("metapage btm_level = %d, want 1", got)
+	}
+	if got := le.Uint32(out[base+16 : base+20]); got != 3 {
+		t.Errorf("metapage btm_fastroot = %d, want 3", got)
+	}
+	if got := le.Uint32(out[base+20 : base+24]); got != 1 {
+		t.Errorf("metapage btm_fastlevel = %d, want 1", got)
+	}
+
+	// ─── Leaf 1 (block 1) ──────────────────────────────────────────────
+	leaf1 := out[1*storage.BlockSize : 2*storage.BlockSize]
+	opaqueOff := storage.BlockSize - sizeOfBTPageOpaque
+	if got := le.Uint32(leaf1[opaqueOff+0 : opaqueOff+4]); got != pNone {
+		t.Errorf("leaf1 btpo_prev = %#x, want P_NONE (%#x)", got, pNone)
+	}
+	if got := le.Uint32(leaf1[opaqueOff+4 : opaqueOff+8]); got != 2 {
+		t.Errorf("leaf1 btpo_next = %d, want 2", got)
+	}
+	if got := le.Uint32(leaf1[opaqueOff+8 : opaqueOff+12]); got != 0 {
+		t.Errorf("leaf1 btpo_level = %d, want 0", got)
+	}
+	if got := le.Uint16(leaf1[opaqueOff+12 : opaqueOff+14]); got != btpLeaf {
+		t.Errorf("leaf1 btpo_flags = %#x, want BTP_LEAF (%#x) only (no BTP_ROOT)", got, btpLeaf)
+	}
+	leaf1Header, err := storage.Header(storage.Page(leaf1))
+	if err != nil {
+		t.Fatalf("leaf1 header: %v", err)
+	}
+	leaf1Items := (int(leaf1Header.Lower()) - storage.SizeOfPageHeaderData) / 4
+	// 406 data tuples + 1 P_HIKEY = 407 items.
+	if leaf1Items != maxTuplesPerNonRightmostLeaf+1 {
+		t.Errorf("leaf1 items = %d, want %d (P_HIKEY + %d data)",
+			leaf1Items, maxTuplesPerNonRightmostLeaf+1, maxTuplesPerNonRightmostLeaf)
+	}
+	// P_HIKEY is item slot 1 (= the very first line pointer at offset 24).
+	hikeyRaw := le.Uint32(leaf1[storage.SizeOfPageHeaderData : storage.SizeOfPageHeaderData+4])
+	hikeyOff := hikeyRaw & 0x7FFF
+	hikeyLen := (hikeyRaw >> 17) & 0x7FFF
+	if hikeyLen != fixedIndexTupleSize {
+		t.Errorf("P_HIKEY length = %d, want %d", hikeyLen, fixedIndexTupleSize)
+	}
+	// P_HIKEY must be a copy of leaf 1's last data tuple
+	// (= tuples[maxTuplesPerNonRightmostLeaf-1] for 16-byte fixed-size tuples).
+	wantHikey := tuples[maxTuplesPerNonRightmostLeaf-1]
+	gotHikey := leaf1[hikeyOff : hikeyOff+uint32(fixedIndexTupleSize)]
+	for i := range wantHikey {
+		if gotHikey[i] != wantHikey[i] {
+			t.Errorf("P_HIKEY byte %d: got %#x, want %#x (copy of leaf1's last tuple)",
+				i, gotHikey[i], wantHikey[i])
+		}
+	}
+
+	// ─── Leaf 2 (block 2, rightmost) ───────────────────────────────────
+	leaf2 := out[2*storage.BlockSize : 3*storage.BlockSize]
+	if got := le.Uint32(leaf2[opaqueOff+0 : opaqueOff+4]); got != 1 {
+		t.Errorf("leaf2 btpo_prev = %d, want 1", got)
+	}
+	if got := le.Uint32(leaf2[opaqueOff+4 : opaqueOff+8]); got != pNone {
+		t.Errorf("leaf2 btpo_next = %#x, want P_NONE (%#x)", got, pNone)
+	}
+	if got := le.Uint16(leaf2[opaqueOff+12 : opaqueOff+14]); got != btpLeaf {
+		t.Errorf("leaf2 btpo_flags = %#x, want BTP_LEAF (%#x)", got, btpLeaf)
+	}
+	leaf2Header, err := storage.Header(storage.Page(leaf2))
+	if err != nil {
+		t.Fatalf("leaf2 header: %v", err)
+	}
+	leaf2Items := (int(leaf2Header.Lower()) - storage.SizeOfPageHeaderData) / 4
+	// 500 − 406 = 94 data tuples, no high key.
+	if leaf2Items != nTuples-maxTuplesPerNonRightmostLeaf {
+		t.Errorf("leaf2 items = %d, want %d (rightmost, no P_HIKEY)",
+			leaf2Items, nTuples-maxTuplesPerNonRightmostLeaf)
+	}
+	// First data tuple on leaf 2 (slot 1) must equal tuples[406].
+	leaf2FirstRaw := le.Uint32(leaf2[storage.SizeOfPageHeaderData : storage.SizeOfPageHeaderData+4])
+	leaf2FirstOff := leaf2FirstRaw & 0x7FFF
+	leaf2First := leaf2[leaf2FirstOff : leaf2FirstOff+uint32(fixedIndexTupleSize)]
+	wantLeaf2First := tuples[maxTuplesPerNonRightmostLeaf]
+	for i := range wantLeaf2First {
+		if leaf2First[i] != wantLeaf2First[i] {
+			t.Errorf("leaf2 first data tuple byte %d: got %#x, want %#x",
+				i, leaf2First[i], wantLeaf2First[i])
+		}
+	}
+
+	// ─── Root (block 3) ────────────────────────────────────────────────
+	root := out[3*storage.BlockSize : 4*storage.BlockSize]
+	if got := le.Uint32(root[opaqueOff+0 : opaqueOff+4]); got != pNone {
+		t.Errorf("root btpo_prev = %#x, want P_NONE", got)
+	}
+	if got := le.Uint32(root[opaqueOff+4 : opaqueOff+8]); got != pNone {
+		t.Errorf("root btpo_next = %#x, want P_NONE", got)
+	}
+	if got := le.Uint32(root[opaqueOff+8 : opaqueOff+12]); got != 1 {
+		t.Errorf("root btpo_level = %d, want 1", got)
+	}
+	if got := le.Uint16(root[opaqueOff+12 : opaqueOff+14]); got != btpRoot {
+		t.Errorf("root btpo_flags = %#x, want BTP_ROOT (%#x) only", got, btpRoot)
+	}
+	rootHeader, err := storage.Header(storage.Page(root))
+	if err != nil {
+		t.Fatalf("root header: %v", err)
+	}
+	rootItems := (int(rootHeader.Lower()) - storage.SizeOfPageHeaderData) / 4
+	if rootItems != 2 {
+		t.Fatalf("root items = %d, want 2 (one downlink per leaf)", rootItems)
+	}
+
+	// Root downlink 1 (slot 1): minus-infinity pivot = 8-byte
+	// IndexTupleData with INDEX_ALT_TID_MASK set, ip_blkid=1, ip_posid=0.
+	dl1Raw := le.Uint32(root[storage.SizeOfPageHeaderData : storage.SizeOfPageHeaderData+4])
+	dl1Off := dl1Raw & 0x7FFF
+	dl1Len := (dl1Raw >> 17) & 0x7FFF
+	if dl1Len != sizeOfIndexTupleData {
+		t.Errorf("root downlink 1 length = %d, want %d (minus-infinity)", dl1Len, sizeOfIndexTupleData)
+	}
+	dl1 := root[dl1Off : dl1Off+uint32(sizeOfIndexTupleData)]
+	dl1BiHi := le.Uint16(dl1[0:2])
+	dl1BiLo := le.Uint16(dl1[2:4])
+	if got := (uint32(dl1BiHi) << 16) | uint32(dl1BiLo); got != 1 {
+		t.Errorf("root downlink 1 ip_blkid = %d, want 1 (leaf 1)", got)
+	}
+	if got := le.Uint16(dl1[4:6]); got != 0 {
+		t.Errorf("root downlink 1 ip_posid = %d, want 0 (zero key attrs)", got)
+	}
+	if got := le.Uint16(dl1[6:8]); got&indexAltTIDMask == 0 {
+		t.Errorf("root downlink 1 t_info = %#x, want INDEX_ALT_TID_MASK (%#x) set", got, indexAltTIDMask)
+	}
+	if got := le.Uint16(dl1[6:8]) & indexSizeMask; got != sizeOfIndexTupleData {
+		t.Errorf("root downlink 1 size bits = %d, want %d", got, sizeOfIndexTupleData)
+	}
+
+	// Root downlink 2 (slot 2): copy of leaf 2's first key with
+	// INDEX_ALT_TID_MASK set, ip_blkid=2, ip_posid=nkeyatts(2).
+	dl2Raw := le.Uint32(root[storage.SizeOfPageHeaderData+4 : storage.SizeOfPageHeaderData+8])
+	dl2Off := dl2Raw & 0x7FFF
+	dl2Len := (dl2Raw >> 17) & 0x7FFF
+	if dl2Len != fixedIndexTupleSize {
+		t.Errorf("root downlink 2 length = %d, want %d (full tuple copy)", dl2Len, fixedIndexTupleSize)
+	}
+	dl2 := root[dl2Off : dl2Off+uint32(fixedIndexTupleSize)]
+	dl2BiHi := le.Uint16(dl2[0:2])
+	dl2BiLo := le.Uint16(dl2[2:4])
+	if got := (uint32(dl2BiHi) << 16) | uint32(dl2BiLo); got != 2 {
+		t.Errorf("root downlink 2 ip_blkid = %d, want 2 (leaf 2)", got)
+	}
+	if got := le.Uint16(dl2[4:6]); got != 2 {
+		t.Errorf("root downlink 2 ip_posid = %d, want 2 (nkeyatts)", got)
+	}
+	if got := le.Uint16(dl2[6:8]); got&indexAltTIDMask == 0 {
+		t.Errorf("root downlink 2 t_info = %#x, want INDEX_ALT_TID_MASK set", got)
+	}
+	// Key payload at offsets [8..14] must match leaf 2's first tuple
+	// payload (ip_blkid/posid differ — already verified — so compare
+	// the key bytes only).
+	for i := 8; i < 16; i++ {
+		if dl2[i] != wantLeaf2First[i] {
+			t.Errorf("root downlink 2 key byte %d: got %#x, want %#x", i, dl2[i], wantLeaf2First[i])
+		}
+	}
+}
