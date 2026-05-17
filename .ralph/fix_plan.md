@@ -2930,8 +2930,66 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         index with real btree index tuples pointing at the
         bootstrapped heap rows — substantial scope of its own.
         Design: `docs/design/0106-0010-step3k-btree-metapage-encoding.md`.
+      - Step 3l LANDED 2026-05-17. Closes the FATAL
+        `could not find tuple for opclass 1986` PG-standby boot blocker
+        that surfaced after Step 3k. Root cause: Step 3k seeded the
+        nailed-index metapages with `btm_root = P_NONE` (canonical empty-
+        index sentinel), so every `LookupOpclassInfo →
+        SearchSysCache1(CLAOID, …)` lookup against `pg_opclass_oid_index`
+        (OID 2687) returned zero rows. The pg_opclass heap itself was
+        already populated by Step 3b — the missing piece was the index
+        tuples that PG's `_bt_search` walks.  Fix: new
+        `internal/initdb/btree_index_bootstrap.go` adds three builders —
+        `pgBuildIndexTupleOidKey` (8-byte IndexTupleHeader + 4-byte LE
+        oid + 4-byte MAXALIGN pad = 16 bytes total; `t_info` stores size
+        with no flags because no nulls/no varlena),
+        `pgBuildBtreeLeafRootPage` (8192-byte page; forward-growing line
+        pointers from byte 24, backward-growing tuples from
+        BlockSize-16; `btpo_flags = BTP_LEAF|BTP_ROOT`; level/prev/next
+        zero), and `pgBuildBtreeMetapageWithRoot` (variant of
+        `makeBtreeRootPage` that writes a real root pointer; original
+        kept for the other 22 nailed indexes which remain Step-3k
+        empty).  `bootstrapPgOpclassOidIndex(dataDir)` ties them
+        together — iterates `pgOpclassInitialEntries`, computes (oid,
+        tid) where tid = (block 0, offset i+1) since
+        `bootstrapPgOpclassTuples` packs all 12 rows on block 0, sorts
+        by oid for B-tree key order, builds the 2-block file
+        (metapage→leaf-root with 12 tuples), and writes to
+        `base/{1,5}/2687` + `global/2687`. Wired into `Init` after
+        `bootstrapPgIndexTuples`. Scope deliberately bounded to OID
+        2687 — populating all 23 nailed indexes in one loop would
+        couple variable-width/multi-column/cstring key encoders. Per-
+        loop pattern: rerun
+        `TestE2E_FailoverGoopgToPG/async`
+        (`GOOPG_RUN_BLOCKED_M0102_E2E=1`), capture next FATAL,
+        populate corresponding index. Regression pins:
+        `TestPgBuildIndexTupleOidKeyLayoutMatchesPG18` (byte-exact 16-
+        byte layout including `ip_blkid`/`ip_posid`/`t_info`/oid
+        offsets and zero pad),
+        `TestPgBuildBtreeLeafRootPagePageHeader` (special at
+        BlockSize-16, lower past line pointers, upper above tuples,
+        `BTP_LEAF|BTP_ROOT` flag, level/prev/next zero),
+        `TestPgBuildBtreeMetapageWithRootEncodesRootPointer` (every
+        metapage field byte-exact), and
+        `TestBootstrapPgOpclassOidIndexWritesPopulatedBtree` (end-to-
+        end: file = 2 blocks at all three on-disk locations; metapage
+        points to block 1; leaf has 12 items; OIDs read back ascending)
+        in `internal/initdb/btree_index_bootstrap_test.go`. Verified:
+        `go test -count=1 -run
+        'TestPgBuildIndexTupleOidKey|TestPgBuildBtreeLeafRoot|TestPgBuildBtreeMetapage|TestBootstrapPgOpclassOidIndex'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — 14 pre-existing baseline failures confirmed unchanged via
+        stash-baseline diff; `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Next blocker (Step 3m) will surface on
+        the next E2E re-run — likely `LookupOpclassInfo` against a
+        different opclass via `pg_amop_opr_fam_index` (2654),
+        `pg_amproc_fam_proc_index` (2655), or a nailed-relation lookup
+        via `pg_class_oid_index` (2662). Design:
+        `docs/design/0106-0010-step3l-pg-opclass-oid-index-tuples.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
+        `internal/initdb/btree_index_bootstrap.go`,
         `internal/storage/heap.go`,
         `internal/storage/heap_nullbitmap_test.go`,
         `internal/executor/codec_nullbitmap_test.go`,
@@ -2942,7 +3000,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_amproc_bootstrap_test.go`,
         `internal/initdb/pg_index_bootstrap_test.go`,
         `internal/initdb/pg_index_relnatts_test.go`,
-        `internal/initdb/btree_metapage_test.go`
+        `internal/initdb/btree_metapage_test.go`,
+        `internal/initdb/btree_index_bootstrap_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

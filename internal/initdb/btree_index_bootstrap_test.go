@@ -1,0 +1,194 @@
+package initdb
+
+import (
+	"encoding/binary"
+	"os"
+	"path/filepath"
+	"sort"
+	"testing"
+
+	"github.com/goopg/goopg/internal/storage"
+)
+
+// TestPgBuildIndexTupleOidKeyLayoutMatchesPG18 pins the byte-exact layout
+// PG's heap_deform_tuple / _bt_compare expect for a no-nulls, single-column
+// oid-keyed index tuple — 8 bytes header + 4-byte oid key + 4 bytes
+// MAXALIGN pad = 16 bytes total, with t_info storing the size (16).
+func TestPgBuildIndexTupleOidKeyLayoutMatchesPG18(t *testing.T) {
+	out := pgBuildIndexTupleOidKey(0xDEADBEEF, 0xCAFE, 1986)
+	if len(out) != 16 {
+		t.Fatalf("len=%d, want 16 (MAXALIGN(8+4))", len(out))
+	}
+	le := binary.LittleEndian
+	if got := le.Uint32(out[0:4]); got != 0xDEADBEEF {
+		t.Errorf("ip_blkid: got %#x, want %#x", got, 0xDEADBEEF)
+	}
+	if got := le.Uint16(out[4:6]); got != 0xCAFE {
+		t.Errorf("ip_posid: got %#x, want %#x", got, uint16(0xCAFE))
+	}
+	if got := le.Uint16(out[6:8]); got != 16 {
+		t.Errorf("t_info: got %d, want 16 (size with no flags)", got)
+	}
+	if got := le.Uint32(out[8:12]); got != 1986 {
+		t.Errorf("oid key: got %d, want 1986", got)
+	}
+	// Trailing pad must be zero so future flag bits don't get set inadvertently.
+	for i := 12; i < 16; i++ {
+		if out[i] != 0 {
+			t.Errorf("pad byte %d non-zero: got %#x", i, out[i])
+		}
+	}
+}
+
+// TestPgBuildBtreeLeafRootPagePageHeader pins the on-disk page header
+// fields PG reads in _bt_getroot and _bt_first: special area at the
+// per-block-size boundary, lower past the line pointers, upper above
+// the tuples, and the opaque flag set to BTP_LEAF | BTP_ROOT.
+func TestPgBuildBtreeLeafRootPagePageHeader(t *testing.T) {
+	tuples := [][]byte{
+		pgBuildIndexTupleOidKey(0, 1, 100),
+		pgBuildIndexTupleOidKey(0, 2, 200),
+		pgBuildIndexTupleOidKey(0, 3, 300),
+	}
+	page, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		t.Fatalf("pgBuildBtreeLeafRootPage: %v", err)
+	}
+	if len(page) != storage.BlockSize {
+		t.Fatalf("len=%d, want %d", len(page), storage.BlockSize)
+	}
+	h, err := storage.Header(storage.Page(page))
+	if err != nil {
+		t.Fatalf("Header: %v", err)
+	}
+	wantSpecial := uint16(storage.BlockSize - sizeOfBTPageOpaque)
+	if got := h.Special(); got != wantSpecial {
+		t.Errorf("special: got %d, want %d", got, wantSpecial)
+	}
+	wantLower := uint16(storage.SizeOfPageHeaderData + 4*len(tuples))
+	if got := h.Lower(); got != wantLower {
+		t.Errorf("lower: got %d, want %d", got, wantLower)
+	}
+	wantUpper := uint16(int(wantSpecial) - 16*len(tuples))
+	if got := h.Upper(); got != wantUpper {
+		t.Errorf("upper: got %d, want %d", got, wantUpper)
+	}
+	// Opaque flag at end of page: BTP_LEAF | BTP_ROOT = 0x03.
+	off := storage.BlockSize - sizeOfBTPageOpaque
+	if got := binary.LittleEndian.Uint16(page[off+12 : off+14]); got != btpLeaf|btpRoot {
+		t.Errorf("btpo_flags: got %#x, want %#x (BTP_LEAF|BTP_ROOT)", got, btpLeaf|btpRoot)
+	}
+	// Level and prev/next must be zero on a leaf-root.
+	if got := binary.LittleEndian.Uint32(page[off+0 : off+4]); got != 0 {
+		t.Errorf("btpo_prev: got %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint32(page[off+4 : off+8]); got != 0 {
+		t.Errorf("btpo_next: got %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint32(page[off+8 : off+12]); got != 0 {
+		t.Errorf("btpo_level: got %d, want 0", got)
+	}
+}
+
+// TestPgBuildBtreeMetapageWithRootEncodesRootPointer asserts the metapage
+// declares btm_root, btm_fastroot, btm_level, btm_fastlevel matching the
+// caller-supplied root block — PG's _bt_getroot reads these to descend.
+func TestPgBuildBtreeMetapageWithRootEncodesRootPointer(t *testing.T) {
+	meta := pgBuildBtreeMetapageWithRoot(1, 0)
+	if len(meta) != storage.BlockSize {
+		t.Fatalf("len=%d, want %d", len(meta), storage.BlockSize)
+	}
+	base := storage.SizeOfPageHeaderData
+	le := binary.LittleEndian
+	if got := le.Uint32(meta[base : base+4]); got != btreeMagicConst {
+		t.Errorf("btm_magic: got %#x, want %#x", got, btreeMagicConst)
+	}
+	if got := le.Uint32(meta[base+4 : base+8]); got != btreeVersionConst {
+		t.Errorf("btm_version: got %d, want %d", got, btreeVersionConst)
+	}
+	if got := le.Uint32(meta[base+8 : base+12]); got != 1 {
+		t.Errorf("btm_root: got %d, want 1", got)
+	}
+	if got := le.Uint32(meta[base+12 : base+16]); got != 0 {
+		t.Errorf("btm_level: got %d, want 0", got)
+	}
+	if got := le.Uint32(meta[base+16 : base+20]); got != 1 {
+		t.Errorf("btm_fastroot: got %d, want 1", got)
+	}
+	if got := le.Uint32(meta[base+20 : base+24]); got != 0 {
+		t.Errorf("btm_fastlevel: got %d, want 0", got)
+	}
+	off := storage.BlockSize - sizeOfBTPageOpaque
+	if got := le.Uint16(meta[off+12 : off+14]); got != btpMetaFlag {
+		t.Errorf("btpo_flags: got %#x, want %#x (BTP_META)", got, btpMetaFlag)
+	}
+}
+
+// TestBootstrapPgOpclassOidIndexWritesPopulatedBtree end-to-ends the
+// Step 3l output: file is 2 blocks, block 0 is a metapage pointing at
+// block 1, block 1 is a leaf-root carrying len(pgOpclassInitialEntries)
+// tuples sorted ascending by OID. Pins both shared (global/) and per-
+// database (base/{1,5}/) copies because PG opens the same OID from
+// either path depending on the caller (M0106-0008 / M0106-0009 design).
+func TestBootstrapPgOpclassOidIndexWritesPopulatedBtree(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"base/1", "base/5", "global"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	if err := bootstrapPgOpclassOidIndex(dir); err != nil {
+		t.Fatalf("bootstrapPgOpclassOidIndex: %v", err)
+	}
+	entries := pgOpclassInitialEntries()
+	wantOIDs := make([]uint32, len(entries))
+	for i, e := range entries {
+		wantOIDs[i] = e.OID
+	}
+	sort.Slice(wantOIDs, func(i, j int) bool { return wantOIDs[i] < wantOIDs[j] })
+
+	for _, path := range []string{
+		filepath.Join(dir, "base", "1", "2687"),
+		filepath.Join(dir, "base", "5", "2687"),
+		filepath.Join(dir, "global", "2687"),
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if len(raw) != 2*storage.BlockSize {
+			t.Errorf("%s: len=%d, want %d (2 blocks)", path, len(raw), 2*storage.BlockSize)
+			continue
+		}
+		// Metapage at block 0: btm_root=1, btm_level=0.
+		base := storage.SizeOfPageHeaderData
+		if got := binary.LittleEndian.Uint32(raw[base+8 : base+12]); got != 1 {
+			t.Errorf("%s: btm_root=%d, want 1", path, got)
+		}
+		// Leaf-root at block 1 — count line pointers and read keys back.
+		leaf := raw[storage.BlockSize : 2*storage.BlockSize]
+		h, err := storage.Header(storage.Page(leaf))
+		if err != nil {
+			t.Fatalf("%s: leaf header: %v", path, err)
+		}
+		nItems := (int(h.Lower()) - storage.SizeOfPageHeaderData) / 4
+		if nItems != len(wantOIDs) {
+			t.Errorf("%s: leaf items=%d, want %d", path, nItems, len(wantOIDs))
+			continue
+		}
+		for i := 0; i < nItems; i++ {
+			raw32 := binary.LittleEndian.Uint32(leaf[storage.SizeOfPageHeaderData+i*4 : storage.SizeOfPageHeaderData+i*4+4])
+			off := raw32 & 0x7FFF
+			length := (raw32 >> 17) & 0x7FFF
+			if length != 16 {
+				t.Errorf("%s: item %d length=%d, want 16", path, i, length)
+				continue
+			}
+			// Key is at offset 8 within the tuple (after IndexTupleHeader).
+			gotOID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
+			if gotOID != wantOIDs[i] {
+				t.Errorf("%s: item %d OID=%d, want %d (sorted)", path, i, gotOID, wantOIDs[i])
+			}
+		}
+	}
+}

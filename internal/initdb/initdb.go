@@ -239,6 +239,15 @@ func Init(opts Options) error {
 	if err := bootstrapPgIndexTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_index tuples: %w", err)
 	}
+	// M0106-0010 step 3l: overwrite the empty btree placeholder at
+	// base/{1,5}/2687 + global/2687 with a populated 2-page btree
+	// (metapage + leaf-root) carrying one IndexTuple per pg_opclass
+	// row so PG's LookupOpclassInfo(1986) finds the name_ops row
+	// via pg_opclass_oid_index. Without this the next FATAL during
+	// standby boot is "could not find tuple for opclass 1986".
+	if err := bootstrapPgOpclassOidIndex(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_opclass_oid_index: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
