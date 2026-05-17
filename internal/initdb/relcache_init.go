@@ -78,7 +78,15 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	{1262, "pg_database", 1248, 'r', 16, true, pgDatabaseAttrs()},
 	{1260, "pg_authid", 2842, 'r', 12, true, pgAuthidAttrs()},
 	{1261, "pg_auth_members", 2843, 'r', 5, true, pgAuthMembersAttrs()},
-	{3592, "pg_shseclabel", 4065, 'r', 6, true, pgShseclabelAttrs()},
+	// pg_shseclabel reltype must equal SharedSecLabelRelation_Rowtype_Id
+	// (4066) from postgres/src/include/catalog/pg_shseclabel_d.h. PG's
+	// formrdesc("pg_shseclabel", ...) call in
+	// RelationCacheInitializePhase2 hardcodes tdtypeid=4066; if our heap
+	// row's reltype disagrees, the Phase3 assertion
+	// `relation->rd_att->tdtypeid == relp->reltype` (relcache.c:4293)
+	// PANICs every connecting client backend. See
+	// docs/design/0106-0010-step3v-pg-shseclabel-reltype.md.
+	{3592, "pg_shseclabel", 4066, 'r', 6, true, pgShseclabelAttrs()},
 	{6100, "pg_subscription", 6101, 'r', 9, true, pgSubscriptionAttrs()},
 }, []idxSpec{
 	{2671, "pg_database_datname_index"},

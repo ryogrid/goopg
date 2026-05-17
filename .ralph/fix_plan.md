@@ -3520,19 +3520,95 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         likely a goopg primary issue or a wal-receiver/walsender
         handshake interaction. Design:
         `docs/design/0106-0010-step3u-pg-attribute-null-attoptions.md`.
-      - Carry-over for Step 3v+:
+      - Step 3v LANDED 2026-05-18. The "wal_receiver hang" turned out to
+        not be a walsender/walreceiver problem at all — the streaming
+        handshake works (standby log:
+        `started streaming WAL from primary at 0/0 on timeline 1`).
+        Every client backend the standby's postmaster forked was tripping
+        `TRAP: failed Assert("relation->rd_att->tdtypeid == relp->reltype"),
+        File: "relcache.c", Line: 4293` inside
+        `RelationCacheInitializePhase3`, which terminated the whole
+        postmaster (`signal 6: Aborted`) and triggered a crash-restart
+        loop where every new `SELECT … FROM pg_stat_wal_receiver` probe
+        simply blocked until the 300s test deadline.
+        Root cause: `nailedSharedRels` listed `pg_shseclabel` with
+        `RelType = 4065`, but PG18's authoritative
+        `postgres/src/include/catalog/pg_shseclabel_d.h::
+        SharedSecLabelRelation_Rowtype_Id = 4066`. goopg's
+        `pg_internal.init` is currently rejected on every standby boot
+        (separate, deeper layout bug — `buildRelationDataBlob` writes
+        `rd_id` at offset 0 but PG18's `RelationData` has `rd_id` at
+        offset 72; verified via a sizeof program built against
+        `postgres/local_install/include/server`. The nailed-rel sanity
+        check at `relcache.c:6538` reads `rd_isnailed` as false for
+        every entry, fails the
+        `nailed_rels != NUM_CRITICAL_SHARED_RELS` check, and
+        `goto read_failed`), so PG falls back to
+        `formrdesc("pg_shseclabel", 4066, …)` in
+        `RelationCacheInitializePhase2`. Phase3 then reads the heap row
+        whose `reltype` column comes from
+        `pgClassRow(rel).RelType = 4065` → `Assert(4066 == 4065)`
+        PANICs. The bug was dormant through Steps 3a–3u because earlier
+        blockers crashed each backend before Phase3's nailed-rel
+        verification loop ran.
+        Fix: one-line edit to
+        `internal/initdb/relcache_init.go::nailedSharedRels` flips the
+        `pg_shseclabel` row's `RelType` 4065 → 4066. The value flows
+        through both write sites automatically — `pgClassRow` (heap row
+        `reltype` column) and `buildPgClassBlob` (init-file
+        `Form_pg_class` blob `reltype` field). Comment block on the row
+        cites `pg_shseclabel_d.h` + `relcache.c:4293` so a future edit
+        can't silently regress.
+        Regression pin:
+        `TestNailedRelTypesMatchPG18FormrdescConstants` in
+        `internal/initdb/pg_nailed_reltype_test.go` audits every nailed
+        shared (5) + local (4) catalog's `RelType` against the
+        corresponding `*Relation_Rowtype_Id` constant in
+        `postgres/src/include/catalog/pg_*_d.h` — catches the kind of
+        off-by-one that caused this PANIC loop for any of the 9
+        formrdesc'd catalogs in either Phase2 or Phase3.
+        Verified: `go test -count=1 -run
+        TestNailedRelTypesMatchPG18FormrdescConstants ./internal/initdb/`
+        — PASS (9 sub-tests); `go test -count=1 ./internal/initdb/` —
+        same 14 pre-existing baseline failures as Step 3u
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestOpenOldClusterWithoutM0030FilesStillWorks`,
+        `TestSynchronousCommitFlushesByDefault`) — no new regressions;
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` —
+        PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        — fails fast at 91s with a clean error (was: 300s hang). The
+        PANIC loop is gone; standby reaches a steady `PM_HOT_STANDBY`
+        and the next probe surfaces the next blocker (Step 3w
+        territory): `FATAL: could not open relation with OID 2600`
+        (`pg_aggregate`). Design:
+        `docs/design/0106-0010-step3v-pg-shseclabel-reltype.md`.
+      - Carry-over for Step 3w+:
         1. `pgAttrColDefs()` and `pgAttributeAttrs()` still type
            `attoptions`/`attfdwoptions`/`attmissingval` as plain `text`
            instead of `text[]`/`anyarray`. Harmless while NULL but
            should be aligned with PG18.
         2. `pgAttributeAttrs()` still declares only 22 of the 26 PG18
            pg_attribute columns; alignment is a follow-up.
-        3. wal_receiver query hang requires its own diagnosis (likely
-           goopg primary side, not standby side).
-      - Next blocker (Step 3v): the standby SELECT on
-        `pg_stat_wal_receiver` hangs. Capture goopg primary logs and
-        determine whether the primary is responding to the wal-receiver
-        replication protocol exchanges.
+        3. `buildRelationDataBlob` writes `rd_id` at offset 0 but PG18
+           expects offset 72 (and `rd_isnailed` at offset 33 is never
+           written). Result: goopg's `pg_internal.init` is rejected on
+           every standby boot and PG falls back to formrdesc, then
+           rewrites the init file itself once Phase3 completes.
+           Functionally correct but wastes I/O on every backend
+           startup; rewrite blob to PG18's actual `RelationData` layout
+           (488-byte struct).
+      - Next blocker (Step 3w): standby FATALs with
+        `could not open relation with OID 2600` (`pg_aggregate`). The
+        backend reaches Phase3 → Phase4 → `InitPostgres` and tries to
+        open pg_aggregate via the standard catcache path; goopg either
+        hasn't seeded pg_aggregate's heap file under `base/{1,5}/2600`,
+        hasn't registered it in the relation mapper, or both.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3550,10 +3626,12 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_namespace_index_test.go`,
         `internal/initdb/btree_metapage_test.go`,
         `internal/initdb/btree_index_bootstrap_test.go`,
+        `internal/initdb/pg_nailed_reltype_test.go`,
         `docs/design/0106-0010-step3p-pg-index-indexrelid-index-tuples.md`,
         `docs/design/0106-0010-step3s-index-tuple-block-id-encoding.md`,
         `docs/design/0106-0010-step3t-pg-namespace-index-seeds.md`,
         `docs/design/0106-0010-step3u-pg-attribute-null-attoptions.md`,
+        `docs/design/0106-0010-step3v-pg-shseclabel-reltype.md`,
         `internal/initdb/pg_attribute_null_attoptions_test.go`
 
 - [ ] **M0106-0011**
