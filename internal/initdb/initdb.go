@@ -681,6 +681,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
+		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -767,6 +768,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
+		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -788,6 +790,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
+		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -1734,6 +1737,15 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		//     CastOidIndexId, pg_cast, btree(oid oid_ops));
 		// Indexes pg_cast (OID 2605) on attnum 1 (oid). UNIQUE PRIMARY KEY.
 		entry(2660, 2605, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_cast_oid_index
+		// M0106-0010 Step 3ac: pg_cast_source_target_index (OID 2661).
+		// postgres/src/include/catalog/pg_cast.h:60 —
+		//   DECLARE_UNIQUE_INDEX(pg_cast_source_target_index, 2661,
+		//     CastSourceTargetIndexId, pg_cast,
+		//     btree(castsource oid_ops, casttarget oid_ops));
+		// Indexes pg_cast (OID 2605) on (attnum 2 castsource,
+		// attnum 3 casttarget). UNIQUE but NOT PRIMARY KEY
+		// (DECLARE_UNIQUE_INDEX, not _PKEY variant).
+		entry(2661, 2605, []int16{2, 3}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_cast_source_target_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
