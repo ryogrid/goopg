@@ -54,9 +54,21 @@ const (
 	// per nbtree.h:463.
 	btOffsetMask uint16 = 0x0FFF
 
-	// pNone is the "no sibling / no parent" block-number sentinel
-	// (P_NONE = InvalidBlockNumber = 0xFFFFFFFF in PG).
-	pNone uint32 = 0xFFFFFFFF
+	// pNone is PG's "no sibling / no root / no parent" block-number sentinel
+	// in btree-page opaque fields (btpo_prev, btpo_next) and the metapage
+	// btm_root field. PG's `P_NONE` is defined as `0`, NOT as
+	// `InvalidBlockNumber` (`0xFFFFFFFF`) — the two sentinels coexist in PG
+	// but `P_LEFTMOST`/`P_RIGHTMOST` and `_bt_getroot` use `P_NONE == 0`. See
+	// `postgres/src/include/access/nbtree.h`:
+	//
+	//	#define P_NONE		0
+	//	#define P_LEFTMOST(opaque)  ((opaque)->btpo_prev == P_NONE)
+	//	#define P_RIGHTMOST(opaque) ((opaque)->btpo_next == P_NONE)
+	//
+	// Writing `0xFFFFFFFF` for btpo_next would make PG read every "rightmost"
+	// leaf as non-rightmost: P_FIRSTDATAKEY then treats slot 1 as a high-key
+	// pivot, and `_bt_check_natts` rejects the (non-pivot) data tuple there.
+	pNone uint32 = 0
 
 	// Bulk-load packing parameters for fixed 16-byte composite-key index
 	// tuples (the size emitted by pgBuildIndexTupleOidKey and
@@ -259,11 +271,16 @@ func pgBuildBtreeBulkLoad(sortedTuples [][]byte, nkeyatts uint16) ([]byte, error
 		if !isRightmost {
 			nextBlock = uint32(li + 2) // next leaf block (li+1 in 0-based, +1 for 1-based block)
 		}
-		// Non-rightmost leaves get a P_HIKEY = copy of last data tuple in
-		// this leaf (no truncation: 16-byte composite keys are atomic).
+		// Non-rightmost leaves get a P_HIKEY pivot tuple derived from the
+		// last data tuple in this leaf. PG18 V4 heapkeyspace btrees REQUIRE
+		// the high key to satisfy BTreeTupleIsPivot() — INDEX_ALT_TID_MASK
+		// in t_info and natts encoded in ip_posid. A verbatim data-tuple
+		// copy fails `_bt_check_natts` (nbtutils.c:4163) and aborts every
+		// PG backend at nbtsearch.c:707 the first time `_bt_compare` walks
+		// the index. See pgBuildBtreeLeafHighKey for the exact encoding.
 		var highKey []byte
 		if !isRightmost {
-			highKey = group[len(group)-1]
+			highKey = pgBuildBtreeLeafHighKey(group[len(group)-1], nkeyatts)
 		}
 		page, err := pgBuildBtreeLeafPage(group, highKey, prevBlock, nextBlock)
 		if err != nil {
@@ -443,6 +460,52 @@ func pgBuildBtreeInternalDownlink(dataTuple []byte, childBlock uint32, nkeyatts 
 	// while keeping the size bits intact. t_info size bits cover the whole
 	// 16-byte tuple already (set by the data-tuple builder), so we OR in
 	// the pivot flag without touching the low 13 bits.
+	tinfo := le.Uint16(out[6:8])
+	le.PutUint16(out[6:8], tinfo|indexAltTIDMask)
+	return out
+}
+
+// pgBuildBtreeLeafHighKey transforms a leaf data tuple into a PG18-compatible
+// leaf P_HIKEY pivot tuple. PG18 V4 heapkeyspace btrees require leaf high
+// keys to satisfy `BTreeTupleIsPivot()` (INDEX_ALT_TID_MASK set in t_info and
+// BT_IS_POSTING NOT set in ip_posid), otherwise `_bt_check_natts`
+// (`postgres/src/backend/access/nbtree/nbtutils.c:4163`) returns false and
+// every PG backend aborts at `nbtsearch.c:707` the first time `_bt_compare`
+// descends past the multi-leaf root. Step 3av's `pgBuildBtreeBulkLoad` shipped
+// with a verbatim data-tuple copy for the high key, which was silently
+// accepted by every prior nailed index because they all fit on a single
+// leaf-root (no high key emitted). Step 3aw pushed
+// `pg_attribute_relid_attnum_index` (OID 2659) past the 407-tuple cap so the
+// slow path activated and the latent bug surfaced as
+//
+//	TRAP: failed Assert("_bt_check_natts(rel, key->heapkeyspace, page, offnum)"),
+//	File: "nbtsearch.c", Line: 707
+//
+// during `RelationCacheInitializePhase3 → systable_getnext` on every standby
+// backend startup.
+//
+// Encoding (mirrors a non-truncated heapkeyspace pivot with no heap-TID
+// tiebreaker — BT_PIVOT_HEAP_TID_ATTR clear, so the original heap TID
+// previously held in t_tid.ip_blkid becomes don't-care metadata bytes that
+// PG ignores for pivot tuples):
+//
+//   - t_info |= INDEX_ALT_TID_MASK (preserve low 13 size bits intact)
+//   - ip_posid = nkeyatts (low 12 bits; status bits cleared)
+//   - Key payload (bytes [8..]) and total tuple size unchanged
+//
+// `nkeyatts` must match the index's `indnkeyatts` (1 for pure-oid indexes,
+// 2 for the oid+int2 composite). Tuples returned by this helper round-trip
+// `BTreeTupleIsPivot == true`, `BTreeTupleGetNAtts == nkeyatts`, and
+// `BTreeTupleGetHeapTID == NULL`, which is exactly what
+// `_bt_check_natts`'s heapkeyspace pivot branch expects.
+func pgBuildBtreeLeafHighKey(dataTuple []byte, nkeyatts uint16) []byte {
+	out := make([]byte, len(dataTuple))
+	copy(out, dataTuple)
+	le := binary.LittleEndian
+	// ip_posid: low 12 bits = nkeyatts; clear status bits (no BT_IS_POSTING,
+	// no BT_PIVOT_HEAP_TID_ATTR).
+	le.PutUint16(out[4:6], nkeyatts&btOffsetMask)
+	// t_info: OR in INDEX_ALT_TID_MASK; preserve size bits in the low 13.
 	tinfo := le.Uint16(out[6:8])
 	le.PutUint16(out[6:8], tinfo|indexAltTIDMask)
 	return out

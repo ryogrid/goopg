@@ -5257,7 +5257,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_extension_nailed_test.go`,
         `docs/design/0106-0010-step3aw-pg-extension-nailed-rel.md`,
         `internal/initdb/pg_extension_oid_index_test.go`,
-        `docs/design/0106-0010-step3ax-pg-extension-oid-index.md`
+        `docs/design/0106-0010-step3ax-pg-extension-oid-index.md`,
+        `docs/design/0106-0010-step3ay-pg-extension-name-index.md`,
+        `docs/design/0106-0010-step3az-multi-leaf-btree-hikey-and-pnone.md`
       - Step 3ax LANDED 2026-05-18. Closes the anticipated FATAL
         `could not open relation with OID 3080` PG-standby boot blocker
         that surfaces after Step 3aw seeded the pg_extension heap (OID
@@ -5370,6 +5372,79 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         Step 3ay closes Step 3aw's deferred companion OID list — both
         pg_extension indexes (3080 oid + 3081 name) are now seeded.
         Design: `docs/design/0106-0010-step3ay-pg-extension-name-index.md`.
+      - Step 3az LANDED 2026-05-18. Closes the
+        `TRAP: failed Assert("_bt_check_natts(...)") nbtsearch.c:707`
+        PG-standby boot blocker that has been firing on every backend
+        startup since Step 3aw pushed `pg_attribute_relid_attnum_index`
+        (OID 2659) past Step 3av's 407-tuple single-leaf-root cap. The
+        assertion fired during `RelationCacheInitializePhase3 →
+        systable_getnext` against the multi-leaf 2659 file, reproducible
+        end-to-end against a vanilla PG standby via pg_basebackup. Two
+        encoding bugs in `internal/initdb/btree_index_bootstrap.go` had
+        to be fixed in lockstep (either alone leaves the assert firing):
+        (1) `pgBuildBtreeBulkLoad` set every non-rightmost leaf's
+        P_HIKEY to a verbatim copy of the leaf's last data tuple, but
+        PG18 V4 heapkeyspace btrees require leaf high keys to satisfy
+        `BTreeTupleIsPivot()` — INDEX_ALT_TID_MASK (0x2000) in
+        `t_info` and BT_IS_POSTING (0x2000 in ip_posid) clear.
+        `_bt_check_natts`'s heapkeyspace pivot branch
+        (`postgres/src/backend/access/nbtree/nbtutils.c:4163`)
+        returned false for the non-pivot data tuple at P_HIKEY's slot.
+        New helper `pgBuildBtreeLeafHighKey(dataTuple, nkeyatts)`
+        allocates a fresh buffer (the source tuple is also written
+        verbatim as a data tuple on the same leaf — in-place mutation
+        would corrupt that copy), ORs INDEX_ALT_TID_MASK into t_info
+        preserving size bits, and writes nkeyatts into ip_posid with
+        zero high-4-bit status bits (no BT_IS_POSTING, no
+        BT_PIVOT_HEAP_TID_ATTR — the high key carries the key payload
+        only with no heap-TID tiebreaker).
+        (2) The `pNone` package constant was declared `0xFFFFFFFF` with
+        a comment claiming "P_NONE = InvalidBlockNumber = 0xFFFFFFFF in
+        PG". PG's `#define P_NONE 0`
+        (`postgres/src/include/access/nbtree.h`) and `#define
+        InvalidBlockNumber ((BlockNumber) 0xFFFFFFFF)`
+        (`postgres/src/include/storage/block.h`) are DISTINCT
+        sentinels. Writing `0xFFFFFFFF` into `btpo_next` of the
+        rightmost leaf made `P_RIGHTMOST(opaque) =
+        (btpo_next == P_NONE)` false, so `P_FIRSTDATAKEY(opaque) =
+        (P_RIGHTMOST ? P_HIKEY : P_FIRSTKEY)` treated slot 1 as a
+        high-key pivot; the actual non-pivot data tuple there failed
+        the same `_bt_check_natts` heapkeyspace pivot branch. Fix:
+        `pNone uint32 = 0` with a corrected comment. The single-leaf
+        fast path (`pgBuildBtreeLeafRootPage`) was unaffected because
+        it never explicitly wrote btpo_prev/btpo_next — the
+        `make([]byte, BlockSize)` zero-fill was already the correct
+        P_NONE value, which is why the bug stayed latent until the
+        multi-leaf slow path activated in Step 3aw.
+        New regression pin
+        `TestPgBuildBtreeLeafHighKeyMatchesPGPivotEncoding` (pins the
+        helper's byte layout: INDEX_ALT_TID_MASK set in t_info,
+        ip_posid == nkeyatts with no status bits, key payload preserved
+        verbatim from source, source buffer unmutated).
+        `TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18` updated to
+        demand the pivot encoding on the P_HIKEY instead of verbatim
+        equality with the source data tuple.
+        `TestPgBuildBtreeBulkLoadSingleLeafByteIdenticalToLegacy`
+        unchanged — single-leaf-root callers
+        (`bootstrapPgOpclassOidIndex`, `bootstrapPgClassOidIndex`,
+        `bootstrapPgIndexIndexrelidIndex`) remain byte-identical.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgBuildBtree|TestBootstrapPgAttribute|TestMakeBtreeRootPage'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ay (verified
+        via `git stash` baseline diff — both with and without the fix
+        the same 14 tests fail, none of them touched by this change);
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        advances past 0 TRAP events; standby reaches `database system
+        is ready to accept read-only connections`; first backend query
+        surfaces the NEW blocker — `cache lookup failed for attribute
+        2 of relation 3593` (`pg_shseclabel_object_index`, the shared
+        pg_attribute lookup is missing rows for OID 3593) — Step 3ba
+        territory.
+        Design:
+        `docs/design/0106-0010-step3az-multi-leaf-btree-hikey-and-pnone.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

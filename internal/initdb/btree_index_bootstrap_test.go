@@ -723,15 +723,39 @@ func TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18(t *testing.T) {
 	if hikeyLen != fixedIndexTupleSize {
 		t.Errorf("P_HIKEY length = %d, want %d", hikeyLen, fixedIndexTupleSize)
 	}
-	// P_HIKEY must be a copy of leaf 1's last data tuple
-	// (= tuples[maxTuplesPerNonRightmostLeaf-1] for 16-byte fixed-size tuples).
-	wantHikey := tuples[maxTuplesPerNonRightmostLeaf-1]
+	// P_HIKEY must be a PG18 V4 heapkeyspace pivot tuple derived from leaf 1's
+	// last data tuple (= tuples[maxTuplesPerNonRightmostLeaf-1]) — with
+	// INDEX_ALT_TID_MASK set in t_info and ip_posid encoding nkeyatts (2).
+	// Without this encoding, `_bt_check_natts` aborts every PG backend at
+	// nbtsearch.c:707; see pgBuildBtreeLeafHighKey.
+	srcHikey := tuples[maxTuplesPerNonRightmostLeaf-1]
 	gotHikey := leaf1[hikeyOff : hikeyOff+uint32(fixedIndexTupleSize)]
-	for i := range wantHikey {
-		if gotHikey[i] != wantHikey[i] {
-			t.Errorf("P_HIKEY byte %d: got %#x, want %#x (copy of leaf1's last tuple)",
-				i, gotHikey[i], wantHikey[i])
+	// Key payload (bytes [8..]) carries through unchanged from the source data
+	// tuple — the pivot transform only touches ip_posid (4..6) and t_info
+	// (6..8) so PG's `_bt_compare` finds the same key bytes either way.
+	for i := 8; i < fixedIndexTupleSize; i++ {
+		if gotHikey[i] != srcHikey[i] {
+			t.Errorf("P_HIKEY key byte %d: got %#x, want %#x (preserved from src)",
+				i, gotHikey[i], srcHikey[i])
 		}
+	}
+	// ip_posid must encode nkeyatts (2) in the low 12 bits with no status
+	// bits set (no BT_IS_POSTING, no BT_PIVOT_HEAP_TID_ATTR). Status bits in
+	// the high 4 bits force `BTreeTupleIsPosting` true or change pivot-tuple
+	// natts encoding, both of which break `_bt_check_natts`.
+	if got := le.Uint16(gotHikey[4:6]); got != 2 {
+		t.Errorf("P_HIKEY ip_posid = %#x, want 2 (nkeyatts; no status bits)", got)
+	}
+	// t_info must have INDEX_ALT_TID_MASK set (required for `BTreeTupleIsPivot`
+	// to return true) while preserving the original 16-byte size in the low
+	// 13 bits.
+	hikeyTInfo := le.Uint16(gotHikey[6:8])
+	if hikeyTInfo&indexAltTIDMask == 0 {
+		t.Errorf("P_HIKEY t_info = %#x, want INDEX_ALT_TID_MASK (%#x) set", hikeyTInfo, indexAltTIDMask)
+	}
+	if got := hikeyTInfo & indexSizeMask; got != fixedIndexTupleSize {
+		t.Errorf("P_HIKEY t_info size bits = %d, want %d (preserved across pivot transform)",
+			got, fixedIndexTupleSize)
 	}
 
 	// ─── Leaf 2 (block 2, rightmost) ───────────────────────────────────
@@ -840,6 +864,73 @@ func TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18(t *testing.T) {
 	for i := 8; i < 16; i++ {
 		if dl2[i] != wantLeaf2First[i] {
 			t.Errorf("root downlink 2 key byte %d: got %#x, want %#x", i, dl2[i], wantLeaf2First[i])
+		}
+	}
+}
+
+
+// TestPgBuildBtreeLeafHighKeyMatchesPGPivotEncoding pins the exact byte
+// layout `pgBuildBtreeLeafHighKey` produces against a known data tuple,
+// guarding the invariants that PG's `_bt_check_natts` (nbtutils.c:4163)
+// requires for V4 heapkeyspace leaf P_HIKEY entries:
+//
+//   - INDEX_ALT_TID_MASK bit set in t_info (BTreeTupleIsPivot == true)
+//   - ip_posid == nkeyatts with no high-4-bit status bits
+//     (BT_IS_POSTING clear → not a posting list, BT_PIVOT_HEAP_TID_ATTR clear
+//     → no heap-TID tiebreaker)
+//   - Key payload [8..] preserved byte-for-byte from the source data tuple
+//   - Tuple size bits in the low 13 of t_info preserved
+//   - Source tuple's other bytes (ip_blkid) untouched — pivots ignore them
+//
+// Without these, every PG backend SIGABRTs at nbtsearch.c:707 the first
+// time `_bt_compare` walks a multi-leaf index — see Step 3az's design doc
+// (docs/design/0106-0010-step3az-multi-leaf-btree-leaf-hikey-pivot.md).
+func TestPgBuildBtreeLeafHighKeyMatchesPGPivotEncoding(t *testing.T) {
+	// Use a composite-key data tuple (the most common multi-leaf user is
+	// pg_attribute_relid_attnum_index, nkeyatts=2). Source heapBlk/heapOff
+	// must be non-zero so we can verify they're treated as don't-care bytes
+	// by the pivot transform (they sit in ip_blkid which pivots ignore).
+	src := pgBuildIndexTupleOidInt2Key(0x4242 /* heapBlk */, 0xBEEF /* heapOff */, 12345 /* oid */, 7 /* int2 */)
+	hi := pgBuildBtreeLeafHighKey(src, 2)
+
+	if len(hi) != len(src) {
+		t.Fatalf("output size = %d, want %d (size must be preserved)", len(hi), len(src))
+	}
+
+	le := binary.LittleEndian
+	// ip_posid: low 12 bits = nkeyatts, no high status bits.
+	if got := le.Uint16(hi[4:6]); got != 2 {
+		t.Errorf("ip_posid = %#x, want 2 (nkeyatts, no status bits)", got)
+	}
+	// t_info: INDEX_ALT_TID_MASK set, size bits preserved.
+	tinfo := le.Uint16(hi[6:8])
+	if tinfo&indexAltTIDMask == 0 {
+		t.Errorf("t_info = %#x, INDEX_ALT_TID_MASK not set", tinfo)
+	}
+	if got := tinfo & indexSizeMask; got != fixedIndexTupleSize {
+		t.Errorf("t_info size bits = %d, want %d", got, fixedIndexTupleSize)
+	}
+	// Status bits (high 4 bits of ip_posid) must be zero to keep
+	// BTreeTupleIsPosting false and BTreeTupleGetHeapTID nil.
+	const btStatusOffsetMask uint16 = 0xF000
+	if got := le.Uint16(hi[4:6]) & btStatusOffsetMask; got != 0 {
+		t.Errorf("ip_posid status bits = %#x, want 0 (no BT_IS_POSTING, no BT_PIVOT_HEAP_TID_ATTR)", got)
+	}
+	// Key payload (bytes [8..]) preserved verbatim from the source.
+	for i := 8; i < len(src); i++ {
+		if hi[i] != src[i] {
+			t.Errorf("key byte %d: got %#x, want %#x", i, hi[i], src[i])
+		}
+	}
+
+	// Verify the source tuple itself is unmodified — `pgBuildBtreeLeafHighKey`
+	// must allocate a new buffer (the caller passes a tuple that is also
+	// stored on the same leaf as a data tuple; mutating it would corrupt the
+	// leaf's data area).
+	srcRebuilt := pgBuildIndexTupleOidInt2Key(0x4242, 0xBEEF, 12345, 7)
+	for i := range src {
+		if src[i] != srcRebuilt[i] {
+			t.Fatalf("source mutated at byte %d: src=%#x, rebuilt=%#x", i, src[i], srcRebuilt[i])
 		}
 	}
 }
