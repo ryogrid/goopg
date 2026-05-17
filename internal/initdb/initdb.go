@@ -191,6 +191,14 @@ func Init(opts Options) error {
 	if err := bootstrapPostgresDatabase(abs); err != nil {
 		return fmt.Errorf("goopg init: postgres database: %w", err)
 	}
+	// M0106-0008: populate pg_class/pg_attribute heap tuples so
+	// vanilla PG's RelationBuildDesc → ScanPgRelation finds them.
+	if err := bootstrapPgClassTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_class tuples: %w", err)
+	}
+	if err := bootstrapPgAttributeTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_attribute tuples: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -567,6 +575,387 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	}
 	path := filepath.Join(dataDir, "global", "1262") // pg_database OID
 	return os.WriteFile(path, page, 0o600)
+}
+
+// bootstrapPgClassTuples writes PG-native pg_class heap tuples for every
+// nailed relation. Vanilla PG's load_critical_index → RelationBuildDesc →
+// ScanPgRelation reads actual pg_class tuples, ignoring the init file.
+func bootstrapPgClassTuples(dataDir string) error {
+	cols := pgClassColDefs()
+	allRels := append([]nailedRel{}, nailedSharedRels...)
+	allRels = append(allRels, nailedLocalRels...)
+	return writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
+		return pgClassRow(rel)
+	})
+}
+
+// bootstrapPgAttributeTuples writes PG-native pg_attribute heap tuples for
+// every column of every nailed relation so RelationBuildDesc can load column
+// metadata from disk.
+func bootstrapPgAttributeTuples(dataDir string) error {
+	attrCols := pgAttrColDefs()
+	allRels := append([]nailedRel{}, nailedSharedRels...)
+	allRels = append(allRels, nailedLocalRels...)
+	var rows []executor.Row
+	for _, rel := range allRels {
+		attrs := pgAttrEntriesForRel(rel)
+		for _, a := range attrs {
+			rows = append(rows, pgAttributeRow(rel.OID, a))
+		}
+	}
+	return writeMultiPageHeapRows(dataDir, "1249", attrCols, rows)
+}
+
+// pgClassColDefs returns pg_class column descriptors matching PG18's
+// FormData_pg_class struct byte-for-byte. RelationBuildDesc casts the
+// raw heap tuple as FormData_pg_class*, so every fixed-size field must
+// be present at the correct struct offset.
+func pgClassColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},               // 0
+		{Name: "relname", Type: catalog.Type{Name: "name"}},          // 4 (64 bytes)
+		{Name: "relnamespace", Type: catalog.Type{Name: "oid"}},      // 68
+		{Name: "reltype", Type: catalog.Type{Name: "oid"}},           // 72
+		{Name: "reloftype", Type: catalog.Type{Name: "oid"}},         // 76
+		{Name: "relowner", Type: catalog.Type{Name: "oid"}},          // 80
+		{Name: "relam", Type: catalog.Type{Name: "oid"}},             // 84
+		{Name: "relfilenode", Type: catalog.Type{Name: "oid"}},       // 88
+		{Name: "reltablespace", Type: catalog.Type{Name: "oid"}},     // 92
+		{Name: "relpages", Type: catalog.Type{Name: "int4"}},         // 96
+		{Name: "reltuples", Type: catalog.Type{Name: "float4"}},      // 100
+		{Name: "relallvisible", Type: catalog.Type{Name: "int4"}},    // 104
+		{Name: "relallfrozen", Type: catalog.Type{Name: "int4"}},     // 108
+		{Name: "reltoastrelid", Type: catalog.Type{Name: "oid"}},     // 112
+		{Name: "relhasindex", Type: catalog.Type{Name: "bool"}},      // 116
+		{Name: "relisshared", Type: catalog.Type{Name: "bool"}},      // 117
+		{Name: "relpersistence", Type: catalog.Type{Name: "char"}},   // 118
+		{Name: "relkind", Type: catalog.Type{Name: "char"}},          // 119
+		{Name: "relnatts", Type: catalog.Type{Name: "int2"}},         // 120
+		{Name: "relchecks", Type: catalog.Type{Name: "int2"}},        // 122
+		{Name: "relhasrules", Type: catalog.Type{Name: "bool"}},      // 124
+		{Name: "relhastriggers", Type: catalog.Type{Name: "bool"}},   // 125
+		{Name: "relhassubclass", Type: catalog.Type{Name: "bool"}},   // 126
+		{Name: "relrowsecurity", Type: catalog.Type{Name: "bool"}},   // 127
+		{Name: "relforcerowsecurity", Type: catalog.Type{Name: "bool"}}, // 128
+		{Name: "relispopulated", Type: catalog.Type{Name: "bool"}},   // 129
+		{Name: "relreplident", Type: catalog.Type{Name: "char"}},     // 130
+		{Name: "relispartition", Type: catalog.Type{Name: "bool"}},   // 131
+		{Name: "relrewrite", Type: catalog.Type{Name: "oid"}},        // 132
+		{Name: "relfrozenxid", Type: catalog.Type{Name: "xid"}},      // 136
+		{Name: "relminmxid", Type: catalog.Type{Name: "xid"}},        // 140
+		{Name: "relacl", Type: catalog.Type{Name: "text"}},           // 144 varlena
+		{Name: "reloptions", Type: catalog.Type{Name: "text"}},       // varlena
+		{Name: "relpartbound", Type: catalog.Type{Name: "text"}},     // varlena
+	}
+}
+
+// pgClassRow builds a 14-col pg_class tuple matching pgClassColDefs order.
+func pgClassRow(rel nailedRel) executor.Row {
+	relType := rel.RelType
+	if relType == 0 {
+		relType = rel.OID
+	}
+	relAm := int64(0)
+	if rel.RelKind == 'r' {
+		relAm = 2
+	} else if rel.RelKind == 'i' {
+		relAm = 403
+	}
+	return executor.Row{
+		executor.NewIntDatum(int64(rel.OID)),      // 0: oid
+		executor.NewStringDatum(rel.RelName),      // 4: relname
+		executor.NewIntDatum(11),                  // 68: relnamespace
+		executor.NewIntDatum(int64(relType)),      // 72: reltype
+		executor.NewIntDatum(0),                   // 76: reloftype
+		executor.NewIntDatum(10),                  // 80: relowner
+		executor.NewIntDatum(relAm),               // 84: relam
+		executor.NewIntDatum(int64(rel.OID)),      // 88: relfilenode
+		executor.NewIntDatum(0),                   // 92: reltablespace
+		executor.NewIntDatum(0),                   // 96: relpages
+		executor.NewIntDatum(0),                   // 100: reltuples
+		executor.NewIntDatum(0),                   // 104: relallvisible
+		executor.NewIntDatum(0),                   // 108: relallfrozen
+		executor.NewIntDatum(0),                   // 112: reltoastrelid
+		executor.NewBoolDatum(false),              // 116: relhasindex
+		executor.NewBoolDatum(rel.IsShared),       // 117: relisshared
+		executor.NewStringDatum("p"),              // 118: relpersistence
+		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind
+		executor.NewIntDatum(int64(rel.RelNatts)), // 120: relnatts
+		executor.NewIntDatum(0),                   // 122: relchecks
+		executor.NewBoolDatum(false),              // 124: relhasrules
+		executor.NewBoolDatum(false),              // 125: relhastriggers
+		executor.NewBoolDatum(false),              // 126: relhassubclass
+		executor.NewBoolDatum(false),              // 127: relrowsecurity
+		executor.NewBoolDatum(false),              // 128: relforcerowsecurity
+		executor.NewBoolDatum(true),               // 129: relispopulated
+		executor.NewStringDatum("n"),              // 130: relreplident
+		executor.NewBoolDatum(false),              // 131: relispartition
+		executor.NewIntDatum(0),                   // 132: relrewrite
+		executor.NewIntDatum(3),                   // 136: relfrozenxid
+		executor.NewIntDatum(1),                   // 140: relminmxid
+		executor.NewStringDatum(""),               // relacl (varlena, empty)
+		executor.NewStringDatum(""),               // reloptions (varlena, empty)
+		executor.NewStringDatum(""),               // relpartbound (varlena, empty)
+	}
+}
+
+// pgAttrColDefs returns the 24 pg_attribute column descriptors.
+func pgAttrColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "attrelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "attname", Type: catalog.Type{Name: "name"}},
+		{Name: "atttypid", Type: catalog.Type{Name: "oid"}},
+		{Name: "attlen", Type: catalog.Type{Name: "int2"}},
+		{Name: "attnum", Type: catalog.Type{Name: "int2"}},
+		{Name: "atttypmod", Type: catalog.Type{Name: "int4"}},
+		{Name: "attndims", Type: catalog.Type{Name: "int2"}},
+		{Name: "attbyval", Type: catalog.Type{Name: "bool"}},
+		{Name: "attalign", Type: catalog.Type{Name: "char"}},
+		{Name: "attstorage", Type: catalog.Type{Name: "char"}},
+		{Name: "attcompression", Type: catalog.Type{Name: "char"}},
+		{Name: "attnotnull", Type: catalog.Type{Name: "bool"}},
+		{Name: "atthasdef", Type: catalog.Type{Name: "bool"}},
+		{Name: "atthasmissing", Type: catalog.Type{Name: "bool"}},
+		{Name: "attidentity", Type: catalog.Type{Name: "char"}},
+		{Name: "attgenerated", Type: catalog.Type{Name: "char"}},
+		{Name: "attisdropped", Type: catalog.Type{Name: "bool"}},
+		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
+		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
+		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
+		{Name: "attacl", Type: catalog.Type{Name: "text"}},
+		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
+		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
+		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
+	}
+}
+
+// pgAttrEntriesForRel returns the attribute definitions for a nailed relation.
+// For pg_class and pg_attribute themselves we use column lists matching the
+// heap encoding; for all others we use the relation's Attrs from the nailed
+// registration.
+func pgAttrEntriesForRel(rel nailedRel) []nailedAttr {
+	if rel.OID == catalog.RelationRelationId {
+		// pg_class: derive from pgClassColDefs
+		cols := pgClassColDefs()
+		attrs := make([]nailedAttr, len(cols))
+		for i, c := range cols {
+			attrs[i] = nailedAttr{Name: c.Name, TypeOID: pgCatalogTypeOID(c.Type.Name), Num: int16(i + 1), Len: int16(pgCatalogTypeLen(c.Type.Name)), NotNull: c.Type.Name != "text"}
+		}
+		return attrs
+	}
+	if rel.OID == catalog.AttributeRelationId {
+		cols := pgAttrColDefs()
+		attrs := make([]nailedAttr, len(cols))
+		for i, c := range cols {
+			attrs[i] = nailedAttr{Name: c.Name, TypeOID: pgCatalogTypeOID(c.Type.Name), Num: int16(i + 1), Len: int16(pgCatalogTypeLen(c.Type.Name)), NotNull: c.Type.Name != "text"}
+		}
+		return attrs
+	}
+	return rel.Attrs
+}
+
+// pgAttributeRow builds one pg_attribute tuple.
+func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
+	return executor.Row{
+		executor.NewIntDatum(int64(relOID)),
+		executor.NewStringDatum(a.Name),
+		executor.NewIntDatum(int64(a.TypeOID)),
+		executor.NewIntDatum(int64(a.Len)),
+		executor.NewIntDatum(int64(a.Num)),
+		executor.NewIntDatum(-1),            // atttypmod
+		executor.NewIntDatum(0),             // attndims
+		executor.NewBoolDatum(pgTypeByVal(a.TypeOID)),
+		executor.NewStringDatum(pgTypeAlignChar(a.TypeOID)),
+		executor.NewStringDatum(pgTypeStorageChar(a.TypeOID)),
+		executor.NewStringDatum(""),         // attcompression
+		executor.NewBoolDatum(a.NotNull),
+		executor.NewBoolDatum(false),        // atthasdef
+		executor.NewBoolDatum(false),        // atthasmissing
+		executor.NewStringDatum(""),         // attidentity
+		executor.NewStringDatum(""),         // attgenerated
+		executor.NewBoolDatum(false),        // attisdropped
+		executor.NewBoolDatum(true),         // attislocal
+		executor.NewIntDatum(0),             // attinhcount
+		executor.NewIntDatum(0),             // attcollation
+		executor.NewStringDatum(""),         // attacl
+		executor.NewStringDatum(""),         // attoptions
+		executor.NewStringDatum(""),         // attfdwoptions
+		executor.NewStringDatum(""),         // attmissingval
+	}
+}
+
+// hasVarWidthCol returns true if any column is varlena ("text" type).
+func hasVarWidthCol(cols []catalog.Column) bool {
+	for _, c := range cols {
+		if c.Type.Name == "text" {
+			return true
+		}
+	}
+	return false
+}
+
+// writeMultiPageHeap writes multiple heap tuples (one per nailed rel) into
+// a multi-page heap file.
+func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []nailedRel, rowFn func(nailedRel) executor.Row) error {
+	var pages [][]byte
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	for _, rel := range rels {
+		row := rowFn(rel)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			return fmt.Errorf("encode %s row for %s: %w", relFile, rel.RelName, err)
+		}
+		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		tuple.Header.SetNatts(len(cols))
+		if hasVarWidthCol(cols) {
+			tuple.Header.Infomask |= storage.HeapHasVarWidth
+		}
+		if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+			pages = append(pages, page)
+			page = make(storage.Page, storage.BlockSize)
+			if err := storage.InitPage(page); err != nil {
+				return err
+			}
+			if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+				return fmt.Errorf("add %s tuple for %s on fresh page: %w", relFile, rel.RelName, err)
+			}
+		}
+	}
+	pages = append(pages, page)
+	raw := make([]byte, 0, storage.BlockSize*len(pages))
+	for _, p := range pages {
+		raw = append(raw, p...)
+	}
+	b1 := filepath.Join(dataDir, "base", "1")
+	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
+		return err
+	}
+	b5 := filepath.Join(dataDir, "base", "5")
+	if err := os.MkdirAll(b5, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(b5, relFile), raw, 0o600)
+}
+
+// writeMultiPageHeapRows is like writeMultiPageHeap but takes pre-built rows.
+func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows []executor.Row) error {
+	var pages [][]byte
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			return fmt.Errorf("encode %s row: %w", relFile, err)
+		}
+		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		tuple.Header.SetNatts(len(cols))
+		if hasVarWidthCol(cols) {
+			tuple.Header.Infomask |= storage.HeapHasVarWidth
+		}
+		if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+			pages = append(pages, page)
+			page = make(storage.Page, storage.BlockSize)
+			if err := storage.InitPage(page); err != nil {
+				return err
+			}
+			if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+				return fmt.Errorf("add %s tuple on fresh page: %w", relFile, err)
+			}
+		}
+	}
+	pages = append(pages, page)
+	raw := make([]byte, 0, storage.BlockSize*len(pages))
+	for _, p := range pages {
+		raw = append(raw, p...)
+	}
+	b1 := filepath.Join(dataDir, "base", "1")
+	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
+		return err
+	}
+	b5 := filepath.Join(dataDir, "base", "5")
+	if err := os.MkdirAll(b5, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(b5, relFile), raw, 0o600)
+}
+
+// pgCatalogTypeOID maps a goopg type name → PG type OID.
+func pgCatalogTypeOID(t string) uint32 {
+	switch t {
+	case "bool":
+		return 16
+	case "char":
+		return 18
+	case "name":
+		return 19
+	case "int8":
+		return 20
+	case "int2":
+		return 21
+	case "int4", "oid", "xid":
+		return 23
+	case "text":
+		return 25
+	case "float4":
+		return 700
+	case "float8":
+		return 701
+	}
+	return 0
+}
+
+// pgCatalogTypeLen returns PG attlen for a goopg type name.
+func pgCatalogTypeLen(t string) int {
+	switch t {
+	case "bool", "char":
+		return 1
+	case "int2":
+		return 2
+	case "int4", "oid", "xid", "float4":
+		return 4
+	case "int8", "float8":
+		return 8
+	case "name":
+		return 64
+	case "text":
+		return -1
+	}
+	return 4
+}
+
+func pgTypeByVal(oid uint32) bool {
+	switch oid {
+	case 16, 18, 21, 23, 26, 700, 20, 701:
+		return true
+	}
+	return false
+}
+
+func pgTypeAlignChar(oid uint32) string {
+	switch oid {
+	case 16, 18:
+		return "c"
+	case 21:
+		return "s"
+	case 23, 26, 700:
+		return "i"
+	case 20, 701:
+		return "d"
+	}
+	return "i"
+}
+
+func pgTypeStorageChar(oid uint32) string {
+	switch oid {
+	case 25, 1043, 1042:
+		return "x"
+	}
+	return "p"
 }
 
 // bootstrapCLog creates the initial commit log at <dataDir>/global/pg_xact and

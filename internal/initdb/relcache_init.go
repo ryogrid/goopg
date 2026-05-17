@@ -93,7 +93,7 @@ var nailedSharedRels = flattenRels([]nailedRel{
 var nailedLocalRels = flattenRels([]nailedRel{
 	{1247, "pg_type", 71, 'r', 14, false, pgTypeAttrs()},
 	{1249, "pg_attribute", 75, 'r', 24, false, pgAttributeAttrs()},
-	{1259, "pg_class", 83, 'r', 14, false, pgClassAttrs()},
+	{1259, "pg_class", 83, 'r', 34, false, pgClassAttrs()},
 	{1255, "pg_proc", 81, 'r', 13, false, pgProcAttrs()},
 	{2610, "pg_index", 75, 'r', 4, false, pgIndexAttrs()},
 	{2616, "pg_opclass", 83, 'r', 7, false, pgOpclassAttrs()},
@@ -159,8 +159,11 @@ func indexKeyAttrs(natts int16) []nailedAttr {
 	attrs := make([]nailedAttr, natts)
 	for i := int16(0); i < natts; i++ {
 		attrs[i] = nailedAttr{
-			Name: "oid", // simplified — PG just needs column count
-			Num:  i + 1,
+			Name:    "oid",
+			TypeOID: 26, // OID type
+			Num:     i + 1,
+			Len:     4,  // OID = 4 bytes
+			NotNull: true,
 		}
 	}
 	return attrs
@@ -243,41 +246,58 @@ func buildRelationDataBlob(rel nailedRel) []byte {
 	return buf
 }
 
+// buildPgClassBlob encodes a FormData_pg_class matching PG18 struct layout.
+// Offsets verified against postgres/src/include/catalog/pg_class.h (PG18).
 func buildPgClassBlob(rel nailedRel) []byte {
 	buf := make([]byte, sizeofFormDataPgClass)
 	le := binary.LittleEndian
 
-	// oid (offset 0, Oid, 4 bytes)
+	// oid (offset 0)
 	le.PutUint32(buf[0:4], rel.OID)
-	// relname (offset 4, NameData = 64 bytes)
-	nameBytes := []byte(rel.RelName)
-	copy(buf[4:4+pgNameDataLen], nameBytes)
-	// relnamespace (offset 68, Oid): PGNSP = 11 for pg_catalog
-	le.PutUint32(buf[68:72], 11) // PG_CATALOG_NAMESPACE
-	// reltype (offset 72, Oid)
+	// relname (offset 4, NameData=64)
+	copy(buf[4:4+pgNameDataLen], []byte(rel.RelName))
+	// relnamespace (offset 68): PGNSP=11
+	le.PutUint32(buf[68:72], 11)
+	// reltype (offset 72)
 	if rel.RelType != 0 {
 		le.PutUint32(buf[72:76], rel.RelType)
 	}
-	// relkind (offset 109, char): 'r'=relation, 'i'=index
-	buf[109] = rel.RelKind
-	// relnatts (offset 110, int16)
-	le.PutUint16(buf[110:112], uint16(rel.RelNatts))
-	// relisshared (offset 113, bool)
-	if rel.IsShared {
-		buf[113] = 1
-	}
-	// relpersistence (offset 112, char): 'p'=permanent
-	buf[112] = 'p'
-	// relhaspkey (index only)
-	if rel.RelKind == 'i' {
-		buf[121] = 1 // relispartition → not for indexes, use different flag
-	}
-	// relhasindex (offset 118, bool) — for heap
+	// relowner (offset 80): bootstrap superuser = 10
+	le.PutUint32(buf[80:84], 10)
+	// relam (offset 84)
 	if rel.RelKind == 'r' {
-		buf[118] = 1
+		le.PutUint32(buf[84:88], 2) // HEAP_TABLE_AM_OID
+	} else if rel.RelKind == 'i' {
+		le.PutUint32(buf[84:88], 403) // BTREE_AM_OID
 	}
-	// relstorage (offset 108, char): 'h'=heap
-	buf[108] = 'h'
+	// relfilenode (offset 88) = OID for nailed relations
+	le.PutUint32(buf[88:92], rel.OID)
+	// relpages (offset 96) = 0
+	// reltuples (offset 100) = 0
+	// relallvisible (offset 104) = 0
+	// relallfrozen (offset 108) = 0
+	// reltoastrelid (offset 112) = 0
+	// relhasindex (offset 116)
+	if rel.RelKind == 'r' {
+		buf[116] = 1
+	}
+	// relisshared (offset 117)
+	if rel.IsShared {
+		buf[117] = 1
+	}
+	// relpersistence (offset 118): 'p'=permanent
+	buf[118] = 'p'
+	// relkind (offset 119): 'r'=relation, 'i'=index
+	buf[119] = rel.RelKind
+	// relnatts (offset 120)
+	le.PutUint16(buf[120:122], uint16(rel.RelNatts))
+	// relispopulated (offset 129): true
+	buf[129] = 1
+	// relispartition (offset 131): false
+	// relfrozenxid (offset 136): 3 (FirstNormalTransactionId)
+	le.PutUint32(buf[136:140], 3)
+	// relminmxid (offset 140): 1 (FirstMultiXactId)
+	le.PutUint32(buf[140:144], 1)
 
 	return buf
 }
@@ -320,14 +340,42 @@ func buildPgAttributeBlob(a nailedAttr) []byte {
 	if a.NotNull {
 		buf[86] = 1
 	}
-	buf[83] = 'i'                // attalign = 'i' (int)
-	buf[84] = 'p'                // attstorage = 'p' (plain)
+	buf[82] = pgTypeIsByVal(a.TypeOID) // attbyval
+	buf[83] = pgAlignChar(a.Len)         // attalign
+	buf[84] = 'p'                       // attstorage = 'p' (plain)
 	buf[92] = 1                  // attislocal = true
 	if a.IsDropped {
 		buf[91] = 1
 	}
 
 	return buf
+}
+
+// pgTypeIsByVal returns 1 if the PG type OID is pass-by-value, 0 otherwise.
+func pgTypeIsByVal(oid uint32) byte {
+	switch oid {
+	case 16, 18, 21, 23, 26, 28, 700, 20, 701:
+		return 1
+	}
+	return 0
+}
+
+// pgAlignChar returns the PG alignment character for a given attlen.
+func pgAlignChar(l int16) byte {
+	switch {
+	case l == 1:
+		return 'c'
+	case l == 2:
+		return 's'
+	case l == 4:
+		return 'i'
+	case l == 8:
+		return 'd'
+	case l == 64: // NameData
+		return 'c'
+	default:
+		return 'i' // varlena and unknown
+	}
 }
 
 // ---- Attribute lists for each nailed catalog ----
@@ -433,13 +481,33 @@ func pgClassAttrs() []nailedAttr {
 		{Name: "reloftype", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "relowner", TypeOID: 26, Num: 6, Len: 4, NotNull: true},
 		{Name: "relam", TypeOID: 26, Num: 7, Len: 4, NotNull: true},
-		{Name: "reltablespace", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
-		{Name: "relkind", TypeOID: 18, Num: 9, Len: 1, NotNull: true},
-		{Name: "relnatts", TypeOID: 21, Num: 10, Len: 2, NotNull: true},
-		{Name: "relpersistence", TypeOID: 18, Num: 11, Len: 1, NotNull: true},
-		{Name: "relisshared", TypeOID: 16, Num: 12, Len: 1, NotNull: true},
-		{Name: "relhasindex", TypeOID: 16, Num: 13, Len: 1, NotNull: true},
-		{Name: "relfrozenxid", TypeOID: 28, Num: 14, Len: 4, NotNull: true},
+		{Name: "relfilenode", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
+		{Name: "reltablespace", TypeOID: 26, Num: 9, Len: 4, NotNull: true},
+		{Name: "relpages", TypeOID: 23, Num: 10, Len: 4, NotNull: true},
+		{Name: "reltuples", TypeOID: 700, Num: 11, Len: 4, NotNull: true},
+		{Name: "relallvisible", TypeOID: 23, Num: 12, Len: 4, NotNull: true},
+		{Name: "relallfrozen", TypeOID: 23, Num: 13, Len: 4, NotNull: true},
+		{Name: "reltoastrelid", TypeOID: 26, Num: 14, Len: 4, NotNull: true},
+		{Name: "relhasindex", TypeOID: 16, Num: 15, Len: 1, NotNull: true},
+		{Name: "relisshared", TypeOID: 16, Num: 16, Len: 1, NotNull: true},
+		{Name: "relpersistence", TypeOID: 18, Num: 17, Len: 1, NotNull: true},
+		{Name: "relkind", TypeOID: 18, Num: 18, Len: 1, NotNull: true},
+		{Name: "relnatts", TypeOID: 21, Num: 19, Len: 2, NotNull: true},
+		{Name: "relchecks", TypeOID: 21, Num: 20, Len: 2, NotNull: true},
+		{Name: "relhasrules", TypeOID: 16, Num: 21, Len: 1},
+		{Name: "relhastriggers", TypeOID: 16, Num: 22, Len: 1},
+		{Name: "relhassubclass", TypeOID: 16, Num: 23, Len: 1},
+		{Name: "relrowsecurity", TypeOID: 16, Num: 24, Len: 1},
+		{Name: "relforcerowsecurity", TypeOID: 16, Num: 25, Len: 1},
+		{Name: "relispopulated", TypeOID: 16, Num: 26, Len: 1, NotNull: true},
+		{Name: "relreplident", TypeOID: 18, Num: 27, Len: 1, NotNull: true},
+		{Name: "relispartition", TypeOID: 16, Num: 28, Len: 1, NotNull: true},
+		{Name: "relrewrite", TypeOID: 26, Num: 29, Len: 4, NotNull: true},
+		{Name: "relfrozenxid", TypeOID: 28, Num: 30, Len: 4, NotNull: true},
+		{Name: "relminmxid", TypeOID: 28, Num: 31, Len: 4, NotNull: true},
+		{Name: "relacl", TypeOID: 1034, Num: 32, Len: -1},
+		{Name: "reloptions", TypeOID: 1009, Num: 33, Len: -1},
+		{Name: "relpartbound", TypeOID: 25, Num: 34, Len: -1},
 	}
 }
 

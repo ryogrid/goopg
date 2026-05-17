@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -196,6 +197,55 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		buf := make([]byte, 64)
 		copy(buf, s)
 		return buf, nil
+	case "char":
+		// PG "char" type: single byte
+		if d.Kind == KindString || d.Kind == KindStringArena {
+			s := d.StringValue()
+			if len(s) > 0 {
+				return []byte{s[0]}, nil
+			}
+			return []byte{0}, nil
+		}
+		if d.Kind == KindInt {
+			return []byte{byte(d.Int)}, nil
+		}
+		return nil, fmt.Errorf("expected string or int for char, got kind %d", d.Kind)
+	case "float4", "real":
+		// PG float4: 4-byte IEEE 754 little-endian
+		var v float32
+		switch d.Kind {
+		case KindInt:
+			v = float32(d.Int)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
+		}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], math.Float32bits(v))
+		return buf[:], nil
+	case "float8", "double precision", "double":
+		// PG float8: 8-byte IEEE 754 little-endian
+		var v float64
+		switch d.Kind {
+		case KindInt:
+			v = float64(d.Int)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(v))
+		return buf[:], nil
+	case "xid", "xid8":
+		// PG TransactionId: 4-byte unsigned LE
+		var v uint32
+		switch d.Kind {
+		case KindInt:
+			v = uint32(d.Int)
+		default:
+			return nil, fmt.Errorf("expected int for xid, got kind %d", d.Kind)
+		}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], v)
+		return buf[:], nil
 	default:
 		// text, varchar, char, bpchar, unknown, numeric, etc.
 		// Use PG varlena format: 1-byte header for short strings,
@@ -509,14 +559,16 @@ func alignPhysicalPGOffset(off, align int) int {
 
 func physicalPGTypeAlign(t catalog.Type) int {
 	switch strings.ToLower(t.Name) {
-	case "bool", "boolean":
+	case "bool", "boolean", "char":
 		return 1
 	case "int2", "smallint":
 		return 2
-	case "int4", "integer", "int", "serial", "oid", "float4", "real", "date":
+	case "int4", "integer", "int", "serial", "oid", "float4", "real", "date", "xid":
 		return 4
 	case "int8", "bigint", "bigserial", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
 		return 8
+	case "name":
+		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
 	default:
 		return 4
 	}
