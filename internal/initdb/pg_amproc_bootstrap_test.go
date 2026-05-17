@@ -109,9 +109,57 @@ func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 		}
 	}
 	// 11 cmp + 8 sortsupport (no sortsupport for bool/char/oidvector)
-	// + 11 equalimage = 30 rows.
-	if got, want := len(entries), 30; got != want {
+	// + 11 equalimage + 6 cross-type integer_ops cmp = 36 rows.
+	if got, want := len(entries), 36; got != want {
 		t.Errorf("entry count: got %d, want %d", got, want)
+	}
+}
+
+// TestPgAmprocInitialEntriesCoverCrossTypeInteger pins the
+// 6 cross-type cmp support procs (amprocnum=1) that PG ships for
+// the btree integer_ops family in pg_amproc.dat. OIDs come from
+// pg_proc.dat (btint24cmp=2190, btint42cmp=2191, btint28cmp=2192,
+// btint82cmp=2193, btint48cmp=2188, btint84cmp=2189). Without
+// these rows, PG's `LookupOpclassInfo` returns no cmp proc for an
+// int4↔int8 (or int2↔int8 etc.) index scan and falls back to a
+// runtime cast that defeats index ordering.
+func TestPgAmprocInitialEntriesCoverCrossTypeInteger(t *testing.T) {
+	entries := pgAmprocInitialEntries()
+	type key struct {
+		family    uint32
+		lefttype  uint32
+		righttype uint32
+		num       int16
+	}
+	byKey := make(map[key]pgAmprocEntry, len(entries))
+	for _, e := range entries {
+		byKey[key{e.Family, e.LeftType, e.RightType, e.Num}] = e
+	}
+	type want struct {
+		lefttype  uint32
+		righttype uint32
+		proc      uint32
+		label     string
+	}
+	const famInteger uint32 = 1976
+	wants := []want{
+		{21, 23, 2190, "btint24cmp"},
+		{23, 21, 2191, "btint42cmp"},
+		{21, 20, 2192, "btint28cmp"},
+		{20, 21, 2193, "btint82cmp"},
+		{23, 20, 2188, "btint48cmp"},
+		{20, 23, 2189, "btint84cmp"},
+	}
+	for _, w := range wants {
+		got, ok := byKey[key{famInteger, w.lefttype, w.righttype, 1}]
+		if !ok {
+			t.Errorf("%s: missing entry for family=%d left=%d right=%d",
+				w.label, famInteger, w.lefttype, w.righttype)
+			continue
+		}
+		if got.Proc != w.proc {
+			t.Errorf("%s: proc=%d, want %d", w.label, got.Proc, w.proc)
+		}
 	}
 }
 

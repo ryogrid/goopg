@@ -1074,14 +1074,14 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	// assigns these at initdb time; we pin contiguous ranges so
 	// the pg_amop_oid_index can later be heap-rebuilt.
 	const baseOID uint32 = 7000
-	out := make([]pgAmopEntry, 0, 55)
-	add := func(family, lefttype uint32, ops [5]uint32) {
+	out := make([]pgAmopEntry, 0, 85)
+	addPair := func(family, lefttype, righttype uint32, ops [5]uint32) {
 		for i := 0; i < 5; i++ {
 			out = append(out, pgAmopEntry{
 				OID:        baseOID + uint32(len(out)),
 				Family:     family,
 				LeftType:   lefttype,
-				RightType:  lefttype,
+				RightType:  righttype,
 				Strategy:   int16(i + 1),
 				Purpose:    purposeSearch,
 				Operator:   ops[i],
@@ -1090,12 +1090,26 @@ func pgAmopInitialEntries() []pgAmopEntry {
 			})
 		}
 	}
+	add := func(family, lefttype uint32, ops [5]uint32) {
+		addPair(family, lefttype, lefttype, ops)
+	}
 	// int4 — pg_operator.dat 97 <, 523 <=, 96 =, 525 >=, 521 >.
 	add(famInteger, 23, [5]uint32{97, 523, 96, 525, 521})
 	// int2 — 95 <, 522 <=, 94 =, 524 >=, 520 >.
 	add(famInteger, 21, [5]uint32{95, 522, 94, 524, 520})
 	// int8 — 412 <, 414 <=, 410 =, 415 >=, 413 >.
 	add(famInteger, 20, [5]uint32{412, 414, 410, 415, 413})
+	// Cross-type integer_ops — pg_amop.dat int24/int28/int42/int48/int82/int84.
+	// These are required for index scans that compare across integer widths
+	// (e.g. an int4 indexed column compared to an int2 literal). Without the
+	// rows, PG's `get_op_btree_interpretation` returns no strategy match and
+	// the planner can't push down the qual.
+	addPair(famInteger, 21, 23, [5]uint32{534, 540, 532, 542, 536}) // int24
+	addPair(famInteger, 21, 20, [5]uint32{1864, 1866, 1862, 1867, 1865}) // int28
+	addPair(famInteger, 23, 21, [5]uint32{535, 541, 533, 543, 537}) // int42
+	addPair(famInteger, 23, 20, [5]uint32{37, 80, 15, 82, 76})      // int48
+	addPair(famInteger, 20, 21, [5]uint32{1870, 1872, 1868, 1873, 1871}) // int82
+	addPair(famInteger, 20, 23, [5]uint32{418, 420, 416, 430, 419}) // int84
 	// oid  — 609 <, 611 <=, 607 =, 612 >=, 610 >.
 	add(famOID, 26, [5]uint32{609, 611, 607, 612, 610})
 	// text — 664 <, 665 <=, 98 =, 667 >=, 666 >.
@@ -1230,6 +1244,16 @@ func pgAmprocInitialEntries() []pgAmprocEntry {
 		{0, famInteger, 23, 23, 4, btequalimageOID},    // int4
 		{0, famInteger, 21, 21, 4, btequalimageOID},    // int2
 		{0, famInteger, 20, 20, 4, btequalimageOID},    // int8
+		// integer_ops cross-type cmp procs (pg_amproc.dat). Match
+		// the cross-type amop strategy rows above so PG's btree
+		// LookupOpclassInfo can drive an index scan across integer
+		// widths without falling back to lossy cast comparison.
+		{0, famInteger, 21, 23, 1, 2190}, // btint24cmp
+		{0, famInteger, 21, 20, 1, 2192}, // btint28cmp
+		{0, famInteger, 23, 21, 1, 2191}, // btint42cmp
+		{0, famInteger, 23, 20, 1, 2188}, // btint48cmp
+		{0, famInteger, 20, 21, 1, 2193}, // btint82cmp
+		{0, famInteger, 20, 23, 1, 2189}, // btint84cmp
 		// oid_ops — cmp + sortsupport + equalimage.
 		{0, famOID, 26, 26, 1, 356},                    // btoidcmp
 		{0, famOID, 26, 26, 2, 3134},                   // btoidsortsupport

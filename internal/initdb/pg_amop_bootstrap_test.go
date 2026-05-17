@@ -70,51 +70,58 @@ func TestPgAmopRowInt4LessMatchesFormPgAmop(t *testing.T) {
 func TestPgAmopInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 	entries := pgAmopInitialEntries()
 	type key struct {
-		family   uint32
-		lefttype uint32
-		strategy int16
+		family    uint32
+		lefttype  uint32
+		righttype uint32
+		strategy  int16
 	}
 	byKey := make(map[key]pgAmopEntry, len(entries))
 	for _, e := range entries {
-		if e.LeftType != e.RightType {
-			t.Errorf("entry %+v: only default (lefttype=righttype) rows are seeded", e)
-		}
 		if e.Method != 403 {
 			t.Errorf("entry %+v: method=%d, want 403 (btree)", e, e.Method)
 		}
 		if e.Purpose != 's' {
 			t.Errorf("entry %+v: purpose=%q, want 's'", e, e.Purpose)
 		}
-		k := key{e.Family, e.LeftType, e.Strategy}
+		k := key{e.Family, e.LeftType, e.RightType, e.Strategy}
 		if _, dup := byKey[k]; dup {
-			t.Errorf("duplicate (family=%d, lefttype=%d, strategy=%d)", e.Family, e.LeftType, e.Strategy)
+			t.Errorf("duplicate (family=%d, left=%d, right=%d, strategy=%d)", e.Family, e.LeftType, e.RightType, e.Strategy)
 		}
 		byKey[k] = e
 	}
-	// (family, lefttype, expected op OID per strategy 1..5).
+	// (family, lefttype, righttype, expected op OID per strategy 1..5).
 	want := []struct {
-		family   uint32
-		lefttype uint32
-		ops      [5]uint32
-		label    string
+		family    uint32
+		lefttype  uint32
+		righttype uint32
+		ops       [5]uint32
+		label     string
 	}{
-		{1976, 23, [5]uint32{97, 523, 96, 525, 521}, "int4"},
-		{1976, 21, [5]uint32{95, 522, 94, 524, 520}, "int2"},
-		{1976, 20, [5]uint32{412, 414, 410, 415, 413}, "int8"},
-		{1989, 26, [5]uint32{609, 611, 607, 612, 610}, "oid"},
-		{1994, 25, [5]uint32{664, 665, 98, 667, 666}, "text"},
-		{1994, 19, [5]uint32{660, 661, 93, 663, 662}, "name"},
-		{2095, 25, [5]uint32{2314, 2315, 98, 2317, 2318}, "text_pattern"},
-		{424, 16, [5]uint32{58, 1694, 91, 1695, 59}, "bool"},
-		{429, 18, [5]uint32{631, 632, 92, 634, 633}, "char"},
-		{1991, 30, [5]uint32{645, 647, 649, 648, 646}, "oidvector"},
-		{2097, 1042, [5]uint32{2326, 2327, 1054, 2329, 2330}, "bpchar_pattern"},
+		{1976, 23, 23, [5]uint32{97, 523, 96, 525, 521}, "int4"},
+		{1976, 21, 21, [5]uint32{95, 522, 94, 524, 520}, "int2"},
+		{1976, 20, 20, [5]uint32{412, 414, 410, 415, 413}, "int8"},
+		// Cross-type integer_ops — pg_amop.dat int24/int28/int42/int48/int82/int84.
+		{1976, 21, 23, [5]uint32{534, 540, 532, 542, 536}, "int24"},
+		{1976, 21, 20, [5]uint32{1864, 1866, 1862, 1867, 1865}, "int28"},
+		{1976, 23, 21, [5]uint32{535, 541, 533, 543, 537}, "int42"},
+		{1976, 23, 20, [5]uint32{37, 80, 15, 82, 76}, "int48"},
+		{1976, 20, 21, [5]uint32{1870, 1872, 1868, 1873, 1871}, "int82"},
+		{1976, 20, 23, [5]uint32{418, 420, 416, 430, 419}, "int84"},
+		{1989, 26, 26, [5]uint32{609, 611, 607, 612, 610}, "oid"},
+		{1994, 25, 25, [5]uint32{664, 665, 98, 667, 666}, "text"},
+		{1994, 19, 19, [5]uint32{660, 661, 93, 663, 662}, "name"},
+		{2095, 25, 25, [5]uint32{2314, 2315, 98, 2317, 2318}, "text_pattern"},
+		{424, 16, 16, [5]uint32{58, 1694, 91, 1695, 59}, "bool"},
+		{429, 18, 18, [5]uint32{631, 632, 92, 634, 633}, "char"},
+		{1991, 30, 30, [5]uint32{645, 647, 649, 648, 646}, "oidvector"},
+		{2097, 1042, 1042, [5]uint32{2326, 2327, 1054, 2329, 2330}, "bpchar_pattern"},
 	}
 	for _, w := range want {
 		for i := 0; i < 5; i++ {
-			got, ok := byKey[key{w.family, w.lefttype, int16(i + 1)}]
+			got, ok := byKey[key{w.family, w.lefttype, w.righttype, int16(i + 1)}]
 			if !ok {
-				t.Errorf("%s strategy %d: missing entry for family=%d lefttype=%d", w.label, i+1, w.family, w.lefttype)
+				t.Errorf("%s strategy %d: missing entry for family=%d lefttype=%d righttype=%d",
+					w.label, i+1, w.family, w.lefttype, w.righttype)
 				continue
 			}
 			if got.Operator != w.ops[i] {
@@ -122,8 +129,9 @@ func TestPgAmopInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 			}
 		}
 	}
-	// Total row count = 11 families × 5 strategies = 55.
-	if got, want := len(entries), 55; got != want {
+	// Total row count = 11 default-type families × 5 strategies +
+	// 6 cross-type integer_ops combos × 5 strategies = 85.
+	if got, want := len(entries), 85; got != want {
 		t.Errorf("entry count: got %d, want %d", got, want)
 	}
 }

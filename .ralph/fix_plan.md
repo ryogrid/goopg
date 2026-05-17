@@ -2742,6 +2742,39 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         Next scope (Step 3h): cross-type `pg_amop` strategy rows
         surfaced once the now-resolvable index opclass lookups
         attempt e.g. `int2 < int4` comparisons.
+      - Step 3h LANDED 2026-05-17. `internal/initdb/initdb.go::
+        pgAmopInitialEntries` factors out `addPair(family, lefttype,
+        righttype, ops)` and seeds the six PG18 cross-type
+        `integer_ops` row sets (int24/int28/int42/int48/int82/int84 ×
+        5 strategies = 30 new rows; total 55 → 85). Operator OIDs
+        verbatim from `pg_operator.dat`: int24 {534,540,532,542,536},
+        int28 {1864,1866,1862,1867,1865}, int42 {535,541,533,543,537},
+        int48 {37,80,15,82,76}, int82 {1870,1872,1868,1873,1871},
+        int84 {418,420,416,430,419}. `pgAmprocInitialEntries` adds
+        six matching cross-type cmp procs (amprocnum=1) from
+        `pg_proc.dat`: btint24cmp=2190, btint42cmp=2191,
+        btint28cmp=2192, btint82cmp=2193, btint48cmp=2188,
+        btint84cmp=2189 (total 30 → 36). Unblocks
+        `get_op_btree_interpretation()` for cross-width integer
+        index scans, which Step 3g surfaced as the next standby-boot
+        blocker once `pg_index` rows resolved. Test pin
+        `TestPgAmopInitialEntriesCoverPinnedOpclasses` widens lookup
+        key to `(family, lefttype, righttype, strategy)`, drops the
+        `lefttype==righttype` rejection, and bumps count 55→85.
+        New pin `TestPgAmprocInitialEntriesCoverCrossTypeInteger`
+        pins each of the six cross-type cmp rows by `(left, right) →
+        proc OID`. `TestPgAmprocInitialEntriesCoverPinnedOpclasses`
+        count bumped 30→36. Verified: `go test -count=1 -run
+        'TestPgAmop|TestPgAmproc' ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — 14 pre-existing
+        baseline failures confirmed unchanged via stash-baseline diff;
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3h-pg-amop-amproc-crosstype-integer.md`.
+        Still open (Step 3i): cross-type rows for text/name (family
+        1994) and the pattern families when a concrete standby-boot
+        blocker surfaces; `in_range` (amprocnum=3) and `skipsupport`
+        (amprocnum=6) procs.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,
