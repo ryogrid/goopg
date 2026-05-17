@@ -64,6 +64,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		828: {1},          // pg_default_acl_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3am
 		3502: {1},         // pg_enum_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ao
 		3503: {2, 4},      // pg_enum_typid_label_index : btree(enumtypid oid_ops, enumlabel name_ops) UNIQUE ← Step 3ap
+		3534: {2, 3},      // pg_enum_typid_sortorder_index : btree(enumtypid oid_ops, enumsortorder float4_ops) UNIQUE ← Step 3aq
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

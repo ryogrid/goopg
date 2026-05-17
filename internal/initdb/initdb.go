@@ -697,6 +697,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
+		3534, // pg_enum_typid_sortorder_index (Step 3aq)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -796,6 +797,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
+		3534, // pg_enum_typid_sortorder_index (Step 3aq)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -828,6 +830,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
+		3534, // pg_enum_typid_sortorder_index (Step 3aq)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -1649,7 +1652,8 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		textOps            uint32 = 3126
 		charOps            uint32 = 1985
 		oidvectorOps       uint32 = 1987
-		cCollation         uint32 = 950 // C_COLLATION_OID — name/text use C in catalogs
+		float4Ops          uint32 = 10012 // btree float4_ops (postgres.bki: am=403 / btree)
+		cCollation         uint32 = 950   // C_COLLATION_OID — name/text use C in catalogs
 	)
 	// Helper builders.
 	entry := func(idxOID, relOID uint32, key []int16, class []uint32, coll []uint32, unique, primary bool) pgIndexEntry {
@@ -1906,7 +1910,7 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_default_acl_oid_index (828, Step 3am), and
 		// pg_opclass_oid_index (2687, Step 3l). Companion index 3534
 		// (pg_enum_typid_sortorder_index UNIQUE composite float4_ops)
-		// is deferred to Step 3aq.
+		// is seeded by Step 3aq below.
 		entry(3502, 3501, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_enum_oid_index
 		// M0106-0010 Step 3ap: pg_enum_typid_label_index.
 		//   postgres/src/include/catalog/pg_enum.h:48
@@ -1924,6 +1928,22 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// (2669, Step 3aj) and pg_opclass_am_name_nsp_index (2686,
 		// Step 3ad) for the name_ops slot.
 		entry(3503, 3501, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_enum_typid_label_index
+		// M0106-0010 Step 3aq: pg_enum_typid_sortorder_index.
+		//   postgres/src/include/catalog/pg_enum.h:48
+		//   DECLARE_UNIQUE_INDEX(pg_enum_typid_sortorder_index, 3534,
+		//     EnumTypIdSortOrderIndexId, pg_enum,
+		//     btree(enumtypid oid_ops, enumsortorder float4_ops));
+		// pg_enum attnums (pg_enum_d.h): 2=enumtypid, 3=enumsortorder.
+		// UNIQUE non-PRIMARY composite over pg_enum heap OID 3501
+		// (Step 3an nailed rel). First nailed index keyed on
+		// `float4_ops` btree opclass — OID 10012 from postgres.bki
+		// (`insert ( 10012 403 float4_ops 11 10 1970 700 t 0 )`,
+		// am=403 / btree). No collation on either key: oid_ops carries
+		// no collation; float4_ops is a scalar numeric opclass with no
+		// collation slot. Companion to OID 3502 (pg_enum_oid_index
+		// UNIQUE PRIMARY, Step 3ao) and OID 3503
+		// (pg_enum_typid_label_index UNIQUE composite name_ops, Step 3ap).
+		entry(3534, 3501, []int16{2, 3}, []uint32{oidOps, float4Ops}, []uint32{0, 0}, true, false), // pg_enum_typid_sortorder_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

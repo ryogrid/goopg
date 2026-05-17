@@ -302,7 +302,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// `EnumOidIndexId = 3502` as UNIQUE PRIMARY KEY on btree(oid oid_ops).
 	// Heap OID 3501 (pg_enum, Step 3an nailed rel). Companion index 3534
 	// (pg_enum_typid_sortorder_index, UNIQUE composite float4_ops) is
-	// deferred to Step 3aq. Backs MAKE_SYSCACHE(ENUMOID,
+	// seeded by Step 3aq below. Backs MAKE_SYSCACHE(ENUMOID,
 	// pg_enum_oid_index, 8). Without this entry RelationIdGetRelation(3502)
 	// FATALs because no pg_class row gets seeded; flattenRels derives
 	// RelNatts=1 via pgIndexNattsByOID, satisfying
@@ -320,6 +320,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
 	{3503, "pg_enum_typid_label_index"},
+	// M0106-0010 Step 3aq: pg_enum_typid_sortorder_index. PG18
+	// `postgres/src/include/catalog/pg_enum.h:48` declares
+	// `EnumTypIdSortOrderIndexId = 3534` as UNIQUE (non-PKEY) composite on
+	// btree(enumtypid oid_ops, enumsortorder float4_ops). Heap OID 3501
+	// (pg_enum, Step 3an nailed rel). First nailed index keyed on
+	// `float4_ops` btree opclass (OID 10012 from postgres.bki). Without
+	// this entry RelationIdGetRelation(3534) FATALs because no pg_class
+	// row gets seeded; flattenRels derives RelNatts=2 via
+	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+	// relnatts/indnatts check (relcache.c:1492).
+	{3534, "pg_enum_typid_sortorder_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
