@@ -684,6 +684,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667,
 		2668, // pg_conversion_default_index (Step 3ah)
+		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		2684, 2685,
@@ -776,6 +777,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667,
 		2668, // pg_conversion_default_index (Step 3ah)
+		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		2684, 2685,
@@ -803,6 +805,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667,
 		2668, // pg_conversion_default_index (Step 3ah)
+		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		2684, 2685,
@@ -1828,6 +1831,24 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_cast_oid_index (2660, Step 3ab), pg_collation_oid_index (3085,
 		// Step 3af), and pg_opclass_oid_index (2687, Step 3l).
 		entry(2670, 2607, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_conversion_oid_index
+		// M0106-0010 Step 3aj: pg_conversion_name_nsp_index (OID 2669).
+		// postgres/src/include/catalog/pg_conversion.h:64 —
+		//   DECLARE_UNIQUE_INDEX(pg_conversion_name_nsp_index, 2669,
+		//     ConversionNameNspIndexId, pg_conversion,
+		//     btree(conname name_ops, connamespace oid_ops));
+		//   MAKE_SYSCACHE(CONNAMENSP, pg_conversion_name_nsp_index, 8);
+		// pg_conversion attnums (pg_conversion_d.h): 2=conname,
+		// 3=connamespace. UNIQUE but NOT primary (DECLARE_UNIQUE_INDEX,
+		// not the _PKEY variant — the PKEY is 2670 =
+		// pg_conversion_oid_index, seeded by Step 3ai). `conname` is a
+		// `name` type column whose btree opclass uses C collation
+		// (C_COLLATION_OID=950) — same convention as
+		// pg_namespace_nspname_index (2684) and
+		// pg_class_relname_nsp_index (2663). Closes the last
+		// pg_conversion companion index per pg_conversion.h:63-65;
+		// companion to 2668 (composite UNIQUE non-PKEY, Step 3ah) and
+		// 2670 (UNIQUE PRIMARY, Step 3ai).
+		entry(2669, 2607, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false), // pg_conversion_name_nsp_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

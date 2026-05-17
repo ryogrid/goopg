@@ -4415,13 +4415,75 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3ai-pg-conversion-oid-index.md`.
-      - Next blocker (Step 3aj): after Step 3ai the next E2E re-run
-        is expected to surface OID 2669
-        (`pg_conversion_name_nsp_index`, 2-column UNIQUE on
-        `(conname name_ops, connamespace oid_ops)`) — the last
-        remaining pg_conversion companion index per
-        `pg_conversion.h:64`. Follows the same single-OID catalog-seed-
-        addition pattern.
+      - Step 3aj LANDED 2026-05-18. Closes the last pg_conversion
+        companion index per
+        `postgres/src/include/catalog/pg_conversion.h:64`:
+        `DECLARE_UNIQUE_INDEX(pg_conversion_name_nsp_index, 2669,
+        ConversionNameNspIndexId, pg_conversion, btree(conname
+        name_ops, connamespace oid_ops))` + `MAKE_SYSCACHE(CONNAMENSP,
+        …, 8)`. Pure catalog-seed addition mirroring Step 3ae
+        (`pg_collation_name_enc_nsp_index`) and Step 3ad
+        (`pg_opclass_am_name_nsp_index`) for the `name_ops` leading-key
+        + `oid_ops` trailing-key composite UNIQUE non-PKEY pattern.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(2669, 2607, []int16{2, 3}, []uint32{nameOps, oidOps},
+        []uint32{cCollation, 0}, true, false)` — UNIQUE but NOT primary
+        (the PKEY is 2670). `conname` is a `name`-typed column whose
+        `name_ops` btree opclass carries `C_COLLATION_OID = 950`;
+        `connamespace` is `oid_ops` (typeless).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2669, "pg_conversion_name_nsp_index"}`; `flattenRels`
+        derives `RelKind='i', RelNatts=2` via `pgIndexNattsByOID`,
+        satisfying `RelationInitIndexAccessInfo`'s `relnatts ==
+        indnatts` check (`relcache.c:1492`).
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain
+        `2669, // pg_conversion_name_nsp_index (Step 3aj)`. The Step-3k
+        empty-btree placeholder is sufficient because pg_conversion is
+        currently unpopulated (zero-row CONNAMENSP lookup is the
+        expected outcome).
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` (2 indexKeyAttrs rows) →
+        `bootstrapPgIndexTuples` (writes Form_pg_index row, captures
+        TID in `pgIndexTIDs[2669]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (composite-key leaves at
+        2659).
+        Regression pins:
+        `TestPgConversionNameNspIndexSeededFromInitialEntries` (asserts
+        `(IndRelid=2607, IndKey=[2 3], IsUnique=true, IsPrimary=false,
+        IndCollation=[950, 0])`) and
+        `TestNailedLocalRelsContainsPgConversionNameNspIndex` (asserts
+        `RelName="pg_conversion_name_nsp_index", RelKind='i',
+        RelNatts=2`) in
+        `internal/initdb/pg_conversion_name_nsp_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds
+        `2669: {2, 3}` (strict count guard auto-rejects future
+        additions without map updates);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2669.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgConversionNameNspIndex|TestNailedLocalRelsContainsPgConversionNameNspIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestPgConversionDefaultIndex|TestPgConversionOidIndex|TestNailedLocalRelsContainsPgConversion'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ai
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3aj-pg-conversion-name-nsp-index.md`.
+      - Next blocker (Step 3ak): with the pg_conversion family
+        (2607 + 2668/2669/2670) now complete, the next E2E re-run is
+        expected to surface a different `pg_*_index` OID flagged by
+        `RelationCacheInitializePhase3`'s nailed-index walk. Same
+        single-OID catalog-seed-addition pattern applies.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4473,7 +4535,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `docs/design/0106-0010-step3ah-pg-conversion-default-index.md`,
         `internal/testutil/replcluster/replcluster.go`,
         `internal/initdb/pg_conversion_oid_index_test.go`,
-        `docs/design/0106-0010-step3ai-pg-conversion-oid-index.md`
+        `docs/design/0106-0010-step3ai-pg-conversion-oid-index.md`,
+        `internal/initdb/pg_conversion_name_nsp_index_test.go`,
+        `docs/design/0106-0010-step3aj-pg-conversion-name-nsp-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
