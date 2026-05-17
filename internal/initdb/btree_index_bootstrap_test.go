@@ -386,49 +386,87 @@ func TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree(t *testing.T) 
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if len(raw) != 2*storage.BlockSize {
-			t.Errorf("%s: len=%d, want %d (2 blocks)", path, len(raw), 2*storage.BlockSize)
+		if len(raw)%storage.BlockSize != 0 || len(raw) < 2*storage.BlockSize {
+			t.Errorf("%s: len=%d, want positive multiple of BlockSize ≥ 2 blocks", path, len(raw))
 			continue
 		}
 		base := storage.SizeOfPageHeaderData
-		if got := binary.LittleEndian.Uint32(raw[base+8 : base+12]); got != 1 {
-			t.Errorf("%s: btm_root=%d, want 1", path, got)
-		}
-		leaf := raw[storage.BlockSize : 2*storage.BlockSize]
-		h, err := storage.Header(storage.Page(leaf))
-		if err != nil {
-			t.Fatalf("%s: leaf header: %v", path, err)
-		}
-		nItems := (int(h.Lower()) - storage.SizeOfPageHeaderData) / 4
-		if nItems != len(wantKeys) {
-			t.Errorf("%s: leaf items=%d, want %d", path, nItems, len(wantKeys))
+		rootBlock := binary.LittleEndian.Uint32(raw[base+8 : base+12])
+		// After M0106-0010 step 3aw, pg_extension's 8 new pg_attribute rows push
+		// past the 407-tuple single-leaf cap so this file is a multi-leaf
+		// bulk-load: metapage at block 0, leaves at blocks 1..rootBlock-1, root
+		// at rootBlock. For single-leaf inputs (≤407 tuples) the assertion
+		// degenerates to rootBlock==1, one leaf, no P_HIKEY.
+		nBlocks := uint32(len(raw) / storage.BlockSize)
+		if rootBlock < 1 || rootBlock >= nBlocks {
+			t.Errorf("%s: btm_root=%d outside [1, %d)", path, rootBlock, nBlocks)
 			continue
 		}
-		for i := 0; i < nItems; i++ {
-			raw32 := binary.LittleEndian.Uint32(leaf[storage.SizeOfPageHeaderData+i*4 : storage.SizeOfPageHeaderData+i*4+4])
-			off := raw32 & 0x7FFF
-			length := (raw32 >> 17) & 0x7FFF
-			if length != 16 {
-				t.Errorf("%s: item %d length=%d, want 16", path, i, length)
-				continue
+		var leafBlocks []uint32
+		if rootBlock == 1 {
+			leafBlocks = []uint32{1}
+		} else {
+			for b := uint32(1); b < rootBlock; b++ {
+				leafBlocks = append(leafBlocks, b)
 			}
-			// BlockIdData = (bi_hi[2], bi_lo[2]) in struct order.
-			gotBiHi := binary.LittleEndian.Uint16(leaf[off : off+2])
-			gotBiLo := binary.LittleEndian.Uint16(leaf[off+2 : off+4])
-			gotBlock := (uint32(gotBiHi) << 16) | uint32(gotBiLo)
-			gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
-			gotAttRelID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
-			gotAttNum := int16(binary.LittleEndian.Uint16(leaf[off+12 : off+14]))
-			want := wantKeys[i]
-			if gotAttRelID != want.AttRelID || gotAttNum != want.AttNum {
+		}
+		gotItems := make([]struct {
+			Block uint32
+			Off   uint16
+			Rel   uint32
+			Num   int16
+		}, 0, len(wantKeys))
+		for li, lb := range leafBlocks {
+			leaf := raw[lb*uint32(storage.BlockSize) : (lb+1)*uint32(storage.BlockSize)]
+			h, err := storage.Header(storage.Page(leaf))
+			if err != nil {
+				t.Fatalf("%s: leaf %d header: %v", path, lb, err)
+			}
+			nItems := (int(h.Lower()) - storage.SizeOfPageHeaderData) / 4
+			// Non-rightmost leaves carry P_HIKEY at item slot 1 (offset 0
+			// in line-pointer array). Skip it when collecting data items.
+			isRightmost := li == len(leafBlocks)-1
+			start := 0
+			if !isRightmost && rootBlock != 1 {
+				start = 1
+			}
+			for i := start; i < nItems; i++ {
+				raw32 := binary.LittleEndian.Uint32(leaf[storage.SizeOfPageHeaderData+i*4 : storage.SizeOfPageHeaderData+i*4+4])
+				off := raw32 & 0x7FFF
+				length := (raw32 >> 17) & 0x7FFF
+				if length != 16 {
+					t.Errorf("%s: leaf %d item %d length=%d, want 16", path, lb, i, length)
+					continue
+				}
+				gotBiHi := binary.LittleEndian.Uint16(leaf[off : off+2])
+				gotBiLo := binary.LittleEndian.Uint16(leaf[off+2 : off+4])
+				gotBlock := (uint32(gotBiHi) << 16) | uint32(gotBiLo)
+				gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
+				gotRel := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
+				gotNum := int16(binary.LittleEndian.Uint16(leaf[off+12 : off+14]))
+				gotItems = append(gotItems, struct {
+					Block uint32
+					Off   uint16
+					Rel   uint32
+					Num   int16
+				}{gotBlock, gotOff, gotRel, gotNum})
+			}
+		}
+		if len(gotItems) != len(wantKeys) {
+			t.Errorf("%s: total leaf data items=%d, want %d", path, len(gotItems), len(wantKeys))
+			continue
+		}
+		for i, want := range wantKeys {
+			g := gotItems[i]
+			if g.Rel != want.AttRelID || g.Num != want.AttNum {
 				t.Errorf("%s: item %d key=(%d,%d), want (%d,%d)",
-					path, i, gotAttRelID, gotAttNum, want.AttRelID, want.AttNum)
+					path, i, g.Rel, g.Num, want.AttRelID, want.AttNum)
 				continue
 			}
 			wantTID := tids[pgAttrTIDKey{AttRelID: want.AttRelID, AttNum: want.AttNum}]
-			if gotBlock != wantTID.Block || gotOff != wantTID.Offset {
+			if g.Block != wantTID.Block || g.Off != wantTID.Offset {
 				t.Errorf("%s: (%d,%d) TID=(%d,%d), want (%d,%d)",
-					path, want.AttRelID, want.AttNum, gotBlock, gotOff, wantTID.Block, wantTID.Offset)
+					path, want.AttRelID, want.AttNum, g.Block, g.Off, wantTID.Block, wantTID.Offset)
 			}
 		}
 	}

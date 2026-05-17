@@ -5104,7 +5104,80 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         landed, the pg_extension seed (Step 3aw — original Step 3au
         intent renumbered) is a pure catalog-seed change with no
         further btree work.
-        Design: `docs/design/0106-0010-step3av-multi-leaf-btree-bulk-load.md`.
+      - Step 3aw LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3079` PG-standby boot blocker
+        that surfaced after Step 3at completed the pg_event_trigger
+        index pair. OID 3079 is `pg_extension` per
+        `postgres/src/include/catalog/pg_extension_d.h:23`
+        (`#define ExtensionRelationId 3079`). Pure catalog-seed change
+        mirroring nailed-rel pattern of Steps 3w/3aa/3ag/3ak/3an/3ar;
+        enabled by Step 3av's multi-leaf bulk-load refactor absorbing
+        the 407-tuple single-leaf-cap crossover triggered by pg_extension's
+        8 new pg_attribute rows. No encoder, builder, or `Init` flow
+        change.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgExtensionAttrs()` returning the 8-column PG18 schema sourced
+        verbatim from `pg_extension.h`: oid (26/4 NOT NULL), extname
+        (19 name/64 NOT NULL), extowner (26/4 NOT NULL), extnamespace
+        (26/4 NOT NULL), extrelocatable (16 bool/1 NOT NULL),
+        extversion (25 text/-1 NOT NULL via BKI_FORCE_NOT_NULL),
+        extconfig (1028 oid[]/−1 nullable), extcondition (1009 text[]/−1
+        nullable). The header comment at pg_extension.h:39 documents the
+        nullability split: "extversion may never be null, but the others
+        can be".
+        (b) `nailedLocalRels` gains
+        `{3079, "pg_extension", 83, 'r', 8, false, pgExtensionAttrs()}`
+        immediately after the Step 3ar pg_event_trigger entry.
+        `RelType=83` is safe — pg_extension is not formrdesc'd (no
+        `ExtensionRelation_Rowtype_Id` constant in PG18 headers), so
+        Step 3v's `relation->rd_att->tdtypeid == relp->reltype` Phase-3
+        assertion does not fire.
+        (c) `bootstrapMappedLocalCatalogHeaps` OID list and `localRelMap`
+        both gain 3079 so PG's mdopen finds an InitPage-stamped 8 KiB
+        heap at `base/{1,5}/3079` and the relfilenode mapper resolves
+        OID 3079 to its own backing file.
+        Multi-leaf cap crossover: with the 8 new pg_attribute rows
+        added, the total `attnum>0` count for the populated
+        `pg_attribute_relid_attnum_index` btree (OID 2659) crosses the
+        407-tuple single-leaf threshold. Runtime confirms Step 3av's
+        slow path activates and produces a 4-block file (metapage +
+        2 leaves + internal root). Existing pin
+        `TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree`
+        rewritten to walk the metapage's root pointer and iterate each
+        leaf block (skipping P_HIKEY at slot 1 on non-rightmost leaves),
+        preserving the end-to-end TID round-trip guarantee across the
+        fast/slow path crossover.
+        Companion indexes 3080 (`pg_extension_oid_index`, UNIQUE PRIMARY
+        on `oid_ops`, backs MAKE_SYSCACHE(EXTENSIONOID, …)) and 3081
+        (`pg_extension_name_index`, UNIQUE non-PKEY on `extname
+        name_ops`, backs MAKE_SYSCACHE(EXTENSIONNAME, …)) deferred to
+        Step 3ax/3ay — empty-btree placeholders already exist from the
+        Step 3k seed sweep.
+        Regression pins: new file
+        `internal/initdb/pg_extension_nailed_test.go` with
+        `TestNailedLocalRelsContainsPgExtension` (full per-column
+        `(Name, TypeOID, Num, Len, NotNull)` audit) and
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgExtension`
+        (asserts `base/{1,5}/3079` exists with InitPage-stamped 8 KiB
+        content). Existing
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 3079.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgExtension|TestBootstrapMappedLocalCatalogHeapsIncludesPgExtension|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree|TestPgBuildBtreeBulkLoad|TestNailedLocalRelsContainsPgEventTrigger|TestNailedLocalRelsContainsPgEnum|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3av
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3aw-pg-extension-nailed-rel.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -5180,7 +5253,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_event_trigger_oid_index_test.go`,
         `docs/design/0106-0010-step3at-pg-event-trigger-oid-index.md`,
         `docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md`,
-        `docs/design/0106-0010-step3av-multi-leaf-btree-bulk-load.md`
+        `docs/design/0106-0010-step3av-multi-leaf-btree-bulk-load.md`,
+        `internal/initdb/pg_extension_nailed_test.go`,
+        `docs/design/0106-0010-step3aw-pg-extension-nailed-rel.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

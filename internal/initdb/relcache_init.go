@@ -176,6 +176,20 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// EventTriggerRelationId == 3466). 7 columns; evttags is in the
 	// CATALOG_VARLEN block so it is nullable.
 	{3466, "pg_event_trigger", 83, 'r', 7, false, pgEventTriggerAttrs()},
+	// M0106-0010 step 3aw: pg_extension is opened during PG-standby boot
+	// once Step 3at cleared the pg_event_trigger family. Without a pg_class
+	// row, `RelationBuildDesc(3079) → ScanPgRelation(3079)` returns NULL and
+	// the backend FATALs with `could not open relation with OID 3079`.
+	// RelType=83 is safe because pg_extension is not formrdesc'd (no
+	// `ExtensionRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_extension.h` (PG18,
+	// ExtensionRelationId == 3079). 8 columns; the trailing three
+	// CATALOG_VARLEN columns (extversion text BKI_FORCE_NOT_NULL,
+	// extconfig oid[], extcondition text[]) are stored as plain text in
+	// the nailedAttr schema same as pg_event_trigger's evttags
+	// convention — the heap is empty at bootstrap time so the encoder
+	// is never exercised.
+	{3079, "pg_extension", 83, 'r', 8, false, pgExtensionAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1183,6 +1197,29 @@ func pgEventTriggerAttrs() []nailedAttr {
 		{Name: "evtfoid", TypeOID: 26, Num: 5, Len: 4, NotNull: true},     // oid → pg_proc
 		{Name: "evtenabled", TypeOID: 18, Num: 6, Len: 1, NotNull: true},  // char
 		{Name: "evttags", TypeOID: 1009, Num: 7, Len: -1, NotNull: false}, // text[] (nullable)
+	}
+}
+
+// pgExtensionAttrs defines the 8-column PG18 pg_extension schema. PG
+// `RelationBuildDesc(3079) → ScanPgRelation(3079)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row
+// gets seeded and PG FATALs with `could not open relation with OID
+// 3079`. Sourced verbatim from `postgres/src/include/catalog/pg_extension.h`
+// and `pg_extension_d.h` (Anum_pg_extension_* 1–8). M0106-0010 step 3aw.
+// The first five columns are fixed-width NOT NULL; extversion is text
+// (TypeOID 25) and BKI_FORCE_NOT_NULL; extconfig is oid[] (TypeOID 1028)
+// and extcondition is text[] (TypeOID 1009), both nullable. The heap is
+// currently empty (no extensions are bootstrapped at initdb time).
+func pgExtensionAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},             // oid
+		{Name: "extname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},        // name
+		{Name: "extowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},        // oid → pg_authid
+		{Name: "extnamespace", TypeOID: 26, Num: 4, Len: 4, NotNull: true},    // oid → pg_namespace
+		{Name: "extrelocatable", TypeOID: 16, Num: 5, Len: 1, NotNull: true},  // bool
+		{Name: "extversion", TypeOID: 25, Num: 6, Len: -1, NotNull: true},     // text (BKI_FORCE_NOT_NULL)
+		{Name: "extconfig", TypeOID: 1028, Num: 7, Len: -1, NotNull: false},   // oid[] (nullable)
+		{Name: "extcondition", TypeOID: 1009, Num: 8, Len: -1, NotNull: false}, // text[] (nullable)
 	}
 }
 
