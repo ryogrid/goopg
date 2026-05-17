@@ -2576,13 +2576,51 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/executor/ ./internal/server/ ./internal/storage/
         ./internal/catalog/ ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3b-pg-opclass-bootstrap.md`.
-      - Step 3c (still open): `pg_amop` / `pg_amproc` rows for each
-        opclass's strategy/support fns.
+      - Step 3c LANDED 2026-05-17. `internal/initdb/initdb.go` gains
+        `pgAmopEntry / pgAmopColDefs / pgAmopInitialEntries /
+        pgAmopRow / bootstrapPgAmopTuples` (writes 40 default-type
+        btree strategy operator rows — 8 opclass families × 5
+        strategies — into `base/{1,5}/2602`) and parallel
+        `pgAmprocEntry / pgAmprocColDefs / pgAmprocInitialEntries /
+        pgAmprocRow / bootstrapPgAmprocTuples` (writes 8 default
+        cmp support-proc rows into `base/{1,5}/2603`), called from
+        `Init` right after `bootstrapPgOpclassTuples`. Operator
+        OIDs sourced from `pg_operator.dat` (e.g. int4 strategies
+        1..5 → 97/523/96/525/521); cmp proc OIDs from `pg_proc.dat`
+        (e.g. btint4cmp=351, btoidcmp=356, bttext_pattern_cmp=2166).
+        `internal/initdb/relcache_init.go::pgAmopAttrs` expands
+        4 → 9 columns (adds amopstrategy int2 / amoppurpose char /
+        amopopr oid / amopmethod oid / amopsortfamily oid);
+        `pgAmprocAttrs` expands 4 → 6 (adds amprocnum int2 /
+        amproc regproc). `nailedLocalRels` bumps pg_amop `relnatts`
+        4 → 9 and pg_amproc `relnatts` 4 → 6 so the init-file
+        TupleDesc agrees with the heap layout. Regression pins:
+        `TestPgAmopRowInt4LessMatchesFormPgAmop`,
+        `TestPgAmopInitialEntriesCoverPinnedOpclasses`,
+        `TestBootstrapPgAmopTuplesWritesRowsToBase1And5`,
+        `TestPgAmopAttrsMatchesPg18FormPgAmop` in
+        `internal/initdb/pg_amop_bootstrap_test.go`; matching
+        4 pins in `internal/initdb/pg_amproc_bootstrap_test.go`.
+        Verified: `go test -count=1 ./internal/initdb/`
+        (pre-existing `TestSynchronousCommitFlushesByDefault`
+        failure confirmed via baseline stash; all other initdb
+        tests including the new pg_amop/pg_amproc cases PASS) and
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3c-pg-amop-amproc-bootstrap.md`.
+      - Step 3d (still open): cross-type amop/amproc rows + fix
+        Step 3b's wrong opfamily OIDs for bpchar_pattern_ops
+        (should be 2097), char_ops (synthetic family needed),
+        oidvector_ops (synthetic family needed); then add amop /
+        amproc rows for those four opclasses.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,
         `internal/initdb/pg_proc_bootstrap_test.go`,
-        `internal/initdb/pg_opclass_bootstrap_test.go`
+        `internal/initdb/pg_opclass_bootstrap_test.go`,
+        `internal/initdb/pg_amop_bootstrap_test.go`,
+        `internal/initdb/pg_amproc_bootstrap_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

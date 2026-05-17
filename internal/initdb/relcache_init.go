@@ -97,7 +97,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{1255, "pg_proc", 81, 'r', 30, false, pgProcAttrs()},
 	{2610, "pg_index", 75, 'r', 4, false, pgIndexAttrs()},
 	{2616, "pg_opclass", 83, 'r', 9, false, pgOpclassAttrs()},
-	{2603, "pg_amproc", 83, 'r', 4, false, pgAmprocAttrs()},
+	{2603, "pg_amproc", 83, 'r', 6, false, pgAmprocAttrs()},
 	{2618, "pg_rewrite", 83, 'r', 7, false, pgRewriteAttrs()},
 	{2620, "pg_trigger", 83, 'r', 8, false, pgTriggerAttrs()},
 	{2615, "pg_namespace", 83, 'r', 5, false, pgNamespaceAttrs()},
@@ -108,7 +108,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{3456, "pg_collation", 83, 'r', 8, false, pgCollationAttrs()},
 	{2611, "pg_inherits", 83, 'r', 3, false, pgInheritsAttrs()},
 	{2612, "pg_language", 83, 'r', 7, false, pgLanguageAttrs()},
-	{2602, "pg_amop", 83, 'r', 4, false, pgAmopAttrs()},
+	{2602, "pg_amop", 83, 'r', 9, false, pgAmopAttrs()},
 	{2609, "pg_description", 83, 'r', 5, false, pgDescriptionAttrs()},
 	{2608, "pg_depend", 83, 'r', 8, false, pgDependAttrs()},
 }, []idxSpec{
@@ -610,11 +610,17 @@ func pgOpclassAttrs() []nailedAttr {
 }
 
 func pgAmprocAttrs() []nailedAttr {
+	// M0106-0010 step 3c: PG18 FormData_pg_amproc has 6 columns.
+	// Heap-tuple seed in initdb writes all 6; the init file's
+	// TupleDesc must agree so heap_deformtuple can read amprocnum
+	// (attnum 5) and amproc (regproc, attnum 6).
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "amprocfamily", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "amproclefttype", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "amprocrighttype", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
+		{Name: "amprocnum", TypeOID: 21, Num: 5, Len: 2, NotNull: true},
+		{Name: "amproc", TypeOID: 24, Num: 6, Len: 4, NotNull: true},
 	}
 }
 
@@ -679,11 +685,20 @@ func pgInheritsAttrs() []nailedAttr {
 }
 
 func pgAmopAttrs() []nailedAttr {
+	// M0106-0010 step 3c: PG18 FormData_pg_amop has 9 columns.
+	// Heap-tuple seed in initdb writes all 9; the init file's
+	// TupleDesc must agree so heap_deformtuple can read every
+	// attr (amopopr at attnum 7 in particular).
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "amopfamily", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "amoplefttype", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "amoprighttype", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
+		{Name: "amopstrategy", TypeOID: 21, Num: 5, Len: 2, NotNull: true},
+		{Name: "amoppurpose", TypeOID: 18, Num: 6, Len: 1, NotNull: true},
+		{Name: "amopopr", TypeOID: 26, Num: 7, Len: 4, NotNull: true},
+		{Name: "amopmethod", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
+		{Name: "amopsortfamily", TypeOID: 26, Num: 9, Len: 4, NotNull: true},
 	}
 }
 

@@ -219,6 +219,16 @@ func Init(opts Options) error {
 	if err := bootstrapPgOpclassTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_opclass tuples: %w", err)
 	}
+	// M0106-0010 step 3c: write pg_amop strategy operator rows
+	// (queried at planning time via AMOPSTRATEGY/AMOPOPID) and
+	// pg_amproc support function rows (load-bearing — scanned by
+	// LookupOpclassInfo during RelationInitIndexAccessInfo).
+	if err := bootstrapPgAmopTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_amop tuples: %w", err)
+	}
+	if err := bootstrapPgAmprocTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_amproc tuples: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -960,6 +970,234 @@ func bootstrapPgOpclassTuples(dataDir string) error {
 		rows = append(rows, pgOpclassRow(e))
 	}
 	return writeMultiPageHeapRows(dataDir, "2616", cols, rows)
+}
+
+
+// pgAmopEntry mirrors one row of PG18's pg_amop.dat — see
+// `postgres/src/include/catalog/pg_amop.dat` and the
+// `FormData_pg_amop` struct in `pg_amop.h`. goopg only seeds
+// the default (lefttype = righttype = opcintype) strategy
+// operators for the btree opclasses pinned in
+// pgOpclassInitialEntries; cross-type entries are out of scope.
+type pgAmopEntry struct {
+	OID         uint32 // amop OID
+	Family      uint32 // amopfamily — pg_opfamily OID
+	LeftType    uint32 // amoplefttype — pg_type OID
+	RightType   uint32 // amoprighttype — pg_type OID
+	Strategy    int16  // amopstrategy — 1..5 for btree
+	Purpose     byte   // amoppurpose — 's' (search) or 'o' (order)
+	Operator    uint32 // amopopr — pg_operator OID
+	Method      uint32 // amopmethod — pg_am OID (403 = btree)
+	SortFamily  uint32 // amopsortfamily — 0 for search ops
+}
+
+// pgAmopColDefs returns the PG18 9-column FormData_pg_amop shape.
+// Order and types must match `pg_amop.h` exactly so PG's GETSTRUCT
+// cast yields a valid Form_pg_amop.
+func pgAmopColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},            // 1
+		{Name: "amopfamily", Type: catalog.Type{Name: "oid"}},     // 2
+		{Name: "amoplefttype", Type: catalog.Type{Name: "oid"}},   // 3
+		{Name: "amoprighttype", Type: catalog.Type{Name: "oid"}},  // 4
+		{Name: "amopstrategy", Type: catalog.Type{Name: "int2"}},  // 5
+		{Name: "amoppurpose", Type: catalog.Type{Name: "char"}},   // 6
+		{Name: "amopopr", Type: catalog.Type{Name: "oid"}},        // 7
+		{Name: "amopmethod", Type: catalog.Type{Name: "oid"}},     // 8
+		{Name: "amopsortfamily", Type: catalog.Type{Name: "oid"}}, // 9
+	}
+}
+
+// pgAmopInitialEntries returns the canonical btree strategy
+// operator rows for each pinned default opclass. OIDs are taken
+// from `postgres/src/include/catalog/pg_operator.dat` (canonical
+// PG18 builtins). For each (family, lefttype=righttype) key we
+// emit five rows — strategy 1..5 → <, <=, =, >=, >.
+//
+// The amop OIDs are synthetic (below FirstGenbkiObjectId 10000)
+// — pg_amop.dat does not pin amop row OIDs upstream either; the
+// OID column merely identifies the row in pg_amop_oid_index.
+func pgAmopInitialEntries() []pgAmopEntry {
+	const (
+		amBtree         uint32 = 403
+		famInteger      uint32 = 1976
+		famOID          uint32 = 1989
+		famText         uint32 = 1994
+		famTextPattern  uint32 = 2095
+		famBool         uint32 = 424
+		purposeSearch   byte   = 's'
+	)
+	// Synthetic OIDs for the amop rows themselves. PG normally
+	// assigns these at initdb time; we pin contiguous ranges so
+	// the pg_amop_oid_index can later be heap-rebuilt.
+	const baseOID uint32 = 7000
+	out := make([]pgAmopEntry, 0, 40)
+	add := func(family, lefttype uint32, ops [5]uint32) {
+		for i := 0; i < 5; i++ {
+			out = append(out, pgAmopEntry{
+				OID:        baseOID + uint32(len(out)),
+				Family:     family,
+				LeftType:   lefttype,
+				RightType:  lefttype,
+				Strategy:   int16(i + 1),
+				Purpose:    purposeSearch,
+				Operator:   ops[i],
+				Method:     amBtree,
+				SortFamily: 0,
+			})
+		}
+	}
+	// int4 — pg_operator.dat 97 <, 523 <=, 96 =, 525 >=, 521 >.
+	add(famInteger, 23, [5]uint32{97, 523, 96, 525, 521})
+	// int2 — 95 <, 522 <=, 94 =, 524 >=, 520 >.
+	add(famInteger, 21, [5]uint32{95, 522, 94, 524, 520})
+	// int8 — 412 <, 414 <=, 410 =, 415 >=, 413 >.
+	add(famInteger, 20, [5]uint32{412, 414, 410, 415, 413})
+	// oid  — 609 <, 611 <=, 607 =, 612 >=, 610 >.
+	add(famOID, 26, [5]uint32{609, 611, 607, 612, 610})
+	// text — 664 <, 665 <=, 98 =, 667 >=, 666 >.
+	add(famText, 25, [5]uint32{664, 665, 98, 667, 666})
+	// name — 660 <, 661 <=, 93 =, 663 >=, 662 >.
+	add(famText, 19, [5]uint32{660, 661, 93, 663, 662})
+	// text pattern — 2314 ~<~, 2315 ~<=~, 98 =, 2317 ~>=~, 2318 ~>~.
+	add(famTextPattern, 25, [5]uint32{2314, 2315, 98, 2317, 2318})
+	// bool — 58 <, 1694 <=, 91 =, 1695 >=, 59 >.
+	add(famBool, 16, [5]uint32{58, 1694, 91, 1695, 59})
+	return out
+}
+
+// pgAmopRow encodes one pg_amop row. Field order mirrors
+// FormData_pg_amop so PG's GETSTRUCT cast is byte-for-byte valid.
+//
+// PG-native alignment puts a 1-byte pad after amoppurpose (offset
+// 19) before amopopr (4-byte aligned, offset 20). EncodeRowPG
+// inserts the pad automatically based on each column's typalign.
+func pgAmopRow(e pgAmopEntry) executor.Row {
+	return executor.Row{
+		executor.NewIntDatum(int64(e.OID)),         // 1 oid
+		executor.NewIntDatum(int64(e.Family)),      // 2 amopfamily
+		executor.NewIntDatum(int64(e.LeftType)),    // 3 amoplefttype
+		executor.NewIntDatum(int64(e.RightType)),   // 4 amoprighttype
+		executor.NewIntDatum(int64(e.Strategy)),    // 5 amopstrategy (int2)
+		executor.NewStringDatum(string(e.Purpose)), // 6 amoppurpose (char)
+		executor.NewIntDatum(int64(e.Operator)),    // 7 amopopr
+		executor.NewIntDatum(int64(e.Method)),      // 8 amopmethod
+		executor.NewIntDatum(int64(e.SortFamily)),  // 9 amopsortfamily
+	}
+}
+
+// bootstrapPgAmopTuples writes the pg_amop heap to
+// base/{1,5}/2602 so PG can resolve strategy operators for the
+// pinned btree opclasses without scanning an empty page. PG only
+// touches this catalog at query-planning time (operator → strategy
+// lookups via the AMOPOPID / AMOPSTRATEGY syscaches), so the
+// rows are not load-bearing for hot-standby boot but ARE required
+// for any non-trivial SELECT against a system view.
+func bootstrapPgAmopTuples(dataDir string) error {
+	cols := pgAmopColDefs()
+	entries := pgAmopInitialEntries()
+	rows := make([]executor.Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, pgAmopRow(e))
+	}
+	return writeMultiPageHeapRows(dataDir, "2602", cols, rows)
+}
+
+// pgAmprocEntry mirrors one row of PG18's pg_amproc.dat — see
+// `postgres/src/include/catalog/pg_amproc.dat` and the
+// `FormData_pg_amproc` struct in `pg_amproc.h`. goopg only seeds
+// the default support function 1 (cmp) for each pinned btree
+// opclass; sortsupport / in_range / equalimage are out of scope.
+type pgAmprocEntry struct {
+	OID            uint32 // amproc OID
+	Family         uint32 // amprocfamily — pg_opfamily OID
+	LeftType       uint32 // amproclefttype — pg_type OID
+	RightType      uint32 // amprocrighttype — pg_type OID
+	Num            int16  // amprocnum — 1 for cmp
+	Proc           uint32 // amproc — pg_proc OID (regproc)
+}
+
+// pgAmprocColDefs returns the PG18 6-column FormData_pg_amproc
+// shape. Order and types must match `pg_amproc.h` exactly so
+// PG's GETSTRUCT cast yields a valid Form_pg_amproc.
+func pgAmprocColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},               // 1
+		{Name: "amprocfamily", Type: catalog.Type{Name: "oid"}},      // 2
+		{Name: "amproclefttype", Type: catalog.Type{Name: "oid"}},    // 3
+		{Name: "amprocrighttype", Type: catalog.Type{Name: "oid"}},   // 4
+		{Name: "amprocnum", Type: catalog.Type{Name: "int2"}},        // 5
+		{Name: "amproc", Type: catalog.Type{Name: "regproc"}},        // 6
+	}
+}
+
+// pgAmprocInitialEntries returns the canonical btree comparison
+// support function for each pinned default opclass. Proc OIDs are
+// from `postgres/src/include/catalog/pg_proc.dat`.
+//
+// PG's RelationInitIndexAccessInfo → LookupOpclassInfo scans
+// pg_amproc for (opcfamily, opcintype, opcintype) and stores the
+// support proc OIDs into the relcache opclass entry. Without
+// these rows the standby panics the first time an index dispatches
+// to its comparison function.
+func pgAmprocInitialEntries() []pgAmprocEntry {
+	const (
+		famInteger     uint32 = 1976
+		famOID         uint32 = 1989
+		famText        uint32 = 1994
+		famTextPattern uint32 = 2095
+		famBool        uint32 = 424
+	)
+	const baseOID uint32 = 7100
+	out := []pgAmprocEntry{
+		// btree integer_ops default cmp procs.
+		{0, famInteger, 23, 23, 1, 351}, // btint4cmp
+		{0, famInteger, 21, 21, 1, 350}, // btint2cmp
+		{0, famInteger, 20, 20, 1, 842}, // btint8cmp
+		// btree oid_ops default cmp.
+		{0, famOID, 26, 26, 1, 356}, // btoidcmp
+		// btree text_ops default cmp procs (text and name share family).
+		{0, famText, 25, 25, 1, 360}, // bttextcmp
+		{0, famText, 19, 19, 1, 359}, // btnamecmp
+		// btree text_pattern_ops default cmp (text_pattern_ops and
+		// varchar_pattern_ops share the same family/lefttype/righttype).
+		{0, famTextPattern, 25, 25, 1, 2166}, // bttext_pattern_cmp
+		// btree bool_ops default cmp.
+		{0, famBool, 16, 16, 1, 1693}, // btboolcmp
+	}
+	for i := range out {
+		out[i].OID = baseOID + uint32(i)
+	}
+	return out
+}
+
+// pgAmprocRow encodes one pg_amproc row. Field order mirrors
+// FormData_pg_amproc so PG's GETSTRUCT cast is byte-for-byte
+// valid. PG-native alignment puts a 2-byte pad after amprocnum
+// (offset 18) before amproc (4-byte aligned, offset 20).
+func pgAmprocRow(e pgAmprocEntry) executor.Row {
+	return executor.Row{
+		executor.NewIntDatum(int64(e.OID)),       // 1 oid
+		executor.NewIntDatum(int64(e.Family)),    // 2 amprocfamily
+		executor.NewIntDatum(int64(e.LeftType)),  // 3 amproclefttype
+		executor.NewIntDatum(int64(e.RightType)), // 4 amprocrighttype
+		executor.NewIntDatum(int64(e.Num)),       // 5 amprocnum (int2)
+		executor.NewIntDatum(int64(e.Proc)),      // 6 amproc (regproc)
+	}
+}
+
+// bootstrapPgAmprocTuples writes the pg_amproc heap to
+// base/{1,5}/2603. This is load-bearing for standby boot — PG's
+// LookupOpclassInfo unconditionally scans pg_amproc as part of
+// RelationInitIndexAccessInfo for every nailed index.
+func bootstrapPgAmprocTuples(dataDir string) error {
+	cols := pgAmprocColDefs()
+	entries := pgAmprocInitialEntries()
+	rows := make([]executor.Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, pgAmprocRow(e))
+	}
+	return writeMultiPageHeapRows(dataDir, "2603", cols, rows)
 }
 
 // pgClassColDefs returns pg_class column descriptors matching PG18's
