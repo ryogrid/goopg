@@ -96,7 +96,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{1259, "pg_class", 83, 'r', 34, false, pgClassAttrs()},
 	{1255, "pg_proc", 81, 'r', 30, false, pgProcAttrs()},
 	{2610, "pg_index", 75, 'r', 4, false, pgIndexAttrs()},
-	{2616, "pg_opclass", 83, 'r', 7, false, pgOpclassAttrs()},
+	{2616, "pg_opclass", 83, 'r', 9, false, pgOpclassAttrs()},
 	{2603, "pg_amproc", 83, 'r', 4, false, pgAmprocAttrs()},
 	{2618, "pg_rewrite", 83, 'r', 7, false, pgRewriteAttrs()},
 	{2620, "pg_trigger", 83, 'r', 8, false, pgTriggerAttrs()},
@@ -593,6 +593,9 @@ func pgIndexAttrs() []nailedAttr {
 }
 
 func pgOpclassAttrs() []nailedAttr {
+	// M0106-0010 step 3b: expanded to the full PG18 FormData_pg_opclass
+	// column set so PG's heap_deformtuple can read opcdefault / opckeytype
+	// when SearchSysCache1(CLAOID, ...) returns a row.
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "opcmethod", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
@@ -601,6 +604,8 @@ func pgOpclassAttrs() []nailedAttr {
 		{Name: "opcowner", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "opcfamily", TypeOID: 26, Num: 6, Len: 4, NotNull: true},
 		{Name: "opcintype", TypeOID: 26, Num: 7, Len: 4, NotNull: true},
+		{Name: "opcdefault", TypeOID: 16, Num: 8, Len: 1, NotNull: true},
+		{Name: "opckeytype", TypeOID: 26, Num: 9, Len: 4, NotNull: true},
 	}
 }
 

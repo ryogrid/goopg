@@ -2545,14 +2545,44 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3a-pg-proc-bootstrap.md`.
-      - Step 3b (still open): `pg_opclass` rows for the operator
-        classes pg_index columns reference (oid_ops, int4_ops, etc.).
+      - Step 3b LANDED 2026-05-17. `internal/initdb/initdb.go` gains
+        `pgOpclassEntry / pgOpclassColDefs / pgOpclassInitialEntries /
+        pgOpclassRow / bootstrapPgOpclassTuples`, called from `Init`
+        right after `bootstrapPgProcTuples`. Twelve btree opclass
+        rows land as 9-column `Form_pg_opclass` heap tuples in
+        `base/1/2616` and `base/5/2616`: the eight hardcoded OIDs
+        from `pg_opclass_d.h` (1978 int4_ops, 1979 int2_ops, 1981
+        oid_ops, 3124 int8_ops, 3126 text_ops, 4217 text_pattern_ops,
+        4218 varchar_pattern_ops, 4219 bpchar_pattern_ops) plus four
+        pinned OIDs for opclasses that PG normally assigns at initdb
+        time (1984 bool_ops, 1985 char_ops, 1986 name_ops with
+        opckeytype=2275 cstring, 1987 oidvector_ops). Each row
+        carries the canonical `opcfamily` from `pg_opfamily_d.h`
+        (1976 INTEGER_BTREE, 1989 OID_BTREE, 1994 TEXT_BTREE, 2095
+        TEXT_PATTERN_BTREE, 426 BPCHAR_BTREE, 424 BOOL_BTREE).
+        `internal/initdb/relcache_init.go::pgOpclassAttrs` expands
+        7 → 9 columns (adds `opcdefault` bool / `opckeytype` oid)
+        and `nailedLocalRels` bumps pg_opclass `relnatts` 7 → 9 so
+        the init-file TupleDesc agrees with the heap layout.
+        Regression pins: `TestPgOpclassRowOidOpsMatchesFormPgOpclass`,
+        `TestPgOpclassInitialEntriesCoverNailedIndexNeeds`,
+        `TestBootstrapPgOpclassTuplesWritesRowsToBase1And5`,
+        `TestPgOpclassAttrsMatchesPg18FormPgOpclass` in
+        `internal/initdb/pg_opclass_bootstrap_test.go`. Verified:
+        `go test -count=1 ./internal/initdb/` (pre-existing
+        `TestSynchronousCommitFlushesByDefault` failure confirmed
+        via baseline stash; all other initdb tests including the
+        new pg_opclass cases PASS); `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3b-pg-opclass-bootstrap.md`.
       - Step 3c (still open): `pg_amop` / `pg_amproc` rows for each
         opclass's strategy/support fns.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,
-        `internal/initdb/pg_proc_bootstrap_test.go`
+        `internal/initdb/pg_proc_bootstrap_test.go`,
+        `internal/initdb/pg_opclass_bootstrap_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

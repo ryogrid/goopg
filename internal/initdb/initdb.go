@@ -212,6 +212,13 @@ func Init(opts Options) error {
 	if err := bootstrapPgProcTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_proc tuples: %w", err)
 	}
+	// M0106-0010 step 3b: write pg_opclass rows so PG's
+	// RelationInitIndexAccessInfo → SearchSysCache1(CLAOID, ...)
+	// resolves every opclass referenced by a nailed index's
+	// indclass vector.
+	if err := bootstrapPgOpclassTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_opclass tuples: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -838,6 +845,121 @@ func bootstrapPgProcTuples(dataDir string) error {
 		rows = append(rows, pgProcRow(e))
 	}
 	return writeMultiPageHeapRows(dataDir, "1255", cols, rows)
+}
+
+// pgOpclassEntry mirrors one row of PG18's pg_opclass.dat — see
+// `postgres/src/include/catalog/pg_opclass.dat` and the
+// `FormData_pg_opclass` struct in `pg_opclass.h`.
+//
+// goopg only needs the btree opclasses the nailed system indexes
+// reference via `pg_index.indclass`. Future work (step 3c) extends
+// this to pg_amop / pg_amproc.
+type pgOpclassEntry struct {
+	OID       uint32 // opclass OID
+	Method    uint32 // pg_am OID — 403 for btree
+	Name      string // opcname (NameData, ≤63 bytes)
+	Namespace uint32 // opcnamespace — 11 (pg_catalog)
+	Owner     uint32 // opcowner — 10 (POSTGRES bootstrap superuser)
+	Family    uint32 // opcfamily — pg_opfamily OID
+	IntType   uint32 // opcintype — pg_type OID
+	Default   bool   // opcdefault — t/f
+	KeyType   uint32 // opckeytype — 0 unless conversion needed
+}
+
+// pgOpclassColDefs returns the PG18 9-column FormData_pg_opclass shape.
+// The order and types must match `pg_opclass.h` exactly so PG's
+// GETSTRUCT(tup) cast yields a valid Form_pg_opclass.
+func pgOpclassColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},
+		{Name: "opcmethod", Type: catalog.Type{Name: "oid"}},
+		{Name: "opcname", Type: catalog.Type{Name: "name"}},
+		{Name: "opcnamespace", Type: catalog.Type{Name: "oid"}},
+		{Name: "opcowner", Type: catalog.Type{Name: "oid"}},
+		{Name: "opcfamily", Type: catalog.Type{Name: "oid"}},
+		{Name: "opcintype", Type: catalog.Type{Name: "oid"}},
+		{Name: "opcdefault", Type: catalog.Type{Name: "bool"}},
+		{Name: "opckeytype", Type: catalog.Type{Name: "oid"}},
+	}
+}
+
+// pgOpclassInitialEntries returns the btree opclasses required for
+// the nailed system indexes goopg seeds in `nailedLocalRels` /
+// `nailedSharedRels`. OIDs match PG18's pg_opclass_d.h where
+// available; opfamily OIDs match pg_opfamily_d.h.
+//
+// Without these rows, PG's `RelationInitIndexAccessInfo` →
+// `SearchSysCache1(CLAOID, opcid)` returns NULL for every
+// `pg_index.indclass` entry and the standby PANICs the moment it
+// opens a critical index past the bthandler stage.
+func pgOpclassInitialEntries() []pgOpclassEntry {
+	const (
+		nsPGCatalog uint32 = 11
+		ownerSuper  uint32 = 10
+		amBtree     uint32 = 403
+		famInteger  uint32 = 1976 // INTEGER_BTREE_FAM_OID
+		famOID      uint32 = 1989 // OID_BTREE_FAM_OID
+		famText     uint32 = 1994 // TEXT_BTREE_FAM_OID
+		famTextPat  uint32 = 2095 // TEXT_PATTERN_BTREE_FAM_OID
+		famBpchar   uint32 = 426  // BPCHAR_BTREE_FAM_OID
+	)
+	// Synthetic OIDs for opclasses with no hardcoded OID in
+	// pg_opclass_d.h. Chosen below FirstGenbkiObjectId (10000) so
+	// they don't collide with user-assigned OIDs.
+	const (
+		nameBtreeOps     uint32 = 1986
+		charBtreeOps     uint32 = 1985
+		oidvectorBtreeOps uint32 = 1987
+		boolBtreeOps     uint32 = 1984
+	)
+	return []pgOpclassEntry{
+		// Hardcoded OIDs from pg_opclass_d.h.
+		{1978, amBtree, "int4_ops", nsPGCatalog, ownerSuper, famInteger, 23, true, 0},
+		{1979, amBtree, "int2_ops", nsPGCatalog, ownerSuper, famInteger, 21, true, 0},
+		{1981, amBtree, "oid_ops", nsPGCatalog, ownerSuper, famOID, 26, true, 0},
+		{3124, amBtree, "int8_ops", nsPGCatalog, ownerSuper, famInteger, 20, true, 0},
+		{3126, amBtree, "text_ops", nsPGCatalog, ownerSuper, famText, 25, true, 0},
+		{4217, amBtree, "text_pattern_ops", nsPGCatalog, ownerSuper, famTextPat, 25, false, 0},
+		{4218, amBtree, "varchar_pattern_ops", nsPGCatalog, ownerSuper, famTextPat, 25, false, 0},
+		{4219, amBtree, "bpchar_pattern_ops", nsPGCatalog, ownerSuper, famBpchar, 1042, false, 0},
+		// Dynamically-assigned OIDs we pin so nailed-index
+		// indclass references can point at them.
+		// name_ops keys are stored as cstring (2275) for index
+		// space — see pg_opclass.dat comment.
+		{nameBtreeOps, amBtree, "name_ops", nsPGCatalog, ownerSuper, famText, 19, true, 2275},
+		{charBtreeOps, amBtree, "char_ops", nsPGCatalog, ownerSuper, famText, 18, true, 0},
+		{oidvectorBtreeOps, amBtree, "oidvector_ops", nsPGCatalog, ownerSuper, famOID, 30, true, 0},
+		{boolBtreeOps, amBtree, "bool_ops", nsPGCatalog, ownerSuper, 424 /* BOOL_BTREE_FAM_OID */, 16, true, 0},
+	}
+}
+
+// pgOpclassRow encodes one pg_opclass row. Field order mirrors
+// FormData_pg_opclass so PG's GETSTRUCT cast is byte-for-byte valid.
+func pgOpclassRow(e pgOpclassEntry) executor.Row {
+	return executor.Row{
+		executor.NewIntDatum(int64(e.OID)),       // 1 oid
+		executor.NewIntDatum(int64(e.Method)),    // 2 opcmethod
+		executor.NewStringDatum(e.Name),          // 3 opcname (NameData)
+		executor.NewIntDatum(int64(e.Namespace)), // 4 opcnamespace
+		executor.NewIntDatum(int64(e.Owner)),     // 5 opcowner
+		executor.NewIntDatum(int64(e.Family)),    // 6 opcfamily
+		executor.NewIntDatum(int64(e.IntType)),   // 7 opcintype
+		executor.NewBoolDatum(e.Default),         // 8 opcdefault
+		executor.NewIntDatum(int64(e.KeyType)),   // 9 opckeytype
+	}
+}
+
+// bootstrapPgOpclassTuples writes the pg_opclass heap to
+// base/{1,5}/2616 so PG's CLAOID syscache hits resolve for every
+// opclass referenced by a nailed index.
+func bootstrapPgOpclassTuples(dataDir string) error {
+	cols := pgOpclassColDefs()
+	entries := pgOpclassInitialEntries()
+	rows := make([]executor.Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, pgOpclassRow(e))
+	}
+	return writeMultiPageHeapRows(dataDir, "2616", cols, rows)
 }
 
 // pgClassColDefs returns pg_class column descriptors matching PG18's
