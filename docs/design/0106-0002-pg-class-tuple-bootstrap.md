@@ -142,6 +142,47 @@ Key design decisions:
 - No new files needed — the nailed relation metadata already lives in
   `internal/initdb/relcache_init.go`.
 
+## Operational relcache / catcache Maintenance (NOT DEFERRED)
+
+Bootstrap-time pg_class tuples are necessary but NOT sufficient. Once the
+primary is running, DDL operations (CREATE TABLE, ALTER TABLE, DROP TABLE,
+CREATE INDEX, etc.) must maintain PG-compatible catalog state so that:
+
+1. **pg_class stays current**: every DDL that adds, modifies, or removes a
+   relation must insert/update/delete the corresponding pg_class heap tuple
+   using PG-native physical encoding.
+2. **catcache stays consistent**: goopg's internal catalog cache (analogue of
+   PG's catcache) must reflect the on-disk pg_class contents so internal
+   lookups and PG standby queries agree on relation metadata.
+3. **relcache init file stays fresh**: after any catalog change, goopg must
+   regenerate the relcache init file (`pg_internal.init`) so a PG standby
+   that reconnects (or a new standby bootstrapped from a later basebackup)
+   loads the correct relation descriptor set. This mirrors PG's
+   `write_relcache_init_file()` triggered by `RelationCacheInitFileRemove`.
+
+This is load-bearing for the M0105/M0106 goal of "vanilla PG standby can
+boot and serve queries from a goopg basebackup at any point in the
+primary's lifetime", not just immediately after init. **Do NOT defer this
+work** — even if it appears to expand the milestone scope, it is a
+hard requirement for correct ongoing replication. An init-time-only
+snapshot will bit-rot the moment the first DDL runs.
+
+### Specific requirements
+
+- `internal/catalog/`: extend the catalog write path so INSERT/UPDATE/DELETE
+  on `pg_class` encodes tuples in PG-native format (or writes both formats
+  atomically).
+- `internal/executor/codec.go`: `EncodeRowPG()` must support all pg_class
+  column types (already verified: oid, name, int4, float4, bool, char, int2,
+  xid, text).
+- `internal/initdb/relcache_init.go`: expose `WriteRelcacheInitFile()` as a
+  public function callable from the catalog-change path. Add an invalidation
+  trigger so the next checkpoint or graceful-shutdown event regenerates the
+  init file if the catalog was dirtied.
+- `internal/server/`: wire the init-file regeneration into the checkpointer
+  (shutdown checkpoint) or into a new background writer cycle, mirroring
+  PG's `RelationCacheInitFileRemove` + `write_relcache_init_file` pattern.
+
 ## Verification
 
 1. Unit test: `TestInitCreatesSystemCatalogRelfiles` extended to verify
@@ -150,6 +191,9 @@ Key design decisions:
    to "database system is in recovery mode" (or beyond).
 3. strace: confirm `base/5/1259` is opened O_RDONLY AND `ScanPgRelation`
    finds the tuple (no PANIC).
+4. Post-DDL test: CREATE TABLE on goopg primary, take a second basebackup,
+   start a new PG standby — verify init file still loads correctly (no
+   stale or missing entries).
 
 ## Dependencies
 

@@ -3155,7 +3155,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         Run regression suite. Mark all tasks [x].
 
 - [ ] **M0106-0008**
-      - Summary: Populate pg_class heap tuples for nailed relations.
+      - Summary: Populate pg_class heap tuples for nailed relations, and
+        maintain relcache/catcache + init file during normal operation.
       - Root cause (strace-confirmed 2026-05-17): vanilla PG's
         `load_critical_index()` calls `RelationBuildDesc()` which calls
         `ScanPgRelation()` — this reads the **actual pg_class heap table**
@@ -3163,18 +3164,20 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         The init file populates the relcache but `RelationBuildDesc` ignores
         it. So `ScanPgRelation(2662, ...)` finds zero tuples in the empty
         btree page → NULL → PANIC.
-      - Fix: during goopg init, after building the nailed relation metadata
-        (already done for the init file), encode PG-native heap tuples for
-        every nailed relation (heaps + indexes) into `base/1/1259` and
-        `base/5/1259` (and `global/1259` for shared relations' entries).
-        Each tuple must be a valid PG heap tuple with the full pg_class
-        column set (oid, relname, relnamespace, reltype, relkind, relnatts,
-        relisshared, relpersistence, relfilenode, etc.).
-      - This is load-bearing for vanilla PG compatibility: PG's
-        `load_critical_index` WILL call `ScanPgRelation` unconditionally
-        during backend startup, and we cannot change that.
-      - Design doc: `docs/design/0106-0002-pg-class-tuple-bootstrap.md`
-      - Files: `internal/initdb/initdb.go`, `internal/executor/codec.go`
+      - Bootstrap fix: during goopg init, encode PG-native heap tuples for
+        every nailed relation into `base/1/1259` and `base/5/1259`.
+      - Operational fix (NOT DEFERRED): DDL operations must maintain
+        PG-compatible pg_class tuples so the catalog stays current after
+        init. After any catalog change, goopg must regenerate the relcache
+        init file so a PG standby reconnecting (or bootstrapped from a later
+        basebackup) loads correct relation descriptors. This mirrors PG's
+        `write_relcache_init_file()` triggered by catalog invalidation.
+        Even if this expands the milestone scope, it is a hard requirement
+        for correct ongoing replication — an init-time-only snapshot will
+        bit-rot the moment the first DDL runs.
+      - Files: `internal/initdb/initdb.go` (bootstrap), `internal/catalog/`
+        (operational), `internal/initdb/relcache_init.go` (public writer),
+        `internal/server/` (checkpointer integration)
 
 ## Notes
 
