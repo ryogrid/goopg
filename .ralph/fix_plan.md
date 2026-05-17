@@ -3737,11 +3737,83 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3x-pg-aggregate-fnoid-index.md`.
-      - Next blocker (Step 3y): capture next FATAL via
-        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
-        E2E re-run. Candidates per the empty-heap inventory in
-        `bootstrapMappedLocalCatalogHeaps`: pg_attrdef=2604, pg_cast=2605,
-        pg_conversion=2607 (in nailedLocalRels), or unmapped catalogs.
+      - Step 3y LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2653` PG-standby boot blocker
+        that surfaced after Step 3x. OID 2653 is `pg_amop_fam_strat_index`
+        per `postgres/src/include/catalog/pg_amop.h:90`:
+        `DECLARE_UNIQUE_INDEX(pg_amop_fam_strat_index, 2653,
+        AccessMethodStrategyIndexId, pg_amop,
+        btree(amopfamily oid_ops, amoplefttype oid_ops,
+              amoprighttype oid_ops, amopstrategy int2_ops));
+        MAKE_SYSCACHE(AMOPSTRATEGY, pg_amop_fam_strat_index, 64)`.
+        Same pattern as Steps 3t/3x — pure catalog-seed addition with no
+        encoder/builder/Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(2653, 2602, []int16{2,3,4,5},
+        []uint32{oidOps,oidOps,oidOps,int2Ops},
+        []uint32{0,0,0,0}, true, false)`. UNIQUE but NOT primary —
+        `DECLARE_UNIQUE_INDEX` is not the `_PKEY` variant. pg_amop
+        attnums (pg_amop_d.h): 2=amopfamily, 3=amoplefttype,
+        4=amoprighttype, 5=amopstrategy.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2653, "pg_amop_fam_strat_index"}`; `flattenRels` consults
+        `pgIndexNattsByOID()` (returns 4 for OID 2653), so the nailed
+        rel carries `RelKind='i', RelNatts=4` and
+        `RelationInitIndexAccessInfo`'s `relnatts == indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain `2653, // pg_amop_fam_strat_index
+        (Step 3y)`. The 4-column composite-key encoder is not yet
+        implemented in goopg so 2653's file stays an empty Step-3k
+        placeholder — sufficient because clearing the FATAL only
+        requires PG to open the relcache entry; the empty btree
+        returning zero rows during initial standby boot is tolerated by
+        the `AMOPSTRATEGY` syscache lookup path.
+        Seed threads automatically through
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples →
+        bootstrapPgIndexTuples` (writes Form_pg_index row, captures
+        TID in `pgIndexTIDs` map) → `bootstrapPgIndexIndexrelidIndex`
+        (adds 25th leaf to populated 2-page btree at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (4 composite-key leaves
+        at file 2659).
+        Regression pins:
+        `TestPgAmopFamStratIndexSeededFromInitialEntries` (asserts
+        `(IndRelid=2602, IndKey=[2,3,4,5], IsUnique=true,
+        IsPrimary=false)`) and
+        `TestNailedLocalRelsContainsPgAmopFamStratIndex` (asserts
+        `RelName="pg_amop_fam_strat_index", RelKind='i', RelNatts=4`)
+        in `internal/initdb/pg_amop_fam_strat_index_test.go`. Existing
+        pins extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds
+        `2653: {2,3,4,5}` (strict count guard auto-rejects future
+        additions without map updates);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2653 so the populated 2679 btree must carry this
+        leaf.
+        Verified: `go test -count=1 -run
+        'TestPgAmopFamStrat|TestNailedLocalRelsContainsPgAmopFamStrat|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestNailedLocalRelsContainsPgAggregateFnoidIndex|TestPgAggregateFnoidIndex'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3x (`TestMigration*`, `TestCreate*`,
+        `TestBootstrappedPG*`, `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` advances past the
+        `could not open relation with OID 2653` FATAL to the next
+        blocker: `FATAL: could not open relation with OID 2694`
+        (Step 3z territory).
+        Design: `docs/design/0106-0010-step3y-pg-amop-fam-strat-index.md`.
+      - Next blocker (Step 3z): OID 2694. Identify catalog/index via
+        `grep -n "2694" postgres/src/include/catalog/*_d.h` and seed via
+        the established `pgIndexInitialEntries` + `nailedLocalRels` +
+        placeholder pattern.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3770,7 +3842,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_mapped_local_catalog_heap_test.go`,
         `docs/design/0106-0010-step3w-pg-aggregate-nailed-rel.md`,
         `internal/initdb/pg_aggregate_fnoid_index_test.go`,
-        `docs/design/0106-0010-step3x-pg-aggregate-fnoid-index.md`
+        `docs/design/0106-0010-step3x-pg-aggregate-fnoid-index.md`,
+        `internal/initdb/pg_amop_fam_strat_index_test.go`,
+        `docs/design/0106-0010-step3y-pg-amop-fam-strat-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

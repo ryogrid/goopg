@@ -155,6 +155,13 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// nailed pg_class row's relnatts matches the pg_index row's
 	// indnatts == 1.
 	{2650, "pg_aggregate_fnoid_index"},
+	// M0106-0010 Step 3y: pg_amop_fam_strat_index. PG18
+	// `postgres/src/include/catalog/pg_amop.h:90` declares
+	// `AccessMethodStrategyIndexId = 2653` as a 4-column composite
+	// btree(amopfamily, amoplefttype, amoprighttype, amopstrategy).
+	// Without this entry RelationIdGetRelation(2653) FATALs because
+	// no pg_class row gets seeded.
+	{2653, "pg_amop_fam_strat_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

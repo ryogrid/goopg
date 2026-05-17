@@ -678,6 +678,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	btreePage := makeBtreeRootPage()
 	for _, oid := range []uint32{
 		2650, // pg_aggregate_fnoid_index (Step 3x)
+		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -761,6 +762,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	for _, oid := range []uint32{
 		// Local critical indexes
 		2650, // pg_aggregate_fnoid_index (Step 3x)
+		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -777,6 +779,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2671, 2672, 2676, 2677, 2695, 3593,
 		// Also copy all local critical indexes to global/
 		2650, // pg_aggregate_fnoid_index (Step 3x)
+		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
@@ -1687,6 +1690,16 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// amoppurpose char_ops, amopfamily oid_ops). amoppurpose is
 		// pg_amop attnum 6 (char), amopopr is attnum 7, amopfamily attnum 2.
 		entry(2654, 2602, []int16{7, 6, 2}, []uint32{oidOps, charOps, oidOps}, []uint32{0, 0, 0}, true, false),         // pg_amop_opr_fam_index
+		// M0106-0010 Step 3y: pg_amop_fam_strat_index (OID 2653).
+		// postgres/src/include/catalog/pg_amop.h:90 —
+		//   DECLARE_UNIQUE_INDEX(pg_amop_fam_strat_index, 2653,
+		//     AccessMethodStrategyIndexId, pg_amop,
+		//     btree(amopfamily oid_ops, amoplefttype oid_ops,
+		//           amoprighttype oid_ops, amopstrategy int2_ops));
+		//   MAKE_SYSCACHE(AMOPSTRATEGY, pg_amop_fam_strat_index, 64);
+		// pg_amop attnums (pg_amop_d.h): 2=amopfamily, 3=amoplefttype,
+		// 4=amoprighttype, 5=amopstrategy. UNIQUE but NOT primary.
+		entry(2653, 2602, []int16{2, 3, 4, 5}, []uint32{oidOps, oidOps, oidOps, int2Ops}, []uint32{0, 0, 0, 0}, true, false), // pg_amop_fam_strat_index
 		// M0106-0010 Step 3x: pg_aggregate_fnoid_index (OID 2650).
 		// postgres/src/include/catalog/pg_aggregate.h:113 —
 		//   DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650,

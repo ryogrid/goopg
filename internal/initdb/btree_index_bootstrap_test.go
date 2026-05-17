@@ -466,6 +466,7 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 	// critical-index pass FATALs immediately.
 	mustHave := []uint32{2671, 2672, 2676, 2677, 2695, 3593,
 		2650, // pg_aggregate_fnoid_index ← Step 3x
+		2653, // pg_amop_fam_strat_index ← Step 3y
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680,
 		2684, 2685, // pg_namespace_nspname_index, pg_namespace_oid_index ← Step 3t
 		2687, 2688, 2690, 2691, 2693, 2701, 2703, 2704}
