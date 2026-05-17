@@ -475,6 +475,7 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 		3164, // pg_collation_name_enc_nsp_index ← Step 3ae
 		3085, // pg_collation_oid_index ← Step 3af
 		2668, // pg_conversion_default_index ← Step 3ah
+		2670, // pg_conversion_oid_index ← Step 3ai
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680,
 		2684, 2685, // pg_namespace_nspname_index, pg_namespace_oid_index ← Step 3t
 		2687, 2688, 2690, 2691, 2693, 2701, 2703, 2704}

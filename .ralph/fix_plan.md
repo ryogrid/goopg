@@ -4290,14 +4290,138 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3ag-pg-conversion-nailed-rel.md`.
-      - Next blocker (Step 3ah): after Step 3ag the next E2E re-run
-        is expected to surface either one of the pg_conversion
-        companion indexes (2668/2669/2670) or a different nailed-rel
-        FATAL at a later OID (e.g. `pg_class_tblspc_relfilenode_index`
-        = 3455 if pg_class index lookups attempt it during early
-        boot, or pg_database / pg_foreign_* / pg_publication
-        catalogs). Whichever surfaces follows the same single-OID
-        catalog-seed-addition pattern.
+      - Step 3ah LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2668` PG-standby boot
+        blocker that surfaced after Step 3ag. Confirmed via E2E
+        re-run: `FATAL: could not open relation with OID 2668`
+        repeated on every backend the standby's postmaster forked.
+        Per `postgres/src/include/catalog/pg_conversion.h:63`
+        (`DECLARE_UNIQUE_INDEX(pg_conversion_default_index, 2668,
+        ConversionDefaultIndexId, pg_conversion, btree(connamespace
+        oid_ops, conforencoding int4_ops, contoencoding int4_ops,
+        oid oid_ops))` + `MAKE_SYSCACHE(CONDEFAULT, …, 8)`), OID
+        2668 is the `CONDEFAULT` syscache backing index on
+        pg_conversion: 4-column composite UNIQUE (not PRIMARY — PKEY
+        is 2670). Pure catalog-seed addition with no encoder, builder,
+        or Init flow change.
+        (a) `pgIndexInitialEntries` gains
+        `entry(2668, 2607, []int16{3, 5, 6, 1},
+        []uint32{oidOps, int4Ops, int4Ops, oidOps},
+        []uint32{0, 0, 0, 0}, true, false)` — composite key matches
+        the column order declared by `DECLARE_UNIQUE_INDEX`; none of
+        the four keys carry a collation (oid_ops/int4_ops are
+        typeless). Same pattern as `pg_amop_fam_strat_index` (2754,
+        Step 3y) and `pg_collation_name_enc_nsp_index` (3164, Step
+        3ae) — minus the name_ops cCollation slot.
+        (b) `nailedLocalRels` idxSpec gains
+        `{2668, "pg_conversion_default_index"}`. `flattenRels` →
+        `pgIndexNattsByOID` returns 4 so the nailed rel carries
+        `RelKind='i', RelNatts=4`, satisfying the
+        `RelationInitIndexAccessInfo` relnatts/indnatts check
+        (relcache.c:1492).
+        (c) The three placeholder OID lists in
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `2668`. The Step-3k empty btree placeholder
+        (`btm_root = P_NONE`) is sufficient because pg_conversion is
+        currently unpopulated.
+        (d) Test-infra prerequisite:
+        `internal/testutil/replcluster/replcluster.go::cloneDataDir`
+        gains `os.Remove(target)` before `OpenFile`, since
+        `bootstrapRelcacheInitFiles` chmods `pg_internal.init` to
+        0o400 and `OpenFile(...O_TRUNC|O_WRONLY)` cannot reopen a
+        read-only file. Without this fix `TestE2E_PhysicalReplication`
+        (goopg→goopg) blocks on "permission denied" and the failover
+        harness never reaches the 2668 FATAL. Same pattern already in
+        `copyInitFiles` (e2e_failover_goopg_to_pg_test.go).
+        Regression pins:
+        `TestPgConversionDefaultIndexSeededFromInitialEntries` and
+        `TestNailedLocalRelsContainsPgConversionDefaultIndex` in
+        `internal/initdb/pg_conversion_default_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map gains
+        `2668: {3, 5, 6, 1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        gains 2668.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgConversionDefaultIndex|TestNailedLocalRelsContainsPgConversion|TestNailedLocalRelsContainsPgCast|TestBootstrapPgIndexIndexrelidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18'
+        ./internal/initdb/` PASS; `go test -count=1
+        ./internal/initdb/` — same 14 pre-existing baseline failures
+        as Step 3ag (no new regressions); `go test -count=1
+        -run '^TestE2E_PhysicalReplication$' ./internal/testport/`
+        PASS (cloneDataDir fix unblocks goopg→goopg replication);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3ah-pg-conversion-default-index.md`.
+      - Step 3ai LANDED 2026-05-18. Anticipated next-blocker fix
+        (`could not open relation with OID 2670` —
+        `pg_conversion_oid_index`) per
+        `postgres/src/include/catalog/pg_conversion.h:65`:
+        `DECLARE_UNIQUE_INDEX_PKEY(pg_conversion_oid_index, 2670,
+        ConversionOidIndexId, pg_conversion, btree(oid oid_ops))`.
+        Pure catalog-seed addition mirroring the single-column oid PKEY
+        pattern of Steps 3ab (pg_cast_oid_index), 3af
+        (pg_collation_oid_index), and 3l (pg_opclass_oid_index); no
+        encoder, builder, or Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(2670, 2607, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` — UNIQUE PRIMARY (single oid_ops key, no
+        collation). Companion to 2668 (Step 3ah composite UNIQUE
+        non-PKEY) and 2669 (`pg_conversion_name_nsp_index`, conname/nsp
+        composite UNIQUE non-PKEY, deferred to Step 3aj).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2670, "pg_conversion_oid_index"}`; `flattenRels` derives
+        `RelKind='i', RelNatts=1` via `pgIndexNattsByOID` so
+        `RelationInitIndexAccessInfo`'s `relnatts == indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain
+        `2670, // pg_conversion_oid_index (Step 3ai)` — the Step-3k
+        empty btree placeholder is sufficient because pg_conversion is
+        currently unpopulated (a zero-row CONOID lookup is the expected
+        outcome at this stage).
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` → `bootstrapPgIndexTuples` (writes
+        Form_pg_index row + captures TID in `pgIndexTIDs[2670]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (composite-key leaf at
+        2659).
+        Regression pins:
+        `TestPgConversionOidIndexSeededFromInitialEntries` (asserts
+        `(IndRelid=2607, IndKey=[1], IsUnique=true, IsPrimary=true,
+        IndCollation=[0])`) and
+        `TestNailedLocalRelsContainsPgConversionOidIndex` (asserts
+        `RelName="pg_conversion_oid_index", RelKind='i', RelNatts=1`)
+        in `internal/initdb/pg_conversion_oid_index_test.go`. Existing
+        pins extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18`
+        adds `2670: {1}` (strict count guard auto-rejects future
+        additions without map updates);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2670 so the populated 2679 btree must carry this
+        leaf.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgConversionOidIndex|TestNailedLocalRelsContainsPgConversionOidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestPgConversionDefaultIndex|TestNailedLocalRelsContainsPgConversion'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ah
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3ai-pg-conversion-oid-index.md`.
+      - Next blocker (Step 3aj): after Step 3ai the next E2E re-run
+        is expected to surface OID 2669
+        (`pg_conversion_name_nsp_index`, 2-column UNIQUE on
+        `(conname name_ops, connamespace oid_ops)`) — the last
+        remaining pg_conversion companion index per
+        `pg_conversion.h:64`. Follows the same single-OID catalog-seed-
+        addition pattern.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4344,7 +4468,12 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_collation_oid_index_test.go`,
         `docs/design/0106-0010-step3af-pg-collation-oid-index.md`,
         `internal/initdb/pg_conversion_nailed_test.go`,
-        `docs/design/0106-0010-step3ag-pg-conversion-nailed-rel.md`
+        `docs/design/0106-0010-step3ag-pg-conversion-nailed-rel.md`,
+        `internal/initdb/pg_conversion_default_index_test.go`,
+        `docs/design/0106-0010-step3ah-pg-conversion-default-index.md`,
+        `internal/testutil/replcluster/replcluster.go`,
+        `internal/initdb/pg_conversion_oid_index_test.go`,
+        `docs/design/0106-0010-step3ai-pg-conversion-oid-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

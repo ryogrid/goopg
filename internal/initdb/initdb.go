@@ -684,6 +684,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667,
 		2668, // pg_conversion_default_index (Step 3ah)
+		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
@@ -775,6 +776,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667,
 		2668, // pg_conversion_default_index (Step 3ah)
+		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
@@ -801,6 +803,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2661, // pg_cast_source_target_index (Step 3ac)
 		2662, 2663, 2667,
 		2668, // pg_conversion_default_index (Step 3ah)
+		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
@@ -1813,6 +1816,18 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// (2754, Step 3y) and pg_collation_name_enc_nsp_index
 		// (3164, Step 3ae) — minus the name_ops cCollation slot.
 		entry(2668, 2607, []int16{3, 5, 6, 1}, []uint32{oidOps, int4Ops, int4Ops, oidOps}, []uint32{0, 0, 0, 0}, true, false), // pg_conversion_default_index
+		// M0106-0010 Step 3ai: pg_conversion_oid_index (OID 2670).
+		// postgres/src/include/catalog/pg_conversion.h:65 —
+		//   DECLARE_UNIQUE_INDEX_PKEY(pg_conversion_oid_index, 2670,
+		//     ConversionOidIndexId, pg_conversion, btree(oid oid_ops));
+		// pg_conversion attnums (pg_conversion_d.h): 1=oid. UNIQUE PRIMARY
+		// KEY (DECLARE_UNIQUE_INDEX_PKEY) — companion to 2668 (composite
+		// UNIQUE non-PKEY seeded by Step 3ah) and 2669 (the conname/nsp
+		// composite UNIQUE non-PKEY; to be seeded by Step 3aj). Single
+		// oid_ops key, no collation. Same single-column oid PKEY pattern as
+		// pg_cast_oid_index (2660, Step 3ab), pg_collation_oid_index (3085,
+		// Step 3af), and pg_opclass_oid_index (2687, Step 3l).
+		entry(2670, 2607, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_conversion_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
