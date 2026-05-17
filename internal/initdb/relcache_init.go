@@ -94,7 +94,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{1247, "pg_type", 71, 'r', 14, false, pgTypeAttrs()},
 	{1249, "pg_attribute", 75, 'r', 24, false, pgAttributeAttrs()},
 	{1259, "pg_class", 83, 'r', 34, false, pgClassAttrs()},
-	{1255, "pg_proc", 81, 'r', 13, false, pgProcAttrs()},
+	{1255, "pg_proc", 81, 'r', 30, false, pgProcAttrs()},
 	{2610, "pg_index", 75, 'r', 4, false, pgIndexAttrs()},
 	{2616, "pg_opclass", 83, 'r', 7, false, pgOpclassAttrs()},
 	{2603, "pg_amproc", 83, 'r', 4, false, pgAmprocAttrs()},
@@ -541,6 +541,11 @@ func pgAttributeAttrs() []nailedAttr {
 }
 
 func pgProcAttrs() []nailedAttr {
+	// PG18 FormData_pg_proc — 30 columns. Column order, OIDs and
+	// per-attr (Len, NotNull) flags match
+	// `postgres/src/include/catalog/pg_proc.h`. M0106-0010 step 3a
+	// bumps relnatts 13 → 30 so the init-file TupleDesc agrees with
+	// the heap-tuple seed produced by bootstrapPgProcTuples.
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "proname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
@@ -549,12 +554,32 @@ func pgProcAttrs() []nailedAttr {
 		{Name: "prolang", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "procost", TypeOID: 700, Num: 6, Len: 4, NotNull: true},
 		{Name: "prorows", TypeOID: 700, Num: 7, Len: 4, NotNull: true},
-		{Name: "prokind", TypeOID: 18, Num: 8, Len: 1, NotNull: true},
-		{Name: "proisstrict", TypeOID: 16, Num: 9, Len: 1, NotNull: true},
-		{Name: "proretset", TypeOID: 16, Num: 10, Len: 1, NotNull: true},
-		{Name: "provolatile", TypeOID: 18, Num: 11, Len: 1, NotNull: true},
-		{Name: "proparallel", TypeOID: 18, Num: 12, Len: 1, NotNull: true},
-		{Name: "pronargs", TypeOID: 21, Num: 13, Len: 2, NotNull: true},
+		{Name: "provariadic", TypeOID: 26, Num: 8, Len: 4, NotNull: true},
+		{Name: "prosupport", TypeOID: 24, Num: 9, Len: 4, NotNull: true},
+		{Name: "prokind", TypeOID: 18, Num: 10, Len: 1, NotNull: true},
+		{Name: "prosecdef", TypeOID: 16, Num: 11, Len: 1, NotNull: true},
+		{Name: "proleakproof", TypeOID: 16, Num: 12, Len: 1, NotNull: true},
+		{Name: "proisstrict", TypeOID: 16, Num: 13, Len: 1, NotNull: true},
+		{Name: "proretset", TypeOID: 16, Num: 14, Len: 1, NotNull: true},
+		{Name: "provolatile", TypeOID: 18, Num: 15, Len: 1, NotNull: true},
+		{Name: "proparallel", TypeOID: 18, Num: 16, Len: 1, NotNull: true},
+		{Name: "pronargs", TypeOID: 21, Num: 17, Len: 2, NotNull: true},
+		{Name: "pronargdefaults", TypeOID: 21, Num: 18, Len: 2, NotNull: true},
+		{Name: "prorettype", TypeOID: 26, Num: 19, Len: 4, NotNull: true},
+		{Name: "proargtypes", TypeOID: 30, Num: 20, Len: -1, NotNull: true},
+		// CATALOG_VARLEN fields — nullable in PG; goopg encodes
+		// empty binary placeholders (see encodeValuePG) so PG's
+		// raw-bytes-as-ArrayType dereferences do not crash.
+		{Name: "proallargtypes", TypeOID: 1028, Num: 21, Len: -1, NotNull: false},
+		{Name: "proargmodes", TypeOID: 1002, Num: 22, Len: -1, NotNull: false},
+		{Name: "proargnames", TypeOID: 1009, Num: 23, Len: -1, NotNull: false},
+		{Name: "proargdefaults", TypeOID: 194, Num: 24, Len: -1, NotNull: false},
+		{Name: "protrftypes", TypeOID: 1028, Num: 25, Len: -1, NotNull: false},
+		{Name: "prosrc", TypeOID: 25, Num: 26, Len: -1, NotNull: true},
+		{Name: "probin", TypeOID: 25, Num: 27, Len: -1, NotNull: false},
+		{Name: "prosqlbody", TypeOID: 194, Num: 28, Len: -1, NotNull: false},
+		{Name: "proconfig", TypeOID: 1009, Num: 29, Len: -1, NotNull: false},
+		{Name: "proacl", TypeOID: 1034, Num: 30, Len: -1, NotNull: false},
 	}
 }
 

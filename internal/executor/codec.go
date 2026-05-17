@@ -161,7 +161,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(d.Int))
 		return buf[:], nil
-	case "oid":
+	case "oid", "regproc":
 		if d.Kind != KindInt {
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
@@ -258,6 +258,19 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return emptyArrayTypeBytes(26), nil
 	case "int2[]", "_int2":
 		return emptyArrayTypeBytes(21), nil
+	case "char[]", "_char":
+		// PG binary empty ArrayType, elemtype = char (18).
+		// Used for pg_proc.proargmodes when no per-arg modes are set.
+		return emptyArrayTypeBytes(18), nil
+	case "oidvector":
+		// oidvector is a fixed-shape varlena ArrayType: 1-D, lbound=0,
+		// elemtype=OID(26). The caller (initdb) pre-encodes the entire
+		// blob via oidVectorBytes() and passes it through as KindBytes
+		// so this codec only needs to splice the pre-built buffer.
+		if d.Kind != KindBytes {
+			return nil, fmt.Errorf("expected bytes for oidvector, got kind %d", d.Kind)
+		}
+		return d.BytesValue(), nil
 	case "pg_node_tree":
 		// pg_node_tree is varlena-text; PG only reads it conditionally
 		// (e.g. relpartbound when relispartition=true). Empty varlena.
@@ -607,14 +620,14 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 1
 	case "int2", "smallint":
 		return 2
-	case "int4", "integer", "int", "serial", "oid", "float4", "real", "date", "xid":
+	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
 		return 4
 	case "int8", "bigint", "bigserial", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
 		return 8
 	case "name":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "anyarray", "pg_node_tree":
-		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree
+	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "anyarray", "pg_node_tree", "oidvector":
+		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector
 	default:
 		return 4
 	}

@@ -2508,16 +2508,51 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step2-pg-am-bootstrap.md`.
-      - Step 3 (still open): `RelationInitIndexAccessInfo` continues
-        into `bthandler` via fmgr after the AMOID syscache hit. That
-        needs (a) `pg_proc` rows for the handler OIDs (e.g. 330 for
-        `bthandler`), (b) `pg_opclass` rows for the operator classes
-        pg_index columns reference, and (c) `pg_amop` / `pg_amproc`
-        rows for each opclass's strategy/support fns. Tracked as a
-        follow-up loop under M0106-0010.
+      - Step 3a LANDED 2026-05-17. The seven AM handler pg_proc rows
+        (heap_tableam_handler=3, bthandler=330, hashhandler=331,
+        gisthandler=332, ginhandler=333, spghandler=334,
+        brinhandler=335) are written to `base/1/1255` and
+        `base/5/1255` as 30-column `Form_pg_proc` heap tuples so PG
+        standby startup's `OidFunctionCall0(amhandler) →
+        SearchSysCache1(PROCOID, …)` succeeds. New
+        `internal/initdb/initdb.go::pgProcEntry / pgProcColDefs /
+        pgProcInitialEntries / pgProcRow / bootstrapPgProcTuples`;
+        `oidVectorBytes` helper builds the on-disk oidvector blob
+        (4-byte varlena header + 20-byte ArrayType header + N×4 oid
+        payload) for `proargtypes`. `internal/executor/codec.go::
+        encodeValuePG` learns three new types — `oidvector`
+        (KindBytes passthrough), `regproc` (4-byte LE oid alias) and
+        `char[]` / `_char` (16-byte empty `ArrayType` with elemtype
+        18) — and `physicalPGTypeAlign` maps each to PG `typalign='i'`.
+        `pgCatalogTypeOID / Len / pgTypeByVal / pgTypeAlignChar /
+        pgTypeStorageChar` learn OIDs 24, 30, 269, 325, 1002, 1028,
+        2281. `hasVarWidthCol` extended to recognise every varlena
+        type used by pg_class and pg_proc (was only `text`) so the
+        `HEAP_HASVARWIDTH` infomask bit is set on the resulting
+        tuples. `internal/initdb/relcache_init.go::pgProcAttrs()`
+        expanded from 13 → 30 columns and `nailedLocalRels` bumps
+        pg_proc `relnatts` 13 → 30 so PG's `heap_deformtuple` can
+        read `prosrc` (attnum 26). Regression pins:
+        `TestPgProcRowBtreeHandlerMatchesFormPgProc`,
+        `TestPgProcInitialEntriesCoverAMHandlers`,
+        `TestBootstrapPgProcTuplesWritesRowsToBase1And5`,
+        `TestPgProcAttrsMatchesPg18FormPgProc` in
+        `internal/initdb/pg_proc_bootstrap_test.go`. Verified:
+        `go test -count=1 ./internal/initdb/` (pre-existing
+        `TestSynchronousCommitFlushesByDefault` failure confirmed via
+        baseline-diff stash; all other initdb tests including the new
+        pg_proc cases PASS); `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3a-pg-proc-bootstrap.md`.
+      - Step 3b (still open): `pg_opclass` rows for the operator
+        classes pg_index columns reference (oid_ops, int4_ops, etc.).
+      - Step 3c (still open): `pg_amop` / `pg_amproc` rows for each
+        opclass's strategy/support fns.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
-        `internal/initdb/pg_am_bootstrap_test.go`
+        `internal/initdb/pg_am_bootstrap_test.go`,
+        `internal/initdb/pg_proc_bootstrap_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
@@ -2535,6 +2570,11 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         snapshot will bit-rot the moment the first DDL runs.
       - Files: `internal/catalog/`, `internal/initdb/relcache_init.go`,
         `internal/server/`
+
+ - [ ] **M0106-0012**
+      - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.
+      - Survery failure reason and fix. This test become failing after modifications
+        related catalog bootstrap.
 
 ## Completed
 

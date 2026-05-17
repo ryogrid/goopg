@@ -205,6 +205,13 @@ func Init(opts Options) error {
 	if err := bootstrapPgAmTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_am tuples: %w", err)
 	}
+	// M0106-0010 step 3a: write pg_proc rows for the AM handler
+	// functions so PG's RelationInitIndexAccessInfo →
+	// OidFunctionCall0(amhandler) finds bthandler /
+	// heap_tableam_handler / etc. in the syscache.
+	if err := bootstrapPgProcTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_proc tuples: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -674,6 +681,165 @@ func bootstrapPgAmTuples(dataDir string) error {
 	return writeMultiPageHeapRows(dataDir, "2601", cols, rows)
 }
 
+
+// oidVectorBytes returns the on-disk PG-native serialization of an
+// `oidvector` value (1-D Oid array with lbound=0, elemtype=OID(26)).
+// Used to seed pg_proc.proargtypes for the AM handler functions —
+// PG's RelationInitIndexAccessInfo path looks the handler up via
+// fmgr → SearchSysCache1(PROCOID), and the cached tuple's proargtypes
+// is dereferenced as ArrayType* through DatumGetPointer. A plain
+// varlena text "{2281}" would not satisfy the ARR_ELEMTYPE assertion.
+//
+// Wire layout (LE):
+//
+//	[0:4]   varlena 4-byte header: (24 + 4*N) << 2
+//	[4:8]   ndim       = 1
+//	[8:12]  dataoffset = 0
+//	[12:16] elemtype   = 26 (OID)
+//	[16:20] dim1       = N
+//	[20:24] lbound1    = 0
+//	[24:]   N * 4-byte little-endian OIDs
+func oidVectorBytes(oids []uint32) []byte {
+	const headerSize = 24
+	total := headerSize + 4*len(oids)
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	binary.LittleEndian.PutUint32(buf[12:16], 26)
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(oids)))
+	binary.LittleEndian.PutUint32(buf[20:24], 0)
+	for i, o := range oids {
+		binary.LittleEndian.PutUint32(buf[24+i*4:28+i*4], o)
+	}
+	return buf
+}
+
+// pgProcEntry is a minimal description of a pg_proc row produced
+// during initdb. v0 only needs to seed the AM handler functions so
+// PG's RelationInitIndexAccessInfo can resolve amhandler via fmgr.
+type pgProcEntry struct {
+	OID         uint32
+	Name        string // proname (NameData, ≤63 bytes)
+	RetType     uint32 // prorettype OID
+	HandlerName string // prosrc text (e.g. "bthandler") — fmgr internal lookup key
+}
+
+// pgProcColDefs returns the 30-column PG18 FormData_pg_proc layout.
+// Column order must match `postgres/src/include/catalog/pg_proc.h`
+// so PG can dereference GETSTRUCT(tup)→Form_pg_proc directly.
+func pgProcColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},                   // 1
+		{Name: "proname", Type: catalog.Type{Name: "name"}},              // 2
+		{Name: "pronamespace", Type: catalog.Type{Name: "oid"}},          // 3
+		{Name: "proowner", Type: catalog.Type{Name: "oid"}},              // 4
+		{Name: "prolang", Type: catalog.Type{Name: "oid"}},               // 5
+		{Name: "procost", Type: catalog.Type{Name: "float4"}},            // 6
+		{Name: "prorows", Type: catalog.Type{Name: "float4"}},            // 7
+		{Name: "provariadic", Type: catalog.Type{Name: "oid"}},           // 8
+		{Name: "prosupport", Type: catalog.Type{Name: "regproc"}},        // 9
+		{Name: "prokind", Type: catalog.Type{Name: "char"}},              // 10
+		{Name: "prosecdef", Type: catalog.Type{Name: "bool"}},            // 11
+		{Name: "proleakproof", Type: catalog.Type{Name: "bool"}},         // 12
+		{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},          // 13
+		{Name: "proretset", Type: catalog.Type{Name: "bool"}},            // 14
+		{Name: "provolatile", Type: catalog.Type{Name: "char"}},          // 15
+		{Name: "proparallel", Type: catalog.Type{Name: "char"}},          // 16
+		{Name: "pronargs", Type: catalog.Type{Name: "int2"}},             // 17
+		{Name: "pronargdefaults", Type: catalog.Type{Name: "int2"}},      // 18
+		{Name: "prorettype", Type: catalog.Type{Name: "oid"}},            // 19
+		{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}},     // 20
+		// CATALOG_VARLEN section: nullable in PG but we emit empty
+		// binary arrays so the relacl-style "raw bytes as ArrayType*"
+		// dereferences in PG do not trip ARR_ELEMTYPE assertions.
+		{Name: "proallargtypes", Type: catalog.Type{Name: "oid[]"}},      // 21
+		{Name: "proargmodes", Type: catalog.Type{Name: "char[]"}},        // 22
+		{Name: "proargnames", Type: catalog.Type{Name: "text[]"}},        // 23
+		{Name: "proargdefaults", Type: catalog.Type{Name: "pg_node_tree"}}, // 24
+		{Name: "protrftypes", Type: catalog.Type{Name: "oid[]"}},         // 25
+		{Name: "prosrc", Type: catalog.Type{Name: "text"}},               // 26 — FORCE_NOT_NULL
+		{Name: "probin", Type: catalog.Type{Name: "text"}},               // 27
+		{Name: "prosqlbody", Type: catalog.Type{Name: "pg_node_tree"}},   // 28
+		{Name: "proconfig", Type: catalog.Type{Name: "text[]"}},          // 29
+		{Name: "proacl", Type: catalog.Type{Name: "aclitem[]"}},          // 30
+	}
+}
+
+// pgProcInitialEntries lists the seven AM handler pg_proc rows that
+// vanilla PG18 ships in `pg_proc.dat` and that goopg must mirror so
+// `OidFunctionCall0(amhandler)` succeeds during standby startup.
+//
+// All seven are PROVOLATILE 'v', PROPARALLEL 's', INTERNALlanguageId
+// (12), pronamespace = 11 (pg_catalog), proowner = 10 (bootstrap
+// superuser), one `internal` argument (OID 2281).
+func pgProcInitialEntries() []pgProcEntry {
+	return []pgProcEntry{
+		// Table AM handler
+		{3, "heap_tableam_handler", 269, "heap_tableam_handler"},
+		// Index AM handlers
+		{330, "bthandler", 325, "bthandler"},
+		{331, "hashhandler", 325, "hashhandler"},
+		{332, "gisthandler", 325, "gisthandler"},
+		{333, "ginhandler", 325, "ginhandler"},
+		{334, "spghandler", 325, "spghandler"},
+		{335, "brinhandler", 325, "brinhandler"},
+	}
+}
+
+// pgProcRow materialises one pgProcEntry as the 30-column row that
+// EncodeRowPG will pack into the on-disk heap tuple.
+func pgProcRow(e pgProcEntry) executor.Row {
+	return executor.Row{
+		executor.NewIntDatum(int64(e.OID)),               // 1  oid
+		executor.NewStringDatum(e.Name),                  // 2  proname
+		executor.NewIntDatum(11),                         // 3  pronamespace = pg_catalog
+		executor.NewIntDatum(10),                         // 4  proowner = BOOTSTRAP_SUPERUSERID
+		executor.NewIntDatum(12),                         // 5  prolang = INTERNALlanguageId
+		executor.NewIntDatum(1),                          // 6  procost = 1 (float4)
+		executor.NewIntDatum(0),                          // 7  prorows = 0 (float4)
+		executor.NewIntDatum(0),                          // 8  provariadic = 0
+		executor.NewIntDatum(0),                          // 9  prosupport = 0
+		executor.NewStringDatum("f"),                     // 10 prokind = 'f' (function)
+		executor.NewBoolDatum(false),                     // 11 prosecdef
+		executor.NewBoolDatum(false),                     // 12 proleakproof
+		executor.NewBoolDatum(true),                      // 13 proisstrict
+		executor.NewBoolDatum(false),                     // 14 proretset
+		executor.NewStringDatum("v"),                     // 15 provolatile = 'v' (volatile)
+		executor.NewStringDatum("s"),                     // 16 proparallel = 's' (safe)
+		executor.NewIntDatum(1),                          // 17 pronargs = 1 (single `internal` arg)
+		executor.NewIntDatum(0),                          // 18 pronargdefaults
+		executor.NewIntDatum(int64(e.RetType)),           // 19 prorettype
+		executor.NewBytesDatum(oidVectorBytes([]uint32{2281})), // 20 proargtypes = (internal)
+		executor.NewStringDatum(""),                      // 21 proallargtypes
+		executor.NewStringDatum(""),                      // 22 proargmodes
+		executor.NewStringDatum(""),                      // 23 proargnames
+		executor.NewStringDatum(""),                      // 24 proargdefaults (pg_node_tree)
+		executor.NewStringDatum(""),                      // 25 protrftypes
+		executor.NewStringDatum(e.HandlerName),           // 26 prosrc — fmgr internal lookup key
+		executor.NewStringDatum(""),                      // 27 probin
+		executor.NewStringDatum(""),                      // 28 prosqlbody
+		executor.NewStringDatum(""),                      // 29 proconfig
+		executor.NewStringDatum(""),                      // 30 proacl
+	}
+}
+
+// bootstrapPgProcTuples writes the 7 AM handler pg_proc heap tuples
+// to base/1/1255 and base/5/1255. M0106-0010 step 3a: required so
+// PG standby startup's RelationInitIndexAccessInfo →
+// OidFunctionCall0(amhandler) succeeds — fmgr does
+// SearchSysCache1(PROCOID, …) on the index AM's handler OID and
+// dereferences GETSTRUCT(tup)→Form_pg_proc to read prosrc.
+func bootstrapPgProcTuples(dataDir string) error {
+	cols := pgProcColDefs()
+	entries := pgProcInitialEntries()
+	rows := make([]executor.Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, pgProcRow(e))
+	}
+	return writeMultiPageHeapRows(dataDir, "1255", cols, rows)
+}
+
 // pgClassColDefs returns pg_class column descriptors matching PG18's
 // FormData_pg_class struct byte-for-byte. RelationBuildDesc casts the
 // raw heap tuple as FormData_pg_class*, so every fixed-size field must
@@ -875,7 +1041,16 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 // hasVarWidthCol returns true if any column is varlena ("text" type).
 func hasVarWidthCol(cols []catalog.Column) bool {
 	for _, c := range cols {
-		if c.Type.Name == "text" {
+		switch c.Type.Name {
+		case "text", "varchar", "bpchar",
+			"pg_node_tree",
+			"text[]", "_text",
+			"aclitem[]", "_aclitem",
+			"oid[]", "_oid",
+			"int2[]", "_int2",
+			"char[]", "_char",
+			"oidvector",
+			"anyarray":
 			return true
 		}
 	}
@@ -1001,6 +1176,20 @@ func pgCatalogTypeOID(t string) uint32 {
 		return 1034
 	case "anyarray":
 		return 2277
+	case "regproc":
+		return 24
+	case "oidvector":
+		return 30
+	case "char[]", "_char":
+		return 1002
+	case "oid[]", "_oid":
+		return 1028
+	case "index_am_handler":
+		return 325
+	case "table_am_handler":
+		return 269
+	case "internal":
+		return 2281
 	}
 	return 0
 }
@@ -1012,13 +1201,13 @@ func pgCatalogTypeLen(t string) int {
 		return 1
 	case "int2":
 		return 2
-	case "int4", "oid", "xid", "float4":
+	case "int4", "oid", "xid", "float4", "regproc", "index_am_handler", "table_am_handler":
 		return 4
 	case "int8", "float8":
 		return 8
 	case "name":
 		return 64
-	case "text", "pg_node_tree", "text[]", "_text", "aclitem[]", "_aclitem", "anyarray":
+	case "text", "pg_node_tree", "text[]", "_text", "aclitem[]", "_aclitem", "anyarray", "oidvector", "char[]", "_char", "oid[]", "_oid":
 		return -1
 	}
 	return 4
@@ -1026,7 +1215,7 @@ func pgCatalogTypeLen(t string) int {
 
 func pgTypeByVal(oid uint32) bool {
 	switch oid {
-	case 16, 18, 21, 23, 26, 700, 20, 701:
+	case 16, 18, 21, 23, 26, 700, 20, 701, 24, 325, 269:
 		return true
 	}
 	return false
@@ -1038,7 +1227,7 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700, 194, 1009, 1034, 2277:
+	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 1002, 1028:
 		return "i"
 	case 20, 701:
 		return "d"
@@ -1048,7 +1237,7 @@ func pgTypeAlignChar(oid uint32) string {
 
 func pgTypeStorageChar(oid uint32) string {
 	switch oid {
-	case 25, 1043, 1042, 194, 1009, 1034, 2277:
+	case 25, 1043, 1042, 194, 1009, 1034, 2277, 1002, 1028:
 		return "x"
 	}
 	return "p"
