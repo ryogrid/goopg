@@ -5255,7 +5255,64 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md`,
         `docs/design/0106-0010-step3av-multi-leaf-btree-bulk-load.md`,
         `internal/initdb/pg_extension_nailed_test.go`,
-        `docs/design/0106-0010-step3aw-pg-extension-nailed-rel.md`
+        `docs/design/0106-0010-step3aw-pg-extension-nailed-rel.md`,
+        `internal/initdb/pg_extension_oid_index_test.go`,
+        `docs/design/0106-0010-step3ax-pg-extension-oid-index.md`
+      - Step 3ax LANDED 2026-05-18. Closes the anticipated FATAL
+        `could not open relation with OID 3080` PG-standby boot blocker
+        that surfaces after Step 3aw seeded the pg_extension heap (OID
+        3079). OID 3080 is `pg_extension_oid_index` per
+        `postgres/src/include/catalog/pg_extension.h:56`
+        (`DECLARE_UNIQUE_INDEX_PKEY(pg_extension_oid_index, 3080,
+        ExtensionOidIndexId, pg_extension, btree(oid oid_ops))`). Backs
+        `MAKE_SYSCACHE(EXTENSIONOID, pg_extension_oid_index, 2)`. Pure
+        catalog-seed addition mirroring single-column oid PKEY pattern
+        of Steps 3at (pg_event_trigger_oid_index), 3ao (pg_enum_oid_index),
+        3ab (pg_cast_oid_index), 3af (pg_collation_oid_index), 3ai
+        (pg_conversion_oid_index), 3am (pg_default_acl_oid_index), and 3l
+        (pg_opclass_oid_index); no encoder/builder/Init flow change:
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(3080, 3079, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` — UNIQUE PRIMARY single oid_ops key (no collation)
+        over pg_extension heap OID 3079 (Step 3aw nailed rel).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{3080, "pg_extension_oid_index"}`; `flattenRels`+
+        `pgIndexNattsByOID` derives `RelKind='i', RelNatts=1` so the
+        `relnatts==indnatts` check (relcache.c:1492) passes.
+        (c) Three empty-placeholder OID lists in
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `3080, // pg_extension_oid_index (Step 3ax)`. Step-3k
+        empty-btree placeholder is sufficient because pg_extension is
+        currently unpopulated — any `SearchSysCache1(EXTENSIONOID, …)`
+        probe correctly returns no row.
+        The seed threads automatically through the existing flow:
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples →
+        bootstrapPgIndexTuples (captures TID) →
+        bootstrapPgIndexIndexrelidIndex (adds leaf at 2679) →
+        bootstrapPgClassOidIndex (adds leaf at 2662) →
+        bootstrapPgAttributeRelidAttnumIndex (composite leaf at 2659)`.
+        Regression pins:
+        `TestPgExtensionOidIndexSeededFromInitialEntries` (pins
+        `(IndRelid=3079, IndKey=[1], IsUnique=true, IsPrimary=true,
+        IndCollation=[0])`) and
+        `TestNailedLocalRelsContainsPgExtensionOidIndex` (pins
+        `RelName, RelKind='i', RelNatts=1`) in
+        `internal/initdb/pg_extension_oid_index_test.go`.
+        Existing pins extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18`
+        adds `3080: {1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3080.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgExtensionOidIndex|TestNailedLocalRelsContainsPgExtensionOidIndex|TestPgEventTriggerOidIndex|TestNailedLocalRelsContainsPgExtension|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3aw (no new regressions);
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        Companion index 3081 (`pg_extension_name_index`, UNIQUE non-PKEY
+        on `extname name_ops`, backing
+        `MAKE_SYSCACHE(EXTENSIONNAME, …)`) deferred to Step 3ay.
+        Design: `docs/design/0106-0010-step3ax-pg-extension-oid-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

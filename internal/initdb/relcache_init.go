@@ -377,6 +377,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
 	{3468, "pg_event_trigger_oid_index"},
+	// M0106-0010 Step 3ax: pg_extension_oid_index. PG18
+	// `postgres/src/include/catalog/pg_extension.h:56` declares
+	// `ExtensionOidIndexId = 3080` as UNIQUE PRIMARY KEY on
+	// btree(oid oid_ops). Heap OID 3079 (pg_extension,
+	// Step 3aw nailed rel). Backs MAKE_SYSCACHE(EXTENSIONOID,
+	// pg_extension_oid_index, 2). Without this entry
+	// RelationIdGetRelation(3080) FATALs because no pg_class row gets
+	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
+	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
+	// (relcache.c:1492).
+	{3080, "pg_extension_oid_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
