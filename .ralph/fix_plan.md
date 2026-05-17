@@ -3348,18 +3348,65 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `go test -count=1 ./internal/executor/ ./internal/server/
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3r-pg-index-2678-2679-pg18-oid-correction.md`.
-      - Next blocker (Step 3s): re-run
+      - Step 3s LANDED 2026-05-18. Closes the FATAL
+        `could not open file "base/5/1249.1" (target block 196608):
+        previous segment is only 6 blocks` PG-standby boot blocker that
+        surfaced after Step 3r let `SearchSysCache1(INDEXRELID, …)`
+        actually reach `pg_attribute_relid_attnum_index` (OID 2659) and
+        dereference a stored TID. Root cause:
+        `internal/initdb/btree_index_bootstrap.go::pgBuildIndexTupleOidKey`
+        and `pgBuildIndexTupleOidInt2Key` were both writing `heapBlk`
+        as a single LE `uint32` (`le.PutUint32(out[0:4], heapBlk)`).
+        PG's `ItemPointerData.ip_blkid` is the struct
+        `(bi_hi uint16, bi_lo uint16)` per
+        `postgres/src/include/storage/block.h`, where
+        `BlockIdGetBlockNumber == (bi_hi<<16)|bi_lo`. For block 3, the
+        buggy bytes `[03,00,00,00]` decode as
+        `bi_hi=3, bi_lo=0 → 196608` — exactly the FATAL block number.
+        The bug was silent through Steps 3l/3m/3o/3p because every TID
+        previously dereferenced pointed at heap block 0 (round-trips
+        identically under either encoding); Step 3r's OID correction
+        was the first step that let PG follow a TID into a non-zero
+        heap block of a heap that PG actually re-reads via sysscan.
+        Fix: each encoder writes the two halves separately
+        (`le.PutUint16(out[0:2], uint16(heapBlk>>16))` then
+        `le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))`). Doc comments
+        updated to cite `pg_index_d.h`'s BlockIdData layout and warn
+        against the LE-uint32 trap. Regression pins:
+        `TestPgBuildIndexTupleOidKeyLayoutMatchesPG18` and
+        `TestPgBuildIndexTupleOidInt2KeyLayoutMatchesPG18` rewritten to
+        round-trip `(bi_hi<<16)|bi_lo == heapBlk` for `0xDEADBEEF`
+        (previously pinned the bug as a single LE uint32). Four
+        `WritesPopulatedBtree` pins
+        (`TestBootstrapPgOpclassOidIndex…`,
+        `TestBootstrapPgClassOidIndex…`,
+        `TestBootstrapPgIndexIndexrelidIndex…`,
+        `TestBootstrapPgAttributeRelidAttnumIndex…`) updated to decode
+        the on-disk block via the same bi_hi/bi_lo halves. Verified:
+        `go test -count=1 -run 'TestPgBuildIndexTuple|TestBootstrapPgOpclassOidIndex|TestBootstrapPgClassOidIndex|TestBootstrapPgIndexIndexrelidIndex|TestBootstrapPgAttributeRelidAttnumIndex|TestPgBuildBtreeLeafRoot|TestPgBuildBtreeMetapage'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3r unchanged (no new regressions);
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        advances past the 196608 FATAL to
+        `FATAL: could not open relation with OID 2684`
+        (`pg_amop_fam_strat_index` — Step 3t territory).
+        Carry-over: `internal/storage/heap.go` writes `t_ctid` with the
+        same LE-uint32 pattern; not load-bearing for boot (only read
+        during UPDATE chain following) but a follow-up step will
+        harmonise it once an actual symptom surfaces. Design:
+        `docs/design/0106-0010-step3s-index-tuple-block-id-encoding.md`.
+      - Next blocker (Step 3t): re-run
         `GOOPG_RUN_BLOCKED_M0102_E2E=1
-        TestE2E_FailoverGoopgToPG/async` and capture the new FATAL.
-        Most likely candidates: (a) a sysscan against another
-        shared-critical index whose Step-3k empty btree still returns
-        zero rows — `pg_authid_oid_index` (2677),
-        `pg_database_oid_index` (2672), `pg_authid_rolname_index`
-        (2676), `pg_database_datname_index` (2671), or
-        `pg_shseclabel_object_index` (3593); or (b) missing
-        pg_attribute heap rows for the SHARED catalog relations
-        (1262/1260/1261/3592) seeded into `global/1249` — Step 3o
-        seeded the LOCAL `base/{1,5}/1249` only.
+        TestE2E_FailoverGoopgToPG/async` and populate (or seed) the
+        relation `pg_amop_fam_strat_index` (OID 2684). The FATAL
+        `could not open relation with OID 2684` indicates either the
+        pg_class row for 2684 is missing from
+        `pgClassInitialEntries`/`nailedLocalRels`, or the relfile
+        `base/{1,5}/2684` is not laid down by initdb. Likely a missing
+        nailed-index seed for pg_amop's family/strategy index.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3376,7 +3423,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_index_indkey_test.go`,
         `internal/initdb/btree_metapage_test.go`,
         `internal/initdb/btree_index_bootstrap_test.go`,
-        `docs/design/0106-0010-step3p-pg-index-indexrelid-index-tuples.md`
+        `docs/design/0106-0010-step3p-pg-index-indexrelid-index-tuples.md`,
+        `docs/design/0106-0010-step3s-index-tuple-block-id-encoding.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

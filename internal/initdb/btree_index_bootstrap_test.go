@@ -15,13 +15,28 @@ import (
 // oid-keyed index tuple — 8 bytes header + 4-byte oid key + 4 bytes
 // MAXALIGN pad = 16 bytes total, with t_info storing the size (16).
 func TestPgBuildIndexTupleOidKeyLayoutMatchesPG18(t *testing.T) {
-	out := pgBuildIndexTupleOidKey(0xDEADBEEF, 0xCAFE, 1986)
+	const heapBlk uint32 = 0xDEADBEEF
+	out := pgBuildIndexTupleOidKey(heapBlk, 0xCAFE, 1986)
 	if len(out) != 16 {
 		t.Fatalf("len=%d, want 16 (MAXALIGN(8+4))", len(out))
 	}
 	le := binary.LittleEndian
-	if got := le.Uint32(out[0:4]); got != 0xDEADBEEF {
-		t.Errorf("ip_blkid: got %#x, want %#x", got, 0xDEADBEEF)
+	// BlockIdData is two uint16 halves in struct order: bi_hi at [0..1],
+	// bi_lo at [2..3]. PG decodes the block number as
+	// (bi_hi<<16)|bi_lo, NOT as a single LE uint32. Encoding heapBlk as
+	// LE uint32 silently corrupts the TID for any block > 0 (e.g. block
+	// 3 → bi_hi=3, bi_lo=0 → 196608) — the Step 3s regression.
+	biHi := le.Uint16(out[0:2])
+	biLo := le.Uint16(out[2:4])
+	if got := (uint32(biHi) << 16) | uint32(biLo); got != heapBlk {
+		t.Errorf("BlockIdGetBlockNumber: got %#x, want %#x (bi_hi=%#x bi_lo=%#x)",
+			got, heapBlk, biHi, biLo)
+	}
+	if biHi != uint16(heapBlk>>16) {
+		t.Errorf("bi_hi: got %#x, want %#x", biHi, uint16(heapBlk>>16))
+	}
+	if biLo != uint16(heapBlk&0xFFFF) {
+		t.Errorf("bi_lo: got %#x, want %#x", biLo, uint16(heapBlk&0xFFFF))
 	}
 	if got := le.Uint16(out[4:6]); got != 0xCAFE {
 		t.Errorf("ip_posid: got %#x, want %#x", got, uint16(0xCAFE))
@@ -256,7 +271,10 @@ func TestBootstrapPgClassOidIndexWritesPopulatedBtree(t *testing.T) {
 				continue
 			}
 			// Block id at offset 0..3, posid at 4..5, oid key at 8..11.
-			gotBlock := binary.LittleEndian.Uint32(leaf[off : off+4])
+			// BlockIdData = (bi_hi[2], bi_lo[2]) in struct order.
+			gotBiHi := binary.LittleEndian.Uint16(leaf[off : off+2])
+			gotBiLo := binary.LittleEndian.Uint16(leaf[off+2 : off+4])
+			gotBlock := (uint32(gotBiHi) << 16) | uint32(gotBiLo)
 			gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
 			gotOID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
 			if gotOID != wantOIDs[i] {
@@ -279,13 +297,24 @@ func TestBootstrapPgClassOidIndexWritesPopulatedBtree(t *testing.T) {
 // keyed on (oid, int2): 8-byte header + 4-byte attrelid + 2-byte attnum
 // + 2 bytes MAXALIGN pad = 16 bytes total. t_info stores size 16.
 func TestPgBuildIndexTupleOidInt2KeyLayoutMatchesPG18(t *testing.T) {
-	out := pgBuildIndexTupleOidInt2Key(0xDEADBEEF, 0xCAFE, 1259, 7)
+	const heapBlk uint32 = 0xDEADBEEF
+	out := pgBuildIndexTupleOidInt2Key(heapBlk, 0xCAFE, 1259, 7)
 	if len(out) != 16 {
 		t.Fatalf("len=%d, want 16 (MAXALIGN(8+4+2))", len(out))
 	}
 	le := binary.LittleEndian
-	if got := le.Uint32(out[0:4]); got != 0xDEADBEEF {
-		t.Errorf("ip_blkid: got %#x, want %#x", got, 0xDEADBEEF)
+	// BlockIdData = (bi_hi[2], bi_lo[2]) in struct order, NOT LE uint32.
+	biHi := le.Uint16(out[0:2])
+	biLo := le.Uint16(out[2:4])
+	if got := (uint32(biHi) << 16) | uint32(biLo); got != heapBlk {
+		t.Errorf("BlockIdGetBlockNumber: got %#x, want %#x (bi_hi=%#x bi_lo=%#x)",
+			got, heapBlk, biHi, biLo)
+	}
+	if biHi != uint16(heapBlk>>16) {
+		t.Errorf("bi_hi: got %#x, want %#x", biHi, uint16(heapBlk>>16))
+	}
+	if biLo != uint16(heapBlk&0xFFFF) {
+		t.Errorf("bi_lo: got %#x, want %#x", biLo, uint16(heapBlk&0xFFFF))
 	}
 	if got := le.Uint16(out[4:6]); got != 0xCAFE {
 		t.Errorf("ip_posid: got %#x, want %#x", got, uint16(0xCAFE))
@@ -383,7 +412,10 @@ func TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree(t *testing.T) 
 				t.Errorf("%s: item %d length=%d, want 16", path, i, length)
 				continue
 			}
-			gotBlock := binary.LittleEndian.Uint32(leaf[off : off+4])
+			// BlockIdData = (bi_hi[2], bi_lo[2]) in struct order.
+			gotBiHi := binary.LittleEndian.Uint16(leaf[off : off+2])
+			gotBiLo := binary.LittleEndian.Uint16(leaf[off+2 : off+4])
+			gotBlock := (uint32(gotBiHi) << 16) | uint32(gotBiLo)
 			gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
 			gotAttRelID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
 			gotAttNum := int16(binary.LittleEndian.Uint16(leaf[off+12 : off+14]))
@@ -476,7 +508,10 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 				t.Errorf("%s: item %d length=%d, want 16", path, i, length)
 				continue
 			}
-			gotBlock := binary.LittleEndian.Uint32(leaf[off : off+4])
+			// BlockIdData = (bi_hi[2], bi_lo[2]) in struct order.
+			gotBiHi := binary.LittleEndian.Uint16(leaf[off : off+2])
+			gotBiLo := binary.LittleEndian.Uint16(leaf[off+2 : off+4])
+			gotBlock := (uint32(gotBiHi) << 16) | uint32(gotBiLo)
 			gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
 			gotOID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
 			if gotOID != wantOIDs[i] {

@@ -50,14 +50,21 @@ const (
 // returned buffer matches PG's index_form_tuple output for a tuple
 // with no nulls and one 4-byte oid key. Layout:
 //
-//	[0..3]   ItemPointerData.ip_blkid  (heapBlk, LE uint32)
-//	[4..5]   ItemPointerData.ip_posid  (heapOff, LE uint16)
+//	[0..1]   ItemPointerData.ip_blkid.bi_hi (heapBlk>>16, LE uint16)
+//	[2..3]   ItemPointerData.ip_blkid.bi_lo (heapBlk&0xFFFF, LE uint16)
+//	[4..5]   ItemPointerData.ip_posid       (heapOff, LE uint16)
 //	[6..7]   t_info  (size_low_13_bits | flags=0)
-//	[8..11]  oid key data              (oid, LE uint32)
+//	[8..11]  oid key data                   (oid, LE uint32)
 //	[12..15] MAXALIGN padding (zero)
 //
 // PG's _bt_search calls oidcmp() over the [8..11] window; the trailing
 // MAXALIGN pad never participates in comparisons, only in tuple sizing.
+//
+// NOTE: PG's BlockIdData is two uint16 halves laid out as (bi_hi, bi_lo)
+// in struct order — NOT a single LE uint32. For block 3:
+//   correct bytes: [0,0, 3,0]   (bi_hi=0, bi_lo=3)
+//   LE uint32  3 : [3,0, 0,0]   (PG decodes as block (3<<16)|0 = 196608)
+// See postgres/src/include/storage/block.h::BlockIdSet / BlockIdGetBlockNumber.
 func pgBuildIndexTupleOidKey(heapBlk uint32, heapOff uint16, oid uint32) []byte {
 	// hoff (data offset) for no-nulls case = MAXALIGN(sizeof(IndexTupleData))
 	// = MAXALIGN(8) = 8 on a 64-bit MAXALIGN target. data_size = 4 (oid).
@@ -71,10 +78,9 @@ func pgBuildIndexTupleOidKey(heapBlk uint32, heapOff uint16, oid uint32) []byte 
 	out := make([]byte, size)
 	le := binary.LittleEndian
 
-	// ItemPointerData: 4-byte block id (LE uint32) + 2-byte item offset
-	// (LE uint16). PG stores ip_blkid as two uint16 halves (bi_hi, bi_lo)
-	// but the on-disk LE encoding is byte-identical to a LE uint32.
-	le.PutUint32(out[0:4], heapBlk)
+	// ItemPointerData: bi_hi at [0..1], bi_lo at [2..3], ip_posid at [4..5].
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
 	le.PutUint16(out[4:6], heapOff)
 
 	// t_info: lower 13 bits = size; INDEX_VAR_MASK / INDEX_NULL_MASK both 0.
@@ -298,12 +304,15 @@ func bootstrapPgClassOidIndex(dataDir string, tids map[uint32]heapTID) error {
 // emitted by PG's `index_form_tuple` for a no-nulls 2-attribute tuple
 // where att1.align='i' (oid) and att2.align='s' (int2):
 //
-//	[0..3]   ItemPointerData.ip_blkid  (heapBlk, LE uint32)
-//	[4..5]   ItemPointerData.ip_posid  (heapOff, LE uint16)
+//	[0..1]   ItemPointerData.ip_blkid.bi_hi (heapBlk>>16, LE uint16)
+//	[2..3]   ItemPointerData.ip_blkid.bi_lo (heapBlk&0xFFFF, LE uint16)
+//	[4..5]   ItemPointerData.ip_posid       (heapOff, LE uint16)
 //	[6..7]   t_info (size_low_13_bits | flags=0)
 //	[8..11]  attrelid (LE uint32, oid_ops compares as unsigned)
 //	[12..13] attnum   (LE int16,  int2_ops compares as signed)
 //	[14..15] MAXALIGN padding (zero)
+//
+// See pgBuildIndexTupleOidKey for BlockIdData layout rationale.
 //
 // Total size = MAXALIGN(IndexTupleHeader + att1.len + att2.len) =
 // MAXALIGN(8 + 4 + 2) = 16. The on-disk size stored in t_info's low
@@ -317,8 +326,10 @@ func pgBuildIndexTupleOidInt2Key(heapBlk uint32, heapOff uint16, attrelid uint32
 	out := make([]byte, size)
 	le := binary.LittleEndian
 
-	// ItemPointerData.
-	le.PutUint32(out[0:4], heapBlk)
+	// ItemPointerData: bi_hi at [0..1], bi_lo at [2..3], ip_posid at [4..5].
+	// See pgBuildIndexTupleOidKey for the BlockIdData layout rationale.
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
 	le.PutUint16(out[4:6], heapOff)
 
 	// t_info: lower 13 bits = size; no INDEX_VAR_MASK / INDEX_NULL_MASK.
