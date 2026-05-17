@@ -272,3 +272,132 @@ func TestBootstrapPgClassOidIndexWritesPopulatedBtree(t *testing.T) {
 		}
 	}
 }
+
+
+// TestPgBuildIndexTupleOidInt2KeyLayoutMatchesPG18 pins the byte-exact
+// layout PG's index_form_tuple emits for a no-nulls 2-attribute tuple
+// keyed on (oid, int2): 8-byte header + 4-byte attrelid + 2-byte attnum
+// + 2 bytes MAXALIGN pad = 16 bytes total. t_info stores size 16.
+func TestPgBuildIndexTupleOidInt2KeyLayoutMatchesPG18(t *testing.T) {
+	out := pgBuildIndexTupleOidInt2Key(0xDEADBEEF, 0xCAFE, 1259, 7)
+	if len(out) != 16 {
+		t.Fatalf("len=%d, want 16 (MAXALIGN(8+4+2))", len(out))
+	}
+	le := binary.LittleEndian
+	if got := le.Uint32(out[0:4]); got != 0xDEADBEEF {
+		t.Errorf("ip_blkid: got %#x, want %#x", got, 0xDEADBEEF)
+	}
+	if got := le.Uint16(out[4:6]); got != 0xCAFE {
+		t.Errorf("ip_posid: got %#x, want %#x", got, uint16(0xCAFE))
+	}
+	if got := le.Uint16(out[6:8]); got != 16 {
+		t.Errorf("t_info: got %d, want 16 (size with no flags)", got)
+	}
+	if got := le.Uint32(out[8:12]); got != 1259 {
+		t.Errorf("attrelid key: got %d, want 1259", got)
+	}
+	if got := int16(le.Uint16(out[12:14])); got != 7 {
+		t.Errorf("attnum key: got %d, want 7", got)
+	}
+	// Trailing 2 bytes are MAXALIGN padding.
+	for i := 14; i < 16; i++ {
+		if out[i] != 0 {
+			t.Errorf("pad byte %d non-zero: got %#x", i, out[i])
+		}
+	}
+}
+
+// TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree
+// end-to-ends Step 3o's output: file is 2 blocks at every on-disk
+// location; the metapage points at block 1; the leaf-root carries one
+// IndexTuple per (attrelid, attnum>0) pair sorted ascending by
+// (attrelid, attnum); each line pointer's heap TID matches the
+// pg_attribute heap row written by bootstrapPgAttributeTuples for the
+// same (attrelid, attnum). Closes the FATAL "pg_attribute catalog is
+// missing N attribute(s) for relation OID …".
+func TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"base/1", "base/5", "global"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	tids, err := bootstrapPgAttributeTuples(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPgAttributeTuples: %v", err)
+	}
+	if err := bootstrapPgAttributeRelidAttnumIndex(dir, tids); err != nil {
+		t.Fatalf("bootstrapPgAttributeRelidAttnumIndex: %v", err)
+	}
+
+	type key struct {
+		AttRelID uint32
+		AttNum   int16
+	}
+	wantKeys := make([]key, 0, len(tids))
+	for k := range tids {
+		if k.AttNum <= 0 {
+			continue
+		}
+		wantKeys = append(wantKeys, key{AttRelID: k.AttRelID, AttNum: k.AttNum})
+	}
+	sort.Slice(wantKeys, func(i, j int) bool {
+		if wantKeys[i].AttRelID != wantKeys[j].AttRelID {
+			return wantKeys[i].AttRelID < wantKeys[j].AttRelID
+		}
+		return wantKeys[i].AttNum < wantKeys[j].AttNum
+	})
+
+	for _, path := range []string{
+		filepath.Join(dir, "base", "1", "2659"),
+		filepath.Join(dir, "base", "5", "2659"),
+		filepath.Join(dir, "global", "2659"),
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if len(raw) != 2*storage.BlockSize {
+			t.Errorf("%s: len=%d, want %d (2 blocks)", path, len(raw), 2*storage.BlockSize)
+			continue
+		}
+		base := storage.SizeOfPageHeaderData
+		if got := binary.LittleEndian.Uint32(raw[base+8 : base+12]); got != 1 {
+			t.Errorf("%s: btm_root=%d, want 1", path, got)
+		}
+		leaf := raw[storage.BlockSize : 2*storage.BlockSize]
+		h, err := storage.Header(storage.Page(leaf))
+		if err != nil {
+			t.Fatalf("%s: leaf header: %v", path, err)
+		}
+		nItems := (int(h.Lower()) - storage.SizeOfPageHeaderData) / 4
+		if nItems != len(wantKeys) {
+			t.Errorf("%s: leaf items=%d, want %d", path, nItems, len(wantKeys))
+			continue
+		}
+		for i := 0; i < nItems; i++ {
+			raw32 := binary.LittleEndian.Uint32(leaf[storage.SizeOfPageHeaderData+i*4 : storage.SizeOfPageHeaderData+i*4+4])
+			off := raw32 & 0x7FFF
+			length := (raw32 >> 17) & 0x7FFF
+			if length != 16 {
+				t.Errorf("%s: item %d length=%d, want 16", path, i, length)
+				continue
+			}
+			gotBlock := binary.LittleEndian.Uint32(leaf[off : off+4])
+			gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
+			gotAttRelID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
+			gotAttNum := int16(binary.LittleEndian.Uint16(leaf[off+12 : off+14]))
+			want := wantKeys[i]
+			if gotAttRelID != want.AttRelID || gotAttNum != want.AttNum {
+				t.Errorf("%s: item %d key=(%d,%d), want (%d,%d)",
+					path, i, gotAttRelID, gotAttNum, want.AttRelID, want.AttNum)
+				continue
+			}
+			wantTID := tids[pgAttrTIDKey{AttRelID: want.AttRelID, AttNum: want.AttNum}]
+			if gotBlock != wantTID.Block || gotOff != wantTID.Offset {
+				t.Errorf("%s: (%d,%d) TID=(%d,%d), want (%d,%d)",
+					path, want.AttRelID, want.AttNum, gotBlock, gotOff, wantTID.Block, wantTID.Offset)
+			}
+		}
+	}
+}

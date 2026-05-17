@@ -198,7 +198,8 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: pg_class tuples: %w", err)
 	}
-	if err := bootstrapPgAttributeTuples(abs); err != nil {
+	pgAttrTIDs, err := bootstrapPgAttributeTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_attribute tuples: %w", err)
 	}
 	// M0106-0010 step 2: write pg_am rows so PG's
@@ -259,6 +260,19 @@ func Init(opts Options) error {
 	// standby boot is "could not open critical system index 2671".
 	if err := bootstrapPgClassOidIndex(abs, pgClassTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_class_oid_index: %w", err)
+	}
+	// M0106-0010 step 3o: overwrite the empty btree placeholder at
+	// base/{1,5}/2659 + global/2659 with a populated btree (metapage +
+	// leaf-root) carrying one (attrelid, attnum)-keyed IndexTuple per
+	// pg_attribute heap row so PG's RelationBuildTupleDesc →
+	// systable_beginscan(AttributeRelidNumIndexId, {attrelid=X, attnum>0})
+	// finds the column tuples via an index scan (the path taken once
+	// criticalRelcachesBuilt = true — i.e. for every shared catalog
+	// relation loaded after the local critical phase). Without this
+	// the next FATAL during standby boot is "pg_attribute catalog is
+	// missing N attribute(s) for relation OID …".
+	if err := bootstrapPgAttributeRelidAttnumIndex(abs, pgAttrTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_attribute_relid_attnum_index: %w", err)
 	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
@@ -690,21 +704,48 @@ func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
 	return m, nil
 }
 
+// pgAttrTIDKey identifies a pg_attribute row uniquely by (attrelid, attnum).
+// Used by Step 3o's bootstrap of pg_attribute_relid_attnum_index, which
+// needs the on-disk heap TID for each (relation, attnum) pair so the
+// index leaf's IndexTuple.t_tid points at the correct heap row.
+type pgAttrTIDKey struct {
+	AttRelID uint32
+	AttNum   int16
+}
+
 // bootstrapPgAttributeTuples writes PG-native pg_attribute heap tuples for
 // every column of every nailed relation so RelationBuildDesc can load column
-// metadata from disk.
-func bootstrapPgAttributeTuples(dataDir string) error {
+// metadata from disk. Returns a map from (attrelid, attnum) → heapTID so
+// callers can build composite-key btree index tuples that point at each row.
+func bootstrapPgAttributeTuples(dataDir string) (map[pgAttrTIDKey]heapTID, error) {
 	attrCols := pgAttrColDefs()
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
+	type rowKey struct {
+		AttRelID uint32
+		AttNum   int16
+	}
 	var rows []executor.Row
+	keys := make([]rowKey, 0)
 	for _, rel := range allRels {
 		attrs := pgAttrEntriesForRel(rel)
 		for _, a := range attrs {
 			rows = append(rows, pgAttributeRow(rel.OID, a))
+			keys = append(keys, rowKey{AttRelID: rel.OID, AttNum: a.Num})
 		}
 	}
-	return writeMultiPageHeapRows(dataDir, "1249", attrCols, rows)
+	tids, err := writeMultiPageHeapRows(dataDir, "1249", attrCols, rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(tids) != len(keys) {
+		return nil, fmt.Errorf("pg_attribute: tid/row count mismatch (%d vs %d)", len(tids), len(keys))
+	}
+	out := make(map[pgAttrTIDKey]heapTID, len(tids))
+	for i, k := range keys {
+		out[pgAttrTIDKey{AttRelID: k.AttRelID, AttNum: k.AttNum}] = tids[i]
+	}
+	return out, nil
 }
 
 // pgAmColDefs returns pg_am column descriptors matching PG18's
@@ -766,7 +807,8 @@ func bootstrapPgAmTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgAmRow(e))
 	}
-	return writeMultiPageHeapRows(dataDir, "2601", cols, rows)
+	_, err := writeMultiPageHeapRows(dataDir, "2601", cols, rows)
+	return err
 }
 
 
@@ -947,7 +989,8 @@ func bootstrapPgProcTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgProcRow(e))
 	}
-	return writeMultiPageHeapRows(dataDir, "1255", cols, rows)
+	_, err := writeMultiPageHeapRows(dataDir, "1255", cols, rows)
+	return err
 }
 
 // pgOpclassEntry mirrors one row of PG18's pg_opclass.dat — see
@@ -1071,7 +1114,8 @@ func bootstrapPgOpclassTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgOpclassRow(e))
 	}
-	return writeMultiPageHeapRows(dataDir, "2616", cols, rows)
+	_, err := writeMultiPageHeapRows(dataDir, "2616", cols, rows)
+	return err
 }
 
 
@@ -1225,7 +1269,8 @@ func bootstrapPgAmopTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgAmopRow(e))
 	}
-	return writeMultiPageHeapRows(dataDir, "2602", cols, rows)
+	_, err := writeMultiPageHeapRows(dataDir, "2602", cols, rows)
+	return err
 }
 
 // pgAmprocEntry mirrors one row of PG18's pg_amproc.dat — see
@@ -1378,7 +1423,8 @@ func bootstrapPgAmprocTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgAmprocRow(e))
 	}
-	return writeMultiPageHeapRows(dataDir, "2603", cols, rows)
+	_, err := writeMultiPageHeapRows(dataDir, "2603", cols, rows)
+	return err
 }
 
 // pgIndexColDefs returns the full PG18 FormData_pg_index column shape
@@ -1576,7 +1622,8 @@ func bootstrapPgIndexTuples(dataDir string) error {
 	for _, e := range entries {
 		rows = append(rows, pgIndexRow(e))
 	}
-	return writeMultiPageHeapRows(dataDir, "2610", cols, rows)
+	_, err := writeMultiPageHeapRows(dataDir, "2610", cols, rows)
+	return err
 }
 
 // pgClassColDefs returns pg_class column descriptors matching PG18's
@@ -1861,16 +1908,20 @@ func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []n
 }
 
 // writeMultiPageHeapRows is like writeMultiPageHeap but takes pre-built rows.
-func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows []executor.Row) error {
+// Returns the per-row heap TIDs in input order — callers that do not need
+// them may discard the slice. Step 3o uses the TIDs to build composite-key
+// btree index tuples for pg_attribute_relid_attnum_index.
+func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows []executor.Row) ([]heapTID, error) {
 	var pages [][]byte
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
-		return err
+		return nil, err
 	}
+	tids := make([]heapTID, 0, len(rows))
 	for _, row := range rows {
 		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
-			return fmt.Errorf("encode %s row: %w", relFile, err)
+			return nil, fmt.Errorf("encode %s row: %w", relFile, err)
 		}
 		bitmap := executor.NullBitmapPG(row)
 		var tuple storage.HeapTuple
@@ -1883,16 +1934,19 @@ func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows
 		if hasVarWidthCol(cols) {
 			tuple.Header.Infomask |= storage.HeapHasVarWidth
 		}
-		if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+		off, err := storage.PageAddHeapTuple(page, tuple)
+		if err != nil {
 			pages = append(pages, page)
 			page = make(storage.Page, storage.BlockSize)
 			if err := storage.InitPage(page); err != nil {
-				return err
+				return nil, err
 			}
-			if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
-				return fmt.Errorf("add %s tuple on fresh page: %w", relFile, err)
+			off, err = storage.PageAddHeapTuple(page, tuple)
+			if err != nil {
+				return nil, fmt.Errorf("add %s tuple on fresh page: %w", relFile, err)
 			}
 		}
+		tids = append(tids, heapTID{Block: uint32(len(pages)), Offset: off})
 	}
 	pages = append(pages, page)
 	raw := make([]byte, 0, storage.BlockSize*len(pages))
@@ -1901,13 +1955,16 @@ func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows
 	}
 	b1 := filepath.Join(dataDir, "base", "1")
 	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
-		return err
+		return nil, err
 	}
 	b5 := filepath.Join(dataDir, "base", "5")
 	if err := os.MkdirAll(b5, 0o700); err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(filepath.Join(b5, relFile), raw, 0o600)
+	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	return tids, nil
 }
 
 // pgCatalogTypeOID maps a goopg type name → PG type OID.

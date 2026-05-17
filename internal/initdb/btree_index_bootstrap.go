@@ -290,3 +290,118 @@ func bootstrapPgClassOidIndex(dataDir string, tids map[uint32]heapTID) error {
 	}
 	return nil
 }
+
+
+// pgBuildIndexTupleOidInt2Key constructs an IndexTuple for the
+// (oid attrelid, int2 attnum) composite key used by
+// pg_attribute_relid_attnum_index (OID 2659). Mirrors the byte layout
+// emitted by PG's `index_form_tuple` for a no-nulls 2-attribute tuple
+// where att1.align='i' (oid) and att2.align='s' (int2):
+//
+//	[0..3]   ItemPointerData.ip_blkid  (heapBlk, LE uint32)
+//	[4..5]   ItemPointerData.ip_posid  (heapOff, LE uint16)
+//	[6..7]   t_info (size_low_13_bits | flags=0)
+//	[8..11]  attrelid (LE uint32, oid_ops compares as unsigned)
+//	[12..13] attnum   (LE int16,  int2_ops compares as signed)
+//	[14..15] MAXALIGN padding (zero)
+//
+// Total size = MAXALIGN(IndexTupleHeader + att1.len + att2.len) =
+// MAXALIGN(8 + 4 + 2) = 16. The on-disk size stored in t_info's low
+// 13 bits is the MAXALIGN'd total (16) so PG `IndexTupleSize` matches
+// `len(out)`.
+func pgBuildIndexTupleOidInt2Key(heapBlk uint32, heapOff uint16, attrelid uint32, attnum int16) []byte {
+	const (
+		hoff = 8
+		size = 16 // MAXALIGN(hoff + 4 + 2) = MAXALIGN(14) = 16
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	// ItemPointerData.
+	le.PutUint32(out[0:4], heapBlk)
+	le.PutUint16(out[4:6], heapOff)
+
+	// t_info: lower 13 bits = size; no INDEX_VAR_MASK / INDEX_NULL_MASK.
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	// Key data.
+	le.PutUint32(out[hoff:hoff+4], attrelid)
+	le.PutUint16(out[hoff+4:hoff+6], uint16(attnum))
+	// Bytes [14..15] are MAXALIGN padding — already zero.
+	return out
+}
+
+// bootstrapPgAttributeRelidAttnumIndex overwrites the empty btree
+// placeholders at base/{1,5}/2659 + global/2659 with a 2-block btree file
+// (metapage + populated leaf-root) carrying one IndexTuple per pg_attribute
+// heap row, keyed on (attrelid, attnum). Closes the FATAL
+//
+//	pg_attribute catalog is missing N attribute(s) for relation OID …
+//
+// that surfaces during PG-standby boot once `criticalRelcachesBuilt = true`,
+// because `RelationBuildTupleDesc` then drives column lookups through
+// `systable_beginscan(AttributeRelidNumIndexId, …)` instead of falling back
+// to a sequential pg_attribute heap scan. The empty placeholder produced
+// by Step 3k returned zero rows for every (attrelid, attnum>0) probe.
+//
+// Btree leaves require monotonic key ordering across line pointers (PG
+// `_bt_binsrch`). The composite comparator is lexicographic over
+// (attrelid, attnum) — both columns ascending — matching the
+// `oid_ops, int2_ops` opclass tuple in `pgIndexInitialEntries`.
+//
+// Only attnum > 0 rows are produced because the bootstrap pg_attribute
+// heap currently seeds only user/catalog columns (no system attributes
+// such as ctid / xmin), and PG probes attnum > 0 in this code path;
+// system columns are resolved from a hardcoded table in
+// `SystemAttributeDefinition`.
+func bootstrapPgAttributeRelidAttnumIndex(dataDir string, tids map[pgAttrTIDKey]heapTID) error {
+	type entry struct {
+		attrelid uint32
+		attnum   int16
+		block    uint32
+		off      uint16
+	}
+	entries := make([]entry, 0, len(tids))
+	for k, t := range tids {
+		if k.AttNum <= 0 {
+			continue
+		}
+		entries = append(entries, entry{
+			attrelid: k.AttRelID,
+			attnum:   k.AttNum,
+			block:    t.Block,
+			off:      t.Offset,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].attrelid != entries[j].attrelid {
+			return entries[i].attrelid < entries[j].attrelid
+		}
+		return entries[i].attnum < entries[j].attnum
+	})
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidInt2Key(e.block, e.off, e.attrelid, e.attnum)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_attribute_relid_attnum_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2659, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_attribute_relid_attnum_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

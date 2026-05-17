@@ -3095,6 +3095,79 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         indexes are not yet seeded into `global/1249` (Step 3o
         territory). Design:
         `docs/design/0106-0010-step3n-pg-index-indkey-pg18-attnum-fixes.md`.
+      - Step 3o LANDED 2026-05-17. Closes the FATAL
+        `pg_attribute catalog is missing N attribute(s) for relation OID …`
+        PG-standby boot blocker that surfaced after Step 3n. Root cause:
+        once `criticalRelcachesBuilt = true` (set after the seven local
+        critical indexes finish loading), `RelationBuildTupleDesc` drives
+        every subsequent column lookup through
+        `systable_beginscan(AttributeRelidNumIndexId=2659,
+        {attrelid=X, attnum>0})` (postgres/src/backend/utils/cache/
+        relcache.c:436-500) instead of the no-critical-indexes-yet
+        sequential pg_attribute heap-scan fallback. The Step 3k empty
+        btree placeholder (`btm_root = P_NONE`) returned zero rows for
+        every probe, so the `if (need > 0) elog(ERROR, …)` check at the
+        end of `RelationBuildTupleDesc` FATAL'd on the first shared
+        critical index (`pg_database_datname_index` = OID 2671) loaded
+        in `RelationCacheInitializePhase3`'s shared-index pass. Local
+        critical indexes themselves never tripped the FATAL because
+        they finished loading *before* the flip, so their
+        `RelationBuildTupleDesc` invocations used the seq-scan fallback
+        (which read the pg_attribute rows already seeded by
+        `bootstrapPgAttributeTuples`).
+        Fix: new
+        `internal/initdb/btree_index_bootstrap.go::pgBuildIndexTupleOidInt2Key`
+        — goopg's first composite-key index tuple builder, emitting the
+        16-byte tuple PG's `index_form_tuple` produces for an
+        `oid_ops, int2_ops` no-nulls 2-attribute key (8-byte
+        IndexTupleHeader + 4-byte attrelid + 2-byte attnum + 2-byte
+        MAXALIGN pad; `t_info` stores size 16 with no flags) — plus
+        `bootstrapPgAttributeRelidAttnumIndex(dataDir, tids)` which
+        sorts (attrelid, attnum) lexicographically ascending, builds
+        a 2-block file (metapage with `btm_root=1` → leaf-root with
+        `BTP_LEAF|BTP_ROOT`), and writes to `base/{1,5}/2659` +
+        `global/2659`.
+        Heap-TID tracking: `writeMultiPageHeapRows` is widened to
+        `([]heapTID, error)` — the per-row TIDs in input order. Six
+        callers (`bootstrapPgAm*`, `pg_proc*`, `pg_opclass*`, `pg_amop*`,
+        `pg_amproc*`, `pg_index*`) discard the slice with `_, err :=`;
+        only `bootstrapPgAttributeTuples` consumes it, returning
+        `map[pgAttrTIDKey]heapTID` keyed on (attrelid, attnum). The
+        index builder filters `attnum > 0` because PG only probes
+        positive attnums via this index (system attributes are
+        resolved from a hardcoded `SystemAttributeDefinition` table).
+        `Init` consumes the new TID map and calls the bootstrap
+        right after `bootstrapPgClassOidIndex`. Regression pins:
+        `TestPgBuildIndexTupleOidInt2KeyLayoutMatchesPG18` (byte-exact
+        16-byte layout incl. `ip_blkid`/`ip_posid`/`t_info`/attrelid/
+        attnum offsets and zero pad);
+        `TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree`
+        (end-to-end: file = 2 blocks at all three on-disk locations;
+        metapage `btm_root == 1`; leaf-item count == sum of attnum>0
+        entries; each IndexTuple's (attrelid, attnum, TID) round-trips
+        against the pg_attribute heap map) in
+        `internal/initdb/btree_index_bootstrap_test.go`. Verified:
+        `go test -count=1 -run 'TestPgBuildIndexTupleOidInt2KeyLayout|TestBootstrapPgAttributeRelidAttnumIndex'
+        ./internal/initdb/` PASS;
+        `go test -count=1 -run 'TestPgBuildIndexTupleOidKey|TestPgBuildBtreeLeafRoot|TestPgBuildBtreeMetapage|TestBootstrapPgOpclassOidIndex|TestBootstrapPgClassOidIndex|TestPgIndex|TestBootstrapPgIndex|TestPgAm|TestPgOpclass|TestPgProc|TestNailedIndexRelnatts|TestPgClassOidIndexHasSingleKey|TestMakeBtreeRootPage'
+        ./internal/initdb/` — every Step 3a-3n pin still PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3n (`TestMigration*`, `TestCreate*`,
+        `TestBootstrappedPG*`, `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3o-pg-attribute-relid-attnum-index-tuples.md`.
+        Next blocker (Step 3p) will surface on the next E2E re-run —
+        probable next FATAL is a `pg_authid`/`pg_database` row lookup
+        via `pg_authid_oid_index` (2677) or `pg_database_oid_index`
+        (2672), both single-column oid-keyed indexes whose Step-3k
+        empty btree still returns zero rows.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
