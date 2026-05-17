@@ -405,3 +405,60 @@ func bootstrapPgAttributeRelidAttnumIndex(dataDir string, tids map[pgAttrTIDKey]
 	}
 	return nil
 }
+
+// bootstrapPgIndexIndexrelidIndex overwrites the empty btree placeholders
+// at base/{1,5}/2678 and global/2678 with a 2-block btree file (metapage +
+// populated leaf-root) carrying one IndexTuple per Form_pg_index heap row,
+// keyed on `indexrelid`. Closes the FATAL "cache lookup failed for index
+// 2671" blocker that surfaced after Step 3o.
+//
+// Why this is needed: after the seven local critical indexes finish loading,
+// `criticalRelcachesBuilt` flips to true; the immediately-following pass
+// over the six SHARED critical indexes invokes
+// `RelationInitIndexAccessInfo(relation)` → `SearchSysCache1(INDEXRELID,
+// RelationGetRelid(relation))` (postgres/src/backend/utils/cache/relcache.c:1467,
+// :2339) to materialise each index's Form_pg_index. The catcache miss falls
+// back to a sysscan against `pg_index_indexrelid_index` (OID 2678); the
+// Step-3k empty btree placeholder returned zero rows for every probe, so
+// the very first shared index — `pg_database_datname_index` (2671) — FATAL'd
+// with `cache lookup failed for index 2671`.
+//
+// Index tuples are sorted by `indexrelid` before page assembly so PG's
+// `_bt_binsrch` finds them via the standard ordered search.
+func bootstrapPgIndexIndexrelidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	entries := make([]entry, 0, len(tids))
+	for oid, t := range tids {
+		entries = append(entries, entry{oid: oid, block: t.Block, off: t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].oid < entries[j].oid })
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidKey(e.block, e.off, e.oid)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_index_indexrelid_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2678, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_index_indexrelid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

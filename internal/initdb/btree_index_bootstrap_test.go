@@ -401,3 +401,93 @@ func TestBootstrapPgAttributeRelidAttnumIndexWritesPopulatedBtree(t *testing.T) 
 		}
 	}
 }
+
+// TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree end-to-ends Step 3p:
+// file is 2 blocks at every disk location, block 0 is a metapage pointing at
+// block 1, block 1 is a leaf-root carrying one oid-keyed IndexTuple per
+// pgIndexInitialEntries() row sorted ascending by indexrelid, with the heap
+// TID encoded in ItemPointer matching what bootstrapPgIndexTuples reported.
+// Closes the FATAL "cache lookup failed for index 2671" blocker.
+func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"base/1", "base/5", "global"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	tids, err := bootstrapPgIndexTuples(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPgIndexTuples: %v", err)
+	}
+	if err := bootstrapPgIndexIndexrelidIndex(dir, tids); err != nil {
+		t.Fatalf("bootstrapPgIndexIndexrelidIndex: %v", err)
+	}
+
+	wantOIDs := make([]uint32, 0, len(tids))
+	for oid := range tids {
+		wantOIDs = append(wantOIDs, oid)
+	}
+	sort.Slice(wantOIDs, func(i, j int) bool { return wantOIDs[i] < wantOIDs[j] })
+
+	// Must cover every nailed index (i.e. the 2671 shared index plus all
+	// of nailedLocalRels' index OIDs). If this drops, Phase 3's SHARED
+	// critical-index pass FATALs immediately.
+	mustHave := []uint32{2671, 2672, 2676, 2677, 2695, 3593,
+		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680,
+		2687, 2688, 2690, 2691, 2693, 2701, 2703, 2704}
+	for _, w := range mustHave {
+		if _, ok := tids[w]; !ok {
+			t.Errorf("missing required pg_index TID for OID %d", w)
+		}
+	}
+
+	for _, path := range []string{
+		filepath.Join(dir, "base", "1", "2678"),
+		filepath.Join(dir, "base", "5", "2678"),
+		filepath.Join(dir, "global", "2678"),
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if len(raw) != 2*storage.BlockSize {
+			t.Errorf("%s: len=%d, want %d (2 blocks)", path, len(raw), 2*storage.BlockSize)
+			continue
+		}
+		base := storage.SizeOfPageHeaderData
+		if got := binary.LittleEndian.Uint32(raw[base+8 : base+12]); got != 1 {
+			t.Errorf("%s: btm_root=%d, want 1", path, got)
+		}
+		leaf := raw[storage.BlockSize : 2*storage.BlockSize]
+		h, err := storage.Header(storage.Page(leaf))
+		if err != nil {
+			t.Fatalf("%s: leaf header: %v", path, err)
+		}
+		nItems := (int(h.Lower()) - storage.SizeOfPageHeaderData) / 4
+		if nItems != len(wantOIDs) {
+			t.Errorf("%s: leaf items=%d, want %d", path, nItems, len(wantOIDs))
+			continue
+		}
+		for i := 0; i < nItems; i++ {
+			raw32 := binary.LittleEndian.Uint32(leaf[storage.SizeOfPageHeaderData+i*4 : storage.SizeOfPageHeaderData+i*4+4])
+			off := raw32 & 0x7FFF
+			length := (raw32 >> 17) & 0x7FFF
+			if length != 16 {
+				t.Errorf("%s: item %d length=%d, want 16", path, i, length)
+				continue
+			}
+			gotBlock := binary.LittleEndian.Uint32(leaf[off : off+4])
+			gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
+			gotOID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
+			if gotOID != wantOIDs[i] {
+				t.Errorf("%s: item %d OID=%d, want %d (sorted)", path, i, gotOID, wantOIDs[i])
+				continue
+			}
+			wantTID := tids[gotOID]
+			if gotBlock != wantTID.Block || gotOff != wantTID.Offset {
+				t.Errorf("%s: OID %d TID=(%d,%d), want (%d,%d)",
+					path, gotOID, gotBlock, gotOff, wantTID.Block, wantTID.Offset)
+			}
+		}
+	}
+}

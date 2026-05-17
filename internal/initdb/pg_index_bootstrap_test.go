@@ -24,7 +24,7 @@ func TestBootstrapPgIndexTuplesWritesHeapPagesToBase1And5(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	if err := bootstrapPgIndexTuples(dir); err != nil {
+	if _, err := bootstrapPgIndexTuples(dir); err != nil {
 		t.Fatalf("bootstrapPgIndexTuples: %v", err)
 	}
 	for _, sub := range []string{"base/1", "base/5"} {

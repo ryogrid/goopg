@@ -3168,6 +3168,78 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         via `pg_authid_oid_index` (2677) or `pg_database_oid_index`
         (2672), both single-column oid-keyed indexes whose Step-3k
         empty btree still returns zero rows.
+      - Step 3p LANDED PARTIAL 2026-05-18. The next E2E re-run after
+        Step 3o produced a different FATAL than predicted:
+        `FATAL: cache lookup failed for index 2671` (relcache.c:1467
+        in `RelationInitIndexAccessInfo` — `SearchSysCache1(INDEXRELID,
+        2671)` returns nothing). Source is the SHARED critical-index
+        pass's `load_critical_index(DatabaseNameIndexId=2671,
+        DatabaseRelationId=1262)`. After the LOCAL phase finishes,
+        `criticalRelcachesBuilt` flips to true, so the catcache miss
+        falls back to a sysscan against `pg_index_indexrelid_index`
+        (OID 2678) — Step 3k's empty btree placeholder returned zero
+        rows on every probe.
+        Fix (Step 3p): new
+        `internal/initdb/btree_index_bootstrap.go::
+        bootstrapPgIndexIndexrelidIndex(dataDir, tids)` builds the
+        2-block btree (metapage + populated leaf-root) at
+        `base/{1,5}/2678` + `global/2678` carrying one
+        `pgBuildIndexTupleOidKey`-shaped 16-byte oid-keyed IndexTuple
+        per `Form_pg_index` heap row, sorted ascending by `indexrelid`,
+        with each leaf tuple's `t_tid` stamped at the heap row's
+        actual (block, offset). Reuses Step 3l/3m's builders verbatim.
+        `bootstrapPgIndexTuples` widened to return
+        `(map[uint32]heapTID, error)` keyed by `indexrelid` (matching
+        Step 3m's `bootstrapPgClassTuples` pattern); the single
+        existing test caller drops the map with `_, err :=`. `Init`
+        captures `pgIndexTIDs, err := bootstrapPgIndexTuples(abs)`
+        and calls `bootstrapPgIndexIndexrelidIndex(abs, pgIndexTIDs)`
+        right after the heap seed. Regression pins:
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree`
+        (file = 2 blocks at all three on-disk locations; metapage
+        `btm_root == 1`; 23 leaf items oid-sorted ascending; per-OID
+        TID round-trip against the heap map; mandatory presence of
+        every shared-critical OID (2671/2/6/7/95, 3593) + 17 local
+        nailed-index OIDs). Verified `go test -count=1 -run
+        'TestBootstrapPgIndexIndexrelidIndex|TestBootstrapPgIndexTuples'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        same 14 baseline failures as Step 3o (no regressions); cross-
+        package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Bytes confirmed identical between the
+        standalone `goopg init` output and the PG-standby data dir
+        after pg_basebackup (`cmp` MATCH).
+        **PARTIAL** — the FATAL persists despite the btree being
+        correctly populated and shipped to the standby. Investigation
+        revealed a deeper catalog-state inconsistency: BOTH
+        `pgIndexInitialEntries()` (initdb.go) and `nailedLocalRels`
+        (relcache_init.go) OMIT OID 2678 (`pg_index_indexrelid_index`)
+        ITSELF. Direct heap dumps confirm:
+          - `pg_class` heap (base/5/1259) has rows for 25 nailed
+            relations but NONE for OID 2678.
+          - `pg_index` heap (base/5/2610) has 23 rows but none with
+            `indexrelid = 2678`.
+        PG's LOCAL critical-index pass at relcache.c:4183 calls
+        `load_critical_index(IndexRelidIndexId=2678,
+        IndexRelationId=2610)`. With no pg_class row, RelationBuildDesc
+        should return NULL and load_critical_index PANIC with
+        "could not open critical system index 2678" — yet the PG log
+        shows no such PANIC, indicating PG silently falls through some
+        path that leaves the relcache entry for 2678 partial, which
+        then defeats my Step 3p btree on the SHARED pass (where 2671
+        is the first probe). Step 3p's btree IS load-bearing for the
+        eventual fix; Step 3q must add OID 2678 to both lists, after
+        which Step 3p's code requires no further change.
+        Design: `docs/design/0106-0010-step3p-pg-index-indexrelid-index-tuples.md`.
+      - Next blocker (Step 3q): add OID 2678 to
+        `pgIndexInitialEntries()` (with `indrelid=2610, indkey={1},
+        indclass={oid_ops}, indcollation={0}, unique=true,
+        primary=true`) AND to `nailedLocalRels` (with same indkey).
+        Also add 2678 to the empty-placeholder list at initdb.go:670
+        so the file exists for PG's mdopen before Step 3p overwrites
+        it. After Step 3q, the heap TID for 2678's Form_pg_index row
+        will automatically flow into Step 3p's btree via the existing
+        TID-map plumbing — no Step 3p code change required.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3183,7 +3255,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_index_relnatts_test.go`,
         `internal/initdb/pg_index_indkey_test.go`,
         `internal/initdb/btree_metapage_test.go`,
-        `internal/initdb/btree_index_bootstrap_test.go`
+        `internal/initdb/btree_index_bootstrap_test.go`,
+        `docs/design/0106-0010-step3p-pg-index-indexrelid-index-tuples.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -238,8 +238,22 @@ func Init(opts Options) error {
 	// "FATAL: could not open file base/5/2610". A heap-initialised
 	// page with zero tuples is the minimum that satisfies BasicOpenFile;
 	// per-index rows come in the next step.
-	if err := bootstrapPgIndexTuples(abs); err != nil {
+	pgIndexTIDs, err := bootstrapPgIndexTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_index tuples: %w", err)
+	}
+	// M0106-0010 step 3p: overwrite the empty btree placeholder at
+	// base/{1,5}/2678 + global/2678 with a populated 2-page btree
+	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per
+	// Form_pg_index heap row so PG's
+	// load_critical_index → RelationInitIndexAccessInfo →
+	// SearchSysCache1(INDEXRELID, oid) — the call taken once
+	// criticalRelcachesBuilt becomes true while loading the
+	// SHARED critical indexes — finds the pg_index row via
+	// pg_index_indexrelid_index. Without this the next FATAL during
+	// standby boot is "cache lookup failed for index 2671".
+	if err := bootstrapPgIndexIndexrelidIndex(abs, pgIndexTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_index_indexrelid_index: %w", err)
 	}
 	// M0106-0010 step 3l: overwrite the empty btree placeholder at
 	// base/{1,5}/2687 + global/2687 with a populated 2-page btree
@@ -1615,15 +1629,26 @@ func pgIndexRow(e pgIndexEntry) executor.Row {
 // `RelationCacheInitializePhase3 → load_critical_index → ScanPgRelation
 // → SearchSysCache1(INDEXRELID, ...)`; without an actual row each
 // nailed index FATALs with "cache lookup failed for index <oid>".
-func bootstrapPgIndexTuples(dataDir string) error {
+//
+// Returns a map keyed by `indexrelid` so Step 3p's
+// bootstrapPgIndexIndexrelidIndex can stamp each leaf IndexTuple's
+// t_tid at the (block, offset) where its Form_pg_index row landed.
+func bootstrapPgIndexTuples(dataDir string) (map[uint32]heapTID, error) {
 	cols := pgIndexColDefs()
 	entries := pgIndexInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
 		rows = append(rows, pgIndexRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "2610", cols, rows)
-	return err
+	tids, err := writeMultiPageHeapRows(dataDir, "2610", cols, rows)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[uint32]heapTID, len(entries))
+	for i, e := range entries {
+		m[e.IndexRelid] = tids[i]
+	}
+	return m, nil
 }
 
 // pgClassColDefs returns pg_class column descriptors matching PG18's
