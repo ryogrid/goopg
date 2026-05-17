@@ -3398,15 +3398,64 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         during UPDATE chain following) but a follow-up step will
         harmonise it once an actual symptom surfaces. Design:
         `docs/design/0106-0010-step3s-index-tuple-block-id-encoding.md`.
-      - Next blocker (Step 3t): re-run
+      - Step 3t LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2684` PG-standby boot blocker
+        that surfaced after Step 3s. Root cause: the Step 3s note
+        hypothesised OID 2684 = `pg_amop_fam_strat_index`, but the
+        authoritative `postgres/src/include/catalog/pg_namespace.h:56-57`
+        + `pg_namespace_d.h:24-25` show 2684 = `pg_namespace_nspname_index`
+        (`btree(nspname name_ops)` UNIQUE) and 2685 =
+        `pg_namespace_oid_index` (`btree(oid oid_ops)` UNIQUE PRIMARY
+        KEY). `pg_amop_fam_strat_index` is actually OID 2653. Both
+        pg_namespace indexes had Step-3k empty-placeholder relfiles
+        but neither was registered in `pgIndexInitialEntries()` (no
+        `Form_pg_index` heap row, no leaf in the populated 2679 btree,
+        no entry in the per-index TID map) nor in `nailedLocalRels`
+        (no pg_class row written by `bootstrapPgClassTuples`). The
+        first `RelationIdGetRelation(2684)` therefore sysscanned
+        `pg_class_oid_index` (OID 2662) — which after Step 3s returns
+        valid TIDs — and FATAL'd because no pg_class row exists for
+        2684. Fix: two `entry(…)` calls added to
+        `pgIndexInitialEntries` after `pg_inherits_relid_seqno_index`
+        (`entry(2684, 2615, {2}, {nameOps}, {cCollation}, true, false)`
+        and `entry(2685, 2615, {1}, {oidOps}, {0}, true, true)`); two
+        `idxSpec` rows added to `nailedLocalRels` (`{2684,
+        "pg_namespace_nspname_index"}`, `{2685,
+        "pg_namespace_oid_index"}`). No builder/encoder/Init flow
+        change — TIDs flow through the existing
+        `bootstrapPgIndexIndexrelidIndex` plumbing automatically. The
+        three empty-placeholder OID lists at `initdb.go:592/674/689`
+        already include 2684/2685. Regression pins:
+        `TestPgNamespaceIndexesSeededFromInitialEntries` and
+        `TestNailedLocalRelsContainsPgNamespaceIndexes` (new) in
+        `internal/initdb/pg_namespace_index_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` extended with
+        both OIDs (count guard auto-rejects future adds without map
+        updates); `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2684/2685. Verified:
+        `go test -count=1 -run
+        'TestPgNamespaceIndexes|TestNailedLocalRelsContainsPgNamespaceIndexes|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestPgIndex2678|TestNailedLocalRelsContainsPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3s (`TestMigration*`, `TestCreate*`,
+        `TestBootstrappedPG*`, `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3t-pg-namespace-index-seeds.md`.
+      - Next blocker (Step 3u): re-run
         `GOOPG_RUN_BLOCKED_M0102_E2E=1
-        TestE2E_FailoverGoopgToPG/async` and populate (or seed) the
-        relation `pg_amop_fam_strat_index` (OID 2684). The FATAL
-        `could not open relation with OID 2684` indicates either the
-        pg_class row for 2684 is missing from
-        `pgClassInitialEntries`/`nailedLocalRels`, or the relfile
-        `base/{1,5}/2684` is not laid down by initdb. Likely a missing
-        nailed-index seed for pg_amop's family/strategy index.
+        TestE2E_FailoverGoopgToPG/async` and capture the next FATAL.
+        Likely next: a syscache lookup against another nailed index
+        OID still on Step 3k's empty placeholder (e.g. 2667
+        pg_constraint_oid_index, 2680 pg_inherits_relid_seqno_index,
+        or one of pg_proc/pg_type's oid indexes), or a missing pg_proc
+        row for a function looked up by OID during early startup.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3421,10 +3470,12 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_index_bootstrap_test.go`,
         `internal/initdb/pg_index_relnatts_test.go`,
         `internal/initdb/pg_index_indkey_test.go`,
+        `internal/initdb/pg_namespace_index_test.go`,
         `internal/initdb/btree_metapage_test.go`,
         `internal/initdb/btree_index_bootstrap_test.go`,
         `docs/design/0106-0010-step3p-pg-index-indexrelid-index-tuples.md`,
-        `docs/design/0106-0010-step3s-index-tuple-block-id-encoding.md`
+        `docs/design/0106-0010-step3s-index-tuple-block-id-encoding.md`,
+        `docs/design/0106-0010-step3t-pg-namespace-index-seeds.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

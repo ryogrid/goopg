@@ -46,6 +46,8 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2667: {1},        // pg_constraint_oid_index
 		2688: {1},        // pg_operator_oid_index
 		2680: {1, 3},     // pg_inherits_relid_seqno_index : btree(inhrelid, inhseqno)
+		2684: {2},        // pg_namespace_nspname_index : btree(nspname name_ops)            ← Step 3t
+		2685: {1},        // pg_namespace_oid_index     : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3t
 		2654: {7, 6, 2},  // pg_amop_opr_fam_index : btree(amopopr, amoppurpose, amopfamily)
 	}
 	got := make(map[uint32][]int16, len(want))

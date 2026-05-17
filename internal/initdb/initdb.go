@@ -1583,6 +1583,14 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_constraint_oid_index
 		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_operator_oid_index
 		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                        // pg_inherits_relid_seqno_index
+		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
+		// 3=nspowner, 4=nspacl. PG18 indexing.h:
+		//   NamespaceNameIndexId = 2684 = pg_namespace_nspname_index
+		//     btree(nspname name_ops) UNIQUE
+		//   NamespaceOidIndexId  = 2685 = pg_namespace_oid_index
+		//     btree(oid oid_ops) UNIQUE PRIMARY KEY
+		entry(2684, 2615, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),                           // pg_namespace_nspname_index
+		entry(2685, 2615, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                      // pg_namespace_oid_index
 		// OID 2654 = pg_amop_opr_fam_index: btree(amopopr oid_ops,
 		// amoppurpose char_ops, amopfamily oid_ops). amoppurpose is
 		// pg_amop attnum 6 (char), amopopr is attnum 7, amopfamily attnum 2.
