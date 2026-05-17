@@ -5027,6 +5027,41 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         3468 oid); next E2E re-run will surface the next-blocker OID
         beyond pg_event_trigger.
         Design: `docs/design/0106-0010-step3at-pg-event-trigger-oid-index.md`.
+      - PROGRESS 2026-05-18 (Step 3au investigation): E2E re-run after Step 3at
+        surfaces the next blocker as `FATAL: could not open relation with OID 3079`
+        = `pg_extension` per `postgres/src/include/catalog/pg_extension_d.h:23`
+        (`#define ExtensionRelationId 3079`). The steady-state nailed-rel fix
+        cannot land in isolation: adding pg_extension's 8 pg_attribute rows
+        pushes `bootstrapPgAttributeRelidAttnumIndex`'s populated leaf-root
+        btree at file OID 2659 past its single-page capacity. The current
+        `pgBuildBtreeLeafRootPage` in
+        `internal/initdb/btree_index_bootstrap.go` caps at 407 tuples
+        (8KB page − 24B header − 16B btree opaque ÷ 20B per tuple+lp);
+        the existing nailed-rel attrs already fill it to 407, so eight
+        more attrs from pg_extension overflow with
+        `btree leaf overflow inserting tuple 407`. Empirically confirmed
+        by `git stash` of the pg_extension changes restoring green tests
+        and reapplying triggering the overflow in 20+ initdb tests that
+        invoke `Init()`. Resolution scoped for Step 3av: refactor
+        `pgBuildBtreeLeafRootPage` into a 2-level PG18-compatible bulk-load
+        builder (`pgBuildBtreeBulkLoad`) — metapage at block 0, leaves at
+        blocks 1..N with `btpo_prev`/`btpo_next` sibling links and P_HIKEY
+        at item slot 1 on every non-rightmost leaf, root at block N+1
+        with `BTP_ROOT` + `btpo_level=1` + N downlink tuples. Internal-node
+        downlinks per `nbtsort.c::BTreeTupleSetDownLink` (line 563) and
+        `nbtree.h:603`: same 16-byte IndexTupleData header, `t_tid.ip_blkid`
+        = child block (bi_hi:bi_lo encoding mirroring Step 3s),
+        `t_tid.ip_posid` = `nkeyatts & BT_OFFSET_MASK`, `t_info |=
+        INDEX_ALT_TID_MASK` (bit 0x2000). Leftmost downlink is a
+        zero-attribute "minus infinity" pivot tuple (8-byte
+        `IndexTupleData` header only) per `nbtsort.c:1006-1008`. After
+        Step 3av's refactor lands, the pg_extension seed itself is a
+        pure catalog-seed change (new `pgExtensionAttrs()` returning the
+        8-column PG18 schema per `pg_extension.h:29-45`, `nailedLocalRels`
+        entry `{3079, "pg_extension", 83, 'r', 8, false, pgExtensionAttrs()}`,
+        3079 added to `bootstrapMappedLocalCatalogHeaps` OID list +
+        `localRelMap`, companion indexes 3080 / 3081 in subsequent steps).
+        Design: `docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -5100,7 +5135,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_event_trigger_evtname_index_test.go`,
         `docs/design/0106-0010-step3as-pg-event-trigger-evtname-index.md`,
         `internal/initdb/pg_event_trigger_oid_index_test.go`,
-        `docs/design/0106-0010-step3at-pg-event-trigger-oid-index.md`
+        `docs/design/0106-0010-step3at-pg-event-trigger-oid-index.md`,
+        `docs/design/0106-0010-step3au-multi-leaf-btree-prereq.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
