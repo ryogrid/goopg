@@ -215,3 +215,26 @@ If Go symbol operations fail:
 - Reported `server_version` is tracked in design doc `root-0001-architecture-overview.md`
   so client gating (`pgx`, JDBC, `psql`) behaves predictably.
 
+## Vanilla PG Compatibility (ABSOLUTE)
+
+The postgres source tree at `./postgres/` is a **read-only reference oracle**.
+**NEVER modify PG source code** to make replication or any other integration
+work with goopg. Not even "one-line fixes" or "harmless changes."
+
+The entire purpose of M0105/M0106 is that a **vanilla, unmodified PostgreSQL**
+binary bootstrapped from a goopg basebackup must start, stream WAL, and serve
+read-only queries. If something doesn't work, the fix belongs in **goopg**,
+not in PG.
+
+Permitted PG interactions:
+- Adding `elog(DEBUG1, ...)` calls for diagnostic purposes (must be reverted
+  after the investigation concludes).
+- Reading PG source code to understand wire format, catalog layout, and
+  expected invariants.
+- Running `make install` to rebuild PG after adding/removing debug logging.
+
+Absolutely forbidden:
+- Changing PG function signatures, struct layouts, or logic.
+- Adding `if (goopg_compat) {...}` branches or similar workarounds.
+- Any change that would make PG behave differently from upstream release.
+
