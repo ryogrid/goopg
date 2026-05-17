@@ -45,6 +45,11 @@ func bootstrapRelcacheInitFiles(dataDir string) error {
 	if err := os.WriteFile(dst, srcData, 0o600); err != nil {
 		return fmt.Errorf("write base/5/pg_internal.init: %w", err)
 	}
+	// Read-only to prevent PG from overwriting.
+	if err := os.Chmod(dst, 0o400); err != nil {
+		return fmt.Errorf("chmod base/5/pg_internal.init: %w", err)
+	}
+
 	return nil
 }
 
@@ -173,7 +178,6 @@ func writeRelcacheInitFile(dataDir string, shared bool, rels []nailedRel) error 
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	// Magic number
 	if err := binary.Write(f, binary.LittleEndian, uint32(relCacheInitFileMagic)); err != nil {
@@ -216,7 +220,12 @@ func writeRelcacheInitFile(dataDir string, shared bool, rels []nailedRel) error 
 		}
 	}
 
-	return nil
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// Write as read-only to prevent PG's write_relcache_init_file from
+	// overwriting hand-crafted init data when the standby starts up.
+	return os.Chmod(path, 0o400)
 }
 
 func buildRelationDataBlob(rel nailedRel) []byte {
