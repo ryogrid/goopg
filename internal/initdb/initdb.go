@@ -199,6 +199,12 @@ func Init(opts Options) error {
 	if err := bootstrapPgAttributeTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_attribute tuples: %w", err)
 	}
+	// M0106-0010 step 2: write pg_am rows so PG's
+	// RelationInitIndexAccessInfo → SearchSysCache1(AMOID, ...) does
+	// not return NULL and PANIC when opening a critical index.
+	if err := bootstrapPgAmTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_am tuples: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -604,6 +610,68 @@ func bootstrapPgAttributeTuples(dataDir string) error {
 		}
 	}
 	return writeMultiPageHeapRows(dataDir, "1249", attrCols, rows)
+}
+
+// pgAmColDefs returns pg_am column descriptors matching PG18's
+// FormData_pg_am struct byte-for-byte. RelationInitIndexAccessInfo
+// calls SearchSysCache1(AMOID, relam) → systable_getnext, which
+// returns a HeapTuple whose data is cast as Form_pg_am. The four
+// columns are: oid (OID, 4) + amname (NameData, 64) + amhandler
+// (regproc=OID, 4) + amtype (char, 1).
+func pgAmColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},
+		{Name: "amname", Type: catalog.Type{Name: "name"}},
+		{Name: "amhandler", Type: catalog.Type{Name: "oid"}},
+		{Name: "amtype", Type: catalog.Type{Name: "char"}},
+	}
+}
+
+// pgAmEntry is one row of pg_am.
+type pgAmEntry struct {
+	OID       uint32
+	Name      string
+	HandlerID uint32
+	AmType    byte // 'i'=index, 't'=table
+}
+
+// pgAmInitialEntries mirrors the seven seed rows in PG18's
+// src/include/catalog/pg_am.dat. The handler OIDs come from
+// pg_proc.dat (heap_tableam_handler=3, bthandler=330, etc.).
+func pgAmInitialEntries() []pgAmEntry {
+	return []pgAmEntry{
+		{2, "heap", 3, 't'},
+		{403, "btree", 330, 'i'},
+		{405, "hash", 331, 'i'},
+		{783, "gist", 332, 'i'},
+		{2742, "gin", 333, 'i'},
+		{4000, "spgist", 334, 'i'},
+		{3580, "brin", 335, 'i'},
+	}
+}
+
+// pgAmRow builds one pg_am tuple in pgAmColDefs order.
+func pgAmRow(e pgAmEntry) executor.Row {
+	return executor.Row{
+		executor.NewIntDatum(int64(e.OID)),
+		executor.NewStringDatum(e.Name),
+		executor.NewIntDatum(int64(e.HandlerID)),
+		executor.NewStringDatum(string(rune(e.AmType))),
+	}
+}
+
+// bootstrapPgAmTuples writes PG-native pg_am heap tuples (one per
+// access method) so vanilla PG's SearchSysCache1(AMOID, relam) inside
+// RelationInitIndexAccessInfo finds the AM row instead of returning
+// InvalidOid and PANICing on a critical index open.
+func bootstrapPgAmTuples(dataDir string) error {
+	cols := pgAmColDefs()
+	entries := pgAmInitialEntries()
+	rows := make([]executor.Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, pgAmRow(e))
+	}
+	return writeMultiPageHeapRows(dataDir, "2601", cols, rows)
 }
 
 // pgClassColDefs returns pg_class column descriptors matching PG18's

@@ -103,7 +103,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{2615, "pg_namespace", 83, 'r', 5, false, pgNamespaceAttrs()},
 	{2604, "pg_attrdef", 83, 'r', 3, false, pgAttrdefAttrs()},
 	{2606, "pg_constraint", 83, 'r', 11, false, pgConstraintAttrs()},
-	{2601, "pg_am", 83, 'r', 3, false, pgAmAttrs()},
+	{2601, "pg_am", 83, 'r', 4, false, pgAmAttrs()},
 	{2617, "pg_operator", 83, 'r', 10, false, pgOperatorAttrs()},
 	{3456, "pg_collation", 83, 'r', 8, false, pgCollationAttrs()},
 	{2611, "pg_inherits", 83, 'r', 3, false, pgInheritsAttrs()},
@@ -618,6 +618,10 @@ func pgAmAttrs() []nailedAttr {
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "amname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
 		{Name: "amhandler", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		// M0106-0010 step 2: PG18 FormData_pg_am declares 4 columns.
+		// Heap-tuple seed in initdb writes a 1-byte char at the
+		// trailing slot; the init file's TupleDesc must agree.
+		{Name: "amtype", TypeOID: 18, Num: 4, Len: 1, NotNull: true},
 	}
 }
 

@@ -2317,7 +2317,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         enabling PM_HOT_STANDBY and allowing pg_ctl -w to succeed.
       - File: `internal/wal/format.go`
 
-- [ ] **M0105-0010**
+- [x] **M0105-0010**
       - Summary: Encode tuple data in PG-native physical format on disk.
       - PG standby reaches PM_HOT_STANDBY and accepts connections, but
         authentication fails because pg_authid rows use goopg's internal
@@ -2352,7 +2352,7 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
 
 ### Sub-milestones
 
-- [ ] **M0106-0001**
+- [x] **M0106-0001**
       - Summary: Extract PG struct sizes and offsets.
       - Determine sizeof(RelationData), sizeof(FormData_pg_class),
         sizeof(FormData_pg_attribute), ATTRIBUTE_FIXED_PART_SIZE from
@@ -2362,7 +2362,7 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         source code.
       - File: `internal/initdb/relcache_init_offsets.go` (new)
 
-- [ ] **M0106-0002**
+- [x] **M0106-0002**
       - Summary: Encode FormData_pg_class and FormData_pg_attribute.
       - Build PG-native binary encoders for the pg_class and pg_attribute
         tuple forms. Each nailed relation needs a valid Form_pg_class
@@ -2371,7 +2371,7 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         PG18 definitions. Use PG-native encoding (LE, PG type alignment).
       - File: `internal/initdb/relcache_init_encode.go` (new)
 
-- [ ] **M0106-0003**
+- [x] **M0106-0003**
       - Summary: Build RelationData blob encoder.
       - Encode the PG RelationData struct as a binary blob with correct
         field offsets. Key fields: rd_id, rd_node, rd_rel (will be
@@ -2379,7 +2379,7 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         are zeroed by the loader. The sizeof must match PG18 exactly.
       - File: `internal/initdb/relcache_init_encode.go`
 
-- [ ] **M0106-0004**
+- [x] **M0106-0004**
       - Summary: Generate relcache init file writer.
       - Implement `writeRelcacheInitFile(shared bool, relations []NailedRel)`
         that produces the binary file in PG's `RELCACHE_INIT_FILEMAGIC`
@@ -2387,7 +2387,7 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         variants.
       - File: `internal/initdb/relcache_init.go` (new)
 
-- [ ] **M0106-0005**
+- [x] **M0106-0005**
       - Summary: Integrate into goopg initdb.
       - Call the init file generation during `goopg init` after catalog
         bootstrap. Write `global/pg_internal.init` and
@@ -2407,7 +2407,7 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
       - Update milestone doc to accepted. Update design doc to accepted.
         Run regression suite. Mark all tasks [x].
 
-- [ ] **M0106-0008**
+- [x] **M0106-0008**
       - Summary: Populate pg_class heap tuples for nailed relations, and
         maintain relcache/catcache + init file during normal operation.
       - Root cause (strace-confirmed 2026-05-17): vanilla PG's
@@ -2486,14 +2486,38 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         (pre-existing baseline failures in `internal/initdb/`,
         `internal/wal/` unchanged — confirmed via baseline diff).
         Design: `docs/design/0106-0010-pg-class-empty-array-encoding.md`.
-      - Step 2 (still open): `SearchSysCache1(AMOID, 403)` during
-        `RelationInitIndexAccessInfo` will likely fail next because the
-        pg_am heap is still empty.  Write the btree AM tuple (OID 403,
-        amname="btree", amhandler=330, amtype='i') into `base/1/2601` /
-        `base/5/2601`.  May also need pg_opclass / pg_amop / pg_amproc
-        tuples.
+      - Step 2 LANDED 2026-05-17. `internal/initdb/initdb.go` gains
+        `pgAmColDefs` / `pgAmEntry` / `pgAmInitialEntries` / `pgAmRow` /
+        `bootstrapPgAmTuples`, called from `Init` after the existing
+        pg_class and pg_attribute heap seeds. Seven PG18-canonical AMs
+        (heap=2/handler=3/'t', btree=403/330/'i', hash=405/331/'i',
+        gist=783/332/'i', gin=2742/333/'i', spgist=4000/334/'i',
+        brin=3580/335/'i') land as `Form_pg_am`-shaped heap tuples in
+        `base/1/2601` and `base/5/2601` via `writeMultiPageHeapRows`.
+        `internal/initdb/relcache_init.go` adds the missing `amtype`
+        column to `pgAmAttrs()` and bumps `pg_am` relnatts 3→4 so the
+        init-file TupleDesc agrees with the heap layout. Regression
+        pins: `TestPgAmRowBtreeMatchesFormPgAm`,
+        `TestPgAmInitialEntriesCoverPg18Defaults`,
+        `TestBootstrapPgAmTuplesWritesBtreeRowToBase1And5` in
+        `internal/initdb/pg_am_bootstrap_test.go`.  Verified:
+        `go test -count=1 ./internal/initdb/` (pre-existing
+        `TestSynchronousCommitFlushesByDefault` failure confirmed via
+        baseline-diff stash; all other initdb tests including the new
+        pg_am cases PASS) and `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step2-pg-am-bootstrap.md`.
+      - Step 3 (still open): `RelationInitIndexAccessInfo` continues
+        into `bthandler` via fmgr after the AMOID syscache hit. That
+        needs (a) `pg_proc` rows for the handler OIDs (e.g. 330 for
+        `bthandler`), (b) `pg_opclass` rows for the operator classes
+        pg_index columns reference, and (c) `pg_amop` / `pg_amproc`
+        rows for each opclass's strategy/support fns. Tracked as a
+        follow-up loop under M0106-0010.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
-        `internal/initdb/relcache_init.go`
+        `internal/initdb/relcache_init.go`,
+        `internal/initdb/pg_am_bootstrap_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
