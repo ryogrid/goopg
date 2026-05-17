@@ -2833,6 +2833,51 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         index 2662` — a pg_class/pg_index consistency issue tracked
         as Step 3j. Design:
         `docs/design/0106-0010-step3i-null-bitmap-encoding.md`.
+      - Step 3j LANDED 2026-05-17. Closes the FATAL
+        "relnatts disagrees with indnatts for index 2662" PG-standby
+        boot blocker that survived Step 3i. Root cause:
+        `internal/initdb/relcache_init.go::flattenRels` hardcoded
+        `RelNatts = 2` for every nailed index, but Step 3g's
+        `pgIndexInitialEntries` faithfully set `indnatts =
+        len(IndKey)` per index — so every single-column nailed
+        index (16 of 23, e.g. `pg_class_oid_index` keyed on
+        `[oid]`) FATALed PG's `RelationInitIndexAccessInfo`
+        consistency check
+        (`postgres/src/backend/utils/cache/relcache.c:1490-1493` —
+        `if (indnatts != IndexRelationGetNumberOfAttributes(relation))
+        elog(ERROR, "relnatts disagrees with indnatts for index %u")`).
+        Fix: new `internal/initdb/initdb.go::pgIndexNattsByOID()`
+        derives `map[indexOID]int16` directly from
+        `pgIndexInitialEntries`; `internal/initdb/relcache_init.go::
+        flattenRels` consults this map per index instead of using the
+        hardcoded `2`. The single-source-of-truth flow-through then
+        keeps `RelNatts`, `len(Attrs)`, the heap pg_class tuple's
+        `relnatts` (via `pgClassRow`), the init-file pg_class blob's
+        `relnatts` (via `buildPgClassBlob`), and the per-index
+        pg_attribute heap rows (via `pgAttrEntriesForRel` walking
+        `rel.Attrs`) all consistent with the underlying pg_index row.
+        Fallback `n=1` keeps the loop robust if an index lands in
+        `nailedSharedRels` / `nailedLocalRels` before its
+        `pgIndexInitialEntries` row does — but the new test pin
+        catches that gap loudly. Per-column type fidelity in
+        `indexKeyAttrs` (still types every index key as `oid`)
+        deliberately deferred to the next E2E re-run. Regression
+        pins: `TestNailedIndexRelnattsAgreesWithIndnatts` (walks
+        every nailed index and asserts `RelNatts == indnatts` and
+        `len(Attrs) == indnatts`) and
+        `TestPgClassOidIndexHasSingleKeyColumn` (canary for OID
+        2662) in
+        `internal/initdb/pg_index_relnatts_test.go`. Verified:
+        `go test -count=1 -run
+        'TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuplesWritesHeapPagesToBase1And5'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — the 14 pre-existing
+        baseline failures are unchanged (stash-baseline diff with the
+        new test file moved aside confirms zero new regressions);
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3j-relnatts-indnatts-alignment.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/storage/heap.go`,
@@ -2843,7 +2888,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_opclass_bootstrap_test.go`,
         `internal/initdb/pg_amop_bootstrap_test.go`,
         `internal/initdb/pg_amproc_bootstrap_test.go`,
-        `internal/initdb/pg_index_bootstrap_test.go`
+        `internal/initdb/pg_index_bootstrap_test.go`,
+        `internal/initdb/pg_index_relnatts_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

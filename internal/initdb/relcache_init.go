@@ -147,10 +147,20 @@ type idxSpec struct {
 func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 	var out []nailedRel
 	out = append(out, heaps...)
+	natts := pgIndexNattsByOID()
 	for _, idx := range idxs {
-		// Index Natts = 2 for btree (pg_class_oid_index has key cols: oid).
-		// Most critical indexes are unique btree with 1-2 key columns.
-		out = append(out, indexNailed(idx.OID, idx.Name, 2))
+		// Each index's natts MUST equal its pg_index.indnatts; PG's
+		// RelationInitIndexAccessInfo asserts relnatts == indnatts and
+		// FATALs with "relnatts disagrees with indnatts for index <oid>"
+		// otherwise (postgres/src/backend/utils/cache/relcache.c:1492).
+		n, ok := natts[idx.OID]
+		if !ok {
+			// Fallback for any index without a pg_index seed row. 1 is
+			// the most common arity and matches the historical default
+			// for OID-keyed unique indexes.
+			n = 1
+		}
+		out = append(out, indexNailed(idx.OID, idx.Name, n))
 	}
 	return out
 }

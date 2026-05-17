@@ -1446,6 +1446,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 	return out
 }
 
+// pgIndexNattsByOID returns the per-index attribute count derived from
+// pgIndexInitialEntries. It is consumed by relcache_init.go::flattenRels
+// to keep pg_class.relnatts aligned with pg_index.indnatts for every
+// nailed index — PG's RelationInitIndexAccessInfo FATALs with
+// "relnatts disagrees with indnatts for index <oid>" otherwise.
+func pgIndexNattsByOID() map[uint32]int16 {
+	entries := pgIndexInitialEntries()
+	out := make(map[uint32]int16, len(entries))
+	for _, e := range entries {
+		out[e.IndexRelid] = int16(len(e.IndKey))
+	}
+	return out
+}
+
 // pgIndexRow builds the 21-column Form_pg_index row matching
 // pgIndexColDefs order. The two pg_node_tree columns (indexprs,
 // indpred) are emitted as SQL NULL via NullDatum — none of the
