@@ -140,6 +140,15 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// (no `CastRelation_Rowtype_Id` constant in PG18 headers).
 	// Schema per `postgres/src/include/catalog/pg_cast.h` (PG18).
 	{2605, "pg_cast", 83, 'r', 6, false, pgCastAttrs()},
+	// M0106-0010 step 3ag: pg_conversion is opened during PG-standby
+	// boot once Steps 3w/3aa/3ab/3ac/3ad/3ae/3af cleared every prior
+	// catalog FATAL. Without a pg_class row, `RelationBuildDesc(2607)
+	// → ScanPgRelation(2607)` returns NULL and the backend FATALs with
+	// `could not open relation with OID 2607`. RelType=83 is safe
+	// because pg_conversion is not formrdesc'd (no
+	// `ConversionRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_conversion.h` (PG18).
+	{2607, "pg_conversion", 83, 'r', 8, false, pgConversionAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -958,6 +967,26 @@ func pgCastAttrs() []nailedAttr {
 		{Name: "castfunc", TypeOID: 26, Num: 4, Len: 4, NotNull: true},    // oid → pg_proc (0 = binary)
 		{Name: "castcontext", TypeOID: 18, Num: 5, Len: 1, NotNull: true}, // char (i/a/e)
 		{Name: "castmethod", TypeOID: 18, Num: 6, Len: 1, NotNull: true},  // char (f/b/i)
+	}
+}
+
+// pgConversionAttrs defines the 8-column PG18 pg_conversion schema.
+// PG `RelationBuildDesc(2607) → ScanPgRelation(2607)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row
+// gets seeded and PG FATALs with `could not open relation with OID
+// 2607`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_conversion.h` and
+// `pg_conversion_d.h` (Anum_pg_conversion_* 1–8). M0106-0010 step 3ag.
+func pgConversionAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},             // oid
+		{Name: "conname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},        // name
+		{Name: "connamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},    // oid → pg_namespace
+		{Name: "conowner", TypeOID: 26, Num: 4, Len: 4, NotNull: true},        // oid → pg_authid
+		{Name: "conforencoding", TypeOID: 23, Num: 5, Len: 4, NotNull: true},  // int4
+		{Name: "contoencoding", TypeOID: 23, Num: 6, Len: 4, NotNull: true},   // int4
+		{Name: "conproc", TypeOID: 24, Num: 7, Len: 4, NotNull: true},         // regproc → pg_proc
+		{Name: "condefault", TypeOID: 16, Num: 8, Len: 1, NotNull: true},      // bool
 	}
 }
 

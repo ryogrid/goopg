@@ -4227,12 +4227,77 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         blocker: `FATAL: could not open relation with OID 2607` =
         `pg_class_tblspc_relfilenode_index` (Step 3ag).
         Design: `docs/design/0106-0010-step3af-pg-collation-oid-index.md`.
-      - Next blocker (Step 3ag): OID 2607 =
-        `pg_class_tblspc_relfilenode_index` per
-        `postgres/src/include/catalog/pg_class.h`. Composite index
-        on `(reltablespace, relfilenode)`. The catalog-seed pattern
-        is identical to Steps 3ab/3ac/3ad/3ae/3af; the new wrinkle
-        is two oid_ops keys on existing pg_class attnums.
+      - Step 3ag LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2607` PG-standby boot blocker
+        that surfaced after Step 3af. Step 3af's note hypothesising
+        `pg_class_tblspc_relfilenode_index` was incorrect — that
+        index's authoritative OID is 3455 per `pg_class.h:160`
+        (`DECLARE_INDEX(pg_class_tblspc_relfilenode_index, 3455, …)`).
+        Per `postgres/src/include/catalog/pg_conversion_d.h:23`
+        (`#define ConversionRelationId 2607`) and `pg_conversion.h:29`
+        (`CATALOG(pg_conversion,2607,ConversionRelationId)`), OID 2607
+        is the `pg_conversion` heap relation. Same pattern as Steps 3w
+        (pg_aggregate=2600) and 3aa (pg_cast=2605); pure catalog-seed
+        addition with no encoder, builder, or Init flow change.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgConversionAttrs()` returning the 8-column PG18 schema
+        sourced verbatim from `pg_conversion.h` / `pg_conversion_d.h`:
+        oid (26/4), conname (19/64 name), connamespace (26/4),
+        conowner (26/4), conforencoding (23/4 int4), contoencoding
+        (23/4 int4), conproc (24/4 regproc), condefault (16/1 bool) —
+        all NotNull.
+        (b) `nailedLocalRels` gains
+        `{2607, "pg_conversion", 83, 'r', 8, false, pgConversionAttrs()}`
+        immediately after the Step-3aa pg_cast entry. `RelType=83` is
+        safe — pg_conversion is not formrdesc'd (no
+        `ConversionRelation_Rowtype_Id` constant in PG18 headers), so
+        Step 3v's `relation->rd_att->tdtypeid == relp->reltype` Phase3
+        assertion does not fire.
+        (c) The empty 8 KiB `InitPage`-stamped heap at `base/{1,5}/2607`
+        is already produced by `bootstrapMappedLocalCatalogHeaps`
+        (Step 3w infrastructure — OID 2607 was already on the OID list
+        at `initdb.go:430` and `localRelMap` already advertised the
+        mapping at `initdb.go:731`); no edit needed.
+        Seed threads automatically through `bootstrapPgClassTuples`
+        (writes Form_pg_class row) → `bootstrapPgAttributeTuples`
+        (8 pg_attribute rows) → `bootstrapPgClassOidIndex` (leaf for
+        2607 at file 2662) → `bootstrapPgAttributeRelidAttnumIndex`
+        (8 composite-key leaves at file 2659). Companion indexes
+        2668 (`pg_conversion_default_index`),
+        2669 (`pg_conversion_name_nsp_index`), and
+        2670 (`pg_conversion_oid_index`) per `pg_conversion.h:60-62`
+        are intentionally deferred — pg_conversion is currently
+        unpopulated so the Step-3k empty btree placeholders suffice
+        for early-boot lookups expecting zero rows.
+        Regression pin: `TestNailedLocalRelsContainsPgConversion` in
+        `internal/initdb/pg_conversion_nailed_test.go` asserts
+        `(RelName="pg_conversion", RelKind='r', RelNatts=8,
+        len(Attrs)=8)` and pins every `(Name, TypeOID, Num, Len,
+        NotNull)` against `pg_conversion_d.h` authoritative
+        definitions. Rejects silent re-emergence of the FATAL.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgConversion|TestNailedLocalRelsContainsPgCast|TestNailedLocalRelsContainsPgAggregate|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestPgClassOidIndexHasSingleKeyColumn|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3af
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3ag-pg-conversion-nailed-rel.md`.
+      - Next blocker (Step 3ah): after Step 3ag the next E2E re-run
+        is expected to surface either one of the pg_conversion
+        companion indexes (2668/2669/2670) or a different nailed-rel
+        FATAL at a later OID (e.g. `pg_class_tblspc_relfilenode_index`
+        = 3455 if pg_class index lookups attempt it during early
+        boot, or pg_database / pg_foreign_* / pg_publication
+        catalogs). Whichever surfaces follows the same single-OID
+        catalog-seed-addition pattern.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4277,7 +4342,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_collation_name_enc_nsp_index_test.go`,
         `docs/design/0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`,
         `internal/initdb/pg_collation_oid_index_test.go`,
-        `docs/design/0106-0010-step3af-pg-collation-oid-index.md`
+        `docs/design/0106-0010-step3af-pg-collation-oid-index.md`,
+        `internal/initdb/pg_conversion_nailed_test.go`,
+        `docs/design/0106-0010-step3ag-pg-conversion-nailed-rel.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
