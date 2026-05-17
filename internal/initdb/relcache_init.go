@@ -227,6 +227,16 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
 	{3085, "pg_collation_oid_index"},
+	// M0106-0010 Step 3ah: pg_conversion_default_index. PG18
+	// `postgres/src/include/catalog/pg_conversion.h:63` declares
+	// `ConversionDefaultIndexId = 2668` as UNIQUE (not PRIMARY) on
+	// btree(connamespace oid_ops, conforencoding int4_ops,
+	//        contoencoding int4_ops, oid oid_ops).
+	// Without this entry RelationIdGetRelation(2668) FATALs because no
+	// pg_class row gets seeded; flattenRels derives RelNatts=4 via
+	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+	// relnatts/indnatts check (relcache.c:1492).
+	{2668, "pg_conversion_default_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

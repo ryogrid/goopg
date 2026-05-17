@@ -682,7 +682,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
-		2662, 2663, 2667, 2678, 2679, 2680, 2682,
+		2662, 2663, 2667,
+		2668, // pg_conversion_default_index (Step 3ah)
+		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
@@ -771,7 +773,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
-		2662, 2663, 2667, 2678, 2679, 2680, 2682,
+		2662, 2663, 2667,
+		2668, // pg_conversion_default_index (Step 3ah)
+		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
@@ -795,7 +799,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
-		2662, 2663, 2667, 2678, 2679, 2680, 2682,
+		2662, 2663, 2667,
+		2668, // pg_conversion_default_index (Step 3ah)
+		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
@@ -1791,6 +1797,22 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_cast_oid_index (2660, Step 3ab) and pg_opclass_oid_index
 		// (2687, Step 3l).
 		entry(3085, 3456, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_collation_oid_index
+		// M0106-0010 Step 3ah: pg_conversion_default_index (OID 2668).
+		// postgres/src/include/catalog/pg_conversion.h:63 —
+		//   DECLARE_UNIQUE_INDEX(pg_conversion_default_index, 2668,
+		//     ConversionDefaultIndexId, pg_conversion,
+		//     btree(connamespace oid_ops, conforencoding int4_ops,
+		//           contoencoding int4_ops, oid oid_ops));
+		//   MAKE_SYSCACHE(CONDEFAULT, pg_conversion_default_index, 8);
+		// pg_conversion attnums (pg_conversion_d.h): 3=connamespace,
+		// 5=conforencoding, 6=contoencoding, 1=oid. UNIQUE but NOT
+		// primary (DECLARE_UNIQUE_INDEX, not the _PKEY variant — the
+		// PKEY is 2670 = pg_conversion_oid_index). None of the four
+		// keys carry a collation (oid_ops / int4_ops are typeless).
+		// Same composite-UNIQUE pattern as pg_amop_fam_strat_index
+		// (2754, Step 3y) and pg_collation_name_enc_nsp_index
+		// (3164, Step 3ae) — minus the name_ops cCollation slot.
+		entry(2668, 2607, []int16{3, 5, 6, 1}, []uint32{oidOps, int4Ops, int4Ops, oidOps}, []uint32{0, 0, 0, 0}, true, false), // pg_conversion_default_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

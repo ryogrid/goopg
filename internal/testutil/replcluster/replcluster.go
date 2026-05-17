@@ -270,6 +270,15 @@ func cloneDataDir(src, dst string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
 			return err
 		}
+		// The standby's Init() may have already laid down a
+		// read-only file at this path (e.g. base/1/pg_internal.init,
+		// which bootstrapRelcacheInitFiles chmods to 0o400).
+		// OpenFile with O_TRUNC|O_WRONLY cannot reopen a 0o400 file
+		// even for the owner, so remove any existing target first
+		// and let OpenFile recreate it with the primary's mode.
+		if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 		d, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
 		if err != nil {
 			return err
