@@ -176,6 +176,14 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// Without this entry RelationIdGetRelation(2653) FATALs because
 	// no pg_class row gets seeded.
 	{2653, "pg_amop_fam_strat_index"},
+	// M0106-0010 Step 3ab: pg_cast_oid_index. PG18
+	// `postgres/src/include/catalog/pg_cast.h:59` declares
+	// `CastOidIndexId = 2660` as UNIQUE PRIMARY KEY on
+	// btree(oid oid_ops). Without this entry RelationIdGetRelation(2660)
+	// FATALs because no pg_class row gets seeded; flattenRels also
+	// derives RelNatts=1 via pgIndexNattsByOID, satisfying
+	// RelationInitIndexAccessInfo's relnatts/indnatts check.
+	{2660, "pg_cast_oid_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

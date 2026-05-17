@@ -679,7 +679,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	for _, oid := range []uint32{
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
+		2654, 2655, 2658, 2659,
+		2660, // pg_cast_oid_index (Step 3ab)
+		2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
@@ -763,7 +765,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		// Local critical indexes
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
+		2654, 2655, 2658, 2659,
+		2660, // pg_cast_oid_index (Step 3ab)
+		2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
@@ -782,7 +786,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		// Also copy all local critical indexes to global/
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
-		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
+		2654, 2655, 2658, 2659,
+		2660, // pg_cast_oid_index (Step 3ab)
+		2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
@@ -1722,6 +1728,12 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// `aggfnoid` is regproc type but the index uses oid_ops, not
 		// regproc_ops. Indexes pg_aggregate (OID 2600) on attnum 1.
 		entry(2650, 2600, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_aggregate_fnoid_index
+		// M0106-0010 Step 3ab: pg_cast_oid_index (OID 2660).
+		// postgres/src/include/catalog/pg_cast.h:59 —
+		//   DECLARE_UNIQUE_INDEX_PKEY(pg_cast_oid_index, 2660,
+		//     CastOidIndexId, pg_cast, btree(oid oid_ops));
+		// Indexes pg_cast (OID 2605) on attnum 1 (oid). UNIQUE PRIMARY KEY.
+		entry(2660, 2605, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_cast_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

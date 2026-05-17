@@ -3899,13 +3899,71 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3aa-pg-cast-nailed-rel.md`.
-      - Next blocker (Step 3ab): expected to surface on the next
-        E2E re-run as `could not open relation with OID 2660`
-        (`pg_cast_oid_index`) or `OID 2661`
-        (`pg_cast_source_target_index`). Both have empty Step-3k
-        placeholder relfiles already; Step 3ab follows the established
-        Step 3x/3y/3z pattern (entry in `pgIndexInitialEntries` +
-        `nailedLocalRels` idxSpec).
+      - Step 3ab LANDED 2026-05-18. Anticipated next-blocker fix
+        (`could not open relation with OID 2660` —
+        `pg_cast_oid_index`) per
+        `postgres/src/include/catalog/pg_cast.h:59`:
+        `DECLARE_UNIQUE_INDEX_PKEY(pg_cast_oid_index, 2660,
+        CastOidIndexId, pg_cast, btree(oid oid_ops))`. Pure catalog-
+        seed addition mirroring Steps 3x/3y/3z; no encoder, builder,
+        or Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(2660, 2605, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` (UNIQUE PRIMARY KEY on attnum 1 = oid).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels`
+        idxSpec gains `{2660, "pg_cast_oid_index"}`; `flattenRels`
+        derives `RelKind='i', RelNatts=1` via `pgIndexNattsByOID`.
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain
+        `2660, // pg_cast_oid_index (Step 3ab)` — the Step-3k empty
+        btree placeholder is sufficient because pg_cast is currently
+        unpopulated.
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` → `bootstrapPgIndexTuples` (writes
+        Form_pg_index row + captures TID in `pgIndexTIDs[2660]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (composite-key leaf at
+        2659). Companion OID 2661 (`pg_cast_source_target_index`,
+        UNIQUE non-primary on (castsource, casttarget)) deferred to
+        Step 3ac to keep the single-OID rhythm.
+        Regression pins:
+        `TestPgCastOidIndexSeededFromInitialEntries`
+        (asserts `(IndRelid=2605, IndKey=[1], IsUnique=true,
+        IsPrimary=true)`) and
+        `TestNailedLocalRelsContainsPgCastOidIndex` (asserts
+        `RelName="pg_cast_oid_index", RelKind='i', RelNatts=1`) in
+        `internal/initdb/pg_cast_oid_index_test.go`. Existing pins
+        extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds
+        `2660: {1}` (strict count guard auto-rejects future additions
+        without map updates);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2660 so the populated 2679 btree must carry this
+        leaf.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgCastOidIndex|TestNailedLocalRelsContainsPgCastOidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestNailedLocalRelsContainsPgCast|TestPgAggregateFnoidIndex|TestPgAmopFamStrat'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3aa
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3ab-pg-cast-oid-index.md`.
+      - Next blocker (Step 3ac): expected next E2E re-run will surface
+        `could not open relation with OID 2661`
+        (`pg_cast_source_target_index`, UNIQUE non-primary 2-column
+        btree(castsource oid_ops, casttarget oid_ops)). Step 3ac
+        follows this step verbatim with
+        `IndKey=[2,3], IsUnique=true, IsPrimary=false` per
+        `pg_cast.h:60`. If another OID surfaces first (different
+        relcache initialization order), pivot to that OID; the
+        pattern is identical.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3940,7 +3998,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_auth_members_role_member_index_test.go`,
         `docs/design/0106-0010-step3z-pg-auth-members-role-member-index.md`,
         `internal/initdb/pg_cast_nailed_test.go`,
-        `docs/design/0106-0010-step3aa-pg-cast-nailed-rel.md`
+        `docs/design/0106-0010-step3aa-pg-cast-nailed-rel.md`,
+        `internal/initdb/pg_cast_oid_index_test.go`,
+        `docs/design/0106-0010-step3ab-pg-cast-oid-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
