@@ -3448,14 +3448,91 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3t-pg-namespace-index-seeds.md`.
-      - Next blocker (Step 3u): re-run
+      - Step 3u LANDED 2026-05-18. Closes the
+        `PANIC: ERRORDATA_STACK_SIZE exceeded` PG standby-boot blocker
+        that surfaced after Step 3t. The PANIC fired for every newly
+        forked client backend immediately after `PM_HOT_STANDBY`, with
+        no preceding ERROR/FATAL — pointing at recursive `ereport`
+        calls inside one of PG's early-startup catalog-lookup paths.
+        Diagnosis required instrumenting
+        `postgres/src/backend/utils/error/elog.c::get_error_stack_entry`
+        with `backtrace_symbols_fd` to dump the recursion chain (PG
+        binary stays clean now — the instrumentation has been reverted
+        and PG was rebuilt).
+        Root cause: `pgAttributeRow` in `internal/initdb/initdb.go`
+        wrote `executor.NewStringDatum("")` for `attoptions` (and
+        three sibling array columns: `attacl`, `attfdwoptions`,
+        `attmissingval`). `encodeValuePG` serialises the empty string
+        as a 1-byte empty-varlena header (`0x03` =
+        `SET_VARSIZE_1B(p, 1)`) — a NON-NULL text datum from PG's
+        perspective. PG's
+        `RelationGetIndexAttOptions` (relcache.c:5988) →
+        `index_opclass_options` (indexam.c:1043) then satisfied all
+        three conditions for the `ereport(ERROR, errmsg("operator
+        class %s has no options", generate_opclass_name(opclass)))`
+        path (btree's `amoptsprocnum != 0`, no amprocnum=5 row in
+        `pgAmprocInitialEntries`, and now non-NULL `attoptions`). The
+        errmsg's argument formatting calls
+        `generate_opclass_name → OpclassIsVisible →
+        get_namespace_oid("pg_catalog") →
+        SearchSysCache1(NAMESPACENAME, …) →
+        systable_beginscan(pg_namespace_nspname_index=2684) →
+        index_open(2684) → RelationIdGetRelation(2684) →
+        RelationInitIndexAccessInfo → RelationGetIndexAttOptions →
+        index_opclass_options → ereport(ERROR, ...)` — recursion
+        unbounded; after five nested unfinished ereports the safety
+        check at `elog.c:758` fires and PANICs. The path was dormant
+        before Step 3o populated the shared-critical-index pass that
+        flips `criticalRelcachesBuilt = true`; the
+        `criticalRelcachesBuilt && relid != AttributeRelidNumIndexId`
+        guard at `relcache.c:6006` had short-circuited the
+        `get_attoptions` call.
+        Fix: `pgAttributeRow` emits `executor.NullDatum` for `attacl`,
+        `attoptions`, `attfdwoptions`, `attmissingval`. With
+        `attoptions == NULL`, `index_opclass_options` returns early at
+        `indexam.c:1062` (`if (!DatumGetPointer(attoptions)) return
+        NULL`) and the recursive opclass-name lookup never fires. The
+        Step 3i null-bitmap plumbing
+        (`writeMultiPageHeapRows → NewHeapTupleWithNulls`) handles
+        the layout shift transparently (HEAP_HASNULL stamped,
+        `t_hoff = MAXALIGN(SizeofHeapTupleHeader + len(bitmap))`,
+        GETSTRUCT remains correct because t_hoff accounts for the
+        bitmap padding).
+        Regression pin:
+        `TestPgAttributeRowEmitsNullForOptionalArrayColumns` in
+        `internal/initdb/pg_attribute_null_attoptions_test.go`
+        asserts cols 20–23 (attacl/attoptions/attfdwoptions/
+        attmissingval) are NULL in every pg_attribute heap row and
+        rejects future regressions silently re-introducing the empty
+        varlena.  Verified:
+        `go test -count=1 -run TestPgAttributeRowEmitsNullForOptionalArrayColumns
+        ./internal/initdb/` PASS; `go test -count=1
+        ./internal/initdb/` — same 14 pre-existing baseline failures
+        as Step 3t (no new regressions); `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS.
         `GOOPG_RUN_BLOCKED_M0102_E2E=1
-        TestE2E_FailoverGoopgToPG/async` and capture the next FATAL.
-        Likely next: a syscache lookup against another nailed index
-        OID still on Step 3k's empty placeholder (e.g. 2667
-        pg_constraint_oid_index, 2680 pg_inherits_relid_seqno_index,
-        or one of pg_proc/pg_type's oid indexes), or a missing pg_proc
-        row for a function looked up by OID during early startup.
+        TestE2E_FailoverGoopgToPG/async` advances past the PANIC —
+        PG standby reaches `PM_HOT_STANDBY` and stays alive, and no
+        backend PANICs on connect. New blocker (Step 3v territory):
+        the test's `SELECT status FROM pg_catalog.pg_stat_wal_receiver`
+        probe hangs (5-minute test timeout) rather than crashing,
+        likely a goopg primary issue or a wal-receiver/walsender
+        handshake interaction. Design:
+        `docs/design/0106-0010-step3u-pg-attribute-null-attoptions.md`.
+      - Carry-over for Step 3v+:
+        1. `pgAttrColDefs()` and `pgAttributeAttrs()` still type
+           `attoptions`/`attfdwoptions`/`attmissingval` as plain `text`
+           instead of `text[]`/`anyarray`. Harmless while NULL but
+           should be aligned with PG18.
+        2. `pgAttributeAttrs()` still declares only 22 of the 26 PG18
+           pg_attribute columns; alignment is a follow-up.
+        3. wal_receiver query hang requires its own diagnosis (likely
+           goopg primary side, not standby side).
+      - Next blocker (Step 3v): the standby SELECT on
+        `pg_stat_wal_receiver` hangs. Capture goopg primary logs and
+        determine whether the primary is responding to the wal-receiver
+        replication protocol exchanges.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3475,7 +3552,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/btree_index_bootstrap_test.go`,
         `docs/design/0106-0010-step3p-pg-index-indexrelid-index-tuples.md`,
         `docs/design/0106-0010-step3s-index-tuple-block-id-encoding.md`,
-        `docs/design/0106-0010-step3t-pg-namespace-index-seeds.md`
+        `docs/design/0106-0010-step3t-pg-namespace-index-seeds.md`,
+        `docs/design/0106-0010-step3u-pg-attribute-null-attoptions.md`,
+        `internal/initdb/pg_attribute_null_attoptions_test.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

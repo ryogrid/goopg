@@ -1866,10 +1866,19 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewBoolDatum(true),         // attislocal
 		executor.NewIntDatum(0),             // attinhcount
 		executor.NewIntDatum(0),             // attcollation
-		executor.NewStringDatum(""),         // attacl
-		executor.NewStringDatum(""),         // attoptions
-		executor.NewStringDatum(""),         // attfdwoptions
-		executor.NewStringDatum(""),         // attmissingval
+		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
+		// trailing varlena/array columns. Previously NewStringDatum("") wrote
+		// a 1-byte empty varlena which PG's RelationGetIndexAttOptions →
+		// index_opclass_options interpreted as "attoptions present" → ereport
+		// ERROR → generate_opclass_name → OpclassIsVisible →
+		// get_namespace_oid(pg_namespace_nspname_index=2684) → recursive
+		// RelationInitIndexAccessInfo on the very index whose error message
+		// is being formatted → ERRORDATA_STACK_SIZE PANIC. PG18's default
+		// for an unconfigured catalog row is SQL NULL on all four columns.
+		executor.NullDatum,                  // attacl
+		executor.NullDatum,                  // attoptions
+		executor.NullDatum,                  // attfdwoptions
+		executor.NullDatum,                  // attmissingval
 	}
 }
 
