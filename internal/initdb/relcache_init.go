@@ -507,7 +507,7 @@ func pgClassAttrs() []nailedAttr {
 		{Name: "relminmxid", TypeOID: 28, Num: 31, Len: 4, NotNull: true},
 		{Name: "relacl", TypeOID: 1034, Num: 32, Len: -1},
 		{Name: "reloptions", TypeOID: 1009, Num: 33, Len: -1},
-		{Name: "relpartbound", TypeOID: 25, Num: 34, Len: -1},
+		{Name: "relpartbound", TypeOID: 194, Num: 34, Len: -1},
 	}
 }
 

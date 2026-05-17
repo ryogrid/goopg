@@ -246,28 +246,68 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], v)
 		return buf[:], nil
+	case "aclitem[]", "_aclitem":
+		// PG binary empty ArrayType, elemtype = aclitem (1033).
+		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
+		// "{}" is not a valid ArrayType*. Match construct_empty_array.
+		return emptyArrayTypeBytes(1033), nil
+	case "text[]", "_text":
+		// PG binary empty ArrayType, elemtype = text (25).
+		return emptyArrayTypeBytes(25), nil
+	case "oid[]", "_oid":
+		return emptyArrayTypeBytes(26), nil
+	case "int2[]", "_int2":
+		return emptyArrayTypeBytes(21), nil
+	case "pg_node_tree":
+		// pg_node_tree is varlena-text; PG only reads it conditionally
+		// (e.g. relpartbound when relispartition=true). Empty varlena.
+		s := d.StringValue()
+		return varlenaTextBytes(s), nil
 	default:
 		// text, varchar, char, bpchar, unknown, numeric, etc.
-		// Use PG varlena format (LE): 1-byte header for short
-		// values, 4-byte header for longer ones.
-		// PG's SET_VARSIZE_1B encodes TOTAL size (data+header),
-		// not just data length. BIT 0 = 1 for 1-byte header.
-		s := d.StringValue()
-		total := len(s) + 1 // data + 1-byte header
-		if total <= 127 {   // 1-byte header: 7 bits for size (max 127)
-			buf := make([]byte, total)
-			buf[0] = byte(total<<1) | 1
-			copy(buf[1:], s)
-			return buf, nil
-		}
-		// 4-byte header (LE): bits 0-1 = 10, total size in upper
-		// 30 bits. Uses LittleEndian, not BigEndian.
-		total = len(s) + 4 // data + 4-byte header
-		buf := make([]byte, total)
-		binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
-		copy(buf[4:], s)
-		return buf, nil
+		// Use PG varlena format (LE): 1-byte header for short values,
+		// 4-byte header for longer ones.
+		return varlenaTextBytes(d.StringValue()), nil
 	}
+}
+
+// emptyArrayTypeBytes returns the 16-byte PG-native serialization of
+// `construct_empty_array(elemType)`: a 4-byte uncompressed varlena
+// header containing total size 16, then ndim=0, dataoffset=0,
+// elemtype=elemType. Required so that PG's deconstruct_array does not
+// fail its ARR_ELEMTYPE assertion when reading nailed pg_class
+// rows where relacl/reloptions are conceptually empty.
+func emptyArrayTypeBytes(elemType uint32) []byte {
+	var buf [16]byte
+	// PG SET_VARSIZE (uncompressed, LE machine): low 2 bits = 00,
+	// total size in upper 30 bits.
+	binary.LittleEndian.PutUint32(buf[0:4], 16<<2)
+	// ndim = 0, dataoffset = 0
+	// (already zero-initialised)
+	binary.LittleEndian.PutUint32(buf[12:16], elemType)
+	return buf[:]
+}
+
+// varlenaTextBytes returns a PG-native varlena serialisation of the
+// given text payload using the 1-byte header for short values and the
+// 4-byte header otherwise. PG's SET_VARSIZE_1B encodes the TOTAL size
+// (data+header), not just the data length; bit 0 = 1 marks the 1-byte
+// form (and the body shifts by one).
+func varlenaTextBytes(s string) []byte {
+	total := len(s) + 1 // data + 1-byte header
+	if total <= 127 {   // 1-byte header: 7 bits for size (max 127)
+		buf := make([]byte, total)
+		buf[0] = byte(total<<1) | 1
+		copy(buf[1:], s)
+		return buf
+	}
+	// 4-byte header (LE): low 2 bits = 00 (uncompressed), total size
+	// in upper 30 bits.
+	total = len(s) + 4
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	copy(buf[4:], s)
+	return buf
 }
 
 // pgEpochUnixMicros is 2000-01-01 UTC in Unix microseconds (used by
@@ -573,6 +613,8 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 8
 	case "name":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
+	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "anyarray", "pg_node_tree":
+		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree
 	default:
 		return 4
 	}

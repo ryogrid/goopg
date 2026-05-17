@@ -643,9 +643,14 @@ func pgClassColDefs() []catalog.Column {
 		{Name: "relrewrite", Type: catalog.Type{Name: "oid"}},        // 132
 		{Name: "relfrozenxid", Type: catalog.Type{Name: "xid"}},      // 136
 		{Name: "relminmxid", Type: catalog.Type{Name: "xid"}},        // 140
-		{Name: "relacl", Type: catalog.Type{Name: "text"}},           // 144 varlena
-		{Name: "reloptions", Type: catalog.Type{Name: "text"}},       // varlena
-		{Name: "relpartbound", Type: catalog.Type{Name: "text"}},     // varlena
+		// Varlena columns. PG's extractRelOptions / aclitem-walking code
+		// casts the raw datum as ArrayType*; the empty placeholder MUST
+		// therefore be a valid binary ArrayType, not a text "{}" varlena.
+		// See encodeValuePG's "aclitem[]" / "text[]" cases and
+		// docs/design/0106-0010-pg-class-empty-array-encoding.md.
+		{Name: "relacl", Type: catalog.Type{Name: "aclitem[]"}},     // 144 varlena (16-byte empty ArrayType)
+		{Name: "reloptions", Type: catalog.Type{Name: "text[]"}},    // varlena
+		{Name: "relpartbound", Type: catalog.Type{Name: "pg_node_tree"}}, // varlena text
 	}
 }
 
@@ -739,7 +744,16 @@ func pgAttrEntriesForRel(rel nailedRel) []nailedAttr {
 		cols := pgClassColDefs()
 		attrs := make([]nailedAttr, len(cols))
 		for i, c := range cols {
-			attrs[i] = nailedAttr{Name: c.Name, TypeOID: pgCatalogTypeOID(c.Type.Name), Num: int16(i + 1), Len: int16(pgCatalogTypeLen(c.Type.Name)), NotNull: c.Type.Name != "text"}
+			attrs[i] = nailedAttr{
+				Name:    c.Name,
+				TypeOID: pgCatalogTypeOID(c.Type.Name),
+				Num:     int16(i + 1),
+				Len:     int16(pgCatalogTypeLen(c.Type.Name)),
+				// Varlena columns (attlen=-1) are nullable; fixed-size
+				// catalog columns are NOT NULL. PG's att_addlength_pointer
+				// asserts on attlen=0, so we must not produce that value.
+				NotNull: pgCatalogTypeLen(c.Type.Name) != -1,
+			}
 		}
 		return attrs
 	}
@@ -747,7 +761,13 @@ func pgAttrEntriesForRel(rel nailedRel) []nailedAttr {
 		cols := pgAttrColDefs()
 		attrs := make([]nailedAttr, len(cols))
 		for i, c := range cols {
-			attrs[i] = nailedAttr{Name: c.Name, TypeOID: pgCatalogTypeOID(c.Type.Name), Num: int16(i + 1), Len: int16(pgCatalogTypeLen(c.Type.Name)), NotNull: c.Type.Name != "text"}
+			attrs[i] = nailedAttr{
+				Name:    c.Name,
+				TypeOID: pgCatalogTypeOID(c.Type.Name),
+				Num:     int16(i + 1),
+				Len:     int16(pgCatalogTypeLen(c.Type.Name)),
+				NotNull: pgCatalogTypeLen(c.Type.Name) != -1,
+			}
 		}
 		return attrs
 	}
@@ -901,10 +921,18 @@ func pgCatalogTypeOID(t string) uint32 {
 		return 23
 	case "text":
 		return 25
+	case "pg_node_tree":
+		return 194
 	case "float4":
 		return 700
 	case "float8":
 		return 701
+	case "text[]", "_text":
+		return 1009
+	case "aclitem[]", "_aclitem":
+		return 1034
+	case "anyarray":
+		return 2277
 	}
 	return 0
 }
@@ -922,7 +950,7 @@ func pgCatalogTypeLen(t string) int {
 		return 8
 	case "name":
 		return 64
-	case "text":
+	case "text", "pg_node_tree", "text[]", "_text", "aclitem[]", "_aclitem", "anyarray":
 		return -1
 	}
 	return 4
@@ -942,7 +970,7 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700:
+	case 23, 26, 700, 194, 1009, 1034, 2277:
 		return "i"
 	case 20, 701:
 		return "d"
@@ -952,7 +980,7 @@ func pgTypeAlignChar(oid uint32) string {
 
 func pgTypeStorageChar(oid uint32) string {
 	switch oid {
-	case 25, 1043, 1042:
+	case 25, 1043, 1042, 194, 1009, 1034, 2277:
 		return "x"
 	}
 	return "p"

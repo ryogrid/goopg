@@ -2301,7 +2301,7 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         pg_basebackup completes, PG standby starts, WAL streams, data
         replicates, SIGKILL + promote works, post-failover INSERT succeeds,
         zero-loss invariant holds for sync mode.
-      - Depends on: M0105-0007, M0105-0009
+      - Depends on: M0105-0007, M0105-0009, M0105-0010.
 
 - [x] **M0105-0009**
       - Summary: Fix PG standby hot standby readiness (pg_ctl timeout).
@@ -2457,18 +2457,43 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
       - M0106-0009 resolved the nocachegetattr assertion, but surfaced a new
         blocker: `deconstruct_array` assertion (`ARR_ELEMTYPE`, arrayfuncs.c)
         because PG casts stored varlena text `{}` as binary `ArrayType*`.
-      - Step 1: Fix array assertion. Options:
-        (a) Encode proper binary empty `ArrayType` for relacl/reloptions
-            (varlena hdr + ndim=0 + flags=0 + elemtype OID, ~16 bytes).
-        (b) Remove varlena columns from TupleDesc AND heap tuple, force
-            slow path via alternative mechanism (e.g. HEAP_HASNULL with a
-            trailing null column after the fixed part).
-      - Step 2: After array assertion is fixed, `SearchSysCache1(AMOID, 403)`
-        during `RelationInitIndexAccessInfo` will fail because pg_am heap is
-        empty. Write btree AM tuple (OID 403, amname="btree", amhandler=330,
-        amtype='i') into `base/1/2601` / `base/5/2601`. May also need
-        pg_opclass/pg_amop/pg_amproc tuples.
-      - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`
+      - Step 1 LANDED 2026-05-17.  Option (a) chosen.
+        `internal/executor/codec.go::encodeValuePG` now emits a 16-byte
+        binary `ArrayType` blob (matching upstream `construct_empty_array`)
+        for `aclitem[]` / `_aclitem` (elemtype 1033), `text[]` / `_text`
+        (elemtype 25), `oid[]` / `int2[]` aliases, and a 1-byte empty
+        varlena for `pg_node_tree`.  New helpers `emptyArrayTypeBytes` and
+        `varlenaTextBytes`.  `physicalPGTypeAlign` returns 4 for every
+        array/`pg_node_tree`/`anyarray` alias (PG `'i'` alignment).
+        `internal/initdb/initdb.go::pgClassColDefs` now declares relacl /
+        reloptions / relpartbound as `aclitem[]` / `text[]` /
+        `pg_node_tree` instead of `text`.  Type helpers
+        (`pgCatalogTypeOID`, `pgCatalogTypeLen`, `pgTypeAlignChar`,
+        `pgTypeStorageChar`) learn OIDs 194 / 1009 / 1034 / 2277.
+        `pgAttrEntriesForRel` derives `NotNull` from
+        `pgCatalogTypeLen != -1` (was `Type.Name != "text"`).
+        `internal/initdb/relcache_init.go::pgClassAttrs` updates
+        `relpartbound.TypeOID` from 25 → 194 so the init-file TupleDesc
+        matches the heap-tuple schema.  Regression pins:
+        `TestEmptyArrayTypeBytesShape`,
+        `TestEncodeValuePGAclItemArrayEmitsEmptyArrayType`,
+        `TestPhysicalPGTypeAlignArrayTypes` in
+        `internal/executor/codec_empty_array_test.go`;
+        `TestPgClassRelaclReloptionsEncodedAsBinaryArrayType` in
+        `internal/initdb/pg_class_empty_array_test.go`.  Verified:
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS
+        (pre-existing baseline failures in `internal/initdb/`,
+        `internal/wal/` unchanged — confirmed via baseline diff).
+        Design: `docs/design/0106-0010-pg-class-empty-array-encoding.md`.
+      - Step 2 (still open): `SearchSysCache1(AMOID, 403)` during
+        `RelationInitIndexAccessInfo` will likely fail next because the
+        pg_am heap is still empty.  Write the btree AM tuple (OID 403,
+        amname="btree", amhandler=330, amtype='i') into `base/1/2601` /
+        `base/5/2601`.  May also need pg_opclass / pg_amop / pg_amproc
+        tuples.
+      - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
+        `internal/initdb/relcache_init.go`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
