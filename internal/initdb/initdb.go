@@ -693,9 +693,9 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(0),                   // 132: relrewrite
 		executor.NewIntDatum(3),                   // 136: relfrozenxid
 		executor.NewIntDatum(1),                   // 140: relminmxid
-		executor.NewStringDatum(""),               // relacl (varlena, empty)
-		executor.NewStringDatum(""),               // reloptions (varlena, empty)
-		executor.NewStringDatum(""),               // relpartbound (varlena, empty)
+		executor.NewStringDatum("{}"),             // relacl (empty aclitem[])
+		executor.NewStringDatum("{}"),             // reloptions (empty text[])
+		executor.NewStringDatum(""),               // relpartbound (empty pg_node_tree)
 	}
 }
 
