@@ -448,7 +448,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3766, // pg_ts_dict
 		3767, // pg_ts_parser
 		3768, // pg_ts_template
-		4044, // pg_event_trigger
+		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		6003, // pg_publication
 		6101, // pg_publication_rel
 		6102, // pg_sequence
@@ -762,7 +762,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3766, 3766}, // pg_ts_dict
 		{3767, 3767}, // pg_ts_parser
 		{3768, 3768}, // pg_ts_template
-		{4044, 4044}, // pg_event_trigger
+		{3466, 3466}, // pg_event_trigger (M0106-0010 step 3ar)
 		{6003, 6003}, // pg_publication
 		{6101, 6101}, // pg_publication_rel
 		{6102, 6102}, // pg_sequence

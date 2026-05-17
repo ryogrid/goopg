@@ -166,6 +166,16 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// `EnumRelation_Rowtype_Id` constant in PG18 headers).
 	// Schema per `postgres/src/include/catalog/pg_enum.h` (PG18).
 	{3501, "pg_enum", 83, 'r', 4, false, pgEnumAttrs()},
+	// M0106-0010 step 3ar: pg_event_trigger is opened during PG-standby boot
+	// once Step 3aq cleared the pg_enum family of indexes. Without a pg_class
+	// row, `RelationBuildDesc(3466) → ScanPgRelation(3466)` returns NULL and
+	// the backend FATALs with `could not open relation with OID 3466`.
+	// RelType=83 is safe because pg_event_trigger is not formrdesc'd (no
+	// `EventTriggerRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_event_trigger.h` (PG18,
+	// EventTriggerRelationId == 3466). 7 columns; evttags is in the
+	// CATALOG_VARLEN block so it is nullable.
+	{3466, "pg_event_trigger", 83, 'r', 7, false, pgEventTriggerAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1131,6 +1141,26 @@ func pgEnumAttrs() []nailedAttr {
 		{Name: "enumtypid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},      // oid → owning enum type
 		{Name: "enumsortorder", TypeOID: 700, Num: 3, Len: 4, NotNull: true}, // float4
 		{Name: "enumlabel", TypeOID: 19, Num: 4, Len: 64, NotNull: true},     // name
+	}
+}
+
+// pgEventTriggerAttrs defines the 7-column PG18 pg_event_trigger schema.
+// PG `RelationBuildDesc(3466) → ScanPgRelation(3466)` looks up the
+// pg_class row whose attribute count this function pins; without it, PG
+// FATALs with `could not open relation with OID 3466`. Sourced verbatim
+// from `postgres/src/include/catalog/pg_event_trigger.h` and
+// `pg_event_trigger_d.h` (Anum_pg_event_trigger_* 1–7). evttags is in
+// the CATALOG_VARLEN block and has no BKI_FORCE_NOT_NULL attribute, so
+// it is nullable. M0106-0010 step 3ar.
+func pgEventTriggerAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},         // oid
+		{Name: "evtname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},    // name
+		{Name: "evtevent", TypeOID: 19, Num: 3, Len: 64, NotNull: true},   // name
+		{Name: "evtowner", TypeOID: 26, Num: 4, Len: 4, NotNull: true},    // oid → pg_authid
+		{Name: "evtfoid", TypeOID: 26, Num: 5, Len: 4, NotNull: true},     // oid → pg_proc
+		{Name: "evtenabled", TypeOID: 18, Num: 6, Len: 1, NotNull: true},  // char
+		{Name: "evttags", TypeOID: 1009, Num: 7, Len: -1, NotNull: false}, // text[] (nullable)
 	}
 }
 

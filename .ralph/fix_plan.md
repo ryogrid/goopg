@@ -4853,11 +4853,68 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3aq-pg-enum-typid-sortorder-index.md`.
-      - Next blocker (Step 3ar): with OID 3534 opened cleanly (and all
-        three `pg_enum.h` indexes now seeded), the next E2E re-run is
-        expected to surface another single-OID nailed-rel/index OID
-        flagged by `RelationCacheInitializePhase3`'s nailed-rel walk
-        (likely candidates: pg_event_trigger, pg_foreign_*, pg_inherits,
+      - Step 3ar LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3466` PG-standby boot blocker
+        that surfaced after Step 3aq. OID 3466 is `pg_event_trigger` per
+        `postgres/src/include/catalog/pg_event_trigger_d.h:23`
+        (`#define EventTriggerRelationId 3466`). Without a pg_class row,
+        `RelationBuildDesc(3466) → ScanPgRelation(3466)` returns NULL and
+        the backend FATALs. Pure catalog-seed change (no encoder, builder,
+        or `Init` flow change):
+        (a) `internal/initdb/relcache_init.go::nailedLocalRels` gains
+        `{3466, "pg_event_trigger", 83, 'r', 7, false, pgEventTriggerAttrs()}`.
+        `RelType=83` is safe because pg_event_trigger is not formrdesc'd
+        (no `EventTriggerRelation_Rowtype_Id` constant in PG18 headers),
+        so the Step 3v `relation->rd_att->tdtypeid == relp->reltype`
+        Phase-3 assertion does not fire.
+        (b) New `pgEventTriggerAttrs()` returns the 7-column PG18 schema
+        verbatim from `pg_event_trigger.h` / `pg_event_trigger_d.h`: oid
+        (26/4), evtname (19 name/64), evtevent (19 name/64), evtowner
+        (26/4), evtfoid (26/4), evtenabled (18 char/1), evttags (1009
+        _text/-1 nullable). evttags is in the CATALOG_VARLEN block with
+        no `BKI_FORCE_NOT_NULL` so it is the only nullable column; Step
+        3i's null-bitmap plumbing
+        (`writeMultiPageHeapRows → NewHeapTupleWithNulls`) handles any
+        future NULL evttags row transparently.
+        (c) Secondary fix: corrects the mis-labelled OID `4044,
+        // pg_event_trigger` in `bootstrapMappedLocalCatalogHeaps`
+        (`internal/initdb/initdb.go:451`) and in the `localRelMap`
+        entries (`internal/initdb/initdb.go:765`) to the canonical 3466.
+        Confirmed via grep that 4044 is not assigned to any PG18 catalog
+        (`postgres/src/include/catalog/*.h` returns nothing for 4044).
+        Without the on-disk heap file at `base/{1,5}/3466`, PG's
+        `mdopen` would ENOENT immediately after the pg_class row
+        resolves the relation.
+        Nailed-rel entry threads automatically through the existing
+        bootstrap flow: `bootstrapPgClassTuples` writes the
+        Form_pg_class row; `bootstrapPgAttributeTuples` writes 7
+        pg_attribute rows; `bootstrapPgClassOidIndex` adds the leaf to
+        `base/{1,5}/2662 + global/2662`;
+        `bootstrapPgAttributeRelidAttnumIndex` adds 7 composite-key
+        leaves to 2659; `buildPgClassBlob` adds the Form_pg_class blob
+        to `pg_internal.init`; `bootstrapMappedLocalCatalogHeaps` writes
+        the empty heap page at `base/{1,5}/3466`. The two indexes
+        declared by pg_event_trigger.h (3467 evtname_index, 3468
+        oid_index) are deliberately deferred until a
+        `MAKE_SYSCACHE(EVENTTRIGGER{NAME,OID}, …)` lookup surfaces as
+        the next concrete blocker.
+        Regression pins: `TestNailedLocalRelsContainsPgEventTrigger`
+        (full per-column `(Name, TypeOID, Num, Len, NotNull)` audit) and
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgEventTrigger`
+        (asserts `base/{1,5}/3466` exists with InitPage-stamped 8-KiB
+        content and 4044 does NOT exist) in
+        `internal/initdb/pg_event_trigger_nailed_test.go`. Existing
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages`
+        wantOIDs list updated 4044 → 3466.
+        Verified: `go build ./...` PASS;
+        `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgEventTrigger|TestBootstrapMappedLocalCatalogHeapsIncludesPgEventTrigger|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgEnum|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree'
+        ./internal/initdb/` PASS.
+        Design: `docs/design/0106-0010-step3ar-pg-event-trigger-nailed-rel.md`.
+      - Next blocker (Step 3as): with OID 3466 (pg_event_trigger) opened
+        cleanly, the next E2E re-run is expected to surface another
+        single-OID nailed-rel/index blocker. Likely candidates from the
+        remaining mapped local catalog OID list (pg_foreign_*, pg_inherits,
         pg_init_privs, pg_language, pg_largeobject*, pg_partitioned_table,
         pg_publication*, pg_range, pg_replication_origin, pg_seclabel,
         pg_sequence, pg_statistic, pg_subscription*, pg_tablespace,
@@ -4930,7 +4987,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_enum_typid_label_index_test.go`,
         `docs/design/0106-0010-step3ap-pg-enum-typid-label-index.md`,
         `internal/initdb/pg_enum_typid_sortorder_index_test.go`,
-        `docs/design/0106-0010-step3aq-pg-enum-typid-sortorder-index.md`
+        `docs/design/0106-0010-step3aq-pg-enum-typid-sortorder-index.md`,
+        `internal/initdb/pg_event_trigger_nailed_test.go`,
+        `docs/design/0106-0010-step3ar-pg-event-trigger-nailed-rel.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
