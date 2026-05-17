@@ -2775,8 +2775,69 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         1994) and the pattern families when a concrete standby-boot
         blocker surfaces; `in_range` (amprocnum=3) and `skipsupport`
         (amprocnum=6) procs.
+      - Step 3i LANDED 2026-05-17. Closes the FATAL "cache lookup failed
+        for index 2662" PG-standby boot blocker that survived Step 3g.
+        Root cause: two interacting encoder bugs in
+        `internal/executor/codec.go::encodeRowPG` and
+        `internal/storage/heap.go` that silently corrupted any heap
+        tuple containing a NULL column. pg_index was the first
+        bootstrapped catalog to seed NULL columns
+        (`indexprs`/`indpred`), which is why the bug had been silent
+        through Steps 3a–3h.
+        (1) The null bitmap convention was INVERTED: goopg set
+        `bit=1` when the column WAS NULL; PG's `heap_fill_tuple`
+        (`postgres/src/backend/access/common/heaptuple.c` ~line 308)
+        does the opposite — `bit=1` means NOT NULL,
+        `att_isnull` reads `!(bits & mask)`. For a 21-col pg_index
+        row with cols 20,21 NULL, goopg emitted `{0x00,0x00,0x18}`;
+        PG decoded that as "cols 1–19 are NULL, cols 20–21 are NOT
+        NULL", so every `SearchSysCache1(INDEXRELID, …)` lookup
+        missed because indexrelid itself was treated as NULL.
+        (2) The bitmap was prepended into the column-data payload
+        while `t_hoff` stayed at the no-bitmap default 24 and
+        `HEAP_HASNULL` was never stamped. PG's heap_deform_tuple
+        then read the bitmap bytes themselves as the first columns
+        of the tuple, putting indexrelid 4 bytes too late.
+        Fix: `internal/storage/heap.go` gains `HeapTuple.Bitmap []byte`,
+        a `maxAlign8(n)` helper (PG `MAXALIGN` for 64-bit), and
+        `NewHeapTupleWithNulls(xmin, xmax, bitmap, data)` which sets
+        `t_hoff = MAXALIGN(SizeofHeapTupleHeader + len(bitmap))` and
+        stamps `HEAP_HASNULL`. `MarshalBinary` writes the bitmap into
+        `out[SizeOfHeapTupleHeaderData:]` and the data at
+        `out[hoff:]`; `parseHeapTupleAlias` round-trips the bitmap.
+        `internal/executor/codec.go::encodeRowPG` no longer prepends
+        the bitmap (returns column-data area only); new
+        `NullBitmapPG(row) []byte` returns the PG-convention bitmap
+        or nil. `internal/initdb/initdb.go::writeMultiPageHeapRows`
+        routes NULL-bearing rows through
+        `NewHeapTupleWithNulls`; no-NULL path is byte-identical to
+        before so every prior bootstrap catalog test still pins the
+        same layout. Regression pins:
+        `TestNewHeapTupleWithNullsLayoutMatchesPG18`,
+        `TestHeapTupleNullBitmapConventionMatchesPG18` in
+        `internal/storage/heap_nullbitmap_test.go`;
+        `TestNullBitmapPGUsesPGConvention`,
+        `TestNullBitmapPGNilWhenNoNulls`,
+        `TestNullBitmapPGSpansTwoBytes` in
+        `internal/executor/codec_nullbitmap_test.go`. Verified:
+        `go test -count=1 ./internal/storage/ ./internal/executor/`
+        PASS (incl. four new bitmap tests);
+        `go test -count=1 -run
+        'TestPgIndex|TestBootstrapPgIndex|TestPgAm|TestPgOpclass|TestPgProc'
+        ./internal/initdb/` PASS (every Step 3a/b/c/d/e/f/g pin still
+        agrees on layout); pre-existing 14 baseline-fail tests in
+        `./internal/initdb/` and 2 in `./internal/wal/` confirmed
+        unchanged via stash-baseline diff.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1` E2E re-run advances to the
+        next blocker — `FATAL: relnatts disagrees with indnatts for
+        index 2662` — a pg_class/pg_index consistency issue tracked
+        as Step 3j. Design:
+        `docs/design/0106-0010-step3i-null-bitmap-encoding.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
+        `internal/storage/heap.go`,
+        `internal/storage/heap_nullbitmap_test.go`,
+        `internal/executor/codec_nullbitmap_test.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,
         `internal/initdb/pg_proc_bootstrap_test.go`,
         `internal/initdb/pg_opclass_bootstrap_test.go`,

@@ -1769,7 +1769,13 @@ func writeMultiPageHeapRows(dataDir, relFile string, cols []catalog.Column, rows
 		if err != nil {
 			return fmt.Errorf("encode %s row: %w", relFile, err)
 		}
-		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		bitmap := executor.NullBitmapPG(row)
+		var tuple storage.HeapTuple
+		if bitmap != nil {
+			tuple = storage.NewHeapTupleWithNulls(storage.TransactionID(1), storage.InvalidTransactionID, bitmap, payload)
+		} else {
+			tuple = storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		}
 		tuple.Header.SetNatts(len(cols))
 		if hasVarWidthCol(cols) {
 			tuple.Header.Infomask |= storage.HeapHasVarWidth

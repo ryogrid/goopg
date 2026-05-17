@@ -143,8 +143,15 @@ type HeapTupleHeader struct {
 }
 
 // HeapTuple is one on-page tuple body.
+//
+// Bitmap is the PG null bitmap (bit=1 means NOT NULL, matching PG's
+// heap_fill_tuple), nil when the tuple has no nulls. Data is the column
+// data area only — the bitmap is stored separately so MarshalBinary can
+// place it at the canonical PG location (right after the fixed header,
+// before the t_hoff-aligned data region).
 type HeapTuple struct {
 	Header HeapTupleHeader
+	Bitmap []byte
 	Data   []byte
 }
 
@@ -171,7 +178,44 @@ func NewHeapTuple(xmin, xmax TransactionID, data []byte) HeapTuple {
 	}
 }
 
-// MarshalBinary encodes the tuple into the on-page layout.
+// maxAlign8 rounds n up to the nearest multiple of 8 (PG's MAXALIGN on
+// 64-bit platforms).
+func maxAlign8(n int) int {
+	return (n + 7) &^ 7
+}
+
+// NewHeapTupleWithNulls constructs a tuple whose payload includes a PG
+// null bitmap (bit=1 means NOT NULL, matching PG's heap_fill_tuple).
+// data is the column-data area only — without a bitmap and without
+// header-to-data alignment padding. The constructor stamps HEAP_HASNULL
+// in infomask and computes t_hoff = MAXALIGN(SizeofHeapTupleHeader +
+// len(bitmap)) so PG's heap_deform_tuple finds the column data at the
+// expected offset.
+func NewHeapTupleWithNulls(xmin, xmax TransactionID, bitmap, data []byte) HeapTuple {
+	hoff := maxAlign8(SizeOfHeapTupleHeaderData + len(bitmap))
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	bitmapCopy := make([]byte, len(bitmap))
+	copy(bitmapCopy, bitmap)
+	return HeapTuple{
+		Header: HeapTupleHeader{
+			Xmin:     xmin,
+			Xmax:     xmax,
+			Xvac:     InvalidTransactionID,
+			CTID:     ItemPointer{Block: InvalidBlockNumber, Offset: 0},
+			Infomask: HeapHasNull,
+			Hoff:     uint8(hoff),
+		},
+		Bitmap: bitmapCopy,
+		Data:   dataCopy,
+	}
+}
+
+// MarshalBinary encodes the tuple into the on-page layout. When Bitmap
+// is non-nil, it is written immediately after the fixed header (byte
+// SizeOfHeapTupleHeaderData..SizeOfHeapTupleHeaderData+len(Bitmap));
+// the gap between the bitmap and Data (starting at byte t_hoff) is
+// alignment padding required by PG.
 func (t HeapTuple) MarshalBinary() ([]byte, error) {
 	hoff := int(t.Header.Hoff)
 	if hoff == 0 {
@@ -179,6 +223,9 @@ func (t HeapTuple) MarshalBinary() ([]byte, error) {
 	}
 	if hoff < SizeOfHeapTupleHeaderData || hoff > 255 {
 		return nil, fmt.Errorf("invalid t_hoff=%d", hoff)
+	}
+	if len(t.Bitmap) > 0 && SizeOfHeapTupleHeaderData+len(t.Bitmap) > hoff {
+		return nil, fmt.Errorf("null bitmap of %d bytes does not fit under t_hoff=%d", len(t.Bitmap), hoff)
 	}
 	out := make([]byte, hoff+len(t.Data))
 	binary.LittleEndian.PutUint32(out[0:4], uint32(t.Header.Xmin))
@@ -189,6 +236,9 @@ func (t HeapTuple) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint16(out[18:20], t.Header.Infomask2)
 	binary.LittleEndian.PutUint16(out[20:22], t.Header.Infomask)
 	out[22] = byte(hoff)
+	if len(t.Bitmap) > 0 {
+		copy(out[SizeOfHeapTupleHeaderData:SizeOfHeapTupleHeaderData+len(t.Bitmap)], t.Bitmap)
+	}
 	copy(out[hoff:], t.Data)
 	return out, nil
 }
@@ -201,6 +251,9 @@ func ParseHeapTuple(raw []byte) (HeapTuple, error) {
 		return HeapTuple{}, err
 	}
 	t.Data = append([]byte(nil), t.Data...)
+	if len(t.Bitmap) > 0 {
+		t.Bitmap = append([]byte(nil), t.Bitmap...)
+	}
 	return t, nil
 }
 
@@ -216,17 +269,29 @@ func parseHeapTupleAlias(raw []byte) (HeapTuple, error) {
 	if hoff < SizeOfHeapTupleHeaderData || hoff > len(raw) {
 		return HeapTuple{}, fmt.Errorf("%w: invalid t_hoff=%d len=%d", ErrCorruptTuple, hoff, len(raw))
 	}
+	infomask := binary.LittleEndian.Uint16(raw[20:22])
+	infomask2 := binary.LittleEndian.Uint16(raw[18:20])
+	var bitmap []byte
+	if infomask&HeapHasNull != 0 {
+		natts := int(infomask2 & HeapNattsMask)
+		bmLen := (natts + 7) / 8
+		if SizeOfHeapTupleHeaderData+bmLen > hoff {
+			return HeapTuple{}, fmt.Errorf("%w: null bitmap of %d bytes overruns t_hoff=%d", ErrCorruptTuple, bmLen, hoff)
+		}
+		bitmap = raw[SizeOfHeapTupleHeaderData : SizeOfHeapTupleHeaderData+bmLen]
+	}
 	return HeapTuple{
 		Header: HeapTupleHeader{
 			Xmin:      TransactionID(binary.LittleEndian.Uint32(raw[0:4])),
 			Xmax:      TransactionID(binary.LittleEndian.Uint32(raw[4:8])),
 			Xvac:      TransactionID(binary.LittleEndian.Uint32(raw[8:12])),
 			CTID:      ItemPointer{Block: BlockNumber(binary.LittleEndian.Uint32(raw[12:16])), Offset: binary.LittleEndian.Uint16(raw[16:18])},
-			Infomask2: binary.LittleEndian.Uint16(raw[18:20]),
-			Infomask:  binary.LittleEndian.Uint16(raw[20:22]),
+			Infomask2: infomask2,
+			Infomask:  infomask,
 			Hoff:      uint8(hoff),
 		},
-		Data: raw[hoff:],
+		Bitmap: bitmap,
+		Data:   raw[hoff:],
 	}, nil
 }
 

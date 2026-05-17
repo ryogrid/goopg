@@ -58,7 +58,13 @@ func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
 // EncodeRowPG encodes a row in PG-native physical tuple format
 // (M0105-0010). Used for catalog pages that PG must read directly,
 // such as pg_authid. The format mirrors PostgreSQL's heap tuple
-// layout: null bitmap + aligned per-type values in little-endian.
+// layout: aligned per-type values in little-endian.
+//
+// The returned bytes are the column-data area only — the null bitmap,
+// when needed, must be computed separately via NullBitmapPG and stored
+// in the tuple header via storage.NewHeapTupleWithNulls. PG stores the
+// bitmap between the fixed header and the t_hoff-aligned data region,
+// not inline with the data.
 //
 // Most goopg code should continue using EncodeRow (goopg-internal
 // format) for backward compatibility.
@@ -69,12 +75,14 @@ func EncodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 	return encodeRowPG(cols, row)
 }
 
-// encodeRowPG encodes a row in PG-native physical tuple format.
-// PG's heap_fill_tuple omits the null bitmap when all columns are
-// non-null. When nulls are present, the bitmap is at the start of
-// the data area with each null column's bit set to 1.
-func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
-	numCols := len(cols)
+// NullBitmapPG returns the PG-convention null bitmap for the row, or
+// nil when the row has no NULL columns. The convention matches PG's
+// heap_fill_tuple: bit i is set when column i is NOT NULL, cleared
+// when column i is NULL. Bit numbering is little-endian within each
+// byte (bit 0 = first attribute in the byte). Callers stamp the result
+// into the tuple header via storage.NewHeapTupleWithNulls and the
+// resulting HEAP_HASNULL flag.
+func NullBitmapPG(row Row) []byte {
 	hasNull := false
 	for _, d := range row {
 		if d.IsNull() {
@@ -82,22 +90,26 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 			break
 		}
 	}
-	var out []byte
-	off := 0
-	if hasNull {
-		nullBitmapLen := (numCols + 7) / 8
-		nullBitmap := make([]byte, nullBitmapLen)
-		for i, d := range row {
-			if d.IsNull() {
-				nullBitmap[i/8] |= 1 << (i % 8)
-			}
-		}
-		out = make([]byte, 0, 256)
-		out = append(out, nullBitmap...)
-		off = nullBitmapLen
-	} else {
-		out = make([]byte, 0, 256)
+	if !hasNull {
+		return nil
 	}
+	bmLen := (len(row) + 7) / 8
+	bm := make([]byte, bmLen)
+	for i, d := range row {
+		if !d.IsNull() {
+			bm[i/8] |= 1 << (i % 8)
+		}
+	}
+	return bm
+}
+
+// encodeRowPG encodes a row's column-data area in PG-native physical
+// tuple format. NULL columns are skipped (they consume no data bytes
+// in PG's heap tuple); see NullBitmapPG for the null bitmap that must
+// accompany the result whenever the row contains NULL.
+func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
+	out := make([]byte, 0, 256)
+	off := 0
 	for i, c := range cols {
 		d := row[i]
 		if d.IsNull() {
