@@ -194,7 +194,8 @@ func Init(opts Options) error {
 	}
 	// M0106-0008: populate pg_class/pg_attribute heap tuples so
 	// vanilla PG's RelationBuildDesc → ScanPgRelation finds them.
-	if err := bootstrapPgClassTuples(abs); err != nil {
+	pgClassTIDs, err := bootstrapPgClassTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_class tuples: %w", err)
 	}
 	if err := bootstrapPgAttributeTuples(abs); err != nil {
@@ -247,6 +248,17 @@ func Init(opts Options) error {
 	// standby boot is "could not find tuple for opclass 1986".
 	if err := bootstrapPgOpclassOidIndex(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_opclass_oid_index: %w", err)
+	}
+	// M0106-0010 step 3m: overwrite the empty btree placeholder at
+	// base/{1,5}/2662 + global/2662 with a populated 2-page btree
+	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per
+	// pg_class heap row so PG's ScanPgRelation(oid, indexOK=true)
+	// — invoked once criticalRelcachesBuilt becomes true while
+	// loading the SHARED critical indexes — can find pg_class rows
+	// via pg_class_oid_index. Without this the next FATAL during
+	// standby boot is "could not open critical system index 2671".
+	if err := bootstrapPgClassOidIndex(abs, pgClassTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_class_oid_index: %w", err)
 	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
@@ -658,13 +670,24 @@ func bootstrapPostgresDatabase(dataDir string) error {
 // bootstrapPgClassTuples writes PG-native pg_class heap tuples for every
 // nailed relation. Vanilla PG's load_critical_index → RelationBuildDesc →
 // ScanPgRelation reads actual pg_class tuples, ignoring the init file.
-func bootstrapPgClassTuples(dataDir string) error {
+//
+// Returns a map[oid]heapTID so the Step 3m caller can build the matching
+// pg_class_oid_index btree over the same heap-row locations.
+func bootstrapPgClassTuples(dataDir string) (map[uint32]heapTID, error) {
 	cols := pgClassColDefs()
 	allRels := append([]nailedRel{}, nailedSharedRels...)
 	allRels = append(allRels, nailedLocalRels...)
-	return writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
+	tids, err := writeMultiPageHeap(dataDir, "1259", cols, allRels, func(rel nailedRel) executor.Row {
 		return pgClassRow(rel)
 	})
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[uint32]heapTID, len(allRels))
+	for i, rel := range allRels {
+		m[rel.OID] = tids[i]
+	}
+	return m, nil
 }
 
 // bootstrapPgAttributeTuples writes PG-native pg_attribute heap tuples for
@@ -1764,35 +1787,49 @@ func hasVarWidthCol(cols []catalog.Column) bool {
 	return false
 }
 
+// heapTID identifies a heap tuple by (block, 1-based offset within block).
+// Used by Step 3m's btree index bootstrapping path (pg_class_oid_index)
+// where we need to know which TID each just-packed row landed at.
+type heapTID struct {
+	Block  uint32
+	Offset uint16
+}
+
 // writeMultiPageHeap writes multiple heap tuples (one per nailed rel) into
-// a multi-page heap file.
-func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []nailedRel, rowFn func(nailedRel) executor.Row) error {
+// a multi-page heap file. Returns the per-row TID slice (aligned with the
+// input rels) so callers that need to build a covering btree index over the
+// same rows can stamp the correct ItemPointer into each IndexTuple.
+func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []nailedRel, rowFn func(nailedRel) executor.Row) ([]heapTID, error) {
 	var pages [][]byte
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
-		return err
+		return nil, err
 	}
-	for _, rel := range rels {
+	tids := make([]heapTID, len(rels))
+	for i, rel := range rels {
 		row := rowFn(rel)
 		payload, err := executor.EncodeRowPG(cols, row)
 		if err != nil {
-			return fmt.Errorf("encode %s row for %s: %w", relFile, rel.RelName, err)
+			return nil, fmt.Errorf("encode %s row for %s: %w", relFile, rel.RelName, err)
 		}
 		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
 		tuple.Header.SetNatts(len(cols))
 		if hasVarWidthCol(cols) {
 			tuple.Header.Infomask |= storage.HeapHasVarWidth
 		}
-		if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+		off, err := storage.PageAddHeapTuple(page, tuple)
+		if err != nil {
 			pages = append(pages, page)
 			page = make(storage.Page, storage.BlockSize)
 			if err := storage.InitPage(page); err != nil {
-				return err
+				return nil, err
 			}
-			if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
-				return fmt.Errorf("add %s tuple for %s on fresh page: %w", relFile, rel.RelName, err)
+			off, err = storage.PageAddHeapTuple(page, tuple)
+			if err != nil {
+				return nil, fmt.Errorf("add %s tuple for %s on fresh page: %w", relFile, rel.RelName, err)
 			}
 		}
+		tids[i] = heapTID{Block: uint32(len(pages)), Offset: off}
 	}
 	pages = append(pages, page)
 	raw := make([]byte, 0, storage.BlockSize*len(pages))
@@ -1801,13 +1838,16 @@ func writeMultiPageHeap(dataDir, relFile string, cols []catalog.Column, rels []n
 	}
 	b1 := filepath.Join(dataDir, "base", "1")
 	if err := os.WriteFile(filepath.Join(b1, relFile), raw, 0o600); err != nil {
-		return err
+		return nil, err
 	}
 	b5 := filepath.Join(dataDir, "base", "5")
 	if err := os.MkdirAll(b5, 0o700); err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(filepath.Join(b5, relFile), raw, 0o600)
+	if err := os.WriteFile(filepath.Join(b5, relFile), raw, 0o600); err != nil {
+		return nil, err
+	}
+	return tids, nil
 }
 
 // writeMultiPageHeapRows is like writeMultiPageHeap but takes pre-built rows.

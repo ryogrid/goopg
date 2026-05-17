@@ -192,3 +192,83 @@ func TestBootstrapPgOpclassOidIndexWritesPopulatedBtree(t *testing.T) {
 		}
 	}
 }
+
+// TestBootstrapPgClassOidIndexWritesPopulatedBtree end-to-ends Step 3m's
+// output: file is 2 blocks at every disk location, block 0 is a metapage
+// pointing at block 1, block 1 is a leaf-root carrying one IndexTuple per
+// nailed rel (shared + local) sorted ascending by OID with the heap-row
+// TID encoded in ItemPointer. Closes the PANIC "could not open critical
+// system index 2671" blocker.
+func TestBootstrapPgClassOidIndexWritesPopulatedBtree(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"base/1", "base/5", "global"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	tids, err := bootstrapPgClassTuples(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPgClassTuples: %v", err)
+	}
+	if err := bootstrapPgClassOidIndex(dir, tids); err != nil {
+		t.Fatalf("bootstrapPgClassOidIndex: %v", err)
+	}
+
+	wantOIDs := make([]uint32, 0, len(tids))
+	for oid := range tids {
+		wantOIDs = append(wantOIDs, oid)
+	}
+	sort.Slice(wantOIDs, func(i, j int) bool { return wantOIDs[i] < wantOIDs[j] })
+
+	for _, path := range []string{
+		filepath.Join(dir, "base", "1", "2662"),
+		filepath.Join(dir, "base", "5", "2662"),
+		filepath.Join(dir, "global", "2662"),
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if len(raw) != 2*storage.BlockSize {
+			t.Errorf("%s: len=%d, want %d (2 blocks)", path, len(raw), 2*storage.BlockSize)
+			continue
+		}
+		base := storage.SizeOfPageHeaderData
+		if got := binary.LittleEndian.Uint32(raw[base+8 : base+12]); got != 1 {
+			t.Errorf("%s: btm_root=%d, want 1", path, got)
+		}
+		leaf := raw[storage.BlockSize : 2*storage.BlockSize]
+		h, err := storage.Header(storage.Page(leaf))
+		if err != nil {
+			t.Fatalf("%s: leaf header: %v", path, err)
+		}
+		nItems := (int(h.Lower()) - storage.SizeOfPageHeaderData) / 4
+		if nItems != len(wantOIDs) {
+			t.Errorf("%s: leaf items=%d, want %d", path, nItems, len(wantOIDs))
+			continue
+		}
+		for i := 0; i < nItems; i++ {
+			raw32 := binary.LittleEndian.Uint32(leaf[storage.SizeOfPageHeaderData+i*4 : storage.SizeOfPageHeaderData+i*4+4])
+			off := raw32 & 0x7FFF
+			length := (raw32 >> 17) & 0x7FFF
+			if length != 16 {
+				t.Errorf("%s: item %d length=%d, want 16", path, i, length)
+				continue
+			}
+			// Block id at offset 0..3, posid at 4..5, oid key at 8..11.
+			gotBlock := binary.LittleEndian.Uint32(leaf[off : off+4])
+			gotOff := binary.LittleEndian.Uint16(leaf[off+4 : off+6])
+			gotOID := binary.LittleEndian.Uint32(leaf[off+8 : off+12])
+			if gotOID != wantOIDs[i] {
+				t.Errorf("%s: item %d OID=%d, want %d (sorted)", path, i, gotOID, wantOIDs[i])
+				continue
+			}
+			// TID must match what bootstrapPgClassTuples reported for this OID.
+			wantTID := tids[gotOID]
+			if gotBlock != wantTID.Block || gotOff != wantTID.Offset {
+				t.Errorf("%s: OID %d TID=(%d,%d), want (%d,%d)",
+					path, gotOID, gotBlock, gotOff, wantTID.Block, wantTID.Offset)
+			}
+		}
+	}
+}

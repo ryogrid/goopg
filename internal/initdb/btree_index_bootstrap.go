@@ -231,3 +231,62 @@ func bootstrapPgOpclassOidIndex(dataDir string) error {
 	}
 	return nil
 }
+
+// bootstrapPgClassOidIndex overwrites the empty btree placeholders at
+// base/{1,5}/2662 and global/2662 with a 2-block btree file (metapage +
+// populated leaf-root) carrying one IndexTuple per pg_class heap row,
+// keyed on relation OID. Closes the PANIC "could not open critical system
+// index 2671" blocker that surfaced after Step 3l.
+//
+// Why this is needed: once the 7 local critical indexes finish loading,
+// `criticalRelcachesBuilt` flips to true; the immediately-following pass
+// over the 6 SHARED critical indexes resolves each shared index's pg_class
+// row via `ScanPgRelation(oid, indexOK=true)`, which now switches from the
+// sequential-scan fallback to an index lookup against pg_class_oid_index
+// (OID 2662). The empty placeholder produced by Step 3k returned zero rows
+// for every shared-index lookup, FATALing the standby with
+//   PANIC: could not open critical system index 2671
+//
+// Heap-row TIDs are taken verbatim from `bootstrapPgClassTuples`'s return
+// value — `writeMultiPageHeap` packs nailed rels in iteration order across
+// however many 8 KiB pages are required and reports the actual (block,
+// offset) each row landed at. Index tuples are then sorted by OID before
+// leaf-page assembly so PG's `_bt_binsrch` over `oidcmp` finds them via
+// the standard ordered search.
+func bootstrapPgClassOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type oidEntry struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	entries := make([]oidEntry, 0, len(tids))
+	for oid, t := range tids {
+		entries = append(entries, oidEntry{oid: oid, block: t.Block, off: t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].oid < entries[j].oid })
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidKey(e.block, e.off, e.oid)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_class_oid_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2662, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_class_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

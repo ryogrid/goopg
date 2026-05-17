@@ -2987,6 +2987,57 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `pg_amproc_fam_proc_index` (2655), or a nailed-relation lookup
         via `pg_class_oid_index` (2662). Design:
         `docs/design/0106-0010-step3l-pg-opclass-oid-index-tuples.md`.
+      - Step 3m LANDED 2026-05-17. Closes the PANIC
+        `could not open critical system index 2671` PG-standby boot blocker
+        that surfaced after Step 3l populated `pg_opclass_oid_index`. Root
+        cause: once the seven local critical indexes finish loading,
+        `RelationCacheInitializePhase3` flips `criticalRelcachesBuilt =
+        true` and proceeds to load the six SHARED critical indexes.
+        `RelationBuildDesc(2671)` then does
+        `ScanPgRelation(2671, indexOK=true)` which — with the flag now
+        flipped — switches from the seq-scan fallback to an index lookup
+        against `pg_class_oid_index` (OID 2662). The Step-3k empty
+        placeholder (`btm_root = P_NONE`) returns zero rows, so
+        `ScanPgRelation` returns NULL, `RelationBuildDesc` returns NULL,
+        and `load_critical_index` PANICs
+        (`postgres/src/backend/utils/cache/relcache.c:4408`). Fix:
+        `internal/initdb/initdb.go::writeMultiPageHeap` widened to return
+        `[]heapTID` (new package-private struct
+        `heapTID{Block uint32; Offset uint16}`); only call site
+        `bootstrapPgClassTuples` widened to return
+        `map[oid]heapTID`; `Init` captures the map and threads it into a
+        new `bootstrapPgClassOidIndex(dataDir, tids)` call placed
+        immediately after `bootstrapPgOpclassOidIndex`. The new function
+        in `internal/initdb/btree_index_bootstrap.go` reuses Step 3l's
+        builders verbatim — `pgBuildIndexTupleOidKey`,
+        `pgBuildBtreeLeafRootPage`, `pgBuildBtreeMetapageWithRoot` —
+        sorts the (oid, tid) pairs ascending by OID
+        (required by `_bt_binsrch`), builds 16-byte oid-keyed
+        IndexTuples, assembles a 2-block file (metapage at block 0 →
+        leaf-root at block 1), and writes to `base/{1,5}/2662` +
+        `global/2662`. The TID-tracking refactor is necessary because
+        pg_class rows span multiple 8 KiB pages — index tuples must
+        carry the actual (block, offset) `PageAddHeapTuple` placed each
+        row at, not a synthesised TID. Regression pin:
+        `TestBootstrapPgClassOidIndexWritesPopulatedBtree` (file = 2
+        blocks at all three on-disk locations; metapage `btm_root == 1`;
+        leaf line-pointer count == len(nailed rels); each IndexTuple's
+        [8..11] OID window decodes ascending; each
+        (`ip_blkid`, `ip_posid`) matches the heap-side `tids` map by
+        OID — guards against silently-corrupt TID-to-OID alignment).
+        Verified: `go test -count=1 -run
+        'TestBootstrapPgClassOidIndex|TestPgBuildIndexTupleOidKey|TestPgBuildBtreeLeafRoot|TestPgBuildBtreeMetapage|TestBootstrapPgOpclassOidIndex'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — 14 pre-existing baseline failures confirmed unchanged via
+        stash-baseline diff; `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1` E2E re-run
+        (`TestE2E_FailoverGoopgToPG/async`) advances past PANIC 2671 to
+        the next blocker: `FATAL: column is not in index` from
+        `RelationInitIndexAccessInfo` — index-key vs pg_attribute
+        consistency check; Step 3n territory. Design:
+        `docs/design/0106-0010-step3m-pg-class-oid-index-tuples.md`.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
