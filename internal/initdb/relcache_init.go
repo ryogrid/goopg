@@ -93,6 +93,13 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	{2672, "pg_database_oid_index"},
 	{2676, "pg_authid_rolname_index"},
 	{2677, "pg_authid_oid_index"},
+	// M0106-0010 Step 3z: pg_auth_members_role_member_index. PG18
+	// `postgres/src/include/catalog/pg_auth_members.h:49` declares
+	// `AuthMemRoleMemIndexId = 2694` as a 3-column composite
+	// btree(roleid, member, grantor). Without this entry
+	// RelationIdGetRelation(2694) FATALs because no pg_class row
+	// gets seeded; the sibling 2695 follows the same pattern.
+	{2694, "pg_auth_members_role_member_index"},
 	{2695, "pg_auth_members_member_role_index"},
 	{3593, "pg_shseclabel_object_index"},
 })

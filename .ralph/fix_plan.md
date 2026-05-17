@@ -3810,10 +3810,48 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         blocker: `FATAL: could not open relation with OID 2694`
         (Step 3z territory).
         Design: `docs/design/0106-0010-step3y-pg-amop-fam-strat-index.md`.
-      - Next blocker (Step 3z): OID 2694. Identify catalog/index via
-        `grep -n "2694" postgres/src/include/catalog/*_d.h` and seed via
-        the established `pgIndexInitialEntries` + `nailedLocalRels` +
-        placeholder pattern.
+      - PROGRESS 2026-05-18 (step 3z): seeded
+        `pg_auth_members_role_member_index` (OID 2694) into the catalog
+        bootstrap. OID 2694 is a SHARED-catalog index (parent
+        pg_auth_members OID 1261 is BKI_SHARED_RELATION) so it mirrors
+        the existing sibling 2695 (`pg_auth_members_member_role_index`):
+        `nailedSharedRels` (not local), and only the shared-index OID
+        list at `bootstrapPostgresDatabase` line 779 (`global/<oid>`).
+        Per `postgres/src/include/catalog/pg_auth_members.h:49`,
+        `DECLARE_UNIQUE_INDEX(pg_auth_members_role_member_index, 2694,
+        AuthMemRoleMemIndexId, pg_auth_members, btree(roleid oid_ops,
+        member oid_ops, grantor oid_ops))` and
+        `MAKE_SYSCACHE(AUTHMEMROLEMEM, pg_auth_members_role_member_index, 8)`.
+        UNIQUE but NOT primary (the PKEY of pg_auth_members is OID 6303).
+        `pgIndexInitialEntries` gains
+        `entry(2694, 1261, []int16{2,3,4}, []uint32{oidOps,oidOps,oidOps},
+        []uint32{0,0,0}, true, false)`. `flattenRels` derives
+        `RelKind='i', RelNatts=3` automatically via `pgIndexNattsByOID`.
+        Regression pins: new
+        `TestPgAuthMembersRoleMemberIndexSeededFromInitialEntries` and
+        `TestNailedSharedRelsContainsPgAuthMembersRoleMemberIndex` in
+        `internal/initdb/pg_auth_members_role_member_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds
+        `2694: {2,3,4}`;
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2694.
+        Verified: `go build ./...` PASS;
+        `go test -count=1 -run
+        'TestPgAuthMembersRoleMemberIndex|TestNailedSharedRelsContainsPgAuthMembers|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBtreeIndexBootstrap|TestBootstrapPgIndexIndexrelidIndex'
+        ./internal/initdb/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        advances past `could not open relation with OID 2694` to the
+        next blocker: `FATAL: could not open relation with OID 2605`
+        (`pg_cast` heap; CastRelationId per
+        `postgres/src/include/catalog/pg_cast_d.h:23`) — Step 3aa
+        territory.
+        Design: `docs/design/0106-0010-step3z-pg-auth-members-role-member-index.md`.
+      - Next blocker (Step 3aa): OID 2605 = `pg_cast` heap relation
+        (NOT an index). Will require nailing the heap via
+        `nailedLocalRels` (sibling pattern: pg_aggregate step 3w),
+        plus its companion indexes (2660 `pg_cast_oid_index`, 2661
+        `pg_cast_source_target_index` per `pg_cast_d.h`).
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3844,7 +3882,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_aggregate_fnoid_index_test.go`,
         `docs/design/0106-0010-step3x-pg-aggregate-fnoid-index.md`,
         `internal/initdb/pg_amop_fam_strat_index_test.go`,
-        `docs/design/0106-0010-step3y-pg-amop-fam-strat-index.md`
+        `docs/design/0106-0010-step3y-pg-amop-fam-strat-index.md`,
+        `internal/initdb/pg_auth_members_role_member_index_test.go`,
+        `docs/design/0106-0010-step3z-pg-auth-members-role-member-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -464,7 +464,9 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 	// Must cover every nailed index (i.e. the 2671 shared index plus all
 	// of nailedLocalRels' index OIDs). If this drops, Phase 3's SHARED
 	// critical-index pass FATALs immediately.
-	mustHave := []uint32{2671, 2672, 2676, 2677, 2695, 3593,
+	mustHave := []uint32{2671, 2672, 2676, 2677,
+		2694, // pg_auth_members_role_member_index ← Step 3z
+		2695, 3593,
 		2650, // pg_aggregate_fnoid_index ← Step 3x
 		2653, // pg_amop_fam_strat_index ← Step 3y
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680,

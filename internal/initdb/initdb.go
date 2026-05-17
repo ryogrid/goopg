@@ -776,7 +776,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	// formrdesc may use InvalidOid for dbNode on nailed
 	// relations, causing lookups in global/ instead of base/<dboid>/.
 	for _, oid := range []uint32{
-		2671, 2672, 2676, 2677, 2695, 3593,
+		2671, 2672, 2676, 2677,
+		2694, // pg_auth_members_role_member_index (Step 3z)
+		2695, 3593,
 		// Also copy all local critical indexes to global/
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
@@ -1628,6 +1630,17 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2676, 1260, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),  // pg_authid_rolname_index
 		entry(2677, 1260, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),             // pg_authid_oid_index
 		entry(2695, 1261, []int16{3, 2, 4}, []uint32{oidOps, oidOps, oidOps}, []uint32{0, 0, 0}, true, false), // pg_auth_members_member_role_index
+		// M0106-0010 Step 3z: pg_auth_members_role_member_index (OID 2694).
+		// postgres/src/include/catalog/pg_auth_members.h:49 —
+		//   DECLARE_UNIQUE_INDEX(pg_auth_members_role_member_index, 2694,
+		//     AuthMemRoleMemIndexId, pg_auth_members,
+		//     btree(roleid oid_ops, member oid_ops, grantor oid_ops));
+		//   MAKE_SYSCACHE(AUTHMEMROLEMEM, pg_auth_members_role_member_index, 8);
+		// pg_auth_members attnums (pg_auth_members_d.h): 1=oid,
+		// 2=roleid, 3=member, 4=grantor. UNIQUE but NOT primary
+		// (DECLARE_UNIQUE_INDEX, not _PKEY which is 6303).
+		// Shared catalog like its sibling 2695.
+		entry(2694, 1261, []int16{2, 3, 4}, []uint32{oidOps, oidOps, oidOps}, []uint32{0, 0, 0}, true, false), // pg_auth_members_role_member_index
 		// pg_shseclabel columns (PG18, pg_shseclabel.h): 1=objoid, 2=classoid,
 		// 3=provider, 4=label. Index = btree(objoid, classoid, provider text_ops).
 		entry(3593, 3592, []int16{1, 2, 3}, []uint32{oidOps, oidOps, textOps}, []uint32{0, 0, cCollation}, true, true), // pg_shseclabel_object_index
