@@ -741,6 +741,28 @@ func oidVectorBytes(oids []uint32) []byte {
 	return buf
 }
 
+// int2VectorBytes builds the on-disk int2vector blob for pg_index.indkey
+// and pg_index.indoption. Layout mirrors oidVectorBytes but with
+// elemtype=INT2(21) and 2-byte payload elements. Matches upstream
+// `buildint2vector` (src/backend/utils/adt/int.c) byte-for-byte: a 24-byte
+// 1-D no-null ArrayType header followed by n*int16 values, with vl_len_
+// encoded as (total << 2) per SET_VARSIZE_4B.
+func int2VectorBytes(values []int16) []byte {
+	const headerSize = 24
+	total := headerSize + 2*len(values)
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	binary.LittleEndian.PutUint32(buf[12:16], 21)
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(values)))
+	binary.LittleEndian.PutUint32(buf[20:24], 0)
+	for i, v := range values {
+		binary.LittleEndian.PutUint16(buf[24+i*2:26+i*2], uint16(v))
+	}
+	return buf
+}
+
 // pgProcEntry is a minimal description of a pg_proc row produced
 // during initdb. v0 only needs to seed the AM handler functions so
 // PG's RelationInitIndexAccessInfo can resolve amhandler via fmgr.
@@ -1273,37 +1295,178 @@ func bootstrapPgAmprocTuples(dataDir string) error {
 	return writeMultiPageHeapRows(dataDir, "2603", cols, rows)
 }
 
-// pgIndexMinimalColDefs returns the 4-column minimal pg_index shape
-// that matches the current `pgIndexAttrs()` declaration in
-// `relcache_init.go`. The full PG18 FormData_pg_index has 21 columns
-// (10 bool flags, int2vector indkey, oidvector indcollation /
-// indclass, int2vector indoption, pg_node_tree indexprs / indpred);
-// the per-index row encoder lands in a follow-up step. For now we
-// only need an empty-page file on disk so PG's
-// `RelationOpenSmgr → mdopen` during standby start-up's nailed-index
-// initialisation can `BasicOpenFile("base/<dboid>/2610")` without
-// FATAL'ing.
-func pgIndexMinimalColDefs() []catalog.Column {
+// pgIndexColDefs returns the full PG18 FormData_pg_index column shape
+// — 21 columns: 2 oids + 2 int2 + 11 bools fixed-part, then int2vector
+// indkey, oidvector indcollation / indclass, int2vector indoption, and
+// nullable pg_node_tree indexprs / indpred. Byte-aligned offsets match
+// `postgres/src/include/catalog/pg_index.h` so the heap-tuple seed and
+// PG's `heap_deformtuple → Form_pg_index` cast agree.
+func pgIndexColDefs() []catalog.Column {
 	return []catalog.Column{
-		{Name: "indexrelid", Type: catalog.Type{Name: "oid"}},
-		{Name: "indrelid", Type: catalog.Type{Name: "oid"}},
-		{Name: "indnatts", Type: catalog.Type{Name: "int2"}},
-		{Name: "indislive", Type: catalog.Type{Name: "bool"}},
+		{Name: "indexrelid", Type: catalog.Type{Name: "oid"}},          // 1
+		{Name: "indrelid", Type: catalog.Type{Name: "oid"}},            // 2
+		{Name: "indnatts", Type: catalog.Type{Name: "int2"}},           // 3
+		{Name: "indnkeyatts", Type: catalog.Type{Name: "int2"}},        // 4
+		{Name: "indisunique", Type: catalog.Type{Name: "bool"}},        // 5
+		{Name: "indnullsnotdistinct", Type: catalog.Type{Name: "bool"}}, // 6
+		{Name: "indisprimary", Type: catalog.Type{Name: "bool"}},       // 7
+		{Name: "indisexclusion", Type: catalog.Type{Name: "bool"}},     // 8
+		{Name: "indimmediate", Type: catalog.Type{Name: "bool"}},       // 9
+		{Name: "indisclustered", Type: catalog.Type{Name: "bool"}},     // 10
+		{Name: "indisvalid", Type: catalog.Type{Name: "bool"}},         // 11
+		{Name: "indcheckxmin", Type: catalog.Type{Name: "bool"}},       // 12
+		{Name: "indisready", Type: catalog.Type{Name: "bool"}},         // 13
+		{Name: "indislive", Type: catalog.Type{Name: "bool"}},          // 14
+		{Name: "indisreplident", Type: catalog.Type{Name: "bool"}},     // 15
+		// Variable-length region. int2vector indkey is BKI_FORCE_NOT_NULL.
+		{Name: "indkey", Type: catalog.Type{Name: "int2vector"}},       // 16
+		{Name: "indcollation", Type: catalog.Type{Name: "oidvector"}},  // 17
+		{Name: "indclass", Type: catalog.Type{Name: "oidvector"}},      // 18
+		{Name: "indoption", Type: catalog.Type{Name: "int2vector"}},    // 19
+		// pg_node_tree fields are nullable; we always encode NULL via
+		// the null bitmap (see pgIndexRow).
+		{Name: "indexprs", Type: catalog.Type{Name: "pg_node_tree"}},   // 20
+		{Name: "indpred", Type: catalog.Type{Name: "pg_node_tree"}},    // 21
 	}
 }
 
-// bootstrapPgIndexTuples writes an empty pg_index heap page to
-// base/{1,5}/2610. M0106-0010 step 3f: the previous E2E run hit
-// "FATAL: could not open file base/5/2610" because the file did not
-// exist on disk — pg_index is a per-database local catalog and PG's
-// nailed-index initialisation opens it via mdopen → BasicOpenFile.
-// Step 3f writes an initialised but empty heap page so the open
-// succeeds; the next step seeds one Form_pg_index tuple per nailed
-// index so RelationInitIndexAccessInfo can resolve indclass /
-// indcollation / indkey for every critical index.
+// pgIndexEntry describes one Form_pg_index row to seed into the heap.
+// IndKey, IndCollation, IndClass and IndOption must all have length
+// equal to IndNatts (= IndNKeyAtts for goopg's seed, which has no
+// INCLUDE columns).
+type pgIndexEntry struct {
+	IndexRelid   uint32
+	IndRelid     uint32
+	IndKey       []int16
+	IndCollation []uint32
+	IndClass     []uint32
+	IndOption    []int16
+	IsUnique     bool
+	IsPrimary    bool
+}
+
+// pgIndexInitialEntries returns one Form_pg_index row per nailed index
+// (local + shared). Column / opclass selections match upstream
+// `pg_<rel>.h::DECLARE_*_INDEX`. Both base/1/2610 and base/5/2610
+// receive every entry — pg_index is per-database, but PG's nailed-
+// index initialisation walks both critical-local AND critical-shared
+// lists against the current database's pg_index, so shared-catalog
+// index rows must be present in every per-database pg_index too.
+func pgIndexInitialEntries() []pgIndexEntry {
+	const (
+		oidOps             uint32 = 1981
+		int2Ops            uint32 = 1979
+		int4Ops            uint32 = 1978
+		nameOps            uint32 = 1986
+		textOps            uint32 = 3126
+		charOps            uint32 = 1985
+		oidvectorOps       uint32 = 1987
+		cCollation         uint32 = 950 // C_COLLATION_OID — name/text use C in catalogs
+	)
+	// Helper builders.
+	entry := func(idxOID, relOID uint32, key []int16, class []uint32, coll []uint32, unique, primary bool) pgIndexEntry {
+		n := len(key)
+		opt := make([]int16, n)
+		return pgIndexEntry{
+			IndexRelid:   idxOID,
+			IndRelid:     relOID,
+			IndKey:       key,
+			IndCollation: coll,
+			IndClass:     class,
+			IndOption:    opt,
+			IsUnique:     unique,
+			IsPrimary:    primary,
+		}
+	}
+	// Shared-catalog index rows (also written to per-database pg_index).
+	shared := []pgIndexEntry{
+		entry(2671, 1262, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),  // pg_database_datname_index
+		entry(2672, 1262, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),             // pg_database_oid_index
+		entry(2676, 1260, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),  // pg_authid_rolname_index
+		entry(2677, 1260, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),             // pg_authid_oid_index
+		entry(2695, 1261, []int16{3, 2, 4}, []uint32{oidOps, oidOps, oidOps}, []uint32{0, 0, 0}, true, false), // pg_auth_members_member_role_index
+		entry(3593, 3592, []int16{3, 2, 5}, []uint32{oidOps, oidOps, textOps}, []uint32{0, 0, cCollation}, true, true), // pg_shseclabel_object_index
+	}
+	// Local-catalog index rows mirroring nailedLocalRels.
+	local := []pgIndexEntry{
+		entry(2703, 1247, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_type_oid_index
+		entry(2704, 1247, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_type_typname_nsp_index
+		entry(2658, 1249, []int16{1, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_attribute_relid_attnam_index
+		entry(2659, 1249, []int16{1, 6}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, true),                        // pg_attribute_relid_attnum_index
+		entry(2662, 1259, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_class_oid_index
+		entry(2663, 1259, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_class_relname_nsp_index
+		entry(2690, 1255, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_proc_oid_index
+		entry(2691, 1255, []int16{2, 20, 3}, []uint32{nameOps, oidvectorOps, oidOps}, []uint32{cCollation, 0, 0}, true, false), // pg_proc_proname_args_nsp_index
+		// OID 2679 in upstream is pg_index_indexrelid_index (on indexrelid,
+		// attnum 1), not indrelid. nailedLocalRels' label is historical;
+		// the row content must match the OID semantics.
+		entry(2679, 2610, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_index_indexrelid_index
+		entry(2687, 2616, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_opclass_oid_index
+		// OID 2655 in upstream is pg_amproc_fam_proc_index (on amprocfamily,
+		// amproclefttype, amprocrighttype, amprocnum), not the oid index;
+		// the label in nailedLocalRels is historical.
+		entry(2655, 2603, []int16{2, 3, 4, 5}, []uint32{oidOps, oidOps, oidOps, int2Ops}, []uint32{0, 0, 0, 0}, true, false), // pg_amproc_fam_proc_index
+		entry(2693, 2618, []int16{2, 7}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_rewrite_rel_rulename_index
+		entry(2701, 2620, []int16{2, 3}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_trigger_tgrelid_tgname_index
+		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_constraint_oid_index
+		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_operator_oid_index
+		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                        // pg_inherits_relid_seqno_index
+		// OID 2654 = pg_amop_opr_fam_index: btree(amopopr oid_ops,
+		// amoppurpose char_ops, amopfamily oid_ops). amoppurpose is
+		// pg_amop attnum 6 (char), amopopr is attnum 7, amopfamily attnum 2.
+		entry(2654, 2602, []int16{7, 6, 2}, []uint32{oidOps, charOps, oidOps}, []uint32{0, 0, 0}, true, false),         // pg_amop_opr_fam_index
+	}
+	out := make([]pgIndexEntry, 0, len(shared)+len(local))
+	out = append(out, shared...)
+	out = append(out, local...)
+	return out
+}
+
+// pgIndexRow builds the 21-column Form_pg_index row matching
+// pgIndexColDefs order. The two pg_node_tree columns (indexprs,
+// indpred) are emitted as SQL NULL via NullDatum — none of the
+// nailed system catalog indexes is expression-based or partial.
+func pgIndexRow(e pgIndexEntry) executor.Row {
+	natts := int16(len(e.IndKey))
+	return executor.Row{
+		executor.NewIntDatum(int64(e.IndexRelid)),       // 1 indexrelid
+		executor.NewIntDatum(int64(e.IndRelid)),         // 2 indrelid
+		executor.NewIntDatum(int64(natts)),              // 3 indnatts
+		executor.NewIntDatum(int64(natts)),              // 4 indnkeyatts
+		executor.NewBoolDatum(e.IsUnique),               // 5 indisunique
+		executor.NewBoolDatum(false),                    // 6 indnullsnotdistinct
+		executor.NewBoolDatum(e.IsPrimary),              // 7 indisprimary
+		executor.NewBoolDatum(false),                    // 8 indisexclusion
+		executor.NewBoolDatum(true),                     // 9 indimmediate
+		executor.NewBoolDatum(false),                    // 10 indisclustered
+		executor.NewBoolDatum(true),                     // 11 indisvalid
+		executor.NewBoolDatum(false),                    // 12 indcheckxmin
+		executor.NewBoolDatum(true),                     // 13 indisready
+		executor.NewBoolDatum(true),                     // 14 indislive
+		executor.NewBoolDatum(false),                    // 15 indisreplident
+		executor.NewBytesDatum(int2VectorBytes(e.IndKey)),    // 16 indkey
+		executor.NewBytesDatum(oidVectorBytes(e.IndCollation)), // 17 indcollation
+		executor.NewBytesDatum(oidVectorBytes(e.IndClass)),    // 18 indclass
+		executor.NewBytesDatum(int2VectorBytes(e.IndOption)), // 19 indoption
+		executor.NullDatum,                              // 20 indexprs (NULL — no expression indexes)
+		executor.NullDatum,                              // 21 indpred  (NULL — no partial indexes)
+	}
+}
+
+// bootstrapPgIndexTuples writes Form_pg_index heap tuples for every
+// nailed index (local + shared) to base/{1,5}/2610. M0106-0010 step 3g
+// supersedes step 3f's empty-page placeholder. PG's standby boot calls
+// `RelationCacheInitializePhase3 → load_critical_index → ScanPgRelation
+// → SearchSysCache1(INDEXRELID, ...)`; without an actual row each
+// nailed index FATALs with "cache lookup failed for index <oid>".
 func bootstrapPgIndexTuples(dataDir string) error {
-	cols := pgIndexMinimalColDefs()
-	return writeMultiPageHeapRows(dataDir, "2610", cols, nil)
+	cols := pgIndexColDefs()
+	entries := pgIndexInitialEntries()
+	rows := make([]executor.Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, pgIndexRow(e))
+	}
+	return writeMultiPageHeapRows(dataDir, "2610", cols, rows)
 }
 
 // pgClassColDefs returns pg_class column descriptors matching PG18's
@@ -1516,6 +1679,7 @@ func hasVarWidthCol(cols []catalog.Column) bool {
 			"int2[]", "_int2",
 			"char[]", "_char",
 			"oidvector",
+			"int2vector",
 			"anyarray":
 			return true
 		}
@@ -1646,6 +1810,8 @@ func pgCatalogTypeOID(t string) uint32 {
 		return 24
 	case "oidvector":
 		return 30
+	case "int2vector":
+		return 22
 	case "char[]", "_char":
 		return 1002
 	case "oid[]", "_oid":
@@ -1673,7 +1839,7 @@ func pgCatalogTypeLen(t string) int {
 		return 8
 	case "name":
 		return 64
-	case "text", "pg_node_tree", "text[]", "_text", "aclitem[]", "_aclitem", "anyarray", "oidvector", "char[]", "_char", "oid[]", "_oid":
+	case "text", "pg_node_tree", "text[]", "_text", "aclitem[]", "_aclitem", "anyarray", "oidvector", "int2vector", "char[]", "_char", "oid[]", "_oid":
 		return -1
 	}
 	return 4
@@ -1693,7 +1859,7 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 1002, 1028:
+	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 22, 1002, 1028:
 		return "i"
 	case 20, 701:
 		return "d"

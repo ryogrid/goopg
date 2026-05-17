@@ -2697,11 +2697,51 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         by encoding actual `Form_pg_index` rows for every nailed
         index. Design:
         `docs/design/0106-0010-step3f-pg-index-empty-page.md`.
-        Step 3g scope (next loop): `int2vector` codec support;
-        21-column `Form_pg_index` encoder; per-index initial
-        entries for every nailed local + shared index; expand
-        `pgIndexAttrs()` 4 → 21 and `nailedLocalRels` `relnatts`
-        4 → 21 in lockstep.
+      - Step 3g LANDED 2026-05-17. The empty-page placeholder from
+        Step 3f is replaced with the full 21-column `Form_pg_index`
+        row set for every nailed local + shared index (23 entries
+        total: 6 shared-catalog + 17 local). `internal/executor/codec.go::
+        encodeValuePG` learns `int2vector` (varlena passthrough
+        mirroring `oidvector`, elemtype=21=INT2OID, alignment
+        PG `'i'`=4). `internal/initdb/initdb.go` gains
+        `int2VectorBytes` (24-byte ArrayType header + N×int2
+        payload), `pgIndexEntry / pgIndexColDefs (21 cols) /
+        pgIndexInitialEntries / pgIndexRow / bootstrapPgIndexTuples`
+        called via `writeMultiPageHeapRows("2610", cols, rows)`.
+        Each entry derives `indkey` (source-table attnum order,
+        not column position), `indcollation` (`C_COLLATION_OID=950`
+        for name/text keys, else 0), `indclass` (per-key opclass
+        OID from Step 3b), `indoption = {0,…}`, `indisunique=true`,
+        `indisprimary=true` when the key is the OID identity, and
+        NULL `indexprs`/`indpred`. Two OIDs are re-labelled to
+        match upstream semantics over `nailedLocalRels`'s
+        historical names: `2679` is
+        `pg_index_indexrelid_index` (attnum 1) not
+        `pg_index_indrelid_index`; `2655` is `pg_amproc_fam_proc_index`
+        ({2,3,4,5}) not `pg_amproc_oid_index`. The
+        `nailedLocalRels` labels are decorative — only the OIDs
+        are load-bearing — but row content must match OID
+        semantics so PG's `SearchSysCache1(INDEXRELID, …)`
+        resolves the correct index. `internal/initdb/relcache_init.go::
+        pgIndexAttrs()` expands 4 → 21 and `nailedLocalRels`
+        bumps pg_index `relnatts` 4 → 21 in lockstep so PG's
+        `heap_deformtuple` reads the heap tuple under the matching
+        TupleDesc (otherwise `indkey` lands at attnum 4 and
+        `RelationInitIndexAccessInfo` dereferences garbage).
+        Regression pins: `TestPgIndexColDefsMatchesRelcacheAttrs`
+        (21-column agreement) and
+        `TestBootstrapPgIndexTuplesWritesHeapPagesToBase1And5`
+        (page heap-initialised, file is a positive multiple of
+        `storage.BlockSize`). Verified: `go test -count=1
+        ./internal/initdb/` — all PASS except the pre-existing
+        `TestSynchronousCommitFlushesByDefault` (M0106-0012,
+        baseline-stash confirmed unchanged); `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3g-pg-index-form-encoder.md`.
+        Next scope (Step 3h): cross-type `pg_amop` strategy rows
+        surfaced once the now-resolvable index opclass lookups
+        attempt e.g. `int2 < int4` comparisons.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/pg_am_bootstrap_test.go`,

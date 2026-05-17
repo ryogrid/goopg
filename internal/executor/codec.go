@@ -271,6 +271,15 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected bytes for oidvector, got kind %d", d.Kind)
 		}
 		return d.BytesValue(), nil
+	case "int2vector":
+		// int2vector mirrors oidvector but with elemtype=INT2(21) and
+		// 2-byte payload elements. The caller (initdb) pre-encodes the
+		// blob via int2VectorBytes() and passes KindBytes through here.
+		// Used by pg_index.indkey and pg_index.indoption.
+		if d.Kind != KindBytes {
+			return nil, fmt.Errorf("expected bytes for int2vector, got kind %d", d.Kind)
+		}
+		return d.BytesValue(), nil
 	case "pg_node_tree":
 		// pg_node_tree is varlena-text; PG only reads it conditionally
 		// (e.g. relpartbound when relispartition=true). Empty varlena.
@@ -626,8 +635,8 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 8
 	case "name":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "anyarray", "pg_node_tree", "oidvector":
-		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector
+	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "anyarray", "pg_node_tree", "oidvector", "int2vector":
+		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
 	default:
 		return 4
 	}

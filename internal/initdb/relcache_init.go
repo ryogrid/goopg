@@ -95,7 +95,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{1249, "pg_attribute", 75, 'r', 24, false, pgAttributeAttrs()},
 	{1259, "pg_class", 83, 'r', 34, false, pgClassAttrs()},
 	{1255, "pg_proc", 81, 'r', 30, false, pgProcAttrs()},
-	{2610, "pg_index", 75, 'r', 4, false, pgIndexAttrs()},
+	{2610, "pg_index", 75, 'r', 21, false, pgIndexAttrs()},
 	{2616, "pg_opclass", 83, 'r', 9, false, pgOpclassAttrs()},
 	{2603, "pg_amproc", 83, 'r', 6, false, pgAmprocAttrs()},
 	{2618, "pg_rewrite", 83, 'r', 7, false, pgRewriteAttrs()},
@@ -588,7 +588,26 @@ func pgIndexAttrs() []nailedAttr {
 		{Name: "indexrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "indrelid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "indnatts", TypeOID: 21, Num: 3, Len: 2, NotNull: true},
-		{Name: "indislive", TypeOID: 16, Num: 4, Len: 1, NotNull: true},
+		{Name: "indnkeyatts", TypeOID: 21, Num: 4, Len: 2, NotNull: true},
+		{Name: "indisunique", TypeOID: 16, Num: 5, Len: 1, NotNull: true},
+		{Name: "indnullsnotdistinct", TypeOID: 16, Num: 6, Len: 1, NotNull: true},
+		{Name: "indisprimary", TypeOID: 16, Num: 7, Len: 1, NotNull: true},
+		{Name: "indisexclusion", TypeOID: 16, Num: 8, Len: 1, NotNull: true},
+		{Name: "indimmediate", TypeOID: 16, Num: 9, Len: 1, NotNull: true},
+		{Name: "indisclustered", TypeOID: 16, Num: 10, Len: 1, NotNull: true},
+		{Name: "indisvalid", TypeOID: 16, Num: 11, Len: 1, NotNull: true},
+		{Name: "indcheckxmin", TypeOID: 16, Num: 12, Len: 1, NotNull: true},
+		{Name: "indisready", TypeOID: 16, Num: 13, Len: 1, NotNull: true},
+		{Name: "indislive", TypeOID: 16, Num: 14, Len: 1, NotNull: true},
+		{Name: "indisreplident", TypeOID: 16, Num: 15, Len: 1, NotNull: true},
+		// Variable-length region. int2vector indkey is BKI_FORCE_NOT_NULL.
+		{Name: "indkey", TypeOID: 22, Num: 16, Len: -1, NotNull: true},
+		{Name: "indcollation", TypeOID: 30, Num: 17, Len: -1, NotNull: true},
+		{Name: "indclass", TypeOID: 30, Num: 18, Len: -1, NotNull: true},
+		{Name: "indoption", TypeOID: 22, Num: 19, Len: -1, NotNull: true},
+		// indexprs / indpred are pg_node_tree and nullable.
+		{Name: "indexprs", TypeOID: 194, Num: 20, Len: -1, NotNull: false},
+		{Name: "indpred", TypeOID: 194, Num: 21, Len: -1, NotNull: false},
 	}
 }
 

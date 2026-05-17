@@ -8,15 +8,16 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestBootstrapPgIndexTuplesWritesEmptyPageToBase1And5 pins the
-// M0106-0010 step 3f empty-page contract for pg_index. Vanilla
-// PG's nailed-index initialisation calls
+// TestBootstrapPgIndexTuplesWritesHeapPagesToBase1And5 pins the
+// M0106-0010 step 3g contract: bootstrap writes BOTH per-database
+// pg_index files (template1=1 + postgres=5) as a heap-initialised
+// page (or pages) with the full nailed-index row set. Vanilla PG's
+// nailed-index initialisation calls
 // `RelationOpenSmgr → mdopen → BasicOpenFile("base/<dboid>/2610")`
-// during standby start-up; an absent file FATALs the backend. An
-// initialised heap page with zero tuples is the minimum that lets
-// the open succeed without faking later semantics — the per-index
-// Form_pg_index rows land in a follow-up step.
-func TestBootstrapPgIndexTuplesWritesEmptyPageToBase1And5(t *testing.T) {
+// during standby start-up, then loads each critical index by OID
+// via SearchSysCache1(INDEXRELID, ...). An absent file or empty
+// page FATALs the backend with "cache lookup failed for index <oid>".
+func TestBootstrapPgIndexTuplesWritesHeapPagesToBase1And5(t *testing.T) {
 	dir := t.TempDir()
 	for _, sub := range []string{"base/1", "base/5"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
@@ -32,26 +33,28 @@ func TestBootstrapPgIndexTuplesWritesEmptyPageToBase1And5(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if got := len(raw); got != storage.BlockSize {
-			t.Fatalf("%s: page size %d, want %d", path, got, storage.BlockSize)
+		if got := len(raw); got == 0 || got%storage.BlockSize != 0 {
+			t.Fatalf("%s: page size %d not a positive multiple of %d", path, got, storage.BlockSize)
 		}
 		// Page must be heap-initialised, not just zeroed — InitPage sets
-		// pd_lower / pd_upper to BlockSize / BlockSize-MAXALIGN(SizeOfPageHeader)
-		// so PG's PageInit ↔ PageIsNew check distinguishes a real heap page
-		// from an unallocated extent.
+		// pd_lower / pd_upper to non-zero, and PageAddHeapTuple writes
+		// at least one item pointer + tuple body per row.
 		if isAllZero(raw) {
 			t.Fatalf("%s: page is all zero — InitPage was skipped", path)
 		}
 	}
 }
 
-// TestPgIndexMinimalColDefsMatchesRelcacheAttrs ensures the empty-page
-// schema agrees with the relcache init-file pgIndexAttrs() declaration
-// — both list the same 4 columns in the same order so that, once the
-// per-row encoder lands, PG's heap_deformtuple does not see a column
-// count mismatch between the init file's TupleDesc and the heap page.
-func TestPgIndexMinimalColDefsMatchesRelcacheAttrs(t *testing.T) {
-	cols := pgIndexMinimalColDefs()
+// TestPgIndexColDefsMatchesRelcacheAttrs ensures the heap-tuple schema
+// agrees with the relcache init-file pgIndexAttrs() declaration. PG's
+// heap_deformtuple casts the raw heap tuple as Form_pg_index; the
+// init-file TupleDesc must declare the same column count, names, and
+// order as the on-disk row layout, otherwise indkey / indclass land
+// at the wrong attnum and RelationInitIndexAccessInfo reads garbage.
+// M0106-0010 step 3g expands both sides from 4 to the full 21 columns
+// of upstream FormData_pg_index.
+func TestPgIndexColDefsMatchesRelcacheAttrs(t *testing.T) {
+	cols := pgIndexColDefs()
 	attrs := pgIndexAttrs()
 	if len(cols) != len(attrs) {
 		t.Fatalf("col vs attr count: %d vs %d", len(cols), len(attrs))
@@ -60,6 +63,9 @@ func TestPgIndexMinimalColDefsMatchesRelcacheAttrs(t *testing.T) {
 		if c.Name != attrs[i].Name {
 			t.Errorf("col[%d] name: %q vs %q", i, c.Name, attrs[i].Name)
 		}
+	}
+	if got, want := len(cols), 21; got != want {
+		t.Fatalf("pg_index column count: %d, want %d", got, want)
 	}
 }
 
