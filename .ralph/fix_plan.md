@@ -3282,18 +3282,84 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         FATAL fires for a 34-attribute relation at attnum 32 and for a
         21-attribute relation at attnum 16-18). Design:
         `docs/design/0106-0010-step3q-pg-index-indexrelid-and-indrelid-split.md`.
-      - Next blocker (Step 3r): `FATAL: column is not in index` after
-        the SHARED critical-index pass completes. `nocachegetattr`
-        log preamble fires for a 34-attribute relation (pg_class) at
-        attnum 32 and for a 21-attribute relation (pg_index) at
-        attnum 16-18 (the trailing indkey/indcollation/indclass/
-        indoption vector columns). Likely cause: an `indkey` in
-        `pgIndexInitialEntries` for a `pg_*_oid_index` whose stored
-        `indkey[0]` disagrees with the column ordering in
-        `pg_*_*Attrs()` (Step 3n-shape bug, but on a different
-        relation). Compare every indkey against
-        `postgres/src/include/catalog/indexing.h` for indexes whose
-        key column lives beyond attnum 15.
+      - Step 3r LANDED 2026-05-18. Closes the FATAL
+        `column is not in index` PG-standby boot blocker that surfaced
+        after Step 3q. Root cause was *not* an indkey-beyond-attnum-15
+        bug as Step 3q's note hypothesised — it was that Step 3q (and
+        the underlying Step 3p file path) inverted the PG18 OID
+        assignment for pg_index's two indexes. Authoritative source is
+        `postgres/src/include/catalog/pg_index_d.h` /
+        `indexing.h`:
+        `IndexIndrelidIndexId = 2678 = pg_index_indrelid_index`
+        (`btree(indrelid oid_ops)`, NON-UNIQUE — `DECLARE_INDEX`) and
+        `IndexRelidIndexId = 2679 = pg_index_indexrelid_index`
+        (`btree(indexrelid oid_ops)`, UNIQUE PRIMARY KEY —
+        `DECLARE_UNIQUE_INDEX_PKEY`). PG's
+        `MAKE_SYSCACHE(INDEXRELID, pg_index_indexrelid_index, 64)` at
+        `pg_index.h:77` therefore traverses OID **2679**, not 2678.
+        With goopg's 2679 entry labelled `pg_index_indrelid_index`
+        (`indkey={2}`) and the populated btree at file 2678, the first
+        `SearchSysCache1(INDEXRELID, …)` fell back to a sysscan on
+        the empty file 2679; `genam.c:446` walked `indkey={2}` for
+        the caller's `sk_attno=1` (indexrelid), never found it, and
+        FATAL'd.  Fix: swap the two `pgIndexInitialEntries` rows so
+        `entry(2678, …, {2}, …, false, false)` and
+        `entry(2679, …, {1}, …, true, true)`; swap the
+        `nailedLocalRels` labels for 2678/2679; change
+        `bootstrapPgIndexIndexrelidIndex` to write the populated 2-page
+        btree to file OID **2679** (file 2678 keeps its Step-3k empty
+        placeholder — `pg_index_indrelid_index` is not used by any
+        syscache during early backend startup). The empty-placeholder
+        OID lists at `initdb.go:589/671/686` already include both
+        2678 and 2679 from Step 3q, so the populated btree correctly
+        overwrites the placeholder at 2679 while 2678 stays empty.
+        Doc comments at `initdb.go:1552-1567` rewritten to point at
+        the authoritative `pg_index_d.h` constants and explain why
+        Step 3p's btree now lands at file 2679. Tests updated in
+        place (no new files):
+        `TestPgIndex2678And2679AreDistinctWithCorrectFlags` — swap
+        expected `(IndKey, IsUnique, IsPrimary)` so 2678 = `({2},
+        false, false)` and 2679 = `({1}, true, true)`, comment
+        rewritten to cite `pg_index_d.h`;
+        `TestNailedLocalRelsContainsPgIndexIndexrelidIndex` — extended
+        to guard *both* OIDs (2678 = "pg_index_indrelid_index", 2679
+        = "pg_index_indexrelid_index") with `RelKind='i'`,
+        `RelNatts=1`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` — swap 2678/2679
+        indkeys in the pinned map;
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree` —
+        file-path strings `2678` → `2679` at all three on-disk
+        locations. Verified:
+        `go test -count=1 -run
+        'TestPgIndex2678|TestNailedLocalRelsContainsPgIndexIndexrelidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3q (TestBootstrappedPG{Class,Attribute}RowsReadable,
+        TestCommittedTableSurvivesCrashRestart,
+        TestCreateIndex{Recovered…,SurvivesRestart…},
+        TestCreateTableSurvivesRestartViaCatalogHeap,
+        TestMigration{FromLegacyJSON…,Idempotent,PGAttributeRowsWritten},
+        TestMultipleTablesLoadFromHeap,
+        TestOpenOldClusterWithoutM0030FilesStillWorks,
+        TestRuntimeCloseTriggersFinalCheckpoint,
+        TestSynchronousCommitFlushesByDefault,
+        TestSystemCatalogRelfilesAreValidHeapPages) unchanged — no
+        new regressions; cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3r-pg-index-2678-2679-pg18-oid-correction.md`.
+      - Next blocker (Step 3s): re-run
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` and capture the new FATAL.
+        Most likely candidates: (a) a sysscan against another
+        shared-critical index whose Step-3k empty btree still returns
+        zero rows — `pg_authid_oid_index` (2677),
+        `pg_database_oid_index` (2672), `pg_authid_rolname_index`
+        (2676), `pg_database_datname_index` (2671), or
+        `pg_shseclabel_object_index` (3593); or (b) missing
+        pg_attribute heap rows for the SHARED catalog relations
+        (1262/1260/1261/3592) seeded into `global/1249` — Step 3o
+        seeded the LOCAL `base/{1,5}/1249` only.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,

@@ -442,9 +442,9 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 	}
 
 	for _, path := range []string{
-		filepath.Join(dir, "base", "1", "2678"),
-		filepath.Join(dir, "base", "5", "2678"),
-		filepath.Join(dir, "global", "2678"),
+		filepath.Join(dir, "base", "1", "2679"),
+		filepath.Join(dir, "base", "5", "2679"),
+		filepath.Join(dir, "global", "2679"),
 	} {
 		raw, err := os.ReadFile(path)
 		if err != nil {

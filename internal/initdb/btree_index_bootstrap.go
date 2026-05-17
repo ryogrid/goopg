@@ -407,7 +407,7 @@ func bootstrapPgAttributeRelidAttnumIndex(dataDir string, tids map[pgAttrTIDKey]
 }
 
 // bootstrapPgIndexIndexrelidIndex overwrites the empty btree placeholders
-// at base/{1,5}/2678 and global/2678 with a 2-block btree file (metapage +
+// at base/{1,5}/2679 and global/2679 with a 2-block btree file (metapage +
 // populated leaf-root) carrying one IndexTuple per Form_pg_index heap row,
 // keyed on `indexrelid`. Closes the FATAL "cache lookup failed for index
 // 2671" blocker that surfaced after Step 3o.
@@ -418,10 +418,12 @@ func bootstrapPgAttributeRelidAttnumIndex(dataDir string, tids map[pgAttrTIDKey]
 // `RelationInitIndexAccessInfo(relation)` → `SearchSysCache1(INDEXRELID,
 // RelationGetRelid(relation))` (postgres/src/backend/utils/cache/relcache.c:1467,
 // :2339) to materialise each index's Form_pg_index. The catcache miss falls
-// back to a sysscan against `pg_index_indexrelid_index` (OID 2678); the
-// Step-3k empty btree placeholder returned zero rows for every probe, so
-// the very first shared index — `pg_database_datname_index` (2671) — FATAL'd
-// with `cache lookup failed for index 2671`.
+// back to a sysscan against `pg_index_indexrelid_index` (PG18 OID = 2679 —
+// `IndexRelidIndexId` in `postgres/src/include/catalog/pg_index_d.h`; Step
+// 3q originally targeted 2678 in error, Step 3r restores the correct OID).
+// The Step-3k empty btree placeholder returned zero rows for every probe,
+// so the very first shared index — `pg_database_datname_index` (2671) —
+// FATAL'd with `cache lookup failed for index 2671`.
 //
 // Index tuples are sorted by `indexrelid` before page assembly so PG's
 // `_bt_binsrch` finds them via the standard ordered search.
@@ -456,7 +458,7 @@ func bootstrapPgIndexIndexrelidIndex(dataDir string, tids map[uint32]heapTID) er
 		filepath.Join(dataDir, "base", "5"),
 		filepath.Join(dataDir, "global"),
 	} {
-		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2678, 10)), file, 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2679, 10)), file, 0o600); err != nil {
 			return fmt.Errorf("write pg_index_indexrelid_index in %s: %w", dir, err)
 		}
 	}

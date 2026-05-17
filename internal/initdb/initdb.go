@@ -242,16 +242,18 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: pg_index tuples: %w", err)
 	}
-	// M0106-0010 step 3p: overwrite the empty btree placeholder at
-	// base/{1,5}/2678 + global/2678 with a populated 2-page btree
+	// M0106-0010 step 3p/3r: overwrite the empty btree placeholder at
+	// base/{1,5}/2679 + global/2679 with a populated 2-page btree
 	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per
 	// Form_pg_index heap row so PG's
 	// load_critical_index → RelationInitIndexAccessInfo →
 	// SearchSysCache1(INDEXRELID, oid) — the call taken once
 	// criticalRelcachesBuilt becomes true while loading the
 	// SHARED critical indexes — finds the pg_index row via
-	// pg_index_indexrelid_index. Without this the next FATAL during
-	// standby boot is "cache lookup failed for index 2671".
+	// pg_index_indexrelid_index (PG18 OID = 2679, not 2678 as Step
+	// 3q originally claimed; Step 3r restores the correct OID).
+	// Without this the next FATAL during standby boot is "cache
+	// lookup failed for index 2671".
 	if err := bootstrapPgIndexIndexrelidIndex(abs, pgIndexTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_index_indexrelid_index: %w", err)
 	}
@@ -1549,19 +1551,24 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2663, 1259, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_class_relname_nsp_index
 		entry(2690, 1255, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_proc_oid_index
 		entry(2691, 1255, []int16{2, 20, 3}, []uint32{nameOps, oidvectorOps, oidOps}, []uint32{cCollation, 0, 0}, true, false), // pg_proc_proname_args_nsp_index
-		// PG18 (postgres/src/include/catalog/indexing.h):
-		//   IndexRelidIndexId    = 2678 = pg_index_indexrelid_index
-		//     btree(indexrelid oid_ops)  UNIQUE  PRIMARY
-		//   IndexIndrelidIndexId = 2679 = pg_index_indrelid_index
-		//     btree(indrelid    oid_ops)  UNIQUE  (not primary)
-		// Step 3p surfaced that OID 2678 was missing entirely from
-		// pgIndexInitialEntries and nailedLocalRels — every shared
-		// critical-index load went through 2678's empty btree and
-		// FATAL'd "cache lookup failed for index 2671". Step 3q adds
-		// 2678 here and corrects 2679's indkey from {1} → {2} so each
-		// row's content matches its OID's PG18 semantics.
-		entry(2678, 2610, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_index_indexrelid_index
-		entry(2679, 2610, []int16{2}, []uint32{oidOps}, []uint32{0}, true, false),                                      // pg_index_indrelid_index
+		// PG18 (postgres/src/include/catalog/indexing.h + pg_index_d.h):
+		//   IndexIndrelidIndexId = 2678 = pg_index_indrelid_index
+		//     btree(indrelid    oid_ops)  NON-UNIQUE (DECLARE_INDEX)
+		//   IndexRelidIndexId    = 2679 = pg_index_indexrelid_index
+		//     btree(indexrelid  oid_ops)  UNIQUE PRIMARY KEY
+		// Step 3q (2026-05-18) initially split the row with the OIDs
+		// reversed (claiming 2678=indexrelid). Step 3r restores the
+		// authoritative pg_index_d.h assignment so PG's
+		// SearchSysCache1(INDEXRELID, …) — which traverses
+		// IndexRelidIndexId = 2679 — finds an index whose indkey={1}
+		// (indexrelid) matches the caller's sk_attno. The populated
+		// btree built by bootstrapPgIndexIndexrelidIndex therefore
+		// writes to base/{1,5}/2679 + global/2679 (Step 3r); 2678's
+		// file remains the empty Step-3k placeholder because
+		// pg_index_indrelid_index is not used for a syscache lookup
+		// during early backend startup.
+		entry(2678, 2610, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                                     // pg_index_indrelid_index
+		entry(2679, 2610, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_index_indexrelid_index
 		entry(2687, 2616, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_opclass_oid_index
 		// OID 2655 in upstream is pg_amproc_fam_proc_index (on amprocfamily,
 		// amproclefttype, amprocrighttype, amprocnum), not the oid index;
