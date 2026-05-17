@@ -679,6 +679,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	btreePage := makeBtreeRootPage()
 	for _, oid := range []uint32{
 		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
+		828, // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -774,6 +775,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	for _, oid := range []uint32{
 		// Local critical indexes
 		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
+		828, // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -803,6 +805,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2695, 3593,
 		// Also copy all local critical indexes to global/
 		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
+		828, // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -1869,6 +1872,18 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// typeless). Companion to OID 828 (Step 3am UNIQUE PRIMARY on
 		// oid). Heap OID 826 (pg_default_acl, Step 3ak nailed rel).
 		entry(827, 826, []int16{2, 3, 4}, []uint32{oidOps, oidOps, charOps}, []uint32{0, 0, 0}, true, false), // pg_default_acl_role_nsp_obj_index
+		// M0106-0010 Step 3am: pg_default_acl_oid_index (OID 828).
+		// postgres/src/include/catalog/pg_default_acl.h:55 —
+		//   DECLARE_UNIQUE_INDEX_PKEY(pg_default_acl_oid_index, 828,
+		//     DefaultAclOidIndexId, pg_default_acl, btree(oid oid_ops));
+		// UNIQUE PRIMARY KEY on attnum 1 (oid). Same single-column oid PKEY
+		// pattern as pg_cast_oid_index (2660, Step 3ab),
+		// pg_collation_oid_index (3085, Step 3af),
+		// pg_conversion_oid_index (2670, Step 3ai), and
+		// pg_opclass_oid_index (2687, Step 3l). Heap OID 826 (pg_default_acl,
+		// Step 3ak nailed rel). Companion to OID 827 (Step 3al composite
+		// UNIQUE non-PKEY backing the DEFACLROLENSPOBJ syscache).
+		entry(828, 826, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_default_acl_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

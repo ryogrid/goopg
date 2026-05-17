@@ -279,6 +279,16 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
 	{827, "pg_default_acl_role_nsp_obj_index"},
+	// M0106-0010 Step 3am: pg_default_acl_oid_index. PG18
+	// `postgres/src/include/catalog/pg_default_acl.h:55` declares
+	// `DefaultAclOidIndexId = 828` as UNIQUE PRIMARY KEY on
+	// btree(oid oid_ops). Companion to 827
+	// (pg_default_acl_role_nsp_obj_index, UNIQUE non-PKEY, Step 3al).
+	// Without this entry RelationIdGetRelation(828) FATALs because no
+	// pg_class row gets seeded; flattenRels derives RelNatts=1 via
+	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+	// relnatts/indnatts check (relcache.c:1492).
+	{828, "pg_default_acl_oid_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

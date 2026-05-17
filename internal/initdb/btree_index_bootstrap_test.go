@@ -468,6 +468,7 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 		2694, // pg_auth_members_role_member_index ← Step 3z
 		2695, 3593,
 		827, // pg_default_acl_role_nsp_obj_index ← Step 3al
+		828, // pg_default_acl_oid_index ← Step 3am
 		2650, // pg_aggregate_fnoid_index ← Step 3x
 		2653, // pg_amop_fam_strat_index ← Step 3y
 		2660, // pg_cast_oid_index ← Step 3ab

@@ -4621,6 +4621,73 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         (`pg_default_acl_oid_index`, UNIQUE PRIMARY KEY on `oid`) or a
         different nailed-rel OID. Same single-OID catalog-seed-addition
         pattern applies.
+      - Step 3am LANDED 2026-05-18. Anticipated next-blocker fix after
+        Step 3al (`could not open relation with OID 828`). OID 828 is
+        `pg_default_acl_oid_index` per
+        `postgres/src/include/catalog/pg_default_acl.h:55`:
+        `DECLARE_UNIQUE_INDEX_PKEY(pg_default_acl_oid_index, 828,
+        DefaultAclOidIndexId, pg_default_acl, btree(oid oid_ops))`.
+        Pure catalog-seed addition mirroring single-column oid PKEY
+        pattern of Steps 3ab (pg_cast_oid_index, 2660), 3ai
+        (pg_conversion_oid_index, 2670), 3l (pg_opclass_oid_index, 2687),
+        3af (pg_collation_oid_index, 3085); no encoder, builder, or Init
+        flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(828, 826, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` — UNIQUE PRIMARY (single oid_ops key, no
+        collation). Companion to OID 827 (Step 3al composite UNIQUE
+        non-PKEY).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{828, "pg_default_acl_oid_index"}`; `flattenRels` derives
+        `RelKind='i', RelNatts=1` via `pgIndexNattsByOID` so
+        `RelationInitIndexAccessInfo`'s `relnatts == indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three placeholder OID lists in `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain
+        `828, // pg_default_acl_oid_index (Step 3am)` — the Step-3k
+        empty btree placeholder is sufficient because pg_default_acl is
+        currently unpopulated.
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` → `bootstrapPgIndexTuples` (writes
+        Form_pg_index row + captures TID in `pgIndexTIDs[828]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (1 composite-key leaf
+        at 2659).
+        Regression pins:
+        `TestPgDefaultAclOidIndexSeededFromInitialEntries` (asserts
+        `(IndRelid=826, IndKey=[1], IsUnique=true, IsPrimary=true,
+        IndCollation=[0])`) and
+        `TestNailedLocalRelsContainsPgDefaultAclOidIndex` (asserts
+        `RelName="pg_default_acl_oid_index", RelKind='i', RelNatts=1`)
+        in `internal/initdb/pg_default_acl_oid_index_test.go`. Existing
+        pins extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18`
+        adds `828: {1}` (strict count guard auto-rejects future
+        additions without map updates);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 828.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgDefaultAclOidIndex|TestNailedLocalRelsContainsPgDefaultAclOidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestPgDefaultAclRoleNspObjIndex|TestNailedLocalRelsContainsPgDefaultAcl|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3al
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design:
+        `docs/design/0106-0010-step3am-pg-default-acl-oid-index.md`.
+      - Next blocker (Step 3an): with OIDs 826/827/828 (the full
+        pg_default_acl family) now opened cleanly, the next E2E re-run
+        is expected to surface another single-OID nailed-rel/index OID
+        flagged by `RelationCacheInitializePhase3`'s nailed-rel walk, or
+        a deeper issue requiring populated btree content. Same
+        single-OID catalog-seed-addition pattern applies.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4678,7 +4745,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_default_acl_nailed_test.go`,
         `docs/design/0106-0010-step3ak-pg-default-acl-nailed-rel.md`,
         `internal/initdb/pg_default_acl_role_nsp_obj_index_test.go`,
-        `docs/design/0106-0010-step3al-pg-default-acl-role-nsp-obj-index.md`
+        `docs/design/0106-0010-step3al-pg-default-acl-role-nsp-obj-index.md`,
+        `internal/initdb/pg_default_acl_oid_index_test.go`,
+        `docs/design/0106-0010-step3am-pg-default-acl-oid-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
