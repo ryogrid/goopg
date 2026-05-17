@@ -4557,6 +4557,70 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         different `pg_*` OID flagged by `RelationCacheInitializePhase3`'s
         nailed-rel walk. Same single-OID catalog-seed-addition pattern
         applies.
+      - Step 3al LANDED 2026-05-18. Anticipated next-blocker fix after
+        Step 3ak (`could not open relation with OID 827`). OID 827 is
+        `pg_default_acl_role_nsp_obj_index` per
+        `postgres/src/include/catalog/pg_default_acl.h:54`
+        (`DECLARE_UNIQUE_INDEX(pg_default_acl_role_nsp_obj_index, 827,
+         DefaultAclRoleNspObjIndexId, pg_default_acl,
+         btree(defaclrole oid_ops, defaclnamespace oid_ops,
+               defaclobjtype char_ops))` +
+        `MAKE_SYSCACHE(DEFACLROLENSPOBJ, …, 8)`). Pure catalog-seed
+        addition mirroring the pg_conversion family (Steps 3ah/3ai/3aj);
+        no encoder/builder/Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(827, 826, []int16{2,3,4}, []uint32{oidOps,oidOps,charOps},
+         []uint32{0,0,0}, true, false)` — UNIQUE but NOT primary; none
+        of the three keys carry a collation (oid_ops/char_ops are
+        typeless). Same composite-UNIQUE pattern as
+        `pg_amop_fam_strat_index` (2653, Step 3y) and
+        `pg_conversion_default_index` (2668, Step 3ah), distinguished
+        by the `char_ops` third slot.
+        (b) `nailedLocalRels` idxSpec gains
+        `{827, "pg_default_acl_role_nsp_obj_index"}` so
+        `flattenRels`+`pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=3` and the `relnatts==indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three placeholder OID lists at `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain `827`. Empty-btree
+        placeholder is sufficient because pg_default_acl is currently
+        unpopulated.
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` (3 indexKeyAttrs rows) →
+        `bootstrapPgIndexTuples` (writes Form_pg_index with
+        `indnatts=3` + captures TID in `pgIndexTIDs[827]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (3 composite-key leaves
+        at 2659).
+        Regression pins: new file
+        `internal/initdb/pg_default_acl_role_nsp_obj_index_test.go`
+        with `TestPgDefaultAclRoleNspObjIndexSeededFromInitialEntries`
+        (asserts `IndRelid=826, IndKey=[2 3 4], IsUnique=true,
+        IsPrimary=false, IndCollation=[0 0 0]`) and
+        `TestNailedLocalRelsContainsPgDefaultAclRoleNspObjIndex`
+        (asserts `RelKind='i', RelNatts=3`). Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds `827:{2,3,4}`
+        (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 827. Companion 828 (`pg_default_acl_oid_index`,
+        UNIQUE PRIMARY KEY) deferred to Step 3am.
+        Verified: `go build ./...` PASS;
+        `go test -count=1 -run
+        'TestPgDefaultAclRoleNspObjIndex|TestNailedLocalRelsContainsPgDefaultAcl|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestPgConversionDefaultIndex|TestPgConversionOidIndex|TestPgConversionNameNspIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestPgClassOidIndexHasSingleKeyColumn'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3ak (no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design:
+        `docs/design/0106-0010-step3al-pg-default-acl-role-nsp-obj-index.md`.
+      - Next blocker (Step 3am): with OID 827 now opened cleanly, the
+        next E2E re-run is expected to surface OID 828
+        (`pg_default_acl_oid_index`, UNIQUE PRIMARY KEY on `oid`) or a
+        different nailed-rel OID. Same single-OID catalog-seed-addition
+        pattern applies.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4612,7 +4676,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_conversion_name_nsp_index_test.go`,
         `docs/design/0106-0010-step3aj-pg-conversion-name-nsp-index.md`,
         `internal/initdb/pg_default_acl_nailed_test.go`,
-        `docs/design/0106-0010-step3ak-pg-default-acl-nailed-rel.md`
+        `docs/design/0106-0010-step3ak-pg-default-acl-nailed-rel.md`,
+        `internal/initdb/pg_default_acl_role_nsp_obj_index_test.go`,
+        `docs/design/0106-0010-step3al-pg-default-acl-role-nsp-obj-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -678,6 +678,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	base1Dir := filepath.Join(dataDir, "base", "1")
 	btreePage := makeBtreeRootPage()
 	for _, oid := range []uint32{
+		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -772,6 +773,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	btreePage = makeBtreeRootPage()
 	for _, oid := range []uint32{
 		// Local critical indexes
+		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -800,6 +802,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2694, // pg_auth_members_role_member_index (Step 3z)
 		2695, 3593,
 		// Also copy all local critical indexes to global/
+		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -1851,6 +1854,21 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// companion to 2668 (composite UNIQUE non-PKEY, Step 3ah) and
 		// 2670 (UNIQUE PRIMARY, Step 3ai).
 		entry(2669, 2607, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false), // pg_conversion_name_nsp_index
+		// M0106-0010 Step 3al: pg_default_acl_role_nsp_obj_index (OID 827).
+		// postgres/src/include/catalog/pg_default_acl.h:54 —
+		//   DECLARE_UNIQUE_INDEX(pg_default_acl_role_nsp_obj_index, 827,
+		//     DefaultAclRoleNspObjIndexId, pg_default_acl,
+		//     btree(defaclrole oid_ops, defaclnamespace oid_ops,
+		//           defaclobjtype char_ops));
+		//   MAKE_SYSCACHE(DEFACLROLENSPOBJ, pg_default_acl_role_nsp_obj_index, 8);
+		// pg_default_acl attnums (pg_default_acl_d.h): 2=defaclrole,
+		// 3=defaclnamespace, 4=defaclobjtype. UNIQUE but NOT primary
+		// (DECLARE_UNIQUE_INDEX, not the _PKEY variant — PKEY is 828 =
+		// pg_default_acl_oid_index, to be seeded by Step 3am). None of
+		// the three keys carry a collation (oid_ops / char_ops are
+		// typeless). Companion to OID 828 (Step 3am UNIQUE PRIMARY on
+		// oid). Heap OID 826 (pg_default_acl, Step 3ak nailed rel).
+		entry(827, 826, []int16{2, 3, 4}, []uint32{oidOps, oidOps, charOps}, []uint32{0, 0, 0}, true, false), // pg_default_acl_role_nsp_obj_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
