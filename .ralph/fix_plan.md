@@ -4772,15 +4772,63 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS.
         Design: `docs/design/0106-0010-step3ao-pg-enum-oid-index.md`.
-      - Next blocker (Step 3ap): with OID 3502 opened cleanly, the next
-        E2E re-run is expected to surface 3503
-        (`pg_enum_typid_label_index`, UNIQUE composite name_ops on
-        (enumtypid, enumlabel)), 3534 (`pg_enum_typid_sortorder_index`,
-        UNIQUE composite float4_ops — would be the first nailed index
-        keyed on `float4_ops` opclass), or another single-OID
-        nailed-rel/index OID flagged by
-        `RelationCacheInitializePhase3`'s nailed-rel walk. Same
-        single-OID catalog-seed-addition pattern applies.
+      - Step 3ap LANDED 2026-05-18. Anticipated next-blocker fix after
+        Step 3ao (`could not open relation with OID 3503`). OID 3503 is
+        `pg_enum_typid_label_index` per `postgres/src/include/catalog/pg_enum.h:48`
+        (`DECLARE_UNIQUE_INDEX(pg_enum_typid_label_index, 3503,
+        EnumTypIdLabelIndexId, pg_enum,
+        btree(enumtypid oid_ops, enumlabel name_ops))`). Backs
+        `MAKE_SYSCACHE(ENUMTYPOIDNAME, pg_enum_typid_label_index, 8)`.
+        Pure catalog-seed addition mirroring composite `(oid_ops,
+        name_ops)` pattern of Steps 3aj
+        (`pg_conversion_name_nsp_index`) and 3ad
+        (`pg_opclass_am_name_nsp_index`) — leading oid key with no
+        collation, trailing `name_ops` key carrying
+        `C_COLLATION_OID = 950`; no encoder/builder/Init flow change.
+        `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(3503, 3501, []int16{2, 4},
+        []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false)` —
+        UNIQUE non-PRIMARY composite over pg_enum heap OID 3501 (Step
+        3an nailed rel).
+        `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{3503, "pg_enum_typid_label_index"}`; `flattenRels` +
+        `pgIndexNattsByOID` derives `RelKind='i', RelNatts=2` so the
+        `relnatts==indnatts` check (relcache.c:1492) passes.
+        Three placeholder OID lists at `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain
+        `3503, // pg_enum_typid_label_index (Step 3ap)`. Step-3k
+        empty-btree placeholder is sufficient because pg_enum is
+        currently unpopulated (zero-row ENUMTYPOIDNAME syscache lookup
+        is the expected outcome at this stage). Companion index 3534
+        (`pg_enum_typid_sortorder_index`, UNIQUE composite float4_ops —
+        would be the first nailed index keyed on `float4_ops` opclass,
+        requires opclass-inventory check) deferred to Step 3aq.
+        New regression pins
+        `TestPgEnumTypIdLabelIndexSeededFromInitialEntries` /
+        `TestNailedLocalRelsContainsPgEnumTypIdLabelIndex` in
+        `internal/initdb/pg_enum_typid_label_index_test.go`.
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `3503: {2, 4}` (strict count guard auto-rejects future
+        additions without map updates).
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3503 so the populated 2679 btree must carry
+        this leaf.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgEnumTypIdLabelIndex|TestNailedLocalRelsContainsPgEnumTypIdLabelIndex|TestPgEnumOidIndex|TestNailedLocalRelsContainsPgEnumOidIndex|TestNailedLocalRelsContainsPgEnum|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestNailedIndexRelnattsAgreesWithIndnatts|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ao (no new
+        regressions); `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3ap-pg-enum-typid-label-index.md`.
+      - Next blocker (Step 3aq): with OID 3503 opened cleanly, the next
+        E2E re-run is expected to surface 3534
+        (`pg_enum_typid_sortorder_index`, UNIQUE composite
+        `btree(enumtypid oid_ops, enumsortorder float4_ops)` — the first
+        nailed index to key on `float4_ops` opclass; opclass-inventory
+        check needed), or another single-OID nailed-rel/index OID
+        flagged by `RelationCacheInitializePhase3`'s nailed-rel walk.
+        Same single-OID catalog-seed-addition pattern applies.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4844,7 +4892,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_enum_nailed_test.go`,
         `docs/design/0106-0010-step3an-pg-enum-nailed-rel.md`,
         `internal/initdb/pg_enum_oid_index_test.go`,
-        `docs/design/0106-0010-step3ao-pg-enum-oid-index.md`
+        `docs/design/0106-0010-step3ao-pg-enum-oid-index.md`,
+        `internal/initdb/pg_enum_typid_label_index_test.go`,
+        `docs/design/0106-0010-step3ap-pg-enum-typid-label-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
