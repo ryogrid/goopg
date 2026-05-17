@@ -4911,15 +4911,72 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         'TestNailedLocalRelsContainsPgEventTrigger|TestBootstrapMappedLocalCatalogHeapsIncludesPgEventTrigger|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgEnum|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree'
         ./internal/initdb/` PASS.
         Design: `docs/design/0106-0010-step3ar-pg-event-trigger-nailed-rel.md`.
-      - Next blocker (Step 3as): with OID 3466 (pg_event_trigger) opened
-        cleanly, the next E2E re-run is expected to surface another
-        single-OID nailed-rel/index blocker. Likely candidates from the
-        remaining mapped local catalog OID list (pg_foreign_*, pg_inherits,
-        pg_init_privs, pg_language, pg_largeobject*, pg_partitioned_table,
-        pg_publication*, pg_range, pg_replication_origin, pg_seclabel,
-        pg_sequence, pg_statistic, pg_subscription*, pg_tablespace,
-        pg_transform, pg_ts_*). Same single-OID catalog-seed-addition
-        pattern applies.
+      - Step 3as LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3467` PG-standby boot blocker
+        that surfaced after Step 3ar seeded pg_event_trigger (heap rel
+        OID 3466). OID 3467 is `pg_event_trigger_evtname_index` per
+        `postgres/src/include/catalog/pg_event_trigger.h:54`
+        (`DECLARE_UNIQUE_INDEX(pg_event_trigger_evtname_index, 3467,
+        EventTriggerNameIndexId, pg_event_trigger,
+        btree(evtname name_ops))`). Backs
+        `MAKE_SYSCACHE(EVENTTRIGGERNAME, pg_event_trigger_evtname_index, 8)`.
+        Pure catalog-seed addition mirroring the single-column `name_ops`
+        pattern of Steps 3t (pg_namespace_nspname_index) and the trailing
+        slot of 3aj (pg_conversion_name_nsp_index); no encoder/builder/
+        Init flow change:
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(3467, 3466, []int16{2}, []uint32{nameOps},
+        []uint32{cCollation}, true, false)` — UNIQUE non-PRIMARY single
+        key over pg_event_trigger heap OID 3466 (Step 3ar nailed rel);
+        `name_ops` carries C_COLLATION_OID = 950 same as Step 3t/3aj.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{3467, "pg_event_trigger_evtname_index"}`; `flattenRels`+
+        `pgIndexNattsByOID` derives `RelKind='i', RelNatts=1` so the
+        `relnatts==indnatts` check (relcache.c:1492) passes.
+        (c) Three empty-placeholder OID lists in
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `3467, // pg_event_trigger_evtname_index (Step 3as)`. The
+        Step 3k empty-btree placeholder is sufficient because
+        pg_event_trigger is currently unpopulated (no event triggers
+        are bootstrapped) — any `SearchSysCache1(EVENTTRIGGERNAME, …)`
+        probe correctly returns no row.
+        The seed threads automatically through the existing flow:
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples →
+        bootstrapPgIndexTuples (captures TID) →
+        bootstrapPgIndexIndexrelidIndex (adds leaf at 2679) →
+        bootstrapPgClassOidIndex (adds leaf at 2662) →
+        bootstrapPgAttributeRelidAttnumIndex (composite leaf at 2659)`.
+        Regression pins:
+        `TestPgEventTriggerEvtnameIndexSeededFromInitialEntries` (pins
+        `(IndRelid=3466, IndKey=[2], IsUnique=true, IsPrimary=false,
+        IndCollation=[950])`) and
+        `TestNailedLocalRelsContainsPgEventTriggerEvtnameIndex` (pins
+        `RelName, RelKind='i', RelNatts=1`) in
+        `internal/initdb/pg_event_trigger_evtname_index_test.go`.
+        Existing pins extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18`
+        adds `3467: {2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3467.
+        Verified: `go test -count=1 -run
+        'TestPgEventTriggerEvtnameIndex|TestNailedLocalRelsContainsPgEventTriggerEvtnameIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestNailedLocalRelsContainsPgEventTrigger'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3ar (no new regressions);
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        advances past `OID 3467` to the next blocker: `FATAL: could not
+        open relation with OID 3468` (`pg_event_trigger_oid_index`,
+        UNIQUE PRIMARY on `oid_ops`, backing
+        `MAKE_SYSCACHE(EVENTTRIGGEROID, …)`) — Step 3at territory.
+        Design: `docs/design/0106-0010-step3as-pg-event-trigger-evtname-index.md`.
+      - Next blocker (Step 3at): seed `pg_event_trigger_oid_index`
+        (OID 3468) per `pg_event_trigger.h:55`
+        (`DECLARE_UNIQUE_INDEX_PKEY(pg_event_trigger_oid_index, 3468,
+        EventTriggerOidIndexId, pg_event_trigger, btree(oid oid_ops))`).
+        Companion to Step 3as; same single-OID catalog-seed-addition
+        pattern as Steps 3ao (pg_enum_oid_index PKEY), 3am
+        (pg_default_acl_oid_index PKEY).
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -4989,7 +5046,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_enum_typid_sortorder_index_test.go`,
         `docs/design/0106-0010-step3aq-pg-enum-typid-sortorder-index.md`,
         `internal/initdb/pg_event_trigger_nailed_test.go`,
-        `docs/design/0106-0010-step3ar-pg-event-trigger-nailed-rel.md`
+        `docs/design/0106-0010-step3ar-pg-event-trigger-nailed-rel.md`,
+        `internal/initdb/pg_event_trigger_evtname_index_test.go`,
+        `docs/design/0106-0010-step3as-pg-event-trigger-evtname-index.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

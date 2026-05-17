@@ -341,6 +341,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
 	{3534, "pg_enum_typid_sortorder_index"},
+	// M0106-0010 Step 3as: pg_event_trigger_evtname_index. PG18
+	// `postgres/src/include/catalog/pg_event_trigger.h:54` declares
+	// `EventTriggerNameIndexId = 3467` as UNIQUE (non-PKEY) on
+	// btree(evtname name_ops). Heap OID 3466 (pg_event_trigger,
+	// Step 3ar nailed rel). Backs MAKE_SYSCACHE(EVENTTRIGGERNAME,
+	// pg_event_trigger_evtname_index, 8). Without this entry
+	// RelationIdGetRelation(3467) FATALs because no pg_class row gets
+	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
+	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
+	// (relcache.c:1492).
+	{3467, "pg_event_trigger_evtname_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

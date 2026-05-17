@@ -698,6 +698,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
 		3534, // pg_enum_typid_sortorder_index (Step 3aq)
+		3467, // pg_event_trigger_evtname_index (Step 3as)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -798,6 +799,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
 		3534, // pg_enum_typid_sortorder_index (Step 3aq)
+		3467, // pg_event_trigger_evtname_index (Step 3as)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -831,6 +833,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
 		3534, // pg_enum_typid_sortorder_index (Step 3aq)
+		3467, // pg_event_trigger_evtname_index (Step 3as)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -1944,6 +1947,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// UNIQUE PRIMARY, Step 3ao) and OID 3503
 		// (pg_enum_typid_label_index UNIQUE composite name_ops, Step 3ap).
 		entry(3534, 3501, []int16{2, 3}, []uint32{oidOps, float4Ops}, []uint32{0, 0}, true, false), // pg_enum_typid_sortorder_index
+		// M0106-0010 Step 3as: pg_event_trigger_evtname_index. PG18
+		//   postgres/src/include/catalog/pg_event_trigger.h:54
+		//     DECLARE_UNIQUE_INDEX(pg_event_trigger_evtname_index, 3467,
+		//       EventTriggerNameIndexId, pg_event_trigger,
+		//       btree(evtname name_ops));
+		//     MAKE_SYSCACHE(EVENTTRIGGERNAME, pg_event_trigger_evtname_index, 8);
+		// pg_event_trigger attnums (pg_event_trigger_d.h): 2=evtname.
+		// UNIQUE non-PRIMARY single-key on a `name` column; like
+		// pg_namespace_nspname_index (2684, Step 3t) the name_ops slot
+		// carries C_COLLATION_OID = 950. Heap OID 3466 (pg_event_trigger,
+		// Step 3ar nailed rel). Companion to OID 3468
+		// (pg_event_trigger_oid_index, UNIQUE PRIMARY) — added when a
+		// MAKE_SYSCACHE(EVENTTRIGGEROID, …) lookup surfaces.
+		entry(3467, 3466, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_event_trigger_evtname_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
