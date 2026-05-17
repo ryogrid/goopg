@@ -441,6 +441,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		2619, // pg_statistic
 		2620, // pg_trigger
 		3381, // pg_statistic_ext
+		3501, // pg_enum (M0106-0010 step 3an)
 		3596, // pg_seclabel
 		3764, // pg_ts_config
 		3765, // pg_ts_config_map
@@ -751,6 +752,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{2619, 2619}, // pg_statistic
 		{2620, 2620}, // pg_trigger
 		{3381, 3381}, // pg_statistic_ext
+		{3501, 3501}, // pg_enum (M0106-0010 step 3an)
 		{3596, 3596}, // pg_seclabel
 		{3764, 3764}, // pg_ts_config
 		{3765, 3765}, // pg_ts_config_map

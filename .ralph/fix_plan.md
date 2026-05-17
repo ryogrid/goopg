@@ -4682,11 +4682,54 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/mvcc/` PASS.
         Design:
         `docs/design/0106-0010-step3am-pg-default-acl-oid-index.md`.
-      - Next blocker (Step 3an): with OIDs 826/827/828 (the full
-        pg_default_acl family) now opened cleanly, the next E2E re-run
-        is expected to surface another single-OID nailed-rel/index OID
-        flagged by `RelationCacheInitializePhase3`'s nailed-rel walk, or
-        a deeper issue requiring populated btree content. Same
+      - Step 3an LANDED 2026-05-18. Anticipated next-blocker fix after
+        Step 3am (`could not open relation with OID 3501`). OID 3501 is
+        `pg_enum` per `postgres/src/include/catalog/pg_enum.h:32`
+        (`CATALOG(pg_enum,3501,EnumRelationId)`). Pure catalog-seed
+        addition mirroring nailed-rel pattern of Steps 3w
+        (pg_aggregate=2600), 3aa (pg_cast=2605), 3ag
+        (pg_conversion=2607), 3ak (pg_default_acl=826); no
+        encoder/builder/Init flow change. `pgEnumAttrs()` (new in
+        `internal/initdb/relcache_init.go`) returns the 4-column PG18
+        schema: oid (TypeOID 26), enumtypid (TypeOID 26),
+        enumsortorder (TypeOID 700 float4), enumlabel (TypeOID 19 name,
+        Len 64). `nailedLocalRels` gains `{3501, "pg_enum", 83, 'r',
+        4, false, pgEnumAttrs()}`; RelType=83 is safe because pg_enum
+        is not formrdesc'd (no `EnumRelation_Rowtype_Id` constant in
+        PG18 headers), so Step 3v's `relation->rd_att->tdtypeid ==
+        relp->reltype` Phase3 assertion does not fire.
+        `internal/initdb/initdb.go::bootstrapMappedLocalCatalogHeaps`
+        OID list + `localRelMap` gain `3501, // pg_enum (M0106-0010
+        step 3an)` slotted between 3381 (pg_statistic_ext) and 3596
+        (pg_seclabel). Empty 8 KiB `InitPage`-stamped heap is
+        sufficient because pg_enum has zero rows at initdb time (any
+        ENUMOID syscache lookup expects NULL return at early boot).
+        Three companion indexes deferred to Steps 3ao/3ap/3aq:
+        3502 (`pg_enum_oid_index` UNIQUE PRIMARY KEY on oid),
+        3503 (`pg_enum_typid_label_index` UNIQUE on (enumtypid,
+        enumlabel)), 3534 (`pg_enum_typid_sortorder_index` UNIQUE on
+        (enumtypid, enumsortorder) — first nailed index to key on
+        `float4_ops` opclass, requires inventory check during Step
+        3aq). New regression pin
+        `TestNailedLocalRelsContainsPgEnum` in
+        `internal/initdb/pg_enum_nailed_test.go` asserts
+        `(RelName="pg_enum", RelKind='r', RelNatts=4, len(Attrs)=4)`
+        and pins every column against pg_enum_d.h.
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 3501.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgEnum|TestNailedLocalRelsContainsPgDefaultAcl|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3am (no new
+        regressions); `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design: `docs/design/0106-0010-step3an-pg-enum-nailed-rel.md`.
+      - Next blocker (Step 3ao): with pg_enum (OID 3501) now opened
+        cleanly, the next E2E re-run is expected to surface one of the
+        three companion indexes (3502/3503/3534) or another single-OID
+        nailed-rel/index OID flagged by
+        `RelationCacheInitializePhase3`'s nailed-rel walk. Same
         single-OID catalog-seed-addition pattern applies.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
@@ -4747,7 +4790,9 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `internal/initdb/pg_default_acl_role_nsp_obj_index_test.go`,
         `docs/design/0106-0010-step3al-pg-default-acl-role-nsp-obj-index.md`,
         `internal/initdb/pg_default_acl_oid_index_test.go`,
-        `docs/design/0106-0010-step3am-pg-default-acl-oid-index.md`
+        `docs/design/0106-0010-step3am-pg-default-acl-oid-index.md`,
+        `internal/initdb/pg_enum_nailed_test.go`,
+        `docs/design/0106-0010-step3an-pg-enum-nailed-rel.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

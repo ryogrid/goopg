@@ -158,6 +158,14 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// `DefaultAclRelation_Rowtype_Id` constant in PG18 headers).
 	// Schema per `postgres/src/include/catalog/pg_default_acl.h` (PG18).
 	{826, "pg_default_acl", 83, 'r', 5, false, pgDefaultAclAttrs()},
+	// M0106-0010 step 3an: pg_enum is opened during PG-standby boot once
+	// Step 3am cleared the pg_default_acl family. Without a pg_class row,
+	// `RelationBuildDesc(3501) → ScanPgRelation(3501)` returns NULL and the
+	// backend FATALs with `could not open relation with OID 3501`. RelType=83
+	// is safe because pg_enum is not formrdesc'd (no
+	// `EnumRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_enum.h` (PG18).
+	{3501, "pg_enum", 83, 'r', 4, false, pgEnumAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1070,6 +1078,25 @@ func pgDefaultAclAttrs() []nailedAttr {
 		{Name: "defaclnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},  // oid → pg_namespace (0 = all)
 		{Name: "defaclobjtype", TypeOID: 18, Num: 4, Len: 1, NotNull: true},    // char (DEFACLOBJ_*)
 		{Name: "defaclacl", TypeOID: 1034, Num: 5, Len: -1, NotNull: true},     // aclitem[] (BKI_FORCE_NOT_NULL)
+	}
+}
+
+// pgEnumAttrs defines the 4-column PG18 pg_enum schema. PG
+// `RelationBuildDesc(3501) → ScanPgRelation(3501)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row
+// gets seeded and PG FATALs with `could not open relation with OID
+// 3501`. Sourced verbatim from `postgres/src/include/catalog/pg_enum.h`
+// and `pg_enum_d.h` (Anum_pg_enum_* 1–4, Natts_pg_enum=4). M0106-0010
+// step 3an. enumsortorder is float4 (TypeOID 700, Len 4); enumlabel is
+// NameData (TypeOID 19, Len 64). All four columns are fixed-width and
+// NOT NULL; the heap is currently empty (no enum values are
+// bootstrapped at initdb time).
+func pgEnumAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},            // oid
+		{Name: "enumtypid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},      // oid → owning enum type
+		{Name: "enumsortorder", TypeOID: 700, Num: 3, Len: 4, NotNull: true}, // float4
+		{Name: "enumlabel", TypeOID: 19, Num: 4, Len: 64, NotNull: true},     // name
 	}
 }
 
