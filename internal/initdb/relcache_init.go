@@ -119,6 +119,13 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{2602, "pg_amop", 83, 'r', 9, false, pgAmopAttrs()},
 	{2609, "pg_description", 83, 'r', 5, false, pgDescriptionAttrs()},
 	{2608, "pg_depend", 83, 'r', 8, false, pgDependAttrs()},
+	// M0106-0010 step 3w: pg_aggregate is opened during InitPostgres'
+	// `find_inheritance_children → table_open(AggregateRelationId)` path.
+	// Without a pg_class row, PG FATALs with
+	// `could not open relation with OID 2600`. RelType=83 is safe because
+	// pg_aggregate is not formrdesc'd (no
+	// `AggregateRelation_Rowtype_Id` constant in PG18 headers).
+	{2600, "pg_aggregate", 83, 'r', 22, false, pgAggregateAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -821,6 +828,48 @@ func pgDependAttrs() []nailedAttr {
 		{Name: "refobjsubid", TypeOID: 23, Num: 6, Len: 4, NotNull: true},
 		{Name: "deptype", TypeOID: 18, Num: 7, Len: 1, NotNull: true},
 		{Name: "objversion", TypeOID: 28, Num: 8, Len: 4, NotNull: true},
+	}
+}
+
+// pgAggregateAttrs defines the 22-column PG18 pg_aggregate schema. PG
+// doesn't formrdesc pg_aggregate, so RelType is free (we use 83 like the
+// other non-formrdesc'd local nailed catalogs). Schema sourced from
+// `postgres/src/include/catalog/pg_aggregate_d.h` (Anum_pg_aggregate_*)
+// and `pg_aggregate.h` (column type declarations).
+//
+// Why this exists: M0106-0010 step 3w. After Step 3v cleared the relcache
+// init-file PANIC loop, PG standby's backends FATAL with
+// `could not open relation with OID 2600` from
+// `relation.c::table_openrv` — `RelationIdGetRelation(2600)` returns NULL
+// because `RelationBuildDesc → ScanPgRelation(2600)` finds no pg_class
+// row. Adding pg_aggregate to nailedLocalRels writes the row via
+// `bootstrapPgClassTuples`, lays down 22 pg_attribute rows via
+// `bootstrapPgAttributeTuples`, and threads its heap-TID into the
+// pg_class_oid_index btree.
+func pgAggregateAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "aggfnoid", TypeOID: 24, Num: 1, Len: 4, NotNull: true},      // regproc
+		{Name: "aggkind", TypeOID: 18, Num: 2, Len: 1, NotNull: true},       // char
+		{Name: "aggnumdirectargs", TypeOID: 21, Num: 3, Len: 2, NotNull: true}, // int2
+		{Name: "aggtransfn", TypeOID: 24, Num: 4, Len: 4, NotNull: true},
+		{Name: "aggfinalfn", TypeOID: 24, Num: 5, Len: 4, NotNull: true},
+		{Name: "aggcombinefn", TypeOID: 24, Num: 6, Len: 4, NotNull: true},
+		{Name: "aggserialfn", TypeOID: 24, Num: 7, Len: 4, NotNull: true},
+		{Name: "aggdeserialfn", TypeOID: 24, Num: 8, Len: 4, NotNull: true},
+		{Name: "aggmtransfn", TypeOID: 24, Num: 9, Len: 4, NotNull: true},
+		{Name: "aggminvtransfn", TypeOID: 24, Num: 10, Len: 4, NotNull: true},
+		{Name: "aggmfinalfn", TypeOID: 24, Num: 11, Len: 4, NotNull: true},
+		{Name: "aggfinalextra", TypeOID: 16, Num: 12, Len: 1, NotNull: true}, // bool
+		{Name: "aggmfinalextra", TypeOID: 16, Num: 13, Len: 1, NotNull: true},
+		{Name: "aggfinalmodify", TypeOID: 18, Num: 14, Len: 1, NotNull: true},
+		{Name: "aggmfinalmodify", TypeOID: 18, Num: 15, Len: 1, NotNull: true},
+		{Name: "aggsortop", TypeOID: 26, Num: 16, Len: 4, NotNull: true}, // oid
+		{Name: "aggtranstype", TypeOID: 26, Num: 17, Len: 4, NotNull: true},
+		{Name: "aggtransspace", TypeOID: 23, Num: 18, Len: 4, NotNull: true}, // int4
+		{Name: "aggmtranstype", TypeOID: 26, Num: 19, Len: 4, NotNull: true},
+		{Name: "aggmtransspace", TypeOID: 23, Num: 20, Len: 4, NotNull: true},
+		{Name: "agginitval", TypeOID: 25, Num: 21, Len: -1},                  // text (nullable)
+		{Name: "aggminitval", TypeOID: 25, Num: 22, Len: -1},                 // text (nullable)
 	}
 }
 

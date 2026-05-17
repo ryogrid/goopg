@@ -3603,12 +3603,84 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
            Functionally correct but wastes I/O on every backend
            startup; rewrite blob to PG18's actual `RelationData` layout
            (488-byte struct).
-      - Next blocker (Step 3w): standby FATALs with
-        `could not open relation with OID 2600` (`pg_aggregate`). The
-        backend reaches Phase3 → Phase4 → `InitPostgres` and tries to
-        open pg_aggregate via the standard catcache path; goopg either
-        hasn't seeded pg_aggregate's heap file under `base/{1,5}/2600`,
-        hasn't registered it in the relation mapper, or both.
+      - Step 3w LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2600` (pg_aggregate) PG-standby
+        boot blocker that surfaced after Step 3v cleared the relcache
+        Assert PANIC loop. The error is emitted from
+        `postgres/src/backend/access/common/relation.c:61` because
+        `RelationBuildDesc(2600) → ScanPgRelation(2600)` returned no row
+        — goopg's `localRelMap` advertised the relfilenode mapping but
+        no `pg_class` tuple existed for OID 2600. Initial hypothesis
+        (just seed an empty heap file) was incorrect: the FATAL is a
+        pg_class lookup failure, not a file-open failure. Fix adds
+        pg_aggregate to `internal/initdb/relcache_init.go::nailedLocalRels`
+        with `{2600, "pg_aggregate", 83, 'r', 22, false, pgAggregateAttrs()}`.
+        New `pgAggregateAttrs()` returns the 22-column PG18 schema
+        sourced verbatim from `postgres/src/include/catalog/pg_aggregate_d.h`
+        (`Anum_pg_aggregate_*` 1–22) and `pg_aggregate.h` (column type
+        declarations). Per-column `(TypeOID, Len, NotNull)` matches PG18
+        (regproc=24/4, oid=26/4, int2=21/2, int4=23/4, char=18/1,
+        bool=16/1, text=25/-1; `agginitval`/`aggminitval` nullable).
+        `RelType=83` is safe — pg_aggregate is not formrdesc'd (no
+        `AggregateRelation_Rowtype_Id` constant in PG18 headers), so
+        Step 3v's `relation->rd_att->tdtypeid == relp->reltype` Phase3
+        assertion does not fire. The single nailedLocalRels entry
+        threads automatically through the existing bootstrap flow:
+        `bootstrapPgClassTuples` writes the `Form_pg_class` row,
+        `bootstrapPgAttributeTuples` writes 22 `pg_attribute` rows,
+        `bootstrapPgClassOidIndex` adds the leaf to
+        `base/{1,5}/2662 + global/2662`,
+        `bootstrapPgAttributeRelidAttnumIndex` adds 22 composite-key
+        leaves to `2659`, and the init file gains a `Form_pg_class`
+        blob. Complementary: new generic `bootstrapMappedLocalCatalogHeaps`
+        in `internal/initdb/initdb.go` seeds `InitPage`-stamped empty
+        8-KiB heap pages at `base/{1,5}/<oid>` for every mapped local
+        catalog that lacks a dedicated bootstrapper (~30 OIDs covering
+        pg_aggregate through pg_db_role_setting; pg_type=1247 excluded
+        because `bootstrapSystemCatalogs` already populates it in
+        goopg's internal row format and overwriting would wipe
+        `TestBootstrappedPGTypeRowsReadable`; pg_authid=6239 excluded
+        as shared). Only pg_aggregate=2600 is load-bearing for Step 3w;
+        the others are forward-looking infrastructure so future steps
+        don't have to re-add the file. Cost: ~480 KiB of empty pages
+        at init time.
+        Regression pins: `TestNailedLocalRelsContainsPgAggregate`
+        (asserts the nailedLocalRels entry's OID/Name/RelKind/RelNatts
+        and spot-checks `Attrs[0]` matches
+        `Anum_pg_aggregate_aggfnoid=1`+regproc) in
+        `internal/initdb/pg_aggregate_nailed_test.go`;
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages`
+        (pins canonical OID list, asserts each file is 8 KiB,
+        InitPage-stamped, present under both `base/1` and `base/5`,
+        rejects all-zero pages) in
+        `internal/initdb/pg_mapped_local_catalog_heap_test.go`.
+        Verified: `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgAggregate|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestBootstrapPgIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestPgClassOidIndexHasSingleKeyColumn|TestNailedIndexRelnattsAgreesWithIndnatts|TestBootstrapPgClassOidIndex'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3v (`TestMigration*`, `TestCreate*`,
+        `TestBootstrappedPG*`, `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — confirmed unchanged via
+        stash-baseline diff; `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` advances past the
+        `could not open relation with OID 2600` FATAL to the next
+        blocker: `FATAL: could not open relation with OID 2650` =
+        `pg_aggregate_fnoid_index`
+        (`postgres/src/include/catalog/pg_aggregate.h:113`:
+        `DECLARE_UNIQUE_INDEX_PKEY(pg_aggregate_fnoid_index, 2650, …)`),
+        Step 3x territory.
+        Design: `docs/design/0106-0010-step3w-pg-aggregate-nailed-rel.md`.
+      - Next blocker (Step 3x): add `pg_aggregate_fnoid_index` (OID
+        2650) to `pgIndexInitialEntries` and `nailedLocalRels`.
+        Single-column oid-keyed UNIQUE PRIMARY index on `aggfnoid`
+        (attnum 1).
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,
@@ -3632,7 +3704,10 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `docs/design/0106-0010-step3t-pg-namespace-index-seeds.md`,
         `docs/design/0106-0010-step3u-pg-attribute-null-attoptions.md`,
         `docs/design/0106-0010-step3v-pg-shseclabel-reltype.md`,
-        `internal/initdb/pg_attribute_null_attoptions_test.go`
+        `internal/initdb/pg_attribute_null_attoptions_test.go`,
+        `internal/initdb/pg_aggregate_nailed_test.go`,
+        `internal/initdb/pg_mapped_local_catalog_heap_test.go`,
+        `docs/design/0106-0010-step3w-pg-aggregate-nailed-rel.md`
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

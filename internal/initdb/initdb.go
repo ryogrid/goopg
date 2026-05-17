@@ -290,6 +290,15 @@ func Init(opts Options) error {
 	if err := bootstrapPgAttributeRelidAttnumIndex(abs, pgAttrTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_attribute_relid_attnum_index: %w", err)
 	}
+	// M0106-0010 step 3w: write an empty heap page for every mapped local
+	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
+	// pg_type=1247, pg_namespace=2615, …). Without these files PG's
+	// InitPostgres FATALs with `could not open relation with OID 2600` on
+	// the first probe of pg_aggregate after Step 3v cleared the relcache
+	// PANIC loop.
+	if err := bootstrapMappedLocalCatalogHeaps(abs); err != nil {
+		return fmt.Errorf("goopg init: mapped local catalog heaps: %w", err)
+	}
 	if err := bootstrapCLog(abs); err != nil {
 		return fmt.Errorf("goopg init: clog: %w", err)
 	}
@@ -377,6 +386,86 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 	// back to sequential scan of the heap. Without index files,
 	// PG's IndexScanOK() returns false for auth/database lookups
 	// (!criticalSharedRelcachesBuilt), forcing a seq scan.
+	return nil
+}
+
+// bootstrapMappedLocalCatalogHeaps writes a heap-initialised empty 8 KiB
+// page for every mapped local system catalog that does NOT receive a
+// dedicated PG18-shaped bootstrap (pg_class, pg_attribute, pg_proc, pg_am,
+// pg_amop, pg_amproc, pg_opclass, pg_index).
+//
+// Why: M0106-0010 step 3w. After Step 3v cleared the relcache-init
+// assertion PANIC loop, PG standby's backends reach `InitPostgres` and try
+// to open `pg_aggregate` (OID 2600) via the standard catcache path. The
+// local relfilenode mapper already advertises 2600 → 2600 (and ~30 other
+// local catalog OIDs), but no file exists on disk under `base/{1,5}/2600`,
+// so `mdopen → BasicOpenFile` FATALs with
+// `could not open relation with OID 2600`. The same blocker would surface
+// in turn for every other mapped-but-unseeded local catalog, so this
+// function seeds them all in one pass instead of fixing one OID per loop.
+//
+// An empty heap page is sufficient: catcache lookups against an empty
+// relation return nothing, which PG's early-startup probes interpret as
+// "the catalog has no rows yet" rather than crashing. Rows for catalogs
+// PG actually reads during boot (pg_class, pg_attribute, pg_am, …) are
+// still produced by the dedicated bootstrappers; this function only fills
+// the leftover OIDs so `BasicOpenFile` never returns ENOENT.
+func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
+	heapPage := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(heapPage); err != nil {
+		return err
+	}
+	// Local catalogs whose heap file is NOT written by a dedicated
+	// bootstrapper. Keep in sync with `localRelMap` in
+	// `bootstrapPostgresDatabase`; pg_authid (6239) is omitted because it
+	// is fundamentally shared and already has a populated `global/1260`
+	// heap via `bootstrapPostgresRole`.
+	oids := []uint32{
+		// 1247 pg_type is bootstrapped by bootstrapSystemCatalogs in
+		// goopg's internal row format — do NOT overwrite it.
+		2600, // pg_aggregate
+		2604, // pg_attrdef
+		2605, // pg_cast
+		2606, // pg_constraint
+		2607, // pg_conversion
+		2608, // pg_depend
+		2609, // pg_description
+		2611, // pg_inherits
+		2612, // pg_language
+		2613, // pg_largeobject
+		2614, // pg_largeobject_metadata
+		2615, // pg_namespace
+		2617, // pg_operator
+		2618, // pg_rewrite
+		2619, // pg_statistic
+		2620, // pg_trigger
+		3381, // pg_statistic_ext
+		3596, // pg_seclabel
+		3764, // pg_ts_config
+		3765, // pg_ts_config_map
+		3766, // pg_ts_dict
+		3767, // pg_ts_parser
+		3768, // pg_ts_template
+		4044, // pg_event_trigger
+		6003, // pg_publication
+		6101, // pg_publication_rel
+		6102, // pg_sequence
+		6137, // pg_transform
+		6245, // pg_statistic_ext_data
+		9400, // pg_db_role_setting
+	}
+	for _, dbOid := range []uint32{1, 5} {
+		dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOid), 10))
+		if err := os.MkdirAll(dbDir, 0o700); err != nil {
+			return err
+		}
+		for _, oid := range oids {
+			path := filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10))
+			if err := os.WriteFile(path, heapPage, 0o600); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
