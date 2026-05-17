@@ -3164,20 +3164,69 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         The init file populates the relcache but `RelationBuildDesc` ignores
         it. So `ScanPgRelation(2662, ...)` finds zero tuples in the empty
         btree page → NULL → PANIC.
-      - Bootstrap fix: during goopg init, encode PG-native heap tuples for
-        every nailed relation into `base/1/1259` and `base/5/1259`.
-      - Operational fix (NOT DEFERRED): DDL operations must maintain
-        PG-compatible pg_class tuples so the catalog stays current after
-        init. After any catalog change, goopg must regenerate the relcache
-        init file so a PG standby reconnecting (or bootstrapped from a later
-        basebackup) loads correct relation descriptors. This mirrors PG's
-        `write_relcache_init_file()` triggered by catalog invalidation.
-        Even if this expands the milestone scope, it is a hard requirement
-        for correct ongoing replication — an init-time-only snapshot will
-        bit-rot the moment the first DDL runs.
-      - Files: `internal/initdb/initdb.go` (bootstrap), `internal/catalog/`
-        (operational), `internal/initdb/relcache_init.go` (public writer),
-        `internal/server/` (checkpointer integration)
+      - PROGRESS 2026-05-17: pg_class heap tuples (34-col PG18 layout) and
+        pg_attribute heap tuples (~264 rows) are written during goopg init.
+        Init file offsets fixed for PG18. Index key attlen fixed (was 0).
+        HEAP_HASVARWIDTH flag set. PG standby now reaches PM_HOT_STANDBY
+        without PANIC on critical indexes.
+      - BLOCKER 2026-05-17: PG backend startup hits `nocachegetattr` slow-path
+        assertion (`Assert("false")`, heaptuple.c:705) when accessing `relacl`
+        (attnum 32, first varlena column) from a cached pg_class tuple. The
+        `att_addlength_pointer` macro fires inside `VARSIZE_ANY`. Fix tracked
+        in M0106-0009.
+      - Operational maintenance (NOT DEFERRED) tracked in M0106-0011.
+      - Handover: `docs/handover/2026-05-17-m0106-pg-class-tuple-bootstrap.md`
+      - Files: `internal/initdb/initdb.go`, `internal/initdb/relcache_init.go`,
+        `internal/executor/codec.go`
+
+- [ ] **M0106-0009**
+      - Summary: Fix varlena assertion in pg_class heap tuples.
+      - Blocked by: M0106-0008 (bootstrap code written, assertion remains).
+      - Root cause hypothesis: PG's `nocachegetattr` slow path hits
+        `att_addlength_pointer` for `attnum=32` (relacl, attlen=-1). The
+        macro's `VARSIZE_ANY(attptr)` either reads an invalid varlena header
+        byte or the `off` pointer is misaligned relative to our encoding.
+        Debug log confirms `i=31 attlen=-1 attnum=32 natts=34` right before
+        the assertion.
+      - Step 1: Write a Go unit test that encodes a pg_class tuple and dumps
+        the byte at offset 144 (where relacl starts) — should be `0x01`.
+      - Step 2: If encoding is correct, the mismatch is in alignment
+        computation between PG's slow path and our TupleDesc/encoding.
+        Consider setting `relacl`/`reloptions`/`relpartbound` as SQL NULL
+        (requires null bitmap support in `EncodeRowPG`) to make PG skip
+        the slow path entirely.
+      - Design doc: `docs/design/0106-0002-pg-class-tuple-bootstrap.md`
+      - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`
+
+- [ ] **M0106-0010**
+      - Summary: Bootstrap pg_am and related catalog tuples.
+      - Blocked by: M0106-0009 (varlena assertion must be fixed first).
+      - After the assertion is fixed, `SearchSysCache1(AMOID, 403)` during
+        `RelationInitIndexAccessInfo` will return NULL because pg_am heap
+        is empty (btree root page, no tuples).
+      - Write btree AM tuple (OID 403, amname="btree", amhandler=330,
+        amtype='i') into `base/1/2601` / `base/5/2601`.
+      - May also need pg_opclass (OID 3122 for int4_ops), pg_amop, and
+        pg_amproc tuples depending on how far `RelationInitIndexAccessInfo`
+        probes after finding the AM.
+      - Files: `internal/initdb/initdb.go`
+
+- [ ] **M0106-0011**
+      - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
+      - DDL operations (CREATE TABLE, ALTER TABLE, DROP TABLE) must maintain
+        PG-compatible pg_class/pg_attribute tuples — not just an init-time
+        snapshot. After any catalog change, goopg must regenerate the
+        relcache init file (`pg_internal.init`) so a PG standby reconnecting
+        (or bootstrapped from a later basebackup) loads correct relation
+        descriptors.
+      - Mirror PG's `write_relcache_init_file()` triggered by
+        `RelationCacheInitFileRemove` on catalog invalidation.
+      - Wire init-file regeneration into the checkpointer (shutdown
+        checkpoint) or a background writer cycle.
+      - Hard requirement for correct ongoing replication — an init-time-only
+        snapshot will bit-rot the moment the first DDL runs.
+      - Files: `internal/catalog/`, `internal/initdb/relcache_init.go`,
+        `internal/server/`
 
 ## Notes
 
