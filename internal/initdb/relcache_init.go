@@ -120,6 +120,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{2663, "pg_class_relname_nsp_index"},
 	{2690, "pg_proc_oid_index"},
 	{2691, "pg_proc_proname_args_nsp_index"},
+	{2678, "pg_index_indexrelid_index"},
 	{2679, "pg_index_indrelid_index"},
 	{2687, "pg_opclass_oid_index"},
 	{2655, "pg_amproc_oid_index"},

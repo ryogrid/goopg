@@ -3240,6 +3240,60 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         it. After Step 3q, the heap TID for 2678's Form_pg_index row
         will automatically flow into Step 3p's btree via the existing
         TID-map plumbing — no Step 3p code change required.
+      - Step 3q LANDED 2026-05-18. Closes Step 3p's residual blocker
+        (`FATAL: cache lookup failed for index 2671`). Two-line catalog
+        seed change at the data layer; no encoder, builder, or `Init`
+        flow change. `internal/initdb/initdb.go::pgIndexInitialEntries`
+        splits the single mis-labelled `2679` row into two:
+        `entry(2678, 2610, {1}, {oid_ops}, {0}, true, true)`
+        (pg_index_indexrelid_index — PRIMARY on indexrelid) and
+        `entry(2679, 2610, {2}, {oid_ops}, {0}, true, false)`
+        (pg_index_indrelid_index — UNIQUE on indrelid, NOT primary).
+        Authoritative OIDs from
+        `postgres/src/include/catalog/indexing.h`. The three empty-
+        placeholder OID lists in `initdb.go` (base/1/, base/5/,
+        global/) all gain `2678` so PG's `mdopen` finds a valid
+        empty-btree file before Step 3p's `bootstrapPgIndexIndexrelidIndex`
+        overwrites it with the populated 2-block btree.
+        `internal/initdb/relcache_init.go::nailedLocalRels`
+        idxSpec list gains `{2678, "pg_index_indexrelid_index"}` just
+        before the existing 2679 entry. Step 3p's btree code is
+        unchanged — once 2678 lands in `pgIndexInitialEntries`, its
+        heap row is written by `bootstrapPgIndexTuples`, its TID
+        flows through the existing `pgIndexTIDs` map plumbing into
+        `bootstrapPgIndexIndexrelidIndex`, and the btree gets a 24th
+        leaf entry that closes the `(2671 → ?)` gap. Regression pins:
+        `TestPgIndex2678And2679AreDistinctWithCorrectFlags` (new) +
+        `TestNailedLocalRelsContainsPgIndexIndexrelidIndex` (new) in
+        `internal/initdb/pg_index_indexrelid_indrelid_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` extended to 24
+        entries (2678 added, 2679 corrected to {2});
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        slice extended with 2678. Verified: `go test -count=1
+        -run 'TestPgIndex2678|TestNailedLocalRelsContainsPgIndexIndexrelidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — 14 pre-existing baseline failures (Step 3o list) unchanged;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` confirms `cache lookup failed
+        for index 2671` is gone; next blocker is `column is not in
+        index` (Step 3r territory; `nocachegetattr` preamble shows the
+        FATAL fires for a 34-attribute relation at attnum 32 and for a
+        21-attribute relation at attnum 16-18). Design:
+        `docs/design/0106-0010-step3q-pg-index-indexrelid-and-indrelid-split.md`.
+      - Next blocker (Step 3r): `FATAL: column is not in index` after
+        the SHARED critical-index pass completes. `nocachegetattr`
+        log preamble fires for a 34-attribute relation (pg_class) at
+        attnum 32 and for a 21-attribute relation (pg_index) at
+        attnum 16-18 (the trailing indkey/indcollation/indclass/
+        indoption vector columns). Likely cause: an `indkey` in
+        `pgIndexInitialEntries` for a `pg_*_oid_index` whose stored
+        `indkey[0]` disagrees with the column ordering in
+        `pg_*_*Attrs()` (Step 3n-shape bug, but on a different
+        relation). Compare every indkey against
+        `postgres/src/include/catalog/indexing.h` for indexes whose
+        key column lives beyond attnum 15.
       - Files: `internal/executor/codec.go`, `internal/initdb/initdb.go`,
         `internal/initdb/relcache_init.go`,
         `internal/initdb/btree_index_bootstrap.go`,

@@ -37,7 +37,8 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2663: {2, 3},     // pg_class_relname_nsp_index
 		2690: {1},        // pg_proc_oid_index
 		2691: {2, 20, 3}, // pg_proc_proname_args_nsp_index : btree(proname, proargtypes, pronamespace)
-		2679: {1},        // pg_index_indexrelid_index
+		2678: {1},        // pg_index_indexrelid_index : btree(indexrelid)   UNIQUE PRIMARY  ← Step 3q
+		2679: {2},        // pg_index_indrelid_index   : btree(indrelid)     UNIQUE          ← Step 3q
 		2687: {1},        // pg_opclass_oid_index
 		2655: {2, 3, 4, 5}, // pg_amproc_fam_proc_index : btree(amprocfamily, lefttype, righttype, amprocnum)
 		2693: {3, 2},     // pg_rewrite_rel_rulename_index : btree(ev_class, rulename)  ← Step 3n

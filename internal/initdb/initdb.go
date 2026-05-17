@@ -586,7 +586,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	base1Dir := filepath.Join(dataDir, "base", "1")
 	btreePage := makeBtreeRootPage()
 	for _, oid := range []uint32{
-		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680, 2682,
+		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
@@ -668,7 +668,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	btreePage = makeBtreeRootPage()
 	for _, oid := range []uint32{
 		// Local critical indexes
-		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680, 2682,
+		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
@@ -683,7 +683,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	for _, oid := range []uint32{
 		2671, 2672, 2676, 2677, 2695, 3593,
 		// Also copy all local critical indexes to global/
-		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2679, 2680, 2682,
+		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680, 2682,
 		2684, 2685, 2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 	} {
@@ -1549,10 +1549,19 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2663, 1259, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_class_relname_nsp_index
 		entry(2690, 1255, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_proc_oid_index
 		entry(2691, 1255, []int16{2, 20, 3}, []uint32{nameOps, oidvectorOps, oidOps}, []uint32{cCollation, 0, 0}, true, false), // pg_proc_proname_args_nsp_index
-		// OID 2679 in upstream is pg_index_indexrelid_index (on indexrelid,
-		// attnum 1), not indrelid. nailedLocalRels' label is historical;
-		// the row content must match the OID semantics.
-		entry(2679, 2610, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_index_indexrelid_index
+		// PG18 (postgres/src/include/catalog/indexing.h):
+		//   IndexRelidIndexId    = 2678 = pg_index_indexrelid_index
+		//     btree(indexrelid oid_ops)  UNIQUE  PRIMARY
+		//   IndexIndrelidIndexId = 2679 = pg_index_indrelid_index
+		//     btree(indrelid    oid_ops)  UNIQUE  (not primary)
+		// Step 3p surfaced that OID 2678 was missing entirely from
+		// pgIndexInitialEntries and nailedLocalRels — every shared
+		// critical-index load went through 2678's empty btree and
+		// FATAL'd "cache lookup failed for index 2671". Step 3q adds
+		// 2678 here and corrects 2679's indkey from {1} → {2} so each
+		// row's content matches its OID's PG18 semantics.
+		entry(2678, 2610, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_index_indexrelid_index
+		entry(2679, 2610, []int16{2}, []uint32{oidOps}, []uint32{0}, true, false),                                      // pg_index_indrelid_index
 		entry(2687, 2616, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_opclass_oid_index
 		// OID 2655 in upstream is pg_amproc_fam_proc_index (on amprocfamily,
 		// amproclefttype, amprocrighttype, amprocnum), not the oid index;
