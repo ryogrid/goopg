@@ -75,7 +75,7 @@ type nailedAttr struct {
 
 // nailedSharedRels lists all shared nailed relations (heaps + indexes flattened).
 var nailedSharedRels = flattenRels([]nailedRel{
-	{1262, "pg_database", 1248, 'r', 16, true, pgDatabaseAttrs()},
+	{1262, "pg_database", 1248, 'r', 18, true, pgDatabaseAttrs()},
 	{1260, "pg_authid", 2842, 'r', 12, true, pgAuthidAttrs()},
 	{1261, "pg_auth_members", 2843, 'r', 5, true, pgAuthMembersAttrs()},
 	// pg_shseclabel reltype must equal SharedSecLabelRelation_Rowtype_Id
@@ -1527,6 +1527,13 @@ func pgAlignChar(l int16) byte {
 
 // ---- Attribute lists for each nailed catalog ----
 
+// pgDatabaseAttrs returns the 18-column PG18 pg_database schema. Must
+// stay in lockstep with `internal/initdb/initdb.go::bootstrapPostgresDatabase`
+// because PG's formrdesc-baked TupleDesc decodes the heap row through
+// PG18's compile-time schema and any disagreement here either silently
+// rots the goopg-internal view or surfaces as a Phase3 relcache
+// assertion. Source: postgres/src/include/catalog/pg_database.h (M0106-0010
+// Step 3ct).
 func pgDatabaseAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
@@ -1536,15 +1543,17 @@ func pgDatabaseAttrs() []nailedAttr {
 		{Name: "datlocprovider", TypeOID: 18, Num: 5, Len: 1, NotNull: true},
 		{Name: "datistemplate", TypeOID: 16, Num: 6, Len: 1, NotNull: true},
 		{Name: "datallowconn", TypeOID: 16, Num: 7, Len: 1, NotNull: true},
-		{Name: "datconnlimit", TypeOID: 23, Num: 8, Len: 4, NotNull: true},
-		{Name: "datfrozenxid", TypeOID: 28, Num: 9, Len: 4, NotNull: true},
-		{Name: "datminmxid", TypeOID: 28, Num: 10, Len: 4, NotNull: true},
-		{Name: "dattablespace", TypeOID: 26, Num: 11, Len: 4, NotNull: true},
-		{Name: "datcollate", TypeOID: 19, Num: 12, Len: 64, NotNull: true},
-		{Name: "datctype", TypeOID: 19, Num: 13, Len: 64, NotNull: true},
-		{Name: "daticulocale", TypeOID: 25, Num: 14, Len: -1},
-		{Name: "datcollversion", TypeOID: 25, Num: 15, Len: -1},
-		{Name: "datacl", TypeOID: 1034, Num: 16, Len: -1},
+		{Name: "dathasloginevt", TypeOID: 16, Num: 8, Len: 1, NotNull: true},
+		{Name: "datconnlimit", TypeOID: 23, Num: 9, Len: 4, NotNull: true},
+		{Name: "datfrozenxid", TypeOID: 28, Num: 10, Len: 4, NotNull: true},
+		{Name: "datminmxid", TypeOID: 28, Num: 11, Len: 4, NotNull: true},
+		{Name: "dattablespace", TypeOID: 26, Num: 12, Len: 4, NotNull: true},
+		{Name: "datcollate", TypeOID: 25, Num: 13, Len: -1, NotNull: true},
+		{Name: "datctype", TypeOID: 25, Num: 14, Len: -1, NotNull: true},
+		{Name: "datlocale", TypeOID: 25, Num: 15, Len: -1},
+		{Name: "daticurules", TypeOID: 25, Num: 16, Len: -1},
+		{Name: "datcollversion", TypeOID: 25, Num: 17, Len: -1},
+		{Name: "datacl", TypeOID: 1034, Num: 18, Len: -1},
 	}
 }
 

@@ -646,12 +646,37 @@ func bootstrapPostgresRole(dataDir string) error {
 
 // bootstrapPostgresDatabase writes a minimal pg_database tuple for the
 // template1 database so PG can look up database names during connection.
+//
+// The row layout MUST match PG18's Form_pg_database exactly because
+// pg_database is one of the five formrdesc'd shared critical catalogs:
+// PG's RelationCacheInitializePhase2 hardcodes the TupleDesc from
+// `postgres/src/include/catalog/pg_database.h` and Phase3 reads our
+// heap bytes through that TupleDesc. Schema mismatch → either GETSTRUCT
+// reads garbage out of the fixed prefix or SysCacheGetAttr trips
+// `Assert("j > attnum")` in nocachegetattr because HEAP_HASVARWIDTH is
+// missing while the TupleDesc believes there are var-width attrs
+// before the target attnum. M0106-0010 Step 3ct.
 func bootstrapPostgresDatabase(dataDir string) error {
-	// pg_database columns (postgres/src/include/catalog/pg_database.h):
-	// oid(4), datname(64), datdba(4), encoding(4), datlocprovider(1),
-	// datistemplate(1), datallowconn(1), datconnlimit(4), datfrozenxid(4),
-	// datminmxid(4), dattablespace(4), datcollate(64), datctype(64),
-	// daticulocale(text), datcollversion(text), datacl(aclitem[])
+	// PG18 pg_database schema (18 cols) per postgres/src/include/catalog/pg_database.h:
+	//   1  oid              Oid
+	//   2  datname          NameData (NAMEDATALEN=64)
+	//   3  datdba           Oid
+	//   4  encoding         int4
+	//   5  datlocprovider   char (1 byte)
+	//   6  datistemplate    bool
+	//   7  datallowconn     bool
+	//   8  dathasloginevt   bool          (PG18 ADDITION)
+	//   9  datconnlimit     int4
+	//  10  datfrozenxid     TransactionId
+	//  11  datminmxid       TransactionId
+	//  12  dattablespace    Oid
+	//  --- CATALOG_VARLEN below this line ---
+	//  13  datcollate       text          (was NameData in pre-PG15)
+	//  14  datctype         text          (was NameData in pre-PG15)
+	//  15  datlocale        text          (renamed from daticulocale)
+	//  16  daticurules      text          (PG18 ADDITION)
+	//  17  datcollversion   text          (BKI_DEFAULT(_null_))
+	//  18  datacl           aclitem[]
 	cols := []catalog.Column{
 		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
 		{Name: "datname", Type: catalog.Type{Name: "name"}, Ordinal: 1},
@@ -660,59 +685,78 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{Name: "datlocprovider", Type: catalog.Type{Name: "char"}, Ordinal: 4},
 		{Name: "datistemplate", Type: catalog.Type{Name: "bool"}, Ordinal: 5},
 		{Name: "datallowconn", Type: catalog.Type{Name: "bool"}, Ordinal: 6},
-		{Name: "datconnlimit", Type: catalog.Type{Name: "int4"}, Ordinal: 7},
-		{Name: "datfrozenxid", Type: catalog.Type{Name: "xid"}, Ordinal: 8},
-		{Name: "datminmxid", Type: catalog.Type{Name: "xid"}, Ordinal: 9},
-		{Name: "dattablespace", Type: catalog.Type{Name: "oid"}, Ordinal: 10},
-		{Name: "datcollate", Type: catalog.Type{Name: "name"}, Ordinal: 11},
-		{Name: "datctype", Type: catalog.Type{Name: "name"}, Ordinal: 12},
-		{Name: "daticulocale", Type: catalog.Type{Name: "text"}, Ordinal: 13},
-		{Name: "datcollversion", Type: catalog.Type{Name: "text"}, Ordinal: 14},
-		{Name: "datacl", Type: catalog.Type{Name: "text"}, Ordinal: 15},
+		{Name: "dathasloginevt", Type: catalog.Type{Name: "bool"}, Ordinal: 7},
+		{Name: "datconnlimit", Type: catalog.Type{Name: "int4"}, Ordinal: 8},
+		{Name: "datfrozenxid", Type: catalog.Type{Name: "xid"}, Ordinal: 9},
+		{Name: "datminmxid", Type: catalog.Type{Name: "xid"}, Ordinal: 10},
+		{Name: "dattablespace", Type: catalog.Type{Name: "oid"}, Ordinal: 11},
+		{Name: "datcollate", Type: catalog.Type{Name: "text"}, Ordinal: 12},
+		{Name: "datctype", Type: catalog.Type{Name: "text"}, Ordinal: 13},
+		{Name: "datlocale", Type: catalog.Type{Name: "text"}, Ordinal: 14},
+		{Name: "daticurules", Type: catalog.Type{Name: "text"}, Ordinal: 15},
+		{Name: "datcollversion", Type: catalog.Type{Name: "text"}, Ordinal: 16},
+		{Name: "datacl", Type: catalog.Type{Name: "aclitem[]"}, Ordinal: 17},
 	}
-	row := executor.Row{
-		executor.NewIntDatum(1),             // oid = template1
-		executor.NewStringDatum("template1"), // datname
-		executor.NewIntDatum(10),             // datdba = bootstrap superuser
-		executor.NewIntDatum(6),              // encoding = PG_UTF8
-		executor.NewStringDatum("c"),         // datlocprovider = libc
-		executor.NewBoolDatum(false),         // datistemplate
-		executor.NewBoolDatum(true),          // datallowconn
-		executor.NewIntDatum(-1),             // datconnlimit
-		executor.NewIntDatum(3),              // datfrozenxid
-		executor.NewIntDatum(1),              // datminmxid
-		executor.NewIntDatum(1663),           // dattablespace = pg_default
-		executor.NewStringDatum("C"),          // datcollate
-		executor.NewStringDatum("C"),          // datctype
-		executor.NewStringDatum(""),           // daticulocale (empty, not null)
-		executor.NewStringDatum(""),           // datcollversion (empty, not null)
-		executor.NewStringDatum(""),           // datacl (empty, not null)
+	// libc / "C" locale defaults — matches a fresh `initdb --locale=C`.
+	// datlocale, daticurules, datcollversion, datacl are NULL per BKI defaults
+	// (libc uses datcollate/datctype, not datlocale; no ICU rules; no recorded
+	// collation version; no ACL means default-public access).
+	buildRow := func(oid uint32, name string) executor.Row {
+		return executor.Row{
+			executor.NewIntDatum(int64(oid)),     // oid
+			executor.NewStringDatum(name),        // datname
+			executor.NewIntDatum(10),             // datdba = bootstrap superuser
+			executor.NewIntDatum(6),              // encoding = PG_UTF8
+			executor.NewStringDatum("c"),         // datlocprovider = libc
+			executor.NewBoolDatum(false),         // datistemplate
+			executor.NewBoolDatum(true),          // datallowconn
+			executor.NewBoolDatum(false),         // dathasloginevt
+			executor.NewIntDatum(-1),             // datconnlimit
+			executor.NewIntDatum(3),              // datfrozenxid
+			executor.NewIntDatum(1),              // datminmxid
+			executor.NewIntDatum(1663),           // dattablespace = pg_default
+			executor.NewStringDatum("C"),         // datcollate (text, NOT NULL)
+			executor.NewStringDatum("C"),         // datctype   (text, NOT NULL)
+			executor.NullDatum,                   // datlocale (NULL for libc)
+			executor.NullDatum,                   // daticurules
+			executor.NullDatum,                   // datcollversion
+			executor.NullDatum,                   // datacl
+		}
 	}
-	payload, err := executor.EncodeRowPG(cols, row)
-	if err != nil {
+	writeRow := func(page storage.Page, row executor.Row) error {
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			return err
+		}
+		bitmap := executor.NullBitmapPG(row)
+		var tuple storage.HeapTuple
+		if bitmap != nil {
+			tuple = storage.NewHeapTupleWithNulls(storage.TransactionID(1), storage.InvalidTransactionID, bitmap, payload)
+		} else {
+			tuple = storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		}
+		tuple.Header.SetNatts(len(cols))
+		// Any text column ⇒ HEAP_HASVARWIDTH must be set. Without this
+		// PG18 nocachegetattr skips its var-width early-exit guard
+		// (`if (HeapTupleHasVarWidth(tup))`), enters the fast path, walks
+		// the TupleDesc forward, breaks at the first attlen<=0 attribute,
+		// and trips `Assert(j > attnum)` if that var-width attr sits at
+		// position ≤ the target. CheckMyDatabase →
+		// SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_datcollversion)
+		// hits this exact path during early backend startup.
+		tuple.Header.Infomask |= storage.HeapHasVarWidth
+		_, err = storage.PageAddHeapTuple(page, tuple)
 		return err
 	}
+
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
 		return err
 	}
-	tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
-	tuple.Header.SetNatts(len(cols))
-	if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
+	if err := writeRow(page, buildRow(1, "template1")); err != nil {
 		return err
 	}
-	// Also add "postgres" database (default connection target).
-	row2 := make(executor.Row, len(row))
-	copy(row2, row)
-	row2[0] = executor.NewIntDatum(5)             // oid = 5
-	row2[1] = executor.NewStringDatum("postgres") // datname
-	payload2, err := executor.EncodeRowPG(cols, row2)
-	if err != nil {
-		return err
-	}
-	tuple2 := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload2)
-	tuple2.Header.SetNatts(len(cols))
-	if _, err := storage.PageAddHeapTuple(page, tuple2); err != nil {
+	if err := writeRow(page, buildRow(5, "postgres")); err != nil {
 		return err
 	}
 	// Also create index placeholders in base/1/ (goopg's default

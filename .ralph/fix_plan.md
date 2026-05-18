@@ -8249,6 +8249,71 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         PG opens immediately after `CheckMyDatabase` succeeds — needs
         further investigation to identify which catalog rel and
         which tuple trip the assert.
+      - Step 3ct LANDED 2026-05-18. Closes the
+        `TRAP: failed Assert("j > attnum"), File: "heaptuple.c",
+        Line: 642` PG-standby user-backend abort surfaced by Step 3cs.
+        Root cause was twofold: (1) `bootstrapPostgresDatabase`
+        emitted a 16-column pre-PG15 pg_database schema (missing
+        `dathasloginevt` + `daticurules`; `daticulocale` not
+        renamed to `datlocale`; `datcollate`/`datctype` typed as
+        `name` not `text`), and (2) it never stamped
+        `HEAP_HASVARWIDTH` in `t_infomask`. The flag is the actual
+        trigger: PG18 `nocachegetattr` (heaptuple.c:520) skips its
+        var-width early-exit guard when the bit is unset, falls
+        through to the fast path, walks the TupleDesc forward,
+        breaks the fixed-prefix loop at the first attlen<=0
+        attribute, and asserts `j > attnum`. PG18 reads pg_database
+        through `formrdesc`-baked `Desc_pg_database` (18 cols, with
+        `datcollate` text at attnum 13) — schema drift in our row
+        layout was fully invisible to local tests but produced
+        immediate FATALs on every standby user-backend connect.
+        `CheckMyDatabase`'s `SysCacheGetAttr(DATABASEOID, tup,
+        Anum_pg_database_datcollversion)` (attnum 17) is the first
+        path that hits this assertion.
+        Fix: rewrite `bootstrapPostgresDatabase` in
+        `internal/initdb/initdb.go` to emit a PG18-canonical
+        18-column row sourced verbatim from
+        `postgres/src/include/catalog/pg_database.h`. Route through
+        `executor.NullBitmapPG` + `storage.NewHeapTupleWithNulls`
+        for the 4 trailing nullable cols (`datlocale`,
+        `daticurules`, `datcollversion`, `datacl`) and explicitly
+        OR `storage.HeapHasVarWidth` into `t_infomask`. New types in
+        the row: `datcollate`/`datctype` change `name`(19) →
+        `text`(25) varlena (with "C" emitted as 2-byte short
+        varlena); `dathasloginevt` bool at col 8; `daticurules`
+        text at col 16; `datacl` becomes `aclitem[]`(1034) NULL via
+        the bitmap. `internal/initdb/relcache_init.go::pgDatabaseAttrs`
+        updated in lockstep (16 → 18 cols, types corrected to PG18);
+        `nailedSharedRels` pg_database `RelNatts` bumped 16 → 18 so
+        goopg's internal pg_attribute heap + init-file blob agree.
+        Regression pins (new in
+        `internal/initdb/pg_database_pg18_schema_test.go`):
+        `TestPgDatabaseAttrsMatchesPG18FormPgDatabase` (strict
+        18-attr fixture by name/TypeOID/Num/Len against
+        pg_database.h; count guard forces future additions to update
+        the fixture); `TestBootstrapPostgresDatabaseTupleHasVarWidthAndNullBitmap`
+        (end-to-end pin asserting `HEAP_HASVARWIDTH | HEAP_HASNULL`
+        and `t_natts == 18` on both template1 + postgres heap
+        tuples — guards the actual byte that closes the assertion
+        path). Verified: `go build ./...` PASS; targeted
+        `go test -run 'TestPgDatabaseAttrs|TestBootstrapPostgresDatabaseTuple' ./internal/initdb/`
+        PASS; `go test -count=1 ./internal/initdb/` — same 15 baseline
+        failures as Step 3cs (no new regressions, baseline-diff
+        confirmed via `git stash` rerun); cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS;
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        re-run confirms the `Assert("j > attnum")` TRAP is gone. New
+        blocker (Step 3cu): first FATAL is now
+        `FATAL: XX000: could not open relation with OID 2964`
+        (pg_db_role_setting = DbRoleSettingRelationId), opened by
+        `process_settings(MyDatabaseId, GetSessionUserId())`
+        immediately after `CheckMyDatabase` returns. Cascading
+        `invalid attalign value:` FATALs on follower backends are
+        the Step 3cs catcache-stale pattern and will disappear once
+        the first FATAL is closed by seeding pg_db_role_setting.
+        Design:
+        `docs/design/0106-0010-step3ct-pg-database-pg18-row-layout.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
