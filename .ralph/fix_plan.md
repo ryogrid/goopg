@@ -8030,6 +8030,47 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
         PASS. Design:
         `docs/design/0106-0010-step3cp-pg-user-mapping-nailed-rel.md`.
+      - Step 3cq DIAGNOSTIC LANDED 2026-05-18. Root-cause loop only;
+        no PG-canonical pg_type rewrite this loop. Re-running
+        `TestE2E_FailoverGoopgToPG/async` after Step 3cp surfaces a
+        different FATAL than the prior `could not open relation with
+        OID …` cascade: every PG-standby user backend now FATALs
+        `invalid attalign value:` at `populate_compact_attribute_internal,
+        tupdesc.c:105` immediately after `InitPostgres` begins (PG18
+        log location confirmed with `log_min_messages = debug3` +
+        `log_error_verbosity = verbose`, added to
+        `configurePGStandbyFromGoopgBackup`). New regression test
+        `internal/initdb/pg_attribute_attalign_offset_test.go::
+        TestAllPgAttributeHeapRowsHaveValidAttalignByte` pins that
+        every pg_attribute heap row goopg writes has a valid
+        `'c'/'s'/'i'/'d'` byte at offset 83 — so the corruption is
+        NOT in goopg's pg_attribute heap. Actual root cause: PG18
+        `StartupXLOG` (`postgres/src/backend/access/transam/xlog.c:5633`)
+        unconditionally calls `RelationCacheInitFileRemove()` at WAL
+        recovery start, wiping the init-file copies that
+        `copyInitFiles()` placed under `base/1/`, `base/5/`, `global/`.
+        Every backend therefore rebuilds tupledesc from heap;
+        `TupleDescInitEntry` (`tupdesc.c:902`) overrides attalign
+        from `typeForm->typalign` looked up via SysCache on pg_type.
+        goopg's pg_type heap is still goopg-v0 encoded via
+        `catalog.EncodePGTypeRow` (no PG18-canonical Form_pg_type
+        field offsets), so the `Form_pg_type *` cast yields garbage
+        typalign — usually `\0`. Step 3cq proper will add
+        `bootstrapPgTypeTuples(dataDir)` writing PG-canonical
+        `Form_pg_type` rows for every TypeOID referenced by any
+        `nailedAttr` (the finite set already enumerated by
+        `pgTypeAlignChar`), overwriting `base/1/1247` + `base/5/1247`
+        using the same idempotent overwrite pattern as
+        `bootstrapPgAttributeTuples`. Also out of scope for 3cq:
+        a separate one-shot FATAL `could not open file "base/5/2672"`
+        (pg_database_oid_index, shared) raised by the
+        autovacuum-launcher-equivalent first backend; will be tracked
+        as Step 3cr once 3cq lets user backends past InitPostgres.
+        Verified this loop: `go build ./...` PASS;
+        `go test -count=1 -run TestAllPgAttributeHeapRowsHaveValidAttalignByte
+        ./internal/initdb/` PASS; standby log shows the FATAL
+        location explicitly (`tupdesc.c:105`). Design:
+        `docs/design/0106-0010-step3cq-pg-type-heap-canonical-typalign.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

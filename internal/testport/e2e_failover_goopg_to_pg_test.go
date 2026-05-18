@@ -284,7 +284,7 @@ func runGoopgBasebackupToPG(t *testing.T, repo, bin string, primary *cluster.Clu
 func configurePGStandbyFromGoopgBackup(t *testing.T, dataDir, conninfo, slotName string) {
 	t.Helper()
 	conf := fmt.Sprintf(
-		"primary_conninfo = '%s'\nprimary_slot_name = '%s'\nwal_receiver_status_interval = 1\nlog_min_messages = debug1\n",
+		"primary_conninfo = '%s'\nprimary_slot_name = '%s'\nwal_receiver_status_interval = 1\nlog_min_messages = debug3\nlog_error_verbosity = verbose\n",
 		conninfo, slotName)
 	if err := os.WriteFile(filepath.Join(dataDir, "postgresql.auto.conf"), []byte(conf), 0o600); err != nil {
 		t.Fatalf("write postgresql.auto.conf: %v", err)
