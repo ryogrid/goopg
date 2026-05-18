@@ -127,8 +127,16 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// `ParameterAclParnameIndexId = 6246` as UNIQUE btree(parname text_ops).
 	// Without this entry RelationIdGetRelation(6246) FATALs because no
 	// pg_class row gets seeded for the index. Companion to OID 6247
-	// (pg_parameter_acl_oid_index, UNIQUE PRIMARY) deferred to Step 3br.
+	// (pg_parameter_acl_oid_index, UNIQUE PRIMARY) seeded in Step 3br below.
 	{6246, "pg_parameter_acl_parname_index"},
+	// M0106-0010 Step 3br: pg_parameter_acl_oid_index (OID 6247).
+	// PG18 `postgres/src/include/catalog/pg_parameter_acl.h:54` declares
+	// `ParameterAclOidIndexId = 6247` as UNIQUE PRIMARY btree(oid oid_ops),
+	// backing MAKE_SYSCACHE(PARAMETERACLOID, …). Without this entry
+	// RelationIdGetRelation(6247) FATALs even though the Form_pg_index row
+	// exists, because no pg_class row gets seeded. Sibling to OID 6246
+	// (parname text_ops UNIQUE non-PKEY) from Step 3bq.
+	{6247, "pg_parameter_acl_oid_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).
