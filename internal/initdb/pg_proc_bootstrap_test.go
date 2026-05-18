@@ -154,7 +154,7 @@ func TestBootstrapPgProcTuplesWritesRowsToBase1And5(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	if err := bootstrapPgProcTuples(dir); err != nil {
+	if _, err := bootstrapPgProcTuples(dir); err != nil {
 		t.Fatalf("bootstrapPgProcTuples: %v", err)
 	}
 	needle := make([]byte, 64)

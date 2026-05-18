@@ -8800,6 +8800,84 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         fresh standby pg.log capture via the Step-3cy cleanup tag
         + `gdb --batch -ex bt` against the SIGSEGV PID if the heap
         + index path is already populated.
+      - Step 3db LANDED 2026-05-18: pg_proc_oid_index populated
+        2-page btree. Direct inspection of `base/{1,5}/2690` from the
+        Step-3da E2E temp dir confirmed an unpopulated metapage-only
+        placeholder (the generic placeholder loop in
+        `bootstrapSystemCatalogs` writes the index OID as just a
+        single-page metapage). Direct inspection of `base/{1,5}/1255`
+        confirmed the 7 AM-handler heap rows from
+        `bootstrapPgProcTuples` are present and OID 43 (`int4out`) is
+        legitimately absent from the heap — the 3da hypothesis is
+        therefore partially correct (index is empty) and partially
+        speculative (whether the missing heap rows are the actual
+        SEGV trigger remains unconfirmed). Fix is the index-only half
+        of the hypothesis: `internal/initdb/initdb.go::bootstrapPgProcTuples`
+        widens to return `([]heapTID, error)`; new
+        `internal/initdb/btree_index_bootstrap.go::bootstrapPgProcOidIndex(dataDir, tids)`
+        mirrors Step 3cz exactly — sort by OID ascending, build a
+        2-page btree via `pgBuildIndexTupleOidKey` /
+        `pgBuildBtreeLeafRootPage` /
+        `pgBuildBtreeMetapageWithRoot(1, 0)`, overwrite
+        `base/{1,5}/2690` (pg_proc is per-database, no `global/`
+        copy). `bootstrapSystemCatalogs` calls the new bootstrap
+        immediately after `bootstrapPgProcTuples`, before
+        `bootstrapPgOpclassTuples`.
+        Regression pin (new in
+        `internal/initdb/pg_proc_oid_index_test.go`):
+        `TestBootstrapPgProcOidIndexWritesPopulatedBtree` checks
+        2-page file size on both `base/1/2690` and `base/5/2690`,
+        leaf line-pointer count == `len(tids)`, strictly ascending
+        OID keys, and **mandatory bthandler (OID 330)** — the
+        canary every nailed btree index exercises via
+        `RelationInitIndexAccessInfo → OidFunctionCall0(amhandler)`.
+        Verified: `go build ./...` PASS; targeted
+        `go test -count=1 -run 'TestBootstrapPgProcOidIndex|TestBootstrapPgProcTuples|TestPgType|TestPgProc' ./internal/initdb/`
+        PASS; `go test -count=1 ./internal/initdb/` — same 15
+        pre-existing baseline failures as Step 3da (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3db-pg-proc-oid-index-populated.md`.
+        E2E impact (the load-bearing metric): `[m0102-pg-standby-log]`
+        capture before vs after — `cache lookup failed for type 23`
+        lines 0→0 (Step 3cz invariant holds), `cache lookup failed
+        for function …` lines 0→0, `no output function available
+        for type integer` lines 0→0 (Step 3da invariant holds),
+        `signal 11: Segmentation fault` lines **1→1** (UNCHANGED —
+        Step 3db's index-only half is necessary but not sufficient
+        to clear the lone SIGSEGV; the 7-row heap seed is reachable
+        via the indexed path now, but the dereferencing call site
+        is still hitting a NULL tuple from an *unseeded* OID lookup
+        that fmgr_isbuiltin can't short-circuit).
+        Next blocker (Step 3dc): two complementary paths. (1) Heap
+        expansion: extend `pgProcInitialEntries` to include the I/O
+        regproc OIDs Step 3da wired into `pgTypeCanonical` —
+        starting with the int4 quad (42 int4in, 43 int4out, 2406
+        int4recv, 2407 int4send) plus text (46/47/2414/2415), name
+        (34/35/2422/2423), oid (1798/1799/2418/2419), bool
+        (1242/1243/2436/2437), and the array I/O quad
+        (750/751/2400/2401) — sourced verbatim from
+        `postgres/src/include/catalog/pg_proc.dat`. Each row needs
+        canonical `prorettype` / `proargtypes` matching upstream
+        (e.g. int4out is `cstring(prorettype) ← int4(proargtypes)`,
+        int4recv is `int4(prorettype) ← internal(proargtypes)`).
+        `bootstrapPgProcOidIndex` already handles arbitrary-size
+        entry lists. (2) If Step 3dc(1) leaves the SIGSEGV in
+        place, fall back to non-invasive diagnostic: build a small
+        `tools/segv_backtrace/` C shared library that installs a
+        `sigaction(SIGSEGV)` handler calling
+        `backtrace_symbols_fd(STDERR_FILENO)` and re-raising; wire
+        it into `pgcluster.Start` via `LD_PRELOAD` env var
+        (gated by `GOOPG_TEST_SEGV_BACKTRACE=1`). PG installs no
+        SIGSEGV handler of its own (only `sigdelset(BlockSig,
+        SIGSEGV)` in `libpq/pqsignal.c`), so an LD_PRELOAD'd
+        handler will fire before the kernel terminates the child.
+        The stderr-written backtrace will appear in the standby's
+        `pg.log` under the Step-3cy `[m0102-pg-standby-log]` tag.
+        Working assumption for 3dc(1) ordering: try the int4 quad
+        first; if that's not enough, expand to the full ~30-row
+        set derived from `pgTypeCanonical`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

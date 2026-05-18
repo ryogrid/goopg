@@ -722,6 +722,56 @@ func bootstrapPgTypeOidIndex(dataDir string, tids []heapTID) error {
 	return nil
 }
 
+// bootstrapPgProcOidIndex (M0106-0010 step 3db) overwrites the empty btree
+// placeholder at base/{1,5}/2690 (pg_proc_oid_index) with a populated 2-page
+// btree carrying one oid-keyed IndexTuple per pg_proc heap row written by
+// bootstrapPgProcTuples. PG's SearchSysCache1(PROCOID, ObjectIdGetDatum(oid))
+// takes the indexed path on the standby; without populated leaf entries the
+// lookup returns NULL and an InitPostgres-stage backend SIGSEGVs when
+// downstream code dereferences GETSTRUCT on the NULL tuple. pg_proc is
+// per-database, so the file is written under base/1 (template1) and base/5
+// (postgres) only; there is no global/ copy.
+func bootstrapPgProcOidIndex(dataDir string, tids []heapTID) error {
+	entries := pgProcInitialEntries()
+	if len(entries) != len(tids) {
+		return fmt.Errorf("pg_proc_oid_index: entries=%d tids=%d", len(entries), len(tids))
+	}
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, len(entries))
+	for i, e := range entries {
+		items[i] = indexed{oid: e.OID, block: tids[i].Block, off: tids[i].Offset}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_proc_oid_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2690, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_proc_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 // bootstrapPgClassOidIndex overwrites the empty btree placeholders at
 // base/{1,5}/2662 and global/2662 with a 2-block btree file (metapage +
 // populated leaf-root) carrying one IndexTuple per pg_class heap row,

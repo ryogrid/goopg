@@ -259,8 +259,20 @@ func Init(opts Options) error {
 	// functions so PG's RelationInitIndexAccessInfo →
 	// OidFunctionCall0(amhandler) finds bthandler /
 	// heap_tableam_handler / etc. in the syscache.
-	if err := bootstrapPgProcTuples(abs); err != nil {
+	pgProcTIDs, err := bootstrapPgProcTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_proc tuples: %w", err)
+	}
+	// M0106-0010 step 3db: overwrite the empty btree placeholder at
+	// base/{1,5}/2690 with a populated 2-page btree (metapage +
+	// leaf-root) carrying one oid-keyed IndexTuple per pg_proc heap
+	// row so PG's SearchSysCache1(PROCOID, ObjectIdGetDatum(oid))
+	// resolves the AM handler functions (bthandler=330, etc.) via
+	// the indexed path. Without populated leaf entries the lookup
+	// returns NULL and an InitPostgres-stage client backend SIGSEGVs
+	// when downstream code dereferences GETSTRUCT on the NULL tuple.
+	if err := bootstrapPgProcOidIndex(abs, pgProcTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_proc_oid_index: %w", err)
 	}
 	// M0106-0010 step 3b: write pg_opclass rows so PG's
 	// RelationInitIndexAccessInfo → SearchSysCache1(CLAOID, ...)
@@ -1412,15 +1424,14 @@ func pgProcRow(e pgProcEntry) executor.Row {
 // OidFunctionCall0(amhandler) succeeds — fmgr does
 // SearchSysCache1(PROCOID, …) on the index AM's handler OID and
 // dereferences GETSTRUCT(tup)→Form_pg_proc to read prosrc.
-func bootstrapPgProcTuples(dataDir string) error {
+func bootstrapPgProcTuples(dataDir string) ([]heapTID, error) {
 	cols := pgProcColDefs()
 	entries := pgProcInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
 		rows = append(rows, pgProcRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "1255", cols, rows)
-	return err
+	return writeMultiPageHeapRows(dataDir, "1255", cols, rows)
 }
 
 // pgOpclassEntry mirrors one row of PG18's pg_opclass.dat — see
