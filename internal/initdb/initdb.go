@@ -1205,6 +1205,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	for _, oid := range []uint32{
 		2671, 2672, 2676, 2677,
 		2694, // pg_auth_members_role_member_index (Step 3z)
+		6303, // pg_auth_members_oid_index (batched-13)
+		6302, // pg_auth_members_grantor_index (batched-13)
 		2695, 3593,
 		6246, // pg_parameter_acl_parname_index (Step 3bq)
 		6247, // pg_parameter_acl_oid_index (Step 3br)
@@ -2549,6 +2551,18 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// (DECLARE_UNIQUE_INDEX, not _PKEY which is 6303).
 		// Shared catalog like its sibling 2695.
 		entry(2694, 1261, []int16{2, 3, 4}, []uint32{oidOps, oidOps, oidOps}, []uint32{0, 0, 0}, true, false), // pg_auth_members_role_member_index
+		// M0106-0010 batched-13: pg_auth_members_oid_index (OID 6303).
+		// postgres/src/include/catalog/pg_auth_members.h:48 —
+		//   DECLARE_UNIQUE_INDEX_PKEY(pg_auth_members_oid_index, 6303,
+		//     AuthMemOidIndexId, pg_auth_members, btree(oid oid_ops));
+		// pg_auth_members attnums: 1=oid. PRIMARY KEY over pg_auth_members.
+		entry(6303, 1261, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_auth_members_oid_index
+		// M0106-0010 batched-13: pg_auth_members_grantor_index (OID 6302).
+		// postgres/src/include/catalog/pg_auth_members.h:51 —
+		//   DECLARE_INDEX(pg_auth_members_grantor_index, 6302,
+		//     AuthMemGrantorIndexId, pg_auth_members, btree(grantor oid_ops));
+		// pg_auth_members attnums: 4=grantor. Non-unique, non-primary.
+		entry(6302, 1261, []int16{4}, []uint32{oidOps}, []uint32{0}, false, false), // pg_auth_members_grantor_index
 		// pg_shseclabel columns (PG18, pg_shseclabel.h): 1=objoid, 2=classoid,
 		// 3=provider, 4=label. Index = btree(objoid, classoid, provider text_ops).
 		entry(3593, 3592, []int16{1, 2, 3}, []uint32{oidOps, oidOps, textOps}, []uint32{0, 0, cCollation}, true, true), // pg_shseclabel_object_index

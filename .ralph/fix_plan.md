@@ -9669,21 +9669,31 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3dg-pg-authid-rolname-index-name-typed-descriptor.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-12** (bootstrap-procedure task 12)
+- [x] **M0106-0010 batched-12** (bootstrap-procedure task 12)
       - Summary: Seed 2 default `pg_tablespace` rows (1663 `pg_default`,
         1664 `pg_global`) and update `pg_tablespace_oid_index` (2697)
         and `pg_tablespace_spcname_index` (2698) leaves.
+      - COMPLETE 2026-05-19. New `pg_tablespace_bootstrap.go` adds
+        `bootstrapPgTablespaceTuples` (writes pg_default+pg_global heap rows
+        with HEAP_HASNULL+HEAP_XMIN_FROZEN into global/1213),
+        `bootstrapPgTablespaceOidIndex` (global/2697), and
+        `bootstrapPgTablespaceSpcnameIndex` (global/2698). Wired into Init
+        after bootstrapPgAuthidIndexes. Tests: heap row count/TID/size
+        assertions + btree metapage magic + col-def schema in
+        `pg_tablespace_heap_test.go`.
+      - Regression: `go test -count=1 ./internal/initdb/` — 16 pre-existing
+        failures unchanged; `./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
       - Spec: `bootstrap-procedure/04-shared-catalog-bootstrap.md`.
-      - Files: `internal/initdb/sharedcatalog.go` (new),
-        `internal/initdb/btree_index_bootstrap.go`.
-      - Test: `internal/initdb/pg_class_reltablespace_test.go` extended;
-        new `pg_tablespace_heap_test.go`.
+      - Files: `internal/initdb/pg_tablespace_bootstrap.go` (new),
+        `internal/initdb/initdb.go`.
+      - Test: new `pg_tablespace_heap_test.go`.
       - Originating step-3* docs:
         `0106-0010-step3ch-pg-tablespace-nailed-rel.md`,
         `0106-0010-step3cr-pg-class-reltablespace-shared.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-13** (bootstrap-procedure task 13)
+- [x] **M0106-0010 batched-13** (bootstrap-procedure task 13)
       - Summary: Wire `pg_auth_members_oid_index` (6303) and
         `pg_auth_members_grantor_index` (6302) into the
         critical-shared-index loop so the empty placeholders match

@@ -504,6 +504,8 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 	// critical-index pass FATALs immediately.
 	mustHave := []uint32{2671, 2672, 2676, 2677,
 		2694, // pg_auth_members_role_member_index ← Step 3z
+		6303, // pg_auth_members_oid_index ← batched-13
+		6302, // pg_auth_members_grantor_index ← batched-13
 		2695, 3593,
 		827, // pg_default_acl_role_nsp_obj_index ← Step 3al
 		828, // pg_default_acl_oid_index ← Step 3am

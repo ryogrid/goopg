@@ -28,6 +28,8 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2677: {1},       // pg_authid_oid_index        : btree(oid)
 		2694: {2, 3, 4}, // pg_auth_members_role_member_index : btree(roleid, member, grantor) UNIQUE ← Step 3z
 		2695: {3, 2, 4}, // pg_auth_members_member_role_index : btree(member, roleid, grantor)
+		6303: {1},       // pg_auth_members_oid_index : btree(oid) UNIQUE PRIMARY ← batched-13
+		6302: {4},       // pg_auth_members_grantor_index : btree(grantor) non-unique ← batched-13
 		3593: {1, 2, 3}, // pg_shseclabel_object_index : btree(objoid, classoid, provider)
 		// Local catalogs.
 		2703: {1},        // pg_type_oid_index

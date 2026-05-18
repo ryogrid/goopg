@@ -193,6 +193,18 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// gets seeded; the sibling 2695 follows the same pattern.
 	{OID: 2694, Name: "pg_auth_members_role_member_index"},
 	{OID: 2695, Name: "pg_auth_members_member_role_index"},
+	// M0106-0010 batched-13: pg_auth_members_oid_index (OID 6303).
+	// PG18 `postgres/src/include/catalog/pg_auth_members.h:48` declares
+	// `AuthMemOidIndexId = 6303` as UNIQUE PRIMARY btree(oid oid_ops).
+	// PG's load_critical_index pass opens every declared index of a nailed
+	// rel; without this entry RelationIdGetRelation(6303) FATALs because
+	// no pg_class row gets seeded. Companion to OID 6302 (grantor, non-unique).
+	{OID: 6303, Name: "pg_auth_members_oid_index"},
+	// M0106-0010 batched-13: pg_auth_members_grantor_index (OID 6302).
+	// PG18 `postgres/src/include/catalog/pg_auth_members.h:51` declares
+	// `AuthMemGrantorIndexId = 6302` as btree(grantor oid_ops), non-unique.
+	// Companion to OID 6303 (oid PKEY) over the pg_auth_members heap OID 1261.
+	{OID: 6302, Name: "pg_auth_members_grantor_index"},
 	{OID: 3593, Name: "pg_shseclabel_object_index"},
 	// M0106-0010 Step 3bq: pg_parameter_acl_parname_index (OID 6246).
 	// PG18 `postgres/src/include/catalog/pg_parameter_acl.h:53` declares
