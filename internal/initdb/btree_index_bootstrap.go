@@ -829,19 +829,15 @@ func bootstrapPgDatabaseDatnameIndex(dataDir string) error {
 // type 23" at tupdesc.c:896 (int4 OID=23). pg_type is per-database, so
 // the file is written under base/1 (template1) and base/5 (postgres) only;
 // there is no global/ copy.
-func bootstrapPgTypeOidIndex(dataDir string, tids []heapTID) error {
-	entries := pgTypeInitialEntries()
-	if len(entries) != len(tids) {
-		return fmt.Errorf("pg_type_oid_index: entries=%d tids=%d", len(entries), len(tids))
-	}
+func bootstrapPgTypeOidIndex(dataDir string, tids map[uint32]heapTID) error {
 	type indexed struct {
 		oid   uint32
 		block uint32
 		off   uint16
 	}
-	items := make([]indexed, len(entries))
-	for i, e := range entries {
-		items[i] = indexed{oid: e.OID, block: tids[i].Block, off: tids[i].Offset}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
 

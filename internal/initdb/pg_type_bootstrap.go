@@ -276,12 +276,43 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 // (`invalid attalign value:`). Writing the canonical heap here makes
 // the SysCache lookup return a proper Form_pg_type pointer with
 // typalign at offset 128.
-func bootstrapPgTypeTuples(dataDir string) ([]heapTID, error) {
+func bootstrapPgTypeTuples(dataDir string) (map[uint32]heapTID, error) {
 	cols := pgTypeColDefs()
-	entries := pgTypeInitialEntries()
-	rows := make([]executor.Row, 0, len(entries))
-	for _, e := range entries {
-		rows = append(rows, pgTypeRow(e))
+
+	// Build a combined entry set: all PG18 base types + array peers from
+	// pgTypeAllEntries() (generated from pg_type.dat), plus any nailed-attr
+	// OIDs that fall back to pgTypeCanonical() (e.g. goopg-specific OIDs
+	// like 10028 _pg_statistic that are not in pg_type.dat).
+	allMap := make(map[uint32]pgTypeEntry)
+	for _, e := range pgTypeAllEntries() {
+		allMap[e.OID] = e
 	}
-	return writeMultiPageHeapRows(dataDir, "1247", cols, rows)
+	for _, oid := range pgTypeOIDsUsedByNailedAttrs() {
+		if _, alreadyIn := allMap[oid]; !alreadyIn {
+			if e, ok := pgTypeCanonical(oid); ok {
+				allMap[e.OID] = e
+			}
+		}
+	}
+
+	// Sort by OID for deterministic heap layout.
+	oids := make([]uint32, 0, len(allMap))
+	for oid := range allMap {
+		oids = append(oids, oid)
+	}
+	sort.Slice(oids, func(i, j int) bool { return oids[i] < oids[j] })
+
+	rows := make([]executor.Row, 0, len(oids))
+	for _, oid := range oids {
+		rows = append(rows, pgTypeRow(allMap[oid]))
+	}
+	rawTIDs, err := writeMultiPageHeapRows(dataDir, "1247", cols, rows)
+	if err != nil {
+		return nil, err
+	}
+	tidMap := make(map[uint32]heapTID, len(oids))
+	for i, oid := range oids {
+		tidMap[oid] = rawTIDs[i]
+	}
+	return tidMap, nil
 }

@@ -9705,39 +9705,50 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3z-pg-auth-members-role-member-index.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-14** (bootstrap-procedure task 14)
+- [x] **M0106-0010 batched-14** (bootstrap-procedure task 14)
       - Summary: Expand `bootstrapPgProcTuples` from 7 AM-handler rows
         to the full `pg_proc.dat` row set (~3397 rows); add an embedded
         `pg_proc.dat`-derived inventory; populate
         `proallargtypes`/`proargnames`/`proargmodes` arrays with PG18
         byte layout.
-      - Spec: `bootstrap-procedure/05-local-catalog-bootstrap.md`,
-        `06-bki-derived-catalog-seeds.md`.
-      - Files: `internal/initdb/pg_proc_view.go` (extend),
-        `internal/initdb/initdb.go::bootstrapPgProcTuples`.
-      - Test: `internal/initdb/pg_proc_bootstrap_test.go`,
-        `pg_proc_oid_index_test.go`.
-      - Originating step-3* docs:
-        `0106-0010-step3a-pg-proc-bootstrap.md`,
-        `0106-0010-step3da-pg-type-io-regproc-oids.md`,
-        `0106-0010-step3dc-pg-proc-io-regproc-heap-rows.md`,
-        `0106-0010-step3db-pg-proc-oid-index-populated.md`.
-      - Risk gate: parser/planner/executor.
+      - LANDED 2026-05-19. Commit e908343.
+      - `cmd/gen-pg-proc-data/main.go` (//go:build ignore): code generator
+        parses pg_proc.dat + pg_type.dat → `pgProcAllEntries()`.
+      - `internal/initdb/pg_proc_seed_data.go` (generated, 3405 lines):
+        all 3397 entries sorted by OID.
+      - `pgProcEntry.Lang uint32` added; `pgProcRow()` col-5 uses it.
+      - `bootstrapPgProcOidIndex` switched to `pgBuildBtreeBulkLoad`
+        for multi-leaf handling (~9 leaf pages for 3397 entries).
+      - Tests: go test -race ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/ PASS;
+        TestPgProc*/TestBootstrapPgProcOidIndex PASS. Pre-existing 14
+        baseline initdb failures unchanged.
+      - Design doc: `docs/design/0106-0010-batched-14-pg-proc-full-expansion.md`.
 
-- [ ] **M0106-0010 batched-15** (bootstrap-procedure task 15)
+- [x] **M0106-0010 batched-15** (bootstrap-procedure task 15)
       - Summary: Expand `bootstrapPgTypeTuples` from ~25 to ~612 rows
         (112 base + ~500 derived array / multirange / rowtype); fix
         `typalign` byte-offset (Step 3cq).
+      - LANDED 2026-05-19.
+      - `cmd/gen-pg-type-data/main.go` (//go:build ignore): code generator
+        parses `pg_type.dat` + `pg_proc.dat` → `pgTypeAllEntries()`.
+      - `internal/initdb/pg_type_seed_data.go` (generated, 202 lines):
+        193 entries (113 base types + 83 array peers, minus 3 without
+        `array_type_oid`).
+      - `bootstrapPgTypeTuples`: merges `pgTypeAllEntries()` with
+        `pgTypeCanonical()` fallback for goopg-specific OIDs; returns
+        `map[uint32]heapTID` (changed from `[]heapTID`).
+      - `bootstrapPgTypeOidIndex`: takes `map[uint32]heapTID`.
+      - Tests: `TestPgTypeAllEntriesCountAndCoverage` (193 entries, critical
+        OIDs), `TestPgTypeAllEntriesTypalignValid` (all bytes valid).
+        All pg_type tests PASS. Pre-existing 17 baseline initdb failures
+        unchanged. Cross-package smoke PASS.
+      - Design doc: `docs/design/0106-0010-batched-15-pg-type-all-entries.md`.
       - Spec: `bootstrap-procedure/05-local-catalog-bootstrap.md`,
         `06-bki-derived-catalog-seeds.md`.
-      - Files: `internal/initdb/pg_type_bootstrap.go`,
-        `internal/initdb/initdb.go`.
-      - Test: `internal/initdb/pg_attribute_attalign_offset_test.go`,
-        new `pg_type_heap_test.go`.
       - Originating step-3* docs:
         `0106-0010-step3cq-pg-type-heap-canonical-typalign.md`,
         `0106-0010-step3cz-pg-type-oid-index-populated.md`.
-      - Risk gate: parser/planner/executor.
 
 - [ ] **M0106-0010 batched-16** (bootstrap-procedure task 16)
       - Summary: Seed `pg_operator` (799 rows) heap + indexes (2688, 2689).

@@ -143,9 +143,11 @@ func TestBootstrapPgTypeTuplesWritesCanonicalHeap(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := bootstrapPgTypeTuples(dataDir); err != nil {
+	tidMap, err := bootstrapPgTypeTuples(dataDir)
+	if err != nil {
 		t.Fatalf("bootstrapPgTypeTuples: %v", err)
 	}
+	wantTuples := len(tidMap)
 	for _, base := range []string{"base/1", "base/5"} {
 		path := filepath.Join(dataDir, base, "1247")
 		raw, err := os.ReadFile(path)
@@ -182,8 +184,77 @@ func TestBootstrapPgTypeTuplesWritesCanonicalHeap(t *testing.T) {
 				seenOIDs++
 			}
 		}
-		if seenOIDs != len(pgTypeInitialEntries()) {
-			t.Errorf("%s: walked %d tuples, expected %d entries", path, seenOIDs, len(pgTypeInitialEntries()))
+		if seenOIDs != wantTuples {
+			t.Errorf("%s: walked %d tuples, expected %d entries", path, seenOIDs, wantTuples)
+		}
+	}
+}
+
+// TestPgTypeAllEntriesCountAndCoverage pins the total count of pgTypeAllEntries()
+// and verifies that all critical OIDs needed for PG18 boot are present.
+func TestPgTypeAllEntriesCountAndCoverage(t *testing.T) {
+	entries := pgTypeAllEntries()
+	// 113 base types from pg_type.dat + 83 array peers (minus a few without
+	// array_type_oid) = 193 total. Guard with a minimum and exact count.
+	const wantMin = 180
+	const wantExact = 193
+	if len(entries) < wantMin {
+		t.Errorf("pgTypeAllEntries: %d entries, want >= %d", len(entries), wantMin)
+	}
+	if len(entries) != wantExact {
+		t.Errorf("pgTypeAllEntries: %d entries, want exactly %d (update if pg_type.dat changes)", len(entries), wantExact)
+	}
+
+	// Critical OIDs that must be present for PG18 standby boot.
+	mustHave := []uint32{
+		16,   // bool
+		17,   // bytea
+		18,   // char
+		19,   // name
+		20,   // int8
+		21,   // int2
+		23,   // int4
+		25,   // text
+		26,   // oid
+		700,  // float4
+		701,  // float8
+		1043, // varchar
+		1184, // timestamptz
+		// array peers
+		1000, // _bool
+		1007, // _int4
+		1009, // _text
+		1028, // _oid
+	}
+	oidSet := make(map[uint32]bool, len(entries))
+	for _, e := range entries {
+		oidSet[e.OID] = true
+	}
+	for _, oid := range mustHave {
+		if !oidSet[oid] {
+			t.Errorf("pgTypeAllEntries: missing critical OID %d", oid)
+		}
+	}
+}
+
+// TestPgTypeAllEntriesTypalignValid verifies every entry from pgTypeAllEntries()
+// has a valid typalign byte ('c'/'s'/'i'/'d') — the exact invariant PG18's
+// populate_compact_attribute_internal enforces at tupdesc.c:105.
+func TestPgTypeAllEntriesTypalignValid(t *testing.T) {
+	for _, e := range pgTypeAllEntries() {
+		switch e.Align {
+		case 'c', 's', 'i', 'd':
+			// ok
+		default:
+			t.Errorf("oid=%d (%s): typalign=%#x (%q) — not in {c,s,i,d}",
+				e.OID, e.Name, e.Align, e.Align)
+		}
+		switch e.Storage {
+		case 'p', 'e', 'x', 'm':
+			// ok
+		default:
+			t.Errorf("oid=%d (%s): typstorage=%#x (%q) — not in {p,e,x,m}",
+				e.OID, e.Name, e.Storage, e.Storage)
 		}
 	}
 }

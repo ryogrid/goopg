@@ -141,16 +141,11 @@ func TestInitCreatesSystemCatalogRelfiles(t *testing.T) {
 			t.Errorf("%s: path is a directory", rel.name)
 			continue
 		}
-		// pg_class/pg_attribute may span multiple blocks due to nailed-relation
-		// tuples (M0106-0008).
-		if rel.name == "pg_class" || rel.name == "pg_attribute" {
-			if st.Size()%int64(storage.BlockSize) != 0 || st.Size() < int64(storage.BlockSize) {
-				t.Errorf("%s: size=%d not a multiple of block size %d", rel.name, st.Size(), storage.BlockSize)
-			}
-		} else {
-			if want := int64(storage.BlockSize); st.Size() != want {
-				t.Errorf("%s: size=%d want %d (one block)", rel.name, st.Size(), want)
-			}
+		// All three may span multiple blocks (pg_class/pg_attribute due to
+		// nailed-relation tuples (M0106-0008); pg_type due to the expanded
+		// pg_type.dat seed (batched-15)).
+		if st.Size()%int64(storage.BlockSize) != 0 || st.Size() < int64(storage.BlockSize) {
+			t.Errorf("%s: size=%d not a multiple of block size %d", rel.name, st.Size(), storage.BlockSize)
 		}
 	}
 }
