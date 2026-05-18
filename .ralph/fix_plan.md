@@ -6564,6 +6564,59 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         parname text_ops UNIQUE + 6247 oid_ops UNIQUE PKEY) are now
         seeded. Design:
         `docs/design/0106-0010-step3br-pg-parameter-acl-oid-index.md`.
+      - Step 3bs LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3350` PG-standby boot blocker
+        surfaced by `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` after Step 3br seeded
+        `pg_parameter_acl_oid_index` (OID 6247). OID 3350 is
+        `pg_partitioned_table` per
+        `postgres/src/include/catalog/pg_partitioned_table_d.h:23`
+        (`PartitionedRelationId == 3350`). Pure catalog-seed addition
+        mirroring the nailed-rel pattern of Steps 3w/3aa/3ag/3ak/3an/
+        3ar/3aw/3bb/3be/3bh/3bm (no encoder/builder/Init flow change).
+        (a) `internal/initdb/relcache_init.go::pgPartitionedTableAttrs()`
+        returns the 8-column PG18 schema verbatim from
+        `pg_partitioned_table.h`: 4 fixed-width NotNull
+        (partrelid oid/4, partstrat char/1, partnatts int2/2,
+        partdefid oid/4) + 3 CATALOG_VARLEN BKI_FORCE_NOT_NULL vector
+        cols (partattrs int2vector/-1, partclass oidvector/-1,
+        partcollation oidvector/-1) + 1 CATALOG_VARLEN nullable
+        (partexprs pg_node_tree/-1). `nailedLocalRels` gains
+        `{3350, "pg_partitioned_table", 83, 'r', 8, false,
+        pgPartitionedTableAttrs()}` after the Step 3bm pg_opfamily
+        entry; RelType=83 is safe because pg_partitioned_table is not
+        formrdesc'd (no `PartitionedRelation_Rowtype_Id` constant in
+        PG18), so Step 3v's tdtypeid==reltype assertion does not fire.
+        (b) `internal/initdb/initdb.go::bootstrapMappedLocalCatalogHeaps`
+        OID list gains `3350` so an `InitPage`-stamped 8 KiB empty heap
+        is written to `base/{1,5}/3350` before PG's `mdopen`.
+        `localRelMap` gains `{3350, 3350}` so PG's relfilenode mapper
+        resolves OID 3350 to the backing file. Seed flows automatically
+        through `bootstrapPgClassTuples` (Form_pg_class row) →
+        `bootstrapPgAttributeTuples` (8 Form_pg_attribute rows) →
+        `bootstrapPgClassOidIndex` (leaf at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (8 composite-key leaves
+        at file 2659) → `writeRelcacheInitFile`. Regression pins:
+        `TestNailedLocalRelsContainsPgPartitionedTable` (full per-column
+        audit against `pg_partitioned_table_d.h` and
+        `pg_partitioned_table.h`) and
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgPartitionedTable`
+        (asserts `base/{1,5}/3350` exists, is exactly 8 KiB, and
+        InitPage-stamped) in `internal/initdb/pg_partitioned_table_nailed_test.go`;
+        existing `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 3350 so the placeholder OID list cannot silently
+        drop pg_partitioned_table. Companion index 3351
+        (`pg_partitioned_table_partrelid_index`, UNIQUE PRIMARY on
+        `partrelid oid_ops`, backs `MAKE_SYSCACHE(PARTRELID, …, 32)`)
+        deferred to Step 3bt. Verified: `go build ./...` PASS;
+        `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgPartitionedTable|TestBootstrapMappedLocalCatalogHeapsIncludesPgPartitionedTable|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgOpfamily|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3br (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3bs-pg-partitioned-table-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

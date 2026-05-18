@@ -267,6 +267,20 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// `postgres/src/include/catalog/pg_opfamily.h` (PG18,
 	// OperatorFamilyRelationId == 2753). 5 columns, all NotNull.
 	{2753, "pg_opfamily", 83, 'r', 5, false, pgOpfamilyAttrs()},
+	// M0106-0010 step 3bs: pg_partitioned_table is opened during PG-standby
+	// boot once Step 3br cleared `pg_parameter_acl_oid_index`. Without a
+	// pg_class row, `RelationBuildDesc(3350) → ScanPgRelation(3350)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 3350`. RelType=83 is safe because pg_partitioned_table is
+	// not formrdesc'd (no `PartitionedRelation_Rowtype_Id` constant in
+	// PG18 headers). Schema per
+	// `postgres/src/include/catalog/pg_partitioned_table.h` (PG18,
+	// PartitionedRelationId == 3350). 8 columns: 4 fixed-width NotNull
+	// (partrelid, partstrat, partnatts, partdefid) + 3 CATALOG_VARLEN
+	// NotNull (partattrs int2vector, partclass oidvector, partcollation
+	// oidvector — all BKI_FORCE_NOT_NULL) + 1 CATALOG_VARLEN nullable
+	// (partexprs pg_node_tree).
+	{3350, "pg_partitioned_table", 83, 'r', 8, false, pgPartitionedTableAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1370,6 +1384,27 @@ func pgOpfamilyAttrs() []nailedAttr {
 		{Name: "opfname", TypeOID: 19, Num: 3, Len: 64, NotNull: true},      // name
 		{Name: "opfnamespace", TypeOID: 26, Num: 4, Len: 4, NotNull: true},  // oid → pg_namespace
 		{Name: "opfowner", TypeOID: 26, Num: 5, Len: 4, NotNull: true},      // oid → pg_authid
+	}
+}
+
+// pgPartitionedTableAttrs defines the 8-column PG18 pg_partitioned_table
+// schema. PG `RelationBuildDesc(3350) → ScanPgRelation(3350)` looks up
+// the `Form_pg_class` row first; without a nailedLocalRels entry no
+// row gets seeded and PG FATALs with `could not open relation with OID
+// 3350`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_partitioned_table.h` (PG18).
+// pg_partitioned_table has no `oid` system column — `partrelid` is the
+// primary key. M0106-0010 step 3bs.
+func pgPartitionedTableAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "partrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},      // oid → pg_class
+		{Name: "partstrat", TypeOID: 18, Num: 2, Len: 1, NotNull: true},      // char
+		{Name: "partnatts", TypeOID: 21, Num: 3, Len: 2, NotNull: true},      // int2
+		{Name: "partdefid", TypeOID: 26, Num: 4, Len: 4, NotNull: true},      // oid → pg_class (BKI_LOOKUP_OPT)
+		{Name: "partattrs", TypeOID: 22, Num: 5, Len: -1, NotNull: true},     // int2vector BKI_FORCE_NOT_NULL
+		{Name: "partclass", TypeOID: 30, Num: 6, Len: -1, NotNull: true},     // oidvector → pg_opclass BKI_FORCE_NOT_NULL
+		{Name: "partcollation", TypeOID: 30, Num: 7, Len: -1, NotNull: true}, // oidvector → pg_collation BKI_FORCE_NOT_NULL
+		{Name: "partexprs", TypeOID: 194, Num: 8, Len: -1, NotNull: false},   // pg_node_tree (CATALOG_VARLEN, nullable)
 	}
 }
 
