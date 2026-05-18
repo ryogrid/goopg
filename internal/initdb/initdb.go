@@ -868,6 +868,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3380, // pg_statistic_ext_oid_index (Step 3cd)
 		3997, // pg_statistic_ext_name_index (Step 3cd)
 		3379, // pg_statistic_ext_relid_index (Step 3cd)
+		2696, // pg_statistic_relid_att_inh_index (Step 3ce)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -934,6 +935,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3380, // pg_statistic_ext_oid_index (Step 3cd)
 		3997, // pg_statistic_ext_name_index (Step 3cd)
 		3379, // pg_statistic_ext_relid_index (Step 3cd)
+		2696, // pg_statistic_relid_att_inh_index (Step 3ce)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2595,6 +2597,17 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(3380, 3381, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                  // pg_statistic_ext_oid_index
 		entry(3997, 3381, []int16{3, 4}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),         // pg_statistic_ext_name_index
 		entry(3379, 3381, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                                // pg_statistic_ext_relid_index
+		// M0106-0010 Step 3ce: pg_statistic_relid_att_inh_index. PG18
+		//   postgres/src/include/catalog/pg_statistic.h:139
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_relid_att_inh_index, 2696,
+		//       StatisticRelidAttnumInhIndexId, pg_statistic,
+		//       btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops));
+		//   MAKE_SYSCACHE(STATRELATTINH, pg_statistic_relid_att_inh_index, 128);
+		// pg_statistic attnums (pg_statistic_d.h): 1=starelid, 2=staattnum,
+		// 3=stainherit. Heap OID 2619 is the nailed local rel added in Step
+		// 3ce. UNIQUE PRIMARY 3-column composite key with three different
+		// opclasses (oid_ops, int2_ops, bool_ops) and no collations.
+		entry(2696, 2619, []int16{1, 2, 3}, []uint32{oidOps, int2Ops, boolOps}, []uint32{0, 0, 0}, true, true), // pg_statistic_relid_att_inh_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

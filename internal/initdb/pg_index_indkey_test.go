@@ -98,6 +98,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		3380: {1},         // pg_statistic_ext_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cd
 		3997: {3, 4},      // pg_statistic_ext_name_index : btree(stxname name_ops, stxnamespace oid_ops) UNIQUE ← Step 3cd
 		3379: {2},         // pg_statistic_ext_relid_index : btree(stxrelid oid_ops) NON-UNIQUE ← Step 3cd
+		2696: {1, 2, 3},   // pg_statistic_relid_att_inh_index : btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops) UNIQUE PRIMARY ← Step 3ce
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

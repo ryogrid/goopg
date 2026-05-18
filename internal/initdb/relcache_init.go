@@ -397,6 +397,22 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// (stxexprs). pg_statistic_ext DOES have an `oid` system column —
 	// attnum 1 is oid.
 	{3381, "pg_statistic_ext", 83, 'r', 9, false, pgStatisticExtAttrs()},
+	// M0106-0010 step 3ce: pg_statistic is opened during PG-standby boot
+	// once Step 3cd cleared the pg_statistic_ext family. Without a pg_class
+	// row, `RelationBuildDesc(2619) → ScanPgRelation(2619)` returns NULL
+	// and the backend FATALs with `could not open relation with OID 2619`.
+	// RelType=83 is safe because pg_statistic is not formrdesc'd (no
+	// `StatisticRelation_Rowtype_Id` constant in PG18 headers). Schema per
+	// `postgres/src/include/catalog/pg_statistic.h` (PG18,
+	// StatisticRelationId == 2619). 31 columns total: 3 leading fixed
+	// NOT NULL key columns (starelid oid, staattnum int2, stainherit bool)
+	// + 3 fixed NOT NULL stats (stanullfrac float4, stawidth int4,
+	// stadistinct float4) + 5×stakind int2 NOT NULL + 5×staop oid NOT NULL
+	// (BKI_LOOKUP_OPT, zero when unused) + 5×stacoll oid NOT NULL
+	// (BKI_LOOKUP_OPT) + 5×stanumbers _float4 NULLABLE + 5×stavalues
+	// anyarray NULLABLE. pg_statistic has no `oid` system column —
+	// attnums start at 1 = starelid.
+	{2619, "pg_statistic", 83, 'r', 31, false, pgStatisticAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -893,6 +909,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// this entry RelationIdGetRelation(3379) FATALs; flattenRels
 		// derives RelNatts=1.
 		{3379, "pg_statistic_ext_relid_index"},
+		// M0106-0010 Step 3ce: pg_statistic_relid_att_inh_index. PG18
+		// `postgres/src/include/catalog/pg_statistic.h:139` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_relid_att_inh_index, 2696,
+		// StatisticRelidAttnumInhIndexId, pg_statistic, btree(starelid
+		// oid_ops, staattnum int2_ops, stainherit bool_ops))`. UNIQUE
+		// PRIMARY 3-column composite key. Heap OID 2619 (pg_statistic) is
+		// the nailed local rel above (Step 3ce). Backs
+		// MAKE_SYSCACHE(STATRELATTINH, pg_statistic_relid_att_inh_index, 128).
+		// Without this entry RelationIdGetRelation(2696) FATALs; flattenRels
+		// derives RelNatts=3 via pgIndexNattsByOID.
+		{2696, "pg_statistic_relid_att_inh_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1861,6 +1888,57 @@ func pgStatisticExtAttrs() []nailedAttr {
 		{Name: "stxstattarget", TypeOID: 21, Num: 7, Len: 2, NotNull: false}, // int2 BKI_FORCE_NULL
 		{Name: "stxkind", TypeOID: 1002, Num: 8, Len: -1, NotNull: true},    // _char BKI_FORCE_NOT_NULL
 		{Name: "stxexprs", TypeOID: 194, Num: 9, Len: -1, NotNull: false},   // pg_node_tree
+	}
+}
+
+
+// pgStatisticAttrs returns the 31-column PG18 schema for pg_statistic.
+// Source of truth: `postgres/src/include/catalog/pg_statistic.h` (PG18,
+// StatisticRelationId == 2619).
+//
+// Columns 1..3 are the unique key (starelid, staattnum, stainherit).
+// Columns 4..6 are scalar statistics (stanullfrac, stawidth, stadistinct).
+// Columns 7..11 are stakindN int2 (NOT NULL — zero when slot unused).
+// Columns 12..16 are staopN oid (NOT NULL, BKI_LOOKUP_OPT — zero when unused).
+// Columns 17..21 are stacollN oid (NOT NULL, BKI_LOOKUP_OPT — zero when unused).
+// Columns 22..26 are stanumbersN _float4 (CATALOG_VARLEN — NULLABLE).
+// Columns 27..31 are stavaluesN anyarray (CATALOG_VARLEN — NULLABLE).
+//
+// pg_statistic has no `oid` system column — attnum 1 is starelid.
+// anyarray is type OID 2277; _float4 is type OID 1021; float4 is 700; int4 23.
+func pgStatisticAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "starelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},     // oid → pg_class (BKI_LOOKUP)
+		{Name: "staattnum", TypeOID: 21, Num: 2, Len: 2, NotNull: true},    // int2
+		{Name: "stainherit", TypeOID: 16, Num: 3, Len: 1, NotNull: true},   // bool
+		{Name: "stanullfrac", TypeOID: 700, Num: 4, Len: 4, NotNull: true}, // float4
+		{Name: "stawidth", TypeOID: 23, Num: 5, Len: 4, NotNull: true},     // int4
+		{Name: "stadistinct", TypeOID: 700, Num: 6, Len: 4, NotNull: true}, // float4
+		{Name: "stakind1", TypeOID: 21, Num: 7, Len: 2, NotNull: true},     // int2
+		{Name: "stakind2", TypeOID: 21, Num: 8, Len: 2, NotNull: true},     // int2
+		{Name: "stakind3", TypeOID: 21, Num: 9, Len: 2, NotNull: true},     // int2
+		{Name: "stakind4", TypeOID: 21, Num: 10, Len: 2, NotNull: true},    // int2
+		{Name: "stakind5", TypeOID: 21, Num: 11, Len: 2, NotNull: true},    // int2
+		{Name: "staop1", TypeOID: 26, Num: 12, Len: 4, NotNull: true},      // oid → pg_operator (BKI_LOOKUP_OPT)
+		{Name: "staop2", TypeOID: 26, Num: 13, Len: 4, NotNull: true},      // oid
+		{Name: "staop3", TypeOID: 26, Num: 14, Len: 4, NotNull: true},      // oid
+		{Name: "staop4", TypeOID: 26, Num: 15, Len: 4, NotNull: true},      // oid
+		{Name: "staop5", TypeOID: 26, Num: 16, Len: 4, NotNull: true},      // oid
+		{Name: "stacoll1", TypeOID: 26, Num: 17, Len: 4, NotNull: true},    // oid → pg_collation (BKI_LOOKUP_OPT)
+		{Name: "stacoll2", TypeOID: 26, Num: 18, Len: 4, NotNull: true},    // oid
+		{Name: "stacoll3", TypeOID: 26, Num: 19, Len: 4, NotNull: true},    // oid
+		{Name: "stacoll4", TypeOID: 26, Num: 20, Len: 4, NotNull: true},    // oid
+		{Name: "stacoll5", TypeOID: 26, Num: 21, Len: 4, NotNull: true},    // oid
+		{Name: "stanumbers1", TypeOID: 1021, Num: 22, Len: -1, NotNull: false}, // _float4 (CATALOG_VARLEN, NULLABLE)
+		{Name: "stanumbers2", TypeOID: 1021, Num: 23, Len: -1, NotNull: false},
+		{Name: "stanumbers3", TypeOID: 1021, Num: 24, Len: -1, NotNull: false},
+		{Name: "stanumbers4", TypeOID: 1021, Num: 25, Len: -1, NotNull: false},
+		{Name: "stanumbers5", TypeOID: 1021, Num: 26, Len: -1, NotNull: false},
+		{Name: "stavalues1", TypeOID: 2277, Num: 27, Len: -1, NotNull: false}, // anyarray (CATALOG_VARLEN, NULLABLE)
+		{Name: "stavalues2", TypeOID: 2277, Num: 28, Len: -1, NotNull: false},
+		{Name: "stavalues3", TypeOID: 2277, Num: 29, Len: -1, NotNull: false},
+		{Name: "stavalues4", TypeOID: 2277, Num: 30, Len: -1, NotNull: false},
+		{Name: "stavalues5", TypeOID: 2277, Num: 31, Len: -1, NotNull: false},
 	}
 }
 

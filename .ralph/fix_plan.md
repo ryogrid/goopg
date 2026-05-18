@@ -7319,6 +7319,75 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         FATAL on 3381 is closed — next FATAL is OID 2619 (`pg_statistic`),
         to be handled by Step 3ce. Design:
         `docs/design/0106-0010-step3cd-pg-statistic-ext-nailed-rel.md`.
+      - Step 3ce LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 2619` PG-standby boot blocker that surfaces
+        after Step 3cd seeded the pg_statistic_ext family. OID 2619 is
+        `pg_statistic` per
+        `postgres/src/include/catalog/pg_statistic.h:29`
+        (`CATALOG(pg_statistic,2619,StatisticRelationId)`). Per-database
+        (non-shared) catalog with the largest column count yet seeded
+        in M0106-0010 (Natts_pg_statistic == 31). Family-complete seed:
+        heap 2619 + its single declared UNIQUE PRIMARY index 2696
+        (`pg_statistic_relid_att_inh_index`, btree on
+        `(starelid oid_ops, staattnum int2_ops, stainherit bool_ops)`,
+        backs `MAKE_SYSCACHE(STATRELATTINH, …, 128)`). Third
+        multi-opclass composite index seeded in M0106-0010 — exercises
+        `int2_ops` + `bool_ops` next to `oid_ops` in the same IndClass
+        slot.
+        (a) `pgStatisticAttrs()` (relcache_init.go) returns the
+        31-column PG18 schema verbatim from `pg_statistic.h:29-125` +
+        `pg_statistic_d.h` (Anum_pg_statistic_* 1..31): 3 fixed NOT
+        NULL key columns (starelid oid 26/4, staattnum int2 21/2,
+        stainherit bool 16/1) + 3 fixed NOT NULL stats (stanullfrac
+        float4 700/4, stawidth int4 23/4, stadistinct float4 700/4) +
+        5×stakindN int2 NOT NULL + 5×staopN oid NOT NULL
+        (BKI_LOOKUP_OPT) + 5×stacollN oid NOT NULL (BKI_LOOKUP_OPT) +
+        5×stanumbersN _float4 NULLABLE (TypeOID 1021 Len -1) +
+        5×stavaluesN anyarray NULLABLE (TypeOID 2277 Len -1).
+        pg_statistic has no `oid` system column — attnums start at 1 =
+        starelid. RelType=83 is safe (no `StatisticRelation_Rowtype_Id`
+        in PG18 headers).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{2619, "pg_statistic", 83, 'r', 31, false, pgStatisticAttrs()}`
+        after the Step 3cd 3381 entry; idxSpec list gains
+        `{2696, "pg_statistic_relid_att_inh_index"}` after the Step 3cd
+        3379 entry.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        `entry(2696, 2619, []int16{1, 2, 3}, []uint32{oidOps, int2Ops,
+        boolOps}, []uint32{0, 0, 0}, true, true)` after the Step 3cd
+        3379 entry.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `2696` after the Step 3cd 3379
+        entry.
+        (e) No new entries in `bootstrapMappedLocalCatalogHeaps` oid
+        list or in `localRelMap` — both already contained 2619 from
+        the Step 3w baseline (the existing 2619 heap-page placeholder
+        is sufficient because pg_statistic is unpopulated at
+        bootstrap).
+        (f) No new type-helper entries needed: `int2` (21), `bool`
+        (16), `float4` (700), `int4` (23), `_float4` (1021), `anyarray`
+        (2277), `oid` (26) are all already registered in
+        `pgCatalogTypeOID` / `pgCatalogTypeLen` / `pgTypeByVal` /
+        `pgTypeAlignChar` / `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgStatistic`,
+        `TestNailedLocalRelsContainsPgStatisticRelidAttInhIndex`,
+        `TestPgStatisticIndexInitialEntries`,
+        `TestPgStatisticAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_statistic_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `2696:{1,2,3}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2696.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgStatistic|TestPgStatisticIndexInitialEntries|TestPgStatisticAttrsTypeOIDsMatchPG18|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3cd (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3ce-pg-statistic-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
