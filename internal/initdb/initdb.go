@@ -720,6 +720,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3119, // pg_foreign_table_relid_index (Step 3bi)
 		2681, // pg_language_name_index (Step 3bj)
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
+		6111, // pg_publication_pubname_index (Step 3bv)
 		} {
 			if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -842,6 +843,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3119, // pg_foreign_table_relid_index (Step 3bi)
 		2681, // pg_language_name_index (Step 3bj)
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
+		6111, // pg_publication_pubname_index (Step 3bv)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -892,6 +894,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3119, // pg_foreign_table_relid_index (Step 3bi)
 		2681, // pg_language_name_index (Step 3bj)
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
+		6111, // pg_publication_pubname_index (Step 3bv)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2302,6 +2305,30 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// GOOPG_RUN_BLOCKED_M0102_E2E=1) is expected to surface OID 3351
 		// as the next FATAL after Step 3bs seeded pg_partitioned_table.
 		entry(3351, 3350, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_partitioned_table_partrelid_index
+		// M0106-0010 Step 3bv: pg_publication_pubname_index.
+		//   postgres/src/include/catalog/pg_publication.h:73
+		//     DECLARE_UNIQUE_INDEX(pg_publication_pubname_index, 6111,
+		//       PublicationNameIndexId, pg_publication,
+		//       btree(pubname name_ops));
+		//   MAKE_SYSCACHE(PUBLICATIONNAME, pg_publication_pubname_index, 8);
+		// pg_publication attnums (pg_publication_d.h / pg_publication.h):
+		// 1=oid, 2=pubname (name), 3=pubowner, 4=puballtables,
+		// 5=pubinsert, 6=pubupdate, 7=pubdelete, 8=pubtruncate,
+		// 9=pubviaroot, 10=pubgencols.
+		// UNIQUE (NOT primary; DECLARE_UNIQUE_INDEX, not DECLARE_UNIQUE_INDEX_PKEY)
+		// single name_ops key with C collation over pg_publication heap
+		// OID 6104 (Step 3bu nailed local rel). Mirrors the single name_ops
+		// UNIQUE pattern of pg_namespace_nspname_index (2684, Step 3t),
+		// pg_event_trigger_evtname_index (3467, Step 3as),
+		// pg_extension_name_index (3081, Step 3ay),
+		// pg_foreign_data_wrapper_name_index (548, Step 3bc),
+		// pg_foreign_server_name_index (549, Step 3bf),
+		// pg_language_name_index (2681, Step 3bj). Without this entry
+		// RelationIdGetRelation(6111) FATALs. E2E test
+		// (TestE2E_FailoverGoopgToPG/async with GOOPG_RUN_BLOCKED_M0102_E2E=1)
+		// surfaced OID 6111 as the next FATAL after Step 3bu seeded
+		// pg_publication.
+		entry(6111, 6104, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_publication_pubname_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

@@ -6715,6 +6715,52 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         blocker `FATAL: could not open relation with OID 6111`
         (pg_publication_pubname_index — Step 3bv territory). Design:
         `docs/design/0106-0010-step3bu-pg-publication-nailed-rel.md`.
+      - Step 3bv LANDED 2026-05-18. Closes the `FATAL: could not open
+        relation with OID 6111` PG-standby boot blocker that surfaced
+        after Step 3bu seeded pg_publication (6104). OID 6111 is
+        `pg_publication_pubname_index` per
+        `postgres/src/include/catalog/pg_publication.h:73`
+        (`DECLARE_UNIQUE_INDEX(pg_publication_pubname_index, 6111,
+        PublicationNameIndexId, pg_publication, btree(pubname name_ops))`).
+        Backs `MAKE_SYSCACHE(PUBLICATIONNAME, pg_publication_pubname_index, 8)`.
+        Pure catalog-seed addition mirroring the single-column
+        `name_ops` UNIQUE non-PKEY pattern of Steps
+        3t/3as/3ay/3bc/3bf/3bj; no encoder/builder/Init flow change.
+        (a) `pgIndexInitialEntries` (initdb.go) gains
+        `entry(6111, 6104, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false)`
+        after the Step 3bt 3351 row — UNIQUE (not primary) single
+        name_ops key with C collation over pg_publication heap OID
+        6104. `pubname` is attnum 2 of pg_publication (attnum 1 is the
+        oid system column).
+        (b) `nailedLocalRels` idxSpec list (relcache_init.go) gains
+        `{6111, "pg_publication_pubname_index"}` after the Step 3bt
+        3351 entry; `flattenRels`+`pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=1` so the `relnatts==indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three critical-index placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        each gain `6111, // pg_publication_pubname_index (Step 3bv)`.
+        Empty-btree placeholder is sufficient because pg_publication
+        is unpopulated at bootstrap.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgPublicationPubnameIndex` and
+        `TestPgPublicationPubnameIndexInitialEntry` in
+        `internal/initdb/pg_publication_pubname_index_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `6111:{2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 6111.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgPublicationPubnameIndex|TestPgPublicationPubnameIndexInitialEntry|TestNailedLocalRelsContainsPgPublication|TestBootstrapMappedLocalCatalogHeapsIncludesPgPublication|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bu (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Companion PKEY
+        6110 (`pg_publication_oid_index`, UNIQUE PRIMARY backing
+        `MAKE_SYSCACHE(PUBLICATIONOID)`) deferred to Step 3bw — that
+        is the next anticipated E2E blocker. Design:
+        `docs/design/0106-0010-step3bv-pg-publication-pubname-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
