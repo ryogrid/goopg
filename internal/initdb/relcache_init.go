@@ -108,6 +108,21 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// steps — the Step-3k empty btree placeholders are sufficient
 	// because pg_parameter_acl is currently unpopulated.
 	{6243, "pg_parameter_acl", 83, 'r', 3, true, pgParameterAclAttrs()},
+	// M0106-0010 step 3ca: pg_replication_origin is opened during
+	// PG-standby boot once Step 3bz cleared the pg_range family. Without
+	// a pg_class row, `RelationBuildDesc(6000) → ScanPgRelation(6000)`
+	// returns NULL and every forked backend FATALs with
+	// `could not open relation with OID 6000`. RelType=83 is safe because
+	// pg_replication_origin is not formrdesc'd (no
+	// `ReplicationOriginRelation_Rowtype_Id` constant in PG18 headers;
+	// only pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are formrdesc'd shared rels), so the Phase3
+	// `relation->rd_att->tdtypeid == relp->reltype` assertion
+	// (relcache.c:4293) does not fire. Schema per
+	// `postgres/src/include/catalog/pg_replication_origin.h` (PG18,
+	// 2 cols: roident/roname). The empty 8 KiB heap at `global/6000` is
+	// already produced by `bootstrapSharedCatalogPlaceholders`.
+	{6000, "pg_replication_origin", 83, 'r', 2, true, pgReplicationOriginAttrs()},
 }, []idxSpec{
 	{2671, "pg_database_datname_index"},
 	{2672, "pg_database_oid_index"},
@@ -137,6 +152,19 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// exists, because no pg_class row gets seeded. Sibling to OID 6246
 	// (parname text_ops UNIQUE non-PKEY) from Step 3bq.
 	{6247, "pg_parameter_acl_oid_index"},
+	// M0106-0010 Step 3ca: pg_replication_origin_roiident_index (OID 6001).
+	// PG18 `postgres/src/include/catalog/pg_replication_origin.h:57` declares
+	// `ReplicationOriginIdentIndex = 6001` as UNIQUE PRIMARY btree(roident
+	// oid_ops), backing MAKE_SYSCACHE(REPLORIGIDENT, …). Without this entry
+	// RelationIdGetRelation(6001) FATALs because no pg_class row gets seeded
+	// for the index. Sibling to OID 6002 (roname text_ops UNIQUE non-PKEY).
+	{6001, "pg_replication_origin_roiident_index"},
+	// M0106-0010 Step 3ca: pg_replication_origin_roname_index (OID 6002).
+	// PG18 `postgres/src/include/catalog/pg_replication_origin.h:58` declares
+	// `ReplicationOriginNameIndex = 6002` as UNIQUE btree(roname text_ops),
+	// backing MAKE_SYSCACHE(REPLORIGNAME, …). Companion to OID 6001
+	// (pg_replication_origin_roiident_index, UNIQUE PRIMARY).
+	{6002, "pg_replication_origin_roname_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).
@@ -1810,6 +1838,20 @@ func pgParameterAclAttrs() []nailedAttr {
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},      // oid
 		{Name: "parname", TypeOID: 25, Num: 2, Len: -1, NotNull: true}, // text BKI_FORCE_NOT_NULL
 		{Name: "paracl", TypeOID: 1034, Num: 3, Len: -1, NotNull: false}, // aclitem[] BKI_DEFAULT(_null_)
+	}
+}
+
+// pgReplicationOriginAttrs defines the 2-column PG18 pg_replication_origin
+// schema per `postgres/src/include/catalog/pg_replication_origin.h`.
+// Shared catalog (BKI_SHARED_RELATION); roname is BKI_FORCE_NOT_NULL.
+// roident is typed as `Oid` (4 bytes) even though the upstream comment
+// notes the *value* needs to fit into uint16 — the column is allocated
+// manually outside the normal Oid pool, but its on-disk storage is the
+// usual 4-byte Oid.
+func pgReplicationOriginAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "roident", TypeOID: 26, Num: 1, Len: 4, NotNull: true},  // oid (manually allocated)
+		{Name: "roname", TypeOID: 25, Num: 2, Len: -1, NotNull: true},  // text BKI_FORCE_NOT_NULL
 	}
 }
 

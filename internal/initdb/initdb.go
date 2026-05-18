@@ -874,6 +874,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2695, 3593,
 		6246, // pg_parameter_acl_parname_index (Step 3bq)
 		6247, // pg_parameter_acl_oid_index (Step 3br)
+		6001, // pg_replication_origin_roiident_index (Step 3ca)
+		6002, // pg_replication_origin_roname_index (Step 3ca)
 		// Also copy all local critical indexes to global/
 		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828, // pg_default_acl_oid_index (Step 3am)
@@ -1811,6 +1813,37 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// GOOPG_RUN_BLOCKED_M0102_E2E=1) surfaced OID 6247 as the next
 		// FATAL after Step 3bq seeded pg_parameter_acl_parname_index.
 		entry(6247, 6243, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_parameter_acl_oid_index
+		// M0106-0010 Step 3ca: pg_replication_origin_roiident_index.
+		//   postgres/src/include/catalog/pg_replication_origin.h:57
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_replication_origin_roiident_index, 6001,
+		//       ReplicationOriginIdentIndex, pg_replication_origin,
+		//       btree(roident oid_ops));
+		//   MAKE_SYSCACHE(REPLORIGIDENT, pg_replication_origin_roiident_index, 16);
+		// pg_replication_origin attnums (pg_replication_origin_d.h):
+		// 1=roident, 2=roname. UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY)
+		// single oid_ops key (no collation) over pg_replication_origin heap
+		// OID 6000 (Step 3ca nailed shared rel). Same single-column oid_ops
+		// UNIQUE PRIMARY pattern as pg_parameter_acl_oid_index (6247,
+		// Step 3br). Without this entry RelationIdGetRelation(6001) FATALs.
+		// E2E test (TestE2E_FailoverGoopgToPG/async with
+		// GOOPG_RUN_BLOCKED_M0102_E2E=1) surfaced OID 6000 as the next FATAL
+		// after Step 3bz seeded pg_range; seeding the heap + both indexes
+		// in one step matches the family-complete pattern.
+		entry(6001, 6000, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_replication_origin_roiident_index
+		// M0106-0010 Step 3ca: pg_replication_origin_roname_index.
+		//   postgres/src/include/catalog/pg_replication_origin.h:58
+		//     DECLARE_UNIQUE_INDEX(pg_replication_origin_roname_index, 6002,
+		//       ReplicationOriginNameIndex, pg_replication_origin,
+		//       btree(roname text_ops));
+		//   MAKE_SYSCACHE(REPLORIGNAME, pg_replication_origin_roname_index, 16);
+		// UNIQUE (NOT primary; DECLARE_UNIQUE_INDEX, not the _PKEY variant —
+		// PKEY is 6001 = pg_replication_origin_roiident_index) single text_ops
+		// key with C_COLLATION_OID = 950 — same convention as
+		// pg_parameter_acl_parname_index (6246, Step 3bq) and the text_ops
+		// `provider` slot of pg_shseclabel_object_index (3593). Shared catalog
+		// (BKI_SHARED_RELATION) over pg_replication_origin heap OID 6000.
+		// Without this entry RelationIdGetRelation(6002) FATALs.
+		entry(6002, 6000, []int16{2}, []uint32{textOps}, []uint32{cCollation}, true, false), // pg_replication_origin_roname_index
 	}
 	// Local-catalog index rows mirroring nailedLocalRels.
 	local := []pgIndexEntry{

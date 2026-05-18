@@ -7026,6 +7026,73 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         on E2E re-run lies in the next pg_subscription / pg_statistic
         catalog territory (Step 3ca). Design:
         `docs/design/0106-0010-step3bz-pg-range-nailed-rel.md`.
+      - Step 3ca LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 6000` PG-standby boot blocker that surfaces
+        after Step 3bz seeded the pg_range family. OID 6000 is
+        `pg_replication_origin` per
+        `postgres/src/include/catalog/pg_replication_origin.h:30`
+        (`CATALOG(pg_replication_origin,6000,ReplicationOriginRelationId) BKI_SHARED_RELATION`).
+        First **shared** nailed-rel addition since Step 3br.
+        Family-complete seed in one step: heap 6000 + both declared
+        indexes 6001 (UNIQUE PRIMARY `oid_ops` over roident, backs
+        `MAKE_SYSCACHE(REPLORIGIDENT)`) and 6002 (UNIQUE `text_ops`
+        over roname with `cCollation`, backs
+        `MAKE_SYSCACHE(REPLORIGNAME)`).
+        (a) `pgReplicationOriginAttrs()` (relcache_init.go) returns the
+        2-column PG18 schema: roident (oid TypeOID 26 Len 4 NotNull —
+        manually allocated value-pool, but 4-byte Oid storage) +
+        roname (text TypeOID 25 Len -1 BKI_FORCE_NOT_NULL).
+        pg_replication_origin has **no `oid` system column** — attnums
+        start at 1 = roident. RelType=83 is safe (no
+        `ReplicationOriginRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedSharedRels` (relcache_init.go) heap list gains
+        `{6000, "pg_replication_origin", 83, 'r', 2, true, pgReplicationOriginAttrs()}`
+        after the Step 3bp pg_parameter_acl 6243 entry; idxSpec list
+        gains `{6001, "pg_replication_origin_roiident_index"}` and
+        `{6002, "pg_replication_origin_roname_index"}` after the
+        Step 3br 6247 entry.
+        (c) `pgIndexInitialEntries` shared section (initdb.go) gains
+        `entry(6001, 6000, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` (UNIQUE PRIMARY roident PKEY) and
+        `entry(6002, 6000, []int16{2}, []uint32{textOps},
+        []uint32{cCollation}, true, false)` (UNIQUE roname text_ops
+        with C_COLLATION_OID) after the Step 3br 6247 entry.
+        (d) Heap file at `global/6000` already created by
+        `bootstrapSharedCatalogPlaceholders` (heapOIDs list already
+        contains 6000); `pg_filenode.map` already maps `{6000, 6000}`.
+        No change needed in either location.
+        (e) "Shared critical indexes (under global/)" placeholder OID
+        list at `bootstrapPostgresDatabase` gains
+        `6001, // pg_replication_origin_roiident_index (Step 3ca)` and
+        `6002, // pg_replication_origin_roname_index (Step 3ca)` after
+        the Step 3br 6247 entry. Empty-btree placeholder is sufficient
+        because pg_replication_origin is unpopulated at bootstrap.
+        Regression pins:
+        `TestNailedSharedRelsContainsPgReplicationOrigin`,
+        `TestPgReplicationOriginRoiidentIndexSeededFromInitialEntries`,
+        `TestNailedSharedRelsContainsPgReplicationOriginRoiidentIndex`,
+        `TestPgReplicationOriginRonameIndexSeededFromInitialEntries`,
+        `TestNailedSharedRelsContainsPgReplicationOriginRonameIndex` in
+        `internal/initdb/pg_replication_origin_nailed_test.go` +
+        `pg_replication_origin_roiident_index_test.go` +
+        `pg_replication_origin_roname_index_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `6001:{1}` + `6002:{2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 6001 + 6002.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedSharedRelsContainsPgReplicationOrigin|TestPgReplicationOriginRoiidentIndex|TestPgReplicationOriginRonameIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bz (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. With the heap
+        (6000) + PKEY (6001) + UNIQUE secondary (6002) all seeded,
+        the pg_replication_origin family is fully wired. Next
+        anticipated blocker on E2E re-run lies in the pg_subscription_rel
+        / pg_statistic / pg_statistic_ext catalog territory (Step 3cb).
+        Design:
+        `docs/design/0106-0010-step3ca-pg-replication-origin-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
