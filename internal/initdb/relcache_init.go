@@ -123,6 +123,21 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// 2 cols: roident/roname). The empty 8 KiB heap at `global/6000` is
 	// already produced by `bootstrapSharedCatalogPlaceholders`.
 	{6000, "pg_replication_origin", 83, 'r', 2, true, pgReplicationOriginAttrs()},
+	// M0106-0010 step 3ch: pg_tablespace is opened during PG-standby boot
+	// once Step 3cg cleared the pg_subscription_rel family. Without a
+	// pg_class row, `RelationBuildDesc(1213) → ScanPgRelation(1213)`
+	// returns NULL and every forked backend FATALs with
+	// `could not open relation with OID 1213`. RelType=83 is safe because
+	// pg_tablespace is not formrdesc'd (no `TableSpaceRelation_Rowtype_Id`
+	// constant in PG18 headers; only pg_database/pg_authid/pg_auth_members/
+	// pg_shseclabel/pg_subscription are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`), so the
+	// Phase3 `relation->rd_att->tdtypeid == relp->reltype` assertion
+	// (relcache.c:4293) does not fire. Schema per
+	// `postgres/src/include/catalog/pg_tablespace.h` (PG18, 5 cols:
+	// oid/spcname/spcowner/spcacl/spcoptions). The empty 8 KiB heap at
+	// `global/1213` is already produced by `bootstrapSharedCatalogPlaceholders`.
+	{1213, "pg_tablespace", 83, 'r', 5, true, pgTablespaceAttrs()},
 }, []idxSpec{
 	{2671, "pg_database_datname_index"},
 	{2672, "pg_database_oid_index"},
@@ -182,6 +197,22 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// seeded pg_statistic. Companion to OID 6114 (oid PKEY) over the
 	// already-nailed pg_subscription heap OID 6100.
 	{6115, "pg_subscription_subname_index"},
+	// M0106-0010 Step 3ch: pg_tablespace_oid_index (OID 2697).
+	// PG18 `postgres/src/include/catalog/pg_tablespace.h:52` declares
+	// `TablespaceOidIndexId = 2697` as UNIQUE PRIMARY btree(oid oid_ops),
+	// backing MAKE_SYSCACHE(TABLESPACEOID, …). PG's load_critical_index
+	// pass opens every declared index of a nailed rel; without this entry
+	// RelationIdGetRelation(2697) FATALs because no pg_class row gets
+	// seeded for the index. Sibling to OID 2698 (spcname name_ops UNIQUE
+	// non-PKEY).
+	{2697, "pg_tablespace_oid_index"},
+	// M0106-0010 Step 3ch: pg_tablespace_spcname_index (OID 2698).
+	// PG18 `postgres/src/include/catalog/pg_tablespace.h:53` declares
+	// `TablespaceNameIndexId = 2698` as UNIQUE btree(spcname name_ops)
+	// (no MAKE_SYSCACHE — used directly by get_tablespace_oid()).
+	// Companion to OID 2697 (oid PKEY) over the pg_tablespace heap OID 1213
+	// nailed in this same step.
+	{2698, "pg_tablespace_spcname_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).
@@ -2172,6 +2203,26 @@ func pgReplicationOriginAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "roident", TypeOID: 26, Num: 1, Len: 4, NotNull: true},  // oid (manually allocated)
 		{Name: "roname", TypeOID: 25, Num: 2, Len: -1, NotNull: true},  // text BKI_FORCE_NOT_NULL
+	}
+}
+
+
+// pgTablespaceAttrs defines the 5-column PG18 pg_tablespace schema per
+// `postgres/src/include/catalog/pg_tablespace.h:29-41` and
+// `pg_tablespace_d.h` (Anum_pg_tablespace_* 1..5,
+// Natts_pg_tablespace == 5). Shared catalog (BKI_SHARED_RELATION).
+// Three fixed-width NOT NULL leading columns (oid 26/4, spcname name 19/64,
+// spcowner oid 26/4) + two CATALOG_VARLEN nullable columns (spcacl
+// aclitem[] 1034/-1 BKI_DEFAULT(_null_), spcoptions text[] 1009/-1
+// BKI_DEFAULT(_null_)). Used by M0106-0010 Step 3ch nailed shared
+// relation entry.
+func pgTablespaceAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},        // oid
+		{Name: "spcname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},   // name (NAMEDATALEN=64)
+		{Name: "spcowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},   // oid → pg_authid
+		{Name: "spcacl", TypeOID: 1034, Num: 4, Len: -1, NotNull: false}, // aclitem[] BKI_DEFAULT(_null_)
+		{Name: "spcoptions", TypeOID: 1009, Num: 5, Len: -1, NotNull: false}, // text[] BKI_DEFAULT(_null_)
 	}
 }
 

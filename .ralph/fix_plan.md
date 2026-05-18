@@ -7319,6 +7319,70 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         FATAL on 3381 is closed — next FATAL is OID 2619 (`pg_statistic`),
         to be handled by Step 3ce. Design:
         `docs/design/0106-0010-step3cd-pg-statistic-ext-nailed-rel.md`.
+      - Step 3ch LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 1213` PG-standby boot blocker that surfaces
+        after Step 3cg seeded the pg_subscription_rel family. OID 1213
+        is `pg_tablespace` per
+        `postgres/src/include/catalog/pg_tablespace.h:29`
+        (`CATALOG(pg_tablespace,1213,TableSpaceRelationId) BKI_SHARED_RELATION`).
+        Shared catalog — follows the Step 3ca (pg_replication_origin)
+        family-complete template: heap 1213 + both declared indexes
+        2697 (`pg_tablespace_oid_index`, UNIQUE PRIMARY btree(oid
+        oid_ops), backs `MAKE_SYSCACHE(TABLESPACEOID, …)`) and 2698
+        (`pg_tablespace_spcname_index`, UNIQUE btree(spcname name_ops),
+        no syscache — used directly by `get_tablespace_oid()`).
+        (a) `pgTablespaceAttrs()` (relcache_init.go) returns the
+        5-column PG18 schema verbatim from `pg_tablespace.h:29-41` +
+        `pg_tablespace_d.h` (Anum_pg_tablespace_* 1..5,
+        Natts_pg_tablespace == 5): 3 fixed NOT NULL leading (oid 26/4,
+        spcname name 19/64, spcowner oid 26/4) + 2 CATALOG_VARLEN
+        nullable (spcacl aclitem[] 1034/-1 BKI_DEFAULT(_null_),
+        spcoptions text[] 1009/-1 BKI_DEFAULT(_null_)). RelType=83 is
+        safe — pg_tablespace is not formrdesc'd (only
+        pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+        are at `postgres/src/backend/utils/cache/relcache.c:4075-4083`).
+        (b) `nailedSharedRels` (relcache_init.go) heap list gains
+        `{1213, "pg_tablespace", 83, 'r', 5, true, pgTablespaceAttrs()}`
+        after the Step 3ca pg_replication_origin entry; idxSpec list
+        gains `{2697, "pg_tablespace_oid_index"}` and `{2698,
+        "pg_tablespace_spcname_index"}` after the Step 3cf 6115 entry.
+        (c) `pgIndexInitialEntries` shared section (initdb.go) gains
+        `entry(2697, 1213, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` and `entry(2698, 1213, []int16{2},
+        []uint32{nameOps}, []uint32{cCollation}, true, false)` after
+        the Step 3cf 6115 entry.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `2697` and `2698` after the
+        Step 3cg 6117 entry.
+        (e) No new heapOIDs entry in `bootstrapSharedCatalogPlaceholders`
+        — `global/1213` was already seeded as an 8 KiB empty heap page.
+        (f) No new type-helper entries: `oid` (26), `name` (19),
+        `aclitem[]` (1034), `text[]` (1009) are already registered in
+        `pgCatalogTypeOID` / `pgCatalogTypeLen` / `pgTypeByVal` /
+        `pgTypeAlignChar` / `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedSharedRelsContainsPgTablespace`,
+        `TestNailedSharedRelsContainsPgTablespaceIndexes`,
+        `TestPgTablespaceIndexInitialEntries`,
+        `TestPgTablespaceAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_tablespace_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `2697:{1}` + `2698:{2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2697 + 2698.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedSharedRelsContainsPgTablespace|TestPgTablespaceIndexInitialEntries|TestPgTablespaceAttrsTypeOIDsMatchPG18|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3cg (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. E2E re-run
+        (`GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run
+        TestE2E_FailoverGoopgToPG/async ./internal/testport/`) confirms
+        FATAL on 1213 is closed — next FATAL is OID 3576
+        (`pg_transform`), to be handled by Step 3ci. Design:
+        `docs/design/0106-0010-step3ch-pg-tablespace-nailed-rel.md`.
       - Step 3cg LANDED 2026-05-18. Closes the FATAL `could not open
         relation with OID 6102` PG-standby boot blocker that surfaces
         after Step 3cf seeded the pg_subscription index pair. OID 6102

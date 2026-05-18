@@ -872,6 +872,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6114, // pg_subscription_oid_index (Step 3cf)
 		6115, // pg_subscription_subname_index (Step 3cf)
 		6117, // pg_subscription_rel_srrelid_srsubid_index (Step 3cg)
+		2697, // pg_tablespace_oid_index (Step 3ch)
+		2698, // pg_tablespace_spcname_index (Step 3ch)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -942,6 +944,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6114, // pg_subscription_oid_index (Step 3cf)
 		6115, // pg_subscription_subname_index (Step 3cf)
 		6117, // pg_subscription_rel_srrelid_srsubid_index (Step 3cg)
+		2697, // pg_tablespace_oid_index (Step 3ch)
+		2698, // pg_tablespace_spcname_index (Step 3ch)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -1893,6 +1897,30 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// GOOPG_RUN_BLOCKED_M0102_E2E=1) surfaced OID 6115 as the next
 		// FATAL after Step 3ce seeded pg_statistic.
 		entry(6115, 6100, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_subscription_subname_index
+		// M0106-0010 Step 3ch: pg_tablespace_oid_index.
+		//   postgres/src/include/catalog/pg_tablespace.h:52
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_tablespace_oid_index, 2697,
+		//       TablespaceOidIndexId, pg_tablespace,
+		//       btree(oid oid_ops));
+		//   MAKE_SYSCACHE(TABLESPACEOID, pg_tablespace_oid_index, 4);
+		// pg_tablespace attnums (pg_tablespace_d.h): 1=oid, 2=spcname,
+		// 3=spcowner, 4=spcacl, 5=spcoptions. UNIQUE PRIMARY single
+		// oid_ops key (no collation) over pg_tablespace heap OID 1213
+		// (Step 3ch nailed shared rel). Same single-column oid_ops UNIQUE
+		// PRIMARY pattern as pg_replication_origin_roiident_index (6001)
+		// and pg_subscription_oid_index (6114).
+		entry(2697, 1213, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_tablespace_oid_index
+		// M0106-0010 Step 3ch: pg_tablespace_spcname_index.
+		//   postgres/src/include/catalog/pg_tablespace.h:53
+		//     DECLARE_UNIQUE_INDEX(pg_tablespace_spcname_index, 2698,
+		//       TablespaceNameIndexId, pg_tablespace,
+		//       btree(spcname name_ops));
+		// UNIQUE (NOT primary; DECLARE_UNIQUE_INDEX, not the _PKEY variant —
+		// PKEY is 2697 = pg_tablespace_oid_index). Single name_ops key
+		// with C_COLLATION_OID = 950 — same convention as
+		// pg_database_datname_index (2671), pg_authid_rolname_index (2676)
+		// and other shared-catalog name-keyed indexes.
+		entry(2698, 1213, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_tablespace_spcname_index
 	}
 	// Local-catalog index rows mirroring nailedLocalRels.
 	local := []pgIndexEntry{
